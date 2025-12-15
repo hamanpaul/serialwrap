@@ -24,6 +24,34 @@ B_LOG_DIR = "/home/paul_chen/arc_prj/b-log"
 TMUX_BIN = "/usr/bin/tmux"
 PS_BIN = "/usr/bin/ps"
 
+SERIALWRAP_VERSION = "0.1.0-dev"
+
+HELP_EPILOG = """\
+範例（開發階段）:
+  /home/paul_chen/arc_prj/ser-dep/serialwrap attach --list
+  /home/paul_chen/arc_prj/ser-dep/serialwrap attach --auto
+  /home/paul_chen/arc_prj/ser-dep/serialwrap attach COM0 --tmux-target %2
+  /home/paul_chen/arc_prj/ser-dep/serialwrap run COM0 --cmd 'echo true' --timeout 5
+  /home/paul_chen/arc_prj/ser-dep/serialwrap read COM0 --max-bytes 65536
+  /home/paul_chen/arc_prj/ser-dep/serialwrap detach COM0
+
+狀態檔:
+  /tmp/serialwrap/registry.json
+  /tmp/serialwrap/locks/COMx.lock
+
+輸出:
+  預設輸出為 JSON（stable keys, 便於 AI/程式解析）
+
+常見 error_code:
+  MULTI_MINICOM_UNREGISTERED  COM mapping 不唯一，需手動 attach
+  LOGIN_REQUIRED              console 需要登入（工具不處理密碼）
+  LOCKED                      同一 COM 正在執行 run/read
+  COM_NOT_FOUND               找不到對應 COM 的 minicom instance
+  LOG_NOT_FOUND               log 檔案不存在
+  MAX_OUTPUT_EXCEEDED         輸出超過上限（partial=true）
+  TIMEOUT                     超時（partial=true）
+"""
+
 
 @dataclasses.dataclass(frozen=True)
 class PaneInfo:
@@ -795,7 +823,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="serialwrap",
         description="Operate minicom consoles via tmux and read back outputs from b-log.",
+        epilog=HELP_EPILOG,
+        formatter_class=argparse.RawTextHelpFormatter,
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {SERIALWRAP_VERSION}")
 
     sub = parser.add_subparsers(dest="cmd", required=True)
 

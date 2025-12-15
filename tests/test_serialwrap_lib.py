@@ -20,7 +20,15 @@ class TestSerialwrapParsing(unittest.TestCase):
         text = "\x1b[31mRED\x1b[0m\r\nOK\r\n"
         self.assertEqual(serialwrap_lib._clean_output(text), "RED\nOK\n")
 
+    def test_find_marker_line_not_command_echo(self) -> None:
+        run_id = "deadbeef"
+        marker = f"__SERIALWRAP_BEGIN__{run_id}"
+        text = f"echo {marker}\n{marker}\n"
+        norm = serialwrap_lib._normalize_newlines(text)
+        match = serialwrap_lib._find_marker_line(norm, marker)
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group(0).strip(), marker)
+
 
 if __name__ == "__main__":
     unittest.main()
-
