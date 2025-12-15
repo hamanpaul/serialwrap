@@ -23,11 +23,27 @@ class TestSerialwrapParsing(unittest.TestCase):
     def test_find_marker_line_not_command_echo(self) -> None:
         run_id = "deadbeef"
         marker = f"__SERIALWRAP_BEGIN__{run_id}"
-        text = f"echo {marker}\n{marker}\n"
+        text = f"root# echo {marker}\n{marker}\n"
         norm = serialwrap_lib._normalize_newlines(text)
-        match = serialwrap_lib._find_marker_line(norm, marker)
-        self.assertIsNotNone(match)
-        self.assertEqual(match.group(0).strip(), marker)
+        begin_pos = serialwrap_lib._find_marker_output_line_end(norm, marker)
+        self.assertIsNotNone(begin_pos)
+        self.assertEqual(norm[begin_pos:], "")
+
+        begin_pos = serialwrap_lib._find_marker_after_line(norm, marker)
+        self.assertIsNotNone(begin_pos)
+        self.assertEqual(norm[begin_pos:], f"{marker}\n")
+
+    def test_find_marker_line_start(self) -> None:
+        marker = "__SERIALWRAP_END__x"
+        text = f"ok\nroot# echo {marker}\n{marker}\n# "
+        norm = serialwrap_lib._normalize_newlines(text)
+        end_pos = serialwrap_lib._find_marker_output_line_start(norm, marker)
+        self.assertIsNotNone(end_pos)
+        self.assertEqual(norm[:end_pos], "ok\nroot# echo __SERIALWRAP_END__x\n")
+
+        end_pos = serialwrap_lib._find_marker_line_start(norm, marker)
+        self.assertIsNotNone(end_pos)
+        self.assertEqual(norm[:end_pos], "ok\n")
 
     def test_strip_shell_noise(self) -> None:
         cmd = "echo true"

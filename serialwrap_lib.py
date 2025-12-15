@@ -527,9 +527,44 @@ def _normalize_newlines(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
-def _find_marker_line(text: str, marker: str) -> re.Match[str] | None:
-    pattern = rf"(?:^|\n){re.escape(marker)}\s*(?:\n|$)"
-    return re.search(pattern, text)
+def _find_marker_after_line(text: str, marker: str) -> int | None:
+    idx = text.find(marker)
+    if idx < 0:
+        return None
+    next_nl = text.find("\n", idx)
+    if next_nl < 0:
+        return len(text)
+    return next_nl + 1
+
+
+def _find_marker_line_start(text: str, marker: str) -> int | None:
+    idx = text.find(marker)
+    if idx < 0:
+        return None
+    line_start = text.rfind("\n", 0, idx)
+    return 0 if line_start < 0 else line_start + 1
+
+
+def _marker_line_pattern(marker: str) -> re.Pattern[str]:
+    return re.compile(rf"(?:^|\n){re.escape(marker)}\s*(?:\n|$)")
+
+
+def _find_marker_output_line_end(text: str, marker: str) -> int | None:
+    match = _marker_line_pattern(marker).search(text)
+    if match is None:
+        return None
+    return match.end()
+
+
+def _find_marker_output_line_start(text: str, marker: str) -> int | None:
+    match = _marker_line_pattern(marker).search(text)
+    if match is None:
+        return None
+    if match.start() == 0:
+        return 0
+    if text[match.start()] == "\n":
+        return match.start() + 1
+    return match.start()
 
 
 def _strip_shell_noise(text: str, *, cmd: str, begin_marker: str, end_marker: str) -> str:
@@ -610,9 +645,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     t0 = time.monotonic()
     try:
         if mode == "shell":
-            _send_line(tmux_target, f"echo {begin_marker}", clear_line=True)
-            _send_line(tmux_target, args.cmd, clear_line=True)
-            _send_line(tmux_target, f"echo {end_marker}", clear_line=True)
+            _send_line(tmux_target, f"echo {begin_marker}; {args.cmd}; echo {end_marker}", clear_line=True)
         else:
             _send_line(tmux_target, args.cmd, clear_line=False)
 
@@ -647,10 +680,10 @@ def cmd_run(args: argparse.Namespace) -> int:
                                 }
                             )
                             return 2
-                        begin_match = _find_marker_line(scan_buf, begin_marker)
-                        if begin_match is not None:
+                        begin_pos = _find_marker_output_line_end(scan_buf, begin_marker)
+                        if begin_pos is not None:
                             found_begin = True
-                            capture = scan_buf[begin_match.end() :]
+                            capture = scan_buf[begin_pos:]
                             scan_buf = ""
                     else:
                         capture += chunk
@@ -667,9 +700,9 @@ def cmd_run(args: argparse.Namespace) -> int:
                                 }
                             )
                             return 2
-                        end_match = _find_marker_line(capture, end_marker)
-                        if end_match is not None:
-                            content = capture[: end_match.start()]
+                        end_pos = _find_marker_output_line_start(capture, end_marker)
+                        if end_pos is not None:
+                            content = capture[:end_pos]
                             content = _strip_shell_noise(content, cmd=args.cmd, begin_marker=begin_marker, end_marker=end_marker)
                             stdout = _clean_output(content).strip("\n")
                             duration_ms = int((time.monotonic() - t0) * 1000)
