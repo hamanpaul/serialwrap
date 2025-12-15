@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime as _dt
+import fcntl
 import json
 import os
 import re
@@ -439,6 +440,36 @@ def _send_line(tmux_target: str, line: str) -> None:
         raise RuntimeError(proc.stderr.strip() or "tmux send-keys enter failed")
 
 
+class _LockTimeout(Exception):
+    pass
+
+
+def _com_lock_path(com: str) -> str:
+    return os.path.join(LOCKS_DIR, f"{com}.lock")
+
+
+def _acquire_com_lock(com: str, *, timeout_s: float) -> int:
+    _ensure_state_dirs()
+    fd = os.open(_com_lock_path(com), os.O_RDWR | os.O_CREAT, 0o600)
+    t0 = time.monotonic()
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.monotonic() - t0 >= timeout_s:
+                os.close(fd)
+                raise _LockTimeout()
+            time.sleep(0.05)
+
+
+def _release_com_lock(fd: int) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 def _cursor_from_file(path: str) -> dict[str, Any]:
     st = os.stat(path)
     return {"inode": st.st_ino, "offset": st.st_size}
@@ -458,6 +489,15 @@ def _detect_login_prompt(text: str) -> bool:
     if re.search(r"(?mi)^password:\s*$", text):
         return True
     return False
+
+
+def _normalize_newlines(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _find_marker_line(text: str, marker: str) -> re.Match[str] | None:
+    pattern = rf"(?:^|\n){re.escape(marker)}\s*(?:\n|$)"
+    return re.search(pattern, text)
 
 
 def _resolve_com_entry(registry: dict[str, Any], com: str, *, mode: str, prompt_regex: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
@@ -514,69 +554,147 @@ def cmd_run(args: argparse.Namespace) -> int:
     start_cursor = _cursor_from_file(log_path)
     start_offset = int(start_cursor["offset"])
 
+    lock_fd: int | None = None
+    try:
+        lock_fd = _acquire_com_lock(com, timeout_s=args.lock_timeout_s)
+    except _LockTimeout:
+        _print_json({"ok": False, "error_code": "LOCKED", "com": com})
+        return 2
+
     t0 = time.monotonic()
-    if mode == "shell":
-        _send_line(tmux_target, f"echo {begin_marker}")
-        _send_line(tmux_target, args.cmd)
-        _send_line(tmux_target, f"echo {end_marker}")
-    else:
-        _send_line(tmux_target, args.cmd)
+    try:
+        if mode == "shell":
+            _send_line(tmux_target, f"echo {begin_marker}")
+            _send_line(tmux_target, args.cmd)
+            _send_line(tmux_target, f"echo {end_marker}")
+        else:
+            _send_line(tmux_target, args.cmd)
 
-    deadline = time.monotonic() + args.timeout_s
-    buf = ""
-    offset = start_offset
-    found_begin = False
-    begin_pos = 0
+        deadline = time.monotonic() + args.timeout_s
+        scan_buf = ""
+        capture = ""
+        offset = start_offset
+        found_begin = False
+        last_data_at = time.monotonic()
+        prompt_seen_at: float | None = None
 
-    while time.monotonic() < deadline:
-        chunk, new_offset = _read_since(log_path, offset, max_bytes=args.poll_max_bytes)
-        if new_offset != offset:
-            offset = new_offset
-            buf += chunk
+        while time.monotonic() < deadline:
+            chunk, new_offset = _read_since(log_path, offset, max_bytes=args.poll_max_bytes)
+            if new_offset != offset:
+                offset = new_offset
+                last_data_at = time.monotonic()
+                chunk = _normalize_newlines(chunk)
 
-            if _detect_login_prompt(buf):
-                _print_json(
-                    {
-                        "ok": False,
-                        "error_code": "LOGIN_REQUIRED",
-                        "com": com,
-                        "tmux_target": tmux_target,
-                        "log_path": log_path,
-                    }
-                )
-                return 2
+                if mode == "shell":
+                    if not found_begin:
+                        scan_buf += chunk
+                        if len(scan_buf) > args.max_scan_chars:
+                            scan_buf = scan_buf[-args.max_scan_chars :]
+                        if _detect_login_prompt(scan_buf):
+                            _print_json(
+                                {
+                                    "ok": False,
+                                    "error_code": "LOGIN_REQUIRED",
+                                    "com": com,
+                                    "tmux_target": tmux_target,
+                                    "log_path": log_path,
+                                }
+                            )
+                            return 2
+                        begin_match = _find_marker_line(scan_buf, begin_marker)
+                        if begin_match is not None:
+                            found_begin = True
+                            capture = scan_buf[begin_match.end() :]
+                            scan_buf = ""
+                    else:
+                        capture += chunk
 
-            if mode == "shell":
-                if not found_begin:
-                    idx = buf.find(begin_marker)
-                    if idx != -1:
-                        found_begin = True
-                        begin_pos = idx + len(begin_marker)
-                if found_begin:
-                    idx_end = buf.find(end_marker, begin_pos)
-                    if idx_end != -1:
-                        content = buf[begin_pos:idx_end]
-                        stdout = _clean_output(content).strip("\n")
-                        duration_ms = int((time.monotonic() - t0) * 1000)
-                        entry["cursor"] = {"inode": start_cursor["inode"], "offset": offset}
-                        registry[com] = entry
-                        _write_registry(registry)
+                    if found_begin:
+                        if _detect_login_prompt(capture):
+                            _print_json(
+                                {
+                                    "ok": False,
+                                    "error_code": "LOGIN_REQUIRED",
+                                    "com": com,
+                                    "tmux_target": tmux_target,
+                                    "log_path": log_path,
+                                }
+                            )
+                            return 2
+                        end_match = _find_marker_line(capture, end_marker)
+                        if end_match is not None:
+                            content = capture[: end_match.start()]
+                            stdout = _clean_output(content).strip("\n")
+                            duration_ms = int((time.monotonic() - t0) * 1000)
+                            entry["cursor"] = {"inode": start_cursor["inode"], "offset": offset}
+                            registry[com] = entry
+                            _write_registry(registry)
+                            _print_json(
+                                {
+                                    "ok": True,
+                                    "com": com,
+                                    "stdout": stdout,
+                                    "log": log_path,
+                                    "start_offset": start_offset,
+                                    "end_offset": offset,
+                                    "duration_ms": duration_ms,
+                                    "partial": False,
+                                }
+                            )
+                            return 0
+                        if len(capture) > args.max_output_chars:
+                            stdout = _clean_output(capture[-args.max_output_chars :]).strip("\n")
+                            duration_ms = int((time.monotonic() - t0) * 1000)
+                            _print_json(
+                                {
+                                    "ok": False,
+                                    "error_code": "MAX_OUTPUT_EXCEEDED",
+                                    "com": com,
+                                    "stdout": stdout,
+                                    "log": log_path,
+                                    "start_offset": start_offset,
+                                    "end_offset": offset,
+                                    "duration_ms": duration_ms,
+                                    "partial": True,
+                                }
+                            )
+                            return 2
+                else:
+                    capture += chunk
+                    if _detect_login_prompt(capture):
                         _print_json(
                             {
-                                "ok": True,
+                                "ok": False,
+                                "error_code": "LOGIN_REQUIRED",
+                                "com": com,
+                                "tmux_target": tmux_target,
+                                "log_path": log_path,
+                            }
+                        )
+                        return 2
+                    if len(capture) > args.max_output_chars:
+                        stdout = _clean_output(capture[-args.max_output_chars :]).strip("\n")
+                        duration_ms = int((time.monotonic() - t0) * 1000)
+                        _print_json(
+                            {
+                                "ok": False,
+                                "error_code": "MAX_OUTPUT_EXCEEDED",
                                 "com": com,
                                 "stdout": stdout,
                                 "log": log_path,
                                 "start_offset": start_offset,
                                 "end_offset": offset,
                                 "duration_ms": duration_ms,
-                                "partial": False,
+                                "partial": True,
                             }
                         )
-                        return 0
-            else:
-                if re.search(prompt_regex, buf):
-                    stdout = _clean_output(buf).strip("\n")
+                        return 2
+                    if re.search(prompt_regex, capture):
+                        prompt_seen_at = time.monotonic()
+
+            if mode != "shell" and prompt_seen_at is not None:
+                if time.monotonic() - last_data_at >= args.idle_timeout_s:
+                    stdout = _clean_output(capture).strip("\n")
                     duration_ms = int((time.monotonic() - t0) * 1000)
                     entry["cursor"] = {"inode": start_cursor["inode"], "offset": offset}
                     registry[com] = entry
@@ -594,24 +712,28 @@ def cmd_run(args: argparse.Namespace) -> int:
                         }
                     )
                     return 0
-        time.sleep(args.poll_interval_s)
 
-    duration_ms = int((time.monotonic() - t0) * 1000)
-    stdout = _clean_output(buf).strip("\n")
-    _print_json(
-        {
-            "ok": False,
-            "error_code": "TIMEOUT",
-            "com": com,
-            "stdout": stdout,
-            "log": log_path,
-            "start_offset": start_offset,
-            "end_offset": offset,
-            "duration_ms": duration_ms,
-            "partial": True,
-        }
-    )
-    return 2
+            time.sleep(args.poll_interval_s)
+
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        stdout = _clean_output(capture or scan_buf).strip("\n")
+        _print_json(
+            {
+                "ok": False,
+                "error_code": "TIMEOUT",
+                "com": com,
+                "stdout": stdout,
+                "log": log_path,
+                "start_offset": start_offset,
+                "end_offset": offset,
+                "duration_ms": duration_ms,
+                "partial": True,
+            }
+        )
+        return 2
+    finally:
+        if lock_fd is not None:
+            _release_com_lock(lock_fd)
 
 
 def cmd_read(args: argparse.Namespace) -> int:
@@ -626,26 +748,37 @@ def cmd_read(args: argparse.Namespace) -> int:
         _print_json({"ok": False, "error_code": "REGISTRY_INVALID", "com": com})
         return 2
 
-    log_path = entry.get("log_path")
-    if not isinstance(log_path, str):
-        _print_json({"ok": False, "error_code": "REGISTRY_INVALID", "com": com})
+    lock_fd: int | None = None
+    try:
+        lock_fd = _acquire_com_lock(com, timeout_s=args.lock_timeout_s)
+    except _LockTimeout:
+        _print_json({"ok": False, "error_code": "LOCKED", "com": com})
         return 2
 
-    cursor = entry.get("cursor")
-    offset = 0
-    if isinstance(cursor, dict) and isinstance(cursor.get("offset"), int):
-        offset = int(cursor["offset"])
-    if not os.path.exists(log_path):
-        _print_json({"ok": False, "error_code": "LOG_NOT_FOUND", "com": com, "log_path": log_path})
-        return 2
+    try:
+        log_path = entry.get("log_path")
+        if not isinstance(log_path, str):
+            _print_json({"ok": False, "error_code": "REGISTRY_INVALID", "com": com})
+            return 2
 
-    text, new_offset = _read_since(log_path, offset, max_bytes=args.max_bytes)
-    stdout = _clean_output(text)
-    entry["cursor"] = {"inode": os.stat(log_path).st_ino, "offset": new_offset}
-    registry[com] = entry
-    _write_registry(registry)
-    _print_json({"ok": True, "com": com, "stdout": stdout, "log": log_path, "start_offset": offset, "end_offset": new_offset})
-    return 0
+        cursor = entry.get("cursor")
+        offset = 0
+        if isinstance(cursor, dict) and isinstance(cursor.get("offset"), int):
+            offset = int(cursor["offset"])
+        if not os.path.exists(log_path):
+            _print_json({"ok": False, "error_code": "LOG_NOT_FOUND", "com": com, "log_path": log_path})
+            return 2
+
+        text, new_offset = _read_since(log_path, offset, max_bytes=args.max_bytes)
+        stdout = _clean_output(text)
+        entry["cursor"] = {"inode": os.stat(log_path).st_ino, "offset": new_offset}
+        registry[com] = entry
+        _write_registry(registry)
+        _print_json({"ok": True, "com": com, "stdout": stdout, "log": log_path, "start_offset": offset, "end_offset": new_offset})
+        return 0
+    finally:
+        if lock_fd is not None:
+            _release_com_lock(lock_fd)
 
 
 def cmd_detach(args: argparse.Namespace) -> int:
@@ -682,13 +815,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("com")
     p_run.add_argument("--cmd", required=True)
     p_run.add_argument("--timeout", dest="timeout_s", type=float, default=5.0)
+    p_run.add_argument("--lock-timeout", dest="lock_timeout_s", type=float, default=2.0)
+    p_run.add_argument("--idle-timeout", dest="idle_timeout_s", type=float, default=0.3)
     p_run.add_argument("--poll-interval", dest="poll_interval_s", type=float, default=0.05)
     p_run.add_argument("--poll-max-bytes", dest="poll_max_bytes", type=int, default=65536)
+    p_run.add_argument("--max-scan-chars", dest="max_scan_chars", type=int, default=8192)
+    p_run.add_argument("--max-output-chars", dest="max_output_chars", type=int, default=262144)
     p_run.set_defaults(func=cmd_run)
 
     p_read = sub.add_parser("read", help="Read new log output since last cursor")
     p_read.add_argument("com")
     p_read.add_argument("--max-bytes", type=int, default=65536)
+    p_read.add_argument("--lock-timeout", dest="lock_timeout_s", type=float, default=2.0)
     p_read.set_defaults(func=cmd_read)
 
     p_detach = sub.add_parser("detach", help="Detach a COMx from registry")
