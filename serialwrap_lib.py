@@ -459,7 +459,11 @@ def _clean_output(text: str) -> str:
     return text
 
 
-def _send_line(tmux_target: str, line: str) -> None:
+def _send_line(tmux_target: str, line: str, *, clear_line: bool) -> None:
+    if clear_line:
+        proc = _run([TMUX_BIN, "send-keys", "-t", tmux_target, "C-u"])
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr.strip() or "tmux send-keys clear-line failed")
     proc = _run([TMUX_BIN, "send-keys", "-t", tmux_target, "-l", line])
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or "tmux send-keys failed")
@@ -528,6 +532,20 @@ def _find_marker_line(text: str, marker: str) -> re.Match[str] | None:
     return re.search(pattern, text)
 
 
+def _strip_shell_noise(text: str, *, cmd: str, begin_marker: str, end_marker: str) -> str:
+    lines = text.splitlines()
+    out: list[str] = []
+    removed_first_cmd_echo = False
+    for line in lines:
+        if begin_marker in line or end_marker in line:
+            continue
+        if not removed_first_cmd_echo and cmd and cmd in line:
+            removed_first_cmd_echo = True
+            continue
+        out.append(line)
+    return "\n".join(out) + ("\n" if text.endswith("\n") else "")
+
+
 def _resolve_com_entry(registry: dict[str, Any], com: str, *, mode: str, prompt_regex: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     entry = registry.get(com)
     if isinstance(entry, dict):
@@ -592,11 +610,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     t0 = time.monotonic()
     try:
         if mode == "shell":
-            _send_line(tmux_target, f"echo {begin_marker}")
-            _send_line(tmux_target, args.cmd)
-            _send_line(tmux_target, f"echo {end_marker}")
+            _send_line(tmux_target, f"echo {begin_marker}", clear_line=True)
+            _send_line(tmux_target, args.cmd, clear_line=True)
+            _send_line(tmux_target, f"echo {end_marker}", clear_line=True)
         else:
-            _send_line(tmux_target, args.cmd)
+            _send_line(tmux_target, args.cmd, clear_line=False)
 
         deadline = time.monotonic() + args.timeout_s
         scan_buf = ""
@@ -652,6 +670,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                         end_match = _find_marker_line(capture, end_marker)
                         if end_match is not None:
                             content = capture[: end_match.start()]
+                            content = _strip_shell_noise(content, cmd=args.cmd, begin_marker=begin_marker, end_marker=end_marker)
                             stdout = _clean_output(content).strip("\n")
                             duration_ms = int((time.monotonic() - t0) * 1000)
                             entry["cursor"] = {"inode": start_cursor["inode"], "offset": offset}

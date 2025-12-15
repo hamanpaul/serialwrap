@@ -29,6 +29,14 @@ class TestSerialwrapParsing(unittest.TestCase):
         self.assertIsNotNone(match)
         self.assertEqual(match.group(0).strip(), marker)
 
+    def test_strip_shell_noise(self) -> None:
+        cmd = "echo true"
+        begin_marker = "__SERIALWRAP_BEGIN__x"
+        end_marker = "__SERIALWRAP_END__x"
+        text = f"root# {cmd}\ntrue\nroot# echo {end_marker}\n"
+        stripped = serialwrap_lib._strip_shell_noise(text, cmd=cmd, begin_marker=begin_marker, end_marker=end_marker)
+        self.assertEqual(stripped, "true\n")
+
 
 if __name__ == "__main__":
     unittest.main()
