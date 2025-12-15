@@ -311,11 +311,7 @@ def cmd_attach_auto(args: argparse.Namespace) -> int:
             continue
         candidates[inst.com] = inst
 
-    if ambiguous:
-        payload = _make_multi_unregistered_error(instances)
-        _print_json(payload)
-        return 2
-
+    registered: list[str] = []
     for com, inst in sorted(candidates.items(), key=lambda x: x[0]):
         registry[com] = _registry_entry_for_instance(
             com,
@@ -323,8 +319,14 @@ def cmd_attach_auto(args: argparse.Namespace) -> int:
             mode=args.mode,
             prompt_regex=args.prompt_regex,
         )
+        registered.append(com)
     _write_registry(registry)
-    _print_json({"ok": True, "registered": sorted(candidates.keys())})
+    if ambiguous:
+        payload = _make_multi_unregistered_error(instances)
+        payload["registered"] = registered
+        _print_json(payload)
+        return 2
+    _print_json({"ok": True, "registered": registered})
     return 0
 
 
@@ -458,17 +460,39 @@ def _detect_login_prompt(text: str) -> bool:
     return False
 
 
+def _resolve_com_entry(registry: dict[str, Any], com: str, *, mode: str, prompt_regex: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    entry = registry.get(com)
+    if isinstance(entry, dict):
+        tmux_target = entry.get("tmux_target")
+        log_path = entry.get("log_path")
+        if isinstance(tmux_target, str) and isinstance(log_path, str) and os.path.exists(log_path):
+            return entry, None
+
+    instances = discover_minicom_instances()
+    matches = [inst for inst in instances if inst.com == com]
+    if len(matches) == 1 and matches[0].log_path:
+        new_entry = _registry_entry_for_instance(com, matches[0], mode=mode, prompt_regex=prompt_regex)
+        registry[com] = new_entry
+        _write_registry(registry)
+        return new_entry, None
+    if len(matches) == 0:
+        return None, {"ok": False, "error_code": "COM_NOT_FOUND", "com": com}
+
+    err = _make_multi_unregistered_error(matches)
+    err["com"] = com
+    return None, err
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     _ensure_state_dirs()
     registry = _load_registry()
     com = args.com
-    entry = registry.get(com)
-    if not isinstance(entry, dict):
-        instances = discover_minicom_instances()
-        if len(instances) >= 2:
-            _print_json(_make_multi_unregistered_error(instances))
-            return 2
-        _print_json({"ok": False, "error_code": "COM_NOT_REGISTERED", "com": com})
+    entry, err = _resolve_com_entry(registry, com, mode="shell", prompt_regex=r".*# $")
+    if err is not None:
+        _print_json(err)
+        return 2
+    if entry is None:
+        _print_json({"ok": False, "error_code": "REGISTRY_INVALID", "com": com})
         return 2
 
     tmux_target = entry.get("tmux_target")
@@ -594,9 +618,12 @@ def cmd_read(args: argparse.Namespace) -> int:
     _ensure_state_dirs()
     registry = _load_registry()
     com = args.com
-    entry = registry.get(com)
-    if not isinstance(entry, dict):
-        _print_json({"ok": False, "error_code": "COM_NOT_REGISTERED", "com": com})
+    entry, err = _resolve_com_entry(registry, com, mode="shell", prompt_regex=r".*# $")
+    if err is not None:
+        _print_json(err)
+        return 2
+    if entry is None:
+        _print_json({"ok": False, "error_code": "REGISTRY_INVALID", "com": com})
         return 2
 
     log_path = entry.get("log_path")
