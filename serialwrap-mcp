@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-from sw_core.cli import main
-
+from sw_mcp.server import main
 
 if __name__ == "__main__":
     raise SystemExit(main())

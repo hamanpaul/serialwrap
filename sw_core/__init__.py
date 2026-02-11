@@ -1,0 +1,1 @@
+"""serialwrap core package."""
