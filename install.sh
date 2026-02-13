@@ -30,6 +30,20 @@ cp -a "${SCRIPT_DIR}/profiles/." "${TARGET_DIR}/profiles/"
 cp -a "${SCRIPT_DIR}/tools/." "${TARGET_DIR}/tools/"
 cp -a "${SCRIPT_DIR}/docs/." "${TARGET_DIR}/docs/"
 
+DEFAULT_PROFILE_PATH="${TARGET_DIR}/profiles/default.yaml"
+DEFAULT_PLACEHOLDER_BY_ID="/dev/serial/by-id/target0"
+INSTALL_AUTOBIND="${SERIALWRAP_INSTALL_AUTOBIND:-1}"
+
+if [[ "${INSTALL_AUTOBIND}" == "1" && -f "${DEFAULT_PROFILE_PATH}" ]]; then
+  mapfile -t by_id_entries < <(compgen -G "/dev/serial/by-id/*" || true)
+  if /usr/bin/grep -Fq "${DEFAULT_PLACEHOLDER_BY_ID}" "${DEFAULT_PROFILE_PATH}" \
+    && [[ "${#by_id_entries[@]}" -eq 1 ]] \
+    && [[ -e "${by_id_entries[0]}" ]]; then
+    /usr/bin/sed -i "s#${DEFAULT_PLACEHOLDER_BY_ID}#${by_id_entries[0]}#g" "${DEFAULT_PROFILE_PATH}"
+    echo "[serialwrap] auto-bind default target to: ${by_id_entries[0]}"
+  fi
+fi
+
 cat <<MSG
 [serialwrap] install done
   target: ${TARGET_DIR}
