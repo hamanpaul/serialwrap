@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from typing import Any
 
 from .client import rpc_call
@@ -36,8 +37,25 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
         return subprocess.call(cmd)
 
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-    _print({"ok": True, "pid": proc.pid, "socket": args.socket})
-    return 0
+
+    # 等待 daemon 就緒（最多 3 秒）
+    for attempt in range(15):
+        time.sleep(0.2)
+        if proc.poll() is not None:
+            _print({"ok": False, "error_code": "DAEMON_EXITED", "pid": proc.pid, "returncode": proc.returncode})
+            return 2
+        resp = rpc_call(args.socket, "health.ping", {}, timeout_s=0.5)
+        if resp.get("ok"):
+            result: dict[str, Any] = {"ok": True, "pid": proc.pid, "socket": args.socket}
+            health = rpc_call(args.socket, "health.status", {}, timeout_s=1.0)
+            warnings = health.get("warnings")
+            if warnings:
+                result["warnings"] = warnings
+            _print(result)
+            return 0
+
+    _print({"ok": False, "error_code": "DAEMON_NOT_READY", "pid": proc.pid})
+    return 2
 
 
 def _run_daemon_stop(args: argparse.Namespace) -> int:

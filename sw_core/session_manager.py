@@ -324,11 +324,22 @@ class SessionManager:
                 self._on_detached(session.session_id)
                 return
 
-            session.bridge = bridge
-            session.vtty_path = bridge.vtty_path
-            session.state = "READY"
-            session.last_error = None
-            session.last_ready_at = now_iso()
+            # 持鎖重新驗證裝置是否仍存在，避免與 _detach_by_id 競態
+            with self._lock:
+                if by_id not in self._devices or session.state == "DETACHED":
+                    bridge.stop()
+                    session.state = "DETACHED"
+                    session.last_error = "DEVICE_REMOVED_DURING_ATTACH"
+                    session.detached_at = now_iso()
+                    session.bridge = None
+                    session.vtty_path = None
+                    return
+
+                session.bridge = bridge
+                session.vtty_path = bridge.vtty_path
+                session.state = "READY"
+                session.last_error = None
+                session.last_ready_at = now_iso()
             self._on_ready(session.session_id)
         except Exception as exc:
             try:

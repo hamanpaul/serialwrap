@@ -19,6 +19,7 @@ class SerialwrapService:
         self._lock = threading.RLock()
         self._running = False
         self._started_at: str | None = None
+        self._profile_count = len(profiles)
 
         self._arbiter = CommandArbiter(self._send_cb)
         self._sessions = SessionManager(profiles, self._wal, on_ready=self._on_ready, on_detached=self._on_detached)
@@ -59,16 +60,26 @@ class SerialwrapService:
 
     def health(self) -> dict[str, Any]:
         with self._lock:
-            return {
+            sessions = self._sessions.list_sessions()
+            devices = self._sessions.list_devices()
+            warnings: list[str] = []
+            if self._profile_count == 0:
+                warnings.append("no_profiles_loaded")
+            if not devices:
+                warnings.append("no_devices_found")
+            result: dict[str, Any] = {
                 "ok": True,
                 "pid": os.getpid(),
                 "running": self._running,
                 "started_at": self._started_at,
-                "sessions": len(self._sessions.list_sessions()),
-                "devices": len(self._sessions.list_devices()),
+                "sessions": len(sessions),
+                "devices": len(devices),
                 "wal_path": self._wal.wal_path,
                 "mirror_path": self._wal.mirror_path,
             }
+            if warnings:
+                result["warnings"] = warnings
+            return result
 
     def _resolve_session_id(self, selector: str) -> tuple[str | None, dict[str, Any] | None]:
         state = self._sessions.get_session_state(selector)
