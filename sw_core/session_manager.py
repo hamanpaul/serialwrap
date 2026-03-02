@@ -299,9 +299,26 @@ class SessionManager:
             self._on_detached(session.session_id)
 
     def _attach_by_id(self, by_id: str) -> None:
+        save_needed = False
         with self._lock:
             session = next((s for s in self._sessions.values() if s.profile.device_by_id == by_id), None)
+            # 無精確匹配 → 嘗試自動綁定到 act_no 最小、device_by_id 無效的 DETACHED session
+            if session is None:
+                candidates = sorted(
+                    [
+                        s for s in self._sessions.values()
+                        if s.state == "DETACHED" and s.profile.device_by_id not in self._devices
+                    ],
+                    key=lambda s: s.profile.act_no,
+                )
+                if candidates:
+                    session = candidates[0]
+                    session.profile = dataclasses.replace(session.profile, device_by_id=by_id)
+                    self._binding_overrides[session.session_id] = by_id
+                    save_needed = True
             dev = self._devices.get(by_id)
+        if save_needed:
+            self._save_state()
         if session is None or dev is None:
             return
         if session.bridge is not None:

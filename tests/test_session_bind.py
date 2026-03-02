@@ -57,6 +57,50 @@ class TestSessionBind(unittest.TestCase):
         self.assertFalse(resp["ok"])
         self.assertEqual(resp["error_code"], "DEVICE_NOT_FOUND")
 
+    def test_auto_bind_on_device_attach(self) -> None:
+        """裝置 by-id 不符合 profile 佔位符時，_attach_by_id 應自動綁定並更新 device_by_id。"""
+        from sw_core.device_watcher import DeviceInfo
+        import unittest.mock as mock
+
+        profiles = [self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/placeholder")]
+        ready_called: list[str] = []
+        mgr = SessionManager(
+            profiles,
+            WalWriter(wal_dir=self._tmp.name),
+            on_ready=lambda sid: ready_called.append(sid),
+            on_detached=lambda _sid: None,
+        )
+
+        real_by_id = "/dev/serial/by-id/usb-FTDI_REAL-if00"
+        real_device = DeviceInfo(by_id=real_by_id, real_path="/dev/ttyUSB0")
+        mgr.update_devices({real_by_id: real_device})
+
+        # update_devices 後，session 的 device_by_id 應已被自動綁定
+        # (attach 本身需要真實 serial port，這裡 mock UARTBridge + ensure_ready 跳過實體 attach)
+        with mock.patch("sw_core.session_manager.UARTBridge") as MockBridge, \
+             mock.patch("sw_core.session_manager.ensure_ready", return_value=(True, None)):
+            bridge_inst = MockBridge.return_value
+            bridge_inst.vtty_path = "/dev/pts/99"
+            bridge_inst.start.return_value = None
+
+            # 等 spawn_attach 執行緒完成
+            import time
+            for _ in range(50):
+                sessions = mgr.list_sessions()
+                if sessions and sessions[0]["state"] == "READY":
+                    break
+                time.sleep(0.05)
+
+        sessions = mgr.list_sessions()
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0]["device_by_id"], real_by_id)
+        self.assertEqual(sessions[0]["state"], "READY")
+
+        # binding 應已寫入 state.json
+        import json
+        state = json.loads(Path(sm_mod.STATE_PATH).read_text())
+        self.assertEqual(state["bindings"]["p:COM0"], real_by_id)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -116,8 +116,20 @@ targets:
     com: COM0
     alias: default+1
     profile: prpl-template
-    device_by_id: /dev/serial/by-id/target0
+    device_by_id: /dev/serial/by-id/target0   # 佔位符，見下方「裝置自動綁定」說明
 ```
+
+> **裝置自動綁定（Auto-Bind）**
+>
+> `device_by_id` 填寫佔位符（如 `target0`）或留空時不需手動修改。  
+> daemon 啟動後，只要 `/dev/serial/by-id/` 下出現尚未被任何 session 佔用的裝置，
+> 就會自動選取 `act_no` 最小的 DETACHED session 進行綁定，並寫入 `/tmp/serialwrap/state.json` 持久化。
+> 下次重啟 daemon 時直接沿用已綁定的路徑，無需重複設定。
+>
+> 手動修正綁定：
+> ```bash
+> serialwrap session bind --selector COM0 --device-by-id /dev/serial/by-id/<target-by-id>
+> ```
 
 ## 安裝
 
@@ -189,13 +201,31 @@ serialwrap-mcp --tool serialwrap_submit_command \
 
 ### minicom 互動
 
+minicom_router.sh（`alias minicom="$INSTALL_DIR/minicom_router.sh"` 設好後直接輸入 `minicom`）會：
+
+1. **自動啟動 daemon**（若 daemon 未執行）
+2. **自動偵測並綁定裝置**（WSL `usbipd attach` 後直接可用，無需手動設定 `device_by_id`）
+3. **等待 session 進入 READY** 後以 minicom 連上 broker PTY
+
 ```bash
-# 自動選 READY session 的 broker PTY
+# 直接叫起（自動選第一個 READY session）
 minicom
 
 # 指定 session/com/alias
-minicom_router.sh COM0
+minicom COM0
+minicom_router.sh default+1
 ```
+
+相關環境變數（可在 shell 設定覆蓋預設值）：
+
+| 變數 | 預設值 | 說明 |
+|------|--------|------|
+| `SERIALWRAP_AUTO_START_DAEMON` | `1` | `1` = 自動啟動 daemon |
+| `SERIALWRAP_ATTACH_WHEN_NOT_READY` | `1` | `1` = session 非 READY 時嘗試 attach |
+| `SERIALWRAP_ATTACH_WAIT_TICKS` | `60` | 等待 READY 的輪詢次數（× 0.2 秒 = 12 秒） |
+| `SERIALWRAP_PREFERRED_COM` | `COM0` | 無 selector 時優先選用的 COM slot |
+| `MINICOM_AUTO_CAPTURE` | `1` | `1` = 自動存 capture log 至 `$BLOG_DIR` |
+| `BLOG_DIR` | `~/arc_prj/b-log` | capture log 目錄（`$BUILD_LOG_PATH` 優先） |
 
 ## 測試
 
