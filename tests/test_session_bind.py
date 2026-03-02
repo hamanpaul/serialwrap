@@ -101,6 +101,63 @@ class TestSessionBind(unittest.TestCase):
         state = json.loads(Path(sm_mod.STATE_PATH).read_text())
         self.assertEqual(state["bindings"]["p:COM0"], real_by_id)
 
+    def test_multi_device_auto_bind_order(self) -> None:
+        """兩顆裝置依序到來時，應按 act_no 升序分配給 COM0、COM1。"""
+        from sw_core.device_watcher import DeviceInfo
+        import unittest.mock as mock
+        import time
+
+        profiles = [
+            self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/placeholder0"),
+            SessionProfile(
+                profile_name="p",
+                com="COM1",
+                act_no=2,
+                alias="lab+2",
+                device_by_id="/dev/serial/by-id/placeholder1",
+                platform="prpl",
+                uart=UartProfile(),
+            ),
+        ]
+        mgr = SessionManager(
+            profiles,
+            WalWriter(wal_dir=self._tmp.name),
+            on_ready=lambda _sid: None,
+            on_detached=lambda _sid: None,
+        )
+
+        dev0_by_id = "/dev/serial/by-id/usb-FTDI_AAA-if00"
+        dev1_by_id = "/dev/serial/by-id/usb-FTDI_BBB-if00"
+
+        with mock.patch("sw_core.session_manager.UARTBridge") as MockBridge, \
+             mock.patch("sw_core.session_manager.ensure_ready", return_value=(True, None)):
+            MockBridge.return_value.vtty_path = "/dev/pts/10"
+            MockBridge.return_value.start.return_value = None
+
+            # 兩顆裝置同時出現
+            mgr.update_devices({
+                dev0_by_id: DeviceInfo(by_id=dev0_by_id, real_path="/dev/ttyUSB0"),
+                dev1_by_id: DeviceInfo(by_id=dev1_by_id, real_path="/dev/ttyUSB1"),
+            })
+
+            for _ in range(80):
+                sessions = mgr.list_sessions()
+                ready = [s for s in sessions if s["state"] == "READY"]
+                if len(ready) == 2:
+                    break
+                time.sleep(0.05)
+
+        sessions = sorted(mgr.list_sessions(), key=lambda s: s["act_no"])
+        self.assertEqual(len(sessions), 2)
+        # 每個 session 都被綁定到某個真實裝置（非佔位符）
+        bound = {s["device_by_id"] for s in sessions}
+        self.assertEqual(bound, {dev0_by_id, dev1_by_id})
+        # COM0 (act_no=1) 應拿到字母序較小的裝置（sorted auto-bind 依 act_no 排序）
+        self.assertEqual(sessions[0]["com"], "COM0")
+        self.assertEqual(sessions[1]["com"], "COM1")
+        self.assertEqual(sessions[0]["state"], "READY")
+        self.assertEqual(sessions[1]["state"], "READY")
+
 
 if __name__ == "__main__":
     unittest.main()

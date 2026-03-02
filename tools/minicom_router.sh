@@ -28,6 +28,31 @@ if [[ $# -gt 0 && "${1}" != -* ]]; then
   shift
 fi
 
+# 從剩餘參數中抽出 -D（使用者指定的裝置路徑），避免與 router 選取的 vtty 重複傳入 minicom
+user_device=""
+if [[ $# -gt 0 ]]; then
+  _args_copy=("$@")
+  _kept=()
+  _i=0
+  while [[ $_i -lt ${#_args_copy[@]} ]]; do
+    if [[ "${_args_copy[$_i]}" == "-D" && $((_i+1)) -lt ${#_args_copy[@]} ]]; then
+      user_device="${_args_copy[$((_i+1))]}"
+      ((_i+=2))
+    elif [[ "${_args_copy[$_i]}" == -D?* ]]; then
+      user_device="${_args_copy[$_i]#-D}"
+      ((_i+=1))
+    else
+      _kept+=("${_args_copy[$_i]}")
+      ((_i+=1))
+    fi
+  done
+  if [[ ${#_kept[@]} -gt 0 ]]; then
+    set -- "${_kept[@]}"
+  else
+    set --
+  fi
+fi
+
 _get_sessions_json() {
   "${SERIALWRAP_BIN}" --socket "${SOCKET}" session list 2>/dev/null || true
 }
@@ -46,6 +71,12 @@ _find_row_by_selector() {
 _find_first_ready_row() {
   local obj="$1"
   printf '%s' "${obj}" | jq -c '.sessions[]? | select(.state=="READY" and (.vtty // "") != "")' | head -n 1
+}
+
+_find_row_by_vtty() {
+  local obj="$1"
+  local vtty="$2"
+  printf '%s' "${obj}" | jq -c --arg v "${vtty}" '.sessions[]? | select(.vtty==$v)' | head -n 1
 }
 
 _find_attach_selector_default() {
@@ -156,6 +187,18 @@ if [[ -z "${state_json}" ]] || ! _json_ok "${state_json}"; then
 fi
 
 if _json_ok "${state_json}"; then
+  # user_device 為 /dev/pts/X → 以 vtty 直接查找對應 session
+  if [[ -n "${user_device}" && "${user_device}" == /dev/pts/* ]]; then
+    session_row="$(_find_row_by_vtty "${state_json}" "${user_device}")"
+    if _try_exec_row "${session_row}" "$@"; then
+      exit 0
+    fi
+    # 找到 session 但尚未 READY → 改以 com 作為 selector 走後續 attach 流程
+    if [[ -n "${session_row}" && -z "${selector}" ]]; then
+      selector="$(printf '%s' "${session_row}" | jq -r '.com // ""')"
+    fi
+  fi
+
   if [[ -n "${selector}" ]]; then
     session_row="$(_find_row_by_selector "${state_json}" "${selector}")"
     if _try_exec_row "${session_row}" "$@"; then
@@ -176,6 +219,10 @@ if _json_ok "${state_json}"; then
       fi
     fi
   fi
+fi
+
+if [[ -n "${user_device:-}" ]]; then
+  _exec_minicom "${user_device}" "DIRECT" "$@"
 fi
 
 if [[ -n "${MINICOM_RAW_DEVICE:-}" ]]; then
