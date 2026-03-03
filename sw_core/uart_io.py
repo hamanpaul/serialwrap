@@ -197,7 +197,8 @@ class UARTBridge:
                 else:
                     self.wal.append(com=self.com, direction="TX", source="human", payload=data)
                     try:
-                        self._write_all(serial_fd, data)
+                        with self._write_lock:
+                            self._write_all(serial_fd, data)
                     except OSError:
                         self._stop_event.set()
                         break
