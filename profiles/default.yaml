@@ -19,3 +19,18 @@ targets:
     alias: default+1
     profile: prpl-template
     device_by_id: /dev/serial/by-id/target0
+  - act_no: 2
+    com: COM1
+    alias: default+2
+    profile: prpl-template
+    device_by_id: /dev/serial/by-id/target1
+  - act_no: 3
+    com: COM2
+    alias: default+3
+    profile: prpl-template
+    device_by_id: /dev/serial/by-id/target2
+  - act_no: 4
+    com: COM3
+    alias: default+4
+    profile: prpl-template
+    device_by_id: /dev/serial/by-id/target3

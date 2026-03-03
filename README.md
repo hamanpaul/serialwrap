@@ -116,8 +116,38 @@ targets:
     com: COM0
     alias: default+1
     profile: prpl-template
-    device_by_id: /dev/serial/by-id/target0
+    device_by_id: /dev/serial/by-id/target0   # 佔位符，見下方「裝置自動綁定」說明
+  - act_no: 2
+    com: COM1
+    alias: default+2
+    profile: prpl-template
+    device_by_id: /dev/serial/by-id/target1
+  - act_no: 3
+    com: COM2
+    alias: default+3
+    profile: prpl-template
+    device_by_id: /dev/serial/by-id/target2
+  - act_no: 4
+    com: COM3
+    alias: default+4
+    profile: prpl-template
+    device_by_id: /dev/serial/by-id/target3
 ```
+
+> **多裝置自動綁定（Auto-Bind）**
+>
+> `device_by_id` 填寫佔位符（如 `target0`）或留空時不需手動修改。  
+> daemon 啟動後，`/dev/serial/by-id/` 下出現尚未被任何 session 占用的裝置時，
+> 自動依 **`act_no` 升序**選取第一個有效 DETACHED session 進行綁定，並持久化至
+> `/tmp/serialwrap/state.json`。daemon 重啟後沿用已綁定的路徑，無需重複設定。
+>
+> - 插入第 1 顆 UART → 自動綁定到 COM0
+> - 插入第 2 顆 UART → 自動綁定到 COM1，以此類推（最多 COM3）
+>
+> 手動修正綁定：
+> ```bash
+> serialwrap session bind --selector COM0 --device-by-id /dev/serial/by-id/<target-by-id>
+> ```
 
 ## 安裝
 
@@ -189,13 +219,37 @@ serialwrap-mcp --tool serialwrap_submit_command \
 
 ### minicom 互動
 
+minicom_router.sh（`alias minicom="$INSTALL_DIR/minicom_router.sh"` 設好後直接輸入 `minicom`）會：
+
+1. **自動啟動 daemon**（若 daemon 未執行）
+2. **自動偵測並綁定裝置**（WSL `usbipd attach` 後直接可用，無需手動設定 `device_by_id`）
+3. **等待 session 進入 READY** 後以 minicom 連上 broker PTY
+
 ```bash
-# 自動選 READY session 的 broker PTY
+# 自動選第一個 READY session（COM0 優先）
 minicom
 
-# 指定 session/com/alias
-minicom_router.sh COM0
+# 指定 COM slot 或 alias
+minicom COM1
+minicom default+2
+
+# 指定 PTY 路徑（適合已知 vtty 的場景）
+minicom -D /dev/pts/5
+
+# 若 PTY 不屬於任何 broker session，直接透傳給 minicom
+minicom -D /dev/ttyUSB0
 ```
+
+相關環境變數（可在 shell 設定覆蓋預設值）：
+
+| 變數 | 預設值 | 說明 |
+|------|--------|------|
+| `SERIALWRAP_AUTO_START_DAEMON` | `1` | `1` = 自動啟動 daemon |
+| `SERIALWRAP_ATTACH_WHEN_NOT_READY` | `1` | `1` = session 非 READY 時嘗試 attach |
+| `SERIALWRAP_ATTACH_WAIT_TICKS` | `60` | 等待 READY 的輪詢次數（× 0.2 秒 = 12 秒） |
+| `SERIALWRAP_PREFERRED_COM` | `COM0` | 無 selector 時優先選用的 COM slot |
+| `MINICOM_AUTO_CAPTURE` | `1` | `1` = 自動存 capture log 至 `$BLOG_DIR` |
+| `BLOG_DIR` | `~/arc_prj/b-log` | capture log 目錄（`$BUILD_LOG_PATH` 優先） |
 
 ## 測試
 
