@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import fcntl
 import os
+import queue
 import re
 import select
 import termios
@@ -42,6 +43,8 @@ class UARTBridge:
         self._rx_lock = threading.Lock()
         self._rx_text = ""
         self._rx_max_chars = 65536
+        self._agent_active = threading.Event()
+        self._human_tx_queue: queue.Queue[bytes] = queue.Queue()
 
     @property
     def vtty_path(self) -> str | None:
@@ -196,12 +199,16 @@ class UARTBridge:
                         pass
                 else:
                     self.wal.append(com=self.com, direction="TX", source="human", payload=data)
-                    try:
-                        with self._write_lock:
-                            self._write_all(serial_fd, data)
-                    except OSError:
-                        self._stop_event.set()
-                        break
+                    if self._agent_active.is_set():
+                        # Agent 執行中：暫存於佇列，end_agent_cmd() 結束後排程送出
+                        self._human_tx_queue.put(data)
+                    else:
+                        try:
+                            with self._write_lock:
+                                self._write_all(serial_fd, data)
+                        except OSError:
+                            self._stop_event.set()
+                            break
 
     def send_command(self, cmd: str, *, source: str, cmd_id: str | None = None) -> None:
         if self._serial_fd is None:
@@ -236,6 +243,44 @@ class UARTBridge:
                 return True
             time.sleep(0.05)
         return False
+
+    def rx_snapshot_len(self) -> int:
+        """回傳目前 _rx_text 的長度，供 wait_for_regex_from 使用。"""
+        with self._rx_lock:
+            return len(self._rx_text)
+
+    def wait_for_regex_from(self, pattern: str, from_offset: int, timeout_s: float) -> bool:
+        """只搜尋 _rx_text[from_offset:] 的新 RX，避免舊輸出誤觸 prompt 判斷。"""
+        deadline = time.monotonic() + timeout_s
+        regex = re.compile(pattern)
+        while time.monotonic() < deadline:
+            with self._rx_lock:
+                snapshot = self._rx_text[from_offset:]
+            if regex.search(snapshot):
+                return True
+            time.sleep(0.05)
+        return False
+
+    def begin_agent_cmd(self) -> None:
+        """Agent 命令開始：後續 minicom TX 暫存於佇列，不立即送到 serial。"""
+        self._agent_active.set()
+
+    def end_agent_cmd(self) -> None:
+        """Agent 命令結束：清除 flag，將暫存的 minicom TX 依序送到 serial。"""
+        self._agent_active.clear()
+        serial_fd = self._serial_fd
+        while True:
+            try:
+                data = self._human_tx_queue.get_nowait()
+            except queue.Empty:
+                break
+            if serial_fd is None:
+                continue  # bridge 已停止，丟棄
+            try:
+                with self._write_lock:
+                    self._write_all(serial_fd, data)
+            except OSError:
+                break
 
     def snapshot(self) -> dict[str, Any]:
         return {

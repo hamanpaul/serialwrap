@@ -378,6 +378,23 @@ class SessionManager:
             bridge = session.bridge
         bridge.send_command(command, source=source, cmd_id=cmd_id)
 
+    def execute_command(self, session_id: str, command: str, source: str, cmd_id: str, *, timeout_s: float = 10.0) -> None:
+        """送出命令並等待 target prompt 回應，期間暫緩 minicom TX（結束後排程送出）。"""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None or session.bridge is None or session.state != "READY":
+                raise RuntimeError("SESSION_NOT_READY")
+            bridge = session.bridge
+            prompt_regex = session.profile.prompt_regex
+        bridge.begin_agent_cmd()
+        pre_offset = bridge.rx_snapshot_len()
+        try:
+            bridge.send_command(command, source=source, cmd_id=cmd_id)
+            if not bridge.wait_for_regex_from(prompt_regex, pre_offset, timeout_s):
+                raise RuntimeError("PROMPT_TIMEOUT")
+        finally:
+            bridge.end_agent_cmd()
+
     def get_session_state(self, selector: str) -> dict[str, Any]:
         session = self.get_session(selector)
         if session is None:

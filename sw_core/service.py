@@ -31,8 +31,8 @@ class SerialwrapService:
     def _on_detached(self, session_id: str) -> None:
         self._arbiter.unregister_session(session_id)
 
-    def _send_cb(self, session_id: str, command: str, source: str, cmd_id: str) -> None:
-        self._sessions.send_command(session_id, command, source, cmd_id)
+    def _send_cb(self, session_id: str, command: str, source: str, cmd_id: str, timeout_s: float) -> None:
+        self._sessions.execute_command(session_id, command, source, cmd_id, timeout_s=timeout_s)
 
     def _on_device_change(self, _added, _removed) -> None:
         self._sessions.update_devices(self._watcher.devices)

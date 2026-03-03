@@ -22,7 +22,7 @@ class _QueuedCommand:
 
 
 class CommandArbiter:
-    def __init__(self, send_cb: Callable[[str, str, str, str], None]) -> None:
+    def __init__(self, send_cb: Callable[[str, str, str, str, float], None]) -> None:
         self._send_cb = send_cb
         self._lock = threading.Lock()
         self._queues: dict[str, queue.PriorityQueue[_QueuedCommand]] = {}
@@ -136,7 +136,7 @@ class CommandArbiter:
                 rec["started_at"] = now_iso()
 
             try:
-                self._send_cb(session_id, item.command, item.source, item.cmd_id)
+                self._send_cb(session_id, item.command, item.source, item.cmd_id, item.timeout_s)
             except Exception:
                 with self._lock:
                     rec = self._commands.get(item.cmd_id)
