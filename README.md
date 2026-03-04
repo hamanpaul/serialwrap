@@ -249,7 +249,7 @@ minicom -D /dev/ttyUSB0
 | `SERIALWRAP_ATTACH_WAIT_TICKS` | `60` | 等待 READY 的輪詢次數（× 0.2 秒 = 12 秒） |
 | `SERIALWRAP_PREFERRED_COM` | `COM0` | 無 selector 時優先選用的 COM slot |
 | `MINICOM_AUTO_CAPTURE` | `1` | `1` = 自動存 capture log 至 `$BLOG_DIR` |
-| `BLOG_DIR` | `~/arc_prj/b-log` | capture log 目錄（`$BUILD_LOG_PATH` 優先） |
+| `BLOG_DIR` | `~/b-log` | capture log 目錄（`$BUILD_LOG_PATH` 優先） |
 
 ## 測試
 

@@ -19,7 +19,7 @@ STATE_DIR = "/tmp/serialwrap"
 LOCKS_DIR = "/tmp/serialwrap/locks"
 REGISTRY_PATH = "/tmp/serialwrap/registry.json"
 
-B_LOG_DIR = "/home/paul_chen/arc_prj/b-log"
+B_LOG_DIR = "/home/paul_chen/b-log"
 
 TMUX_BIN = "/usr/bin/tmux"
 PS_BIN = "/usr/bin/ps"
