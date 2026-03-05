@@ -120,7 +120,7 @@ target:
 ## 10. hotplug 行為
 - 拔除：session -> `DETACHED`，不重試。
 - 插入：同 by-id -> 自動掛回。
-- 提供 `session clear` 清除失連 session。
+- 提供 `session clear --selector <session_id|COMx|alias>` 重置 runtime 狀態並保留原綁定（可再次 attach）。
 
 ## 11. minicom 相容
 - broker 提供 `vtty-*`。

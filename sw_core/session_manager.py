@@ -151,18 +151,34 @@ class SessionManager:
             return {"ok": False, "error_code": "ALIAS_NOT_FOUND", "alias": alias}
         return {"ok": True, "alias": alias}
 
-    def clear_session(self, session_id: str) -> dict[str, Any]:
+    def clear_session(self, selector: str) -> dict[str, Any]:
+        """Clear runtime state but keep session registration/binding."""
         with self._lock:
-            session = self._sessions.pop(session_id, None)
-        if session is None:
-            return {"ok": False, "error_code": "SESSION_NOT_FOUND", "session_id": session_id}
-        if session.bridge is not None:
-            session.bridge.stop()
-            self._on_detached(session_id)
-        with self._lock:
-            self._binding_overrides.pop(session_id, None)
+            session = self.get_session(selector)
+            if session is None:
+                return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+
+            if session.bridge is not None:
+                session.bridge.stop()
+                session.bridge = None
+                self._on_detached(session.session_id)
+
+            session.vtty_path = None
+            session.detached_at = now_iso()
+
+            by_id = session.profile.device_by_id
+            has_device = bool(by_id and by_id in self._devices)
+            if has_device:
+                session.state = "ATTACHING"
+                session.last_error = None
+            else:
+                session.state = "DETACHED"
+                session.last_error = "CLEARED"
+
         self._save_state()
-        return {"ok": True, "cleared": session_id}
+        if has_device and by_id is not None:
+            self._spawn_attach(by_id)
+        return {"ok": True, "session": session.to_public_dict()}
 
     def bind_session(self, selector: str, device_by_id: str) -> dict[str, Any]:
         device_by_id = device_by_id.strip()
@@ -392,8 +408,21 @@ class SessionManager:
             bridge.send_command(command, source=source, cmd_id=cmd_id)
             if not bridge.wait_for_regex_from(prompt_regex, pre_offset, timeout_s):
                 raise RuntimeError("PROMPT_TIMEOUT")
+        except Exception:
+            self._recover_prompt_after_failure(bridge, prompt_regex)
+            raise
         finally:
             bridge.end_agent_cmd()
+
+    @staticmethod
+    def _recover_prompt_after_failure(bridge: UARTBridge, prompt_regex: str) -> None:
+        """Best-effort recovery to avoid leaving shell at continuation prompt."""
+        try:
+            offset = bridge.rx_snapshot_len()
+            bridge.send_command("\x03", source="agent:recover", cmd_id=None)
+            bridge.wait_for_regex_from(prompt_regex, offset, timeout_s=2.0)
+        except Exception:
+            pass
 
     def get_session_state(self, selector: str) -> dict[str, Any]:
         session = self.get_session(selector)

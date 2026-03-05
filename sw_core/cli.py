@@ -97,7 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
     sess_sub = p_session.add_subparsers(dest="session_cmd", required=True)
     sess_sub.add_parser("list")
     p_sc = sess_sub.add_parser("clear")
-    p_sc.add_argument("--session-id", required=True)
+    p_sc.add_argument("--selector", required=True, help="session_id | COMx | alias")
     p_sb = sess_sub.add_parser("bind")
     p_sb.add_argument("--selector", required=True, help="session_id | COMx | alias")
     p_sb.add_argument("--device-by-id", required=True)
@@ -181,7 +181,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.session_cmd == "list":
             return _run_rpc(args, "session.list", {})
         if args.session_cmd == "clear":
-            return _run_rpc(args, "session.clear", {"session_id": args.session_id})
+            return _run_rpc(args, "session.clear", {"selector": args.selector})
         if args.session_cmd == "bind":
             return _run_rpc(args, "session.bind", {"selector": args.selector, "device_by_id": args.device_by_id})
         if args.session_cmd == "attach":

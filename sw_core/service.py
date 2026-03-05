@@ -9,7 +9,7 @@ from .config import SessionProfile
 from .constants import DEVICE_BY_ID_DIR
 from .device_watcher import DeviceWatcher
 from .session_manager import SessionManager
-from .util import now_iso
+from .util import now_iso, shell_command_incomplete_reason
 from .wal import WalWriter
 
 
@@ -107,8 +107,16 @@ class SerialwrapService:
             return self._sessions.get_session_state(selector)
 
         if method == "session.clear":
-            session_id = str(params.get("session_id") or "")
-            return self._sessions.clear_session(session_id)
+            selector = str(
+                params.get("selector")
+                or params.get("session_id")
+                or params.get("com")
+                or params.get("alias")
+                or ""
+            )
+            if not selector:
+                return {"ok": False, "error_code": "INVALID_ARGS"}
+            return self._sessions.clear_session(selector)
 
         if method == "session.bind":
             selector = str(params.get("selector") or params.get("session_id") or params.get("com") or params.get("alias") or "")
@@ -152,6 +160,13 @@ class SerialwrapService:
             priority = int(params.get("priority") or 10)
             if not selector or not cmd:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
+            incomplete_reason = shell_command_incomplete_reason(cmd)
+            if incomplete_reason is not None:
+                return {
+                    "ok": False,
+                    "error_code": "CMD_INCOMPLETE",
+                    "reason": incomplete_reason,
+                }
             session_id, err = self._resolve_session_id(selector)
             if err is not None:
                 return err
