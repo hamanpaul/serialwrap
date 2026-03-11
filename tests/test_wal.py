@@ -19,7 +19,7 @@ class TestWal(unittest.TestCase):
 
             lines = wal.tail_text(from_seq=0, com="COM0", limit=10)
             self.assertEqual(len(lines), 1)
-            self.assertIn("COM0", lines[0])
+            self.assertEqual(lines[0], "echo hi")
             self.assertTrue(Path(td, "raw.mirror.log").exists())
 
 

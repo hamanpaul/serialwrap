@@ -69,6 +69,37 @@ class TestConfigProfiles(unittest.TestCase):
             self.assertEqual(rows[0].device_by_id, "/dev/serial/by-id/tty0")
             self.assertEqual(rows[1].device_by_id, "/dev/serial/by-id/tty1")
 
+    def test_shell_profile_loads_short_env_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "shell.yaml"
+            p.write_text(
+                textwrap.dedent(
+                    """
+                    profiles:
+                      opi-shell:
+                        platform: shell
+                        prompt_regex: ".*[$#] $"
+                        user_env: "SW_OPI_U"
+                        pass_env: "SW_OPI_P"
+                        ready_probe: "echo __READY__${nonce}"
+                    targets:
+                      - act_no: 3
+                        com: COM2
+                        alias: shell+3
+                        profile: opi-shell
+                        device_by_id: /dev/serial/by-id/tty2
+                    """
+                ),
+                encoding="utf-8",
+            )
+            rows = load_profiles(td)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].profile_name, "opi-shell")
+            self.assertEqual(rows[0].platform, "shell")
+            self.assertEqual(rows[0].user_env, "SW_OPI_U")
+            self.assertEqual(rows[0].pass_env, "SW_OPI_P")
+            self.assertEqual(rows[0].ready_probe, "echo __READY__${nonce}")
+
 
 if __name__ == "__main__":
     unittest.main()

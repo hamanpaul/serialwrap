@@ -10,13 +10,26 @@ from sw_core.client import rpc_call
 from sw_core.constants import SOCKET_PATH
 
 _TOOL_MAP = {
-    "serialwrap_submit_command": "command.submit",
-    "serialwrap_tail_results": "result.tail",
-    "serialwrap_get_session_state": "session.get_state",
-    "serialwrap_list_devices": "device.list",
-    "serialwrap_list_sessions": "session.list",
     "serialwrap_clear_session": "session.clear",
     "serialwrap_get_health": "health.status",
+    "serialwrap_get_command": "command.get",
+    "serialwrap_get_session_state": "session.get_state",
+    "serialwrap_bind_session": "session.bind",
+    "serialwrap_attach_session": "session.attach",
+    "serialwrap_self_test": "session.self_test",
+    "serialwrap_recover_session": "session.recover",
+    "serialwrap_list_devices": "device.list",
+    "serialwrap_list_sessions": "session.list",
+    "serialwrap_submit_command": "command.submit",
+    "serialwrap_tail_command_result": "command.result_tail",
+    "serialwrap_tail_results": "result.tail",
+    "serialwrap_attach_console": "session.console_attach",
+    "serialwrap_detach_console": "session.console_detach",
+    "serialwrap_list_consoles": "session.console_list",
+    "serialwrap_open_interactive": "session.interactive_open",
+    "serialwrap_send_interactive_keys": "session.interactive_send",
+    "serialwrap_get_interactive_status": "session.interactive_status",
+    "serialwrap_close_interactive": "session.interactive_close",
 }
 
 

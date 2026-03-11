@@ -31,6 +31,11 @@ class WalWriter:
     def mirror_path(self) -> str:
         return self._mirror_path
 
+    @property
+    def current_seq(self) -> int:
+        with self._lock:
+            return self._seq
+
     def _load_last_seq(self) -> None:
         if not os.path.exists(self._wal_path):
             self._seq = 0
@@ -94,13 +99,8 @@ class WalWriter:
             with open(self._wal_path, "a", encoding="utf-8") as wal_fp:
                 wal_fp.write(dumps_stable(record))
                 wal_fp.write("\n")
-            mirror = (
-                f"{record['wall_ts']} {record['mono_ts_ns']} {record['seq']} {com} {direction} {source} "
-                f"{cmd_id or '-'} {record['len']} {record['crc32']} | {to_printable(payload)}"
-            )
             with open(self._mirror_path, "a", encoding="utf-8") as mirror_fp:
-                mirror_fp.write(mirror)
-                mirror_fp.write("\n")
+                mirror_fp.write(to_printable(payload))
         return record
 
     def tail_raw(self, *, from_seq: int = 0, com: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
@@ -130,12 +130,19 @@ class WalWriter:
 
     def tail_text(self, *, from_seq: int = 0, com: str | None = None, limit: int = 200) -> list[str]:
         rows = self.tail_raw(from_seq=from_seq, com=com, limit=limit)
-        out: list[str] = []
+        chunks: list[str] = []
         for row in rows:
             payload = base64.b64decode(row.get("payload_b64", ""), validate=False)
-            out.append(
-                f"{row.get('wall_ts')} {row.get('mono_ts_ns')} {row.get('seq')} {row.get('com')} "
-                f"{row.get('dir')} {row.get('source')} {row.get('cmd_id') or '-'} {row.get('len')} "
-                f"{row.get('crc32')} | {to_printable(payload)}"
-            )
-        return out
+            chunks.append(to_printable(payload))
+        text = "".join(chunks)
+        if not text:
+            return []
+        lines = text.splitlines()
+        if text.endswith("\n"):
+            return lines
+        if not lines:
+            return [text]
+        consumed = sum(len(line) for line in lines) + max(len(lines) - 1, 0)
+        if consumed < len(text):
+            lines.append(text[consumed:])
+        return lines
