@@ -17,7 +17,7 @@ class TestCommandGuard(unittest.TestCase):
         reason = shell_command_incomplete_reason("iw dev wl0 link | grep -q 'Connected to '")
         self.assertIsNone(reason)
 
-    def test_service_rejects_incomplete_command(self) -> None:
+    def test_service_no_longer_blocks_incomplete_command_preflight(self) -> None:
         svc = SerialwrapService([])
         resp = svc.rpc(
             "command.submit",
@@ -28,8 +28,7 @@ class TestCommandGuard(unittest.TestCase):
             },
         )
         self.assertFalse(resp["ok"])
-        self.assertEqual(resp["error_code"], "CMD_INCOMPLETE")
-        self.assertEqual(resp["reason"], "UNBALANCED_SINGLE_QUOTE")
+        self.assertEqual(resp["error_code"], "SESSION_NOT_FOUND")
 
 
 if __name__ == "__main__":

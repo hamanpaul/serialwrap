@@ -30,6 +30,10 @@ cp -a "${SCRIPT_DIR}/profiles/." "${TARGET_DIR}/profiles/"
 cp -a "${SCRIPT_DIR}/tools/." "${TARGET_DIR}/tools/"
 cp -a "${SCRIPT_DIR}/docs/." "${TARGET_DIR}/docs/"
 
+# Remove legacy artifacts that are no longer part of the mainline design.
+rm -f "${TARGET_DIR}/serialwrap_lib.py"
+rm -f "${TARGET_DIR}/__pycache__/serialwrap_lib."*.pyc 2>/dev/null || true
+
 DEFAULT_PROFILE_PATH="${TARGET_DIR}/profiles/default.yaml"
 DEFAULT_PLACEHOLDER_BY_ID="/dev/serial/by-id/target0"
 INSTALL_AUTOBIND="${SERIALWRAP_INSTALL_AUTOBIND:-1}"

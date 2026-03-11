@@ -49,8 +49,15 @@ class DeviceWatcher:
         prev = self._devices
         added_keys = sorted(set(current.keys()) - set(prev.keys()))
         removed_keys = sorted(set(prev.keys()) - set(current.keys()))
+        changed_keys = sorted(
+            key for key in set(current.keys()) & set(prev.keys())
+            if current[key].real_path != prev[key].real_path
+        )
         added = [current[k] for k in added_keys]
         removed = [prev[k] for k in removed_keys]
+        for key in changed_keys:
+            removed.append(prev[key])
+            added.append(current[key])
         self._devices = current
         if added or removed:
             self._on_change(added, removed)

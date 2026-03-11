@@ -22,7 +22,7 @@ class _QueuedCommand:
 
 
 class CommandArbiter:
-    def __init__(self, send_cb: Callable[[str, str, str, str, float], None]) -> None:
+    def __init__(self, send_cb: Callable[[str, str, str, str, float, str], dict[str, Any]]) -> None:
         self._send_cb = send_cb
         self._lock = threading.Lock()
         self._queues: dict[str, queue.PriorityQueue[_QueuedCommand]] = {}
@@ -83,6 +83,7 @@ class CommandArbiter:
             "command": command,
             "source": source,
             "mode": mode,
+            "execution_mode": {"fg": "line", "bg": "background"}.get(mode, mode),
             "timeout_s": timeout_s,
             "priority": priority,
             "status": "accepted",
@@ -91,6 +92,11 @@ class CommandArbiter:
             "started_at": None,
             "done_at": None,
             "error_code": None,
+            "stdout": "",
+            "partial": False,
+            "background_capture_id": None,
+            "interactive_session_id": None,
+            "recovery_action": None,
         }
         with self._lock:
             self._commands[cmd_id] = rec
@@ -136,7 +142,7 @@ class CommandArbiter:
                 rec["started_at"] = now_iso()
 
             try:
-                self._send_cb(session_id, item.command, item.source, item.cmd_id, item.timeout_s)
+                result = self._send_cb(session_id, item.command, item.source, item.cmd_id, item.timeout_s, item.mode)
             except Exception:
                 with self._lock:
                     rec = self._commands.get(item.cmd_id)
@@ -149,7 +155,26 @@ class CommandArbiter:
             with self._lock:
                 rec = self._commands.get(item.cmd_id)
                 if rec and rec.get("status") != "canceled":
-                    rec["status"] = "done"
+                    if isinstance(result, dict):
+                        for key in (
+                            "stdout",
+                            "partial",
+                            "background_capture_id",
+                            "interactive_session_id",
+                            "recovery_action",
+                            "execution_mode",
+                        ):
+                            if key in result:
+                                rec[key] = result[key]
+                        if not result.get("ok", True):
+                            rec["status"] = "error"
+                            rec["error_code"] = result.get("error_code") or "COMMAND_FAILED"
+                        elif result.get("status") == "interactive":
+                            rec["status"] = "interactive"
+                        else:
+                            rec["status"] = "done"
+                    else:
+                        rec["status"] = "done"
                     rec["done_at"] = now_iso()
 
     def snapshot(self) -> list[dict[str, Any]]:

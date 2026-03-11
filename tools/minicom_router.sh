@@ -28,22 +28,21 @@ if [[ $# -gt 0 && "${1}" != -* ]]; then
   shift
 fi
 
-# 從剩餘參數中抽出 -D（使用者指定的裝置路徑），避免與 router 選取的 vtty 重複傳入 minicom
 user_device=""
 if [[ $# -gt 0 ]]; then
   _args_copy=("$@")
   _kept=()
   _i=0
   while [[ $_i -lt ${#_args_copy[@]} ]]; do
-    if [[ "${_args_copy[$_i]}" == "-D" && $((_i+1)) -lt ${#_args_copy[@]} ]]; then
-      user_device="${_args_copy[$((_i+1))]}"
-      ((_i+=2))
+    if [[ "${_args_copy[$_i]}" == "-D" && $((_i + 1)) -lt ${#_args_copy[@]} ]]; then
+      user_device="${_args_copy[$((_i + 1))]}"
+      ((_i += 2))
     elif [[ "${_args_copy[$_i]}" == -D?* ]]; then
       user_device="${_args_copy[$_i]#-D}"
-      ((_i+=1))
+      ((_i += 1))
     else
       _kept+=("${_args_copy[$_i]}")
-      ((_i+=1))
+      ((_i += 1))
     fi
   done
   if [[ ${#_kept[@]} -gt 0 ]]; then
@@ -70,13 +69,7 @@ _find_row_by_selector() {
 
 _find_first_ready_row() {
   local obj="$1"
-  printf '%s' "${obj}" | jq -c '.sessions[]? | select(.state=="READY" and (.vtty // "") != "")' | head -n 1
-}
-
-_find_row_by_vtty() {
-  local obj="$1"
-  local vtty="$2"
-  printf '%s' "${obj}" | jq -c --arg v "${vtty}" '.sessions[]? | select(.vtty==$v)' | head -n 1
+  printf '%s' "${obj}" | jq -c '.sessions[]? | select(.state=="READY")' | head -n 1
 }
 
 _find_attach_selector_default() {
@@ -87,8 +80,7 @@ _find_attach_selector_default() {
     printf '%s' "${pick}"
     return 0
   fi
-  pick="$(printf '%s' "${obj}" | jq -r '.sessions[]?.com' | head -n 1)"
-  printf '%s' "${pick}"
+  printf '%s' "${obj}" | jq -r '.sessions[]?.com' | head -n 1
 }
 
 _exec_minicom() {
@@ -129,41 +121,45 @@ _exec_minicom() {
     extra_args+=("-C" "${logfile}")
   fi
 
-  exec "${MINICOM_BIN}" -D "${device}" "${extra_args[@]}" "${user_args[@]}"
+  "${MINICOM_BIN}" -D "${device}" "${extra_args[@]}" "${user_args[@]}"
 }
 
-_try_exec_row() {
-  local row="$1"
-  shift
-  if [[ -z "${row}" ]]; then
-    return 1
+_ensure_daemon() {
+  local state_json
+  state_json="$(_get_sessions_json)"
+  if _json_ok "${state_json}"; then
+    printf '%s' "${state_json}"
+    return 0
   fi
-  local st
-  local vtty
-  local com_name
-  st="$(printf '%s' "${row}" | jq -r '.state // ""')"
-  vtty="$(printf '%s' "${row}" | jq -r '.vtty // ""')"
-  com_name="$(printf '%s' "${row}" | jq -r '.com // "COMX"')"
-  if [[ "${st}" == "READY" && -n "${vtty}" && -e "${vtty}" ]]; then
-    _exec_minicom "${vtty}" "${com_name}" "$@"
+  if [[ "${AUTO_START_DAEMON}" != "1" ]]; then
+    printf '%s' "${state_json}"
+    return 0
   fi
-  return 1
+  "${SERIALWRAP_BIN}" --socket "${SOCKET}" daemon start --profile-dir "${PROFILE_DIR}" >/dev/null 2>&1 || true
+  for _ in $(seq 1 30); do
+    state_json="$(_get_sessions_json)"
+    if _json_ok "${state_json}"; then
+      break
+    fi
+    sleep 0.1
+  done
+  printf '%s' "${state_json}"
 }
 
-_try_attach_and_exec() {
+_wait_ready_row() {
   local sel="$1"
-  shift
-  local obj=""
   local row=""
-  "${SERIALWRAP_BIN}" --socket "${SOCKET}" session attach --selector "${sel}" >/dev/null 2>&1 || true
+  local state_json=""
+
   for _ in $(seq 1 "${ATTACH_WAIT_TICKS}"); do
-    obj="$(_get_sessions_json)"
-    if ! _json_ok "${obj}"; then
+    state_json="$(_get_sessions_json)"
+    if ! _json_ok "${state_json}"; then
       sleep 0.2
       continue
     fi
-    row="$(_find_row_by_selector "${obj}" "${sel}")"
-    if _try_exec_row "${row}" "$@"; then
+    row="$(_find_row_by_selector "${state_json}" "${sel}")"
+    if [[ -n "${row}" && "$(printf '%s' "${row}" | jq -r '.state // ""')" == "READY" ]]; then
+      printf '%s' "${row}"
       return 0
     fi
     sleep 0.2
@@ -171,66 +167,81 @@ _try_attach_and_exec() {
   return 1
 }
 
-state_json="$(_get_sessions_json)"
+_attach_console_json() {
+  local sel="$1"
+  "${SERIALWRAP_BIN}" --socket "${SOCKET}" session console-attach --selector "${sel}" --label "minicom:$$" 2>/dev/null || true
+}
 
-if [[ -z "${state_json}" ]] || ! _json_ok "${state_json}"; then
-  if [[ "${AUTO_START_DAEMON}" == "1" ]]; then
-    "${SERIALWRAP_BIN}" --socket "${SOCKET}" daemon start --profile-dir "${PROFILE_DIR}" >/dev/null 2>&1 || true
-    for _ in $(seq 1 30); do
-      state_json="$(_get_sessions_json)"
-      if _json_ok "${state_json}"; then
-        break
-      fi
-      sleep 0.1
-    done
+_run_broker_minicom() {
+  local row="$1"
+  shift
+  local sel
+  local com_name
+  local attach_json
+  local client_id
+  local vtty
+
+  sel="$(printf '%s' "${row}" | jq -r '.com // .session_id')"
+  com_name="$(printf '%s' "${row}" | jq -r '.com // "COMX"')"
+  attach_json="$(_attach_console_json "${sel}")"
+  if [[ "$(printf '%s' "${attach_json}" | jq -r '.ok // false')" != "true" ]]; then
+    return 1
   fi
-fi
+  client_id="$(printf '%s' "${attach_json}" | jq -r '.client_id // ""')"
+  vtty="$(printf '%s' "${attach_json}" | jq -r '.vtty // ""')"
+  if [[ -z "${client_id}" || -z "${vtty}" ]]; then
+    return 1
+  fi
+
+  cleanup() {
+    "${SERIALWRAP_BIN}" --socket "${SOCKET}" session console-detach --selector "${sel}" --client-id "${client_id}" >/dev/null 2>&1 || true
+  }
+  trap cleanup EXIT INT TERM
+  _exec_minicom "${vtty}" "${com_name}" "$@"
+  local rc=$?
+  trap - EXIT INT TERM
+  cleanup
+  return "${rc}"
+}
+
+state_json="$(_ensure_daemon)"
 
 if _json_ok "${state_json}"; then
-  # user_device 為 /dev/pts/X → 以 vtty 直接查找對應 session
-  if [[ -n "${user_device}" && "${user_device}" == /dev/pts/* ]]; then
-    session_row="$(_find_row_by_vtty "${state_json}" "${user_device}")"
-    if _try_exec_row "${session_row}" "$@"; then
-      exit 0
+  if [[ -z "${selector}" ]]; then
+    row="$(_find_first_ready_row "${state_json}")"
+    if [[ -z "${row}" && "${ATTACH_WHEN_NOT_READY}" == "1" ]]; then
+      selector="$(_find_attach_selector_default "${state_json}")"
+      if [[ -n "${selector}" ]]; then
+        "${SERIALWRAP_BIN}" --socket "${SOCKET}" session attach --selector "${selector}" >/dev/null 2>&1 || true
+        row="$(_wait_ready_row "${selector}")"
+      fi
     fi
-    # 找到 session 但尚未 READY → 改以 com 作為 selector 走後續 attach 流程
-    if [[ -n "${session_row}" && -z "${selector}" ]]; then
-      selector="$(printf '%s' "${session_row}" | jq -r '.com // ""')"
+  else
+    row="$(_find_row_by_selector "${state_json}" "${selector}")"
+    if [[ -n "${row}" && "$(printf '%s' "${row}" | jq -r '.state // ""')" != "READY" && "${ATTACH_WHEN_NOT_READY}" == "1" ]]; then
+      "${SERIALWRAP_BIN}" --socket "${SOCKET}" session attach --selector "${selector}" >/dev/null 2>&1 || true
+      row="$(_wait_ready_row "${selector}")"
     fi
   fi
 
-  if [[ -n "${selector}" ]]; then
-    session_row="$(_find_row_by_selector "${state_json}" "${selector}")"
-    if _try_exec_row "${session_row}" "$@"; then
-      exit 0
-    fi
-    if [[ "${ATTACH_WHEN_NOT_READY}" == "1" && -n "${session_row}" ]]; then
-      _try_attach_and_exec "${selector}" "$@" || true
-    fi
-  else
-    session_row="$(_find_first_ready_row "${state_json}")"
-    if _try_exec_row "${session_row}" "$@"; then
-      exit 0
-    fi
-    if [[ "${ATTACH_WHEN_NOT_READY}" == "1" ]]; then
-      attach_selector="$(_find_attach_selector_default "${state_json}")"
-      if [[ -n "${attach_selector}" ]]; then
-        _try_attach_and_exec "${attach_selector}" "$@" || true
-      fi
-    fi
+  if [[ -n "${row:-}" && "$(printf '%s' "${row}" | jq -r '.state // ""')" == "READY" ]]; then
+    _run_broker_minicom "${row}" "$@"
+    exit $?
   fi
 fi
 
 if [[ -n "${user_device:-}" ]]; then
   _exec_minicom "${user_device}" "DIRECT" "$@"
+  exit $?
 fi
 
 if [[ -n "${MINICOM_RAW_DEVICE:-}" ]]; then
   _exec_minicom "${MINICOM_RAW_DEVICE}" "RAW" "$@"
+  exit $?
 fi
 
 echo "minicom_router: broker not ready, no READY session, and MINICOM_RAW_DEVICE not set" >&2
-if [[ "$(printf '%s' "${state_json}" | jq -r '.ok // false')" == "true" ]]; then
+if [[ "$(printf '%s' "${state_json:-}" | jq -r '.ok // false' 2>/dev/null || printf 'false')" == "true" ]]; then
   echo "sessions:" >&2
   printf '%s' "${state_json}" | jq -r '.sessions[]? | "  - \(.com) \(.alias) state=\(.state) last_error=\(.last_error // "-")"' >&2 || true
 fi

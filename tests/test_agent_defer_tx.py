@@ -1,168 +1,189 @@
-"""測試 UARTBridge agent 命令執行期間暫存 minicom TX，命令完成後排程送出。"""
 from __future__ import annotations
 
-import queue
+import os
+import pty
+import select
+import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import MagicMock, patch
+
+from sw_core.config import UartProfile
+from sw_core.uart_io import UARTBridge
+from sw_core.wal import WalWriter
 
 
-class TestAgentDeferHumanTx(unittest.TestCase):
-    """驗證 begin/end_agent_cmd + _loop() TX buffering 行為。"""
+class FakeTarget:
+    def __init__(self) -> None:
+        self.master_fd, self.slave_fd = pty.openpty()
+        self.slave_path = os.ttyname(self.slave_fd)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self.received: list[bytes] = []
 
-    def _make_bridge(self):
-        """建立 UARTBridge（不開啟真實 serial，只測 flag/queue 邏輯）。"""
-        from sw_core.uart_io import UARTBridge
-        from sw_core.config import UartProfile
-        profile = UartProfile()
-        wal = MagicMock()
-        bridge = UARTBridge(com="COM0", device_path="/dev/null", profile=profile, wal=wal)
-        return bridge
+    def start(self) -> None:
+        self._thread.start()
 
-    # ── begin / end_agent_cmd ────────────────────────────────────────────
-
-    def test_begin_sets_flag(self):
-        bridge = self._make_bridge()
-        self.assertFalse(bridge._agent_active.is_set())
-        bridge.begin_agent_cmd()
-        self.assertTrue(bridge._agent_active.is_set())
-
-    def test_end_clears_flag(self):
-        bridge = self._make_bridge()
-        bridge.begin_agent_cmd()
-        bridge._serial_fd = None  # 已停止，讓 end_agent_cmd 直接清 queue
-        bridge.end_agent_cmd()
-        self.assertFalse(bridge._agent_active.is_set())
-
-    def test_end_flushes_queue_to_serial(self):
-        bridge = self._make_bridge()
-        # 模擬 _serial_fd 為 fake fd；攔截 _write_all
-        bridge._serial_fd = 99
-        written = []
-        bridge._write_all = lambda fd, data: written.append(data)
-
-        # 塞入兩筆暫存資料
-        bridge._agent_active.set()
-        bridge._human_tx_queue.put(b"hello\n")
-        bridge._human_tx_queue.put(b"world\n")
-
-        bridge.end_agent_cmd()
-
-        self.assertFalse(bridge._agent_active.is_set())
-        self.assertEqual(written, [b"hello\n", b"world\n"])
-        self.assertTrue(bridge._human_tx_queue.empty())
-
-    def test_end_discards_queue_when_serial_closed(self):
-        bridge = self._make_bridge()
-        bridge._serial_fd = None  # serial 已關閉
-        bridge._agent_active.set()
-        bridge._human_tx_queue.put(b"orphan\n")
-
-        bridge.end_agent_cmd()
-
-        # flag 清除，queue 清空（資料丟棄，不 raise）
-        self.assertFalse(bridge._agent_active.is_set())
-        self.assertTrue(bridge._human_tx_queue.empty())
-
-    # ── rx_snapshot_len / wait_for_regex_from ───────────────────────────
-
-    def test_rx_snapshot_len(self):
-        bridge = self._make_bridge()
-        bridge._rx_text = "abc"
-        self.assertEqual(bridge.rx_snapshot_len(), 3)
-
-    def test_wait_for_regex_from_ignores_old_data(self):
-        bridge = self._make_bridge()
-        # 在 offset=0 之前就有 prompt，但 from_offset=10 之後才看
-        bridge._rx_text = "root@box:~# \n" + "cmd output"
-        # offset=10 之後沒有 prompt → should timeout quickly
-        result = bridge.wait_for_regex_from(r".*# $", from_offset=10, timeout_s=0.1)
-        self.assertFalse(result)
-
-    def test_wait_for_regex_from_sees_new_prompt(self):
-        bridge = self._make_bridge()
-        bridge._rx_text = "old stuff"
-        pre = bridge.rx_snapshot_len()
-
-        # 背景執行緒模擬 target 在 0.1s 後送回 prompt
-        def inject():
-            time.sleep(0.1)
-            with bridge._rx_lock:
-                bridge._rx_text += "\nroot@box:~# "
-
-        t = threading.Thread(target=inject, daemon=True)
-        t.start()
-
-        result = bridge.wait_for_regex_from(r"# $", from_offset=pre, timeout_s=1.0)
-        self.assertTrue(result)
-
-    # ── _loop() TX 暫存行為（透過 _agent_active + queue 驗證）───────────
-
-    def test_loop_buffers_pty_tx_during_agent_cmd(self):
-        """_loop() 讀到 PTY TX 時若 _agent_active，不送 serial 而是放 queue。"""
-        import os
-        import select as _select
-        from sw_core.uart_io import UARTBridge
-        from sw_core.config import UartProfile
-
-        wal = MagicMock()
-        bridge = UARTBridge(
-            com="COM0", device_path="/dev/null",
-            profile=UartProfile(baud=115200), wal=wal
-        )
-
-        # 建立 PTY pair + fake serial pipe
-        pty_master, pty_slave = os.openpty()
-        serial_r, serial_w = os.pipe()
-
-        bridge._serial_fd = serial_r
-        bridge._pty_master = pty_master
-        bridge._pty_slave = pty_slave
-        bridge._pty_slave_path = os.ttyname(pty_slave)
-
-        # 讓 _write_all 對 serial_r 的寫入不實際觸發，攔截 serial 寫入
-        serial_written: list[bytes] = []
-        orig_write_all = bridge._write_all
-
-        def mock_write_all(fd, data):
-            if fd == serial_r:
-                serial_written.append(data)
-            else:
-                orig_write_all(fd, data)
-
-        bridge._write_all = mock_write_all
-
-        # 啟動 _loop()
-        bridge._stop_event.clear()
-        t = threading.Thread(target=bridge._loop, daemon=True)
-        t.start()
-
-        # 先等 loop 起來，然後 set agent_active
-        time.sleep(0.05)
-        bridge.begin_agent_cmd()
-
-        # 模擬 minicom 使用者輸入（寫到 pty_slave → _loop 從 pty_master 讀到）
-        os.write(pty_slave, b"hello\n")
-        time.sleep(0.15)
-
-        # agent_active 期間：不應送到 serial，但應在 queue 裡
-        self.assertEqual(serial_written, [], "agent_active 期間不應直接寫 serial")
-        self.assertFalse(bridge._human_tx_queue.empty(), "應有暫存資料在 queue")
-
-        # 結束 agent_cmd → 暫存資料應排程送出
-        bridge.end_agent_cmd()
-        time.sleep(0.05)
-        self.assertEqual(serial_written, [b"hello\r\n"], "end_agent_cmd 後應排程送出")
-
-        # 清理
-        bridge._stop_event.set()
-        t.join(timeout=1)
-        for fd in (pty_master, pty_slave, serial_r, serial_w):
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+        for fd in (self.master_fd, self.slave_fd):
             try:
                 os.close(fd)
             except OSError:
                 pass
+
+    def emit(self, payload: bytes) -> None:
+        os.write(self.master_fd, payload)
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                rlist, _, _ = select.select([self.master_fd], [], [], 0.1)
+            except OSError:
+                return
+            if self.master_fd not in rlist:
+                continue
+            try:
+                chunk = os.read(self.master_fd, 4096)
+            except OSError:
+                return
+            if chunk:
+                self.received.append(chunk)
+
+
+class TestUARTBridgeConsoles(unittest.TestCase):
+    def _make_target(self) -> FakeTarget:
+        try:
+            return FakeTarget()
+        except OSError as exc:
+            self.skipTest(f"pty not available in current environment: {exc}")
+
+    def test_console_attach_creates_unique_vtty(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            target = self._make_target()
+            target.start()
+            self.addCleanup(target.stop)
+
+            bridge = UARTBridge("COM0", target.slave_path, UartProfile(), WalWriter(wal_dir=td))
+            bridge.start()
+            self.addCleanup(bridge.stop)
+
+            primary = bridge.vtty_path
+            attached = bridge.attach_console(label="observer")
+
+            self.assertIsNotNone(primary)
+            self.assertNotEqual(primary, attached["vtty"])
+            self.assertEqual(len(bridge.list_consoles()), 2)
+
+    def test_console_input_is_line_buffered_for_broker_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            target = self._make_target()
+            target.start()
+            self.addCleanup(target.stop)
+
+            captured: list[tuple[str, str]] = []
+            bridge = UARTBridge(
+                "COM0",
+                target.slave_path,
+                UartProfile(),
+                WalWriter(wal_dir=td),
+                on_console_line=lambda client_id, line: captured.append((client_id, line)),
+            )
+            bridge.start()
+            self.addCleanup(bridge.stop)
+
+            primary = bridge.vtty_path
+            assert primary is not None
+            fd = os.open(primary, os.O_RDWR | os.O_NOCTTY)
+            try:
+                os.write(fd, b"ifconfig\n")
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and not captured:
+                    time.sleep(0.05)
+            finally:
+                os.close(fd)
+
+            self.assertEqual(len(captured), 1)
+            self.assertEqual(captured[0][1], "ifconfig")
+            self.assertEqual(target.received, [])
+
+    def test_rx_is_fanned_out_to_all_consoles(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            target = self._make_target()
+            target.start()
+            self.addCleanup(target.stop)
+
+            bridge = UARTBridge("COM0", target.slave_path, UartProfile(), WalWriter(wal_dir=td))
+            bridge.start()
+            self.addCleanup(bridge.stop)
+
+            attached = bridge.attach_console(label="observer")
+            primary = bridge.vtty_path
+            assert primary is not None
+
+            fd_primary = os.open(primary, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+            fd_second = os.open(attached["vtty"], os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+            try:
+                target.emit(b"hello\r\n# ")
+                deadline = time.monotonic() + 2.0
+                primary_data = b""
+                second_data = b""
+                while time.monotonic() < deadline and (not primary_data or not second_data):
+                    try:
+                        primary_data += os.read(fd_primary, 4096)
+                    except BlockingIOError:
+                        pass
+                    try:
+                        second_data += os.read(fd_second, 4096)
+                    except BlockingIOError:
+                        pass
+                    time.sleep(0.05)
+            finally:
+                os.close(fd_primary)
+                os.close(fd_second)
+
+            self.assertIn(b"hello", primary_data)
+            self.assertIn(b"hello", second_data)
+
+    def test_unread_console_does_not_block_human_line_submission(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            target = self._make_target()
+            target.start()
+            self.addCleanup(target.stop)
+
+            captured: list[tuple[str, str]] = []
+            bridge = UARTBridge(
+                "COM0",
+                target.slave_path,
+                UartProfile(),
+                WalWriter(wal_dir=td),
+                on_console_line=lambda client_id, line: captured.append((client_id, line)),
+            )
+            bridge.start()
+            self.addCleanup(bridge.stop)
+
+            # Leave all console slaves unread, then push enough RX data to
+            # pressure the PTY buffers. Human line input must still reach the
+            # callback instead of being blocked behind fan-out writes.
+            bridge.attach_console(label="idle-observer")
+            for _ in range(32):
+                target.emit(b"x" * 4096)
+                time.sleep(0.01)
+
+            primary = bridge.vtty_path
+            assert primary is not None
+            fd = os.open(primary, os.O_RDWR | os.O_NOCTTY)
+            try:
+                os.write(fd, b"echo still-works\n")
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and not captured:
+                    time.sleep(0.05)
+            finally:
+                os.close(fd)
+
+            self.assertEqual(len(captured), 1)
+            self.assertEqual(captured[0][1], "echo still-works")
 
 
 if __name__ == "__main__":

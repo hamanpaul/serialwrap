@@ -103,6 +103,34 @@ def build_parser() -> argparse.ArgumentParser:
     p_sb.add_argument("--device-by-id", required=True)
     p_sa = sess_sub.add_parser("attach")
     p_sa.add_argument("--selector", required=True, help="session_id | COMx | alias")
+    p_sst = sess_sub.add_parser("self-test")
+    p_sst.add_argument("--selector", required=True, help="session_id | COMx | alias")
+    p_sst.add_argument("--probe-timeout", dest="probe_timeout_s", type=float, default=2.0)
+    p_sr = sess_sub.add_parser("recover")
+    p_sr.add_argument("--selector", required=True, help="session_id | COMx | alias")
+    p_sr.add_argument("--timeout", dest="recover_timeout_s", type=float, default=2.0)
+    p_sca = sess_sub.add_parser("console-attach")
+    p_sca.add_argument("--selector", required=True, help="session_id | COMx | alias")
+    p_sca.add_argument("--label")
+    p_scd = sess_sub.add_parser("console-detach")
+    p_scd.add_argument("--selector", required=True, help="session_id | COMx | alias")
+    p_scd.add_argument("--client-id", required=True)
+    p_scl = sess_sub.add_parser("console-list")
+    p_scl.add_argument("--selector", required=True, help="session_id | COMx | alias")
+    p_sio = sess_sub.add_parser("interactive-open")
+    p_sio.add_argument("--selector", required=True, help="session_id | COMx | alias")
+    p_sio.add_argument("--owner", default="agent")
+    p_sio.add_argument("--timeout", dest="interactive_timeout_s", type=float, default=60.0)
+    p_sio.add_argument("--command", default="")
+    p_sis = sess_sub.add_parser("interactive-send")
+    p_sis.add_argument("--interactive-id", required=True)
+    p_sis.add_argument("--data", required=True)
+    p_sis.add_argument("--encoding", default="plain")
+    p_sist = sess_sub.add_parser("interactive-status")
+    p_sist.add_argument("--interactive-id", required=True)
+    p_sist.add_argument("--screen-chars", type=int, default=2048)
+    p_sic = sess_sub.add_parser("interactive-close")
+    p_sic.add_argument("--interactive-id", required=True)
 
     p_alias = sub.add_parser("alias")
     alias_sub = p_alias.add_subparsers(dest="alias_cmd", required=True)
@@ -121,13 +149,17 @@ def build_parser() -> argparse.ArgumentParser:
     cmd_sub = p_cmd.add_subparsers(dest="cmd_cmd", required=True)
     p_cs = cmd_sub.add_parser("submit")
     p_cs.add_argument("--selector", required=True)
-    p_cs.add_argument("--cmd", dest="command_text", required=True)
+    p_cs.add_argument("--cmd", dest="command_text", default="")
     p_cs.add_argument("--source", default="agent")
-    p_cs.add_argument("--mode", default="fg")
+    p_cs.add_argument("--mode", default="line")
     p_cs.add_argument("--priority", type=int, default=10)
     p_cs.add_argument("--cmd-timeout", dest="cmd_timeout_s", type=float, default=10.0)
     p_cg = cmd_sub.add_parser("status")
     p_cg.add_argument("--cmd-id", required=True)
+    p_cr = cmd_sub.add_parser("result-tail")
+    p_cr.add_argument("--cmd-id", required=True)
+    p_cr.add_argument("--from-chunk", type=int, default=0)
+    p_cr.add_argument("--limit", type=int, default=200)
     p_cc = cmd_sub.add_parser("cancel")
     p_cc.add_argument("--cmd-id", required=True)
 
@@ -186,6 +218,44 @@ def main(argv: list[str] | None = None) -> int:
             return _run_rpc(args, "session.bind", {"selector": args.selector, "device_by_id": args.device_by_id})
         if args.session_cmd == "attach":
             return _run_rpc(args, "session.attach", {"selector": args.selector})
+        if args.session_cmd == "self-test":
+            return _run_rpc(args, "session.self_test", {"selector": args.selector, "timeout_s": args.probe_timeout_s})
+        if args.session_cmd == "recover":
+            return _run_rpc(args, "session.recover", {"selector": args.selector, "timeout_s": args.recover_timeout_s})
+        if args.session_cmd == "console-attach":
+            params: dict[str, Any] = {"selector": args.selector}
+            if args.label:
+                params["label"] = args.label
+            return _run_rpc(args, "session.console_attach", params)
+        if args.session_cmd == "console-detach":
+            return _run_rpc(args, "session.console_detach", {"selector": args.selector, "client_id": args.client_id})
+        if args.session_cmd == "console-list":
+            return _run_rpc(args, "session.console_list", {"selector": args.selector})
+        if args.session_cmd == "interactive-open":
+            return _run_rpc(
+                args,
+                "session.interactive_open",
+                {
+                    "selector": args.selector,
+                    "owner": args.owner,
+                    "timeout_s": args.interactive_timeout_s,
+                    "command": args.command,
+                },
+            )
+        if args.session_cmd == "interactive-send":
+            return _run_rpc(
+                args,
+                "session.interactive_send",
+                {"interactive_id": args.interactive_id, "data": args.data, "encoding": args.encoding},
+            )
+        if args.session_cmd == "interactive-status":
+            return _run_rpc(
+                args,
+                "session.interactive_status",
+                {"interactive_id": args.interactive_id, "screen_chars": args.screen_chars},
+            )
+        if args.session_cmd == "interactive-close":
+            return _run_rpc(args, "session.interactive_close", {"interactive_id": args.interactive_id})
 
     if args.cmd == "alias":
         if args.alias_cmd == "list":
@@ -216,6 +286,12 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.cmd_cmd == "status":
             return _run_rpc(args, "command.get", {"cmd_id": args.cmd_id})
+        if args.cmd_cmd == "result-tail":
+            return _run_rpc(
+                args,
+                "command.result_tail",
+                {"cmd_id": args.cmd_id, "from_chunk": args.from_chunk, "limit": args.limit},
+            )
         if args.cmd_cmd == "cancel":
             return _run_rpc(args, "command.cancel", {"cmd_id": args.cmd_id})
 

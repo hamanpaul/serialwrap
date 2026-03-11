@@ -1,269 +1,398 @@
 # serialwrap
 
-`serialwrap` 是面向單一 UART/多 Agent 協作的 broker 架構，核心是 `serialwrapd`（常駐仲裁）+ `serialwrap`（CLI client）+ `serialwrap-mcp`（MCP adapter）。
+`serialwrap` 是面向單一 UART、多 agent 與多人 console 共用的 broker。主線由 `serialwrapd`、`serialwrap` CLI、`serialwrap-mcp` 與 `minicom_router.sh` 組成，目標是在不污染 target UART 輸入的前提下，保留單寫入仲裁、透明 console 視圖、結果擷取與故障診斷能力。
 
-## 動機
+## 核心特性
 
-- 解決多 Agent/人類同時操作 UART 時的競爭寫入、回應混線、資料遺失與不可追溯。
-- 提供可機器處理與可人工閱讀的雙軌原始紀錄，滿足除錯、稽核與回放需求。
-- 將 profile 與實體 UART 連接點解耦，讓同一組 login/UART 參數可套用到多個 target。
+- target UART 只接收原始 command 或 raw keystrokes，不注入任何 begin/end marker。
+- 同一個 COM 可同時 attach 多個 minicom；所有 console 都看到同樣的原始 RX 內容。
+- 所有前景命令透過 arbiter 單寫入排隊，避免 agent/human 交錯寫入。
+- 支援 `line`、`background`、`interactive` 三種執行模式。
+- 內建 `session self-test`、`session recover`，可區分裝置遺失、TTY 重綁、bridge stale、target 無回應等狀態。
+- 保留 `raw.wal.ndjson` 權威記錄，並提供人類可讀的 `raw.mirror.log` 與 `log tail-text`。
 
 ## 依賴
 
 - Python 3.10+
-- `pyyaml` — profile YAML 解析
-- `pyserial`（間接需要 `termios`）— UART 控制
+- `pyyaml`
+- `jq`：`minicom_router.sh` 需要
+- `minicom`：human console 路徑需要
 
-## 架構
+## 架構圖
 
-```text
-Agent/CLI ----\
-Agent/MCP -----+--> serialwrapd (RPC + Arbiter) --> UART IO --> Target Shell
-Human/minicom -/              |
-                              +--> WAL (raw.wal.ndjson)
-                              +--> Mirror (raw.mirror.log)
+```mermaid
+flowchart LR
+    A["Agent"]
+    C["CLI"]
+    M["MCP"]
+    R["Minicom Router"]
+    H1["Minicom A"]
+    H2["Minicom B"]
+    D["serialwrapd"]
+    S["Service"]
+    Q["Arbiter"]
+    SM["SessionMgr"]
+    U["UARTBridge"]
+    T["Target"]
+    W["raw.wal.ndjson"]
+    X["raw.mirror.log"]
+
+    A --> M
+    M --> D
+    C --> D
+    R --> D
+    H1 --> R
+    H2 --> R
+    D --> S
+    S --> Q
+    S --> SM
+    Q --> U
+    SM --> U
+    U --> T
+    U --> W
+    U --> X
+    U --> H1
+    U --> H2
+
+    classDef actor fill:#e8f1ff,stroke:#335c99,stroke-width:1px;
+    classDef core fill:#eef7e8,stroke:#4f7a3f,stroke-width:1px;
+    classDef io fill:#fff4e6,stroke:#9a6b25,stroke-width:1px;
+
+    class A,C,M,R,H1,H2 actor
+    class D,S,Q,SM core
+    class U,T,W,X io
 ```
 
-| 元件 | 入口 | 說明 |
-|------|------|------|
-| **daemon** | `serialwrapd.py` | singleton 常駐，獨占實體 UART，提供 JSON-RPC Unix socket |
-| **CLI client** | `serialwrap` → `sw_core/cli.py` | 子命令式 CLI，透過 socket 發送 RPC |
-| **MCP adapter** | `serialwrap-mcp` → `sw_mcp/server.py` | 將 MCP 工具名對應到內部 RPC 方法（`_TOOL_MAP`） |
+## 啟動時序圖
 
-### 內部模組
+```mermaid
+sequenceDiagram
+    participant CLI as CLI
+    participant D as serialwrapd
+    participant W as Watcher
+    participant SM as SessionMgr
+    participant U as UARTBridge
+    participant T as Target
 
-| 模組 | 職責 |
-|------|------|
-| `sw_core/service.py` | 頂層調度器（`SerialwrapService`），路由所有 RPC 方法 |
-| `sw_core/arbiter.py` | 每 session 優先佇列，單寫入者保證 |
-| `sw_core/session_manager.py` | session 生命週期管理、裝置綁定、alias 解析 |
-| `sw_core/uart_io.py` | serial port + PTY bridge，TX/RX 搭配 WAL 記錄 |
-| `sw_core/login_fsm.py` | 平台相依 login FSM（`bcm` / `prpl` 路徑） |
-| `sw_core/wal.py` | 雙軌 append-only log |
-| `sw_core/device_watcher.py` | 輪詢 `/dev/serial/by-id/` 偵測 hotplug |
-| `sw_core/config.py` | profile YAML 載入：`ProfileTemplate` → `SessionProfile` 合併 |
-| `sw_core/alias_registry.py` | alias → session_id / by-id 映射 |
-
-### Session 狀態機
-
-```text
-DETACHED ──(裝置出現 + attach)──► ATTACHING ──(login FSM 成功)──► READY
-   ▲                                  │                            │
-   │                                  │ (FSM 失敗/例外)            │ (裝置拔除)
-   └──────────────────────────────────┘                            │
-   └───────────────────────────────────────────────────────────────┘
+    CLI->>D: daemon start
+    D->>W: start poll
+    W-->>D: devices
+    D->>SM: update_devices
+    SM->>U: attach by-id
+    U->>T: empty line
+    U->>T: ready_probe
+    T-->>U: login/prompt/probe
+    U-->>SM: ready
+    SM-->>D: session READY
+    D-->>CLI: health ok
 ```
 
-- `DETACHED`：未連接或裝置已移除。
-- `ATTACHING`：bridge 已開啟，login FSM 進行中。
-- `READY`：可接受命令。arbiter worker thread 已註冊。
+## 呼叫流程圖
 
-### 啟動流程
+```mermaid
+flowchart TD
+    S1["submit"] --> M1{"mode"}
+    M1 -->|line| L1["queue"]
+    L1 --> L2["send raw command"]
+    L2 --> L3["wait prompt"]
+    L3 --> L4["return stdout"]
+    M1 -->|background| B1["send raw command"]
+    B1 --> B2["prompt back"]
+    B2 --> B3["capture later RX"]
+    B3 --> B4["cmd result-tail"]
+    M1 -->|interactive| I1["open lease"]
+    I1 --> I2["send raw keys"]
+    I2 --> I3["close lease"]
+    M1 -->|recover| R1["Ctrl-C"]
+    R1 --> R2["Ctrl-D"]
+    R2 --> R3["reboot -f"]
 
-```text
-serialwrap daemon start
-  └─ Popen(serialwrapd.py, background)
-       └─ ensure_runtime_dirs()        建立 /tmp/serialwrap/*
-       └─ load_profiles(profile_dir)   載入 profiles/*.yaml
-       └─ SingletonLock.acquire()      flock + socket 排他
-       └─ SerialwrapService(profiles)
-            └─ SessionManager.__init__  讀取 state.json（alias/binding 持久化）
-       └─ service.start()
-            └─ DeviceWatcher.start()   啟動輪詢線程
-            └─ poll_once()             首次掃描 → update_devices → _spawn_attach
-            └─ bootstrap_attach()      確保所有已知裝置嘗試 attach
-       └─ server.start()              建立 Unix socket，開始接受連線
-       └─ stop_event.wait()           阻塞直到 SIGTERM/daemon.stop
-  └─ CLI 等待就緒（health.ping，最多 3 秒）
-       └─ 成功 → 回報 pid + socket（附帶 warnings 如有）
-       └─ daemon 提前退出 → DAEMON_EXITED
-       └─ 超時 → DAEMON_NOT_READY
+    classDef flow fill:#eef7e8,stroke:#4f7a3f,stroke-width:1px;
+    classDef warn fill:#fff4e6,stroke:#9a6b25,stroke-width:1px;
+
+    class S1,M1,L1,L2,L3,L4,B1,B2,B3,B4,I1,I2,I3 flow
+    class R1,R2,R3 warn
 ```
 
-### WAL 雙軌記錄
+## 快速開始
 
-| 檔案 | 格式 | 用途 |
-|------|------|------|
-| `/tmp/serialwrap/wal/raw.wal.ndjson` | NDJSON（base64 payload） | 機器可讀權威記錄 |
-| `/tmp/serialwrap/wal/raw.mirror.log` | 純文字 | 人類可讀鏡像 |
+```bash
+# 安裝
+./install.sh
 
-每筆記錄包含：`seq`、`mono_ts_ns`、`wall_ts`、`com`、`dir`、`source`、`cmd_id`、`len`、`crc32`、`payload_b64`。
-WAL 檔案達 64 MiB 自動 rotate。
+# 啟動 daemon
+serialwrap daemon start --profile-dir "$HOME/.paul_tools/profiles"
 
-### 環境變數
+# 檢查健康狀態
+serialwrap daemon status
+serialwrap session list
 
-| 變數 | 預設值 | 說明 |
-|------|--------|------|
-| `SERIALWRAP_STATE_DIR` | `/tmp/serialwrap` | 狀態目錄（WAL、state.json） |
-| `SERIALWRAP_RUN_DIR` | 同 `STATE_DIR` | lock/socket 目錄 |
-| `SERIALWRAP_PROFILE_DIR` | `<安裝目錄>/profiles` | profile YAML 目錄 |
-| `SERIALWRAP_BY_ID_DIR` | `/dev/serial/by-id` | 裝置搜尋目錄 |
+# 首次綁定並 attach
+serialwrap session bind --selector COM0 --device-by-id /dev/serial/by-id/<target-by-id>
+serialwrap session attach --selector COM0
 
-### Profile 系統
+# 送前景命令
+serialwrap cmd submit --selector COM0 --mode line --source agent:diag --cmd "ifconfig"
+serialwrap cmd status --cmd-id <cmd_id>
+```
 
-`profiles/*.yaml` 定義 `ProfileTemplate`（login/prompt/UART 參數模板）與 `targets`（將 template 綁定到 COM slot + 裝置）。target 欄位覆蓋 template 預設值。
+建議 shell 設定：
+
+```bash
+export INSTALL_DIR="$HOME/.paul_tools"
+export PATH="$INSTALL_DIR:$PATH"
+alias minicom="$INSTALL_DIR/minicom_router.sh"
+```
+
+## Profile 與目標綁定
+
+`profiles/*.yaml` 以 template + targets 定義 platform、prompt、login、ready probe 與 UART 參數。
 
 ```yaml
 profiles:
   prpl-template:
     platform: prpl
     prompt_regex: ".*# $"
+    ready_probe: "echo __READY__${nonce}; whoami"
     uart:
       baud: 115200
+      data_bits: 8
+      parity: N
+      stop_bits: 1
+      flow_control: none
+      xonxoff: false
+  opi-shell:
+    platform: shell
+    prompt_regex: ".*[$#] $"
+    login_regex: "(?mi)^login:\\s*$"
+    password_regex: "(?mi)^password:\\s*$"
+    user_env: "SW_OPI_U"
+    pass_env: "SW_OPI_P"
+    ready_probe: "echo __READY__${nonce}"
+    uart:
+      baud: 115200
+      data_bits: 8
+      parity: N
+      stop_bits: 1
+      flow_control: none
+      xonxoff: false
 
 targets:
   - act_no: 1
     com: COM0
     alias: default+1
     profile: prpl-template
-    device_by_id: /dev/serial/by-id/target0   # 佔位符，見下方「裝置自動綁定」說明
-  - act_no: 2
-    com: COM1
-    alias: default+2
-    profile: prpl-template
-    device_by_id: /dev/serial/by-id/target1
+    device_by_id: /dev/serial/by-id/<target0>
   - act_no: 3
     com: COM2
     alias: default+3
-    profile: prpl-template
-    device_by_id: /dev/serial/by-id/target2
-  - act_no: 4
-    com: COM3
-    alias: default+4
-    profile: prpl-template
-    device_by_id: /dev/serial/by-id/target3
+    profile: opi-shell
+    device_by_id: /dev/serial/by-id/<target2>
 ```
 
-> **多裝置自動綁定（Auto-Bind）**
->
-> `device_by_id` 填寫佔位符（如 `target0`）或留空時不需手動修改。  
-> daemon 啟動後，`/dev/serial/by-id/` 下出現尚未被任何 session 占用的裝置時，
-> 自動依 **`act_no` 升序**選取第一個有效 DETACHED session 進行綁定，並持久化至
-> `/tmp/serialwrap/state.json`。daemon 重啟後沿用已綁定的路徑，無需重複設定。
->
-> - 插入第 1 顆 UART → 自動綁定到 COM0
-> - 插入第 2 顆 UART → 自動綁定到 COM1，以此類推（最多 COM3）
->
-> 手動修正綁定：
-> ```bash
-> serialwrap session bind --selector COM0 --device-by-id /dev/serial/by-id/<target-by-id>
-> ```
-
-## 安裝
+`user_env` / `pass_env` 是每個 profile 自己指定的登入帳密環境變數名稱。CLI / daemon 不會把密碼寫進 YAML 或 WAL。
 
 ```bash
-# 預設安裝至 ~/.paul_tools/
-./install.sh
-
-# 指定安裝目錄
-./install.sh /path/to/install
+export SW_OPI_U='haman'
+export SW_OPI_P='your-password'
+serialwrap daemon start --profile-dir "$HOME/.paul_tools/profiles"
 ```
 
-安裝後建議設定 shell：
+若 shell device 已經自動登入，`serialwrap` 會直接用 prompt + `ready_probe` 驗證；若先看到 `login:` / `password:`，則會依 `user_env` / `pass_env` 自動登入。
+
+常用查看：
 
 ```bash
-export INSTALL_DIR="$HOME/.paul_tools"   # 或你指定的路徑
-export PATH="$INSTALL_DIR:$PATH"
-alias minicom="$INSTALL_DIR/minicom_router.sh"
-```
-
-## 啟動 daemon
-
-```bash
-serialwrap daemon start --profile-dir "$INSTALL_DIR/profiles"
-serialwrap daemon status
-```
-
-## 使用說明
-
-### CLI help
-
-```bash
-serialwrap --help
-serialwrap daemon --help
-serialwrap session --help
-serialwrap cmd --help
-serialwrap log --help
-```
-
-### 常用操作流程
-
-```bash
-# 1) 查看裝置與 Session
 serialwrap device list
 serialwrap session list
+serialwrap session self-test --selector COM0
+```
 
-# 2) 綁定目標並 attach（首次或換線時）
-serialwrap session bind --selector COM0 --device-by-id /dev/serial/by-id/<target-by-id>
-serialwrap session attach --selector COM0
+## 命令模式
 
-# 3) 下命令與查結果
-serialwrap cmd submit --selector COM0 --source agent:test --cmd "ifconfig"
+### 1. `line`
+
+適用 `ifconfig`、`wl assoc`、`cat /proc/...` 等會回 prompt 的命令。
+
+```bash
+serialwrap cmd submit --selector COM0 --mode line --source agent:diag --cmd "ifconfig"
 serialwrap cmd status --cmd-id <cmd_id>
+```
 
-# 4) 追蹤輸出與原始資料
+`command.get` 會直接帶 `stdout`。
+
+### 2. `background`
+
+適用 prompt 很快回來、後續內容會持續吐出的命令。
+
+```bash
+serialwrap cmd submit --selector COM0 --mode background --source agent:bg --cmd "wl assoc scan"
+serialwrap cmd status --cmd-id <cmd_id>
+serialwrap cmd result-tail --cmd-id <cmd_id> --from-chunk 0 --limit 200
+```
+
+`background` capture 會在 quiet window 到期，或新的前景/互動命令開始時封口。
+
+### 3. `interactive`
+
+適用 `menuconfig`、`top`、`vi` 等需要持續送按鍵的場景。
+
+```bash
+serialwrap session interactive-open --selector COM0 --owner agent:menu --command "menuconfig"
+serialwrap session interactive-send --interactive-id <interactive_id> --data down --encoding key
+serialwrap session interactive-send --interactive-id <interactive_id> --data enter --encoding key
+serialwrap session interactive-status --interactive-id <interactive_id>
+serialwrap session interactive-close --interactive-id <interactive_id>
+```
+
+`--encoding key` 目前支援：`enter`、`tab`、`escape`、`ctrl-c`、`ctrl-d`、`up`、`down`、`left`、`right`。
+
+## 多 minicom 使用
+
+`minicom_router.sh` 會：
+
+1. 視需要自動啟動 daemon
+2. 視需要對 selector 執行 `session attach`
+3. 透過 `session console-attach` 取得專屬 PTY
+4. 啟動 `minicom`
+5. 結束後自動 `session console-detach`
+
+```bash
+# 自動選第一個 READY session
+minicom
+
+# 指定 COM 或 alias
+minicom COM1
+minicom default+2
+
+# 無 broker 時直接 fallback raw device
+minicom -D /dev/ttyUSB0
+```
+
+重要限制：
+
+- minicom 看到的是透明 RX 視圖。
+- 一般 human 輸入會以「逐行」方式進入 broker queue，與 agent 共用單寫入仲裁。
+- 若要讓某個 console 進入 raw interactive ownership，先 `console-attach` 拿到 `client_id`，再用 `interactive-open --owner human:<client_id>` 開 lease。
+
+手動 console 控制範例：
+
+```bash
+serialwrap session console-attach --selector COM0 --label human:lab
+serialwrap session console-list --selector COM0
+serialwrap session interactive-open --selector COM0 --owner human:<client_id>
+serialwrap session interactive-close --interactive-id <interactive_id>
+serialwrap session console-detach --selector COM0 --client-id <client_id>
+```
+
+## 診斷與恢復
+
+### Self-test
+
+```bash
+serialwrap session self-test --selector COM0
+```
+
+常見 `classification`：
+
+- `OK`
+- `DEVICE_MISSING`
+- `DEVICE_REBOUND_REQUIRED`
+- `BRIDGE_DOWN`
+- `VTTY_STALE`
+- `TARGET_UNRESPONSIVE`
+- `SESSION_RECOVERING`
+
+### Recover
+
+```bash
+serialwrap session recover --selector COM0
+```
+
+recover 升級順序固定：
+
+1. `Ctrl-C`
+2. `Ctrl-D`
+3. `reboot -f`
+
+若進入 reboot recover，session 會轉成 `RECOVERING`，之後由 attach/login FSM 自動回到 `READY`。
+
+## 日誌與輸出
+
+| 檔案 | 說明 |
+|------|------|
+| `/tmp/serialwrap/wal/raw.wal.ndjson` | 權威事件記錄，保留 `seq/cmd_id/source/crc32/...` |
+| `/tmp/serialwrap/wal/raw.mirror.log` | 可讀文字鏡像，接近 console payload |
+| `/tmp/serialwrap/state.json` | alias 與 binding 持久化 |
+
+CLI 查詢：
+
+```bash
 serialwrap log tail-text --selector COM0 --from-seq 0 --limit 200
 serialwrap log tail-raw  --selector COM0 --from-seq 0 --limit 200
 serialwrap wal export --from-seq 0 --limit 500
 ```
 
-### MCP 呼叫
+說明：
+
+- `log tail-text` 偏向人類閱讀，不輸出 metadata header。
+- `log tail-raw` / `wal export` 仍保留完整權威欄位。
+- `stream tail` 與 MCP `serialwrap_tail_results` 為 legacy alias；新設計優先使用 `cmd result-tail` / `serialwrap_tail_command_result`。
+
+## MCP 使用
+
+### 核心工具
+
+| Tool | RPC |
+|------|-----|
+| `serialwrap_get_health` | `health.status` |
+| `serialwrap_list_devices` | `device.list` |
+| `serialwrap_list_sessions` | `session.list` |
+| `serialwrap_get_session_state` | `session.get_state` |
+| `serialwrap_bind_session` | `session.bind` |
+| `serialwrap_attach_session` | `session.attach` |
+| `serialwrap_self_test` | `session.self_test` |
+| `serialwrap_recover_session` | `session.recover` |
+| `serialwrap_submit_command` | `command.submit` |
+| `serialwrap_get_command` | `command.get` |
+| `serialwrap_tail_command_result` | `command.result_tail` |
+| `serialwrap_attach_console` | `session.console_attach` |
+| `serialwrap_detach_console` | `session.console_detach` |
+| `serialwrap_list_consoles` | `session.console_list` |
+| `serialwrap_open_interactive` | `session.interactive_open` |
+| `serialwrap_send_interactive_keys` | `session.interactive_send` |
+| `serialwrap_get_interactive_status` | `session.interactive_status` |
+| `serialwrap_close_interactive` | `session.interactive_close` |
+
+### Legacy alias
+
+| Tool | 說明 |
+|------|------|
+| `serialwrap_tail_results` | 舊工具名。若帶 `cmd_id` 走 `command.result_tail`；若帶 `selector/from_seq` 走 legacy `result.tail` raw records。 |
+
+### 範例
 
 ```bash
-serialwrap-mcp --help
 serialwrap-mcp --tool serialwrap_get_health --params "{}"
-serialwrap-mcp --tool serialwrap_list_sessions --params "{}"
-serialwrap-mcp --tool serialwrap_submit_command \
-  --params '{"selector":"COM0","cmd":"echo hello","source":"agent:mcp"}'
+serialwrap-mcp --tool serialwrap_get_session_state --params '{"selector":"COM0"}'
+serialwrap-mcp --tool serialwrap_submit_command --params '{"selector":"COM0","cmd":"ifconfig","source":"agent:mcp","mode":"line"}'
+serialwrap-mcp --tool serialwrap_get_command --params '{"cmd_id":"<cmd_id>"}'
+serialwrap-mcp --tool serialwrap_tail_command_result --params '{"cmd_id":"<cmd_id>","from_chunk":0,"limit":120}'
 ```
-
-### minicom 互動
-
-minicom_router.sh（`alias minicom="$INSTALL_DIR/minicom_router.sh"` 設好後直接輸入 `minicom`）會：
-
-1. **自動啟動 daemon**（若 daemon 未執行）
-2. **自動偵測並綁定裝置**（WSL `usbipd attach` 後直接可用，無需手動設定 `device_by_id`）
-3. **等待 session 進入 READY** 後以 minicom 連上 broker PTY
-
-```bash
-# 自動選第一個 READY session（COM0 優先）
-minicom
-
-# 指定 COM slot 或 alias
-minicom COM1
-minicom default+2
-
-# 指定 PTY 路徑（適合已知 vtty 的場景）
-minicom -D /dev/pts/5
-
-# 若 PTY 不屬於任何 broker session，直接透傳給 minicom
-minicom -D /dev/ttyUSB0
-```
-
-相關環境變數（可在 shell 設定覆蓋預設值）：
-
-| 變數 | 預設值 | 說明 |
-|------|--------|------|
-| `SERIALWRAP_AUTO_START_DAEMON` | `1` | `1` = 自動啟動 daemon |
-| `SERIALWRAP_ATTACH_WHEN_NOT_READY` | `1` | `1` = session 非 READY 時嘗試 attach |
-| `SERIALWRAP_ATTACH_WAIT_TICKS` | `60` | 等待 READY 的輪詢次數（× 0.2 秒 = 12 秒） |
-| `SERIALWRAP_PREFERRED_COM` | `COM0` | 無 selector 時優先選用的 COM slot |
-| `MINICOM_AUTO_CAPTURE` | `1` | `1` = 自動存 capture log 至 `$BLOG_DIR` |
-| `BLOG_DIR` | `~/b-log` | capture log 目錄（`$BUILD_LOG_PATH` 優先） |
 
 ## 測試
 
 ```bash
-# 全部測試
 python3 -m unittest discover -s tests -v
-
-# 單一測試檔
-python3 -m unittest tests.test_wal -v
-
-# 單一測試方法
-python3 -m unittest tests.test_wal.TestWal.test_append_and_tail -v
 ```
 
-## 規格書
+常用單測：
 
-詳細設計規格見 `docs/serialwrap-spec.md`。
+```bash
+python3 -m unittest tests.test_multiagent_e2e -v
+python3 -m unittest tests.test_session_bind -v
+```
+
+## 延伸閱讀
+
+- 詳細決策與 API 契約：[`docs/serialwrap-spec.md`](./docs/serialwrap-spec.md)

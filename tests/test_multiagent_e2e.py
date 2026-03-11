@@ -273,6 +273,12 @@ targets:
 
             self.assertFalse(pending, msg=f"pending cmd_ids: {sorted(pending)}")
 
+            for row in submit_rows:
+                st = self._run_cmd([SERIALWRAP, "--socket", socket_path, "cmd", "status", "--cmd-id", row["resp"]["cmd_id"]], env=env, timeout=5.0)
+                command = st.get("command") or {}
+                self.assertEqual(command.get("status"), "done", msg=f"unexpected command status: {st}")
+                self.assertIn(f"RESULT:{row['cmd']}:OK", command.get("stdout") or "")
+
             raw = self._run_cmd(
                 [SERIALWRAP, "--socket", socket_path, "log", "tail-raw", "--selector", "COM0", "--from-seq", "0", "--limit", "10000"],
                 env=env,

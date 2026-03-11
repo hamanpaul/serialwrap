@@ -27,7 +27,8 @@ class ProfileTemplate:
     post_login_cmd: str = ""
     ready_probe: str = "echo __READY__${nonce}; whoami"
     username: str | None = None
-    password_env: str | None = None
+    user_env: str | None = None
+    pass_env: str | None = None
     timeout_s: float = 10.0
     quiet_window_s: float = 2.0
     hard_timeout_s: float = 60.0
@@ -48,7 +49,8 @@ class SessionProfile:
     post_login_cmd: str = ""
     ready_probe: str = "echo __READY__${nonce}; whoami"
     username: str | None = None
-    password_env: str | None = None
+    user_env: str | None = None
+    pass_env: str | None = None
     timeout_s: float = 10.0
     quiet_window_s: float = 2.0
     hard_timeout_s: float = 60.0
@@ -99,7 +101,8 @@ def _template_from_dict(name: str, raw: dict[str, Any]) -> ProfileTemplate:
         post_login_cmd=str(raw.get("post_login_cmd") or "").strip(),
         ready_probe=str(raw.get("ready_probe") or "echo __READY__${nonce}; whoami").strip(),
         username=_as_opt_str(raw.get("username")),
-        password_env=_as_opt_str(raw.get("password_env")),
+        user_env=_as_opt_str(raw.get("user_env") or raw.get("username_env") or raw.get("login_env")),
+        pass_env=_as_opt_str(raw.get("pass_env") or raw.get("password_env") or raw.get("pw_env")),
         timeout_s=_as_float(raw.get("timeout_s"), 10.0),
         quiet_window_s=_as_float(raw.get("quiet_window_s"), 2.0),
         hard_timeout_s=_as_float(raw.get("hard_timeout_s"), 60.0),
@@ -151,7 +154,16 @@ def _merge_session(template: ProfileTemplate, target: dict[str, Any], *, act_no:
         post_login_cmd=str(target.get("post_login_cmd") or template.post_login_cmd).strip(),
         ready_probe=str(target.get("ready_probe") or template.ready_probe).strip(),
         username=_as_opt_str(target.get("username")) if target.get("username") is not None else template.username,
-        password_env=_as_opt_str(target.get("password_env")) if target.get("password_env") is not None else template.password_env,
+        user_env=(
+            _as_opt_str(target.get("user_env") or target.get("username_env") or target.get("login_env"))
+            if any(k in target for k in ("user_env", "username_env", "login_env"))
+            else template.user_env
+        ),
+        pass_env=(
+            _as_opt_str(target.get("pass_env") or target.get("password_env") or target.get("pw_env"))
+            if any(k in target for k in ("pass_env", "password_env", "pw_env"))
+            else template.pass_env
+        ),
         timeout_s=_as_float(target.get("timeout_s"), template.timeout_s),
         quiet_window_s=_as_float(target.get("quiet_window_s"), template.quiet_window_s),
         hard_timeout_s=_as_float(target.get("hard_timeout_s"), template.hard_timeout_s),
