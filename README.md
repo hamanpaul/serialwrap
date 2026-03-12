@@ -156,8 +156,8 @@ alias minicom="$INSTALL_DIR/minicom_router.sh"
 profiles:
   prpl-template:
     platform: prpl
-    prompt_regex: ".*# $"
-    ready_probe: "echo __READY__${nonce}; whoami"
+    prompt_regex: "(?m)^root@prplOS:.*# "
+    ready_probe: "echo __READY__${nonce}"
     uart:
       baud: 115200
       data_bits: 8
@@ -193,6 +193,8 @@ targets:
     profile: opi-shell
     device_by_id: /dev/serial/by-id/<target2>
 ```
+
+`prpl-template` 預設改成匹配 `root@prplOS:/#` 這種 prompt prefix，而不是要求 prompt 必須單獨佔一整行。這樣在 prompt 後面立刻接 driver / kernel log 的情況下，line mode 仍能正確收尾；`ready_probe` 也維持最小 `echo __READY__${nonce}`，避免在沒有 `whoami` 的 target 上增加噪音。
 
 `user_env` / `pass_env` 是每個 profile 自己指定的登入帳密環境變數名稱。CLI / daemon 不會把密碼寫進 YAML 或 WAL。`serialwrap daemon start` 會在啟動前先嘗試載入 `~/OPI.env`；若檔案不存在，則維持既有行為。
 

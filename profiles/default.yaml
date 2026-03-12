@@ -1,10 +1,10 @@
 profiles:
   prpl-template:
     platform: prpl
-    prompt_regex: ".*# $"
+    prompt_regex: "(?m)^root@prplOS:.*# "
     login_regex: "(?mi)^login:\\s*$"
     password_regex: "(?mi)^password:\\s*$"
-    ready_probe: "echo __READY__${nonce}; whoami"
+    ready_probe: "echo __READY__${nonce}"
     uart:
       baud: 115200
       data_bits: 8
