@@ -11,6 +11,8 @@ from typing import Any
 from .client import rpc_call
 from .constants import LOCK_PATH, PROFILE_DIR, SOCKET_PATH
 
+DEFAULT_DAEMON_ENV_FILE = os.environ.get("SERIALWRAP_DAEMON_ENV_FILE", "~/OPI.env")
+
 
 def _print(obj: dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
@@ -20,6 +22,40 @@ def _print(obj: dict[str, Any]) -> None:
 def _daemon_script_path() -> str:
     here = os.path.dirname(os.path.abspath(__file__))
     return os.path.normpath(os.path.join(here, "..", "serialwrapd.py"))
+
+
+def _decode_env_text(raw: bytes) -> str:
+    return raw.decode("utf-8", errors="surrogateescape")
+
+
+def _load_daemon_start_env(env_file: str | None = DEFAULT_DAEMON_ENV_FILE) -> tuple[dict[str, str], str | None]:
+    env = dict(os.environ)
+    if env_file is None:
+        return env, None
+
+    path = os.path.expanduser(env_file).strip()
+    if not path or not os.path.isfile(path):
+        return env, None
+
+    proc = subprocess.run(
+        ["bash", "-lc", 'set -a && source "$1" >/dev/null && env -0', "serialwrap", path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.returncode != 0:
+        stderr = _decode_env_text(proc.stderr).strip()
+        raise RuntimeError(stderr or f"failed to source {path}")
+
+    loaded_env: dict[str, str] = {}
+    for row in proc.stdout.split(b"\0"):
+        if not row:
+            continue
+        key, sep, value = row.partition(b"=")
+        if not sep:
+            continue
+        loaded_env[_decode_env_text(key)] = _decode_env_text(value)
+    return loaded_env, path
 
 
 def _run_daemon_start(args: argparse.Namespace) -> int:
@@ -33,10 +69,23 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
         "--lock",
         args.lock,
     ]
-    if args.foreground:
-        return subprocess.call(cmd)
+    try:
+        daemon_env, _ = _load_daemon_start_env()
+    except RuntimeError as exc:
+        _print(
+            {
+                "ok": False,
+                "error_code": "ENV_FILE_SOURCE_FAILED",
+                "env_file": os.path.expanduser(DEFAULT_DAEMON_ENV_FILE),
+                "message": str(exc),
+            }
+        )
+        return 2
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    if args.foreground:
+        return subprocess.call(cmd, env=daemon_env)
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, env=daemon_env)
 
     # 等待 daemon 就緒（最多 3 秒）
     for attempt in range(15):

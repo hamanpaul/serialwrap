@@ -80,10 +80,14 @@ sequenceDiagram
     D->>SM: update_devices
     SM->>U: attach by-id
     U->>T: empty line
-    U->>T: ready_probe
-    T-->>U: login/prompt/probe
-    U-->>SM: ready
-    SM-->>D: session READY
+    T-->>U: prompt / login / boot log
+    alt 已有 shell prompt
+        U->>T: ready_probe
+        T-->>U: nonce + prompt
+        U-->>SM: READY
+    else 尚未 ready
+        U-->>SM: ATTACHED
+    end
     D-->>CLI: health ok
 ```
 
@@ -105,7 +109,7 @@ flowchart TD
     I2 --> I3["close lease"]
     M1 -->|recover| R1["Ctrl-C"]
     R1 --> R2["Ctrl-D"]
-    R2 --> R3["reboot -f"]
+    R2 --> R3["停在 ATTACHED，等待人類或後續 agent 決策"]
 
     classDef flow fill:#eef7e8,stroke:#4f7a3f,stroke-width:1px;
     classDef warn fill:#fff4e6,stroke:#9a6b25,stroke-width:1px;
@@ -120,7 +124,7 @@ flowchart TD
 # 安裝
 ./install.sh
 
-# 啟動 daemon
+# 啟動 daemon（若 `~/OPI.env` 存在會先自動載入）
 serialwrap daemon start --profile-dir "$HOME/.paul_tools/profiles"
 
 # 檢查健康狀態
@@ -164,7 +168,7 @@ profiles:
   opi-shell:
     platform: shell
     prompt_regex: ".*[$#] $"
-    login_regex: "(?mi)^login:\\s*$"
+    login_regex: "(?mi)^.*login:\\s*$"
     password_regex: "(?mi)^password:\\s*$"
     user_env: "SW_OPI_U"
     pass_env: "SW_OPI_P"
@@ -190,15 +194,20 @@ targets:
     device_by_id: /dev/serial/by-id/<target2>
 ```
 
-`user_env` / `pass_env` 是每個 profile 自己指定的登入帳密環境變數名稱。CLI / daemon 不會把密碼寫進 YAML 或 WAL。
+`user_env` / `pass_env` 是每個 profile 自己指定的登入帳密環境變數名稱。CLI / daemon 不會把密碼寫進 YAML 或 WAL。`serialwrap daemon start` 會在啟動前先嘗試載入 `~/OPI.env`；若檔案不存在，則維持既有行為。
 
 ```bash
-export SW_OPI_U='haman'
-export SW_OPI_P='your-password'
+cat > ~/OPI.env <<'EOF'
+SW_OPI_U='haman'
+SW_OPI_P='your-password'
+EOF
+
 serialwrap daemon start --profile-dir "$HOME/.paul_tools/profiles"
 ```
 
-若 shell device 已經自動登入，`serialwrap` 會直接用 prompt + `ready_probe` 驗證；若先看到 `login:` / `password:`，則會依 `user_env` / `pass_env` 自動登入。
+若你偏好手動設定環境變數，也可以沿用原本的 `export SW_OPI_U=...` / `export SW_OPI_P=...` 方式再啟動 daemon。
+
+若 shell device 已經自動登入，`serialwrap` 會直接用 prompt + `ready_probe` 驗證；若先看到 `login:` / `password:`，則會依 `user_env` / `pass_env` 自動登入。像 Orange Pi 常見的 `orangepi3 login:`，建議 `login_regex` 用 `(?mi)^.*login:\\s*$`。
 
 常用查看：
 
@@ -258,7 +267,7 @@ serialwrap session interactive-close --interactive-id <interactive_id>
 5. 結束後自動 `session console-detach`
 
 ```bash
-# 自動選第一個 READY session
+# 自動選第一個 READY，否則退而求其次選 ATTACHED session
 minicom
 
 # 指定 COM 或 alias
@@ -272,8 +281,10 @@ minicom -D /dev/ttyUSB0
 重要限制：
 
 - minicom 看到的是透明 RX 視圖。
-- 一般 human 輸入會以「逐行」方式進入 broker queue，與 agent 共用單寫入仲裁。
+- 一般 human 輸入會以「逐行」方式進入 broker queue，與 agent 共用單寫入仲裁；broker 會替 minicom 做本地回顯與基本 backspace 行編輯。
+- 若 session 只有 `ATTACHED`（bridge 已掛上但尚未 ready），`session console-attach` 仍可進入 brokered minicom；這時 console 會自動拿到 raw human ownership，方便手動登入或觀察 boot/log 狀態。
 - 若要讓某個 console 進入 raw interactive ownership，先 `console-attach` 拿到 `client_id`，再用 `interactive-open --owner human:<client_id>` 開 lease。
+- 常見 human/minicom 互動式命令（例如 `vi`、`vim`、`top`、`htop`、`less`、`menuconfig`）會自動升級成 human interactive ownership，不再因為等不到 shell prompt 而自動觸發 recover / reboot。
 
 手動 console 控制範例：
 
@@ -302,6 +313,10 @@ serialwrap session self-test --selector COM0
 - `VTTY_STALE`
 - `TARGET_UNRESPONSIVE`
 - `SESSION_RECOVERING`
+- `LOGIN_REQUIRED`：bridge 已掛，看到 `login:` prompt，但無 `pending_auto_login`，等待 human 手動登入
+- `ATTACHED_NOT_READY`：bridge 已掛，但 prompt probe 失敗（如 boot log 中、前景程式仍在跑）
+- `REBOOTING`：agent 已送出 reboot 類指令，正在等待 target 重開機完畢後自動 relogin
+- `HUMAN_INTERACTIVE_ACTIVE`：human console 目前握有 interactive ownership，不適合 agent 干預
 
 ### Recover
 
@@ -313,9 +328,10 @@ recover 升級順序固定：
 
 1. `Ctrl-C`
 2. `Ctrl-D`
-3. `reboot -f`
 
-若進入 reboot recover，session 會轉成 `RECOVERING`，之後由 attach/login FSM 自動回到 `READY`。
+若 `Ctrl-C` / `Ctrl-D` 都救不回 prompt，session 會降級成 `ATTACHED`，保留 bridge 與 console，交由 human/minicom 接手。
+
+只有 **agent 明確送出 reboot 類指令** 時，daemon 才會進入 `RECOVERING`，並在 target 回來後自動重新 login / 回到 `READY`。
 
 ## 日誌與輸出
 

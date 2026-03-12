@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import re
+import shlex
 import threading
 from typing import Any
 
@@ -11,6 +13,85 @@ from .device_watcher import DeviceWatcher
 from .session_manager import SessionManager
 from .util import now_iso
 from .wal import WalWriter
+
+_HUMAN_INTERACTIVE_COMMANDS = {
+    "alsamixer",
+    "btop",
+    "htop",
+    "less",
+    "menuconfig",
+    "more",
+    "most",
+    "nano",
+    "nmtui",
+    "screen",
+    "tig",
+    "tmux",
+    "top",
+    "vi",
+    "view",
+    "vim",
+    "vimdiff",
+    "watch",
+}
+_ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
+
+
+def _human_console_mode(command: str) -> str:
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        tokens = command.strip().split()
+    if not tokens:
+        return "line"
+
+    idx = 0
+    while idx < len(tokens):
+        token = tokens[idx].strip()
+        if not token:
+            idx += 1
+            continue
+        if token == "--":
+            idx += 1
+            continue
+        if _ENV_ASSIGNMENT_RE.match(token):
+            idx += 1
+            continue
+
+        base = os.path.basename(token)
+        if base == "sudo":
+            idx += 1
+            while idx < len(tokens):
+                opt = tokens[idx]
+                if opt == "--":
+                    idx += 1
+                    break
+                if opt in {"-u", "-g", "-h", "-p", "-C", "-T", "-r", "-t"}:
+                    idx += 2
+                    continue
+                if opt.startswith("-"):
+                    idx += 1
+                    continue
+                break
+            continue
+        if base == "env":
+            idx += 1
+            while idx < len(tokens):
+                opt = tokens[idx]
+                if opt == "--":
+                    idx += 1
+                    break
+                if opt.startswith("-") or _ENV_ASSIGNMENT_RE.match(opt):
+                    idx += 1
+                    continue
+                break
+            continue
+        if base in {"command", "builtin", "exec"}:
+            idx += 1
+            continue
+
+        return "interactive" if base in _HUMAN_INTERACTIVE_COMMANDS else "line"
+    return "line"
 
 
 class SerialwrapService:
@@ -41,11 +122,12 @@ class SerialwrapService:
         return self._sessions.execute_command(session_id, command, source, cmd_id, timeout_s=timeout_s, mode=mode)
 
     def _on_console_line(self, session_id: str, client_id: str, line: str) -> None:
+        mode = _human_console_mode(line)
         self._arbiter.submit(
             session_id=session_id,
             command=line,
             source=f"human:{client_id}",
-            mode="line",
+            mode=mode,
             timeout_s=30.0,
             priority=100,
         )

@@ -3,7 +3,7 @@ import unittest
 from unittest import mock
 
 from sw_core.config import SessionProfile, UartProfile
-from sw_core.login_fsm import ensure_ready
+from sw_core.login_fsm import ensure_ready, probe_ready
 
 
 class TestLoginFsm(unittest.TestCase):
@@ -16,7 +16,7 @@ class TestLoginFsm(unittest.TestCase):
             device_by_id="/dev/serial/by-id/tty2",
             platform="shell",
             prompt_regex=r".*[$#] $",
-            login_regex=r"(?mi)^login:\s*$",
+            login_regex=r"(?mi)^.*login:\s*$",
             password_regex=r"(?mi)^password:\s*$",
             ready_probe="echo __READY__${nonce}",
             user_env="SW_OPI_U",
@@ -39,6 +39,19 @@ class TestLoginFsm(unittest.TestCase):
         bridge.send_secret.assert_called_once_with("secret")
         probe_calls = [call for call in bridge.send_command.call_args_list if "__READY__" in str(call)]
         self.assertEqual(len(probe_calls), 1)
+
+    def test_probe_ready_reports_login_required_without_auto_login(self) -> None:
+        bridge = mock.MagicMock()
+        bridge.wait_for_regex.return_value = False
+        bridge.rx_tail.return_value = "orangepi3 login: "
+        profile = self._make_shell_profile()
+
+        ok, err = probe_ready(bridge, profile)
+
+        self.assertFalse(ok)
+        self.assertEqual(err, "LOGIN_REQUIRED")
+        bridge.send_command.assert_called_once_with("", source="system")
+        bridge.send_secret.assert_not_called()
 
 
 if __name__ == "__main__":

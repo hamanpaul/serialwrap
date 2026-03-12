@@ -260,6 +260,44 @@ class UARTBridge:
             lines.append(raw.decode("utf-8", errors="replace"))
         return lines
 
+    def _pop_last_console_char(self, buf: bytearray) -> bool:
+        if not buf:
+            return False
+        idx = len(buf) - 1
+        while idx > 0 and (buf[idx] & 0xC0) == 0x80:
+            idx -= 1
+        del buf[idx:]
+        return True
+
+    def _consume_console_input(self, client: ConsoleClient, data: bytes) -> tuple[list[str], bytes]:
+        lines: list[str] = []
+        echo = bytearray()
+        last_terminator: int | None = None
+
+        for b in data:
+            if b in (0x08, 0x7F):
+                last_terminator = None
+                if self._pop_last_console_char(client.tx_buffer):
+                    echo.extend(b"\b \b")
+                continue
+
+            if b in (0x0A, 0x0D):
+                if last_terminator is not None and last_terminator != b and not client.tx_buffer:
+                    last_terminator = None
+                    continue
+                lines.append(client.tx_buffer.decode("utf-8", errors="replace"))
+                client.tx_buffer.clear()
+                echo.extend(b"\r\n")
+                last_terminator = b
+                continue
+
+            last_terminator = None
+            client.tx_buffer.append(b)
+            if b == 0x09 or 0x20 <= b <= 0x7E or b >= 0x80:
+                echo.append(b)
+
+        return lines, bytes(echo)
+
     def _handle_console_rx(self, client: ConsoleClient, data: bytes) -> None:
         owner = None
         with self._state_lock:
@@ -268,10 +306,15 @@ class UARTBridge:
             self.send_bytes(data, source=f"human:{client.client_id}", cmd_id=None)
             return
 
-        client.tx_buffer.extend(data)
+        lines, echo = self._consume_console_input(client, data)
+        if echo:
+            try:
+                self._write_console_best_effort(client.master_fd, echo)
+            except OSError:
+                pass
         if self._on_console_line is None:
             return
-        for line in self._drain_line_buffer(client):
+        for line in lines:
             self._on_console_line(client.client_id, line)
 
     def _loop(self) -> None:

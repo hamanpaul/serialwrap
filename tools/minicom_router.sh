@@ -72,6 +72,17 @@ _find_first_ready_row() {
   printf '%s' "${obj}" | jq -c '.sessions[]? | select(.state=="READY")' | head -n 1
 }
 
+_find_first_console_row() {
+  local obj="$1"
+  local row
+  row="$(_find_first_ready_row "${obj}")"
+  if [[ -n "${row}" ]]; then
+    printf '%s' "${row}"
+    return 0
+  fi
+  printf '%s' "${obj}" | jq -c '.sessions[]? | select(.state=="ATTACHED")' | head -n 1
+}
+
 _find_attach_selector_default() {
   local obj="$1"
   local pick
@@ -146,7 +157,7 @@ _ensure_daemon() {
   printf '%s' "${state_json}"
 }
 
-_wait_ready_row() {
+_wait_console_row() {
   local sel="$1"
   local row=""
   local state_json=""
@@ -158,12 +169,27 @@ _wait_ready_row() {
       continue
     fi
     row="$(_find_row_by_selector "${state_json}" "${sel}")"
-    if [[ -n "${row}" && "$(printf '%s' "${row}" | jq -r '.state // ""')" == "READY" ]]; then
-      printf '%s' "${row}"
-      return 0
+    if [[ -n "${row}" ]]; then
+      local state
+      state="$(printf '%s' "${row}" | jq -r '.state // ""')"
+      if [[ "${state}" == "READY" || "${state}" == "ATTACHED" ]]; then
+        printf '%s' "${row}"
+        return 0
+      fi
     fi
     sleep 0.2
   done
+  return 1
+}
+
+_wait_ready_row() {
+  local sel="$1"
+  local row=""
+  row="$(_wait_console_row "${sel}")" || return 1
+  if [[ "$(printf '%s' "${row}" | jq -r '.state // ""')" == "READY" ]]; then
+      printf '%s' "${row}"
+      return 0
+  fi
   return 1
 }
 
@@ -208,23 +234,28 @@ state_json="$(_ensure_daemon)"
 
 if _json_ok "${state_json}"; then
   if [[ -z "${selector}" ]]; then
-    row="$(_find_first_ready_row "${state_json}")"
+    row="$(_find_first_console_row "${state_json}")"
     if [[ -z "${row}" && "${ATTACH_WHEN_NOT_READY}" == "1" ]]; then
       selector="$(_find_attach_selector_default "${state_json}")"
       if [[ -n "${selector}" ]]; then
         "${SERIALWRAP_BIN}" --socket "${SOCKET}" session attach --selector "${selector}" >/dev/null 2>&1 || true
-        row="$(_wait_ready_row "${selector}")"
+        row="$(_wait_console_row "${selector}")"
       fi
     fi
   else
     row="$(_find_row_by_selector "${state_json}" "${selector}")"
-    if [[ -n "${row}" && "$(printf '%s' "${row}" | jq -r '.state // ""')" != "READY" && "${ATTACH_WHEN_NOT_READY}" == "1" ]]; then
+    if [[ -n "${row}" && "$(printf '%s' "${row}" | jq -r '.state // ""')" != "READY" && "$(printf '%s' "${row}" | jq -r '.state // ""')" != "ATTACHED" && "${ATTACH_WHEN_NOT_READY}" == "1" ]]; then
       "${SERIALWRAP_BIN}" --socket "${SOCKET}" session attach --selector "${selector}" >/dev/null 2>&1 || true
-      row="$(_wait_ready_row "${selector}")"
+      row="$(_wait_console_row "${selector}")"
     fi
   fi
 
-  if [[ -n "${row:-}" && "$(printf '%s' "${row}" | jq -r '.state // ""')" == "READY" ]]; then
+  if [[ -n "${row:-}" ]]; then
+    state="$(printf '%s' "${row}" | jq -r '.state // ""')"
+  else
+    state=""
+  fi
+  if [[ -n "${row:-}" && ( "${state}" == "READY" || "${state}" == "ATTACHED" ) ]]; then
     _run_broker_minicom "${row}" "$@"
     exit $?
   fi
@@ -240,7 +271,7 @@ if [[ -n "${MINICOM_RAW_DEVICE:-}" ]]; then
   exit $?
 fi
 
-echo "minicom_router: broker not ready, no READY session, and MINICOM_RAW_DEVICE not set" >&2
+echo "minicom_router: broker not ready, no READY/ATTACHED session, and MINICOM_RAW_DEVICE not set" >&2
 if [[ "$(printf '%s' "${state_json:-}" | jq -r '.ok // false' 2>/dev/null || printf 'false')" == "true" ]]; then
   echo "sessions:" >&2
   printf '%s' "${state_json}" | jq -r '.sessions[]? | "  - \(.com) \(.alias) state=\(.state) last_error=\(.last_error // "-")"' >&2 || true

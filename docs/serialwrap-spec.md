@@ -21,7 +21,7 @@
 - command 可回傳結構化結果
 - background / interactive / recover 有明確模型
 - 裝置換 tty、bridge stale、target 無回應可被分類
-- reboot 後可自動重新 attach / login / READY
+- 只有 agent 明確 reboot 時才自動重新 login / READY
 
 ### 2.2 核心不變量
 
@@ -87,16 +87,17 @@ flowchart LR
 ### 4.1 啟動步驟
 
 1. `serialwrap daemon start`
-2. 建立 runtime dirs / lock / socket
-3. 載入 `profiles/*.yaml`
-4. 建立 `SerialwrapService`
-5. 啟動 `DeviceWatcher`
-6. 首次掃描 by-id
-7. 依裝置嘗試 attach
-8. `UARTBridge.start()`
-9. `ensure_ready()`
-10. session 進 `READY`
-11. CLI / MCP 可正式提交命令
+2. CLI 若發現 `~/OPI.env`，先以 shell 載入帳密相關環境變數
+3. 建立 runtime dirs / lock / socket
+4. 載入 `profiles/*.yaml`
+5. 建立 `SerialwrapService`
+6. 啟動 `DeviceWatcher`
+7. 首次掃描 by-id
+8. 依裝置嘗試 attach
+9. `UARTBridge.start()`
+10. `ensure_ready()`
+11. session 進 `READY`
+12. CLI / MCP 可正式提交命令
 
 ### 4.2 啟動時序圖
 
@@ -111,6 +112,7 @@ sequenceDiagram
     participant T as Target
 
     User->>CLI: daemon start
+    CLI->>CLI: source ~/OPI.env (if exists)
     CLI->>D: spawn
     D->>W: start
     W->>S: update devices
@@ -129,15 +131,19 @@ sequenceDiagram
 
 - `DETACHED`
 - `ATTACHING`
+- `ATTACHED`
 - `READY`
 - `RECOVERING`
 
 ### 5.2 Console 模型
 
-- 每個 `READY` session 至少有一個 primary console PTY
+- 每個已掛上 bridge 的 session 都至少有一個 primary console PTY
 - `session.console_attach` 會再建立一個專屬 PTY
 - 所有 console 都收到同一份 RX fan-out
 - 非 interactive owner 的 human input 只會緩衝成 line，經 broker queue 執行
+- line-buffered human input 由 broker 提供本地回顯與基本 backspace 行編輯，避免 minicom 看不到鍵入內容
+- 常見 human/minicom 互動式命令（如 `vim`、`top`、`less`、`menuconfig`）可自動升級為 human interactive ownership，避免被誤判為 prompt timeout 故障
+- 若 session 僅為 `ATTACHED`，`session.console_attach` 仍可使用，且該 console 會自動拿到 raw human ownership，方便手動登入或觀察 boot/log
 
 ### 5.3 Command record
 
@@ -211,6 +217,8 @@ sequenceDiagram
 5. `session.interactive_status` 讀畫面
 6. `session.interactive_close` 釋放 lease
 
+若 `source=human:*` 的 line command 已送出但後續未回 prompt，daemon 會優先把該 console 升級成 human interactive，而不是直接觸發 recover。這條保護僅套用 human/minicom；agent foreground command 仍保留既有 prompt timeout / recover 路徑。
+
 ### 6.4 recover
 
 適用：
@@ -224,7 +232,7 @@ sequenceDiagram
 
 1. `Ctrl-C`
 2. `Ctrl-D`
-3. `reboot -f`
+3. 若仍無 prompt，session 降級為 `ATTACHED`
 
 ## 7. 呼叫流程圖
 
@@ -252,7 +260,7 @@ flowchart TD
     LP --> TO["timeout"]
     TO --> RC["Ctrl-C"]
     RC --> RD["Ctrl-D"]
-    RD --> RB["reboot -f"]
+    RD --> RA["mark ATTACHED"]
 ```
 
 ## 8. Device 變更與 reattach
@@ -276,7 +284,8 @@ flowchart TD
 - bridge 停止
 - session 先進 `DETACHED`
 - 重新 `_attach_by_id`
-- `ensure_ready()` 成功後回 `READY`
+- 若看到 shell prompt，送 `ready_probe` 後回 `READY`
+- 若沒看到 prompt，保留 bridge 並停在 `ATTACHED`
 
 ## 9. self_test 與 recover
 
@@ -291,6 +300,9 @@ flowchart TD
 - `BRIDGE_DOWN`
 - `VTTY_STALE`
 - `TARGET_UNRESPONSIVE`
+- `LOGIN_REQUIRED`
+- `ATTACHED_NOT_READY`
+- `REBOOTING`
 
 判斷順序：
 
@@ -310,13 +322,12 @@ flowchart TD
 1. 送 `Ctrl-C`
 2. 等 prompt
 3. 失敗則送 `Ctrl-D`
-4. 再失敗則送 `reboot -f`
-5. session 進 `RECOVERING`
-6. background thread 持續 reattach / relogin，直到 `READY` 或超時
+4. 再失敗則把 session 降級成 `ATTACHED`
 
 若 session 已無 bridge 但裝置還在：
 
-- 直接走 reattach / relogin
+- 直接走 reattach
+- attach 流程只做被動 prompt probe，不自動 login
 
 ## 10. Logging 與輸出層
 
@@ -438,7 +449,7 @@ flowchart TD
 
 1. 確認 daemon 存活，必要時自動啟動
 2. 找到 selector 對應 session
-3. session 非 READY 且允許自動 attach 時，先 `session attach`
+3. session 既非 `READY` 也非 `ATTACHED`，且允許自動 attach 時，先 `session attach`
 4. `session console-attach`
 5. 以回傳的 PTY 啟動 `minicom`
 6. minicom 結束後 `session console-detach`
@@ -465,7 +476,7 @@ flowchart TD
 
 `quiet_window_s` 目前用於 background capture idle finalize。
 
-`platform=shell` 可使用 `user_env` / `pass_env` 做 generic shell login。若裝置已自動登入並直接出現 prompt，daemon 會略過 login 流程，直接做 `ready_probe`。
+`platform=shell` 可使用 `user_env` / `pass_env` 做 generic shell login。`serialwrap daemon start` 會先嘗試載入 `~/OPI.env`，因此可將 `SW_OPI_U` / `SW_OPI_P` 放在該檔。若裝置 login prompt 會帶 hostname（例如 `orangepi3 login:`），建議 `login_regex` 使用 `(?mi)^.*login:\\s*$`。若裝置已自動登入並直接出現 prompt，daemon 會略過 login 流程，直接做 `ready_probe`。
 
 ## 14. 驗收標準
 
@@ -476,8 +487,8 @@ flowchart TD
 - human line input 不會繞過 broker
 - 裝置 real_path 變更時會 reattach
 - `self_test` 可區分主要故障類型
-- `recover` 可走 `Ctrl-C -> Ctrl-D -> reboot -f`
-- reboot 後可重新回 `READY`
+- `recover` 僅會走 `Ctrl-C -> Ctrl-D`
+- agent 明確 reboot 後可重新回 `READY`
 - README / spec / CLI / MCP 命名一致
 
 ## 15. 使用建議
