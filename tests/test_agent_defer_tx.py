@@ -108,6 +108,44 @@ class TestUARTBridgeConsoles(unittest.TestCase):
             self.assertEqual(captured[0][1], "ifconfig")
             self.assertEqual(target.received, [])
 
+    def test_console_input_supports_backspace_and_local_echo(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            target = self._make_target()
+            target.start()
+            self.addCleanup(target.stop)
+
+            captured: list[tuple[str, str]] = []
+            bridge = UARTBridge(
+                "COM0",
+                target.slave_path,
+                UartProfile(),
+                WalWriter(wal_dir=td),
+                on_console_line=lambda client_id, line: captured.append((client_id, line)),
+            )
+            bridge.start()
+            self.addCleanup(bridge.stop)
+
+            primary = bridge.vtty_path
+            assert primary is not None
+            fd = os.open(primary, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+            echoed = b""
+            try:
+                os.write(fd, b"abc\x7fd\n")
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and (not captured or b"abc\x08 \x08d\r\n" not in echoed):
+                    try:
+                        echoed += os.read(fd, 4096)
+                    except BlockingIOError:
+                        pass
+                    time.sleep(0.05)
+            finally:
+                os.close(fd)
+
+            self.assertEqual(len(captured), 1)
+            self.assertEqual(captured[0][1], "abd")
+            self.assertIn(b"abc\x08 \x08d\r\n", echoed)
+            self.assertEqual(target.received, [])
+
     def test_rx_is_fanned_out_to_all_consoles(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             target = self._make_target()

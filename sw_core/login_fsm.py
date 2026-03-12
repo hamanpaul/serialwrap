@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 import uuid
 
@@ -42,6 +43,38 @@ def _prompt_timeout_error(sp: SessionProfile) -> str:
     return "PRPL_PROMPT_TIMEOUT"
 
 
+def _probe_prompt(bridge: UARTBridge, sp: SessionProfile) -> bool:
+    bridge.clear_rx_buffer()
+    bridge.send_command("", source="system")
+    return bridge.wait_for_regex(sp.prompt_regex, sp.timeout_s)
+
+
+def _classify_non_ready_state(bridge: UARTBridge, sp: SessionProfile) -> str:
+    snapshot = bridge.rx_tail()
+    if re.search(sp.login_regex, snapshot):
+        return "LOGIN_REQUIRED"
+    return "PROMPT_UNAVAILABLE"
+
+
+def _finalize_ready(bridge: UARTBridge, sp: SessionProfile) -> tuple[bool, str | None]:
+    if sp.post_login_cmd:
+        bridge.send_command(sp.post_login_cmd, source="system")
+        ok, err = _wait_or_fail(bridge, sp.prompt_regex, sp.timeout_s, "POST_LOGIN_CMD_TIMEOUT")
+        if not ok:
+            return ok, err
+
+    nonce = uuid.uuid4().hex[:8]
+    probe = sp.ready_probe.replace("${nonce}", nonce)
+    bridge.send_command(probe, source="system")
+    ok, err = _wait_or_fail(bridge, nonce, sp.timeout_s, "READY_NONCE_TIMEOUT")
+    if not ok:
+        return ok, err
+    ok, err = _wait_or_fail(bridge, sp.prompt_regex, sp.timeout_s, "READY_PROMPT_TIMEOUT")
+    if not ok:
+        return ok, err
+    return True, None
+
+
 def _maybe_login(bridge: UARTBridge, sp: SessionProfile) -> tuple[bool, str | None]:
     user, err = _resolve_login_user(sp)
     needs_login = bool(user or sp.pass_env)
@@ -69,30 +102,17 @@ def _maybe_login(bridge: UARTBridge, sp: SessionProfile) -> tuple[bool, str | No
     return ok, err
 
 
-def ensure_ready(bridge: UARTBridge, sp: SessionProfile) -> tuple[bool, str | None]:
-    bridge.clear_rx_buffer()
-    bridge.send_command("", source="system")
+def probe_ready(bridge: UARTBridge, sp: SessionProfile) -> tuple[bool, str | None]:
+    if not _probe_prompt(bridge, sp):
+        return False, _classify_non_ready_state(bridge, sp)
+    return _finalize_ready(bridge, sp)
 
-    if not bridge.wait_for_regex(sp.prompt_regex, sp.timeout_s):
+
+def ensure_ready(bridge: UARTBridge, sp: SessionProfile) -> tuple[bool, str | None]:
+    if not _probe_prompt(bridge, sp):
         ok, err = _maybe_login(bridge, sp)
         if err is not None:
             return ok, err
         if not ok:
             return False, _prompt_timeout_error(sp)
-
-    if sp.post_login_cmd:
-        bridge.send_command(sp.post_login_cmd, source="system")
-        ok, err = _wait_or_fail(bridge, sp.prompt_regex, sp.timeout_s, "POST_LOGIN_CMD_TIMEOUT")
-        if not ok:
-            return ok, err
-
-    nonce = uuid.uuid4().hex[:8]
-    probe = sp.ready_probe.replace("${nonce}", nonce)
-    bridge.send_command(probe, source="system")
-    ok, err = _wait_or_fail(bridge, nonce, sp.timeout_s, "READY_NONCE_TIMEOUT")
-    if not ok:
-        return ok, err
-    ok, err = _wait_or_fail(bridge, sp.prompt_regex, sp.timeout_s, "READY_PROMPT_TIMEOUT")
-    if not ok:
-        return ok, err
-    return True, None
+    return _finalize_ready(bridge, sp)

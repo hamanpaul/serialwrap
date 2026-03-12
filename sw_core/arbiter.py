@@ -55,7 +55,7 @@ class CommandArbiter:
                 pq.put_nowait(_QueuedCommand(sort_key=(0, 0), cmd_id="", session_id="", command="", source="", mode="", timeout_s=0.0))
             except Exception:
                 pass
-        if th and th.is_alive():
+        if th and th.is_alive() and th is not threading.current_thread():
             th.join(timeout=1.0)
 
     def submit(

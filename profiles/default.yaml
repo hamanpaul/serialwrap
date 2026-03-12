@@ -15,7 +15,7 @@ profiles:
   opi-shell:
     platform: shell
     prompt_regex: ".*[$#] $"
-    login_regex: "(?mi)^login:\\s*$"
+    login_regex: "(?mi)^.*login:\\s*$"
     password_regex: "(?mi)^password:\\s*$"
     user_env: "SW_OPI_U"
     pass_env: "SW_OPI_P"

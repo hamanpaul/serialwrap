@@ -79,6 +79,7 @@ class TestConfigProfiles(unittest.TestCase):
                       opi-shell:
                         platform: shell
                         prompt_regex: ".*[$#] $"
+                        login_regex: '(?mi)^.*login:\s*$'
                         user_env: "SW_OPI_U"
                         pass_env: "SW_OPI_P"
                         ready_probe: "echo __READY__${nonce}"
@@ -96,6 +97,7 @@ class TestConfigProfiles(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0].profile_name, "opi-shell")
             self.assertEqual(rows[0].platform, "shell")
+            self.assertEqual(rows[0].login_regex, r"(?mi)^.*login:\s*$")
             self.assertEqual(rows[0].user_env, "SW_OPI_U")
             self.assertEqual(rows[0].pass_env, "SW_OPI_P")
             self.assertEqual(rows[0].ready_probe, "echo __READY__${nonce}")
