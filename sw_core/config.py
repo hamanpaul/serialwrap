@@ -21,11 +21,11 @@ class UartProfile:
 class ProfileTemplate:
     profile_name: str
     platform: str = "prpl"
-    prompt_regex: str = r".*# $"
+    prompt_regex: str = r"(?m)^root@prplOS:.*# "
     login_regex: str = r"(?mi)^login:\\s*$"
     password_regex: str = r"(?mi)^password:\\s*$"
     post_login_cmd: str = ""
-    ready_probe: str = "echo __READY__${nonce}; whoami"
+    ready_probe: str = "echo __READY__${nonce}"
     username: str | None = None
     user_env: str | None = None
     pass_env: str | None = None
@@ -43,11 +43,11 @@ class SessionProfile:
     alias: str
     device_by_id: str
     platform: str
-    prompt_regex: str = r".*# $"
+    prompt_regex: str = r"(?m)^root@prplOS:.*# "
     login_regex: str = r"(?mi)^login:\\s*$"
     password_regex: str = r"(?mi)^password:\\s*$"
     post_login_cmd: str = ""
-    ready_probe: str = "echo __READY__${nonce}; whoami"
+    ready_probe: str = "echo __READY__${nonce}"
     username: str | None = None
     user_env: str | None = None
     pass_env: str | None = None
@@ -95,11 +95,11 @@ def _template_from_dict(name: str, raw: dict[str, Any]) -> ProfileTemplate:
     return ProfileTemplate(
         profile_name=name,
         platform=str(raw.get("platform") or "prpl").strip().lower(),
-        prompt_regex=str(raw.get("prompt_regex") or r".*# $").strip(),
+        prompt_regex=str(raw.get("prompt_regex") or r"(?m)^root@prplOS:.*# "),
         login_regex=str(raw.get("login_regex") or r"(?mi)^login:\\s*$").strip(),
         password_regex=str(raw.get("password_regex") or r"(?mi)^password:\\s*$").strip(),
         post_login_cmd=str(raw.get("post_login_cmd") or "").strip(),
-        ready_probe=str(raw.get("ready_probe") or "echo __READY__${nonce}; whoami").strip(),
+        ready_probe=str(raw.get("ready_probe") or "echo __READY__${nonce}").strip(),
         username=_as_opt_str(raw.get("username")),
         user_env=_as_opt_str(raw.get("user_env") or raw.get("username_env") or raw.get("login_env")),
         pass_env=_as_opt_str(raw.get("pass_env") or raw.get("password_env") or raw.get("pw_env")),
@@ -148,7 +148,7 @@ def _merge_session(template: ProfileTemplate, target: dict[str, Any], *, act_no:
         alias=alias,
         device_by_id=device_by_id,
         platform=str(target.get("platform") or template.platform).strip().lower(),
-        prompt_regex=str(target.get("prompt_regex") or template.prompt_regex).strip(),
+        prompt_regex=str(target.get("prompt_regex") or template.prompt_regex),
         login_regex=str(target.get("login_regex") or template.login_regex).strip(),
         password_regex=str(target.get("password_regex") or template.password_regex).strip(),
         post_login_cmd=str(target.get("post_login_cmd") or template.post_login_cmd).strip(),

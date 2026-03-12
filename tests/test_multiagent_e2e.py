@@ -38,7 +38,7 @@ class FakeTarget:
         termios.tcsetattr(fd, termios.TCSANOW, attrs)
 
     def start(self) -> None:
-        os.write(self.master_fd, b"boot done\r\n# ")
+        os.write(self.master_fd, b"boot done\r\nroot@prplOS:/# ")
         self._cmd_thread.start()
         self._noise_thread.start()
 
@@ -85,11 +85,11 @@ class FakeTarget:
                 cmd = line.replace(b"\r", b"").decode("utf-8", errors="replace").strip()
                 if not cmd:
                     try:
-                        os.write(self.master_fd, b"# ")
+                        os.write(self.master_fd, b"root@prplOS:/# ")
                     except OSError:
                         return
                     continue
-                out = f"EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\n# ".encode("utf-8")
+                out = f"EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# ".encode("utf-8")
                 try:
                     os.write(self.master_fd, out)
                 except OSError:
@@ -152,8 +152,8 @@ class TestMultiAgentE2E(unittest.TestCase):
             profile = f"""profiles:
   prpl-template:
     platform: prpl
-    prompt_regex: ".*# "
-    ready_probe: "echo __READY__${{nonce}}; whoami"
+    prompt_regex: "(?m)^root@prplOS:.*# "
+    ready_probe: "echo __READY__${{nonce}}"
     uart:
       baud: 115200
       data_bits: 8

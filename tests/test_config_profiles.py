@@ -39,7 +39,8 @@ class TestConfigProfiles(unittest.TestCase):
                     profiles:
                       prpl-template:
                         platform: prpl
-                        prompt_regex: ".*# $"
+                        prompt_regex: "(?m)^root@prplOS:.*# "
+                        ready_probe: "echo __READY__${nonce}"
                         uart:
                           baud: 115200
                           data_bits: 8
@@ -68,6 +69,10 @@ class TestConfigProfiles(unittest.TestCase):
             self.assertEqual(rows[1].uart.baud, 115200)
             self.assertEqual(rows[0].device_by_id, "/dev/serial/by-id/tty0")
             self.assertEqual(rows[1].device_by_id, "/dev/serial/by-id/tty1")
+            self.assertEqual(rows[0].prompt_regex, r"(?m)^root@prplOS:.*# ")
+            self.assertEqual(rows[1].prompt_regex, r"(?m)^root@prplOS:.*# ")
+            self.assertEqual(rows[0].ready_probe, "echo __READY__${nonce}")
+            self.assertEqual(rows[1].ready_probe, "echo __READY__${nonce}")
 
     def test_shell_profile_loads_short_env_fields(self) -> None:
         with tempfile.TemporaryDirectory() as td:
