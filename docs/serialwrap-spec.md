@@ -143,7 +143,9 @@ sequenceDiagram
 - 非 interactive owner 的 human input 只會緩衝成 line，經 broker queue 執行
 - line-buffered human input 由 broker 提供本地回顯與基本 backspace 行編輯，避免 minicom 看不到鍵入內容
 - 常見 human/minicom 互動式命令（如 `vim`、`top`、`less`、`menuconfig`）可自動升級為 human interactive ownership，避免被誤判為 prompt timeout 故障
+- human interactive ownership 存在時，agent foreground/background 命令不會立即失敗，而是等待 ownership 釋放；若超過該命令 timeout，才回 `SESSION_INTERACTIVE_BUSY`
 - 若 session 僅為 `ATTACHED`，`session.console_attach` 仍可使用，且該 console 會自動拿到 raw human ownership，方便手動登入或觀察 boot/log
+- `platform=passthrough` 的 session attach 後不做 prompt/login/ready 探測，直接停在 `ATTACHED`，供未知設備走純 bridge/passthrough 路徑
 
 ### 5.3 Command record
 
@@ -477,6 +479,8 @@ flowchart TD
 `quiet_window_s` 目前用於 background capture idle finalize。
 
 `platform=shell` 可使用 `user_env` / `pass_env` 做 generic shell login。`serialwrap daemon start` 會先嘗試載入 `~/OPI.env`，因此可將 `SW_OPI_U` / `SW_OPI_P` 放在該檔。若裝置 login prompt 會帶 hostname（例如 `orangepi3 login:`），建議 `login_regex` 使用 `(?mi)^.*login:\\s*$`。若裝置已自動登入並直接出現 prompt，daemon 會略過 login 流程，直接做 `ready_probe`。
+
+`platform=passthrough` 則完全不做 `ready_probe` / login 流程。daemon 只負責建立 UART bridge 與 console PTY，session 會停在 `ATTACHED`，由 human console 或後續人工判斷設備型態。
 
 對 prplOS 這類會把 driver / kernel log 直接接在 prompt 後面的 target，`prompt_regex` 應偏向匹配 prompt prefix，例如 `(?m)^root@prplOS:.*# `，不要只依賴行尾錨點。`ready_probe` 也建議保持最小 `echo __READY__${nonce}`，避免像 `whoami` 這類 target 可能不存在的指令干擾 ready 判定。
 

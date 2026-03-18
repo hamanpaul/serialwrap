@@ -434,6 +434,7 @@ class SessionManager:
     def _attach_by_id(self, by_id: str) -> None:
         save_needed = False
         require_login = False
+        passthrough_only = False
         with self._lock:
             session = next((s for s in self._sessions.values() if s.profile.device_by_id == by_id), None)
             if session is None:
@@ -449,6 +450,7 @@ class SessionManager:
             dev = self._devices.get(by_id)
             if session is not None:
                 require_login = session.pending_auto_login
+                passthrough_only = session.profile.platform == "passthrough"
         if save_needed:
             self._save_state()
         if session is None or dev is None or session.bridge is not None:
@@ -468,7 +470,10 @@ class SessionManager:
 
         try:
             bridge.start()
-            if require_login:
+            if passthrough_only:
+                ok = False
+                err = None
+            elif require_login:
                 ok, err = ensure_ready(bridge, session.profile)
                 if not ok:
                     bridge.stop()
@@ -596,6 +601,12 @@ class SessionManager:
             self._close_interactive_locked(session, interactive_id=lease_id)
             return None
         if lease.owner.startswith("human:"):
+            client_id = lease.owner.split(":", 1)[1]
+            if not session.bridge.console_has_external_peer(client_id):
+                session.bridge.detach_console(client_id)
+                session.vtty_path = session.bridge.vtty_path
+                self._close_interactive_locked(session, interactive_id=lease_id)
+                return None
             snapshot = session.bridge.snapshot()
             if snapshot.get("interactive_owner") != lease.owner:
                 self._close_interactive_locked(session, interactive_id=lease_id)
@@ -614,6 +625,30 @@ class SessionManager:
             session.pending_auto_login = False
         if notify_not_ready:
             self._on_detached(session.session_id)
+
+    def _wait_for_human_interactive_release(
+        self,
+        session_id: str,
+        *,
+        timeout_s: float,
+    ) -> tuple[bool, str | None]:
+        deadline = time.monotonic() + timeout_s
+
+        while time.monotonic() < deadline:
+            with self._lock:
+                session = self._sessions.get(session_id)
+                if session is None or session.bridge is None or session.state != "READY":
+                    return False, "SESSION_NOT_READY"
+                if session.recovering:
+                    return False, "SESSION_RECOVERING"
+                lease = self._refresh_interactive_locked(session)
+                if lease is None:
+                    return True, None
+                if not lease.owner.startswith("human:"):
+                    return False, "SESSION_INTERACTIVE_BUSY"
+            time.sleep(0.05)
+
+        return False, "SESSION_INTERACTIVE_BUSY"
 
     def _spawn_reboot_recovery(self, session_id: str, timeout_s: float) -> None:
         def _run() -> None:
@@ -741,6 +776,7 @@ class SessionManager:
         mode: str = "line",
     ) -> dict[str, Any]:
         normalized_mode = {"fg": "line", "bg": "background"}.get(mode, mode)
+        wait_for_human_interactive = False
         with self._lock:
             session = self._sessions.get(session_id)
             if session is None or session.bridge is None or session.state != "READY":
@@ -749,9 +785,33 @@ class SessionManager:
                 return {"ok": False, "error_code": "SESSION_RECOVERING"}
             lease = self._refresh_interactive_locked(session)
             if lease is not None and normalized_mode != "interactive":
-                return {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY", "interactive_session_id": session.interactive_session_id}
+                if not source.startswith("human:") and lease.owner.startswith("human:"):
+                    wait_for_human_interactive = True
+                else:
+                    return {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY", "interactive_session_id": session.interactive_session_id}
             bridge = session.bridge
             prompt_regex = session.profile.prompt_regex
+
+        if wait_for_human_interactive:
+            wait_ok, wait_error = self._wait_for_human_interactive_release(session_id, timeout_s=timeout_s)
+            if not wait_ok:
+                with self._lock:
+                    current = self._sessions.get(session_id)
+                    result = {"ok": False, "error_code": wait_error or "SESSION_INTERACTIVE_BUSY"}
+                    if current is not None and current.interactive_session_id is not None:
+                        result["interactive_session_id"] = current.interactive_session_id
+                    return result
+            with self._lock:
+                session = self._sessions.get(session_id)
+                if session is None or session.bridge is None or session.state != "READY":
+                    return {"ok": False, "error_code": "SESSION_NOT_READY"}
+                if session.recovering:
+                    return {"ok": False, "error_code": "SESSION_RECOVERING"}
+                lease = self._refresh_interactive_locked(session)
+                if lease is not None:
+                    return {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY", "interactive_session_id": session.interactive_session_id}
+                bridge = session.bridge
+                prompt_regex = session.profile.prompt_regex
 
         if normalized_mode == "interactive":
             with self._lock:
@@ -1071,7 +1131,10 @@ class SessionManager:
                     "recommended_action": "console_attach",
                 }
             if session.state == "ATTACHED":
-                if session.last_error == "LOGIN_REQUIRED":
+                if session.profile.platform == "passthrough":
+                    classification = "PASSTHROUGH"
+                    recommended_action = "console_attach"
+                elif session.last_error == "LOGIN_REQUIRED":
                     classification = "LOGIN_REQUIRED"
                     recommended_action = "console_attach"
                 elif session.last_error == "REBOOTING":

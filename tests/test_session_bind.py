@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import dataclasses
 from pathlib import Path
 
 from sw_core.config import SessionProfile, UartProfile
@@ -317,6 +318,112 @@ class TestSessionBind(unittest.TestCase):
         self.assertNotIn("lease-2", mgr._interactive)
         bridge.set_interactive_owner.assert_called_with(None)
 
+    def test_refresh_interactive_releases_stale_human_console(self) -> None:
+        import unittest.mock as mock
+
+        profiles = [self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")]
+        mgr = SessionManager(profiles, WalWriter(wal_dir=self._tmp.name), on_ready=lambda _sid: None, on_detached=lambda _sid: None)
+        session = mgr.get_session("COM0")
+        self.assertIsNotNone(session)
+        assert session is not None
+
+        bridge = mock.MagicMock()
+        bridge.console_has_external_peer.return_value = False
+        bridge.detach_console.return_value = True
+        bridge.vtty_path = "/dev/pts/9"
+        session.bridge = bridge
+        session.state = "READY"
+
+        lease = InteractiveLease(
+            interactive_id="lease-stale",
+            session_id=session.session_id,
+            owner="human:cid-stale",
+            created_at="now",
+            timeout_s=60.0,
+        )
+        with mgr._lock:
+            mgr._interactive[lease.interactive_id] = lease
+            session.interactive_session_id = lease.interactive_id
+
+        refreshed = mgr._refresh_interactive_locked(session)
+
+        self.assertIsNone(refreshed)
+        self.assertIsNone(session.interactive_session_id)
+        self.assertNotIn("lease-stale", mgr._interactive)
+        bridge.detach_console.assert_called_once_with("cid-stale")
+        bridge.set_interactive_owner.assert_called_with(None)
+
+    def test_agent_command_waits_for_human_interactive_release(self) -> None:
+        import unittest.mock as mock
+
+        profiles = [self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")]
+        mgr = SessionManager(profiles, WalWriter(wal_dir=self._tmp.name), on_ready=lambda _sid: None, on_detached=lambda _sid: None)
+        session = mgr.get_session("COM0")
+        self.assertIsNotNone(session)
+        assert session is not None
+
+        bridge = mock.MagicMock()
+        bridge.console_has_external_peer.side_effect = [True, False]
+        bridge.snapshot.return_value = {"interactive_owner": "human:cid-wait"}
+        bridge.detach_console.return_value = True
+        bridge.vtty_path = "/dev/pts/9"
+        bridge.rx_snapshot_len.return_value = 10
+        bridge.wait_for_regex_from.return_value = True
+        bridge.rx_text_from.return_value = "RESULT:ifconfig:OK\nroot@prplOS:/# "
+        session.bridge = bridge
+        session.state = "READY"
+
+        lease = InteractiveLease(
+            interactive_id="lease-wait",
+            session_id=session.session_id,
+            owner="human:cid-wait",
+            created_at="now",
+            timeout_s=60.0,
+        )
+        with mgr._lock:
+            mgr._interactive[lease.interactive_id] = lease
+            session.interactive_session_id = lease.interactive_id
+
+        resp = mgr.execute_command("p:COM0", "ifconfig", "agent:test", "cmd-wait", timeout_s=0.2)
+
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["stdout"], "RESULT:ifconfig:OK")
+        bridge.send_command.assert_called_once_with("ifconfig", source="agent:test", cmd_id="cmd-wait")
+        self.assertIsNone(session.interactive_session_id)
+
+    def test_agent_command_times_out_when_human_interactive_persists(self) -> None:
+        import unittest.mock as mock
+
+        profiles = [self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")]
+        mgr = SessionManager(profiles, WalWriter(wal_dir=self._tmp.name), on_ready=lambda _sid: None, on_detached=lambda _sid: None)
+        session = mgr.get_session("COM0")
+        self.assertIsNotNone(session)
+        assert session is not None
+
+        bridge = mock.MagicMock()
+        bridge.console_has_external_peer.return_value = True
+        bridge.snapshot.return_value = {"interactive_owner": "human:cid-busy"}
+        session.bridge = bridge
+        session.state = "READY"
+
+        lease = InteractiveLease(
+            interactive_id="lease-busy",
+            session_id=session.session_id,
+            owner="human:cid-busy",
+            created_at="now",
+            timeout_s=60.0,
+        )
+        with mgr._lock:
+            mgr._interactive[lease.interactive_id] = lease
+            session.interactive_session_id = lease.interactive_id
+
+        resp = mgr.execute_command("p:COM0", "ifconfig", "agent:test", "cmd-busy", timeout_s=0.1)
+
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error_code"], "SESSION_INTERACTIVE_BUSY")
+        self.assertEqual(resp["interactive_session_id"], "lease-busy")
+        bridge.send_command.assert_not_called()
+
     def test_auto_bind_on_device_attach(self) -> None:
         """裝置 by-id 不符合 profile 佔位符時，_attach_by_id 應自動綁定並更新 device_by_id。"""
         from sw_core.device_watcher import DeviceInfo
@@ -483,6 +590,70 @@ class TestSessionBind(unittest.TestCase):
 
         self.assertTrue(resp["ok"])
         self.assertEqual(resp["classification"], "LOGIN_REQUIRED")
+        self.assertEqual(resp["recommended_action"], "console_attach")
+        bridge.send_command.assert_not_called()
+
+    def test_passthrough_attach_skips_prompt_probe_and_stays_attached(self) -> None:
+        from sw_core.device_watcher import DeviceInfo
+        import unittest.mock as mock
+        import time
+
+        profiles = [self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")]
+        profiles[0] = dataclasses.replace(profiles[0], platform="passthrough", ready_probe="")
+        mgr = SessionManager(profiles, WalWriter(wal_dir=self._tmp.name), on_ready=lambda _sid: None, on_detached=lambda _sid: None)
+
+        with (
+            mock.patch("sw_core.session_manager.UARTBridge") as MockBridge,
+            mock.patch("sw_core.session_manager.probe_ready") as probe_ready,
+            mock.patch("sw_core.session_manager.ensure_ready") as ensure_ready,
+        ):
+            MockBridge.return_value.vtty_path = "/dev/pts/9"
+            MockBridge.return_value.start.return_value = None
+            mgr.update_devices(
+                {
+                    "/dev/serial/by-id/orig": DeviceInfo(
+                        by_id="/dev/serial/by-id/orig",
+                        real_path="/dev/ttyUSB0",
+                    )
+                }
+            )
+            for _ in range(40):
+                session = mgr.get_session("COM0")
+                if session is not None and session.state == "ATTACHED":
+                    break
+                time.sleep(0.05)
+
+        session = mgr.get_session("COM0")
+        assert session is not None
+        self.assertEqual(session.state, "ATTACHED")
+        self.assertIsNone(session.last_error)
+        probe_ready.assert_not_called()
+        ensure_ready.assert_not_called()
+
+    def test_self_test_reports_passthrough_for_attached_session(self) -> None:
+        from sw_core.device_watcher import DeviceInfo
+        import unittest.mock as mock
+
+        profiles = [self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")]
+        mgr = SessionManager(profiles, WalWriter(wal_dir=self._tmp.name), on_ready=lambda _sid: None, on_detached=lambda _sid: None)
+        session = mgr.get_session("COM0")
+        assert session is not None
+        session.profile = dataclasses.replace(session.profile, platform="passthrough", ready_probe="")
+
+        bridge = mock.MagicMock()
+        bridge.snapshot.return_value = {"running": True, "serial_alive": True, "vtty_alive": True, "vtty": "/dev/pts/9"}
+        session.bridge = bridge
+        session.state = "ATTACHED"
+        session.attached_real_path = "/dev/ttyUSB0"
+        with mgr._lock:
+            mgr._devices = {
+                "/dev/serial/by-id/orig": DeviceInfo(by_id="/dev/serial/by-id/orig", real_path="/dev/ttyUSB0")
+            }
+
+        resp = mgr.self_test("COM0")
+
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["classification"], "PASSTHROUGH")
         self.assertEqual(resp["recommended_action"], "console_attach")
         bridge.send_command.assert_not_called()
 

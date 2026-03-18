@@ -12,7 +12,7 @@ profiles:
       stop_bits: 1
       flow_control: none
       xonxoff: false
-  opi-shell:
+  op3-template:
     platform: shell
     prompt_regex: ".*[$#] $"
     login_regex: "(?mi)^.*login:\\s*$"
@@ -20,6 +20,19 @@ profiles:
     user_env: "SW_OPI_U"
     pass_env: "SW_OPI_P"
     ready_probe: "echo __READY__${nonce}"
+    uart:
+      baud: 115200
+      data_bits: 8
+      parity: N
+      stop_bits: 1
+      flow_control: none
+      xonxoff: false
+  others-template:
+    platform: passthrough
+    prompt_regex: ".*"
+    login_regex: "$^"
+    password_regex: "$^"
+    ready_probe: ""
     uart:
       baud: 115200
       data_bits: 8
@@ -42,10 +55,10 @@ targets:
   - act_no: 3
     com: COM2
     alias: default+3
-    profile: opi-shell
+    profile: op3-template
     device_by_id: /dev/serial/by-id/target2
   - act_no: 4
     com: COM3
     alias: default+4
-    profile: prpl-template
+    profile: others-template
     device_by_id: /dev/serial/by-id/target3

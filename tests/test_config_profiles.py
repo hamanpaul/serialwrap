@@ -81,7 +81,7 @@ class TestConfigProfiles(unittest.TestCase):
                 textwrap.dedent(
                     """
                     profiles:
-                      opi-shell:
+                      op3-template:
                         platform: shell
                         prompt_regex: ".*[$#] $"
                         login_regex: '(?mi)^.*login:\s*$'
@@ -92,7 +92,7 @@ class TestConfigProfiles(unittest.TestCase):
                       - act_no: 3
                         com: COM2
                         alias: shell+3
-                        profile: opi-shell
+                        profile: op3-template
                         device_by_id: /dev/serial/by-id/tty2
                     """
                 ),
@@ -100,12 +100,42 @@ class TestConfigProfiles(unittest.TestCase):
             )
             rows = load_profiles(td)
             self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0].profile_name, "opi-shell")
+            self.assertEqual(rows[0].profile_name, "op3-template")
             self.assertEqual(rows[0].platform, "shell")
             self.assertEqual(rows[0].login_regex, r"(?mi)^.*login:\s*$")
             self.assertEqual(rows[0].user_env, "SW_OPI_U")
             self.assertEqual(rows[0].pass_env, "SW_OPI_P")
             self.assertEqual(rows[0].ready_probe, "echo __READY__${nonce}")
+
+    def test_passthrough_profile_loads_without_ready_constraints(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "others.yaml"
+            p.write_text(
+                textwrap.dedent(
+                    """
+                    profiles:
+                      others-template:
+                        platform: passthrough
+                        prompt_regex: ".*"
+                        login_regex: "$^"
+                        password_regex: "$^"
+                        ready_probe: ""
+                    targets:
+                      - act_no: 4
+                        com: COM3
+                        alias: others+4
+                        profile: others-template
+                        device_by_id: /dev/serial/by-id/tty3
+                    """
+                ),
+                encoding="utf-8",
+            )
+            rows = load_profiles(td)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].profile_name, "others-template")
+            self.assertEqual(rows[0].platform, "passthrough")
+            self.assertEqual(rows[0].prompt_regex, ".*")
+            self.assertEqual(rows[0].ready_probe, "")
 
 
 if __name__ == "__main__":
