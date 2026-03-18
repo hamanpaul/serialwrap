@@ -133,7 +133,7 @@ class TestUARTBridgeConsoles(unittest.TestCase):
             try:
                 os.write(fd, b"abc\x7fd\n")
                 deadline = time.monotonic() + 2.0
-                while time.monotonic() < deadline and (not captured or b"abc\x08 \x08d\r\n" not in echoed):
+                while time.monotonic() < deadline and (not captured or b"abc\x08 \x08d\r" not in echoed):
                     try:
                         echoed += os.read(fd, 4096)
                     except BlockingIOError:
@@ -144,7 +144,7 @@ class TestUARTBridgeConsoles(unittest.TestCase):
 
             self.assertEqual(len(captured), 1)
             self.assertEqual(captured[0][1], "abd")
-            self.assertIn(b"abc\x08 \x08d\r\n", echoed)
+            self.assertIn(b"abc\x08 \x08d\r", echoed)
             self.assertEqual(target.received, [])
 
     def test_rx_is_fanned_out_to_all_consoles(self) -> None:

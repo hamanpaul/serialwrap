@@ -35,7 +35,7 @@ rm -f "${TARGET_DIR}/serialwrap_lib.py"
 rm -f "${TARGET_DIR}/__pycache__/serialwrap_lib."*.pyc 2>/dev/null || true
 
 DEFAULT_PROFILE_PATH="${TARGET_DIR}/profiles/default.yaml"
-DEFAULT_PLACEHOLDER_BY_ID="/dev/serial/by-id/target0"
+DEFAULT_PLACEHOLDER_BY_ID="/dev/serial/by-id/target3"
 INSTALL_AUTOBIND="${SERIALWRAP_INSTALL_AUTOBIND:-1}"
 
 if [[ "${INSTALL_AUTOBIND}" == "1" && -f "${DEFAULT_PROFILE_PATH}" ]]; then

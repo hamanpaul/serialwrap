@@ -315,7 +315,9 @@ class UARTBridge:
                     continue
                 lines.append(client.tx_buffer.decode("utf-8", errors="replace"))
                 client.tx_buffer.clear()
-                echo.extend(b"\r\n")
+                # Commit the local line visually without adding an extra blank
+                # line before the target shell echoes the submitted command.
+                echo.extend(b"\r")
                 last_terminator = b
                 continue
 

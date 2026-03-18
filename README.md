@@ -165,7 +165,7 @@ profiles:
       stop_bits: 1
       flow_control: none
       xonxoff: false
-  opi-shell:
+  op3-template:
     platform: shell
     prompt_regex: ".*[$#] $"
     login_regex: "(?mi)^.*login:\\s*$"
@@ -173,6 +173,19 @@ profiles:
     user_env: "SW_OPI_U"
     pass_env: "SW_OPI_P"
     ready_probe: "echo __READY__${nonce}"
+    uart:
+      baud: 115200
+      data_bits: 8
+      parity: N
+      stop_bits: 1
+      flow_control: none
+      xonxoff: false
+  others-template:
+    platform: passthrough
+    prompt_regex: ".*"
+    login_regex: "$^"
+    password_regex: "$^"
+    ready_probe: ""
     uart:
       baud: 115200
       data_bits: 8
@@ -190,13 +203,18 @@ targets:
   - act_no: 3
     com: COM2
     alias: default+3
-    profile: opi-shell
+    profile: op3-template
     device_by_id: /dev/serial/by-id/<target2>
+  - act_no: 4
+    com: COM3
+    alias: default+4
+    profile: others-template
+    device_by_id: /dev/serial/by-id/<target3>
 ```
 
 `prpl-template` 預設改成匹配 `root@prplOS:/#` 這種 prompt prefix，而不是要求 prompt 必須單獨佔一整行。這樣在 prompt 後面立刻接 driver / kernel log 的情況下，line mode 仍能正確收尾；`ready_probe` 也維持最小 `echo __READY__${nonce}`，避免在沒有 `whoami` 的 target 上增加噪音。
 
-`user_env` / `pass_env` 是每個 profile 自己指定的登入帳密環境變數名稱。CLI / daemon 不會把密碼寫進 YAML 或 WAL。`serialwrap daemon start` 會在啟動前先嘗試載入 `~/OPI.env`；若檔案不存在，則維持既有行為。
+`op3-template` 沿用 generic shell login 模型，適合 Orange Pi / Debian shell。`user_env` / `pass_env` 是每個 profile 自己指定的登入帳密環境變數名稱。CLI / daemon 不會把密碼寫進 YAML 或 WAL。`serialwrap daemon start` 會在啟動前先嘗試載入 `~/OPI.env`；若檔案不存在，則維持既有行為。
 
 ```bash
 cat > ~/OPI.env <<'EOF'
@@ -210,6 +228,8 @@ serialwrap daemon start --profile-dir "$HOME/.paul_tools/profiles"
 若你偏好手動設定環境變數，也可以沿用原本的 `export SW_OPI_U=...` / `export SW_OPI_P=...` 方式再啟動 daemon。
 
 若 shell device 已經自動登入，`serialwrap` 會直接用 prompt + `ready_probe` 驗證；若先看到 `login:` / `password:`，則會依 `user_env` / `pass_env` 自動登入。像 Orange Pi 常見的 `orangepi3 login:`，建議 `login_regex` 用 `(?mi)^.*login:\\s*$`。
+
+`others-template` 使用 `platform=passthrough`。attach 時不做 prompt/login/ready 限制，只建立 broker bridge，讓 `ttyUSB` 與 broker 建出的 `ttyPTS` 直接透傳；這類 session 會停在 `ATTACHED`，適合不認識的設備先用 minicom/human console 觀察。
 
 常用查看：
 

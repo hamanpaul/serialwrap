@@ -78,6 +78,12 @@ def _as_opt_str(v: Any) -> str | None:
     return s if s else None
 
 
+def _as_str_keep_empty(v: Any, default: str) -> str:
+    if v is None:
+        return default
+    return str(v).strip()
+
+
 def _load_uart(raw: Any, default: UartProfile | None = None) -> UartProfile:
     base = default or UartProfile()
     obj = raw if isinstance(raw, dict) else {}
@@ -99,7 +105,7 @@ def _template_from_dict(name: str, raw: dict[str, Any]) -> ProfileTemplate:
         login_regex=str(raw.get("login_regex") or r"(?mi)^login:\\s*$").strip(),
         password_regex=str(raw.get("password_regex") or r"(?mi)^password:\\s*$").strip(),
         post_login_cmd=str(raw.get("post_login_cmd") or "").strip(),
-        ready_probe=str(raw.get("ready_probe") or "echo __READY__${nonce}").strip(),
+        ready_probe=_as_str_keep_empty(raw.get("ready_probe"), "echo __READY__${nonce}"),
         username=_as_opt_str(raw.get("username")),
         user_env=_as_opt_str(raw.get("user_env") or raw.get("username_env") or raw.get("login_env")),
         pass_env=_as_opt_str(raw.get("pass_env") or raw.get("password_env") or raw.get("pw_env")),
@@ -152,7 +158,7 @@ def _merge_session(template: ProfileTemplate, target: dict[str, Any], *, act_no:
         login_regex=str(target.get("login_regex") or template.login_regex).strip(),
         password_regex=str(target.get("password_regex") or template.password_regex).strip(),
         post_login_cmd=str(target.get("post_login_cmd") or template.post_login_cmd).strip(),
-        ready_probe=str(target.get("ready_probe") or template.ready_probe).strip(),
+        ready_probe=_as_str_keep_empty(target.get("ready_probe"), template.ready_probe),
         username=_as_opt_str(target.get("username")) if target.get("username") is not None else template.username,
         user_env=(
             _as_opt_str(target.get("user_env") or target.get("username_env") or target.get("login_env"))

@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import dataclasses
 from pathlib import Path
 
 from sw_core.config import SessionProfile, UartProfile
@@ -589,6 +590,70 @@ class TestSessionBind(unittest.TestCase):
 
         self.assertTrue(resp["ok"])
         self.assertEqual(resp["classification"], "LOGIN_REQUIRED")
+        self.assertEqual(resp["recommended_action"], "console_attach")
+        bridge.send_command.assert_not_called()
+
+    def test_passthrough_attach_skips_prompt_probe_and_stays_attached(self) -> None:
+        from sw_core.device_watcher import DeviceInfo
+        import unittest.mock as mock
+        import time
+
+        profiles = [self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")]
+        profiles[0] = dataclasses.replace(profiles[0], platform="passthrough", ready_probe="")
+        mgr = SessionManager(profiles, WalWriter(wal_dir=self._tmp.name), on_ready=lambda _sid: None, on_detached=lambda _sid: None)
+
+        with (
+            mock.patch("sw_core.session_manager.UARTBridge") as MockBridge,
+            mock.patch("sw_core.session_manager.probe_ready") as probe_ready,
+            mock.patch("sw_core.session_manager.ensure_ready") as ensure_ready,
+        ):
+            MockBridge.return_value.vtty_path = "/dev/pts/9"
+            MockBridge.return_value.start.return_value = None
+            mgr.update_devices(
+                {
+                    "/dev/serial/by-id/orig": DeviceInfo(
+                        by_id="/dev/serial/by-id/orig",
+                        real_path="/dev/ttyUSB0",
+                    )
+                }
+            )
+            for _ in range(40):
+                session = mgr.get_session("COM0")
+                if session is not None and session.state == "ATTACHED":
+                    break
+                time.sleep(0.05)
+
+        session = mgr.get_session("COM0")
+        assert session is not None
+        self.assertEqual(session.state, "ATTACHED")
+        self.assertIsNone(session.last_error)
+        probe_ready.assert_not_called()
+        ensure_ready.assert_not_called()
+
+    def test_self_test_reports_passthrough_for_attached_session(self) -> None:
+        from sw_core.device_watcher import DeviceInfo
+        import unittest.mock as mock
+
+        profiles = [self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")]
+        mgr = SessionManager(profiles, WalWriter(wal_dir=self._tmp.name), on_ready=lambda _sid: None, on_detached=lambda _sid: None)
+        session = mgr.get_session("COM0")
+        assert session is not None
+        session.profile = dataclasses.replace(session.profile, platform="passthrough", ready_probe="")
+
+        bridge = mock.MagicMock()
+        bridge.snapshot.return_value = {"running": True, "serial_alive": True, "vtty_alive": True, "vtty": "/dev/pts/9"}
+        session.bridge = bridge
+        session.state = "ATTACHED"
+        session.attached_real_path = "/dev/ttyUSB0"
+        with mgr._lock:
+            mgr._devices = {
+                "/dev/serial/by-id/orig": DeviceInfo(by_id="/dev/serial/by-id/orig", real_path="/dev/ttyUSB0")
+            }
+
+        resp = mgr.self_test("COM0")
+
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["classification"], "PASSTHROUGH")
         self.assertEqual(resp["recommended_action"], "console_attach")
         bridge.send_command.assert_not_called()
 

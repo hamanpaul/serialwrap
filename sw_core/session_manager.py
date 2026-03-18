@@ -434,6 +434,7 @@ class SessionManager:
     def _attach_by_id(self, by_id: str) -> None:
         save_needed = False
         require_login = False
+        passthrough_only = False
         with self._lock:
             session = next((s for s in self._sessions.values() if s.profile.device_by_id == by_id), None)
             if session is None:
@@ -449,6 +450,7 @@ class SessionManager:
             dev = self._devices.get(by_id)
             if session is not None:
                 require_login = session.pending_auto_login
+                passthrough_only = session.profile.platform == "passthrough"
         if save_needed:
             self._save_state()
         if session is None or dev is None or session.bridge is not None:
@@ -468,7 +470,10 @@ class SessionManager:
 
         try:
             bridge.start()
-            if require_login:
+            if passthrough_only:
+                ok = False
+                err = None
+            elif require_login:
                 ok, err = ensure_ready(bridge, session.profile)
                 if not ok:
                     bridge.stop()
@@ -1126,7 +1131,10 @@ class SessionManager:
                     "recommended_action": "console_attach",
                 }
             if session.state == "ATTACHED":
-                if session.last_error == "LOGIN_REQUIRED":
+                if session.profile.platform == "passthrough":
+                    classification = "PASSTHROUGH"
+                    recommended_action = "console_attach"
+                elif session.last_error == "LOGIN_REQUIRED":
                     classification = "LOGIN_REQUIRED"
                     recommended_action = "console_attach"
                 elif session.last_error == "REBOOTING":
