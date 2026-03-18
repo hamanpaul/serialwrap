@@ -621,6 +621,30 @@ class SessionManager:
         if notify_not_ready:
             self._on_detached(session.session_id)
 
+    def _wait_for_human_interactive_release(
+        self,
+        session_id: str,
+        *,
+        timeout_s: float,
+    ) -> tuple[bool, str | None]:
+        deadline = time.monotonic() + timeout_s
+
+        while time.monotonic() < deadline:
+            with self._lock:
+                session = self._sessions.get(session_id)
+                if session is None or session.bridge is None or session.state != "READY":
+                    return False, "SESSION_NOT_READY"
+                if session.recovering:
+                    return False, "SESSION_RECOVERING"
+                lease = self._refresh_interactive_locked(session)
+                if lease is None:
+                    return True, None
+                if not lease.owner.startswith("human:"):
+                    return False, "SESSION_INTERACTIVE_BUSY"
+            time.sleep(0.05)
+
+        return False, "SESSION_INTERACTIVE_BUSY"
+
     def _spawn_reboot_recovery(self, session_id: str, timeout_s: float) -> None:
         def _run() -> None:
             deadline = time.monotonic() + timeout_s
@@ -747,6 +771,7 @@ class SessionManager:
         mode: str = "line",
     ) -> dict[str, Any]:
         normalized_mode = {"fg": "line", "bg": "background"}.get(mode, mode)
+        wait_for_human_interactive = False
         with self._lock:
             session = self._sessions.get(session_id)
             if session is None or session.bridge is None or session.state != "READY":
@@ -755,9 +780,33 @@ class SessionManager:
                 return {"ok": False, "error_code": "SESSION_RECOVERING"}
             lease = self._refresh_interactive_locked(session)
             if lease is not None and normalized_mode != "interactive":
-                return {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY", "interactive_session_id": session.interactive_session_id}
+                if not source.startswith("human:") and lease.owner.startswith("human:"):
+                    wait_for_human_interactive = True
+                else:
+                    return {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY", "interactive_session_id": session.interactive_session_id}
             bridge = session.bridge
             prompt_regex = session.profile.prompt_regex
+
+        if wait_for_human_interactive:
+            wait_ok, wait_error = self._wait_for_human_interactive_release(session_id, timeout_s=timeout_s)
+            if not wait_ok:
+                with self._lock:
+                    current = self._sessions.get(session_id)
+                    result = {"ok": False, "error_code": wait_error or "SESSION_INTERACTIVE_BUSY"}
+                    if current is not None and current.interactive_session_id is not None:
+                        result["interactive_session_id"] = current.interactive_session_id
+                    return result
+            with self._lock:
+                session = self._sessions.get(session_id)
+                if session is None or session.bridge is None or session.state != "READY":
+                    return {"ok": False, "error_code": "SESSION_NOT_READY"}
+                if session.recovering:
+                    return {"ok": False, "error_code": "SESSION_RECOVERING"}
+                lease = self._refresh_interactive_locked(session)
+                if lease is not None:
+                    return {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY", "interactive_session_id": session.interactive_session_id}
+                bridge = session.bridge
+                prompt_regex = session.profile.prompt_regex
 
         if normalized_mode == "interactive":
             with self._lock:

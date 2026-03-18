@@ -143,6 +143,7 @@ sequenceDiagram
 - 非 interactive owner 的 human input 只會緩衝成 line，經 broker queue 執行
 - line-buffered human input 由 broker 提供本地回顯與基本 backspace 行編輯，避免 minicom 看不到鍵入內容
 - 常見 human/minicom 互動式命令（如 `vim`、`top`、`less`、`menuconfig`）可自動升級為 human interactive ownership，避免被誤判為 prompt timeout 故障
+- human interactive ownership 存在時，agent foreground/background 命令不會立即失敗，而是等待 ownership 釋放；若超過該命令 timeout，才回 `SESSION_INTERACTIVE_BUSY`
 - 若 session 僅為 `ATTACHED`，`session.console_attach` 仍可使用，且該 console 會自動拿到 raw human ownership，方便手動登入或觀察 boot/log
 
 ### 5.3 Command record

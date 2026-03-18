@@ -287,6 +287,7 @@ minicom -D /dev/ttyUSB0
 - 若 session 只有 `ATTACHED`（bridge 已掛上但尚未 ready），`session console-attach` 仍可進入 brokered minicom；這時 console 會自動拿到 raw human ownership，方便手動登入或觀察 boot/log 狀態。
 - 若要讓某個 console 進入 raw interactive ownership，先 `console-attach` 拿到 `client_id`，再用 `interactive-open --owner human:<client_id>` 開 lease。
 - 常見 human/minicom 互動式命令（例如 `vi`、`vim`、`top`、`htop`、`less`、`menuconfig`）會自動升級成 human interactive ownership，不再因為等不到 shell prompt 而自動觸發 recover / reboot。
+- human interactive ownership 存在時，agent 的 `line` / `background` 命令會在 worker 內等待 ownership 釋放；若超過該命令自己的 timeout，才會回 `SESSION_INTERACTIVE_BUSY`。
 
 手動 console 控制範例：
 
