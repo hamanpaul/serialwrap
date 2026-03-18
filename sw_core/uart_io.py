@@ -184,6 +184,34 @@ class UARTBridge:
             except OSError:
                 pass
 
+    def _client_has_external_peer_locked(self, client: ConsoleClient) -> bool:
+        self_pid = os.getpid()
+        try:
+            pids = os.listdir("/proc")
+        except OSError:
+            # Be conservative when procfs is unavailable.
+            return True
+
+        for pid_text in pids:
+            if not pid_text.isdigit():
+                continue
+            pid = int(pid_text)
+            if pid == self_pid:
+                continue
+            fd_dir = os.path.join("/proc", pid_text, "fd")
+            try:
+                fd_names = os.listdir(fd_dir)
+            except OSError:
+                continue
+            for fd_name in fd_names:
+                try:
+                    target = os.readlink(os.path.join(fd_dir, fd_name))
+                except OSError:
+                    continue
+                if target == client.slave_path:
+                    return True
+        return False
+
     def _drop_console_client(self, client_id: str) -> None:
         with self._state_lock:
             client = self._clients.pop(client_id, None)
@@ -461,6 +489,13 @@ class UARTBridge:
                 }
                 for client in sorted(self._clients.values(), key=lambda row: (row.label, row.client_id))
             ]
+
+    def console_has_external_peer(self, client_id: str) -> bool:
+        with self._state_lock:
+            client = self._clients.get(client_id)
+            if client is None:
+                return False
+            return self._client_has_external_peer_locked(client)
 
     def set_interactive_owner(self, owner: str | None) -> None:
         with self._state_lock:

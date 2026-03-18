@@ -596,6 +596,12 @@ class SessionManager:
             self._close_interactive_locked(session, interactive_id=lease_id)
             return None
         if lease.owner.startswith("human:"):
+            client_id = lease.owner.split(":", 1)[1]
+            if not session.bridge.console_has_external_peer(client_id):
+                session.bridge.detach_console(client_id)
+                session.vtty_path = session.bridge.vtty_path
+                self._close_interactive_locked(session, interactive_id=lease_id)
+                return None
             snapshot = session.bridge.snapshot()
             if snapshot.get("interactive_owner") != lease.owner:
                 self._close_interactive_locked(session, interactive_id=lease_id)

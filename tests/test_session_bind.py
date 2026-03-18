@@ -317,6 +317,41 @@ class TestSessionBind(unittest.TestCase):
         self.assertNotIn("lease-2", mgr._interactive)
         bridge.set_interactive_owner.assert_called_with(None)
 
+    def test_refresh_interactive_releases_stale_human_console(self) -> None:
+        import unittest.mock as mock
+
+        profiles = [self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")]
+        mgr = SessionManager(profiles, WalWriter(wal_dir=self._tmp.name), on_ready=lambda _sid: None, on_detached=lambda _sid: None)
+        session = mgr.get_session("COM0")
+        self.assertIsNotNone(session)
+        assert session is not None
+
+        bridge = mock.MagicMock()
+        bridge.console_has_external_peer.return_value = False
+        bridge.detach_console.return_value = True
+        bridge.vtty_path = "/dev/pts/9"
+        session.bridge = bridge
+        session.state = "READY"
+
+        lease = InteractiveLease(
+            interactive_id="lease-stale",
+            session_id=session.session_id,
+            owner="human:cid-stale",
+            created_at="now",
+            timeout_s=60.0,
+        )
+        with mgr._lock:
+            mgr._interactive[lease.interactive_id] = lease
+            session.interactive_session_id = lease.interactive_id
+
+        refreshed = mgr._refresh_interactive_locked(session)
+
+        self.assertIsNone(refreshed)
+        self.assertIsNone(session.interactive_session_id)
+        self.assertNotIn("lease-stale", mgr._interactive)
+        bridge.detach_console.assert_called_once_with("cid-stale")
+        bridge.set_interactive_owner.assert_called_with(None)
+
     def test_auto_bind_on_device_attach(self) -> None:
         """裝置 by-id 不符合 profile 佔位符時，_attach_by_id 應自動綁定並更新 device_by_id。"""
         from sw_core.device_watcher import DeviceInfo

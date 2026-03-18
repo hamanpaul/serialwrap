@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import pty
 import select
+import subprocess
 import tempfile
 import threading
 import time
@@ -222,6 +223,42 @@ class TestUARTBridgeConsoles(unittest.TestCase):
 
             self.assertEqual(len(captured), 1)
             self.assertEqual(captured[0][1], "echo still-works")
+
+    def test_console_external_peer_tracking(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            target = self._make_target()
+            target.start()
+            self.addCleanup(target.stop)
+
+            bridge = UARTBridge("COM0", target.slave_path, UartProfile(), WalWriter(wal_dir=td))
+            bridge.start()
+            self.addCleanup(bridge.stop)
+
+            attached = bridge.attach_console(label="observer")
+            client_id = attached["client_id"]
+
+            self.assertFalse(bridge.console_has_external_peer(client_id))
+
+            proc = subprocess.Popen(
+                [
+                    os.environ.get("PYTHON", "python3"),
+                    "-c",
+                    "import os, sys, time; fd = os.open(sys.argv[1], os.O_RDWR | os.O_NOCTTY); time.sleep(1.5); os.close(fd)",
+                    attached["vtty"],
+                ]
+            )
+            try:
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and not bridge.console_has_external_peer(client_id):
+                    time.sleep(0.05)
+                self.assertTrue(bridge.console_has_external_peer(client_id))
+            finally:
+                proc.wait(timeout=3.0)
+
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and bridge.console_has_external_peer(client_id):
+                time.sleep(0.05)
+            self.assertFalse(bridge.console_has_external_peer(client_id))
 
 
 if __name__ == "__main__":
