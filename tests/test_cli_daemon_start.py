@@ -30,6 +30,36 @@ class TestCliDaemonStart(unittest.TestCase):
         self.assertIsNone(loaded)
         self.assertEqual(env["SERIALWRAP_TEST_FLAG"], "1")
 
+    def test_resolve_daemon_start_env_files_uses_legacy_fallback(self) -> None:
+        """不設 SERIALWRAP_DAEMON_ENV_FILE 時，回退到 legacy ~/OPI.env。"""
+        with mock.patch.dict(os.environ, {}, clear=True):
+            env_files = cli._resolve_daemon_start_env_files("/tmp/any-profile-dir")
+
+        self.assertEqual(env_files, ["~/OPI.env"])
+
+    def test_resolve_daemon_start_env_files_explicit_override_wins(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile = os.path.join(td, "default.yaml")
+            with open(profile, "w", encoding="utf-8") as fp:
+                fp.write(
+                    """
+profiles:
+  op3-template:
+    platform: shell
+    env_file: OPI.env
+targets:
+  - act_no: 3
+    com: COM2
+    profile: op3-template
+    device_by_id: /dev/serial/by-id/tty2
+""".lstrip()
+                )
+
+            with mock.patch.dict(os.environ, {"SERIALWRAP_DAEMON_ENV_FILE": "/tmp/global.env"}, clear=True):
+                env_files = cli._resolve_daemon_start_env_files(td)
+
+        self.assertEqual(env_files, ["/tmp/global.env"])
+
     def test_run_daemon_start_passes_loaded_env_to_daemon(self) -> None:
         args = argparse.Namespace(
             profile_dir="/tmp/profiles",
@@ -41,7 +71,8 @@ class TestCliDaemonStart(unittest.TestCase):
         proc.poll.return_value = None
 
         with (
-            mock.patch("sw_core.cli._load_daemon_start_env", return_value=({"SW_OPI_U": "haman"}, "/tmp/OPI.env")),
+            mock.patch("sw_core.cli._resolve_daemon_start_env_files", return_value=["/tmp/OPI.env"]),
+            mock.patch("sw_core.cli._load_daemon_start_env_files", return_value=({"SW_OPI_U": "haman"}, ["/tmp/OPI.env"])),
             mock.patch("sw_core.cli.subprocess.Popen", return_value=proc) as popen,
             mock.patch("sw_core.cli.rpc_call", side_effect=[{"ok": True}, {"ok": True, "warnings": ["no_profiles_loaded"]}]),
             mock.patch("sw_core.cli.time.sleep"),
@@ -54,6 +85,7 @@ class TestCliDaemonStart(unittest.TestCase):
         payload = printer.call_args.args[0]
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["pid"], 4321)
+        self.assertEqual(payload["env_files"], ["/tmp/OPI.env"])
         self.assertEqual(payload["warnings"], ["no_profiles_loaded"])
 
     def test_run_daemon_start_reports_env_source_failure(self) -> None:
@@ -65,7 +97,8 @@ class TestCliDaemonStart(unittest.TestCase):
         )
 
         with (
-            mock.patch("sw_core.cli._load_daemon_start_env", side_effect=RuntimeError("bad env")),
+            mock.patch("sw_core.cli._resolve_daemon_start_env_files", return_value=["/tmp/OPI.env"]),
+            mock.patch("sw_core.cli._load_daemon_start_env_files", side_effect=cli.EnvFileSourceError("/tmp/OPI.env", "bad env")),
             mock.patch("sw_core.cli._print") as printer,
         ):
             rc = cli._run_daemon_start(args)
@@ -74,7 +107,8 @@ class TestCliDaemonStart(unittest.TestCase):
         payload = printer.call_args.args[0]
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["error_code"], "ENV_FILE_SOURCE_FAILED")
-        self.assertIn("OPI.env", payload["env_file"])
+        self.assertEqual(payload["env_file"], "/tmp/OPI.env")
+        self.assertEqual(payload["env_files"], ["/tmp/OPI.env"])
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ import uuid
 from typing import Any, Callable
 
 from .alias_registry import AliasRegistry
+from .auth import resolve_session_auth
 from .config import SessionProfile
 from .constants import STATE_PATH
 from .device_watcher import DeviceInfo
@@ -474,7 +475,8 @@ class SessionManager:
                 ok = False
                 err = None
             elif require_login:
-                ok, err = ensure_ready(bridge, session.profile)
+                auth = resolve_session_auth(session.profile)
+                ok, err = ensure_ready(bridge, session.profile, auth=auth)
                 if not ok:
                     bridge.stop()
                     with self._lock:
@@ -661,7 +663,8 @@ class SessionManager:
                     bridge = session.bridge
                     by_id = session.profile.device_by_id
                 if bridge is not None:
-                    ok, err = ensure_ready(bridge, session.profile)
+                    auth = resolve_session_auth(session.profile)
+                    ok, err = ensure_ready(bridge, session.profile, auth=auth)
                     if ok:
                         with self._lock:
                             session = self._sessions.get(session_id)

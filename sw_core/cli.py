@@ -6,12 +6,20 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from typing import Any
 
 from .client import rpc_call
 from .constants import LOCK_PATH, PROFILE_DIR, SOCKET_PATH
 
-DEFAULT_DAEMON_ENV_FILE = os.environ.get("SERIALWRAP_DAEMON_ENV_FILE", "~/OPI.env")
+_USE_DEFAULT_ENV = object()
+LEGACY_DAEMON_ENV_FILE = "~/OPI.env"
+
+
+class EnvFileSourceError(RuntimeError):
+    def __init__(self, path: str, message: str) -> None:
+        super().__init__(message)
+        self.path = path
 
 
 def _print(obj: dict[str, Any]) -> None:
@@ -28,34 +36,74 @@ def _decode_env_text(raw: bytes) -> str:
     return raw.decode("utf-8", errors="surrogateescape")
 
 
-def _load_daemon_start_env(env_file: str | None = DEFAULT_DAEMON_ENV_FILE) -> tuple[dict[str, str], str | None]:
+def _configured_daemon_env_file() -> str | None:
+    raw = os.environ.get("SERIALWRAP_DAEMON_ENV_FILE")
+    if raw is None:
+        return LEGACY_DAEMON_ENV_FILE
+    value = raw.strip()
+    return value or None
+
+
+def _load_daemon_start_env_files(env_files: Sequence[str]) -> tuple[dict[str, str], list[str]]:
     env = dict(os.environ)
+    loaded_paths: list[str] = []
+    seen_paths: set[str] = set()
+    for env_file in env_files:
+        path = os.path.expanduser(str(env_file).strip())
+        if not path or path in seen_paths:
+            continue
+        seen_paths.add(path)
+        if not os.path.isfile(path):
+            continue
+
+        proc = subprocess.run(
+            ["bash", "-lc", 'set -a && source "$1" >/dev/null && env -0', "serialwrap", path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            env=env,
+        )
+        if proc.returncode != 0:
+            stderr = _decode_env_text(proc.stderr).strip()
+            raise EnvFileSourceError(path, stderr or f"failed to source {path}")
+
+        loaded_env: dict[str, str] = {}
+        for row in proc.stdout.split(b"\0"):
+            if not row:
+                continue
+            key, sep, value = row.partition(b"=")
+            if not sep:
+                continue
+            loaded_env[_decode_env_text(key)] = _decode_env_text(value)
+        env = loaded_env
+        loaded_paths.append(path)
+    return env, loaded_paths
+
+
+def _load_daemon_start_env(env_file: str | None | object = _USE_DEFAULT_ENV) -> tuple[dict[str, str], str | None]:
+    if env_file is _USE_DEFAULT_ENV:
+        env_file = _configured_daemon_env_file()
     if env_file is None:
-        return env, None
+        return dict(os.environ), None
+    env, loaded = _load_daemon_start_env_files([str(env_file)])
+    return env, loaded[0] if loaded else None
 
-    path = os.path.expanduser(env_file).strip()
-    if not path or not os.path.isfile(path):
-        return env, None
 
-    proc = subprocess.run(
-        ["bash", "-lc", 'set -a && source "$1" >/dev/null && env -0', "serialwrap", path],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    if proc.returncode != 0:
-        stderr = _decode_env_text(proc.stderr).strip()
-        raise RuntimeError(stderr or f"failed to source {path}")
+def _resolve_daemon_start_env_files(profile_dir: str) -> list[str]:
+    """解析 daemon 啟動時要載入的 runtime env 檔。
 
-    loaded_env: dict[str, str] = {}
-    for row in proc.stdout.split(b"\0"):
-        if not row:
-            continue
-        key, sep, value = row.partition(b"=")
-        if not sep:
-            continue
-        loaded_env[_decode_env_text(key)] = _decode_env_text(value)
-    return loaded_env, path
+    帳密不再在此階段載入（改為 per-session 解析），
+    這裡只處理 runtime 設定（如 SERIALWRAP_WAL_DIR）。
+    """
+    explicit_env_file = os.environ.get("SERIALWRAP_DAEMON_ENV_FILE")
+    if explicit_env_file is not None:
+        value = explicit_env_file.strip()
+        return [value] if value else []
+
+    fallback = _configured_daemon_env_file()
+    if fallback is None:
+        return []
+    return [fallback]
 
 
 def _run_daemon_start(args: argparse.Namespace) -> int:
@@ -69,17 +117,19 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
         "--lock",
         args.lock,
     ]
+    env_files = _resolve_daemon_start_env_files(args.profile_dir)
     try:
-        daemon_env, _ = _load_daemon_start_env()
-    except RuntimeError as exc:
-        _print(
-            {
-                "ok": False,
-                "error_code": "ENV_FILE_SOURCE_FAILED",
-                "env_file": os.path.expanduser(DEFAULT_DAEMON_ENV_FILE),
-                "message": str(exc),
-            }
-        )
+        daemon_env, loaded_env_files = _load_daemon_start_env_files(env_files)
+    except EnvFileSourceError as exc:
+        payload: dict[str, Any] = {
+            "ok": False,
+            "error_code": "ENV_FILE_SOURCE_FAILED",
+            "env_file": exc.path,
+            "message": str(exc),
+        }
+        if env_files:
+            payload["env_files"] = [os.path.expanduser(path) for path in env_files]
+        _print(payload)
         return 2
 
     if args.foreground:
@@ -96,6 +146,8 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
         resp = rpc_call(args.socket, "health.ping", {}, timeout_s=0.5)
         if resp.get("ok"):
             result: dict[str, Any] = {"ok": True, "pid": proc.pid, "socket": args.socket}
+            if loaded_env_files:
+                result["env_files"] = loaded_env_files
             health = rpc_call(args.socket, "health.status", {}, timeout_s=1.0)
             warnings = health.get("warnings")
             if warnings:

@@ -5,6 +5,7 @@ import re
 import time
 import uuid
 
+from .auth import SessionAuth
 from .config import SessionProfile
 from .uart_io import UARTBridge
 
@@ -15,7 +16,10 @@ def _wait_or_fail(bridge: UARTBridge, pattern: str, timeout_s: float, err: str) 
     return False, err
 
 
-def _resolve_login_user(sp: SessionProfile) -> tuple[str | None, str | None]:
+def _resolve_login_user(sp: SessionProfile, auth: SessionAuth | None) -> tuple[str | None, str | None]:
+    if auth is not None and auth.username:
+        return auth.username, None
+    # fallback: 直接從 os.environ 讀取（向後相容）
     if sp.user_env:
         user = os.environ.get(sp.user_env)
         if not user:
@@ -26,7 +30,10 @@ def _resolve_login_user(sp: SessionProfile) -> tuple[str | None, str | None]:
     return None, None
 
 
-def _resolve_login_password(sp: SessionProfile) -> tuple[str | None, str | None]:
+def _resolve_login_password(sp: SessionProfile, auth: SessionAuth | None) -> tuple[str | None, str | None]:
+    if auth is not None and auth.password:
+        return auth.password, None
+    # fallback: 直接從 os.environ 讀取（向後相容）
     if not sp.pass_env:
         return None, "PASS_ENV_REQUIRED"
     password = os.environ.get(sp.pass_env)
@@ -75,8 +82,8 @@ def _finalize_ready(bridge: UARTBridge, sp: SessionProfile) -> tuple[bool, str |
     return True, None
 
 
-def _maybe_login(bridge: UARTBridge, sp: SessionProfile) -> tuple[bool, str | None]:
-    user, err = _resolve_login_user(sp)
+def _maybe_login(bridge: UARTBridge, sp: SessionProfile, auth: SessionAuth | None) -> tuple[bool, str | None]:
+    user, err = _resolve_login_user(sp, auth)
     needs_login = bool(user or sp.pass_env)
     if not needs_login:
         return False, None
@@ -90,7 +97,7 @@ def _maybe_login(bridge: UARTBridge, sp: SessionProfile) -> tuple[bool, str | No
     bridge.send_command(user, source="system")
 
     if bridge.wait_for_regex(sp.password_regex, sp.timeout_s):
-        password, perr = _resolve_login_password(sp)
+        password, perr = _resolve_login_password(sp, auth)
         if perr is not None:
             return False, perr
         assert password is not None
@@ -108,9 +115,9 @@ def probe_ready(bridge: UARTBridge, sp: SessionProfile) -> tuple[bool, str | Non
     return _finalize_ready(bridge, sp)
 
 
-def ensure_ready(bridge: UARTBridge, sp: SessionProfile) -> tuple[bool, str | None]:
+def ensure_ready(bridge: UARTBridge, sp: SessionProfile, auth: SessionAuth | None = None) -> tuple[bool, str | None]:
     if not _probe_prompt(bridge, sp):
-        ok, err = _maybe_login(bridge, sp)
+        ok, err = _maybe_login(bridge, sp, auth)
         if err is not None:
             return ok, err
         if not ok:

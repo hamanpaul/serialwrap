@@ -124,7 +124,7 @@ flowchart TD
 # 安裝
 ./install.sh
 
-# 啟動 daemon（若 `~/OPI.env` 存在會先自動載入）
+# 啟動 daemon（runtime env 從 shell env 或 ~/OPI.env 載入）
 serialwrap daemon start --profile-dir "$HOME/.paul_tools/profiles"
 
 # 檢查健康狀態
@@ -172,6 +172,7 @@ profiles:
     password_regex: "(?mi)^password:\\s*$"
     user_env: "SW_OPI_U"
     pass_env: "SW_OPI_P"
+    env_file: "OPI.env"
     ready_probe: "echo __READY__${nonce}"
     uart:
       baud: 115200
@@ -214,10 +215,12 @@ targets:
 
 `prpl-template` 預設改成匹配 `root@prplOS:/#` 這種 prompt prefix，而不是要求 prompt 必須單獨佔一整行。這樣在 prompt 後面立刻接 driver / kernel log 的情況下，line mode 仍能正確收尾；`ready_probe` 也維持最小 `echo __READY__${nonce}`，避免在沒有 `whoami` 的 target 上增加噪音。
 
-`op3-template` 沿用 generic shell login 模型，適合 Orange Pi / Debian shell。`user_env` / `pass_env` 是每個 profile 自己指定的登入帳密環境變數名稱。CLI / daemon 不會把密碼寫進 YAML 或 WAL。`serialwrap daemon start` 會在啟動前先嘗試載入 `~/OPI.env`；若檔案不存在，則維持既有行為。
+`op3-template` 沿用 generic shell login 模型，適合 Orange Pi / Debian shell。`user_env` / `pass_env` 是每個 profile 自己指定的登入帳密環境變數名稱。CLI / daemon 不會把密碼寫進 YAML 或 WAL。`env_file` 指向同目錄 env 檔，帳密在每次 session attach 時**per-session 解析**，不會污染 daemon 全域環境。不同 COM 可以用不同的 `env_file`，達到 per-session 帳密隔離。
+
+建議把 env 檔直接放在 profile 旁邊，例如：
 
 ```bash
-cat > ~/OPI.env <<'EOF'
+cat > "$HOME/.paul_tools/profiles/OPI.env" <<'EOF'
 SW_OPI_U='haman'
 SW_OPI_P='your-password'
 EOF
@@ -225,7 +228,7 @@ EOF
 serialwrap daemon start --profile-dir "$HOME/.paul_tools/profiles"
 ```
 
-若你偏好手動設定環境變數，也可以沿用原本的 `export SW_OPI_U=...` / `export SW_OPI_P=...` 方式再啟動 daemon。
+`profiles/default.yaml` 的 `op3-template` 已內建 `env_file: "OPI.env"`，相對路徑會以該 YAML 所在目錄解析。若 profile 沒有宣告 `env_file`，`login_fsm` 仍會從 daemon 的 `os.environ` 讀取帳密（向後相容）；這時候若 `~/OPI.env` 在 daemon 啟動時被載入，帳密仍能正常運作。若只想把 WAL / mirror log 改到 `~/b-log`，建議在 shell 環境設 `SERIALWRAP_WAL_DIR`，或者用 `SERIALWRAP_DAEMON_ENV_FILE` 指向包含 runtime 設定的 env 檔。
 
 若 shell device 已經自動登入，`serialwrap` 會直接用 prompt + `ready_probe` 驗證；若先看到 `login:` / `password:`，則會依 `user_env` / `pass_env` 自動登入。像 Orange Pi 常見的 `orangepi3 login:`，建議 `login_regex` 用 `(?mi)^.*login:\\s*$`。
 
@@ -360,9 +363,9 @@ recover 升級順序固定：
 
 | 檔案 | 說明 |
 |------|------|
-| `/tmp/serialwrap/wal/raw.wal.ndjson` | 權威事件記錄，保留 `seq/cmd_id/source/crc32/...` |
-| `/tmp/serialwrap/wal/raw.mirror.log` | 可讀文字鏡像，接近 console payload |
-| `/tmp/serialwrap/state.json` | alias 與 binding 持久化 |
+| 預設 `/tmp/serialwrap/wal/raw.wal.ndjson` | 權威事件記錄，保留 `seq/cmd_id/source/crc32/...` |
+| 預設 `/tmp/serialwrap/wal/raw.mirror.log` | 可讀文字鏡像，接近 console payload |
+| 預設 `/tmp/serialwrap/state.json` | alias 與 binding 持久化 |
 
 CLI 查詢：
 
@@ -376,6 +379,7 @@ serialwrap wal export --from-seq 0 --limit 500
 
 - `log tail-text` 偏向人類閱讀，不輸出 metadata header。
 - `log tail-raw` / `wal export` 仍保留完整權威欄位。
+- 可用 `SERIALWRAP_WAL_DIR` 覆寫 WAL / mirror log 目錄，例如放到 `~/b-log`；這不會改動 daemon socket / lock 的 `RUN_DIR`。
 - `stream tail` 與 MCP `serialwrap_tail_results` 為 legacy alias；新設計優先使用 `cmd result-tail` / `serialwrap_tail_command_result`。
 
 ## MCP 使用

@@ -87,7 +87,7 @@ flowchart LR
 ### 4.1 啟動步驟
 
 1. `serialwrap daemon start`
-2. CLI 若發現 `~/OPI.env`，先以 shell 載入帳密相關環境變數
+2. CLI 載入 runtime env（`SERIALWRAP_DAEMON_ENV_FILE` 或 legacy `~/OPI.env`）
 3. 建立 runtime dirs / lock / socket
 4. 載入 `profiles/*.yaml`
 5. 建立 `SerialwrapService`
@@ -112,7 +112,7 @@ sequenceDiagram
     participant T as Target
 
     User->>CLI: daemon start
-    CLI->>CLI: source ~/OPI.env (if exists)
+    CLI->>CLI: load runtime env (WAL_DIR etc.)
     CLI->>D: spawn
     D->>W: start
     W->>S: update devices
@@ -366,6 +366,8 @@ flowchart TD
 - 接近透明 console 視角
 - 不附帶每行 metadata prefix
 
+預設目錄是 `/tmp/serialwrap/wal/`。若只想改 WAL / mirror log 的位置，可設定 `SERIALWRAP_WAL_DIR`（例如 `~/b-log`）；這不會改動 daemon socket / lock 的 runtime 目錄。
+
 ### 10.3 Command result
 
 來源：
@@ -469,6 +471,7 @@ flowchart TD
 - `username`
 - `user_env`
 - `pass_env`
+- `env_file`
 - `post_login_cmd`
 - `ready_probe`
 - `timeout_s`
@@ -478,7 +481,7 @@ flowchart TD
 
 `quiet_window_s` 目前用於 background capture idle finalize。
 
-`platform=shell` 可使用 `user_env` / `pass_env` 做 generic shell login。`serialwrap daemon start` 會先嘗試載入 `~/OPI.env`，因此可將 `SW_OPI_U` / `SW_OPI_P` 放在該檔。若裝置 login prompt 會帶 hostname（例如 `orangepi3 login:`），建議 `login_regex` 使用 `(?mi)^.*login:\\s*$`。若裝置已自動登入並直接出現 prompt，daemon 會略過 login 流程，直接做 `ready_probe`。
+`platform=shell` 可使用 `user_env` / `pass_env` 做 generic shell login。帳密解析採用 **per-session 隔離**：在每次 session attach 時，`sw_core/auth.py` 的 `resolve_session_auth()` 會從 `env_file` 解析帳密（純 Python 解析，不 fork shell），不同 COM / template 可用不同的 `env_file` 指向不同帳密。查找順序為：`env_file` 內的 key → `os.environ` fallback → `username` 欄位。相對路徑會以該 YAML 所在目錄解析。若 profile 沒有宣告 `env_file`，帳密仍從 daemon 的 `os.environ` 讀取（向後相容）。若裝置 login prompt 會帶 hostname（例如 `orangepi3 login:`），建議 `login_regex` 使用 `(?mi)^.*login:\\s*$`。若裝置已自動登入並直接出現 prompt，daemon 會略過 login 流程，直接做 `ready_probe`。
 
 `platform=passthrough` 則完全不做 `ready_probe` / login 流程。daemon 只負責建立 UART bridge 與 console PTY，session 會停在 `ATTACHED`，由 human console 或後續人工判斷設備型態。
 

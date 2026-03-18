@@ -19,6 +19,7 @@ profiles:
     password_regex: "(?mi)^password:\\s*$"
     user_env: "SW_OPI_U"
     pass_env: "SW_OPI_P"
+    env_file: "OPI.env"
     ready_probe: "echo __READY__${nonce}"
     uart:
       baud: 115200
