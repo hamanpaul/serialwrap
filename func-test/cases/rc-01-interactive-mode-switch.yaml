@@ -1,0 +1,61 @@
+---
+meta:
+  name: rc-01-interactive-mode-switch
+  category: race-condition
+  severity: critical
+  description: "Interactive lease 過期/關閉後，驗證 console 輸入正確回到 line buffering 模式"
+  tags: ["race-condition", "interactive", "console"]
+  repeat: 5
+
+target:
+  platform: prpl
+  boot_banner: "boot done\r\nroot@prplOS:/# "
+  noise:
+    enabled: false
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+
+profile:
+  prompt_regex: '(?m)^root@prplOS:.*# '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+
+steps:
+  - action: wait_ready
+    timeout_s: 20
+
+  # 重複 attach → write → detach 循環，檢測 mode switch race
+  - action: repeat
+    count: 3
+    steps:
+      - action: attach_console
+        selector: COM0
+        label: race-test
+        save_as: rc_console
+
+      - action: sleep
+        seconds: 0.2
+
+      - action: detach_console
+        console_id: "{rc_console.client_id}"
+        selector: COM0
+
+      - action: sleep
+        seconds: 0.1
+
+  # 最後驗證 session 仍然健康
+  - action: assert_state
+    selector: COM0
+    expect:
+      state: "READY"
+
+  # Agent 命令應正常執行（驗證沒有卡住）
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--cmd", "echo post-race", "--source", "agent:1"]
+    expect:
+      ok: true
+    save_as: post_race
+
+  - action: wait_command_done
+    cmd_id: "{post_race.cmd_id}"
+    timeout_s: 10

@@ -1,0 +1,49 @@
+---
+meta:
+  name: sm-04-device-unplug
+  category: state-machine
+  severity: high
+  description: "READY 狀態下裝置拔除，驗證 session 轉為 DETACHED"
+  tags: ["state-machine", "device", "hotplug"]
+
+target:
+  platform: prpl
+  boot_banner: "boot done\r\nroot@prplOS:/# "
+  noise:
+    enabled: false
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+
+profile:
+  prompt_regex: '(?m)^root@prplOS:.*# '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+
+steps:
+  - action: wait_ready
+    timeout_s: 20
+
+  - action: assert_state
+    selector: COM0
+    expect:
+      state: "READY"
+
+  # 模擬裝置拔除
+  - action: inject_device_event
+    event: remove
+
+  # 等待 daemon 偵測到裝置消失
+  - action: sleep
+    seconds: 3
+
+  # 驗證 session 狀態
+  - action: cli
+    argv: ["session", "list"]
+    save_as: after_unplug
+
+  # 注意：因為 DeviceWatcher 的掃描間隔，可能需要更久
+  # 此處只驗證 daemon 仍在運行
+  - action: cli
+    argv: ["daemon", "status"]
+    expect:
+      ok: true

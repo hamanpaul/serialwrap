@@ -1,0 +1,64 @@
+---
+meta:
+  name: ha-05-concurrent-submit
+  category: human-agent
+  severity: critical
+  description: "多個 agent 併發 submit，驗證命令全部完成且 WAL 記錄正確"
+  tags: ["agent", "concurrent", "arbiter"]
+
+target:
+  platform: prpl
+  boot_banner: "boot done\r\nroot@prplOS:/# "
+  noise:
+    enabled: true
+    interval_ms: 50
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+
+profile:
+  prompt_regex: '(?m)^root@prplOS:.*# '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+
+steps:
+  - action: wait_ready
+    timeout_s: 20
+
+  # 3 個 agent 併發 submit
+  - action: parallel
+    steps:
+      - action: cli
+        argv: ["cmd", "submit", "--selector", "COM0", "--cmd", "ls", "--source", "agent:1"]
+        expect:
+          ok: true
+        save_as: p1
+
+      - action: cli
+        argv: ["cmd", "submit", "--selector", "COM0", "--cmd", "pwd", "--source", "agent:2"]
+        expect:
+          ok: true
+        save_as: p2
+
+      - action: cli
+        argv: ["cmd", "submit", "--selector", "COM0", "--cmd", "whoami", "--source", "agent:3"]
+        expect:
+          ok: true
+        save_as: p3
+
+  # 等待全部完成
+  - action: sleep
+    seconds: 5
+
+  # 驗證狀態仍 READY
+  - action: assert_state
+    selector: COM0
+    expect:
+      state: "READY"
+
+  # 驗證 WAL 有 3 個 agent TX 記錄
+  - action: assert_wal
+    selector: COM0
+    expect:
+      min_tx_count:
+        gte: 3
+      has_source: ["agent:1", "agent:2", "agent:3"]
