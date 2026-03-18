@@ -326,7 +326,11 @@ class SessionManager:
                 session.state = "ATTACHING"
                 session.last_error = None
         if should_probe and bridge is not None:
-            ok, err = probe_ready(bridge, session.profile)
+            if session.profile.login_regex:
+                auth = resolve_session_auth(session.profile)
+                ok, err = ensure_ready(bridge, session.profile, auth=auth)
+            else:
+                ok, err = probe_ready(bridge, session.profile)
             notify_ready = False
             with self._lock:
                 current = self._sessions.get(session.session_id)
@@ -450,7 +454,7 @@ class SessionManager:
                     save_needed = True
             dev = self._devices.get(by_id)
             if session is not None:
-                require_login = session.pending_auto_login
+                require_login = session.pending_auto_login or bool(session.profile.login_regex)
                 passthrough_only = session.profile.platform == "passthrough"
         if save_needed:
             self._save_state()

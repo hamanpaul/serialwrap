@@ -28,6 +28,24 @@ profiles:
       stop_bits: 1
       flow_control: none
       xonxoff: false
+  brcm-template:
+    platform: bcm
+    prompt_regex: "(?m)[>#]\\s*$"
+    login_regex: "(?mi)login:\\s*$"
+    password_regex: "(?mi)password:\\s*$"
+    post_login_cmd: "sh"
+    ready_probe: "echo __READY__${nonce}"
+    user_env: "BRCM_USER"
+    pass_env: "BRCM_PASS"
+    env_file: "brcm.env"
+    timeout_s: 15
+    uart:
+      baud: 115200
+      data_bits: 8
+      parity: N
+      stop_bits: 1
+      flow_control: none
+      xonxoff: false
   others-template:
     platform: passthrough
     prompt_regex: ".*"
