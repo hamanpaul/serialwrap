@@ -124,7 +124,7 @@ flowchart TD
 # 安裝
 ./install.sh
 
-# 啟動 daemon（runtime env 從 shell env 或 ~/OPI.env 載入）
+# 啟動 daemon（runtime env 依序從 shell env、~/OPI.env、profile_dir/OPI.env 載入）
 serialwrap daemon start --profile-dir "$HOME/.paul_tools/profiles"
 
 # 檢查健康狀態
@@ -145,7 +145,7 @@ serialwrap cmd status --cmd-id <cmd_id>
 ```bash
 export INSTALL_DIR="$HOME/.paul_tools"
 export PATH="$INSTALL_DIR:$PATH"
-alias minicom="$INSTALL_DIR/minicom_router.sh"
+hash -r 2>/dev/null || true
 ```
 
 ## Profile 與目標綁定
@@ -228,7 +228,7 @@ EOF
 serialwrap daemon start --profile-dir "$HOME/.paul_tools/profiles"
 ```
 
-`profiles/default.yaml` 的 `op3-template` 已內建 `env_file: "OPI.env"`，相對路徑會以該 YAML 所在目錄解析。若 profile 沒有宣告 `env_file`，`login_fsm` 仍會從 daemon 的 `os.environ` 讀取帳密（向後相容）；這時候若 `~/OPI.env` 在 daemon 啟動時被載入，帳密仍能正常運作。若只想把 WAL / mirror log 改到 `~/b-log`，建議在 shell 環境設 `SERIALWRAP_WAL_DIR`，或者用 `SERIALWRAP_DAEMON_ENV_FILE` 指向包含 runtime 設定的 env 檔。
+`profiles/default.yaml` 的 `op3-template` 已內建 `env_file: "OPI.env"`，相對路徑會以該 YAML 所在目錄解析。daemon 啟動時，runtime env 會先保留目前 shell 的環境，再依序嘗試載入 `~/OPI.env` 與 `profile_dir/OPI.env`；因此像 `SERIALWRAP_WAL_DIR="$HOME/b-log"` 這類 runtime 設定，放在 `~/.paul_tools/profiles/OPI.env` 也會生效。若 profile 沒有宣告 `env_file`，`login_fsm` 仍會從 daemon 的 `os.environ` 讀取帳密（向後相容）。若要完全指定來源，也可以用 `SERIALWRAP_DAEMON_ENV_FILE` 指向包含 runtime 設定的 env 檔。
 
 若 shell device 已經自動登入，`serialwrap` 會直接用 prompt + `ready_probe` 驗證；若先看到 `login:` / `password:`，則會依 `user_env` / `pass_env` 自動登入。像 Orange Pi 常見的 `orangepi3 login:`，建議 `login_regex` 用 `(?mi)^.*login:\\s*$`。
 

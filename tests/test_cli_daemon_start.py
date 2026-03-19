@@ -30,12 +30,12 @@ class TestCliDaemonStart(unittest.TestCase):
         self.assertIsNone(loaded)
         self.assertEqual(env["SERIALWRAP_TEST_FLAG"], "1")
 
-    def test_resolve_daemon_start_env_files_uses_legacy_fallback(self) -> None:
-        """不設 SERIALWRAP_DAEMON_ENV_FILE 時，回退到 legacy ~/OPI.env。"""
+    def test_resolve_daemon_start_env_files_uses_legacy_and_profile_env(self) -> None:
+        """不設 SERIALWRAP_DAEMON_ENV_FILE 時，先載入 legacy，再載入 profile_dir/OPI.env。"""
         with mock.patch.dict(os.environ, {}, clear=True):
             env_files = cli._resolve_daemon_start_env_files("/tmp/any-profile-dir")
 
-        self.assertEqual(env_files, ["~/OPI.env"])
+        self.assertEqual(env_files, ["~/OPI.env", "/tmp/any-profile-dir/OPI.env"])
 
     def test_resolve_daemon_start_env_files_explicit_override_wins(self) -> None:
         with tempfile.TemporaryDirectory() as td:

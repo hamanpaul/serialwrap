@@ -14,6 +14,7 @@ from .constants import LOCK_PATH, PROFILE_DIR, SOCKET_PATH
 
 _USE_DEFAULT_ENV = object()
 LEGACY_DAEMON_ENV_FILE = "~/OPI.env"
+PROFILE_DAEMON_ENV_FILE = "OPI.env"
 
 
 class EnvFileSourceError(RuntimeError):
@@ -100,10 +101,14 @@ def _resolve_daemon_start_env_files(profile_dir: str) -> list[str]:
         value = explicit_env_file.strip()
         return [value] if value else []
 
+    env_files: list[str] = []
     fallback = _configured_daemon_env_file()
-    if fallback is None:
-        return []
-    return [fallback]
+    if fallback is not None:
+        env_files.append(fallback)
+    profile_env = os.path.join(profile_dir, PROFILE_DAEMON_ENV_FILE)
+    if profile_env not in env_files:
+        env_files.append(profile_env)
+    return env_files
 
 
 def _run_daemon_start(args: argparse.Namespace) -> int:
