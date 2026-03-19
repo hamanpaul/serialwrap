@@ -62,22 +62,17 @@ profiles:
 
 targets:
   - act_no: 1
-    com: COM0
-    alias: default+1
-    profile: prpl-template
-    device_by_id: /dev/serial/by-id/target0
-  - act_no: 2
     com: COM1
-    alias: default+2
-    profile: prpl-template
-    device_by_id: /dev/serial/by-id/target1
-  - act_no: 3
-    com: COM2
-    alias: default+3
+    alias: opi
     profile: op3-template
-    device_by_id: /dev/serial/by-id/target2
-  - act_no: 4
+    device_by_id: /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0
+  - act_no: 2
+    com: COM2
+    alias: brcm
+    profile: brcm-template
+    device_by_id: /dev/serial/by-path/platform-vhci_hcd.0-usb-0:1:1.0-port0
+  - act_no: 3
     com: COM3
-    alias: default+4
+    alias: passthrough
     profile: others-template
-    device_by_id: /dev/serial/by-id/target3
+    device_by_id: /dev/serial/by-id/placeholder-passthrough

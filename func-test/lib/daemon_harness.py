@@ -102,6 +102,7 @@ class DaemonHarness:
         self._env["SERIALWRAP_STATE_DIR"] = str(self._root / "state")
         self._env["SERIALWRAP_RUN_DIR"] = str(self._root / "run")
         self._env["SERIALWRAP_BY_ID_DIR"] = str(by_id_dir)
+        self._env["SERIALWRAP_BY_PATH_DIR"] = str(self._root / "by-path")
 
         self._socket_path = str(self._root / "run" / "serialwrapd.sock")
         lock_path = str(self._root / "run" / "serialwrapd.lock")

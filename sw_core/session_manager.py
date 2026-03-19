@@ -328,7 +328,10 @@ class SessionManager:
         if should_probe and bridge is not None:
             if session.profile.login_regex:
                 auth = resolve_session_auth(session.profile)
-                ok, err = ensure_ready(bridge, session.profile, auth=auth)
+                if auth.username and auth.password:
+                    ok, err = ensure_ready(bridge, session.profile, auth=auth)
+                else:
+                    ok, err = probe_ready(bridge, session.profile)
             else:
                 ok, err = probe_ready(bridge, session.profile)
             notify_ready = False
@@ -480,18 +483,22 @@ class SessionManager:
                 err = None
             elif require_login:
                 auth = resolve_session_auth(session.profile)
-                ok, err = ensure_ready(bridge, session.profile, auth=auth)
-                if not ok:
-                    bridge.stop()
-                    with self._lock:
-                        session.state = "DETACHED"
-                        session.last_error = err
-                        session.detached_at = now_iso()
-                        session.bridge = None
-                        session.vtty_path = None
-                        session.attached_real_path = None
-                    self._on_detached(session.session_id)
-                    return
+                if auth.username and auth.password:
+                    ok, err = ensure_ready(bridge, session.profile, auth=auth)
+                    if not ok:
+                        bridge.stop()
+                        with self._lock:
+                            session.state = "DETACHED"
+                            session.last_error = err
+                            session.detached_at = now_iso()
+                            session.bridge = None
+                            session.vtty_path = None
+                            session.attached_real_path = None
+                        self._on_detached(session.session_id)
+                        return
+                else:
+                    # 無帳密時退回 probe，讓 human 手動登入
+                    ok, err = probe_ready(bridge, session.profile)
             else:
                 ok, err = probe_ready(bridge, session.profile)
 

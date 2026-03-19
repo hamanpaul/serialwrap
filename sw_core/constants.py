@@ -19,6 +19,7 @@ STATE_PATH = os.path.join(STATE_DIR, "state.json")
 WAL_DIR = _env_path("SERIALWRAP_WAL_DIR", os.path.join(STATE_DIR, "wal"))
 PROFILE_DIR = _env_path("SERIALWRAP_PROFILE_DIR", os.path.join(BASE_DIR, "profiles"))
 DEVICE_BY_ID_DIR = _env_path("SERIALWRAP_BY_ID_DIR", "/dev/serial/by-id")
+DEVICE_BY_PATH_DIR = _env_path("SERIALWRAP_BY_PATH_DIR", "/dev/serial/by-path")
 DEFAULT_WAL_ROTATE_BYTES = 64 * 1024 * 1024
 
 
