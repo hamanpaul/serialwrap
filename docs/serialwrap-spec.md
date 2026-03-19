@@ -467,6 +467,8 @@ flowchart TD
 
 `minicom_router.sh` 不再依賴 session 單一 `vtty` 當唯一入口。
 
+預設 transcript 走 minicom 內建 `-C` capturefile；只有在明確設定 `MINICOM_CAPTURE_WRAPPER=1` 時，才改用 `script -qef` 包一層 PTY 來保留完整 terminal transcript。後者可能增加 human 體感延遲。
+
 ## 13. Profile 規格
 
 關鍵欄位：

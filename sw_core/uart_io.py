@@ -26,6 +26,8 @@ _BAUD_MAP = {
     921600: termios.B921600,
 }
 
+_STALE_CONSOLE_GRACE_S = 2.0
+
 
 @dataclasses.dataclass
 class ConsoleClient:
@@ -223,6 +225,24 @@ class UARTBridge:
             if self._interactive_owner == f"human:{client_id}":
                 self._interactive_owner = None
         self._close_console_client(client)
+
+    def _prune_stale_consoles_locked(self, *, now: float | None = None) -> list[ConsoleClient]:
+        cutoff = time.time() if now is None else now
+        stale: list[ConsoleClient] = []
+        for client_id, client in list(self._clients.items()):
+            if client_id == self._primary_client_id:
+                continue
+            if cutoff - client.attached_at < _STALE_CONSOLE_GRACE_S:
+                continue
+            if self._client_has_external_peer_locked(client):
+                continue
+            removed = self._clients.pop(client_id, None)
+            if removed is None:
+                continue
+            if self._interactive_owner == f"human:{client_id}":
+                self._interactive_owner = None
+            stale.append(removed)
+        return stale
 
     def _write_all(self, fd: int, payload: bytes) -> None:
         view = memoryview(payload)
@@ -456,10 +476,14 @@ class UARTBridge:
 
     def attach_console(self, *, label: str | None = None) -> dict[str, Any]:
         client = self._create_console_client(label)
+        stale: list[ConsoleClient] = []
         with self._state_lock:
+            stale = self._prune_stale_consoles_locked(now=client.attached_at)
             self._clients[client.client_id] = client
             if self._primary_client_id is None:
                 self._primary_client_id = client.client_id
+        for row in stale:
+            self._close_console_client(row)
         return {
             "client_id": client.client_id,
             "label": client.label,
@@ -480,9 +504,11 @@ class UARTBridge:
         return True
 
     def list_consoles(self) -> list[dict[str, Any]]:
+        stale: list[ConsoleClient] = []
         with self._state_lock:
+            stale = self._prune_stale_consoles_locked()
             owner = self._interactive_owner
-            return [
+            rows = [
                 {
                     "client_id": client.client_id,
                     "label": client.label,
@@ -491,6 +517,9 @@ class UARTBridge:
                 }
                 for client in sorted(self._clients.values(), key=lambda row: (row.label, row.client_id))
             ]
+        for row in stale:
+            self._close_console_client(row)
+        return rows
 
     def console_has_external_peer(self, client_id: str) -> bool:
         with self._state_lock:
@@ -504,10 +533,16 @@ class UARTBridge:
             self._interactive_owner = owner
 
     def snapshot(self) -> dict[str, Any]:
+        consoles = self.list_consoles()
         with self._state_lock:
             serial_fd = self._serial_fd
-            primary = self.vtty_path
-            consoles = self.list_consoles()
+            primary_client_id = self._primary_client_id
+            primary = None
+            if primary_client_id is not None:
+                client = self._clients.get(primary_client_id)
+                if client is not None:
+                    primary = client.slave_path
+            interactive_owner = self._interactive_owner
         serial_alive = False
         if serial_fd is not None:
             try:
@@ -522,7 +557,7 @@ class UARTBridge:
             "vtty": primary,
             "serial_alive": serial_alive,
             "vtty_alive": vtty_alive,
-            "interactive_owner": self._interactive_owner,
+            "interactive_owner": interactive_owner,
             "consoles": consoles,
             "running": bool(self._thread and self._thread.is_alive()),
         }

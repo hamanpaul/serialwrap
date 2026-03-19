@@ -61,4 +61,5 @@ Suggested shell setup:
   export PATH="${TARGET_DIR}:\$PATH"
   hash -r 2>/dev/null || true
   # 若 shell 已經有 alias minicom，請先 unalias minicom
+  # 用 type -a minicom 確認目前先命中 ${TARGET_DIR}/minicom
 MSG
