@@ -1,3 +1,6 @@
+defaults:
+  log_dir: "~/b-log"
+
 profiles:
   prpl-template:
     platform: prpl

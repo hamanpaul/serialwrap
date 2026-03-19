@@ -33,6 +33,7 @@ class ProfileTemplate:
     timeout_s: float = 10.0
     quiet_window_s: float = 2.0
     hard_timeout_s: float = 60.0
+    log_dir: str | None = None
     uart: UartProfile = dataclasses.field(default_factory=UartProfile)
 
 
@@ -56,6 +57,7 @@ class SessionProfile:
     timeout_s: float = 10.0
     quiet_window_s: float = 2.0
     hard_timeout_s: float = 60.0
+    log_dir: str | None = None
     uart: UartProfile = dataclasses.field(default_factory=UartProfile)
 
 
@@ -125,6 +127,7 @@ def _template_from_dict(name: str, raw: dict[str, Any], *, base_dir: str) -> Pro
         timeout_s=_as_float(raw.get("timeout_s"), 10.0),
         quiet_window_s=_as_float(raw.get("quiet_window_s"), 2.0),
         hard_timeout_s=_as_float(raw.get("hard_timeout_s"), 60.0),
+        log_dir=_resolve_opt_path(raw.get("log_dir"), base_dir=base_dir),
         uart=_load_uart(raw.get("uart")),
     )
 
@@ -168,7 +171,13 @@ def _merge_session(
     alias: str,
     device_by_id: str,
     base_dir: str,
+    defaults_log_dir: str | None = None,
 ) -> SessionProfile:
+    log_dir = (
+        _resolve_opt_path(target.get("log_dir"), base_dir=base_dir)
+        if "log_dir" in target
+        else template.log_dir
+    ) or defaults_log_dir
     return SessionProfile(
         profile_name=template.profile_name,
         com=com,
@@ -198,6 +207,7 @@ def _merge_session(
         timeout_s=_as_float(target.get("timeout_s"), template.timeout_s),
         quiet_window_s=_as_float(target.get("quiet_window_s"), template.quiet_window_s),
         hard_timeout_s=_as_float(target.get("hard_timeout_s"), template.hard_timeout_s),
+        log_dir=log_dir,
         uart=_load_uart(target.get("uart"), default=template.uart),
     )
 
@@ -217,6 +227,8 @@ def load_profiles(profile_dir: str) -> list[SessionProfile]:
             continue
 
         base_dir = os.path.dirname(path)
+        defaults_obj = obj.get("defaults") if isinstance(obj.get("defaults"), dict) else {}
+        defaults_log_dir = _resolve_opt_path(defaults_obj.get("log_dir"), base_dir=base_dir) if defaults_obj else None
         templates, default_profile_name = _load_templates(file_name, obj, base_dir=base_dir)
         targets = obj.get("targets") or []
         if not isinstance(targets, list):
@@ -247,6 +259,7 @@ def load_profiles(profile_dir: str) -> list[SessionProfile]:
                     alias=alias,
                     device_by_id=device_by_id,
                     base_dir=base_dir,
+                    defaults_log_dir=defaults_log_dir,
                 )
             )
     return out

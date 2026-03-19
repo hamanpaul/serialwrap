@@ -237,6 +237,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_sist.add_argument("--screen-chars", type=int, default=2048)
     p_sic = sess_sub.add_parser("interactive-close")
     p_sic.add_argument("--interactive-id", required=True)
+    p_sls = sess_sub.add_parser("log-start")
+    p_sls.add_argument("--selector", required=True, help="session_id | COMx | alias")
+    p_slst = sess_sub.add_parser("log-stop")
+    p_slst.add_argument("--selector", required=True, help="session_id | COMx | alias")
+    p_slstat = sess_sub.add_parser("log-status")
+    p_slstat.add_argument("--selector", required=True, help="session_id | COMx | alias")
 
     p_alias = sub.add_parser("alias")
     alias_sub = p_alias.add_subparsers(dest="alias_cmd", required=True)
@@ -362,6 +368,12 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.session_cmd == "interactive-close":
             return _run_rpc(args, "session.interactive_close", {"interactive_id": args.interactive_id})
+        if args.session_cmd == "log-start":
+            return _run_rpc(args, "session.log_start", {"selector": args.selector})
+        if args.session_cmd == "log-stop":
+            return _run_rpc(args, "session.log_stop", {"selector": args.selector})
+        if args.session_cmd == "log-status":
+            return _run_rpc(args, "session.log_status", {"selector": args.selector})
 
     if args.cmd == "alias":
         if args.alias_cmd == "list":

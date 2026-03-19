@@ -386,6 +386,7 @@ flowchart TD
 - `serialwrap session self-test|recover`
 - `serialwrap session console-attach|console-detach|console-list`
 - `serialwrap session interactive-open|interactive-send|interactive-status|interactive-close`
+- `serialwrap session log-start|log-stop|log-status`
 - `serialwrap alias list|set|assign|unassign`
 - `serialwrap cmd submit|status|result-tail|cancel`
 - `serialwrap log tail-raw|tail-text`
@@ -410,6 +411,9 @@ flowchart TD
 - `session.interactive_send`
 - `session.interactive_status`
 - `session.interactive_close`
+- `session.log_start`
+- `session.log_stop`
+- `session.log_status`
 - `alias.list`
 - `alias.set`
 - `alias.assign`
@@ -442,6 +446,9 @@ flowchart TD
 - `serialwrap_send_interactive_keys` -> `session.interactive_send`
 - `serialwrap_get_interactive_status` -> `session.interactive_status`
 - `serialwrap_close_interactive` -> `session.interactive_close`
+- `serialwrap_log_start` -> `session.log_start`
+- `serialwrap_log_stop` -> `session.log_stop`
+- `serialwrap_log_status` -> `session.log_status`
 
 相容 alias：
 

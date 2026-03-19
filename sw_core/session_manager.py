@@ -14,7 +14,7 @@ from typing import Any, Callable
 from .alias_registry import AliasRegistry
 from .auth import resolve_session_auth
 from .config import SessionProfile
-from .constants import STATE_PATH
+from .constants import LOG_DIR, STATE_PATH
 from .device_watcher import DeviceInfo
 from .login_fsm import ensure_ready, probe_ready
 from .uart_io import UARTBridge
@@ -78,6 +78,17 @@ class InteractiveLease:
 
 
 @dataclasses.dataclass
+class SessionCapture:
+    capture_id: str
+    session_id: str
+    log_path: str
+    started_at: str
+    line_count: int = 0
+    byte_count: int = 0
+    status: str = "active"
+
+
+@dataclasses.dataclass
 class SessionRuntime:
     session_id: str
     profile: SessionProfile
@@ -95,6 +106,7 @@ class SessionRuntime:
     interactive_session_id: str | None = None
     foreground_busy: bool = False
     background_cmd_ids: list[str] = dataclasses.field(default_factory=list)
+    active_capture: SessionCapture | None = None
 
     def to_public_dict(self) -> dict[str, Any]:
         console_count = 0
@@ -118,6 +130,13 @@ class SessionRuntime:
             "recovering": self.recovering,
             "interactive_session_id": self.interactive_session_id,
             "console_count": console_count,
+            "capture": {
+                "capture_id": self.active_capture.capture_id,
+                "log_path": self.active_capture.log_path,
+                "status": self.active_capture.status,
+                "line_count": self.active_capture.line_count,
+                "byte_count": self.active_capture.byte_count,
+            } if self.active_capture else None,
         }
 
 
@@ -143,6 +162,7 @@ class SessionManager:
         self._attach_inflight: set[str] = set()
         self._background: dict[str, BackgroundCapture] = {}
         self._interactive: dict[str, InteractiveLease] = {}
+        self._capture_fps: dict[str, Any] = {}  # capture_id → open file object
 
         self._load_state()
         for p in profiles:
@@ -240,6 +260,7 @@ class SessionManager:
                 lease.status = "closed"
         session.interactive_session_id = None
         session.foreground_busy = False
+        self._stop_capture_locked(session)
         for cmd_id in list(session.background_cmd_ids):
             capture = self._background.get(cmd_id)
             if capture is not None:
@@ -417,6 +438,18 @@ class SessionManager:
             session = self._sessions.get(session_id)
             if session is None or session.foreground_busy:
                 return
+            # agent log capture
+            cap = session.active_capture
+            if cap is not None and cap.status == "active":
+                fp = self._capture_fps.get(cap.capture_id)
+                if fp is not None:
+                    try:
+                        fp.write(chunk)
+                        fp.flush()
+                        cap.byte_count += len(chunk.encode("utf-8"))
+                        cap.line_count += chunk.count("\n")
+                    except Exception:
+                        pass
             for cmd_id in list(session.background_cmd_ids):
                 capture = self._background.get(cmd_id)
                 if capture is None or capture.status != "active":
@@ -1230,4 +1263,101 @@ class SessionManager:
                 "from_chunk": from_chunk,
                 "next_chunk": next_chunk,
                 "chunks": chunks,
+            }
+
+    # ------------------------------------------------------------------
+    # Agent log capture: start / stop / status
+    # ------------------------------------------------------------------
+
+    def _resolve_log_dir(self, session: SessionRuntime) -> str:
+        return session.profile.log_dir or LOG_DIR
+
+    def _stop_capture_locked(self, session: SessionRuntime) -> None:
+        cap = session.active_capture
+        if cap is None:
+            return
+        cap.status = "stopped"
+        fp = self._capture_fps.pop(cap.capture_id, None)
+        if fp is not None:
+            try:
+                fp.close()
+            except Exception:
+                pass
+        session.active_capture = None
+
+    def log_start(self, selector: str) -> dict[str, Any]:
+        with self._lock:
+            session = self.get_session(selector)
+            if session is None:
+                return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            if session.active_capture is not None and session.active_capture.status == "active":
+                cap = session.active_capture
+                return {
+                    "ok": True,
+                    "already_active": True,
+                    "capture_id": cap.capture_id,
+                    "log_path": cap.log_path,
+                    "session": session.to_public_dict(),
+                }
+            log_dir = self._resolve_log_dir(session)
+            os.makedirs(log_dir, exist_ok=True)
+            ts = time.strftime("%y%m%d-%H%M%S")
+            filename = f"{session.profile.com}_{ts}.log"
+            log_path = os.path.join(log_dir, filename)
+            capture_id = str(uuid.uuid4())
+            try:
+                fp = open(log_path, "a", encoding="utf-8")
+            except OSError as exc:
+                return {"ok": False, "error_code": "LOG_OPEN_FAILED", "detail": str(exc)}
+            cap = SessionCapture(
+                capture_id=capture_id,
+                session_id=session.session_id,
+                log_path=log_path,
+                started_at=now_iso(),
+            )
+            session.active_capture = cap
+            self._capture_fps[capture_id] = fp
+            return {
+                "ok": True,
+                "capture_id": capture_id,
+                "log_path": log_path,
+                "session": session.to_public_dict(),
+            }
+
+    def log_stop(self, selector: str) -> dict[str, Any]:
+        with self._lock:
+            session = self.get_session(selector)
+            if session is None:
+                return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            cap = session.active_capture
+            if cap is None:
+                return {"ok": False, "error_code": "NO_ACTIVE_CAPTURE", "session": session.to_public_dict()}
+            result = {
+                "ok": True,
+                "capture_id": cap.capture_id,
+                "log_path": cap.log_path,
+                "line_count": cap.line_count,
+                "byte_count": cap.byte_count,
+                "started_at": cap.started_at,
+            }
+            self._stop_capture_locked(session)
+            return result
+
+    def log_status(self, selector: str) -> dict[str, Any]:
+        with self._lock:
+            session = self.get_session(selector)
+            if session is None:
+                return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            cap = session.active_capture
+            if cap is None:
+                return {"ok": True, "active": False, "session": session.to_public_dict()}
+            return {
+                "ok": True,
+                "active": cap.status == "active",
+                "capture_id": cap.capture_id,
+                "log_path": cap.log_path,
+                "line_count": cap.line_count,
+                "byte_count": cap.byte_count,
+                "started_at": cap.started_at,
+                "session": session.to_public_dict(),
             }

@@ -400,4 +400,22 @@ class SerialwrapService:
                 rows = [r for r in rows if int(r.get("seq", 0)) <= to_seq]
             return {"ok": True, "records": rows}
 
+        if method == "session.log_start":
+            selector = str(params.get("selector") or params.get("session_id") or params.get("com") or params.get("alias") or "")
+            if not selector:
+                return {"ok": False, "error_code": "INVALID_ARGS"}
+            return self._sessions.log_start(selector)
+
+        if method == "session.log_stop":
+            selector = str(params.get("selector") or params.get("session_id") or params.get("com") or params.get("alias") or "")
+            if not selector:
+                return {"ok": False, "error_code": "INVALID_ARGS"}
+            return self._sessions.log_stop(selector)
+
+        if method == "session.log_status":
+            selector = str(params.get("selector") or params.get("session_id") or params.get("com") or params.get("alias") or "")
+            if not selector:
+                return {"ok": False, "error_code": "INVALID_ARGS"}
+            return self._sessions.log_status(selector)
+
         return {"ok": False, "error_code": "METHOD_NOT_FOUND", "method": method}

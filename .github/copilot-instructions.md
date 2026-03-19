@@ -78,6 +78,15 @@ serialwrap 是一個讓多個 agent 與多個 human console 共用**同一條 UA
 - `background` 命令不是直接把所有輸出塞回 `command.get`；需要透過 `command.result_tail` 逐段讀取 capture。
 - 若只要改 log 位置、不想搬動 socket / state，可在 shell 環境設 `SERIALWRAP_WAL_DIR="$HOME/b-log"` 或透過 `SERIALWRAP_DAEMON_ENV_FILE` 指向 runtime env 檔。
 
+### Agent 日誌 capture
+
+- Agent 可透過 `session.log_start` / `session.log_stop` 對特定 session 啟停純文字 RX capture。
+- 日誌寫入 `{log_dir}/{COM}_{YYMMDD}-{HHMMSS}.log`，預設 `~/b-log`。
+- `log_dir` 優先序：per-target > per-profile > YAML `defaults.log_dir` > `SERIALWRAP_LOG_DIR` env > `~/b-log`。
+- `SessionCapture` 是可變 dataclass，掛在 `SessionRuntime.active_capture`；同一 session 同時最多一個 active capture。
+- session detach 時自動停止 capture。
+- WAL 是 always-on 審計記錄，agent log 是 on-demand focused capture，兩者互補。
+
 ### MCP 與 RPC 的關係
 
 MCP 只是 RPC 的薄轉接層。新增或改名工具時，要把 `sw_mcp/server.py` 的 `_TOOL_MAP` 跟 `sw_core/service.py` 的 RPC 方法一起看，不然 CLI / MCP 很容易不同步。
@@ -87,7 +96,7 @@ MCP 只是 RPC 的薄轉接層。新增或改名工具時，要把 `sw_mcp/serve
 ### 設定物件 immutable，執行期狀態 mutable
 
 - `sw_core/config.py` 的 `UartProfile`、`ProfileTemplate`、`SessionProfile` 都是 `@dataclass(frozen=True)`。
-- `sw_core/session_manager.py` 的 `SessionRuntime`、`BackgroundCapture`、`InteractiveLease` 則是可變 dataclass。
+- `sw_core/session_manager.py` 的 `SessionRuntime`、`BackgroundCapture`、`InteractiveLease`、`SessionCapture` 則是可變 dataclass。
 - 需要更新 session profile（例如 alias、device_by_id）時，慣例是用 `dataclasses.replace(...)` 產生新物件，而不是原地改 frozen config。
 
 ### RPC 路由是平面 if/elif，不做動態註冊

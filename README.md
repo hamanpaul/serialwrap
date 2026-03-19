@@ -367,6 +367,46 @@ recover 升級順序固定：
 | 預設 `/tmp/serialwrap/wal/raw.wal.ndjson` | 權威事件記錄，保留 `seq/cmd_id/source/crc32/...` |
 | 預設 `/tmp/serialwrap/wal/raw.mirror.log` | 可讀文字鏡像，接近 console payload |
 | 預設 `/tmp/serialwrap/state.json` | alias 與 binding 持久化 |
+| Agent log `~/b-log/{COM}_{YYMMDD}-{HHMMSS}.log` | Agent 觸發式 per-session 日誌，純文字 RX 內容 |
+
+### Agent 日誌 (log start/stop)
+
+Agent 可對特定 COM port 啟停日誌：
+
+```bash
+serialwrap session log-start --selector COM0
+# → {"ok":true,"capture_id":"...","log_path":"~/b-log/COM0_250117-143021.log",...}
+
+serialwrap session log-stop --selector COM0
+# → {"ok":true,"log_path":"...","line_count":42,"byte_count":1024,...}
+
+serialwrap session log-status --selector COM0
+# → {"ok":true,"active":true,"capture_id":"...",...}
+```
+
+特性：
+
+- WAL（always-on）不受影響，agent log 是額外的 focused capture
+- 每個 session 同一時間最多一個 active capture
+- session detach 時自動停止 capture
+- 預設路徑 `~/b-log`，可透過 YAML `defaults.log_dir`、profile `log_dir` 或 target `log_dir` 覆寫
+
+### log_dir 組態
+
+優先序：per-target `log_dir` > per-profile `log_dir` > YAML `defaults.log_dir` > `SERIALWRAP_LOG_DIR` env > `~/b-log`
+
+```yaml
+defaults:
+  log_dir: "~/b-log"         # 全域預設
+profiles:
+  op3-template:
+    log_dir: "/var/log/opi"   # per-profile 覆寫
+targets:
+  - com: COM1
+    log_dir: "/tmp/com1-log"  # per-target 最高優先
+```
+
+### WAL 查詢
 
 CLI 查詢：
 
@@ -407,6 +447,9 @@ serialwrap wal export --from-seq 0 --limit 500
 | `serialwrap_send_interactive_keys` | `session.interactive_send` |
 | `serialwrap_get_interactive_status` | `session.interactive_status` |
 | `serialwrap_close_interactive` | `session.interactive_close` |
+| `serialwrap_log_start` | `session.log_start` |
+| `serialwrap_log_stop` | `session.log_stop` |
+| `serialwrap_log_status` | `session.log_status` |
 
 ### Legacy alias
 
