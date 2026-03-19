@@ -1,0 +1,63 @@
+---
+meta:
+  name: hk-03-deferred-input-flush
+  category: human-key
+  severity: high
+  description: "Human 在 agent 執行期間的輸入會累積在 deferred buffer，agent 完成後 flush 到 UART"
+  tags: ["console", "raw-interactive", "deferred-flush"]
+
+target:
+  platform: prpl
+  boot_banner: "boot done\r\nroot@prplOS:/# "
+  noise:
+    enabled: false
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+
+profile:
+  prompt_regex: '(?m)^root@prplOS:.*# '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+
+steps:
+  - action: wait_ready
+    timeout_s: 20
+
+  # Human attach（raw interactive）
+  - action: attach_console
+    selector: COM0
+    label: hk-deferred
+    save_as: con
+
+  # Agent 提交一個命令
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--cmd", "echo agent-slow", "--source", "agent:defer-test"]
+    expect:
+      ok: true
+      has_keys: ["cmd_id"]
+    save_as: submit1
+
+  # 在 agent 可能還在執行的期間，human 送 raw 輸入
+  # 這些 bytes 會進 deferred buffer，agent 完成後 flush
+  - action: console_write
+    console_id: "{con.client_id}"
+    input_raw: "echo deferred\r"
+    delay_ms: 0
+
+  - action: wait_command_done
+    cmd_id: "{submit1.cmd_id}"
+    timeout_s: 10
+
+  # agent 完成後，deferred 的 human 輸入應被 flush 到 UART
+  # target 會處理 "echo deferred\r" 並回應
+  - action: sleep
+    seconds: 1
+
+  - action: assert_state
+    selector: COM0
+    expect:
+      state: "READY"
+
+  - action: detach_console
+    console_id: "{con.client_id}"
+    selector: COM0

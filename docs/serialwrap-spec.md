@@ -140,10 +140,30 @@ sequenceDiagram
 - 每個已掛上 bridge 的 session 都至少有一個 primary console PTY
 - `session.console_attach` 會再建立一個專屬 PTY
 - 所有 console 都收到同一份 RX fan-out
-- 非 interactive owner 的 human input 只會緩衝成 line，經 broker queue 執行
-- line-buffered human input 由 broker 提供本地回顯與基本 backspace 行編輯，避免 minicom 看不到鍵入內容
-- 常見 human/minicom 互動式命令（如 `vim`、`top`、`less`、`menuconfig`）可自動升級為 human interactive ownership，避免被誤判為 prompt timeout 故障
-- human interactive ownership 存在時，agent foreground/background 命令不會立即失敗，而是等待 ownership 釋放；若超過該命令 timeout，才回 `SESSION_INTERACTIVE_BUSY`
+
+#### Raw Interactive（預設行為）
+
+- **`console-attach` 在 `ATTACHED` 或 `READY` 狀態下，會自動授予第一個 human console raw interactive ownership**。minicom 連上即可使用方向鍵、Tab、ESC 序列等特殊按鍵，不需手動 `interactive-open`。
+- Raw interactive 期間，所有 console bytes 透過 `UARTBridge.send_bytes()` 即時透傳到 UART，不做 line buffering 或 local echo。
+- 第二個以後的 console 因為 interactive lease 已存在，仍走 line-buffer 模式。
+
+#### Agent 命令搶佔（Suspend / Resume）
+
+- Agent 提交 foreground 或 background 命令時，若 human 持有 interactive ownership，daemon 會 **暫時掛起（suspend）** human 的 raw mode：
+  1. `bridge.suspend_interactive()` → 保存 owner、切到 deferred mode
+  2. 執行 agent 命令
+  3. `bridge.resume_interactive()` → 恢復 owner、flush deferred buffer 到 UART
+- Human 在 agent 執行期間的按鍵輸入會累積在 deferred buffer（不做 local echo），agent 完成後一次性 flush 到 UART，由 target 自然回顯。
+- Agent 命令**不再需要等待 human 關閉 minicom**；超時回 `SESSION_INTERACTIVE_BUSY` 的情境僅保留給 agent-vs-agent interactive lease 衝突。
+
+#### Line-Buffer 模式
+
+- 非 interactive owner 的 human console（第二個以後的 minicom）仍走 line-buffer 路徑。
+- line-buffered human input 由 broker 提供本地回顯與基本 backspace 行編輯。
+- 常見 human/minicom 互動式命令（如 `vim`、`top`、`less`、`menuconfig`）可自動升級為 human interactive ownership，避免被誤判為 prompt timeout 故障。
+
+#### 其他
+
 - 若 session 僅為 `ATTACHED`，`session.console_attach` 仍可使用，且該 console 會自動拿到 raw human ownership，方便手動登入或觀察 boot/log
 - `platform=passthrough` 的 session attach 後不做 prompt/login/ready 探測，直接停在 `ATTACHED`，供未知設備走純 bridge/passthrough 路徑
 
@@ -220,6 +240,8 @@ sequenceDiagram
 6. `session.interactive_close` 釋放 lease
 
 若 `source=human:*` 的 line command 已送出但後續未回 prompt，daemon 會優先把該 console 升級成 human interactive，而不是直接觸發 recover。這條保護僅套用 human/minicom；agent foreground command 仍保留既有 prompt timeout / recover 路徑。
+
+> **注意**：在 raw interactive 預設行為下，human console 的按鍵不會走 `_on_console_line()` 路徑，因此上述 line command 升級機制僅在 **非 interactive owner** 的 console 或 suspend 期間的 line-buffer 路徑中生效。
 
 ### 6.4 recover
 

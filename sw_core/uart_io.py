@@ -71,6 +71,9 @@ class UARTBridge:
         self._rx_max_chars = 131072
         self._clients: dict[str, ConsoleClient] = {}
         self._interactive_owner: str | None = None
+        self._agent_active: bool = False
+        self._suspended_owner: str | None = None
+        self._deferred_buffers: dict[str, bytearray] = {}
 
     @property
     def vtty_path(self) -> str | None:
@@ -349,11 +352,22 @@ class UARTBridge:
         return lines, bytes(echo)
 
     def _handle_console_rx(self, client: ConsoleClient, data: bytes) -> None:
-        owner = None
         with self._state_lock:
             owner = self._interactive_owner
+            agent_active = self._agent_active
+            suspended = self._suspended_owner
+
         if owner == f"human:{client.client_id}":
             self.send_bytes(data, source=f"human:{client.client_id}", cmd_id=None)
+            return
+
+        if agent_active and suspended == f"human:{client.client_id}":
+            with self._state_lock:
+                buf = self._deferred_buffers.get(client.client_id)
+                if buf is None:
+                    buf = bytearray()
+                    self._deferred_buffers[client.client_id] = buf
+                buf.extend(data)
             return
 
         lines, echo = self._consume_console_input(client, data)
@@ -500,6 +514,10 @@ class UARTBridge:
                 self._primary_client_id = next_client.client_id if next_client is not None else None
             if self._interactive_owner == f"human:{client_id}":
                 self._interactive_owner = None
+            if self._suspended_owner == f"human:{client_id}":
+                self._suspended_owner = None
+                self._agent_active = False
+            self._deferred_buffers.pop(client_id, None)
         self._close_console_client(client)
         return True
 
@@ -531,6 +549,35 @@ class UARTBridge:
     def set_interactive_owner(self, owner: str | None) -> None:
         with self._state_lock:
             self._interactive_owner = owner
+
+    def suspend_interactive(self) -> None:
+        """暫時掛起 human interactive ownership，切換到 deferred 模式。
+
+        Agent 執行命令前呼叫；human console input 會累積在 deferred buffer
+        而不是直接 raw 送到 UART。
+        """
+        with self._state_lock:
+            self._suspended_owner = self._interactive_owner
+            self._interactive_owner = None
+            self._agent_active = True
+
+    def resume_interactive(self) -> None:
+        """恢復 human interactive ownership 並 flush deferred buffer 到 UART。
+
+        Agent 命令完成後呼叫；deferred 期間累積的 human 輸入以 raw bytes
+        送到 UART，讓 target 自然回顯。
+        """
+        flush_data: list[tuple[str, bytes]] = []
+        with self._state_lock:
+            self._interactive_owner = self._suspended_owner
+            self._agent_active = False
+            self._suspended_owner = None
+            for client_id, buf in self._deferred_buffers.items():
+                if buf:
+                    flush_data.append((f"human:{client_id}", bytes(buf)))
+            self._deferred_buffers.clear()
+        for source, data in flush_data:
+            self.send_bytes(data, source=source, cmd_id=None)
 
     def snapshot(self) -> dict[str, Any]:
         consoles = self.list_consoles()

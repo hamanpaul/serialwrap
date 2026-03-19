@@ -307,12 +307,11 @@ minicom -D /dev/ttyUSB0
 重要限制：
 
 - minicom 看到的是透明 RX 視圖。
-- 一般 human 輸入會以「逐行」方式進入 broker queue，與 agent 共用單寫入仲裁；broker 會替 minicom 做本地回顯與基本 backspace 行編輯。
+- **`console-attach` 在 `ATTACHED` 或 `READY` 狀態下，會自動授予第一個 human console raw interactive ownership**，不需手動 `interactive-open`。所有按鍵（包含方向鍵、Tab、ESC 序列）即時透傳到 UART，操作體感與直接 minicom 一致。
+- 若 agent 在 human interactive 期間提交命令，daemon 會暫時掛起（suspend）human raw mode → 執行 agent 命令 → 完成後自動恢復（resume）。Human 在 agent 執行期間的按鍵會累積在 deferred buffer，agent 完成後 flush 到 UART。
+- 第二個以後的 minicom console 因為 interactive lease 已存在，仍走 line-buffer 模式（broker 提供本地回顯與 backspace 行編輯）。
 - 若要保留舊版「完整 terminal transcript」行為，可顯式設定 `MINICOM_CAPTURE_WRAPPER=1`，此時 wrapper 會改用 `script -qef` 包一層 PTY；但這可能增加 human 體感延遲。
-- 若 session 只有 `ATTACHED`（bridge 已掛上但尚未 ready），`session console-attach` 仍可進入 brokered minicom；這時 console 會自動拿到 raw human ownership，方便手動登入或觀察 boot/log 狀態。
-- 若要讓某個 console 進入 raw interactive ownership，先 `console-attach` 拿到 `client_id`，再用 `interactive-open --owner human:<client_id>` 開 lease。
 - 常見 human/minicom 互動式命令（例如 `vi`、`vim`、`top`、`htop`、`less`、`menuconfig`）會自動升級成 human interactive ownership，不再因為等不到 shell prompt 而自動觸發 recover / reboot。
-- human interactive ownership 存在時，agent 的 `line` / `background` 命令會在 worker 內等待 ownership 釋放；若超過該命令自己的 timeout，才會回 `SESSION_INTERACTIVE_BUSY`。
 - 若直接打 `minicom` 沒有走 broker，先用 `type -a minicom` 檢查目前 shell 是否先命中 `~/.paul_tools/minicom`；若仍是 `/usr/bin/minicom`，代表 shell PATH 尚未把 wrapper 放到前面。
 
 手動 console 控制範例：

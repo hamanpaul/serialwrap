@@ -110,22 +110,32 @@ MCP 只是 RPC 的薄轉接層。新增或改名工具時，要把 `sw_mcp/serve
 - CLI 與 MCP 一律用 `json.dumps(..., ensure_ascii=False, separators=(",", ":"))`。
 - `state.json` 與 WAL 相關輸出會加上 `sort_keys=True`，避免不必要的 diff 與測試波動。
 
-### human console 不會直接把每個按鍵原樣寫進 UART
+### human console 預設走 raw interactive 模式
 
-human console 走的是 brokered console 模型：
+`console-attach` 在 `ATTACHED` 或 `READY` 狀態下，會自動授予第一個 human console **raw interactive ownership**：
 
-- `UARTBridge` 先做本地回顯與 backspace 編輯。
-- 只有湊成一整行之後，才由 `SerialwrapService._on_console_line()` 送進 arbiter。
-- 這是為了讓多 console / 多 agent 共用 UART 時，target 不會看到半截輸入。
+- Raw interactive 期間，所有 console bytes 透過 `UARTBridge.send_bytes()` 即時透傳到 UART，不經過 `_consume_console_input()` 或 `_on_console_line()`。
+- 方向鍵（ESC 序列）、Tab 等特殊按鍵可正常使用。
+- 第二個以後的 console 因為 interactive lease 已存在，仍走 line-buffer 路徑。
+
+當 agent 提交命令時，daemon 會暫時 **suspend** human raw mode：
+
+1. `bridge.suspend_interactive()` → 保存 owner、切到 deferred mode
+2. 執行 agent 命令（human 按鍵累積在 deferred buffer，不做 local echo）
+3. `bridge.resume_interactive()` → 恢復 owner、flush deferred buffer 到 UART
+
+這個機制取代了舊的 `_wait_for_human_interactive_release()` 等待行為。Agent 不再需要等 human 關閉 minicom 才能執行命令。
 
 ### 常見 human 互動式命令會自動升級成 interactive 模式
 
 `sw_core/service.py` 的 `_human_console_mode()` 會辨識 `vi`、`vim`、`top`、`less`、`menuconfig` 等命令；若 human console 打的是這類命令，broker 會自動走 interactive ownership，而不是當成普通 line command。
 
+> **注意**：在 raw interactive 預設行為下，第一個 console 的按鍵已經走 raw path，不經過 `_on_console_line()`，因此 `_human_console_mode()` 的辨識只在 line-buffer 路徑（第二個以後的 console 或 suspend 期間）生效。
+
 這個機制會影響：
 
-- agent 命令是否需要等待 human interactive lease 釋放
-- `SESSION_INTERACTIVE_BUSY` 何時出現
+- agent 命令是否需要透過 suspend/resume 搶佔 human interactive lease
+- `SESSION_INTERACTIVE_BUSY` 何時出現（僅 agent-vs-agent interactive 衝突時）
 - recover 流程是否應該介入
 
 ### Alias / binding 是持久化狀態，不只存在記憶體

@@ -1,0 +1,74 @@
+---
+meta:
+  name: hk-01-special-keys-raw
+  category: human-key
+  severity: critical
+  description: "驗證 ESC 序列（方向鍵）及 Tab 在 raw interactive mode 下正確透傳到 UART"
+  tags: ["console", "raw-interactive", "escape-sequence"]
+
+target:
+  platform: prpl
+  boot_banner: "boot done\r\nroot@prplOS:/# "
+  noise:
+    enabled: false
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+
+profile:
+  prompt_regex: '(?m)^root@prplOS:.*# '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+
+steps:
+  - action: wait_ready
+    timeout_s: 20
+
+  # attach 應自動取得 interactive ownership（raw mode）
+  - action: attach_console
+    selector: COM0
+    label: hk-test
+    save_as: con
+
+  - action: assert_state
+    selector: COM0
+    expect:
+      state: "READY"
+      has_interactive: true
+
+  # 送 ESC [ A (Up arrow) — 在 raw mode 應完整透傳
+  - action: console_write
+    console_id: "{con.client_id}"
+    input_raw: "\x1b[A"
+    delay_ms: 0
+
+  - action: sleep
+    seconds: 0.3
+
+  # 送 ESC [ B (Down arrow)
+  - action: console_write
+    console_id: "{con.client_id}"
+    input_raw: "\x1b[B"
+    delay_ms: 0
+
+  - action: sleep
+    seconds: 0.3
+
+  # 送 Tab
+  - action: console_write
+    console_id: "{con.client_id}"
+    input_raw: "\x09"
+    delay_ms: 0
+
+  - action: sleep
+    seconds: 0.3
+
+  # 驗證 WAL 中有完整的 ESC 序列（source=human:*）
+  - action: assert_wal
+    expect:
+      any_tx_contains_raw: "\x1b[A"
+      any_tx_contains_raw: "\x1b[B"
+      any_tx_contains_raw: "\x09"
+
+  - action: detach_console
+    console_id: "{con.client_id}"
+    selector: COM0

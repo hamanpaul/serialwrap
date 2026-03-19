@@ -1,0 +1,82 @@
+---
+meta:
+  name: hk-02-agent-preempt-human
+  category: human-key
+  severity: critical
+  description: "Agent 命令在 human raw interactive session 期間正確搶佔執行"
+  tags: ["console", "raw-interactive", "agent-preempt"]
+
+target:
+  platform: prpl
+  boot_banner: "boot done\r\nroot@prplOS:/# "
+  noise:
+    enabled: false
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+
+profile:
+  prompt_regex: '(?m)^root@prplOS:.*# '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+
+steps:
+  - action: wait_ready
+    timeout_s: 20
+
+  # Human attach（自動取得 interactive ownership）
+  - action: attach_console
+    selector: COM0
+    label: hk-preempt
+    save_as: con
+
+  # Human 先 raw 送一條命令
+  - action: console_write
+    console_id: "{con.client_id}"
+    input: "echo human-first\n"
+    delay_ms: 10
+
+  - action: console_read
+    console_id: "{con.client_id}"
+    timeout_s: 5
+    expect:
+      contains: "RESULT:echo human-first:OK"
+
+  # Agent 提交命令（human 不 detach）
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--cmd", "echo agent-cmd", "--source", "agent:preempt-test"]
+    expect:
+      ok: true
+      has_keys: ["cmd_id"]
+    save_as: submit1
+
+  - action: wait_command_done
+    cmd_id: "{submit1.cmd_id}"
+    timeout_s: 10
+
+  # 驗證 agent 命令成功
+  - action: cli
+    argv: ["cmd", "get", "--cmd-id", "{submit1.cmd_id}"]
+    expect:
+      ok: true
+    save_as: result1
+
+  - action: assert_state
+    selector: COM0
+    expect:
+      state: "READY"
+
+  # Human 命令在 agent 完成後仍可正常操作
+  - action: console_write
+    console_id: "{con.client_id}"
+    input: "echo human-after\n"
+    delay_ms: 10
+
+  - action: console_read
+    console_id: "{con.client_id}"
+    timeout_s: 5
+    expect:
+      contains: "RESULT:echo human-after:OK"
+
+  - action: detach_console
+    console_id: "{con.client_id}"
+    selector: COM0

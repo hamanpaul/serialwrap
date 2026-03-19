@@ -823,7 +823,7 @@ class SessionManager:
         mode: str = "line",
     ) -> dict[str, Any]:
         normalized_mode = {"fg": "line", "bg": "background"}.get(mode, mode)
-        wait_for_human_interactive = False
+        suspend_human_interactive = False
         with self._lock:
             session = self._sessions.get(session_id)
             if session is None or session.bridge is None or session.state != "READY":
@@ -833,33 +833,37 @@ class SessionManager:
             lease = self._refresh_interactive_locked(session)
             if lease is not None and normalized_mode != "interactive":
                 if not source.startswith("human:") and lease.owner.startswith("human:"):
-                    wait_for_human_interactive = True
+                    suspend_human_interactive = True
                 else:
                     return {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY", "interactive_session_id": session.interactive_session_id}
             bridge = session.bridge
             prompt_regex = session.profile.prompt_regex
 
-        if wait_for_human_interactive:
-            wait_ok, wait_error = self._wait_for_human_interactive_release(session_id, timeout_s=timeout_s)
-            if not wait_ok:
-                with self._lock:
-                    current = self._sessions.get(session_id)
-                    result = {"ok": False, "error_code": wait_error or "SESSION_INTERACTIVE_BUSY"}
-                    if current is not None and current.interactive_session_id is not None:
-                        result["interactive_session_id"] = current.interactive_session_id
-                    return result
-            with self._lock:
-                session = self._sessions.get(session_id)
-                if session is None or session.bridge is None or session.state != "READY":
-                    return {"ok": False, "error_code": "SESSION_NOT_READY"}
-                if session.recovering:
-                    return {"ok": False, "error_code": "SESSION_RECOVERING"}
-                lease = self._refresh_interactive_locked(session)
-                if lease is not None:
-                    return {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY", "interactive_session_id": session.interactive_session_id}
-                bridge = session.bridge
-                prompt_regex = session.profile.prompt_regex
+        if suspend_human_interactive:
+            bridge.suspend_interactive()
 
+        try:
+            return self._execute_command_inner(
+                session, bridge, command, source, cmd_id,
+                timeout_s=timeout_s, normalized_mode=normalized_mode,
+                prompt_regex=prompt_regex,
+            )
+        finally:
+            if suspend_human_interactive:
+                bridge.resume_interactive()
+
+    def _execute_command_inner(
+        self,
+        session: SessionRuntime,
+        bridge: UARTBridge,
+        command: str,
+        source: str,
+        cmd_id: str,
+        *,
+        timeout_s: float,
+        normalized_mode: str,
+        prompt_regex: str,
+    ) -> dict[str, Any]:
         if normalized_mode == "interactive":
             with self._lock:
                 for bg_cmd_id in list(session.background_cmd_ids):
@@ -991,7 +995,7 @@ class SessionManager:
             payload = session.bridge.attach_console(label=label)
             if session.vtty_path is None:
                 session.vtty_path = payload["vtty"]
-            if session.state == "ATTACHED" and self._refresh_interactive_locked(session) is None:
+            if session.state in {"ATTACHED", "READY"} and self._refresh_interactive_locked(session) is None:
                 lease = self._open_interactive_locked(
                     session,
                     owner=f"human:{payload['client_id']}",
