@@ -288,8 +288,9 @@ serialwrap session interactive-close --interactive-id <interactive_id>
 1. 視需要自動啟動 daemon
 2. 視需要對 selector 執行 `session attach`
 3. 透過 `session console-attach` 取得專屬 PTY
-4. 啟動 `minicom`
-5. 結束後自動 `session console-detach`
+4. 用 wrapper 自己記錄一份 `mini_<COM>_<timestamp>.log` transcript（預設在 `~/b-log`，可用 `BLOG_DIR` 覆寫）
+5. 啟動 `minicom`
+6. 結束後自動 `session console-detach`
 
 ```bash
 # 自動選第一個 READY，否則退而求其次選 ATTACHED session

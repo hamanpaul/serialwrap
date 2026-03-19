@@ -20,7 +20,20 @@ PREFERRED_COM="${SERIALWRAP_PREFERRED_COM:-COM0}"
 MINICOM_BIN="${MINICOM_BIN:-/usr/bin/minicom}"
 MINICOM_DEFAULT_COLOR="${MINICOM_DEFAULT_COLOR:-on}"
 MINICOM_AUTO_CAPTURE="${MINICOM_AUTO_CAPTURE:-1}"
-BLOG_DIR="${BLOG_DIR:-${BUILD_LOG_PATH:-${HOME}/b-log}}"
+BLOG_DIR="${BLOG_DIR:-${HOME}/b-log}"
+MINICOM_CAPTURE_WRAPPER="${MINICOM_CAPTURE_WRAPPER:-1}"
+
+_shell_join() {
+  local -a quoted
+  quoted=()
+  local arg
+  for arg in "$@"; do
+    printf -v arg '%q' "${arg}"
+    quoted+=("${arg}")
+  done
+  local IFS=' '
+  printf '%s' "${quoted[*]}"
+}
 
 selector=""
 if [[ $# -gt 0 && "${1}" != -* ]]; then
@@ -122,17 +135,28 @@ _exec_minicom() {
   if [[ "${has_color}" -eq 0 && -n "${MINICOM_DEFAULT_COLOR}" ]]; then
     extra_args+=("--color=${MINICOM_DEFAULT_COLOR}")
   fi
+
+  local logfile=""
   if [[ "${has_capture}" -eq 0 && "${MINICOM_AUTO_CAPTURE}" == "1" ]]; then
     mkdir -p "${BLOG_DIR}"
     local ts
     ts="$(date +%y%m%d-%H%M%S)"
     local safe_com
     safe_com="$(printf '%s' "${com_name}" | tr -c 'A-Za-z0-9._+-' '_')"
-    local logfile="${BLOG_DIR}/mini_${safe_com}_${ts}.log"
-    extra_args+=("-C" "${logfile}")
+    logfile="${BLOG_DIR}/mini_${safe_com}_${ts}.log"
   fi
 
-  "${MINICOM_BIN}" -D "${device}" "${extra_args[@]}" "${user_args[@]}"
+  local -a cmd
+  cmd=("${MINICOM_BIN}" -D "${device}" "${extra_args[@]}" "${user_args[@]}")
+  if [[ -n "${logfile}" && "${MINICOM_CAPTURE_WRAPPER}" == "1" ]] && command -v script >/dev/null 2>&1; then
+    local cmdline
+    cmdline="$(_shell_join "${cmd[@]}")"
+    exec script -qef -c "${cmdline}" "${logfile}"
+  fi
+  if [[ -n "${logfile}" ]]; then
+    cmd+=("-C" "${logfile}")
+  fi
+  exec "${cmd[@]}"
 }
 
 _ensure_daemon() {
