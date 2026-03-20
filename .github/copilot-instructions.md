@@ -142,7 +142,22 @@ MCP 只是 RPC 的薄轉接層。新增或改名工具時，要把 `sw_mcp/serve
 
 - `SessionManager` 會把 alias 與 binding override 存到 `state.json`。
 - `profiles/*.yaml` 是預設來源，但執行期 `session.bind` / `alias.*` 的結果會覆寫到持久化狀態。
-- 裝置綁定慣例是使用 `/dev/serial/by-id/`，不要改回不穩定的 `/dev/ttyUSB*`。
+- 裝置綁定慣例是使用 `/dev/serial/by-id/` 或 `/dev/serial/by-path/`，不要用不穩定的 `/dev/ttyUSB*`。
+- 若多張板使用同款 USB-Serial 晶片（如 CH340），`by-id` 會完全相同，此時必須改用 `by-path`（基於物理 USB port 路徑，不隨列舉順序變）。
+
+### Profile YAML 結構
+
+- YAML 有三個頂層區段：`defaults`、`profiles`、`targets`。
+- `defaults` 目前支援 `log_dir`（agent log 預設目錄）。
+- `profiles` 定義 template（`platform`、`prompt_regex`、`login_regex`、`password_regex`、`user_env`、`pass_env`、`env_file`、`post_login_cmd`、`ready_probe`、`timeout_s`、`quiet_window_s`、`hard_timeout_s`、`log_dir`、`uart.*`）。
+- `targets` 綁定 COM → template → device_by_id。
+
+### Platform 行為差異
+
+- `platform=shell`：generic Linux login（如 Orange Pi），走 prompt → login → ready_probe 流程。
+- `platform=bcm`：Broadcom 原生平台（如 BCM968575），登入後進入 BCM CLI（`>`），需 `post_login_cmd: "sh"` 切到 Linux shell（`#`）。`timeout_s` 建議加大（15s+）。
+- `platform=prpl`：prplOS，prompt_regex 匹配 prefix，不依賴行尾錨點。
+- `platform=passthrough`：不做任何 login/ready gating，session 停在 `ATTACHED`，適合未知設備觀察。
 
 ### 新增能力通常要同步改多個面
 

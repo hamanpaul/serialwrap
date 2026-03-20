@@ -153,6 +153,9 @@ hash -r 2>/dev/null || true
 `profiles/*.yaml` 以 template + targets 定義 platform、prompt、login、ready probe 與 UART 參數。
 
 ```yaml
+defaults:
+  log_dir: "~/b-log"           # 全域 agent log 預設目錄
+
 profiles:
   prpl-template:
     platform: prpl
@@ -181,6 +184,24 @@ profiles:
       stop_bits: 1
       flow_control: none
       xonxoff: false
+  brcm-template:
+    platform: bcm
+    prompt_regex: "(?m)[>#]\\s*$"
+    login_regex: "(?mi)login:\\s*$"
+    password_regex: "(?mi)password:\\s*$"
+    post_login_cmd: "sh"         # 登入後自動執行，從 BCM shell (>) 切到 Linux shell (#)
+    user_env: "BRCM_USER"
+    pass_env: "BRCM_PASS"
+    env_file: "brcm.env"
+    timeout_s: 15
+    ready_probe: "echo __READY__${nonce}"
+    uart:
+      baud: 115200
+      data_bits: 8
+      parity: N
+      stop_bits: 1
+      flow_control: none
+      xonxoff: false
   others-template:
     platform: passthrough
     prompt_regex: ".*"
@@ -197,25 +218,27 @@ profiles:
 
 targets:
   - act_no: 1
-    com: COM0
-    alias: default+1
-    profile: prpl-template
-    device_by_id: /dev/serial/by-id/<target0>
-  - act_no: 3
-    com: COM2
-    alias: default+3
+    com: COM1
+    alias: opi
     profile: op3-template
-    device_by_id: /dev/serial/by-id/<target2>
-  - act_no: 4
+    device_by_id: /dev/serial/by-path/platform-vhci_hcd.0-usb-0:1:1.0-port0
+  - act_no: 2
+    com: COM2
+    alias: brcm
+    profile: brcm-template
+    device_by_id: /dev/serial/by-path/platform-vhci_hcd.0-usb-0:2:1.0-port0
+  - act_no: 3
     com: COM3
-    alias: default+4
+    alias: passthrough
     profile: others-template
-    device_by_id: /dev/serial/by-id/<target3>
+    device_by_id: /dev/serial/by-id/placeholder-passthrough
 ```
 
 `prpl-template` 預設改成匹配 `root@prplOS:/#` 這種 prompt prefix，而不是要求 prompt 必須單獨佔一整行。這樣在 prompt 後面立刻接 driver / kernel log 的情況下，line mode 仍能正確收尾；`ready_probe` 也維持最小 `echo __READY__${nonce}`，避免在沒有 `whoami` 的 target 上增加噪音。
 
 `op3-template` 沿用 generic shell login 模型，適合 Orange Pi / Debian shell。`user_env` / `pass_env` 是每個 profile 自己指定的登入帳密環境變數名稱。CLI / daemon 不會把密碼寫進 YAML 或 WAL。`env_file` 指向同目錄 env 檔，帳密在每次 session attach 時**per-session 解析**，不會污染 daemon 全域環境。不同 COM 可以用不同的 `env_file`，達到 per-session 帳密隔離。
+
+`brcm-template` 用於 Broadcom 原生平台（如 BCM968575）。登入後 target 進入 BCM CLI shell（提示符 `>`），需要再執行 `sh` 才會進到 Linux shell（`#`）。`post_login_cmd: "sh"` 讓 daemon 在成功登入後自動送出此命令，完成兩階段切換。`timeout_s: 15` 因為 Broadcom 登入流程較慢而加長。
 
 建議把 env 檔直接放在 profile 旁邊，例如：
 
@@ -233,6 +256,8 @@ serialwrap daemon start --profile-dir "$HOME/.paul_tools/profiles"
 若 shell device 已經自動登入，`serialwrap` 會直接用 prompt + `ready_probe` 驗證；若先看到 `login:` / `password:`，則會依 `user_env` / `pass_env` 自動登入。像 Orange Pi 常見的 `orangepi3 login:`，建議 `login_regex` 用 `(?mi)^.*login:\\s*$`。
 
 `others-template` 使用 `platform=passthrough`。attach 時不做 prompt/login/ready 限制，只建立 broker bridge，讓 `ttyUSB` 與 broker 建出的 `ttyPTS` 直接透傳；這類 session 會停在 `ATTACHED`，適合不認識的設備先用 minicom/human console 觀察。
+
+`device_by_id` 支援 `/dev/serial/by-id/` 與 `/dev/serial/by-path/` 兩種穩定識別方式。若多張板使用同款 USB-Serial 晶片（如 CH340），`by-id` 無法區分，建議改用 `by-path`（基於物理 USB port 路徑，不隨列舉順序變）。
 
 常用查看：
 
