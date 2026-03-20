@@ -103,6 +103,7 @@ def _maybe_login(bridge: UARTBridge, sp: SessionProfile, auth: SessionAuth | Non
         assert password is not None
         bridge.send_secret(password)
         ok, err = _wait_or_fail(bridge, sp.prompt_regex, sp.timeout_s, _prompt_timeout_error(sp))
+        bridge.clear_rx_buffer()
         return ok, err
 
     ok, err = _wait_or_fail(bridge, sp.prompt_regex, sp.timeout_s, _prompt_timeout_error(sp))

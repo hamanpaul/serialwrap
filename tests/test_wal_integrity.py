@@ -58,10 +58,9 @@ class TestWalIntegrity(unittest.TestCase):
             wal2 = WalWriter(wal_dir=td, rotate_bytes=300)
             rec = wal2.append(com="COM0", direction="TX", source="test",
                               payload=b"after-rotate\n", cmd_id="ar")
-            # 注意：_load_last_seq 只讀主檔，rotate 後主檔可能只有最後幾筆，
-            # 但 seq 在記憶體中已遞增到 20，寫入後新 WalWriter 只能看到主檔的 seq
-            # 所以 rec seq 應 > 最大歸檔 seq（至少 > 0）
-            self.assertGreater(rec["seq"], 0)
+            # 新 WalWriter 只讀主檔，但主檔一定保留最後一筆 seq=20，
+            # 因此下一筆 append 應為 21，不能重置為 1。
+            self.assertEqual(rec["seq"], 21)
 
     def test_wal_load_last_seq_skips_corrupt_lines(self) -> None:
         """WAL 檔中間有亂碼行時，_load_last_seq 應跳過並繼續讀取。"""

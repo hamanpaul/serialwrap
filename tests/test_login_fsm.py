@@ -39,6 +39,7 @@ class TestLoginFsm(unittest.TestCase):
         bridge.send_command.assert_any_call("", source="system")
         bridge.send_command.assert_any_call("haman", source="system")
         bridge.send_secret.assert_called_once_with("secret")
+        self.assertEqual(bridge.clear_rx_buffer.call_count, 2)
         probe_calls = [call for call in bridge.send_command.call_args_list if "__READY__" in str(call)]
         self.assertEqual(len(probe_calls), 1)
 
@@ -56,6 +57,7 @@ class TestLoginFsm(unittest.TestCase):
         self.assertIsNone(err)
         bridge.send_command.assert_any_call("explicit_user", source="system")
         bridge.send_secret.assert_called_once_with("explicit_pass")
+        self.assertEqual(bridge.clear_rx_buffer.call_count, 2)
 
     def test_probe_ready_reports_login_required_without_auto_login(self) -> None:
         bridge = mock.MagicMock()
@@ -69,6 +71,7 @@ class TestLoginFsm(unittest.TestCase):
         self.assertEqual(err, "LOGIN_REQUIRED")
         bridge.send_command.assert_called_once_with("", source="system")
         bridge.send_secret.assert_not_called()
+        bridge.clear_rx_buffer.assert_called_once_with()
 
 
 if __name__ == "__main__":

@@ -474,8 +474,6 @@ class SessionManager:
 
     def _attach_by_id(self, by_id: str) -> None:
         save_needed = False
-        require_login = False
-        passthrough_only = False
         with self._lock:
             session = next((s for s in self._sessions.values() if s.profile.device_by_id == by_id), None)
             if session is None:
@@ -488,26 +486,32 @@ class SessionManager:
                     session.profile = dataclasses.replace(session.profile, device_by_id=by_id)
                     self._binding_overrides[session.session_id] = by_id
                     save_needed = True
-            dev = self._devices.get(by_id)
-            if session is not None:
-                require_login = session.pending_auto_login or bool(session.profile.login_regex)
-                passthrough_only = session.profile.platform == "passthrough"
         if save_needed:
             self._save_state()
-        if session is None or dev is None or session.bridge is not None:
-            return
+        with self._lock:
+            if session is None:
+                return
+            dev = self._devices.get(by_id)
+            if dev is None or session.bridge is not None or session.profile.device_by_id != by_id:
+                return
+            session.state = "ATTACHING"
+            session.last_error = None
+            gen_before = session.bridge_generation
+            session_id = session.session_id
+            profile = session.profile
+            require_login = session.pending_auto_login or bool(profile.login_regex)
+            passthrough_only = profile.platform == "passthrough"
+            real_path = dev.real_path
 
         bridge = UARTBridge(
-            session.profile.com,
-            dev.real_path,
-            session.profile.uart,
+            profile.com,
+            real_path,
+            profile.uart,
             self._wal,
-            on_console_line=lambda client_id, line, sid=session.session_id: self._on_bridge_console_line(sid, client_id, line),
-            on_rx_data=lambda data, sid=session.session_id: self._on_bridge_rx(sid, data),
-            on_bridge_down=lambda reason, sid=session.session_id: self._handle_bridge_down(sid, bridge, reason),
+            on_console_line=lambda client_id, line, sid=session_id: self._on_bridge_console_line(sid, client_id, line),
+            on_rx_data=lambda data, sid=session_id: self._on_bridge_rx(sid, data),
+            on_bridge_down=lambda reason, sid=session_id: self._handle_bridge_down(sid, bridge, reason),
         )
-        session.state = "ATTACHING"
-        session.last_error = None
 
         try:
             bridge.start()
@@ -515,9 +519,9 @@ class SessionManager:
                 ok = False
                 err = None
             elif require_login:
-                auth = resolve_session_auth(session.profile)
+                auth = resolve_session_auth(profile)
                 if auth.username and auth.password:
-                    ok, err = ensure_ready(bridge, session.profile, auth=auth)
+                    ok, err = ensure_ready(bridge, profile, auth=auth)
                     if not ok:
                         bridge.stop()
                         with self._lock:
@@ -531,14 +535,14 @@ class SessionManager:
                         return
                 else:
                     # 無帳密時退回 probe，讓 human 手動登入
-                    ok, err = probe_ready(bridge, session.profile)
+                    ok, err = probe_ready(bridge, profile)
             else:
-                ok, err = probe_ready(bridge, session.profile)
+                ok, err = probe_ready(bridge, profile)
 
             notify_ready = False
             with self._lock:
                 current = self._devices.get(by_id)
-                if current is None or current.real_path != dev.real_path or session.state == "DETACHED":
+                if current is None or current.real_path != real_path or session.state == "DETACHED" or session.bridge_generation != gen_before:
                     bridge.stop()
                     session.state = "DETACHED"
                     session.last_error = "DEVICE_REMOVED_DURING_ATTACH"
@@ -549,7 +553,7 @@ class SessionManager:
                     return
                 session.bridge = bridge
                 session.vtty_path = bridge.vtty_path
-                session.attached_real_path = dev.real_path
+                session.attached_real_path = real_path
                 session.bridge_generation += 1
                 if ok:
                     session.state = "READY"
@@ -881,9 +885,9 @@ class SessionManager:
                 "status": "interactive",
             }
 
-        session.foreground_busy = True
-        if normalized_mode != "background":
-            with self._lock:
+        with self._lock:
+            session.foreground_busy = True
+            if normalized_mode != "background":
                 for bg_cmd_id in list(session.background_cmd_ids):
                     capture = self._background.get(bg_cmd_id)
                     if capture is not None:
@@ -900,7 +904,8 @@ class SessionManager:
                     execution_mode=normalized_mode,
                 )
             finally:
-                session.foreground_busy = False
+                with self._lock:
+                    session.foreground_busy = False
         pre_offset = bridge.rx_snapshot_len()
         try:
             bridge.send_command(command, source=source, cmd_id=cmd_id)
@@ -929,7 +934,8 @@ class SessionManager:
                 result["background_capture_id"] = cmd_id
             return result
         finally:
-            session.foreground_busy = False
+            with self._lock:
+                session.foreground_busy = False
 
     def _recover_after_failure(
         self,

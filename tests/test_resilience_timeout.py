@@ -83,6 +83,7 @@ class TestCommandCancel(unittest.TestCase):
                                 mode="fg", timeout_s=10.0)
         cmd_id = r["cmd_id"]
         self._exec_started.wait(timeout=5.0)
+        time.sleep(0.05)
 
         # 命令正在執行（status=running），此時 cancel
         result = self.arbiter.cancel(cmd_id)

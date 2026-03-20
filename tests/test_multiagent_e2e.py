@@ -252,6 +252,7 @@ targets:
                     th.start()
                 for th in threads:
                     th.join(timeout=15.0)
+                    self.assertFalse(th.is_alive(), "submit thread did not finish in time")
 
             self.assertEqual(len(submit_rows), 15)
             bad = [row for row in submit_rows if not row["resp"].get("ok")]
