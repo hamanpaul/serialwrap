@@ -370,6 +370,7 @@ serialwrap session self-test --selector COM0
 - `ATTACHED_NOT_READY`：bridge 已掛，但 prompt probe 失敗（如 boot log 中、前景程式仍在跑）
 - `REBOOTING`：agent 已送出 reboot 類指令，正在等待 target 重開機完畢後自動 relogin
 - `HUMAN_INTERACTIVE_ACTIVE`：human console 目前握有 interactive ownership，不適合 agent 干預
+- `PASSTHROUGH`：platform 設為 passthrough，session 已 ATTACHED，適合透明 bridge 模式
 
 ### Recover
 
@@ -476,6 +477,7 @@ serialwrap wal export --from-seq 0 --limit 500
 | `serialwrap_log_start` | `session.log_start` |
 | `serialwrap_log_stop` | `session.log_stop` |
 | `serialwrap_log_status` | `session.log_status` |
+| `serialwrap_clear_session` | `session.clear` |
 
 ### Legacy alias
 
