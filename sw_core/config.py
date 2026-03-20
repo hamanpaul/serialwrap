@@ -29,9 +29,11 @@ class ProfileTemplate:
     username: str | None = None
     user_env: str | None = None
     pass_env: str | None = None
+    env_file: str | None = None
     timeout_s: float = 10.0
     quiet_window_s: float = 2.0
     hard_timeout_s: float = 60.0
+    log_dir: str | None = None
     uart: UartProfile = dataclasses.field(default_factory=UartProfile)
 
 
@@ -51,9 +53,11 @@ class SessionProfile:
     username: str | None = None
     user_env: str | None = None
     pass_env: str | None = None
+    env_file: str | None = None
     timeout_s: float = 10.0
     quiet_window_s: float = 2.0
     hard_timeout_s: float = 60.0
+    log_dir: str | None = None
     uart: UartProfile = dataclasses.field(default_factory=UartProfile)
 
 
@@ -84,6 +88,16 @@ def _as_str_keep_empty(v: Any, default: str) -> str:
     return str(v).strip()
 
 
+def _resolve_opt_path(v: Any, *, base_dir: str) -> str | None:
+    s = _as_opt_str(v)
+    if s is None:
+        return None
+    expanded = os.path.expanduser(s)
+    if os.path.isabs(expanded):
+        return os.path.normpath(expanded)
+    return os.path.normpath(os.path.join(base_dir, expanded))
+
+
 def _load_uart(raw: Any, default: UartProfile | None = None) -> UartProfile:
     base = default or UartProfile()
     obj = raw if isinstance(raw, dict) else {}
@@ -97,7 +111,7 @@ def _load_uart(raw: Any, default: UartProfile | None = None) -> UartProfile:
     )
 
 
-def _template_from_dict(name: str, raw: dict[str, Any]) -> ProfileTemplate:
+def _template_from_dict(name: str, raw: dict[str, Any], *, base_dir: str) -> ProfileTemplate:
     return ProfileTemplate(
         profile_name=name,
         platform=str(raw.get("platform") or "prpl").strip().lower(),
@@ -109,14 +123,16 @@ def _template_from_dict(name: str, raw: dict[str, Any]) -> ProfileTemplate:
         username=_as_opt_str(raw.get("username")),
         user_env=_as_opt_str(raw.get("user_env") or raw.get("username_env") or raw.get("login_env")),
         pass_env=_as_opt_str(raw.get("pass_env") or raw.get("password_env") or raw.get("pw_env")),
+        env_file=_resolve_opt_path(raw.get("env_file"), base_dir=base_dir),
         timeout_s=_as_float(raw.get("timeout_s"), 10.0),
         quiet_window_s=_as_float(raw.get("quiet_window_s"), 2.0),
         hard_timeout_s=_as_float(raw.get("hard_timeout_s"), 60.0),
+        log_dir=_resolve_opt_path(raw.get("log_dir"), base_dir=base_dir),
         uart=_load_uart(raw.get("uart")),
     )
 
 
-def _load_templates(file_name: str, obj: dict[str, Any]) -> tuple[dict[str, ProfileTemplate], str]:
+def _load_templates(file_name: str, obj: dict[str, Any], *, base_dir: str) -> tuple[dict[str, ProfileTemplate], str]:
     templates: dict[str, ProfileTemplate] = {}
     default_name = str(obj.get("profile_name") or os.path.splitext(file_name)[0]).strip()
 
@@ -128,7 +144,7 @@ def _load_templates(file_name: str, obj: dict[str, Any]) -> tuple[dict[str, Prof
             name = str(k).strip()
             if not name:
                 continue
-            templates[name] = _template_from_dict(name, v)
+            templates[name] = _template_from_dict(name, v, base_dir=base_dir)
     elif isinstance(profiles_obj, list):
         for row in profiles_obj:
             if not isinstance(row, dict):
@@ -136,17 +152,32 @@ def _load_templates(file_name: str, obj: dict[str, Any]) -> tuple[dict[str, Prof
             name = str(row.get("name") or row.get("profile_name") or "").strip()
             if not name:
                 continue
-            templates[name] = _template_from_dict(name, row)
+            templates[name] = _template_from_dict(name, row, base_dir=base_dir)
 
     if not templates:
-        templates[default_name] = _template_from_dict(default_name, obj)
+        templates[default_name] = _template_from_dict(default_name, obj, base_dir=base_dir)
 
     if default_name not in templates:
         default_name = sorted(templates.keys())[0]
     return templates, default_name
 
 
-def _merge_session(template: ProfileTemplate, target: dict[str, Any], *, act_no: int, com: str, alias: str, device_by_id: str) -> SessionProfile:
+def _merge_session(
+    template: ProfileTemplate,
+    target: dict[str, Any],
+    *,
+    act_no: int,
+    com: str,
+    alias: str,
+    device_by_id: str,
+    base_dir: str,
+    defaults_log_dir: str | None = None,
+) -> SessionProfile:
+    log_dir = (
+        _resolve_opt_path(target.get("log_dir"), base_dir=base_dir)
+        if "log_dir" in target
+        else template.log_dir
+    ) or defaults_log_dir
     return SessionProfile(
         profile_name=template.profile_name,
         com=com,
@@ -170,9 +201,13 @@ def _merge_session(template: ProfileTemplate, target: dict[str, Any], *, act_no:
             if any(k in target for k in ("pass_env", "password_env", "pw_env"))
             else template.pass_env
         ),
+        env_file=_resolve_opt_path(target.get("env_file"), base_dir=base_dir)
+        if "env_file" in target
+        else template.env_file,
         timeout_s=_as_float(target.get("timeout_s"), template.timeout_s),
         quiet_window_s=_as_float(target.get("quiet_window_s"), template.quiet_window_s),
         hard_timeout_s=_as_float(target.get("hard_timeout_s"), template.hard_timeout_s),
+        log_dir=log_dir,
         uart=_load_uart(target.get("uart"), default=template.uart),
     )
 
@@ -191,7 +226,10 @@ def load_profiles(profile_dir: str) -> list[SessionProfile]:
         if not isinstance(obj, dict):
             continue
 
-        templates, default_profile_name = _load_templates(file_name, obj)
+        base_dir = os.path.dirname(path)
+        defaults_obj = obj.get("defaults") if isinstance(obj.get("defaults"), dict) else {}
+        defaults_log_dir = _resolve_opt_path(defaults_obj.get("log_dir"), base_dir=base_dir) if defaults_obj else None
+        templates, default_profile_name = _load_templates(file_name, obj, base_dir=base_dir)
         targets = obj.get("targets") or []
         if not isinstance(targets, list):
             continue
@@ -212,5 +250,16 @@ def load_profiles(profile_dir: str) -> list[SessionProfile]:
                 continue
             alias = str(t.get("alias") or f"{tpl.profile_name}+{act_no}").strip()
 
-            out.append(_merge_session(tpl, t, act_no=act_no, com=com, alias=alias, device_by_id=device_by_id))
+            out.append(
+                _merge_session(
+                    tpl,
+                    t,
+                    act_no=act_no,
+                    com=com,
+                    alias=alias,
+                    device_by_id=device_by_id,
+                    base_dir=base_dir,
+                    defaults_log_dir=defaults_log_dir,
+                )
+            )
     return out

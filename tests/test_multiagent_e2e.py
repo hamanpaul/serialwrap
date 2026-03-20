@@ -175,6 +175,7 @@ targets:
             env["SERIALWRAP_STATE_DIR"] = str(root / "state")
             env["SERIALWRAP_RUN_DIR"] = str(root / "run")
             env["SERIALWRAP_BY_ID_DIR"] = str(by_id_dir)
+            env["SERIALWRAP_BY_PATH_DIR"] = str(root / "by-path")
 
             socket_path = str(root / "run" / "serialwrapd.sock")
             lock_path = str(root / "run" / "serialwrapd.lock")
@@ -251,6 +252,7 @@ targets:
                     th.start()
                 for th in threads:
                     th.join(timeout=15.0)
+                    self.assertFalse(th.is_alive(), "submit thread did not finish in time")
 
             self.assertEqual(len(submit_rows), 15)
             bad = [row for row in submit_rows if not row["resp"].get("ok")]

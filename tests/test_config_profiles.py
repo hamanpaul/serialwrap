@@ -107,6 +107,61 @@ class TestConfigProfiles(unittest.TestCase):
             self.assertEqual(rows[0].pass_env, "SW_OPI_P")
             self.assertEqual(rows[0].ready_probe, "echo __READY__${nonce}")
 
+    def test_shell_profile_resolves_env_file_relative_to_yaml(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "shell.yaml"
+            p.write_text(
+                textwrap.dedent(
+                    """
+                    profiles:
+                      op3-template:
+                        platform: shell
+                        user_env: "SW_OPI_U"
+                        pass_env: "SW_OPI_P"
+                        env_file: "OPI.env"
+                    targets:
+                      - act_no: 3
+                        com: COM2
+                        alias: shell+3
+                        profile: op3-template
+                        device_by_id: /dev/serial/by-id/tty2
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            rows = load_profiles(td)
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].env_file, str(Path(td) / "OPI.env"))
+
+    def test_target_can_override_template_env_file(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "shell.yaml"
+            p.write_text(
+                textwrap.dedent(
+                    """
+                    profiles:
+                      op3-template:
+                        platform: shell
+                        env_file: "OPI.env"
+                    targets:
+                      - act_no: 3
+                        com: COM2
+                        alias: shell+3
+                        profile: op3-template
+                        env_file: "special.env"
+                        device_by_id: /dev/serial/by-id/tty2
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            rows = load_profiles(td)
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].env_file, str(Path(td) / "special.env"))
+
     def test_passthrough_profile_loads_without_ready_constraints(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             p = Path(td) / "others.yaml"

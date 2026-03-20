@@ -1,0 +1,52 @@
+---
+meta:
+  name: sm-01-attach-to-ready
+  category: state-machine
+  severity: critical
+  description: "驗證正常路徑：DETACHED → ATTACHING → READY，並能成功執行命令"
+  tags: ["state-machine", "basic"]
+
+target:
+  platform: prpl
+  boot_banner: "boot done\r\nroot@prplOS:/# "
+  noise:
+    enabled: true
+    interval_ms: 100
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+
+profile:
+  prompt_regex: '(?m)^root@prplOS:.*# '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+
+steps:
+  - action: wait_ready
+    timeout_s: 20
+
+  - action: assert_state
+    selector: COM0
+    expect:
+      state: "READY"
+
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--cmd", "echo hello", "--source", "agent:1"]
+    expect:
+      ok: true
+      has_keys: ["cmd_id"]
+    save_as: submit1
+
+  - action: wait_command_done
+    cmd_id: "{submit1.cmd_id}"
+    timeout_s: 10
+
+  - action: cli
+    argv: ["cmd", "status", "--cmd-id", "{submit1.cmd_id}"]
+    expect:
+      ok: true
+    save_as: status1
+
+  - action: assert_state
+    selector: COM0
+    expect:
+      state: "READY"

@@ -1,0 +1,54 @@
+---
+meta:
+  name: co-01-line-buffering
+  category: console-io
+  severity: high
+  description: "驗證 human console 的 line buffering：輸入整行後才送進 arbiter"
+  tags: ["console", "line-buffering", "human"]
+
+target:
+  platform: prpl
+  boot_banner: "boot done\r\nroot@prplOS:/# "
+  noise:
+    enabled: false
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+
+profile:
+  prompt_regex: '(?m)^root@prplOS:.*# '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+
+steps:
+  - action: wait_ready
+    timeout_s: 20
+
+  # Attach human console
+  - action: attach_console
+    selector: COM0
+    label: line-buf-test
+    save_as: con
+
+  # 逐字元輸入（模擬真實 human 打字）
+  - action: console_write
+    console_id: "{con.client_id}"
+    input: "echo line-test\n"
+    delay_ms: 20
+
+  # 讀取回應
+  - action: console_read
+    console_id: "{con.client_id}"
+    timeout_s: 5
+    expect:
+      contains: "RESULT:echo line-test:OK"
+
+  # Detach
+  - action: detach_console
+    console_id: "{con.client_id}"
+    selector: COM0
+
+  # 驗證 session 仍 READY
+  - action: assert_state
+    selector: COM0
+    expect:
+      state: "READY"

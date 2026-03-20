@@ -18,7 +18,7 @@
 - `jq`：`minicom_router.sh` 需要
 - `minicom`：human console 路徑需要
 
-## 架構圖
+## 系統方塊圖
 
 ```mermaid
 flowchart LR
@@ -63,7 +63,7 @@ flowchart LR
     class U,T,W,X io
 ```
 
-## 啟動時序圖
+## 啟動流程圖
 
 ```mermaid
 sequenceDiagram
@@ -89,6 +89,91 @@ sequenceDiagram
         U-->>SM: ATTACHED
     end
     D-->>CLI: health ok
+```
+
+## Session 狀態機
+
+```mermaid
+stateDiagram-v2
+    [*] --> DETACHED
+    DETACHED --> ATTACHING: device seen
+    ATTACHING --> READY: prompt ok
+    ATTACHING --> ATTACHED: login needed
+    ATTACHING --> ATTACHED: passthrough
+    ATTACHING --> DETACHED: device lost
+    ATTACHED --> READY: login ok
+    ATTACHED --> READY: recover ok
+    ATTACHED --> DETACHED: detach
+    READY --> ATTACHED: recover fallback
+    READY --> DETACHED: unplug
+    READY --> RECOVERING: reboot cmd
+    RECOVERING --> READY: auto relogin ok
+    RECOVERING --> ATTACHED: prompt not ready
+    RECOVERING --> DETACHED: device lost
+```
+
+## Agent / Human Co-work 時序圖
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant H as Human
+    participant D as Daemon
+    participant A as Arbiter
+    participant B as Bridge
+    participant T as Target
+    participant G as Agent
+
+    H->>B: raw keys
+    G->>D: submit line cmd
+    D->>B: suspend human
+    D->>A: enqueue cmd
+    A->>B: send command
+    B->>T: raw command
+    H->>B: deferred keys
+    T-->>B: stdout + prompt
+    B-->>A: prompt back
+    A-->>D: done + stdout
+    D->>B: resume human
+    B->>T: flush deferred
+    D-->>G: command result
+```
+
+## Multi-Agent 競爭時序圖
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A1 as Agent A
+    participant A2 as Agent B
+    participant A3 as Agent C
+    participant D as Daemon
+    participant Q as Arbiter
+    participant B as Bridge
+    participant T as Target
+
+    par submit
+        A1->>D: slow cmd
+    and
+        A2->>D: fast cmd
+    and
+        A3->>D: status / cancel
+    end
+
+    D->>Q: queue slow
+    D->>Q: queue fast
+    Q->>B: run slow
+    B->>T: slow command
+    T-->>B: slow prompt
+    B-->>Q: slow done
+    Q-->>D: update record
+    Q->>B: run fast
+    B->>T: fast command
+    T-->>B: fast prompt
+    Q-->>D: update record
+    D-->>A1: slow done
+    D-->>A2: fast done
+    D-->>A3: queued / canceled / done
 ```
 
 ## 呼叫流程圖
@@ -124,7 +209,7 @@ flowchart TD
 # 安裝
 ./install.sh
 
-# 啟動 daemon（若 `~/OPI.env` 存在會先自動載入）
+# 啟動 daemon（runtime env 依序從 shell env、~/OPI.env、profile_dir/OPI.env 載入）
 serialwrap daemon start --profile-dir "$HOME/.paul_tools/profiles"
 
 # 檢查健康狀態
@@ -145,14 +230,67 @@ serialwrap cmd status --cmd-id <cmd_id>
 ```bash
 export INSTALL_DIR="$HOME/.paul_tools"
 export PATH="$INSTALL_DIR:$PATH"
-alias minicom="$INSTALL_DIR/minicom_router.sh"
+hash -r 2>/dev/null || true
 ```
 
 ## Profile 與目標綁定
 
 `profiles/*.yaml` 以 template + targets 定義 platform、prompt、login、ready probe 與 UART 參數。
 
+## Session Template 架構圖
+
+```mermaid
+flowchart LR
+    DEF["defaults"]
+    ENV1["OPI.env"]
+    ENV2["brcm.env"]
+    OVR["state.json"]
+    SES["runtime session"]
+
+    subgraph CFG["profiles.yaml"]
+        subgraph TPL["profiles"]
+            P1["prpl-template"]
+            P2["op3-template"]
+            P3["brcm-template"]
+            P4["others-template"]
+        end
+        subgraph TGT["targets"]
+            T0["COMx prpl"]
+            T1["COM1 opi"]
+            T2["COM2 brcm"]
+            T3["COM3 passthrough"]
+        end
+    end
+
+    DEF --> P1
+    DEF --> P2
+    DEF --> P3
+    DEF --> P4
+    ENV1 --> P2
+    ENV2 --> P3
+    P1 --> T0
+    P2 --> T1
+    P3 --> T2
+    P4 --> T3
+    T0 --> SES
+    T1 --> SES
+    T2 --> SES
+    T3 --> SES
+    OVR --> SES
+
+    classDef cfg fill:#e8f1ff,stroke:#335c99,stroke-width:1px;
+    classDef profile fill:#eef7e8,stroke:#4f7a3f,stroke-width:1px;
+    classDef runtime fill:#fff4e6,stroke:#9a6b25,stroke-width:1px;
+
+    class DEF,ENV1,ENV2,OVR cfg
+    class P1,P2,P3,P4,T0,T1,T2,T3 profile
+    class SES runtime
+```
+
 ```yaml
+defaults:
+  log_dir: "~/b-log"           # 全域 agent log 預設目錄
+
 profiles:
   prpl-template:
     platform: prpl
@@ -172,6 +310,25 @@ profiles:
     password_regex: "(?mi)^password:\\s*$"
     user_env: "SW_OPI_U"
     pass_env: "SW_OPI_P"
+    env_file: "OPI.env"
+    ready_probe: "echo __READY__${nonce}"
+    uart:
+      baud: 115200
+      data_bits: 8
+      parity: N
+      stop_bits: 1
+      flow_control: none
+      xonxoff: false
+  brcm-template:
+    platform: bcm
+    prompt_regex: "(?m)[>#]\\s*$"
+    login_regex: "(?mi)login:\\s*$"
+    password_regex: "(?mi)password:\\s*$"
+    post_login_cmd: "sh"         # 登入後自動執行，從 BCM shell (>) 切到 Linux shell (#)
+    user_env: "BRCM_USER"
+    pass_env: "BRCM_PASS"
+    env_file: "brcm.env"
+    timeout_s: 15
     ready_probe: "echo __READY__${nonce}"
     uart:
       baud: 115200
@@ -196,28 +353,32 @@ profiles:
 
 targets:
   - act_no: 1
-    com: COM0
-    alias: default+1
-    profile: prpl-template
-    device_by_id: /dev/serial/by-id/<target0>
-  - act_no: 3
-    com: COM2
-    alias: default+3
+    com: COM1
+    alias: opi
     profile: op3-template
-    device_by_id: /dev/serial/by-id/<target2>
-  - act_no: 4
+    device_by_id: /dev/serial/by-path/platform-vhci_hcd.0-usb-0:1:1.0-port0
+  - act_no: 2
+    com: COM2
+    alias: brcm
+    profile: brcm-template
+    device_by_id: /dev/serial/by-path/platform-vhci_hcd.0-usb-0:2:1.0-port0
+  - act_no: 3
     com: COM3
-    alias: default+4
+    alias: passthrough
     profile: others-template
-    device_by_id: /dev/serial/by-id/<target3>
+    device_by_id: /dev/serial/by-id/placeholder-passthrough
 ```
 
 `prpl-template` 預設改成匹配 `root@prplOS:/#` 這種 prompt prefix，而不是要求 prompt 必須單獨佔一整行。這樣在 prompt 後面立刻接 driver / kernel log 的情況下，line mode 仍能正確收尾；`ready_probe` 也維持最小 `echo __READY__${nonce}`，避免在沒有 `whoami` 的 target 上增加噪音。
 
-`op3-template` 沿用 generic shell login 模型，適合 Orange Pi / Debian shell。`user_env` / `pass_env` 是每個 profile 自己指定的登入帳密環境變數名稱。CLI / daemon 不會把密碼寫進 YAML 或 WAL。`serialwrap daemon start` 會在啟動前先嘗試載入 `~/OPI.env`；若檔案不存在，則維持既有行為。
+`op3-template` 沿用 generic shell login 模型，適合 Orange Pi / Debian shell。`user_env` / `pass_env` 是每個 profile 自己指定的登入帳密環境變數名稱。CLI / daemon 不會把密碼寫進 YAML 或 WAL。`env_file` 指向同目錄 env 檔，帳密在每次 session attach 時**per-session 解析**，不會污染 daemon 全域環境。不同 COM 可以用不同的 `env_file`，達到 per-session 帳密隔離。
+
+`brcm-template` 用於 Broadcom 原生平台（如 BCM968575）。登入後 target 進入 BCM CLI shell（提示符 `>`），需要再執行 `sh` 才會進到 Linux shell（`#`）。`post_login_cmd: "sh"` 讓 daemon 在成功登入後自動送出此命令，完成兩階段切換。`timeout_s: 15` 因為 Broadcom 登入流程較慢而加長。
+
+建議把 env 檔直接放在 profile 旁邊，例如：
 
 ```bash
-cat > ~/OPI.env <<'EOF'
+cat > "$HOME/.paul_tools/profiles/OPI.env" <<'EOF'
 SW_OPI_U='haman'
 SW_OPI_P='your-password'
 EOF
@@ -225,11 +386,13 @@ EOF
 serialwrap daemon start --profile-dir "$HOME/.paul_tools/profiles"
 ```
 
-若你偏好手動設定環境變數，也可以沿用原本的 `export SW_OPI_U=...` / `export SW_OPI_P=...` 方式再啟動 daemon。
+`profiles/default.yaml` 的 `op3-template` 已內建 `env_file: "OPI.env"`，相對路徑會以該 YAML 所在目錄解析。daemon 啟動時，runtime env 會先保留目前 shell 的環境，再依序嘗試載入 `~/OPI.env` 與 `profile_dir/OPI.env`；因此像 `SERIALWRAP_WAL_DIR="$HOME/b-log"` 這類 runtime 設定，放在 `~/.paul_tools/profiles/OPI.env` 也會生效。若 profile 沒有宣告 `env_file`，`login_fsm` 仍會從 daemon 的 `os.environ` 讀取帳密（向後相容）。若要完全指定來源，也可以用 `SERIALWRAP_DAEMON_ENV_FILE` 指向包含 runtime 設定的 env 檔。
 
 若 shell device 已經自動登入，`serialwrap` 會直接用 prompt + `ready_probe` 驗證；若先看到 `login:` / `password:`，則會依 `user_env` / `pass_env` 自動登入。像 Orange Pi 常見的 `orangepi3 login:`，建議 `login_regex` 用 `(?mi)^.*login:\\s*$`。
 
 `others-template` 使用 `platform=passthrough`。attach 時不做 prompt/login/ready 限制，只建立 broker bridge，讓 `ttyUSB` 與 broker 建出的 `ttyPTS` 直接透傳；這類 session 會停在 `ATTACHED`，適合不認識的設備先用 minicom/human console 觀察。
+
+`device_by_id` 支援 `/dev/serial/by-id/` 與 `/dev/serial/by-path/` 兩種穩定識別方式。若多張板使用同款 USB-Serial 晶片（如 CH340），`by-id` 無法區分，建議改用 `by-path`（基於物理 USB port 路徑，不隨列舉順序變）。
 
 常用查看：
 
@@ -285,8 +448,9 @@ serialwrap session interactive-close --interactive-id <interactive_id>
 1. 視需要自動啟動 daemon
 2. 視需要對 selector 執行 `session attach`
 3. 透過 `session console-attach` 取得專屬 PTY
-4. 啟動 `minicom`
-5. 結束後自動 `session console-detach`
+4. 預設用 minicom 內建 `-C` 記錄一份 `mini_<COM>_<timestamp>.log` transcript（預設在 `~/b-log`，可用 `BLOG_DIR` 覆寫）
+5. 啟動 `minicom`
+6. 結束後自動 `session console-detach`
 
 ```bash
 # 自動選第一個 READY，否則退而求其次選 ATTACHED session
@@ -303,11 +467,12 @@ minicom -D /dev/ttyUSB0
 重要限制：
 
 - minicom 看到的是透明 RX 視圖。
-- 一般 human 輸入會以「逐行」方式進入 broker queue，與 agent 共用單寫入仲裁；broker 會替 minicom 做本地回顯與基本 backspace 行編輯。
-- 若 session 只有 `ATTACHED`（bridge 已掛上但尚未 ready），`session console-attach` 仍可進入 brokered minicom；這時 console 會自動拿到 raw human ownership，方便手動登入或觀察 boot/log 狀態。
-- 若要讓某個 console 進入 raw interactive ownership，先 `console-attach` 拿到 `client_id`，再用 `interactive-open --owner human:<client_id>` 開 lease。
+- **`console-attach` 在 `ATTACHED` 或 `READY` 狀態下，會自動授予第一個 human console raw interactive ownership**，不需手動 `interactive-open`。所有按鍵（包含方向鍵、Tab、ESC 序列）即時透傳到 UART，操作體感與直接 minicom 一致。
+- 若 agent 在 human interactive 期間提交命令，daemon 會暫時掛起（suspend）human raw mode → 執行 agent 命令 → 完成後自動恢復（resume）。Human 在 agent 執行期間的按鍵會累積在 deferred buffer，agent 完成後 flush 到 UART。
+- 第二個以後的 minicom console 因為 interactive lease 已存在，仍走 line-buffer 模式（broker 提供本地回顯與 backspace 行編輯）。
+- 若要保留舊版「完整 terminal transcript」行為，可顯式設定 `MINICOM_CAPTURE_WRAPPER=1`，此時 wrapper 會改用 `script -qef` 包一層 PTY；但這可能增加 human 體感延遲。
 - 常見 human/minicom 互動式命令（例如 `vi`、`vim`、`top`、`htop`、`less`、`menuconfig`）會自動升級成 human interactive ownership，不再因為等不到 shell prompt 而自動觸發 recover / reboot。
-- human interactive ownership 存在時，agent 的 `line` / `background` 命令會在 worker 內等待 ownership 釋放；若超過該命令自己的 timeout，才會回 `SESSION_INTERACTIVE_BUSY`。
+- 若直接打 `minicom` 沒有走 broker，先用 `type -a minicom` 檢查目前 shell 是否先命中 `~/.paul_tools/minicom`；若仍是 `/usr/bin/minicom`，代表 shell PATH 尚未把 wrapper 放到前面。
 
 手動 console 控制範例：
 
@@ -340,6 +505,7 @@ serialwrap session self-test --selector COM0
 - `ATTACHED_NOT_READY`：bridge 已掛，但 prompt probe 失敗（如 boot log 中、前景程式仍在跑）
 - `REBOOTING`：agent 已送出 reboot 類指令，正在等待 target 重開機完畢後自動 relogin
 - `HUMAN_INTERACTIVE_ACTIVE`：human console 目前握有 interactive ownership，不適合 agent 干預
+- `PASSTHROUGH`：platform 設為 passthrough，session 已 ATTACHED，適合透明 bridge 模式
 
 ### Recover
 
@@ -360,9 +526,49 @@ recover 升級順序固定：
 
 | 檔案 | 說明 |
 |------|------|
-| `/tmp/serialwrap/wal/raw.wal.ndjson` | 權威事件記錄，保留 `seq/cmd_id/source/crc32/...` |
-| `/tmp/serialwrap/wal/raw.mirror.log` | 可讀文字鏡像，接近 console payload |
-| `/tmp/serialwrap/state.json` | alias 與 binding 持久化 |
+| 預設 `/tmp/serialwrap/wal/raw.wal.ndjson` | 權威事件記錄，保留 `seq/cmd_id/source/crc32/...` |
+| 預設 `/tmp/serialwrap/wal/raw.mirror.log` | 可讀文字鏡像，接近 console payload |
+| 預設 `/tmp/serialwrap/state.json` | alias 與 binding 持久化 |
+| Agent log `~/b-log/{COM}_{YYMMDD}-{HHMMSS}.log` | Agent 觸發式 per-session 日誌，純文字 RX 內容 |
+
+### Agent 日誌 (log start/stop)
+
+Agent 可對特定 COM port 啟停日誌：
+
+```bash
+serialwrap session log-start --selector COM0
+# → {"ok":true,"capture_id":"...","log_path":"~/b-log/COM0_250117-143021.log",...}
+
+serialwrap session log-stop --selector COM0
+# → {"ok":true,"log_path":"...","line_count":42,"byte_count":1024,...}
+
+serialwrap session log-status --selector COM0
+# → {"ok":true,"active":true,"capture_id":"...",...}
+```
+
+特性：
+
+- WAL（always-on）不受影響，agent log 是額外的 focused capture
+- 每個 session 同一時間最多一個 active capture
+- session detach 時自動停止 capture
+- 預設路徑 `~/b-log`，可透過 YAML `defaults.log_dir`、profile `log_dir` 或 target `log_dir` 覆寫
+
+### log_dir 組態
+
+優先序：per-target `log_dir` > per-profile `log_dir` > YAML `defaults.log_dir` > `SERIALWRAP_LOG_DIR` env > `~/b-log`
+
+```yaml
+defaults:
+  log_dir: "~/b-log"         # 全域預設
+profiles:
+  op3-template:
+    log_dir: "/var/log/opi"   # per-profile 覆寫
+targets:
+  - com: COM1
+    log_dir: "/tmp/com1-log"  # per-target 最高優先
+```
+
+### WAL 查詢
 
 CLI 查詢：
 
@@ -376,6 +582,7 @@ serialwrap wal export --from-seq 0 --limit 500
 
 - `log tail-text` 偏向人類閱讀，不輸出 metadata header。
 - `log tail-raw` / `wal export` 仍保留完整權威欄位。
+- 可用 `SERIALWRAP_WAL_DIR` 覆寫 WAL / mirror log 目錄，例如放到 `~/b-log`；這不會改動 daemon socket / lock 的 `RUN_DIR`。
 - `stream tail` 與 MCP `serialwrap_tail_results` 為 legacy alias；新設計優先使用 `cmd result-tail` / `serialwrap_tail_command_result`。
 
 ## MCP 使用
@@ -402,6 +609,10 @@ serialwrap wal export --from-seq 0 --limit 500
 | `serialwrap_send_interactive_keys` | `session.interactive_send` |
 | `serialwrap_get_interactive_status` | `session.interactive_status` |
 | `serialwrap_close_interactive` | `session.interactive_close` |
+| `serialwrap_log_start` | `session.log_start` |
+| `serialwrap_log_stop` | `session.log_stop` |
+| `serialwrap_log_status` | `session.log_status` |
+| `serialwrap_clear_session` | `session.clear` |
 
 ### Legacy alias
 

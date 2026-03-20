@@ -12,8 +12,9 @@ import uuid
 from typing import Any, Callable
 
 from .alias_registry import AliasRegistry
+from .auth import resolve_session_auth
 from .config import SessionProfile
-from .constants import STATE_PATH
+from .constants import LOG_DIR, STATE_PATH
 from .device_watcher import DeviceInfo
 from .login_fsm import ensure_ready, probe_ready
 from .uart_io import UARTBridge
@@ -77,6 +78,17 @@ class InteractiveLease:
 
 
 @dataclasses.dataclass
+class SessionCapture:
+    capture_id: str
+    session_id: str
+    log_path: str
+    started_at: str
+    line_count: int = 0
+    byte_count: int = 0
+    status: str = "active"
+
+
+@dataclasses.dataclass
 class SessionRuntime:
     session_id: str
     profile: SessionProfile
@@ -94,6 +106,7 @@ class SessionRuntime:
     interactive_session_id: str | None = None
     foreground_busy: bool = False
     background_cmd_ids: list[str] = dataclasses.field(default_factory=list)
+    active_capture: SessionCapture | None = None
 
     def to_public_dict(self) -> dict[str, Any]:
         console_count = 0
@@ -117,6 +130,13 @@ class SessionRuntime:
             "recovering": self.recovering,
             "interactive_session_id": self.interactive_session_id,
             "console_count": console_count,
+            "capture": {
+                "capture_id": self.active_capture.capture_id,
+                "log_path": self.active_capture.log_path,
+                "status": self.active_capture.status,
+                "line_count": self.active_capture.line_count,
+                "byte_count": self.active_capture.byte_count,
+            } if self.active_capture else None,
         }
 
 
@@ -142,6 +162,7 @@ class SessionManager:
         self._attach_inflight: set[str] = set()
         self._background: dict[str, BackgroundCapture] = {}
         self._interactive: dict[str, InteractiveLease] = {}
+        self._capture_fps: dict[str, Any] = {}  # capture_id → open file object
 
         self._load_state()
         for p in profiles:
@@ -239,6 +260,7 @@ class SessionManager:
                 lease.status = "closed"
         session.interactive_session_id = None
         session.foreground_busy = False
+        self._stop_capture_locked(session)
         for cmd_id in list(session.background_cmd_ids):
             capture = self._background.get(cmd_id)
             if capture is not None:
@@ -325,7 +347,14 @@ class SessionManager:
                 session.state = "ATTACHING"
                 session.last_error = None
         if should_probe and bridge is not None:
-            ok, err = probe_ready(bridge, session.profile)
+            if session.profile.login_regex:
+                auth = resolve_session_auth(session.profile)
+                if auth.username and auth.password:
+                    ok, err = ensure_ready(bridge, session.profile, auth=auth)
+                else:
+                    ok, err = probe_ready(bridge, session.profile)
+            else:
+                ok, err = probe_ready(bridge, session.profile)
             notify_ready = False
             with self._lock:
                 current = self._sessions.get(session.session_id)
@@ -409,6 +438,18 @@ class SessionManager:
             session = self._sessions.get(session_id)
             if session is None or session.foreground_busy:
                 return
+            # agent log capture
+            cap = session.active_capture
+            if cap is not None and cap.status == "active":
+                fp = self._capture_fps.get(cap.capture_id)
+                if fp is not None:
+                    try:
+                        fp.write(chunk)
+                        fp.flush()
+                        cap.byte_count += len(chunk.encode("utf-8"))
+                        cap.line_count += chunk.count("\n")
+                    except Exception:
+                        pass
             for cmd_id in list(session.background_cmd_ids):
                 capture = self._background.get(cmd_id)
                 if capture is None or capture.status != "active":
@@ -433,8 +474,6 @@ class SessionManager:
 
     def _attach_by_id(self, by_id: str) -> None:
         save_needed = False
-        require_login = False
-        passthrough_only = False
         with self._lock:
             session = next((s for s in self._sessions.values() if s.profile.device_by_id == by_id), None)
             if session is None:
@@ -447,26 +486,32 @@ class SessionManager:
                     session.profile = dataclasses.replace(session.profile, device_by_id=by_id)
                     self._binding_overrides[session.session_id] = by_id
                     save_needed = True
-            dev = self._devices.get(by_id)
-            if session is not None:
-                require_login = session.pending_auto_login
-                passthrough_only = session.profile.platform == "passthrough"
         if save_needed:
             self._save_state()
-        if session is None or dev is None or session.bridge is not None:
-            return
+        with self._lock:
+            if session is None:
+                return
+            dev = self._devices.get(by_id)
+            if dev is None or session.bridge is not None or session.profile.device_by_id != by_id:
+                return
+            session.state = "ATTACHING"
+            session.last_error = None
+            gen_before = session.bridge_generation
+            session_id = session.session_id
+            profile = session.profile
+            require_login = session.pending_auto_login or bool(profile.login_regex)
+            passthrough_only = profile.platform == "passthrough"
+            real_path = dev.real_path
 
         bridge = UARTBridge(
-            session.profile.com,
-            dev.real_path,
-            session.profile.uart,
+            profile.com,
+            real_path,
+            profile.uart,
             self._wal,
-            on_console_line=lambda client_id, line, sid=session.session_id: self._on_bridge_console_line(sid, client_id, line),
-            on_rx_data=lambda data, sid=session.session_id: self._on_bridge_rx(sid, data),
-            on_bridge_down=lambda reason, sid=session.session_id: self._handle_bridge_down(sid, bridge, reason),
+            on_console_line=lambda client_id, line, sid=session_id: self._on_bridge_console_line(sid, client_id, line),
+            on_rx_data=lambda data, sid=session_id: self._on_bridge_rx(sid, data),
+            on_bridge_down=lambda reason, sid=session_id: self._handle_bridge_down(sid, bridge, reason),
         )
-        session.state = "ATTACHING"
-        session.last_error = None
 
         try:
             bridge.start()
@@ -474,25 +519,30 @@ class SessionManager:
                 ok = False
                 err = None
             elif require_login:
-                ok, err = ensure_ready(bridge, session.profile)
-                if not ok:
-                    bridge.stop()
-                    with self._lock:
-                        session.state = "DETACHED"
-                        session.last_error = err
-                        session.detached_at = now_iso()
-                        session.bridge = None
-                        session.vtty_path = None
-                        session.attached_real_path = None
-                    self._on_detached(session.session_id)
-                    return
+                auth = resolve_session_auth(profile)
+                if auth.username and auth.password:
+                    ok, err = ensure_ready(bridge, profile, auth=auth)
+                    if not ok:
+                        bridge.stop()
+                        with self._lock:
+                            session.state = "DETACHED"
+                            session.last_error = err
+                            session.detached_at = now_iso()
+                            session.bridge = None
+                            session.vtty_path = None
+                            session.attached_real_path = None
+                        self._on_detached(session.session_id)
+                        return
+                else:
+                    # 無帳密時退回 probe，讓 human 手動登入
+                    ok, err = probe_ready(bridge, profile)
             else:
-                ok, err = probe_ready(bridge, session.profile)
+                ok, err = probe_ready(bridge, profile)
 
             notify_ready = False
             with self._lock:
                 current = self._devices.get(by_id)
-                if current is None or current.real_path != dev.real_path or session.state == "DETACHED":
+                if current is None or current.real_path != real_path or session.state == "DETACHED" or session.bridge_generation != gen_before:
                     bridge.stop()
                     session.state = "DETACHED"
                     session.last_error = "DEVICE_REMOVED_DURING_ATTACH"
@@ -503,7 +553,7 @@ class SessionManager:
                     return
                 session.bridge = bridge
                 session.vtty_path = bridge.vtty_path
-                session.attached_real_path = dev.real_path
+                session.attached_real_path = real_path
                 session.bridge_generation += 1
                 if ok:
                     session.state = "READY"
@@ -661,7 +711,8 @@ class SessionManager:
                     bridge = session.bridge
                     by_id = session.profile.device_by_id
                 if bridge is not None:
-                    ok, err = ensure_ready(bridge, session.profile)
+                    auth = resolve_session_auth(session.profile)
+                    ok, err = ensure_ready(bridge, session.profile, auth=auth)
                     if ok:
                         with self._lock:
                             session = self._sessions.get(session_id)
@@ -776,7 +827,7 @@ class SessionManager:
         mode: str = "line",
     ) -> dict[str, Any]:
         normalized_mode = {"fg": "line", "bg": "background"}.get(mode, mode)
-        wait_for_human_interactive = False
+        suspend_human_interactive = False
         with self._lock:
             session = self._sessions.get(session_id)
             if session is None or session.bridge is None or session.state != "READY":
@@ -786,33 +837,37 @@ class SessionManager:
             lease = self._refresh_interactive_locked(session)
             if lease is not None and normalized_mode != "interactive":
                 if not source.startswith("human:") and lease.owner.startswith("human:"):
-                    wait_for_human_interactive = True
+                    suspend_human_interactive = True
                 else:
                     return {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY", "interactive_session_id": session.interactive_session_id}
             bridge = session.bridge
             prompt_regex = session.profile.prompt_regex
 
-        if wait_for_human_interactive:
-            wait_ok, wait_error = self._wait_for_human_interactive_release(session_id, timeout_s=timeout_s)
-            if not wait_ok:
-                with self._lock:
-                    current = self._sessions.get(session_id)
-                    result = {"ok": False, "error_code": wait_error or "SESSION_INTERACTIVE_BUSY"}
-                    if current is not None and current.interactive_session_id is not None:
-                        result["interactive_session_id"] = current.interactive_session_id
-                    return result
-            with self._lock:
-                session = self._sessions.get(session_id)
-                if session is None or session.bridge is None or session.state != "READY":
-                    return {"ok": False, "error_code": "SESSION_NOT_READY"}
-                if session.recovering:
-                    return {"ok": False, "error_code": "SESSION_RECOVERING"}
-                lease = self._refresh_interactive_locked(session)
-                if lease is not None:
-                    return {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY", "interactive_session_id": session.interactive_session_id}
-                bridge = session.bridge
-                prompt_regex = session.profile.prompt_regex
+        if suspend_human_interactive:
+            bridge.suspend_interactive()
 
+        try:
+            return self._execute_command_inner(
+                session, bridge, command, source, cmd_id,
+                timeout_s=timeout_s, normalized_mode=normalized_mode,
+                prompt_regex=prompt_regex,
+            )
+        finally:
+            if suspend_human_interactive:
+                bridge.resume_interactive()
+
+    def _execute_command_inner(
+        self,
+        session: SessionRuntime,
+        bridge: UARTBridge,
+        command: str,
+        source: str,
+        cmd_id: str,
+        *,
+        timeout_s: float,
+        normalized_mode: str,
+        prompt_regex: str,
+    ) -> dict[str, Any]:
         if normalized_mode == "interactive":
             with self._lock:
                 for bg_cmd_id in list(session.background_cmd_ids):
@@ -830,9 +885,9 @@ class SessionManager:
                 "status": "interactive",
             }
 
-        session.foreground_busy = True
-        if normalized_mode != "background":
-            with self._lock:
+        with self._lock:
+            session.foreground_busy = True
+            if normalized_mode != "background":
                 for bg_cmd_id in list(session.background_cmd_ids):
                     capture = self._background.get(bg_cmd_id)
                     if capture is not None:
@@ -849,7 +904,8 @@ class SessionManager:
                     execution_mode=normalized_mode,
                 )
             finally:
-                session.foreground_busy = False
+                with self._lock:
+                    session.foreground_busy = False
         pre_offset = bridge.rx_snapshot_len()
         try:
             bridge.send_command(command, source=source, cmd_id=cmd_id)
@@ -878,7 +934,8 @@ class SessionManager:
                 result["background_capture_id"] = cmd_id
             return result
         finally:
-            session.foreground_busy = False
+            with self._lock:
+                session.foreground_busy = False
 
     def _recover_after_failure(
         self,
@@ -944,7 +1001,7 @@ class SessionManager:
             payload = session.bridge.attach_console(label=label)
             if session.vtty_path is None:
                 session.vtty_path = payload["vtty"]
-            if session.state == "ATTACHED" and self._refresh_interactive_locked(session) is None:
+            if session.state in {"ATTACHED", "READY"} and self._refresh_interactive_locked(session) is None:
                 lease = self._open_interactive_locked(
                     session,
                     owner=f"human:{payload['client_id']}",
@@ -1216,4 +1273,101 @@ class SessionManager:
                 "from_chunk": from_chunk,
                 "next_chunk": next_chunk,
                 "chunks": chunks,
+            }
+
+    # ------------------------------------------------------------------
+    # Agent log capture: start / stop / status
+    # ------------------------------------------------------------------
+
+    def _resolve_log_dir(self, session: SessionRuntime) -> str:
+        return session.profile.log_dir or LOG_DIR
+
+    def _stop_capture_locked(self, session: SessionRuntime) -> None:
+        cap = session.active_capture
+        if cap is None:
+            return
+        cap.status = "stopped"
+        fp = self._capture_fps.pop(cap.capture_id, None)
+        if fp is not None:
+            try:
+                fp.close()
+            except Exception:
+                pass
+        session.active_capture = None
+
+    def log_start(self, selector: str) -> dict[str, Any]:
+        with self._lock:
+            session = self.get_session(selector)
+            if session is None:
+                return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            if session.active_capture is not None and session.active_capture.status == "active":
+                cap = session.active_capture
+                return {
+                    "ok": True,
+                    "already_active": True,
+                    "capture_id": cap.capture_id,
+                    "log_path": cap.log_path,
+                    "session": session.to_public_dict(),
+                }
+            log_dir = self._resolve_log_dir(session)
+            os.makedirs(log_dir, exist_ok=True)
+            ts = time.strftime("%y%m%d-%H%M%S")
+            filename = f"{session.profile.com}_{ts}.log"
+            log_path = os.path.join(log_dir, filename)
+            capture_id = str(uuid.uuid4())
+            try:
+                fp = open(log_path, "a", encoding="utf-8")
+            except OSError as exc:
+                return {"ok": False, "error_code": "LOG_OPEN_FAILED", "detail": str(exc)}
+            cap = SessionCapture(
+                capture_id=capture_id,
+                session_id=session.session_id,
+                log_path=log_path,
+                started_at=now_iso(),
+            )
+            session.active_capture = cap
+            self._capture_fps[capture_id] = fp
+            return {
+                "ok": True,
+                "capture_id": capture_id,
+                "log_path": log_path,
+                "session": session.to_public_dict(),
+            }
+
+    def log_stop(self, selector: str) -> dict[str, Any]:
+        with self._lock:
+            session = self.get_session(selector)
+            if session is None:
+                return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            cap = session.active_capture
+            if cap is None:
+                return {"ok": False, "error_code": "NO_ACTIVE_CAPTURE", "session": session.to_public_dict()}
+            result = {
+                "ok": True,
+                "capture_id": cap.capture_id,
+                "log_path": cap.log_path,
+                "line_count": cap.line_count,
+                "byte_count": cap.byte_count,
+                "started_at": cap.started_at,
+            }
+            self._stop_capture_locked(session)
+            return result
+
+    def log_status(self, selector: str) -> dict[str, Any]:
+        with self._lock:
+            session = self.get_session(selector)
+            if session is None:
+                return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            cap = session.active_capture
+            if cap is None:
+                return {"ok": True, "active": False, "session": session.to_public_dict()}
+            return {
+                "ok": True,
+                "active": cap.status == "active",
+                "capture_id": cap.capture_id,
+                "log_path": cap.log_path,
+                "line_count": cap.line_count,
+                "byte_count": cap.byte_count,
+                "started_at": cap.started_at,
+                "session": session.to_public_dict(),
             }

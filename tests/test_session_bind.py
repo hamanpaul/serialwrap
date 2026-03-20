@@ -353,7 +353,8 @@ class TestSessionBind(unittest.TestCase):
         bridge.detach_console.assert_called_once_with("cid-stale")
         bridge.set_interactive_owner.assert_called_with(None)
 
-    def test_agent_command_waits_for_human_interactive_release(self) -> None:
+    def test_agent_command_suspends_human_interactive_and_executes(self) -> None:
+        """Agent 命令到達時暫時掛起 human interactive，執行後恢復。"""
         import unittest.mock as mock
 
         profiles = [self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")]
@@ -363,9 +364,8 @@ class TestSessionBind(unittest.TestCase):
         assert session is not None
 
         bridge = mock.MagicMock()
-        bridge.console_has_external_peer.side_effect = [True, False]
+        bridge.console_has_external_peer.return_value = True
         bridge.snapshot.return_value = {"interactive_owner": "human:cid-wait"}
-        bridge.detach_console.return_value = True
         bridge.vtty_path = "/dev/pts/9"
         bridge.rx_snapshot_len.return_value = 10
         bridge.wait_for_regex_from.return_value = True
@@ -389,9 +389,12 @@ class TestSessionBind(unittest.TestCase):
         self.assertTrue(resp["ok"])
         self.assertEqual(resp["stdout"], "RESULT:ifconfig:OK")
         bridge.send_command.assert_called_once_with("ifconfig", source="agent:test", cmd_id="cmd-wait")
-        self.assertIsNone(session.interactive_session_id)
+        bridge.suspend_interactive.assert_called_once()
+        bridge.resume_interactive.assert_called_once()
+        self.assertEqual(session.interactive_session_id, "lease-wait")
 
-    def test_agent_command_times_out_when_human_interactive_persists(self) -> None:
+    def test_agent_command_resumes_interactive_even_on_failure(self) -> None:
+        """即使命令執行失敗，human interactive ownership 仍會恢復。"""
         import unittest.mock as mock
 
         profiles = [self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")]
@@ -403,6 +406,10 @@ class TestSessionBind(unittest.TestCase):
         bridge = mock.MagicMock()
         bridge.console_has_external_peer.return_value = True
         bridge.snapshot.return_value = {"interactive_owner": "human:cid-busy"}
+        bridge.vtty_path = "/dev/pts/9"
+        bridge.rx_snapshot_len.return_value = 10
+        bridge.wait_for_regex_from.return_value = False
+        bridge.rx_text_from.return_value = ""
         session.bridge = bridge
         session.state = "READY"
 
@@ -419,10 +426,8 @@ class TestSessionBind(unittest.TestCase):
 
         resp = mgr.execute_command("p:COM0", "ifconfig", "agent:test", "cmd-busy", timeout_s=0.1)
 
-        self.assertFalse(resp["ok"])
-        self.assertEqual(resp["error_code"], "SESSION_INTERACTIVE_BUSY")
-        self.assertEqual(resp["interactive_session_id"], "lease-busy")
-        bridge.send_command.assert_not_called()
+        bridge.suspend_interactive.assert_called_once()
+        bridge.resume_interactive.assert_called_once()
 
     def test_auto_bind_on_device_attach(self) -> None:
         """裝置 by-id 不符合 profile 佔位符時，_attach_by_id 應自動綁定並更新 device_by_id。"""

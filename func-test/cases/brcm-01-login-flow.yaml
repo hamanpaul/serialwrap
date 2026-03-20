@@ -1,0 +1,76 @@
+# brcm-01-login-flow.yaml
+# Broadcom 雙階段登入：admin/admin → Broadcom shell (>) → sh → Linux shell (#)
+
+meta:
+  name: brcm-01-login-flow
+  category: state-machine
+  severity: high
+  description: >
+    驗證 Broadcom 平台的雙階段登入流程：
+    1. 帳號密碼 admin/admin 登入 Broadcom CLI (> prompt)
+    2. post_login_cmd "sh" 進入 Linux shell (# prompt)
+    3. ready_probe 驗證 nonce
+    4. session 狀態到達 READY 後可執行命令
+  tags: [brcm, login, post_login_cmd]
+
+target:
+  platform: bcm
+  boot_banner: "\r\nBroadcom platform boot...\r\nLogin: "
+  login_steps:
+    - expect: "admin"
+      respond: "\r\nPassword: "
+    - expect: "admin"
+      respond: "\r\n\r\nCM> "
+  noise:
+    enabled: false
+  commands:
+    overrides:
+      "sh":
+        response: "\r\n\r\n/ # "
+    default: "{cmd}\r\nRESULT:{cmd}:OK\r\n/ # "
+
+profile:
+  prompt_regex: '(?m)[>#]\s*$'
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 10
+  login_regex: '(?mi)login:\s*$'
+  password_regex: '(?mi)password:\s*$'
+  post_login_cmd: 'sh'
+  user_env: 'BRCM_USER'
+  pass_env: 'BRCM_PASS'
+  env_file: 'brcm.env'
+
+env_files:
+  brcm.env: |
+    BRCM_USER=admin
+    BRCM_PASS=admin
+
+steps:
+  # 等待 session READY（登入 + post_login_cmd + ready_probe 全部完成）
+  - action: wait_ready
+    timeout_s: 30
+    description: "等待雙階段登入流程完成，session 到達 READY"
+
+  # 確認 session 狀態
+  - action: assert_state
+    selector: COM0
+    expect:
+      state: READY
+
+  # 登入完成後送一個命令，確認可正常執行
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--cmd", "uname -a", "--source", "agent:brcm-test"]
+    save_as: cmd_submit
+    expect:
+      ok: true
+
+  - action: wait_command_done
+    cmd_id: "{cmd_submit.cmd_id}"
+    timeout_s: 10
+
+  - action: cli
+    argv: ["cmd", "status", "--cmd-id", "{cmd_submit.cmd_id}"]
+    save_as: cmd_result
+    expect:
+      ok: true
+      command.status: "done"

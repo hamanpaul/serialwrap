@@ -1,0 +1,57 @@
+---
+meta:
+  name: ha-01-human-then-agent
+  category: human-agent
+  severity: high
+  description: "Human attach console 觀察 → 執行 line 命令 → detach → agent 命令成功"
+  tags: ["human", "agent", "console"]
+
+target:
+  platform: prpl
+  boot_banner: "boot done\r\nroot@prplOS:/# "
+  noise:
+    enabled: false
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+
+profile:
+  prompt_regex: '(?m)^root@prplOS:.*# '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+
+steps:
+  - action: wait_ready
+    timeout_s: 20
+
+  # Human attach console
+  - action: attach_console
+    selector: COM0
+    label: human-test
+    save_as: console1
+
+  # Human 透過 console 觀察（讀取 boot 輸出）
+  - action: console_read
+    console_id: "{console1.client_id}"
+    timeout_s: 2
+
+  # Human detach
+  - action: detach_console
+    console_id: "{console1.client_id}"
+    selector: COM0
+
+  # Agent 命令應正常執行
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--cmd", "echo after-human", "--source", "agent:1"]
+    expect:
+      ok: true
+      has_keys: ["cmd_id"]
+    save_as: agent_cmd
+
+  - action: wait_command_done
+    cmd_id: "{agent_cmd.cmd_id}"
+    timeout_s: 10
+
+  - action: assert_state
+    selector: COM0
+    expect:
+      state: "READY"

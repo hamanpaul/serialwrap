@@ -8,7 +8,7 @@ from typing import Any
 
 from .arbiter import CommandArbiter
 from .config import SessionProfile
-from .constants import DEVICE_BY_ID_DIR
+from .constants import DEVICE_BY_ID_DIR, DEVICE_BY_PATH_DIR
 from .device_watcher import DeviceWatcher
 from .session_manager import SessionManager
 from .util import now_iso
@@ -95,7 +95,7 @@ def _human_console_mode(command: str) -> str:
 
 
 class SerialwrapService:
-    def __init__(self, profiles: list[SessionProfile], *, by_id_dir: str = DEVICE_BY_ID_DIR) -> None:
+    def __init__(self, profiles: list[SessionProfile], *, by_id_dir: str = DEVICE_BY_ID_DIR, by_path_dir: str = DEVICE_BY_PATH_DIR) -> None:
         self._wal = WalWriter()
         self._lock = threading.RLock()
         self._running = False
@@ -110,7 +110,10 @@ class SerialwrapService:
             on_detached=self._on_detached,
             on_console_line=self._on_console_line,
         )
-        self._watcher = DeviceWatcher(by_id_dir, self._on_device_change)
+        self._watcher = DeviceWatcher(
+            by_id_dir, self._on_device_change,
+            extra_scan_dirs=[by_path_dir],
+        )
 
     def _on_ready(self, session_id: str) -> None:
         self._arbiter.register_session(session_id)
@@ -396,5 +399,23 @@ class SerialwrapService:
             if to_seq > 0:
                 rows = [r for r in rows if int(r.get("seq", 0)) <= to_seq]
             return {"ok": True, "records": rows}
+
+        if method == "session.log_start":
+            selector = str(params.get("selector") or params.get("session_id") or params.get("com") or params.get("alias") or "")
+            if not selector:
+                return {"ok": False, "error_code": "INVALID_ARGS"}
+            return self._sessions.log_start(selector)
+
+        if method == "session.log_stop":
+            selector = str(params.get("selector") or params.get("session_id") or params.get("com") or params.get("alias") or "")
+            if not selector:
+                return {"ok": False, "error_code": "INVALID_ARGS"}
+            return self._sessions.log_stop(selector)
+
+        if method == "session.log_status":
+            selector = str(params.get("selector") or params.get("session_id") or params.get("com") or params.get("alias") or "")
+            if not selector:
+                return {"ok": False, "error_code": "INVALID_ARGS"}
+            return self._sessions.log_status(selector)
 
         return {"ok": False, "error_code": "METHOD_NOT_FOUND", "method": method}

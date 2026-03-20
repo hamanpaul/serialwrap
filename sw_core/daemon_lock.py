@@ -36,7 +36,6 @@ class SingletonLock:
                     os.close(fd)
                     raise RuntimeError("SOCKET_UNAVAILABLE")
             else:
-                sock.close()
                 os.close(fd)
                 raise RuntimeError("DAEMON_ALREADY_RUNNING")
             finally:

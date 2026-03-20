@@ -87,7 +87,7 @@ flowchart LR
 ### 4.1 啟動步驟
 
 1. `serialwrap daemon start`
-2. CLI 若發現 `~/OPI.env`，先以 shell 載入帳密相關環境變數
+2. CLI 載入 runtime env（`SERIALWRAP_DAEMON_ENV_FILE` 或 legacy `~/OPI.env`）
 3. 建立 runtime dirs / lock / socket
 4. 載入 `profiles/*.yaml`
 5. 建立 `SerialwrapService`
@@ -112,7 +112,7 @@ sequenceDiagram
     participant T as Target
 
     User->>CLI: daemon start
-    CLI->>CLI: source ~/OPI.env (if exists)
+    CLI->>CLI: load runtime env (WAL_DIR etc.)
     CLI->>D: spawn
     D->>W: start
     W->>S: update devices
@@ -140,10 +140,30 @@ sequenceDiagram
 - 每個已掛上 bridge 的 session 都至少有一個 primary console PTY
 - `session.console_attach` 會再建立一個專屬 PTY
 - 所有 console 都收到同一份 RX fan-out
-- 非 interactive owner 的 human input 只會緩衝成 line，經 broker queue 執行
-- line-buffered human input 由 broker 提供本地回顯與基本 backspace 行編輯，避免 minicom 看不到鍵入內容
-- 常見 human/minicom 互動式命令（如 `vim`、`top`、`less`、`menuconfig`）可自動升級為 human interactive ownership，避免被誤判為 prompt timeout 故障
-- human interactive ownership 存在時，agent foreground/background 命令不會立即失敗，而是等待 ownership 釋放；若超過該命令 timeout，才回 `SESSION_INTERACTIVE_BUSY`
+
+#### Raw Interactive（預設行為）
+
+- **`console-attach` 在 `ATTACHED` 或 `READY` 狀態下，會自動授予第一個 human console raw interactive ownership**。minicom 連上即可使用方向鍵、Tab、ESC 序列等特殊按鍵，不需手動 `interactive-open`。
+- Raw interactive 期間，所有 console bytes 透過 `UARTBridge.send_bytes()` 即時透傳到 UART，不做 line buffering 或 local echo。
+- 第二個以後的 console 因為 interactive lease 已存在，仍走 line-buffer 模式。
+
+#### Agent 命令搶佔（Suspend / Resume）
+
+- Agent 提交 foreground 或 background 命令時，若 human 持有 interactive ownership，daemon 會 **暫時掛起（suspend）** human 的 raw mode：
+  1. `bridge.suspend_interactive()` → 保存 owner、切到 deferred mode
+  2. 執行 agent 命令
+  3. `bridge.resume_interactive()` → 恢復 owner、flush deferred buffer 到 UART
+- Human 在 agent 執行期間的按鍵輸入會累積在 deferred buffer（不做 local echo），agent 完成後一次性 flush 到 UART，由 target 自然回顯。
+- Agent 命令**不再需要等待 human 關閉 minicom**；超時回 `SESSION_INTERACTIVE_BUSY` 的情境僅保留給 agent-vs-agent interactive lease 衝突。
+
+#### Line-Buffer 模式
+
+- 非 interactive owner 的 human console（第二個以後的 minicom）仍走 line-buffer 路徑。
+- line-buffered human input 由 broker 提供本地回顯與基本 backspace 行編輯。
+- 常見 human/minicom 互動式命令（如 `vim`、`top`、`less`、`menuconfig`）可自動升級為 human interactive ownership，避免被誤判為 prompt timeout 故障。
+
+#### 其他
+
 - 若 session 僅為 `ATTACHED`，`session.console_attach` 仍可使用，且該 console 會自動拿到 raw human ownership，方便手動登入或觀察 boot/log
 - `platform=passthrough` 的 session attach 後不做 prompt/login/ready 探測，直接停在 `ATTACHED`，供未知設備走純 bridge/passthrough 路徑
 
@@ -220,6 +240,8 @@ sequenceDiagram
 6. `session.interactive_close` 釋放 lease
 
 若 `source=human:*` 的 line command 已送出但後續未回 prompt，daemon 會優先把該 console 升級成 human interactive，而不是直接觸發 recover。這條保護僅套用 human/minicom；agent foreground command 仍保留既有 prompt timeout / recover 路徑。
+
+> **注意**：在 raw interactive 預設行為下，human console 的按鍵不會走 `_on_console_line()` 路徑，因此上述 line command 升級機制僅在 **非 interactive owner** 的 console 或 suspend 期間的 line-buffer 路徑中生效。
 
 ### 6.4 recover
 
@@ -366,6 +388,18 @@ flowchart TD
 - 接近透明 console 視角
 - 不附帶每行 metadata prefix
 
+預設目錄是 `/tmp/serialwrap/wal/`。若只想改 WAL / mirror log 的位置，可設定 `SERIALWRAP_WAL_DIR`（例如 `~/b-log`）；這不會改動 daemon socket / lock 的 runtime 目錄。
+
+### 10.4 Agent per-session capture
+
+Agent 可透過 `session.log_start` / `session.log_stop` 對特定 session 啟停純文字 RX capture：
+
+- 日誌寫入 `{log_dir}/{COM}_{YYMMDD}-{HHMMSS}.log`
+- `log_dir` 優先序：per-target `log_dir` > per-profile `log_dir` > YAML `defaults.log_dir` > `SERIALWRAP_LOG_DIR` env > `~/b-log`
+- 同一 session 同時最多一個 active capture
+- session detach 時自動停止 capture
+- WAL 是 always-on 審計記錄，agent log 是 on-demand focused capture，兩者互補
+
 ### 10.3 Command result
 
 來源：
@@ -384,9 +418,11 @@ flowchart TD
 - `serialwrap session self-test|recover`
 - `serialwrap session console-attach|console-detach|console-list`
 - `serialwrap session interactive-open|interactive-send|interactive-status|interactive-close`
+- `serialwrap session log-start|log-stop|log-status`
 - `serialwrap alias list|set|assign|unassign`
 - `serialwrap cmd submit|status|result-tail|cancel`
 - `serialwrap log tail-raw|tail-text`
+- `serialwrap stream tail` (legacy alias，對應 `result.tail`)
 - `serialwrap wal export`
 
 ### 11.2 RPC
@@ -408,6 +444,9 @@ flowchart TD
 - `session.interactive_send`
 - `session.interactive_status`
 - `session.interactive_close`
+- `session.log_start`
+- `session.log_stop`
+- `session.log_status`
 - `alias.list`
 - `alias.set`
 - `alias.assign`
@@ -440,6 +479,10 @@ flowchart TD
 - `serialwrap_send_interactive_keys` -> `session.interactive_send`
 - `serialwrap_get_interactive_status` -> `session.interactive_status`
 - `serialwrap_close_interactive` -> `session.interactive_close`
+- `serialwrap_log_start` -> `session.log_start`
+- `serialwrap_log_stop` -> `session.log_stop`
+- `serialwrap_log_status` -> `session.log_status`
+- `serialwrap_clear_session` -> `session.clear`
 
 相容 alias：
 
@@ -458,31 +501,72 @@ flowchart TD
 
 `minicom_router.sh` 不再依賴 session 單一 `vtty` 當唯一入口。
 
+預設 transcript 走 minicom 內建 `-C` capturefile；只有在明確設定 `MINICOM_CAPTURE_WRAPPER=1` 時，才改用 `script -qef` 包一層 PTY 來保留完整 terminal transcript。後者可能增加 human 體感延遲。
+
 ## 13. Profile 規格
+
+### 13.1 YAML 結構
+
+Profile YAML 由三個頂層區段組成：
+
+```yaml
+defaults:
+  log_dir: "~/b-log"       # 全域 agent log 預設目錄
+
+profiles:
+  <template-name>:
+    platform: ...
+    prompt_regex: ...
+    # ... 其餘 template 欄位
+
+targets:
+  - act_no: 1
+    com: COM1
+    alias: <alias>
+    profile: <template-name>
+    device_by_id: /dev/serial/by-path/...  # 或 /dev/serial/by-id/...
+```
+
+`defaults` 區段目前支援 `log_dir`（agent log 寫入目錄），若未設定則 fallback 到 `SERIALWRAP_LOG_DIR` env 或 `~/b-log`。
+
+### 13.2 Template 欄位
 
 關鍵欄位：
 
-- `platform`
+- `platform`：`shell` / `prpl` / `bcm` / `passthrough`
 - `prompt_regex`
 - `login_regex`
 - `password_regex`
 - `username`
 - `user_env`
 - `pass_env`
-- `post_login_cmd`
+- `env_file`
+- `post_login_cmd`：登入後自動送出的命令（用於 `bcm` 平台兩階段切換）
 - `ready_probe`
-- `timeout_s`
-- `quiet_window_s`
-- `hard_timeout_s`
-- `uart.*`
+- `timeout_s`：登入等待超時（預設 10s）
+- `quiet_window_s`：background capture idle finalize 安靜等待時間
+- `hard_timeout_s`：命令硬超時
+- `log_dir`：per-profile agent log 目錄，覆寫 `defaults.log_dir`
+- `uart.*`：序列埠參數（baud、data_bits、parity、stop_bits、flow_control、xonxoff）
 
-`quiet_window_s` 目前用於 background capture idle finalize。
+### 13.3 Platform 行為
 
-`platform=shell` 可使用 `user_env` / `pass_env` 做 generic shell login。`serialwrap daemon start` 會先嘗試載入 `~/OPI.env`，因此可將 `SW_OPI_U` / `SW_OPI_P` 放在該檔。若裝置 login prompt 會帶 hostname（例如 `orangepi3 login:`），建議 `login_regex` 使用 `(?mi)^.*login:\\s*$`。若裝置已自動登入並直接出現 prompt，daemon 會略過 login 流程，直接做 `ready_probe`。
+**`platform=shell`**：generic Linux login。可使用 `user_env` / `pass_env` 做帳密。帳密解析採用 **per-session 隔離**：在每次 session attach 時，`sw_core/auth.py` 的 `resolve_session_auth()` 會從 `env_file` 解析帳密（純 Python 解析，不 fork shell），不同 COM / template 可用不同的 `env_file` 指向不同帳密。查找順序為：`env_file` 內的 key → `os.environ` fallback → `username` 欄位。相對路徑會以該 YAML 所在目錄解析。若 profile 沒有宣告 `env_file`，帳密仍從 daemon 的 `os.environ` 讀取（向後相容）。若裝置 login prompt 會帶 hostname（例如 `orangepi3 login:`），建議 `login_regex` 使用 `(?mi)^.*login:\\s*$`。若裝置已自動登入並直接出現 prompt，daemon 會略過 login 流程，直接做 `ready_probe`。
 
-`platform=passthrough` 則完全不做 `ready_probe` / login 流程。daemon 只負責建立 UART bridge 與 console PTY，session 會停在 `ATTACHED`，由 human console 或後續人工判斷設備型態。
+**`platform=bcm`**：Broadcom 原生平台（如 BCM968575）。登入後 target 進入 BCM CLI shell（`>`），需再執行 `post_login_cmd`（通常是 `sh`）才進到 Linux shell（`#`）。`timeout_s` 建議加大（15s+），因 Broadcom 登入流程較慢。
 
-對 prplOS 這類會把 driver / kernel log 直接接在 prompt 後面的 target，`prompt_regex` 應偏向匹配 prompt prefix，例如 `(?m)^root@prplOS:.*# `，不要只依賴行尾錨點。`ready_probe` 也建議保持最小 `echo __READY__${nonce}`，避免像 `whoami` 這類 target 可能不存在的指令干擾 ready 判定。
+**`platform=prpl`**：prplOS 平台。`prompt_regex` 應匹配 prompt prefix，例如 `(?m)^root@prplOS:.*# `。不依賴行尾錨點，以適應 prompt 後接 driver / kernel log 的情境。`ready_probe` 保持最小 `echo __READY__${nonce}`。
+
+**`platform=passthrough`**：不做 `ready_probe` / login 流程。daemon 只建立 UART bridge 與 console PTY，session 停在 `ATTACHED`，由 human console 或後續人工判斷設備型態。
+
+### 13.4 裝置識別
+
+`device_by_id` 支援兩種穩定路徑：
+
+- `/dev/serial/by-id/...`：基於 USB descriptor，但若多張板使用同款晶片（如 CH340）會完全相同
+- `/dev/serial/by-path/...`：基於物理 USB port 路徑，不隨列舉順序變動，同款晶片也能區分
+
+若遇到同晶片無法區分的情境，建議改用 `by-path`。
 
 ## 14. 驗收標準
 
@@ -490,7 +574,7 @@ flowchart TD
 - background mode 可用 `result-tail` 取得後續 chunk
 - interactive lease 可建立、送 key、關閉
 - 多 console attach 可同時收到 RX
-- human line input 不會繞過 broker
+- human input 在 line-buffer 模式下經 broker 排隊；raw interactive 模式直接透傳 UART
 - 裝置 real_path 變更時會 reattach
 - `self_test` 可區分主要故障類型
 - `recover` 僅會走 `Ctrl-C -> Ctrl-D`

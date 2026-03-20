@@ -14,13 +14,20 @@ class DeviceInfo:
 
 
 class DeviceWatcher:
+    """監控 /dev/serial/by-id 與 by-path 下的裝置變化。
+
+    掃描多個目錄時，同一 real_path 只保留第一個（by-id 優先於 by-path），
+    避免同款 USB 轉接器因 by-id 衝突而遺漏裝置。
+    """
+
     def __init__(
         self,
         by_id_dir: str,
         on_change: Callable[[list[DeviceInfo], list[DeviceInfo]], None],
         poll_interval_s: float = 1.0,
+        extra_scan_dirs: list[str] | None = None,
     ) -> None:
-        self._by_id_dir = by_id_dir
+        self._scan_dirs = [by_id_dir] + (extra_scan_dirs or [])
         self._on_change = on_change
         self._poll_interval_s = poll_interval_s
         self._stop_event = threading.Event()
@@ -33,15 +40,19 @@ class DeviceWatcher:
 
     def _scan(self) -> dict[str, DeviceInfo]:
         out: dict[str, DeviceInfo] = {}
-        if not os.path.isdir(self._by_id_dir):
-            return out
-
-        for name in sorted(os.listdir(self._by_id_dir)):
-            path = os.path.join(self._by_id_dir, name)
-            if not os.path.exists(path):
+        seen_real: set[str] = set()
+        for scan_dir in self._scan_dirs:
+            if not os.path.isdir(scan_dir):
                 continue
-            real_path = os.path.realpath(path)
-            out[path] = DeviceInfo(by_id=path, real_path=real_path)
+            for name in sorted(os.listdir(scan_dir)):
+                path = os.path.join(scan_dir, name)
+                if not os.path.exists(path):
+                    continue
+                real_path = os.path.realpath(path)
+                if real_path in seen_real:
+                    continue
+                seen_real.add(real_path)
+                out[path] = DeviceInfo(by_id=path, real_path=real_path)
         return out
 
     def poll_once(self) -> None:

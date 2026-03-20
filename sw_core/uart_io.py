@@ -26,6 +26,8 @@ _BAUD_MAP = {
     921600: termios.B921600,
 }
 
+_STALE_CONSOLE_GRACE_S = 2.0
+
 
 @dataclasses.dataclass
 class ConsoleClient:
@@ -69,6 +71,9 @@ class UARTBridge:
         self._rx_max_chars = 131072
         self._clients: dict[str, ConsoleClient] = {}
         self._interactive_owner: str | None = None
+        self._agent_active: bool = False
+        self._suspended_owner: str | None = None
+        self._deferred_buffers: dict[str, bytearray] = {}
 
     @property
     def vtty_path(self) -> str | None:
@@ -224,6 +229,24 @@ class UARTBridge:
                 self._interactive_owner = None
         self._close_console_client(client)
 
+    def _prune_stale_consoles_locked(self, *, now: float | None = None) -> list[ConsoleClient]:
+        cutoff = time.time() if now is None else now
+        stale: list[ConsoleClient] = []
+        for client_id, client in list(self._clients.items()):
+            if client_id == self._primary_client_id:
+                continue
+            if cutoff - client.attached_at < _STALE_CONSOLE_GRACE_S:
+                continue
+            if self._client_has_external_peer_locked(client):
+                continue
+            removed = self._clients.pop(client_id, None)
+            if removed is None:
+                continue
+            if self._interactive_owner == f"human:{client_id}":
+                self._interactive_owner = None
+            stale.append(removed)
+        return stale
+
     def _write_all(self, fd: int, payload: bytes) -> None:
         view = memoryview(payload)
         sent = 0
@@ -329,11 +352,22 @@ class UARTBridge:
         return lines, bytes(echo)
 
     def _handle_console_rx(self, client: ConsoleClient, data: bytes) -> None:
-        owner = None
         with self._state_lock:
             owner = self._interactive_owner
+            agent_active = self._agent_active
+            suspended = self._suspended_owner
+
         if owner == f"human:{client.client_id}":
             self.send_bytes(data, source=f"human:{client.client_id}", cmd_id=None)
+            return
+
+        if agent_active and suspended == f"human:{client.client_id}":
+            with self._state_lock:
+                buf = self._deferred_buffers.get(client.client_id)
+                if buf is None:
+                    buf = bytearray()
+                    self._deferred_buffers[client.client_id] = buf
+                buf.extend(data)
             return
 
         lines, echo = self._consume_console_input(client, data)
@@ -456,10 +490,14 @@ class UARTBridge:
 
     def attach_console(self, *, label: str | None = None) -> dict[str, Any]:
         client = self._create_console_client(label)
+        stale: list[ConsoleClient] = []
         with self._state_lock:
+            stale = self._prune_stale_consoles_locked(now=client.attached_at)
             self._clients[client.client_id] = client
             if self._primary_client_id is None:
                 self._primary_client_id = client.client_id
+        for row in stale:
+            self._close_console_client(row)
         return {
             "client_id": client.client_id,
             "label": client.label,
@@ -476,13 +514,19 @@ class UARTBridge:
                 self._primary_client_id = next_client.client_id if next_client is not None else None
             if self._interactive_owner == f"human:{client_id}":
                 self._interactive_owner = None
+            if self._suspended_owner == f"human:{client_id}":
+                self._suspended_owner = None
+                self._agent_active = False
+            self._deferred_buffers.pop(client_id, None)
         self._close_console_client(client)
         return True
 
     def list_consoles(self) -> list[dict[str, Any]]:
+        stale: list[ConsoleClient] = []
         with self._state_lock:
+            stale = self._prune_stale_consoles_locked()
             owner = self._interactive_owner
-            return [
+            rows = [
                 {
                     "client_id": client.client_id,
                     "label": client.label,
@@ -491,6 +535,9 @@ class UARTBridge:
                 }
                 for client in sorted(self._clients.values(), key=lambda row: (row.label, row.client_id))
             ]
+        for row in stale:
+            self._close_console_client(row)
+        return rows
 
     def console_has_external_peer(self, client_id: str) -> bool:
         with self._state_lock:
@@ -503,11 +550,46 @@ class UARTBridge:
         with self._state_lock:
             self._interactive_owner = owner
 
+    def suspend_interactive(self) -> None:
+        """暫時掛起 human interactive ownership，切換到 deferred 模式。
+
+        Agent 執行命令前呼叫；human console input 會累積在 deferred buffer
+        而不是直接 raw 送到 UART。
+        """
+        with self._state_lock:
+            self._suspended_owner = self._interactive_owner
+            self._interactive_owner = None
+            self._agent_active = True
+
+    def resume_interactive(self) -> None:
+        """恢復 human interactive ownership 並 flush deferred buffer 到 UART。
+
+        Agent 命令完成後呼叫；deferred 期間累積的 human 輸入以 raw bytes
+        送到 UART，讓 target 自然回顯。
+        """
+        flush_data: list[tuple[str, bytes]] = []
+        with self._state_lock:
+            self._interactive_owner = self._suspended_owner
+            self._agent_active = False
+            self._suspended_owner = None
+            for client_id, buf in self._deferred_buffers.items():
+                if buf:
+                    flush_data.append((f"human:{client_id}", bytes(buf)))
+            self._deferred_buffers.clear()
+        for source, data in flush_data:
+            self.send_bytes(data, source=source, cmd_id=None)
+
     def snapshot(self) -> dict[str, Any]:
+        consoles = self.list_consoles()
         with self._state_lock:
             serial_fd = self._serial_fd
-            primary = self.vtty_path
-            consoles = self.list_consoles()
+            primary_client_id = self._primary_client_id
+            primary = None
+            if primary_client_id is not None:
+                client = self._clients.get(primary_client_id)
+                if client is not None:
+                    primary = client.slave_path
+            interactive_owner = self._interactive_owner
         serial_alive = False
         if serial_fd is not None:
             try:
@@ -522,7 +604,7 @@ class UARTBridge:
             "vtty": primary,
             "serial_alive": serial_alive,
             "vtty_alive": vtty_alive,
-            "interactive_owner": self._interactive_owner,
+            "interactive_owner": interactive_owner,
             "consoles": consoles,
             "running": bool(self._thread and self._thread.is_alive()),
         }

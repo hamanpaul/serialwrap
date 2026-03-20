@@ -21,6 +21,7 @@ install -m 0755 "${SCRIPT_DIR}/serialwrap" "${TARGET_DIR}/serialwrap"
 install -m 0755 "${SCRIPT_DIR}/serialwrapd.py" "${TARGET_DIR}/serialwrapd.py"
 install -m 0755 "${SCRIPT_DIR}/serialwrap-mcp" "${TARGET_DIR}/serialwrap-mcp"
 install -m 0755 "${SCRIPT_DIR}/tools/minicom_router.sh" "${TARGET_DIR}/minicom_router.sh"
+ln -sfn "${TARGET_DIR}/minicom_router.sh" "${TARGET_DIR}/minicom"
 install -m 0755 "${SCRIPT_DIR}/tools/minicom-broker.sh" "${TARGET_DIR}/minicom-broker.sh"
 install -m 0755 "${SCRIPT_DIR}/tools/minicom-raw.sh" "${TARGET_DIR}/minicom-raw.sh"
 
@@ -53,9 +54,12 @@ cat <<MSG
   target: ${TARGET_DIR}
   binary: ${TARGET_DIR}/serialwrap
   daemon: ${TARGET_DIR}/serialwrapd.py
+  minicom: ${TARGET_DIR}/minicom
   minicom router: ${TARGET_DIR}/minicom_router.sh
 
 Suggested shell setup:
   export PATH="${TARGET_DIR}:\$PATH"
-  alias minicom="${TARGET_DIR}/minicom_router.sh"
+  hash -r 2>/dev/null || true
+  # 若 shell 已經有 alias minicom，請先 unalias minicom
+  # 用 type -a minicom 確認目前先命中 ${TARGET_DIR}/minicom
 MSG

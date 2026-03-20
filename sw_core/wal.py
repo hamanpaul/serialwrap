@@ -65,6 +65,11 @@ class WalWriter:
             ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
             dst = f"{path}.{ts}"
             os.replace(path, dst)
+            dir_fd = os.open(os.path.dirname(path), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
 
     def append(
         self,

@@ -1,0 +1,74 @@
+---
+meta:
+  name: cowork-01-agent-bad-cmd
+  category: cowork
+  severity: critical
+  description: "Agent 送壞命令卡住 → timeout recover → human 操作不受影響 → agent 再次正常"
+  tags: ["agent", "bad-command", "recover", "cowork"]
+
+target:
+  platform: shell
+  boot_banner: "login: "
+  noise:
+    enabled: false
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\n$ "
+    # 壞命令：target 只回半截，不送 prompt
+    "bad-hang": "partial output..."
+    # 正常命令
+    "echo ok": "ok\r\n$ "
+    "ls": "file1 file2\r\n$ "
+    "echo after-recover": "after-recover\r\n$ "
+
+profile:
+  prompt_regex: '(?m)^\$ '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 5
+  login:
+    user: root
+    pass: ""
+
+steps:
+  # 1. 等待 daemon READY
+  - action: wait_ready
+    timeout_s: 20
+
+  # 2. Agent 送壞命令（target 不回 prompt → timeout）
+  - action: submit_command
+    command: "bad-hang"
+    source: "agent:stress-test"
+    mode: fg
+    timeout_s: 5
+    save_as: bad_cmd
+    expect_error: true
+
+  # 3. 驗證 timeout → recover
+  - action: wait_command
+    cmd_id: "{bad_cmd.cmd_id}"
+    timeout_s: 10
+    expect_status: error
+    expect_error_code: PROMPT_TIMEOUT
+
+  # 4. Agent 送正常命令 — 驗證 session 已 recover
+  - action: submit_command
+    command: "echo after-recover"
+    source: "agent:stress-test"
+    mode: fg
+    timeout_s: 5
+    save_as: good_cmd
+
+  - action: wait_command
+    cmd_id: "{good_cmd.cmd_id}"
+    timeout_s: 10
+    expect_status: done
+
+  # 5. Human attach console — 驗證 console 可正常連線
+  - action: attach_console
+    selector: COM0
+    label: human-after-recover
+    save_as: console1
+
+  # 6. Human detach — 清理
+  - action: detach_console
+    console_id: "{console1.client_id}"
+    selector: COM0
