@@ -18,7 +18,7 @@
 - `jq`：`minicom_router.sh` 需要
 - `minicom`：human console 路徑需要
 
-## 架構圖
+## 系統方塊圖
 
 ```mermaid
 flowchart LR
@@ -63,7 +63,7 @@ flowchart LR
     class U,T,W,X io
 ```
 
-## 啟動時序圖
+## 啟動流程圖
 
 ```mermaid
 sequenceDiagram
@@ -89,6 +89,91 @@ sequenceDiagram
         U-->>SM: ATTACHED
     end
     D-->>CLI: health ok
+```
+
+## Session 狀態機
+
+```mermaid
+stateDiagram-v2
+    [*] --> DETACHED
+    DETACHED --> ATTACHING: device seen
+    ATTACHING --> READY: prompt ok
+    ATTACHING --> ATTACHED: login needed
+    ATTACHING --> ATTACHED: passthrough
+    ATTACHING --> DETACHED: device lost
+    ATTACHED --> READY: login ok
+    ATTACHED --> READY: recover ok
+    ATTACHED --> DETACHED: detach
+    READY --> ATTACHED: recover fallback
+    READY --> DETACHED: unplug
+    READY --> RECOVERING: reboot cmd
+    RECOVERING --> READY: auto relogin ok
+    RECOVERING --> ATTACHED: prompt not ready
+    RECOVERING --> DETACHED: device lost
+```
+
+## Agent / Human Co-work 時序圖
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant H as Human
+    participant D as Daemon
+    participant A as Arbiter
+    participant B as Bridge
+    participant T as Target
+    participant G as Agent
+
+    H->>B: raw keys
+    G->>D: submit line cmd
+    D->>B: suspend human
+    D->>A: enqueue cmd
+    A->>B: send command
+    B->>T: raw command
+    H->>B: deferred keys
+    T-->>B: stdout + prompt
+    B-->>A: prompt back
+    A-->>D: done + stdout
+    D->>B: resume human
+    B->>T: flush deferred
+    D-->>G: command result
+```
+
+## Multi-Agent 競爭時序圖
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A1 as Agent A
+    participant A2 as Agent B
+    participant A3 as Agent C
+    participant D as Daemon
+    participant Q as Arbiter
+    participant B as Bridge
+    participant T as Target
+
+    par submit
+        A1->>D: slow cmd
+    and
+        A2->>D: fast cmd
+    and
+        A3->>D: status / cancel
+    end
+
+    D->>Q: queue slow
+    D->>Q: queue fast
+    Q->>B: run slow
+    B->>T: slow command
+    T-->>B: slow prompt
+    B-->>Q: slow done
+    Q-->>D: update record
+    Q->>B: run fast
+    B->>T: fast command
+    T-->>B: fast prompt
+    Q-->>D: update record
+    D-->>A1: slow done
+    D-->>A2: fast done
+    D-->>A3: queued / canceled / done
 ```
 
 ## 呼叫流程圖
@@ -151,6 +236,56 @@ hash -r 2>/dev/null || true
 ## Profile 與目標綁定
 
 `profiles/*.yaml` 以 template + targets 定義 platform、prompt、login、ready probe 與 UART 參數。
+
+## Session Template 架構圖
+
+```mermaid
+flowchart LR
+    DEF["defaults"]
+    ENV1["OPI.env"]
+    ENV2["brcm.env"]
+    OVR["state.json"]
+    SES["runtime session"]
+
+    subgraph CFG["profiles.yaml"]
+        subgraph TPL["profiles"]
+            P1["prpl-template"]
+            P2["op3-template"]
+            P3["brcm-template"]
+            P4["others-template"]
+        end
+        subgraph TGT["targets"]
+            T0["COMx prpl"]
+            T1["COM1 opi"]
+            T2["COM2 brcm"]
+            T3["COM3 passthrough"]
+        end
+    end
+
+    DEF --> P1
+    DEF --> P2
+    DEF --> P3
+    DEF --> P4
+    ENV1 --> P2
+    ENV2 --> P3
+    P1 --> T0
+    P2 --> T1
+    P3 --> T2
+    P4 --> T3
+    T0 --> SES
+    T1 --> SES
+    T2 --> SES
+    T3 --> SES
+    OVR --> SES
+
+    classDef cfg fill:#e8f1ff,stroke:#335c99,stroke-width:1px;
+    classDef profile fill:#eef7e8,stroke:#4f7a3f,stroke-width:1px;
+    classDef runtime fill:#fff4e6,stroke:#9a6b25,stroke-width:1px;
+
+    class DEF,ENV1,ENV2,OVR cfg
+    class P1,P2,P3,P4,T0,T1,T2,T3 profile
+    class SES runtime
+```
 
 ```yaml
 defaults:
