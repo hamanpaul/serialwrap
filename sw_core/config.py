@@ -132,8 +132,18 @@ def _template_from_dict(name: str, raw: dict[str, Any], *, base_dir: str) -> Pro
     )
 
 
-def _load_templates(file_name: str, obj: dict[str, Any], *, base_dir: str) -> tuple[dict[str, ProfileTemplate], str]:
+def _load_templates(
+    file_name: str,
+    obj: dict[str, Any],
+    *,
+    base_dir: str,
+) -> tuple[dict[str, ProfileTemplate], list[ProfileTemplate], str]:
+    """回傳 (name→template 對映, 排序後的 template list, default_name)。
+
+    排序規則：passthrough 類型永遠排最後，其餘保持 YAML 定義順序。
+    """
     templates: dict[str, ProfileTemplate] = {}
+    ordered: list[ProfileTemplate] = []
     default_name = str(obj.get("profile_name") or os.path.splitext(file_name)[0]).strip()
 
     profiles_obj = obj.get("profiles")
@@ -144,7 +154,9 @@ def _load_templates(file_name: str, obj: dict[str, Any], *, base_dir: str) -> tu
             name = str(k).strip()
             if not name:
                 continue
-            templates[name] = _template_from_dict(name, v, base_dir=base_dir)
+            tpl = _template_from_dict(name, v, base_dir=base_dir)
+            templates[name] = tpl
+            ordered.append(tpl)
     elif isinstance(profiles_obj, list):
         for row in profiles_obj:
             if not isinstance(row, dict):
@@ -152,14 +164,22 @@ def _load_templates(file_name: str, obj: dict[str, Any], *, base_dir: str) -> tu
             name = str(row.get("name") or row.get("profile_name") or "").strip()
             if not name:
                 continue
-            templates[name] = _template_from_dict(name, row, base_dir=base_dir)
+            tpl = _template_from_dict(name, row, base_dir=base_dir)
+            templates[name] = tpl
+            ordered.append(tpl)
 
     if not templates:
-        templates[default_name] = _template_from_dict(default_name, obj, base_dir=base_dir)
+        tpl = _template_from_dict(default_name, obj, base_dir=base_dir)
+        templates[default_name] = tpl
+        ordered.append(tpl)
 
     if default_name not in templates:
         default_name = sorted(templates.keys())[0]
-    return templates, default_name
+
+    # passthrough 排最後，其餘維持 YAML 定義順序
+    ordered.sort(key=lambda t: (1 if t.platform == "passthrough" else 0))
+
+    return templates, ordered, default_name
 
 
 def _merge_session(
@@ -212,10 +232,20 @@ def _merge_session(
     )
 
 
-def load_profiles(profile_dir: str) -> list[SessionProfile]:
+@dataclasses.dataclass(frozen=True)
+class LoadResult:
+    """``load_profiles()`` 的回傳值。"""
+    profiles: list[SessionProfile]
+    templates: list[ProfileTemplate]
+    max_sessions: int
+
+
+def load_profiles(profile_dir: str) -> LoadResult:
     out: list[SessionProfile] = []
+    all_templates: list[ProfileTemplate] = []
+    max_sessions = 16
     if not os.path.isdir(profile_dir):
-        return out
+        return LoadResult(profiles=out, templates=all_templates, max_sessions=max_sessions)
 
     for file_name in sorted(os.listdir(profile_dir)):
         if not (file_name.endswith(".yaml") or file_name.endswith(".yml")):
@@ -229,8 +259,15 @@ def load_profiles(profile_dir: str) -> list[SessionProfile]:
         base_dir = os.path.dirname(path)
         defaults_obj = obj.get("defaults") if isinstance(obj.get("defaults"), dict) else {}
         defaults_log_dir = _resolve_opt_path(defaults_obj.get("log_dir"), base_dir=base_dir) if defaults_obj else None
-        templates, default_profile_name = _load_templates(file_name, obj, base_dir=base_dir)
-        targets = obj.get("targets") or []
+        if defaults_obj:
+            max_sessions = _as_int(defaults_obj.get("max_sessions"), max_sessions)
+        templates_map, ordered_templates, default_profile_name = _load_templates(file_name, obj, base_dir=base_dir)
+        all_templates = ordered_templates
+
+        targets = obj.get("targets")
+        if targets is None:
+            # targets 區段省略 → 全部走動態偵測
+            continue
         if not isinstance(targets, list):
             continue
 
@@ -239,7 +276,7 @@ def load_profiles(profile_dir: str) -> list[SessionProfile]:
                 continue
 
             profile_ref = str(t.get("profile") or t.get("profile_name") or default_profile_name).strip()
-            tpl = templates.get(profile_ref)
+            tpl = templates_map.get(profile_ref)
             if tpl is None:
                 continue
 
@@ -262,4 +299,4 @@ def load_profiles(profile_dir: str) -> list[SessionProfile]:
                     defaults_log_dir=defaults_log_dir,
                 )
             )
-    return out
+    return LoadResult(profiles=out, templates=all_templates, max_sessions=max_sessions)

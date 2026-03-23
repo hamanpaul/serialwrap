@@ -23,7 +23,7 @@ class TestConfigProfiles(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            rows = load_profiles(td)
+            rows = load_profiles(td).profiles
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0].profile_name, "demo")
             self.assertEqual(rows[0].com, "COM2")
@@ -61,7 +61,7 @@ class TestConfigProfiles(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            rows = load_profiles(td)
+            rows = load_profiles(td).profiles
             self.assertEqual(len(rows), 2)
             self.assertEqual(rows[0].profile_name, "prpl-template")
             self.assertEqual(rows[1].profile_name, "prpl-template")
@@ -98,7 +98,7 @@ class TestConfigProfiles(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            rows = load_profiles(td)
+            rows = load_profiles(td).profiles
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0].profile_name, "op3-template")
             self.assertEqual(rows[0].platform, "shell")
@@ -130,7 +130,7 @@ class TestConfigProfiles(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            rows = load_profiles(td)
+            rows = load_profiles(td).profiles
 
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0].env_file, str(Path(td) / "OPI.env"))
@@ -157,7 +157,7 @@ class TestConfigProfiles(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            rows = load_profiles(td)
+            rows = load_profiles(td).profiles
 
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0].env_file, str(Path(td) / "special.env"))
@@ -185,7 +185,7 @@ class TestConfigProfiles(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            rows = load_profiles(td)
+            rows = load_profiles(td).profiles
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0].profile_name, "others-template")
             self.assertEqual(rows[0].platform, "passthrough")

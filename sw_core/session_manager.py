@@ -13,10 +13,10 @@ from typing import Any, Callable
 
 from .alias_registry import AliasRegistry
 from .auth import resolve_session_auth
-from .config import SessionProfile
+from .config import ProfileTemplate, SessionProfile
 from .constants import LOG_DIR, STATE_PATH
 from .device_watcher import DeviceInfo
-from .login_fsm import ensure_ready, probe_ready
+from .login_fsm import detect_template, ensure_ready, probe_ready
 from .uart_io import UARTBridge
 from .util import clean_text, now_iso
 from .wal import WalWriter
@@ -146,6 +146,8 @@ class SessionManager:
         profiles: list[SessionProfile],
         wal: WalWriter,
         *,
+        templates: list[ProfileTemplate] | None = None,
+        max_sessions: int = 16,
         on_ready: Callable[[str], None],
         on_detached: Callable[[str], None],
         on_console_line: Callable[[str, str, str], None] | None = None,
@@ -163,6 +165,8 @@ class SessionManager:
         self._background: dict[str, BackgroundCapture] = {}
         self._interactive: dict[str, InteractiveLease] = {}
         self._capture_fps: dict[str, Any] = {}  # capture_id → open file object
+        self._templates: list[ProfileTemplate] = list(templates) if templates else []
+        self._max_sessions = max_sessions
 
         self._load_state()
         for p in profiles:
@@ -206,6 +210,52 @@ class SessionManager:
                 separators=(",", ":"),
             )
             fp.write("\n")
+
+    def _next_dynamic_com(self) -> str:
+        """分配下一個可用的 COM 編號（須在 self._lock 內呼叫）。"""
+        used = {s.profile.com for s in self._sessions.values()}
+        for i in range(self._max_sessions):
+            com = f"COM{i}"
+            if com not in used:
+                return com
+        return f"COM{len(self._sessions)}"
+
+    def _session_from_template(
+        self,
+        tpl: ProfileTemplate,
+        device_by_id: str,
+    ) -> SessionRuntime:
+        """從 template 建立新的動態 session（須在 self._lock 內呼叫）。"""
+        com = self._next_dynamic_com()
+        act_no = len(self._sessions) + 1
+        alias = f"{tpl.profile_name}+{act_no}"
+        profile = SessionProfile(
+            profile_name=tpl.profile_name,
+            com=com,
+            act_no=act_no,
+            alias=alias,
+            device_by_id=device_by_id,
+            platform=tpl.platform,
+            prompt_regex=tpl.prompt_regex,
+            login_regex=tpl.login_regex,
+            password_regex=tpl.password_regex,
+            post_login_cmd=tpl.post_login_cmd,
+            ready_probe=tpl.ready_probe,
+            username=tpl.username,
+            user_env=tpl.user_env,
+            pass_env=tpl.pass_env,
+            env_file=tpl.env_file,
+            timeout_s=tpl.timeout_s,
+            quiet_window_s=tpl.quiet_window_s,
+            hard_timeout_s=tpl.hard_timeout_s,
+            log_dir=tpl.log_dir,
+            uart=tpl.uart,
+        )
+        sid = f"{profile.profile_name}:{com}"
+        session = SessionRuntime(session_id=sid, profile=profile)
+        self._sessions[sid] = session
+        self._aliases.set_for_session(sid, alias)
+        return session
 
     def list_sessions(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -474,6 +524,7 @@ class SessionManager:
 
     def _attach_by_id(self, by_id: str) -> None:
         save_needed = False
+        dynamic_created = False
         with self._lock:
             session = next((s for s in self._sessions.values() if s.profile.device_by_id == by_id), None)
             if session is None:
@@ -486,8 +537,23 @@ class SessionManager:
                     session.profile = dataclasses.replace(session.profile, device_by_id=by_id)
                     self._binding_overrides[session.session_id] = by_id
                     save_needed = True
+            # 若仍無匹配且有 templates → 嘗試動態偵測
+            if session is None and self._templates:
+                if len(self._sessions) >= self._max_sessions:
+                    import logging
+                    logging.getLogger("serialwrap").warning(
+                        "已達 max_sessions=%d，忽略裝置 %s", self._max_sessions, by_id,
+                    )
+                    return
+                dynamic_created = True
         if save_needed:
             self._save_state()
+
+        # --- 動態偵測路徑 ---
+        if dynamic_created:
+            self._attach_by_id_dynamic(by_id)
+            return
+
         with self._lock:
             if session is None:
                 return
@@ -535,6 +601,141 @@ class SessionManager:
                         return
                 else:
                     # 無帳密時退回 probe，讓 human 手動登入
+                    ok, err = probe_ready(bridge, profile)
+            else:
+                ok, err = probe_ready(bridge, profile)
+
+            notify_ready = False
+            with self._lock:
+                current = self._devices.get(by_id)
+                if current is None or current.real_path != real_path or session.state == "DETACHED" or session.bridge_generation != gen_before:
+                    bridge.stop()
+                    session.state = "DETACHED"
+                    session.last_error = "DEVICE_REMOVED_DURING_ATTACH"
+                    session.detached_at = now_iso()
+                    session.bridge = None
+                    session.vtty_path = None
+                    session.attached_real_path = None
+                    return
+                session.bridge = bridge
+                session.vtty_path = bridge.vtty_path
+                session.attached_real_path = real_path
+                session.bridge_generation += 1
+                if ok:
+                    session.state = "READY"
+                    session.last_error = None
+                    session.last_ready_at = now_iso()
+                    session.recovering = False
+                    session.recovery_started_at = None
+                    session.pending_auto_login = False
+                    notify_ready = True
+                else:
+                    session.state = "ATTACHED"
+                    session.last_error = err
+                    session.recovering = False
+                    session.recovery_started_at = None
+            if notify_ready:
+                self._on_ready(session.session_id)
+        except Exception as exc:
+            try:
+                bridge.stop()
+            except Exception:
+                pass
+            with self._lock:
+                session.state = "DETACHED"
+                session.last_error = f"ATTACH_FAILED:{type(exc).__name__}"
+                session.detached_at = now_iso()
+                session.bridge = None
+                session.vtty_path = None
+                session.attached_real_path = None
+            self._on_detached(session.session_id)
+
+    def _attach_by_id_dynamic(self, by_id: str) -> None:
+        """動態偵測 template 並建立新 session。"""
+        from .config import UartProfile
+
+        with self._lock:
+            dev = self._devices.get(by_id)
+            if dev is None:
+                return
+            real_path = dev.real_path
+
+        # 先用預設 UART 參數開 bridge 做 probe
+        default_uart = UartProfile()
+        probe_bridge = UARTBridge(
+            "PROBE",
+            real_path,
+            default_uart,
+            self._wal,
+        )
+        detected: ProfileTemplate | None = None
+        try:
+            probe_bridge.start()
+            detected = detect_template(probe_bridge, self._templates)
+        except Exception:
+            pass
+        finally:
+            try:
+                probe_bridge.stop()
+            except Exception:
+                pass
+
+        # 找 passthrough fallback
+        passthrough = next((t for t in self._templates if t.platform == "passthrough"), None)
+        tpl = detected or passthrough
+        if tpl is None:
+            return
+
+        with self._lock:
+            # 確認裝置仍在線且 session 數仍未超限
+            if by_id not in self._devices or len(self._sessions) >= self._max_sessions:
+                return
+            session = self._session_from_template(tpl, by_id)
+
+        # 用正確 uart 參數重新開 bridge
+        profile = session.profile
+        with self._lock:
+            dev = self._devices.get(by_id)
+            if dev is None:
+                return
+            real_path = dev.real_path
+            session.state = "ATTACHING"
+            session.last_error = None
+            gen_before = session.bridge_generation
+            session_id = session.session_id
+            require_login = session.pending_auto_login or bool(profile.login_regex)
+            passthrough_only = profile.platform == "passthrough"
+
+        bridge = UARTBridge(
+            profile.com,
+            real_path,
+            profile.uart,
+            self._wal,
+            on_console_line=lambda client_id, line, sid=session_id: self._on_bridge_console_line(sid, client_id, line),
+            on_rx_data=lambda data, sid=session_id: self._on_bridge_rx(sid, data),
+            on_bridge_down=lambda reason, sid=session_id: self._handle_bridge_down(sid, bridge, reason),
+        )
+
+        try:
+            bridge.start()
+            if passthrough_only:
+                ok, err = False, None
+            elif require_login:
+                auth = resolve_session_auth(profile)
+                if auth.username and auth.password:
+                    ok, err = ensure_ready(bridge, profile, auth=auth)
+                    if not ok:
+                        bridge.stop()
+                        with self._lock:
+                            session.state = "DETACHED"
+                            session.last_error = err
+                            session.detached_at = now_iso()
+                            session.bridge = None
+                            session.vtty_path = None
+                            session.attached_real_path = None
+                        self._on_detached(session.session_id)
+                        return
+                else:
                     ok, err = probe_ready(bridge, profile)
             else:
                 ok, err = probe_ready(bridge, profile)

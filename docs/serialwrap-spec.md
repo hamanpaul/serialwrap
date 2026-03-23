@@ -507,11 +507,12 @@ Agent 可透過 `session.log_start` / `session.log_stop` 對特定 session 啟�
 
 ### 13.1 YAML 結構
 
-Profile YAML 由三個頂層區段組成：
+Profile YAML 由三個頂層區段組成（`targets` 為可選）：
 
 ```yaml
 defaults:
   log_dir: "~/b-log"       # 全域 agent log 預設目錄
+  max_sessions: 16         # 動態 session 上限（預設 16）
 
 profiles:
   <template-name>:
@@ -519,6 +520,7 @@ profiles:
     prompt_regex: ...
     # ... 其餘 template 欄位
 
+# targets 區段為可選：省略 → 全部走動態偵測
 targets:
   - act_no: 1
     com: COM1
@@ -527,7 +529,9 @@ targets:
     device_by_id: /dev/serial/by-path/...  # 或 /dev/serial/by-id/...
 ```
 
-`defaults` 區段目前支援 `log_dir`（agent log 寫入目錄），若未設定則 fallback 到 `SERIALWRAP_LOG_DIR` env 或 `~/b-log`。
+`defaults` 區段支援：
+- `log_dir`：agent log 寫入目錄，若未設定則 fallback 到 `SERIALWRAP_LOG_DIR` env 或 `~/b-log`
+- `max_sessions`：動態 session 上限，預設 16，超過時忽略新裝置
 
 ### 13.2 Template 欄位
 
@@ -567,6 +571,42 @@ targets:
 - `/dev/serial/by-path/...`：基於物理 USB port 路徑，不隨列舉順序變動，同款晶片也能區分
 
 若遇到同晶片無法區分的情境，建議改用 `by-path`。
+
+### 13.5 Auto-detect Template（自動偵測）
+
+當 DeviceWatcher 偵測到新 UART 裝置且無任何 explicit target 綁定匹配時，daemon 進入自動偵測流程。
+
+**觸發條件**：
+- 裝置的 `by_id` 路徑不在任何已建立 session 的 `device_by_id` 中
+- 也沒有 DETACHED session 可重新綁定
+- `templates` 列表非空（由 `load_profiles()` 從 YAML `profiles` 區段載入）
+- 現有 session 總數未達 `max_sessions`
+
+**偵測流程**（`login_fsm.detect_template()`）：
+
+1. 用預設 UART 參數（115200/8N1）開啟臨時 probe bridge
+2. `bridge.clear_rx_buffer()` + `bridge.send_command("")`（送 `\r`）
+3. 等待 `probe_timeout_s`（預設 3 秒）收集 UART 輸出
+4. 取得 `bridge.rx_tail()` snapshot
+5. 依序嘗試各 template（passthrough 排最後）：
+   - **prompt_regex 匹配** → 立即選定此 template
+   - **login_regex 匹配** → 記錄為候選
+6. 若有 login_regex 候選 → 選定第一個匹配的 template
+7. 全不匹配 → 回傳 `None`（caller 使用 passthrough fallback）
+
+**動態 session 建立**（`session_manager._attach_by_id_dynamic()`）：
+
+1. 偵測成功或 fallback 後，呼叫 `_session_from_template()` 建立新 session
+2. `_next_dynamic_com()` 分配 COM 編號（COM0, COM1, ...，跳過已用的）
+3. session_id 格式為 `{profile_name}:{COM}`
+4. 關閉 probe bridge，用偵測到的 template 的 UART 參數重新開啟正式 bridge
+5. 繼續 login/ready 流程
+
+**設計決策**：
+- 偵測結果不持久化：每次裝置出現都重新偵測
+- passthrough 永遠是最後 fallback，不會被 `prompt_regex: ".*"` 搶先匹配
+- profiles 定義順序決定偵測優先級 → 把 specific（prpl/bcm）排在 generic（shell）前面
+- `max_sessions` 預設 16，超過則 log warning 並忽略新裝置
 
 ## 14. 驗收標準
 

@@ -237,29 +237,34 @@ hash -r 2>/dev/null || true
 
 `profiles/*.yaml` 以 template + targets 定義 platform、prompt、login、ready probe 與 UART 參數。
 
+**targets 區段為可選**：若省略或留空，daemon 會在偵測到新 UART 裝置時，自動使用 `detect_template()` 比對各 template 的 `prompt_regex` / `login_regex`，匹配成功即動態建立 session；全不匹配則 fallback 到 passthrough。已有 explicit binding 的裝置仍走原本路徑，不受影響。
+
 ## Session Template 架構圖
 
 ```mermaid
 flowchart LR
-    DEF["defaults"]
+    DEF["defaults\nmax_sessions: 16"]
     ENV1["OPI.env"]
     ENV2["brcm.env"]
     OVR["state.json"]
     SES["runtime session"]
+    DEV["/dev/serial/by-id/*"]
 
     subgraph CFG["profiles.yaml"]
         subgraph TPL["profiles"]
             P1["prpl-template"]
             P2["op3-template"]
             P3["brcm-template"]
-            P4["others-template"]
+            P4["others-template\n(passthrough fallback)"]
         end
-        subgraph TGT["targets"]
-            T0["COMx prpl"]
-            T1["COM1 opi"]
-            T2["COM2 brcm"]
-            T3["COM3 passthrough"]
+        subgraph TGT["targets (可選)"]
+            T0["explicit binding\nCOM→profile→device"]
         end
+    end
+
+    subgraph AUTO["auto-detect"]
+        DT["detect_template()"]
+        DYN["動態建立 session\n_session_from_template()"]
     end
 
     DEF --> P1
@@ -268,28 +273,31 @@ flowchart LR
     DEF --> P4
     ENV1 --> P2
     ENV2 --> P3
-    P1 --> T0
-    P2 --> T1
-    P3 --> T2
-    P4 --> T3
     T0 --> SES
-    T1 --> SES
-    T2 --> SES
-    T3 --> SES
     OVR --> SES
+    DEV --> DT
+    P1 --> DT
+    P2 --> DT
+    P3 --> DT
+    DT --> DYN
+    P4 -.-> DYN
+    DYN --> SES
 
     classDef cfg fill:#e8f1ff,stroke:#335c99,stroke-width:1px;
     classDef profile fill:#eef7e8,stroke:#4f7a3f,stroke-width:1px;
     classDef runtime fill:#fff4e6,stroke:#9a6b25,stroke-width:1px;
+    classDef detect fill:#ffeef0,stroke:#993333,stroke-width:1px;
 
     class DEF,ENV1,ENV2,OVR cfg
-    class P1,P2,P3,P4,T0,T1,T2,T3 profile
+    class P1,P2,P3,P4,T0 profile
     class SES runtime
+    class DT,DYN detect
 ```
 
 ```yaml
 defaults:
   log_dir: "~/b-log"           # 全域 agent log 預設目錄
+  max_sessions: 16             # 動態 session 上限
 
 profiles:
   prpl-template:
@@ -351,22 +359,14 @@ profiles:
       flow_control: none
       xonxoff: false
 
-targets:
-  - act_no: 1
-    com: COM1
-    alias: opi
-    profile: op3-template
-    device_by_id: /dev/serial/by-path/platform-vhci_hcd.0-usb-0:1:1.0-port0
-  - act_no: 2
-    com: COM2
-    alias: brcm
-    profile: brcm-template
-    device_by_id: /dev/serial/by-path/platform-vhci_hcd.0-usb-0:2:1.0-port0
-  - act_no: 3
-    com: COM3
-    alias: passthrough
-    profile: others-template
-    device_by_id: /dev/serial/by-id/placeholder-passthrough
+# targets 區段為可選：省略 → 全走動態偵測
+# 有 explicit 綁定的裝置可寫在這裡：
+# targets:
+#   - act_no: 1
+#     com: COM0
+#     alias: my-prpl
+#     profile: prpl-template
+#     device_by_id: /dev/serial/by-id/usb-FTDI_...
 ```
 
 `prpl-template` 預設改成匹配 `root@prplOS:/#` 這種 prompt prefix，而不是要求 prompt 必須單獨佔一整行。這樣在 prompt 後面立刻接 driver / kernel log 的情況下，line mode 仍能正確收尾；`ready_probe` 也維持最小 `echo __READY__${nonce}`，避免在沒有 `whoami` 的 target 上增加噪音。
@@ -391,6 +391,19 @@ serialwrap daemon start --profile-dir "$HOME/.paul_tools/profiles"
 若 shell device 已經自動登入，`serialwrap` 會直接用 prompt + `ready_probe` 驗證；若先看到 `login:` / `password:`，則會依 `user_env` / `pass_env` 自動登入。像 Orange Pi 常見的 `orangepi3 login:`，建議 `login_regex` 用 `(?mi)^.*login:\\s*$`。
 
 `others-template` 使用 `platform=passthrough`。attach 時不做 prompt/login/ready 限制，只建立 broker bridge，讓 `ttyUSB` 與 broker 建出的 `ttyPTS` 直接透傳；這類 session 會停在 `ATTACHED`，適合不認識的設備先用 minicom/human console 觀察。
+
+### Auto-detect 流程
+
+當 DeviceWatcher 偵測到新 UART 裝置且沒有任何 explicit binding 匹配時，daemon 會自動執行 template 偵測：
+
+1. 用預設 UART 參數（115200/8N1）開啟臨時 bridge
+2. 送 `\r` 到 UART，等待 3 秒收集輸出
+3. 依 profiles YAML 定義順序（passthrough 排最後），依序嘗試各 template 的 `prompt_regex` → 匹配即選定
+4. 若 prompt 不匹配但 `login_regex` 匹配 → 選為候選
+5. 全不匹配 → fallback 到 passthrough
+6. 動態分配 COM 編號（COM0, COM1, ...），建立新 session
+
+偵測結果**不會持久化**：每次裝置出現都重新偵測。`max_sessions`（預設 16）限制同時存在的 session 數量。
 
 `device_by_id` 支援 `/dev/serial/by-id/` 與 `/dev/serial/by-path/` 兩種穩定識別方式。若多張板使用同款 USB-Serial 晶片（如 CH340），`by-id` 無法區分，建議改用 `by-path`（基於物理 USB port 路徑，不隨列舉順序變）。
 

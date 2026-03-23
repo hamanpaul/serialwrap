@@ -7,7 +7,7 @@ import threading
 from typing import Any
 
 from .arbiter import CommandArbiter
-from .config import SessionProfile
+from .config import ProfileTemplate, SessionProfile
 from .constants import DEVICE_BY_ID_DIR, DEVICE_BY_PATH_DIR
 from .device_watcher import DeviceWatcher
 from .session_manager import SessionManager
@@ -95,7 +95,15 @@ def _human_console_mode(command: str) -> str:
 
 
 class SerialwrapService:
-    def __init__(self, profiles: list[SessionProfile], *, by_id_dir: str = DEVICE_BY_ID_DIR, by_path_dir: str = DEVICE_BY_PATH_DIR) -> None:
+    def __init__(
+        self,
+        profiles: list[SessionProfile],
+        *,
+        templates: list[ProfileTemplate] | None = None,
+        max_sessions: int = 16,
+        by_id_dir: str = DEVICE_BY_ID_DIR,
+        by_path_dir: str = DEVICE_BY_PATH_DIR,
+    ) -> None:
         self._wal = WalWriter()
         self._lock = threading.RLock()
         self._running = False
@@ -106,6 +114,8 @@ class SerialwrapService:
         self._sessions = SessionManager(
             profiles,
             self._wal,
+            templates=templates,
+            max_sessions=max_sessions,
             on_ready=self._on_ready,
             on_detached=self._on_detached,
             on_console_line=self._on_console_line,

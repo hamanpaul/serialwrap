@@ -74,5 +74,116 @@ class TestLoginFsm(unittest.TestCase):
         bridge.clear_rx_buffer.assert_called_once_with()
 
 
+class TestDetectTemplate(unittest.TestCase):
+    """detect_template() 自動偵測 ProfileTemplate 的單元測試。"""
+
+    def _make_templates(self) -> list:
+        from sw_core.config import ProfileTemplate
+        return [
+            ProfileTemplate(
+                profile_name="prpl-template",
+                platform="prpl",
+                prompt_regex=r"(?m)^root@prplOS:.*# ",
+                login_regex=r"(?mi)^login:\s*$",
+            ),
+            ProfileTemplate(
+                profile_name="brcm-template",
+                platform="bcm",
+                prompt_regex=r"(?m)[>#]\s*$",
+                login_regex=r"(?mi)login:\s*$",
+            ),
+            ProfileTemplate(
+                profile_name="op3-template",
+                platform="shell",
+                prompt_regex=r".*[$#] $",
+                login_regex=r"(?mi)^.*login:\s*$",
+            ),
+            ProfileTemplate(
+                profile_name="others-template",
+                platform="passthrough",
+                prompt_regex=".*",
+                login_regex="$^",
+            ),
+        ]
+
+    def test_detect_prpl_prompt(self) -> None:
+        """UART 輸出含 prplOS prompt → 回傳 prpl-template。"""
+        from sw_core.login_fsm import detect_template
+
+        bridge = mock.MagicMock()
+        bridge.rx_tail.return_value = "\r\nroot@prplOS:/# "
+        templates = self._make_templates()
+        result = detect_template(bridge, templates, probe_timeout_s=0.01)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.profile_name, "prpl-template")
+
+    def test_detect_bcm_prompt(self) -> None:
+        """UART 輸出含 bcm prompt → 回傳 brcm-template。"""
+        from sw_core.login_fsm import detect_template
+
+        bridge = mock.MagicMock()
+        bridge.rx_tail.return_value = "\r\nBCM968575> "
+        templates = self._make_templates()
+        result = detect_template(bridge, templates, probe_timeout_s=0.01)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.profile_name, "brcm-template")
+
+    def test_detect_shell_prompt(self) -> None:
+        """UART 輸出含 generic shell prompt → 回傳 op3-template。"""
+        from sw_core.login_fsm import detect_template
+
+        bridge = mock.MagicMock()
+        # 用 $ 結尾避免被 bcm 的 [>#]\s*$ 搶走
+        bridge.rx_tail.return_value = "\r\nuser@host:~$ "
+        templates = self._make_templates()
+        result = detect_template(bridge, templates, probe_timeout_s=0.01)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.profile_name, "op3-template")
+
+    def test_detect_login_regex_fallback(self) -> None:
+        """UART 輸出是 login prompt → 用 login_regex 匹配回傳 template。"""
+        from sw_core.login_fsm import detect_template
+
+        bridge = mock.MagicMock()
+        bridge.rx_tail.return_value = "\r\norangepi3 login: "
+        templates = self._make_templates()
+        result = detect_template(bridge, templates, probe_timeout_s=0.01)
+        self.assertIsNotNone(result)
+        # login_regex "(?mi)^login:\s*$" 不匹配（因為有 hostname），
+        # 但 op3 的 "(?mi)^.*login:\s*$" 會匹配
+        self.assertIn(result.profile_name, ("prpl-template", "brcm-template", "op3-template"))
+
+    def test_detect_none_when_no_output(self) -> None:
+        """UART 沒有輸出 → 回傳 None。"""
+        from sw_core.login_fsm import detect_template
+
+        bridge = mock.MagicMock()
+        bridge.rx_tail.return_value = ""
+        templates = self._make_templates()
+        result = detect_template(bridge, templates, probe_timeout_s=0.01)
+        self.assertIsNone(result)
+
+    def test_passthrough_never_matched(self) -> None:
+        """passthrough 的 prompt_regex '.*' 不會被偵測使用。"""
+        from sw_core.login_fsm import detect_template
+
+        bridge = mock.MagicMock()
+        bridge.rx_tail.return_value = "some random boot garbage\r\n"
+        templates = self._make_templates()
+        result = detect_template(bridge, templates, probe_timeout_s=0.01)
+        # passthrough 被 skip，其他都不匹配 → None
+        self.assertIsNone(result)
+
+    def test_template_order_specificity(self) -> None:
+        """prpl 排在 shell 前面 → prpl prompt 不會被 shell 搶走。"""
+        from sw_core.login_fsm import detect_template
+
+        bridge = mock.MagicMock()
+        bridge.rx_tail.return_value = "root@prplOS:/# "
+        templates = self._make_templates()
+        result = detect_template(bridge, templates, probe_timeout_s=0.01)
+        self.assertEqual(result.profile_name, "prpl-template")
+
+
 if __name__ == "__main__":
     unittest.main()

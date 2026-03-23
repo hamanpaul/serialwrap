@@ -196,7 +196,7 @@ class TestConfigLogDir(unittest.TestCase):
 
         from sw_core.config import load_profiles
 
-        profiles = load_profiles(tmpdir)
+        profiles = load_profiles(tmpdir).profiles
         self.assertEqual(len(profiles), 1)
         self.assertEqual(profiles[0].log_dir, "/my/log/dir")
 
@@ -230,7 +230,7 @@ class TestConfigLogDir(unittest.TestCase):
 
         from sw_core.config import load_profiles
 
-        profiles = load_profiles(tmpdir)
+        profiles = load_profiles(tmpdir).profiles
         self.assertEqual(profiles[0].log_dir, "/target/dir")
 
     def test_profile_template_overrides_defaults(self) -> None:
@@ -263,7 +263,7 @@ class TestConfigLogDir(unittest.TestCase):
 
         from sw_core.config import load_profiles
 
-        profiles = load_profiles(tmpdir)
+        profiles = load_profiles(tmpdir).profiles
         self.assertEqual(profiles[0].log_dir, "/profile/dir")
 
 

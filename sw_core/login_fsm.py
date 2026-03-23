@@ -6,7 +6,7 @@ import time
 import uuid
 
 from .auth import SessionAuth
-from .config import SessionProfile
+from .config import ProfileTemplate, SessionProfile
 from .uart_io import UARTBridge
 
 
@@ -124,3 +124,46 @@ def ensure_ready(bridge: UARTBridge, sp: SessionProfile, auth: SessionAuth | Non
         if not ok:
             return False, _prompt_timeout_error(sp)
     return _finalize_ready(bridge, sp)
+
+
+# ---------------------------------------------------------------------------
+# Auto-detect：用 UART 輸出匹配最佳 ProfileTemplate
+# ---------------------------------------------------------------------------
+
+def detect_template(
+    bridge: UARTBridge,
+    templates: list[ProfileTemplate],
+    probe_timeout_s: float = 3.0,
+) -> ProfileTemplate | None:
+    """送 ``\\r`` 到 UART，收集回應，依序嘗試各 template 的 regex 進行匹配。
+
+    回傳最先匹配的 ``ProfileTemplate``，全部不符合則回傳 ``None``。
+    templates 應已由 ``config.py`` 排序（passthrough 在最後）。
+    """
+    bridge.clear_rx_buffer()
+    bridge.send_command("", source="system")
+    time.sleep(probe_timeout_s)
+    snapshot = bridge.rx_tail()
+
+    # 第一輪：嘗試 prompt_regex（已處於可操作 prompt）
+    login_candidate: ProfileTemplate | None = None
+    for tpl in templates:
+        if tpl.platform == "passthrough":
+            continue
+        try:
+            if re.search(tpl.prompt_regex, snapshot):
+                return tpl
+        except re.error:
+            continue
+        # 第二輪備選：login_regex 匹配（尚未登入）
+        if login_candidate is None:
+            try:
+                if re.search(tpl.login_regex, snapshot):
+                    login_candidate = tpl
+            except re.error:
+                continue
+
+    if login_candidate is not None:
+        return login_candidate
+
+    return None

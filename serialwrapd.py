@@ -23,8 +23,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 async def _run_async(args: argparse.Namespace) -> int:
     ensure_runtime_dirs()
-    profiles = load_profiles(args.profile_dir)
-    if not profiles:
+    result = load_profiles(args.profile_dir)
+    if not result.profiles and not result.templates:
         sys.stderr.write("serialwrapd: no profiles loaded\n")
 
     lock = SingletonLock(args.lock, args.socket)
@@ -34,7 +34,11 @@ async def _run_async(args: argparse.Namespace) -> int:
         sys.stderr.write(f"serialwrapd: {exc}\n")
         return 2
 
-    service = SerialwrapService(profiles)
+    service = SerialwrapService(
+        result.profiles,
+        templates=result.templates,
+        max_sessions=result.max_sessions,
+    )
     stop_event = asyncio.Event()
 
     def _handle(method: str, params: dict[str, object]) -> dict[str, object]:

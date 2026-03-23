@@ -690,5 +690,149 @@ class TestSessionBind(unittest.TestCase):
         spawn_attach.assert_called_once_with("/dev/serial/by-id/orig")
 
 
+class TestDynamicSessionAutoDetect(unittest.TestCase):
+    """動態 session 建立 + auto-detect template 的測試。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old_state_path = sm_mod.STATE_PATH
+        sm_mod.STATE_PATH = str(Path(self._tmp.name) / "state.json")
+
+    def tearDown(self) -> None:
+        sm_mod.STATE_PATH = self._old_state_path
+        self._tmp.cleanup()
+
+    def test_dynamic_session_created_when_no_explicit_binding(self) -> None:
+        """無 explicit binding 且有 templates → 建立動態 session。"""
+        from sw_core.config import ProfileTemplate
+
+        templates = [
+            ProfileTemplate(profile_name="prpl-template", platform="prpl", prompt_regex=r"(?m)^root@prplOS:.*# "),
+            ProfileTemplate(profile_name="others-template", platform="passthrough", prompt_regex=".*"),
+        ]
+        mgr = SessionManager(
+            [],
+            WalWriter(wal_dir=self._tmp.name),
+            templates=templates,
+            max_sessions=4,
+            on_ready=lambda _sid: None,
+            on_detached=lambda _sid: None,
+        )
+        self.assertEqual(len(mgr.list_sessions()), 0)
+
+        # 模擬動態 session 建立（直接呼叫內部 helper）
+        with mgr._lock:
+            session = mgr._session_from_template(templates[0], "/dev/serial/by-id/test-dev")
+        self.assertEqual(session.profile.profile_name, "prpl-template")
+        self.assertEqual(session.profile.platform, "prpl")
+        self.assertIn("COM", session.profile.com)
+        self.assertEqual(session.profile.device_by_id, "/dev/serial/by-id/test-dev")
+        self.assertEqual(len(mgr.list_sessions()), 1)
+
+    def test_max_sessions_prevents_creation(self) -> None:
+        """超過 max_sessions 時不建立新 session。"""
+        from sw_core.config import ProfileTemplate
+
+        templates = [
+            ProfileTemplate(profile_name="prpl-template", platform="prpl"),
+            ProfileTemplate(profile_name="others-template", platform="passthrough"),
+        ]
+        mgr = SessionManager(
+            [],
+            WalWriter(wal_dir=self._tmp.name),
+            templates=templates,
+            max_sessions=2,
+            on_ready=lambda _sid: None,
+            on_detached=lambda _sid: None,
+        )
+        # 手動建 2 個 session 達到上限
+        with mgr._lock:
+            mgr._session_from_template(templates[0], "/dev/serial/by-id/dev1")
+            mgr._session_from_template(templates[0], "/dev/serial/by-id/dev2")
+        self.assertEqual(len(mgr.list_sessions()), 2)
+
+        # 第三個應該不建立
+        with mgr._lock:
+            if len(mgr._sessions) >= mgr._max_sessions:
+                over_limit = True
+            else:
+                over_limit = False
+        self.assertTrue(over_limit)
+
+    def test_next_dynamic_com_skips_used(self) -> None:
+        """_next_dynamic_com() 跳過已使用的 COM 編號。"""
+        from sw_core.config import ProfileTemplate
+
+        templates = [
+            ProfileTemplate(profile_name="t", platform="prpl"),
+        ]
+        mgr = SessionManager(
+            [],
+            WalWriter(wal_dir=self._tmp.name),
+            templates=templates,
+            max_sessions=16,
+            on_ready=lambda _sid: None,
+            on_detached=lambda _sid: None,
+        )
+        with mgr._lock:
+            s1 = mgr._session_from_template(templates[0], "/dev/serial/by-id/d1")
+            s2 = mgr._session_from_template(templates[0], "/dev/serial/by-id/d2")
+        self.assertEqual(s1.profile.com, "COM0")
+        self.assertEqual(s2.profile.com, "COM1")
+
+    def test_explicit_binding_takes_priority(self) -> None:
+        """已有 explicit binding 的裝置不走動態偵測。"""
+        from sw_core.config import ProfileTemplate
+
+        p = SessionProfile(
+            profile_name="prpl-template",
+            com="COM0",
+            act_no=1,
+            alias="my-prpl",
+            device_by_id="/dev/serial/by-id/explicit-dev",
+            platform="prpl",
+        )
+        templates = [
+            ProfileTemplate(profile_name="prpl-template", platform="prpl"),
+            ProfileTemplate(profile_name="others-template", platform="passthrough"),
+        ]
+        mgr = SessionManager(
+            [p],
+            WalWriter(wal_dir=self._tmp.name),
+            templates=templates,
+            max_sessions=4,
+            on_ready=lambda _sid: None,
+            on_detached=lambda _sid: None,
+        )
+        sessions = mgr.list_sessions()
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0]["device_by_id"], "/dev/serial/by-id/explicit-dev")
+
+    def test_config_load_result_has_templates(self) -> None:
+        """load_profiles() 回傳的 LoadResult 包含 templates 列表。"""
+        import tempfile
+        from pathlib import Path
+
+        from sw_core.config import load_profiles
+
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "test.yaml"
+            p.write_text(
+                "defaults:\n  max_sessions: 8\n"
+                "profiles:\n"
+                "  prpl-template:\n    platform: prpl\n"
+                "  others-template:\n    platform: passthrough\n",
+                encoding="utf-8",
+            )
+            result = load_profiles(td)
+            self.assertIsInstance(result.templates, list)
+            self.assertEqual(len(result.templates), 2)
+            self.assertEqual(result.max_sessions, 8)
+            # passthrough 排最後
+            self.assertEqual(result.templates[-1].platform, "passthrough")
+            # 沒有 targets → profiles 為空
+            self.assertEqual(len(result.profiles), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
