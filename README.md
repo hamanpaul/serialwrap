@@ -643,6 +643,56 @@ python3 -m unittest tests.test_multiagent_e2e -v
 python3 -m unittest tests.test_session_bind -v
 ```
 
+### 32h 長時間穩定度測試摘要
+
+最近對 `COM1` 做了一輪 **32 小時** 長時間穩定度測試，負載模型是：
+
+- 4 個 agent source 持續送 `serialwrap cmd submit`
+- 1 個 human console 透過 `tmux + minicom + tmux send-keys`
+- controller 會持續監控 daemon / session 狀態；若 session 長時間不健康，會自動重啟 serialwrap，並把每段 run 納入統計
+
+關鍵結果如下：
+
+| 指標 | 結果 |
+|---|---|
+| 總時長 | `32:00:01` |
+| 最長單次執行 | `01:15:17` |
+| run segments | `31` |
+| daemon restart | `30` |
+| health failure | `30` |
+| bridge rebuild | `0` |
+| vtty change | `0` |
+| human launch / stale / send | `29 / 1 / 5696` |
+
+Agent 總量：
+
+- submitted：`49,899`
+- accepted：`48,396`
+- done：`48,288`
+- error：`27`
+- status_timeout：`81`
+- submit_fail：`1,503`
+
+這輪長跑最重要的發現是：**主要不穩定模式不是 bridge rebuild 或 vtty 換號，而是 session 週期性卡在 `ATTACHED`、沒有回到 `READY`。**
+
+run end reason 分布如下：
+
+- `session_not_ready:ATTACHED`：`27`
+- `session_not_ready:DETACHED`：`2`
+- `daemon_health_fail`：`1`
+- `completed`：`1`
+
+也就是說，這次長跑真正暴露的主問題是 `ATTACHED -> READY` gating / recover 流程，而不是單純的 stale PTY。相關追蹤 issue：[#12](https://github.com/hamanpaul/serialwrap/issues/12)。stale PTY / primary PTY 變更問題仍另列於 [#11](https://github.com/hamanpaul/serialwrap/issues/11)。
+
+### 下一步根因分析計畫
+
+針對 issue #12，接下來建議優先做這幾件事：
+
+1. 在 `ATTACHING -> ATTACHED -> READY` 路徑補更細的 event / log，包含 `login_fsm` probe、`ready_probe` nonce 與關鍵 session snapshot。
+2. 把這次 32h controller 的負載縮成可在 1~2 小時內重現的 stress case，優先重現「卡在 `ATTACHED`」而不是只觀察 daemon restart。
+3. 補 attach / recover gating 的 regression test，避免 session 無限停在 `ATTACHED`。
+4. 修完後重新跑 long-run，驗收標準至少要把 `session_not_ready:ATTACHED` 造成的 restart 降到 `0`，且不能讓 human / multi-agent 協作退化。
+
 ## 延伸閱讀
 
 - 詳細決策與 API 契約：[`docs/serialwrap-spec.md`](./docs/serialwrap-spec.md)
