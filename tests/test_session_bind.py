@@ -131,6 +131,7 @@ class TestSessionBind(unittest.TestCase):
         bridge = mock.MagicMock()
         bridge.rx_snapshot_len.side_effect = [10, 20, 30]
         bridge.wait_for_regex_from.side_effect = [False, False, False]
+        bridge.rx_text_from.return_value = "partial output"
         session.bridge = bridge
         session.state = "READY"
 
@@ -688,6 +689,63 @@ class TestSessionBind(unittest.TestCase):
         self.assertIsNone(session.bridge)
         self.assertIsNone(session.vtty_path)
         spawn_attach.assert_called_once_with("/dev/serial/by-id/orig")
+
+    def test_attach_reuses_preserved_consoles_and_restores_human_owner(self) -> None:
+        from sw_core.device_watcher import DeviceInfo
+        from sw_core.uart_io import ConsoleClient, PreservedConsoles
+        import time
+        import unittest.mock as mock
+
+        profiles = [self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")]
+        mgr = SessionManager(profiles, WalWriter(wal_dir=self._tmp.name), on_ready=lambda _sid: None, on_detached=lambda _sid: None)
+        session = mgr.get_session("COM0")
+        assert session is not None
+
+        preserved = PreservedConsoles(
+            clients={
+                "cid-1": ConsoleClient(
+                    client_id="cid-1",
+                    label="minicom:1",
+                    master_fd=-1,
+                    slave_fd=-1,
+                    slave_path="/dev/pts/55",
+                    attached_at=time.time(),
+                )
+            },
+            primary_client_id="cid-1",
+        )
+        session.bridge = mock.MagicMock()
+        session.bridge.stop.return_value = preserved
+        session.state = "READY"
+        lease = InteractiveLease(
+            interactive_id="lease-1",
+            session_id=session.session_id,
+            owner="human:cid-1",
+            created_at="now",
+            timeout_s=90.0,
+        )
+        with mgr._lock:
+            mgr._interactive[lease.interactive_id] = lease
+            session.interactive_session_id = lease.interactive_id
+            mgr._devices = {
+                "/dev/serial/by-id/orig": DeviceInfo(by_id="/dev/serial/by-id/orig", real_path="/dev/ttyUSB0")
+            }
+
+        mgr._detach_session_locked(session, reason="BRIDGE_DOWN:TEST")
+        self.assertEqual(session.vtty_path, "/dev/pts/55")
+        self.assertEqual(session.to_public_dict()["console_count"], 1)
+
+        with mock.patch("sw_core.session_manager.UARTBridge") as MockBridge, \
+             mock.patch("sw_core.session_manager.probe_ready", return_value=(True, None)):
+            MockBridge.return_value.start.return_value = None
+            MockBridge.return_value.vtty_path = "/dev/pts/55"
+            MockBridge.return_value.has_console.return_value = True
+            mgr._attach_by_id("/dev/serial/by-id/orig")
+
+        self.assertIsNone(session.retained_consoles)
+        self.assertIsNotNone(session.interactive_session_id)
+        MockBridge.return_value.set_interactive_owner.assert_called_once_with("human:cid-1")
+        self.assertEqual(MockBridge.call_args.kwargs["preserved_consoles"].primary_vtty(), "/dev/pts/55")
 
 
 if __name__ == "__main__":

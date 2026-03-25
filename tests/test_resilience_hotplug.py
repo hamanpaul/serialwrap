@@ -89,6 +89,24 @@ class TestDeviceHotplug(unittest.TestCase):
             mgr.update_devices(device)
             mock_attach.assert_called_with(by_id)
 
+    def test_missing_bound_device_sets_detached_diagnostic(self) -> None:
+        """已綁定但目前不存在的裝置，update_devices 應留下 DEVICE_NOT_FOUND 診斷。"""
+        by_id = "/dev/serial/by-id/missing"
+        profile = _make_profile(by_id=by_id)
+        mgr = SessionManager(
+            [profile], WalWriter(wal_dir=self._tmp.name),
+            on_ready=lambda _: None, on_detached=lambda _: None,
+        )
+        session = mgr.get_session("COM0")
+        assert session is not None
+
+        with mock.patch.object(mgr, "_spawn_attach"):
+            mgr.update_devices({})
+
+        self.assertEqual(session.state, "DETACHED")
+        self.assertEqual(session.last_error, "DEVICE_NOT_FOUND")
+        self.assertIsNotNone(session.detached_at)
+
     def test_device_realpath_change_triggers_reattach(self) -> None:
         """同一 by_id 但 real_path 變更（重新列舉），應 detach + reattach。"""
         by_id = "/dev/serial/by-id/dev0"
@@ -151,6 +169,71 @@ class TestDeviceHotplug(unittest.TestCase):
         result = mgr.recover_session("COM0")
         self.assertFalse(result["ok"])
         self.assertEqual(result["error_code"], "SESSION_NOT_READY")
+
+    def test_recover_session_attached_reprobes_to_ready(self) -> None:
+        """ATTACHED + bridge 存活時，recover 應直接 re-probe 回 READY。"""
+        by_id = "/dev/serial/by-id/dev0"
+        profile = _make_profile(by_id=by_id)
+        mgr = SessionManager(
+            [profile], WalWriter(wal_dir=self._tmp.name),
+            on_ready=lambda _: None, on_detached=lambda _: None,
+        )
+        session = mgr.get_session("COM0")
+        assert session is not None
+        session.state = "ATTACHED"
+        session.last_error = "PROMPT_TIMEOUT"
+        session.bridge = mock.MagicMock()
+
+        with mock.patch("sw_core.session_manager.probe_ready", return_value=(True, None)) as probe_ready:
+            result = mgr.recover_session("COM0")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["action"], "REPROBE")
+        self.assertTrue(result["recovered"])
+        self.assertEqual(result["session"]["state"], "READY")
+        self.assertIsNone(result["session"]["last_error"])
+        probe_ready.assert_called_once_with(session.bridge, session.profile)
+
+    def test_recover_session_attached_failed_reprobe_stays_attached(self) -> None:
+        """ATTACHED re-probe 失敗時，recover 應保留 ATTACHED 並回傳明確錯誤。"""
+        by_id = "/dev/serial/by-id/dev0"
+        profile = _make_profile(by_id=by_id)
+        mgr = SessionManager(
+            [profile], WalWriter(wal_dir=self._tmp.name),
+            on_ready=lambda _: None, on_detached=lambda _: None,
+        )
+        session = mgr.get_session("COM0")
+        assert session is not None
+        session.state = "ATTACHED"
+        session.last_error = "PROMPT_TIMEOUT"
+        session.bridge = mock.MagicMock()
+
+        with mock.patch("sw_core.session_manager.probe_ready", return_value=(False, "PROMPT_TIMEOUT")):
+            result = mgr.recover_session("COM0")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["action"], "REPROBE")
+        self.assertFalse(result["recovered"])
+        self.assertEqual(result["error_code"], "PROMPT_TIMEOUT")
+        self.assertEqual(result["session"]["state"], "ATTACHED")
+        self.assertEqual(result["session"]["last_error"], "PROMPT_TIMEOUT")
+
+    def test_attach_by_id_missing_device_sets_last_error(self) -> None:
+        """_attach_by_id 早退遇到缺裝置時，不應留下 last_error=None。"""
+        by_id = "/dev/serial/by-id/missing"
+        profile = _make_profile(by_id=by_id)
+        mgr = SessionManager(
+            [profile], WalWriter(wal_dir=self._tmp.name),
+            on_ready=lambda _: None, on_detached=lambda _: None,
+        )
+        session = mgr.get_session("COM0")
+        assert session is not None
+
+        mgr._attach_by_id(by_id)
+
+        self.assertEqual(session.state, "DETACHED")
+        self.assertEqual(session.last_error, "DEVICE_NOT_FOUND")
+        self.assertIsNotNone(session.detached_at)
 
 
 if __name__ == "__main__":

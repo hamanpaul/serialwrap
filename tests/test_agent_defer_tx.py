@@ -260,6 +260,58 @@ class TestUARTBridgeConsoles(unittest.TestCase):
                 time.sleep(0.05)
             self.assertFalse(bridge.console_has_external_peer(client_id))
 
+    def test_bridge_restart_reuses_existing_console_vttys(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            target = self._make_target()
+            target.start()
+            self.addCleanup(target.stop)
+
+            bridge = UARTBridge("COM0", target.slave_path, UartProfile(), WalWriter(wal_dir=td))
+            bridge.start()
+
+            primary = bridge.vtty_path
+            attached = bridge.attach_console(label="observer")
+            assert primary is not None
+
+            fd_primary = os.open(primary, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+            fd_second = os.open(attached["vtty"], os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+            try:
+                preserved = bridge.stop(preserve_consoles=True)
+                restarted = UARTBridge(
+                    "COM0",
+                    target.slave_path,
+                    UartProfile(),
+                    WalWriter(wal_dir=td),
+                    preserved_consoles=preserved,
+                )
+                restarted.start()
+                self.addCleanup(restarted.stop)
+
+                self.assertEqual(restarted.vtty_path, primary)
+                consoles = {row["client_id"]: row["vtty"] for row in restarted.list_consoles()}
+                self.assertEqual(consoles[attached["client_id"]], attached["vtty"])
+
+                target.emit(b"after-restart\r\n# ")
+                deadline = time.monotonic() + 2.0
+                primary_data = b""
+                second_data = b""
+                while time.monotonic() < deadline and (not primary_data or not second_data):
+                    try:
+                        primary_data += os.read(fd_primary, 4096)
+                    except BlockingIOError:
+                        pass
+                    try:
+                        second_data += os.read(fd_second, 4096)
+                    except BlockingIOError:
+                        pass
+                    time.sleep(0.05)
+            finally:
+                os.close(fd_primary)
+                os.close(fd_second)
+
+            self.assertIn(b"after-restart", primary_data)
+            self.assertIn(b"after-restart", second_data)
+
 
 if __name__ == "__main__":
     unittest.main()
