@@ -17,7 +17,7 @@ from .config import ProfileTemplate, SessionProfile
 from .constants import LOG_DIR, STATE_PATH
 from .device_watcher import DeviceInfo
 from .login_fsm import detect_template, ensure_ready, probe_ready
-from .uart_io import UARTBridge
+from .uart_io import PreservedConsoles, UARTBridge
 from .util import clean_text, now_iso
 from .wal import WalWriter
 
@@ -53,6 +53,7 @@ class BackgroundCapture:
     chunks: list[str] = dataclasses.field(default_factory=list)
     last_seq: int = 0
     status: str = "active"
+    error_code: str | None = None
     last_activity_mono: float = dataclasses.field(default_factory=time.monotonic)
 
     def maybe_finalize(self) -> None:
@@ -107,11 +108,19 @@ class SessionRuntime:
     foreground_busy: bool = False
     background_cmd_ids: list[str] = dataclasses.field(default_factory=list)
     active_capture: SessionCapture | None = None
+    retained_consoles: PreservedConsoles | None = None
+    retained_human_owner: str | None = None
+    retained_human_timeout_s: float | None = None
 
     def to_public_dict(self) -> dict[str, Any]:
         console_count = 0
         if self.bridge is not None:
             console_count = len(self.bridge.list_consoles())
+        elif self.retained_consoles is not None:
+            console_count = len(self.retained_consoles.clients)
+        vtty_path = self.vtty_path
+        if vtty_path is None and self.retained_consoles is not None:
+            vtty_path = self.retained_consoles.primary_vtty()
         return {
             "session_id": self.session_id,
             "profile": self.profile.profile_name,
@@ -124,7 +133,7 @@ class SessionRuntime:
             "last_error": self.last_error,
             "detached_at": self.detached_at,
             "last_ready_at": self.last_ready_at,
-            "vtty": self.vtty_path,
+            "vtty": vtty_path,
             "attached_real_path": self.attached_real_path,
             "bridge_generation": self.bridge_generation,
             "recovering": self.recovering,
@@ -295,11 +304,66 @@ class SessionManager:
             return {"ok": False, "error_code": "ALIAS_NOT_FOUND", "alias": alias}
         return {"ok": True, "alias": alias}
 
+    def _store_retained_consoles_locked(
+        self,
+        session: SessionRuntime,
+        preserved: PreservedConsoles | None,
+        *,
+        human_owner: str | None = None,
+        human_timeout_s: float | None = None,
+    ) -> None:
+        if not isinstance(preserved, PreservedConsoles) or not preserved.clients:
+            session.retained_consoles = None
+            session.retained_human_owner = None
+            session.retained_human_timeout_s = None
+            session.vtty_path = None
+            return
+        session.retained_consoles = preserved
+        session.vtty_path = preserved.primary_vtty()
+        session.retained_human_owner = None
+        session.retained_human_timeout_s = None
+        if human_owner is None or not human_owner.startswith("human:"):
+            return
+        client_id = human_owner.split(":", 1)[1]
+        if client_id and preserved.has_client(client_id):
+            session.retained_human_owner = human_owner
+            session.retained_human_timeout_s = human_timeout_s
+
+    def _restore_retained_human_console_locked(self, session: SessionRuntime) -> None:
+        owner = session.retained_human_owner
+        timeout_s = session.retained_human_timeout_s
+        session.retained_human_owner = None
+        session.retained_human_timeout_s = None
+        if owner is None or session.bridge is None or not owner.startswith("human:"):
+            return
+        client_id = owner.split(":", 1)[1]
+        if not client_id or not session.bridge.has_console(client_id):
+            return
+        if self._refresh_interactive_locked(session) is None:
+            self._open_interactive_locked(
+                session,
+                owner=owner,
+                timeout_s=timeout_s or max(session.profile.hard_timeout_s, _ATTACHED_CONSOLE_LEASE_TIMEOUT_S),
+            )
+
     def _detach_session_locked(self, session: SessionRuntime, *, reason: str) -> None:
+        preserved = session.retained_consoles
+        retained_human_owner = session.retained_human_owner
+        retained_human_timeout_s = session.retained_human_timeout_s
+        if session.interactive_session_id is not None:
+            lease = self._interactive.get(session.interactive_session_id)
+            if lease is not None and lease.owner.startswith("human:"):
+                retained_human_owner = lease.owner
+                retained_human_timeout_s = lease.timeout_s
         if session.bridge is not None:
-            session.bridge.stop()
+            preserved = session.bridge.stop(preserve_consoles=True)
             session.bridge = None
-        session.vtty_path = None
+        self._store_retained_consoles_locked(
+            session,
+            preserved,
+            human_owner=retained_human_owner,
+            human_timeout_s=retained_human_timeout_s,
+        )
         session.attached_real_path = None
         session.state = "DETACHED"
         session.detached_at = now_iso()
@@ -397,34 +461,7 @@ class SessionManager:
                 session.state = "ATTACHING"
                 session.last_error = None
         if should_probe and bridge is not None:
-            if session.profile.login_regex:
-                auth = resolve_session_auth(session.profile)
-                if auth.username and auth.password:
-                    ok, err = ensure_ready(bridge, session.profile, auth=auth)
-                else:
-                    ok, err = probe_ready(bridge, session.profile)
-            else:
-                ok, err = probe_ready(bridge, session.profile)
-            notify_ready = False
-            with self._lock:
-                current = self._sessions.get(session.session_id)
-                if current is None or current.bridge is not bridge:
-                    return {"ok": False, "error_code": "SESSION_NOT_READY"}
-                if ok:
-                    current.state = "READY"
-                    current.last_error = None
-                    current.last_ready_at = now_iso()
-                    current.recovering = False
-                    current.recovery_started_at = None
-                    current.pending_auto_login = False
-                    notify_ready = True
-                else:
-                    current.state = "ATTACHED"
-                    current.last_error = err
-                result = current.to_public_dict()
-            if notify_ready:
-                self._on_ready(session.session_id)
-            return {"ok": True, "session": result}
+            return self._probe_existing_bridge(session, bridge)
         self._spawn_attach(by_id)
         return {"ok": True, "session": session.to_public_dict()}
 
@@ -432,10 +469,25 @@ class SessionManager:
         with self._lock:
             return [{"by_id": by_id, "real_path": dev.real_path} for by_id, dev in sorted(self._devices.items())]
 
+    def _mark_missing_devices_locked(self) -> None:
+        missing_at = now_iso()
+        for session in self._sessions.values():
+            by_id = session.profile.device_by_id
+            if not by_id or session.bridge is not None:
+                continue
+            if by_id in self._devices:
+                continue
+            session.state = "DETACHED"
+            if session.last_error is None:
+                session.last_error = "DEVICE_NOT_FOUND"
+            if session.detached_at is None:
+                session.detached_at = missing_at
+
     def update_devices(self, devices: dict[str, DeviceInfo]) -> None:
         with self._lock:
             prev = self._devices
             self._devices = dict(devices)
+            self._mark_missing_devices_locked()
 
         changed = sorted(
             by_id for by_id in set(prev.keys()) & set(devices.keys())
@@ -522,6 +574,43 @@ class SessionManager:
         if by_id and by_id in self._devices:
             self._spawn_attach(by_id)
 
+    def _probe_existing_bridge(self, session: SessionRuntime, bridge: UARTBridge) -> dict[str, Any]:
+        if session.profile.platform == "passthrough":
+            current = self._sessions.get(session.session_id)
+            if current is None or current.bridge is not bridge:
+                return {"ok": False, "error_code": "SESSION_NOT_READY"}
+            return {"ok": True, "session": current.to_public_dict()}
+
+        if session.profile.login_regex:
+            auth = resolve_session_auth(session.profile)
+            if auth.username and auth.password:
+                ok, err = ensure_ready(bridge, session.profile, auth=auth)
+            else:
+                ok, err = probe_ready(bridge, session.profile)
+        else:
+            ok, err = probe_ready(bridge, session.profile)
+
+        notify_ready = False
+        with self._lock:
+            current = self._sessions.get(session.session_id)
+            if current is None or current.bridge is not bridge:
+                return {"ok": False, "error_code": "SESSION_NOT_READY"}
+            current.recovering = False
+            current.recovery_started_at = None
+            current.pending_auto_login = False
+            if ok:
+                current.state = "READY"
+                current.last_error = None
+                current.last_ready_at = now_iso()
+                notify_ready = True
+            else:
+                current.state = "ATTACHED"
+                current.last_error = err
+            result = current.to_public_dict()
+        if notify_ready:
+            self._on_ready(session.session_id)
+        return {"ok": True, "session": result}
+
     def _attach_by_id(self, by_id: str) -> None:
         save_needed = False
         dynamic_created = False
@@ -558,7 +647,12 @@ class SessionManager:
             if session is None:
                 return
             dev = self._devices.get(by_id)
-            if dev is None or session.bridge is not None or session.profile.device_by_id != by_id:
+            if dev is None:
+                session.state = "DETACHED"
+                session.last_error = "DEVICE_NOT_FOUND"
+                session.detached_at = now_iso()
+                return
+            if session.bridge is not None or session.profile.device_by_id != by_id:
                 return
             session.state = "ATTACHING"
             session.last_error = None
@@ -568,6 +662,7 @@ class SessionManager:
             require_login = session.pending_auto_login or bool(profile.login_regex)
             passthrough_only = profile.platform == "passthrough"
             real_path = dev.real_path
+            preserved_consoles = session.retained_consoles if isinstance(session.retained_consoles, PreservedConsoles) else None
 
         bridge = UARTBridge(
             profile.com,
@@ -577,6 +672,7 @@ class SessionManager:
             on_console_line=lambda client_id, line, sid=session_id: self._on_bridge_console_line(sid, client_id, line),
             on_rx_data=lambda data, sid=session_id: self._on_bridge_rx(sid, data),
             on_bridge_down=lambda reason, sid=session_id: self._handle_bridge_down(sid, bridge, reason),
+            preserved_consoles=preserved_consoles,
         )
 
         try:
@@ -589,13 +685,18 @@ class SessionManager:
                 if auth.username and auth.password:
                     ok, err = ensure_ready(bridge, profile, auth=auth)
                     if not ok:
-                        bridge.stop()
+                        preserved = bridge.stop(preserve_consoles=True)
                         with self._lock:
+                            self._store_retained_consoles_locked(
+                                session,
+                                preserved,
+                                human_owner=session.retained_human_owner,
+                                human_timeout_s=session.retained_human_timeout_s,
+                            )
                             session.state = "DETACHED"
                             session.last_error = err
                             session.detached_at = now_iso()
                             session.bridge = None
-                            session.vtty_path = None
                             session.attached_real_path = None
                         self._on_detached(session.session_id)
                         return
@@ -609,18 +710,24 @@ class SessionManager:
             with self._lock:
                 current = self._devices.get(by_id)
                 if current is None or current.real_path != real_path or session.state == "DETACHED" or session.bridge_generation != gen_before:
-                    bridge.stop()
+                    preserved = bridge.stop(preserve_consoles=True)
+                    self._store_retained_consoles_locked(
+                        session,
+                        preserved,
+                        human_owner=session.retained_human_owner,
+                        human_timeout_s=session.retained_human_timeout_s,
+                    )
                     session.state = "DETACHED"
                     session.last_error = "DEVICE_REMOVED_DURING_ATTACH"
                     session.detached_at = now_iso()
                     session.bridge = None
-                    session.vtty_path = None
                     session.attached_real_path = None
                     return
                 session.bridge = bridge
                 session.vtty_path = bridge.vtty_path
                 session.attached_real_path = real_path
                 session.bridge_generation += 1
+                session.retained_consoles = None
                 if ok:
                     session.state = "READY"
                     session.last_error = None
@@ -634,19 +741,25 @@ class SessionManager:
                     session.last_error = err
                     session.recovering = False
                     session.recovery_started_at = None
+                self._restore_retained_human_console_locked(session)
             if notify_ready:
                 self._on_ready(session.session_id)
         except Exception as exc:
             try:
-                bridge.stop()
+                preserved = bridge.stop(preserve_consoles=True)
             except Exception:
-                pass
+                preserved = None
             with self._lock:
+                self._store_retained_consoles_locked(
+                    session,
+                    preserved,
+                    human_owner=session.retained_human_owner,
+                    human_timeout_s=session.retained_human_timeout_s,
+                )
                 session.state = "DETACHED"
                 session.last_error = f"ATTACH_FAILED:{type(exc).__name__}"
                 session.detached_at = now_iso()
                 session.bridge = None
-                session.vtty_path = None
                 session.attached_real_path = None
             self._on_detached(session.session_id)
 
@@ -951,6 +1064,34 @@ class SessionManager:
 
         threading.Thread(target=_run, name=f"serialwrap-reboot-{session_id}", daemon=True).start()
 
+    def _set_terminal_capture_locked(
+        self,
+        session: SessionRuntime,
+        *,
+        cmd_id: str,
+        chunks: list[str] | None = None,
+        error_code: str | None = None,
+    ) -> None:
+        if not cmd_id:
+            return
+        capture = self._background.get(cmd_id)
+        if capture is None:
+            capture = BackgroundCapture(
+                cmd_id=cmd_id,
+                session_id=session.session_id,
+                from_seq=self._wal.current_seq + 1,
+                quiet_window_s=session.profile.quiet_window_s,
+                created_at=now_iso(),
+                last_seq=self._wal.current_seq,
+            )
+            self._background[cmd_id] = capture
+        if chunks:
+            capture.chunks.extend(chunk for chunk in chunks if chunk)
+        capture.last_seq = self._wal.current_seq
+        capture.last_activity_mono = time.monotonic()
+        capture.status = "error" if error_code else "done"
+        capture.error_code = error_code
+
     def _handle_reboot_command(
         self,
         session: SessionRuntime,
@@ -1111,7 +1252,16 @@ class SessionManager:
         try:
             bridge.send_command(command, source=source, cmd_id=cmd_id)
             if not bridge.wait_for_regex_from(prompt_regex, pre_offset, timeout_s):
-                return self._recover_after_failure(session, bridge, cmd_id=cmd_id, timeout_s=timeout_s, source=source)
+                return self._recover_after_failure(
+                    session,
+                    bridge,
+                    cmd_id=cmd_id,
+                    timeout_s=timeout_s,
+                    source=source,
+                    command=command,
+                    prompt_regex=prompt_regex,
+                    pre_offset=pre_offset,
+                )
             raw_text = bridge.rx_text_from(pre_offset)
             stdout = self._extract_command_stdout(raw_text, command, prompt_regex)
             result: dict[str, Any] = {
@@ -1146,6 +1296,9 @@ class SessionManager:
         cmd_id: str,
         timeout_s: float,
         source: str,
+        command: str,
+        prompt_regex: str,
+        pre_offset: int,
     ) -> dict[str, Any]:
         if source.startswith("human:"):
             with self._lock:
@@ -1166,12 +1319,18 @@ class SessionManager:
                 "recovery_action": "PROMOTE_HUMAN_INTERACTIVE",
             }
 
-        prompt_regex = session.profile.prompt_regex
         for action_name, payload in (("CTRL_C", b"\x03"), ("CTRL_D", b"\x04")):
             offset = bridge.rx_snapshot_len()
             bridge.send_bytes(payload, source="system:recover", cmd_id=None)
             if bridge.wait_for_regex_from(prompt_regex, offset, min(timeout_s, 2.0)):
-                stdout = self._extract_command_stdout(bridge.rx_text_from(offset), "", prompt_regex)
+                stdout = self._extract_command_stdout(bridge.rx_text_from(pre_offset), command, prompt_regex)
+                with self._lock:
+                    self._set_terminal_capture_locked(
+                        session,
+                        cmd_id=cmd_id,
+                        chunks=[stdout] if stdout else None,
+                        error_code="PROMPT_TIMEOUT_RECOVERED",
+                    )
                 return {
                     "ok": False,
                     "error_code": "PROMPT_TIMEOUT_RECOVERED",
@@ -1180,6 +1339,14 @@ class SessionManager:
                     "recovery_action": action_name,
                 }
 
+        partial_stdout = clean_text(bridge.rx_text_from(pre_offset))
+        with self._lock:
+            self._set_terminal_capture_locked(
+                session,
+                cmd_id=cmd_id,
+                chunks=[partial_stdout] if partial_stdout else None,
+                error_code="PROMPT_TIMEOUT",
+            )
         self._transition_to_attached(session, reason="PROMPT_TIMEOUT")
         return {
             "ok": False,
@@ -1440,6 +1607,7 @@ class SessionManager:
             }
 
     def recover_session(self, selector: str, *, timeout_s: float = 2.0) -> dict[str, Any]:
+        reprobe = False
         with self._lock:
             session = self.get_session(selector)
             if session is None:
@@ -1452,10 +1620,38 @@ class SessionManager:
                     self._spawn_attach(by_id)
                     return {"ok": True, "recovering": False, "action": "REATTACH", "session": session.to_public_dict()}
                 return {"ok": False, "error_code": "SESSION_NOT_READY", "session": session.to_public_dict()}
-            if session.state != "READY":
+            if session.state == "ATTACHED":
+                bridge = session.bridge
+                reprobe = True
+            elif session.state != "READY":
                 return {"ok": False, "error_code": "SESSION_NOT_READY", "session": session.to_public_dict()}
-            bridge = session.bridge
-        return self._recover_after_failure(session, bridge, cmd_id="", timeout_s=timeout_s, source="system:recover")
+            else:
+                bridge = session.bridge
+        if reprobe:
+            result = self._probe_existing_bridge(session, bridge)
+            if not result.get("ok"):
+                return result
+            recovered = result["session"]["state"] == "READY"
+            payload: dict[str, Any] = {
+                "ok": True,
+                "recovering": False,
+                "action": "REPROBE",
+                "recovered": recovered,
+                "session": result["session"],
+            }
+            if not recovered:
+                payload["error_code"] = result["session"].get("last_error") or "SESSION_NOT_READY"
+            return payload
+        return self._recover_after_failure(
+            session,
+            bridge,
+            cmd_id="",
+            timeout_s=timeout_s,
+            source="system:recover",
+            command="",
+            prompt_regex=session.profile.prompt_regex,
+            pre_offset=bridge.rx_snapshot_len(),
+        )
 
     def get_background_result(self, cmd_id: str, *, from_chunk: int = 0, limit: int = 200) -> dict[str, Any]:
         with self._lock:
@@ -1469,6 +1665,7 @@ class SessionManager:
                 "ok": True,
                 "cmd_id": cmd_id,
                 "status": capture.status,
+                "error_code": capture.error_code,
                 "from_seq": capture.from_seq,
                 "last_seq": capture.last_seq,
                 "from_chunk": from_chunk,

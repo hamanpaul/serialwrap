@@ -440,6 +440,8 @@ serialwrap cmd result-tail --cmd-id <cmd_id> --from-chunk 0 --limit 200
 
 `background` capture 會在 quiet window 到期，或新的前景/互動命令開始時封口。
 
+若命令在 prompt timeout 路徑失敗，`cmd result-tail` 仍會保留 terminal `status` / `error_code`，並盡量回傳已緩衝的 partial chunk，不再直接掉成 `CMD_NOT_FOUND`。
+
 ### 3. `interactive`
 
 適用 `menuconfig`、`top`、`vi` 等需要持續送按鍵的場景。
@@ -483,6 +485,7 @@ minicom -D /dev/ttyUSB0
 - **`console-attach` 在 `ATTACHED` 或 `READY` 狀態下，會自動授予第一個 human console raw interactive ownership**，不需手動 `interactive-open`。所有按鍵（包含方向鍵、Tab、ESC 序列）即時透傳到 UART，操作體感與直接 minicom 一致。
 - 若 agent 在 human interactive 期間提交命令，daemon 會暫時掛起（suspend）human raw mode → 執行 agent 命令 → 完成後自動恢復（resume）。Human 在 agent 執行期間的按鍵會累積在 deferred buffer，agent 完成後 flush 到 UART。
 - 第二個以後的 minicom console 因為 interactive lease 已存在，仍走 line-buffer 模式（broker 提供本地回顯與 backspace 行編輯）。
+- bridge rebuild / reattach 時，broker 會盡量保留既有 console PTY 與 human ownership，避免既有 minicom 掛到 stale `/dev/pts/*`。
 - 若要保留舊版「完整 terminal transcript」行為，可顯式設定 `MINICOM_CAPTURE_WRAPPER=1`，此時 wrapper 會改用 `script -qef` 包一層 PTY；但這可能增加 human 體感延遲。
 - 常見 human/minicom 互動式命令（例如 `vi`、`vim`、`top`、`htop`、`less`、`menuconfig`）會自動升級成 human interactive ownership，不再因為等不到 shell prompt 而自動觸發 recover / reboot。
 - 若直接打 `minicom` 沒有走 broker，先用 `type -a minicom` 檢查目前 shell 是否先命中 `~/.paul_tools/minicom`；若仍是 `/usr/bin/minicom`，代表 shell PATH 尚未把 wrapper 放到前面。
@@ -526,12 +529,13 @@ serialwrap session self-test --selector COM0
 serialwrap session recover --selector COM0
 ```
 
-recover 升級順序固定：
+recover 行為分成三種：
 
-1. `Ctrl-C`
-2. `Ctrl-D`
+1. `ATTACHED` 且 bridge 仍存活：先直接 re-probe 現有 bridge，成功就回 `READY`
+2. `READY`：走 `Ctrl-C` → `Ctrl-D`
+3. bridge 已不存在但裝置還在：直接 reattach
 
-若 `Ctrl-C` / `Ctrl-D` 都救不回 prompt，session 會降級成 `ATTACHED`，保留 bridge 與 console，交由 human/minicom 接手。
+若 `READY` 路徑中的 `Ctrl-C` / `Ctrl-D` 都救不回 prompt，session 會降級成 `ATTACHED`，保留 bridge 與 console，交由 human/minicom 接手。
 
 只有 **agent 明確送出 reboot 類指令** 時，daemon 才會進入 `RECOVERING`，並在 target 回來後自動重新 login / 回到 `READY`。
 
