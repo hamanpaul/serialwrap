@@ -341,7 +341,13 @@ flowchart TD
 
 ### 9.2 `session.recover`
 
-若 session 仍有可用 bridge：
+若 session 狀態為 `ATTACHED` 且 bridge 仍在：
+
+- 直接對現有 bridge 做 re-probe
+- 成功則回到 `READY`
+- 失敗則保留 `ATTACHED`，並把失敗原因留在 `last_error`
+
+若 session 狀態為 `READY` 且 bridge 仍有可用：
 
 1. 送 `Ctrl-C`
 2. 等 prompt
@@ -572,12 +578,13 @@ targets:
 
 - line mode 命令完成後 `stdout` 正確回填
 - background mode 可用 `result-tail` 取得後續 chunk
+- prompt timeout 後 `result-tail` 仍可查 terminal status / error_code 與已緩衝 chunk
 - interactive lease 可建立、送 key、關閉
 - 多 console attach 可同時收到 RX
 - human input 在 line-buffer 模式下經 broker 排隊；raw interactive 模式直接透傳 UART
 - 裝置 real_path 變更時會 reattach
 - `self_test` 可區分主要故障類型
-- `recover` 僅會走 `Ctrl-C -> Ctrl-D`
+- `recover` 會先對 `ATTACHED` bridge 做 re-probe；`READY` 才走 `Ctrl-C -> Ctrl-D`
 - agent 明確 reboot 後可重新回 `READY`
 - README / spec / CLI / MCP 命名一致
 

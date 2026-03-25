@@ -58,7 +58,7 @@ class TestBadCommandRecovery(unittest.TestCase):
         # Ctrl-C 後第二次 = True（prompt 回來）
         bridge.rx_snapshot_len.side_effect = [10, 20]
         bridge.wait_for_regex_from.side_effect = [False, True]
-        bridge.rx_text_from.return_value = "$ "
+        bridge.rx_text_from.return_value = "partial line\n$ "
 
         resp = mgr.execute_command("p:COM0", "cat", "agent:test", "cid-bad1", timeout_s=0.1)
 
@@ -69,6 +69,11 @@ class TestBadCommandRecovery(unittest.TestCase):
         bridge.send_bytes.assert_any_call(b"\x03", source="system:recover", cmd_id=None)
         # session 仍為 READY（recover 成功）
         self.assertEqual(session.state, "READY")
+        tail = mgr.get_background_result("cid-bad1")
+        self.assertTrue(tail["ok"])
+        self.assertEqual(tail["status"], "error")
+        self.assertEqual(tail["error_code"], "PROMPT_TIMEOUT_RECOVERED")
+        self.assertEqual(tail["chunks"], ["partial line"])
 
     def test_partial_output_hang_recover_then_next_command_works(self) -> None:
         """target 只回一半輸出就停 → timeout → recover → 下一個命令正常完成。"""
@@ -142,6 +147,7 @@ class TestBadCommandRecovery(unittest.TestCase):
         # 全部 wait_for_regex = False（連 Ctrl-C 後也沒回 prompt）
         bridge.rx_snapshot_len.side_effect = [10, 20, 30]
         bridge.wait_for_regex_from.side_effect = [False, False, False]
+        bridge.rx_text_from.return_value = "partial output only"
 
         resp = mgr.execute_command("p:COM0", "totally-broken", "agent:test", "cid-stuck", timeout_s=0.1)
 
@@ -151,6 +157,11 @@ class TestBadCommandRecovery(unittest.TestCase):
         # session 降級到 ATTACHED
         self.assertEqual(session.state, "ATTACHED")
         self.assertEqual(session.last_error, "PROMPT_TIMEOUT")
+        tail = mgr.get_background_result("cid-stuck")
+        self.assertTrue(tail["ok"])
+        self.assertEqual(tail["status"], "error")
+        self.assertEqual(tail["error_code"], "PROMPT_TIMEOUT")
+        self.assertEqual(tail["chunks"], ["partial output only"])
 
 
 if __name__ == "__main__":

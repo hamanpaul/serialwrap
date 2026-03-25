@@ -40,6 +40,29 @@ class ConsoleClient:
     tx_buffer: bytearray = dataclasses.field(default_factory=bytearray)
 
 
+@dataclasses.dataclass
+class PreservedConsoles:
+    clients: dict[str, ConsoleClient]
+    primary_client_id: str | None
+
+    def primary_vtty(self) -> str | None:
+        if self.primary_client_id is None:
+            return None
+        client = self.clients.get(self.primary_client_id)
+        return client.slave_path if client is not None else None
+
+    def has_client(self, client_id: str) -> bool:
+        return client_id in self.clients
+
+
+def _close_console_client_fds(client: ConsoleClient) -> None:
+    for fd in (client.master_fd, client.slave_fd):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 class UARTBridge:
     def __init__(
         self,
@@ -51,6 +74,7 @@ class UARTBridge:
         on_console_line: Callable[[str, str], None] | None = None,
         on_rx_data: Callable[[bytes], None] | None = None,
         on_bridge_down: Callable[[str], None] | None = None,
+        preserved_consoles: PreservedConsoles | None = None,
     ) -> None:
         self.com = com
         self.device_path = device_path
@@ -69,6 +93,7 @@ class UARTBridge:
         self._rx_lock = threading.Lock()
         self._rx_text = ""
         self._rx_max_chars = 131072
+        self._preserved_consoles = preserved_consoles
         self._clients: dict[str, ConsoleClient] = {}
         self._interactive_owner: str | None = None
         self._agent_active: bool = False
@@ -150,28 +175,47 @@ class UARTBridge:
         self._configure_serial(serial_fd)
         self._set_nonblock(serial_fd)
 
-        primary = self._create_console_client("primary")
         with self._state_lock:
+            preserved = self._preserved_consoles
+            self._preserved_consoles = None
+            if preserved is not None and preserved.clients:
+                clients = dict(preserved.clients)
+                primary_client_id = preserved.primary_client_id if preserved.primary_client_id in clients else None
+                if primary_client_id is None:
+                    next_client = next(iter(clients.values()), None)
+                    primary_client_id = next_client.client_id if next_client is not None else None
+            else:
+                primary = self._create_console_client("primary")
+                clients = {primary.client_id: primary}
+                primary_client_id = primary.client_id
             self._serial_fd = serial_fd
-            self._clients = {primary.client_id: primary}
-            self._primary_client_id = primary.client_id
+            self._clients = clients
+            self._primary_client_id = primary_client_id
 
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._loop, name=f"serialwrap-uart-{self.com}", daemon=True)
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self, *, preserve_consoles: bool = False) -> PreservedConsoles | None:
         self._stop_event.set()
         if self._thread and self._thread.is_alive() and threading.current_thread() is not self._thread:
             self._thread.join(timeout=2.0)
 
+        preserved: PreservedConsoles | None = None
         with self._state_lock:
             serial_fd = self._serial_fd
-            clients = list(self._clients.values())
+            if preserve_consoles and self._clients:
+                preserved = PreservedConsoles(clients=dict(self._clients), primary_client_id=self._primary_client_id)
+                clients_to_close: list[ConsoleClient] = []
+            else:
+                clients_to_close = list(self._clients.values())
             self._serial_fd = None
             self._clients = {}
             self._primary_client_id = None
             self._interactive_owner = None
+            self._suspended_owner = None
+            self._agent_active = False
+            self._deferred_buffers.clear()
 
         if serial_fd is not None:
             try:
@@ -179,15 +223,12 @@ class UARTBridge:
             except OSError:
                 pass
 
-        for client in clients:
+        for client in clients_to_close:
             self._close_console_client(client)
+        return preserved
 
     def _close_console_client(self, client: ConsoleClient) -> None:
-        for fd in (client.master_fd, client.slave_fd):
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+        _close_console_client_fds(client)
 
     def _client_has_external_peer_locked(self, client: ConsoleClient) -> bool:
         self_pid = os.getpid()
@@ -545,6 +586,10 @@ class UARTBridge:
             if client is None:
                 return False
             return self._client_has_external_peer_locked(client)
+
+    def has_console(self, client_id: str) -> bool:
+        with self._state_lock:
+            return client_id in self._clients
 
     def set_interactive_owner(self, owner: str | None) -> None:
         with self._state_lock:
