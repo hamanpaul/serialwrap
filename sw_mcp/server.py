@@ -33,6 +33,8 @@ _TOOL_MAP = {
     "serialwrap_log_start": "session.log_start",
     "serialwrap_log_stop": "session.log_stop",
     "serialwrap_log_status": "session.log_status",
+    "serialwrap_wal_reset": "wal.reset",
+    "serialwrap_wal_current_seq": "wal.current_seq",
 }
 
 

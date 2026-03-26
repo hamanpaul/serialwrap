@@ -595,6 +595,24 @@ serialwrap log tail-raw  --selector COM0 --from-seq 0 --limit 200
 serialwrap wal export --from-seq 0 --limit 500
 ```
 
+### WAL 管理
+
+```bash
+# 輪替現有 WAL 並重設 seq（daemon 不重啟，console 不斷線）
+serialwrap wal reset
+
+# 查詢目前 WAL seq（不需讀檔，無 race condition）
+serialwrap wal current-seq
+```
+
+`wal.reset` 會將現有 `raw.wal.ndjson` 與 `raw.mirror.log` 改名為 `*.{timestamp}` 歸檔，然後重新從 seq 0 開始寫入。此操作**不影響任何已連線的 console PTY**。
+
+### session.bind 冪等行為
+
+當 session 已綁定同一 `device_by_id` 且狀態為 `READY` 或 `ATTACHED` 時，重複呼叫 `session.bind` 不會 detach 現有 bridge 或銷毀 console PTY。回傳值包含 `"already_bound": true`。
+
+這使得外部 orchestrator（如 testpilot）可以安全地呼叫 `session bind` 而不必擔心打斷 human console。
+
 說明：
 
 - `log tail-text` 偏向人類閱讀，不輸出 metadata header。
@@ -630,6 +648,8 @@ serialwrap wal export --from-seq 0 --limit 500
 | `serialwrap_log_stop` | `session.log_stop` |
 | `serialwrap_log_status` | `session.log_status` |
 | `serialwrap_clear_session` | `session.clear` |
+| `serialwrap_wal_reset` | `wal.reset` |
+| `serialwrap_wal_current_seq` | `wal.current_seq` |
 
 ### Legacy alias
 
