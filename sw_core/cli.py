@@ -302,6 +302,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_we.add_argument("--from-seq", type=int, default=0)
     p_we.add_argument("--to-seq", type=int, default=0)
     p_we.add_argument("--limit", type=int, default=1000)
+    wal_sub.add_parser("reset")
+    wal_sub.add_parser("current-seq")
 
     return p
 
@@ -432,6 +434,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "wal" and args.wal_cmd == "export":
         return _run_rpc(args, "wal.range", {"from_seq": args.from_seq, "to_seq": args.to_seq, "limit": args.limit})
+
+    if args.cmd == "wal" and args.wal_cmd == "reset":
+        return _run_rpc(args, "wal.reset", {})
+
+    if args.cmd == "wal" and args.wal_cmd == "current-seq":
+        return _run_rpc(args, "wal.current_seq", {})
 
     _print({"ok": False, "error_code": "INVALID_ARGS"})
     return 2

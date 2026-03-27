@@ -410,6 +410,12 @@ class SerialwrapService:
                 rows = [r for r in rows if int(r.get("seq", 0)) <= to_seq]
             return {"ok": True, "records": rows}
 
+        if method == "wal.reset":
+            return self._wal.reset()
+
+        if method == "wal.current_seq":
+            return {"ok": True, "seq": self._wal.current_seq}
+
         if method == "session.log_start":
             selector = str(params.get("selector") or params.get("session_id") or params.get("com") or params.get("alias") or "")
             if not selector:

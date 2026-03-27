@@ -415,6 +415,13 @@ class SessionManager:
                         "device_by_id": device_by_id,
                         "session_id": other.session_id,
                     }
+            # 冪等：已綁定同 device 且 bridge 存在且 READY/ATTACHED → 不 detach
+            if (
+                session.bridge is not None
+                and session.profile.device_by_id == device_by_id
+                and session.state in ("READY", "ATTACHED")
+            ):
+                return {"ok": True, "already_bound": True, "session": session.to_public_dict()}
             if session.bridge is not None:
                 self._detach_session_locked(session, reason="REBOUND")
             session.profile = dataclasses.replace(session.profile, device_by_id=device_by_id)

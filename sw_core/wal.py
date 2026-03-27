@@ -108,6 +108,23 @@ class WalWriter:
                 mirror_fp.write(to_printable(payload))
         return record
 
+    def reset(self) -> dict[str, Any]:
+        """輪替現有 WAL 檔案並重設 seq 計數器。不需重啟 daemon。"""
+        with self._lock:
+            prev_seq = self._seq
+            ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+            for path in (self._wal_path, self._mirror_path):
+                if os.path.exists(path) and os.path.getsize(path) > 0:
+                    dst = f"{path}.{ts}"
+                    os.replace(path, dst)
+            dir_fd = os.open(self._wal_dir, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+            self._seq = 0
+            return {"ok": True, "previous_seq": prev_seq, "rotated_suffix": ts}
+
     def tail_raw(self, *, from_seq: int = 0, com: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         if not os.path.exists(self._wal_path):
