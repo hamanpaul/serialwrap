@@ -60,6 +60,11 @@
 - `serialwrap_submit_command`
   - 必填：`selector`, `cmd`
   - 建議：`source="agent:<name>"`, `mode="line|background|interactive"`, `timeout_s`, `priority`
+  - 命令長度限制：> 4 KB 會回 warning，> 16 KB 會被 reject (`CMD_TOO_LONG`)
+  - 長命令建議改用 file-based injection（見 `docs/design-file-transfer.md`）
+- `serialwrap_recover_session`
+  - 必填：`selector`
+  - 選填：`timeout_s`, `force`（布林，force=true 時自動 clear+reattach+wait-ready）
 - `serialwrap_get_command`
   - 必填：`cmd_id`
 - `serialwrap_tail_command_result`
@@ -81,6 +86,13 @@
 - 長流命令（`logread -f`, `tcpdump`, kernel debug）一律使用 `mode=background` 或限制 timeout，避免阻塞共享通道。
 - 每筆自動化命令必填 `source`，不可省略，確保追蹤性。
 - 卡住時先 `serialwrap_self_test`，再決定是否 `serialwrap_recover_session`。
+
+## 短命令原則（Best Practice）
+- **避免 heredoc**：heredoc 經 UART 傳輸時容易遺失字元或打亂 prompt，改用 `echo ... > file` 分步寫入。
+- **單行 < 2 KB**：每條命令盡量控制在 2 KB 以內，超過 4 KB 會收到 warning。
+- **避免 base64 inline**：不要將整個檔案 base64 編碼塞進 `cmd submit`，改用分段寫入或 file transfer（待實作）。
+- **長命令拆分**：管線命令過長時，先寫成 script 檔再 `source` 或 `sh /tmp/script.sh`。
+- **回復策略**：若命令導致 PROMPT_TIMEOUT，使用 `serialwrap_recover_session` (可加 `force=true`)。
 
 ## 最小可用 MCP 範例
 ```bash
