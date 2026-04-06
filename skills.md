@@ -26,7 +26,8 @@
 5. 提交命令：`serialwrap_submit_command`，必填 `source` 與 `selector`。
 6. 前景命令：`serialwrap_get_command` 直接取 `stdout`。
 7. 背景命令：`serialwrap_tail_command_result` 增量取回後續內容。
-8. 需要完整證據時，改拉 CLI `log tail-raw` / `wal export`。
+8. 若需要 focused 純文字 RX capture，可用 `serialwrap_log_start` / `serialwrap_log_status` / `serialwrap_log_stop`。
+9. 需要完整證據時，改拉 CLI `log tail-raw` / `wal export`；若只要查目前 WAL seq，可用 `serialwrap_wal_current_seq`。
 
 ## MCP Tool 對應
 - `serialwrap_get_health` -> `health.status`
@@ -48,6 +49,11 @@
 - `serialwrap_send_interactive_keys` -> `session.interactive_send`
 - `serialwrap_get_interactive_status` -> `session.interactive_status`
 - `serialwrap_close_interactive` -> `session.interactive_close`
+- `serialwrap_log_start` -> `session.log_start`
+- `serialwrap_log_stop` -> `session.log_stop`
+- `serialwrap_log_status` -> `session.log_status`
+- `serialwrap_wal_reset` -> `wal.reset`
+- `serialwrap_wal_current_seq` -> `wal.current_seq`
 - `serialwrap_tail_results` -> `result.tail`（deprecated alias）
 
 ## MCP 參數規範
@@ -61,6 +67,13 @@
   - 建議：`from_chunk`, `limit`
 - `serialwrap_get_session_state`
   - 必填：`selector`（`session_id | COMx | alias`）
+- `serialwrap_log_start`
+  - 必填：`selector`
+  - 選填：`log_dir`
+- `serialwrap_log_status`
+  - 必填：`selector`
+- `serialwrap_wal_current_seq`
+  - 不需參數
 
 ## 安全規則
 - 禁止 Agent 直接寫 `/dev/ttyUSB*` 或 `/dev/ttyACM*`。
@@ -77,4 +90,6 @@
 /home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_submit_command --params "{\"selector\":\"COM0\",\"cmd\":\"ifconfig\",\"source\":\"agent:diag\",\"mode\":\"line\"}"
 /home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_get_command --params "{\"cmd_id\":\"<cmd_id>\"}"
 /home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_tail_command_result --params "{\"cmd_id\":\"<cmd_id>\",\"from_chunk\":0,\"limit\":120}"
+/home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_log_status --params "{\"selector\":\"COM0\"}"
+/home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_wal_current_seq --params "{}"
 ```
