@@ -181,6 +181,8 @@ MCP 只是 RPC 的薄轉接層。新增或改名工具時，要把 `sw_mcp/serve
 - `serialwrap cmd result-tail`
 - `serialwrap_tail_command_result`
 
+其中 `serialwrap_tail_results` 目前固定對應 `result.tail` raw records，不會依 `cmd_id` 自動切到 `command.result_tail`。
+
 ### Python 風格慣例
 
 - Python 3.10+

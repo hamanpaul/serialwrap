@@ -655,7 +655,7 @@ serialwrap wal current-seq
 
 | Tool | 說明 |
 |------|------|
-| `serialwrap_tail_results` | 舊工具名。若帶 `cmd_id` 走 `command.result_tail`；若帶 `selector/from_seq` 走 legacy `result.tail` raw records。 |
+| `serialwrap_tail_results` | 舊工具名，固定對應 `result.tail` raw records。若要讀 `background` capture，請改用 `serialwrap_tail_command_result`。 |
 
 ### 範例
 

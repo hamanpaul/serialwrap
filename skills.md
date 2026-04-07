@@ -26,7 +26,8 @@
 5. 提交命令：`serialwrap_submit_command`，必填 `source` 與 `selector`。
 6. 前景命令：`serialwrap_get_command` 直接取 `stdout`。
 7. 背景命令：`serialwrap_tail_command_result` 增量取回後續內容。
-8. 需要完整證據時，改拉 CLI `log tail-raw` / `wal export`。
+8. 若需要 focused 純文字 RX capture，可用 `serialwrap_log_start` / `serialwrap_log_status` / `serialwrap_log_stop`。
+9. 需要完整證據時，改拉 CLI `log tail-raw` / `wal export`；若只要查目前 WAL seq，可用 `serialwrap_wal_current_seq`。
 
 ## MCP Tool 對應
 - `serialwrap_get_health` -> `health.status`
@@ -48,12 +49,22 @@
 - `serialwrap_send_interactive_keys` -> `session.interactive_send`
 - `serialwrap_get_interactive_status` -> `session.interactive_status`
 - `serialwrap_close_interactive` -> `session.interactive_close`
+- `serialwrap_log_start` -> `session.log_start`
+- `serialwrap_log_stop` -> `session.log_stop`
+- `serialwrap_log_status` -> `session.log_status`
+- `serialwrap_wal_reset` -> `wal.reset`
+- `serialwrap_wal_current_seq` -> `wal.current_seq`
 - `serialwrap_tail_results` -> `result.tail`（deprecated alias）
 
 ## MCP 參數規範
 - `serialwrap_submit_command`
   - 必填：`selector`, `cmd`
   - 建議：`source="agent:<name>"`, `mode="line|background|interactive"`, `timeout_s`, `priority`
+  - 命令長度限制：> 4 KB 會回 warning，> 16 KB 會被 reject (`CMD_TOO_LONG`)
+  - 長命令建議改用 file-based injection（見 `docs/design-file-transfer.md`）
+- `serialwrap_recover_session`
+  - 必填：`selector`
+  - 選填：`timeout_s`, `force`（布林，force=true 時自動 clear+reattach+wait-ready）
 - `serialwrap_get_command`
   - 必填：`cmd_id`
 - `serialwrap_tail_command_result`
@@ -61,6 +72,13 @@
   - 建議：`from_chunk`, `limit`
 - `serialwrap_get_session_state`
   - 必填：`selector`（`session_id | COMx | alias`）
+- `serialwrap_log_start`
+  - 必填：`selector`
+  - 選填：`log_dir`
+- `serialwrap_log_status`
+  - 必填：`selector`
+- `serialwrap_wal_current_seq`
+  - 不需參數
 
 ## 安全規則
 - 禁止 Agent 直接寫 `/dev/ttyUSB*` 或 `/dev/ttyACM*`。
@@ -68,6 +86,13 @@
 - 長流命令（`logread -f`, `tcpdump`, kernel debug）一律使用 `mode=background` 或限制 timeout，避免阻塞共享通道。
 - 每筆自動化命令必填 `source`，不可省略，確保追蹤性。
 - 卡住時先 `serialwrap_self_test`，再決定是否 `serialwrap_recover_session`。
+
+## 短命令原則（Best Practice）
+- **避免 heredoc**：heredoc 經 UART 傳輸時容易遺失字元或打亂 prompt，改用 `echo ... > file` 分步寫入。
+- **單行 < 2 KB**：每條命令盡量控制在 2 KB 以內，超過 4 KB 會收到 warning。
+- **避免 base64 inline**：不要將整個檔案 base64 編碼塞進 `cmd submit`，改用分段寫入或 file transfer（待實作）。
+- **長命令拆分**：管線命令過長時，先寫成 script 檔再 `source` 或 `sh /tmp/script.sh`。
+- **回復策略**：若命令導致 PROMPT_TIMEOUT，使用 `serialwrap_recover_session` (可加 `force=true`)。
 
 ## 最小可用 MCP 範例
 ```bash
@@ -77,4 +102,6 @@
 /home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_submit_command --params "{\"selector\":\"COM0\",\"cmd\":\"ifconfig\",\"source\":\"agent:diag\",\"mode\":\"line\"}"
 /home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_get_command --params "{\"cmd_id\":\"<cmd_id>\"}"
 /home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_tail_command_result --params "{\"cmd_id\":\"<cmd_id>\",\"from_chunk\":0,\"limit\":120}"
+/home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_log_status --params "{\"selector\":\"COM0\"}"
+/home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_wal_current_seq --params "{}"
 ```

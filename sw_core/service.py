@@ -228,9 +228,10 @@ class SerialwrapService:
         if method == "session.recover":
             selector = str(params.get("selector") or params.get("session_id") or params.get("com") or params.get("alias") or "")
             timeout_s = float(params.get("timeout_s") or 2.0)
+            force = bool(params.get("force"))
             if not selector:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
-            return self._sessions.recover_session(selector, timeout_s=timeout_s)
+            return self._sessions.recover_session(selector, timeout_s=timeout_s, force=force)
 
         if method == "session.clear":
             selector = str(

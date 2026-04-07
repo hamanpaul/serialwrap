@@ -1355,6 +1355,19 @@ class SessionManager:
                 error_code="PROMPT_TIMEOUT",
             )
         self._transition_to_attached(session, reason="PROMPT_TIMEOUT")
+
+        # Auto-fallback: try force clear + reattach when both CTRL_C/D fail
+        if source == "system:recover":
+            force_result = self._force_recover(session)
+            if force_result.get("recovered"):
+                return {
+                    "ok": True,
+                    "error_code": "PROMPT_TIMEOUT_FORCE_RECOVERED",
+                    "partial": True,
+                    "recovery_action": "FORCE_CLEAR_REATTACH",
+                    "session": force_result.get("session", {}),
+                }
+
         return {
             "ok": False,
             "error_code": "PROMPT_TIMEOUT",
@@ -1613,7 +1626,7 @@ class SessionManager:
                 "recommended_action": "none",
             }
 
-    def recover_session(self, selector: str, *, timeout_s: float = 2.0) -> dict[str, Any]:
+    def recover_session(self, selector: str, *, timeout_s: float = 2.0, force: bool = False) -> dict[str, Any]:
         reprobe = False
         with self._lock:
             session = self.get_session(selector)
@@ -1628,15 +1641,21 @@ class SessionManager:
                     return {"ok": True, "recovering": False, "action": "REATTACH", "session": session.to_public_dict()}
                 return {"ok": False, "error_code": "SESSION_NOT_READY", "session": session.to_public_dict()}
             if session.state == "ATTACHED":
+                if force:
+                    return self._force_recover(session)
                 bridge = session.bridge
                 reprobe = True
             elif session.state != "READY":
+                if force:
+                    return self._force_recover(session)
                 return {"ok": False, "error_code": "SESSION_NOT_READY", "session": session.to_public_dict()}
             else:
                 bridge = session.bridge
         if reprobe:
             result = self._probe_existing_bridge(session, bridge)
             if not result.get("ok"):
+                if force:
+                    return self._force_recover(session)
                 return result
             recovered = result["session"]["state"] == "READY"
             payload: dict[str, Any] = {
@@ -1648,6 +1667,8 @@ class SessionManager:
             }
             if not recovered:
                 payload["error_code"] = result["session"].get("last_error") or "SESSION_NOT_READY"
+                if force:
+                    return self._force_recover(session)
             return payload
         return self._recover_after_failure(
             session,
@@ -1659,6 +1680,31 @@ class SessionManager:
             prompt_regex=session.profile.prompt_regex,
             pre_offset=bridge.rx_snapshot_len(),
         )
+
+    def _force_recover(self, session: SessionRuntime) -> dict[str, Any]:
+        """Force recovery via clear + reattach + wait-ready."""
+        selector = session.session_id
+        self.clear_session(selector)
+        import time
+        for _ in range(10):
+            time.sleep(1.0)
+            state = self.get_session_state(selector)
+            if state.get("ok") and state.get("session", {}).get("state") == "READY":
+                return {
+                    "ok": True,
+                    "recovering": False,
+                    "action": "FORCE_CLEAR_REATTACH",
+                    "recovered": True,
+                    "session": state["session"],
+                }
+        state = self.get_session_state(selector)
+        return {
+            "ok": False,
+            "error_code": "FORCE_RECOVER_TIMEOUT",
+            "action": "FORCE_CLEAR_REATTACH",
+            "recovered": False,
+            "session": state.get("session", {}),
+        }
 
     def get_background_result(self, cmd_id: str, *, from_chunk: int = 0, limit: int = 200) -> dict[str, Any]:
         with self._lock:

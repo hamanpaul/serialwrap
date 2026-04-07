@@ -488,13 +488,15 @@ Agent 可透過 `session.log_start` / `session.log_stop` 對特定 session 啟�
 - `serialwrap_log_start` -> `session.log_start`
 - `serialwrap_log_stop` -> `session.log_stop`
 - `serialwrap_log_status` -> `session.log_status`
+- `serialwrap_wal_reset` -> `wal.reset`
+- `serialwrap_wal_current_seq` -> `wal.current_seq`
 - `serialwrap_clear_session` -> `session.clear`
 
 相容 alias：
 
 - `serialwrap_tail_results` -> `result.tail`
-  - 帶 `cmd_id` 時，回到 `command.result_tail` 語義
-  - 帶 `selector/from_seq` 時，維持 legacy raw result tail
+  - 固定維持 legacy raw result tail
+  - 若要讀 `background` capture，請改用 `serialwrap_tail_command_result`
 
 ## 12. `minicom_router.sh` 行為
 

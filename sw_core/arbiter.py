@@ -9,6 +9,9 @@ from typing import Any, Callable
 
 from .util import now_iso
 
+CMD_WARN_BYTES = 4096
+CMD_REJECT_BYTES = 16384
+
 
 @dataclasses.dataclass(order=True)
 class _QueuedCommand:
@@ -68,6 +71,24 @@ class CommandArbiter:
         timeout_s: float,
         priority: int = 10,
     ) -> dict[str, Any]:
+        cmd_len = len(command.encode("utf-8", errors="replace"))
+        if cmd_len > CMD_REJECT_BYTES:
+            return {
+                "ok": False,
+                "error_code": "CMD_TOO_LONG",
+                "cmd_length": cmd_len,
+                "limit": CMD_REJECT_BYTES,
+                "hint": "Command exceeds 16 KB hard limit. Use file-based injection or split into smaller commands.",
+            }
+        cmd_warning = None
+        if cmd_len > CMD_WARN_BYTES:
+            cmd_warning = {
+                "code": "CMD_LENGTH_WARNING",
+                "cmd_length": cmd_len,
+                "soft_limit": CMD_WARN_BYTES,
+                "hint": "Command exceeds 4 KB soft limit. Long commands may cause UART buffer overflow or prompt timeout.",
+            }
+
         with self._lock:
             pq = self._queues.get(session_id)
             if pq is None:
@@ -101,7 +122,10 @@ class CommandArbiter:
         with self._lock:
             self._commands[cmd_id] = rec
         pq.put(_QueuedCommand(sort_key=(priority, counter), cmd_id=cmd_id, session_id=session_id, command=command, source=source, mode=mode, timeout_s=timeout_s))
-        return {"ok": True, "cmd_id": cmd_id, "status": "accepted", "session_id": session_id}
+        result: dict[str, Any] = {"ok": True, "cmd_id": cmd_id, "status": "accepted", "session_id": session_id}
+        if cmd_warning is not None:
+            result["warning"] = cmd_warning
+        return result
 
     def get(self, cmd_id: str) -> dict[str, Any]:
         with self._lock:

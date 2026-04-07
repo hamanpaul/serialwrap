@@ -215,6 +215,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_sr = sess_sub.add_parser("recover")
     p_sr.add_argument("--selector", required=True, help="session_id | COMx | alias")
     p_sr.add_argument("--timeout", dest="recover_timeout_s", type=float, default=2.0)
+    p_sr.add_argument("--force", action="store_true", help="force clear+reattach if normal recovery fails")
     p_sca = sess_sub.add_parser("console-attach")
     p_sca.add_argument("--selector", required=True, help="session_id | COMx | alias")
     p_sca.add_argument("--label")
@@ -335,7 +336,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.session_cmd == "self-test":
             return _run_rpc(args, "session.self_test", {"selector": args.selector, "timeout_s": args.probe_timeout_s})
         if args.session_cmd == "recover":
-            return _run_rpc(args, "session.recover", {"selector": args.selector, "timeout_s": args.recover_timeout_s})
+            return _run_rpc(args, "session.recover", {"selector": args.selector, "timeout_s": args.recover_timeout_s, "force": getattr(args, "force", False)})
         if args.session_cmd == "console-attach":
             params: dict[str, Any] = {"selector": args.selector}
             if args.label:
