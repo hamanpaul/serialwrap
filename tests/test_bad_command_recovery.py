@@ -54,9 +54,9 @@ class TestBadCommandRecovery(unittest.TestCase):
         """壞命令（如 cat 不帶 EOF）→ prompt timeout → Ctrl-C recover → 回 READY。"""
         mgr, session, bridge = self._setup_ready_session()
 
-        # 第一次 wait_for_regex = False（命令卡住）
-        # Ctrl-C 後第二次 = True（prompt 回來）
-        bridge.rx_snapshot_len.side_effect = [10, 20]
+        # keepalive 迴圈：pre_offset(10), pre_rx(10), wait→False, silence_check(10)→靜默
+        # 進入 recover：CTRL_C offset(20), wait→True
+        bridge.rx_snapshot_len.side_effect = [10, 10, 10, 20]
         bridge.wait_for_regex_from.side_effect = [False, True]
         bridge.rx_text_from.return_value = "partial line\n$ "
 
@@ -80,7 +80,9 @@ class TestBadCommandRecovery(unittest.TestCase):
         mgr, session, bridge = self._setup_ready_session()
 
         # --- 壞命令 ---
-        bridge.rx_snapshot_len.side_effect = [10, 20]
+        # keepalive 迴圈：pre_offset(10), pre_rx(10), wait→False, silence_check(10)→靜默
+        # 進入 recover：CTRL_C offset(20), wait→True
+        bridge.rx_snapshot_len.side_effect = [10, 10, 10, 20]
         bridge.wait_for_regex_from.side_effect = [False, True]
         bridge.rx_text_from.return_value = "$ "
 
@@ -118,7 +120,9 @@ class TestBadCommandRecovery(unittest.TestCase):
         mgr, session, bridge = self._setup_ready_session()
 
         for i in range(3):
-            bridge.rx_snapshot_len.side_effect = [10 + i, 20 + i]
+            # keepalive 迴圈：pre_offset, pre_rx, wait→False, silence_check→靜默
+            # 進入 recover：CTRL_C offset, wait→True
+            bridge.rx_snapshot_len.side_effect = [10 + i, 10 + i, 10 + i, 20 + i]
             bridge.wait_for_regex_from.side_effect = [False, True]
             bridge.rx_text_from.return_value = "$ "
 
@@ -145,7 +149,9 @@ class TestBadCommandRecovery(unittest.TestCase):
         mgr, session, bridge = self._setup_ready_session()
 
         # 全部 wait_for_regex = False（連 Ctrl-C 後也沒回 prompt）
-        bridge.rx_snapshot_len.side_effect = [10, 20, 30]
+        # keepalive 迴圈：pre_offset(10), pre_rx(10), wait→False, silence_check(10)→靜默
+        # recover：CTRL_C offset(20), wait→False, CTRL_D offset(30), wait→False
+        bridge.rx_snapshot_len.side_effect = [10, 10, 10, 20, 30]
         bridge.wait_for_regex_from.side_effect = [False, False, False]
         bridge.rx_text_from.return_value = "partial output only"
 

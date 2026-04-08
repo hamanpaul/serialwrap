@@ -104,7 +104,9 @@ class TestSessionBind(unittest.TestCase):
         assert session is not None
 
         bridge = mock.MagicMock()
-        bridge.rx_snapshot_len.side_effect = [10, 20]
+        # keepalive 迴圈：pre_offset(10), pre_rx(10), wait→False, silence_check(10)→靜默
+        # recover：CTRL_C offset(20), wait→True
+        bridge.rx_snapshot_len.side_effect = [10, 10, 10, 20]
         bridge.wait_for_regex_from.side_effect = [False, True]
         bridge.rx_text_from.return_value = "# "
         session.bridge = bridge
@@ -129,7 +131,9 @@ class TestSessionBind(unittest.TestCase):
         assert session is not None
 
         bridge = mock.MagicMock()
-        bridge.rx_snapshot_len.side_effect = [10, 20, 30]
+        # keepalive 迴圈：pre_offset(10), pre_rx(10), wait→False, silence_check(10)→靜默
+        # recover：CTRL_C offset(20), wait→False, CTRL_D offset(30), wait→False
+        bridge.rx_snapshot_len.side_effect = [10, 10, 10, 20, 30]
         bridge.wait_for_regex_from.side_effect = [False, False, False]
         bridge.rx_text_from.return_value = "partial output"
         session.bridge = bridge

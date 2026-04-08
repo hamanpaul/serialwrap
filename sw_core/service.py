@@ -131,8 +131,8 @@ class SerialwrapService:
     def _on_detached(self, session_id: str) -> None:
         self._arbiter.unregister_session(session_id)
 
-    def _send_cb(self, session_id: str, command: str, source: str, cmd_id: str, timeout_s: float, mode: str) -> dict[str, Any]:
-        return self._sessions.execute_command(session_id, command, source, cmd_id, timeout_s=timeout_s, mode=mode)
+    def _send_cb(self, session_id: str, command: str, source: str, cmd_id: str, timeout_s: float, mode: str, expected_duration_s: float | None = None) -> dict[str, Any]:
+        return self._sessions.execute_command(session_id, command, source, cmd_id, timeout_s=timeout_s, mode=mode, expected_duration_s=expected_duration_s)
 
     def _on_console_line(self, session_id: str, client_id: str, line: str) -> None:
         mode = _human_console_mode(line)
@@ -369,6 +369,8 @@ class SerialwrapService:
             mode = str(params.get("mode") or "line")
             timeout_s = float(params.get("timeout_s") or 10.0)
             priority = int(params.get("priority") or 10)
+            raw_ed = params.get("expected_duration_s")
+            expected_duration_s: float | None = float(raw_ed) if raw_ed is not None else None
             if not selector:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
             session_id, err = self._resolve_session_id(selector)
@@ -382,6 +384,7 @@ class SerialwrapService:
                 mode=mode,
                 timeout_s=timeout_s,
                 priority=priority,
+                expected_duration_s=expected_duration_s,
             )
 
         if method == "command.get":
@@ -474,5 +477,41 @@ class SerialwrapService:
             if not selector:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
             return self._sessions.log_status(selector)
+
+        if method == "file.push":
+            selector = str(params.get("selector") or "")
+            local_path = str(params.get("local_path") or "")
+            remote_path = str(params.get("remote_path") or "")
+            chunk_size = int(params.get("chunk_size") or 2048)
+            source = str(params.get("source") or "agent")
+            if not selector or not local_path or not remote_path:
+                return {"ok": False, "error_code": "INVALID_ARGS"}
+            session_id, err = self._resolve_session_id(selector)
+            if err is not None:
+                return err
+            return self._sessions.file_push(
+                selector,
+                local_path=local_path,
+                remote_path=remote_path,
+                chunk_size=chunk_size,
+                source=source,
+            )
+
+        if method == "file.pull":
+            selector = str(params.get("selector") or "")
+            remote_path = str(params.get("remote_path") or "")
+            local_path = params.get("local_path")
+            source = str(params.get("source") or "agent")
+            if not selector or not remote_path:
+                return {"ok": False, "error_code": "INVALID_ARGS"}
+            session_id, err = self._resolve_session_id(selector)
+            if err is not None:
+                return err
+            return self._sessions.file_pull(
+                selector,
+                remote_path=remote_path,
+                local_path=str(local_path) if local_path else None,
+                source=source,
+            )
 
         return {"ok": False, "error_code": "METHOD_NOT_FOUND", "method": method}

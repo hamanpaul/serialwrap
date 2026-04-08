@@ -111,6 +111,8 @@ class SessionRuntime:
     retained_consoles: PreservedConsoles | None = None
     retained_human_owner: str | None = None
     retained_human_timeout_s: float | None = None
+    fg_cmd_started_mono: float | None = None
+    fg_cmd_expected_duration_s: float | None = None
 
     def to_public_dict(self) -> dict[str, Any]:
         console_count = 0
@@ -138,6 +140,8 @@ class SessionRuntime:
             "bridge_generation": self.bridge_generation,
             "recovering": self.recovering,
             "interactive_session_id": self.interactive_session_id,
+            "foreground_busy": self.foreground_busy,
+            "fg_cmd_expected_duration_s": self.fg_cmd_expected_duration_s,
             "console_count": console_count,
             "capture": {
                 "capture_id": self.active_capture.capture_id,
@@ -1174,6 +1178,7 @@ class SessionManager:
         *,
         timeout_s: float = 10.0,
         mode: str = "line",
+        expected_duration_s: float | None = None,
     ) -> dict[str, Any]:
         normalized_mode = {"fg": "line", "bg": "background"}.get(mode, mode)
         suspend_human_interactive = False
@@ -1200,6 +1205,7 @@ class SessionManager:
                 session, bridge, command, source, cmd_id,
                 timeout_s=timeout_s, normalized_mode=normalized_mode,
                 prompt_regex=prompt_regex,
+                expected_duration_s=expected_duration_s,
             )
         finally:
             if suspend_human_interactive:
@@ -1216,6 +1222,7 @@ class SessionManager:
         timeout_s: float,
         normalized_mode: str,
         prompt_regex: str,
+        expected_duration_s: float | None = None,
     ) -> dict[str, Any]:
         if normalized_mode == "interactive":
             with self._lock:
@@ -1236,6 +1243,8 @@ class SessionManager:
 
         with self._lock:
             session.foreground_busy = True
+            session.fg_cmd_started_mono = time.monotonic()
+            session.fg_cmd_expected_duration_s = expected_duration_s
             if normalized_mode != "background":
                 for bg_cmd_id in list(session.background_cmd_ids):
                     capture = self._background.get(bg_cmd_id)
@@ -1255,10 +1264,34 @@ class SessionManager:
             finally:
                 with self._lock:
                     session.foreground_busy = False
+                    session.fg_cmd_started_mono = None
+                    session.fg_cmd_expected_duration_s = None
         pre_offset = bridge.rx_snapshot_len()
         try:
             bridge.send_command(command, source=source, cmd_id=cmd_id)
-            if not bridge.wait_for_regex_from(prompt_regex, pre_offset, timeout_s):
+
+            # — heartbeat / keepalive 迴圈 —
+            effective_timeout = timeout_s
+            if expected_duration_s is not None:
+                effective_timeout = max(timeout_s, expected_duration_s)
+            silence_limit = min(timeout_s, 30.0)
+            deadline = time.monotonic() + effective_timeout
+            matched = False
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                wait_chunk = min(silence_limit, remaining)
+                pre_rx = bridge.rx_snapshot_len()
+                if bridge.wait_for_regex_from(prompt_regex, pre_offset, wait_chunk):
+                    matched = True
+                    break
+                if bridge.rx_snapshot_len() == pre_rx:
+                    # 真正靜默，不再等待
+                    break
+                # 有 RX 活動，繼續等待
+
+            if not matched:
                 return self._recover_after_failure(
                     session,
                     bridge,
@@ -1294,6 +1327,8 @@ class SessionManager:
         finally:
             with self._lock:
                 session.foreground_busy = False
+                session.fg_cmd_started_mono = None
+                session.fg_cmd_expected_duration_s = None
 
     def _recover_after_failure(
         self,
@@ -1822,3 +1857,97 @@ class SessionManager:
                 "started_at": cap.started_at,
                 "session": session.to_public_dict(),
             }
+
+    # ── 檔案傳輸 ──────────────────────────────────────────────
+
+    def file_push(
+        self,
+        selector: str,
+        *,
+        local_path: str,
+        remote_path: str,
+        chunk_size: int = 2048,
+        source: str = "agent",
+    ) -> dict[str, Any]:
+        """將 host 端檔案推送到 target。"""
+        from .file_transfer import push_file
+
+        suspend_human_interactive = False
+        with self._lock:
+            session = self.get_session(selector)
+            if session is None or session.bridge is None or session.state != "READY":
+                return {"ok": False, "error_code": "SESSION_NOT_READY"}
+            if session.recovering:
+                return {"ok": False, "error_code": "SESSION_RECOVERING"}
+            lease = self._refresh_interactive_locked(session)
+            if lease is not None:
+                if not source.startswith("human:") and lease.owner.startswith("human:"):
+                    suspend_human_interactive = True
+                else:
+                    return {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY"}
+            bridge = session.bridge
+            prompt_regex = session.profile.prompt_regex
+            session.foreground_busy = True
+
+        if suspend_human_interactive:
+            bridge.suspend_interactive()
+        try:
+            return push_file(
+                bridge,
+                local_path,
+                remote_path,
+                chunk_size=chunk_size,
+                timeout_s=10.0,
+                prompt_regex=prompt_regex,
+                source=source,
+            )
+        finally:
+            with self._lock:
+                session.foreground_busy = False
+            if suspend_human_interactive:
+                bridge.resume_interactive()
+
+    def file_pull(
+        self,
+        selector: str,
+        *,
+        remote_path: str,
+        local_path: str | None = None,
+        source: str = "agent",
+    ) -> dict[str, Any]:
+        """從 target 拉取檔案到 host。"""
+        from .file_transfer import pull_file
+
+        suspend_human_interactive = False
+        with self._lock:
+            session = self.get_session(selector)
+            if session is None or session.bridge is None or session.state != "READY":
+                return {"ok": False, "error_code": "SESSION_NOT_READY"}
+            if session.recovering:
+                return {"ok": False, "error_code": "SESSION_RECOVERING"}
+            lease = self._refresh_interactive_locked(session)
+            if lease is not None:
+                if not source.startswith("human:") and lease.owner.startswith("human:"):
+                    suspend_human_interactive = True
+                else:
+                    return {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY"}
+            bridge = session.bridge
+            prompt_regex = session.profile.prompt_regex
+            session.foreground_busy = True
+
+        if suspend_human_interactive:
+            bridge.suspend_interactive()
+        try:
+            return pull_file(
+                bridge,
+                remote_path,
+                local_path,
+                timeout_s=30.0,
+                prompt_regex=prompt_regex,
+                source=source,
+            )
+        finally:
+            with self._lock:
+                session.foreground_busy = False
+            if suspend_human_interactive:
+                bridge.resume_interactive()
