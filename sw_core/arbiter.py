@@ -22,10 +22,11 @@ class _QueuedCommand:
     source: str = dataclasses.field(compare=False)
     mode: str = dataclasses.field(compare=False)
     timeout_s: float = dataclasses.field(compare=False)
+    expected_duration_s: float | None = dataclasses.field(default=None, compare=False)
 
 
 class CommandArbiter:
-    def __init__(self, send_cb: Callable[[str, str, str, str, float, str], dict[str, Any]]) -> None:
+    def __init__(self, send_cb: Callable[[str, str, str, str, float, str, float | None], dict[str, Any]]) -> None:
         self._send_cb = send_cb
         self._lock = threading.Lock()
         self._queues: dict[str, queue.PriorityQueue[_QueuedCommand]] = {}
@@ -55,7 +56,7 @@ class CommandArbiter:
             stop.set()
         if pq:
             try:
-                pq.put_nowait(_QueuedCommand(sort_key=(0, 0), cmd_id="", session_id="", command="", source="", mode="", timeout_s=0.0))
+                pq.put_nowait(_QueuedCommand(sort_key=(0, 0), cmd_id="", session_id="", command="", source="", mode="", timeout_s=0.0, expected_duration_s=None))
             except Exception:
                 pass
         if th and th.is_alive() and th is not threading.current_thread():
@@ -70,6 +71,7 @@ class CommandArbiter:
         mode: str,
         timeout_s: float,
         priority: int = 10,
+        expected_duration_s: float | None = None,
     ) -> dict[str, Any]:
         cmd_len = len(command.encode("utf-8", errors="replace"))
         if cmd_len > CMD_REJECT_BYTES:
@@ -106,6 +108,7 @@ class CommandArbiter:
             "mode": mode,
             "execution_mode": {"fg": "line", "bg": "background"}.get(mode, mode),
             "timeout_s": timeout_s,
+            "expected_duration_s": expected_duration_s,
             "priority": priority,
             "status": "accepted",
             "created_at": now,
@@ -121,7 +124,7 @@ class CommandArbiter:
         }
         with self._lock:
             self._commands[cmd_id] = rec
-        pq.put(_QueuedCommand(sort_key=(priority, counter), cmd_id=cmd_id, session_id=session_id, command=command, source=source, mode=mode, timeout_s=timeout_s))
+        pq.put(_QueuedCommand(sort_key=(priority, counter), cmd_id=cmd_id, session_id=session_id, command=command, source=source, mode=mode, timeout_s=timeout_s, expected_duration_s=expected_duration_s))
         result: dict[str, Any] = {"ok": True, "cmd_id": cmd_id, "status": "accepted", "session_id": session_id}
         if cmd_warning is not None:
             result["warning"] = cmd_warning
@@ -166,7 +169,7 @@ class CommandArbiter:
                 rec["started_at"] = now_iso()
 
             try:
-                result = self._send_cb(session_id, item.command, item.source, item.cmd_id, item.timeout_s, item.mode)
+                result = self._send_cb(session_id, item.command, item.source, item.cmd_id, item.timeout_s, item.mode, item.expected_duration_s)
             except Exception:
                 with self._lock:
                     rec = self._commands.get(item.cmd_id)

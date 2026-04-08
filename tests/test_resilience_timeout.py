@@ -15,7 +15,7 @@ from sw_core.arbiter import CommandArbiter
 class TestCommandCancel(unittest.TestCase):
     """Arbiter cancel() 的各種情境。"""
 
-    def _slow_cb(self, session_id, command, source, cmd_id, timeout_s, mode):
+    def _slow_cb(self, session_id, command, source, cmd_id, timeout_s, mode, expected_duration_s=None):
         """模擬慢命令，用 Event 控制完成。"""
         self._exec_started.set()
         self._exec_gate.wait(timeout=10.0)
@@ -109,7 +109,7 @@ class TestCommandCancel(unittest.TestCase):
         call_log: list[str] = []
         original_cb = self._slow_cb
 
-        def tracking_cb(session_id, command, source, cmd_id, timeout_s, mode):
+        def tracking_cb(session_id, command, source, cmd_id, timeout_s, mode, expected_duration_s=None):
             call_log.append(command)
             return {"ok": True, "stdout": f"done:{command}"}
 

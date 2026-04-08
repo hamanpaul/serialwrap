@@ -27,7 +27,7 @@ class TestMultiAgentArbiter(unittest.TestCase):
         results: list[str] = []
         gate = threading.Event()
 
-        def slow_cb(session_id, command, source, cmd_id, timeout_s, mode):
+        def slow_cb(session_id, command, source, cmd_id, timeout_s, mode, expected_duration_s=None):
             if command == "slow":
                 gate.wait(timeout=10.0)
             results.append(command)
@@ -69,7 +69,7 @@ class TestMultiAgentArbiter(unittest.TestCase):
         """3 agents 各送 good/bad/good，bad 觸發錯誤但不阻塞後續。"""
         exec_log: list[str] = []
 
-        def cb(session_id, command, source, cmd_id, timeout_s, mode):
+        def cb(session_id, command, source, cmd_id, timeout_s, mode, expected_duration_s=None):
             exec_log.append(f"{source}:{command}")
             if "bad" in command:
                 return {"ok": False, "error_code": "PROMPT_TIMEOUT", "stdout": ""}
@@ -114,7 +114,7 @@ class TestMultiAgentArbiter(unittest.TestCase):
         a_started = threading.Event()
         a_gate = threading.Event()
 
-        def cb(session_id, command, source, cmd_id, timeout_s, mode):
+        def cb(session_id, command, source, cmd_id, timeout_s, mode, expected_duration_s=None):
             if source == "agent:A":
                 a_started.set()
                 a_gate.wait(timeout=10.0)
@@ -155,7 +155,7 @@ class TestMultiAgentArbiter(unittest.TestCase):
         exec_order: list[str] = []
         gate = threading.Event()
 
-        def cb(session_id, command, source, cmd_id, timeout_s, mode):
+        def cb(session_id, command, source, cmd_id, timeout_s, mode, expected_duration_s=None):
             if command == "blocker":
                 gate.wait(timeout=10.0)
             exec_order.append(command)
