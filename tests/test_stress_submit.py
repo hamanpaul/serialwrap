@@ -32,7 +32,8 @@ class TestStressSubmit(unittest.TestCase):
         lock = threading.Lock()
 
         def cb(session_id: str, command: str, source: str,
-               cmd_id: str, timeout_s: float, mode: str) -> dict[str, Any]:
+               cmd_id: str, timeout_s: float, mode: str,
+               expected_duration_s: float | None = None) -> dict[str, Any]:
             if delay > 0:
                 time.sleep(delay)
             with lock:

@@ -44,6 +44,8 @@ _TOOL_MAP = {
     "serialwrap_ping": "health.ping",
     "serialwrap_log_tail_text": "log.tail_text",
     "serialwrap_wal_range": "wal.range",
+    "serialwrap_file_push": "file.push",
+    "serialwrap_file_pull": "file.pull",
 }
 
 # ── 型別縮寫 ──────────────────────────────────────────────────
@@ -258,6 +260,28 @@ _TOOL_DEFS: list[dict[str, Any]] = [
     ),
     _td("serialwrap_wal_reset", "重設 WAL（清除所有記錄）"),
     _td("serialwrap_wal_current_seq", "取得目前 WAL 序號"),
+    # ── File Transfer ────────────────────────────────────────────
+    _td(
+        "serialwrap_file_push",
+        "將本地檔案推送到 target 裝置",
+        {
+            "selector": _STR,
+            "local_path": _STR,
+            "remote_path": _STR,
+            "chunk_size": _INT,
+        },
+        ["selector", "local_path", "remote_path"],
+    ),
+    _td(
+        "serialwrap_file_pull",
+        "從 target 裝置拉取檔案到本地",
+        {
+            "selector": _STR,
+            "remote_path": _STR,
+            "local_path": _STR,
+        },
+        ["selector", "remote_path"],
+    ),
 ]
 
 

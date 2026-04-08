@@ -267,6 +267,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_cs.add_argument("--mode", default="line")
     p_cs.add_argument("--priority", type=int, default=10)
     p_cs.add_argument("--cmd-timeout", dest="cmd_timeout_s", type=float, default=10.0)
+    p_cs.add_argument("--expected-duration", dest="expected_duration_s", type=float, default=None)
     p_cg = cmd_sub.add_parser("status")
     p_cg.add_argument("--cmd-id", required=True)
     p_cr = cmd_sub.add_parser("result-tail")
@@ -296,6 +297,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_lt.add_argument("--com")
     p_lt.add_argument("--from-seq", type=int, default=0)
     p_lt.add_argument("--limit", type=int, default=200)
+
+    p_file = sub.add_parser("file")
+    file_sub = p_file.add_subparsers(dest="file_cmd", required=True)
+    p_fp = file_sub.add_parser("push")
+    p_fp.add_argument("--selector", required=True)
+    p_fp.add_argument("--local", required=True)
+    p_fp.add_argument("--remote", required=True)
+    p_fp.add_argument("--chunk-size", dest="chunk_size", type=int, default=2048)
+    p_fp.add_argument("--source", default="agent")
+    p_fl = file_sub.add_parser("pull")
+    p_fl.add_argument("--selector", required=True)
+    p_fl.add_argument("--remote", required=True)
+    p_fl.add_argument("--local", default=None)
+    p_fl.add_argument("--source", default="agent")
 
     p_wal = sub.add_parser("wal")
     wal_sub = p_wal.add_subparsers(dest="wal_cmd", required=True)
@@ -393,18 +408,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "cmd":
         if args.cmd_cmd == "submit":
-            return _run_rpc(
-                args,
-                "command.submit",
-                {
-                    "selector": args.selector,
-                    "cmd": args.command_text,
-                    "source": args.source,
-                    "mode": args.mode,
-                    "priority": args.priority,
-                    "timeout_s": args.cmd_timeout_s,
-                },
-            )
+            submit_params: dict[str, Any] = {
+                "selector": args.selector,
+                "cmd": args.command_text,
+                "source": args.source,
+                "mode": args.mode,
+                "priority": args.priority,
+                "timeout_s": args.cmd_timeout_s,
+            }
+            if args.expected_duration_s is not None:
+                submit_params["expected_duration_s"] = args.expected_duration_s
+            return _run_rpc(args, "command.submit", submit_params)
         if args.cmd_cmd == "status":
             return _run_rpc(args, "command.get", {"cmd_id": args.cmd_id})
         if args.cmd_cmd == "result-tail":
@@ -432,6 +446,29 @@ def main(argv: list[str] | None = None) -> int:
             return _run_rpc(args, "log.tail_raw", params)
         if args.log_cmd == "tail-text":
             return _run_rpc(args, "log.tail_text", params)
+
+    if args.cmd == "file":
+        if args.file_cmd == "push":
+            return _run_rpc(
+                args,
+                "file.push",
+                {
+                    "selector": args.selector,
+                    "local_path": args.local,
+                    "remote_path": args.remote,
+                    "chunk_size": args.chunk_size,
+                    "source": args.source,
+                },
+            )
+        if args.file_cmd == "pull":
+            p: dict[str, Any] = {
+                "selector": args.selector,
+                "remote_path": args.remote,
+                "source": args.source,
+            }
+            if args.local is not None:
+                p["local_path"] = args.local
+            return _run_rpc(args, "file.pull", p)
 
     if args.cmd == "wal" and args.wal_cmd == "export":
         return _run_rpc(args, "wal.range", {"from_seq": args.from_seq, "to_seq": args.to_seq, "limit": args.limit})

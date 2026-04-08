@@ -131,8 +131,8 @@ class SerialwrapService:
     def _on_detached(self, session_id: str) -> None:
         self._arbiter.unregister_session(session_id)
 
-    def _send_cb(self, session_id: str, command: str, source: str, cmd_id: str, timeout_s: float, mode: str) -> dict[str, Any]:
-        return self._sessions.execute_command(session_id, command, source, cmd_id, timeout_s=timeout_s, mode=mode)
+    def _send_cb(self, session_id: str, command: str, source: str, cmd_id: str, timeout_s: float, mode: str, expected_duration_s: float | None = None) -> dict[str, Any]:
+        return self._sessions.execute_command(session_id, command, source, cmd_id, timeout_s=timeout_s, mode=mode, expected_duration_s=expected_duration_s)
 
     def _on_console_line(self, session_id: str, client_id: str, line: str) -> None:
         mode = _human_console_mode(line)
@@ -144,6 +144,40 @@ class SerialwrapService:
             timeout_s=30.0,
             priority=100,
         )
+
+    def _bg_fallback_from_arbiter(
+        self, cmd_id: str, from_chunk: int = 0,
+    ) -> dict[str, Any]:
+        """BackgroundCapture 尚未建立時，以 arbiter 狀態合成 result_tail 回應。
+
+        當 background 命令已被 arbiter 接受但 worker 尚未執行完畢（或
+        執行失敗導致 BackgroundCapture 從未建立），回傳帶有 arbiter
+        狀態的空 chunks 回應，避免 caller 收到 CMD_NOT_FOUND。
+        """
+        arb_result = self._arbiter.get(cmd_id)
+        if not arb_result.get("ok"):
+            return {"ok": False, "error_code": "CMD_NOT_FOUND", "cmd_id": cmd_id}
+        cmd_rec = arb_result["command"]
+        if cmd_rec.get("execution_mode") != "background":
+            return {"ok": False, "error_code": "CMD_NOT_FOUND", "cmd_id": cmd_id}
+        status = cmd_rec["status"]
+        # done 狀態應有 BackgroundCapture；若缺失代表內部異常，不遮蓋
+        if status == "done":
+            return {"ok": False, "error_code": "CMD_NOT_FOUND", "cmd_id": cmd_id}
+        # canceled 若已開始執行，capture 可能稍後建立，不能提前宣告終止
+        if status == "canceled" and cmd_rec.get("started_at") is not None:
+            return {"ok": False, "error_code": "CMD_NOT_FOUND", "cmd_id": cmd_id}
+        return {
+            "ok": True,
+            "cmd_id": cmd_id,
+            "status": status,
+            "error_code": cmd_rec.get("error_code"),
+            "from_seq": 0,  # pre-capture sentinel，非真實 WAL 邊界
+            "last_seq": 0,
+            "from_chunk": from_chunk,
+            "next_chunk": from_chunk,
+            "chunks": [],
+        }
 
     def _on_device_change(self, _added, _removed) -> None:
         self._sessions.update_devices(self._watcher.devices)
@@ -335,6 +369,8 @@ class SerialwrapService:
             mode = str(params.get("mode") or "line")
             timeout_s = float(params.get("timeout_s") or 10.0)
             priority = int(params.get("priority") or 10)
+            raw_ed = params.get("expected_duration_s")
+            expected_duration_s: float | None = float(raw_ed) if raw_ed is not None else None
             if not selector:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
             session_id, err = self._resolve_session_id(selector)
@@ -348,6 +384,7 @@ class SerialwrapService:
                 mode=mode,
                 timeout_s=timeout_s,
                 priority=priority,
+                expected_duration_s=expected_duration_s,
             )
 
         if method == "command.get":
@@ -360,7 +397,10 @@ class SerialwrapService:
             limit = int(params.get("limit") or 200)
             if not cmd_id:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
-            return self._sessions.get_background_result(cmd_id, from_chunk=from_chunk, limit=limit)
+            result = self._sessions.get_background_result(cmd_id, from_chunk=from_chunk, limit=limit)
+            if not result.get("ok") and result.get("error_code") == "CMD_NOT_FOUND":
+                result = self._bg_fallback_from_arbiter(cmd_id, from_chunk)
+            return result
 
         if method == "command.cancel":
             cmd_id = str(params.get("cmd_id") or "")
@@ -371,7 +411,10 @@ class SerialwrapService:
             if cmd_id:
                 from_chunk = int(params.get("from_chunk") or 0)
                 limit = int(params.get("limit") or 200)
-                return self._sessions.get_background_result(cmd_id, from_chunk=from_chunk, limit=limit)
+                result = self._sessions.get_background_result(cmd_id, from_chunk=from_chunk, limit=limit)
+                if not result.get("ok") and result.get("error_code") == "CMD_NOT_FOUND":
+                    result = self._bg_fallback_from_arbiter(cmd_id, from_chunk)
+                return result
             # Deprecated legacy path: fall back to raw WAL tail by selector.
 
         if method in {"result.tail", "log.tail_raw"}:
@@ -434,5 +477,41 @@ class SerialwrapService:
             if not selector:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
             return self._sessions.log_status(selector)
+
+        if method == "file.push":
+            selector = str(params.get("selector") or "")
+            local_path = str(params.get("local_path") or "")
+            remote_path = str(params.get("remote_path") or "")
+            chunk_size = int(params.get("chunk_size") or 2048)
+            source = str(params.get("source") or "agent")
+            if not selector or not local_path or not remote_path:
+                return {"ok": False, "error_code": "INVALID_ARGS"}
+            session_id, err = self._resolve_session_id(selector)
+            if err is not None:
+                return err
+            return self._sessions.file_push(
+                selector,
+                local_path=local_path,
+                remote_path=remote_path,
+                chunk_size=chunk_size,
+                source=source,
+            )
+
+        if method == "file.pull":
+            selector = str(params.get("selector") or "")
+            remote_path = str(params.get("remote_path") or "")
+            local_path = params.get("local_path")
+            source = str(params.get("source") or "agent")
+            if not selector or not remote_path:
+                return {"ok": False, "error_code": "INVALID_ARGS"}
+            session_id, err = self._resolve_session_id(selector)
+            if err is not None:
+                return err
+            return self._sessions.file_pull(
+                selector,
+                remote_path=remote_path,
+                local_path=str(local_path) if local_path else None,
+                source=source,
+            )
 
         return {"ok": False, "error_code": "METHOD_NOT_FOUND", "method": method}
