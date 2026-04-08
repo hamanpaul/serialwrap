@@ -90,6 +90,13 @@ class CommandArbiter:
                 "soft_limit": CMD_WARN_BYTES,
                 "hint": "Command exceeds 4 KB soft limit. Long commands may cause UART buffer overflow or prompt timeout.",
             }
+        if "\n" in command:
+            return {
+                "ok": False,
+                "error_code": "CMD_CONTAINS_NEWLINE",
+                "hint": "Command must not contain embedded newline characters. "
+                        "Split into multiple independent submissions.",
+            }
 
         with self._lock:
             pq = self._queues.get(session_id)

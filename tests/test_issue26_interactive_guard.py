@@ -1,4 +1,4 @@
-"""Issue #26 測試：recover ok 語義修正。"""
+"""Issue #26 測試：recover ok 語義修正（成功恢復 prompt 後回 ok:True）。"""
 from __future__ import annotations
 
 import threading
