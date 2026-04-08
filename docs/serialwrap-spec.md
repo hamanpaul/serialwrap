@@ -183,6 +183,7 @@ sequenceDiagram
 - `background_capture_id`
 - `interactive_session_id`
 - `recovery_action`
+- `error_code`
 - `started_at`
 - `done_at`
 
@@ -205,6 +206,12 @@ sequenceDiagram
 5. 清除 echo / prompt
 6. `stdout` 寫回 `command.get`
 
+#### 命令限制
+
+- 命令字串不得含有 `\n` 換行字元。`arbiter.submit()` 會在入口檢查，若偵測到換行則拒絕並回傳 `error_code: CMD_CONTAINS_NEWLINE`。
+- 命令長度 > 4 KB 回 warning，> 16 KB 拒絕（`CMD_TOO_LONG`）。
+- 長命令建議拆分為多步驟或使用 `file.push` 傳輸 script 後在 target 執行。
+
 ### 6.2 background
 
 適用：
@@ -221,6 +228,16 @@ sequenceDiagram
 5. 後續 chunk 由 `command.result_tail` 讀取
 
 背景結果不是由 agent 直接 parse raw WAL，而是由 daemon 維護 capture 狀態與 chunk 邊界。
+
+#### Background capture 建立前的 fallback
+
+background 命令送出後，prompt 回來之前（capture 尚未建立），若 agent 立即呼叫 `command.result_tail` 或 `result.tail`，daemon 會走 `_bg_fallback_from_arbiter()` 路徑，回傳 pre-capture sentinel：
+
+```json
+{"ok":true,"from_seq":0,"last_seq":0,"chunks":[],"status":"pending","note":"capture not yet created"}
+```
+
+Agent 收到 sentinel 後應短暫 sleep 後重試，而非視為錯誤。
 
 ### 6.3 interactive
 
@@ -257,6 +274,41 @@ sequenceDiagram
 1. `Ctrl-C`
 2. `Ctrl-D`
 3. 若仍無 prompt，session 降級為 `ATTACHED`
+
+#### `_recover_after_failure` 語義
+
+當前景命令因 `PROMPT_TIMEOUT` 失敗後，`_recover_after_failure()` 會嘗試透過 `Ctrl-C` / `Ctrl-D` 恢復 prompt。若成功恢復：
+
+- 回傳 `ok: true`（表示 session 已回到可用狀態）
+- 保留 `error_code: PROMPT_TIMEOUT_RECOVERED`
+- 保留 `partial: true`（原始命令的輸出可能不完整）
+
+這讓 caller 可以區分「命令失敗但 session 仍可用」與「session 完全失聯」。
+
+### 6.5 長命令 keepalive hint
+
+`command.submit` 支援選填的 `expected_duration_s` 參數，用於提示 broker 該命令預期的執行時間。機制包含：
+
+1. **Foreground busy 保護**：前景命令執行期間，prompt timeout 暫停，避免誤判為 session 失聯。
+2. **Expected duration hint**：在 `expected_duration_s` 期間內不觸發 prompt 超時警告。
+3. **Output-based keepalive**：監控 UART RX 活動，若有任何輸出（如測試進度、編譯訊息），自動重置靜默計時器，延長等待。
+
+範例：
+
+```json
+{"method":"command.submit","params":{
+  "selector":"COM0",
+  "cmd":"python3 -m unittest discover -s tests -v",
+  "source":"agent:ci",
+  "mode":"line",
+  "timeout_s":300,
+  "expected_duration_s":120
+}}
+```
+
+適用場景：`apt upgrade`、`make`、`python -m unittest`、`opkg install` 等長時間但有間歇輸出的命令。
+
+詳見設計文件：[`docs/design-heartbeat-keepalive.md`](./design-heartbeat-keepalive.md)。
 
 ## 7. 呼叫流程圖
 
@@ -411,8 +463,35 @@ Agent 可透過 `session.log_start` / `session.log_stop` 對特定 session 啟�
 來源：
 
 - line mode：`command.get.stdout`
-- background mode：`command.result_tail`
+- background mode：`command.result_tail`（含 `from_chunk` / `next_chunk` 分頁）
 - interactive mode：`interactive_status.screen`
+
+background mode 的 `command.result_tail` 在 capture 尚未建立時，會回傳 `from_seq=0, last_seq=0` sentinel（詳見 6.2 fallback 說明）。
+
+## 10.5 檔案傳輸（file.push / file.pull）
+
+內建的 UART 檔案傳輸 primitive，透過 base64 分段傳輸與 md5 校驗，取代不可靠的 inline base64 / heredoc workaround。
+
+### file.push（host → target）
+
+1. 讀取本地檔案，分割為 chunk（預設 2KB）
+2. 每個 chunk：base64 編碼後送出 `echo '<b64>' | base64 -d >> /tmp/.sw_upload_<id>`
+3. 所有 chunk 送完後：校驗 checksum（`md5sum`）
+4. 將暫存檔 rename 到最終路徑
+
+### file.pull（target → host）
+
+1. 在 target 執行 `base64 < /path/to/file`
+2. 透過 UART 分段擷取輸出
+3. 解碼並寫入本地
+4. 校驗 checksum
+
+### 前置條件
+
+- Session 必須處於 `READY` 狀態
+- Target 必須有 `base64`、`md5sum` 或 `sha256sum`
+
+詳見設計文件：[`docs/design-file-transfer.md`](./design-file-transfer.md)。
 
 ## 11. Public Interface
 
@@ -427,6 +506,7 @@ Agent 可透過 `session.log_start` / `session.log_stop` 對特定 session 啟�
 - `serialwrap session log-start|log-stop|log-status`
 - `serialwrap alias list|set|assign|unassign`
 - `serialwrap cmd submit|status|result-tail|cancel`
+- `serialwrap file push|pull`
 - `serialwrap log tail-raw|tail-text`
 - `serialwrap stream tail` (legacy alias，對應 `result.tail`)
 - `serialwrap wal export`
@@ -461,6 +541,8 @@ Agent 可透過 `session.log_start` / `session.log_stop` 對特定 session 啟�
 - `command.get`
 - `command.cancel`
 - `command.result_tail`
+- `file.push`
+- `file.pull`
 - `log.tail_raw`
 - `log.tail_text`
 - `wal.range`
@@ -491,6 +573,8 @@ Agent 可透過 `session.log_start` / `session.log_stop` 對特定 session 啟�
 - `serialwrap_wal_reset` -> `wal.reset`
 - `serialwrap_wal_current_seq` -> `wal.current_seq`
 - `serialwrap_clear_session` -> `session.clear`
+- `serialwrap_file_push` -> `file.push`
+- `serialwrap_file_pull` -> `file.pull`
 
 相容 alias：
 
@@ -619,8 +703,12 @@ targets:
 ## 14. 驗收標準
 
 - line mode 命令完成後 `stdout` 正確回填
+- 含 `\n` 的命令被 `arbiter.submit()` 拒絕，回傳 `CMD_CONTAINS_NEWLINE`
 - background mode 可用 `result-tail` 取得後續 chunk
+- background capture 建立前的 `result-tail` 回傳 `from_seq=0, last_seq=0` sentinel
 - prompt timeout 後 `result-tail` 仍可查 terminal status / error_code 與已緩衝 chunk
+- `_recover_after_failure` 成功恢復 prompt 時回 `ok: true`（含 `PROMPT_TIMEOUT_RECOVERED`）
+- `expected_duration_s` 可延長前景命令 keepalive 等待
 - interactive lease 可建立、送 key、關閉
 - 多 console attach 可同時收到 RX
 - human input 在 line-buffer 模式下經 broker 排隊；raw interactive 模式直接透傳 UART
@@ -628,6 +716,7 @@ targets:
 - `self_test` 可區分主要故障類型
 - `recover` 會先對 `ATTACHED` bridge 做 re-probe；`READY` 才走 `Ctrl-C -> Ctrl-D`
 - agent 明確 reboot 後可重新回 `READY`
+- `file.push` / `file.pull` 可完成 base64 分段傳輸與 md5 校驗
 - README / spec / CLI / MCP 命名一致
 
 ## 15. 使用建議
@@ -637,9 +726,10 @@ targets:
   - `session recover`
   - `minicom`
 - agent：
-  - `command.submit`
+  - `command.submit`（長命令加 `expected_duration_s`）
   - `command.get`
   - `command.result_tail`
+  - `file.push` / `file.pull`（取代 inline base64 / heredoc workaround）
   - interactive 類走 `session.interactive_*`
 - 稽核：
   - `log tail-raw`
