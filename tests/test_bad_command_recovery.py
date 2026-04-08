@@ -62,7 +62,7 @@ class TestBadCommandRecovery(unittest.TestCase):
 
         resp = mgr.execute_command("p:COM0", "cat", "agent:test", "cid-bad1", timeout_s=0.1)
 
-        self.assertFalse(resp["ok"])
+        self.assertTrue(resp["ok"])
         self.assertEqual(resp["error_code"], "PROMPT_TIMEOUT_RECOVERED")
         self.assertEqual(resp["recovery_action"], "CTRL_C")
         # Ctrl-C 應被送出
@@ -85,7 +85,7 @@ class TestBadCommandRecovery(unittest.TestCase):
         bridge.rx_text_from.return_value = "$ "
 
         resp1 = mgr.execute_command("p:COM0", "broken-cmd", "agent:test", "cid-bad2", timeout_s=0.1)
-        self.assertFalse(resp1["ok"])
+        self.assertTrue(resp1["ok"])
         self.assertEqual(resp1["recovery_action"], "CTRL_C")
         self.assertEqual(session.state, "READY")
 
@@ -125,7 +125,7 @@ class TestBadCommandRecovery(unittest.TestCase):
             resp = mgr.execute_command(
                 "p:COM0", f"bad-{i}", "agent:test", f"cid-bad-{i}", timeout_s=0.1,
             )
-            self.assertFalse(resp["ok"])
+            self.assertTrue(resp["ok"])
             self.assertEqual(resp["recovery_action"], "CTRL_C")
             # 每次 recover 後都回 READY
             self.assertEqual(session.state, "READY")

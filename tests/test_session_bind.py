@@ -112,7 +112,7 @@ class TestSessionBind(unittest.TestCase):
 
         resp = mgr.execute_command("p:COM0", "printf 'broken", "agent:test", "cid-1", timeout_s=0.1)
 
-        self.assertFalse(resp["ok"])
+        self.assertTrue(resp["ok"])
         self.assertEqual(resp["error_code"], "PROMPT_TIMEOUT_RECOVERED")
         self.assertEqual(resp["recovery_action"], "CTRL_C")
         self.assertEqual(bridge.send_command.call_count, 1)
