@@ -1,80 +1,73 @@
 # Design: Long-running Command Heartbeat / Keepalive
 
 **Issue**: #24  
-**Status**: Design draft  
+**Status**: 已實作（Phase 1 於 `bugfix/open-issues-phase1`，Phase 2 於 `feat/open-issues-phase2`）  
 
-## Problem
+## 背景問題
 
-Long-running commands (e.g., `apt upgrade`, `python -m unittest`) produce no
-prompt output during execution. The broker's prompt probe times out, causing
-the session to transition from READY → ATTACHED + PROMPT_TIMEOUT even though
-the command is still running successfully.
+長時間命令（如 `apt upgrade`、`python -m unittest`）執行期間不會產生 prompt 輸出。broker 的 prompt probe 會因超時而將 session 從 READY → ATTACHED + PROMPT_TIMEOUT，即使命令仍在正常執行。
 
-## Proposed Solution
+## 解決方案
 
-### 1. Foreground Command Awareness
+### 1. Foreground Command Awareness（Phase 1 已實作）
 
-When a command is submitted via `command.submit`, the broker should track that
-a foreground command is in-flight and **suspend prompt timeout** during execution.
+當 `command.submit` 送出前景命令時，broker 會追蹤該命令正在執行，並在 `foreground_busy == True` 期間**暫停 prompt timeout**。
 
 ```python
-# In session_manager.py execute_command:
-session.foreground_busy = True   # Already exists
+# session_manager.py execute_command:
+session.foreground_busy = True   # 標記前景命令進行中
 session.fg_cmd_started_at = now_iso()
 session.fg_cmd_timeout_s = timeout_s
 ```
 
-The prompt health probe should skip sessions where `foreground_busy == True`
-and `elapsed < fg_cmd_timeout_s`.
+prompt health probe 會跳過 `foreground_busy == True` 且 `elapsed < fg_cmd_timeout_s` 的 session。
 
-### 2. Expected Duration Hint
+### 2. Expected Duration Hint（Phase 2 已實作）
 
-Add optional `expected_duration_s` parameter to `command.submit`:
+`command.submit` 支援選填的 `expected_duration_s` 參數：
 
 ```json
-{"tool": "serialwrap_submit_command", "params": {
-  "selector": "COM0",
-  "cmd": "python3 -m unittest discover",
-  "timeout_s": 120,
-  "expected_duration_s": 60
+{"tool":"serialwrap_submit_command","params":{
+  "selector":"COM0",
+  "cmd":"python3 -m unittest discover",
+  "timeout_s":120,
+  "expected_duration_s":60
 }}
 ```
 
-When `expected_duration_s` is provided:
-- Prompt timeout is suspended for that duration
-- After expiry, normal prompt probing resumes
+當提供 `expected_duration_s` 時：
+- prompt timeout 在該期間內暫停
+- 過期後恢復正常 prompt 探測
 
-### 3. Output-based Keepalive Detection
+### 3. Output-based Keepalive Detection（Phase 2 已實作）
 
-Monitor UART rx during command execution. If any bytes are received (even
-non-prompt output like test progress dots), reset the silence timer.
+命令執行期間監控 UART RX 活動。若收到任何 bytes（即使不是 prompt，例如測試進度輸出），重置靜默計時器，延長等待：
 
 ```python
-# In _wait_for_prompt:
+# _wait_for_prompt keepalive 迴圈:
 while elapsed < timeout_s:
     if bridge.rx_snapshot_len() > last_rx_len:
         last_rx_len = bridge.rx_snapshot_len()
-        silence_start = time.monotonic()  # Reset silence timer
+        silence_start = time.monotonic()  # 重置靜默計時器
     if time.monotonic() - silence_start > silence_timeout:
-        break  # True silence
+        break  # 真正靜默，結束等待
 ```
 
-### 4. Distinguishing Silence Types
+### 4. 靜默類型區分
 
-| Condition | Meaning | Action |
-|-----------|---------|--------|
-| foreground_busy + rx flowing | Command running, producing output | Wait |
-| foreground_busy + rx silent + elapsed < expected | Command running silently | Wait |
-| foreground_busy + rx silent + elapsed > expected | Possibly stuck | Warn |
-| NOT foreground_busy + rx silent | Session may be lost | Probe |
+| 條件 | 意義 | 動作 |
+|------|------|------|
+| foreground_busy + rx 有輸出 | 命令正在執行且有輸出 | 繼續等待 |
+| foreground_busy + rx 靜默 + elapsed < expected | 命令靜默執行中 | 繼續等待 |
+| foreground_busy + rx 靜默 + elapsed > expected | 可能卡住 | 發出警告 |
+| 非 foreground_busy + rx 靜默 | session 可能已失聯 | 執行 probe |
 
-## Implementation Phases
+## 實作階段
 
-1. **Phase 1**: Skip prompt timeout when `foreground_busy == True` (minimal)
-2. **Phase 2**: Add `expected_duration_s` parameter
-3. **Phase 3**: Output-based silence detection
+1. **Phase 1**（已完成）：`foreground_busy == True` 時跳過 prompt timeout
+2. **Phase 2**（已完成）：新增 `expected_duration_s` 參數與 output-based keepalive 迴圈
 
-## Risks
+## 已知限制
 
-- Phase 1 alone could mask real session loss if command crashes
-- Need a hard upper bound (e.g., 10x expected_duration or 30 min) as safety net
+- 仍需硬上限（如 10x expected_duration 或 30 分鐘）作為安全網，避免無限等待
+- Phase 1 單獨使用時，若命令 crash 可能會遮蔽真正的 session 失聯

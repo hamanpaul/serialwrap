@@ -1,14 +1,13 @@
 # Design: File Transfer Primitive (file.push / file.pull)
 
 **Issue**: #21  
-**Status**: Design draft  
+**Status**: 已實作（Phase 2，`feat/open-issues-phase2`）  
 
-## Problem
+## 背景問題
 
-No built-in file transfer mechanism. Agent workarounds (gzip+base64 inline,
-local HTTP server, sequential echo) are unreliable and slow.
+過去沒有內建檔案傳輸機制。Agent 的替代方案（gzip+base64 inline、本地 HTTP server、sequential echo）既不可靠又慢。
 
-## Proposed API
+## API
 
 ### CLI
 
@@ -20,8 +19,8 @@ serialwrap file pull --selector COM0 --remote /etc/config --local ./config
 ### MCP
 
 ```json
-{"tool": "serialwrap_file_push", "params": {"selector": "COM0", "local_path": "/path/to/file", "remote_path": "/tmp/file"}}
-{"tool": "serialwrap_file_pull", "params": {"selector": "COM0", "remote_path": "/etc/config"}}
+{"tool":"serialwrap_file_push","params":{"selector":"COM0","local_path":"/path/to/file","remote_path":"/tmp/file"}}
+{"tool":"serialwrap_file_pull","params":{"selector":"COM0","remote_path":"/etc/config"}}
 ```
 
 ### RPC
@@ -29,38 +28,38 @@ serialwrap file pull --selector COM0 --remote /etc/config --local ./config
 - `file.push` → `{selector, local_path, remote_path, chunk_size?, checksum?}`
 - `file.pull` → `{selector, remote_path, local_path?, chunk_size?}`
 
-## Implementation Strategy
+## 實作策略
 
-### Push (host → target)
+### Push（host → target）
 
-1. Read local file, split into chunks (default 2KB)
-2. For each chunk: base64-encode, send as `echo '<b64>' | base64 -d >> /tmp/.sw_upload_<id>`
-3. After all chunks: verify checksum (`md5sum` or `sha256sum`)
-4. Rename temp file to final path
-5. Report progress via status callback
+1. 讀取本地檔案，分割為 chunk（預設 2KB）
+2. 每個 chunk：base64 編碼後送出 `echo '<b64>' | base64 -d >> /tmp/.sw_upload_<id>`
+3. 所有 chunk 送完後：校驗 checksum（`md5sum` 或 `sha256sum`）
+4. 將暫存檔 rename 到最終路徑
+5. 透過 status callback 回報進度
 
-### Pull (target → host)
+### Pull（target → host）
 
-1. On target: `base64 < /path/to/file`
-2. Capture output in chunks via UART
-3. Decode and write locally
-4. Verify checksum
+1. 在 target 執行 `base64 < /path/to/file`
+2. 透過 UART 分段擷取輸出
+3. 解碼並寫入本地
+4. 校驗 checksum
 
-### Key Considerations
+### 設計要點
 
-- **Chunk size**: Must stay under UART buffer limit (~2KB per line safe)
-- **Progress**: Return chunk count / total in status
-- **Resumable**: If interrupted, check existing temp file size
-- **Binary safety**: base64 encoding handles binary
-- **Cleanup**: Remove temp files on success or explicit cancel
+- **Chunk size**：須控制在 UART buffer 上限內（每行 ~2KB 安全）
+- **Progress**：在 status 回傳 chunk count / total
+- **Resumable**：中斷時可檢查既有暫存檔大小
+- **Binary safety**：base64 編碼處理二進位檔案
+- **Cleanup**：成功或明確取消後清除暫存檔
 
-## Alternatives Considered
+## 曾考慮的替代方案
 
-- **ZMODEM/XMODEM**: Too complex for serial console, requires compatible receiver
-- **scp/rsync over network**: Requires network connectivity, not always available
-- **tar pipe**: Single-shot, not resumable
+- **ZMODEM/XMODEM**：serial console 太複雜，需要相容接收器
+- **scp/rsync**：需要網路連線，不一定可用
+- **tar pipe**：一次性，不可恢復
 
-## Dependencies
+## 前置條件
 
-- Session must be in READY state
-- Target must have `base64`, `md5sum` or `sha256sum`
+- Session 必須處於 `READY` 狀態
+- Target 必須有 `base64`、`md5sum` 或 `sha256sum`

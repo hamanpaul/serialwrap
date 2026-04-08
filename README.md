@@ -428,6 +428,18 @@ serialwrap cmd status --cmd-id <cmd_id>
 
 `command.get` 會直接帶 `stdout`。
 
+**命令限制**：命令字串不得含有 `\n` 換行字元，否則回傳 `CMD_CONTAINS_NEWLINE`。命令長度 > 4 KB 回 warning，> 16 KB 拒絕（`CMD_TOO_LONG`）。
+
+**長命令 keepalive**：對於 `apt upgrade`、`make`、`python -m unittest` 等長時間命令，可加 `--expected-duration` 提示 broker 延長等待：
+
+```bash
+serialwrap cmd submit --selector COM0 --mode line --source agent:ci \
+  --cmd "python3 -m unittest discover -s tests -v" \
+  --timeout 300 --expected-duration 120
+```
+
+broker 會在命令執行期間監控 UART RX 活動，有輸出時自動延長等待。詳見 [`docs/design-heartbeat-keepalive.md`](./docs/design-heartbeat-keepalive.md)。
+
 ### 2. `background`
 
 適用 prompt 很快回來、後續內容會持續吐出的命令。
@@ -455,6 +467,22 @@ serialwrap session interactive-close --interactive-id <interactive_id>
 ```
 
 `--encoding key` 目前支援：`enter`、`tab`、`escape`、`ctrl-c`、`ctrl-d`、`up`、`down`、`left`、`right`。
+
+## 檔案傳輸
+
+內建 `file push` / `file pull` 透過 UART base64 分段傳輸檔案，取代不可靠的 inline base64 / heredoc workaround。
+
+```bash
+# 推送本地檔案到 target
+serialwrap file push --selector COM0 --local ./firmware.bin --remote /tmp/firmware.bin
+
+# 從 target 拉取檔案到本地
+serialwrap file pull --selector COM0 --remote /etc/config/wireless --local ./wireless.bak
+```
+
+傳輸完成後自動進行 md5 校驗。Session 必須處於 `READY` 狀態，target 需有 `base64` 與 `md5sum`。
+
+詳見設計文件：[`docs/design-file-transfer.md`](./docs/design-file-transfer.md)。
 
 ## 多 minicom 使用
 
@@ -650,6 +678,8 @@ serialwrap wal current-seq
 | `serialwrap_clear_session` | `session.clear` |
 | `serialwrap_wal_reset` | `wal.reset` |
 | `serialwrap_wal_current_seq` | `wal.current_seq` |
+| `serialwrap_file_push` | `file.push` |
+| `serialwrap_file_pull` | `file.pull` |
 
 ### Legacy alias
 
@@ -665,6 +695,8 @@ serialwrap-mcp --tool serialwrap_get_session_state --params '{"selector":"COM0"}
 serialwrap-mcp --tool serialwrap_submit_command --params '{"selector":"COM0","cmd":"ifconfig","source":"agent:mcp","mode":"line"}'
 serialwrap-mcp --tool serialwrap_get_command --params '{"cmd_id":"<cmd_id>"}'
 serialwrap-mcp --tool serialwrap_tail_command_result --params '{"cmd_id":"<cmd_id>","from_chunk":0,"limit":120}'
+serialwrap-mcp --tool serialwrap_file_push --params '{"selector":"COM0","local_path":"./fw.bin","remote_path":"/tmp/fw.bin"}'
+serialwrap-mcp --tool serialwrap_file_pull --params '{"selector":"COM0","remote_path":"/etc/config/wireless"}'
 ```
 
 ## 測試

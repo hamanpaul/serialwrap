@@ -55,13 +55,17 @@
 - `serialwrap_wal_reset` -> `wal.reset`
 - `serialwrap_wal_current_seq` -> `wal.current_seq`
 - `serialwrap_tail_results` -> `result.tail`（deprecated alias）
+- `serialwrap_file_push` -> `file.push`
+- `serialwrap_file_pull` -> `file.pull`
 
 ## MCP 參數規範
 - `serialwrap_submit_command`
   - 必填：`selector`, `cmd`
   - 建議：`source="agent:<name>"`, `mode="line|background|interactive"`, `timeout_s`, `priority`
+  - 選填：`expected_duration_s`（長命令 keepalive hint，broker 在此期間暫停 prompt timeout 並監控 RX 活動延長等待）
+  - 命令不得含 `\n` 換行字元，否則回 `CMD_CONTAINS_NEWLINE`
   - 命令長度限制：> 4 KB 會回 warning，> 16 KB 會被 reject (`CMD_TOO_LONG`)
-  - 長命令建議改用 file-based injection（見 `docs/design-file-transfer.md`）
+  - 長命令建議改用 `serialwrap_file_push` 傳輸 script 後在 target 執行
 - `serialwrap_recover_session`
   - 必填：`selector`
   - 選填：`timeout_s`, `force`（布林，force=true 時自動 clear+reattach+wait-ready）
@@ -79,6 +83,12 @@
   - 必填：`selector`
 - `serialwrap_wal_current_seq`
   - 不需參數
+- `serialwrap_file_push`
+  - 必填：`selector`, `local_path`, `remote_path`
+  - 選填：`chunk_size`（預設 2KB）, `checksum`（布林，預設 true）
+- `serialwrap_file_pull`
+  - 必填：`selector`, `remote_path`
+  - 選填：`local_path`（省略時回傳檔案內容）, `chunk_size`
 
 ## 安全規則
 - 禁止 Agent 直接寫 `/dev/ttyUSB*` 或 `/dev/ttyACM*`。
@@ -86,13 +96,15 @@
 - 長流命令（`logread -f`, `tcpdump`, kernel debug）一律使用 `mode=background` 或限制 timeout，避免阻塞共享通道。
 - 每筆自動化命令必填 `source`，不可省略，確保追蹤性。
 - 卡住時先 `serialwrap_self_test`，再決定是否 `serialwrap_recover_session`。
+- `serialwrap_recover_session` 成功恢復 prompt 時回傳 `ok: true`（附 `error_code: PROMPT_TIMEOUT_RECOVERED`, `partial: true`），表示 session 可繼續使用。
 
 ## 短命令原則（Best Practice）
 - **避免 heredoc**：heredoc 經 UART 傳輸時容易遺失字元或打亂 prompt，改用 `echo ... > file` 分步寫入。
 - **單行 < 2 KB**：每條命令盡量控制在 2 KB 以內，超過 4 KB 會收到 warning。
-- **避免 base64 inline**：不要將整個檔案 base64 編碼塞進 `cmd submit`，改用分段寫入或 file transfer（待實作）。
+- **避免 base64 inline**：不要將整個檔案 base64 編碼塞進 `cmd submit`，改用 `serialwrap_file_push` 傳輸。
 - **長命令拆分**：管線命令過長時，先寫成 script 檔再 `source` 或 `sh /tmp/script.sh`。
-- **回復策略**：若命令導致 PROMPT_TIMEOUT，使用 `serialwrap_recover_session` (可加 `force=true`)。
+- **長命令 keepalive**：長時間命令加 `expected_duration_s` 避免誤判 prompt timeout。
+- **回復策略**：若命令導致 PROMPT_TIMEOUT，使用 `serialwrap_recover_session` (可加 `force=true`)。recover 成功後 `ok: true` 表示 session 已恢復。
 
 ## 最小可用 MCP 範例
 ```bash
@@ -104,4 +116,6 @@
 /home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_tail_command_result --params "{\"cmd_id\":\"<cmd_id>\",\"from_chunk\":0,\"limit\":120}"
 /home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_log_status --params "{\"selector\":\"COM0\"}"
 /home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_wal_current_seq --params "{}"
+/home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_file_push --params "{\"selector\":\"COM0\",\"local_path\":\"./fw.bin\",\"remote_path\":\"/tmp/fw.bin\"}"
+/home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_file_pull --params "{\"selector\":\"COM0\",\"remote_path\":\"/etc/config/wireless\"}"
 ```
