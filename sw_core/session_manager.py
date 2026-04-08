@@ -1339,7 +1339,7 @@ class SessionManager:
                         error_code="PROMPT_TIMEOUT_RECOVERED",
                     )
                 return {
-                    "ok": False,
+                    "ok": True,
                     "error_code": "PROMPT_TIMEOUT_RECOVERED",
                     "stdout": stdout,
                     "partial": True,
