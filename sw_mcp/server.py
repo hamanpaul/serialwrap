@@ -325,11 +325,20 @@ def run_stdio(endpoint: str) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="serialwrap-mcp")
-    p.add_argument("--socket", default=SOCKET_PATH)
+    p = argparse.ArgumentParser(
+        prog="serialwrap-mcp",
+        description="serialwrap MCP adapter（支援本機 Unix socket 與遠端 endpoint）",
+        epilog=(
+            "examples:\n"
+            "  serialwrap-mcp --tool serialwrap_ping --params '{}'\n"
+            "  serialwrap-mcp --endpoint tcp://127.0.0.1:7777 --tool serialwrap_list_sessions"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    p.add_argument("--socket", default=SOCKET_PATH, help="本機 daemon 的 Unix socket 路徑（預設: %(default)s）")
     p.add_argument("--endpoint", default=None, metavar="ENDPOINT", help="遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）")
-    p.add_argument("--tool")
-    p.add_argument("--params", default="{}")
+    p.add_argument("--tool", help="單次執行的 MCP tool 名稱；省略時進入 stdio 模式")
+    p.add_argument("--params", default="{}", help="傳給 --tool 的 JSON 參數字串（預設: %(default)s）")
     args = p.parse_args(argv)
 
     endpoint = args.endpoint if args.endpoint else args.socket

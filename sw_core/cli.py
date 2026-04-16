@@ -192,10 +192,20 @@ def _run_rpc(args: argparse.Namespace, method: str, params: dict[str, Any]) -> i
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="serialwrap", description="serialwrap client")
-    p.add_argument("--socket", default=SOCKET_PATH)
+    p = argparse.ArgumentParser(
+        prog="serialwrap",
+        description="serialwrap client（支援本機 Unix socket 與遠端 endpoint）",
+        epilog=(
+            "examples:\n"
+            "  serialwrap session list\n"
+            "  serialwrap --endpoint tcp://127.0.0.1:7777 session list\n"
+            "  serialwrap --endpoint tcp://127.0.0.1:7777 cmd submit --selector COM0 --cmd 'uname -a'"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    p.add_argument("--socket", default=SOCKET_PATH, help="本機 daemon 的 Unix socket 路徑（預設: %(default)s）")
     p.add_argument("--endpoint", default=None, metavar="ENDPOINT", help="遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）")
-    p.add_argument("--timeout", dest="timeout_s", type=float, default=5.0)
+    p.add_argument("--timeout", dest="timeout_s", type=float, default=5.0, help="RPC timeout 秒數（預設: %(default)s）")
 
     sub = p.add_subparsers(dest="cmd", required=True)
 
