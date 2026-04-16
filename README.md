@@ -847,6 +847,22 @@ serialwrap-mcp --endpoint tcp://127.0.0.1:7777
 - **`file.push / file.pull` 的 `local_path` 是 FAE host（daemon 端）的路徑**，不是 RD 本機路徑。若 RD 要傳輸本機檔案，需先透過 scp/rsync 傳到 FAE host，再由 daemon 執行 file transfer
 - WAL 路徑、mirror log 路徑等回傳值也都是 FAE host 上的路徑
 - 認證完全委由 ssh 本身，daemon 不加 token 驗證
+- 若要做隔離式雙 container 驗證，可直接執行 `./tools/docker/remote_smoke.sh`；完整流程說明在 [`func-test/README.md`](./func-test/README.md) 的 **Remote Support Docker test flow**
+
+### Docker smoke test
+
+若要快速驗證目前 repo 的 remote-support 能否跨 container 工作，可直接執行：
+
+```bash
+./tools/docker/remote_smoke.sh
+```
+
+這個腳本會：
+
+1. build `serialwrap:remote-smoke`
+2. 建立隔離 bridge network（不固定 IP、不指定 MAC）
+3. 起一個 remote daemon container（內含 fake target + `serialwrapd` + `socat`）
+4. 再起一個 client container，驗證 `daemon status` / `session list` / `cmd submit` / `cmd status`
 
 ## 延伸閱讀
 

@@ -103,6 +103,58 @@ steps:                   # 測試步驟（循序執行）
 | 適用 | CI 回歸 | Human-agent 互動驗證 |
 | Race detection | 有限 | 可重複執行 |
 
+## Remote Support Docker test flow
+
+除了本機 PTY / YAML 功能測試外，repo 也提供一個 **雙 container smoke flow**，用來驗證 remote-support 的 `--endpoint tcp://...` 能否跨 container 存取遠端 daemon。
+
+### 目的
+
+- **Container A**：跑 fake target + `serialwrapd` + `socat`
+- **Container B**：只當 remote client，透過 `serialwrap --endpoint tcp://<container-a>:7777 ...` 存取 A
+
+### 相關檔案
+
+| 檔案 | 用途 |
+|------|------|
+| `Dockerfile` | 建立可執行 serialwrap 的 image |
+| `tools/docker/remote_lab.py` | 在 container A 內啟動 fake target / daemon / socat |
+| `tools/docker/remote_smoke.sh` | 在 host 端 build image、建立 network、起兩個 container 並驗證 remote flow |
+
+### 執行方式
+
+```bash
+./tools/docker/remote_smoke.sh
+```
+
+預期流程：
+
+1. build `serialwrap:remote-smoke` image
+2. 建立獨立 bridge network
+3. 起 `sw-remote-a-*` container，內含 fake target + daemon + TCP endpoint
+4. 再起另一個臨時 client container，依序驗證：
+   - `serialwrap --endpoint tcp://<remote>:7777 daemon status`
+   - `serialwrap --endpoint tcp://<remote>:7777 session list`
+   - `serialwrap --endpoint tcp://<remote>:7777 cmd submit --selector COM0 --cmd 'uname -a'`
+   - `serialwrap --endpoint tcp://<remote>:7777 cmd status --cmd-id <id>`
+
+### Docker 網路原則（避免 IP/MAC 衝突）
+
+- 一律使用 **user-defined bridge network**
+- **不要指定固定 IP**
+- **不要指定固定 MAC**
+- 兩個 container 一律用 **Docker DNS 名稱**（例如 `sw-remote-a-12345`）互連
+- `remote_lab.py` 在 Docker smoke 模式會讓 `socat` bind `0.0.0.0`，但 **只存在於隔離的 bridge network 中**，不 publish 到 host，也不是 production 建議做法
+
+### 與正式 remote-support 的差異
+
+- **正式環境**：FAE 主機應只 `bind=127.0.0.1`，再由 RD 透過 ssh-tunnel 連接
+- **Docker smoke**：為了讓第二個 container 可直連，測試用 `0.0.0.0` 僅限 isolated Docker network；不代表實際部署建議
+
+### 注意事項
+
+- `daemon start` 仍不支援 `--endpoint`
+- `file.push / file.pull` 在 remote 模式下的 `local_path` 仍是 daemon 所在 host/container 的路徑，不是 client container 的本地路徑
+
 ## 研究報告
 
 詳見 `docs/func-test/research-test.md`。

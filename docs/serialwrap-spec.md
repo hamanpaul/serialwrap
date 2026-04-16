@@ -125,6 +125,16 @@ sequenceDiagram
     D-->>CLI: health ok
 ```
 
+### 4.3 Client ↔ Daemon transport
+
+- daemon 本體仍只 listen **Unix socket**
+- CLI / MCP client 端可接受：
+  - `--socket /tmp/serialwrap/serialwrapd.sock`
+  - `--endpoint unix:///tmp/serialwrap/serialwrapd.sock`
+  - `--endpoint tcp://host:port`
+- `tcp://...` 的用途是讓 client 經由 **ssh-tunnel / socat / 隔離測試網路** 連到遠端 daemon；**不是**讓 daemon 直接 listen TCP
+- `daemon start` 只支援本機 socket，不支援 `--endpoint`
+
 ## 5. Session / Console / Command 狀態
 
 ### 5.1 Session 狀態
@@ -486,6 +496,12 @@ background mode 的 `command.result_tail` 在 capture 尚未建立時，會回�
 3. 解碼並寫入本地
 4. 校驗 checksum
 
+### Remote endpoint 模式下的語意
+
+- `file.push` / `file.pull` 中的「host」是 **daemon 所在主機**
+- 若 agent 透過 `--endpoint tcp://...` 連到遠端 daemon，`local_path` 也是 **遠端 host/container** 的路徑，不是 agent 自己機器上的路徑
+- 若需要傳輸 agent 本機檔案到遠端 host，應先透過 ssh/scp/rsync 把檔案送到 daemon host，再呼叫 `file.push`
+
 ### 前置條件
 
 - Session 必須處於 `READY` 狀態
@@ -497,6 +513,9 @@ background mode 的 `command.result_tail` 在 capture 尚未建立時，會回�
 
 ### 11.1 CLI
 
+- 全域 transport 參數：
+  - `--socket <path>`（預設，本機 Unix socket）
+  - `--endpoint <endpoint>`（優先於 `--socket`，支援 `unix://` / `tcp://`）
 - `serialwrap daemon start|stop|status`
 - `serialwrap device list`
 - `serialwrap session list|bind|attach|clear`
@@ -548,6 +567,8 @@ background mode 的 `command.result_tail` 在 capture 尚未建立時，會回�
 - `wal.range`
 
 ### 11.3 MCP Tool 對應
+
+- `serialwrap-mcp` 與 CLI 相同，也支援全域 `--endpoint <endpoint>`
 
 - `serialwrap_get_health` -> `health.status`
 - `serialwrap_list_devices` -> `device.list`
@@ -718,6 +739,7 @@ targets:
 - agent 明確 reboot 後可重新回 `READY`
 - `file.push` / `file.pull` 可完成 base64 分段傳輸與 md5 校驗
 - README / spec / CLI / MCP 命名一致
+- Docker smoke flow 可用同一個 image 起兩個 container，並透過 `--endpoint tcp://<container-name>:7777` 成功完成 `daemon status` / `session list` / `cmd submit`
 
 ## 15. 使用建議
 
