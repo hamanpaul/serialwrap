@@ -762,6 +762,92 @@ run end reason 分布如下：
 3. 補 attach / recover gating 的 regression test，避免 session 無限停在 `ATTACHED`。
 4. 修完後重新跑 long-run，驗收標準至少要把 `session_not_ready:ATTACHED` 造成的 restart 降到 `0`，且不能讓 human / multi-agent 協作退化。
 
+## Remote Support（ssh-tunnel 遠端連線）
+
+當 FAE 在海外（美國 / 歐洲電信客戶端）用 serialwrap 連接 DUT，台灣 RD 可透過 **ssh-tunnel** 讓 agent 對遠端 daemon 下命令，無需修改 daemon 端程式。
+
+### 架構概覽
+
+```
+[台灣 RD]                              [FAE 現場]
+ agent/MCP                              serialwrapd
+   |                                        |
+   | tcp://127.0.0.1:7777                   |
+   +--> ssh tunnel (ssh -L) -->--> socat <--> Unix socket
+```
+
+### FAE 端設定（一次性）
+
+**步驟 1**：以 `socat` 將 Unix socket 暴露成 TCP（**只 bind loopback，不可對外**）：
+
+```bash
+socat TCP-LISTEN:7777,bind=127.0.0.1,reuseaddr,fork \
+      UNIX-CONNECT:/tmp/serialwrap/serialwrapd.sock &
+```
+
+> ⚠️ **安全注意**：
+> - 必須 `bind=127.0.0.1`，絕對不能省略，否則 port 會暴露在 0.0.0.0
+> - serialwrap RPC 包含 `command.submit`、`file.push`、`daemon.stop`，**任何可連到此 port 的機器都能完全遠端操控 DUT**
+> - 永遠只透過 ssh-tunnel 使用，不可直接對網路開放
+
+**步驟 2**：在 FAE 的 sshd 確認允許 `AllowTcpForwarding yes`（預設通常已開）。
+
+### 台灣 RD 端設定
+
+**建立 ssh-tunnel**：
+
+```bash
+ssh -N -L 127.0.0.1:7777:127.0.0.1:7777 fae_user@fae_host
+```
+
+| 參數 | 說明 |
+|---|---|
+| `-N` | 不開 shell，只轉發 port |
+| `-L 127.0.0.1:7777:127.0.0.1:7777` | 本機 7777 → FAE host 127.0.0.1:7777 |
+
+若要保持常駐，可加 `-f` 或用 autossh：
+
+```bash
+autossh -M 0 -N -L 127.0.0.1:7777:127.0.0.1:7777 fae_user@fae_host
+```
+
+**確認 tunnel 通**：
+
+```bash
+serialwrap --endpoint tcp://127.0.0.1:7777 daemon status
+```
+
+### `--endpoint` 參數
+
+CLI 與 MCP 都支援 `--endpoint`，優先於 `--socket`：
+
+```bash
+# CLI 遠端查詢 session 列表
+serialwrap --endpoint tcp://127.0.0.1:7777 session list
+
+# CLI 遠端提交命令
+serialwrap --endpoint tcp://127.0.0.1:7777 cmd submit \
+    --selector COM0 --cmd "uname -a"
+
+# MCP adapter 指向遠端 daemon
+serialwrap-mcp --endpoint tcp://127.0.0.1:7777
+```
+
+支援的 endpoint 格式：
+
+| 格式 | 用途 |
+|---|---|
+| `/tmp/serialwrap/serialwrapd.sock` | 本機 Unix socket（預設，向後相容） |
+| `unix:///tmp/serialwrap/serialwrapd.sock` | 本機 Unix socket（顯式指定） |
+| `tcp://127.0.0.1:7777` | 透過 ssh-tunnel 連接遠端 daemon |
+
+### 限制與注意事項
+
+- `daemon start` **不支援** `--endpoint`（daemon 只能在本機啟動，會回 `REMOTE_NOT_SUPPORTED`）
+- **`file.push / file.pull` 的 `local_path` 是 FAE host（daemon 端）的路徑**，不是 RD 本機路徑。若 RD 要傳輸本機檔案，需先透過 scp/rsync 傳到 FAE host，再由 daemon 執行 file transfer
+- WAL 路徑、mirror log 路徑等回傳值也都是 FAE host 上的路徑
+- 認證完全委由 ssh 本身，daemon 不加 token 驗證
+
 ## 延伸閱讀
 
 - 詳細決策與 API 契約：[`docs/serialwrap-spec.md`](./docs/serialwrap-spec.md)

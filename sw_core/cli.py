@@ -112,6 +112,9 @@ def _resolve_daemon_start_env_files(profile_dir: str) -> list[str]:
 
 
 def _run_daemon_start(args: argparse.Namespace) -> int:
+    if getattr(args, "endpoint", None):
+        _print({"ok": False, "error_code": "REMOTE_NOT_SUPPORTED", "message": "--endpoint 不支援 daemon start（daemon 只能在本機啟動）"})
+        return 2
     cmd = [
         sys.executable,
         _daemon_script_path(),
@@ -165,7 +168,7 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
 
 
 def _run_daemon_stop(args: argparse.Namespace) -> int:
-    resp = rpc_call(args.socket, "daemon.stop", {}, timeout_s=2.0)
+    resp = rpc_call(_resolve_endpoint(args), "daemon.stop", {}, timeout_s=2.0)
     if not resp.get("ok"):
         _print(resp)
         return 2
@@ -173,8 +176,17 @@ def _run_daemon_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_endpoint(args: argparse.Namespace) -> str:
+    """回傳實際連接 endpoint。
+
+    若有 ``--endpoint`` 則優先，否則回 ``--socket`` 值（向後相容）。
+    """
+    ep = getattr(args, "endpoint", None)
+    return ep if ep else args.socket
+
+
 def _run_rpc(args: argparse.Namespace, method: str, params: dict[str, Any]) -> int:
-    resp = rpc_call(args.socket, method, params, timeout_s=args.timeout_s)
+    resp = rpc_call(_resolve_endpoint(args), method, params, timeout_s=args.timeout_s)
     _print(resp)
     return 0 if resp.get("ok") else 2
 
@@ -182,6 +194,7 @@ def _run_rpc(args: argparse.Namespace, method: str, params: dict[str, Any]) -> i
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="serialwrap", description="serialwrap client")
     p.add_argument("--socket", default=SOCKET_PATH)
+    p.add_argument("--endpoint", default=None, metavar="ENDPOINT", help="遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）")
     p.add_argument("--timeout", dest="timeout_s", type=float, default=5.0)
 
     sub = p.add_subparsers(dest="cmd", required=True)

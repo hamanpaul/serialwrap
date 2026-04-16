@@ -290,16 +290,16 @@ def list_tools() -> list[dict[str, Any]]:
     return list(_TOOL_DEFS)
 
 
-def call_tool(socket_path: str, tool: str, params: dict[str, Any]) -> dict[str, Any]:
+def call_tool(endpoint: str, tool: str, params: dict[str, Any]) -> dict[str, Any]:
     if tool == "list_tools":
         return {"ok": True, "tools": list_tools()}
     method = _TOOL_MAP.get(tool)
     if method is None:
         return {"ok": False, "error_code": "TOOL_NOT_FOUND", "tool": tool}
-    return rpc_call(socket_path, method, params)
+    return rpc_call(endpoint, method, params)
 
 
-def run_stdio(socket_path: str) -> int:
+def run_stdio(endpoint: str) -> int:
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -318,7 +318,7 @@ def run_stdio(socket_path: str) -> int:
 
         tool = str(req.get("tool") or "")
         params = req.get("params") if isinstance(req.get("params"), dict) else {}
-        resp = call_tool(socket_path, tool, params)
+        resp = call_tool(endpoint, tool, params)
         sys.stdout.write(json.dumps(resp, ensure_ascii=False, separators=(",", ":")) + "\n")
         sys.stdout.flush()
     return 0
@@ -327,20 +327,23 @@ def run_stdio(socket_path: str) -> int:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="serialwrap-mcp")
     p.add_argument("--socket", default=SOCKET_PATH)
+    p.add_argument("--endpoint", default=None, metavar="ENDPOINT", help="遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）")
     p.add_argument("--tool")
     p.add_argument("--params", default="{}")
     args = p.parse_args(argv)
+
+    endpoint = args.endpoint if args.endpoint else args.socket
 
     if args.tool:
         try:
             params = json.loads(args.params)
         except json.JSONDecodeError:
             params = {}
-        resp = call_tool(args.socket, args.tool, params if isinstance(params, dict) else {})
+        resp = call_tool(endpoint, args.tool, params if isinstance(params, dict) else {})
         sys.stdout.write(json.dumps(resp, ensure_ascii=False, separators=(",", ":")) + "\n")
         return 0 if resp.get("ok") else 2
 
-    return run_stdio(args.socket)
+    return run_stdio(endpoint)
 
 
 if __name__ == "__main__":
