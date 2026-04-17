@@ -18,6 +18,48 @@
 - 目標 session 必須是 `READY`。
 - profile 與 target 已綁定（`session bind` + `session attach` 至少完成一次）。
 
+## Remote Support 用法
+
+當 Agent 不在 FAE 現場機器上，而是要從遠端透過 network debug UART target 時，應改走 **remote endpoint** 模式。
+
+### 基本原則
+
+- daemon 仍跑在 **FAE / target 所在主機**
+- Agent 端只透過 `--endpoint tcp://host:port` 連到遠端 daemon
+- 正式環境優先使用 **ssh-tunnel**
+- Docker 雙 container smoke 只用於隔離測試，不代表 production 暴露方式
+
+### 正式環境（ssh-tunnel）
+
+FAE 端：
+
+```bash
+socat TCP-LISTEN:7777,bind=127.0.0.1,reuseaddr,fork \
+      UNIX-CONNECT:/tmp/serialwrap/serialwrapd.sock &
+```
+
+RD / Agent 端：
+
+```bash
+ssh -N -L 127.0.0.1:7777:127.0.0.1:7777 fae_user@fae_host
+serialwrap --endpoint tcp://127.0.0.1:7777 session list
+serialwrap-mcp --endpoint tcp://127.0.0.1:7777 --tool serialwrap_list_sessions
+```
+
+### Docker smoke
+
+若只是要驗證 remote-support 在隔離環境內可用，可直接跑：
+
+```bash
+./tools/docker/remote_smoke.sh
+```
+
+### Remote 模式注意事項
+
+- `daemon start` 不支援 `--endpoint`
+- `file.push` / `file.pull` 的 `local_path` 是 **daemon 所在 host/container** 的路徑，不是 Agent 本機路徑
+- 正式環境 `socat` 必須 `bind=127.0.0.1`，不可直接暴露到外網
+
 ## 標準執行順序（Agent 必須遵守）
 1. 健康檢查：`serialwrap_get_health`。
 2. 探測資源：`serialwrap_list_sessions`、`serialwrap_list_devices`。
@@ -109,6 +151,7 @@
 ## 最小可用 MCP 範例
 ```bash
 /home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_get_health --params "{}"
+/home/paul_chen/.paul_tools/serialwrap-mcp --endpoint tcp://127.0.0.1:7777 --tool serialwrap_get_health --params "{}"
 /home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_get_session_state --params "{\"selector\":\"COM0\"}"
 /home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_self_test --params "{\"selector\":\"COM0\"}"
 /home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_submit_command --params "{\"selector\":\"COM0\",\"cmd\":\"ifconfig\",\"source\":\"agent:diag\",\"mode\":\"line\"}"

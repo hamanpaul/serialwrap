@@ -89,7 +89,7 @@
 **定義**：結合白箱與黑箱，測試者知道部分內部架構但透過外部介面操作。
 
 **最適合 serialwrap 的原因**：
-- Daemon 是獨立程序，透過 RPC（Unix socket）互動 → 自然是黑箱入口
+- Daemon 是獨立程序；本機預設透過 RPC（Unix socket）互動，remote-support 則可經由 `--endpoint tcp://...` 走 tunnel / bridge → 自然是黑箱入口
 - 但需要知道內部狀態機來設計有效的測試場景 → 需要白箱知識
 - PTY fake target 可以精確控制時序 → 灰箱的核心優勢
 
