@@ -43,6 +43,18 @@ class TestParseEndpoint(unittest.TestCase):
         with self.assertRaises(ValueError):
             _parse_endpoint("unix://")
 
+    def test_unix_requires_absolute_path(self) -> None:
+        with self.assertRaises(ValueError):
+            _parse_endpoint("unix://tmp/serialwrapd.sock")
+
+    def test_unsupported_scheme(self) -> None:
+        with self.assertRaises(ValueError):
+            _parse_endpoint("http://127.0.0.1:7777")
+
+    def test_tcp_rejects_path_suffix(self) -> None:
+        with self.assertRaises(ValueError):
+            _parse_endpoint("tcp://127.0.0.1:7777/rpc")
+
 
 class TestRpcCallEndpointBranch(unittest.TestCase):
     """確認 rpc_call 依 endpoint scheme 選擇正確 transport。"""
@@ -82,6 +94,7 @@ class TestRpcCallEndpointBranch(unittest.TestCase):
         with patch("socket.create_connection", return_value=mock_sock) as mock_cc:
             rpc_call("tcp://127.0.0.1:7777", "health.ping", {})
         mock_cc.assert_called_once_with(("127.0.0.1", 7777), timeout=5.0)
+        mock_sock.settimeout.assert_called_once_with(5.0)
 
     def test_socket_error_returns_structured_error(self) -> None:
         with patch("socket.socket") as mock_socket_cls:
@@ -95,6 +108,17 @@ class TestRpcCallEndpointBranch(unittest.TestCase):
             resp = rpc_call("tcp://127.0.0.1:7777", "health.ping", {})
         self.assertFalse(resp.get("ok"))
         self.assertEqual(resp.get("error_code"), "SOCKET_ERROR")
+
+    def test_tcp_connect_timeout_returns_timeout(self) -> None:
+        with patch("socket.create_connection", side_effect=socket.timeout("timed out")):
+            resp = rpc_call("tcp://127.0.0.1:7777", "health.ping", {})
+        self.assertFalse(resp.get("ok"))
+        self.assertEqual(resp.get("error_code"), "TIMEOUT")
+
+    def test_unsupported_scheme_returns_invalid_endpoint(self) -> None:
+        resp = rpc_call("http://127.0.0.1:7777", "health.ping", {})
+        self.assertFalse(resp.get("ok"))
+        self.assertEqual(resp.get("error_code"), "INVALID_ENDPOINT")
 
 
 class TestRpcCallOverRealTcpSocket(unittest.TestCase):

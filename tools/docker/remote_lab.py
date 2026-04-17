@@ -129,18 +129,22 @@ def main(argv: list[str] | None = None) -> int:
         harness.start()
         _wait_ready(harness, args.selector, args.ready_timeout)
         socat_proc = _start_socat(harness.socket_path, args.listen_host, args.tcp_port)
-        endpoint = f"tcp://{args.listen_host}:{args.tcp_port}"
+        payload: dict[str, object] = {
+            "ok": True,
+            "event": "REMOTE_LAB_READY",
+            "selector": args.selector,
+            "socket": harness.socket_path,
+            "listen_host": args.listen_host,
+            "tcp_port": args.tcp_port,
+        }
+        if args.listen_host == "0.0.0.0":
+            payload["connect_hint"] = f"tcp://<container-name>:{args.tcp_port}"
+            payload["note"] = "0.0.0.0 是 listen address；請用同一個 Docker network 內的 container DNS 名稱連線"
+        else:
+            payload["endpoint"] = f"tcp://{args.listen_host}:{args.tcp_port}"
         print(
             json.dumps(
-                {
-                    "ok": True,
-                    "event": "REMOTE_LAB_READY",
-                    "selector": args.selector,
-                    "socket": harness.socket_path,
-                    "endpoint": endpoint,
-                    "listen_host": args.listen_host,
-                    "tcp_port": args.tcp_port,
-                },
+                payload,
                 ensure_ascii=False,
                 separators=(",", ":"),
             ),

@@ -10,6 +10,35 @@ REMOTE_PORT="${REMOTE_PORT:-7777}"
 REMOTE_ENDPOINT="tcp://${REMOTE_NAME}:${REMOTE_PORT}"
 STATUS_FILE="$(mktemp /tmp/serialwrap-remote-status.XXXXXX.json)"
 
+json_extract() {
+  local path="$1"
+  docker run --rm -i "${IMAGE_TAG}" python3 -c '
+import json
+import sys
+
+path = sys.argv[1].split(".")
+current = json.load(sys.stdin)
+for part in path:
+    if not isinstance(current, dict):
+        raise SystemExit(1)
+    current = current.get(part)
+if current is None:
+    raise SystemExit(1)
+print(current)
+' "${path}"
+}
+
+json_command_done() {
+  docker run --rm -i "${IMAGE_TAG}" python3 -c '
+import json
+import sys
+
+obj = json.load(sys.stdin)
+command = obj.get("command") or {}
+raise SystemExit(0 if command.get("status") == "done" else 1)
+'
+}
+
 cleanup() {
   docker rm -f "${REMOTE_NAME}" >/dev/null 2>&1 || true
   docker network rm "${NETWORK_NAME}" >/dev/null 2>&1 || true
@@ -64,35 +93,30 @@ submit_json="$(docker run --rm \
   serialwrap --endpoint "${REMOTE_ENDPOINT}" cmd submit --selector COM0 --cmd 'uname -a')"
 echo "${submit_json}"
 
-cmd_id="$(python3 - <<'PY' "${submit_json}"
-import json
-import sys
-obj = json.loads(sys.argv[1])
-cmd_id = obj.get("cmd_id")
-if not cmd_id:
-    raise SystemExit(1)
-print(cmd_id)
-PY
-)"
+cmd_id="$(printf '%s\n' "${submit_json}" | json_extract cmd_id)"
 
 echo "[serialwrap] wait command done: ${cmd_id}"
+done=0
+last_status_json=""
 for _ in $(seq 1 30); do
-  status_json="$(docker run --rm \
+  last_status_json="$(docker run --rm \
     --network "${NETWORK_NAME}" \
     "${IMAGE_TAG}" \
     serialwrap --endpoint "${REMOTE_ENDPOINT}" cmd status --cmd-id "${cmd_id}")"
-  echo "${status_json}"
-  if python3 - <<'PY' "${status_json}"
-import json
-import sys
-obj = json.loads(sys.argv[1])
-command = obj.get("command") or {}
-raise SystemExit(0 if command.get("status") == "done" else 1)
-PY
-  then
+  echo "${last_status_json}"
+  if printf '%s\n' "${last_status_json}" | json_command_done; then
+    done=1
     break
   fi
   sleep 1
 done
+
+if [[ "${done}" != "1" ]]; then
+  echo "[serialwrap] remote command did not finish in time"
+  if [[ -n "${last_status_json}" ]]; then
+    echo "${last_status_json}"
+  fi
+  exit 1
+fi
 
 echo "[serialwrap] remote smoke PASS"

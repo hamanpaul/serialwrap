@@ -16,19 +16,33 @@ def _parse_endpoint(endpoint: str) -> tuple[str, tuple[str, int] | str]:
 
     解析失敗時 raise ``ValueError``。
     """
-    if endpoint.startswith("tcp://"):
+    if "://" in endpoint:
         parsed = urlsplit(endpoint)
-        host = parsed.hostname
-        port = parsed.port
-        if not host or not port:
-            raise ValueError(f"invalid tcp endpoint: {endpoint!r}")
-        return "tcp", (host, port)
-    if endpoint.startswith("unix://"):
-        parsed = urlsplit(endpoint)
-        path = parsed.path
-        if not path:
-            raise ValueError(f"invalid unix endpoint: {endpoint!r}")
-        return "unix", path
+        if parsed.scheme == "tcp":
+            try:
+                port = parsed.port
+            except ValueError as exc:
+                raise ValueError(f"invalid tcp endpoint: {endpoint!r}") from exc
+            host = parsed.hostname
+            if parsed.path or parsed.query or parsed.fragment or not host or port is None:
+                raise ValueError(f"invalid tcp endpoint: {endpoint!r}")
+            return "tcp", (host, port)
+
+        if parsed.scheme == "unix":
+            path = parsed.path
+            if parsed.netloc:
+                raise ValueError(
+                    f"invalid unix endpoint: {endpoint!r} "
+                    "(unix endpoint must use an absolute path such as 'unix:///path/to/sock')"
+                )
+            if parsed.query or parsed.fragment or not path or not path.startswith("/"):
+                raise ValueError(
+                    f"invalid unix endpoint: {endpoint!r} "
+                    "(unix endpoint path must be absolute)"
+                )
+            return "unix", path
+
+        raise ValueError(f"unsupported endpoint scheme: {parsed.scheme!r}")
     # plain path (backward compat)
     return "unix", endpoint
 
@@ -49,10 +63,13 @@ def rpc_call(socket_path: str, method: str, params: dict[str, Any], *, req_id: i
     try:
         if transport == "tcp":
             sock = socket.create_connection(address, timeout=timeout_s)  # type: ignore[arg-type]
+            sock.settimeout(timeout_s)
         else:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             sock.settimeout(timeout_s)
             sock.connect(address)  # type: ignore[arg-type]
+    except socket.timeout:
+        return {"ok": False, "error_code": "TIMEOUT"}
     except OSError as exc:
         return {"ok": False, "error_code": "SOCKET_ERROR", "message": str(exc)}
 
