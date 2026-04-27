@@ -536,4 +536,42 @@ class SerialwrapService:
                 source=source,
             )
 
+        if method == "event.rule_set":
+            rule = self._engine.rule_set(params or {})
+            return {"ok": True, **dict(rule.raw)}
+        if method == "event.rule_delete":
+            deleted = self._engine.rule_delete(str(params.get("rule_id") or ""))
+            return {"ok": True, "deleted": deleted}
+        if method == "event.rule_list":
+            return {"ok": True, "rules": self._engine.rule_list(
+                selector=params.get("selector"),
+                owner=params.get("owner"),
+            )}
+        if method == "event.rule_get":
+            result = self._engine.rule_get(str(params.get("rule_id") or ""))
+            if result is None:
+                return {"ok": False, "error_code": "RULE_NOT_FOUND"}
+            return {"ok": True, **result}
+        if method == "event.com_enable":
+            return {"ok": True, **self._engine.com_enable(str(params.get("selector") or ""))}
+        if method == "event.com_disable":
+            return {"ok": True, **self._engine.com_disable(str(params.get("selector") or ""))}
+        if method == "event.com_status":
+            return {"ok": True, **self._engine.com_status(params.get("selector"))}
+        if method == "event.reset":
+            cleared = self._engine.reset(
+                rule_id=params.get("rule_id"),
+                selector=params.get("selector"),
+            )
+            return {"ok": True, "cleared": cleared}
+        if method == "event.reload":
+            return {"ok": True, **self._engine.reload()}
+        if method == "event.tail":
+            return {"ok": True, "entries": self._engine.tail(
+                rule_id=params.get("rule_id"),
+                selector=params.get("selector"),
+                since_ts=params.get("since_ts"),
+                n=params.get("n"),
+            )}
+
         return {"ok": False, "error_code": "METHOD_NOT_FOUND", "method": method}
