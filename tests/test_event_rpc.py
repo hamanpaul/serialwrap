@@ -69,6 +69,10 @@ class TestEventRpcDispatch(unittest.TestCase):
         self.assertEqual(cleared, 1)
         self.assertEqual(self.engine._counters.load("o.n").fires, 0)
 
+    def test_rule_set_invalid_schema_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            self.engine.rule_set({"invalid": "rule"})
+
 
 if __name__ == "__main__":
     unittest.main()

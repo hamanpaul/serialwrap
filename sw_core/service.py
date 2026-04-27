@@ -537,8 +537,11 @@ class SerialwrapService:
             )
 
         if method == "event.rule_set":
-            rule = self._engine.rule_set(params or {})
-            return {"ok": True, **dict(rule.raw)}
+            try:
+                rule = self._engine.rule_set(params or {})
+                return {"ok": True, **dict(rule.raw)}
+            except ValueError as e:
+                return {"ok": False, "error_code": "INVALID_RULE_SCHEMA", "error": str(e)}
         if method == "event.rule_delete":
             deleted = self._engine.rule_delete(str(params.get("rule_id") or ""))
             return {"ok": True, "deleted": deleted}
