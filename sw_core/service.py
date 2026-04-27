@@ -8,8 +8,10 @@ from typing import Any
 
 from .arbiter import CommandArbiter
 from .config import ProfileTemplate, SessionProfile
-from .constants import DEVICE_BY_ID_DIR, DEVICE_BY_PATH_DIR
+from .constants import DEVICE_BY_ID_DIR, DEVICE_BY_PATH_DIR, EVENTS_DIR, EVENTS_RUNTIME_DIR, EVENTS_LOG_PATH
 from .device_watcher import DeviceWatcher
+from .event_engine import EventEngine, EngineDeps
+from .event_engine.line_buffer import LineBuffer
 from .session_manager import SessionManager
 from .util import now_iso
 from .wal import WalWriter
@@ -120,6 +122,14 @@ class SerialwrapService:
             on_detached=self._on_detached,
             on_console_line=self._on_console_line,
         )
+        self._engine = EventEngine(EngineDeps(
+            events_dir=EVENTS_DIR,
+            runtime_dir=EVENTS_RUNTIME_DIR,
+            log_path=EVENTS_LOG_PATH,
+            bridge=self._sessions,
+        ))
+        self._engine_line_buffers: dict[str, LineBuffer] = {}
+        self._engine_buffers_lock = threading.Lock()
         self._watcher = DeviceWatcher(
             by_id_dir, self._on_device_change,
             extra_scan_dirs=[by_path_dir],
@@ -130,6 +140,15 @@ class SerialwrapService:
 
     def _on_detached(self, session_id: str) -> None:
         self._arbiter.unregister_session(session_id)
+
+    def _engine_rx_observer(self, com: str, data: bytes, wal_seq: int) -> None:
+        with self._engine_buffers_lock:
+            buf = self._engine_line_buffers.get(com)
+            if buf is None:
+                buf = LineBuffer()
+                self._engine_line_buffers[com] = buf
+        for line in buf.feed(data):
+            self._engine.feed_line(com, line, wal_seq)
 
     def _send_cb(self, session_id: str, command: str, source: str, cmd_id: str, timeout_s: float, mode: str, expected_duration_s: float | None = None) -> dict[str, Any]:
         return self._sessions.execute_command(session_id, command, source, cmd_id, timeout_s=timeout_s, mode=mode, expected_duration_s=expected_duration_s)
@@ -188,6 +207,8 @@ class SerialwrapService:
                 return
             self._running = True
             self._started_at = now_iso()
+        self._engine.start()
+        self._sessions.add_rx_observer(self._engine_rx_observer)
         self._watcher.start()
         self._watcher.poll_once()
         self._sessions.update_devices(self._watcher.devices)
@@ -198,6 +219,7 @@ class SerialwrapService:
             if not self._running:
                 return
             self._running = False
+        self._engine.stop()
         self._watcher.stop()
         for row in self._sessions.list_sessions():
             sid = row["session_id"]
@@ -513,5 +535,46 @@ class SerialwrapService:
                 local_path=str(local_path) if local_path else None,
                 source=source,
             )
+
+        if method == "event.rule_set":
+            try:
+                rule = self._engine.rule_set(params or {})
+                return {"ok": True, **dict(rule.raw)}
+            except ValueError as e:
+                return {"ok": False, "error_code": "INVALID_RULE_SCHEMA", "error": str(e)}
+        if method == "event.rule_delete":
+            deleted = self._engine.rule_delete(str(params.get("rule_id") or ""))
+            return {"ok": True, "deleted": deleted}
+        if method == "event.rule_list":
+            return {"ok": True, "rules": self._engine.rule_list(
+                selector=params.get("selector"),
+                owner=params.get("owner"),
+            )}
+        if method == "event.rule_get":
+            result = self._engine.rule_get(str(params.get("rule_id") or ""))
+            if result is None:
+                return {"ok": False, "error_code": "RULE_NOT_FOUND"}
+            return {"ok": True, **result}
+        if method == "event.com_enable":
+            return {"ok": True, **self._engine.com_enable(str(params.get("selector") or ""))}
+        if method == "event.com_disable":
+            return {"ok": True, **self._engine.com_disable(str(params.get("selector") or ""))}
+        if method == "event.com_status":
+            return {"ok": True, **self._engine.com_status(params.get("selector"))}
+        if method == "event.reset":
+            cleared = self._engine.reset(
+                rule_id=params.get("rule_id"),
+                selector=params.get("selector"),
+            )
+            return {"ok": True, "cleared": cleared}
+        if method == "event.reload":
+            return {"ok": True, **self._engine.reload()}
+        if method == "event.tail":
+            return {"ok": True, "entries": self._engine.tail(
+                rule_id=params.get("rule_id"),
+                selector=params.get("selector"),
+                since_ts=params.get("since_ts"),
+                n=params.get("n"),
+            )}
 
         return {"ok": False, "error_code": "METHOD_NOT_FOUND", "method": method}

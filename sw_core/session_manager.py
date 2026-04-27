@@ -170,6 +170,7 @@ class SessionManager:
         self._on_detached = on_detached
         self._on_console_line = on_console_line
         self._lock = threading.RLock()
+        self._rx_observers: list[Callable[[str, bytes, int], None]] = []
         self._sessions: dict[str, SessionRuntime] = {}
         self._aliases = AliasRegistry()
         self._devices: dict[str, DeviceInfo] = {}
@@ -285,6 +286,32 @@ class SessionManager:
 
     def list_aliases(self) -> list[dict[str, Any]]:
         return self._aliases.list_alias()
+
+    def active_cmd_id_for(self, com: str) -> str | None:
+        with self._lock:
+            session = next(
+                (s for s in self._sessions.values() if s.profile.com == com), None
+            )
+            if session is None:
+                return None
+            return "foreground" if session.foreground_busy else None
+
+    def profile_for(self, com: str) -> str | None:
+        with self._lock:
+            session = next(
+                (s for s in self._sessions.values() if s.profile.com == com), None
+            )
+            if session is None:
+                return None
+            return session.profile.profile_name
+
+    def known_coms(self) -> list[str]:
+        with self._lock:
+            return sorted(s.profile.com for s in self._sessions.values())
+
+    def add_rx_observer(self, observer: Callable[[str, bytes, int], None]) -> None:
+        with self._lock:
+            self._rx_observers.append(observer)
 
     def set_alias_for_session(self, session_id: str, alias: str) -> dict[str, Any]:
         with self._lock:
@@ -544,6 +571,20 @@ class SessionManager:
             self._on_console_line(session_id, client_id, line)
 
     def _on_bridge_rx(self, session_id: str, data: bytes) -> None:
+        # Notify RX observers before foreground_busy gate (observers receive ALL rx).
+        # IMPORTANT: Observer MUST NOT block on I/O or cross-thread wait, and MUST NOT
+        # call SessionManager methods under _lock (deadlock risk). Exceptions are silently swallowed.
+        if self._rx_observers:
+            with self._lock:
+                session = self._sessions.get(session_id)
+                com = session.profile.com if session is not None else session_id
+                wal_seq = self._wal.current_seq
+                observers = list(self._rx_observers)
+            for obs in observers:
+                try:
+                    obs(com, data, wal_seq)
+                except Exception:
+                    pass
         chunk = clean_text(data.decode("utf-8", errors="replace"))
         if not chunk:
             return

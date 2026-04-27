@@ -191,6 +191,56 @@ def _run_rpc(args: argparse.Namespace, method: str, params: dict[str, Any]) -> i
     return 0 if resp.get("ok") else 2
 
 
+def _dispatch_event(args: argparse.Namespace) -> int:
+    if args.event_cmd == "add":
+        with open(args.file, "r", encoding="utf-8") as f:
+            params = json.load(f)
+        result = rpc_call(_resolve_endpoint(args), "event.rule_set", params, timeout_s=args.timeout_s)
+    elif args.event_cmd == "rm":
+        result = rpc_call(_resolve_endpoint(args), "event.rule_delete", {"rule_id": args.rule_id}, timeout_s=args.timeout_s)
+    elif args.event_cmd == "list":
+        result = rpc_call(
+            _resolve_endpoint(args),
+            "event.rule_list",
+            {"selector": getattr(args, "selector", None), "owner": getattr(args, "owner", None)},
+            timeout_s=args.timeout_s,
+        )
+    elif args.event_cmd == "show":
+        result = rpc_call(_resolve_endpoint(args), "event.rule_get", {"rule_id": args.rule_id}, timeout_s=args.timeout_s)
+    elif args.event_cmd == "enable":
+        result = rpc_call(_resolve_endpoint(args), "event.com_enable", {"selector": args.selector}, timeout_s=args.timeout_s)
+    elif args.event_cmd == "disable":
+        result = rpc_call(_resolve_endpoint(args), "event.com_disable", {"selector": args.selector}, timeout_s=args.timeout_s)
+    elif args.event_cmd == "status":
+        result = rpc_call(_resolve_endpoint(args), "event.com_status", {"selector": getattr(args, "selector", None)}, timeout_s=args.timeout_s)
+    elif args.event_cmd == "reset":
+        result = rpc_call(
+            _resolve_endpoint(args),
+            "event.reset",
+            {"rule_id": getattr(args, "rule_id", None), "selector": getattr(args, "selector", None)},
+            timeout_s=args.timeout_s,
+        )
+    elif args.event_cmd == "reload":
+        result = rpc_call(_resolve_endpoint(args), "event.reload", {}, timeout_s=args.timeout_s)
+    elif args.event_cmd == "tail":
+        result = rpc_call(
+            _resolve_endpoint(args),
+            "event.tail",
+            {
+                "rule_id": getattr(args, "rule_id", None),
+                "selector": getattr(args, "selector", None),
+                "n": args.n,
+                "since_ts": getattr(args, "since", None),
+            },
+            timeout_s=args.timeout_s,
+        )
+    else:
+        _print({"ok": False, "error_code": "UNKNOWN_EVENT_CMD", "cmd": args.event_cmd})
+        return 2
+    _print(result)
+    return 0 if result.get("ok") else 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="serialwrap",
@@ -343,6 +393,44 @@ def build_parser() -> argparse.ArgumentParser:
     p_we.add_argument("--limit", type=int, default=1000)
     wal_sub.add_parser("reset")
     wal_sub.add_parser("current-seq")
+
+    p_event = sub.add_parser("event", help="event-trigger rule registry / matcher control")
+    e_sub = p_event.add_subparsers(dest="event_cmd", required=True)
+
+    e_add = e_sub.add_parser("add", help="register or update a rule from JSON file")
+    e_add.add_argument("--file", required=True)
+
+    e_rm = e_sub.add_parser("rm", help="delete a rule by id")
+    e_rm.add_argument("rule_id")
+
+    e_list = e_sub.add_parser("list")
+    e_list.add_argument("--selector")
+    e_list.add_argument("--owner")
+
+    e_show = e_sub.add_parser("show")
+    e_show.add_argument("rule_id")
+
+    e_enable = e_sub.add_parser("enable")
+    e_enable.add_argument("--selector", required=True)
+
+    e_disable = e_sub.add_parser("disable")
+    e_disable.add_argument("--selector", required=True)
+
+    e_status = e_sub.add_parser("status")
+    e_status.add_argument("--selector")
+
+    e_reset = e_sub.add_parser("reset")
+    grp = e_reset.add_mutually_exclusive_group(required=True)
+    grp.add_argument("--rule-id")
+    grp.add_argument("--selector")
+
+    e_reload = e_sub.add_parser("reload")
+
+    e_tail = e_sub.add_parser("tail")
+    e_tail.add_argument("--rule-id")
+    e_tail.add_argument("--selector")
+    e_tail.add_argument("-n", type=int, default=50)
+    e_tail.add_argument("--since", type=int)
 
     return p
 
@@ -501,6 +589,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "wal" and args.wal_cmd == "current-seq":
         return _run_rpc(args, "wal.current_seq", {})
+
+    if args.cmd == "event":
+        return _dispatch_event(args)
 
     _print({"ok": False, "error_code": "INVALID_ARGS"})
     return 2

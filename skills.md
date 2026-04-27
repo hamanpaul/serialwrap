@@ -162,3 +162,48 @@ serialwrap-mcp --endpoint tcp://127.0.0.1:7777 --tool serialwrap_list_sessions
 /home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_file_push --params "{\"selector\":\"COM0\",\"local_path\":\"./fw.bin\",\"remote_path\":\"/tmp/fw.bin\"}"
 /home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_file_pull --params "{\"selector\":\"COM0\",\"remote_path\":\"/etc/config/wireless\"}"
 ```
+
+## Event Trigger Engine
+
+用於 UART RX 觸發自動化 handler。先呼叫 `serialwrap_event_status` 確認狀態。
+
+### 基本使用流程
+
+```bash
+# 1. 寫 rule 檔案（JSON）
+# 2. 載入
+serialwrap event add --file /path/to/rule.json
+# 3. 確認狀態
+serialwrap event status --selector COM0
+# 4. 若未啟用，手動啟用
+serialwrap event enable --selector COM0
+# 5. 查看 fire 記錄
+serialwrap event tail --rule-id owner.name -n 20
+```
+
+### MCP 使用範例
+
+```bash
+# 載入規則
+/home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_event_rule_set --params '{
+  "rule": {
+    "schema_version": 1, "owner": "ops", "name": "panic",
+    "kind": "tool", "selectors": ["COM0"],
+    "pattern": {"kind": "contains", "value": "Kernel panic"},
+    "handler": {"exec": ["/usr/local/bin/alert"]},
+    "auto_enable_com_on_load": true
+  }
+}'
+
+# 查詢狀態（必須在 enable/disable 之前呼叫）
+/home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_event_status --params '{"selector": "COM0"}'
+
+# 查看最近觸發記錄
+/home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_event_tail --params '{"rule_id": "ops.panic", "n": 10}'
+```
+
+### 安全規則
+
+- **先呼叫 `serialwrap_event_status`** 再 enable/disable，避免假設狀態。
+- `auto_enable_com_on_load: true` 的規則在 daemon 重啟後自動啟用。
+- Counter 由 disable/delete/reset 清除；daemon 重啟後 counter 保留（tmpfs 除外）。

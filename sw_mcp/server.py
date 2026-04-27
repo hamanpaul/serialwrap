@@ -46,6 +46,17 @@ _TOOL_MAP = {
     "serialwrap_wal_range": "wal.range",
     "serialwrap_file_push": "file.push",
     "serialwrap_file_pull": "file.pull",
+    # event trigger tools
+    "serialwrap_event_rule_set": "event.rule_set",
+    "serialwrap_event_rule_delete": "event.rule_delete",
+    "serialwrap_event_rule_list": "event.rule_list",
+    "serialwrap_event_rule_get": "event.rule_get",
+    "serialwrap_event_enable": "event.com_enable",
+    "serialwrap_event_disable": "event.com_disable",
+    "serialwrap_event_status": "event.com_status",
+    "serialwrap_event_reset": "event.reset",
+    "serialwrap_event_reload": "event.reload",
+    "serialwrap_event_tail": "event.tail",
 }
 
 # ── 型別縮寫 ──────────────────────────────────────────────────
@@ -281,6 +292,61 @@ _TOOL_DEFS: list[dict[str, Any]] = [
             "local_path": _STR,
         },
         ["selector", "remote_path"],
+    ),
+    # ── event trigger ─────────────────────────────────────────
+    _td(
+        "serialwrap_event_rule_set",
+        "註冊或更新一條 event rule（idempotent upsert）。重要：daemon failover 後，rule 的 auto_enable_com_on_load 會自動把 COM 重新打開。請在設定前先呼叫 serialwrap_event_status 確認當下狀態，避免假設 fresh state。",
+        {"rule": {"type": "object"}},
+        ["rule"],
+    ),
+    _td(
+        "serialwrap_event_rule_delete",
+        "刪除指定 rule_id 的 event rule（連同 counter）。重要：daemon failover 後，rule 的 auto_enable_com_on_load 會自動把 COM 重新打開。請在設定前先呼叫 serialwrap_event_status 確認當下狀態，避免假設 fresh state。",
+        {"rule_id": _STR},
+        ["rule_id"],
+    ),
+    _td(
+        "serialwrap_event_rule_list",
+        "列舉 event rule。重要：daemon failover 後，rule 的 auto_enable_com_on_load 會自動把 COM 重新打開。請在設定前先呼叫 serialwrap_event_status 確認當下狀態，避免假設 fresh state。",
+        {"selector": _STR, "owner": _STR},
+    ),
+    _td(
+        "serialwrap_event_rule_get",
+        "取單一 event rule（含 counter）。重要：daemon failover 後，rule 的 auto_enable_com_on_load 會自動把 COM 重新打開。請在設定前先呼叫 serialwrap_event_status 確認當下狀態，避免假設 fresh state。",
+        {"rule_id": _STR},
+        ["rule_id"],
+    ),
+    _td(
+        "serialwrap_event_enable",
+        "啟用某 COM 上的 event matcher。注意 rule.auto_enable_com_on_load 會在 daemon 啟動時自動把對應 COM 打開，請先呼叫 serialwrap_event_status 確認當下狀態。",
+        {"selector": _STR},
+        ["selector"],
+    ),
+    _td(
+        "serialwrap_event_disable",
+        "停用某 COM 的 event matcher 並清除其上 rule 的 counter。重要：daemon failover 後，rule 的 auto_enable_com_on_load 會自動把 COM 重新打開。請在設定前先呼叫 serialwrap_event_status 確認當下狀態，避免假設 fresh state。",
+        {"selector": _STR},
+        ["selector"],
+    ),
+    _td(
+        "serialwrap_event_status",
+        "查詢 COM event matcher 狀態與 active rules（請在 enable/disable 前先呼叫此工具）。重要：daemon failover 後，rule 的 auto_enable_com_on_load 會自動把 COM 重新打開。請在設定前先呼叫 serialwrap_event_status 確認當下狀態，避免假設 fresh state。",
+        {"selector": _STR},
+    ),
+    _td(
+        "serialwrap_event_reset",
+        "清除指定 rule 或某 COM 上 rule 的 counter（不刪除 rule）。重要：daemon failover 後，rule 的 auto_enable_com_on_load 會自動把 COM 重新打開。請在設定前先呼叫 serialwrap_event_status 確認當下狀態，避免假設 fresh state。",
+        {"rule_id": _STR, "selector": _STR},
+    ),
+    _td(
+        "serialwrap_event_reload",
+        "重新掃描 events.d/，diff apply rule 變更。重要：daemon failover 後，rule 的 auto_enable_com_on_load 會自動把 COM 重新打開。請在設定前先呼叫 serialwrap_event_status 確認當下狀態，避免假設 fresh state。",
+    ),
+    _td(
+        "serialwrap_event_tail",
+        "tail event log。重要：daemon failover 後，rule 的 auto_enable_com_on_load 會自動把 COM 重新打開。請在設定前先呼叫 serialwrap_event_status 確認當下狀態，避免假設 fresh state。",
+        {"rule_id": _STR, "selector": _STR, "n": _INT, "since_ts": _INT},
     ),
 ]
 
