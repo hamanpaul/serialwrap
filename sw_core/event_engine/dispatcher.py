@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -134,7 +135,20 @@ class Dispatcher:
         if self._executor is None:
             self.start()
         assert self._executor is not None
-        self._executor.submit(self._run_handler, fire, matched_line)
+        try:
+            self._executor.submit(self._run_handler, fire, matched_line)
+        except Exception as exc:
+            with self._lock:
+                self._busy_rules.discard(rule.rule_id)
+                self._inflight -= 1
+                if self._inflight == 0:
+                    self._idle.set()
+            self._emit({
+                "type": "fire_failed",
+                "rule_id": rule.rule_id,
+                "selector": fire.selector,
+                "reason": str(exc),
+            })
 
     def _run_handler(self, fire: MatcherFire, matched_line: str) -> None:
         rule = fire.rule
@@ -161,8 +175,9 @@ class Dispatcher:
                     stderr=subprocess.PIPE,
                     env=env,
                     close_fds=True,
+                    start_new_session=True,
                 )
-            except (FileNotFoundError, PermissionError) as exc:
+            except OSError as exc:
                 self._emit({
                     "type": "fire_failed",
                     "rule_id": rule.rule_id,
@@ -187,11 +202,21 @@ class Dispatcher:
                     "wal_seq": fire.wal_seq,
                 })
             except subprocess.TimeoutExpired:
-                proc.terminate()
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
                 try:
                     proc.wait(timeout=1.0)
                 except subprocess.TimeoutExpired:
-                    proc.kill()
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                try:
+                    proc.communicate()
+                except Exception:
+                    pass
                 duration = int((time.time() - start) * 1000)
                 self._emit({
                     "type": "fire_timeout",
