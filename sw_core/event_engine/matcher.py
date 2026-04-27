@@ -125,6 +125,11 @@ class MatcherWorker:
             except queue.Full:
                 pass
             self._thread.join(timeout=2.0)
+            if self._thread.is_alive():
+                import logging
+                logging.getLogger(__name__).warning(
+                    "event-matcher thread did not exit within 2s; context may receive late callbacks"
+                )
             self._thread = None
 
     def replace_rules(self, rules: Iterable[Rule]) -> None:
@@ -183,7 +188,12 @@ class MatcherWorker:
                 try:
                     self._queue.put_nowait(item)
                 except queue.Full:
-                    pass
+                    self._ctx.emit_dropped({
+                        "type": "event_dropped",
+                        "reason": "matcher_queue_overflow",
+                        "selector": item.selector,
+                        "wal_seq": item.wal_seq,
+                    })
                 continue
             try:
                 self._evaluate(item)
