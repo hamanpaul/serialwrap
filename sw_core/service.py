@@ -129,7 +129,7 @@ class SerialwrapService:
             bridge=self._sessions,
         ))
         self._engine_line_buffers: dict[str, LineBuffer] = {}
-        self._sessions.add_rx_observer(self._engine_rx_observer)
+        self._engine_buffers_lock = threading.Lock()
         self._watcher = DeviceWatcher(
             by_id_dir, self._on_device_change,
             extra_scan_dirs=[by_path_dir],
@@ -142,10 +142,11 @@ class SerialwrapService:
         self._arbiter.unregister_session(session_id)
 
     def _engine_rx_observer(self, com: str, data: bytes, wal_seq: int) -> None:
-        buf = self._engine_line_buffers.get(com)
-        if buf is None:
-            buf = LineBuffer()
-            self._engine_line_buffers[com] = buf
+        with self._engine_buffers_lock:
+            buf = self._engine_line_buffers.get(com)
+            if buf is None:
+                buf = LineBuffer()
+                self._engine_line_buffers[com] = buf
         for line in buf.feed(data):
             self._engine.feed_line(com, line, wal_seq)
 
@@ -207,6 +208,7 @@ class SerialwrapService:
             self._running = True
             self._started_at = now_iso()
         self._engine.start()
+        self._sessions.add_rx_observer(self._engine_rx_observer)
         self._watcher.start()
         self._watcher.poll_once()
         self._sessions.update_devices(self._watcher.devices)

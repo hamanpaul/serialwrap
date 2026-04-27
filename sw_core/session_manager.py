@@ -571,7 +571,9 @@ class SessionManager:
             self._on_console_line(session_id, client_id, line)
 
     def _on_bridge_rx(self, session_id: str, data: bytes) -> None:
-        # Notify rx observers with raw data for ALL rx, including during foreground cmds
+        # Notify RX observers before foreground_busy gate (observers receive ALL rx).
+        # IMPORTANT: Observer MUST NOT block on I/O or cross-thread wait, and MUST NOT
+        # call SessionManager methods under _lock (deadlock risk). Exceptions are silently swallowed.
         if self._rx_observers:
             with self._lock:
                 session = self._sessions.get(session_id)
