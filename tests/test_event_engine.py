@@ -99,5 +99,50 @@ class TestEventEngine(unittest.TestCase):
         self.fail(f"file did not appear: {path}")
 
 
+class TestBridgeWiring(unittest.TestCase):
+    def test_engine_receives_lines_from_bridge_callback(self) -> None:
+        import pty
+        import os as _os
+        from sw_core.uart_io import UARTBridge
+        from sw_core.wal import WalWriter
+        from sw_core.config import UartProfile
+
+        master, slave = _os.openpty()
+        try:
+            received: list[tuple[str, str, int]] = []
+
+            wal_dir = tempfile.mkdtemp(prefix="sw-wal-")
+            wal = WalWriter(wal_dir=wal_dir)
+
+            def on_rx(data: bytes) -> None:
+                for line in data.decode("utf-8", errors="replace").splitlines():
+                    received.append(("COMTEST", line, 0))
+
+            profile = UartProfile()
+            bridge = UARTBridge(
+                com="COMTEST",
+                device_path=_os.ttyname(slave),
+                profile=profile,
+                wal=wal,
+                on_rx_data=on_rx,
+            )
+            bridge.start()
+            try:
+                _os.write(master, b"panic now\n")
+                end = time.time() + 2.0
+                while time.time() < end and not received:
+                    time.sleep(0.02)
+                self.assertTrue(len(received) > 0)
+                self.assertIn("panic now", [r[1] for r in received])
+            finally:
+                bridge.stop()
+        finally:
+            _os.close(master)
+            try:
+                _os.close(slave)
+            except OSError:
+                pass
+
+
 if __name__ == "__main__":
     unittest.main()
