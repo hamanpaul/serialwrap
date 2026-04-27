@@ -1,0 +1,72 @@
+---
+meta:
+  name: ev-01-spawn-handler
+  category: event-engine
+  severity: high
+  description: "端到端：UART 行 → event rule → spawned handler"
+  tags: ["event", "handler", "spawn"]
+
+target:
+  platform: prpl
+  boot_banner: "boot done\r\nroot@prplOS:/# "
+  noise:
+    enabled: false
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+
+profile:
+  prompt_regex: '(?m)^root@prplOS:.*# '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+
+steps:
+  - action: wait_ready
+    timeout_s: 20
+
+  - action: shell
+    cmd: |
+      cat > /home/paul_chen/sw-ev-test-rule.json <<'JSON'
+      {
+        "schema_version": 1,
+        "owner": "ev",
+        "name": "panic-marker",
+        "kind": "tool",
+        "selectors": ["COM0"],
+        "pattern": {"kind": "contains", "value": "Kernel panic"},
+        "handler": {"shell": "touch /home/paul_chen/sw-ev-test-fired"},
+        "auto_enable_com_on_load": true,
+        "timeout_ms": 3000
+      }
+      JSON
+      rm -f /home/paul_chen/sw-ev-test-fired
+
+  - action: cli
+    argv: [event, add, --file, /home/paul_chen/sw-ev-test-rule.json]
+    expect:
+      ok: true
+
+  - action: cli
+    argv: [event, status, --selector, COM0]
+    expect:
+      ok: true
+
+  - action: sleep
+    seconds: 1.0
+
+  - action: target_emit
+    payload: "Kernel panic - not syncing\n"
+
+  - action: wait_for_file
+    path: /home/paul_chen/sw-ev-test-fired
+    timeout_s: 8
+
+  - action: cli
+    argv: [event, tail, --rule-id, ev.panic-marker, -n, "10"]
+    save_as: tail_resp
+    expect:
+      ok: true
+      has_keys: ["entries"]
+
+  # Cleanup
+  - action: shell
+    cmd: rm -f /home/paul_chen/sw-ev-test-fired /home/paul_chen/sw-ev-test-rule.json

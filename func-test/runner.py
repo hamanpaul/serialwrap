@@ -19,6 +19,7 @@ import argparse
 import os
 import pathlib
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -120,6 +121,9 @@ class TestRunner:
             "inject_device_event": self._step_inject_device_event,
             "target_stop_responding": self._step_target_stop,
             "repeat": self._step_repeat,
+            "shell": self._step_shell,
+            "target_emit": self._step_target_emit,
+            "wait_for_file": self._step_wait_for_file,
         }.get(action)
 
         if handler is None:
@@ -394,6 +398,39 @@ class TestRunner:
             self._log(f"Repeat {iteration + 1}/{count}")
             for si, sub in enumerate(sub_steps):
                 self._exec_step(sub, step_idx=idx * 1000 + iteration * 100 + si)
+
+    def _step_shell(self, step: dict[str, Any], idx: int) -> None:
+        cmd = step.get("cmd", "")
+        timeout = step.get("timeout", 10.0)
+        result = subprocess.run(
+            cmd, shell=True, timeout=timeout, capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            raise StepError(
+                f"步驟 {idx} (shell): 命令失敗 rc={result.returncode}\n"
+                f"stdout: {result.stdout}\nstderr: {result.stderr}"
+            )
+        self._log(f"Shell OK: {cmd[:60]}")
+
+    def _step_target_emit(self, step: dict[str, Any], idx: int) -> None:
+        assert self.harness is not None
+        payload = step.get("payload", "")
+        data = payload.encode("utf-8")
+        if self.harness.fake_target is None:
+            raise StepError(f"步驟 {idx}: 無 fake target")
+        os.write(self.harness.fake_target.master_fd, data)
+        self._log(f"target_emit: {repr(payload[:40])}")
+
+    def _step_wait_for_file(self, step: dict[str, Any], idx: int) -> None:
+        path = step.get("path", "")
+        timeout_s = step.get("timeout_s", 5.0)
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if os.path.exists(path):
+                self._log(f"檔案出現: {path}")
+                return
+            time.sleep(0.1)
+        raise StepError(f"步驟 {idx}: 等待檔案逾時 {timeout_s}s: {path}")
 
 
 # -- 主程式 --
