@@ -81,9 +81,7 @@ class RuleRegistry:
         path = self.path_for(rule_id)
         try:
             with open(path, "r", encoding="utf-8") as f:
-                rule = validate_rule_dict(json.load(f))
-                self._cache[rule_id] = rule
-                return rule
+                return validate_rule_dict(json.load(f))
         except FileNotFoundError:
             return None
         except (OSError, json.JSONDecodeError, RuleSchemaError) as exc:
@@ -94,7 +92,7 @@ class RuleRegistry:
         path = self.path_for(rule.rule_id)
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(rule.raw, f, ensure_ascii=False, indent=2, sort_keys=True)
+            json.dump(dict(rule.raw), f, ensure_ascii=False, indent=2, sort_keys=True)
             f.flush()
             os.fsync(f.fileno())
         os.rename(tmp, path)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import types
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -43,7 +44,7 @@ class Rule:
     handler: Handler
     auto_enable_com_on_load: bool
     debug: bool
-    raw: dict[str, Any] = field(default_factory=dict)
+    raw: types.MappingProxyType = field(default_factory=dict)
 
 
 class RuleSchemaError(ValueError):
@@ -142,7 +143,7 @@ def validate_rule_dict(obj: dict[str, Any]) -> Rule:
         handler=handler,
         auto_enable_com_on_load=bool(obj.get("auto_enable_com_on_load", True)),
         debug=bool(obj.get("debug", False)),
-        raw=dict(obj),
+        raw=types.MappingProxyType(dict(obj)),
     )
 
 

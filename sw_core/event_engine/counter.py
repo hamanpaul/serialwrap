@@ -19,7 +19,7 @@ class Counter:
     def from_json(cls, obj: dict) -> "Counter":
         return cls(
             fires=int(obj.get("fires", 0)),
-            last_fire_ts=obj.get("last_fire_ts"),
+            last_fire_ts=int(obj["last_fire_ts"]) if obj.get("last_fire_ts") is not None else None,
             exhausted=bool(obj.get("exhausted", False)),
         )
 
