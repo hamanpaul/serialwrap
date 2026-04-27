@@ -864,6 +864,66 @@ serialwrap-mcp --endpoint tcp://127.0.0.1:7777
 3. 起一個 remote daemon container（內含 fake target + `serialwrapd` + `socat`）
 4. 再起一個 client container，驗證 `daemon status` / `session list` / `cmd submit` / `cmd status`
 
+## Event Trigger Engine（Issue #37）
+
+Event Trigger Engine 讓 daemon 持續監聽每個 COM 的 UART RX 行，當輸出符合指定 pattern 時自動 spawn 一個 handler process。
+
+### 規則格式
+
+規則為 JSON/YAML 檔，儲存在 `~/.serialwrap/events.d/`：
+
+```json
+{
+  "schema_version": 1,
+  "owner": "ops",
+  "name": "kernel-panic",
+  "kind": "tool",
+  "selectors": ["COM0"],
+  "pattern": {"kind": "contains", "value": "Kernel panic"},
+  "handler": {"exec": ["/usr/local/bin/notify-on-panic", "--selector", "COM0"]},
+  "auto_enable_com_on_load": true,
+  "max_fires": 3,
+  "cooldown_ms": 5000,
+  "timeout_ms": 10000
+}
+```
+
+`rule_id` = `{owner}.{name}`（例：`ops.kernel-panic`）。
+
+### CLI 子命令
+
+```bash
+serialwrap event add --file rule.json        # 載入或更新規則
+serialwrap event rm ops.kernel-panic         # 刪除規則
+serialwrap event list [--selector COM0]      # 列舉規則
+serialwrap event show ops.kernel-panic       # 查看單一規則 + counter
+serialwrap event enable --selector COM0      # 啟用 COM0 的 matcher
+serialwrap event disable --selector COM0     # 停用並清除 counter
+serialwrap event status [--selector COM0]    # 查詢 COM matcher 狀態
+serialwrap event reset --rule-id ops.kernel-panic   # 清除指定規則 counter
+serialwrap event reload                      # 重新掃描 events.d/ 目錄
+serialwrap event tail --rule-id ops.kernel-panic -n 20  # 查看最近 fire 記錄
+```
+
+### MCP 工具
+
+| 工具名稱 | 對應 CLI |
+|----------|---------|
+| `serialwrap_event_rule_set` | `event add` |
+| `serialwrap_event_rule_delete` | `event rm` |
+| `serialwrap_event_rule_list` | `event list` |
+| `serialwrap_event_rule_get` | `event show` |
+| `serialwrap_event_enable` | `event enable` |
+| `serialwrap_event_disable` | `event disable` |
+| `serialwrap_event_status` | `event status` |
+| `serialwrap_event_reset` | `event reset` |
+| `serialwrap_event_reload` | `event reload` |
+| `serialwrap_event_tail` | `event tail` |
+
+> ⚠️ **安全規則**：在呼叫 `serialwrap_event_enable` 或 `serialwrap_event_disable` 之前，**必須先呼叫 `serialwrap_event_status`** 確認當下狀態。若規則設定了 `auto_enable_com_on_load: true`，daemon 重啟後 COM 會自動回到啟用狀態。
+
+詳細設計請見 [`docs/plan-event-trigger.md`](./docs/plan-event-trigger.md)。
+
 ## 延伸閱讀
 
 - 詳細決策與 API 契約：[`docs/serialwrap-spec.md`](./docs/serialwrap-spec.md)
