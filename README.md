@@ -922,6 +922,19 @@ serialwrap event tail --rule-id ops.kernel-panic -n 20  # 查看最近 fire 記�
 
 > ⚠️ **安全規則**：在呼叫 `serialwrap_event_enable` 或 `serialwrap_event_disable` 之前，**必須先呼叫 `serialwrap_event_status`** 確認當下狀態。若規則設定了 `auto_enable_com_on_load: true`，daemon 重啟後 COM 會自動回到啟用狀態。
 
+### Handler 撰寫守則
+
+由 event engine 觸發的 handler script **必須**：
+- 在 `timeout_ms`（預設 10s）內結束；超時會依序收到 SIGTERM（pgid）→ SIGKILL（pgid）
+- **不可呼叫 `setsid()`** 或主動 daemonize，否則子進程會脫離 process group，timeout 無法強制終止
+- 從 stdin 讀取 JSON payload（含 `com`、`rule_id`、`matched_text`、`trigger_ts` 等欄位）
+- 以 exit code 0 代表成功，非 0 代表失敗（均記入 events.ndjson）
+
+Handler **建議**：
+- 保持冪等性（同一 pattern 可能觸發多次）
+- 輸出寫到 syslog 或獨立 log 檔（stdout/stderr 僅保留最後 4 KB）
+- 響應 SIGTERM 做 graceful shutdown
+
 詳細設計請見 [`docs/plan-event-trigger.md`](./docs/plan-event-trigger.md)。
 
 ## 延伸閱讀
