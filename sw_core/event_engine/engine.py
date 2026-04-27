@@ -147,18 +147,22 @@ class EventEngine:
         return out
 
     def rule_get(self, rule_id: str) -> dict | None:
-        rule = self._registry.get(rule_id)
+        with self._lock:
+            rule = next((r for r in self._rules if r.rule_id == rule_id), None)
         if rule is None:
             return None
         counter = self._counters.load(rule_id)
-        return {"rule": rule.raw, "counter": counter.to_json()}
+        return {"rule": dict(rule.raw), "counter": counter.to_json()}
 
     def reload(self) -> dict:
         with self._lock:
             previous = list(self._rules)
         diff = self._registry.diff_against(previous)
+        load = self._registry.load_all()
+        for fail in load.failed:
+            self._log.write({"type": "rule_load_failed", "path": fail.path, "reason": fail.reason})
         with self._lock:
-            current = self._registry.load_all().rules
+            current = load.rules
             self._rules = current
             if self._matcher is not None:
                 self._matcher.replace_rules(self._rules)
