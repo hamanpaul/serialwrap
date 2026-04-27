@@ -144,5 +144,18 @@ class TestBridgeWiring(unittest.TestCase):
                 pass
 
 
+class TestSessionManagerHelpers(unittest.TestCase):
+    def test_helpers_exist(self) -> None:
+        import threading
+        from sw_core.session_manager import SessionManager
+        sm = SessionManager.__new__(SessionManager)
+        sm._lock = threading.RLock()
+        sm._sessions = {}
+        sm._rx_observers = []
+        self.assertIsNone(sm.active_cmd_id_for("COM-none"))
+        self.assertIsNone(sm.profile_for("COM-none"))
+        self.assertEqual(sm.known_coms(), [])
+
+
 if __name__ == "__main__":
     unittest.main()
