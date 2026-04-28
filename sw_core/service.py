@@ -274,6 +274,18 @@ class SerialwrapService:
             selector = str(params.get("selector") or "")
             return self._sessions.get_session_state(selector)
 
+        if method == "session.activity":
+            selector = str(
+                params.get("selector")
+                or params.get("session_id")
+                or params.get("com")
+                or params.get("alias")
+                or ""
+            )
+            if not selector:
+                return {"ok": False, "error_code": "INVALID_ARGS"}
+            return self._sessions.get_session_state(selector)
+
         if method == "session.self_test":
             selector = str(params.get("selector") or params.get("session_id") or params.get("com") or params.get("alias") or "")
             timeout_s = float(params.get("timeout_s") or 2.0)
