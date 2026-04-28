@@ -9,6 +9,8 @@ import shlex
 import uuid
 from typing import TYPE_CHECKING, Any
 
+from .util import strip_ansi
+
 if TYPE_CHECKING:
     from .uart_io import UARTBridge
 
@@ -197,5 +199,5 @@ def _extract_between_sentinels(text: str) -> str | None:
     if begin_idx < 0 or end_idx < 0 or end_idx <= begin_idx:
         return None
     content = text[begin_idx + len(_SENTINEL_BEGIN) : end_idx]
-    # 去除空白與換行，只保留有效 base64 字元
-    return re.sub(r"\s+", "", content)
+    # 去除 ANSI 逸出序列（顏色、游標控制、括弧貼上模式等），再去除空白
+    return re.sub(r"\s+", "", strip_ansi(content))

@@ -258,6 +258,44 @@ class TestPullFileSuccess(unittest.TestCase):
         if os.path.exists("config.txt"):
             os.unlink("config.txt")
 
+    def test_pull_with_ansi_contamination(self) -> None:
+        """pull_file should work with ANSI-contaminated base64 output."""
+        data = b"binary\x00\x01\x02file"
+        b64 = base64.b64encode(data).decode("ascii")
+        md5 = hashlib.md5(data).hexdigest()
+        from sw_core.file_transfer import _SENTINEL_BEGIN, _SENTINEL_END
+
+        bridge = _FakeBridge()
+        # Contaminate the base64 with ANSI color codes and bracketed-paste markers
+        b64_with_ansi = (
+            f"{b64[:8]}\x1b[0m{b64[8:16]}\x1b[31m"
+            f"{b64[16:24]}\x1b[?2004h{b64[24:]}\x1b[?2004l\x1b[0m"
+        )
+        bridge.enqueue_rx(
+            f"echo start\r\n{_SENTINEL_BEGIN}\r\n"
+            f"{b64_with_ansi}\r\n"
+            f"{_SENTINEL_END}\r\n{_PROMPT}"
+        )
+        bridge.enqueue_rx(f"{md5}  /tmp/binary.bin\r\n{_PROMPT}")
+
+        outdir = tempfile.mkdtemp()
+        local = os.path.join(outdir, "ansi_pull.bin")
+        try:
+            result = pull_file(
+                bridge, "/tmp/binary.bin", local,
+                timeout_s=5.0,
+                prompt_regex=_PROMPT_REGEX,
+            )
+            self.assertTrue(result["ok"], f"Pull failed: {result}")
+            self.assertEqual(result["bytes"], len(data))
+            self.assertEqual(result["md5"], md5)
+            with open(local, "rb") as f:
+                self.assertEqual(f.read(), data)
+        finally:
+            if os.path.exists(local):
+                os.unlink(local)
+            os.rmdir(outdir)
+
 
 class TestPushChunkBoundary(unittest.TestCase):
     """邊界測試：空檔、恰好一個 chunk、多個 chunk。"""
@@ -373,6 +411,30 @@ class TestExtractBetweenSentinels(unittest.TestCase):
         text = "===SW_XFER_BEGIN======SW_XFER_END==="
         result = _extract_between_sentinels(text)
         self.assertEqual(result, "")
+
+    def test_ansi_color_sequences(self) -> None:
+        """ANSI color codes embedded in base64 should be stripped."""
+        clean_b64 = "aGVsbG8gd29ybGQ="
+        # Inject ANSI color codes (SGR reset, red foreground, etc.)
+        text = (
+            "===SW_XFER_BEGIN===\r\n"
+            f"\x1b[0m{clean_b64[:8]}\x1b[31m{clean_b64[8:]}\x1b[0m"
+            "\r\n===SW_XFER_END==="
+        )
+        result = _extract_between_sentinels(text)
+        self.assertEqual(result, clean_b64)
+
+    def test_bracketed_paste_marker(self) -> None:
+        """Bracketed paste mode sequences should be stripped."""
+        clean_b64 = "aGVsbG8="
+        # \x1b[?2004h and \x1b[?2004l are bracketed-paste enable/disable
+        text = (
+            "===SW_XFER_BEGIN===\r\n"
+            f"\x1b[?2004h{clean_b64}\x1b[?2004l"
+            "\r\n===SW_XFER_END==="
+        )
+        result = _extract_between_sentinels(text)
+        self.assertEqual(result, clean_b64)
 
 
 class TestPullParseFailed(unittest.TestCase):
