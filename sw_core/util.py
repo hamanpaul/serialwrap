@@ -35,6 +35,13 @@ def to_printable(data: bytes) -> str:
 
 _ANSI_RE = re.compile(r"\x1B\[[0-9;?]*[A-Za-z]")
 _OSC_RE = re.compile(r"\x1B\][^\x07]*(\x07|\x1B\\)")
+_ESC_RE = re.compile(
+    r"\x1b(?:"
+    r"\[[0-?]*[ -/]*[@-~]"
+    r"|\][^\x07]*\x07"
+    r"|[@-Z\\-_]"
+    r")"
+)
 _TRAILING_CONTINUATION_RE = re.compile(r"(?:\|\|?|\&\&)\s*$")
 
 
@@ -53,6 +60,10 @@ def clean_text(text: str) -> str:
             continue
         out.append(ch)
     return "".join(out)
+
+
+def strip_ansi(text: str) -> str:
+    return _ESC_RE.sub("", text)
 
 
 def shell_command_incomplete_reason(command: str) -> str | None:

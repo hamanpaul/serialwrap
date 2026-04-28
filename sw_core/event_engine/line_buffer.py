@@ -1,12 +1,6 @@
 from __future__ import annotations
 
-import re
-
-_ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*\x07|[@-Z\\-_])")
-
-
-def strip_ansi(text: str) -> str:
-    return _ANSI_RE.sub("", text)
+from sw_core.util import strip_ansi  # noqa: F401 – re-exported for callers
 
 
 class LineBuffer:
