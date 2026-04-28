@@ -93,7 +93,6 @@ class SessionCapture:
 class SessionRuntime:
     session_id: str
     profile: SessionProfile
-    state: str = "DETACHED"
     last_error: str | None = None
     detached_at: str | None = None
     last_ready_at: str | None = None
@@ -113,6 +112,43 @@ class SessionRuntime:
     retained_human_timeout_s: float | None = None
     fg_cmd_started_mono: float | None = None
     fg_cmd_expected_duration_s: float | None = None
+    # Activity tracking (issue #34)
+    last_state_change_at: str | None = None
+    last_rx_at: str | None = None
+    last_tx_at: str | None = None
+    last_probe_at: str | None = None
+    last_rx_mono: float = 0.0
+    last_tx_mono: float = 0.0
+    _state: str = dataclasses.field(default="DETACHED", init=False, repr=False)
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @state.setter
+    def state(self, value: str) -> None:
+        prev = getattr(self, "_state", None)
+        if prev is not None and prev != value:
+            self.last_state_change_at = now_iso()
+        self._state = value
+
+    def compute_idle_ms(self) -> int | None:
+        last = max(self.last_rx_mono, self.last_tx_mono)
+        if last == 0.0:
+            return None
+        return int((time.monotonic() - last) * 1000)
+
+    def classify_activity(self) -> str:
+        if self._state not in ("READY", "ATTACHED"):
+            return "offline"
+        idle = self.compute_idle_ms()
+        if idle is None:
+            return "newly-attached"
+        if idle < 5_000:
+            return "active"
+        if idle < 60_000:
+            return "idle-healthy"
+        return "quiet-suspicious"
 
     def to_public_dict(self) -> dict[str, Any]:
         console_count = 0
@@ -123,6 +159,7 @@ class SessionRuntime:
         vtty_path = self.vtty_path
         if vtty_path is None and self.retained_consoles is not None:
             vtty_path = self.retained_consoles.primary_vtty()
+        outstanding = len(self.background_cmd_ids) + (1 if self.foreground_busy else 0)
         return {
             "session_id": self.session_id,
             "profile": self.profile.profile_name,
@@ -143,6 +180,13 @@ class SessionRuntime:
             "foreground_busy": self.foreground_busy,
             "fg_cmd_expected_duration_s": self.fg_cmd_expected_duration_s,
             "console_count": console_count,
+            "last_state_change_at": self.last_state_change_at,
+            "last_rx_at": self.last_rx_at,
+            "last_tx_at": self.last_tx_at,
+            "last_probe_at": self.last_probe_at,
+            "idle_for_ms": self.compute_idle_ms(),
+            "outstanding_commands": outstanding,
+            "activity_classification": self.classify_activity(),
             "capture": {
                 "capture_id": self.active_capture.capture_id,
                 "log_path": self.active_capture.log_path,
@@ -566,6 +610,16 @@ class SessionManager:
             for session in targets:
                 self._detach_session_locked(session, reason=reason)
 
+    def _mark_session_rx(self, session: SessionRuntime) -> None:
+        """Update session's last_rx_at / last_rx_mono. Cheap; safe outside lock."""
+        session.last_rx_at = now_iso()
+        session.last_rx_mono = time.monotonic()
+
+    def _mark_session_tx(self, session: SessionRuntime) -> None:
+        """Update session's last_tx_at / last_tx_mono. Cheap; safe outside lock."""
+        session.last_tx_at = now_iso()
+        session.last_tx_mono = time.monotonic()
+
     def _on_bridge_console_line(self, session_id: str, client_id: str, line: str) -> None:
         if self._on_console_line is not None:
             self._on_console_line(session_id, client_id, line)
@@ -590,7 +644,10 @@ class SessionManager:
             return
         with self._lock:
             session = self._sessions.get(session_id)
-            if session is None or session.foreground_busy:
+            if session is None:
+                return
+            self._mark_session_rx(session)
+            if session.foreground_busy:
                 return
             # agent log capture
             cap = session.active_capture
@@ -1157,6 +1214,7 @@ class SessionManager:
     ) -> dict[str, Any]:
         prompt_regex = session.profile.prompt_regex
         pre_offset = bridge.rx_snapshot_len()
+        self._mark_session_tx(session)
         bridge.send_command(command, source=source, cmd_id=cmd_id)
         if bridge.wait_for_regex_from(prompt_regex, pre_offset, min(timeout_s, 2.0)):
             raw_text = bridge.rx_text_from(pre_offset)
@@ -1273,6 +1331,7 @@ class SessionManager:
                         capture.status = "done"
                 lease = self._open_interactive_locked(session, owner=source, timeout_s=max(timeout_s, session.profile.hard_timeout_s))
             if command:
+                self._mark_session_tx(session)
                 bridge.send_command(command, source=source, cmd_id=cmd_id)
             return {
                 "ok": True,
@@ -1309,6 +1368,7 @@ class SessionManager:
                     session.fg_cmd_expected_duration_s = None
         pre_offset = bridge.rx_snapshot_len()
         try:
+            self._mark_session_tx(session)
             bridge.send_command(command, source=source, cmd_id=cmd_id)
 
             # — heartbeat / keepalive 迴圈 —
@@ -1404,6 +1464,7 @@ class SessionManager:
 
         for action_name, payload in (("CTRL_C", b"\x03"), ("CTRL_D", b"\x04")):
             offset = bridge.rx_snapshot_len()
+            self._mark_session_tx(session)
             bridge.send_bytes(payload, source="system:recover", cmd_id=None)
             if bridge.wait_for_regex_from(prompt_regex, offset, min(timeout_s, 2.0)):
                 stdout = self._extract_command_stdout(bridge.rx_text_from(pre_offset), command, prompt_regex)
@@ -1508,6 +1569,7 @@ class SessionManager:
             lease = self._open_interactive_locked(session, owner=owner, timeout_s=timeout_s)
             bridge = session.bridge
         if command:
+            self._mark_session_tx(session)
             bridge.send_command(command, source=owner, cmd_id=None)
         return {
             "ok": True,
@@ -1551,6 +1613,7 @@ class SessionManager:
             if session is None or session.bridge is None:
                 return {"ok": False, "error_code": "SESSION_NOT_READY", "interactive_id": interactive_id}
             payload = self._encode_interactive_payload(data, encoding)
+            self._mark_session_tx(session)
             session.bridge.send_bytes(payload, source=lease.owner, cmd_id=None)
             lease.touch()
             return {"ok": True, "interactive_id": interactive_id, "bytes": len(payload)}
@@ -1678,6 +1741,8 @@ class SessionManager:
             nonce = uuid.uuid4().hex[:8]
             probe = session.profile.ready_probe.replace("${nonce}", nonce)
             offset = bridge.rx_snapshot_len()
+            session.last_probe_at = now_iso()
+            self._mark_session_tx(session)
             bridge.send_command(probe, source="system:self_test", cmd_id=None)
             if not bridge.wait_for_regex_from(nonce, offset, timeout_s):
                 return {

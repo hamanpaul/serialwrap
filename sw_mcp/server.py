@@ -15,6 +15,7 @@ _TOOL_MAP = {
     "serialwrap_get_health": "health.status",
     "serialwrap_get_command": "command.get",
     "serialwrap_get_session_state": "session.get_state",
+    "serialwrap_get_session_activity": "session.activity",
     "serialwrap_bind_session": "session.bind",
     "serialwrap_attach_session": "session.attach",
     "serialwrap_self_test": "session.self_test",
@@ -89,6 +90,12 @@ _TOOL_DEFS: list[dict[str, Any]] = [
     _td(
         "serialwrap_get_session_state",
         "取得指定 session 狀態",
+        {"selector": _STR},
+        ["selector"],
+    ),
+    _td(
+        "serialwrap_get_session_activity",
+        "取得 session 活動觀測（last_rx_at / last_tx_at / idle_for_ms / activity_classification 等，用於分辨 quiet-but-healthy 與 dead）",
         {"selector": _STR},
         ["selector"],
     ),

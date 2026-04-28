@@ -285,6 +285,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_sst = sess_sub.add_parser("self-test")
     p_sst.add_argument("--selector", required=True, help="session_id | COMx | alias")
     p_sst.add_argument("--probe-timeout", dest="probe_timeout_s", type=float, default=2.0)
+    p_sact = sess_sub.add_parser("activity", help="show RX/TX/state activity for a session")
+    p_sact.add_argument("--selector", required=True, help="session_id | COMx | alias")
     p_sr = sess_sub.add_parser("recover")
     p_sr.add_argument("--selector", required=True, help="session_id | COMx | alias")
     p_sr.add_argument("--timeout", dest="recover_timeout_s", type=float, default=2.0)
@@ -461,6 +463,8 @@ def main(argv: list[str] | None = None) -> int:
             return _run_rpc(args, "session.attach", {"selector": args.selector})
         if args.session_cmd == "self-test":
             return _run_rpc(args, "session.self_test", {"selector": args.selector, "timeout_s": args.probe_timeout_s})
+        if args.session_cmd == "activity":
+            return _run_rpc(args, "session.activity", {"selector": args.selector})
         if args.session_cmd == "recover":
             return _run_rpc(args, "session.recover", {"selector": args.selector, "timeout_s": args.recover_timeout_s, "force": getattr(args, "force", False)})
         if args.session_cmd == "console-attach":
