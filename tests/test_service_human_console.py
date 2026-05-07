@@ -40,6 +40,65 @@ class TestServiceHumanConsole(unittest.TestCase):
 
         self.assertEqual(submit.call_args.kwargs["mode"], "interactive")
 
+    def test_session_self_test_rpc_passes_strict_human_lock(self) -> None:
+        svc = SerialwrapService([])
+        expected = {"ok": True, "selector": "COM0"}
+        with mock.patch.object(svc._sessions, "self_test", return_value=expected) as self_test:
+            resp = svc.rpc(
+                "session.self_test",
+                {
+                    "selector": "COM0",
+                    "timeout_s": 4.5,
+                    "strict_human_lock": True,
+                },
+            )
+
+        self_test.assert_called_once_with("COM0", timeout_s=4.5, strict_human_lock=True)
+        self.assertEqual(resp, expected)
+
+    def test_session_self_test_rpc_defaults_strict_human_lock_false(self) -> None:
+        svc = SerialwrapService([])
+        expected = {"ok": True, "selector": "COM0"}
+        with mock.patch.object(svc._sessions, "self_test", return_value=expected) as self_test:
+            resp = svc.rpc(
+                "session.self_test",
+                {
+                    "selector": "COM0",
+                    "timeout_s": 2.5,
+                },
+            )
+
+        self_test.assert_called_once_with("COM0", timeout_s=2.5, strict_human_lock=False)
+        self.assertEqual(resp, expected)
+
+    def test_session_self_test_rpc_coerces_strict_human_lock_values(self) -> None:
+        cases = [
+            ("bool-true", True, True),
+            ("bool-false", False, False),
+            ("str-true", "true", True),
+            ("str-false", "false", False),
+            ("str-one", "1", True),
+            ("str-zero", "0", False),
+            ("int-one", 1, True),
+            ("int-zero", 0, False),
+            ("none", None, False),
+        ]
+
+        for name, raw_value, expected_value in cases:
+            with self.subTest(case=name):
+                svc = SerialwrapService([])
+                with mock.patch.object(svc._sessions, "self_test", return_value={"ok": True}) as self_test:
+                    resp = svc.rpc(
+                        "session.self_test",
+                        {
+                            "selector": "COM0",
+                            "strict_human_lock": raw_value,
+                        },
+                    )
+
+                self_test.assert_called_once_with("COM0", timeout_s=2.0, strict_human_lock=expected_value)
+                self.assertTrue(resp["ok"])
+
 
 if __name__ == "__main__":
     unittest.main()

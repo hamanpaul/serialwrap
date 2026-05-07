@@ -8,7 +8,7 @@ import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
-from sw_core.cli import main as cli_main
+from sw_core.cli import build_parser, main as cli_main
 
 
 class _StubClient:
@@ -53,6 +53,73 @@ class TestEventCli(unittest.TestCase):
             self.assertEqual(stub.calls[0][1]["owner"], "o")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestSessionSelfTestCli(unittest.TestCase):
+    def test_parser_accepts_strict_human_lock(self) -> None:
+        args = build_parser().parse_args(
+            ["session", "self-test", "--selector", "COM0", "--strict-human-lock"]
+        )
+        self.assertTrue(args.strict_human_lock)
+
+    def test_parser_defaults_strict_human_lock_false(self) -> None:
+        args = build_parser().parse_args(["session", "self-test", "--selector", "COM0"])
+        self.assertFalse(args.strict_human_lock)
+
+    def test_parser_help_describes_strict_human_lock(self) -> None:
+        buf = io.StringIO()
+        with self.assertRaises(SystemExit):
+            with redirect_stdout(buf):
+                build_parser().parse_args(["session", "self-test", "--help"])
+
+        help_text = buf.getvalue()
+        self.assertIn("--strict-human-lock", help_text)
+        self.assertIn("嚴格", help_text)
+        self.assertIn("預設", help_text)
+        self.assertIn("interactive lease", help_text)
+        self.assertNotIn("raw interactive", help_text)
+
+    def test_session_self_test_writes_strict_human_lock_to_rpc_params(self) -> None:
+        stub = _StubClient()
+        stub.responses["session.self_test"] = {"ok": True, "selector": "COM0"}
+        with patch("sw_core.cli.rpc_call", stub):
+            with redirect_stdout(io.StringIO()):
+                rc = cli_main(
+                    [
+                        "session",
+                        "self-test",
+                        "--selector",
+                        "COM0",
+                        "--probe-timeout",
+                        "4.5",
+                        "--strict-human-lock",
+                    ]
+                )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            stub.calls[0],
+            (
+                "session.self_test",
+                {"selector": "COM0", "timeout_s": 4.5, "strict_human_lock": True},
+            ),
+        )
+
+    def test_session_self_test_writes_default_strict_human_lock_false_to_rpc_params(self) -> None:
+        stub = _StubClient()
+        stub.responses["session.self_test"] = {"ok": True, "selector": "COM0"}
+        with patch("sw_core.cli.rpc_call", stub):
+            with redirect_stdout(io.StringIO()):
+                rc = cli_main(["session", "self-test", "--selector", "COM0"])
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            stub.calls[0],
+            (
+                "session.self_test",
+                {"selector": "COM0", "timeout_s": 2.0, "strict_human_lock": False},
+            ),
+        )
 
 
 if __name__ == "__main__":

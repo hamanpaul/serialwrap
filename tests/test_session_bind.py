@@ -244,7 +244,7 @@ class TestSessionBind(unittest.TestCase):
         bridge.set_interactive_owner.assert_called_once_with("human:cid-9")
         self.assertEqual(session.interactive_session_id, resp["interactive_id"])
 
-    def test_self_test_reports_human_interactive_active(self) -> None:
+    def test_self_test_strict_mode_reports_human_interactive_active(self) -> None:
         from sw_core.device_watcher import DeviceInfo
         import unittest.mock as mock
 
@@ -277,12 +277,300 @@ class TestSessionBind(unittest.TestCase):
             mgr._interactive[lease.interactive_id] = lease
             session.interactive_session_id = lease.interactive_id
 
-        resp = mgr.self_test("COM0")
+        resp = mgr.self_test("COM0", strict_human_lock=True)
 
         self.assertTrue(resp["ok"])
         self.assertEqual(resp["classification"], "HUMAN_INTERACTIVE_ACTIVE")
+        self.assertEqual(resp["recommended_action"], "wait_or_detach_console")
+        self.assertEqual(resp["interactive_id"], "lease-1")
         self.assertEqual(resp["interactive_owner"], "human:cid-2")
+        self.assertTrue(resp["human_attached"])
         bridge.send_command.assert_not_called()
+        bridge.wait_for_regex_from.assert_not_called()
+        bridge.suspend_interactive.assert_not_called()
+        bridge.resume_interactive.assert_not_called()
+
+    def test_self_test_default_walks_through_with_human_attached(self) -> None:
+        from sw_core.device_watcher import DeviceInfo
+        import unittest.mock as mock
+
+        profiles = [self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")]
+        mgr = SessionManager(profiles, WalWriter(wal_dir=self._tmp.name), on_ready=lambda _sid: None, on_detached=lambda _sid: None)
+        session = mgr.get_session("COM0")
+        self.assertIsNotNone(session)
+        assert session is not None
+
+        bridge = mock.MagicMock()
+        bridge.console_has_external_peer.return_value = True
+        bridge.snapshot.return_value = {
+            "running": True,
+            "serial_alive": True,
+            "vtty_alive": True,
+            "vtty": "/dev/pts/9",
+            "interactive_owner": "human:cid-2",
+        }
+        bridge.rx_snapshot_len.return_value = 10
+        bridge.wait_for_regex_from.side_effect = [True, True]
+        session.bridge = bridge
+        session.state = "READY"
+        session.attached_real_path = "/dev/ttyUSB0"
+        lease = InteractiveLease(
+            interactive_id="lease-1",
+            session_id=session.session_id,
+            owner="human:cid-2",
+            created_at="now",
+            timeout_s=60.0,
+        )
+        with mgr._lock:
+            mgr._devices = {"/dev/serial/by-id/orig": DeviceInfo(by_id="/dev/serial/by-id/orig", real_path="/dev/ttyUSB0")}
+            mgr._interactive[lease.interactive_id] = lease
+            session.interactive_session_id = lease.interactive_id
+
+        expected_timeout = 1.5
+        nonce_uuid = mock.Mock(hex="deadbeefcafebabe")
+        expected_nonce = "deadbeef"
+        expected_probe = session.profile.ready_probe.replace("${nonce}", expected_nonce)
+        with mock.patch("sw_core.session_manager.uuid.uuid4", return_value=nonce_uuid):
+            resp = mgr.self_test("COM0", timeout_s=expected_timeout)
+
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["classification"], "OK")
+        self.assertTrue(resp["probe_ok"])
+        self.assertTrue(resp["human_attached"])
+        self.assertTrue(resp["interactive_owner"].startswith("human:"))
+        bridge.rx_snapshot_len.assert_called_once_with()
+        bridge.send_command.assert_called_once_with(expected_probe, source="system:self_test", cmd_id=None)
+        bridge.wait_for_regex_from.assert_has_calls(
+            [
+                mock.call(expected_nonce, 10, expected_timeout),
+                mock.call(session.profile.prompt_regex, 10, expected_timeout),
+            ]
+        )
+        self.assertEqual(bridge.wait_for_regex_from.call_count, 2)
+
+    def test_self_test_default_suspends_human_during_probe(self) -> None:
+        from sw_core.device_watcher import DeviceInfo
+        import unittest.mock as mock
+
+        for send_side_effect, expect_error in ((None, False), (RuntimeError("probe failed"), True)):
+            with self.subTest(expect_error=expect_error):
+                profiles = [self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")]
+                mgr = SessionManager(profiles, WalWriter(wal_dir=self._tmp.name), on_ready=lambda _sid: None, on_detached=lambda _sid: None)
+                session = mgr.get_session("COM0")
+                self.assertIsNotNone(session)
+                assert session is not None
+
+                bridge = mock.MagicMock()
+                bridge.console_has_external_peer.return_value = True
+                bridge.snapshot.return_value = {
+                    "running": True,
+                    "serial_alive": True,
+                    "vtty_alive": True,
+                    "vtty": "/dev/pts/9",
+                    "interactive_owner": "human:cid-2",
+                }
+                bridge.rx_snapshot_len.return_value = 10
+                bridge.wait_for_regex_from.side_effect = [True, True]
+                bridge.send_command.side_effect = send_side_effect
+                session.bridge = bridge
+                session.state = "READY"
+                session.attached_real_path = "/dev/ttyUSB0"
+                lease = InteractiveLease(
+                    interactive_id="lease-1",
+                    session_id=session.session_id,
+                    owner="human:cid-2",
+                    created_at="now",
+                    timeout_s=60.0,
+                )
+                with mgr._lock:
+                    mgr._devices = {
+                        "/dev/serial/by-id/orig": DeviceInfo(by_id="/dev/serial/by-id/orig", real_path="/dev/ttyUSB0")
+                    }
+                    mgr._interactive[lease.interactive_id] = lease
+                    session.interactive_session_id = lease.interactive_id
+
+                if expect_error:
+                    with self.assertRaisesRegex(RuntimeError, "probe failed"):
+                        mgr.self_test("COM0")
+                else:
+                    resp = mgr.self_test("COM0")
+                    self.assertEqual(resp["classification"], "OK")
+
+                bridge.suspend_interactive.assert_called_once_with()
+                bridge.resume_interactive.assert_called_once_with()
+                method_names = [call[0] for call in bridge.mock_calls]
+                self.assertLess(method_names.index("suspend_interactive"), method_names.index("send_command"))
+                self.assertLess(method_names.index("send_command"), method_names.index("resume_interactive"))
+
+    def test_self_test_no_suspend_when_lease_is_agent(self) -> None:
+        from sw_core.device_watcher import DeviceInfo
+        import unittest.mock as mock
+
+        profiles = [self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")]
+        mgr = SessionManager(profiles, WalWriter(wal_dir=self._tmp.name), on_ready=lambda _sid: None, on_detached=lambda _sid: None)
+        session = mgr.get_session("COM0")
+        self.assertIsNotNone(session)
+        assert session is not None
+
+        bridge = mock.MagicMock()
+        bridge.snapshot.return_value = {
+            "running": True,
+            "serial_alive": True,
+            "vtty_alive": True,
+            "vtty": "/dev/pts/9",
+        }
+        bridge.rx_snapshot_len.return_value = 10
+        bridge.wait_for_regex_from.side_effect = [True, True]
+        session.bridge = bridge
+        session.state = "READY"
+        session.attached_real_path = "/dev/ttyUSB0"
+        lease = InteractiveLease(
+            interactive_id="lease-1",
+            session_id=session.session_id,
+            owner="agent",
+            created_at="now",
+            timeout_s=60.0,
+        )
+        with mgr._lock:
+            mgr._devices = {"/dev/serial/by-id/orig": DeviceInfo(by_id="/dev/serial/by-id/orig", real_path="/dev/ttyUSB0")}
+            mgr._interactive[lease.interactive_id] = lease
+            session.interactive_session_id = lease.interactive_id
+
+        resp = mgr.self_test("COM0")
+
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["classification"], "OK")
+        self.assertEqual(resp["interactive_owner"], "agent")
+        self.assertFalse(resp["human_attached"])
+        bridge.suspend_interactive.assert_not_called()
+        bridge.resume_interactive.assert_not_called()
+
+    def test_self_test_human_attached_field_in_non_ok_paths(self) -> None:
+        import unittest.mock as mock
+
+        profiles = [self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")]
+        mgr = SessionManager(profiles, WalWriter(wal_dir=self._tmp.name), on_ready=lambda _sid: None, on_detached=lambda _sid: None)
+        session = mgr.get_session("COM0")
+        self.assertIsNotNone(session)
+        assert session is not None
+
+        bridge = mock.MagicMock()
+        bridge.console_has_external_peer.return_value = True
+        bridge.snapshot.return_value = {"interactive_owner": "human:cid-3"}
+        session.bridge = bridge
+        session.state = "READY"
+        lease = InteractiveLease(
+            interactive_id="lease-1",
+            session_id=session.session_id,
+            owner="human:cid-3",
+            created_at="now",
+            timeout_s=60.0,
+        )
+        with mgr._lock:
+            mgr._devices = {}
+            mgr._interactive[lease.interactive_id] = lease
+            session.interactive_session_id = lease.interactive_id
+
+        resp = mgr.self_test("COM0")
+
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["classification"], "DEVICE_MISSING")
+        self.assertEqual(resp["interactive_owner"], "human:cid-3")
+        self.assertTrue(resp["human_attached"])
+        bridge.send_command.assert_not_called()
+        bridge.wait_for_regex_from.assert_not_called()
+        bridge.suspend_interactive.assert_not_called()
+        bridge.resume_interactive.assert_not_called()
+
+    def test_self_test_human_attached_field_in_vtty_stale_path(self) -> None:
+        from sw_core.device_watcher import DeviceInfo
+        import unittest.mock as mock
+
+        profiles = [self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")]
+        mgr = SessionManager(profiles, WalWriter(wal_dir=self._tmp.name), on_ready=lambda _sid: None, on_detached=lambda _sid: None)
+        session = mgr.get_session("COM0")
+        self.assertIsNotNone(session)
+        assert session is not None
+
+        bridge = mock.MagicMock()
+        bridge.console_has_external_peer.return_value = True
+        bridge.snapshot.return_value = {
+            "running": True,
+            "serial_alive": True,
+            "vtty_alive": False,
+            "vtty": "/dev/pts/11",
+            "interactive_owner": "human:cid-4",
+        }
+        session.bridge = bridge
+        session.state = "READY"
+        session.attached_real_path = "/dev/ttyUSB0"
+        lease = InteractiveLease(
+            interactive_id="lease-2",
+            session_id=session.session_id,
+            owner="human:cid-4",
+            created_at="now",
+            timeout_s=60.0,
+        )
+        with mgr._lock:
+            mgr._devices = {
+                "/dev/serial/by-id/orig": DeviceInfo(by_id="/dev/serial/by-id/orig", real_path="/dev/ttyUSB0")
+            }
+            mgr._interactive[lease.interactive_id] = lease
+            session.interactive_session_id = lease.interactive_id
+
+        resp = mgr.self_test("COM0")
+
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["classification"], "VTTY_STALE")
+        self.assertEqual(resp["interactive_owner"], "human:cid-4")
+        self.assertTrue(resp["human_attached"])
+        bridge.send_command.assert_not_called()
+        bridge.wait_for_regex_from.assert_not_called()
+        bridge.suspend_interactive.assert_not_called()
+        bridge.resume_interactive.assert_not_called()
+
+    def test_self_test_recovering_preserves_human_lease_without_side_effects(self) -> None:
+        from sw_core.device_watcher import DeviceInfo
+        import unittest.mock as mock
+
+        profiles = [self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")]
+        mgr = SessionManager(profiles, WalWriter(wal_dir=self._tmp.name), on_ready=lambda _sid: None, on_detached=lambda _sid: None)
+        session = mgr.get_session("COM0")
+        self.assertIsNotNone(session)
+        assert session is not None
+
+        bridge = mock.MagicMock()
+        bridge.console_has_external_peer.return_value = False
+        session.bridge = bridge
+        session.state = "RECOVERING"
+        session.recovering = True
+        session.attached_real_path = "/dev/ttyUSB0"
+        lease = InteractiveLease(
+            interactive_id="lease-3",
+            session_id=session.session_id,
+            owner="human:cid-5",
+            created_at="now",
+            timeout_s=60.0,
+        )
+        with mgr._lock:
+            mgr._devices = {
+                "/dev/serial/by-id/orig": DeviceInfo(by_id="/dev/serial/by-id/orig", real_path="/dev/ttyUSB0")
+            }
+            mgr._interactive[lease.interactive_id] = lease
+            session.interactive_session_id = lease.interactive_id
+
+        resp = mgr.self_test("COM0")
+
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["classification"], "SESSION_RECOVERING")
+        self.assertEqual(resp["interactive_owner"], "human:cid-5")
+        self.assertTrue(resp["human_attached"])
+        self.assertEqual(session.interactive_session_id, "lease-3")
+        self.assertIn("lease-3", mgr._interactive)
+        bridge.detach_console.assert_not_called()
+        bridge.send_command.assert_not_called()
+        bridge.suspend_interactive.assert_not_called()
+        bridge.resume_interactive.assert_not_called()
 
     def test_detach_console_releases_human_interactive(self) -> None:
         import unittest.mock as mock
