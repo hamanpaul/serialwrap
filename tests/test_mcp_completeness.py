@@ -87,6 +87,25 @@ class TestMcpCompleteness(unittest.TestCase):
             f"list_tools() 有重複工具名稱",
         )
 
+    def test_self_test_tool_schema_describes_strict_human_lock(self) -> None:
+        """serialwrap_self_test 應公開 strict_human_lock schema 與模式說明。"""
+        from sw_mcp.server import list_tools
+
+        tool = next(t for t in list_tools() if t["name"] == "serialwrap_self_test")
+        props = tool["inputSchema"]["properties"]
+        required = tool["inputSchema"].get("required", [])
+        strict_desc = props["strict_human_lock"]["description"]
+
+        self.assertEqual(props["strict_human_lock"]["type"], "boolean")
+        self.assertIn("嚴格", tool["description"])
+        self.assertIn("預設", tool["description"])
+        self.assertIn("interactive lease", tool["description"])
+        self.assertNotIn("raw interactive", tool["description"])
+        self.assertIn("嚴格", strict_desc)
+        self.assertIn("預設", strict_desc)
+        self.assertIn("interactive lease", strict_desc)
+        self.assertNotIn("strict_human_lock", required)
+
 
 if __name__ == "__main__":
     unittest.main()

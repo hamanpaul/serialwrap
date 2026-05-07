@@ -285,6 +285,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_sst = sess_sub.add_parser("self-test")
     p_sst.add_argument("--selector", required=True, help="session_id | COMx | alias")
     p_sst.add_argument("--probe-timeout", dest="probe_timeout_s", type=float, default=2.0)
+    p_sst.add_argument(
+        "--strict-human-lock",
+        action="store_true",
+        default=False,
+        help="嚴格模式：若 human interactive lease 仍在使用中則直接回報 busy；預設模式會先暫停 human interactive lease 再做 probe",
+    )
     p_sact = sess_sub.add_parser("activity", help="show RX/TX/state activity for a session")
     p_sact.add_argument("--selector", required=True, help="session_id | COMx | alias")
     p_sr = sess_sub.add_parser("recover")
@@ -462,7 +468,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.session_cmd == "attach":
             return _run_rpc(args, "session.attach", {"selector": args.selector})
         if args.session_cmd == "self-test":
-            return _run_rpc(args, "session.self_test", {"selector": args.selector, "timeout_s": args.probe_timeout_s})
+            return _run_rpc(
+                args,
+                "session.self_test",
+                {
+                    "selector": args.selector,
+                    "timeout_s": args.probe_timeout_s,
+                    "strict_human_lock": args.strict_human_lock,
+                },
+            )
         if args.session_cmd == "activity":
             return _run_rpc(args, "session.activity", {"selector": args.selector})
         if args.session_cmd == "recover":
