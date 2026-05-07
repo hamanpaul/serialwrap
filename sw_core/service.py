@@ -39,6 +39,23 @@ _HUMAN_INTERACTIVE_COMMANDS = {
 _ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
 
 
+def _coerce_rpc_bool(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"", "0", "false", "no", "off", "none", "null"}:
+            return False
+        return False
+    return bool(value)
+
+
 def _human_console_mode(command: str) -> str:
     try:
         tokens = shlex.split(command, posix=True)
@@ -289,9 +306,14 @@ class SerialwrapService:
         if method == "session.self_test":
             selector = str(params.get("selector") or params.get("session_id") or params.get("com") or params.get("alias") or "")
             timeout_s = float(params.get("timeout_s") or 2.0)
+            strict_human_lock = _coerce_rpc_bool(params.get("strict_human_lock"))
             if not selector:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
-            return self._sessions.self_test(selector, timeout_s=timeout_s)
+            return self._sessions.self_test(
+                selector,
+                timeout_s=timeout_s,
+                strict_human_lock=strict_human_lock,
+            )
 
         if method == "session.recover":
             selector = str(params.get("selector") or params.get("session_id") or params.get("com") or params.get("alias") or "")

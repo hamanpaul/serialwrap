@@ -1086,6 +1086,13 @@ class SessionManager:
                 return None
         return lease
 
+    def _lease_context(self, lease: InteractiveLease | None) -> dict[str, Any]:
+        interactive_owner = lease.owner if lease is not None else None
+        return {
+            "interactive_owner": interactive_owner,
+            "human_attached": bool(interactive_owner and interactive_owner.startswith("human:")),
+        }
+
     def _transition_to_attached(self, session: SessionRuntime, *, reason: str) -> None:
         notify_not_ready = False
         with self._lock:
@@ -1648,30 +1655,39 @@ class SessionManager:
                 self._interactive.pop(interactive_id, None)
             return {"ok": True, "interactive_id": interactive_id}
 
-    def self_test(self, selector: str, *, timeout_s: float = 2.0) -> dict[str, Any]:
+    def self_test(self, selector: str, *, timeout_s: float = 2.0, strict_human_lock: bool = False) -> dict[str, Any]:
+        suspend_human_interactive = False
         with self._lock:
             session = self.get_session(selector)
             if session is None:
-                return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
-            device = self._devices.get(session.profile.device_by_id)
-            attached_real_path = session.attached_real_path
-            bridge = session.bridge
+                return {
+                    "ok": False,
+                    "error_code": "SESSION_NOT_FOUND",
+                    "selector": selector,
+                    **self._lease_context(None),
+                }
+            lease = self._interactive.get(session.interactive_session_id) if session.interactive_session_id is not None else None
             if session.recovering:
                 return {
                     "ok": True,
                     "classification": "SESSION_RECOVERING",
                     "session": session.to_public_dict(),
                     "recommended_action": "wait",
+                    **self._lease_context(lease),
                 }
             lease = self._refresh_interactive_locked(session)
-            if lease is not None and lease.owner.startswith("human:"):
+            lease_context = self._lease_context(lease)
+            device = self._devices.get(session.profile.device_by_id)
+            attached_real_path = session.attached_real_path
+            bridge = session.bridge
+            if strict_human_lock and lease is not None and lease.owner.startswith("human:"):
                 return {
                     "ok": True,
                     "classification": "HUMAN_INTERACTIVE_ACTIVE",
                     "interactive_id": lease.interactive_id,
-                    "interactive_owner": lease.owner,
                     "session": session.to_public_dict(),
                     "recommended_action": "wait_or_detach_console",
+                    **lease_context,
                 }
             if device is None:
                 return {
@@ -1679,6 +1695,7 @@ class SessionManager:
                     "classification": "DEVICE_MISSING",
                     "session": session.to_public_dict(),
                     "recommended_action": "check_cable_or_bind",
+                    **lease_context,
                 }
             if attached_real_path and attached_real_path != device.real_path:
                 return {
@@ -1688,6 +1705,7 @@ class SessionManager:
                     "attached_real_path": attached_real_path,
                     "current_real_path": device.real_path,
                     "recommended_action": "reattach",
+                    **lease_context,
                 }
             if bridge is None:
                 return {
@@ -1696,6 +1714,7 @@ class SessionManager:
                     "session": session.to_public_dict(),
                     "current_real_path": device.real_path,
                     "recommended_action": "attach",
+                    **lease_context,
                 }
             snapshot = bridge.snapshot()
             if not snapshot.get("running") or not snapshot.get("serial_alive"):
@@ -1705,6 +1724,7 @@ class SessionManager:
                     "session": session.to_public_dict(),
                     "current_real_path": device.real_path,
                     "recommended_action": "recover",
+                    **lease_context,
                 }
             if not snapshot.get("vtty_alive"):
                 return {
@@ -1713,6 +1733,7 @@ class SessionManager:
                     "session": session.to_public_dict(),
                     "attached_vtty": snapshot.get("vtty"),
                     "recommended_action": "console_attach",
+                    **lease_context,
                 }
             if session.state == "ATTACHED":
                 if session.profile.platform == "passthrough":
@@ -1736,12 +1757,22 @@ class SessionManager:
                     "attached_vtty": snapshot.get("vtty"),
                     "bridge_generation": session.bridge_generation,
                     "recommended_action": recommended_action,
+                    **lease_context,
                 }
 
             nonce = uuid.uuid4().hex[:8]
             probe = session.profile.ready_probe.replace("${nonce}", nonce)
-            offset = bridge.rx_snapshot_len()
             session.last_probe_at = now_iso()
+            prompt_regex = session.profile.prompt_regex
+            bridge_generation = session.bridge_generation
+            attached_vtty = snapshot.get("vtty")
+            current_real_path = device.real_path
+            suspend_human_interactive = lease is not None and lease.owner.startswith("human:")
+
+        if suspend_human_interactive:
+            bridge.suspend_interactive()
+        try:
+            offset = bridge.rx_snapshot_len()
             self._mark_session_tx(session)
             bridge.send_command(probe, source="system:self_test", cmd_id=None)
             if not bridge.wait_for_regex_from(nonce, offset, timeout_s):
@@ -1750,22 +1781,27 @@ class SessionManager:
                     "classification": "TARGET_UNRESPONSIVE",
                     "session": session.to_public_dict(),
                     "attached_real_path": attached_real_path,
-                    "current_real_path": device.real_path,
+                    "current_real_path": current_real_path,
                     "probe_ok": False,
                     "recommended_action": "recover",
+                    **lease_context,
                 }
-            bridge.wait_for_regex_from(session.profile.prompt_regex, offset, timeout_s)
+            bridge.wait_for_regex_from(prompt_regex, offset, timeout_s)
             return {
                 "ok": True,
                 "classification": "OK",
                 "session": session.to_public_dict(),
                 "attached_real_path": attached_real_path,
-                "current_real_path": device.real_path,
-                "attached_vtty": snapshot.get("vtty"),
-                "bridge_generation": session.bridge_generation,
+                "current_real_path": current_real_path,
+                "attached_vtty": attached_vtty,
+                "bridge_generation": bridge_generation,
                 "probe_ok": True,
                 "recommended_action": "none",
+                **lease_context,
             }
+        finally:
+            if suspend_human_interactive:
+                bridge.resume_interactive()
 
     def recover_session(self, selector: str, *, timeout_s: float = 2.0, force: bool = False) -> dict[str, Any]:
         reprobe = False

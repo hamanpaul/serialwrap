@@ -113,8 +113,15 @@ _TOOL_DEFS: list[dict[str, Any]] = [
     ),
     _td(
         "serialwrap_self_test",
-        "對 session 執行 self-test（ready probe）",
-        {"selector": _STR, "timeout_s": _INT},
+        "對 session 執行 self-test（ready probe）。預設模式會暫停 human interactive lease 後再送 probe；嚴格模式（strict_human_lock=true）則在 human interactive lease 尚未釋放時直接回報 busy。",
+        {
+            "selector": _STR,
+            "timeout_s": _INT,
+            "strict_human_lock": {
+                "type": "boolean",
+                "description": "是否啟用嚴格模式。true 時只要 human interactive lease 仍在使用中就直接回報 busy；false（預設）時會先暫停 human interactive lease 再做 probe。",
+            },
+        },
         ["selector"],
     ),
     _td(
