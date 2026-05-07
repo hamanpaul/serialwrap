@@ -41,14 +41,11 @@
 
 ### Requirement: recovery interactive lease SHALL stash human lease and restore on close
 
-`session.console_attach` 會替 human 開 session-layer lease（owner=`"human:<client_id>"`，
-`session_manager.py:1536-1541`）。recovery 不能只動 bridge-layer ownership，否則
-後續 `_refresh_interactive_locked` 會發現 bridge `interactive_owner` 不再是 human、
-把 lease 視為失效並自動 close。因此 recovery 流程 SHALL 採 **stash-and-restore**：
+當 `interactive_open(allow_attached=True)` 在 ATTACHED + bootloader 命中下開 lease 時，若 `_refresh_interactive_locked(session)` 回非 None 且 owner 以 `"human:"` 開頭，daemon SHALL 採 **stash-and-restore** 機制——把 human session-layer lease 從 `self._interactive` 暫存到 `session._stashed_human_lease`、呼叫 `bridge.suspend_interactive()` 切換 bridge-layer ownership、開出 agent recovery lease；recovery 結束時 SHALL 還原 stashed lease 並 resume bridge-layer ownership。
 
-當 `interactive_open(allow_attached=True)` 在 ATTACHED + bootloader 命中下開 lease 時，
-若 `_refresh_interactive_locked(session)` 回非 None 且 owner 以 `"human:"` 開頭，
-daemon SHALL（在 `_lock` 內以原子方式）：
+> 背景：`session.console_attach`（`session_manager.py:1536-1541`）會替 human 開 session-layer lease（owner=`"human:<client_id>"`）。若 recovery 只動 bridge-layer ownership，後續 `_refresh_interactive_locked` 會發現 bridge `interactive_owner` 不再是 human、把 lease 視為失效並自動 close——等於把 human 趕跑、與 #44 設計目標相反。stash-and-restore 解決此問題。
+
+具體步驟（在 `_lock` 內以原子方式執行）：
 
 1. 將該 human lease 從 `self._interactive` pop 移除，並指派給
    `session._stashed_human_lease`。
