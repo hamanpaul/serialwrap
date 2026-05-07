@@ -46,11 +46,11 @@
 
 ## 7. Commit / PR
 
-- [ ] 7.1 commit 1：`feat(self_test): add strict_human_lock + interactive_owner/human_attached fields`
-- [ ] 7.2 commit 2：`feat(self_test): suspend human interactive during probe`
-- [ ] 7.3 commit 3：`test(self_test): cover default walk-through + strict mode + suspend orchestration`
-- [ ] 7.4 commit 4：`docs(self_test): document collaborative monitoring in spec §9.1`
-- [ ] 7.5 push branch、開 PR `fix(self_test): allow agent handoff while human monitors console (#42)`、PR body 連結 issue #42
+- [x] 7.1 commit 1：`feat(self_test): add strict_human_lock + interactive_owner/human_attached fields`
+- [x] 7.2 commit 2：`feat(self_test): suspend human interactive during probe`
+- [x] 7.3 commit 3：`test(self_test): cover default walk-through + strict mode + suspend orchestration`
+- [x] 7.4 commit 4：`docs(self_test): document collaborative monitoring in spec §9.1`
+- [x] 7.5 push branch、開 PR `fix(self_test): allow agent handoff while human monitors console (#42)`、PR body 連結 issue #42
 
 ## 8. Archive openspec change
 
