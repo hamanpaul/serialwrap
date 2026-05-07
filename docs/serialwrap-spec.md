@@ -377,10 +377,17 @@ flowchart TD
 
 ### 9.1 `session.self_test`
 
+輸入：
+
+- `selector`
+- `timeout_s`
+- `strict_human_lock`：預設 `false`。預設 collaborative 模式下，即使 human console 正持有 interactive lease，仍繼續執行完整 readiness + probe；只有設成 `true` 時，才會把 human interactive 視為鎖定條件。
+
 輸出分類：
 
 - `OK`
 - `SESSION_RECOVERING`
+- `HUMAN_INTERACTIVE_ACTIVE`（僅 `strict_human_lock=true` 且目前 interactive owner 為 `human:*` 時）
 - `DEVICE_MISSING`
 - `DEVICE_REBOUND_REQUIRED`
 - `BRIDGE_DOWN`
@@ -389,17 +396,32 @@ flowchart TD
 - `LOGIN_REQUIRED`
 - `ATTACHED_NOT_READY`
 - `REBOOTING`
+- `PASSTHROUGH`
+
+輸出欄位：
+
+- `interactive_owner`：目前 interactive lease owner；若沒有 lease 則為 `null`
+- `human_attached`：以目前 active interactive lease 的 owner 是否為 `human:*` 為準；不等同於僅有 human console attach、`console_count > 0`，或任何 human console 已連上但未持有 active interactive lease
+- 以上 lease context 欄位會跟著所有 `session.self_test` 回應一起回傳，便於 caller 判斷是純裝置問題還是 collaborative 使用中的狀態
 
 判斷順序：
 
 1. session 是否存在
 2. 是否處於 recovering
-3. by-id 是否仍存在
-4. `attached_real_path` 是否與目前 `real_path` 一致
-5. bridge / vtty 是否存活
-6. 執行安全 probe
+3. 是否觸發 strict human lock（`strict_human_lock=true` 且 human interactive lease 存在）
+4. by-id 是否仍存在
+5. `attached_real_path` 是否與目前 `real_path` 一致
+6. bridge / vtty 是否存活
+7. 若 `session.state == ATTACHED`，先依 substate 回 `PASSTHROUGH` / `LOGIN_REQUIRED` / `REBOOTING` / `ATTACHED_NOT_READY`
+8. 其餘情況才執行安全 probe
 
 安全 probe 目前使用 profile 的 `ready_probe`。
+
+#### Collaborative monitoring
+
+- 預設 `strict_human_lock=false` 時，若 active interactive lease owner 為 `human:*`，不會直接回 `HUMAN_INTERACTIVE_ACTIVE`；`session.self_test` 仍會走完整 readiness + probe。
+- 若 probe 階段偵測到 active interactive lease owner 為 `human:*`，daemon 會先暫時 suspend human interactive lease，待 probe 完成後再 resume。
+- 此行為與 command path 的 human interactive 搶佔策略一致；可一併參考 §5.2「Agent 命令搶佔（Suspend / Resume）」。
 
 ### 9.2 `session.recover`
 
