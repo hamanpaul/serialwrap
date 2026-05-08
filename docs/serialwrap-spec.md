@@ -268,6 +268,35 @@ Agent 收到 sentinel 後應短暫 sleep 後重試，而非視為錯誤。
 
 若 `source=human:*` 的 line command 已送出但後續未回 prompt，daemon 會優先把該 console 升級成 human interactive，而不是直接觸發 recover。這條保護僅套用 human/minicom；agent foreground command 仍保留既有 prompt timeout / recover 路徑。
 
+#### Bootloader Recovery Lease（`allow_attached=True`）
+
+當 session 狀態為 `ATTACHED`（bridge 已掛但未完成 login/ready）且 target 卡在 bootloader 時，agent 可傳入 `allow_attached=True` 來開啟 **recovery lease**：
+
+1. 呼叫 `session.interactive_open(selector, owner, allow_attached=True, timeout_s=<N>)`
+2. daemon 驗證：
+   - session 狀態為 `ATTACHED`（或 `READY` 則走一般路徑）
+   - bridge snapshot 中 `running / serial_alive / vtty_alive` 均為 True
+   - `bridge.rx_tail(BOOTLOADER_RX_TAIL_BYTES)` 清洗後最後一個非空行符合 profile `bootloader_prompts` 中至少一個 regex
+3. 若驗證通過：
+   - 若 session 已有 human interactive lease → 呼叫 `bridge.suspend_interactive()`，將 human lease 存入 `session._stashed_human_lease`
+   - 建立 recovery lease（`InteractiveLease.recovery_mode=True, suspended_human=True`）
+   - timeout 受 `MAX_RECOVERY_LEASE_S`（120s）clamp
+4. 成功回傳：`{"ok": true, "interactive_id": "...", "recovery_mode": true}`
+
+#### Recovery Lease Close 與 Stash 恢復
+
+呼叫 `session.interactive_close(interactive_id)` 時：
+
+- 若 lease 為 recovery（`recovery_mode=True, suspended_human=True`）：
+  - stash 有效（未 expired）且 human console 仍存在 → **恢復**：human lease 重新激活，呼叫 `bridge.resume_interactive()`
+  - stash 已 expired 或 human console 已斷線 → **丟棄**：`bridge.set_interactive_owner(None)`，session `interactive_session_id = None`
+- 恢復邏輯保證 `bridge.resume_interactive()` 在 `_lock` 釋放後執行（透過 `_PostCloseAction`）
+
+#### `interactive_open` / `interactive_status` 回傳的 `recovery_mode`
+
+- `interactive_open` 成功時：回傳 `recovery_mode: true`（recovery）或 `recovery_mode: false`（一般）
+- `interactive_status` 成功時：加入 `recovery_mode` 欄位，反映 lease 的 `recovery_mode` 值
+
 > **注意**：在 raw interactive 預設行為下，human console 的按鍵不會走 `_on_console_line()` 路徑，因此上述 line command 升級機制僅在 **非 interactive owner** 的 console 或 suspend 期間的 line-buffer 路徑中生效。
 
 ### 6.4 recover
@@ -394,15 +423,22 @@ flowchart TD
 - `VTTY_STALE`
 - `TARGET_UNRESPONSIVE`
 - `LOGIN_REQUIRED`
-- `ATTACHED_NOT_READY`
 - `REBOOTING`
 - `PASSTHROUGH`
+- `BOOTLOADER`：ATTACHED 狀態下，bridge/vtty 正常，但 RX tail 最後一個非空行符合 profile `bootloader_prompts` 中至少一個 regex；此時 target 很可能卡在 bootloader 等待輸入，需人工介入或 recovery interactive。
+- `ATTACHED_NOT_READY`
 
 輸出欄位：
 
 - `interactive_owner`：目前 interactive lease owner；若沒有 lease 則為 `null`
 - `human_attached`：以目前 active interactive lease 的 owner 是否為 `human:*` 為準；不等同於僅有 human console attach、`console_count > 0`，或任何 human console 已連上但未持有 active interactive lease
+- `recovery_mode`：目前 active interactive lease 是否為 recovery lease（`InteractiveLease.recovery_mode == True`）；無 lease 時為 `false`
 - 以上 lease context 欄位會跟著所有 `session.self_test` 回應一起回傳，便於 caller 判斷是純裝置問題還是 collaborative 使用中的狀態
+
+`BOOTLOADER` 分類額外欄位：
+
+- `matched_prompt`：命中的 bootloader prompt regex 字串（取 `bootloader_prompts` 中第一個命中的 pattern）
+- `rx_tail`：用於比對的 RX tail 字串（經 `clean_text` 過濾後）
 
 判斷順序：
 
@@ -412,7 +448,12 @@ flowchart TD
 4. by-id 是否仍存在
 5. `attached_real_path` 是否與目前 `real_path` 一致
 6. bridge / vtty 是否存活
-7. 若 `session.state == ATTACHED`，先依 substate 回 `PASSTHROUGH` / `LOGIN_REQUIRED` / `REBOOTING` / `ATTACHED_NOT_READY`
+7. 若 `session.state == ATTACHED`，依下列順序判斷：
+   1. `platform == passthrough` → `PASSTHROUGH`
+   2. `last_error == LOGIN_REQUIRED` → `LOGIN_REQUIRED`
+   3. `last_error == REBOOTING` → `REBOOTING`
+   4. RX tail 比對 `bootloader_prompts` 有命中 → `BOOTLOADER`
+   5. 否則 → `ATTACHED_NOT_READY`
 8. 其餘情況才執行安全 probe
 
 安全 probe 目前使用 profile 的 `ready_probe`。
@@ -687,6 +728,13 @@ targets:
 - `hard_timeout_s`：命令硬超時
 - `log_dir`：per-profile agent log 目錄，覆寫 `defaults.log_dir`
 - `uart.*`：序列埠參數（baud、data_bits、parity、stop_bits、flow_control、xonxoff）
+- `bootloader_prompts`：bootloader prompt 的 regex 清單（YAML list，內部以 `tuple[str, ...]` 儲存，預設 `()`）。僅接受 `str` 元素；int/null/dict 等非字串元素會被過濾。此欄位供 `self_test` 的 `BOOTLOADER` 分類與 `interactive_open(..., allow_attached=True)` recovery gate 使用；只在 `ATTACHED` 狀態下比對 RX tail 最後一個非空行，並優先於 `ATTACHED_NOT_READY` fallback。支援 Python `re` 語法。範例：
+  ```yaml
+  bootloader_prompts:
+    - "^CFE> $"       # Broadcom CFE bootloader
+    - "^=> $"         # U-Boot 標準 prompt
+    - "^BCM\\d+>> $"  # Broadcom BCM 系列 bootloader
+  ```
 
 ### 13.3 Platform 行為
 

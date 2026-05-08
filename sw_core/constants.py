@@ -38,6 +38,13 @@ EVENTS_LOG_ROTATE_BYTES = 10 * 1024 * 1024
 EVENTS_LOG_BACKUP_COUNT = 3
 
 
+# bootloader recovery 用常數
+MAX_RECOVERY_LEASE_S: float = 120.0
+"""recovery interactive lease 最長持續秒數。"""
+BOOTLOADER_RX_TAIL_BYTES: int = 512
+"""self_test 讀取 RX tail 的位元組數，用於 bootloader prompt 比對。"""
+
+
 def ensure_runtime_dirs() -> None:
     os.makedirs(STATE_DIR, exist_ok=True)
     os.makedirs(RUN_DIR, exist_ok=True)

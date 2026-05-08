@@ -638,7 +638,8 @@ class TestSessionBind(unittest.TestCase):
             mgr._interactive[lease.interactive_id] = lease
             session.interactive_session_id = lease.interactive_id
 
-        refreshed = mgr._refresh_interactive_locked(session)
+        refreshed, post = mgr._refresh_interactive_locked(session)
+        post.execute()
 
         self.assertIsNone(refreshed)
         self.assertIsNone(session.interactive_session_id)
@@ -1078,6 +1079,30 @@ class TestDynamicSessionAutoDetect(unittest.TestCase):
         self.assertIn("COM", session.profile.com)
         self.assertEqual(session.profile.device_by_id, "/dev/serial/by-id/test-dev")
         self.assertEqual(len(mgr.list_sessions()), 1)
+
+    def test_dynamic_session_preserves_template_bootloader_prompts(self) -> None:
+        """動態 session 應保留 template 的 bootloader_prompts。"""
+        from sw_core.config import ProfileTemplate
+
+        template = ProfileTemplate(
+            profile_name="brcm-template",
+            platform="bcm",
+            prompt_regex=r"(?m)[>#]\s*$",
+            bootloader_prompts=(r"^CFE> $", r"^=> $"),
+        )
+        mgr = SessionManager(
+            [],
+            WalWriter(wal_dir=self._tmp.name),
+            templates=[template],
+            max_sessions=4,
+            on_ready=lambda _sid: None,
+            on_detached=lambda _sid: None,
+        )
+
+        with mgr._lock:
+            session = mgr._session_from_template(template, "/dev/serial/by-id/brcm-dev")
+
+        self.assertEqual(session.profile.bootloader_prompts, (r"^CFE> $", r"^=> $"))
 
     def test_max_sessions_prevents_creation(self) -> None:
         """超過 max_sessions 時不建立新 session。"""

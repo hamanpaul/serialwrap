@@ -373,9 +373,10 @@ class SerialwrapService:
             owner = str(params.get("owner") or "agent")
             timeout_s = float(params.get("timeout_s") or 60.0)
             command = str(params.get("command") or "")
+            allow_attached = bool(params.get("allow_attached", False))
             if not selector:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
-            return self._sessions.interactive_open(selector, owner=owner, timeout_s=timeout_s, command=command)
+            return self._sessions.interactive_open(selector, owner=owner, timeout_s=timeout_s, command=command, allow_attached=allow_attached)
 
         if method == "session.interactive_send":
             interactive_id = str(params.get("interactive_id") or "")
