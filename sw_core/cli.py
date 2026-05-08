@@ -310,6 +310,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_sio.add_argument("--owner", default="agent")
     p_sio.add_argument("--timeout", dest="interactive_timeout_s", type=float, default=60.0)
     p_sio.add_argument("--command", default="")
+    p_sio.add_argument(
+        "--allow-attached",
+        action="store_true",
+        default=False,
+        help="允許在 ATTACHED 狀態下開啟 bootloader recovery lease（需通過 bootloader prompt 比對）。"
+             " 若 session 已有 human interactive lease 則暫停並在 close 時恢復。",
+    )
     p_sis = sess_sub.add_parser("interactive-send")
     p_sis.add_argument("--interactive-id", required=True)
     p_sis.add_argument("--data", required=True)
@@ -499,6 +506,7 @@ def main(argv: list[str] | None = None) -> int:
                     "owner": args.owner,
                     "timeout_s": args.interactive_timeout_s,
                     "command": args.command,
+                    "allow_attached": args.allow_attached,
                 },
             )
         if args.session_cmd == "interactive-send":

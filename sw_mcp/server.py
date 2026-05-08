@@ -158,12 +158,16 @@ _TOOL_DEFS: list[dict[str, Any]] = [
     # ── interactive ───────────────────────────────────────────
     _td(
         "serialwrap_open_interactive",
-        "開啟 interactive lease（vi/top 等互動命令）",
+        "開啟 interactive lease（vi/top 等互動命令）。設定 allow_attached=true 可在 ATTACHED 狀態"
+        "（bootloader recovery）下開啟 recovery lease；若 session 已有 human console lease 會暫停，"
+        "close 時自動恢復。recovery lease timeout 受 MAX_RECOVERY_LEASE_S（120s）clamp。"
+        "成功回傳 recovery_mode: true/false。",
         {
             "selector": _STR,
             "owner": _STR,
             "timeout_s": _INT,
             "command": _STR,
+            "allow_attached": _BOOL,
         },
         ["selector"],
     ),

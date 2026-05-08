@@ -20,7 +20,16 @@
 - `sw_core/session_manager.py`：`InteractiveLease` 新增 `recovery_mode: bool = False` 與 `suspended_human: bool = False` schema 欄位（Phase B 基礎，後續 interactive_open allow_attached/stash 使用）
 - `sw_core/session_manager.py`：`SessionRuntime` 新增 `_stashed_human_lease: InteractiveLease | None = None`（Phase B 基礎，不透出 RPC）
 - `sw_core/session_manager.py`：`_lease_context()` 新增 `recovery_mode` 欄位（所有 self_test 分類結果均含此欄位）
-- `tests/test_bootloader_recovery.py`：新增 TDD 測試，涵蓋 `_matches_any_bootloader_prompt` helper、self_test BOOTLOADER/ATTACHED_NOT_READY/優先序、recovery lease schema 與 lease_context
+- `sw_core/session_manager.py`：`interactive_open(allow_attached=True)` 支援 ATTACHED 狀態下通過 bootloader prompt 比對後開啟 recovery lease；human lease 自動暫停（stash），close 時恢復
+- `sw_core/session_manager.py`：recovery lease timeout 受 `MAX_RECOVERY_LEASE_S`（120s）clamp
+- `sw_core/session_manager.py`：`interactive_open` / `interactive_status` 回傳 `recovery_mode` 欄位
+- `sw_core/session_manager.py`：`_PostCloseAction` 機制保證 `bridge.resume_interactive()` 在 `_lock` 外執行
+- `sw_core/session_manager.py`：`_detach_session_locked` 清除 `_stashed_human_lease`
+- `sw_core/session_manager.py`：`_refresh_interactive_locked` 自動清除 expired 非 human lease
+- `sw_core/service.py`：RPC `session.interactive_open` 透傳 `allow_attached` 參數
+- `sw_core/cli.py`：`session interactive-open` 新增 `--allow-attached` 選項
+- `sw_mcp/server.py`：`serialwrap_open_interactive` 工具 schema 新增 `allow_attached: boolean`
+- `tests/test_bootloader_recovery.py`：新增 26 個 TDD 測試，涵蓋 recovery lease 完整生命週期（開啟、stash/restore、逾時 clamp、send、status recovery_mode、expired 清理、detach 清除 stash、RPC/CLI/MCP 透傳）
 
 ### Changed
 

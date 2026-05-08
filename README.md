@@ -468,6 +468,32 @@ serialwrap session interactive-close --interactive-id <interactive_id>
 
 `--encoding key` 目前支援：`enter`、`tab`、`escape`、`ctrl-c`、`ctrl-d`、`up`、`down`、`left`、`right`。
 
+#### Bootloader Recovery Lease
+
+當 target 卡在 bootloader（session 處於 `ATTACHED` 狀態，尚未完成 login/ready），agent 可使用 `--allow-attached` 開啟 recovery lease：
+
+```bash
+# 1. 確認 session 是否卡在 bootloader
+serialwrap session self-test --selector COM0
+# 若 result 為 BOOTLOADER 則繼續
+
+# 2. 開啟 recovery lease（最長 120s，受 MAX_RECOVERY_LEASE_S clamp）
+serialwrap session interactive-open --selector COM0 --owner agent:recovery \
+  --allow-attached --timeout 120
+
+# 3. 送 bootloader 命令（例如 U-Boot boot command）
+serialwrap session interactive-send --interactive-id <iid> --data "boot" --encoding text
+serialwrap session interactive-send --interactive-id <iid> --data enter --encoding key
+
+# 4. 觀察畫面
+serialwrap session interactive-status --interactive-id <iid>
+
+# 5. 完成後釋放（若 session 已有 human console，會自動恢復）
+serialwrap session interactive-close --interactive-id <iid>
+```
+
+成功回傳 `recovery_mode: true`。若 session 已有 human interactive lease，daemon 會自動暫停並在 close 後恢復。
+
 ## 檔案傳輸
 
 內建 `file push` / `file pull` 透過 UART base64 分段傳輸檔案，取代不可靠的 inline base64 / heredoc workaround。

@@ -268,6 +268,35 @@ Agent 收到 sentinel 後應短暫 sleep 後重試，而非視為錯誤。
 
 若 `source=human:*` 的 line command 已送出但後續未回 prompt，daemon 會優先把該 console 升級成 human interactive，而不是直接觸發 recover。這條保護僅套用 human/minicom；agent foreground command 仍保留既有 prompt timeout / recover 路徑。
 
+#### Bootloader Recovery Lease（`allow_attached=True`）
+
+當 session 狀態為 `ATTACHED`（bridge 已掛但未完成 login/ready）且 target 卡在 bootloader 時，agent 可傳入 `allow_attached=True` 來開啟 **recovery lease**：
+
+1. 呼叫 `session.interactive_open(selector, owner, allow_attached=True, timeout_s=<N>)`
+2. daemon 驗證：
+   - session 狀態為 `ATTACHED`（或 `READY` 則走一般路徑）
+   - bridge snapshot 中 `running / serial_alive / vtty_alive` 均為 True
+   - `bridge.rx_tail(BOOTLOADER_RX_TAIL_BYTES)` 清洗後最後一個非空行符合 profile `bootloader_prompts` 中至少一個 regex
+3. 若驗證通過：
+   - 若 session 已有 human interactive lease → 呼叫 `bridge.suspend_interactive()`，將 human lease 存入 `session._stashed_human_lease`
+   - 建立 recovery lease（`InteractiveLease.recovery_mode=True, suspended_human=True`）
+   - timeout 受 `MAX_RECOVERY_LEASE_S`（120s）clamp
+4. 成功回傳：`{"ok": true, "interactive_id": "...", "recovery_mode": true}`
+
+#### Recovery Lease Close 與 Stash 恢復
+
+呼叫 `session.interactive_close(interactive_id)` 時：
+
+- 若 lease 為 recovery（`recovery_mode=True, suspended_human=True`）：
+  - stash 有效（未 expired）且 human console 仍存在 → **恢復**：human lease 重新激活，呼叫 `bridge.resume_interactive()`
+  - stash 已 expired 或 human console 已斷線 → **丟棄**：`bridge.set_interactive_owner(None)`，session `interactive_session_id = None`
+- 恢復邏輯保證 `bridge.resume_interactive()` 在 `_lock` 釋放後執行（透過 `_PostCloseAction`）
+
+#### `interactive_open` / `interactive_status` 回傳的 `recovery_mode`
+
+- `interactive_open` 成功時：回傳 `recovery_mode: true`（recovery）或 `recovery_mode: false`（一般）
+- `interactive_status` 成功時：加入 `recovery_mode` 欄位，反映 lease 的 `recovery_mode` 值
+
 > **注意**：在 raw interactive 預設行為下，human console 的按鍵不會走 `_on_console_line()` 路徑，因此上述 line command 升級機制僅在 **非 interactive owner** 的 console 或 suspend 期間的 line-buffer 路徑中生效。
 
 ### 6.4 recover
