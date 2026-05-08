@@ -21,7 +21,7 @@
 ### paulsha-conventions 導入（policy_profile=`flat`、policy_version=`1.0.0`）
 
 - 新增 `.paul-project.yml`（`code_paths: ["sw_core/**", "sw_mcp/**", "tools/**", "tests/**"]` + `cli` 區塊）。
-- 新增 `VERSION`（`0.0.0`）。
+- 新增 `VERSION`（`0.0.1`，對齊既有 git tag `v0.0.1` / R-07）。
 - 新增 `CHANGELOG.md`（Keep-a-Changelog 1.1.0；`[Unreleased]` 段含本 PR 條目）。
 - 新增 `CLAUDE.md` / `AGENTS.md` / `GEMINI.md`（managed-by marker、policy_version、本地測試指令在地化）。
 - 既有 `.github/copilot-instructions.md` 補首行 `<!-- managed-by: hamanpaul/paulsha-conventions@v1.0.0 -->`、`policy_version: 1.0.0`，與其他三份 agent file 同步。

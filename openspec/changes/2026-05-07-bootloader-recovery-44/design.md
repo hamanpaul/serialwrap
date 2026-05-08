@@ -231,7 +231,7 @@ BOOTLOADER_RX_TAIL_BYTES: int = 512
 | 路徑 | 必要欄位 |
 |---|---|
 | `.paul-project.yml` | `policy_profile: flat`、`policy_version: 1.0.0`、`code_paths`（見 §7.2）、`cli`（見 §7.3） |
-| `VERSION` | `0.0.0` |
+| `VERSION` | `0.0.1`（對齊既有 git tag `v0.0.1` / R-07） |
 | `CHANGELOG.md` | Keep-a-Changelog 1.1.0；`[Unreleased]` 段含本 PR 三條 entry |
 | `CLAUDE.md` | managed-by marker + policy_version: 1.0.0 + 本地化 checklist |
 | `AGENTS.md` | 與 `CLAUDE.md` 同內容（首行 marker 不同） |

@@ -371,7 +371,7 @@ package 內，archive 時搬到 specs/）。
 | 檔 | 內容 / 來源 | 對應 rule |
 |---|---|---|
 | `.paul-project.yml` | `policy_profile: flat`、`policy_version: 1.0.0`、`code_paths: ["sw_core/**", "sw_mcp/**", "tools/**", "tests/**"]`、`cli:` 列出 `serialwrap --help` 與 `serialwrap session self-test --help` 等對外 entry 與 marker | R-08 |
-| `VERSION` | `0.0.0`（baseline；merge 後第一個 release 才升） | R-05 / R-06 |
+| `VERSION` | `0.0.1`（對齊既有 git tag `v0.0.1`；R-07 要求 VERSION == latest tag） | R-05 / R-06 / R-07 |
 | `CHANGELOG.md` | Keep-a-Changelog 1.1.0；`[Unreleased]` 段含本 PR 條目 | R-03 / R-04 / R-09 |
 | `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` | 直接複製 paulsha-conventions 對應檔，調整本地測試指令（`python3 -m pytest -q tests/`）；首行 `<!-- managed-by: hamanpaul/paulsha-conventions@v1.0.0 -->`；`policy_version: 1.0.0` | R-13 / R-14 |
 | `.github/copilot-instructions.md` | 既有檔已存在；補首行 `managed-by` marker、`policy_version: 1.0.0` 段，與其他三份 agent file 同步 | R-13 / R-14 |
