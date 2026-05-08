@@ -35,7 +35,7 @@ class ProfileTemplate:
     hard_timeout_s: float = 60.0
     log_dir: str | None = None
     uart: UartProfile = dataclasses.field(default_factory=UartProfile)
-    bootloader_prompts: list[str] = dataclasses.field(default_factory=list)
+    bootloader_prompts: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -131,9 +131,9 @@ def _template_from_dict(name: str, raw: dict[str, Any], *, base_dir: str) -> Pro
         hard_timeout_s=_as_float(raw.get("hard_timeout_s"), 60.0),
         log_dir=_resolve_opt_path(raw.get("log_dir"), base_dir=base_dir),
         uart=_load_uart(raw.get("uart")),
-        bootloader_prompts=[str(s) for s in raw["bootloader_prompts"] if isinstance(s, (str, int, float))]
+        bootloader_prompts=tuple(s for s in raw["bootloader_prompts"] if isinstance(s, str))
         if isinstance(raw.get("bootloader_prompts"), list)
-        else [],
+        else (),
     )
 
 
@@ -234,7 +234,7 @@ def _merge_session(
         hard_timeout_s=_as_float(target.get("hard_timeout_s"), template.hard_timeout_s),
         log_dir=log_dir,
         uart=_load_uart(target.get("uart"), default=template.uart),
-        bootloader_prompts=tuple(template.bootloader_prompts),
+        bootloader_prompts=template.bootloader_prompts,
     )
 
 

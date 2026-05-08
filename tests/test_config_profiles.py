@@ -26,14 +26,15 @@ class TestBootloaderPrompts(unittest.TestCase):
     # --- B2: ProfileTemplate default ---
 
     def test_profile_template_default_bootloader_prompts_empty(self) -> None:
-        """ProfileTemplate 預設 bootloader_prompts 應為空 list。"""
+        """ProfileTemplate 預設 bootloader_prompts 應為空 tuple（不可變）。"""
         tpl = ProfileTemplate(profile_name="x")
-        self.assertEqual(tpl.bootloader_prompts, [])
+        self.assertIsInstance(tpl.bootloader_prompts, tuple)
+        self.assertEqual(tpl.bootloader_prompts, ())
 
     # --- B2: YAML parser with bootloader_prompts ---
 
     def test_yaml_with_bootloader_prompts_parsed(self) -> None:
-        """YAML 含 bootloader_prompts list 應正確解析到 ProfileTemplate。"""
+        """YAML 含 bootloader_prompts list 應解析成 tuple[str, ...] 到 ProfileTemplate。"""
         with tempfile.TemporaryDirectory() as td:
             p = Path(td) / "brcm.yaml"
             p.write_text(
@@ -57,12 +58,12 @@ class TestBootloaderPrompts(unittest.TestCase):
                 encoding="utf-8",
             )
             result = load_profiles(td)
-            # template 層驗證
             tpl = next(t for t in result.templates if t.profile_name == "brcm-template")
-            self.assertEqual(tpl.bootloader_prompts, ["^=> $", "^Marvell>> $"])
+            self.assertIsInstance(tpl.bootloader_prompts, tuple)
+            self.assertEqual(tpl.bootloader_prompts, ("^=> $", "^Marvell>> $"))
 
     def test_yaml_without_bootloader_prompts_yields_empty(self) -> None:
-        """YAML 不含 bootloader_prompts 應使 ProfileTemplate.bootloader_prompts 為空 list。"""
+        """YAML 不含 bootloader_prompts 應使 ProfileTemplate.bootloader_prompts 為空 tuple。"""
         with tempfile.TemporaryDirectory() as td:
             p = Path(td) / "prpl.yaml"
             p.write_text(
@@ -84,7 +85,8 @@ class TestBootloaderPrompts(unittest.TestCase):
             )
             result = load_profiles(td)
             tpl = next(t for t in result.templates if t.profile_name == "prpl-template")
-            self.assertEqual(tpl.bootloader_prompts, [])
+            self.assertIsInstance(tpl.bootloader_prompts, tuple)
+            self.assertEqual(tpl.bootloader_prompts, ())
 
     def test_session_profile_propagates_bootloader_prompts_as_tuple(self) -> None:
         """SessionProfile.bootloader_prompts 應為 tuple，且從 template 正確傳播。"""
@@ -115,6 +117,37 @@ class TestBootloaderPrompts(unittest.TestCase):
             sp = rows[0]
             self.assertIsInstance(sp.bootloader_prompts, tuple)
             self.assertEqual(sp.bootloader_prompts, ("^CFE> $", "^=> $"))
+
+    def test_yaml_bootloader_prompts_rejects_non_str_elements(self) -> None:
+        """YAML bootloader_prompts 中 int/null/dict 元素應被過濾，只保留 str。"""
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "mixed.yaml"
+            p.write_text(
+                textwrap.dedent(
+                    """
+                    profiles:
+                      mixed-template:
+                        platform: bcm
+                        prompt_regex: "(?m)[>#]\\\\s*$"
+                        bootloader_prompts:
+                          - 42
+                          - null
+                          - x: "y"
+                          - "^=> $"
+                    targets:
+                      - act_no: 1
+                        com: COM0
+                        alias: mixed+1
+                        profile: mixed-template
+                        device_by_id: /dev/serial/by-id/tty0
+                    """
+                ),
+                encoding="utf-8",
+            )
+            result = load_profiles(td)
+            tpl = next(t for t in result.templates if t.profile_name == "mixed-template")
+            # int(42)、null、dict 均應被過濾，只保留 str "^=> $"
+            self.assertEqual(tpl.bootloader_prompts, ("^=> $",))
 
 
 class TestConfigProfiles(unittest.TestCase):

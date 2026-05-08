@@ -687,7 +687,7 @@ targets:
 - `hard_timeout_s`：命令硬超時
 - `log_dir`：per-profile agent log 目錄，覆寫 `defaults.log_dir`
 - `uart.*`：序列埠參數（baud、data_bits、parity、stop_bits、flow_control、xonxoff）
-- `bootloader_prompts`：bootloader prompt 的 regex 清單（list[str]，預設 `[]`）。當 `self_test` 在 `ATTACHED` 狀態偵測到 UART RX tail 符合其中任何一個 pattern 時，結果分類為 `BOOTLOADER`。支援 Python `re` 語法。範例：
+- `bootloader_prompts`：bootloader prompt 的 regex 清單（YAML list，內部以 `tuple[str, ...]` 儲存，預設 `()`）。僅接受 `str` 元素；int/null/dict 等非字串元素會被過濾。此欄位供後續 `self_test` BOOTLOADER 分類與 interactive recovery 使用；BOOTLOADER classification 行為由後續 session-selftest 實作章節定義，**本欄位只負責宣告 pattern，不代表目前版本已落地 BOOTLOADER 偵測**。支援 Python `re` 語法。範例：
   ```yaml
   bootloader_prompts:
     - "^CFE> $"       # Broadcom CFE bootloader

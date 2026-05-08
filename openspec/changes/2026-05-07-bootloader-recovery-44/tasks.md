@@ -24,7 +24,7 @@
 
 ## 3. Profile schema：`bootloader_prompts`
 
-- [x] 3.1 在 `sw_core/config.py`（或 profile parser）加 `bootloader_prompts: list[str] = []`
+- [x] 3.1 在 `sw_core/config.py`（或 profile parser）加 `bootloader_prompts`：接受 YAML list，只保留 str 元素；`ProfileTemplate` 與 `SessionProfile` 均以 `tuple[str, ...]`（immutable）暴露，預設 `()`
 - [x] 3.2 `docs/serialwrap-spec.md` profile 章節新增欄位說明、範例 regex
 - [x] 3.3 至少一個 vendor profile 補上 `bootloader_prompts`（BGW720 / Marvell；視 `profiles/` 既有檔案而定）
 - [x] 3.4 單元測試：profile parser 認得 `bootloader_prompts: []`（向後相容）與含值 list
