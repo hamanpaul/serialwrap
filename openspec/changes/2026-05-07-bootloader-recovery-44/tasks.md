@@ -74,7 +74,8 @@
 - [ ] 7.8 unit: `interactive_send during recovery writes raw bytes`（plain / key encoding 各一）
 - [ ] 7.9 unit: `recovery lease enforces MAX_RECOVERY_LEASE_S cap`
 - [ ] 7.10 unit: `recovery lease auto-expires resumes human`
-- [x] 7.11 unit: `recovery lease snapshot exposes recovery_mode in interactive_status and self_test lease_context`（self_test lease_context 已覆蓋；interactive_status 部分留待後續）
+- [x] 7.11a unit: `self_test / _lease_context` 回傳 `recovery_mode` 欄位（lease 有 recovery_mode=True 時為 True、None lease 時為 False）
+- [ ] 7.11b unit: `interactive_status` 回傳 `recovery_mode`（待 interactive recovery 實作後）
 - [ ] 7.12 func-test: fake-target 模擬 U-Boot prompt → human attach → self_test → recovery lease → reset → OS prompt → close → 驗 deferred flush
 - [ ] 7.13 跑 `python3 -m pytest -q tests/` 全綠（含既有 selftest-collab-handoff scenarios 不破壞）
 - [ ] 7.14 跑 `python3 -m unittest discover -s tests -v`，比對既有已知失敗（`test_multiagent_e2e.test_five_agents_three_rounds_no_conflict`）僅該案例；其餘 100% 綠

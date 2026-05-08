@@ -29,21 +29,21 @@ def _matches_any_bootloader_prompt(
     rx_tail: str,
     patterns: "list[str] | tuple[str, ...]",
 ) -> "str | None":
-    """rx_tail の最後の非空・非純空白行が patterns のいずれかに一致するか検査する。
+    """rx_tail 的最後一個非空／非純空白行是否符合 patterns 中任一 regex。
 
-    一致した最初の pattern 文字列を返す。命中なし・空入力・空 patterns は None を返す。
-    invalid regex は例外を発生させず、そのパターンを読み飛ばす。
+    回傳第一個命中的 pattern 字串；無命中、空 rx_tail、空 patterns 均返回 None。
+    invalid regex 不拋出例外，直接略過該 pattern。
     """
     if not rx_tail or not patterns:
         return None
-    # 最後の非空白行を探す
+    # 從尾端找最後一個非空白行
     lines = rx_tail.splitlines()
     last_line: str | None = None
     for line in reversed(lines):
         if line.strip():
             last_line = line
             break
-    # splitlines() が末尾に改行なし文字列で空リストになる場合のフォールバック
+    # splitlines() 對無換行字串返回含一個元素的 list，不會為空；此分支為防禦性保留
     if last_line is None and not lines:
         return None
     if last_line is None:
