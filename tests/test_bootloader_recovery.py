@@ -90,15 +90,20 @@ class TestMatchesAnyBootloaderPrompt(unittest.TestCase):
         # invalid pattern 略過，第二個 pattern 命中
         self.assertEqual(result, r"^=> ")
 
+    def test_rx_tail_with_no_newline(self) -> None:
+        """rx_tail 沒有換行符號，直接把整個字串當最後一行。"""
+        result = self._fn("=> ", [r"^=> "])
+        self.assertEqual(result, r"^=> ")
+
     def test_returns_first_matching_pattern(self) -> None:
         """有多個 pattern 命中時，回傳第一個。"""
         result = self._fn("CFE> ", [r"CFE>", r"=> "])
         self.assertEqual(result, r"CFE>")
 
-    def test_rx_tail_with_no_newline(self) -> None:
-        """rx_tail 沒有換行符號，直接把整個字串當最後一行。"""
-        result = self._fn("=> ", [r"^=> "])
-        self.assertEqual(result, r"^=> ")
+    def test_rx_tail_all_whitespace_lines_returns_none(self) -> None:
+        """rx_tail 全部為空白行時，找不到非空白行，應返回 None。"""
+        result = self._fn("  \n  ", [r"^=> "])
+        self.assertIsNone(result)
 
 
 # ──────────────────────────────────────────────
@@ -267,6 +272,24 @@ class TestSelfTestBootloaderClassification(unittest.TestCase):
 class TestRecoveryLeaseSchema(unittest.TestCase):
     """測試 InteractiveLease / SessionRuntime 的 recovery_mode / suspended_human schema。"""
 
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._old_state_path = sm_mod.STATE_PATH
+        sm_mod.STATE_PATH = str(Path(self._tmp.name) / "state.json")
+
+    def tearDown(self) -> None:
+        sm_mod.STATE_PATH = self._old_state_path
+
+    def _make_manager(self) -> SessionManager:
+        profile = _make_profile()
+        return SessionManager(
+            [profile],
+            WalWriter(wal_dir=self._tmp.name),
+            on_ready=lambda _sid: None,
+            on_detached=lambda _sid: None,
+        )
+
     def test_interactive_lease_recovery_mode_defaults_false(self) -> None:
         """`InteractiveLease.recovery_mode` 預設值應為 False。"""
         lease = InteractiveLease(
@@ -303,117 +326,55 @@ class TestRecoveryLeaseSchema(unittest.TestCase):
 
     def test_session_runtime_stashed_human_lease_defaults_none(self) -> None:
         """`SessionRuntime._stashed_human_lease` 預設值應為 None。"""
-        profile = _make_profile()
-        runtime = SessionRuntime(session_id="p:COM0", profile=profile)
+        runtime = SessionRuntime(session_id="p:COM0", profile=_make_profile())
         self.assertIsNone(runtime._stashed_human_lease)
 
     def test_lease_context_recovery_mode_true_when_lease_has_recovery_mode(self) -> None:
         """`_lease_context` 在 lease.recovery_mode=True 時回傳 recovery_mode: True。"""
-        import tempfile
-        from pathlib import Path
-
-        tmp = tempfile.mkdtemp()
-        old_state = sm_mod.STATE_PATH
-        sm_mod.STATE_PATH = str(Path(tmp) / "state.json")
-        try:
-            profile = _make_profile()
-            mgr = SessionManager(
-                [profile],
-                WalWriter(wal_dir=tmp),
-                on_ready=lambda _sid: None,
-                on_detached=lambda _sid: None,
-            )
-            lease = InteractiveLease(
-                interactive_id="lid",
-                session_id="p:COM0",
-                owner="agent:test",
-                created_at="2025-01-01T00:00:00+00:00",
-                timeout_s=60.0,
-                recovery_mode=True,
-            )
-            ctx = mgr._lease_context(lease)
-            self.assertTrue(ctx["recovery_mode"])
-        finally:
-            sm_mod.STATE_PATH = old_state
+        mgr = self._make_manager()
+        lease = InteractiveLease(
+            interactive_id="lid",
+            session_id="p:COM0",
+            owner="agent:test",
+            created_at="2025-01-01T00:00:00+00:00",
+            timeout_s=60.0,
+            recovery_mode=True,
+        )
+        ctx = mgr._lease_context(lease)
+        self.assertTrue(ctx["recovery_mode"])
 
     def test_lease_context_recovery_mode_false_when_lease_is_none(self) -> None:
         """`_lease_context(None)` 回傳 recovery_mode: False。"""
-        import tempfile
-        from pathlib import Path
-
-        tmp = tempfile.mkdtemp()
-        old_state = sm_mod.STATE_PATH
-        sm_mod.STATE_PATH = str(Path(tmp) / "state.json")
-        try:
-            profile = _make_profile()
-            mgr = SessionManager(
-                [profile],
-                WalWriter(wal_dir=tmp),
-                on_ready=lambda _sid: None,
-                on_detached=lambda _sid: None,
-            )
-            ctx = mgr._lease_context(None)
-            self.assertFalse(ctx["recovery_mode"])
-        finally:
-            sm_mod.STATE_PATH = old_state
+        ctx = self._make_manager()._lease_context(None)
+        self.assertFalse(ctx["recovery_mode"])
 
     def test_lease_context_recovery_mode_false_when_lease_not_recovery(self) -> None:
         """`_lease_context` 在 lease.recovery_mode=False 時回傳 recovery_mode: False。"""
-        import tempfile
-        from pathlib import Path
-
-        tmp = tempfile.mkdtemp()
-        old_state = sm_mod.STATE_PATH
-        sm_mod.STATE_PATH = str(Path(tmp) / "state.json")
-        try:
-            profile = _make_profile()
-            mgr = SessionManager(
-                [profile],
-                WalWriter(wal_dir=tmp),
-                on_ready=lambda _sid: None,
-                on_detached=lambda _sid: None,
-            )
-            lease = InteractiveLease(
-                interactive_id="lid",
-                session_id="p:COM0",
-                owner="agent:test",
-                created_at="2025-01-01T00:00:00+00:00",
-                timeout_s=60.0,
-                recovery_mode=False,
-            )
-            ctx = mgr._lease_context(lease)
-            self.assertFalse(ctx["recovery_mode"])
-        finally:
-            sm_mod.STATE_PATH = old_state
+        mgr = self._make_manager()
+        lease = InteractiveLease(
+            interactive_id="lid",
+            session_id="p:COM0",
+            owner="agent:test",
+            created_at="2025-01-01T00:00:00+00:00",
+            timeout_s=60.0,
+            recovery_mode=False,
+        )
+        ctx = mgr._lease_context(lease)
+        self.assertFalse(ctx["recovery_mode"])
 
     def test_suspended_human_not_exposed_in_lease_context(self) -> None:
         """`suspended_human` 是內部 flag，不應出現在 _lease_context 結果中。"""
-        import tempfile
-        from pathlib import Path
-
-        tmp = tempfile.mkdtemp()
-        old_state = sm_mod.STATE_PATH
-        sm_mod.STATE_PATH = str(Path(tmp) / "state.json")
-        try:
-            profile = _make_profile()
-            mgr = SessionManager(
-                [profile],
-                WalWriter(wal_dir=tmp),
-                on_ready=lambda _sid: None,
-                on_detached=lambda _sid: None,
-            )
-            lease = InteractiveLease(
-                interactive_id="lid",
-                session_id="p:COM0",
-                owner="agent:test",
-                created_at="2025-01-01T00:00:00+00:00",
-                timeout_s=60.0,
-                suspended_human=True,
-            )
-            ctx = mgr._lease_context(lease)
-            self.assertNotIn("suspended_human", ctx)
-        finally:
-            sm_mod.STATE_PATH = old_state
+        mgr = self._make_manager()
+        lease = InteractiveLease(
+            interactive_id="lid",
+            session_id="p:COM0",
+            owner="agent:test",
+            created_at="2025-01-01T00:00:00+00:00",
+            timeout_s=60.0,
+            suspended_human=True,
+        )
+        ctx = mgr._lease_context(lease)
+        self.assertNotIn("suspended_human", ctx)
 
 
 if __name__ == "__main__":

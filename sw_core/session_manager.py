@@ -43,9 +43,6 @@ def _matches_any_bootloader_prompt(
         if line.strip():
             last_line = line
             break
-    # splitlines() 對無換行字串返回含一個元素的 list，不會為空；此分支為防禦性保留
-    if last_line is None and not lines:
-        return None
     if last_line is None:
         return None
     for pattern in patterns:
@@ -104,6 +101,7 @@ class InteractiveLease:
     last_activity_at: float = dataclasses.field(default_factory=time.monotonic)
     status: str = "active"
     recovery_mode: bool = False
+    # 內部 lifecycle flag：recovery lease 開啟前是否已 suspend 人類 console lease；不透出 RPC。
     suspended_human: bool = False
 
     def touch(self) -> None:
