@@ -940,3 +940,59 @@ Handler **建議**：
 ## 延伸閱讀
 
 - 詳細決策與 API 契約：[`docs/serialwrap-spec.md`](./docs/serialwrap-spec.md)
+
+## Install
+
+```bash
+# 安裝到預設路徑（/usr/local/bin）
+./install.sh
+
+# 安裝到自訂路徑
+./install.sh /custom/path
+```
+
+依賴：Python 3.10+、`pyyaml`、`pyserial`；human console 路徑另需 `jq` 與 `minicom`。
+
+## Usage
+
+<!-- BEGIN: cli-help marker="serialwrap-help" -->
+usage: serialwrap [-h] [--socket SOCKET] [--endpoint ENDPOINT]
+                  [--timeout TIMEOUT_S]
+                  {daemon,device,session,alias,cmd,stream,log,file,wal,event}
+                  ...
+
+serialwrap client（支援本機 Unix socket 與遠端 endpoint）
+
+positional arguments:
+  {daemon,device,session,alias,cmd,stream,log,file,wal,event}
+    event               event-trigger rule registry / matcher control
+
+options:
+  -h, --help            show this help message and exit
+  --socket SOCKET       本機 daemon 的 Unix socket 路徑（預設: /tmp/serialwrap/serialwrapd.sock）
+  --endpoint ENDPOINT   遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）
+  --timeout TIMEOUT_S   RPC timeout 秒數（預設: 5.0）
+
+examples:
+  serialwrap session list
+  serialwrap --endpoint tcp://127.0.0.1:7777 session list
+  serialwrap --endpoint tcp://127.0.0.1:7777 cmd submit --selector COM0 --cmd 'uname -a'
+<!-- END: cli-help marker="serialwrap-help" -->
+
+```bash
+# 啟動 daemon
+serialwrap daemon start --profile-dir "$HOME/.paul_tools/profiles"
+
+# 查看 session 列表
+serialwrap session list
+
+# 綁定裝置
+serialwrap session bind --selector COM0 --device-by-id /dev/serial/by-id/<target-by-id>
+
+# 附加 console
+serialwrap session attach --selector COM0
+```
+
+## Version
+
+目前版本請見 [`VERSION`](./VERSION) 檔案。版本歷程請見 [`CHANGELOG.md`](./CHANGELOG.md)。

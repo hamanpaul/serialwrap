@@ -1,3 +1,7 @@
+<!-- managed-by: hamanpaul/paulsha-conventions@v1.0.0 -->
+<!-- 若修改此檔，同步更新 CLAUDE.md / AGENTS.md / GEMINI.md / .github/copilot-instructions.md 四份 -->
+policy_version: 1.0.0
+
 # Copilot Instructions — serialwrap
 
 > 本專案的文件、註解、docstring、README、規格、commit message 與 Copilot 回覆一律使用**繁體中文**。

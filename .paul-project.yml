@@ -1,0 +1,17 @@
+policy_profile: flat
+policy_version: "1.0.0"
+code_paths:
+  - "sw_core/**"
+  - "sw_mcp/**"
+  - "tools/**"
+  - "tests/**"
+  - "profiles/**"
+  - "serialwrap"
+  - "serialwrapd.py"
+  - "serialwrap-mcp"
+  - "install.sh"
+cli:
+  - command: "./serialwrap"
+    help_args: ["--help"]
+    reflected_in: "README.md"
+    marker: "serialwrap-help"
