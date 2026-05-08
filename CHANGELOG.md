@@ -12,6 +12,9 @@
 - 新增 `.github/pull_request_template.md`（含 R-11 policy checklist）
 - 新增 `.github/workflows/policy-check.yml`（PR 自動 policy 驗證）
 - README.md 補充 `## Install`、`## Usage`、`## Version` 段落與 CLI help marker
+- `sw_core/config.py`：`ProfileTemplate` 新增 `bootloader_prompts: list[str] = []` 欄位；`SessionProfile` 新增 `bootloader_prompts: tuple[str, ...] = ()`；loader 自動從 YAML 解析並傳播至 session profile
+- `sw_core/constants.py`：新增 `MAX_RECOVERY_LEASE_S = 120.0` 與 `BOOTLOADER_RX_TAIL_BYTES = 512`（為 Issue #44 bootloader recovery 所需）
+- `profiles/default.yaml`：`brcm-template` 加入 `bootloader_prompts`（CFE、U-Boot、BCM 系列 prompt pattern）
 
 ### Changed
 

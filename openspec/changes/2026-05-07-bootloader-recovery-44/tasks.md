@@ -24,10 +24,10 @@
 
 ## 3. Profile schema：`bootloader_prompts`
 
-- [ ] 3.1 在 `sw_core/config.py`（或 profile parser）加 `bootloader_prompts: list[str] = []`
-- [ ] 3.2 `docs/serialwrap-spec.md` profile 章節新增欄位說明、範例 regex
-- [ ] 3.3 至少一個 vendor profile 補上 `bootloader_prompts`（BGW720 / Marvell；視 `profiles/` 既有檔案而定）
-- [ ] 3.4 單元測試：profile parser 認得 `bootloader_prompts: []`（向後相容）與含值 list
+- [x] 3.1 在 `sw_core/config.py`（或 profile parser）加 `bootloader_prompts: list[str] = []`
+- [x] 3.2 `docs/serialwrap-spec.md` profile 章節新增欄位說明、範例 regex
+- [x] 3.3 至少一個 vendor profile 補上 `bootloader_prompts`（BGW720 / Marvell；視 `profiles/` 既有檔案而定）
+- [x] 3.4 單元測試：profile parser 認得 `bootloader_prompts: []`（向後相容）與含值 list
 
 ## 4. `SessionManager.self_test`：BOOTLOADER 分類
 
@@ -39,7 +39,7 @@
 
 ## 5. `InteractiveLease` / `interactive_open` 改動（stash-and-restore）
 
-- [ ] 5.1 `sw_core/constants.py` 新增 `MAX_RECOVERY_LEASE_S = 120.0`、`BOOTLOADER_RX_TAIL_BYTES = 512`
+- [x] 5.1 `sw_core/constants.py` 新增 `MAX_RECOVERY_LEASE_S = 120.0`、`BOOTLOADER_RX_TAIL_BYTES = 512`
 - [ ] 5.2 `InteractiveLease` dataclass 加 `recovery_mode: bool = False`、`suspended_human: bool = False`
 - [ ] 5.3 `SessionRuntime` dataclass 加 `_stashed_human_lease: InteractiveLease | None = None`
 - [ ] 5.4 `_lease_context` 加 `recovery_mode` 鍵（從 lease.recovery_mode 取）

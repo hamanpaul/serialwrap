@@ -43,6 +43,10 @@ profiles:
     pass_env: "BRCM_PASS"
     env_file: "brcm.env"
     timeout_s: 15
+    bootloader_prompts:
+      - "^CFE> $"
+      - "^=> $"
+      - "^BCM\\d+>> $"
     uart:
       baud: 115200
       data_bits: 8
