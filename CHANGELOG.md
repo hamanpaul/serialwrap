@@ -7,7 +7,7 @@
 ### Added
 
 - 導入 [paulsha-conventions](https://github.com/hamanpaul/paulsha-conventions) v1.0.0 治理基線（`.paul-project.yml`、`policy_version: 1.0.0`）
-- 新增 `VERSION` 檔案（初始值 `0.0.0`）
+- 新增 `VERSION` 檔案（值 `0.0.1`，對齊既有 git tag `v0.0.1` / policy R-07）
 - 新增 `CLAUDE.md` / `AGENTS.md` / `GEMINI.md`（AI agent policy checklist）
 - 新增 `.github/pull_request_template.md`（含 R-11 policy checklist）
 - 新增 `.github/workflows/policy-check.yml`（PR 自動 policy 驗證）

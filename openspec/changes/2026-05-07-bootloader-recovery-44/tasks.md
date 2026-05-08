@@ -9,7 +9,7 @@
 ## 2. paulsha-conventions Bootstrap（先做、避免後續 PR 反覆改）
 
 - [ ] 2.1 新增 `.paul-project.yml`（`policy_profile: flat`、`policy_version: 1.0.0`、`code_paths`、`cli`，內容見 design §7.2 / §7.3）
-- [ ] 2.2 新增 `VERSION`（單行 `0.0.0`）
+- [ ] 2.2 新增 `VERSION`（單行 `0.0.1`，對齊既有 git tag `v0.0.1` / R-07）
 - [ ] 2.3 新增 `CHANGELOG.md`（Keep-a-Changelog 1.1.0；`[Unreleased]` 段落骨架）
 - [ ] 2.4 新增 `CLAUDE.md`（managed-by marker + policy_version: 1.0.0 + 在地化 checklist：本 repo 測試指令 `python3 -m pytest -q tests/`、policy_check 指令）
 - [ ] 2.5 新增 `AGENTS.md`（內容同 `CLAUDE.md`，僅首行 marker 不同）
@@ -94,7 +94,7 @@
 ## 10. CHANGELOG / VERSION
 
 - [ ] 10.1 `CHANGELOG.md [Unreleased]` 補三條 entry（design §8）：`feat(session)` recovery、`chore(policy)` adopt conventions、`docs` OpenSpec change package
-- [ ] 10.2 `VERSION` 維持 `0.0.0`（baseline，merge 後第一個 release PR 才升）
+- [ ] 10.2 `VERSION` 值為 `0.0.1`（對齊既有 git tag `v0.0.1`，R-07 要求 VERSION == latest tag；release PR 才升版）
 
 ## 11. Functional verification（實機）
 

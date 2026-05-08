@@ -81,13 +81,13 @@ Expected: `ok`
 
 Content (exactly one line, no trailing newline issues):
 ```
-0.0.0
+0.0.1
 ```
 
 - [ ] **Step 2: Verify**
 
 Run: `cat VERSION`
-Expected: `0.0.0`
+Expected: `0.0.1`（對齊既有 git tag `v0.0.1`；R-07 要求 VERSION == latest tag）
 
 ### Task A4: Add `CHANGELOG.md` skeleton
 
@@ -346,7 +346,7 @@ If `## Version` is missing, append:
 
 `VERSION` 檔（repo root）為專案版號 single source of truth。
 
-當前版本：`0.0.0`（baseline；首次接入 paulsha-conventions v1.0.0）。
+當前版本：`0.0.1`（對齊既有 git tag `v0.0.1`；R-07 要求 VERSION == latest tag；首次接入 paulsha-conventions v1.0.0）。
 ```
 
 - [ ] **Step 3: Verify all three sections now exist**
@@ -2495,7 +2495,7 @@ Closes #44. Adds an agent-driven bootloader recovery interactive lease that pres
 
 - [x] Branch `feature/bootloader-recovery-44`
 - [x] CHANGELOG.md `[Unreleased]` updated per commit
-- [x] VERSION at 0.0.0 baseline (no release)
+- [x] VERSION at 0.0.1 (aligned to latest tag v0.0.1 / R-07; no release bump needed)
 - [x] All R-01 ~ R-16 checks pass locally
 - [x] No exemption labels needed
 
