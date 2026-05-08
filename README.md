@@ -963,6 +963,67 @@ Handler **建議**：
 
 詳細設計請見 [`docs/plan-event-trigger.md`](./docs/plan-event-trigger.md)。
 
+## Serialwrap Reboot Log Test Toolkit
+
+`serialwrap_reboot_test/` 提供長時間 reboot log soak 測試工具，建立在 Event Trigger Engine 之上。它用一個 controller process 管一個 COM selector，COM0/COM1 共用同一套流程；COM1 可另外安裝 boot-time fault injector 做異常 reboot 測試。
+
+### 工具
+
+| Tool | 用途 |
+|------|------|
+| `bin/serialwrap-reboot-controller` | 驗證 serialwrap、找 active minicom log、註冊 event rules、驅動 reboot loop、退出時清理 event state |
+| `bin/serialwrap-event-handler` | 由 event rules spawn，維護 `~/b-log/event-triggered_COMx_<timestamp>.md` |
+| `bin/serialwrap-fault-install` | 將 fault injector 安裝到 COM1 target 的 `/usr/sbin`、`/etc/init.d`、`/etc/rc.d` |
+
+### Event rules
+
+Controller 啟動時會註冊並啟用目前 selector 的 shared rules：
+
+| Event | Match |
+|-------|-------|
+| `brcm-therm` | `brcm-therm` |
+| `Link is Down` | `Link is Down` |
+| `pstate` | lowercase case-sensitive `pstate` |
+| `Kernel panic` | `Kernel panic` |
+| `SMC bootloader` | `SMC bootloader` |
+
+每條 rule 都呼叫 `serialwrap-event-handler`。handler 會從 stdin 讀取 serialwrap event payload，解析目前 selector 的 active minicom log，並更新報告：
+
+```text
+~/b-log/event-triggered_COMx_<timestamp>.md
+```
+
+報告包含 summary table 與 event table。Summary 以 `SMC bootloader` 次數為分母，計算其他事件的發生機率；若分母為 0，機率顯示 `N/A`。Event table 記錄 minicom log name、physical log line number、event trigger time 與 event name。handler 也會維護 per-event scan cursor，避免重複事件一直對到同一行 log。
+
+### 使用流程
+
+先確認部署版 serialwrap 支援 event subcommand 且 daemon 正常：
+
+```bash
+/home/paul_chen/.paul_tools/serialwrap event --help
+/home/paul_chen/.paul_tools/serialwrap daemon status
+/home/paul_chen/.paul_tools/serialwrap event status --selector COM0
+/home/paul_chen/.paul_tools/serialwrap event status --selector COM1
+```
+
+先開 minicom logging，再啟動 controller：
+
+```bash
+minicom COM0 -O timestamp=extended
+minicom COM1 -O timestamp=extended
+
+bin/serialwrap-reboot-controller --selector COM0
+bin/serialwrap-reboot-controller --selector COM1
+```
+
+可用 `--count N` 或 `--hours N` 限制執行長度。COM1 fault injector 可用下列命令安裝：
+
+```bash
+bin/serialwrap-fault-install --selector COM1
+```
+
+詳細設計請見 [`docs/superpowers/specs/2026-05-06-serialwrap-reboot-log-test-design.md`](./docs/superpowers/specs/2026-05-06-serialwrap-reboot-log-test-design.md) 與 [`openspec/specs/serialwrap-reboot-log-test/spec.md`](./openspec/specs/serialwrap-reboot-log-test/spec.md)。
+
 ## 延伸閱讀
 
 - 詳細決策與 API 契約：[`docs/serialwrap-spec.md`](./docs/serialwrap-spec.md)
