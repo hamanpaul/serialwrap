@@ -3,24 +3,24 @@
 ## 1. Branch / scaffold
 
 - [x] 1.1 從 `main` 開新 branch `feature/bootloader-recovery-44`
-- [ ] 1.2 確認 `python3 -m pytest -q tests/` 在改動前的綠燈狀態（baseline）
-- [ ] 1.3 Local 安裝 paulsha-conventions policy engine（pin SHA `ff1a031172ec24fc155699f9f3ce5bdea24d9e24`）；先跑 `python3 -m policy_check --repo .` 把預期會 fail 的規則記下來（baseline）
+- [x] 1.2 確認 `python3 -m pytest -q tests/` 在改動前的綠燈狀態（baseline）
+- [x] 1.3 Local 安裝 paulsha-conventions policy engine（pin SHA `ff1a031172ec24fc155699f9f3ce5bdea24d9e24`）；先跑 `python3 -m policy_check --repo .` 把預期會 fail 的規則記下來（baseline）
 
 ## 2. paulsha-conventions Bootstrap（先做、避免後續 PR 反覆改）
 
-- [ ] 2.1 新增 `.paul-project.yml`（`policy_profile: flat`、`policy_version: 1.0.0`、`code_paths`、`cli`，內容見 design §7.2 / §7.3）
-- [ ] 2.2 新增 `VERSION`（單行 `0.0.1`，對齊既有 git tag `v0.0.1` / R-07）
-- [ ] 2.3 新增 `CHANGELOG.md`（Keep-a-Changelog 1.1.0；`[Unreleased]` 段落骨架）
-- [ ] 2.4 新增 `CLAUDE.md`（managed-by marker + policy_version: 1.0.0 + 在地化 checklist：本 repo 測試指令 `python3 -m pytest -q tests/`、policy_check 指令）
-- [ ] 2.5 新增 `AGENTS.md`（內容同 `CLAUDE.md`，僅首行 marker 不同）
-- [ ] 2.6 新增 `GEMINI.md`（同上）
-- [ ] 2.7 既有 `.github/copilot-instructions.md` 首行加 `<!-- managed-by: hamanpaul/paulsha-conventions@v1.0.0 -->` 與 policy_version: 1.0.0；保留其餘 11KB 既有內容
-- [ ] 2.8 grep 四份 agent file 的 policy_version 字串、確認皆為 `1.0.0`
-- [ ] 2.9 新增 `.github/pull_request_template.md`（conventions 標準 template + R-11 checklist）
-- [ ] 2.10 新增 `.github/workflows/policy-check.yml`，雙 pin 到 `hamanpaul/paulsha-conventions@ff1a031172ec24fc155699f9f3ce5bdea24d9e24`
-- [ ] 2.11 補 README.md `## Install` / `## Usage` / `## Version` 段落（缺則加 heading + 一段引用，不重寫既有內容）；若 R-16 啟用，`## Usage` 加 `<!-- BEGIN: cli-help marker="serialwrap-help" -->` 區塊
-- [ ] 2.12 跑 `bash <conventions>/scripts/update-cli-help.sh` 把 `./serialwrap --help` 灌進 README marker
-- [ ] 2.13 `python3 -m policy_check --repo .` 全綠（R-01 ~ R-16 全 pass）
+- [x] 2.1 新增 `.paul-project.yml`（`policy_profile: flat`、`policy_version: 1.0.0`、`code_paths`、`cli`，內容見 design §7.2 / §7.3）
+- [x] 2.2 新增 `VERSION`（單行 `0.0.1`，對齊既有 git tag `v0.0.1` / R-07）
+- [x] 2.3 新增 `CHANGELOG.md`（Keep-a-Changelog 1.1.0；`[Unreleased]` 段落骨架）
+- [x] 2.4 新增 `CLAUDE.md`（managed-by marker + policy_version: 1.0.0 + 在地化 checklist：本 repo 測試指令 `python3 -m pytest -q tests/`、policy_check 指令）
+- [x] 2.5 新增 `AGENTS.md`（內容與 `CLAUDE.md` 相同，三份共用同一 managed-by marker / policy_version；R-13 只驗證檔案存在，R-14 掃 `^policy_version:` 裸行）
+- [x] 2.6 新增 `GEMINI.md`（同上）
+- [x] 2.7 既有 `.github/copilot-instructions.md` 首行加 `<!-- managed-by: hamanpaul/paulsha-conventions@v1.0.0 -->` 與 policy_version: 1.0.0；保留其餘 11KB 既有內容
+- [x] 2.8 grep 四份 agent file 的 policy_version 字串、確認皆為 `1.0.0`
+- [x] 2.9 新增 `.github/pull_request_template.md`（conventions 標準 template + R-11 checklist）
+- [x] 2.10 新增 `.github/workflows/policy-check.yml`，雙 pin 到 `hamanpaul/paulsha-conventions@ff1a031172ec24fc155699f9f3ce5bdea24d9e24`
+- [x] 2.11 補 README.md `## Install` / `## Usage` / `## Version` 段落（缺則加 heading + 一段引用，不重寫既有內容）；若 R-16 啟用，`## Usage` 加 `<!-- BEGIN: cli-help marker="serialwrap-help" -->` 區塊
+- [x] 2.12 跑 `bash <conventions>/scripts/update-cli-help.sh` 把 `./serialwrap --help` 灌進 README marker
+- [x] 2.13 `python3 -m policy_check --repo .` 全綠（R-01 ~ R-16 全 pass）
 
 ## 3. Profile schema：`bootloader_prompts`
 

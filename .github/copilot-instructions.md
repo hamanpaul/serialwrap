@@ -1,6 +1,7 @@
 <!-- managed-by: hamanpaul/paulsha-conventions@v1.0.0 -->
 <!-- 若修改此檔，同步更新 CLAUDE.md / AGENTS.md / GEMINI.md / .github/copilot-instructions.md 四份 -->
 policy_version: 1.0.0
+<!-- policy_version 為 policy_check R-14 machine-readable marker；需保持裸行格式，請勿移入 frontmatter 或 code block。 -->
 
 # Copilot Instructions — serialwrap
 
