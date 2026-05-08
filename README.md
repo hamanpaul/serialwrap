@@ -482,7 +482,7 @@ serialwrap session interactive-open --selector COM0 --owner agent:recovery \
   --allow-attached --timeout 120
 
 # 3. 送 bootloader 命令（例如 U-Boot boot command）
-serialwrap session interactive-send --interactive-id <iid> --data "boot" --encoding text
+serialwrap session interactive-send --interactive-id <iid> --data "boot"
 serialwrap session interactive-send --interactive-id <iid> --data enter --encoding key
 
 # 4. 觀察畫面

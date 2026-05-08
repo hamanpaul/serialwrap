@@ -955,12 +955,13 @@ class TestRpcCliMcpPassthrough(unittest.TestCase):
         import subprocess
         import sys
 
+        repo_root = Path(__file__).resolve().parents[1]
         result = subprocess.run(
-            [sys.executable, "/home/paul_chen/prj_pri/serialwrap/serialwrap",
+            [sys.executable, str(repo_root / "serialwrap"),
              "session", "interactive-open", "--help"],
             capture_output=True,
             text=True,
-            cwd="/home/paul_chen/prj_pri/serialwrap",
+            cwd=repo_root,
         )
         output = result.stdout + result.stderr
         self.assertIn("--allow-attached", output, f"--allow-attached not found in help:\n{output}")
