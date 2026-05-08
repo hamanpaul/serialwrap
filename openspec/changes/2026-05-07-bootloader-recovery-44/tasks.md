@@ -43,39 +43,39 @@
 - [x] 5.2 `InteractiveLease` dataclass 加 `recovery_mode: bool = False`、`suspended_human: bool = False`
 - [x] 5.3 `SessionRuntime` dataclass 加 `_stashed_human_lease: InteractiveLease | None = None`
 - [x] 5.4 `_lease_context` 加 `recovery_mode` 鍵（從 lease.recovery_mode 取）
-- [ ] 5.5 `interactive_open` signature 加 `allow_attached: bool = False`
-- [ ] 5.6 替換 `state != "READY"` 單檢，依 design §4.2 邏輯放寬：READY 走原路徑、ATTACHED + allow_attached + 當下匹配 bootloader → 開 recovery lease
-- [ ] 5.7 ATTACHED 路徑匹配失敗回 `SESSION_NOT_READY`，加 `error_detail: NOT_BOOTLOADER`
-- [ ] 5.8 recovery 開 lease 流程（design §4.3）：在 `_lock` 內檢查既有 lease；owner 為 `human:*` → stash 到 `session._stashed_human_lease`、從 `self._interactive` pop、`session.interactive_session_id=None`、`bridge.suspend_interactive()`；owner 為 agent → 回 `SESSION_INTERACTIVE_BUSY`；無既有 lease → suspended_human=False
-- [ ] 5.9 `_open_interactive_locked` 接 `recovery_mode` / `suspended_human` kwarg：clamp `timeout_s ≤ MAX_RECOVERY_LEASE_S`（recovery lease only）、設旗標
-- [ ] 5.10 `_close_interactive_locked` 處理 recovery lease：pop lease、bridge owner 設 None；若 `lease.suspended_human=True`：呼叫 `bridge.resume_interactive()`、檢查 `_stashed_human_lease.expired()` 與 `bridge.console_has_external_peer(client_id)`、皆通過則還原 stash 回 `_interactive` + `set_interactive_owner(stashed.owner)`、否則丟棄 stash；最後 `_stashed_human_lease=None`
-- [ ] 5.11 lease expire 路徑（`interactive_send` / `interactive_status` 內的 `expired()` 檢查）對 recovery lease 也走相同 close path、確保 stash 被正確處理
-- [ ] 5.12 `_refresh_interactive_locked` 行為驗證：recovery lease 期間呼叫不應誤把 stashed lease 當成失效（因為已從 `_interactive` pop）
+- [x] 5.5 `interactive_open` signature 加 `allow_attached: bool = False`
+- [x] 5.6 替換 `state != "READY"` 單檢，依 design §4.2 邏輯放寬：READY 走原路徑、ATTACHED + allow_attached + 當下匹配 bootloader → 開 recovery lease
+- [x] 5.7 ATTACHED 路徑匹配失敗回 `SESSION_NOT_READY`，加 `error_detail: NOT_BOOTLOADER`
+- [x] 5.8 recovery 開 lease 流程（design §4.3）：在 `_lock` 內檢查既有 lease；owner 為 `human:*` → stash 到 `session._stashed_human_lease`、從 `self._interactive` pop、`session.interactive_session_id=None`、`bridge.suspend_interactive()`；owner 為 agent → 回 `SESSION_INTERACTIVE_BUSY`；無既有 lease → suspended_human=False
+- [x] 5.9 `_open_interactive_locked` 接 `recovery_mode` / `suspended_human` kwarg：clamp `timeout_s ≤ MAX_RECOVERY_LEASE_S`（recovery lease only）、設旗標
+- [x] 5.10 `_close_interactive_locked` 處理 recovery lease：pop lease、bridge owner 設 None；若 `lease.suspended_human=True`：呼叫 `bridge.resume_interactive()`、檢查 `_stashed_human_lease.expired()` 與 `bridge.console_has_external_peer(client_id)`、皆通過則還原 stash 回 `_interactive` + `set_interactive_owner(stashed.owner)`、否則丟棄 stash；最後 `_stashed_human_lease=None`
+- [x] 5.11 lease expire 路徑（`_refresh_interactive_locked` 內的 `expired()` 檢查）對 recovery lease 呼叫 `_expire_interactive_locked`，在 lock 內安全清除 `bridge._suspended_owner`，確保 stash 被正確處理（bug fix commit）
+- [x] 5.12 `_refresh_interactive_locked` 行為驗證：recovery lease 期間呼叫不應誤把 stashed lease 當成失效（因為已從 `_interactive` pop）
 
 ## 6. RPC / CLI passthrough
 
-- [ ] 6.1 `sw_core/service.py` `session.interactive_open` 從 `params.get("allow_attached", False)` 讀並傳入
-- [ ] 6.2 `sw_core/cli.py` `session interactive-open` 加 `--allow-attached`（store_true、default False），寫入 RPC params
-- [ ] 6.3 CLI `--help` 文字描述用途（recovery 用、會 suspend human）
-- [ ] 6.4 grep `sw_mcp/`：若 MCP `interactive_open` tool 描述提到 READY-only，同步補 `allow_attached` 與 `recovery_mode` 說明
+- [x] 6.1 `sw_core/service.py` `session.interactive_open` 從 `params.get("allow_attached", False)` 讀並傳入
+- [x] 6.2 `sw_core/cli.py` `session interactive-open` 加 `--allow-attached`（store_true、default False），寫入 RPC params
+- [x] 6.3 CLI `--help` 文字描述用途（recovery 用、會 suspend human）
+- [x] 6.4 grep `sw_mcp/`：若 MCP `interactive_open` tool 描述提到 READY-only，同步補 `allow_attached` 與 `recovery_mode` 說明
 
 ## 7. Tests（unit + functional）
 
 - [x] 7.1 unit: `self_test classifies BOOTLOADER when bootloader_prompts matches RX tail`
 - [x] 7.2 unit: `self_test falls back to ATTACHED_NOT_READY when bootloader_prompts is empty`
 - [x] 7.3 unit: `self_test prefers BOOTLOADER over ATTACHED_NOT_READY when both could apply`
-- [ ] 7.4 unit: `interactive_open with allow_attached=False rejects ATTACHED state`（向後相容）
-- [ ] 7.5 unit: `interactive_open with allow_attached=True rejects ATTACHED if no bootloader match`（含 `error_detail: NOT_BOOTLOADER`）
-- [ ] 7.6 unit: `interactive_open with allow_attached=True opens recovery lease in BOOTLOADER`（無 human lease → suspend 不被呼叫）
-- [ ] 7.7 unit: `interactive_open recovery stashes human lease and restores on close`（斷言：stash 入 `_stashed_human_lease`、recovery 期間 `_refresh_interactive_locked` 不誤判失效、close 時 stash 還原 + bridge.resume_interactive flush deferred buffer）
-- [ ] 7.7a unit: `interactive_open recovery rejects when existing lease is agent`（owner 非 human → SESSION_INTERACTIVE_BUSY，不執行 stash）
-- [ ] 7.7b unit: `interactive_close recovery discards expired stash`（stash 在 recovery 期間 expire → close 時丟棄、session 回到無 lease）
-- [ ] 7.7c unit: `interactive_close recovery discards stash when human detached`（human 在 recovery 期間 detach → close 時 console_has_external_peer=False、stash 丟棄）
-- [ ] 7.8 unit: `interactive_send during recovery writes raw bytes`（plain / key encoding 各一）
-- [ ] 7.9 unit: `recovery lease enforces MAX_RECOVERY_LEASE_S cap`
-- [ ] 7.10 unit: `recovery lease auto-expires resumes human`
+- [x] 7.4 unit: `interactive_open with allow_attached=False rejects ATTACHED state`（向後相容）
+- [x] 7.5 unit: `interactive_open with allow_attached=True rejects ATTACHED if no bootloader match`（含 `error_detail: NOT_BOOTLOADER`）
+- [x] 7.6 unit: `interactive_open with allow_attached=True opens recovery lease in BOOTLOADER`（無 human lease → suspend 不被呼叫）
+- [x] 7.7 unit: `interactive_open recovery stashes human lease and restores on close`（斷言：stash 入 `_stashed_human_lease`、recovery 期間 `_refresh_interactive_locked` 不誤判失效、close 時 stash 還原 + bridge.resume_interactive flush deferred buffer）
+- [x] 7.7a unit: `interactive_open recovery rejects when existing lease is agent`（owner 非 human → SESSION_INTERACTIVE_BUSY，不執行 stash）
+- [x] 7.7b unit: `interactive_close recovery discards expired stash`（stash 在 recovery 期間 expire → close 時丟棄、session 回到無 lease）
+- [x] 7.7c unit: `interactive_close recovery discards stash when human detached`（human 在 recovery 期間 detach → close 時 console_has_external_peer=False、stash 丟棄）
+- [x] 7.8 unit: `interactive_send during recovery writes raw bytes`（plain / key encoding 各一）
+- [x] 7.9 unit: `recovery lease enforces MAX_RECOVERY_LEASE_S cap`
+- [x] 7.10 unit: `recovery lease auto-expires resumes human`（`_refresh_interactive_locked` 呼叫 `_expire_interactive_locked`，清 `bridge._suspended_owner`；bug fix commit 補完）
 - [x] 7.11a unit: `self_test / _lease_context` 回傳 `recovery_mode` 欄位（lease 有 recovery_mode=True 時為 True、None lease 時為 False）
-- [ ] 7.11b unit: `interactive_status` 回傳 `recovery_mode`（待 interactive recovery 實作後）
+- [x] 7.11b unit: `interactive_status` 回傳 `recovery_mode`（待 interactive recovery 實作後）
 - [ ] 7.12 func-test: fake-target 模擬 U-Boot prompt → human attach → self_test → recovery lease → reset → OS prompt → close → 驗 deferred flush
 - [ ] 7.13 跑 `python3 -m pytest -q tests/` 全綠（含既有 selftest-collab-handoff scenarios 不破壞）
 - [ ] 7.14 跑 `python3 -m unittest discover -s tests -v`，比對既有已知失敗（`test_multiagent_e2e.test_five_agents_three_rounds_no_conflict`）僅該案例；其餘 100% 綠
@@ -88,13 +88,13 @@
 ## 9. Docs
 
 - [x] 9.1 `docs/serialwrap-spec.md` self_test 章節加 BOOTLOADER classification、`bootloader_prompts` 欄位、`matched_prompt` / `rx_tail` 輸出
-- [ ] 9.2 `docs/serialwrap-spec.md` interactive 章節加 `allow_attached`、`recovery_mode`、`MAX_RECOVERY_LEASE_S`、suspend-resume 行為
+- [x] 9.2 `docs/serialwrap-spec.md` interactive 章節加 `allow_attached`、`recovery_mode`、`MAX_RECOVERY_LEASE_S`、suspend-resume 行為
 - [ ] 9.3 `docs/serialwrap-spec.md` profile 章節加 `bootloader_prompts` 欄位、範例 regex、與 `prompt_regex` 的優先序
-- [ ] 9.4 `README.md`（troubleshooting / Usage 段）加 recovery 流程使用範例（self_test → interactive-open --allow-attached → interactive-send reset）
+- [x] 9.4 `README.md`（troubleshooting / Usage 段）加 recovery 流程使用範例（self_test → interactive-open --allow-attached → interactive-send reset）
 
 ## 10. CHANGELOG / VERSION
 
-- [ ] 10.1 `CHANGELOG.md [Unreleased]` 補三條 entry（design §8）：`feat(session)` recovery、`chore(policy)` adopt conventions、`docs` OpenSpec change package
+- [x] 10.1 `CHANGELOG.md [Unreleased]` 補三條 entry（design §8）：`feat(session)` recovery、`chore(policy)` adopt conventions、`docs` OpenSpec change package
 - [ ] 10.2 `VERSION` 值為 `0.0.1`（對齊既有 git tag `v0.0.1`，R-07 要求 VERSION == latest tag；release PR 才升版）
 
 ## 11. Functional verification（實機）

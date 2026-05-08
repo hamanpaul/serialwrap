@@ -797,6 +797,41 @@ class TestInteractiveOpenAllowAttached(unittest.TestCase):
         self.assertIn("recovery_mode", resp)
         self.assertFalse(resp["recovery_mode"])
 
+    # ── 19: _refresh_interactive_locked 清理 expired recovery 須清除 suspended 狀態 ──
+
+    def test_refresh_clears_suspended_state_for_expired_recovery_lease(self) -> None:
+        """bug fix (#44 Phase B)：expired recovery lease 被 _refresh_interactive_locked
+        清理時，bridge.clear_suspended_interactive() 必須被呼叫以清除 _suspended_owner。
+        若沒呼叫，bridge 會永久停在 suspended 狀態，後續 suspend_interactive() 行為不定。
+        """
+        mgr, session, bridge = self._make_mgr_attached()
+        human_lease = self._inject_human_lease(mgr, session, bridge, "client1")
+
+        # 開啟 recovery lease（stash human, suspended_human=True）
+        resp1 = mgr.interactive_open("COM0", owner="agent:test", allow_attached=True)
+        self.assertTrue(resp1["ok"])
+        recovery_iid = resp1["interactive_id"]
+
+        # 讓 recovery lease 過期
+        mgr._interactive[recovery_iid].last_activity_at = time.monotonic() - 999999.0
+
+        # peer dead → stash 被丟棄（discard path，較簡單）
+        bridge.console_has_external_peer.return_value = False
+
+        # 觸發 _refresh_interactive_locked（第二次 allow_attached open）
+        resp2 = mgr.interactive_open("COM0", owner="agent:test", allow_attached=True)
+
+        # 第二次 open 應成功（expired lease 被清除）
+        self.assertTrue(resp2["ok"], f"expected ok, got: {resp2}")
+
+        # bug fix 驗證：clear_suspended_interactive() 必須被呼叫
+        # 修前：_refresh_interactive_locked 丟棄 _PostCloseAction，resume 永遠不執行
+        # 修後：_expire_interactive_locked 直接呼叫 clear_suspended_interactive（lock 內安全）
+        self.assertGreaterEqual(
+            bridge.clear_suspended_interactive.call_count, 1,
+            "bridge.clear_suspended_interactive() 未被呼叫 —— bridge 永久 suspended！"
+        )
+
 
 # ──────────────────────────────────────────────
 # 5. RPC / CLI / MCP passthrough 測試（Phase B）

@@ -14,7 +14,7 @@ from typing import Any, Callable
 from .alias_registry import AliasRegistry
 from .auth import resolve_session_auth
 from .config import ProfileTemplate, SessionProfile
-from .constants import BOOTLOADER_RX_TAIL_BYTES, LOG_DIR, STATE_PATH
+from .constants import BOOTLOADER_RX_TAIL_BYTES, LOG_DIR, MAX_RECOVERY_LEASE_S, STATE_PATH
 from .device_watcher import DeviceInfo
 from .login_fsm import detect_template, ensure_ready, probe_ready
 from .uart_io import PreservedConsoles, UARTBridge
@@ -1160,6 +1160,57 @@ class SessionManager:
             session.bridge.set_interactive_owner(None)
         return lease, post
 
+    def _expire_interactive_locked(
+        self, session: SessionRuntime, *, lease_id: str
+    ) -> InteractiveLease | None:
+        """清理 expired non-human lease（在 _lock 內呼叫）。
+
+        對 recovery+suspended_human lease：呼叫 bridge.clear_suspended_interactive()
+        清除 _suspended_owner（純 state mutation，可在 _lock 內安全呼叫，不做 I/O flush）。
+        若 stash 有效且 peer alive → 還原 stash，回傳還原的 human lease；
+        否則丟棄 stash，回傳 None。
+
+        與 _close_interactive_locked 的差異：此方法不產生 _PostCloseAction，
+        而是直接在 lock 內呼叫 bridge.clear_suspended_interactive()，
+        使 _suspended_owner 立即清除，讓後續的 suspend_interactive() 可安全呼叫。
+        """
+        lease = self._interactive.pop(lease_id, None)
+        if lease is None:
+            session.interactive_session_id = None
+            return None
+
+        lease.status = "closed"
+
+        if lease.recovery_mode and lease.suspended_human:
+            stash = session._stashed_human_lease
+            session._stashed_human_lease = None
+            bridge = session.bridge
+
+            if bridge is not None:
+                # 清除 suspended owner（lock 內安全，不做 I/O flush）
+                bridge.clear_suspended_interactive()
+
+            if stash is not None and not stash.expired():
+                client_id = stash.owner.split(":", 1)[1] if ":" in stash.owner else ""
+                if bridge is not None and bridge.console_has_external_peer(client_id):
+                    # 還原 human lease 狀態
+                    self._interactive[stash.interactive_id] = stash
+                    session.interactive_session_id = stash.interactive_id
+                    bridge.set_interactive_owner(stash.owner)
+                    return stash
+
+            # Discard：清除 session 狀態
+            session.interactive_session_id = None
+            if bridge is not None:
+                bridge.set_interactive_owner(None)
+            return None
+
+        # 一般 non-human lease close（non-recovery 或 suspended_human=False）
+        session.interactive_session_id = None
+        if session.bridge is not None:
+            session.bridge.set_interactive_owner(None)
+        return None
+
     def _refresh_interactive_locked(self, session: SessionRuntime) -> InteractiveLease | None:
         lease_id = session.interactive_session_id
         if lease_id is None:
@@ -1183,10 +1234,12 @@ class SessionManager:
                 self._close_interactive_locked(session, interactive_id=lease_id)
                 return None
         else:
-            # 非 human lease：若已 expired 則清除（post-close ops 在 lock 內無法執行，忽略）
+            # 非 human lease：若已 expired 則透過 _expire_interactive_locked 清理。
+            # _expire_interactive_locked 在 lock 內呼叫 bridge.clear_suspended_interactive()
+            # 以清除 _suspended_owner（可安全在 lock 內執行），
+            # 並在 stash 有效時還原 human lease，回傳還原的 lease（或 None）。
             if lease.expired():
-                self._close_interactive_locked(session, interactive_id=lease_id)
-                return None
+                return self._expire_interactive_locked(session, lease_id=lease_id)
         return lease
 
     def _lease_context(self, lease: InteractiveLease | None) -> dict[str, Any]:
@@ -1657,7 +1710,13 @@ class SessionManager:
             lease = self._refresh_interactive_locked(session)
             ok = session.bridge.detach_console(client_id)
             if lease is not None and lease.owner == human_owner:
-                self._close_interactive_locked(session, interactive_id=lease.interactive_id, expected_owner=human_owner)
+                # Human lease close：lease.recovery_mode=False，故 _close_interactive_locked
+                # 回傳的 post.needs_resume 必為 False（no-op post），安全丟棄。
+                # 若有 recovery lease 在此之前被 _refresh_interactive_locked 清理，
+                # 也已由 _expire_interactive_locked 正確處理（clear_suspended_interactive）。
+                _, _ = self._close_interactive_locked(
+                    session, interactive_id=lease.interactive_id, expected_owner=human_owner
+                )
             session.vtty_path = session.bridge.vtty_path
             if not ok:
                 return {"ok": False, "error_code": "CONSOLE_NOT_FOUND", "client_id": client_id}
@@ -1679,8 +1738,6 @@ class SessionManager:
         command: str = "",
         allow_attached: bool = False,
     ) -> dict[str, Any]:
-        from .constants import BOOTLOADER_RX_TAIL_BYTES, MAX_RECOVERY_LEASE_S
-
         with self._lock:
             session = self.get_session(selector)
             if session is None or session.bridge is None:
