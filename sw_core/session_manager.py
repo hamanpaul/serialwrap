@@ -467,7 +467,8 @@ class SessionManager:
         client_id = owner.split(":", 1)[1]
         if not client_id or not session.bridge.has_console(client_id):
             return
-        if self._refresh_interactive_locked(session) is None:
+        lease, _ = self._refresh_interactive_locked(session)
+        if lease is None:
             self._open_interactive_locked(
                 session,
                 owner=owner,
@@ -572,6 +573,8 @@ class SessionManager:
     def attach_session(self, selector: str) -> dict[str, Any]:
         bridge: UARTBridge | None = None
         should_probe = False
+        post = _PostCloseAction()
+        result: dict[str, Any] | None = None
         with self._lock:
             session = self.get_session(selector)
             if session is None:
@@ -580,22 +583,25 @@ class SessionManager:
             if not by_id:
                 return {"ok": False, "error_code": "DEVICE_NOT_BOUND", "session": session.to_public_dict()}
             if session.bridge is not None:
-                lease = self._refresh_interactive_locked(session)
+                lease, post = self._refresh_interactive_locked(session)
                 if lease is not None and lease.owner.startswith("human:"):
-                    return {"ok": True, "session": session.to_public_dict()}
-                if session.state == "ATTACHED":
+                    result = {"ok": True, "session": session.to_public_dict()}
+                elif session.state == "ATTACHED":
                     bridge = session.bridge
                     should_probe = True
                 else:
-                    return {"ok": True, "session": session.to_public_dict()}
-            if by_id not in self._devices:
+                    result = {"ok": True, "session": session.to_public_dict()}
+            if result is None and by_id not in self._devices:
                 session.state = "DETACHED"
                 session.last_error = "DEVICE_NOT_FOUND"
                 session.detached_at = now_iso()
-                return {"ok": False, "error_code": "DEVICE_NOT_FOUND", "session": session.to_public_dict()}
-            if not should_probe:
+                result = {"ok": False, "error_code": "DEVICE_NOT_FOUND", "session": session.to_public_dict()}
+            if result is None and not should_probe:
                 session.state = "ATTACHING"
                 session.last_error = None
+        post.execute()
+        if result is not None:
+            return result
         if should_probe and bridge is not None:
             return self._probe_existing_bridge(session, bridge)
         self._spawn_attach(by_id)
@@ -1160,87 +1166,38 @@ class SessionManager:
             session.bridge.set_interactive_owner(None)
         return lease, post
 
-    def _expire_interactive_locked(
-        self, session: SessionRuntime, *, lease_id: str
-    ) -> InteractiveLease | None:
-        """清理 expired non-human lease（在 _lock 內呼叫）。
-
-        對 recovery+suspended_human lease：呼叫 bridge.clear_suspended_interactive()
-        清除 _suspended_owner（純 state mutation，可在 _lock 內安全呼叫，不做 I/O flush）。
-        若 stash 有效且 peer alive → 還原 stash，回傳還原的 human lease；
-        否則丟棄 stash，回傳 None。
-
-        與 _close_interactive_locked 的差異：此方法不產生 _PostCloseAction，
-        而是直接在 lock 內呼叫 bridge.clear_suspended_interactive()，
-        使 _suspended_owner 立即清除，讓後續的 suspend_interactive() 可安全呼叫。
-        """
-        lease = self._interactive.pop(lease_id, None)
-        if lease is None:
-            session.interactive_session_id = None
-            return None
-
-        lease.status = "closed"
-
-        if lease.recovery_mode and lease.suspended_human:
-            stash = session._stashed_human_lease
-            session._stashed_human_lease = None
-            bridge = session.bridge
-
-            if bridge is not None:
-                # 清除 suspended owner（lock 內安全，不做 I/O flush）
-                bridge.clear_suspended_interactive()
-
-            if stash is not None and not stash.expired():
-                client_id = stash.owner.split(":", 1)[1] if ":" in stash.owner else ""
-                if bridge is not None and bridge.console_has_external_peer(client_id):
-                    # 還原 human lease 狀態
-                    self._interactive[stash.interactive_id] = stash
-                    session.interactive_session_id = stash.interactive_id
-                    bridge.set_interactive_owner(stash.owner)
-                    return stash
-
-            # Discard：清除 session 狀態
-            session.interactive_session_id = None
-            if bridge is not None:
-                bridge.set_interactive_owner(None)
-            return None
-
-        # 一般 non-human lease close（non-recovery 或 suspended_human=False）
-        session.interactive_session_id = None
-        if session.bridge is not None:
-            session.bridge.set_interactive_owner(None)
-        return None
-
-    def _refresh_interactive_locked(self, session: SessionRuntime) -> InteractiveLease | None:
+    def _refresh_interactive_locked(
+        self, session: SessionRuntime
+    ) -> tuple[InteractiveLease | None, _PostCloseAction]:
+        post = _PostCloseAction()
         lease_id = session.interactive_session_id
         if lease_id is None:
-            return None
+            return None, post
         lease = self._interactive.get(lease_id)
         if lease is None:
-            self._close_interactive_locked(session, interactive_id=lease_id)
-            return None
+            _, post = self._close_interactive_locked(session, interactive_id=lease_id)
+            return None, post
         if session.bridge is None:
-            self._close_interactive_locked(session, interactive_id=lease_id)
-            return None
+            _, post = self._close_interactive_locked(session, interactive_id=lease_id)
+            return None, post
         if lease.owner.startswith("human:"):
             client_id = lease.owner.split(":", 1)[1]
             if not session.bridge.console_has_external_peer(client_id):
                 session.bridge.detach_console(client_id)
                 session.vtty_path = session.bridge.vtty_path
-                self._close_interactive_locked(session, interactive_id=lease_id)
-                return None
+                _, post = self._close_interactive_locked(session, interactive_id=lease_id)
+                return None, post
             snapshot = session.bridge.snapshot()
             if snapshot.get("interactive_owner") != lease.owner:
-                self._close_interactive_locked(session, interactive_id=lease_id)
-                return None
+                _, post = self._close_interactive_locked(session, interactive_id=lease_id)
+                return None, post
         else:
-            # 非 human lease：若已 expired 則透過 _expire_interactive_locked 清理。
-            # _expire_interactive_locked 在 lock 內呼叫 bridge.clear_suspended_interactive()
-            # 以清除 _suspended_owner（可安全在 lock 內執行），
-            # 並在 stash 有效時還原 human lease，回傳還原的 lease（或 None）。
             if lease.expired():
-                return self._expire_interactive_locked(session, lease_id=lease_id)
-        return lease
+                _, post = self._close_interactive_locked(session, interactive_id=lease_id)
+                restored_id = session.interactive_session_id
+                restored = self._interactive.get(restored_id) if restored_id is not None else None
+                return restored, post
+        return lease, post
 
     def _lease_context(self, lease: InteractiveLease | None) -> dict[str, Any]:
         interactive_owner = lease.owner if lease is not None else None
@@ -1272,17 +1229,22 @@ class SessionManager:
         deadline = time.monotonic() + timeout_s
 
         while time.monotonic() < deadline:
+            post = _PostCloseAction()
+            outcome: tuple[bool, str | None] | None = None
             with self._lock:
                 session = self._sessions.get(session_id)
                 if session is None or session.bridge is None or session.state != "READY":
                     return False, "SESSION_NOT_READY"
                 if session.recovering:
                     return False, "SESSION_RECOVERING"
-                lease = self._refresh_interactive_locked(session)
+                lease, post = self._refresh_interactive_locked(session)
                 if lease is None:
-                    return True, None
-                if not lease.owner.startswith("human:"):
-                    return False, "SESSION_INTERACTIVE_BUSY"
+                    outcome = (True, None)
+                elif not lease.owner.startswith("human:"):
+                    outcome = (False, "SESSION_INTERACTIVE_BUSY")
+            post.execute()
+            if outcome is not None:
+                return outcome
             time.sleep(0.05)
 
         return False, "SESSION_INTERACTIVE_BUSY"
@@ -1391,8 +1353,9 @@ class SessionManager:
             }
 
         if source.startswith("human:"):
+            post = _PostCloseAction()
             with self._lock:
-                lease = self._refresh_interactive_locked(session)
+                lease, post = self._refresh_interactive_locked(session)
                 if lease is None:
                     lease = self._open_interactive_locked(
                         session,
@@ -1404,6 +1367,7 @@ class SessionManager:
                 session.recovering = False
                 session.recovery_started_at = None
                 session.pending_auto_login = False
+            post.execute()
             self._on_detached(session.session_id)
             return {
                 "ok": True,
@@ -1445,21 +1409,30 @@ class SessionManager:
     ) -> dict[str, Any]:
         normalized_mode = {"fg": "line", "bg": "background"}.get(mode, mode)
         suspend_human_interactive = False
+        post = _PostCloseAction()
+        busy_result: dict[str, Any] | None = None
         with self._lock:
             session = self._sessions.get(session_id)
             if session is None or session.bridge is None or session.state != "READY":
                 return {"ok": False, "error_code": "SESSION_NOT_READY"}
             if session.recovering:
                 return {"ok": False, "error_code": "SESSION_RECOVERING"}
-            lease = self._refresh_interactive_locked(session)
+            lease, post = self._refresh_interactive_locked(session)
             if lease is not None and normalized_mode != "interactive":
                 if not source.startswith("human:") and lease.owner.startswith("human:"):
                     suspend_human_interactive = True
                 else:
-                    return {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY", "interactive_session_id": session.interactive_session_id}
+                    busy_result = {
+                        "ok": False,
+                        "error_code": "SESSION_INTERACTIVE_BUSY",
+                        "interactive_session_id": session.interactive_session_id,
+                    }
             bridge = session.bridge
             prompt_regex = session.profile.prompt_regex
 
+        post.execute()
+        if busy_result is not None:
+            return busy_result
         if suspend_human_interactive:
             bridge.suspend_interactive()
 
@@ -1608,14 +1581,16 @@ class SessionManager:
         pre_offset: int,
     ) -> dict[str, Any]:
         if source.startswith("human:"):
+            post = _PostCloseAction()
             with self._lock:
-                lease = self._refresh_interactive_locked(session)
+                lease, post = self._refresh_interactive_locked(session)
                 if lease is None:
                     lease = self._open_interactive_locked(
                         session,
                         owner=source,
                         timeout_s=max(timeout_s, session.profile.hard_timeout_s),
                     )
+            post.execute()
             return {
                 "ok": True,
                 "execution_mode": "interactive",
@@ -1683,6 +1658,7 @@ class SessionManager:
         return {"ok": True, "session": session.to_public_dict()}
 
     def attach_console(self, selector: str, *, label: str | None = None) -> dict[str, Any]:
+        post = _PostCloseAction()
         with self._lock:
             session = self.get_session(selector)
             if session is None or session.bridge is None or session.state not in {"READY", "ATTACHED"}:
@@ -1690,7 +1666,8 @@ class SessionManager:
             payload = session.bridge.attach_console(label=label)
             if session.vtty_path is None:
                 session.vtty_path = payload["vtty"]
-            if session.state in {"ATTACHED", "READY"} and self._refresh_interactive_locked(session) is None:
+            lease, post = self._refresh_interactive_locked(session)
+            if session.state in {"ATTACHED", "READY"} and lease is None:
                 lease = self._open_interactive_locked(
                     session,
                     owner=f"human:{payload['client_id']}",
@@ -1699,28 +1676,32 @@ class SessionManager:
                 payload["interactive_session_id"] = lease.interactive_id
                 payload["interactive_owner"] = True
             payload["session"] = session.to_public_dict()
-            return {"ok": True, **payload}
+            result = {"ok": True, **payload}
+        post.execute()
+        return result
 
     def detach_console(self, selector: str, client_id: str) -> dict[str, Any]:
+        post = _PostCloseAction()
         with self._lock:
             session = self.get_session(selector)
             if session is None or session.bridge is None:
                 return {"ok": False, "error_code": "SESSION_NOT_READY", "selector": selector}
             human_owner = f"human:{client_id}"
-            lease = self._refresh_interactive_locked(session)
+            lease, post = self._refresh_interactive_locked(session)
             ok = session.bridge.detach_console(client_id)
             if lease is not None and lease.owner == human_owner:
                 # Human lease close：lease.recovery_mode=False，故 _close_interactive_locked
                 # 回傳的 post.needs_resume 必為 False（no-op post），安全丟棄。
-                # 若有 recovery lease 在此之前被 _refresh_interactive_locked 清理，
-                # 也已由 _expire_interactive_locked 正確處理（clear_suspended_interactive）。
                 _, _ = self._close_interactive_locked(
                     session, interactive_id=lease.interactive_id, expected_owner=human_owner
                 )
             session.vtty_path = session.bridge.vtty_path
             if not ok:
-                return {"ok": False, "error_code": "CONSOLE_NOT_FOUND", "client_id": client_id}
-            return {"ok": True, "client_id": client_id, "session": session.to_public_dict()}
+                result = {"ok": False, "error_code": "CONSOLE_NOT_FOUND", "client_id": client_id}
+            else:
+                result = {"ok": True, "client_id": client_id, "session": session.to_public_dict()}
+        post.execute()
+        return result
 
     def list_consoles(self, selector: str) -> dict[str, Any]:
         with self._lock:
@@ -1738,94 +1719,131 @@ class SessionManager:
         command: str = "",
         allow_attached: bool = False,
     ) -> dict[str, Any]:
-        with self._lock:
-            session = self.get_session(selector)
-            if session is None or session.bridge is None:
-                return {"ok": False, "error_code": "SESSION_NOT_READY", "selector": selector}
-
-            if not allow_attached:
-                # 原有行為：只允許 READY
-                if session.state != "READY":
-                    return {"ok": False, "error_code": "SESSION_NOT_READY", "selector": selector}
-                if self._refresh_interactive_locked(session) is not None:
-                    return {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY", "interactive_session_id": session.interactive_session_id}
-                lease = self._open_interactive_locked(session, owner=owner, timeout_s=timeout_s)
-                bridge = session.bridge
-                result: dict[str, Any] = {
-                    "ok": True,
-                    "interactive_id": lease.interactive_id,
-                    "session": session.to_public_dict(),
-                    "recovery_mode": False,
-                }
-
-            elif session.state == "READY":
-                # allow_attached=True 但 session 已是 READY：走一般路徑，不 clamp，recovery_mode False
-                if self._refresh_interactive_locked(session) is not None:
-                    return {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY", "interactive_session_id": session.interactive_session_id}
-                lease = self._open_interactive_locked(session, owner=owner, timeout_s=timeout_s)
-                bridge = session.bridge
-                result = {
-                    "ok": True,
-                    "interactive_id": lease.interactive_id,
-                    "session": session.to_public_dict(),
-                    "recovery_mode": False,
-                }
-
-            elif session.state == "ATTACHED":
-                # bootloader recovery path
-                snap = session.bridge.snapshot()
-                if not snap.get("running") or not snap.get("serial_alive") or not snap.get("vtty_alive"):
+        while True:
+            retry_after_post = False
+            post = _PostCloseAction()
+            with self._lock:
+                session = self.get_session(selector)
+                if session is None or session.bridge is None:
                     return {"ok": False, "error_code": "SESSION_NOT_READY", "selector": selector}
 
-                rx_tail_raw = session.bridge.rx_tail(BOOTLOADER_RX_TAIL_BYTES)
-                rx_tail_clean = clean_text(rx_tail_raw)
-                matched = _matches_any_bootloader_prompt(rx_tail_clean, session.profile.bootloader_prompts)
-                if matched is None:
-                    return {"ok": False, "error_code": "SESSION_NOT_READY", "selector": selector, "error_detail": "NOT_BOOTLOADER"}
+                if not allow_attached:
+                    # 原有行為：只允許 READY
+                    if session.state != "READY":
+                        return {"ok": False, "error_code": "SESSION_NOT_READY", "selector": selector}
+                    existing, post = self._refresh_interactive_locked(session)
+                    if post.needs_resume:
+                        retry_after_post = True
+                    elif existing is not None:
+                        return {
+                            "ok": False,
+                            "error_code": "SESSION_INTERACTIVE_BUSY",
+                            "interactive_session_id": session.interactive_session_id,
+                        }
+                    else:
+                        lease = self._open_interactive_locked(session, owner=owner, timeout_s=timeout_s)
+                        bridge = session.bridge
+                        result: dict[str, Any] = {
+                            "ok": True,
+                            "interactive_id": lease.interactive_id,
+                            "session": session.to_public_dict(),
+                            "recovery_mode": False,
+                        }
 
-                # 清除 expired lease（避免 BUSY 誤判）
-                existing = self._refresh_interactive_locked(session)
-                clamped_timeout = min(timeout_s, MAX_RECOVERY_LEASE_S)
+                elif session.state == "READY":
+                    # allow_attached=True 但 session 已是 READY：走一般路徑，不 clamp，recovery_mode False
+                    existing, post = self._refresh_interactive_locked(session)
+                    if post.needs_resume:
+                        retry_after_post = True
+                    elif existing is not None:
+                        return {
+                            "ok": False,
+                            "error_code": "SESSION_INTERACTIVE_BUSY",
+                            "interactive_session_id": session.interactive_session_id,
+                        }
+                    else:
+                        lease = self._open_interactive_locked(session, owner=owner, timeout_s=timeout_s)
+                        bridge = session.bridge
+                        result = {
+                            "ok": True,
+                            "interactive_id": lease.interactive_id,
+                            "session": session.to_public_dict(),
+                            "recovery_mode": False,
+                        }
 
-                if existing is None:
-                    # 無現有 lease：直接開啟 recovery lease
-                    lease = self._open_interactive_locked(
-                        session, owner=owner, timeout_s=clamped_timeout,
-                        recovery_mode=True, suspended_human=False,
-                    )
-                    bridge = session.bridge
-                    result = {
-                        "ok": True,
-                        "interactive_id": lease.interactive_id,
-                        "session": session.to_public_dict(),
-                        "recovery_mode": True,
-                    }
+                elif session.state == "ATTACHED":
+                    # bootloader recovery path
+                    snap = session.bridge.snapshot()
+                    if not snap.get("running") or not snap.get("serial_alive") or not snap.get("vtty_alive"):
+                        return {"ok": False, "error_code": "SESSION_NOT_READY", "selector": selector}
 
-                elif existing.owner.startswith("human:"):
-                    # 有 human lease：stash and open recovery
-                    human_id = existing.interactive_id
-                    self._interactive.pop(human_id, None)
-                    session.interactive_session_id = None
-                    session._stashed_human_lease = existing
-                    session.bridge.suspend_interactive()
-                    lease = self._open_interactive_locked(
-                        session, owner=owner, timeout_s=clamped_timeout,
-                        recovery_mode=True, suspended_human=True,
-                    )
-                    bridge = session.bridge
-                    result = {
-                        "ok": True,
-                        "interactive_id": lease.interactive_id,
-                        "session": session.to_public_dict(),
-                        "recovery_mode": True,
-                    }
+                    rx_tail_raw = session.bridge.rx_tail(BOOTLOADER_RX_TAIL_BYTES)
+                    rx_tail_clean = clean_text(rx_tail_raw)
+                    matched = _matches_any_bootloader_prompt(rx_tail_clean, session.profile.bootloader_prompts)
+                    if matched is None:
+                        return {
+                            "ok": False,
+                            "error_code": "SESSION_NOT_READY",
+                            "selector": selector,
+                            "error_detail": "NOT_BOOTLOADER",
+                        }
+
+                    # 清除 expired lease（避免 BUSY 誤判）；若 close 需要 resume，
+                    # 先在 lock 外完成 post-close，再重新評估是否要 stash human。
+                    existing, post = self._refresh_interactive_locked(session)
+                    if post.needs_resume:
+                        retry_after_post = True
+                    else:
+                        clamped_timeout = min(timeout_s, MAX_RECOVERY_LEASE_S)
+
+                        if existing is None:
+                            # 無現有 lease：直接開啟 recovery lease
+                            lease = self._open_interactive_locked(
+                                session, owner=owner, timeout_s=clamped_timeout,
+                                recovery_mode=True, suspended_human=False,
+                            )
+                            bridge = session.bridge
+                            result = {
+                                "ok": True,
+                                "interactive_id": lease.interactive_id,
+                                "session": session.to_public_dict(),
+                                "recovery_mode": True,
+                            }
+
+                        elif existing.owner.startswith("human:"):
+                            # 有 human lease：stash and open recovery
+                            human_id = existing.interactive_id
+                            self._interactive.pop(human_id, None)
+                            session.interactive_session_id = None
+                            session._stashed_human_lease = existing
+                            session.bridge.suspend_interactive()
+                            lease = self._open_interactive_locked(
+                                session, owner=owner, timeout_s=clamped_timeout,
+                                recovery_mode=True, suspended_human=True,
+                            )
+                            bridge = session.bridge
+                            result = {
+                                "ok": True,
+                                "interactive_id": lease.interactive_id,
+                                "session": session.to_public_dict(),
+                                "recovery_mode": True,
+                            }
+
+                        else:
+                            # 有其他 agent lease：BUSY
+                            return {
+                                "ok": False,
+                                "error_code": "SESSION_INTERACTIVE_BUSY",
+                                "interactive_session_id": session.interactive_session_id,
+                            }
 
                 else:
-                    # 有其他 agent lease：BUSY
-                    return {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY", "interactive_session_id": session.interactive_session_id}
+                    return {"ok": False, "error_code": "SESSION_NOT_READY", "selector": selector}
 
-            else:
-                return {"ok": False, "error_code": "SESSION_NOT_READY", "selector": selector}
+            post.execute()
+            if retry_after_post:
+                continue
+            break
 
         if command:
             self._mark_session_tx(session)
@@ -1924,6 +1942,8 @@ class SessionManager:
 
     def self_test(self, selector: str, *, timeout_s: float = 2.0, strict_human_lock: bool = False) -> dict[str, Any]:
         suspend_human_interactive = False
+        post = _PostCloseAction()
+        result: dict[str, Any] | None = None
         with self._lock:
             session = self.get_session(selector)
             if session is None:
@@ -1942,13 +1962,13 @@ class SessionManager:
                     "recommended_action": "wait",
                     **self._lease_context(lease),
                 }
-            lease = self._refresh_interactive_locked(session)
+            lease, post = self._refresh_interactive_locked(session)
             lease_context = self._lease_context(lease)
             device = self._devices.get(session.profile.device_by_id)
             attached_real_path = session.attached_real_path
             bridge = session.bridge
             if strict_human_lock and lease is not None and lease.owner.startswith("human:"):
-                return {
+                result = {
                     "ok": True,
                     "classification": "HUMAN_INTERACTIVE_ACTIVE",
                     "interactive_id": lease.interactive_id,
@@ -1956,16 +1976,16 @@ class SessionManager:
                     "recommended_action": "wait_or_detach_console",
                     **lease_context,
                 }
-            if device is None:
-                return {
+            elif device is None:
+                result = {
                     "ok": True,
                     "classification": "DEVICE_MISSING",
                     "session": session.to_public_dict(),
                     "recommended_action": "check_cable_or_bind",
                     **lease_context,
                 }
-            if attached_real_path and attached_real_path != device.real_path:
-                return {
+            elif attached_real_path and attached_real_path != device.real_path:
+                result = {
                     "ok": True,
                     "classification": "DEVICE_REBOUND_REQUIRED",
                     "session": session.to_public_dict(),
@@ -1974,8 +1994,8 @@ class SessionManager:
                     "recommended_action": "reattach",
                     **lease_context,
                 }
-            if bridge is None:
-                return {
+            elif bridge is None:
+                result = {
                     "ok": True,
                     "classification": "BRIDGE_DOWN",
                     "session": session.to_public_dict(),
@@ -1983,75 +2003,79 @@ class SessionManager:
                     "recommended_action": "attach",
                     **lease_context,
                 }
-            snapshot = bridge.snapshot()
-            if not snapshot.get("running") or not snapshot.get("serial_alive"):
-                return {
-                    "ok": True,
-                    "classification": "BRIDGE_DOWN",
-                    "session": session.to_public_dict(),
-                    "current_real_path": device.real_path,
-                    "recommended_action": "recover",
-                    **lease_context,
-                }
-            if not snapshot.get("vtty_alive"):
-                return {
-                    "ok": True,
-                    "classification": "VTTY_STALE",
-                    "session": session.to_public_dict(),
-                    "attached_vtty": snapshot.get("vtty"),
-                    "recommended_action": "console_attach",
-                    **lease_context,
-                }
-            if session.state == "ATTACHED":
-                if session.profile.platform == "passthrough":
-                    classification = "PASSTHROUGH"
-                    recommended_action = "console_attach"
-                    extra: dict[str, Any] = {}
-                elif session.last_error == "LOGIN_REQUIRED":
-                    classification = "LOGIN_REQUIRED"
-                    recommended_action = "console_attach"
-                    extra = {}
-                elif session.last_error == "REBOOTING":
-                    classification = "REBOOTING"
-                    recommended_action = "wait_or_console_attach"
-                    extra = {}
-                else:
-                    # BOOTLOADER detection：讀取 RX tail 並比對 bootloader prompts
-                    rx_tail_raw = bridge.rx_tail(BOOTLOADER_RX_TAIL_BYTES)
-                    rx_tail_evidence = clean_text(rx_tail_raw)
-                    matched = _matches_any_bootloader_prompt(
-                        rx_tail_evidence, session.profile.bootloader_prompts
-                    )
-                    if matched is not None:
-                        classification = "BOOTLOADER"
-                        recommended_action = "recover_interactive"
-                        extra = {"matched_prompt": matched, "rx_tail": rx_tail_evidence}
-                    else:
-                        classification = "ATTACHED_NOT_READY"
+            else:
+                snapshot = bridge.snapshot()
+                if not snapshot.get("running") or not snapshot.get("serial_alive"):
+                    result = {
+                        "ok": True,
+                        "classification": "BRIDGE_DOWN",
+                        "session": session.to_public_dict(),
+                        "current_real_path": device.real_path,
+                        "recommended_action": "recover",
+                        **lease_context,
+                    }
+                elif not snapshot.get("vtty_alive"):
+                    result = {
+                        "ok": True,
+                        "classification": "VTTY_STALE",
+                        "session": session.to_public_dict(),
+                        "attached_vtty": snapshot.get("vtty"),
+                        "recommended_action": "console_attach",
+                        **lease_context,
+                    }
+                elif session.state == "ATTACHED":
+                    if session.profile.platform == "passthrough":
+                        classification = "PASSTHROUGH"
+                        recommended_action = "console_attach"
+                        extra: dict[str, Any] = {}
+                    elif session.last_error == "LOGIN_REQUIRED":
+                        classification = "LOGIN_REQUIRED"
                         recommended_action = "console_attach"
                         extra = {}
-                return {
-                    "ok": True,
-                    "classification": classification,
-                    "session": session.to_public_dict(),
-                    "attached_real_path": attached_real_path,
-                    "current_real_path": device.real_path,
-                    "attached_vtty": snapshot.get("vtty"),
-                    "bridge_generation": session.bridge_generation,
-                    "recommended_action": recommended_action,
-                    **extra,
-                    **lease_context,
-                }
+                    elif session.last_error == "REBOOTING":
+                        classification = "REBOOTING"
+                        recommended_action = "wait_or_console_attach"
+                        extra = {}
+                    else:
+                        # BOOTLOADER detection：讀取 RX tail 並比對 bootloader prompts
+                        rx_tail_raw = bridge.rx_tail(BOOTLOADER_RX_TAIL_BYTES)
+                        rx_tail_evidence = clean_text(rx_tail_raw)
+                        matched = _matches_any_bootloader_prompt(
+                            rx_tail_evidence, session.profile.bootloader_prompts
+                        )
+                        if matched is not None:
+                            classification = "BOOTLOADER"
+                            recommended_action = "recover_interactive"
+                            extra = {"matched_prompt": matched, "rx_tail": rx_tail_evidence}
+                        else:
+                            classification = "ATTACHED_NOT_READY"
+                            recommended_action = "console_attach"
+                            extra = {}
+                    result = {
+                        "ok": True,
+                        "classification": classification,
+                        "session": session.to_public_dict(),
+                        "attached_real_path": attached_real_path,
+                        "current_real_path": device.real_path,
+                        "attached_vtty": snapshot.get("vtty"),
+                        "bridge_generation": session.bridge_generation,
+                        "recommended_action": recommended_action,
+                        **extra,
+                        **lease_context,
+                    }
+                else:
+                    nonce = uuid.uuid4().hex[:8]
+                    probe = session.profile.ready_probe.replace("${nonce}", nonce)
+                    session.last_probe_at = now_iso()
+                    prompt_regex = session.profile.prompt_regex
+                    bridge_generation = session.bridge_generation
+                    attached_vtty = snapshot.get("vtty")
+                    current_real_path = device.real_path
+                    suspend_human_interactive = lease is not None and lease.owner.startswith("human:")
 
-            nonce = uuid.uuid4().hex[:8]
-            probe = session.profile.ready_probe.replace("${nonce}", nonce)
-            session.last_probe_at = now_iso()
-            prompt_regex = session.profile.prompt_regex
-            bridge_generation = session.bridge_generation
-            attached_vtty = snapshot.get("vtty")
-            current_real_path = device.real_path
-            suspend_human_interactive = lease is not None and lease.owner.startswith("human:")
-
+        post.execute()
+        if result is not None:
+            return result
         if suspend_human_interactive:
             bridge.suspend_interactive()
         try:
@@ -2298,22 +2322,28 @@ class SessionManager:
         from .file_transfer import push_file
 
         suspend_human_interactive = False
+        post = _PostCloseAction()
+        busy_result: dict[str, Any] | None = None
         with self._lock:
             session = self.get_session(selector)
             if session is None or session.bridge is None or session.state != "READY":
                 return {"ok": False, "error_code": "SESSION_NOT_READY"}
             if session.recovering:
                 return {"ok": False, "error_code": "SESSION_RECOVERING"}
-            lease = self._refresh_interactive_locked(session)
+            lease, post = self._refresh_interactive_locked(session)
             if lease is not None:
                 if not source.startswith("human:") and lease.owner.startswith("human:"):
                     suspend_human_interactive = True
                 else:
-                    return {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY"}
+                    busy_result = {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY"}
             bridge = session.bridge
             prompt_regex = session.profile.prompt_regex
-            session.foreground_busy = True
+            if busy_result is None:
+                session.foreground_busy = True
 
+        post.execute()
+        if busy_result is not None:
+            return busy_result
         if suspend_human_interactive:
             bridge.suspend_interactive()
         try:
@@ -2344,22 +2374,28 @@ class SessionManager:
         from .file_transfer import pull_file
 
         suspend_human_interactive = False
+        post = _PostCloseAction()
+        busy_result: dict[str, Any] | None = None
         with self._lock:
             session = self.get_session(selector)
             if session is None or session.bridge is None or session.state != "READY":
                 return {"ok": False, "error_code": "SESSION_NOT_READY"}
             if session.recovering:
                 return {"ok": False, "error_code": "SESSION_RECOVERING"}
-            lease = self._refresh_interactive_locked(session)
+            lease, post = self._refresh_interactive_locked(session)
             if lease is not None:
                 if not source.startswith("human:") and lease.owner.startswith("human:"):
                     suspend_human_interactive = True
                 else:
-                    return {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY"}
+                    busy_result = {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY"}
             bridge = session.bridge
             prompt_regex = session.profile.prompt_regex
-            session.foreground_busy = True
+            if busy_result is None:
+                session.foreground_busy = True
 
+        post.execute()
+        if busy_result is not None:
+            return busy_result
         if suspend_human_interactive:
             bridge.suspend_interactive()
         try:

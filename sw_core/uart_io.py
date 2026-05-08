@@ -624,19 +624,6 @@ class UARTBridge:
         for source, data in flush_data:
             self.send_bytes(data, source=source, cmd_id=None)
 
-    def clear_suspended_interactive(self) -> None:
-        """清除 suspended owner 狀態，丟棄 deferred buffer（不做 I/O flush）。
-
-        用於 expired recovery lease 被 session manager lock 內清理時：
-        `resume_interactive()` 需要在 lock 外執行（有 I/O），但 lock 內需要立即
-        清除 `_suspended_owner` 以避免 bridge 永久 suspended。
-        此方法只做純 state mutation，可在 session manager lock 內安全呼叫。
-        """
-        with self._state_lock:
-            self._suspended_owner = None
-            self._agent_active = False
-            self._deferred_buffers.clear()
-
     def snapshot(self) -> dict[str, Any]:
         consoles = self.list_consoles()
         with self._state_lock:

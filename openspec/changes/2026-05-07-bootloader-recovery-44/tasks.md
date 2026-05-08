@@ -48,8 +48,8 @@
 - [x] 5.7 ATTACHED 路徑匹配失敗回 `SESSION_NOT_READY`，加 `error_detail: NOT_BOOTLOADER`
 - [x] 5.8 recovery 開 lease 流程（design §4.3）：在 `_lock` 內檢查既有 lease；owner 為 `human:*` → stash 到 `session._stashed_human_lease`、從 `self._interactive` pop、`session.interactive_session_id=None`、`bridge.suspend_interactive()`；owner 為 agent → 回 `SESSION_INTERACTIVE_BUSY`；無既有 lease → suspended_human=False
 - [x] 5.9 `_open_interactive_locked` 接 `recovery_mode` / `suspended_human` kwarg：clamp `timeout_s ≤ MAX_RECOVERY_LEASE_S`（recovery lease only）、設旗標
-- [x] 5.10 `_close_interactive_locked` 處理 recovery lease：pop lease、bridge owner 設 None；若 `lease.suspended_human=True`：呼叫 `bridge.resume_interactive()`、檢查 `_stashed_human_lease.expired()` 與 `bridge.console_has_external_peer(client_id)`、皆通過則還原 stash 回 `_interactive` + `set_interactive_owner(stashed.owner)`、否則丟棄 stash；最後 `_stashed_human_lease=None`
-- [x] 5.11 lease expire 路徑（`_refresh_interactive_locked` 內的 `expired()` 檢查）對 recovery lease 呼叫 `_expire_interactive_locked`，在 lock 內安全清除 `bridge._suspended_owner`，確保 stash 被正確處理（bug fix commit）
+- [x] 5.10 `_close_interactive_locked` 處理 recovery lease：pop lease、bridge owner 設 None；若 `lease.suspended_human=True`：回傳 lock 外 post-close action 呼叫 `bridge.resume_interactive()`、檢查 `_stashed_human_lease.expired()` 與 `bridge.console_has_external_peer(client_id)`、皆通過則還原 stash 回 `_interactive` + `set_interactive_owner(stashed.owner)`、否則丟棄 stash；最後 `_stashed_human_lease=None`
+- [x] 5.11 lease expire 路徑（`_refresh_interactive_locked` 內的 `expired()` 檢查）共用 `_close_interactive_locked` 並回傳 post-close action，呼叫端在 lock 外執行 `bridge.resume_interactive()`，確保 stash 與 deferred buffer flush 語意一致（bug fix commit）
 - [x] 5.12 `_refresh_interactive_locked` 行為驗證：recovery lease 期間呼叫不應誤把 stashed lease 當成失效（因為已從 `_interactive` pop）
 
 ## 6. RPC / CLI passthrough
@@ -73,7 +73,7 @@
 - [x] 7.7c unit: `interactive_close recovery discards stash when human detached`（human 在 recovery 期間 detach → close 時 console_has_external_peer=False、stash 丟棄）
 - [x] 7.8 unit: `interactive_send during recovery writes raw bytes`（plain / key encoding 各一）
 - [x] 7.9 unit: `recovery lease enforces MAX_RECOVERY_LEASE_S cap`
-- [x] 7.10 unit: `recovery lease auto-expires resumes human`（`_refresh_interactive_locked` 呼叫 `_expire_interactive_locked`，清 `bridge._suspended_owner`；bug fix commit 補完）
+- [x] 7.10 unit: `recovery lease auto-expires resumes human`（`_refresh_interactive_locked` 回傳 post-close action，呼叫端在 lock 外執行 `bridge.resume_interactive()` 後才重新 stash human；bug fix commit 補完）
 - [x] 7.11a unit: `self_test / _lease_context` 回傳 `recovery_mode` 欄位（lease 有 recovery_mode=True 時為 True、None lease 時為 False）
 - [x] 7.11b unit: `interactive_status` 回傳 `recovery_mode`（待 interactive recovery 實作後）
 - [ ] 7.12 func-test: fake-target 模擬 U-Boot prompt → human attach → self_test → recovery lease → reset → OS prompt → close → 驗 deferred flush

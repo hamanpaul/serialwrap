@@ -638,7 +638,8 @@ class TestSessionBind(unittest.TestCase):
             mgr._interactive[lease.interactive_id] = lease
             session.interactive_session_id = lease.interactive_id
 
-        refreshed = mgr._refresh_interactive_locked(session)
+        refreshed, post = mgr._refresh_interactive_locked(session)
+        post.execute()
 
         self.assertIsNone(refreshed)
         self.assertIsNone(session.interactive_session_id)

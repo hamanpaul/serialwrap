@@ -797,15 +797,17 @@ class TestInteractiveOpenAllowAttached(unittest.TestCase):
         self.assertIn("recovery_mode", resp)
         self.assertFalse(resp["recovery_mode"])
 
-    # ── 19: _refresh_interactive_locked 清理 expired recovery 須清除 suspended 狀態 ──
+    # ── 19: _refresh_interactive_locked 清理 expired recovery 須執行 post-close ──
 
-    def test_refresh_clears_suspended_state_for_expired_recovery_lease(self) -> None:
+    def test_refresh_expired_recovery_resumes_human_before_new_recovery(self) -> None:
         """bug fix (#44 Phase B)：expired recovery lease 被 _refresh_interactive_locked
-        清理時，bridge.clear_suspended_interactive() 必須被呼叫以清除 _suspended_owner。
-        若沒呼叫，bridge 會永久停在 suspended 狀態，後續 suspend_interactive() 行為不定。
+        清理時，必須在 lock 外執行 post-close 的 resume_interactive()。
+        這會 flush recovery 期間累積的人類 deferred input，再允許新的 recovery lease
+        重新 suspend human；不能只清 state 而靜默丟棄 deferred bytes。
         """
         mgr, session, bridge = self._make_mgr_attached()
         human_lease = self._inject_human_lease(mgr, session, bridge, "client1")
+        human_id = human_lease.interactive_id
 
         # 開啟 recovery lease（stash human, suspended_human=True）
         resp1 = mgr.interactive_open("COM0", owner="agent:test", allow_attached=True)
@@ -815,8 +817,8 @@ class TestInteractiveOpenAllowAttached(unittest.TestCase):
         # 讓 recovery lease 過期
         mgr._interactive[recovery_iid].last_activity_at = time.monotonic() - 999999.0
 
-        # peer dead → stash 被丟棄（discard path，較簡單）
-        bridge.console_has_external_peer.return_value = False
+        # peer alive → expired close path 應先 restore human 並執行 resume_interactive()
+        bridge.console_has_external_peer.return_value = True
 
         # 觸發 _refresh_interactive_locked（第二次 allow_attached open）
         resp2 = mgr.interactive_open("COM0", owner="agent:test", allow_attached=True)
@@ -824,13 +826,65 @@ class TestInteractiveOpenAllowAttached(unittest.TestCase):
         # 第二次 open 應成功（expired lease 被清除）
         self.assertTrue(resp2["ok"], f"expected ok, got: {resp2}")
 
-        # bug fix 驗證：clear_suspended_interactive() 必須被呼叫
-        # 修前：_refresh_interactive_locked 丟棄 _PostCloseAction，resume 永遠不執行
-        # 修後：_expire_interactive_locked 直接呼叫 clear_suspended_interactive（lock 內安全）
-        self.assertGreaterEqual(
-            bridge.clear_suspended_interactive.call_count, 1,
-            "bridge.clear_suspended_interactive() 未被呼叫 —— bridge 永久 suspended！"
+        # bug fix 驗證：refresh-expire path 必須等同 close path，先 resume/flush，
+        # 再由第二次 recovery open 重新 stash human。
+        bridge.resume_interactive.assert_called_once()
+        self.assertEqual(bridge.suspend_interactive.call_count, 2)
+        self.assertIsNotNone(session._stashed_human_lease)
+        self.assertEqual(session._stashed_human_lease.interactive_id, human_id)
+
+    def test_busy_paths_after_expired_recovery_still_run_post_close(self) -> None:
+        """expired recovery 清出 stashed human 後，即使 caller 回 BUSY 也必須 resume。
+
+        execute_command/file_push/file_pull 對 human source 會回 SESSION_INTERACTIVE_BUSY；
+        這些 early-return path 仍不能跳過 post-close action，否則 bridge 會永久停在
+        recovery suspend 狀態並丟失 deferred human input。
+        """
+        cases = (
+            (
+                "execute_command",
+                lambda mgr, session: mgr.execute_command(
+                    session.session_id,
+                    "echo busy",
+                    source="human:other",
+                    cmd_id="cmd-busy",
+                ),
+            ),
+            (
+                "file_push",
+                lambda mgr, session: mgr.file_push(
+                    session.session_id,
+                    local_path="/tmp/nonexistent",
+                    remote_path="/tmp/nonexistent",
+                    source="human:other",
+                ),
+            ),
+            (
+                "file_pull",
+                lambda mgr, session: mgr.file_pull(
+                    session.session_id,
+                    remote_path="/tmp/nonexistent",
+                    source="human:other",
+                ),
+            ),
         )
+
+        for name, call in cases:
+            with self.subTest(name=name):
+                mgr, session, bridge = self._make_mgr_attached()
+                self._inject_human_lease(mgr, session, bridge, "client1")
+                resp = mgr.interactive_open("COM0", owner="agent:test", allow_attached=True)
+                self.assertTrue(resp["ok"])
+                recovery_iid = resp["interactive_id"]
+                mgr._interactive[recovery_iid].last_activity_at = time.monotonic() - 999999.0
+                bridge.console_has_external_peer.return_value = True
+                session.state = "READY"
+
+                result = call(mgr, session)
+
+                self.assertFalse(result["ok"], result)
+                self.assertEqual(result["error_code"], "SESSION_INTERACTIVE_BUSY")
+                bridge.resume_interactive.assert_called_once()
 
 
 # ──────────────────────────────────────────────
