@@ -14,7 +14,7 @@ from typing import Any, Callable
 from .alias_registry import AliasRegistry
 from .auth import resolve_session_auth
 from .config import ProfileTemplate, SessionProfile
-from .constants import LOG_DIR, STATE_PATH
+from .constants import BOOTLOADER_RX_TAIL_BYTES, LOG_DIR, STATE_PATH
 from .device_watcher import DeviceInfo
 from .login_fsm import detect_template, ensure_ready, probe_ready
 from .uart_io import PreservedConsoles, UARTBridge
@@ -23,6 +23,39 @@ from .wal import WalWriter
 
 
 _ATTACHED_CONSOLE_LEASE_TIMEOUT_S = 86400.0
+
+
+def _matches_any_bootloader_prompt(
+    rx_tail: str,
+    patterns: "list[str] | tuple[str, ...]",
+) -> "str | None":
+    """rx_tail の最後の非空・非純空白行が patterns のいずれかに一致するか検査する。
+
+    一致した最初の pattern 文字列を返す。命中なし・空入力・空 patterns は None を返す。
+    invalid regex は例外を発生させず、そのパターンを読み飛ばす。
+    """
+    if not rx_tail or not patterns:
+        return None
+    # 最後の非空白行を探す
+    lines = rx_tail.splitlines()
+    last_line: str | None = None
+    for line in reversed(lines):
+        if line.strip():
+            last_line = line
+            break
+    # splitlines() が末尾に改行なし文字列で空リストになる場合のフォールバック
+    if last_line is None and not lines:
+        return None
+    if last_line is None:
+        return None
+    for pattern in patterns:
+        try:
+            if re.search(pattern, last_line) is not None:
+                return pattern
+        except re.error:
+            # invalid regex → 略過
+            continue
+    return None
 
 
 def _is_reboot_command(command: str) -> bool:
@@ -70,6 +103,8 @@ class InteractiveLease:
     timeout_s: float
     last_activity_at: float = dataclasses.field(default_factory=time.monotonic)
     status: str = "active"
+    recovery_mode: bool = False
+    suspended_human: bool = False
 
     def touch(self) -> None:
         self.last_activity_at = time.monotonic()
@@ -119,6 +154,8 @@ class SessionRuntime:
     last_probe_at: str | None = None
     last_rx_mono: float = 0.0
     last_tx_mono: float = 0.0
+    # recovery lease stash（Phase B issue #44）
+    _stashed_human_lease: InteractiveLease | None = dataclasses.field(default=None, repr=False)
     _state: str = dataclasses.field(default="DETACHED", init=False, repr=False)
 
     @property
@@ -1091,6 +1128,7 @@ class SessionManager:
         return {
             "interactive_owner": interactive_owner,
             "human_attached": bool(interactive_owner and interactive_owner.startswith("human:")),
+            "recovery_mode": bool(lease is not None and lease.recovery_mode),
         }
 
     def _transition_to_attached(self, session: SessionRuntime, *, reason: str) -> None:
@@ -1739,15 +1777,30 @@ class SessionManager:
                 if session.profile.platform == "passthrough":
                     classification = "PASSTHROUGH"
                     recommended_action = "console_attach"
+                    extra: dict[str, Any] = {}
                 elif session.last_error == "LOGIN_REQUIRED":
                     classification = "LOGIN_REQUIRED"
                     recommended_action = "console_attach"
+                    extra = {}
                 elif session.last_error == "REBOOTING":
                     classification = "REBOOTING"
                     recommended_action = "wait_or_console_attach"
+                    extra = {}
                 else:
-                    classification = "ATTACHED_NOT_READY"
-                    recommended_action = "console_attach"
+                    # BOOTLOADER detection：讀取 RX tail 並比對 bootloader prompts
+                    rx_tail_raw = bridge.rx_tail(BOOTLOADER_RX_TAIL_BYTES)
+                    rx_tail_evidence = clean_text(rx_tail_raw)
+                    matched = _matches_any_bootloader_prompt(
+                        rx_tail_evidence, session.profile.bootloader_prompts
+                    )
+                    if matched is not None:
+                        classification = "BOOTLOADER"
+                        recommended_action = "recover_interactive"
+                        extra = {"matched_prompt": matched, "rx_tail": rx_tail_evidence}
+                    else:
+                        classification = "ATTACHED_NOT_READY"
+                        recommended_action = "console_attach"
+                        extra = {}
                 return {
                     "ok": True,
                     "classification": classification,
@@ -1757,6 +1810,7 @@ class SessionManager:
                     "attached_vtty": snapshot.get("vtty"),
                     "bridge_generation": session.bridge_generation,
                     "recommended_action": recommended_action,
+                    **extra,
                     **lease_context,
                 }
 

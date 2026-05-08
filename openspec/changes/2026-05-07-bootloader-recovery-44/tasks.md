@@ -31,18 +31,18 @@
 
 ## 4. `SessionManager.self_test`：BOOTLOADER 分類
 
-- [ ] 4.1 新增 `_matches_any_bootloader_prompt(rx_tail: str, patterns: list[str]) -> str | None`（命中回 pattern、否則 None）
-- [ ] 4.2 在 `session_manager.py:1738` 附近 ATTACHED 區塊插入 BOOTLOADER 分支（`elif _matches_any_bootloader_prompt(...)`）
-- [ ] 4.3 BOOTLOADER result 加 `matched_prompt`、`rx_tail`（用 `clean_text(bridge.rx_tail(BOOTLOADER_RX_TAIL_BYTES))`）
-- [ ] 4.4 確認 OS prompt 與 bootloader prompt 同時匹配時優先取 BOOTLOADER（在分支順序上即 elif chain 自然成立；補 unit test）
-- [ ] 4.5 確認所有 classification 的 result 都帶上 `recovery_mode`（透過 `_lease_context` 同步）
+- [x] 4.1 新增 `_matches_any_bootloader_prompt(rx_tail: str, patterns: list[str]) -> str | None`（命中回 pattern、否則 None）
+- [x] 4.2 在 `session_manager.py:1738` 附近 ATTACHED 區塊插入 BOOTLOADER 分支（`elif _matches_any_bootloader_prompt(...)`）
+- [x] 4.3 BOOTLOADER result 加 `matched_prompt`、`rx_tail`（用 `clean_text(bridge.rx_tail(BOOTLOADER_RX_TAIL_BYTES))`）
+- [x] 4.4 確認 OS prompt 與 bootloader prompt 同時匹配時優先取 BOOTLOADER（在分支順序上即 elif chain 自然成立；補 unit test）
+- [x] 4.5 確認所有 classification 的 result 都帶上 `recovery_mode`（透過 `_lease_context` 同步）
 
 ## 5. `InteractiveLease` / `interactive_open` 改動（stash-and-restore）
 
 - [x] 5.1 `sw_core/constants.py` 新增 `MAX_RECOVERY_LEASE_S = 120.0`、`BOOTLOADER_RX_TAIL_BYTES = 512`
-- [ ] 5.2 `InteractiveLease` dataclass 加 `recovery_mode: bool = False`、`suspended_human: bool = False`
-- [ ] 5.3 `SessionRuntime` dataclass 加 `_stashed_human_lease: InteractiveLease | None = None`
-- [ ] 5.4 `_lease_context` 加 `recovery_mode` 鍵（從 lease.recovery_mode 取）
+- [x] 5.2 `InteractiveLease` dataclass 加 `recovery_mode: bool = False`、`suspended_human: bool = False`
+- [x] 5.3 `SessionRuntime` dataclass 加 `_stashed_human_lease: InteractiveLease | None = None`
+- [x] 5.4 `_lease_context` 加 `recovery_mode` 鍵（從 lease.recovery_mode 取）
 - [ ] 5.5 `interactive_open` signature 加 `allow_attached: bool = False`
 - [ ] 5.6 替換 `state != "READY"` 單檢，依 design §4.2 邏輯放寬：READY 走原路徑、ATTACHED + allow_attached + 當下匹配 bootloader → 開 recovery lease
 - [ ] 5.7 ATTACHED 路徑匹配失敗回 `SESSION_NOT_READY`，加 `error_detail: NOT_BOOTLOADER`
@@ -61,9 +61,9 @@
 
 ## 7. Tests（unit + functional）
 
-- [ ] 7.1 unit: `self_test classifies BOOTLOADER when bootloader_prompts matches RX tail`
-- [ ] 7.2 unit: `self_test falls back to ATTACHED_NOT_READY when bootloader_prompts is empty`
-- [ ] 7.3 unit: `self_test prefers BOOTLOADER over ATTACHED_NOT_READY when both could apply`
+- [x] 7.1 unit: `self_test classifies BOOTLOADER when bootloader_prompts matches RX tail`
+- [x] 7.2 unit: `self_test falls back to ATTACHED_NOT_READY when bootloader_prompts is empty`
+- [x] 7.3 unit: `self_test prefers BOOTLOADER over ATTACHED_NOT_READY when both could apply`
 - [ ] 7.4 unit: `interactive_open with allow_attached=False rejects ATTACHED state`（向後相容）
 - [ ] 7.5 unit: `interactive_open with allow_attached=True rejects ATTACHED if no bootloader match`（含 `error_detail: NOT_BOOTLOADER`）
 - [ ] 7.6 unit: `interactive_open with allow_attached=True opens recovery lease in BOOTLOADER`（無 human lease → suspend 不被呼叫）
@@ -74,7 +74,7 @@
 - [ ] 7.8 unit: `interactive_send during recovery writes raw bytes`（plain / key encoding 各一）
 - [ ] 7.9 unit: `recovery lease enforces MAX_RECOVERY_LEASE_S cap`
 - [ ] 7.10 unit: `recovery lease auto-expires resumes human`
-- [ ] 7.11 unit: `recovery lease snapshot exposes recovery_mode in interactive_status and self_test lease_context`
+- [x] 7.11 unit: `recovery lease snapshot exposes recovery_mode in interactive_status and self_test lease_context`（self_test lease_context 已覆蓋；interactive_status 部分留待後續）
 - [ ] 7.12 func-test: fake-target 模擬 U-Boot prompt → human attach → self_test → recovery lease → reset → OS prompt → close → 驗 deferred flush
 - [ ] 7.13 跑 `python3 -m pytest -q tests/` 全綠（含既有 selftest-collab-handoff scenarios 不破壞）
 - [ ] 7.14 跑 `python3 -m unittest discover -s tests -v`，比對既有已知失敗（`test_multiagent_e2e.test_five_agents_three_rounds_no_conflict`）僅該案例；其餘 100% 綠
@@ -86,7 +86,7 @@
 
 ## 9. Docs
 
-- [ ] 9.1 `docs/serialwrap-spec.md` self_test 章節加 BOOTLOADER classification、`bootloader_prompts` 欄位、`matched_prompt` / `rx_tail` 輸出
+- [x] 9.1 `docs/serialwrap-spec.md` self_test 章節加 BOOTLOADER classification、`bootloader_prompts` 欄位、`matched_prompt` / `rx_tail` 輸出
 - [ ] 9.2 `docs/serialwrap-spec.md` interactive 章節加 `allow_attached`、`recovery_mode`、`MAX_RECOVERY_LEASE_S`、suspend-resume 行為
 - [ ] 9.3 `docs/serialwrap-spec.md` profile 章節加 `bootloader_prompts` 欄位、範例 regex、與 `prompt_regex` 的優先序
 - [ ] 9.4 `README.md`（troubleshooting / Usage 段）加 recovery 流程使用範例（self_test → interactive-open --allow-attached → interactive-send reset）

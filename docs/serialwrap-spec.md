@@ -394,15 +394,22 @@ flowchart TD
 - `VTTY_STALE`
 - `TARGET_UNRESPONSIVE`
 - `LOGIN_REQUIRED`
-- `ATTACHED_NOT_READY`
 - `REBOOTING`
 - `PASSTHROUGH`
+- `BOOTLOADER`：ATTACHED 狀態下，bridge/vtty 正常，但 RX tail 最後一個非空行符合 profile `bootloader_prompts` 中至少一個 regex；此時 target 很可能卡在 bootloader 等待輸入，需人工介入或 recovery interactive。
+- `ATTACHED_NOT_READY`
 
 輸出欄位：
 
 - `interactive_owner`：目前 interactive lease owner；若沒有 lease 則為 `null`
 - `human_attached`：以目前 active interactive lease 的 owner 是否為 `human:*` 為準；不等同於僅有 human console attach、`console_count > 0`，或任何 human console 已連上但未持有 active interactive lease
+- `recovery_mode`：目前 active interactive lease 是否為 recovery lease（`InteractiveLease.recovery_mode == True`）；無 lease 時為 `false`
 - 以上 lease context 欄位會跟著所有 `session.self_test` 回應一起回傳，便於 caller 判斷是純裝置問題還是 collaborative 使用中的狀態
+
+`BOOTLOADER` 分類額外欄位：
+
+- `matched_prompt`：命中的 bootloader prompt regex 字串（取 `bootloader_prompts` 中第一個命中的 pattern）
+- `rx_tail`：用於比對的 RX tail 字串（經 `clean_text` 過濾後）
 
 判斷順序：
 
@@ -412,7 +419,12 @@ flowchart TD
 4. by-id 是否仍存在
 5. `attached_real_path` 是否與目前 `real_path` 一致
 6. bridge / vtty 是否存活
-7. 若 `session.state == ATTACHED`，先依 substate 回 `PASSTHROUGH` / `LOGIN_REQUIRED` / `REBOOTING` / `ATTACHED_NOT_READY`
+7. 若 `session.state == ATTACHED`，依下列順序判斷：
+   1. `platform == passthrough` → `PASSTHROUGH`
+   2. `last_error == LOGIN_REQUIRED` → `LOGIN_REQUIRED`
+   3. `last_error == REBOOTING` → `REBOOTING`
+   4. RX tail 比對 `bootloader_prompts` 有命中 → `BOOTLOADER`
+   5. 否則 → `ATTACHED_NOT_READY`
 8. 其餘情況才執行安全 probe
 
 安全 probe 目前使用 profile 的 `ready_probe`。
