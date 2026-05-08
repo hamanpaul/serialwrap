@@ -25,15 +25,19 @@
 - `sw_core/session_manager.py`：`interactive_open` / `interactive_status` 回傳 `recovery_mode` 欄位
 - `sw_core/session_manager.py`：`_PostCloseAction` 機制保證 `bridge.resume_interactive()` 在 `_lock` 外執行
 - `sw_core/session_manager.py`：`_detach_session_locked` 清除 `_stashed_human_lease`
-- `sw_core/session_manager.py`：`_refresh_interactive_locked` 自動清除 expired 非 human lease
+- `sw_core/session_manager.py`：`_refresh_interactive_locked` 自動清除 expired 非 human lease，並透過 lock 外 post-close action 恢復 human deferred input
 - `sw_core/service.py`：RPC `session.interactive_open` 透傳 `allow_attached` 參數
 - `sw_core/cli.py`：`session interactive-open` 新增 `--allow-attached` 選項
 - `sw_mcp/server.py`：`serialwrap_open_interactive` 工具 schema 新增 `allow_attached: boolean`
-- `tests/test_bootloader_recovery.py`：新增 26 個 TDD 測試，涵蓋 recovery lease 完整生命週期（開啟、stash/restore、逾時 clamp、send、status recovery_mode、expired 清理、detach 清除 stash、RPC/CLI/MCP 透傳）
+- `tests/test_bootloader_recovery.py`：新增 56 個 TDD 測試，涵蓋 recovery lease 完整生命週期（開啟、stash/restore、逾時 clamp、send、status recovery_mode、expired 清理、BUSY early-return post-close、detach 清除 stash、RPC/CLI/MCP 透傳）
 
 ### Changed
 
 - `.github/copilot-instructions.md` 前置 paulsha-conventions marker 與 policy_version
+
+### Fixed
+
+- `sw_core/session_manager.py`：動態 auto-detect session 現在會從 `ProfileTemplate` 傳播 `bootloader_prompts`，避免未宣告 targets 的 template session 無法進入 BOOTLOADER recovery
 
 ### Notes
 

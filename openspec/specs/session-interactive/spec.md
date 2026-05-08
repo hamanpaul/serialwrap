@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+定義 session interactive lease 的對外契約，包含 READY-only 預設行為、Issue #44 bootloader recovery 的 `allow_attached` opt-in、human lease stash/restore、recovery timeout cap 與 `recovery_mode` 回傳欄位。
+
+## Requirements
 
 ### Requirement: interactive_open SHALL accept allow_attached opt-in for bootloader recovery
 
@@ -43,41 +47,24 @@
 
 當 `interactive_open(allow_attached=True)` 在 ATTACHED + bootloader 命中下開 lease 時，若 `_refresh_interactive_locked(session)` 回非 None 且 owner 以 `"human:"` 開頭，daemon SHALL 採 **stash-and-restore** 機制——把 human session-layer lease 從 `self._interactive` 暫存到 `session._stashed_human_lease`、呼叫 `bridge.suspend_interactive()` 切換 bridge-layer ownership、開出 agent recovery lease；recovery 結束時 SHALL 還原 stashed lease 並 resume bridge-layer ownership。
 
-> 背景：`session.console_attach`（`session_manager.py:1536-1541`）會替 human 開 session-layer lease（owner=`"human:<client_id>"`）。若 recovery 只動 bridge-layer ownership，後續 `_refresh_interactive_locked` 會發現 bridge `interactive_owner` 不再是 human、把 lease 視為失效並自動 close——等於把 human 趕跑、與 #44 設計目標相反。stash-and-restore 解決此問題。
-
 具體步驟（在 `_lock` 內以原子方式執行）：
 
-1. 將該 human lease 從 `self._interactive` pop 移除，並指派給
-   `session._stashed_human_lease`。
+1. 將該 human lease 從 `self._interactive` pop 移除，並指派給 `session._stashed_human_lease`。
 2. 將 `session.interactive_session_id` 設為 None。
 3. 呼叫 `bridge.suspend_interactive()`（與 self_test 共用機制）。
-4. 開出新的 agent recovery lease（`recovery_mode=True`、`suspended_human=True`）並
-   置入 `self._interactive`、`session.interactive_session_id` 指向此 lease、
-   `bridge.set_interactive_owner("agent")`。
+4. 開出新的 agent recovery lease（`recovery_mode=True`、`suspended_human=True`）並置入 `self._interactive`、`session.interactive_session_id` 指向此 lease、`bridge.set_interactive_owner("agent")`。
 
-當 recovery lease 透過 `interactive_close` 或 `lease.expired()` 走 close path 時，
-daemon SHALL：
+當 recovery lease 透過 `interactive_close` 或 `lease.expired()` 走 close path 時，daemon SHALL：
 
-1. 從 `self._interactive` pop recovery lease、`session.interactive_session_id`
-   設為 None。
+1. 從 `self._interactive` pop recovery lease、`session.interactive_session_id` 設為 None。
 2. 若 `lease.suspended_human == True`：
-   - 呼叫 `bridge.resume_interactive()`。`resume_interactive` 既有實作會將
-     `_suspended_owner` 還原為 human、把 deferred buffer 中累積的 human bytes
-     以 `bridge.send_bytes(source="human:<client_id>", payload=<deferred>)` 一次性
-     flush 到 UART（uart_io.py:609-625）。
-   - 從 `session._stashed_human_lease` 取出 stashed lease。若 stashed 仍未 expire 且
-     `bridge.console_has_external_peer(client_id) == True`，SHALL 把 stashed lease
-     還原回 `self._interactive`、`session.interactive_session_id` 指向它、呼叫
-     `bridge.set_interactive_owner(stashed.owner)`（與 resume_interactive 還原結果
-     冪等）。否則 SHALL 丟棄 stashed lease（human 已離開或 lease 已 expire）。
+   - 回傳 lock 外 post-close action 呼叫 `bridge.resume_interactive()`。`resume_interactive` 既有實作會將 `_suspended_owner` 還原為 human、把 deferred buffer 中累積的 human bytes 以 `bridge.send_bytes(source="human:<client_id>", payload=<deferred>)` 一次性 flush 到 UART。
+   - 從 `session._stashed_human_lease` 取出 stashed lease。若 stashed 仍未 expire 且 `bridge.console_has_external_peer(client_id) == True`，SHALL 把 stashed lease 還原回 `self._interactive`、`session.interactive_session_id` 指向它、呼叫 `bridge.set_interactive_owner(stashed.owner)`。否則 SHALL 丟棄 stashed lease（human 已離開或 lease 已 expire）。
    - 將 `session._stashed_human_lease` 設為 None。
 
-`SessionRuntime` SHALL 新增欄位 `_stashed_human_lease: InteractiveLease | None = None`。
-此欄位只在 recovery lease 存在時非 None；recovery close 後恢復 None。
+`SessionRuntime` SHALL 新增欄位 `_stashed_human_lease: InteractiveLease | None = None`。此欄位只在 recovery lease 存在時非 None；recovery close 後恢復 None。
 
-如果開 recovery lease 當下 `_refresh_interactive_locked` 回 None（無既有 lease），
-SHALL NOT 呼叫 `suspend_interactive`、SHALL 將 lease.suspended_human 設為 False、
-close 時亦 SHALL NOT 呼叫 `resume_interactive`。
+如果開 recovery lease 當下 `_refresh_interactive_locked` 回 None（無既有 lease），SHALL NOT 呼叫 `suspend_interactive`、SHALL 將 lease.suspended_human 設為 False、close 時亦 SHALL NOT 呼叫 `resume_interactive`。
 
 #### Scenario: open recovery with human lease stashes existing lease
 
@@ -114,6 +101,12 @@ close 時亦 SHALL NOT 呼叫 `resume_interactive`。
 - **WHEN** recovery lease 已開、human 已 stashed
 - **AND** `lease.expired()` 變成 True、agent 後續呼叫 `interactive_send`
 - **THEN** `interactive_send` 走 expired close path（與 `interactive_close` 相同的 stash 還原流程）、回傳 `ok: false` / `error_code: "INTERACTIVE_EXPIRED"`
+
+#### Scenario: refresh caller returning busy still resumes human
+
+- **WHEN** recovery lease 已開、human 已 stashed，且 `lease.expired()` 變成 True
+- **AND** 後續 caller 經由 `_refresh_interactive_locked` 清理 expired recovery lease 後仍要回 `SESSION_INTERACTIVE_BUSY`
+- **THEN** caller SHALL 先在 `SessionManager._lock` 外執行 post-close action，呼叫 `bridge.resume_interactive()` flush deferred bytes，再回傳 busy result
 
 ### Requirement: recovery lease SHALL enforce MAX_RECOVERY_LEASE_S timeout cap
 

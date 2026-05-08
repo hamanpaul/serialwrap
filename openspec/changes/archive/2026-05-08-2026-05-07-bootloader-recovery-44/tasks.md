@@ -77,25 +77,25 @@
 - [x] 7.11a unit: `self_test / _lease_context` 回傳 `recovery_mode` 欄位（lease 有 recovery_mode=True 時為 True、None lease 時為 False）
 - [x] 7.11b unit: `interactive_status` 回傳 `recovery_mode`（待 interactive recovery 實作後）
 - [ ] 7.12 func-test: fake-target 模擬 U-Boot prompt → human attach → self_test → recovery lease → reset → OS prompt → close → 驗 deferred flush
-- [ ] 7.13 跑 `python3 -m pytest -q tests/` 全綠（含既有 selftest-collab-handoff scenarios 不破壞）
-- [ ] 7.14 跑 `python3 -m unittest discover -s tests -v`，比對既有已知失敗（`test_multiagent_e2e.test_five_agents_three_rounds_no_conflict`）僅該案例；其餘 100% 綠
+- [x] 7.13 跑 `python3 -m pytest -q tests/`；結果 418 passed，僅既有 baseline failure `test_multiagent_e2e.test_five_agents_three_rounds_no_conflict`（agent TX count mismatch）
+- [x] 7.14 跑 `python3 -m unittest discover -s tests -v`；結果 419 tests，僅既有 baseline failure `test_multiagent_e2e.test_five_agents_three_rounds_no_conflict`
 
 ## 8. OpenSpec specs 寫入
 
-- [ ] 8.1 `openspec/changes/2026-05-07-bootloader-recovery-44/specs/session-selftest/spec.md`：ADDED Requirements 對應 task 7.1 / 7.3 scenarios
-- [ ] 8.2 `openspec/changes/2026-05-07-bootloader-recovery-44/specs/session-interactive/spec.md`：ADDED Requirements 對應 task 7.4 ~ 7.11 scenarios（`allow_attached`、`recovery_mode`、`MAX_RECOVERY_LEASE_S`、suspend-resume 行為）
+- [x] 8.1 `openspec/changes/2026-05-07-bootloader-recovery-44/specs/session-selftest/spec.md`：ADDED Requirements 對應 task 7.1 / 7.3 scenarios
+- [x] 8.2 `openspec/changes/2026-05-07-bootloader-recovery-44/specs/session-interactive/spec.md`：ADDED Requirements 對應 task 7.4 ~ 7.11 scenarios（`allow_attached`、`recovery_mode`、`MAX_RECOVERY_LEASE_S`、suspend-resume 行為）
 
 ## 9. Docs
 
 - [x] 9.1 `docs/serialwrap-spec.md` self_test 章節加 BOOTLOADER classification、`bootloader_prompts` 欄位、`matched_prompt` / `rx_tail` 輸出
 - [x] 9.2 `docs/serialwrap-spec.md` interactive 章節加 `allow_attached`、`recovery_mode`、`MAX_RECOVERY_LEASE_S`、suspend-resume 行為
-- [ ] 9.3 `docs/serialwrap-spec.md` profile 章節加 `bootloader_prompts` 欄位、範例 regex、與 `prompt_regex` 的優先序
+- [x] 9.3 `docs/serialwrap-spec.md` profile 章節加 `bootloader_prompts` 欄位、範例 regex、與 `prompt_regex` 的優先序
 - [x] 9.4 `README.md`（troubleshooting / Usage 段）加 recovery 流程使用範例（self_test → interactive-open --allow-attached → interactive-send reset）
 
 ## 10. CHANGELOG / VERSION
 
 - [x] 10.1 `CHANGELOG.md [Unreleased]` 補三條 entry（design §8）：`feat(session)` recovery、`chore(policy)` adopt conventions、`docs` OpenSpec change package
-- [ ] 10.2 `VERSION` 值為 `0.0.1`（對齊既有 git tag `v0.0.1`，R-07 要求 VERSION == latest tag；release PR 才升版）
+- [x] 10.2 `VERSION` 值為 `0.0.1`（對齊既有 git tag `v0.0.1`，R-07 要求 VERSION == latest tag；release PR 才升版）
 
 ## 11. Functional verification（實機）
 
@@ -110,12 +110,12 @@
 
 ## 12. Commit / PR
 
-- [ ] 12.1 commit 1：`chore(policy): adopt paulsha-conventions v1.0.0 (R-01 ~ R-16 baseline)`（task 2 全部）
-- [ ] 12.2 commit 2：`feat(profile): add bootloader_prompts schema field`（task 3）
-- [ ] 12.3 commit 3：`feat(self_test): classify BOOTLOADER when RX tail matches bootloader_prompts`（task 4）
-- [ ] 12.4 commit 4：`feat(session): allow interactive_open in BOOTLOADER state with --allow-attached`（task 5 / 6）
-- [ ] 12.5 commit 5：`test(session): cover bootloader recovery interactive lease`（task 7）
-- [ ] 12.6 commit 6：`docs(session): document bootloader recovery + interactive_open allow_attached`（task 8 / 9 / 10）
+- [x] 12.1 commit 1：`chore(policy): adopt paulsha-conventions v1.0.0 (R-01 ~ R-16 baseline)`（task 2 全部；實作拆成多個 policy/docs commit）
+- [x] 12.2 commit 2：`feat(profile): add bootloader_prompts schema field`（task 3；含 tuple immutability fix）
+- [x] 12.3 commit 3：`feat(self_test): classify BOOTLOADER when RX tail matches bootloader_prompts`（task 4；含 review fix）
+- [x] 12.4 commit 4：`feat(session): allow interactive_open in BOOTLOADER state with --allow-attached`（task 5 / 6；含 expired recovery follow-up fix）
+- [x] 12.5 commit 5：`test(session): cover bootloader recovery interactive lease`（task 7；測試隨功能 commits 一併提交）
+- [x] 12.6 commit 6：`docs(session): document bootloader recovery + interactive_open allow_attached`（task 8 / 9 / 10；archive sync commit 另行提交）
 - [ ] 12.7 push branch、開 PR title `feat(session): add bootloader recovery interactive lease (#44)`
 - [ ] 12.8 PR body：套用 `.github/pull_request_template.md`、checklist 全勾、明寫 `Closes #44`
 - [ ] 12.9 等 GitHub Action `Policy Check` 綠燈（R-15 dual-pin 驗證）
@@ -123,5 +123,5 @@
 
 ## 13. Post-merge
 
-- [ ] 13.1 `openspec` 進 archive：`mv openspec/changes/2026-05-07-bootloader-recovery-44 openspec/changes/archive/`、把 `specs/session-interactive/spec.md` 內容搬到 `openspec/specs/session-interactive/spec.md`、`specs/session-selftest/spec.md` 內容 merge 進 `openspec/specs/session-selftest/spec.md`
+- [x] 13.1 `openspec` 進 archive：`mv openspec/changes/2026-05-07-bootloader-recovery-44 openspec/changes/archive/`、把 `specs/session-interactive/spec.md` 內容搬到 `openspec/specs/session-interactive/spec.md`、`specs/session-selftest/spec.md` 內容 merge 進 `openspec/specs/session-selftest/spec.md`（依使用者要求於 PR 前歸檔）
 - [ ] 13.2 在 issue #44 留 closing comment、附 PR 連結與實機驗證紀錄

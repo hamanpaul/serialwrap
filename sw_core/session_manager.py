@@ -360,6 +360,7 @@ class SessionManager:
             quiet_window_s=tpl.quiet_window_s,
             hard_timeout_s=tpl.hard_timeout_s,
             log_dir=tpl.log_dir,
+            bootloader_prompts=tpl.bootloader_prompts,
             uart=tpl.uart,
         )
         sid = f"{profile.profile_name}:{com}"
@@ -1727,10 +1728,8 @@ class SessionManager:
                 if session is None or session.bridge is None:
                     return {"ok": False, "error_code": "SESSION_NOT_READY", "selector": selector}
 
-                if not allow_attached:
-                    # 原有行為：只允許 READY
-                    if session.state != "READY":
-                        return {"ok": False, "error_code": "SESSION_NOT_READY", "selector": selector}
+                if session.state == "READY":
+                    # READY 一律走既有路徑；allow_attached 在 READY 下不改變語意。
                     existing, post = self._refresh_interactive_locked(session)
                     if post.needs_resume:
                         retry_after_post = True
@@ -1750,26 +1749,9 @@ class SessionManager:
                             "recovery_mode": False,
                         }
 
-                elif session.state == "READY":
-                    # allow_attached=True 但 session 已是 READY：走一般路徑，不 clamp，recovery_mode False
-                    existing, post = self._refresh_interactive_locked(session)
-                    if post.needs_resume:
-                        retry_after_post = True
-                    elif existing is not None:
-                        return {
-                            "ok": False,
-                            "error_code": "SESSION_INTERACTIVE_BUSY",
-                            "interactive_session_id": session.interactive_session_id,
-                        }
-                    else:
-                        lease = self._open_interactive_locked(session, owner=owner, timeout_s=timeout_s)
-                        bridge = session.bridge
-                        result = {
-                            "ok": True,
-                            "interactive_id": lease.interactive_id,
-                            "session": session.to_public_dict(),
-                            "recovery_mode": False,
-                        }
+                elif not allow_attached:
+                    # 原有行為：未 opt-in 時只允許 READY。
+                    return {"ok": False, "error_code": "SESSION_NOT_READY", "selector": selector}
 
                 elif session.state == "ATTACHED":
                     # bootloader recovery path
