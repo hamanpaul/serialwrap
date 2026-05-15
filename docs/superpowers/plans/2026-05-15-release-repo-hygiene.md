@@ -75,8 +75,8 @@ build/
 .superpowers/
 
 # 本機測試與執行產物
-test/reports/
 reports/
+test/reports/
 htmlcov/
 .coverage
 *.log
