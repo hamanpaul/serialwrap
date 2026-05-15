@@ -257,6 +257,7 @@ Create `docs/releases/v0.1.0.md` with:
 ## Notes
 
 - 本 release 不重寫 git history；`test/reports/` 僅自目前版本的 tracked tree 移除。
+- Release PR 必須標記 `release:0.1.0`，讓 R-07 在 tag `v0.1.0` 於 merge 後建立前先跳過。
 - GitHub Release 應於 PR merge 後從 `main` 建立 tag `v0.1.0`。
 ```
 
@@ -280,13 +281,13 @@ Expected: commit 包含 changelog、version、release note 與本 plan。
 
 - [ ] **Step 1: 檢查 policy engine 是否可用**
 
-Run:
+Run release-PR validation command:
 
 ```bash
-python3 -m policy_check --repo .
+python3 -m policy_check --repo . --pr-labels release:0.1.0
 ```
 
-Expected: 若 policy engine 已安裝，命令執行並回報 pass/fail；若出現 `No module named policy_check`，執行 Step 2。
+Expected: 若 policy engine 已安裝，命令執行並回報 pass/fail；若出現 `No module named policy_check`，執行 Step 2。plain `python3 -m policy_check --repo .` 會在 tag `v0.1.0` 建立前因 R-07 失敗，屬 release sequencing 預期狀態。
 
 - [ ] **Step 2: 必要時安裝 pinned policy engine**
 
@@ -298,15 +299,15 @@ python3 -m pip install --user --disable-pip-version-check "git+https://github.co
 
 Expected: pip install 成功，未改動 repo tracked files。
 
-- [ ] **Step 3: 重新執行 policy check**
+- [ ] **Step 3: 重新執行 release PR policy check**
 
 Run:
 
 ```bash
-python3 -m policy_check --repo .
+python3 -m policy_check --repo . --pr-labels release:0.1.0
 ```
 
-Expected: PASS。若 FAIL 指出 agent 文件不同步，下一步同步四份 agent 文件；若 FAIL 指出其他具體檔案，依訊息修正後重跑。
+Expected: PASS，且 R-07 因 `release:0.1.0` label 跳過。plain `python3 -m policy_check --repo .` 會在 tag `v0.1.0` 建立前因 R-07 失敗；若 release label 版本仍 FAIL 且指出 agent 文件不同步，下一步同步四份 agent 文件；若 FAIL 指出其他具體檔案，依訊息修正後重跑。
 
 - [ ] **Step 4: 若需同步 agent 文件，一次修改四份**
 
@@ -358,15 +359,15 @@ python3 -m unittest discover -s tests -v
 
 Expected: PASS，或與 Step 1 相同的既有失敗範圍。
 
-- [ ] **Step 3: 執行 policy check**
+- [ ] **Step 3: 執行 release PR policy check**
 
 Run:
 
 ```bash
-python3 -m policy_check --repo .
+python3 -m policy_check --repo . --pr-labels release:0.1.0
 ```
 
-Expected: PASS。
+Expected: PASS，且 R-07 因 `release:0.1.0` label 跳過。plain `python3 -m policy_check --repo .` 會在 tag `v0.1.0` 建立前因 R-07 失敗，屬 release sequencing 預期狀態。
 
 - [ ] **Step 4: 最終 hygiene 檢查**
 
@@ -392,10 +393,16 @@ Expected: remote branch 建立或更新成功。
 
 - [ ] **Step 6: 建立 PR**
 
-Run:
+Run this first if label `release:0.1.0` does not already exist:
 
 ```bash
-gh pr create --base main --head release/0.1.0-repo-hygiene --title "chore: 發布 0.1.0 repo hygiene release" --body "$(cat <<'EOF'
+gh label list --search 'release:0.1.0' --json name --jq '.[].name' | grep -Fx 'release:0.1.0' >/dev/null || gh label create 'release:0.1.0' --color 0E8A16 --description 'Release PR for v0.1.0'
+```
+
+Then create the PR with the release label:
+
+```bash
+gh pr create --base main --head release/0.1.0-repo-hygiene --label release:0.1.0 --title "chore: 發布 0.1.0 repo hygiene release" --body "$(cat <<'EOF'
 ## Summary
 
 - 移除 tracked `test/reports/` 測試報告並加入 `.gitignore`
@@ -406,7 +413,7 @@ gh pr create --base main --head release/0.1.0-repo-hygiene --title "chore: 發�
 
 - [ ] 執行 `python3 -m pytest -q tests/` — 無新增失敗
 - [ ] 執行 `python3 -m unittest discover -s tests -v` — 無新增失敗
-- [ ] 執行 `python3 -m policy_check --repo .` — 通過
+- [ ] 執行 `python3 -m policy_check --repo . --pr-labels release:0.1.0` — 通過（R-07 skipped）
 
 ## Policy Checklist (R-11)
 
@@ -414,9 +421,9 @@ gh pr create --base main --head release/0.1.0-repo-hygiene --title "chore: 發�
 - [ ] `CHANGELOG.md` 已更新（`[Unreleased]` 段落）
 - [ ] `VERSION` 已更新（若有版本號變動）
 - [ ] `python3 -m pytest -q tests/` 通過（無新失敗）
-- [ ] `python3 -m policy_check --repo .` 通過
+- [ ] `python3 -m policy_check --repo . --pr-labels release:0.1.0` 通過（R-07 skipped）
 - [ ] 四份 agent 檔案已同步（若有修改 `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` / `.github/copilot-instructions.md`）
-- [ ] 已標記 exemption label（若適用，白名單：`policy-exempt-changelog`、`policy-exempt-tests`、`policy-exempt-version`）
+- [ ] 已標記 release label：`release:0.1.0`
 
 ## Issue Reference
 

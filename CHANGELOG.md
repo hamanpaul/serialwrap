@@ -54,4 +54,5 @@
 ### Notes
 
 - Phase A 為治理/文件/CI scaffolding，不含 Issue #44 recovery 功能
+- Release PR 必須標記 `release:0.1.0`，讓 R-07 在 tag `v0.1.0` 建立前跳過
 - policy_check engine pinned to `ff1a031172ec24fc155699f9f3ce5bdea24d9e24`

@@ -17,7 +17,7 @@
 - [ ] `python3 -m pytest -q tests/` 通過（無新失敗）
 - [ ] `python3 -m policy_check --repo .` 通過
 - [ ] 四份 agent 檔案已同步（若有修改 `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` / `.github/copilot-instructions.md`）
-- [ ] 已標記 exemption label（若適用，白名單：`policy-exempt-changelog`、`policy-exempt-tests`、`policy-exempt-version`）
+- [ ] 已標記適用 label（release PR 使用 `release:<version>`；豁免白名單：`policy-exempt-changelog`、`policy-exempt-tests`）
 
 ## Issue Reference
 
