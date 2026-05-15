@@ -4,10 +4,12 @@
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-05-15
+
 ### Added
 
 - 導入 [paulsha-conventions](https://github.com/hamanpaul/paulsha-conventions) v1.0.0 治理基線（`.paul-project.yml`、`policy_version: 1.0.0`）
-- 新增 `VERSION` 檔案（值 `0.0.1`，對齊既有 git tag `v0.0.1` / policy R-07）
+- 新增 `VERSION` 檔案並將正式 release 版本更新為 `0.1.0`
 - 新增 `CLAUDE.md` / `AGENTS.md` / `GEMINI.md`（AI agent policy checklist）
 - 新增 `.github/pull_request_template.md`（含 R-11 policy checklist）
 - 新增 `.github/workflows/policy-check.yml`（PR 自動 policy 驗證）
@@ -30,14 +32,24 @@
 - `sw_core/cli.py`：`session interactive-open` 新增 `--allow-attached` 選項
 - `sw_mcp/server.py`：`serialwrap_open_interactive` 工具 schema 新增 `allow_attached: boolean`
 - `tests/test_bootloader_recovery.py`：新增 56 個 TDD 測試，涵蓋 recovery lease 完整生命週期（開啟、stash/restore、逾時 clamp、send、status recovery_mode、expired 清理、BUSY early-return post-close、detach 清除 stash、RPC/CLI/MCP 透傳）
+- 新增 `docs/superpowers/specs/2026-05-15-release-repo-hygiene-design.md` 與本實作計畫，記錄 repo hygiene release 流程。
 
 ### Changed
 
 - `.github/copilot-instructions.md` 前置 paulsha-conventions marker 與 policy_version
+- `.gitignore` 新增 `test/reports/` 與常見本機測試、報告、log、coverage 產物規則。
+
+### Removed
+
+- 從目前 tracked tree 移除 `test/reports/` 測試報告；不重寫既有 git history。
 
 ### Fixed
 
 - `sw_core/session_manager.py`：動態 auto-detect session 現在會從 `ProfileTemplate` 傳播 `bootloader_prompts`，避免未宣告 targets 的 template session 無法進入 BOOTLOADER recovery
+
+### Security
+
+- 掃描 tracked paths 與 tracked content，確認未發現需移除的非例外機敏資料；`profiles/brcm.env` 屬 console login profile 例外。
 
 ### Notes
 
