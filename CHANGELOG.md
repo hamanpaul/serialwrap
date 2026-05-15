@@ -38,6 +38,7 @@
 
 - `.github/copilot-instructions.md` 前置 paulsha-conventions marker 與 policy_version
 - `.gitignore` 新增 `test/reports/` 與常見本機測試、報告、log、coverage 產物規則。
+- `.github/pull_request_template.md` 與 `docs/releases/v0.1.0.md` 補充 release PR 階段 label-aware policy check 與 post-tag plain policy check 的驗證時機。
 
 ### Removed
 
