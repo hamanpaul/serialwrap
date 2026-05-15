@@ -1,6 +1,19 @@
 .pytest_cache/
 __pycache__/
 *.pyc
+*.pyo
+
 dist/
 build/
 
+# 本機 agent / worktree 目錄
+.worktrees/
+.superpowers/
+
+# 本機測試與執行產物
+reports/
+test/reports/
+htmlcov/
+.coverage
+*.log
+*.tmp

@@ -7,7 +7,7 @@
 <!-- 說明如何驗證此 PR 的正確性 -->
 
 - [ ] 執行 `python3 -m pytest -q tests/` — 無新增失敗
-- [ ] 執行 `python3 -m policy_check --repo .` — 通過
+- [ ] 執行 `python3 -m policy_check --repo .` — 通過（release PR 在 tag 建立前改用 `python3 -m policy_check --repo . --pr-labels release:<version>`）
 
 ## Policy Checklist (R-11)
 
@@ -15,9 +15,9 @@
 - [ ] `CHANGELOG.md` 已更新（`[Unreleased]` 段落）
 - [ ] `VERSION` 已更新（若有版本號變動）
 - [ ] `python3 -m pytest -q tests/` 通過（無新失敗）
-- [ ] `python3 -m policy_check --repo .` 通過
+- [ ] `python3 -m policy_check --repo .` 通過（release PR 在 tag 建立前改用 `--pr-labels release:<version>`）
 - [ ] 四份 agent 檔案已同步（若有修改 `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` / `.github/copilot-instructions.md`）
-- [ ] 已標記 exemption label（若適用，白名單：`policy-exempt-changelog`、`policy-exempt-tests`、`policy-exempt-version`）
+- [ ] 已標記適用 label（release PR 使用 `release:<version>`；豁免白名單：`policy-exempt-changelog`、`policy-exempt-tests`）
 
 ## Issue Reference
 
