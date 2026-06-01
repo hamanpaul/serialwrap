@@ -21,7 +21,12 @@ MINICOM_BIN="${MINICOM_BIN:-/usr/bin/minicom}"
 MINICOM_DEFAULT_COLOR="${MINICOM_DEFAULT_COLOR:-on}"
 MINICOM_AUTO_CAPTURE="${MINICOM_AUTO_CAPTURE:-1}"
 BLOG_DIR="${BLOG_DIR:-${HOME}/b-log}"
-MINICOM_CAPTURE_WRAPPER="${MINICOM_CAPTURE_WRAPPER:-0}"
+MINICOM_CAPTURE_WRAPPER_WAS_SET=0
+if [[ -v MINICOM_CAPTURE_WRAPPER ]]; then
+  MINICOM_CAPTURE_WRAPPER_WAS_SET=1
+fi
+MINICOM_CAPTURE_WRAPPER="${MINICOM_CAPTURE_WRAPPER:-}"
+MINICOM_CAPTURE_MODE="${MINICOM_CAPTURE_MODE:-}"
 
 _shell_join() {
   local -a quoted
@@ -33,6 +38,32 @@ _shell_join() {
   done
   local IFS=' '
   printf '%s' "${quoted[*]}"
+}
+
+_resolve_capture_mode() {
+  if [[ -n "${MINICOM_CAPTURE_MODE}" ]]; then
+    case "${MINICOM_CAPTURE_MODE}" in
+      script|minicom|off)
+        printf '%s' "${MINICOM_CAPTURE_MODE}"
+        return 0
+        ;;
+      *)
+        echo "minicom_router: invalid MINICOM_CAPTURE_MODE='${MINICOM_CAPTURE_MODE}' (expected script, minicom, or off)" >&2
+        return 2
+        ;;
+    esac
+  fi
+
+  if [[ "${MINICOM_CAPTURE_WRAPPER_WAS_SET}" == "1" ]]; then
+    if [[ "${MINICOM_CAPTURE_WRAPPER}" == "1" ]]; then
+      printf 'script'
+    else
+      printf 'minicom'
+    fi
+    return 0
+  fi
+
+  printf 'script'
 }
 
 selector=""
@@ -137,7 +168,10 @@ _exec_minicom() {
   fi
 
   local logfile=""
-  if [[ "${has_capture}" -eq 0 && "${MINICOM_AUTO_CAPTURE}" == "1" ]]; then
+  local capture_mode
+  capture_mode="$(_resolve_capture_mode)" || return $?
+
+  if [[ "${has_capture}" -eq 0 && "${MINICOM_AUTO_CAPTURE}" == "1" && "${capture_mode}" != "off" ]]; then
     mkdir -p "${BLOG_DIR}"
     local ts
     ts="$(date +%y%m%d-%H%M%S)"
@@ -148,15 +182,19 @@ _exec_minicom() {
 
   local -a cmd
   cmd=("${MINICOM_BIN}" -D "${device}" "${extra_args[@]}" "${user_args[@]}")
-  if [[ -n "${logfile}" && "${MINICOM_CAPTURE_WRAPPER}" == "1" ]] && command -v script >/dev/null 2>&1; then
-    local cmdline
-    cmdline="$(_shell_join "${cmd[@]}")"
-    exec script -qef -c "${cmdline}" "${logfile}"
+  if [[ -n "${logfile}" && "${capture_mode}" == "script" ]]; then
+    if command -v script >/dev/null 2>&1; then
+      local cmdline
+      cmdline="$(_shell_join "${cmd[@]}")"
+      script -qef -c "${cmdline}" "${logfile}"
+      return $?
+    fi
+    echo "minicom_router: warning: MINICOM_CAPTURE_MODE=script requested but 'script' command not found; auto transcript disabled" >&2
   fi
-  if [[ -n "${logfile}" ]]; then
+  if [[ -n "${logfile}" && "${capture_mode}" == "minicom" ]]; then
     cmd+=("-C" "${logfile}")
   fi
-  exec "${cmd[@]}"
+  "${cmd[@]}"
 }
 
 _ensure_daemon() {
@@ -247,8 +285,12 @@ _run_broker_minicom() {
     "${SERIALWRAP_BIN}" --socket "${SOCKET}" session console-detach --selector "${sel}" --client-id "${client_id}" >/dev/null 2>&1 || true
   }
   trap cleanup EXIT INT TERM
-  _exec_minicom "${vtty}" "${com_name}" "$@"
-  local rc=$?
+  local rc
+  if _exec_minicom "${vtty}" "${com_name}" "$@"; then
+    rc=0
+  else
+    rc=$?
+  fi
   trap - EXIT INT TERM
   cleanup
   return "${rc}"

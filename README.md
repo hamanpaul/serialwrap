@@ -517,7 +517,7 @@ serialwrap file pull --selector COM0 --remote /etc/config/wireless --local ./wir
 1. 視需要自動啟動 daemon
 2. 視需要對 selector 執行 `session attach`
 3. 透過 `session console-attach` 取得專屬 PTY
-4. 預設用 minicom 內建 `-C` 記錄一份 `mini_<COM>_<timestamp>.log` transcript（預設在 `~/b-log`，可用 `BLOG_DIR` 覆寫）
+4. 預設用 `script -qef` 包住 minicom 記錄一份 `mini_<COM>_<timestamp>.log` transcript（預設在 `~/b-log`，可用 `BLOG_DIR` 覆寫），避免 minicom 內建 `-C` 在 PTY / resize / 高頻 RX 下的 native crash 風險
 5. 啟動 `minicom`
 6. 結束後自動 `session console-detach`
 
@@ -540,7 +540,11 @@ minicom -D /dev/ttyUSB0
 - 若 agent 在 human interactive 期間提交命令，daemon 會暫時掛起（suspend）human raw mode → 執行 agent 命令 → 完成後自動恢復（resume）。Human 在 agent 執行期間的按鍵會累積在 deferred buffer，agent 完成後 flush 到 UART。
 - 第二個以後的 minicom console 因為 interactive lease 已存在，仍走 line-buffer 模式（broker 提供本地回顯與 backspace 行編輯）。
 - bridge rebuild / reattach 時，broker 會盡量保留既有 console PTY 與 human ownership，避免既有 minicom 掛到 stale `/dev/pts/*`。
-- 若要保留舊版「完整 terminal transcript」行為，可顯式設定 `MINICOM_CAPTURE_WRAPPER=1`，此時 wrapper 會改用 `script -qef` 包一層 PTY；但這可能增加 human 體感延遲。
+- Broker minicom 的自動 transcript 可用 `MINICOM_CAPTURE_MODE=script|minicom|off` 控制：
+  - `script`（預設）：使用 `script -qef` 包住 minicom，不傳 `-C` 給 minicom。
+  - `minicom`：明確 opt-in 使用 minicom 內建 `-C`；此模式在 PTY / resize / 高頻輸出下較容易觸發 minicom native crash 風險。
+  - `off`：關閉自動 transcript，不建立 log、不使用 `script` wrapper，也不自動傳 `-C`。
+- Legacy `MINICOM_CAPTURE_WRAPPER=1` 仍等同 `MINICOM_CAPTURE_MODE=script`；若未設定 `MINICOM_CAPTURE_MODE` 且明確設定 `MINICOM_CAPTURE_WRAPPER=0`，仍保留舊版 minicom `-C` 行為。
 - 常見 human/minicom 互動式命令（例如 `vi`、`vim`、`top`、`htop`、`less`、`menuconfig`）會自動升級成 human interactive ownership，不再因為等不到 shell prompt 而自動觸發 recover / reboot。
 - 若直接打 `minicom` 沒有走 broker，先用 `type -a minicom` 檢查目前 shell 是否先命中 `~/.paul_tools/minicom`；若仍是 `/usr/bin/minicom`，代表 shell PATH 尚未把 wrapper 放到前面。
 
