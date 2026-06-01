@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+### Changed
+
+- `tools/minicom_router.sh` 的 broker minicom 自動 transcript 預設改為 `script -qef` wrapper，不再預設把 `-C` 傳給 minicom；新增 `MINICOM_CAPTURE_MODE=script|minicom|off` 控制模式，`MINICOM_CAPTURE_MODE=minicom` 才明確 opt-in 使用原生 capture。
+
+### Fixed
+
+- 修正 broker minicom 正常或非 0 結束時可能因 shell 被 `exec` 取代而跳過 `session console-detach` 的 lifecycle cleanup 風險。
+
 ## [0.1.0] - 2026-05-15
 
 ### Added
