@@ -1,5 +1,5 @@
 policy_profile: flat
-policy_version: "1.0.0"
+policy_version: "1.0.1"
 code_paths:
   - "sw_core/**"
   - "sw_mcp/**"
