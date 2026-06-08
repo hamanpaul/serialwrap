@@ -1,6 +1,6 @@
-<!-- managed-by: hamanpaul/paulsha-conventions@v1.0.0 -->
+<!-- managed-by: hamanpaul/paulsha-conventions@v1.0.1 -->
 <!-- 若修改此檔，同步更新 CLAUDE.md / AGENTS.md / GEMINI.md / .github/copilot-instructions.md 四份 -->
-policy_version: 1.0.0
+policy_version: 1.0.1
 <!-- policy_version 為 policy_check R-14 machine-readable marker；需保持裸行格式，請勿移入 frontmatter 或 code block。 -->
 
 # Copilot Instructions — serialwrap
@@ -199,3 +199,12 @@ MCP 只是 RPC 的薄轉接層。新增或改名工具時，要把 `sw_mcp/serve
 - `tests/test_multiagent_e2e.py` 會啟動真實 daemon，再用 PTY 假 target 驗證 `READY` 流程與多 agent 序列化，任何跨 `service / arbiter / session_manager / uart_io` 的改動都很適合先看這個測試。
 - `tests/test_wal.py`、`tests/test_login_fsm.py`、`tests/test_session_bind.py` 分別對應 WAL、登入狀態機與綁定/持久化行為。
 - `install.sh` 不是單純複製檔案：它還會移除 legacy `serialwrap_lib.py`，並在偵測到唯一一個 `/dev/serial/by-id/*` 且 `profiles/default.yaml` 仍是 placeholder 時，自動改寫預設 target。
+
+## v1.0.1 新增規則（issue 連結 / docs 對齊 / 語言）
+> 本段於 policy 1.0.1 隨 R-17 / R-18 與語言規範新增。
+
+- **R-17（PR↔issue，FAIL gate）**：PR body 引用 issue（`#N`）時必須為 closing-keyword 形式（`Closes` / `Fixes` / `Resolves #N`），merge 由 GitHub 原生自動關閉 issue 並留下 cross-reference；只引用不關閉時上 `policy-exempt:issue-link`。
+- **R-18（docs 對齊，WARN，不擋 merge）**：`code_paths` 有變動但 `README.md` / `docs/**` 未同步時提醒；純內部變動可上 `policy-exempt:docs-sync`。
+- **語言規範（checklist）**：依 repo 來源決定語言——`github.com/hamanpaul/*`、`github.com/paulc-arc/*` → zh-tw；arcadyan GitLab → en_US。涵蓋 PR 標題／內文與所有 comment。本 repo 屬 `hamanpaul` → zh-tw。
+- **動工前（軟性，不打斷流程）**：若任務對應某 issue，`gh issue view <N>` 核對相關性後分支可命名 `feature/<N>-<slug>`，開 PR 於 body 寫 `Closes #N`；查無對應 issue 照常進行，不另開、不停。
+- **Exemption 白名單新增**：`policy-exempt:issue-link`（R-17）、`policy-exempt:docs-sync`（R-18）。
