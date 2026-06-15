@@ -244,6 +244,8 @@ class SessionRuntime:
             "idle_for_ms": self.compute_idle_ms(),
             "outstanding_commands": outstanding,
             "activity_classification": self.classify_activity(),
+            "released_by": self.released_by,
+            "released_at": self.released_at,
             "capture": {
                 "capture_id": self.active_capture.capture_id,
                 "log_path": self.active_capture.log_path,
@@ -2060,6 +2062,23 @@ class SessionManager:
                     "ok": False,
                     "error_code": "SESSION_NOT_FOUND",
                     "selector": selector,
+                    **self._lease_context(None),
+                }
+            if session.state == "RELEASED":
+                device = self._devices.get(session.profile.device_by_id)
+                real_path = device.real_path if device is not None else None
+                holder = self._probe_external_holder(real_path) if real_path else {"pids": [], "holder": None}
+                reclaimable = not holder["pids"]
+                return {
+                    "ok": True,
+                    "classification": "RELEASED",
+                    "session": session.to_public_dict(),
+                    "released_by": session.released_by,
+                    "released_at": session.released_at,
+                    "reason": session.released_reason,
+                    "external_holder": holder["pids"] if holder["pids"] else "none",
+                    "reclaimable": reclaimable,
+                    "recommended_action": "device_attach" if reclaimable else "wait_external_flash",
                     **self._lease_context(None),
                 }
             lease = self._interactive.get(session.interactive_session_id) if session.interactive_session_id is not None else None

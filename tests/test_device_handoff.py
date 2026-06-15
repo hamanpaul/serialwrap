@@ -261,3 +261,42 @@ class TestReleasedPersistence(_Base):
             time.sleep(0.1)
         attach_by_id.assert_not_called()
         self.assertEqual(s2.state, "RELEASED")
+
+
+class TestSelfTestReleased(_Base):
+    def _released(self, holder_pids):
+        by_id = "/dev/serial/by-id/orig"
+        mgr = self._mgr([self._make_profile("p", "COM0", "lab+1", by_id)])
+        session = mgr.get_session("COM0")
+        with mgr._lock:
+            mgr._devices = {by_id: DeviceInfo(by_id=by_id, real_path="/dev/ttyUSB0")}
+            session.state = "RELEASED"
+            session.released_by = "agent:flash"
+            session.released_at = "now"
+            session.released_reason = "flash CC2674"
+        mgr._probe_external_holder = mock.MagicMock(
+            return_value={"pids": holder_pids, "holder": (holder_pids[0] if holder_pids else None)}
+        )
+        return mgr
+
+    def test_self_test_released_with_holder(self) -> None:
+        resp = self._released([4321]).self_test("COM0")
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["classification"], "RELEASED")
+        self.assertEqual(resp["external_holder"], [4321])
+        self.assertFalse(resp["reclaimable"])
+        self.assertEqual(resp["recommended_action"], "wait_external_flash")
+        self.assertEqual(resp["released_by"], "agent:flash")
+
+    def test_self_test_released_reclaimable(self) -> None:
+        resp = self._released([]).self_test("COM0")
+        self.assertEqual(resp["classification"], "RELEASED")
+        self.assertEqual(resp["external_holder"], "none")
+        self.assertTrue(resp["reclaimable"])
+        self.assertEqual(resp["recommended_action"], "device_attach")
+
+    def test_public_dict_has_released_fields(self) -> None:
+        mgr = self._released([])
+        pub = mgr.get_session("COM0").to_public_dict()
+        self.assertEqual(pub["released_by"], "agent:flash")
+        self.assertEqual(pub["released_at"], "now")
