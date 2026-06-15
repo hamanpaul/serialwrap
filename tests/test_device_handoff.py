@@ -31,6 +31,10 @@ class _Base(unittest.TestCase):
         )
 
 
+import time
+import unittest.mock as mock
+
+
 class TestReleasedStateFields(_Base):
     def test_session_has_released_fields_and_set(self) -> None:
         mgr = self._mgr([self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")])
@@ -40,3 +44,24 @@ class TestReleasedStateFields(_Base):
         self.assertIsNone(session.released_at)
         self.assertIsNone(session.released_reason)
         self.assertEqual(mgr._released_by_ids, set())
+
+
+class TestSpawnAttachGuard(_Base):
+    def test_spawn_attach_skips_released_by_id(self) -> None:
+        by_id = "/dev/serial/by-id/orig"
+        mgr = self._mgr([self._make_profile("p", "COM0", "lab+1", by_id)])
+        with mgr._lock:
+            mgr._released_by_ids.add(by_id)
+        with mock.patch.object(mgr, "_attach_by_id") as attach_by_id:
+            mgr._spawn_attach(by_id)
+            time.sleep(0.1)
+        attach_by_id.assert_not_called()
+        self.assertNotIn(by_id, mgr._attach_inflight)
+
+    def test_spawn_attach_runs_for_non_released_by_id(self) -> None:
+        by_id = "/dev/serial/by-id/orig"
+        mgr = self._mgr([self._make_profile("p", "COM0", "lab+1", by_id)])
+        with mock.patch.object(mgr, "_attach_by_id") as attach_by_id:
+            mgr._spawn_attach(by_id)
+            time.sleep(0.1)
+        attach_by_id.assert_called_once_with(by_id)

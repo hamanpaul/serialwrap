@@ -658,6 +658,8 @@ class SessionManager:
 
     def _spawn_attach(self, by_id: str) -> None:
         with self._lock:
+            if by_id in self._released_by_ids:
+                return
             if by_id in self._attach_inflight:
                 return
             self._attach_inflight.add(by_id)
