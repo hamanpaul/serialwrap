@@ -597,6 +597,31 @@ class SessionManager:
         ordered = sorted(holders)
         return {"pids": ordered, "holder": (ordered[0] if ordered else None)}
 
+    def attach_device(self, selector: str, *, force: bool = False) -> dict[str, Any]:
+        with self._lock:
+            session = self.get_session(selector)
+            if session is None:
+                return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            by_id = session.profile.device_by_id
+            if not by_id or by_id not in self._devices:
+                return {"ok": False, "error_code": "DEVICE_NOT_PRESENT", "selector": selector, "device_by_id": by_id}
+            real_path = self._devices[by_id].real_path
+        if not force:
+            holder = self._probe_external_holder(real_path)
+            if holder["pids"]:
+                return {"ok": False, "error_code": "DEVICE_STILL_HELD", "pids": holder["pids"], "selector": selector}
+        with self._lock:
+            self._released_by_ids.discard(by_id)
+            session.released_by = None
+            session.released_at = None
+            session.released_reason = None
+            session.state = "ATTACHING"
+            session.last_error = None
+            public = session.to_public_dict()
+        self._save_state()
+        self._spawn_attach(by_id)
+        return {"ok": True, "session": public}
+
     def bind_session(self, selector: str, device_by_id: str) -> dict[str, Any]:
         device_by_id = device_by_id.strip()
         if not device_by_id:

@@ -175,3 +175,57 @@ class TestProbeExternalHolder(_Base):
         res = mgr._probe_external_holder("/dev/ttyUSB9", _proc_root=str(proc))
         self.assertEqual(res["pids"], [])
         self.assertIsNone(res["holder"])
+
+
+class TestAttachDevice(_Base):
+    def _released_mgr(self, by_id="/dev/serial/by-id/orig", real="/dev/ttyUSB0"):
+        mgr = self._mgr([self._make_profile("p", "COM0", "lab+1", by_id)])
+        session = mgr.get_session("COM0")
+        with mgr._lock:
+            mgr._devices = {by_id: DeviceInfo(by_id=by_id, real_path=real)}
+            mgr._released_by_ids.add(by_id)
+            session.state = "RELEASED"
+            session.released_by = "agent:flash"
+            session.released_at = "now"
+        return mgr, session, by_id
+
+    def test_attach_reclaims_when_free(self) -> None:
+        mgr, session, by_id = self._released_mgr()
+        with mock.patch.object(mgr, "_probe_external_holder", return_value={"pids": [], "holder": None}), \
+             mock.patch.object(mgr, "_spawn_attach") as spawn_attach:
+            resp = mgr.attach_device("COM0")
+        self.assertTrue(resp["ok"])
+        self.assertNotIn(by_id, mgr._released_by_ids)
+        self.assertIsNone(session.released_by)
+        self.assertEqual(session.state, "ATTACHING")
+        spawn_attach.assert_called_once_with(by_id)
+
+    def test_attach_refuses_when_externally_held(self) -> None:
+        mgr, session, by_id = self._released_mgr()
+        with mock.patch.object(mgr, "_probe_external_holder", return_value={"pids": [4321], "holder": 4321}), \
+             mock.patch.object(mgr, "_spawn_attach") as spawn_attach:
+            resp = mgr.attach_device("COM0")
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error_code"], "DEVICE_STILL_HELD")
+        self.assertEqual(resp["pids"], [4321])
+        self.assertEqual(session.state, "RELEASED")
+        spawn_attach.assert_not_called()
+
+    def test_attach_force_bypasses_holder_check(self) -> None:
+        mgr, session, by_id = self._released_mgr()
+        with mock.patch.object(mgr, "_probe_external_holder", return_value={"pids": [4321], "holder": 4321}) as probe, \
+             mock.patch.object(mgr, "_spawn_attach") as spawn_attach:
+            resp = mgr.attach_device("COM0", force=True)
+        self.assertTrue(resp["ok"])
+        probe.assert_not_called()
+        spawn_attach.assert_called_once_with(by_id)
+
+    def test_attach_device_not_present(self) -> None:
+        mgr = self._mgr([self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")])
+        session = mgr.get_session("COM0")
+        with mgr._lock:
+            session.state = "RELEASED"
+            mgr._released_by_ids.add("/dev/serial/by-id/orig")
+        resp = mgr.attach_device("COM0")
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error_code"], "DEVICE_NOT_PRESENT")
