@@ -536,6 +536,15 @@ class TestBindSessionReleasedRebind(_Base):
         self.assertIsNone(session.released_at)
         self.assertIsNone(session.released_reason)
         self.assertEqual(session.profile.device_by_id, new_by_id)
+        # state 須完全離開 RELEASED（否則 self_test 仍回 RELEASED、provenance 為 None）
+        self.assertNotEqual(session.state, "RELEASED")
+        # 持久化不得殘留半殘 released entry：重建 SessionManager（模擬 daemon 重啟）
+        # 不得把這個剛重綁的 session 復活成 RELEASED
+        mgr2 = self._mgr([self._make_profile("p", "COM0", "lab+1", new_by_id)])
+        s2 = mgr2.get_session("COM0")
+        assert s2 is not None
+        self.assertNotEqual(s2.state, "RELEASED")
+        self.assertNotIn(new_by_id, mgr2._released_by_ids)
 
 
 class TestSelfTestReleasedLockHygiene(_Base):

@@ -683,7 +683,9 @@ class SessionManager:
             if session.bridge is not None:
                 self._detach_session_locked(session, reason="REBOUND")
             # I1：對 RELEASED session 重綁新 by_id 屬明確覆寫（離開 RELEASED）——
-            # 須把舊 by_id 移出 _released_by_ids 並清 provenance，避免永久殘留。
+            # 須把舊 by_id 移出 _released_by_ids、清 provenance，並把 state 移出 RELEASED，
+            # 否則下方 _save_state 會以新 by_id、released_by=None 寫入半殘 released entry，
+            # 導致 daemon 重啟後 session 被復活成 RELEASED、永遠無法 attach。
             if session.state == "RELEASED":
                 old_by_id = session.profile.device_by_id
                 if old_by_id:
@@ -691,6 +693,7 @@ class SessionManager:
                 session.released_by = None
                 session.released_at = None
                 session.released_reason = None
+                session.state = "DETACHED"
             session.profile = dataclasses.replace(session.profile, device_by_id=device_by_id)
             self._binding_overrides[session.session_id] = device_by_id
             self._save_state()
