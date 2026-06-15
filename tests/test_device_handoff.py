@@ -155,3 +155,23 @@ class TestReleaseDevice(_Base):
         resp = mgr.release_device("COM9")
         self.assertFalse(resp["ok"])
         self.assertEqual(resp["error_code"], "SESSION_NOT_FOUND")
+
+
+class TestProbeExternalHolder(_Base):
+    def test_probe_detects_holder_in_fake_proc(self) -> None:
+        mgr = self._mgr([self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")])
+        proc = Path(self._tmp.name) / "proc"
+        (proc / "1234" / "fd").mkdir(parents=True)
+        os.symlink("/dev/ttyUSB9", proc / "1234" / "fd" / "5")
+        res = mgr._probe_external_holder("/dev/ttyUSB9", _proc_root=str(proc))
+        self.assertEqual(res["pids"], [1234])
+        self.assertEqual(res["holder"], 1234)
+
+    def test_probe_no_holder(self) -> None:
+        mgr = self._mgr([self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")])
+        proc = Path(self._tmp.name) / "proc"
+        (proc / "1234" / "fd").mkdir(parents=True)
+        os.symlink("/dev/ttyUSB0", proc / "1234" / "fd" / "5")
+        res = mgr._probe_external_holder("/dev/ttyUSB9", _proc_root=str(proc))
+        self.assertEqual(res["pids"], [])
+        self.assertIsNone(res["holder"])

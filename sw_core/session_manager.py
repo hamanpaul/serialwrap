@@ -563,6 +563,40 @@ class SessionManager:
         self._save_state()
         return {"ok": True, "session": public, "closed_consoles": closed_consoles, "aborted_cmd": aborted_cmd}
 
+    def _probe_external_holder(self, real_path: str, *, _proc_root: str = "/proc") -> dict[str, Any]:
+        """唯讀偵測 real_path 是否被其他 process 持有；讀 _proc_root/*/fd，不開 tty、不做 I/O。"""
+        my_pid = os.getpid()
+        try:
+            target = os.path.realpath(real_path)
+        except OSError:
+            target = real_path
+        holders: set[int] = set()
+        try:
+            entries = os.listdir(_proc_root)
+        except OSError:
+            return {"pids": [], "holder": None}
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            if pid == my_pid:
+                continue
+            fd_dir = os.path.join(_proc_root, entry, "fd")
+            try:
+                fds = os.listdir(fd_dir)
+            except OSError:
+                continue
+            for fd in fds:
+                try:
+                    link = os.readlink(os.path.join(fd_dir, fd))
+                except OSError:
+                    continue
+                if link == target or link == real_path:
+                    holders.add(pid)
+                    break
+        ordered = sorted(holders)
+        return {"pids": ordered, "holder": (ordered[0] if ordered else None)}
+
     def bind_session(self, selector: str, device_by_id: str) -> dict[str, Any]:
         device_by_id = device_by_id.strip()
         if not device_by_id:
