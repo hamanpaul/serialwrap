@@ -295,6 +295,13 @@ class SessionManager:
             if sid not in self._sessions:
                 self._sessions[sid] = SessionRuntime(session_id=sid, profile=profile)
             self._aliases.set_for_session(sid, profile.alias)
+        for sid, meta in self._loaded_released.items():
+            s = self._sessions.get(sid)
+            if s is not None:
+                s.state = "RELEASED"
+                s.released_by = meta.get("released_by")
+                s.released_at = meta.get("released_at")
+                s.released_reason = meta.get("reason")
         self._save_state()
 
     def _load_state(self) -> None:
@@ -315,12 +322,37 @@ class SessionManager:
                 if isinstance(sid, str) and isinstance(by_id, str) and sid.strip() and by_id.strip():
                     normalized[sid.strip()] = by_id.strip()
             self._binding_overrides = normalized
+        released = obj.get("released") if isinstance(obj, dict) else None
+        if isinstance(released, dict):
+            loaded: dict[str, dict[str, str | None]] = {}
+            for sid, meta in released.items():
+                if not isinstance(sid, str) or not isinstance(meta, dict):
+                    continue
+                by_id = meta.get("by_id")
+                loaded[sid] = {
+                    "by_id": by_id,
+                    "released_by": meta.get("released_by"),
+                    "released_at": meta.get("released_at"),
+                    "reason": meta.get("reason"),
+                }
+                if isinstance(by_id, str) and by_id:
+                    self._released_by_ids.add(by_id)
+            self._loaded_released = loaded
 
     def _save_state(self) -> None:
         os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+        released: dict[str, dict[str, str | None]] = {}
+        for sid, s in self._sessions.items():
+            if s.state == "RELEASED":
+                released[sid] = {
+                    "by_id": s.profile.device_by_id,
+                    "released_by": s.released_by,
+                    "released_at": s.released_at,
+                    "reason": s.released_reason,
+                }
         with open(STATE_PATH, "w", encoding="utf-8") as fp:
             json.dump(
-                {"aliases": self._aliases.dump(), "bindings": dict(self._binding_overrides)},
+                {"aliases": self._aliases.dump(), "bindings": dict(self._binding_overrides), "released": released},
                 fp,
                 ensure_ascii=False,
                 sort_keys=True,

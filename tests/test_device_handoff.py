@@ -229,3 +229,35 @@ class TestAttachDevice(_Base):
         resp = mgr.attach_device("COM0")
         self.assertFalse(resp["ok"])
         self.assertEqual(resp["error_code"], "DEVICE_NOT_PRESENT")
+
+
+class TestReleasedPersistence(_Base):
+    def test_released_survives_restart_and_bootstrap_skips(self) -> None:
+        by_id = "/dev/serial/by-id/orig"
+        profiles = [self._make_profile("p", "COM0", "lab+1", by_id)]
+        mgr = self._mgr(profiles)
+        session = mgr.get_session("COM0")
+        bridge = mock.MagicMock()
+        bridge.stop.return_value = None
+        bridge.list_consoles.return_value = []
+        session.bridge = bridge
+        session.state = "READY"
+        with mgr._lock:
+            mgr._devices = {by_id: DeviceInfo(by_id=by_id, real_path="/dev/ttyUSB0")}
+        mgr.release_device("COM0", source="agent:flash", reason="flash")
+
+        # 模擬 daemon 重啟：同一 STATE_PATH、同 profiles 重建 SessionManager
+        mgr2 = self._mgr(profiles)
+        s2 = mgr2.get_session("COM0")
+        assert s2 is not None
+        self.assertEqual(s2.state, "RELEASED")
+        self.assertEqual(s2.released_by, "agent:flash")
+        self.assertIn(by_id, mgr2._released_by_ids)
+
+        with mgr2._lock:
+            mgr2._devices = {by_id: DeviceInfo(by_id=by_id, real_path="/dev/ttyUSB0")}
+        with mock.patch.object(mgr2, "_attach_by_id") as attach_by_id:
+            mgr2.bootstrap_attach()
+            time.sleep(0.1)
+        attach_by_id.assert_not_called()
+        self.assertEqual(s2.state, "RELEASED")
