@@ -65,3 +65,21 @@ class TestSpawnAttachGuard(_Base):
             mgr._spawn_attach(by_id)
             time.sleep(0.1)
         attach_by_id.assert_called_once_with(by_id)
+
+
+class TestClearSessionReleasedGuard(_Base):
+    def test_clear_on_released_session_is_noop(self) -> None:
+        by_id = "/dev/serial/by-id/orig"
+        mgr = self._mgr([self._make_profile("p", "COM0", "lab+1", by_id)])
+        session = mgr.get_session("COM0")
+        assert session is not None
+        with mgr._lock:
+            mgr._devices = {by_id: DeviceInfo(by_id=by_id, real_path="/dev/ttyUSB0")}
+            mgr._released_by_ids.add(by_id)
+            session.state = "RELEASED"
+        with mock.patch.object(mgr, "_spawn_attach") as spawn_attach:
+            resp = mgr.clear_session("COM0")
+        self.assertTrue(resp["ok"])
+        self.assertTrue(resp.get("released"))
+        self.assertEqual(session.state, "RELEASED")
+        spawn_attach.assert_not_called()

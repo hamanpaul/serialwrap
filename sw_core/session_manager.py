@@ -524,6 +524,8 @@ class SessionManager:
             session = self.get_session(selector)
             if session is None:
                 return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            if session.state == "RELEASED" or session.profile.device_by_id in self._released_by_ids:
+                return {"ok": True, "released": True, "session": session.to_public_dict()}
             self._detach_session_locked(session, reason="CLEARED")
             by_id = session.profile.device_by_id
             has_device = bool(by_id and by_id in self._devices)
