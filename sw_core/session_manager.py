@@ -482,7 +482,7 @@ class SessionManager:
                 timeout_s=timeout_s or max(session.profile.hard_timeout_s, _ATTACHED_CONSOLE_LEASE_TIMEOUT_S),
             )
 
-    def _detach_session_locked(self, session: SessionRuntime, *, reason: str) -> None:
+    def _detach_session_locked(self, session: SessionRuntime, *, reason: str, drop_consoles: bool = False) -> None:
         preserved = session.retained_consoles
         retained_human_owner = session.retained_human_owner
         retained_human_timeout_s = session.retained_human_timeout_s
@@ -492,8 +492,13 @@ class SessionManager:
                 retained_human_owner = lease.owner
                 retained_human_timeout_s = lease.timeout_s
         if session.bridge is not None:
-            preserved = session.bridge.stop(preserve_consoles=True)
+            preserved = session.bridge.stop(preserve_consoles=not drop_consoles)
             session.bridge = None
+        if drop_consoles:
+            preserved = None
+            retained_human_owner = None
+            retained_human_timeout_s = None
+            session.retained_consoles = None
         self._store_retained_consoles_locked(
             session,
             preserved,

@@ -67,6 +67,34 @@ class TestSpawnAttachGuard(_Base):
         attach_by_id.assert_called_once_with(by_id)
 
 
+class TestDropConsolesDetach(_Base):
+    def test_detach_drop_consoles_closes_and_does_not_stash(self) -> None:
+        mgr = self._mgr([self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")])
+        session = mgr.get_session("COM0")
+        assert session is not None
+        bridge = mock.MagicMock()
+        bridge.stop.return_value = None
+        session.bridge = bridge
+        session.state = "READY"
+        with mgr._lock:
+            mgr._detach_session_locked(session, reason="RELEASED", drop_consoles=True)
+        bridge.stop.assert_called_once_with(preserve_consoles=False)
+        self.assertIsNone(session.retained_consoles)
+        self.assertIsNone(session.bridge)
+
+    def test_detach_default_preserves_consoles(self) -> None:
+        mgr = self._mgr([self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")])
+        session = mgr.get_session("COM0")
+        assert session is not None
+        bridge = mock.MagicMock()
+        bridge.stop.return_value = None
+        session.bridge = bridge
+        session.state = "READY"
+        with mgr._lock:
+            mgr._detach_session_locked(session, reason="X")
+        bridge.stop.assert_called_once_with(preserve_consoles=True)
+
+
 class TestClearSessionReleasedGuard(_Base):
     def test_clear_on_released_session_is_noop(self) -> None:
         by_id = "/dev/serial/by-id/orig"
