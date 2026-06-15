@@ -454,3 +454,56 @@ class TestAttachByIdReleasedBackstop(_Base):
         self.assertEqual(session.state, "RELEASED")
         self.assertIsNone(session.bridge)
         self.assertIn(by_id, mgr._released_by_ids)
+
+
+class TestReleasedGuardAttachRecover(_Base):
+    """C2：attach_session / recover_session 對 RELEASED session 必須早退，
+    不得改 state、不得 spawn、不得動集合——否則下一次 _save_state 會把
+    released map 寫空，重啟後 RELEASED 保護全失。"""
+
+    def _released_mgr(self, by_id="/dev/serial/by-id/orig", real="/dev/ttyUSB0"):
+        profiles = [self._make_profile("p", "COM0", "lab+1", by_id)]
+        mgr = self._mgr(profiles)
+        session = mgr.get_session("COM0")
+        with mgr._lock:
+            mgr._devices = {by_id: DeviceInfo(by_id=by_id, real_path=real)}
+            mgr._released_by_ids.add(by_id)
+            session.state = "RELEASED"
+            session.released_by = "agent:flash"
+            session.released_at = "now"
+            session.released_reason = "flash CC2674"
+        return mgr, session, by_id, profiles
+
+    def _assert_released_persists(self, mgr, by_id, profiles):
+        # 關鍵斷言：_save_state 後重建 SessionManager（同 STATE_PATH、同 profiles）
+        # 仍須 RELEASED；未修前 released map 被寫空 → 重建後 state 非 RELEASED 而 FAIL。
+        mgr._save_state()
+        mgr2 = self._mgr(profiles)
+        s2 = mgr2.get_session("COM0")
+        assert s2 is not None
+        self.assertEqual(s2.state, "RELEASED")
+        self.assertIn(by_id, mgr2._released_by_ids)
+
+    def test_attach_session_on_released_early_returns_and_persists(self) -> None:
+        mgr, session, by_id, profiles = self._released_mgr()
+        with mock.patch.object(mgr, "_spawn_attach") as spawn_attach:
+            resp = mgr.attach_session("COM0")
+        self.assertTrue(resp["ok"])
+        self.assertTrue(resp.get("released"))
+        self.assertEqual(resp.get("recommended_action"), "device_attach")
+        spawn_attach.assert_not_called()
+        self.assertEqual(session.state, "RELEASED")
+        self.assertIn(by_id, mgr._released_by_ids)
+        self._assert_released_persists(mgr, by_id, profiles)
+
+    def test_recover_session_on_released_early_returns_and_persists(self) -> None:
+        mgr, session, by_id, profiles = self._released_mgr()
+        with mock.patch.object(mgr, "_spawn_attach") as spawn_attach:
+            resp = mgr.recover_session("COM0")
+        self.assertTrue(resp["ok"])
+        self.assertTrue(resp.get("released"))
+        self.assertEqual(resp.get("recommended_action"), "device_attach")
+        spawn_attach.assert_not_called()
+        self.assertEqual(session.state, "RELEASED")
+        self.assertIn(by_id, mgr._released_by_ids)
+        self._assert_released_persists(mgr, by_id, profiles)

@@ -710,6 +710,15 @@ class SessionManager:
             by_id = session.profile.device_by_id
             if not by_id:
                 return {"ok": False, "error_code": "DEVICE_NOT_BOUND", "session": session.to_public_dict()}
+            # C2：RELEASED 早退——比照 clear_session，不改 state、不 spawn、不動集合，
+            # 避免卡死 ATTACHING 與下一次 _save_state 把 released map 寫空。
+            if session.state == "RELEASED" or by_id in self._released_by_ids:
+                return {
+                    "ok": True,
+                    "released": True,
+                    "recommended_action": "device_attach",
+                    "session": session.to_public_dict(),
+                }
             if session.bridge is not None:
                 lease, post = self._refresh_interactive_locked(session)
                 if lease is not None and lease.owner.startswith("human:"):
@@ -2267,6 +2276,14 @@ class SessionManager:
             session = self.get_session(selector)
             if session is None:
                 return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            # C2：RELEASED 早退——比照 clear_session，不改 state、不 spawn、不動集合。
+            if session.state == "RELEASED" or session.profile.device_by_id in self._released_by_ids:
+                return {
+                    "ok": True,
+                    "released": True,
+                    "recommended_action": "device_attach",
+                    "session": session.to_public_dict(),
+                }
             if session.bridge is None:
                 by_id = session.profile.device_by_id
                 if by_id and by_id in self._devices:
