@@ -682,6 +682,15 @@ class SessionManager:
                 return {"ok": True, "already_bound": True, "session": session.to_public_dict()}
             if session.bridge is not None:
                 self._detach_session_locked(session, reason="REBOUND")
+            # I1：對 RELEASED session 重綁新 by_id 屬明確覆寫（離開 RELEASED）——
+            # 須把舊 by_id 移出 _released_by_ids 並清 provenance，避免永久殘留。
+            if session.state == "RELEASED":
+                old_by_id = session.profile.device_by_id
+                if old_by_id:
+                    self._released_by_ids.discard(old_by_id)
+                session.released_by = None
+                session.released_at = None
+                session.released_reason = None
             session.profile = dataclasses.replace(session.profile, device_by_id=device_by_id)
             self._binding_overrides[session.session_id] = device_by_id
             self._save_state()
@@ -2087,6 +2096,9 @@ class SessionManager:
         suspend_human_interactive = False
         post = _PostCloseAction()
         result: dict[str, Any] | None = None
+        # I2：RELEASED 分支須在 lock 內擷取、出 lock 後再掃 /proc（_probe_external_holder
+        # 會掃整個 /proc，持 lock 期間會阻塞所有 RPC）。
+        released_capture: dict[str, Any] | None = None
         with self._lock:
             session = self.get_session(selector)
             if session is None:
@@ -2098,140 +2110,152 @@ class SessionManager:
                 }
             if session.state == "RELEASED":
                 device = self._devices.get(session.profile.device_by_id)
-                real_path = device.real_path if device is not None else None
-                holder = self._probe_external_holder(real_path) if real_path else {"pids": [], "holder": None}
-                reclaimable = not holder["pids"]
-                return {
-                    "ok": True,
-                    "classification": "RELEASED",
+                released_capture = {
+                    "real_path": device.real_path if device is not None else None,
                     "session": session.to_public_dict(),
                     "released_by": session.released_by,
                     "released_at": session.released_at,
                     "reason": session.released_reason,
-                    "external_holder": holder["pids"] if holder["pids"] else "none",
-                    "reclaimable": reclaimable,
-                    "recommended_action": "device_attach" if reclaimable else "wait_external_flash",
-                    **self._lease_context(None),
+                    "lease_context": self._lease_context(None),
                 }
-            lease = self._interactive.get(session.interactive_session_id) if session.interactive_session_id is not None else None
-            if session.recovering:
-                return {
-                    "ok": True,
-                    "classification": "SESSION_RECOVERING",
-                    "session": session.to_public_dict(),
-                    "recommended_action": "wait",
-                    **self._lease_context(lease),
-                }
-            lease, post = self._refresh_interactive_locked(session)
-            lease_context = self._lease_context(lease)
-            device = self._devices.get(session.profile.device_by_id)
-            attached_real_path = session.attached_real_path
-            bridge = session.bridge
-            if strict_human_lock and lease is not None and lease.owner.startswith("human:"):
-                result = {
-                    "ok": True,
-                    "classification": "HUMAN_INTERACTIVE_ACTIVE",
-                    "interactive_id": lease.interactive_id,
-                    "session": session.to_public_dict(),
-                    "recommended_action": "wait_or_detach_console",
-                    **lease_context,
-                }
-            elif device is None:
-                result = {
-                    "ok": True,
-                    "classification": "DEVICE_MISSING",
-                    "session": session.to_public_dict(),
-                    "recommended_action": "check_cable_or_bind",
-                    **lease_context,
-                }
-            elif attached_real_path and attached_real_path != device.real_path:
-                result = {
-                    "ok": True,
-                    "classification": "DEVICE_REBOUND_REQUIRED",
-                    "session": session.to_public_dict(),
-                    "attached_real_path": attached_real_path,
-                    "current_real_path": device.real_path,
-                    "recommended_action": "reattach",
-                    **lease_context,
-                }
-            elif bridge is None:
-                result = {
-                    "ok": True,
-                    "classification": "BRIDGE_DOWN",
-                    "session": session.to_public_dict(),
-                    "current_real_path": device.real_path,
-                    "recommended_action": "attach",
-                    **lease_context,
-                }
-            else:
-                snapshot = bridge.snapshot()
-                if not snapshot.get("running") or not snapshot.get("serial_alive"):
+            if released_capture is None:
+                lease = self._interactive.get(session.interactive_session_id) if session.interactive_session_id is not None else None
+                if session.recovering:
+                    return {
+                        "ok": True,
+                        "classification": "SESSION_RECOVERING",
+                        "session": session.to_public_dict(),
+                        "recommended_action": "wait",
+                        **self._lease_context(lease),
+                    }
+                lease, post = self._refresh_interactive_locked(session)
+                lease_context = self._lease_context(lease)
+                device = self._devices.get(session.profile.device_by_id)
+                attached_real_path = session.attached_real_path
+                bridge = session.bridge
+                if strict_human_lock and lease is not None and lease.owner.startswith("human:"):
+                    result = {
+                        "ok": True,
+                        "classification": "HUMAN_INTERACTIVE_ACTIVE",
+                        "interactive_id": lease.interactive_id,
+                        "session": session.to_public_dict(),
+                        "recommended_action": "wait_or_detach_console",
+                        **lease_context,
+                    }
+                elif device is None:
+                    result = {
+                        "ok": True,
+                        "classification": "DEVICE_MISSING",
+                        "session": session.to_public_dict(),
+                        "recommended_action": "check_cable_or_bind",
+                        **lease_context,
+                    }
+                elif attached_real_path and attached_real_path != device.real_path:
+                    result = {
+                        "ok": True,
+                        "classification": "DEVICE_REBOUND_REQUIRED",
+                        "session": session.to_public_dict(),
+                        "attached_real_path": attached_real_path,
+                        "current_real_path": device.real_path,
+                        "recommended_action": "reattach",
+                        **lease_context,
+                    }
+                elif bridge is None:
                     result = {
                         "ok": True,
                         "classification": "BRIDGE_DOWN",
                         "session": session.to_public_dict(),
                         "current_real_path": device.real_path,
-                        "recommended_action": "recover",
-                        **lease_context,
-                    }
-                elif not snapshot.get("vtty_alive"):
-                    result = {
-                        "ok": True,
-                        "classification": "VTTY_STALE",
-                        "session": session.to_public_dict(),
-                        "attached_vtty": snapshot.get("vtty"),
-                        "recommended_action": "console_attach",
-                        **lease_context,
-                    }
-                elif session.state == "ATTACHED":
-                    if session.profile.platform == "passthrough":
-                        classification = "PASSTHROUGH"
-                        recommended_action = "console_attach"
-                        extra: dict[str, Any] = {}
-                    elif session.last_error == "LOGIN_REQUIRED":
-                        classification = "LOGIN_REQUIRED"
-                        recommended_action = "console_attach"
-                        extra = {}
-                    elif session.last_error == "REBOOTING":
-                        classification = "REBOOTING"
-                        recommended_action = "wait_or_console_attach"
-                        extra = {}
-                    else:
-                        # BOOTLOADER detection：讀取 RX tail 並比對 bootloader prompts
-                        rx_tail_raw = bridge.rx_tail(BOOTLOADER_RX_TAIL_BYTES)
-                        rx_tail_evidence = clean_text(rx_tail_raw)
-                        matched = _matches_any_bootloader_prompt(
-                            rx_tail_evidence, session.profile.bootloader_prompts
-                        )
-                        if matched is not None:
-                            classification = "BOOTLOADER"
-                            recommended_action = "recover_interactive"
-                            extra = {"matched_prompt": matched, "rx_tail": rx_tail_evidence}
-                        else:
-                            classification = "ATTACHED_NOT_READY"
-                            recommended_action = "console_attach"
-                            extra = {}
-                    result = {
-                        "ok": True,
-                        "classification": classification,
-                        "session": session.to_public_dict(),
-                        "attached_real_path": attached_real_path,
-                        "current_real_path": device.real_path,
-                        "attached_vtty": snapshot.get("vtty"),
-                        "bridge_generation": session.bridge_generation,
-                        "recommended_action": recommended_action,
-                        **extra,
+                        "recommended_action": "attach",
                         **lease_context,
                     }
                 else:
-                    nonce = uuid.uuid4().hex[:8]
-                    probe = session.profile.ready_probe.replace("${nonce}", nonce)
-                    session.last_probe_at = now_iso()
-                    prompt_regex = session.profile.prompt_regex
-                    bridge_generation = session.bridge_generation
-                    attached_vtty = snapshot.get("vtty")
-                    current_real_path = device.real_path
-                    suspend_human_interactive = lease is not None and lease.owner.startswith("human:")
+                    snapshot = bridge.snapshot()
+                    if not snapshot.get("running") or not snapshot.get("serial_alive"):
+                        result = {
+                            "ok": True,
+                            "classification": "BRIDGE_DOWN",
+                            "session": session.to_public_dict(),
+                            "current_real_path": device.real_path,
+                            "recommended_action": "recover",
+                            **lease_context,
+                        }
+                    elif not snapshot.get("vtty_alive"):
+                        result = {
+                            "ok": True,
+                            "classification": "VTTY_STALE",
+                            "session": session.to_public_dict(),
+                            "attached_vtty": snapshot.get("vtty"),
+                            "recommended_action": "console_attach",
+                            **lease_context,
+                        }
+                    elif session.state == "ATTACHED":
+                        if session.profile.platform == "passthrough":
+                            classification = "PASSTHROUGH"
+                            recommended_action = "console_attach"
+                            extra: dict[str, Any] = {}
+                        elif session.last_error == "LOGIN_REQUIRED":
+                            classification = "LOGIN_REQUIRED"
+                            recommended_action = "console_attach"
+                            extra = {}
+                        elif session.last_error == "REBOOTING":
+                            classification = "REBOOTING"
+                            recommended_action = "wait_or_console_attach"
+                            extra = {}
+                        else:
+                            # BOOTLOADER detection：讀取 RX tail 並比對 bootloader prompts
+                            rx_tail_raw = bridge.rx_tail(BOOTLOADER_RX_TAIL_BYTES)
+                            rx_tail_evidence = clean_text(rx_tail_raw)
+                            matched = _matches_any_bootloader_prompt(
+                                rx_tail_evidence, session.profile.bootloader_prompts
+                            )
+                            if matched is not None:
+                                classification = "BOOTLOADER"
+                                recommended_action = "recover_interactive"
+                                extra = {"matched_prompt": matched, "rx_tail": rx_tail_evidence}
+                            else:
+                                classification = "ATTACHED_NOT_READY"
+                                recommended_action = "console_attach"
+                                extra = {}
+                        result = {
+                            "ok": True,
+                            "classification": classification,
+                            "session": session.to_public_dict(),
+                            "attached_real_path": attached_real_path,
+                            "current_real_path": device.real_path,
+                            "attached_vtty": snapshot.get("vtty"),
+                            "bridge_generation": session.bridge_generation,
+                            "recommended_action": recommended_action,
+                            **extra,
+                            **lease_context,
+                        }
+                    else:
+                        nonce = uuid.uuid4().hex[:8]
+                        probe = session.profile.ready_probe.replace("${nonce}", nonce)
+                        session.last_probe_at = now_iso()
+                        prompt_regex = session.profile.prompt_regex
+                        bridge_generation = session.bridge_generation
+                        attached_vtty = snapshot.get("vtty")
+                        current_real_path = device.real_path
+                        suspend_human_interactive = lease is not None and lease.owner.startswith("human:")
+
+        # I2：RELEASED 早退分支——出 lock 後才掃 /proc，避免阻塞所有 RPC。
+        if released_capture is not None:
+            real_path = released_capture["real_path"]
+            holder = self._probe_external_holder(real_path) if real_path else {"pids": [], "holder": None}
+            reclaimable = not holder["pids"]
+            return {
+                "ok": True,
+                "classification": "RELEASED",
+                "session": released_capture["session"],
+                "released_by": released_capture["released_by"],
+                "released_at": released_capture["released_at"],
+                "reason": released_capture["reason"],
+                "external_holder": holder["pids"] if holder["pids"] else "none",
+                "reclaimable": reclaimable,
+                "recommended_action": "device_attach" if reclaimable else "wait_external_flash",
+                **released_capture["lease_context"],
+            }
 
         post.execute()
         if result is not None:

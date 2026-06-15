@@ -507,3 +507,73 @@ class TestReleasedGuardAttachRecover(_Base):
         self.assertEqual(session.state, "RELEASED")
         self.assertIn(by_id, mgr._released_by_ids)
         self._assert_released_persists(mgr, by_id, profiles)
+
+
+class TestBindSessionReleasedRebind(_Base):
+    """I1：對 RELEASED session 重綁新 by_id 時，舊 by_id 不可永久殘留
+    _released_by_ids，provenance 須清。"""
+
+    def test_rebind_released_clears_old_by_id_and_provenance(self) -> None:
+        old_by_id = "/dev/serial/by-id/orig"
+        new_by_id = "/dev/serial/by-id/new"
+        mgr = self._mgr([self._make_profile("p", "COM0", "lab+1", old_by_id)])
+        session = mgr.get_session("COM0")
+        assert session is not None
+        with mgr._lock:
+            # 新 by_id 不在線 → bind 走 DEVICE_NOT_FOUND 分支，不 spawn
+            mgr._devices = {}
+            mgr._released_by_ids.add(old_by_id)
+            session.state = "RELEASED"
+            session.released_by = "agent:flash"
+            session.released_at = "now"
+            session.released_reason = "flash CC2674"
+
+        resp = mgr.bind_session("COM0", new_by_id)
+        self.assertTrue(resp["ok"])
+        # 重綁後離開 RELEASED：舊 by_id 不得殘留集合、provenance 須清空
+        self.assertNotIn(old_by_id, mgr._released_by_ids)
+        self.assertIsNone(session.released_by)
+        self.assertIsNone(session.released_at)
+        self.assertIsNone(session.released_reason)
+        self.assertEqual(session.profile.device_by_id, new_by_id)
+
+
+class TestSelfTestReleasedLockHygiene(_Base):
+    """I2：self_test 的 RELEASED 早退分支不得在持 self._lock 內掃 /proc
+    （_probe_external_holder 會阻塞所有 RPC）。"""
+
+    def test_probe_external_holder_runs_outside_lock(self) -> None:
+        by_id = "/dev/serial/by-id/orig"
+        mgr = self._mgr([self._make_profile("p", "COM0", "lab+1", by_id)])
+        session = mgr.get_session("COM0")
+        assert session is not None
+        with mgr._lock:
+            mgr._devices = {by_id: DeviceInfo(by_id=by_id, real_path="/dev/ttyUSB0")}
+            session.state = "RELEASED"
+            session.released_by = "agent:flash"
+            session.released_at = "now"
+            session.released_reason = "flash CC2674"
+
+        lock_free_during_probe = {"ok": False}
+
+        def _probe_checks_lock(real_path, **kw):
+            # 從另一執行緒非阻塞嘗試取得 _lock：若 self_test 仍持 lock，
+            # 不同執行緒的 non-blocking acquire 會失敗（RLock 僅同執行緒可重入）。
+            def _try():
+                got = mgr._lock.acquire(blocking=False)
+                if got:
+                    lock_free_during_probe["ok"] = True
+                    mgr._lock.release()
+            t = threading.Thread(target=_try)
+            t.start()
+            t.join()
+            return {"pids": [], "holder": None}
+
+        mgr._probe_external_holder = _probe_checks_lock
+        resp = mgr.self_test("COM0")
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["classification"], "RELEASED")
+        self.assertTrue(
+            lock_free_during_probe["ok"],
+            "_probe_external_holder 在持 self._lock 內被呼叫（會阻塞所有 RPC）",
+        )
