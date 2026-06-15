@@ -6,7 +6,7 @@
 
 ### Added
 
-- 新增 device release / handoff 設計文件 `docs/superpowers/specs/2026-06-15-device-release-handoff-design.md`（#54：daemon 持續運作下把單一 device 交給外部 flasher、燒完手動收回的 surgical release 機制設計；尚未實作）
+- 新增 device release / handoff 設計文件 `docs/superpowers/specs/2026-06-15-device-release-handoff-design.md` 與 OpenSpec change `openspec/changes/device-release-handoff/`（proposal/design/specs/tasks）（#54：daemon 持續運作下把單一 device 交給外部 flasher、燒完手動收回的 surgical release 機制設計；尚未實作）
 
 ### Changed
 
