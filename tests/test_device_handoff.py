@@ -326,3 +326,19 @@ class TestDeviceRpc(_Base):
         resp = svc.rpc("device.release", {})
         self.assertFalse(resp["ok"])
         self.assertEqual(resp["error_code"], "INVALID_ARGS")
+
+
+class TestDeviceCli(_Base):
+    def test_cli_parses_release_and_attach(self) -> None:
+        from sw_core.cli import build_parser
+        parser = build_parser()
+        a = parser.parse_args(["device", "release", "--selector", "COM0", "--source", "agent:x", "--reason", "flash"])
+        self.assertEqual(a.device_cmd, "release")
+        self.assertEqual(a.selector, "COM0")
+        self.assertEqual(a.source, "agent:x")
+        self.assertEqual(a.reason, "flash")
+        b = parser.parse_args(["device", "attach", "--selector", "COM0", "--force"])
+        self.assertEqual(b.device_cmd, "attach")
+        self.assertTrue(b.force)
+        c = parser.parse_args(["device", "list"])
+        self.assertEqual(c.device_cmd, "list")
