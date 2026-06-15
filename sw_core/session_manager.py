@@ -170,6 +170,10 @@ class SessionRuntime:
     last_probe_at: str | None = None
     last_rx_mono: float = 0.0
     last_tx_mono: float = 0.0
+    # device handoff（issue #54）
+    released_by: str | None = None
+    released_at: str | None = None
+    released_reason: str | None = None
     # recovery lease stash（Phase B issue #44）
     _stashed_human_lease: InteractiveLease | None = dataclasses.field(default=None, repr=False)
     _state: str = dataclasses.field(default="DETACHED", init=False, repr=False)
@@ -273,6 +277,8 @@ class SessionManager:
         self._devices: dict[str, DeviceInfo] = {}
         self._binding_overrides: dict[str, str] = {}
         self._attach_inflight: set[str] = set()
+        self._released_by_ids: set[str] = set()
+        self._loaded_released: dict[str, dict[str, str | None]] = {}
         self._background: dict[str, BackgroundCapture] = {}
         self._interactive: dict[str, InteractiveLease] = {}
         self._capture_fps: dict[str, Any] = {}  # capture_id → open file object
