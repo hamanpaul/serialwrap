@@ -542,6 +542,27 @@ class SessionManager:
             self._spawn_attach(by_id)
         return {"ok": True, "session": session.to_public_dict()}
 
+    def release_device(self, selector: str, *, source: str = "cli", reason: str | None = None) -> dict[str, Any]:
+        with self._lock:
+            session = self.get_session(selector)
+            if session is None:
+                return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            if session.state == "RELEASED":
+                return {"ok": True, "already_released": True, "session": session.to_public_dict()}
+            by_id = session.profile.device_by_id
+            closed_consoles = len(session.bridge.list_consoles()) if session.bridge is not None else 0
+            aborted_cmd = session.foreground_busy
+            self._detach_session_locked(session, reason="RELEASED", drop_consoles=True)
+            session.state = "RELEASED"
+            session.released_by = source
+            session.released_at = now_iso()
+            session.released_reason = reason
+            if by_id:
+                self._released_by_ids.add(by_id)
+            public = session.to_public_dict()
+        self._save_state()
+        return {"ok": True, "session": public, "closed_consoles": closed_consoles, "aborted_cmd": aborted_cmd}
+
     def bind_session(self, selector: str, device_by_id: str) -> dict[str, Any]:
         device_by_id = device_by_id.strip()
         if not device_by_id:

@@ -111,3 +111,47 @@ class TestClearSessionReleasedGuard(_Base):
         self.assertTrue(resp.get("released"))
         self.assertEqual(session.state, "RELEASED")
         spawn_attach.assert_not_called()
+
+
+class TestReleaseDevice(_Base):
+    def test_release_clean_slate_and_provenance(self) -> None:
+        by_id = "/dev/serial/by-id/orig"
+        mgr = self._mgr([self._make_profile("p", "COM0", "lab+1", by_id)])
+        session = mgr.get_session("COM0")
+        assert session is not None
+        bridge = mock.MagicMock()
+        bridge.stop.return_value = None
+        bridge.list_consoles.return_value = [{"client_id": "c1"}]
+        session.bridge = bridge
+        session.state = "READY"
+        with mgr._lock:
+            mgr._devices = {by_id: DeviceInfo(by_id=by_id, real_path="/dev/ttyUSB0")}
+
+        resp = mgr.release_device("COM0", source="agent:flash", reason="flash CC2674")
+
+        self.assertTrue(resp["ok"])
+        self.assertEqual(session.state, "RELEASED")
+        self.assertEqual(session.released_by, "agent:flash")
+        self.assertIsNotNone(session.released_at)
+        self.assertEqual(session.released_reason, "flash CC2674")
+        self.assertIn(by_id, mgr._released_by_ids)
+        self.assertIsNone(session.retained_consoles)
+        bridge.stop.assert_called_once_with(preserve_consoles=False)
+
+    def test_release_idempotent(self) -> None:
+        by_id = "/dev/serial/by-id/orig"
+        mgr = self._mgr([self._make_profile("p", "COM0", "lab+1", by_id)])
+        session = mgr.get_session("COM0")
+        assert session is not None
+        with mgr._lock:
+            session.state = "RELEASED"
+            mgr._released_by_ids.add(by_id)
+        resp = mgr.release_device("COM0")
+        self.assertTrue(resp["ok"])
+        self.assertTrue(resp.get("already_released"))
+
+    def test_release_session_not_found(self) -> None:
+        mgr = self._mgr([self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")])
+        resp = mgr.release_device("COM9")
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error_code"], "SESSION_NOT_FOUND")
