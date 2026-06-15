@@ -87,7 +87,13 @@ RELEASED       --(USB 重插/重啟/clear/recover)--> RELEASED（一律略過自
       self._attach_inflight.add(by_id)
   ```
 
-一處 guard 涵蓋全部 re-attach 路徑 —— 把目前 placeholder workaround 在 hack 的事正規化。
+`_spawn_attach` guard 涵蓋大多數自動 re-attach —— 把目前 placeholder workaround 在 hack 的事正規化。
+
+> 實作補強（對抗測試發現）：除 `_spawn_attach` 外，另有兩個前置點需同步略過 RELEASED，否則仍會破壞 released 狀態：
+> - `_detach_by_id`（`update_devices` 偵測 USB realpath 變動時會先 detach 再 `_spawn_attach`）：targets 過濾加 `s.state != "RELEASED"`，避免 RELEASED session 被強制打回 DETACHED。
+> - `clear_session`：對 RELEASED 早退（不 detach、不 re-attach），保留 RELEASED。
+>
+> 故實際 guard 點為三處（`_spawn_attach` + `_detach_by_id` + `clear_session` 早退），source of truth 仍是 session 的 `RELEASED` 狀態與 `_released_by_ids`。
 
 ## 6. 持久化（跨 daemon 重啟）
 
