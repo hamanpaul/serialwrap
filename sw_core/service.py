@@ -284,6 +284,20 @@ class SerialwrapService:
         if method == "device.list":
             return {"ok": True, "devices": self._sessions.list_devices()}
 
+        if method == "device.release":
+            selector = str(params.get("selector") or "")
+            if not selector:
+                return {"ok": False, "error_code": "INVALID_ARGS"}
+            source = str(params.get("source") or "cli")
+            reason = params.get("reason")
+            return self._sessions.release_device(selector, source=source, reason=reason)
+
+        if method == "device.attach":
+            selector = str(params.get("selector") or "")
+            if not selector:
+                return {"ok": False, "error_code": "INVALID_ARGS"}
+            return self._sessions.attach_device(selector, force=bool(params.get("force")))
+
         if method == "session.list":
             return {"ok": True, "sessions": self._sessions.list_sessions()}
 

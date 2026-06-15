@@ -300,3 +300,29 @@ class TestSelfTestReleased(_Base):
         pub = mgr.get_session("COM0").to_public_dict()
         self.assertEqual(pub["released_by"], "agent:flash")
         self.assertEqual(pub["released_at"], "now")
+
+
+class TestDeviceRpc(_Base):
+    def _service(self):
+        from sw_core.service import SerialwrapService
+        profiles = [self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")]
+        return SerialwrapService(profiles)
+
+    def test_rpc_release_and_attach_dispatch(self) -> None:
+        svc = self._service()
+        svc._sessions.release_device = mock.MagicMock(return_value={"ok": True})
+        svc._sessions.attach_device = mock.MagicMock(return_value={"ok": True})
+
+        r1 = svc.rpc("device.release", {"selector": "COM0", "source": "agent:x", "reason": "flash"})
+        self.assertTrue(r1["ok"])
+        svc._sessions.release_device.assert_called_once_with("COM0", source="agent:x", reason="flash")
+
+        r2 = svc.rpc("device.attach", {"selector": "COM0", "force": True})
+        self.assertTrue(r2["ok"])
+        svc._sessions.attach_device.assert_called_once_with("COM0", force=True)
+
+    def test_rpc_release_requires_selector(self) -> None:
+        svc = self._service()
+        resp = svc.rpc("device.release", {})
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error_code"], "INVALID_ARGS")
