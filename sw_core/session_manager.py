@@ -796,7 +796,10 @@ class SessionManager:
 
     def _detach_by_id(self, by_id: str, *, reason: str) -> None:
         with self._lock:
-            targets = [s for s in self._sessions.values() if s.profile.device_by_id == by_id]
+            targets = [
+                s for s in self._sessions.values()
+                if s.profile.device_by_id == by_id and s.state != "RELEASED"
+            ]
             for session in targets:
                 self._detach_session_locked(session, reason=reason)
 

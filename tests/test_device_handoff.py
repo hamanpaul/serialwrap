@@ -342,3 +342,41 @@ class TestDeviceCli(_Base):
         self.assertTrue(b.force)
         c = parser.parse_args(["device", "list"])
         self.assertEqual(c.device_cmd, "list")
+
+
+import threading
+
+
+class TestAdversarial(_Base):
+    def test_update_devices_does_not_steal_released(self) -> None:
+        by_id = "/dev/serial/by-id/orig"
+        mgr = self._mgr([self._make_profile("p", "COM0", "lab+1", by_id)])
+        session = mgr.get_session("COM0")
+        bridge = mock.MagicMock(); bridge.stop.return_value = None; bridge.list_consoles.return_value = []
+        session.bridge = bridge; session.state = "READY"
+        with mgr._lock:
+            mgr._devices = {by_id: DeviceInfo(by_id=by_id, real_path="/dev/ttyUSB0")}
+        mgr.release_device("COM0")
+        with mock.patch.object(mgr, "_attach_by_id") as attach_by_id:
+            # USB realpath 變動（重插）
+            mgr.update_devices({by_id: DeviceInfo(by_id=by_id, real_path="/dev/ttyUSB3")})
+            time.sleep(0.1)
+        attach_by_id.assert_not_called()
+        self.assertEqual(session.state, "RELEASED")
+
+    def test_concurrent_clear_and_attach_keep_invariant(self) -> None:
+        by_id = "/dev/serial/by-id/orig"
+        mgr = self._mgr([self._make_profile("p", "COM0", "lab+1", by_id)])
+        session = mgr.get_session("COM0")
+        bridge = mock.MagicMock(); bridge.stop.return_value = None; bridge.list_consoles.return_value = []
+        session.bridge = bridge; session.state = "READY"
+        with mgr._lock:
+            mgr._devices = {by_id: DeviceInfo(by_id=by_id, real_path="/dev/ttyUSB0")}
+        mgr.release_device("COM0")
+        with mock.patch.object(mgr, "_spawn_attach"):
+            threads = [threading.Thread(target=mgr.clear_session, args=("COM0",)) for _ in range(8)]
+            for t in threads: t.start()
+            for t in threads: t.join()
+        # released 不變、集合不漂移
+        self.assertEqual(session.state, "RELEASED")
+        self.assertIn(by_id, mgr._released_by_ids)
