@@ -956,6 +956,9 @@ class SessionManager:
                 return
             if session.bridge is not None or session.profile.device_by_id != by_id:
                 return
+            # C1 早退：release 早於 attach 開 FD 時，根本不啟動（常見情形不開 FD）。
+            if session.state == "RELEASED" or by_id in self._released_by_ids:
+                return
             session.state = "ATTACHING"
             session.last_error = None
             gen_before = session.bridge_generation
@@ -1010,6 +1013,13 @@ class SessionManager:
 
             notify_ready = False
             with self._lock:
+                # C1 backstop：release 落在 attach 飛行窗口（bridge.start()+probe 耗時）內時，
+                # 關掉剛開的 FD（clean slate），但**保留 RELEASED**——不可打回 DETACHED。
+                if session.state == "RELEASED" or by_id in self._released_by_ids:
+                    bridge.stop(preserve_consoles=False)
+                    session.bridge = None
+                    session.attached_real_path = None
+                    return
                 current = self._devices.get(by_id)
                 if current is None or current.real_path != real_path or session.state == "DETACHED" or session.bridge_generation != gen_before:
                     preserved = bridge.stop(preserve_consoles=True)
@@ -1113,6 +1123,9 @@ class SessionManager:
             dev = self._devices.get(by_id)
             if dev is None:
                 return
+            # C1 早退（dynamic 版）：release 早於 attach 開 FD 時不啟動。
+            if session.state == "RELEASED" or by_id in self._released_by_ids:
+                return
             real_path = dev.real_path
             session.state = "ATTACHING"
             session.last_error = None
@@ -1157,6 +1170,13 @@ class SessionManager:
 
             notify_ready = False
             with self._lock:
+                # C1 backstop（dynamic 版）：release 落在飛行窗口內 → 關 FD、保留 RELEASED。
+                if session.state == "RELEASED" or by_id in self._released_by_ids:
+                    bridge.stop(preserve_consoles=False)
+                    session.bridge = None
+                    session.vtty_path = None
+                    session.attached_real_path = None
+                    return
                 current = self._devices.get(by_id)
                 if current is None or current.real_path != real_path or session.state == "DETACHED" or session.bridge_generation != gen_before:
                     bridge.stop()

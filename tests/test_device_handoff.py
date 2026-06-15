@@ -380,3 +380,77 @@ class TestAdversarial(_Base):
         # released 不變、集合不漂移
         self.assertEqual(session.state, "RELEASED")
         self.assertIn(by_id, mgr._released_by_ids)
+
+
+class TestAttachByIdReleasedBackstop(_Base):
+    """C1：飛行中的 attach 在 probe 窗口期間遇到 release，
+    最終 commit 區必須 RELEASED backstop（關掉剛開的 FD、不打回非 RELEASED）。
+    嚴禁 mock 掉被測的 attach commit 路徑——只 mock UARTBridge（避免開真 FD）
+    與 probe_ready（人為製造 probe 窗口阻塞）。"""
+
+    def _no_login_profile(self, com: str, by_id: str) -> SessionProfile:
+        # login_regex="" → _attach_by_id 走最單純的 probe_ready 分支
+        return SessionProfile(
+            profile_name="p", com=com, act_no=1, alias="lab+1",
+            device_by_id=by_id, platform="prpl", login_regex="",
+            uart=UartProfile(),
+        )
+
+    def test_inflight_attach_aborts_on_release_and_closes_fd(self) -> None:
+        by_id = "/dev/serial/by-id/orig"
+        mgr = self._mgr([self._no_login_profile("COM0", by_id)])
+        session = mgr.get_session("COM0")
+        assert session is not None
+        with mgr._lock:
+            mgr._devices = {by_id: DeviceInfo(by_id=by_id, real_path="/dev/ttyUSB0")}
+
+        in_probe = threading.Event()
+        release_done = threading.Event()
+
+        def _blocking_probe(bridge, profile, *a, **kw):
+            # 進入 probe 窗口 → 通知主執行緒 → 等 release 完成後才回頭 commit
+            in_probe.set()
+            assert release_done.wait(timeout=5.0)
+            return True, None
+
+        with mock.patch("sw_core.session_manager.UARTBridge") as bridge_cls, \
+             mock.patch("sw_core.session_manager.probe_ready", side_effect=_blocking_probe):
+            bridge_cls.return_value.stop.return_value = None
+            bridge_cls.return_value.vtty_path = "/dev/pts/9"
+
+            t = threading.Thread(target=mgr._attach_by_id, args=(by_id,))
+            t.start()
+            assert in_probe.wait(timeout=5.0), "attach 未進入 probe 窗口"
+
+            # release 落在 attach 飛行窗口內
+            resp = mgr.release_device("COM0", source="agent:flash", reason="flash")
+            self.assertTrue(resp["ok"])
+
+            release_done.set()
+            t.join(timeout=5.0)
+            self.assertFalse(t.is_alive(), "attach thread 未結束")
+
+            # backstop：RELEASED 不被打回、FD 被關、集合一致
+            self.assertEqual(session.state, "RELEASED")
+            self.assertIsNone(session.bridge)
+            self.assertIsNone(session.attached_real_path)
+            self.assertIn(by_id, mgr._released_by_ids)
+            bridge_cls.return_value.stop.assert_called_with(preserve_consoles=False)
+
+    def test_attach_by_id_early_returns_when_already_released(self) -> None:
+        by_id = "/dev/serial/by-id/orig"
+        mgr = self._mgr([self._no_login_profile("COM0", by_id)])
+        session = mgr.get_session("COM0")
+        assert session is not None
+        with mgr._lock:
+            mgr._devices = {by_id: DeviceInfo(by_id=by_id, real_path="/dev/ttyUSB0")}
+            mgr._released_by_ids.add(by_id)
+            session.state = "RELEASED"
+
+        with mock.patch("sw_core.session_manager.UARTBridge") as bridge_cls:
+            mgr._attach_by_id(by_id)
+        # 早退：根本不應實例化 bridge（不開 FD），state 仍 RELEASED
+        bridge_cls.assert_not_called()
+        self.assertEqual(session.state, "RELEASED")
+        self.assertIsNone(session.bridge)
+        self.assertIn(by_id, mgr._released_by_ids)
