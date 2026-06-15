@@ -17,3 +17,6 @@ htmlcov/
 .coverage
 *.log
 *.tmp
+
+# 本機憑證 profile（真值不提交；範本見 profiles/*.env.example）
+profiles/*.env
