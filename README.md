@@ -510,6 +510,21 @@ serialwrap file pull --selector COM0 --remote /etc/config/wireless --local ./wir
 
 詳見設計文件：[`docs/design-file-transfer.md`](./docs/design-file-transfer.md)。
 
+## MCU 韌體升級：device handoff
+
+serialwrap 持有 UART 時，外部 flasher（如 `ocp-mcu-upgrade`）無法獨佔 raw device。
+先把裝置交出去、燒完再收回：
+
+```bash
+serialwrap device release --selector COM0 --source agent:flash --reason "flash CC2674"
+# serialwrap 關閉該 UART、清空 console，且不會自動搶回
+ocp-mcu-upgrade -d /dev/ttyUSB1 -b 115200 -t 8 -e -s -i fw.bin
+serialwrap device attach --selector COM0   # 收回；外部仍持有時回 DEVICE_STILL_HELD，--force 可強制
+```
+
+`serialwrap session self-test --selector COM0` 在 RELEASED 下會回 `external_holder` /
+`reclaimable` / `recommended_action`（`wait_external_flash` 或 `device_attach`）。
+
 ## 多 minicom 使用
 
 `minicom_router.sh` 會：

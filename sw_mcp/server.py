@@ -21,6 +21,8 @@ _TOOL_MAP = {
     "serialwrap_self_test": "session.self_test",
     "serialwrap_recover_session": "session.recover",
     "serialwrap_list_devices": "device.list",
+    "serialwrap_release_device": "device.release",
+    "serialwrap_attach_device": "device.attach",
     "serialwrap_list_sessions": "session.list",
     "serialwrap_submit_command": "command.submit",
     "serialwrap_tail_command_result": "command.result_tail",
@@ -85,6 +87,18 @@ _TOOL_DEFS: list[dict[str, Any]] = [
     _td("serialwrap_get_health", "取得 daemon 完整健康狀態"),
     # ── device ────────────────────────────────────────────────
     _td("serialwrap_list_devices", "列出所有偵測到的 serial 裝置"),
+    _td(
+        "serialwrap_release_device",
+        "把 session 綁定的 UART 乾淨交給外部 flasher（RELEASED 狀態），serialwrap 不再自動搶回",
+        {"selector": _STR, "source": _STR, "reason": _STR},
+        ["selector"],
+    ),
+    _td(
+        "serialwrap_attach_device",
+        "收回先前 released 的 UART；外部仍持有時回 DEVICE_STILL_HELD，force=true 可略過持有者檢查",
+        {"selector": _STR, "force": _BOOL},
+        ["selector"],
+    ),
     # ── session 管理 ──────────────────────────────────────────
     _td("serialwrap_list_sessions", "列出所有 session"),
     _td(

@@ -270,7 +270,16 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_sub.add_parser("stop")
     daemon_sub.add_parser("status")
 
-    sub.add_parser("device").add_subparsers(dest="device_cmd", required=True).add_parser("list")
+    p_device = sub.add_parser("device")
+    device_sub = p_device.add_subparsers(dest="device_cmd", required=True)
+    device_sub.add_parser("list")
+    p_drel = device_sub.add_parser("release")
+    p_drel.add_argument("--selector", required=True)
+    p_drel.add_argument("--source", default="cli")
+    p_drel.add_argument("--reason", default=None)
+    p_datt = device_sub.add_parser("attach")
+    p_datt.add_argument("--selector", required=True)
+    p_datt.add_argument("--force", action="store_true")
 
     p_session = sub.add_parser("session")
     sess_sub = p_session.add_subparsers(dest="session_cmd", required=True)
@@ -462,8 +471,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.daemon_cmd == "status":
             return _run_rpc(args, "health.status", {})
 
-    if args.cmd == "device" and args.device_cmd == "list":
-        return _run_rpc(args, "device.list", {})
+    if args.cmd == "device":
+        if args.device_cmd == "list":
+            return _run_rpc(args, "device.list", {})
+        if args.device_cmd == "release":
+            return _run_rpc(args, "device.release", {"selector": args.selector, "source": args.source, "reason": args.reason})
+        if args.device_cmd == "attach":
+            return _run_rpc(args, "device.attach", {"selector": args.selector, "force": args.force})
 
     if args.cmd == "session":
         if args.session_cmd == "list":

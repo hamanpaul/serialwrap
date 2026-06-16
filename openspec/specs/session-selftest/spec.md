@@ -1,9 +1,7 @@
 ## Purpose
 
 定義 `session.self_test` readiness 分類、human interactive context 欄位，以及 Issue #44 bootloader recovery 所需的 BOOTLOADER 分類與 profile schema。
-
 ## Requirements
-
 ### Requirement: self_test SHALL evaluate full readiness regardless of human lease by default
 
 `SessionManager.self_test` 在預設模式下（`strict_human_lock=False`）SHALL 執行完整的 readiness 判斷順序：session 存在 → recovering 檢查 → device by-id 存在 → attached_real_path 一致 → bridge / vtty alive → ATTACHED 子狀態判斷 → `ready_probe` 寫入並等 nonce + prompt。human interactive lease 的存在 SHALL NOT 在預設模式下中斷此流程。
@@ -149,3 +147,29 @@ profile 載入流程 SHALL 接受可選 YAML 欄位 `bootloader_prompts: list[st
 
 - **WHEN** profile YAML 含 `bootloader_prompts: ["^=> $", "^Marvell>> $"]`
 - **THEN** profile 載入成功、`profile.bootloader_prompts == ("^=> $", "^Marvell>> $")`
+
+### Requirement: self_test SHALL 回報 RELEASED handoff 狀態與可收回性
+
+當 session 處於 `RELEASED` 狀態，`SessionManager.self_test` SHALL 在 result 中加入 handoff
+provenance 與唯讀偵測結果：
+- `released_by` / `released_at` / `reason` — release 來源、時間、原因。
+- `external_holder` — 唯讀偵測（讀 `/proc` 或 `lsof`，**不開 tty、不碰 I/O**）所得的外部持有者
+  pid 清單；無持有者時為 `none`／空。
+- `reclaimable` — 當無外部持有者時為 `true`，否則 `false`。
+- `recommended_action` — 有持有者時為 `wait_external_flash`；無持有者時為 `device_attach`。
+
+唯讀偵測 SHALL NOT 對 raw device 進行任何開啟或讀寫，以免干擾外部燒錄。
+
+#### Scenario: RELEASED 且外部仍在燒錄
+
+- **WHEN** session 為 `RELEASED`，唯讀偵測顯示外部 process（如 flasher）仍持有該裝置
+- **AND** caller 呼叫 `session.self_test`
+- **THEN** result 含 `external_holder` 為非空 pid 清單、`reclaimable=false`、`recommended_action="wait_external_flash"`
+- **AND** result 含 `released_by` / `released_at`
+
+#### Scenario: RELEASED 且外部已結束（可安全收回）
+
+- **WHEN** session 為 `RELEASED`，唯讀偵測顯示已無外部持有者
+- **AND** caller 呼叫 `session.self_test`
+- **THEN** result 含 `external_holder` 為 `none`／空、`reclaimable=true`、`recommended_action="device_attach"`
+

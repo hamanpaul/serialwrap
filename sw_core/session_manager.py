@@ -170,6 +170,10 @@ class SessionRuntime:
     last_probe_at: str | None = None
     last_rx_mono: float = 0.0
     last_tx_mono: float = 0.0
+    # device handoff（issue #54）
+    released_by: str | None = None
+    released_at: str | None = None
+    released_reason: str | None = None
     # recovery lease stash（Phase B issue #44）
     _stashed_human_lease: InteractiveLease | None = dataclasses.field(default=None, repr=False)
     _state: str = dataclasses.field(default="DETACHED", init=False, repr=False)
@@ -240,6 +244,9 @@ class SessionRuntime:
             "idle_for_ms": self.compute_idle_ms(),
             "outstanding_commands": outstanding,
             "activity_classification": self.classify_activity(),
+            "released_by": self.released_by,
+            "released_at": self.released_at,
+            "released_reason": self.released_reason,
             "capture": {
                 "capture_id": self.active_capture.capture_id,
                 "log_path": self.active_capture.log_path,
@@ -273,6 +280,8 @@ class SessionManager:
         self._devices: dict[str, DeviceInfo] = {}
         self._binding_overrides: dict[str, str] = {}
         self._attach_inflight: set[str] = set()
+        self._released_by_ids: set[str] = set()
+        self._loaded_released: dict[str, dict[str, str | None]] = {}
         self._background: dict[str, BackgroundCapture] = {}
         self._interactive: dict[str, InteractiveLease] = {}
         self._capture_fps: dict[str, Any] = {}  # capture_id → open file object
@@ -289,6 +298,13 @@ class SessionManager:
             if sid not in self._sessions:
                 self._sessions[sid] = SessionRuntime(session_id=sid, profile=profile)
             self._aliases.set_for_session(sid, profile.alias)
+        for sid, meta in self._loaded_released.items():
+            s = self._sessions.get(sid)
+            if s is not None:
+                s.state = "RELEASED"
+                s.released_by = meta.get("released_by")
+                s.released_at = meta.get("released_at")
+                s.released_reason = meta.get("reason")
         self._save_state()
 
     def _load_state(self) -> None:
@@ -309,12 +325,37 @@ class SessionManager:
                 if isinstance(sid, str) and isinstance(by_id, str) and sid.strip() and by_id.strip():
                     normalized[sid.strip()] = by_id.strip()
             self._binding_overrides = normalized
+        released = obj.get("released") if isinstance(obj, dict) else None
+        if isinstance(released, dict):
+            loaded: dict[str, dict[str, str | None]] = {}
+            for sid, meta in released.items():
+                if not isinstance(sid, str) or not isinstance(meta, dict):
+                    continue
+                by_id = meta.get("by_id")
+                loaded[sid] = {
+                    "by_id": by_id,
+                    "released_by": meta.get("released_by"),
+                    "released_at": meta.get("released_at"),
+                    "reason": meta.get("reason"),
+                }
+                if isinstance(by_id, str) and by_id:
+                    self._released_by_ids.add(by_id)
+            self._loaded_released = loaded
 
     def _save_state(self) -> None:
         os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+        released: dict[str, dict[str, str | None]] = {}
+        for sid, s in self._sessions.items():
+            if s.state == "RELEASED":
+                released[sid] = {
+                    "by_id": s.profile.device_by_id,
+                    "released_by": s.released_by,
+                    "released_at": s.released_at,
+                    "reason": s.released_reason,
+                }
         with open(STATE_PATH, "w", encoding="utf-8") as fp:
             json.dump(
-                {"aliases": self._aliases.dump(), "bindings": dict(self._binding_overrides)},
+                {"aliases": self._aliases.dump(), "bindings": dict(self._binding_overrides), "released": released},
                 fp,
                 ensure_ascii=False,
                 sort_keys=True,
@@ -476,7 +517,7 @@ class SessionManager:
                 timeout_s=timeout_s or max(session.profile.hard_timeout_s, _ATTACHED_CONSOLE_LEASE_TIMEOUT_S),
             )
 
-    def _detach_session_locked(self, session: SessionRuntime, *, reason: str) -> None:
+    def _detach_session_locked(self, session: SessionRuntime, *, reason: str, drop_consoles: bool = False) -> None:
         preserved = session.retained_consoles
         retained_human_owner = session.retained_human_owner
         retained_human_timeout_s = session.retained_human_timeout_s
@@ -486,8 +527,13 @@ class SessionManager:
                 retained_human_owner = lease.owner
                 retained_human_timeout_s = lease.timeout_s
         if session.bridge is not None:
-            preserved = session.bridge.stop(preserve_consoles=True)
+            preserved = session.bridge.stop(preserve_consoles=not drop_consoles)
             session.bridge = None
+        if drop_consoles:
+            preserved = None
+            retained_human_owner = None
+            retained_human_timeout_s = None
+            session.retained_consoles = None
         self._store_retained_consoles_locked(
             session,
             preserved,
@@ -518,6 +564,8 @@ class SessionManager:
             session = self.get_session(selector)
             if session is None:
                 return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            if session.state == "RELEASED" or session.profile.device_by_id in self._released_by_ids:
+                return {"ok": True, "released": True, "session": session.to_public_dict()}
             self._detach_session_locked(session, reason="CLEARED")
             by_id = session.profile.device_by_id
             has_device = bool(by_id and by_id in self._devices)
@@ -528,6 +576,104 @@ class SessionManager:
         if has_device and by_id is not None:
             self._spawn_attach(by_id)
         return {"ok": True, "session": session.to_public_dict()}
+
+    def release_device(self, selector: str, *, source: str = "cli", reason: str | None = None) -> dict[str, Any]:
+        with self._lock:
+            session = self.get_session(selector)
+            if session is None:
+                return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            if session.state == "RELEASED":
+                return {"ok": True, "already_released": True, "session": session.to_public_dict()}
+            by_id = session.profile.device_by_id
+            closed_consoles = len(session.bridge.list_consoles()) if session.bridge is not None else 0
+            aborted_cmd = session.foreground_busy
+            self._detach_session_locked(session, reason="RELEASED", drop_consoles=True)
+            session.state = "RELEASED"
+            session.released_by = source
+            session.released_at = now_iso()
+            session.released_reason = reason
+            if by_id:
+                self._released_by_ids.add(by_id)
+            public = session.to_public_dict()
+        self._save_state()
+        return {"ok": True, "session": public, "closed_consoles": closed_consoles, "aborted_cmd": aborted_cmd}
+
+    def _probe_external_holder(self, real_path: str, *, _proc_root: str = "/proc") -> dict[str, Any]:
+        """唯讀偵測 real_path 是否被其他 process 持有；讀 _proc_root/*/fd，不開 tty、不做 I/O。"""
+        my_pid = os.getpid()
+        try:
+            target = os.path.realpath(real_path)
+        except OSError:
+            target = real_path
+        try:
+            target_rdev = os.stat(real_path).st_rdev
+        except OSError:
+            target_rdev = 0
+        holders: set[int] = set()
+        try:
+            entries = os.listdir(_proc_root)
+        except OSError:
+            return {"pids": [], "holder": None}
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            if pid == my_pid:
+                continue
+            fd_dir = os.path.join(_proc_root, entry, "fd")
+            try:
+                fds = os.listdir(fd_dir)
+            except OSError:
+                continue
+            for fd in fds:
+                fd_path = os.path.join(fd_dir, fd)
+                try:
+                    link = os.readlink(fd_path)
+                except OSError:
+                    continue
+                matched = link == target or link == real_path
+                # 即使外部以 by-id / 其他 symlink 開啟，也以 device number(st_rdev)
+                # 比對同一個 char device，避免漏判導致 attach 誤判可收回、重回 two-reader race。
+                if not matched and target_rdev:
+                    try:
+                        if os.stat(fd_path).st_rdev == target_rdev:
+                            matched = True
+                    except OSError:
+                        pass
+                if matched:
+                    holders.add(pid)
+                    break
+        ordered = sorted(holders)
+        return {"pids": ordered, "holder": (ordered[0] if ordered else None)}
+
+    def attach_device(self, selector: str, *, force: bool = False) -> dict[str, Any]:
+        with self._lock:
+            session = self.get_session(selector)
+            if session is None:
+                return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            by_id = session.profile.device_by_id
+            # 冪等：session 已 attached（有 bridge）且非 RELEASED → 直接回覆，不要改 state。
+            # 否則會被設成 ATTACHING，但 _attach_by_id 因 bridge 已存在而早退，卡在 ATTACHING。
+            if session.bridge is not None and session.state != "RELEASED" and by_id not in self._released_by_ids:
+                return {"ok": True, "already_attached": True, "session": session.to_public_dict()}
+            if not by_id or by_id not in self._devices:
+                return {"ok": False, "error_code": "DEVICE_NOT_PRESENT", "selector": selector, "device_by_id": by_id}
+            real_path = self._devices[by_id].real_path
+        if not force:
+            holder = self._probe_external_holder(real_path)
+            if holder["pids"]:
+                return {"ok": False, "error_code": "DEVICE_STILL_HELD", "pids": holder["pids"], "selector": selector}
+        with self._lock:
+            self._released_by_ids.discard(by_id)
+            session.released_by = None
+            session.released_at = None
+            session.released_reason = None
+            session.state = "ATTACHING"
+            session.last_error = None
+            public = session.to_public_dict()
+        self._save_state()
+        self._spawn_attach(by_id)
+        return {"ok": True, "session": public}
 
     def bind_session(self, selector: str, device_by_id: str) -> dict[str, Any]:
         device_by_id = device_by_id.strip()
@@ -555,6 +701,18 @@ class SessionManager:
                 return {"ok": True, "already_bound": True, "session": session.to_public_dict()}
             if session.bridge is not None:
                 self._detach_session_locked(session, reason="REBOUND")
+            # I1：對 RELEASED session 重綁新 by_id 屬明確覆寫（離開 RELEASED）——
+            # 須把舊 by_id 移出 _released_by_ids、清 provenance，並把 state 移出 RELEASED，
+            # 否則下方 _save_state 會以新 by_id、released_by=None 寫入半殘 released entry，
+            # 導致 daemon 重啟後 session 被復活成 RELEASED、永遠無法 attach。
+            if session.state == "RELEASED":
+                old_by_id = session.profile.device_by_id
+                if old_by_id:
+                    self._released_by_ids.discard(old_by_id)
+                session.released_by = None
+                session.released_at = None
+                session.released_reason = None
+                session.state = "DETACHED"
             session.profile = dataclasses.replace(session.profile, device_by_id=device_by_id)
             self._binding_overrides[session.session_id] = device_by_id
             self._save_state()
@@ -583,6 +741,15 @@ class SessionManager:
             by_id = session.profile.device_by_id
             if not by_id:
                 return {"ok": False, "error_code": "DEVICE_NOT_BOUND", "session": session.to_public_dict()}
+            # C2：RELEASED 早退——比照 clear_session，不改 state、不 spawn、不動集合，
+            # 避免卡死 ATTACHING 與下一次 _save_state 把 released map 寫空。
+            if session.state == "RELEASED" or by_id in self._released_by_ids:
+                return {
+                    "ok": True,
+                    "released": True,
+                    "recommended_action": "device_attach",
+                    "session": session.to_public_dict(),
+                }
             if session.bridge is not None:
                 lease, post = self._refresh_interactive_locked(session)
                 if lease is not None and lease.owner.startswith("human:"):
@@ -652,6 +819,8 @@ class SessionManager:
 
     def _spawn_attach(self, by_id: str) -> None:
         with self._lock:
+            if by_id in self._released_by_ids:
+                return
             if by_id in self._attach_inflight:
                 return
             self._attach_inflight.add(by_id)
@@ -667,7 +836,10 @@ class SessionManager:
 
     def _detach_by_id(self, by_id: str, *, reason: str) -> None:
         with self._lock:
-            targets = [s for s in self._sessions.values() if s.profile.device_by_id == by_id]
+            targets = [
+                s for s in self._sessions.values()
+                if s.profile.device_by_id == by_id and s.state != "RELEASED"
+            ]
             for session in targets:
                 self._detach_session_locked(session, reason=reason)
 
@@ -824,6 +996,9 @@ class SessionManager:
                 return
             if session.bridge is not None or session.profile.device_by_id != by_id:
                 return
+            # C1 早退：release 早於 attach 開 FD 時，根本不啟動（常見情形不開 FD）。
+            if session.state == "RELEASED" or by_id in self._released_by_ids:
+                return
             session.state = "ATTACHING"
             session.last_error = None
             gen_before = session.bridge_generation
@@ -878,6 +1053,13 @@ class SessionManager:
 
             notify_ready = False
             with self._lock:
+                # C1 backstop：release 落在 attach 飛行窗口（bridge.start()+probe 耗時）內時，
+                # 關掉剛開的 FD（clean slate），但**保留 RELEASED**——不可打回 DETACHED。
+                if session.state == "RELEASED" or by_id in self._released_by_ids:
+                    bridge.stop(preserve_consoles=False)
+                    session.bridge = None
+                    session.attached_real_path = None
+                    return
                 current = self._devices.get(by_id)
                 if current is None or current.real_path != real_path or session.state == "DETACHED" or session.bridge_generation != gen_before:
                     preserved = bridge.stop(preserve_consoles=True)
@@ -981,6 +1163,9 @@ class SessionManager:
             dev = self._devices.get(by_id)
             if dev is None:
                 return
+            # C1 早退（dynamic 版）：release 早於 attach 開 FD 時不啟動。
+            if session.state == "RELEASED" or by_id in self._released_by_ids:
+                return
             real_path = dev.real_path
             session.state = "ATTACHING"
             session.last_error = None
@@ -1025,6 +1210,13 @@ class SessionManager:
 
             notify_ready = False
             with self._lock:
+                # C1 backstop（dynamic 版）：release 落在飛行窗口內 → 關 FD、保留 RELEASED。
+                if session.state == "RELEASED" or by_id in self._released_by_ids:
+                    bridge.stop(preserve_consoles=False)
+                    session.bridge = None
+                    session.vtty_path = None
+                    session.attached_real_path = None
+                    return
                 current = self._devices.get(by_id)
                 if current is None or current.real_path != real_path or session.state == "DETACHED" or session.bridge_generation != gen_before:
                     bridge.stop()
@@ -1926,6 +2118,9 @@ class SessionManager:
         suspend_human_interactive = False
         post = _PostCloseAction()
         result: dict[str, Any] | None = None
+        # I2：RELEASED 分支須在 lock 內擷取、出 lock 後再掃 /proc（_probe_external_holder
+        # 會掃整個 /proc，持 lock 期間會阻塞所有 RPC）。
+        released_capture: dict[str, Any] | None = None
         with self._lock:
             session = self.get_session(selector)
             if session is None:
@@ -1935,125 +2130,154 @@ class SessionManager:
                     "selector": selector,
                     **self._lease_context(None),
                 }
-            lease = self._interactive.get(session.interactive_session_id) if session.interactive_session_id is not None else None
-            if session.recovering:
-                return {
-                    "ok": True,
-                    "classification": "SESSION_RECOVERING",
+            if session.state == "RELEASED":
+                device = self._devices.get(session.profile.device_by_id)
+                released_capture = {
+                    "real_path": device.real_path if device is not None else None,
                     "session": session.to_public_dict(),
-                    "recommended_action": "wait",
-                    **self._lease_context(lease),
+                    "released_by": session.released_by,
+                    "released_at": session.released_at,
+                    "reason": session.released_reason,
+                    "lease_context": self._lease_context(None),
                 }
-            lease, post = self._refresh_interactive_locked(session)
-            lease_context = self._lease_context(lease)
-            device = self._devices.get(session.profile.device_by_id)
-            attached_real_path = session.attached_real_path
-            bridge = session.bridge
-            if strict_human_lock and lease is not None and lease.owner.startswith("human:"):
-                result = {
-                    "ok": True,
-                    "classification": "HUMAN_INTERACTIVE_ACTIVE",
-                    "interactive_id": lease.interactive_id,
-                    "session": session.to_public_dict(),
-                    "recommended_action": "wait_or_detach_console",
-                    **lease_context,
-                }
-            elif device is None:
-                result = {
-                    "ok": True,
-                    "classification": "DEVICE_MISSING",
-                    "session": session.to_public_dict(),
-                    "recommended_action": "check_cable_or_bind",
-                    **lease_context,
-                }
-            elif attached_real_path and attached_real_path != device.real_path:
-                result = {
-                    "ok": True,
-                    "classification": "DEVICE_REBOUND_REQUIRED",
-                    "session": session.to_public_dict(),
-                    "attached_real_path": attached_real_path,
-                    "current_real_path": device.real_path,
-                    "recommended_action": "reattach",
-                    **lease_context,
-                }
-            elif bridge is None:
-                result = {
-                    "ok": True,
-                    "classification": "BRIDGE_DOWN",
-                    "session": session.to_public_dict(),
-                    "current_real_path": device.real_path,
-                    "recommended_action": "attach",
-                    **lease_context,
-                }
-            else:
-                snapshot = bridge.snapshot()
-                if not snapshot.get("running") or not snapshot.get("serial_alive"):
+            if released_capture is None:
+                lease = self._interactive.get(session.interactive_session_id) if session.interactive_session_id is not None else None
+                if session.recovering:
+                    return {
+                        "ok": True,
+                        "classification": "SESSION_RECOVERING",
+                        "session": session.to_public_dict(),
+                        "recommended_action": "wait",
+                        **self._lease_context(lease),
+                    }
+                lease, post = self._refresh_interactive_locked(session)
+                lease_context = self._lease_context(lease)
+                device = self._devices.get(session.profile.device_by_id)
+                attached_real_path = session.attached_real_path
+                bridge = session.bridge
+                if strict_human_lock and lease is not None and lease.owner.startswith("human:"):
+                    result = {
+                        "ok": True,
+                        "classification": "HUMAN_INTERACTIVE_ACTIVE",
+                        "interactive_id": lease.interactive_id,
+                        "session": session.to_public_dict(),
+                        "recommended_action": "wait_or_detach_console",
+                        **lease_context,
+                    }
+                elif device is None:
+                    result = {
+                        "ok": True,
+                        "classification": "DEVICE_MISSING",
+                        "session": session.to_public_dict(),
+                        "recommended_action": "check_cable_or_bind",
+                        **lease_context,
+                    }
+                elif attached_real_path and attached_real_path != device.real_path:
+                    result = {
+                        "ok": True,
+                        "classification": "DEVICE_REBOUND_REQUIRED",
+                        "session": session.to_public_dict(),
+                        "attached_real_path": attached_real_path,
+                        "current_real_path": device.real_path,
+                        "recommended_action": "reattach",
+                        **lease_context,
+                    }
+                elif bridge is None:
                     result = {
                         "ok": True,
                         "classification": "BRIDGE_DOWN",
                         "session": session.to_public_dict(),
                         "current_real_path": device.real_path,
-                        "recommended_action": "recover",
-                        **lease_context,
-                    }
-                elif not snapshot.get("vtty_alive"):
-                    result = {
-                        "ok": True,
-                        "classification": "VTTY_STALE",
-                        "session": session.to_public_dict(),
-                        "attached_vtty": snapshot.get("vtty"),
-                        "recommended_action": "console_attach",
-                        **lease_context,
-                    }
-                elif session.state == "ATTACHED":
-                    if session.profile.platform == "passthrough":
-                        classification = "PASSTHROUGH"
-                        recommended_action = "console_attach"
-                        extra: dict[str, Any] = {}
-                    elif session.last_error == "LOGIN_REQUIRED":
-                        classification = "LOGIN_REQUIRED"
-                        recommended_action = "console_attach"
-                        extra = {}
-                    elif session.last_error == "REBOOTING":
-                        classification = "REBOOTING"
-                        recommended_action = "wait_or_console_attach"
-                        extra = {}
-                    else:
-                        # BOOTLOADER detection：讀取 RX tail 並比對 bootloader prompts
-                        rx_tail_raw = bridge.rx_tail(BOOTLOADER_RX_TAIL_BYTES)
-                        rx_tail_evidence = clean_text(rx_tail_raw)
-                        matched = _matches_any_bootloader_prompt(
-                            rx_tail_evidence, session.profile.bootloader_prompts
-                        )
-                        if matched is not None:
-                            classification = "BOOTLOADER"
-                            recommended_action = "recover_interactive"
-                            extra = {"matched_prompt": matched, "rx_tail": rx_tail_evidence}
-                        else:
-                            classification = "ATTACHED_NOT_READY"
-                            recommended_action = "console_attach"
-                            extra = {}
-                    result = {
-                        "ok": True,
-                        "classification": classification,
-                        "session": session.to_public_dict(),
-                        "attached_real_path": attached_real_path,
-                        "current_real_path": device.real_path,
-                        "attached_vtty": snapshot.get("vtty"),
-                        "bridge_generation": session.bridge_generation,
-                        "recommended_action": recommended_action,
-                        **extra,
+                        "recommended_action": "attach",
                         **lease_context,
                     }
                 else:
-                    nonce = uuid.uuid4().hex[:8]
-                    probe = session.profile.ready_probe.replace("${nonce}", nonce)
-                    session.last_probe_at = now_iso()
-                    prompt_regex = session.profile.prompt_regex
-                    bridge_generation = session.bridge_generation
-                    attached_vtty = snapshot.get("vtty")
-                    current_real_path = device.real_path
-                    suspend_human_interactive = lease is not None and lease.owner.startswith("human:")
+                    snapshot = bridge.snapshot()
+                    if not snapshot.get("running") or not snapshot.get("serial_alive"):
+                        result = {
+                            "ok": True,
+                            "classification": "BRIDGE_DOWN",
+                            "session": session.to_public_dict(),
+                            "current_real_path": device.real_path,
+                            "recommended_action": "recover",
+                            **lease_context,
+                        }
+                    elif not snapshot.get("vtty_alive"):
+                        result = {
+                            "ok": True,
+                            "classification": "VTTY_STALE",
+                            "session": session.to_public_dict(),
+                            "attached_vtty": snapshot.get("vtty"),
+                            "recommended_action": "console_attach",
+                            **lease_context,
+                        }
+                    elif session.state == "ATTACHED":
+                        if session.profile.platform == "passthrough":
+                            classification = "PASSTHROUGH"
+                            recommended_action = "console_attach"
+                            extra: dict[str, Any] = {}
+                        elif session.last_error == "LOGIN_REQUIRED":
+                            classification = "LOGIN_REQUIRED"
+                            recommended_action = "console_attach"
+                            extra = {}
+                        elif session.last_error == "REBOOTING":
+                            classification = "REBOOTING"
+                            recommended_action = "wait_or_console_attach"
+                            extra = {}
+                        else:
+                            # BOOTLOADER detection：讀取 RX tail 並比對 bootloader prompts
+                            rx_tail_raw = bridge.rx_tail(BOOTLOADER_RX_TAIL_BYTES)
+                            rx_tail_evidence = clean_text(rx_tail_raw)
+                            matched = _matches_any_bootloader_prompt(
+                                rx_tail_evidence, session.profile.bootloader_prompts
+                            )
+                            if matched is not None:
+                                classification = "BOOTLOADER"
+                                recommended_action = "recover_interactive"
+                                extra = {"matched_prompt": matched, "rx_tail": rx_tail_evidence}
+                            else:
+                                classification = "ATTACHED_NOT_READY"
+                                recommended_action = "console_attach"
+                                extra = {}
+                        result = {
+                            "ok": True,
+                            "classification": classification,
+                            "session": session.to_public_dict(),
+                            "attached_real_path": attached_real_path,
+                            "current_real_path": device.real_path,
+                            "attached_vtty": snapshot.get("vtty"),
+                            "bridge_generation": session.bridge_generation,
+                            "recommended_action": recommended_action,
+                            **extra,
+                            **lease_context,
+                        }
+                    else:
+                        nonce = uuid.uuid4().hex[:8]
+                        probe = session.profile.ready_probe.replace("${nonce}", nonce)
+                        session.last_probe_at = now_iso()
+                        prompt_regex = session.profile.prompt_regex
+                        bridge_generation = session.bridge_generation
+                        attached_vtty = snapshot.get("vtty")
+                        current_real_path = device.real_path
+                        suspend_human_interactive = lease is not None and lease.owner.startswith("human:")
+
+        # I2：RELEASED 早退分支——出 lock 後才掃 /proc，避免阻塞所有 RPC。
+        if released_capture is not None:
+            real_path = released_capture["real_path"]
+            holder = self._probe_external_holder(real_path) if real_path else {"pids": [], "holder": None}
+            reclaimable = not holder["pids"]
+            return {
+                "ok": True,
+                "classification": "RELEASED",
+                "session": released_capture["session"],
+                "released_by": released_capture["released_by"],
+                "released_at": released_capture["released_at"],
+                "reason": released_capture["reason"],
+                "external_holder": holder["pids"] if holder["pids"] else "none",
+                "reclaimable": reclaimable,
+                "recommended_action": "device_attach" if reclaimable else "wait_external_flash",
+                **released_capture["lease_context"],
+            }
 
         post.execute()
         if result is not None:
@@ -2098,6 +2322,14 @@ class SessionManager:
             session = self.get_session(selector)
             if session is None:
                 return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            # C2：RELEASED 早退——比照 clear_session，不改 state、不 spawn、不動集合。
+            if session.state == "RELEASED" or session.profile.device_by_id in self._released_by_ids:
+                return {
+                    "ok": True,
+                    "released": True,
+                    "recommended_action": "device_attach",
+                    "session": session.to_public_dict(),
+                }
             if session.bridge is None:
                 by_id = session.profile.device_by_id
                 if by_id and by_id in self._devices:
