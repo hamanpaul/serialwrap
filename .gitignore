@@ -20,3 +20,7 @@ htmlcov/
 
 # 本機憑證 profile（真值不提交；範本見 profiles/*.env.example）
 profiles/*.env
+
+# ctags 索引（產生物，含絕對路徑，不追蹤）
+tags-session-manager
+tags

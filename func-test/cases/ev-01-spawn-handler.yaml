@@ -25,7 +25,7 @@ steps:
 
   - action: shell
     cmd: |
-      cat > /home/paul_chen/sw-ev-test-rule.json <<'JSON'
+      cat > /tmp/sw-ev-test-rule.json <<'JSON'
       {
         "schema_version": 1,
         "owner": "ev",
@@ -33,15 +33,15 @@ steps:
         "kind": "tool",
         "selectors": ["COM0"],
         "pattern": {"kind": "contains", "value": "Kernel panic"},
-        "handler": {"shell": "touch /home/paul_chen/sw-ev-test-fired"},
+        "handler": {"shell": "touch /tmp/sw-ev-test-fired"},
         "auto_enable_com_on_load": true,
         "timeout_ms": 3000
       }
       JSON
-      rm -f /home/paul_chen/sw-ev-test-fired
+      rm -f /tmp/sw-ev-test-fired
 
   - action: cli
-    argv: [event, add, --file, /home/paul_chen/sw-ev-test-rule.json]
+    argv: [event, add, --file, /tmp/sw-ev-test-rule.json]
     expect:
       ok: true
 
@@ -57,7 +57,7 @@ steps:
     payload: "Kernel panic - not syncing\n"
 
   - action: wait_for_file
-    path: /home/paul_chen/sw-ev-test-fired
+    path: /tmp/sw-ev-test-fired
     timeout_s: 8
 
   - action: cli
@@ -69,4 +69,4 @@ steps:
 
   # Cleanup
   - action: shell
-    cmd: rm -f /home/paul_chen/sw-ev-test-fired /home/paul_chen/sw-ev-test-rule.json
+    cmd: rm -f /tmp/sw-ev-test-fired /tmp/sw-ev-test-rule.json

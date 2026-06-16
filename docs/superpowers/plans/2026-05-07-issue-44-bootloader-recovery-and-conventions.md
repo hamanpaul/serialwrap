@@ -42,7 +42,7 @@ Expected: file written. We do NOT commit this file; it's a workbench reference.
 ### Task A2: Add `.paul-project.yml`
 
 **Files:**
-- Create: `/home/paul_chen/prj_pri/serialwrap/.paul-project.yml`
+- Create: `~/prj_pri/serialwrap/.paul-project.yml`
 
 - [ ] **Step 1: Create `.paul-project.yml` at repo root**
 
@@ -75,7 +75,7 @@ Expected: `ok`
 ### Task A3: Add `VERSION`
 
 **Files:**
-- Create: `/home/paul_chen/prj_pri/serialwrap/VERSION`
+- Create: `~/prj_pri/serialwrap/VERSION`
 
 - [ ] **Step 1: Create VERSION**
 
@@ -92,7 +92,7 @@ Expected: `0.0.1`（對齊既有 git tag `v0.0.1`；R-07 要求 VERSION == lates
 ### Task A4: Add `CHANGELOG.md` skeleton
 
 **Files:**
-- Create: `/home/paul_chen/prj_pri/serialwrap/CHANGELOG.md`
+- Create: `~/prj_pri/serialwrap/CHANGELOG.md`
 
 We're populating the `[Unreleased]` section now with the conventions-adoption entry; the issue-#44 entries are added incrementally during phase B (so each commit satisfies R-09 by editing CHANGELOG together).
 
@@ -127,9 +127,9 @@ Expected: All four lines printed (no missing headings).
 ### Task A5: Add agent convention files (`CLAUDE.md` / `AGENTS.md` / `GEMINI.md`)
 
 **Files:**
-- Create: `/home/paul_chen/prj_pri/serialwrap/CLAUDE.md`
-- Create: `/home/paul_chen/prj_pri/serialwrap/AGENTS.md`
-- Create: `/home/paul_chen/prj_pri/serialwrap/GEMINI.md`
+- Create: `~/prj_pri/serialwrap/CLAUDE.md`
+- Create: `~/prj_pri/serialwrap/AGENTS.md`
+- Create: `~/prj_pri/serialwrap/GEMINI.md`
 
 R-13 / R-14 require all four agent files (these three plus the existing `.github/copilot-instructions.md`) to share the same `policy_version` and a `managed-by` marker. We use one shared body and only vary the marker per file.
 
@@ -220,7 +220,7 @@ Expected: 4 lines, one per file. Note: `.github/copilot-instructions.md` won't y
 ### Task A6: Update `.github/copilot-instructions.md` with marker + policy_version
 
 **Files:**
-- Modify: `/home/paul_chen/prj_pri/serialwrap/.github/copilot-instructions.md` (prepend 3 lines, keep existing 11KB intact)
+- Modify: `~/prj_pri/serialwrap/.github/copilot-instructions.md` (prepend 3 lines, keep existing 11KB intact)
 
 - [ ] **Step 1: Prepend the marker block**
 
@@ -244,7 +244,7 @@ Expected: 4 matching lines.
 ### Task A7: Add `.github/pull_request_template.md`
 
 **Files:**
-- Create: `/home/paul_chen/prj_pri/serialwrap/.github/pull_request_template.md`
+- Create: `~/prj_pri/serialwrap/.github/pull_request_template.md`
 
 - [ ] **Step 1: Create the PR template**
 
@@ -275,7 +275,7 @@ Content (exact):
 ### Task A8: Add policy-check workflow
 
 **Files:**
-- Create: `/home/paul_chen/prj_pri/serialwrap/.github/workflows/policy-check.yml`
+- Create: `~/prj_pri/serialwrap/.github/workflows/policy-check.yml`
 
 - [ ] **Step 1: Create the workflow**
 
@@ -304,8 +304,8 @@ Expected: `ok`
 ### Task A9: Audit README.md required sections (R-02)
 
 **Files:**
-- Read first: `/home/paul_chen/prj_pri/serialwrap/README.md`
-- Modify if needed: `/home/paul_chen/prj_pri/serialwrap/README.md`
+- Read first: `~/prj_pri/serialwrap/README.md`
+- Modify if needed: `~/prj_pri/serialwrap/README.md`
 
 - [ ] **Step 1: Check for required sections**
 
@@ -399,7 +399,7 @@ git -C /tmp clone --depth 1 https://github.com/hamanpaul/paulsha-conventions.git
 
 Run:
 ```bash
-cd /home/paul_chen/prj_pri/serialwrap
+cd ~/prj_pri/serialwrap
 bash /tmp/paulsha-conventions/scripts/update-cli-help.sh
 ```
 Expected: `README.md` `cli-help` marker block populated with `./serialwrap --help` output.
@@ -466,7 +466,7 @@ TDD strictly: each behavior gets a failing test first, then minimal implementati
 ### Task B1: Add constants
 
 **Files:**
-- Modify: `/home/paul_chen/prj_pri/serialwrap/sw_core/constants.py` (append)
+- Modify: `~/prj_pri/serialwrap/sw_core/constants.py` (append)
 
 - [ ] **Step 1: Read current constants.py**
 
@@ -501,8 +501,8 @@ Expected: `120.0 512`
 ### Task B2: Profile schema — `bootloader_prompts` field
 
 **Files:**
-- Modify: `/home/paul_chen/prj_pri/serialwrap/sw_core/config.py` (`ProfileTemplate`, `SessionProfile`, `_template_from_dict`)
-- Test: `/home/paul_chen/prj_pri/serialwrap/tests/test_config_profiles.py`
+- Modify: `~/prj_pri/serialwrap/sw_core/config.py` (`ProfileTemplate`, `SessionProfile`, `_template_from_dict`)
+- Test: `~/prj_pri/serialwrap/tests/test_config_profiles.py`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -689,7 +689,7 @@ Expected: zero failures.
 ### Task B3: `_matches_any_bootloader_prompt` helper
 
 **Files:**
-- Modify: `/home/paul_chen/prj_pri/serialwrap/sw_core/session_manager.py` (add free helper near top of module or as private staticmethod)
+- Modify: `~/prj_pri/serialwrap/sw_core/session_manager.py` (add free helper near top of module or as private staticmethod)
 - Test: extend `tests/test_session_bind.py` or new `tests/test_bootloader_recovery.py`
 
 - [ ] **Step 1: Create `tests/test_bootloader_recovery.py` and write the failing helper test**
@@ -2246,7 +2246,7 @@ Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>"
 ### Task B17: Documentation — `docs/serialwrap-spec.md`
 
 **Files:**
-- Modify: `/home/paul_chen/prj_pri/serialwrap/docs/serialwrap-spec.md`
+- Modify: `~/prj_pri/serialwrap/docs/serialwrap-spec.md`
 
 - [ ] **Step 1: Find self_test section**
 
@@ -2489,7 +2489,7 @@ Closes #44. Adds an agent-driven bootloader recovery interactive lease that pres
 - [x] `python3 -m pytest -q tests/` green (new file: `tests/test_bootloader_recovery.py` with 20+ scenarios)
 - [x] `python3 -m policy_check --repo .` green (R-01 ~ R-16)
 - [x] `openspec validate 2026-05-07-bootloader-recovery-44 --strict` green
-- [ ] Manual hardware verification on BGW720 in U-Boot (see PR body / commit messages)
+- [ ] Manual hardware verification on Broadcom CFE 平台 in U-Boot (see PR body / commit messages)
 
 ## Policy Checklist (R-11)
 
