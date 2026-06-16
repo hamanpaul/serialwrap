@@ -1,6 +1,6 @@
-<!-- managed-by: hamanpaul/paulsha-conventions@v1.0.1 -->
+<!-- managed-by: hamanpaul/paulsha-conventions@v1.0.4 -->
 <!-- 若修改此檔，同步更新 CLAUDE.md / AGENTS.md / GEMINI.md / .github/copilot-instructions.md 四份 -->
-policy_version: 1.0.1
+policy_version: 1.0.4
 <!-- policy_version 為 policy_check R-14 machine-readable marker；需保持裸行格式，請勿移入 frontmatter 或 code block。 -->
 
 # serialwrap — AI Agent Policy Checklist
@@ -37,11 +37,11 @@ policy_version: 1.0.1
   ```bash
   python3 -m policy_check --repo .
   ```
-- policy engine pinned SHA：`4ff59b6c35a46a87af3c3e641975743ee8fa0858`。
+- policy engine pinned SHA：`77a3e8381eeced9dbba623e450ed6a5c1fcc7b18`。
 - 安裝命令：
   ```bash
   python3 -m pip install --user --disable-pip-version-check \
-    "git+https://github.com/hamanpaul/paulsha-conventions.git@4ff59b6c35a46a87af3c3e641975743ee8fa0858"
+    "git+https://github.com/hamanpaul/paulsha-conventions.git@77a3e8381eeced9dbba623e450ed6a5c1fcc7b18"
   ```
 
 ## Agent 檔案同步政策
@@ -53,7 +53,7 @@ policy_version: 1.0.1
   - `.github/copilot-instructions.md`（marker 區段）
 - 檔案首行必須保留：
   ```
-  <!-- managed-by: hamanpaul/paulsha-conventions@v1.0.1 -->
+  <!-- managed-by: hamanpaul/paulsha-conventions@v1.0.4 -->
   ```
 
 ## PR 政策

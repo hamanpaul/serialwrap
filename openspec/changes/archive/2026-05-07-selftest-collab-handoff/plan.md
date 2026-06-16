@@ -39,7 +39,7 @@ Expected: `fix/selftest-collab-42`
 - [ ] **Step 2: Run the existing test suite to capture green baseline**
 
 ```bash
-cd /home/paul_chen/prj_pri/serialwrap
+cd ~/prj_pri/serialwrap
 python -m pytest tests/test_session_bind.py -v
 ```
 Expected: all pass, including `test_self_test_reports_human_interactive_active`. Save the count to compare later.

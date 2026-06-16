@@ -50,7 +50,7 @@ bootloader_prompts:                  # 新增；opt-in；預設 []
 ### 2.2 文件位置
 
 - profile schema 文件：`docs/serialwrap-spec.md`（profile 章節）。
-- 第一波 vendor profile 至少補：BGW720（Broadcom CFE）+ 一個 Marvell 平台（若 repo 已有）。
+- 第一波 vendor profile 至少補：Broadcom CFE 平台+ 一個 Marvell 平台（若 repo 已有）。
 
 ## 3. `SessionManager.self_test` 行為
 

@@ -437,7 +437,7 @@ openspec/changes/2026-05-07-bootloader-recovery-44/
   classification 明確為 `BOOTLOADER`、CLI flag 名 `--allow-attached`
   字面提醒。
 - **profile 須維護 bootloader_prompts**：profile 不更新 → 仍走
-  `ATTACHED_NOT_READY`、agent 仍卡。緩解：第一波 PR 同步把 BGW720 / Marvell /
+  `ATTACHED_NOT_READY`、agent 仍卡。緩解：第一波 PR 同步把 Broadcom CFE 平台 / Marvell /
   常見 vendor profile 補上 prompt（後續 PR 可擴）。
 - **suspend_interactive 期間 human 觀察者體驗變化**：人類打字會被吞、close 後
   一次性 flush。已是 self_test / command path 的既有行為，agent 開
