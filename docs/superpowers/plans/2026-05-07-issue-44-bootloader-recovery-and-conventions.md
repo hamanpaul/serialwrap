@@ -2489,7 +2489,7 @@ Closes #44. Adds an agent-driven bootloader recovery interactive lease that pres
 - [x] `python3 -m pytest -q tests/` green (new file: `tests/test_bootloader_recovery.py` with 20+ scenarios)
 - [x] `python3 -m policy_check --repo .` green (R-01 ~ R-16)
 - [x] `openspec validate 2026-05-07-bootloader-recovery-44 --strict` green
-- [ ] Manual hardware verification on Broadcom CFE 平台 in U-Boot (see PR body / commit messages)
+- [ ] Manual hardware verification on a Broadcom CFE platform in U-Boot (see PR body / commit messages)
 
 ## Policy Checklist (R-11)
 
