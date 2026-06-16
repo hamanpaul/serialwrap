@@ -1,5 +1,7 @@
 policy_profile: flat
-policy_version: "1.0.1"
+policy_version: "1.0.4"
+# 內容分類（R-21）：serialwrap 為通用序列工具、無雇主機密 → 維持 public
+tier: shareable
 code_paths:
   - "sw_core/**"
   - "sw_mcp/**"

@@ -150,17 +150,17 @@ serialwrap-mcp --endpoint tcp://127.0.0.1:7777 --tool serialwrap_list_sessions
 
 ## 最小可用 MCP 範例
 ```bash
-/home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_get_health --params "{}"
-/home/paul_chen/.paul_tools/serialwrap-mcp --endpoint tcp://127.0.0.1:7777 --tool serialwrap_get_health --params "{}"
-/home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_get_session_state --params "{\"selector\":\"COM0\"}"
-/home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_self_test --params "{\"selector\":\"COM0\"}"
-/home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_submit_command --params "{\"selector\":\"COM0\",\"cmd\":\"ifconfig\",\"source\":\"agent:diag\",\"mode\":\"line\"}"
-/home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_get_command --params "{\"cmd_id\":\"<cmd_id>\"}"
-/home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_tail_command_result --params "{\"cmd_id\":\"<cmd_id>\",\"from_chunk\":0,\"limit\":120}"
-/home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_log_status --params "{\"selector\":\"COM0\"}"
-/home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_wal_current_seq --params "{}"
-/home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_file_push --params "{\"selector\":\"COM0\",\"local_path\":\"./fw.bin\",\"remote_path\":\"/tmp/fw.bin\"}"
-/home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_file_pull --params "{\"selector\":\"COM0\",\"remote_path\":\"/etc/config/wireless\"}"
+~/.paul_tools/serialwrap-mcp --tool serialwrap_get_health --params "{}"
+~/.paul_tools/serialwrap-mcp --endpoint tcp://127.0.0.1:7777 --tool serialwrap_get_health --params "{}"
+~/.paul_tools/serialwrap-mcp --tool serialwrap_get_session_state --params "{\"selector\":\"COM0\"}"
+~/.paul_tools/serialwrap-mcp --tool serialwrap_self_test --params "{\"selector\":\"COM0\"}"
+~/.paul_tools/serialwrap-mcp --tool serialwrap_submit_command --params "{\"selector\":\"COM0\",\"cmd\":\"ifconfig\",\"source\":\"agent:diag\",\"mode\":\"line\"}"
+~/.paul_tools/serialwrap-mcp --tool serialwrap_get_command --params "{\"cmd_id\":\"<cmd_id>\"}"
+~/.paul_tools/serialwrap-mcp --tool serialwrap_tail_command_result --params "{\"cmd_id\":\"<cmd_id>\",\"from_chunk\":0,\"limit\":120}"
+~/.paul_tools/serialwrap-mcp --tool serialwrap_log_status --params "{\"selector\":\"COM0\"}"
+~/.paul_tools/serialwrap-mcp --tool serialwrap_wal_current_seq --params "{}"
+~/.paul_tools/serialwrap-mcp --tool serialwrap_file_push --params "{\"selector\":\"COM0\",\"local_path\":\"./fw.bin\",\"remote_path\":\"/tmp/fw.bin\"}"
+~/.paul_tools/serialwrap-mcp --tool serialwrap_file_pull --params "{\"selector\":\"COM0\",\"remote_path\":\"/etc/config/wireless\"}"
 ```
 
 ## Event Trigger Engine
@@ -185,7 +185,7 @@ serialwrap event tail --rule-id owner.name -n 20
 
 ```bash
 # 載入規則
-/home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_event_rule_set --params '{
+~/.paul_tools/serialwrap-mcp --tool serialwrap_event_rule_set --params '{
   "rule": {
     "schema_version": 1, "owner": "ops", "name": "panic",
     "kind": "tool", "selectors": ["COM0"],
@@ -196,10 +196,10 @@ serialwrap event tail --rule-id owner.name -n 20
 }'
 
 # 查詢狀態（必須在 enable/disable 之前呼叫）
-/home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_event_status --params '{"selector": "COM0"}'
+~/.paul_tools/serialwrap-mcp --tool serialwrap_event_status --params '{"selector": "COM0"}'
 
 # 查看最近觸發記錄
-/home/paul_chen/.paul_tools/serialwrap-mcp --tool serialwrap_event_tail --params '{"rule_id": "ops.panic", "n": 10}'
+~/.paul_tools/serialwrap-mcp --tool serialwrap_event_tail --params '{"rule_id": "ops.panic", "n": 10}'
 ```
 
 ### 安全規則
