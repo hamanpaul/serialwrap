@@ -1,6 +1,6 @@
 # Device Release / Handoff 實作計畫（#54）
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **給 agentic worker：** 必用 sub-skill —— 以 superpowers:subagent-driven-development（建議）或 superpowers:executing-plans 逐 task 實作本計畫。各步驟以 checkbox（`- [ ]`）語法追蹤。
 
 **Goal:** 讓 serialwrap 能把單一 session 綁定的 UART 裝置乾淨交給外部 flasher（`device release`）、燒完手動收回（`device attach`），且 released 狀態不被自身 re-attach 邏輯搶回、跨 daemon 重啟保留。
 

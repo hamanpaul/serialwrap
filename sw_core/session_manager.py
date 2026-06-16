@@ -246,6 +246,7 @@ class SessionRuntime:
             "activity_classification": self.classify_activity(),
             "released_by": self.released_by,
             "released_at": self.released_at,
+            "released_reason": self.released_reason,
             "capture": {
                 "capture_id": self.active_capture.capture_id,
                 "log_path": self.active_capture.log_path,
@@ -604,6 +605,10 @@ class SessionManager:
             target = os.path.realpath(real_path)
         except OSError:
             target = real_path
+        try:
+            target_rdev = os.stat(real_path).st_rdev
+        except OSError:
+            target_rdev = 0
         holders: set[int] = set()
         try:
             entries = os.listdir(_proc_root)
@@ -621,11 +626,21 @@ class SessionManager:
             except OSError:
                 continue
             for fd in fds:
+                fd_path = os.path.join(fd_dir, fd)
                 try:
-                    link = os.readlink(os.path.join(fd_dir, fd))
+                    link = os.readlink(fd_path)
                 except OSError:
                     continue
-                if link == target or link == real_path:
+                matched = link == target or link == real_path
+                # 即使外部以 by-id / 其他 symlink 開啟，也以 device number(st_rdev)
+                # 比對同一個 char device，避免漏判導致 attach 誤判可收回、重回 two-reader race。
+                if not matched and target_rdev:
+                    try:
+                        if os.stat(fd_path).st_rdev == target_rdev:
+                            matched = True
+                    except OSError:
+                        pass
+                if matched:
                     holders.add(pid)
                     break
         ordered = sorted(holders)
@@ -637,6 +652,10 @@ class SessionManager:
             if session is None:
                 return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
             by_id = session.profile.device_by_id
+            # 冪等：session 已 attached（有 bridge）且非 RELEASED → 直接回覆，不要改 state。
+            # 否則會被設成 ATTACHING，但 _attach_by_id 因 bridge 已存在而早退，卡在 ATTACHING。
+            if session.bridge is not None and session.state != "RELEASED" and by_id not in self._released_by_ids:
+                return {"ok": True, "already_attached": True, "session": session.to_public_dict()}
             if not by_id or by_id not in self._devices:
                 return {"ok": False, "error_code": "DEVICE_NOT_PRESENT", "selector": selector, "device_by_id": by_id}
             real_path = self._devices[by_id].real_path

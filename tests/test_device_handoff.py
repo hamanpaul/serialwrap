@@ -31,7 +31,7 @@ class _Base(unittest.TestCase):
         )
 
 
-import time
+import threading
 import unittest.mock as mock
 
 
@@ -54,16 +54,17 @@ class TestSpawnAttachGuard(_Base):
             mgr._released_by_ids.add(by_id)
         with mock.patch.object(mgr, "_attach_by_id") as attach_by_id:
             mgr._spawn_attach(by_id)
-            time.sleep(0.1)
+        # released guard 下 _spawn_attach 同步早退、不起 thread，無需等待
         attach_by_id.assert_not_called()
         self.assertNotIn(by_id, mgr._attach_inflight)
 
     def test_spawn_attach_runs_for_non_released_by_id(self) -> None:
         by_id = "/dev/serial/by-id/orig"
         mgr = self._mgr([self._make_profile("p", "COM0", "lab+1", by_id)])
-        with mock.patch.object(mgr, "_attach_by_id") as attach_by_id:
+        called = threading.Event()
+        with mock.patch.object(mgr, "_attach_by_id", side_effect=lambda *a, **k: called.set()) as attach_by_id:
             mgr._spawn_attach(by_id)
-            time.sleep(0.1)
+            self.assertTrue(called.wait(timeout=2.0))  # deterministic：等事件而非賭時序
         attach_by_id.assert_called_once_with(by_id)
 
 
@@ -230,6 +231,26 @@ class TestAttachDevice(_Base):
         self.assertFalse(resp["ok"])
         self.assertEqual(resp["error_code"], "DEVICE_NOT_PRESENT")
 
+    def test_attach_on_already_attached_is_idempotent(self) -> None:
+        # 對「未 released 但已有 bridge」的 session 呼叫 attach_device 應冪等回覆，
+        # 不可把 state 打成 ATTACHING（否則 _attach_by_id 因 bridge 已存在而早退、卡死）
+        by_id = "/dev/serial/by-id/orig"
+        mgr = self._mgr([self._make_profile("p", "COM0", "lab+1", by_id)])
+        session = mgr.get_session("COM0")
+        assert session is not None
+        with mgr._lock:
+            mgr._devices = {by_id: DeviceInfo(by_id=by_id, real_path="/dev/ttyUSB0")}
+        session.bridge = mock.MagicMock()
+        session.state = "READY"
+        with mock.patch.object(mgr, "_spawn_attach") as spawn_attach, \
+             mock.patch.object(mgr, "_probe_external_holder") as probe:
+            resp = mgr.attach_device("COM0")
+        self.assertTrue(resp["ok"])
+        self.assertTrue(resp.get("already_attached"))
+        self.assertEqual(session.state, "READY")
+        spawn_attach.assert_not_called()
+        probe.assert_not_called()
+
 
 class TestReleasedPersistence(_Base):
     def test_released_survives_restart_and_bootstrap_skips(self) -> None:
@@ -257,8 +278,7 @@ class TestReleasedPersistence(_Base):
         with mgr2._lock:
             mgr2._devices = {by_id: DeviceInfo(by_id=by_id, real_path="/dev/ttyUSB0")}
         with mock.patch.object(mgr2, "_attach_by_id") as attach_by_id:
-            mgr2.bootstrap_attach()
-            time.sleep(0.1)
+            mgr2.bootstrap_attach()  # released by_id → _spawn_attach 同步早退、不起 thread
         attach_by_id.assert_not_called()
         self.assertEqual(s2.state, "RELEASED")
 
@@ -359,8 +379,7 @@ class TestAdversarial(_Base):
         mgr.release_device("COM0")
         with mock.patch.object(mgr, "_attach_by_id") as attach_by_id:
             # USB realpath 變動（重插）
-            mgr.update_devices({by_id: DeviceInfo(by_id=by_id, real_path="/dev/ttyUSB3")})
-            time.sleep(0.1)
+            mgr.update_devices({by_id: DeviceInfo(by_id=by_id, real_path="/dev/ttyUSB3")})  # released → 同步早退
         attach_by_id.assert_not_called()
         self.assertEqual(session.state, "RELEASED")
 

@@ -1,7 +1,8 @@
 # device-handoff Specification
 
 ## Purpose
-TBD - created by archiving change device-release-handoff. Update Purpose after archive.
+定義 serialwrap 的 device handoff 能力：把單一 session 綁定的 UART 裝置暫時交給外部工具獨佔（如 MCU 韌體燒錄），燒完手動收回。涵蓋 `RELEASED` 狀態、`device.release` / `device.attach`、跨 daemon 重啟持久化、所有自動 re-attach 路徑的 guard、唯讀外部持有者偵測，以及 `device.attach` 的 `DEVICE_STILL_HELD` 安全 guard（#54）。
+
 ## Requirements
 ### Requirement: device.release SHALL clean-slate detach 並標記 RELEASED
 
