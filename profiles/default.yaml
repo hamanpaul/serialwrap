@@ -56,7 +56,7 @@ profiles:
       xonxoff: false
   uboot-template:
     platform: passthrough
-    prompt_regex: "(?m)^(=>|u-boot>|CFE>) $"
+    prompt_regex: "(?mi)^(=>|u-boot>|cfe>) $"
     login_regex: "$^"
     password_regex: "$^"
     ready_probe: "echo __READY__${nonce}"

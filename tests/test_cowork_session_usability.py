@@ -225,8 +225,9 @@ class TestUbootTemplateProfile(unittest.TestCase):
         self.assertTrue(tpl.command_capable)
         self.assertTrue((tpl.ready_probe or "").strip())
         self.assertRegex("=> ", tpl.prompt_regex)
-        # 確認其他 bootloader prompt 也能匹配
+        # 確認其他 bootloader prompt 也能匹配（含實機 MT7988 的大寫 `U-Boot> `）
         self.assertTrue(re.search(tpl.prompt_regex, "u-boot> "))
+        self.assertTrue(re.search(tpl.prompt_regex, "U-Boot> "))  # 實機驗證字串
         self.assertTrue(re.search(tpl.prompt_regex, "CFE> "))
 
 
