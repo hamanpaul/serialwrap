@@ -186,3 +186,29 @@ class FlashEndpoint:
                     os.write(self._master_fd, text.encode())
                 except OSError:
                     pass
+
+
+def resolve_flash_target(selector: str, sessions: list[dict], *, force: bool) -> dict:
+    """解析顯式 flash 目標並防呆。
+
+    若目標是 command_capable console（很可能是 DUT），預設擋下，需 force 才覆寫，
+    避免把韌體燒進 console 線。
+
+    Args:
+        selector: 使用者指定的目標識別字（``com`` 或 ``by_id``）。
+        sessions: 目前已知 session 清單，每筆含 ``com``、``by_id``、``command_capable`` 欄位。
+        force: 若為 ``True``，即使目標是 command_capable console 仍允許通過。
+
+    Returns:
+        成功時回傳 ``{"ok": True, "by_id": ..., "com": ...}``；
+        失敗時回傳 ``{"ok": False, "error_code": ..., "selector": ..., ...}``。
+    """
+    match = next((s for s in sessions
+                  if selector in (s.get("com"), s.get("by_id"))), None)
+    if match is None:
+        return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+    if match.get("command_capable") and not force:
+        return {"ok": False, "error_code": "FLASH_TARGET_IS_CONSOLE",
+                "selector": selector,
+                "hint": "目標是 command_capable console（可能是 DUT）；確認無誤再加 --force"}
+    return {"ok": True, "by_id": match["by_id"], "com": match.get("com")}
