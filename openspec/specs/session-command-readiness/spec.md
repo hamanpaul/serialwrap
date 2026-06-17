@@ -1,7 +1,8 @@
 # session-command-readiness Specification
 
 ## Purpose
-TBD - created by archiving change cowork-session-usability. Update Purpose after archive.
+定義 session「可下命令（command-capable）」的對外契約：以 `command_capable`（profile `ready_probe` 非空）判定一個 session 可否進入 `READY` 並接受 line 命令；非 command-capable 的 `cmd submit` 回 `PROFILE_NOT_COMMAND_CAPABLE`（保留 `SESSION_NOT_READY` 給「capable 但尚未 READY」）；`READY` 與底層是 OS shell 或 bootloader 無關（只要 prompt/`ready_probe` 對得上即可，含 U-Boot 之類 bootloader command profile）。
+
 ## Requirements
 ### Requirement: command_capable SHALL be determined by non-empty ready_probe
 

@@ -14,7 +14,6 @@ from __future__ import annotations
 import os
 import pty
 import tempfile
-import threading
 import time
 import unittest
 from pathlib import Path
