@@ -504,6 +504,39 @@ class TestSoftPreemptAndLiveness(unittest.TestCase):
         self.assertEqual(session.interactive_session_id, "iv-1")
         session.bridge.resume_interactive.assert_called()
 
+    def test_agent_lease_not_preempted_stays_busy(self) -> None:
+        """READY 路徑既有為 agent lease 時，第二個 agent interactive_open 維持 BUSY（不 preempt）。"""
+        mgr = self._make_manager([_make_profile()])
+        session = mgr.get_session("COM0")
+        assert session is not None
+        bridge = mock.MagicMock()
+        bridge.snapshot.return_value = {
+            "running": True,
+            "serial_alive": True,
+            "vtty_alive": True,
+            "vtty": "/dev/pts/0",
+            "interactive_owner": "agent",
+            "last_human_input_at": None,
+        }
+        bridge.console_has_external_peer.return_value = True
+        bridge.vtty_path = "/dev/pts/0"
+        session.bridge = bridge
+        session.state = "READY"
+        lease = InteractiveLease(
+            interactive_id="iv-agent",
+            session_id=session.session_id,
+            owner="agent",
+            created_at="2026-06-17T00:00:00Z",
+            timeout_s=3600.0,
+        )
+        mgr._interactive[lease.interactive_id] = lease
+        session.interactive_session_id = lease.interactive_id
+
+        resp = mgr.interactive_open("COM0", owner="agent")
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error_code"], "SESSION_INTERACTIVE_BUSY")
+        bridge.suspend_interactive.assert_not_called()
+
     def test_dead_orphan_detached_via_self_test(self) -> None:
         mgr = self._make_manager([_make_profile()])
         session = self._ready_session_with_human_lease(

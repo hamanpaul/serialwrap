@@ -1911,8 +1911,9 @@ class SessionManager:
             lease, post = self._refresh_interactive_locked(session)
             ok = session.bridge.detach_console(client_id)
             if lease is not None and lease.owner == human_owner:
-                # Human lease close：lease.recovery_mode=False，故 _close_interactive_locked
-                # 回傳的 post.needs_resume 必為 False（no-op post），安全丟棄。
+                # Human lease close：一般 human lease 的 suspended_human=False，故
+                # _close_interactive_locked 走一般 close 分支、post.needs_resume 必為 False
+                # （no-op post），安全丟棄。（還原分支現以 suspended_human 判定，非 recovery_mode。）
                 _, _ = self._close_interactive_locked(
                     session, interactive_id=lease.interactive_id, expected_owner=human_owner
                 )
@@ -1958,6 +1959,8 @@ class SessionManager:
                         # agent 可暫停（降級）human lease 取得控制權；human console 不中斷，
                         # 其鍵入進 deferred buffer，agent close 後還原並回放。
                         # human 仍 active 或既有為 agent lease → 維持 BUSY。
+                        # 註：從未鍵入（last_human_input_at=None）視為 idle、可被 preempt——
+                        # soft preempt 非破壞性（降級+回放），故此處理為刻意行為。
                         human_active = self._lease_context(
                             existing, bridge=session.bridge
                         )["human_active"]
