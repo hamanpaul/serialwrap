@@ -37,6 +37,11 @@ class ProfileTemplate:
     uart: UartProfile = dataclasses.field(default_factory=UartProfile)
     bootloader_prompts: tuple[str, ...] = ()
 
+    @property
+    def command_capable(self) -> bool:
+        """是否可下命令。判準同 SessionProfile：有非空白 ready_probe 才可。"""
+        return bool((self.ready_probe or "").strip())
+
 
 @dataclasses.dataclass(frozen=True)
 class SessionProfile:

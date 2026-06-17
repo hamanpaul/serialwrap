@@ -2121,6 +2121,22 @@ class SessionManager:
         return {"ok": True, "interactive_id": interactive_id}
 
     def self_test(self, selector: str, *, timeout_s: float = 2.0, strict_human_lock: bool = False) -> dict[str, Any]:
+        """對外入口：在所有分支的最外層 result dict 注入 command_capable。
+
+        #51 sub-task A：呼叫端不必鑽進巢狀 "session" dict 即可判斷該 session
+        是否可下命令。SESSION_NOT_FOUND 等查無 session 的分支一律以 False 表示。
+        """
+        result = self._self_test_impl(
+            selector, timeout_s=timeout_s, strict_human_lock=strict_human_lock
+        )
+        if "command_capable" not in result:
+            session = self.get_session(selector)
+            result["command_capable"] = (
+                bool(session.profile.command_capable) if session is not None else False
+            )
+        return result
+
+    def _self_test_impl(self, selector: str, *, timeout_s: float = 2.0, strict_human_lock: bool = False) -> dict[str, Any]:
         suspend_human_interactive = False
         post = _PostCloseAction()
         result: dict[str, Any] | None = None

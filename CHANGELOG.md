@@ -10,6 +10,8 @@
 - 新增 device release / handoff 設計文件 `docs/superpowers/specs/2026-06-15-device-release-handoff-design.md`、OpenSpec change（已封存於 `openspec/changes/archive/2026-06-16-device-release-handoff/`，含 proposal/design/specs/tasks）與實作計畫 `docs/superpowers/plans/2026-06-15-device-release-handoff.md`（#54：daemon 持續運作下把單一 device 交給外部 flasher、燒完手動收回的 surgical release 機制）
 - 新增 `.github/workflows/tests.yml`：在 PR 上以 `python3 -m pytest -q tests/` 執行測試套件（修補 R-19：repo 有 `tests/` 但無 CI 執行測試）。
 - **command_capable 判準與 `PROFILE_NOT_COMMAND_CAPABLE` 錯誤碼（#51）**：以 `command_capable = bool(profile.ready_probe.strip())` 判定 session 可否下命令，取代以 `platform == "passthrough"` 寫死；非 command-capable（無 ready_probe，含 passthrough / others-template 等僅 console 的 profile）在 `ATTACHED` 下 `cmd submit` 改回語意明確的 `PROFILE_NOT_COMMAND_CAPABLE`（附 hint），不再回易誤解的 `SESSION_NOT_READY`；`to_public_dict()` 新增 `command_capable` 欄位。
+- **`self_test` 在最外層 result dict 暴露 `command_capable`（#51）**：所有分類分支（含 `SESSION_NOT_FOUND` 早退、`RELEASED`、`ATTACHED`/`READY`/`OK` 等）的最外層 result 都帶 `command_capable`，呼叫端不必鑽進巢狀 `"session"` dict；查無 session 時為 `False`。
+- **新增 `uboot-template` profile（#51）**：`profiles/default.yaml` 增加 bootloader 導向的 command-capable profile（`platform: passthrough`、`prompt_regex` 匹配 `=>` / `u-boot>` / `CFE>`、`ready_probe: echo __READY__${nonce}`），讓停在 U-Boot prompt 的 session 能進 `READY` 並接受 line command；`ProfileTemplate` 比照 `SessionProfile` 新增 `command_capable` property。
 
 ### Changed
 
