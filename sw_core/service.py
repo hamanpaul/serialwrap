@@ -8,7 +8,9 @@ from typing import Any
 
 from .arbiter import CommandArbiter
 from .config import ProfileTemplate, SessionProfile
-from .constants import DEVICE_BY_ID_DIR, DEVICE_BY_PATH_DIR, EVENTS_DIR, EVENTS_RUNTIME_DIR, EVENTS_LOG_PATH
+from .constants import DEVICE_BY_ID_DIR, DEVICE_BY_PATH_DIR, EVENTS_DIR, EVENTS_RUNTIME_DIR, EVENTS_LOG_PATH, TTYMCU_PATH
+from .flash_endpoint import FlashEndpoint
+from .mcu_patterns import McuPatternRegistry
 from .device_watcher import DeviceWatcher
 from .event_engine import EventEngine, EngineDeps
 from .event_engine.line_buffer import LineBuffer
@@ -151,6 +153,12 @@ class SerialwrapService:
             by_id_dir, self._on_device_change,
             extra_scan_dirs=[by_path_dir],
         )
+        self._mcu_registry = McuPatternRegistry.load(None)
+        self._flash_endpoint = FlashEndpoint(
+            link_path=TTYMCU_PATH,
+            registry=self._mcu_registry,
+            list_candidates=self._flash_candidates,
+        )
 
     def _on_ready(self, session_id: str) -> None:
         self._arbiter.register_session(session_id)
@@ -218,6 +226,23 @@ class SerialwrapService:
     def _on_device_change(self, _added, _removed) -> None:
         self._sessions.update_devices(self._watcher.devices)
 
+    def _flash_candidates(self) -> list[dict]:
+        """flash 偵測候選：已 attached 且非 command_capable console 的 session，附上 real_path。"""
+        devices = {d["by_id"]: d["real_path"] for d in self._sessions.list_devices()}
+        out: list[dict] = []
+        for s in self._sessions.list_sessions():
+            if s.get("command_capable"):
+                continue
+            if s.get("state") not in ("READY", "ATTACHED"):
+                continue
+            out.append({
+                "com": s.get("com"),
+                "by_id": s.get("device_by_id"),
+                "real_path": devices.get(s.get("device_by_id")),
+                "command_capable": False,
+            })
+        return out
+
     def start(self) -> None:
         with self._lock:
             if self._running:
@@ -230,6 +255,7 @@ class SerialwrapService:
         self._watcher.poll_once()
         self._sessions.update_devices(self._watcher.devices)
         self._sessions.bootstrap_attach()
+        self._flash_endpoint.start()
 
     def stop(self) -> None:
         with self._lock:
@@ -241,6 +267,10 @@ class SerialwrapService:
         for row in self._sessions.list_sessions():
             sid = row["session_id"]
             self._arbiter.unregister_session(sid)
+        try:
+            self._flash_endpoint.stop()
+        except OSError:
+            pass
 
     def health(self) -> dict[str, Any]:
         with self._lock:
@@ -289,6 +319,16 @@ class SerialwrapService:
             return {"ok": True, "pong": True}
         if method == "health.status":
             return self.health()
+
+        if method == "mcu.patterns":
+            return {"ok": True, "patterns": [
+                {"family": p.family, "probe": p.probe.hex(" "),
+                 "expect": p.expect.hex(" "), "baud": p.baud}
+                for p in self._mcu_registry.all()]}
+        if method == "mcu.status":
+            return {"ok": True,
+                    "candidates": self._flash_candidates(),
+                    "flashing": self._flash_endpoint.is_flashing()}
 
         if method == "device.list":
             return {"ok": True, "devices": self._sessions.list_devices()}

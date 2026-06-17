@@ -49,6 +49,9 @@ _TOOL_MAP = {
     "serialwrap_wal_range": "wal.range",
     "serialwrap_file_push": "file.push",
     "serialwrap_file_pull": "file.pull",
+    # mcu flash tools
+    "serialwrap_mcu_patterns": "mcu.patterns",
+    "serialwrap_mcu_status": "mcu.status",
     # event trigger tools
     "serialwrap_event_rule_set": "event.rule_set",
     "serialwrap_event_rule_delete": "event.rule_delete",
@@ -325,6 +328,9 @@ _TOOL_DEFS: list[dict[str, Any]] = [
         },
         ["selector", "remote_path"],
     ),
+    # ── mcu flash ─────────────────────────────────────────────
+    _td("serialwrap_mcu_patterns", "列出所有已知 MCU 家族 flash pattern（family／probe／expect／baud）"),
+    _td("serialwrap_mcu_status", "顯示 MCU flash 端點狀態：候選 COM port 清單與目前是否 flashing"),
     # ── event trigger ─────────────────────────────────────────
     _td(
         "serialwrap_event_rule_set",
