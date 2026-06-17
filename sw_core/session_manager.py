@@ -180,6 +180,8 @@ class SessionRuntime:
     released_by: str | None = None
     released_at: str | None = None
     released_reason: str | None = None
+    # MCU 燒錄狀態（issue #55）：僅 runtime transient，不寫 _save_state / to_public_dict
+    flash_prev_state: str | None = None
     # recovery lease stash（Phase B issue #44）
     _stashed_human_lease: InteractiveLease | None = dataclasses.field(default=None, repr=False)
     _state: str = dataclasses.field(default="DETACHED", init=False, repr=False)
@@ -604,6 +606,32 @@ class SessionManager:
             public = session.to_public_dict()
         self._save_state()
         return {"ok": True, "session": public, "closed_consoles": closed_consoles, "aborted_cmd": aborted_cmd}
+
+    def enter_flashing(self, selector: str) -> dict:
+        """進入 FLASHING：只標狀態 + 擋命令，**不** detach bridge（daemon 仍是 real device 唯一 reader）。"""
+        with self._lock:
+            session = self.get_session(selector)
+            if session is None:
+                return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            if session.state == "FLASHING":
+                return {"ok": True, "already_flashing": True, "session": session.to_public_dict()}
+            session.flash_prev_state = session.state   # 記住以便結束後恢復
+            session.state = "FLASHING"
+            public = session.to_public_dict()
+        return {"ok": True, "session": public}
+
+    def exit_flashing(self, selector: str) -> dict:
+        """結束 FLASHING：恢復先前狀態（bridge 全程未關，無需 re-attach）。"""
+        with self._lock:
+            session = self.get_session(selector)
+            if session is None:
+                return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            if session.state != "FLASHING":
+                return {"ok": True, "not_flashing": True, "session": session.to_public_dict()}
+            session.state = session.flash_prev_state or ("READY" if session.bridge is not None else "DETACHED")
+            session.flash_prev_state = None
+            public = session.to_public_dict()
+        return {"ok": True, "session": public}
 
     def _probe_external_holder(self, real_path: str, *, _proc_root: str = "/proc") -> dict[str, Any]:
         """唯讀偵測 real_path 是否被其他 process 持有；讀 _proc_root/*/fd，不開 tty、不做 I/O。"""
@@ -1651,6 +1679,8 @@ class SessionManager:
         busy_result: dict[str, Any] | None = None
         with self._lock:
             session = self._sessions.get(session_id)
+            if session is not None and session.state == "FLASHING":
+                return {"ok": False, "error_code": "FLASHING_BUSY", "selector": session.profile.com}
             if session is None or session.bridge is None or session.state != "READY":
                 return {"ok": False, "error_code": "SESSION_NOT_READY"}
             if session.recovering:
