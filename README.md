@@ -873,6 +873,39 @@ CLI（`bind` 只改 device、`recover`/`clear` 沿用舊 profile）。在 produc
 > fallback 必須限定為非 command-capable 的 passthrough；(2) 實機 U-Boot prompt 可能是大寫
 > `U-Boot> `，`prompt_regex` 要用 `(?mi)` 大小寫不敏感。
 
+### Co-work 競爭/對抗測試（human + 多 agent 共用同一 COM）
+
+驗證 human console 與多個 agent 同時存取同一 COM 時，single-writer 仲裁、輸出框定、
+`human_active` 時間窗、soft preempt 與孤兒 liveness 等行為（對應 #51/#53）。在一顆有 shell 的
+真機板（command-capable session，例如 op3-template）上跑：
+
+**建置與步驟**
+
+1. **tmux 開 minicom 模擬 human**：`tmux new-session -d -s cowork`，於 pane 內執行
+   `~/.paul_tools/minicom COMx`（broker minicom：自動 `console-attach` 並在 broker vtty 上開
+   minicom）。`session console-list` 應出現第二個 console、`self-test` 回 `human_attached=true`。
+2. **多 agent 並行存取**：開 2 個 subagent（或 2 條並行 CLI loop），各以不同 `--source` 連續
+   `cmd submit --mode line`（送帶唯一 marker 的 `echo`），驗證每筆 `cmd status` 的 stdout 只含
+   自己的 marker（無 cross-talk / 錯接）。
+3. **tmux send-keys 模擬 human 操作**：`tmux send-keys -t cowork -l -- "echo HUMAN_MARK"` +
+   `Enter`。真人鍵入後 `self-test` 應回 `human_active=true`；此時 agent `interactive-open` 應回
+   `SESSION_INTERACTIVE_BUSY`（active human 不被搶）；human 命令在 minicom 畫面上各自獨立成行、
+   不與 agent 輸出位元組交錯（deferral 生效）。
+4. **kill minicom 再重接（退出再進入）**：以 PID `kill -9` 突然殺掉 minicom（不走 clean
+   `console-detach`）→ `self-test` 應由 liveness 偵測 peer 消失、自動 detach 該 console、
+   `human_attached=false`、`console_count` 回 1；重新 `~/.paul_tools/minicom COMx` 即重新 attach、
+   `human_attached=true`、可再次輸入。
+5. **（選用）長時間壓力測試**：延長步驟 2~3 的並行回合數與時間，觀察 TX/RX 框定與 fairness。
+
+> 額外驗證 soft preempt：human 閒置超過 `HUMAN_ACTIVE_WINDOW_S`（60s）後 `human_active=false`，
+> 此時 agent `interactive-open` 會回 `soft_preempted=true`，且 human console **只降級不中斷**
+> （`console-list` 仍在、owner 轉為 agent），agent close lease 後 human owner 還原。
+>
+> 注意事項：(1) **不要用 `pkill -f "minicom -D ..."`**——pattern 會 self-match 你自己的 shell
+> cmdline；改用 `pgrep -x minicom` 取 PID 再 `kill`。(2) minicom 在 broker pts 上常顯示
+> `Offline`（DCD 未拉起），不影響輸入轉送。(3) `log tail-raw` 預設 `from-seq=0`（最舊起算），
+> 驗證最新輸出要看 minicom 畫面或帶較大 `--limit`/`--from-seq`。
+
 ## Remote Support（ssh-tunnel 遠端連線）
 
 當 FAE 在海外（美國 / 歐洲電信客戶端）用 serialwrap 連接 DUT，台灣 RD 可透過 **ssh-tunnel** 讓 agent 對遠端 daemon 下命令，無需修改 daemon 端程式。
