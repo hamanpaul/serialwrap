@@ -485,6 +485,25 @@ class UARTBridge:
         if log:
             self.wal.append(com=self.com, direction="TX", source=source, payload=payload, cmd_id=cmd_id)
 
+    def flash_tx(self, payload: bytes) -> None:
+        """flash 模式：endpoint→device 原樣送出，跳過行處理（_consume_console_input）。"""
+        self.send_bytes(payload, source="flash", cmd_id=None)
+
+    def mirror_termios_from(self, slave_fd: int) -> None:
+        """把 endpoint PTY slave 的 baud 鏡射到 real device；失敗則保持 profile baud。"""
+        with self._state_lock:
+            serial_fd = self._serial_fd
+        if serial_fd is None:
+            return
+        try:
+            attrs = termios.tcgetattr(slave_fd)
+            ispeed, ospeed = attrs[4], attrs[5]
+            dst = termios.tcgetattr(serial_fd)
+            dst[4], dst[5] = ispeed, ospeed
+            termios.tcsetattr(serial_fd, termios.TCSANOW, dst)
+        except OSError:
+            pass  # fallback：維持 _configure_serial 設定的 registry/profile baud
+
     def send_command(self, cmd: str, *, source: str, cmd_id: str | None = None) -> None:
         payload = cmd.encode("utf-8", errors="replace")
         if not payload.endswith(b"\n"):
