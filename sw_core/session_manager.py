@@ -1338,8 +1338,9 @@ class SessionManager:
             lease.status = "closed"
             self._interactive.pop(lease_id, None)
 
-        # recovery lease with suspended human → stash restore or discard
-        if lease is not None and lease.recovery_mode and lease.suspended_human:
+        # 帶 suspended_human 的 lease（bootloader recovery 或 #53 soft preempt）關閉時 →
+        # 還原 stash 的 human lease 或丟棄；不限 recovery_mode，soft preempt（recovery_mode=False）亦適用。
+        if lease is not None and lease.suspended_human:
             stash = session._stashed_human_lease
             session._stashed_human_lease = None
             bridge = session.bridge
@@ -1953,11 +1954,40 @@ class SessionManager:
                     if post.needs_resume:
                         retry_after_post = True
                     elif existing is not None:
-                        return {
-                            "ok": False,
-                            "error_code": "SESSION_INTERACTIVE_BUSY",
-                            "interactive_session_id": session.interactive_session_id,
-                        }
+                        # #53 soft preempt：human lease 閒置（human_active=False）時，
+                        # agent 可暫停（降級）human lease 取得控制權；human console 不中斷，
+                        # 其鍵入進 deferred buffer，agent close 後還原並回放。
+                        # human 仍 active 或既有為 agent lease → 維持 BUSY。
+                        human_active = self._lease_context(
+                            existing, bridge=session.bridge
+                        )["human_active"]
+                        if (
+                            existing.owner.startswith("human:")
+                            and not human_active
+                            and not owner.startswith("human:")
+                        ):
+                            self._interactive.pop(existing.interactive_id, None)
+                            session.interactive_session_id = None
+                            session._stashed_human_lease = existing
+                            session.bridge.suspend_interactive()
+                            lease = self._open_interactive_locked(
+                                session, owner=owner, timeout_s=timeout_s,
+                                suspended_human=True,
+                            )
+                            bridge = session.bridge
+                            result = {
+                                "ok": True,
+                                "interactive_id": lease.interactive_id,
+                                "session": session.to_public_dict(),
+                                "recovery_mode": False,
+                                "soft_preempted": True,
+                            }
+                        else:
+                            return {
+                                "ok": False,
+                                "error_code": "SESSION_INTERACTIVE_BUSY",
+                                "interactive_session_id": session.interactive_session_id,
+                            }
                     else:
                         lease = self._open_interactive_locked(session, owner=owner, timeout_s=timeout_s)
                         bridge = session.bridge

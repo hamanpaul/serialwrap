@@ -416,5 +416,106 @@ class TestHumanActiveSemantics(unittest.TestCase):
         self.assertFalse(result["human_active"])
 
 
+class TestSoftPreemptAndLiveness(unittest.TestCase):
+    """#53 sub-task 6：閒置 human lease 可被 agent soft preempt（降級而非踢除）；
+    死孤兒 console 由既有 liveness（peer-gone）在 self_test 時 detach。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._old_state_path = sm_mod.STATE_PATH
+        sm_mod.STATE_PATH = str(Path(self._tmp.name) / "state.json")
+
+    def tearDown(self) -> None:
+        sm_mod.STATE_PATH = self._old_state_path
+
+    def _make_manager(self, profiles: list[SessionProfile]) -> SessionManager:
+        return SessionManager(
+            profiles,
+            WalWriter(wal_dir=self._tmp.name),
+            on_ready=lambda _sid: None,
+            on_detached=lambda _sid: None,
+        )
+
+    def _ready_session_with_human_lease(
+        self, mgr: SessionManager, *, last_human_input_at, peer_alive: bool = True
+    ):
+        session = mgr.get_session("COM0")
+        assert session is not None
+        bridge = mock.MagicMock()
+        bridge.snapshot.return_value = {
+            "running": True,
+            "serial_alive": True,
+            "vtty_alive": True,
+            "vtty": "/dev/pts/0",
+            "interactive_owner": "human:c1",
+            "last_human_input_at": last_human_input_at,
+        }
+        bridge.console_has_external_peer.return_value = peer_alive
+        bridge.detach_console.return_value = True
+        bridge.vtty_path = "/dev/pts/0"
+        session.bridge = bridge
+        session.state = "READY"
+        lease = InteractiveLease(
+            interactive_id="iv-1",
+            session_id=session.session_id,
+            owner="human:c1",
+            created_at="2026-06-17T00:00:00Z",
+            timeout_s=3600.0,
+        )
+        mgr._interactive[lease.interactive_id] = lease
+        session.interactive_session_id = lease.interactive_id
+        return session
+
+    def test_agent_soft_preempts_idle_human(self) -> None:
+        mgr = self._make_manager([_make_profile()])
+        session = self._ready_session_with_human_lease(
+            mgr, last_human_input_at=time.monotonic() - (HUMAN_ACTIVE_WINDOW_S + 10.0)
+        )
+        resp = mgr.interactive_open("COM0", owner="agent")
+        self.assertTrue(resp["ok"], resp)
+        self.assertTrue(resp.get("soft_preempted"))
+        session.bridge.suspend_interactive.assert_called_once()
+        self.assertIsNotNone(session._stashed_human_lease)
+        self.assertEqual(session._stashed_human_lease.interactive_id, "iv-1")
+
+    def test_agent_cannot_preempt_active_human(self) -> None:
+        mgr = self._make_manager([_make_profile()])
+        self._ready_session_with_human_lease(
+            mgr, last_human_input_at=time.monotonic() - 1.0
+        )
+        resp = mgr.interactive_open("COM0", owner="agent")
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error_code"], "SESSION_INTERACTIVE_BUSY")
+        self.assertFalse(resp.get("soft_preempted", False))
+
+    def test_soft_preempt_restores_human_on_close(self) -> None:
+        mgr = self._make_manager([_make_profile()])
+        session = self._ready_session_with_human_lease(
+            mgr, last_human_input_at=time.monotonic() - (HUMAN_ACTIVE_WINDOW_S + 10.0)
+        )
+        resp = mgr.interactive_open("COM0", owner="agent")
+        agent_iv = resp["interactive_id"]
+
+        close = mgr.interactive_close(agent_iv)
+        self.assertTrue(close["ok"], close)
+        # 關閉 agent lease 後，stash 的 human lease 應被還原
+        self.assertEqual(session.interactive_session_id, "iv-1")
+        session.bridge.resume_interactive.assert_called()
+
+    def test_dead_orphan_detached_via_self_test(self) -> None:
+        mgr = self._make_manager([_make_profile()])
+        session = self._ready_session_with_human_lease(
+            mgr,
+            last_human_input_at=time.monotonic() - (HUMAN_ACTIVE_WINDOW_S + 10.0),
+            peer_alive=False,
+        )
+        result = mgr.self_test("COM0")
+        self.assertIsNone(result["interactive_owner"])
+        self.assertFalse(result["human_attached"])
+        self.assertIsNone(session.interactive_session_id)
+
+
 if __name__ == "__main__":
     unittest.main()
