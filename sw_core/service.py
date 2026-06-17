@@ -196,6 +196,7 @@ class SerialwrapService:
         self._flash_rx_buffers: dict[str, bytearray] = {}   # com -> 最近 RX（probe 用）
         self._flash_active_com: str | None = None
         self._flash_master_fd: int | None = None
+        self._flash_last_detect: dict | None = None     # 最近一次偵測結果（供 mcu status）（I2）
         self._sessions.add_rx_observer(self._flash_rx_observer)
         self._flash_endpoint = FlashEndpoint(
             link_path=TTYMCU_PATH,
@@ -304,25 +305,40 @@ class SerialwrapService:
         by_id_to_com = {c["by_id"]: c["com"] for c in candidates if c.get("by_id")}
         transport = _BridgeProbe(self, by_id_to_com)
         result = detect_mcu_line(candidates, self._mcu_registry, transport)
+        com = by_id_to_com.get(result.by_id) if result.by_id else None
+        # 記錄最近一次偵測結果，供 `mcu status` 呈現（含 ambiguous 命中清單）（I2）。
+        # ambiguous / none 仍保持端點沉默（不寫 bytes），但操作者可在 status 看到原因。
+        with self._flash_lock:
+            self._flash_last_detect = {
+                "status": result.status,
+                "com": com,
+                "family": result.family,
+                "hits": [{"by_id": h, "com": by_id_to_com.get(h)} for h in result.hits],
+            }
         if result.status != "matched":
-            return  # 沒命中：保持沉默，讓 flasher 自身 retry/timeout
-        com = by_id_to_com.get(result.by_id)
+            return  # 沒命中 / 多義：保持沉默，讓 flasher 自身 retry/timeout（狀態見 mcu status）
         sess = self._sessions.get_session(com) if com else None
         if sess is None or sess.bridge is None:
             return
+        # 命中 pattern 的 registry baud，供 termios 鏡射失敗時 fallback（I3）。
+        try:
+            fallback_baud = self._mcu_registry.get(result.family).baud
+        except (KeyError, AttributeError):
+            fallback_baud = None
         self._sessions.enter_flashing(com)
         stop = threading.Event()
         with self._flash_lock:
             self._flash_active_com = com
             self._flash_master_fd = master_fd
         try:
-            sess.bridge.mirror_termios_from(slave_fd)
+            sess.bridge.mirror_termios_from(slave_fd, fallback_baud=fallback_baud)
             sess.bridge.clear_rx_buffer()
             pump_endpoint_to_sink(master_fd, sess.bridge, stop, first_bytes=first_bytes)
         finally:
             with self._flash_lock:
                 self._flash_active_com = None
                 self._flash_master_fd = None
+                self._flash_rx_buffers.pop(com, None)   # 清掉本次 probe/flash 的 RX buffer（M1）
             self._sessions.exit_flashing(com)
 
     def _flash_candidates(self) -> list[dict]:
@@ -425,9 +441,14 @@ class SerialwrapService:
                  "expect": p.expect.hex(" "), "baud": p.baud}
                 for p in self._mcu_registry.all()]}
         if method == "mcu.status":
+            with self._flash_lock:
+                last_detect = dict(self._flash_last_detect) if self._flash_last_detect else None
+                active_com = self._flash_active_com
             return {"ok": True,
                     "candidates": self._flash_candidates(),
-                    "flashing": self._flash_endpoint.is_flashing()}
+                    "flashing": self._flash_endpoint.is_flashing(),
+                    "flashing_com": active_com,
+                    "last_detect": last_detect}
 
         if method == "device.list":
             return {"ok": True, "devices": self._sessions.list_devices()}

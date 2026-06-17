@@ -117,3 +117,28 @@ def test_rx_writer_tolerates_closed_fd():
     os.close(slave)
     # 不應 raise
     w(b"\xFF\xFF\xFF")
+
+
+def test_pump_survives_sink_runtimeerror():
+    """bridge 中途掉線時 flash_tx 拋 RuntimeError；pump 須收斂結束、不上拋殺執行緒（C1）。"""
+    import os
+    import pty
+    import threading
+    from sw_core.flash_endpoint import pump_endpoint_to_sink
+
+    class _BadSink:
+        def flash_tx(self, payload):
+            raise RuntimeError("serial not ready")
+
+    master, slave = pty.openpty()
+    os.set_blocking(master, False)
+    stop = threading.Event()
+    t = threading.Thread(target=pump_endpoint_to_sink,
+                         args=(master, _BadSink(), stop),
+                         kwargs={"first_bytes": b"\x55"})
+    t.start()
+    t.join(timeout=2.0)
+    assert not t.is_alive()   # 例外被收斂，pump 乾淨結束
+    stop.set()
+    os.close(master)
+    os.close(slave)

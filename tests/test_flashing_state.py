@@ -58,3 +58,24 @@ class TestFlashingState(_Base):
         before = mgr.get_session("COM0").bridge
         mgr.enter_flashing("COM0")
         self.assertIs(mgr.get_session("COM0").bridge, before)
+
+
+class TestFlashingBlocksInjection(_Base):
+    def test_enter_exit_toggles_bridge_flash_mode(self):
+        """enter/exit_flashing 須在 bridge 上開關 flash_mode，據以擋 console 注入（C2）。"""
+        mgr = self._mgr([self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")])
+
+        class _FakeBridge:
+            def __init__(self):
+                self.flash = False
+            def set_flash_mode(self, enabled):
+                self.flash = enabled
+            def list_consoles(self):
+                return []
+
+        fb = _FakeBridge()
+        mgr.get_session("COM0").bridge = fb
+        mgr.enter_flashing("COM0")
+        self.assertTrue(fb.flash)
+        mgr.exit_flashing("COM0")
+        self.assertFalse(fb.flash)

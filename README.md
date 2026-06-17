@@ -573,7 +573,7 @@ flasher 接上去，破壞性的 erase/program 只會到已確認的線。
 # 查支援的 MCU 家族與目前候選
 serialwrap mcu patterns
 serialwrap mcu status
-cat /dev/serialwrap/dev/ttyMCU   # 只讀亦會列出支援家族（不送 bytes → 不進 flash）
+cat /tmp/serialwrap/dev/ttyMCU   # 只讀亦會列出支援家族（不送 bytes → 不進 flash）
 
 # 1) 先在 DUT console（serialwrap console session）把 MCU 帶進 BSL（GPIO reset，依板而定）
 # 2) host 改用 serialwrap 端點取代原本的 raw /dev/ttyUSBx：

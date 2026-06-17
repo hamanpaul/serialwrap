@@ -103,19 +103,22 @@ class FlashEndpoint:
     """
 
     def __init__(self, *, link_path, registry, list_candidates,
-                 on_flash_open=None, grace=0.3, idle_list_interval=0.5):
+                 on_flash_open=None, grace=0.3, idle_list_interval=0.5,
+                 client_cooldown=3.0):
         self._link_path = link_path
         self._registry = registry
         self._list_candidates = list_candidates       # () -> list[dict]
         self._on_flash_open = on_flash_open            # (master_fd, slave_fd, first_bytes) -> None
         self._grace = grace
         self._idle_list_interval = idle_list_interval
+        self._client_cooldown = client_cooldown        # flasher 寫入後抑制 idle 清單的秒數（I1）
         self._master_fd = None
         self._slave_fd = None
         self._stop = threading.Event()
         self._thread = None
         self._flash_active = threading.Event()
         self._last_list = 0.0
+        self._last_client_write = 0.0                  # 最後一次 client（flasher）寫入的 monotonic
 
     def start(self):
         """開啟 PTY、建立 symlink、啟動背景 loop 執行緒。"""
@@ -172,16 +175,27 @@ class FlashEndpoint:
                     first = os.read(self._master_fd, 4096)
                 except (OSError, BlockingIOError):
                     first = b""
+                # 記錄 flasher 活動時間：在 cool-down 內抑制 idle 清單寫入，避免在
+                # flasher 的 sync/retry 視窗把支援清單當成回應 bytes 灌進去（I1）。
+                self._last_client_write = time.monotonic()
                 if not self._flash_active.is_set():
                     self._flash_active.set()
                     try:
                         if self._on_flash_open is not None:
                             self._on_flash_open(self._master_fd, self._slave_fd, first)
+                    except Exception:
+                        # on_flash_open（偵測 / pump）的任何例外都不得殺死端點執行緒；
+                        # 收斂後繼續服務後續 open（C1 加固）。
+                        pass
                     finally:
                         self._flash_active.clear()
                 continue
-            # idle：定期寫支援清單（供 cat 讀取）
+            # idle：定期寫支援清單（供 cat 只讀查詢）。
+            # 只有在「近期沒有任何 client 寫入」時才寫，確保 no-match / flasher 連線期間
+            # 端點保持沉默（spec：no-match SHALL NOT 寫入端點）（I1）。
             now = time.monotonic()
+            if now - self._last_client_write < self._client_cooldown:
+                continue
             if now - self._last_list >= self._idle_list_interval:
                 self._last_list = now
                 text = self._registry.render_support_list(
@@ -218,21 +232,27 @@ def pump_endpoint_to_sink(
         first_bytes: 已由呼叫者預讀的首段位元組，需先轉送給 sink。
         chunk: 每次 os.read 的最大讀取位元組數。
     """
-    if first_bytes:
-        sink.flash_tx(first_bytes)
-    while not stop_event.is_set():
-        try:
-            rlist, _, _ = select.select([master_fd], [], [], 0.2)
-        except OSError:
-            return
-        if master_fd in rlist:
+    # sink.flash_tx 可能在 bridge 中途掉線時拋 RuntimeError("serial not ready")
+    # 或 OSError；必須在 pump 內收斂為「乾淨結束」，否則例外會上拋並殺死端點執行緒，
+    # 使 /dev/ttyMCU 永久失效直到 daemon 重啟（C1）。
+    try:
+        if first_bytes:
+            sink.flash_tx(first_bytes)
+        while not stop_event.is_set():
             try:
-                data = os.read(master_fd, chunk)
-            except (OSError, BlockingIOError):
+                rlist, _, _ = select.select([master_fd], [], [], 0.2)
+            except OSError:
                 return
-            if not data:
-                return  # EOF：flasher 已關閉端點
-            sink.flash_tx(data)
+            if master_fd in rlist:
+                try:
+                    data = os.read(master_fd, chunk)
+                except (OSError, BlockingIOError):
+                    return
+                if not data:
+                    return  # EOF：flasher 已關閉端點
+                sink.flash_tx(data)
+    except (OSError, RuntimeError):
+        return  # bridge 中途掉線 / 裝置不可用 → 結束 pump，讓上層 exit_flashing 收尾
 
 
 def make_rx_to_endpoint_writer(master_fd: int):
@@ -256,6 +276,12 @@ def make_rx_to_endpoint_writer(master_fd: int):
 
 def resolve_flash_target(selector: str, sessions: list[dict], *, force: bool) -> dict:
     """解析顯式 flash 目標並防呆。
+
+    .. note::
+        **v1 保留、尚未接線**：目前 flash 走「開端點 → 自動 sync-probe 認線」路徑，
+        偵測階段本就排除 `command_capable` console，無顯式 target/`--force` CLI。
+        本函式為日後「顯式指定 flash 目標」路徑（`--selector/--by-id/--force`）預留的
+        防呆建構塊，已測試但尚未由任何 runtime 路徑呼叫。
 
     若目標是 command_capable console（很可能是 DUT），預設擋下，需 force 才覆寫，
     避免把韌體燒進 console 線。

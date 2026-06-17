@@ -617,6 +617,8 @@ class SessionManager:
                 return {"ok": True, "already_flashing": True, "session": session.to_public_dict()}
             session.flash_prev_state = session.state   # 記住以便結束後恢復
             session.state = "FLASHING"
+            if session.bridge is not None:
+                session.bridge.set_flash_mode(True)   # 擋 console 注入（C2）
             public = session.to_public_dict()
         return {"ok": True, "session": public}
 
@@ -630,6 +632,8 @@ class SessionManager:
                 return {"ok": True, "not_flashing": True, "session": session.to_public_dict()}
             session.state = session.flash_prev_state or ("READY" if session.bridge is not None else "DETACHED")
             session.flash_prev_state = None
+            if session.bridge is not None:
+                session.bridge.set_flash_mode(False)   # 解除 console 注入封鎖
             public = session.to_public_dict()
         return {"ok": True, "session": public}
 
@@ -2169,6 +2173,9 @@ class SessionManager:
                 session = self._sessions.get(lease.session_id)
                 if session is None or session.bridge is None:
                     result = {"ok": False, "error_code": "SESSION_NOT_READY", "interactive_id": interactive_id}
+                elif session.state == "FLASHING":
+                    # FLASHING 期間禁止任何注入，避免汙染 SBL binary（C2）。
+                    result = {"ok": False, "error_code": "FLASHING_BUSY", "interactive_id": interactive_id}
                 else:
                     payload = self._encode_interactive_payload(data, encoding)
                     self._mark_session_tx(session)

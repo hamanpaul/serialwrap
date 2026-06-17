@@ -25,3 +25,20 @@ def test_flash_tx_is_byte_exact(monkeypatch):
     payload = bytes([0x08, 0x0A, 0x0D, 0x7F, 0x55, 0x00])
     b.flash_tx(payload)                       # 新 API：flash 模式 TX
     assert bytes(sent) == payload             # 無退格/斷行/行組合汙染
+
+
+def test_flash_mode_blocks_console_injection(monkeypatch):
+    """FLASHING 期間 console→device 注入須被丟棄，避免汙染 SBL binary（C2）。"""
+    b = _bridge()
+    b.set_flash_mode(True)
+    sent = []
+    monkeypatch.setattr(b, "send_bytes", lambda *a, **k: sent.append(a))
+
+    class _Client:
+        client_id = "c1"
+        master_fd = -1
+        tx_buffer = bytearray()
+
+    b._handle_console_rx(_Client(), b"echo pwn\n")
+    assert sent == []          # flash 模式下完全不送
+    b.set_flash_mode(False)

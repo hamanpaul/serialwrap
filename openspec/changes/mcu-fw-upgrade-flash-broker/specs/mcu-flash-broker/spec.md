@@ -86,10 +86,12 @@ expected ACK、baud 與 timeout。registry SHALL 預設含 TI CC2674/CC2652（pr
 ### Requirement: FLASHING 狀態、仲裁與自動恢復
 
 認線成功後，目標 session SHALL 進入 `FLASHING` 狀態。`FLASHING` 期間對該 session 的 `cmd submit`
-SHALL 回 `FLASHING_BUSY`；其他 COM session SHALL 不受影響；daemon SHALL 持續運作。flash 結束
-（端點被關閉/hangup、閒置 timeout、或顯式結束）後，serialwrap SHALL 以 `_probe_external_holder` 確認
-無外部持有，再經 `_spawn_attach` 自動恢復 console 至原本能力；恢復失敗 SHALL 停於 `ATTACHING` 並回報
-明確 `last_error`。flash 期間既有的 human console SHALL 轉為唯讀快照（可見進度、不可注入）。
+SHALL 回 `FLASHING_BUSY`；其他 COM session SHALL 不受影響；daemon SHALL 持續運作。
+**flash 期間 bridge 全程不關閉**（daemon 維持 real device 唯一 reader，FD 從未離開 daemon、故不存在
+外部 holder）；既有 human console SHALL 轉為唯讀快照——RX 仍可見，但**所有 console / interactive
+注入 SHALL 被封鎖**（`FLASHING_BUSY`），確保 SBL binary 不被汙染。flash 結束（端點 hangup、閒置
+timeout、或 bridge 掉線）後，serialwrap SHALL 離開 `FLASHING` 並恢復先前狀態（bridge 未關，無需
+re-attach）。
 
 #### Scenario: FLASHING 期間拒絕 cmd submit
 
@@ -101,11 +103,16 @@ SHALL 回 `FLASHING_BUSY`；其他 COM session SHALL 不受影響；daemon SHALL
 - **WHEN** 某 session 處於 `FLASHING`
 - **THEN** 其他 COM session 仍可正常 `cmd submit` 與 console 操作
 
-#### Scenario: flash 結束自動恢復 console
+#### Scenario: flash 結束恢復 console
 
-- **WHEN** flasher 關閉端點（hangup）或閒置 timeout
-- **THEN** session 離開 `FLASHING`，經 holder 確認 + `_spawn_attach` 自動恢復至原 console 能力
-- **AND** 恢復失敗時停於 `ATTACHING` 並帶明確 `last_error`
+- **WHEN** flasher 關閉端點（hangup）、閒置 timeout，或 flash 期間 bridge 掉線
+- **THEN** session 離開 `FLASHING` 並恢復進入前的狀態（bridge 未關，無需 re-attach）
+- **AND** console 注入封鎖解除，恢復正常 console / cmd 能力
+
+#### Scenario: FLASHING 期間封鎖 console / interactive 注入
+
+- **WHEN** session 處於 `FLASHING`，human console 鍵入或 agent 呼叫 `interactive_send`
+- **THEN** 該注入被丟棄 / 回 `FLASHING_BUSY`，不寫入 real device（不汙染 SBL binary）
 
 ### Requirement: baud / framing 鏡射到 real device
 

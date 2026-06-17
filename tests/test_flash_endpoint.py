@@ -82,3 +82,32 @@ def test_endpoint_slave_is_raw_for_byte_transparency():
                 os.close(fd)
         finally:
             ep.stop()
+
+
+def test_no_idle_list_during_flasher_cooldown():
+    """flasher 寫入後的 cool-down 內，端點不得寫支援清單（no-match SHALL 沉默）（I1）。"""
+    with tempfile.TemporaryDirectory() as d:
+        link = os.path.join(d, "dev", "ttyMCU")
+        ep = FlashEndpoint(link_path=link, registry=McuPatternRegistry.default(),
+                           list_candidates=lambda: [], idle_list_interval=0.1,
+                           client_cooldown=5.0)
+        ep.start()
+        try:
+            fd = os.open(link, os.O_RDWR | os.O_NONBLOCK)
+            try:
+                os.write(fd, b"\x55\x55")   # 模擬 flasher sync 寫入
+                time.sleep(0.6)
+                data = b""
+                try:
+                    while True:
+                        chunk = os.read(fd, 4096)
+                        if not chunk:
+                            break
+                        data += chunk
+                except BlockingIOError:
+                    pass
+                assert b"ti-cc26xx" not in data   # cool-down 內保持沉默
+            finally:
+                os.close(fd)
+        finally:
+            ep.stop()
