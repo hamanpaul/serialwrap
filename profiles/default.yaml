@@ -54,6 +54,19 @@ profiles:
       stop_bits: 1
       flow_control: none
       xonxoff: false
+  uboot-template:
+    platform: passthrough
+    prompt_regex: "(?mi)^(=>|u-boot>|cfe>) $"
+    login_regex: "$^"
+    password_regex: "$^"
+    ready_probe: "echo __READY__${nonce}"
+    uart:
+      baud: 115200
+      data_bits: 8
+      parity: N
+      stop_bits: 1
+      flow_control: none
+      xonxoff: false
   others-template:
     platform: passthrough
     prompt_regex: ".*"

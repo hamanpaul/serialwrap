@@ -14,7 +14,13 @@ from typing import Any, Callable
 from .alias_registry import AliasRegistry
 from .auth import resolve_session_auth
 from .config import ProfileTemplate, SessionProfile
-from .constants import BOOTLOADER_RX_TAIL_BYTES, LOG_DIR, MAX_RECOVERY_LEASE_S, STATE_PATH
+from .constants import (
+    BOOTLOADER_RX_TAIL_BYTES,
+    HUMAN_ACTIVE_WINDOW_S,
+    LOG_DIR,
+    MAX_RECOVERY_LEASE_S,
+    STATE_PATH,
+)
 from .device_watcher import DeviceInfo
 from .login_fsm import detect_template, ensure_ready, probe_ready
 from .uart_io import PreservedConsoles, UARTBridge
@@ -225,6 +231,7 @@ class SessionRuntime:
             "act_no": self.profile.act_no,
             "device_by_id": self.profile.device_by_id,
             "platform": self.profile.platform,
+            "command_capable": self.profile.command_capable,
             "state": self.state,
             "last_error": self.last_error,
             "detached_at": self.detached_at,
@@ -917,7 +924,8 @@ class SessionManager:
             self._spawn_attach(by_id)
 
     def _probe_existing_bridge(self, session: SessionRuntime, bridge: UARTBridge) -> dict[str, Any]:
-        if session.profile.platform == "passthrough":
+        # 非 command-capable（無 ready_probe，含 passthrough）維持現狀不升 READY。
+        if not session.profile.command_capable:
             current = self._sessions.get(session.session_id)
             if current is None or current.bridge is not bridge:
                 return {"ok": False, "error_code": "SESSION_NOT_READY"}
@@ -1005,7 +1013,10 @@ class SessionManager:
             session_id = session.session_id
             profile = session.profile
             require_login = session.pending_auto_login or bool(profile.login_regex)
-            passthrough_only = profile.platform == "passthrough"
+            # 以 ready_probe 判定可否下命令；非 command-capable（含無 ready_probe 的
+            # passthrough）僅停在 ATTACHED 不 probe，有 ready_probe 的 passthrough
+            # 也要能走 probe 進 READY。
+            command_capable = profile.command_capable
             real_path = dev.real_path
             preserved_consoles = session.retained_consoles if isinstance(session.retained_consoles, PreservedConsoles) else None
 
@@ -1022,7 +1033,7 @@ class SessionManager:
 
         try:
             bridge.start()
-            if passthrough_only:
+            if not command_capable:
                 ok = False
                 err = None
             elif require_login:
@@ -1115,6 +1126,22 @@ class SessionManager:
                 session.attached_real_path = None
             self._on_detached(session.session_id)
 
+    def _default_passthrough_template(self) -> ProfileTemplate | None:
+        """auto-detect 失敗時的通用 passthrough fallback。
+
+        優先選非 command-capable 的 passthrough（如 others-template，純 console），
+        避免 uboot-template 這類具 ready_probe 的特定 passthrough 被誤當通用 fallback；
+        若沒有非 command-capable 的 passthrough，才退而用任一 passthrough（向後相容）。
+        """
+        generic = next(
+            (t for t in self._templates
+             if t.platform == "passthrough" and not t.command_capable),
+            None,
+        )
+        if generic is not None:
+            return generic
+        return next((t for t in self._templates if t.platform == "passthrough"), None)
+
     def _attach_by_id_dynamic(self, by_id: str) -> None:
         """動態偵測 template 並建立新 session。"""
         from .config import UartProfile
@@ -1145,8 +1172,9 @@ class SessionManager:
             except Exception:
                 pass
 
-        # 找 passthrough fallback
-        passthrough = next((t for t in self._templates if t.platform == "passthrough"), None)
+        # 找 passthrough fallback（通用 fallback 須為非 command-capable 的 passthrough，
+        # 避免 uboot-template 這類 command-capable 的特定 passthrough 搶走通用 fallback）
+        passthrough = self._default_passthrough_template()
         tpl = detected or passthrough
         if tpl is None:
             return
@@ -1172,7 +1200,8 @@ class SessionManager:
             gen_before = session.bridge_generation
             session_id = session.session_id
             require_login = session.pending_auto_login or bool(profile.login_regex)
-            passthrough_only = profile.platform == "passthrough"
+            # 與 _attach_by_id 一致，以 ready_probe 判定可否下命令。
+            command_capable = profile.command_capable
 
         bridge = UARTBridge(
             profile.com,
@@ -1186,7 +1215,7 @@ class SessionManager:
 
         try:
             bridge.start()
-            if passthrough_only:
+            if not command_capable:
                 ok, err = False, None
             elif require_login:
                 auth = resolve_session_auth(profile)
@@ -1326,8 +1355,9 @@ class SessionManager:
             lease.status = "closed"
             self._interactive.pop(lease_id, None)
 
-        # recovery lease with suspended human → stash restore or discard
-        if lease is not None and lease.recovery_mode and lease.suspended_human:
+        # 帶 suspended_human 的 lease（bootloader recovery 或 #53 soft preempt）關閉時 →
+        # 還原 stash 的 human lease 或丟棄；不限 recovery_mode，soft preempt（recovery_mode=False）亦適用。
+        if lease is not None and lease.suspended_human:
             stash = session._stashed_human_lease
             session._stashed_human_lease = None
             bridge = session.bridge
@@ -1392,11 +1422,26 @@ class SessionManager:
                 return restored, post
         return lease, post
 
-    def _lease_context(self, lease: InteractiveLease | None) -> dict[str, Any]:
+    def _lease_context(
+        self, lease: InteractiveLease | None, *, bridge: UARTBridge | None = None
+    ) -> dict[str, Any]:
         interactive_owner = lease.owner if lease is not None else None
+        human_attached = bool(interactive_owner and interactive_owner.startswith("human:"))
+        # human_active：human_attached 且最近一次真實鍵入仍在時間窗內（#53）。
+        # 讓「人類已 attach 但長時間 idle」的 lease 不再被當成正在使用，避免誤擋
+        # agent 行為；無 bridge / 從未鍵入 / 逾時皆為 False。
+        human_active = False
+        if human_attached and bridge is not None:
+            last = bridge.snapshot().get("last_human_input_at")
+            # last 在 production 僅為 None 或 float；以 isinstance 防呆，避免遇到
+            # 非數值（如未設定 return_value 的 mock）時在 '<=' 比較炸掉。
+            if isinstance(last, (int, float)) and not isinstance(last, bool):
+                if (time.monotonic() - last) <= HUMAN_ACTIVE_WINDOW_S:
+                    human_active = True
         return {
             "interactive_owner": interactive_owner,
-            "human_attached": bool(interactive_owner and interactive_owner.startswith("human:")),
+            "human_attached": human_attached,
+            "human_active": human_active,
             "recovery_mode": bool(lease is not None and lease.recovery_mode),
         }
 
@@ -1883,8 +1928,9 @@ class SessionManager:
             lease, post = self._refresh_interactive_locked(session)
             ok = session.bridge.detach_console(client_id)
             if lease is not None and lease.owner == human_owner:
-                # Human lease close：lease.recovery_mode=False，故 _close_interactive_locked
-                # 回傳的 post.needs_resume 必為 False（no-op post），安全丟棄。
+                # Human lease close：一般 human lease 的 suspended_human=False，故
+                # _close_interactive_locked 走一般 close 分支、post.needs_resume 必為 False
+                # （no-op post），安全丟棄。（還原分支現以 suspended_human 判定，非 recovery_mode。）
                 _, _ = self._close_interactive_locked(
                     session, interactive_id=lease.interactive_id, expected_owner=human_owner
                 )
@@ -1926,11 +1972,42 @@ class SessionManager:
                     if post.needs_resume:
                         retry_after_post = True
                     elif existing is not None:
-                        return {
-                            "ok": False,
-                            "error_code": "SESSION_INTERACTIVE_BUSY",
-                            "interactive_session_id": session.interactive_session_id,
-                        }
+                        # #53 soft preempt：human lease 閒置（human_active=False）時，
+                        # agent 可暫停（降級）human lease 取得控制權；human console 不中斷，
+                        # 其鍵入進 deferred buffer，agent close 後還原並回放。
+                        # human 仍 active 或既有為 agent lease → 維持 BUSY。
+                        # 註：從未鍵入（last_human_input_at=None）視為 idle、可被 preempt——
+                        # soft preempt 非破壞性（降級+回放），故此處理為刻意行為。
+                        human_active = self._lease_context(
+                            existing, bridge=session.bridge
+                        )["human_active"]
+                        if (
+                            existing.owner.startswith("human:")
+                            and not human_active
+                            and not owner.startswith("human:")
+                        ):
+                            self._interactive.pop(existing.interactive_id, None)
+                            session.interactive_session_id = None
+                            session._stashed_human_lease = existing
+                            session.bridge.suspend_interactive()
+                            lease = self._open_interactive_locked(
+                                session, owner=owner, timeout_s=timeout_s,
+                                suspended_human=True,
+                            )
+                            bridge = session.bridge
+                            result = {
+                                "ok": True,
+                                "interactive_id": lease.interactive_id,
+                                "session": session.to_public_dict(),
+                                "recovery_mode": False,
+                                "soft_preempted": True,
+                            }
+                        else:
+                            return {
+                                "ok": False,
+                                "error_code": "SESSION_INTERACTIVE_BUSY",
+                                "interactive_session_id": session.interactive_session_id,
+                            }
                     else:
                         lease = self._open_interactive_locked(session, owner=owner, timeout_s=timeout_s)
                         bridge = session.bridge
@@ -2115,6 +2192,25 @@ class SessionManager:
         return {"ok": True, "interactive_id": interactive_id}
 
     def self_test(self, selector: str, *, timeout_s: float = 2.0, strict_human_lock: bool = False) -> dict[str, Any]:
+        """對外入口：在所有分支的最外層 result dict 注入 command_capable。
+
+        #51 sub-task A：呼叫端不必鑽進巢狀 "session" dict 即可判斷該 session
+        是否可下命令。SESSION_NOT_FOUND 等查無 session 的分支一律以 False 表示。
+        """
+        result = self._self_test_impl(
+            selector, timeout_s=timeout_s, strict_human_lock=strict_human_lock
+        )
+        if "command_capable" not in result:
+            # 直接取用 impl 在 lock 內快照進 result["session"] 的值，避免再開一次
+            # lock 重撈 session（消除多餘鎖與 TOCTOU 窗口）。查無 session 的分支
+            # （如 SESSION_NOT_FOUND）沒有 "session" key → 一律 False。
+            nested = result.get("session")
+            result["command_capable"] = (
+                bool(nested.get("command_capable", False)) if nested is not None else False
+            )
+        return result
+
+    def _self_test_impl(self, selector: str, *, timeout_s: float = 2.0, strict_human_lock: bool = False) -> dict[str, Any]:
         suspend_human_interactive = False
         post = _PostCloseAction()
         result: dict[str, Any] | None = None
@@ -2148,10 +2244,10 @@ class SessionManager:
                         "classification": "SESSION_RECOVERING",
                         "session": session.to_public_dict(),
                         "recommended_action": "wait",
-                        **self._lease_context(lease),
+                        **self._lease_context(lease, bridge=session.bridge),
                     }
                 lease, post = self._refresh_interactive_locked(session)
-                lease_context = self._lease_context(lease)
+                lease_context = self._lease_context(lease, bridge=session.bridge)
                 device = self._devices.get(session.profile.device_by_id)
                 attached_real_path = session.attached_real_path
                 bridge = session.bridge

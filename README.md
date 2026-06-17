@@ -112,6 +112,23 @@ stateDiagram-v2
     RECOVERING --> DETACHED: device lost
 ```
 
+### `ATTACHED` vs `READY`：可不可以下命令（command_capable）
+
+`ATTACHED` 代表「裝置已連上、console 可用」，但**不保證能下 line 命令**；`READY` 才代表
+broker 能框出命令的輸出（送出 → 看到 prompt → 取回 stdout）。一個 session 能不能進 `READY`
+取決於它綁的 profile 是否 **command-capable**：
+
+- **command_capable** = profile 的 `ready_probe` 非空（取代舊的「`platform == passthrough` 就不可用」寫死）。
+- 無 `ready_probe`（如 `others-template` 這種純 console / passthrough profile）→ 維持 `ATTACHED`；
+  對它 `cmd submit` 會回明確的 **`PROFILE_NOT_COMMAND_CAPABLE`**（附 hint），而非語意不清的 `SESSION_NOT_READY`。
+- 有 `ready_probe`（+ 能匹配目標 prompt 的 `prompt_regex`）→ 走正常 probe 進 `READY`，`cmd submit` 可用。
+- `READY` 與底層是 OS shell 或 bootloader **無關**：只要 profile 的 prompt/`ready_probe` 對得上即可。
+  停在 U-Boot 的板子可綁 **`uboot-template`**（`prompt_regex` 匹配 `=>` / `u-boot>` / `CFE>`，
+  `ready_probe: echo __READY__${nonce}`）進 `READY`，然後 `cmd submit --cmd 'printenv'` 下 U-Boot 命令。
+- `self_test` / get-state 會在最外層回 `command_capable`，呼叫端可據此分辨「ATTACHED 但本就不可下命令」與「ATTACHED 應可進 READY」。
+
+> 注意：OS profile（prpl/shell）若板子掉進 U-Boot，OS 的 `prompt_regex` 對不上 → **不會** READY（正確：避免把 Linux 命令送進 bootloader）。
+
 ## Agent / Human Co-work 時序圖
 
 ```mermaid
@@ -138,6 +155,22 @@ sequenceDiagram
     B->>T: flush deferred
     D-->>G: command result
 ```
+
+### Human lease 的閒置降級（soft preempt）與孤兒清理
+
+human console（minicom）持有的 interactive lease 是**禮讓**機制、不是硬鎖：
+
+- broker 記錄 human 的**真實鍵入時間**（`last_human_input_at`，只算真人鍵入，不含 broker 週期 probe），
+  `self_test` 以此回報 `human_active`（最後鍵入在 `HUMAN_ACTIVE_WINDOW_S = 60s` 內才為 `True`）。
+  `human_attached`（是否有 human lease）語意不變。
+- agent `interactive-open` 遇到**閒置**（`human_active=False`）的 human lease 時，會 **soft preempt**：
+  把 human **降級**（console 不中斷，其鍵入進 deferred buffer），agent 取得控制權；agent 關閉 lease 後
+  自動還原 human 並回放暫存輸入。human 仍 active 時則維持 `SESSION_INTERACTIVE_BUSY`、不被打斷。
+- **孤兒清理**：minicom 真的關閉（console peer 消失）→ `self_test` 時由 liveness 自動 detach、釋放 lease；
+  活著但長時間 idle 的 console 只降級、不自動 detach。要徹底收掉殘留 console，仍用
+  `session console-detach` 或 `session recover --force`。
+
+> 這解決了「孤兒 minicom 長期假性佔用 console，導致 agent 取不到互動控制權而卡住」的問題。
 
 ## Multi-Agent 競爭時序圖
 
@@ -806,6 +839,72 @@ run end reason 分布如下：
 2. 把這次 32h controller 的負載縮成可在 1~2 小時內重現的 stress case，優先重現「卡在 `ATTACHED`」而不是只觀察 daemon restart。
 3. 補 attach / recover gating 的 regression test，避免 session 無限停在 `ATTACHED`。
 4. 修完後重新跑 long-run，驗收標準至少要把 `session_not_ready:ATTACHED` 造成的 restart 降到 `0`，且不能讓 human / multi-agent 協作退化。
+
+## 真機驗證手法
+
+### Bootloader（U-Boot）command profile 真機驗證
+
+驗證 `uboot-template` 之類 bootloader command profile 能在真機進 `READY` 並下 line 命令時，
+核心原則是**把驗證關進沙箱、完全不動 production daemon 設定**，失敗可隨時丟棄、零殘留。
+
+**為何不直接在 production 上改**：profile 綁定是 detection-based，而 `uboot-template` 是
+`passthrough`（auto-detect 不會自動選它，只能明確綁定）；且沒有乾淨的 runtime 改 profile 的
+CLI（`bind` 只改 device、`recover`/`clear` 沿用舊 profile）。在 production 改要重設定 + 重啟，
+會殺掉其他 COM、動到持久化狀態。
+
+**隔離驗證步驟（dogfood `device release`/`device attach`）**：
+
+1. **釋放 raw device**：`serialwrap device release --selector COMx --source agent:verify`
+   —— production daemon 關閉該 UART FD、進 `RELEASED`，但**繼續運作、其他 COM 不受影響**。
+2. **起受限的 throwaway daemon**：用獨立 socket/lock；關鍵是把
+   `SERIALWRAP_BY_ID_DIR` 指到一個**只含目標裝置一條 by-id symlink** 的暫存目錄，避免它掃到
+   其他裝置與 production 形成 two-reader 衝突。該 daemon 的 profile 加一段 `targets:` 把目標
+   by-id **明確綁到 `uboot-template`**（繞過 auto-detect）。
+3. **把板子弄進 U-Boot**：開 interactive lease → 送 `reboot` → 接著以 ~0.3s 間隔持續送鍵
+   （space）約 30 秒，攔截「Hit any key to stop autoboot」視窗；若是 boot menu，送對應鍵
+   （例如 `0` = Exit）掉到 U-Boot console（prompt 例如 `U-Boot> `）。
+4. **走完整 serialwrap 路徑驗證**：`session self-test`（期望 `OK`/`probe_ok=True`/`READY`）→
+   `cmd submit --cmd 'printenv' --mode line`（期望框出 env dump）。
+5. **還原**：送 `boot` 回正常 OS → 停 throwaway daemon → `device attach --selector COMx` 收回
+   → 等板子開機穩定後（早期 PCIe/kernel 噪音會干擾偵測）重啟 production daemon，讓 detection
+   重新綁回原 profile。
+
+> 真機才抓得到的陷阱：(1) 多個 `passthrough` template 會搶 auto-detect 的通用 fallback，通用
+> fallback 必須限定為非 command-capable 的 passthrough；(2) 實機 U-Boot prompt 可能是大寫
+> `U-Boot> `，`prompt_regex` 要用 `(?mi)` 大小寫不敏感。
+
+### Co-work 競爭/對抗測試（human + 多 agent 共用同一 COM）
+
+驗證 human console 與多個 agent 同時存取同一 COM 時，single-writer 仲裁、輸出框定、
+`human_active` 時間窗、soft preempt 與孤兒 liveness 等行為（對應 #51/#53）。在一顆有 shell 的
+真機板（command-capable session，例如 op3-template）上跑：
+
+**建置與步驟**
+
+1. **tmux 開 minicom 模擬 human**：`tmux new-session -d -s cowork`，於 pane 內執行
+   `~/.paul_tools/minicom COMx`（broker minicom：自動 `console-attach` 並在 broker vtty 上開
+   minicom）。`session console-list` 應出現第二個 console、`self-test` 回 `human_attached=true`。
+2. **多 agent 並行存取**：開 2 個 subagent（或 2 條並行 CLI loop），各以不同 `--source` 連續
+   `cmd submit --mode line`（送帶唯一 marker 的 `echo`），驗證每筆 `cmd status` 的 stdout 只含
+   自己的 marker（無 cross-talk / 錯接）。
+3. **tmux send-keys 模擬 human 操作**：`tmux send-keys -t cowork -l -- "echo HUMAN_MARK"` +
+   `Enter`。真人鍵入後 `self-test` 應回 `human_active=true`；此時 agent `interactive-open` 應回
+   `SESSION_INTERACTIVE_BUSY`（active human 不被搶）；human 命令在 minicom 畫面上各自獨立成行、
+   不與 agent 輸出位元組交錯（deferral 生效）。
+4. **kill minicom 再重接（退出再進入）**：以 PID `kill -9` 突然殺掉 minicom（不走 clean
+   `console-detach`）→ `self-test` 應由 liveness 偵測 peer 消失、自動 detach 該 console、
+   `human_attached=false`、`console_count` 回 1；重新 `~/.paul_tools/minicom COMx` 即重新 attach、
+   `human_attached=true`、可再次輸入。
+5. **（選用）長時間壓力測試**：延長步驟 2~3 的並行回合數與時間，觀察 TX/RX 框定與 fairness。
+
+> 額外驗證 soft preempt：human 閒置超過 `HUMAN_ACTIVE_WINDOW_S`（60s）後 `human_active=false`，
+> 此時 agent `interactive-open` 會回 `soft_preempted=true`，且 human console **只降級不中斷**
+> （`console-list` 仍在、owner 轉為 agent），agent close lease 後 human owner 還原。
+>
+> 注意事項：(1) **不要用 `pkill -f "minicom -D ..."`**——pattern 會 self-match 你自己的 shell
+> cmdline；改用 `pgrep -x minicom` 取 PID 再 `kill`。(2) minicom 在 broker pts 上常顯示
+> `Offline`（DCD 未拉起），不影響輸入轉送。(3) `log tail-raw` 預設 `from-seq=0`（最舊起算），
+> 驗證最新輸出要看 minicom 畫面或帶較大 `--limit`/`--from-seq`。
 
 ## Remote Support（ssh-tunnel 遠端連線）
 

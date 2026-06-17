@@ -37,6 +37,11 @@ class ProfileTemplate:
     uart: UartProfile = dataclasses.field(default_factory=UartProfile)
     bootloader_prompts: tuple[str, ...] = ()
 
+    @property
+    def command_capable(self) -> bool:
+        """是否可下命令。判準同 SessionProfile：有非空白 ready_probe 才可。"""
+        return bool((self.ready_probe or "").strip())
+
 
 @dataclasses.dataclass(frozen=True)
 class SessionProfile:
@@ -61,6 +66,16 @@ class SessionProfile:
     log_dir: str | None = None
     uart: UartProfile = dataclasses.field(default_factory=UartProfile)
     bootloader_prompts: tuple[str, ...] = ()
+
+    @property
+    def command_capable(self) -> bool:
+        """是否可下命令。
+
+        以 ready_probe 是否設定為判準：有非空白 ready_probe 才能 probe 進
+        READY 並接受 `cmd submit`；空 ready_probe（含 passthrough/others-template
+        等僅 console 的 profile）僅支援 console，不可下命令。
+        """
+        return bool((self.ready_probe or "").strip())
 
 
 def _as_int(v: Any, default: int) -> int:

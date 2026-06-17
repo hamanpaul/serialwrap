@@ -43,6 +43,8 @@ MAX_RECOVERY_LEASE_S: float = 120.0
 """recovery interactive lease 最長持續秒數。"""
 BOOTLOADER_RX_TAIL_BYTES: int = 512
 """self_test 讀取 RX tail 的位元組數，用於 bootloader prompt 比對。"""
+HUMAN_ACTIVE_WINDOW_S: float = 60.0
+"""human interactive lease 視為仍在使用的最後鍵入時間窗（秒）。"""
 
 
 def ensure_runtime_dirs() -> None:

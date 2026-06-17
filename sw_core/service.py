@@ -272,6 +272,15 @@ class SerialwrapService:
             return None, state
         session = state["session"]
         if session.get("state") != "READY":
+            # ATTACHED 且非 command-capable（無 ready_probe，僅支援 console）的 profile
+            # 永遠不會進 READY，回語意明確的錯誤碼而非 SESSION_NOT_READY。
+            if session.get("state") == "ATTACHED" and not session.get("command_capable", True):
+                return None, {
+                    "ok": False,
+                    "error_code": "PROFILE_NOT_COMMAND_CAPABLE",
+                    "hint": "此 profile 僅支援 console；要下命令請設定 ready_probe 或改用具 prompt 的 profile。",
+                    "session": session,
+                }
             return None, {"ok": False, "error_code": "SESSION_NOT_READY", "session": session}
         return str(session["session_id"]), None
 

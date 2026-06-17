@@ -99,6 +99,9 @@ class UARTBridge:
         self._agent_active: bool = False
         self._suspended_owner: str | None = None
         self._deferred_buffers: dict[str, bytearray] = {}
+        # 最後一次「真實 human owner 鍵入」的 monotonic 時間（#53）。僅 human-OWNER
+        # 直接 raw 送出分支會更新；deferred buffer、serial RX loop、agent 注入都不更新。
+        self._last_human_input_at: float | None = None
 
     @property
     def vtty_path(self) -> str | None:
@@ -399,6 +402,9 @@ class UARTBridge:
             suspended = self._suspended_owner
 
         if owner == f"human:{client.client_id}":
+            # 僅在真實 human owner 鍵入時記錄時間（#53），供 human_active 時間窗判定。
+            with self._state_lock:
+                self._last_human_input_at = time.monotonic()
             self.send_bytes(data, source=f"human:{client.client_id}", cmd_id=None)
             return
 
@@ -635,6 +641,7 @@ class UARTBridge:
                 if client is not None:
                     primary = client.slave_path
             interactive_owner = self._interactive_owner
+            last_human_input_at = self._last_human_input_at
         serial_alive = False
         if serial_fd is not None:
             try:
@@ -650,6 +657,7 @@ class UARTBridge:
             "serial_alive": serial_alive,
             "vtty_alive": vtty_alive,
             "interactive_owner": interactive_owner,
+            "last_human_input_at": last_human_input_at,
             "consoles": consoles,
             "running": bool(self._thread and self._thread.is_alive()),
         }
