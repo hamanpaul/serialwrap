@@ -4,7 +4,9 @@
 
 `SessionManager.self_test` 的所有 return SHALL 在最外層 dict 包含 `human_active: boolean`：當 session 存在 human lease 且 `now - last_human_input_at <= HUMAN_ACTIVE_WINDOW_S`（60s）時為 `true`；其他情況（無 lease、agent owner、human lease 但已閒置超過視窗）為 `false`。
 
-此欄位 SHALL 與既有 `human_attached` 並存且不改變 `human_attached` 語意（`human_attached` 仍為「有 human lease」）。`self_test` 的 idle 相關 `recommended_action` SHALL 以 `human_active`（而非 `human_attached`）為依據——閒置（`human_active=False`）的 human lease SHALL NOT 阻擋 readiness 判定或 agent 操作建議。
+此欄位 SHALL 與既有 `human_attached` 並存且不改變 `human_attached` 語意（`human_attached` 仍為「有 human lease」）。在**預設模式**（`strict_human_lock=False`）下，`self_test` 的 idle 相關 `recommended_action` SHALL 以 `human_active`（而非 `human_attached`）為依據——閒置（`human_active=False`）的 human lease SHALL NOT 阻擋 readiness 判定或 agent 操作建議。
+
+`strict_human_lock=True` 為明確 opt-in 的嚴格模式，刻意尊重**任何** human lease（不論 active/idle），故其 `HUMAN_INTERACTIVE_ACTIVE` / `wait_or_detach_console` 行為 SHALL NOT 受 `human_active` 放寬影響——這是設計上的刻意例外。
 
 #### Scenario: human lease present but idle
 
