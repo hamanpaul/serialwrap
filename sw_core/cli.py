@@ -257,41 +257,64 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--endpoint", default=None, metavar="ENDPOINT", help="遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）")
     p.add_argument("--timeout", dest="timeout_s", type=float, default=5.0, help="RPC timeout 秒數（預設: %(default)s）")
 
-    sub = p.add_subparsers(dest="cmd", required=True)
+    sub = p.add_subparsers(
+        dest="cmd",
+        required=True,
+        title="command groups",
+        metavar="<group>",
+    )
 
-    p_daemon = sub.add_parser("daemon")
-    daemon_sub = p_daemon.add_subparsers(dest="daemon_cmd", required=True)
+    p_daemon = sub.add_parser(
+        "daemon",
+        help="管理 serialwrap daemon（啟動／停止／狀態）",
+        description="管理 serialwrap daemon 行程：啟動、停止與查詢執行狀態。",
+    )
+    daemon_sub = p_daemon.add_subparsers(dest="daemon_cmd", required=True, metavar="<command>")
 
-    p_ds = daemon_sub.add_parser("start")
+    p_ds = daemon_sub.add_parser("start", help="啟動 daemon（--foreground 可前景執行）")
     p_ds.add_argument("--profile-dir", default=PROFILE_DIR)
     p_ds.add_argument("--lock", default=LOCK_PATH)
     p_ds.add_argument("--foreground", action="store_true")
 
-    daemon_sub.add_parser("stop")
-    daemon_sub.add_parser("status")
+    daemon_sub.add_parser("stop", help="停止執行中的 daemon")
+    daemon_sub.add_parser("status", help="顯示 daemon 狀態（pid／sessions／devices／log 路徑）")
 
-    p_device = sub.add_parser("device")
-    device_sub = p_device.add_subparsers(dest="device_cmd", required=True)
-    device_sub.add_parser("list")
-    p_drel = device_sub.add_parser("release")
+    p_device = sub.add_parser(
+        "device",
+        help="實體 UART 裝置列舉與 handoff（release／attach）",
+        description="管理實體 UART 裝置：列舉裝置，以及把 raw device 暫時交給外部工具獨佔再收回。",
+    )
+    device_sub = p_device.add_subparsers(dest="device_cmd", required=True, metavar="<command>")
+    device_sub.add_parser("list", help="列出實體 UART 裝置（real_path 與 by-id）")
+    p_drel = device_sub.add_parser(
+        "release",
+        help="釋放 raw 裝置給外部工具獨佔（如 MCU 燒錄），進入 RELEASED 不自動搶回",
+    )
     p_drel.add_argument("--selector", required=True)
     p_drel.add_argument("--source", default="cli")
     p_drel.add_argument("--reason", default=None)
-    p_datt = device_sub.add_parser("attach")
+    p_datt = device_sub.add_parser(
+        "attach",
+        help="收回先前 release 的裝置並重建 console（外部仍持有時回 DEVICE_STILL_HELD，--force 略過）",
+    )
     p_datt.add_argument("--selector", required=True)
     p_datt.add_argument("--force", action="store_true")
 
-    p_session = sub.add_parser("session")
-    sess_sub = p_session.add_subparsers(dest="session_cmd", required=True)
-    sess_sub.add_parser("list")
-    p_sc = sess_sub.add_parser("clear")
+    p_session = sub.add_parser(
+        "session",
+        help="session 生命週期、探測、recover、console 與 interactive 操作",
+        description="管理 session：列舉與綁定、健康探測（self-test）、recover、console 與 interactive lease、capture log。",
+    )
+    sess_sub = p_session.add_subparsers(dest="session_cmd", required=True, metavar="<command>")
+    sess_sub.add_parser("list", help="列出所有 session 及其狀態")
+    p_sc = sess_sub.add_parser("clear", help="清除 session（detach 後會自動 re-attach；交接外部請改用 device release）")
     p_sc.add_argument("--selector", required=True, help="session_id | COMx | alias")
-    p_sb = sess_sub.add_parser("bind")
+    p_sb = sess_sub.add_parser("bind", help="把 session 綁定到指定裝置 by-id")
     p_sb.add_argument("--selector", required=True, help="session_id | COMx | alias")
     p_sb.add_argument("--device-by-id", required=True)
-    p_sa = sess_sub.add_parser("attach")
+    p_sa = sess_sub.add_parser("attach", help="將 session attach 到裝置並建立 bridge")
     p_sa.add_argument("--selector", required=True, help="session_id | COMx | alias")
-    p_sst = sess_sub.add_parser("self-test")
+    p_sst = sess_sub.add_parser("self-test", help="探測 session 健康度，回報 classification 與 recommended_action")
     p_sst.add_argument("--selector", required=True, help="session_id | COMx | alias")
     p_sst.add_argument("--probe-timeout", dest="probe_timeout_s", type=float, default=2.0)
     p_sst.add_argument(
@@ -300,21 +323,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="嚴格模式：若 human interactive lease 仍在使用中則直接回報 busy；預設模式會先暫停 human interactive lease 再做 probe",
     )
-    p_sact = sess_sub.add_parser("activity", help="show RX/TX/state activity for a session")
+    p_sact = sess_sub.add_parser("activity", help="顯示 session 的 RX／TX／state 活動")
     p_sact.add_argument("--selector", required=True, help="session_id | COMx | alias")
-    p_sr = sess_sub.add_parser("recover")
+    p_sr = sess_sub.add_parser("recover", help="重建 bridge 修復不健康的 session（TARGET_UNRESPONSIVE 時用這個，非 device attach）")
     p_sr.add_argument("--selector", required=True, help="session_id | COMx | alias")
     p_sr.add_argument("--timeout", dest="recover_timeout_s", type=float, default=2.0)
     p_sr.add_argument("--force", action="store_true", help="force clear+reattach if normal recovery fails")
-    p_sca = sess_sub.add_parser("console-attach")
+    p_sca = sess_sub.add_parser("console-attach", help="附加一個 console reader 到 session")
     p_sca.add_argument("--selector", required=True, help="session_id | COMx | alias")
     p_sca.add_argument("--label")
-    p_scd = sess_sub.add_parser("console-detach")
+    p_scd = sess_sub.add_parser("console-detach", help="卸除指定的 console reader")
     p_scd.add_argument("--selector", required=True, help="session_id | COMx | alias")
     p_scd.add_argument("--client-id", required=True)
-    p_scl = sess_sub.add_parser("console-list")
+    p_scl = sess_sub.add_parser("console-list", help="列出 session 上的 console readers")
     p_scl.add_argument("--selector", required=True, help="session_id | COMx | alias")
-    p_sio = sess_sub.add_parser("interactive-open")
+    p_sio = sess_sub.add_parser("interactive-open", help="開啟 interactive lease（給全螢幕互動程式用）")
     p_sio.add_argument("--selector", required=True, help="session_id | COMx | alias")
     p_sio.add_argument("--owner", default="agent")
     p_sio.add_argument("--timeout", dest="interactive_timeout_s", type=float, default=60.0)
@@ -326,38 +349,46 @@ def build_parser() -> argparse.ArgumentParser:
         help="允許在 ATTACHED 狀態下開啟 bootloader recovery lease（需通過 bootloader prompt 比對）。"
              " 若 session 已有 human interactive lease 則暫停並在 close 時恢復。",
     )
-    p_sis = sess_sub.add_parser("interactive-send")
+    p_sis = sess_sub.add_parser("interactive-send", help="送出按鍵／資料到 interactive lease")
     p_sis.add_argument("--interactive-id", required=True)
     p_sis.add_argument("--data", required=True)
     p_sis.add_argument("--encoding", default="plain")
-    p_sist = sess_sub.add_parser("interactive-status")
+    p_sist = sess_sub.add_parser("interactive-status", help="讀取 interactive lease 目前畫面與狀態")
     p_sist.add_argument("--interactive-id", required=True)
     p_sist.add_argument("--screen-chars", type=int, default=2048)
-    p_sic = sess_sub.add_parser("interactive-close")
+    p_sic = sess_sub.add_parser("interactive-close", help="關閉 interactive lease")
     p_sic.add_argument("--interactive-id", required=True)
-    p_sls = sess_sub.add_parser("log-start")
+    p_sls = sess_sub.add_parser("log-start", help="開始該 session 的 capture log")
     p_sls.add_argument("--selector", required=True, help="session_id | COMx | alias")
-    p_slst = sess_sub.add_parser("log-stop")
+    p_slst = sess_sub.add_parser("log-stop", help="停止該 session 的 capture log")
     p_slst.add_argument("--selector", required=True, help="session_id | COMx | alias")
-    p_slstat = sess_sub.add_parser("log-status")
+    p_slstat = sess_sub.add_parser("log-status", help="查詢該 session 的 capture log 狀態")
     p_slstat.add_argument("--selector", required=True, help="session_id | COMx | alias")
 
-    p_alias = sub.add_parser("alias")
-    alias_sub = p_alias.add_subparsers(dest="alias_cmd", required=True)
-    alias_sub.add_parser("list")
-    p_as = alias_sub.add_parser("set")
+    p_alias = sub.add_parser(
+        "alias",
+        help="session 別名與 by-id 綁定管理",
+        description="管理 session 別名：列舉、指定到 session_id、綁定裝置 by-id 與解除綁定。",
+    )
+    alias_sub = p_alias.add_subparsers(dest="alias_cmd", required=True, metavar="<command>")
+    alias_sub.add_parser("list", help="列出所有 alias 綁定")
+    p_as = alias_sub.add_parser("set", help="把 alias 指定到既有 session_id")
     p_as.add_argument("--session-id", required=True)
     p_as.add_argument("--alias", required=True)
-    p_aa = alias_sub.add_parser("assign")
+    p_aa = alias_sub.add_parser("assign", help="把 alias 綁到裝置 by-id（可附 profile）")
     p_aa.add_argument("--by-id", required=True)
     p_aa.add_argument("--alias", required=True)
     p_aa.add_argument("--profile")
-    p_au = alias_sub.add_parser("unassign")
+    p_au = alias_sub.add_parser("unassign", help="移除 alias 綁定")
     p_au.add_argument("--alias", required=True)
 
-    p_cmd = sub.add_parser("cmd")
-    cmd_sub = p_cmd.add_subparsers(dest="cmd_cmd", required=True)
-    p_cs = cmd_sub.add_parser("submit")
+    p_cmd = sub.add_parser(
+        "cmd",
+        help="提交命令並讀取結果（line／background）",
+        description="向 session 提交命令並取回結果：line 模式看 status，background 模式用 result-tail。",
+    )
+    cmd_sub = p_cmd.add_subparsers(dest="cmd_cmd", required=True, metavar="<command>")
+    p_cs = cmd_sub.add_parser("submit", help="提交命令到 session（--mode line|background|interactive）")
     p_cs.add_argument("--selector", required=True)
     p_cs.add_argument("--cmd", dest="command_text", default="")
     p_cs.add_argument("--source", default="agent")
@@ -365,92 +396,112 @@ def build_parser() -> argparse.ArgumentParser:
     p_cs.add_argument("--priority", type=int, default=10)
     p_cs.add_argument("--cmd-timeout", dest="cmd_timeout_s", type=float, default=10.0)
     p_cs.add_argument("--expected-duration", dest="expected_duration_s", type=float, default=None)
-    p_cg = cmd_sub.add_parser("status")
+    p_cg = cmd_sub.add_parser("status", help="查詢命令狀態與 stdout（line 模式讀這裡）")
     p_cg.add_argument("--cmd-id", required=True)
-    p_cr = cmd_sub.add_parser("result-tail")
+    p_cr = cmd_sub.add_parser("result-tail", help="增量讀取 background 命令的結果 chunk")
     p_cr.add_argument("--cmd-id", required=True)
     p_cr.add_argument("--from-chunk", type=int, default=0)
     p_cr.add_argument("--limit", type=int, default=200)
-    p_cc = cmd_sub.add_parser("cancel")
+    p_cc = cmd_sub.add_parser("cancel", help="取消執行中的命令")
     p_cc.add_argument("--cmd-id", required=True)
 
-    p_stream = sub.add_parser("stream")
-    stream_sub = p_stream.add_subparsers(dest="stream_cmd", required=True)
-    p_st = stream_sub.add_parser("tail")
+    p_stream = sub.add_parser(
+        "stream",
+        help="即時 tail 解析後的文字事件串流",
+        description="即時 tail session 解析後的文字串流（line 事件）。",
+    )
+    stream_sub = p_stream.add_subparsers(dest="stream_cmd", required=True, metavar="<command>")
+    p_st = stream_sub.add_parser("tail", help="即時 tail 解析後的文字串流")
     p_st.add_argument("--selector")
     p_st.add_argument("--com")
     p_st.add_argument("--from-seq", type=int, default=0)
     p_st.add_argument("--limit", type=int, default=200)
 
-    p_log = sub.add_parser("log")
-    log_sub = p_log.add_subparsers(dest="log_cmd", required=True)
-    p_lr = log_sub.add_parser("tail-raw")
+    p_log = sub.add_parser(
+        "log",
+        help="raw／text 日誌 tail（含 timestamp／seq／crc）",
+        description="tail raw 或純文字日誌；raw 含 timestamp／source／seq／crc，可做回放與稽核。",
+    )
+    log_sub = p_log.add_subparsers(dest="log_cmd", required=True, metavar="<command>")
+    p_lr = log_sub.add_parser("tail-raw", help="tail raw 日誌（含 timestamp／source／seq／crc）")
     p_lr.add_argument("--selector")
     p_lr.add_argument("--com")
     p_lr.add_argument("--from-seq", type=int, default=0)
     p_lr.add_argument("--limit", type=int, default=200)
-    p_lt = log_sub.add_parser("tail-text")
+    p_lt = log_sub.add_parser("tail-text", help="tail 純文字日誌")
     p_lt.add_argument("--selector")
     p_lt.add_argument("--com")
     p_lt.add_argument("--from-seq", type=int, default=0)
     p_lt.add_argument("--limit", type=int, default=200)
 
-    p_file = sub.add_parser("file")
-    file_sub = p_file.add_subparsers(dest="file_cmd", required=True)
-    p_fp = file_sub.add_parser("push")
+    p_file = sub.add_parser(
+        "file",
+        help="透過 UART 推送／拉取檔案",
+        description="透過 UART 在本機與 target 之間推送（push）或拉取（pull）檔案。",
+    )
+    file_sub = p_file.add_subparsers(dest="file_cmd", required=True, metavar="<command>")
+    p_fp = file_sub.add_parser("push", help="透過 UART 推送本機檔案到 target")
     p_fp.add_argument("--selector", required=True)
     p_fp.add_argument("--local", required=True)
     p_fp.add_argument("--remote", required=True)
     p_fp.add_argument("--chunk-size", dest="chunk_size", type=int, default=2048)
     p_fp.add_argument("--source", default="agent")
-    p_fl = file_sub.add_parser("pull")
+    p_fl = file_sub.add_parser("pull", help="透過 UART 從 target 拉取檔案到本機")
     p_fl.add_argument("--selector", required=True)
     p_fl.add_argument("--remote", required=True)
     p_fl.add_argument("--local", default=None)
     p_fl.add_argument("--source", default="agent")
 
-    p_wal = sub.add_parser("wal")
-    wal_sub = p_wal.add_subparsers(dest="wal_cmd", required=True)
-    p_we = wal_sub.add_parser("export")
+    p_wal = sub.add_parser(
+        "wal",
+        help="write-ahead log 匯出／重設／seq 查詢",
+        description="操作 write-ahead log（WAL）：匯出區段、重設與查詢目前 seq。",
+    )
+    wal_sub = p_wal.add_subparsers(dest="wal_cmd", required=True, metavar="<command>")
+    p_we = wal_sub.add_parser("export", help="匯出 WAL 區段（--from-seq／--to-seq／--limit）")
     p_we.add_argument("--from-seq", type=int, default=0)
     p_we.add_argument("--to-seq", type=int, default=0)
     p_we.add_argument("--limit", type=int, default=1000)
-    wal_sub.add_parser("reset")
-    wal_sub.add_parser("current-seq")
+    wal_sub.add_parser("reset", help="重設 WAL")
+    wal_sub.add_parser("current-seq", help="顯示目前 WAL seq")
 
-    p_event = sub.add_parser("event", help="event-trigger rule registry / matcher control")
-    e_sub = p_event.add_subparsers(dest="event_cmd", required=True)
+    p_event = sub.add_parser(
+        "event",
+        help="event-trigger 規則註冊與 matcher 控制",
+        description="event-trigger 規則註冊表與 matcher 控制：新增／刪除／列舉／啟用停用規則與檢視觸發紀錄。",
+    )
+    e_sub = p_event.add_subparsers(dest="event_cmd", required=True, metavar="<command>")
 
-    e_add = e_sub.add_parser("add", help="register or update a rule from JSON file")
+    e_add = e_sub.add_parser("add", help="從 JSON 檔註冊或更新一條規則")
     e_add.add_argument("--file", required=True)
 
-    e_rm = e_sub.add_parser("rm", help="delete a rule by id")
+    e_rm = e_sub.add_parser("rm", help="依 id 刪除一條規則")
     e_rm.add_argument("rule_id")
 
-    e_list = e_sub.add_parser("list")
+    e_list = e_sub.add_parser("list", help="列出規則（可依 selector／owner 過濾）")
     e_list.add_argument("--selector")
     e_list.add_argument("--owner")
 
-    e_show = e_sub.add_parser("show")
+    e_show = e_sub.add_parser("show", help="依 id 顯示單一規則內容")
     e_show.add_argument("rule_id")
 
-    e_enable = e_sub.add_parser("enable")
+    e_enable = e_sub.add_parser("enable", help="啟用指定 selector 的規則 matcher")
     e_enable.add_argument("--selector", required=True)
 
-    e_disable = e_sub.add_parser("disable")
+    e_disable = e_sub.add_parser("disable", help="停用指定 selector 的規則 matcher")
     e_disable.add_argument("--selector", required=True)
 
-    e_status = e_sub.add_parser("status")
+    e_status = e_sub.add_parser("status", help="顯示 matcher 狀態（可依 selector 過濾）")
     e_status.add_argument("--selector")
 
-    e_reset = e_sub.add_parser("reset")
+    e_reset = e_sub.add_parser("reset", help="重設規則計數／狀態（--rule-id 或 --selector 擇一）")
     grp = e_reset.add_mutually_exclusive_group(required=True)
     grp.add_argument("--rule-id")
     grp.add_argument("--selector")
 
-    e_reload = e_sub.add_parser("reload")
+    e_reload = e_sub.add_parser("reload", help="重新載入規則註冊表")
 
-    e_tail = e_sub.add_parser("tail")
+    e_tail = e_sub.add_parser("tail", help="檢視規則觸發紀錄（可依 rule-id／selector 過濾）")
     e_tail.add_argument("--rule-id")
     e_tail.add_argument("--selector")
     e_tail.add_argument("-n", type=int, default=50)
