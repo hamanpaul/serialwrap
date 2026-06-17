@@ -188,6 +188,68 @@ class FlashEndpoint:
                     pass
 
 
+class FlashSink(Protocol):
+    """抽象 sink 介面：接收來自 flasher（透過 endpoint master）的位元組並轉送至裝置。"""
+
+    def flash_tx(self, payload: bytes) -> None:
+        """將 payload 原樣發送至底層裝置（binary-safe，不做任何轉義）。"""
+        ...
+
+
+def pump_endpoint_to_sink(
+    master_fd: int,
+    sink: "FlashSink",
+    stop_event: threading.Event,
+    first_bytes: bytes = b"",
+    chunk: int = 4096,
+) -> None:
+    """讀 endpoint master → sink.flash_tx，原樣轉送（含先前已讀的 first_bytes）。
+
+    阻塞直到 stop_event 設定或 flasher 關閉端點（EOF）。
+
+    Args:
+        master_fd: PTY master fd（應設為 non-blocking）。
+        sink: 實作 :class:`FlashSink` 的物件（通常為 UARTBridge）。
+        stop_event: 設定後函式應盡快結束（最多等一個 select timeout）。
+        first_bytes: 已由呼叫者預讀的首段位元組，需先轉送給 sink。
+        chunk: 每次 os.read 的最大讀取位元組數。
+    """
+    if first_bytes:
+        sink.flash_tx(first_bytes)
+    while not stop_event.is_set():
+        try:
+            rlist, _, _ = select.select([master_fd], [], [], 0.2)
+        except OSError:
+            return
+        if master_fd in rlist:
+            try:
+                data = os.read(master_fd, chunk)
+            except (OSError, BlockingIOError):
+                return
+            if not data:
+                return  # EOF：flasher 已關閉端點
+            sink.flash_tx(data)
+
+
+def make_rx_to_endpoint_writer(master_fd: int):
+    """回傳一個把 device RX 原樣寫進 endpoint master 的 callback（bytes -> None）。
+
+    callback 設計為 binary-safe，OSError（如 fd 已關閉）會靜默吞掉。
+
+    Args:
+        master_fd: PTY master fd。
+
+    Returns:
+        ``(data: bytes) -> None`` callback，供 SessionManager.add_rx_observer 使用。
+    """
+    def _writer(data: bytes) -> None:
+        try:
+            os.write(master_fd, data)
+        except OSError:
+            pass
+    return _writer
+
+
 def resolve_flash_target(selector: str, sessions: list[dict], *, force: bool) -> dict:
     """解析顯式 flash 目標並防呆。
 

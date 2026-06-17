@@ -4,12 +4,13 @@ import os
 import re
 import shlex
 import threading
+import time
 from typing import Any
 
 from .arbiter import CommandArbiter
 from .config import ProfileTemplate, SessionProfile
 from .constants import DEVICE_BY_ID_DIR, DEVICE_BY_PATH_DIR, EVENTS_DIR, EVENTS_RUNTIME_DIR, EVENTS_LOG_PATH, TTYMCU_PATH
-from .flash_endpoint import FlashEndpoint
+from .flash_endpoint import FlashEndpoint, detect_mcu_line, pump_endpoint_to_sink
 from .mcu_patterns import McuPatternRegistry
 from .device_watcher import DeviceWatcher
 from .event_engine import EventEngine, EngineDeps
@@ -115,6 +116,42 @@ def _human_console_mode(command: str) -> str:
     return "line"
 
 
+class _BridgeProbe:
+    """ProbeTransport 實作：透過已啟動的 UARTBridge 送出 probe 並等待 ACK。
+
+    由 SerialwrapService._on_flash_open 建立，與 detect_mcu_line 搭配使用。
+    _flash_rx_buffers 由 _flash_rx_observer 即時填充，probe 只需 poll 等待即可。
+    """
+
+    def __init__(self, svc: "SerialwrapService", by_id_to_com: dict[str, str]) -> None:
+        self._svc = svc
+        self._by_id_to_com = by_id_to_com
+
+    def probe(self, by_id: str, probe_bytes: bytes, expect: bytes, timeout_ms: int) -> bool:
+        """送出非破壞性 probe 並等待 ACK（最多 timeout_ms 毫秒）。"""
+        com = self._by_id_to_com.get(by_id)
+        if com is None:
+            return False
+        sess = self._svc._sessions.get_session(com)
+        if sess is None or sess.bridge is None:
+            return False
+        # 清空 probe buffer，準備接收 ACK
+        with self._svc._flash_lock:
+            self._svc._flash_rx_buffers[com] = bytearray()
+        try:
+            sess.bridge.send_bytes(probe_bytes, source="flash-probe", cmd_id=None)
+        except Exception:
+            return False
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while time.monotonic() < deadline:
+            with self._svc._flash_lock:
+                buf = bytes(self._svc._flash_rx_buffers.get(com, b""))
+            if expect in buf:
+                return True
+            time.sleep(0.02)
+        return False
+
+
 class SerialwrapService:
     def __init__(
         self,
@@ -154,10 +191,17 @@ class SerialwrapService:
             extra_scan_dirs=[by_path_dir],
         )
         self._mcu_registry = McuPatternRegistry.load(None)
+        # flash 雙向接線狀態（probe buffer、active com、master fd）
+        self._flash_lock = threading.Lock()
+        self._flash_rx_buffers: dict[str, bytearray] = {}   # com -> 最近 RX（probe 用）
+        self._flash_active_com: str | None = None
+        self._flash_master_fd: int | None = None
+        self._sessions.add_rx_observer(self._flash_rx_observer)
         self._flash_endpoint = FlashEndpoint(
             link_path=TTYMCU_PATH,
             registry=self._mcu_registry,
             list_candidates=self._flash_candidates,
+            on_flash_open=self._on_flash_open,
         )
 
     def _on_ready(self, session_id: str) -> None:
@@ -225,6 +269,61 @@ class SerialwrapService:
 
     def _on_device_change(self, _added, _removed) -> None:
         self._sessions.update_devices(self._watcher.devices)
+
+    def _flash_rx_observer(self, com: str, data: bytes, wal_seq: int) -> None:
+        """RX observer：累積 probe buffer；active flash 期間把 RX bytes 寫入 endpoint master。
+
+        此 callback 由 SessionManager 在 RX 執行緒呼叫，需 thread-safe。
+        binary-safe：不做任何文字處理，原樣轉送。
+        """
+        with self._flash_lock:
+            buf = self._flash_rx_buffers.get(com)
+            if buf is not None:
+                buf.extend(data)
+                # 限制 buffer 大小，避免長時間累積佔用記憶體
+                if len(buf) > 4096:
+                    del buf[:-4096]
+            active = self._flash_active_com == com
+            master_fd = self._flash_master_fd
+        if active and master_fd is not None:
+            try:
+                os.write(master_fd, data)   # device RX → endpoint（flasher 讀）
+            except OSError:
+                pass
+
+    def _on_flash_open(self, master_fd: int, slave_fd: int, first_bytes: bytes) -> None:
+        """FlashEndpoint 偵測到 flasher 寫入時的回呼。
+
+        流程：
+          1. 以 _BridgeProbe + detect_mcu_line 偵測目標 MCU 線。
+          2. 命中 → enter_flashing → 同步 termios → 雙向 pump 直到 flasher 結束。
+          3. pump 結束（flasher 關閉端點或 stop_event）→ exit_flashing，清除狀態。
+          4. 未命中 → 靜默返回（保留 flasher 自身 retry 機會）。
+        """
+        candidates = self._flash_candidates()
+        by_id_to_com = {c["by_id"]: c["com"] for c in candidates if c.get("by_id")}
+        transport = _BridgeProbe(self, by_id_to_com)
+        result = detect_mcu_line(candidates, self._mcu_registry, transport)
+        if result.status != "matched":
+            return  # 沒命中：保持沉默，讓 flasher 自身 retry/timeout
+        com = by_id_to_com.get(result.by_id)
+        sess = self._sessions.get_session(com) if com else None
+        if sess is None or sess.bridge is None:
+            return
+        self._sessions.enter_flashing(com)
+        stop = threading.Event()
+        with self._flash_lock:
+            self._flash_active_com = com
+            self._flash_master_fd = master_fd
+        try:
+            sess.bridge.mirror_termios_from(slave_fd)
+            sess.bridge.clear_rx_buffer()
+            pump_endpoint_to_sink(master_fd, sess.bridge, stop, first_bytes=first_bytes)
+        finally:
+            with self._flash_lock:
+                self._flash_active_com = None
+                self._flash_master_fd = None
+            self._sessions.exit_flashing(com)
 
     def _flash_candidates(self) -> list[dict]:
         """flash 偵測候選：已 attached 且非 command_capable console 的 session，附上 real_path。"""
