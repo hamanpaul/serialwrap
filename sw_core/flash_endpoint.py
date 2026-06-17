@@ -1,9 +1,14 @@
-"""sw_core/flash_endpoint.py — MCU flash 端點（目前僅含 sync-probe 偵測器）。
+"""sw_core/flash_endpoint.py — MCU flash 端點（sync-probe 偵測器 + PTY 端點）。
 
-PTY 端點於後續任務實作，本模組目前只對外提供 ``detect_mcu_line``。
+提供 ``detect_mcu_line`` 偵測器與 ``FlashEndpoint`` 常駐 PTY 端點。
 """
 from __future__ import annotations
 import dataclasses
+import os
+import pty
+import select
+import threading
+import time
 from typing import Protocol
 
 from .mcu_patterns import McuPatternRegistry
@@ -87,3 +92,97 @@ def detect_mcu_line(
         return DetectResult(status="ambiguous", hits=[h[0] for h in hits])
     by_id, family = hits[0]
     return DetectResult(status="matched", by_id=by_id, family=family)
+
+
+class FlashEndpoint:
+    """常駐 PTY flash 端點：slave 以穩定 symlink 命名（如 /dev/ttyMCU），daemon 持 master。
+
+    開啟分流：client 先寫 bytes（flasher 的 sync）→ master 變可讀 → 走 flash 路徑；
+    只讀不寫（cat）→ daemon 定期把支援清單寫進 master 供其讀取（不依賴 EOF）。
+    """
+
+    def __init__(self, *, link_path, registry, list_candidates,
+                 on_flash_open=None, grace=0.3, idle_list_interval=0.5):
+        self._link_path = link_path
+        self._registry = registry
+        self._list_candidates = list_candidates       # () -> list[dict]
+        self._on_flash_open = on_flash_open            # (master_fd, slave_fd, first_bytes) -> None
+        self._grace = grace
+        self._idle_list_interval = idle_list_interval
+        self._master_fd = None
+        self._slave_fd = None
+        self._stop = threading.Event()
+        self._thread = None
+        self._flash_active = threading.Event()
+        self._last_list = 0.0
+
+    def start(self):
+        """開啟 PTY、建立 symlink、啟動背景 loop 執行緒。"""
+        self._master_fd, self._slave_fd = pty.openpty()
+        os.set_blocking(self._master_fd, False)
+        slave_name = os.ttyname(self._slave_fd)
+        os.makedirs(os.path.dirname(self._link_path), exist_ok=True)
+        try:
+            os.remove(self._link_path)
+        except FileNotFoundError:
+            pass
+        os.symlink(slave_name, self._link_path)
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True,
+                                        name="serialwrap-ttyMCU")
+        self._thread.start()
+
+    def stop(self):
+        """停止背景執行緒、關閉 fd、移除 symlink。"""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        for fd in (self._master_fd, self._slave_fd):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        self._master_fd = self._slave_fd = None
+        try:
+            os.remove(self._link_path)
+        except OSError:
+            pass
+
+    def is_flashing(self) -> bool:
+        """回傳目前是否有 flash 操作進行中。"""
+        return self._flash_active.is_set()
+
+    def _loop(self):
+        """背景主迴圈：偵測 client 寫入（flasher）或定期發送支援清單（cat）。"""
+        while not self._stop.is_set():
+            try:
+                rlist, _, _ = select.select([self._master_fd], [], [], self._grace)
+            except OSError:
+                return
+            if self._stop.is_set():
+                return
+            if rlist:
+                # client 寫入 = flasher。讀出首段交給 flash 路徑（供其轉送）。
+                try:
+                    first = os.read(self._master_fd, 4096)
+                except (OSError, BlockingIOError):
+                    first = b""
+                if not self._flash_active.is_set():
+                    self._flash_active.set()
+                    try:
+                        if self._on_flash_open is not None:
+                            self._on_flash_open(self._master_fd, self._slave_fd, first)
+                    finally:
+                        self._flash_active.clear()
+                continue
+            # idle：定期寫支援清單（供 cat 讀取）
+            now = time.monotonic()
+            if now - self._last_list >= self._idle_list_interval:
+                self._last_list = now
+                text = self._registry.render_support_list(
+                    candidates=self._list_candidates())
+                try:
+                    os.write(self._master_fd, text.encode())
+                except OSError:
+                    pass
