@@ -550,5 +550,63 @@ class TestSoftPreemptAndLiveness(unittest.TestCase):
         self.assertIsNone(session.interactive_session_id)
 
 
+class TestPassthroughFallback(unittest.TestCase):
+    """#51 後續：新增第二個 passthrough template（uboot-template，command-capable）後，
+    dynamic auto-detect 的「通用 passthrough fallback」必須仍是非 command-capable 的
+    others-template，不可被 uboot-template 搶走（避免無對應 profile 的裝置被誤綁成可下命令）。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._old_state_path = sm_mod.STATE_PATH
+        sm_mod.STATE_PATH = str(Path(self._tmp.name) / "state.json")
+
+    def tearDown(self) -> None:
+        sm_mod.STATE_PATH = self._old_state_path
+
+    def _mgr_with_templates(self, templates):
+        return SessionManager(
+            [],
+            WalWriter(wal_dir=self._tmp.name),
+            templates=templates,
+            on_ready=lambda _sid: None,
+            on_detached=lambda _sid: None,
+        )
+
+    def test_fallback_prefers_non_command_capable_passthrough(self) -> None:
+        from sw_core.config import ProfileTemplate
+
+        # uboot-template（command-capable）刻意排在前面
+        uboot = ProfileTemplate(
+            profile_name="uboot-template",
+            platform="passthrough",
+            ready_probe="echo __READY__${nonce}",
+        )
+        others = ProfileTemplate(
+            profile_name="others-template",
+            platform="passthrough",
+            ready_probe="",
+        )
+        mgr = self._mgr_with_templates([uboot, others])
+        fallback = mgr._default_passthrough_template()
+        self.assertIsNotNone(fallback)
+        self.assertEqual(fallback.profile_name, "others-template")
+
+    def test_fallback_uses_any_passthrough_when_no_generic(self) -> None:
+        """若沒有非 command-capable 的 passthrough，退而用任一 passthrough（向後相容）。"""
+        from sw_core.config import ProfileTemplate
+
+        uboot = ProfileTemplate(
+            profile_name="uboot-template",
+            platform="passthrough",
+            ready_probe="echo __READY__${nonce}",
+        )
+        mgr = self._mgr_with_templates([uboot])
+        fallback = mgr._default_passthrough_template()
+        self.assertIsNotNone(fallback)
+        self.assertEqual(fallback.profile_name, "uboot-template")
+
+
 if __name__ == "__main__":
     unittest.main()

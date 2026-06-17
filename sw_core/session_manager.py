@@ -1126,6 +1126,22 @@ class SessionManager:
                 session.attached_real_path = None
             self._on_detached(session.session_id)
 
+    def _default_passthrough_template(self) -> ProfileTemplate | None:
+        """auto-detect 失敗時的通用 passthrough fallback。
+
+        優先選非 command-capable 的 passthrough（如 others-template，純 console），
+        避免 uboot-template 這類具 ready_probe 的特定 passthrough 被誤當通用 fallback；
+        若沒有非 command-capable 的 passthrough，才退而用任一 passthrough（向後相容）。
+        """
+        generic = next(
+            (t for t in self._templates
+             if t.platform == "passthrough" and not t.command_capable),
+            None,
+        )
+        if generic is not None:
+            return generic
+        return next((t for t in self._templates if t.platform == "passthrough"), None)
+
     def _attach_by_id_dynamic(self, by_id: str) -> None:
         """動態偵測 template 並建立新 session。"""
         from .config import UartProfile
@@ -1156,8 +1172,9 @@ class SessionManager:
             except Exception:
                 pass
 
-        # 找 passthrough fallback
-        passthrough = next((t for t in self._templates if t.platform == "passthrough"), None)
+        # 找 passthrough fallback（通用 fallback 須為非 command-capable 的 passthrough，
+        # 避免 uboot-template 這類 command-capable 的特定 passthrough 搶走通用 fallback）
+        passthrough = self._default_passthrough_template()
         tpl = detected or passthrough
         if tpl is None:
             return
