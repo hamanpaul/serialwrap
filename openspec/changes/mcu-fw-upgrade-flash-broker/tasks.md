@@ -26,7 +26,7 @@
 - [x] 4.1 寫測試：daemon 啟動建常駐 PTY + 穩定 symlink（預設 `${RUN_DIR}/dev/ttyMCU`）
 - [x] 4.2 寫測試：只讀（無端點輸入）→ 回支援清單 + 候選狀態文字 + EOF
 - [x] 4.3 寫測試：有端點輸入（flasher 送 bytes）→ 走偵測/flash 路徑
-- [x] 4.4 寫測試：已在 flash 中再開 → `FLASH_IN_PROGRESS`
+- [ ] 4.4 已在 flash 中再開 → `FLASH_IN_PROGRESS`（**v1 scope out**：單 PTY／單 loop 執行緒，pump 阻塞期間 `_flash_active` 防重入，未回傳獨立 `FLASH_IN_PROGRESS` 錯誤碼；多 flasher 併發為後續增強）
 - [x] 4.5 實作 `sw_core/flash_endpoint.py`（PTY/symlink 生命週期 + 分流 + 重入擋）令 4.1–4.4 轉綠
 
 ## 5. FLASHING 狀態、仲裁與自動恢復（session_manager，TDD）
@@ -46,7 +46,7 @@
 ## 7. CLI / RPC
 
 - [x] 7.1 寫測試 + 實作：`mcu patterns`（列支援家族）與 `mcu status`（候選/FLASHING/holder probe）RPC + CLI
-- [x] 7.2 寫測試 + 實作：device list 反查（`/dev/ttyUSBx` → st_rdev → 對應 COM；查無→明確回報）
+- [ ] 7.2 device list 反查（`/dev/ttyUSBx` → st_rdev → 對應 COM）（**v1 未做**：B 案 flasher 開 serialwrap 端點、以 COM/by-id 定址 + 自動 sync-probe 認線，不需使用者提供 ttyUSBx；反查列為後續增強，`resolve_flash_target` 已備保留）
 - [x] 7.3 在 `service.py`/`rpc.py` 接上 `mcu.*` dispatch
 
 ## 8. 整合測試（假 PTY/loopback）
