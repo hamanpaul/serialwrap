@@ -111,3 +111,27 @@ def test_no_idle_list_during_flasher_cooldown():
                 os.close(fd)
         finally:
             ep.stop()
+
+
+def test_loop_survives_on_flash_open_exception():
+    """on_flash_open 拋例外時，端點 _loop 執行緒須存活且清除 active flag（C1 _loop 半）。"""
+    def boom(master_fd, slave_fd, first_bytes):
+        raise RuntimeError("boom")
+
+    with tempfile.TemporaryDirectory() as d:
+        link = os.path.join(d, "dev", "ttyMCU")
+        ep = FlashEndpoint(link_path=link, registry=McuPatternRegistry.default(),
+                           list_candidates=lambda: [], on_flash_open=boom,
+                           idle_list_interval=0.1, client_cooldown=0.1)
+        ep.start()
+        try:
+            fd = os.open(link, os.O_RDWR | os.O_NONBLOCK)
+            try:
+                os.write(fd, b"\x55\x55")        # 觸發 on_flash_open → 拋例外
+                time.sleep(0.5)
+                assert ep._thread.is_alive()      # 端點執行緒未被殺
+                assert ep.is_flashing() is False  # active flag 已清
+            finally:
+                os.close(fd)
+        finally:
+            ep.stop()

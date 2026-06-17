@@ -133,12 +133,19 @@ def test_pump_survives_sink_runtimeerror():
     master, slave = pty.openpty()
     os.set_blocking(master, False)
     stop = threading.Event()
-    t = threading.Thread(target=pump_endpoint_to_sink,
-                         args=(master, _BadSink(), stop),
-                         kwargs={"first_bytes": b"\x55"})
-    t.start()
-    t.join(timeout=2.0)
-    assert not t.is_alive()   # 例外被收斂，pump 乾淨結束
-    stop.set()
-    os.close(master)
-    os.close(slave)
+    escaped = []
+    old_hook = threading.excepthook
+    threading.excepthook = lambda args: escaped.append(args.exc_type)
+    try:
+        t = threading.Thread(target=pump_endpoint_to_sink,
+                             args=(master, _BadSink(), stop),
+                             kwargs={"first_bytes": b"\x55"})
+        t.start()
+        t.join(timeout=2.0)
+        assert not t.is_alive()
+        assert escaped == []   # 例外被 pump 收斂、未逸出執行緒（移掉 except 此處會抓到 RuntimeError）
+    finally:
+        threading.excepthook = old_hook
+        stop.set()
+        os.close(master)
+        os.close(slave)

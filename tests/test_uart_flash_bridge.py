@@ -30,7 +30,8 @@ def test_flash_tx_is_byte_exact(monkeypatch):
 def test_flash_mode_blocks_console_injection(monkeypatch):
     """FLASHING 期間 console→device 注入須被丟棄，避免汙染 SBL binary（C2）。"""
     b = _bridge()
-    b.set_flash_mode(True)
+    # 讓 human-owner raw 送出路徑可達（否則測試空轉、移掉 fix 也會過）。
+    b._interactive_owner = "human:c1"
     sent = []
     monkeypatch.setattr(b, "send_bytes", lambda *a, **k: sent.append(a))
 
@@ -39,6 +40,14 @@ def test_flash_mode_blocks_console_injection(monkeypatch):
         master_fd = -1
         tx_buffer = bytearray()
 
+    # flash OFF：human owner 輸入應送達 → 證明本測試非空轉。
+    b.set_flash_mode(False)
+    b._handle_console_rx(_Client(), b"hello\n")
+    assert len(sent) == 1
+
+    # flash ON：注入應被完全丟棄。
+    sent.clear()
+    b.set_flash_mode(True)
     b._handle_console_rx(_Client(), b"echo pwn\n")
-    assert sent == []          # flash 模式下完全不送
+    assert sent == []
     b.set_flash_mode(False)
