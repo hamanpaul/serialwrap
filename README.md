@@ -1003,20 +1003,28 @@ Handler **建議**：
 <!-- BEGIN: cli-help marker="serialwrap-help" -->
 usage: serialwrap [-h] [--socket SOCKET] [--endpoint ENDPOINT]
                   [--timeout TIMEOUT_S]
-                  {daemon,device,session,alias,cmd,stream,log,file,wal,event}
-                  ...
+                  <group> ...
 
 serialwrap client（支援本機 Unix socket 與遠端 endpoint）
 
-positional arguments:
-  {daemon,device,session,alias,cmd,stream,log,file,wal,event}
-    event               event-trigger rule registry / matcher control
-
 options:
-  -h, --help            show this help message and exit
-  --socket SOCKET       本機 daemon 的 Unix socket 路徑（預設: /tmp/serialwrap/serialwrapd.sock）
-  --endpoint ENDPOINT   遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）
-  --timeout TIMEOUT_S   RPC timeout 秒數（預設: 5.0）
+  -h, --help           show this help message and exit
+  --socket SOCKET      本機 daemon 的 Unix socket 路徑（預設: /tmp/serialwrap/serialwrapd.sock）
+  --endpoint ENDPOINT  遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）
+  --timeout TIMEOUT_S  RPC timeout 秒數（預設: 5.0）
+
+command groups:
+  <group>
+    daemon             管理 serialwrap daemon（啟動／停止／狀態）
+    device             實體 UART 裝置列舉與 handoff（release／attach）
+    session            session 生命週期、探測、recover、console 與 interactive 操作
+    alias              session 別名與 by-id 綁定管理
+    cmd                提交命令並讀取結果（line／background）
+    stream             即時 tail 解析後的文字事件串流
+    log                raw／text 日誌 tail（含 timestamp／seq／crc）
+    file               透過 UART 推送／拉取檔案
+    wal                write-ahead log 匯出／重設／seq 查詢
+    event              event-trigger 規則註冊與 matcher 控制
 
 examples:
   serialwrap session list
