@@ -558,6 +558,36 @@ serialwrap device attach --selector COM0   # 收回；外部仍持有時回 DEVI
 `serialwrap session self-test --selector COM0` 在 RELEASED 下會回 `external_holder` /
 `reclaimable` / `recommended_action`（`wait_external_flash` 或 `device_attach`）。
 
+## MCU 韌體升級：flash 端點 `/dev/ttyMCU`（#55）
+
+相對於 `device release`（把**整個** raw device 交給外部工具、燒完手動收回），flash 端點讓 daemon
+**持續 maintain tty**：daemon 仍是 real device 唯一 reader（無 two-reader race），並提供一個
+byte-transparent 端點 `/dev/ttyMCU`（預設 `${SERIALWRAP_RUN_DIR}/dev/ttyMCU`，可用
+`SERIALWRAP_TTYMCU_PATH` 覆寫）。外部 flasher 開這個端點即可，全程 RAW WAL 留證。
+
+不必記底層是哪個 `/dev/ttyUSBx`（會隨重插/換板漂移）：開端點後 serialwrap 以**非破壞性 sync-probe**
+自動認出「BSL 中會回 SBL ACK」的那條線（排除 command_capable console，避免燒到 DUT），認到才把真
+flasher 接上去，破壞性的 erase/program 只會到已確認的線。
+
+```bash
+# 查支援的 MCU 家族與目前候選
+serialwrap mcu patterns
+serialwrap mcu status
+cat /dev/serialwrap/dev/ttyMCU   # 只讀亦會列出支援家族（不送 bytes → 不進 flash）
+
+# 1) 先在 DUT console（serialwrap console session）把 MCU 帶進 BSL（GPIO reset，依板而定）
+# 2) host 改用 serialwrap 端點取代原本的 raw /dev/ttyUSBx：
+ocp-mcu-upgrade -d /tmp/serialwrap/dev/ttyMCU -b 115200 -t 8 -e -s -i fw.bin
+# serialwrap 自動 sync-probe 認線 → bridge → 期望 Return error code : 0x0；燒完該 session 自動恢復 console
+```
+
+支援家族可擴充（pattern registry，預設 TI CC2674/CC2652：probe `55 55` → ACK `00 cc`）。
+偵測不到 BSL 中的 MCU 時 serialwrap 保持沉默，由 flasher 自身 retry/timeout 處理；燒錄期間該 session
+`cmd submit` 回 `FLASHING_BUSY`，其他 COM 不受影響。
+
+> ⚠️ 二進位安全：`/dev/ttyMCU` 的 PTY slave 以 raw 模式建立（無 CR/LF 轉換）。請勿改走一般 console /
+> passthrough session 傳 SBL binary——那條路徑會行處理、汙染協定。
+
 ## 多 minicom 使用
 
 `minicom_router.sh` 會：
@@ -1123,6 +1153,7 @@ command groups:
     log                raw／text 日誌 tail（含 timestamp／seq／crc）
     file               透過 UART 推送／拉取檔案
     wal                write-ahead log 匯出／重設／seq 查詢
+    mcu                MCU flash pattern 查詢與 flash 端點狀態
     event              event-trigger 規則註冊與 matcher 控制
 
 examples:
