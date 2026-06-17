@@ -6,6 +6,7 @@
 
 ### Added
 
+- 新增 MCU 韌體升級 flash-broker 設計文件 `docs/superpowers/specs/2026-06-17-mcu-fw-upgrade-flash-broker-design.md`（#55：在 daemon 持續 maintain tty 下，出一個 byte-transparent 端點 `/dev/ttyMCU`，以非破壞性 sync-probe 自動認出 MCU 線、可擴充 pattern registry、全程保留 RAW WAL、結束自動恢復 console；僅設計，尚未實作）。
 - `device release` / `device attach`（RPC `device.release` / `device.attach`）：把單一 session 綁定的 UART 乾淨交給外部 flasher 並可手動收回（#54）；新增 `RELEASED` 狀態、`_spawn_attach` released guard、跨 daemon 重啟持久化、`self_test` 的 `external_holder`/`reclaimable` 標註與 `device attach` 安全 guard（`DEVICE_STILL_HELD`，`--force` 可略過）
 - 新增 device release / handoff 設計文件 `docs/superpowers/specs/2026-06-15-device-release-handoff-design.md`、OpenSpec change（已封存於 `openspec/changes/archive/2026-06-16-device-release-handoff/`，含 proposal/design/specs/tasks）與實作計畫 `docs/superpowers/plans/2026-06-15-device-release-handoff.md`（#54：daemon 持續運作下把單一 device 交給外部 flasher、燒完手動收回的 surgical release 機制）
 - 新增 `.github/workflows/tests.yml`：在 PR 上以 `python3 -m pytest -q tests/` 執行測試套件（修補 R-19：repo 有 `tests/` 但無 CI 執行測試）。
