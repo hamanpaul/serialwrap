@@ -13,6 +13,7 @@
 - **`self_test` 在最外層 result dict 暴露 `command_capable`（#51）**：所有分類分支（含 `SESSION_NOT_FOUND` 早退、`RELEASED`、`ATTACHED`/`READY`/`OK` 等）的最外層 result 都帶 `command_capable`，呼叫端不必鑽進巢狀 `"session"` dict；查無 session 時為 `False`。
 - **新增 `uboot-template` profile（#51）**：`profiles/default.yaml` 增加 bootloader 導向的 command-capable profile（`platform: passthrough`、`prompt_regex` 匹配 `=>` / `u-boot>` / `CFE>`、`ready_probe: echo __READY__${nonce}`），讓停在 U-Boot prompt 的 session 能進 `READY` 並接受 line command；`ProfileTemplate` 比照 `SessionProfile` 新增 `command_capable` property。
 - **追蹤 human 真實鍵入並新增 `human_active` 時間窗語意（#53）**：`UARTBridge` 新增 `last_human_input_at`（僅在 human-OWNER 的直接 raw 送出分支更新，deferred buffer／serial RX loop／agent 注入皆不更新）並由 `snapshot()` 暴露；`sw_core/constants.py` 新增 `HUMAN_ACTIVE_WINDOW_S = 60.0` 時間窗常數；`self_test` 結果在最外層新增 `human_active`（僅在 `human_attached` 且最後鍵入仍在時間窗內為 `True`），讓「人類已 attach 但長時間 idle」的 lease 不再被當成正在使用。`human_attached` 語意維持不變（#53 issue groundwork）。
+- **閒置 human lease 可被 agent soft preempt（#53）**：`interactive_open` 在 READY 路徑遇到既有 human lease 但 `human_active=False` 時，改以 suspend + stash 將 human **降級**（console 不中斷、其鍵入進 deferred buffer，agent 關閉 lease 後還原並回放）取得控制權，回傳 `soft_preempted`；human 仍 active 或既有為 agent lease 維持 `SESSION_INTERACTIVE_BUSY`。死孤兒（console peer 已關）沿用既有 liveness 在 `self_test` 時 detach；活著但 idle 的 console 只降級、不自動 detach（清理交由 agent 主動 `recover`/`console-detach`）。解決孤兒 minicom 假性佔用 console 導致 co-work 卡住的問題。
 
 ### Changed
 

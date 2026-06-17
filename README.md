@@ -112,6 +112,23 @@ stateDiagram-v2
     RECOVERING --> DETACHED: device lost
 ```
 
+### `ATTACHED` vs `READY`：可不可以下命令（command_capable）
+
+`ATTACHED` 代表「裝置已連上、console 可用」，但**不保證能下 line 命令**；`READY` 才代表
+broker 能框出命令的輸出（送出 → 看到 prompt → 取回 stdout）。一個 session 能不能進 `READY`
+取決於它綁的 profile 是否 **command-capable**：
+
+- **`command_capable = profile 的 `ready_probe` 非空`**（取代舊的「`platform == passthrough` 就不可用」寫死）。
+- 無 `ready_probe`（如 `others-template` 這種純 console / passthrough profile）→ 維持 `ATTACHED`；
+  對它 `cmd submit` 會回明確的 **`PROFILE_NOT_COMMAND_CAPABLE`**（附 hint），而非語意不清的 `SESSION_NOT_READY`。
+- 有 `ready_probe`（+ 能匹配目標 prompt 的 `prompt_regex`）→ 走正常 probe 進 `READY`，`cmd submit` 可用。
+- `READY` 與底層是 OS shell 或 bootloader **無關**：只要 profile 的 prompt/`ready_probe` 對得上即可。
+  停在 U-Boot 的板子可綁 **`uboot-template`**（`prompt_regex` 匹配 `=>` / `u-boot>` / `CFE>`，
+  `ready_probe: echo __READY__${nonce}`）進 `READY`，然後 `cmd submit --cmd 'printenv'` 下 U-Boot 命令。
+- `self_test` / get-state 會在最外層回 `command_capable`，呼叫端可據此分辨「ATTACHED 但本就不可下命令」與「ATTACHED 應可進 READY」。
+
+> 注意：OS profile（prpl/shell）若板子掉進 U-Boot，OS 的 `prompt_regex` 對不上 → **不會** READY（正確：避免把 Linux 命令送進 bootloader）。
+
 ## Agent / Human Co-work 時序圖
 
 ```mermaid
@@ -138,6 +155,22 @@ sequenceDiagram
     B->>T: flush deferred
     D-->>G: command result
 ```
+
+### Human lease 的閒置降級（soft preempt）與孤兒清理
+
+human console（minicom）持有的 interactive lease 是**禮讓**機制、不是硬鎖：
+
+- broker 記錄 human 的**真實鍵入時間**（`last_human_input_at`，只算真人鍵入，不含 broker 週期 probe），
+  `self_test` 以此回報 `human_active`（最後鍵入在 `HUMAN_ACTIVE_WINDOW_S = 60s` 內才為 `True`）。
+  `human_attached`（是否有 human lease）語意不變。
+- agent `interactive-open` 遇到**閒置**（`human_active=False`）的 human lease 時，會 **soft preempt**：
+  把 human **降級**（console 不中斷，其鍵入進 deferred buffer），agent 取得控制權；agent 關閉 lease 後
+  自動還原 human 並回放暫存輸入。human 仍 active 時則維持 `SESSION_INTERACTIVE_BUSY`、不被打斷。
+- **孤兒清理**：minicom 真的關閉（console peer 消失）→ `self_test` 時由 liveness 自動 detach、釋放 lease；
+  活著但長時間 idle 的 console 只降級、不自動 detach。要徹底收掉殘留 console，仍用
+  `session console-detach` 或 `session recover --force`。
+
+> 這解決了「孤兒 minicom 長期假性佔用 console，導致 agent 取不到互動控制權而卡住」的問題。
 
 ## Multi-Agent 競爭時序圖
 
