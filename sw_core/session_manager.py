@@ -225,6 +225,7 @@ class SessionRuntime:
             "act_no": self.profile.act_no,
             "device_by_id": self.profile.device_by_id,
             "platform": self.profile.platform,
+            "command_capable": self.profile.command_capable,
             "state": self.state,
             "last_error": self.last_error,
             "detached_at": self.detached_at,
@@ -917,7 +918,8 @@ class SessionManager:
             self._spawn_attach(by_id)
 
     def _probe_existing_bridge(self, session: SessionRuntime, bridge: UARTBridge) -> dict[str, Any]:
-        if session.profile.platform == "passthrough":
+        # 非 command-capable（無 ready_probe，含 passthrough）維持現狀不升 READY。
+        if not session.profile.command_capable:
             current = self._sessions.get(session.session_id)
             if current is None or current.bridge is not bridge:
                 return {"ok": False, "error_code": "SESSION_NOT_READY"}
@@ -1005,7 +1007,10 @@ class SessionManager:
             session_id = session.session_id
             profile = session.profile
             require_login = session.pending_auto_login or bool(profile.login_regex)
-            passthrough_only = profile.platform == "passthrough"
+            # 以 ready_probe 判定可否下命令；非 command-capable（含無 ready_probe 的
+            # passthrough）僅停在 ATTACHED 不 probe，有 ready_probe 的 passthrough
+            # 也要能走 probe 進 READY。
+            command_capable = profile.command_capable
             real_path = dev.real_path
             preserved_consoles = session.retained_consoles if isinstance(session.retained_consoles, PreservedConsoles) else None
 
@@ -1022,7 +1027,7 @@ class SessionManager:
 
         try:
             bridge.start()
-            if passthrough_only:
+            if not command_capable:
                 ok = False
                 err = None
             elif require_login:
@@ -1172,7 +1177,8 @@ class SessionManager:
             gen_before = session.bridge_generation
             session_id = session.session_id
             require_login = session.pending_auto_login or bool(profile.login_regex)
-            passthrough_only = profile.platform == "passthrough"
+            # 與 _attach_by_id 一致，以 ready_probe 判定可否下命令。
+            command_capable = profile.command_capable
 
         bridge = UARTBridge(
             profile.com,
@@ -1186,7 +1192,7 @@ class SessionManager:
 
         try:
             bridge.start()
-            if passthrough_only:
+            if not command_capable:
                 ok, err = False, None
             elif require_login:
                 auth = resolve_session_auth(profile)
