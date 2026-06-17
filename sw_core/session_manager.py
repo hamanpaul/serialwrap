@@ -14,7 +14,13 @@ from typing import Any, Callable
 from .alias_registry import AliasRegistry
 from .auth import resolve_session_auth
 from .config import ProfileTemplate, SessionProfile
-from .constants import BOOTLOADER_RX_TAIL_BYTES, LOG_DIR, MAX_RECOVERY_LEASE_S, STATE_PATH
+from .constants import (
+    BOOTLOADER_RX_TAIL_BYTES,
+    HUMAN_ACTIVE_WINDOW_S,
+    LOG_DIR,
+    MAX_RECOVERY_LEASE_S,
+    STATE_PATH,
+)
 from .device_watcher import DeviceInfo
 from .login_fsm import detect_template, ensure_ready, probe_ready
 from .uart_io import PreservedConsoles, UARTBridge
@@ -1398,11 +1404,26 @@ class SessionManager:
                 return restored, post
         return lease, post
 
-    def _lease_context(self, lease: InteractiveLease | None) -> dict[str, Any]:
+    def _lease_context(
+        self, lease: InteractiveLease | None, *, bridge: UARTBridge | None = None
+    ) -> dict[str, Any]:
         interactive_owner = lease.owner if lease is not None else None
+        human_attached = bool(interactive_owner and interactive_owner.startswith("human:"))
+        # human_active：human_attached 且最近一次真實鍵入仍在時間窗內（#53）。
+        # 讓「人類已 attach 但長時間 idle」的 lease 不再被當成正在使用，避免誤擋
+        # agent 行為；無 bridge / 從未鍵入 / 逾時皆為 False。
+        human_active = False
+        if human_attached and bridge is not None:
+            last = bridge.snapshot().get("last_human_input_at")
+            # last 在 production 僅為 None 或 float；以 isinstance 防呆，避免遇到
+            # 非數值（如未設定 return_value 的 mock）時在 '<=' 比較炸掉。
+            if isinstance(last, (int, float)) and not isinstance(last, bool):
+                if (time.monotonic() - last) <= HUMAN_ACTIVE_WINDOW_S:
+                    human_active = True
         return {
             "interactive_owner": interactive_owner,
-            "human_attached": bool(interactive_owner and interactive_owner.startswith("human:")),
+            "human_attached": human_attached,
+            "human_active": human_active,
             "recovery_mode": bool(lease is not None and lease.recovery_mode),
         }
 
@@ -2173,10 +2194,10 @@ class SessionManager:
                         "classification": "SESSION_RECOVERING",
                         "session": session.to_public_dict(),
                         "recommended_action": "wait",
-                        **self._lease_context(lease),
+                        **self._lease_context(lease, bridge=session.bridge),
                     }
                 lease, post = self._refresh_interactive_locked(session)
-                lease_context = self._lease_context(lease)
+                lease_context = self._lease_context(lease, bridge=session.bridge)
                 device = self._devices.get(session.profile.device_by_id)
                 attached_real_path = session.attached_real_path
                 bridge = session.bridge

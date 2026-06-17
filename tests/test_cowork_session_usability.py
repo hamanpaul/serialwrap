@@ -11,14 +11,20 @@ passthrough / others-template 等「僅 console」profile 過去永遠停在 ATT
 """
 from __future__ import annotations
 
+import os
+import pty
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from sw_core.config import SessionProfile, UartProfile
-from sw_core.session_manager import SessionManager
+from sw_core.constants import HUMAN_ACTIVE_WINDOW_S
+from sw_core.session_manager import InteractiveLease, SessionManager
 import sw_core.session_manager as sm_mod
+from sw_core.uart_io import UARTBridge
 from sw_core.wal import WalWriter
 
 
@@ -222,6 +228,192 @@ class TestUbootTemplateProfile(unittest.TestCase):
         # 確認其他 bootloader prompt 也能匹配
         self.assertTrue(re.search(tpl.prompt_regex, "u-boot> "))
         self.assertTrue(re.search(tpl.prompt_regex, "CFE> "))
+
+
+class _FakeTarget:
+    """以 pty 模擬 UART target，鏡像 tests/test_agent_defer_tx.py 的 FakeTarget。"""
+
+    def __init__(self) -> None:
+        self.master_fd, self.slave_fd = pty.openpty()
+        self.slave_path = os.ttyname(self.slave_fd)
+
+    def close(self) -> None:
+        for fd in (self.master_fd, self.slave_fd):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+class TestLastHumanInputAt(unittest.TestCase):
+    """#53 sub-task 4：UARTBridge 須追蹤最後一次「真實 human owner 鍵入」時間。
+
+    - 只有 human-OWNER 的直接 raw 送出分支會更新 `last_human_input_at`。
+    - broker/非 owner 的 console RX 路徑（走 line-buffered 佇列）不得更新。
+    - snapshot() 須回出 `last_human_input_at` 欄位。
+    """
+
+    def _make_target(self) -> _FakeTarget:
+        try:
+            return _FakeTarget()
+        except OSError as exc:
+            self.skipTest(f"pty not available in current environment: {exc}")
+
+    def _make_bridge(self, td: str) -> tuple[UARTBridge, _FakeTarget]:
+        target = self._make_target()
+        self.addCleanup(target.close)
+        bridge = UARTBridge("COM0", target.slave_path, UartProfile(), WalWriter(wal_dir=td))
+        bridge.start()
+        self.addCleanup(bridge.stop)
+        return bridge, target
+
+    def test_snapshot_has_last_human_input_at_none_before_keystroke(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            bridge, _target = self._make_bridge(td)
+            snap = bridge.snapshot()
+            self.assertIn("last_human_input_at", snap)
+            self.assertIsNone(snap["last_human_input_at"])
+
+    def test_human_owner_keystroke_updates_last_human_input_at(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            bridge, _target = self._make_bridge(td)
+            attached = bridge.attach_console(label="human")
+            client = bridge._clients[attached["client_id"]]
+            bridge.set_interactive_owner(f"human:{client.client_id}")
+
+            self.assertIsNone(bridge.snapshot()["last_human_input_at"])
+            bridge._handle_console_rx(client, b"x")
+            after = bridge.snapshot()["last_human_input_at"]
+            self.assertIsInstance(after, float)
+
+    def test_non_owner_rx_does_not_update_last_human_input_at(self) -> None:
+        """非 owner（broker line-buffered 佇列路徑）的 console RX 不更新時間。"""
+        with tempfile.TemporaryDirectory() as td:
+            bridge, _target = self._make_bridge(td)
+            attached = bridge.attach_console(label="observer")
+            client = bridge._clients[attached["client_id"]]
+            # 不設 interactive owner → 走 line-buffered on_console_line 路徑
+            bridge._handle_console_rx(client, b"ls\n")
+            self.assertIsNone(bridge.snapshot()["last_human_input_at"])
+
+    def test_deferred_buffer_branch_does_not_update(self) -> None:
+        """agent 執行中、human 被 suspend → deferred-buffer 分支不更新時間。"""
+        with tempfile.TemporaryDirectory() as td:
+            bridge, _target = self._make_bridge(td)
+            attached = bridge.attach_console(label="human")
+            client = bridge._clients[attached["client_id"]]
+            bridge.set_interactive_owner(f"human:{client.client_id}")
+            bridge.suspend_interactive()  # agent_active=True, owner 移到 suspended
+
+            bridge._handle_console_rx(client, b"y")
+            self.assertIsNone(bridge.snapshot()["last_human_input_at"])
+
+
+class TestHumanActiveSemantics(unittest.TestCase):
+    """#53 sub-task 5：self_test 須暴露 human_active（最近鍵入時間窗）。
+
+    - human_active 僅在 human_attached 且 bridge 有 last_human_input_at 且
+      age <= HUMAN_ACTIVE_WINDOW_S 時為 True。
+    - human_attached 語意維持不變（只看 owner 是否 human:）。
+    - 無 lease 時 human_attached / human_active 皆 False。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._old_state_path = sm_mod.STATE_PATH
+        sm_mod.STATE_PATH = str(Path(self._tmp.name) / "state.json")
+
+    def tearDown(self) -> None:
+        sm_mod.STATE_PATH = self._old_state_path
+
+    def _make_manager(self, profiles: list[SessionProfile]) -> SessionManager:
+        return SessionManager(
+            profiles,
+            WalWriter(wal_dir=self._tmp.name),
+            on_ready=lambda _sid: None,
+            on_detached=lambda _sid: None,
+        )
+
+    def _setup_human_session(self, mgr: SessionManager, *, last_human_input_at):
+        """在 session 上掛 human InteractiveLease 與 mock bridge。"""
+        session = mgr.get_session("COM0")
+        assert session is not None
+        session.bridge = mock.MagicMock()
+        session.bridge.snapshot.return_value = {
+            "running": True,
+            "serial_alive": True,
+            "vtty_alive": True,
+            "vtty": "/dev/pts/0",
+            "interactive_owner": "human:c1",
+            "last_human_input_at": last_human_input_at,
+        }
+        session.state = "ATTACHED"
+
+        lease = InteractiveLease(
+            interactive_id="iv-1",
+            session_id=session.session_id,
+            owner="human:c1",
+            created_at="2026-06-17T00:00:00Z",
+            timeout_s=3600.0,
+        )
+        mgr._interactive[lease.interactive_id] = lease
+        session.interactive_session_id = lease.interactive_id
+        return session
+
+    def test_human_active_false_when_input_stale(self) -> None:
+        profiles = [_make_profile(platform="passthrough", ready_probe="")]
+        mgr = self._make_manager(profiles)
+        # 最後鍵入在時間窗外（> 60s）
+        self._setup_human_session(
+            mgr, last_human_input_at=time.monotonic() - (HUMAN_ACTIVE_WINDOW_S + 10.0)
+        )
+
+        result = mgr.self_test("COM0")
+        self.assertTrue(result["human_attached"])
+        self.assertFalse(result["human_active"])
+
+    def test_human_active_true_when_input_recent(self) -> None:
+        profiles = [_make_profile(platform="passthrough", ready_probe="")]
+        mgr = self._make_manager(profiles)
+        self._setup_human_session(
+            mgr, last_human_input_at=time.monotonic() - 1.0
+        )
+
+        result = mgr.self_test("COM0")
+        self.assertTrue(result["human_attached"])
+        self.assertTrue(result["human_active"])
+
+    def test_human_active_false_when_never_typed(self) -> None:
+        """human attached 但從未鍵入（last_human_input_at=None）→ human_active False。"""
+        profiles = [_make_profile(platform="passthrough", ready_probe="")]
+        mgr = self._make_manager(profiles)
+        self._setup_human_session(mgr, last_human_input_at=None)
+
+        result = mgr.self_test("COM0")
+        self.assertTrue(result["human_attached"])
+        self.assertFalse(result["human_active"])
+
+    def test_no_lease_both_false(self) -> None:
+        """無 lease（無 human attach）→ human_attached / human_active 皆 False。"""
+        profiles = [_make_profile(platform="passthrough", ready_probe="")]
+        mgr = self._make_manager(profiles)
+        session = mgr.get_session("COM0")
+        assert session is not None
+        session.bridge = mock.MagicMock()
+        session.bridge.snapshot.return_value = {
+            "running": True,
+            "serial_alive": True,
+            "vtty_alive": True,
+            "vtty": "/dev/pts/0",
+            "interactive_owner": None,
+            "last_human_input_at": None,
+        }
+        session.state = "ATTACHED"
+
+        result = mgr.self_test("COM0")
+        self.assertFalse(result["human_attached"])
+        self.assertFalse(result["human_active"])
 
 
 if __name__ == "__main__":
