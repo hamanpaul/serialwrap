@@ -9,6 +9,7 @@ import pty
 import select
 import threading
 import time
+import tty
 from typing import Protocol
 
 from .mcu_patterns import McuPatternRegistry
@@ -119,6 +120,9 @@ class FlashEndpoint:
     def start(self):
         """開啟 PTY、建立 symlink、啟動背景 loop 執行緒。"""
         self._master_fd, self._slave_fd = pty.openpty()
+        # 關鍵：把 slave 設為 raw，否則 PTY line discipline 會做 CR/LF 轉換與輸入處理，
+        # 汙染 flasher（開 /dev/ttyMCU）的 SBL 二進位協定。byte-transparency 仰賴這一步。
+        tty.setraw(self._slave_fd)
         os.set_blocking(self._master_fd, False)
         slave_name = os.ttyname(self._slave_fd)
         os.makedirs(os.path.dirname(self._link_path), exist_ok=True)

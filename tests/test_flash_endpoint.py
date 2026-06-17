@@ -62,3 +62,23 @@ def test_is_flashing_false_when_idle():
             assert ep.is_flashing() is False
         finally:
             ep.stop()
+
+
+def test_endpoint_slave_is_raw_for_byte_transparency():
+    """真實 flasher 開的就是這個 slave；必須是 raw，否則 SBL binary 會被 line discipline 汙染。"""
+    import termios
+    with tempfile.TemporaryDirectory() as d:
+        link = os.path.join(d, "dev", "ttyMCU")
+        ep = FlashEndpoint(link_path=link, registry=McuPatternRegistry.default(),
+                           list_candidates=lambda: [])
+        ep.start()
+        try:
+            fd = os.open(link, os.O_RDWR | os.O_NONBLOCK)
+            try:
+                oflag, lflag = termios.tcgetattr(fd)[1], termios.tcgetattr(fd)[3]
+                assert not (lflag & termios.ICANON)   # 非 canonical（不行緩衝）
+                assert not (oflag & termios.OPOST)     # 無輸出處理（不會 LF→CRLF）
+            finally:
+                os.close(fd)
+        finally:
+            ep.stop()
