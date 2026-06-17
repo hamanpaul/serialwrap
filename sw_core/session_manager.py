@@ -2130,9 +2130,12 @@ class SessionManager:
             selector, timeout_s=timeout_s, strict_human_lock=strict_human_lock
         )
         if "command_capable" not in result:
-            session = self.get_session(selector)
+            # 直接取用 impl 在 lock 內快照進 result["session"] 的值，避免再開一次
+            # lock 重撈 session（消除多餘鎖與 TOCTOU 窗口）。查無 session 的分支
+            # （如 SESSION_NOT_FOUND）沒有 "session" key → 一律 False。
+            nested = result.get("session")
             result["command_capable"] = (
-                bool(session.profile.command_capable) if session is not None else False
+                bool(nested.get("command_capable", False)) if nested is not None else False
             )
         return result
 
