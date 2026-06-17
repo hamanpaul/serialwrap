@@ -840,6 +840,39 @@ run end reason 分布如下：
 3. 補 attach / recover gating 的 regression test，避免 session 無限停在 `ATTACHED`。
 4. 修完後重新跑 long-run，驗收標準至少要把 `session_not_ready:ATTACHED` 造成的 restart 降到 `0`，且不能讓 human / multi-agent 協作退化。
 
+## 真機驗證手法
+
+### Bootloader（U-Boot）command profile 真機驗證
+
+驗證 `uboot-template` 之類 bootloader command profile 能在真機進 `READY` 並下 line 命令時，
+核心原則是**把驗證關進沙箱、完全不動 production daemon 設定**，失敗可隨時丟棄、零殘留。
+
+**為何不直接在 production 上改**：profile 綁定是 detection-based，而 `uboot-template` 是
+`passthrough`（auto-detect 不會自動選它，只能明確綁定）；且沒有乾淨的 runtime 改 profile 的
+CLI（`bind` 只改 device、`recover`/`clear` 沿用舊 profile）。在 production 改要重設定 + 重啟，
+會殺掉其他 COM、動到持久化狀態。
+
+**隔離驗證步驟（dogfood `device release`/`device attach`）**：
+
+1. **釋放 raw device**：`serialwrap device release --selector COMx --source agent:verify`
+   —— production daemon 關閉該 UART FD、進 `RELEASED`，但**繼續運作、其他 COM 不受影響**。
+2. **起受限的 throwaway daemon**：用獨立 socket/lock；關鍵是把
+   `SERIALWRAP_BY_ID_DIR` 指到一個**只含目標裝置一條 by-id symlink** 的暫存目錄，避免它掃到
+   其他裝置與 production 形成 two-reader 衝突。該 daemon 的 profile 加一段 `targets:` 把目標
+   by-id **明確綁到 `uboot-template`**（繞過 auto-detect）。
+3. **把板子弄進 U-Boot**：開 interactive lease → 送 `reboot` → 接著以 ~0.3s 間隔持續送鍵
+   （space）約 30 秒，攔截「Hit any key to stop autoboot」視窗；若是 boot menu，送對應鍵
+   （例如 `0` = Exit）掉到 U-Boot console（prompt 例如 `U-Boot> `）。
+4. **走完整 serialwrap 路徑驗證**：`session self-test`（期望 `OK`/`probe_ok=True`/`READY`）→
+   `cmd submit --cmd 'printenv' --mode line`（期望框出 env dump）。
+5. **還原**：送 `boot` 回正常 OS → 停 throwaway daemon → `device attach --selector COMx` 收回
+   → 等板子開機穩定後（早期 PCIe/kernel 噪音會干擾偵測）重啟 production daemon，讓 detection
+   重新綁回原 profile。
+
+> 真機才抓得到的陷阱：(1) 多個 `passthrough` template 會搶 auto-detect 的通用 fallback，通用
+> fallback 必須限定為非 command-capable 的 passthrough；(2) 實機 U-Boot prompt 可能是大寫
+> `U-Boot> `，`prompt_regex` 要用 `(?mi)` 大小寫不敏感。
+
 ## Remote Support（ssh-tunnel 遠端連線）
 
 當 FAE 在海外（美國 / 歐洲電信客戶端）用 serialwrap 連接 DUT，台灣 RD 可透過 **ssh-tunnel** 讓 agent 對遠端 daemon 下命令，無需修改 daemon 端程式。
