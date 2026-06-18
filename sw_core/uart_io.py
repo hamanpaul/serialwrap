@@ -102,6 +102,14 @@ class UARTBridge:
         # 最後一次「真實 human owner 鍵入」的 monotonic 時間（#53）。僅 human-OWNER
         # 直接 raw 送出分支會更新；deferred buffer、serial RX loop、agent 注入都不更新。
         self._last_human_input_at: float | None = None
+        # flash 模式（#55）：FLASHING 期間封鎖所有 console→device 注入，避免汙染 SBL binary；
+        # RX→console 仍照常（唯讀快照）。flash bridge 走 flash_tx，不受此旗標影響。
+        self._flash_mode: bool = False
+
+    def set_flash_mode(self, enabled: bool) -> None:
+        """進出 flash 模式；FLASHING 期間擋下 console 注入（C2）。"""
+        with self._state_lock:
+            self._flash_mode = enabled
 
     @property
     def vtty_path(self) -> str | None:
@@ -397,6 +405,10 @@ class UARTBridge:
 
     def _handle_console_rx(self, client: ConsoleClient, data: bytes) -> None:
         with self._state_lock:
+            if self._flash_mode:
+                # FLASHING 期間：console 為唯讀快照，丟棄所有 console→device 輸入，
+                # 避免人類鍵入 / agent 注入汙染 flasher 的 SBL binary 串流（C2）。
+                return
             owner = self._interactive_owner
             agent_active = self._agent_active
             suspended = self._suspended_owner
@@ -484,6 +496,36 @@ class UARTBridge:
             self._write_all(serial_fd, payload)
         if log:
             self.wal.append(com=self.com, direction="TX", source=source, payload=payload, cmd_id=cmd_id)
+
+    def flash_tx(self, payload: bytes) -> None:
+        """flash 模式：endpoint→device 原樣送出，跳過行處理（_consume_console_input）。"""
+        self.send_bytes(payload, source="flash", cmd_id=None)
+
+    def mirror_termios_from(self, slave_fd: int, *, fallback_baud: int | None = None) -> None:
+        """把 endpoint PTY slave 的 baud 鏡射到 real device。
+
+        鏡射失敗時，若有提供 fallback_baud（命中 pattern 的 registry baud，#55 I3），
+        則明確把 real device 設成該 baud；否則維持 _configure_serial 的 profile baud。
+        """
+        with self._state_lock:
+            serial_fd = self._serial_fd
+        if serial_fd is None:
+            return
+        try:
+            attrs = termios.tcgetattr(slave_fd)
+            ispeed, ospeed = attrs[4], attrs[5]
+            dst = termios.tcgetattr(serial_fd)
+            dst[4], dst[5] = ispeed, ospeed
+            termios.tcsetattr(serial_fd, termios.TCSANOW, dst)
+        except OSError:
+            if fallback_baud is not None and fallback_baud in _BAUD_MAP:
+                try:
+                    speed = _BAUD_MAP[fallback_baud]
+                    dst = termios.tcgetattr(serial_fd)
+                    dst[4] = dst[5] = speed
+                    termios.tcsetattr(serial_fd, termios.TCSANOW, dst)
+                except OSError:
+                    pass  # 連 fallback 都失敗 → 維持 profile baud
 
     def send_command(self, cmd: str, *, source: str, cmd_id: str | None = None) -> None:
         payload = cmd.encode("utf-8", errors="replace")

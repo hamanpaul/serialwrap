@@ -465,6 +465,15 @@ def build_parser() -> argparse.ArgumentParser:
     wal_sub.add_parser("reset", help="重設 WAL")
     wal_sub.add_parser("current-seq", help="顯示目前 WAL seq")
 
+    p_mcu = sub.add_parser(
+        "mcu",
+        help="MCU flash pattern 查詢與 flash 端點狀態",
+        description="查詢 MCU flash pattern 清單與目前 flash 端點狀態（候選 COM port 與 is_flashing）。",
+    )
+    mcu_sub = p_mcu.add_subparsers(dest="mcu_cmd", required=True, metavar="<command>")
+    mcu_sub.add_parser("patterns", help="列出所有已知 MCU 家族 flash pattern（family／probe／expect／baud）")
+    mcu_sub.add_parser("status", help="顯示 flash 端點狀態：候選 COM port 清單與目前是否 flashing")
+
     p_event = sub.add_parser(
         "event",
         help="event-trigger 規則註冊與 matcher 控制",
@@ -680,6 +689,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "wal" and args.wal_cmd == "current-seq":
         return _run_rpc(args, "wal.current_seq", {})
+
+    if args.cmd == "mcu":
+        if args.mcu_cmd == "patterns":
+            return _run_rpc(args, "mcu.patterns", {})
+        if args.mcu_cmd == "status":
+            return _run_rpc(args, "mcu.status", {})
 
     if args.cmd == "event":
         return _dispatch_event(args)

@@ -98,3 +98,15 @@ policy_version: 1.0.4
 - **語言規範（checklist）**：依 repo 來源決定語言——`github.com/hamanpaul/*`、`github.com/paulc-arc/*` → zh-tw；arcadyan GitLab → en_US。涵蓋 PR 標題／內文與所有 comment。本 repo 屬 `hamanpaul` → zh-tw。
 - **動工前（軟性，不打斷流程）**：若任務對應某 issue，`gh issue view <N>` 核對相關性後分支可命名 `feature/<N>-<slug>`，開 PR 於 body 寫 `Closes #N`；查無對應 issue 照常進行，不另開、不停。
 - **Exemption 白名單新增**：`policy-exempt:issue-link`（R-17）、`policy-exempt:docs-sync`（R-18）。
+
+## MCU flash 真機驗證手法（#55 `/dev/ttyMCU`，PR #66 實證）
+
+> serialwrap 原生 MCU 韌體升級端點 `/dev/ttyMCU`（daemon 維持 tty 唯一 reader、sync-probe 自動認線、FLASHING 仲裁）的真機驗證程序與已知陷阱。
+
+- **隔離跑法（不動 prod / 人類 minicom）**：prod daemon 不停；用獨立 socket/state/run 的 **throwaway daemon** 跑待測程式碼（`SERIALWRAP_RUN_DIR` / `_STATE_DIR` / `_BY_ID_DIR` 等 env）。關鍵：`SERIALWRAP_BY_ID_DIR` 指向只放「MCU 線（FTDI）by-id symlink」的 sandbox 目錄，否則動態偵測會抓到被人類 minicom 佔住的 DUT console（ttyUSB0）造成 two-reader 衝突。
+- **進 BSL**：DUT console（如 CH340/ttyUSB0）下 GPIO BSL-invoke（unbind `1fbf0300.serial`、GPIO13/14 設 in、GPIO31/54 reset）。**長指令會在 UART console 被截斷 → 必須逐行短指令送**（`tmux send-keys -l` 每行 +Enter +sleep，勿用 `;` 串長行）。
+- **燒錄**：`ocp-mcu-upgrade -d <RUN_DIR>/dev/ttyMCU -b 115200 -t 8 -e -s -i <fw.bin>` → 期望 `Return error code : 0x0`；燒後 session 自動恢復 `ATTACHED`、daemon 不死、其他 COM 不受影響。
+- **三個只有實機才現形的坑（皆已修，列為回歸重點）**：
+  1. 端點未 bridge 時**一律沉默、不主動寫任何 bytes**（曾於 idle 寫支援清單 → 被 flasher 讀成假回應、汙染 SBL sync）。清單查詢只走 `mcu patterns` / `mcu status`，不經此 PTY。
+  2. 認線 probe 必須用 **flasher 自身的 sync bytes** 並把 MCU 的 ACK **回放**給 flasher；若另注入獨立 sync 會吃掉 MCU 的 ACK（double-sync），flasher 隨後自己的 sync 永遠收不到回應。
+  3. daemon 同持 PTY master+slave（避免閒置時 master 一直 EOF 空轉）→ flasher 關閉端點時 master 無 EOF；需以 holder-probe（`_probe_external_holder` 掃 pts）偵測 flasher 斷線才能結束 pump、離開 `FLASHING` 自動恢復。
