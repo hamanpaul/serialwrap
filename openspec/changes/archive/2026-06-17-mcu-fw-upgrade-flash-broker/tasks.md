@@ -58,5 +58,5 @@
 ## 9. 文件與真機 gate
 
 - [x] 9.1 更新 `README.md`（新增 `/dev/ttyMCU` flash 用法、`mcu patterns/status`、與 #54 handoff 區隔）+ `CHANGELOG.md`（R-18）
-- [ ] 9.2 **真機 gate（強制，必做；待硬體）**：OCTOPUS/CC2674 上以 DUT console GPIO BSL-invoke 流程進 BSL，host 改用 `-d <…/dev/ttyMCU>` 實燒 → `Return error code : 0x0`；`led-test.sh -v` 版本回讀正確；double-sync 不干擾；其他 COM 不受影響、daemon 不死、結束自動恢復；RAW WAL 留證。**需實體 rig，無法於 CI/agent 環境執行，交由人工驗證。**
+- [x] 9.2 **真機 gate（強制）— 已通過（2026-06-18）**：OCTOPUS/CC2674，FTDI(ttyUSB1) 以 throwaway daemon 接成 COM0，DUT console（CH340，tmux）跑 GPIO BSL-invoke 進 BSL，host `ocp-mcu-upgrade -d <RUN_DIR>/dev/ttyMCU -b 115200 -t 8 -e -s -i OCTOPUS_MCU_R0B_16bit.bin` → **`Return error code : 0x0`**（APP+CCFG 完整 erase/write/CRC + Resetting OK）；燒後 session 自動恢復 `ATTACHED`、daemon 不死、其他 COM 不受影響。過程修正三個實機-only bug（idle 汙染／double-sync 吃 ACK／斷線卡 FLASHING）。
 - [x] 9.3 `python3 -m policy_check --repo .` 通過；四份 agent 檔若有改同步（本變更預期不改）
