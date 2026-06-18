@@ -110,6 +110,13 @@ stateDiagram-v2
     RECOVERING --> READY: auto relogin ok
     RECOVERING --> ATTACHED: prompt not ready
     RECOVERING --> DETACHED: device lost
+    ATTACHED --> RELEASED: device release
+    READY --> RELEASED: device release
+    RELEASED --> ATTACHING: device attach
+    ATTACHED --> FLASHING: mcu flash（/dev/ttyMCU 認線）
+    READY --> FLASHING: mcu flash（/dev/ttyMCU 認線）
+    FLASHING --> ATTACHED: flash 結束（恢復先前）
+    FLASHING --> READY: flash 結束（恢復先前）
 ```
 
 ### `ATTACHED` vs `READY`：可不可以下命令（command_capable）
@@ -128,6 +135,11 @@ broker 能框出命令的輸出（送出 → 看到 prompt → 取回 stdout）�
 - `self_test` / get-state 會在最外層回 `command_capable`，呼叫端可據此分辨「ATTACHED 但本就不可下命令」與「ATTACHED 應可進 READY」。
 
 > 注意：OS profile（prpl/shell）若板子掉進 U-Boot，OS 的 `prompt_regex` 對不上 → **不會** READY（正確：避免把 Linux 命令送進 bootloader）。
+
+### `RELEASED` / `FLASHING`
+
+- `RELEASED`（#54）：`device release` 把 raw 裝置交給外部工具獨佔（如燒錄），broker 關閉 FD、**不自動搶回**、跨 daemon 重啟保留；`device attach` 收回。詳見 `openspec/specs/device-handoff/spec.md`。
+- `FLASHING`（#55）：外部 flasher 經 `/dev/ttyMCU` 認線後 session 進入，期間 `cmd submit` 回 `FLASHING_BUSY`、其他 COM 不受影響、daemon 不死；flash 結束自動恢復先前狀態。詳見 `openspec/specs/mcu-flash-broker/spec.md`。
 
 ## Agent / Human Co-work 時序圖
 

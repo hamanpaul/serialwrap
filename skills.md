@@ -1,5 +1,7 @@
 # serialwrap-mcp Agent Skill
 
+> ⚠️ **本檔狀態**：與 `hamanpaul/custom-skills` 的同名 skill 為兩份平行 agent 指南，且**只更新到 event 時代**——尚缺 device release/attach（#54）、command_capable + `PROFILE_NOT_COMMAND_CAPABLE`（#51）、`/dev/ttyMCU` + `mcu patterns/status`（#55）、human_active/soft-preempt（#53）。source-of-truth 收斂、改名（`serialwrap-mcp` → `serialwrap`）與 plugin 打包追蹤於 **#59**；在 #59 完成前，agent 操作以 README + `openspec/specs/*` 為準。
+
 ## 目的
 定義 Agent 在 UART 任務中使用 `serialwrap`/`serialwrap-mcp` 的觸發條件、操作順序與安全邊界，避免直接碰觸實體 UART 造成資料失真或衝突。
 
