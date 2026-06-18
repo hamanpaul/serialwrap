@@ -137,5 +137,3 @@ NAT 穿透 / 跨國接入由 tunnel/relay（SSH `-R`/autossh、Tailscale/WireGua
 
 - `tests/test_multiagent_e2e.py::...::test_five_agents_three_rounds_no_conflict`（CLAUDE.md 載明）
 - `t8_full_run_simulation`、`test_t1_wal_reset_preserves_console`（~機率性，pre-existing）
-</content>
-</invoke>

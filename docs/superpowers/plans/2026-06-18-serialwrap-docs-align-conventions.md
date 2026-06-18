@@ -1,12 +1,12 @@
 # #67 文件對齊 + conventions 升 1.0.5 實作計畫
 
-> **For agentic workers:** REQUIRED SUB-SKILL: 用 superpowers:subagent-driven-development（建議）或 superpowers:executing-plans 逐 task 實作。步驟用 checkbox（`- [ ]`）追蹤。
+> **給 agentic worker：** 必用子技能——`superpowers:subagent-driven-development`（建議）或 `superpowers:executing-plans` 逐 task 實作。步驟用 checkbox（`- [ ]`）追蹤。
 
-**Goal:** 把 serialwrap repo 的 policy pin 升到 conventions v1.0.5（讓 R-22 doc_reference 在本地與 CI 生效），並一次對齊落後現行架構的文件。
+**目標：** 把 serialwrap repo 的 policy pin 升到 conventions v1.0.5（讓 R-22 doc_reference 在本地與 CI 生效），並一次對齊落後現行架構的文件。
 
-**Architecture:** 兩支 PR。PR#1 純機械式版本 pin（config + workflow + 四份 agent 檔同步），以 `policy_check` 當測試 harness 做 RED（版本漂移偵測）→ GREEN。PR#2 文件對齊（刪 stub / spec 降級指向 openspec / 標歷史 / README 狀態機補 RELEASED+FLASHING / skills.md 最小 cross-ref），以 `policy_check`（含 R-22）+ grep 斷言當 harness。**不動任何程式碼、不改 capability 行為。**
+**架構：** 兩支 PR。PR#1 純機械式版本 pin（config + workflow + 四份 agent 檔同步），以 `policy_check` 當測試 harness 做 RED（版本漂移偵測）→ GREEN。PR#2 文件對齊（刪 stub / spec 降級指向 openspec / 標歷史 / README 狀態機補 RELEASED+FLASHING / skills.md 最小 cross-ref），以 `policy_check`（含 R-22）+ grep 斷言當 harness。**不動任何程式碼、不改 capability 行為。**
 
-**Tech Stack:** `paulsha-conventions` policy engine（`python3 -m policy_check`）、pytest、git、markdown/mermaid。
+**技術棧：** `paulsha-conventions` policy engine（`python3 -m policy_check`）、pytest、git、markdown/mermaid。
 
 **設計來源:** `docs/superpowers/specs/2026-06-18-serialwrap-docs-align-and-skill-consolidation-design.md`
 
@@ -383,4 +383,3 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 - R-22：本次變更未產生新懸空引用（removed-this-change=0 FAIL）。
 - 無程式碼變更、`VERSION` 未動、無新測試失敗。
 - 範疇：#59（退役 MCP/改名/skill 整併）不在本計畫。
-</content>
