@@ -117,29 +117,34 @@ def _human_console_mode(command: str) -> str:
 
 
 class _BridgeProbe:
-    """ProbeTransport 實作：透過已啟動的 UARTBridge 送出 probe 並等待 ACK。
+    """ProbeTransport 實作：透過已啟動的 UARTBridge 送 sync 並等待 ACK。
 
-    由 SerialwrapService._on_flash_open 建立，與 detect_mcu_line 搭配使用。
-    _flash_rx_buffers 由 _flash_rx_observer 即時填充，probe 只需 poll 等待即可。
+    與 detect_mcu_line 搭配；_flash_rx_buffers 由 _flash_rx_observer 即時填充。
+
+    關鍵（真機修正）：probe 送的是 **flasher 自己的 sync bytes**（`sync_bytes`），而非另外注入
+    一組 sync。否則獨立 probe 會「吃掉」MCU 對 sync 的 ACK，導致 flasher 隨後自己的 sync 不再被
+    回應（double-sync）。命中時把 MCU 回來的 bytes 存進 `acks[by_id]`，供 bridge 啟動時回放給 flasher。
     """
 
-    def __init__(self, svc: "SerialwrapService", by_id_to_com: dict[str, str]) -> None:
+    def __init__(self, svc: "SerialwrapService", by_id_to_com: dict[str, str],
+                 sync_bytes: bytes = b"") -> None:
         self._svc = svc
         self._by_id_to_com = by_id_to_com
+        self._sync_bytes = sync_bytes
+        self.acks: dict[str, bytes] = {}      # by_id -> 命中時擷取到的 MCU 回應（含 ACK），供回放
 
     def probe(self, by_id: str, probe_bytes: bytes, expect: bytes, timeout_ms: int) -> bool:
-        """送出非破壞性 probe 並等待 ACK（最多 timeout_ms 毫秒）。"""
+        """以 flasher 的 sync（無則退回 pattern probe）試探並等待 ACK（最多 timeout_ms 毫秒）。"""
         com = self._by_id_to_com.get(by_id)
         if com is None:
             return False
         sess = self._svc._sessions.get_session(com)
         if sess is None or sess.bridge is None:
             return False
-        # 清空 probe buffer，準備接收 ACK
         with self._svc._flash_lock:
             self._svc._flash_rx_buffers[com] = bytearray()
         try:
-            sess.bridge.send_bytes(probe_bytes, source="flash-probe", cmd_id=None)
+            sess.bridge.flash_tx(self._sync_bytes or probe_bytes)
         except Exception:
             return False
         deadline = time.monotonic() + timeout_ms / 1000.0
@@ -147,6 +152,7 @@ class _BridgeProbe:
             with self._svc._flash_lock:
                 buf = bytes(self._svc._flash_rx_buffers.get(com, b""))
             if expect in buf:
+                self.acks[by_id] = buf      # 記下 MCU 回應，bridge 啟動時回放給 flasher
                 return True
             time.sleep(0.02)
         return False
@@ -294,18 +300,21 @@ class SerialwrapService:
         """FlashEndpoint 偵測到 flasher 寫入時的回呼。
 
         流程：
-          1. 以 _BridgeProbe + detect_mcu_line 偵測目標 MCU 線。
-          2. 命中 → enter_flashing → 同步 termios → 雙向 pump 直到 flasher 結束。
+          1. 以 flasher 自己的 sync bytes（first_bytes）為 probe + detect_mcu_line 偵測目標 MCU 線。
+          2. 命中 → 把 MCU 的 ACK 回放給 flasher（它在等自己 sync 的回應）→ enter_flashing →
+             同步 termios → 雙向 pump（**不**重送 first_bytes，已當 probe 送出）直到 flasher 結束。
           3. pump 結束（flasher 關閉端點或 stop_event）→ exit_flashing，清除狀態。
           4. 未命中 → 靜默返回（保留 flasher 自身 retry 機會）。
+
+        真機修正：偵測用 flasher 的 sync（非另注入一組），命中後回放 ACK；否則獨立 probe 會吃掉
+        MCU 的 sync ACK，使 flasher 隨後自己的 sync 收不到回應而永遠 timeout。
         """
         candidates = self._flash_candidates()
         by_id_to_com = {c["by_id"]: c["com"] for c in candidates if c.get("by_id")}
-        transport = _BridgeProbe(self, by_id_to_com)
+        transport = _BridgeProbe(self, by_id_to_com, sync_bytes=first_bytes)
         result = detect_mcu_line(candidates, self._mcu_registry, transport)
         com = by_id_to_com.get(result.by_id) if result.by_id else None
         # 記錄最近一次偵測結果，供 `mcu status` 呈現（含 ambiguous 命中清單）（I2）。
-        # ambiguous / none 仍保持端點沉默（不寫 bytes），但操作者可在 status 看到原因。
         with self._flash_lock:
             self._flash_last_detect = {
                 "status": result.status,
@@ -323,21 +332,54 @@ class SerialwrapService:
             fallback_baud = self._mcu_registry.get(result.family).baud
         except (KeyError, AttributeError):
             fallback_baud = None
+        ack = transport.acks.get(result.by_id, b"")   # 偵測時 MCU 回的 ACK，回放給 flasher
         self._sessions.enter_flashing(com)
         stop = threading.Event()
         with self._flash_lock:
             self._flash_active_com = com
             self._flash_master_fd = master_fd
+        # daemon 同時持有 PTY master+slave fd（持 slave 是為了避免閒置時 master 一直 EOF 空轉），
+        # 所以 flasher 關閉端點時 master 收不到 EOF。改以 holder-probe 偵測 flasher 斷線：
+        # 一旦曾偵測到外部持有（flasher 開著），之後降到 0 即視為結束、收掉 pump。
+        try:
+            slave_path = os.ttyname(slave_fd)
+        except OSError:
+            slave_path = None
+        if slave_path is not None:
+            threading.Thread(target=self._watch_flasher_disconnect,
+                             args=(slave_path, stop), daemon=True).start()
         try:
             sess.bridge.mirror_termios_from(slave_fd, fallback_baud=fallback_baud)
-            sess.bridge.clear_rx_buffer()
-            pump_endpoint_to_sink(master_fd, sess.bridge, stop, first_bytes=first_bytes)
+            if ack:
+                try:
+                    os.write(master_fd, ack)   # 讓 flasher 看到自己 sync 的回應
+                except OSError:
+                    pass
+            # 注意：first_bytes 已在 probe 階段送給 MCU，這裡不可重送（會變成多餘的 sync）。
+            pump_endpoint_to_sink(master_fd, sess.bridge, stop, first_bytes=b"")
         finally:
             with self._flash_lock:
                 self._flash_active_com = None
                 self._flash_master_fd = None
                 self._flash_rx_buffers.pop(com, None)   # 清掉本次 probe/flash 的 RX buffer（M1）
             self._sessions.exit_flashing(com)
+
+    def _watch_flasher_disconnect(self, slave_path: str, stop: "threading.Event",
+                                  poll_s: float = 0.5, max_s: float = 1800.0) -> None:
+        """輪詢 flash 端點 PTY 的外部持有者；flasher 斷線（持有歸零）即設 stop 結束 pump。"""
+        armed = False
+        deadline = time.monotonic() + max_s
+        while not stop.is_set() and time.monotonic() < deadline:
+            try:
+                pids = self._sessions._probe_external_holder(slave_path).get("pids", [])
+            except Exception:
+                pids = []
+            if pids:
+                armed = True
+            elif armed:
+                break       # 曾連上、現在斷了 → flasher 結束
+            time.sleep(poll_s)
+        stop.set()
 
     def _flash_candidates(self) -> list[dict]:
         """flash 偵測候選：已 attached 且非 command_capable console 的 session，附上 real_path。"""
