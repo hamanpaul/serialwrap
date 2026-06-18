@@ -570,10 +570,9 @@ byte-transparent 端點 `/dev/ttyMCU`（預設 `${SERIALWRAP_RUN_DIR}/dev/ttyMCU
 flasher 接上去，破壞性的 erase/program 只會到已確認的線。
 
 ```bash
-# 查支援的 MCU 家族與目前候選
+# 查支援的 MCU 家族與目前候選（端點本身一律沉默，清單只走 CLI/RPC）
 serialwrap mcu patterns
 serialwrap mcu status
-cat /tmp/serialwrap/dev/ttyMCU   # 只讀亦會列出支援家族（不送 bytes → 不進 flash）
 
 # 1) 先在 DUT console（serialwrap console session）把 MCU 帶進 BSL（GPIO reset，依板而定）
 # 2) host 改用 serialwrap 端點取代原本的 raw /dev/ttyUSBx：

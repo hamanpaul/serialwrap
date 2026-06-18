@@ -8,7 +8,6 @@ import os
 import pty
 import select
 import threading
-import time
 import tty
 from typing import Protocol
 
@@ -98,27 +97,21 @@ def detect_mcu_line(
 class FlashEndpoint:
     """常駐 PTY flash 端點：slave 以穩定 symlink 命名（如 /dev/ttyMCU），daemon 持 master。
 
-    開啟分流：client 先寫 bytes（flasher 的 sync）→ master 變可讀 → 走 flash 路徑；
-    只讀不寫（cat）→ daemon 定期把支援清單寫進 master 供其讀取（不依賴 EOF）。
+    **端點一律保持沉默**，只有在偵測到 client 寫入（flasher 的 sync）→ master 變可讀時，
+    才走 flash 路徑（偵測 + bridge）。daemon 端絕不主動往 master 寫任何 bytes，否則會被
+    flasher 讀成假回應、汙染 SBL sync（這在真機測試中已實證會讓燒錄失敗）。
+    支援家族清單請改用 `serialwrap mcu patterns` / `mcu status`（不經此 PTY）。
     """
 
-    def __init__(self, *, link_path, registry, list_candidates,
-                 on_flash_open=None, grace=0.3, idle_list_interval=0.5,
-                 client_cooldown=3.0):
+    def __init__(self, *, link_path, on_flash_open=None, grace=0.3):
         self._link_path = link_path
-        self._registry = registry
-        self._list_candidates = list_candidates       # () -> list[dict]
         self._on_flash_open = on_flash_open            # (master_fd, slave_fd, first_bytes) -> None
         self._grace = grace
-        self._idle_list_interval = idle_list_interval
-        self._client_cooldown = client_cooldown        # flasher 寫入後抑制 idle 清單的秒數（I1）
         self._master_fd = None
         self._slave_fd = None
         self._stop = threading.Event()
         self._thread = None
         self._flash_active = threading.Event()
-        self._last_list = 0.0
-        self._last_client_write = 0.0                  # 最後一次 client（flasher）寫入的 monotonic
 
     def start(self):
         """開啟 PTY、建立 symlink、啟動背景 loop 執行緒。"""
@@ -161,7 +154,7 @@ class FlashEndpoint:
         return self._flash_active.is_set()
 
     def _loop(self):
-        """背景主迴圈：偵測 client 寫入（flasher）或定期發送支援清單（cat）。"""
+        """背景主迴圈：只偵測 client 寫入（flasher）；其餘時間端點完全沉默。"""
         while not self._stop.is_set():
             try:
                 rlist, _, _ = select.select([self._master_fd], [], [], self._grace)
@@ -169,41 +162,24 @@ class FlashEndpoint:
                 return
             if self._stop.is_set():
                 return
-            if rlist:
-                # client 寫入 = flasher。讀出首段交給 flash 路徑（供其轉送）。
+            if not rlist:
+                continue  # 無 client 寫入 → 不主動寫任何 bytes（保持沉默）
+            # client 寫入 = flasher。讀出首段交給 flash 路徑（供其轉送）。
+            try:
+                first = os.read(self._master_fd, 4096)
+            except (OSError, BlockingIOError):
+                first = b""
+            if not self._flash_active.is_set():
+                self._flash_active.set()
                 try:
-                    first = os.read(self._master_fd, 4096)
-                except (OSError, BlockingIOError):
-                    first = b""
-                # 記錄 flasher 活動時間：在 cool-down 內抑制 idle 清單寫入，避免在
-                # flasher 的 sync/retry 視窗把支援清單當成回應 bytes 灌進去（I1）。
-                self._last_client_write = time.monotonic()
-                if not self._flash_active.is_set():
-                    self._flash_active.set()
-                    try:
-                        if self._on_flash_open is not None:
-                            self._on_flash_open(self._master_fd, self._slave_fd, first)
-                    except Exception:
-                        # on_flash_open（偵測 / pump）的任何例外都不得殺死端點執行緒；
-                        # 收斂後繼續服務後續 open（C1 加固）。
-                        pass
-                    finally:
-                        self._flash_active.clear()
-                continue
-            # idle：定期寫支援清單（供 cat 只讀查詢）。
-            # 只有在「近期沒有任何 client 寫入」時才寫，確保 no-match / flasher 連線期間
-            # 端點保持沉默（spec：no-match SHALL NOT 寫入端點）（I1）。
-            now = time.monotonic()
-            if now - self._last_client_write < self._client_cooldown:
-                continue
-            if now - self._last_list >= self._idle_list_interval:
-                self._last_list = now
-                text = self._registry.render_support_list(
-                    candidates=self._list_candidates())
-                try:
-                    os.write(self._master_fd, text.encode())
-                except OSError:
+                    if self._on_flash_open is not None:
+                        self._on_flash_open(self._master_fd, self._slave_fd, first)
+                except Exception:
+                    # on_flash_open（偵測 / pump）的任何例外都不得殺死端點執行緒；
+                    # 收斂後繼續服務後續 open（C1 加固）。
                     pass
+                finally:
+                    self._flash_active.clear()
 
 
 class FlashSink(Protocol):

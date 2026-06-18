@@ -73,13 +73,14 @@ flasher 走其自身的 retry/timeout。沉默期間 serialwrap SHALL 週期性 
 serialwrap SHALL 維護 per-family 的 MCU pattern registry，每筆含 family 名稱、probe 位元組、
 expected ACK、baud 與 timeout。registry SHALL 預設含 TI CC2674/CC2652（probe `0x55 0x55` → ACK `0x00 0xCC`）。
 每筆 probe SHALL 為非破壞性 sync 握手（不得含 erase/program 等破壞性操作）；載入時 SHALL 拒絕未通過
-非破壞審核標記的項目。`/dev/ttyMCU` 在**只讀**存取（無端點輸入）時 SHALL 回傳目前支援家族清單與候選狀態文字；
-另 SHALL 提供 `mcu patterns` / `mcu status` CLI/RPC 作為 canonical 查詢。
+非破壞審核標記的項目。支援家族與候選查詢 SHALL 經 `mcu patterns` / `mcu status` CLI/RPC 提供。
+`/dev/ttyMCU` 端點本身在未進入 flash bridge 時 SHALL 保持沉默、絕不主動寫入任何 bytes（避免被 flasher
+讀成假回應而汙染 SBL sync——此為真機實證的失效模式）。
 
-#### Scenario: cat 端點列出支援的 MCU
+#### Scenario: 端點未 bridge 時保持沉默
 
-- **WHEN** 對 `/dev/ttyMCU` 只讀（如 `cat`）且未送出任何 bytes
-- **THEN** 回傳支援家族清單（含預設 TI CC2674/CC2652）與目前候選 tty/分類，並 EOF
+- **WHEN** `/dev/ttyMCU` 未處於 flash bridge（無論是否有人開啟/讀取/送出 sync 但偵測未命中）
+- **THEN** serialwrap 不對端點寫入任何 bytes；查支援家族請改用 `mcu patterns` / `mcu status`
 
 #### Scenario: 拒絕破壞性 probe 項目
 

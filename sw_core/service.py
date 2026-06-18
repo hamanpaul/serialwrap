@@ -200,8 +200,6 @@ class SerialwrapService:
         self._sessions.add_rx_observer(self._flash_rx_observer)
         self._flash_endpoint = FlashEndpoint(
             link_path=TTYMCU_PATH,
-            registry=self._mcu_registry,
-            list_candidates=self._flash_candidates,
             on_flash_open=self._on_flash_open,
         )
 
