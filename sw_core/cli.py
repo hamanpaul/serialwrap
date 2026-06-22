@@ -12,6 +12,7 @@ from typing import Any
 from .client import rpc_call
 from .constants import CONFIG_DIR, LOCK_PATH, PROFILE_DIR, SOCKET_PATH
 from .runtime_config import RuntimeConfig
+from .service_ctl import service_action
 
 _USE_DEFAULT_ENV = object()
 LEGACY_DAEMON_ENV_FILE = "~/OPI.env"
@@ -179,6 +180,15 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
 
 
 def _run_daemon_stop(args: argparse.Namespace) -> int:
+    mode = _default_runtime_config().mode() or "on-demand"
+    if mode.startswith("systemd"):
+        # systemd 模式：將 daemon stop 重導到 service stop，避免繞開 unit 管理
+        with_sudo = getattr(args, "with_sudo", False)
+        resp = service_action("stop", mode=mode, with_sudo=with_sudo)
+        resp["_routed_to"] = "service stop"
+        _print(resp)
+        return 0 if resp.get("ok") else 2
+    # on-demand 模式：維持原有 RPC daemon.stop 路徑
     resp = rpc_call(_resolve_endpoint(args), "daemon.stop", {}, timeout_s=2.0)
     if not resp.get("ok"):
         _print(resp)
@@ -264,7 +274,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
-    p.add_argument("--socket", default=SOCKET_PATH, help="本機 daemon 的 Unix socket 路徑（預設: %(default)s）")
+    p.add_argument("--socket", default=SOCKET_PATH, help="本機 daemon 的 Unix socket 路徑（預設依 XDG 執行期目錄解析，可用 SERIALWRAP_RUN_DIR 覆寫）")
     p.add_argument("--endpoint", default=None, metavar="ENDPOINT", help="遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）")
     p.add_argument("--timeout", dest="timeout_s", type=float, default=5.0, help="RPC timeout 秒數（預設: %(default)s）")
 
@@ -287,7 +297,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_ds.add_argument("--lock", default=LOCK_PATH)
     p_ds.add_argument("--foreground", action="store_true")
 
-    daemon_sub.add_parser("stop", help="停止執行中的 daemon")
+    p_dstop = daemon_sub.add_parser("stop", help="停止執行中的 daemon")
+    p_dstop.add_argument(
+        "--with-sudo",
+        dest="with_sudo",
+        action="store_true",
+        default=False,
+        help="systemd-system 模式下，daemon stop 重導至 service stop 時以 sudo 執行",
+    )
     daemon_sub.add_parser("status", help="顯示 daemon 狀態（pid／sessions／devices／log 路徑）")
 
     p_device = sub.add_parser(
@@ -533,6 +550,29 @@ def build_parser() -> argparse.ArgumentParser:
         description="印出 config.yaml 中的 supervision_mode，未設定時預設為 on-demand。供 shell 腳本（如 minicom_router.sh）查詢。",
     )
 
+    p_svc = sub.add_parser(
+        "service",
+        help="透過 systemctl 管理 serialwrap systemd service（systemd 監管模式適用）",
+        description=(
+            "包裝 systemctl，按 config.yaml 的 supervision_mode 決定呼叫方式。\n"
+            "systemd-user 模式：免 sudo。\n"
+            "systemd-system 模式：start/stop/restart 需 root（加 --with-sudo 代跑）。\n"
+            "on-demand 模式：不可用。"
+        ),
+    )
+    p_svc.add_argument(
+        "action",
+        choices=["start", "stop", "restart", "status"],
+        help="要執行的 systemctl 動作",
+    )
+    p_svc.add_argument(
+        "--with-sudo",
+        dest="with_sudo",
+        action="store_true",
+        default=False,
+        help="systemd-system 模式的特權動作（start/stop/restart）以 sudo 執行",
+    )
+
     return p
 
 
@@ -719,6 +759,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "supervision-mode":
         print(_default_runtime_config().mode() or "on-demand")
         return 0
+
+    if args.cmd == "service":
+        mode = _default_runtime_config().mode() or "on-demand"
+        result = service_action(args.action, mode=mode, with_sudo=args.with_sudo)
+        _print(result)
+        return 0 if result.get("ok") else 2
 
     _print({"ok": False, "error_code": "INVALID_ARGS"})
     return 2

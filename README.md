@@ -1097,7 +1097,7 @@ serialwrap client（支援本機 Unix socket 與遠端 endpoint）
 
 options:
   -h, --help           show this help message and exit
-  --socket SOCKET      本機 daemon 的 Unix socket 路徑（預設: /tmp/serialwrap/serialwrapd.sock）
+  --socket SOCKET      本機 daemon 的 Unix socket 路徑（預設依 XDG 執行期目錄解析，可用 SERIALWRAP_RUN_DIR 覆寫）
   --endpoint ENDPOINT  遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）
   --timeout TIMEOUT_S  RPC timeout 秒數（預設: 5.0）
 
@@ -1114,6 +1114,8 @@ command groups:
     wal                write-ahead log 匯出／重設／seq 查詢
     mcu                MCU flash pattern 查詢與 flash 端點狀態
     event              event-trigger 規則註冊與 matcher 控制
+    supervision-mode   顯示有效的監管模式（on-demand、systemd-user 或 systemd-system）
+    service            透過 systemctl 管理 serialwrap systemd service（systemd 監管模式適用）
 
 examples:
   serialwrap session list
