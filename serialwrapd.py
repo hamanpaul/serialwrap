@@ -12,6 +12,10 @@ from sw_core.daemon_lock import SingletonLock
 from sw_core.rpc import JsonRpcUnixServer
 from sw_core.service import SerialwrapService
 
+# 這些 RPC method 的 handler 會長時間阻塞（UART 上的 base64 分段傳輸），須丟到 executor
+# 執行，否則會卡住單執行緒 asyncio event loop，導致傳輸期間全 daemon 的所有 RPC 凍結（#52）。
+BLOCKING_RPC_METHODS = {"file.push", "file.pull"}
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="serialwrapd", description="serialwrap daemon")
@@ -47,7 +51,7 @@ async def _run_async(args: argparse.Namespace) -> int:
             return {"ok": True, "stopping": True}
         return service.rpc(method, params)
 
-    server = JsonRpcUnixServer(args.socket, _handle)
+    server = JsonRpcUnixServer(args.socket, _handle, blocking_methods=BLOCKING_RPC_METHODS)
 
     def _stop(*_unused: object) -> None:
         stop_event.set()
