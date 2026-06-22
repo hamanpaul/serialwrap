@@ -12,28 +12,31 @@ fi
 
 mkdir -p "${TARGET_DIR}"
 mkdir -p "${TARGET_DIR}/sw_core"
-mkdir -p "${TARGET_DIR}/sw_mcp"
 mkdir -p "${TARGET_DIR}/profiles"
 mkdir -p "${TARGET_DIR}/tools"
 mkdir -p "${TARGET_DIR}/docs"
 
 install -m 0755 "${SCRIPT_DIR}/serialwrap" "${TARGET_DIR}/serialwrap"
 install -m 0755 "${SCRIPT_DIR}/serialwrapd.py" "${TARGET_DIR}/serialwrapd.py"
-install -m 0755 "${SCRIPT_DIR}/serialwrap-mcp" "${TARGET_DIR}/serialwrap-mcp"
 install -m 0755 "${SCRIPT_DIR}/tools/minicom_router.sh" "${TARGET_DIR}/minicom_router.sh"
 ln -sfn "${TARGET_DIR}/minicom_router.sh" "${TARGET_DIR}/minicom"
 install -m 0755 "${SCRIPT_DIR}/tools/minicom-broker.sh" "${TARGET_DIR}/minicom-broker.sh"
 install -m 0755 "${SCRIPT_DIR}/tools/minicom-raw.sh" "${TARGET_DIR}/minicom-raw.sh"
 
 cp -a "${SCRIPT_DIR}/sw_core/." "${TARGET_DIR}/sw_core/"
-cp -a "${SCRIPT_DIR}/sw_mcp/." "${TARGET_DIR}/sw_mcp/"
 cp -a "${SCRIPT_DIR}/profiles/." "${TARGET_DIR}/profiles/"
 cp -a "${SCRIPT_DIR}/tools/." "${TARGET_DIR}/tools/"
 cp -a "${SCRIPT_DIR}/docs/." "${TARGET_DIR}/docs/"
 
+# Expose the repo-canonical agent skill via the shared skills dir (symlink to repo source).
+mkdir -p "${HOME}/.agents/skills"
+ln -sfn "${SCRIPT_DIR}/skills/serialwrap" "${HOME}/.agents/skills/serialwrap"
+
 # Remove legacy artifacts that are no longer part of the mainline design.
 rm -f "${TARGET_DIR}/serialwrap_lib.py"
 rm -f "${TARGET_DIR}/__pycache__/serialwrap_lib."*.pyc 2>/dev/null || true
+rm -f "${TARGET_DIR}/serialwrap-mcp"
+rm -rf "${TARGET_DIR}/sw_mcp"
 
 DEFAULT_PROFILE_PATH="${TARGET_DIR}/profiles/default.yaml"
 DEFAULT_PLACEHOLDER_BY_ID="/dev/serial/by-id/target3"
@@ -56,6 +59,7 @@ cat <<MSG
   daemon: ${TARGET_DIR}/serialwrapd.py
   minicom: ${TARGET_DIR}/minicom
   minicom router: ${TARGET_DIR}/minicom_router.sh
+  skill: ${HOME}/.agents/skills/serialwrap
 
 Suggested shell setup:
   export PATH="${TARGET_DIR}:\$PATH"

@@ -1,5 +1,7 @@
 # Design: UART Sense Event → Agent/Tool Trigger
 
+> 📌 **歷史快照**：#37 已交付。本設計「對既有 code 的改動範圍」列出的 sw_mcp/server.py（event MCP tools）**已隨 #59 MCP 退役而不適用**——MCP adapter 已自 repo 移除，event 功能僅經 RPC/CLI 表面提供。本檔僅留作歷史。
+
 **Issue**: #37
 **Status**: Draft v1（brainstorming 完成，pending implementation plan）
 **Author**: Paul Chen
@@ -417,7 +419,7 @@ serialwrap event tail [--rule-id X] [--selector COM0] [-n 50] [--since <ts>]
 | `sw_core/session_manager.py` | service 啟動 / 停止 matcher worker；提供「該 COM 此刻是否有 active cmd_id」query API 給 scope filter |
 | `sw_core/service.py` | 註冊新 RPC method、在 daemon startup 載入 rules + 評估 auto_enable |
 | `sw_core/cli.py` | 新增 `event` 子命令群 |
-| `sw_mcp/server.py` | 新增 10 個 `serialwrap_event_*` tool definition |
+| sw_mcp/server.py（已退役 #59）| 新增 10 個 serialwrap_event_* tool definition |
 | `sw_core/event_engine.py`（新檔）| RuleRegistry / Matcher / Dispatcher / EventLog；本 feature 主要邏輯 |
 | `sw_core/constants.py` | `EVENTS_DIR`（rule 持久層）、`EVENTS_RUNTIME_DIR`（counter / event log）env 與預設 |
 | `docs/design-event-trigger.md` | 本文件 |

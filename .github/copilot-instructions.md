@@ -45,13 +45,12 @@ serialwrap 是一個讓多個 agent 與多個 human console 共用**同一條 UA
 
 - `serialwrapd.py`：singleton daemon。啟動時載入 profiles、建立 `SerialwrapService`，再以 `sw_core/rpc.py` 提供 JSON-RPC Unix socket server。只有這個 daemon 會直接碰 UART。
 - `serialwrap`（`sw_core/cli.py`）：子命令式 CLI。每個子命令都只是 RPC client；`daemon start` 載入 runtime env（`SERIALWRAP_DAEMON_ENV_FILE` 或 legacy `~/OPI.env`），帳密則是 per-session 在 attach 時解析。
-- `serialwrap-mcp`（`sw_mcp/server.py`）：MCP adapter。它不自己實作業務邏輯，只把工具名透過 `_TOOL_MAP` 映射到內部 RPC 方法。
 
 ### 主要資料流
 
 `command.submit` 的實際路徑是：
 
-`CLI / MCP` → `SerialwrapService.rpc()` → `_resolve_session_id()`（僅 `READY` 可送 agent 命令）→ `CommandArbiter.submit()` → 該 session 的 worker thread → `SessionManager.execute_command()` → `UARTBridge` → `WalWriter`
+`CLI` → `SerialwrapService.rpc()` → `_resolve_session_id()`（僅 `READY` 可送 agent 命令）→ `CommandArbiter.submit()` → 該 session 的 worker thread → `SessionManager.execute_command()` → `UARTBridge` → `WalWriter`
 
 要理解前景命令、背景命令、interactive lease、human console 為什麼互不打架，至少要一起看這幾個檔案：
 
@@ -92,10 +91,6 @@ serialwrap 是一個讓多個 agent 與多個 human console 共用**同一條 UA
 - session detach 時自動停止 capture。
 - WAL 是 always-on 審計記錄，agent log 是 on-demand focused capture，兩者互補。
 
-### MCP 與 RPC 的關係
-
-MCP 只是 RPC 的薄轉接層。新增或改名工具時，要把 `sw_mcp/server.py` 的 `_TOOL_MAP` 跟 `sw_core/service.py` 的 RPC 方法一起看，不然 CLI / MCP 很容易不同步。
-
 ## 關鍵慣例
 
 ### 設定物件 immutable，執行期狀態 mutable
@@ -112,7 +107,7 @@ MCP 只是 RPC 的薄轉接層。新增或改名工具時，要把 `sw_mcp/serve
 
 ### JSON 輸出必須維持緊湊且穩定
 
-- CLI 與 MCP 一律用 `json.dumps(..., ensure_ascii=False, separators=(",", ":"))`。
+- CLI 一律用 `json.dumps(..., ensure_ascii=False, separators=(",", ":"))`。
 - `state.json` 與 WAL 相關輸出會加上 `sort_keys=True`，避免不必要的 diff 與測試波動。
 
 ### human console 預設走 raw interactive 模式
@@ -170,7 +165,6 @@ MCP 只是 RPC 的薄轉接層。新增或改名工具時，要把 `sw_mcp/serve
 
 - `sw_core/service.py`：RPC 分派
 - `sw_core/cli.py`：CLI subparser 與參數轉換
-- `sw_mcp/server.py`：MCP `_TOOL_MAP`
 - `README.md` / `docs/serialwrap-spec.md`：對外契約與使用方式
 - `tests/` 下的代表性測試：至少補觸及該流程的 unit 或 E2E
 
@@ -178,15 +172,8 @@ MCP 只是 RPC 的薄轉接層。新增或改名工具時，要把 `sw_mcp/serve
 
 ### legacy alias 仍存在，但新介面優先
 
-- CLI 的 `stream tail`
-- MCP 的 `serialwrap_tail_results`
-
-這些仍可用，但目前新設計優先使用：
-
-- `serialwrap cmd result-tail`
-- `serialwrap_tail_command_result`
-
-其中 `serialwrap_tail_results` 目前固定對應 `result.tail` raw records，不會依 `cmd_id` 自動切到 `command.result_tail`。
+- CLI 的 `stream tail` 仍可用，但新設計優先使用 `serialwrap cmd result-tail`。
+- `stream tail` 固定對應 `result.tail` raw records，不會依 `cmd_id` 自動切到 `command.result_tail`。
 
 ### Python 風格慣例
 
