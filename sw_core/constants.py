@@ -11,14 +11,38 @@ def _env_path(name: str, default: str) -> str:
 
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-STATE_DIR = _env_path("SERIALWRAP_STATE_DIR", "/tmp/serialwrap")
-RUN_DIR = _env_path("SERIALWRAP_RUN_DIR", STATE_DIR)
+
+
+def _xdg(name: str, fallback_rel: str) -> str:
+    return os.environ.get(name) or os.path.join(os.path.expanduser("~"), fallback_rel)
+
+
+_CONFIG_HOME = _xdg("XDG_CONFIG_HOME", ".config")
+_STATE_HOME = _xdg("XDG_STATE_HOME", ".local/state")
+_DATA_HOME = _xdg("XDG_DATA_HOME", ".local/share")
+_RUNTIME_HOME = os.environ.get("XDG_RUNTIME_DIR")  # 可能 None
+
+CONFIG_DIR = _env_path("SERIALWRAP_CONFIG_DIR", os.path.join(_CONFIG_HOME, "serialwrap"))
+STATE_DIR = _env_path("SERIALWRAP_STATE_DIR", os.path.join(_STATE_HOME, "serialwrap"))
+def _run_dir_default() -> str:
+    # 若呼叫端只設 SERIALWRAP_STATE_DIR（常見 CI / throwaway daemon 隔離），socket/lock 必須
+    # 落在 STATE_DIR 之下以維持向後相容（舊行為 RUN_DIR 預設＝STATE_DIR，即使 XDG_RUNTIME_DIR 存在）。
+    if os.environ.get("SERIALWRAP_STATE_DIR", "").strip():
+        return STATE_DIR
+    if _RUNTIME_HOME:
+        return os.path.join(_RUNTIME_HOME, "serialwrap")
+    return os.path.join(STATE_DIR, "run")
+
+
+RUN_DIR = _env_path("SERIALWRAP_RUN_DIR", _run_dir_default())
+DATA_DIR = _env_path("SERIALWRAP_DATA_DIR", os.path.join(_DATA_HOME, "serialwrap"))
+
 LOCK_PATH = os.path.join(RUN_DIR, "serialwrapd.lock")
 SOCKET_PATH = os.path.join(RUN_DIR, "serialwrapd.sock")
 TTYMCU_PATH = _env_path("SERIALWRAP_TTYMCU_PATH", os.path.join(RUN_DIR, "dev", "ttyMCU"))
 STATE_PATH = os.path.join(STATE_DIR, "state.json")
 WAL_DIR = _env_path("SERIALWRAP_WAL_DIR", os.path.join(STATE_DIR, "wal"))
-PROFILE_DIR = _env_path("SERIALWRAP_PROFILE_DIR", os.path.join(BASE_DIR, "profiles"))
+PROFILE_DIR = _env_path("SERIALWRAP_PROFILE_DIR", os.path.join(CONFIG_DIR, "profiles"))
 DEVICE_BY_ID_DIR = _env_path("SERIALWRAP_BY_ID_DIR", "/dev/serial/by-id")
 DEVICE_BY_PATH_DIR = _env_path("SERIALWRAP_BY_PATH_DIR", "/dev/serial/by-path")
 LOG_DIR = _env_path("SERIALWRAP_LOG_DIR", os.path.join(os.path.expanduser("~"), "b-log"))
@@ -57,6 +81,7 @@ REPROBE_MAX_ATTEMPTS: int = 10
 
 
 def ensure_runtime_dirs() -> None:
+    os.makedirs(CONFIG_DIR, exist_ok=True)
     os.makedirs(STATE_DIR, exist_ok=True)
     os.makedirs(RUN_DIR, exist_ok=True)
     os.makedirs(WAL_DIR, exist_ok=True)
