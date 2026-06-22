@@ -14,8 +14,8 @@
 ## 依賴
 
 - Python 3.10+
-- `pyyaml`
-- `jq`：`minicom_router.sh` 需要
+- `pyyaml`：`pipx install` 會自動帶入，無需手動安裝
+- `jq`：`minicom_router.sh` 需要（router/human console 路徑）
 - `minicom`：human console 路徑需要
 
 ## 系統方塊圖
@@ -251,13 +251,19 @@ flowchart TD
 ## 快速開始
 
 ```bash
-# 安裝
-./install.sh
+# 安裝（正式流程）
+pipx install "git+https://github.com/hamanpaul/serialwrap@v0.1.0"
+serialwrap setup     # 物化 profiles/skill/minicom、設定 daemon（systemd 或 on-demand fallback）
+serialwrap doctor    # 驗證環境
+```
 
-# 啟動 daemon（runtime env 依序從 shell env、~/OPI.env、profile_dir/OPI.env 載入）
-serialwrap daemon start --profile-dir "$HOME/.paul_tools/profiles"
+- dialout：`sudo usermod -aG dialout $USER`（之後重新登入）。
+- WSL 啟用 systemd：於 `/etc/wsl.conf` 設 `[boot]\nsystemd=true` 後 `wsl --shutdown`（否則 `serialwrap setup` 退回 on-demand）。
+- 本機開發安裝：`./install.sh`（= `pipx install <repo>` + `serialwrap setup`）。
+- minicom broker wrapper 現為 `serialwrap-minicom COMx`（取代舊的 `~/.paul_tools/minicom`）。
 
-# 檢查健康狀態
+```bash
+# 啟動 daemon 後快速驗證
 serialwrap daemon status
 serialwrap session list
 
@@ -268,14 +274,6 @@ serialwrap session attach --selector COM0
 # 送前景命令
 serialwrap cmd submit --selector COM0 --mode line --source agent:diag --cmd "ifconfig"
 serialwrap cmd status --cmd-id <cmd_id>
-```
-
-建議 shell 設定：
-
-```bash
-export INSTALL_DIR="$HOME/.paul_tools"
-export PATH="$INSTALL_DIR:$PATH"
-hash -r 2>/dev/null || true
 ```
 
 ## Profile 與目標綁定
@@ -635,7 +633,8 @@ minicom -D /dev/ttyUSB0
   - `off`：關閉自動 transcript，不建立 log、不使用 `script` wrapper，也不自動傳 `-C`。
 - Legacy `MINICOM_CAPTURE_WRAPPER=1` 仍等同 `MINICOM_CAPTURE_MODE=script`；若未設定 `MINICOM_CAPTURE_MODE` 且明確設定 `MINICOM_CAPTURE_WRAPPER=0`，仍保留舊版 minicom `-C` 行為。
 - 常見 human/minicom 互動式命令（例如 `vi`、`vim`、`top`、`htop`、`less`、`menuconfig`）會自動升級成 human interactive ownership，不再因為等不到 shell prompt 而自動觸發 recover / reboot。
-- 若直接打 `minicom` 沒有走 broker，先用 `type -a minicom` 檢查目前 shell 是否先命中 `~/.paul_tools/minicom`；若仍是 `/usr/bin/minicom`，代表 shell PATH 尚未把 wrapper 放到前面。
+- broker minicom wrapper 現為 `serialwrap-minicom COMx`（取代舊的 `~/.paul_tools/minicom`）；`serialwrap setup` 會自動物化到 `~/.local/bin/serialwrap-minicom`。
+- 若直接打 `minicom` 沒有走 broker，先用 `type -a minicom` 檢查目前 shell 是否先命中 `serialwrap-minicom`；若未命中，確認 `~/.local/bin` 已在 PATH（`pipx ensurepath`）。
 
 手動 console 控制範例：
 
@@ -1077,14 +1076,17 @@ Handler **建議**：
 ## Install
 
 ```bash
-# 安裝到預設路徑（/usr/local/bin）
-./install.sh
-
-# 安裝到自訂路徑
-./install.sh /custom/path
+pipx install "git+https://github.com/hamanpaul/serialwrap@v0.1.0"
+serialwrap setup     # 物化 profiles/skill/minicom、設定 daemon（systemd 或 on-demand fallback）
+serialwrap doctor    # 驗證環境
 ```
 
-依賴：Python 3.10+、`pyyaml`、`pyserial`；human console 路徑另需 `jq` 與 `minicom`。
+- dialout：`sudo usermod -aG dialout $USER`（之後重新登入）。
+- WSL 啟用 systemd：於 `/etc/wsl.conf` 設 `[boot]\nsystemd=true` 後 `wsl --shutdown`（否則 `serialwrap setup` 退回 on-demand）。
+- 本機開發安裝：`./install.sh`（= `pipx install <repo>` + `serialwrap setup`）。
+- minicom broker wrapper 現為 `serialwrap-minicom COMx`（取代舊的 `~/.paul_tools/minicom`）。
+
+依賴：Python 3.10+（`pipx install` 自動帶入 `pyyaml`）；human console 路徑另需 `jq` 與 `minicom`。
 
 ## Usage
 
@@ -1126,8 +1128,9 @@ examples:
 <!-- END: cli-help marker="serialwrap-help" -->
 
 ```bash
-# 啟動 daemon
-serialwrap daemon start --profile-dir "$HOME/.paul_tools/profiles"
+# 啟動 daemon（systemd 模式請改用 serialwrap service start；on-demand 模式才需手動啟動）
+# 經 serialwrap setup 後 profiles 已在 XDG 設定目錄，daemon 預設即可讀取，無需 --profile-dir
+serialwrap daemon start
 
 # 查看 session 列表
 serialwrap session list
