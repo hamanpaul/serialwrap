@@ -1,6 +1,6 @@
 # serialwrap
 
-`serialwrap` 是面向單一 UART、多 agent 與多人 console 共用的 broker。主線由 `serialwrapd`、`serialwrap` CLI、`serialwrap-mcp` 與 `minicom_router.sh` 組成，目標是在不污染 target UART 輸入的前提下，保留單寫入仲裁、透明 console 視圖、結果擷取與故障診斷能力。
+`serialwrap` 是面向單一 UART、多 agent 與多人 console 共用的 broker。主線由 `serialwrapd`、`serialwrap` CLI 與 `minicom_router.sh` 組成，目標是在不污染 target UART 輸入的前提下，保留單寫入仲裁、透明 console 視圖、結果擷取與故障診斷能力。
 
 ## 核心特性
 
@@ -24,7 +24,6 @@
 flowchart LR
     A["Agent"]
     C["CLI"]
-    M["MCP"]
     R["Minicom Router"]
     H1["Minicom A"]
     H2["Minicom B"]
@@ -37,8 +36,7 @@ flowchart LR
     W["raw.wal.ndjson"]
     X["raw.mirror.log"]
 
-    A --> M
-    M --> D
+    A --> C
     C --> D
     R --> D
     H1 --> R
@@ -58,7 +56,7 @@ flowchart LR
     classDef core fill:#eef7e8,stroke:#4f7a3f,stroke-width:1px;
     classDef io fill:#fff4e6,stroke:#9a6b25,stroke-width:1px;
 
-    class A,C,M,R,H1,H2 actor
+    class A,C,R,H1,H2 actor
     class D,S,Q,SM core
     class U,T,W,X io
 ```
@@ -765,58 +763,7 @@ serialwrap wal current-seq
 - `log tail-text` 偏向人類閱讀，不輸出 metadata header。
 - `log tail-raw` / `wal export` 仍保留完整權威欄位。
 - 可用 `SERIALWRAP_WAL_DIR` 覆寫 WAL / mirror log 目錄，例如放到 `~/b-log`；這不會改動 daemon socket / lock 的 `RUN_DIR`。
-- `stream tail` 與 MCP `serialwrap_tail_results` 為 legacy alias；新設計優先使用 `cmd result-tail` / `serialwrap_tail_command_result`。
-
-## MCP 使用
-
-### 核心工具
-
-| Tool | RPC |
-|------|-----|
-| `serialwrap_get_health` | `health.status` |
-| `serialwrap_list_devices` | `device.list` |
-| `serialwrap_list_sessions` | `session.list` |
-| `serialwrap_get_session_state` | `session.get_state` |
-| `serialwrap_bind_session` | `session.bind` |
-| `serialwrap_attach_session` | `session.attach` |
-| `serialwrap_self_test` | `session.self_test` |
-| `serialwrap_recover_session` | `session.recover` |
-| `serialwrap_submit_command` | `command.submit` |
-| `serialwrap_get_command` | `command.get` |
-| `serialwrap_tail_command_result` | `command.result_tail` |
-| `serialwrap_attach_console` | `session.console_attach` |
-| `serialwrap_detach_console` | `session.console_detach` |
-| `serialwrap_list_consoles` | `session.console_list` |
-| `serialwrap_open_interactive` | `session.interactive_open` |
-| `serialwrap_send_interactive_keys` | `session.interactive_send` |
-| `serialwrap_get_interactive_status` | `session.interactive_status` |
-| `serialwrap_close_interactive` | `session.interactive_close` |
-| `serialwrap_log_start` | `session.log_start` |
-| `serialwrap_log_stop` | `session.log_stop` |
-| `serialwrap_log_status` | `session.log_status` |
-| `serialwrap_clear_session` | `session.clear` |
-| `serialwrap_wal_reset` | `wal.reset` |
-| `serialwrap_wal_current_seq` | `wal.current_seq` |
-| `serialwrap_file_push` | `file.push` |
-| `serialwrap_file_pull` | `file.pull` |
-
-### Legacy alias
-
-| Tool | 說明 |
-|------|------|
-| `serialwrap_tail_results` | 舊工具名，固定對應 `result.tail` raw records。若要讀 `background` capture，請改用 `serialwrap_tail_command_result`。 |
-
-### 範例
-
-```bash
-serialwrap-mcp --tool serialwrap_get_health --params "{}"
-serialwrap-mcp --tool serialwrap_get_session_state --params '{"selector":"COM0"}'
-serialwrap-mcp --tool serialwrap_submit_command --params '{"selector":"COM0","cmd":"ifconfig","source":"agent:mcp","mode":"line"}'
-serialwrap-mcp --tool serialwrap_get_command --params '{"cmd_id":"<cmd_id>"}'
-serialwrap-mcp --tool serialwrap_tail_command_result --params '{"cmd_id":"<cmd_id>","from_chunk":0,"limit":120}'
-serialwrap-mcp --tool serialwrap_file_push --params '{"selector":"COM0","local_path":"./fw.bin","remote_path":"/tmp/fw.bin"}'
-serialwrap-mcp --tool serialwrap_file_pull --params '{"selector":"COM0","remote_path":"/etc/config/wireless"}'
-```
+- `stream tail` 為 legacy alias；新設計優先使用 `cmd result-tail`。
 
 ## 測試
 
@@ -955,7 +902,7 @@ CLI（`bind` 只改 device、`recover`/`clear` 沿用舊 profile）。在 produc
 
 ```
 [台灣 RD]                              [FAE 現場]
- agent/MCP                              serialwrapd
+ agent (CLI)                           serialwrapd
    |                                        |
    | tcp://127.0.0.1:7777                   |
    +--> ssh tunnel (ssh -L) -->--> socat <--> Unix socket
@@ -1004,7 +951,7 @@ serialwrap --endpoint tcp://127.0.0.1:7777 daemon status
 
 ### `--endpoint` 參數
 
-CLI 與 MCP 都支援 `--endpoint`，優先於 `--socket`：
+CLI 支援 `--endpoint`，優先於 `--socket`：
 
 ```bash
 # CLI 遠端查詢 session 列表
@@ -1013,9 +960,6 @@ serialwrap --endpoint tcp://127.0.0.1:7777 session list
 # CLI 遠端提交命令
 serialwrap --endpoint tcp://127.0.0.1:7777 cmd submit \
     --selector COM0 --cmd "uname -a"
-
-# MCP adapter 指向遠端 daemon
-serialwrap-mcp --endpoint tcp://127.0.0.1:7777
 ```
 
 支援的 endpoint 格式：
@@ -1090,22 +1034,7 @@ serialwrap event reload                      # 重新掃描 events.d/ 目錄
 serialwrap event tail --rule-id ops.kernel-panic -n 20  # 查看最近 fire 記錄
 ```
 
-### MCP 工具
-
-| 工具名稱 | 對應 CLI |
-|----------|---------|
-| `serialwrap_event_rule_set` | `event add` |
-| `serialwrap_event_rule_delete` | `event rm` |
-| `serialwrap_event_rule_list` | `event list` |
-| `serialwrap_event_rule_get` | `event show` |
-| `serialwrap_event_enable` | `event enable` |
-| `serialwrap_event_disable` | `event disable` |
-| `serialwrap_event_status` | `event status` |
-| `serialwrap_event_reset` | `event reset` |
-| `serialwrap_event_reload` | `event reload` |
-| `serialwrap_event_tail` | `event tail` |
-
-> ⚠️ **安全規則**：在呼叫 `serialwrap_event_enable` 或 `serialwrap_event_disable` 之前，**必須先呼叫 `serialwrap_event_status`** 確認當下狀態。若規則設定了 `auto_enable_com_on_load: true`，daemon 重啟後 COM 會自動回到啟用狀態。
+> ⚠️ **安全規則**：在 `serialwrap event enable` / `event disable` 之前，**必須先 `serialwrap event status`** 確認當下狀態。若規則設定了 `auto_enable_com_on_load: true`，daemon 重啟後 COM 會自動回到啟用狀態。
 
 ### Handler 撰寫守則
 

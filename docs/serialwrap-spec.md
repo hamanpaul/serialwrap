@@ -12,7 +12,7 @@
 - 不再使用 tmux / shell marker
 - target UART 只接收原始 command 或 raw keystrokes
 - human console 改為 multi-console fan-out
-- MCP / CLI / RPC 對齊新主線
+- CLI / RPC 對齊新主線
 
 ## Canonical 規格（openspec/specs）
 
@@ -53,7 +53,6 @@
 - `sw_core/login_fsm.py`
 - `sw_core/device_watcher.py`
 - `sw_core/wal.py`
-- `sw_mcp/server.py`
 - `tools/minicom_router.sh`
 
 ### 3.2 系統架構圖
@@ -62,12 +61,10 @@
 flowchart LR
     subgraph C["Clients"]
         CLI["CLI"]
-        MCP["MCP"]
         MINI["minicom xN"]
     end
 
     CLI --> RPC["JSON-RPC"]
-    MCP --> RPC
     MINI --> ROUTER["minicom_router"]
     ROUTER --> RPC
     RPC --> D["serialwrapd"]
@@ -86,7 +83,7 @@ flowchart LR
     classDef io fill:#fff3e0,stroke:#9a6b16,stroke-width:1px,color:#111;
     classDef log fill:#fce4ec,stroke:#9a3f64,stroke-width:1px,color:#111;
 
-    class CLI,MCP,MINI,ROUTER client;
+    class CLI,MINI,ROUTER client;
     class RPC,D,A,S,R core;
     class B,P,U,T io;
     class W,M log;
@@ -107,7 +104,7 @@ flowchart LR
 9. `UARTBridge.start()`
 10. `ensure_ready()`
 11. session 進 `READY`
-12. CLI / MCP 可正式提交命令
+12. CLI 可正式提交命令
 
 ### 4.2 啟動時序圖
 
@@ -138,7 +135,7 @@ sequenceDiagram
 ### 4.3 Client ↔ Daemon transport
 
 - daemon 本體仍只 listen **Unix socket**
-- CLI / MCP client 端可接受：
+- CLI client 端可接受：
   - `--socket /tmp/serialwrap/serialwrapd.sock`
   - `--endpoint unix:///tmp/serialwrap/serialwrapd.sock`
   - `--endpoint tcp://host:port`
@@ -556,43 +553,6 @@ background mode 的 `command.result_tail` 在 capture 尚未建立時，會回�
 - `log.tail_text`
 - `wal.range`
 
-### 11.3 MCP Tool 對應
-
-- `serialwrap-mcp` 與 CLI 相同，也支援全域 `--endpoint <endpoint>`
-
-- `serialwrap_get_health` -> `health.status`
-- `serialwrap_list_devices` -> `device.list`
-- `serialwrap_list_sessions` -> `session.list`
-- `serialwrap_get_session_state` -> `session.get_state`
-- `serialwrap_bind_session` -> `session.bind`
-- `serialwrap_attach_session` -> `session.attach`
-- `serialwrap_self_test` -> `session.self_test`
-- `serialwrap_recover_session` -> `session.recover`
-- `serialwrap_submit_command` -> `command.submit`
-- `serialwrap_get_command` -> `command.get`
-- `serialwrap_tail_command_result` -> `command.result_tail`
-- `serialwrap_attach_console` -> `session.console_attach`
-- `serialwrap_detach_console` -> `session.console_detach`
-- `serialwrap_list_consoles` -> `session.console_list`
-- `serialwrap_open_interactive` -> `session.interactive_open`
-- `serialwrap_send_interactive_keys` -> `session.interactive_send`
-- `serialwrap_get_interactive_status` -> `session.interactive_status`
-- `serialwrap_close_interactive` -> `session.interactive_close`
-- `serialwrap_log_start` -> `session.log_start`
-- `serialwrap_log_stop` -> `session.log_stop`
-- `serialwrap_log_status` -> `session.log_status`
-- `serialwrap_wal_reset` -> `wal.reset`
-- `serialwrap_wal_current_seq` -> `wal.current_seq`
-- `serialwrap_clear_session` -> `session.clear`
-- `serialwrap_file_push` -> `file.push`
-- `serialwrap_file_pull` -> `file.pull`
-
-相容 alias：
-
-- `serialwrap_tail_results` -> `result.tail`
-  - 固定維持 legacy raw result tail
-  - 若要讀 `background` capture，請改用 `serialwrap_tail_command_result`
-
 ## 12. `minicom_router.sh` 行為
 
 1. 確認 daemon 存活，必要時自動啟動
@@ -735,7 +695,7 @@ targets:
 - `recover` 會先對 `ATTACHED` bridge 做 re-probe；`READY` 才走 `Ctrl-C -> Ctrl-D`
 - agent 明確 reboot 後可重新回 `READY`
 - `file.push` / `file.pull` 可完成 base64 分段傳輸與 md5 校驗
-- README / spec / CLI / MCP 命名一致
+- README / spec / CLI 命名一致
 - Docker smoke flow 可用同一個 image 起兩個 container，並透過 `--endpoint tcp://<container-name>:7777` 成功完成 `daemon status` / `session list` / `cmd submit`
 
 ## 15. 使用建議

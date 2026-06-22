@@ -4,13 +4,11 @@ policy_version: "1.0.5"
 tier: shareable
 code_paths:
   - "sw_core/**"
-  - "sw_mcp/**"
   - "tools/**"
   - "tests/**"
   - "profiles/**"
   - "serialwrap"
   - "serialwrapd.py"
-  - "serialwrap-mcp"
   - "install.sh"
 cli:
   - command: "./serialwrap"
