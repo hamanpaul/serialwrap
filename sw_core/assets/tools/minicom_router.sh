@@ -236,6 +236,13 @@ _ensure_daemon() {
     printf '%s' "${state_json}"
     return 0
   fi
+  local mode
+  mode="$("${SERIALWRAP_BIN}" supervision-mode 2>/dev/null || echo on-demand)"
+  if [[ "${mode}" != "on-demand" ]]; then
+    echo "serialwrap: daemon 由 systemd 管理（${mode}），不自動啟動。請執行: systemctl --user start serialwrap（或 system 模式: sudo systemctl start serialwrap）" >&2
+    printf '%s' "${state_json}"
+    return 0
+  fi
   "${SERIALWRAP_BIN}" --socket "${SOCKET}" daemon start --profile-dir "${PROFILE_DIR}" >/dev/null 2>&1 || true
   for _ in $(seq 1 30); do
     state_json="$(_get_sessions_json)"

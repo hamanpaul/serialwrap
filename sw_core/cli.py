@@ -10,7 +10,8 @@ from collections.abc import Sequence
 from typing import Any
 
 from .client import rpc_call
-from .constants import LOCK_PATH, PROFILE_DIR, SOCKET_PATH
+from .constants import CONFIG_DIR, LOCK_PATH, PROFILE_DIR, SOCKET_PATH
+from .runtime_config import RuntimeConfig
 
 _USE_DEFAULT_ENV = object()
 LEGACY_DAEMON_ENV_FILE = "~/OPI.env"
@@ -88,6 +89,16 @@ def _load_daemon_start_env(env_file: str | None | object = _USE_DEFAULT_ENV) -> 
         return dict(os.environ), None
     env, loaded = _load_daemon_start_env_files([str(env_file)])
     return env, loaded[0] if loaded else None
+
+
+def _default_runtime_config() -> RuntimeConfig:
+    return RuntimeConfig(os.path.join(CONFIG_DIR, "config.yaml"))
+
+
+def should_auto_spawn(rc: RuntimeConfig | None = None) -> bool:
+    """systemd 監管模式下不得自動 spawn（避免與 unit 互搶）；on-demand/未設→可。"""
+    rc = rc if rc is not None else _default_runtime_config()
+    return (rc.mode() or "on-demand") == "on-demand"
 
 
 def _resolve_daemon_start_env_files(profile_dir: str) -> list[str]:
@@ -516,6 +527,12 @@ def build_parser() -> argparse.ArgumentParser:
     e_tail.add_argument("-n", type=int, default=50)
     e_tail.add_argument("--since", type=int)
 
+    sub.add_parser(
+        "supervision-mode",
+        help="顯示有效的監管模式（on-demand、systemd-user 或 systemd-system）",
+        description="印出 config.yaml 中的 supervision_mode，未設定時預設為 on-demand。供 shell 腳本（如 minicom_router.sh）查詢。",
+    )
+
     return p
 
 
@@ -698,6 +715,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "event":
         return _dispatch_event(args)
+
+    if args.cmd == "supervision-mode":
+        print(_default_runtime_config().mode() or "on-demand")
+        return 0
 
     _print({"ok": False, "error_code": "INVALID_ARGS"})
     return 2
