@@ -59,6 +59,42 @@ class TestFlashingState(_Base):
         mgr.enter_flashing("COM0")
         self.assertIs(mgr.get_session("COM0").bridge, before)
 
+    def test_exit_flashing_clears_mode_even_if_state_clobbered(self):
+        """防禦縱深（#69 r4）：即使競態路徑（command timeout recovery / probe）已把 state
+        搶改出 FLASHING，exit_flashing 仍須無條件清除 bridge flash 模式，避免 bridge 永久卡
+        flash、靜默丟棄所有非 flash 寫入。"""
+        mgr = self._mgr([self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")])
+
+        class _FakeBridge:
+            def __init__(self):
+                self.flash = False
+            def set_flash_mode(self, enabled):
+                self.flash = enabled
+            def list_consoles(self):
+                return []
+
+        fb = _FakeBridge()
+        session = mgr.get_session("COM0")
+        session.bridge = fb
+        mgr.enter_flashing("COM0")
+        self.assertTrue(fb.flash)
+        # 模擬競態：flash 仍進行中，但 state 被搶改回 ATTACHED。
+        session.state = "ATTACHED"
+        res = mgr.exit_flashing("COM0")
+        self.assertTrue(res["ok"])
+        self.assertFalse(fb.flash, "exit_flashing 必須清除 flash 模式，即使 state 已非 FLASHING")
+
+    def test_transition_to_attached_refuses_flashing_or_released(self):
+        """在途 command 的 timeout/recovery 走的 _transition_to_attached 不得把 FLASHING/
+        RELEASED 打回 ATTACHED（否則 exit_flashing 提早 return、bridge 卡 flash；#69 r4）。"""
+        mgr = self._mgr([self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")])
+        session = mgr.get_session("COM0")
+        for guarded in ("FLASHING", "RELEASED"):
+            with self.subTest(guarded):
+                session.state = guarded
+                mgr._transition_to_attached(session, reason="CMD_TIMEOUT")
+                self.assertEqual(session.state, guarded)
+
 
 class TestFlashingBlocksInjection(_Base):
     def test_enter_exit_toggles_bridge_flash_mode(self):

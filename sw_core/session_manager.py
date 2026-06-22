@@ -642,7 +642,11 @@ class SessionManager:
                 except Exception as exc:
                     with self._lock:
                         current = self._sessions.get(session_id)
-                        if current is not None and current.bridge is bridge:
+                        if (
+                            current is not None
+                            and current.bridge is bridge
+                            and current.state not in {"FLASHING", "RELEASED"}
+                        ):
                             current.state = "ATTACHED"
                             current.last_error = f"REPROBE_FAILED:{type(exc).__name__}"
                             self._record_reprobe_attempt_locked(current, now)
@@ -864,12 +868,16 @@ class SessionManager:
             session = self.get_session(selector)
             if session is None:
                 return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            # 防禦縱深（#69 r2/r4）：不論目前 state 為何，只要有 bridge 就無條件解除 flash 模式。
+            # 即使某競態路徑（command timeout recovery / probe）已把 state 搶改出 FLASHING，
+            # 也確保 bridge 不會永久卡在 flash 模式、靜默丟棄所有非 flash 寫入。
+            if session.bridge is not None:
+                session.bridge.set_flash_mode(False)
             if session.state != "FLASHING":
+                session.flash_prev_state = None
                 return {"ok": True, "not_flashing": True, "session": session.to_public_dict()}
             session.state = session.flash_prev_state or ("READY" if session.bridge is not None else "DETACHED")
             session.flash_prev_state = None
-            if session.bridge is not None:
-                session.bridge.set_flash_mode(False)   # 解除 console 注入封鎖
             public = session.to_public_dict()
         return {"ok": True, "session": public}
 
@@ -1741,6 +1749,11 @@ class SessionManager:
     def _transition_to_attached(self, session: SessionRuntime, *, reason: str) -> None:
         notify_not_ready = False
         with self._lock:
+            # 在途 command 的 timeout/recovery 可能在 flash endpoint 已把 session 移入 FLASHING、
+            # 或 device handoff 釋放成 RELEASED 之後才跑到這；此時不得覆寫狀態，否則 FLASHING 被打回
+            # ATTACHED → exit_flashing 提早 return、bridge 卡 flash 模式（#69 Finding round4）。
+            if session.state in {"FLASHING", "RELEASED"}:
+                return
             if session.state == "READY":
                 notify_not_ready = True
             session.state = "ATTACHED"
@@ -1798,6 +1811,9 @@ class SessionManager:
                             session = self._sessions.get(session_id)
                             if session is None or session.bridge is not bridge:
                                 continue
+                            # unlocked ensure_ready 期間 session 可能被搶進 FLASHING/RELEASED；不得覆寫（#69 r4）。
+                            if session.state in {"FLASHING", "RELEASED"}:
+                                return
                             session.state = "READY"
                             session.last_error = None
                             session.last_ready_at = now_iso()
@@ -1818,6 +1834,9 @@ class SessionManager:
             with self._lock:
                 session = self._sessions.get(session_id)
                 if session is None:
+                    return
+                # 同理：recovery 逾時收尾不得覆寫已搶進的 FLASHING/RELEASED（#69 r4）。
+                if session.state in {"FLASHING", "RELEASED"}:
                     return
                 session.recovering = False
                 session.recovery_started_at = None
