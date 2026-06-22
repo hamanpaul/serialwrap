@@ -36,11 +36,24 @@ def _user_dirs(home: Path | str | None) -> dict[str, Path]:
         含 ``config``、``data``、``agents_skill_link``、``bin`` 的路徑字典。
     """
     home_path = Path(home) if home else Path(os.path.expanduser("~"))
-    config_home = os.environ.get("XDG_CONFIG_HOME") or str(home_path / ".config")
-    data_home = os.environ.get("XDG_DATA_HOME") or str(home_path / ".local" / "share")
+    # config/data 解析須與 constants.CONFIG_DIR/DATA_DIR 同優先序（SERIALWRAP_* 覆寫 > XDG > ~/…），
+    # 否則只設 SERIALWRAP_CONFIG_DIR 時 setup 物化的 profiles 會與 daemon 讀的 PROFILE_DIR
+    # （= CONFIG_DIR/profiles）分歧、daemon 讀不到 profiles（最終整合審查 I-B）。
+    cfg_override = os.environ.get("SERIALWRAP_CONFIG_DIR")
+    if cfg_override:
+        config = Path(cfg_override)
+    else:
+        config_home = os.environ.get("XDG_CONFIG_HOME") or str(home_path / ".config")
+        config = Path(config_home) / "serialwrap"
+    data_override = os.environ.get("SERIALWRAP_DATA_DIR")
+    if data_override:
+        data = Path(data_override)
+    else:
+        data_home = os.environ.get("XDG_DATA_HOME") or str(home_path / ".local" / "share")
+        data = Path(data_home) / "serialwrap"
     return {
-        "config": Path(config_home) / "serialwrap",
-        "data": Path(data_home) / "serialwrap",
+        "config": config,
+        "data": data,
         "agents_skill_link": home_path / ".agents" / "skills" / "serialwrap",
         "bin": home_path / ".local" / "bin",
     }

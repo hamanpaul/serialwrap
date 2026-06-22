@@ -52,3 +52,24 @@ def test_materialize_replaces_stale_real_directory_at_link(tmp_path, monkeypatch
     materialize_assets(home=tmp_path)  # 不可炸
     assert stale.is_symlink()
     assert (stale / "SKILL.md").is_file()
+
+
+def test_materialize_honors_serialwrap_config_dir_matching_daemon_profile_dir(tmp_path, monkeypatch):
+    """I-B：只設 SERIALWRAP_CONFIG_DIR 時，setup 物化的 profiles 必須等於 daemon 讀的 PROFILE_DIR。"""
+    import importlib
+    monkeypatch.setenv("SERIALWRAP_CONFIG_DIR", str(tmp_path / "cc"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("SERIALWRAP_PROFILE_DIR", raising=False)
+    from sw_core.setup_cmd import materialize_assets
+    res = materialize_assets(home=tmp_path)
+    assert (tmp_path / "cc" / "profiles" / "default.yaml").is_file()
+    import sw_core.constants as c
+    importlib.reload(c)
+    assert res["profiles"] == c.PROFILE_DIR  # writer == reader（daemon 的 --profile-dir 預設）
+
+
+def teardown_module(module):
+    import importlib
+    import sw_core.constants as c
+    importlib.reload(c)  # 還原 constants（上面測試 reload 過），避免污染其他測試
