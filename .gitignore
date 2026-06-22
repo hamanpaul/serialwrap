@@ -5,6 +5,7 @@ __pycache__/
 
 dist/
 build/
+*.egg-info/
 
 # 本機 agent / worktree 目錄
 .worktrees/

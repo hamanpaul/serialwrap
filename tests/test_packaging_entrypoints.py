@@ -31,3 +31,13 @@ def test_copy_tree_handles_nested_skill_dir(tmp_path):
     dest = tmp_path / "skill"
     assets.copy_tree("skill", dest)
     assert (dest / "SKILL.md").is_file()
+
+
+def test_pyproject_declares_entrypoints_and_deps():
+    import tomllib, pathlib
+    data = tomllib.loads((pathlib.Path(__file__).resolve().parent.parent / "pyproject.toml").read_text())
+    scripts = data["project"]["scripts"]
+    assert scripts["serialwrap"] == "sw_core.cli:main"
+    assert scripts["serialwrapd"] == "sw_core.daemon:main"
+    assert any(d.lower().startswith("pyyaml") for d in data["project"]["dependencies"])
+    assert data["project"]["requires-python"] == ">=3.10"
