@@ -630,16 +630,20 @@ class SessionManager:
                 if not acquired:
                     # manual attach/recover 正持有 probe 鎖 → 本次跳過，交給 backoff 後重試（Finding 2）。
                     return
-                now = time.monotonic()
+                start = time.monotonic()
                 with self._lock:
                     session = self._sessions.get(session_id)
                     if session is None or session.bridge is not bridge:
                         return
-                    if not self._reprobe_target_still_valid_locked(session, bridge, now):
+                    if not self._reprobe_target_still_valid_locked(session, bridge, start):
                         return
                 try:
                     result = self._probe_existing_bridge(session, bridge)
                 except Exception as exc:
+                    # backoff 以 probe「完成時間」計算，而非 start：probe 可能阻塞到 profile timeout
+                    # （10/15s），用 start 會讓 next_reprobe_at 落在過去、下一 tick 立刻重探、
+                    # 慢速/靜默開機時過早 exhausted（#69 Finding round6）。
+                    done = time.monotonic()
                     with self._lock:
                         current = self._sessions.get(session_id)
                         if (
@@ -649,9 +653,9 @@ class SessionManager:
                         ):
                             current.state = "ATTACHED"
                             current.last_error = f"REPROBE_FAILED:{type(exc).__name__}"
-                            self._record_reprobe_attempt_locked(current, now)
+                            self._record_reprobe_attempt_locked(current, done)
                     return
-                self._finish_probe_reprobe(session_id, bridge, result, now)
+                self._finish_probe_reprobe(session_id, bridge, result, time.monotonic())
             finally:
                 if acquired:
                     probe_lock.release()

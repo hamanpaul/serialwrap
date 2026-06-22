@@ -347,6 +347,36 @@ class TestReadinessReprobe(unittest.TestCase):
                 self.assertEqual(session.state, clobber_state)
                 self.assertNotEqual(session.state, "READY")
 
+    def test_slow_failed_probe_backoff_uses_completion_time(self) -> None:
+        """Finding round6：probe 阻塞超過 backoff 間隔時，失敗後的 next_reprobe_at 必須以 probe
+        完成時間（非開始時間）計算；否則 next_reprobe_at 落在過去、下一 tick 立刻重探、過早 exhausted。"""
+        mgr, session = self._make_attached_candidate()
+        session.reprobe_attempts = 0
+        session.next_reprobe_at = None
+        session.last_rx_mono = 0.0  # 視為 RX 已閒置
+
+        clock = {"t": 100.0}
+
+        def fake_monotonic() -> float:
+            return clock["t"]
+
+        def slow_probe_fail(_session: sm_mod.SessionRuntime, _bridge: FakeBridge) -> dict:
+            clock["t"] += 20.0  # 模擬 probe 阻塞 20s（遠大於首次 backoff 2s）
+            session.state = "ATTACHED"
+            session.last_error = "PROMPT_UNAVAILABLE"
+            return {"ok": True, "session": session.to_public_dict()}
+
+        with mock.patch.object(sm_mod.time, "monotonic", side_effect=fake_monotonic):
+            with mock.patch.object(mgr, "_probe_existing_bridge", side_effect=slow_probe_fail):
+                mgr.reconcile_readiness()
+                mgr.join_reprobe_workers(2.0)
+
+        self.assertEqual(session.reprobe_attempts, 1)
+        self.assertFalse(session.reprobe_exhausted)
+        # 完成時間 120 + 首次 backoff 2 = 122；不得是 start(100)+2=102（落在 120 之前）。
+        self.assertIsNotNone(session.next_reprobe_at)
+        self.assertGreaterEqual(session.next_reprobe_at, 120.0)
+
 
 if __name__ == "__main__":
     unittest.main()
