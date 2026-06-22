@@ -966,19 +966,6 @@ class TestRpcCliMcpPassthrough(unittest.TestCase):
         output = result.stdout + result.stderr
         self.assertIn("--allow-attached", output, f"--allow-attached not found in help:\n{output}")
 
-    def test_mcp_tool_schema_has_allow_attached(self) -> None:
-        """MCP serialwrap_open_interactive inputSchema 應包含 allow_attached 屬性。"""
-        from sw_mcp import server as mcp_server
-
-        tool = next(
-            (t for t in mcp_server._TOOL_DEFS if t["name"] == "serialwrap_open_interactive"),
-            None,
-        )
-        self.assertIsNotNone(tool, "serialwrap_open_interactive 不在 _TOOL_DEFS 中")
-        props = tool["inputSchema"]["properties"]
-        self.assertIn("allow_attached", props, f"allow_attached 不在 inputSchema 中: {props}")
-        self.assertEqual(props["allow_attached"].get("type"), "boolean")
-
 
 if __name__ == "__main__":
     unittest.main()

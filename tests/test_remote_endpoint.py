@@ -189,19 +189,32 @@ class TestCliEndpoint(unittest.TestCase):
         self.assertEqual(args.endpoint, "tcp://127.0.0.1:7777")
 
 
-class TestMcpEndpoint(unittest.TestCase):
-    """MCP server --endpoint 參數測試。"""
+class TestCliEndpointPassthrough(unittest.TestCase):
+    """CLI --endpoint 透傳測試。
 
-    def test_mcp_parser_has_endpoint(self) -> None:
-        import argparse
-        from sw_mcp.server import main
-        # 直接解析 argv，確認 --endpoint 不會 argparse error
-        import sys
-        from io import StringIO
-        with patch("sw_mcp.server.call_tool", return_value={"ok": True}):
-            with patch("sys.stdout", new_callable=StringIO):
-                rc = main(["--endpoint", "tcp://127.0.0.1:7777", "--tool", "serialwrap_ping"])
+    原 ``TestMcpEndpoint`` 驗證 MCP server 把 ``--endpoint`` 透傳到底層
+    ``rpc_call``；MCP adapter 退役後，遠端路徑改由 ``sw_core.cli`` 直接走
+    （兩者底層同一 ``rpc_call``）。此處驗證 CLI ``--endpoint`` 確實把端點
+    傳到 ``rpc_call`` 第一個參數，保留 remote-endpoint 透傳覆蓋。
+    """
+
+    def test_cli_endpoint_passed_to_rpc_call(self) -> None:
+        import io
+        from contextlib import redirect_stdout
+        from sw_core.cli import main
+
+        with patch(
+            "sw_core.cli.rpc_call",
+            return_value={"ok": True, "result": "pong"},
+        ) as mock_rpc:
+            with redirect_stdout(io.StringIO()):
+                rc = main(
+                    ["--endpoint", "tcp://127.0.0.1:7777", "event", "status",
+                     "--selector", "COM0"]
+                )
         self.assertEqual(rc, 0)
+        # rpc_call 第一個 positional 參數應為遠端 endpoint
+        self.assertEqual(mock_rpc.call_args.args[0], "tcp://127.0.0.1:7777")
 
 
 if __name__ == "__main__":

@@ -28,6 +28,10 @@
 - **採用 policy 1.0.4**：`policy_version` 1.0.1 → 1.0.4（`.paul-project.yml` + 四份 agent 檔 + workflow `uses:`/`policy_engine_ref` 重釘至 `hamanpaul/paulsha-conventions@v1.0.4`，SHA `77a3e83`）；`.paul-project.yml` 宣告 `tier: shareable`。
 - **強化 CLI help（`sw_core/cli.py`）**：為全部命令群組（`daemon`/`device`/`session`/`alias`/`cmd`/`stream`/`log`/`file`/`wal`/`event`）補上 `help=` 摘要與 `description=`，並為每個子命令（含先前看不到的 `recover`/`self-test`/`release`/`attach` 等）補繁中 `help=`；子命令選單 `metavar` 由冗長的 `{...}` 改為 `<group>`／`<command>`，`event` 既有英文 help 一併改為繁中；同步重生 `README.md` `## Usage` 的 `serialwrap-help` marker 區段（R-16）。純說明文字調整，不影響任何指令行為與參數。
 
+### Removed
+
+- 退役 vestigial MCP 層：刪除 `sw_mcp/`（含 server.py）與 `serialwrap-mcp` shim，並移除/改寫 4 個 MCP-coupled 測試（event/remote/bootloader 改走 CLI/RPC 路徑覆蓋）。(#59)
+
 ### Security
 
 - 配合 `tier: shareable` 的 R-21（已對公開廠商/OS 名減敏），清除 tracked 內容中的個人家目錄絕對路徑（docs/skills 改 `~/`、func-test 改 `/tmp/` 以維持可攜）與雇主裝置型號（改用公開的 `Broadcom CFE 平台` 通稱）；停止追蹤 ctags 索引檔（含絕對路徑）並加入 `.gitignore`。
