@@ -11,8 +11,10 @@ from typing import Any
 
 from .client import rpc_call
 from .constants import CONFIG_DIR, LOCK_PATH, PROFILE_DIR, SOCKET_PATH
+from .doctor_cmd import run_doctor
 from .runtime_config import RuntimeConfig
 from .service_ctl import service_action
+from .setup_cmd import FlashingBusy, detect_legacy_install, materialize_assets, reconcile
 
 _USE_DEFAULT_ENV = object()
 LEGACY_DAEMON_ENV_FILE = "~/OPI.env"
@@ -260,6 +262,98 @@ def _dispatch_event(args: argparse.Namespace) -> int:
         return 2
     _print(result)
     return 0 if result.get("ok") else 2
+
+
+# 與 doctor 報告中「advisory（缺少不致命）」的檢查項對應；這些項 ok=False 不
+# 拉低整體 ok（無 systemd 可走 on-demand；無裝置可能只是還沒插線）。
+_DOCTOR_ADVISORY_CHECKS = {"systemd", "wsl_systemd", "devices"}
+
+
+def _run_doctor(args: argparse.Namespace) -> int:
+    """執行環境診斷並印出 JSON 報告；advisory 項不影響整體 ok。"""
+    report = run_doctor()
+    overall_ok = all(
+        item["ok"] or item["check"] in _DOCTOR_ADVISORY_CHECKS for item in report
+    )
+    _print({"ok": overall_ok, "checks": report})
+    return 0
+
+
+def _resolve_target_mode(args: argparse.Namespace, fx) -> str:
+    """依旗標解析目標監管模式；未指定時 auto（有 systemd → user，否則 on-demand）。"""
+    if getattr(args, "user", False):
+        return "systemd-user"
+    if getattr(args, "system", False):
+        return "systemd-system"
+    if getattr(args, "on_demand", False):
+        return "on-demand"
+    return "systemd-user" if fx.has_systemd() else "on-demand"
+
+
+def _run_setup(args: argparse.Namespace) -> int:
+    """物化資產並 reconcile 監管模式，輸出 legacy 偵測與 setup 結果。"""
+    from .sysenv import SystemEffects
+
+    fx = SystemEffects()
+
+    # 1. legacy 偵測（僅指引、不刪除）。
+    legacy = detect_legacy_install()
+
+    # 2. 物化套件資產到使用者可寫位置。
+    materialize_assets(force=args.force)
+
+    # 3. 解析目標模式與目前（舊）模式。
+    target = _resolve_target_mode(args, fx)
+    old = _default_runtime_config().mode() or "on-demand"
+
+    # 4. daemon/flash 偵測：best-effort，連不到一律 False，不阻擋 setup。
+    daemon_running = False
+    any_flashing = False
+    try:
+        daemon_running = bool(rpc_call(SOCKET_PATH, "health.ping", {}, timeout_s=0.5).get("ok"))
+    except Exception:
+        daemon_running = False
+    try:
+        any_flashing = bool(rpc_call(SOCKET_PATH, "mcu.status", {}, timeout_s=0.5).get("flashing"))
+    except Exception:
+        any_flashing = False
+
+    # 5. reconcile（先停舊、再起新）；flash 進行中除非 force 否則拒絕。
+    try:
+        result = reconcile(
+            old_mode=old,
+            target_mode=target,
+            fx=fx,
+            home=os.path.expanduser("~"),
+            daemon_running=daemon_running,
+            any_flashing=any_flashing,
+            with_sudo=args.with_sudo,
+            force=args.force,
+            socket_path=SOCKET_PATH,
+            # config 寫入路徑須與所有讀取端（_default_runtime_config→CONFIG_DIR）一致，
+            # 否則自訂 XDG_CONFIG_HOME/SERIALWRAP_CONFIG_DIR 下 writer≠reader 會分歧（I-1）。
+            config_path=os.path.join(CONFIG_DIR, "config.yaml"),
+        )
+    except FlashingBusy as exc:
+        _print({
+            "ok": False,
+            "error_code": "FLASHING_BUSY",
+            "message": str(exc),
+            "legacy": legacy,
+        })
+        return 2
+
+    payload: dict[str, Any] = {
+        "ok": True,
+        "legacy": legacy,
+        "setup": result,
+        "doctor_hint": "serialwrap doctor 可驗證環境",
+    }
+    pending_sudo = result.get("pending_sudo")
+    if pending_sudo:
+        payload["pending_sudo"] = pending_sudo
+    _print(payload)
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -573,6 +667,45 @@ def build_parser() -> argparse.ArgumentParser:
         help="systemd-system 模式的特權動作（start/stop/restart）以 sudo 執行",
     )
 
+    p_setup = sub.add_parser(
+        "setup",
+        help="安裝資產並設定監管模式（systemd-user／systemd-system／on-demand）",
+        description=(
+            "物化套件資產（profiles／agent skill／minicom wrappers）到使用者位置，"
+            "並 reconcile 監管模式（先停舊、再起新）。\n"
+            "未指定模式時自動偵測（有 systemd → systemd-user，否則 on-demand）。\n"
+            "system scope 的特權動作需 --with-sudo，否則只回報待執行的 sudo 指令。"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    setup_mode = p_setup.add_mutually_exclusive_group()
+    setup_mode.add_argument("--user", action="store_true", help="設為 systemd-user 模式（免 sudo）")
+    setup_mode.add_argument("--system", action="store_true", help="設為 systemd-system 模式（特權動作需 --with-sudo）")
+    setup_mode.add_argument(
+        "--on-demand",
+        dest="on_demand",
+        action="store_true",
+        help="設為 on-demand 模式（無 systemd 時的降級備援）",
+    )
+    p_setup.add_argument("--force", action="store_true", help="覆蓋既有 profiles，並在 flash 進行中仍強制切換")
+    p_setup.add_argument(
+        "--with-sudo",
+        dest="with_sudo",
+        action="store_true",
+        default=False,
+        help="systemd-system 模式下允許執行特權 sudo 指令（安裝 unit／enable／start）",
+    )
+
+    sub.add_parser(
+        "doctor",
+        help="診斷安裝與執行環境（Python／PyYAML／PATH／dialout／systemd／裝置）",
+        description=(
+            "對安裝與執行環境做一系列唯讀檢查並印出 JSON 報告。\n"
+            "systemd／wsl_systemd／devices 為 advisory（缺少不致命，不拉低整體 ok）。"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+
     return p
 
 
@@ -765,6 +898,12 @@ def main(argv: list[str] | None = None) -> int:
         result = service_action(args.action, mode=mode, with_sudo=args.with_sudo)
         _print(result)
         return 0 if result.get("ok") else 2
+
+    if args.cmd == "setup":
+        return _run_setup(args)
+
+    if args.cmd == "doctor":
+        return _run_doctor(args)
 
     _print({"ok": False, "error_code": "INVALID_ARGS"})
     return 2

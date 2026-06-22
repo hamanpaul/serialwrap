@@ -1116,6 +1116,8 @@ command groups:
     event              event-trigger 規則註冊與 matcher 控制
     supervision-mode   顯示有效的監管模式（on-demand、systemd-user 或 systemd-system）
     service            透過 systemctl 管理 serialwrap systemd service（systemd 監管模式適用）
+    setup              安裝資產並設定監管模式（systemd-user／systemd-system／on-demand）
+    doctor             診斷安裝與執行環境（Python／PyYAML／PATH／dialout／systemd／裝置）
 
 examples:
   serialwrap session list

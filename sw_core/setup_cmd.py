@@ -83,6 +83,65 @@ def _copy_profile_file(src_item: importlib.resources.abc.Traversable, dest: Path
 # ────────────────────────────── 公開 API ──────────────────────────────
 
 
+def detect_legacy_install(home: Path | str | None = None) -> dict | None:
+    """偵測舊版 ``~/.paul_tools`` 安裝並回傳退役指引（不刪除任何東西）。
+
+    舊版安裝特徵為 ``~/.paul_tools/serialwrap`` shadow 二進位存在。偵測到時
+    一併回報 minicom 符號連結與 ``/tmp/serialwrap/state.json`` 是否殘留，並給
+    出退役步驟提示，供 ``serialwrap setup`` 顯示。此函式**僅偵測 + 指引**，
+    絕不自動刪除——交由使用者確認後手動清理。
+
+    Args:
+        home: 使用者家目錄；``None`` 時自動展開 ``~``。
+
+    Returns:
+        無 legacy 安裝時回 ``None``；否則回字典::
+
+            {
+                "path": str(~/.paul_tools),
+                "serialwrap": bool,        # shadow 二進位是否存在
+                "minicom_symlink": bool,   # minicom 符號連結是否存在
+                "state_json": str | None,  # /tmp/serialwrap/state.json（存在才有）
+                "hint": str,               # 退役步驟指引
+            }
+    """
+    home_path = Path(home) if home else Path(os.path.expanduser("~"))
+    paul_tools = home_path / ".paul_tools"
+    serialwrap_bin = paul_tools / "serialwrap"
+
+    # 偵測判準：~/.paul_tools/serialwrap 存在才算 legacy 安裝。
+    if not serialwrap_bin.exists():
+        return None
+
+    # minicom 符號連結（舊版常見於 ~/.paul_tools/minicom 或 ~/.local/bin/minicom）。
+    minicom_candidates = [
+        paul_tools / "minicom",
+        home_path / ".local" / "bin" / "minicom",
+    ]
+    minicom_symlink = any(p.is_symlink() for p in minicom_candidates)
+
+    # 舊版 state.json 殘留於 /tmp（新版改走 XDG state home）。
+    legacy_state = Path("/tmp/serialwrap/state.json")
+    state_json = str(legacy_state) if legacy_state.exists() else None
+
+    hint = (
+        "偵測到舊版 ~/.paul_tools 安裝。建議退役步驟："
+        "1) 停掉舊 daemon（若仍在跑）；"
+        "2) 移除 shadow 二進位 ~/.paul_tools/serialwrap 與 minicom 符號連結；"
+        "3) 從 shell rc 移除 ~/.paul_tools 的 PATH export。"
+        "新版改以 pipx 安裝（~/.local/bin）並以 XDG 路徑運作，不需 ~/.paul_tools。"
+        "本指令不會自動刪除任何檔案。"
+    )
+
+    return {
+        "path": str(paul_tools),
+        "serialwrap": serialwrap_bin.exists(),
+        "minicom_symlink": minicom_symlink,
+        "state_json": state_json,
+        "hint": hint,
+    }
+
+
 def materialize_assets(
     home: Path | str | None = None,
     *,
@@ -392,7 +451,7 @@ def reconcile(
             "mode": target_mode,
             "transitioned": False,
             "applied": True,
-            "ran": [list(c) for c in fx.calls],
+            "ran": [list(c) for c in getattr(fx, "calls", [])],
             "pending_sudo": pending_sudo,
         }
 
@@ -432,6 +491,6 @@ def reconcile(
         "mode": target_mode,
         "transitioned": True,
         "applied": True,
-        "ran": [list(c) for c in fx.calls],
+        "ran": [list(c) for c in getattr(fx, "calls", [])],
         "pending_sudo": pending_sudo,
     }
