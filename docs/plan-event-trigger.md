@@ -39,8 +39,8 @@
 | `sw_core/session_manager.py` | Expose `active_cmd_id_for(com)` helper for scope filter; lifecycle hooks for engine start/stop |
 | `sw_core/service.py` | Register 10 new RPC methods, load engine in daemon startup |
 | `sw_core/cli.py` | New `event` subcommand group |
-| `sw_mcp/server.py` | 10 new tool definitions with required "call status first" notice |
-| `README.md`, `skills.md` | Doc additions |
+| sw_mcp/server.py（已退役 #59）| 10 new tool definitions with required "call status first" notice |
+| `README.md`, `skills/serialwrap/SKILL.md` | Doc additions |
 
 ---
 
@@ -3026,9 +3026,9 @@ git commit -m "feat(event): serialwrap event CLI subcommand group"
 
 ### Task 12.1: Failing test for MCP completeness
 
-**Files:** Create `tests/test_event_mcp.py`
+**Files:** Create tests/test_event_mcp.py（已隨 MCP 退役移除 #59）
 
-- [ ] **Step 1:** Write the test (mirror style of existing `tests/test_mcp_completeness.py`).
+- [ ] **Step 1:** Write the test (mirror style of existing tests/test_mcp_completeness.py).
 
 ```python
 from __future__ import annotations
@@ -3079,7 +3079,7 @@ if __name__ == "__main__":
 
 ### Task 12.2: Add MCP tool definitions
 
-**Files:** Modify `sw_mcp/server.py`
+**Files:** Modify sw_mcp/server.py（已退役 #59）
 
 - [ ] **Step 1:** Append to `_TOOL_MAP`:
 
@@ -3268,18 +3268,18 @@ git commit -m "test(event): func-test ev-01 covers spawn handler end-to-end"
 
 ## Phase 14 — Documentation & issue closure
 
-### Task 14.1: README + skills.md
+### Task 14.1: README + skills/serialwrap/SKILL.md
 
-**Files:** Modify `README.md`, `skills.md`
+**Files:** Modify `README.md`, `skills/serialwrap/SKILL.md`
 
 - [ ] **Step 1:** Add a short section to `README.md` titled `Event Trigger (issue #37)` that links to `docs/design-event-trigger.md` and `docs/plan-event-trigger.md`, lists the 10 MCP tools by name, and shows one minimal rule example.
 
-- [ ] **Step 2:** Update `skills.md` with the new `event` subcommand group + at least one example. Add a "**先呼叫 serialwrap_event_status**" warning to the description.
+- [ ] **Step 2:** Update `skills/serialwrap/SKILL.md` with the new `event` subcommand group + at least one example. Add a "**先呼叫 serialwrap event status**" warning to the description.
 
 - [ ] **Step 3:** Commit.
 
 ```bash
-git add README.md skills.md
+git add README.md skills/serialwrap/SKILL.md
 git commit -m "docs(event): document event trigger CLI / MCP / safety contract"
 ```
 
