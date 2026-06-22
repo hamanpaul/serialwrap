@@ -324,6 +324,29 @@ class TestReadinessReprobe(unittest.TestCase):
 
         probe.assert_not_called()
 
+    def test_probe_result_does_not_clobber_flashing_or_released_state(self) -> None:
+        """Finding 1 round2：probe 在 lock 外阻塞期間 session 被搶進 FLASHING/RELEASED 時，
+        probe 結果不得覆寫狀態——否則 FLASHING 被打回 ATTACHED，flasher 結束時 exit_flashing
+        提早 return、bridge 永久卡在 flash 模式並靜默丟棄非 flash 寫入。"""
+        mgr, session = self._make_attached_candidate()
+        bridge = session.bridge
+
+        for clobber_state in ("FLASHING", "RELEASED"):
+            with self.subTest(clobber_state):
+                session.state = "ATTACHED"
+                session.last_error = "PROMPT_UNAVAILABLE"
+
+                def fake_probe(_bridge: object, _sp: object) -> tuple[bool, None]:
+                    # 模擬 probe 進行中 flash broker / device release 搶進改了狀態。
+                    session.state = clobber_state
+                    return True, None
+
+                with mock.patch.object(sm_mod, "probe_ready", side_effect=fake_probe):
+                    mgr._probe_existing_bridge(session, bridge)
+
+                self.assertEqual(session.state, clobber_state)
+                self.assertNotEqual(session.state, "READY")
+
 
 if __name__ == "__main__":
     unittest.main()

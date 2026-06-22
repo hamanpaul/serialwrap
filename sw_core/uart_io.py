@@ -107,9 +107,16 @@ class UARTBridge:
         self._flash_mode: bool = False
 
     def set_flash_mode(self, enabled: bool) -> None:
-        """進出 flash 模式；FLASHING 期間擋下 console 注入（C2）。"""
-        with self._state_lock:
-            self._flash_mode = enabled
+        """進出 flash 模式；FLASHING 期間擋下 console 注入（C2）。
+
+        取 `_write_lock` 再改旗標，與 `send_bytes` 的 flash gate 共用同一鎖序
+        （_write_lock ⊃ _state_lock），確保「檢查 flash_mode → 寫入」與「切換 flash_mode」
+        互斥：flash 開啟一旦贏得鎖，任何進行中的非 flash 寫入已完成、後續非 flash 寫入必被擋下
+        （#69 Finding 2 round2）。
+        """
+        with self._write_lock:
+            with self._state_lock:
+                self._flash_mode = enabled
 
     @property
     def vtty_path(self) -> str | None:
@@ -488,16 +495,18 @@ class UARTBridge:
             threading.Thread(target=self._on_bridge_down, args=(failure_reason,), daemon=True).start()
 
     def send_bytes(self, payload: bytes, *, source: str, cmd_id: str | None = None, log: bool = True) -> None:
-        with self._state_lock:
-            if self._flash_mode and not source.startswith("flash"):
-                # FLASHING 期間僅允許 flasher（source="flash"）寫入；丟棄其他所有來源
-                # （system probe / reconcile 自動重探 / self_test / agent 注入等），
-                # 防止競態下把 probe bytes 寫進燒錄中的 device、汙染 SBL binary 串流（C2，#69 Finding 1）。
-                return
-            serial_fd = self._serial_fd
-        if serial_fd is None:
-            raise RuntimeError("serial not ready")
+        # 全程持有 _write_lock，使「檢查 flash_mode → 實際寫入」對 set_flash_mode 切換原子化
+        # （#69 Finding 2 round2）：否則檢查與寫入之間若 flash 開啟，非 flash byte 仍會寫出汙染 SBL。
         with self._write_lock:
+            with self._state_lock:
+                if self._flash_mode and not source.startswith("flash"):
+                    # FLASHING 期間僅允許 flasher（source="flash"）寫入；丟棄其他所有來源
+                    # （system probe / reconcile 自動重探 / self_test / agent 注入等），
+                    # 防止競態下把 probe bytes 寫進燒錄中的 device、汙染 SBL binary 串流（C2，#69 Finding 1）。
+                    return
+                serial_fd = self._serial_fd
+            if serial_fd is None:
+                raise RuntimeError("serial not ready")
             self._write_all(serial_fd, payload)
         if log:
             self.wal.append(com=self.com, direction="TX", source=source, payload=payload, cmd_id=cmd_id)

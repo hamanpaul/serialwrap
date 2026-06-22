@@ -1229,6 +1229,12 @@ class SessionManager:
             current = self._sessions.get(session.session_id)
             if current is None or current.bridge is not bridge:
                 return {"ok": False, "error_code": "SESSION_NOT_READY"}
+            # probe 在 lock 外阻塞期間，session 可能被 flash broker 搶進 FLASHING、或被 device
+            # handoff 釋放成 RELEASED。此時不得用 probe 結果覆寫狀態，否則會把 FLASHING 打回
+            # ATTACHED → flasher 結束時 exit_flashing 見 state≠FLASHING 提早 return、bridge 永久
+            # 卡在 flash 模式並靜默丟棄非 flash 寫入（#69 Finding 1 round2）。
+            if current.state in {"FLASHING", "RELEASED"}:
+                return {"ok": False, "error_code": "STATE_CHANGED", "session": current.to_public_dict()}
             current.recovering = False
             current.recovery_started_at = None
             current.pending_auto_login = False
