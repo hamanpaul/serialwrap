@@ -19,6 +19,9 @@ import shutil
 from pathlib import Path
 
 from sw_core import assets as _assets
+from sw_core.runtime_config import RuntimeConfig
+from sw_core.state_migrate import migrate_legacy_state
+from sw_core.systemd_units import render_system_unit, render_user_unit
 
 # ────────────────────────────── 私有工具 ──────────────────────────────
 
@@ -140,4 +143,295 @@ def materialize_assets(
         "profiles": str(profiles_dest),
         "skill_link": str(dirs["agents_skill_link"]),
         "bin": str(bin_dest),
+    }
+
+
+# ═══════════════════════════ 監管模式 reconciler（Task 11）═══════════════════════════
+#
+# 核心不變式：模式 *改變* 時，必須「先停舊、再起新」。
+# 這是為了避免 on-demand ↔ systemd 交接過程中，兩個程序同時開啟同一支
+# /dev/ttyUSB*（two-reader）。SingletonLock 不足以擋住跨機制的競態——舊機制的
+# daemon 必須先釋放 tty FD，新機制才可啟動。此順序是本任務的核心，務必正確。
+#
+# 另一護欄：flash 進行中（any_flashing）除非 force，否則拒絕轉換，避免在 MCU
+# 韌體燒錄／檔案傳輸中途切斷。
+#
+# sudo 邊界：system scope 的特權動作（寫 /etc/systemd/system、sudo systemctl）
+# 在未帶 with_sudo 時**絕不**靜默執行，改記入 result 的 pending_sudo 供呼叫端決定。
+
+
+class FlashingBusy(Exception):
+    """flash 進行中且未帶 force 時拋出，表示不可在此刻切換監管模式。"""
+
+
+# systemd user/system scope 的 unit 安裝路徑與 ExecStart。
+_USER_UNIT_REL = Path(".config") / "systemd" / "user" / "serialwrap.service"
+_USER_EXEC_START = "%h/.local/bin/serialwrapd"
+_SYSTEM_UNIT_PATH = "/etc/systemd/system/serialwrap.service"
+_SYSTEM_EXEC_START = "/usr/local/bin/serialwrapd --socket /run/serialwrap/serialwrapd.sock"
+
+
+def _stage_system_unit(home: Path) -> Path:
+    """把 system unit 真實內容寫到非特權 staging 檔，回傳路徑。
+
+    以 staging + ``sudo install`` 取代直接 ``sudo tee``：Effects.run 不帶 stdin，直接
+    ``sudo tee`` 會寫出空檔；staging 讓非特權步驟先備妥真實內容，特權步驟只做複製。
+    """
+    staging = home / ".local" / "share" / "serialwrap" / "serialwrap.service"
+    staging.parent.mkdir(parents=True, exist_ok=True)
+    staging.write_text(render_system_unit(_SYSTEM_EXEC_START), encoding="utf-8")
+    return staging
+
+
+def _system_install_cmds(home: Path, *, include_start: bool) -> list[list[str]]:
+    """組出 system scope 安裝/啟用 unit 的特權指令（unit 內容已先 stage 成真實檔）。"""
+    staging = _stage_system_unit(home)
+    cmds = [
+        ["sudo", "install", "-m", "0644", str(staging), _SYSTEM_UNIT_PATH],
+        ["sudo", "systemctl", "daemon-reload"],
+        ["sudo", "systemctl", "enable", "serialwrap"],
+    ]
+    if include_start:
+        cmds.append(["sudo", "systemctl", "start", "serialwrap"])
+    return cmds
+
+
+def _state_path_for(mode: str, home: Path) -> Path:
+    """回傳指定 scope 的 state.json 路徑（用於跨 scope 遷移判斷）。
+
+    user scope（``on-demand`` / ``systemd-user``）落在 XDG state home；
+    system scope（``systemd-system``）對應 systemd ``StateDirectory=serialwrap``
+    的 ``/var/lib/serialwrap``。同一 scope 內路徑相同 → 遷移為 no-op。
+
+    Args:
+        mode: 監管模式字串。
+        home: 使用者家目錄。
+
+    Returns:
+        該 scope 對應的 ``state.json`` 路徑。
+    """
+    if mode == "systemd-system":
+        return Path("/var/lib/serialwrap/state.json")
+    state_home = os.environ.get("XDG_STATE_HOME") or str(home / ".local" / "state")
+    return Path(state_home) / "serialwrap" / "state.json"
+
+
+def _stop_old(
+    *,
+    old_mode: str,
+    fx,
+    daemon_running: bool,
+    with_sudo: bool,
+    pending_sudo: list[list[str]],
+) -> None:
+    """停掉舊機制，讓它釋放 tty FD（轉換的第一步，務必先於起新）。
+
+    - ``on-demand``：只有 daemon 真的在跑才需停（讓正在跑的 on-demand daemon
+      釋放 tty）。
+    - ``systemd-user``：``systemctl --user stop`` 後 ``disable``。
+    - ``systemd-system``：特權動作；帶 ``with_sudo`` 才實跑，否則記入
+      *pending_sudo*（絕不靜默跑 sudo）。
+
+    Args:
+        old_mode:       目前監管模式。
+        fx:             effects 介面（所有外部指令經此，供測試攔截）。
+        daemon_running: on-demand daemon 是否在跑。
+        with_sudo:      是否允許執行特權 sudo 指令。
+        pending_sudo:   累積未授權特權指令的清單（原地修改）。
+    """
+    if old_mode == "on-demand":
+        if daemon_running:
+            fx.run(["serialwrap", "daemon", "stop"])
+    elif old_mode == "systemd-user":
+        fx.run(["systemctl", "--user", "stop", "serialwrap"])
+        fx.run(["systemctl", "--user", "disable", "serialwrap"])
+    elif old_mode == "systemd-system":
+        if with_sudo:
+            fx.run(["sudo", "systemctl", "stop", "serialwrap"])
+            fx.run(["sudo", "systemctl", "disable", "serialwrap"])
+        else:
+            pending_sudo.append(["sudo", "systemctl", "stop", "serialwrap"])
+            pending_sudo.append(["sudo", "systemctl", "disable", "serialwrap"])
+
+
+def _start_new(
+    *,
+    target_mode: str,
+    fx,
+    home: Path,
+    with_sudo: bool,
+    pending_sudo: list[list[str]],
+) -> None:
+    """啟動新機制（轉換的最後一步，必在停舊之後）。
+
+    - ``systemd-user``：寫 user unit → ``daemon-reload`` / ``enable`` / ``start``
+      / ``loginctl enable-linger``。
+    - ``systemd-system``：特權動作；帶 ``with_sudo`` 才寫 unit（經
+      ``sudo tee``）並 ``sudo systemctl daemon-reload``/``enable``/``start``，
+      否則把確切的 sudo 指令記入 *pending_sudo*，不執行。
+    - ``on-demand``：無需啟動（daemon 依需求自生），直接略過。
+
+    Args:
+        target_mode:  目標監管模式。
+        fx:           effects 介面（外部指令經此）。
+        home:         使用者家目錄（user unit 寫此目錄下，可在 tmp 測試）。
+        with_sudo:    是否允許執行特權 sudo 指令。
+        pending_sudo: 累積未授權特權指令的清單（原地修改）。
+    """
+    if target_mode == "systemd-user":
+        unit_path = home / _USER_UNIT_REL
+        unit_path.parent.mkdir(parents=True, exist_ok=True)
+        unit_path.write_text(render_user_unit(_USER_EXEC_START), encoding="utf-8")
+        fx.run(["systemctl", "--user", "daemon-reload"])
+        fx.run(["systemctl", "--user", "enable", "serialwrap"])
+        fx.run(["systemctl", "--user", "start", "serialwrap"])
+        fx.run(["loginctl", "enable-linger"])
+    elif target_mode == "systemd-system":
+        # 特權：unit 內容先 stage 成真實檔，再以 sudo install 複製到 /etc（避免空檔的 sudo tee）。
+        # 未授權路徑已於 reconcile 上游早退，這裡 with_sudo 必為真；保留 else 為防禦。
+        cmds = _system_install_cmds(home, include_start=True)
+        if with_sudo:
+            for c in cmds:
+                fx.run(c)
+        else:
+            pending_sudo.extend(cmds)
+    # target_mode == "on-demand"：無需啟動，daemon 依需求自生。
+
+
+def reconcile(
+    *,
+    old_mode,
+    target_mode,
+    fx,
+    home,
+    daemon_running: bool = False,
+    any_flashing: bool = False,
+    with_sudo: bool = False,
+    force: bool = False,
+    socket_path=None,
+    config_path=None,
+) -> dict:
+    """決定並套用監管模式；模式改變時以「先停舊、再起新」嚴格順序轉換。
+
+    順序的存在是為了避免 on-demand ↔ systemd 交接時兩個程序同時開啟同一支
+    /dev/ttyUSB*。flash 進行中除非 *force* 否則拒絕（不動任何東西）。system
+    scope 特權動作未帶 *with_sudo* 時記入 pending_sudo，不靜默執行。
+
+    Args:
+        old_mode:       目前監管模式（``on-demand`` / ``systemd-user`` /
+                        ``systemd-system``）。
+        target_mode:    目標監管模式。
+        fx:             effects 介面，所有外部指令（systemctl/loginctl/daemon
+                        stop）經此以便單元測試攔截。
+        home:           使用者家目錄；unit 檔寫於此目錄下（可在 tmp 測試）。
+        daemon_running: on-demand daemon 是否在跑（決定是否需先停舊）。
+        any_flashing:   是否有 flash／傳輸進行中（護欄）。
+        with_sudo:      是否允許執行特權 sudo 指令。
+        force:          ``True`` 時跳過 flash 護欄。
+        socket_path:    寫入 config 的有效 socket 路徑（可為 ``None``）。
+        config_path:    config.yaml 路徑；``None`` 時用
+                        ``home/.config/serialwrap/config.yaml``。
+
+    Returns:
+        摘要字典::
+
+            {
+                "mode": target_mode,
+                "transitioned": old_mode != target_mode,
+                "ran": [已實際執行的指令字串清單],
+                "pending_sudo": [未授權待執行的特權指令清單],
+            }
+
+    Raises:
+        FlashingBusy: ``any_flashing`` 為真且未帶 ``force``。
+    """
+    home = Path(home)
+    pending_sudo: list[list[str]] = []
+
+    # ── 護欄 1：flash 進行中除非 force，否則拒絕（不動任何東西）────────────
+    if any_flashing and not force:
+        raise FlashingBusy("flash 進行中，拒絕切換監管模式（可用 force 覆寫）")
+
+    cfg = RuntimeConfig(config_path or (home / ".config" / "serialwrap" / "config.yaml"))
+
+    # ── 護欄 2：system scope 需 root；未帶 with_sudo → 蒐集 pending 並早退，且
+    #    「不停舊、不寫 config」。否則會留下「config 說 systemd-system 但 unit 沒裝、
+    #    daemon 沒跑」的半套/分歧狀態（I-1）；也避免白白停掉仍可用的舊 daemon。
+    #    使用者改用 `serialwrap setup --system --with-sudo` 或手動跑 pending 即可套用。
+    if target_mode == "systemd-system" and not with_sudo:
+        pending = _system_install_cmds(home, include_start=(old_mode != target_mode))
+        return {
+            "mode": old_mode,            # 實際生效模式未變（config 不寫）
+            "requested_mode": target_mode,
+            "transitioned": False,
+            "applied": False,
+            "ran": [],
+            "pending_sudo": pending,
+        }
+
+    # ── 情境 A：同模式 → 冪等刷新（不 stop、不啟新、不打斷正在跑的 daemon）──
+    if target_mode == old_mode:
+        if target_mode == "systemd-user":
+            # 只重寫 unit + reload + enable，不 start churn。
+            unit_path = home / _USER_UNIT_REL
+            unit_path.parent.mkdir(parents=True, exist_ok=True)
+            unit_path.write_text(render_user_unit(_USER_EXEC_START), encoding="utf-8")
+            fx.run(["systemctl", "--user", "daemon-reload"])
+            fx.run(["systemctl", "--user", "enable", "serialwrap"])
+        elif target_mode == "systemd-system":
+            # 同模式刷新：不含 start（已在跑）。未授權路徑已於上游早退。
+            cmds = _system_install_cmds(home, include_start=False)
+            if with_sudo:
+                for c in cmds:
+                    fx.run(c)
+            else:
+                pending_sudo.extend(cmds)
+        # on-demand 同模式：無 unit 可刷新，僅寫 config。
+        cfg.set_mode(target_mode, socket_path=socket_path)
+        return {
+            "mode": target_mode,
+            "transitioned": False,
+            "applied": True,
+            "ran": [list(c) for c in fx.calls],
+            "pending_sudo": pending_sudo,
+        }
+
+    # ── 情境 B：模式改變 → 嚴格順序轉換 ────────────────────────────────────
+    # a. 先停舊（釋放 tty FD）——務必先於起新，避免 two-reader。
+    _stop_old(
+        old_mode=old_mode,
+        fx=fx,
+        daemon_running=daemon_running,
+        with_sudo=with_sudo,
+        pending_sudo=pending_sudo,
+    )
+
+    # b. 跨 scope 才需遷移 state（best-effort、僅 dest 空才搬、絕不拋例外）。
+    legacy_state = _state_path_for(old_mode, home)
+    new_state = _state_path_for(target_mode, home)
+    if legacy_state != new_state:
+        try:
+            migrate_legacy_state(legacy_state, new_state)
+        except Exception:
+            # 遷移屬 best-effort，失敗不可中斷模式轉換。
+            pass
+
+    # c. 再起新（必在停舊之後）。
+    _start_new(
+        target_mode=target_mode,
+        fx=fx,
+        home=home,
+        with_sudo=with_sudo,
+        pending_sudo=pending_sudo,
+    )
+
+    # d. 寫 config（單一事實來源）。此處必為已實際套用（system-no-sudo 已於上游早退）。
+    cfg.set_mode(target_mode, socket_path=socket_path)
+
+    return {
+        "mode": target_mode,
+        "transitioned": True,
+        "applied": True,
+        "ran": [list(c) for c in fx.calls],
+        "pending_sudo": pending_sudo,
     }
