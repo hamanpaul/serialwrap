@@ -19,7 +19,6 @@ COPY . /opt/serialwrap
 
 RUN pip install --no-cache-dir pyyaml pyserial \
     && chmod +x /opt/serialwrap/serialwrap \
-    && chmod +x /opt/serialwrap/serialwrap-mcp \
     && chmod +x /opt/serialwrap/serialwrapd.py
 
 CMD ["bash"]
