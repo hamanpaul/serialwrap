@@ -1,5 +1,7 @@
 # Design: UART Sense Event → Agent/Tool Trigger
 
+> 📌 **歷史快照**：#37 已交付。本設計「對既有 code 的改動範圍」列出的 sw_mcp/server.py（event MCP tools）**已隨 #59 MCP 退役而不適用**——MCP adapter 已自 repo 移除，event 功能僅經 RPC/CLI 表面提供。本檔僅留作歷史。
+
 **Issue**: #37
 **Status**: Draft v1（brainstorming 完成，pending implementation plan）
 **Author**: Paul Chen

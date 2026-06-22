@@ -1,5 +1,7 @@
 # #37 Event Trigger Implementation Plan
 
+> 📌 **歷史快照**：#37 event trigger 已交付。本計畫含「Phase 12 — MCP tools」等步驟（建立 tests/test_event_mcp.py、修改 sw_mcp/server.py 的 serialwrap_event_* definitions）**已隨 #59 MCP 退役而不適用**——相關檔案已自 repo 移除，event 功能僅經 RPC/CLI 表面提供（`serialwrap event ...`）。本檔僅留作歷史，不再維護；勿照其 MCP 步驟操作。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Implement v1 of the UART RX → pattern → handler trigger described in `docs/design-event-trigger.md` (issue #37): a udev/crontab-style declarative rule engine that lives next to the bridge, runs handlers as fire-and-forget subprocesses, and never blocks UART IO.
