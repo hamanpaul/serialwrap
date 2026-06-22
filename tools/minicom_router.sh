@@ -16,6 +16,8 @@ PROFILE_DIR="${SERIALWRAP_PROFILE_DIR:-${BASE_DIR}/profiles}"
 AUTO_START_DAEMON="${SERIALWRAP_AUTO_START_DAEMON:-1}"
 ATTACH_WHEN_NOT_READY="${SERIALWRAP_ATTACH_WHEN_NOT_READY:-1}"
 ATTACH_WAIT_TICKS="${SERIALWRAP_ATTACH_WAIT_TICKS:-60}"
+MINICOM_WAIT_READY="${MINICOM_WAIT_READY:-0}"
+MINICOM_WAIT_READY_TICKS="${MINICOM_WAIT_READY_TICKS:-120}"
 PREFERRED_COM="${SERIALWRAP_PREFERRED_COM:-COM0}"
 MINICOM_BIN="${MINICOM_BIN:-/usr/bin/minicom}"
 MINICOM_DEFAULT_COLOR="${MINICOM_DEFAULT_COLOR:-on}"
@@ -125,6 +127,32 @@ _find_first_console_row() {
     return 0
   fi
   printf '%s' "${obj}" | jq -c '.sessions[]? | select(.state=="ATTACHED")' | head -n 1
+}
+
+_find_first_reprobe_row() {
+  local obj="$1"
+  printf '%s' "${obj}" | jq -c '
+    .sessions[]?
+    | select(.state!="READY")
+    | select(
+        ((.last_error // "") == "PROMPT_UNAVAILABLE")
+        or ((.last_error // "") == "PROMPT_TIMEOUT")
+        or ((.last_error // "") | endswith("_PROMPT_TIMEOUT"))
+        or ((.reprobe_attempts // 0) > 0)
+        or (.reprobe_exhausted // false)
+      )
+  ' | head -n 1
+}
+
+_row_needs_reprobe_hint() {
+  local row="$1"
+  [[ "$(printf '%s' "${row}" | jq -r '
+    (((.last_error // "") == "PROMPT_UNAVAILABLE")
+      or ((.last_error // "") == "PROMPT_TIMEOUT")
+      or ((.last_error // "") | endswith("_PROMPT_TIMEOUT"))
+      or ((.reprobe_attempts // 0) > 0)
+      or (.reprobe_exhausted // false))
+  ')" == "true" ]]
 }
 
 _find_attach_selector_default() {
@@ -255,6 +283,31 @@ _wait_ready_row() {
   return 1
 }
 
+_wait_ready_only_row() {
+  local sel="$1"
+  local row=""
+  local state_json=""
+  local state=""
+
+  for _ in $(seq 1 "${MINICOM_WAIT_READY_TICKS}"); do
+    state_json="$(_get_sessions_json)"
+    if ! _json_ok "${state_json}"; then
+      sleep 0.5
+      continue
+    fi
+    row="$(_find_row_by_selector "${state_json}" "${sel}")"
+    if [[ -n "${row}" ]]; then
+      state="$(printf '%s' "${row}" | jq -r '.state // ""')"
+      if [[ "${state}" == "READY" ]]; then
+        printf '%s' "${row}"
+        return 0
+      fi
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
 _attach_console_json() {
   local sel="$1"
   "${SERIALWRAP_BIN}" --socket "${SOCKET}" session console-attach --selector "${sel}" --label "minicom:$$" 2>/dev/null || true
@@ -337,10 +390,47 @@ if [[ -n "${MINICOM_RAW_DEVICE:-}" ]]; then
   exit $?
 fi
 
-echo "minicom_router: broker not ready, no READY/ATTACHED session, and MINICOM_RAW_DEVICE not set" >&2
+reprobe_row=""
 if [[ "$(printf '%s' "${state_json:-}" | jq -r '.ok // false' 2>/dev/null || printf 'false')" == "true" ]]; then
+  if [[ -n "${row:-}" ]] && _row_needs_reprobe_hint "${row}"; then
+    reprobe_row="${row}"
+  elif [[ -n "${selector:-}" ]]; then
+    candidate_row="$(_find_row_by_selector "${state_json}" "${selector}")"
+    if [[ -n "${candidate_row}" ]] && _row_needs_reprobe_hint "${candidate_row}"; then
+      reprobe_row="${candidate_row}"
+    fi
+  else
+    reprobe_row="$(_find_first_reprobe_row "${state_json}")"
+  fi
+
+  if [[ -n "${reprobe_row}" ]]; then
+    reprobe_sel="$(printf '%s' "${reprobe_row}" | jq -r '.com // .session_id // ""')"
+    reprobe_state="$(printf '%s' "${reprobe_row}" | jq -r '.state // "-"')"
+    reprobe_error="$(printf '%s' "${reprobe_row}" | jq -r '.last_error // "-"')"
+    reprobe_attempts="$(printf '%s' "${reprobe_row}" | jq -r '.reprobe_attempts // 0')"
+    reprobe_exhausted="$(printf '%s' "${reprobe_row}" | jq -r '.reprobe_exhausted // false')"
+    echo "minicom_router: ${reprobe_sel:-session} 尚未 READY (state=${reprobe_state}, last_error=${reprobe_error}, reprobe_attempts=${reprobe_attempts})" >&2
+    if [[ "${reprobe_exhausted}" == "true" ]]; then
+      echo "minicom_router: serialwrap 自動重探已達上限；可手動執行 '${SERIALWRAP_BIN} session recover --selector ${reprobe_sel}'" >&2
+    else
+      echo "minicom_router: DUT 可能仍在開機，serialwrap 正在自動重探；可稍候，或手動執行 '${SERIALWRAP_BIN} session recover --selector ${reprobe_sel}'" >&2
+    fi
+    if [[ "${MINICOM_WAIT_READY}" == "1" && -n "${reprobe_sel}" ]]; then
+      echo "minicom_router: MINICOM_WAIT_READY=1，等待 ${reprobe_sel} 進入 READY（上限 ${MINICOM_WAIT_READY_TICKS} 次輪詢）" >&2
+      ready_row="$(_wait_ready_only_row "${reprobe_sel}")" || ready_row=""
+      if [[ -n "${ready_row}" ]]; then
+        _run_broker_minicom "${ready_row}" "$@"
+        exit $?
+      fi
+      echo "minicom_router: 等待 READY 逾時；可稍後重試或手動 recover" >&2
+    fi
+  else
+    echo "minicom_router: broker not ready, no READY/ATTACHED session, and MINICOM_RAW_DEVICE not set" >&2
+  fi
   echo "sessions:" >&2
-  printf '%s' "${state_json}" | jq -r '.sessions[]? | "  - \(.com) \(.alias) state=\(.state) last_error=\(.last_error // "-")"' >&2 || true
+  printf '%s' "${state_json}" | jq -r '.sessions[]? | "  - \(.com) \(.alias) state=\(.state) last_error=\(.last_error // "-") reprobe_attempts=\(.reprobe_attempts // 0) reprobe_exhausted=\(.reprobe_exhausted // false)"' >&2 || true
+else
+  echo "minicom_router: broker not ready, no READY/ATTACHED session, and MINICOM_RAW_DEVICE not set" >&2
 fi
 echo "hint: ${SERIALWRAP_BIN} daemon start --profile-dir ${PROFILE_DIR}" >&2
 echo "hint: ${SERIALWRAP_BIN} session list" >&2

@@ -19,6 +19,10 @@ from .constants import (
     HUMAN_ACTIVE_WINDOW_S,
     LOG_DIR,
     MAX_RECOVERY_LEASE_S,
+    REPROBE_BACKOFF_S,
+    REPROBE_MAX_ATTEMPTS,
+    REPROBE_MAX_INTERVAL_S,
+    REPROBE_RX_IDLE_S,
     STATE_PATH,
 )
 from .device_watcher import DeviceInfo
@@ -176,6 +180,9 @@ class SessionRuntime:
     last_probe_at: str | None = None
     last_rx_mono: float = 0.0
     last_tx_mono: float = 0.0
+    reprobe_attempts: int = 0
+    next_reprobe_at: float | None = None
+    reprobe_exhausted: bool = False
     # device handoff（issue #54）
     released_by: str | None = None
     released_at: str | None = None
@@ -215,6 +222,11 @@ class SessionRuntime:
             return "idle-healthy"
         return "quiet-suspicious"
 
+    def reset_reprobe_progress(self) -> None:
+        self.reprobe_attempts = 0
+        self.next_reprobe_at = None
+        self.reprobe_exhausted = False
+
     def to_public_dict(self) -> dict[str, Any]:
         console_count = 0
         if self.bridge is not None:
@@ -250,6 +262,9 @@ class SessionRuntime:
             "last_rx_at": self.last_rx_at,
             "last_tx_at": self.last_tx_at,
             "last_probe_at": self.last_probe_at,
+            "reprobe_attempts": self.reprobe_attempts,
+            "next_reprobe_at": self.next_reprobe_at,
+            "reprobe_exhausted": self.reprobe_exhausted,
             "idle_for_ms": self.compute_idle_ms(),
             "outstanding_commands": outstanding,
             "activity_classification": self.classify_activity(),
@@ -289,6 +304,12 @@ class SessionManager:
         self._devices: dict[str, DeviceInfo] = {}
         self._binding_overrides: dict[str, str] = {}
         self._attach_inflight: set[str] = set()
+        # readiness 自動重探（#69）：_reprobe_inflight 防止同一 session 重複 spawn auto worker；
+        # _reprobe_probe_locks 為 per-session probe 互斥（auto 用 non-blocking、manual attach/recover
+        # 用 blocking），避免 auto 與 manual 在同一 bridge 上並發 probe（Finding 2）。
+        self._reprobe_inflight: set[str] = set()
+        self._reprobe_probe_locks: dict[str, threading.Lock] = {}
+        self._reprobe_workers: list[threading.Thread] = []
         self._released_by_ids: set[str] = set()
         self._loaded_released: dict[str, dict[str, str | None]] = {}
         self._background: dict[str, BackgroundCapture] = {}
@@ -461,6 +482,227 @@ class SessionManager:
         with self._lock:
             self._rx_observers.append(observer)
 
+    def _reset_reprobe_progress_locked(self, session: SessionRuntime) -> None:
+        session.reset_reprobe_progress()
+
+    def _is_reprobe_prompt_error(self, state: str, last_error: str | None) -> bool:
+        if not last_error:
+            return False
+        prompt_related = (
+            last_error == "PROMPT_UNAVAILABLE"
+            or last_error == "PROMPT_TIMEOUT"
+            or last_error.endswith("_PROMPT_TIMEOUT")
+        )
+        if state == "ATTACHED":
+            return prompt_related
+        if state == "DETACHED":
+            return last_error == "PROMPT_TIMEOUT" or last_error.endswith("_PROMPT_TIMEOUT")
+        return False
+
+    def _rx_idle_enough(self, session: SessionRuntime, now: float) -> bool:
+        return session.last_rx_mono == 0.0 or (now - session.last_rx_mono) >= REPROBE_RX_IDLE_S
+
+    def _human_active_locked(self, session: SessionRuntime, now: float) -> bool:
+        if session.bridge is None or session.interactive_session_id is None:
+            return False
+        lease = self._interactive.get(session.interactive_session_id)
+        if lease is None or not lease.owner.startswith("human:"):
+            return False
+        client_id = lease.owner.split(":", 1)[1]
+        if not session.bridge.console_has_external_peer(client_id):
+            return False
+        snapshot = session.bridge.snapshot()
+        if snapshot.get("interactive_owner") != lease.owner:
+            return False
+        last = snapshot.get("last_human_input_at")
+        if not isinstance(last, (int, float)) or isinstance(last, bool):
+            return False
+        return (now - last) <= HUMAN_ACTIVE_WINDOW_S
+
+    def _record_reprobe_attempt_locked(self, session: SessionRuntime, now: float) -> None:
+        session.reprobe_attempts += 1
+        if session.reprobe_attempts >= REPROBE_MAX_ATTEMPTS:
+            session.reprobe_exhausted = True
+            session.next_reprobe_at = None
+            return
+        interval = min(
+            REPROBE_BACKOFF_S * (2 ** max(session.reprobe_attempts - 1, 0)),
+            REPROBE_MAX_INTERVAL_S,
+        )
+        session.next_reprobe_at = now + interval
+
+    def _prepare_reprobe_locked(
+        self, session: SessionRuntime, now: float
+    ) -> tuple[str, SessionRuntime, UARTBridge | None, str] | None:
+        by_id = session.profile.device_by_id
+        if not by_id or by_id in self._released_by_ids or by_id not in self._devices:
+            return None
+        if session.state in {"READY", "RELEASED", "FLASHING", "ATTACHING", "RECOVERING"}:
+            return None
+        if session.reprobe_exhausted:
+            return None
+        if session.reprobe_attempts >= REPROBE_MAX_ATTEMPTS:
+            session.reprobe_exhausted = True
+            session.next_reprobe_at = None
+            return None
+        if session.next_reprobe_at is not None and now < session.next_reprobe_at:
+            return None
+        if not self._is_reprobe_prompt_error(session.state, session.last_error):
+            return None
+        if not self._rx_idle_enough(session, now):
+            return None
+        if self._human_active_locked(session, now):
+            return None
+
+        if session.state == "ATTACHED":
+            if session.bridge is None:
+                return None
+            # 已有 auto worker 在跑這個 session → 不重複 spawn（single-flight，Finding 2）。
+            if session.session_id in self._reprobe_inflight:
+                return None
+            interval = min(
+                REPROBE_BACKOFF_S * (2 ** max(session.reprobe_attempts, 0)),
+                REPROBE_MAX_INTERVAL_S,
+            )
+            session.next_reprobe_at = now + interval
+            self._reprobe_inflight.add(session.session_id)
+            return ("probe", session, session.bridge, by_id)
+
+        if session.state == "DETACHED":
+            session.state = "ATTACHING"
+            session.last_error = None
+            self._record_reprobe_attempt_locked(session, now)
+            return ("attach", session, None, by_id)
+
+        return None
+
+    def _finish_probe_reprobe(self, session_id: str, bridge: UARTBridge, result: dict[str, Any], now: float) -> None:
+        with self._lock:
+            current = self._sessions.get(session_id)
+            if current is None or current.bridge is not bridge:
+                return
+            result_session = result.get("session") if isinstance(result, dict) else None
+            result_state = result_session.get("state") if isinstance(result_session, dict) else current.state
+            if current.state == "READY" or result_state == "READY":
+                self._reset_reprobe_progress_locked(current)
+            else:
+                self._record_reprobe_attempt_locked(current, now)
+
+    def _reprobe_probe_lock_locked(self, session_id: str) -> threading.Lock:
+        """取得（必要時建立）per-session probe 互斥鎖；須在持有 self._lock 時呼叫。"""
+        lock = self._reprobe_probe_locks.get(session_id)
+        if lock is None:
+            lock = threading.Lock()
+            self._reprobe_probe_locks[session_id] = lock
+        return lock
+
+    def _reprobe_target_still_valid_locked(
+        self, session: SessionRuntime, bridge: UARTBridge, now: float
+    ) -> bool:
+        """auto worker 真正寫 probe 前的最終驗證（須持有 self._lock）。
+
+        防止 job 收集後、probe 前狀態翻轉的競態（Finding 1）：例如 flash broker 搶進
+        FLASHING、人類介入、device 被釋放/移除等。任一條件不再成立即放棄本次重探。
+        """
+        if session.bridge is not bridge:
+            return False
+        by_id = session.profile.device_by_id
+        if not by_id or by_id in self._released_by_ids or by_id not in self._devices:
+            return False
+        if session.state != "ATTACHED":
+            return False
+        if session.reprobe_exhausted:
+            return False
+        if not self._is_reprobe_prompt_error(session.state, session.last_error):
+            return False
+        if self._human_active_locked(session, now):
+            return False
+        return True
+
+    def _spawn_reprobe_probe(self, session_id: str, bridge: UARTBridge) -> None:
+        """在背景 worker 執行 ATTACHED 的 readiness probe，避免阻塞 DeviceWatcher tick（Finding 3）。"""
+        with self._lock:
+            probe_lock = self._reprobe_probe_lock_locked(session_id)
+
+        def _run() -> None:
+            acquired = probe_lock.acquire(blocking=False)
+            try:
+                if not acquired:
+                    # manual attach/recover 正持有 probe 鎖 → 本次跳過，交給 backoff 後重試（Finding 2）。
+                    return
+                start = time.monotonic()
+                with self._lock:
+                    session = self._sessions.get(session_id)
+                    if session is None or session.bridge is not bridge:
+                        return
+                    if not self._reprobe_target_still_valid_locked(session, bridge, start):
+                        return
+                try:
+                    result = self._probe_existing_bridge(session, bridge)
+                except Exception as exc:
+                    # backoff 以 probe「完成時間」計算，而非 start：probe 可能阻塞到 profile timeout
+                    # （10/15s），用 start 會讓 next_reprobe_at 落在過去、下一 tick 立刻重探、
+                    # 慢速/靜默開機時過早 exhausted（#69 Finding round6）。
+                    done = time.monotonic()
+                    with self._lock:
+                        current = self._sessions.get(session_id)
+                        if (
+                            current is not None
+                            and current.bridge is bridge
+                            and current.state not in {"FLASHING", "RELEASED"}
+                        ):
+                            current.state = "ATTACHED"
+                            current.last_error = f"REPROBE_FAILED:{type(exc).__name__}"
+                            self._record_reprobe_attempt_locked(current, done)
+                    return
+                self._finish_probe_reprobe(session_id, bridge, result, time.monotonic())
+            finally:
+                if acquired:
+                    probe_lock.release()
+                with self._lock:
+                    self._reprobe_inflight.discard(session_id)
+
+        thread = threading.Thread(target=_run, name=f"serialwrap-reprobe-{session_id}", daemon=True)
+        with self._lock:
+            self._reprobe_workers = [t for t in self._reprobe_workers if t.is_alive()]
+            self._reprobe_workers.append(thread)
+        thread.start()
+
+    def join_reprobe_workers(self, timeout: float | None = None) -> None:
+        """等待目前所有 readiness probe worker 結束（供測試與優雅關閉使用）。"""
+        with self._lock:
+            workers = list(self._reprobe_workers)
+        for thread in workers:
+            thread.join(timeout)
+        with self._lock:
+            self._reprobe_workers = [t for t in self._reprobe_workers if t.is_alive()]
+
+    def reconcile_readiness(self) -> None:
+        """週期性重探可復原的非 READY session。
+
+        本方法由 DeviceWatcher tick 同步呼叫，因此只在 lock 內收集候選、不在此同步等待 probe；
+        ATTACHED 的 readiness probe 改交背景 worker（Finding 3），DETACHED 走既有 threaded _spawn_attach。
+        """
+        now = time.monotonic()
+        jobs: list[tuple[str, str, UARTBridge | None, str]] = []
+        with self._lock:
+            for session in list(self._sessions.values()):
+                prepared = self._prepare_reprobe_locked(session, now)
+                if prepared is None:
+                    continue
+                action, prepared_session, bridge, by_id = prepared
+                jobs.append((action, prepared_session.session_id, bridge, by_id))
+
+        for action, session_id, bridge, by_id in jobs:
+            if action == "attach":
+                self._spawn_attach(by_id)
+                continue
+            if bridge is None:
+                with self._lock:
+                    self._reprobe_inflight.discard(session_id)
+                continue
+            self._spawn_reprobe_probe(session_id, bridge)
+
     def set_alias_for_session(self, session_id: str, alias: str) -> dict[str, Any]:
         with self._lock:
             session = self._sessions.get(session_id)
@@ -553,6 +795,7 @@ class SessionManager:
         session.state = "DETACHED"
         session.detached_at = now_iso()
         session.last_error = reason
+        self._reset_reprobe_progress_locked(session)
         if session.interactive_session_id is not None:
             lease = self._interactive.pop(session.interactive_session_id, None)
             if lease is not None:
@@ -573,6 +816,10 @@ class SessionManager:
             session = self.get_session(selector)
             if session is None:
                 return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            # FLASHING 期間不得 detach bridge——否則會在 MCU 燒錄途中切斷 transport、寫壞韌體（#69 r5）。
+            # 與 cmd submit / interactive 既有的 FLASHING_BUSY 守法一致；須先 exit_flashing。
+            if session.state == "FLASHING":
+                return {"ok": False, "error_code": "FLASHING_BUSY", "selector": session.profile.com, "session": session.to_public_dict()}
             if session.state == "RELEASED" or session.profile.device_by_id in self._released_by_ids:
                 return {"ok": True, "released": True, "session": session.to_public_dict()}
             self._detach_session_locked(session, reason="CLEARED")
@@ -591,6 +838,9 @@ class SessionManager:
             session = self.get_session(selector)
             if session is None:
                 return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            # FLASHING 期間不得 release/detach——避免切斷正在進行的 MCU 燒錄 transport（#69 r5）。須先 exit_flashing。
+            if session.state == "FLASHING":
+                return {"ok": False, "error_code": "FLASHING_BUSY", "selector": session.profile.com, "session": session.to_public_dict()}
             if session.state == "RELEASED":
                 return {"ok": True, "already_released": True, "session": session.to_public_dict()}
             by_id = session.profile.device_by_id
@@ -601,6 +851,7 @@ class SessionManager:
             session.released_by = source
             session.released_at = now_iso()
             session.released_reason = reason
+            self._reset_reprobe_progress_locked(session)
             if by_id:
                 self._released_by_ids.add(by_id)
             public = session.to_public_dict()
@@ -628,12 +879,16 @@ class SessionManager:
             session = self.get_session(selector)
             if session is None:
                 return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            # 防禦縱深（#69 r2/r4）：不論目前 state 為何，只要有 bridge 就無條件解除 flash 模式。
+            # 即使某競態路徑（command timeout recovery / probe）已把 state 搶改出 FLASHING，
+            # 也確保 bridge 不會永久卡在 flash 模式、靜默丟棄所有非 flash 寫入。
+            if session.bridge is not None:
+                session.bridge.set_flash_mode(False)
             if session.state != "FLASHING":
+                session.flash_prev_state = None
                 return {"ok": True, "not_flashing": True, "session": session.to_public_dict()}
             session.state = session.flash_prev_state or ("READY" if session.bridge is not None else "DETACHED")
             session.flash_prev_state = None
-            if session.bridge is not None:
-                session.bridge.set_flash_mode(False)   # 解除 console 注入封鎖
             public = session.to_public_dict()
         return {"ok": True, "session": public}
 
@@ -709,6 +964,7 @@ class SessionManager:
             session.released_reason = None
             session.state = "ATTACHING"
             session.last_error = None
+            self._reset_reprobe_progress_locked(session)
             public = session.to_public_dict()
         self._save_state()
         self._spawn_attach(by_id)
@@ -723,6 +979,9 @@ class SessionManager:
             session = self.get_session(selector)
             if session is None:
                 return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            # FLASHING 期間不得 rebind——rebind 會 detach 舊 bridge、切斷燒錄 transport（#69 r5）。須先 exit_flashing。
+            if session.state == "FLASHING":
+                return {"ok": False, "error_code": "FLASHING_BUSY", "selector": session.profile.com, "session": session.to_public_dict()}
             for other in self._sessions.values():
                 if other.session_id != session.session_id and other.profile.device_by_id == device_by_id:
                     return {
@@ -752,13 +1011,16 @@ class SessionManager:
                 session.released_at = None
                 session.released_reason = None
                 session.state = "DETACHED"
+                self._reset_reprobe_progress_locked(session)
             session.profile = dataclasses.replace(session.profile, device_by_id=device_by_id)
+            self._reset_reprobe_progress_locked(session)
             self._binding_overrides[session.session_id] = device_by_id
             self._save_state()
             has_device = device_by_id in self._devices
             if has_device:
                 session.state = "ATTACHING"
                 session.last_error = None
+                self._reset_reprobe_progress_locked(session)
 
         if has_device:
             self._spawn_attach(device_by_id)
@@ -806,11 +1068,16 @@ class SessionManager:
             if result is None and not should_probe:
                 session.state = "ATTACHING"
                 session.last_error = None
+                self._reset_reprobe_progress_locked(session)
         post.execute()
         if result is not None:
             return result
         if should_probe and bridge is not None:
-            return self._probe_existing_bridge(session, bridge)
+            # 與 auto 自動重探共用 per-session probe 互斥，避免並發 probe 同一 bridge（Finding 2）。
+            with self._lock:
+                probe_lock = self._reprobe_probe_lock_locked(session.session_id)
+            with probe_lock:
+                return self._probe_existing_bridge(session, bridge)
         self._spawn_attach(by_id)
         return {"ok": True, "session": session.to_public_dict()}
 
@@ -844,6 +1111,13 @@ class SessionManager:
         )
         removed = sorted(set(prev.keys()) - set(devices.keys()))
         added = sorted(set(devices.keys()) - set(prev.keys()))
+
+        changed_by_ids = set(removed) | set(changed) | set(added)
+        if changed_by_ids:
+            with self._lock:
+                for session in self._sessions.values():
+                    if session.profile.device_by_id in changed_by_ids:
+                        self._reset_reprobe_progress_locked(session)
 
         for by_id in [*removed, *changed]:
             self._detach_by_id(by_id, reason="DEVICE_REBOUND_REQUIRED" if by_id in changed else "DEVICE_REMOVED")
@@ -977,6 +1251,12 @@ class SessionManager:
             current = self._sessions.get(session.session_id)
             if current is None or current.bridge is not bridge:
                 return {"ok": False, "error_code": "SESSION_NOT_READY"}
+            # probe 在 lock 外阻塞期間，session 可能被 flash broker 搶進 FLASHING、或被 device
+            # handoff 釋放成 RELEASED。此時不得用 probe 結果覆寫狀態，否則會把 FLASHING 打回
+            # ATTACHED → flasher 結束時 exit_flashing 見 state≠FLASHING 提早 return、bridge 永久
+            # 卡在 flash 模式並靜默丟棄非 flash 寫入（#69 Finding 1 round2）。
+            if current.state in {"FLASHING", "RELEASED"}:
+                return {"ok": False, "error_code": "STATE_CHANGED", "session": current.to_public_dict()}
             current.recovering = False
             current.recovery_started_at = None
             current.pending_auto_login = False
@@ -984,6 +1264,7 @@ class SessionManager:
                 current.state = "READY"
                 current.last_error = None
                 current.last_ready_at = now_iso()
+                self._reset_reprobe_progress_locked(current)
                 notify_ready = True
             else:
                 current.state = "ATTACHED"
@@ -1130,6 +1411,7 @@ class SessionManager:
                     session.recovering = False
                     session.recovery_started_at = None
                     session.pending_auto_login = False
+                    self._reset_reprobe_progress_locked(session)
                     notify_ready = True
                 else:
                     session.state = "ATTACHED"
@@ -1299,6 +1581,7 @@ class SessionManager:
                     session.recovering = False
                     session.recovery_started_at = None
                     session.pending_auto_login = False
+                    self._reset_reprobe_progress_locked(session)
                     notify_ready = True
                 else:
                     session.state = "ATTACHED"
@@ -1480,6 +1763,11 @@ class SessionManager:
     def _transition_to_attached(self, session: SessionRuntime, *, reason: str) -> None:
         notify_not_ready = False
         with self._lock:
+            # 在途 command 的 timeout/recovery 可能在 flash endpoint 已把 session 移入 FLASHING、
+            # 或 device handoff 釋放成 RELEASED 之後才跑到這；此時不得覆寫狀態，否則 FLASHING 被打回
+            # ATTACHED → exit_flashing 提早 return、bridge 卡 flash 模式（#69 Finding round4）。
+            if session.state in {"FLASHING", "RELEASED"}:
+                return
             if session.state == "READY":
                 notify_not_ready = True
             session.state = "ATTACHED"
@@ -1537,12 +1825,16 @@ class SessionManager:
                             session = self._sessions.get(session_id)
                             if session is None or session.bridge is not bridge:
                                 continue
+                            # unlocked ensure_ready 期間 session 可能被搶進 FLASHING/RELEASED；不得覆寫（#69 r4）。
+                            if session.state in {"FLASHING", "RELEASED"}:
+                                return
                             session.state = "READY"
                             session.last_error = None
                             session.last_ready_at = now_iso()
                             session.recovering = False
                             session.recovery_started_at = None
                             session.pending_auto_login = False
+                            self._reset_reprobe_progress_locked(session)
                         self._on_ready(session_id)
                         return
                     with self._lock:
@@ -1556,6 +1848,9 @@ class SessionManager:
             with self._lock:
                 session = self._sessions.get(session_id)
                 if session is None:
+                    return
+                # 同理：recovery 逾時收尾不得覆寫已搶進的 FLASHING/RELEASED（#69 r4）。
+                if session.state in {"FLASHING", "RELEASED"}:
                     return
                 session.recovering = False
                 session.recovery_started_at = None
@@ -1886,6 +2181,7 @@ class SessionManager:
                         chunks=[stdout] if stdout else None,
                         error_code="PROMPT_TIMEOUT_RECOVERED",
                     )
+                    self._reset_reprobe_progress_locked(session)
                 return {
                     "ok": True,
                     "error_code": "PROMPT_TIMEOUT_RECOVERED",
@@ -2463,11 +2759,19 @@ class SessionManager:
                     "recommended_action": "device_attach",
                     "session": session.to_public_dict(),
                 }
+            # FLASHING 期間連 force recover 也不得介入——_force_recover 會 detach/重連 bridge，
+            # 切斷正在進行的 MCU 燒錄 transport（#69 r5）。須先 exit_flashing。
+            if session.state == "FLASHING":
+                return {"ok": False, "error_code": "FLASHING_BUSY", "selector": session.profile.com, "session": session.to_public_dict()}
+            # 顯式人工 recover 視為重新介入：先清掉 reprobe 上限/進度，讓自動重探可在之後重新接手。
+            # 否則 exhausted 的 ATTACHED session 一旦手動 recover 仍失敗，將永遠被 reconcile 跳過（Finding 4）。
+            self._reset_reprobe_progress_locked(session)
             if session.bridge is None:
                 by_id = session.profile.device_by_id
                 if by_id and by_id in self._devices:
                     session.state = "ATTACHING"
                     session.last_error = None
+                    self._reset_reprobe_progress_locked(session)
                     self._spawn_attach(by_id)
                     return {"ok": True, "recovering": False, "action": "REATTACH", "session": session.to_public_dict()}
                 return {"ok": False, "error_code": "SESSION_NOT_READY", "session": session.to_public_dict()}
@@ -2483,7 +2787,11 @@ class SessionManager:
             else:
                 bridge = session.bridge
         if reprobe:
-            result = self._probe_existing_bridge(session, bridge)
+            # 與 auto 自動重探共用 per-session probe 互斥（Finding 2）。
+            with self._lock:
+                probe_lock = self._reprobe_probe_lock_locked(session.session_id)
+            with probe_lock:
+                result = self._probe_existing_bridge(session, bridge)
             if not result.get("ok"):
                 if force:
                     return self._force_recover(session)

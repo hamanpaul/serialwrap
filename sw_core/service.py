@@ -195,6 +195,7 @@ class SerialwrapService:
         self._watcher = DeviceWatcher(
             by_id_dir, self._on_device_change,
             extra_scan_dirs=[by_path_dir],
+            on_tick=self._sessions.reconcile_readiness,
         )
         self._mcu_registry = McuPatternRegistry.load(None)
         # flash 雙向接線狀態（probe buffer、active com、master fd）

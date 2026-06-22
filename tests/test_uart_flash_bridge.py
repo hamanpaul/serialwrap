@@ -2,6 +2,9 @@
 
 測試 UARTBridge.flash_tx 原樣送出（不行處理）與 mirror_termios_from baud 鏡射。
 """
+import threading
+import time
+
 from sw_core.uart_io import UARTBridge
 from sw_core.config import UartProfile
 
@@ -51,3 +54,54 @@ def test_flash_mode_blocks_console_injection(monkeypatch):
     b._handle_console_rx(_Client(), b"echo pwn\n")
     assert sent == []
     b.set_flash_mode(False)
+
+
+def test_flash_mode_drops_non_flash_send_bytes(monkeypatch):
+    """FLASHING 期間，非 flasher 來源（system probe / reconcile 自動重探等）的 send_bytes
+    必須在寫入 choke point 被丟棄，避免競態下汙染 SBL binary 串流（C2，#69 Finding 1）。"""
+    b = _bridge()
+    written = []
+    monkeypatch.setattr(b, "_write_all", lambda fd, payload: written.append(payload))
+    b._serial_fd = 1  # 假 fd，讓非 flash 路徑能走到 _write_all（已被 monkeypatch）
+
+    b.set_flash_mode(True)
+    # system probe 寫入（login_fsm.probe_ready/ensure_ready 走的就是 source="system"）→ 應被丟棄
+    b.send_bytes(b"\rprobe\n", source="system")
+    assert written == []
+    # 偽造 source 不得繞過 gate：授權綁內部能力而非可控的 source 字串（#69 Finding round3）
+    b.send_bytes(b"pwn\n", source="flash-agent")
+    b.send_bytes(b"pwn2\n", source="flash")
+    assert written == []
+    # flasher 自身（flash_tx，內部能力）仍可寫
+    b.flash_tx(bytes([0x80, 0x55, 0x00]))
+    assert written == [bytes([0x80, 0x55, 0x00])]
+
+    # flash OFF 後，system 寫入恢復正常
+    b.set_flash_mode(False)
+    b.send_bytes(b"cmd\n", source="system")
+    assert written == [bytes([0x80, 0x55, 0x00]), b"cmd\n"]
+
+
+def test_set_flash_mode_serializes_with_in_flight_write(monkeypatch):
+    """set_flash_mode 須與寫入序列化（共用 _write_lock），使 flash 開啟不會插進
+    『檢查 flash_mode → 實際寫入』的空隙、讓非 flash byte 在 flash 開始後仍寫出（#69 Finding 2 round2）。"""
+    b = _bridge()
+    b._serial_fd = 1
+    monkeypatch.setattr(b, "_write_all", lambda fd, payload: None)
+
+    b._write_lock.acquire()  # 模擬一筆寫入正持有 _write_lock
+    done = []
+
+    def flip():
+        b.set_flash_mode(True)
+        done.append(True)
+
+    t = threading.Thread(target=flip)
+    t.start()
+    time.sleep(0.15)
+    assert done == []              # set_flash_mode 被 _write_lock 擋住，旗標尚未翻轉
+    assert b._flash_mode is False
+    b._write_lock.release()
+    t.join(2.0)
+    assert done == [True]
+    assert b._flash_mode is True
