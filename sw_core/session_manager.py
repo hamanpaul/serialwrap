@@ -812,6 +812,10 @@ class SessionManager:
             session = self.get_session(selector)
             if session is None:
                 return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            # FLASHING 期間不得 detach bridge——否則會在 MCU 燒錄途中切斷 transport、寫壞韌體（#69 r5）。
+            # 與 cmd submit / interactive 既有的 FLASHING_BUSY 守法一致；須先 exit_flashing。
+            if session.state == "FLASHING":
+                return {"ok": False, "error_code": "FLASHING_BUSY", "selector": session.profile.com, "session": session.to_public_dict()}
             if session.state == "RELEASED" or session.profile.device_by_id in self._released_by_ids:
                 return {"ok": True, "released": True, "session": session.to_public_dict()}
             self._detach_session_locked(session, reason="CLEARED")
@@ -830,6 +834,9 @@ class SessionManager:
             session = self.get_session(selector)
             if session is None:
                 return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            # FLASHING 期間不得 release/detach——避免切斷正在進行的 MCU 燒錄 transport（#69 r5）。須先 exit_flashing。
+            if session.state == "FLASHING":
+                return {"ok": False, "error_code": "FLASHING_BUSY", "selector": session.profile.com, "session": session.to_public_dict()}
             if session.state == "RELEASED":
                 return {"ok": True, "already_released": True, "session": session.to_public_dict()}
             by_id = session.profile.device_by_id
@@ -968,6 +975,9 @@ class SessionManager:
             session = self.get_session(selector)
             if session is None:
                 return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            # FLASHING 期間不得 rebind——rebind 會 detach 舊 bridge、切斷燒錄 transport（#69 r5）。須先 exit_flashing。
+            if session.state == "FLASHING":
+                return {"ok": False, "error_code": "FLASHING_BUSY", "selector": session.profile.com, "session": session.to_public_dict()}
             for other in self._sessions.values():
                 if other.session_id != session.session_id and other.profile.device_by_id == device_by_id:
                     return {
@@ -2745,6 +2755,10 @@ class SessionManager:
                     "recommended_action": "device_attach",
                     "session": session.to_public_dict(),
                 }
+            # FLASHING 期間連 force recover 也不得介入——_force_recover 會 detach/重連 bridge，
+            # 切斷正在進行的 MCU 燒錄 transport（#69 r5）。須先 exit_flashing。
+            if session.state == "FLASHING":
+                return {"ok": False, "error_code": "FLASHING_BUSY", "selector": session.profile.com, "session": session.to_public_dict()}
             # 顯式人工 recover 視為重新介入：先清掉 reprobe 上限/進度，讓自動重探可在之後重新接手。
             # 否則 exhausted 的 ATTACHED session 一旦手動 recover 仍失敗，將永遠被 reconcile 跳過（Finding 4）。
             self._reset_reprobe_progress_locked(session)
