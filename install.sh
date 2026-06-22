@@ -30,7 +30,7 @@ cp -a "${SCRIPT_DIR}/docs/." "${TARGET_DIR}/docs/"
 
 # Expose the repo-canonical agent skill via the shared skills dir (symlink to repo source).
 mkdir -p "${HOME}/.agents/skills"
-ln -sfn "${SCRIPT_DIR}/skills/serialwrap" "${HOME}/.agents/skills/serialwrap"
+ln -sfn "${SCRIPT_DIR}/sw_core/assets/skill" "${HOME}/.agents/skills/serialwrap"
 
 # Remove legacy artifacts that are no longer part of the mainline design.
 rm -f "${TARGET_DIR}/serialwrap_lib.py"
