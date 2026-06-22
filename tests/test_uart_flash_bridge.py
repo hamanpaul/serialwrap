@@ -51,3 +51,25 @@ def test_flash_mode_blocks_console_injection(monkeypatch):
     b._handle_console_rx(_Client(), b"echo pwn\n")
     assert sent == []
     b.set_flash_mode(False)
+
+
+def test_flash_mode_drops_non_flash_send_bytes(monkeypatch):
+    """FLASHING 期間，非 flasher 來源（system probe / reconcile 自動重探等）的 send_bytes
+    必須在寫入 choke point 被丟棄，避免競態下汙染 SBL binary 串流（C2，#69 Finding 1）。"""
+    b = _bridge()
+    written = []
+    monkeypatch.setattr(b, "_write_all", lambda fd, payload: written.append(payload))
+    b._serial_fd = 1  # 假 fd，讓非 flash 路徑能走到 _write_all（已被 monkeypatch）
+
+    b.set_flash_mode(True)
+    # system probe 寫入（login_fsm.probe_ready/ensure_ready 走的就是 source="system"）→ 應被丟棄
+    b.send_bytes(b"\rprobe\n", source="system")
+    assert written == []
+    # flasher 自身仍可寫
+    b.flash_tx(bytes([0x80, 0x55, 0x00]))
+    assert written == [bytes([0x80, 0x55, 0x00])]
+
+    # flash OFF 後，system 寫入恢復正常
+    b.set_flash_mode(False)
+    b.send_bytes(b"cmd\n", source="system")
+    assert written == [bytes([0x80, 0x55, 0x00]), b"cmd\n"]

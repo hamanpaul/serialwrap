@@ -489,6 +489,11 @@ class UARTBridge:
 
     def send_bytes(self, payload: bytes, *, source: str, cmd_id: str | None = None, log: bool = True) -> None:
         with self._state_lock:
+            if self._flash_mode and not source.startswith("flash"):
+                # FLASHING 期間僅允許 flasher（source="flash"）寫入；丟棄其他所有來源
+                # （system probe / reconcile 自動重探 / self_test / agent 注入等），
+                # 防止競態下把 probe bytes 寫進燒錄中的 device、汙染 SBL binary 串流（C2，#69 Finding 1）。
+                return
             serial_fd = self._serial_fd
         if serial_fd is None:
             raise RuntimeError("serial not ready")

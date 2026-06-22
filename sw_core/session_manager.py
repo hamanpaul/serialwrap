@@ -304,6 +304,12 @@ class SessionManager:
         self._devices: dict[str, DeviceInfo] = {}
         self._binding_overrides: dict[str, str] = {}
         self._attach_inflight: set[str] = set()
+        # readiness 自動重探（#69）：_reprobe_inflight 防止同一 session 重複 spawn auto worker；
+        # _reprobe_probe_locks 為 per-session probe 互斥（auto 用 non-blocking、manual attach/recover
+        # 用 blocking），避免 auto 與 manual 在同一 bridge 上並發 probe（Finding 2）。
+        self._reprobe_inflight: set[str] = set()
+        self._reprobe_probe_locks: dict[str, threading.Lock] = {}
+        self._reprobe_workers: list[threading.Thread] = []
         self._released_by_ids: set[str] = set()
         self._loaded_released: dict[str, dict[str, str | None]] = {}
         self._background: dict[str, BackgroundCapture] = {}
@@ -551,11 +557,15 @@ class SessionManager:
         if session.state == "ATTACHED":
             if session.bridge is None:
                 return None
+            # 已有 auto worker 在跑這個 session → 不重複 spawn（single-flight，Finding 2）。
+            if session.session_id in self._reprobe_inflight:
+                return None
             interval = min(
                 REPROBE_BACKOFF_S * (2 ** max(session.reprobe_attempts, 0)),
                 REPROBE_MAX_INTERVAL_S,
             )
             session.next_reprobe_at = now + interval
+            self._reprobe_inflight.add(session.session_id)
             return ("probe", session, session.bridge, by_id)
 
         if session.state == "DETACHED":
@@ -578,8 +588,93 @@ class SessionManager:
             else:
                 self._record_reprobe_attempt_locked(current, now)
 
+    def _reprobe_probe_lock_locked(self, session_id: str) -> threading.Lock:
+        """取得（必要時建立）per-session probe 互斥鎖；須在持有 self._lock 時呼叫。"""
+        lock = self._reprobe_probe_locks.get(session_id)
+        if lock is None:
+            lock = threading.Lock()
+            self._reprobe_probe_locks[session_id] = lock
+        return lock
+
+    def _reprobe_target_still_valid_locked(
+        self, session: SessionRuntime, bridge: UARTBridge, now: float
+    ) -> bool:
+        """auto worker 真正寫 probe 前的最終驗證（須持有 self._lock）。
+
+        防止 job 收集後、probe 前狀態翻轉的競態（Finding 1）：例如 flash broker 搶進
+        FLASHING、人類介入、device 被釋放/移除等。任一條件不再成立即放棄本次重探。
+        """
+        if session.bridge is not bridge:
+            return False
+        by_id = session.profile.device_by_id
+        if not by_id or by_id in self._released_by_ids or by_id not in self._devices:
+            return False
+        if session.state != "ATTACHED":
+            return False
+        if session.reprobe_exhausted:
+            return False
+        if not self._is_reprobe_prompt_error(session.state, session.last_error):
+            return False
+        if self._human_active_locked(session, now):
+            return False
+        return True
+
+    def _spawn_reprobe_probe(self, session_id: str, bridge: UARTBridge) -> None:
+        """在背景 worker 執行 ATTACHED 的 readiness probe，避免阻塞 DeviceWatcher tick（Finding 3）。"""
+        with self._lock:
+            probe_lock = self._reprobe_probe_lock_locked(session_id)
+
+        def _run() -> None:
+            acquired = probe_lock.acquire(blocking=False)
+            try:
+                if not acquired:
+                    # manual attach/recover 正持有 probe 鎖 → 本次跳過，交給 backoff 後重試（Finding 2）。
+                    return
+                now = time.monotonic()
+                with self._lock:
+                    session = self._sessions.get(session_id)
+                    if session is None or session.bridge is not bridge:
+                        return
+                    if not self._reprobe_target_still_valid_locked(session, bridge, now):
+                        return
+                try:
+                    result = self._probe_existing_bridge(session, bridge)
+                except Exception as exc:
+                    with self._lock:
+                        current = self._sessions.get(session_id)
+                        if current is not None and current.bridge is bridge:
+                            current.state = "ATTACHED"
+                            current.last_error = f"REPROBE_FAILED:{type(exc).__name__}"
+                            self._record_reprobe_attempt_locked(current, now)
+                    return
+                self._finish_probe_reprobe(session_id, bridge, result, now)
+            finally:
+                if acquired:
+                    probe_lock.release()
+                with self._lock:
+                    self._reprobe_inflight.discard(session_id)
+
+        thread = threading.Thread(target=_run, name=f"serialwrap-reprobe-{session_id}", daemon=True)
+        with self._lock:
+            self._reprobe_workers = [t for t in self._reprobe_workers if t.is_alive()]
+            self._reprobe_workers.append(thread)
+        thread.start()
+
+    def join_reprobe_workers(self, timeout: float | None = None) -> None:
+        """等待目前所有 readiness probe worker 結束（供測試與優雅關閉使用）。"""
+        with self._lock:
+            workers = list(self._reprobe_workers)
+        for thread in workers:
+            thread.join(timeout)
+        with self._lock:
+            self._reprobe_workers = [t for t in self._reprobe_workers if t.is_alive()]
+
     def reconcile_readiness(self) -> None:
-        """週期性重探可復原的非 READY session。"""
+        """週期性重探可復原的非 READY session。
+
+        本方法由 DeviceWatcher tick 同步呼叫，因此只在 lock 內收集候選、不在此同步等待 probe；
+        ATTACHED 的 readiness probe 改交背景 worker（Finding 3），DETACHED 走既有 threaded _spawn_attach。
+        """
         now = time.monotonic()
         jobs: list[tuple[str, str, UARTBridge | None, str]] = []
         with self._lock:
@@ -595,21 +690,10 @@ class SessionManager:
                 self._spawn_attach(by_id)
                 continue
             if bridge is None:
-                continue
-            session = self.get_session(session_id)
-            if session is None:
-                continue
-            try:
-                result = self._probe_existing_bridge(session, bridge)
-            except Exception as exc:
                 with self._lock:
-                    current = self._sessions.get(session_id)
-                    if current is not None and current.bridge is bridge:
-                        current.state = "ATTACHED"
-                        current.last_error = f"REPROBE_FAILED:{type(exc).__name__}"
-                        self._record_reprobe_attempt_locked(current, now)
+                    self._reprobe_inflight.discard(session_id)
                 continue
-            self._finish_probe_reprobe(session_id, bridge, result, now)
+            self._spawn_reprobe_probe(session_id, bridge)
 
     def set_alias_for_session(self, session_id: str, alias: str) -> dict[str, Any]:
         with self._lock:
@@ -967,7 +1051,11 @@ class SessionManager:
         if result is not None:
             return result
         if should_probe and bridge is not None:
-            return self._probe_existing_bridge(session, bridge)
+            # 與 auto 自動重探共用 per-session probe 互斥，避免並發 probe 同一 bridge（Finding 2）。
+            with self._lock:
+                probe_lock = self._reprobe_probe_lock_locked(session.session_id)
+            with probe_lock:
+                return self._probe_existing_bridge(session, bridge)
         self._spawn_attach(by_id)
         return {"ok": True, "session": session.to_public_dict()}
 
@@ -2632,6 +2720,9 @@ class SessionManager:
                     "recommended_action": "device_attach",
                     "session": session.to_public_dict(),
                 }
+            # 顯式人工 recover 視為重新介入：先清掉 reprobe 上限/進度，讓自動重探可在之後重新接手。
+            # 否則 exhausted 的 ATTACHED session 一旦手動 recover 仍失敗，將永遠被 reconcile 跳過（Finding 4）。
+            self._reset_reprobe_progress_locked(session)
             if session.bridge is None:
                 by_id = session.profile.device_by_id
                 if by_id and by_id in self._devices:
@@ -2653,7 +2744,11 @@ class SessionManager:
             else:
                 bridge = session.bridge
         if reprobe:
-            result = self._probe_existing_bridge(session, bridge)
+            # 與 auto 自動重探共用 per-session probe 互斥（Finding 2）。
+            with self._lock:
+                probe_lock = self._reprobe_probe_lock_locked(session.session_id)
+            with probe_lock:
+                result = self._probe_existing_bridge(session, bridge)
             if not result.get("ok"):
                 if force:
                     return self._force_recover(session)

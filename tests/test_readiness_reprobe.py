@@ -1,4 +1,6 @@
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -102,6 +104,7 @@ class TestReadinessReprobe(unittest.TestCase):
         with mock.patch.object(sm_mod.time, "monotonic", return_value=100.0):
             with mock.patch.object(mgr, "_probe_existing_bridge", side_effect=probe_success) as probe:
                 mgr.reconcile_readiness()
+                mgr.join_reprobe_workers(2.0)
 
         probe.assert_called_once_with(session, bridge)
         self.assertEqual(session.state, "READY")
@@ -120,6 +123,7 @@ class TestReadinessReprobe(unittest.TestCase):
         with mock.patch.object(sm_mod.time, "monotonic", return_value=100.0):
             with mock.patch.object(mgr, "_probe_existing_bridge") as probe:
                 mgr.reconcile_readiness()
+                mgr.join_reprobe_workers(2.0)
 
         probe.assert_not_called()
         self.assertEqual(session.reprobe_attempts, 0)
@@ -156,6 +160,7 @@ class TestReadinessReprobe(unittest.TestCase):
                     with mock.patch.object(mgr, "_probe_existing_bridge") as probe:
                         with mock.patch.object(mgr, "_spawn_attach") as spawn:
                             mgr.reconcile_readiness()
+                            mgr.join_reprobe_workers(2.0)
 
                 probe.assert_not_called()
                 spawn.assert_not_called()
@@ -179,6 +184,7 @@ class TestReadinessReprobe(unittest.TestCase):
                 session.next_reprobe_at = 0.0
                 with mock.patch.object(sm_mod.time, "monotonic", return_value=now):
                     mgr.reconcile_readiness()
+                    mgr.join_reprobe_workers(2.0)
                 self.assertEqual(session.reprobe_attempts, attempt)
 
         self.assertEqual(probe.call_count, constants.REPROBE_MAX_ATTEMPTS)
@@ -186,6 +192,7 @@ class TestReadinessReprobe(unittest.TestCase):
         with mock.patch.object(mgr, "_probe_existing_bridge") as probe_after_limit:
             with mock.patch.object(sm_mod.time, "monotonic", return_value=999.0):
                 mgr.reconcile_readiness()
+                mgr.join_reprobe_workers(2.0)
         probe_after_limit.assert_not_called()
 
     def test_detached_prompt_timeout_spawns_reprobe_attach(self) -> None:
@@ -203,6 +210,119 @@ class TestReadinessReprobe(unittest.TestCase):
         self.assertEqual(session.state, "ATTACHING")
         self.assertEqual(session.reprobe_attempts, 1)
         self.assertIsNotNone(session.next_reprobe_at)
+
+    # --- adversarial-review 回歸（#69 codex review）-------------------------
+
+    def test_reprobe_probe_runs_off_watcher_tick(self) -> None:
+        """Finding 3：reconcile 不得同步阻塞在 probe 上；probe 須在背景 worker 執行，
+        否則 DeviceWatcher tick 會被 probe 的 timeout（最長數十秒）卡住、延誤裝置偵測。"""
+        mgr, session = self._make_attached_candidate()
+        session.reprobe_attempts = 0
+        session.next_reprobe_at = None
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_probe(_session: sm_mod.SessionRuntime, _bridge: FakeBridge) -> dict:
+            started.set()
+            release.wait(2.0)
+            session.state = "READY"
+            session.last_error = None
+            return {"ok": True, "session": session.to_public_dict()}
+
+        with mock.patch.object(sm_mod.time, "monotonic", return_value=100.0):
+            with mock.patch.object(mgr, "_probe_existing_bridge", side_effect=slow_probe):
+                mgr.reconcile_readiness()  # 必須立即返回，不等 probe 完成
+                self.assertTrue(started.wait(1.0), "probe worker 未在背景啟動")
+                self.assertEqual(session.state, "ATTACHED")  # probe 仍卡住，尚未回 READY
+                release.set()
+                mgr.join_reprobe_workers(2.0)
+
+        self.assertEqual(session.state, "READY")
+
+    def test_reprobe_is_single_flight_per_session(self) -> None:
+        """Finding 2：同一 session 進行中的 readiness probe 不得被第二次 tick 重入，
+        避免兩個 probe 在同一 bridge 上互相清 RX / 交錯 nonce / 重複寫 bytes。"""
+        mgr, session = self._make_attached_candidate()
+        session.reprobe_attempts = 0
+        session.next_reprobe_at = None
+
+        calls: list[int] = []
+        no_overlap: list[bool] = []
+        active = threading.Lock()
+        first_in = threading.Event()
+        let_go = threading.Event()
+
+        def probe(_session: sm_mod.SessionRuntime, _bridge: FakeBridge) -> dict:
+            no_overlap.append(active.acquire(blocking=False))
+            calls.append(1)
+            first_in.set()
+            let_go.wait(2.0)
+            try:
+                if no_overlap[-1]:
+                    active.release()
+            except RuntimeError:
+                pass
+            session.state = "ATTACHED"
+            session.last_error = "PROMPT_UNAVAILABLE"
+            return {"ok": True, "session": session.to_public_dict()}
+
+        with mock.patch.object(sm_mod.time, "monotonic", return_value=100.0):
+            with mock.patch.object(mgr, "_probe_existing_bridge", side_effect=probe):
+                mgr.reconcile_readiness()        # spawn worker 1
+                self.assertTrue(first_in.wait(1.0), "第一個 probe worker 未啟動")
+                session.next_reprobe_at = 0.0    # 強制通過 backoff gate
+                mgr.reconcile_readiness()        # worker 1 仍在跑 → 不應再 spawn
+                let_go.set()
+                mgr.join_reprobe_workers(2.0)
+
+        self.assertEqual(len(calls), 1, "in-flight 期間不該重入第二個 probe")
+        self.assertTrue(all(no_overlap), "probe 發生重疊")
+
+    def test_manual_recover_rearms_exhausted_attached_session(self) -> None:
+        """Finding 4：已 exhausted 的 ATTACHED session，手動 recover（顯式人工介入）即使
+        當下 probe 仍失敗，也必須清掉 reprobe 上限/進度，讓之後自動重探能重新接手。"""
+        mgr, session = self._make_attached_candidate()
+        session.reprobe_attempts = constants.REPROBE_MAX_ATTEMPTS
+        session.reprobe_exhausted = True
+        session.next_reprobe_at = None
+
+        def probe_fail(_session: sm_mod.SessionRuntime, _bridge: FakeBridge) -> dict:
+            session.state = "ATTACHED"
+            session.last_error = "PROMPT_UNAVAILABLE"
+            return {"ok": True, "session": session.to_public_dict()}
+
+        with mock.patch.object(mgr, "_probe_existing_bridge", side_effect=probe_fail):
+            result = mgr.recover_session("COM0")
+
+        self.assertTrue(result.get("ok"))
+        self.assertFalse(session.reprobe_exhausted, "手動 recover 後 exhausted 應被清除（re-arm）")
+        self.assertEqual(session.reprobe_attempts, 0, "手動 recover 後 attempts 應歸零")
+
+    def test_reprobe_skips_when_state_flips_to_flashing_before_probe(self) -> None:
+        """Finding 1：job 收集後、worker 實際 probe 前若 session 轉入 FLASHING，
+        worker 必須在寫入前重新驗證並放棄，不得對燒錄中的 bridge 送 probe bytes。"""
+        mgr, session = self._make_attached_candidate()
+        session.reprobe_attempts = 0
+        session.next_reprobe_at = None
+
+        # 攔截 prepare：在 job 已收集（state 仍 ATTACHED）後，把 session 翻成 FLASHING，
+        # 模擬 flash broker 在 lock 釋放後搶進 FLASHING 的競態。
+        orig_prepare = mgr._prepare_reprobe_locked
+
+        def prepare_then_flip(sess, now):
+            job = orig_prepare(sess, now)
+            if job is not None:
+                sess.state = "FLASHING"
+            return job
+
+        with mock.patch.object(sm_mod.time, "monotonic", return_value=100.0):
+            with mock.patch.object(mgr, "_prepare_reprobe_locked", side_effect=prepare_then_flip):
+                with mock.patch.object(mgr, "_probe_existing_bridge") as probe:
+                    mgr.reconcile_readiness()
+                    mgr.join_reprobe_workers(2.0)
+
+        probe.assert_not_called()
 
 
 if __name__ == "__main__":
