@@ -68,7 +68,11 @@ def test_flash_mode_drops_non_flash_send_bytes(monkeypatch):
     # system probe 寫入（login_fsm.probe_ready/ensure_ready 走的就是 source="system"）→ 應被丟棄
     b.send_bytes(b"\rprobe\n", source="system")
     assert written == []
-    # flasher 自身仍可寫
+    # 偽造 source 不得繞過 gate：授權綁內部能力而非可控的 source 字串（#69 Finding round3）
+    b.send_bytes(b"pwn\n", source="flash-agent")
+    b.send_bytes(b"pwn2\n", source="flash")
+    assert written == []
+    # flasher 自身（flash_tx，內部能力）仍可寫
     b.flash_tx(bytes([0x80, 0x55, 0x00]))
     assert written == [bytes([0x80, 0x55, 0x00])]
 
