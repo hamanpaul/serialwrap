@@ -67,6 +67,13 @@ serialwrap 另提供原生 MCU flash 端點（與上面 device handoff 互補）
 - 解決孤兒 minicom 假性佔用 console 導致 co-work 卡住的問題：死孤兒（console peer 已關）由 self-test 時 detach；活著但 idle 的 console 只降級、不自動 detach（清理交由 agent 主動 `session recover` / `session console-detach`）。
 - bootloader recovery（#44）：板子掉進 bootloader 時 session 為 `ATTACHED`，可用 `serialwrap session interactive-open --selector COM0 --allow-attached`（需通過 bootloader prompt 比對）開 recovery lease；READY 下此 flag 無作用。
 
+## FAQ：開機窗連不到 / broker not ready（#69）
+- 先跑 `serialwrap session self-test --selector COM0` 與 `serialwrap session list`，看 `classification`、`state`、`last_error`、`reprobe_attempts`、`reprobe_exhausted`。
+- `ATTACHED_NOT_READY` + `last_error=PROMPT_UNAVAILABLE` / `PROMPT_TIMEOUT`：通常是 attach 撞 DUT 開機窗、prompt 尚未出現；daemon 會等 RX 閒置後自動重探，成功會回 `READY`。
+- `BRIDGE_DOWN` + `DETACHED` + `*_PROMPT_TIMEOUT`：若 device 還在位，daemon 會重新走 attach/probe 路徑。
+- `minicom_router.sh` 會提示「DUT 可能仍在開機、serialwrap 正在自動重探」；需要阻塞等 READY 時可設 `MINICOM_WAIT_READY=1`。
+- 若 `reprobe_exhausted=true` 或等待過久仍未 READY，再手動 `serialwrap session recover --selector COM0`（必要時 `--force`）。
+
 ## Remote Support 用法（ssh-tunnel）
 當 Agent 不在 target 所在機器上，而要從遠端 debug UART 時，走 **remote endpoint** 模式。
 - daemon 仍跑在 **target 所在主機**；Agent 端只透過 `--endpoint tcp://host:port` 連到遠端 daemon。

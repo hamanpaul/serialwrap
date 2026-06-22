@@ -19,6 +19,10 @@ from .constants import (
     HUMAN_ACTIVE_WINDOW_S,
     LOG_DIR,
     MAX_RECOVERY_LEASE_S,
+    REPROBE_BACKOFF_S,
+    REPROBE_MAX_ATTEMPTS,
+    REPROBE_MAX_INTERVAL_S,
+    REPROBE_RX_IDLE_S,
     STATE_PATH,
 )
 from .device_watcher import DeviceInfo
@@ -176,6 +180,9 @@ class SessionRuntime:
     last_probe_at: str | None = None
     last_rx_mono: float = 0.0
     last_tx_mono: float = 0.0
+    reprobe_attempts: int = 0
+    next_reprobe_at: float | None = None
+    reprobe_exhausted: bool = False
     # device handoff（issue #54）
     released_by: str | None = None
     released_at: str | None = None
@@ -215,6 +222,11 @@ class SessionRuntime:
             return "idle-healthy"
         return "quiet-suspicious"
 
+    def reset_reprobe_progress(self) -> None:
+        self.reprobe_attempts = 0
+        self.next_reprobe_at = None
+        self.reprobe_exhausted = False
+
     def to_public_dict(self) -> dict[str, Any]:
         console_count = 0
         if self.bridge is not None:
@@ -250,6 +262,9 @@ class SessionRuntime:
             "last_rx_at": self.last_rx_at,
             "last_tx_at": self.last_tx_at,
             "last_probe_at": self.last_probe_at,
+            "reprobe_attempts": self.reprobe_attempts,
+            "next_reprobe_at": self.next_reprobe_at,
+            "reprobe_exhausted": self.reprobe_exhausted,
             "idle_for_ms": self.compute_idle_ms(),
             "outstanding_commands": outstanding,
             "activity_classification": self.classify_activity(),
@@ -461,6 +476,141 @@ class SessionManager:
         with self._lock:
             self._rx_observers.append(observer)
 
+    def _reset_reprobe_progress_locked(self, session: SessionRuntime) -> None:
+        session.reset_reprobe_progress()
+
+    def _is_reprobe_prompt_error(self, state: str, last_error: str | None) -> bool:
+        if not last_error:
+            return False
+        prompt_related = (
+            last_error == "PROMPT_UNAVAILABLE"
+            or last_error == "PROMPT_TIMEOUT"
+            or last_error.endswith("_PROMPT_TIMEOUT")
+        )
+        if state == "ATTACHED":
+            return prompt_related
+        if state == "DETACHED":
+            return last_error == "PROMPT_TIMEOUT" or last_error.endswith("_PROMPT_TIMEOUT")
+        return False
+
+    def _rx_idle_enough(self, session: SessionRuntime, now: float) -> bool:
+        return session.last_rx_mono == 0.0 or (now - session.last_rx_mono) >= REPROBE_RX_IDLE_S
+
+    def _human_active_locked(self, session: SessionRuntime, now: float) -> bool:
+        if session.bridge is None or session.interactive_session_id is None:
+            return False
+        lease = self._interactive.get(session.interactive_session_id)
+        if lease is None or not lease.owner.startswith("human:"):
+            return False
+        client_id = lease.owner.split(":", 1)[1]
+        if not session.bridge.console_has_external_peer(client_id):
+            return False
+        snapshot = session.bridge.snapshot()
+        if snapshot.get("interactive_owner") != lease.owner:
+            return False
+        last = snapshot.get("last_human_input_at")
+        if not isinstance(last, (int, float)) or isinstance(last, bool):
+            return False
+        return (now - last) <= HUMAN_ACTIVE_WINDOW_S
+
+    def _record_reprobe_attempt_locked(self, session: SessionRuntime, now: float) -> None:
+        session.reprobe_attempts += 1
+        if session.reprobe_attempts >= REPROBE_MAX_ATTEMPTS:
+            session.reprobe_exhausted = True
+            session.next_reprobe_at = None
+            return
+        interval = min(
+            REPROBE_BACKOFF_S * (2 ** max(session.reprobe_attempts - 1, 0)),
+            REPROBE_MAX_INTERVAL_S,
+        )
+        session.next_reprobe_at = now + interval
+
+    def _prepare_reprobe_locked(
+        self, session: SessionRuntime, now: float
+    ) -> tuple[str, SessionRuntime, UARTBridge | None, str] | None:
+        by_id = session.profile.device_by_id
+        if not by_id or by_id in self._released_by_ids or by_id not in self._devices:
+            return None
+        if session.state in {"READY", "RELEASED", "FLASHING", "ATTACHING", "RECOVERING"}:
+            return None
+        if session.reprobe_exhausted:
+            return None
+        if session.reprobe_attempts >= REPROBE_MAX_ATTEMPTS:
+            session.reprobe_exhausted = True
+            session.next_reprobe_at = None
+            return None
+        if session.next_reprobe_at is not None and now < session.next_reprobe_at:
+            return None
+        if not self._is_reprobe_prompt_error(session.state, session.last_error):
+            return None
+        if not self._rx_idle_enough(session, now):
+            return None
+        if self._human_active_locked(session, now):
+            return None
+
+        if session.state == "ATTACHED":
+            if session.bridge is None:
+                return None
+            interval = min(
+                REPROBE_BACKOFF_S * (2 ** max(session.reprobe_attempts, 0)),
+                REPROBE_MAX_INTERVAL_S,
+            )
+            session.next_reprobe_at = now + interval
+            return ("probe", session, session.bridge, by_id)
+
+        if session.state == "DETACHED":
+            session.state = "ATTACHING"
+            session.last_error = None
+            self._record_reprobe_attempt_locked(session, now)
+            return ("attach", session, None, by_id)
+
+        return None
+
+    def _finish_probe_reprobe(self, session_id: str, bridge: UARTBridge, result: dict[str, Any], now: float) -> None:
+        with self._lock:
+            current = self._sessions.get(session_id)
+            if current is None or current.bridge is not bridge:
+                return
+            result_session = result.get("session") if isinstance(result, dict) else None
+            result_state = result_session.get("state") if isinstance(result_session, dict) else current.state
+            if current.state == "READY" or result_state == "READY":
+                self._reset_reprobe_progress_locked(current)
+            else:
+                self._record_reprobe_attempt_locked(current, now)
+
+    def reconcile_readiness(self) -> None:
+        """週期性重探可復原的非 READY session。"""
+        now = time.monotonic()
+        jobs: list[tuple[str, str, UARTBridge | None, str]] = []
+        with self._lock:
+            for session in list(self._sessions.values()):
+                prepared = self._prepare_reprobe_locked(session, now)
+                if prepared is None:
+                    continue
+                action, prepared_session, bridge, by_id = prepared
+                jobs.append((action, prepared_session.session_id, bridge, by_id))
+
+        for action, session_id, bridge, by_id in jobs:
+            if action == "attach":
+                self._spawn_attach(by_id)
+                continue
+            if bridge is None:
+                continue
+            session = self.get_session(session_id)
+            if session is None:
+                continue
+            try:
+                result = self._probe_existing_bridge(session, bridge)
+            except Exception as exc:
+                with self._lock:
+                    current = self._sessions.get(session_id)
+                    if current is not None and current.bridge is bridge:
+                        current.state = "ATTACHED"
+                        current.last_error = f"REPROBE_FAILED:{type(exc).__name__}"
+                        self._record_reprobe_attempt_locked(current, now)
+                continue
+            self._finish_probe_reprobe(session_id, bridge, result, now)
+
     def set_alias_for_session(self, session_id: str, alias: str) -> dict[str, Any]:
         with self._lock:
             session = self._sessions.get(session_id)
@@ -553,6 +703,7 @@ class SessionManager:
         session.state = "DETACHED"
         session.detached_at = now_iso()
         session.last_error = reason
+        self._reset_reprobe_progress_locked(session)
         if session.interactive_session_id is not None:
             lease = self._interactive.pop(session.interactive_session_id, None)
             if lease is not None:
@@ -601,6 +752,7 @@ class SessionManager:
             session.released_by = source
             session.released_at = now_iso()
             session.released_reason = reason
+            self._reset_reprobe_progress_locked(session)
             if by_id:
                 self._released_by_ids.add(by_id)
             public = session.to_public_dict()
@@ -709,6 +861,7 @@ class SessionManager:
             session.released_reason = None
             session.state = "ATTACHING"
             session.last_error = None
+            self._reset_reprobe_progress_locked(session)
             public = session.to_public_dict()
         self._save_state()
         self._spawn_attach(by_id)
@@ -752,13 +905,16 @@ class SessionManager:
                 session.released_at = None
                 session.released_reason = None
                 session.state = "DETACHED"
+                self._reset_reprobe_progress_locked(session)
             session.profile = dataclasses.replace(session.profile, device_by_id=device_by_id)
+            self._reset_reprobe_progress_locked(session)
             self._binding_overrides[session.session_id] = device_by_id
             self._save_state()
             has_device = device_by_id in self._devices
             if has_device:
                 session.state = "ATTACHING"
                 session.last_error = None
+                self._reset_reprobe_progress_locked(session)
 
         if has_device:
             self._spawn_attach(device_by_id)
@@ -806,6 +962,7 @@ class SessionManager:
             if result is None and not should_probe:
                 session.state = "ATTACHING"
                 session.last_error = None
+                self._reset_reprobe_progress_locked(session)
         post.execute()
         if result is not None:
             return result
@@ -844,6 +1001,13 @@ class SessionManager:
         )
         removed = sorted(set(prev.keys()) - set(devices.keys()))
         added = sorted(set(devices.keys()) - set(prev.keys()))
+
+        changed_by_ids = set(removed) | set(changed) | set(added)
+        if changed_by_ids:
+            with self._lock:
+                for session in self._sessions.values():
+                    if session.profile.device_by_id in changed_by_ids:
+                        self._reset_reprobe_progress_locked(session)
 
         for by_id in [*removed, *changed]:
             self._detach_by_id(by_id, reason="DEVICE_REBOUND_REQUIRED" if by_id in changed else "DEVICE_REMOVED")
@@ -984,6 +1148,7 @@ class SessionManager:
                 current.state = "READY"
                 current.last_error = None
                 current.last_ready_at = now_iso()
+                self._reset_reprobe_progress_locked(current)
                 notify_ready = True
             else:
                 current.state = "ATTACHED"
@@ -1130,6 +1295,7 @@ class SessionManager:
                     session.recovering = False
                     session.recovery_started_at = None
                     session.pending_auto_login = False
+                    self._reset_reprobe_progress_locked(session)
                     notify_ready = True
                 else:
                     session.state = "ATTACHED"
@@ -1299,6 +1465,7 @@ class SessionManager:
                     session.recovering = False
                     session.recovery_started_at = None
                     session.pending_auto_login = False
+                    self._reset_reprobe_progress_locked(session)
                     notify_ready = True
                 else:
                     session.state = "ATTACHED"
@@ -1543,6 +1710,7 @@ class SessionManager:
                             session.recovering = False
                             session.recovery_started_at = None
                             session.pending_auto_login = False
+                            self._reset_reprobe_progress_locked(session)
                         self._on_ready(session_id)
                         return
                     with self._lock:
@@ -1886,6 +2054,7 @@ class SessionManager:
                         chunks=[stdout] if stdout else None,
                         error_code="PROMPT_TIMEOUT_RECOVERED",
                     )
+                    self._reset_reprobe_progress_locked(session)
                 return {
                     "ok": True,
                     "error_code": "PROMPT_TIMEOUT_RECOVERED",
@@ -2468,6 +2637,7 @@ class SessionManager:
                 if by_id and by_id in self._devices:
                     session.state = "ATTACHING"
                     session.last_error = None
+                    self._reset_reprobe_progress_locked(session)
                     self._spawn_attach(by_id)
                     return {"ok": True, "recovering": False, "action": "REATTACH", "session": session.to_public_dict()}
                 return {"ok": False, "error_code": "SESSION_NOT_READY", "session": session.to_public_dict()}

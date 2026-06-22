@@ -26,10 +26,12 @@ class DeviceWatcher:
         on_change: Callable[[list[DeviceInfo], list[DeviceInfo]], None],
         poll_interval_s: float = 1.0,
         extra_scan_dirs: list[str] | None = None,
+        on_tick: Callable[[], None] | None = None,
     ) -> None:
         self._scan_dirs = [by_id_dir] + (extra_scan_dirs or [])
         self._on_change = on_change
         self._poll_interval_s = poll_interval_s
+        self._on_tick = on_tick
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._devices: dict[str, DeviceInfo] = {}
@@ -76,6 +78,8 @@ class DeviceWatcher:
     def _loop(self) -> None:
         while not self._stop_event.is_set():
             self.poll_once()
+            if self._on_tick is not None:
+                self._on_tick()
             self._stop_event.wait(self._poll_interval_s)
 
     def start(self) -> None:

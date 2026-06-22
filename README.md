@@ -100,8 +100,10 @@ stateDiagram-v2
     ATTACHING --> ATTACHED: passthrough
     ATTACHING --> DETACHED: device lost
     ATTACHED --> READY: login ok
+    ATTACHED --> READY: auto re-probe ok
     ATTACHED --> READY: recover ok
     ATTACHED --> DETACHED: detach
+    DETACHED --> ATTACHING: auto re-probe
     READY --> ATTACHED: recover fallback
     READY --> DETACHED: unplug
     READY --> RECOVERING: reboot cmd
@@ -667,6 +669,23 @@ serialwrap session self-test --selector COM0
 - `REBOOTING`：agent 已送出 reboot 類指令，正在等待 target 重開機完畢後自動 relogin
 - `HUMAN_INTERACTIVE_ACTIVE`：human console 目前握有 interactive ownership，不適合 agent 干預
 - `PASSTHROUGH`：platform 設為 passthrough，session 已 ATTACHED，適合透明 bridge 模式
+
+### FAQ：開機窗連不到、minicom 顯示 broker not ready
+
+若 `session attach` 剛好撞上 DUT 開機窗，target 仍在噴 boot log 或 prompt 尚未出現，session 可能暫時停在非 `READY`：
+
+```bash
+serialwrap session self-test --selector COM0
+serialwrap session list
+```
+
+判讀方式：
+
+1. `ATTACHED_NOT_READY` 且 `last_error=PROMPT_UNAVAILABLE` / `PROMPT_TIMEOUT`：bridge 還在，通常是 prompt 尚未可用；daemon 會在 RX 閒置後依 `reprobe_attempts` / `next_reprobe_at` 做有界自動重探，成功後回 `READY`。
+2. `BRIDGE_DOWN` 且 session 為 `DETACHED`、`last_error` 為 `*_PROMPT_TIMEOUT`：裝置仍在位時 daemon 會重新走 attach/probe 路徑。
+3. `reprobe_exhausted=true` 或等待過久仍未 READY：手動執行 `serialwrap session recover --selector COM0`（必要時加 `--force`）。
+
+`minicom_router.sh` 在偵測到這類狀態時會提示「DUT 可能仍在開機、serialwrap 正在自動重探」；若希望它阻塞等待 READY 後再開 minicom，可設 `MINICOM_WAIT_READY=1`。
 
 ### Recover
 

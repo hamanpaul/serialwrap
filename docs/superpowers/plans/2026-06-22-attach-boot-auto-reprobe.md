@@ -18,7 +18,7 @@
 
 **Files:** `sw_core/constants.py`、`sw_core/session_manager.py`（`SessionRuntime` / `to_public_dict`）
 
-- [ ] **Step 1：constants**
+- [x] **Step 1：constants**
 新增（值可依真機調，先用保守預設）：
 ```python
 REPROBE_RX_IDLE_S = 3.0          # RX 轉閒多久才視為「boot log 已停、prompt 可能可用」
@@ -26,22 +26,22 @@ REPROBE_BACKOFF_S = 2.0          # 首次重探間隔
 REPROBE_MAX_INTERVAL_S = 15.0    # backoff 上限
 REPROBE_MAX_ATTEMPTS = 10        # 重探次數上限（達上限停手）
 ```
-- [ ] **Step 2：SessionRuntime 欄位 + 公開**
+- [x] **Step 2：SessionRuntime 欄位 + 公開**
 `SessionRuntime` 加 `reprobe_attempts: int = 0`、`next_reprobe_at: float | None = None`、`reprobe_exhausted: bool = False`；`to_public_dict()` 暴露這三欄；在「成功進 READY / 人工 recover / device 變動 / RELEASED」時歸零（找既有 state→READY 與 recover 收尾處重置）。
-- [ ] **Step 3**：`python3 -c "import sw_core.session_manager"` 匯入無誤。
+- [x] **Step 3**：`python3 -c "import sw_core.session_manager"` 匯入無誤。
 
 ## Task 2：RED — reconcile 觸發/邊界的失敗測試
 
 **Files:** `tests/test_readiness_reprobe.py`（新增）
 
-- [ ] **Step 1：寫失敗測試**（用既有測試風格的 fake bridge / monkeypatch probe；參考 `tests/test_login_fsm.py`、`tests/test_session_bind.py` 的建構方式）
+- [x] **Step 1：寫失敗測試**（用既有測試風格的 fake bridge / monkeypatch probe；參考 `tests/test_login_fsm.py`、`tests/test_session_bind.py` 的建構方式）
 涵蓋：
   1. `ATTACHED`+`last_error=PROMPT_UNAVAILABLE`、RX idle ≥ `REPROBE_RX_IDLE_S` → `reconcile_readiness()` 觸發重探，probe 成功 → state `READY`、欄位歸零。
   2. RX idle < 門檻（boot log 仍噴）→ 不重探（`reprobe_attempts` 不增）。
   3. human-active interactive lease / `FLASHING` / `RELEASED` → 跳過、不送 probe。
   4. probe 持續失敗 → backoff 遞增、達 `REPROBE_MAX_ATTEMPTS` → `reprobe_exhausted=True` 且停止重探。
   5. `DETACHED`+`*_PROMPT_TIMEOUT`、device 在位 → 重探（走 `_spawn_attach`/`ensure_ready`）。
-- [ ] **Step 2：跑測試確認 RED**
+- [x] **Step 2：跑測試確認 RED**
 Run: `python3 -m pytest -q tests/test_readiness_reprobe.py`
 Expected：FAIL（`reconcile_readiness` 不存在 / 行為未實作）。
 
@@ -49,14 +49,14 @@ Expected：FAIL（`reconcile_readiness` 不存在 / 行為未實作）。
 
 **Files:** `sw_core/session_manager.py`
 
-- [ ] **Step 1：實作 `reconcile_readiness(self) -> None`**
+- [x] **Step 1：實作 `reconcile_readiness(self) -> None`**
 掃 `self._sessions`，對每個 session 在 `self._lock` 下套用觸發條件（見設計 §4）：
   - 跳過：READY / RELEASED（或 by-id 在 `_released_by_ids`）/ FLASHING / human-active interactive lease / device 不在位 / `reprobe_exhausted` / 未到 `next_reprobe_at`。
   - 候選：`ATTACHED` 且 `last_error` 屬 prompt-unavailable 類，或 `DETACHED` 且 `last_error` 屬 prompt-timeout 類。
   - RX-idle gate：`now - last_rx_at >= REPROBE_RX_IDLE_S`（用既有 bridge/snapshot 的 last_rx）。
   - 動作：`ATTACHED` → 複用 `_probe_existing_bridge`；`DETACHED` → 複用 `_spawn_attach`/attach 路徑。成功 READY → 欄位歸零；失敗 → `reprobe_attempts += 1`、`next_reprobe_at = now + min(REPROBE_BACKOFF_S * 2**(n-1), REPROBE_MAX_INTERVAL_S)`；達上限 → `reprobe_exhausted = True`。
   - 以 lock + `next_reprobe_at` 去重，避免與 recover/attach 重入。
-- [ ] **Step 2：跑測試確認 GREEN**
+- [x] **Step 2：跑測試確認 GREEN**
 Run: `python3 -m pytest -q tests/test_readiness_reprobe.py`
 Expected：PASS。
 
@@ -64,31 +64,31 @@ Expected：PASS。
 
 **Files:** `serialwrapd.py`（或 service/DeviceWatcher 的週期點——實作時 grep `DeviceWatcher`/週期迴圈確認驅動位置）
 
-- [ ] **Step 1：在既有週期工作（如 device 掃描 tick）呼叫 `session_manager.reconcile_readiness()`**（與 DeviceWatcher 同節奏，或獨立 interval；避免新開執行緒若已有 tick）。
-- [ ] **Step 2：`python3 -m pytest -q tests/`** 全跑，除既有 flaky 外無新失敗。
+- [x] **Step 1：在既有週期工作（如 device 掃描 tick）呼叫 `session_manager.reconcile_readiness()`**（與 DeviceWatcher 同節奏，或獨立 interval；避免新開執行緒若已有 tick）。
+- [x] **Step 2：`python3 -m pytest -q tests/`** 全跑，除既有 flaky 外無新失敗。
 
 ## Task 5：minicom_router 訊息 + 可選 wait
 
 **Files:** `tools/minicom_router.sh`
 
-- [ ] **Step 1：改 `:~340` 的 `broker not ready` 分支**——查 session state/`last_error`/`reprobe_attempts`，非 READY 且屬 prompt-timeout 類 / 正在重試時印明確提示：「DUT 可能仍在開機，serialwrap 正在自動重試；可稍候或手動 `serialwrap session recover --selector COMx`」。
-- [ ] **Step 2（可選）**：`MINICOM_WAIT_READY=1` 時輪詢等待 READY（有上限）再開 minicom。
-- [ ] **Step 3：`bash -n tools/minicom_router.sh`**。
+- [x] **Step 1：改 `:~340` 的 `broker not ready` 分支**——查 session state/`last_error`/`reprobe_attempts`，非 READY 且屬 prompt-timeout 類 / 正在重試時印明確提示：「DUT 可能仍在開機，serialwrap 正在自動重試；可稍候或手動 `serialwrap session recover --selector COMx`」。
+- [x] **Step 2（可選）**：`MINICOM_WAIT_READY=1` 時輪詢等待 READY（有上限）再開 minicom。
+- [x] **Step 3：`bash -n tools/minicom_router.sh`**。
 
 ## Task 6：docs
 
 **Files:** `README.md`、`skills/serialwrap/SKILL.md`
 
-- [ ] FAQ：「開機窗連不到」→ self-test 判讀（`ATTACHED_NOT_READY`/`BRIDGE_DOWN`）→ daemon 會自動重探 / 必要時手動 `session recover`。
+- [x] FAQ：「開機窗連不到」→ self-test 判讀（`ATTACHED_NOT_READY`/`BRIDGE_DOWN`）→ daemon 會自動重探 / 必要時手動 `session recover`。
 
 ## Task 7：本地驗證 + CHANGELOG + commit
 
 **Files:** `CHANGELOG.md`
 
-- [ ] `python3 -m pytest -q tests/`（除既有 flaky 無新失敗）。
-- [ ] `python3 -m policy_check --repo .` EXIT=0（R-09 CHANGELOG）。
-- [ ] `CHANGELOG.md [Unreleased]` 記一筆。
-- [ ] commit（conventional，繁中 + 兩個 Co-author trailer）。
+- [x] `python3 -m pytest -q tests/`（除既有 flaky 無新失敗）。
+- [x] `python3 -m policy_check --repo .` EXIT=0（R-09 CHANGELOG）。
+- [x] `CHANGELOG.md [Unreleased]` 記一筆。
+- [x] commit（conventional，繁中 + 兩個 Co-author trailer）。
 
 ## Task 8：真機驗證（COM1，設計 §6）— 修復後執行
 
