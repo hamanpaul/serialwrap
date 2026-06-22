@@ -8,9 +8,18 @@ from typing import Any
 
 
 class JsonRpcUnixServer:
-    def __init__(self, socket_path: str, handler: Callable[[str, dict[str, Any]], dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        socket_path: str,
+        handler: Callable[[str, dict[str, Any]], dict[str, Any]],
+        *,
+        blocking_methods: set[str] | None = None,
+    ) -> None:
         self._socket_path = socket_path
         self._handler = handler
+        # 這些 method 的 handler 會長時間阻塞（如 file.push/file.pull 的 UART 傳輸），
+        # 須丟到 executor 執行，避免卡住單執行緒 asyncio event loop 而凍結其他 RPC（#52）。
+        self._blocking_methods = blocking_methods or set()
         self._server: asyncio.AbstractServer | None = None
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -46,7 +55,13 @@ class JsonRpcUnixServer:
                     if not isinstance(params, dict):
                         params = {}
                     try:
-                        result = self._handler(method, params)
+                        if method in self._blocking_methods:
+                            # 長阻塞 handler（如 file.push/file.pull）丟到 executor 執行，
+                            # 釋放 event loop 以繼續服務其他 RPC，避免傳輸期間全 daemon 凍結（#52）。
+                            loop = asyncio.get_running_loop()
+                            result = await loop.run_in_executor(None, self._handler, method, params)
+                        else:
+                            result = self._handler(method, params)
                     except Exception as exc:
                         result = {"ok": False, "error_code": "EXCEPTION", "message": str(exc)}
                     resp = {"id": req_id}
