@@ -1,5 +1,5 @@
 <!-- managed-by: hamanpaul/paulsha-conventions@v1.0.5 -->
-<!-- 若修改此檔，同步更新 CLAUDE.md / AGENTS.md / GEMINI.md / .github/copilot-instructions.md 四份 -->
+<!-- CLAUDE.md 為單一事實來源；AGENTS.md / GEMINI.md / .github/copilot-instructions.md 為指向本檔的 symlink，只需維護本檔 -->
 policy_version: 1.0.5
 <!-- policy_version 為 policy_check R-14 machine-readable marker；需保持裸行格式，請勿移入 frontmatter 或 code block。 -->
 
@@ -46,15 +46,16 @@ policy_version: 1.0.5
 
 ## Agent 檔案同步政策
 
-- **禁止單獨修改以下任一檔案**；必須同時更新四份：
-  - `CLAUDE.md`
-  - `AGENTS.md`
-  - `GEMINI.md`
-  - `.github/copilot-instructions.md`（marker 區段）
-- 檔案首行必須保留：
-  ```
-  <!-- managed-by: hamanpaul/paulsha-conventions@v1.0.5 -->
-  ```
+- **`CLAUDE.md` 為唯一事實來源（single source of truth）**；只需維護本檔。
+- `AGENTS.md`、`GEMINI.md`、`.github/copilot-instructions.md` 一律為指向 `CLAUDE.md` 的 **symlink**（相對路徑），不再各自維護內容；改 `CLAUDE.md` 即同步生效。
+  - 合規性：policy_check R-13（`is_file()`）與 R-14（`read_text()` 找 `policy_version:`）皆會跟隨 symlink 解析到 `CLAUDE.md`，故四檔仍視為存在且版本對齊。
+  - 若 symlink 遺失或被取代為一般檔，重建：
+    ```bash
+    ln -sf CLAUDE.md AGENTS.md
+    ln -sf CLAUDE.md GEMINI.md
+    ln -sf ../CLAUDE.md .github/copilot-instructions.md
+    ```
+- 本檔首行保留 `<!-- managed-by: hamanpaul/paulsha-conventions@v1.0.5 -->`，第 3 行保留裸行 `policy_version: 1.0.5`（R-14 machine-readable marker，勿移入 frontmatter 或 code block）。
 
 ## PR 政策
 
@@ -65,7 +66,7 @@ policy_version: 1.0.5
   - [ ] `VERSION` 已更新（若有版本號變動）
   - [ ] `python3 -m pytest -q tests/` 通過（無新失敗）
   - [ ] `python3 -m policy_check --repo .` 通過
-  - [ ] 四份 agent 檔案已同步（若有修改）
+  - [ ] `CLAUDE.md` 已更新（`AGENTS.md` / `GEMINI.md` / `.github/copilot-instructions.md` 為 symlink，自動同步）
   - [ ] 已標記 exemption label（若適用）
 
 ## Exemption Label 白名單
@@ -89,6 +90,133 @@ policy_version: 1.0.5
   ```
   Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
   ```
+
+## 實際命令
+
+> 開發/操作速查（由 `.github/copilot-instructions.md` 併入，並對齊現行 pipx + systemd + XDG 流程）。
+
+執行期依賴：`PyYAML`、`pyserial`（human console 路徑另需 `jq`、`minicom`）。套件以 `pyproject.toml`（setuptools）打包，console_scripts `serialwrap` / `serialwrapd`，內嵌資產在 `sw_core/assets/`。
+
+```bash
+# 安裝（pipx 隔離 venv + serialwrap setup；有 systemd → systemd-user，無 → on-demand 降級）
+./install.sh
+serialwrap doctor                 # 驗證環境（python/pyyaml/PATH/dialout/systemd/監管模式/裝置）
+
+# 測試（CI 與政策以 pytest 為準）
+python3 -m pytest -q tests/
+python3 -m unittest discover -s tests -v   # 亦可
+
+# policy check
+python3 -m policy_check --repo .
+
+# 常用 daemon / session smoke
+serialwrap service status|start|stop|restart   # systemd 模式的生命週期管理
+serialwrap daemon status
+serialwrap session list
+serialwrap session attach --selector COM0
+serialwrap session self-test --selector COM0
+```
+
+- 監管模式（`supervision_mode`）為單一事實來源（`~/.config/serialwrap/config.yaml`）。**systemd 模式下用 `serialwrap service ...` 管理生命週期；勿用 `serialwrap daemon start`**（它不會 route 到 systemd，會另起非託管 daemon 造成 two-reader）。`serialwrap daemon stop` 在 systemd 模式會自動 route 到 `service stop`。
+- 既有測試框架同時涵蓋 `pytest` 與 `unittest`；CI（`.github/workflows/tests.yml`）與政策以 `pytest` 為準。
+
+## 高層架構
+
+serialwrap 是讓多個 agent 與多個 human console 共用**同一條 UART** 的 broker 架構，核心不是單一 CLI，而是 daemon + RPC + broker pipeline。
+
+- `serialwrapd`（`sw_core/daemon.py`，`serialwrapd.py` 為薄 shim）：singleton daemon。啟動時載入 profiles、建立 `SerialwrapService`，再以 `sw_core/rpc.py` 提供 JSON-RPC Unix socket server。只有這個 daemon 會直接碰 UART。
+- `serialwrap`（`sw_core/cli.py`）：子命令式 CLI。每個子命令都只是 RPC client；帳密為 per-session 在 attach 時解析。
+
+### 主要資料流
+
+`command.submit` 的實際路徑是：
+
+`CLI` → `SerialwrapService.rpc()` → `_resolve_session_id()`（僅 `READY` 可送 agent 命令）→ `CommandArbiter.submit()` → 該 session 的 worker thread → `SessionManager.execute_command()` → `UARTBridge` → `WalWriter`
+
+要理解前景命令、背景命令、interactive lease、human console 為什麼互不打架，至少要一起看這幾個檔案：
+
+- `sw_core/service.py`：整體組裝點，持有 `CommandArbiter`、`SessionManager`、`DeviceWatcher`、`WalWriter`，也是唯一的 RPC 路由層。
+- `sw_core/arbiter.py`：每個 session 一條 daemon worker thread + priority queue，保證單 UART 單寫入者。
+- `sw_core/session_manager.py`：session 狀態機、裝置 hotplug、binding/alias 持久化、console attach、interactive lease、recover、background capture 全都在這裡。
+- `sw_core/uart_io.py`：serial port 與 PTY bridge、RX fan-out、human line buffering、本地回顯與 backspace 編輯。
+- `sw_core/auth.py`：per-session 帳密解析。`SessionAuth` frozen dataclass 持有已解析的帳密；`resolve_session_auth()` 從 `env_file` → `os.environ` 解析。
+- `sw_core/login_fsm.py`：prompt probe、登入流程與 `ready_probe` nonce 驗證。接受 `SessionAuth` 參數，不直接碰 `os.environ`。
+- `sw_core/wal.py`：`raw.wal.ndjson` 與 `raw.mirror.log` 的雙軌 append-only 記錄。
+
+### Session 狀態機
+
+基本流轉：`DETACHED -> ATTACHING -> ATTACHED -> READY`，另有 `RECOVERING`；裝置交接/燒錄另有 `RELEASED`(#54) 與 `FLASHING`(#55)（見下方 MCU 段與 `README.md` 狀態機）。
+
+- `ATTACHED`：bridge 已掛上，但 target 還沒確認進入可執行 prompt；這時候 **human console 仍可 attach 進去做手動登入或觀察 boot/log**。
+- `READY`：agent 命令可進入 arbiter。
+- `platform=passthrough` 的 session 會停在 `ATTACHED`，因為它不做 prompt/login/ready gating。
+
+### WAL 與結果擷取
+
+- 權威記錄為 `raw.wal.ndjson`、人類可讀鏡像為 `raw.mirror.log`，預設落在 XDG state home（`~/.local/state/serialwrap/wal/`，可由 `SERIALWRAP_WAL_DIR` 覆寫；舊版為 `/tmp/serialwrap/wal/`）。
+- 每筆 WAL 都有 `seq`、`mono_ts_ns`、`wall_ts`、`source`、`cmd_id`、`crc32`、`payload_b64`。
+- `background` 命令不是直接把所有輸出塞回 `command.get`；需要透過 `command.result_tail` 逐段讀取 capture。
+
+### Agent 日誌 capture
+
+- Agent 可透過 `session.log_start` / `session.log_stop` 對特定 session 啟停純文字 RX capture。
+- 日誌寫入 `{log_dir}/{COM}_{YYMMDD}-{HHMMSS}.log`，預設 `~/b-log`。
+- `log_dir` 優先序：per-target > per-profile > YAML `defaults.log_dir` > `SERIALWRAP_LOG_DIR` env > `~/b-log`。
+- session detach 時自動停止 capture。WAL 是 always-on 審計記錄，agent log 是 on-demand focused capture，兩者互補。
+
+## 關鍵慣例
+
+### 設定物件 immutable，執行期狀態 mutable
+
+- `sw_core/config.py` 的 `UartProfile`、`ProfileTemplate`、`SessionProfile` 都是 `@dataclass(frozen=True)`。
+- `sw_core/session_manager.py` 的 `SessionRuntime`、`BackgroundCapture`、`InteractiveLease`、`SessionCapture` 則是可變 dataclass。
+- 需要更新 session profile（例如 alias、device_by_id）時，慣例是用 `dataclasses.replace(...)` 產生新物件，而不是原地改 frozen config。
+
+### RPC 路由是平面 if/elif，不做動態註冊
+
+- `SerialwrapService.rpc()` 是單一平面分派器；新增 RPC 方法時直接加分支，不要引入 decorator registry 或 metaprogramming。
+- 所有 RPC 回應都維持 `dict[str, Any]` + `ok: bool`；失敗時附 `error_code`，例外不要穿越 RPC 邊界。
+
+### JSON 輸出必須維持緊湊且穩定
+
+- CLI 一律用 `json.dumps(..., ensure_ascii=False, separators=(",", ":"))`。
+- `state.json` 與 WAL 相關輸出會加上 `sort_keys=True`，避免不必要的 diff 與測試波動。
+
+### human console 預設走 raw interactive 模式
+
+`console-attach` 在 `ATTACHED` 或 `READY` 狀態下，會自動授予第一個 human console **raw interactive ownership**：所有 console bytes 透過 `UARTBridge.send_bytes()` 即時透傳到 UART（方向鍵/Tab 等特殊按鍵可用）；第二個以後的 console 仍走 line-buffer 路徑。
+
+當 agent 提交命令時，daemon 會暫時 **suspend** human raw mode：`bridge.suspend_interactive()`（切 deferred）→ 執行 agent 命令（human 按鍵累積在 deferred buffer）→ `bridge.resume_interactive()`（flush 回 UART）。Agent 不需等 human 關閉 minicom 才能執行命令。
+
+### Alias / binding 是持久化狀態
+
+- `SessionManager` 把 alias 與 binding override 存到 `state.json`；`profiles/*.yaml` 是預設來源，但執行期 `session.bind` / `alias.*` 的結果會覆寫到持久化狀態。
+- 裝置綁定用 `/dev/serial/by-id/` 或 `/dev/serial/by-path/`，不要用不穩定的 `/dev/ttyUSB*`。同款晶片（如 CH340）`by-id` 會相同，須改用 `by-path`。
+
+### Profile YAML 結構
+
+- 三個頂層區段：`defaults`、`profiles`、`targets`。`defaults` 支援 `log_dir`；`profiles` 定義 template（`platform`、`prompt_regex`、`login_regex`、`password_regex`、`user_env`、`pass_env`、`env_file`、`post_login_cmd`、`ready_probe`、`timeout_s`、`uart.*` 等）；`targets` 綁定 COM → template → device_by_id（省略則全走動態偵測）。
+
+### Platform 行為差異
+
+- `platform=shell`：generic Linux login，走 prompt → login → ready_probe。
+- `platform=bcm`：Broadcom 原生平台，登入後進入 BCM CLI（`>`），需 `post_login_cmd: "sh"` 切到 Linux shell（`#`），`timeout_s` 建議加大（15s+）。
+- `platform=prpl`：prplOS，prompt_regex 匹配 prefix，不依賴行尾錨點。
+- `platform=passthrough`：不做任何 login/ready gating，停在 `ATTACHED`，適合未知設備觀察。
+
+### 新增能力通常要同步改多個面
+
+新增命令/RPC/工具時，通常至少一起檢查：`sw_core/service.py`（RPC 分派）、`sw_core/cli.py`（subparser 與參數）、`README.md` / `docs/**`（對外契約，R-16/R-18）、`tests/`（代表性 unit 或 E2E）。本 repo 設計是**顯式同步多個表面**，而非自動產生。
+
+### Python 風格慣例
+
+- Python 3.10+；幾乎所有模組以 `from __future__ import annotations` 開頭；函式簽章普遍有完整型別標註。
+
+## 測試與除錯重點
+
+- `tests/test_multiagent_e2e.py` 會啟動真實 daemon，再用 PTY 假 target 驗證 `READY` 流程與多 agent 序列化，任何跨 `service / arbiter / session_manager / uart_io` 的改動都適合先看這個測試。
+- `tests/test_wal.py`、`tests/test_login_fsm.py`、`tests/test_session_bind.py` 分別對應 WAL、登入狀態機與綁定/持久化行為。
+- 安裝走 `install.sh`（pipx install + `serialwrap setup`），不是單純複製檔案；setup 會物化資產、reconcile 監管模式（先停舊再起新）、並以 `detect_legacy_install` 偵測舊版 `~/.paul_tools` 安裝給退役指引（只指引不刪除）。
 
 ## v1.0.1 新增規則（issue 連結 / docs 對齊 / 語言）
 > 本段於 policy 1.0.1 隨 R-17 / R-18 與語言規範新增。
