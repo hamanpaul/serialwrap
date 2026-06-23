@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-23
+
 ### Added
 
 - **`serialwrap setup` / `doctor` 子命令接線（`feature/install-flow-systemd-pipx`，T12）**：新增 `sw_core/doctor_cmd.py`（`run_doctor` 對 Python 版本／PyYAML／`serialwrap`+`serialwrapd` 是否在 PATH／`dialout` 群組／systemd／監管模式／by-id 裝置／WSL systemd 做唯讀診斷，每項永不拋例外並附繁中修復提示；systemd／wsl_systemd／devices 為 advisory 不拉低整體 ok）；`sw_core/setup_cmd.py` 新增 `detect_legacy_install`（偵測舊版 `~/.paul_tools/serialwrap` 安裝並回報 minicom 符號連結／`/tmp/serialwrap/state.json` 殘留與退役指引，只指引不刪除）；`sw_core/cli.py` 註冊 `setup`（`--user`/`--system`/`--on-demand` 互斥目標模式、`--force`、`--with-sudo`）與 `doctor` 子命令並接上 `materialize_assets`＋`reconcile`（daemon/flash 偵測為 best-effort try/except 預設 False，不阻擋 setup；`FlashingBusy` → `FLASHING_BUSY` rc 2），同步重生 `README.md` `serialwrap-help` marker（R-16）。
@@ -22,6 +24,7 @@
 
 ### Changed
 
+- **agent 檔改為單一事實來源 + symlink**：`AGENTS.md` / `GEMINI.md` / `.github/copilot-instructions.md` 改為指向 `CLAUDE.md` 的 symlink，往後只維護 `CLAUDE.md`；原 `.github/copilot-instructions.md` 專屬的「實際命令／高層架構／關鍵慣例／測試與除錯重點」併入 `CLAUDE.md`（操作事實對齊現行 pipx + systemd + XDG 流程）。policy_check R-13（`is_file()`）/ R-14（`read_text()` 找 `policy_version`）跟隨 symlink 解析至 `CLAUDE.md`，仍合規 v1.0.5。
 - agent skill 整併為 repo 內唯一權威來源 `skills/serialwrap/SKILL.md`（CLI-first，改名 `serialwrap-mcp` → `serialwrap`），`install.sh` symlink 到 `~/.agents/skills/`；移除 root `skills.md`。(#59)
 - 移除 `Dockerfile` 對已退役 `serialwrap-mcp` 的 `chmod +x`（該檔已隨 MCP 退役刪除，否則 `docker build` 及 `tools/docker/remote_smoke.sh` remote smoke 會因檔案不存在而失敗）。(#59)
 - 文件與現行架構對齊：刪除 `sills.md` 轉址 stub；`docs/serialwrap-spec.md` 降級為概覽並指向 `openspec/specs/*`；`docs/plan.md`/`docs/todos.md` 標為歷史快照；`README.md` 狀態機補 `RELEASED`(#54)/`FLASHING`(#55)；`skills.md` 加 #59 cross-ref 與過時標記。
@@ -36,10 +39,6 @@
 ### Removed
 
 - 退役 vestigial MCP 層：刪除 `sw_mcp/`（含 server.py）與 `serialwrap-mcp` shim，並移除/改寫 4 個 MCP-coupled 測試（event/remote/bootloader 改走 CLI/RPC 路徑覆蓋）。(#59)
-
-### Security
-
-- 配合 `tier: shareable` 的 R-21（已對公開廠商/OS 名減敏），清除 tracked 內容中的個人家目錄絕對路徑（docs/skills 改 `~/`、func-test 改 `/tmp/` 以維持可攜）與雇主裝置型號（改用公開的 `Broadcom CFE 平台` 通稱）；停止追蹤 ctags 索引檔（含絕對路徑）並加入 `.gitignore`。
 
 ### Fixed
 
@@ -56,6 +55,7 @@
 
 ### Security
 
+- 配合 `tier: shareable` 的 R-21（已對公開廠商/OS 名減敏），清除 tracked 內容中的個人家目錄絕對路徑（docs/skills 改 `~/`、func-test 改 `/tmp/` 以維持可攜）與雇主裝置型號（改用公開的 `Broadcom CFE 平台` 通稱）；停止追蹤 ctags 索引檔（含絕對路徑）並加入 `.gitignore`。
 - 將 `profiles/brcm.env`（含 `BRCM_USER` / `BRCM_PASS`）改為 `profiles/brcm.env.example` 範本並停止追蹤；`.gitignore` 新增 `profiles/*.env`，避免本機憑證 profile 被提交。實際憑證由使用者複製範本後在本機填入（`profiles/default.yaml` 的 brcm-template 仍以 `env_file: brcm.env` 載入）。
 
 ## [0.1.0] - 2026-05-15
