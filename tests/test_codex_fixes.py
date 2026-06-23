@@ -109,3 +109,28 @@ def test_setup_aborts_before_materialize_when_flashing(tmp_path, monkeypatch):
     assert rc == 2
     assert calls["materialize"] == 0, "flash 進行中不可在中止前先物化資產"
     importlib.reload(c); importlib.reload(cli)
+
+
+# ── Copilot PR review：loginctl enable-linger 須帶使用者名稱（否則 linger 不生效） ──
+def test_enable_linger_includes_user(tmp_path, monkeypatch):
+    monkeypatch.setenv("USER", "alice")
+    monkeypatch.delenv("LOGNAME", raising=False)
+    from sw_core.sysenv import FakeEffects
+    from sw_core.setup_cmd import reconcile
+    fx = FakeEffects(systemd=True)
+    reconcile(old_mode="on-demand", target_mode="systemd-user", fx=fx, home=tmp_path,
+              daemon_running=False, config_path=tmp_path / "config.yaml")
+    assert ["loginctl", "enable-linger", "alice"] in fx.calls
+    # 不可送出沒帶使用者的版本
+    assert ["loginctl", "enable-linger"] not in fx.calls
+
+
+def test_enable_linger_skipped_when_no_user(tmp_path, monkeypatch):
+    monkeypatch.delenv("USER", raising=False)
+    monkeypatch.delenv("LOGNAME", raising=False)
+    from sw_core.sysenv import FakeEffects
+    from sw_core.setup_cmd import reconcile
+    fx = FakeEffects(systemd=True)
+    reconcile(old_mode="on-demand", target_mode="systemd-user", fx=fx, home=tmp_path,
+              daemon_running=False, config_path=tmp_path / "config.yaml")
+    assert not any(c[:2] == ["loginctl", "enable-linger"] for c in fx.calls)  # 不送空字串

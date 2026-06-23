@@ -376,7 +376,11 @@ def _start_new(
         fx.run(["systemctl", "--user", "daemon-reload"])
         fx.run(["systemctl", "--user", "enable", "serialwrap"])
         fx.run(["systemctl", "--user", "start", "serialwrap"])
-        fx.run(["loginctl", "enable-linger"])
+        # loginctl enable-linger 須帶使用者名稱：多數 systemd 版本不接受省略/空字串，否則 linger
+        # 不生效、服務無法開機自啟（Copilot PR review）。取不到使用者名時略過、不送空字串。
+        _linger_user = os.environ.get("USER") or os.environ.get("LOGNAME")
+        if _linger_user:
+            fx.run(["loginctl", "enable-linger", _linger_user])
     elif target_mode == "systemd-system":
         # 特權：unit 內容先 stage 成真實檔，再以 sudo install 複製到 /etc（避免空檔的 sudo tee）。
         # 未授權路徑已於 reconcile 上游早退，這裡 with_sudo 必為真；保留 else 為防禦。
