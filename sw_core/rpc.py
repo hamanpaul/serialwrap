@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 from collections.abc import Callable
 from typing import Any
 
@@ -80,6 +81,25 @@ class JsonRpcUnixServer:
         if os.path.exists(self._socket_path):
             os.unlink(self._socket_path)
         self._server = await asyncio.start_unix_server(self._handle_client, path=self._socket_path)
+        self._secure_socket()
+
+    def _secure_socket(self) -> None:
+        """限制 socket 權限為 0660，並（若有指定）chgrp 到 SERIALWRAP_SOCKET_GROUP。
+
+        systemd-system 模式下 daemon 以 serialwrap 帳號跑，需把 socket 群組設為 dialout（由 unit
+        的 Environment 指定），讓同群組的其他使用者 CLI 連得上；同時避免 world 可寫（Codex #2）。
+        user 模式 socket 在 $XDG_RUNTIME_DIR、本就僅本人可及，0660 無妨。
+        """
+        try:
+            os.chmod(self._socket_path, 0o660)
+        except OSError:
+            pass
+        group = os.environ.get("SERIALWRAP_SOCKET_GROUP")
+        if group and group.strip():
+            try:
+                shutil.chown(self._socket_path, group=group.strip())
+            except (OSError, LookupError):
+                pass
 
     async def serve_forever(self) -> None:
         if self._server is None:

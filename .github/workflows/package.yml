@@ -1,0 +1,28 @@
+name: Package
+
+on: [pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  package-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 乾淨 venv 安裝套件（走 pyproject）
+        run: |
+          python3 -m venv /tmp/swpkg
+          /tmp/swpkg/bin/pip install --disable-pip-version-check .
+      - name: console_scripts entry points 可解析
+        run: |
+          /tmp/swpkg/bin/serialwrap --help >/dev/null
+          /tmp/swpkg/bin/serialwrapd --help >/dev/null
+      - name: 資產確實隨輪子打包（從 / 執行，避免 repo cwd 遮蔽）
+        run: |
+          cd / && /tmp/swpkg/bin/python -c "from sw_core import assets; pf=assets.list_profile_files(); tf=assets.list_tool_files(); assert any(n.endswith('.yaml') for n in pf), 'profiles 未打包'; assert 'minicom_router.sh' in tf, 'minicom wrappers 未打包'; print('OK assets bundled:', pf, tf)"
+      - name: serialwrap doctor 可執行（無 systemd 容器 → on-demand）
+        run: cd / && /tmp/swpkg/bin/serialwrap doctor

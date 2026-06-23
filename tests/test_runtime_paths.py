@@ -27,6 +27,7 @@ class TestRuntimePaths(unittest.TestCase):
                 importlib.reload(constants)
 
                 self.assertEqual(constants.STATE_DIR, state_dir)
+                # 向後相容：只設 SERIALWRAP_STATE_DIR 時 RUN_DIR 預設＝STATE_DIR（socket/lock 落其下）
                 self.assertEqual(constants.RUN_DIR, state_dir)
                 self.assertEqual(constants.WAL_DIR, os.path.join(state_dir, "wal"))
 

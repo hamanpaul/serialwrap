@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "serialwrap"
+dynamic = ["version"]
+description = "UART broker daemon + CLI（多 agent/human 共用序列埠）"
+requires-python = ">=3.10"
+dependencies = ["PyYAML>=6"]
+
+[project.scripts]
+serialwrap = "sw_core.cli:main"
+serialwrapd = "sw_core.daemon:main"
+
+[tool.setuptools]
+packages = ["sw_core", "sw_core.event_engine", "sw_core.assets"]
+
+[tool.setuptools.package-data]
+"sw_core.assets" = ["profiles/*", "tools/*", "skill/**/*"]
+
+[tool.setuptools.dynamic]
+version = { file = ["VERSION"] }

@@ -216,7 +216,7 @@ class TestUbootTemplateProfile(unittest.TestCase):
         from sw_core.config import load_profiles
 
         repo_root = Path(__file__).resolve().parent.parent
-        result = load_profiles(str(repo_root / "profiles"))
+        result = load_profiles(str(repo_root / "sw_core" / "assets" / "profiles"))
         by_name = {t.profile_name: t for t in result.templates}
         self.assertIn("uboot-template", by_name)
 

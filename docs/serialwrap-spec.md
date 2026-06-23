@@ -53,7 +53,7 @@
 - `sw_core/login_fsm.py`
 - `sw_core/device_watcher.py`
 - `sw_core/wal.py`
-- `tools/minicom_router.sh`
+- `sw_core/assets/tools/minicom_router.sh`
 
 ### 3.2 系統架構圖
 

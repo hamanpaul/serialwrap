@@ -42,7 +42,7 @@
 | `sw_core/service.py` | Register 10 new RPC methods, load engine in daemon startup |
 | `sw_core/cli.py` | New `event` subcommand group |
 | sw_mcp/server.py（已退役 #59）| 10 new tool definitions with required "call status first" notice |
-| `README.md`, `skills/serialwrap/SKILL.md` | Doc additions |
+| `README.md`, `sw_core/assets/skill/SKILL.md` | Doc additions |
 
 ---
 
@@ -3270,18 +3270,18 @@ git commit -m "test(event): func-test ev-01 covers spawn handler end-to-end"
 
 ## Phase 14 — Documentation & issue closure
 
-### Task 14.1: README + skills/serialwrap/SKILL.md
+### Task 14.1: README + sw_core/assets/skill/SKILL.md
 
-**Files:** Modify `README.md`, `skills/serialwrap/SKILL.md`
+**Files:** Modify `README.md`, `sw_core/assets/skill/SKILL.md`
 
 - [ ] **Step 1:** Add a short section to `README.md` titled `Event Trigger (issue #37)` that links to `docs/design-event-trigger.md` and `docs/plan-event-trigger.md`, lists the 10 MCP tools by name, and shows one minimal rule example.
 
-- [ ] **Step 2:** Update `skills/serialwrap/SKILL.md` with the new `event` subcommand group + at least one example. Add a "**先呼叫 serialwrap event status**" warning to the description.
+- [ ] **Step 2:** Update `sw_core/assets/skill/SKILL.md` with the new `event` subcommand group + at least one example. Add a "**先呼叫 serialwrap event status**" warning to the description.
 
 - [ ] **Step 3:** Commit.
 
 ```bash
-git add README.md skills/serialwrap/SKILL.md
+git add README.md sw_core/assets/skill/SKILL.md
 git commit -m "docs(event): document event trigger CLI / MCP / safety contract"
 ```
 

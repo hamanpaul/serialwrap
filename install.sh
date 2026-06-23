@@ -1,69 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TARGET_DIR="${1:-${HOME}/.paul_tools}"
-
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-  echo "Usage: ${0} [install_dir]"
-  echo "Default install_dir: ${HOME}/.paul_tools"
+  echo "Usage: ${0} [setup-args...]"
+  echo "以 pipx 安裝 serialwrap（隔離 venv）並執行 serialwrap setup；額外參數轉給 setup。"
   exit 0
 fi
-
-mkdir -p "${TARGET_DIR}"
-mkdir -p "${TARGET_DIR}/sw_core"
-mkdir -p "${TARGET_DIR}/profiles"
-mkdir -p "${TARGET_DIR}/tools"
-mkdir -p "${TARGET_DIR}/docs"
-
-install -m 0755 "${SCRIPT_DIR}/serialwrap" "${TARGET_DIR}/serialwrap"
-install -m 0755 "${SCRIPT_DIR}/serialwrapd.py" "${TARGET_DIR}/serialwrapd.py"
-install -m 0755 "${SCRIPT_DIR}/tools/minicom_router.sh" "${TARGET_DIR}/minicom_router.sh"
-ln -sfn "${TARGET_DIR}/minicom_router.sh" "${TARGET_DIR}/minicom"
-install -m 0755 "${SCRIPT_DIR}/tools/minicom-broker.sh" "${TARGET_DIR}/minicom-broker.sh"
-install -m 0755 "${SCRIPT_DIR}/tools/minicom-raw.sh" "${TARGET_DIR}/minicom-raw.sh"
-
-cp -a "${SCRIPT_DIR}/sw_core/." "${TARGET_DIR}/sw_core/"
-cp -a "${SCRIPT_DIR}/profiles/." "${TARGET_DIR}/profiles/"
-cp -a "${SCRIPT_DIR}/tools/." "${TARGET_DIR}/tools/"
-cp -a "${SCRIPT_DIR}/docs/." "${TARGET_DIR}/docs/"
-
-# Expose the repo-canonical agent skill via the shared skills dir (symlink to repo source).
-mkdir -p "${HOME}/.agents/skills"
-ln -sfn "${SCRIPT_DIR}/skills/serialwrap" "${HOME}/.agents/skills/serialwrap"
-
-# Remove legacy artifacts that are no longer part of the mainline design.
-rm -f "${TARGET_DIR}/serialwrap_lib.py"
-rm -f "${TARGET_DIR}/__pycache__/serialwrap_lib."*.pyc 2>/dev/null || true
-rm -f "${TARGET_DIR}/serialwrap-mcp"
-rm -rf "${TARGET_DIR}/sw_mcp"
-
-DEFAULT_PROFILE_PATH="${TARGET_DIR}/profiles/default.yaml"
-DEFAULT_PLACEHOLDER_BY_ID="/dev/serial/by-id/target3"
-INSTALL_AUTOBIND="${SERIALWRAP_INSTALL_AUTOBIND:-1}"
-
-if [[ "${INSTALL_AUTOBIND}" == "1" && -f "${DEFAULT_PROFILE_PATH}" ]]; then
-  mapfile -t by_id_entries < <(compgen -G "/dev/serial/by-id/*" || true)
-  if /usr/bin/grep -Fq "${DEFAULT_PLACEHOLDER_BY_ID}" "${DEFAULT_PROFILE_PATH}" \
-    && [[ "${#by_id_entries[@]}" -eq 1 ]] \
-    && [[ -e "${by_id_entries[0]}" ]]; then
-    /usr/bin/sed -i "s#${DEFAULT_PLACEHOLDER_BY_ID}#${by_id_entries[0]}#g" "${DEFAULT_PROFILE_PATH}"
-    echo "[serialwrap] auto-bind default target to: ${by_id_entries[0]}"
-  fi
+if command -v pipx >/dev/null 2>&1; then
+  pipx install --force "${SCRIPT_DIR}"
+else
+  echo "[serialwrap] 未找到 pipx，改用 pip install --user（建議改用 pipx 取得隔離 venv）" >&2
+  python3 -m pip install --user --force-reinstall "${SCRIPT_DIR}"
 fi
-
-cat <<MSG
-[serialwrap] install done
-  target: ${TARGET_DIR}
-  binary: ${TARGET_DIR}/serialwrap
-  daemon: ${TARGET_DIR}/serialwrapd.py
-  minicom: ${TARGET_DIR}/minicom
-  minicom router: ${TARGET_DIR}/minicom_router.sh
-  skill: ${HOME}/.agents/skills/serialwrap
-
-Suggested shell setup:
-  export PATH="${TARGET_DIR}:\$PATH"
-  hash -r 2>/dev/null || true
-  # 若 shell 已經有 alias minicom，請先 unalias minicom
-  # 用 type -a minicom 確認目前先命中 ${TARGET_DIR}/minicom
+hash -r 2>/dev/null || true
+echo "[serialwrap] 套件已安裝；接著執行 serialwrap setup ..."
+if command -v serialwrap >/dev/null 2>&1; then
+  serialwrap setup "$@"
+else
+  cat >&2 <<'MSG'
+[serialwrap] serialwrap 不在 PATH。請確認 ~/.local/bin 在 PATH（pipx 可用 `pipx ensurepath`），
+重開 shell 後執行：serialwrap setup
 MSG
+  exit 1
+fi

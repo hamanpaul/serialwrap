@@ -11,8 +11,16 @@ else
 fi
 
 SERIALWRAP_BIN="${SERIALWRAP_BIN:-${BASE_DIR}/serialwrap}"
-SOCKET="${SERIALWRAP_SOCKET:-/tmp/serialwrap/serialwrapd.sock}"
-PROFILE_DIR="${SERIALWRAP_PROFILE_DIR:-${BASE_DIR}/profiles}"
+# 不再硬編 socket/profile：改由 serialwrap CLI 依 config.yaml / XDG / SERIALWRAP_* 解析（Codex #3/#5），
+# 確保與 daemon 單一事實來源一致，且 throwaway（只設 SERIALWRAP_RUN_DIR）也能正確隔離、不誤連全域 /tmp。
+# 僅當使用者明確設定 SERIALWRAP_SOCKET 時，才以 --socket 覆寫 CLI 的自動解析。
+SW() {
+  if [[ -n "${SERIALWRAP_SOCKET:-}" ]]; then
+    "${SERIALWRAP_BIN}" --socket "${SERIALWRAP_SOCKET}" "$@"
+  else
+    "${SERIALWRAP_BIN}" "$@"
+  fi
+}
 AUTO_START_DAEMON="${SERIALWRAP_AUTO_START_DAEMON:-1}"
 ATTACH_WHEN_NOT_READY="${SERIALWRAP_ATTACH_WHEN_NOT_READY:-1}"
 ATTACH_WAIT_TICKS="${SERIALWRAP_ATTACH_WAIT_TICKS:-60}"
@@ -99,7 +107,7 @@ if [[ $# -gt 0 ]]; then
 fi
 
 _get_sessions_json() {
-  "${SERIALWRAP_BIN}" --socket "${SOCKET}" session list 2>/dev/null || true
+  SW session list 2>/dev/null || true
 }
 
 _json_ok() {
@@ -236,7 +244,14 @@ _ensure_daemon() {
     printf '%s' "${state_json}"
     return 0
   fi
-  "${SERIALWRAP_BIN}" --socket "${SOCKET}" daemon start --profile-dir "${PROFILE_DIR}" >/dev/null 2>&1 || true
+  local mode
+  mode="$("${SERIALWRAP_BIN}" supervision-mode 2>/dev/null || echo on-demand)"
+  if [[ "${mode}" != "on-demand" ]]; then
+    echo "serialwrap: daemon 由 systemd 管理（${mode}），不自動啟動。請執行: systemctl --user start serialwrap（或 system 模式: sudo systemctl start serialwrap）" >&2
+    printf '%s' "${state_json}"
+    return 0
+  fi
+  SW daemon start >/dev/null 2>&1 || true
   for _ in $(seq 1 30); do
     state_json="$(_get_sessions_json)"
     if _json_ok "${state_json}"; then
@@ -310,7 +325,7 @@ _wait_ready_only_row() {
 
 _attach_console_json() {
   local sel="$1"
-  "${SERIALWRAP_BIN}" --socket "${SOCKET}" session console-attach --selector "${sel}" --label "minicom:$$" 2>/dev/null || true
+  SW session console-attach --selector "${sel}" --label "minicom:$$" 2>/dev/null || true
 }
 
 _run_broker_minicom() {
@@ -335,7 +350,7 @@ _run_broker_minicom() {
   fi
 
   cleanup() {
-    "${SERIALWRAP_BIN}" --socket "${SOCKET}" session console-detach --selector "${sel}" --client-id "${client_id}" >/dev/null 2>&1 || true
+    SW session console-detach --selector "${sel}" --client-id "${client_id}" >/dev/null 2>&1 || true
   }
   trap cleanup EXIT INT TERM
   local rc
@@ -357,14 +372,14 @@ if _json_ok "${state_json}"; then
     if [[ -z "${row}" && "${ATTACH_WHEN_NOT_READY}" == "1" ]]; then
       selector="$(_find_attach_selector_default "${state_json}")"
       if [[ -n "${selector}" ]]; then
-        "${SERIALWRAP_BIN}" --socket "${SOCKET}" session attach --selector "${selector}" >/dev/null 2>&1 || true
+        SW session attach --selector "${selector}" >/dev/null 2>&1 || true
         row="$(_wait_console_row "${selector}")"
       fi
     fi
   else
     row="$(_find_row_by_selector "${state_json}" "${selector}")"
     if [[ -n "${row}" && "$(printf '%s' "${row}" | jq -r '.state // ""')" != "READY" && "$(printf '%s' "${row}" | jq -r '.state // ""')" != "ATTACHED" && "${ATTACH_WHEN_NOT_READY}" == "1" ]]; then
-      "${SERIALWRAP_BIN}" --socket "${SOCKET}" session attach --selector "${selector}" >/dev/null 2>&1 || true
+      SW session attach --selector "${selector}" >/dev/null 2>&1 || true
       row="$(_wait_console_row "${selector}")"
     fi
   fi
@@ -432,6 +447,6 @@ if [[ "$(printf '%s' "${state_json:-}" | jq -r '.ok // false' 2>/dev/null || pri
 else
   echo "minicom_router: broker not ready, no READY/ATTACHED session, and MINICOM_RAW_DEVICE not set" >&2
 fi
-echo "hint: ${SERIALWRAP_BIN} daemon start --profile-dir ${PROFILE_DIR}" >&2
+echo "hint: ${SERIALWRAP_BIN} daemon start" >&2
 echo "hint: ${SERIALWRAP_BIN} session list" >&2
 exit 2

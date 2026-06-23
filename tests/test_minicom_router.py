@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-ROUTER = REPO_ROOT / "tools" / "minicom_router.sh"
+ROUTER = REPO_ROOT / "sw_core" / "assets" / "tools" / "minicom_router.sh"
 TEMP_ROOT = REPO_ROOT / ".test-minicom-router.tmp"
 
 
