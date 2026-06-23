@@ -15,7 +15,7 @@
 - [x] `session_manager.py`：`_attach_by_id_dynamic()` 完整實作
 - [x] `service.py`：傳遞 `templates` + `max_sessions` 給 SessionManager
 - [x] `serialwrapd.py`：解包 `LoadResult` 並傳入 service
-- [x] `profiles/default.yaml`：加回 prpl-template、targets 改為可選、加 `max_sessions: 16`
+- [x] `sw_core/assets/profiles/default.yaml`：加回 prpl-template、targets 改為可選、加 `max_sessions: 16`
 - [x] `tests/test_login_fsm.py`：新增 7 個 `detect_template` 測試
 - [x] `tests/test_session_bind.py`：新增 5 個動態 session 測試
 - [x] `README.md`：更新 Profile 段落，反映動態偵測
