@@ -236,11 +236,16 @@ class FlashingBusy(Exception):
     """flash 進行中且未帶 force 時拋出，表示不可在此刻切換監管模式。"""
 
 
-# systemd user/system scope 的 unit 安裝路徑與 ExecStart。
+# systemd user/system scope 的 unit 安裝路徑、固定 socket/profile 與 ExecStart。
 _USER_UNIT_REL = Path(".config") / "systemd" / "user" / "serialwrap.service"
 _USER_EXEC_START = "%h/.local/bin/serialwrapd"
 _SYSTEM_UNIT_PATH = "/etc/systemd/system/serialwrap.service"
-_SYSTEM_EXEC_START = "/usr/local/bin/serialwrapd --socket /run/serialwrap/serialwrapd.sock"
+# system scope 為跨使用者共用，路徑固定於系統位置（不隨呼叫者 XDG 變動）：
+# socket 於 RuntimeDirectory、profiles 於 ConfigurationDirectory。供 cli 寫 config 的有效 socket
+# 與 daemon --profile-dir 一致對齊（Codex #1a/#1b）。
+SYSTEM_SOCKET = "/run/serialwrap/serialwrapd.sock"
+SYSTEM_PROFILE_DIR = "/etc/serialwrap/profiles"
+_SYSTEM_EXEC_START = f"/usr/local/bin/serialwrapd --socket {SYSTEM_SOCKET} --profile-dir {SYSTEM_PROFILE_DIR}"
 
 
 def _stage_system_unit(home: Path) -> Path:
@@ -255,11 +260,25 @@ def _stage_system_unit(home: Path) -> Path:
     return staging
 
 
+def _stage_system_profiles(home: Path) -> Path:
+    """把套件內 profiles 物化到非特權 staging 目錄，供 sudo 複製到 /etc/serialwrap/profiles。"""
+    staging = home / ".local" / "share" / "serialwrap" / "system-profiles"
+    _assets.copy_tree("profiles", staging)
+    return staging
+
+
 def _system_install_cmds(home: Path, *, include_start: bool) -> list[list[str]]:
-    """組出 system scope 安裝/啟用 unit 的特權指令（unit 內容已先 stage 成真實檔）。"""
-    staging = _stage_system_unit(home)
+    """組出 system scope 安裝/啟用 unit + profiles 的特權指令（內容已先 stage 成真實檔）。
+
+    含把 profiles 安裝到 ``/etc/serialwrap/profiles``——否則 system daemon 的
+    ``--profile-dir`` 指向系統路徑卻沒有內容、開機讀不到 profiles（Codex #1b）。
+    """
+    unit_staging = _stage_system_unit(home)
+    prof_staging = _stage_system_profiles(home)
     cmds = [
-        ["sudo", "install", "-m", "0644", str(staging), _SYSTEM_UNIT_PATH],
+        ["sudo", "install", "-m", "0644", str(unit_staging), _SYSTEM_UNIT_PATH],
+        ["sudo", "mkdir", "-p", SYSTEM_PROFILE_DIR],
+        ["sudo", "cp", "-r", f"{prof_staging}/.", SYSTEM_PROFILE_DIR],
         ["sudo", "systemctl", "daemon-reload"],
         ["sudo", "systemctl", "enable", "serialwrap"],
     ]
@@ -426,12 +445,20 @@ def reconcile(
 
     cfg = RuntimeConfig(config_path or (home / ".config" / "serialwrap" / "config.yaml"))
 
-    # ── 護欄 2：system scope 需 root；未帶 with_sudo → 蒐集 pending 並早退，且
-    #    「不停舊、不寫 config」。否則會留下「config 說 systemd-system 但 unit 沒裝、
-    #    daemon 沒跑」的半套/分歧狀態（I-1）；也避免白白停掉仍可用的舊 daemon。
-    #    使用者改用 `serialwrap setup --system --with-sudo` 或手動跑 pending 即可套用。
-    if target_mode == "systemd-system" and not with_sudo:
-        pending = _system_install_cmds(home, include_start=(old_mode != target_mode))
+    # ── 護欄 2：涉及 system scope 的特權操作（裝/起新 system unit、或停舊 system service）都需 root；
+    #    未帶 with_sudo → 蒐集 pending 並早退，且「不停舊、不起新、不寫 config」。這同時擋掉兩種半套：
+    #    (a) config 說 systemd-system 但 unit 沒裝/daemon 沒跑（I-1）；
+    #    (b) 從 systemd-system 轉出時，舊 system daemon 未被停掉卻又起新 daemon → /dev/ttyUSB*
+    #        two-reader（Codex 對抗式審查 CRITICAL #4）。使用者改用 --with-sudo 或手動跑 pending。
+    _system_target = target_mode == "systemd-system"
+    _system_old_transition = old_mode == "systemd-system" and old_mode != target_mode
+    if (_system_target or _system_old_transition) and not with_sudo:
+        pending: list[list[str]] = []
+        if _system_old_transition:
+            pending.append(["sudo", "systemctl", "stop", "serialwrap"])
+            pending.append(["sudo", "systemctl", "disable", "serialwrap"])
+        if _system_target:
+            pending.extend(_system_install_cmds(home, include_start=(old_mode != target_mode)))
         return {
             "mode": old_mode,            # 實際生效模式未變（config 不寫）
             "requested_mode": target_mode,

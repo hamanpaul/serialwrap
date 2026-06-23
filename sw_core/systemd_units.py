@@ -67,6 +67,8 @@ SupplementaryGroups=dialout
 RuntimeDirectory=serialwrap
 StateDirectory=serialwrap
 ConfigurationDirectory=serialwrap
+UMask=0117
+Environment=SERIALWRAP_SOCKET_GROUP=dialout
 ExecStart={exec_start}
 Restart=on-failure
 RestartSec=2

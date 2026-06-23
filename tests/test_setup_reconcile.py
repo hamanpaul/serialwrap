@@ -113,3 +113,35 @@ def test_system_with_sudo_installs_real_unit_content(tmp_path):
     content = staging.read_text(encoding="utf-8")
     assert "User=serialwrap" in content and "ExecStart=" in content  # 真實 system unit
     assert any(c[:2] == ["sudo", "install"] for c in fx.calls)
+
+
+def test_transition_out_of_system_without_sudo_blocks_no_two_reader(tmp_path):
+    """CRITICAL #4：systemd-system → user 未帶 sudo，不可停不了舊卻起新（two-reader）。"""
+    from sw_core.sysenv import FakeEffects
+    from sw_core.runtime_config import RuntimeConfig
+    from sw_core.setup_cmd import reconcile
+    fx = FakeEffects(systemd=True)
+    cfgp = tmp_path / "config.yaml"
+    res = reconcile(old_mode="systemd-system", target_mode="systemd-user", fx=fx, home=tmp_path,
+                    daemon_running=True, with_sudo=False, config_path=cfgp)
+    assert res["applied"] is False
+    assert res["mode"] == "systemd-system"          # 模式未變
+    assert fx.calls == []                            # 什麼都沒跑（沒停舊、沒起新）
+    assert RuntimeConfig(cfgp).mode() is None        # config 沒被改寫
+    assert any("stop" in " ".join(c) for c in res["pending_sudo"])  # 停舊列為待辦
+    # 新 user unit 不可被寫出（沒起新）
+    assert not (tmp_path / ".config" / "systemd" / "user" / "serialwrap.service").exists()
+
+
+def test_transition_out_of_system_with_sudo_stops_before_starts(tmp_path):
+    """systemd-system → user 帶 sudo：先停舊 system service，再起新 user unit。"""
+    from sw_core.sysenv import FakeEffects
+    from sw_core.setup_cmd import reconcile
+    fx = FakeEffects(systemd=True)
+    res = reconcile(old_mode="systemd-system", target_mode="systemd-user", fx=fx, home=tmp_path,
+                    daemon_running=True, with_sudo=True)
+    cmds = [" ".join(c) for c in fx.calls]
+    stop_idx = next(i for i, c in enumerate(cmds) if "stop" in c)
+    start_idx = next(i for i, c in enumerate(cmds) if "start" in c)
+    assert stop_idx < start_idx, f"停舊須在起新之前: {cmds}"
+    assert res["applied"] is True and res["mode"] == "systemd-user"

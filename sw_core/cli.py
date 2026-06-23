@@ -14,7 +14,7 @@ from .constants import CONFIG_DIR, LOCK_PATH, PROFILE_DIR, SOCKET_PATH
 from .doctor_cmd import run_doctor
 from .runtime_config import RuntimeConfig
 from .service_ctl import service_action
-from .setup_cmd import FlashingBusy, detect_legacy_install, materialize_assets, reconcile
+from .setup_cmd import SYSTEM_SOCKET, FlashingBusy, detect_legacy_install, materialize_assets, reconcile
 
 _USE_DEFAULT_ENV = object()
 LEGACY_DAEMON_ENV_FILE = "~/OPI.env"
@@ -202,10 +202,20 @@ def _run_daemon_stop(args: argparse.Namespace) -> int:
 def _resolve_endpoint(args: argparse.Namespace) -> str:
     """回傳實際連接 endpoint。
 
-    若有 ``--endpoint`` 則優先，否則回 ``--socket`` 值（向後相容）。
+    優先序：``--endpoint`` > 明確指定的 ``--socket``（非預設）> config.yaml 記錄的有效 socket
+    > 預設 ``SOCKET_PATH``。讀 config 是為了讓 systemd-system 裝完後 CLI 連到系統 daemon 的
+    socket（``/run/serialwrap/...``）而非使用者 XDG socket（Codex #1a）。
     """
     ep = getattr(args, "endpoint", None)
-    return ep if ep else args.socket
+    if ep:
+        return ep
+    if args.socket and args.socket != SOCKET_PATH:
+        return args.socket
+    try:
+        cfg_sock = _default_runtime_config().socket_path()
+    except Exception:
+        cfg_sock = None
+    return cfg_sock or args.socket
 
 
 def _run_rpc(args: argparse.Namespace, method: str, params: dict[str, Any]) -> int:
@@ -299,26 +309,36 @@ def _run_setup(args: argparse.Namespace) -> int:
     # 1. legacy 偵測（僅指引、不刪除）。
     legacy = detect_legacy_install()
 
-    # 2. 物化套件資產到使用者可寫位置。
-    materialize_assets(force=args.force)
-
-    # 3. 解析目標模式與目前（舊）模式。
+    # 2. 解析目標模式與目前（舊）模式。
     target = _resolve_target_mode(args, fx)
     old = _default_runtime_config().mode() or "on-demand"
 
-    # 4. daemon/flash 偵測：best-effort，連不到一律 False，不阻擋 setup。
+    # 3. daemon/flash 偵測：best-effort，連不到一律 False，不阻擋 setup。
+    #    flash 偵測須在物化「之前」——否則燒錄中仍會先覆寫 profiles/wrappers/skill 才報錯（Codex #1c）。
     daemon_running = False
     any_flashing = False
     try:
-        daemon_running = bool(rpc_call(SOCKET_PATH, "health.ping", {}, timeout_s=0.5).get("ok"))
+        daemon_running = bool(rpc_call(_resolve_endpoint(args), "health.ping", {}, timeout_s=0.5).get("ok"))
     except Exception:
         daemon_running = False
     try:
-        any_flashing = bool(rpc_call(SOCKET_PATH, "mcu.status", {}, timeout_s=0.5).get("flashing"))
+        any_flashing = bool(rpc_call(_resolve_endpoint(args), "mcu.status", {}, timeout_s=0.5).get("flashing"))
     except Exception:
         any_flashing = False
 
-    # 5. reconcile（先停舊、再起新）；flash 進行中除非 force 否則拒絕。
+    # 4. flash 護欄前置：進行中且未 force → 立即中止，不物化、不動模式（Codex #1c）。
+    if any_flashing and not args.force:
+        _print({"ok": False, "error_code": "FLASHING_BUSY",
+                "message": "flash 進行中，拒絕 setup（可用 --force 覆寫）"})
+        return 2
+
+    # 5. 物化套件資產到使用者可寫位置。
+    materialize_assets(force=args.force)
+
+    # 6. 有效 socket：systemd-system 走系統固定 socket，其餘走使用者 XDG 預設（Codex #1a/#1b）。
+    effective_socket = SYSTEM_SOCKET if target == "systemd-system" else SOCKET_PATH
+
+    # 7. reconcile（先停舊、再起新）；flash 進行中除非 force 否則拒絕。
     try:
         result = reconcile(
             old_mode=old,
@@ -329,7 +349,7 @@ def _run_setup(args: argparse.Namespace) -> int:
             any_flashing=any_flashing,
             with_sudo=args.with_sudo,
             force=args.force,
-            socket_path=SOCKET_PATH,
+            socket_path=effective_socket,
             # config 寫入路徑須與所有讀取端（_default_runtime_config→CONFIG_DIR）一致，
             # 否則自訂 XDG_CONFIG_HOME/SERIALWRAP_CONFIG_DIR 下 writer≠reader 會分歧（I-1）。
             config_path=os.path.join(CONFIG_DIR, "config.yaml"),
