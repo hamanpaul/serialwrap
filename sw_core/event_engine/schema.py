@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import json
 import re
-import subprocess
-import sys
 import types
 from dataclasses import dataclass, field
 from typing import Any
@@ -15,18 +12,12 @@ _VALID_PATTERN_KIND = {"contains", "regex"}
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _OWNER_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 
-# ReDoS 防護（#83 STA-4；Codex 必修強化）：使用者可控 regex 規則由單執行緒 matcher 逐行 re.search
-# 求值（CPython re 在 catastrophic backtracking 期間獨佔 GIL、不檢查 signal，thread/signal timeout 無法
-# 中斷），故無法靠 per-line runtime timeout。改採兩層防護：
-#  (1) upsert 時以 **stdlib 解析器走訪 AST**（非脆弱的 regex-on-regex heuristic）結構性拒絕「重複>1 次且
-#      重複單元模糊（含巢狀量詞或 alternation）」的指數回溯類——完整涵蓋 (a+)+、(a|aa)+、(a?)+、
-#      (a{1,3})+、(.*)* 等（原 heuristic 可被後三者繞過）。
-#  (2) matcher 對 regex 求值的輸入長度封頂（REGEX_MATCH_INPUT_MAX），使殘餘多項式回溯成本有界，即便
-#      靜態分析漏放亦不致凍結單執行緒 matcher（line_buffer 已 16KB 截斷，此處對 regex 再收緊）。
-# 完全消除多項式 ReDoS 需 re2 類線性引擎（無回溯），列為可選未來強化。
+# ReDoS 防護（#83 STA-4 / #91）：規則 regex 由單執行緒 matcher 逐行 re.search 求值，catastrophic
+# backtracking 會凍結 matcher。最終設計（見下方 fail-closed 段）：有 re2＝線性免疫；無 re2＝對結構上
+# 可疑 regex fail-closed 拒絕；matcher 另以 REGEX_MATCH_INPUT_MAX 封頂 re 路徑輸入長度作 runtime 兜底。
 _REGEX_MAX_LEN = 512
 REGEX_MATCH_INPUT_MAX = 4096
-"""matcher 對單行 regex 求值時，最多餵入的字元數（ReDoS runtime 防護；超過部分不參與比對）。"""
+"""matcher 對單行 regex 求值時，最多餵入的字元數（ReDoS runtime 兜底；超過部分不參與比對）。"""
 
 # stdlib regex AST 解析器：3.11+ 為 re._parser / re._constants；3.10 為 sre_parse / sre_constants。
 try:  # pragma: no cover - 版本相依匯入
@@ -98,34 +89,19 @@ def _walk_ast(subpattern: Any):
             yield from _walk_ast(child)
 
 
-# ── ReDoS 防護（#83 STA-4 / #91 Codex 必修，三輪對抗式審查收斂）─────────────────────────────
-# 標準 re 於 catastrophic backtracking 期間獨佔 GIL、不可中斷；任何「靜態 AST 啟發式」都被對抗式審查
-# 逐一繞過（指數→多項式→寬原子等價形 [\s\S]*→大量有界 a{0,4096}→backreference (a*)\1），同時又誤拒
-# 安全 pattern（\d+\.\d+）。改用**經驗式探測**：對「可疑」pattern（≥2 個回溯量詞，或含 backreference）
-# 於 upsert 在獨立子行程以硬 timeout 實跑 re.search 對抗輸入；逾時＝catastrophic → 拒絕。empirical 不依賴
-# 結構形狀，無法被任何 AST 形繞過；安全 pattern 數百毫秒內完成、不誤拒。僅在 pattern 將落到標準 re 路徑
-# （re2 不可用或不支援）時啟用；裝 google-re2 線性引擎即一律免疫、不探測。
-_OP_LITERAL = _sre_constants.LITERAL
-_OP_NOT_LITERAL = _sre_constants.NOT_LITERAL
-_OP_IN = _sre_constants.IN
-_OP_NEGATE = _sre_constants.NEGATE
-_OP_RANGE = _sre_constants.RANGE
-_OP_CATEGORY = _sre_constants.CATEGORY
+# ── ReDoS 防護（#83 STA-4 / #91；9 輪 Codex 對抗式審查後收斂為 fail-closed）─────────────────────
+# 結論：標準 re 於 catastrophic backtracking 期間獨佔 GIL、不可中斷；任何「靜態 AST 啟發式」或「經驗式
+# 子行程探測」都被對抗式審查逐輪繞過（指數→多項式→寬原子 [\s\S]*→大量有界 a{0,4096}→backref (a*)\1→
+# 多字元單元 (?:ab|abab)*→負類排除→inline flags (?i:…)→失敗尾→path-context prefix），是無界軍備競賽，
+# 且 timing-based 探測本質 flaky。唯一**完整、確定、無 flaky** 的解：
+#   • 有 re2 線性引擎（可選依賴 `pip install 'serialwrap[redos]'`）→ 零結構限制（re2 對任何 pattern 皆
+#     線性、無回溯，徹底免疫）。
+#   • 無 re2（pattern 將落到標準 re 路徑）→ 對「結構上可疑」的 regex 一律 **fail-closed 拒絕**。
+# 可疑＝(a) ≥2 個會回溯量詞（多項式，含大量有界 {0,N}）、(b) backreference、(c) 量詞單元含 alternation／
+# 巢狀量詞（指數）。此三者經驗證為 catastrophic 的**完整結構超集**（單一非歧義量詞為線性、安全），故
+# fail-closed 無漏放、且不誤擋 contains 與單量詞 regex（如 Kernel panic、temp=(\d+)C、root@.*#）。
+# matcher 另以 REGEX_MATCH_INPUT_MAX 封頂 re 路徑輸入長度作 runtime 兜底。
 _OP_GROUPREF = _sre_constants.GROUPREF
-_CATEGORY_REPR = {
-    _sre_constants.CATEGORY_DIGIT: "0", _sre_constants.CATEGORY_WORD: "a",
-    _sre_constants.CATEGORY_SPACE: " ", _sre_constants.CATEGORY_NOT_DIGIT: "a",
-    _sre_constants.CATEGORY_NOT_WORD: ".", _sre_constants.CATEGORY_NOT_SPACE: "a",
-}
-# 子行程探測預算（秒）：catastrophic pattern 遠超此值 → 逾時即判；安全 pattern 數百毫秒內完成（巨大
-# 裕度，CPU 競態下亦不誤判）。upsert 罕見，1.5s 單次成本可接受；測試可 monkeypatch 調小加速。
-_REDOS_PROBE_BUDGET_S = 1.5
-_REDOS_PROBE_SCRIPT = (
-    "import sys,json,re\n"
-    "d=json.load(sys.stdin)\n"
-    "rx=re.compile(d['v'],d['f'])\n"
-    "[rx.search(s) for s in d['a']]\n"
-)
 
 
 def _count_backtrack_repeats(parsed: Any) -> int:
@@ -148,7 +124,7 @@ def _has_ambiguous_quantified_body(parsed: Any) -> bool:
     """是否有「重複>1 次」的量詞，其重複單元含 alternation 或巢狀量詞——單量詞亦可指數回溯。
 
     `(a|aa)+`、`(a?)+`、`(.*)*` 等：外層只有一個量詞（`_count_backtrack_repeats` 可能 <2），但重複單元
-    模糊 → 指數爆炸。納入預篩，交由子行程探測確認。
+    模糊 → 指數爆炸。
     """
     for op, av in _walk_ast(parsed):
         if op in _BACKTRACK_REPEATS:
@@ -160,279 +136,17 @@ def _has_ambiguous_quantified_body(parsed: Any) -> bool:
 
 
 def _maybe_redos_suspicious(parsed: Any) -> bool:
-    """寬鬆預篩：是否值得做子行程探測（顯然安全的單量詞 pattern 不付探測成本）。
+    """結構上是否可能 catastrophic backtracking——無 re2 時據此 fail-closed 拒絕。
 
-    過度涵蓋無妨——探測是精確仲裁者，會放行實際安全的可疑 pattern（如 `\\d+\\.\\d+`）。
+    (a) ≥2 個會回溯量詞（多項式，含大量有界 `{0,N}`）、(b) backreference、(c) 量詞單元含 alternation／
+    巢狀量詞（指數）。三者為 catastrophic 的**完整結構超集**（單一非歧義量詞為線性、安全）；保守拒絕，
+    可能誤擋少數實際安全的多量詞 pattern（如 `\\d+\\.\\d+`、`\\w+\\s+\\w+`）——裝 re2 即不受此限。
     """
     return (
         _count_backtrack_repeats(parsed) >= 2
         or _has_backref(parsed)
         or _has_ambiguous_quantified_body(parsed)
     )
-
-
-# 找代表字元的掃描順序：可見 ASCII 優先 → 其他控制 → BMP。排除集有限（pattern ≤512 字），故 IN class
-# 必能找到被接受字元，杜絕「攻擊者排除掉固定代表字元」的盲點（round5）。
-_ATTACK_CODEPOINTS = list(range(0x21, 0x7F)) + list(range(0x00, 0x21)) + list(range(0x7F, 0x2000))
-# 類別 → class 內部來源片段，供以**實際 flags** 重建並編譯該原子（flag-aware 成員測試，round6）。
-_CAT_SRC = {
-    _sre_constants.CATEGORY_DIGIT: r"\d", _sre_constants.CATEGORY_NOT_DIGIT: r"\D",
-    _sre_constants.CATEGORY_WORD: r"\w", _sre_constants.CATEGORY_NOT_WORD: r"\W",
-    _sre_constants.CATEGORY_SPACE: r"\s", _sre_constants.CATEGORY_NOT_SPACE: r"\S",
-}
-
-
-def _in_class_regex(av: Any, flags: int):
-    """把 IN class（含 NEGATE/literal/range/category）以**實際 flags** 重建並編譯為單字元 regex。
-
-    用真實 re 語意（含 IGNORECASE 的大小寫折疊等）測試候選字元成員，而非手刻判定——後者忽略 flags
-    會挑到實際**不被**負類接受的字元而漏放（Codex round6 [high]：`[^\\x00-\\x60]` + `flags='i'`）。
-    """
-    parts = []
-    items = av
-    if items and items[0][0] == _OP_NEGATE:
-        parts.append("^")
-        items = items[1:]
-    for o, a in items:
-        if o == _OP_LITERAL:
-            parts.append(re.escape(chr(a)))
-        elif o == _OP_RANGE:
-            parts.append(re.escape(chr(a[0])) + "-" + re.escape(chr(a[1])))
-        elif o == _OP_CATEGORY:
-            parts.append(_CAT_SRC.get(a, ""))
-        else:
-            return None  # 罕見巢狀構造 → 放棄重建，由呼叫端 fallback
-    try:
-        return re.compile("[" + "".join(parts) + "]", flags)
-    except re.error:  # pragma: no cover
-        return None
-
-
-def _scan_matching_char(rx, default: str = "a") -> str:
-    """掃描候選 codepoint，回傳第一個被已編譯單字元 regex `rx` fullmatch 的字元。"""
-    for cp in _ATTACK_CODEPOINTS:
-        ch = chr(cp)
-        if rx.fullmatch(ch):
-            return ch
-    return default  # pragma: no cover - 該 class 涵蓋整個掃描範圍（極罕）
-
-
-def _atom_char(op: Any, av: Any, flags: int = 0) -> str:
-    """能被該原子（在實際 flags 下）**確實**匹配的一個代表字元（用於建構對抗輸入）。
-
-    IN class 與 NOT_LITERAL 以「重建+編譯+fullmatch」挑出真正被接受者（flag-aware，含 IGNORECASE）；
-    literal/any/category 之代表本身即與 flags 無關地匹配。
-    """
-    if op == _OP_LITERAL:
-        return chr(av) if 0 <= av < 0x110000 else "a"
-    if op == _OP_CATEGORY:
-        return _CATEGORY_REPR.get(av, "a")
-    if op == _OP_NOT_LITERAL:
-        try:
-            rx = re.compile("[^" + re.escape(chr(av)) + "]", flags)
-            return _scan_matching_char(rx)
-        except (re.error, ValueError):  # pragma: no cover
-            return "a" if av != ord("a") else "b"
-    if op == _OP_IN:
-        rx = _in_class_regex(av, flags)
-        if rx is not None:
-            return _scan_matching_char(rx)
-        for o, a in av:                 # fallback：重建失敗時的結構式取值（正類）
-            if o == _OP_LITERAL:
-                return chr(a) if 0 <= a < 0x110000 else "a"
-            if o == _OP_RANGE:
-                return chr(a[0]) if 0 <= a[0] < 0x110000 else "a"
-            if o == _OP_CATEGORY:
-                return _CATEGORY_REPR.get(a, "a")
-    return "a"
-
-
-def _atom_regex(op: Any, av: Any, flags: int):
-    """把單一原子（literal/not_literal/in/category/any）重建為單字元 regex（實際 flags），供成員測試。"""
-    try:
-        if op == _OP_LITERAL:
-            return re.compile("[" + re.escape(chr(av)) + "]", flags)
-        if op == _OP_NOT_LITERAL:
-            return re.compile("[^" + re.escape(chr(av)) + "]", flags)
-        if op == _OP_IN:
-            return _in_class_regex(av, flags)
-        if op == _OP_CATEGORY:
-            src = _CAT_SRC.get(av)
-            return re.compile("[" + src + "]", flags) if src else None
-        if op == _OP_ANY:
-            return re.compile(".", flags)            # 非 DOTALL：拒 \n
-        if op == _OP_ANY_ALL:
-            return None                              # DOTALL `.`：匹配一切，無拒絕字元
-    except (re.error, ValueError):  # pragma: no cover
-        return None
-    return None
-
-
-def _scan_nonmatching_char(rx) -> "str | None":
-    """掃描候選 codepoint，回傳第一個**不**被單字元 regex `rx` fullmatch 的字元（無則 None）。"""
-    for cp in _ATTACK_CODEPOINTS:
-        ch = chr(cp)
-        if not rx.fullmatch(ch):
-            return ch
-    return None  # pragma: no cover - 該原子匹配整個掃描範圍
-
-
-def _atom_rejecting_char(op: Any, av: Any, flags: int) -> "str | None":
-    """一個該原子（在實際 flags 下）**確實不**匹配的字元（None 表示匹配一切，如 DOTALL `.`）。
-
-    用於建構**會失敗的尾字元**：固定 `\\x01` 對 `[^\\x02]` 這類負類其實仍被匹配 → witness 全程命中、
-    從不走回溯失敗路徑而漏放（Codex round8 [critical]）。改用「以真實 re 語意挑真正被原子拒絕的字元」
-    當失敗尾，強迫 anchored 量詞（如 `^([^\\x02]+)+$`）回溯。
-    """
-    rx = _atom_regex(op, av, flags)
-    if rx is None:
-        return None
-    return _scan_nonmatching_char(rx)
-
-
-def _subpattern_flags(av: Any, flags: int) -> int:
-    """套用 SUBPATTERN 的 scoped inline flags（如 `(?i:...)`）：`(flags | add) & ~del`。
-
-    sre 的 add/del flag 值與 `re.I/S/M` 常數相同，故可直接位元運算。結構為
-    `(group, add_flags, del_flags, subpattern)`；舊版可能無 add/del 欄位 → 維持原 flags。
-    """
-    try:
-        _group, add, dele, _sub = av
-        return (flags | int(add)) & ~int(dele)
-    except (ValueError, TypeError):  # pragma: no cover - 舊版/非預期結構
-        return flags
-
-
-def _representative_match(sp: Any, flags: int, depth: int = 0) -> str:
-    """為一個 SubPattern 產生一段「可被它（在實際 flags 下）匹配」的字串（量詞取 body 一次、取首分支）。
-
-    用於建構**多字元重複單元 witness**：char-only 全填無法觸發 `(?:ab|abab)*`、`(ab)*(ab)*` 這類
-    需要多字元重複串的 catastrophic（Codex round4 [critical]）。
-    """
-    if depth > 24:  # 防深巢狀遞迴爆炸
-        return ""
-    parts: list[str] = []
-    for op, av in sp:
-        if op == _OP_LITERAL:
-            parts.append(chr(av) if 0 <= av < 0x110000 else "a")
-        elif op in (_OP_ANY, _OP_ANY_ALL):
-            parts.append("a")
-        elif op in (_OP_IN, _OP_CATEGORY, _OP_NOT_LITERAL):
-            parts.append(_atom_char(op, av, flags))
-        elif op in _BACKTRACK_REPEATS or (
-            _OP_POSSESSIVE_REPEAT is not None and op == _OP_POSSESSIVE_REPEAT
-        ):
-            parts.append(_representative_match(av[2], flags, depth + 1))   # body 一次
-        elif op == _OP_SUBPATTERN:
-            parts.append(_representative_match(av[-1], _subpattern_flags(av, flags), depth + 1))
-        elif _OP_ATOMIC_GROUP is not None and op == _OP_ATOMIC_GROUP:
-            parts.append(_representative_match(av, flags, depth + 1))
-        elif op == _OP_BRANCH:
-            br = next((b for b in av[1] if b is not None), None)
-            if br is not None:
-                parts.append(_representative_match(br, flags, depth + 1))
-        # AT（anchor）/ASSERT/GROUPREF 等不產生字元
-    return "".join(parts)
-
-
-def _collect_witness_units(sp: Any, flags: int, units: set, reject: set, depth: int = 0) -> None:
-    """遞迴收集 witness 重複單元與「會失敗的尾字元」，沿 SUBPATTERN 邊界傳遞 effective flags。
-
-    平掃（`_walk_ast`）會在進入 `(?i:...)` 子樹時用錯 flags（Codex round7 [high]），故遞迴 thread flags。
-    收集兩類：(1) `units`＝可匹配重複單元（每 atom 代表字元、每量詞 body 與每 alternation 分支的代表匹配
-    串）；(2) `reject`＝每個 atom **不**匹配的字元（用真實 re 語意求；round8 [critical]——固定 `\x01`
-    對 `[^\x02]` 仍被匹配 → witness 全程命中、不走回溯失敗路徑而漏放）。
-    """
-    if depth > 24:
-        return
-    for op, av in sp:
-        if op in (_OP_LITERAL, _OP_IN, _OP_CATEGORY, _OP_NOT_LITERAL, _OP_ANY):
-            if op != _OP_ANY:
-                units.add(_atom_char(op, av, flags))
-            r = _atom_rejecting_char(op, av, flags)
-            if r is not None:
-                reject.add(r)
-        if op in _BACKTRACK_REPEATS or (
-            _OP_POSSESSIVE_REPEAT is not None and op == _OP_POSSESSIVE_REPEAT
-        ):
-            _mn, mx, body = av
-            if mx == _MAXREPEAT or (isinstance(mx, int) and mx > 1):
-                u = _representative_match(body, flags)
-                if u:
-                    units.add(u[:128])
-            _collect_witness_units(body, flags, units, reject, depth + 1)
-        elif op == _OP_SUBPATTERN:
-            _collect_witness_units(av[-1], _subpattern_flags(av, flags), units, reject, depth + 1)
-        elif _OP_ATOMIC_GROUP is not None and op == _OP_ATOMIC_GROUP:
-            _collect_witness_units(av, flags, units, reject, depth + 1)
-        elif op == _OP_BRANCH:
-            for br in av[1]:
-                if br is not None:
-                    bu = _representative_match(br, flags)
-                    if bu:
-                        units.add(bu[:128])
-                    _collect_witness_units(br, flags, units, reject, depth + 1)
-        elif op in (_OP_ASSERT, _OP_ASSERT_NOT):
-            _collect_witness_units(av[1], flags, units, reject, depth + 1)
-        elif op == _OP_GROUPREF_EXISTS:
-            for x in av[1:]:
-                if x is not None:
-                    _collect_witness_units(x, flags, units, reject, depth + 1)
-
-
-def _redos_attack_inputs(parsed: Any, flags: int) -> list[str]:
-    """為 pattern 建構對抗輸入：以「可匹配重複單元」鋪成 4096 長字串，各產生『全填』與『全填+失敗尾』。
-
-    - 單字元 witness：pattern 的 literal/類別代表字元 ＋ 通用 {a,0,space}（觸發多項式/重疊回溯）。
-    - 多字元 witness：每個量詞 body（及其 alternation 各分支）的代表匹配字串重複鋪滿（觸發
-      `(?:ab|abab)*`、`(ab)*(ab)*` 這類需多字元重複串的 catastrophic；Codex round4 [critical]）。
-    - 失敗尾：以**真實被原子拒絕的字元**（per-pattern 求得；round8）＋通用 `\x01`，強迫 anchored 量詞
-      （如 `(a+)+$`、`^([^\x02]+)+$`）回溯失敗。
-    代表字元/拒絕字元皆以「該節點生效的 flags」取得（flag-aware，含全域 `(?i)` 與 scoped `(?i:...)`）。
-    """
-    L = REGEX_MATCH_INPUT_MAX
-    units: set = {"a", "0", " "}
-    reject: set = set()
-    _collect_witness_units(parsed, flags, units, reject)
-    # 失敗尾候選：真實拒絕字元（上限 8 個，控成本）＋ 通用 \x01（多數正類 pattern 適用）。
-    suffixes = ["\x01"] + sorted(reject)[:8]
-    out: list[str] = []
-    for u in units:
-        if not u:
-            continue
-        s = (u * (L // len(u) + 1))[:L]
-        out.append(s)
-        for suf in suffixes:
-            out.append(s[:-1] + suf)
-    return out
-
-
-def _stdlib_regex_is_catastrophic(value: str, flags: int) -> bool:
-    """獨立子行程以硬 timeout 實測 re.search 對抗輸入；逾時＝catastrophic backtracking（fail closed）。
-
-    僅對 `_maybe_redos_suspicious` 的 pattern 呼叫（罕見）。empirical 涵蓋指數/多項式/大量有界/backref
-    等任意 AST 形，無法被結構繞過；安全 pattern 不誤拒。子行程跑全新直譯器（無 multiprocessing 的
-    spawn 重匯入 / fork 鎖繼承風險），timeout 後由 subprocess 終結。探測基礎設施失敗 → fail closed。
-    """
-    try:
-        # effective flags 含 pattern 內的**全域** inline flag（如開頭 `(?i)`）——反映於 compiled.flags；
-        # scoped `(?i:...)` 則由 _collect_witness_units 沿 SUBPATTERN 邊界另行套用（round7）。子行程仍以
-        # 原 flags compile（re 自會處理 pattern 內 inline flag），effective 僅用於挑代表字元。
-        effective = re.compile(value, flags).flags
-        parsed = _sre_parse.parse(value, flags)
-        payload = json.dumps({"v": value, "f": int(flags), "a": _redos_attack_inputs(parsed, effective)})
-        subprocess.run(
-            [sys.executable, "-c", _REDOS_PROBE_SCRIPT],
-            input=payload.encode("utf-8"),
-            timeout=_REDOS_PROBE_BUDGET_S,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        return False
-    except subprocess.TimeoutExpired:
-        return True
-    except Exception:  # pragma: no cover - 探測基礎設施不可用 → fail closed
-        return True
 
 
 @dataclass(frozen=True)
@@ -520,22 +234,21 @@ def validate_rule_dict(obj: dict[str, Any]) -> Rule:
             re.compile(pvalue, pflags_int)
         except re.error as exc:
             raise RuleSchemaError(f"pattern.value is not a valid regex: {exc}") from exc
-        # ReDoS fail-closed（#83 STA-4 / #91 Codex 必修）：僅當此 pattern 將落到**標準 re** 路徑才檢查；
-        # re2 線性引擎可用且支援此 pattern 時一律不限制（re2 對任何 pattern 皆線性、無回溯）。判定以 matcher
-        # 同款 `_re2_compile`：re2 不可用，或 pattern 用 re2 不支援的構造（backref/lookaround）→ 落 re。
-        # 對「可疑」pattern（≥2 個回溯量詞或含 backreference）於子行程實測探測，catastrophic 即拒——
-        # empirical 涵蓋指數/多項式/大量有界/backref 任意形，杜絕靜態 heuristic 的繞過與誤拒。
+        # ReDoS fail-closed（#83 STA-4 / #91，9 輪對抗式審查後定案）：僅當此 pattern 將落到**標準 re**
+        # 路徑才檢查（`_re2_compile` 回 None＝re2 不可用，或 pattern 用 re2 不支援的構造 backref/lookaround）；
+        # re2 線性引擎可用且支援時一律不限制。落 re 路徑時，結構上可疑（指數/多項式/backref，完整超集）
+        # 即 fail-closed 拒絕——不再嘗試逐一證明安全（靜態/經驗探測皆被逐輪繞過且 flaky）。
         if _re2_compile(pvalue, pflags) is None:
             try:
                 parsed_for_check = _sre_parse.parse(pvalue, pflags_int)
             except re.error as exc:  # pragma: no cover - compile 已過，此處幾乎不會觸發
                 raise RuleSchemaError(f"pattern.value is not a valid regex: {exc}") from exc
-            if _maybe_redos_suspicious(parsed_for_check) and _stdlib_regex_is_catastrophic(pvalue, pflags_int):
-                _require(
-                    False,
-                    "pattern.value 在標準 re 下對長輸入呈 catastrophic backtracking（ReDoS，子行程實測逾時）；"
-                    "請改寫為非回溯形式，或安裝 google-re2（pip install 'serialwrap[redos]'）以線性引擎免疫",
-                )
+            _require(
+                not _maybe_redos_suspicious(parsed_for_check),
+                "pattern.value 結構上可能 catastrophic backtracking（ReDoS：≥2 個回溯量詞／backreference／"
+                "量詞單元含 alternation 或巢狀量詞）；無 google-re2 時一律拒絕。請改寫為單一非歧義量詞形式，"
+                "或安裝 google-re2（pip install 'serialwrap[redos]'）以線性引擎免疫此限制",
+            )
     pattern = Pattern(kind=pkind, value=pvalue, flags=pflags)
 
     scope = str(obj.get("scope", "spontaneous"))

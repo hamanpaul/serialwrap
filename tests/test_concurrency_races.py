@@ -68,14 +68,9 @@ def test_fanout_skips_bad_fd_without_crash(tmp_path):
     b._handle_serial_rx(b"data")  # 不得拋例外
 
 
-# ── STA-4 / #91：ReDoS 經驗式子行程探測（三輪 Codex 對抗式審查收斂）───────────────────────────
+# ── STA-4 / #91：ReDoS fail-closed（9 輪 Codex 對抗式審查後定案；確定性、無 flaky）───────────────
+# 設計：有 re2＝線性免疫零限制；無 re2＝結構上可疑（指數/多項式/backref，完整超集）一律拒絕。
 import sw_core.event_engine.schema as _schema_mod  # noqa: E402
-
-
-@pytest.fixture(autouse=True)
-def _fast_redos_probe(monkeypatch):
-    """加速：catastrophic pattern 遠超此值即逾時被判，安全 pattern 數百毫秒完成 → 0.8s 有足夠裕度。"""
-    monkeypatch.setattr(_schema_mod, "_REDOS_PROBE_BUDGET_S", 0.8, raising=False)
 
 
 def test_overlong_regex_rejected():
@@ -87,92 +82,52 @@ def test_contains_pattern_not_redos_checked():
     _rule(pattern={"kind": "contains", "value": "(a+)+"})  # contains 非 regex，不做 ReDoS 檢查
 
 
+# 9 輪對抗式審查找到的全部 catastrophic（re2-可編譯）：無 re2 → fail-closed 拒絕；re2 → 線性接受。
 @pytest.mark.parametrize("bad", [
-    "(a+)+$",                 # 指數（anchored，需失敗尾觸發回溯）
-    "(a|aa)+$",               # 指數：alternation 重疊（單量詞，由 ambiguous-body 預篩抓出）
-    "a.*a.*X",                # 多項式：. 序列
-    r"[\s\S]*[\s\S]*X",       # round2 繞過：寬原子等價形（非單一 ANY）
-    r"\d*\d*X",               # round2：narrow 類（不分寬窄皆凍結）
-    r"^(?:ab|abab)*X",        # round4：多字元重複單元（char-only 全填漏放，body witness 抓到）
-    r"(ab)*(ab)*X",           # round4：多字元群組重複
-    # round5：負類排除掉所有固定代表字元（\x01 失敗尾 / \x07 舊 fallback / a 0 space 通用 / Y）——
-    # 須以「成員判定掃描」挑出真正被負類接受的字元（如 '!'）才能觸發。
-    "^[^\x01\x07 a0Y]*[^\x01\x07 a0Y]*[^\x01\x07 a0Y]*[^\x01\x07 a0Y]*Y$",
+    "(a+)+$",                                              # 指數：巢狀量詞
+    "(a|aa)+$", "(a?)+$", "(a{1,3})+$", "(.*)*",           # 指數：模糊量詞 body（單量詞亦危險）
+    "a.*a.*X", ".*.*", r"\d*\d*X",                         # 多項式：≥2 序列量詞（round1-2）
+    r"[\s\S]*[\s\S]*X",                                    # round2：寬原子等價形
+    r"^(?:ab|abab)*X", r"(ab)*(ab)*X",                     # round4：多字元重複單元
+    "^[^\x01\x07 a0Y]*[^\x01\x07 a0Y]*Y$",                 # round5：負類排除固定字元
+    r"\w+\s+\w+", r"\d+\.\d+", r"(error.*|warn.*)",        # round2/3 過往「邊界」O(n^2)/多量詞 → 保守拒
 ])
-def test_redos_catastrophic_rejected_without_re2(bad):
-    """re2-可編譯的 catastrophic pattern：標準 re 路徑（re2 不可用）fail-closed 拒絕；re2 可用則接受。"""
+def test_redos_suspicious_rejected_without_re2(bad):
     if _schema_mod._re2 is None:
         with pytest.raises(RuleSchemaError):
             _rule(pattern={"kind": "regex", "value": bad})
     else:
-        _rule(pattern={"kind": "regex", "value": bad})  # re2 線性 → 免疫 → 接受
+        _rule(pattern={"kind": "regex", "value": bad})    # re2 線性 → 免疫 → 接受
 
 
-def test_redos_ignorecase_negated_range_rejected_without_re2():
-    """round6：負類範圍 `[^\\x00-\\x60]` + IGNORECASE——代表字元選取須 flag-aware（用實際 flags 編譯+
-    fullmatch）才能挑到真正被接受者（如 '{'）；flag-unaware 會挑到 'a'（i 下被排除）而漏放。
-    """
-    pat = "^[^\x00-\x60]*[^\x00-\x60]*[^\x00-\x60]*Y$"
+# IGNORECASE 負類（外部/scoped/global flags）：結構可疑 → 無 re2 拒、re2 接受（round6/7）。
+@pytest.mark.parametrize("pat,flags", [
+    ("^[^\x00-\x60]*[^\x00-\x60]*Y$", "i"),               # 外部 flags=i
+    ("(?i:^[^\x00-\x60]*[^\x00-\x60]*Y$)", ""),           # scoped inline (?i:...)
+    ("(?i)^[^\x00-\x60]*[^\x00-\x60]*Y$", ""),            # global inline (?i)
+    (r"^([^\x02]+)+$", ""), (r"^([^,]+)+$", ""),          # round8：負類 anchored 巢狀量詞
+])
+def test_redos_negated_suspicious_rejected_without_re2(pat, flags):
     if _schema_mod._re2 is None:
         with pytest.raises(RuleSchemaError):
-            _rule(pattern={"kind": "regex", "value": pat, "flags": "i"})
+            _rule(pattern={"kind": "regex", "value": pat, "flags": flags})
     else:
-        _rule(pattern={"kind": "regex", "value": pat, "flags": "i"})
+        _rule(pattern={"kind": "regex", "value": pat, "flags": flags})
 
 
-@pytest.mark.parametrize("pat", [
-    "(?i:^[^\x00-\x60]*[^\x00-\x60]*[^\x00-\x60]*Y$)",   # scoped inline (?i:...)
-    "(?i)^[^\x00-\x60]*[^\x00-\x60]*[^\x00-\x60]*Y$",    # global inline (?i)
-])
-def test_redos_inline_ignorecase_flags_rejected_without_re2(pat):
-    """round7：pattern 內嵌 flags（scoped `(?i:...)` / 全域 `(?i)`）須被納入代表字元選取的 effective
-    flags；否則 IGNORECASE 折疊使探測挑錯字元而漏放。flags 欄位為空、靠 inline 帶 IGNORECASE。
-    """
-    if _schema_mod._re2 is None:
-        with pytest.raises(RuleSchemaError):
-            _rule(pattern={"kind": "regex", "value": pat})
-    else:
-        _rule(pattern={"kind": "regex", "value": pat})
-
-
-@pytest.mark.parametrize("pat", [
-    r"^([^\x02]+)+$",         # 負類 anchored：固定 \x01 失敗尾被 [^\x02] 匹配 → 須以真實拒絕字元(\x02)觸發
-    r"^([^,]+)+$",            # 負類逗號
-])
-def test_redos_negated_class_failing_suffix_rejected_without_re2(pat):
-    """round8：失敗尾須是**真實被原子拒絕**的字元（per-pattern 求得），而非固定 `\\x01`；否則負類
-    anchored 量詞的 witness 全程命中、不走回溯而漏放。
-    """
-    if _schema_mod._re2 is None:
-        with pytest.raises(RuleSchemaError):
-            _rule(pattern={"kind": "regex", "value": pat})
-    else:
-        _rule(pattern={"kind": "regex", "value": pat})
-
-
-@pytest.mark.parametrize("bad", [
-    r"(a*)\1X",               # round3：backreference（re2 不支援）→ 落 re → 探測拒
-    r"a{0,4096}a{0,4096}X",   # round3：大量有界 repeat（re2 拒絕超大 repetition）→ 落 re → 探測拒
-])
-def test_redos_catastrophic_always_rejected(bad):
-    """re2 無法處理者（backref / 超大 repetition）→ **兩引擎皆**落標準 re，經驗式探測必拒。"""
+# re2 無法編譯者（backref / 超大 repetition）→ 兩引擎皆落標準 re → 結構可疑 → **永遠**拒。
+@pytest.mark.parametrize("bad", [r"(a*)\1X", r"a{0,4096}a{0,4096}X"])
+def test_redos_re2_incompatible_always_rejected(bad):
     with pytest.raises(RuleSchemaError):
         _rule(pattern={"kind": "regex", "value": bad})
 
 
+# 單一非歧義量詞 / 無量詞：非可疑（線性安全）→ 兩引擎皆接受、不誤擋（含 contains-like 常見規則）。
 @pytest.mark.parametrize("ok", [
-    r"\d+\.\d+",          # round3：separator(\.) 不可被前量詞吞 → 安全；empirical 不誤拒（量詞數法會誤拒）
-    r"\w+\s+\w+",         # 同上：disjoint 類分隔 → 安全
-    r"(error.*|warn.*)",  # alternation-of-singles → 安全
-    r"temp=(\d+)C",       # 單一量詞 → 非可疑、不探測
-    r"root@.*# ",         # 單一 .*
-    r"error|warn|fail",   # 頂層 alternation
-    r"\d{3,5}",           # 單一小 bounded repeat
-    r"(abc)+",            # 量詞群組但單元固定
-    r"Kernel panic",
+    r"temp=(\d+)C", r"root@.*# ", r"dhd_dpc.*firmware_trap", r"Kernel panic - not syncing: ",
+    r"error|warn|fail", r"\d{3,5}", r"(abc)+", r"Kernel panic", r"a+$", r".*X",
 ])
-def test_redos_safe_accepted_both_engines(ok):
-    """安全 pattern（含可疑但實測快速通過者）兩引擎皆不誤拒。"""
+def test_redos_safe_single_quantifier_accepted_both_engines(ok):
     _rule(pattern={"kind": "regex", "value": ok})
 
 
