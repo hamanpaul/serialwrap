@@ -12,18 +12,12 @@ _VALID_PATTERN_KIND = {"contains", "regex"}
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _OWNER_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 
-# ReDoS 防護（#83 STA-4；Codex 必修強化）：使用者可控 regex 規則由單執行緒 matcher 逐行 re.search
-# 求值（CPython re 在 catastrophic backtracking 期間獨佔 GIL、不檢查 signal，thread/signal timeout 無法
-# 中斷），故無法靠 per-line runtime timeout。改採兩層防護：
-#  (1) upsert 時以 **stdlib 解析器走訪 AST**（非脆弱的 regex-on-regex heuristic）結構性拒絕「重複>1 次且
-#      重複單元模糊（含巢狀量詞或 alternation）」的指數回溯類——完整涵蓋 (a+)+、(a|aa)+、(a?)+、
-#      (a{1,3})+、(.*)* 等（原 heuristic 可被後三者繞過）。
-#  (2) matcher 對 regex 求值的輸入長度封頂（REGEX_MATCH_INPUT_MAX），使殘餘多項式回溯成本有界，即便
-#      靜態分析漏放亦不致凍結單執行緒 matcher（line_buffer 已 16KB 截斷，此處對 regex 再收緊）。
-# 完全消除多項式 ReDoS 需 re2 類線性引擎（無回溯），列為可選未來強化。
+# ReDoS 防護（#83 STA-4 / #91）：規則 regex 由單執行緒 matcher 逐行 re.search 求值，catastrophic
+# backtracking 會凍結 matcher。最終設計（見下方 fail-closed 段）：有 re2＝線性免疫；無 re2＝對結構上
+# 可疑 regex fail-closed 拒絕；matcher 另以 REGEX_MATCH_INPUT_MAX 封頂 re 路徑輸入長度作 runtime 兜底。
 _REGEX_MAX_LEN = 512
 REGEX_MATCH_INPUT_MAX = 4096
-"""matcher 對單行 regex 求值時，最多餵入的字元數（ReDoS runtime 防護；超過部分不參與比對）。"""
+"""matcher 對單行 regex 求值時，最多餵入的字元數（ReDoS runtime 兜底；超過部分不參與比對）。"""
 
 # stdlib regex AST 解析器：3.11+ 為 re._parser / re._constants；3.10 為 sre_parse / sre_constants。
 try:  # pragma: no cover - 版本相依匯入
@@ -42,9 +36,30 @@ _OP_ASSERT_NOT = _sre_constants.ASSERT_NOT
 _OP_GROUPREF_EXISTS = _sre_constants.GROUPREF_EXISTS
 _OP_ATOMIC_GROUP = getattr(_sre_constants, "ATOMIC_GROUP", None)            # 3.11+ (?>...)
 _OP_POSSESSIVE_REPEAT = getattr(_sre_constants, "POSSESSIVE_REPEAT", None)  # 3.11+ a++/a*+
+_OP_ANY = _sre_constants.ANY                                  # `.`（非 DOTALL）
+_OP_ANY_ALL = getattr(_sre_constants, "ANY_ALL", None)       # DOTALL 下的 `.`
 _MAXREPEAT = _sre_constants.MAXREPEAT
 # 會回溯的量詞（greedy / lazy）。possessive / atomic 不回溯，故不列入「危險量詞」。
 _BACKTRACK_REPEATS = {_OP_MAX_REPEAT, _OP_MIN_REPEAT}
+
+# google-re2 線性引擎（可選依賴 serialwrap[redos]）：可用時 matcher 以其求值 user regex，免疫所有
+# catastrophic backtracking（指數＋多項式）。schema 以它判定「此 pattern 是否會落到標準 re 路徑」——
+# 若會（re2 不可用，或 pattern 用 re2 不支援的構造），則於 upsert 階段 fail-closed 拒絕指數/多項式類。
+try:  # pragma: no cover - 視環境是否安裝 re2
+    import re2 as _re2
+except ImportError:  # pragma: no cover
+    _re2 = None
+
+
+def _re2_compile(value: str, flags_str: str):
+    """以 google-re2 編譯（flags 以 inline `(?ism)` 帶入）。re2 不可用或不支援構造（backref/lookaround）回 None。"""
+    if _re2 is None:
+        return None
+    try:
+        inline = f"(?{flags_str})" if flags_str else ""
+        return _re2.compile(inline + value)
+    except Exception:  # pragma: no cover - re2 不支援構造
+        return None
 
 
 def _child_subpatterns(op: Any, av: Any) -> list:
@@ -74,30 +89,90 @@ def _walk_ast(subpattern: Any):
             yield from _walk_ast(child)
 
 
-def _body_has_ambiguous_repeat(body: Any) -> bool:
-    """量詞的重複單元（body）內是否含「會回溯的量詞」或 alternation——模糊重複＝catastrophic 來源。"""
-    for op, _av in _walk_ast(body):
-        if op in _BACKTRACK_REPEATS or op == _OP_BRANCH:
-            return True
-    return False
+# ── ReDoS 防護（#83 STA-4 / #91；9 輪 Codex 對抗式審查後收斂為 fail-closed）─────────────────────
+# 結論：標準 re 於 catastrophic backtracking 期間獨佔 GIL、不可中斷；任何「靜態 AST 啟發式」或「經驗式
+# 子行程探測」都被對抗式審查逐輪繞過（指數→多項式→寬原子 [\s\S]*→大量有界 a{0,4096}→backref (a*)\1→
+# 多字元單元 (?:ab|abab)*→負類排除→inline flags (?i:…)→失敗尾→path-context prefix），是無界軍備競賽，
+# 且 timing-based 探測本質 flaky。唯一**完整、確定、無 flaky** 的解：
+#   • 有 re2 線性引擎（可選依賴 `pip install 'serialwrap[redos]'`）→ 零結構限制（re2 對任何 pattern 皆
+#     線性、無回溯，徹底免疫）。
+#   • 無 re2（pattern 將落到標準 re 路徑）→ 對「結構上可疑」的 regex 一律 **fail-closed 拒絕**。
+# 可疑＝(a) ≥2 個會回溯量詞（多項式，含大量有界 {0,N}）、(b) backreference、(c) 量詞單元含 alternation／
+# 巢狀量詞（指數）。此三者經驗證為 catastrophic 的**完整結構超集**（單一非歧義量詞為線性、安全），故
+# fail-closed 無漏放、且不誤擋 contains 與單量詞 regex（如 Kernel panic、temp=(\d+)C、root@.*#）。
+# matcher 另以 REGEX_MATCH_INPUT_MAX 封頂 re 路徑輸入長度作 runtime 兜底。
+_OP_GROUPREF = _sre_constants.GROUPREF
 
 
-def _regex_is_redos_risky(pattern: str, flags: int) -> bool:
-    """AST 結構分析：是否存在「重複>1 次且重複單元模糊」的回溯型量詞（指數 ReDoS 類）。
+def _is_variable_repeat(mn: Any, mx: Any) -> bool:
+    """量詞重複次數是否「可變」（mn != mx）——可變即會回溯：`?`/`*`/`+`/`{0,1}`/`{0,N}`/`{3,5}` 皆是；
+    固定次數 `{2}`（mn==mx）為確定性、線性、不回溯。`?`/`{0,1}` 雖 mx==1，鏈接（`a?a?…aaa`）仍指數
+    回溯，故序列計數必須以 mn!=mx（而非 mx>1）判定（Codex final [critical]）。"""
+    return mn != mx
 
-    取代脆弱的 regex-on-regex heuristic：直接走訪 stdlib 解析的 AST，捕捉 (a+)+、(a|aa)+、(a?)+、
-    (a{1,3})+、(.*)* 等可 catastrophic backtracking 的模式（皆為「量詞包住含量詞/alternation 的單元」）。
-    保守——可能誤拒少數安全 pattern（如 (a+b)+、(a|b)+），但寧可誤拒不可漏放。
+
+def _repeats_at_least_twice(mn: Any, mx: Any) -> bool:
+    """量詞是否可能將其 body **重複 ≥2 次**（mx==MAXREPEAT 或 mx>=2，含固定 `{N}` N>=2）。
+
+    用於指數判定：重複一個「模糊 body（含可變量詞或 alternation）」≥2 次即指數爆炸——含**固定** `{N}`
+    重複（`(a?){30}a{30}` 的外層 `{30}` 雖固定，仍把可變的 `a?` 序列化 30 次 → 2^30；Codex final [critical]）。"""
+    return mx == _MAXREPEAT or (isinstance(mx, int) and mx >= 2)
+
+
+def _has_backref(parsed: Any) -> bool:
+    """是否含 backreference（如 `\\1`）——`(a*)\\1` 類在標準 re 下可 catastrophic，且 re2 不支援。"""
+    return any(op == _OP_GROUPREF for op, _av in _walk_ast(parsed))
+
+
+def _ambiguity_score(sp: Any) -> int:
+    """沿 concatenation 路徑累計「回溯歧義來源數」——統一度量，取代逐一列舉各 catastrophic pattern 類。
+
+    歧義來源＝(1) 可變量詞（`?`/`*`/`+`/`{m,n}` with mn!=mx，引擎可選擇匹配幾次）、(2) alternation
+    BRANCH（多分支可選，重疊分支致回溯）。固定 `{N}`（mn==mx）本身不算來源，但**重複一個有歧義的 body
+    N>=2 次**＝把該歧義序列化 N 份（`(a?){30}`、`(a|aa){5}`）→ 以 `2*body_score` 反映。
+
+    理論：單一歧義來源至多 O(n) 回溯（線性）；沿同一路徑 **≥2 個來源即可能 compound 成超線性**（多項式
+    `a.*a.*`、指數 `(a+)+`／`(a|aa)+`／unrolled `(a|aa)(a|aa)…`）。故 `score >= 2` 為 catastrophic 的
+    **完整結構超集**（保守：可能誤拒實際安全的 disjoint alternation 序列如 `(foo|bar)(baz|qux)`、多量詞
+    如 `\\d+\\.\\d+`——裝 re2 即不受限）。BRANCH 內各分支取 max（僅一分支被取）、群組/lookaround 內聯遞迴。
     """
-    parsed = _sre_parse.parse(pattern, flags)
-    for op, av in _walk_ast(parsed):
-        if op not in _BACKTRACK_REPEATS:
-            continue
-        _mn, mx, body = av
-        repeated_more_than_once = (mx == _MAXREPEAT) or (isinstance(mx, int) and mx > 1)
-        if repeated_more_than_once and _body_has_ambiguous_repeat(body):
-            return True
-    return False
+    total = 0
+    for op, av in sp:
+        if op in _BACKTRACK_REPEATS:
+            mn, mx, body = av
+            body_score = _ambiguity_score(body)
+            if _is_variable_repeat(mn, mx):
+                total += 1 + body_score                       # 可變量詞：本身 1 來源 + body
+            elif _repeats_at_least_twice(mn, mx):
+                total += 2 * body_score                       # 固定 {N>=2}：序列化 N 份 body 歧義
+            else:
+                total += body_score                           # 固定 {1}/{0,0}：透傳 body
+        elif _OP_POSSESSIVE_REPEAT is not None and op == _OP_POSSESSIVE_REPEAT:
+            total += _ambiguity_score(av[2])                  # possessive 不回溯，僅遞迴 body
+        elif op == _OP_BRANCH:
+            total += 1 + max((_ambiguity_score(b) for b in av[1] if b is not None), default=0)
+        elif op == _OP_SUBPATTERN:
+            total += _ambiguity_score(av[-1])
+        elif _OP_ATOMIC_GROUP is not None and op == _OP_ATOMIC_GROUP:
+            total += _ambiguity_score(av)
+        elif op in (_OP_ASSERT, _OP_ASSERT_NOT):
+            total += _ambiguity_score(av[1])
+        # 其餘 atom（literal/in/any/category…）非歧義來源
+    return total
+
+
+def _maybe_redos_suspicious(parsed: Any) -> bool:
+    """結構上是否可能 super-linear backtracking——無 re2 時據此 fail-closed 拒絕。
+
+    判準＝沿路徑「回溯歧義來源數」`_ambiguity_score >= 2`（單一來源為線性、安全；≥2 可 compound 成
+    多項式/指數）**或** backreference。經 13 輪對抗式審查全部 catastrophic + 經典安全 pattern 驗證為
+    catastrophic 的完整結構超集，且不誤擋 contains/單量詞/單 alternation/固定非模糊 body（MAC 等）。
+    保守代價：誤拒少數實際安全的多歧義 pattern（多量詞、disjoint alternation 序列）——裝 re2 即不受限。
+    """
+    return (
+        _ambiguity_score(parsed) >= 2
+        or _has_backref(parsed)
+    )
 
 
 @dataclass(frozen=True)
@@ -185,17 +260,21 @@ def validate_rule_dict(obj: dict[str, Any]) -> Rule:
             re.compile(pvalue, pflags_int)
         except re.error as exc:
             raise RuleSchemaError(f"pattern.value is not a valid regex: {exc}") from exc
-        # AST 結構分析拒絕指數 ReDoS 類（取代原 regex-on-regex heuristic，後者可被 (a|aa)+/(a?)+/
-        # (a{1,3})+ 繞過）。解析理論上不會失敗（compile 已過），保險仍轉成 schema 錯誤。
-        try:
-            risky = _regex_is_redos_risky(pvalue, pflags_int)
-        except re.error as exc:  # pragma: no cover - compile 已過，此處幾乎不會觸發
-            raise RuleSchemaError(f"pattern.value is not a valid regex: {exc}") from exc
-        _require(
-            not risky,
-            "pattern.value 含可致 catastrophic backtracking 的模糊巢狀量詞（如 (a+)+、(a|aa)+、(a?)+、"
-            "(a{1,3})+、(.*)* 等），易遭 ReDoS，請改寫為非歧義／非回溯形式",
-        )
+        # ReDoS fail-closed（#83 STA-4 / #91，9 輪對抗式審查後定案）：僅當此 pattern 將落到**標準 re**
+        # 路徑才檢查（`_re2_compile` 回 None＝re2 不可用，或 pattern 用 re2 不支援的構造 backref/lookaround）；
+        # re2 線性引擎可用且支援時一律不限制。落 re 路徑時，結構上可疑（指數/多項式/backref，完整超集）
+        # 即 fail-closed 拒絕——不再嘗試逐一證明安全（靜態/經驗探測皆被逐輪繞過且 flaky）。
+        if _re2_compile(pvalue, pflags) is None:
+            try:
+                parsed_for_check = _sre_parse.parse(pvalue, pflags_int)
+            except re.error as exc:  # pragma: no cover - compile 已過，此處幾乎不會觸發
+                raise RuleSchemaError(f"pattern.value is not a valid regex: {exc}") from exc
+            _require(
+                not _maybe_redos_suspicious(parsed_for_check),
+                "pattern.value 結構上可能 catastrophic backtracking（ReDoS：≥2 個回溯量詞／backreference／"
+                "量詞單元含 alternation 或巢狀量詞）；無 google-re2 時一律拒絕。請改寫為單一非歧義量詞形式，"
+                "或安裝 google-re2（pip install 'serialwrap[redos]'）以線性引擎免疫此限制",
+            )
     pattern = Pattern(kind=pkind, value=pvalue, flags=pflags)
 
     scope = str(obj.get("scope", "spontaneous"))

@@ -9,6 +9,11 @@ description = "UART broker daemon + CLI（多 agent/human 共用序列埠）"
 requires-python = ">=3.10"
 dependencies = ["PyYAML>=6"]
 
+[project.optional-dependencies]
+# 事件規則 regex 改用 google-re2 線性引擎，免疫 catastrophic backtracking（ReDoS，含 #91 多項式類）。
+# 未安裝時 matcher 自動退回標準 re + schema AST 拒絕 + 輸入封頂的既有防護。
+redos = ["google-re2"]
+
 [project.scripts]
 serialwrap = "sw_core.cli:main"
 serialwrapd = "sw_core.daemon:main"

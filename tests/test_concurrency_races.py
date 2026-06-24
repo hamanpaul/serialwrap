@@ -68,15 +68,9 @@ def test_fanout_skips_bad_fd_without_crash(tmp_path):
     b._handle_serial_rx(b"data")  # 不得拋例外
 
 
-# ── STA-4 ────────────────────────────────────────────────────────────────
-def test_safe_regex_accepted():
-    _rule(pattern={"kind": "regex", "value": "root@.*# "})  # 正常 regex 不受影響
-
-
-@pytest.mark.parametrize("bad", ["(a+)+$", "(a*)*", "(.+)+", "(\\d+)+", "(ab+)*"])
-def test_nested_quantifier_regex_rejected(bad):
-    with pytest.raises(RuleSchemaError):
-        _rule(pattern={"kind": "regex", "value": bad})
+# ── STA-4 / #91：ReDoS fail-closed（9 輪 Codex 對抗式審查後定案；確定性、無 flaky）───────────────
+# 設計：有 re2＝線性免疫零限制；無 re2＝結構上可疑（指數/多項式/backref，完整超集）一律拒絕。
+import sw_core.event_engine.schema as _schema_mod  # noqa: E402
 
 
 def test_overlong_regex_rejected():
@@ -88,49 +82,101 @@ def test_contains_pattern_not_redos_checked():
     _rule(pattern={"kind": "contains", "value": "(a+)+"})  # contains 非 regex，不做 ReDoS 檢查
 
 
-# ── STA-4 強化（Codex 必修）：原 heuristic 可被以下模式繞過，AST 結構分析須一律拒絕 ──────────
+# 9 輪對抗式審查找到的全部 catastrophic（re2-可編譯）：無 re2 → fail-closed 拒絕；re2 → 線性接受。
 @pytest.mark.parametrize("bad", [
-    "(a|aa)+$",      # alternation 重疊分支（原 heuristic 無 +/* 在群組內 → 漏放）
-    "(a?)+$",        # optional 重複
-    "(a{1,3})+$",    # bounded-range 重複
-    "(a|aa)*",
-    "(.*)*",
-    "(.*)+",
-    "((ab)*)*",      # 巢狀群組量詞
-    "(\\d|\\d\\d)+",
-    "(x+)+y",
+    "(a+)+$",                                              # 指數：巢狀量詞
+    "(a|aa)+$", "(a?)+$", "(a{1,3})+$", "(.*)*",           # 指數：模糊量詞 body（單量詞亦危險）
+    "a.*a.*X", ".*.*", r"\d*\d*X",                         # 多項式：≥2 序列量詞（round1-2）
+    r"[\s\S]*[\s\S]*X",                                    # round2：寬原子等價形
+    r"^(?:ab|abab)*X", r"(ab)*(ab)*X",                     # round4：多字元重複單元
+    "^[^\x01\x07 a0Y]*[^\x01\x07 a0Y]*Y$",                 # round5：負類排除固定字元
+    r"\w+\s+\w+", r"\d+\.\d+", r"(error.*|warn.*)",        # round2/3 過往「邊界」O(n^2)/多量詞 → 保守拒
+    "a?" * 5 + "a" * 5,                                    # final：optional-quantifier chain（mx==1 鏈接指數）
+    r"(a?){5}a{5}",                                        # final：固定 {N} 重複可變 body → 序列化指數
+    "^" + "(a|aa)" * 8 + "b$", r"(a|aa)(a|aa)b",           # final2：unrolled 重疊 alternation 序列（無量詞）
 ])
-def test_redos_bypass_patterns_rejected(bad):
+def test_redos_suspicious_rejected_without_re2(bad):
+    if _schema_mod._re2 is None:
+        with pytest.raises(RuleSchemaError):
+            _rule(pattern={"kind": "regex", "value": bad})
+    else:
+        _rule(pattern={"kind": "regex", "value": bad})    # re2 線性 → 免疫 → 接受
+
+
+# IGNORECASE 負類（外部/scoped/global flags）：結構可疑 → 無 re2 拒、re2 接受（round6/7）。
+@pytest.mark.parametrize("pat,flags", [
+    ("^[^\x00-\x60]*[^\x00-\x60]*Y$", "i"),               # 外部 flags=i
+    ("(?i:^[^\x00-\x60]*[^\x00-\x60]*Y$)", ""),           # scoped inline (?i:...)
+    ("(?i)^[^\x00-\x60]*[^\x00-\x60]*Y$", ""),            # global inline (?i)
+    (r"^([^\x02]+)+$", ""), (r"^([^,]+)+$", ""),          # round8：負類 anchored 巢狀量詞
+])
+def test_redos_negated_suspicious_rejected_without_re2(pat, flags):
+    if _schema_mod._re2 is None:
+        with pytest.raises(RuleSchemaError):
+            _rule(pattern={"kind": "regex", "value": pat, "flags": flags})
+    else:
+        _rule(pattern={"kind": "regex", "value": pat, "flags": flags})
+
+
+# re2 無法編譯者（backref / 超大 repetition）→ 兩引擎皆落標準 re → 結構可疑 → **永遠**拒。
+@pytest.mark.parametrize("bad", [r"(a*)\1X", r"a{0,4096}a{0,4096}X"])
+def test_redos_re2_incompatible_always_rejected(bad):
     with pytest.raises(RuleSchemaError):
         _rule(pattern={"kind": "regex", "value": bad})
 
 
+# 單一非歧義量詞 / 無量詞：非可疑（線性安全）→ 兩引擎皆接受、不誤擋（含 contains-like 常見規則）。
 @pytest.mark.parametrize("ok", [
-    r"temp=(\d+)C",       # 群組未被再施量詞 → 安全
-    r"root@.*# ",         # 單一 .* → 安全
-    r"error|warn|fail",   # 頂層 alternation（未被量詞包住）→ 安全
-    r"\d{3,5}",           # 單一 bounded repeat → 安全
-    r"(abc)+",            # 量詞群組但單元固定、無歧義 → 安全
-    r"Kernel panic",
+    r"temp=(\d+)C", r"root@.*# ", r"dhd_dpc.*firmware_trap", r"Kernel panic - not syncing: ",
+    r"error|warn|fail", r"\d{3,5}", r"(abc)+", r"Kernel panic", r"a+$", r".*X",
+    r"(abc){5}", r"x{3}y{3}",        # final：固定 {N} 重複但 body 非模糊（無可變量詞/alternation）→ 線性安全
 ])
-def test_safe_regex_patterns_still_accepted(ok):
-    _rule(pattern={"kind": "regex", "value": ok})  # 不得誤拒
+def test_redos_safe_single_quantifier_accepted_both_engines(ok):
+    _rule(pattern={"kind": "regex", "value": ok})
 
 
-# ── ReDoS runtime 防護：matcher 對 regex 求值輸入長度封頂 ───────────────────────────────
-def test_matcher_caps_regex_input_length():
-    """超過 REGEX_MATCH_INPUT_MAX 的尾端不參與比對（殘餘多項式回溯成本有界）。"""
+# ── ReDoS runtime 防護：re2 線性引擎（#91）/ re 回退路徑輸入封頂 ─────────────────────────
+def test_matcher_regex_input_handling_by_engine():
+    """re2 線性 → 全文求值（不截斷）；re 回退 → 對 regex 輸入封頂截掉尾端。"""
     pm = PatternMatcher(Pattern(kind="regex", value="needle", flags=""))
-    # needle 只出現在封頂之後 → 被截斷、查不到
     tail_only = "x" * REGEX_MATCH_INPUT_MAX + "needle"
-    assert pm.eval(tail_only) is None
-    # 封頂之內的 match 仍正常命中
-    within = "a needle here" + "x" * REGEX_MATCH_INPUT_MAX
-    assert pm.eval(within) is not None
+    if pm._engine == "re2":
+        assert pm.eval(tail_only) is not None          # re2 不截斷，尾端 needle 仍命中
+    else:
+        assert pm.eval(tail_only) is None              # re 回退封頂 → 尾端被截斷
+    assert pm.eval("a needle here") is not None         # 封頂之內/全文皆命中
 
 
 def test_matcher_contains_not_capped():
-    """contains（已 escape 的字面量、無回溯風險）不截斷，長行尾端仍可命中。"""
+    """contains（已 escape 的字面量、無回溯風險）不截斷，長行尾端仍可命中（兩引擎皆然）。"""
     pm = PatternMatcher(Pattern(kind="contains", value="needle", flags=""))
     tail_only = "x" * REGEX_MATCH_INPUT_MAX + "needle"
     assert pm.eval(tail_only) is not None
+
+
+def test_matcher_re2_immune_to_polynomial_redos():
+    """#91：re2 線性引擎對多項式 pattern（`a.*a.*a.*X`，AST 偵測器放行）長輸入不凍結。"""
+    pytest.importorskip("re2")
+    import time
+    pm = PatternMatcher(Pattern(kind="regex", value="a.*a.*a.*X", flags=""))
+    assert pm._engine == "re2"
+    t0 = time.monotonic()
+    assert pm.eval("a" * 200000) is None                # 無 X → 不命中；re2 線性 → 必須極快
+    assert (time.monotonic() - t0) < 1.0, "re2 路徑對多項式 pattern 不應有 catastrophic backtracking"
+
+
+def test_matcher_re2_flags_and_groups():
+    """re2 路徑：inline flag（i/s/m）與群組擷取語意與 re 一致。"""
+    pytest.importorskip("re2")
+    pm = PatternMatcher(Pattern(kind="regex", value=r"temp=(\d+)c", flags="i"))
+    assert pm._engine == "re2"
+    r = pm.eval("XX TEMP=42C yy")
+    assert r is not None and r.matched_text == "TEMP=42C" and r.groups == ["42"]
+
+
+def test_matcher_re2_falls_back_for_backreference():
+    """re2 不支援 backreference → 自動退回標準 re（不致無法載入規則）。"""
+    pytest.importorskip("re2")
+    pm = PatternMatcher(Pattern(kind="regex", value=r"(ab)\1", flags=""))
+    assert pm._engine == "re"                            # 退回 re
+    assert pm.eval("abab") is not None

@@ -12,7 +12,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: 安裝測試相依
+      - name: 安裝測試相依（預設安裝，不含 [redos] extra）
         run: python3 -m pip install --disable-pip-version-check pytest pyyaml
-      - name: 執行測試套件
+      - name: 執行測試套件（預設安裝，無 re2 → fail-closed 拒絕 ReDoS 類）
+        # 覆蓋 #91 預設安裝路徑（無 google-re2）：matcher 走標準 re、schema 對指數＋多項式
+        # fail-closed 拒絕；re2 專屬測試以 importorskip 自動跳過。
+        run: python3 -m pytest -q tests/
+      - name: 安裝 google-re2（[redos] 可選依賴）
+        run: python3 -m pip install --disable-pip-version-check google-re2
+      - name: 執行測試套件（含 re2 線性引擎）
+        # 覆蓋 #91 re2 路徑：matcher 以 re2 線性引擎求值、免疫所有 catastrophic backtracking。
         run: python3 -m pytest -q tests/

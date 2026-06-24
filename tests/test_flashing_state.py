@@ -154,3 +154,96 @@ class TestFlashingBlocksInjection(_Base):
         self.assertTrue(fb.flash)
         mgr.exit_flashing("COM0")
         self.assertFalse(fb.flash)
+
+
+class TestFlashProbeCriticalGuard(_Base):
+    """#83 RACE-2 final：flash 偵測 probe 窗口（enter_flashing 之前、state 仍非 FLASHING）內，
+    destructive op（clear/release/bind）須一律回 FLASHING_BUSY，不得 detach/rebind bridge 中斷 probe。"""
+
+    def _ready_mgr(self):
+        mgr = self._mgr([self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")])
+        # 模擬 probe 窗口：session 仍 READY/ATTACHED（非 FLASHING），但已標 flash-critical。
+        mgr.get_session("COM0").state = "READY"
+        return mgr
+
+    def test_clear_rejected_during_probe_window(self):
+        mgr = self._ready_mgr()
+        mgr.mark_flash_critical("COM0")
+        self.assertEqual(mgr.clear_session("COM0").get("error_code"), "FLASHING_BUSY")
+
+    def test_release_rejected_during_probe_window(self):
+        mgr = self._ready_mgr()
+        mgr.mark_flash_critical("COM0")
+        self.assertEqual(mgr.release_device("COM0").get("error_code"), "FLASHING_BUSY")
+
+    def test_bind_rejected_during_probe_window(self):
+        mgr = self._ready_mgr()
+        mgr.mark_flash_critical("COM0")
+        self.assertEqual(
+            mgr.bind_session("COM0", "/dev/serial/by-id/new").get("error_code"), "FLASHING_BUSY"
+        )
+
+    def test_unmark_lifts_guard(self):
+        mgr = self._ready_mgr()
+        mgr.mark_flash_critical("COM0")
+        mgr.unmark_flash_critical("COM0")
+        # 解標後不再因 flash-critical 被擋（clear 於 READY+device 走正常 detach 路徑，非 FLASHING_BUSY）
+        self.assertNotEqual(mgr.clear_session("COM0").get("error_code"), "FLASHING_BUSY")
+
+    def test_other_com_not_affected(self):
+        mgr = self._mgr([
+            self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/a"),
+            self._make_profile("p", "COM1", "lab+2", "/dev/serial/by-id/b"),
+        ])
+        mgr.get_session("COM1").state = "READY"
+        mgr.mark_flash_critical("COM0")                      # 只標 COM0
+        self.assertNotEqual(mgr.clear_session("COM1").get("error_code"), "FLASHING_BUSY")
+
+    def test_recover_force_rejected_during_probe_window(self):
+        """Codex final [high]：force recover 也是 destructive 路徑（_force_recover detach/重連 bridge），
+        probe 窗口須一律 FLASHING_BUSY。"""
+        mgr = self._ready_mgr()
+        mgr.mark_flash_critical("COM0")
+        res = mgr.recover_session("COM0", force=True)
+        self.assertEqual(res.get("error_code"), "FLASHING_BUSY")
+
+    def test_collect_candidates_marks_atomically(self):
+        """Codex final [high]：collect_flash_candidates_and_mark 須在回傳的同時已標記候選（snapshot+mark
+        同鎖），杜絕 snapshot 與 mark 之間的 TOCTOU。"""
+        import dataclasses
+        prof = dataclasses.replace(
+            self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/a"), ready_probe=""
+        )  # ready_probe="" → 非 command_capable → 合格 flash 候選
+        self.assertFalse(prof.command_capable)
+        mgr = self._mgr([prof])
+        mgr.get_session("COM0").state = "READY"
+        cands = mgr.collect_flash_candidates_and_mark()
+        self.assertIn("COM0", [c["com"] for c in cands])     # 確為候選（非 trivial skip）
+        # 回傳後立即就已是 critical（destructive op 被擋）→ 證明 snapshot 與 mark 原子完成
+        self.assertEqual(mgr.clear_session("COM0").get("error_code"), "FLASHING_BUSY")
+        mgr.unmark_flash_critical("COM0")
+        self.assertNotEqual(mgr.clear_session("COM0").get("error_code"), "FLASHING_BUSY")
+
+    def test_detach_by_id_skips_flash_critical(self):
+        """Codex final2 [high]：device hotplug 在 flash 臨界區（probe/FLASHING）不得 detach——MCU reset
+        期間 by_id 短暫消失常見，誤 detach 會切斷 transport。"""
+        mgr = self._mgr([self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/x")])
+        s = mgr.get_session("COM0")
+        s.state = "READY"
+        mgr.mark_flash_critical("COM0")
+        mgr._detach_by_id("/dev/serial/by-id/x", reason="DEVICE_REMOVED")
+        self.assertEqual(mgr.get_session("COM0").state, "READY")   # 未被 detach
+
+    def test_bridge_down_skips_flash_critical(self):
+        """Codex final2 [high]：flash 臨界區不得因 bridge-down 回呼自動 detach+reattach 與 flash pump 對撞。"""
+        mgr = self._mgr([self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/x")])
+        s = mgr.get_session("COM0")
+
+        class _FB:
+            def list_consoles(self): return []
+        fb = _FB()
+        s.bridge = fb
+        s.state = "FLASHING"                                       # flash 進行中
+        mgr._handle_bridge_down(s.session_id, fb, reason="EIO")
+        self.assertEqual(mgr.get_session("COM0").state, "FLASHING")  # 未被搶進 ATTACHING
+        self.assertIs(mgr.get_session("COM0").bridge, fb)            # bridge 未被 detach
