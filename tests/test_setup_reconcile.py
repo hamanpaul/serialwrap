@@ -102,16 +102,21 @@ def test_system_no_sudo_does_not_write_config_or_diverge(tmp_path):
 
 
 def test_system_with_sudo_installs_real_unit_content(tmp_path):
-    """I-2：system 模式帶 sudo → staging 寫出真實 unit 內容（非空檔），並以 sudo install 安裝。"""
+    """I-2：system 模式帶 sudo → staging 寫出真實 unit 內容（非空檔），並以 sudo install 安裝。
+
+    run-as-user（#76）：system unit 以安裝者本人帳號執行（非 serialwrap dedicated account），
+    ExecStart 指向其 pipx serialwrapd 絕對路徑 + 固定 system socket/profile-dir。
+    """
     from sw_core.sysenv import FakeEffects
-    from sw_core.setup_cmd import reconcile
+    from sw_core.setup_cmd import reconcile, _resolve_run_user, SYSTEM_SOCKET, SYSTEM_PROFILE_DIR
     fx = FakeEffects(systemd=True)
     reconcile(old_mode="on-demand", target_mode="systemd-system", fx=fx, home=tmp_path,
               daemon_running=False, with_sudo=True)
     staging = tmp_path / ".local" / "share" / "serialwrap" / "serialwrap.service"
     assert staging.is_file()
     content = staging.read_text(encoding="utf-8")
-    assert "User=serialwrap" in content and "ExecStart=" in content  # 真實 system unit
+    assert f"User={_resolve_run_user()}" in content          # run-as-user，非 serialwrap account
+    assert f"serialwrapd --socket {SYSTEM_SOCKET} --profile-dir {SYSTEM_PROFILE_DIR}" in content
     assert any(c[:2] == ["sudo", "install"] for c in fx.calls)
 
 

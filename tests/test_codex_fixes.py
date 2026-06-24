@@ -31,7 +31,9 @@ def test_resolve_endpoint_uses_config_socket_when_socket_not_overridden(tmp_path
 # ── #1b：system unit ExecStart 帶 --profile-dir，且 install 會把 profiles 放到 /etc ──
 def test_system_exec_start_and_install_cover_profiles(tmp_path):
     from sw_core import setup_cmd as sc
-    assert "--profile-dir /etc/serialwrap/profiles" in sc._SYSTEM_EXEC_START
+    # #76：ExecStart 改由 _system_exec_start(home) 動態組（run-as-user pipx 路徑），
+    # 仍須帶固定 system --profile-dir。
+    assert "--profile-dir /etc/serialwrap/profiles" in sc._system_exec_start(Path(tmp_path))
     cmds = sc._system_install_cmds(Path(tmp_path), include_start=True)
     flat = [" ".join(c) for c in cmds]
     assert any("/etc/serialwrap/profiles" in f and "cp" in f for f in flat), flat

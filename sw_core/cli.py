@@ -14,7 +14,14 @@ from .constants import CONFIG_DIR, LOCK_PATH, PROFILE_DIR, SOCKET_PATH
 from .doctor_cmd import run_doctor
 from .runtime_config import RuntimeConfig
 from .service_ctl import service_action
-from .setup_cmd import SYSTEM_SOCKET, FlashingBusy, detect_legacy_install, materialize_assets, reconcile
+from .setup_cmd import (
+    SYSTEM_SOCKET,
+    FlashingBusy,
+    detect_legacy_install,
+    ensure_wsl_systemd,
+    materialize_assets,
+    reconcile,
+)
 
 _USE_DEFAULT_ENV = object()
 LEGACY_DAEMON_ENV_FILE = "~/OPI.env"
@@ -334,6 +341,21 @@ def _run_setup(args: argparse.Namespace) -> int:
 
     # 5. 物化套件資產到使用者可寫位置。
     materialize_assets(force=args.force)
+
+    # 5b. WSL 偵測：若在 WSL 但 systemd 尚未啟用，主動寫 /etc/wsl.conf [boot] systemd=true，
+    #     並早退提示使用者 `wsl --shutdown` 重啟後再跑 setup（systemd 須重進 WSL 才生效，
+    #     當次無法直接起 systemd 服務）。已啟用或非 WSL → no-op，照常往下走。
+    wsl_info = ensure_wsl_systemd(fx, os.path.expanduser("~"))
+    if wsl_info.get("needs_restart"):
+        _print({
+            "ok": True,
+            "legacy": legacy,
+            "wsl_systemd_enabled": True,
+            "needs_restart": True,
+            "requested_mode": target,
+            "hint": wsl_info.get("hint"),
+        })
+        return 0
 
     # 6. 有效 socket：systemd-system 走系統固定 socket，其餘走使用者 XDG 預設（Codex #1a/#1b）。
     effective_socket = SYSTEM_SOCKET if target == "systemd-system" else SOCKET_PATH

@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+import configparser
+import getpass
 import importlib.resources
 import os
 import shutil
@@ -245,7 +247,90 @@ _SYSTEM_UNIT_PATH = "/etc/systemd/system/serialwrap.service"
 # 與 daemon --profile-dir 一致對齊（Codex #1a/#1b）。
 SYSTEM_SOCKET = "/run/serialwrap/serialwrapd.sock"
 SYSTEM_PROFILE_DIR = "/etc/serialwrap/profiles"
-_SYSTEM_EXEC_START = f"/usr/local/bin/serialwrapd --socket {SYSTEM_SOCKET} --profile-dir {SYSTEM_PROFILE_DIR}"
+
+
+def _resolve_run_user() -> str:
+    """解析 system unit 的執行身份（``User=``）。
+
+    pipx 使用者安裝下 serialwrapd binary 落在安裝者 venv（家目錄內），dedicated
+    ``serialwrap`` service account 讀不到該家目錄，故 system unit 改以「安裝者本人」
+    執行。優先取 ``SUDO_USER``（``sudo serialwrap setup`` 時為原始使用者），否則取
+    目前登入帳號。
+    """
+    return os.environ.get("SUDO_USER") or getpass.getuser()
+
+
+def _resolve_serialwrapd_path(home: Path) -> str:
+    """解析 system unit ExecStart 用的 serialwrapd 絕對路徑（pipx 使用者安裝）。
+
+    ExecStart 不能用 ``%h``（system unit 無使用者 home 展開），故解析成絕對路徑：
+    優先 ``which serialwrapd``（pipx shim，通常 ``~/.local/bin/serialwrapd``），
+    否則退回 ``home/.local/bin/serialwrapd``。
+    """
+    return shutil.which("serialwrapd") or str(home / ".local" / "bin" / "serialwrapd")
+
+
+def _system_exec_start(home: Path) -> str:
+    """組出 system unit 的 ExecStart（絕對 serialwrapd + 固定 socket/profile-dir）。"""
+    return f"{_resolve_serialwrapd_path(home)} --socket {SYSTEM_SOCKET} --profile-dir {SYSTEM_PROFILE_DIR}"
+
+
+def _merge_wsl_conf_systemd(existing: str) -> str:
+    """把現有 /etc/wsl.conf 內容合併出含 ``[boot] systemd=true`` 的版本（保留其他段落/鍵）。"""
+    import io
+
+    cp = configparser.ConfigParser()
+    cp.optionxform = str  # 保留鍵大小寫（wsl.conf 鍵大小寫敏感）
+    try:
+        cp.read_string(existing)
+    except configparser.Error:
+        # 既有檔不合法時不沿用，改寫成只含 [boot] 的乾淨版本（不破壞性丟棄無法解析內容）。
+        cp = configparser.ConfigParser()
+        cp.optionxform = str
+    if not cp.has_section("boot"):
+        cp.add_section("boot")
+    cp.set("boot", "systemd", "true")
+    buf = io.StringIO()
+    cp.write(buf)
+    return buf.getvalue()
+
+
+def ensure_wsl_systemd(fx, home) -> dict:
+    """WSL 上若 systemd 尚未啟用，寫 ``/etc/wsl.conf`` ``[boot] systemd=true``（需 sudo）。
+
+    - 非 WSL → no-op（``{"wsl": False}``）。
+    - 已啟用 systemd（``has_systemd``）→ no-op（``already=True``）。
+    - 需啟用 → staging + ``sudo install`` 寫 ``/etc/wsl.conf``，回報需於 Windows 端
+      ``wsl --shutdown`` 重啟（systemd 須重進 WSL 才生效，當次 setup 無法直接起 systemd 服務）。
+
+    以 Effects.run 經過 sudo install（非直接 sudo tee，避免空檔）。回傳結果字典供
+    cli 決定是否早退並提示使用者重啟。
+    """
+    if not fx.is_wsl():
+        return {"wsl": False, "already": False, "enabled_now": False, "needs_restart": False}
+    if fx.has_systemd():
+        return {"wsl": True, "already": True, "enabled_now": False, "needs_restart": False}
+    home = Path(home)
+    try:
+        existing = Path("/etc/wsl.conf").read_text(encoding="utf-8")
+    except OSError:
+        existing = ""
+    merged = _merge_wsl_conf_systemd(existing)
+    staging = home / ".local" / "share" / "serialwrap" / "wsl.conf"
+    staging.parent.mkdir(parents=True, exist_ok=True)
+    staging.write_text(merged, encoding="utf-8")
+    rc, _out, _err = fx.run(["sudo", "install", "-m", "0644", str(staging), "/etc/wsl.conf"])
+    return {
+        "wsl": True,
+        "already": False,
+        "enabled_now": rc == 0,
+        "needs_restart": rc == 0,
+        "rc": rc,
+        "hint": (
+            "已寫入 /etc/wsl.conf [boot] systemd=true；請在 Windows 端執行 "
+            "`wsl --shutdown`，重新進入 WSL 後再跑一次 `serialwrap setup --system --with-sudo`。"
+        ),
+    }
 
 
 def _stage_system_unit(home: Path) -> Path:
@@ -253,10 +338,14 @@ def _stage_system_unit(home: Path) -> Path:
 
     以 staging + ``sudo install`` 取代直接 ``sudo tee``：Effects.run 不帶 stdin，直接
     ``sudo tee`` 會寫出空檔；staging 讓非特權步驟先備妥真實內容，特權步驟只做複製。
+    unit 以安裝者本人帳號執行（run-as-user），ExecStart 指向其 pipx serialwrapd。
     """
     staging = home / ".local" / "share" / "serialwrap" / "serialwrap.service"
     staging.parent.mkdir(parents=True, exist_ok=True)
-    staging.write_text(render_system_unit(_SYSTEM_EXEC_START), encoding="utf-8")
+    staging.write_text(
+        render_system_unit(_system_exec_start(home), run_user=_resolve_run_user()),
+        encoding="utf-8",
+    )
     return staging
 
 
