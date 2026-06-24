@@ -7,7 +7,7 @@ import time
 import uuid
 from typing import Any, Callable
 
-from .constants import CMD_HISTORY_MAX
+from .constants import CMD_HISTORY_MAX, CMD_PENDING_MAX
 from .util import now_iso
 
 CMD_WARN_BYTES = 4096
@@ -99,13 +99,6 @@ class CommandArbiter:
                         "Split into multiple independent submissions.",
             }
 
-        with self._lock:
-            pq = self._queues.get(session_id)
-            if pq is None:
-                return {"ok": False, "error_code": "SESSION_NOT_READY", "session_id": session_id}
-            self._counter += 1
-            counter = self._counter
-
         cmd_id = uuid.uuid4().hex
         now = now_iso()
         rec = {
@@ -130,7 +123,28 @@ class CommandArbiter:
             "interactive_session_id": None,
             "recovery_action": None,
         }
+        # admission control + 入列在同一把鎖內原子完成：先擋下超量，再 counter/insert/evict，避免
+        # 兩個並發 submit 各自通過檢查後雙雙插入而短暫超出上限（#81 Codex 必修）。
         with self._lock:
+            pq = self._queues.get(session_id)
+            if pq is None:
+                return {"ok": False, "error_code": "SESSION_NOT_READY", "session_id": session_id}
+            pending = self._count_pending_locked(session_id)
+            if pending >= CMD_PENDING_MAX:
+                # 進行中（accepted/running）命令已達 per-session 硬上限：拒絕而非排隊。eviction 只能淘汰
+                # 已完成命令，無法回收尚未執行者；少了 admission control，client 比 UART worker 快時
+                # _commands 與 PriorityQueue 會持續累積 accepted/running records 而 OOM。
+                return {
+                    "ok": False,
+                    "error_code": "SESSION_QUEUE_FULL",
+                    "session_id": session_id,
+                    "pending": pending,
+                    "limit": CMD_PENDING_MAX,
+                    "hint": "Per-session pending command queue is full (backpressure). "
+                            "Wait for in-flight commands to drain before submitting more.",
+                }
+            self._counter += 1
+            counter = self._counter
             self._commands[cmd_id] = rec
             self._evict_commands_locked()
         pq.put(_QueuedCommand(sort_key=(priority, counter), cmd_id=cmd_id, session_id=session_id, command=command, source=source, mode=mode, timeout_s=timeout_s, expected_duration_s=expected_duration_s))
@@ -138,6 +152,18 @@ class CommandArbiter:
         if cmd_warning is not None:
             result["warning"] = cmd_warning
         return result
+
+    def _count_pending_locked(self, session_id: str) -> int:
+        """該 session 進行中（accepted/running，done_at 為 None）的命令數。須在持有 ``self._lock`` 下呼叫。
+
+        以掃描 _commands 計數而非維護獨立計數器：admission control 把 pending 上限封頂後 _commands
+        大小有界（≤ CMD_HISTORY_MAX + pending 上限），掃描成本可控；且避免計數器在多處終結轉移
+        （worker 成功/例外、cancel、unregister 殘留）漏增漏減而 drift。
+        """
+        return sum(
+            1 for rec in self._commands.values()
+            if rec.get("session_id") == session_id and not rec.get("done_at")
+        )
 
     def _evict_commands_locked(self) -> None:
         """淘汰最舊的「已完成（有 done_at）」命令記錄，使數量回到上限（#81）。

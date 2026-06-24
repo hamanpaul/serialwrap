@@ -2879,8 +2879,17 @@ class SessionManager:
         finalized = [(cid, cap) for cid, cap in self._background.items() if cap.status != "active"]
         finalized.sort(key=lambda kv: kv[1].created_at)
         excess = len(self._background) - BG_CAPTURE_MAX_COUNT
-        for cid, _cap in finalized[:excess]:
+        for cid, cap in finalized[:excess]:
             self._background.pop(cid, None)
+            # 同步從擁有者 session 的 background_cmd_ids 移除：否則該 per-session list 只在 detach 時
+            # clear，會隨長壽 daemon 無界成長，且 _on_bridge_rx 每筆 RX 都會逐一掃描它（記憶體 + per-RX
+            # CPU 累積），即使 _background 已被 BG_CAPTURE_MAX_COUNT 封頂亦然（#81 Codex 必修）。
+            owner = self._sessions.get(cap.session_id)
+            if owner is not None:
+                try:
+                    owner.background_cmd_ids.remove(cid)
+                except ValueError:
+                    pass
 
     def get_background_result(self, cmd_id: str, *, from_chunk: int = 0, limit: int = 200) -> dict[str, Any]:
         with self._lock:

@@ -86,6 +86,11 @@ BG_CAPTURE_MAX_COUNT: int = 64
 """保留的 background capture 數上限；超過則淘汰最舊的「已終結（非 active）」capture。"""
 CMD_HISTORY_MAX: int = 512
 """arbiter 保留的命令記錄數上限；超過則淘汰最舊的「已完成（有 done_at）」命令。"""
+CMD_PENDING_MAX: int = 256
+"""arbiter 每個 session「進行中（accepted/running，done_at 為 None）」命令的硬上限（admission control）。
+超過即拒絕新 submit（SESSION_QUEUE_FULL backpressure），而非接受後排隊——eviction 只能淘汰已完成命令，
+無法回收尚未執行者；少了 admission control，client 比 UART worker 快時 _commands 與 PriorityQueue 會
+持續累積 accepted/running records 而 OOM（#81 Codex 必修）。"""
 DEFERRED_INPUT_MAX_BYTES: int = 256 * 1024
 """agent 命令期間單一 human console 的 deferred 輸入緩衝上限；超過則丟最舊位元組。"""
 
