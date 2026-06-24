@@ -171,52 +171,73 @@ def _maybe_redos_suspicious(parsed: Any) -> bool:
     )
 
 
-# 類別成員判定（用真實 re 語意，確保挑出的代表字元**確實**被該原子匹配，而非 best-effort 猜測）。
-_CAT_MATCH = {
-    _sre_constants.CATEGORY_DIGIT: re.compile(r"\d"),
-    _sre_constants.CATEGORY_NOT_DIGIT: re.compile(r"\D"),
-    _sre_constants.CATEGORY_WORD: re.compile(r"\w"),
-    _sre_constants.CATEGORY_NOT_WORD: re.compile(r"\W"),
-    _sre_constants.CATEGORY_SPACE: re.compile(r"\s"),
-    _sre_constants.CATEGORY_NOT_SPACE: re.compile(r"\S"),
-}
-# 找「被負類接受的字元」的掃描順序：可見 ASCII 優先 → 其他控制 → BMP。負類排除集有限（pattern ≤512 字），
-# 故必能找到非排除字元，杜絕「攻擊者排除掉固定代表字母」的盲點（Codex round5 [critical]）。
+# 找代表字元的掃描順序：可見 ASCII 優先 → 其他控制 → BMP。排除集有限（pattern ≤512 字），故 IN class
+# 必能找到被接受字元，杜絕「攻擊者排除掉固定代表字元」的盲點（round5）。
 _ATTACK_CODEPOINTS = list(range(0x21, 0x7F)) + list(range(0x00, 0x21)) + list(range(0x7F, 0x2000))
+# 類別 → class 內部來源片段，供以**實際 flags** 重建並編譯該原子（flag-aware 成員測試，round6）。
+_CAT_SRC = {
+    _sre_constants.CATEGORY_DIGIT: r"\d", _sre_constants.CATEGORY_NOT_DIGIT: r"\D",
+    _sre_constants.CATEGORY_WORD: r"\w", _sre_constants.CATEGORY_NOT_WORD: r"\W",
+    _sre_constants.CATEGORY_SPACE: r"\s", _sre_constants.CATEGORY_NOT_SPACE: r"\S",
+}
 
 
-def _char_in_in_items(c: str, items: Any) -> bool:
-    """字元 c 是否屬於 IN class 的（去 NEGATE 後）items（literal/range/category）。未知類別保守視為屬於。"""
-    cp = ord(c)
+def _in_class_regex(av: Any, flags: int):
+    """把 IN class（含 NEGATE/literal/range/category）以**實際 flags** 重建並編譯為單字元 regex。
+
+    用真實 re 語意（含 IGNORECASE 的大小寫折疊等）測試候選字元成員，而非手刻判定——後者忽略 flags
+    會挑到實際**不被**負類接受的字元而漏放（Codex round6 [high]：`[^\\x00-\\x60]` + `flags='i'`）。
+    """
+    parts = []
+    items = av
+    if items and items[0][0] == _OP_NEGATE:
+        parts.append("^")
+        items = items[1:]
     for o, a in items:
-        if o == _OP_LITERAL and a == cp:
-            return True
-        if o == _OP_RANGE and a[0] <= cp <= a[1]:
-            return True
-        if o == _OP_CATEGORY:
-            rx = _CAT_MATCH.get(a)
-            if rx is None or rx.match(c):
-                return True
-    return False
+        if o == _OP_LITERAL:
+            parts.append(re.escape(chr(a)))
+        elif o == _OP_RANGE:
+            parts.append(re.escape(chr(a[0])) + "-" + re.escape(chr(a[1])))
+        elif o == _OP_CATEGORY:
+            parts.append(_CAT_SRC.get(a, ""))
+        else:
+            return None  # 罕見巢狀構造 → 放棄重建，由呼叫端 fallback
+    try:
+        return re.compile("[" + "".join(parts) + "]", flags)
+    except re.error:  # pragma: no cover
+        return None
 
 
-def _atom_char(op: Any, av: Any) -> str:
-    """能被該原子**確實**匹配的一個代表字元（用於建構對抗輸入；負類以成員判定挑出真正被接受者）。"""
+def _scan_matching_char(rx, default: str = "a") -> str:
+    """掃描候選 codepoint，回傳第一個被已編譯單字元 regex `rx` fullmatch 的字元。"""
+    for cp in _ATTACK_CODEPOINTS:
+        ch = chr(cp)
+        if rx.fullmatch(ch):
+            return ch
+    return default  # pragma: no cover - 該 class 涵蓋整個掃描範圍（極罕）
+
+
+def _atom_char(op: Any, av: Any, flags: int = 0) -> str:
+    """能被該原子（在實際 flags 下）**確實**匹配的一個代表字元（用於建構對抗輸入）。
+
+    IN class 與 NOT_LITERAL 以「重建+編譯+fullmatch」挑出真正被接受者（flag-aware，含 IGNORECASE）；
+    literal/any/category 之代表本身即與 flags 無關地匹配。
+    """
     if op == _OP_LITERAL:
         return chr(av) if 0 <= av < 0x110000 else "a"
-    if op == _OP_NOT_LITERAL:
-        return "a" if av != ord("a") else "b"
     if op == _OP_CATEGORY:
         return _CATEGORY_REPR.get(av, "a")
+    if op == _OP_NOT_LITERAL:
+        try:
+            rx = re.compile("[^" + re.escape(chr(av)) + "]", flags)
+            return _scan_matching_char(rx)
+        except (re.error, ValueError):  # pragma: no cover
+            return "a" if av != ord("a") else "b"
     if op == _OP_IN:
-        if av and av[0][0] == _OP_NEGATE:
-            excluded = av[1:]
-            for cp in _ATTACK_CODEPOINTS:
-                ch = chr(cp)
-                if not _char_in_in_items(ch, excluded):
-                    return ch       # 確認不在排除集 → 負類接受此字元
-            return "\x07"           # pragma: no cover - 排除集涵蓋整個掃描範圍（極罕）
-        for o, a in av:
+        rx = _in_class_regex(av, flags)
+        if rx is not None:
+            return _scan_matching_char(rx)
+        for o, a in av:                 # fallback：重建失敗時的結構式取值（正類）
             if o == _OP_LITERAL:
                 return chr(a) if 0 <= a < 0x110000 else "a"
             if o == _OP_RANGE:
@@ -226,8 +247,8 @@ def _atom_char(op: Any, av: Any) -> str:
     return "a"
 
 
-def _representative_match(sp: Any, depth: int = 0) -> str:
-    """為一個 SubPattern 產生一段「可被它匹配」的字串（量詞取 body 一次、alternation 取首分支）。
+def _representative_match(sp: Any, flags: int, depth: int = 0) -> str:
+    """為一個 SubPattern 產生一段「可被它（在實際 flags 下）匹配」的字串（量詞取 body 一次、取首分支）。
 
     用於建構**多字元重複單元 witness**：char-only 全填無法觸發 `(?:ab|abab)*`、`(ab)*(ab)*` 這類
     需要多字元重複串的 catastrophic（Codex round4 [critical]）。
@@ -241,49 +262,50 @@ def _representative_match(sp: Any, depth: int = 0) -> str:
         elif op in (_OP_ANY, _OP_ANY_ALL):
             parts.append("a")
         elif op in (_OP_IN, _OP_CATEGORY, _OP_NOT_LITERAL):
-            parts.append(_atom_char(op, av))
+            parts.append(_atom_char(op, av, flags))
         elif op in _BACKTRACK_REPEATS or (
             _OP_POSSESSIVE_REPEAT is not None and op == _OP_POSSESSIVE_REPEAT
         ):
-            parts.append(_representative_match(av[2], depth + 1))   # body 一次
+            parts.append(_representative_match(av[2], flags, depth + 1))   # body 一次
         elif op == _OP_SUBPATTERN:
-            parts.append(_representative_match(av[-1], depth + 1))
+            parts.append(_representative_match(av[-1], flags, depth + 1))
         elif _OP_ATOMIC_GROUP is not None and op == _OP_ATOMIC_GROUP:
-            parts.append(_representative_match(av, depth + 1))
+            parts.append(_representative_match(av, flags, depth + 1))
         elif op == _OP_BRANCH:
             br = next((b for b in av[1] if b is not None), None)
             if br is not None:
-                parts.append(_representative_match(br, depth + 1))
+                parts.append(_representative_match(br, flags, depth + 1))
         # AT（anchor）/ASSERT/GROUPREF 等不產生字元
     return "".join(parts)
 
 
-def _redos_attack_inputs(parsed: Any) -> list[str]:
+def _redos_attack_inputs(parsed: Any, flags: int) -> list[str]:
     """為 pattern 建構對抗輸入：以「可匹配重複單元」鋪成 4096 長字串，各產生『全填』與『全填+失敗尾』。
 
     - 單字元 witness：pattern 的 literal/類別代表字元 ＋ 通用 {a,0,space}（觸發多項式/重疊回溯）。
     - 多字元 witness：每個量詞 body（及其 alternation 各分支）的代表匹配字串重複鋪滿（觸發
       `(?:ab|abab)*`、`(ab)*(ab)*` 這類需多字元重複串的 catastrophic；Codex round4 [critical]）。
     - 失敗尾（末位塞罕用控制字元）強迫 anchored 量詞（如 (a+)+$）回溯。
+    代表字元皆以實際 flags 取得（flag-aware，含 IGNORECASE；round6）。
     """
     L = REGEX_MATCH_INPUT_MAX
     units: set[str] = {"a", "0", " "}
     for op, av in _walk_ast(parsed):
         if op in (_OP_LITERAL, _OP_IN, _OP_CATEGORY, _OP_NOT_LITERAL):
-            units.add(_atom_char(op, av))
+            units.add(_atom_char(op, av, flags))
         if op in _BACKTRACK_REPEATS or (
             _OP_POSSESSIVE_REPEAT is not None and op == _OP_POSSESSIVE_REPEAT
         ):
             _mn, mx, body = av
             if mx == _MAXREPEAT or (isinstance(mx, int) and mx > 1):
-                u = _representative_match(body)
+                u = _representative_match(body, flags)
                 if u:
                     units.add(u[:128])
                 for bop, bav in _walk_ast(body):    # body 內每個 alternation 分支各取一 witness
                     if bop == _OP_BRANCH:
                         for br in bav[1]:
                             if br is not None:
-                                bu = _representative_match(br)
+                                bu = _representative_match(br, flags)
                                 if bu:
                                     units.add(bu[:128])
     out: list[str] = []
@@ -305,7 +327,7 @@ def _stdlib_regex_is_catastrophic(value: str, flags: int) -> bool:
     """
     try:
         parsed = _sre_parse.parse(value, flags)
-        payload = json.dumps({"v": value, "f": int(flags), "a": _redos_attack_inputs(parsed)})
+        payload = json.dumps({"v": value, "f": int(flags), "a": _redos_attack_inputs(parsed, flags)})
         subprocess.run(
             [sys.executable, "-c", _REDOS_PROBE_SCRIPT],
             input=payload.encode("utf-8"),

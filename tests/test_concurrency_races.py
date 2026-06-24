@@ -108,6 +108,18 @@ def test_redos_catastrophic_rejected_without_re2(bad):
         _rule(pattern={"kind": "regex", "value": bad})  # re2 線性 → 免疫 → 接受
 
 
+def test_redos_ignorecase_negated_range_rejected_without_re2():
+    """round6：負類範圍 `[^\\x00-\\x60]` + IGNORECASE——代表字元選取須 flag-aware（用實際 flags 編譯+
+    fullmatch）才能挑到真正被接受者（如 '{'）；flag-unaware 會挑到 'a'（i 下被排除）而漏放。
+    """
+    pat = "^[^\x00-\x60]*[^\x00-\x60]*[^\x00-\x60]*Y$"
+    if _schema_mod._re2 is None:
+        with pytest.raises(RuleSchemaError):
+            _rule(pattern={"kind": "regex", "value": pat, "flags": "i"})
+    else:
+        _rule(pattern={"kind": "regex", "value": pat, "flags": "i"})
+
+
 @pytest.mark.parametrize("bad", [
     r"(a*)\1X",               # round3：backreference（re2 不支援）→ 落 re → 探測拒
     r"a{0,4096}a{0,4096}X",   # round3：大量有界 repeat（re2 拒絕超大 repetition）→ 落 re → 探測拒
