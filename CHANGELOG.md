@@ -6,6 +6,7 @@
 
 ### Fixed
 
+- **`suspend_interactive`/`resume_interactive` 改為可重入，修正並發 agent 操作使 human 永久失去 raw ownership（#78）**：原本以單一 `_suspended_owner` 保存 owner，兩條 agent 路徑（`execute_command`／`file_push`/`pull`／`self_test`／interactive lease soft-preempt）重疊呼叫時，第二次 suspend 會把已保存的 `human:X` 覆寫成 `None`，resume 後 human 永久掉到 line-buffer/deferred（打字卡/掉字）。改以巢狀深度計數（`_suspend_depth`）：只有最外層 suspend 保存 owner、最外層 resume 才還原並 flush deferred；不平衡 resume 為 no-op；被 suspend 的 human console 斷線則重置深度。新增 `tests/test_suspend_resume_reentrant.py`。
 - **systemd-system 模式可在 pipx 使用者安裝下實際啟動（#76）**：原 system unit 寫死 `User=serialwrap` dedicated account 且 `ExecStart=/usr/local/bin/serialwrapd`，但 pipx 只把 serialwrapd 裝到安裝者家目錄 venv（`~/.local/bin/serialwrapd`）、且 install 從未建立 `serialwrap` 帳號 → `setup --system` 起不來。改為 **run-as-user**：`render_system_unit(exec_start, run_user=...)` 參數化 `User=`，`setup_cmd` 以 `_resolve_run_user()`（`SUDO_USER`→`getpass.getuser()`）帶安裝者本人帳號、`_resolve_serialwrapd_path()` 解析其 pipx serialwrapd 絕對路徑組 ExecStart。保留「非 root + dialout」安全邊界，socket 仍於 `/run/serialwrap`（不受 WSLg `/run/user` 遮蔽、不依賴脆弱的 `user@<uid>`）。
 
 ### Added
