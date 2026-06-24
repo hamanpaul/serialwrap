@@ -39,16 +39,19 @@ RestartSec=2
 WantedBy=default.target"""
 
 
-def render_system_unit(exec_start: str) -> str:
+def render_system_unit(exec_start: str, run_user: str = "serialwrap") -> str:
     """
     產生 system scope（/etc/systemd/system/）的 serialwrap daemon unit 內容。
 
-    執行身份為 ``serialwrap`` service account，附加 ``dialout`` 群組以存取
+    執行身份為 ``run_user``（預設 ``serialwrap`` service account；pipx 使用者安裝
+    流程會帶入「安裝者本人的帳號」，因為 serialwrapd binary 落在該使用者 venv，
+    dedicated service account 讀不到其家目錄）。附加 ``dialout`` 群組以存取
     /dev/ttyUSB* 等 UART 裝置。
 
     Args:
         exec_start: ExecStart 指令字串，例如
-            ``/usr/local/bin/serialwrapd --socket /run/serialwrap/serialwrapd.sock``。
+            ``/home/<user>/.local/bin/serialwrapd --socket /run/serialwrap/serialwrapd.sock``。
+        run_user: service 執行身份（``User=``）；WSL／pipx 使用者安裝下為安裝者本人。
 
     Returns:
         完整的 systemd unit 檔案文字（不含尾端換行）。
@@ -62,7 +65,7 @@ After=multi-user.target
 
 [Service]
 Type=simple
-User=serialwrap
+User={run_user}
 SupplementaryGroups=dialout
 RuntimeDirectory=serialwrap
 StateDirectory=serialwrap

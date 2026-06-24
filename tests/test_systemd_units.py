@@ -25,3 +25,13 @@ def test_system_unit_runs_service_account_in_dialout():
 def test_exec_start_is_parameterized():
     from sw_core.systemd_units import render_user_unit
     assert "ExecStart=/custom/path/serialwrapd" in render_user_unit(exec_start="/custom/path/serialwrapd")
+
+
+def test_system_unit_run_user_parameterized():
+    """#76：system unit 的 User= 可帶安裝者本人帳號（run-as-user，pipx 使用者安裝）。"""
+    from sw_core.systemd_units import render_system_unit
+    text = render_system_unit(exec_start="/opt/serialwrap/serialwrapd", run_user="svcuser")
+    assert "User=svcuser" in text
+    assert "User=serialwrap" not in text
+    assert "SupplementaryGroups=dialout" in text
+    assert "ExecStart=/opt/serialwrap/serialwrapd" in text

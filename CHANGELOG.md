@@ -4,7 +4,14 @@
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-06-23
+### Fixed
+
+- **systemd-system 模式可在 pipx 使用者安裝下實際啟動（#76）**：原 system unit 寫死 `User=serialwrap` dedicated account 且 `ExecStart=/usr/local/bin/serialwrapd`，但 pipx 只把 serialwrapd 裝到安裝者家目錄 venv（`~/.local/bin/serialwrapd`）、且 install 從未建立 `serialwrap` 帳號 → `setup --system` 起不來。改為 **run-as-user**：`render_system_unit(exec_start, run_user=...)` 參數化 `User=`，`setup_cmd` 以 `_resolve_run_user()`（`SUDO_USER`→`getpass.getuser()`）帶安裝者本人帳號、`_resolve_serialwrapd_path()` 解析其 pipx serialwrapd 絕對路徑組 ExecStart。保留「非 root + dialout」安全邊界，socket 仍於 `/run/serialwrap`（不受 WSLg `/run/user` 遮蔽、不依賴脆弱的 `user@<uid>`）。
+
+### Added
+
+- **`serialwrap setup` 在 WSL 上主動啟用 systemd（#76）**：新增 `ensure_wsl_systemd()`——偵測到 WSL 但 systemd 尚未啟用時，合併寫入 `/etc/wsl.conf` `[boot] systemd=true`（保留既有段落／鍵，經 staging + `sudo install`，不破壞性丟棄無法解析內容），並早退提示使用者於 Windows 端 `wsl --shutdown` 重啟後再跑 `setup --system`。非 WSL 或 systemd 已啟用 → no-op。新增 `tests/test_wsl_systemd.py` 與 system unit run-as-user 測試。
+
 
 ### Added
 
