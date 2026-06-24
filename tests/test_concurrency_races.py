@@ -117,20 +117,48 @@ def test_safe_regex_patterns_still_accepted(ok):
     _rule(pattern={"kind": "regex", "value": ok})  # 不得誤拒
 
 
-# ── ReDoS runtime 防護：matcher 對 regex 求值輸入長度封頂 ───────────────────────────────
-def test_matcher_caps_regex_input_length():
-    """超過 REGEX_MATCH_INPUT_MAX 的尾端不參與比對（殘餘多項式回溯成本有界）。"""
+# ── ReDoS runtime 防護：re2 線性引擎（#91）/ re 回退路徑輸入封頂 ─────────────────────────
+def test_matcher_regex_input_handling_by_engine():
+    """re2 線性 → 全文求值（不截斷）；re 回退 → 對 regex 輸入封頂截掉尾端。"""
     pm = PatternMatcher(Pattern(kind="regex", value="needle", flags=""))
-    # needle 只出現在封頂之後 → 被截斷、查不到
     tail_only = "x" * REGEX_MATCH_INPUT_MAX + "needle"
-    assert pm.eval(tail_only) is None
-    # 封頂之內的 match 仍正常命中
-    within = "a needle here" + "x" * REGEX_MATCH_INPUT_MAX
-    assert pm.eval(within) is not None
+    if pm._engine == "re2":
+        assert pm.eval(tail_only) is not None          # re2 不截斷，尾端 needle 仍命中
+    else:
+        assert pm.eval(tail_only) is None              # re 回退封頂 → 尾端被截斷
+    assert pm.eval("a needle here") is not None         # 封頂之內/全文皆命中
 
 
 def test_matcher_contains_not_capped():
-    """contains（已 escape 的字面量、無回溯風險）不截斷，長行尾端仍可命中。"""
+    """contains（已 escape 的字面量、無回溯風險）不截斷，長行尾端仍可命中（兩引擎皆然）。"""
     pm = PatternMatcher(Pattern(kind="contains", value="needle", flags=""))
     tail_only = "x" * REGEX_MATCH_INPUT_MAX + "needle"
     assert pm.eval(tail_only) is not None
+
+
+def test_matcher_re2_immune_to_polynomial_redos():
+    """#91：re2 線性引擎對多項式 pattern（`a.*a.*a.*X`，AST 偵測器放行）長輸入不凍結。"""
+    pytest.importorskip("re2")
+    import time
+    pm = PatternMatcher(Pattern(kind="regex", value="a.*a.*a.*X", flags=""))
+    assert pm._engine == "re2"
+    t0 = time.monotonic()
+    assert pm.eval("a" * 200000) is None                # 無 X → 不命中；re2 線性 → 必須極快
+    assert (time.monotonic() - t0) < 1.0, "re2 路徑對多項式 pattern 不應有 catastrophic backtracking"
+
+
+def test_matcher_re2_flags_and_groups():
+    """re2 路徑：inline flag（i/s/m）與群組擷取語意與 re 一致。"""
+    pytest.importorskip("re2")
+    pm = PatternMatcher(Pattern(kind="regex", value=r"temp=(\d+)c", flags="i"))
+    assert pm._engine == "re2"
+    r = pm.eval("XX TEMP=42C yy")
+    assert r is not None and r.matched_text == "TEMP=42C" and r.groups == ["42"]
+
+
+def test_matcher_re2_falls_back_for_backreference():
+    """re2 不支援 backreference → 自動退回標準 re（不致無法載入規則）。"""
+    pytest.importorskip("re2")
+    pm = PatternMatcher(Pattern(kind="regex", value=r"(ab)\1", flags=""))
+    assert pm._engine == "re"                            # 退回 re
+    assert pm.eval("abab") is not None

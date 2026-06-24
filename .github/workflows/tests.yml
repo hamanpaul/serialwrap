@@ -13,6 +13,8 @@ jobs:
         with:
           python-version: "3.12"
       - name: 安裝測試相依
-        run: python3 -m pip install --disable-pip-version-check pytest pyyaml
+        # 併裝 google-re2（[redos] 可選依賴）使 CI 覆蓋 matcher 的 re2 線性引擎路徑（#91）；
+        # 不支援平台/構造仍由 matcher 自動退回標準 re，re2 專屬測試以 importorskip 守門。
+        run: python3 -m pip install --disable-pip-version-check pytest pyyaml google-re2
       - name: 執行測試套件
         run: python3 -m pytest -q tests/

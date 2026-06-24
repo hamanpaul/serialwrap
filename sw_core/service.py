@@ -141,21 +141,33 @@ class _BridgeProbe:
         sess = self._svc._sessions.get_session(com)
         if sess is None or sess.bridge is None:
             return False
+        bridge = sess.bridge
         with self._svc._flash_lock:
             self._svc._flash_rx_buffers[com] = bytearray()
+        # RACE-2（#83）：probe 在正式 enter_flashing 之前進行，此時候選 bridge 的 flash_mode 仍為 False；
+        # 若其上有 human raw console 正鍵入，其 send_bytes 會與 probe 的 sync bytes 在同一 UART 交錯
+        # （兩個邏輯寫入者 → 污染 target 輸入行 / 干擾 ACK 判讀）。probe 期間暫時開 flash_mode gate 取得
+        # 該 bridge 的寫入仲裁：console→device 寫入（human 鍵入／注入）被 drop，而 probe 的 flash_tx 帶
+        # _allow_during_flash 不受影響、device→buffer 的 ACK 擷取（_handle_serial_rx 不看 flash_mode）亦
+        # 不受影響。命中與否都先解除；命中後由 _on_flash_open 的 enter_flashing 正式接管（候選必為非
+        # FLASHING——_flash_candidates 只收 READY/ATTACHED）。
+        bridge.set_flash_mode(True)
         try:
-            sess.bridge.flash_tx(self._sync_bytes or probe_bytes)
-        except Exception:
+            try:
+                bridge.flash_tx(self._sync_bytes or probe_bytes)
+            except Exception:
+                return False
+            deadline = time.monotonic() + timeout_ms / 1000.0
+            while time.monotonic() < deadline:
+                with self._svc._flash_lock:
+                    buf = bytes(self._svc._flash_rx_buffers.get(com, b""))
+                if expect in buf:
+                    self.acks[by_id] = buf      # 記下 MCU 回應，bridge 啟動時回放給 flasher
+                    return True
+                time.sleep(0.02)
             return False
-        deadline = time.monotonic() + timeout_ms / 1000.0
-        while time.monotonic() < deadline:
-            with self._svc._flash_lock:
-                buf = bytes(self._svc._flash_rx_buffers.get(com, b""))
-            if expect in buf:
-                self.acks[by_id] = buf      # 記下 MCU 回應，bridge 啟動時回放給 flasher
-                return True
-            time.sleep(0.02)
-        return False
+        finally:
+            bridge.set_flash_mode(False)
 
 
 class SerialwrapService:

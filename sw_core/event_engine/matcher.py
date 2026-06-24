@@ -9,6 +9,15 @@ from typing import Iterable, Protocol
 from .counter import Counter
 from .schema import REGEX_MATCH_INPUT_MAX, Pattern, Rule, _flags_from_string
 
+# google-re2 線性（Thompson NFA）regex 引擎，對 user-controlled regex 免疫所有 catastrophic
+# backtracking（含指數與 #91 的多項式 `a.*a.*a.*X` 類；標準 `re` 無此能力且不可中斷）。為可選依賴
+# （`pip install serialwrap[redos]` 或 `google-re2`）：未安裝時自動退回標準 `re` + schema AST 拒絕
+# + 輸入封頂的既有防護。re2 不支援的構造（backreference / lookaround）亦自動退回 `re`。
+try:  # pragma: no cover - 視環境是否安裝 re2
+    import re2 as _re2
+except ImportError:  # pragma: no cover
+    _re2 = None
+
 
 @dataclass
 class MatchResult:
@@ -21,18 +30,37 @@ class PatternMatcher:
         self._pattern = pattern
         self._is_regex = pattern.kind == "regex"
         if pattern.kind == "regex":
-            self._re = re.compile(pattern.value, _flags_from_string(pattern.flags))
+            raw = pattern.value
         elif pattern.kind == "contains":
-            flags = _flags_from_string(pattern.flags)
-            self._re = re.compile(re.escape(pattern.value), flags)
+            raw = re.escape(pattern.value)
         else:
             raise ValueError(f"unknown pattern kind: {pattern.kind}")
+        flags = _flags_from_string(pattern.flags)  # 驗證 flags（即使走 re2 也先確認合法）
+
+        self._engine = "re"
+        self._re = None
+        if _re2 is not None:
+            # re2 以 inline flag 群組帶旗標（`(?ism)`）——pattern.flags 已由 _flags_from_string 限定為
+            # i/s/m 子集，與 re2 inline 字母一致。不支援構造則 compile 失敗，退回標準 re。
+            inline = f"(?{pattern.flags})" if pattern.flags else ""
+            try:
+                self._re = _re2.compile(inline + raw)
+                self._engine = "re2"
+            except Exception:
+                self._re = None
+        if self._re is None:
+            self._re = re.compile(raw, flags)
+            self._engine = "re"
 
     def eval(self, line: str) -> MatchResult | None:
-        # ReDoS runtime 防護（#83 Codex 必修）：對 user-controlled regex 把求值輸入長度封頂，使殘餘
-        # 多項式回溯成本有界，即便 schema AST 靜態分析漏放亦不致凍結單執行緒 matcher。contains（已
-        # re.escape 的字面量）無回溯風險，維持原樣不截斷以保語意。
-        target = line[:REGEX_MATCH_INPUT_MAX] if self._is_regex else line
+        # re2 為線性，無回溯爆炸風險，全文求值（不截斷，保完整匹配）。
+        # 標準 re 回退路徑：對 user-controlled regex 把求值輸入長度封頂（REGEX_MATCH_INPUT_MAX），使
+        # 殘餘多項式回溯成本有界，即便 schema AST 靜態分析漏放亦不致凍結單執行緒 matcher（#83/#91）。
+        # contains（已 re.escape 的字面量）無回溯風險，不截斷。
+        if self._is_regex and self._engine == "re":
+            target = line[:REGEX_MATCH_INPUT_MAX]
+        else:
+            target = line
         m = self._re.search(target)
         if m is None:
             return None
