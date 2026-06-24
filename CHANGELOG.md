@@ -6,6 +6,7 @@
 
 ### Fixed
 
+- **補齊阻塞型 RPC handler 的 executor offload，避免單一慢 RPC 凍結全 daemon（#80，延伸 #52）**：#52/PR#73 僅 offload `file.push`/`file.pull`，但 `session.recover`（force 路徑硬 sleep 10s + probe 數十秒）、`session.attach`（reprobe 完整 ensure_ready/probe）、`session.self_test`（同步等 UART 2×timeout）、`session.console_attach`（可觸發 recover）、`result.tail`/`log.tail_raw`/`log.tail_text`/`wal.range`（整檔讀取）仍在單執行緒 asyncio loop 上同步執行，期間**所有** RPC（含 `health.ping`）凍結。將以上方法併入 `BLOCKING_RPC_METHODS` 一併 offload。安全性：這些 handler 都經 `service.rpc` → `SessionManager`/`WalWriter` 鎖保護方法、本已被多執行緒並發呼叫，於 executor 跑亦執行緒安全；RPC 為每連線請求/回應模型，不影響回應對應。新增 `tests/test_rpc_blocking_offload.py`。（REACT-4：reader thread `_write_all` 於 serial EAGAIN 自旋，屬 reader thread 而非 RPC loop，列為後續。）
 - **systemd-system 模式可在 pipx 使用者安裝下實際啟動（#76）**：原 system unit 寫死 `User=serialwrap` dedicated account 且 `ExecStart=/usr/local/bin/serialwrapd`，但 pipx 只把 serialwrapd 裝到安裝者家目錄 venv（`~/.local/bin/serialwrapd`）、且 install 從未建立 `serialwrap` 帳號 → `setup --system` 起不來。改為 **run-as-user**：`render_system_unit(exec_start, run_user=...)` 參數化 `User=`，`setup_cmd` 以 `_resolve_run_user()`（`SUDO_USER`→`getpass.getuser()`）帶安裝者本人帳號、`_resolve_serialwrapd_path()` 解析其 pipx serialwrapd 絕對路徑組 ExecStart。保留「非 root + dialout」安全邊界，socket 仍於 `/run/serialwrap`（不受 WSLg `/run/user` 遮蔽、不依賴脆弱的 `user@<uid>`）。
 
 ### Added
