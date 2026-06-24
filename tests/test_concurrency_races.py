@@ -135,6 +135,21 @@ def test_redos_inline_ignorecase_flags_rejected_without_re2(pat):
         _rule(pattern={"kind": "regex", "value": pat})
 
 
+@pytest.mark.parametrize("pat", [
+    r"^([^\x02]+)+$",         # 負類 anchored：固定 \x01 失敗尾被 [^\x02] 匹配 → 須以真實拒絕字元(\x02)觸發
+    r"^([^,]+)+$",            # 負類逗號
+])
+def test_redos_negated_class_failing_suffix_rejected_without_re2(pat):
+    """round8：失敗尾須是**真實被原子拒絕**的字元（per-pattern 求得），而非固定 `\\x01`；否則負類
+    anchored 量詞的 witness 全程命中、不走回溯而漏放。
+    """
+    if _schema_mod._re2 is None:
+        with pytest.raises(RuleSchemaError):
+            _rule(pattern={"kind": "regex", "value": pat})
+    else:
+        _rule(pattern={"kind": "regex", "value": pat})
+
+
 @pytest.mark.parametrize("bad", [
     r"(a*)\1X",               # round3：backreference（re2 不支援）→ 落 re → 探測拒
     r"a{0,4096}a{0,4096}X",   # round3：大量有界 repeat（re2 拒絕超大 repetition）→ 落 re → 探測拒

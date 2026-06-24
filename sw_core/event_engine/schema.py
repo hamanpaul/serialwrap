@@ -247,6 +247,49 @@ def _atom_char(op: Any, av: Any, flags: int = 0) -> str:
     return "a"
 
 
+def _atom_regex(op: Any, av: Any, flags: int):
+    """把單一原子（literal/not_literal/in/category/any）重建為單字元 regex（實際 flags），供成員測試。"""
+    try:
+        if op == _OP_LITERAL:
+            return re.compile("[" + re.escape(chr(av)) + "]", flags)
+        if op == _OP_NOT_LITERAL:
+            return re.compile("[^" + re.escape(chr(av)) + "]", flags)
+        if op == _OP_IN:
+            return _in_class_regex(av, flags)
+        if op == _OP_CATEGORY:
+            src = _CAT_SRC.get(av)
+            return re.compile("[" + src + "]", flags) if src else None
+        if op == _OP_ANY:
+            return re.compile(".", flags)            # 非 DOTALL：拒 \n
+        if op == _OP_ANY_ALL:
+            return None                              # DOTALL `.`：匹配一切，無拒絕字元
+    except (re.error, ValueError):  # pragma: no cover
+        return None
+    return None
+
+
+def _scan_nonmatching_char(rx) -> "str | None":
+    """掃描候選 codepoint，回傳第一個**不**被單字元 regex `rx` fullmatch 的字元（無則 None）。"""
+    for cp in _ATTACK_CODEPOINTS:
+        ch = chr(cp)
+        if not rx.fullmatch(ch):
+            return ch
+    return None  # pragma: no cover - 該原子匹配整個掃描範圍
+
+
+def _atom_rejecting_char(op: Any, av: Any, flags: int) -> "str | None":
+    """一個該原子（在實際 flags 下）**確實不**匹配的字元（None 表示匹配一切，如 DOTALL `.`）。
+
+    用於建構**會失敗的尾字元**：固定 `\\x01` 對 `[^\\x02]` 這類負類其實仍被匹配 → witness 全程命中、
+    從不走回溯失敗路徑而漏放（Codex round8 [critical]）。改用「以真實 re 語意挑真正被原子拒絕的字元」
+    當失敗尾，強迫 anchored 量詞（如 `^([^\\x02]+)+$`）回溯。
+    """
+    rx = _atom_regex(op, av, flags)
+    if rx is None:
+        return None
+    return _scan_nonmatching_char(rx)
+
+
 def _subpattern_flags(av: Any, flags: int) -> int:
     """套用 SUBPATTERN 的 scoped inline flags（如 `(?i:...)`）：`(flags | add) & ~del`。
 
@@ -292,18 +335,23 @@ def _representative_match(sp: Any, flags: int, depth: int = 0) -> str:
     return "".join(parts)
 
 
-def _collect_witness_units(sp: Any, flags: int, units: set, depth: int = 0) -> None:
-    """遞迴收集 witness 重複單元，沿 SUBPATTERN 邊界傳遞 effective flags（含 scoped `(?i:...)`）。
+def _collect_witness_units(sp: Any, flags: int, units: set, reject: set, depth: int = 0) -> None:
+    """遞迴收集 witness 重複單元與「會失敗的尾字元」，沿 SUBPATTERN 邊界傳遞 effective flags。
 
-    平掃（`_walk_ast`）會在進入 `(?i:...)` 子樹時用錯 flags 挑代表字元而漏放（Codex round7 [high]），
-    故改遞迴 thread flags。收集：每個 atom 的代表字元、每個量詞 body 與每個 alternation 分支的代表
-    匹配字串（多字元 witness）。
+    平掃（`_walk_ast`）會在進入 `(?i:...)` 子樹時用錯 flags（Codex round7 [high]），故遞迴 thread flags。
+    收集兩類：(1) `units`＝可匹配重複單元（每 atom 代表字元、每量詞 body 與每 alternation 分支的代表匹配
+    串）；(2) `reject`＝每個 atom **不**匹配的字元（用真實 re 語意求；round8 [critical]——固定 `\x01`
+    對 `[^\x02]` 仍被匹配 → witness 全程命中、不走回溯失敗路徑而漏放）。
     """
     if depth > 24:
         return
     for op, av in sp:
-        if op in (_OP_LITERAL, _OP_IN, _OP_CATEGORY, _OP_NOT_LITERAL):
-            units.add(_atom_char(op, av, flags))
+        if op in (_OP_LITERAL, _OP_IN, _OP_CATEGORY, _OP_NOT_LITERAL, _OP_ANY):
+            if op != _OP_ANY:
+                units.add(_atom_char(op, av, flags))
+            r = _atom_rejecting_char(op, av, flags)
+            if r is not None:
+                reject.add(r)
         if op in _BACKTRACK_REPEATS or (
             _OP_POSSESSIVE_REPEAT is not None and op == _OP_POSSESSIVE_REPEAT
         ):
@@ -312,24 +360,24 @@ def _collect_witness_units(sp: Any, flags: int, units: set, depth: int = 0) -> N
                 u = _representative_match(body, flags)
                 if u:
                     units.add(u[:128])
-            _collect_witness_units(body, flags, units, depth + 1)
+            _collect_witness_units(body, flags, units, reject, depth + 1)
         elif op == _OP_SUBPATTERN:
-            _collect_witness_units(av[-1], _subpattern_flags(av, flags), units, depth + 1)
+            _collect_witness_units(av[-1], _subpattern_flags(av, flags), units, reject, depth + 1)
         elif _OP_ATOMIC_GROUP is not None and op == _OP_ATOMIC_GROUP:
-            _collect_witness_units(av, flags, units, depth + 1)
+            _collect_witness_units(av, flags, units, reject, depth + 1)
         elif op == _OP_BRANCH:
             for br in av[1]:
                 if br is not None:
                     bu = _representative_match(br, flags)
                     if bu:
                         units.add(bu[:128])
-                    _collect_witness_units(br, flags, units, depth + 1)
+                    _collect_witness_units(br, flags, units, reject, depth + 1)
         elif op in (_OP_ASSERT, _OP_ASSERT_NOT):
-            _collect_witness_units(av[1], flags, units, depth + 1)
+            _collect_witness_units(av[1], flags, units, reject, depth + 1)
         elif op == _OP_GROUPREF_EXISTS:
             for x in av[1:]:
                 if x is not None:
-                    _collect_witness_units(x, flags, units, depth + 1)
+                    _collect_witness_units(x, flags, units, reject, depth + 1)
 
 
 def _redos_attack_inputs(parsed: Any, flags: int) -> list[str]:
@@ -338,19 +386,24 @@ def _redos_attack_inputs(parsed: Any, flags: int) -> list[str]:
     - 單字元 witness：pattern 的 literal/類別代表字元 ＋ 通用 {a,0,space}（觸發多項式/重疊回溯）。
     - 多字元 witness：每個量詞 body（及其 alternation 各分支）的代表匹配字串重複鋪滿（觸發
       `(?:ab|abab)*`、`(ab)*(ab)*` 這類需多字元重複串的 catastrophic；Codex round4 [critical]）。
-    - 失敗尾（末位塞罕用控制字元）強迫 anchored 量詞（如 (a+)+$）回溯。
-    代表字元皆以「該節點生效的 flags」取得（flag-aware，含全域 `(?i)` 與 scoped `(?i:...)`；round6/7）。
+    - 失敗尾：以**真實被原子拒絕的字元**（per-pattern 求得；round8）＋通用 `\x01`，強迫 anchored 量詞
+      （如 `(a+)+$`、`^([^\x02]+)+$`）回溯失敗。
+    代表字元/拒絕字元皆以「該節點生效的 flags」取得（flag-aware，含全域 `(?i)` 與 scoped `(?i:...)`）。
     """
     L = REGEX_MATCH_INPUT_MAX
     units: set = {"a", "0", " "}
-    _collect_witness_units(parsed, flags, units)
+    reject: set = set()
+    _collect_witness_units(parsed, flags, units, reject)
+    # 失敗尾候選：真實拒絕字元（上限 8 個，控成本）＋ 通用 \x01（多數正類 pattern 適用）。
+    suffixes = ["\x01"] + sorted(reject)[:8]
     out: list[str] = []
     for u in units:
         if not u:
             continue
         s = (u * (L // len(u) + 1))[:L]
         out.append(s)
-        out.append(s[:-1] + "\x01")
+        for suf in suffixes:
+            out.append(s[:-1] + suf)
     return out
 
 
