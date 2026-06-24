@@ -56,20 +56,37 @@ class WalWriter:
                         last = seq
         self._seq = last
 
-    def _rotate_if_needed(self) -> None:
+    def _rotate_if_needed(self) -> bool:
+        """檔案超過上限時輪替。回傳 True 表示輪替過程發生 OSError 已被 best-effort 含住（degrade）。
+
+        輪替只是「限制檔案大小」的最佳化，不是資料平面必要步驟。原本此方法在 ``append`` 的 try
+        之外執行，rotation path 的 ``getsize``/``replace``/``open(dir)``/``fsync(dir)`` 因 EIO/權限/
+        fd 耗盡拋 OSError 會逃出 ``append`` → 殺死 RX reader thread（正是 #79 想避免的長壽 thread
+        死亡，含 console fan-out 一併中止）。改為自身含住例外：失敗則告警並續用既有（可能超大的）
+        檔案，遠優於殺 reader（#79 Codex 必修）。
+        """
+        rotation_failed = False
         for path in (self._wal_path, self._mirror_path):
-            if not os.path.exists(path):
-                continue
-            if os.path.getsize(path) < self._rotate_bytes:
-                continue
-            ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
-            dst = f"{path}.{ts}"
-            os.replace(path, dst)
-            dir_fd = os.open(os.path.dirname(path), os.O_RDONLY)
             try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
+                if not os.path.exists(path):
+                    continue
+                if os.path.getsize(path) < self._rotate_bytes:
+                    continue
+                ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+                dst = f"{path}.{ts}"
+                os.replace(path, dst)
+                dir_fd = os.open(os.path.dirname(path), os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError as exc:
+                rotation_failed = True
+                import logging
+                logging.getLogger("serialwrap").warning(
+                    "WAL 輪替失敗（best-effort 續用既有檔案，不殺 reader）：%s：%s", path, exc
+                )
+        return rotation_failed
 
     def append(
         self,
@@ -85,7 +102,7 @@ class WalWriter:
         payload_b64 = base64.b64encode(payload).decode("ascii")
         crc32 = zlib.crc32(payload) & 0xFFFFFFFF
         with self._lock:
-            self._rotate_if_needed()
+            rotation_failed = self._rotate_if_needed()
             self._seq += 1
             record = {
                 "seq": self._seq,
@@ -101,6 +118,9 @@ class WalWriter:
                 "loss_flag": bool(loss_flag),
                 "meta": meta or {},
             }
+            if rotation_failed:
+                # 輪替失敗不丟資料（仍寫入既有檔），但標記供觀測；conditional key 維持常態 record 向後相容。
+                record["rotation_failed"] = True
             try:
                 with open(self._wal_path, "a", encoding="utf-8") as wal_fp:
                     wal_fp.write(dumps_stable(record))
