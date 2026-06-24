@@ -101,11 +101,18 @@ class WalWriter:
                 "loss_flag": bool(loss_flag),
                 "meta": meta or {},
             }
-            with open(self._wal_path, "a", encoding="utf-8") as wal_fp:
-                wal_fp.write(dumps_stable(record))
-                wal_fp.write("\n")
-            with open(self._mirror_path, "a", encoding="utf-8") as mirror_fp:
-                mirror_fp.write(to_printable(payload))
+            try:
+                with open(self._wal_path, "a", encoding="utf-8") as wal_fp:
+                    wal_fp.write(dumps_stable(record))
+                    wal_fp.write("\n")
+                with open(self._mirror_path, "a", encoding="utf-8") as mirror_fp:
+                    mirror_fp.write(to_printable(payload))
+            except OSError as exc:
+                # 稽核寫入失敗（ENOSPC/EROFS/權限/fd 耗盡）不得讓資料平面（RX reader thread）崩潰（#79 STA-1）。
+                # best-effort：標記 loss、告警，仍回傳 record 讓上游照常 fan-out 給 console、續處理後續 RX。
+                record["loss_flag"] = True
+                import logging
+                logging.getLogger("serialwrap").warning("WAL append 寫入失敗（best-effort 略過）：%s", exc)
         return record
 
     def reset(self) -> dict[str, Any]:

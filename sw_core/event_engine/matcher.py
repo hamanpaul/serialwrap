@@ -197,6 +197,11 @@ class MatcherWorker:
                 continue
             try:
                 self._evaluate(item)
+            except Exception:  # noqa: BLE001 — 單一 item 求值失敗（含 counter store I/O）不得殺死 matcher（#79 STA-3）
+                import logging
+                logging.getLogger("serialwrap").warning(
+                    "event matcher 求值失敗，丟棄此 item（selector=%s）", item.selector, exc_info=True
+                )
             finally:
                 if self._queue.empty():
                     self._idle_event.set()

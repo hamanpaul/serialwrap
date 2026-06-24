@@ -6,6 +6,7 @@
 
 ### Fixed
 
+- **長壽 worker thread 加例外防護，單一 I/O/handler 例外不再靜默殺死整條 thread（#79）**：(STA-1) UART reader `_loop` 的 RX handler 派發包 try/except——原本 `_handle_serial_rx` 首步 `wal.append` 在 ENOSPC/EROFS/fd 耗盡時拋 OSError 會殺死 reader（RX 永久停擺、session 卻仍顯示 READY）；另 `WalWriter.append` 寫入改 best-effort（失敗標 `loss_flag`+告警、不拋，讓 console fan-out 續行）。(STA-2) `DeviceWatcher._loop` 的 `poll_once`/`on_tick` 包 try/except，避免一次例外讓 hotplug 與週期 reconcile 永久停擺。(STA-3) event matcher `_run` 的 `_evaluate` 包 try/except，counter store I/O 失敗只丟該 item、不殺 matcher。(STA-6) reboot-recovery worker 的 `ensure_ready`/login 包 try/except，例外時續迴圈待逾時收尾、不讓 session 永卡 RECOVERING。新增 `tests/test_thread_survival.py`。（STA-7 SingletonLock liveness 邊界為 low，列為後續。）
 - **systemd-system 模式可在 pipx 使用者安裝下實際啟動（#76）**：原 system unit 寫死 `User=serialwrap` dedicated account 且 `ExecStart=/usr/local/bin/serialwrapd`，但 pipx 只把 serialwrapd 裝到安裝者家目錄 venv（`~/.local/bin/serialwrapd`）、且 install 從未建立 `serialwrap` 帳號 → `setup --system` 起不來。改為 **run-as-user**：`render_system_unit(exec_start, run_user=...)` 參數化 `User=`，`setup_cmd` 以 `_resolve_run_user()`（`SUDO_USER`→`getpass.getuser()`）帶安裝者本人帳號、`_resolve_serialwrapd_path()` 解析其 pipx serialwrapd 絕對路徑組 ExecStart。保留「非 root + dialout」安全邊界，socket 仍於 `/run/serialwrap`（不受 WSLg `/run/user` 遮蔽、不依賴脆弱的 `user@<uid>`）。
 
 ### Added
