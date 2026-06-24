@@ -247,6 +247,19 @@ def _atom_char(op: Any, av: Any, flags: int = 0) -> str:
     return "a"
 
 
+def _subpattern_flags(av: Any, flags: int) -> int:
+    """套用 SUBPATTERN 的 scoped inline flags（如 `(?i:...)`）：`(flags | add) & ~del`。
+
+    sre 的 add/del flag 值與 `re.I/S/M` 常數相同，故可直接位元運算。結構為
+    `(group, add_flags, del_flags, subpattern)`；舊版可能無 add/del 欄位 → 維持原 flags。
+    """
+    try:
+        _group, add, dele, _sub = av
+        return (flags | int(add)) & ~int(dele)
+    except (ValueError, TypeError):  # pragma: no cover - 舊版/非預期結構
+        return flags
+
+
 def _representative_match(sp: Any, flags: int, depth: int = 0) -> str:
     """為一個 SubPattern 產生一段「可被它（在實際 flags 下）匹配」的字串（量詞取 body 一次、取首分支）。
 
@@ -268,7 +281,7 @@ def _representative_match(sp: Any, flags: int, depth: int = 0) -> str:
         ):
             parts.append(_representative_match(av[2], flags, depth + 1))   # body 一次
         elif op == _OP_SUBPATTERN:
-            parts.append(_representative_match(av[-1], flags, depth + 1))
+            parts.append(_representative_match(av[-1], _subpattern_flags(av, flags), depth + 1))
         elif _OP_ATOMIC_GROUP is not None and op == _OP_ATOMIC_GROUP:
             parts.append(_representative_match(av, flags, depth + 1))
         elif op == _OP_BRANCH:
@@ -279,18 +292,16 @@ def _representative_match(sp: Any, flags: int, depth: int = 0) -> str:
     return "".join(parts)
 
 
-def _redos_attack_inputs(parsed: Any, flags: int) -> list[str]:
-    """為 pattern 建構對抗輸入：以「可匹配重複單元」鋪成 4096 長字串，各產生『全填』與『全填+失敗尾』。
+def _collect_witness_units(sp: Any, flags: int, units: set, depth: int = 0) -> None:
+    """遞迴收集 witness 重複單元，沿 SUBPATTERN 邊界傳遞 effective flags（含 scoped `(?i:...)`）。
 
-    - 單字元 witness：pattern 的 literal/類別代表字元 ＋ 通用 {a,0,space}（觸發多項式/重疊回溯）。
-    - 多字元 witness：每個量詞 body（及其 alternation 各分支）的代表匹配字串重複鋪滿（觸發
-      `(?:ab|abab)*`、`(ab)*(ab)*` 這類需多字元重複串的 catastrophic；Codex round4 [critical]）。
-    - 失敗尾（末位塞罕用控制字元）強迫 anchored 量詞（如 (a+)+$）回溯。
-    代表字元皆以實際 flags 取得（flag-aware，含 IGNORECASE；round6）。
+    平掃（`_walk_ast`）會在進入 `(?i:...)` 子樹時用錯 flags 挑代表字元而漏放（Codex round7 [high]），
+    故改遞迴 thread flags。收集：每個 atom 的代表字元、每個量詞 body 與每個 alternation 分支的代表
+    匹配字串（多字元 witness）。
     """
-    L = REGEX_MATCH_INPUT_MAX
-    units: set[str] = {"a", "0", " "}
-    for op, av in _walk_ast(parsed):
+    if depth > 24:
+        return
+    for op, av in sp:
         if op in (_OP_LITERAL, _OP_IN, _OP_CATEGORY, _OP_NOT_LITERAL):
             units.add(_atom_char(op, av, flags))
         if op in _BACKTRACK_REPEATS or (
@@ -301,13 +312,38 @@ def _redos_attack_inputs(parsed: Any, flags: int) -> list[str]:
                 u = _representative_match(body, flags)
                 if u:
                     units.add(u[:128])
-                for bop, bav in _walk_ast(body):    # body 內每個 alternation 分支各取一 witness
-                    if bop == _OP_BRANCH:
-                        for br in bav[1]:
-                            if br is not None:
-                                bu = _representative_match(br, flags)
-                                if bu:
-                                    units.add(bu[:128])
+            _collect_witness_units(body, flags, units, depth + 1)
+        elif op == _OP_SUBPATTERN:
+            _collect_witness_units(av[-1], _subpattern_flags(av, flags), units, depth + 1)
+        elif _OP_ATOMIC_GROUP is not None and op == _OP_ATOMIC_GROUP:
+            _collect_witness_units(av, flags, units, depth + 1)
+        elif op == _OP_BRANCH:
+            for br in av[1]:
+                if br is not None:
+                    bu = _representative_match(br, flags)
+                    if bu:
+                        units.add(bu[:128])
+                    _collect_witness_units(br, flags, units, depth + 1)
+        elif op in (_OP_ASSERT, _OP_ASSERT_NOT):
+            _collect_witness_units(av[1], flags, units, depth + 1)
+        elif op == _OP_GROUPREF_EXISTS:
+            for x in av[1:]:
+                if x is not None:
+                    _collect_witness_units(x, flags, units, depth + 1)
+
+
+def _redos_attack_inputs(parsed: Any, flags: int) -> list[str]:
+    """為 pattern 建構對抗輸入：以「可匹配重複單元」鋪成 4096 長字串，各產生『全填』與『全填+失敗尾』。
+
+    - 單字元 witness：pattern 的 literal/類別代表字元 ＋ 通用 {a,0,space}（觸發多項式/重疊回溯）。
+    - 多字元 witness：每個量詞 body（及其 alternation 各分支）的代表匹配字串重複鋪滿（觸發
+      `(?:ab|abab)*`、`(ab)*(ab)*` 這類需多字元重複串的 catastrophic；Codex round4 [critical]）。
+    - 失敗尾（末位塞罕用控制字元）強迫 anchored 量詞（如 (a+)+$）回溯。
+    代表字元皆以「該節點生效的 flags」取得（flag-aware，含全域 `(?i)` 與 scoped `(?i:...)`；round6/7）。
+    """
+    L = REGEX_MATCH_INPUT_MAX
+    units: set = {"a", "0", " "}
+    _collect_witness_units(parsed, flags, units)
     out: list[str] = []
     for u in units:
         if not u:
@@ -326,8 +362,12 @@ def _stdlib_regex_is_catastrophic(value: str, flags: int) -> bool:
     spawn 重匯入 / fork 鎖繼承風險），timeout 後由 subprocess 終結。探測基礎設施失敗 → fail closed。
     """
     try:
+        # effective flags 含 pattern 內的**全域** inline flag（如開頭 `(?i)`）——反映於 compiled.flags；
+        # scoped `(?i:...)` 則由 _collect_witness_units 沿 SUBPATTERN 邊界另行套用（round7）。子行程仍以
+        # 原 flags compile（re 自會處理 pattern 內 inline flag），effective 僅用於挑代表字元。
+        effective = re.compile(value, flags).flags
         parsed = _sre_parse.parse(value, flags)
-        payload = json.dumps({"v": value, "f": int(flags), "a": _redos_attack_inputs(parsed, flags)})
+        payload = json.dumps({"v": value, "f": int(flags), "a": _redos_attack_inputs(parsed, effective)})
         subprocess.run(
             [sys.executable, "-c", _REDOS_PROBE_SCRIPT],
             input=payload.encode("utf-8"),

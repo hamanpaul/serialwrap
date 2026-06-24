@@ -120,6 +120,21 @@ def test_redos_ignorecase_negated_range_rejected_without_re2():
         _rule(pattern={"kind": "regex", "value": pat, "flags": "i"})
 
 
+@pytest.mark.parametrize("pat", [
+    "(?i:^[^\x00-\x60]*[^\x00-\x60]*[^\x00-\x60]*Y$)",   # scoped inline (?i:...)
+    "(?i)^[^\x00-\x60]*[^\x00-\x60]*[^\x00-\x60]*Y$",    # global inline (?i)
+])
+def test_redos_inline_ignorecase_flags_rejected_without_re2(pat):
+    """round7：pattern 內嵌 flags（scoped `(?i:...)` / 全域 `(?i)`）須被納入代表字元選取的 effective
+    flags；否則 IGNORECASE 折疊使探測挑錯字元而漏放。flags 欄位為空、靠 inline 帶 IGNORECASE。
+    """
+    if _schema_mod._re2 is None:
+        with pytest.raises(RuleSchemaError):
+            _rule(pattern={"kind": "regex", "value": pat})
+    else:
+        _rule(pattern={"kind": "regex", "value": pat})
+
+
 @pytest.mark.parametrize("bad", [
     r"(a*)\1X",               # round3：backreference（re2 不支援）→ 落 re → 探測拒
     r"a{0,4096}a{0,4096}X",   # round3：大量有界 repeat（re2 拒絕超大 repetition）→ 落 re → 探測拒
