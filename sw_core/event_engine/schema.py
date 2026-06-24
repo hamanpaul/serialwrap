@@ -171,8 +171,37 @@ def _maybe_redos_suspicious(parsed: Any) -> bool:
     )
 
 
+# 類別成員判定（用真實 re 語意，確保挑出的代表字元**確實**被該原子匹配，而非 best-effort 猜測）。
+_CAT_MATCH = {
+    _sre_constants.CATEGORY_DIGIT: re.compile(r"\d"),
+    _sre_constants.CATEGORY_NOT_DIGIT: re.compile(r"\D"),
+    _sre_constants.CATEGORY_WORD: re.compile(r"\w"),
+    _sre_constants.CATEGORY_NOT_WORD: re.compile(r"\W"),
+    _sre_constants.CATEGORY_SPACE: re.compile(r"\s"),
+    _sre_constants.CATEGORY_NOT_SPACE: re.compile(r"\S"),
+}
+# 找「被負類接受的字元」的掃描順序：可見 ASCII 優先 → 其他控制 → BMP。負類排除集有限（pattern ≤512 字），
+# 故必能找到非排除字元，杜絕「攻擊者排除掉固定代表字母」的盲點（Codex round5 [critical]）。
+_ATTACK_CODEPOINTS = list(range(0x21, 0x7F)) + list(range(0x00, 0x21)) + list(range(0x7F, 0x2000))
+
+
+def _char_in_in_items(c: str, items: Any) -> bool:
+    """字元 c 是否屬於 IN class 的（去 NEGATE 後）items（literal/range/category）。未知類別保守視為屬於。"""
+    cp = ord(c)
+    for o, a in items:
+        if o == _OP_LITERAL and a == cp:
+            return True
+        if o == _OP_RANGE and a[0] <= cp <= a[1]:
+            return True
+        if o == _OP_CATEGORY:
+            rx = _CAT_MATCH.get(a)
+            if rx is None or rx.match(c):
+                return True
+    return False
+
+
 def _atom_char(op: Any, av: Any) -> str:
-    """能被該原子匹配的一個代表字元（best-effort，用於建構對抗輸入）。"""
+    """能被該原子**確實**匹配的一個代表字元（用於建構對抗輸入；負類以成員判定挑出真正被接受者）。"""
     if op == _OP_LITERAL:
         return chr(av) if 0 <= av < 0x110000 else "a"
     if op == _OP_NOT_LITERAL:
@@ -181,7 +210,12 @@ def _atom_char(op: Any, av: Any) -> str:
         return _CATEGORY_REPR.get(av, "a")
     if op == _OP_IN:
         if av and av[0][0] == _OP_NEGATE:
-            return "\x07"  # 假設此罕用控制字元不在排除集（多數 [^...] 成立）
+            excluded = av[1:]
+            for cp in _ATTACK_CODEPOINTS:
+                ch = chr(cp)
+                if not _char_in_in_items(ch, excluded):
+                    return ch       # 確認不在排除集 → 負類接受此字元
+            return "\x07"           # pragma: no cover - 排除集涵蓋整個掃描範圍（極罕）
         for o, a in av:
             if o == _OP_LITERAL:
                 return chr(a) if 0 <= a < 0x110000 else "a"

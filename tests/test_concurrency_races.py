@@ -95,6 +95,9 @@ def test_contains_pattern_not_redos_checked():
     r"\d*\d*X",               # round2：narrow 類（不分寬窄皆凍結）
     r"^(?:ab|abab)*X",        # round4：多字元重複單元（char-only 全填漏放，body witness 抓到）
     r"(ab)*(ab)*X",           # round4：多字元群組重複
+    # round5：負類排除掉所有固定代表字元（\x01 失敗尾 / \x07 舊 fallback / a 0 space 通用 / Y）——
+    # 須以「成員判定掃描」挑出真正被負類接受的字元（如 '!'）才能觸發。
+    "^[^\x01\x07 a0Y]*[^\x01\x07 a0Y]*[^\x01\x07 a0Y]*[^\x01\x07 a0Y]*Y$",
 ])
 def test_redos_catastrophic_rejected_without_re2(bad):
     """re2-可編譯的 catastrophic pattern：標準 re 路徑（re2 不可用）fail-closed 拒絕；re2 可用則接受。"""
