@@ -1280,9 +1280,13 @@ class SessionManager:
 
     def _detach_by_id(self, by_id: str, *, reason: str) -> None:
         with self._lock:
+            # flash 臨界區（FLASHING 或 probe 進行中）不得 detach（#83 RACE-2 final）：device hotplug 在
+            # MCU reset/BSL 期間常見地讓 by_id 短暫消失，若據此 detach 會切斷燒錄/偵測 transport。略過；
+            # flash 結束（exit_flashing/unmark）後下一個 device_watcher tick 會再 reconcile。
             targets = [
                 s for s in self._sessions.values()
                 if s.profile.device_by_id == by_id and s.state != "RELEASED"
+                and not self._flash_busy_locked(s)
             ]
             for session in targets:
                 self._detach_session_locked(session, reason=reason)
@@ -1351,6 +1355,11 @@ class SessionManager:
         with self._lock:
             session = self._sessions.get(session_id)
             if session is None or session.bridge is not bridge:
+                return
+            # flash 臨界區（FLASHING 或 probe 進行中）不得自動 detach+reattach（#83 RACE-2 final）：燒錄/
+            # 偵測期間 bridge 由 daemon 持有為唯一 reader，不應因 bridge-down 回呼搶進 ATTACHING、另起新
+            # attach 與 flash pump 對撞。略過；flash 結束後若 bridge 真的壞了，pump 收尾與後續 reconcile 處理。
+            if self._flash_busy_locked(session):
                 return
             by_id = session.profile.device_by_id
             self._detach_session_locked(session, reason=f"BRIDGE_DOWN:{reason}")

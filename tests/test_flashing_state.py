@@ -223,3 +223,27 @@ class TestFlashProbeCriticalGuard(_Base):
         self.assertEqual(mgr.clear_session("COM0").get("error_code"), "FLASHING_BUSY")
         mgr.unmark_flash_critical("COM0")
         self.assertNotEqual(mgr.clear_session("COM0").get("error_code"), "FLASHING_BUSY")
+
+    def test_detach_by_id_skips_flash_critical(self):
+        """Codex final2 [high]：device hotplug 在 flash 臨界區（probe/FLASHING）不得 detach——MCU reset
+        期間 by_id 短暫消失常見，誤 detach 會切斷 transport。"""
+        mgr = self._mgr([self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/x")])
+        s = mgr.get_session("COM0")
+        s.state = "READY"
+        mgr.mark_flash_critical("COM0")
+        mgr._detach_by_id("/dev/serial/by-id/x", reason="DEVICE_REMOVED")
+        self.assertEqual(mgr.get_session("COM0").state, "READY")   # 未被 detach
+
+    def test_bridge_down_skips_flash_critical(self):
+        """Codex final2 [high]：flash 臨界區不得因 bridge-down 回呼自動 detach+reattach 與 flash pump 對撞。"""
+        mgr = self._mgr([self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/x")])
+        s = mgr.get_session("COM0")
+
+        class _FB:
+            def list_consoles(self): return []
+        fb = _FB()
+        s.bridge = fb
+        s.state = "FLASHING"                                       # flash 進行中
+        mgr._handle_bridge_down(s.session_id, fb, reason="EIO")
+        self.assertEqual(mgr.get_session("COM0").state, "FLASHING")  # 未被搶進 ATTACHING
+        self.assertIs(mgr.get_session("COM0").bridge, fb)            # bridge 未被 detach

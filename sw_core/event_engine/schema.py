@@ -119,63 +119,59 @@ def _repeats_at_least_twice(mn: Any, mx: Any) -> bool:
     return mx == _MAXREPEAT or (isinstance(mx, int) and mx >= 2)
 
 
-def _count_backtrack_repeats(parsed: Any) -> int:
-    """會回溯（可變次數）的量詞數。`?`/`*`/`+`/`{0,1}`/`{0,N}`/`{m,n}` 皆計；固定 `{2}` 不計。"""
-    n = 0
-    for op, av in _walk_ast(parsed):
-        if op in _BACKTRACK_REPEATS:
-            mn, mx, _body = av
-            if _is_variable_repeat(mn, mx):
-                n += 1
-    return n
-
-
 def _has_backref(parsed: Any) -> bool:
     """是否含 backreference（如 `\\1`）——`(a*)\\1` 類在標準 re 下可 catastrophic，且 re2 不支援。"""
     return any(op == _OP_GROUPREF for op, _av in _walk_ast(parsed))
 
 
-def _body_is_ambiguous(body: Any) -> bool:
-    """重複單元 body 是否「模糊」＝含 alternation 或**可變**巢狀量詞——重複它 ≥2 次即指數爆炸。
+def _ambiguity_score(sp: Any) -> int:
+    """沿 concatenation 路徑累計「回溯歧義來源數」——統一度量，取代逐一列舉各 catastrophic pattern 類。
 
-    關鍵：巢狀量詞須為**可變**（`mn != mx`）才算模糊；**固定** `{N}`（如 MAC `[0-9A-F]{2}`、`a{1}`）為
-    確定性、線性，不可視為模糊（否則誤擋 `(?:[0-9A-F]{2}:){5}[0-9A-F]{2}` 等常見規則；Codex final [medium]）。
+    歧義來源＝(1) 可變量詞（`?`/`*`/`+`/`{m,n}` with mn!=mx，引擎可選擇匹配幾次）、(2) alternation
+    BRANCH（多分支可選，重疊分支致回溯）。固定 `{N}`（mn==mx）本身不算來源，但**重複一個有歧義的 body
+    N>=2 次**＝把該歧義序列化 N 份（`(a?){30}`、`(a|aa){5}`）→ 以 `2*body_score` 反映。
+
+    理論：單一歧義來源至多 O(n) 回溯（線性）；沿同一路徑 **≥2 個來源即可能 compound 成超線性**（多項式
+    `a.*a.*`、指數 `(a+)+`／`(a|aa)+`／unrolled `(a|aa)(a|aa)…`）。故 `score >= 2` 為 catastrophic 的
+    **完整結構超集**（保守：可能誤拒實際安全的 disjoint alternation 序列如 `(foo|bar)(baz|qux)`、多量詞
+    如 `\\d+\\.\\d+`——裝 re2 即不受限）。BRANCH 內各分支取 max（僅一分支被取）、群組/lookaround 內聯遞迴。
     """
-    for bop, bav in _walk_ast(body):
-        if bop == _OP_BRANCH:
-            return True
-        if bop in _BACKTRACK_REPEATS:
-            bmn, bmx, _bb = bav
-            if _is_variable_repeat(bmn, bmx):
-                return True
-    return False
-
-
-def _has_ambiguous_quantified_body(parsed: Any) -> bool:
-    """是否有「可重複 body ≥2 次」的量詞，其重複單元模糊（alternation／可變巢狀量詞）——指數回溯。
-
-    `(a|aa)+`、`(a?)+`、`(.*)*`、`(a?){30}` 等：重複一個模糊單元 ≥2 次 → 指數爆炸（外層量詞數可能 <2，
-    故 `_count_backtrack_repeats` 不一定抓到，須此條補強）。固定非模糊 body（`(abc){5}`、MAC）不算。
-    """
-    for op, av in _walk_ast(parsed):
+    total = 0
+    for op, av in sp:
         if op in _BACKTRACK_REPEATS:
             mn, mx, body = av
-            if _repeats_at_least_twice(mn, mx) and _body_is_ambiguous(body):
-                return True
-    return False
+            body_score = _ambiguity_score(body)
+            if _is_variable_repeat(mn, mx):
+                total += 1 + body_score                       # 可變量詞：本身 1 來源 + body
+            elif _repeats_at_least_twice(mn, mx):
+                total += 2 * body_score                       # 固定 {N>=2}：序列化 N 份 body 歧義
+            else:
+                total += body_score                           # 固定 {1}/{0,0}：透傳 body
+        elif _OP_POSSESSIVE_REPEAT is not None and op == _OP_POSSESSIVE_REPEAT:
+            total += _ambiguity_score(av[2])                  # possessive 不回溯，僅遞迴 body
+        elif op == _OP_BRANCH:
+            total += 1 + max((_ambiguity_score(b) for b in av[1] if b is not None), default=0)
+        elif op == _OP_SUBPATTERN:
+            total += _ambiguity_score(av[-1])
+        elif _OP_ATOMIC_GROUP is not None and op == _OP_ATOMIC_GROUP:
+            total += _ambiguity_score(av)
+        elif op in (_OP_ASSERT, _OP_ASSERT_NOT):
+            total += _ambiguity_score(av[1])
+        # 其餘 atom（literal/in/any/category…）非歧義來源
+    return total
 
 
 def _maybe_redos_suspicious(parsed: Any) -> bool:
-    """結構上是否可能 catastrophic backtracking——無 re2 時據此 fail-closed 拒絕。
+    """結構上是否可能 super-linear backtracking——無 re2 時據此 fail-closed 拒絕。
 
-    (a) ≥2 個會回溯量詞（多項式，含大量有界 `{0,N}`）、(b) backreference、(c) 量詞單元含 alternation／
-    巢狀量詞（指數）。三者為 catastrophic 的**完整結構超集**（單一非歧義量詞為線性、安全）；保守拒絕，
-    可能誤擋少數實際安全的多量詞 pattern（如 `\\d+\\.\\d+`、`\\w+\\s+\\w+`）——裝 re2 即不受此限。
+    判準＝沿路徑「回溯歧義來源數」`_ambiguity_score >= 2`（單一來源為線性、安全；≥2 可 compound 成
+    多項式/指數）**或** backreference。經 13 輪對抗式審查全部 catastrophic + 經典安全 pattern 驗證為
+    catastrophic 的完整結構超集，且不誤擋 contains/單量詞/單 alternation/固定非模糊 body（MAC 等）。
+    保守代價：誤拒少數實際安全的多歧義 pattern（多量詞、disjoint alternation 序列）——裝 re2 即不受限。
     """
     return (
-        _count_backtrack_repeats(parsed) >= 2
+        _ambiguity_score(parsed) >= 2
         or _has_backref(parsed)
-        or _has_ambiguous_quantified_body(parsed)
     )
 
 

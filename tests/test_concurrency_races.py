@@ -93,6 +93,7 @@ def test_contains_pattern_not_redos_checked():
     r"\w+\s+\w+", r"\d+\.\d+", r"(error.*|warn.*)",        # round2/3 過往「邊界」O(n^2)/多量詞 → 保守拒
     "a?" * 5 + "a" * 5,                                    # final：optional-quantifier chain（mx==1 鏈接指數）
     r"(a?){5}a{5}",                                        # final：固定 {N} 重複可變 body → 序列化指數
+    "^" + "(a|aa)" * 8 + "b$", r"(a|aa)(a|aa)b",           # final2：unrolled 重疊 alternation 序列（無量詞）
 ])
 def test_redos_suspicious_rejected_without_re2(bad):
     if _schema_mod._re2 is None:
