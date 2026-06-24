@@ -7,6 +7,7 @@ import time
 import uuid
 from typing import Any, Callable
 
+from .constants import CMD_HISTORY_MAX
 from .util import now_iso
 
 CMD_WARN_BYTES = 4096
@@ -131,11 +132,26 @@ class CommandArbiter:
         }
         with self._lock:
             self._commands[cmd_id] = rec
+            self._evict_commands_locked()
         pq.put(_QueuedCommand(sort_key=(priority, counter), cmd_id=cmd_id, session_id=session_id, command=command, source=source, mode=mode, timeout_s=timeout_s, expected_duration_s=expected_duration_s))
         result: dict[str, Any] = {"ok": True, "cmd_id": cmd_id, "status": "accepted", "session_id": session_id}
         if cmd_warning is not None:
             result["warning"] = cmd_warning
         return result
+
+    def _evict_commands_locked(self) -> None:
+        """淘汰最舊的「已完成（有 done_at）」命令記錄，使數量回到上限（#81）。
+
+        進行中（done_at 為 None）的命令永不淘汰；全部進行中時暫時超量。
+        須在持有 ``self._lock`` 下呼叫。
+        """
+        if len(self._commands) <= CMD_HISTORY_MAX:
+            return
+        done = [(cid, rec) for cid, rec in self._commands.items() if rec.get("done_at")]
+        done.sort(key=lambda kv: kv[1].get("done_at") or "")
+        excess = len(self._commands) - CMD_HISTORY_MAX
+        for cid, _rec in done[:excess]:
+            self._commands.pop(cid, None)
 
     def get(self, cmd_id: str) -> dict[str, Any]:
         with self._lock:

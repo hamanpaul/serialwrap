@@ -79,6 +79,16 @@ REPROBE_MAX_INTERVAL_S: float = 15.0
 REPROBE_MAX_ATTEMPTS: int = 10
 """readiness 自動重探的最大嘗試次數。"""
 
+# 記憶體上限（#81）：防止長壽 daemon 下無界 in-memory 結構成長至 OOM。
+BG_CAPTURE_MAX_BYTES: int = 4 * 1024 * 1024
+"""單一 background capture 在記憶體保留的 chunk 總位元組上限；超過則丟最舊（環形），dropped_chunks 累計。"""
+BG_CAPTURE_MAX_COUNT: int = 64
+"""保留的 background capture 數上限；超過則淘汰最舊的「已終結（非 active）」capture。"""
+CMD_HISTORY_MAX: int = 512
+"""arbiter 保留的命令記錄數上限；超過則淘汰最舊的「已完成（有 done_at）」命令。"""
+DEFERRED_INPUT_MAX_BYTES: int = 256 * 1024
+"""agent 命令期間單一 human console 的 deferred 輸入緩衝上限；超過則丟最舊位元組。"""
+
 
 def ensure_runtime_dirs() -> None:
     os.makedirs(CONFIG_DIR, exist_ok=True)
