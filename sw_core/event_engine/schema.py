@@ -106,6 +106,7 @@ def _walk_ast(subpattern: Any):
 # 結構形狀，無法被任何 AST 形繞過；安全 pattern 數百毫秒內完成、不誤拒。僅在 pattern 將落到標準 re 路徑
 # （re2 不可用或不支援）時啟用；裝 google-re2 線性引擎即一律免疫、不探測。
 _OP_LITERAL = _sre_constants.LITERAL
+_OP_NOT_LITERAL = _sre_constants.NOT_LITERAL
 _OP_IN = _sre_constants.IN
 _OP_NEGATE = _sre_constants.NEGATE
 _OP_RANGE = _sre_constants.RANGE
@@ -174,6 +175,8 @@ def _atom_char(op: Any, av: Any) -> str:
     """能被該原子匹配的一個代表字元（best-effort，用於建構對抗輸入）。"""
     if op == _OP_LITERAL:
         return chr(av) if 0 <= av < 0x110000 else "a"
+    if op == _OP_NOT_LITERAL:
+        return "a" if av != ord("a") else "b"
     if op == _OP_CATEGORY:
         return _CATEGORY_REPR.get(av, "a")
     if op == _OP_IN:
@@ -189,23 +192,73 @@ def _atom_char(op: Any, av: Any) -> str:
     return "a"
 
 
-def _redos_attack_inputs(parsed: Any) -> list[str]:
-    """為 pattern 建構對抗輸入：每個「可匹配代表字元」各產生『全填』與『全填+失敗尾』兩種長字串。
+def _representative_match(sp: Any, depth: int = 0) -> str:
+    """為一個 SubPattern 產生一段「可被它匹配」的字串（量詞取 body 一次、alternation 取首分支）。
 
-    全填觸發多項式/重疊回溯；失敗尾（末位塞罕用控制字元）強迫 anchored 量詞（如 (a+)+$）回溯。代表
-    字元取自 pattern 的 literal/類別 ＋ 通用 {a,0,space}，使對抗輸入確實能被量詞原子匹配。
+    用於建構**多字元重複單元 witness**：char-only 全填無法觸發 `(?:ab|abab)*`、`(ab)*(ab)*` 這類
+    需要多字元重複串的 catastrophic（Codex round4 [critical]）。
+    """
+    if depth > 24:  # 防深巢狀遞迴爆炸
+        return ""
+    parts: list[str] = []
+    for op, av in sp:
+        if op == _OP_LITERAL:
+            parts.append(chr(av) if 0 <= av < 0x110000 else "a")
+        elif op in (_OP_ANY, _OP_ANY_ALL):
+            parts.append("a")
+        elif op in (_OP_IN, _OP_CATEGORY, _OP_NOT_LITERAL):
+            parts.append(_atom_char(op, av))
+        elif op in _BACKTRACK_REPEATS or (
+            _OP_POSSESSIVE_REPEAT is not None and op == _OP_POSSESSIVE_REPEAT
+        ):
+            parts.append(_representative_match(av[2], depth + 1))   # body 一次
+        elif op == _OP_SUBPATTERN:
+            parts.append(_representative_match(av[-1], depth + 1))
+        elif _OP_ATOMIC_GROUP is not None and op == _OP_ATOMIC_GROUP:
+            parts.append(_representative_match(av, depth + 1))
+        elif op == _OP_BRANCH:
+            br = next((b for b in av[1] if b is not None), None)
+            if br is not None:
+                parts.append(_representative_match(br, depth + 1))
+        # AT（anchor）/ASSERT/GROUPREF 等不產生字元
+    return "".join(parts)
+
+
+def _redos_attack_inputs(parsed: Any) -> list[str]:
+    """為 pattern 建構對抗輸入：以「可匹配重複單元」鋪成 4096 長字串，各產生『全填』與『全填+失敗尾』。
+
+    - 單字元 witness：pattern 的 literal/類別代表字元 ＋ 通用 {a,0,space}（觸發多項式/重疊回溯）。
+    - 多字元 witness：每個量詞 body（及其 alternation 各分支）的代表匹配字串重複鋪滿（觸發
+      `(?:ab|abab)*`、`(ab)*(ab)*` 這類需多字元重複串的 catastrophic；Codex round4 [critical]）。
+    - 失敗尾（末位塞罕用控制字元）強迫 anchored 量詞（如 (a+)+$）回溯。
     """
     L = REGEX_MATCH_INPUT_MAX
-    chars = {"a", "0", " "}
+    units: set[str] = {"a", "0", " "}
     for op, av in _walk_ast(parsed):
-        if op in (_OP_LITERAL, _OP_IN, _OP_CATEGORY):
-            chars.add(_atom_char(op, av))
+        if op in (_OP_LITERAL, _OP_IN, _OP_CATEGORY, _OP_NOT_LITERAL):
+            units.add(_atom_char(op, av))
+        if op in _BACKTRACK_REPEATS or (
+            _OP_POSSESSIVE_REPEAT is not None and op == _OP_POSSESSIVE_REPEAT
+        ):
+            _mn, mx, body = av
+            if mx == _MAXREPEAT or (isinstance(mx, int) and mx > 1):
+                u = _representative_match(body)
+                if u:
+                    units.add(u[:128])
+                for bop, bav in _walk_ast(body):    # body 內每個 alternation 分支各取一 witness
+                    if bop == _OP_BRANCH:
+                        for br in bav[1]:
+                            if br is not None:
+                                bu = _representative_match(br)
+                                if bu:
+                                    units.add(bu[:128])
     out: list[str] = []
-    for c in chars:
-        if not c:
+    for u in units:
+        if not u:
             continue
-        out.append(c * L)
-        out.append(c * (L - 1) + "\x01")
+        s = (u * (L // len(u) + 1))[:L]
+        out.append(s)
+        out.append(s[:-1] + "\x01")
     return out
 
 

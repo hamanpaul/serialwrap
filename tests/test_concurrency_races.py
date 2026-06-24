@@ -93,6 +93,8 @@ def test_contains_pattern_not_redos_checked():
     "a.*a.*X",                # 多項式：. 序列
     r"[\s\S]*[\s\S]*X",       # round2 繞過：寬原子等價形（非單一 ANY）
     r"\d*\d*X",               # round2：narrow 類（不分寬窄皆凍結）
+    r"^(?:ab|abab)*X",        # round4：多字元重複單元（char-only 全填漏放，body witness 抓到）
+    r"(ab)*(ab)*X",           # round4：多字元群組重複
 ])
 def test_redos_catastrophic_rejected_without_re2(bad):
     """re2-可編譯的 catastrophic pattern：標準 re 路徑（re2 不可用）fail-closed 拒絕；re2 可用則接受。"""
