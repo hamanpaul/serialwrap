@@ -99,6 +99,7 @@ class UARTBridge:
         self._interactive_owner: str | None = None
         self._agent_active: bool = False
         self._suspended_owner: str | None = None
+        self._suspend_depth: int = 0  # suspend/resume 巢狀深度（#78 可重入）
         self._deferred_buffers: dict[str, bytearray] = {}
         # 最後一次「真實 human owner 鍵入」的 monotonic 時間（#53）。僅 human-OWNER
         # 直接 raw 送出分支會更新；deferred buffer、serial RX loop、agent 注入都不更新。
@@ -234,6 +235,7 @@ class UARTBridge:
             self._interactive_owner = None
             self._suspended_owner = None
             self._agent_active = False
+            self._suspend_depth = 0
             self._deferred_buffers.clear()
 
         if serial_fd is not None:
@@ -646,8 +648,11 @@ class UARTBridge:
             if self._interactive_owner == f"human:{client_id}":
                 self._interactive_owner = None
             if self._suspended_owner == f"human:{client_id}":
+                # 被 suspend 的 human console 斷線：放棄整個 suspend 簿記（保護對象已消失），
+                # 後續未配對的 resume 因 depth 歸 0 成 no-op（#78）。
                 self._suspended_owner = None
                 self._agent_active = False
+                self._suspend_depth = 0
             self._deferred_buffers.pop(client_id, None)
         self._close_console_client(client)
         return True
@@ -690,20 +695,32 @@ class UARTBridge:
 
         Agent 執行命令前呼叫；human console input 會累積在 deferred buffer
         而不是直接 raw 送到 UART。
+
+        可重入（#78）：多條 agent 路徑（execute_command／file_push/pull／self_test／
+        interactive lease soft-preempt）可能重疊呼叫，以巢狀深度計數——只有最外層
+        suspend 保存原 owner、最外層 resume 才還原。否則巢狀 suspend 會把已保存的
+        ``_suspended_owner`` 覆寫成 None，resume 後 human 永久失去 raw ownership。
         """
         with self._state_lock:
-            self._suspended_owner = self._interactive_owner
-            self._interactive_owner = None
-            self._agent_active = True
+            if self._suspend_depth == 0:
+                self._suspended_owner = self._interactive_owner
+                self._interactive_owner = None
+                self._agent_active = True
+            self._suspend_depth += 1
 
     def resume_interactive(self) -> None:
         """恢復 human interactive ownership 並 flush deferred buffer 到 UART。
 
-        Agent 命令完成後呼叫；deferred 期間累積的 human 輸入以 raw bytes
-        送到 UART，讓 target 自然回顯。
+        Agent 命令完成後呼叫；僅在巢狀深度歸 0（最外層）時還原 owner 並 flush
+        deferred 期間累積的 human 輸入（#78）。不平衡的 resume（depth 已 0）為 no-op。
         """
         flush_data: list[tuple[str, bytes]] = []
         with self._state_lock:
+            if self._suspend_depth == 0:
+                return
+            self._suspend_depth -= 1
+            if self._suspend_depth > 0:
+                return
             self._interactive_owner = self._suspended_owner
             self._agent_active = False
             self._suspended_owner = None
