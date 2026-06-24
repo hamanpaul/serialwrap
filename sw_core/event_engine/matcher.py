@@ -7,16 +7,14 @@ from dataclasses import dataclass
 from typing import Iterable, Protocol
 
 from .counter import Counter
-from .schema import REGEX_MATCH_INPUT_MAX, Pattern, Rule, _flags_from_string
+from .schema import REGEX_MATCH_INPUT_MAX, Pattern, Rule, _flags_from_string, _re2_compile
 
-# google-re2 線性（Thompson NFA）regex 引擎，對 user-controlled regex 免疫所有 catastrophic
-# backtracking（含指數與 #91 的多項式 `a.*a.*a.*X` 類；標準 `re` 無此能力且不可中斷）。為可選依賴
-# （`pip install serialwrap[redos]` 或 `google-re2`）：未安裝時自動退回標準 `re` + schema AST 拒絕
-# + 輸入封頂的既有防護。re2 不支援的構造（backreference / lookaround）亦自動退回 `re`。
-try:  # pragma: no cover - 視環境是否安裝 re2
-    import re2 as _re2
-except ImportError:  # pragma: no cover
-    _re2 = None
+# user-controlled regex 改以 google-re2 線性（Thompson NFA）引擎求值——對所有 catastrophic
+# backtracking（含指數與 #91 的多項式 `a.*a.*a.*X` 類；標準 `re` 無此能力且不可中斷）免疫。為可選
+# 依賴（`pip install serialwrap[redos]` / `google-re2`）：未安裝時自動退回標準 `re`，並由 schema
+# upsert 階段對指數＋多項式 ReDoS 類 fail-closed 拒絕 + 輸入封頂兜底。re2 不支援的構造（backreference
+# / lookaround）亦退回 `re`（同樣已被 schema 拒絕 ReDoS 類）。`_re2_compile` 為與 schema 共用的單一
+# 判定來源（schema 用它決定是否 fail-closed 拒絕）。
 
 
 @dataclass
@@ -37,18 +35,11 @@ class PatternMatcher:
             raise ValueError(f"unknown pattern kind: {pattern.kind}")
         flags = _flags_from_string(pattern.flags)  # 驗證 flags（即使走 re2 也先確認合法）
 
-        self._engine = "re"
-        self._re = None
-        if _re2 is not None:
-            # re2 以 inline flag 群組帶旗標（`(?ism)`）——pattern.flags 已由 _flags_from_string 限定為
-            # i/s/m 子集，與 re2 inline 字母一致。不支援構造則 compile 失敗，退回標準 re。
-            inline = f"(?{pattern.flags})" if pattern.flags else ""
-            try:
-                self._re = _re2.compile(inline + raw)
-                self._engine = "re2"
-            except Exception:
-                self._re = None
-        if self._re is None:
+        # re2 可用且支援此構造 → 線性引擎；否則退回標準 re（schema 已對 ReDoS 類 fail-closed）。
+        self._re = _re2_compile(raw, pattern.flags)
+        if self._re is not None:
+            self._engine = "re2"
+        else:
             self._re = re.compile(raw, flags)
             self._engine = "re"
 

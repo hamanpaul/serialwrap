@@ -117,6 +117,26 @@ def test_safe_regex_patterns_still_accepted(ok):
     _rule(pattern={"kind": "regex", "value": ok})  # 不得誤拒
 
 
+# ── 多項式 ReDoS：標準 re 路徑 fail-closed 拒絕，re2 線性引擎可用則接受（#91 Codex 必修）──────
+import sw_core.event_engine.schema as _schema_mod  # noqa: E402
+
+
+@pytest.mark.parametrize("poly", ["a.*a.*X", ".*.*", r"root@.*:.*# ", r"\d.*\d.*\d.*x"])
+def test_polynomial_redos_gated_by_engine(poly):
+    """≥2 個序列式 .*：標準 re 路徑（re2 不可用）upsert 即拒絕；re2 線性可用時接受（安全）。"""
+    if _schema_mod._re2 is None:
+        with pytest.raises(RuleSchemaError):
+            _rule(pattern={"kind": "regex", "value": poly})
+    else:
+        _rule(pattern={"kind": "regex", "value": poly})  # re2 線性 → 免疫 → 接受
+
+
+@pytest.mark.parametrize("ok", [r"root@.*# ", r"dhd_dpc.*firmware_trap", r"temp=(\d+)C", "error.*panic"])
+def test_single_unbounded_quantifier_always_accepted(ok):
+    """≤1 個 .* → 非多項式類 → 兩引擎皆接受（不誤拒常見單一 .* pattern）。"""
+    _rule(pattern={"kind": "regex", "value": ok})
+
+
 # ── ReDoS runtime 防護：re2 線性引擎（#91）/ re 回退路徑輸入封頂 ─────────────────────────
 def test_matcher_regex_input_handling_by_engine():
     """re2 線性 → 全文求值（不截斷）；re 回退 → 對 regex 輸入封頂截掉尾端。"""
