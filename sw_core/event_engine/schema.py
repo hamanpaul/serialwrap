@@ -12,6 +12,12 @@ _VALID_PATTERN_KIND = {"contains", "regex"}
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _OWNER_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 
+# ReDoS 防護（#83 STA-4）：使用者可控 regex 規則由單執行緒 matcher 逐行 re.search 求值（無 timeout），
+# catastrophic backtracking 會卡死 matcher。upsert 時靜態拒絕：超長 + 巢狀量詞（對含量詞的群組再施量詞，
+# 如 (a+)+、(a*)*、(.+)+）——典型指數回溯來源。屬啟發式（非完備），搭配長度上限大幅縮小攻擊面。
+_REGEX_MAX_LEN = 512
+_NESTED_QUANTIFIER_RE = re.compile(r"\([^)]*[+*][^)]*\)\s*[+*]")
+
 
 @dataclass(frozen=True)
 class Pattern:
@@ -89,6 +95,14 @@ def validate_rule_dict(obj: dict[str, Any]) -> Rule:
     _require(pkind in _VALID_PATTERN_KIND, "pattern.kind must be 'contains' or 'regex'")
     _require(isinstance(pvalue, str) and pvalue != "", "pattern.value must be non-empty string")
     if pkind == "regex":
+        _require(
+            len(pvalue) <= _REGEX_MAX_LEN,
+            f"pattern.value regex 過長（上限 {_REGEX_MAX_LEN} 字元，避免 ReDoS）",
+        )
+        _require(
+            _NESTED_QUANTIFIER_RE.search(pvalue) is None,
+            "pattern.value 含巢狀量詞（如 (a+)+、(a*)*、(.+)+），易致 catastrophic backtracking（ReDoS），請改寫",
+        )
         try:
             re.compile(pvalue, _flags_from_string(pflags))
         except re.error as exc:

@@ -6,6 +6,7 @@
 
 ### Fixed
 
+- **RX fan-out use-after-close 競態 + 規則 regex ReDoS 防護（#83）**：(RACE-1) `_handle_serial_rx` 原在 `_state_lock` 外才對快照到的 `console.master_fd` 做 `os.write`，與另一執行緒「pop 後 `os.close(fd)`」形成 use-after-close／寫到被重用 fd（資料誤送）窗口 → 改在持 `_state_lock` 下逐一 best-effort 寫入（所有關閉路徑都先在鎖內移出 `_clients` 再於鎖外 close，故持鎖迭代永不含已移除者）。(STA-4) 使用者可控規則 regex 由單執行緒 matcher 無 timeout 逐行求值，catastrophic backtracking 可凍結 event engine → `validate_rule_dict` 對 regex 加長度上限 + 巢狀量詞（`(a+)+` 類）靜態拒絕。新增 `tests/test_concurrency_races.py`。（RACE-2 flash 偵測 probe 與進行中命令的雙寫入者競態，需 flash 流程寫入仲裁，列為後續，#83 保留追蹤。）
 - **systemd-system 模式可在 pipx 使用者安裝下實際啟動（#76）**：原 system unit 寫死 `User=serialwrap` dedicated account 且 `ExecStart=/usr/local/bin/serialwrapd`，但 pipx 只把 serialwrapd 裝到安裝者家目錄 venv（`~/.local/bin/serialwrapd`）、且 install 從未建立 `serialwrap` 帳號 → `setup --system` 起不來。改為 **run-as-user**：`render_system_unit(exec_start, run_user=...)` 參數化 `User=`，`setup_cmd` 以 `_resolve_run_user()`（`SUDO_USER`→`getpass.getuser()`）帶安裝者本人帳號、`_resolve_serialwrapd_path()` 解析其 pipx serialwrapd 絕對路徑組 ExecStart。保留「非 root + dialout」安全邊界，socket 仍於 `/run/serialwrap`（不受 WSLg `/run/user` 遮蔽、不依賴脆弱的 `user@<uid>`）。
 
 ### Added
