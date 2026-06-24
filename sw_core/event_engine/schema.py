@@ -157,7 +157,13 @@ def _ambiguity_score(sp: Any) -> int:
             total += _ambiguity_score(av)
         elif op in (_OP_ASSERT, _OP_ASSERT_NOT):
             total += _ambiguity_score(av[1])
-        # 其餘 atom（literal/in/any/category…）非歧義來源
+        else:
+            # 其餘容器型 opcode（如 GROUPREF_EXISTS 條件 `(?(1)yes|no)`）：遞迴其子 SubPattern，避免把
+            # 隱藏在分支內的歧義（`(?(1)(a+)+b|c)`）漏算（Codex 必修）。子分支取 max（單路徑只走一支）。
+            # 純 atom（literal/in/any/category…）無子 SubPattern → 貢獻 0，非歧義來源。
+            children = _child_subpatterns(op, av)
+            if children:
+                total += max(_ambiguity_score(c) for c in children)
     return total
 
 
