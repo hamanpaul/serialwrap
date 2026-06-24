@@ -13,6 +13,7 @@ import uuid
 from typing import Any, Callable
 
 from .config import UartProfile
+from .constants import DEFERRED_INPUT_MAX_BYTES
 from .wal import WalWriter
 
 _BAUD_MAP = {
@@ -436,6 +437,10 @@ class UARTBridge:
                     buf = bytearray()
                     self._deferred_buffers[client.client_id] = buf
                 buf.extend(data)
+                # 上限保護（#81）：agent 命令期間 human 持續輸入不致無界成長 → OOM；
+                # 超過上限丟最舊位元組（保留最近輸入），resume 時 flush 較新的內容。
+                if len(buf) > DEFERRED_INPUT_MAX_BYTES:
+                    del buf[: len(buf) - DEFERRED_INPUT_MAX_BYTES]
             return
 
         lines, echo = self._consume_console_input(client, data)
