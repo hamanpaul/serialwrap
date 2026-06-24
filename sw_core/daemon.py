@@ -24,7 +24,10 @@ BLOCKING_RPC_METHODS = {
     "session.self_test",      # 同步等 UART（2×timeout_s）（#80 REACT-3）
     "session.console_attach",  # recover 升級分支可同步觸發 recover（#80 REACT-6）
     # 整檔讀取（WAL/log tail），大檔在 loop 上同步讀會凍結全 daemon（#80 REACT-5）
-    "result.tail", "log.tail_raw", "log.tail_text", "wal.range",
+    # command.result_tail 是 CLI `serialwrap cmd result-tail` 實際送的方法（service.rpc 內與 legacy
+    # result.tail 同樣 get_background_result 讀取/切片大 capture 並序列化）；漏了它，最常用的查詢路徑
+    # 仍跑在 asyncio loop 上，大 capture 慢查詢照樣凍結其他 RPC（含 health.ping）（#80 Codex 必修）。
+    "command.result_tail", "result.tail", "log.tail_raw", "log.tail_text", "wal.range",
 }
 
 
