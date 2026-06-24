@@ -6,6 +6,8 @@
 
 ### Fixed
 
+- **`_load_state` 讀取失敗改 fail-closed，杜絕以空狀態 clobber RELEASED 交接（#82 Codex 必修）**：原 `_load_state` 以 `except Exception` 將 `PermissionError`／暫時性 I/O 等讀取失敗一律當「損毀」備份至 `.corrupt` 後回傳空狀態，`__init__` 尾段 `_save_state()` 隨即以空的記憶體狀態覆寫磁碟檔 → 遺失 RELEASED（裝置交接）→ 重啟後 daemon 重新 attach 已交給 flasher/人類的 tty 形成 two-reader。改為**嚴格區分**：僅「確認的 JSON 格式損毀」（`json.JSONDecodeError`/`UnicodeDecodeError`）才備份重建；讀取失敗（`OSError`/`PermissionError`）改拋 `StateLoadError`，由 daemon 啟動層攔截、釋放 lock、以非零碼拒絕啟動（原檔絕不動），fail closed 杜絕帶病啟動 clobber 交接。新增 fail-closed 與 `__init__` 不 clobber RELEASED 兩項回歸測試。
+- **`_save_state` 改原子寫入，崩潰/磁碟滿不再損毀 state.json 致 RELEASED 交接遺失（#82）**：原 `_save_state` 以 `open(STATE_PATH, "w")` 直接覆寫（先 truncate 再寫、無 fsync），崩潰/斷電/ENOSPC 中途失敗會留下截斷檔，`_load_state` 解析失敗即靜默全棄 → alias/binding/**released（裝置交接）**歸零，重啟後 daemon 重新 attach 已交給 flasher/人類的 tty 形成 two-reader。改為 `tempfile.mkstemp`（唯一名，並發 `_save_state` 安全）+ `fsync` + `os.replace` + 目錄 `fsync`（比照 `wal.py` 慣例）；`_load_state` 遇損毀檔改備份至 `state.json.corrupt` + 告警，而非靜默全棄。新增 `tests/test_state_persistence_atomic.py`。
 - **systemd-system 模式可在 pipx 使用者安裝下實際啟動（#76）**：原 system unit 寫死 `User=serialwrap` dedicated account 且 `ExecStart=/usr/local/bin/serialwrapd`，但 pipx 只把 serialwrapd 裝到安裝者家目錄 venv（`~/.local/bin/serialwrapd`）、且 install 從未建立 `serialwrap` 帳號 → `setup --system` 起不來。改為 **run-as-user**：`render_system_unit(exec_start, run_user=...)` 參數化 `User=`，`setup_cmd` 以 `_resolve_run_user()`（`SUDO_USER`→`getpass.getuser()`）帶安裝者本人帳號、`_resolve_serialwrapd_path()` 解析其 pipx serialwrapd 絕對路徑組 ExecStart。保留「非 root + dialout」安全邊界，socket 仍於 `/run/serialwrap`（不受 WSLg `/run/user` 遮蔽、不依賴脆弱的 `user@<uid>`）。
 
 ### Added
