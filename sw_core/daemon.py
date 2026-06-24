@@ -10,6 +10,7 @@ from sw_core.constants import LOCK_PATH, PROFILE_DIR, SOCKET_PATH, ensure_runtim
 from sw_core.daemon_lock import SingletonLock
 from sw_core.rpc import JsonRpcUnixServer
 from sw_core.service import SerialwrapService
+from sw_core.session_manager import StateLoadError
 
 # 這些 RPC method 的 handler 會長時間阻塞（UART 上的 base64 分段傳輸），須丟到 executor
 # 執行，否則會卡住單執行緒 asyncio event loop，導致傳輸期間全 daemon 的所有 RPC 凍結（#52）。
@@ -37,11 +38,18 @@ async def _run_async(args: argparse.Namespace) -> int:
         sys.stderr.write(f"serialwrapd: {exc}\n")
         return 2
 
-    service = SerialwrapService(
-        result.profiles,
-        templates=result.templates,
-        max_sessions=result.max_sessions,
-    )
+    try:
+        service = SerialwrapService(
+            result.profiles,
+            templates=result.templates,
+            max_sessions=result.max_sessions,
+        )
+    except StateLoadError as exc:
+        # _load_state fail closed（既有 state.json 讀取失敗，非 JSON 損毀）：拒絕啟動，避免以空狀態
+        # 覆寫 RELEASED 交接致重啟 two-reader（#82 / Codex 必修）。比照 lock 失敗：釋放 lock、非零退出。
+        sys.stderr.write(f"serialwrapd: {exc}\n")
+        lock.release()
+        return 3
     stop_event = asyncio.Event()
 
     def _handle(method: str, params: dict[str, object]) -> dict[str, object]:

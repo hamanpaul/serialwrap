@@ -195,6 +195,7 @@ class CommandArbiter:
                 return {"ok": False, "error_code": "CMD_NOT_CANCELABLE", "cmd_id": cmd_id}
             rec["status"] = "canceled"
             rec["done_at"] = now_iso()
+            self._evict_commands_locked()  # 命令終結即收斂 history，不必等下一次 submit（Copilot 審查）
             return {"ok": True, "cmd_id": cmd_id, "status": "canceled"}
 
     def _worker(self, session_id: str, pq: queue.PriorityQueue[_QueuedCommand], stop_event: threading.Event) -> None:
@@ -226,6 +227,7 @@ class CommandArbiter:
                         rec["status"] = "error"
                         rec["error_code"] = "SEND_FAILED"
                         rec["done_at"] = now_iso()
+                        self._evict_commands_locked()  # 終結即收斂 history（Copilot 審查）
                 continue
 
             with self._lock:
@@ -252,6 +254,7 @@ class CommandArbiter:
                     else:
                         rec["status"] = "done"
                     rec["done_at"] = now_iso()
+                    self._evict_commands_locked()  # 終結即收斂 history，尖峰後不再長期超量（Copilot 審查）
 
     def snapshot(self) -> list[dict[str, Any]]:
         with self._lock:
