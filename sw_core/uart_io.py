@@ -491,13 +491,20 @@ class UARTBridge:
                         if client is not None:
                             self._drop_console_client(client.client_id)
                     continue
-                if fd == serial_fd:
-                    self._handle_serial_rx(data)
+                try:
+                    if fd == serial_fd:
+                        self._handle_serial_rx(data)
+                        continue
+                    client = clients_by_fd.get(fd)
+                    if client is None:
+                        continue
+                    self._handle_console_rx(client, data)
+                except Exception:  # noqa: BLE001 — 單一 RX handler 例外不得殺死 reader thread（致該 UART RX 永久停擺、session 卻仍顯示 READY）（#79 STA-1）
+                    import logging
+                    logging.getLogger("serialwrap").warning(
+                        "RX handler 例外（com=%s），略過此塊、reader 續行", self.com, exc_info=True
+                    )
                     continue
-                client = clients_by_fd.get(fd)
-                if client is None:
-                    continue
-                self._handle_console_rx(client, data)
         if failure_reason and self._on_bridge_down is not None:
             threading.Thread(target=self._on_bridge_down, args=(failure_reason,), daemon=True).start()
 

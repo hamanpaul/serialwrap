@@ -1900,8 +1900,15 @@ class SessionManager:
                     bridge = session.bridge
                     by_id = session.profile.device_by_id
                 if bridge is not None:
-                    auth = resolve_session_auth(session.profile)
-                    ok, err = ensure_ready(bridge, session.profile, auth=auth)
+                    try:
+                        auth = resolve_session_auth(session.profile)
+                        ok, err = ensure_ready(bridge, session.profile, auth=auth)
+                    except Exception:  # noqa: BLE001 — login/probe 非預期例外不得殺死 worker（致 session 永卡 RECOVERING）（#79 STA-6）
+                        import logging
+                        logging.getLogger("serialwrap").warning(
+                            "reboot-recovery ensure_ready 例外（session=%s），續迴圈待逾時收尾", session_id, exc_info=True
+                        )
+                        ok, err = False, "RECOVERY_ERROR"
                     if ok:
                         with self._lock:
                             session = self._sessions.get(session_id)
