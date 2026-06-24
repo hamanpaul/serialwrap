@@ -198,3 +198,28 @@ class TestFlashProbeCriticalGuard(_Base):
         mgr.get_session("COM1").state = "READY"
         mgr.mark_flash_critical("COM0")                      # 只標 COM0
         self.assertNotEqual(mgr.clear_session("COM1").get("error_code"), "FLASHING_BUSY")
+
+    def test_recover_force_rejected_during_probe_window(self):
+        """Codex final [high]：force recover 也是 destructive 路徑（_force_recover detach/重連 bridge），
+        probe 窗口須一律 FLASHING_BUSY。"""
+        mgr = self._ready_mgr()
+        mgr.mark_flash_critical("COM0")
+        res = mgr.recover_session("COM0", force=True)
+        self.assertEqual(res.get("error_code"), "FLASHING_BUSY")
+
+    def test_collect_candidates_marks_atomically(self):
+        """Codex final [high]：collect_flash_candidates_and_mark 須在回傳的同時已標記候選（snapshot+mark
+        同鎖），杜絕 snapshot 與 mark 之間的 TOCTOU。"""
+        import dataclasses
+        prof = dataclasses.replace(
+            self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/a"), ready_probe=""
+        )  # ready_probe="" → 非 command_capable → 合格 flash 候選
+        self.assertFalse(prof.command_capable)
+        mgr = self._mgr([prof])
+        mgr.get_session("COM0").state = "READY"
+        cands = mgr.collect_flash_candidates_and_mark()
+        self.assertIn("COM0", [c["com"] for c in cands])     # 確為候選（非 trivial skip）
+        # 回傳後立即就已是 critical（destructive op 被擋）→ 證明 snapshot 與 mark 原子完成
+        self.assertEqual(mgr.clear_session("COM0").get("error_code"), "FLASHING_BUSY")
+        mgr.unmark_flash_critical("COM0")
+        self.assertNotEqual(mgr.clear_session("COM0").get("error_code"), "FLASHING_BUSY")

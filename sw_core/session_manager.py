@@ -960,6 +960,34 @@ class SessionManager:
         """session 是否處於 flash 臨界區（FLASHING 狀態或 probe 進行中）——須在 self._lock 內呼叫。"""
         return session.state == "FLASHING" or session.profile.com in self._flash_critical_coms
 
+    def collect_flash_candidates_and_mark(self) -> list[dict[str, Any]]:
+        """**原子**收集 flash 偵測候選（非 command_capable、READY/ATTACHED）並同時標記 flash-critical。
+
+        snapshot 與 mark 必須在同一把鎖內（#83 RACE-2 final）：否則「收集候選 → 釋鎖 → 逐一標記」之間，
+        並發的 clear/release/bind 可在標記生效前 detach/rebind bridge（probe 隨後撞到 stale by_id→com 或
+        新 bridge）。回傳候選 dict 串列（com/by_id/real_path/command_capable），呼叫端於偵測結束後對各
+        com `unmark_flash_critical`。標記後 bind 被擋，故 probe 期間候選的 device_by_id 不會變。
+        """
+        out: list[dict[str, Any]] = []
+        with self._lock:
+            for session in self._sessions.values():
+                if session.profile.command_capable:
+                    continue
+                if session.state not in ("READY", "ATTACHED"):
+                    continue
+                by_id = session.profile.device_by_id
+                dev = self._devices.get(by_id) if by_id else None
+                com = session.profile.com
+                out.append({
+                    "com": com,
+                    "by_id": by_id,
+                    "real_path": dev.real_path if dev is not None else None,
+                    "command_capable": False,
+                })
+                if com:
+                    self._flash_critical_coms.add(com)
+        return out
+
     def enter_flashing(self, selector: str) -> dict:
         """進入 FLASHING：只標狀態 + 擋命令，**不** detach bridge（daemon 仍是 real device 唯一 reader）。"""
         with self._lock:
@@ -2872,9 +2900,10 @@ class SessionManager:
                     "recommended_action": "device_attach",
                     "session": session.to_public_dict(),
                 }
-            # FLASHING 期間連 force recover 也不得介入——_force_recover 會 detach/重連 bridge，
-            # 切斷正在進行的 MCU 燒錄 transport（#69 r5）。須先 exit_flashing。
-            if session.state == "FLASHING":
+            # FLASHING 或 flash probe 臨界區，連 force recover 也不得介入——_force_recover 會 detach/重連
+            # bridge、切斷進行中的燒錄/偵測 transport（#69 r5；#83 RACE-2 final：probe 窗口 state 仍非
+            # FLASHING，但已標 flash-critical）。須先 exit_flashing 或待 probe 結束。
+            if self._flash_busy_locked(session):
                 return {"ok": False, "error_code": "FLASHING_BUSY", "selector": session.profile.com, "session": session.to_public_dict()}
             # 顯式人工 recover 視為重新介入：先清掉 reprobe 上限/進度，讓自動重探可在之後重新接手。
             # 否則 exhausted 的 ATTACHED session 一旦手動 recover 仍失敗，將永遠被 reconcile 跳過（Finding 4）。

@@ -342,18 +342,17 @@ class SerialwrapService:
         真機修正：偵測用 flasher 的 sync（非另注入一組），命中後回放 ACK；否則獨立 probe 會吃掉
         MCU 的 sync ACK，使 flasher 隨後自己的 sync 收不到回應而永遠 timeout。
         """
-        candidates = self._flash_candidates()
+        # RACE-2 final（#83）：**原子**收集候選並同時標記 flash-critical（snapshot+mark 同鎖），使
+        # destructive op（clear/release/bind/recover）於 probe 窗口（enter_flashing 之前、state 仍
+        # READY/ATTACHED）也回 FLASHING_BUSY，不得 detach/rebind bridge 中斷 probe；亦杜絕 snapshot 與
+        # mark 之間的 TOCTOU。命中者於 enter_flashing 後改由 FLASHING state 守護；outer finally 統一解標。
+        candidates = self._sessions.collect_flash_candidates_and_mark()
+        probe_coms = [c["com"] for c in candidates if c.get("com")]
         by_id_to_com = {c["by_id"]: c["com"] for c in candidates if c.get("by_id")}
         transport = _BridgeProbe(self, by_id_to_com, sync_bytes=first_bytes)
-        # RACE-2（#83）：detect_mcu_line 會掃完所有候選做 ambiguity scan，故命中候選在後續 probe 期間
-        # 必須保持 gate（probe 命中時不解、記入 transport.held）。outer finally 釋放任何仍持有但未交接
-        # 的 gate（早退 no-match/ambiguous、sess 失效、例外路徑）；命中且有效則交接 enter_flashing。
-        # RACE-2 final：偵測全程把候選 COM 標為 flash-critical，使 destructive op（clear/release/bind）於
-        # probe 窗口（enter_flashing 之前、state 仍 READY/ATTACHED）也回 FLASHING_BUSY，不得 detach/rebind
-        # bridge 中斷 probe。命中者於 enter_flashing 後改由 FLASHING state 守護；outer finally 統一解標。
-        probe_coms = [c["com"] for c in candidates if c.get("com")]
-        for _com in probe_coms:
-            self._sessions.mark_flash_critical(_com)
+        # detect_mcu_line 會掃完所有候選做 ambiguity scan，故命中候選在後續 probe 期間必須保持 gate
+        # （probe 命中時不解、記入 transport.held）。outer finally 釋放任何仍持有但未交接的 gate
+        # （早退 no-match/ambiguous、sess 失效、例外路徑）；命中且有效則交接 enter_flashing。
         try:
             result = detect_mcu_line(candidates, self._mcu_registry, transport)
             com = by_id_to_com.get(result.by_id) if result.by_id else None

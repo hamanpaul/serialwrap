@@ -135,18 +135,33 @@ def _has_backref(parsed: Any) -> bool:
     return any(op == _OP_GROUPREF for op, _av in _walk_ast(parsed))
 
 
-def _has_ambiguous_quantified_body(parsed: Any) -> bool:
-    """是否有「重複>1 次」的量詞，其重複單元含 alternation 或巢狀量詞——單量詞亦可指數回溯。
+def _body_is_ambiguous(body: Any) -> bool:
+    """重複單元 body 是否「模糊」＝含 alternation 或**可變**巢狀量詞——重複它 ≥2 次即指數爆炸。
 
-    `(a|aa)+`、`(a?)+`、`(.*)*` 等：外層只有一個量詞（`_count_backtrack_repeats` 可能 <2），但重複單元
-    模糊 → 指數爆炸。
+    關鍵：巢狀量詞須為**可變**（`mn != mx`）才算模糊；**固定** `{N}`（如 MAC `[0-9A-F]{2}`、`a{1}`）為
+    確定性、線性，不可視為模糊（否則誤擋 `(?:[0-9A-F]{2}:){5}[0-9A-F]{2}` 等常見規則；Codex final [medium]）。
+    """
+    for bop, bav in _walk_ast(body):
+        if bop == _OP_BRANCH:
+            return True
+        if bop in _BACKTRACK_REPEATS:
+            bmn, bmx, _bb = bav
+            if _is_variable_repeat(bmn, bmx):
+                return True
+    return False
+
+
+def _has_ambiguous_quantified_body(parsed: Any) -> bool:
+    """是否有「可重複 body ≥2 次」的量詞，其重複單元模糊（alternation／可變巢狀量詞）——指數回溯。
+
+    `(a|aa)+`、`(a?)+`、`(.*)*`、`(a?){30}` 等：重複一個模糊單元 ≥2 次 → 指數爆炸（外層量詞數可能 <2，
+    故 `_count_backtrack_repeats` 不一定抓到，須此條補強）。固定非模糊 body（`(abc){5}`、MAC）不算。
     """
     for op, av in _walk_ast(parsed):
         if op in _BACKTRACK_REPEATS:
             mn, mx, body = av
-            if _repeats_at_least_twice(mn, mx):
-                if any(bop in _BACKTRACK_REPEATS or bop == _OP_BRANCH for bop, _b in _walk_ast(body)):
-                    return True
+            if _repeats_at_least_twice(mn, mx) and _body_is_ambiguous(body):
+                return True
     return False
 
 
