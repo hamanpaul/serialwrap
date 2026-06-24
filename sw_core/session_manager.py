@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shlex
+import tempfile
 import threading
 import time
 import uuid
@@ -343,7 +344,18 @@ class SessionManager:
         try:
             with open(STATE_PATH, "r", encoding="utf-8") as fp:
                 obj = json.load(fp)
-        except Exception:
+        except Exception as exc:
+            # 損毀的 state.json：保留備份並告警，而非靜默全棄（#82）。released 交接無法從損毀檔復原，
+            # 但原子寫入已大幅降低出現損毀檔的機率；備份保留證據並清出 active 路徑供下次 _save_state 重建。
+            import logging
+            backup = f"{STATE_PATH}.corrupt"
+            try:
+                os.replace(STATE_PATH, backup)
+            except OSError:
+                backup = None
+            logging.getLogger("serialwrap").warning(
+                "state.json 解析失敗，略過載入並備份至 %s：%s", backup, exc
+            )
             return
         rows = obj.get("aliases") if isinstance(obj, dict) else None
         if isinstance(rows, dict):
@@ -383,15 +395,37 @@ class SessionManager:
                     "released_at": s.released_at,
                     "reason": s.released_reason,
                 }
-        with open(STATE_PATH, "w", encoding="utf-8") as fp:
-            json.dump(
-                {"aliases": self._aliases.dump(), "bindings": dict(self._binding_overrides), "released": released},
-                fp,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            fp.write("\n")
+        payload = json.dumps(
+            {"aliases": self._aliases.dump(), "bindings": dict(self._binding_overrides), "released": released},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ) + "\n"
+        # 原子寫入：temp + fsync + os.replace + 目錄 fsync（比照 wal.py 既有慣例），避免崩潰/斷電/ENOSPC
+        # 在「直接覆寫 state.json」中途失敗留下截斷檔，致 _load_state 解析失敗而靜默全棄（含 RELEASED
+        # 交接狀態）→ 重啟後 daemon 重新 attach 已交給 flasher/人類的 tty 形成 two-reader（#82）。
+        state_dir = os.path.dirname(STATE_PATH)
+        # 每次取唯一 temp 名（mkstemp）：_save_state 可能由多執行緒並發呼叫（device 自動綁定／attach），
+        # 固定 temp 名會在並發 os.replace 時互踩（FileNotFoundError）。唯一名 → 並發安全、last-writer-wins。
+        fd, tmp_path = tempfile.mkstemp(dir=state_dir, prefix="state.json.tmp.")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fp:
+                fp.write(payload)
+                fp.flush()
+                os.fsync(fp.fileno())
+            os.replace(tmp_path, STATE_PATH)
+            dir_fd = os.open(state_dir, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        finally:
+            # os.replace 成功後 tmp 已不存在；中途失敗時清掉半寫 temp，且絕不動到原 state.json。
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
 
     def _next_dynamic_com(self) -> str:
         """分配下一個可用的 COM 編號（須在 self._lock 內呼叫）。"""
