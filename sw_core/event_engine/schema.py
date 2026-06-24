@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import re
+import subprocess
+import sys
 import types
 from dataclasses import dataclass, field
 from typing import Any
@@ -95,75 +98,139 @@ def _walk_ast(subpattern: Any):
             yield from _walk_ast(child)
 
 
-def _body_has_ambiguous_repeat(body: Any) -> bool:
-    """量詞的重複單元（body）內是否含「會回溯的量詞」或 alternation——模糊重複＝catastrophic 來源。"""
-    for op, _av in _walk_ast(body):
-        if op in _BACKTRACK_REPEATS or op == _OP_BRANCH:
-            return True
-    return False
+# ── ReDoS 防護（#83 STA-4 / #91 Codex 必修，三輪對抗式審查收斂）─────────────────────────────
+# 標準 re 於 catastrophic backtracking 期間獨佔 GIL、不可中斷；任何「靜態 AST 啟發式」都被對抗式審查
+# 逐一繞過（指數→多項式→寬原子等價形 [\s\S]*→大量有界 a{0,4096}→backreference (a*)\1），同時又誤拒
+# 安全 pattern（\d+\.\d+）。改用**經驗式探測**：對「可疑」pattern（≥2 個回溯量詞，或含 backreference）
+# 於 upsert 在獨立子行程以硬 timeout 實跑 re.search 對抗輸入；逾時＝catastrophic → 拒絕。empirical 不依賴
+# 結構形狀，無法被任何 AST 形繞過；安全 pattern 數百毫秒內完成、不誤拒。僅在 pattern 將落到標準 re 路徑
+# （re2 不可用或不支援）時啟用；裝 google-re2 線性引擎即一律免疫、不探測。
+_OP_LITERAL = _sre_constants.LITERAL
+_OP_IN = _sre_constants.IN
+_OP_NEGATE = _sre_constants.NEGATE
+_OP_RANGE = _sre_constants.RANGE
+_OP_CATEGORY = _sre_constants.CATEGORY
+_OP_GROUPREF = _sre_constants.GROUPREF
+_CATEGORY_REPR = {
+    _sre_constants.CATEGORY_DIGIT: "0", _sre_constants.CATEGORY_WORD: "a",
+    _sre_constants.CATEGORY_SPACE: " ", _sre_constants.CATEGORY_NOT_DIGIT: "a",
+    _sre_constants.CATEGORY_NOT_WORD: ".", _sre_constants.CATEGORY_NOT_SPACE: "a",
+}
+# 子行程探測預算（秒）：catastrophic pattern 遠超此值 → 逾時即判；安全 pattern 數百毫秒內完成（巨大
+# 裕度，CPU 競態下亦不誤判）。upsert 罕見，1.5s 單次成本可接受；測試可 monkeypatch 調小加速。
+_REDOS_PROBE_BUDGET_S = 1.5
+_REDOS_PROBE_SCRIPT = (
+    "import sys,json,re\n"
+    "d=json.load(sys.stdin)\n"
+    "rx=re.compile(d['v'],d['f'])\n"
+    "[rx.search(s) for s in d['a']]\n"
+)
 
 
-def _regex_is_redos_risky(pattern: str, flags: int) -> bool:
-    """AST 結構分析：是否存在「重複>1 次且重複單元模糊」的回溯型量詞（指數 ReDoS 類）。
-
-    取代脆弱的 regex-on-regex heuristic：直接走訪 stdlib 解析的 AST，捕捉 (a+)+、(a|aa)+、(a?)+、
-    (a{1,3})+、(.*)* 等可 catastrophic backtracking 的模式（皆為「量詞包住含量詞/alternation 的單元」）。
-    保守——可能誤拒少數安全 pattern（如 (a+b)+、(a|b)+），但寧可誤拒不可漏放。
-    """
-    parsed = _sre_parse.parse(pattern, flags)
+def _count_backtrack_repeats(parsed: Any) -> int:
+    """「會回溯且重複>1 次」的量詞數（含無界 `*`/`+`/`{n,}` 與大量有界 `{0,4096}`，後者亦可凍結）。"""
+    n = 0
     for op, av in _walk_ast(parsed):
-        if op not in _BACKTRACK_REPEATS:
-            continue
-        _mn, mx, body = av
-        repeated_more_than_once = (mx == _MAXREPEAT) or (isinstance(mx, int) and mx > 1)
-        if repeated_more_than_once and _body_has_ambiguous_repeat(body):
-            return True
+        if op in _BACKTRACK_REPEATS:
+            _mn, mx, _body = av
+            if mx == _MAXREPEAT or (isinstance(mx, int) and mx > 1):
+                n += 1
+    return n
+
+
+def _has_backref(parsed: Any) -> bool:
+    """是否含 backreference（如 `\\1`）——`(a*)\\1` 類在標準 re 下可 catastrophic，且 re2 不支援。"""
+    return any(op == _OP_GROUPREF for op, _av in _walk_ast(parsed))
+
+
+def _has_ambiguous_quantified_body(parsed: Any) -> bool:
+    """是否有「重複>1 次」的量詞，其重複單元含 alternation 或巢狀量詞——單量詞亦可指數回溯。
+
+    `(a|aa)+`、`(a?)+`、`(.*)*` 等：外層只有一個量詞（`_count_backtrack_repeats` 可能 <2），但重複單元
+    模糊 → 指數爆炸。納入預篩，交由子行程探測確認。
+    """
+    for op, av in _walk_ast(parsed):
+        if op in _BACKTRACK_REPEATS:
+            _mn, mx, body = av
+            if mx == _MAXREPEAT or (isinstance(mx, int) and mx > 1):
+                if any(bop in _BACKTRACK_REPEATS or bop == _OP_BRANCH for bop, _b in _walk_ast(body)):
+                    return True
     return False
 
 
-def _max_unbounded_in_path(sp: Any) -> int:
-    """單一 concatenation 序列沿路徑可累積的最大「無界回溯量詞數」。
+def _maybe_redos_suspicious(parsed: Any) -> bool:
+    """寬鬆預篩：是否值得做子行程探測（顯然安全的單量詞 pattern 不付探測成本）。
 
-    規則：group 內聯（SUBPATTERN/atomic 併入主路徑、量詞 body 內部遞迴累加）、alternation 取分支
-    最大、lookaround 內部獨立計（取 max 不沿主路徑累加）。沿路徑 ≥2 即代表序列上有 ≥2 個無界量詞
-    （如 `a.*a.*`、`\\d*\\d*`、`[\\s\\S]*[\\s\\S]*`、`[^,]*[^,]*`），標準 re 下對長輸入可多項式回溯爆炸
-    （實測即便 2 個皆於 4096 失敗輸入凍結，且**不限**原子寬窄——narrow 的 `\\d*\\d*` 亦然，故以「量詞
-    數」而非「原子寬度」計，杜絕 `[\\s\\S]` 等寬原子等價形繞過）。possessive（`*+`）不回溯故不計。
+    過度涵蓋無妨——探測是精確仲裁者，會放行實際安全的可疑 pattern（如 `\\d+\\.\\d+`）。
     """
-    total = 0
-    for op, av in sp:
-        if op in _BACKTRACK_REPEATS or (
-            _OP_POSSESSIVE_REPEAT is not None and op == _OP_POSSESSIVE_REPEAT
-        ):
-            _mn, mx, body = av
-            inner = _max_unbounded_in_path(body)
-            if op in _BACKTRACK_REPEATS and mx == _MAXREPEAT:
-                total += 1 + inner          # 本無界回溯量詞 + body 內部路徑
-            else:
-                total += inner              # 有界 / possessive：本身不計，body 內部仍算
-        elif op == _OP_BRANCH:
-            total += max((_max_unbounded_in_path(b) for b in av[1] if b is not None), default=0)
-        elif op == _OP_SUBPATTERN:
-            total += _max_unbounded_in_path(av[-1])          # group 內聯
-        elif _OP_ATOMIC_GROUP is not None and op == _OP_ATOMIC_GROUP:
-            total += _max_unbounded_in_path(av)
-        elif op in (_OP_ASSERT, _OP_ASSERT_NOT):
-            total = max(total, _max_unbounded_in_path(av[1]))  # lookaround 不消耗主路徑輸入
-        elif op == _OP_GROUPREF_EXISTS:
-            total += max((_max_unbounded_in_path(x) for x in av[1:] if x is not None), default=0)
-        # 其餘 atom（literal/in/any/category…）不影響計數
-    return total
+    return (
+        _count_backtrack_repeats(parsed) >= 2
+        or _has_backref(parsed)
+        or _has_ambiguous_quantified_body(parsed)
+    )
 
 
-def _regex_has_polynomial_redos(pattern: str, flags: int) -> bool:
-    """是否含 ≥2 個序列式無界回溯量詞（多項式 ReDoS 來源）。
+def _atom_char(op: Any, av: Any) -> str:
+    """能被該原子匹配的一個代表字元（best-effort，用於建構對抗輸入）。"""
+    if op == _OP_LITERAL:
+        return chr(av) if 0 <= av < 0x110000 else "a"
+    if op == _OP_CATEGORY:
+        return _CATEGORY_REPR.get(av, "a")
+    if op == _OP_IN:
+        if av and av[0][0] == _OP_NEGATE:
+            return "\x07"  # 假設此罕用控制字元不在排除集（多數 [^...] 成立）
+        for o, a in av:
+            if o == _OP_LITERAL:
+                return chr(a) if 0 <= a < 0x110000 else "a"
+            if o == _OP_RANGE:
+                return chr(a[0]) if 0 <= a[0] < 0x110000 else "a"
+            if o == _OP_CATEGORY:
+                return _CATEGORY_REPR.get(a, "a")
+    return "a"
 
-    保守以「量詞數」計（不分原子寬窄、不分析 separator 重疊），故亦會誤拒 `\\d+\\.\\d+`、`\\w+\\s+\\w+`
-    這類實際安全（separator 不可被前量詞吞）的 pattern——但 fail-closed 寧可誤拒不可漏放，且裝
-    google-re2（`serialwrap[redos]`）線性引擎後此限制即解除。alternation-of-singles（如
-    `(error.*|warn.*)`）走分支取 max 故不誤判。
+
+def _redos_attack_inputs(parsed: Any) -> list[str]:
+    """為 pattern 建構對抗輸入：每個「可匹配代表字元」各產生『全填』與『全填+失敗尾』兩種長字串。
+
+    全填觸發多項式/重疊回溯；失敗尾（末位塞罕用控制字元）強迫 anchored 量詞（如 (a+)+$）回溯。代表
+    字元取自 pattern 的 literal/類別 ＋ 通用 {a,0,space}，使對抗輸入確實能被量詞原子匹配。
     """
-    return _max_unbounded_in_path(_sre_parse.parse(pattern, flags)) >= 2
+    L = REGEX_MATCH_INPUT_MAX
+    chars = {"a", "0", " "}
+    for op, av in _walk_ast(parsed):
+        if op in (_OP_LITERAL, _OP_IN, _OP_CATEGORY):
+            chars.add(_atom_char(op, av))
+    out: list[str] = []
+    for c in chars:
+        if not c:
+            continue
+        out.append(c * L)
+        out.append(c * (L - 1) + "\x01")
+    return out
+
+
+def _stdlib_regex_is_catastrophic(value: str, flags: int) -> bool:
+    """獨立子行程以硬 timeout 實測 re.search 對抗輸入；逾時＝catastrophic backtracking（fail closed）。
+
+    僅對 `_maybe_redos_suspicious` 的 pattern 呼叫（罕見）。empirical 涵蓋指數/多項式/大量有界/backref
+    等任意 AST 形，無法被結構繞過；安全 pattern 不誤拒。子行程跑全新直譯器（無 multiprocessing 的
+    spawn 重匯入 / fork 鎖繼承風險），timeout 後由 subprocess 終結。探測基礎設施失敗 → fail closed。
+    """
+    try:
+        parsed = _sre_parse.parse(value, flags)
+        payload = json.dumps({"v": value, "f": int(flags), "a": _redos_attack_inputs(parsed)})
+        subprocess.run(
+            [sys.executable, "-c", _REDOS_PROBE_SCRIPT],
+            input=payload.encode("utf-8"),
+            timeout=_REDOS_PROBE_BUDGET_S,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return False
+    except subprocess.TimeoutExpired:
+        return True
+    except Exception:  # pragma: no cover - 探測基礎設施不可用 → fail closed
+        return True
 
 
 @dataclass(frozen=True)
@@ -251,24 +318,22 @@ def validate_rule_dict(obj: dict[str, Any]) -> Rule:
             re.compile(pvalue, pflags_int)
         except re.error as exc:
             raise RuleSchemaError(f"pattern.value is not a valid regex: {exc}") from exc
-        # ReDoS fail-closed（#83 STA-4 / #91 Codex 必修）：僅當此 pattern 將落到**標準 re** 路徑
-        # 才於 upsert 結構性拒絕 catastrophic backtracking 類；re2 線性引擎可用且支援此 pattern 時，
-        # 一律不限制（re2 對任何 pattern 皆線性、無回溯）。判定以 matcher 同款 `_re2_compile`：
-        # re2 不可用，或 pattern 用 re2 不支援的構造（backref/lookaround）→ 落 re → fail-closed。
+        # ReDoS fail-closed（#83 STA-4 / #91 Codex 必修）：僅當此 pattern 將落到**標準 re** 路徑才檢查；
+        # re2 線性引擎可用且支援此 pattern 時一律不限制（re2 對任何 pattern 皆線性、無回溯）。判定以 matcher
+        # 同款 `_re2_compile`：re2 不可用，或 pattern 用 re2 不支援的構造（backref/lookaround）→ 落 re。
+        # 對「可疑」pattern（≥2 個回溯量詞或含 backreference）於子行程實測探測，catastrophic 即拒——
+        # empirical 涵蓋指數/多項式/大量有界/backref 任意形，杜絕靜態 heuristic 的繞過與誤拒。
         if _re2_compile(pvalue, pflags) is None:
             try:
-                # (a) 指數類：量詞包住「含巢狀量詞 / alternation」的模糊單元（(a+)+、(a|aa)+、(.*)* …）。
-                # (b) 多項式類：≥2 個序列式無界回溯量詞（a.*a.*X、\d*\d*X、[\s\S]*[\s\S]*X …，不分原子寬窄）。
-                risky = _regex_is_redos_risky(pvalue, pflags_int)
-                poly = _regex_has_polynomial_redos(pvalue, pflags_int)
+                parsed_for_check = _sre_parse.parse(pvalue, pflags_int)
             except re.error as exc:  # pragma: no cover - compile 已過，此處幾乎不會觸發
                 raise RuleSchemaError(f"pattern.value is not a valid regex: {exc}") from exc
-            _require(
-                not (risky or poly),
-                "pattern.value 含 catastrophic backtracking 風險（指數類如 (a+)+/(a|aa)+/(.*)*，或多項式類"
-                "如 a.*a.*X／\\d*\\d*X 等 ≥2 個序列式無界量詞），標準 re 下易遭 ReDoS；請改寫為非歧義／非"
-                "回溯形式，或安裝 google-re2（pip install 'serialwrap[redos]'）以線性引擎免疫此限制",
-            )
+            if _maybe_redos_suspicious(parsed_for_check) and _stdlib_regex_is_catastrophic(pvalue, pflags_int):
+                _require(
+                    False,
+                    "pattern.value 在標準 re 下對長輸入呈 catastrophic backtracking（ReDoS，子行程實測逾時）；"
+                    "請改寫為非回溯形式，或安裝 google-re2（pip install 'serialwrap[redos]'）以線性引擎免疫",
+                )
     pattern = Pattern(kind=pkind, value=pvalue, flags=pflags)
 
     scope = str(obj.get("scope", "spontaneous"))

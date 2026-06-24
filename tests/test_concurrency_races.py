@@ -68,20 +68,14 @@ def test_fanout_skips_bad_fd_without_crash(tmp_path):
     b._handle_serial_rx(b"data")  # 不得拋例外
 
 
-# ── STA-4 ────────────────────────────────────────────────────────────────
-def test_safe_regex_accepted():
-    _rule(pattern={"kind": "regex", "value": "root@.*# "})  # 正常 regex 不受影響
+# ── STA-4 / #91：ReDoS 經驗式子行程探測（三輪 Codex 對抗式審查收斂）───────────────────────────
+import sw_core.event_engine.schema as _schema_mod  # noqa: E402
 
 
-@pytest.mark.parametrize("bad", ["(a+)+$", "(a*)*", "(.+)+", "(\\d+)+", "(ab+)*"])
-def test_nested_quantifier_regex_rejected(bad):
-    """指數類：無 re2 → fail-closed 拒絕；裝 re2 線性引擎 → 接受（不受結構限制）。"""
-    import sw_core.event_engine.schema as schema
-    if schema._re2 is None:
-        with pytest.raises(RuleSchemaError):
-            _rule(pattern={"kind": "regex", "value": bad})
-    else:
-        _rule(pattern={"kind": "regex", "value": bad})
+@pytest.fixture(autouse=True)
+def _fast_redos_probe(monkeypatch):
+    """加速：catastrophic pattern 遠超此值即逾時被判，安全 pattern 數百毫秒完成 → 0.8s 有足夠裕度。"""
+    monkeypatch.setattr(_schema_mod, "_REDOS_PROBE_BUDGET_S", 0.8, raising=False)
 
 
 def test_overlong_regex_rejected():
@@ -93,66 +87,45 @@ def test_contains_pattern_not_redos_checked():
     _rule(pattern={"kind": "contains", "value": "(a+)+"})  # contains 非 regex，不做 ReDoS 檢查
 
 
-# ── STA-4 強化（Codex 必修）：原 heuristic 可被以下模式繞過，AST 結構分析須一律拒絕 ──────────
 @pytest.mark.parametrize("bad", [
-    "(a|aa)+$",      # alternation 重疊分支（原 heuristic 無 +/* 在群組內 → 漏放）
-    "(a?)+$",        # optional 重複
-    "(a{1,3})+$",    # bounded-range 重複
-    "(a|aa)*",
-    "(.*)*",
-    "(.*)+",
-    "((ab)*)*",      # 巢狀群組量詞
-    "(\\d|\\d\\d)+",
-    "(x+)+y",
+    "(a+)+$",                 # 指數（anchored，需失敗尾觸發回溯）
+    "(a|aa)+$",               # 指數：alternation 重疊（單量詞，由 ambiguous-body 預篩抓出）
+    "a.*a.*X",                # 多項式：. 序列
+    r"[\s\S]*[\s\S]*X",       # round2 繞過：寬原子等價形（非單一 ANY）
+    r"\d*\d*X",               # round2：narrow 類（不分寬窄皆凍結）
 ])
-def test_redos_bypass_patterns_rejected(bad):
-    """指數類繞過例：無 re2 → fail-closed 拒絕；裝 re2 線性引擎 → 接受。"""
-    import sw_core.event_engine.schema as schema
-    if schema._re2 is None:
+def test_redos_catastrophic_rejected_without_re2(bad):
+    """re2-可編譯的 catastrophic pattern：標準 re 路徑（re2 不可用）fail-closed 拒絕；re2 可用則接受。"""
+    if _schema_mod._re2 is None:
         with pytest.raises(RuleSchemaError):
             _rule(pattern={"kind": "regex", "value": bad})
     else:
+        _rule(pattern={"kind": "regex", "value": bad})  # re2 線性 → 免疫 → 接受
+
+
+@pytest.mark.parametrize("bad", [
+    r"(a*)\1X",               # round3：backreference（re2 不支援）→ 落 re → 探測拒
+    r"a{0,4096}a{0,4096}X",   # round3：大量有界 repeat（re2 拒絕超大 repetition）→ 落 re → 探測拒
+])
+def test_redos_catastrophic_always_rejected(bad):
+    """re2 無法處理者（backref / 超大 repetition）→ **兩引擎皆**落標準 re，經驗式探測必拒。"""
+    with pytest.raises(RuleSchemaError):
         _rule(pattern={"kind": "regex", "value": bad})
 
 
 @pytest.mark.parametrize("ok", [
-    r"temp=(\d+)C",       # 群組未被再施量詞 → 安全
-    r"root@.*# ",         # 單一 .* → 安全
-    r"error|warn|fail",   # 頂層 alternation（未被量詞包住）→ 安全
-    r"\d{3,5}",           # 單一 bounded repeat → 安全
-    r"(abc)+",            # 量詞群組但單元固定、無歧義 → 安全
+    r"\d+\.\d+",          # round3：separator(\.) 不可被前量詞吞 → 安全；empirical 不誤拒（量詞數法會誤拒）
+    r"\w+\s+\w+",         # 同上：disjoint 類分隔 → 安全
+    r"(error.*|warn.*)",  # alternation-of-singles → 安全
+    r"temp=(\d+)C",       # 單一量詞 → 非可疑、不探測
+    r"root@.*# ",         # 單一 .*
+    r"error|warn|fail",   # 頂層 alternation
+    r"\d{3,5}",           # 單一小 bounded repeat
+    r"(abc)+",            # 量詞群組但單元固定
     r"Kernel panic",
 ])
-def test_safe_regex_patterns_still_accepted(ok):
-    _rule(pattern={"kind": "regex", "value": ok})  # 不得誤拒
-
-
-# ── 多項式 ReDoS：標準 re 路徑 fail-closed 拒絕，re2 線性引擎可用則接受（#91 Codex 必修）──────
-import sw_core.event_engine.schema as _schema_mod  # noqa: E402
-
-
-@pytest.mark.parametrize("poly", [
-    "a.*a.*X", ".*.*", r"root@.*:.*# ", r"\d.*\d.*\d.*x",
-    # Codex 對抗式審查 round2：寬原子等價形 + narrow 類 + 群組形，皆須被「量詞數」計法擋下（非僅 `.`）
-    r"[\s\S]*[\s\S]*X", r"(?:.|\n)*(?:.|\n)*X", r"\d*\d*X", r"\w*\w*X", r"[^,]*[^,]*X", r"(\d*)(\d*)X",
-])
-def test_polynomial_redos_gated_by_engine(poly):
-    """≥2 個序列式無界量詞：標準 re 路徑（re2 不可用）upsert 即拒絕；re2 線性可用時接受（安全）。"""
-    if _schema_mod._re2 is None:
-        with pytest.raises(RuleSchemaError):
-            _rule(pattern={"kind": "regex", "value": poly})
-    else:
-        _rule(pattern={"kind": "regex", "value": poly})  # re2 線性 → 免疫 → 接受
-
-
-def test_alternation_of_single_quantifiers_not_false_rejected():
-    """alternation-of-singles（每分支僅 1 個 .*）走分支取 max → 非多項式 → 不誤拒（兩引擎皆然）。"""
-    _rule(pattern={"kind": "regex", "value": r"(error.*|warn.*)"})
-
-
-@pytest.mark.parametrize("ok", [r"root@.*# ", r"dhd_dpc.*firmware_trap", r"temp=(\d+)C", "error.*panic"])
-def test_single_unbounded_quantifier_always_accepted(ok):
-    """≤1 個 .* → 非多項式類 → 兩引擎皆接受（不誤拒常見單一 .* pattern）。"""
+def test_redos_safe_accepted_both_engines(ok):
+    """安全 pattern（含可疑但實測快速通過者）兩引擎皆不誤拒。"""
     _rule(pattern={"kind": "regex", "value": ok})
 
 
