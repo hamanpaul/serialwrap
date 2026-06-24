@@ -36,6 +36,16 @@ from .wal import WalWriter
 _ATTACHED_CONSOLE_LEASE_TIMEOUT_S = 86400.0
 
 
+class StateLoadError(RuntimeError):
+    """既有 state.json 讀取失敗（非 JSON 損毀，如 PermissionError／暫時性 I/O）時拋出。
+
+    用以與「確認的 JSON 格式損毀」區分：後者可備份重建，前者必須 fail closed——若帶病啟動，
+    __init__ 尾段的 _save_state() 會以空狀態覆寫磁碟檔，遺失 RELEASED（裝置交接），重啟後
+    daemon 重新 attach 已交給 flasher／人類的 tty 形成 two-reader（#82 / Codex 必修）。
+    daemon 啟動層（daemon.py）攔截本例外並拒絕啟動。
+    """
+
+
 def _matches_any_bootloader_prompt(
     rx_tail: str,
     patterns: "list[str] | tuple[str, ...]",
@@ -342,11 +352,25 @@ class SessionManager:
         if not os.path.exists(STATE_PATH):
             return
         try:
-            with open(STATE_PATH, "r", encoding="utf-8") as fp:
-                obj = json.load(fp)
-        except Exception as exc:
-            # 損毀的 state.json：保留備份並告警，而非靜默全棄（#82）。released 交接無法從損毀檔復原，
-            # 但原子寫入已大幅降低出現損毀檔的機率；備份保留證據並清出 active 路徑供下次 _save_state 重建。
+            with open(STATE_PATH, "rb") as fp:
+                raw = fp.read()
+        except OSError as exc:
+            # 讀取既有 state.json 失敗（PermissionError／暫時性 EIO／fd 耗盡等）——檔案內容多半仍完好，
+            # 只是此刻讀不到。絕不可當成「損毀」而備份/清空：__init__ 尾段的 _save_state() 會以空的
+            # 記憶體狀態覆寫磁碟檔，遺失 RELEASED（裝置交接）→ 重啟後 daemon 重新 attach 已交給
+            # flasher／人類的 tty，正是 CLAUDE.md 一再防範的 two-reader（#82 / Codex 必修）。
+            # 故 fail closed：拋 StateLoadError 由 daemon 啟動層拒絕啟動，由運維修復後再起，
+            # 而非帶病啟動 clobber 交接狀態。原檔絕不動。
+            raise StateLoadError(
+                f"無法讀取既有 state.json（{STATE_PATH}）：{exc}；"
+                "為避免以空狀態覆寫並遺失 RELEASED 交接（two-reader 風險），daemon 拒絕啟動。"
+            ) from exc
+        try:
+            obj = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+            # 僅「確認的 JSON 格式損毀」（截斷／非 UTF-8／非 JSON）才備份重建：內容已無從復原 RELEASED，
+            # 備份保留證據並清出 active 路徑供下次 _save_state 重建；原子寫入（本 PR）已使此情形罕見。
+            # 與上方「讀取失敗」嚴格區分——後者一律 fail closed，不得在此誤判為損毀（#82 / Codex 必修）。
             import logging
             backup = f"{STATE_PATH}.corrupt"
             try:
@@ -354,7 +378,7 @@ class SessionManager:
             except OSError:
                 backup = None
             logging.getLogger("serialwrap").warning(
-                "state.json 解析失敗，略過載入並備份至 %s：%s", backup, exc
+                "state.json 解析失敗（JSON 損毀），略過載入並備份至 %s：%s", backup, exc
             )
             return
         rows = obj.get("aliases") if isinstance(obj, dict) else None
