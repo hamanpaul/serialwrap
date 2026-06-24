@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shlex
+import tempfile
 import threading
 import time
 import uuid
@@ -33,6 +34,16 @@ from .wal import WalWriter
 
 
 _ATTACHED_CONSOLE_LEASE_TIMEOUT_S = 86400.0
+
+
+class StateLoadError(RuntimeError):
+    """既有 state.json 讀取失敗（非 JSON 損毀，如 PermissionError／暫時性 I/O）時拋出。
+
+    用以與「確認的 JSON 格式損毀」區分：後者可備份重建，前者必須 fail closed——若帶病啟動，
+    __init__ 尾段的 _save_state() 會以空狀態覆寫磁碟檔，遺失 RELEASED（裝置交接），重啟後
+    daemon 重新 attach 已交給 flasher／人類的 tty 形成 two-reader（#82 / Codex 必修）。
+    daemon 啟動層（daemon.py）攔截本例外並拒絕啟動。
+    """
 
 
 def _matches_any_bootloader_prompt(
@@ -341,9 +352,34 @@ class SessionManager:
         if not os.path.exists(STATE_PATH):
             return
         try:
-            with open(STATE_PATH, "r", encoding="utf-8") as fp:
-                obj = json.load(fp)
-        except Exception:
+            with open(STATE_PATH, "rb") as fp:
+                raw = fp.read()
+        except OSError as exc:
+            # 讀取既有 state.json 失敗（PermissionError／暫時性 EIO／fd 耗盡等）——檔案內容多半仍完好，
+            # 只是此刻讀不到。絕不可當成「損毀」而備份/清空：__init__ 尾段的 _save_state() 會以空的
+            # 記憶體狀態覆寫磁碟檔，遺失 RELEASED（裝置交接）→ 重啟後 daemon 重新 attach 已交給
+            # flasher／人類的 tty，正是 CLAUDE.md 一再防範的 two-reader（#82 / Codex 必修）。
+            # 故 fail closed：拋 StateLoadError 由 daemon 啟動層拒絕啟動，由運維修復後再起，
+            # 而非帶病啟動 clobber 交接狀態。原檔絕不動。
+            raise StateLoadError(
+                f"無法讀取既有 state.json（{STATE_PATH}）：{exc}；"
+                "為避免以空狀態覆寫並遺失 RELEASED 交接（two-reader 風險），daemon 拒絕啟動。"
+            ) from exc
+        try:
+            obj = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+            # 僅「確認的 JSON 格式損毀」（截斷／非 UTF-8／非 JSON）才備份重建：內容已無從復原 RELEASED，
+            # 備份保留證據並清出 active 路徑供下次 _save_state 重建；原子寫入（本 PR）已使此情形罕見。
+            # 與上方「讀取失敗」嚴格區分——後者一律 fail closed，不得在此誤判為損毀（#82 / Codex 必修）。
+            import logging
+            backup = f"{STATE_PATH}.corrupt"
+            try:
+                os.replace(STATE_PATH, backup)
+            except OSError:
+                backup = None
+            logging.getLogger("serialwrap").warning(
+                "state.json 解析失敗（JSON 損毀），略過載入並備份至 %s：%s", backup, exc
+            )
             return
         rows = obj.get("aliases") if isinstance(obj, dict) else None
         if isinstance(rows, dict):
@@ -383,15 +419,37 @@ class SessionManager:
                     "released_at": s.released_at,
                     "reason": s.released_reason,
                 }
-        with open(STATE_PATH, "w", encoding="utf-8") as fp:
-            json.dump(
-                {"aliases": self._aliases.dump(), "bindings": dict(self._binding_overrides), "released": released},
-                fp,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            fp.write("\n")
+        payload = json.dumps(
+            {"aliases": self._aliases.dump(), "bindings": dict(self._binding_overrides), "released": released},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ) + "\n"
+        # 原子寫入：temp + fsync + os.replace + 目錄 fsync（比照 wal.py 既有慣例），避免崩潰/斷電/ENOSPC
+        # 在「直接覆寫 state.json」中途失敗留下截斷檔，致 _load_state 解析失敗而靜默全棄（含 RELEASED
+        # 交接狀態）→ 重啟後 daemon 重新 attach 已交給 flasher/人類的 tty 形成 two-reader（#82）。
+        state_dir = os.path.dirname(STATE_PATH)
+        # 每次取唯一 temp 名（mkstemp）：_save_state 可能由多執行緒並發呼叫（device 自動綁定／attach），
+        # 固定 temp 名會在並發 os.replace 時互踩（FileNotFoundError）。唯一名 → 並發安全、last-writer-wins。
+        fd, tmp_path = tempfile.mkstemp(dir=state_dir, prefix="state.json.tmp.")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fp:
+                fp.write(payload)
+                fp.flush()
+                os.fsync(fp.fileno())
+            os.replace(tmp_path, STATE_PATH)
+            dir_fd = os.open(state_dir, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        finally:
+            # os.replace 成功後 tmp 已不存在；中途失敗時清掉半寫 temp，且絕不動到原 state.json。
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
 
     def _next_dynamic_com(self) -> str:
         """分配下一個可用的 COM 編號（須在 self._lock 內呼叫）。"""
