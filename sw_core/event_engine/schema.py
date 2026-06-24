@@ -121,34 +121,49 @@ def _regex_is_redos_risky(pattern: str, flags: int) -> bool:
     return False
 
 
-def _is_single_any_atom(body: Any) -> bool:
-    """body 是否為「單一 ANY（`.` 或 DOTALL 的 `.`）」原子——序列多個這種無界量詞＝多項式回溯來源。"""
-    items = list(body)
-    if len(items) != 1:
-        return False
-    op0 = items[0][0]
-    return op0 == _OP_ANY or (_OP_ANY_ALL is not None and op0 == _OP_ANY_ALL)
+def _max_unbounded_in_path(sp: Any) -> int:
+    """單一 concatenation 序列沿路徑可累積的最大「無界回溯量詞數」。
+
+    規則：group 內聯（SUBPATTERN/atomic 併入主路徑、量詞 body 內部遞迴累加）、alternation 取分支
+    最大、lookaround 內部獨立計（取 max 不沿主路徑累加）。沿路徑 ≥2 即代表序列上有 ≥2 個無界量詞
+    （如 `a.*a.*`、`\\d*\\d*`、`[\\s\\S]*[\\s\\S]*`、`[^,]*[^,]*`），標準 re 下對長輸入可多項式回溯爆炸
+    （實測即便 2 個皆於 4096 失敗輸入凍結，且**不限**原子寬窄——narrow 的 `\\d*\\d*` 亦然，故以「量詞
+    數」而非「原子寬度」計，杜絕 `[\\s\\S]` 等寬原子等價形繞過）。possessive（`*+`）不回溯故不計。
+    """
+    total = 0
+    for op, av in sp:
+        if op in _BACKTRACK_REPEATS or (
+            _OP_POSSESSIVE_REPEAT is not None and op == _OP_POSSESSIVE_REPEAT
+        ):
+            _mn, mx, body = av
+            inner = _max_unbounded_in_path(body)
+            if op in _BACKTRACK_REPEATS and mx == _MAXREPEAT:
+                total += 1 + inner          # 本無界回溯量詞 + body 內部路徑
+            else:
+                total += inner              # 有界 / possessive：本身不計，body 內部仍算
+        elif op == _OP_BRANCH:
+            total += max((_max_unbounded_in_path(b) for b in av[1] if b is not None), default=0)
+        elif op == _OP_SUBPATTERN:
+            total += _max_unbounded_in_path(av[-1])          # group 內聯
+        elif _OP_ATOMIC_GROUP is not None and op == _OP_ATOMIC_GROUP:
+            total += _max_unbounded_in_path(av)
+        elif op in (_OP_ASSERT, _OP_ASSERT_NOT):
+            total = max(total, _max_unbounded_in_path(av[1]))  # lookaround 不消耗主路徑輸入
+        elif op == _OP_GROUPREF_EXISTS:
+            total += max((_max_unbounded_in_path(x) for x in av[1:] if x is not None), default=0)
+        # 其餘 atom（literal/in/any/category…）不影響計數
+    return total
 
 
 def _regex_has_polynomial_redos(pattern: str, flags: int) -> bool:
-    """是否含 ≥2 個「`.`-無界量詞」（如 `a.*a.*X`／`.*.*`／`root@.*:.*#`）——多項式 ReDoS 來源。
+    """是否含 ≥2 個序列式無界回溯量詞（多項式 ReDoS 來源）。
 
-    實測即便 2 個 `.*` 對 4096 字元失敗輸入即可凍結單執行緒 matcher（標準 re 不可中斷、輸入封頂 4096
-    不足）。僅在 pattern 將由標準 re 求值（re2 不可用或不支援）時於 upsert 階段拒絕（fail closed）；
-    re2 線性引擎可用時不限制。保守以「單一 ANY 原子的無界量詞（`*`/`+`/`{n,}`）」計數，涵蓋最常見的
-    `.*`/`.+` 序列；可能誤拒 `root@.*:.*#` 等含 2 個 `.*` 的合規 pattern（裝 re2 即不受限）。
+    保守以「量詞數」計（不分原子寬窄、不分析 separator 重疊），故亦會誤拒 `\\d+\\.\\d+`、`\\w+\\s+\\w+`
+    這類實際安全（separator 不可被前量詞吞）的 pattern——但 fail-closed 寧可誤拒不可漏放，且裝
+    google-re2（`serialwrap[redos]`）線性引擎後此限制即解除。alternation-of-singles（如
+    `(error.*|warn.*)`）走分支取 max 故不誤判。
     """
-    parsed = _sre_parse.parse(pattern, flags)
-    count = 0
-    for op, av in _walk_ast(parsed):
-        if op not in _BACKTRACK_REPEATS:
-            continue
-        _mn, mx, body = av
-        if mx == _MAXREPEAT and _is_single_any_atom(body):
-            count += 1
-            if count >= 2:
-                return True
-    return False
+    return _max_unbounded_in_path(_sre_parse.parse(pattern, flags)) >= 2
 
 
 @dataclass(frozen=True)
@@ -236,30 +251,23 @@ def validate_rule_dict(obj: dict[str, Any]) -> Rule:
             re.compile(pvalue, pflags_int)
         except re.error as exc:
             raise RuleSchemaError(f"pattern.value is not a valid regex: {exc}") from exc
-        # AST 結構分析拒絕指數 ReDoS 類（取代原 regex-on-regex heuristic，後者可被 (a|aa)+/(a?)+/
-        # (a{1,3})+ 繞過）。解析理論上不會失敗（compile 已過），保險仍轉成 schema 錯誤。
-        try:
-            risky = _regex_is_redos_risky(pvalue, pflags_int)
-        except re.error as exc:  # pragma: no cover - compile 已過，此處幾乎不會觸發
-            raise RuleSchemaError(f"pattern.value is not a valid regex: {exc}") from exc
-        _require(
-            not risky,
-            "pattern.value 含可致 catastrophic backtracking 的模糊巢狀量詞（如 (a+)+、(a|aa)+、(a?)+、"
-            "(a{1,3})+、(.*)* 等），易遭 ReDoS，請改寫為非歧義／非回溯形式",
-        )
-        # 多項式 ReDoS（#91 Codex 必修）：≥2 個序列式 `.`-無界量詞（如 a.*a.*X）在標準 re 下對長輸入即可
-        # 凍結單執行緒 matcher（輸入封頂 4096 不足、re 不可中斷）。僅當此 pattern 將落到標準 re 路徑
-        # （re2 不可用，或 pattern 用 re2 不支援的構造）才 fail-closed 拒絕；裝了 google-re2
-        # （serialwrap[redos]）線性引擎即免疫、不受此限。
+        # ReDoS fail-closed（#83 STA-4 / #91 Codex 必修）：僅當此 pattern 將落到**標準 re** 路徑
+        # 才於 upsert 結構性拒絕 catastrophic backtracking 類；re2 線性引擎可用且支援此 pattern 時，
+        # 一律不限制（re2 對任何 pattern 皆線性、無回溯）。判定以 matcher 同款 `_re2_compile`：
+        # re2 不可用，或 pattern 用 re2 不支援的構造（backref/lookaround）→ 落 re → fail-closed。
         if _re2_compile(pvalue, pflags) is None:
             try:
+                # (a) 指數類：量詞包住「含巢狀量詞 / alternation」的模糊單元（(a+)+、(a|aa)+、(.*)* …）。
+                # (b) 多項式類：≥2 個序列式無界回溯量詞（a.*a.*X、\d*\d*X、[\s\S]*[\s\S]*X …，不分原子寬窄）。
+                risky = _regex_is_redos_risky(pvalue, pflags_int)
                 poly = _regex_has_polynomial_redos(pvalue, pflags_int)
-            except re.error as exc:  # pragma: no cover - compile 已過
+            except re.error as exc:  # pragma: no cover - compile 已過，此處幾乎不會觸發
                 raise RuleSchemaError(f"pattern.value is not a valid regex: {exc}") from exc
             _require(
-                not poly,
-                "pattern.value 含 ≥2 個序列式 `.`-無界量詞（如 a.*a.*X、.*.*），標準 re 下易遭多項式 "
-                "ReDoS；請改寫，或安裝 google-re2（pip install 'serialwrap[redos]'）以線性引擎免疫",
+                not (risky or poly),
+                "pattern.value 含 catastrophic backtracking 風險（指數類如 (a+)+/(a|aa)+/(.*)*，或多項式類"
+                "如 a.*a.*X／\\d*\\d*X 等 ≥2 個序列式無界量詞），標準 re 下易遭 ReDoS；請改寫為非歧義／非"
+                "回溯形式，或安裝 google-re2（pip install 'serialwrap[redos]'）以線性引擎免疫此限制",
             )
     pattern = Pattern(kind=pkind, value=pvalue, flags=pflags)
 

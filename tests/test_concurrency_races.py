@@ -75,7 +75,12 @@ def test_safe_regex_accepted():
 
 @pytest.mark.parametrize("bad", ["(a+)+$", "(a*)*", "(.+)+", "(\\d+)+", "(ab+)*"])
 def test_nested_quantifier_regex_rejected(bad):
-    with pytest.raises(RuleSchemaError):
+    """指數類：無 re2 → fail-closed 拒絕；裝 re2 線性引擎 → 接受（不受結構限制）。"""
+    import sw_core.event_engine.schema as schema
+    if schema._re2 is None:
+        with pytest.raises(RuleSchemaError):
+            _rule(pattern={"kind": "regex", "value": bad})
+    else:
         _rule(pattern={"kind": "regex", "value": bad})
 
 
@@ -101,7 +106,12 @@ def test_contains_pattern_not_redos_checked():
     "(x+)+y",
 ])
 def test_redos_bypass_patterns_rejected(bad):
-    with pytest.raises(RuleSchemaError):
+    """指數類繞過例：無 re2 → fail-closed 拒絕；裝 re2 線性引擎 → 接受。"""
+    import sw_core.event_engine.schema as schema
+    if schema._re2 is None:
+        with pytest.raises(RuleSchemaError):
+            _rule(pattern={"kind": "regex", "value": bad})
+    else:
         _rule(pattern={"kind": "regex", "value": bad})
 
 
@@ -121,14 +131,23 @@ def test_safe_regex_patterns_still_accepted(ok):
 import sw_core.event_engine.schema as _schema_mod  # noqa: E402
 
 
-@pytest.mark.parametrize("poly", ["a.*a.*X", ".*.*", r"root@.*:.*# ", r"\d.*\d.*\d.*x"])
+@pytest.mark.parametrize("poly", [
+    "a.*a.*X", ".*.*", r"root@.*:.*# ", r"\d.*\d.*\d.*x",
+    # Codex 對抗式審查 round2：寬原子等價形 + narrow 類 + 群組形，皆須被「量詞數」計法擋下（非僅 `.`）
+    r"[\s\S]*[\s\S]*X", r"(?:.|\n)*(?:.|\n)*X", r"\d*\d*X", r"\w*\w*X", r"[^,]*[^,]*X", r"(\d*)(\d*)X",
+])
 def test_polynomial_redos_gated_by_engine(poly):
-    """≥2 個序列式 .*：標準 re 路徑（re2 不可用）upsert 即拒絕；re2 線性可用時接受（安全）。"""
+    """≥2 個序列式無界量詞：標準 re 路徑（re2 不可用）upsert 即拒絕；re2 線性可用時接受（安全）。"""
     if _schema_mod._re2 is None:
         with pytest.raises(RuleSchemaError):
             _rule(pattern={"kind": "regex", "value": poly})
     else:
         _rule(pattern={"kind": "regex", "value": poly})  # re2 線性 → 免疫 → 接受
+
+
+def test_alternation_of_single_quantifiers_not_false_rejected():
+    """alternation-of-singles（每分支僅 1 個 .*）走分支取 max → 非多項式 → 不誤拒（兩引擎皆然）。"""
+    _rule(pattern={"kind": "regex", "value": r"(error.*|warn.*)"})
 
 
 @pytest.mark.parametrize("ok", [r"root@.*# ", r"dhd_dpc.*firmware_trap", r"temp=(\d+)C", "error.*panic"])
