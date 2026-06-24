@@ -77,9 +77,13 @@ class DeviceWatcher:
 
     def _loop(self) -> None:
         while not self._stop_event.is_set():
-            self.poll_once()
-            if self._on_tick is not None:
-                self._on_tick()
+            try:
+                self.poll_once()
+                if self._on_tick is not None:
+                    self._on_tick()
+            except Exception:  # noqa: BLE001 — 單輪 poll/tick 例外不得殺死 watcher（致 hotplug 與週期 reconcile 永久停擺）（#79 STA-2）
+                import logging
+                logging.getLogger("serialwrap").warning("device watcher tick 失敗，略過本輪", exc_info=True)
             self._stop_event.wait(self._poll_interval_s)
 
     def start(self) -> None:

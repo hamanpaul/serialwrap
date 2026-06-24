@@ -3,6 +3,8 @@
 直接驅動真實 suspend_interactive/resume_interactive（bypass __init__，僅設狀態屬性），
 驗證巢狀（重疊 agent 路徑）下 human raw ownership 不再被覆寫成 None。
 """
+from __future__ import annotations
+
 import threading
 
 from sw_core.uart_io import UARTBridge
