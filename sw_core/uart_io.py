@@ -13,6 +13,7 @@ import uuid
 from typing import Any, Callable
 
 from .config import UartProfile
+from .constants import DEFERRED_INPUT_MAX_BYTES
 from .wal import WalWriter
 
 _BAUD_MAP = {
@@ -346,15 +347,17 @@ class UARTBridge:
         self._append_rx_text(data)
         if self._on_rx_data is not None:
             self._on_rx_data(data)
+        # 在持 _state_lock 下逐一寫入（#83 RACE-1）：消除「鎖外快照 fd → 釋鎖 → 另一執行緒
+        # 在 _clients pop 後 os.close(master_fd) → 此處 os.write 寫到已關閉/被重用的 fd」之
+        # use-after-close（資料誤送）窗口。所有關閉路徑都「先在鎖內把 client 移出 _clients、
+        # 再於鎖外 os.close」，故持鎖迭代 _clients 永不含已被移除者。best-effort 非阻塞 write
+        # 很快，持鎖風險低（human console 仍是 best-effort 視圖，不阻塞 RX loop）。
         with self._state_lock:
-            clients = list(self._clients.values())
-        for client in clients:
-            try:
-                # Human consoles are best-effort views. Never let a slow or idle
-                # PTY client stall the serial RX loop or block queued commands.
-                self._write_console_best_effort(client.master_fd, data)
-            except OSError:
-                continue
+            for client in list(self._clients.values()):
+                try:
+                    self._write_console_best_effort(client.master_fd, data)
+                except OSError:
+                    continue
 
     def _drain_line_buffer(self, client: ConsoleClient) -> list[str]:
         lines: list[str] = []
@@ -434,6 +437,10 @@ class UARTBridge:
                     buf = bytearray()
                     self._deferred_buffers[client.client_id] = buf
                 buf.extend(data)
+                # 上限保護（#81）：agent 命令期間 human 持續輸入不致無界成長 → OOM；
+                # 超過上限丟最舊位元組（保留最近輸入），resume 時 flush 較新的內容。
+                if len(buf) > DEFERRED_INPUT_MAX_BYTES:
+                    del buf[: len(buf) - DEFERRED_INPUT_MAX_BYTES]
             return
 
         lines, echo = self._consume_console_input(client, data)

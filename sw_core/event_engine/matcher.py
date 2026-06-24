@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Iterable, Protocol
 
 from .counter import Counter
-from .schema import Pattern, Rule, _flags_from_string
+from .schema import REGEX_MATCH_INPUT_MAX, Pattern, Rule, _flags_from_string
 
 
 @dataclass
@@ -19,6 +19,7 @@ class MatchResult:
 class PatternMatcher:
     def __init__(self, pattern: Pattern) -> None:
         self._pattern = pattern
+        self._is_regex = pattern.kind == "regex"
         if pattern.kind == "regex":
             self._re = re.compile(pattern.value, _flags_from_string(pattern.flags))
         elif pattern.kind == "contains":
@@ -28,7 +29,11 @@ class PatternMatcher:
             raise ValueError(f"unknown pattern kind: {pattern.kind}")
 
     def eval(self, line: str) -> MatchResult | None:
-        m = self._re.search(line)
+        # ReDoS runtime 防護（#83 Codex 必修）：對 user-controlled regex 把求值輸入長度封頂，使殘餘
+        # 多項式回溯成本有界，即便 schema AST 靜態分析漏放亦不致凍結單執行緒 matcher。contains（已
+        # re.escape 的字面量）無回溯風險，維持原樣不截斷以保語意。
+        target = line[:REGEX_MATCH_INPUT_MAX] if self._is_regex else line
+        m = self._re.search(target)
         if m is None:
             return None
         return MatchResult(matched_text=m.group(0), groups=list(m.groups()))

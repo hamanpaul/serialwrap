@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import itertools
 import json
 import os
 import re
@@ -10,12 +11,15 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import deque
 from typing import Any, Callable
 
 from .alias_registry import AliasRegistry
 from .auth import resolve_session_auth
 from .config import ProfileTemplate, SessionProfile
 from .constants import (
+    BG_CAPTURE_MAX_BYTES,
+    BG_CAPTURE_MAX_COUNT,
     BOOTLOADER_RX_TAIL_BYTES,
     HUMAN_ACTIVE_WINDOW_S,
     LOG_DIR,
@@ -101,11 +105,31 @@ class BackgroundCapture:
     from_seq: int
     quiet_window_s: float
     created_at: str
-    chunks: list[str] = dataclasses.field(default_factory=list)
+    chunks: "deque[str]" = dataclasses.field(default_factory=deque)
     last_seq: int = 0
     status: str = "active"
     error_code: str | None = None
     last_activity_mono: float = dataclasses.field(default_factory=time.monotonic)
+    total_bytes: int = 0          # chunks 在記憶體的累計大小（#81，增量維護避免每次 O(n) 加總）
+    dropped_chunks: int = 0       # 因環形上限丟棄的最舊 chunk 數（供 result cursor 對齊）
+
+    def add_chunk(self, chunk: str, max_bytes: int) -> None:
+        """新增一段 RX chunk 並維持記憶體環形上限（#81）。
+
+        超過 ``max_bytes`` 時丟最舊 chunk（保留尾端最新），``dropped_chunks`` 累計，
+        使 ``get_background_result`` 的絕對 chunk cursor 仍可對齊；至少保留一段，
+        避免單一超大 chunk 無限丟棄。
+        """
+        if not chunk:
+            return
+        self.chunks.append(chunk)
+        self.total_bytes += len(chunk)
+        # deque.popleft 為 O(1)；原 list.pop(0) 每丟一段需整體位移（O(n)），狂吐/高頻 RX 下會把
+        # OOM 修正路徑變成 CPU 熱點（Copilot 審查）。改用 deque 後仍維持「丟最舊、保留尾端」語意。
+        while self.total_bytes > max_bytes and len(self.chunks) > 1:
+            oldest = self.chunks.popleft()
+            self.total_bytes -= len(oldest)
+            self.dropped_chunks += 1
 
     def maybe_finalize(self) -> None:
         if self.status == "active" and time.monotonic() - self.last_activity_mono >= self.quiet_window_s:
@@ -1269,7 +1293,7 @@ class SessionManager:
                 capture = self._background.get(cmd_id)
                 if capture is None or capture.status != "active":
                     continue
-                capture.chunks.append(chunk)
+                capture.add_chunk(chunk, BG_CAPTURE_MAX_BYTES)
                 capture.last_activity_mono = time.monotonic()
                 capture.last_seq = self._wal.current_seq
 
@@ -1950,8 +1974,10 @@ class SessionManager:
                 last_seq=self._wal.current_seq,
             )
             self._background[cmd_id] = capture
+            self._evict_background_locked()
         if chunks:
-            capture.chunks.extend(chunk for chunk in chunks if chunk)
+            for c in chunks:
+                capture.add_chunk(c, BG_CAPTURE_MAX_BYTES)
         capture.last_seq = self._wal.current_seq
         capture.last_activity_mono = time.monotonic()
         capture.status = "error" if error_code else "done"
@@ -2191,6 +2217,7 @@ class SessionManager:
                 )
                 with self._lock:
                     self._background[cmd_id] = capture
+                    self._evict_background_locked()
                     session.background_cmd_ids.append(cmd_id)
                 result["background_capture_id"] = cmd_id
             return result
@@ -2910,14 +2937,42 @@ class SessionManager:
             "session": state.get("session", {}),
         }
 
+    def _evict_background_locked(self) -> None:
+        """淘汰最舊的「已終結（非 active）」background capture，使數量回到上限（#81）。
+
+        進行中的 capture 永不淘汰；全為 active 時暫時超量（待其完成後下次淘汰）。
+        須在持有 ``self._lock`` 下呼叫。
+        """
+        if len(self._background) <= BG_CAPTURE_MAX_COUNT:
+            return
+        finalized = [(cid, cap) for cid, cap in self._background.items() if cap.status != "active"]
+        finalized.sort(key=lambda kv: kv[1].created_at)
+        excess = len(self._background) - BG_CAPTURE_MAX_COUNT
+        for cid, cap in finalized[:excess]:
+            self._background.pop(cid, None)
+            # 同步從擁有者 session 的 background_cmd_ids 移除：否則該 per-session list 只在 detach 時
+            # clear，會隨長壽 daemon 無界成長，且 _on_bridge_rx 每筆 RX 都會逐一掃描它（記憶體 + per-RX
+            # CPU 累積），即使 _background 已被 BG_CAPTURE_MAX_COUNT 封頂亦然（#81 Codex 必修）。
+            owner = self._sessions.get(cap.session_id)
+            if owner is not None:
+                try:
+                    owner.background_cmd_ids.remove(cid)
+                except ValueError:
+                    pass
+
     def get_background_result(self, cmd_id: str, *, from_chunk: int = 0, limit: int = 200) -> dict[str, Any]:
         with self._lock:
             capture = self._background.get(cmd_id)
             if capture is None:
                 return {"ok": False, "error_code": "CMD_NOT_FOUND", "cmd_id": cmd_id}
             capture.maybe_finalize()
-            chunks = capture.chunks[from_chunk : from_chunk + limit]
-            next_chunk = from_chunk + len(chunks)
+            # 環形上限下最舊 dropped_chunks 段已丟棄；以絕對 chunk 索引對齊 list 位置（#81）。
+            # dropped_chunks==0（未丟棄，常態）時行為與原本完全相同。
+            start = max(from_chunk - capture.dropped_chunks, 0)
+            # chunks 為 deque（O(1) popleft），不支援切片；以 islice 取窗口（讀路徑非熱點）。
+            chunks = list(itertools.islice(capture.chunks, start, start + limit))
+            returned_from = capture.dropped_chunks + start  # 實際回傳第一段的絕對索引
+            next_chunk = returned_from + len(chunks)
             return {
                 "ok": True,
                 "cmd_id": cmd_id,
@@ -2927,6 +2982,8 @@ class SessionManager:
                 "last_seq": capture.last_seq,
                 "from_chunk": from_chunk,
                 "next_chunk": next_chunk,
+                "dropped_chunks": capture.dropped_chunks,
+                "lost": from_chunk < capture.dropped_chunks,
                 "chunks": chunks,
             }
 
