@@ -154,3 +154,47 @@ class TestFlashingBlocksInjection(_Base):
         self.assertTrue(fb.flash)
         mgr.exit_flashing("COM0")
         self.assertFalse(fb.flash)
+
+
+class TestFlashProbeCriticalGuard(_Base):
+    """#83 RACE-2 final：flash 偵測 probe 窗口（enter_flashing 之前、state 仍非 FLASHING）內，
+    destructive op（clear/release/bind）須一律回 FLASHING_BUSY，不得 detach/rebind bridge 中斷 probe。"""
+
+    def _ready_mgr(self):
+        mgr = self._mgr([self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")])
+        # 模擬 probe 窗口：session 仍 READY/ATTACHED（非 FLASHING），但已標 flash-critical。
+        mgr.get_session("COM0").state = "READY"
+        return mgr
+
+    def test_clear_rejected_during_probe_window(self):
+        mgr = self._ready_mgr()
+        mgr.mark_flash_critical("COM0")
+        self.assertEqual(mgr.clear_session("COM0").get("error_code"), "FLASHING_BUSY")
+
+    def test_release_rejected_during_probe_window(self):
+        mgr = self._ready_mgr()
+        mgr.mark_flash_critical("COM0")
+        self.assertEqual(mgr.release_device("COM0").get("error_code"), "FLASHING_BUSY")
+
+    def test_bind_rejected_during_probe_window(self):
+        mgr = self._ready_mgr()
+        mgr.mark_flash_critical("COM0")
+        self.assertEqual(
+            mgr.bind_session("COM0", "/dev/serial/by-id/new").get("error_code"), "FLASHING_BUSY"
+        )
+
+    def test_unmark_lifts_guard(self):
+        mgr = self._ready_mgr()
+        mgr.mark_flash_critical("COM0")
+        mgr.unmark_flash_critical("COM0")
+        # 解標後不再因 flash-critical 被擋（clear 於 READY+device 走正常 detach 路徑，非 FLASHING_BUSY）
+        self.assertNotEqual(mgr.clear_session("COM0").get("error_code"), "FLASHING_BUSY")
+
+    def test_other_com_not_affected(self):
+        mgr = self._mgr([
+            self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/a"),
+            self._make_profile("p", "COM1", "lab+2", "/dev/serial/by-id/b"),
+        ])
+        mgr.get_session("COM1").state = "READY"
+        mgr.mark_flash_critical("COM0")                      # 只標 COM0
+        self.assertNotEqual(mgr.clear_session("COM1").get("error_code"), "FLASHING_BUSY")

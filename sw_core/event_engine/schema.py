@@ -104,13 +104,28 @@ def _walk_ast(subpattern: Any):
 _OP_GROUPREF = _sre_constants.GROUPREF
 
 
+def _is_variable_repeat(mn: Any, mx: Any) -> bool:
+    """量詞重複次數是否「可變」（mn != mx）——可變即會回溯：`?`/`*`/`+`/`{0,1}`/`{0,N}`/`{3,5}` 皆是；
+    固定次數 `{2}`（mn==mx）為確定性、線性、不回溯。`?`/`{0,1}` 雖 mx==1，鏈接（`a?a?…aaa`）仍指數
+    回溯，故序列計數必須以 mn!=mx（而非 mx>1）判定（Codex final [critical]）。"""
+    return mn != mx
+
+
+def _repeats_at_least_twice(mn: Any, mx: Any) -> bool:
+    """量詞是否可能將其 body **重複 ≥2 次**（mx==MAXREPEAT 或 mx>=2，含固定 `{N}` N>=2）。
+
+    用於指數判定：重複一個「模糊 body（含可變量詞或 alternation）」≥2 次即指數爆炸——含**固定** `{N}`
+    重複（`(a?){30}a{30}` 的外層 `{30}` 雖固定，仍把可變的 `a?` 序列化 30 次 → 2^30；Codex final [critical]）。"""
+    return mx == _MAXREPEAT or (isinstance(mx, int) and mx >= 2)
+
+
 def _count_backtrack_repeats(parsed: Any) -> int:
-    """「會回溯且重複>1 次」的量詞數（含無界 `*`/`+`/`{n,}` 與大量有界 `{0,4096}`，後者亦可凍結）。"""
+    """會回溯（可變次數）的量詞數。`?`/`*`/`+`/`{0,1}`/`{0,N}`/`{m,n}` 皆計；固定 `{2}` 不計。"""
     n = 0
     for op, av in _walk_ast(parsed):
         if op in _BACKTRACK_REPEATS:
-            _mn, mx, _body = av
-            if mx == _MAXREPEAT or (isinstance(mx, int) and mx > 1):
+            mn, mx, _body = av
+            if _is_variable_repeat(mn, mx):
                 n += 1
     return n
 
@@ -128,8 +143,8 @@ def _has_ambiguous_quantified_body(parsed: Any) -> bool:
     """
     for op, av in _walk_ast(parsed):
         if op in _BACKTRACK_REPEATS:
-            _mn, mx, body = av
-            if mx == _MAXREPEAT or (isinstance(mx, int) and mx > 1):
+            mn, mx, body = av
+            if _repeats_at_least_twice(mn, mx):
                 if any(bop in _BACKTRACK_REPEATS or bop == _OP_BRANCH for bop, _b in _walk_ast(body)):
                     return True
     return False

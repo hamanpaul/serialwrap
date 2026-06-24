@@ -346,6 +346,10 @@ class SessionManager:
         self._reprobe_probe_locks: dict[str, threading.Lock] = {}
         self._reprobe_workers: list[threading.Thread] = []
         self._released_by_ids: set[str] = set()
+        # flash 偵測 probe 進行中的 COM（#83 RACE-2 final）：probe 已開 bridge flash_mode gate 擋 console，
+        # 但 enter_flashing 之前 session.state 仍是 READY/ATTACHED，destructive op（clear/release/bind）只
+        # 守 state==FLASHING → 探測窗口內仍可 detach/rebind bridge 中斷 probe。此 set 在 probe 期間封鎖。
+        self._flash_critical_coms: set[str] = set()
         self._loaded_released: dict[str, dict[str, str | None]] = {}
         self._background: dict[str, BackgroundCapture] = {}
         self._interactive: dict[str, InteractiveLease] = {}
@@ -898,9 +902,10 @@ class SessionManager:
             session = self.get_session(selector)
             if session is None:
                 return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
-            # FLASHING 期間不得 detach bridge——否則會在 MCU 燒錄途中切斷 transport、寫壞韌體（#69 r5）。
-            # 與 cmd submit / interactive 既有的 FLASHING_BUSY 守法一致；須先 exit_flashing。
-            if session.state == "FLASHING":
+            # FLASHING 或 flash probe 臨界區不得 detach bridge——否則會在 MCU 燒錄/偵測途中切斷 transport、
+            # 寫壞韌體或汙染 probe（#69 r5；#83 RACE-2 final）。與 cmd submit / interactive 既有 FLASHING_BUSY
+            # 守法一致；須先 exit_flashing 或待 probe 結束。
+            if self._flash_busy_locked(session):
                 return {"ok": False, "error_code": "FLASHING_BUSY", "selector": session.profile.com, "session": session.to_public_dict()}
             if session.state == "RELEASED" or session.profile.device_by_id in self._released_by_ids:
                 return {"ok": True, "released": True, "session": session.to_public_dict()}
@@ -920,8 +925,9 @@ class SessionManager:
             session = self.get_session(selector)
             if session is None:
                 return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
-            # FLASHING 期間不得 release/detach——避免切斷正在進行的 MCU 燒錄 transport（#69 r5）。須先 exit_flashing。
-            if session.state == "FLASHING":
+            # FLASHING 或 flash probe 臨界區不得 release/detach——避免切斷進行中的燒錄/偵測 transport
+            # （#69 r5；#83 RACE-2 final）。須先 exit_flashing 或待 probe 結束。
+            if self._flash_busy_locked(session):
                 return {"ok": False, "error_code": "FLASHING_BUSY", "selector": session.profile.com, "session": session.to_public_dict()}
             if session.state == "RELEASED":
                 return {"ok": True, "already_released": True, "session": session.to_public_dict()}
@@ -939,6 +945,20 @@ class SessionManager:
             public = session.to_public_dict()
         self._save_state()
         return {"ok": True, "session": public, "closed_consoles": closed_consoles, "aborted_cmd": aborted_cmd}
+
+    def mark_flash_critical(self, com: str) -> None:
+        """標記 COM 進入 flash 偵測 probe 臨界區（#83 RACE-2 final）：destructive op 一律 FLASHING_BUSY。"""
+        with self._lock:
+            self._flash_critical_coms.add(com)
+
+    def unmark_flash_critical(self, com: str) -> None:
+        """解除 flash probe 臨界區標記。"""
+        with self._lock:
+            self._flash_critical_coms.discard(com)
+
+    def _flash_busy_locked(self, session: "SessionRuntime") -> bool:
+        """session 是否處於 flash 臨界區（FLASHING 狀態或 probe 進行中）——須在 self._lock 內呼叫。"""
+        return session.state == "FLASHING" or session.profile.com in self._flash_critical_coms
 
     def enter_flashing(self, selector: str) -> dict:
         """進入 FLASHING：只標狀態 + 擋命令，**不** detach bridge（daemon 仍是 real device 唯一 reader）。"""
@@ -1061,8 +1081,9 @@ class SessionManager:
             session = self.get_session(selector)
             if session is None:
                 return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
-            # FLASHING 期間不得 rebind——rebind 會 detach 舊 bridge、切斷燒錄 transport（#69 r5）。須先 exit_flashing。
-            if session.state == "FLASHING":
+            # FLASHING 或 flash probe 臨界區不得 rebind——rebind 會 detach 舊 bridge、切斷燒錄/偵測 transport
+            # （#69 r5；#83 RACE-2 final）。須先 exit_flashing 或待 probe 結束。
+            if self._flash_busy_locked(session):
                 return {"ok": False, "error_code": "FLASHING_BUSY", "selector": session.profile.com, "session": session.to_public_dict()}
             for other in self._sessions.values():
                 if other.session_id != session.session_id and other.profile.device_by_id == device_by_id:

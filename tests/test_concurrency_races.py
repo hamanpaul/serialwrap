@@ -91,6 +91,8 @@ def test_contains_pattern_not_redos_checked():
     r"^(?:ab|abab)*X", r"(ab)*(ab)*X",                     # round4：多字元重複單元
     "^[^\x01\x07 a0Y]*[^\x01\x07 a0Y]*Y$",                 # round5：負類排除固定字元
     r"\w+\s+\w+", r"\d+\.\d+", r"(error.*|warn.*)",        # round2/3 過往「邊界」O(n^2)/多量詞 → 保守拒
+    "a?" * 5 + "a" * 5,                                    # final：optional-quantifier chain（mx==1 鏈接指數）
+    r"(a?){5}a{5}",                                        # final：固定 {N} 重複可變 body → 序列化指數
 ])
 def test_redos_suspicious_rejected_without_re2(bad):
     if _schema_mod._re2 is None:
@@ -126,6 +128,7 @@ def test_redos_re2_incompatible_always_rejected(bad):
 @pytest.mark.parametrize("ok", [
     r"temp=(\d+)C", r"root@.*# ", r"dhd_dpc.*firmware_trap", r"Kernel panic - not syncing: ",
     r"error|warn|fail", r"\d{3,5}", r"(abc)+", r"Kernel panic", r"a+$", r".*X",
+    r"(abc){5}", r"x{3}y{3}",        # final：固定 {N} 重複但 body 非模糊（無可變量詞/alternation）→ 線性安全
 ])
 def test_redos_safe_single_quantifier_accepted_both_engines(ok):
     _rule(pattern={"kind": "regex", "value": ok})
