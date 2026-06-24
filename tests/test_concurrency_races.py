@@ -10,7 +10,13 @@ import threading
 import pytest
 
 import sw_core.uart_io as uio
-from sw_core.event_engine.schema import RuleSchemaError, validate_rule_dict
+from sw_core.event_engine.matcher import PatternMatcher
+from sw_core.event_engine.schema import (
+    REGEX_MATCH_INPUT_MAX,
+    Pattern,
+    RuleSchemaError,
+    validate_rule_dict,
+)
 from sw_core.wal import WalWriter
 
 
@@ -80,3 +86,51 @@ def test_overlong_regex_rejected():
 
 def test_contains_pattern_not_redos_checked():
     _rule(pattern={"kind": "contains", "value": "(a+)+"})  # contains 非 regex，不做 ReDoS 檢查
+
+
+# ── STA-4 強化（Codex 必修）：原 heuristic 可被以下模式繞過，AST 結構分析須一律拒絕 ──────────
+@pytest.mark.parametrize("bad", [
+    "(a|aa)+$",      # alternation 重疊分支（原 heuristic 無 +/* 在群組內 → 漏放）
+    "(a?)+$",        # optional 重複
+    "(a{1,3})+$",    # bounded-range 重複
+    "(a|aa)*",
+    "(.*)*",
+    "(.*)+",
+    "((ab)*)*",      # 巢狀群組量詞
+    "(\\d|\\d\\d)+",
+    "(x+)+y",
+])
+def test_redos_bypass_patterns_rejected(bad):
+    with pytest.raises(RuleSchemaError):
+        _rule(pattern={"kind": "regex", "value": bad})
+
+
+@pytest.mark.parametrize("ok", [
+    r"temp=(\d+)C",       # 群組未被再施量詞 → 安全
+    r"root@.*# ",         # 單一 .* → 安全
+    r"error|warn|fail",   # 頂層 alternation（未被量詞包住）→ 安全
+    r"\d{3,5}",           # 單一 bounded repeat → 安全
+    r"(abc)+",            # 量詞群組但單元固定、無歧義 → 安全
+    r"Kernel panic",
+])
+def test_safe_regex_patterns_still_accepted(ok):
+    _rule(pattern={"kind": "regex", "value": ok})  # 不得誤拒
+
+
+# ── ReDoS runtime 防護：matcher 對 regex 求值輸入長度封頂 ───────────────────────────────
+def test_matcher_caps_regex_input_length():
+    """超過 REGEX_MATCH_INPUT_MAX 的尾端不參與比對（殘餘多項式回溯成本有界）。"""
+    pm = PatternMatcher(Pattern(kind="regex", value="needle", flags=""))
+    # needle 只出現在封頂之後 → 被截斷、查不到
+    tail_only = "x" * REGEX_MATCH_INPUT_MAX + "needle"
+    assert pm.eval(tail_only) is None
+    # 封頂之內的 match 仍正常命中
+    within = "a needle here" + "x" * REGEX_MATCH_INPUT_MAX
+    assert pm.eval(within) is not None
+
+
+def test_matcher_contains_not_capped():
+    """contains（已 escape 的字面量、無回溯風險）不截斷，長行尾端仍可命中。"""
+    pm = PatternMatcher(Pattern(kind="contains", value="needle", flags=""))
+    tail_only = "x" * REGEX_MATCH_INPUT_MAX + "needle"
+    assert pm.eval(tail_only) is not None
