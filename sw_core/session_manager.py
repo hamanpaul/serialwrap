@@ -512,7 +512,9 @@ class SessionManager:
         tpl: ProfileTemplate,
         device_by_id: str,
     ) -> SessionRuntime:
-        """從 template 建立新的動態 session（須在 self._lock 內呼叫）。"""
+        """從 template 建立新的動態 session（須在 self._lock 內呼叫）。
+        注意：profile_source 由呼叫方（_attach_by_id_dynamic）在回傳後設定，此處預設值不具權威性。
+        """
         com = self._next_dynamic_com()
         act_no = len(self._sessions) + 1
         alias = f"{tpl.profile_name}+{act_no}"
@@ -1599,6 +1601,12 @@ class SessionManager:
                 session.attached_real_path = None
             self._on_detached(session.session_id)
 
+    def _template_by_name(self, name: str) -> ProfileTemplate | None:
+        for t in self._templates:
+            if t.profile_name == name:
+                return t
+        return None
+
     def _default_passthrough_template(self) -> ProfileTemplate | None:
         """auto-detect 失敗時的通用 passthrough fallback。
 
@@ -1625,30 +1633,38 @@ class SessionManager:
                 return
             real_path = dev.real_path
 
-        # 先用預設 UART 參數開 bridge 做 probe
-        default_uart = UartProfile()
-        probe_bridge = UARTBridge(
-            "PROBE",
-            real_path,
-            default_uart,
-            self._wal,
-        )
-        detected: ProfileTemplate | None = None
-        try:
-            probe_bridge.start()
-            detected = detect_template(probe_bridge, self._templates)
-        except Exception:
-            pass
-        finally:
+        # 四層優先序（#95）：pin > sticky > detect > fallback。pin/sticky 命中跳過 probe。
+        tpl: ProfileTemplate | None = None
+        source: str | None = None
+        pin_name = self._profile_pins.get(by_id)
+        if pin_name:
+            tpl = self._template_by_name(pin_name)
+            if tpl is not None:
+                source = "pin"
+        if tpl is None:
+            sticky_name = self._profile_detected.get(by_id)
+            if sticky_name:
+                tpl = self._template_by_name(sticky_name)
+                if tpl is not None:
+                    source = "sticky"
+        if tpl is None:
+            default_uart = UartProfile()
+            probe_bridge = UARTBridge("PROBE", real_path, default_uart, self._wal)
+            detected: ProfileTemplate | None = None
             try:
-                probe_bridge.stop()
+                probe_bridge.start()
+                detected = detect_template(probe_bridge, self._templates)
             except Exception:
                 pass
-
-        # 找 passthrough fallback（通用 fallback 須為非 command-capable 的 passthrough，
-        # 避免 uboot-template 這類 command-capable 的特定 passthrough 搶走通用 fallback）
-        passthrough = self._default_passthrough_template()
-        tpl = detected or passthrough
+            finally:
+                try:
+                    probe_bridge.stop()
+                except Exception:
+                    pass
+            if detected is not None:
+                tpl, source = detected, "detected"
+        if tpl is None:
+            tpl, source = self._default_passthrough_template(), "fallback"
         if tpl is None:
             return
 
@@ -1657,6 +1673,7 @@ class SessionManager:
             if by_id not in self._devices or len(self._sessions) >= self._max_sessions:
                 return
             session = self._session_from_template(tpl, by_id)
+            session.profile_source = source
 
         # 用正確 uart 參數重新開 bridge
         profile = session.profile

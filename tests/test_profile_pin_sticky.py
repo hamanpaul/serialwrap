@@ -59,3 +59,83 @@ class TestPersistence(_Base):
         sess = mgr._sessions["prpl-template:COM0"]
         self.assertEqual(sess.profile_source, "yaml-target")
         self.assertEqual(sess.to_public_dict()["profile_source"], "yaml-target")
+
+
+class TestPriority(_Base):
+    def _mgr_with_templates(self):
+        from sw_core.config import ProfileTemplate
+        prpl = ProfileTemplate(profile_name="prpl-template", platform="prpl",
+                               prompt_regex="root@prplOS", login_regex="", password_regex="",
+                               ready_probe="echo __R__", uart=UartProfile())
+        others = ProfileTemplate(profile_name="others-template", platform="passthrough",
+                                 prompt_regex=".*", login_regex="", password_regex="",
+                                 ready_probe="", uart=UartProfile())
+        mgr = SessionManager([], WalWriter(wal_dir=self._tmp.name),
+                             templates=[prpl, others],
+                             on_ready=lambda _sid: None, on_detached=lambda _sid: None)
+        return mgr
+
+    def test_pin_skips_probe(self):
+        from sw_core.session_manager import DeviceInfo
+        mgr = self._mgr_with_templates()
+        key = "/dev/serial/by-id/usb-X"
+        mgr._devices[key] = DeviceInfo(by_id=key, real_path="/dev/ttyUSB9")
+        mgr._profile_pins[key] = "prpl-template"
+        import sw_core.session_manager as m
+        # 監看 UARTBridge 建構：pin 命中時不應建構 "PROBE" bridge（load-bearing）
+        constructed = []
+        orig_bridge = m.UARTBridge
+
+        def _spy(name, *a, **k):
+            constructed.append(name)
+            return orig_bridge(name, *a, **k)
+
+        m.UARTBridge = _spy
+        self.addCleanup(lambda: setattr(m, "UARTBridge", orig_bridge))
+        called = {"n": 0}
+        orig_detect = m.detect_template
+        m.detect_template = lambda *a, **k: called.__setitem__("n", called["n"] + 1) or None
+        self.addCleanup(lambda: setattr(m, "detect_template", orig_detect))
+        try:
+            mgr._attach_by_id_dynamic(key)
+        except Exception:
+            pass
+        sess = next((s for s in mgr._sessions.values() if s.profile.device_by_id == key), None)
+        self.assertIsNotNone(sess)
+        self.assertEqual(sess.profile_source, "pin")
+        self.assertNotIn("PROBE", constructed)   # 關鍵：pin 命中不建 PROBE bridge（load-bearing）
+        self.assertEqual(called["n"], 0)
+
+    def test_sticky_skips_probe(self):
+        from sw_core.session_manager import DeviceInfo
+        mgr = self._mgr_with_templates()
+        key = "/dev/serial/by-id/usb-Y"
+        mgr._devices[key] = DeviceInfo(by_id=key, real_path="/dev/ttyUSB8")
+        mgr._profile_detected[key] = "prpl-template"
+        import sw_core.session_manager as m
+        # 監看 UARTBridge 建構：sticky 命中時不應建構 "PROBE" bridge（load-bearing）
+        constructed = []
+        orig_bridge = m.UARTBridge
+
+        def _spy(name, *a, **k):
+            constructed.append(name)
+            return orig_bridge(name, *a, **k)
+
+        m.UARTBridge = _spy
+        self.addCleanup(lambda: setattr(m, "UARTBridge", orig_bridge))
+        called = {"n": 0}
+        orig_detect = m.detect_template
+        m.detect_template = lambda *a, **k: called.__setitem__("n", called["n"] + 1) or None
+        self.addCleanup(lambda: setattr(m, "detect_template", orig_detect))
+        try:
+            mgr._attach_by_id_dynamic(key)
+        except Exception:
+            pass
+        sess = next((s for s in mgr._sessions.values() if s.profile.device_by_id == key), None)
+        self.assertEqual(sess.profile_source, "sticky")
+        self.assertNotIn("PROBE", constructed)   # 關鍵：sticky 命中不建 PROBE bridge（load-bearing）
+        self.assertEqual(called["n"], 0)
+
+    def test_unknown_pin_falls_through(self):
+        mgr = self._mgr_with_templates()
+        self.assertIsNone(mgr._template_by_name("no-such"))
