@@ -25,6 +25,7 @@
 
 ### Added
 
+- 動態裝置 profile 持久化（#95）：`session pin`/`unpin` 手動釘選 + 偵測達 READY 後自動 sticky，根治 daemon 重啟後 profile 漂移；`session list` 新增 `profile_source` 欄位（pin/sticky/detected/fallback/yaml-target）。
 - **`serialwrap setup` 在 WSL 上主動啟用 systemd（#76）**：新增 `ensure_wsl_systemd()`——偵測到 WSL 但 systemd 尚未啟用時，合併寫入 `/etc/wsl.conf` `[boot] systemd=true`（保留既有段落／鍵，經 staging + `sudo install`，不破壞性丟棄無法解析內容），並早退提示使用者於 Windows 端 `wsl --shutdown` 重啟後再跑 `setup --system`。非 WSL 或 systemd 已啟用 → no-op。新增 `tests/test_wsl_systemd.py` 與 system unit run-as-user 測試。
 
 

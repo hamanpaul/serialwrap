@@ -242,3 +242,65 @@ class TestDeviceKey(_Base):
         resp = mgr.pin_session(bypath, "prpl-template")
         self.assertTrue(resp["ok"])
         self.assertEqual(mgr._profile_pins[bypath], "prpl-template")
+
+
+class TestIntegration(_Base):
+    def test_sticky_written_then_reused_after_restart(self):
+        prpl = ProfileTemplate(profile_name="prpl-template", platform="prpl",
+                               prompt_regex="x", login_regex="", password_regex="",
+                               ready_probe="echo __R__", uart=UartProfile())
+        mgr = SessionManager([], WalWriter(wal_dir=self._tmp.name), templates=[prpl],
+                             on_ready=lambda _sid: None, on_detached=lambda _sid: None)
+        key = "/dev/serial/by-id/usb-INT"
+        mgr._devices[key] = DeviceInfo(by_id=key, real_path="/dev/ttyUSB0")
+        with mgr._lock:
+            mgr._maybe_persist_sticky(by_id=key, profile_name="prpl-template",
+                                      source="detected", real_path="/dev/ttyUSB0")
+        # 重啟：新 SessionManager 載入同 STATE_PATH
+        mgr2 = SessionManager([], WalWriter(wal_dir=self._tmp.name), templates=[prpl],
+                              on_ready=lambda _sid: None, on_detached=lambda _sid: None)
+        self.assertEqual(mgr2._profile_detected.get(key), "prpl-template")
+        import sw_core.session_manager as m
+        called = {"n": 0}
+        orig = m.detect_template
+        m.detect_template = lambda *a, **k: called.__setitem__("n", called["n"] + 1) or None
+        self.addCleanup(lambda: setattr(m, "detect_template", orig))
+        mgr2._devices[key] = DeviceInfo(by_id=key, real_path="/dev/ttyUSB0")
+        try:
+            mgr2._attach_by_id_dynamic(key)
+        except Exception:
+            pass
+        sess = next((s for s in mgr2._sessions.values() if s.profile.device_by_id == key), None)
+        self.assertEqual(sess.profile_source, "sticky")
+        self.assertEqual(called["n"], 0)
+
+    def test_sticky_idempotent_no_redundant_save(self):
+        prpl = ProfileTemplate(profile_name="prpl-template", platform="prpl",
+                               prompt_regex="x", login_regex="", password_regex="",
+                               ready_probe="echo __R__", uart=UartProfile())
+        mgr = SessionManager([], WalWriter(wal_dir=self._tmp.name), templates=[prpl],
+                             on_ready=lambda _sid: None, on_detached=lambda _sid: None)
+        key = "/dev/serial/by-id/usb-IDEM"
+        mgr._devices[key] = DeviceInfo(by_id=key, real_path="/dev/ttyUSB0")
+        with mgr._lock:
+            mgr._maybe_persist_sticky(by_id=key, profile_name="prpl-template",
+                                      source="detected", real_path="/dev/ttyUSB0")
+        calls = {"n": 0}
+        orig_save = mgr._save_state
+        mgr._save_state = lambda: calls.__setitem__("n", calls["n"] + 1)
+        self.addCleanup(lambda: setattr(mgr, "_save_state", orig_save))
+        with mgr._lock:  # 第二次同值
+            mgr._maybe_persist_sticky(by_id=key, profile_name="prpl-template",
+                                      source="detected", real_path="/dev/ttyUSB0")
+        self.assertEqual(calls["n"], 0)  # 同值不應再 _save_state
+
+    def test_cli_pin_unpin_parser_args(self):
+        # 鎖定 CLI argparse → args 的 selector/profile 對應（service 單元測試未覆蓋此層）
+        import sw_core.cli as cli_mod
+        # 找出 parser 建構函式：cli.py 應有 build_parser() 或類似；用實際存在的那個
+        parser = cli_mod.build_parser()
+        ns = parser.parse_args(["session", "pin", "--selector", "COM0", "--profile", "prpl-template"])
+        self.assertEqual(ns.selector, "COM0")
+        self.assertEqual(ns.profile, "prpl-template")
+        ns2 = parser.parse_args(["session", "unpin", "--selector", "COM0"])
+        self.assertEqual(ns2.selector, "COM0")
