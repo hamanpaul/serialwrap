@@ -79,9 +79,14 @@ class TestWinDeviceName(unittest.TestCase):
 
 class TestBackendSelection(unittest.TestCase):
     def test_explicit_posix(self) -> None:
-        port = open_serial_port("/dev/null", UartProfile(), backend="posix")
-        self.assertEqual(type(port).__name__, "_PosixSerialPort")
-        self.assertIsInstance(port, SerialPort)
+        if os.name == "posix":
+            port = open_serial_port("/dev/null", UartProfile(), backend="posix")
+            self.assertEqual(type(port).__name__, "_PosixSerialPort")
+            self.assertIsInstance(port, SerialPort)
+        else:
+            # 非 POSIX 強選 posix 後端須明確拒絕（避免回傳會在 open()/configure() 才 NameError 的物件）（#84 review）。
+            with self.assertRaises(OSError):
+                open_serial_port("COM8", UartProfile(), backend="posix")
 
     def test_explicit_pyserial(self) -> None:
         port = open_serial_port("COM8", UartProfile(), backend="pyserial")
@@ -89,6 +94,13 @@ class TestBackendSelection(unittest.TestCase):
         self.assertIsInstance(port, SerialPort)
         # 尚未 open → 無可多工 fd。
         self.assertIsNone(port.fileno())
+
+    def test_posix_backend_rejected_on_non_posix(self) -> None:
+        # 非 POSIX 平台強選 posix 後端 → factory 直接回明確 OSError（#84 review），
+        # 而非回傳會在 open()/configure() 才 NameError 的物件。以 patch os.name 在任何平台驗證。
+        with mock.patch.object(sp.os, "name", "nt"):
+            with self.assertRaises(OSError):
+                open_serial_port("COM8", UartProfile(), backend="posix")
 
     def test_env_override(self) -> None:
         old = os.environ.get("SERIALWRAP_SERIAL_BACKEND")
@@ -490,6 +502,28 @@ class TestUARTBridgeWindowsPath(unittest.TestCase):
         self.assertIsNone(b._serial)
         self.assertIsNone(b._serial_fd)
 
+    def test_console_send_handles_partial_socket_send(self) -> None:
+        # non-blocking socket send() 可能只送部分 bytes；_console_send 必須迴圈送完、不截斷（#84 review）。
+        from sw_core.uart_io import ConsoleClient
+
+        class _PartialSock:
+            def __init__(self) -> None:
+                self.got = bytearray()
+
+            def send(self, data) -> int:
+                chunk = bytes(data[:1])  # 每次只送 1 byte 模擬 partial send
+                self.got.extend(chunk)
+                return len(chunk)
+
+        sock = _PartialSock()
+        client = ConsoleClient(
+            client_id="c", label="c", master_fd=-1, slave_fd=-1,
+            slave_path="127.0.0.1:1", attached_at=0.0, sock=sock,
+        )
+        b = self._bridge()
+        b._console_send(client, b"abcdef")
+        self.assertEqual(bytes(sock.got), b"abcdef")
+
 
 @unittest.skipUnless(os.name == "posix" and hasattr(os, "openpty"), "需 POSIX + PTY 跑真 UARTBridge")
 class TestUARTBridgePosixStartStopInvariant(unittest.TestCase):
@@ -727,6 +761,17 @@ class TestUARTBridgeTcpConsole(unittest.TestCase):
             self.assertIn(b"during-agent", _recv_until(s, b"during-agent", 2.0))
             # 連線全程保持
             s.sendall(b"still-alive\r")
+        finally:
+            s.close()
+
+    def test_vtty_alive_true_for_tcp_console(self) -> None:
+        # TCP console（#84 review）：vtty 是 "host:port"，os.path.exists 永遠 False；snapshot 應改以
+        # listener 是否在監聽判定 vtty_alive，避免 SessionManager 誤判 VTTY_STALE/SESSION_NOT_READY。
+        s = self._connect()
+        try:
+            snap = self._bridge.snapshot()
+            self.assertTrue(snap["console_endpoint"])
+            self.assertTrue(snap["vtty_alive"])
         finally:
             s.close()
 

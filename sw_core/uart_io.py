@@ -475,7 +475,20 @@ class UARTBridge:
         （socket 斷線另由 console loop 的 recv b"" 偵測並 drop）。
         """
         if client.sock is not None:
-            client.sock.send(payload)  # 非阻塞 best-effort；OSError 交呼叫端處理
+            # non-blocking socket 的 send() 可能只送出部分 bytes：必須迴圈推進 offset，
+            # 否則 RX fan-out / 本地回顯會在 partial send 時靜默截斷遺失尾端（#84 review）。
+            # 緩衝滿（BlockingIOError）時停止、丟棄剩餘（best-effort，與 PTY 路徑語意一致）；
+            # 其他 OSError（斷線）上拋由呼叫端 except OSError 吸收（斷線另由 recv b"" drop）。
+            view = memoryview(payload)
+            sent = 0
+            while sent < len(payload):
+                try:
+                    n = client.sock.send(view[sent:])
+                except BlockingIOError:
+                    break
+                if n <= 0:
+                    break
+                sent += n
         else:
             self._write_console_best_effort(client.master_fd, payload)
 
@@ -952,6 +965,8 @@ class UARTBridge:
                     primary = client.slave_path
             interactive_owner = self._interactive_owner
             last_human_input_at = self._last_human_input_at
+            console_endpoint = self._console_endpoint
+            console_listener_alive = self._console_listener is not None
         serial_alive = False
         if serial_fd is not None:
             try:
@@ -962,7 +977,13 @@ class UARTBridge:
         elif port is not None:
             # Windows/pyserial：無整數 fd，改問 port 是否仍開啟（#84 PORT-1）。
             serial_alive = port.is_alive()
-        vtty_alive = bool(primary and os.path.exists(primary))
+        if console_endpoint is not None:
+            # Windows TCP console（#84 PORT-2）：primary 是 "host:port"（非檔案路徑），os.path.exists
+            # 永遠 False 會讓 SessionManager 誤判 VTTY_STALE/SESSION_NOT_READY；改以 listener 是否
+            # 仍在監聽判定 console 是否可達（#84 review）。
+            vtty_alive = console_listener_alive
+        else:
+            vtty_alive = bool(primary and os.path.exists(primary))
         return {
             "com": self.com,
             "device_path": self.device_path,
@@ -973,5 +994,5 @@ class UARTBridge:
             "last_human_input_at": last_human_input_at,
             "consoles": consoles,
             "running": bool(self._thread and self._thread.is_alive()),
-            "console_endpoint": self._console_endpoint,  # Windows TCP console 端點；POSIX 為 None（#84 PORT-2）
+            "console_endpoint": console_endpoint,  # Windows TCP console 端點；POSIX 為 None（#84 PORT-2）
         }

@@ -231,6 +231,8 @@ serialwrap 是讓多個 agent 與多個 human console 共用**同一條 UART** �
 
 > serialwrap 原生 MCU 韌體升級端點 `/dev/ttyMCU`（daemon 維持 tty 唯一 reader、sync-probe 自動認線、FLASHING 仲裁）的真機驗證程序與已知陷阱。
 
+> **平台範圍（#84）**：`/dev/ttyMCU` PTY-bridge（含 sync-probe、baud 鏡射）為 **POSIX-only**。**Windows 不走此模型也不需要**——Windows 韌體升級工具直接獨佔開啟 UART `COMx` 自行燒錄；serialwrap 在 Windows flash 只需 **detach（release）該 COM port**（關閉自身 handle、燒完 reclaim），對應 **#54 device release/handoff** 語意（非 #55）。底層 `stop()`→`close()` / `start()`→re-open primitive 已可用；完整 `device release`/`attach` 編排待 Windows daemon（#84 PORT-4）。
+
 - **隔離跑法（不動 prod / 人類 minicom）**：prod daemon 不停；用獨立 socket/state/run 的 **throwaway daemon** 跑待測程式碼（`SERIALWRAP_RUN_DIR` / `_STATE_DIR` / `_BY_ID_DIR` 等 env）。關鍵：`SERIALWRAP_BY_ID_DIR` 指向只放「MCU 線（FTDI）by-id symlink」的 sandbox 目錄，否則動態偵測會抓到被人類 minicom 佔住的 DUT console（ttyUSB0）造成 two-reader 衝突。
 - **進 BSL**：DUT console（如 CH340/ttyUSB0）下 GPIO BSL-invoke（unbind `1fbf0300.serial`、GPIO13/14 設 in、GPIO31/54 reset）。**長指令會在 UART console 被截斷 → 必須逐行短指令送**（`tmux send-keys -l` 每行 +Enter +sleep，勿用 `;` 串長行）。
 - **燒錄**：`ocp-mcu-upgrade -d <RUN_DIR>/dev/ttyMCU -b 115200 -t 8 -e -s -i <fw.bin>` → 期望 `Return error code : 0x0`；燒後 session 自動恢復 `ATTACHED`、daemon 不死、其他 COM 不受影響。

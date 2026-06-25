@@ -384,4 +384,11 @@ def open_serial_port(
     chosen = _select_backend(backend)
     if chosen == "pyserial":
         return _PySerialPort(device_path, profile)
+    if os.name != "posix":
+        # _PosixSerialPort.open()/configure() 會引用僅在 os.name=="posix" 才 import 的
+        # termios/fcntl/os.O_NOCTTY；在非 POSIX 平台強選 posix 後端，與其回傳一個會在使用時
+        # 才 NameError/AttributeError 的物件，不如在 factory 就回明確 OSError（#84 review）。
+        raise OSError(
+            "POSIX/termios 序列埠後端在此平台不可用（缺 termios/fcntl）；請改用 pyserial 後端"
+        )
     return _PosixSerialPort(device_path, profile)
