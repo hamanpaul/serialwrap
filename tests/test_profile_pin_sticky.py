@@ -213,6 +213,15 @@ class TestPinUnpin(_Base):
         self.assertNotIn(key, mgr._profile_pins)
         self.assertEqual(mgr._profile_detected.get(key), "op3-template")
 
+    def test_pin_explicit_target_by_byid_rejected(self):
+        # I1 回歸：用 yaml-target 裝置自己的 by-id 當 selector 也須擋（不可繞過 explicit guard）
+        mgr = self._mgr()
+        key = "/dev/serial/by-id/usb-FTDI_A-if00-port0"  # = _profile() 的 device_by_id（COM0 yaml-target）
+        mgr._devices[key] = DeviceInfo(by_id=key, real_path="/dev/ttyUSB0")
+        resp = mgr.pin_session(key, "prpl-template")
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error_code"], "PROFILE_IS_EXPLICIT")
+
 
 class TestRpc(_Base):
     def test_rpc_pin_unpin_routed(self):

@@ -222,8 +222,8 @@ class SessionRuntime:
     released_by: str | None = None
     released_at: str | None = None
     released_reason: str | None = None
-    # 動態 profile 來源（#95）：pin / sticky / detected / fallback / yaml-target
-    profile_source: str = "detected"
+    # 動態 profile 來源（#95）：unknown / pin / sticky / detected / fallback / yaml-target
+    profile_source: str = "unknown"
     # MCU 燒錄狀態（issue #55）：僅 runtime transient，不寫 _save_state / to_public_dict
     flash_prev_state: str | None = None
     # recovery lease stash（Phase B issue #44）
@@ -1189,11 +1189,11 @@ class SessionManager:
             for sid, s in self._sessions.items():
                 if selector in (sid, s.profile.com, s.profile.alias):
                     return s.profile.device_by_id, s
-            if selector in self._devices:
-                return selector, None
             for sid, s in self._sessions.items():
                 if s.profile.device_by_id == selector:
                     return selector, s
+            if selector in self._devices:
+                return selector, None
         return (selector if selector.startswith("/dev/") else None), None
 
     def pin_session(self, selector: str, profile_name: str) -> dict[str, Any]:
