@@ -172,3 +172,43 @@ class TestStickyWrite(_Base):
         mgr._maybe_persist_sticky(by_id=key, profile_name="prpl-template",
                                   source="detected", real_path="/dev/ttyUSB1")  # attach 當時
         self.assertNotIn(key, mgr._profile_detected)
+
+
+class TestPinUnpin(_Base):
+    def _mgr(self):
+        prpl = ProfileTemplate(profile_name="prpl-template", platform="prpl",
+                               prompt_regex="root@prplOS", login_regex="", password_regex="",
+                               ready_probe="echo __R__", uart=UartProfile())
+        return SessionManager([_profile()], WalWriter(wal_dir=self._tmp.name),
+                              templates=[prpl],
+                              on_ready=lambda _sid: None, on_detached=lambda _sid: None)
+
+    def test_pin_valid_profile(self):
+        mgr = self._mgr()
+        key = "/dev/serial/by-id/usb-NEW-if00-port0"
+        mgr._devices[key] = DeviceInfo(by_id=key, real_path="/dev/ttyUSB5")
+        resp = mgr.pin_session(key, "prpl-template")  # 用 by-id 當 selector（無既有 session）
+        self.assertTrue(resp["ok"])
+        self.assertEqual(mgr._profile_pins[key], "prpl-template")
+
+    def test_pin_unknown_profile_rejected(self):
+        mgr = self._mgr()
+        resp = mgr.pin_session("COM0", "no-such-template")
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error_code"], "UNKNOWN_PROFILE")
+
+    def test_pin_explicit_target_rejected(self):
+        mgr = self._mgr()  # _profile() 經 __init__ → COM0 session 為 yaml-target
+        resp = mgr.pin_session("COM0", "prpl-template")
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error_code"], "PROFILE_IS_EXPLICIT")
+
+    def test_unpin_keeps_sticky(self):
+        mgr = self._mgr()
+        key = "/dev/serial/by-id/usb-FTDI_A-if00-port0"  # = _profile() 的 device_by_id
+        mgr._profile_pins[key] = "prpl-template"
+        mgr._profile_detected[key] = "op3-template"
+        resp = mgr.unpin_session("COM0")
+        self.assertTrue(resp["ok"])
+        self.assertNotIn(key, mgr._profile_pins)
+        self.assertEqual(mgr._profile_detected.get(key), "op3-template")

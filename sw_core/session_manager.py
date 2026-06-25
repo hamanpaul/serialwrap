@@ -1182,6 +1182,42 @@ class SessionManager:
                 session.state = "DETACHED"
         return {"ok": True, "session": session.to_public_dict()}
 
+    def _resolve_device_key(self, selector: str) -> tuple[str | None, SessionRuntime | None]:
+        """解析 selector → (device_key, session)。selector 可為 COM/alias/sid（→ 既有 session 的
+        device_by_id）或直接 by-id/by-path（→ 該字串即 device_key，session 可能為 None）。"""
+        with self._lock:
+            for sid, s in self._sessions.items():
+                if selector in (sid, s.profile.com, s.profile.alias):
+                    return s.profile.device_by_id, s
+            if selector in self._devices:
+                return selector, None
+            for sid, s in self._sessions.items():
+                if s.profile.device_by_id == selector:
+                    return selector, s
+        return (selector if selector.startswith("/dev/") else None), None
+
+    def pin_session(self, selector: str, profile_name: str) -> dict[str, Any]:
+        if self._template_by_name(profile_name) is None:
+            return {"ok": False, "error_code": "UNKNOWN_PROFILE"}
+        device_key, session = self._resolve_device_key(selector)
+        if not device_key:
+            return {"ok": False, "error_code": "DEVICE_NOT_FOUND"}
+        if session is not None and session.profile_source == "yaml-target":
+            return {"ok": False, "error_code": "PROFILE_IS_EXPLICIT"}
+        with self._lock:
+            self._profile_pins[device_key] = profile_name
+            self._save_state()
+        return {"ok": True, "device_key": device_key, "profile": profile_name}
+
+    def unpin_session(self, selector: str) -> dict[str, Any]:
+        device_key, _ = self._resolve_device_key(selector)
+        if not device_key:
+            return {"ok": False, "error_code": "DEVICE_NOT_FOUND"}
+        with self._lock:
+            self._profile_pins.pop(device_key, None)
+            self._save_state()
+        return {"ok": True, "device_key": device_key}
+
     def attach_session(self, selector: str) -> dict[str, Any]:
         bridge: UARTBridge | None = None
         should_probe = False
