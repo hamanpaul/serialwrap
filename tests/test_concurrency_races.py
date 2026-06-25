@@ -119,7 +119,10 @@ def test_redos_negated_suspicious_rejected_without_re2(pat, flags):
 
 
 # re2 無法編譯者（backref / 超大 repetition）→ 兩引擎皆落標準 re → 結構可疑 → **永遠**拒。
-@pytest.mark.parametrize("bad", [r"(a*)\1X", r"a{0,4096}a{0,4096}X"])
+@pytest.mark.parametrize("bad", [
+    r"(a*)\1X", r"a{0,4096}a{0,4096}X",
+    r"^(a)?(?(1)(a+)+b|c)$", r"^(a)?(?(1)(a|aa)+b|c)$",   # final3：GROUPREF_EXISTS 條件（re2 不支援）→ 落 re
+])
 def test_redos_re2_incompatible_always_rejected(bad):
     with pytest.raises(RuleSchemaError):
         _rule(pattern={"kind": "regex", "value": bad})

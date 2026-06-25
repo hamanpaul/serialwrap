@@ -616,6 +616,19 @@ class SerialwrapService:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
             return self._sessions.bind_session(selector, device_by_id)
 
+        if method == "session.pin":
+            selector = str(params.get("selector") or params.get("session_id") or params.get("com") or params.get("alias") or "")
+            profile_name = str(params.get("profile") or params.get("profile_name") or "")
+            if not selector or not profile_name:
+                return {"ok": False, "error_code": "INVALID_ARGS"}
+            return self._sessions.pin_session(selector, profile_name)
+
+        if method == "session.unpin":
+            selector = str(params.get("selector") or params.get("session_id") or params.get("com") or params.get("alias") or "")
+            if not selector:
+                return {"ok": False, "error_code": "INVALID_ARGS"}
+            return self._sessions.unpin_session(selector)
+
         if method == "session.attach":
             selector = str(params.get("selector") or params.get("session_id") or params.get("com") or params.get("alias") or "")
             if not selector:
