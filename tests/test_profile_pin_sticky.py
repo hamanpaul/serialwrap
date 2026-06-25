@@ -212,3 +212,19 @@ class TestPinUnpin(_Base):
         self.assertTrue(resp["ok"])
         self.assertNotIn(key, mgr._profile_pins)
         self.assertEqual(mgr._profile_detected.get(key), "op3-template")
+
+
+class TestRpc(_Base):
+    def test_rpc_pin_unpin_routed(self):
+        import sw_core.service as svc_mod
+        seen = {}
+        class _S:
+            def pin_session(self, sel, prof): seen["pin"] = (sel, prof); return {"ok": True}
+            def unpin_session(self, sel): seen["unpin"] = sel; return {"ok": True}
+        service = svc_mod.SerialwrapService.__new__(svc_mod.SerialwrapService)
+        service._sessions = _S()
+        r1 = service.rpc("session.pin", {"selector": "COM0", "profile": "prpl-template"})
+        r2 = service.rpc("session.unpin", {"selector": "COM0"})
+        self.assertTrue(r1["ok"]); self.assertTrue(r2["ok"])
+        self.assertEqual(seen["pin"], ("COM0", "prpl-template"))
+        self.assertEqual(seen["unpin"], "COM0")
