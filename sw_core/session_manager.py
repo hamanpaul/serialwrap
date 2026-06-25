@@ -455,23 +455,28 @@ class SessionManager:
 
     def _save_state(self) -> None:
         os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
-        released: dict[str, dict[str, str | None]] = {}
-        for sid, s in self._sessions.items():
-            if s.state == "RELEASED":
-                released[sid] = {
-                    "by_id": s.profile.device_by_id,
-                    "released_by": s.released_by,
-                    "released_at": s.released_at,
-                    "reason": s.released_reason,
-                }
-        payload = json.dumps(
-            {"aliases": self._aliases.dump(), "bindings": dict(self._binding_overrides),
-             "released": released, "profile_pins": dict(self._profile_pins),
-             "profile_detected": dict(self._profile_detected)},
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ) + "\n"
+        # snapshot 一律在 lock 內建（迭代 _sessions、複製 _binding_overrides/_profile_pins/
+        # _profile_detected），避免並發 mutation 觸發 RuntimeError: dictionary changed size
+        # during iteration 或寫出欄位彼此不一致的 state.json（Copilot review）；磁碟 I/O 留在
+        # lock 外。self._lock 為 RLock，caller 已持鎖時可重入。
+        with self._lock:
+            released: dict[str, dict[str, str | None]] = {}
+            for sid, s in self._sessions.items():
+                if s.state == "RELEASED":
+                    released[sid] = {
+                        "by_id": s.profile.device_by_id,
+                        "released_by": s.released_by,
+                        "released_at": s.released_at,
+                        "reason": s.released_reason,
+                    }
+            payload = json.dumps(
+                {"aliases": self._aliases.dump(), "bindings": dict(self._binding_overrides),
+                 "released": released, "profile_pins": dict(self._profile_pins),
+                 "profile_detected": dict(self._profile_detected)},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ) + "\n"
         # 原子寫入：temp + fsync + os.replace + 目錄 fsync（比照 wal.py 既有慣例），避免崩潰/斷電/ENOSPC
         # 在「直接覆寫 state.json」中途失敗留下截斷檔，致 _load_state 解析失敗而靜默全棄（含 RELEASED
         # 交接狀態）→ 重啟後 daemon 重新 attach 已交給 flasher/人類的 tty 形成 two-reader（#82）。

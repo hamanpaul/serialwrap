@@ -1,7 +1,9 @@
 # session-profile-binding Specification
 
 ## Purpose
-TBD - created by archiving change profile-pin-sticky. Update Purpose after archive.
+
+定義動態偵測（無 YAML explicit target）裝置 session 的 profile 解析來源與持久化契約：四層優先序（`pin` > `sticky` > `detect` > `fallback`）、`state.json` 的 `profile_pins`（手動）與 `profile_detected`（偵測達 READY 後自動 sticky）兩個 device_key-keyed map、`profile_source` provenance 欄位、device_key 穩定性規範（同款晶片 by-id 碰撞改 by-path），以及 `session.pin`/`session.unpin` 的對外行為與錯誤碼（`UNKNOWN_PROFILE`/`PROFILE_IS_EXPLICIT`/`DEVICE_NOT_FOUND`/`INVALID_ARGS`）。目的是根治 daemon 重啟後動態 session 的 profile 漂移。
+
 ## Requirements
 ### Requirement: 動態裝置 profile 四層優先序解析
 attach 動態偵測裝置時，系統 SHALL 依固定優先序決定 profile：`pin` > `sticky` > `detect` > `fallback`。pin 或 sticky 命中時系統 MUST 跳過 prompt probe（不開 PROBE bridge）。
