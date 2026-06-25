@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import dataclasses
 import errno
-import fcntl
 import os
 import re
 import select
-import termios
+import socket
 import threading
 import time
 import uuid
@@ -14,20 +13,22 @@ from typing import Any, Callable
 
 from .config import UartProfile
 from .constants import DEFERRED_INPUT_MAX_BYTES
+from .serial_port import SerialPort, open_serial_port
 from .wal import WalWriter
 
-_BAUD_MAP = {
-    9600: termios.B9600,
-    19200: termios.B19200,
-    38400: termios.B38400,
-    57600: termios.B57600,
-    115200: termios.B115200,
-    230400: termios.B230400,
-    460800: termios.B460800,
-    921600: termios.B921600,
-}
+# 序列埠的 termios/fcntl 設定與 _BAUD_MAP 已收斂進 sw_core/serial_port.py 的 SerialPort
+# 後端（#84 PORT-1）。本模組僅保留 human console PTY 相關的 POSIX 呼叫（lazy import），
+# 使 `import sw_core.uart_io` 在 Windows 不再因 top-level import termios/fcntl 而失敗。
 
 _STALE_CONSOLE_GRACE_S = 2.0
+
+
+def _pty_available() -> bool:
+    """此平台是否支援 PTY（human console / flash endpoint 的基礎，POSIX-only）。
+
+    抽成函式便於測試以 monkeypatch 模擬 Windows（無 os.openpty）路徑（#84）。
+    """
+    return hasattr(os, "openpty")
 
 
 @dataclasses.dataclass
@@ -39,6 +40,11 @@ class ConsoleClient:
     slave_path: str
     attached_at: float
     tx_buffer: bytearray = dataclasses.field(default_factory=bytearray)
+    # Windows human console（#84 PORT-2）：以 TCP socket 取代 PTY；PTY 路徑此欄為 None、
+    # master_fd/slave_fd 為真實 fd；socket 路徑 sock 為連線 socket、master_fd/slave_fd=-1、
+    # slave_path 為 "host:port" 端點字串。console 的狀態機（line buffer / raw / suspend-resume /
+    # fan-out）對兩者共用，I/O 原語由 _console_send 與 console loop 依 sock 分派。
+    sock: Any = None
 
 
 @dataclasses.dataclass
@@ -57,6 +63,13 @@ class PreservedConsoles:
 
 
 def _close_console_client_fds(client: ConsoleClient) -> None:
+    if client.sock is not None:
+        # Windows TCP console（#84 PORT-2）。
+        try:
+            client.sock.close()
+        except OSError:
+            pass
+        return
     for fd in (client.master_fd, client.slave_fd):
         try:
             os.close(fd)
@@ -65,6 +78,25 @@ def _close_console_client_fds(client: ConsoleClient) -> None:
 
 
 class UARTBridge:
+    """單一 UART 的 broker bridge：序列埠 RX/TX、human console 多工、命令寫入仲裁、WAL。
+
+    並發/鎖序不變式（修改 console 或寫入路徑前必讀）：
+    - 鎖序固定 `_write_lock ⊃ _state_lock`：**永遠先取 _write_lock 再取 _state_lock，
+      絕不反向**（全檔僅 send_bytes / set_flash_mode 兩處巢狀，皆 write 在外）。任何「持
+      _state_lock 後再取 _write_lock」都會與之形成 AB-BA 死鎖——維持單向是 #69 gate 原子性
+      與雙執行緒安全的前提。需要在持鎖後送資料者（如 resume_interactive flush）一律先**釋放**
+      _state_lock 再呼 send_bytes。
+    - reader 執行緒模型：POSIX 為**單一** `_loop`，以 select() 同時多工序列埠 fd 與 human
+      console PTY master fd。Windows（`_pty_available()` 為 False）為**兩條**執行緒——`_loop`
+      做序列埠阻塞讀、`_console_loop` 以 socket select() 收 TCP console；兩者並發存取 `_clients`
+      與 bridge 狀態，全靠上述單向鎖序避免死鎖（serial reader 只取 _state_lock 做 fan-out；
+      console thread 經 send_bytes 取 _write_lock→_state_lock）。
+    - `_serial`(SerialPort) 與 `_serial_fd`(POSIX 整數別名) 必須**在同一個 _state_lock 內成對
+      設定/清除**：start() 設 `_serial=port; _serial_fd=port.fileno()`，stop() 同時清為 None。
+      `_loop` 以 `_serial_fd is None` 區分 POSIX(select)／Windows(阻塞讀) 分支，故兩者若不同步
+      會讓 POSIX bridge 誤入 Windows 路徑（見 tests/test_serial_port.py 的配對不變式回歸）。
+    """
+
     def __init__(
         self,
         com: str,
@@ -85,6 +117,10 @@ class UARTBridge:
         self._on_rx_data = on_rx_data
         self._on_bridge_down = on_bridge_down
 
+        self._serial: SerialPort | None = None
+        # POSIX 上 _serial_fd 是 _serial.fileno() 的整數別名，讓 select/os.read/os.write 熱路徑與
+        # 既有測試（直接戳 _serial_fd / monkeypatch _write_all）逐字不變；Windows 上恆為 None，
+        # 由 _serial(port) 的 read/write 承擔 I/O（#84 PORT-1）。
         self._serial_fd: int | None = None
         self._primary_client_id: str | None = None
         self._stop_event = threading.Event()
@@ -107,6 +143,11 @@ class UARTBridge:
         # flash 模式（#55）：FLASHING 期間封鎖所有 console→device 注入，避免汙染 SBL binary；
         # RX→console 仍照常（唯讀快照）。flash bridge 走 flash_tx，不受此旗標影響。
         self._flash_mode: bool = False
+        # Windows human console（#84 PORT-2）：無 PTY 平台改以 127.0.0.1 TCP listener 讓
+        # TeraTerm/PuTTY 連入；每條連線即一個 socket-backed ConsoleClient。Linux 上這三者恆為 None。
+        self._console_listener: socket.socket | None = None
+        self._console_thread: threading.Thread | None = None
+        self._console_endpoint: str | None = None
 
     def set_flash_mode(self, enabled: bool) -> None:
         """進出 flash 模式；FLASHING 期間擋下 console 注入（C2）。
@@ -129,41 +170,16 @@ class UARTBridge:
             return client.slave_path if client is not None else None
 
     def _set_nonblock(self, fd: int) -> None:
+        # 僅 human console PTY master fd 走此路徑（POSIX-only）；序列埠 nonblock 已移至
+        # SerialPort POSIX 後端。lazy import 使本模組在 Windows 仍可載入（#84 PORT-1）。
+        import fcntl
+
         flags = fcntl.fcntl(fd, fcntl.F_GETFL)
         fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
-    def _configure_serial(self, fd: int) -> None:
-        attrs = termios.tcgetattr(fd)
-        attrs[0] = 0
-        attrs[1] = 0
-        attrs[3] = 0
-
-        cflag = termios.CREAD | termios.CLOCAL
-        cflag |= termios.CS7 if self.profile.data_bits == 7 else termios.CS8
-
-        parity = self.profile.parity.upper()
-        if parity == "E":
-            cflag |= termios.PARENB
-        elif parity == "O":
-            cflag |= termios.PARENB | termios.PARODD
-
-        if self.profile.stop_bits == 2:
-            cflag |= termios.CSTOPB
-        if self.profile.flow_control.lower() == "rtscts" and hasattr(termios, "CRTSCTS"):
-            cflag |= termios.CRTSCTS
-        attrs[2] = cflag
-
-        speed = _BAUD_MAP.get(self.profile.baud, termios.B115200)
-        if hasattr(termios, "cfsetispeed") and hasattr(termios, "cfsetospeed"):
-            termios.cfsetispeed(attrs, speed)
-            termios.cfsetospeed(attrs, speed)
-        else:
-            attrs[4] = speed
-            attrs[5] = speed
-
-        termios.tcsetattr(fd, termios.TCSANOW, attrs)
-
     def _configure_pty_slave(self, fd: int) -> None:
+        import termios  # PTY slave 設定為 POSIX-only（#84 PORT-1，lazy import）
+
         attrs = termios.tcgetattr(fd)
         attrs[0] = 0
         attrs[1] = 0
@@ -174,6 +190,10 @@ class UARTBridge:
         termios.tcsetattr(fd, termios.TCSANOW, attrs)
 
     def _create_console_client(self, label: str | None = None) -> ConsoleClient:
+        if not _pty_available():
+            # human console 走 PTY，屬 POSIX-only（#84 PORT-2 為後續工作）；Windows 上序列埠
+            # RX/TX 仍可運作，只是不支援 human console attach。
+            raise RuntimeError("human console（PTY）在此平台不支援；序列埠 RX/TX 仍可用")
         master_fd, slave_fd = os.openpty()
         self._set_nonblock(master_fd)
         self._configure_pty_slave(slave_fd)
@@ -191,9 +211,9 @@ class UARTBridge:
         if self._thread and self._thread.is_alive():
             return
 
-        serial_fd = os.open(self.device_path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
-        self._configure_serial(serial_fd)
-        self._set_nonblock(serial_fd)
+        port = open_serial_port(self.device_path, self.profile)
+        port.open()
+        port.configure(self.profile)
 
         with self._state_lock:
             preserved = self._preserved_consoles
@@ -204,15 +224,23 @@ class UARTBridge:
                 if primary_client_id is None:
                     next_client = next(iter(clients.values()), None)
                     primary_client_id = next_client.client_id if next_client is not None else None
-            else:
+            elif _pty_available():
                 primary = self._create_console_client("primary")
                 clients = {primary.client_id: primary}
                 primary_client_id = primary.client_id
-            self._serial_fd = serial_fd
+            else:
+                # Windows 等無 PTY 平台：序列埠 RX/TX 仍運作，只是不建立 human console（#84）。
+                clients = {}
+                primary_client_id = None
+            self._serial = port
+            self._serial_fd = port.fileno()  # POSIX：真實整數 fd；Windows：None
             self._clients = clients
             self._primary_client_id = primary_client_id
 
         self._stop_event.clear()
+        if not _pty_available():
+            # Windows：無 PTY → 開 127.0.0.1 TCP listener 供 TeraTerm/PuTTY 連入做 human console（#84 PORT-2）。
+            self._start_console_listener()
         self._thread = threading.Thread(target=self._loop, name=f"serialwrap-uart-{self.com}", daemon=True)
         self._thread.start()
 
@@ -221,14 +249,20 @@ class UARTBridge:
         if self._thread and self._thread.is_alive() and threading.current_thread() is not self._thread:
             self._thread.join(timeout=2.0)
 
+        console_thread = self._console_thread
+        if console_thread and console_thread.is_alive() and threading.current_thread() is not console_thread:
+            console_thread.join(timeout=2.0)
+
         preserved: PreservedConsoles | None = None
         with self._state_lock:
-            serial_fd = self._serial_fd
+            port = self._serial
+            console_listener = self._console_listener
             if preserve_consoles and self._clients:
                 preserved = PreservedConsoles(clients=dict(self._clients), primary_client_id=self._primary_client_id)
                 clients_to_close: list[ConsoleClient] = []
             else:
                 clients_to_close = list(self._clients.values())
+            self._serial = None
             self._serial_fd = None
             self._clients = {}
             self._primary_client_id = None
@@ -237,10 +271,16 @@ class UARTBridge:
             self._agent_active = False
             self._suspend_depth = 0
             self._deferred_buffers.clear()
+            self._console_listener = None
+            self._console_thread = None
+            self._console_endpoint = None
 
-        if serial_fd is not None:
+        if port is not None:
+            port.close()
+        if console_listener is not None:
+            # listener 關閉後 port 釋放；保留的 socket console（preserve_consoles）連線本身不關，交接新 bridge。
             try:
-                os.close(serial_fd)
+                console_listener.close()
             except OSError:
                 pass
 
@@ -251,7 +291,115 @@ class UARTBridge:
     def _close_console_client(self, client: ConsoleClient) -> None:
         _close_console_client_fds(client)
 
+    # ───────── Windows human console（TCP 端點，#84 PORT-2）─────────
+    def _start_console_listener(self) -> None:
+        """建立 127.0.0.1 TCP listener 並啟動 console accept/pump thread。
+
+        每條 TeraTerm/PuTTY 連線即一個 socket-backed ConsoleClient；首個連線自動取得 raw
+        interactive ownership，agent 命令期間以既有 suspend/resume 簿記保持連線不中斷。
+        """
+        lst = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        lst.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        lst.bind(("127.0.0.1", 0))
+        lst.listen(8)
+        lst.setblocking(False)
+        host, port = lst.getsockname()[:2]
+        self._console_listener = lst
+        self._console_endpoint = f"{host}:{port}"
+        self._console_thread = threading.Thread(
+            target=self._console_loop, name=f"serialwrap-console-{self.com}", daemon=True
+        )
+        self._console_thread.start()
+
+    def _client_for_sock_locked(self, sock_obj: Any) -> ConsoleClient | None:
+        for client in self._clients.values():
+            if client.sock is sock_obj:
+                return client
+        return None
+
+    def _accept_console_conn(self, conn: socket.socket, addr: Any) -> None:
+        conn.setblocking(False)
+        try:
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        client_id = uuid.uuid4().hex[:12]
+        peer = f"{addr[0]}:{addr[1]}" if isinstance(addr, tuple) and len(addr) >= 2 else str(addr)
+        client = ConsoleClient(
+            client_id=client_id,
+            label=peer,
+            master_fd=-1,
+            slave_fd=-1,
+            slave_path=self._console_endpoint or peer,
+            attached_at=time.time(),
+            sock=conn,
+        )
+        with self._state_lock:
+            self._clients[client_id] = client
+            if self._primary_client_id is None:
+                self._primary_client_id = client_id
+            # 首個 human console 自動取得 raw interactive ownership（對齊 Linux console-attach；
+            # Windows 無 session_manager 代為授予，故於 bridge 層授予，使方向鍵/Tab 即時透傳，
+            # 且 agent 命令時走 suspend/resume coexistence、連線不中斷）。
+            if self._interactive_owner is None:
+                self._interactive_owner = f"human:{client_id}"
+
+    def _console_loop(self) -> None:
+        listener = self._console_listener
+        if listener is None:
+            return
+        while not self._stop_event.is_set():
+            with self._state_lock:
+                socks = [c.sock for c in self._clients.values() if c.sock is not None]
+            try:
+                rlist, _, _ = select.select([listener, *socks], [], [], 0.2)
+            except OSError:
+                if self._stop_event.is_set():
+                    break
+                time.sleep(0.02)  # listener/socket 失效；短暫退避後重整 fd 集合續行
+                continue
+            for s in rlist:
+                if s is listener:
+                    try:
+                        conn, addr = listener.accept()
+                    except OSError:
+                        continue
+                    self._accept_console_conn(conn, addr)
+                    continue
+                with self._state_lock:
+                    client = self._client_for_sock_locked(s)
+                if client is None:
+                    continue
+                try:
+                    data = s.recv(8192)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    self._drop_console_client(client.client_id)
+                    continue
+                if not data:  # 對端關閉（TeraTerm/PuTTY 斷線）
+                    self._drop_console_client(client.client_id)
+                    continue
+                try:
+                    self._handle_console_rx(client, data)
+                except Exception:  # noqa: BLE001 — 單一 console handler 例外不得殺死 console thread（比照 #79）
+                    import logging
+
+                    logging.getLogger("serialwrap").warning(
+                        "console RX handler 例外（com=%s），略過此塊、console 續行", self.com, exc_info=True
+                    )
+                    continue
+
+    def console_endpoint(self) -> str | None:
+        """Windows TCP console 的連線端點（"host:port"）；POSIX 為 None（#84 PORT-2）。"""
+        with self._state_lock:
+            return self._console_endpoint
+
     def _client_has_external_peer_locked(self, client: ConsoleClient) -> bool:
+        if client.sock is not None:
+            # Windows TCP console（#84 PORT-2）：連線斷開由 console loop 的 recv b"" 直接偵測並
+            # drop，不靠 /proc 掃描；故視為「仍有 peer」直到被 drop（避免 stale-pruning 誤剪）。
+            return True
         self_pid = os.getpid()
         try:
             pids = os.listdir("/proc")
@@ -309,24 +457,6 @@ class UARTBridge:
             stale.append(removed)
         return stale
 
-    def _write_all(self, fd: int, payload: bytes) -> None:
-        view = memoryview(payload)
-        sent = 0
-        while sent < len(payload):
-            try:
-                n = os.write(fd, view[sent:])
-            except BlockingIOError:
-                time.sleep(0.01)
-                continue
-            except OSError as exc:
-                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
-                    time.sleep(0.01)
-                    continue
-                raise
-            if n <= 0:
-                break
-            sent += n
-
     def _write_console_best_effort(self, fd: int, payload: bytes) -> None:
         try:
             os.write(fd, payload)
@@ -336,6 +466,31 @@ class UARTBridge:
             if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
                 return
             raise
+
+    def _console_send(self, client: ConsoleClient, payload: bytes) -> None:
+        """把 bytes 送到一個 console client（RX fan-out 或本地回顯），best-effort 非阻塞。
+
+        PTY（POSIX）走 os.write（行為與原版逐字相同）；TCP socket（Windows #84 PORT-2）走
+        非阻塞 send。例外（含 socket EWOULDBLOCK / 斷線）一律由呼叫端的 `except OSError` 吸收
+        （socket 斷線另由 console loop 的 recv b"" 偵測並 drop）。
+        """
+        if client.sock is not None:
+            # non-blocking socket 的 send() 可能只送出部分 bytes：必須迴圈推進 offset，
+            # 否則 RX fan-out / 本地回顯會在 partial send 時靜默截斷遺失尾端（#84 review）。
+            # 緩衝滿（BlockingIOError）時停止、丟棄剩餘（best-effort，與 PTY 路徑語意一致）；
+            # 其他 OSError（斷線）上拋由呼叫端 except OSError 吸收（斷線另由 recv b"" drop）。
+            view = memoryview(payload)
+            sent = 0
+            while sent < len(payload):
+                try:
+                    n = client.sock.send(view[sent:])
+                except BlockingIOError:
+                    break
+                if n <= 0:
+                    break
+                sent += n
+        else:
+            self._write_console_best_effort(client.master_fd, payload)
 
     def _append_rx_text(self, payload: bytes) -> None:
         text = payload.decode("utf-8", errors="replace")
@@ -357,7 +512,7 @@ class UARTBridge:
         with self._state_lock:
             for client in list(self._clients.values()):
                 try:
-                    self._write_console_best_effort(client.master_fd, data)
+                    self._console_send(client, data)
                 except OSError:
                     continue
 
@@ -448,7 +603,7 @@ class UARTBridge:
         lines, echo = self._consume_console_input(client, data)
         if echo:
             try:
-                self._write_console_best_effort(client.master_fd, echo)
+                self._console_send(client, echo)
             except OSError:
                 pass
         if self._on_console_line is None:
@@ -460,12 +615,34 @@ class UARTBridge:
         failure_reason: str | None = None
         while not self._stop_event.is_set():
             with self._state_lock:
+                port = self._serial
                 serial_fd = self._serial_fd
                 clients_by_fd = {client.master_fd: client for client in self._clients.values()}
 
-            if serial_fd is None:
+            if port is None:
                 break
 
+            if serial_fd is None:
+                # ── Windows/pyserial：序列埠 handle 無法被 select() 多工，且該平台無 PTY console。
+                #    改以阻塞讀取（read timeout 控制輪詢節奏與 stop 反應延遲 ≤timeout）（#84 PORT-1）。
+                try:
+                    data = port.read(8192)
+                except Exception as exc:  # noqa: BLE001 — pyserial SerialException / OSError 皆視為斷線
+                    failure_reason = f"SERIAL_READ:{type(exc).__name__}"
+                    self._stop_event.set()
+                    break
+                if not data:
+                    continue
+                try:
+                    self._handle_serial_rx(data)
+                except Exception:  # noqa: BLE001 — 單一 RX handler 例外不得殺死 reader thread（#79 STA-1）
+                    import logging
+                    logging.getLogger("serialwrap").warning(
+                        "RX handler 例外（com=%s），略過此塊、reader 續行", self.com, exc_info=True
+                    )
+                continue
+
+            # ── POSIX：序列埠 fd 與 human console PTY master fd 統一以 select() 多工（行為與原版逐字一致）。
             read_fds = [serial_fd, *clients_by_fd.keys()]
             try:
                 rlist, _, _ = select.select(read_fds, [], [], 0.2)
@@ -530,12 +707,37 @@ class UARTBridge:
                     # 注意：授權不綁使用者可控的 `source` 稽核字串（cmd submit 可帶任意 source），
                     # 否則 source="flash-..." 的命令會繞過此 gate（#69 Finding round3）。
                     return
+                port = self._serial
                 serial_fd = self._serial_fd
-            if serial_fd is None:
+            if serial_fd is not None:
+                # POSIX：維持原寫入路徑（self._write_all），與既有測試（戳 _serial_fd / monkeypatch
+                # _write_all）逐字相容；flash gate 與 _write_lock 原子性（#69）皆不變。
+                self._write_all(serial_fd, payload)
+            elif port is not None:
+                # Windows/pyserial：序列埠無整數 fd，改由 port 寫入（#84 PORT-1）。
+                port.write(payload)
+            else:
                 raise RuntimeError("serial not ready")
-            self._write_all(serial_fd, payload)
         if log:
             self.wal.append(com=self.com, direction="TX", source=source, payload=payload, cmd_id=cmd_id)
+
+    def _write_all(self, fd: int, payload: bytes) -> None:
+        view = memoryview(payload)
+        sent = 0
+        while sent < len(payload):
+            try:
+                n = os.write(fd, view[sent:])
+            except BlockingIOError:
+                time.sleep(0.01)
+                continue
+            except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    time.sleep(0.01)
+                    continue
+                raise
+            if n <= 0:
+                break
+            sent += n
 
     def flash_tx(self, payload: bytes) -> None:
         """flash 模式：endpoint→device 原樣送出，跳過行處理（_consume_console_input）。
@@ -549,12 +751,24 @@ class UARTBridge:
         """把 endpoint PTY slave 的 baud 鏡射到 real device。
 
         鏡射失敗時，若有提供 fallback_baud（命中 pattern 的 registry baud，#55 I3），
-        則明確把 real device 設成該 baud；否則維持 _configure_serial 的 profile baud。
+        則明確把 real device 設成該 baud；否則維持 configure() 的 profile baud。
+
+        本路徑為 flash endpoint（PTY slave）專用，屬 POSIX-only（#55）；termios 改 lazy import
+        使 uart_io 在無 termios 的平台仍可載入（#84）。非 POSIX 後端（fileno()=None）只走
+        fallback_baud→set_baud。
         """
         with self._state_lock:
-            serial_fd = self._serial_fd
-        if serial_fd is None:
+            port = self._serial
+        if port is None:
             return
+        serial_fd = port.fileno()
+        if serial_fd is None:
+            # 無可多工 fd（如 Windows pyserial）：只能套 fallback baud（flash 在此平台不支援）。
+            if fallback_baud is not None:
+                port.set_baud(fallback_baud)
+            return
+        import termios
+
         try:
             attrs = termios.tcgetattr(slave_fd)
             ispeed, ospeed = attrs[4], attrs[5]
@@ -562,12 +776,9 @@ class UARTBridge:
             dst[4], dst[5] = ispeed, ospeed
             termios.tcsetattr(serial_fd, termios.TCSANOW, dst)
         except OSError:
-            if fallback_baud is not None and fallback_baud in _BAUD_MAP:
+            if fallback_baud is not None:
                 try:
-                    speed = _BAUD_MAP[fallback_baud]
-                    dst = termios.tcgetattr(serial_fd)
-                    dst[4] = dst[5] = speed
-                    termios.tcsetattr(serial_fd, termios.TCSANOW, dst)
+                    port.set_baud(fallback_baud)
                 except OSError:
                     pass  # 連 fallback 都失敗 → 維持 profile baud
 
@@ -622,6 +833,16 @@ class UARTBridge:
         return False
 
     def attach_console(self, *, label: str | None = None) -> dict[str, Any]:
+        if not _pty_available():
+            # Windows（#84 PORT-2）：human 直接連 TCP 端點，console client 於連線時自動建立；
+            # 此處回傳端點供呼叫端轉達使用者（TeraTerm/PuTTY raw 連 127.0.0.1:port）。
+            return {
+                "client_id": None,
+                "label": label,
+                "vtty": self._console_endpoint,
+                "endpoint": self._console_endpoint,
+                "transport": "tcp",
+            }
         client = self._create_console_client(label)
         stale: list[ConsoleClient] = []
         with self._state_lock:
@@ -735,6 +956,7 @@ class UARTBridge:
         consoles = self.list_consoles()
         with self._state_lock:
             serial_fd = self._serial_fd
+            port = self._serial
             primary_client_id = self._primary_client_id
             primary = None
             if primary_client_id is not None:
@@ -743,6 +965,8 @@ class UARTBridge:
                     primary = client.slave_path
             interactive_owner = self._interactive_owner
             last_human_input_at = self._last_human_input_at
+            console_endpoint = self._console_endpoint
+            console_listener_alive = self._console_listener is not None
         serial_alive = False
         if serial_fd is not None:
             try:
@@ -750,7 +974,16 @@ class UARTBridge:
                 serial_alive = True
             except OSError:
                 serial_alive = False
-        vtty_alive = bool(primary and os.path.exists(primary))
+        elif port is not None:
+            # Windows/pyserial：無整數 fd，改問 port 是否仍開啟（#84 PORT-1）。
+            serial_alive = port.is_alive()
+        if console_endpoint is not None:
+            # Windows TCP console（#84 PORT-2）：primary 是 "host:port"（非檔案路徑），os.path.exists
+            # 永遠 False 會讓 SessionManager 誤判 VTTY_STALE/SESSION_NOT_READY；改以 listener 是否
+            # 仍在監聽判定 console 是否可達（#84 review）。
+            vtty_alive = console_listener_alive
+        else:
+            vtty_alive = bool(primary and os.path.exists(primary))
         return {
             "com": self.com,
             "device_path": self.device_path,
@@ -761,4 +994,5 @@ class UARTBridge:
             "last_human_input_at": last_human_input_at,
             "consoles": consoles,
             "running": bool(self._thread and self._thread.is_alive()),
+            "console_endpoint": console_endpoint,  # Windows TCP console 端點；POSIX 為 None（#84 PORT-2）
         }

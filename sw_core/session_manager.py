@@ -2480,6 +2480,14 @@ class SessionManager:
             if session is None or session.bridge is None or session.state not in {"READY", "ATTACHED"}:
                 return {"ok": False, "error_code": "SESSION_NOT_READY", "selector": selector}
             payload = session.bridge.attach_console(label=label)
+            if payload.get("client_id") is None:
+                # 無 PTY 平台（Windows TCP console，#84 PORT-2）：human 直接連 TCP 端點，console
+                # client 於連線時自動建立、raw ownership 由 bridge 在 accept 時授予。此處**不可**用
+                # owner=f"human:{client_id}"（會是 human:None）開 lease 覆寫之；只回傳端點即可（#84 review）。
+                if session.vtty_path is None:
+                    session.vtty_path = payload["vtty"]
+                payload["session"] = session.to_public_dict()
+                return {"ok": True, **payload}
             if session.vtty_path is None:
                 session.vtty_path = payload["vtty"]
             lease, post = self._refresh_interactive_locked(session)

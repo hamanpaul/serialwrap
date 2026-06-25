@@ -793,6 +793,25 @@ serialwrap wal current-seq
 - 可用 `SERIALWRAP_WAL_DIR` 覆寫 WAL / mirror log 目錄，例如放到 `~/b-log`；這不會改動 daemon socket / lock 的 `RUN_DIR`。
 - `stream tail` 為 legacy alias；新設計優先使用 `cmd result-tail`。
 
+## 跨平台序列埠與 Windows human console（#84 PORT-1/PORT-2）
+
+序列埠 I/O 已抽象為可替換的 `SerialPort` port（`sw_core/serial_port.py`），human console 亦支援 PTY / TCP 兩種 transport，使核心收發不再寫死 POSIX `termios`/PTY：
+
+- **序列埠（PORT-1）**
+  - **Linux/WSL（預設）**：`_PosixSerialPort`（termios 後端），與既往**逐位元組等價**；`select()` 多工序列埠 fd 與 console PTY 不變。
+  - **Windows**：`_PySerialPort`（pyserial 後端）。`import sw_core.uart_io` 不再因 `termios`/`fcntl` 而 `ImportError`；`UARTBridge` 序列埠 RX/TX 對 `COMx` 運作。
+  - 後端自動依平台選擇，`SERIALWRAP_SERIAL_BACKEND`（`auto`／`posix`／`pyserial`）可覆寫；`pyserial` 為 Windows 後端執行期依賴（`pyproject` `sys_platform=='win32'`）。
+- **human console（PORT-2）**
+  - **Linux/WSL**：PTY（minicom 開 `/dev/pts/N`），行為不變。
+  - **Windows**：無 PTY → `UARTBridge` 開 `127.0.0.1` TCP listener；**TeraTerm（TCP/IP, Service=Other）或 PuTTY（Raw）**連入即一個 console，沿用 raw ownership / suspend-resume coexistence / RX fan-out（agent 下命令期間連線不中斷）。連線端點見 `console_endpoint()` / `session console-attach` 回傳的 `host:port`。
+- 真機驗證：Windows 對 CH340（`COM8`，TxRx 短接 loopback）實測序列埠 start/RX/TX/WAL/clean-stop 與 TCP console raw/雙向/agent coexistence/斷線偵測全數通過。
+
+### Windows MCU flash（設計決策，後續）
+
+Linux 的 `/dev/ttyMCU`（PTY-bridge + sync-probe + baud 鏡射，#55）在 Windows **不適用也不需要**：Windows 的韌體升級工具直接獨佔開啟該 UART `COMx` 自行燒錄。serialwrap 在 Windows flash 流程唯一要做的是 **detach（release）該 COM port**——關閉自身 handle 讓外部工具獨佔開啟、燒完再 reclaim，對應 **#54 device release/handoff** 語意（**非** #55）。底層 release/reclaim primitive（`stop()`→`close()` 釋放 COM、`start()`→re-open 收回）已可用；完整的 `device release`/`device attach` 使用者編排需 Windows daemon（PORT-4），列為後續。
+
+> ⚠️ 範圍：本支援涵蓋 **PORT-1（序列埠）** 與 **PORT-2（Windows human console，TCP）**。其餘 OS 邊界——daemon 控制通道 AF_UNIX（**PORT-4**，故 Windows 暫無 daemon/CLI/agent 命令路徑與 `device release` 編排）、`/proc` peer 偵測（PORT-5）、`/dev` 裝置列舉（PORT-6）、WAL 目錄 fsync（PORT-7）、systemd/dialout 監管（PORT-8）——仍為 Linux-only，列為後續。
+
 ## 測試
 
 ```bash
