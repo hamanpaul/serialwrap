@@ -476,6 +476,55 @@ class TestUARTBridgeWindowsPath(unittest.TestCase):
         finally:
             b.stop()
 
+    def test_serial_and_serial_fd_paired_and_cleared(self) -> None:
+        # 不變式（#84）：_serial 與 _serial_fd 必在同一鎖內成對設定/清除，且 _serial_fd 必派生自
+        # _serial.fileno()。Windows 後端 fileno()=None → _serial_fd 必為 None（_loop 才會走 Windows 分支）。
+        b = self._bridge()
+        b.start()
+        try:
+            self.assertIs(b._serial, self._fake)
+            self.assertIsNone(b._serial_fd)
+            self.assertEqual(b._serial_fd, self._fake.fileno())  # 派生自同一來源
+        finally:
+            b.stop()
+        self.assertIsNone(b._serial)
+        self.assertIsNone(b._serial_fd)
+
+
+@unittest.skipUnless(os.name == "posix" and hasattr(os, "openpty"), "需 POSIX + PTY 跑真 UARTBridge")
+class TestUARTBridgePosixStartStopInvariant(unittest.TestCase):
+    """POSIX：真 UARTBridge（PTY 當假 device）驗 _serial 與 _serial_fd 配對不變式（#84）。
+
+    POSIX 後端 fileno() 回真整數 fd → _serial_fd 必 == _serial.fileno()（非 None），_loop 才會走
+    select 分支；stop() 後兩者必同時為 None。
+    """
+
+    def test_serial_fd_equals_fileno_then_cleared(self) -> None:
+        from sw_core.uart_io import UARTBridge
+        from sw_core.wal import WalWriter
+
+        master, slave = os.openpty()
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            dev = os.ttyname(slave)
+            b = UARTBridge("COM0", dev, UartProfile(), WalWriter(wal_dir=tmp.name))
+            b.start()
+            try:
+                self.assertIsNotNone(b._serial)
+                self.assertIsInstance(b._serial_fd, int)
+                self.assertEqual(b._serial_fd, b._serial.fileno())  # POSIX：真實 fd，成對且一致
+            finally:
+                b.stop()
+            self.assertIsNone(b._serial)
+            self.assertIsNone(b._serial_fd)
+        finally:
+            tmp.cleanup()
+            for fd in (master, slave):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
 
 def _pyserial_available() -> bool:
     try:
@@ -692,6 +741,69 @@ class TestUARTBridgeTcpConsole(unittest.TestCase):
                 break
             time.sleep(0.05)
         self.assertTrue(dropped)
+
+    def test_concurrent_console_serial_flash_no_deadlock(self) -> None:
+        # 守護 Windows 雙執行緒新併發面（#84）：serial reader（fan-out 取 _state_lock）、console
+        # thread（recv→send_bytes 取 _write_lock→_state_lock）、agent send_command 與 set_flash_mode
+        # （亦 _write_lock→_state_lock）同時施壓。鎖序若被改成反向（_state_lock→_write_lock）即會
+        # AB-BA 死鎖，本測試會因 thread 卡住 + 結尾 marker 收不到而（有界）失敗。
+        s = self._connect()
+        stop = threading.Event()
+        errors: list = []
+
+        def feeder() -> None:
+            try:
+                while not stop.is_set():
+                    s.sendall(b"x\r")  # owner raw → send_bytes → _write_lock→_state_lock
+                    time.sleep(0.003)
+            except OSError as exc:
+                errors.append(("feeder", repr(exc)))
+
+        def agent_spammer() -> None:
+            try:
+                i = 0
+                while not stop.is_set():
+                    self._bridge.send_command(f"A{i}", source="agent")
+                    i += 1
+                    time.sleep(0.003)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(("agent", repr(exc)))
+
+        def flash_toggler() -> None:
+            try:
+                while not stop.is_set():
+                    self._bridge.set_flash_mode(True)
+                    time.sleep(0.002)
+                    self._bridge.set_flash_mode(False)
+                    time.sleep(0.002)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(("flash", repr(exc)))
+
+        threads = [
+            threading.Thread(target=feeder, daemon=True),
+            threading.Thread(target=agent_spammer, daemon=True),
+            threading.Thread(target=flash_toggler, daemon=True),
+        ]
+        try:
+            for t in threads:
+                t.start()
+            time.sleep(1.0)  # 並發壓力
+            stop.set()
+            for t in threads:
+                t.join(timeout=3.0)
+            self.assertFalse(any(t.is_alive() for t in threads), f"壓力 thread 卡住（疑似死鎖）；errors={errors}")
+            self.assertEqual(errors, [])
+            # bridge 仍可回應（flash 已關）→ 證明無 serial-reader↔console-thread 死鎖
+            self._bridge.set_flash_mode(False)
+            self._bridge.clear_rx_buffer()
+            self._bridge.send_command("NODEADLOCK-MARKER", source="agent")
+            self.assertTrue(
+                self._bridge.wait_for_regex("NODEADLOCK-MARKER", timeout_s=3.0),
+                "壓力後 bridge 無回應（疑似死鎖或 reader 停擺）",
+            )
+        finally:
+            stop.set()
+            s.close()
 
 
 if __name__ == "__main__":

@@ -78,6 +78,25 @@ def _close_console_client_fds(client: ConsoleClient) -> None:
 
 
 class UARTBridge:
+    """單一 UART 的 broker bridge：序列埠 RX/TX、human console 多工、命令寫入仲裁、WAL。
+
+    並發/鎖序不變式（修改 console 或寫入路徑前必讀）：
+    - 鎖序固定 `_write_lock ⊃ _state_lock`：**永遠先取 _write_lock 再取 _state_lock，
+      絕不反向**（全檔僅 send_bytes / set_flash_mode 兩處巢狀，皆 write 在外）。任何「持
+      _state_lock 後再取 _write_lock」都會與之形成 AB-BA 死鎖——維持單向是 #69 gate 原子性
+      與雙執行緒安全的前提。需要在持鎖後送資料者（如 resume_interactive flush）一律先**釋放**
+      _state_lock 再呼 send_bytes。
+    - reader 執行緒模型：POSIX 為**單一** `_loop`，以 select() 同時多工序列埠 fd 與 human
+      console PTY master fd。Windows（`_pty_available()` 為 False）為**兩條**執行緒——`_loop`
+      做序列埠阻塞讀、`_console_loop` 以 socket select() 收 TCP console；兩者並發存取 `_clients`
+      與 bridge 狀態，全靠上述單向鎖序避免死鎖（serial reader 只取 _state_lock 做 fan-out；
+      console thread 經 send_bytes 取 _write_lock→_state_lock）。
+    - `_serial`(SerialPort) 與 `_serial_fd`(POSIX 整數別名) 必須**在同一個 _state_lock 內成對
+      設定/清除**：start() 設 `_serial=port; _serial_fd=port.fileno()`，stop() 同時清為 None。
+      `_loop` 以 `_serial_fd is None` 區分 POSIX(select)／Windows(阻塞讀) 分支，故兩者若不同步
+      會讓 POSIX bridge 誤入 Windows 路徑（見 tests/test_serial_port.py 的配對不變式回歸）。
+    """
+
     def __init__(
         self,
         com: str,
