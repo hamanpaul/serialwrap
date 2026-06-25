@@ -222,6 +222,8 @@ class SessionRuntime:
     released_by: str | None = None
     released_at: str | None = None
     released_reason: str | None = None
+    # 動態 profile 來源（#95）：unknown / pin / sticky / detected / fallback / yaml-target
+    profile_source: str = "unknown"
     # MCU 燒錄狀態（issue #55）：僅 runtime transient，不寫 _save_state / to_public_dict
     flash_prev_state: str | None = None
     # recovery lease stash（Phase B issue #44）
@@ -280,6 +282,7 @@ class SessionRuntime:
             "act_no": self.profile.act_no,
             "device_by_id": self.profile.device_by_id,
             "platform": self.profile.platform,
+            "profile_source": self.profile_source,
             "command_capable": self.profile.command_capable,
             "state": self.state,
             "last_error": self.last_error,
@@ -356,6 +359,9 @@ class SessionManager:
         self._capture_fps: dict[str, Any] = {}  # capture_id → open file object
         self._templates: list[ProfileTemplate] = list(templates) if templates else []
         self._max_sessions = max_sessions
+        # 動態 profile 持久化（#95）：device_key → profile_name
+        self._profile_pins: dict[str, str] = {}
+        self._profile_detected: dict[str, str] = {}
 
         self._load_state()
         for p in profiles:
@@ -366,6 +372,7 @@ class SessionManager:
             profile = dataclasses.replace(p, device_by_id=device_by_id)
             if sid not in self._sessions:
                 self._sessions[sid] = SessionRuntime(session_id=sid, profile=profile)
+                self._sessions[sid].profile_source = "yaml-target"
             self._aliases.set_for_session(sid, profile.alias)
         for sid, meta in self._loaded_released.items():
             s = self._sessions.get(sid)
@@ -435,24 +442,41 @@ class SessionManager:
                 if isinstance(by_id, str) and by_id:
                     self._released_by_ids.add(by_id)
             self._loaded_released = loaded
+        pins = obj.get("profile_pins") if isinstance(obj, dict) else None
+        if isinstance(pins, dict):
+            self._profile_pins = {str(k).strip(): str(v).strip()
+                                  for k, v in pins.items()
+                                  if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip()}
+        detected = obj.get("profile_detected") if isinstance(obj, dict) else None
+        if isinstance(detected, dict):
+            self._profile_detected = {str(k).strip(): str(v).strip()
+                                      for k, v in detected.items()
+                                      if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip()}
 
     def _save_state(self) -> None:
         os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
-        released: dict[str, dict[str, str | None]] = {}
-        for sid, s in self._sessions.items():
-            if s.state == "RELEASED":
-                released[sid] = {
-                    "by_id": s.profile.device_by_id,
-                    "released_by": s.released_by,
-                    "released_at": s.released_at,
-                    "reason": s.released_reason,
-                }
-        payload = json.dumps(
-            {"aliases": self._aliases.dump(), "bindings": dict(self._binding_overrides), "released": released},
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ) + "\n"
+        # snapshot 一律在 lock 內建（迭代 _sessions、複製 _binding_overrides/_profile_pins/
+        # _profile_detected），避免並發 mutation 觸發 RuntimeError: dictionary changed size
+        # during iteration 或寫出欄位彼此不一致的 state.json（Copilot review）；磁碟 I/O 留在
+        # lock 外。self._lock 為 RLock，caller 已持鎖時可重入。
+        with self._lock:
+            released: dict[str, dict[str, str | None]] = {}
+            for sid, s in self._sessions.items():
+                if s.state == "RELEASED":
+                    released[sid] = {
+                        "by_id": s.profile.device_by_id,
+                        "released_by": s.released_by,
+                        "released_at": s.released_at,
+                        "reason": s.released_reason,
+                    }
+            payload = json.dumps(
+                {"aliases": self._aliases.dump(), "bindings": dict(self._binding_overrides),
+                 "released": released, "profile_pins": dict(self._profile_pins),
+                 "profile_detected": dict(self._profile_detected)},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ) + "\n"
         # 原子寫入：temp + fsync + os.replace + 目錄 fsync（比照 wal.py 既有慣例），避免崩潰/斷電/ENOSPC
         # 在「直接覆寫 state.json」中途失敗留下截斷檔，致 _load_state 解析失敗而靜默全棄（含 RELEASED
         # 交接狀態）→ 重啟後 daemon 重新 attach 已交給 flasher/人類的 tty 形成 two-reader（#82）。
@@ -493,7 +517,9 @@ class SessionManager:
         tpl: ProfileTemplate,
         device_by_id: str,
     ) -> SessionRuntime:
-        """從 template 建立新的動態 session（須在 self._lock 內呼叫）。"""
+        """從 template 建立新的動態 session（須在 self._lock 內呼叫）。
+        注意：profile_source 由呼叫方（_attach_by_id_dynamic）在回傳後設定，此處預設值不具權威性。
+        """
         com = self._next_dynamic_com()
         act_no = len(self._sessions) + 1
         alias = f"{tpl.profile_name}+{act_no}"
@@ -1161,6 +1187,46 @@ class SessionManager:
                 session.state = "DETACHED"
         return {"ok": True, "session": session.to_public_dict()}
 
+    def _resolve_device_key(self, selector: str) -> tuple[str | None, SessionRuntime | None]:
+        """解析 selector → (device_key, session)。selector 可為 COM/alias/sid（→ 既有 session 的
+        device_by_id）或直接 by-id/by-path（→ 該字串即 device_key，session 可能為 None）。"""
+        with self._lock:
+            for sid, s in self._sessions.items():
+                if selector in (sid, s.profile.com, s.profile.alias):
+                    return s.profile.device_by_id, s
+            for sid, s in self._sessions.items():
+                if s.profile.device_by_id == selector:
+                    return selector, s
+            if selector in self._devices:
+                return selector, None
+        if selector.startswith("/dev/serial/by-id/") or selector.startswith("/dev/serial/by-path/"):
+            return selector, None
+        return None, None
+
+    def pin_session(self, selector: str, profile_name: str) -> dict[str, Any]:
+        if self._template_by_name(profile_name) is None:
+            return {"ok": False, "error_code": "UNKNOWN_PROFILE"}
+        device_key, session = self._resolve_device_key(selector)
+        if not device_key:
+            return {"ok": False, "error_code": "DEVICE_NOT_FOUND"}
+        if session is not None and session.profile_source == "yaml-target":
+            return {"ok": False, "error_code": "PROFILE_IS_EXPLICIT"}
+        with self._lock:
+            self._profile_pins[device_key] = profile_name
+            self._save_state()
+        return {"ok": True, "device_key": device_key, "profile": profile_name}
+
+    def unpin_session(self, selector: str) -> dict[str, Any]:
+        device_key, session = self._resolve_device_key(selector)
+        if not device_key:
+            return {"ok": False, "error_code": "DEVICE_NOT_FOUND"}
+        if session is not None and session.profile_source == "yaml-target":
+            return {"ok": False, "error_code": "PROFILE_IS_EXPLICIT"}
+        with self._lock:
+            self._profile_pins.pop(device_key, None)
+            self._save_state()
+        return {"ok": True, "device_key": device_key}
+
     def attach_session(self, selector: str) -> dict[str, Any]:
         bridge: UARTBridge | None = None
         should_probe = False
@@ -1580,6 +1646,26 @@ class SessionManager:
                 session.attached_real_path = None
             self._on_detached(session.session_id)
 
+    def _template_by_name(self, name: str) -> ProfileTemplate | None:
+        for t in self._templates:
+            if t.profile_name == name:
+                return t
+        return None
+
+    def _maybe_persist_sticky(self, *, by_id: str, profile_name: str,
+                              source: str, real_path: str) -> None:
+        """達 READY 的正向偵測才寫 sticky（#95）。TOCTOU：real_path 須與 attach 當時一致。
+        須在 self._lock 內呼叫。"""
+        if source != "detected":
+            return
+        cur = self._devices.get(by_id)
+        if cur is None or cur.real_path != real_path:
+            return
+        if self._profile_detected.get(by_id) == profile_name:
+            return
+        self._profile_detected[by_id] = profile_name
+        self._save_state()
+
     def _default_passthrough_template(self) -> ProfileTemplate | None:
         """auto-detect 失敗時的通用 passthrough fallback。
 
@@ -1605,31 +1691,40 @@ class SessionManager:
             if dev is None:
                 return
             real_path = dev.real_path
+            probe_real_path = real_path  # detect 當時的 real_path（#95 HIGH#2 TOCTOU：sticky 須比對此值）
 
-        # 先用預設 UART 參數開 bridge 做 probe
-        default_uart = UartProfile()
-        probe_bridge = UARTBridge(
-            "PROBE",
-            real_path,
-            default_uart,
-            self._wal,
-        )
-        detected: ProfileTemplate | None = None
-        try:
-            probe_bridge.start()
-            detected = detect_template(probe_bridge, self._templates)
-        except Exception:
-            pass
-        finally:
+        # 四層優先序（#95）：pin > sticky > detect > fallback。pin/sticky 命中跳過 probe。
+        tpl: ProfileTemplate | None = None
+        source: str | None = None
+        pin_name = self._profile_pins.get(by_id)
+        if pin_name:
+            tpl = self._template_by_name(pin_name)
+            if tpl is not None:
+                source = "pin"
+        if tpl is None:
+            sticky_name = self._profile_detected.get(by_id)
+            if sticky_name:
+                tpl = self._template_by_name(sticky_name)
+                if tpl is not None:
+                    source = "sticky"
+        if tpl is None:
+            default_uart = UartProfile()
+            probe_bridge = UARTBridge("PROBE", real_path, default_uart, self._wal)
+            detected: ProfileTemplate | None = None
             try:
-                probe_bridge.stop()
+                probe_bridge.start()
+                detected = detect_template(probe_bridge, self._templates)
             except Exception:
                 pass
-
-        # 找 passthrough fallback（通用 fallback 須為非 command-capable 的 passthrough，
-        # 避免 uboot-template 這類 command-capable 的特定 passthrough 搶走通用 fallback）
-        passthrough = self._default_passthrough_template()
-        tpl = detected or passthrough
+            finally:
+                try:
+                    probe_bridge.stop()
+                except Exception:
+                    pass
+            if detected is not None:
+                tpl, source = detected, "detected"
+        if tpl is None:
+            tpl, source = self._default_passthrough_template(), "fallback"
         if tpl is None:
             return
 
@@ -1638,6 +1733,7 @@ class SessionManager:
             if by_id not in self._devices or len(self._sessions) >= self._max_sessions:
                 return
             session = self._session_from_template(tpl, by_id)
+            session.profile_source = source
 
         # 用正確 uart 參數重新開 bridge
         profile = session.profile
@@ -1722,6 +1818,8 @@ class SessionManager:
                     session.recovery_started_at = None
                     session.pending_auto_login = False
                     self._reset_reprobe_progress_locked(session)
+                    self._maybe_persist_sticky(by_id=by_id, profile_name=profile.profile_name,
+                                               source=session.profile_source, real_path=probe_real_path)
                     notify_ready = True
                 else:
                     session.state = "ATTACHED"

@@ -476,6 +476,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_sb = sess_sub.add_parser("bind", help="把 session 綁定到指定裝置 by-id")
     p_sb.add_argument("--selector", required=True, help="session_id | COMx | alias")
     p_sb.add_argument("--device-by-id", required=True)
+    p_pin = sess_sub.add_parser("pin", help="把 device 釘到指定 profile（最高優先，繞過偵測）")
+    p_pin.add_argument("--selector", required=True, help="session_id | COMx | alias | by-id | by-path")
+    p_pin.add_argument("--profile", required=True, help="要釘的 profile/template 名")
+    p_unpin = sess_sub.add_parser("unpin", help="解除 device 的 profile pin（保留 sticky）")
+    p_unpin.add_argument("--selector", required=True, help="session_id | COMx | alias | by-id | by-path")
     p_sa = sess_sub.add_parser("attach", help="將 session attach 到裝置並建立 bridge")
     p_sa.add_argument("--selector", required=True, help="session_id | COMx | alias")
     p_sst = sess_sub.add_parser("self-test", help="探測 session 健康度，回報 classification 與 recommended_action")
@@ -778,6 +783,10 @@ def main(argv: list[str] | None = None) -> int:
             return _run_rpc(args, "session.clear", {"selector": args.selector})
         if args.session_cmd == "bind":
             return _run_rpc(args, "session.bind", {"selector": args.selector, "device_by_id": args.device_by_id})
+        if args.session_cmd == "pin":
+            return _run_rpc(args, "session.pin", {"selector": args.selector, "profile": args.profile})
+        if args.session_cmd == "unpin":
+            return _run_rpc(args, "session.unpin", {"selector": args.selector})
         if args.session_cmd == "attach":
             return _run_rpc(args, "session.attach", {"selector": args.selector})
         if args.session_cmd == "self-test":
