@@ -205,10 +205,12 @@ class TestPinUnpin(_Base):
 
     def test_unpin_keeps_sticky(self):
         mgr = self._mgr()
-        key = "/dev/serial/by-id/usb-FTDI_A-if00-port0"  # = _profile() 的 device_by_id
+        # FIX B：COM0 是 yaml-target session，unpin 現在對稱回 PROFILE_IS_EXPLICIT。
+        # 改用不屬於任何 yaml-target session 的獨立 by-id key 測試 sticky 保留行為。
+        key = "/dev/serial/by-id/usb-FTDI_B-if00-port0"  # 非 yaml-target，無既有 session
         mgr._profile_pins[key] = "prpl-template"
         mgr._profile_detected[key] = "op3-template"
-        resp = mgr.unpin_session("COM0")
+        resp = mgr.unpin_session(key)
         self.assertTrue(resp["ok"])
         self.assertNotIn(key, mgr._profile_pins)
         self.assertEqual(mgr._profile_detected.get(key), "op3-template")
@@ -219,6 +221,13 @@ class TestPinUnpin(_Base):
         key = "/dev/serial/by-id/usb-FTDI_A-if00-port0"  # = _profile() 的 device_by_id（COM0 yaml-target）
         mgr._devices[key] = DeviceInfo(by_id=key, real_path="/dev/ttyUSB0")
         resp = mgr.pin_session(key, "prpl-template")
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error_code"], "PROFILE_IS_EXPLICIT")
+
+    def test_unpin_rejects_explicit_target(self):
+        # FIX B：unpin 與 pin 對稱，yaml-target 裝置應回 PROFILE_IS_EXPLICIT
+        mgr = self._mgr()
+        resp = mgr.unpin_session("COM0")
         self.assertFalse(resp["ok"])
         self.assertEqual(resp["error_code"], "PROFILE_IS_EXPLICIT")
 
@@ -251,6 +260,17 @@ class TestDeviceKey(_Base):
         resp = mgr.pin_session(bypath, "prpl-template")
         self.assertTrue(resp["ok"])
         self.assertEqual(mgr._profile_pins[bypath], "prpl-template")
+
+    def test_pin_rejects_unstable_ttyusb_selector(self):
+        # FIX A：/dev/ttyUSB* 不是穩定 key，pin 應回 DEVICE_NOT_FOUND（不可寫成永不命中的 pin）
+        prpl = ProfileTemplate(profile_name="prpl-template", platform="prpl",
+                               prompt_regex="x", login_regex="", password_regex="",
+                               ready_probe="echo __R__", uart=UartProfile())
+        mgr = SessionManager([], WalWriter(wal_dir=self._tmp.name), templates=[prpl],
+                             on_ready=lambda _sid: None, on_detached=lambda _sid: None)
+        resp = mgr.pin_session("/dev/ttyUSB0", "prpl-template")
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error_code"], "DEVICE_NOT_FOUND")
 
 
 class TestIntegration(_Base):

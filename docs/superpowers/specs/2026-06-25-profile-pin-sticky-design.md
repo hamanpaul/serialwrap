@@ -115,7 +115,7 @@ serialwrap session unpin --selector COM0                           # 只清 prof
 - `pin` **驗證 `--profile` 為已載入 template**，未知 → `UNKNOWN_PROFILE`、不寫。**驗證須對 service 持有的完整 template 集合**（非單一 YAML 檔；因 `load_profiles` 的 `all_templates` 多 YAML 時被最後檔覆蓋，:285——**v2 面向 6 附注**：UNKNOWN_PROFILE 以 SessionManager 實際載入的 `self._templates` 為準）。
 - selector 解析不到 device_key → 回錯。
 - 對**有 YAML explicit target** 的裝置 `pin` → `PROFILE_IS_EXPLICIT`、不寫（判斷見 §8 provenance，**不**用 by-id map 反推）。
-- pin/unpin 寫入後回更新後 session；**不主動重新 attach**（避免意外中斷），下次 attach/clear 或重啟生效（spec + CLI help 明示）。
+- pin/unpin 寫入後回更新後 session；**不主動重新 attach**（避免意外中斷）；對已存在的 session，**下次 daemon 重啟生效**（重啟時 session 重建走動態偵測路徑才重讀 pin/sticky）。執行期 `clear`/`attach` 沿用既有 session 的 profile、不重選（重選需變更 session_id，牽動 arbiter/alias，本案不做）。
 - 清 sticky 不另做指令（YAGNI）：`pin` 正確值即覆蓋（順位 1 蓋順位 2）。
 - **RPC**：`rpc()` 平面 if/elif 加 `session.pin` / `session.unpin`（不引 registry）；回應維持 `dict[str,Any]`+`ok`+失敗附 `error_code`。
 

@@ -1194,7 +1194,9 @@ class SessionManager:
                     return selector, s
             if selector in self._devices:
                 return selector, None
-        return (selector if selector.startswith("/dev/") else None), None
+        if selector.startswith("/dev/serial/by-id/") or selector.startswith("/dev/serial/by-path/"):
+            return selector, None
+        return None, None
 
     def pin_session(self, selector: str, profile_name: str) -> dict[str, Any]:
         if self._template_by_name(profile_name) is None:
@@ -1210,9 +1212,11 @@ class SessionManager:
         return {"ok": True, "device_key": device_key, "profile": profile_name}
 
     def unpin_session(self, selector: str) -> dict[str, Any]:
-        device_key, _ = self._resolve_device_key(selector)
+        device_key, session = self._resolve_device_key(selector)
         if not device_key:
             return {"ok": False, "error_code": "DEVICE_NOT_FOUND"}
+        if session is not None and session.profile_source == "yaml-target":
+            return {"ok": False, "error_code": "PROFILE_IS_EXPLICIT"}
         with self._lock:
             self._profile_pins.pop(device_key, None)
             self._save_state()
@@ -1682,6 +1686,7 @@ class SessionManager:
             if dev is None:
                 return
             real_path = dev.real_path
+            probe_real_path = real_path  # detect 當時的 real_path（#95 HIGH#2 TOCTOU：sticky 須比對此值）
 
         # 四層優先序（#95）：pin > sticky > detect > fallback。pin/sticky 命中跳過 probe。
         tpl: ProfileTemplate | None = None
@@ -1809,7 +1814,7 @@ class SessionManager:
                     session.pending_auto_login = False
                     self._reset_reprobe_progress_locked(session)
                     self._maybe_persist_sticky(by_id=by_id, profile_name=profile.profile_name,
-                                               source=session.profile_source, real_path=real_path)
+                                               source=session.profile_source, real_path=probe_real_path)
                     notify_ready = True
                 else:
                     session.state = "ATTACHED"
