@@ -783,6 +783,17 @@ serialwrap wal current-seq
 - 可用 `SERIALWRAP_WAL_DIR` 覆寫 WAL / mirror log 目錄，例如放到 `~/b-log`；這不會改動 daemon socket / lock 的 `RUN_DIR`。
 - `stream tail` 為 legacy alias；新設計優先使用 `cmd result-tail`。
 
+## 跨平台序列埠（Windows，#84 PORT-1）
+
+序列埠 I/O 已抽象為可替換的 `SerialPort` port（`sw_core/serial_port.py`），使核心序列埠收發不再寫死 POSIX `termios`：
+
+- **Linux/WSL（預設）**：`_PosixSerialPort`（termios 後端），行為與既往**逐位元組等價**；`select()` 多工序列埠 fd 與 human console PTY 不變。
+- **Windows**：`_PySerialPort`（pyserial 後端）。`import sw_core.uart_io` 不再因 `termios`/`fcntl` 而 `ImportError`；`UARTBridge` 的序列埠 RX/TX 可對 `COMx` 運作（已對 CH340 TxRx 短接 loopback 真機驗證 start/RX/TX/WAL/clean-stop）。
+- 後端自動依平台選擇，可用環境變數 `SERIALWRAP_SERIAL_BACKEND`（`auto`／`posix`／`pyserial`）覆寫（測試或強制路徑用）。
+- `pyserial` 為 Windows 後端執行期依賴（`pyproject` 以 `sys_platform=='win32'` 條件安裝）。
+
+> ⚠️ 範圍：本支援僅涵蓋**序列埠層（PORT-1）**。Windows 上 human console（PTY）、daemon 控制通道（AF_UNIX）、`/dev` 裝置列舉、systemd 生命週期等 OS 邊界（#84 的 PORT-2/4/5/6/7/8）仍為 Linux-only，列為後續工作；Windows 上 `start()` 不建 human console，`console-attach` 不支援。
+
 ## 測試
 
 ```bash

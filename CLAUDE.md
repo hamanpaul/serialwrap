@@ -95,7 +95,7 @@ policy_version: 1.0.5
 
 > 開發/操作速查（由 `.github/copilot-instructions.md` 併入，並對齊現行 pipx + systemd + XDG 流程）。
 
-執行期依賴：`PyYAML`、`pyserial`（human console 路徑另需 `jq`、`minicom`）。套件以 `pyproject.toml`（setuptools）打包，console_scripts `serialwrap` / `serialwrapd`，內嵌資產在 `sw_core/assets/`。
+執行期依賴：`PyYAML`；`pyserial` 為 **Windows 序列埠後端**（`sw_core/serial_port.py` 的 `_PySerialPort`，#84 PORT-1）依賴，`pyproject` 以 `sys_platform=='win32'` 條件安裝（Linux/WSL 預設走 termios 後端不需要；亦可手動裝以 `SERIALWRAP_SERIAL_BACKEND=pyserial` 覆寫）。human console 路徑另需 `jq`、`minicom`。套件以 `pyproject.toml`（setuptools）打包，console_scripts `serialwrap` / `serialwrapd`，內嵌資產在 `sw_core/assets/`。
 
 ```bash
 # 安裝（pipx 隔離 venv + serialwrap setup；有 systemd → systemd-user，無 → on-demand 降級）

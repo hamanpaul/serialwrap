@@ -7,7 +7,12 @@ name = "serialwrap"
 dynamic = ["version"]
 description = "UART broker daemon + CLI（多 agent/human 共用序列埠）"
 requires-python = ">=3.10"
-dependencies = ["PyYAML>=6"]
+# pyserial 為 Windows 序列埠後端（sw_core/serial_port.py 的 _PySerialPort）的執行期依賴（#84 PORT-1）；
+# Linux/WSL 預設走 termios 後端不需要它，故僅在 Windows 自動安裝（亦可手動裝以用 SERIALWRAP_SERIAL_BACKEND=pyserial）。
+dependencies = [
+    "PyYAML>=6",
+    "pyserial>=3; sys_platform == 'win32'",
+]
 
 [project.optional-dependencies]
 # 事件規則 regex 改用 google-re2 線性引擎，免疫 catastrophic backtracking（ReDoS，含 #91 多項式類）。
