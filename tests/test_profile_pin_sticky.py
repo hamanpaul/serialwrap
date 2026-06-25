@@ -3,8 +3,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from sw_core.config import SessionProfile, UartProfile
-from sw_core.session_manager import SessionManager
+from sw_core.config import ProfileTemplate, SessionProfile, UartProfile
+from sw_core.session_manager import DeviceInfo, SessionManager
 import sw_core.session_manager as sm_mod
 from sw_core.wal import WalWriter
 
@@ -139,3 +139,36 @@ class TestPriority(_Base):
     def test_unknown_pin_falls_through(self):
         mgr = self._mgr_with_templates()
         self.assertIsNone(mgr._template_by_name("no-such"))
+
+
+class TestStickyWrite(_Base):
+    def _mgr_with_templates(self):
+        prpl = ProfileTemplate(profile_name="prpl-template", platform="prpl",
+                               prompt_regex="x", login_regex="", password_regex="",
+                               ready_probe="echo __R__", uart=UartProfile())
+        return SessionManager([], WalWriter(wal_dir=self._tmp.name), templates=[prpl],
+                              on_ready=lambda _sid: None, on_detached=lambda _sid: None)
+
+    def test_maybe_persist_sticky_writes_when_ready_detected(self):
+        mgr = self._mgr_with_templates()
+        key = "/dev/serial/by-id/usb-Z"
+        mgr._devices[key] = DeviceInfo(by_id=key, real_path="/dev/ttyUSB1")
+        mgr._maybe_persist_sticky(by_id=key, profile_name="prpl-template",
+                                  source="detected", real_path="/dev/ttyUSB1")
+        self.assertEqual(mgr._profile_detected.get(key), "prpl-template")
+
+    def test_no_write_when_source_not_detected(self):
+        mgr = self._mgr_with_templates()
+        key = "/dev/serial/by-id/usb-Z"
+        mgr._devices[key] = DeviceInfo(by_id=key, real_path="/dev/ttyUSB1")
+        mgr._maybe_persist_sticky(by_id=key, profile_name="prpl-template",
+                                  source="fallback", real_path="/dev/ttyUSB1")
+        self.assertNotIn(key, mgr._profile_detected)
+
+    def test_no_write_when_real_path_changed(self):
+        mgr = self._mgr_with_templates()
+        key = "/dev/serial/by-id/usb-Z"
+        mgr._devices[key] = DeviceInfo(by_id=key, real_path="/dev/ttyUSB2")  # 已換
+        mgr._maybe_persist_sticky(by_id=key, profile_name="prpl-template",
+                                  source="detected", real_path="/dev/ttyUSB1")  # attach 當時
+        self.assertNotIn(key, mgr._profile_detected)

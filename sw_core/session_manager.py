@@ -1607,6 +1607,20 @@ class SessionManager:
                 return t
         return None
 
+    def _maybe_persist_sticky(self, *, by_id: str, profile_name: str,
+                              source: str, real_path: str) -> None:
+        """達 READY 的正向偵測才寫 sticky（#95）。TOCTOU：real_path 須與 attach 當時一致。
+        須在 self._lock 內呼叫。"""
+        if source != "detected":
+            return
+        cur = self._devices.get(by_id)
+        if cur is None or cur.real_path != real_path:
+            return
+        if self._profile_detected.get(by_id) == profile_name:
+            return
+        self._profile_detected[by_id] = profile_name
+        self._save_state()
+
     def _default_passthrough_template(self) -> ProfileTemplate | None:
         """auto-detect 失敗時的通用 passthrough fallback。
 
@@ -1758,6 +1772,8 @@ class SessionManager:
                     session.recovery_started_at = None
                     session.pending_auto_login = False
                     self._reset_reprobe_progress_locked(session)
+                    self._maybe_persist_sticky(by_id=by_id, profile_name=profile.profile_name,
+                                               source=session.profile_source, real_path=real_path)
                     notify_ready = True
                 else:
                     session.state = "ATTACHED"
