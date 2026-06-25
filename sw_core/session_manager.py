@@ -222,6 +222,8 @@ class SessionRuntime:
     released_by: str | None = None
     released_at: str | None = None
     released_reason: str | None = None
+    # 動態 profile 來源（#95）：pin / sticky / detected / fallback / yaml-target
+    profile_source: str = "detected"
     # MCU 燒錄狀態（issue #55）：僅 runtime transient，不寫 _save_state / to_public_dict
     flash_prev_state: str | None = None
     # recovery lease stash（Phase B issue #44）
@@ -280,6 +282,7 @@ class SessionRuntime:
             "act_no": self.profile.act_no,
             "device_by_id": self.profile.device_by_id,
             "platform": self.profile.platform,
+            "profile_source": self.profile_source,
             "command_capable": self.profile.command_capable,
             "state": self.state,
             "last_error": self.last_error,
@@ -356,6 +359,9 @@ class SessionManager:
         self._capture_fps: dict[str, Any] = {}  # capture_id → open file object
         self._templates: list[ProfileTemplate] = list(templates) if templates else []
         self._max_sessions = max_sessions
+        # 動態 profile 持久化（#95）：device_key → profile_name
+        self._profile_pins: dict[str, str] = {}
+        self._profile_detected: dict[str, str] = {}
 
         self._load_state()
         for p in profiles:
@@ -366,6 +372,7 @@ class SessionManager:
             profile = dataclasses.replace(p, device_by_id=device_by_id)
             if sid not in self._sessions:
                 self._sessions[sid] = SessionRuntime(session_id=sid, profile=profile)
+                self._sessions[sid].profile_source = "yaml-target"
             self._aliases.set_for_session(sid, profile.alias)
         for sid, meta in self._loaded_released.items():
             s = self._sessions.get(sid)
@@ -435,6 +442,16 @@ class SessionManager:
                 if isinstance(by_id, str) and by_id:
                     self._released_by_ids.add(by_id)
             self._loaded_released = loaded
+        pins = obj.get("profile_pins") if isinstance(obj, dict) else None
+        if isinstance(pins, dict):
+            self._profile_pins = {str(k).strip(): str(v).strip()
+                                  for k, v in pins.items()
+                                  if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip()}
+        detected = obj.get("profile_detected") if isinstance(obj, dict) else None
+        if isinstance(detected, dict):
+            self._profile_detected = {str(k).strip(): str(v).strip()
+                                      for k, v in detected.items()
+                                      if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip()}
 
     def _save_state(self) -> None:
         os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
@@ -448,7 +465,9 @@ class SessionManager:
                     "reason": s.released_reason,
                 }
         payload = json.dumps(
-            {"aliases": self._aliases.dump(), "bindings": dict(self._binding_overrides), "released": released},
+            {"aliases": self._aliases.dump(), "bindings": dict(self._binding_overrides),
+             "released": released, "profile_pins": dict(self._profile_pins),
+             "profile_detected": dict(self._profile_detected)},
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
