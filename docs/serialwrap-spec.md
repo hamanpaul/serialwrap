@@ -516,6 +516,16 @@ background mode 的 `command.result_tail` 在 capture 尚未建立時，會回�
 - `serialwrap log tail-raw|tail-text`
 - `serialwrap stream tail` (legacy alias，對應 `result.tail`)
 - `serialwrap wal export`
+- `serialwrap session pin|unpin`
+
+#### session pin / unpin（動態裝置 profile 持久化，#95）
+
+`serialwrap session pin --selector <COM|alias|by-id|by-path> --profile <name>` 把裝置釘到指定 profile（最高優先，繞過動態偵測，跨重啟保留）；`serialwrap session unpin --selector <...>` 解除 pin（保留自動 sticky）。
+
+- **同款晶片（如 CH340）by-id 相同時，務必以 `/dev/serial/by-path/...` 當 selector**，避免 pin/sticky 張冠李戴（與既有 binding 規範一致）。
+- profile 解析優先序：pin > sticky（偵測達 READY 後自動記住）> 動態偵測 > others-template fallback。
+- `session list` 的 `profile_source` 欄位顯示來源：`pin` / `sticky` / `detected` / `fallback` / `yaml-target`。
+- 錯誤碼：`UNKNOWN_PROFILE`（profile 名不存在）、`PROFILE_IS_EXPLICIT`（對 YAML explicit-target 裝置 pin）、`DEVICE_NOT_FOUND`（selector 解析不到裝置）、`INVALID_ARGS`（缺 selector/profile）。
 
 ### 11.2 RPC
 
@@ -539,6 +549,8 @@ background mode 的 `command.result_tail` 在 capture 尚未建立時，會回�
 - `session.log_start`
 - `session.log_stop`
 - `session.log_status`
+- `session.pin`
+- `session.unpin`
 - `alias.list`
 - `alias.set`
 - `alias.assign`

@@ -228,3 +228,17 @@ class TestRpc(_Base):
         self.assertTrue(r1["ok"]); self.assertTrue(r2["ok"])
         self.assertEqual(seen["pin"], ("COM0", "prpl-template"))
         self.assertEqual(seen["unpin"], "COM0")
+
+
+class TestDeviceKey(_Base):
+    def test_by_path_selector_used_as_key(self):
+        prpl = ProfileTemplate(profile_name="prpl-template", platform="prpl",
+                               prompt_regex="x", login_regex="", password_regex="",
+                               ready_probe="echo __R__", uart=UartProfile())
+        mgr = SessionManager([], WalWriter(wal_dir=self._tmp.name), templates=[prpl],
+                             on_ready=lambda _sid: None, on_detached=lambda _sid: None)
+        bypath = "/dev/serial/by-path/pci-0000:00:14.0-usb-0:1:1.0-port0"
+        mgr._devices[bypath] = DeviceInfo(by_id=bypath, real_path="/dev/ttyUSB0")
+        resp = mgr.pin_session(bypath, "prpl-template")
+        self.assertTrue(resp["ok"])
+        self.assertEqual(mgr._profile_pins[bypath], "prpl-template")
