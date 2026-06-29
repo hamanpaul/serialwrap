@@ -15,3 +15,16 @@ cli:
     help_args: ["--help"]
     reflected_in: "README.md"
     marker: "serialwrap-help"
+  # 群組 help（列出各群組子命令）——新增子命令但未同步 README 時 R-16 FAIL，補掉子命令層的漏記
+  - command: "./serialwrap daemon"
+    help_args: ["--help"]
+    reflected_in: "README.md"
+    marker: "serialwrap-daemon-help"
+  - command: "./serialwrap session"
+    help_args: ["--help"]
+    reflected_in: "README.md"
+    marker: "serialwrap-session-help"
+  - command: "./serialwrap device"
+    help_args: ["--help"]
+    reflected_in: "README.md"
+    marker: "serialwrap-device-help"

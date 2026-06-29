@@ -1185,6 +1185,81 @@ examples:
   serialwrap --endpoint tcp://127.0.0.1:7777 cmd submit --selector COM0 --cmd 'uname -a'
 <!-- END: cli-help marker="serialwrap-help" -->
 
+### 子命令 help（R-16 同步管控）
+
+`serialwrap daemon --help`：
+
+<!-- BEGIN: cli-help marker="serialwrap-daemon-help" -->
+usage: serialwrap daemon [-h] <command> ...
+
+管理 serialwrap daemon 行程：啟動、停止與查詢執行狀態。
+
+positional arguments:
+  <command>
+    start     啟動 daemon（--foreground 可前景執行）
+    stop      停止執行中的 daemon
+    status    顯示 daemon 狀態（pid／sessions／devices／log 路徑／多開偵測 multi_open）
+
+options:
+  -h, --help  show this help message and exit
+<!-- END: cli-help marker="serialwrap-daemon-help" -->
+
+`serialwrap session --help`：
+
+<!-- BEGIN: cli-help marker="serialwrap-session-help" -->
+usage: serialwrap session [-h] <command> ...
+
+管理 session：列舉與綁定、健康探測（self-test）、recover、console 與 interactive lease、capture
+log。
+
+positional arguments:
+  <command>
+    list              列出所有 session 及其狀態
+    clear             清除 session（detach 後會自動 re-attach；交接外部請改用 device release）
+    bind              把 session 綁定到指定裝置 by-id
+    pin               把 device 釘到指定 profile（最高優先，繞過偵測）
+    unpin             解除 device 的 profile pin（保留 sticky）
+    attach            將 session attach 到裝置並建立 bridge
+    self-test         探測 session 健康度，回報 classification 與 recommended_action
+    activity          顯示 session 的 RX／TX／state 活動
+    recover           重建 bridge 修復不健康的 session（TARGET_UNRESPONSIVE 時用這個，非
+                      device attach）
+    console-attach    附加一個 console reader 到 session
+    console-detach    卸除指定的 console reader
+    console-list      列出 session 上的 console readers
+    interactive-open  開啟 interactive lease（給全螢幕互動程式用）
+    interactive-send  送出按鍵／資料到 interactive lease
+    interactive-status
+                      讀取 interactive lease 目前畫面與狀態
+    interactive-close
+                      關閉 interactive lease
+    log-start         開始該 session 的 capture log
+    log-stop          停止該 session 的 capture log
+    log-status        查詢該 session 的 capture log 狀態
+
+options:
+  -h, --help          show this help message and exit
+<!-- END: cli-help marker="serialwrap-session-help" -->
+
+`serialwrap device --help`：
+
+<!-- BEGIN: cli-help marker="serialwrap-device-help" -->
+usage: serialwrap device [-h] <command> ...
+
+管理實體 UART 裝置：列舉裝置，以及把 raw device 暫時交給外部工具獨佔再收回。
+
+positional arguments:
+  <command>
+    list      列出實體 UART 裝置（real_path 與 by-id）
+    release   釋放 raw 裝置給外部工具獨佔（如 MCU 燒錄），進入 RELEASED 不自動搶回
+    attach    收回先前 release 的裝置並重建 console（外部仍持有時回 DEVICE_STILL_HELD，--force
+              略過）
+
+options:
+  -h, --help  show this help message and exit
+<!-- END: cli-help marker="serialwrap-device-help" -->
+
+
 ```bash
 # 啟動 daemon（systemd 模式請改用 serialwrap service start；on-demand 模式才需手動啟動）
 # 經 serialwrap setup 後 profiles 已在 XDG 設定目錄，daemon 預設即可讀取，無需 --profile-dir
