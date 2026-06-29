@@ -292,22 +292,14 @@ serialwrap cmd status --cmd-id <cmd_id>
 - 錯誤碼：`UNKNOWN_PROFILE`（profile 名不存在）、`PROFILE_IS_EXPLICIT`（對 YAML explicit-target 裝置 pin/unpin）、`DEVICE_NOT_FOUND`（selector 解析不到裝置）、`INVALID_ARGS`（缺 selector/profile）。
 - **生效時機**：pin/unpin 寫入後不主動重新 attach；對已存在的 session，**下次 daemon 重啟生效**（重啟時 session 重建走動態偵測路徑才重讀 pin/sticky）。執行期 `clear`/`attach` 沿用既有 session 的 profile、不重選。
 
-### COM 編號確定性綁定 by-id 與 `session renumber`（#100）
+### COM 編號確定性綁定 by-id（#100）
 
-dynamic 自動偵測 session 的 COM 編號**依裝置 by-id 字典序確定性分配**（同款晶片 by-id 衝突時 fallback by-path）：daemon startup 在 spawn 並發 attach threads 之前，先對「當下在線的 dynamic 裝置」一次排序配好 COM rank，因此 **restart 後 COM↔實體板的對應穩定不變**，不再隨並發 attach 完成順序對調。
+dynamic 自動偵測 session 的 COM 編號**依裝置 by-id 字典序確定性分配**：daemon startup 在 spawn 並發 attach threads 之前，先對「當下在線的 dynamic 裝置」一次排序配好 COM rank，因此 **restart 後 COM↔實體板的對應穩定不變**，不再隨並發 attach 完成順序對調。
 
 - **rank 作用域只限 dynamic 自動偵測 session**。explicit YAML `targets` 指定的 COM、`session bind` / `_binding_overrides` 綁定、RELEASED 的裝置都是權威來源，排除在 rank pool 外、COM 不被覆寫。
 - **runtime hotplug**：不同 by-id 的板插入時繼承空出的 DETACHED 槽（維持原 COM 名）；同 by-id 重接總是拿回自己原槽；active session 的 COM 名在 daemon 存活期間不變。
-
-當執行期狀態漂移（例如人為亂序、熱插拔後想 snap 回排序）時，用 **`session renumber`** 一次重排：
-
-```bash
-serialwrap session renumber
-```
-
-- **語意**：把所有 **dynamic** session 的 COM 依 sorted by-id 重排，**無條件強制執行（含 active session、不檢查 busy）**——這是使用者主動選擇的破壞性操作。
-- 重排在 daemon 端單一 lock 區間原子完成 `session_id`（`profile:COM`）、alias、binding、`state.json` 與 arbiter worker 的 remap；**被重編 session 的 in-flight 命令會被丟棄**（force 語意的明確後果）。
-- 回應 `{"ok": true, "renumbered": {"<old_sid>": "<new_sid>", ...}}`；已是排序狀態時 `renumbered` 為空物件（no-op）。
+- **同款晶片（如 CH340）by-id 衝突的 by-path tiebreak**：排序鍵已預留 by-path 次序骨架，但 end-to-end 完整支援為 **TODO**（待 `DeviceInfo.by_path` 接上資料來源）；在此之前 rank 僅依 by-id。
+- **on-demand `session renumber`（執行期把漂移的 COM snap 回排序）已 defer 至 follow-up**：強制重編 active session 牽動 bridge callback / flash state / lease reverse-link，須改以「拆 bridge → 改號 → 重 attach」另案重做。現階段如需重排，以 daemon restart 為暫時手段。
 
 ## Session Template 架構圖
 

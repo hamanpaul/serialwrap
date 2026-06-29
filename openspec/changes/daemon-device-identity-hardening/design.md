@@ -10,8 +10,8 @@
 
 **Goals:**
 - COM↔by-id 對應在 restart / 亂序 attach 下確定性穩定。
-- 提供 on-demand `session renumber` 重排。
 - daemon 主動暴露多開 / two-reader，免 user 手動 `ps`。
+- （on-demand `session renumber` 重排已 defer 至 follow-up，不在本 PR 目標內。）
 
 **Non-Goals:**
 - 不做 #101 自動 refuse/kill/退讓（純偵測+回報）。
@@ -24,15 +24,15 @@
 - **D1：確定性 sorted-by-`device_key` rank，而非 sticky 持久化**。替代方案（持久化 by-id→COM map）需額外 state 與 reconcile，且仍要定義衝突；排序天生 restart-stable 且零持久化。`device_key`=by-id 路徑，同款晶片衝突 fallback by-path。
 - **D2：rank 上移到 lock 內、spawn threads 之前**。替代（在 thread 內讓 `_next_dynamic_com` 算 rank）仍受並發 race；唯有在同步點對「整批在線 dynamic 裝置」一次排序配號才確定。兩條 startup 入口（`service.py:464` `update_devices` + `:465` `bootstrap_attach`）都涵蓋。
 - **D3：rank 僅作用於 dynamic 自動偵測 session**；explicit `targets`/`bind` COM 為權威、排除 pool 外，避免污染既有持久化綁定。
-- **D4：runtime hotplug 沿用現有（使用者拍板 (a)）**；不同 by-id 板繼承空槽，不活體重編 active。on-demand 重排改由 `session renumber` 顯式觸發。
-- **D5：`session renumber` 無條件強制（含 active）**。實作須在單一 lock 區間原子 remap `session_id`（`profile:COM`）牽動的全部狀態（`_sessions` key、`_aliases`、`_binding_overrides`、arbiter worker、in-flight cmd、console/interactive lease、`state.json`）。
+- **D4：runtime hotplug 沿用現有（使用者拍板 (a)）**；不同 by-id 板繼承空槽，不活體重編 active。on-demand 顯式重排（`session renumber`）已 defer 至 follow-up。
+- **D5：`session renumber` defer 至 follow-up；本 PR 不含**。經 reviewer（superpowers + codex）審查：強制重編 active session 會牽動 attach 時以值捕捉 `session_id` 的 bridge callback、flash state、lease reverse-link 等深層管路，須改以「拆 bridge → 改號 → 重 attach」另案重做，故自本 PR 移除。
 - **D6：#101 偵測為 on-demand、module-level helper**（非複用只回 pid 的 `_probe_external_holder` instance method）。doctor 直接用（daemon-less）；daemon status 走 executor offload（`health.status` 在同步 dispatcher，全 /proc 掃描會凍結 event loop）。
 
 ## Risks / Trade-offs
 
-- **[renumber 原子 remap 漏改某狀態 → session 參照斷裂]** → mitigation：集中在單一 method、單一 lock 區間完成所有 remap；TDD 斷言 alias/binding/in-flight 一致；列為 codex 複審重點。
+- **[renumber 原子 remap 漏改某狀態 → session 參照斷裂]** → 即此風險導致 `session renumber` defer 至 follow-up（bridge callback / flash state / lease reverse-link 須改以拆 bridge → 改號 → 重 attach 重做），本 PR 不含。
 - **[跨 uid 讀不到 `/proc/<pid>/fd` → 無法判定 tty 持有者]** → mitigation：明確降級為 `permission`/`unknown` 狀態並寫進輸出契約，不靜默；至少回報「另有 serialwrapd 存在」。
-- **[hotplug (a) 與 #100「COM 誠實對應實體板」部分矛盾]** → 已知取捨，使用者明確選 (a)；以 `session renumber` 作為矯正手段。
+- **[hotplug (a) 與 #100「COM 誠實對應實體板」部分矛盾]** → 已知取捨，使用者明確選 (a)；矯正手段（`session renumber`）defer 至 follow-up，現階段以 restart 重排為暫時手段。
 - **[daemon status 掃 /proc 阻塞 event loop]** → mitigation：executor offload 或快取，不在 RPC 同步路徑掃描。
 
 ## Migration Plan
@@ -42,4 +42,4 @@
 
 ## Open Questions
 
-- 無（brainstorm + Codex 對抗審查已收斂；renumber 原子 remap 的具體 lock 邊界於 tasks/實作釘死）。
+- `session renumber` 的「拆 bridge → 改號 → 重 attach」具體編排（bridge callback 重綁、flash state / lease reverse-link 處理）於 follow-up 另案定案。

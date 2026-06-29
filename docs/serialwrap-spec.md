@@ -380,20 +380,18 @@ flowchart TD
 - 若看到 shell prompt，送 `ready_probe` 後回 `READY`
 - 若沒看到 prompt，保留 bridge 並停在 `ATTACHED`
 
-### 8.4 COM 編號確定性 rank 與 `session.renumber`（#100）
+### 8.4 COM 編號確定性 rank（#100）
 
-dynamic 自動偵測 session 的 COM 編號**依裝置 by-id 字典序確定性分配**（排序鍵 `device_sort_key(by_id, by_path)`：by-id 優先、同款晶片 by-id 衝突時 fallback by-path）：
+dynamic 自動偵測 session 的 COM 編號**依裝置 by-id 字典序確定性分配**（排序鍵 `device_sort_key(by_id, by_path)`：以 by-id 為主）：
 
 - daemon startup 在 spawn 並發 attach threads 之前（`SerialwrapService.start()` 於 `update_devices` / `bootstrap_attach` 之前呼叫 `prepare_dynamic_rank`），對「當下在線的 dynamic 裝置」一次排序配好 COM rank，因此 restart 後 COM↔板對應穩定不變。
 - rank 作用域**只限 dynamic**：explicit YAML `targets`、`session.bind` / `_binding_overrides`、RELEASED 裝置排除在 pool 外，COM 由其權威來源決定。
+- startup 預配（`_pending_com`）的 lifecycle：對應裝置離線時，`update_devices` 會 prune 其 pending，COM 號隨即可被回收（`_next_dynamic_com` 純掃描最低空號）。
 - runtime hotplug：不同 by-id 繼承空出的 DETACHED 槽；同 by-id 重接拿回原槽；active session 的 COM 名在 daemon 存活期間不變。
 
-**RPC `session.renumber`**（params `{}`）：
+**by-path tiebreak（TODO）**：`device_sort_key` 已接受 by-path 參數作為同 by-id（如同款 CH340）的次序 tiebreak，但 end-to-end 完整支援為 **TODO**——需 `DeviceInfo.by_path` 欄位接上資料來源，在此之前 `_by_path_for` 一律回 None、rank 僅依 by-id。
 
-- 把所有 dynamic session 的 COM 依 sorted by-id 重排，**無條件強制執行（含 active、不檢查 busy）**。
-- daemon 端在單一 lock 區間原子 remap `session_id`（`profile:COM`）、alias、binding、`state.json` 與 `CommandArbiter` worker；**被重編 session 的 in-flight 命令會被丟棄**（force 語意）。
-- 回應：`{"ok": true, "renumbered": {"<old_session_id>": "<new_session_id>", ...}}`；已排序時 `renumbered` 為空物件。
-- CLI：`serialwrap session renumber`。
+**on-demand `session renumber` 已 defer 至 follow-up**：把執行期漂移的 COM snap 回 sorted by-id 序的 RPC/CLI，因強制重編 active session 牽動 bridge callback / flash state / lease reverse-link，須改以「拆 bridge → 改號 → 重 attach」另案重做，本版不含。
 
 ### 8.5 同機多開（two-reader）偵測（#101）
 

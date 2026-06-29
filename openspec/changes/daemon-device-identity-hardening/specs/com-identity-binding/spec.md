@@ -2,7 +2,9 @@
 
 ### Requirement: COM 編號依 device_key 排序確定性指派
 
-daemon 在 startup 對「當下在線的 dynamic 自動偵測裝置」SHALL 依 `device_key`（`/dev/serial/by-id` 路徑字串；同款晶片 by-id 衝突時 fallback `/dev/serial/by-path`）排序後的 rank 指派 COM 編號（`COM0, COM1, …`），且指派 MUST 在配置 lock 內、於 spawn 並發 attach thread 之前完成，使 COM↔裝置 對應與 attach 完成順序無關。
+daemon 在 startup 對「當下在線的 dynamic 自動偵測裝置」SHALL 依 `device_key`（`/dev/serial/by-id` 路徑字串）排序後的 rank 指派 COM 編號（`COM0, COM1, …`），且指派 MUST 在配置 lock 內、於 spawn 並發 attach thread 之前完成，使 COM↔裝置 對應與 attach 完成順序無關。
+
+排序鍵已預留 by-path 次序 tiebreak 骨架（`device_sort_key` 接受 by-path 參數）；同款晶片（如 CH340）by-id 相同時以 by-path 去衝突的 **end-to-end 完整支援為 TODO**，待 `DeviceInfo.by_path` 欄位接上資料來源，在此之前 rank 僅依 by-id。
 
 #### Scenario: 亂序/並發 attach 仍得確定性 COM
 - **WHEN** 兩片 dynamic 裝置（by-id `AC01QZT0`、`AQ00OAQ7`）以任意順序或並發被偵測 attach
@@ -12,9 +14,9 @@ daemon 在 startup 對「當下在線的 dynamic 自動偵測裝置」SHALL 依 
 - **WHEN** daemon restart 且兩片裝置皆在線
 - **THEN** 重新指派的 COM↔by-id 對應與 restart 前相同
 
-#### Scenario: 同款晶片 by-id 衝突改用 by-path
+#### Scenario: 同款晶片 by-id 衝突改用 by-path（TODO：待 DeviceInfo.by_path）
 - **WHEN** 兩裝置 by-id 相同（如同款 CH340）
-- **THEN** 以 by-path 作為排序鍵決定 rank，不致遺漏或對調
+- **THEN** 以 by-path 作為排序鍵決定 rank，不致遺漏或對調（排序單元已備；end-to-end 待 `DeviceInfo.by_path` 接上）
 
 ### Requirement: rank 僅作用於 dynamic 自動偵測 session
 
@@ -35,15 +37,3 @@ daemon 存活期間，runtime 熱插裝置 SHALL 維持既有行為：同 by-id 
 #### Scenario: 不同板繼承空出的槽
 - **WHEN** COM0 的裝置拔除（session 轉 DETACHED）後插入不同 by-id 的板
 - **THEN** 新板繼承 COM0（沿用既有 DETACHED-rebind），active session 不被打斷
-
-### Requirement: session renumber on-demand 強制重排
-
-系統 SHALL 提供 `session renumber`（RPC `session.renumber` + CLI `session renumber`），將所有 dynamic session 的 COM 依 sorted by-id 重排，並 MUST 無條件強制執行（不因 session busy/active 而拒絕）。重排 MUST 原子地 remap 受 `session_id`（`profile:COM`）影響的全部狀態（session map key、alias、binding override、arbiter worker、in-flight 命令、console/interactive lease、持久化）。
-
-#### Scenario: 重排回 sorted 序
-- **WHEN** 既有 COM 對應因 hotplug 偏離 by-id 排序，user 執行 `session renumber`
-- **THEN** 所有 dynamic session 的 COM 重排為 sorted by-id 序
-
-#### Scenario: 強制重排不破壞參照
-- **WHEN** 有 active session（含 console / in-flight 命令）時執行 `session renumber`
-- **THEN** 重排仍執行，且 alias / binding / 命令參照與新 session_id 一致、無斷裂
