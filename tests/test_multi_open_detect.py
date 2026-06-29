@@ -70,6 +70,25 @@ class TestDetectMultiOpen(unittest.TestCase):
         self.assertFalse(res["multi_open"])
         self.assertEqual(res["daemons"], [])
 
+    def test_grep_serialwrapd_not_misdetected(self) -> None:
+        """#101 5a：`grep serialwrapd` 的命令列僅「字串含 serialwrapd」，argv0 為 grep、
+        無任何 arg 的 basename 為 serialwrapd.py，故不應被誤判為 daemon。"""
+        from sw_core.multi_open import detect_multi_open
+
+        _make_fake_proc(
+            self.proc,
+            {
+                # 真正的 daemon（薄 shim 路徑）
+                "2114": {"cmdline": "python\0/opt/serialwrapd.py\0", "fd": {}},
+                # `grep serialwrapd` —— 不應計入
+                "4000": {"cmdline": "grep\0serialwrapd\0", "fd": {}},
+            },
+        )
+        res = detect_multi_open(proc_root=str(self.proc), tty_paths=[])
+        self.assertEqual({d["pid"] for d in res["daemons"]}, {2114})
+        # 只有一個真正 daemon → 非多開
+        self.assertFalse(res["multi_open"])
+
     def test_missing_proc_root_degrades_unknown(self) -> None:
         from sw_core.multi_open import detect_multi_open
 

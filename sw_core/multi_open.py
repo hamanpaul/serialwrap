@@ -25,13 +25,31 @@ def _iter_pids(proc_root: str):
 
 
 def _is_serialwrapd(proc_root: str, pid: int) -> bool:
-    """以 ``/proc/<pid>/cmdline`` 任一參數含 ``serialwrapd`` 判定是否為 daemon 程序。"""
+    """判定 ``/proc/<pid>`` 是否為 serialwrapd daemon 程序（#101 5a）。
+
+    僅在以下兩種情形之一才算，避免 ``grep serialwrapd`` / 編輯器命令列等「僅命令列字串含
+    serialwrapd」的程序被誤判為 daemon：
+
+    - argv0 的 basename 為 ``serialwrapd``（console_script 進入點），或
+    - 任一參數的 basename 為 ``serialwrapd.py`` 或以 ``serialwrapd.py`` 結尾（薄 shim 路徑）。
+
+    不在此處做 TGID 去重：``/proc`` 頂層只列 thread group leader（TGID）、不列同 group 的子
+    thread，故同一 daemon 不會在頂層重複出現，無需去重。
+    """
     try:
         with open(f"{proc_root}/{pid}/cmdline", "rb") as fh:
-            parts = fh.read().split(b"\0")
+            raw = fh.read()
     except OSError:
         return False
-    return any(b"serialwrapd" in p for p in parts)
+    parts = [p.decode("utf-8", "surrogateescape") for p in raw.split(b"\0") if p]
+    if not parts:
+        return False
+    if os.path.basename(parts[0]) == "serialwrapd":
+        return True
+    return any(
+        os.path.basename(p) == "serialwrapd.py" or p.endswith("serialwrapd.py")
+        for p in parts
+    )
 
 
 def detect_multi_open(proc_root: str = "/proc", tty_paths: list[str] | None = None) -> dict:
