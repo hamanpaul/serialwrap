@@ -441,7 +441,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="systemd-system 模式下，daemon stop 重導至 service stop 時以 sudo 執行",
     )
-    daemon_sub.add_parser("status", help="顯示 daemon 狀態（pid／sessions／devices／log 路徑）")
+    daemon_sub.add_parser("status", help="顯示 daemon 狀態（pid／sessions／devices／log 路徑／多開偵測 multi_open）")
 
     p_device = sub.add_parser(
         "device",
