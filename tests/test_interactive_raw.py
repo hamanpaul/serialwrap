@@ -583,7 +583,10 @@ class TestSelfHealPeriodicGrant(unittest.TestCase):
         # 設定 bridge owner（表示 console 當前持有 ownership）
         bridge.set_interactive_owner(f"human:{cid}")
 
-        # monkeypatch：primary_cid 永遠視為有 peer（不依賴 /proc）
+        # monkeypatch /proc 掃描：reaper 算出的共享 held 含 primary 的 slave_path（確定性，
+        # 不依賴真實 /proc）。self-heal 複用此 held（snap["vtty"] in held）判定活 primary。
+        bridge._enumerate_all_held_paths = lambda: {"/dev/pts/77"}  # type: ignore[method-assign]
+        # 保留 console_has_external_peer monkeypatch 作 held=None fallback 路徑的保險（一般不會走到）
         bridge.console_has_external_peer = lambda client_id: client_id == cid  # type: ignore[method-assign]
 
         # 掛到 session

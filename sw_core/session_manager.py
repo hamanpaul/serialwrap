@@ -839,8 +839,9 @@ class SessionManager:
 
                 # lease-backed 自癒：對每個無 owner / 無 agent / 無 flash 的 bridge，
                 # 若 primary console 仍有外部 peer 但 session layer 已無 lease → 重授。
-                # snapshot / console_has_external_peer 在 self._lock 外（避免鎖內 I/O）；
-                # session 狀態突變在 with self._lock 內；try_grant_interactive_if_idle 原子。
+                # snapshot 在 self._lock 外（避免鎖內 I/O）；活 primary 判定複用 reaper 已算出的
+                # 共享 held（不重掃 /proc）；session 狀態突變在 with self._lock 內；
+                # try_grant_interactive_if_idle 原子。
                 for bridge in bridges:
                     try:
                         snap = bridge.snapshot()
@@ -854,9 +855,15 @@ class SessionManager:
                         primary_cid = snap["primary_client_id"]
                         if not primary_cid:
                             continue
-                        # 活 primary 判定（鎖外）：primary 的 slave_path 是否被外部持有
-                        if not bridge.console_has_external_peer(primary_cid):
-                            continue
+                        # 活 primary 判定（鎖外）：複用 reaper 已算出的共享 held（snapshot 的 vtty
+                        # 即 primary client 的 slave_path），避免每 bridge 在 _state_lock 內重掃 /proc。
+                        # held 為 None（procfs 不可用）或 vtty 未知時，才退回 console_has_external_peer
+                        # 做保守判定（沿用 _client_has_external_peer_locked 既有語意）。
+                        if held is not None and snap["vtty"] is not None:
+                            if snap["vtty"] not in held:
+                                continue  # primary 的 slave 未被外部持有 → 非活 console
+                        elif not bridge.console_has_external_peer(primary_cid):
+                            continue  # procfs 不可用 / vtty 未知時的保守 fallback
                         with self._lock:
                             session = self._session_for_bridge_locked(bridge)
                             if session is None or session.state not in {"READY", "ATTACHED"}:
