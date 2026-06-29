@@ -62,6 +62,43 @@ class TestDetectMultiOpen(unittest.TestCase):
         self.assertFalse(res["multi_open"])
         self.assertEqual([d["pid"] for d in res["daemons"]], [2114])
 
+    def test_detect_pipx_console_script_form(self) -> None:
+        """#101 實機回歸：pipx/venv console_script 形式（實機 prod daemon）——
+        ``python /home/.../bin/serialwrapd --socket ...``，argv1 basename 為
+        ``serialwrapd``（無 ``.py``）。曾因 _is_serialwrapd 只認 ``serialwrapd.py``
+        而漏掉真正的 prod daemon（實機驗證才現形）。"""
+        from sw_core.multi_open import detect_multi_open
+
+        _make_fake_proc(
+            self.proc,
+            {
+                "1095518": {
+                    "cmdline": "/home/u/.local/share/pipx/venvs/serialwrap/bin/python\0"
+                    "/home/u/.local/bin/serialwrapd\0--socket\0/run/serialwrap/serialwrapd.sock\0",
+                    "fd": {"7": "/dev/ttyUSB1"},
+                },
+                "1200888": {"cmdline": "python3\0/worktree/serialwrapd.py\0", "fd": {}},
+            },
+        )
+        res = detect_multi_open(proc_root=str(self.proc), tty_paths=["/dev/ttyUSB1"])
+        self.assertTrue(res["multi_open"])
+        self.assertEqual({d["pid"] for d in res["daemons"]}, {1095518, 1200888})
+        self.assertEqual(res["holders"]["/dev/ttyUSB1"], 1095518)
+
+    def test_argv0_serialwrapd_py_detected(self) -> None:
+        """argv0 直接是 serialwrapd.py（直接 exec shim）也要算（回歸：曾把 .py 判定
+        限縮到 argv1+ 而漏掉 argv0）。"""
+        from sw_core.multi_open import detect_multi_open
+
+        _make_fake_proc(
+            self.proc,
+            {"1": {"cmdline": "serialwrapd.py\0", "fd": {}},
+             "2": {"cmdline": "serialwrapd.py\0", "fd": {}}},
+        )
+        res = detect_multi_open(proc_root=str(self.proc), tty_paths=[])
+        self.assertTrue(res["multi_open"])
+        self.assertEqual({d["pid"] for d in res["daemons"]}, {1, 2})
+
     def test_no_daemons(self) -> None:
         from sw_core.multi_open import detect_multi_open
 

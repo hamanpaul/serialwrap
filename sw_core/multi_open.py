@@ -27,11 +27,16 @@ def _iter_pids(proc_root: str):
 def _is_serialwrapd(proc_root: str, pid: int) -> bool:
     """判定 ``/proc/<pid>`` 是否為 serialwrapd daemon 程序（#101 5a）。
 
-    僅在以下兩種情形之一才算，避免 ``grep serialwrapd`` / 編輯器命令列等「僅命令列字串含
-    serialwrapd」的程序被誤判為 daemon：
+    需涵蓋三種真實啟動形式，同時排除 ``grep serialwrapd`` 這類「裸字串含 serialwrapd」誤判：
 
-    - argv0 的 basename 為 ``serialwrapd``（console_script 進入點），或
-    - 任一參數的 basename 為 ``serialwrapd.py`` 或以 ``serialwrapd.py`` 結尾（薄 shim 路徑）。
+    - argv0 的 basename 為 ``serialwrapd``（直接 exec console_script，或 pipx 入口），或
+    - 某個**路徑型**參數（含 ``/``）的 basename 為 ``serialwrapd``——pipx/venv console_script
+      被 python 執行的形式 ``python /path/bin/serialwrapd --socket ...``（argv0=python、
+      argv1=可執行檔路徑、basename 無 ``.py``；**這是實機 prod daemon 的形式**），或
+    - 某參數以 ``serialwrapd.py`` 結尾（薄 shim ``python serialwrapd.py``）。
+
+    關鍵：對裸名 ``serialwrapd`` 要求含路徑分隔 ``/`` 才算，以排除 ``grep serialwrapd``
+    （arg 為裸字串、無路徑）的誤判；``serialwrapd.py`` 因副檔名特異性高，放寬不要求路徑。
 
     不在此處做 TGID 去重：``/proc`` 頂層只列 thread group leader（TGID）、不列同 group 的子
     thread，故同一 daemon 不會在頂層重複出現，無需去重。
@@ -46,10 +51,15 @@ def _is_serialwrapd(proc_root: str, pid: int) -> bool:
         return False
     if os.path.basename(parts[0]) == "serialwrapd":
         return True
-    return any(
-        os.path.basename(p) == "serialwrapd.py" or p.endswith("serialwrapd.py")
-        for p in parts
-    )
+    # 任一參數（含 argv0）以 serialwrapd.py 結尾：薄 shim，無論直接 exec 或 python 執行。
+    if any(p.endswith("serialwrapd.py") for p in parts):
+        return True
+    # console_script 路徑形式（python /path/bin/serialwrapd）：某路徑型參數 basename 為
+    # serialwrapd 且含 '/' 才算，避免 `grep serialwrapd` 裸字串誤判。
+    for p in parts[1:]:
+        if "/" in p and os.path.basename(p) == "serialwrapd":
+            return True
+    return False
 
 
 def detect_multi_open(proc_root: str = "/proc", tty_paths: list[str] | None = None) -> dict:
