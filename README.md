@@ -614,7 +614,7 @@ ocp-mcu-upgrade -d /tmp/serialwrap/dev/ttyMCU -b 115200 -t 8 -e -s -i fw.bin
 1. 視需要自動啟動 daemon
 2. 視需要對 selector 執行 `session attach`
 3. 透過 `session console-attach` 取得專屬 PTY
-4. 預設用 `script -qef` 包住 minicom 記錄一份 `mini_<COM>_<timestamp>.log` transcript（預設在 `~/b-log`，可用 `BLOG_DIR` 覆寫），避免 minicom 內建 `-C` 在 PTY / resize / 高頻 RX 下的 native crash 風險
+4. 預設用 minicom 內建 `-C` 記錄一份 `mini_<COM>_<timestamp>.log` 純序列 transcript（預設在 `~/b-log`，可用 `BLOG_DIR` 覆寫）；需要含完整終端畫面的 transcript 可設 `MINICOM_CAPTURE_MODE=script` 改用 `script -qef` 包裹
 5. 啟動 `minicom`
 6. 結束後自動 `session console-detach`
 
@@ -638,8 +638,8 @@ minicom -D /dev/ttyUSB0
 - 第二個以後的 minicom console 因為 interactive lease 已存在，仍走 line-buffer 模式（broker 提供本地回顯與 backspace 行編輯）。
 - bridge rebuild / reattach 時，broker 會盡量保留既有 console PTY 與 human ownership，避免既有 minicom 掛到 stale `/dev/pts/*`。
 - Broker minicom 的自動 transcript 可用 `MINICOM_CAPTURE_MODE=script|minicom|off` 控制：
-  - `script`（預設）：使用 `script -qef` 包住 minicom，不傳 `-C` 給 minicom。
-  - `minicom`：明確 opt-in 使用 minicom 內建 `-C`；此模式在 PTY / resize / 高頻輸出下較容易觸發 minicom native crash 風險。
+  - `script`：使用 `script -qef` 包住 minicom（完整終端 transcript，會含 minicom 自身 UI/顏色），不傳 `-C` 給 minicom。
+  - `minicom`（預設）：使用 minicom 內建 `-C`，產生不含 minicom UI 的乾淨序列 log。
   - `off`：關閉自動 transcript，不建立 log、不使用 `script` wrapper，也不自動傳 `-C`。
 - Legacy `MINICOM_CAPTURE_WRAPPER=1` 仍等同 `MINICOM_CAPTURE_MODE=script`；若未設定 `MINICOM_CAPTURE_MODE` 且明確設定 `MINICOM_CAPTURE_WRAPPER=0`，仍保留舊版 minicom `-C` 行為。
 - 常見 human/minicom 互動式命令（例如 `vi`、`vim`、`top`、`htop`、`less`、`menuconfig`）會自動升級成 human interactive ownership，不再因為等不到 shell prompt 而自動觸發 recover / reboot。
