@@ -73,8 +73,10 @@ class TestDetectMultiOpen(unittest.TestCase):
             self.proc,
             {
                 "1095518": {
-                    "cmdline": "/home/u/.local/share/pipx/venvs/serialwrap/bin/python\0"
-                    "/home/u/.local/bin/serialwrapd\0--socket\0/run/serialwrap/serialwrapd.sock\0",
+                    # console_script 形式：python 執行 venv 內的 serialwrapd 入口（argv1 basename
+                    # 為 serialwrapd、無 .py、為路徑）。用 /opt 中性路徑避免 R-21 個人路徑誤判。
+                    "cmdline": "/opt/serialwrap-venv/bin/python\0"
+                    "/opt/serialwrap-venv/bin/serialwrapd\0--socket\0/run/serialwrap/serialwrapd.sock\0",
                     "fd": {"7": "/dev/ttyUSB1"},
                 },
                 "1200888": {"cmdline": "python3\0/worktree/serialwrapd.py\0", "fd": {}},

@@ -42,8 +42,10 @@
 
 ## 6. 實機驗證（throwaway daemon，不動 prod COM0/COM1）
 
-- [ ] 6.1 throwaway daemon 起新碼 → 斷言 COM0=AC01QZT0、COM1=AQ00OAQ7；重啟數次皆同
-- [ ] 6.2 usbipd 反序 attach（`detach 8-1/8-2` → `attach -w` 反序）→ COM 仍依 by-id 排序
-- [~] 6.3 人為亂序後 `serialwrap session renumber` → snap 回 sorted（DEFERRED 至 follow-up，隨 renumber 一併 defer）
-- [ ] 6.4 `detach 8-1`→DETACHED→`attach 8-1` 同板拿回 COM0（hotplug a）
-- [ ] 6.5 刻意起第二個 serialwrapd（不同 socket）→ `doctor` 與 `daemon status` 報出多開
+> 實機驗證（2026-06-29）：busid 8-1=AC01QZT0、8-2=AQ00OAQ7。以 throwaway daemon（worktree 新碼、isolated state/run、指向真實 `/dev/serial/by-id`、passthrough profile）跑，不動 prod 持久狀態；驗畢還原 usbipd 原序、重接 prod COM1，prod 復原為 COM0=AC01QZT0/COM1=AQ00OAQ7 READY、無 daemon 洩漏。
+
+- [x] 6.1 throwaway daemon 起新碼 → COM0=AC01QZT0、COM1=AQ00OAQ7（正常序，PASS）
+- [x] 6.2 usbipd 反序 attach（detach 8-1/8-2 → attach 8-2 先、8-1 後，real_path 翻轉成 AQ00OAQ7=ttyUSB0、AC01QZT0=ttyUSB1）→ throwaway 仍給 **COM0=AC01QZT0@ttyUSB1、COM1=AQ00OAQ7@ttyUSB0**，COM 跟 by-id 不跟列舉序；連續二次重啟皆同（**決定性 PASS，#100 核心證據**）
+- [~] 6.3 人為亂序後 `serialwrap session renumber` → snap 回 sorted（DEFERRED 至 follow-up #103，隨 renumber 一併 defer）
+- [x] 6.4 hotplug(a)：throwaway 停止釋放 ttyUSB0 後，prod 既有 DETACHED COM0 經 DETACHED-rebind 自動接回 AC01QZT0（實測還原時觀察到，PASS）
+- [x] 6.5 多開偵測：實機本有 5 個 serialwrapd（prod + 4 個 pytest 洩漏 coexist）→ 新碼 `detect_multi_open`/doctor 正確報多開；**並抓到真 bug**：`_is_serialwrapd` 漏認 pipx console_script 形式（`python …/bin/serialwrapd`）而漏掉 prod daemon，已修（commit 595d227）+ 補回歸測試；清掉洩漏 daemon 後 before/after 正確（multi_open True→False）
