@@ -100,16 +100,13 @@ bridge SHALL 另提供一個**原子條件式 grant** primitive：於單次 `_st
 - **WHEN** 已有一個持 lease 的活 human owner，第二個活 console 連入
 - **THEN** 自癒/接管 SHALL NOT 把 ownership 從第一個活 owner 奪走（原子條件式 grant 因 `interactive_owner` 非 None 而失敗；維持既有「第二 console 不奪權」契約）
 
-### Requirement: console-attach 連入 client SHALL 取得 raw ownership 且 SIGHUP SHALL detach
+### Requirement: console-attach 連入 client SHALL 取得 raw ownership
 
-在 READY/ATTACHED 下透過 `console-attach` 連入的 human console，經授予流程後其鍵入 SHALL 走 raw 透傳（`\x1b[A`/`\t` 等 SHALL 原樣送達 UART，而非落入 line-buffer）。broker minicom wrapper SHALL 於終端關閉（SIGHUP，含關視窗/分頁/SSH/WSL pane）時執行 console-detach，使對應 broker console 不殘留為孤兒。
+在 READY/ATTACHED 下透過 `console-attach` 連入的 human console，經授予流程後其鍵入 SHALL 走 raw 透傳（`\x1b[A`/`\t` 等 SHALL 原樣送達 UART，而非落入 line-buffer）。
+
+> 註：關終端（SIGHUP）的 console-detach 不在本變更範圍——真機驗證（真 minicom + 真 tmux pane kill＝process-group SIGHUP）證明既有 `minicom_router.sh` 於前景 minicom 被 HUP 殺死後即跑到顯式 cleanup → `console-detach`，不留孤兒。真正需處理的 orphan 來源是 SIGKILL/crash（跑不到 cleanup），由「dead orphan console 經 liveness 週期回收」requirement 涵蓋。
 
 #### Scenario: attach 後方向鍵/Tab 原樣到 UART
 
 - **WHEN** human 經 console-attach 連入一個 READY session（無其他活 owner）
 - **THEN** 該 client SHALL 取得 `interactive_owner`，其送出的 `\x1b[A`/`\t` SHALL 原樣寫入 UART（非經 line-buffer 行編輯）
-
-#### Scenario: 關終端 SIGHUP 觸發 detach
-
-- **WHEN** 執行中的 minicom wrapper 收到 SIGHUP（終端關閉）
-- **THEN** wrapper SHALL 執行 `session console-detach`，broker SHALL 移除對應 console、不殘留孤兒

@@ -4,7 +4,7 @@
 
 **Goal:** 修好 minicom 因 serialwrap 端 console 生命週期問題造成的兩個同源回歸——孤兒/stale console 累積（#76 掉字/卡頓）與 human console 掉回 line-buffer（症狀1：Tab/方向鍵失效）。
 
-**Architecture:** 三條協同修法。Fix2＝關終端 SIGHUP 時可靠 detach（minicom wrapper）＋ daemon 週期主動回收無 reader 的孤兒 console（含死掉的 primary）。Fix3＝human lease 被動拆除加 peer-loss grace（防 flap）＋ lease-backed 週期自癒重授 raw ownership。所有跨層 bridge 狀態存取走**原子鎖內快照**與**原子條件式 grant**（Codex 對抗審查 finding-2），鎖序 `SessionManager._lock ⊃ UARTBridge._state_lock`、`/proc` 掃描一律在鎖外。
+**Architecture:** 兩條協同修法（原 Fix2 的 SIGHUP-trap 子項經真機驗證為非必要，已 drop——見 Task 1）。Fix2＝daemon 週期主動回收無 reader 的孤兒 console（含死掉的 primary；涵蓋 SIGKILL/crash 等所有 orphan 來源——關終端的 process-group SIGHUP 既有碼已自行 cleanup detach，不需處理）。Fix3＝human lease 被動拆除加 peer-loss grace（防 flap）＋ lease-backed 週期自癒重授 raw ownership。所有跨層 bridge 狀態存取走**原子鎖內快照**與**原子條件式 grant**（Codex 對抗審查 finding-2），鎖序 `SessionManager._lock ⊃ UARTBridge._state_lock`、`/proc` 掃描一律在鎖外。
 
 **Tech Stack:** Python 3.10+（`from __future__ import annotations`、完整型別標註、`threading.RLock`/`Lock`、`@dataclasses.dataclass`）、bash（minicom_router.sh）、pytest/unittest（既有 PTY 測試慣例）。
 
@@ -12,7 +12,7 @@
 
 **前置（已完成的實機重現，餵入本計畫）：**
 - 症狀1：`serialwrap session console-list` 顯示 COM0/COM1 `interactive_session_id:null`、兩 console `interactive_owner:false`（line-buffer）；各 `console_count:2`＝1 真 minicom + 1 個 label=`primary` 死 console（pts 僅 daemon slave、無外部 reader、因 primary 永不 reap 卡死）。
-- SIGHUP 孤兒：用真 `minicom_router.sh` 走 broker 路徑 + fake-serialwrap 記錄呼叫 + fake-minicom `sleep` + `kill -HUP`：紀錄只見 `session list`、`console-attach`，**無 `console-detach`** → 孤兒（重現 bug）。
+- ~~SIGHUP 孤兒~~（**已推翻**）：初次用 `kill -HUP <router_pid>`（只送 router、非 process-group）誤判為孤兒；改用**真 minicom + 真 tmux `kill-session`**（= 關終端 process-group SIGHUP）後證明**有無 HUP trap 都會 detach、不留孤兒**（process-group HUP 先殺 minicom → router 跑到 :363 顯式 cleanup）。故 Task 1 drop，orphan 防護交給 Task 3 reaper（涵蓋 SIGKILL/crash）。
 
 ---
 
@@ -20,14 +20,14 @@
 
 | 檔案 | 變更 | 責任 |
 |---|---|---|
-| `sw_core/assets/tools/minicom_router.sh` | 修改（`trap` 兩處） | wrapper：SIGHUP 也跑 cleanup→console-detach |
 | `sw_core/constants.py` | 新增常數 | `_HUMAN_PEER_GRACE_S` |
 | `sw_core/uart_io.py` | 修改 | `ConsoleClient.internal`、`reap_stale_consoles()`、`snapshot()` 擴充、`try_grant_interactive_if_idle()` |
 | `sw_core/session_manager.py` | 修改 | `InteractiveLease.peer_lost_at`、`_refresh_interactive_locked` grace、`reconcile_readiness` 接 reaper + lease-backed 自癒 |
-| `tests/test_minicom_router.py` | 新增測試 | SIGHUP detach |
 | `tests/test_uart_io.py` | 新增測試 | internal flag、reaper、snapshot、原子 grant |
 | `tests/test_interactive_raw.py` | 新增測試 | grace、自癒、TOCTOU、真 PTY attach 授予 |
 | `README.md` / `CHANGELOG.md` | 修改 | 契約對齊（R-18）、變更紀錄 |
+
+> 註：`minicom_router.sh` / `tests/test_minicom_router.py` 原列於 Task 1（SIGHUP trap），經真機驗證 drop，故不在本 PR 變更範圍。
 
 **測試 fixture 慣例：** 各 task 測試出現的 `_make_bridge` / `_make_session_manager_with_ready_bridge` / `_attach_human_owner` / `bridge_console_peer_returns` 為示意名；實作時**優先沿用 `tests/test_uart_io.py`、`tests/test_interactive_raw.py`、`tests/test_session_bind.py` 既有的 bridge/SessionManager 建構 fixture**，無等價者才新增最小 helper（建真 `UARTBridge`/`SessionManager` + 假 PTY device，比照既有測試）。peer 判定的 monkeypatch 以該檔既有方式為準。
 
@@ -41,116 +41,16 @@
 
 ---
 
-## Task 1: Fix2 — minicom wrapper SIGHUP detach
+## Task 1: ~~Fix2 — minicom wrapper SIGHUP detach~~ —— **DROPPED（真機驗證推翻）**
 
-**Files:**
-- Modify: `sw_core/assets/tools/minicom_router.sh:355,362`
-- Test: `tests/test_minicom_router.py`（新增 1 個 method）
-
-- [ ] **Step 1: 寫 failing 測試**（複製既有 `test_broker_console_detaches_after_minicom_nonzero_exit` 的 stub 慣例，改送 SIGHUP）
-
-```python
-    def test_broker_console_detaches_on_sighup(self) -> None:
-        with self._temporary_directory() as td:
-            root = Path(td)
-            fake_minicom = root / "fake-minicom.sh"
-            fake_serialwrap = root / "fake-serialwrap.sh"
-            serialwrap_log = root / "serialwrap.log"
-
-            # fake minicom 睡著，模擬 human 連線中（讓 router 仍在跑時可被 SIGHUP）
-            self._write_executable(
-                fake_minicom,
-                "#!/usr/bin/env bash\nsleep 30\n",
-            )
-            self._write_executable(
-                fake_serialwrap,
-                "#!/usr/bin/env bash\n"
-                "printf '%s\\n' \"$*\" >> \"$FAKE_SERIALWRAP_LOG\"\n"
-                "if [[ \"${1:-}\" == '--socket' ]]; then shift 2; fi\n"
-                "if [[ \"${1:-}\" == 'session' && \"${2:-}\" == 'list' ]]; then\n"
-                "  echo '{\"ok\":true,\"sessions\":[{\"com\":\"COM0\",\"alias\":\"default\",\"session_id\":\"s0\",\"state\":\"READY\"}]}'\n"
-                "  exit 0\n"
-                "fi\n"
-                "if [[ \"${1:-}\" == 'session' && \"${2:-}\" == 'console-attach' ]]; then\n"
-                "  echo '{\"ok\":true,\"client_id\":\"client-1\",\"vtty\":\"/dev/null\"}'\n"
-                "  exit 0\n"
-                "fi\n"
-                "if [[ \"${1:-}\" == 'session' && \"${2:-}\" == 'console-detach' ]]; then echo '{\"ok\":true}'; exit 0; fi\n"
-                "echo '{\"ok\":false}'\nexit 1\n",
-            )
-
-            env = os.environ.copy()
-            env["SERIALWRAP_BIN"] = str(fake_serialwrap)
-            env["SERIALWRAP_SOCKET"] = str(root / "serialwrapd.sock")
-            env["SERIALWRAP_AUTO_START_DAEMON"] = "0"
-            env["FAKE_SERIALWRAP_LOG"] = str(serialwrap_log)
-            env["MINICOM_BIN"] = str(fake_minicom)
-            env["MINICOM_AUTO_CAPTURE"] = "0"
-            env["MINICOM_DEFAULT_COLOR"] = ""
-            env["MINICOM_CAPTURE_MODE"] = "off"
-
-            # 自成 process group，送 SIGHUP 給 router 本身
-            proc = subprocess.Popen(
-                ["bash", str(ROUTER), "COM0"],
-                cwd=str(REPO_ROOT), env=env,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-            try:
-                # 等 console-attach 出現（最多 ~5s）
-                deadline = time.monotonic() + 5.0
-                while time.monotonic() < deadline:
-                    if serialwrap_log.exists() and "session console-attach" in serialwrap_log.read_text(encoding="utf-8"):
-                        break
-                    time.sleep(0.05)
-                proc.send_signal(signal.SIGHUP)
-                proc.wait(timeout=5)
-            finally:
-                if proc.poll() is None:
-                    proc.kill()
-
-            calls = serialwrap_log.read_text(encoding="utf-8").splitlines()
-            self.assertTrue(any("session console-attach" in c for c in calls))
-            self.assertTrue(
-                any("session console-detach" in c for c in calls),
-                msg="SIGHUP 應觸發 console-detach（trap 需含 HUP），否則留孤兒",
-            )
-```
-
-  並於檔頭確認 `import signal`、`import time` 已存在（若無則補）。
-
-- [ ] **Step 2: 跑測試確認 FAIL**
-
-Run: `python3 -m pytest -q tests/test_minicom_router.py::TestMinicomRouter::test_broker_console_detaches_on_sighup`
-Expected: FAIL（斷言 console-detach 未出現——現況 `trap` 無 HUP，bash 收 SIGHUP 直接死、不跑 EXIT trap）。
-
-- [ ] **Step 3: 改 trap 加 HUP**
-
-`sw_core/assets/tools/minicom_router.sh` 第 355 行：
-```bash
-  trap cleanup EXIT INT TERM HUP
-```
-第 362 行（清 trap 處同步）：
-```bash
-  trap - EXIT INT TERM HUP
-```
-
-- [ ] **Step 4: 跑測試確認 PASS**
-
-Run: `python3 -m pytest -q tests/test_minicom_router.py`
-Expected: PASS（含新測試；既有 broker-detach/capture 測試續綠）。
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add sw_core/assets/tools/minicom_router.sh tests/test_minicom_router.py
-git commit -m "fix(minicom): SIGHUP 也觸發 console-detach，避免關終端留孤兒 console（#76）
-
-Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
-Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
-```
-
----
+> **不做。** 真機驗證（真 minicom + 真 tmux `kill-session` = 關終端 process-group SIGHUP，bash 5.2.21）證明：
+> **不論 `_run_broker_minicom` 的 `trap` 有無 `HUP`，關終端都會呼叫 `console-detach`、不留孤兒**——因為 process-group SIGHUP
+> 先殺前景 minicom → router bash 繼續跑到 `trap - …; cleanup`（:363）→ 顯式 `console-detach`。加 `HUP` 只是讓 detach
+> 多呼叫一次（冗餘、idempotent），且在「只送 router、不送 group」的非真實情境會延後 router 退出。原先的 SIGHUP 測試在
+> fix 前後都綠（無效 red），故移除。
+>
+> **真正的孤兒來源是 SIGKILL / crash**（無法 trap、跑不到 :363 cleanup）→ 由 **Task 3 broker reaper** 涵蓋（偵測 PTY 無外部 reader）。
+> 故 orphan-on-close 防護完全交給 Task 3，本 task 移除。
 
 ## Task 2: Fix2 — ConsoleClient.internal 旗標 + 哨兵 primary
 
