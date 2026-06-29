@@ -45,6 +45,9 @@ class ConsoleClient:
     # slave_path 為 "host:port" 端點字串。console 的狀態機（line buffer / raw / suspend-resume /
     # fan-out）對兩者共用，I/O 原語由 _console_send 與 console loop 依 sock 分派。
     sock: Any = None
+    # broker 內部哨兵 primary（start() 建、無外部 reader、作 snapshot.vtty 錨點）為 True，永不被 reaper 回收；
+    # 經 attach_console / TCP accept 建立的真實 console 為 False。
+    internal: bool = False
 
 
 @dataclasses.dataclass
@@ -226,6 +229,7 @@ class UARTBridge:
                     primary_client_id = next_client.client_id if next_client is not None else None
             elif _pty_available():
                 primary = self._create_console_client("primary")
+                primary.internal = True  # 哨兵 primary：永不被 reaper 回收
                 clients = {primary.client_id: primary}
                 primary_client_id = primary.client_id
             else:

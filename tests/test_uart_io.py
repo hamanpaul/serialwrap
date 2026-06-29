@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import time
 import unittest
@@ -8,6 +9,24 @@ from unittest import mock
 from sw_core.config import UartProfile
 from sw_core.uart_io import UARTBridge
 from sw_core.wal import WalWriter
+
+
+def _make_pty_bridge(com: str = "COM0") -> tuple[UARTBridge, int, int, tempfile.TemporaryDirectory]:
+    """PTY slave を device_path とした UARTBridge を生成して返す。
+    start() を呼ぶテスト用。teardown は bridge.stop() + PTY fd 閉鎖 + tmpdir.cleanup()。
+    返値: (bridge, master_fd, slave_fd, tmpdir)
+    """
+    tmpdir = tempfile.TemporaryDirectory()
+    wal = WalWriter(wal_dir=tmpdir.name)
+    master_fd, slave_fd = os.openpty()
+    slave_path = os.ttyname(slave_fd)
+    bridge = UARTBridge(
+        com=com,
+        device_path=slave_path,
+        profile=UartProfile(),
+        wal=wal,
+    )
+    return bridge, master_fd, slave_fd, tmpdir
 
 
 class TestUartBridgeConsoleCleanup(unittest.TestCase):
@@ -182,3 +201,36 @@ class TestUartBridgeSuspendResume(unittest.TestCase):
         with self._bridge._state_lock:
             self.assertFalse(self._bridge._agent_active)
             self.assertIsNone(self._bridge._interactive_owner)
+
+
+class TestConsoleClientInternalFlag(unittest.TestCase):
+    """Task 2：ConsoleClient.internal 旗標——哨兵 primary vs 真實 console。"""
+
+    def test_start_primary_is_internal_sentinel(self) -> None:
+        """start() で建立的哨兵 primary 應標記 internal=True。"""
+        bridge, master_fd, slave_fd, tmpdir = _make_pty_bridge()
+        try:
+            bridge.start()
+            with bridge._state_lock:
+                primary = bridge._clients[bridge._primary_client_id]
+            self.assertTrue(primary.internal, "start() 建的哨兵 primary 應 internal=True")
+        finally:
+            bridge.stop()
+            os.close(master_fd)
+            os.close(slave_fd)
+            tmpdir.cleanup()
+
+    def test_attach_console_client_is_not_internal(self) -> None:
+        """attach_console() 建的真實 console 應標記 internal=False。"""
+        bridge, master_fd, slave_fd, tmpdir = _make_pty_bridge()
+        try:
+            bridge.start()
+            info = bridge.attach_console(label="minicom-test")
+            with bridge._state_lock:
+                client = bridge._clients[info["client_id"]]
+            self.assertFalse(client.internal, "attach_console 建的真實 console 應 internal=False")
+        finally:
+            bridge.stop()
+            os.close(master_fd)
+            os.close(slave_fd)
+            tmpdir.cleanup()
