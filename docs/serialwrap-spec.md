@@ -577,7 +577,7 @@ background mode 的 `command.result_tail` 在 capture 尚未建立時，會回�
 
 `minicom_router.sh` 不再依賴 session 單一 `vtty` 當唯一入口。
 
-預設 transcript 走 minicom 內建 `-C` capturefile；只有在明確設定 `MINICOM_CAPTURE_WRAPPER=1` 時，才改用 `script -qef` 包一層 PTY 來保留完整 terminal transcript。後者可能增加 human 體感延遲。
+預設 transcript 走 minicom 內建 `-C` capturefile（乾淨序列 log，不含 minicom UI）；可設 `MINICOM_CAPTURE_MODE=script`（或舊式 `MINICOM_CAPTURE_WRAPPER=1`）改用 `script -qef` 包一層 PTY 來保留含完整終端畫面的 transcript。後者可能增加 human 體感延遲。
 
 ## 13. Profile 規格
 
