@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-06-29
+
 ### Fixed
 
 - **`reconcile_readiness` 週期回收孤兒 console（#76）**：`DeviceWatcher` tick 的 `reconcile_readiness` 原只重探非 READY session，從不主動清理 console client，導致死掉的 minicom process 的孤兒 `ConsoleClient` 在 steady state 長期積存（observed：COM0/COM1 死掉的 `primary` console 不消失）。新增 `_HUMAN_PEER_GRACE_S`（3.0s）節流常數、`_last_console_reap_at` 節流時間戳；`reconcile_readiness` 在 jobs loop 之後、節流通過時做一次**共享 /proc 掃描**（`_enumerate_all_held_paths`，鎖外執行）並對所有 bridge 呼叫 `reap_stale_consoles`，單一 bridge 例外不中斷 tick；不具備該方法的測試假物件（`held=None`）各自 fallback 保守掃描。新增 `test_reconcile_reaps_orphan_console` 回歸（RED：孤兒存活；GREEN：孤兒被回收）。底層回收原語為 `UARTBridge.reap_stale_consoles`（lock-split：鎖內快照候選 → 鎖外掃 /proc → 回鎖 pop → 鎖外 close fd，沿用 pop-in-lock/close-out-of-lock 防 #83 use-after-close；硬性跳過當前 `_interactive_owner`/`_suspended_owner` 與 `internal=True` 哨兵 primary，防 #78 suspend 簿記損壞），新增 `ConsoleClient.internal` 旗標標記 `start()` 建立的哨兵 primary（永不回收），死掉的非-internal primary 則可被回收並重指。
