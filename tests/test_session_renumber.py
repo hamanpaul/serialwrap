@@ -250,5 +250,34 @@ class TestServiceRenumberRpc(unittest.TestCase):
         )
 
 
+class TestCliRenumber(unittest.TestCase):
+    """Task 7：CLI session renumber 解析與分派。"""
+
+    def test_parser_accepts_session_renumber(self) -> None:
+        import sw_core.cli as cli_mod
+
+        parser = cli_mod.build_parser()
+        ns = parser.parse_args(["session", "renumber"])
+        self.assertEqual(ns.cmd, "session")
+        self.assertEqual(ns.session_cmd, "renumber")
+
+    def test_main_dispatches_session_renumber_rpc(self) -> None:
+        import sw_core.cli as cli_mod
+
+        captured: dict = {}
+
+        def _fake_rpc_call(endpoint, method, params, timeout_s=None):
+            captured["method"] = method
+            captured["params"] = params
+            return {"ok": True, "renumbered": {}}
+
+        with mock.patch.object(cli_mod, "rpc_call", side_effect=_fake_rpc_call):
+            rc = cli_mod.main(["session", "renumber"])
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(captured["method"], "session.renumber")
+        self.assertEqual(captured["params"], {})
+
+
 if __name__ == "__main__":
     unittest.main()
