@@ -12,9 +12,10 @@ from sw_core.wal import WalWriter
 
 
 def _make_pty_bridge(com: str = "COM0") -> tuple[UARTBridge, int, int, tempfile.TemporaryDirectory]:
-    """PTY slave を device_path とした UARTBridge を生成して返す。
-    start() を呼ぶテスト用。teardown は bridge.stop() + PTY fd 閉鎖 + tmpdir.cleanup()。
-    返値: (bridge, master_fd, slave_fd, tmpdir)
+    """以 PTY slave 作 device_path 建立 UARTBridge 並回傳。
+
+    供需要呼叫 start() 的測試使用。teardown 須 bridge.stop() + 關閉 PTY fd + tmpdir.cleanup()。
+    回傳：(bridge, master_fd, slave_fd, tmpdir)
     """
     tmpdir = tempfile.TemporaryDirectory()
     wal = WalWriter(wal_dir=tmpdir.name)
@@ -207,7 +208,7 @@ class TestConsoleClientInternalFlag(unittest.TestCase):
     """Task 2：ConsoleClient.internal 旗標——哨兵 primary vs 真實 console。"""
 
     def test_start_primary_is_internal_sentinel(self) -> None:
-        """start() で建立的哨兵 primary 應標記 internal=True。"""
+        """start() 建立的哨兵 primary 應標記 internal=True。"""
         bridge, master_fd, slave_fd, tmpdir = _make_pty_bridge()
         try:
             bridge.start()
@@ -259,7 +260,7 @@ class TestReapStaleConsoles(unittest.TestCase):
             tmpdir.cleanup()
 
     def test_reap_never_touches_internal_sentinel(self) -> None:
-        """internal=True の哨兵 primary は過 grace でも絶對に回收してはならない。"""
+        """internal=True 的哨兵 primary 即使過 grace 也絕不可被回收。"""
         bridge, master_fd, slave_fd, tmpdir = _make_pty_bridge()
         try:
             bridge.start()
@@ -276,7 +277,7 @@ class TestReapStaleConsoles(unittest.TestCase):
             tmpdir.cleanup()
 
     def test_reap_skips_owner_and_suspended_owner(self) -> None:
-        """reaper は current owner と suspended owner を回收してはならない。"""
+        """reaper 不可回收當前 owner 與 suspended owner。"""
         bridge, master_fd, slave_fd, tmpdir = _make_pty_bridge()
         try:
             bridge.start()
@@ -295,6 +296,34 @@ class TestReapStaleConsoles(unittest.TestCase):
                 self.assertIn(cid, bridge._clients, "suspended owner 不得被 reaper 回收")
                 self.assertEqual(bridge._suspended_owner, f"human:{cid}")
             bridge.resume_interactive()
+        finally:
+            bridge.stop()
+            os.close(master_fd)
+            os.close(slave_fd)
+            tmpdir.cleanup()
+
+    def test_reap_conservative_when_procfs_unavailable(self) -> None:
+        """procfs 不可用時，reaper 保守不回收活著的 console（_scan_held_slave_paths 回全集）。"""
+        bridge, master_fd, slave_fd, tmpdir = _make_pty_bridge()
+        real_listdir = os.listdir
+
+        def fake_listdir(path):
+            if path == "/proc":
+                raise OSError("procfs unavailable")
+            return real_listdir(path)
+
+        try:
+            bridge.start()
+            info = bridge.attach_console(label="live")
+            cid = info["client_id"]
+            with bridge._state_lock:
+                bridge._clients[cid].attached_at -= 10.0  # 過 grace，否則不進候選
+            # 不傳 held_slave_paths → 觸發 _scan_held_slave_paths → /proc 掃描失敗 → 保守回全集
+            with mock.patch("sw_core.uart_io.os.listdir", side_effect=fake_listdir):
+                reaped = bridge.reap_stale_consoles()
+            self.assertEqual(reaped, [], "procfs 不可用時不得回收任何 console")
+            with bridge._state_lock:
+                self.assertIn(cid, bridge._clients, "procfs 不可用時活 console 須保留")
         finally:
             bridge.stop()
             os.close(master_fd)

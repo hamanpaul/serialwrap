@@ -399,23 +399,21 @@ class UARTBridge:
         with self._state_lock:
             return self._console_endpoint
 
-    def _client_has_external_peer_locked(self, client: ConsoleClient) -> bool:
-        if client.sock is not None:
-            # Windows TCP console（#84 PORT-2）：連線斷開由 console loop 的 recv b"" 直接偵測並
-            # drop，不靠 /proc 掃描；故視為「仍有 peer」直到被 drop（避免 stale-pruning 誤剪）。
-            return True
+    def _enumerate_all_held_paths(self) -> set[str] | None:
+        """掃描 /proc，回傳所有外部 process 持有的 fd readlink 目標集合（排除自身 pid）。
+
+        procfs 不可用時回傳 None（呼叫端據此採保守策略）。本函式不取任何鎖，純讀 /proc；
+        呼叫端自行決定是否在 _state_lock 內外呼叫（reaper 走鎖外、_client_has_external_peer_locked
+        既有行為走鎖內，均不變）。
+        """
+        held: set[str] = set()
         self_pid = os.getpid()
         try:
             pids = os.listdir("/proc")
         except OSError:
-            # Be conservative when procfs is unavailable.
-            return True
-
+            return None
         for pid_text in pids:
-            if not pid_text.isdigit():
-                continue
-            pid = int(pid_text)
-            if pid == self_pid:
+            if not pid_text.isdigit() or int(pid_text) == self_pid:
                 continue
             fd_dir = os.path.join("/proc", pid_text, "fd")
             try:
@@ -427,9 +425,19 @@ class UARTBridge:
                     target = os.readlink(os.path.join(fd_dir, fd_name))
                 except OSError:
                     continue
-                if target == client.slave_path:
-                    return True
-        return False
+                held.add(target)
+        return held
+
+    def _client_has_external_peer_locked(self, client: ConsoleClient) -> bool:
+        if client.sock is not None:
+            # Windows TCP console（#84 PORT-2）：連線斷開由 console loop 的 recv b"" 直接偵測並
+            # drop，不靠 /proc 掃描；故視為「仍有 peer」直到被 drop（避免 stale-pruning 誤剪）。
+            return True
+        held = self._enumerate_all_held_paths()
+        if held is None:
+            # procfs 不可用：保守起見視為仍有 peer（避免誤剪）。
+            return True
+        return client.slave_path in held
 
     def _drop_console_client(self, client_id: str) -> None:
         with self._state_lock:
@@ -469,14 +477,16 @@ class UARTBridge:
             held_slave_paths = self._scan_held_slave_paths()  # 鎖外 /proc 掃描
         reaped: list[ConsoleClient] = []
         with self._state_lock:
+            # 回鎖後重查保護集合（鎖外掃描期間可能變成 owner/suspended）；持鎖期間不會再變，
+            # 故只計算一次、避免每個候選重算。
+            cur_owner = self._interactive_owner.split(":", 1)[1] if (self._interactive_owner or "").startswith("human:") else None
+            cur_susp = self._suspended_owner.split(":", 1)[1] if (self._suspended_owner or "").startswith("human:") else None
+            cur_protected = {x for x in (cur_owner, cur_susp) if x}
             for cid, slave_path in candidates:
                 client = self._clients.get(cid)
                 if client is None or client.internal:
                     continue
-                # 回鎖後重查保護集合（期間可能變成 owner/suspended）
-                cur_owner = self._interactive_owner.split(":", 1)[1] if (self._interactive_owner or "").startswith("human:") else None
-                cur_susp = self._suspended_owner.split(":", 1)[1] if (self._suspended_owner or "").startswith("human:") else None
-                if cid in {x for x in (cur_owner, cur_susp) if x}:
+                if cid in cur_protected:
                     continue
                 if slave_path in held_slave_paths:
                     continue
@@ -493,29 +503,15 @@ class UARTBridge:
         return reaped
 
     def _scan_held_slave_paths(self) -> set[str]:
-        """鎖外掃描 /proc，回傳「被外部 process 持有的 slave_path 集合」（排除自身 pid）。"""
-        held: set[str] = set()
-        self_pid = os.getpid()
-        try:
-            pids = os.listdir("/proc")
-        except OSError:
-            # procfs 不可用：保守起見回傳所有現存 client 的 slave_path（視為仍被持有，不誤剪）
+        """鎖外掃描 /proc，回傳「被外部 process 持有的 slave_path 集合」（排除自身 pid）。
+
+        procfs 不可用（`_enumerate_all_held_paths` 回 None）時，保守起見回傳所有現存 client 的
+        slave_path（視為仍被持有、不誤剪）——此分支會**內部取得 `_state_lock`** 做快照。
+        """
+        held = self._enumerate_all_held_paths()
+        if held is None:
             with self._state_lock:
                 return {c.slave_path for c in self._clients.values()}
-        for pid_text in pids:
-            if not pid_text.isdigit() or int(pid_text) == self_pid:
-                continue
-            fd_dir = os.path.join("/proc", pid_text, "fd")
-            try:
-                fd_names = os.listdir(fd_dir)
-            except OSError:
-                continue
-            for fd_name in fd_names:
-                try:
-                    target = os.readlink(os.path.join(fd_dir, fd_name))
-                except OSError:
-                    continue
-                held.add(target)
         return held
 
     def _prune_stale_consoles_locked(self, *, now: float | None = None) -> list[ConsoleClient]:
