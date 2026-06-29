@@ -142,6 +142,27 @@ def _check_wsl_systemd(fx) -> dict:
     }
 
 
+def _check_single_daemon(proc_root: str = "/proc") -> dict:
+    """是否只有單一 serialwrapd 在跑（#101）。
+
+    daemon-less：doctor 為獨立程序、不碰 socket，直接掃 /proc 找 serialwrapd。
+    多開（不同 socket / systemd-user 與 system 同時在跑）會造成 two-reader 靜默掉字，
+    這裡僅偵測 + 回報，不終止任何 daemon。
+    """
+    from .multi_open import detect_multi_open
+
+    res = detect_multi_open(proc_root=proc_root)
+    n = len(res["daemons"])
+    ok = not res["multi_open"]
+    detail = f"{n} 個 serialwrapd 在跑" + ("（偵測到多開）" if res["multi_open"] else "")
+    fix = (
+        ""
+        if ok
+        else "停掉多餘 daemon（serialwrap service stop；並檢查 systemd-user 與 system 是否同時在跑）"
+    )
+    return {"check": "single_daemon", "ok": ok, "detail": detail, "fix": fix}
+
+
 def run_doctor(fx=None, home=None) -> list[dict]:
     """執行所有環境檢查並回傳結果清單（每項皆唯讀、永不拋例外）。
 
@@ -162,6 +183,7 @@ def run_doctor(fx=None, home=None) -> list[dict]:
         _check_dialout(fx),
         _check_systemd(fx),
         _check_supervision_mode(home),
+        _check_single_daemon(),
         _check_devices(),
         _check_wsl_systemd(fx),
     ]

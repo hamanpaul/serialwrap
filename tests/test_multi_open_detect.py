@@ -106,5 +106,43 @@ class TestDetectMultiOpen(unittest.TestCase):
         self.assertEqual(res["holders_status"], "permission")
 
 
+class TestDoctorSingleDaemon(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.proc = Path(self._tmp.name) / "proc"
+
+    def test_single_daemon_check_fails_on_multi_open(self) -> None:
+        from sw_core.doctor_cmd import _check_single_daemon
+
+        _make_fake_proc(
+            self.proc,
+            {
+                "1": {"cmdline": "serialwrapd.py\0", "fd": {}},
+                "2": {"cmdline": "serialwrapd.py\0", "fd": {}},
+            },
+        )
+        r = _check_single_daemon(proc_root=str(self.proc))
+        self.assertEqual(r["check"], "single_daemon")
+        self.assertFalse(r["ok"])
+        self.assertTrue(r["detail"])
+        self.assertTrue(r["fix"])
+
+    def test_single_daemon_check_ok_on_one(self) -> None:
+        from sw_core.doctor_cmd import _check_single_daemon
+
+        _make_fake_proc(self.proc, {"1": {"cmdline": "serialwrapd.py\0", "fd": {}}})
+        r = _check_single_daemon(proc_root=str(self.proc))
+        self.assertEqual(r["check"], "single_daemon")
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["fix"], "")
+
+    def test_run_doctor_includes_single_daemon(self) -> None:
+        from sw_core.doctor_cmd import run_doctor
+
+        checks = {c["check"] for c in run_doctor()}
+        self.assertIn("single_daemon", checks)
+
+
 if __name__ == "__main__":
     unittest.main()
