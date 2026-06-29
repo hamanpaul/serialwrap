@@ -8,6 +8,7 @@
 - CLI `session renumber` 解析與分派。
 """
 
+import os
 import tempfile
 import unittest
 import unittest.mock as mock
@@ -146,6 +147,107 @@ class TestRenumberDynamic(unittest.TestCase):
         with mock.patch.object(mgr, "_save_state", wraps=mgr._save_state) as save:
             mgr.renumber_dynamic()
         save.assert_called()
+
+
+def _inject_dynamic_into(
+    mgr: SessionManager, com: str, by_id: str, *, act_no: int
+) -> SessionRuntime:
+    sid = f"prpl-template:{com}"
+    alias = f"prpl-template+{act_no}"
+    profile = SessionProfile(
+        profile_name="prpl-template",
+        com=com,
+        act_no=act_no,
+        alias=alias,
+        device_by_id=by_id,
+        platform="prpl",
+        uart=UartProfile(),
+    )
+    rt = SessionRuntime(session_id=sid, profile=profile)
+    rt.state = "READY"
+    rt.profile_source = "detected"
+    with mgr._lock:
+        mgr._sessions[sid] = rt
+        mgr._aliases.set_for_session(sid, alias)
+    return rt
+
+
+class TestServiceRenumberRpc(unittest.TestCase):
+    """Task 6：RPC session.renumber 編排 SM remap + arbiter worker re-register。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._old_state_path = sm_mod.STATE_PATH
+        sm_mod.STATE_PATH = str(Path(self._tmp.name) / "state.json")
+        self.addCleanup(lambda: setattr(sm_mod, "STATE_PATH", self._old_state_path))
+        self._old_wal = os.environ.get("SERIALWRAP_WAL_DIR")
+        os.environ["SERIALWRAP_WAL_DIR"] = self._tmp.name
+        self.addCleanup(self._restore_wal)
+        self._byid = Path(self._tmp.name) / "by-id-empty"
+        self._byid.mkdir()
+
+    def _restore_wal(self) -> None:
+        if self._old_wal is None:
+            os.environ.pop("SERIALWRAP_WAL_DIR", None)
+        else:
+            os.environ["SERIALWRAP_WAL_DIR"] = self._old_wal
+
+    def _make_service(self):
+        from sw_core.service import SerialwrapService
+
+        templates = [
+            ProfileTemplate(profile_name="prpl-template", platform="prpl"),
+            ProfileTemplate(profile_name="others-template", platform="passthrough"),
+        ]
+        svc = SerialwrapService(
+            [],
+            templates=templates,
+            by_id_dir=str(self._byid),
+            by_path_dir=str(Path(self._tmp.name) / "nonexistent-by-path"),
+        )
+        return svc
+
+    def test_service_renumber_remaps_arbiter_workers(self) -> None:
+        svc = self._make_service()
+        sm = svc._sessions
+        # 亂序且有間隙：COM3=AQ00、COM7=AC01 → renumber 後應 snap 到 COM1/COM0
+        _inject_dynamic_into(sm, "COM3", BY_ID_AQ00, act_no=1)
+        _inject_dynamic_into(sm, "COM7", BY_ID_AC01, act_no=2)
+        svc._arbiter.register_session("prpl-template:COM3")
+        svc._arbiter.register_session("prpl-template:COM7")
+        self.addCleanup(lambda: [svc._arbiter.unregister_session(s) for s in list(svc._arbiter._queues.keys())])
+
+        res = svc.rpc("session.renumber", {})
+
+        self.assertTrue(res["ok"])
+        self.assertEqual(
+            res["renumbered"],
+            {"prpl-template:COM7": "prpl-template:COM0", "prpl-template:COM3": "prpl-template:COM1"},
+        )
+        # arbiter worker 已由舊 sid remap 到新 sid（COM 集合確實改變，足以證明 remap）
+        self.assertEqual(
+            set(svc._arbiter._queues.keys()),
+            {"prpl-template:COM0", "prpl-template:COM1"},
+        )
+
+    def test_service_renumber_noop_returns_empty_mapping(self) -> None:
+        svc = self._make_service()
+        sm = svc._sessions
+        _inject_dynamic_into(sm, "COM0", BY_ID_AC01, act_no=1)
+        _inject_dynamic_into(sm, "COM1", BY_ID_AQ00, act_no=2)
+        svc._arbiter.register_session("prpl-template:COM0")
+        svc._arbiter.register_session("prpl-template:COM1")
+        self.addCleanup(lambda: [svc._arbiter.unregister_session(s) for s in list(svc._arbiter._queues.keys())])
+
+        res = svc.rpc("session.renumber", {})
+
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["renumbered"], {})
+        self.assertEqual(
+            set(svc._arbiter._queues.keys()),
+            {"prpl-template:COM0", "prpl-template:COM1"},
+        )
 
 
 if __name__ == "__main__":
