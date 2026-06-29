@@ -73,7 +73,7 @@ _resolve_capture_mode() {
     return 0
   fi
 
-  printf 'script'
+  printf 'minicom'
 }
 
 selector=""

@@ -128,8 +128,7 @@ class TestMinicomRouter(unittest.TestCase):
             self.assertEqual(len(logs), 1)
             self.assertFalse(legacy_dir.exists())
 
-    @unittest.skipUnless(shutil.which("script"), "script command is required")
-    def test_default_capture_uses_script_wrapper_without_minicom_capturefile(self) -> None:
+    def test_default_capture_uses_native_minicom_capturefile(self) -> None:
         with self._temporary_directory() as td:
             root = Path(td)
             fake_minicom = root / "fake-minicom.sh"
@@ -140,12 +139,18 @@ class TestMinicomRouter(unittest.TestCase):
                 fake_minicom,
                 "#!/usr/bin/env bash\n"
                 "printf '%s\\n' \"$@\" > \"$FAKE_ARGS_OUT\"\n"
-                "for arg in \"$@\"; do\n"
-                "  if [[ \"$arg\" == '-C' || \"$arg\" == --capturefile* ]]; then\n"
-                "    echo 'unexpected minicom native capture arg' >&2\n"
-                "    exit 44\n"
+                "capture=''\n"
+                "while [[ $# -gt 0 ]]; do\n"
+                "  if [[ \"$1\" == '-C' && $# -ge 2 ]]; then\n"
+                "    capture=\"$2\"\n"
+                "    shift 2\n"
+                "    continue\n"
                 "  fi\n"
+                "  shift\n"
                 "done\n"
+                "if [[ -n \"$capture\" ]]; then\n"
+                "  printf 'fake minicom output\\n' > \"$capture\"\n"
+                "fi\n"
                 "printf 'fake minicom output\\n'\n",
             )
 
@@ -163,11 +168,12 @@ class TestMinicomRouter(unittest.TestCase):
             )
 
             args = args_out.read_text(encoding="utf-8")
-            self.assertNotIn("-C", args)
+            self.assertIn("-C", args)
             logs = sorted(blog_dir.glob("mini_*.log"))
             self.assertEqual(len(logs), 1)
-            content = logs[0].read_text(encoding="utf-8", errors="replace")
+            content = logs[0].read_text(encoding="utf-8")
             self.assertIn("fake minicom output", content)
+            self.assertNotIn("Script started", content)
 
     def test_user_capture_args_disable_auto_transcript(self) -> None:
         cases = (
@@ -238,6 +244,7 @@ class TestMinicomRouter(unittest.TestCase):
 
             env = self._base_env(root, fake_minicom, blog_dir)
             env["FAKE_ARGS_OUT"] = str(args_out)
+            env["MINICOM_CAPTURE_MODE"] = "script"
             env["PATH"] = str(path_without_script)
 
             result = subprocess.run(
