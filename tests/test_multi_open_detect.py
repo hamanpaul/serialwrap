@@ -106,6 +106,88 @@ class TestDetectMultiOpen(unittest.TestCase):
         self.assertEqual(res["holders_status"], "permission")
 
 
+class TestDaemonStatusMultiOpen(unittest.TestCase):
+    """Task 10：daemon status（health()）回應加多開 / 外部持有者欄位。"""
+
+    def setUp(self) -> None:
+        import sw_core.session_manager as sm_mod
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._old_state_path = sm_mod.STATE_PATH
+        sm_mod.STATE_PATH = str(Path(self._tmp.name) / "state.json")
+        self.addCleanup(lambda: setattr(sm_mod, "STATE_PATH", self._old_state_path))
+        self._old_wal = os.environ.get("SERIALWRAP_WAL_DIR")
+        os.environ["SERIALWRAP_WAL_DIR"] = self._tmp.name
+        self.addCleanup(self._restore_wal)
+        self._byid = Path(self._tmp.name) / "by-id-empty"
+        self._byid.mkdir()
+
+    def _restore_wal(self) -> None:
+        if self._old_wal is None:
+            os.environ.pop("SERIALWRAP_WAL_DIR", None)
+        else:
+            os.environ["SERIALWRAP_WAL_DIR"] = self._old_wal
+
+    def _make_service(self):
+        from sw_core.service import SerialwrapService
+
+        return SerialwrapService(
+            [],
+            templates=[],
+            by_id_dir=str(self._byid),
+            by_path_dir=str(Path(self._tmp.name) / "nonexistent-by-path"),
+        )
+
+    def test_health_includes_multi_open_fields(self) -> None:
+        svc = self._make_service()
+        fake = {
+            "multi_open": False,
+            "daemons": [{"pid": 1}],
+            "holders": {},
+            "holders_status": "ok",
+        }
+        with mock.patch("sw_core.service.detect_multi_open", return_value=fake):
+            st = svc.health()
+        self.assertIn("multi_open", st)
+        self.assertFalse(st["multi_open"])
+        self.assertEqual(st["foreign_holders"], {})
+        self.assertEqual(st["multi_open_detail"]["holders_status"], "ok")
+        self.assertEqual(st["multi_open_detail"]["daemons"], [{"pid": 1}])
+
+    def test_health_passes_attached_tty_paths(self) -> None:
+        from sw_core.config import SessionProfile, UartProfile
+        from sw_core.session_manager import SessionRuntime
+
+        svc = self._make_service()
+        # 注入一個 attached session（有 attached_real_path）
+        sm = svc._sessions
+        profile = SessionProfile(
+            profile_name="prpl-template",
+            com="COM0",
+            act_no=1,
+            alias="prpl-template+1",
+            device_by_id="/dev/serial/by-id/x",
+            platform="prpl",
+            uart=UartProfile(),
+        )
+        rt = SessionRuntime(session_id="prpl-template:COM0", profile=profile)
+        rt.state = "READY"
+        rt.attached_real_path = "/dev/ttyUSB9"
+        with sm._lock:
+            sm._sessions["prpl-template:COM0"] = rt
+
+        captured: dict = {}
+
+        def _fake_detect(proc_root="/proc", tty_paths=None):
+            captured["tty_paths"] = tty_paths
+            return {"multi_open": False, "daemons": [], "holders": {}, "holders_status": "ok"}
+
+        with mock.patch("sw_core.service.detect_multi_open", side_effect=_fake_detect):
+            svc.health()
+        self.assertIn("/dev/ttyUSB9", captured["tty_paths"])
+
+
 class TestDoctorSingleDaemon(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
