@@ -824,11 +824,9 @@ class SessionManager:
             with self._lock:
                 bridges = [s.bridge for s in self._sessions.values() if s.bridge is not None]
             if bridges:
-                # 取第一個 bridge 做全域 /proc 掃描（結果對所有 bridge 共用）。
-                # 若 bridge 不具備此方法（測試假物件等），fallback held=None，
-                # 各 bridge 的 reap 會自行保守處理（不誤剪）。
-                _enumerator = getattr(bridges[0], "_enumerate_all_held_paths", None)
-                held = _enumerator() if _enumerator is not None else None
+                # 取第一個 bridge 做全域 /proc 掃描（結果對所有 bridge 共用）；
+                # procfs 不可用時回 None，各 bridge 的 reap 自行 fallback 至本身保守掃描（不誤剪）。
+                held = bridges[0]._enumerate_all_held_paths()
                 for bridge in bridges:
                     try:
                         bridge.reap_stale_consoles(held_slave_paths=held)

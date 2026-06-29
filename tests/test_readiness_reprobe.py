@@ -37,6 +37,12 @@ class FakeBridge:
     def set_interactive_owner(self, owner: str | None) -> None:
         self.interactive_owner = owner
 
+    def _enumerate_all_held_paths(self):
+        return None  # 測試不模擬 /proc；回 None 讓 reap 走保守 fallback
+
+    def reap_stale_consoles(self, *, held_slave_paths=None):
+        return []
+
 
 class TestReadinessReprobe(unittest.TestCase):
     def setUp(self) -> None:
