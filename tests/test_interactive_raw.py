@@ -342,6 +342,113 @@ class TestAgentSuspendsHumanInteractive(unittest.TestCase):
         self.assertEqual(resume_calls, ["resume"])
 
 
+class TestHumanLeasePeerLossGrace(unittest.TestCase):
+    """human lease peer-loss grace 測試（症狀1 觸發B）。
+
+    _refresh_interactive_locked 對 human lease 的 peer-loss 應有 grace 窗：
+    - 首次 peer-False：記錄時間戳，暫不拆 lease。
+    - 再次 peer-False 但仍在 grace 窗內：繼續持有 lease。
+    - peer 回復：清 peer_lost_at。
+    - 超過 grace 窗：才真正拆 lease。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        import sw_core.session_manager as sm_mod
+        self._old_state_path = sm_mod.STATE_PATH
+        sm_mod.STATE_PATH = str(Path(self._tmp.name) / "state.json")
+
+    def tearDown(self) -> None:
+        import sw_core.session_manager as sm_mod
+        sm_mod.STATE_PATH = self._old_state_path
+
+    def _make_mgr_with_human_lease(self) -> tuple:
+        """建立 SessionManager + 一個已持有 human interactive lease 的 session。
+
+        Returns:
+            (mgr, session, bridge_mock, lease)
+        """
+        profiles = [_make_profile()]
+        mgr = SessionManager(
+            profiles,
+            WalWriter(wal_dir=self._tmp.name),
+            on_ready=lambda _: None,
+            on_detached=lambda _: None,
+        )
+        session = mgr.get_session("COM0")
+        assert session is not None
+
+        bridge = mock.MagicMock()
+        bridge.console_has_external_peer.return_value = True
+        bridge.snapshot.return_value = {"interactive_owner": "human:cid-grace"}
+        bridge.vtty_path = "/dev/pts/99"
+        bridge.detach_console.return_value = True
+        session.bridge = bridge
+        session.state = "READY"
+
+        lease = InteractiveLease(
+            interactive_id="lease-grace",
+            session_id=session.session_id,
+            owner="human:cid-grace",
+            created_at="now",
+            timeout_s=60.0,
+        )
+        with mgr._lock:
+            mgr._interactive[lease.interactive_id] = lease
+            session.interactive_session_id = lease.interactive_id
+
+        return mgr, session, bridge, lease
+
+    def test_peer_flap_within_grace_keeps_lease(self) -> None:
+        """grace 窗內首次 peer-loss 不應拆 lease，peer 回復後清 peer_lost_at。"""
+        mgr, session, bridge, lease = self._make_mgr_with_human_lease()
+
+        # 模擬 peer 瞬時消失
+        bridge.console_has_external_peer.return_value = False
+
+        with mgr._lock:
+            result, _post = mgr._refresh_interactive_locked(session)
+
+        self.assertIsNotNone(result, "grace 窗內首次 peer-loss 不應拆 lease")
+        self.assertIsNotNone(result.peer_lost_at, "首次 peer-loss 應記錄 peer_lost_at")
+        # session 的 interactive_session_id 應仍存在
+        self.assertIsNotNone(session.interactive_session_id)
+
+        # peer 回復
+        bridge.console_has_external_peer.return_value = True
+        bridge.snapshot.return_value = {"interactive_owner": "human:cid-grace"}
+
+        with mgr._lock:
+            result2, _post2 = mgr._refresh_interactive_locked(session)
+
+        self.assertIsNotNone(result2, "peer 回復後 lease 應持有")
+        self.assertIsNone(result2.peer_lost_at, "peer 回復應清 peer_lost_at")
+
+    def test_peer_gone_past_grace_tears_down(self) -> None:
+        """超過 grace 窗後，_refresh_interactive_locked 應拆 lease。"""
+        from sw_core.constants import _HUMAN_PEER_GRACE_S
+
+        mgr, session, bridge, lease = self._make_mgr_with_human_lease()
+
+        # 首次 peer-False → 記錄 peer_lost_at
+        bridge.console_has_external_peer.return_value = False
+
+        with mgr._lock:
+            result, _post = mgr._refresh_interactive_locked(session)
+
+        self.assertIsNotNone(result, "首次 peer-loss 應仍持有 lease")
+        # 強制 peer_lost_at 超過 grace 窗
+        result.peer_lost_at -= (_HUMAN_PEER_GRACE_S + 1.0)
+
+        # 再次 refresh：應拆 lease
+        with mgr._lock:
+            result2, _post2 = mgr._refresh_interactive_locked(session)
+
+        self.assertIsNone(result2, "超過 grace 窗應拆 lease，回傳 None")
+        self.assertIsNone(session.interactive_session_id, "拆後 session.interactive_session_id 應為 None")
+
+
 class TestReconcileReapsOrphanConsole(unittest.TestCase):
     """reconcile_readiness 應週期回收無外部 reader 的孤兒 console（#76）。
 

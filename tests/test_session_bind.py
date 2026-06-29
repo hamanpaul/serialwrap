@@ -612,7 +612,14 @@ class TestSessionBind(unittest.TestCase):
         bridge.set_interactive_owner.assert_called_with(None)
 
     def test_refresh_interactive_releases_stale_human_console(self) -> None:
+        """peer 消失超過 grace 窗後，_refresh_interactive_locked 應拆 human lease。
+
+        grace 語意（Task 5）：peer-False 首次只設 peer_lost_at，不立即拆；
+        超過 _HUMAN_PEER_GRACE_S 才真正 detach。本測試直接把 peer_lost_at
+        設在 grace 之前，模擬「peer 消失已久」的情境。
+        """
         import unittest.mock as mock
+        from sw_core.constants import _HUMAN_PEER_GRACE_S
 
         profiles = [self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")]
         mgr = SessionManager(profiles, WalWriter(wal_dir=self._tmp.name), on_ready=lambda _sid: None, on_detached=lambda _sid: None)
@@ -627,18 +634,22 @@ class TestSessionBind(unittest.TestCase):
         session.bridge = bridge
         session.state = "READY"
 
+        import time as _time
         lease = InteractiveLease(
             interactive_id="lease-stale",
             session_id=session.session_id,
             owner="human:cid-stale",
             created_at="now",
             timeout_s=60.0,
+            # 預設 peer_lost_at 設在 grace 窗之前，模擬 peer 消失已久（無需等待真實時間）
+            peer_lost_at=_time.monotonic() - (_HUMAN_PEER_GRACE_S + 1.0),
         )
         with mgr._lock:
             mgr._interactive[lease.interactive_id] = lease
             session.interactive_session_id = lease.interactive_id
 
-        refreshed, post = mgr._refresh_interactive_locked(session)
+        with mgr._lock:
+            refreshed, post = mgr._refresh_interactive_locked(session)
         post.execute()
 
         self.assertIsNone(refreshed)

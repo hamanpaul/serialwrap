@@ -149,6 +149,8 @@ class InteractiveLease:
     recovery_mode: bool = False
     # 內部 lifecycle flag：recovery lease 開啟前是否已 suspend 人類 console lease；不透出 RPC。
     suspended_human: bool = False
+    # human lease peer-loss grace：首次觀測到 console peer 消失的 monotonic 時間；peer 回復清為 None。
+    peer_lost_at: float | None = None
 
     def touch(self) -> None:
         self.last_activity_at = time.monotonic()
@@ -1977,10 +1979,18 @@ class SessionManager:
         if lease.owner.startswith("human:"):
             client_id = lease.owner.split(":", 1)[1]
             if not session.bridge.console_has_external_peer(client_id):
+                # peer 不在：進入 peer-loss grace 窗，不立即拆 lease（防瞬時 flap 誤拆）。
+                if lease.peer_lost_at is None:
+                    lease.peer_lost_at = time.monotonic()
+                    return lease, post  # grace 窗開始：暫不拆
+                if time.monotonic() - lease.peer_lost_at <= _HUMAN_PEER_GRACE_S:
+                    return lease, post  # 仍在 grace 窗內：繼續持有
+                # 超過 grace 窗：真正拆 lease
                 session.bridge.detach_console(client_id)
                 session.vtty_path = session.bridge.vtty_path
                 _, post = self._close_interactive_locked(session, interactive_id=lease_id)
                 return None, post
+            lease.peer_lost_at = None  # peer 在：清 grace 計時
             snapshot = session.bridge.snapshot()
             if snapshot.get("interactive_owner") != lease.owner:
                 _, post = self._close_interactive_locked(session, interactive_id=lease_id)
