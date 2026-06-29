@@ -35,8 +35,11 @@ class TestDeviceSortKey(unittest.TestCase):
             device_sort_key(BY_ID_AQ00, None),
         )
 
-    def test_device_sort_key_falls_back_to_by_path_on_collision(self) -> None:
-        # 同款晶片（by-id 相同）時，用 by-path 區分
+    def test_device_sort_key_accepts_by_path_tiebreak(self) -> None:
+        # 注意：本測試只驗證 `device_sort_key` helper 「接受 by_path 參數做次序 tiebreak」
+        # 的單元行為（未來 CH340 同 by-id 去衝突的排序單元）。end-to-end 的 CH340 同 by-id
+        # 完整支援仍需 `DeviceInfo.by_path` 欄位接上資料來源（尚未接、TODO #100）；
+        # 在此之前 `_by_path_for` 一律回 None，rank 仍只依 by-id。
         same_by_id = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
         k1 = device_sort_key(
             same_by_id, "/dev/serial/by-path/pci-0000:00:14.0-usb-0:8.1:1.0-port0"
@@ -102,6 +105,29 @@ class TestStartupRank(unittest.TestCase):
             s_ac = mgr._session_from_template(templates[0], BY_ID_AC01)
         self.assertEqual(s_aq.profile.com, "COM1")
         self.assertEqual(s_ac.profile.com, "COM0")
+
+    def test_pending_pruned_when_device_removed_frees_com(self) -> None:
+        """#100 M2/3a：startup 預配（pending）的裝置離線後，update_devices 須 prune 其 pending，
+        使 com_for_by_id 回 None、且該 COM 不再被 reserved（_next_dynamic_com 可回收）。"""
+        mgr = self._make_manager()
+        # 兩片在線並完成 startup 預配：AC01→COM0、AQ00→COM1
+        with mgr._lock:
+            mgr._devices = {
+                BY_ID_AC01: DeviceInfo(by_id=BY_ID_AC01, real_path="/dev/ttyUSB0"),
+                BY_ID_AQ00: DeviceInfo(by_id=BY_ID_AQ00, real_path="/dev/ttyUSB1"),
+            }
+        mgr.prepare_dynamic_rank([BY_ID_AC01, BY_ID_AQ00])
+        self.assertEqual(mgr.com_for_by_id(BY_ID_AC01), "COM0")
+        self.assertEqual(mgr.com_for_by_id(BY_ID_AQ00), "COM1")
+        # AC01 離線（AQ00 維持原 real_path → 不觸發 re-attach），只剩 AQ00 在線
+        mgr.update_devices(
+            {BY_ID_AQ00: DeviceInfo(by_id=BY_ID_AQ00, real_path="/dev/ttyUSB1")}
+        )
+        # pending 已被清：com_for_by_id 回 None
+        self.assertIsNone(mgr.com_for_by_id(BY_ID_AC01))
+        # COM0 不再被 reserved → _next_dynamic_com 可回收
+        with mgr._lock:
+            self.assertEqual(mgr._next_dynamic_com(), "COM0")
 
     def test_explicit_target_com_not_overwritten_by_rank(self) -> None:
         explicit = SessionProfile(

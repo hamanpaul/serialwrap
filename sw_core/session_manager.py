@@ -528,16 +528,18 @@ class SessionManager:
     def _next_dynamic_com(self) -> str:
         """分配下一個可用的 COM 編號（須在 self._lock 內呼叫）。
 
-        runtime 單片熱插（hotplug）的 fallback 路徑——取目前最低空號。startup 多片
-        並發 attach 改走 prepare_dynamic_rank 預配（消除並發 race），不經此函式。
+        runtime 單片熱插（hotplug）的 fallback 路徑——純掃描第一個未被佔用的空號。
+        startup 多片並發 attach 改走 prepare_dynamic_rank 預配（消除並發 race），不經此函式。
+
+        不在此處以 max_sessions 設上限（避免全滿時 fallback 回已用/已 pending 的號）；
+        max_sessions 由 attach 路徑另行把關。
         """
         used = {s.profile.com for s in self._sessions.values()}
         used |= set(self._pending_com.values())
-        for i in range(self._max_sessions):
-            com = f"COM{i}"
-            if com not in used:
-                return com
-        return f"COM{len(self._sessions)}"
+        i = 0
+        while f"COM{i}" in used:
+            i += 1
+        return f"COM{i}"
 
     def _by_path_for(self, by_id: str) -> str | None:
         """取得 by_id 對應的 by-path（須在 self._lock 內呼叫）。
@@ -604,79 +606,6 @@ class SessionManager:
                 if s.profile.device_by_id == by_id:
                     return s.profile.com
             return self._pending_com.get(by_id)
-
-    def renumber_dynamic(self) -> dict[str, str]:
-        """依 sorted by-id 重排所有 dynamic session 的 COM（on-demand、無條件強制，含 active）。
-
-        回傳 ``{old_session_id: new_session_id}``；Service 層據此 remap arbiter worker
-        （``unregister(old)`` + ``register(new)``）。**in-flight 命令在強制重編下會被丟棄**——
-        這是 force 語意的明確後果（使用者主動選擇重排）。
-
-        SessionManager 端在**單一 lock 區間**原子 remap：``_sessions`` key、``profile.com`` /
-        ``session_id``、``_aliases``（reassign_session）、``_binding_overrides`` key、``state.json``。
-        explicit YAML target / binding override / RELEASED 的 session 不參與重排、COM 保留。
-        """
-        with self._lock:
-            # 參與重排者：有 by_id、非 RELEASED/未釋放、非 explicit/bound 的 dynamic session。
-            dynamic = [
-                s
-                for s in self._sessions.values()
-                if s.profile.device_by_id
-                and s.state != "RELEASED"
-                and s.profile.device_by_id not in self._released_by_ids
-                and not self._is_explicit_or_bound(s.profile.device_by_id)
-            ]
-            dynamic_sids = {s.session_id for s in dynamic}
-            ordered = sorted(
-                dynamic,
-                key=lambda s: device_sort_key(
-                    s.profile.device_by_id, self._by_path_for(s.profile.device_by_id)
-                ),
-            )
-            # 目標 COM：避開不參與重排者（explicit/bound/RELEASED）已佔用的號；
-            # dynamic 自身舊 COM 會被釋放重配，不算 reserved。
-            reserved = {
-                s.profile.com
-                for s in self._sessions.values()
-                if s.session_id not in dynamic_sids
-            }
-            targets: dict[str, str] = {}
-            idx = 0
-            for s in ordered:
-                while f"COM{idx}" in reserved:
-                    idx += 1
-                targets[s.session_id] = f"COM{idx}"
-                idx += 1
-            # 兩階段：先把所有「COM 有變」的 session 移出 _sessions（避免新舊 sid key 互撞，
-            # 如 COM0↔COM1 對調），再以新 sid 寫回。alias 在第一階段以**原始**指向一次抓齊
-            # （old_sid → alias 字串），第二階段才寫回——若改用逐筆 reassign_session(old→new)，
-            # 對調情境下「先被移走的 alias」會在後一筆 reassign 時被當成另一筆的 old_sid 誤改。
-            mapping: dict[str, str] = {}
-            moved: list[tuple[str, str, SessionRuntime, str | None]] = []
-            for s in ordered:
-                old_sid = s.session_id
-                new_com = targets[old_sid]
-                if new_com == s.profile.com:
-                    continue
-                alias = self._aliases.for_session(old_sid)  # 原始指向（尚未被任何 remap 動過）
-                self._sessions.pop(old_sid, None)
-                new_profile = dataclasses.replace(s.profile, com=new_com)
-                new_sid = f"{new_profile.profile_name}:{new_com}"
-                s.profile = new_profile
-                s.session_id = new_sid
-                moved.append((old_sid, new_sid, s, alias))
-                mapping[old_sid] = new_sid
-            for old_sid, new_sid, s, alias in moved:
-                self._sessions[new_sid] = s
-                # alias 字串不變、只改指向；以唯一 alias key 寫回 new_sid（對調安全）。
-                if alias is not None:
-                    self._aliases.set_for_session(new_sid, alias)
-                # binding override key remap（防禦：被排除者不會進 moved，故多半為 no-op）。
-                if old_sid in self._binding_overrides:
-                    self._binding_overrides[new_sid] = self._binding_overrides.pop(old_sid)
-            if mapping:
-                self._save_state()
-            return mapping
 
     def _session_from_template(
         self,
@@ -1549,6 +1478,11 @@ class SessionManager:
         with self._lock:
             prev = self._devices
             self._devices = dict(devices)
+            # #100 M2/3a：device 離線後 prune 其 startup 預配（pending）COM，避免已不在線的
+            # by-id 長期 reserve COM 號，導致 _next_dynamic_com 無法回收該號。
+            self._pending_com = {
+                b: c for b, c in self._pending_com.items() if b in self._devices
+            }
             self._mark_missing_devices_locked()
 
         changed = sorted(

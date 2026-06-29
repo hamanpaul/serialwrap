@@ -578,17 +578,6 @@ class SerialwrapService:
         if method == "session.list":
             return {"ok": True, "sessions": self._sessions.list_sessions()}
 
-        if method == "session.renumber":
-            # #100：依 sorted by-id 強制重排所有 dynamic session 的 COM。SessionManager 端做
-            # session/alias/binding/state 的原子 remap 並回傳 {old_sid: new_sid}；arbiter worker
-            # 以 session_id 索引、由 Service 持有，故在此 remap：unregister(old)+register(new)。
-            # 強制重編下，舊 sid 的 in-flight 命令隨 worker unregister 一併丟棄（force 語意的明確後果）。
-            mapping = self._sessions.renumber_dynamic()
-            for old_sid, new_sid in mapping.items():
-                self._arbiter.unregister_session(old_sid)
-                self._arbiter.register_session(new_sid)
-            return {"ok": True, "renumbered": mapping}
-
         if method == "session.get_state":
             selector = str(params.get("selector") or "")
             return self._sessions.get_session_state(selector)

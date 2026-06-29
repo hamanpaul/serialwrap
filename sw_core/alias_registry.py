@@ -35,25 +35,6 @@ class AliasRegistry:
                 "updated_at": now_iso(),
             }
 
-    def for_session(self, session_id: str) -> str | None:
-        """回傳指向該 session_id 的 alias 字串；找不到回 None（#100 renumber 用）。"""
-        with self._lock:
-            for alias, row in self._rows.items():
-                if row.get("session_id") == session_id:
-                    return alias
-            return None
-
-    def reassign_session(self, old_session_id: str, new_session_id: str) -> None:
-        """把所有指向 old_session_id 的 alias row 改指向 new_session_id（#100 renumber 用）。
-
-        alias 字串綁 act_no、**不變**，只改 row 內 session_id 指向。
-        """
-        with self._lock:
-            for row in self._rows.values():
-                if row.get("session_id") == old_session_id:
-                    row["session_id"] = new_session_id
-                    row["updated_at"] = now_iso()
-
     def assign_by_id(self, by_id: str, alias: str, profile: str | None = None) -> None:
         with self._lock:
             row = {

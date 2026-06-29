@@ -471,10 +471,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sess_sub = p_session.add_subparsers(dest="session_cmd", required=True, metavar="<command>")
     sess_sub.add_parser("list", help="列出所有 session 及其狀態")
-    sess_sub.add_parser(
-        "renumber",
-        help="依 by-id 排序重排所有 dynamic session 的 COM（強制，含 active；in-flight 命令會被丟棄）",
-    )
     p_sc = sess_sub.add_parser("clear", help="清除 session（detach 後會自動 re-attach；交接外部請改用 device release）")
     p_sc.add_argument("--selector", required=True, help="session_id | COMx | alias")
     p_sb = sess_sub.add_parser("bind", help="把 session 綁定到指定裝置 by-id")
@@ -783,8 +779,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "session":
         if args.session_cmd == "list":
             return _run_rpc(args, "session.list", {})
-        if args.session_cmd == "renumber":
-            return _run_rpc(args, "session.renumber", {})
         if args.session_cmd == "clear":
             return _run_rpc(args, "session.clear", {"selector": args.selector})
         if args.session_cmd == "bind":
