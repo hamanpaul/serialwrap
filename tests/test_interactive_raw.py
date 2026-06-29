@@ -17,6 +17,7 @@ import termios
 import threading
 import time
 import unittest
+import uuid
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -24,6 +25,7 @@ from unittest import mock
 from sw_core.config import SessionProfile, UartProfile
 from sw_core.session_manager import InteractiveLease, SessionManager
 from sw_core.uart_io import ConsoleClient, UARTBridge
+from sw_core.util import now_iso
 from sw_core.wal import WalWriter
 
 
@@ -518,4 +520,155 @@ class TestReconcileReapsOrphanConsole(unittest.TestCase):
             "orphan-cid",
             bridge._clients,
             "reconcile_readiness 應回收無外部 holder 且逾 grace 的孤兒 console",
+        )
+
+
+class TestSelfHealPeriodicGrant(unittest.TestCase):
+    """lease-backed 週期自癒重授 raw ownership（症狀1 觸發C、Task 7）。
+
+    self-heal 在 reconcile_readiness 週期：bridge 無 owner + 無 agent_active + 無 flash +
+    primary console 有外部 peer → try_grant_interactive_if_idle 原子授予 → 補 session 層 lease。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        import sw_core.session_manager as sm_mod
+        self._old_state_path = sm_mod.STATE_PATH
+        sm_mod.STATE_PATH = str(Path(self._tmp.name) / "state.json")
+
+    def tearDown(self) -> None:
+        import sw_core.session_manager as sm_mod
+        sm_mod.STATE_PATH = self._old_state_path
+
+    def _attach_human_owner(self) -> tuple:
+        """建立 SessionManager + 持有 human interactive lease 的 session。
+
+        bridge 不啟動（無 UART），直接注入 ConsoleClient 到 _clients，並 monkeypatch
+        console_has_external_peer 永遠對 primary_cid 回 True（確定性，不依賴真實 /proc）。
+
+        Returns:
+            (mgr, session, bridge, primary_cid)
+        """
+        profiles = [_make_profile()]
+        mgr = SessionManager(
+            profiles,
+            WalWriter(wal_dir=self._tmp.name),
+            on_ready=lambda _: None,
+            on_detached=lambda _: None,
+        )
+        session = mgr.get_session("COM0")
+        assert session is not None
+        session.state = "READY"
+
+        bridge = UARTBridge(
+            com="COM0",
+            device_path="/dev/null",
+            profile=_make_profile().uart,
+            wal=WalWriter(wal_dir=self._tmp.name),
+        )
+        cid = "heal-cid-1"
+        client = ConsoleClient(
+            client_id=cid,
+            label="minicom-heal",
+            master_fd=-1,
+            slave_fd=-1,
+            slave_path="/dev/pts/77",
+            attached_at=time.time(),
+        )
+        with bridge._state_lock:
+            bridge._clients[cid] = client
+            bridge._primary_client_id = cid
+
+        # 設定 bridge owner（表示 console 當前持有 ownership）
+        bridge.set_interactive_owner(f"human:{cid}")
+
+        # monkeypatch：primary_cid 永遠視為有 peer（不依賴 /proc）
+        bridge.console_has_external_peer = lambda client_id: client_id == cid  # type: ignore[method-assign]
+
+        # 掛到 session
+        with mgr._lock:
+            session.bridge = bridge
+
+        # 建 interactive lease
+        lease = InteractiveLease(
+            interactive_id=uuid.uuid4().hex,
+            session_id=session.session_id,
+            owner=f"human:{cid}",
+            created_at=now_iso(),
+            timeout_s=60.0,
+        )
+        with mgr._lock:
+            mgr._interactive[lease.interactive_id] = lease
+            session.interactive_session_id = lease.interactive_id
+
+        return mgr, session, bridge, cid
+
+    def test_self_heal_regrants_after_owner_loss(self) -> None:
+        """owner 掉失（bridge owner=None, session lease=None）+ primary console 活著
+        → reconcile_readiness 後自癒重授 ownership 並補 session lease。"""
+        mgr, session, bridge, cid = self._attach_human_owner()
+
+        # 模擬 owner 掉失：清 bridge owner 與 session lease
+        bridge.set_interactive_owner(None)
+        session.interactive_session_id = None
+
+        # 強制通過節流
+        mgr._last_console_reap_at = 0.0
+        mgr.reconcile_readiness()
+
+        snap = bridge.snapshot()
+        self.assertEqual(
+            snap["interactive_owner"],
+            f"human:{cid}",
+            "自癒後 bridge 的 interactive_owner 應重授給 primary console",
+        )
+        self.assertIsNotNone(
+            session.interactive_session_id,
+            "自癒後 session.interactive_session_id 應有新 lease",
+        )
+
+    def test_self_heal_skips_during_agent_active(self) -> None:
+        """agent 進行中（suspend_interactive → agent_active=True）→ reconcile 不應自癒奪權。"""
+        mgr, session, bridge, cid = self._attach_human_owner()
+
+        # 清 bridge owner 和 session lease，再模擬 agent 進行中
+        bridge.set_interactive_owner(None)
+        session.interactive_session_id = None
+        bridge.suspend_interactive()  # _agent_active = True
+
+        mgr._last_console_reap_at = 0.0
+        mgr.reconcile_readiness()
+
+        self.assertIsNone(
+            bridge.snapshot()["interactive_owner"],
+            "agent 進行中不得自癒奪權（agent_active=True 應跳過）",
+        )
+        bridge.resume_interactive()  # 清理 suspend 狀態
+
+    def test_self_heal_grant_fails_on_toctou(self) -> None:
+        """snapshot 判為 idle 後、grant 前另一條路設了 owner → try_grant 回 False → 不開 lease。"""
+        mgr, session, bridge, cid = self._attach_human_owner()
+
+        # 清 bridge owner 和 session lease
+        bridge.set_interactive_owner(None)
+        session.interactive_session_id = None
+
+        # monkeypatch try_grant：在 grant 前模擬 owner 已被搶先設定（TOCTOU 競態）
+        orig_grant = bridge.try_grant_interactive_if_idle
+
+        def racing_grant(owner: str) -> bool:
+            # 模擬 grant 前另一條路已設 owner → orig_grant 看到非 None → 回 False
+            bridge.set_interactive_owner(f"human:{cid}")
+            return orig_grant(owner)
+
+        bridge.try_grant_interactive_if_idle = racing_grant  # type: ignore[method-assign]
+
+        mgr._last_console_reap_at = 0.0
+        mgr.reconcile_readiness()
+
+        # try_grant 回 False → 不呼 _record_self_heal_lease_locked → interactive_session_id 仍 None
+        self.assertIsNone(
+            session.interactive_session_id,
+            "TOCTOU race 後不得開出衝突的新 lease（interactive_session_id 應仍 None）",
         )

@@ -820,7 +820,9 @@ class SessionManager:
                 continue
             self._spawn_reprobe_probe(session_id, bridge)
 
-        # 週期回收孤兒 console（#76）：節流 + 單次共享 /proc 掃描，鎖外執行。
+        # 週期回收孤兒 console + lease-backed 自癒重授（#76 / 症狀1 觸發C）。
+        # 同一節流閘、同一 bridges 清單；snapshot / console_has_external_peer 在鎖外；
+        # session 狀態突變（lease 記錄）在 self._lock 內。
         if now - self._last_console_reap_at >= _HUMAN_PEER_GRACE_S:
             self._last_console_reap_at = now
             with self._lock:
@@ -834,6 +836,63 @@ class SessionManager:
                         bridge.reap_stale_consoles(held_slave_paths=held)
                     except Exception:  # noqa: BLE001 — 單一 bridge 回收失敗不得中斷 tick
                         pass
+
+                # lease-backed 自癒：對每個無 owner / 無 agent / 無 flash 的 bridge，
+                # 若 primary console 仍有外部 peer 但 session layer 已無 lease → 重授。
+                # snapshot / console_has_external_peer 在 self._lock 外（避免鎖內 I/O）；
+                # session 狀態突變在 with self._lock 內；try_grant_interactive_if_idle 原子。
+                for bridge in bridges:
+                    try:
+                        snap = bridge.snapshot()
+                        # 跳過條件：已有 owner、suspended owner、agent 進行中、flash 模式
+                        if snap["interactive_owner"] is not None:
+                            continue
+                        if snap["suspended_owner"] is not None:
+                            continue
+                        if snap["agent_active"] or snap["flash_mode"]:
+                            continue
+                        primary_cid = snap["primary_client_id"]
+                        if not primary_cid:
+                            continue
+                        # 活 primary 判定（鎖外）：primary 的 slave_path 是否被外部持有
+                        if not bridge.console_has_external_peer(primary_cid):
+                            continue
+                        with self._lock:
+                            session = self._session_for_bridge_locked(bridge)
+                            if session is None or session.state not in {"READY", "ATTACHED"}:
+                                continue
+                            if session.interactive_session_id is not None:
+                                continue
+                            # 原子 grant：僅當 bridge 仍完全 idle 才授予（消除 TOCTOU）
+                            if bridge.try_grant_interactive_if_idle(f"human:{primary_cid}"):
+                                # owner 已由 try_grant 原子設定；僅補 session-layer lease 記錄
+                                self._record_self_heal_lease_locked(session, f"human:{primary_cid}")
+                    except Exception:  # noqa: BLE001 — 單一 bridge 自癒失敗不得中斷 tick
+                        pass
+
+    def _session_for_bridge_locked(self, bridge: UARTBridge) -> SessionRuntime | None:
+        """在 self._lock 內以 bridge 物件找對應的 SessionRuntime。"""
+        for s in self._sessions.values():
+            if s.bridge is bridge:
+                return s
+        return None
+
+    def _record_self_heal_lease_locked(self, session: SessionRuntime, owner: str) -> None:
+        """自癒 grant 後補 session-layer lease 記錄。
+
+        比照 _open_interactive_locked，但不呼叫 bridge.set_interactive_owner()——
+        owner 已由 try_grant_interactive_if_idle 原子設定，重設會破壞原子性。
+        """
+        interactive_id = uuid.uuid4().hex
+        lease = InteractiveLease(
+            interactive_id=interactive_id,
+            session_id=session.session_id,
+            owner=owner,
+            created_at=now_iso(),
+            timeout_s=max(session.profile.hard_timeout_s, _ATTACHED_CONSOLE_LEASE_TIMEOUT_S),
+        )
+        self._interactive[interactive_id] = lease
+        session.interactive_session_id = interactive_id
 
     def set_alias_for_session(self, session_id: str, alias: str) -> dict[str, Any]:
         with self._lock:
