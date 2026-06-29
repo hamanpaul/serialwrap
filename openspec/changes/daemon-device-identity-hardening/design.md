@@ -25,7 +25,7 @@
 - **D2：rank 上移到 lock 內、spawn threads 之前**。替代（在 thread 內讓 `_next_dynamic_com` 算 rank）仍受並發 race；唯有在同步點對「整批在線 dynamic 裝置」一次排序配號才確定。兩條 startup 入口（`service.py:464` `update_devices` + `:465` `bootstrap_attach`）都涵蓋。
 - **D3：rank 僅作用於 dynamic 自動偵測 session**；explicit `targets`/`bind` COM 為權威、排除 pool 外，避免污染既有持久化綁定。
 - **D4：runtime hotplug 沿用現有（使用者拍板 (a)）**；不同 by-id 板繼承空槽，不活體重編 active。on-demand 顯式重排（`session renumber`）已 defer 至 follow-up。
-- **D5：`session renumber` defer 至 follow-up；本 PR 不含**。經 reviewer（superpowers + codex）審查：強制重編 active session 會牽動 attach 時以值捕捉 `session_id` 的 bridge callback、flash state、lease reverse-link 等深層管路，須改以「拆 bridge → 改號 → 重 attach」另案重做，故自本 PR 移除。
+- **D5：`session renumber` defer 至 follow-up（#103）；本 PR 不含**。經 reviewer（superpowers + codex）審查：強制重編 active session 會牽動 attach 時以值捕捉 `session_id` 的 bridge callback、flash state、lease reverse-link 等深層管路，須改以「拆 bridge → 改號 → 重 attach」另案重做，故自本 PR 移除。
 - **D6：#101 偵測為 on-demand、module-level helper**（非複用只回 pid 的 `_probe_external_holder` instance method）。doctor 直接用（daemon-less）；daemon status 走 executor offload（`health.status` 在同步 dispatcher，全 /proc 掃描會凍結 event loop）。
 
 ## Risks / Trade-offs

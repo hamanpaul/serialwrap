@@ -7,7 +7,7 @@
 - **COM 編號改為依 `device_key`（by-id，by-path fallback）排序的確定性 rank**：startup 在 lock 內、spawn attach threads 之前一次配好 COM rank，消除現行「並發 attach 完成順序決定 COM0」的 race（#100 根因）。
 - **rank 作用域限定 dynamic 自動偵測 session**：explicit YAML `targets` / `session.bind` 綁定的 COM 為權威、排除在 rank pool 外。
 - **runtime hotplug 維持現有行為**：不同 by-id 的板繼承空出的 DETACHED/RELEASED 槽（`_attach_by_id` rebind 不改），active session COM 名 daemon 存活期間不變。
-- **`session renumber` 已 defer 至 follow-up**（需以「拆 bridge → 改號 → 重 attach」重做，避免弄壞 attach 時以值捕捉的 bridge callback / flash state / lease reverse-link），本 PR 不含。
+- **`session renumber` 已 defer 至 follow-up（#103）**（需以「拆 bridge → 改號 → 重 attach」重做，避免弄壞 attach 時以值捕捉的 bridge callback / flash state / lease reverse-link），本 PR 不含。
 - **新增 daemon 多開被動偵測**：on-demand 掃 /proc 找其他 `serialwrapd` 與 tty 持有者，暴露到 `serialwrap doctor` 與 `serialwrap daemon status`，不自動 refuse/kill/退讓。
 
 ## Capabilities

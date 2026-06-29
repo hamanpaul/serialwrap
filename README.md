@@ -299,7 +299,7 @@ dynamic 自動偵測 session 的 COM 編號**依裝置 by-id 字典序確定性�
 - **rank 作用域只限 dynamic 自動偵測 session**。explicit YAML `targets` 指定的 COM、`session bind` / `_binding_overrides` 綁定、RELEASED 的裝置都是權威來源，排除在 rank pool 外、COM 不被覆寫。
 - **runtime hotplug**：不同 by-id 的板插入時繼承空出的 DETACHED 槽（維持原 COM 名）；同 by-id 重接總是拿回自己原槽；active session 的 COM 名在 daemon 存活期間不變。
 - **同款晶片（如 CH340）by-id 衝突的 by-path tiebreak**：排序鍵已預留 by-path 次序骨架，但 end-to-end 完整支援為 **TODO**（待 `DeviceInfo.by_path` 接上資料來源）；在此之前 rank 僅依 by-id。
-- **on-demand `session renumber`（執行期把漂移的 COM snap 回排序）已 defer 至 follow-up**：強制重編 active session 牽動 bridge callback / flash state / lease reverse-link，須改以「拆 bridge → 改號 → 重 attach」另案重做。現階段如需重排，以 daemon restart 為暫時手段。
+- **on-demand `session renumber`（執行期把漂移的 COM snap 回排序）已 defer 至 follow-up（#103）**：強制重編 active session 牽動 bridge callback / flash state / lease reverse-link，須改以「拆 bridge → 改號 → 重 attach」另案重做。現階段如需重排，以 daemon restart 為暫時手段。
 
 ## Session Template 架構圖
 

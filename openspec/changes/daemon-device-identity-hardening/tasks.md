@@ -15,7 +15,7 @@
 - [x] 2.4 確保 rank 僅作用 dynamic；explicit `targets`/`bind`/RELEASED 排除在 pool 外
 - [x] 2.5 跑 1.1/1.2/1.4/1.5 轉綠
 
-## 3. Capability A — session renumber（DEFERRED 至 follow-up）
+## 3. Capability A — session renumber（DEFERRED 至 follow-up #103）
 
 > reviewer（superpowers + codex）審查後決定 defer：強制重編 active session 會弄壞 attach 時以值捕捉 `session_id` 的 bridge callback、flash state、lease reverse-link，須改以「拆 bridge → 改號 → 重 attach」另案重做。本 PR 已移除相關程式/測試/契約。
 
