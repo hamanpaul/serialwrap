@@ -10,8 +10,10 @@
 """
 
 import dataclasses
+import os
 import tempfile
 import unittest
+import unittest.mock as mock
 from pathlib import Path
 
 from sw_core.config import ProfileTemplate, SessionProfile, UartProfile
@@ -180,6 +182,82 @@ class TestStartupRank(unittest.TestCase):
             chosen.profile = dataclasses.replace(chosen.profile, device_by_id=new_by_id)
         # 新 by-id 繼承了原 COM0
         self.assertEqual(mgr.com_for_by_id(new_by_id), "COM0")
+
+
+class TestServiceStartRankWiring(unittest.TestCase):
+    """Task 3：start() 兩條 startup 入口收斂走預配（spawn attach 前先 prepare_dynamic_rank）。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._old_state_path = sm_mod.STATE_PATH
+        sm_mod.STATE_PATH = str(Path(self._tmp.name) / "state.json")
+        self.addCleanup(lambda: setattr(sm_mod, "STATE_PATH", self._old_state_path))
+        self._old_wal = os.environ.get("SERIALWRAP_WAL_DIR")
+        os.environ["SERIALWRAP_WAL_DIR"] = self._tmp.name
+        self.addCleanup(self._restore_wal)
+        # fake by-id 目錄：兩條 symlink 指向不同 real_path（避免 DeviceWatcher 同 real_path 去重）。
+        self._byid = Path(self._tmp.name) / "by-id"
+        self._byid.mkdir()
+        tty_a = Path(self._tmp.name) / "ttyFakeA"
+        tty_b = Path(self._tmp.name) / "ttyFakeB"
+        tty_a.touch()
+        tty_b.touch()
+        # 以反序檔名建立（AQ00 先 touch），驗證最終 rank 不隨建立順序、只依 by-id 排序。
+        (self._byid / os.path.basename(BY_ID_AQ00)).symlink_to(tty_a)
+        (self._byid / os.path.basename(BY_ID_AC01)).symlink_to(tty_b)
+
+    def _restore_wal(self) -> None:
+        if self._old_wal is None:
+            os.environ.pop("SERIALWRAP_WAL_DIR", None)
+        else:
+            os.environ["SERIALWRAP_WAL_DIR"] = self._old_wal
+
+    def test_start_prepares_rank_before_attach(self) -> None:
+        from sw_core.service import SerialwrapService
+
+        templates = [
+            ProfileTemplate(profile_name="prpl-template", platform="prpl"),
+            ProfileTemplate(profile_name="others-template", platform="passthrough"),
+        ]
+        svc = SerialwrapService(
+            [],
+            templates=templates,
+            by_id_dir=str(self._byid),
+            by_path_dir=str(Path(self._tmp.name) / "nonexistent-by-path"),
+        )
+        calls: list[tuple] = []
+        with mock.patch.object(svc._engine, "start"), mock.patch.object(
+            svc._flash_endpoint, "start"
+        ), mock.patch.object(svc._watcher, "start"), mock.patch.object(
+            svc._sessions,
+            "prepare_dynamic_rank",
+            side_effect=lambda ids: calls.append(("prepare", list(ids))),
+        ), mock.patch.object(
+            svc._sessions,
+            "update_devices",
+            side_effect=lambda d: calls.append(("update", sorted(d.keys()))),
+        ), mock.patch.object(
+            svc._sessions,
+            "bootstrap_attach",
+            side_effect=lambda: calls.append(("bootstrap",)),
+        ):
+            svc.start()
+
+        kinds = [c[0] for c in calls]
+        self.assertIn("prepare", kinds)
+        self.assertIn("bootstrap", kinds)
+        # prepare 必須早於 bootstrap（spawn attach 前先配號）
+        self.assertLess(kinds.index("prepare"), kinds.index("bootstrap"))
+        # prepare 收到的是 watcher 在線裝置 by-id（依 by-id 排序：AC01 在前）
+        prepare_args = next(c[1] for c in calls if c[0] == "prepare")
+        expected = sorted(
+            [
+                str(self._byid / os.path.basename(BY_ID_AC01)),
+                str(self._byid / os.path.basename(BY_ID_AQ00)),
+            ]
+        )
+        self.assertEqual(prepare_args, expected)
 
 
 if __name__ == "__main__":

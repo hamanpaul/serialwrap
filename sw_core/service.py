@@ -459,6 +459,10 @@ class SerialwrapService:
         self._sessions.add_rx_observer(self._engine_rx_observer)
         self._watcher.start()
         self._watcher.poll_once()
+        # #100：在 spawn attach threads 之前，先對「當下在線的 dynamic 裝置」依 by-id
+        # 排序一次配好 COM rank（兩條 startup 入口 update_devices / bootstrap_attach 都會
+        # 觸發並發 attach；先預配才能消除「誰先搶到 lock 誰拿 COM0」的 race）。
+        self._sessions.prepare_dynamic_rank(list(self._watcher.devices.keys()))
         self._sessions.update_devices(self._watcher.devices)
         self._sessions.bootstrap_attach()
         self._flash_endpoint.start()
