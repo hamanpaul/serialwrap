@@ -234,3 +234,69 @@ class TestConsoleClientInternalFlag(unittest.TestCase):
             os.close(master_fd)
             os.close(slave_fd)
             tmpdir.cleanup()
+
+
+class TestReapStaleConsoles(unittest.TestCase):
+    """Task 3：UARTBridge.reap_stale_consoles() 主動回收孤兒 console。"""
+
+    def test_reap_drops_orphan_non_primary(self) -> None:
+        """孤兒（過 grace、無外部 reader）非 internal console 應被 reaper 回收。"""
+        bridge, master_fd, slave_fd, tmpdir = _make_pty_bridge()
+        try:
+            bridge.start()
+            info = bridge.attach_console(label="orphan")
+            cid = info["client_id"]
+            with bridge._state_lock:
+                bridge._clients[cid].attached_at -= 10.0  # 強制過 grace
+            reaped = bridge.reap_stale_consoles(held_slave_paths=set())  # 模擬「無人持有任何 slave」
+            self.assertIn(cid, [c.client_id for c in reaped])
+            with bridge._state_lock:
+                self.assertNotIn(cid, bridge._clients)
+        finally:
+            bridge.stop()
+            os.close(master_fd)
+            os.close(slave_fd)
+            tmpdir.cleanup()
+
+    def test_reap_never_touches_internal_sentinel(self) -> None:
+        """internal=True の哨兵 primary は過 grace でも絶對に回收してはならない。"""
+        bridge, master_fd, slave_fd, tmpdir = _make_pty_bridge()
+        try:
+            bridge.start()
+            pid = bridge._primary_client_id
+            with bridge._state_lock:
+                bridge._clients[pid].attached_at -= 10.0
+            bridge.reap_stale_consoles(held_slave_paths=set())
+            with bridge._state_lock:
+                self.assertIn(pid, bridge._clients, "internal 哨兵 primary 不得被回收")
+        finally:
+            bridge.stop()
+            os.close(master_fd)
+            os.close(slave_fd)
+            tmpdir.cleanup()
+
+    def test_reap_skips_owner_and_suspended_owner(self) -> None:
+        """reaper は current owner と suspended owner を回收してはならない。"""
+        bridge, master_fd, slave_fd, tmpdir = _make_pty_bridge()
+        try:
+            bridge.start()
+            info = bridge.attach_console(label="owner")
+            cid = info["client_id"]
+            bridge.set_interactive_owner(f"human:{cid}")
+            with bridge._state_lock:
+                bridge._clients[cid].attached_at -= 10.0
+            bridge.reap_stale_consoles(held_slave_paths=set())
+            with bridge._state_lock:
+                self.assertIn(cid, bridge._clients, "當前 owner 不得被 reaper 回收")
+            # suspended owner（agent 命令中）
+            bridge.suspend_interactive()
+            bridge.reap_stale_consoles(held_slave_paths=set())
+            with bridge._state_lock:
+                self.assertIn(cid, bridge._clients, "suspended owner 不得被 reaper 回收")
+                self.assertEqual(bridge._suspended_owner, f"human:{cid}")
+            bridge.resume_interactive()
+        finally:
+            bridge.stop()
+            os.close(master_fd)
+            os.close(slave_fd)
+            tmpdir.cleanup()

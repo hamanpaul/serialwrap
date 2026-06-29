@@ -443,6 +443,81 @@ class UARTBridge:
                 self._interactive_owner = None
         self._close_console_client(client)
 
+    def reap_stale_consoles(self, *, held_slave_paths: set[str] | None = None) -> list[ConsoleClient]:
+        """週期主動回收無外部 reader 的孤兒 console（含死掉的非-internal primary）。
+
+        lock-split：鎖內快照候選 → 鎖外掃 /proc（若 held_slave_paths 未給）→ 回鎖 pop → 鎖外 close fd。
+        硬性跳過當前 _interactive_owner / _suspended_owner / internal 哨兵，避免破壞 #78 suspend 簿記
+        與 Fix3 的 peer-loss grace（owner 拆除全權交 session-layer）。
+        """
+        now = time.time()
+        with self._state_lock:
+            owner_cid = self._interactive_owner.split(":", 1)[1] if (self._interactive_owner or "").startswith("human:") else None
+            susp_cid = self._suspended_owner.split(":", 1)[1] if (self._suspended_owner or "").startswith("human:") else None
+            protected = {cid for cid in (owner_cid, susp_cid) if cid}
+            candidates = [
+                (c.client_id, c.slave_path)
+                for c in self._clients.values()
+                if not c.internal
+                and c.sock is None  # POSIX PTY only（TCP client 的斷線由 console loop recv b"" 偵測）
+                and c.client_id not in protected
+                and (now - c.attached_at) >= _STALE_CONSOLE_GRACE_S
+            ]
+        if not candidates:
+            return []
+        if held_slave_paths is None:
+            held_slave_paths = self._scan_held_slave_paths()  # 鎖外 /proc 掃描
+        reaped: list[ConsoleClient] = []
+        with self._state_lock:
+            for cid, slave_path in candidates:
+                client = self._clients.get(cid)
+                if client is None or client.internal:
+                    continue
+                # 回鎖後重查保護集合（期間可能變成 owner/suspended）
+                cur_owner = self._interactive_owner.split(":", 1)[1] if (self._interactive_owner or "").startswith("human:") else None
+                cur_susp = self._suspended_owner.split(":", 1)[1] if (self._suspended_owner or "").startswith("human:") else None
+                if cid in {x for x in (cur_owner, cur_susp) if x}:
+                    continue
+                if slave_path in held_slave_paths:
+                    continue
+                removed = self._clients.pop(cid, None)
+                if removed is None:
+                    continue
+                self._deferred_buffers.pop(cid, None)
+                if self._primary_client_id == cid:
+                    nxt = next(iter(self._clients.values()), None)
+                    self._primary_client_id = nxt.client_id if nxt is not None else None
+                reaped.append(removed)
+        for client in reaped:
+            self._close_console_client(client)  # 鎖外關 fd
+        return reaped
+
+    def _scan_held_slave_paths(self) -> set[str]:
+        """鎖外掃描 /proc，回傳「被外部 process 持有的 slave_path 集合」（排除自身 pid）。"""
+        held: set[str] = set()
+        self_pid = os.getpid()
+        try:
+            pids = os.listdir("/proc")
+        except OSError:
+            # procfs 不可用：保守起見回傳所有現存 client 的 slave_path（視為仍被持有，不誤剪）
+            with self._state_lock:
+                return {c.slave_path for c in self._clients.values()}
+        for pid_text in pids:
+            if not pid_text.isdigit() or int(pid_text) == self_pid:
+                continue
+            fd_dir = os.path.join("/proc", pid_text, "fd")
+            try:
+                fd_names = os.listdir(fd_dir)
+            except OSError:
+                continue
+            for fd_name in fd_names:
+                try:
+                    target = os.readlink(os.path.join(fd_dir, fd_name))
+                except OSError:
+                    continue
+                held.add(target)
+        return held
+
     def _prune_stale_consoles_locked(self, *, now: float | None = None) -> list[ConsoleClient]:
         cutoff = time.time() if now is None else now
         stale: list[ConsoleClient] = []
