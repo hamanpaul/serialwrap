@@ -73,6 +73,7 @@ serialwrap 另提供原生 MCU flash 端點（與上面 device handoff 互補）
 - `BRIDGE_DOWN` + `DETACHED` + `*_PROMPT_TIMEOUT`：若 device 還在位，daemon 會重新走 attach/probe 路徑。
 - `minicom_router.sh` 會提示「DUT 可能仍在開機、serialwrap 正在自動重探」；需要阻塞等 READY 時可設 `MINICOM_WAIT_READY=1`。
 - 若 `reprobe_exhausted=true` 或等待過久仍未 READY，再手動 `serialwrap session recover --selector COM0`（必要時 `--force`）。
+- 懷疑 RX 掉字／狀態被污染：可能是同機多開（two-reader）。`serialwrap daemon status` 的 `multi_open`／`foreign_holders` 欄位與 `serialwrap doctor` 的 `single_daemon` 檢查會掃 `/proc` 報出其他 `serialwrapd` 與 tty 持有者（#101，純偵測）。勿用 `serialwrap daemon start`（systemd 模式會另起非託管 daemon 造成 two-reader）；生命週期用 `serialwrap service ...`。
 
 ## Remote Support 用法（ssh-tunnel）
 當 Agent 不在 target 所在機器上，而要從遠端 debug UART 時，走 **remote endpoint** 模式。
@@ -82,8 +83,9 @@ serialwrap 另提供原生 MCU flash 端點（與上面 device handoff 互補）
 target 端（暴露 daemon socket，務必 bind 127.0.0.1）：
 ```bash
 socat TCP-LISTEN:7777,bind=127.0.0.1,reuseaddr,fork \
-      UNIX-CONNECT:/tmp/serialwrap/serialwrapd.sock &
+      UNIX-CONNECT:/run/serialwrap/serialwrapd.sock &
 ```
+（socket 路徑依監管模式：systemd-system 預設 `/run/serialwrap/serialwrapd.sock`；實際值見 `~/.config/serialwrap/config.yaml` 的 `socket_path`。）
 RD / Agent 端：
 ```bash
 ssh -N -L 127.0.0.1:7777:127.0.0.1:7777 remote_user@target_host

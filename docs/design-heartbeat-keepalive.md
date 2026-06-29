@@ -1,5 +1,7 @@
 # Design: Long-running Command Heartbeat / Keepalive
 
+> 📌 **歷史快照**：#24 heartbeat/keepalive 已交付（功能仍在用）。本檔為當時的設計記錄；現行對外契約（含 `expected_duration_s`、output-based keepalive、`foreground_busy` 等）以 `README.md` 與 `docs/serialwrap-spec.md` 為準，本檔僅留作歷史。
+
 **Issue**: #24  
 **Status**: 已實作（Phase 1 於 `bugfix/open-issues-phase1`，Phase 2 於 `feat/open-issues-phase2`）  
 
