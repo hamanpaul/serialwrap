@@ -329,3 +329,79 @@ class TestReapStaleConsoles(unittest.TestCase):
             os.close(master_fd)
             os.close(slave_fd)
             tmpdir.cleanup()
+
+
+class TestSnapshotDecisionFieldsAndAtomicGrant(unittest.TestCase):
+    """Task 6：snapshot() 擴充決策欄位 + try_grant_interactive_if_idle 原子 grant（Codex finding-2）。"""
+
+    def _make_idle_bridge(self) -> tuple[UARTBridge, tempfile.TemporaryDirectory]:
+        tmpdir = tempfile.TemporaryDirectory()
+        wal = WalWriter(wal_dir=tmpdir.name)
+        bridge = UARTBridge(
+            com="COM0",
+            device_path="/dev/null",
+            profile=UartProfile(),
+            wal=wal,
+        )
+        return bridge, tmpdir
+
+    def test_snapshot_exposes_decision_fields(self) -> None:
+        """snapshot() 必須包含 agent_active / suspended_owner / flash_mode / primary_client_id 四個決策欄位。"""
+        bridge, tmpdir = self._make_idle_bridge()
+        try:
+            snap = bridge.snapshot()
+            for key in ("agent_active", "suspended_owner", "flash_mode", "primary_client_id"):
+                self.assertIn(key, snap, f"snapshot() 缺少欄位：{key}")
+            # 確認初始值
+            self.assertFalse(snap["agent_active"])
+            self.assertIsNone(snap["suspended_owner"])
+            self.assertFalse(snap["flash_mode"])
+            self.assertIsNone(snap["primary_client_id"])
+        finally:
+            bridge.stop()
+            tmpdir.cleanup()
+
+    def test_try_grant_if_idle_succeeds_when_idle(self) -> None:
+        """完全 idle bridge（無 owner/suspended/agent/flash）→ grant 回 True，owner 被設定。"""
+        bridge, tmpdir = self._make_idle_bridge()
+        try:
+            result = bridge.try_grant_interactive_if_idle("human:test-client")
+            self.assertTrue(result, "idle bridge 應成功 grant")
+            with bridge._state_lock:
+                self.assertEqual(bridge._interactive_owner, "human:test-client")
+        finally:
+            bridge.stop()
+            tmpdir.cleanup()
+
+    def test_try_grant_if_idle_fails_when_owner_set(self) -> None:
+        """已有 interactive owner → grant 回 False，owner 不變。"""
+        bridge, tmpdir = self._make_idle_bridge()
+        try:
+            bridge.set_interactive_owner("human:existing-owner")
+            result = bridge.try_grant_interactive_if_idle("human:new-client")
+            self.assertFalse(result, "有 owner 時不得 grant")
+            with bridge._state_lock:
+                self.assertEqual(bridge._interactive_owner, "human:existing-owner")
+        finally:
+            bridge.stop()
+            tmpdir.cleanup()
+
+    def test_try_grant_if_idle_fails_when_agent_active(self) -> None:
+        """agent 執行中（suspend_interactive 後 _agent_active=True）→ grant 回 False。"""
+        bridge, tmpdir = self._make_idle_bridge()
+        try:
+            # 先設 owner，再 suspend → _suspended_owner 非 None、_agent_active=True、_interactive_owner=None
+            bridge.set_interactive_owner("human:original-owner")
+            bridge.suspend_interactive()
+            with bridge._state_lock:
+                self.assertTrue(bridge._agent_active)
+                self.assertEqual(bridge._suspended_owner, "human:original-owner")
+                self.assertIsNone(bridge._interactive_owner)
+            result = bridge.try_grant_interactive_if_idle("human:new-client")
+            self.assertFalse(result, "agent 執行中（suspended）不得 grant")
+            with bridge._state_lock:
+                self.assertIsNone(bridge._interactive_owner, "grant 失敗後 owner 仍應為 None")
+        finally:
+            bridge.resume_interactive()
+            bridge.stop()
+            tmpdir.cleanup()

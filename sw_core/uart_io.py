@@ -1042,6 +1042,9 @@ class UARTBridge:
             last_human_input_at = self._last_human_input_at
             console_endpoint = self._console_endpoint
             console_listener_alive = self._console_listener is not None
+            agent_active = self._agent_active
+            suspended_owner = self._suspended_owner
+            flash_mode = self._flash_mode
         serial_alive = False
         if serial_fd is not None:
             try:
@@ -1070,4 +1073,27 @@ class UARTBridge:
             "consoles": consoles,
             "running": bool(self._thread and self._thread.is_alive()),
             "console_endpoint": console_endpoint,  # Windows TCP console 端點；POSIX 為 None（#84 PORT-2）
+            # Task 6 決策欄位（Codex finding-2）：供 SessionManager 自癒邏輯在同一 snapshot 取得所有
+            # 判斷條件，避免分次讀取造成的 TOCTOU（racing suspend_interactive/flash 轉換）。
+            "agent_active": agent_active,
+            "suspended_owner": suspended_owner,
+            "flash_mode": flash_mode,
+            "primary_client_id": primary_client_id,
         }
+
+    def try_grant_interactive_if_idle(self, owner: str) -> bool:
+        """原子 check-and-set：僅當 bridge 完全 idle（無 owner、無 suspended owner、非 agent_active、非 flash）才授予 interactive ownership。
+
+        單次 _state_lock critical section，消除「讀到陳舊 idle 快照→期間 agent suspend/flash→仍誤授」
+        的 TOCTOU。供 Task 7 self-heal 邏輯使用。
+        """
+        with self._state_lock:
+            if (
+                self._interactive_owner is None
+                and self._suspended_owner is None
+                and not self._agent_active
+                and not self._flash_mode
+            ):
+                self._interactive_owner = owner
+                return True
+            return False
