@@ -45,6 +45,9 @@ class ConsoleClient:
     # slave_path 為 "host:port" 端點字串。console 的狀態機（line buffer / raw / suspend-resume /
     # fan-out）對兩者共用，I/O 原語由 _console_send 與 console loop 依 sock 分派。
     sock: Any = None
+    # broker 內部哨兵 primary（start() 建、無外部 reader、作 snapshot.vtty 錨點）為 True，永不被 reaper 回收；
+    # 經 attach_console / TCP accept 建立的真實 console 為 False。
+    internal: bool = False
 
 
 @dataclasses.dataclass
@@ -226,6 +229,7 @@ class UARTBridge:
                     primary_client_id = next_client.client_id if next_client is not None else None
             elif _pty_available():
                 primary = self._create_console_client("primary")
+                primary.internal = True  # 哨兵 primary：永不被 reaper 回收
                 clients = {primary.client_id: primary}
                 primary_client_id = primary.client_id
             else:
@@ -395,23 +399,21 @@ class UARTBridge:
         with self._state_lock:
             return self._console_endpoint
 
-    def _client_has_external_peer_locked(self, client: ConsoleClient) -> bool:
-        if client.sock is not None:
-            # Windows TCP console（#84 PORT-2）：連線斷開由 console loop 的 recv b"" 直接偵測並
-            # drop，不靠 /proc 掃描；故視為「仍有 peer」直到被 drop（避免 stale-pruning 誤剪）。
-            return True
+    def _enumerate_all_held_paths(self) -> set[str] | None:
+        """掃描 /proc，回傳所有外部 process 持有的 fd readlink 目標集合（排除自身 pid）。
+
+        procfs 不可用時回傳 None（呼叫端據此採保守策略）。本函式不取任何鎖，純讀 /proc；
+        呼叫端自行決定是否在 _state_lock 內外呼叫（reaper 走鎖外、_client_has_external_peer_locked
+        既有行為走鎖內，均不變）。
+        """
+        held: set[str] = set()
         self_pid = os.getpid()
         try:
             pids = os.listdir("/proc")
         except OSError:
-            # Be conservative when procfs is unavailable.
-            return True
-
+            return None
         for pid_text in pids:
-            if not pid_text.isdigit():
-                continue
-            pid = int(pid_text)
-            if pid == self_pid:
+            if not pid_text.isdigit() or int(pid_text) == self_pid:
                 continue
             fd_dir = os.path.join("/proc", pid_text, "fd")
             try:
@@ -423,9 +425,19 @@ class UARTBridge:
                     target = os.readlink(os.path.join(fd_dir, fd_name))
                 except OSError:
                     continue
-                if target == client.slave_path:
-                    return True
-        return False
+                held.add(target)
+        return held
+
+    def _client_has_external_peer_locked(self, client: ConsoleClient) -> bool:
+        if client.sock is not None:
+            # Windows TCP console（#84 PORT-2）：連線斷開由 console loop 的 recv b"" 直接偵測並
+            # drop，不靠 /proc 掃描；故視為「仍有 peer」直到被 drop（避免 stale-pruning 誤剪）。
+            return True
+        held = self._enumerate_all_held_paths()
+        if held is None:
+            # procfs 不可用：保守起見視為仍有 peer（避免誤剪）。
+            return True
+        return client.slave_path in held
 
     def _drop_console_client(self, client_id: str) -> None:
         with self._state_lock:
@@ -438,6 +450,69 @@ class UARTBridge:
             if self._interactive_owner == f"human:{client_id}":
                 self._interactive_owner = None
         self._close_console_client(client)
+
+    def reap_stale_consoles(self, *, held_slave_paths: set[str] | None = None) -> list[ConsoleClient]:
+        """週期主動回收無外部 reader 的孤兒 console（含死掉的非-internal primary）。
+
+        lock-split：鎖內快照候選 → 鎖外掃 /proc（若 held_slave_paths 未給）→ 回鎖 pop → 鎖外 close fd。
+        硬性跳過當前 _interactive_owner / _suspended_owner / internal 哨兵，避免破壞 #78 suspend 簿記
+        與 Fix3 的 peer-loss grace（owner 拆除全權交 session-layer）。
+        """
+        now = time.time()
+        with self._state_lock:
+            owner_cid = self._interactive_owner.split(":", 1)[1] if (self._interactive_owner or "").startswith("human:") else None
+            susp_cid = self._suspended_owner.split(":", 1)[1] if (self._suspended_owner or "").startswith("human:") else None
+            protected = {cid for cid in (owner_cid, susp_cid) if cid}
+            candidates = [
+                (c.client_id, c.slave_path)
+                for c in self._clients.values()
+                if not c.internal
+                and c.sock is None  # POSIX PTY only（TCP client 的斷線由 console loop recv b"" 偵測）
+                and c.client_id not in protected
+                and (now - c.attached_at) >= _STALE_CONSOLE_GRACE_S
+            ]
+        if not candidates:
+            return []
+        if held_slave_paths is None:
+            held_slave_paths = self._scan_held_slave_paths()  # 鎖外 /proc 掃描
+        reaped: list[ConsoleClient] = []
+        with self._state_lock:
+            # 回鎖後重查保護集合（鎖外掃描期間可能變成 owner/suspended）；持鎖期間不會再變，
+            # 故只計算一次、避免每個候選重算。
+            cur_owner = self._interactive_owner.split(":", 1)[1] if (self._interactive_owner or "").startswith("human:") else None
+            cur_susp = self._suspended_owner.split(":", 1)[1] if (self._suspended_owner or "").startswith("human:") else None
+            cur_protected = {x for x in (cur_owner, cur_susp) if x}
+            for cid, slave_path in candidates:
+                client = self._clients.get(cid)
+                if client is None or client.internal:
+                    continue
+                if cid in cur_protected:
+                    continue
+                if slave_path in held_slave_paths:
+                    continue
+                removed = self._clients.pop(cid, None)
+                if removed is None:
+                    continue
+                self._deferred_buffers.pop(cid, None)
+                if self._primary_client_id == cid:
+                    nxt = next(iter(self._clients.values()), None)
+                    self._primary_client_id = nxt.client_id if nxt is not None else None
+                reaped.append(removed)
+        for client in reaped:
+            self._close_console_client(client)  # 鎖外關 fd
+        return reaped
+
+    def _scan_held_slave_paths(self) -> set[str]:
+        """鎖外掃描 /proc，回傳「被外部 process 持有的 slave_path 集合」（排除自身 pid）。
+
+        procfs 不可用（`_enumerate_all_held_paths` 回 None）時，保守起見回傳所有現存 client 的
+        slave_path（視為仍被持有、不誤剪）——此分支會**內部取得 `_state_lock`** 做快照。
+        """
+        held = self._enumerate_all_held_paths()
+        if held is None:
+            with self._state_lock:
+                return {c.slave_path for c in self._clients.values()}
+        return held
 
     def _prune_stale_consoles_locked(self, *, now: float | None = None) -> list[ConsoleClient]:
         cutoff = time.time() if now is None else now
@@ -967,6 +1042,9 @@ class UARTBridge:
             last_human_input_at = self._last_human_input_at
             console_endpoint = self._console_endpoint
             console_listener_alive = self._console_listener is not None
+            agent_active = self._agent_active
+            suspended_owner = self._suspended_owner
+            flash_mode = self._flash_mode
         serial_alive = False
         if serial_fd is not None:
             try:
@@ -995,4 +1073,27 @@ class UARTBridge:
             "consoles": consoles,
             "running": bool(self._thread and self._thread.is_alive()),
             "console_endpoint": console_endpoint,  # Windows TCP console 端點；POSIX 為 None（#84 PORT-2）
+            # Task 6 決策欄位（Codex finding-2）：供 SessionManager 自癒邏輯在同一 snapshot 取得所有
+            # 判斷條件，避免分次讀取造成的 TOCTOU（racing suspend_interactive/flash 轉換）。
+            "agent_active": agent_active,
+            "suspended_owner": suspended_owner,
+            "flash_mode": flash_mode,
+            "primary_client_id": primary_client_id,
         }
+
+    def try_grant_interactive_if_idle(self, owner: str) -> bool:
+        """原子 check-and-set：僅當 bridge 完全 idle（無 owner、無 suspended owner、非 agent_active、非 flash）才授予 interactive ownership。
+
+        單次 _state_lock critical section，消除「讀到陳舊 idle 快照→期間 agent suspend/flash→仍誤授」
+        的 TOCTOU。供 Task 7 self-heal 邏輯使用。
+        """
+        with self._state_lock:
+            if (
+                self._interactive_owner is None
+                and self._suspended_owner is None
+                and not self._agent_active
+                and not self._flash_mode
+            ):
+                self._interactive_owner = owner
+                return True
+            return False

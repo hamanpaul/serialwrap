@@ -29,6 +29,7 @@ from .constants import (
     REPROBE_MAX_INTERVAL_S,
     REPROBE_RX_IDLE_S,
     STATE_PATH,
+    _HUMAN_PEER_GRACE_S,
 )
 from .device_watcher import DeviceInfo
 from .login_fsm import detect_template, ensure_ready, probe_ready
@@ -148,6 +149,8 @@ class InteractiveLease:
     recovery_mode: bool = False
     # 內部 lifecycle flag：recovery lease 開啟前是否已 suspend 人類 console lease；不透出 RPC。
     suspended_human: bool = False
+    # human lease peer-loss grace：首次觀測到 console peer 消失的 monotonic 時間；peer 回復清為 None。
+    peer_lost_at: float | None = None
 
     def touch(self) -> None:
         self.last_activity_at = time.monotonic()
@@ -362,6 +365,8 @@ class SessionManager:
         # 動態 profile 持久化（#95）：device_key → profile_name
         self._profile_pins: dict[str, str] = {}
         self._profile_detected: dict[str, str] = {}
+        # 孤兒 console 回收節流（#76）：記錄上次共享 /proc 掃描的時間，避免每 tick 都掃一次 procfs。
+        self._last_console_reap_at: float = 0.0
 
         self._load_state()
         for p in profiles:
@@ -814,6 +819,87 @@ class SessionManager:
                     self._reprobe_inflight.discard(session_id)
                 continue
             self._spawn_reprobe_probe(session_id, bridge)
+
+        # 週期回收孤兒 console + lease-backed 自癒重授（#76 / 症狀1 觸發C）。
+        # 同一節流閘、同一 bridges 清單；snapshot / console_has_external_peer 在鎖外；
+        # session 狀態突變（lease 記錄）在 self._lock 內。
+        if now - self._last_console_reap_at >= _HUMAN_PEER_GRACE_S:
+            self._last_console_reap_at = now
+            with self._lock:
+                bridges = [s.bridge for s in self._sessions.values() if s.bridge is not None]
+            if bridges:
+                # 取第一個 bridge 做全域 /proc 掃描（結果對所有 bridge 共用）；
+                # procfs 不可用時回 None，各 bridge 的 reap 自行 fallback 至本身保守掃描（不誤剪）。
+                held = bridges[0]._enumerate_all_held_paths()
+                for bridge in bridges:
+                    try:
+                        bridge.reap_stale_consoles(held_slave_paths=held)
+                    except Exception:  # noqa: BLE001 — 單一 bridge 回收失敗不得中斷 tick
+                        pass
+
+                # lease-backed 自癒：對每個無 owner / 無 agent / 無 flash 的 bridge，
+                # 若 primary console 仍有外部 peer 但 session layer 已無 lease → 重授。
+                # snapshot 在 self._lock 外（避免鎖內 I/O）；活 primary 判定複用 reaper 已算出的
+                # 共享 held（不重掃 /proc）；session 狀態突變在 with self._lock 內；
+                # try_grant_interactive_if_idle 原子。
+                for bridge in bridges:
+                    try:
+                        snap = bridge.snapshot()
+                        # 跳過條件：已有 owner、suspended owner、agent 進行中、flash 模式
+                        if snap["interactive_owner"] is not None:
+                            continue
+                        if snap["suspended_owner"] is not None:
+                            continue
+                        if snap["agent_active"] or snap["flash_mode"]:
+                            continue
+                        primary_cid = snap["primary_client_id"]
+                        if not primary_cid:
+                            continue
+                        # 活 primary 判定（鎖外）：複用 reaper 已算出的共享 held（snapshot 的 vtty
+                        # 即 primary client 的 slave_path），避免每 bridge 在 _state_lock 內重掃 /proc。
+                        # held 為 None（procfs 不可用）或 vtty 未知時，才退回 console_has_external_peer
+                        # 做保守判定（沿用 _client_has_external_peer_locked 既有語意）。
+                        if held is not None and snap["vtty"] is not None:
+                            if snap["vtty"] not in held:
+                                continue  # primary 的 slave 未被外部持有 → 非活 console
+                        elif not bridge.console_has_external_peer(primary_cid):
+                            continue  # procfs 不可用 / vtty 未知時的保守 fallback
+                        with self._lock:
+                            session = self._session_for_bridge_locked(bridge)
+                            if session is None or session.state not in {"READY", "ATTACHED"}:
+                                continue
+                            if session.interactive_session_id is not None:
+                                continue
+                            # 原子 grant：僅當 bridge 仍完全 idle 才授予（消除 TOCTOU）
+                            if bridge.try_grant_interactive_if_idle(f"human:{primary_cid}"):
+                                # owner 已由 try_grant 原子設定；僅補 session-layer lease 記錄
+                                self._record_self_heal_lease_locked(session, f"human:{primary_cid}")
+                    except Exception:  # noqa: BLE001 — 單一 bridge 自癒失敗不得中斷 tick
+                        pass
+
+    def _session_for_bridge_locked(self, bridge: UARTBridge) -> SessionRuntime | None:
+        """在 self._lock 內以 bridge 物件找對應的 SessionRuntime。"""
+        for s in self._sessions.values():
+            if s.bridge is bridge:
+                return s
+        return None
+
+    def _record_self_heal_lease_locked(self, session: SessionRuntime, owner: str) -> None:
+        """自癒 grant 後補 session-layer lease 記錄。
+
+        比照 _open_interactive_locked，但不呼叫 bridge.set_interactive_owner()——
+        owner 已由 try_grant_interactive_if_idle 原子設定，重設會破壞原子性。
+        """
+        interactive_id = uuid.uuid4().hex
+        lease = InteractiveLease(
+            interactive_id=interactive_id,
+            session_id=session.session_id,
+            owner=owner,
+            created_at=now_iso(),
+            timeout_s=max(session.profile.hard_timeout_s, _ATTACHED_CONSOLE_LEASE_TIMEOUT_S),
+        )
+        self._interactive[interactive_id] = lease
+        session.interactive_session_id = interactive_id
 
     def set_alias_for_session(self, session_id: str, alias: str) -> dict[str, Any]:
         with self._lock:
@@ -1959,10 +2045,18 @@ class SessionManager:
         if lease.owner.startswith("human:"):
             client_id = lease.owner.split(":", 1)[1]
             if not session.bridge.console_has_external_peer(client_id):
+                # peer 不在：進入 peer-loss grace 窗，不立即拆 lease（防瞬時 flap 誤拆）。
+                if lease.peer_lost_at is None:
+                    lease.peer_lost_at = time.monotonic()
+                    return lease, post  # grace 窗開始：暫不拆
+                if time.monotonic() - lease.peer_lost_at <= _HUMAN_PEER_GRACE_S:
+                    return lease, post  # 仍在 grace 窗內：繼續持有
+                # 超過 grace 窗：真正拆 lease
                 session.bridge.detach_console(client_id)
                 session.vtty_path = session.bridge.vtty_path
                 _, post = self._close_interactive_locked(session, interactive_id=lease_id)
                 return None, post
+            lease.peer_lost_at = None  # peer 在：清 grace 計時
             snapshot = session.bridge.snapshot()
             if snapshot.get("interactive_owner") != lease.owner:
                 _, post = self._close_interactive_locked(session, interactive_id=lease_id)

@@ -20,7 +20,7 @@ from pathlib import Path
 from unittest import mock
 
 from sw_core.config import SessionProfile, UartProfile
-from sw_core.constants import HUMAN_ACTIVE_WINDOW_S
+from sw_core.constants import HUMAN_ACTIVE_WINDOW_S, _HUMAN_PEER_GRACE_S
 from sw_core.session_manager import InteractiveLease, SessionManager
 import sw_core.session_manager as sm_mod
 from sw_core.uart_io import UARTBridge
@@ -543,6 +543,13 @@ class TestSoftPreemptAndLiveness(unittest.TestCase):
             mgr,
             last_human_input_at=time.monotonic() - (HUMAN_ACTIVE_WINDOW_S + 10.0),
             peer_alive=False,
+        )
+        # peer-loss grace（症狀1 觸發B）：human lease 的被動拆除（含 self_test 走的
+        # _refresh_interactive_locked 共用路徑）首次 peer-False 只記 peer_lost_at、不立即拆，
+        # 須持續無 peer 超過 _HUMAN_PEER_GRACE_S 才釋放。此處模擬「peer 已消失逾 grace」的
+        # 真正死孤兒，確認仍會被 self_test 拆除（保留本測試原意，對齊 grace 語意）。
+        mgr._interactive[session.interactive_session_id].peer_lost_at = (
+            time.monotonic() - (_HUMAN_PEER_GRACE_S + 1.0)
         )
         result = mgr.self_test("COM0")
         self.assertIsNone(result["interactive_owner"])

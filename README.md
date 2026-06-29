@@ -637,6 +637,9 @@ minicom -D /dev/ttyUSB0
 - 若 agent 在 human interactive 期間提交命令，daemon 會暫時掛起（suspend）human raw mode → 執行 agent 命令 → 完成後自動恢復（resume）。Human 在 agent 執行期間的按鍵會累積在 deferred buffer，agent 完成後 flush 到 UART。
 - 第二個以後的 minicom console 因為 interactive lease 已存在，仍走 line-buffer 模式（broker 提供本地回顯與 backspace 行編輯）。
 - bridge rebuild / reattach 時，broker 會盡量保留既有 console PTY 與 human ownership，避免既有 minicom 掛到 stale `/dev/pts/*`。
+- **孤兒 console 週期回收（#76）**：daemon 在每次 readiness tick（節流）主動回收「PTY slave 已無外部 reader」的孤兒 console（含死掉的非哨兵 primary；不碰當前 owner 與 agent 命令期間的 suspended owner、不碰內部哨兵 primary），避免 minicom 不乾淨關閉（SIGKILL/crash）後 console 累積拖慢 RX fan-out（卡頓/掉字）。
+- **raw ownership 自癒**：若 human console 的 raw ownership 因故掉失但 console 仍連著，daemon 會在 tick 中自動重授（lease-backed、原子授予），不需重開 minicom 即恢復方向鍵/Tab；agent 命令進行中（含 flash）不自癒、不奪權。
+- **peer-loss grace**：human lease 不因 `console_has_external_peer` 瞬時 flap 立即被拆——須持續無 peer 超過 grace 窗（預設 3s）才釋放，避免短暫探測競態誤把 raw ownership 拆掉而掉回 line-buffer。
 - Broker minicom 的自動 transcript 可用 `MINICOM_CAPTURE_MODE=script|minicom|off` 控制：
   - `script`：使用 `script -qef` 包住 minicom（完整終端 transcript，會含 minicom 自身 UI/顏色），不傳 `-C` 給 minicom。
   - `minicom`（預設）：使用 minicom 內建 `-C`，產生不含 minicom UI 的乾淨序列 log。
