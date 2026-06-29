@@ -1,5 +1,7 @@
 # daemon/device 身分穩定性 hardening Implementation Plan
 
+> **⚠️ 範圍更新（2026-06-29，PR #104）**：本計畫於 writing-plans 階段寫成、含 `session renumber`（Tasks 3 系列：Task 5/6/7 的 `renumber_dynamic`/RPC/CLI）。實作後經兩位 reviewer（superpowers + codex 對抗）審查，判定強制重編 active session 會牽動 attach 時以值捕捉 `session_id` 的 bridge callback、flash state、lease reverse-link，須改以「拆 bridge → 改號 → 重 attach」另案重做，故 **`session renumber` 已自本 PR 移除、defer 至 follow-up #103**。下方 renumber 相關 task 為歷史紀錄，**本 PR 未實作**；實際交付以 openspec `tasks.md` 與 `design.md` D5 為準。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 讓 COM↔裝置 by-id 對應在 restart/亂序 attach 下確定性穩定、提供 `session renumber` on-demand 重排，並讓 daemon 被動偵測同機多開（two-reader）暴露到 doctor / daemon status。

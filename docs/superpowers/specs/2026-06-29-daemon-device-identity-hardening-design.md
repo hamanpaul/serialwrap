@@ -2,6 +2,8 @@
 
 > 制定日期：2026-06-29 ｜ 對應 issue：#100、#101 ｜ 語言：繁體中文（repo 政策）
 
+> **⚠️ 範圍更新（PR #104）**：本設計含 `session renumber`（§2.4），但實作後經 reviewer 審查判定強制重編 active session 是深水區（bridge callback 以值捕捉 `session_id`、flash/lease 狀態），已 **defer 至 follow-up #103**，本 PR 不含。§2.4 為歷史紀錄。
+
 ## 1. 背景與範圍
 
 本設計合併兩個同源 issue（皆出自 2026-06-29 同一次實機 restart / two-reader 事件）：
