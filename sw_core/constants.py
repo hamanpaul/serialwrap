@@ -70,6 +70,8 @@ BOOTLOADER_RX_TAIL_BYTES: int = 512
 """self_test 讀取 RX tail 的位元組數，用於 bootloader prompt 比對。"""
 HUMAN_ACTIVE_WINDOW_S: float = 60.0
 """human interactive lease 視為仍在使用的最後鍵入時間窗（秒）。"""
+_HUMAN_PEER_GRACE_S: float = 3.0
+"""reconcile tick 的孤兒 console 回收節流間隔（秒）；亦作 Task 5 peer-loss grace 基準值（#76）。"""
 REPROBE_RX_IDLE_S: float = 3.0
 """readiness 自動重探前，RX 需先維持閒置的秒數。"""
 REPROBE_BACKOFF_S: float = 2.0

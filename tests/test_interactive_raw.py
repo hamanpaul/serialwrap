@@ -23,7 +23,7 @@ from unittest import mock
 
 from sw_core.config import SessionProfile, UartProfile
 from sw_core.session_manager import InteractiveLease, SessionManager
-from sw_core.uart_io import UARTBridge
+from sw_core.uart_io import ConsoleClient, UARTBridge
 from sw_core.wal import WalWriter
 
 
@@ -340,3 +340,75 @@ class TestAgentSuspendsHumanInteractive(unittest.TestCase):
 
         self.assertEqual(suspend_calls, ["suspend"])
         self.assertEqual(resume_calls, ["resume"])
+
+
+class TestReconcileReapsOrphanConsole(unittest.TestCase):
+    """reconcile_readiness 應週期回收無外部 reader 的孤兒 console（#76）。
+
+    以不啟動 bridge（無真實 UART）的方式，直接注入孤兒 ConsoleClient，
+    確認 reconcile_readiness 在 wired 後能主動回收。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        import sw_core.session_manager as sm_mod
+        self._old_state_path = sm_mod.STATE_PATH
+        sm_mod.STATE_PATH = str(Path(self._tmp.name) / "state.json")
+
+    def tearDown(self) -> None:
+        import sw_core.session_manager as sm_mod
+        sm_mod.STATE_PATH = self._old_state_path
+
+    def test_reconcile_reaps_orphan_console(self) -> None:
+        """孤兒 console（attached_at 已逾 grace、無外部 holder）應在 reconcile 週期被回收。"""
+        profile = _make_profile("COM0")
+        mgr = SessionManager(
+            [profile],
+            WalWriter(wal_dir=self._tmp.name),
+            on_ready=lambda _: None,
+            on_detached=lambda _: None,
+        )
+
+        # 建立不啟動的 UARTBridge（不需要真實 UART）
+        bridge = UARTBridge(
+            com="COM0",
+            device_path="/dev/null",
+            profile=profile.uart,
+            wal=WalWriter(wal_dir=self._tmp.name),
+        )
+
+        # 注入孤兒 console client：attached_at 設為 100s 前，已遠超過 grace period
+        orphan = ConsoleClient(
+            client_id="orphan-cid",
+            label="dead-minicom",
+            master_fd=-1,
+            slave_fd=-1,
+            slave_path="/dev/pts/999",
+            attached_at=time.time() - 100.0,
+        )
+        bridge._clients["orphan-cid"] = orphan
+
+        # 將 bridge 掛到 session（模擬 ATTACHED/READY 狀態下 bridge 存在）
+        session = mgr.get_session("COM0")
+        assert session is not None
+        with mgr._lock:
+            session.bridge = bridge
+
+        # monkeypatch：模擬無外部 process 持有任何 pts（確定性，不依賴真實 /proc 狀態）
+        bridge._enumerate_all_held_paths = lambda: set()  # type: ignore[assignment]
+
+        # 重置節流時間戳（若已存在），確保本次 reconcile 必然觸發回收
+        try:
+            mgr._last_console_reap_at = 0.0
+        except AttributeError:
+            pass  # RED 階段：屬性尚不存在，跳過；GREEN 後 __init__ 會建立
+
+        mgr.reconcile_readiness()
+
+        # 孤兒應已被回收（從 bridge._clients 移除）
+        self.assertNotIn(
+            "orphan-cid",
+            bridge._clients,
+            "reconcile_readiness 應回收無外部 holder 且逾 grace 的孤兒 console",
+        )

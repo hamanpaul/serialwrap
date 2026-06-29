@@ -29,6 +29,7 @@ from .constants import (
     REPROBE_MAX_INTERVAL_S,
     REPROBE_RX_IDLE_S,
     STATE_PATH,
+    _HUMAN_PEER_GRACE_S,
 )
 from .device_watcher import DeviceInfo
 from .login_fsm import detect_template, ensure_ready, probe_ready
@@ -362,6 +363,8 @@ class SessionManager:
         # 動態 profile 持久化（#95）：device_key → profile_name
         self._profile_pins: dict[str, str] = {}
         self._profile_detected: dict[str, str] = {}
+        # 孤兒 console 回收節流（#76）：記錄上次共享 /proc 掃描的時間，避免每 tick 都掃一次 procfs。
+        self._last_console_reap_at: float = 0.0
 
         self._load_state()
         for p in profiles:
@@ -814,6 +817,23 @@ class SessionManager:
                     self._reprobe_inflight.discard(session_id)
                 continue
             self._spawn_reprobe_probe(session_id, bridge)
+
+        # 週期回收孤兒 console（#76）：節流 + 單次共享 /proc 掃描，鎖外執行。
+        if now - self._last_console_reap_at >= _HUMAN_PEER_GRACE_S:
+            self._last_console_reap_at = now
+            with self._lock:
+                bridges = [s.bridge for s in self._sessions.values() if s.bridge is not None]
+            if bridges:
+                # 取第一個 bridge 做全域 /proc 掃描（結果對所有 bridge 共用）。
+                # 若 bridge 不具備此方法（測試假物件等），fallback held=None，
+                # 各 bridge 的 reap 會自行保守處理（不誤剪）。
+                _enumerator = getattr(bridges[0], "_enumerate_all_held_paths", None)
+                held = _enumerator() if _enumerator is not None else None
+                for bridge in bridges:
+                    try:
+                        bridge.reap_stale_consoles(held_slave_paths=held)
+                    except Exception:  # noqa: BLE001 — 單一 bridge 回收失敗不得中斷 tick
+                        pass
 
     def set_alias_for_session(self, session_id: str, alias: str) -> dict[str, Any]:
         with self._lock:
