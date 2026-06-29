@@ -380,6 +380,29 @@ flowchart TD
 - 若看到 shell prompt，送 `ready_probe` 後回 `READY`
 - 若沒看到 prompt，保留 bridge 並停在 `ATTACHED`
 
+### 8.4 COM 編號確定性 rank（#100）
+
+dynamic 自動偵測 session 的 COM 編號**依裝置 by-id 字典序確定性分配**（排序鍵 `device_sort_key(by_id, by_path)`：以 by-id 為主）：
+
+- daemon startup 在 spawn 並發 attach threads 之前（`SerialwrapService.start()` 於 `update_devices` / `bootstrap_attach` 之前呼叫 `prepare_dynamic_rank`），對「當下在線的 dynamic 裝置」一次排序配好 COM rank，因此 restart 後 COM↔板對應穩定不變。
+- rank 作用域**只限 dynamic**：explicit YAML `targets`、`session.bind` / `_binding_overrides`、RELEASED 裝置排除在 pool 外，COM 由其權威來源決定。
+- startup 預配（`_pending_com`）的 lifecycle：對應裝置離線時，`update_devices` 會 prune 其 pending，COM 號隨即可被回收（`_next_dynamic_com` 純掃描最低空號）。
+- runtime hotplug：不同 by-id 繼承空出的 DETACHED 槽；同 by-id 重接拿回原槽；active session 的 COM 名在 daemon 存活期間不變。
+
+**by-path tiebreak（TODO）**：`device_sort_key` 已接受 by-path 參數作為同 by-id（如同款 CH340）的次序 tiebreak，但 end-to-end 完整支援為 **TODO**——需 `DeviceInfo.by_path` 欄位接上資料來源，在此之前 `_by_path_for` 一律回 None、rank 僅依 by-id。
+
+**on-demand `session renumber` 已 defer 至 follow-up**：把執行期漂移的 COM snap 回 sorted by-id 序的 RPC/CLI，因強制重編 active session 牽動 bridge callback / flash state / lease reverse-link，須改以「拆 bridge → 改號 → 重 attach」另案重做，本版不含。
+
+### 8.5 同機多開（two-reader）偵測（#101）
+
+純被動、on-demand 偵測同機是否有一個以上 `serialwrapd`（不終止任何 daemon、不退讓、無背景週期掃描）。module-level `detect_multi_open(proc_root, tty_paths)` 掃 `/proc/*/cmdline` 找 `serialwrapd`、best-effort 讀 `/proc/<pid>/fd` 找 tty 持有者。兩個 surface：
+
+- **`serialwrap doctor`** → `single_daemon` 檢查項（daemon-less，回 `{check, ok, detail, fix}`）：多開時 `ok=false`。
+- **`serialwrap daemon status`**（RPC `health.status`）→ 回應加欄位：
+  - `multi_open`（bool）。
+  - `foreign_holders`（`{tty_real_path: pid}`）：持有目前 attach 中 tty 的 pid。
+  - `multi_open_detail`：`{"daemons": [{"pid": N}, ...], "holders_status": "ok" | "permission" | "unknown"}`。`holders_status` 在跨 uid 讀不到 `/proc/<pid>/fd` 時降級為 `permission`、procfs 不可用時為 `unknown`，此降級資訊本身即為輸出契約的一部分。
+
 ## 9. self_test 與 recover
 
 ### 9.1 `session.self_test`

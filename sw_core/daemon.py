@@ -29,6 +29,9 @@ BLOCKING_RPC_METHODS = {
     # result.tail 同樣 get_background_result 讀取/切片大 capture 並序列化）；漏了它，最常用的查詢路徑
     # 仍跑在 asyncio loop 上，大 capture 慢查詢照樣凍結其他 RPC（含 health.ping）（#80 Codex 必修）。
     "command.result_tail", "result.tail", "log.tail_raw", "log.tail_text", "wal.range",
+    # daemon status：health() 內做同步 /proc 掃描（detect_multi_open），多裝置/大量 pid
+    # 下會在 asyncio event loop 上同步耗時，凍結全 daemon RPC（含 health.ping 探針）（#101 I2/6b）。
+    "health.status",
 }
 
 

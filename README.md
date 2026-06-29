@@ -292,6 +292,15 @@ serialwrap cmd status --cmd-id <cmd_id>
 - 錯誤碼：`UNKNOWN_PROFILE`（profile 名不存在）、`PROFILE_IS_EXPLICIT`（對 YAML explicit-target 裝置 pin/unpin）、`DEVICE_NOT_FOUND`（selector 解析不到裝置）、`INVALID_ARGS`（缺 selector/profile）。
 - **生效時機**：pin/unpin 寫入後不主動重新 attach；對已存在的 session，**下次 daemon 重啟生效**（重啟時 session 重建走動態偵測路徑才重讀 pin/sticky）。執行期 `clear`/`attach` 沿用既有 session 的 profile、不重選。
 
+### COM 編號確定性綁定 by-id（#100）
+
+dynamic 自動偵測 session 的 COM 編號**依裝置 by-id 字典序確定性分配**：daemon startup 在 spawn 並發 attach threads 之前，先對「當下在線的 dynamic 裝置」一次排序配好 COM rank，因此 **restart 後 COM↔實體板的對應穩定不變**，不再隨並發 attach 完成順序對調。
+
+- **rank 作用域只限 dynamic 自動偵測 session**。explicit YAML `targets` 指定的 COM、`session bind` / `_binding_overrides` 綁定、RELEASED 的裝置都是權威來源，排除在 rank pool 外、COM 不被覆寫。
+- **runtime hotplug**：不同 by-id 的板插入時繼承空出的 DETACHED 槽（維持原 COM 名）；同 by-id 重接總是拿回自己原槽；active session 的 COM 名在 daemon 存活期間不變。
+- **同款晶片（如 CH340）by-id 衝突的 by-path tiebreak**：排序鍵已預留 by-path 次序骨架，但 end-to-end 完整支援為 **TODO**（待 `DeviceInfo.by_path` 接上資料來源）；在此之前 rank 僅依 by-id。
+- **on-demand `session renumber`（執行期把漂移的 COM snap 回排序）已 defer 至 follow-up（#103）**：強制重編 active session 牽動 bridge callback / flash state / lease reverse-link，須改以「拆 bridge → 改號 → 重 attach」另案重做。現階段如需重排，以 daemon restart 為暫時手段。
+
 ## Session Template 架構圖
 
 ```mermaid
@@ -698,6 +707,21 @@ serialwrap session list
 3. `reprobe_exhausted=true` 或等待過久仍未 READY：手動執行 `serialwrap session recover --selector COM0`（必要時加 `--force`）。
 
 `minicom_router.sh` 在偵測到這類狀態時會提示「DUT 可能仍在開機、serialwrap 正在自動重探」；若希望它阻塞等待 READY 後再開 minicom，可設 `MINICOM_WAIT_READY=1`。
+
+### 同機多開（two-reader）偵測（#101）
+
+同機同時跑多個 `serialwrapd`（不同 socket / 監管模式，例如 systemd-user 與 systemd-system 並存）會造成 two-reader——兩個 daemon 同時讀同一條 UART、靜默掉字。`SingletonLock` 是 per-`(lock_path, socket_path)` 的 flock，擋不到不同 socket 的第二個 daemon。serialwrap 以**純被動、on-demand 偵測 + 回報**（不終止任何 daemon、不退讓、無背景週期掃描）暴露此情況，兩個 surface：
+
+```bash
+serialwrap doctor          # single_daemon 檢查項
+serialwrap daemon status   # multi_open / foreign_holders 欄位
+```
+
+- **`serialwrap doctor`**：新增 `single_daemon` 檢查項，掃 `/proc` 找 `serialwrapd` 程序；多開時 `ok=false`、`detail` 列出在跑的 daemon 數、`fix` 指引「停掉多餘 daemon（`serialwrap service stop`；並檢查 systemd-user 與 system 是否同時在跑）」。doctor 為獨立程序、不碰 socket。
+- **`serialwrap daemon status`**：回應加三個欄位：
+  - `multi_open`（bool）：是否偵測到一個以上 `serialwrapd`。
+  - `foreign_holders`（`{tty_real_path: pid}`）：哪個 pid 持有目前 attach 中的 tty。
+  - `multi_open_detail`：`{"daemons": [{"pid": N}, ...], "holders_status": "ok" | "permission" | "unknown"}`。`holders_status` 在跨 uid 讀不到 `/proc/<pid>/fd` 時降級為 `permission`（仍確認另有 daemon 存在，但無法判定持有哪條 tty）；procfs 不可用時為 `unknown`。
 
 ### Recover
 

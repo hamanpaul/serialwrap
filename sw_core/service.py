@@ -12,6 +12,7 @@ from .config import ProfileTemplate, SessionProfile
 from .constants import DEVICE_BY_ID_DIR, DEVICE_BY_PATH_DIR, EVENTS_DIR, EVENTS_RUNTIME_DIR, EVENTS_LOG_PATH, TTYMCU_PATH
 from .flash_endpoint import FlashEndpoint, detect_mcu_line, pump_endpoint_to_sink
 from .mcu_patterns import McuPatternRegistry
+from .multi_open import detect_multi_open
 from .device_watcher import DeviceWatcher
 from .event_engine import EventEngine, EngineDeps
 from .event_engine.line_buffer import LineBuffer
@@ -459,6 +460,10 @@ class SerialwrapService:
         self._sessions.add_rx_observer(self._engine_rx_observer)
         self._watcher.start()
         self._watcher.poll_once()
+        # #100：在 spawn attach threads 之前，先對「當下在線的 dynamic 裝置」依 by-id
+        # 排序一次配好 COM rank（兩條 startup 入口 update_devices / bootstrap_attach 都會
+        # 觸發並發 attach；先預配才能消除「誰先搶到 lock 誰拿 COM0」的 race）。
+        self._sessions.prepare_dynamic_rank(list(self._watcher.devices.keys()))
         self._sessions.update_devices(self._watcher.devices)
         self._sessions.bootstrap_attach()
         self._flash_endpoint.start()
@@ -500,7 +505,19 @@ class SerialwrapService:
             }
             if warnings:
                 result["warnings"] = warnings
-            return result
+        # #101：同機多開（two-reader）被動偵測，暴露到 daemon status。掃 /proc 的 I/O 留在
+        # self._lock 之外（lock 內只取 sessions 快照），避免 daemon RPC 路由層持鎖期間做 /proc 掃描。
+        # 註：health.status 在單執行緒 asyncio dispatcher 內同步呼叫——若日後在多裝置/大量 pid 下
+        # 量到掃描耗時過長（凍結 event loop），可改為背景 thread 週期更新快取後於此讀快取（offload）。
+        tty_paths = [s.get("attached_real_path") for s in sessions if s.get("attached_real_path")]
+        mo = detect_multi_open(tty_paths=[t for t in tty_paths if t])
+        result["multi_open"] = mo["multi_open"]
+        result["foreign_holders"] = mo["holders"]
+        result["multi_open_detail"] = {
+            "daemons": mo["daemons"],
+            "holders_status": mo["holders_status"],
+        }
+        return result
 
     def _resolve_session_id(self, selector: str) -> tuple[str | None, dict[str, Any] | None]:
         state = self._sessions.get_session_state(selector)
