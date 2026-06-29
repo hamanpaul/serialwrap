@@ -440,15 +440,17 @@ profiles:
 建議把 env 檔直接放在 profile 旁邊，例如：
 
 ```bash
-cat > "$HOME/.paul_tools/profiles/OPI.env" <<'EOF'
+# profile 目錄：pipx/XDG 安裝為 ~/.config/serialwrap/profiles；systemd-system 安裝為 /etc/serialwrap/profiles
+cat > "$HOME/.config/serialwrap/profiles/OPI.env" <<'EOF'
 SW_OPI_U='haman'
 SW_OPI_P='your-password'
 EOF
 
-serialwrap daemon start --profile-dir "$HOME/.paul_tools/profiles"
+# systemd 模式用 service 重啟讓 daemon 重讀（勿用 `serialwrap daemon start`，它不 route 到 systemd）
+serialwrap service restart
 ```
 
-`sw_core/assets/profiles/default.yaml` 的 `op3-template` 已內建 `env_file: "OPI.env"`，相對路徑會以該 YAML 所在目錄解析。daemon 啟動時，runtime env 會先保留目前 shell 的環境，再依序嘗試載入 `~/OPI.env` 與 `profile_dir/OPI.env`；因此像 `SERIALWRAP_WAL_DIR="$HOME/b-log"` 這類 runtime 設定，放在 `~/.paul_tools/profiles/OPI.env` 也會生效。若 profile 沒有宣告 `env_file`，`login_fsm` 仍會從 daemon 的 `os.environ` 讀取帳密（向後相容）。若要完全指定來源，也可以用 `SERIALWRAP_DAEMON_ENV_FILE` 指向包含 runtime 設定的 env 檔。
+`sw_core/assets/profiles/default.yaml` 的 `op3-template` 已內建 `env_file: "OPI.env"`，相對路徑會以該 YAML 所在目錄解析。daemon 啟動時，runtime env 會先保留目前 shell 的環境，再依序嘗試載入 `~/OPI.env` 與 `profile_dir/OPI.env`；因此像 `SERIALWRAP_WAL_DIR="$HOME/b-log"` 這類 runtime 設定，放在 `~/.config/serialwrap/profiles/OPI.env` 也會生效。若 profile 沒有宣告 `env_file`，`login_fsm` 仍會從 daemon 的 `os.environ` 讀取帳密（向後相容）。若要完全指定來源，也可以用 `SERIALWRAP_DAEMON_ENV_FILE` 指向包含 runtime 設定的 env 檔。
 
 若 shell device 已經自動登入，`serialwrap` 會直接用 prompt + `ready_probe` 驗證；若先看到 `login:` / `password:`，則會依 `user_env` / `pass_env` 自動登入。像 Orange Pi 常見的 `orangepi3 login:`，建議 `login_regex` 用 `(?mi)^.*login:\\s*$`。
 
@@ -743,9 +745,9 @@ recover 行為分成三種：
 
 | 檔案 | 說明 |
 |------|------|
-| 預設 `/tmp/serialwrap/wal/raw.wal.ndjson` | 權威事件記錄，保留 `seq/cmd_id/source/crc32/...` |
-| 預設 `/tmp/serialwrap/wal/raw.mirror.log` | 可讀文字鏡像，接近 console payload |
-| 預設 `/tmp/serialwrap/state.json` | alias 與 binding 持久化 |
+| 預設 `~/.local/state/serialwrap/wal/raw.wal.ndjson`（XDG state home，可由 `SERIALWRAP_WAL_DIR` 覆寫；舊版為 `/tmp/serialwrap/wal/`） | 權威事件記錄，保留 `seq/cmd_id/source/crc32/...` |
+| 預設 `~/.local/state/serialwrap/wal/raw.mirror.log` | 可讀文字鏡像，接近 console payload |
+| 預設 `~/.local/state/serialwrap/state.json`（可由 `SERIALWRAP_STATE_DIR` 覆寫；舊版為 `/tmp/serialwrap/state.json`） | alias 與 binding 持久化 |
 | Agent log `~/b-log/{COM}_{YYMMDD}-{HHMMSS}.log` | Agent 觸發式 per-session 日誌，純文字 RX 內容 |
 
 ### Agent 日誌 (log start/stop)
@@ -944,7 +946,7 @@ CLI（`bind` 只改 device、`recover`/`clear` 沿用舊 profile）。在 produc
 **建置與步驟**
 
 1. **tmux 開 minicom 模擬 human**：`tmux new-session -d -s cowork`，於 pane 內執行
-   `~/.paul_tools/minicom COMx`（broker minicom：自動 `console-attach` 並在 broker vtty 上開
+   `serialwrap-minicom COMx`（broker minicom：自動 `console-attach` 並在 broker vtty 上開
    minicom）。`session console-list` 應出現第二個 console、`self-test` 回 `human_attached=true`。
 2. **多 agent 並行存取**：開 2 個 subagent（或 2 條並行 CLI loop），各以不同 `--source` 連續
    `cmd submit --mode line`（送帶唯一 marker 的 `echo`），驗證每筆 `cmd status` 的 stdout 只含
@@ -955,7 +957,7 @@ CLI（`bind` 只改 device、`recover`/`clear` 沿用舊 profile）。在 produc
    不與 agent 輸出位元組交錯（deferral 生效）。
 4. **kill minicom 再重接（退出再進入）**：以 PID `kill -9` 突然殺掉 minicom（不走 clean
    `console-detach`）→ `self-test` 應由 liveness 偵測 peer 消失、自動 detach 該 console、
-   `human_attached=false`、`console_count` 回 1；重新 `~/.paul_tools/minicom COMx` 即重新 attach、
+   `human_attached=false`、`console_count` 回 1；重新 `serialwrap-minicom COMx` 即重新 attach、
    `human_attached=true`、可再次輸入。
 5. **（選用）長時間壓力測試**：延長步驟 2~3 的並行回合數與時間，觀察 TX/RX 框定與 fairness。
 

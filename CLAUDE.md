@@ -118,6 +118,7 @@ serialwrap session self-test --selector COM0
 ```
 
 - 監管模式（`supervision_mode`）為單一事實來源（`~/.config/serialwrap/config.yaml`）。**systemd 模式下用 `serialwrap service ...` 管理生命週期；勿用 `serialwrap daemon start`**（它不會 route 到 systemd，會另起非託管 daemon 造成 two-reader）。`serialwrap daemon stop` 在 systemd 模式會自動 route 到 `service stop`。
+- daemon 多開（two-reader）可被動偵測（#101）：`serialwrap doctor` 的 `single_daemon` 檢查與 `serialwrap daemon status` 的 `multi_open`/`foreign_holders` 欄位會掃 `/proc` 報出同機其他 `serialwrapd` 與 tty 持有者（純偵測、不自動 refuse/kill）。`SingletonLock` 僅 per-`(lock_path, socket_path)` flock，擋不到不同 socket／監管模式的第二個 daemon，故需此偵測。
 - 既有測試框架同時涵蓋 `pytest` 與 `unittest`；CI（`.github/workflows/tests.yml`）與政策以 `pytest` 為準。
 
 ## 高層架構
@@ -138,7 +139,9 @@ serialwrap 是讓多個 agent 與多個 human console 共用**同一條 UART** �
 - `sw_core/service.py`：整體組裝點，持有 `CommandArbiter`、`SessionManager`、`DeviceWatcher`、`WalWriter`，也是唯一的 RPC 路由層。
 - `sw_core/arbiter.py`：每個 session 一條 daemon worker thread + priority queue，保證單 UART 單寫入者。
 - `sw_core/session_manager.py`：session 狀態機、裝置 hotplug、binding/alias 持久化、console attach、interactive lease、recover、background capture 全都在這裡。
-- `sw_core/uart_io.py`：serial port 與 PTY bridge、RX fan-out、human line buffering、本地回顯與 backspace 編輯。
+- `sw_core/uart_io.py`：UART bridge、RX fan-out、human line buffering、本地回顯與 backspace 編輯。序列埠 I/O 透過 `sw_core/serial_port.py` 的 `SerialPort` 抽象（非直接 termios）；human console 在 POSIX 走 PTY、在無 PTY 平台（Windows）改走 `127.0.0.1` TCP listener（#84 PORT-2，TeraTerm/PuTTY 連入即一個 socket-backed `ConsoleClient`）。
+- `sw_core/serial_port.py`：`SerialPort` 抽象（#84 PORT-1）——`_PosixSerialPort`（termios，Linux/WSL 生產路徑）與 `_PySerialPort`（pyserial，Windows）雙後端，`open_serial_port()` 依平台或 `SERIALWRAP_SERIAL_BACKEND`（`auto`/`posix`/`pyserial`）選擇；termios import 收在 POSIX 守衛內，使 `import sw_core.uart_io` 在 Windows 不致硬失敗。
+- `sw_core/multi_open.py`：同機多開（two-reader）被動偵測（#101）——on-demand 掃 `/proc` 找其他 `serialwrapd` 與 tty 持有者，暴露到 `doctor`／`daemon status`，純偵測+回報、不自動動手。
 - `sw_core/auth.py`：per-session 帳密解析。`SessionAuth` frozen dataclass 持有已解析的帳密；`resolve_session_auth()` 從 `env_file` → `os.environ` 解析。
 - `sw_core/login_fsm.py`：prompt probe、登入流程與 `ready_probe` nonce 驗證。接受 `SessionAuth` 參數，不直接碰 `os.environ`。
 - `sw_core/wal.py`：`raw.wal.ndjson` 與 `raw.mirror.log` 的雙軌 append-only 記錄。
@@ -188,10 +191,13 @@ serialwrap 是讓多個 agent 與多個 human console 共用**同一條 UART** �
 
 當 agent 提交命令時，daemon 會暫時 **suspend** human raw mode：`bridge.suspend_interactive()`（切 deferred）→ 執行 agent 命令（human 按鍵累積在 deferred buffer）→ `bridge.resume_interactive()`（flush 回 UART）。Agent 不需等 human 關閉 minicom 才能執行命令。
 
+POSIX 上 human console 走 PTY（minicom 開 `/dev/pts/N`）；無 PTY 的平台（Windows）改走 `127.0.0.1` TCP listener（#84 PORT-2），由 TeraTerm/PuTTY 連入，每條連線即一個 socket-backed console，對端斷線以 socket EOF 偵測（不掃 `/proc`，#84 PORT-5 半切）。
+
 ### Alias / binding 是持久化狀態
 
 - `SessionManager` 把 alias 與 binding override 存到 `state.json`；`profiles/*.yaml` 是預設來源，但執行期 `session.bind` / `alias.*` 的結果會覆寫到持久化狀態。
 - 裝置綁定用 `/dev/serial/by-id/` 或 `/dev/serial/by-path/`，不要用不穩定的 `/dev/ttyUSB*`。同款晶片（如 CH340）`by-id` 會相同，須改用 `by-path`。
+- **COM 編號依 by-id 排序確定性指派（#100）**：dynamic 自動偵測 session 的 COM 號在 startup 由 `prepare_dynamic_rank()` 於 lock 內、spawn attach threads **之前**依 `device_sort_key`（by-id 為主、by-path tiebreak）排序一次配好（存 `_pending_com`，`_session_from_template` 優先消費），消除「並發 attach 完成順序決定 COM0」的 race（restart 後 COM↔板對調根因）。rank 只作用 dynamic session；explicit YAML `targets`/`session.bind`/RELEASED 的 COM 為權威、排除在 pool 外。runtime 熱插沿用既有 DETACHED-rebind（不同 by-id 板繼承空槽）。on-demand 強制重排（`session renumber`）defer 至 #103。
 
 ### Profile YAML 結構
 

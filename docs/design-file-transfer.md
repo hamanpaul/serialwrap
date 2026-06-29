@@ -1,5 +1,7 @@
 # Design: File Transfer Primitive (file.push / file.pull)
 
+> 📌 **歷史快照**：#21 `file.push`/`file.pull` 已交付（功能仍在用）。本檔的 `### MCP` 段**已隨 #59 MCP 退役而不適用**——MCP adapter 已自 repo 移除，file transfer 僅經 RPC/CLI（`serialwrap file ...`）提供。現行對外契約以 `README.md` 與 `docs/serialwrap-spec.md` 為準，本檔僅留作歷史。
+
 **Issue**: #21  
 **Status**: 已實作（Phase 2，`feat/open-issues-phase2`）  
 
