@@ -41,6 +41,19 @@ from .wal import WalWriter
 _ATTACHED_CONSOLE_LEASE_TIMEOUT_S = 86400.0
 
 
+def device_sort_key(by_id: str, by_path: str | None) -> tuple[str, str]:
+    """COM rank 排序鍵（#100）：以 by-id 路徑字串為主、by-path 為輔。
+
+    同款晶片（如 CH340）by-id 會相同——此時改用 by-path 區分，沿用 ``DeviceWatcher``
+    「by-id 優先、同 real_path 去重」的既有語意。回傳 tuple 確保穩定且可比較；
+    FTDI 等 by-id 皆唯一的情境下 by-path 可傳 None 不影響排序。
+
+    註：目前 ``DeviceInfo`` 尚無 by-path 欄位，FTDI 情境呼叫端會以 None 傳入；
+    by-path fallback 的完整資料來源待 ``DeviceWatcher`` 後續補欄位（TODO #100）。
+    """
+    return (by_id or "", by_path or "")
+
+
 class StateLoadError(RuntimeError):
     """既有 state.json 讀取失敗（非 JSON 損毀，如 PermissionError／暫時性 I/O）時拋出。
 
@@ -344,6 +357,10 @@ class SessionManager:
         self._aliases = AliasRegistry()
         self._devices: dict[str, DeviceInfo] = {}
         self._binding_overrides: dict[str, str] = {}
+        # startup 確定性 COM rank（#100）：by_id → 預配 COM 號。
+        # 由 prepare_dynamic_rank 在 lock 內、spawn attach 前一次配好；
+        # _session_from_template 建立 dynamic session 時優先消費（pop）這裡的預配號。
+        self._pending_com: dict[str, str] = {}
         self._attach_inflight: set[str] = set()
         # readiness 自動重探（#69）：_reprobe_inflight 防止同一 session 重複 spawn auto worker；
         # _reprobe_probe_locks 為 per-session probe 互斥（auto 用 non-blocking、manual attach/recover
@@ -509,13 +526,84 @@ class SessionManager:
                 pass
 
     def _next_dynamic_com(self) -> str:
-        """分配下一個可用的 COM 編號（須在 self._lock 內呼叫）。"""
+        """分配下一個可用的 COM 編號（須在 self._lock 內呼叫）。
+
+        runtime 單片熱插（hotplug）的 fallback 路徑——取目前最低空號。startup 多片
+        並發 attach 改走 prepare_dynamic_rank 預配（消除並發 race），不經此函式。
+        """
         used = {s.profile.com for s in self._sessions.values()}
+        used |= set(self._pending_com.values())
         for i in range(self._max_sessions):
             com = f"COM{i}"
             if com not in used:
                 return com
         return f"COM{len(self._sessions)}"
+
+    def _by_path_for(self, by_id: str) -> str | None:
+        """取得 by_id 對應的 by-path（須在 self._lock 內呼叫）。
+
+        目前 ``DeviceInfo`` 無 by-path 欄位，FTDI 情境一律回 None；保留此 helper
+        以利未來 by-path fallback（同款晶片去衝突）接上資料來源。
+        """
+        dev = self._devices.get(by_id)
+        return getattr(dev, "by_path", None) if dev else None
+
+    def _is_explicit_or_bound(self, by_id: str) -> bool:
+        """by_id 是否為 explicit YAML target 或 binding override 綁定（須在 self._lock 內呼叫）。
+
+        這類裝置為權威來源，COM 不由 dynamic rank 決定，排除在 rank pool 外。
+        """
+        if by_id in self._binding_overrides.values():
+            return True
+        return any(
+            s.profile.device_by_id == by_id and s.profile_source == "yaml-target"
+            for s in self._sessions.values()
+        )
+
+    def prepare_dynamic_rank(self, by_ids: list[str]) -> None:
+        """startup：對整批在線 dynamic by-id 依 device_sort_key 排序，預配 COM 號（#100）。
+
+        在 self._lock 內、spawn attach threads **之前**一次配好號，消除「誰先搶到 lock
+        誰拿 COM0」的並發 race（restart 後 COM↔板對調的根因）。
+
+        rank 作用域：explicit YAML target / binding override / RELEASED 的 by-id 與已有
+        session 的 by-id 都排除在 pool 外（不污染既有持久化狀態）。預配號避開既有 session
+        已佔用的 COM。
+        """
+        with self._lock:
+            used = {s.profile.com for s in self._sessions.values()}
+            used |= set(self._pending_com.values())
+            ordered = sorted(
+                (
+                    b
+                    for b in by_ids
+                    if b
+                    and b not in self._released_by_ids
+                    and not self._is_explicit_or_bound(b)
+                    and not any(
+                        s.profile.device_by_id == b for s in self._sessions.values()
+                    )
+                ),
+                key=lambda b: device_sort_key(b, self._by_path_for(b)),
+            )
+            idx = 0
+            for b in ordered:
+                if b in self._pending_com:
+                    continue
+                while f"COM{idx}" in used:
+                    idx += 1
+                com = f"COM{idx}"
+                self._pending_com[b] = com
+                used.add(com)
+                idx += 1
+
+    def com_for_by_id(self, by_id: str) -> str | None:
+        """查詢 by_id 的 COM：既有 session 優先，否則回 startup 預配（pending）號。"""
+        with self._lock:
+            for s in self._sessions.values():
+                if s.profile.device_by_id == by_id:
+                    return s.profile.com
+            return self._pending_com.get(by_id)
 
     def _session_from_template(
         self,
@@ -525,7 +613,9 @@ class SessionManager:
         """從 template 建立新的動態 session（須在 self._lock 內呼叫）。
         注意：profile_source 由呼叫方（_attach_by_id_dynamic）在回傳後設定，此處預設值不具權威性。
         """
-        com = self._next_dynamic_com()
+        # startup 確定性 rank（#100）：優先用 prepare_dynamic_rank 預配的 COM 號（與
+        # attach 完成順序無關），無預配（runtime 熱插）才 fallback 最低空號。
+        com = self._pending_com.pop(device_by_id, None) or self._next_dynamic_com()
         act_no = len(self._sessions) + 1
         alias = f"{tpl.profile_name}+{act_no}"
         profile = SessionProfile(
