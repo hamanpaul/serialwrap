@@ -380,6 +380,31 @@ flowchart TD
 - 若看到 shell prompt，送 `ready_probe` 後回 `READY`
 - 若沒看到 prompt，保留 bridge 並停在 `ATTACHED`
 
+### 8.4 COM 編號確定性 rank 與 `session.renumber`（#100）
+
+dynamic 自動偵測 session 的 COM 編號**依裝置 by-id 字典序確定性分配**（排序鍵 `device_sort_key(by_id, by_path)`：by-id 優先、同款晶片 by-id 衝突時 fallback by-path）：
+
+- daemon startup 在 spawn 並發 attach threads 之前（`SerialwrapService.start()` 於 `update_devices` / `bootstrap_attach` 之前呼叫 `prepare_dynamic_rank`），對「當下在線的 dynamic 裝置」一次排序配好 COM rank，因此 restart 後 COM↔板對應穩定不變。
+- rank 作用域**只限 dynamic**：explicit YAML `targets`、`session.bind` / `_binding_overrides`、RELEASED 裝置排除在 pool 外，COM 由其權威來源決定。
+- runtime hotplug：不同 by-id 繼承空出的 DETACHED 槽；同 by-id 重接拿回原槽；active session 的 COM 名在 daemon 存活期間不變。
+
+**RPC `session.renumber`**（params `{}`）：
+
+- 把所有 dynamic session 的 COM 依 sorted by-id 重排，**無條件強制執行（含 active、不檢查 busy）**。
+- daemon 端在單一 lock 區間原子 remap `session_id`（`profile:COM`）、alias、binding、`state.json` 與 `CommandArbiter` worker；**被重編 session 的 in-flight 命令會被丟棄**（force 語意）。
+- 回應：`{"ok": true, "renumbered": {"<old_session_id>": "<new_session_id>", ...}}`；已排序時 `renumbered` 為空物件。
+- CLI：`serialwrap session renumber`。
+
+### 8.5 同機多開（two-reader）偵測（#101）
+
+純被動、on-demand 偵測同機是否有一個以上 `serialwrapd`（不終止任何 daemon、不退讓、無背景週期掃描）。module-level `detect_multi_open(proc_root, tty_paths)` 掃 `/proc/*/cmdline` 找 `serialwrapd`、best-effort 讀 `/proc/<pid>/fd` 找 tty 持有者。兩個 surface：
+
+- **`serialwrap doctor`** → `single_daemon` 檢查項（daemon-less，回 `{check, ok, detail, fix}`）：多開時 `ok=false`。
+- **`serialwrap daemon status`**（RPC `health.status`）→ 回應加欄位：
+  - `multi_open`（bool）。
+  - `foreign_holders`（`{tty_real_path: pid}`）：持有目前 attach 中 tty 的 pid。
+  - `multi_open_detail`：`{"daemons": [{"pid": N}, ...], "holders_status": "ok" | "permission" | "unknown"}`。`holders_status` 在跨 uid 讀不到 `/proc/<pid>/fd` 時降級為 `permission`、procfs 不可用時為 `unknown`，此降級資訊本身即為輸出契約的一部分。
+
 ## 9. self_test 與 recover
 
 ### 9.1 `session.self_test`
