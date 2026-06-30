@@ -6,6 +6,7 @@
 
 ### Fixed
 
+- **PyInstaller exe CLI entry 修正（#84 PORT-4 follow-up）**：`serialwrap.exe` 實機建置後 `--help` 因 `sw_core/cli.py` 為 package-relative import、被 PyInstaller 當 `__main__` 直接執行而 `ImportError: attempted relative import with no known parent package`。新增 root `serialwrap.py` 薄 shim（絕對 import `from sw_core.cli import main`，鏡像既有 `serialwrapd.py`），`serialwrap.spec` 兩個 Analysis entry 改指向 root shim（`serialwrapd.py` / `serialwrap.py`）。實機建置驗證：`serialwrap.exe` / `serialwrapd.exe` `--help` 均 exit 0。
 - **Copilot PR #109 review 四項修正（#84 PORT-4 follow-up）**：
   - `platform_backends._select()`：未知後端值（非 auto/posix 別名/win 別名）改 raise `ValueError`，不再靜默退化為 auto。
   - `rpc_win._parse_tcp()`：新增 loopback 驗證，非 loopback host（如 `0.0.0.0`/LAN IP）raise `ValueError` 並附說明，避免 RPC server 對外暴露（RPC 無認證）。
