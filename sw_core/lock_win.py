@@ -52,6 +52,7 @@ class WindowsSingletonLock:
         self._fd = fd
         os.ftruncate(self._fd, 0)
         os.write(self._fd, f"{os.getpid()}\n".encode("ascii"))
+        os.fsync(self._fd)  # 與 POSIX 版對齊，確保 PID 寫入持久化
 
     def release(self) -> None:
         """釋放 msvcrt 檔鎖並關閉 fd；未取鎖時為 no-op。"""
