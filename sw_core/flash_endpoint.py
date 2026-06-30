@@ -123,8 +123,11 @@ class FlashEndpoint:
             import pty  # noqa: PLC0415
             import tty  # noqa: PLC0415
         except ImportError:
-            # Windows（或其他無 PTY 的平台）：flash 端點不適用，跳過啟動。
-            return
+            import sys
+            if sys.platform == "win32":
+                # Windows 無 PTY：flash 端點不適用，跳過啟動（#84 PORT-4）
+                return
+            raise   # POSIX 缺 pty/tty 屬異常，明確拋出不靜默
         self._master_fd, self._slave_fd = pty.openpty()
         # 關鍵：把 slave 設為 raw，否則 PTY line discipline 會做 CR/LF 轉換與輸入處理，
         # 汙染 flasher（開 /dev/ttyMCU）的 SBL 二進位協定。byte-transparency 仰賴這一步。

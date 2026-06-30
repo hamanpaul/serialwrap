@@ -31,7 +31,8 @@ def _load_exclude_coms() -> set[str]:
         config_path = os.path.join(CONFIG_DIR, "config.yaml")
         if not os.path.exists(config_path):
             return set()
-        data: dict = yaml.safe_load(open(config_path, encoding="utf-8").read()) or {}
+        with open(config_path, encoding="utf-8") as _fh:
+            data: dict = yaml.safe_load(_fh) or {}
         coms = data.get("windows", {}).get("exclude_coms", [])
         if isinstance(coms, list):
             return {str(c) for c in coms}
