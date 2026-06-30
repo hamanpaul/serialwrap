@@ -8,8 +8,6 @@
 #   serial  — pyserial（_PySerialPort 後端，Windows UART，#84 PORT-1）
 #   yaml    — PyYAML（config 載入）
 
-import os
-
 # 內嵌 sw_core/assets 目錄到打包內的 sw_core/assets
 datas = [("sw_core/assets", "sw_core/assets")]
 
@@ -31,7 +29,6 @@ exe_d = EXE(
     a_d.datas,
     name="serialwrapd",
     console=True,
-    onefile=True,
 )
 
 # ---------- serialwrap（CLI）----------
@@ -52,5 +49,4 @@ exe_c = EXE(
     a_c.datas,
     name="serialwrap",
     console=True,
-    onefile=True,
 )

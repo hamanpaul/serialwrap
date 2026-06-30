@@ -33,3 +33,6 @@ Get-ChildItem dist\*.exe | Select-Object Name, @{Name="大小(bytes)";Expression
 
 Write-Host "`n煙霧測試 serialwrap.exe --help：" -ForegroundColor Cyan
 & ".\dist\serialwrap.exe" --help
+
+Write-Host "`n煙霧測試 serialwrapd.exe --help：" -ForegroundColor Cyan
+& ".\dist\serialwrapd.exe" --help
