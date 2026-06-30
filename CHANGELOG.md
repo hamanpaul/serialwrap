@@ -6,6 +6,7 @@
 
 ### Fixed
 
+- **PyInstaller exe CLI entry 修正（#84 PORT-4 follow-up）**：`serialwrap.exe` 實機建置後 `--help` 因 `sw_core/cli.py` 為 package-relative import、被 PyInstaller 當 `__main__` 直接執行而 `ImportError: attempted relative import with no known parent package`。新增 root `serialwrap.py` 薄 shim（絕對 import `from sw_core.cli import main`，鏡像既有 `serialwrapd.py`），`serialwrap.spec` 兩個 Analysis entry 改指向 root shim（`serialwrapd.py` / `serialwrap.py`）。實機建置驗證：`serialwrap.exe` / `serialwrapd.exe` `--help` 均 exit 0。
 - **Copilot PR #109 review 四項修正（#84 PORT-4 follow-up）**：
   - `platform_backends._select()`：未知後端值（非 auto/posix 別名/win 別名）改 raise `ValueError`，不再靜默退化為 auto。
   - `rpc_win._parse_tcp()`：新增 loopback 驗證，非 loopback host（如 `0.0.0.0`/LAN IP）raise `ValueError` 並附說明，避免 RPC server 對外暴露（RPC 無認證）。
@@ -14,6 +15,7 @@
 
 ### Added
 
+- **release flow 自動產出 Windows exe（#84 PORT-4 follow-up）**：`.github/workflows/release.yml` 新增 `publish-windows-exe` job（`windows-latest`，`needs: publish`）——`pip install .`（帶入 pyyaml/pyserial 供打包）+ `pyinstaller serialwrap.spec`，smoke 測試 `serialwrap.exe`/`serialwrapd.exe --help`，再 `gh release upload` 把兩個 exe 附到同一個 tag release。tag `v*` push 時，release 將同時含 wheel 與 Windows one-file exe（先前僅手動 `scripts/build_windows.ps1`）。
 - **Windows daemon 完整實作（#84 PORT-4 整合）**：Windows daemon 走 TCP loopback RPC（預設 `tcp://127.0.0.1:48700`，可 `--socket` 參數或 `SERIALWRAP_ENDPOINT` / `SERIALWRAP_TCP_PORT` 環境變數覆寫）＋ msvcrt singleton lock（`WindowsSingletonLock`）；SERIALCOMM registry 列舉可用 COM，雙重藍牙排除（BTHENUM PortName 掃描 + `bthmodem` device path 啟發式兜底），`config.yaml::windows.exclude_coms` 可再手動排除；閒置非藍牙 COM 自動以 `passthrough` profile 接管 session（agent 可觀察 UART，需下命令請先 pin profile 並 attach）；PyInstaller one-file 打包為 `serialwrapd.exe`/`serialwrap.exe`（`serialwrap.spec`，建置腳本 `scripts/build_windows.ps1 -Clean`）；三個平台 seam（RPC/lock/device）分檔於 `rpc_posix.py`↔`rpc_win.py`、`lock_posix.py`↔`lock_win.py`、`device_source.py`，由 `platform_backends.py` 的 `select_*_backend()` 依 `os.name` 自動選擇（`SERIALWRAP_{RPC,LOCK,DEVICE}_BACKEND` env 可覆寫）；POSIX 路徑全程 byte-identical（shim 維持相容）。
   - **已知限制（follow-up）**：持續被外部程序佔用的 COM 不會每輪自動輪詢重試（與 POSIX dynamic-session 同語意；需拔插或手動 `session bind`/`session clear` 觸發）。— #84 PORT-4 已知限制，後續處理。
   - **後續工作（follow-up）**：Windows TCP RPC loopback 目前無 token 驗證，本機任意行程可連並下任何 RPC 指令（不同於 POSIX AF_UNIX 的檔案權限保護）；RPC token 驗證（Windows TCP loopback 存取控制）列為後續工作項目。

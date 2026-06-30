@@ -72,3 +72,47 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ github.ref_name }}
         run: gh release upload "$TAG_NAME" dist/*.whl --clobber
+
+  publish-windows-exe:
+    # 在 windows-latest 以 PyInstaller 打 one-file exe，附加到同一個 release（#84 PORT-4）。
+    # needs: publish —— 等 publish job 建好 GitHub Release 後才上傳 exe。
+    runs-on: windows-latest
+    needs: publish
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify tag matches VERSION
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          $fileVersion = (Get-Content VERSION).Trim()
+          if ($env:TAG_NAME -ne "v$fileVersion") {
+            Write-Error "release tag $env:TAG_NAME does not match v$fileVersion (VERSION file)"
+            exit 1
+          }
+          Write-Output "release tag $env:TAG_NAME matches VERSION $fileVersion"
+
+      - name: Install build dependencies
+        # 安裝套件本身（帶入 pyyaml 與 win32 條件相依 pyserial，供 PyInstaller 打包）+ pyinstaller
+        run: python -m pip install --disable-pip-version-check . 'pyinstaller>=6'
+
+      - name: Build Windows one-file exes
+        run: python -m PyInstaller --noconfirm serialwrap.spec
+
+      - name: Smoke test exes
+        run: |
+          .\dist\serialwrap.exe --help; if ($LASTEXITCODE -ne 0) { Write-Error 'serialwrap.exe --help failed'; exit 1 }
+          .\dist\serialwrapd.exe --help; if ($LASTEXITCODE -ne 0) { Write-Error 'serialwrapd.exe --help failed'; exit 1 }
+
+      - name: Upload exes to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: gh release upload "$env:TAG_NAME" dist/serialwrap.exe dist/serialwrapd.exe --clobber

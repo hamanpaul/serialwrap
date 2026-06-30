@@ -13,7 +13,7 @@ datas = [("sw_core/assets", "sw_core/assets")]
 
 # ---------- serialwrapd ----------
 a_d = Analysis(
-    ["sw_core/daemon.py"],
+    ["serialwrapd.py"],
     datas=datas,
     hiddenimports=["winreg", "msvcrt", "serial", "yaml"],
     hookspath=[],
@@ -33,7 +33,7 @@ exe_d = EXE(
 
 # ---------- serialwrap（CLI）----------
 a_c = Analysis(
-    ["sw_core/cli.py"],
+    ["serialwrap.py"],
     datas=datas,
     hiddenimports=["winreg", "msvcrt", "serial", "yaml"],
     hookspath=[],
