@@ -8,6 +8,68 @@ from collections.abc import Callable
 from typing import Any
 
 
+async def serve_connection(reader, writer, handler, blocking_methods) -> None:
+    """逐行讀 JSON-RPC 請求、分派 handler、寫回應。transport 無關，POSIX/TCP 共用。
+
+    將 transport-無關的「讀一行→解析→分派→回寫」邏輯集中於此，
+    讓 JsonRpcUnixServer（AF_UNIX）與 TcpRpcServer（TCP loopback）
+    都呼叫它而不重複分派程式碼（DRY）。
+    """
+    try:
+        while True:
+            line = await reader.readline()
+            if not line:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            req_id: Any = None
+            try:
+                obj = json.loads(line.decode("utf-8", errors="replace"))
+            except json.JSONDecodeError:
+                writer.write(
+                    (json.dumps({"ok": False, "error_code": "INVALID_JSON"}, ensure_ascii=False) + "\n").encode("utf-8")
+                )
+                await writer.drain()
+                continue
+
+            if not isinstance(obj, dict):
+                writer.write(
+                    (json.dumps({"ok": False, "error_code": "INVALID_REQUEST"}, ensure_ascii=False) + "\n").encode("utf-8")
+                )
+                await writer.drain()
+                continue
+
+            req_id = obj.get("id")
+            method = obj.get("method")
+            params = obj.get("params")
+            if not isinstance(method, str):
+                resp: dict[str, Any] = {"id": req_id, "ok": False, "error_code": "INVALID_METHOD"}
+            else:
+                if not isinstance(params, dict):
+                    params = {}
+                try:
+                    if method in blocking_methods:
+                        # 長阻塞 handler 丟到 executor 執行，釋放 event loop（#52）。
+                        loop = asyncio.get_running_loop()
+                        result = await loop.run_in_executor(None, handler, method, params)
+                    else:
+                        result = handler(method, params)
+                except Exception as exc:  # noqa: BLE001
+                    result = {"ok": False, "error_code": "EXCEPTION", "message": str(exc)}
+                resp = {"id": req_id}
+                if isinstance(result, dict):
+                    resp.update(result)
+                else:
+                    resp.update({"ok": True, "data": result})
+
+            writer.write((json.dumps(resp, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8"))
+            await writer.drain()
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
 class JsonRpcUnixServer:
     def __init__(
         self,
@@ -24,58 +86,7 @@ class JsonRpcUnixServer:
         self._server: asyncio.AbstractServer | None = None
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        try:
-            while True:
-                line = await reader.readline()
-                if not line:
-                    break
-                line = line.strip()
-                if not line:
-                    continue
-                req_id: Any = None
-                try:
-                    obj = json.loads(line.decode("utf-8", errors="replace"))
-                except json.JSONDecodeError:
-                    resp = {"ok": False, "error_code": "INVALID_JSON"}
-                    writer.write((json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8"))
-                    await writer.drain()
-                    continue
-
-                if not isinstance(obj, dict):
-                    resp = {"ok": False, "error_code": "INVALID_REQUEST"}
-                    writer.write((json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8"))
-                    await writer.drain()
-                    continue
-
-                req_id = obj.get("id")
-                method = obj.get("method")
-                params = obj.get("params")
-                if not isinstance(method, str):
-                    resp = {"id": req_id, "ok": False, "error_code": "INVALID_METHOD"}
-                else:
-                    if not isinstance(params, dict):
-                        params = {}
-                    try:
-                        if method in self._blocking_methods:
-                            # 長阻塞 handler（如 file.push/file.pull）丟到 executor 執行，
-                            # 釋放 event loop 以繼續服務其他 RPC，避免傳輸期間全 daemon 凍結（#52）。
-                            loop = asyncio.get_running_loop()
-                            result = await loop.run_in_executor(None, self._handler, method, params)
-                        else:
-                            result = self._handler(method, params)
-                    except Exception as exc:
-                        result = {"ok": False, "error_code": "EXCEPTION", "message": str(exc)}
-                    resp = {"id": req_id}
-                    if isinstance(result, dict):
-                        resp.update(result)
-                    else:
-                        resp.update({"ok": True, "data": result})
-
-                writer.write((json.dumps(resp, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8"))
-                await writer.drain()
-        finally:
-            writer.close()
-            await writer.wait_closed()
+        await serve_connection(reader, writer, self._handler, self._blocking_methods)
 
     async def start(self) -> None:
         if os.path.exists(self._socket_path):
