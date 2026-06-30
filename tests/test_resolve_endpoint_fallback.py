@@ -103,5 +103,24 @@ class TestEndpointAlive(unittest.TestCase):
         self.assertFalse(cli._endpoint_alive("unix:///tmp/serialwrap-nonexistent-108.sock"))
 
 
+class TestRuntimeConfigRobustness(unittest.TestCase):
+    """config.yaml 為合法 YAML 但非 dict（純量/list）時不得讓 mode()/socket_path() traceback
+    （Codex re-review 殘留路徑：`should_auto_spawn(rc).mode()` 在 wrong-type _data 上 .get）。"""
+
+    def test_non_dict_yaml_coerced_to_empty(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from sw_core.runtime_config import RuntimeConfig
+
+        for content in ("just a scalar string\n", "- a\n- b\n", "42\n"):
+            with tempfile.TemporaryDirectory() as td:
+                p = Path(td) / "config.yaml"
+                p.write_text(content, encoding="utf-8")
+                rc = RuntimeConfig(p)
+                self.assertIsNone(rc.mode(), f"mode() should be None for {content!r}")
+                self.assertIsNone(rc.socket_path(), f"socket_path() should be None for {content!r}")
+
+
 if __name__ == "__main__":
     unittest.main()
