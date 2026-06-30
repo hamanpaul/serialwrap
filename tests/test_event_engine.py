@@ -112,6 +112,7 @@ class TestBridgeWiring(unittest.TestCase):
             received: list[tuple[str, str, int]] = []
 
             wal_dir = tempfile.mkdtemp(prefix="sw-wal-")
+            self.addCleanup(shutil.rmtree, wal_dir, ignore_errors=True)
             wal = WalWriter(wal_dir=wal_dir)
 
             def on_rx(data: bytes) -> None:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -48,6 +49,7 @@ class TestLogStartStop(unittest.TestCase):
 
     def setUp(self) -> None:
         self._tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._tmpdir, ignore_errors=True)
         self._log_dir = os.path.join(self._tmpdir, "logs")
         self._wal_dir = os.path.join(self._tmpdir, "wal")
         os.makedirs(self._wal_dir, exist_ok=True)
@@ -172,6 +174,7 @@ class TestConfigLogDir(unittest.TestCase):
         import yaml
 
         tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
         yaml_content = {
             "defaults": {"log_dir": "/my/log/dir"},
             "profiles": {
@@ -205,6 +208,7 @@ class TestConfigLogDir(unittest.TestCase):
         import yaml
 
         tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
         yaml_content = {
             "defaults": {"log_dir": "/default/dir"},
             "profiles": {
@@ -238,6 +242,7 @@ class TestConfigLogDir(unittest.TestCase):
         import yaml
 
         tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
         yaml_content = {
             "defaults": {"log_dir": "/default/dir"},
             "profiles": {
@@ -275,6 +280,7 @@ class TestLogStartErrorPaths(unittest.TestCase):
 
     def setUp(self) -> None:
         self._tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._tmpdir, ignore_errors=True)
         self._wal_dir = os.path.join(self._tmpdir, "wal")
         os.makedirs(self._wal_dir, exist_ok=True)
 
@@ -329,6 +335,7 @@ class TestLogStopFields(unittest.TestCase):
 
     def setUp(self) -> None:
         self._tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._tmpdir, ignore_errors=True)
         self._log_dir = os.path.join(self._tmpdir, "logs")
         self._wal_dir = os.path.join(self._tmpdir, "wal")
         os.makedirs(self._wal_dir, exist_ok=True)
@@ -379,6 +386,7 @@ class TestRxEdgeCases(unittest.TestCase):
 
     def setUp(self) -> None:
         self._tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._tmpdir, ignore_errors=True)
         self._log_dir = os.path.join(self._tmpdir, "logs")
         self._wal_dir = os.path.join(self._tmpdir, "wal")
         os.makedirs(self._wal_dir, exist_ok=True)
@@ -478,6 +486,7 @@ class TestMultiSessionCapture(unittest.TestCase):
 
     def setUp(self) -> None:
         self._tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._tmpdir, ignore_errors=True)
         self._log_dir = os.path.join(self._tmpdir, "logs")
         self._wal_dir = os.path.join(self._tmpdir, "wal")
         os.makedirs(self._wal_dir, exist_ok=True)
@@ -540,6 +549,7 @@ class TestEnvVarLogDir(unittest.TestCase):
 
     def setUp(self) -> None:
         self._tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._tmpdir, ignore_errors=True)
         self._wal_dir = os.path.join(self._tmpdir, "wal")
         os.makedirs(self._wal_dir, exist_ok=True)
 
@@ -580,6 +590,7 @@ class TestLogFilename(unittest.TestCase):
 
     def setUp(self) -> None:
         self._tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._tmpdir, ignore_errors=True)
         self._log_dir = os.path.join(self._tmpdir, "logs")
         self._wal_dir = os.path.join(self._tmpdir, "wal")
         os.makedirs(self._wal_dir, exist_ok=True)
@@ -629,6 +640,7 @@ class TestPublicDictCapture(unittest.TestCase):
     def test_no_capture_returns_none(self) -> None:
         """無 active capture 時 capture 欄位為 None"""
         tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
         wal_dir = os.path.join(tmpdir, "wal")
         os.makedirs(wal_dir, exist_ok=True)
         profile = _make_profile("COM0", log_dir=tmpdir)
@@ -651,6 +663,7 @@ class TestSelectorVariants(unittest.TestCase):
 
     def setUp(self) -> None:
         self._tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._tmpdir, ignore_errors=True)
         self._log_dir = os.path.join(self._tmpdir, "logs")
         self._wal_dir = os.path.join(self._tmpdir, "wal")
         os.makedirs(self._wal_dir, exist_ok=True)
@@ -692,6 +705,7 @@ class TestStopCaptureLocked(unittest.TestCase):
 
     def setUp(self) -> None:
         self._tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._tmpdir, ignore_errors=True)
         self._log_dir = os.path.join(self._tmpdir, "logs")
         self._wal_dir = os.path.join(self._tmpdir, "wal")
         os.makedirs(self._wal_dir, exist_ok=True)

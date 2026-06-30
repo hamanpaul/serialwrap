@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+import shutil
 import tempfile
 import unittest
 from typing import Any
@@ -215,6 +216,7 @@ class TestPullFileSuccess(unittest.TestCase):
         bridge.enqueue_rx(f"{md5}  /etc/test\r\n{_PROMPT}")
 
         outdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outdir, ignore_errors=True)
         local = os.path.join(outdir, "pulled.bin")
         try:
             result = pull_file(
@@ -279,6 +281,7 @@ class TestPullFileSuccess(unittest.TestCase):
         bridge.enqueue_rx(f"{md5}  /tmp/binary.bin\r\n{_PROMPT}")
 
         outdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outdir, ignore_errors=True)
         local = os.path.join(outdir, "ansi_pull.bin")
         try:
             result = pull_file(

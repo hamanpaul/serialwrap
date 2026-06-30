@@ -6,6 +6,7 @@
 
 ### Fixed
 
+- **測試臨時目錄洩漏修正（test hygiene）**：數個測試以 `tempfile.mkdtemp()`（不會自動清）建臨時目錄卻無對應清理，每跑一次就在 `/tmp` 留下殘骸（`sw-wal-*` 等 prefix 與 generic `/tmp/tmpXXXX`）；累積會混淆實機除錯（誤把測試殘留當 production WAL 洩漏）。修正：`tests/test_event_engine.py`（`sw-wal-` wal_dir）、`tests/test_file_transfer.py`（2 處 `outdir`）、`tests/test_session_capture.py`（8 處 setUp `self._tmpdir` + 4 處 local `tmpdir`）各以 `self.addCleanup(shutil.rmtree, <dir>, ignore_errors=True)` 補清（失敗亦清、不依賴 tearDown）。production `sw_core/` 不受影響（WalWriter 寫 XDG state dir，從不建 `/tmp/sw-wal-*`）。
 - **daemon start/connect 韌性強化（#108 #1/#2 hardening）**：#108 頭號根因（POSIX daemon 啟動改寫 `config.yaml`）已由 #84 PORT-4 POSIX guard（PR #109）修掉；本變更補其殘留兩項：
   - **#1：`serialwrap daemon start` 納入監管模式 gate（`sw_core/cli.py` `_run_daemon_start`）**——systemd 模式下重導到 `service start`（回應含 `_routed_to:"service start"`，對稱於既有 `daemon stop`→`service stop`），不再顯式 spawn 非託管 daemon；故 `minicom_router` 的 `AUTO_START_DAEMON=1` 在 systemd 模式不再生 coexist daemon。on-demand 模式 spawn 前以 `health.ping` 冪等探測（`_probe_healthy_daemon`），已有健康 daemon 時回 `{ok:true, already_running:true}` no-op。`daemon start` subparser 補 `--with-sudo`；`should_auto_spawn()` 由 dead code 接回使用。
   - **#2：`_resolve_endpoint` 對 dangling socket 依 `supervision_mode` fallback**——當 `config.yaml` 的 `socket_path` 為不可連的 unix socket 時，依 `supervision_mode` 推 canonical endpoint（`systemd-system`→`SYSTEM_SOCKET`；其餘→`SOCKET_PATH`）並改連之（stderr 提示），canonical 不可連或同值則回原值讓既有錯誤照常浮現；新增 `_endpoint_alive()` helper（unix connect probe，非 unix endpoint 跳過）。CLI 對 `config.yaml` 維持唯讀、不 self-heal 改寫。明確 `--endpoint`/`--socket` 不受 fallback 影響。
