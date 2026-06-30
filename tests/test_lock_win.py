@@ -1,0 +1,27 @@
+from __future__ import annotations
+
+import os
+import sys
+import pytest
+
+from sw_core import lock_win
+
+
+def test_endpoint_alive_refuses(tmp_path, monkeypatch):
+    """endpoint 可連時，acquire() 必須 raise DAEMON_ALREADY_RUNNING。"""
+    monkeypatch.setattr(lock_win, "_endpoint_alive", lambda ep: True)
+    lk = lock_win.WindowsSingletonLock(str(tmp_path / "d.lock"), "tcp://127.0.0.1:48799")
+    with pytest.raises(RuntimeError, match="DAEMON_ALREADY_RUNNING"):
+        lk.acquire()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("win"), reason="msvcrt 檔鎖僅 Windows")
+def test_stale_endpoint_acquires(tmp_path, monkeypatch):
+    """endpoint 不可連（stale）時，acquire() 取得 msvcrt 檔鎖，release() 釋放。"""
+    monkeypatch.setattr(lock_win, "_endpoint_alive", lambda ep: False)
+    lk = lock_win.WindowsSingletonLock(str(tmp_path / "d.lock"), "tcp://127.0.0.1:48798")
+    lk.acquire()
+    try:
+        assert os.path.exists(str(tmp_path / "d.lock"))
+    finally:
+        lk.release()
