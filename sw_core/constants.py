@@ -47,12 +47,12 @@ SOCKET_PATH = os.path.join(RUN_DIR, "serialwrapd.sock")
 DEFAULT_TCP_PORT: int = int(os.environ.get("SERIALWRAP_TCP_PORT", "48700"))
 if os.name == "nt" or sys.platform.startswith("win"):
     DEFAULT_ENDPOINT: str = (
-        _env_path("SERIALWRAP_ENDPOINT", f"tcp://127.0.0.1:{DEFAULT_TCP_PORT}")
-        if os.environ.get("SERIALWRAP_ENDPOINT")
-        else f"tcp://127.0.0.1:{DEFAULT_TCP_PORT}"
+        os.environ.get("SERIALWRAP_ENDPOINT")
+        or f"tcp://127.0.0.1:{DEFAULT_TCP_PORT}"
     )
 else:
     DEFAULT_ENDPOINT = os.environ.get("SERIALWRAP_ENDPOINT") or SOCKET_PATH
+
 TTYMCU_PATH = _env_path("SERIALWRAP_TTYMCU_PATH", os.path.join(RUN_DIR, "dev", "ttyMCU"))
 STATE_PATH = os.path.join(STATE_DIR, "state.json")
 WAL_DIR = _env_path("SERIALWRAP_WAL_DIR", os.path.join(STATE_DIR, "wal"))
