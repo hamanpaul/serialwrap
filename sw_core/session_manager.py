@@ -1815,6 +1815,11 @@ class SessionManager:
             if notify_ready:
                 self._on_ready(session.session_id)
         except Exception as exc:
+            # 開埠失敗跳過（#84 PORT-4 閒置 COM 接管/被佔用跳過）：
+            # bridge.start() 拋出例外（如 PermissionError / OSError — 埠被其他程式佔用）時，
+            # session 退回 DETACHED 並記錄 ATTACH_FAILED:<ExcType>，不觸碰 RELEASED 狀態。
+            # 此次 attach thread 結束後，_attach_inflight 由 _spawn_attach._run finally 清除，
+            # 下次可透過手動 attach_device / clear_session 或裝置重新掃到（added）觸發重試。
             try:
                 preserved = bridge.stop(preserve_consoles=True)
             except Exception:
@@ -2016,6 +2021,10 @@ class SessionManager:
             if notify_ready:
                 self._on_ready(session.session_id)
         except Exception as exc:
+            # 動態路徑開埠失敗跳過（#84 PORT-4 閒置 COM 接管/被佔用跳過）：
+            # bridge.start() 拋出例外（埠被佔、PermissionError 等）時，
+            # 已建立的動態 session 退回 DETACHED，不污染 RELEASED，
+            # 下次可透過手動 attach_device / clear_session 觸發重試。
             try:
                 bridge.stop()
             except Exception:
