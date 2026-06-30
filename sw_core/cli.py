@@ -224,7 +224,10 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
 
 
 def _run_daemon_stop(args: argparse.Namespace) -> int:
-    mode = _default_runtime_config().mode() or "on-demand"
+    # 用 _safe_runtime_config 避免 config.yaml 壞 YAML 時 traceback；讀不到退化 on-demand
+    # 路徑（與 daemon start / _resolve_endpoint 的容錯一致，#108 PR #112 review）。
+    rc = _safe_runtime_config()
+    mode = (rc.mode() if rc is not None else None) or "on-demand"
     if mode.startswith("systemd"):
         # systemd 模式：將 daemon stop 重導到 service stop，避免繞開 unit 管理
         with_sudo = getattr(args, "with_sudo", False)

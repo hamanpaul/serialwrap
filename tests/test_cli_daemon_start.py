@@ -219,6 +219,22 @@ class TestDaemonStartSupervision(unittest.TestCase):
         popen.assert_not_called()
         self.assertTrue(printer.call_args.args[0].get("already_running"))
 
+    def test_daemon_stop_unreadable_config_does_not_traceback(self) -> None:
+        """daemon stop 在 config.yaml 壞 YAML 時不 traceback，退化 on-demand RPC 路徑
+        （PR #112 Copilot review：與 daemon start / _resolve_endpoint 容錯一致）。"""
+        args = argparse.Namespace(socket="/tmp/serialwrap.sock", endpoint=None, with_sudo=False, timeout_s=2.0)
+        with (
+            mock.patch("sw_core.cli._default_runtime_config", side_effect=ValueError("bad yaml")),
+            mock.patch("sw_core.cli.rpc_call", return_value={"ok": True}) as rpc,
+            mock.patch("sw_core.cli._print") as printer,
+        ):
+            rc = cli._run_daemon_stop(args)
+
+        self.assertEqual(rc, 0)
+        self.assertTrue(printer.call_args.args[0]["ok"])
+        # 確認走 on-demand RPC daemon.stop（非 systemd 重導），且未 traceback
+        self.assertEqual(rpc.call_args.args[1], "daemon.stop")
+
 
 if __name__ == "__main__":
     unittest.main()
