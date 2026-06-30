@@ -5,7 +5,7 @@ import asyncio
 import signal
 import sys
 
-from sw_core.config import load_profiles
+from sw_core.config import ProfileTemplate, load_profiles
 from sw_core.constants import CONFIG_DIR, DEFAULT_ENDPOINT, LOCK_PATH, PROFILE_DIR, ensure_runtime_dirs
 from sw_core.runtime_config import RuntimeConfig
 from sw_core.service import SerialwrapService
@@ -86,11 +86,46 @@ def _write_config_endpoint(endpoint: str) -> None:
         sys.stderr.write(f"serialwrapd: 寫入 config.yaml endpoint 失敗（非致命）: {exc}\n")
 
 
+def _make_windows_passthrough_templates(
+    templates: list[ProfileTemplate],
+) -> list[ProfileTemplate]:
+    """Windows daemon 路徑：若 templates 中無 passthrough template，注入預設
+    windows-default-passthrough，使空閒 COM 可被 SessionManager 動態接管。
+
+    根因（#84 PORT-4）：無任何 template 時，_attach_by_id 守衛
+    ``if session is None and self._templates:`` 為 False，動態接管永遠跳過。
+    注入後 _templates 非空，守衛通過，_attach_by_id_dynamic 走
+    _default_passthrough_template fallback 建立 passthrough session。
+
+    POSIX 行為：呼叫方（_run_async）僅在 select_device_backend()=="win" 時呼叫，
+    POSIX 路徑完全不受影響。
+    """
+    if any(t.platform == "passthrough" for t in templates):
+        return list(templates)
+    return list(templates) + [
+        ProfileTemplate(
+            profile_name="windows-default-passthrough",
+            platform="passthrough",
+            ready_probe="",  # 空 → command_capable=False → _default_passthrough_template 優先選為 generic fallback
+        )
+    ]
+
+
 async def _run_async(args: argparse.Namespace) -> int:
     ensure_runtime_dirs()
     result = load_profiles(args.profile_dir)
     if not result.profiles and not result.templates:
         sys.stderr.write("serialwrapd: no profiles loaded\n")
+
+    # Windows daemon 路徑（#84 PORT-4）：確保 templates 中至少有一個 passthrough template，
+    # 使空閒 COM 能被 SessionManager._attach_by_id 動態接管。
+    # POSIX 路徑（select_device_backend()!="win"）不注入，維持既有「無 profiles → 不自動接管」行為。
+    from sw_core.platform_backends import select_device_backend  # noqa: PLC0415
+    templates = (
+        _make_windows_passthrough_templates(result.templates)
+        if select_device_backend() == "win"
+        else result.templates
+    )
 
     # 依平台後端選擇器建構 lock（Windows: WindowsSingletonLock / POSIX: SingletonLock）。
     lock = _build_lock(args)
@@ -103,7 +138,7 @@ async def _run_async(args: argparse.Namespace) -> int:
     try:
         service = SerialwrapService(
             result.profiles,
-            templates=result.templates,
+            templates=templates,
             max_sessions=result.max_sessions,
         )
     except StateLoadError as exc:
