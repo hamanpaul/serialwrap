@@ -5,10 +5,9 @@ import asyncio
 import signal
 import sys
 
-from sw_core.config import load_profiles
-from sw_core.constants import LOCK_PATH, PROFILE_DIR, SOCKET_PATH, ensure_runtime_dirs
-from sw_core.daemon_lock import SingletonLock
-from sw_core.rpc import JsonRpcUnixServer
+from sw_core.config import ProfileTemplate, load_profiles
+from sw_core.constants import CONFIG_DIR, DEFAULT_ENDPOINT, LOCK_PATH, PROFILE_DIR, ensure_runtime_dirs
+from sw_core.runtime_config import RuntimeConfig
 from sw_core.service import SerialwrapService
 from sw_core.session_manager import StateLoadError
 
@@ -38,9 +37,78 @@ BLOCKING_RPC_METHODS = {
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="serialwrapd", description="serialwrap daemon")
     parser.add_argument("--profile-dir", default=PROFILE_DIR)
-    parser.add_argument("--socket", default=SOCKET_PATH)
+    # 預設值改為 DEFAULT_ENDPOINT（POSIX 上等同 SOCKET_PATH，Windows 上為 TCP URL）（#84 PORT-4）。
+    parser.add_argument("--socket", default=DEFAULT_ENDPOINT)
     parser.add_argument("--lock", default=LOCK_PATH)
     return parser
+
+
+def _build_lock(args: argparse.Namespace) -> object:
+    """依平台後端選擇器建構 singleton lock（延遲 import，避免非該平台模組被提前載入）。
+
+    Windows（win）→ WindowsSingletonLock；POSIX（posix）→ SingletonLock。
+    """
+    from sw_core.platform_backends import select_lock_backend  # noqa: PLC0415
+    if select_lock_backend() == "win":
+        from sw_core.lock_win import WindowsSingletonLock  # noqa: PLC0415
+        return WindowsSingletonLock(args.lock, args.socket)
+    from sw_core.lock_posix import SingletonLock  # noqa: PLC0415
+    return SingletonLock(args.lock, args.socket)
+
+
+def _build_server(
+    args: argparse.Namespace,
+    handler: object,
+) -> object:
+    """依平台後端選擇器建構 RPC server（延遲 import，避免非該平台模組被提前載入）。
+
+    Windows（win）→ TcpRpcServer；POSIX（posix）→ JsonRpcUnixServer。
+    """
+    from sw_core.platform_backends import select_rpc_backend  # noqa: PLC0415
+    if select_rpc_backend() == "win":
+        from sw_core.rpc_win import TcpRpcServer  # noqa: PLC0415
+        return TcpRpcServer(args.socket, handler, blocking_methods=BLOCKING_RPC_METHODS)
+    from sw_core.rpc_posix import JsonRpcUnixServer  # noqa: PLC0415
+    return JsonRpcUnixServer(args.socket, handler, blocking_methods=BLOCKING_RPC_METHODS)
+
+
+def _write_config_endpoint(endpoint: str) -> None:
+    """daemon 啟動成功後，將有效 endpoint 寫入 config.yaml，供 CLI _resolve_endpoint 讀取。
+
+    僅更新 socket_path，不改動 supervision_mode（避免覆蓋 setup 寫入的監管模式）。
+    寫入失敗時僅記 stderr，不中斷 daemon 運行。
+    """
+    import os  # noqa: PLC0415
+    try:
+        cfg = RuntimeConfig(os.path.join(CONFIG_DIR, "config.yaml"))
+        cfg.set_socket(endpoint)
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(f"serialwrapd: 寫入 config.yaml endpoint 失敗（非致命）: {exc}\n")
+
+
+def _make_windows_passthrough_templates(
+    templates: list[ProfileTemplate],
+) -> list[ProfileTemplate]:
+    """Windows daemon 路徑：若 templates 中無 passthrough template，注入預設
+    windows-default-passthrough，使空閒 COM 可被 SessionManager 動態接管。
+
+    根因（#84 PORT-4）：無任何 template 時，_attach_by_id 守衛
+    ``if session is None and self._templates:`` 為 False，動態接管永遠跳過。
+    注入後 _templates 非空，守衛通過，_attach_by_id_dynamic 走
+    _default_passthrough_template fallback 建立 passthrough session。
+
+    POSIX 行為：呼叫方（_run_async）僅在 select_device_backend()=="win" 時呼叫，
+    POSIX 路徑完全不受影響。
+    """
+    if any(t.platform == "passthrough" for t in templates):
+        return list(templates)
+    return list(templates) + [
+        ProfileTemplate(
+            profile_name="windows-default-passthrough",
+            platform="passthrough",
+            ready_probe="",  # 空 → command_capable=False → _default_passthrough_template 優先選為 generic fallback
+        )
+    ]
 
 
 async def _run_async(args: argparse.Namespace) -> int:
@@ -49,7 +117,18 @@ async def _run_async(args: argparse.Namespace) -> int:
     if not result.profiles and not result.templates:
         sys.stderr.write("serialwrapd: no profiles loaded\n")
 
-    lock = SingletonLock(args.lock, args.socket)
+    # Windows daemon 路徑（#84 PORT-4）：確保 templates 中至少有一個 passthrough template，
+    # 使空閒 COM 能被 SessionManager._attach_by_id 動態接管。
+    # POSIX 路徑（select_device_backend()!="win"）不注入，維持既有「無 profiles → 不自動接管」行為。
+    from sw_core.platform_backends import select_device_backend  # noqa: PLC0415
+    templates = (
+        _make_windows_passthrough_templates(result.templates)
+        if select_device_backend() == "win"
+        else result.templates
+    )
+
+    # 依平台後端選擇器建構 lock（Windows: WindowsSingletonLock / POSIX: SingletonLock）。
+    lock = _build_lock(args)
     try:
         lock.acquire()
     except RuntimeError as exc:
@@ -59,7 +138,7 @@ async def _run_async(args: argparse.Namespace) -> int:
     try:
         service = SerialwrapService(
             result.profiles,
-            templates=result.templates,
+            templates=templates,
             max_sessions=result.max_sessions,
         )
     except StateLoadError as exc:
@@ -76,7 +155,8 @@ async def _run_async(args: argparse.Namespace) -> int:
             return {"ok": True, "stopping": True}
         return service.rpc(method, params)
 
-    server = JsonRpcUnixServer(args.socket, _handle, blocking_methods=BLOCKING_RPC_METHODS)
+    # 依平台後端選擇器建構 RPC server（Windows: TcpRpcServer / POSIX: JsonRpcUnixServer）。
+    server = _build_server(args, _handle)
 
     def _stop(*_unused: object) -> None:
         stop_event.set()
@@ -91,6 +171,11 @@ async def _run_async(args: argparse.Namespace) -> int:
     try:
         service.start()
         await server.start()
+        # Windows：server 啟動後寫入有效 tcp endpoint，CLI _resolve_endpoint 靠此發現 daemon（#84 PORT-4）。
+        # POSIX 不需要：systemd setup 已寫 config，on-demand 模式 CLI 直接 fallback 到 SOCKET_PATH 預設值。
+        from sw_core.platform_backends import select_rpc_backend  # noqa: PLC0415
+        if select_rpc_backend() == "win":
+            _write_config_endpoint(args.socket)
         await stop_event.wait()
     finally:
         await server.stop()
@@ -104,3 +189,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     return int(asyncio.run(_run_async(args)))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -835,11 +835,62 @@ serialwrap wal current-seq
   - **Windows**：無 PTY → `UARTBridge` 開 `127.0.0.1` TCP listener；**TeraTerm（TCP/IP, Service=Other）或 PuTTY（Raw）**連入即一個 console，沿用 raw ownership / suspend-resume coexistence / RX fan-out（agent 下命令期間連線不中斷）。連線端點見 `console_endpoint()` / `session console-attach` 回傳的 `host:port`。
 - 真機驗證：Windows 對 CH340（`COM8`，TxRx 短接 loopback）實測序列埠 start/RX/TX/WAL/clean-stop 與 TCP console raw/雙向/agent coexistence/斷線偵測全數通過。
 
-### Windows MCU flash（設計決策，後續）
+### Windows Daemon（PORT-4）
 
-Linux 的 `/dev/ttyMCU`（PTY-bridge + sync-probe + baud 鏡射，#55）在 Windows **不適用也不需要**：Windows 的韌體升級工具直接獨佔開啟該 UART `COMx` 自行燒錄。serialwrap 在 Windows flash 流程唯一要做的是 **detach（release）該 COM port**——關閉自身 handle 讓外部工具獨佔開啟、燒完再 reclaim，對應 **#54 device release/handoff** 語意（**非** #55）。底層 release/reclaim primitive（`stop()`→`close()` 釋放 COM、`start()`→re-open 收回）已可用；完整的 `device release`/`device attach` 使用者編排需 Windows daemon（PORT-4），列為後續。
+Windows daemon 以 **TCP loopback** 取代 AF_UNIX 做 RPC 控制通道，使 serialwrap CLI/agent 在 Windows 擁有完整指令路徑：
 
-> ⚠️ 範圍：本支援涵蓋 **PORT-1（序列埠）** 與 **PORT-2（Windows human console，TCP）**。其餘 OS 邊界——daemon 控制通道 AF_UNIX（**PORT-4**，故 Windows 暫無 daemon/CLI/agent 命令路徑與 `device release` 編排）、`/proc` peer 偵測（PORT-5）、`/dev` 裝置列舉（PORT-6）、WAL 目錄 fsync（PORT-7）、systemd/dialout 監管（PORT-8）——仍為 Linux-only，列為後續。
+- **RPC endpoint**：預設 `tcp://127.0.0.1:48700`，可以 `--socket` 參數或環境變數 `SERIALWRAP_ENDPOINT`（覆寫整個 endpoint，如 `tcp://127.0.0.1:50000`）、`SERIALWRAP_TCP_PORT`（僅覆寫 port 部分）覆寫。daemon 啟動後會把有效 endpoint 寫入 `config.yaml::socket_path`，CLI `_resolve_endpoint` 自動讀取。
+- **Singleton 鎖**：`msvcrt.locking`（`LK_NBLCK`）+ TCP connect 探測（`WindowsSingletonLock`，`sw_core/lock_win.py`）。語意與 POSIX `SingletonLock`（flock + Unix socket probe）對齊：endpoint 可連 → `DAEMON_ALREADY_RUNNING`；stale → 取得 msvcrt 檔鎖。
+- **COM 列舉與藍牙排除**：從 Windows registry `HKLM\HARDWARE\DEVICEMAP\SERIALCOMM` 列舉所有 COM port（`WindowsDeviceSource`，`sw_core/device_source.py`）；雙重排除藍牙——BTHENUM PortName 掃描（主判據）+ `bthmodem` device path 啟發式（兜底），確保藍牙裝置**永不被接管**。額外手動排除清單：`config.yaml::windows.exclude_coms`（如 `["COM3"]`）。
+- **閒置非藍牙 COM 自動接管**：偵測到不在排除清單的 COM 時，daemon 以 `passthrough` profile 自動建立 session（可觀察 UART 輸出；需要下命令請先 pin 適當 profile 並 attach）。已持續被外部程序佔用的 COM **不會每輪自動輪詢重試**（與 POSIX dynamic-session 同語意；需拔插或手動 `session bind`/`session clear` 觸發）。
+- **平台 seam 分檔**：三個後端由 `sw_core/platform_backends.py` 的 `select_rpc_backend()` / `select_lock_backend()` / `select_device_backend()` 依 `os.name` 自動選擇，環境變數 `SERIALWRAP_{RPC,LOCK,DEVICE}_BACKEND`（`auto`/`posix`/`win`）可覆寫：
+  - RPC：`sw_core/rpc_posix.py`（Unix socket）↔ `sw_core/rpc_win.py`（TCP loopback `TcpRpcServer`）
+  - Lock：`sw_core/lock_posix.py`（`SingletonLock` flock）↔ `sw_core/lock_win.py`（`WindowsSingletonLock` msvcrt）
+  - Device：`PosixDeviceSource`（`/dev/serial/by-id`）↔ `WindowsDeviceSource`（SERIALCOMM registry）
+- POSIX 路徑全程 byte-identical（shim 維持相容）。
+
+#### 建置 Windows 可執行檔（PyInstaller）
+
+`serialwrapd.exe` / `serialwrap.exe` 以 PyInstaller one-file 打包（`serialwrap.spec`）：
+
+```powershell
+# 建置（自動安裝 PyInstaller，-Clean 旗標清除 build/ dist/ 後重建）
+.\scripts\build_windows.ps1 -Clean
+
+# 煙霧測試（--help 即驗收）
+dist\serialwrapd.exe --help
+dist\serialwrap.exe --help
+```
+
+- `serialwrap.spec` 已設定 `hiddenimports = ["winreg", "msvcrt", "serial", "yaml"]` 與內嵌 `sw_core/assets/`。
+- `dist/` 與 `build/` 已在 `.gitignore`，不入版控；實機整合驗收於 Task 14 進行。
+
+#### 啟動 Windows Daemon
+
+```powershell
+# 開發 / 臨時使用（前景模式）
+serialwrapd.exe --socket tcp://127.0.0.1:48700
+
+# 或直接 python 執行
+python -m sw_core.daemon
+
+# CLI 操作（自動讀 config.yaml 或指定 endpoint）
+serialwrap.exe daemon status
+serialwrap.exe session list
+serialwrap.exe cmd submit --selector COM0 --cmd "ver"
+```
+
+> ⚠️ Windows 尚無 systemd 監管（PORT-8）。長期使用建議以 Windows Task Scheduler 或 NSSM 管理 `serialwrapd.exe` 生命週期；`device release` / `device attach` 編排已可用（底層 COM release/reclaim primitive 可用）。
+
+> ⚠️ **安全提醒（Windows TCP RPC）**：Windows daemon 的 RPC 控制通道走 `127.0.0.1` TCP，**本機任意行程與使用者均可連線並下任何 RPC 指令**（不同於 POSIX AF_UNIX 依賴檔案權限與 `dialout` 群組保護）。單人開發機可接受；多人共用 Windows 機請注意此風險，token 驗證機制為後續 follow-up。
+
+> **COM namespace 說明**：serialwrap 給 session 的內部 selector 標籤（COM0／COM1…）與 Windows 實體埠名（COM3／COM8…）是兩個獨立 namespace；`session list` 會同時顯示（如 `device_by_id=COM8`、session `com=COM0`），屬正常行為。
+
+### Windows MCU flash（設計決策）
+
+Linux 的 `/dev/ttyMCU`（PTY-bridge + sync-probe + baud 鏡射，#55）在 Windows **不適用也不需要**：Windows 的韌體升級工具直接獨佔開啟該 UART `COMx` 自行燒錄。serialwrap 在 Windows flash 流程唯一要做的是 **detach（release）該 COM port**——關閉自身 handle 讓外部工具獨佔開啟、燒完再 reclaim，對應 **#54 device release/handoff** 語意（**非** #55）。底層 stop/close / start/re-open primitive 已可用；完整的 `device release`/`device attach` 使用者編排透過 Windows daemon（PORT-4，已完成）即可操作。
+
+> ⚠️ 範圍：本 Windows 支援涵蓋 **PORT-1（序列埠）**、**PORT-2（TCP human console）** 與 **PORT-4（Windows daemon：TCP RPC、msvcrt singleton、SERIALCOMM 列舉）**。其餘 OS 邊界——`/proc` peer 偵測（PORT-5）、`/dev` 裝置列舉（PORT-6）、WAL 目錄 fsync（PORT-7）、systemd/dialout 監管（PORT-8）——仍為 Linux-only。
 
 ## 測試
 

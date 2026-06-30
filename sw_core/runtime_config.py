@@ -24,3 +24,12 @@ class RuntimeConfig:
             self._data["socket_path"] = socket_path
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._path.write_text(yaml.safe_dump(self._data, allow_unicode=True), encoding="utf-8")
+
+    def set_socket(self, endpoint: str) -> None:
+        """更新 config.yaml 的 socket_path，不改動 supervision_mode（#84 PORT-4）。
+
+        daemon 啟動成功後寫入當前 endpoint，使 CLI ``_resolve_endpoint`` 連得上。
+        """
+        self._data["socket_path"] = endpoint
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._path.write_text(yaml.safe_dump(self._data, allow_unicode=True), encoding="utf-8")

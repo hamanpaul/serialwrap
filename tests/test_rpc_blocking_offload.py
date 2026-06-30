@@ -9,10 +9,12 @@ import asyncio
 import os
 import pathlib
 import shutil
+import sys
 import tempfile
 import threading
 import time
 
+import pytest
 import sw_core
 from sw_core.client import rpc_call
 from sw_core.daemon import BLOCKING_RPC_METHODS
@@ -41,6 +43,10 @@ def test_blocking_methods_are_real_dispatch_strings():
         assert f'"{m}"' in src, f"{m} 不是 service.py 的分派方法（可能打錯名）"
 
 
+@pytest.mark.skipif(
+    sys.platform.startswith("win"),
+    reason="POSIX-only: Unix domain socket 在 Windows 不適用（#84 PORT-4）",
+)
 def test_health_ping_not_blocked_by_slow_command_result_tail():
     """以真實 BLOCKING_RPC_METHODS 驅動：大 command.result_tail 進行中，health.ping 不得被卡。
 

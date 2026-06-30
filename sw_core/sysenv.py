@@ -13,11 +13,11 @@
 
 from __future__ import annotations
 
-import grp
 import os
 import platform
 import shutil
 import subprocess
+import sys
 from typing import Dict, FrozenSet, List, Optional, Protocol, Tuple
 
 
@@ -74,8 +74,15 @@ class SystemEffects:
             return False
 
     def user_in_group(self, group: str) -> bool:
-        """回傳 True 若目前使用者（含補充群組）屬於 group；群組不存在回傳 False。"""
+        """回傳 True 若目前使用者（含補充群組）屬於 group；群組不存在回傳 False。
+
+        Windows 無 POSIX 群組概念（grp/os.getgroups 均不存在），一律回傳 False（#84 PORT-4）。
+        """
+        if sys.platform == "win32":
+            # Windows 無 POSIX 群組概念（無 grp/os.getgroups）；一律回 False（#84 PORT-4）
+            return False
         try:
+            import grp  # noqa: PLC0415 — POSIX-only，延遲 import 使本模組在 Windows 可載入
             try:
                 gid = grp.getgrnam(group).gr_gid
             except KeyError:

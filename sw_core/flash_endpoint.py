@@ -5,11 +5,12 @@
 from __future__ import annotations
 import dataclasses
 import os
-import pty
 import select
 import threading
-import tty
 from typing import Protocol
+
+# ``pty`` 與 ``tty`` 為 POSIX-only；延遲 import 至 FlashEndpoint.start()，
+# 使本模組在 Windows 可正常 import（#84 PORT-4）。
 
 from .mcu_patterns import McuPatternRegistry
 
@@ -114,7 +115,19 @@ class FlashEndpoint:
         self._flash_active = threading.Event()
 
     def start(self):
-        """開啟 PTY、建立 symlink、啟動背景 loop 執行緒。"""
+        """開啟 PTY、建立 symlink、啟動背景 loop 執行緒（POSIX-only；Windows 為 no-op）。
+
+        Windows 上無 PTY 支援，直接返回（#84 PORT-4：Windows 走 device release/handoff，不走 PTY）。
+        """
+        try:
+            import pty  # noqa: PLC0415
+            import tty  # noqa: PLC0415
+        except ImportError:
+            import sys
+            if sys.platform == "win32":
+                # Windows 無 PTY：flash 端點不適用，跳過啟動（#84 PORT-4）
+                return
+            raise   # POSIX 缺 pty/tty 屬異常，明確拋出不靜默
         self._master_fd, self._slave_fd = pty.openpty()
         # 關鍵：把 slave 設為 raw，否則 PTY line discipline 會做 CR/LF 轉換與輸入處理，
         # 汙染 flasher（開 /dev/ttyMCU）的 SBL 二進位協定。byte-transparency 仰賴這一步。

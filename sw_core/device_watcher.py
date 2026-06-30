@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import dataclasses
-import os
 import threading
 import time
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
+
+if TYPE_CHECKING:
+    from sw_core.device_source import DeviceSource
 
 
 @dataclasses.dataclass(frozen=True)
@@ -27,6 +29,7 @@ class DeviceWatcher:
         poll_interval_s: float = 1.0,
         extra_scan_dirs: list[str] | None = None,
         on_tick: Callable[[], None] | None = None,
+        source: "DeviceSource | None" = None,
     ) -> None:
         self._scan_dirs = [by_id_dir] + (extra_scan_dirs or [])
         self._on_change = on_change
@@ -35,27 +38,16 @@ class DeviceWatcher:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._devices: dict[str, DeviceInfo] = {}
+        # 延遲 import 避免與 device_source 循環 import（device_source 從本模組 import DeviceInfo）
+        from sw_core.device_source import PosixDeviceSource  # noqa: PLC0415
+        self._source: DeviceSource = source if source is not None else PosixDeviceSource(self._scan_dirs)
 
     @property
     def devices(self) -> dict[str, DeviceInfo]:
         return dict(self._devices)
 
     def _scan(self) -> dict[str, DeviceInfo]:
-        out: dict[str, DeviceInfo] = {}
-        seen_real: set[str] = set()
-        for scan_dir in self._scan_dirs:
-            if not os.path.isdir(scan_dir):
-                continue
-            for name in sorted(os.listdir(scan_dir)):
-                path = os.path.join(scan_dir, name)
-                if not os.path.exists(path):
-                    continue
-                real_path = os.path.realpath(path)
-                if real_path in seen_real:
-                    continue
-                seen_real.add(real_path)
-                out[path] = DeviceInfo(by_id=path, real_path=real_path)
-        return out
+        return self._source.scan()
 
     def poll_once(self) -> None:
         current = self._scan()

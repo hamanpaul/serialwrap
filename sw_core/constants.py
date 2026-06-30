@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 
 
 def _env_path(name: str, default: str) -> str:
@@ -39,6 +40,19 @@ DATA_DIR = _env_path("SERIALWRAP_DATA_DIR", os.path.join(_DATA_HOME, "serialwrap
 
 LOCK_PATH = os.path.join(RUN_DIR, "serialwrapd.lock")
 SOCKET_PATH = os.path.join(RUN_DIR, "serialwrapd.sock")
+
+# 平台感知 RPC endpoint 預設（#84 PORT-4）
+# Windows：走 TCP loopback；POSIX：沿用 AF_UNIX SOCKET_PATH。
+# tcp:// URL 不可過 os.path.expanduser，故 Windows 分支直接組字串。
+DEFAULT_TCP_PORT: int = int(os.environ.get("SERIALWRAP_TCP_PORT", "48700"))
+if os.name == "nt" or sys.platform.startswith("win"):
+    DEFAULT_ENDPOINT: str = (
+        os.environ.get("SERIALWRAP_ENDPOINT")
+        or f"tcp://127.0.0.1:{DEFAULT_TCP_PORT}"
+    )
+else:
+    DEFAULT_ENDPOINT = os.environ.get("SERIALWRAP_ENDPOINT") or SOCKET_PATH
+
 TTYMCU_PATH = _env_path("SERIALWRAP_TTYMCU_PATH", os.path.join(RUN_DIR, "dev", "ttyMCU"))
 STATE_PATH = os.path.join(STATE_DIR, "state.json")
 WAL_DIR = _env_path("SERIALWRAP_WAL_DIR", os.path.join(STATE_DIR, "wal"))
