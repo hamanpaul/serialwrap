@@ -46,6 +46,8 @@ class TcpRpcServer:
         assert self._server is not None
         async with self._server:
             await self._server.serve_forever()
+        # async with 離開後 server 已關閉，置 None 避免 stop() 重複 close
+        self._server = None
 
     async def stop(self) -> None:
         if self._server is None:
