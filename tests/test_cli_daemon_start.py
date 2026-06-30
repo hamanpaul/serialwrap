@@ -71,6 +71,8 @@ targets:
         proc.poll.return_value = None
 
         with (
+            mock.patch("sw_core.cli.should_auto_spawn", return_value=True),
+            mock.patch("sw_core.cli._probe_healthy_daemon", return_value=False),
             mock.patch("sw_core.cli._resolve_daemon_start_env_files", return_value=["/tmp/OPI.env"]),
             mock.patch("sw_core.cli._load_daemon_start_env_files", return_value=({"SW_OPI_U": "haman"}, ["/tmp/OPI.env"])),
             mock.patch("sw_core.cli.subprocess.Popen", return_value=proc) as popen,
@@ -97,6 +99,8 @@ targets:
         )
 
         with (
+            mock.patch("sw_core.cli.should_auto_spawn", return_value=True),
+            mock.patch("sw_core.cli._probe_healthy_daemon", return_value=False),
             mock.patch("sw_core.cli._resolve_daemon_start_env_files", return_value=["/tmp/OPI.env"]),
             mock.patch("sw_core.cli._load_daemon_start_env_files", side_effect=cli.EnvFileSourceError("/tmp/OPI.env", "bad env")),
             mock.patch("sw_core.cli._print") as printer,
@@ -109,6 +113,59 @@ targets:
         self.assertEqual(payload["error_code"], "ENV_FILE_SOURCE_FAILED")
         self.assertEqual(payload["env_file"], "/tmp/OPI.env")
         self.assertEqual(payload["env_files"], ["/tmp/OPI.env"])
+
+
+class TestDaemonStartSupervision(unittest.TestCase):
+    """#108 #1：daemon start 監管模式 gate（systemd 重導 service start）+ on-demand 冪等。"""
+
+    def _args(self) -> argparse.Namespace:
+        return argparse.Namespace(
+            profile_dir="/tmp/profiles",
+            socket="/tmp/serialwrap.sock",
+            lock="/tmp/serialwrap.lock",
+            foreground=False,
+            with_sudo=False,
+        )
+
+    def test_systemd_mode_routes_to_service_start(self) -> None:
+        fake_rc = mock.Mock()
+        fake_rc.mode.return_value = "systemd-system"
+        with (
+            mock.patch("sw_core.cli._default_runtime_config", return_value=fake_rc),
+            mock.patch(
+                "sw_core.cli.service_action",
+                return_value={"ok": True, "mode": "systemd-system", "action": "start"},
+            ) as svc,
+            mock.patch("sw_core.cli.subprocess.Popen") as popen,
+            mock.patch("sw_core.cli._print") as printer,
+        ):
+            rc = cli._run_daemon_start(self._args())
+
+        self.assertEqual(rc, 0)
+        svc.assert_called_once()
+        self.assertEqual(svc.call_args.args[0], "start")
+        self.assertEqual(svc.call_args.kwargs.get("mode"), "systemd-system")
+        popen.assert_not_called()
+        payload = printer.call_args.args[0]
+        self.assertEqual(payload["_routed_to"], "service start")
+
+    def test_ondemand_idempotent_when_daemon_healthy(self) -> None:
+        fake_rc = mock.Mock()
+        fake_rc.mode.return_value = "on-demand"
+        with (
+            mock.patch("sw_core.cli._default_runtime_config", return_value=fake_rc),
+            mock.patch("sw_core.cli.rpc_call", return_value={"ok": True}),
+            mock.patch("sw_core.cli.subprocess.Popen") as popen,
+            mock.patch("sw_core.cli.time.sleep"),
+            mock.patch("sw_core.cli._print") as printer,
+        ):
+            rc = cli._run_daemon_start(self._args())
+
+        self.assertEqual(rc, 0)
+        popen.assert_not_called()
+        payload = printer.call_args.args[0]
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload.get("already_running"))
 
 
 if __name__ == "__main__":

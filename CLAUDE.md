@@ -117,7 +117,7 @@ serialwrap session attach --selector COM0
 serialwrap session self-test --selector COM0
 ```
 
-- 監管模式（`supervision_mode`）為單一事實來源（`~/.config/serialwrap/config.yaml`）。**systemd 模式下用 `serialwrap service ...` 管理生命週期；勿用 `serialwrap daemon start`**（它不會 route 到 systemd，會另起非託管 daemon 造成 two-reader）。`serialwrap daemon stop` 在 systemd 模式會自動 route 到 `service stop`。
+- 監管模式（`supervision_mode`）為單一事實來源（`~/.config/serialwrap/config.yaml`）。**systemd 模式下建議用 `serialwrap service ...` 管理生命週期**；`serialwrap daemon start` / `daemon stop` 在 systemd 模式皆會自動 route 到 `service start` / `service stop`（#108 #1，對稱；故 `minicom_router` 的 `AUTO_START_DAEMON=1` 在 systemd 模式不再另起非託管 daemon 造成 two-reader）。on-demand 模式 `daemon start` 為冪等（已有健康 daemon 時回 `already_running` no-op）。CLI 解析 endpoint 時若 `config.yaml` 的 `socket_path` 失聯，會依 `supervision_mode` fallback 到 canonical socket（#108 #2，唯讀、不改寫 config）。
 - daemon 多開（two-reader）可被動偵測（#101）：`serialwrap doctor` 的 `single_daemon` 檢查與 `serialwrap daemon status` 的 `multi_open`/`foreign_holders` 欄位會掃 `/proc` 報出同機其他 `serialwrapd` 與 tty 持有者（純偵測、不自動 refuse/kill）。`SingletonLock` 僅 per-`(lock_path, socket_path)` flock，擋不到不同 socket／監管模式的第二個 daemon，故需此偵測。
 - 既有測試框架同時涵蓋 `pytest` 與 `unittest`；CI（`.github/workflows/tests.yml`）與政策以 `pytest` 為準。
 

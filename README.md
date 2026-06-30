@@ -446,7 +446,7 @@ SW_OPI_U='haman'
 SW_OPI_P='your-password'
 EOF
 
-# systemd 模式用 service 重啟讓 daemon 重讀（勿用 `serialwrap daemon start`，它不 route 到 systemd）
+# systemd 模式用 service 重啟讓 daemon 重讀（`serialwrap daemon start` 在 systemd 模式已自動 route 到 `service start`，重啟仍用 `service restart` 最直接）
 serialwrap service restart
 ```
 
@@ -1249,7 +1249,7 @@ usage: serialwrap daemon [-h] <command> ...
 
 positional arguments:
   <command>
-    start     啟動 daemon（--foreground 可前景執行）
+    start     啟動 daemon（--foreground 可前景執行；systemd 模式重導 service start）
     stop      停止執行中的 daemon
     status    顯示 daemon 狀態（pid／sessions／devices／log 路徑／多開偵測 multi_open）
 
@@ -1314,8 +1314,9 @@ options:
 
 
 ```bash
-# 啟動 daemon（systemd 模式請改用 serialwrap service start；on-demand 模式才需手動啟動）
+# 啟動 daemon（on-demand 模式手動啟動；systemd 模式下此命令會自動 route 到 service start）
 # 經 serialwrap setup 後 profiles 已在 XDG 設定目錄，daemon 預設即可讀取，無需 --profile-dir
+# on-demand 模式重複執行為冪等：已有健康 daemon 時回 already_running、不另起行程
 serialwrap daemon start
 
 # 查看 session 列表
