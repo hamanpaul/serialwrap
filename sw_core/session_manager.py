@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shlex
+import sys
 import tempfile
 import threading
 import time
@@ -512,11 +513,14 @@ class SessionManager:
                 fp.flush()
                 os.fsync(fp.fileno())
             os.replace(tmp_path, STATE_PATH)
-            dir_fd = os.open(state_dir, os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
+            # 目錄 fsync：確保 state.json 的目錄 entry 持久化（POSIX 語意）。
+            # Windows（nt）：os.O_RDONLY 開目錄會拋 Permission Denied；NTFS 自行管理一致性，跳過即可（#84 PORT-4）。
+            if sys.platform != "win32":
+                dir_fd = os.open(state_dir, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
         finally:
             # os.replace 成功後 tmp 已不存在；中途失敗時清掉半寫 temp，且絕不動到原 state.json。
             try:

@@ -4,9 +4,17 @@
 支援家族清單改用 `serialwrap mcu patterns`，不經此 PTY（避免汙染 flasher）。
 """
 import os
+import sys
 import time
 import tempfile
+import pytest
 from sw_core.flash_endpoint import FlashEndpoint
+
+# FlashEndpoint PTY 功能為 POSIX-only（#84 PORT-4）；Windows 上 start() 為 no-op，測試直接跳過。
+pytestmark = pytest.mark.skipif(
+    sys.platform.startswith("win"),
+    reason="POSIX-only: PTY/symlink 功能在 Windows 不適用（#84 PORT-4）",
+)
 
 
 def test_creates_pty_and_symlink():

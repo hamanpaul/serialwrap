@@ -7,9 +7,11 @@ import threading
 import time
 from typing import Any
 
+import yaml
+
 from .arbiter import CommandArbiter
 from .config import ProfileTemplate, SessionProfile
-from .constants import DEVICE_BY_ID_DIR, DEVICE_BY_PATH_DIR, EVENTS_DIR, EVENTS_RUNTIME_DIR, EVENTS_LOG_PATH, TTYMCU_PATH
+from .constants import CONFIG_DIR, DEVICE_BY_ID_DIR, DEVICE_BY_PATH_DIR, EVENTS_DIR, EVENTS_RUNTIME_DIR, EVENTS_LOG_PATH, TTYMCU_PATH
 from .flash_endpoint import FlashEndpoint, detect_mcu_line, pump_endpoint_to_sink
 from .mcu_patterns import McuPatternRegistry
 from .multi_open import detect_multi_open
@@ -19,6 +21,24 @@ from .event_engine.line_buffer import LineBuffer
 from .session_manager import SessionManager
 from .util import now_iso
 from .wal import WalWriter
+
+def _load_exclude_coms() -> set[str]:
+    """從 config.yaml 的 windows.exclude_coms 讀取手動排除的 COM port 清單（#84 PORT-4）。
+
+    缺少設定或讀取失敗時回傳空集合。
+    """
+    try:
+        config_path = os.path.join(CONFIG_DIR, "config.yaml")
+        if not os.path.exists(config_path):
+            return set()
+        data: dict = yaml.safe_load(open(config_path, encoding="utf-8").read()) or {}
+        coms = data.get("windows", {}).get("exclude_coms", [])
+        if isinstance(coms, list):
+            return {str(c) for c in coms}
+    except Exception:  # noqa: BLE001
+        pass
+    return set()
+
 
 _HUMAN_INTERACTIVE_COMMANDS = {
     "alsamixer",
@@ -225,10 +245,19 @@ class SerialwrapService:
         ))
         self._engine_line_buffers: dict[str, LineBuffer] = {}
         self._engine_buffers_lock = threading.Lock()
+        # 依平台後端選擇器注入裝置來源（Windows: WindowsDeviceSource / POSIX: PosixDeviceSource）。
+        # 延遲 import 避免非該平台模組被提前載入（#84 PORT-4）。
+        from sw_core.platform_backends import select_device_backend  # noqa: PLC0415
+        if select_device_backend() == "win":
+            from sw_core.device_source import WindowsDeviceSource  # noqa: PLC0415
+            _source = WindowsDeviceSource(exclude_coms=_load_exclude_coms())
+        else:
+            _source = None  # 預設 PosixDeviceSource（由 DeviceWatcher 內部建立）
         self._watcher = DeviceWatcher(
             by_id_dir, self._on_device_change,
             extra_scan_dirs=[by_path_dir],
             on_tick=self._sessions.reconcile_readiness,
+            source=_source,
         )
         self._mcu_registry = McuPatternRegistry.load(None)
         # flash 雙向接線狀態（probe buffer、active com、master fd）
