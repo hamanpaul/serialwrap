@@ -851,7 +851,9 @@ Windows daemon 以 **TCP loopback** 取代 AF_UNIX 做 RPC 控制通道，使 se
 
 #### 建置 Windows 可執行檔（PyInstaller）
 
-`serialwrapd.exe` / `serialwrap.exe` 以 PyInstaller one-file 打包（`serialwrap.spec`）：
+`serialwrapd.exe` / `serialwrap.exe` 以 PyInstaller one-file 打包（`serialwrap.spec`）。
+
+正式 release（push `v*` tag）會由 `release.yml` 的 `publish-windows-exe` job 在 `windows-latest` 自動建置並把兩個 exe 附到該 tag 的 GitHub Release assets（與 wheel 並列），一般使用直接下載即可。需在本機自行建置時：
 
 ```powershell
 # 建置（自動安裝 PyInstaller，-Clean 旗標清除 build/ dist/ 後重建）
