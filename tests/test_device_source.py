@@ -25,3 +25,19 @@ def test_exclude_bluetooth_manual_override():
     serialcomm = {r"\Device\Serial2": "COM8"}
     kept = exclude_bluetooth(serialcomm, set(), {"COM8"})
     assert kept == {}
+
+
+def test_windows_device_source_scan(monkeypatch):
+    """WindowsDeviceSource.scan() 應過濾藍牙埠、保留非藍牙埠，並建立正確 DeviceInfo。"""
+    from sw_core import device_source as ds
+
+    monkeypatch.setattr(ds, "_read_serialcomm", lambda: {
+        r"\Device\BthModem0": "COM3",
+        r"\Device\Serial2": "COM8",
+    })
+    monkeypatch.setattr(ds, "_read_bt_ports", lambda: {"COM3"})
+    src = ds.WindowsDeviceSource()
+    devices = src.scan()
+    assert set(devices.keys()) == {"COM8"}
+    assert devices["COM8"].real_path == r"\\.\COM8"
+    assert devices["COM8"].by_id == "COM8"
