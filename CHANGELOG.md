@@ -20,6 +20,10 @@
 - **說明文件對齊現行設計（除 spec）**：`CLAUDE.md` 補上 `sw_core/serial_port.py`（#84 PORT-1 SerialPort 抽象）/`sw_core/multi_open.py`（#101）到架構模組清單、human console 的 Windows TCP socket 路徑（#84 PORT-2）、COM 編號 by-id 確定性 rank（#100）與 daemon 多開被動偵測（#101）兩條慣例。`README.md` 修正過時敘述：WAL/state 預設路徑改 XDG（`~/.local/state/serialwrap/`，舊 `/tmp/serialwrap/` 標為舊版）、human attach 命令 `~/.paul_tools/minicom COMx`→`serialwrap-minicom COMx`、OPI 範例 profile 目錄改 `~/.config/serialwrap/profiles` 並改用 `serialwrap service restart`。`docs/design-file-transfer.md`（含 #59 已退役的 MCP 段）與 `docs/design-heartbeat-keepalive.md` 補「歷史快照」banner 指向現行來源。serialwrap **skill**（`sw_core/assets/skill/SKILL.md`）修正 socat 範例 socket 路徑（`/tmp/serialwrap/serialwrapd.sock`→`/run/serialwrap/serialwrapd.sock` + 監管模式註記）並補 #101 多開（two-reader）診斷 FAQ；CLI `daemon status` **help** 字串補 `multi_open` 偵測。spec（`docs/serialwrap-spec.md`、`openspec/specs/*`）與歷史快照／release notes 不在本次範圍。
 - **policy R-16 cli-help 覆蓋擴大**：`.paul-project.yml` 的 `cli` 段新增 `daemon`／`session`／`device` 三個群組 help 宣告，並於 `README.md` 補對應 `cli-help` marker 區塊（pin `serialwrap <group> --help` 輸出）。新增子命令但未同步 README 群組 help 時 R-16 會 FAIL，補掉「子命令層漏記」的盲區（policy 引擎側的範圍/語意擴充另記於 paulsha-conventions#26）。
 
+### Added（Task 12）
+
+- **PyInstaller one-file 打包（#84 PORT-4，Task 12）**：新增 `serialwrap.spec`（PyInstaller 兩 EXE 單 spec，內嵌 `sw_core/assets`，hiddenimports 含 `winreg`/`msvcrt`/`serial`/`yaml`）與 `scripts/build_windows.ps1`（`-Clean` 旗標、自動安裝 PyInstaller、煙霧測試 `--help`）。`pyproject.toml` 的 `[project.optional-dependencies]` 新增 `dev = ["pyinstaller>=6"]`。`sw_core/daemon.py` 與 `sw_core/cli.py` 補 `if __name__ == "__main__": sys.exit(main())` 入口，使 `python -m PyInstaller` 可直接以模組路徑作為 entry。`dist/` 與 `build/` 已在 `.gitignore` 涵蓋，不入版控；實機建置驗收於 Task 14 進行。
+
 ## [0.2.1] - 2026-06-29
 
 ### Fixed

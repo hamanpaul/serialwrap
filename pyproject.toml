@@ -18,6 +18,8 @@ dependencies = [
 # 事件規則 regex 改用 google-re2 線性引擎，免疫 catastrophic backtracking（ReDoS，含 #91 多項式類）。
 # 未安裝時 matcher 自動退回標準 re + schema AST 拒絕 + 輸入封頂的既有防護。
 redos = ["google-re2"]
+# Windows one-file 打包工具（Task 12，#84 PORT-4）；僅開發/CI 建置時需要。
+dev = ["pyinstaller>=6"]
 
 [project.scripts]
 serialwrap = "sw_core.cli:main"
