@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Protocol
 
 from sw_core.device_watcher import DeviceInfo
@@ -131,18 +132,29 @@ class WindowsDeviceSource:
 
     掃描流程：
     1. ``_read_serialcomm()`` 取得所有 COM port 登錄條目。
-    2. ``_read_bt_ports()`` 取得 BTHENUM 下的藍牙 COM 集合。
+    2. ``_read_bt_ports()`` 取得 BTHENUM 下的藍牙 COM 集合（TTL 快取，預設 5 秒）。
     3. ``exclude_bluetooth()`` 剔除藍牙埠與 ``_exclude_coms`` 手動排除清單。
     4. 回傳 ``{COMname: DeviceInfo(by_id=COMname, real_path=r"\\\\.\\\\ COMname")}``。
+
+    注意：scan() 由 DeviceWatcher 單一 poll thread 呼叫，_bt_cache 無需鎖。
     """
+
+    _BT_TTL: float = 5.0  # BTHENUM 掃描快取秒數（藍牙集合短時間內穩定）
 
     def __init__(self, exclude_coms: set[str] | None = None) -> None:
         self._exclude_coms: set[str] = exclude_coms or set()
+        self._bt_cache: tuple[float, set[str]] | None = None
 
     def scan(self) -> dict[str, DeviceInfo]:
-        """掃描 Windows COM port，剔除藍牙埠後回傳可用裝置字典。"""
+        """掃描 Windows COM port，剔除藍牙埠後回傳可用裝置字典。
+
+        BTHENUM registry 走訪代價較高，以 TTL 快取（_BT_TTL 秒）減少每輪重掃。
+        """
         serialcomm = _read_serialcomm()
-        bt_ports = _read_bt_ports()
+        now = time.monotonic()
+        if self._bt_cache is None or now - self._bt_cache[0] >= self._BT_TTL:
+            self._bt_cache = (now, _read_bt_ports())
+        bt_ports = self._bt_cache[1]
         kept = exclude_bluetooth(serialcomm, bt_ports, self._exclude_coms)
         return {
             com: DeviceInfo(by_id=com, real_path=rf"\\.\{com}")

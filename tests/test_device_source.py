@@ -43,6 +43,33 @@ def test_windows_device_source_scan(monkeypatch):
     assert devices["COM8"].by_id == "COM8"
 
 
+def test_windows_device_source_bt_cache(monkeypatch):
+    """TTL 快取：第二次 scan 在 TTL 內不重呼叫 _read_bt_ports（Copilot review fix）。"""
+    from sw_core import device_source as ds
+
+    monkeypatch.setattr(ds, "_read_serialcomm", lambda: {r"\Device\Serial2": "COM8"})
+    call_count = 0
+
+    def counting_read_bt_ports():
+        nonlocal call_count
+        call_count += 1
+        return set()
+
+    monkeypatch.setattr(ds, "_read_bt_ports", counting_read_bt_ports)
+    src = ds.WindowsDeviceSource()
+
+    src.scan()  # 首次：應呼叫 _read_bt_ports
+    assert call_count == 1
+
+    src.scan()  # TTL 內：不應重呼叫
+    assert call_count == 1, "TTL 內第二次 scan 不應重呼叫 _read_bt_ports"
+
+    # 模擬 TTL 過期（強制讓快取失效）
+    src._bt_cache = (src._bt_cache[0] - ds.WindowsDeviceSource._BT_TTL - 1.0, set())
+    src.scan()  # TTL 逾期：應重呼叫
+    assert call_count == 2, "TTL 逾期後應重呼叫 _read_bt_ports"
+
+
 def test_windows_device_source_exclude_coms(monkeypatch):
     """WindowsDeviceSource(exclude_coms={"COM8"}) 應把 _exclude_coms 傳進 exclude_bluetooth，
     使 scan() 結果不含 COM8（驗證 exclude_coms 確實生效）。"""

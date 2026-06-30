@@ -26,10 +26,12 @@ def _select(env_name: str, backend: str | None) -> str:
         return "posix"
     if mode in ("win", "windows", "win32"):
         return "win"
-    # auto：Windows 走 win，其餘維持 posix（生產路徑零回歸）。
-    if os.name == "nt" or sys.platform.startswith("win"):
-        return "win"
-    return "posix"
+    if mode == "auto":
+        # auto：Windows 走 win，其餘維持 posix（生產路徑零回歸）。
+        if os.name == "nt" or sys.platform.startswith("win"):
+            return "win"
+        return "posix"
+    raise ValueError(f"unsupported backend: {mode!r}")
 
 
 def select_rpc_backend(backend: str | None = None) -> str:

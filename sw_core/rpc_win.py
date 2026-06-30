@@ -57,9 +57,22 @@ class TcpRpcServer:
         self._server = None
 
 
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
 def _parse_tcp(endpoint: str) -> tuple[str, int]:
-    """解析 tcp://host:port 格式的 endpoint，回傳 (host, port)。"""
+    """解析 tcp://host:port 格式的 endpoint，回傳 (host, port)。
+
+    僅允許 loopback 位址（127.0.0.1/localhost/::1）作為 server bind host，
+    拒絕任何非 loopback host（如 0.0.0.0 或 LAN IP），避免 RPC 對外暴露。
+    """
     parsed = urlsplit(endpoint)
     if parsed.scheme != "tcp" or not parsed.hostname or parsed.port is None:
         raise ValueError(f"invalid tcp endpoint: {endpoint!r}")
-    return parsed.hostname, parsed.port
+    host = parsed.hostname
+    if host not in _LOOPBACK_HOSTS:
+        raise ValueError(
+            f"RPC server 僅允許 loopback 位址（127.0.0.1/localhost/::1），"
+            f"拒絕 {host!r} 避免遠端暴露（RPC 無認證，非 loopback 會讓遠端呼叫所有命令）"
+        )
+    return host, parsed.port

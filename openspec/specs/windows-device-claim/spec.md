@@ -34,7 +34,7 @@ Windows daemon SHALL 自動接管所有可獨佔開啟（閒置）的非藍牙 C
 
 #### Scenario: 被佔用埠跳過後重試
 - **WHEN** COM8 當下被外部程式獨佔開啟
-- **THEN** daemon 本輪跳過 COM8，下一輪輪詢偵測到閒置後再接管
+- **THEN** daemon 本輪跳過 COM8；其釋放後需裝置重新出現（拔插/added）或手動 `attach`/`clear` 才會再接管（持續存在的忙碌埠不會自動輪詢重試，與 POSIX dynamic-session 同語意）
 
 #### Scenario: profile 綁定覆寫預設
 - **WHEN** profiles 將 COM8 綁到某非 passthrough template

@@ -3,8 +3,34 @@ from __future__ import annotations
 import asyncio
 import threading
 
-from sw_core.rpc_win import TcpRpcServer
+import pytest
+
+from sw_core.rpc_win import TcpRpcServer, _parse_tcp
 from sw_core.client import rpc_call
+
+
+@pytest.mark.parametrize("endpoint", [
+    "tcp://0.0.0.0:48700",
+    "tcp://192.168.1.100:48700",
+    "tcp://10.0.0.1:48700",
+    "tcp://[::]:48700",  # all-interfaces IPv6（正確方括號格式，非 loopback）
+])
+def test_non_loopback_host_rejected(endpoint):
+    """非 loopback host 應被 _parse_tcp 拒絕，避免 RPC server 對外暴露（Copilot review fix）。"""
+    with pytest.raises(ValueError, match="loopback"):
+        _parse_tcp(endpoint)
+
+
+@pytest.mark.parametrize("endpoint,expected_host", [
+    ("tcp://127.0.0.1:48700", "127.0.0.1"),
+    ("tcp://localhost:48700", "localhost"),
+    ("tcp://[::1]:48700", "::1"),  # IPv6 loopback 需方括號格式
+])
+def test_loopback_host_accepted(endpoint, expected_host):
+    """loopback host 應被 _parse_tcp 接受。"""
+    host, port = _parse_tcp(endpoint)
+    assert host == expected_host
+    assert port == 48700
 
 
 def test_tcp_rpc_round_trip():

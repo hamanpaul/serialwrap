@@ -20,3 +20,9 @@ def test_auto_follows_platform(monkeypatch):
 def test_env_override(monkeypatch):
     monkeypatch.setenv("SERIALWRAP_RPC_BACKEND", "win")
     assert pb.select_rpc_backend() == "win"
+
+def test_unknown_backend_raises():
+    """未知後端值應 raise ValueError，不靜默退化（Copilot review fix）。"""
+    import pytest
+    with pytest.raises(ValueError, match="unsupported backend"):
+        pb.select_rpc_backend("bogus")
