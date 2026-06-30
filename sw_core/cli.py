@@ -3,13 +3,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
 from collections.abc import Sequence
 from typing import Any
 
-from .client import rpc_call
+from .client import _parse_endpoint, rpc_call
 from .constants import CONFIG_DIR, LOCK_PATH, PROFILE_DIR, SOCKET_PATH
 from .doctor_cmd import run_doctor
 from .runtime_config import RuntimeConfig
@@ -111,6 +112,14 @@ def should_auto_spawn(rc: RuntimeConfig | None = None) -> bool:
     return (rc.mode() or "on-demand") == "on-demand"
 
 
+def _safe_runtime_config() -> RuntimeConfig | None:
+    """讀取 config.yaml；損壞/不可讀（如壞 YAML）時回 None，避免 CLI traceback（#108）。"""
+    try:
+        return _default_runtime_config()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _resolve_daemon_start_env_files(profile_dir: str) -> list[str]:
     """解析 daemon 啟動時要載入的 runtime env 檔。
 
@@ -132,10 +141,36 @@ def _resolve_daemon_start_env_files(profile_dir: str) -> list[str]:
     return env_files
 
 
+def _probe_healthy_daemon(endpoint: str) -> bool:
+    """對 endpoint 做 health.ping 存活探測；連得上且 ok 視為已有健康 daemon。"""
+    try:
+        resp = rpc_call(endpoint, "health.ping", {}, timeout_s=0.5)
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(resp.get("ok"))
+
+
 def _run_daemon_start(args: argparse.Namespace) -> int:
     if getattr(args, "endpoint", None):
         _print({"ok": False, "error_code": "REMOTE_NOT_SUPPORTED", "message": "--endpoint 不支援 daemon start（daemon 只能在本機啟動）"})
         return 2
+    # 監管模式 gate（#108 #1）：systemd 模式下重導到 `service start`，避免顯式 daemon
+    # start 繞過 unit 管理另起非託管 daemon（對稱於 `daemon stop` → `service stop`）。
+    # config 不可讀（rc is None）時退化為 on-demand spawn 路徑，不 traceback。
+    rc = _safe_runtime_config()
+    if rc is not None and not should_auto_spawn(rc):  # systemd-user / systemd-system
+        mode = rc.mode() or "on-demand"
+        resp = service_action("start", mode=mode, with_sudo=getattr(args, "with_sudo", False))
+        resp["_routed_to"] = "service start"
+        _print(resp)
+        return 0 if resp.get("ok") else 2
+    # on-demand：spawn 前先對「使用者實際會連到的 endpoint」冪等探測，已有健康 daemon 則
+    # no-op（#108 #1）。用 _resolve_endpoint 而非裸 args.socket，避免 config 記錄的 daemon
+    # 在非預設 socket 時 probe miss 又 spawn 出第二個（two-reader）。
+    endpoint = _resolve_endpoint(args)
+    if _probe_healthy_daemon(endpoint):
+        _print({"ok": True, "already_running": True, "socket": endpoint})
+        return 0
     cmd = [
         sys.executable,
         _daemon_script_path(),
@@ -189,7 +224,10 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
 
 
 def _run_daemon_stop(args: argparse.Namespace) -> int:
-    mode = _default_runtime_config().mode() or "on-demand"
+    # 用 _safe_runtime_config 避免 config.yaml 壞 YAML 時 traceback；讀不到退化 on-demand
+    # 路徑（與 daemon start / _resolve_endpoint 的容錯一致，#108 PR #112 review）。
+    rc = _safe_runtime_config()
+    mode = (rc.mode() if rc is not None else None) or "on-demand"
     if mode.startswith("systemd"):
         # systemd 模式：將 daemon stop 重導到 service stop，避免繞開 unit 管理
         with_sudo = getattr(args, "with_sudo", False)
@@ -206,23 +244,71 @@ def _run_daemon_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def _endpoint_alive(ep: str) -> bool:
+    """對 unix socket endpoint 做 0.2s connect 探測（#108 #2）。
+
+    以 ``client._parse_endpoint`` 判斷 transport（涵蓋裸路徑與 ``unix:///path``）：
+    非 unix endpoint（``tcp://...``）或無法解析者一律視為可連、跳過探測，
+    使 dangling fallback 僅作用於 POSIX unix socket。
+    """
+    if not ep:
+        return True
+    try:
+        transport, address = _parse_endpoint(ep)
+    except ValueError:
+        return True
+    if transport != "unix":
+        return True
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(0.2)
+    try:
+        sock.connect(address)
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
 def _resolve_endpoint(args: argparse.Namespace) -> str:
     """回傳實際連接 endpoint。
 
     優先序：``--endpoint`` > 明確指定的 ``--socket``（非預設）> config.yaml 記錄的有效 socket
     > 預設 ``SOCKET_PATH``。讀 config 是為了讓 systemd-system 裝完後 CLI 連到系統 daemon 的
     socket（``/run/serialwrap/...``）而非使用者 XDG socket（Codex #1a）。
+
+    dangling fallback（#108 #2）：當選用的 config socket 為不可連的 unix socket 時，
+    依 ``supervision_mode`` 推 canonical endpoint（``systemd-system`` → ``SYSTEM_SOCKET``、
+    其餘 → ``SOCKET_PATH``）並改連之；canonical 不可連或同值則回原值讓既有錯誤照常浮現。
+    CLI 對 config.yaml 維持唯讀，不 self-heal 改寫。明確 ``--endpoint``/``--socket`` 不受影響。
     """
     ep = getattr(args, "endpoint", None)
     if ep:
         return ep
     if args.socket and args.socket != SOCKET_PATH:
         return args.socket
-    try:
-        cfg_sock = _default_runtime_config().socket_path()
-    except Exception:
-        cfg_sock = None
-    return cfg_sock or args.socket
+    rc = _safe_runtime_config()
+    cfg_sock = None
+    if rc is not None:
+        try:
+            cfg_sock = rc.socket_path()
+        except Exception:
+            cfg_sock = None
+    chosen = cfg_sock or args.socket
+    if cfg_sock and chosen == cfg_sock and not _endpoint_alive(cfg_sock):
+        try:
+            mode = (rc.mode() if rc is not None else None) or "on-demand"
+        except Exception:
+            mode = "on-demand"
+        canonical = SYSTEM_SOCKET if mode == "systemd-system" else SOCKET_PATH
+        if canonical != cfg_sock and _endpoint_alive(canonical):
+            sys.stderr.write(
+                f"serialwrap: config.yaml socket_path '{cfg_sock}' 不可連，"
+                f"依 supervision_mode={mode} 改用 '{canonical}'；"
+                f"如需修正請更新 config.yaml 或重跑 serialwrap setup。\n"
+            )
+            return canonical
+    return chosen
 
 
 def _run_rpc(args: argparse.Namespace, method: str, params: dict[str, Any]) -> int:
@@ -428,10 +514,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     daemon_sub = p_daemon.add_subparsers(dest="daemon_cmd", required=True, metavar="<command>")
 
-    p_ds = daemon_sub.add_parser("start", help="啟動 daemon（--foreground 可前景執行）")
+    p_ds = daemon_sub.add_parser("start", help="啟動 daemon（--foreground 可前景執行；systemd 模式重導 service start）")
     p_ds.add_argument("--profile-dir", default=PROFILE_DIR)
     p_ds.add_argument("--lock", default=LOCK_PATH)
     p_ds.add_argument("--foreground", action="store_true")
+    p_ds.add_argument(
+        "--with-sudo",
+        dest="with_sudo",
+        action="store_true",
+        default=False,
+        help="systemd-system 模式下，daemon start 重導至 service start 時以 sudo 執行",
+    )
 
     p_dstop = daemon_sub.add_parser("stop", help="停止執行中的 daemon")
     p_dstop.add_argument(

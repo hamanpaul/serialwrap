@@ -10,7 +10,10 @@ class RuntimeConfig:
         self._path = Path(path)
         self._data: dict = {}
         if self._path.exists():
-            self._data = yaml.safe_load(self._path.read_text(encoding="utf-8")) or {}
+            # 非 dict 內容（合法 YAML 但為純量/list）強制視為空，避免 mode()/socket_path()
+            # 對非 dict 呼叫 .get() 而 traceback（#108 對抗審查殘留路徑）。
+            loaded = yaml.safe_load(self._path.read_text(encoding="utf-8"))
+            self._data = loaded if isinstance(loaded, dict) else {}
 
     def mode(self) -> str | None:
         return self._data.get("supervision_mode")

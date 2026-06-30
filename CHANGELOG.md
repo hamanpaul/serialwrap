@@ -6,6 +6,11 @@
 
 ### Fixed
 
+- **daemon start/connect 韌性強化（#108 #1/#2 hardening）**：#108 頭號根因（POSIX daemon 啟動改寫 `config.yaml`）已由 #84 PORT-4 POSIX guard（PR #109）修掉；本變更補其殘留兩項：
+  - **#1：`serialwrap daemon start` 納入監管模式 gate（`sw_core/cli.py` `_run_daemon_start`）**——systemd 模式下重導到 `service start`（回應含 `_routed_to:"service start"`，對稱於既有 `daemon stop`→`service stop`），不再顯式 spawn 非託管 daemon；故 `minicom_router` 的 `AUTO_START_DAEMON=1` 在 systemd 模式不再生 coexist daemon。on-demand 模式 spawn 前以 `health.ping` 冪等探測（`_probe_healthy_daemon`），已有健康 daemon 時回 `{ok:true, already_running:true}` no-op。`daemon start` subparser 補 `--with-sudo`；`should_auto_spawn()` 由 dead code 接回使用。
+  - **#2：`_resolve_endpoint` 對 dangling socket 依 `supervision_mode` fallback**——當 `config.yaml` 的 `socket_path` 為不可連的 unix socket 時，依 `supervision_mode` 推 canonical endpoint（`systemd-system`→`SYSTEM_SOCKET`；其餘→`SOCKET_PATH`）並改連之（stderr 提示），canonical 不可連或同值則回原值讓既有錯誤照常浮現；新增 `_endpoint_alive()` helper（unix connect probe，非 unix endpoint 跳過）。CLI 對 `config.yaml` 維持唯讀、不 self-heal 改寫。明確 `--endpoint`/`--socket` 不受 fallback 影響。
+  - **不實作（結案說明）**：`/tmp/sw-coexist-*` GC 與 dead-pid lock GC——前者為測試（`tests/test_human_agent_coexist.py`）tempdir、非 production 產生；後者已被 `SingletonLock`（flock 持有者死亡由 kernel 自動釋放 + stale socket `unlink` 回收）容忍。
+  - 新增 `tests/test_cli_daemon_start.py::TestDaemonStartSupervision`、`tests/test_resolve_endpoint_fallback.py`（TDD RED→GREEN）；實機驗證（systemd-system，COM0/COM1）：`daemon start` 無 `--with-sudo` 回 `NEEDS_SUDO`+`_routed_to` 不 spawn、`--with-sudo` 走 `service start` idempotent、config.yaml 不被改寫、doctor 單一 daemon；config socket 改死路徑後 `session list` 仍依 fallback 連上系統 daemon（COM0/COM1 READY）並印提示。
 - **PyInstaller exe CLI entry 修正（#84 PORT-4 follow-up）**：`serialwrap.exe` 實機建置後 `--help` 因 `sw_core/cli.py` 為 package-relative import、被 PyInstaller 當 `__main__` 直接執行而 `ImportError: attempted relative import with no known parent package`。新增 root `serialwrap.py` 薄 shim（絕對 import `from sw_core.cli import main`，鏡像既有 `serialwrapd.py`），`serialwrap.spec` 兩個 Analysis entry 改指向 root shim（`serialwrapd.py` / `serialwrap.py`）。實機建置驗證：`serialwrap.exe` / `serialwrapd.exe` `--help` 均 exit 0。
 - **Copilot PR #109 review 四項修正（#84 PORT-4 follow-up）**：
   - `platform_backends._select()`：未知後端值（非 auto/posix 別名/win 別名）改 raise `ValueError`，不再靜默退化為 auto。
