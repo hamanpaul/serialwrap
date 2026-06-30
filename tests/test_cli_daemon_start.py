@@ -167,6 +167,58 @@ class TestDaemonStartSupervision(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertTrue(payload.get("already_running"))
 
+    def test_ondemand_idempotent_probes_config_endpoint_not_default_socket(self) -> None:
+        """config 記錄健康 daemon 在非預設 socket 時，daemon start 應 probe 該 endpoint
+        並 no-op，而非 probe 裸 args.socket（預設）miss 後 spawn 第二個（Codex Important #2）。"""
+        args = argparse.Namespace(
+            profile_dir="/tmp/profiles",
+            socket=cli.SOCKET_PATH,  # 未顯式覆寫 → 應解析到 config 的 socket
+            lock="/tmp/serialwrap.lock",
+            foreground=False,
+            with_sudo=False,
+            endpoint=None,
+        )
+        fake_rc = mock.Mock()
+        fake_rc.mode.return_value = "on-demand"
+        fake_rc.socket_path.return_value = "/tmp/cfg-live-108.sock"
+        with (
+            mock.patch("sw_core.cli._default_runtime_config", return_value=fake_rc),
+            mock.patch("sw_core.cli._endpoint_alive", return_value=True),
+            mock.patch("sw_core.cli._probe_healthy_daemon", return_value=True) as probe,
+            mock.patch("sw_core.cli.subprocess.Popen") as popen,
+            mock.patch("sw_core.cli._print") as printer,
+        ):
+            rc = cli._run_daemon_start(args)
+
+        self.assertEqual(rc, 0)
+        popen.assert_not_called()
+        probe.assert_called_once_with("/tmp/cfg-live-108.sock")
+        payload = printer.call_args.args[0]
+        self.assertTrue(payload.get("already_running"))
+        self.assertEqual(payload["socket"], "/tmp/cfg-live-108.sock")
+
+    def test_unreadable_config_does_not_traceback(self) -> None:
+        """config.yaml 損壞 → daemon start 退化為 on-demand 路徑、不 traceback（Codex Important #1）。"""
+        args = argparse.Namespace(
+            profile_dir="/tmp/profiles",
+            socket="/tmp/serialwrap.sock",
+            lock="/tmp/serialwrap.lock",
+            foreground=False,
+            with_sudo=False,
+            endpoint=None,
+        )
+        with (
+            mock.patch("sw_core.cli._default_runtime_config", side_effect=ValueError("bad yaml")),
+            mock.patch("sw_core.cli._probe_healthy_daemon", return_value=True),
+            mock.patch("sw_core.cli.subprocess.Popen") as popen,
+            mock.patch("sw_core.cli._print") as printer,
+        ):
+            rc = cli._run_daemon_start(args)
+
+        self.assertEqual(rc, 0)
+        popen.assert_not_called()
+        self.assertTrue(printer.call_args.args[0].get("already_running"))
+
 
 if __name__ == "__main__":
     unittest.main()

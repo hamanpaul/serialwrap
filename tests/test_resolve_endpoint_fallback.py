@@ -66,6 +66,42 @@ class TestResolveEndpointFallback(unittest.TestCase):
             )
             alive.assert_not_called()
 
+    def test_unreadable_config_does_not_raise(self) -> None:
+        """config.yaml 損壞/不可讀（建構丟例外）→ 不 traceback，回 args.socket（Codex Important #1）。"""
+        with mock.patch(
+            "sw_core.cli._default_runtime_config", side_effect=ValueError("bad yaml")
+        ):
+            self.assertEqual(cli._resolve_endpoint(self._args()), cli.SOCKET_PATH)
+
+    def test_unix_scheme_dead_socket_triggers_fallback(self) -> None:
+        """config socket_path 為 unix:// scheme 且死 → 仍正確觸發 fallback（Codex Minor #1）。"""
+        fake_rc = mock.Mock()
+        fake_rc.socket_path.return_value = "unix:///tmp/dead-108.sock"
+        fake_rc.mode.return_value = "systemd-system"
+        with (
+            mock.patch("sw_core.cli._default_runtime_config", return_value=fake_rc),
+            mock.patch(
+                "sw_core.cli._endpoint_alive",
+                side_effect=lambda ep: ep == cli.SYSTEM_SOCKET,
+            ),
+            mock.patch("sw_core.cli.sys.stderr"),
+        ):
+            self.assertEqual(cli._resolve_endpoint(self._args()), cli.SYSTEM_SOCKET)
+
+
+class TestEndpointAlive(unittest.TestCase):
+    def test_tcp_endpoint_skipped_as_alive(self) -> None:
+        self.assertTrue(cli._endpoint_alive("tcp://127.0.0.1:65000"))
+
+    def test_unparseable_endpoint_skipped_as_alive(self) -> None:
+        self.assertTrue(cli._endpoint_alive("tcp://"))  # 無 host/port → ValueError → skip
+
+    def test_dead_plain_unix_path_is_not_alive(self) -> None:
+        self.assertFalse(cli._endpoint_alive("/tmp/serialwrap-nonexistent-108.sock"))
+
+    def test_dead_unix_scheme_is_not_alive(self) -> None:
+        self.assertFalse(cli._endpoint_alive("unix:///tmp/serialwrap-nonexistent-108.sock"))
+
 
 if __name__ == "__main__":
     unittest.main()

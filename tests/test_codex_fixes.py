@@ -20,6 +20,8 @@ def test_resolve_endpoint_uses_config_socket_when_socket_not_overridden(tmp_path
     importlib.reload(cli)
     from sw_core.runtime_config import RuntimeConfig
     RuntimeConfig(tmp_path / "config.yaml").set_mode("systemd-system", socket_path="/run/serialwrap/serialwrapd.sock")
+    # hermetic：避免 #108 dangling-fallback 對 host 上真實 socket 做 connect 探測（M4）
+    monkeypatch.setattr(cli, "_endpoint_alive", lambda ep: True)
     args = argparse.Namespace(endpoint=None, socket=c.SOCKET_PATH)  # 未覆寫 --socket
     assert cli._resolve_endpoint(args) == "/run/serialwrap/serialwrapd.sock"
     # 明確 --socket 仍優先
