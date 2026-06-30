@@ -171,8 +171,11 @@ async def _run_async(args: argparse.Namespace) -> int:
     try:
         service.start()
         await server.start()
-        # server 啟動成功後寫入有效 endpoint，使 CLI _resolve_endpoint 連得上（#84 PORT-4）。
-        _write_config_endpoint(args.socket)
+        # Windows：server 啟動後寫入有效 tcp endpoint，CLI _resolve_endpoint 靠此發現 daemon（#84 PORT-4）。
+        # POSIX 不需要：systemd setup 已寫 config，on-demand 模式 CLI 直接 fallback 到 SOCKET_PATH 預設值。
+        from sw_core.platform_backends import select_rpc_backend  # noqa: PLC0415
+        if select_rpc_backend() == "win":
+            _write_config_endpoint(args.socket)
         await stop_event.wait()
     finally:
         await server.stop()

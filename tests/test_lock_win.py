@@ -25,3 +25,19 @@ def test_stale_endpoint_acquires(tmp_path, monkeypatch):
         assert os.path.exists(str(tmp_path / "d.lock"))
     finally:
         lk.release()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("win"), reason="msvcrt 檔鎖互斥僅 Windows")
+def test_two_locks_same_path_second_raises(tmp_path, monkeypatch):
+    """同一 lock_path 的兩個 WindowsSingletonLock，第一個 acquire 成功後，
+    第二個 acquire 應因 msvcrt 鎖互斥而 raise DAEMON_ALREADY_RUNNING。"""
+    monkeypatch.setattr(lock_win, "_endpoint_alive", lambda ep: False)
+    lock_path = str(tmp_path / "mutex.lock")
+    lk1 = lock_win.WindowsSingletonLock(lock_path, "tcp://127.0.0.1:48797")
+    lk2 = lock_win.WindowsSingletonLock(lock_path, "tcp://127.0.0.1:48797")
+    lk1.acquire()
+    try:
+        with pytest.raises(RuntimeError, match="DAEMON_ALREADY_RUNNING"):
+            lk2.acquire()
+    finally:
+        lk1.release()

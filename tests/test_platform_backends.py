@@ -1,5 +1,4 @@
 from __future__ import annotations
-import importlib
 
 from sw_core import platform_backends as pb
 

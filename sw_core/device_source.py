@@ -4,7 +4,7 @@
 - ``DeviceSource``：Protocol，定義 ``scan() -> dict[str, DeviceInfo]`` 介面。
 - ``PosixDeviceSource``：搬自 ``DeviceWatcher._scan``，掃描 /dev/serial/by-id（+by-path），
   行為與原實作等價（seen_real 去重、by-id 優先）。
-- ``WindowsDeviceSource``：Task 7 補完列舉細節（佔位宣告）。
+- ``WindowsDeviceSource``：Windows 原生 COM 列舉（SERIALCOMM 登錄表）＋雙重藍牙排除（BTHENUM PortName + bthmodem 啟發式兜底）＋手動排除清單（#84 PORT-4）。
 - ``exclude_bluetooth``：pure function，從 SERIALCOMM 登錄表列舉剔除藍牙埠與手動排除。
 """
 from __future__ import annotations
