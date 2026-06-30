@@ -2024,7 +2024,7 @@ class SessionManager:
             # 動態路徑開埠失敗跳過（#84 PORT-4 閒置 COM 接管/被佔用跳過）：
             # bridge.start() 拋出例外（埠被佔、PermissionError 等）時，
             # 已建立的動態 session 退回 DETACHED，不污染 RELEASED，
-            # 下次可透過手動 attach_device / clear_session 觸發重試。
+            # 下次可透過手動 attach_device / clear_session 或裝置重新出現（added）觸發重試。
             try:
                 bridge.stop()
             except Exception:

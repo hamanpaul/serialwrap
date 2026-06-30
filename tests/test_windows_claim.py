@@ -33,7 +33,6 @@ def test_bluetooth_never_opened(monkeypatch):
 
     COM8（\\Device\\Serial2）不是藍牙，應保留在掃描結果中。
     """
-    opened = []  # noqa: F841  （保留供未來追蹤開埠呼叫，當前測試不使用）
     monkeypatch.setattr(ds, "_read_serialcomm", lambda: {
         r"\Device\BthModem0": "COM3", r"\Device\Serial2": "COM8",
     })
@@ -111,3 +110,4 @@ def test_busy_port_retries_not_ready(tmp_state, monkeypatch):
     )
     assert session.state != "RELEASED", "開埠失敗不得污染 RELEASED 狀態"
     assert session.bridge is None, "開埠失敗後 bridge 應為 None"
+    assert "COM8" not in mgr._attach_inflight  # 開埠失敗後 inflight 已清除，下次可重試
