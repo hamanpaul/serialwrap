@@ -589,6 +589,8 @@ background mode 的 `command.result_tail` 在 capture 尚未建立時，會回�
 - `log.tail_text`
 - `wal.range`
 
+> **`session.attach` 回傳契約（#94）**：對 command-capable session，未進入 `READY` 的 bridge-present 狀態一律回 `ok:false` + 頂層 `error_code`（開機窗／probe 未成功→`PROMPT_UNAVAILABLE`／`session.last_error`；`FLASHING`→`FLASHING_BUSY`；`RECOVERING`→`SESSION_RECOVERING`；`human:*` interactive lease 佔用而不 probe→`last_error`；其餘→`NOT_READY`），CLI exit code = `2` 並在 stderr 印一行具體錯誤。**回 `ok:true` 的情形**：達 `READY`（可下命令；human lease 下與人交錯）、`ATTACHING`（fresh attach 進行中／async accept）、`RELEASED`（裝置已 release／`released_by_id`，回 `released:true` + `recommended_action=device_attach`，屬保護性 no-op、不建立 bridge，需 `device attach` 重取）、`platform=passthrough`（非 command-capable、`ready_probe` 空、停 `ATTACHED` 即成功）。此為「誠實回報未達 READY、可重試（daemon 有界自動重探）、非致命」契約，供上層 driver 據以 retry/wait。
+
 ## 12. `minicom_router.sh` 行為
 
 1. 確認 daemon 存活，必要時自動啟動
