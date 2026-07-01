@@ -314,6 +314,11 @@ def _resolve_endpoint(args: argparse.Namespace) -> str:
 def _run_rpc(args: argparse.Namespace, method: str, params: dict[str, Any]) -> int:
     resp = rpc_call(_resolve_endpoint(args), method, params, timeout_s=args.timeout_s)
     _print(resp)
+    if not resp.get("ok"):
+        # #94：失敗時除了 stdout 的機器可解析 JSON，另在 stderr 印一行具體 error，
+        # 讓依 Unix 慣例讀 stderr 解釋非零 exit 的 consumer 不再拿到空字串。
+        err = resp.get("error_code") or resp.get("message") or "UNKNOWN_ERROR"
+        sys.stderr.write(f"serialwrap: {method} failed: {err}\n")
     return 0 if resp.get("ok") else 2
 
 

@@ -1409,6 +1409,21 @@ class SessionManager:
             self._save_state()
         return {"ok": True, "device_key": device_key}
 
+    def _attach_state_result(self, session: SessionRuntime, snap: dict[str, Any]) -> dict[str, Any]:
+        """#94：依 attach 契約把 session 快照轉成回傳 dict。command-capable 卡在非 READY/ATTACHING
+        的態回 ok:False + 狀態專用 error_code（FLASHING→FLASHING_BUSY、RECOVERING→SESSION_RECOVERING、
+        其餘→last_error/NOT_READY）；READY / ATTACHING（attach 進行中）與 passthrough（非
+        command-capable）回 ok:True。統一 human-lease / bridge-present else / 同步 probe 三處邏輯，
+        避免各分支 error_code 映射分歧（codex 對抗審查第三輪補洞）。"""
+        state = snap.get("state")
+        if session.profile.command_capable and state not in ("READY", "ATTACHING"):
+            code = {
+                "FLASHING": "FLASHING_BUSY",
+                "RECOVERING": "SESSION_RECOVERING",
+            }.get(state) or snap.get("last_error") or "NOT_READY"
+            return {"ok": False, "error_code": code, "session": snap}
+        return {"ok": True, "session": snap}
+
     def attach_session(self, selector: str) -> dict[str, Any]:
         bridge: UARTBridge | None = None
         should_probe = False
@@ -1433,12 +1448,16 @@ class SessionManager:
             if session.bridge is not None:
                 lease, post = self._refresh_interactive_locked(session)
                 if lease is not None and lease.owner.startswith("human:"):
-                    result = {"ok": True, "session": session.to_public_dict()}
+                    # #94：有 human lease 時不 probe（免干擾人類），但仍依 attach 契約誠實回報狀態
+                    # （command-capable 未達 READY → ok:False + 狀態專用 error_code）。
+                    result = self._attach_state_result(session, session.to_public_dict())
                 elif session.state == "ATTACHED":
                     bridge = session.bridge
                     should_probe = True
                 else:
-                    result = {"ok": True, "session": session.to_public_dict()}
+                    # bridge 存在、無 human lease、非 ATTACHED（READY / FLASHING / RECOVERING 等）：
+                    # 統一走契約，command-capable 卡在非 READY/ATTACHING → ok:False + 狀態專用 error_code。
+                    result = self._attach_state_result(session, session.to_public_dict())
             if result is None and by_id not in self._devices:
                 session.state = "DETACHED"
                 session.last_error = "DEVICE_NOT_FOUND"
@@ -1456,7 +1475,34 @@ class SessionManager:
             with self._lock:
                 probe_lock = self._reprobe_probe_lock_locked(session.session_id)
             with probe_lock:
-                return self._probe_existing_bridge(session, bridge)
+                probe_result = self._probe_existing_bridge(session, bridge)
+            # #94（codex 對抗審查補洞）：probe（lock 外阻塞）期間若 release_device 搶進使 session 變
+            # RELEASED，回與早退路徑一致的 released payload（而非 helper 的 SESSION_NOT_READY/
+            # STATE_CHANGED），使 RELEASED 契約在 release-during-attach race 下仍成立。
+            with self._lock:
+                current = self._sessions.get(session.session_id)
+                cur_by_id = current.profile.device_by_id if current is not None else None
+                if current is not None and (
+                    current.state == "RELEASED"
+                    or (cur_by_id and cur_by_id in self._released_by_ids)
+                ):
+                    return {
+                        "ok": True,
+                        "released": True,
+                        "recommended_action": "device_attach",
+                        "session": current.to_public_dict(),
+                    }
+            # #94：command-capable session 若同步 probe 未達 READY，attach 進入點應把埋在
+            # session.last_error 的真錯浮到頂層並回 ok:False，讓 CLI/上層拿得到具體 error 與
+            # 非零 exit（原本一律 ok:True、錯誤只埋巢狀 session → 上層拿到空 error）。
+            # 不改共用 helper _probe_existing_bridge：reprobe/recover 仍要 stay-ATTACHED、
+            # 非硬錯語意；passthrough（非 command_capable）ATTACHED 即成功，亦不改寫。
+            probe_session = probe_result.get("session") if isinstance(probe_result, dict) else None
+            # helper 回 ok:True 時依契約把「command-capable 未達 READY」浮成頂層 ok:False + error_code；
+            # helper 已回 ok:False（STATE_CHANGED / SESSION_NOT_READY）則原樣直通。
+            if probe_result.get("ok") and isinstance(probe_session, dict):
+                return self._attach_state_result(session, probe_session)
+            return probe_result
         self._spawn_attach(by_id)
         return {"ok": True, "session": session.to_public_dict()}
 
