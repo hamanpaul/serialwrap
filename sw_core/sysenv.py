@@ -163,3 +163,30 @@ class FakeEffects:
     def which(self, name: str) -> Optional[str]:
         """從 which 映射查詢 name；不存在回傳 None。"""
         return self._which.get(name)
+
+
+# ---------------------------------------------------------------------------
+# Windows console 編碼修正（#118）
+# ---------------------------------------------------------------------------
+
+def force_utf8_stdio() -> None:
+    """在 Windows console（預設 cp1252）將 stdout/stderr 重設為 UTF-8。
+
+    PyInstaller 打包的 exe 在 Windows 印含非 ASCII（繁中）的 argparse ``--help``
+    等輸出時，預設 cp1252 會 ``UnicodeEncodeError``（#118）。非 Windows 為 no-op；
+    stream 無 ``reconfigure``（被重導/包裝）或 reconfigure 失敗時安全略過，
+    絕不讓編碼修正本身成為新的失敗點。
+    """
+    if sys.platform != "win32":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8")
+        except Exception:
+            # 本函式唯一目的就是防崩：任何 reconfigure 失敗都不得成為新失敗點。
+            # 含非標準 wrapper 的 reconfigure 不吃 encoding= 而拋 TypeError（#118 review）、
+            # detached buffer 的 ValueError、底層 OSError 等，一律安全略過。
+            pass

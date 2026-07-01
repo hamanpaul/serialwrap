@@ -15,6 +15,7 @@ from .constants import CONFIG_DIR, LOCK_PATH, PROFILE_DIR, SOCKET_PATH
 from .doctor_cmd import run_doctor
 from .runtime_config import RuntimeConfig
 from .service_ctl import service_action
+from .sysenv import force_utf8_stdio
 from .setup_cmd import (
     SYSTEM_SOCKET,
     FlashingBusy,
@@ -855,6 +856,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    force_utf8_stdio()  # Windows console cp1252 印繁中 help 會崩（#118），須在 parse_args 前
     p = build_parser()
     args = p.parse_args(argv)
 
