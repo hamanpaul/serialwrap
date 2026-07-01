@@ -126,3 +126,39 @@ def test_force_utf8_stdio_tolerates_reconfigure_error(monkeypatch):
     monkeypatch.setattr(_sys, "stderr", _FakeStream(raises=OSError("io")))
 
     force_utf8_stdio()  # 不得拋錯（吞 ValueError/OSError）
+
+
+def test_force_utf8_stdio_tolerates_incompatible_reconfigure_signature(monkeypatch):
+    """reconfigure 存在但不吃 encoding=（拋 TypeError）時仍不得崩（#118 review）。"""
+    from sw_core.sysenv import force_utf8_stdio
+
+    class _BadSignatureStream:
+        def __init__(self):
+            self.called = False
+
+        def reconfigure(self, *args, **kwargs):
+            self.called = True
+            raise TypeError("reconfigure() got an unexpected keyword argument 'encoding'")
+
+    out, err = _BadSignatureStream(), _BadSignatureStream()
+    monkeypatch.setattr(_sys, "platform", "win32")
+    monkeypatch.setattr(_sys, "stdout", out)
+    monkeypatch.setattr(_sys, "stderr", err)
+
+    force_utf8_stdio()  # 不得拋 TypeError
+
+    assert out.called and err.called
+
+
+def test_force_utf8_stdio_skips_non_callable_reconfigure(monkeypatch):
+    """reconfigure 屬性存在但不可呼叫時安全略過。"""
+    from sw_core.sysenv import force_utf8_stdio
+
+    class _WeirdStream:
+        reconfigure = "not-callable"
+
+    monkeypatch.setattr(_sys, "platform", "win32")
+    monkeypatch.setattr(_sys, "stdout", _WeirdStream())
+    monkeypatch.setattr(_sys, "stderr", _WeirdStream())
+
+    force_utf8_stdio()  # 不得拋 TypeError（str 不可呼叫）

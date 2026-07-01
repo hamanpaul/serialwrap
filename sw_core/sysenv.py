@@ -181,9 +181,12 @@ def force_utf8_stdio() -> None:
         return
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure is None:
+        if not callable(reconfigure):
             continue
         try:
             reconfigure(encoding="utf-8")
-        except (ValueError, OSError):
+        except Exception:
+            # 本函式唯一目的就是防崩：任何 reconfigure 失敗都不得成為新失敗點。
+            # 含非標準 wrapper 的 reconfigure 不吃 encoding= 而拋 TypeError（#118 review）、
+            # detached buffer 的 ValueError、底層 OSError 等，一律安全略過。
             pass
