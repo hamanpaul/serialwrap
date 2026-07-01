@@ -74,11 +74,16 @@ policy_version: 1.0.10
 
 以下 label 可豁免特定 policy 規則（需在 PR 標記）：
 
+> 以下為 policy engine 實際認得的豁免 label（對齊 v1.0.10 引擎；名稱需精確，多為 `policy-exempt:*` 冒號式，R-09 為歷史命名 `skip-changelog`）。
+
 | Label | 豁免項目 |
 |-------|---------|
-| `policy-exempt-changelog` | 免更新 CHANGELOG（如純文件拼字修正）|
-| `policy-exempt-tests` | 免跑測試（如純 CI/文件變更）|
-| `policy-exempt-version` | 免更新 VERSION（如非 release 的 chore）|
+| `skip-changelog` | 免記 changelog fragment（R-09；純文件/CI 變更，附理由）|
+| `policy-exempt:ci-tests` | 免 CI 執行測試（R-19）|
+| `policy-exempt:issue-link` | 免 PR↔issue closing-keyword（R-17）|
+| `policy-exempt:docs-sync` | 免 docs/README 對齊（R-18，WARN）|
+| `policy-exempt:doc-reference` | 免 doc 懸空引用（R-22）|
+| `release:<version>` | 免 VERSION↔最新 tag 一致（R-07；release PR 於 tag 建立前）|
 
 ## 語言政策
 
