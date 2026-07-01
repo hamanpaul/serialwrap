@@ -252,7 +252,7 @@ flowchart TD
 
 ```bash
 # 安裝（正式流程）
-pipx install "git+https://github.com/hamanpaul/serialwrap@v0.2.0"
+pipx install "git+https://github.com/hamanpaul/serialwrap@v0.2.2"
 serialwrap setup     # 物化 profiles/skill/minicom、設定 daemon（systemd 或 on-demand fallback）
 serialwrap doctor    # 驗證環境
 ```
@@ -1189,7 +1189,7 @@ Handler **建議**：
 ## Install
 
 ```bash
-pipx install "git+https://github.com/hamanpaul/serialwrap@v0.2.0"
+pipx install "git+https://github.com/hamanpaul/serialwrap@v0.2.2"
 serialwrap setup     # 物化 profiles/skill/minicom、設定 daemon（systemd 或 on-demand fallback）
 serialwrap doctor    # 驗證環境
 ```

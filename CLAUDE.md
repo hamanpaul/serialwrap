@@ -1,6 +1,6 @@
-<!-- managed-by: hamanpaul/paulsha-conventions@v1.0.5 -->
+<!-- managed-by: hamanpaul/paulsha-conventions@v1.0.10 -->
 <!-- CLAUDE.md 為單一事實來源；AGENTS.md / GEMINI.md / .github/copilot-instructions.md 為指向本檔的 symlink，只需維護本檔 -->
-policy_version: 1.0.5
+policy_version: 1.0.10
 <!-- policy_version 為 policy_check R-14 machine-readable marker；需保持裸行格式，請勿移入 frontmatter 或 code block。 -->
 
 # serialwrap — AI Agent Policy Checklist
@@ -15,8 +15,9 @@ policy_version: 1.0.5
 
 ## 變更紀錄政策
 
-- 所有 production code 與文件變更，**必須同步更新 `CHANGELOG.md`**（`[Unreleased]` 段落）。
-- 版本號更動時，同步更新 `VERSION` 檔案。
+- 自 policy v1.0.9/v1.0.10 的 **fragment 硬切換**起改採 **per-PR changelog fragment** 模型（消除並行 agent 對 `[Unreleased]` 的衝突）：所有 production code 變更，**必須新增 `changelog.d/<issue>-<slug>.md` fragment**（`changelog.d/` 的 direct child、`.md` 結尾，非巢狀路徑）。R-09 驗本 PR 有無 direct fragment——`code_paths` 有變動而缺 fragment → **FAIL**（純文件／release PR 因不動 `code_paths` 不觸發）；例外走 `skip-changelog` label 並附理由。
+- **release 收斂**：以 `python3 -m policy_check.changelog collate --version X.Y.Z --date YYYY-MM-DD` 把 `changelog.d/*.md` 依 type 收斂成 Keep a Changelog dated 段並清空目錄；R-04 於 v1.0.9+ 僅要求 `# Changelog` 標題、不再強制 `[Unreleased]`（本檔仍保留空 `[Unreleased]` 供人閱讀無妨）。
+- 版本號更動時，同步更新 `VERSION` 檔案（`pyproject.toml` dynamic version 從 `VERSION` 讀）。
 
 ## 測試政策
 
@@ -37,11 +38,11 @@ policy_version: 1.0.5
   ```bash
   python3 -m policy_check --repo .
   ```
-- policy engine pinned SHA：`484f963adddf384d30fa0dd85aef35dddf822ee7`。
+- policy engine pinned SHA：`ee87a6d5ed91209d944934a2559f4f2622fd1ac2`。
 - 安裝命令：
   ```bash
   python3 -m pip install --user --disable-pip-version-check \
-    "git+https://github.com/hamanpaul/paulsha-conventions.git@484f963adddf384d30fa0dd85aef35dddf822ee7"
+    "git+https://github.com/hamanpaul/paulsha-conventions.git@ee87a6d5ed91209d944934a2559f4f2622fd1ac2"
   ```
 
 ## Agent 檔案同步政策
@@ -55,14 +56,14 @@ policy_version: 1.0.5
     ln -sf CLAUDE.md GEMINI.md
     ln -sf ../CLAUDE.md .github/copilot-instructions.md
     ```
-- 本檔首行保留 `<!-- managed-by: hamanpaul/paulsha-conventions@v1.0.5 -->`，第 3 行保留裸行 `policy_version: 1.0.5`（R-14 machine-readable marker，勿移入 frontmatter 或 code block）。
+- 本檔首行保留 `<!-- managed-by: hamanpaul/paulsha-conventions@v1.0.10 -->`，第 3 行保留裸行 `policy_version: 1.0.10`（R-14 machine-readable marker，勿移入 frontmatter 或 code block）。
 
 ## PR 政策
 
 - 所有 PR 必須填寫 `.github/pull_request_template.md` 的 Policy Checklist（R-11）。
 - PR checklist 項目：
   - [ ] 分支不是 `main`
-  - [ ] `CHANGELOG.md` 已更新
+  - [ ] 變更已記錄：新增 `changelog.d/<issue>-<slug>.md` fragment（code 變更必備；純文件／release PR 可改動 `CHANGELOG.md` 或免記）
   - [ ] `VERSION` 已更新（若有版本號變動）
   - [ ] `python3 -m pytest -q tests/` 通過（無新失敗）
   - [ ] `python3 -m policy_check --repo .` 通過
@@ -73,11 +74,16 @@ policy_version: 1.0.5
 
 以下 label 可豁免特定 policy 規則（需在 PR 標記）：
 
+> 以下為 policy engine 實際認得的豁免 label（對齊 v1.0.10 引擎；名稱需精確，多為 `policy-exempt:*` 冒號式，R-09 為歷史命名 `skip-changelog`）。
+
 | Label | 豁免項目 |
 |-------|---------|
-| `policy-exempt-changelog` | 免更新 CHANGELOG（如純文件拼字修正）|
-| `policy-exempt-tests` | 免跑測試（如純 CI/文件變更）|
-| `policy-exempt-version` | 免更新 VERSION（如非 release 的 chore）|
+| `skip-changelog` | 免記 changelog fragment（R-09；純文件/CI 變更，附理由）|
+| `policy-exempt:ci-tests` | 免 CI 執行測試（R-19）|
+| `policy-exempt:issue-link` | 免 PR↔issue closing-keyword（R-17）|
+| `policy-exempt:docs-sync` | 免 docs/README 對齊（R-18，WARN）|
+| `policy-exempt:doc-reference` | 免 doc 懸空引用（R-22）|
+| `release:<version>` | 免 VERSION↔最新 tag 一致（R-07；release PR 於 tag 建立前）|
 
 ## 語言政策
 

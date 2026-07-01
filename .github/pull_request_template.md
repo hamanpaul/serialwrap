@@ -12,12 +12,12 @@
 ## Policy Checklist (R-11)
 
 - [ ] 分支不是 `main`（不可直接 commit 到 main）
-- [ ] `CHANGELOG.md` 已更新（`[Unreleased]` 段落）
+- [ ] 變更已記錄：新增 `changelog.d/<issue>-<slug>.md` fragment（code 變更必備，R-09；純文件／release PR 可改動 `CHANGELOG.md` 或免記）
 - [ ] `VERSION` 已更新（若有版本號變動）
 - [ ] `python3 -m pytest -q tests/` 通過（無新失敗）
 - [ ] `python3 -m policy_check --repo .` 通過（release PR 在 tag 建立前改用 `--pr-labels release:<version>`）
 - [ ] 四份 agent 檔案已同步（若有修改 `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` / `.github/copilot-instructions.md`）
-- [ ] 已標記適用 label（release PR 使用 `release:<version>`；豁免白名單：`policy-exempt-changelog`、`policy-exempt-tests`）
+- [ ] 已標記適用 label（release PR 使用 `release:<version>`；豁免白名單見 `CLAUDE.md`，如 `skip-changelog`(R-09)／`policy-exempt:ci-tests`(R-19)／`policy-exempt:issue-link`(R-17)）
 
 ## Issue Reference
 
