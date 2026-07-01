@@ -10,6 +10,7 @@ from sw_core.constants import CONFIG_DIR, DEFAULT_ENDPOINT, LOCK_PATH, PROFILE_D
 from sw_core.runtime_config import RuntimeConfig
 from sw_core.service import SerialwrapService
 from sw_core.session_manager import StateLoadError
+from sw_core.sysenv import force_utf8_stdio
 
 # 這些 RPC method 的 handler 會長時間同步阻塞，須丟到 executor 執行，否則會卡住單執行緒
 # asyncio event loop，導致期間全 daemon 的所有 RPC 凍結（#52 根因；#80 補齊其餘阻塞 handler）。
@@ -186,6 +187,7 @@ async def _run_async(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    force_utf8_stdio()  # Windows console cp1252 印繁中 help 會崩（#118），須在 parse_args 前
     parser = build_parser()
     args = parser.parse_args(argv)
     return int(asyncio.run(_run_async(args)))
