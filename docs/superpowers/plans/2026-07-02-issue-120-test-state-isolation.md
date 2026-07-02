@@ -1004,6 +1004,18 @@ setUp 重排（建立一項、註冊一項；LIFO 自然得到 tmux→daemon→f
             env["SERIALWRAP_CONFIG_DIR"] = str(root / "config")  # #120：隔離 config 維度
 ```
 
+> **Review 追加（quality review 發現的 plan 缺口，實作時併修）**：
+> 1. **e2e tempdir 生命週期改 mkdtemp+addCleanup（清理順序倒置）**——原本整個測試包在
+>    `with tempfile.TemporaryDirectory()` 內，但 addCleanup（`_cleanup_daemon`／`fake.stop`）在測試
+>    return **之後**才跑 → tempdir 先被刪、daemon 還活著：(a) graceful `daemon stop` 永遠打已刪除的
+>    socket（dead code，e2e daemon 一律吃 SIGTERM）；(b) daemon 關閉期間寫入 vs rmtree 競態會殘留
+>    目錄（`/tmp/serialwrap-e2e-muhjfo6n` 為 6/30 實證殘骸）。修法比照 coexist：
+>    `td = tempfile.mkdtemp(prefix="serialwrap-e2e-")` ＋ 緊接 `self.addCleanup(shutil.rmtree, td,
+>    ignore_errors=True)`，整段 de-indent——LIFO 保證 rmtree 最後跑（daemon stop 之後）。
+> 2. **兩檔 env 各補 `SERIALWRAP_EVENTS_DIR`**——unittest runner 下（無 conftest 防線）throwaway
+>    daemon 的 `ensure_runtime_dirs` 會 mkdir 到 live `~/.serialwrap/events.d`，且 live 有 event
+>    rules 時會被測試 daemon 載入執行（handler 是 `subprocess.Popen`）。
+
 - [ ] **Step 3: 跑這兩檔驗證（Task 3 已修向量 2，現在可以安全跑了）**
 
 Run: `python3 -m pytest -q tests/test_human_agent_coexist.py tests/test_multiagent_e2e.py 2>&1 | tail -8 && pgrep -af 'sw-coexis[t]' || echo NO_LEAKED_DAEMON`

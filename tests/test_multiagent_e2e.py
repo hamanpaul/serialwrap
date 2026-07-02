@@ -4,6 +4,7 @@ import os
 import pathlib
 import pty
 import select
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -135,21 +136,25 @@ class TestMultiAgentE2E(unittest.TestCase):
         except OSError as exc:
             self.skipTest(f"pty not available in current environment: {exc}")
 
-        with tempfile.TemporaryDirectory(prefix="serialwrap-e2e-") as td:
-            root = pathlib.Path(td)
-            by_id_dir = root / "by-id"
-            profile_dir = root / "profiles"
-            by_id_dir.mkdir(parents=True, exist_ok=True)
-            profile_dir.mkdir(parents=True, exist_ok=True)
+        # #120 review：tempdir 改 mkdtemp+addCleanup——with 版在 addCleanup（daemon stop）
+        # 之前就刪目錄：graceful stop 永遠打已刪 socket（dead code），且 daemon 關閉期間
+        # 寫入 vs rmtree 競態會殘留目錄；LIFO 保證 rmtree 在 daemon stop 之後才跑
+        td = tempfile.mkdtemp(prefix="serialwrap-e2e-")
+        self.addCleanup(shutil.rmtree, td, ignore_errors=True)
+        root = pathlib.Path(td)
+        by_id_dir = root / "by-id"
+        profile_dir = root / "profiles"
+        by_id_dir.mkdir(parents=True, exist_ok=True)
+        profile_dir.mkdir(parents=True, exist_ok=True)
 
-            fake = FakeTarget()
-            fake.start()
-            self.addCleanup(fake.stop)
+        fake = FakeTarget()
+        fake.start()
+        self.addCleanup(fake.stop)
 
-            link_path = by_id_dir / "fake-uart0"
-            os.symlink(fake.slave_path, link_path)
+        link_path = by_id_dir / "fake-uart0"
+        os.symlink(fake.slave_path, link_path)
 
-            profile = f"""profiles:
+        profile = f"""profiles:
   prpl-template:
     platform: prpl
     prompt_regex: "(?m)^root@prplOS:.*# "
@@ -169,169 +174,170 @@ targets:
     profile: prpl-template
     device_by_id: {link_path}
 """
-            (profile_dir / "e2e.yaml").write_text(profile, encoding="utf-8")
+        (profile_dir / "e2e.yaml").write_text(profile, encoding="utf-8")
 
-            env = os.environ.copy()
-            env["SERIALWRAP_STATE_DIR"] = str(root / "state")
-            env["SERIALWRAP_RUN_DIR"] = str(root / "run")
-            env["SERIALWRAP_BY_ID_DIR"] = str(by_id_dir)
-            env["SERIALWRAP_BY_PATH_DIR"] = str(root / "by-path")
-            env["SERIALWRAP_WAL_DIR"] = str(root / "wal")  # #120：勿繼承外層 shell（曾真寫 live ~/b-log）
-            env["SERIALWRAP_CONFIG_DIR"] = str(root / "config")  # #120：隔離 config 維度
+        env = os.environ.copy()
+        env["SERIALWRAP_STATE_DIR"] = str(root / "state")
+        env["SERIALWRAP_RUN_DIR"] = str(root / "run")
+        env["SERIALWRAP_BY_ID_DIR"] = str(by_id_dir)
+        env["SERIALWRAP_BY_PATH_DIR"] = str(root / "by-path")
+        env["SERIALWRAP_WAL_DIR"] = str(root / "wal")  # #120：勿繼承外層 shell（曾真寫 live ~/b-log）
+        env["SERIALWRAP_CONFIG_DIR"] = str(root / "config")  # #120：隔離 config 維度
+        env["SERIALWRAP_EVENTS_DIR"] = str(root / "events.d")  # #120：勿 mkdir/載入 live ~/.serialwrap/events.d 的 rules
 
-            socket_path = str(root / "run" / "serialwrapd.sock")
-            lock_path = str(root / "run" / "serialwrapd.lock")
-            daemon = subprocess.Popen(
+        socket_path = str(root / "run" / "serialwrapd.sock")
+        lock_path = str(root / "run" / "serialwrapd.lock")
+        daemon = subprocess.Popen(
+            [
+                os.environ.get("PYTHON", "python3"),
+                SERIALWRAPD,
+                "--profile-dir",
+                str(profile_dir),
+                "--socket",
+                socket_path,
+                "--lock",
+                lock_path,
+            ],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+
+        def _cleanup_daemon() -> None:
+            try:
+                self._run_cmd([SERIALWRAP, "--socket", socket_path, "daemon", "stop"], env=env, timeout=3.0)
+            except Exception:
+                pass
+            if daemon.poll() is None:
+                daemon.terminate()
+                try:
+                    daemon.wait(timeout=3.0)
+                except subprocess.TimeoutExpired:
+                    daemon.kill()
+
+        self.addCleanup(_cleanup_daemon)
+
+        ready = self._wait_ready(env, socket_path)
+        self.assertTrue(ready["ok"], msg=f"session not ready: {ready['payload']}")
+
+        base_cmd_by_agent = {
+            1: "ifconfig",
+            2: "wifi restart",
+            3: "iw dev wlan0 scan",
+            4: "iw dev wlan0 link",
+            5: "logread -f",
+        }
+
+        submit_rows: list[dict[str, Any]] = []
+        submit_lock = threading.Lock()
+
+        def _submit(agent: int, round_no: int) -> None:
+            cmd = f"{base_cmd_by_agent[agent]} __a{agent}_r{round_no}"
+            resp = self._run_cmd(
                 [
-                    os.environ.get("PYTHON", "python3"),
-                    SERIALWRAPD,
-                    "--profile-dir",
-                    str(profile_dir),
+                    SERIALWRAP,
                     "--socket",
                     socket_path,
-                    "--lock",
-                    lock_path,
+                    "cmd",
+                    "submit",
+                    "--selector",
+                    "COM0",
+                    "--cmd",
+                    cmd,
+                    "--source",
+                    f"agent:{agent}",
                 ],
                 env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                text=True,
+                timeout=8.0,
             )
+            with submit_lock:
+                submit_rows.append({"agent": agent, "round": round_no, "cmd": cmd, "resp": resp})
 
-            def _cleanup_daemon() -> None:
-                try:
-                    self._run_cmd([SERIALWRAP, "--socket", socket_path, "daemon", "stop"], env=env, timeout=3.0)
-                except Exception:
-                    pass
-                if daemon.poll() is None:
-                    daemon.terminate()
-                    try:
-                        daemon.wait(timeout=3.0)
-                    except subprocess.TimeoutExpired:
-                        daemon.kill()
+        for round_no in (1, 2, 3):
+            threads = [threading.Thread(target=_submit, args=(agent, round_no), daemon=True) for agent in (1, 2, 3, 4, 5)]
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join(timeout=15.0)
+                self.assertFalse(th.is_alive(), "submit thread did not finish in time")
 
-            self.addCleanup(_cleanup_daemon)
+        self.assertEqual(len(submit_rows), 15)
+        bad = [row for row in submit_rows if not row["resp"].get("ok")]
+        self.assertFalse(bad, msg=f"submit failed: {bad}")
 
-            ready = self._wait_ready(env, socket_path)
-            self.assertTrue(ready["ok"], msg=f"session not ready: {ready['payload']}")
-
-            base_cmd_by_agent = {
-                1: "ifconfig",
-                2: "wifi restart",
-                3: "iw dev wlan0 scan",
-                4: "iw dev wlan0 link",
-                5: "logread -f",
-            }
-
-            submit_rows: list[dict[str, Any]] = []
-            submit_lock = threading.Lock()
-
-            def _submit(agent: int, round_no: int) -> None:
-                cmd = f"{base_cmd_by_agent[agent]} __a{agent}_r{round_no}"
-                resp = self._run_cmd(
-                    [
-                        SERIALWRAP,
-                        "--socket",
-                        socket_path,
-                        "cmd",
-                        "submit",
-                        "--selector",
-                        "COM0",
-                        "--cmd",
-                        cmd,
-                        "--source",
-                        f"agent:{agent}",
-                    ],
-                    env=env,
-                    timeout=8.0,
-                )
-                with submit_lock:
-                    submit_rows.append({"agent": agent, "round": round_no, "cmd": cmd, "resp": resp})
-
-            for round_no in (1, 2, 3):
-                threads = [threading.Thread(target=_submit, args=(agent, round_no), daemon=True) for agent in (1, 2, 3, 4, 5)]
-                for th in threads:
-                    th.start()
-                for th in threads:
-                    th.join(timeout=15.0)
-                    self.assertFalse(th.is_alive(), "submit thread did not finish in time")
-
-            self.assertEqual(len(submit_rows), 15)
-            bad = [row for row in submit_rows if not row["resp"].get("ok")]
-            self.assertFalse(bad, msg=f"submit failed: {bad}")
-
-            cmd_ids = [row["resp"]["cmd_id"] for row in submit_rows]
-            pending = set(cmd_ids)
-            deadline = time.monotonic() + 20.0
-            while pending and time.monotonic() < deadline:
-                done_now: list[str] = []
-                for cmd_id in list(pending):
-                    st = self._run_cmd([SERIALWRAP, "--socket", socket_path, "cmd", "status", "--cmd-id", cmd_id], env=env, timeout=5.0)
-                    command = st.get("command") or {}
-                    if command.get("status") in {"done", "error", "canceled"}:
-                        done_now.append(cmd_id)
-                for cmd_id in done_now:
-                    pending.discard(cmd_id)
-                if pending:
-                    time.sleep(0.2)
-
-            self.assertFalse(pending, msg=f"pending cmd_ids: {sorted(pending)}")
-
-            for row in submit_rows:
-                st = self._run_cmd([SERIALWRAP, "--socket", socket_path, "cmd", "status", "--cmd-id", row["resp"]["cmd_id"]], env=env, timeout=5.0)
+        cmd_ids = [row["resp"]["cmd_id"] for row in submit_rows]
+        pending = set(cmd_ids)
+        deadline = time.monotonic() + 20.0
+        while pending and time.monotonic() < deadline:
+            done_now: list[str] = []
+            for cmd_id in list(pending):
+                st = self._run_cmd([SERIALWRAP, "--socket", socket_path, "cmd", "status", "--cmd-id", cmd_id], env=env, timeout=5.0)
                 command = st.get("command") or {}
-                self.assertEqual(command.get("status"), "done", msg=f"unexpected command status: {st}")
-                self.assertIn(f"RESULT:{row['cmd']}:OK", command.get("stdout") or "")
+                if command.get("status") in {"done", "error", "canceled"}:
+                    done_now.append(cmd_id)
+            for cmd_id in done_now:
+                pending.discard(cmd_id)
+            if pending:
+                time.sleep(0.2)
 
-            raw = self._run_cmd(
-                [SERIALWRAP, "--socket", socket_path, "log", "tail-raw", "--selector", "COM0", "--from-seq", "0", "--limit", "10000"],
-                env=env,
-                timeout=10.0,
-            )
-            self.assertTrue(raw.get("ok"), msg=f"tail raw failed: {raw}")
-            records = raw.get("records") or []
+        self.assertFalse(pending, msg=f"pending cmd_ids: {sorted(pending)}")
 
-            agent_tx = [
-                rec
-                for rec in records
-                if rec.get("dir") == "TX" and isinstance(rec.get("source"), str) and rec["source"].startswith("agent:")
-            ]
-            self.assertEqual(len(agent_tx), 15, msg=f"agent tx count mismatch: {len(agent_tx)}")
+        for row in submit_rows:
+            st = self._run_cmd([SERIALWRAP, "--socket", socket_path, "cmd", "status", "--cmd-id", row["resp"]["cmd_id"]], env=env, timeout=5.0)
+            command = st.get("command") or {}
+            self.assertEqual(command.get("status"), "done", msg=f"unexpected command status: {st}")
+            self.assertIn(f"RESULT:{row['cmd']}:OK", command.get("stdout") or "")
 
-            tx_count_by_cmd_id: dict[str, int] = {}
-            for rec in agent_tx:
-                cmd_id = str(rec.get("cmd_id") or "")
-                tx_count_by_cmd_id[cmd_id] = tx_count_by_cmd_id.get(cmd_id, 0) + 1
-            self.assertEqual(len(tx_count_by_cmd_id), 15)
-            self.assertTrue(all(v == 1 for v in tx_count_by_cmd_id.values()))
+        raw = self._run_cmd(
+            [SERIALWRAP, "--socket", socket_path, "log", "tail-raw", "--selector", "COM0", "--from-seq", "0", "--limit", "10000"],
+            env=env,
+            timeout=10.0,
+        )
+        self.assertTrue(raw.get("ok"), msg=f"tail raw failed: {raw}")
+        records = raw.get("records") or []
 
-            rx_text_parts: list[str] = []
-            for rec in records:
-                if rec.get("dir") != "RX":
-                    continue
-                payload_b64 = rec.get("payload_b64")
-                if not isinstance(payload_b64, str):
-                    continue
-                try:
-                    payload = base64.b64decode(payload_b64)
-                except Exception:
-                    continue
-                rx_text_parts.append(payload.decode("utf-8", errors="replace"))
-            rx_text = "".join(rx_text_parts)
+        agent_tx = [
+            rec
+            for rec in records
+            if rec.get("dir") == "TX" and isinstance(rec.get("source"), str) and rec["source"].startswith("agent:")
+        ]
+        self.assertEqual(len(agent_tx), 15, msg=f"agent tx count mismatch: {len(agent_tx)}")
 
-            missing: list[str] = []
-            for row in submit_rows:
-                expect = f"RESULT:{row['cmd']}:OK"
-                if expect not in rx_text:
-                    missing.append(expect)
-            self.assertFalse(missing, msg=f"missing result markers: {missing}")
+        tx_count_by_cmd_id: dict[str, int] = {}
+        for rec in agent_tx:
+            cmd_id = str(rec.get("cmd_id") or "")
+            tx_count_by_cmd_id[cmd_id] = tx_count_by_cmd_id.get(cmd_id, 0) + 1
+        self.assertEqual(len(tx_count_by_cmd_id), 15)
+        self.assertTrue(all(v == 1 for v in tx_count_by_cmd_id.values()))
 
-            per_agent: dict[str, int] = {}
-            for rec in agent_tx:
-                src = str(rec.get("source"))
-                per_agent[src] = per_agent.get(src, 0) + 1
-            for agent in (1, 2, 3, 4, 5):
-                self.assertEqual(per_agent.get(f"agent:{agent}", 0), 3)
+        rx_text_parts: list[str] = []
+        for rec in records:
+            if rec.get("dir") != "RX":
+                continue
+            payload_b64 = rec.get("payload_b64")
+            if not isinstance(payload_b64, str):
+                continue
+            try:
+                payload = base64.b64decode(payload_b64)
+            except Exception:
+                continue
+            rx_text_parts.append(payload.decode("utf-8", errors="replace"))
+        rx_text = "".join(rx_text_parts)
+
+        missing: list[str] = []
+        for row in submit_rows:
+            expect = f"RESULT:{row['cmd']}:OK"
+            if expect not in rx_text:
+                missing.append(expect)
+        self.assertFalse(missing, msg=f"missing result markers: {missing}")
+
+        per_agent: dict[str, int] = {}
+        for rec in agent_tx:
+            src = str(rec.get("source"))
+            per_agent[src] = per_agent.get(src, 0) + 1
+        for agent in (1, 2, 3, 4, 5):
+            self.assertEqual(per_agent.get(f"agent:{agent}", 0), 3)
 
 
 if __name__ == "__main__":

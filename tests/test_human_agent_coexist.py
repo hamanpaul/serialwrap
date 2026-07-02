@@ -159,6 +159,7 @@ targets:
         self._env["SERIALWRAP_WAL_DIR"] = str(self._root / "wal")
         # #120：隔離 config 維度——否則 CLI 子行程讀 live config.yaml 誤路由到 live daemon（縱深防禦）
         self._env["SERIALWRAP_CONFIG_DIR"] = str(self._root / "config")
+        self._env["SERIALWRAP_EVENTS_DIR"] = str(self._root / "events.d")  # #120：勿 mkdir/載入 live ~/.serialwrap/events.d 的 rules
 
         self._socket = str(self._root / "run" / "serialwrapd.sock")
         self._lock = str(self._root / "run" / "serialwrapd.lock")
