@@ -114,6 +114,35 @@ targets:
         self.assertEqual(payload["env_file"], "/tmp/OPI.env")
         self.assertEqual(payload["env_files"], ["/tmp/OPI.env"])
 
+    def test_run_daemon_start_empty_socket_stays_explicit(self) -> None:
+        args = argparse.Namespace(
+            profile_dir="/tmp/profiles",
+            socket="",
+            lock="/tmp/serialwrap.lock",
+            foreground=False,
+            endpoint=None,
+        )
+        proc = mock.Mock(pid=4321, returncode=None)
+        proc.poll.return_value = None
+
+        with (
+            mock.patch("sw_core.cli._safe_runtime_config", return_value=None),
+            mock.patch("sw_core.cli._probe_healthy_daemon", return_value=False) as probe,
+            mock.patch("sw_core.cli._resolve_daemon_start_env_files", return_value=[]),
+            mock.patch("sw_core.cli._load_daemon_start_env_files", return_value=({}, [])),
+            mock.patch("sw_core.cli.subprocess.Popen", return_value=proc) as popen,
+            mock.patch("sw_core.cli.rpc_call", side_effect=[{"ok": True}, {"ok": True}]),
+            mock.patch("sw_core.cli.time.sleep"),
+            mock.patch("sw_core.cli._print") as printer,
+        ):
+            rc = cli._run_daemon_start(args)
+
+        self.assertEqual(rc, 0)
+        probe.assert_called_once_with("")
+        cmd = popen.call_args.args[0]
+        self.assertEqual(cmd[cmd.index("--socket") + 1], "")
+        self.assertEqual(printer.call_args.args[0]["socket"], "")
+
 
 class TestDaemonStartSupervision(unittest.TestCase):
     """#108 #1：daemon start 監管模式 gate（systemd 重導 service start）+ on-demand 冪等。"""

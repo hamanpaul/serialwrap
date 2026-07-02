@@ -4,6 +4,8 @@ from __future__ import annotations
 import os
 from unittest.mock import MagicMock
 
+import pytest
+
 
 def test_walwriter_default_resolves_at_construction(tmp_path, monkeypatch):
     """WalWriter() 的 default wal_dir 須於建構時讀模組層 WAL_DIR，而非 def-time 凍結值。"""
@@ -13,6 +15,17 @@ def test_walwriter_default_resolves_at_construction(tmp_path, monkeypatch):
     w = wal_mod.WalWriter()
     assert w.wal_path == str(tmp_path / "patched-wal" / "raw.wal.ndjson")
     assert (tmp_path / "patched-wal").is_dir()
+
+
+def test_walwriter_empty_string_does_not_fallback(tmp_path, monkeypatch):
+    """wal_dir="" 視為明確輸入；可報錯，但不得偷偷 fallback 到模組層 WAL_DIR。"""
+    import sw_core.wal as wal_mod
+
+    module_level = tmp_path / "patched-wal"
+    monkeypatch.setattr(wal_mod, "WAL_DIR", str(module_level))
+    with pytest.raises(FileNotFoundError):
+        wal_mod.WalWriter(wal_dir="")
+    assert not module_level.exists()
 
 
 def _mk_manager(**kw):
@@ -47,6 +60,38 @@ def test_default_falls_back_to_module_global(tmp_path, monkeypatch):
     monkeypatch.setattr(sm, "STATE_PATH", str(module_level))
     _mk_manager()
     assert module_level.exists()
+
+
+def test_relative_state_path_writes_in_cwd(tmp_path, monkeypatch):
+    """相對 state_path 應可落在 cwd；空 dirname 需以 "." 供 makedirs/mkstemp 使用。"""
+    import sw_core.session_manager as sm
+
+    module_level = tmp_path / "module" / "state.json"
+    monkeypatch.setattr(sm, "STATE_PATH", str(module_level))
+    monkeypatch.chdir(tmp_path)
+    captured: dict[str, str | None] = {}
+    real_mkstemp = sm.tempfile.mkstemp
+
+    def _spy_mkstemp(*args, **kwargs):
+        captured["dir"] = kwargs.get("dir")
+        return real_mkstemp(*args, **kwargs)
+
+    monkeypatch.setattr(sm.tempfile, "mkstemp", _spy_mkstemp)
+    _mk_manager(state_path="state.json")
+    assert captured["dir"] == "."
+    assert (tmp_path / "state.json").exists()
+    assert not module_level.exists()
+
+
+def test_empty_state_path_does_not_fallback(tmp_path, monkeypatch):
+    """state_path="" 視為明確輸入；可報錯，但不得 fallback 寫回模組層 STATE_PATH。"""
+    import sw_core.session_manager as sm
+
+    module_level = tmp_path / "module" / "state.json"
+    monkeypatch.setattr(sm, "STATE_PATH", str(module_level))
+    with pytest.raises(FileNotFoundError):
+        _mk_manager(state_path="")
+    assert not module_level.exists()
 
 
 def test_corrupt_backup_follows_injected_path(tmp_path, monkeypatch):

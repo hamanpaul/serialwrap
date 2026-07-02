@@ -173,7 +173,7 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
         _print({"ok": True, "already_running": True, "socket": endpoint})
         return 0
     # --socket 為 None sentinel（#120 向量 2）：spawn 路徑落到預設 SOCKET_PATH。
-    sock = args.socket or SOCKET_PATH
+    sock = SOCKET_PATH if args.socket is None else args.socket
     cmd = [
         sys.executable,
         _daemon_script_path(),
@@ -288,7 +288,7 @@ def _resolve_endpoint(args: argparse.Namespace) -> str:
     ep = getattr(args, "endpoint", None)
     if ep:
         return ep
-    if args.socket:
+    if args.socket is not None:
         # 有傳即明確（#120 向量 2）：不得與 import-time 預設值比對——測試以 env 覆寫 RUN_DIR 時
         # 傳入值恰等於預設 SOCKET_PATH，等值比對會誤判為「未指定」而 fallback 到 live config。
         return args.socket

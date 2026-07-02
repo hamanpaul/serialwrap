@@ -352,7 +352,7 @@ class SessionManager:
         # state.json 路徑注入（#120）：daemon 走 default（模組層 STATE_PATH），測試注入 tmp。
         # fallback 於「建構時」讀模組層全域（非 def-time default），使既有
         # setattr(session_manager, "STATE_PATH", ...) 的測試隔離手法持續有效。
-        self._state_path = state_path or STATE_PATH
+        self._state_path = STATE_PATH if state_path is None else state_path
         self._wal = wal
         self._on_ready = on_ready
         self._on_detached = on_detached
@@ -482,7 +482,8 @@ class SessionManager:
                                       if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip()}
 
     def _save_state(self) -> None:
-        os.makedirs(os.path.dirname(self._state_path), exist_ok=True)
+        state_dir = os.path.dirname(self._state_path) or "."
+        os.makedirs(state_dir, exist_ok=True)
         # snapshot 一律在 lock 內建（迭代 _sessions、複製 _binding_overrides/_profile_pins/
         # _profile_detected），避免並發 mutation 觸發 RuntimeError: dictionary changed size
         # during iteration 或寫出欄位彼此不一致的 state.json（Copilot review）；磁碟 I/O 留在
@@ -508,7 +509,6 @@ class SessionManager:
         # 原子寫入：temp + fsync + os.replace + 目錄 fsync（比照 wal.py 既有慣例），避免崩潰/斷電/ENOSPC
         # 在「直接覆寫 state.json」中途失敗留下截斷檔，致 _load_state 解析失敗而靜默全棄（含 RELEASED
         # 交接狀態）→ 重啟後 daemon 重新 attach 已交給 flasher/人類的 tty 形成 two-reader（#82）。
-        state_dir = os.path.dirname(self._state_path)
         # 每次取唯一 temp 名（mkstemp）：_save_state 可能由多執行緒並發呼叫（device 自動綁定／attach），
         # 固定 temp 名會在並發 os.replace 時互踩（FileNotFoundError）。唯一名 → 並發安全、last-writer-wins。
         fd, tmp_path = tempfile.mkstemp(dir=state_dir, prefix="state.json.tmp.")

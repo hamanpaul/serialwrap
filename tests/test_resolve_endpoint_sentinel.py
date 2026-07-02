@@ -19,6 +19,15 @@ def test_socket_equal_to_default_is_explicit(monkeypatch):
     assert cli._resolve_endpoint(_ns(socket=cli.SOCKET_PATH)) == cli.SOCKET_PATH
 
 
+def test_empty_socket_is_explicit(monkeypatch):
+    """空字串也屬明確傳入的 --socket；不得再 fallback 到 config/default。"""
+    def _boom():
+        raise AssertionError("不得 fallback 讀 config（--socket 已明確指定）")
+
+    monkeypatch.setattr(cli, "_safe_runtime_config", _boom)
+    assert cli._resolve_endpoint(_ns(socket="")) == ""
+
+
 def test_no_socket_falls_back_to_config(monkeypatch):
     class _RC:
         def socket_path(self):
