@@ -347,7 +347,12 @@ class SessionManager:
         on_ready: Callable[[str], None],
         on_detached: Callable[[str], None],
         on_console_line: Callable[[str, str, str], None] | None = None,
+        state_path: str | None = None,
     ) -> None:
+        # state.json 路徑注入（#120）：daemon 走 default（模組層 STATE_PATH），測試注入 tmp。
+        # fallback 於「建構時」讀模組層全域（非 def-time default），使既有
+        # setattr(session_manager, "STATE_PATH", ...) 的測試隔離手法持續有效。
+        self._state_path = state_path or STATE_PATH
         self._wal = wal
         self._on_ready = on_ready
         self._on_detached = on_detached
@@ -407,10 +412,10 @@ class SessionManager:
         self._save_state()
 
     def _load_state(self) -> None:
-        if not os.path.exists(STATE_PATH):
+        if not os.path.exists(self._state_path):
             return
         try:
-            with open(STATE_PATH, "rb") as fp:
+            with open(self._state_path, "rb") as fp:
                 raw = fp.read()
         except OSError as exc:
             # 讀取既有 state.json 失敗（PermissionError／暫時性 EIO／fd 耗盡等）——檔案內容多半仍完好，
@@ -420,7 +425,7 @@ class SessionManager:
             # 故 fail closed：拋 StateLoadError 由 daemon 啟動層拒絕啟動，由運維修復後再起，
             # 而非帶病啟動 clobber 交接狀態。原檔絕不動。
             raise StateLoadError(
-                f"無法讀取既有 state.json（{STATE_PATH}）：{exc}；"
+                f"無法讀取既有 state.json（{self._state_path}）：{exc}；"
                 "為避免以空狀態覆寫並遺失 RELEASED 交接（two-reader 風險），daemon 拒絕啟動。"
             ) from exc
         try:
@@ -430,9 +435,9 @@ class SessionManager:
             # 備份保留證據並清出 active 路徑供下次 _save_state 重建；原子寫入（本 PR）已使此情形罕見。
             # 與上方「讀取失敗」嚴格區分——後者一律 fail closed，不得在此誤判為損毀（#82 / Codex 必修）。
             import logging
-            backup = f"{STATE_PATH}.corrupt"
+            backup = f"{self._state_path}.corrupt"
             try:
-                os.replace(STATE_PATH, backup)
+                os.replace(self._state_path, backup)
             except OSError:
                 backup = None
             logging.getLogger("serialwrap").warning(
@@ -477,7 +482,7 @@ class SessionManager:
                                       if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip()}
 
     def _save_state(self) -> None:
-        os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+        os.makedirs(os.path.dirname(self._state_path), exist_ok=True)
         # snapshot 一律在 lock 內建（迭代 _sessions、複製 _binding_overrides/_profile_pins/
         # _profile_detected），避免並發 mutation 觸發 RuntimeError: dictionary changed size
         # during iteration 或寫出欄位彼此不一致的 state.json（Copilot review）；磁碟 I/O 留在
@@ -503,7 +508,7 @@ class SessionManager:
         # 原子寫入：temp + fsync + os.replace + 目錄 fsync（比照 wal.py 既有慣例），避免崩潰/斷電/ENOSPC
         # 在「直接覆寫 state.json」中途失敗留下截斷檔，致 _load_state 解析失敗而靜默全棄（含 RELEASED
         # 交接狀態）→ 重啟後 daemon 重新 attach 已交給 flasher/人類的 tty 形成 two-reader（#82）。
-        state_dir = os.path.dirname(STATE_PATH)
+        state_dir = os.path.dirname(self._state_path)
         # 每次取唯一 temp 名（mkstemp）：_save_state 可能由多執行緒並發呼叫（device 自動綁定／attach），
         # 固定 temp 名會在並發 os.replace 時互踩（FileNotFoundError）。唯一名 → 並發安全、last-writer-wins。
         fd, tmp_path = tempfile.mkstemp(dir=state_dir, prefix="state.json.tmp.")
@@ -512,7 +517,7 @@ class SessionManager:
                 fp.write(payload)
                 fp.flush()
                 os.fsync(fp.fileno())
-            os.replace(tmp_path, STATE_PATH)
+            os.replace(tmp_path, self._state_path)
             # 目錄 fsync：確保 state.json 的目錄 entry 持久化（POSIX 語意）。
             # Windows（nt）：os.O_RDONLY 開目錄會拋 Permission Denied；NTFS 自行管理一致性，跳過即可（#84 PORT-4）。
             if sys.platform != "win32":

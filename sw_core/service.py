@@ -221,6 +221,7 @@ class SerialwrapService:
         max_sessions: int = 16,
         by_id_dir: str = DEVICE_BY_ID_DIR,
         by_path_dir: str = DEVICE_BY_PATH_DIR,
+        state_path: str | None = None,
     ) -> None:
         self._wal = WalWriter()
         self._lock = threading.RLock()
@@ -237,6 +238,7 @@ class SerialwrapService:
             on_ready=self._on_ready,
             on_detached=self._on_detached,
             on_console_line=self._on_console_line,
+            state_path=state_path,
         )
         self._engine = EventEngine(EngineDeps(
             events_dir=EVENTS_DIR,
