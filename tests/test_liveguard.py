@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import types
 
 import liveguard
 
@@ -70,6 +71,31 @@ def test_state_deleted_fails():
     assert v == "FAIL"
 
 
+def test_state_non_json_post_fails_even_in_warn():
+    """post 非 JSON（截斷/損毀）＝結構性破壞，warn 模式仍 FAIL。"""
+    v, _ = liveguard.classify_state(_snap(PRE), _snap(b'{"aliases": {'), mode="warn")
+    assert v == "FAIL"
+
+
+def test_state_structural_key_non_dict_fails_even_in_warn():
+    """結構鍵值非 dict（如 released 變 list）＝結構損毀 FAIL，不得 AttributeError。"""
+    post = _state(aliases={"dut": {"session_id": "prpl-template:COM0"}},
+                  released=["p:COM9"])
+    v, _ = liveguard.classify_state(_snap(PRE), _snap(post), mode="warn")
+    assert v == "FAIL"
+
+
+def test_state_preexisting_marker_not_blamed_in_warn():
+    """pre 已含污染特徵（baseline 髒）：post 沿用同特徵＋良性新增 → 不因 marker FAIL、warn 模式 WARN。"""
+    pre = _state(bindings={"prpl-template:COM0": "/tmp/sw-old/by-id/u"},
+                 released={"p:COM9": {"by_id": "x"}})
+    post = _state(aliases={"sta": {"session_id": "prpl-template:COM1"}},
+                  bindings={"prpl-template:COM0": "/tmp/sw-old/by-id/u"},
+                  released={"p:COM9": {"by_id": "x"}})
+    v, _ = liveguard.classify_state(_snap(pre), _snap(post), mode="warn")
+    assert v == "WARN"
+
+
 # ---- Guard 2: WAL ----
 
 def test_wal_append_passes():
@@ -92,6 +118,13 @@ def test_wal_deleted_fails():
 
 def test_wal_absent_both_passes():
     v, _ = liveguard.classify_wal(liveguard.FileSnap(exists=False), liveguard.FileSnap(exists=False))
+    assert v == "PASS"
+
+
+def test_wal_created_passes():
+    """刻意盲點釘住：pre 不存在→post 建立＝首次 append（live daemon 常態），不 FAIL。"""
+    v, _ = liveguard.classify_wal(
+        liveguard.FileSnap(exists=False), liveguard.FileSnap(exists=True, size=10))
     assert v == "PASS"
 
 
@@ -153,3 +186,27 @@ def test_daemon_bridge_generation_change_fails():
 def test_daemon_untouched_passes():
     v, _ = liveguard.classify_daemon(_dsnap(), _dsnap())
     assert v == "PASS"
+
+
+def test_daemon_session_disappeared_fails():
+    """session 於 post 消失：post.sessions.get 回 (None, None) → 經 gen None mismatch FAIL。"""
+    pre = _dsnap(sessions={"prpl-template:COM0": (None, 1)})
+    post = _dsnap(sessions={})
+    v, _ = liveguard.classify_daemon(pre, post)
+    assert v == "FAIL"
+
+
+# ---- snap_daemon I/O 薄層 ----
+
+def test_snap_daemon_rpc_error_returns_unreachable(monkeypatch):
+    """rpc_call 在 socket error/timeout 不丟例外、回 {"ok": False}——必須判 unreachable，
+    不得回 reachable+空 sessions（post 瞬時 timeout 會產生假 FAIL、pre 失敗會沉默停擺偵測）。"""
+    import sw_core.client
+
+    monkeypatch.setattr(
+        liveguard.subprocess, "run",
+        lambda *a, **k: types.SimpleNamespace(stdout="ActiveState=active\nMainPID=1234\n"))
+    monkeypatch.setattr(
+        sw_core.client, "rpc_call",
+        lambda *a, **k: {"ok": False, "error_code": "TIMEOUT"})
+    assert liveguard.snap_daemon().reachable is False

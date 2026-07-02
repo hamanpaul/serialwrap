@@ -66,7 +66,7 @@ class TestResolveEndpointFallback(unittest.TestCase):
             alive.assert_not_called()
 
     def test_unreadable_config_does_not_raise(self) -> None:
-        """config.yaml 損壞/不可讀（建構丟例外）→ 不 traceback，回 args.socket（Codex Important #1）。"""
+        """config.yaml 損壞/不可讀（建構丟例外）→ 不 traceback，回預設 SOCKET_PATH（Codex Important #1）。"""
         with mock.patch(
             "sw_core.cli._default_runtime_config", side_effect=ValueError("bad yaml")
         ):

@@ -67,7 +67,10 @@ def snap_file(path: str) -> FileSnap:
 
 
 def snap_daemon() -> DaemonSnap:
-    """唯讀查 systemd unit 與 live daemon session 快照；任何一步失敗 → unreachable（SKIP）。"""
+    """唯讀查 systemd unit 與 live daemon session 快照；任何一步失敗 → unreachable（SKIP）。
+
+    只查 system scope systemd（`systemctl show serialwrap`）；systemd-user 機器此維度 SKIP。
+    """
     try:
         out = subprocess.run(
             ["systemctl", "show", "-p", "ActiveState,MainPID", "serialwrap"],
@@ -85,6 +88,10 @@ def snap_daemon() -> DaemonSnap:
 
         endpoint = _live_socket_path()
         resp = rpc_call(endpoint, "session.list", {}, timeout_s=3.0)
+        # rpc_call 在 socket error/timeout 不丟例外、回 {"ok": False, ...}——不檢查會把
+        # 瞬時失敗誤判成 reachable+空 sessions（post 假 FAIL／pre 沉默停擺偵測）。
+        if not resp.get("ok"):
+            return DaemonSnap(reachable=False)
         sessions: dict[str, tuple[str | None, int | None]] = {}
         for s in resp.get("sessions") or []:
             sessions[s.get("session_id", "?")] = (s.get("last_tx_at"), s.get("bridge_generation"))
@@ -120,14 +127,19 @@ def _structural_damage(pre: FileSnap, post: FileSnap) -> str | None:
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
         return "live state.json 內容非 JSON（截斷/損毀）"
     for key in STRUCTURAL_KEYS:
-        pre_entries = set((pre_obj.get(key) or {}).keys()) if isinstance(pre_obj, dict) else set()
-        post_entries = set((post_obj.get(key) or {}).keys()) if isinstance(post_obj, dict) else set()
-        missing = pre_entries - post_entries
+        pre_val = (pre_obj.get(key) if isinstance(pre_obj, dict) else None) or {}
+        post_val = (post_obj.get(key) if isinstance(post_obj, dict) else None) or {}
+        # 結構鍵值非 dict（list/str）＝結構損毀；直接 .keys() 會 AttributeError。
+        if not isinstance(pre_val, dict) or not isinstance(post_val, dict):
+            return f"live state.json 的 {key} 非 dict（結構損毀）"
+        missing = set(pre_val.keys()) - set(post_val.keys())
         if missing:
             return f"live state.json 的 {key} 少了 {sorted(missing)}"
+    pre_text = pre.content.decode("utf-8", errors="replace")
     text = post.content.decode("utf-8", errors="replace")
     for marker in POLLUTION_MARKERS:
-        if marker in text:
+        # 只抓「post 新出現」的特徵；pre 已污染的 baseline 不記到本輪頭上。
+        if marker in text and marker not in pre_text:
             return f"live state.json 含污染特徵 {marker!r}"
     return None
 
@@ -150,6 +162,7 @@ def classify_state(pre: FileSnap, post: FileSnap, mode: str) -> tuple[str, str]:
 
 
 def classify_wal(pre: FileSnap, post: FileSnap) -> tuple[str, str]:
+    # 刻意盲點：pre 不存在→post 建立 視為首次 append（live daemon 常態），不 FAIL。
     if pre.exists and not post.exists:
         return VERDICT_FAIL, "live WAL 於測試期間消失（wal reset/清除特徵）"
     if pre.exists and post.exists and post.size < pre.size:
@@ -176,6 +189,8 @@ def classify_daemon(pre: DaemonSnap, post: DaemonSnap) -> tuple[str, str]:
         return VERDICT_FAIL, "live daemon 於測試期間停止或不可達（測試動到 live service）"
     if post.main_pid != pre.main_pid:
         return VERDICT_FAIL, f"live daemon MainPID 變更（{pre.main_pid}→{post.main_pid}；被 restart）"
+    # 刻意盲點：只迭代 pre.sessions——post 新增的 session（裝置熱插）由 state guard
+    # 接住，這裡不視為 FAIL，避免熱插假紅。
     for sid, (pre_tx, pre_gen) in pre.sessions.items():
         post_tx, post_gen = post.sessions.get(sid, (None, None))
         if post_tx != pre_tx:

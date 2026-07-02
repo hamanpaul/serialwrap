@@ -754,7 +754,7 @@ def classify_daemon(pre: DaemonSnap, post: DaemonSnap) -> tuple[str, str]:
 - [ ] **Step 4: 跑測試確認 GREEN**
 
 Run: `[ISO-ENV] python3 -m pytest tests/test_liveguard.py -v`
-Expected: 全 PASS（21 cases）。
+Expected: 全 PASS（26 cases；plan 原碼 20 個＋review 修正追加 6 個）。
 
 - [ ] **Step 5: Commit**
 
