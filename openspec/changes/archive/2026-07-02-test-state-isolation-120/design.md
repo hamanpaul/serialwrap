@@ -20,7 +20,7 @@
 **Non-Goals:**
 - constants 全面惰性化（三層凍結使其單獨無效、改動面最大）。
 - 跨行程 spy 級的零接觸「證明」——以 outcome guard（前後快照）取代。
-- unittest runner 的雜項維度（events 目錄等）完整隔離（pytest-only，文件載明）。
+- unittest runner 的雜項維度完整隔離——events 維度已由 `tests/state_iso.py` 涵蓋（#121 F3），其餘（LOG_DIR 等）仍 pytest-only（文件載明）。
 - `setup_cmd._state_path_for` 對 systemd-system 的既有 path mismatch（另案）。
 
 ## Decisions
@@ -35,14 +35,14 @@
      - Guard 1 state.json：**任何 byte 變更／從無到有 → FAIL**（strict 預設）；`SERIALWRAP_LIVE_GATE=warn` 逃生閥下，結構性破壞（`released`/`bindings`/`aliases` key 消失、污染特徵）**仍 FAIL**。
      - Guard 2 live WAL：檔案消失 → FAIL（結構級，不受 warn 閥管）；size 縮小 → FAIL（strict；warn 下降 WARN——rotation 誤報情境）；append 為 live daemon 常態不 FAIL；外層 shell 原有 `SERIALWRAP_WAL_DIR` 路徑任何變更（含同 size 內容改寫）→ 無條件 FAIL。
      - Guard 3 live config.yaml：任何 byte 變更 → 無條件 FAIL（沒有合法變更情境）。
-     - Guard 4 live daemon（查 system-scope systemd；systemd-user 機器此維度 SKIP）：unit 轉 inactive／MainPID 變更 → FAIL（結構級，不受 warn 閥管）；唯讀 RPC 快照比對任一 session 的 `last_tx_at` 前進／`bridge_generation` 變更／`state` 變更／session 消失 → FAIL（strict；warn 下降 WARN——開發者測試期間對真板操作情境）；不可達 → SKIP。
+     - Guard 4 live daemon（多層探測，#121 F1：system systemd → user systemd → 唯讀 RPC on-demand；全不可達才 SKIP）：pre 有 systemd unit 時 unit 轉 inactive／MainPID 變更 → FAIL（結構級，不受 warn 閥管；on-demand 無 unit 不比此項）；唯讀 RPC 快照比對任一 session 的 `last_tx_at` 前進／`bridge_generation` 變更／`state` 變更／session 消失 → FAIL（strict；warn 下降 WARN——開發者測試期間對真板操作情境）。
    - live path 公式一律用 XDG（刻意忽略 `SERIALWRAP_*` 隔離變數），與 daemon 實際行為一致；不沿用 `setup_cmd._state_path_for`。
 4. **雙 runner 防線刻意冗餘**：conftest（pytest 下防未來漏網）＋8 檔 per-file `setattr` STATE_PATH/WAL_DIR（unittest 與單檔直跑防線）。
 5. **subprocess 測試縱深防禦**：coexist／e2e env 補 `SERIALWRAP_CONFIG_DIR`；e2e 覆寫 `SERIALWRAP_WAL_DIR`；coexist setUp 改 `addCleanup`（`_wait_ready` 失敗不再洩漏 daemon）。
 
 ## Risks / Trade-offs
 
-- [Guard strict 誤報：測試期間對真板操作／hotplug] → `SERIALWRAP_LIVE_GATE=warn` 逃生閥（降級範圍：Guard 1 非結構變更、Guard 2 size 縮小、Guard 4 tx/gen/state/session 消失）；結構級不受閥管仍 FAIL（Guard 1 結構破壞、Guard 2 消失、Guard 3 與 shell-wal 全部、Guard 4 inactive/PID）。寧誤報不放過（adversarial review F1 決議）。
+- [Guard strict 誤報：測試期間對真板操作／hotplug] → `SERIALWRAP_LIVE_GATE=warn` 逃生閥（降級範圍：Guard 1 非結構變更、Guard 2 size 縮小、Guard 4 tx/gen/state/session 消失）；結構級不受閥管仍 FAIL（Guard 1 結構破壞——含 #121 F2 升格的既有 binding 值改寫、Guard 2 消失、Guard 3 與 shell-wal 全部、Guard 4 inactive/PID）。寧誤報不放過（adversarial review F1 決議）。**warn 為明知風險的 opt-in：daemon TX/state 變更僅示警，開發者需自行確認。**
 - [Guard 2 誤報：64MB WAL rotation 恰逢測試期間] → 極罕見，載明；逃生閥同上（warn 下縮小降 WARN）。
 - [gate 先行、隔離未合 → CI 立即紅] → gate 與隔離同一 PR（真陽性，非 false-fail）。
 - [conftest env 覆寫 shadow 掉 runtime-lazy 測試的 XDG monkeypatch] → 已實測發現 `test_setup_materialize.py` 2 例，補 `delenv`；實作時全 suite 驗證掃同型案例。

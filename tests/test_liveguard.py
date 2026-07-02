@@ -96,6 +96,26 @@ def test_state_preexisting_marker_not_blamed_in_warn():
     assert v == "WARN"
 
 
+def test_state_binding_value_rewrite_fails_even_in_warn():
+    """既有 binding 值被改寫＝結構級（#121 F2：把 live 綁定指去別處比新增更危險），warn 仍 FAIL。"""
+    pre = _state(bindings={"prpl-template:COM0": "/dev/serial/by-id/usb-a"},
+                 released={"p:COM9": {"by_id": "x"}})
+    post = _state(bindings={"prpl-template:COM0": "/dev/serial/by-id/usb-b"},
+                  released={"p:COM9": {"by_id": "x"}})
+    v, _ = liveguard.classify_state(_snap(pre), _snap(post), mode="warn")
+    assert v == "FAIL"
+
+
+def test_state_alias_value_change_warns_in_warn_mode():
+    """alias 值變更維持非結構級（live daemon 合法 churn）→ warn 模式 WARN（#121 F2 邊界）。"""
+    pre = _state(aliases={"dut": {"session_id": "prpl-template:COM0"}},
+                 released={"p:COM9": {"by_id": "x"}})
+    post = _state(aliases={"dut": {"session_id": "prpl-template:COM1"}},
+                  released={"p:COM9": {"by_id": "x"}})
+    v, _ = liveguard.classify_state(_snap(pre), _snap(post), mode="warn")
+    assert v == "WARN"
+
+
 # ---- Guard 2: WAL ----
 
 def test_wal_append_passes():
@@ -239,7 +259,39 @@ def test_daemon_pid_change_fails_even_in_warn():
     assert v == "FAIL"
 
 
+def test_daemon_ondemand_untouched_passes():
+    """on-demand（無 systemd unit、純 RPC 可達）：active=False/pid=None 是常態，不得誤判 FAIL（#121 F1）。"""
+    pre = _dsnap(active=False, main_pid=None)
+    post = _dsnap(active=False, main_pid=None)
+    v, _ = liveguard.classify_daemon(pre, post)
+    assert v == "PASS"
+
+
+def test_daemon_ondemand_tx_advance_fails():
+    """on-demand 情境 session 級判定不可失守：tx 前進仍被抓 FAIL（#121 F1）。"""
+    pre = _dsnap(active=False, main_pid=None)
+    post = _dsnap(active=False, main_pid=None,
+                  sessions={"prpl-template:COM0": ("2026-07-02T00:05:00+00:00", 1, "READY")})
+    v, _ = liveguard.classify_daemon(pre, post)
+    assert v == "FAIL"
+
+
 # ---- snap_daemon I/O 薄層 ----
+
+def _fake_systemctl(system_out=None, user_out=None):
+    """依 argv 是否含 --user 分派輸出的 subprocess.run 假件；None＝該 scope 不可用（raise）。"""
+    def run(argv, **kw):
+        out = user_out if "--user" in argv else system_out
+        if out is None:
+            raise OSError("scope 不可用")
+        return types.SimpleNamespace(stdout=out)
+    return run
+
+
+_RPC_OK = {"ok": True, "sessions": [
+    {"session_id": "prpl-template:COM0", "last_tx_at": None,
+     "bridge_generation": 1, "state": "READY"}]}
+
 
 def test_snap_daemon_rpc_error_returns_unreachable(monkeypatch):
     """rpc_call 在 socket error/timeout 不丟例外、回 {"ok": False}——必須判 unreachable，
@@ -253,3 +305,46 @@ def test_snap_daemon_rpc_error_returns_unreachable(monkeypatch):
         sw_core.client, "rpc_call",
         lambda *a, **k: {"ok": False, "error_code": "TIMEOUT"})
     assert liveguard.snap_daemon().reachable is False
+
+
+def test_snap_daemon_system_scope(monkeypatch):
+    """system scope 命中：active=True、MainPID 取 system unit 的值（#121 F1）。"""
+    import sw_core.client
+
+    monkeypatch.setattr(
+        liveguard.subprocess, "run",
+        _fake_systemctl(system_out="ActiveState=active\nMainPID=4321\n",
+                        user_out="ActiveState=inactive\nMainPID=0\n"))
+    monkeypatch.setattr(sw_core.client, "rpc_call", lambda *a, **k: dict(_RPC_OK))
+    snap = liveguard.snap_daemon()
+    assert snap.reachable is True
+    assert snap.active is True
+    assert snap.main_pid == 4321
+
+
+def test_snap_daemon_user_scope_fallback(monkeypatch):
+    """system scope 未命中 → fallback 到 systemd-user scope（#121 F1）。"""
+    import sw_core.client
+
+    monkeypatch.setattr(
+        liveguard.subprocess, "run",
+        _fake_systemctl(system_out="ActiveState=inactive\nMainPID=0\n",
+                        user_out="ActiveState=active\nMainPID=7777\n"))
+    monkeypatch.setattr(sw_core.client, "rpc_call", lambda *a, **k: dict(_RPC_OK))
+    snap = liveguard.snap_daemon()
+    assert snap.reachable is True
+    assert snap.active is True
+    assert snap.main_pid == 7777
+
+
+def test_snap_daemon_ondemand_rpc_only(monkeypatch):
+    """systemd 兩 scope 皆不可用、RPC 可達 → reachable=True/active=False/pid=None（on-demand，#121 F1）。"""
+    import sw_core.client
+
+    monkeypatch.setattr(liveguard.subprocess, "run", _fake_systemctl())  # 兩 scope 都 raise
+    monkeypatch.setattr(sw_core.client, "rpc_call", lambda *a, **k: dict(_RPC_OK))
+    snap = liveguard.snap_daemon()
+    assert snap.reachable is True
+    assert snap.active is False
+    assert snap.main_pid is None
+    assert "prpl-template:COM0" in snap.sessions

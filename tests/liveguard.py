@@ -68,38 +68,65 @@ def snap_file(path: str) -> FileSnap:
 
 
 def snap_daemon() -> DaemonSnap:
-    """唯讀查 systemd unit 與 live daemon session 快照；任何一步失敗 → unreachable（SKIP）。
+    """唯讀多層探測 live daemon 快照；systemd 與 RPC 全不可用 → unreachable（SKIP）。
 
-    只查 system scope systemd（`systemctl show serialwrap`）；systemd-user 機器此維度 SKIP。
+    探測順序（#121 F1——只認 system scope 會讓 systemd-user／on-demand 機器 Guard 4 恆 SKIP）：
+    1. system scope：`systemctl show -p ActiveState,MainPID serialwrap` active → 記 MainPID。
+    2. user scope：`systemctl --user show ...` active → 記 MainPID（CI 無 user bus 等任何
+       例外 → 該 scope 視為不可用，繼續）。
+    3. 不論 systemd 是否命中，能對 live socket 候選唯讀 RPC 拿到 `session.list` 即
+       reachable（on-demand 情境 active=False、main_pid=None）。
+    4. systemd 與 RPC 都不可用 → unreachable（CI 情境）。
     """
-    try:
-        out = subprocess.run(
-            ["systemctl", "show", "-p", "ActiveState,MainPID", "serialwrap"],
-            capture_output=True, text=True, timeout=5,
-        ).stdout
-        props = dict(line.split("=", 1) for line in out.strip().splitlines() if "=" in line)
-        active = props.get("ActiveState") == "active"
-        main_pid = int(props.get("MainPID") or 0) or None
-    except Exception:
-        return DaemonSnap(reachable=False)
-    if not active or not main_pid:
-        return DaemonSnap(reachable=False)
+    active = False
+    main_pid: int | None = None
+    for scope_args in ((), ("--user",)):
+        try:
+            out = subprocess.run(
+                ["systemctl", *scope_args, "show", "-p", "ActiveState,MainPID", "serialwrap"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
+            props = dict(line.split("=", 1) for line in out.strip().splitlines() if "=" in line)
+            pid = int(props.get("MainPID") or 0) or None
+            if props.get("ActiveState") == "active" and pid:
+                active, main_pid = True, pid
+                break
+        except Exception:
+            continue  # 該 scope 不可用 → 試下一層
     try:
         from sw_core.client import rpc_call  # lazy：此時 env 已隔離，僅用 client、endpoint 顯式傳入
-
-        endpoint = _live_socket_path()
-        resp = rpc_call(endpoint, "session.list", {}, timeout_s=3.0)
-        # rpc_call 在 socket error/timeout 不丟例外、回 {"ok": False, ...}——不檢查會把
-        # 瞬時失敗誤判成 reachable+空 sessions（post 假 FAIL／pre 沉默停擺偵測）。
-        if not resp.get("ok"):
-            return DaemonSnap(reachable=False)
-        sessions: dict[str, tuple[str | None, int | None, str | None]] = {}
-        for s in resp.get("sessions") or []:
-            sessions[s.get("session_id", "?")] = (
-                s.get("last_tx_at"), s.get("bridge_generation"), s.get("state"))
     except Exception:
         return DaemonSnap(reachable=False)
-    return DaemonSnap(reachable=True, active=active, main_pid=main_pid, sessions=sessions)
+    for endpoint in _live_socket_candidates():
+        try:
+            resp = rpc_call(endpoint, "session.list", {}, timeout_s=3.0)
+            # rpc_call 在 socket error/timeout 不丟例外、回 {"ok": False, ...}——不檢查會把
+            # 瞬時失敗誤判成 reachable+空 sessions（post 假 FAIL／pre 沉默停擺偵測）。
+            if not resp.get("ok"):
+                continue
+            sessions: dict[str, tuple[str | None, int | None, str | None]] = {}
+            for s in resp.get("sessions") or []:
+                sessions[s.get("session_id", "?")] = (
+                    s.get("last_tx_at"), s.get("bridge_generation"), s.get("state"))
+            return DaemonSnap(reachable=True, active=active, main_pid=main_pid, sessions=sessions)
+        except Exception:
+            continue
+    return DaemonSnap(reachable=False)
+
+
+def _live_socket_candidates() -> list[str]:
+    """live RPC endpoint 候選：config socket_path／system canonical → XDG_RUNTIME_DIR user socket。
+
+    XDG_RUNTIME_DIR 非 SERIALWRAP_* 隔離變數（conftest 不動它），可安全用於
+    systemd-user／on-demand 機器的 live daemon 探測。
+    """
+    cands = [_live_socket_path()]
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime_dir:
+        cand = os.path.join(runtime_dir, "serialwrap", "serialwrapd.sock")
+        if cand not in cands:
+            cands.append(cand)
+    return cands
 
 
 def _live_socket_path() -> str:
@@ -137,6 +164,13 @@ def _structural_damage(pre: FileSnap, post: FileSnap) -> str | None:
         missing = set(pre_val.keys()) - set(post_val.keys())
         if missing:
             return f"live state.json 的 {key} 少了 {sorted(missing)}"
+    # bindings 既有 entry 的值改寫＝結構級（#121 F2：把 live 綁定指去別處比新增更危險）；
+    # aliases/profile_detected 的值變更維持非結構級（live daemon 合法 churn，warn 可降）。
+    pre_bind = (pre_obj.get("bindings") if isinstance(pre_obj, dict) else None) or {}
+    post_bind = (post_obj.get("bindings") if isinstance(post_obj, dict) else None) or {}
+    for bkey, bval in pre_bind.items():
+        if bkey in post_bind and post_bind[bkey] != bval:
+            return f"live state.json 的 binding {bkey!r} 值被改寫（{bval!r}→{post_bind[bkey]!r}）"
     pre_text = pre.content.decode("utf-8", errors="replace")
     text = post.content.decode("utf-8", errors="replace")
     for marker in POLLUTION_MARKERS:
@@ -192,11 +226,16 @@ def classify_config(pre: FileSnap, post: FileSnap) -> tuple[str, str]:
 def classify_daemon(pre: DaemonSnap, post: DaemonSnap, mode: str = "strict") -> tuple[str, str]:
     if not pre.reachable:
         return VERDICT_SKIP, "live daemon 不存在或不可達（CI/無 daemon 機器）"
-    # 結構級（daemon 被 stop/restart）：不受 warn 閥管。
-    if not post.reachable or not post.active:
+    if not post.reachable:
         return VERDICT_FAIL, "live daemon 於測試期間停止或不可達（測試動到 live service）"
-    if post.main_pid != pre.main_pid:
-        return VERDICT_FAIL, f"live daemon MainPID 變更（{pre.main_pid}→{post.main_pid}；被 restart）"
+    # 結構級（daemon 被 stop/restart）：不受 warn 閥管。pre 有 systemd unit（main_pid
+    # 非 None）才比 inactive/PID——on-demand（無 unit、純 RPC 可達）的 active=False
+    # 是常態，不得誤判 FAIL（#121 F1）。
+    if pre.main_pid is not None:
+        if not post.active:
+            return VERDICT_FAIL, "live daemon systemd unit 於測試期間轉 inactive（被 stop）"
+        if post.main_pid != pre.main_pid:
+            return VERDICT_FAIL, f"live daemon MainPID 變更（{pre.main_pid}→{post.main_pid}；被 restart）"
     # session 級（tx/gen/state/session 消失）＝「對真板操作」類：warn 下降 WARN
     # （開發者測試期間自己操作真板的情境）。
     soft = VERDICT_WARN if mode == "warn" else VERDICT_FAIL

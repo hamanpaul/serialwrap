@@ -1,6 +1,7 @@
 """#120：state/WAL 路徑注入與 def-time 凍結消除的單元測試。"""
 from __future__ import annotations
 
+import os
 from unittest.mock import MagicMock
 
 
@@ -75,3 +76,21 @@ def test_service_passthrough(tmp_path, monkeypatch):
     svc_mod.SerialwrapService([], state_path=str(injected))
     assert injected.exists()
     assert not (tmp_path / "module-state.json").exists()
+
+
+def test_isolated_state_covers_events_dimension():
+    """state_iso.isolated_state() 內建構 SerialwrapService：events 三維落 tmp、屬性事後還原（#121 F3）。"""
+    import sw_core.service as svc_mod
+
+    import state_iso
+
+    orig = (svc_mod.EVENTS_DIR, svc_mod.EVENTS_RUNTIME_DIR, svc_mod.EVENTS_LOG_PATH)
+    with state_iso.isolated_state() as td:
+        svc_mod.SerialwrapService([])
+        assert svc_mod.EVENTS_DIR == os.path.join(td, "events.d")
+        assert svc_mod.EVENTS_RUNTIME_DIR == os.path.join(td, "events-rt")
+        assert svc_mod.EVENTS_LOG_PATH == os.path.join(td, "events-rt", "events.ndjson")
+        # SerialwrapService 建構即注入 EngineDeps 並 makedirs——三維都要真的落在 tmp
+        assert os.path.isdir(os.path.join(td, "events.d"))
+        assert os.path.isdir(os.path.join(td, "events-rt"))
+    assert (svc_mod.EVENTS_DIR, svc_mod.EVENTS_RUNTIME_DIR, svc_mod.EVENTS_LOG_PATH) == orig
