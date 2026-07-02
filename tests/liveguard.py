@@ -34,8 +34,9 @@ class DaemonSnap:
     reachable: bool
     active: bool = False
     main_pid: int | None = None
-    # session_id → (last_tx_at, bridge_generation)
-    sessions: dict[str, tuple[str | None, int | None]] = dataclasses.field(default_factory=dict)
+    # session_id → (last_tx_at, bridge_generation, state)
+    sessions: dict[str, tuple[str | None, int | None, str | None]] = dataclasses.field(
+        default_factory=dict)
 
 
 # ---- live 路徑公式 ----
@@ -92,9 +93,10 @@ def snap_daemon() -> DaemonSnap:
         # 瞬時失敗誤判成 reachable+空 sessions（post 假 FAIL／pre 沉默停擺偵測）。
         if not resp.get("ok"):
             return DaemonSnap(reachable=False)
-        sessions: dict[str, tuple[str | None, int | None]] = {}
+        sessions: dict[str, tuple[str | None, int | None, str | None]] = {}
         for s in resp.get("sessions") or []:
-            sessions[s.get("session_id", "?")] = (s.get("last_tx_at"), s.get("bridge_generation"))
+            sessions[s.get("session_id", "?")] = (
+                s.get("last_tx_at"), s.get("bridge_generation"), s.get("state"))
     except Exception:
         return DaemonSnap(reachable=False)
     return DaemonSnap(reachable=True, active=active, main_pid=main_pid, sessions=sessions)
@@ -161,17 +163,22 @@ def classify_state(pre: FileSnap, post: FileSnap, mode: str) -> tuple[str, str]:
     return VERDICT_FAIL, "live state.json 內容變更（strict 模式；確為 live daemon 合法活動時可 SERIALWRAP_LIVE_GATE=warn）"
 
 
-def classify_wal(pre: FileSnap, post: FileSnap) -> tuple[str, str]:
+def classify_wal(pre: FileSnap, post: FileSnap, mode: str = "strict") -> tuple[str, str]:
     # 刻意盲點：pre 不存在→post 建立 視為首次 append（live daemon 常態），不 FAIL。
     if pre.exists and not post.exists:
+        # 結構級：檔案消失＝wal reset/清除特徵，不受 warn 閥管。
         return VERDICT_FAIL, "live WAL 於測試期間消失（wal reset/清除特徵）"
     if pre.exists and post.exists and post.size < pre.size:
+        if mode == "warn":
+            return VERDICT_WARN, (
+                f"live WAL 縮小（{pre.size}→{post.size}；warn 模式放行——rotation 誤報情境，請人工確認）")
         return VERDICT_FAIL, f"live WAL 縮小（{pre.size}→{post.size}；wal reset 特徵，罕見誤報源：64MB rotation）"
     return VERDICT_PASS, "live WAL 未縮小（append 為 live daemon 常態）"
 
 
 def classify_shell_wal(pre: FileSnap, post: FileSnap) -> tuple[str, str]:
-    if pre.exists != post.exists or pre.size != post.size:
+    # content 也要比：同 size 改寫（in-place 覆寫）僅比 exists+size 會滑過。
+    if pre.exists != post.exists or pre.size != post.size or pre.content != post.content:
         return VERDICT_FAIL, "外層 shell SERIALWRAP_WAL_DIR 的 WAL 有變更（env 繼承類回歸）"
     return VERDICT_PASS, "shell WAL 維度未變"
 
@@ -182,19 +189,25 @@ def classify_config(pre: FileSnap, post: FileSnap) -> tuple[str, str]:
     return VERDICT_PASS, "live config.yaml 未變"
 
 
-def classify_daemon(pre: DaemonSnap, post: DaemonSnap) -> tuple[str, str]:
+def classify_daemon(pre: DaemonSnap, post: DaemonSnap, mode: str = "strict") -> tuple[str, str]:
     if not pre.reachable:
         return VERDICT_SKIP, "live daemon 不存在或不可達（CI/無 daemon 機器）"
+    # 結構級（daemon 被 stop/restart）：不受 warn 閥管。
     if not post.reachable or not post.active:
         return VERDICT_FAIL, "live daemon 於測試期間停止或不可達（測試動到 live service）"
     if post.main_pid != pre.main_pid:
         return VERDICT_FAIL, f"live daemon MainPID 變更（{pre.main_pid}→{post.main_pid}；被 restart）"
+    # session 級（tx/gen/state/session 消失）＝「對真板操作」類：warn 下降 WARN
+    # （開發者測試期間自己操作真板的情境）。
+    soft = VERDICT_WARN if mode == "warn" else VERDICT_FAIL
     # 刻意盲點：只迭代 pre.sessions——post 新增的 session（裝置熱插）由 state guard
     # 接住，這裡不視為 FAIL，避免熱插假紅。
-    for sid, (pre_tx, pre_gen) in pre.sessions.items():
-        post_tx, post_gen = post.sessions.get(sid, (None, None))
+    for sid, (pre_tx, pre_gen, pre_state) in pre.sessions.items():
+        post_tx, post_gen, post_state = post.sessions.get(sid, (None, None, None))
         if post_tx != pre_tx:
-            return VERDICT_FAIL, f"live session {sid} 的 last_tx_at 前進（{pre_tx}→{post_tx}；有東西對真板 TX）"
+            return soft, f"live session {sid} 的 last_tx_at 前進（{pre_tx}→{post_tx}；有東西對真板 TX）"
         if post_gen != pre_gen:
-            return VERDICT_FAIL, f"live session {sid} 的 bridge_generation 變更（{pre_gen}→{post_gen}；被 rebind/reattach）"
+            return soft, f"live session {sid} 的 bridge_generation 變更（{pre_gen}→{post_gen}；被 rebind/reattach）"
+        if post_state != pre_state:
+            return soft, f"live session {sid} 的 state 變更（{pre_state}→{post_state}；被 detach/attach 類操作）"
     return VERDICT_PASS, "live daemon 未被觸碰"

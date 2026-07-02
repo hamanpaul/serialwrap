@@ -63,9 +63,11 @@ for _k in (
 
 # tripwire：第 1 層的前提是 sw_core.constants（import-time 凍結路徑）尚未被載入；
 # 若 conftest 頂層 import 鏈提前拉進它，隔離會全然無聲地失效——在此顯式釘住。
-assert "sw_core.constants" not in sys.modules, (
-    "sw_core.constants 已於 env 隔離前被 import——第 1 層隔離失效（檢查 conftest 頂層 import 鏈）"
-)
+# 用 raise 而非 assert：python3 -O 下 assert 會靜默消失，tripwire 不得可被優化掉。
+if "sw_core.constants" in sys.modules:
+    raise RuntimeError(
+        "sw_core.constants 已於 env 隔離前被 import——第 1 層隔離失效（檢查 conftest 頂層 import 鏈）"
+    )
 
 
 # ---- 第 2 層：per-test STATE_PATH patch（消除順序耦合）----
@@ -83,10 +85,10 @@ def pytest_sessionfinish(session, exitstatus):
         ("state", liveguard.classify_state(
             _PRE_STATE, liveguard.snap_file(liveguard.live_state_path()), mode=_MODE)),
         ("wal", liveguard.classify_wal(
-            _PRE_WAL, liveguard.snap_file(liveguard.live_wal_path()))),
+            _PRE_WAL, liveguard.snap_file(liveguard.live_wal_path()), mode=_MODE)),
         ("config", liveguard.classify_config(
             _PRE_CONFIG, liveguard.snap_file(liveguard.live_config_path()))),
-        ("daemon", liveguard.classify_daemon(_PRE_DAEMON, liveguard.snap_daemon())),
+        ("daemon", liveguard.classify_daemon(_PRE_DAEMON, liveguard.snap_daemon(), mode=_MODE)),
     ]
     if _PRE_SHELL_WAL is not None:
         results.append(("shell-wal", liveguard.classify_shell_wal(

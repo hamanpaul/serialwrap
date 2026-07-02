@@ -128,6 +128,22 @@ def test_wal_created_passes():
     assert v == "PASS"
 
 
+def test_wal_shrink_warns_in_warn_mode():
+    """warn 逃生閥涵蓋 Guard 2：size 縮小（rotation 誤報情境）降 WARN。"""
+    v, _ = liveguard.classify_wal(
+        liveguard.FileSnap(exists=True, size=200), liveguard.FileSnap(exists=True, size=100),
+        mode="warn")
+    assert v == "WARN"
+
+
+def test_wal_deleted_fails_even_in_warn():
+    """檔案消失＝結構級（wal reset/清除特徵），warn 閥不管、仍 FAIL。"""
+    v, _ = liveguard.classify_wal(
+        liveguard.FileSnap(exists=True, size=200), liveguard.FileSnap(exists=False),
+        mode="warn")
+    assert v == "FAIL"
+
+
 def test_shell_wal_any_change_fails():
     """外層 shell SERIALWRAP_WAL_DIR 維度：任何變更（size 或存在性）→ FAIL。"""
     v, _ = liveguard.classify_shell_wal(
@@ -151,7 +167,7 @@ def test_config_identical_passes():
 
 def _dsnap(**kw):
     base = dict(reachable=True, active=True, main_pid=1234,
-                sessions={"prpl-template:COM0": ("2026-07-02T00:00:00+00:00", 1)})
+                sessions={"prpl-template:COM0": ("2026-07-02T00:00:00+00:00", 1, "READY")})
     base.update(kw)
     return liveguard.DaemonSnap(**base)
 
@@ -172,13 +188,20 @@ def test_daemon_inactive_post_fails():
 
 
 def test_daemon_tx_advance_fails():
-    post = _dsnap(sessions={"prpl-template:COM0": ("2026-07-02T00:05:00+00:00", 1)})
+    post = _dsnap(sessions={"prpl-template:COM0": ("2026-07-02T00:05:00+00:00", 1, "READY")})
     v, _ = liveguard.classify_daemon(_dsnap(), post)
     assert v == "FAIL"
 
 
 def test_daemon_bridge_generation_change_fails():
-    post = _dsnap(sessions={"prpl-template:COM0": ("2026-07-02T00:00:00+00:00", 2)})
+    post = _dsnap(sessions={"prpl-template:COM0": ("2026-07-02T00:00:00+00:00", 2, "READY")})
+    v, _ = liveguard.classify_daemon(_dsnap(), post)
+    assert v == "FAIL"
+
+
+def test_daemon_state_change_fails():
+    """純 detach 型 misroute（不 TX、不 bump gen、state.json 未變）由 state 欄位抓住。"""
+    post = _dsnap(sessions={"prpl-template:COM0": ("2026-07-02T00:00:00+00:00", 1, "DETACHED")})
     v, _ = liveguard.classify_daemon(_dsnap(), post)
     assert v == "FAIL"
 
@@ -189,10 +212,30 @@ def test_daemon_untouched_passes():
 
 
 def test_daemon_session_disappeared_fails():
-    """session 於 post 消失：post.sessions.get 回 (None, None) → 經 gen None mismatch FAIL。"""
-    pre = _dsnap(sessions={"prpl-template:COM0": (None, 1)})
+    """session 於 post 消失：post.sessions.get 回 (None, None, None) → 經 gen None mismatch FAIL。"""
+    pre = _dsnap(sessions={"prpl-template:COM0": (None, 1, "READY")})
     post = _dsnap(sessions={})
     v, _ = liveguard.classify_daemon(pre, post)
+    assert v == "FAIL"
+
+
+def test_daemon_tx_advance_warns_in_warn_mode():
+    """warn 逃生閥涵蓋 Guard 4 session 級：tx 前進（開發者測試期間對真板操作）降 WARN。"""
+    post = _dsnap(sessions={"prpl-template:COM0": ("2026-07-02T00:05:00+00:00", 1, "READY")})
+    v, _ = liveguard.classify_daemon(_dsnap(), post, mode="warn")
+    assert v == "WARN"
+
+
+def test_daemon_state_change_warns_in_warn_mode():
+    """warn 下 state 變更（detach/attach 同屬「對真板操作」類）降 WARN。"""
+    post = _dsnap(sessions={"prpl-template:COM0": ("2026-07-02T00:00:00+00:00", 1, "DETACHED")})
+    v, _ = liveguard.classify_daemon(_dsnap(), post, mode="warn")
+    assert v == "WARN"
+
+
+def test_daemon_pid_change_fails_even_in_warn():
+    """MainPID 變更＝結構級（daemon 被 restart），warn 閥不管、仍 FAIL。"""
+    v, _ = liveguard.classify_daemon(_dsnap(), _dsnap(main_pid=5678), mode="warn")
     assert v == "FAIL"
 
 
