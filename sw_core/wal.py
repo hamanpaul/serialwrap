@@ -13,8 +13,10 @@ from .util import dumps_stable, monotonic_ns, now_iso, to_printable
 
 
 class WalWriter:
-    def __init__(self, wal_dir: str = WAL_DIR, rotate_bytes: int = DEFAULT_WAL_ROTATE_BYTES) -> None:
-        self._wal_dir = wal_dir
+    def __init__(self, wal_dir: str | None = None, rotate_bytes: int = DEFAULT_WAL_ROTATE_BYTES) -> None:
+        # None-sentinel：於建構時解析模組層 WAL_DIR（#120）——def-time default 會在類別定義時
+        # 凍結 import 當下的值，使 conftest env 隔離與 setattr(wal, "WAL_DIR", ...) 全部失效。
+        self._wal_dir = wal_dir or WAL_DIR
         self._rotate_bytes = rotate_bytes
         self._wal_path = os.path.join(self._wal_dir, "raw.wal.ndjson")
         self._mirror_path = os.path.join(self._wal_dir, "raw.mirror.log")
