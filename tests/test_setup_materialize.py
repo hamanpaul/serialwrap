@@ -10,6 +10,8 @@ from __future__ import annotations
 def test_materialize_copies_profiles_and_symlinks_skill(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.delenv("SERIALWRAP_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("SERIALWRAP_DATA_DIR", raising=False)
     from sw_core.setup_cmd import materialize_assets
     materialize_assets(home=tmp_path)
     assert (tmp_path / "cfg" / "serialwrap" / "profiles" / "default.yaml").is_file()
@@ -22,6 +24,8 @@ def test_materialize_copies_profiles_and_symlinks_skill(tmp_path, monkeypatch):
 def test_materialize_does_not_overwrite_existing_profiles(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.delenv("SERIALWRAP_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("SERIALWRAP_DATA_DIR", raising=False)
     prof = tmp_path / "cfg" / "serialwrap" / "profiles" / "default.yaml"
     prof.parent.mkdir(parents=True)
     prof.write_text("MINE", encoding="utf-8")

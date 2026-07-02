@@ -17,6 +17,11 @@ from sw_core.session_manager import (
 )
 from sw_core.wal import WalWriter
 
+try:
+    import state_iso  # pytest／unittest discover：tests/ 在 sys.path
+except ImportError:  # python3 -m unittest tests.test_x（repo root 跑法，#120）
+    from tests import state_iso
+
 
 def _make_profile(com: str = "COM0", *, log_dir: str | None = None,
                   alias: str = "test") -> SessionProfile:
@@ -48,6 +53,7 @@ class TestLogStartStop(unittest.TestCase):
     """使用真實 SessionManager（搭配 mock bridge）測試 log_start / log_stop"""
 
     def setUp(self) -> None:
+        state_iso.isolate_testcase(self)  # #120 per-file 隔離（unittest 不載 conftest）
         self._tmpdir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self._tmpdir, ignore_errors=True)
         self._log_dir = os.path.join(self._tmpdir, "logs")
@@ -279,6 +285,7 @@ class TestLogStartErrorPaths(unittest.TestCase):
     """log_start 的各種失敗路徑"""
 
     def setUp(self) -> None:
+        state_iso.isolate_testcase(self)  # #120 per-file 隔離（unittest 不載 conftest）
         self._tmpdir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self._tmpdir, ignore_errors=True)
         self._wal_dir = os.path.join(self._tmpdir, "wal")
@@ -334,6 +341,7 @@ class TestLogStopFields(unittest.TestCase):
     """log_stop 回傳值的欄位驗證"""
 
     def setUp(self) -> None:
+        state_iso.isolate_testcase(self)  # #120 per-file 隔離（unittest 不載 conftest）
         self._tmpdir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self._tmpdir, ignore_errors=True)
         self._log_dir = os.path.join(self._tmpdir, "logs")
@@ -385,6 +393,7 @@ class TestRxEdgeCases(unittest.TestCase):
     """_on_bridge_rx 與 capture 的邊界條件"""
 
     def setUp(self) -> None:
+        state_iso.isolate_testcase(self)  # #120 per-file 隔離（unittest 不載 conftest）
         self._tmpdir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self._tmpdir, ignore_errors=True)
         self._log_dir = os.path.join(self._tmpdir, "logs")
@@ -485,6 +494,7 @@ class TestMultiSessionCapture(unittest.TestCase):
     """多 session 各自獨立 capture"""
 
     def setUp(self) -> None:
+        state_iso.isolate_testcase(self)  # #120 per-file 隔離（unittest 不載 conftest）
         self._tmpdir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self._tmpdir, ignore_errors=True)
         self._log_dir = os.path.join(self._tmpdir, "logs")
@@ -548,6 +558,7 @@ class TestEnvVarLogDir(unittest.TestCase):
     """SERIALWRAP_LOG_DIR 環境變數 fallback"""
 
     def setUp(self) -> None:
+        state_iso.isolate_testcase(self)  # #120 per-file 隔離（unittest 不載 conftest）
         self._tmpdir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self._tmpdir, ignore_errors=True)
         self._wal_dir = os.path.join(self._tmpdir, "wal")
@@ -589,6 +600,7 @@ class TestLogFilename(unittest.TestCase):
     """log 檔名格式驗證"""
 
     def setUp(self) -> None:
+        state_iso.isolate_testcase(self)  # #120 per-file 隔離（unittest 不載 conftest）
         self._tmpdir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self._tmpdir, ignore_errors=True)
         self._log_dir = os.path.join(self._tmpdir, "logs")
@@ -637,6 +649,9 @@ class TestLogFilename(unittest.TestCase):
 class TestPublicDictCapture(unittest.TestCase):
     """to_public_dict 中 capture 欄位的邊界條件"""
 
+    def setUp(self) -> None:
+        state_iso.isolate_testcase(self)  # #120 per-file 隔離（unittest 不載 conftest）
+
     def test_no_capture_returns_none(self) -> None:
         """無 active capture 時 capture 欄位為 None"""
         tmpdir = tempfile.mkdtemp()
@@ -662,6 +677,7 @@ class TestSelectorVariants(unittest.TestCase):
     """log_start / log_stop / log_status 支援 COM / alias / session_id"""
 
     def setUp(self) -> None:
+        state_iso.isolate_testcase(self)  # #120 per-file 隔離（unittest 不載 conftest）
         self._tmpdir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self._tmpdir, ignore_errors=True)
         self._log_dir = os.path.join(self._tmpdir, "logs")
@@ -704,6 +720,7 @@ class TestStopCaptureLocked(unittest.TestCase):
     """_stop_capture_locked 的邊界行為"""
 
     def setUp(self) -> None:
+        state_iso.isolate_testcase(self)  # #120 per-file 隔離（unittest 不載 conftest）
         self._tmpdir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self._tmpdir, ignore_errors=True)
         self._log_dir = os.path.join(self._tmpdir, "logs")

@@ -111,7 +111,11 @@ class TestHumanAgentCoexist(unittest.TestCase):
             raise unittest.SkipTest(f"PTY 不可用: {exc}")
 
     def setUp(self) -> None:
+        # #120：建立一項資源、立刻 addCleanup 一項——LIFO 自然得到
+        # tmux→daemon→fake→tempdir 的正確清理順序；且 setUp 中途失敗時
+        # 已註冊的 cleanup 仍會執行（tearDown 則會被 unittest 跳過）。
         self._td = tempfile.mkdtemp(prefix="sw-coexist-")
+        self.addCleanup(shutil.rmtree, self._td, ignore_errors=True)
         self._root = pathlib.Path(self._td)
         self._by_id_dir = self._root / "by-id"
         self._profile_dir = self._root / "profiles"
@@ -120,6 +124,7 @@ class TestHumanAgentCoexist(unittest.TestCase):
 
         self._fake = FakeTarget()
         self._fake.start()
+        self.addCleanup(self._fake.stop)
 
         self._link_path = self._by_id_dir / "fake-uart0"
         os.symlink(self._fake.slave_path, self._link_path)
@@ -152,6 +157,9 @@ targets:
         self._env["SERIALWRAP_BY_ID_DIR"] = str(self._by_id_dir)
         self._env["SERIALWRAP_BY_PATH_DIR"] = str(self._root / "by-path")
         self._env["SERIALWRAP_WAL_DIR"] = str(self._root / "wal")
+        # #120：隔離 config 維度——否則 CLI 子行程讀 live config.yaml 誤路由到 live daemon（縱深防禦）
+        self._env["SERIALWRAP_CONFIG_DIR"] = str(self._root / "config")
+        self._env["SERIALWRAP_EVENTS_DIR"] = str(self._root / "events.d")  # #120：勿 mkdir/載入 live ~/.serialwrap/events.d 的 rules
 
         self._socket = str(self._root / "run" / "serialwrapd.sock")
         self._lock = str(self._root / "run" / "serialwrapd.lock")
@@ -168,18 +176,16 @@ targets:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        self.addCleanup(self._stop_daemon)
+
+        # tmux session 名先定、清理先掛——_wait_ready 失敗時 unittest 跳過 tearDown，
+        # addCleanup 仍會執行（#120：8 個殭屍 daemon 的成因就是舊 tearDown 被跳過）
+        self._tmux_session = f"sw_test_{os.getpid()}"
+        self.addCleanup(self._kill_tmux)
 
         self._wait_ready()
 
-        self._tmux_session = f"sw_test_{os.getpid()}"
-
-    def tearDown(self) -> None:
-        # 清理 tmux session
-        subprocess.run(
-            ["tmux", "kill-session", "-t", self._tmux_session],
-            capture_output=True, timeout=5,
-        )
-        # 清理 daemon
+    def _stop_daemon(self) -> None:
         try:
             self._sw("daemon", "stop")
         except Exception:
@@ -190,8 +196,12 @@ targets:
                 self._daemon.wait(timeout=3.0)
             except subprocess.TimeoutExpired:
                 self._daemon.kill()
-        self._fake.stop()
-        shutil.rmtree(self._td, ignore_errors=True)
+
+    def _kill_tmux(self) -> None:
+        subprocess.run(
+            ["tmux", "kill-session", "-t", self._tmux_session],
+            capture_output=True, timeout=5,
+        )
 
     def _sw(self, *args: str, timeout: float = 10.0) -> dict[str, Any]:
         cmd = [SERIALWRAP, "--socket", self._socket, *args]

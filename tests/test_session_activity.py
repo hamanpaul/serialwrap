@@ -13,6 +13,11 @@ from unittest import mock
 from sw_core.config import SessionProfile
 from sw_core.session_manager import SessionManager, SessionRuntime
 
+try:
+    import state_iso  # pytest／unittest discover：tests/ 在 sys.path
+except ImportError:  # python3 -m unittest tests.test_x（repo root 跑法，#120）
+    from tests import state_iso
+
 
 def _make_profile(**overrides: Any) -> SessionProfile:
     defaults: dict[str, Any] = {
@@ -168,6 +173,9 @@ class TestSessionPublicDict(unittest.TestCase):
 
 class TestSessionManagerActivityHooks(unittest.TestCase):
     """SessionManager 內 RX / TX 標記助手在實際路徑被呼叫的整合測試。"""
+
+    def setUp(self) -> None:
+        state_iso.isolate_testcase(self)  # #120 per-file 隔離（unittest 不載 conftest）
 
     def _make_manager(self) -> SessionManager:
         wal = mock.MagicMock()

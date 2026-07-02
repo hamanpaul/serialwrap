@@ -3,8 +3,16 @@ from unittest import mock
 
 from sw_core.service import SerialwrapService
 
+try:
+    import state_iso  # pytest／unittest discover：tests/ 在 sys.path
+except ImportError:  # python3 -m unittest tests.test_x（repo root 跑法，#120）
+    from tests import state_iso
+
 
 class TestServiceHumanConsole(unittest.TestCase):
+    def setUp(self) -> None:
+        state_iso.isolate_testcase(self)  # #120 per-file 隔離（unittest 不載 conftest）
+
     def test_human_console_interactive_command_uses_interactive_mode(self) -> None:
         svc = SerialwrapService([])
         with mock.patch.object(svc._arbiter, "submit") as submit:

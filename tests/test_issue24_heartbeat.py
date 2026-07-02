@@ -16,6 +16,11 @@ from sw_core.config import SessionProfile
 from sw_core.session_manager import SessionManager, SessionRuntime
 from sw_core.wal import WalWriter
 
+try:
+    import state_iso  # pytest／unittest discover：tests/ 在 sys.path
+except ImportError:  # python3 -m unittest tests.test_x（repo root 跑法，#120）
+    from tests import state_iso
+
 
 def _make_profile(**overrides: Any) -> SessionProfile:
     """建立測試用 SessionProfile。"""
@@ -80,6 +85,9 @@ class TestOutputKeepaliveExtendsWait(unittest.TestCase):
     """mock bridge 使得每次 wait_for_regex_from 都回 False 但 rx_snapshot_len 增加，
     驗證不會在 timeout_s 就放棄。"""
 
+    def setUp(self) -> None:
+        state_iso.isolate_testcase(self)  # #120 per-file 隔離（unittest 不載 conftest）
+
     def test_output_keepalive_extends_wait(self) -> None:
         profile = _make_profile(timeout_s=1.0)
         session = SessionRuntime(session_id="test:COM0", profile=profile)
@@ -131,6 +139,9 @@ class TestSilenceTriggersTimeout(unittest.TestCase):
     """mock bridge 使得 wait_for_regex_from 回 False 且 rx_snapshot_len 不變，
     驗證正確觸發 PROMPT_TIMEOUT。"""
 
+    def setUp(self) -> None:
+        state_iso.isolate_testcase(self)  # #120 per-file 隔離（unittest 不載 conftest）
+
     def test_silence_triggers_timeout(self) -> None:
         profile = _make_profile(timeout_s=1.0)
         session = SessionRuntime(session_id="test:COM0", profile=profile)
@@ -166,6 +177,9 @@ class TestSilenceTriggersTimeout(unittest.TestCase):
 
 class TestFgCmdObservability(unittest.TestCase):
     """驗證 execute_command 期間 SessionRuntime 的觀察性欄位被正確設定。"""
+
+    def setUp(self) -> None:
+        state_iso.isolate_testcase(self)  # #120 per-file 隔離（unittest 不載 conftest）
 
     def test_fg_cmd_observability(self) -> None:
         profile = _make_profile(timeout_s=2.0)
