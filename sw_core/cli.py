@@ -172,13 +172,15 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
     if _probe_healthy_daemon(endpoint):
         _print({"ok": True, "already_running": True, "socket": endpoint})
         return 0
+    # --socket 為 None sentinel（#120 向量 2）：spawn 路徑落到預設 SOCKET_PATH。
+    sock = args.socket or SOCKET_PATH
     cmd = [
         sys.executable,
         _daemon_script_path(),
         "--profile-dir",
         args.profile_dir,
         "--socket",
-        args.socket,
+        sock,
         "--lock",
         args.lock,
     ]
@@ -208,12 +210,12 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
         if proc.poll() is not None:
             _print({"ok": False, "error_code": "DAEMON_EXITED", "pid": proc.pid, "returncode": proc.returncode})
             return 2
-        resp = rpc_call(args.socket, "health.ping", {}, timeout_s=0.5)
+        resp = rpc_call(sock, "health.ping", {}, timeout_s=0.5)
         if resp.get("ok"):
-            result: dict[str, Any] = {"ok": True, "pid": proc.pid, "socket": args.socket}
+            result: dict[str, Any] = {"ok": True, "pid": proc.pid, "socket": sock}
             if loaded_env_files:
                 result["env_files"] = loaded_env_files
-            health = rpc_call(args.socket, "health.status", {}, timeout_s=1.0)
+            health = rpc_call(sock, "health.status", {}, timeout_s=1.0)
             warnings = health.get("warnings")
             if warnings:
                 result["warnings"] = warnings
@@ -274,7 +276,7 @@ def _endpoint_alive(ep: str) -> bool:
 def _resolve_endpoint(args: argparse.Namespace) -> str:
     """回傳實際連接 endpoint。
 
-    優先序：``--endpoint`` > 明確指定的 ``--socket``（非預設）> config.yaml 記錄的有效 socket
+    優先序：``--endpoint`` > 明確傳入的 ``--socket`` > config.yaml 記錄的有效 socket
     > 預設 ``SOCKET_PATH``。讀 config 是為了讓 systemd-system 裝完後 CLI 連到系統 daemon 的
     socket（``/run/serialwrap/...``）而非使用者 XDG socket（Codex #1a）。
 
@@ -286,7 +288,9 @@ def _resolve_endpoint(args: argparse.Namespace) -> str:
     ep = getattr(args, "endpoint", None)
     if ep:
         return ep
-    if args.socket and args.socket != SOCKET_PATH:
+    if args.socket:
+        # 有傳即明確（#120 向量 2）：不得與 import-time 預設值比對——測試以 env 覆寫 RUN_DIR 時
+        # 傳入值恰等於預設 SOCKET_PATH，等值比對會誤判為「未指定」而 fallback 到 live config。
         return args.socket
     rc = _safe_runtime_config()
     cfg_sock = None
@@ -295,7 +299,7 @@ def _resolve_endpoint(args: argparse.Namespace) -> str:
             cfg_sock = rc.socket_path()
         except Exception:
             cfg_sock = None
-    chosen = cfg_sock or args.socket
+    chosen = cfg_sock or SOCKET_PATH
     if cfg_sock and chosen == cfg_sock and not _endpoint_alive(cfg_sock):
         try:
             mode = (rc.mode() if rc is not None else None) or "on-demand"
@@ -502,7 +506,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
-    p.add_argument("--socket", default=SOCKET_PATH, help="本機 daemon 的 Unix socket 路徑（預設依 XDG 執行期目錄解析，可用 SERIALWRAP_RUN_DIR 覆寫）")
+    p.add_argument("--socket", default=None, help="本機 daemon 的 Unix socket 路徑（未指定時依 config.yaml 與 XDG 執行期目錄解析，可用 SERIALWRAP_RUN_DIR 覆寫）")
     p.add_argument("--endpoint", default=None, metavar="ENDPOINT", help="遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）")
     p.add_argument("--timeout", dest="timeout_s", type=float, default=5.0, help="RPC timeout 秒數（預設: %(default)s）")
 

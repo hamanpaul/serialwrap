@@ -172,7 +172,7 @@ class TestDaemonStartSupervision(unittest.TestCase):
         並 no-op，而非 probe 裸 args.socket（預設）miss 後 spawn 第二個（Codex Important #2）。"""
         args = argparse.Namespace(
             profile_dir="/tmp/profiles",
-            socket=cli.SOCKET_PATH,  # 未顯式覆寫 → 應解析到 config 的 socket
+            socket=None,  # 未顯式覆寫（#120 None sentinel）→ 應解析到 config 的 socket
             lock="/tmp/serialwrap.lock",
             foreground=False,
             with_sudo=False,

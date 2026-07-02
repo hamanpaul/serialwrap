@@ -10,10 +10,9 @@ from sw_core import cli
 
 class TestResolveEndpointFallback(unittest.TestCase):
     def _args(self, socket: str | None = None, endpoint: str | None = None) -> argparse.Namespace:
-        return argparse.Namespace(
-            socket=socket if socket is not None else cli.SOCKET_PATH,
-            endpoint=endpoint,
-        )
+        # #120 向量 2 起 --socket argparse default 為 None sentinel：
+        # 「未指定」的模擬值即 None（有傳任何值皆視為明確指定）。
+        return argparse.Namespace(socket=socket, endpoint=endpoint)
 
     def test_dangling_config_socket_falls_back_to_system_socket(self) -> None:
         """systemd-system 下 config socket 失聯 → 改連 SYSTEM_SOCKET。"""
