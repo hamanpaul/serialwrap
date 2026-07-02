@@ -35,8 +35,8 @@
 ## 非目標（YAGNI）
 
 - 不做 constants 全面惰性化（三層凍結使其單獨無效，改動面全 repo 最大、reload 型測試全要改寫）。
-- 不動 `WalWriter` 簽章（conftest env 隔離已涵蓋其 def-time default 凍結）。
-- 不處理 `python3 -m unittest discover` 跑法的隔離（不載入 conftest；政策與 CI 以 pytest 為準，此限制載明於本文件）。
+- 不做跨行程 spy／strace 級的「live 資源零接觸」證明——以 outcome guard（state／WAL／config／daemon 前後快照）取代 mechanism spy。
+- `python3 -m unittest discover` 的**完整**隔離（WAL 目錄建立、events 目錄等雜項維度）仍非目標——conftest 防線是 pytest-only；但 **state.json 維度經 P5 per-file 隔離後，兩種 runner 皆安全**（回應 adversarial review F3），並於 CLAUDE.md 測試政策註記 pytest 為唯一具完整防線的跑法。
 - 不在本 change 處理 `setup_cmd._state_path_for` 對 systemd-system 回 `/var/lib/serialwrap` 與 daemon 實際行為不一致的既有 mismatch（另案）。
 
 ## 設計
@@ -47,6 +47,7 @@
   - fallback 讀**模組層全域**（非 def-time default），既有 19 檔 `setattr(session_manager, "STATE_PATH", ...)` 隔離測試零破壞（皆於 setUp patch 後才建構）。
 - `_load_state`／`_save_state`／`.corrupt` 備份路徑／mkstemp dir／`os.replace` 目標，全部改用 `self._state_path`。
 - `SerialwrapService.__init__` 新增同名 keyword 透傳給 `SessionManager`；default `None` → 行為與現行完全一致，`daemon.py` 不需改。
+- 併修 `WalWriter.__init__` 的 def-time 凍結：`wal_dir: str = WAL_DIR` → `wal_dir: str | None = None`，於建構時 `wal_dir or WAL_DIR`（讀模組層全域）。行為相容，但 `setattr(wal, "WAL_DIR", ...)` 與 conftest env 隔離對 default 路徑真正生效，P5 的 per-file 隔離才有著力點。
 
 ### P2. `cli.py --socket` 改 sentinel（向量 2 根修）
 
@@ -77,16 +78,30 @@
 
 **第 2 層——function-scoped autouse fixture**：per-test `monkeypatch.setattr(sw_core.session_manager, "STATE_PATH", str(tmp_path/"state.json"))`，消除未隔離測試共寫同一 session 級 state 的順序耦合。autouse 對 unittest.TestCase 風格測試同樣生效；既有自帶 setUp patch 的測試，其 setUp 後蓋、tearDown 還原到 fixture 值、fixture teardown 還原原值，語意不變。
 
-**第 3 層——session-finish gate**（#120 的驗證要求，`pytest_sessionfinish` 設 `session.exitstatus`）：
+**第 3 層——session-finish live guard**（#120 的驗證要求，`pytest_sessionstart`/`pytest_sessionfinish` 快照比對，FAIL 時設 `session.exitstatus = 1`）。判定邏輯抽成純函式模組 `tests/liveguard.py`（conftest import），使每種失敗模式可被 RED unit test 證明（adversarial review F1/F2 要求）：
+
+**Guard 1——live state.json**（strict by default，回應 F1「乾淨覆寫／released 清空不能只 WARN」）：
 
 | 情形 | 判定 |
 |---|---|
-| live state.json 從不存在 → 存在 | **FAIL**（CI fresh runner 上即此型態，真陽性） |
-| 內容變更且含污染特徵（`/tmp/sw-`、`test-tpl`、`"test:`、`fake-uart`） | **FAIL**＋印 diff |
-| 內容變更但無污染特徵 | WARNING 不 FAIL（live daemon 測試期間合法寫入：hotplug／alias 操作等） |
-| 未變 | 通過 |
+| 從不存在 → 存在 | **FAIL**（CI fresh runner 上即此型態，真陽性） |
+| 任何 byte-level 內容變更（含「乾淨空 state 覆寫」「`released`/`bindings`/`aliases` 被刪」） | **FAIL**＋印結構化 diff |
+| 未變（byte-identical） | 通過 |
 
-污染特徵判別抽成純函式以便 unit test。
+- 逃生閥：`SERIALWRAP_LIVE_GATE=warn` 供「測試期間 live daemon 確有合法活動（hotplug／人為 alias 操作）」的機器降級；**warn 模式下結構性破壞仍一律 FAIL**——`released`/`bindings`/`aliases` 任一 key 消失、或內容含污染特徵（`/tmp/sw-`、`test-tpl`、`"test:`、`fake-uart`）。
+- live path 公式同前（XDG，刻意忽略 `SERIALWRAP_STATE_DIR`）。
+
+**Guard 2——live WAL**（回應 F2；live daemon 的 RX append 是常態，byte 比對必誤報，改守「破壞」）：
+
+- 監看 live XDG WAL（`(XDG_STATE_HOME|~/.local/state)/serialwrap/wal/raw.wal.ndjson`）：檔案**消失或 size 縮小**（`wal reset`／truncate 的特徵）→ **FAIL**；append（size 增加）視為 live daemon 合法活動。已知極罕見誤報：測試期間恰逢 64MB rotation（載明、可用逃生閥）。
+- 若外層 shell 在 conftest 覆寫前就有 `SERIALWRAP_WAL_DIR`（如 `~/b-log`），該路徑的 `raw.wal.ndjson` **任何變更 → FAIL**（live daemon 不寫那裡；會寫的只有 env 繼承類回歸，即 P4 修的 e2e 型態）。
+
+**Guard 3——live config.yaml**：`(XDG_CONFIG_HOME|~/.config)/serialwrap/config.yaml` byte 快照，任何變更 → **FAIL**（CLI 對 config 依設計唯讀；合法寫入者只有 `serialwrap setup`，測試不得對 live 跑 setup）。
+
+**Guard 4——live daemon 未被觸碰**（回應 F2「misroute 不改 state 也要被抓」）：
+
+- sessionstart：若 systemd unit `serialwrap` active → 記錄 MainPID；並對 live daemon 做**唯讀** RPC 快照（`session.list` 的每 session `last_tx_at`／`bridge_generation`／`state`）。daemon 不存在／不可達（CI）→ 此 guard 靜默 skip。
+- sessionfinish：unit 不再 active 或 MainPID 變更 → **FAIL**（測試 stop/restart 了 live daemon）；任一 session 的 `last_tx_at` 前進或 `bridge_generation` 變更 → **FAIL**（有東西對真板 TX／rebind——vector 2 的 `cmd submit`／`session bind` 型態）。同受 `SERIALWRAP_LIVE_GATE=warn` 逃生閥管轄（並列印完整 diff 供人工判讀）。
 
 ### P4. coexist／e2e 併修（縱深防禦＋洩漏根絕）
 
@@ -95,20 +110,38 @@
   - setUp 改為每項資源（tempdir／FakeTarget／daemon／tmux session）建立後立刻 `addCleanup` 註冊清理，`_wait_ready` 失敗不再洩漏 daemon（今日 8 個殭屍 daemon 的成因）。
 - `tests/test_multiagent_e2e.py`：subprocess env 補 `SERIALWRAP_CONFIG_DIR`，並明確覆寫 `SERIALWRAP_WAL_DIR` 到自身 tempdir（現行繼承外層 shell env，若 shell export `SERIALWRAP_WAL_DIR=~/b-log` 則子 daemon 真寫 live WAL）。
 
+### P5. 8 檔未隔離測試補 per-file 隔離＋測試政策文件註記（回應 adversarial review F3）
+
+conftest 防線是 pytest-only；`python3 -m unittest discover -s tests` 是 CLAUDE.md 載明的替代跑法，不載入 conftest → 8 檔未隔離建構點在該跑法下仍直寫 live STATE_PATH。雙防線收斂：
+
+- **8 檔全部補 per-file 隔離**（issue 修法 3，比照既有 19 檔正確範例）：setUp `setattr(session_manager, "STATE_PATH", tmp)`＋`setattr(wal, "WAL_DIR", tmp)`（P1 的 WalWriter None-sentinel 使後者生效）、tearDown 還原。對象：`test_session_capture.py`、`test_issue24_heartbeat.py`、`test_session_activity.py`、`test_command_guard.py`、`test_service_human_console.py`、`test_mcu_cli_rpc.py`、`test_flash_service_wiring.py`、`test_daemon_service_selector.py`。此層與 conftest 第 2 層冗餘——刻意如此：conftest 防 pytest 下的未來漏網，per-file 防 unittest runner 與單檔直跑。
+- **CLAUDE.md 測試政策註記**：unittest discover 不載入 `tests/conftest.py` 的隔離與 live guard 防線，在有 production daemon 的機器上以 pytest 為準（政策與 CI 本即如此）。README 若提及測試跑法則同步。
+
 ## 測試策略（TDD，RED 先行）
 
-1. **P1**：新 unit test——`SessionManager(state_path=tmp)` 寫到注入路徑、不碰模組層 `STATE_PATH`；未注入時 fallback 至模組層值（含 setattr patch 後建構的相容性）。`SerialwrapService(state_path=...)` 透傳生效。
+1. **P1**：新 unit test——`SessionManager(state_path=tmp)` 寫到注入路徑、不碰模組層 `STATE_PATH`；未注入時 fallback 至模組層值（含 setattr patch 後建構的相容性）。`SerialwrapService(state_path=...)` 透傳生效。`WalWriter()` 於 `setattr(wal, "WAL_DIR", tmp)` 後建構落 tmp（RED：現行 def-time default 無視 patch）。
 2. **P2**：`_resolve_endpoint` unit test——`--socket` 傳「恰等於 `SOCKET_PATH` 預設值」→ 直接回傳、不讀 config（RED：現行 fallback 到 config）；未傳 → config fallback 照舊；`--endpoint` 優先序不變；daemon start on-demand 等價替換。
-3. **P3**：gate 污染特徵函式 unit test；conftest env 隔離以「跑代表性子集後斷言 live path 未被建立」驗證。
-4. **整體驗收**（= issue 驗證要求）：完整 suite 跑完，gate 綠、live `~/.local/state/serialwrap/state.json` 內容不變。
+3. **P3（liveguard 純函式，每一 F1/F2 失敗模式一個 RED case）**：
+   - state：乾淨空 state 覆寫 → FAIL；`released` 整段消失 → FAIL（strict 與 warn 模式皆然）；byte-identical → PASS；warn 模式＋無結構破壞的變更 → WARN。
+   - WAL：size 縮小／檔案消失 → FAIL；append → PASS；shell `SERIALWRAP_WAL_DIR` 維度任何變更 → FAIL。
+   - config：任何 byte 變更 → FAIL。
+   - daemon：MainPID 變更／unit 轉 inactive → FAIL；`last_tx_at` 前進／`bridge_generation` 變更 → FAIL；daemon 不可達 → SKIP。
+4. **P5**：8 檔各自在無 conftest 環境下驗證不觸 live path（實作時抽測代表檔以 `python3 -m unittest tests.test_issue24_heartbeat` 型式驗證）。
+5. **整體驗收**（= issue 驗證要求＋F2 補強）：完整 pytest suite 跑完，四個 guard 全綠——live state.json byte-identical、live WAL 未縮小、live config 未變、live daemon PID／sessions 未被觸碰。
 
 ## 風險與相容性
 
 - **gate 與隔離必須同一 PR**：CI fresh runner 上未隔離測試同樣會建 runner 的 live path，先上 gate 會立即紅（真陽性、非 false-fail）。
+- **Guard 誤報特性（strict 預設的代價，載明）**：測試期間若開發者同時對真板操作（attach／alias／下命令）或發生 hotplug，Guard 1／4 會 FAIL——這是刻意選擇（寧可誤報也不放過 released 清空型破壞，adversarial review F1）；此情境用 `SERIALWRAP_LIVE_GATE=warn` 降級，warn 下結構性破壞仍 FAIL。Guard 2 的 64MB rotation 誤報極罕見。
+- Guard 4 依賴 systemd unit 與唯讀 RPC；CI／無 daemon 機器靜默 skip，不造成 false-fail。
 - 既有 19 檔 setattr 隔離、5 檔 reload 隔離、2 檔 subprocess 隔離：全部不需改、行為不變。
-- `python3 -m unittest discover` 不載入 conftest → 第 1／3 層防線不生效；P1／P2 仍有效。已知限制。
+- `python3 -m unittest discover` 不載入 conftest → 第 1／3 層防線不生效；state 維度由 P5 per-file 隔離補上，雜項維度（events 目錄等）載明為 pytest-only。
 - pre-existing flaky `test_multiagent_e2e` TX count mismatch 可能因 P2 順帶改善（觀察、不承諾）。
 - 本機驗證期間避免在 fix 合入前跑 coexist／e2e（會經向量 2 復發污染）；live state 已於 2026-07-02 手動清理並確認兩板 READY。
+
+## Adversarial review 迭代紀錄
+
+- 2026-07-02 Codex adversarial review（spec v1）三發現，全數採納：F1（high）gate WARNING 路徑放過無特徵破壞 → Guard 1 改 strict byte-FAIL＋warn 模式仍擋結構破壞；F2（high）驗收只守 state → 補 Guard 2/3/4（WAL／config／daemon）；F3（medium）unittest discover 破口 → P5 per-file 隔離＋CLAUDE.md 註記。
 
 ## 探索紀錄（供 review 參考）
 
