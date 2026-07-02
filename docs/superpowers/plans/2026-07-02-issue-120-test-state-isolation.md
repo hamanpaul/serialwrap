@@ -9,7 +9,7 @@
 **Tech Stack:** Python 3.10+、pytest（conftest hook）、unittest、systemd（guard 4 唯讀查詢）、JSON-RPC unix socket（`sw_core.client.rpc_call`）。
 
 **執行環境注意：**
-- 工作區：`/home/paul_chen/prj_pri/serialwrap/.worktrees/120-test-state-isolation`（分支 `feature/120-test-state-isolation`）。開工前 `git branch --show-current` 確認。
+- 工作區：repo 根下的 worktree `.worktrees/120-test-state-isolation`（分支 `feature/120-test-state-isolation`）。開工前 `git branch --show-current` 確認。
 - **Task 5 完成前，跑測試一律帶外層 env 隔離**（conftest 防線還沒上，直接跑會污染本機 live state）：
   ```bash
   ISO=$(mktemp -d) && env SERIALWRAP_STATE_DIR="$ISO/state" SERIALWRAP_WAL_DIR="$ISO/wal" \

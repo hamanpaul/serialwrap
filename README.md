@@ -911,6 +911,7 @@ python3 -m unittest discover -s tests -v
 常用單測：
 
 ```bash
+python3 -m pytest tests/test_session_bind.py -v
 python3 -m unittest tests.test_multiagent_e2e -v
 python3 -m unittest tests.test_session_bind -v
 ```
@@ -1218,7 +1219,7 @@ serialwrap client（支援本機 Unix socket 與遠端 endpoint）
 
 options:
   -h, --help           show this help message and exit
-  --socket SOCKET      本機 daemon 的 Unix socket 路徑（預設依 XDG 執行期目錄解析，可用 SERIALWRAP_RUN_DIR 覆寫）
+  --socket SOCKET      本機 daemon 的 Unix socket 路徑（未指定時依 config.yaml 與 XDG 執行期目錄解析，可用 SERIALWRAP_RUN_DIR 覆寫）
   --endpoint ENDPOINT  遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）
   --timeout TIMEOUT_S  RPC timeout 秒數（預設: 5.0）
 
