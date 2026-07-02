@@ -899,6 +899,12 @@ Linux 的 `/dev/ttyMCU`（PTY-bridge + sync-probe + baud 鏡射，#55）在 Wind
 ## 測試
 
 ```bash
+python3 -m pytest -q tests/
+```
+
+亦可用 unittest；但 unittest 不載入 `tests/conftest.py` 的 env 隔離與 live guard 防線，**有 production daemon 的機器一律以 pytest 為準**（#120，詳見 `CLAUDE.md` 測試政策）：
+
+```bash
 python3 -m unittest discover -s tests -v
 ```
 
