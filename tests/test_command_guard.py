@@ -3,8 +3,16 @@ import unittest
 from sw_core.service import SerialwrapService
 from sw_core.util import shell_command_incomplete_reason
 
+try:
+    import state_iso  # pytest／unittest discover：tests/ 在 sys.path
+except ImportError:  # python3 -m unittest tests.test_x（repo root 跑法，#120）
+    from tests import state_iso
+
 
 class TestCommandGuard(unittest.TestCase):
+    def setUp(self) -> None:
+        state_iso.isolate_testcase(self)  # #120 per-file 隔離（unittest 不載 conftest）
+
     def test_detect_unbalanced_single_quote(self) -> None:
         reason = shell_command_incomplete_reason("wpa_cli -i wl1 set_network 0 ssid '\"B0_6G_AP\"")
         self.assertEqual(reason, "UNBALANCED_SINGLE_QUOTE")
