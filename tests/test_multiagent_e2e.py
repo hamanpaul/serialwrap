@@ -176,6 +176,8 @@ targets:
             env["SERIALWRAP_RUN_DIR"] = str(root / "run")
             env["SERIALWRAP_BY_ID_DIR"] = str(by_id_dir)
             env["SERIALWRAP_BY_PATH_DIR"] = str(root / "by-path")
+            env["SERIALWRAP_WAL_DIR"] = str(root / "wal")  # #120：勿繼承外層 shell（曾真寫 live ~/b-log）
+            env["SERIALWRAP_CONFIG_DIR"] = str(root / "config")  # #120：隔離 config 維度
 
             socket_path = str(root / "run" / "serialwrapd.sock")
             lock_path = str(root / "run" / "serialwrapd.lock")
