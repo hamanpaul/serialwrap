@@ -55,7 +55,7 @@
 - Create: `tests/test_state_path_injection.py`
 - Modify: `sw_core/wal.py:16-17`
 
-- [ ] **Step 1: 寫 RED 測試**
+- [x] **Step 1: 寫 RED 測試**
 
 ```python
 # tests/test_state_path_injection.py
@@ -75,12 +75,12 @@ def test_walwriter_default_resolves_at_construction(tmp_path, monkeypatch):
     assert (tmp_path / "patched-wal").is_dir()
 ```
 
-- [ ] **Step 2: 跑測試確認 RED**
+- [x] **Step 2: 跑測試確認 RED**
 
 Run: `[ISO-ENV] python3 -m pytest tests/test_state_path_injection.py::test_walwriter_default_resolves_at_construction -v`
 Expected: FAIL——`w.wal_path` 指向 import-time 凍結的舊 `WAL_DIR`（def-time default 無視 setattr patch）。
 
-- [ ] **Step 3: 最小實作**
+- [x] **Step 3: 最小實作**
 
 `sw_core/wal.py:16-17` 改為：
 
@@ -91,12 +91,12 @@ Expected: FAIL——`w.wal_path` 指向 import-time 凍結的舊 `WAL_DIR`（def
         self._wal_dir = wal_dir or WAL_DIR
 ```
 
-- [ ] **Step 4: 跑測試確認 GREEN＋WAL 回歸**
+- [x] **Step 4: 跑測試確認 GREEN＋WAL 回歸**
 
 Run: `[ISO-ENV] python3 -m pytest tests/test_state_path_injection.py tests/test_wal.py -v`
 Expected: 全 PASS。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add tests/test_state_path_injection.py sw_core/wal.py
@@ -112,7 +112,7 @@ git commit -m "fix(wal): WalWriter wal_dir 改 None-sentinel 建構時解析，�
 - Modify: `sw_core/session_manager.py:340-357`（簽章）、`:409-435`（`_load_state`）、`:479-520`（`_save_state`）
 - Modify: `sw_core/service.py:216-240`
 
-- [ ] **Step 1: 追加 RED 測試**
+- [x] **Step 1: 追加 RED 測試**
 
 在 `tests/test_state_path_injection.py` 追加：
 
@@ -180,12 +180,12 @@ def test_service_passthrough(tmp_path, monkeypatch):
     assert not (tmp_path / "module-state.json").exists()
 ```
 
-- [ ] **Step 2: 跑測試確認 RED**
+- [x] **Step 2: 跑測試確認 RED**
 
 Run: `[ISO-ENV] python3 -m pytest tests/test_state_path_injection.py -v`
 Expected: 新增 4 個測試 FAIL——`SessionManager.__init__() got an unexpected keyword argument 'state_path'`（Task 1 的測試維持 PASS）。
 
-- [ ] **Step 3: 實作 `session_manager.py`**
+- [x] **Step 3: 實作 `session_manager.py`**
 
 簽章（`:340-350`）加 keyword＋建構時解析：
 
@@ -220,7 +220,7 @@ Expected: 新增 4 個測試 FAIL——`SessionManager.__init__() got an unexpec
 
 確認改完無殘留：`grep -n '[^_]STATE_PATH' sw_core/session_manager.py` 應只剩 `:32` 的 import 與 `__init__` 的 fallback。
 
-- [ ] **Step 4: 實作 `service.py` 透傳**
+- [x] **Step 4: 實作 `service.py` 透傳**
 
 `:216-224` 簽章加參數、`:232` 傳入：
 
@@ -250,12 +250,12 @@ Expected: 新增 4 個測試 FAIL——`SessionManager.__init__() got an unexpec
         )
 ```
 
-- [ ] **Step 5: 跑測試確認 GREEN＋回歸**
+- [x] **Step 5: 跑測試確認 GREEN＋回歸**
 
 Run: `[ISO-ENV] python3 -m pytest tests/test_state_path_injection.py tests/test_state_persistence_atomic.py tests/test_bounded_memory.py tests/test_session_bind.py tests/test_windows_claim.py -v`
 Expected: 全 PASS（fallback 相容性由後三檔實證）。
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add tests/test_state_path_injection.py sw_core/session_manager.py sw_core/service.py
@@ -270,7 +270,7 @@ git commit -m "feat(session): SessionManager/SerialwrapService 注入 state_path
 - Create: `tests/test_resolve_endpoint_sentinel.py`
 - Modify: `sw_core/cli.py:505`（argparse default）、`:274-312`（`_resolve_endpoint`）、`:175-224`（`_run_daemon_start`）
 
-- [ ] **Step 1: 寫 RED 測試**
+- [x] **Step 1: 寫 RED 測試**
 
 ```python
 # tests/test_resolve_endpoint_sentinel.py
@@ -331,12 +331,12 @@ def test_parser_socket_default_is_none():
 
 > 注意：`test_parser_socket_default_is_none` 的 parser 取得方式依 `cli.py` 實際結構調整——找 `argparse.ArgumentParser(prog="serialwrap"...)` 的建構函式名（`cli.py:494` 附近），若 parser 建構內嵌在 `main()` 就改為 `subprocess` 跑 `serialwrap --help` 型驗證或直接刪除此 case（前四個 case 已覆蓋語意）。
 
-- [ ] **Step 2: 跑測試確認 RED**
+- [x] **Step 2: 跑測試確認 RED**
 
 Run: `[ISO-ENV] python3 -m pytest tests/test_resolve_endpoint_sentinel.py -v`
 Expected: `test_socket_equal_to_default_is_explicit` FAIL（現行 `args.socket != SOCKET_PATH` 等值誤判 → 呼叫 `_safe_runtime_config` → AssertionError）；其餘依現行實作可能 PASS。
 
-- [ ] **Step 3: 實作**
+- [x] **Step 3: 實作**
 
 `cli.py:505`：
 
@@ -374,12 +374,12 @@ Expected: `test_socket_equal_to_default_is_explicit` FAIL（現行 `args.socket 
 - `:213` `"socket": sock`
 - `:216` `rpc_call(sock, "health.status", ...)`
 
-- [ ] **Step 4: 跑測試確認 GREEN＋回歸**
+- [x] **Step 4: 跑測試確認 GREEN＋回歸**
 
 Run: `[ISO-ENV] python3 -m pytest tests/test_resolve_endpoint_sentinel.py tests/test_cli_daemon_start.py tests/test_autospawn_gate.py tests/test_daemon_service_selector.py tests/test_constants_endpoint.py -v`
 Expected: 全 PASS。若 daemon start 回歸測試斷言了 `--socket` 預設值行為，依「等價替換」原則修測試斷言（結果 socket 應仍為 `SOCKET_PATH`）。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add tests/test_resolve_endpoint_sentinel.py sw_core/cli.py
@@ -394,7 +394,7 @@ git commit -m "fix(cli): --socket 改 None sentinel，有傳即明確；根修�
 - Create: `tests/liveguard.py`
 - Create: `tests/test_liveguard.py`
 
-- [ ] **Step 1: 寫 RED 測試**
+- [x] **Step 1: 寫 RED 測試**
 
 ```python
 # tests/test_liveguard.py
@@ -555,12 +555,12 @@ def test_daemon_untouched_passes():
     assert v == "PASS"
 ```
 
-- [ ] **Step 2: 跑測試確認 RED**
+- [x] **Step 2: 跑測試確認 RED**
 
 Run: `[ISO-ENV] python3 -m pytest tests/test_liveguard.py -v`
 Expected: 全 FAIL——`ModuleNotFoundError: No module named 'liveguard'`（乾淨 RED；pytest 預設 importmode 會把 `tests/` prepend 到 sys.path，`import liveguard` 於實作後可解析）。
 
-- [ ] **Step 3: 實作 `tests/liveguard.py`**
+- [x] **Step 3: 實作 `tests/liveguard.py`**
 
 ```python
 # tests/liveguard.py
@@ -751,12 +751,12 @@ def classify_daemon(pre: DaemonSnap, post: DaemonSnap) -> tuple[str, str]:
     return VERDICT_PASS, "live daemon 未被觸碰"
 ```
 
-- [ ] **Step 4: 跑測試確認 GREEN**
+- [x] **Step 4: 跑測試確認 GREEN**
 
 Run: `[ISO-ENV] python3 -m pytest tests/test_liveguard.py -v`
 Expected: 全 PASS（26 cases；plan 原碼 20 個＋review 修正追加 6 個）。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add tests/liveguard.py tests/test_liveguard.py
@@ -771,7 +771,7 @@ git commit -m "test(liveguard): #120 live guard 四維判定純函式＋逐失�
 - Create: `tests/conftest.py`
 - Modify: `tests/test_setup_materialize.py`（前 2 測試）
 
-- [ ] **Step 1: 寫 `tests/conftest.py`**
+- [x] **Step 1: 寫 `tests/conftest.py`**
 
 ```python
 # tests/conftest.py
@@ -892,7 +892,7 @@ def pytest_sessionfinish(session, exitstatus):
     shutil.rmtree(_ISO_ROOT, ignore_errors=True)
 ```
 
-- [ ] **Step 2: 修 `test_setup_materialize.py` 前 2 測試（conftest env shadow）**
+- [x] **Step 2: 修 `test_setup_materialize.py` 前 2 測試（conftest env shadow）**
 
 `test_materialize_copies_profiles_and_symlinks_skill`（:10-12）與 `test_materialize_does_not_overwrite_existing_profiles`（:22-24），在 `monkeypatch.setenv` 兩行之後各加：
 
@@ -903,17 +903,17 @@ def pytest_sessionfinish(session, exitstatus):
 
 （`setup_cmd._user_dirs` 為 runtime 讀 env 且 `SERIALWRAP_*` 優先於 XDG；conftest 第 1 層設定後會 shadow 掉這兩個只 patch XDG 的測試——同檔 `:60-63` 已有兩維度都管理的先例。）
 
-- [ ] **Step 3: 全 suite 驗證（不再需要 [ISO-ENV]）＋掃同型 shadow**
+- [x] **Step 3: 全 suite 驗證（不再需要 [ISO-ENV]）＋掃同型 shadow**
 
 Run: `python3 -m pytest -q tests/ --ignore=tests/test_human_agent_coexist.py --ignore=tests/test_multiagent_e2e.py --ignore=tests/test_multiagent_stress.py --ignore=tests/test_flash_pump.py --ignore=tests/test_flash_service_wiring.py --ignore=tests/test_agent_defer_tx.py 2>&1 | tail -15`
 Expected: 與 baseline 等值（825+ passed）＋新增測試全綠、guard 4 維度輸出 PASS/SKIP、**無新失敗**。若出現新失敗：逐一判別是否「runtime-lazy／reload 讀 XDG 但未管理 `SERIALWRAP_*`」同型 shadow（比照 Step 2 補 `delenv`）或 conftest 設計問題（修 conftest）。
 
-- [ ] **Step 4: 驗證 gate 快照確實在隔離前取得**
+- [x] **Step 4: 驗證 gate 快照確實在隔離前取得**
 
 Run: `python3 -m pytest -q tests/test_liveguard.py tests/test_state_path_injection.py -p no:cacheprovider 2>&1 | tail -5 && echo "live state mtime: $(stat -c %y ~/.local/state/serialwrap/state.json 2>/dev/null || echo ABSENT)"`
 Expected: PASS＋live state.json 的 mtime 未因跑測試而更新。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add tests/conftest.py tests/test_setup_materialize.py
@@ -928,7 +928,7 @@ git commit -m "test(conftest): #120 三層防線——強制 env 隔離＋autous
 - Modify: `tests/test_human_agent_coexist.py`（setUp `:113-177`、tearDown `:176-194`）
 - Modify: `tests/test_multiagent_e2e.py`（env 區塊 `:174-178`）
 
-- [ ] **Step 1: coexist——env 補 CONFIG_DIR＋資源建立即 addCleanup**
+- [x] **Step 1: coexist——env 補 CONFIG_DIR＋資源建立即 addCleanup**
 
 setUp 重排（建立一項、註冊一項；LIFO 自然得到 tmux→daemon→fake→tempdir 的正確清理順序），tearDown 整段刪除：
 
@@ -995,7 +995,7 @@ setUp 重排（建立一項、註冊一項；LIFO 自然得到 tmux→daemon→f
 
 （`shutil` 若未 import 則補；profile 字串與 Popen 參數原樣保留。）
 
-- [ ] **Step 2: e2e——env 補兩行**
+- [x] **Step 2: e2e——env 補兩行**
 
 `tests/test_multiagent_e2e.py:178` 後（`SERIALWRAP_BY_PATH_DIR` 之後）加：
 
@@ -1016,12 +1016,12 @@ setUp 重排（建立一項、註冊一項；LIFO 自然得到 tmux→daemon→f
 >    daemon 的 `ensure_runtime_dirs` 會 mkdir 到 live `~/.serialwrap/events.d`，且 live 有 event
 >    rules 時會被測試 daemon 載入執行（handler 是 `subprocess.Popen`）。
 
-- [ ] **Step 3: 跑這兩檔驗證（Task 3 已修向量 2，現在可以安全跑了）**
+- [x] **Step 3: 跑這兩檔驗證（Task 3 已修向量 2，現在可以安全跑了）**
 
 Run: `python3 -m pytest -q tests/test_human_agent_coexist.py tests/test_multiagent_e2e.py 2>&1 | tail -8 && pgrep -af 'sw-coexis[t]' || echo NO_LEAKED_DAEMON`
 Expected: 通過（t1/t8/TX-mismatch 為已知 pre-existing flaky，若失敗重跑一次判別）；**無殭屍 daemon 殘留**；conftest guard 輸出全 PASS/SKIP——live daemon 未被觸碰（向量 2 根修的實證）。
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add tests/test_human_agent_coexist.py tests/test_multiagent_e2e.py
@@ -1036,7 +1036,7 @@ git commit -m "test(subprocess): coexist/e2e 隔離 config 維度＋coexist addC
 - Create: `tests/state_iso.py`
 - Modify: 下表 8 檔
 
-- [ ] **Step 1: 寫共用 helper**
+- [x] **Step 1: 寫共用 helper**
 
 ```python
 # tests/state_iso.py
@@ -1078,7 +1078,7 @@ def isolate_testcase(tc) -> str:
     return td
 ```
 
-- [ ] **Step 2: 逐檔補隔離**
+- [x] **Step 2: 逐檔補隔離**
 
 | 檔案 | 型態 | 動作 |
 |---|---|---|
@@ -1113,7 +1113,7 @@ def _iso_state():
 
 實作時逐檔先看建構點實際型態再套模板（audit 行號為 2026-07-02 快照，以現檔為準）。
 
-- [ ] **Step 3: unittest runner 實證（無 conftest 防線下不觸 live）**
+- [x] **Step 3: unittest runner 實證（無 conftest 防線下不觸 live）**
 
 Run:
 ```bash
@@ -1121,12 +1121,12 @@ SENTINEL=$(mktemp -d) && env XDG_STATE_HOME="$SENTINEL" python3 -m unittest test
 ```
 Expected: 測試 OK＋`UNITTEST_ISOLATED_OK`。
 
-- [ ] **Step 4: pytest 全量回歸**
+- [x] **Step 4: pytest 全量回歸**
 
 Run: `python3 -m pytest -q tests/ --ignore=tests/test_human_agent_coexist.py --ignore=tests/test_multiagent_e2e.py --ignore=tests/test_multiagent_stress.py --ignore=tests/test_flash_pump.py --ignore=tests/test_agent_defer_tx.py 2>&1 | tail -5`
 Expected: 無新失敗（flash_service_wiring 此輪包含——它已被 Task 7 改動，需驗證）。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add tests/state_iso.py tests/test_session_capture.py tests/test_issue24_heartbeat.py tests/test_session_activity.py tests/test_command_guard.py tests/test_service_human_console.py tests/test_daemon_service_selector.py tests/test_mcu_cli_rpc.py tests/test_flash_service_wiring.py
@@ -1142,7 +1142,7 @@ git commit -m "test(iso): 8 檔未隔離測試補 per-file STATE_PATH/WAL_DIR �
 - Create: `changelog.d/120-test-state-isolation.md`
 - 檢查: `README.md`（若提及測試跑法）
 
-- [ ] **Step 1: CLAUDE.md 測試政策註記**
+- [x] **Step 1: CLAUDE.md 測試政策註記**
 
 「測試政策」段的 unittest 命令後加註：
 
@@ -1154,7 +1154,7 @@ git commit -m "test(iso): 8 檔未隔離測試補 per-file STATE_PATH/WAL_DIR �
   （注意：unittest 不載入 `tests/conftest.py` 的強制 env 隔離與 live guard 防線，僅 state.json 維度有 per-file 隔離；**有 production daemon 的機器一律以 pytest 為準**，#120。）
 ```
 
-- [ ] **Step 2: changelog fragment**
+- [x] **Step 2: changelog fragment**
 
 ```markdown
 ---
@@ -1165,12 +1165,12 @@ scope: tests
 修復測試污染 live state.json 的兩個向量：`SessionManager`/`SerialwrapService` 注入 `state_path`（in-process 測試不再寫 live）；CLI `--socket` 改 None sentinel（有傳即明確，杜絕等值誤判把測試 RPC 路由到 live daemon）。新增 `tests/conftest.py` 三層防線（強制 env 隔離／autouse STATE_PATH patch／live guard gate：state/WAL/config/daemon 四維快照，`SERIALWRAP_LIVE_GATE=warn` 逃生閥）、8 檔 per-file 隔離（unittest runner 防線）、coexist/e2e 隔離 config 維度＋coexist `addCleanup` 根絕 daemon 洩漏。
 ```
 
-- [ ] **Step 3: README 檢查**
+- [x] **Step 3: README 檢查**
 
 Run: `grep -n "unittest\|pytest" README.md | head`
 若 README 有測試跑法段落，同步加同款註記；沒有則跳過（R-18 為 WARN 不擋，但 tests 行為變更值得同步）。
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add CLAUDE.md changelog.d/120-test-state-isolation.md README.md
@@ -1181,12 +1181,12 @@ git commit -m "docs: #120 測試政策註記 pytest 為準＋changelog fragment"
 
 ### Task 9: 驗收
 
-- [ ] **Step 1: 完整 suite（本機、有 production daemon、無外層 env 前綴）**
+- [x] **Step 1: 完整 suite（本機、有 production daemon、無外層 env 前綴）**
 
 Run: `python3 -m pytest -q tests/ 2>&1 | tail -12`
 Expected: 無新失敗（pre-existing flaky 除外，失敗者重跑判別）；guard 輸出四維 PASS（daemon 維在本機為 PASS 非 SKIP）。
 
-- [ ] **Step 2: live 資源實證**
+- [x] **Step 2: live 資源實證**
 
 Run:
 ```bash
@@ -1202,7 +1202,7 @@ serialwrap session list | python3 -c "import json,sys; d=json.load(sys.stdin); p
 ```
 Expected: `LIVE_STATE_CLEAN`＋兩板仍 READY。
 
-- [ ] **Step 3: policy check（含 PR 參數複現 CI）**
+- [x] **Step 3: policy check（含 PR 參數複現 CI）**
 
 Run:
 ```bash
@@ -1213,7 +1213,7 @@ python3 -m policy_check --repo . \
 ```
 Expected: PASS（R-09 由 fragment 滿足；R-12 branch=feature/*；R-17 closing keyword；R-18 若 WARN 屬預期——CLAUDE.md/README 已同步）。
 
-- [ ] **Step 4: openspec tasks 勾稽**
+- [x] **Step 4: openspec tasks 勾稽**
 
 `openspec/changes/test-state-isolation-120/tasks.md` 全部勾 `[x]`（對應本 plan Task 1-9），commit：
 
