@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 import tempfile
 
 import pytest
@@ -17,7 +18,7 @@ import pytest
 import liveguard
 
 # ---- 第 0 步：live 快照（必須在覆寫任何 env 之前）----
-_MODE = os.environ.get("SERIALWRAP_LIVE_GATE", "strict")
+_MODE = os.environ.get("SERIALWRAP_LIVE_GATE", "strict").strip().lower()
 _SHELL_WAL_DIR = os.environ.get("SERIALWRAP_WAL_DIR")  # 覆寫前的外層 shell 值
 _PRE_STATE = liveguard.snap_file(liveguard.live_state_path())
 _PRE_WAL = liveguard.snap_file(liveguard.live_wal_path())
@@ -48,6 +49,24 @@ os.environ["SERIALWRAP_EVENTS_RUNTIME_DIR"] = _iso("events-rt")
 os.environ["SERIALWRAP_BY_ID_DIR"] = _iso("by-id")
 os.environ["SERIALWRAP_BY_PATH_DIR"] = _iso("by-path")
 
+# 這些變數優先序高於上方已覆寫目錄的推導值（如 SERIALWRAP_ENDPOINT 蓋過 RUN_DIR 推導的
+# socket、PROFILE_DIR 蓋過 CONFIG_DIR/profiles）——外層 shell 若 export 會穿透隔離。
+# pop 使其回歸「由已隔離目錄推導」的 default；hard-override 反而要在此重算一次路徑。
+for _k in (
+    "SERIALWRAP_ENDPOINT",
+    "SERIALWRAP_PROFILE_DIR",
+    "SERIALWRAP_TTYMCU_PATH",
+    "SERIALWRAP_EVENTS_LOG_PATH",
+    "SERIALWRAP_DATA_DIR",
+):
+    os.environ.pop(_k, None)
+
+# tripwire：第 1 層的前提是 sw_core.constants（import-time 凍結路徑）尚未被載入；
+# 若 conftest 頂層 import 鏈提前拉進它，隔離會全然無聲地失效——在此顯式釘住。
+assert "sw_core.constants" not in sys.modules, (
+    "sw_core.constants 已於 env 隔離前被 import——第 1 層隔離失效（檢查 conftest 頂層 import 鏈）"
+)
+
 
 # ---- 第 2 層：per-test STATE_PATH patch（消除順序耦合）----
 @pytest.fixture(autouse=True)
@@ -74,16 +93,24 @@ def pytest_sessionfinish(session, exitstatus):
             _PRE_SHELL_WAL, liveguard.snap_file(os.path.join(_SHELL_WAL_DIR, "raw.wal.ndjson")))))
 
     tr = session.config.pluginmanager.get_plugin("terminalreporter")
+
+    def _emit(line: str, *, red: bool = False, yellow: bool = False) -> None:
+        if tr is not None:
+            tr.write_line(line, red=red, yellow=yellow)
+        else:
+            print(line, file=sys.stderr)  # reporter 缺席時 gate FAIL 不得無聲
+
     failed = False
     for name, (verdict, reason) in results:
         line = f"[live-guard:{name}] {verdict}: {reason}"
         if verdict == liveguard.VERDICT_FAIL:
             failed = True
-        if tr is not None and verdict != liveguard.VERDICT_PASS:
-            tr.write_line(line, red=(verdict == liveguard.VERDICT_FAIL),
-                          yellow=(verdict == liveguard.VERDICT_WARN))
+        if verdict != liveguard.VERDICT_PASS:
+            _emit(line, red=(verdict == liveguard.VERDICT_FAIL),
+                  yellow=(verdict == liveguard.VERDICT_WARN))
     if failed:
-        if tr is not None:
-            tr.write_line("[live-guard] 偵測到 live 資源被測試觸碰（#120 回歸）——詳見上方各維度", red=True)
-        session.exitstatus = 1
+        _emit("[live-guard] 偵測到 live 資源被測試觸碰（#120 回歸）——詳見上方各維度", red=True)
+        # 只在原 exitstatus 乾淨時升為 1——不蓋掉 interrupted(2)/internal error(3) 等更高語意
+        if session.exitstatus == 0:
+            session.exitstatus = 1
     shutil.rmtree(_ISO_ROOT, ignore_errors=True)

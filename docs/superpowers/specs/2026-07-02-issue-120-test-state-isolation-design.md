@@ -69,6 +69,7 @@
 2. `tempfile.mkdtemp(prefix="sw-pytest-iso-")` 建 per-run 隔離根，**硬覆寫**（不是 `setdefault`；開發 shell 可能 export 指向 live 的值，如 `SERIALWRAP_WAL_DIR=~/b-log`，必須蓋掉）：
    - `SERIALWRAP_STATE_DIR`、`SERIALWRAP_RUN_DIR`、`SERIALWRAP_WAL_DIR`、`SERIALWRAP_CONFIG_DIR`、`SERIALWRAP_LOG_DIR`、`SERIALWRAP_EVENTS_DIR`、`SERIALWRAP_EVENTS_RUNTIME_DIR`
    - `SERIALWRAP_BY_ID_DIR`／`SERIALWRAP_BY_PATH_DIR` 指向空目錄（防 in-process 動態偵測抓到真板 → two-reader）。
+   - 另 **pop 5 個優先序高於目錄推導的 env**（`SERIALWRAP_ENDPOINT`、`SERIALWRAP_PROFILE_DIR`、`SERIALWRAP_TTYMCU_PATH`、`SERIALWRAP_EVENTS_LOG_PATH`、`SERIALWRAP_DATA_DIR`）——外層 shell 若 export 會蓋過已隔離目錄的推導值（如 `SERIALWRAP_ENDPOINT` 直指 live socket）穿透隔離；pop 使其回歸由隔離目錄推導的 default。
    - 附帶效果：`RUN_DIR` 跟隨 `STATE_DIR`（constants.py:31-32）→ `SOCKET_PATH`／`DEFAULT_ENDPOINT` 也離開 live，in-process 誤連 production socket 之路一併封死。
 3. 隔離根於 sessionfinish 清除。
 
