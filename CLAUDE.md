@@ -90,6 +90,9 @@ policy_version: 1.0.10
 ## 語言政策
 
 - 本 repo 文件、註解、docstring、README、規格、commit message 與 AI 回覆**一律使用繁體中文**。
+- **例外（雙語／對外發布素材）**：
+  - `README.md` 採**中英雙語並存**（`English` 章節 + `繁體中文` 章節；英文段為繁中段的對照翻譯，供非中文操作者閱讀）——兩段內容須保持一致，非以英文取代繁中。
+  - `brag-output/**` 為**對外發布素材**（launch video composition brief 等，目標受眾與影片字幕皆為英文），以**英文**撰寫，不受「一律繁中」限制。此為刻意例外，範圍僅限該目錄。
 
 ## Commit 政策
 
