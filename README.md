@@ -1,5 +1,367 @@
 # serialwrap
 
+> **[English](#english)** ｜ **[繁體中文](#繁體中文)**
+
+---
+
+## Install
+
+This README is the canonical operator reference. For a managed install that
+materializes profiles, the broker minicom wrapper, and daemon supervision, see
+[Quick Start](#quick-start). For the full Traditional Chinese reference,
+including diagrams and field validation notes, see [繁體中文](#繁體中文).
+
+```bash
+pipx install "git+https://github.com/hamanpaul/serialwrap@v0.2.2"
+serialwrap setup
+serialwrap doctor
+```
+
+## Usage
+
+`serialwrapd` owns the real UART. Agents, CLI users, and human consoles talk to
+the daemon through `serialwrap`, so command execution, raw console visibility,
+WAL capture, and recovery remain coordinated.
+
+```bash
+serialwrap daemon status
+serialwrap session list
+serialwrap session bind --selector COM0 --device-by-id /dev/serial/by-id/<target-by-id>
+serialwrap session attach --selector COM0
+serialwrap cmd submit --selector COM0 --mode line --source agent:diag --cmd "ifconfig"
+```
+
+## Version
+
+The canonical project version is [`VERSION`](./VERSION). Release history lives
+in [`CHANGELOG.md`](./CHANGELOG.md).
+
+---
+
+## English
+
+`serialwrap` is a broker for sharing one UART between multiple AI agents and
+multiple human consoles. The main runtime is `serialwrapd`; the `serialwrap` CLI
+and the broker-aware minicom wrapper are thin clients. The design keeps the
+target UART byte-clean while preserving single-writer arbitration, transparent
+console views, command result capture, and diagnostics.
+
+### Core Features
+
+- The target UART receives only raw commands or raw keystrokes; no begin/end
+  markers are injected into the target input stream.
+- Multiple minicom consoles can attach to the same COM session and observe the
+  same raw RX stream.
+- Foreground commands are serialized by the arbiter so agent and human writes do
+  not interleave.
+- Command execution supports `line`, `background`, and `interactive` modes.
+- Built-in `session self-test` and `session recover` classify missing devices,
+  TTY rebinding, stale bridges, target unresponsiveness, and login states.
+- Always-on `raw.wal.ndjson` plus `raw.mirror.log` and `log tail-text` provide
+  auditable UART evidence.
+
+### Prerequisites
+
+- **Python 3.10+**
+- **pipx**
+- **PyYAML** — installed automatically by the package metadata
+- **jq** — required by the broker minicom route
+- **minicom** — required for human console workflows on Linux/WSL
+
+For serial devices on Linux, add the user to `dialout` and log in again:
+
+```bash
+sudo usermod -aG dialout "$USER"
+```
+
+On WSL, enable systemd in `/etc/wsl.conf` and run `wsl --shutdown`; otherwise
+`serialwrap setup` falls back to on-demand daemon supervision.
+
+### Quick Start
+
+```bash
+# Managed install
+pipx install "git+https://github.com/hamanpaul/serialwrap@v0.2.2"
+serialwrap setup
+serialwrap doctor
+
+# Check daemon and sessions
+serialwrap daemon status
+serialwrap session list
+
+# Bind and attach the first target
+serialwrap session bind --selector COM0 --device-by-id /dev/serial/by-id/<target-by-id>
+serialwrap session attach --selector COM0
+
+# Run a foreground command
+serialwrap cmd submit --selector COM0 --mode line --source agent:diag --cmd "ifconfig"
+serialwrap cmd status --cmd-id <cmd_id>
+```
+
+For local development, run `./install.sh`; it performs the same package install
+and `serialwrap setup` flow from the checkout.
+
+### Architecture
+
+The broker path is:
+
+```text
+CLI / minicom wrapper
+  -> serialwrapd RPC
+  -> SerialwrapService
+  -> CommandArbiter / SessionManager
+  -> UARTBridge
+  -> target UART
+  -> WAL + mirror log + console fan-out
+```
+
+Key modules:
+
+- `sw_core/service.py` wires the service, RPC dispatch, arbiter, session
+  manager, device watcher, and WAL writer.
+- `sw_core/arbiter.py` runs one worker queue per session and enforces a single
+  UART writer.
+- `sw_core/session_manager.py` owns session state, binding, alias persistence,
+  console attach, interactive leases, recover, and capture.
+- `sw_core/uart_io.py` owns UART RX/TX, console fan-out, human raw mode, and
+  deferred human input during agent commands.
+- `sw_core/wal.py` writes `raw.wal.ndjson` and `raw.mirror.log`.
+
+### Session States
+
+Sessions normally move from `DETACHED` to `ATTACHING`, then either `ATTACHED`
+or `READY`.
+
+- `ATTACHED` means the bridge exists and human console access is available, but
+  line commands are not guaranteed to be frameable.
+- `READY` means the profile has a usable prompt and `ready_probe`; agent command
+  submission is allowed.
+- `RELEASED` means the real device has been handed off to an external tool.
+- `FLASHING` means the MCU flash endpoint is currently bridging an external
+  flasher.
+
+Command-capable profiles require a non-empty `ready_probe`. Passthrough-style
+profiles intentionally stay at `ATTACHED` and return
+`PROFILE_NOT_COMMAND_CAPABLE` for `cmd submit`.
+
+### Profiles and Binding
+
+Profiles live under `profiles/*.yaml` and define platform behavior, prompt
+matching, login prompts, ready probes, credentials environment variable names,
+and UART settings. Targets may be explicit, or the daemon can auto-detect a
+template from the current UART output.
+
+Profile selection precedence:
+
+```text
+pin > sticky > dynamic detection > others-template fallback
+```
+
+Use stable `/dev/serial/by-id/` or `/dev/serial/by-path/` selectors rather than
+volatile `/dev/ttyUSB*` names. If several boards use the same USB-serial chip
+and therefore share the same by-id value, prefer by-path.
+
+### Command Modes
+
+`line` is for commands that return to a prompt:
+
+```bash
+serialwrap cmd submit --selector COM0 --mode line --source agent:diag --cmd "ifconfig"
+serialwrap cmd status --cmd-id <cmd_id>
+```
+
+`background` is for commands that return a prompt early but keep producing
+output later:
+
+```bash
+serialwrap cmd submit --selector COM0 --mode background --source agent:bg --cmd "wl assoc scan"
+serialwrap cmd result-tail --cmd-id <cmd_id> --from-chunk 0 --limit 200
+```
+
+`interactive` is for full-screen or key-driven workflows:
+
+```bash
+serialwrap session interactive-open --selector COM0 --owner agent:menu --command "menuconfig"
+serialwrap session interactive-send --interactive-id <interactive_id> --data down --encoding key
+serialwrap session interactive-close --interactive-id <interactive_id>
+```
+
+Supported key encodings include `enter`, `tab`, `escape`, `ctrl-c`, `ctrl-d`,
+`up`, `down`, `left`, and `right`.
+
+### Human Console Coexistence
+
+The broker minicom wrapper is `serialwrap-minicom COMx`. The first human console
+attached to an `ATTACHED` or `READY` session receives raw interactive ownership,
+so arrow keys, Tab, and escape sequences behave like a direct minicom session.
+When an agent submits a command, the daemon suspends human raw mode, runs the
+agent command, then resumes the human console and flushes deferred input.
+
+```bash
+serialwrap-minicom COM0
+serialwrap session console-list --selector COM0
+serialwrap session console-detach --selector COM0 --client-id <client_id>
+```
+
+### File Transfer
+
+`file push` and `file pull` transfer files over UART using base64 chunks with
+checksum verification:
+
+```bash
+serialwrap file push --selector COM0 --local ./firmware.bin --remote /tmp/firmware.bin
+serialwrap file pull --selector COM0 --remote /etc/config/wireless --local ./wireless.bak
+```
+
+The session must be `READY`, and the target must provide `base64` and `md5sum`.
+
+### MCU Firmware Workflows
+
+For external flash tools that need exclusive access to the raw UART, release the
+device and reclaim it afterwards:
+
+```bash
+serialwrap device release --selector COM0 --source agent:flash --reason "flash CC2674"
+ocp-mcu-upgrade -d /dev/ttyUSB1 -b 115200 -t 8 -e -s -i fw.bin
+serialwrap device attach --selector COM0
+```
+
+Linux/WSL also supports the `/dev/ttyMCU` flash endpoint. The daemon remains the
+only real-device reader, probes for the MCU BSL ACK, bridges the external
+flasher only to the verified MCU line, and restores the session when flashing
+finishes:
+
+```bash
+serialwrap mcu patterns
+serialwrap mcu status
+# Endpoint is <run-dir>/dev/ttyMCU (SERIALWRAP_RUN_DIR, default
+# $XDG_RUNTIME_DIR/serialwrap; override with SERIALWRAP_TTYMCU_PATH). Point the flasher at it:
+ocp-mcu-upgrade -d "$XDG_RUNTIME_DIR/serialwrap/dev/ttyMCU" -b 115200 -t 8 -e -s -i fw.bin
+```
+
+### Diagnostics and Recovery
+
+Start with:
+
+```bash
+serialwrap session self-test --selector COM0
+serialwrap doctor
+serialwrap daemon status
+```
+
+Common classifications include `OK`, `DEVICE_MISSING`,
+`DEVICE_REBOUND_REQUIRED`, `BRIDGE_DOWN`, `VTTY_STALE`,
+`TARGET_UNRESPONSIVE`, `LOGIN_REQUIRED`, `ATTACHED_NOT_READY`,
+`REBOOTING`, `HUMAN_INTERACTIVE_ACTIVE`, and `PASSTHROUGH`.
+
+Use `recover` for unhealthy sessions:
+
+```bash
+serialwrap session recover --selector COM0
+```
+
+`recover` first tries to re-probe an attached bridge, then uses control
+characters for a `READY` shell, and finally reattaches when the bridge is gone
+but the device remains present.
+
+### Logs and Evidence
+
+Default output paths:
+
+| File | Purpose |
+|---|---|
+| `~/.local/state/serialwrap/wal/raw.wal.ndjson` | Authoritative append-only UART event log |
+| `~/.local/state/serialwrap/wal/raw.mirror.log` | Human-readable text mirror |
+| `~/.local/state/serialwrap/state.json` | Persistent aliases and binding overrides |
+| `~/b-log/{COM}_{YYMMDD}-{HHMMSS}.log` | Agent-triggered focused session capture |
+
+Useful commands:
+
+```bash
+serialwrap session log-start --selector COM0
+serialwrap session log-stop --selector COM0
+serialwrap log tail-text --selector COM0 --from-seq 0 --limit 200
+serialwrap wal export --from-seq 0 --limit 500
+serialwrap wal reset
+```
+
+### Windows Support
+
+Windows uses pyserial for `COMx` access and a loopback TCP RPC endpoint instead
+of Unix sockets. Human console transport uses a TCP listener that can be opened
+from TeraTerm or PuTTY.
+
+```powershell
+serialwrapd.exe --socket tcp://127.0.0.1:48700
+serialwrap.exe daemon status
+serialwrap.exe session list
+serialwrap.exe cmd submit --selector COM0 --cmd "ver"
+```
+
+On Windows, MCU flashing should use `device release` / `device attach`; the
+Linux `/dev/ttyMCU` PTY bridge model is not used.
+
+### Remote Support
+
+Remote operation is normally done through an SSH tunnel. The remote FAE host
+exposes the daemon Unix socket to loopback TCP with `socat`, and the RD host
+forwards that port through SSH:
+
+```bash
+# On the FAE host — the daemon socket is <run-dir>/serialwrapd.sock
+# (default $XDG_RUNTIME_DIR/serialwrap; override with SERIALWRAP_SOCKET).
+socat TCP-LISTEN:7777,bind=127.0.0.1,reuseaddr,fork \
+      UNIX-CONNECT:"$XDG_RUNTIME_DIR/serialwrap/serialwrapd.sock" &
+
+# On the RD host
+ssh -N -L 127.0.0.1:7777:127.0.0.1:7777 fae_user@fae_host
+serialwrap --endpoint tcp://127.0.0.1:7777 session list
+```
+
+Never expose the TCP bridge on a non-loopback interface; serialwrap RPC can
+submit commands, transfer files, and control the daemon.
+
+### Event Trigger Engine
+
+The event trigger engine watches UART RX lines and spawns bounded handler
+processes when rules match:
+
+```bash
+serialwrap event add --file rule.json
+serialwrap event list --selector COM0
+serialwrap event enable --selector COM0
+serialwrap event status --selector COM0
+serialwrap event tail --rule-id ops.kernel-panic -n 20
+```
+
+Handlers must finish within `timeout_ms`, avoid daemonizing, read the JSON
+payload from stdin, and use exit code `0` for success.
+
+### Testing
+
+```bash
+python3 -m pytest -q tests/
+```
+
+`pytest` is the policy reference because it loads the environment isolation and
+live-daemon guard in `tests/conftest.py`. `unittest` is still available for
+focused debugging:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+### Further Reading
+
+- Detailed design and API contract: [`docs/serialwrap-spec.md`](./docs/serialwrap-spec.md)
+- Heartbeat keepalive design: [`docs/design-heartbeat-keepalive.md`](./docs/design-heartbeat-keepalive.md)
+- File transfer design: [`docs/design-file-transfer.md`](./docs/design-file-transfer.md)
+- Event trigger design: [`docs/plan-event-trigger.md`](./docs/plan-event-trigger.md)
+
+---
+
+## 繁體中文
+
 `serialwrap` 是面向單一 UART、多 agent 與多人 console 共用的 broker。主線由 `serialwrapd`、`serialwrap` CLI 與 `minicom_router.sh` 組成，目標是在不污染 target UART 輸入的前提下，保留單寫入仲裁、透明 console 視圖、結果擷取與故障診斷能力。
 
 ## 核心特性
@@ -606,8 +968,9 @@ serialwrap mcu patterns
 serialwrap mcu status
 
 # 1) 先在 DUT console（serialwrap console session）把 MCU 帶進 BSL（GPIO reset，依板而定）
-# 2) host 改用 serialwrap 端點取代原本的 raw /dev/ttyUSBx：
-ocp-mcu-upgrade -d /tmp/serialwrap/dev/ttyMCU -b 115200 -t 8 -e -s -i fw.bin
+# 2) host 改用 serialwrap 端點取代原本的 raw /dev/ttyUSBx（端點為 <run-dir>/dev/ttyMCU；
+#    RUN_DIR 預設 $XDG_RUNTIME_DIR/serialwrap，可用 SERIALWRAP_TTYMCU_PATH 覆寫）：
+ocp-mcu-upgrade -d "$XDG_RUNTIME_DIR/serialwrap/dev/ttyMCU" -b 115200 -t 8 -e -s -i fw.bin
 # serialwrap 自動 sync-probe 認線 → bridge → 期望 Return error code : 0x0；燒完該 session 自動恢復 console
 ```
 
@@ -1051,8 +1414,9 @@ CLI（`bind` 只改 device、`recover`/`clear` 沿用舊 profile）。在 produc
 **步驟 1**：以 `socat` 將 Unix socket 暴露成 TCP（**只 bind loopback，不可對外**）：
 
 ```bash
+# socket 為 <run-dir>/serialwrapd.sock（RUN_DIR 預設 $XDG_RUNTIME_DIR/serialwrap，可 SERIALWRAP_SOCKET 覆寫）
 socat TCP-LISTEN:7777,bind=127.0.0.1,reuseaddr,fork \
-      UNIX-CONNECT:/tmp/serialwrap/serialwrapd.sock &
+      UNIX-CONNECT:"$XDG_RUNTIME_DIR/serialwrap/serialwrapd.sock" &
 ```
 
 > ⚠️ **安全注意**：
@@ -1104,8 +1468,8 @@ serialwrap --endpoint tcp://127.0.0.1:7777 cmd submit \
 
 | 格式 | 用途 |
 |---|---|
-| `/tmp/serialwrap/serialwrapd.sock` | 本機 Unix socket（預設，向後相容） |
-| `unix:///tmp/serialwrap/serialwrapd.sock` | 本機 Unix socket（顯式指定） |
+| `<run-dir>/serialwrapd.sock` | 本機 Unix socket（預設；RUN_DIR 預設 `$XDG_RUNTIME_DIR/serialwrap`，可 `SERIALWRAP_SOCKET` 覆寫） |
+| `unix://<run-dir>/serialwrapd.sock` | 本機 Unix socket（顯式 `unix://` 前綴） |
 | `tcp://127.0.0.1:7777` | 透過 ssh-tunnel 連接遠端 daemon |
 
 ### 限制與注意事項
@@ -1193,7 +1557,7 @@ Handler **建議**：
 
 - 詳細決策與 API 契約：[`docs/serialwrap-spec.md`](./docs/serialwrap-spec.md)
 
-## Install
+## 安裝
 
 ```bash
 pipx install "git+https://github.com/hamanpaul/serialwrap@v0.2.2"
@@ -1208,7 +1572,7 @@ serialwrap doctor    # 驗證環境
 
 依賴：Python 3.10+（`pipx install` 自動帶入 `pyyaml`）；human console 路徑另需 `jq` 與 `minicom`。
 
-## Usage
+## 使用方式
 
 <!-- BEGIN: cli-help marker="serialwrap-help" -->
 usage: serialwrap [-h] [--socket SOCKET] [--endpoint ENDPOINT]
@@ -1338,6 +1702,6 @@ serialwrap session bind --selector COM0 --device-by-id /dev/serial/by-id/<target
 serialwrap session attach --selector COM0
 ```
 
-## Version
+## 版本
 
 目前版本請見 [`VERSION`](./VERSION) 檔案。版本歷程請見 [`CHANGELOG.md`](./CHANGELOG.md)。

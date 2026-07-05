@@ -57,6 +57,7 @@ def _user_dirs(home: Path | str | None) -> dict[str, Path]:
         "config": config,
         "data": data,
         "agents_skill_link": home_path / ".agents" / "skills" / "serialwrap",
+        "legacy_agents_skill_link": home_path / ".agents" / "skills" / "serialwrap-mcp",
         "bin": home_path / ".local" / "bin",
     }
 
@@ -79,6 +80,19 @@ def _force_symlink(link: Path, target: Path) -> None:
     elif link.exists():
         link.unlink()
     link.symlink_to(target)
+
+
+def _remove_legacy_serialwrap_mcp_link(link: Path) -> None:
+    """移除舊版 ``serialwrap-mcp`` skill symlink，避免 agent 同時載入新舊 skill。
+
+    僅清理已知 legacy symlink；若使用者放的是真實目錄、一般檔或指向非
+    ``serialwrap-mcp`` 目標的 symlink，一律保留。
+    """
+    if not link.is_symlink():
+        return
+    target = link.readlink()
+    if target.name == "serialwrap-mcp" or "custom-skills/serialwrap-mcp" in str(target):
+        link.unlink()
 
 
 def _copy_profile_file(src_item: importlib.resources.abc.Traversable, dest: Path, *, force: bool) -> None:
@@ -196,6 +210,7 @@ def materialize_assets(
     skill_dest = dirs["data"] / "skill"
     _assets.copy_tree("skill", skill_dest)
     _force_symlink(dirs["agents_skill_link"], skill_dest)
+    _remove_legacy_serialwrap_mcp_link(dirs["legacy_agents_skill_link"])
 
     # ── 3. Minicom wrappers → ~/.local/bin（設可執行權限）───────────────
     bin_dest = dirs["bin"]

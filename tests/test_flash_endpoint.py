@@ -17,6 +17,11 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _open_noctty(path: str, flags: int) -> int:
+    """測試開 PTY slave 時避免取得 controlling terminal，防止 close 時收到 SIGHUP。"""
+    return os.open(path, flags | getattr(os, "O_NOCTTY", 0))
+
+
 def test_creates_pty_and_symlink():
     with tempfile.TemporaryDirectory() as d:
         link = os.path.join(d, "dev", "ttyMCU")
@@ -37,7 +42,7 @@ def test_endpoint_stays_silent_when_no_flash():
         ep = FlashEndpoint(link_path=link, on_flash_open=None)
         ep.start()
         try:
-            fd = os.open(link, os.O_RDONLY | os.O_NONBLOCK)
+            fd = _open_noctty(link, os.O_RDONLY | os.O_NONBLOCK)
             try:
                 time.sleep(0.8)            # 等數個 loop 週期
                 got = b""
@@ -63,7 +68,7 @@ def test_silent_even_after_client_write_when_no_match():
         ep = FlashEndpoint(link_path=link, on_flash_open=None)
         ep.start()
         try:
-            fd = os.open(link, os.O_RDWR | os.O_NONBLOCK)
+            fd = _open_noctty(link, os.O_RDWR | os.O_NONBLOCK)
             try:
                 os.write(fd, b"\x55\x55")   # 模擬 flasher sync
                 time.sleep(0.6)
@@ -102,7 +107,7 @@ def test_endpoint_slave_is_raw_for_byte_transparency():
         ep = FlashEndpoint(link_path=link)
         ep.start()
         try:
-            fd = os.open(link, os.O_RDWR | os.O_NONBLOCK)
+            fd = _open_noctty(link, os.O_RDWR | os.O_NONBLOCK)
             try:
                 oflag, lflag = termios.tcgetattr(fd)[1], termios.tcgetattr(fd)[3]
                 assert not (lflag & termios.ICANON)   # 非 canonical（不行緩衝）
@@ -123,7 +128,7 @@ def test_loop_survives_on_flash_open_exception():
         ep = FlashEndpoint(link_path=link, on_flash_open=boom)
         ep.start()
         try:
-            fd = os.open(link, os.O_RDWR | os.O_NONBLOCK)
+            fd = _open_noctty(link, os.O_RDWR | os.O_NONBLOCK)
             try:
                 os.write(fd, b"\x55\x55")        # 觸發 on_flash_open → 拋例外
                 time.sleep(0.5)

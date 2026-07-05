@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **`serialwrap setup` 清理舊版 serialwrap-mcp legacy symlink（#59）**：物化新版 `~/.agents/skills/serialwrap` skill 後，清理舊 `~/.agents/skills/serialwrap-mcp` legacy symlink，避免 agent 同時載入新舊 skill 誤走已退役 MCP 流程；僅清已知 legacy symlink，不刪同名真實目錄或一般檔。
+
+### Changed
+
+- **README：英文 operator reference + runtime path 修正**：新增英文 README 段；flash endpoint 與 daemon socket 範例路徑由舊 `/tmp/serialwrap/…` 改為 `<run-dir>/…`（RUN_DIR 預設 `$XDG_RUNTIME_DIR/serialwrap`，可 `SERIALWRAP_TTYMCU_PATH` / `SERIALWRAP_SOCKET` 覆寫），中英範例與 endpoint 對照表對齊。新增 `brag-output/composition-brief.md`（發表影片 composition brief），舊 `brag-plan.md` 改為指向 brief 的 tombstone。
+
 ## [0.2.2] - 2026-07-01
 
 ### Added
