@@ -2,6 +2,18 @@
 
 > **[English](#english)** ｜ **[繁體中文](#繁體中文)**
 
+## Demo
+
+![serialwrap — many AI agents and a human console share one UART, arbitrated and collision-free](brag-output/brag.gif)
+
+An AI agent drives real firmware over one serial line, two ways — raw tty vs the **serialwrap** broker:
+cleaner, ~2× faster, and safe for many agents (plus a human console) at once.
+
+一個 AI agent 隔一條序列線操作真實韌體的兩種做法——裸 tty vs **serialwrap** broker：更乾淨、約 2× 快，
+還能讓多個 agent（加一個真人 console）同時共用一條 UART。
+
+**One UART. Many masters. Zero collisions.** · [▶ full clip with sound／含聲音完整版](brag-output/brag.mp4)
+
 ---
 
 ## Install
