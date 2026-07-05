@@ -25,3 +25,6 @@ profiles/*.env
 # ctags 索引（產生物，含絕對路徑，不追蹤）
 tags-session-manager
 tags
+
+# brag 影片的 HyperFrames 生成專案（產出 brag.mp4/brag.gif 已提交；source 不入版控）
+brag-output/composition/
