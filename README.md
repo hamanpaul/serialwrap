@@ -16,7 +16,7 @@ cleaner, ~2× faster, and safe for many agents (plus a human console) at once.
 
 ## Pilot — one agent, one UART, two ways ｜ 單 agent 實測
 
-![serialwrap vs raw-tty agent pilot: an AI agent times a TCP handshake over one serial line two ways — the raw-tty arm hand-builds its own framing and pays ~2.1× the wall-clock time and ~2.3× the generated tokens the broker gives for free, and the arbiter serializes concurrent agents on one wire with zero byte collisions](docs/images/pilot-report.png)
+![serialwrap vs raw-tty single-agent pilot report — details in the text below](docs/images/pilot-report.png)
 
 An AI agent (codex · gpt-5.5, headless) times a TCP handshake on an Orange Pi 3 over one UART — once
 by hand on the raw tty, once through **serialwrap**. The raw-tty arm hand-builds its own framing and
