@@ -14,6 +14,21 @@ cleaner, ~2× faster, and safe for many agents (plus a human console) at once.
 
 **One UART. Many masters. Zero collisions.** · [▶ full clip with sound／含聲音完整版](brag-output/brag.mp4)
 
+## Pilot — one agent, one UART, two ways ｜ 單 agent 實測
+
+![serialwrap vs raw-tty agent pilot: an AI agent times a TCP handshake over one serial line two ways — the raw-tty arm hand-builds its own framing and pays ~2.1× the wall-clock time and ~2.3× the generated tokens the broker gives for free, and the arbiter serializes concurrent agents on one wire with zero byte collisions](docs/images/pilot-report.png)
+
+An AI agent (codex · gpt-5.5, headless) times a TCP handshake on an Orange Pi 3 over one UART — once
+by hand on the raw tty, once through **serialwrap**. The raw-tty arm hand-builds its own framing and
+pays **~2.1× the wall-clock time** and **~2.3× the generated tokens**; the broker also serializes
+concurrent agents on one wire with **zero byte collisions**. Single pilot run per arm (n=1) — a
+directional data point, not a benchmark.
+
+一個 AI agent（codex · gpt-5.5，headless）在 Orange Pi 3 上隔一條 UART 量測 TCP handshake——一次直接手動
+操作 raw tty，一次透過 **serialwrap**。raw tty 那組得自己搭 framing，代價是**約 2.1× 的 wall-clock 時間**
+與**約 2.3× 的 generated tokens**；broker 還能把並行 agent 在同一條線上序列化、**零 byte 碰撞**。每組僅單次
+pilot（n=1）——是方向性佐證，非正式 benchmark。
+
 ---
 
 ## Install
@@ -51,6 +66,8 @@ in [`CHANGELOG.md`](./CHANGELOG.md).
 ---
 
 ## English
+
+![serialwrap overview — from raw TTY to a managed, shareable UART broker, with human-in-the-loop collaboration and full state/WAL traceability](docs/images/serialwrap-en.png)
 
 `serialwrap` is a broker for sharing one UART between multiple AI agents and
 multiple human consoles. The main runtime is `serialwrapd`; the `serialwrap` CLI
@@ -374,6 +391,8 @@ python3 -m unittest discover -s tests -v
 
 ## 繁體中文
 
+![serialwrap 總覽——從 raw TTY 到受控共享的 UART broker，human-in-the-loop 協作與完整的狀態／WAL 可追溯](docs/images/serialwrap-tw.png)
+
 `serialwrap` 是面向單一 UART、多 agent 與多人 console 共用的 broker。主線由 `serialwrapd`、`serialwrap` CLI 與 `minicom_router.sh` 組成，目標是在不污染 target UART 輸入的前提下，保留單寫入仲裁、透明 console 視圖、結果擷取與故障診斷能力。
 
 ## 核心特性
@@ -679,7 +698,7 @@ dynamic 自動偵測 session 的 COM 編號**依裝置 by-id 字典序確定性�
 
 ```mermaid
 flowchart LR
-    DEF["defaults\nmax_sessions: 16"]
+    DEF["defaults<br/>max_sessions: 16"]
     ENV1["OPI.env"]
     ENV2["brcm.env"]
     OVR["state.json"]
@@ -691,16 +710,16 @@ flowchart LR
             P1["prpl-template"]
             P2["op3-template"]
             P3["brcm-template"]
-            P4["others-template\n(passthrough fallback)"]
+            P4["others-template<br/>(passthrough fallback)"]
         end
         subgraph TGT["targets (可選)"]
-            T0["explicit binding\nCOM→profile→device"]
+            T0["explicit binding<br/>COM→profile→device"]
         end
     end
 
     subgraph AUTO["auto-detect"]
         DT["detect_template()"]
-        DYN["動態建立 session\n_session_from_template()"]
+        DYN["動態建立 session<br/>_session_from_template()"]
     end
 
     DEF --> P1
