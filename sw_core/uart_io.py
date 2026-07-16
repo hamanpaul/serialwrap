@@ -360,8 +360,15 @@ class UARTBridge:
             # 首個 human console 自動取得 raw interactive ownership（對齊 Linux console-attach；
             # Windows 無 session_manager 代為授予，故於 bridge 層授予，使方向鍵/Tab 即時透傳，
             # 且 agent 命令時走 suspend/resume coexistence、連線不中斷）。
-            if self._interactive_owner is None:
+            # #134：suspend 期間（agent 命令執行中）_interactive_owner 被暫存為 None，
+            # 不得誤判為「首個 console」即時授予——owner 路徑會繞過 deferred buffer
+            # 直寫 UART、汙染 agent 命令輸出。改記到 _suspended_owner（原本為 None
+            # 時），期間輸入走既有 deferred 分支累積，resume 時無縫接手 raw 並 flush；
+            # suspend 前已有 owner 者維持第二 console 的 line-buffer 行為。
+            if self._interactive_owner is None and self._suspend_depth == 0:
                 self._interactive_owner = f"human:{client_id}"
+            elif self._suspend_depth > 0 and self._suspended_owner is None:
+                self._suspended_owner = f"human:{client_id}"
 
     def _console_loop(self) -> None:
         listener = self._console_listener
