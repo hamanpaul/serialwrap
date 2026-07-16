@@ -135,6 +135,11 @@ class TestSaveStateSerialized(_Base):
             for t in threads:
                 t.join(10.0)
 
+        # join(timeout) 不保證結束（Copilot review）：顯式斷言無 worker 卡死，
+        # 確實涵蓋「並發 _save_state 不會 deadlock」。
+        self.assertFalse(
+            any(t.is_alive() for t in threads), "worker 逾時仍存活（疑似 _save_state 卡死）"
+        )
         self.assertEqual(errors, [])
         self.assertEqual(max_active, 1, "os.replace 必須被 _state_io_lock 序列化")
         with open(sm_mod.STATE_PATH, encoding="utf-8") as fh:
