@@ -52,15 +52,15 @@ def _check_pyyaml() -> dict:
     }
 
 
-def _check_on_path(fx, name: str) -> dict:
-    """指定二進位是否在 PATH 上。"""
+def _check_on_path(fx, name: str, fix_hint: str = "確認 ~/.local/bin 在 PATH（pipx ensurepath）") -> dict:
+    """指定二進位是否在 PATH 上。``fix_hint`` 預設值即原 Linux 字串（輸出不變）。"""
     path = fx.which(name)
     ok = path is not None
     return {
         "check": f"{name}_on_path",
         "ok": ok,
         "detail": path or "找不到",
-        "fix": "" if ok else "確認 ~/.local/bin 在 PATH（pipx ensurepath）",
+        "fix": "" if ok else fix_hint,
     }
 
 
@@ -163,18 +163,109 @@ def _check_single_daemon(proc_root: str = "/proc") -> dict:
     return {"check": "single_daemon", "ok": ok, "detail": detail, "fix": fix}
 
 
-def run_doctor(fx=None, home=None) -> list[dict]:
+def _check_pyserial() -> dict:
+    """pyserial 是否可匯入（Windows 序列埠後端 _PySerialPort 需要，#84 PORT-1）。"""
+    try:
+        import serial  # noqa: F401,PLC0415
+
+        ok = True
+        detail = getattr(serial, "__version__", "已安裝")
+    except Exception:  # pragma: no cover - 環境相依
+        ok = False
+        detail = "未安裝"
+    return {
+        "check": "pyserial",
+        "ok": ok,
+        "detail": detail,
+        "fix": "" if ok else "安裝 pyserial（pipx 於 Windows 自動帶入；release exe 已內嵌）",
+    }
+
+
+def _check_daemon_endpoint() -> dict:
+    """daemon RPC TCP endpoint 是否可連（Windows，advisory：未起 daemon 不致命）。"""
+    from sw_core.cli import _default_runtime_config  # 延遲匯入避免循環（同 supervision_mode）
+    from sw_core.constants import DEFAULT_ENDPOINT
+    from sw_core.lock_win import _endpoint_alive
+
+    try:
+        cfg_sock = _default_runtime_config().socket_path()
+    except Exception:  # noqa: BLE001
+        cfg_sock = None
+    endpoint = cfg_sock or DEFAULT_ENDPOINT
+    ok = False
+    try:
+        ok = _endpoint_alive(endpoint)
+    except Exception:  # pragma: no cover - 探測永不拋
+        ok = False
+    return {
+        "check": "daemon_endpoint",
+        "ok": ok,
+        "detail": f"{endpoint}（{'可連' if ok else '未在跑'}）",
+        "fix": "" if ok else "serialwrap daemon start（或 serialwrapd.exe --socket tcp://127.0.0.1:48700）",
+    }
+
+
+def _check_devices_windows() -> dict:
+    """SERIALCOMM 登錄列舉 COM 裝置（排除藍牙與 windows.exclude_coms，#84 PORT-4）。"""
+    try:
+        from sw_core.device_source import _read_bt_ports, _read_serialcomm, exclude_bluetooth
+
+        try:
+            from sw_core.service import _load_exclude_coms
+
+            manual = _load_exclude_coms()
+        except Exception:  # noqa: BLE001
+            manual = set()
+        serialcomm = _read_serialcomm()
+        bt_ports = _read_bt_ports()
+        kept = exclude_bluetooth(serialcomm, bt_ports, manual)
+        excluded = len(serialcomm) - len(kept)
+        ok = len(kept) > 0
+        detail = f"{len(kept)}（{', '.join(sorted(kept))}）" if kept else "0"
+        if excluded:
+            detail += f"；排除 {excluded}（藍牙/exclude_coms）"
+    except Exception:  # pragma: no cover - 環境相依（registry 不可讀等）
+        ok = False
+        detail = "無法讀取 SERIALCOMM"
+    return {
+        "check": "devices",
+        "ok": ok,
+        "detail": detail,
+        "fix": "" if ok else "確認 USB-serial 已接上並出現在裝置管理員（藍牙 COM 會被自動排除）",
+    }
+
+
+def run_doctor(fx=None, home=None, *, platform: str | None = None) -> list[dict]:
     """執行所有環境檢查並回傳結果清單（每項皆唯讀、永不拋例外）。
 
     Args:
-        fx:   effects 介面；``None`` 時用 :class:`SystemEffects`。
-        home: 使用者家目錄（目前僅 supervision_mode 取用，保留供測試）。
+        fx:       effects 介面；``None`` 時用 :class:`SystemEffects`。
+        home:     使用者家目錄（目前僅 supervision_mode 取用，保留供測試）。
+        platform: 平台字串（``sys.platform`` 語意）；``None`` 時取實際平台。
+                  ``win*`` → Windows 檢查清單（#131 點 4：pyserial／PATH／daemon
+                  endpoint／SERIALCOMM 裝置），其餘 → 原 Linux 清單逐字不變
+                  （dialout／systemd／single_daemon／by-id devices／wsl_systemd）。
 
     Returns:
         檢查結果清單，每項為
         ``{"check", "ok", "detail", "fix"}``。
     """
     fx = fx if fx is not None else SystemEffects()
+    plat = platform if platform is not None else sys.platform
+    if plat.startswith("win"):
+        # Windows 單例由 WindowsSingletonLock（msvcrt 檔鎖 + TCP probe）強制，
+        # 無 /proc 可掃 → 不移植 single_daemon；dialout/systemd/wsl_systemd 不適用。
+        win_path_hint = "將 serialwrap.exe / serialwrapd.exe 所在目錄加入 PATH"
+        return [
+            _check_python(),
+            _check_pyyaml(),
+            _check_pyserial(),
+            _check_on_path(fx, "serialwrap", win_path_hint),
+            _check_on_path(fx, "serialwrapd", win_path_hint),
+            _check_supervision_mode(home),
+            _check_daemon_endpoint(),
+            _check_devices_windows(),
+        ]
     return [
         _check_python(),
         _check_pyyaml(),

@@ -1,31 +1,164 @@
-"""Task 12 — serialwrap doctor 環境診斷的單元測試。
+"""serialwrap doctor 環境診斷的單元測試。
 
-驗證重點：
+- Linux 檢查清單（順序與內容）逐字 pin（#131：doctor 平台感知後不得改變）。
 - dialout 群組缺漏時 ok=False 並給出 usermod 修復提示。
-- dialout 為成員時 ok=True 且 fix 為空字串。
-- python 檢查在目前直譯器（≥3.10）下必通過。
+- Windows（#131 點 4）：檢查清單改為 pyserial／PATH／daemon endpoint／SERIALCOMM
+  裝置列舉，不再有 dialout／systemd／wsl_systemd／single_daemon。
 """
+from __future__ import annotations
+
+import sys
+from unittest import mock
+
+from sw_core.doctor_cmd import run_doctor
+from sw_core.sysenv import FakeEffects
+
+
+LINUX_CHECKS = [
+    "python",
+    "pyyaml",
+    "serialwrap_on_path",
+    "serialwrapd_on_path",
+    "dialout",
+    "systemd",
+    "supervision_mode",
+    "single_daemon",
+    "devices",
+    "wsl_systemd",
+]
+
+WINDOWS_CHECKS = [
+    "python",
+    "pyyaml",
+    "pyserial",
+    "serialwrap_on_path",
+    "serialwrapd_on_path",
+    "supervision_mode",
+    "daemon_endpoint",
+    "devices",
+]
+
+
+def test_doctor_linux_check_list_pinned():
+    """Linux 清單順序逐字不變（#131 平台感知後的回歸 pin）。"""
+    report = run_doctor(fx=FakeEffects(systemd=True, in_groups={"dialout"}), platform="linux")
+    assert [i["check"] for i in report] == LINUX_CHECKS
 
 
 def test_doctor_reports_dialout_missing_with_fix():
-    from sw_core.sysenv import FakeEffects
-    from sw_core.doctor_cmd import run_doctor
     fx = FakeEffects(systemd=True, in_groups=set())  # 不在 dialout
-    report = run_doctor(fx=fx)
+    report = run_doctor(fx=fx, platform="linux")
     item = next(i for i in report if i["check"] == "dialout")
     assert item["ok"] is False
     assert "usermod -aG dialout" in item["fix"]
 
 
 def test_doctor_dialout_ok_when_member():
-    from sw_core.sysenv import FakeEffects
-    from sw_core.doctor_cmd import run_doctor
-    report = run_doctor(fx=FakeEffects(systemd=True, in_groups={"dialout"}))
+    report = run_doctor(fx=FakeEffects(systemd=True, in_groups={"dialout"}), platform="linux")
     item = next(i for i in report if i["check"] == "dialout")
     assert item["ok"] is True and item["fix"] == ""
 
 
 def test_doctor_python_check_passes_on_current_interpreter():
-    from sw_core.doctor_cmd import run_doctor
     report = run_doctor()
     assert next(i for i in report if i["check"] == "python")["ok"] is True
+
+
+class TestWindowsDoctor:
+    def _win_report(self, **patches):
+        defaults = {
+            "sw_core.lock_win._endpoint_alive": mock.DEFAULT,
+            "sw_core.device_source._read_serialcomm": mock.DEFAULT,
+            "sw_core.device_source._read_bt_ports": mock.DEFAULT,
+        }
+        with (
+            mock.patch("sw_core.lock_win._endpoint_alive", patches.get("alive", lambda ep: True)),
+            mock.patch(
+                "sw_core.device_source._read_serialcomm",
+                lambda: patches.get("serialcomm", {r"\Device\VCP2": "COM5", r"\Device\VCP3": "COM7"}),
+            ),
+            mock.patch(
+                "sw_core.device_source._read_bt_ports",
+                lambda: patches.get("bt", set()),
+            ),
+        ):
+            return run_doctor(fx=FakeEffects(systemd=False, in_groups=set()), platform="win32")
+
+    def test_windows_check_list(self):
+        report = self._win_report()
+        assert [i["check"] for i in report] == WINDOWS_CHECKS
+
+    def test_windows_has_no_linux_only_checks(self):
+        names = {i["check"] for i in self._win_report()}
+        assert names.isdisjoint({"dialout", "systemd", "wsl_systemd", "single_daemon"})
+
+    def test_pyserial_ok_when_importable(self):
+        item = next(i for i in self._win_report() if i["check"] == "pyserial")
+        # 本測試環境已裝 pyserial（CI 亦顯式安裝）→ ok。
+        assert item["ok"] is True and item["fix"] == ""
+
+    def test_pyserial_missing_reports_fix(self):
+        with mock.patch.dict(sys.modules, {"serial": None}):
+            report = self._win_report()
+        item = next(i for i in report if i["check"] == "pyserial")
+        assert item["ok"] is False
+        assert "pyserial" in item["fix"]
+
+    def test_daemon_endpoint_alive(self):
+        item = next(i for i in self._win_report(alive=lambda ep: True) if i["check"] == "daemon_endpoint")
+        assert item["ok"] is True
+
+    def test_daemon_endpoint_down_suggests_daemon_start(self):
+        item = next(i for i in self._win_report(alive=lambda ep: False) if i["check"] == "daemon_endpoint")
+        assert item["ok"] is False
+        assert "daemon start" in item["fix"]
+
+    def test_devices_lists_coms_and_excludes_bluetooth(self):
+        report = self._win_report(
+            serialcomm={
+                r"\Device\VCP2": "COM5",
+                r"\Device\BthModem0": "COM3",
+            },
+            bt={"COM3"},
+        )
+        item = next(i for i in report if i["check"] == "devices")
+        assert item["ok"] is True
+        assert "COM5" in item["detail"]
+        assert "COM3" not in item["detail"].split("排除")[0]  # 保留清單不含藍牙
+
+    def test_devices_none_after_exclusion_not_ok(self):
+        report = self._win_report(
+            serialcomm={r"\Device\BthModem0": "COM3"},
+            bt={"COM3"},
+        )
+        item = next(i for i in report if i["check"] == "devices")
+        assert item["ok"] is False
+
+
+class TestCliAdvisorySets:
+    def test_win_advisory_set_keeps_overall_ok(self):
+        """win advisory 全掛仍 ok=True；pyserial（非 advisory）掛 → False。"""
+        from sw_core import cli
+
+        report = [
+            {"check": "python", "ok": True},
+            {"check": "pyyaml", "ok": True},
+            {"check": "pyserial", "ok": True},
+            {"check": "serialwrap_on_path", "ok": False},
+            {"check": "serialwrapd_on_path", "ok": False},
+            {"check": "supervision_mode", "ok": True},
+            {"check": "daemon_endpoint", "ok": False},
+            {"check": "devices", "ok": False},
+        ]
+        assert all(
+            item["ok"] or item["check"] in cli._DOCTOR_ADVISORY_CHECKS_WIN for item in report
+        )
+        report[2]["ok"] = False  # pyserial 掛
+        assert not all(
+            item["ok"] or item["check"] in cli._DOCTOR_ADVISORY_CHECKS_WIN for item in report
+        )
+
+    def test_linux_advisory_set_unchanged(self):
+        from sw_core import cli
+
+        assert cli._DOCTOR_ADVISORY_CHECKS == {"systemd", "wsl_systemd", "devices"}

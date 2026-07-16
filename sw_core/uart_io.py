@@ -14,6 +14,7 @@ from typing import Any, Callable
 from .config import UartProfile
 from .constants import DEFERRED_INPUT_MAX_BYTES
 from .serial_port import SerialPort, open_serial_port
+from .telnet_console import TELNET_GREETING, TelnetFilter, escape_iac
 from .wal import WalWriter
 
 # 序列埠的 termios/fcntl 設定與 _BAUD_MAP 已收斂進 sw_core/serial_port.py 的 SerialPort
@@ -48,6 +49,9 @@ class ConsoleClient:
     # broker 內部哨兵 primary（start() 建、無外部 reader、作 snapshot.vtty 錨點）為 True，永不被 reaper 回收；
     # 經 attach_console / TCP accept 建立的真實 console 為 False。
     internal: bool = False
+    # Telnet 相容層（#131）：TCP console client 於 accept 時掛 TelnetFilter（server 主動
+    # 協商 + 入向 IAC 過濾 + 出向 IAC 逸出）；PTY（POSIX）路徑恆為 None、行為不變。
+    telnet: Any = None
 
 
 @dataclasses.dataclass
@@ -337,6 +341,7 @@ class UARTBridge:
             slave_path=self._console_endpoint or peer,
             attached_at=time.time(),
             sock=conn,
+            telnet=TelnetFilter(),
         )
         with self._state_lock:
             self._clients[client_id] = client
@@ -347,6 +352,12 @@ class UARTBridge:
             # 且 agent 命令時走 suspend/resume coexistence、連線不中斷）。
             if self._interactive_owner is None:
                 self._interactive_owner = f"human:{client_id}"
+        # Server 主動 telnet 協商（#131）：accept 即送 greeting（含合法 IAC，走不逸出的
+        # _console_sock_send）。Tera Term/PuTTY 以 Telnet 服務連入即得 char-mode + 遠端回顯。
+        try:
+            self._console_sock_send(client, TELNET_GREETING)
+        except OSError:
+            pass  # 對端秒斷線；由 console loop 的 recv b"" 收屍
 
     def _console_loop(self) -> None:
         listener = self._console_listener
@@ -550,22 +561,33 @@ class UARTBridge:
         （socket 斷線另由 console loop 的 recv b"" 偵測並 drop）。
         """
         if client.sock is not None:
-            # non-blocking socket 的 send() 可能只送出部分 bytes：必須迴圈推進 offset，
-            # 否則 RX fan-out / 本地回顯會在 partial send 時靜默截斷遺失尾端（#84 review）。
-            # 緩衝滿（BlockingIOError）時停止、丟棄剩餘（best-effort，與 PTY 路徑語意一致）；
-            # 其他 OSError（斷線）上拋由呼叫端 except OSError 吸收（斷線另由 recv b"" drop）。
-            view = memoryview(payload)
-            sent = 0
-            while sent < len(payload):
-                try:
-                    n = client.sock.send(view[sent:])
-                except BlockingIOError:
-                    break
-                if n <= 0:
-                    break
-                sent += n
+            # telnet client（#131）：先逸出 0xFF → IAC IAC 再送（協商 bytes 由
+            # _console_sock_send 直送、不經此處，不會被二次逸出）。
+            if client.telnet is not None:
+                payload = escape_iac(payload)
+            self._console_sock_send(client, payload)
         else:
             self._write_console_best_effort(client.master_fd, payload)
+
+    def _console_sock_send(self, client: ConsoleClient, payload: bytes) -> None:
+        """socket console 的原始送出原語（無 telnet 逸出）。
+
+        non-blocking socket 的 send() 可能只送出部分 bytes：必須迴圈推進 offset，
+        否則 RX fan-out / 本地回顯會在 partial send 時靜默截斷遺失尾端（#84 review）。
+        緩衝滿（BlockingIOError）時停止、丟棄剩餘（best-effort，與 PTY 路徑語意一致；
+        極端情況下可能切斷 IAC IAC 對，與 raw 模式掉尾風險同級）；
+        其他 OSError（斷線）上拋由呼叫端 except OSError 吸收（斷線另由 recv b"" drop）。
+        """
+        view = memoryview(payload)
+        sent = 0
+        while sent < len(payload):
+            try:
+                n = client.sock.send(view[sent:])
+            except BlockingIOError:
+                break
+            if n <= 0:
+                break
+            sent += n
 
     def _append_rx_text(self, payload: bytes) -> None:
         text = payload.decode("utf-8", errors="replace")
@@ -646,6 +668,18 @@ class UARTBridge:
         return lines, bytes(echo)
 
     def _handle_console_rx(self, client: ConsoleClient, data: bytes) -> None:
+        if client.telnet is not None:
+            # telnet 入向過濾（#131）：先於 flash gate 推進 parser 狀態——協商回覆屬
+            # client 向、不經 UART，flash 期間照送；資料位元組仍受下方 gate／owner／
+            # deferred 管制（deferred buffer 因此存的是已過濾 bytes）。
+            data, reply = client.telnet.feed(data)
+            if reply:
+                try:
+                    self._console_sock_send(client, reply)
+                except OSError:
+                    pass
+            if not data:
+                return
         with self._state_lock:
             if self._flash_mode:
                 # FLASHING 期間：console 為唯讀快照，丟棄所有 console→device 輸入，
@@ -910,13 +944,15 @@ class UARTBridge:
     def attach_console(self, *, label: str | None = None) -> dict[str, Any]:
         if not _pty_available():
             # Windows（#84 PORT-2）：human 直接連 TCP 端點，console client 於連線時自動建立；
-            # 此處回傳端點供呼叫端轉達使用者（TeraTerm/PuTTY raw 連 127.0.0.1:port）。
+            # 此處回傳端點供呼叫端轉達使用者。#131 起 listener 講 telnet（server 主動協商），
+            # TeraTerm/PuTTY 以 Telnet 服務連 127.0.0.1:port。
             return {
                 "client_id": None,
                 "label": label,
                 "vtty": self._console_endpoint,
                 "endpoint": self._console_endpoint,
                 "transport": "tcp",
+                "protocol": "telnet",
             }
         client = self._create_console_client(label)
         stale: list[ConsoleClient] = []

@@ -5,6 +5,7 @@ from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlsplit
 
+from sw_core.constants import LOOPBACK_TCP_HOSTS
 from sw_core.rpc_posix import serve_connection
 
 
@@ -57,7 +58,8 @@ class TcpRpcServer:
         self._server = None
 
 
-_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+# 單一事實來源移至 constants（#131：CLI 的 daemon start loopback 白名單共用）。
+_LOOPBACK_HOSTS = LOOPBACK_TCP_HOSTS
 
 
 def _parse_tcp(endpoint: str) -> tuple[str, int]:

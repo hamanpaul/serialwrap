@@ -47,6 +47,11 @@ def _parse_endpoint(endpoint: str) -> tuple[str, tuple[str, int] | str]:
     return "unix", endpoint
 
 
+def _af_unix_available() -> bool:
+    """本平台是否支援 ``AF_UNIX``（native Windows 的 CPython 不提供，#131）。"""
+    return hasattr(socket, "AF_UNIX")
+
+
 def rpc_call(socket_path: str, method: str, params: dict[str, Any], *, req_id: int = 1, timeout_s: float = 5.0) -> dict[str, Any]:
     """執行 RPC 呼叫。
 
@@ -65,6 +70,12 @@ def rpc_call(socket_path: str, method: str, params: dict[str, Any], *, req_id: i
             sock = socket.create_connection(address, timeout=timeout_s)  # type: ignore[arg-type]
             sock.settimeout(timeout_s)
         else:
+            if not _af_unix_available():
+                return {
+                    "ok": False,
+                    "error_code": "SOCKET_ERROR",
+                    "message": f"本平台無 AF_UNIX，無法連接 unix endpoint {socket_path!r}（請改用 tcp://127.0.0.1:<port>，#131）",
+                }
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             sock.settimeout(timeout_s)
             sock.connect(address)  # type: ignore[arg-type]

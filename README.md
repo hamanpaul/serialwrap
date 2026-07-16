@@ -317,14 +317,20 @@ serialwrap wal reset
 ### Windows Support
 
 Windows uses pyserial for `COMx` access and a loopback TCP RPC endpoint instead
-of Unix sockets. Human console transport uses a TCP listener that can be opened
-from TeraTerm or PuTTY.
+of Unix sockets (default `tcp://127.0.0.1:48700`; the CLI targets it
+automatically, no `--endpoint` needed, #131). Each session exposes a human
+console as a loopback TCP listener that speaks **Telnet** — connect with
+TeraTerm (Service: Telnet) or PuTTY (Telnet) for char-at-a-time interaction
+with remote echo; the `host:port` is shown as `console_endpoint` in
+`session list`.
 
 ```powershell
-serialwrapd.exe --socket tcp://127.0.0.1:48700
+serialwrap.exe daemon start        # spawns serialwrapd.exe detached, binds tcp loopback
 serialwrap.exe daemon status
-serialwrap.exe session list
+serialwrap.exe session list        # per-session "console_endpoint": "127.0.0.1:<port>"
 serialwrap.exe cmd submit --selector COM0 --cmd "ver"
+serialwrap.exe doctor              # Windows-aware checks (pyserial/PATH/endpoint/COM enumeration)
+serialwrap.exe skill --platform windows   # print the full Windows operating guide
 ```
 
 On Windows, MCU flashing should use `device release` / `device attach`; the
@@ -1228,7 +1234,7 @@ serialwrap wal current-seq
   - 後端自動依平台選擇，`SERIALWRAP_SERIAL_BACKEND`（`auto`／`posix`／`pyserial`）可覆寫；`pyserial` 為 Windows 後端執行期依賴（`pyproject` `sys_platform=='win32'`）。
 - **human console（PORT-2）**
   - **Linux/WSL**：PTY（minicom 開 `/dev/pts/N`），行為不變。
-  - **Windows**：無 PTY → `UARTBridge` 開 `127.0.0.1` TCP listener；**TeraTerm（TCP/IP, Service=Other）或 PuTTY（Raw）**連入即一個 console，沿用 raw ownership / suspend-resume coexistence / RX fan-out（agent 下命令期間連線不中斷）。連線端點見 `console_endpoint()` / `session console-attach` 回傳的 `host:port`。
+  - **Windows**：無 PTY → `UARTBridge` 開 `127.0.0.1` TCP listener，且 listener 講 **Telnet**（#131：accept 即主動協商 WILL ECHO／WILL SGA／DO SGA／WILL BINARY，入向吞協商並把 NVT 的 CR NUL／CR LF 摺疊為單一 CR、出向逸出 0xFF）——**TeraTerm（TCP/IP, Service=Telnet）或 PuTTY（Telnet）**連入即得逐字元互動與遠端回顯（體驗同 ssh），沿用 raw ownership / suspend-resume coexistence / RX fan-out（agent 下命令期間連線不中斷）。raw（Service=Other／PuTTY Raw）仍可連作備援，惟連線瞬間會見到 12 bytes 協商 greeting、且 0xFF 依 telnet 語意處理。連線端點見 `session list` 每個 session 的 `console_endpoint` 欄位（#131），或 `session console-attach` 回傳的 `endpoint`（`protocol: "telnet"`）。
 - 真機驗證：Windows 對 CH340（`COM8`，TxRx 短接 loopback）實測序列埠 start/RX/TX/WAL/clean-stop 與 TCP console raw/雙向/agent coexistence/斷線偵測全數通過。
 
 ### Windows Daemon（PORT-4）
@@ -1266,17 +1272,27 @@ dist\serialwrap.exe --help
 #### 啟動 Windows Daemon
 
 ```powershell
-# 開發 / 臨時使用（前景模式）
-serialwrapd.exe --socket tcp://127.0.0.1:48700
+# 建議路徑（#131）：daemon start 於 Windows 直接可用——
+# 預設 bind tcp://127.0.0.1:48700、detached 啟動（關閉終端機不殺 daemon）、冪等
+serialwrap.exe daemon start
 
-# 或直接 python 執行
+# 進階：手動前景執行（除錯用）
+serialwrapd.exe --socket tcp://127.0.0.1:48700
 python -m sw_core.daemon
 
-# CLI 操作（自動讀 config.yaml 或指定 endpoint）
+# CLI 操作免 --endpoint（#131：預設自動連 tcp loopback；config.yaml 殘留
+# unix socket_path 時自動 fallback 到 tcp canonical 並印 stderr 提示）
 serialwrap.exe daemon status
 serialwrap.exe session list
 serialwrap.exe cmd submit --selector COM0 --cmd "ver"
+
+# Windows 感知診斷與操作指南（#131）
+serialwrap.exe doctor
+serialwrap.exe skill --platform windows
 ```
+
+- `daemon start` 的 spawn 解析（#131）：release exe（PyInstaller 凍結）→ `serialwrap.exe` 同層 `serialwrapd.exe` → PATH 上的 `serialwrapd`；原始碼 checkout → `serialwrapd.py`；pip/pipx 安裝 → `-m sw_core.daemon`。
+- `--endpoint` 在 Windows 的 `daemon start` 開放 **loopback tcp://** 作為本機 bind 位址（非 loopback 照舊 `REMOTE_NOT_SUPPORTED`；POSIX 行為不變）。
 
 > ⚠️ Windows 尚無 systemd 監管（PORT-8）。長期使用建議以 Windows Task Scheduler 或 NSSM 管理 `serialwrapd.exe` 生命週期；`device release` / `device attach` 編排已可用（底層 COM release/reclaim primitive 可用）。
 

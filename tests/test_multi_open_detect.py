@@ -280,7 +280,9 @@ class TestDoctorSingleDaemon(unittest.TestCase):
     def test_run_doctor_includes_single_daemon(self) -> None:
         from sw_core.doctor_cmd import run_doctor
 
-        checks = {c["check"] for c in run_doctor()}
+        # single_daemon 為 Linux 檢查（/proc 掃描）；doctor 自 #131 平台感知，
+        # 於原生 Windows 也要能跑本測試 → 顯式 pin linux 清單。
+        checks = {c["check"] for c in run_doctor(platform="linux")}
         self.assertIn("single_daemon", checks)
 
 

@@ -283,15 +283,17 @@ class SessionRuntime:
 
     def to_public_dict(self) -> dict[str, Any]:
         console_count = 0
+        console_endpoint = None
         if self.bridge is not None:
             console_count = len(self.bridge.list_consoles())
+            console_endpoint = self.bridge.console_endpoint()
         elif self.retained_consoles is not None:
             console_count = len(self.retained_consoles.clients)
         vtty_path = self.vtty_path
         if vtty_path is None and self.retained_consoles is not None:
             vtty_path = self.retained_consoles.primary_vtty()
         outstanding = len(self.background_cmd_ids) + (1 if self.foreground_busy else 0)
-        return {
+        payload: dict[str, Any] = {
             "session_id": self.session_id,
             "profile": self.profile.profile_name,
             "com": self.profile.com,
@@ -334,6 +336,11 @@ class SessionRuntime:
                 "byte_count": self.active_capture.byte_count,
             } if self.active_capture else None,
         }
+        # Windows TCP console 連線端點（#131 點 3）：僅非 None（無 PTY 平台且 bridge
+        # 運行中）才輸出；POSIX 恆 None → 不加 key，session 輸出逐位元組不變。
+        if console_endpoint is not None:
+            payload["console_endpoint"] = console_endpoint
+        return payload
 
 
 class SessionManager:

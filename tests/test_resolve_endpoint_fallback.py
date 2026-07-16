@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import unittest
 from unittest import mock
 
@@ -66,9 +67,13 @@ class TestResolveEndpointFallback(unittest.TestCase):
             alive.assert_not_called()
 
     def test_unreadable_config_does_not_raise(self) -> None:
-        """config.yaml 損壞/不可讀（建構丟例外）→ 不 traceback，回預設 SOCKET_PATH（Codex Important #1）。"""
-        with mock.patch(
-            "sw_core.cli._default_runtime_config", side_effect=ValueError("bad yaml")
+        """config.yaml 損壞/不可讀（建構丟例外）→ 不 traceback，回預設 SOCKET_PATH（Codex Important #1）。
+
+        鎖定 posix backend：預設 fallback 自 #131 起平台感知，本測試 pin POSIX 行為。
+        """
+        with (
+            mock.patch.dict(os.environ, {"SERIALWRAP_RPC_BACKEND": "posix"}),
+            mock.patch("sw_core.cli._default_runtime_config", side_effect=ValueError("bad yaml")),
         ):
             self.assertEqual(cli._resolve_endpoint(self._args()), cli.SOCKET_PATH)
 

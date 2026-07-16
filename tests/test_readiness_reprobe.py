@@ -21,6 +21,9 @@ class FakeBridge:
     def list_consoles(self) -> list[dict]:
         return []
 
+    def console_endpoint(self) -> str | None:
+        return None  # to_public_dict 需要（#131；PTY 平台語意）
+
     def snapshot(self) -> dict:
         return {
             "running": True,
