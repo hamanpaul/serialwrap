@@ -471,6 +471,15 @@ class UARTBridge:
                 self._primary_client_id = next_client.client_id if next_client is not None else None
             if self._interactive_owner == f"human:{client_id}":
                 self._interactive_owner = None
+            if self._suspended_owner == f"human:{client_id}":
+                # suspend 期間斷線的（未來）owner（#136 review）：讓位 _suspended_owner，
+                # 否則 resume 會把 ownership 還原成已不存在的 client，之後任何新連線都
+                # 拿不到 raw ownership。刻意**不**比照 detach_console 歸零 _agent_active/
+                # _suspend_depth——suspend 簿記由 agent 命令路徑持有，命令仍在跑，歸零會
+                # 讓後續新連線立即取得 raw、重演 #134 的直寫汙染；讓位後新連線走 #134
+                # 的 elif 接手 _suspended_owner，於 resume 時取得 ownership。
+                self._suspended_owner = None
+            self._deferred_buffers.pop(client_id, None)
         self._close_console_client(client)
 
     def reap_stale_consoles(self, *, held_slave_paths: set[str] | None = None) -> list[ConsoleClient]:
