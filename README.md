@@ -1650,7 +1650,8 @@ command groups:
     supervision-mode   顯示有效的監管模式（on-demand、systemd-user 或 systemd-system）
     service            透過 systemctl 管理 serialwrap systemd service（systemd 監管模式適用）
     setup              安裝資產並設定監管模式（systemd-user／systemd-system／on-demand）
-    doctor             診斷安裝與執行環境（Python／PyYAML／PATH／dialout／systemd／裝置）
+    doctor             診斷安裝與執行環境（平台感知：Linux 檢 dialout／systemd／by-id 裝置，Windows 檢 pyserial／daemon endpoint／COM 列舉）
+    skill              輸出操作指南（skill）原文到 stdout（--platform windows 為 Windows 操作指南）
 
 examples:
   serialwrap session list
