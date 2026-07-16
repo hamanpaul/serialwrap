@@ -90,11 +90,16 @@ def _check_systemd(fx) -> dict:
 
 
 def _check_supervision_mode(home) -> dict:
-    """目前有效的監管模式（advisory，永遠 ok）。"""
-    # 延遲匯入：避免 doctor 對 cli 形成匯入循環，且 mode 在呼叫時才解析。
-    from sw_core.cli import _default_runtime_config
+    """目前有效的監管模式（advisory，永遠 ok）。
 
-    mode = _default_runtime_config().mode() or "on-demand"
+    以 ``_safe_runtime_config`` 讀取（#132 review）：config.yaml 損壞/不可讀時
+    退化回報 on-demand 預設，維持 run_doctor「永不拋例外」契約。
+    """
+    # 延遲匯入：避免 doctor 對 cli 形成匯入循環，且 mode 在呼叫時才解析。
+    from sw_core.cli import _safe_runtime_config
+
+    rc = _safe_runtime_config()
+    mode = (rc.mode() if rc is not None else None) or "on-demand"
     return {"check": "supervision_mode", "ok": True, "detail": mode, "fix": ""}
 
 

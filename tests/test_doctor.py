@@ -10,6 +10,8 @@ from __future__ import annotations
 import sys
 from unittest import mock
 
+import pytest
+
 from sw_core.doctor_cmd import run_doctor
 from sw_core.sysenv import FakeEffects
 
@@ -146,6 +148,25 @@ class TestWindowsDoctor:
         )
         item = next(i for i in report if i["check"] == "devices")
         assert item["ok"] is False
+
+
+class TestDoctorNeverRaises:
+    """run_doctor 契約「每項檢查永不拋例外」（#132 Copilot review）：
+    config.yaml 損壞（RuntimeConfig 建構即拋）時 supervision_mode 檢查
+    須回結構化結果（退化 on-demand），不得讓 doctor 崩潰。"""
+
+    @pytest.mark.parametrize("platform", ["linux", "win32"])
+    def test_broken_config_does_not_crash_doctor(self, platform: str) -> None:
+        with (
+            mock.patch("sw_core.cli._default_runtime_config", side_effect=ValueError("bad yaml")),
+            mock.patch("sw_core.lock_win._endpoint_alive", lambda ep: False),
+            mock.patch("sw_core.device_source._read_serialcomm", lambda: {}),
+            mock.patch("sw_core.device_source._read_bt_ports", lambda: set()),
+        ):
+            report = run_doctor(fx=FakeEffects(systemd=False, in_groups=set()), platform=platform)
+        item = next(i for i in report if i["check"] == "supervision_mode")
+        assert item["ok"] is True
+        assert item["detail"] == "on-demand"
 
 
 class TestCliAdvisorySets:
