@@ -34,7 +34,7 @@ from .constants import (
 )
 from .device_watcher import DeviceInfo
 from .login_fsm import detect_template, ensure_ready, probe_ready
-from .uart_io import PreservedConsoles, UARTBridge
+from .uart_io import PreservedConsoles, UARTBridge, _pty_available
 from .util import clean_text, now_iso
 from .wal import WalWriter
 
@@ -336,9 +336,10 @@ class SessionRuntime:
                 "byte_count": self.active_capture.byte_count,
             } if self.active_capture else None,
         }
-        # Windows TCP console 連線端點（#131 點 3）：僅非 None（無 PTY 平台且 bridge
-        # 運行中）才輸出；POSIX 恆 None → 不加 key，session 輸出逐位元組不變。
-        if console_endpoint is not None:
+        # Windows TCP console 連線端點（#131 點 3）：無 PTY 平台恆輸出（bridge 未起時
+        # 為 null，schema 跨 session 狀態穩定，consumer 不需處理 key 忽有忽無）；
+        # POSIX（有 PTY）不加 key → session 輸出逐位元組不變。
+        if console_endpoint is not None or not _pty_available():
             payload["console_endpoint"] = console_endpoint
         return payload
 

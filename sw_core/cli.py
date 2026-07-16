@@ -15,6 +15,7 @@ from .client import _af_unix_available, _parse_endpoint, rpc_call
 from .constants import (
     CONFIG_DIR,
     DEFAULT_ENDPOINT,
+    DEFAULT_TCP_PORT,
     LOCK_PATH,
     LOOPBACK_TCP_HOSTS,
     PROFILE_DIR,
@@ -95,10 +96,38 @@ def _configured_daemon_env_file() -> str | None:
     return value or None
 
 
+def _parse_env_file_simple(path: str) -> dict[str, str]:
+    """最小 env 檔解析（#131，Windows 用）。
+
+    支援 ``KEY=VALUE``、``export KEY=VALUE``、``#`` 註解與空行、單/雙引號包覆；
+    不做變數展開與 shell 語意。Windows 上不得經 bash source——Git Bash 的
+    ``env -0`` 會把整個環境 MSYS 化（PATH 轉成 ``/c/...`` 冒號分隔），
+    spawn 出的 serialwrapd 會拿到 Windows 無法使用的環境（#131 review）。
+    """
+    out: dict[str, str] = {}
+    with open(path, encoding="utf-8", errors="surrogateescape") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].lstrip()
+            key, sep, value = line.partition("=")
+            key = key.strip()
+            if not sep or not key:
+                continue
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                value = value[1:-1]
+            out[key] = value
+    return out
+
+
 def _load_daemon_start_env_files(env_files: Sequence[str]) -> tuple[dict[str, str], list[str]]:
     env = dict(os.environ)
     loaded_paths: list[str] = []
     seen_paths: set[str] = set()
+    use_simple_parser = _rpc_backend_is_win()  # #131：Windows 不經 bash（見 _parse_env_file_simple）
     for env_file in env_files:
         path = os.path.expanduser(str(env_file).strip())
         if not path or path in seen_paths:
@@ -107,21 +136,21 @@ def _load_daemon_start_env_files(env_files: Sequence[str]) -> tuple[dict[str, st
         if not os.path.isfile(path):
             continue
 
-        try:
-            proc = subprocess.run(
-                ["bash", "-lc", 'set -a && source "$1" >/dev/null && env -0', "serialwrap", path],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-                env=env,
-            )
-        except OSError as exc:
-            if select_rpc_backend() == "win":
-                # Windows 未裝 bash 但 env 檔存在 → 結構化錯誤而非 traceback（#131）。
-                raise EnvFileSourceError(
-                    path, f"無法以 bash source env 檔（Windows 未安裝 bash）：{exc}"
-                ) from exc
-            raise  # POSIX 例外流不變
+        if use_simple_parser:
+            try:
+                env.update(_parse_env_file_simple(path))
+            except OSError as exc:
+                raise EnvFileSourceError(path, f"無法讀取 env 檔：{exc}") from exc
+            loaded_paths.append(path)
+            continue
+
+        proc = subprocess.run(
+            ["bash", "-lc", 'set -a && source "$1" >/dev/null && env -0', "serialwrap", path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            env=env,
+        )
         if proc.returncode != 0:
             stderr = _decode_env_text(proc.stderr).strip()
             raise EnvFileSourceError(path, stderr or f"failed to source {path}")
@@ -197,15 +226,25 @@ def _probe_healthy_daemon(endpoint: str) -> bool:
 
 
 def _run_daemon_start(args: argparse.Namespace) -> int:
+    is_win = _rpc_backend_is_win()  # backend 不會於呼叫中途改變，一次判定全函式共用
     ep_arg = getattr(args, "endpoint", None)
-    if ep_arg and not (select_rpc_backend() == "win" and _is_loopback_tcp(ep_arg)):
+    if ep_arg and not (is_win and _is_loopback_tcp(ep_arg)):
         # Windows（win backend）開放 loopback tcp:// 作為本機 bind 位址（#131）；
         # 其餘（POSIX 一律、win 非 loopback）照舊拒絕，POSIX 訊息逐字保留。
-        if select_rpc_backend() == "win":
+        if is_win:
             message = "--endpoint 於 daemon start 僅接受 loopback tcp://（127.0.0.1/localhost/::1）作為本機 bind 位址"
         else:
             message = "--endpoint 不支援 daemon start（daemon 只能在本機啟動）"
         _print({"ok": False, "error_code": "REMOTE_NOT_SUPPORTED", "message": message})
+        return 2
+    if ep_arg and args.socket is not None and args.socket != ep_arg:
+        # 同給 --endpoint 與 --socket 且不一致：冪等探測（走 --endpoint）與 spawn bind
+        # （走 --socket）會指向不同位址，寧可顯式拒絕也不留下歧義（#131 review）。
+        _print({
+            "ok": False,
+            "error_code": "INVALID_ARGS",
+            "message": "--endpoint 與 --socket 不一致；daemon start 請擇一指定 bind 位址",
+        })
         return 2
     # 監管模式 gate（#108 #1）：systemd 模式下重導到 `service start`，避免顯式 daemon
     # start 繞過 unit 管理另起非託管 daemon（對稱於 `daemon stop` → `service stop`）。
@@ -233,7 +272,7 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
         sock = ep_arg
     else:
         sock = _local_default_endpoint()
-    if select_rpc_backend() == "win":
+    if is_win:
         daemon_argv = _daemon_spawn_argv()
         if daemon_argv is None:
             _print({
@@ -291,7 +330,7 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
 
     # 等待 daemon 就緒（POSIX 最多 3 秒；win backend 放寬至 10 秒——
     # PyInstaller onefile 冷啟需先解壓，#131）
-    attempts = 50 if select_rpc_backend() == "win" else 15
+    attempts = 50 if is_win else 15
     for attempt in range(attempts):
         time.sleep(0.2)
         if proc.poll() is not None:
@@ -334,15 +373,33 @@ def _run_daemon_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def _rpc_backend_is_win() -> bool:
+    """CLI 端的 rpc backend 判準（#131）。
+
+    包一層 ``select_rpc_backend()``：``SERIALWRAP_RPC_BACKEND`` 為無法識別的值時
+    不讓 ValueError 穿出 CLI（維持機器可解析 JSON 契約），退回實際平台判斷；
+    daemon 端仍以 select_rpc_backend 嚴格驗證。
+    """
+    try:
+        return select_rpc_backend() == "win"
+    except ValueError:
+        return os.name == "nt" or sys.platform.startswith("win")
+
+
 def _local_default_endpoint() -> str:
     """本機預設 endpoint（#131）。
 
-    win backend（native Windows，或 ``SERIALWRAP_RPC_BACKEND=win``）→ 平台感知
-    ``DEFAULT_ENDPOINT``（Windows 上為 tcp loopback，與 daemon 的 ``--socket``
-    預設一致）；其餘 → ``SOCKET_PATH``（POSIX 既有行為逐位元組不變）。
+    win backend（native Windows，或 ``SERIALWRAP_RPC_BACKEND=win``）→ tcp
+    loopback（與 daemon 的 ``--socket`` 預設一致）：native Windows 直用平台感知
+    ``DEFAULT_ENDPOINT``；POSIX 上以 env 模擬 win backend 時 ``DEFAULT_ENDPOINT``
+    仍是 unix 路徑，改組 tcp 預設（尊重 ``SERIALWRAP_TCP_PORT``），避免把 unix
+    路徑餵給 win 後端的 TcpRpcServer。其餘 → ``SOCKET_PATH``（POSIX 既有行為
+    逐位元組不變）。
     """
-    if select_rpc_backend() == "win":
-        return DEFAULT_ENDPOINT
+    if _rpc_backend_is_win():
+        if DEFAULT_ENDPOINT.startswith("tcp://"):
+            return DEFAULT_ENDPOINT
+        return f"tcp://127.0.0.1:{DEFAULT_TCP_PORT}"
     return SOCKET_PATH
 
 
@@ -360,6 +417,13 @@ def _endpoint_alive(ep: str) -> bool:
     except ValueError:
         return True
     if transport != "unix":
+        # POSIX：tcp endpoint 一律視為可連、跳過探測（#108 原語意，可能是 ssh tunnel）。
+        # win backend（#131）：tcp 是本機 canonical 的常態，殘留死 port 的 config 若不
+        # 實測就永遠不會觸發 dangling fallback，改用 lock_win 的 0.2s connect 探測。
+        if transport == "tcp" and _rpc_backend_is_win():
+            from .lock_win import _endpoint_alive as _tcp_alive  # 純 socket，msvcrt 為 lazy
+
+            return _tcp_alive(ep)
         return True
     if not _af_unix_available():
         # native Windows：無 AF_UNIX，unix endpoint 必然不可連（#131），

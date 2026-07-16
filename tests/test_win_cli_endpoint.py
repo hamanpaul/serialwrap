@@ -51,9 +51,24 @@ class TestEndpointAliveWithoutAfUnix:
         monkeypatch.delattr(socket, "AF_UNIX", raising=False)
         assert cli._endpoint_alive("unix:///tmp/serialwrap-131.sock") is False
 
-    def test_tcp_still_skipped_as_alive(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delattr(socket, "AF_UNIX", raising=False)
-        assert cli._endpoint_alive("tcp://127.0.0.1:65000") is True
+    def test_tcp_probed_for_real_on_win_backend(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """win backend（#131 review）：tcp endpoint 改實測（lock_win 0.2s probe），
+        殘留死 port 的 config 才會觸發 #108 dangling fallback。"""
+        monkeypatch.setenv("SERIALWRAP_RPC_BACKEND", "win")
+        with mock.patch("sw_core.lock_win._endpoint_alive", return_value=False) as probe:
+            assert cli._endpoint_alive("tcp://127.0.0.1:65000") is False
+        probe.assert_called_once_with("tcp://127.0.0.1:65000")
+        with mock.patch("sw_core.lock_win._endpoint_alive", return_value=True):
+            assert cli._endpoint_alive("tcp://127.0.0.1:65000") is True
+
+    def test_tcp_still_skipped_as_alive_on_posix_backend(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """POSIX 原語意逐位元組不變：tcp 一律視為可連、不探測（可能是 ssh tunnel）。"""
+        monkeypatch.setenv("SERIALWRAP_RPC_BACKEND", "posix")
+        with mock.patch("sw_core.lock_win._endpoint_alive") as probe:
+            assert cli._endpoint_alive("tcp://127.0.0.1:65000") is True
+        probe.assert_not_called()
 
     def test_unparseable_still_skipped_as_alive(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delattr(socket, "AF_UNIX", raising=False)
@@ -82,6 +97,22 @@ class TestLocalDefaultEndpoint:
         monkeypatch.setenv("SERIALWRAP_RPC_BACKEND", "win")
         monkeypatch.setattr(cli, "DEFAULT_ENDPOINT", "tcp://127.0.0.1:48700", raising=False)
         assert cli._local_default_endpoint() == "tcp://127.0.0.1:48700"
+
+    def test_win_backend_always_yields_tcp_even_on_posix(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """POSIX 上以 env 模擬 win backend（CLAUDE.md 明文 seam）：DEFAULT_ENDPOINT 仍為
+        unix 路徑，須改組 tcp 預設，不得把 unix 路徑餵給 win 後端。"""
+        monkeypatch.setenv("SERIALWRAP_RPC_BACKEND", "win")
+        monkeypatch.setattr(cli, "DEFAULT_ENDPOINT", "/run/user/1000/serialwrapd.sock", raising=False)
+        assert cli._local_default_endpoint() == f"tcp://127.0.0.1:{cli.DEFAULT_TCP_PORT}"
+
+    def test_invalid_backend_env_falls_back_to_real_platform(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SERIALWRAP_RPC_BACKEND", "not-a-backend")
+        expected = cli.DEFAULT_ENDPOINT if sys.platform.startswith("win") else cli.SOCKET_PATH
+        assert cli._local_default_endpoint() == expected
 
     def test_posix_backend_keeps_socket_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SERIALWRAP_RPC_BACKEND", "posix")
@@ -118,18 +149,43 @@ class TestResolveEndpointWinBackend:
         fake_rc = mock.Mock()
         fake_rc.socket_path.return_value = "/run/user/1000/serialwrap/serialwrapd.sock"
         fake_rc.mode.return_value = "on-demand"
-        with mock.patch("sw_core.cli._default_runtime_config", return_value=fake_rc):
+        with (
+            mock.patch("sw_core.cli._default_runtime_config", return_value=fake_rc),
+            mock.patch("sw_core.lock_win._endpoint_alive", return_value=True),  # canonical 可連
+        ):
             resolved = cli._resolve_endpoint(_args())
         assert resolved == "tcp://127.0.0.1:48700"
         assert "/run/user/1000/serialwrap/serialwrapd.sock" in capsys.readouterr().err
 
-    def test_tcp_config_used_verbatim(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """config 已記 tcp endpoint（daemon 寫回）→ 原值直用，不 fallback。"""
+    def test_stale_tcp_config_falls_back_to_canonical(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """config 殘留死 tcp port（如舊 --endpoint 實驗）→ 探測失敗改連 canonical（#131 review）。"""
+        monkeypatch.setenv("SERIALWRAP_RPC_BACKEND", "win")
+        monkeypatch.setattr(cli, "DEFAULT_ENDPOINT", "tcp://127.0.0.1:48700", raising=False)
+        fake_rc = mock.Mock()
+        fake_rc.socket_path.return_value = "tcp://127.0.0.1:47000"
+        fake_rc.mode.return_value = "on-demand"
+        with (
+            mock.patch("sw_core.cli._default_runtime_config", return_value=fake_rc),
+            mock.patch(
+                "sw_core.lock_win._endpoint_alive",
+                side_effect=lambda ep: ep == "tcp://127.0.0.1:48700",
+            ),
+        ):
+            assert cli._resolve_endpoint(_args()) == "tcp://127.0.0.1:48700"
+        assert "tcp://127.0.0.1:47000" in capsys.readouterr().err
+
+    def test_tcp_config_used_verbatim_when_alive(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """config 記錄的 tcp endpoint 可連 → 原值直用，不 fallback。"""
         monkeypatch.setenv("SERIALWRAP_RPC_BACKEND", "win")
         fake_rc = mock.Mock()
         fake_rc.socket_path.return_value = "tcp://127.0.0.1:49001"
         fake_rc.mode.return_value = "on-demand"
-        with mock.patch("sw_core.cli._default_runtime_config", return_value=fake_rc):
+        with (
+            mock.patch("sw_core.cli._default_runtime_config", return_value=fake_rc),
+            mock.patch("sw_core.lock_win._endpoint_alive", return_value=True),
+        ):
             assert cli._resolve_endpoint(_args()) == "tcp://127.0.0.1:49001"
 
     def test_explicit_socket_wins_regardless_of_backend(

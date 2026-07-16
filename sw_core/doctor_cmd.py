@@ -182,16 +182,25 @@ def _check_pyserial() -> dict:
 
 
 def _check_daemon_endpoint() -> dict:
-    """daemon RPC TCP endpoint 是否可連（Windows，advisory：未起 daemon 不致命）。"""
-    from sw_core.cli import _default_runtime_config  # 延遲匯入避免循環（同 supervision_mode）
-    from sw_core.constants import DEFAULT_ENDPOINT
+    """daemon RPC TCP endpoint 是否可連（Windows，advisory：未起 daemon 不致命）。
+
+    與 CLI 的 endpoint 解析同 seam（``_local_default_endpoint``）：config 記錄非
+    tcp:// 的殘留值（如 WSL unix 路徑）時視為缺席、改探測 canonical tcp，避免
+    doctor 與 CLI 的 #108 fallback 行為分歧（#131 review）。
+    """
+    from sw_core.cli import _local_default_endpoint, _safe_runtime_config  # 延遲匯入避免循環
     from sw_core.lock_win import _endpoint_alive
 
-    try:
-        cfg_sock = _default_runtime_config().socket_path()
-    except Exception:  # noqa: BLE001
-        cfg_sock = None
-    endpoint = cfg_sock or DEFAULT_ENDPOINT
+    rc = _safe_runtime_config()
+    cfg_sock = None
+    if rc is not None:
+        try:
+            cfg_sock = rc.socket_path()
+        except Exception:  # noqa: BLE001
+            cfg_sock = None
+    if cfg_sock and not str(cfg_sock).startswith("tcp://"):
+        cfg_sock = None  # unix 殘留 → 視為缺席，探測 canonical（同 CLI fallback 語意）
+    endpoint = cfg_sock or _local_default_endpoint()
     ok = False
     try:
         ok = _endpoint_alive(endpoint)
@@ -208,14 +217,14 @@ def _check_daemon_endpoint() -> dict:
 def _check_devices_windows() -> dict:
     """SERIALCOMM 登錄列舉 COM 裝置（排除藍牙與 windows.exclude_coms，#84 PORT-4）。"""
     try:
-        from sw_core.device_source import _read_bt_ports, _read_serialcomm, exclude_bluetooth
+        from sw_core.device_source import (
+            _load_exclude_coms,
+            _read_bt_ports,
+            _read_serialcomm,
+            exclude_bluetooth,
+        )
 
-        try:
-            from sw_core.service import _load_exclude_coms
-
-            manual = _load_exclude_coms()
-        except Exception:  # noqa: BLE001
-            manual = set()
+        manual = _load_exclude_coms()
         serialcomm = _read_serialcomm()
         bt_ports = _read_bt_ports()
         kept = exclude_bluetooth(serialcomm, bt_ports, manual)

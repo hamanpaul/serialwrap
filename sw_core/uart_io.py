@@ -51,7 +51,10 @@ class ConsoleClient:
     internal: bool = False
     # Telnet 相容層（#131）：TCP console client 於 accept 時掛 TelnetFilter（server 主動
     # 協商 + 入向 IAC 過濾 + 出向 IAC 逸出）；PTY（POSIX）路徑恆為 None、行為不變。
-    telnet: Any = None
+    telnet: TelnetFilter | None = None
+    # socket 送出序列化（#131 review）：RX fan-out（reader thread）與協商回覆/echo
+    # （console thread）對同一 socket 併發 send 會撕裂 IAC 逸出/協商序列；PTY 路徑不用。
+    sock_send_lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
 
 
 @dataclasses.dataclass
@@ -343,6 +346,13 @@ class UARTBridge:
             sock=conn,
             telnet=TelnetFilter(),
         )
+        # Server 主動 telnet 協商（#131）：accept 即送 greeting（含合法 IAC，走不逸出的
+        # _console_sock_send）。**先於註冊進 _clients**——註冊後 RX fan-out 即可能對此
+        # socket 送資料，greeting 若晚送會與 RX bytes 交錯、撕裂協商序列。
+        try:
+            self._console_sock_send(client, TELNET_GREETING)
+        except OSError:
+            pass  # 對端秒斷線；由 console loop 的 recv b"" 收屍
         with self._state_lock:
             self._clients[client_id] = client
             if self._primary_client_id is None:
@@ -352,12 +362,6 @@ class UARTBridge:
             # 且 agent 命令時走 suspend/resume coexistence、連線不中斷）。
             if self._interactive_owner is None:
                 self._interactive_owner = f"human:{client_id}"
-        # Server 主動 telnet 協商（#131）：accept 即送 greeting（含合法 IAC，走不逸出的
-        # _console_sock_send）。Tera Term/PuTTY 以 Telnet 服務連入即得 char-mode + 遠端回顯。
-        try:
-            self._console_sock_send(client, TELNET_GREETING)
-        except OSError:
-            pass  # 對端秒斷線；由 console loop 的 recv b"" 收屍
 
     def _console_loop(self) -> None:
         listener = self._console_listener
@@ -575,19 +579,25 @@ class UARTBridge:
         non-blocking socket 的 send() 可能只送出部分 bytes：必須迴圈推進 offset，
         否則 RX fan-out / 本地回顯會在 partial send 時靜默截斷遺失尾端（#84 review）。
         緩衝滿（BlockingIOError）時停止、丟棄剩餘（best-effort，與 PTY 路徑語意一致；
-        極端情況下可能切斷 IAC IAC 對，與 raw 模式掉尾風險同級）；
+        極端情況下可能切斷 IAC IAC 對，屬 best-effort 已知極限）；
         其他 OSError（斷線）上拋由呼叫端 except OSError 吸收（斷線另由 recv b"" drop）。
+
+        以 per-client ``sock_send_lock`` 序列化（#131 review）：RX fan-out（reader
+        thread，持 _state_lock）與協商回覆/greeting/echo（console thread，無
+        _state_lock）對同一 socket 併發 send 會把 IAC 序列插進逸出對中間。鎖序為
+        _state_lock → sock_send_lock 單向（持本鎖期間不再取其他鎖），無死鎖風險。
         """
-        view = memoryview(payload)
-        sent = 0
-        while sent < len(payload):
-            try:
-                n = client.sock.send(view[sent:])
-            except BlockingIOError:
-                break
-            if n <= 0:
-                break
-            sent += n
+        with client.sock_send_lock:
+            view = memoryview(payload)
+            sent = 0
+            while sent < len(payload):
+                try:
+                    n = client.sock.send(view[sent:])
+                except BlockingIOError:
+                    break
+                if n <= 0:
+                    break
+                sent += n
 
     def _append_rx_text(self, payload: bytes) -> None:
         text = payload.decode("utf-8", errors="replace")

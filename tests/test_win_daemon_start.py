@@ -38,37 +38,23 @@ def _args(**overrides) -> argparse.Namespace:
     return argparse.Namespace(**base)
 
 
-def _spawn_mocks(rpc_side_effect=None):
-    """_run_daemon_start spawn 路徑的標準 mock 組。"""
+def _run_with_mocks(args, monkeypatch, backend: str, rpc_side_effect=None):
+    """_run_daemon_start spawn 路徑的標準 mock 組（具名綁定，避免索引位移誤綁）。"""
+    monkeypatch.setenv("SERIALWRAP_RPC_BACKEND", backend)
     proc = mock.Mock(pid=4321, returncode=None)
     proc.poll.return_value = None
-    return proc, (
+    with (
         mock.patch("sw_core.cli._safe_runtime_config", return_value=None),
         mock.patch("sw_core.cli._probe_healthy_daemon", return_value=False),
         mock.patch("sw_core.cli._resolve_daemon_start_env_files", return_value=[]),
         mock.patch("sw_core.cli._load_daemon_start_env_files", return_value=({}, [])),
-        mock.patch("sw_core.cli.subprocess.Popen", return_value=proc),
+        mock.patch("sw_core.cli.subprocess.Popen", return_value=proc) as popen,
         mock.patch(
             "sw_core.cli.rpc_call",
             side_effect=rpc_side_effect or [{"ok": True}, {"ok": True}],
         ),
-        mock.patch("sw_core.cli.time.sleep"),
-        mock.patch("sw_core.cli._print"),
-    )
-
-
-def _run_with_mocks(args, monkeypatch, backend: str, rpc_side_effect=None):
-    monkeypatch.setenv("SERIALWRAP_RPC_BACKEND", backend)
-    proc, patches = _spawn_mocks(rpc_side_effect)
-    with (
-        patches[0],
-        patches[1],
-        patches[2],
-        patches[3],
-        patches[4] as popen,
-        patches[5],
-        patches[6] as sleeper,
-        patches[7] as printer,
+        mock.patch("sw_core.cli.time.sleep") as sleeper,
+        mock.patch("sw_core.cli._print") as printer,
     ):
         rc = cli._run_daemon_start(args)
     return rc, popen, printer, sleeper
@@ -229,24 +215,43 @@ class TestReadinessWindow:
         assert sleeper.call_count == 15
 
 
-class TestEnvFileWithoutBash:
-    def test_missing_bash_raises_env_file_source_error_on_win(
+class TestEnvFileOnWindows:
+    """#131 review：Windows env 檔不經 bash——Git Bash 的 env -0 會把整個環境 MSYS 化
+    （PATH 變 /c/... 冒號分隔），spawn 出的 serialwrapd 拿到不可用環境。改用內建最小解析。"""
+
+    def test_win_backend_parses_without_bash(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path
     ) -> None:
-        """Windows 無 bash 但 env 檔存在 → 結構化 EnvFileSourceError，非 FileNotFoundError traceback。"""
         monkeypatch.setenv("SERIALWRAP_RPC_BACKEND", "win")
         env_file = tmp_path / "OPI.env"
-        env_file.write_text("SW_OPI_U=haman\n", encoding="utf-8")
-        with (
-            mock.patch("sw_core.cli.subprocess.run", side_effect=FileNotFoundError("bash")),
-            pytest.raises(cli.EnvFileSourceError),
-        ):
-            cli._load_daemon_start_env_files([str(env_file)])
+        env_file.write_text(
+            "# 註解\nSW_OPI_U=haman\nexport SW_OPI_P='secret value'\nQUOTED=\"a b\"\n",
+            encoding="utf-8",
+        )
+        with mock.patch("sw_core.cli.subprocess.run") as run:
+            env, loaded = cli._load_daemon_start_env_files([str(env_file)])
+        run.assert_not_called()  # 不得呼叫 bash
+        assert loaded == [str(env_file)]
+        assert env["SW_OPI_U"] == "haman"
+        assert env["SW_OPI_P"] == "secret value"
+        assert env["QUOTED"] == "a b"
+        assert "PATH" in env  # 基底環境保留（overlay 而非整組替換）
 
-    def test_missing_bash_reraises_on_posix(
+    def test_win_backend_env_overlays_not_replaces(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path
     ) -> None:
-        """POSIX 例外流不變：OSError 照舊上拋。"""
+        monkeypatch.setenv("SERIALWRAP_RPC_BACKEND", "win")
+        monkeypatch.setenv("KEEP_ME", "yes")
+        env_file = tmp_path / "OPI.env"
+        env_file.write_text("NEW_VAR=1\n", encoding="utf-8")
+        env, _ = cli._load_daemon_start_env_files([str(env_file)])
+        assert env["KEEP_ME"] == "yes"
+        assert env["NEW_VAR"] == "1"
+
+    def test_posix_still_uses_bash_and_reraises_oserror(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """POSIX 例外流不變：bash 缺失的 OSError 照舊上拋。"""
         monkeypatch.setenv("SERIALWRAP_RPC_BACKEND", "posix")
         env_file = tmp_path / "OPI.env"
         env_file.write_text("SW_OPI_U=haman\n", encoding="utf-8")
@@ -255,6 +260,48 @@ class TestEnvFileWithoutBash:
             pytest.raises(FileNotFoundError),
         ):
             cli._load_daemon_start_env_files([str(env_file)])
+
+
+class TestEndpointSocketConflict:
+    def test_both_flags_divergent_rejected_on_win(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """--endpoint 與 --socket 不一致 → 顯式 INVALID_ARGS，不留探測/bind 歧義。"""
+        monkeypatch.setenv("SERIALWRAP_RPC_BACKEND", "win")
+        with (
+            mock.patch("sw_core.cli.subprocess.Popen") as popen,
+            mock.patch("sw_core.cli._print") as printer,
+        ):
+            rc = cli._run_daemon_start(
+                _args(endpoint="tcp://127.0.0.1:5000", socket="tcp://127.0.0.1:6000")
+            )
+        assert rc == 2
+        popen.assert_not_called()
+        assert printer.call_args.args[0]["error_code"] == "INVALID_ARGS"
+
+    def test_both_flags_identical_accepted_on_win(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rc, popen, printer, _ = _run_with_mocks(
+            _args(endpoint="tcp://127.0.0.1:5000", socket="tcp://127.0.0.1:5000"),
+            monkeypatch,
+            backend="win",
+        )
+        assert rc == 0
+        cmd = popen.call_args.args[0]
+        assert cmd[cmd.index("--socket") + 1] == "tcp://127.0.0.1:5000"
+
+
+class TestInvalidBackendEnv:
+    def test_unknown_backend_value_does_not_crash_cli(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SERIALWRAP_RPC_BACKEND 為未知值 → CLI 退回實際平台判斷，不 ValueError traceback。"""
+        monkeypatch.setenv("SERIALWRAP_RPC_BACKEND", "bogus")
+        assert cli._rpc_backend_is_win() == sys.platform.startswith("win")
+        # daemon start 路徑不炸（走實際平台行為）
+        rc, popen, printer, _ = _run_with_mocks(_args(), monkeypatch, backend="bogus")
+        assert rc == 0
 
 
 @pytest.mark.skipif(not sys.platform.startswith("win"), reason="原生 Windows detach 旗標對測")

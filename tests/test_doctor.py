@@ -66,11 +66,6 @@ def test_doctor_python_check_passes_on_current_interpreter():
 
 class TestWindowsDoctor:
     def _win_report(self, **patches):
-        defaults = {
-            "sw_core.lock_win._endpoint_alive": mock.DEFAULT,
-            "sw_core.device_source._read_serialcomm": mock.DEFAULT,
-            "sw_core.device_source._read_bt_ports": mock.DEFAULT,
-        }
         with (
             mock.patch("sw_core.lock_win._endpoint_alive", patches.get("alive", lambda ep: True)),
             mock.patch(
@@ -112,6 +107,24 @@ class TestWindowsDoctor:
         item = next(i for i in self._win_report(alive=lambda ep: False) if i["check"] == "daemon_endpoint")
         assert item["ok"] is False
         assert "daemon start" in item["fix"]
+
+    def test_daemon_endpoint_ignores_stale_unix_config(self):
+        """config 殘留非 tcp:// 的 unix socket_path → 視為缺席、探測 canonical，
+        不與 CLI 的 #108 fallback 行為分歧（#131 review）。"""
+        fake_rc = mock.Mock()
+        fake_rc.socket_path.return_value = "/run/user/1000/serialwrap/serialwrapd.sock"
+        probed: list[str] = []
+
+        def _probe(ep):
+            probed.append(ep)
+            return True
+
+        with mock.patch("sw_core.cli._safe_runtime_config", return_value=fake_rc):
+            report = self._win_report(alive=_probe)
+        item = next(i for i in report if i["check"] == "daemon_endpoint")
+        assert item["ok"] is True
+        assert "/run/user/1000" not in item["detail"]
+        assert probed and not probed[0].startswith("/run/user")
 
     def test_devices_lists_coms_and_excludes_bluetooth(self):
         report = self._win_report(

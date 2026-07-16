@@ -95,7 +95,10 @@ class TestResolveEndpointFallback(unittest.TestCase):
 
 class TestEndpointAlive(unittest.TestCase):
     def test_tcp_endpoint_skipped_as_alive(self) -> None:
-        self.assertTrue(cli._endpoint_alive("tcp://127.0.0.1:65000"))
+        # pin POSIX 語意（tcp 一律視為可連、不探測）；win backend 自 #131 起改實測，
+        # 該行為由 tests/test_win_cli_endpoint.py 覆蓋。
+        with mock.patch.dict(os.environ, {"SERIALWRAP_RPC_BACKEND": "posix"}):
+            self.assertTrue(cli._endpoint_alive("tcp://127.0.0.1:65000"))
 
     def test_unparseable_endpoint_skipped_as_alive(self) -> None:
         self.assertTrue(cli._endpoint_alive("tcp://"))  # 無 host/port → ValueError → skip
