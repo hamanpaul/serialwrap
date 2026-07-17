@@ -315,6 +315,15 @@ serialwrap wal export --from-seq 0 --limit 500
 serialwrap wal reset
 ```
 
+`log tail-raw` / `log tail-text` responses carry `from_seq` / `last_seq` /
+`current_seq` / `returned` / `truncated` metadata (#124); `returned` counts WAL
+records for `tail-raw` and text lines for `tail-text`. Queries and the
+`truncated` flag only cover the **current** `raw.wal.ndjson`: records rotated
+into `raw.wal.ndjson.<ts>` archives are not scanned — right after a rotation,
+latest mode may return fewer than `--limit` records with `truncated=false`;
+read the archive files directly if you need older records (`log tail-*` and
+`wal export` both read the current file only).
+
 ### Windows Support
 
 Windows uses pyserial for `COMx` access and a loopback TCP RPC endpoint instead
@@ -1206,7 +1215,9 @@ serialwrap wal export --from-seq 0 --limit 500
 - **latest 模式（預設，省略 `--from-seq`）**：回傳符合條件的**最新 N 筆**（seq 升冪），對應「看目前板子輸出到哪」的最常見用法。
 - **range 模式（顯式 `--from-seq N`，含 0）**：維持舊語意——自 `seq > N` 起回傳**最舊的 N 筆**，供增量讀取與老 client 相容。
 
-兩者回應皆附 metadata 欄位：`from_seq`（實際使用值，latest 模式為 `null`）、`last_seq`（回傳紀錄的最大 seq，無紀錄為 `null`，可作下次 `--from-seq` 增量起點）、`current_seq`（WAL 目前 seq 計數）、`returned`（回傳筆數）、`truncated`（是否還有符合但被 `--limit` 截掉的紀錄：latest 模式指視窗**之前**還有更舊紀錄、range 模式指視窗**之後**還有更新紀錄）。
+兩者回應皆附 metadata 欄位：`from_seq`（實際使用值，latest 模式為 `null`）、`last_seq`（回傳紀錄的最大 seq，無紀錄為 `null`，可作下次 `--from-seq` 增量起點）、`current_seq`（WAL 目前 seq 計數）、`returned`（回傳筆數：`tail-raw` 計 WAL records、`tail-text` 計文字行數）、`truncated`（是否還有符合但被 `--limit` 截掉的紀錄：latest 模式指視窗**之前**還有更舊紀錄、range 模式指視窗**之後**還有更新紀錄）。
+
+注意：查詢與 `truncated` 判定**僅涵蓋現行 `raw.wal.ndjson`**。WAL 輪替（rotation）後更舊紀錄保存在 `raw.wal.ndjson.<時戳>` 歸檔檔，不列入判定——rotation 剛發生時 latest 模式可能回不足 `--limit` 筆且 `truncated=false`；需要歸檔紀錄請直接讀取歸檔檔（`log tail-*` 與 `wal export` 皆僅讀現行檔）。
 
 ### WAL 管理
 

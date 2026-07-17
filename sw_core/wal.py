@@ -157,7 +157,10 @@ class WalWriter:
             return {"ok": True, "previous_seq": prev_seq, "rotated_suffix": ts}
 
     def _iter_matching(self, com: str | None) -> Iterator[dict[str, Any]]:
-        """逐行掃 WAL 檔，產出通過解析與 com 過濾的紀錄（seq 為 int 才算有效）。"""
+        """逐行掃**現行** WAL 檔（``raw.wal.ndjson``），產出通過解析與 com 過濾的紀錄（seq 為 int 才算有效）。
+
+        注意：輪替（rotation）歸檔的 ``raw.wal.ndjson.<ts>`` 檔不在掃描範圍內（#124 review）。
+        """
         with open(self._wal_path, "r", encoding="utf-8", errors="replace") as fp:
             for line in fp:
                 line = line.strip()
@@ -183,6 +186,9 @@ class WalWriter:
         - ``from_seq=None``（預設）：**latest 模式**——回傳符合條件的最新 ``limit`` 筆（#124）。
         - ``from_seq=N``（int，含 0）：**range 模式**——回傳 ``seq > N`` 起最舊的
           ``limit`` 筆（舊語意，供增量讀取與老 client 相容）。
+
+        兩種模式皆**僅掃描現行 WAL 檔**；輪替歸檔的更舊紀錄不列入（詳見
+        ``tail_raw_with_meta`` 的 scope 說明）。
         """
         rows, _ = self.tail_raw_with_meta(from_seq=from_seq, com=com, limit=limit)
         return rows
@@ -196,6 +202,11 @@ class WalWriter:
 
         - latest 模式（``from_seq=None``）：True 表示回傳視窗**之前**還有更舊的符合紀錄。
         - range 模式（``from_seq=N``）：True 表示回傳視窗**之後**還有更新的符合紀錄。
+
+        scope（#124 review）：查詢與 truncated 判定**僅涵蓋現行 WAL 檔**（``raw.wal.ndjson``）。
+        輪替（rotation）後更舊紀錄保存在 ``raw.wal.ndjson.<ts>`` 歸檔檔，不在掃描範圍內——
+        rotation 剛發生時 latest 模式可能回不足 ``limit`` 筆且 ``truncated=False``；
+        需要歸檔紀錄請直接讀取歸檔檔（``log tail-*`` 與 ``wal export`` 皆僅讀現行檔）。
         """
         if not os.path.exists(self._wal_path):
             return [], False

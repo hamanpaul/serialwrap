@@ -811,8 +811,17 @@ class SerialwrapService:
             selector = str(com or params.get("selector") or "")
             # params 未帶 from_seq key → None → latest 模式（回傳最新 N 筆，#124）；
             # 顯式帶值（含 0）→ 舊 range 增量語意（老 client 相容）。
+            # 設計決策（#124 review）：JSON 顯式 `null` 視同「未帶 key」走 latest——
+            # null 語意上即「沒有起點」，與省略一致；舊碼把 null 吃成 0（range 模式）屬
+            # `or 0` 的意外行為，不予保留。要 range 語意必須帶 int（含 0）。
             raw_from_seq = params.get("from_seq")
-            from_seq: int | None = int(raw_from_seq) if raw_from_seq is not None else None
+            from_seq: int | None = None
+            if raw_from_seq is not None:
+                try:
+                    from_seq = int(raw_from_seq)
+                except (TypeError, ValueError):
+                    # 非法值（如 ""、"abc"）明確回錯誤，維持「例外不穿越 RPC 邊界」慣例。
+                    return {"ok": False, "error_code": "INVALID_ARGS"}
             limit = int(params.get("limit") or 200)
             target_com: str | None = None
             if selector:
@@ -829,6 +838,8 @@ class SerialwrapService:
             # - current_seq：WAL 目前的 seq 計數
             # - returned：回傳筆數（tail_raw 計 records、tail_text 計 lines）
             # - truncated：latest 模式＝視窗前還有更舊符合紀錄；range 模式＝視窗後還有更新符合紀錄
+            #   scope：僅以現行 WAL 檔為範圍——輪替歸檔 raw.wal.ndjson.<ts> 不列入判定
+            #  （rotation 剛發生時 latest 模式可能回不足 limit 筆且 truncated=False，#124 review）
             meta: dict[str, Any] = {
                 "from_seq": from_seq,
                 "last_seq": rows[-1]["seq"] if rows else None,

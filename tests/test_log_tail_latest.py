@@ -71,6 +71,46 @@ class TestLogTailLatestRpc(unittest.TestCase):
         self.assertEqual(resp["returned"], 10)
         self.assertTrue(resp["truncated"])
 
+    def test_tail_raw_from_seq_json_null_means_latest(self) -> None:
+        """設計決策（#124 review）：JSON 顯式 `null` 視同「未帶 key」→ latest 模式。
+
+        舊碼 `int(params.get("from_seq") or 0)` 會把 null 吃成 0（range 模式），
+        屬意外行為、不予保留；要 range 語意必須帶 int（含 0）。
+        """
+        resp = self.svc.rpc("log.tail_raw", {"from_seq": None, "limit": 10})
+        self.assertTrue(resp["ok"])
+        self.assertEqual([r["seq"] for r in resp["records"]], list(range(21, 31)))
+        self.assertIsNone(resp["from_seq"])
+
+    def test_tail_raw_from_seq_invalid_returns_invalid_args(self) -> None:
+        """非法 from_seq（""、"abc"）→ 明確回 INVALID_ARGS，例外不穿越 RPC 邊界。"""
+        for bad in ("", "abc"):
+            with self.subTest(from_seq=bad):
+                resp = self.svc.rpc("log.tail_raw", {"from_seq": bad, "limit": 10})
+                self.assertFalse(resp["ok"])
+                self.assertEqual(resp["error_code"], "INVALID_ARGS")
+
+    def test_tail_text_from_seq_invalid_returns_invalid_args(self) -> None:
+        resp = self.svc.rpc("log.tail_text", {"from_seq": "", "limit": 10})
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error_code"], "INVALID_ARGS")
+
+    def test_tail_raw_missing_wal_file_metadata_shape(self) -> None:
+        """WAL 檔不存在（daemon 尚未寫入任何紀錄）時的 metadata 形狀（#124 review）。
+
+        釘死實際值：records=[]、returned=0、last_seq=None、current_seq=0、truncated=False。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            svc = _make_service(td)  # 不 append → raw.wal.ndjson 尚未建立
+            resp = svc.rpc("log.tail_raw", {"limit": 10})
+            self.assertTrue(resp["ok"])
+            self.assertEqual(resp["records"], [])
+            self.assertEqual(resp["returned"], 0)
+            self.assertIsNone(resp["from_seq"])
+            self.assertIsNone(resp["last_seq"])
+            self.assertEqual(resp["current_seq"], 0)
+            self.assertFalse(resp["truncated"])
+
     def test_tail_raw_not_truncated_when_limit_covers_all(self) -> None:
         resp = self.svc.rpc("log.tail_raw", {"limit": 100})
         self.assertEqual(resp["returned"], 30)
