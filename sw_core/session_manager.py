@@ -21,6 +21,9 @@ from .config import ProfileTemplate, SessionProfile
 from .constants import (
     BG_CAPTURE_MAX_BYTES,
     BG_CAPTURE_MAX_COUNT,
+    BOOT_BANNER_PATTERNS,
+    BOOT_BANNER_TAIL_CHARS,
+    BOOT_QUIET_WINDOW_S,
     BOOTLOADER_RX_TAIL_BYTES,
     HUMAN_ACTIVE_WINDOW_S,
     LOG_DIR,
@@ -33,7 +36,7 @@ from .constants import (
     _HUMAN_PEER_GRACE_S,
 )
 from .device_watcher import DeviceInfo
-from .login_fsm import detect_template, ensure_ready, probe_ready
+from .login_fsm import detect_boot_banner, detect_template, ensure_ready, probe_ready
 from .uart_io import PreservedConsoles, UARTBridge, _pty_available
 from .util import clean_text, now_iso
 from .wal import WalWriter
@@ -266,6 +269,24 @@ class SessionRuntime:
     released_reason: str | None = None
     # 動態 profile 來源（#95）：unknown / pin / sticky / detected / fallback / yaml-target
     profile_source: str = "unknown"
+    # U-Boot autoboot 保護（#130）：boot quiet window 截止時刻（monotonic；0.0=未啟用）。
+    # 視窗內 gate 以下所有自動 system probe TX（#130 review 收斂後的完整清單，逐一在各自
+    # 呼叫點呼叫 boot_quiet_active()）：
+    #   - _handle_reboot_command 觸發的 _spawn_reboot_recovery（reboot recovery 迴圈）
+    #   - _prepare_reprobe_locked / _reprobe_target_still_valid_locked（readiness reprobe）
+    #   - _attach_by_id（attach probe，含 DUT reboot 期間裝置 re-enumerate 觸發的 re-attach）
+    #   - _probe_existing_bridge（attach_session ATTACHED 分支與 recover_session ATTACHED
+    #     分支共用的唯一 probe 入口）
+    #   - _recover_after_failure 的 CTRL_C/CTRL_D 強制按鍵迴圈（agent 命令逾時觸發）
+    #   - _self_test_impl 的 READY 分支 nonce probe
+    # **絕不** gate human console bytes、interactive lease TX 與 agent 顯式命令
+    # （與 #114「刻意進 bootloader」的未來需求相容：human/lease 送鍵永遠放行）。
+    # 已知架構限制（#130 Finding 4，未修、待 follow-up issue）：本欄位只影響上述自動 probe
+    # gate，**不**改動 session.state；spontaneous reboot 時 state 可能仍停在 READY，此狀態下
+    # agent 顯式命令仍可能撞上 autoboot（不受本欄位保護，需要新 state 或 arbiter 層 gate）。
+    boot_quiet_until: float = 0.0
+    # banner 偵測用 rolling RX tail（跨 chunk 邊界）；純內部狀態，不出 to_public_dict。
+    boot_banner_tail: str = ""
     # MCU 燒錄狀態（issue #55）：僅 runtime transient，不寫 _save_state / to_public_dict
     flash_prev_state: str | None = None
     # recovery lease stash（Phase B issue #44）
@@ -305,6 +326,28 @@ class SessionRuntime:
         self.reprobe_attempts = 0
         self.next_reprobe_at = None
         self.reprobe_exhausted = False
+
+    def boot_quiet_active(self, now: float | None = None) -> bool:
+        """boot quiet window 是否進行中（#130）。"""
+        if self.boot_quiet_until <= 0.0:
+            return False
+        return (time.monotonic() if now is None else now) < self.boot_quiet_until
+
+    def arm_boot_quiet(self, now: float | None = None) -> None:
+        """啟用／延長 boot quiet window，並清空 rolling tail（#130）。
+
+        清 tail 是必要的：reboot 命令送出當下，tail 可能還殘留送出前的 shell
+        prompt，若不清掉，下一個 RX chunk 的解除檢查會被舊 prompt 誤觸發、
+        quiet window 立即失效。
+        """
+        base = time.monotonic() if now is None else now
+        self.boot_quiet_until = base + BOOT_QUIET_WINDOW_S
+        self.boot_banner_tail = ""
+
+    def clear_boot_quiet(self) -> None:
+        """解除 boot quiet window 並清空 rolling tail（#130）。"""
+        self.boot_quiet_until = 0.0
+        self.boot_banner_tail = ""
 
     def to_public_dict(self) -> dict[str, Any]:
         console_count = 0
@@ -347,6 +390,13 @@ class SessionRuntime:
             "reprobe_attempts": self.reprobe_attempts,
             "next_reprobe_at": self.next_reprobe_at,
             "reprobe_exhausted": self.reprobe_exhausted,
+            # #130：boot quiet window 剩餘秒數（None=未啟用/已解除；monotonic 差值，
+            # 跨程序可讀）。供 doctor / session list 觀測 autoboot 保護狀態。
+            "boot_quiet_remaining_s": (
+                round(self.boot_quiet_until - time.monotonic(), 1)
+                if self.boot_quiet_until > 0.0 and self.boot_quiet_until > time.monotonic()
+                else None
+            ),
             "idle_for_ms": self.compute_idle_ms(),
             "outstanding_commands": outstanding,
             "activity_classification": self.classify_activity(),
@@ -808,6 +858,11 @@ class SessionManager:
             return None
         if session.next_reprobe_at is not None and now < session.next_reprobe_at:
             return None
+        # #130：boot quiet window 內不自動重探（probe 的 "\n" 會打斷 U-Boot autoboot）。
+        # 不累加 attempts、不排 backoff——window 解除（RX 見 login/prompt）或過期後，
+        # 下一個 tick 立即恢復既有 reprobe 流程。
+        if session.boot_quiet_active(now):
+            return None
         if not self._is_reprobe_prompt_error(session.state, session.last_error):
             return None
         if not self._rx_idle_enough(session, now):
@@ -875,6 +930,10 @@ class SessionManager:
         if session.reprobe_exhausted:
             return False
         if not self._is_reprobe_prompt_error(session.state, session.last_error):
+            return False
+        # #130：job 收集後、worker 實際寫入前 boot banner 才抵達 → 最終驗證擋下，
+        # 不得對 autoboot 倒數中的 UART 送 probe bytes。
+        if session.boot_quiet_active(now):
             return False
         if self._human_active_locked(session, now):
             return False
@@ -1643,6 +1702,45 @@ class SessionManager:
         session.last_rx_at = now_iso()
         session.last_rx_mono = time.monotonic()
 
+    def _update_boot_quiet_locked(self, session: SessionRuntime, chunk: str) -> None:
+        """依 RX 內容維護 boot quiet window（#130）。須在 ``self._lock`` 內呼叫。
+
+        - RX 見到 boot banner（U-Boot 版本行／autoboot 倒數）→ 啟用／延長 quiet
+          window。``arm_boot_quiet`` 同時清空 rolling tail，使 banner 之前殘留的
+          舊 prompt 不會誤觸發解除（DUT 自行重開機、無人先呼叫 reboot 的情境）。
+        - quiet window 進行中，RX 匹配該 session template 的 ``login_regex`` 或
+          ``prompt_regex``（開機完成訊號）→ 立即解除，讓 recovery / reprobe 恢復探測。
+          但尾行先命中 ``bootloader_prompts``（見下方 Finding 3 說明）時例外不解除。
+        - 只影響 source=system 的自動 probe gate；不 gate human/lease/agent TX。
+
+        比對用 rolling tail（``BOOT_BANNER_TAIL_CHARS`` 字元）跨 chunk 邊界拼接，
+        容忍 banner／prompt 被 RX 讀取切割。
+        """
+        tail = (session.boot_banner_tail + chunk)[-BOOT_BANNER_TAIL_CHARS:]
+        if detect_boot_banner(tail):
+            session.arm_boot_quiet()
+            return
+        session.boot_banner_tail = tail
+        if session.boot_quiet_until <= 0.0:
+            return
+        sp = session.profile
+        # #130 review Finding 3（必修）：tail 尾行若先命中該 template 的
+        # bootloader_prompts，視為仍在 bootloader、非開機完成，本輪不解除。寬鬆
+        # template（如 brcm-template `[>#]\s*$`）的 prompt_regex 會誤配 U-Boot
+        # 自己的 `=> ` prompt，若不先排除，會在板子正卡 bootloader 的最危險時刻
+        # 解除 quiet window，讓後續自動 probe 又打斷一次 autoboot。
+        if _matches_any_bootloader_prompt(tail, sp.bootloader_prompts) is not None:
+            return
+        for pattern in (sp.login_regex, sp.prompt_regex):
+            if not pattern:
+                continue
+            try:
+                if re.search(pattern, tail):
+                    session.clear_boot_quiet()
+                    return
+            except re.error:
+                continue
+
     def _mark_session_tx(self, session: SessionRuntime) -> None:
         """Update session's last_tx_at / last_tx_mono. Cheap; safe outside lock."""
         session.last_tx_at = now_iso()
@@ -1675,6 +1773,9 @@ class SessionManager:
             if session is None:
                 return
             self._mark_session_rx(session)
+            # #130：quiet window 維護須看見**所有** RX（含 foreground 期間），
+            # 故置於 foreground_busy gate 之前。
+            self._update_boot_quiet_locked(session, chunk)
             if session.foreground_busy:
                 return
             # agent log capture
@@ -1723,6 +1824,20 @@ class SessionManager:
             if current is None or current.bridge is not bridge:
                 return {"ok": False, "error_code": "SESSION_NOT_READY"}
             return {"ok": True, "session": current.to_public_dict()}
+
+        # #130 review Finding 2（必修）：本 helper 是 attach_session（ATTACHED 無 human
+        # lease 分支）與 recover_session（ATTACHED 分支）共用的唯一 probe 入口——boot
+        # quiet window 內於此單點 gate，可同時堵住兩條呼叫路徑，避免各呼叫端各自補一次
+        # 判斷、日後新增第三個呼叫端又漏補（原始漏洞正是「多個呼叫端各自漏 gate」）。
+        # 比照 _attach_by_id 的 PROMPT_UNAVAILABLE 語意：不送 probe TX、不改動
+        # session.state（呼叫端進來時已是 ATTACHED），只誠實回報仍在 quiet window。
+        with self._lock:
+            current = self._sessions.get(session.session_id)
+            if current is None or current.bridge is not bridge:
+                return {"ok": False, "error_code": "SESSION_NOT_READY"}
+            if current.boot_quiet_active():
+                current.last_error = "PROMPT_UNAVAILABLE"
+                return {"ok": True, "session": current.to_public_dict()}
 
         if session.profile.login_regex:
             auth = resolve_session_auth(session.profile)
@@ -1833,9 +1948,17 @@ class SessionManager:
 
         try:
             bridge.start()
+            with self._lock:
+                boot_quiet = session.boot_quiet_active()
             if not command_capable:
                 ok = False
                 err = None
+            elif boot_quiet:
+                # #130：boot quiet window 內不送 attach probe（涵蓋 DUT reboot 期間
+                # 序列裝置 re-enumerate 觸發的 re-attach）：掛上 bridge 純收 RX，
+                # 以 PROMPT_UNAVAILABLE 停在 ATTACHED——window 解除後由既有
+                # reprobe / reboot recovery 流程接手升 READY。
+                ok, err = False, "PROMPT_UNAVAILABLE"
             elif require_login:
                 auth = resolve_session_auth(profile)
                 if auth.username and auth.password:
@@ -1999,6 +2122,9 @@ class SessionManager:
             detected: ProfileTemplate | None = None
             try:
                 probe_bridge.start()
+                # #130 註：detect_template 只在「全新動態裝置（尚無 session）」時執行，
+                # 無既有 session 即無 boot quiet 狀態可循；既有 session 的 re-attach
+                # 一律走 _attach_by_id（其 attach probe 已受 quiet gate 保護）。
                 detected = detect_template(probe_bridge, self._templates)
             except Exception:
                 pass
@@ -2345,7 +2471,13 @@ class SessionManager:
 
     def _spawn_reboot_recovery(self, session_id: str, timeout_s: float) -> None:
         def _run() -> None:
-            deadline = time.monotonic() + timeout_s
+            start = time.monotonic()
+            deadline = start + timeout_s
+            # #130：deadline 延伸上限＝一個完整 quiet window + 一輪 probe 預算。
+            # 防 boot-loop 板反覆吐 banner 不斷延長 quiet window，使 recovery
+            # 執行緒無限延命；達上限即走逾時收尾（session 留 ATTACHED，其後
+            # 一切探測仍受 quiet gate 保護，不會打斷 autoboot）。
+            deadline_cap = start + BOOT_QUIET_WINDOW_S + timeout_s
             while time.monotonic() < deadline:
                 with self._lock:
                     session = self._sessions.get(session_id)
@@ -2353,6 +2485,21 @@ class SessionManager:
                         return
                     bridge = session.bridge
                     by_id = session.profile.device_by_id
+                    quiet_until = session.boot_quiet_until
+                    quiet_active = session.boot_quiet_active()
+                now = time.monotonic()
+                if quiet_active:
+                    # #130 review Finding 6（順修）：改呼叫 boot_quiet_active() 統一入口，
+                    # 不再直接比較 boot_quiet_until 屬性（原始寫法與其他呼叫點各自重複
+                    # 判斷邏輯，日後調整 quiet 語意時容易漏改此處）。
+                    # boot quiet window 內不送任何 system probe（ensure_ready 的
+                    # prompt probe 會打 "\n" 到 UART、打斷 U-Boot autoboot 倒數）。
+                    # 純被動等 RX：window 由開機完成訊號（login/prompt）解除或逾時過期。
+                    # deadline 需涵蓋 window 結束後至少一輪完整 probe（hard_timeout_s
+                    # 60s < BOOT_QUIET_WINDOW_S 180s，不延伸會在 window 內就逾時收尾）。
+                    deadline = min(max(deadline, quiet_until + timeout_s), deadline_cap)
+                    time.sleep(min(1.0, quiet_until - now))
+                    continue
                 if bridge is not None:
                     try:
                         auth = resolve_session_auth(session.profile)
@@ -2450,6 +2597,12 @@ class SessionManager:
     ) -> dict[str, Any]:
         prompt_regex = session.profile.prompt_regex
         pre_offset = bridge.rx_snapshot_len()
+        # #130：收到 reboot 命令**當下**即設 boot quiet window，不等 banner——
+        # 真板從 shutdown 訊息到 U-Boot banner 可能間隔數秒，且 U-Boot 可能吃到
+        # banner 前緩衝的 bytes；等 banner 才靜默會讓第一發 probe 落入 autoboot 窗。
+        # 若 target 其實沒重開（2s 內 prompt 回來），RX 解除檢查會立即清掉本視窗。
+        with self._lock:
+            session.arm_boot_quiet()
         self._mark_session_tx(session)
         bridge.send_command(command, source=source, cmd_id=cmd_id)
         if bridge.wait_for_regex_from(prompt_regex, pre_offset, min(timeout_s, 2.0)):
@@ -2714,27 +2867,33 @@ class SessionManager:
                 "recovery_action": "PROMOTE_HUMAN_INTERACTIVE",
             }
 
-        for action_name, payload in (("CTRL_C", b"\x03"), ("CTRL_D", b"\x04")):
-            offset = bridge.rx_snapshot_len()
-            self._mark_session_tx(session)
-            bridge.send_bytes(payload, source="system:recover", cmd_id=None)
-            if bridge.wait_for_regex_from(prompt_regex, offset, min(timeout_s, 2.0)):
-                stdout = self._extract_command_stdout(bridge.rx_text_from(pre_offset), command, prompt_regex)
-                with self._lock:
-                    self._set_terminal_capture_locked(
-                        session,
-                        cmd_id=cmd_id,
-                        chunks=[stdout] if stdout else None,
-                        error_code="PROMPT_TIMEOUT_RECOVERED",
-                    )
-                    self._reset_reprobe_progress_locked(session)
-                return {
-                    "ok": True,
-                    "error_code": "PROMPT_TIMEOUT_RECOVERED",
-                    "stdout": stdout,
-                    "partial": True,
-                    "recovery_action": action_name,
-                }
+        # #130 review Finding 1c（必修）：boot quiet window 內不送 CTRL_C/CTRL_D——這兩個
+        # byte 跟 probe 一樣會打斷 U-Boot autoboot 倒數，且是最容易觸發的路徑（agent 正常
+        # 送命令途中 target 自發重開機、逾時進入本函式）。跳過強制按鍵，直接落到下方既有
+        # timeout 收尾（session 轉 ATTACHED），讓 autoboot 在無人打擾下自然跑完；window 解
+        # 除後由既有 reprobe / reboot recovery 接手升 READY。
+        if not session.boot_quiet_active():
+            for action_name, payload in (("CTRL_C", b"\x03"), ("CTRL_D", b"\x04")):
+                offset = bridge.rx_snapshot_len()
+                self._mark_session_tx(session)
+                bridge.send_bytes(payload, source="system:recover", cmd_id=None)
+                if bridge.wait_for_regex_from(prompt_regex, offset, min(timeout_s, 2.0)):
+                    stdout = self._extract_command_stdout(bridge.rx_text_from(pre_offset), command, prompt_regex)
+                    with self._lock:
+                        self._set_terminal_capture_locked(
+                            session,
+                            cmd_id=cmd_id,
+                            chunks=[stdout] if stdout else None,
+                            error_code="PROMPT_TIMEOUT_RECOVERED",
+                        )
+                        self._reset_reprobe_progress_locked(session)
+                    return {
+                        "ok": True,
+                        "error_code": "PROMPT_TIMEOUT_RECOVERED",
+                        "stdout": stdout,
+                        "partial": True,
+                        "recovery_action": action_name,
+                    }
 
         partial_stdout = clean_text(bridge.rx_text_from(pre_offset))
         with self._lock:
@@ -3232,6 +3391,20 @@ class SessionManager:
                             "bridge_generation": session.bridge_generation,
                             "recommended_action": recommended_action,
                             **extra,
+                            **lease_context,
+                        }
+                    elif session.boot_quiet_active():
+                        # #130 review Finding 1b（必修）：session.state 仍是 READY，但
+                        # RX 已見到 boot banner——因 boot quiet 目前只設 boot_quiet_until
+                        # 不改 session.state（架構層限制，見 Finding 4／#130 follow-up），
+                        # 會出現「state=READY 但已在 quiet window」的過渡態。此時不送
+                        # nonce probe（等同一般 probe，一樣會打斷 U-Boot autoboot），直接
+                        # 誠實回報仍在 quiet window，等 RX 見 login/prompt 或逾時解除。
+                        result = {
+                            "ok": True,
+                            "classification": "AUTOBOOT_QUIET",
+                            "session": session.to_public_dict(),
+                            "recommended_action": "wait",
                             **lease_context,
                         }
                     else:

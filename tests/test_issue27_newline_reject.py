@@ -1,14 +1,29 @@
-"""Issue #27 — 命令換行符拒絕的單元測試。
+"""Issue #27 — 命令換行符拒絕的單元測試；Issue #129 — 上限可查詢性。
 
 驗證 CommandArbiter.submit() 在命令包含嵌入換行符時正確拒絕，
 並確認 CMD_TOO_LONG 優先於 CMD_CONTAINS_NEWLINE。
+另驗 health.status（daemon status）暴露的 limits 欄位與 arbiter 常數一致（#129），
+讓 client 執行期查詢而非硬編碼上限。
 """
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 from unittest.mock import MagicMock
 
-from sw_core.arbiter import CMD_REJECT_BYTES, CommandArbiter
+from sw_core.arbiter import (
+    CMD_REJECT_BYTES,
+    CMD_WARN_BYTES,
+    ERROR_CMD_CONTAINS_NEWLINE,
+    ERROR_CMD_TOO_LONG,
+    WARNING_CMD_LENGTH,
+    CommandArbiter,
+)
+
+try:
+    import state_iso  # pytest／unittest discover：tests/ 在 sys.path
+except ImportError:  # python3 -m unittest tests.test_x（repo root 跑法，#120）
+    from tests import state_iso
 
 
 class TestNewlineReject(unittest.TestCase):
@@ -55,6 +70,76 @@ class TestNewlineReject(unittest.TestCase):
         result = self._submit(long_cmd)
         self.assertFalse(result["ok"])
         self.assertEqual(result["error_code"], "CMD_TOO_LONG")
+
+
+class TestLimitsExposure(unittest.TestCase):
+    """Issue #129 — health.status（daemon status）必須暴露可查詢的命令長度上限。
+
+    limits 值直接引用 ``sw_core.arbiter`` 常數比對（單一事實來源），
+    常數若調整，本測試不需改動即自動對齊。
+    """
+
+    def setUp(self) -> None:
+        state_iso.isolate_testcase(self)  # #120 per-file 隔離（unittest 不載 conftest）
+
+    def _health_limits(self) -> dict:
+        """建立 service、經 RPC 取回 health.status 的 limits 欄位。"""
+        from sw_core.service import SerialwrapService
+
+        svc = SerialwrapService([])
+        fake = {"multi_open": False, "daemons": [], "holders": {}, "holders_status": "ok"}
+        with mock.patch("sw_core.service.detect_multi_open", return_value=fake):
+            st = svc.rpc("health.status", {})
+        self.assertTrue(st["ok"])
+        return st["limits"]
+
+    def test_health_status_exposes_limits(self) -> None:
+        """health.status 回應須含 limits 欄位，且值等於 arbiter 常數。"""
+        self.assertEqual(
+            self._health_limits(),
+            {
+                "max_submit_cmd_bytes": CMD_REJECT_BYTES,
+                "warn_submit_cmd_bytes": CMD_WARN_BYTES,
+                "reject_error_code": ERROR_CMD_TOO_LONG,
+                "newline_error_code": ERROR_CMD_CONTAINS_NEWLINE,
+                "warning_code": WARNING_CMD_LENGTH,
+                "newline_forbidden": True,
+            },
+        )
+
+    def test_limits_codes_bind_to_submit_behavior(self) -> None:
+        """行為綁定（#129 review）：實際 submit 觸發拒絕／警告時，回應的
+        error_code／warning code 必須等於 health.status limits 宣告的字串，
+        防止 limits 欄位與 arbiter 實際回應各自漂移。"""
+        limits = self._health_limits()
+        arbiter = CommandArbiter(send_cb=MagicMock(return_value={"ok": True}))
+        session_id = "limits-bind-session"
+        arbiter.register_session(session_id)
+
+        def submit(command: str) -> dict:
+            return arbiter.submit(
+                session_id=session_id,
+                command=command,
+                source="agent",
+                mode="foreground",
+                timeout_s=5.0,
+            )
+
+        try:
+            # 超過硬上限 → 拒絕，error_code 必等於 limits 的 reject_error_code。
+            too_long = submit("A" * (limits["max_submit_cmd_bytes"] + 1))
+            self.assertFalse(too_long["ok"])
+            self.assertEqual(too_long["error_code"], limits["reject_error_code"])
+            # 含換行 → 拒絕，error_code 必等於 limits 的 newline_error_code。
+            newline = submit("echo a\necho b")
+            self.assertFalse(newline["ok"])
+            self.assertEqual(newline["error_code"], limits["newline_error_code"])
+            # 超過軟上限 → 接受但附 warning，code 必等於 limits 的 warning_code。
+            warned = submit("A" * (limits["warn_submit_cmd_bytes"] + 1))
+            self.assertTrue(warned["ok"])
+            self.assertEqual(warned["warning"]["code"], limits["warning_code"])
+        finally:
+            arbiter.unregister_session(session_id)
 
 
 if __name__ == "__main__":

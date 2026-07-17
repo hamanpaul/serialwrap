@@ -281,7 +281,9 @@ serialwrap daemon status
 Common classifications include `OK`, `DEVICE_MISSING`,
 `DEVICE_REBOUND_REQUIRED`, `BRIDGE_DOWN`, `VTTY_STALE`,
 `TARGET_UNRESPONSIVE`, `LOGIN_REQUIRED`, `ATTACHED_NOT_READY`,
-`REBOOTING`, `HUMAN_INTERACTIVE_ACTIVE`, and `PASSTHROUGH`.
+`REBOOTING`, `HUMAN_INTERACTIVE_ACTIVE`, `PASSTHROUGH`, and
+`AUTOBOOT_QUIET` (#130 — a boot quiet window is active; wait for it to
+clear or expire, don't retry in a loop).
 
 Use `recover` for unhealthy sessions:
 
@@ -292,6 +294,94 @@ serialwrap session recover --selector COM0
 `recover` first tries to re-probe an attached bridge, then uses control
 characters for a `READY` shell, and finally reattaches when the bridge is gone
 but the device remains present.
+
+When recovery demotes a session out of `READY` (or the session re-attaches),
+queued commands that have not started yet are terminated with `status=error`
+and `error_code: FLUSHED_BY_RECOVERY` (#128). Such a command was never sent to
+the UART — resubmit it once the session is back to `READY`. The in-flight
+command keeps running and is finalized by the worker with its real result.
+Flushing also releases the per-session pending quota immediately, so stale
+queue entries can no longer pin the session at `SESSION_QUEUE_FULL` until a
+daemon restart.
+
+All detach-class paths — recovery, `session clear`, device release, rebind,
+hot unplug, re-attach — terminate not-yet-started commands with
+`FLUSHED_BY_RECOVERY`; daemon shutdown uses `FLUSHED_BY_SHUTDOWN`. Both carry
+the same semantics: the command was never executed and can be resubmitted once
+the session is `READY` again.
+
+#### Timeout semantics (#123)
+
+Callers must handle RPC timeouts themselves — a CLI `TIMEOUT` only means the
+CLI stopped waiting; the daemon-side operation may still complete successfully
+afterwards. `session attach`, `session recover`, `session self-test`, and
+`session console-attach` (its recover-upgrade branch can run synchronously for
+tens of seconds) are long operations executed synchronously on the daemon
+side: when `--timeout` is not given, the CLI automatically applies a fixed
+45 s floor instead of the general 5 s default. An explicit `--timeout` always
+wins.
+
+Honest note on that floor: the CLI cannot know the daemon-side profile's
+`timeout_s` (some platforms, e.g. `bcm`, set 15 s+ with multi-stage
+login/ready probing), which is what actually drives how long these operations
+take — so 45 s is a generous constant, not a value derived from any
+per-call parameter. (An earlier version tried to scale the floor with the
+CLI-side `recover_timeout_s`/`probe_timeout_s` flags, but the daemon caps
+those at 2 s internally, so values above that had no effect — that derivation
+was retracted.) If an operation still times out, check the `TIMEOUT` error's
+`daemon_reachable`/`daemon_busy` fields (below) and `session list` to see
+whether the daemon is still working on it.
+
+`TIMEOUT` errors now include `daemon_reachable` (from a fresh 1 s
+`health.ping` probe) and, when reachable, a `daemon_busy` context
+(`commands`/`sessions` counts from `health.status`), so callers can tell a
+dead or disconnected daemon apart from a healthy daemon still working on a
+long operation.
+
+`--retries N` (default 0) enables exponential-backoff retries (0.5 s base,
+×2, capped at 5 s per delay) on `TIMEOUT`/connect failure/`EMPTY_RESPONSE`
+for idempotent read-only methods only (`session list`, `health.*`,
+`device list`, ...); write methods are never retried automatically. Worst-case
+total wall time for a whitelisted call is roughly
+`(retries + 1) × timeout_s + sum of the (capped) backoff delays`.
+
+#### U-Boot autoboot protection (boot quiet window, #130)
+
+When a DUT reboots, any byte received during U-Boot's
+`Hit any key to stop autoboot` countdown interrupts boot and strands the board
+at the bootloader prompt (`=> `). The daemon now guards this window natively —
+no caller action required:
+
+- **Armed** the moment an agent submits a reboot-class command (before any
+  banner), and whenever RX shows a boot banner (`U-Boot` version line or the
+  autoboot countdown line — this also covers spontaneous/power-cycle reboots).
+- **Effect**: while active (180 s default), every automatic `source=system`
+  probe TX is gated — reboot recovery loop, readiness reprobe, attach probe
+  (`attach_session`'s `ATTACHED`-branch probe and `recover_session`'s
+  `ATTACHED`-branch reprobe share one probe entry point, gated at that single
+  point), the forced CTRL_C/CTRL_D keystrokes sent after a command timeout,
+  and `session self-test`'s READY-branch nonce probe (reported back as
+  classification `AUTOBOOT_QUIET`). The daemon waits passively on RX instead.
+  `session list` exposes the remaining time as `boot_quiet_remaining_s`.
+- **Released** immediately when RX matches the session's `login_regex` /
+  `prompt_regex` (boot-complete signal) — recovery resumes at once and the
+  session returns to `READY` automatically; otherwise it expires after 180 s.
+  Exception: if the matched line is itself one of the session's
+  `bootloader_prompts` (e.g. U-Boot's own `=> `), it is *not* treated as
+  boot-complete and the window stays active — a loosely written
+  `prompt_regex` (e.g. `[>#]\s*$`) would otherwise misfire on the bootloader's
+  own prompt and clear the window at the worst possible moment.
+- **Never gated**: human console bytes, interactive lease TX, and explicit
+  agent commands (once a session is `READY`). Deliberately entering the
+  bootloader (e.g. #114) still works. Known limitation: this field only gates
+  the automatic probes above — it does not demote `session.state`, so if a
+  spontaneous reboot races an in-flight agent command while the session is
+  still (nominally) `READY`, that explicit command can still hit the UART
+  during the countdown. Tracked as a follow-up (needs a dedicated state or
+  arbiter-level gate), not fixed here.
+- If a board does end up stuck in the bootloader, `prpl-template` now defines
+  `bootloader_prompts` (`=> `, `U-Boot> `), so the
+  `interactive-open --allow-attached` recovery lease can type `boot` to escape.
 
 ### Logs and Evidence
 
@@ -309,10 +399,20 @@ Useful commands:
 ```bash
 serialwrap session log-start --selector COM0
 serialwrap session log-stop --selector COM0
-serialwrap log tail-text --selector COM0 --from-seq 0 --limit 200
+serialwrap log tail-text --selector COM0 --limit 200                 # latest mode (default): newest 200 records
+serialwrap log tail-text --selector COM0 --from-seq 100 --limit 200  # range mode: incremental read from seq > 100
 serialwrap wal export --from-seq 0 --limit 500
 serialwrap wal reset
 ```
+
+`log tail-raw` / `log tail-text` responses carry `from_seq` / `last_seq` /
+`current_seq` / `returned` / `truncated` metadata (#124); `returned` counts WAL
+records for `tail-raw` and text lines for `tail-text`. Queries and the
+`truncated` flag only cover the **current** `raw.wal.ndjson`: records rotated
+into `raw.wal.ndjson.<ts>` archives are not scanned — right after a rotation,
+latest mode may return fewer than `--limit` records with `truncated=false`;
+read the archive files directly if you need older records (`log tail-*` and
+`wal export` both read the current file only).
 
 ### Windows Support
 
@@ -891,7 +991,7 @@ serialwrap cmd status --cmd-id <cmd_id>
 
 `command.get` 會直接帶 `stdout`。
 
-**命令限制**：命令字串不得含有 `\n` 換行字元，否則回傳 `CMD_CONTAINS_NEWLINE`。命令長度 > 4 KB 回 warning，> 16 KB 拒絕（`CMD_TOO_LONG`）。
+**命令限制**：命令字串不得含有 `\n` 換行字元，否則回傳 `CMD_CONTAINS_NEWLINE`。命令長度（UTF-8 位元組）> 4 KB 回 warning（`CMD_LENGTH_WARNING`），> 16 KB 拒絕（`CMD_TOO_LONG`）；broker 對命令內容不做截斷。注意這是 **broker 對單一 `--cmd` 參數的上限**，與 **target 端 tty line buffer（常見 4096 bytes）的物理單行限制**是兩回事——即使 broker 接受，過長單行仍可能在 target 端被截斷。上限可由 `serialwrap daemon status` 回應的 `limits` 欄位執行期查詢（`max_submit_cmd_bytes`／`warn_submit_cmd_bytes`／`reject_error_code`／`newline_error_code`／`warning_code`／`newline_forbidden`），client 不需硬編碼（#129）。
 
 **長命令 keepalive**：對於 `apt upgrade`、`make`、`python -m unittest` 等長時間命令，可加 `--expected-duration` 提示 broker 延長等待：
 
@@ -1092,6 +1192,7 @@ serialwrap session self-test --selector COM0
 - `REBOOTING`：agent 已送出 reboot 類指令，正在等待 target 重開機完畢後自動 relogin
 - `HUMAN_INTERACTIVE_ACTIVE`：human console 目前握有 interactive ownership，不適合 agent 干預
 - `PASSTHROUGH`：platform 設為 passthrough，session 已 ATTACHED，適合透明 bridge 模式
+- `AUTOBOOT_QUIET`（#130）：session 名義上是 `READY`，但已進入 boot quiet window（自發重開機的過渡態），不送 nonce probe；等它自己解除或過期，勿反覆呼叫
 
 ### FAQ：開機窗連不到、minicom 顯示 broker not ready
 
@@ -1141,7 +1242,37 @@ recover 行為分成三種：
 
 若 `READY` 路徑中的 `Ctrl-C` / `Ctrl-D` 都救不回 prompt，session 會降級成 `ATTACHED`，保留 bridge 與 console，交由 human/minicom 接手。
 
+recovery 把 session 降出 `READY`（或 session 重新 attach）時，佇列中**尚未啟動**的命令會以 `status=error`、`error_code: FLUSHED_BY_RECOVERY` 終結（#128）。此類命令**從未送進 UART**——client 收到即代表未執行，應於 session 回 `READY` 後重送；正在執行中（in-flight）的命令不受影響，仍由 worker 以真實結果終結。flush 同時立即釋放 per-session pending 額度，stale 佇列記錄不再永久佔額度、把 session 卡死在 `SESSION_QUEUE_FULL` 直到 daemon 重啟。
+
+所有 detach 類路徑（含 recovery、`session clear`、device release、rebind、熱拔、re-attach）皆以 `FLUSHED_BY_RECOVERY` 終結未啟動命令；daemon shutdown 則用 `FLUSHED_BY_SHUTDOWN`。兩者語意相同＝命令未執行、可於 session 回 `READY` 後重送。
+
 只有 **agent 明確送出 reboot 類指令** 時，daemon 才會進入 `RECOVERING`，並在 target 回來後自動重新 login / 回到 `READY`。
+
+### Timeout 語意（#123）
+
+呼叫端必須自行處理 RPC timeout——CLI 回 `TIMEOUT` 只代表「CLI 不再等待」，daemon 端操作可能仍在執行、稍後成功。`session attach`／`session recover`／`session self-test`／`session console-attach`（recover 升級分支可同步跑數十秒）屬 daemon 端同步執行的**長操作**：未指定 `--timeout` 時，CLI 對這四個方法自動採固定 45 秒 floor，而非一般方法的預設 5 秒。顯式指定 `--timeout` 時一律照用。
+
+floor 誠實說明：CLI 完全無從得知 daemon 端 profile 的 `timeout_s`（部分平台如 `bcm` 常設 15 秒以上、且可能多階段 login/ready probe）——真正拉長 daemon 端執行時間的其實是這個值，45 秒只是一個寬鬆常數，不是依任何單次呼叫的參數精算出來的上界。（初版曾試著讓 floor 隨 CLI 端 `recover_timeout_s`／`probe_timeout_s` 縮放，但 daemon 端對這兩個參數皆有 2 秒 cap、超過就無作用，該推導已撤回。）若操作仍逾時，可用下方 `TIMEOUT` 錯誤附帶的 `daemon_reachable`／`daemon_busy` 欄位與 `session list` 確認 daemon 是否仍在執行。
+
+`TIMEOUT` 錯誤 JSON 現在附帶 `daemon_reachable`（以新連線做 1 秒 `health.ping` 探測），可達時再附 `daemon_busy` 上下文（`health.status` 的 `commands`／`sessions` 計數），供呼叫端分辨「device 斷線／daemon 死亡」與「daemon 忙碌、長操作仍在跑」：
+
+```json
+{"daemon_busy":{"commands":3,"sessions":2},"daemon_reachable":true,"error_code":"TIMEOUT","ok":false}
+```
+
+`--retries N`（預設 0，行為不變）僅對**冪等唯讀方法白名單**（`session list`、`health.*`、`device list` 等查詢類）在 `TIMEOUT`／連線失敗／`EMPTY_RESPONSE` 時做指數退避重試（0.5s 起、每次 ×2、單次 delay 上限 5s）；寫入類方法（attach／recover／submit…）絕不自動重送——CLI 逾時當下 daemon 可能仍在執行，重送會重複動作。白名單呼叫最壞總耗時約為 `(retries+1) × timeout_s + 退避總和（已個別夾在 5s）`。
+
+### U-Boot autoboot 保護（boot quiet window，#130）
+
+DUT 重開機時，U-Boot 的「`Hit any key to stop autoboot`」倒數窗只要收到任何 byte 就會中斷開機、把板子卡在 bootloader prompt（`=> `）。舊版 daemon 的自動 probe（reboot recovery / readiness reprobe 送的 `\n`）必然落入這個視窗，session 從此回不到 `READY`。daemon 現在**內建 boot quiet window 保護**，呼叫端不需做任何事：
+
+- **觸發**：
+  1. agent 送出 reboot 類指令**當下**即進入 quiet window（不等 banner——真板從 shutdown 訊息到 banner 可能間隔數秒，且 U-Boot 可能吃到 banner 前緩衝的 bytes）；
+  2. RX 看到 boot banner（`U-Boot` 版本行、`Hit any key to stop autoboot` 倒數行）——涵蓋 **DUT 自行重開／斷電重開**的非計畫性情境。
+- **效果**：視窗內（預設 180s，`BOOT_QUIET_WINDOW_S`；實測目標板完整開機約 150s + 裕度）**gate 所有 `source=system` 的自動 probe TX**——reboot recovery 迴圈、readiness reprobe、attach probe（`attach_session` 的 ATTACHED 分支與 `recover_session` 的 ATTACHED 分支重探共用同一個 probe 入口，於此單點一起 gate）、命令逾時後的 CTRL_C/CTRL_D 強制按鍵、`session self-test` READY 分支的 nonce probe（回報 `AUTOBOOT_QUIET` 分類）全部改為純被動等 RX。`session list` 的 `boot_quiet_remaining_s` 欄位可觀測剩餘秒數。
+- **解除**：RX 匹配該 session 的 `login_regex` / `prompt_regex`（開機完成訊號）**即刻解除**，recovery 立即恢復探測、自動回 `READY`；否則 180s 過期自動解除。例外：若命中的尾行本身就是該 session 的 `bootloader_prompts`（如 U-Boot 自己的 `=> `），**不**視為開機完成、window 續留——避免寬鬆撰寫的 `prompt_regex`（如 `[>#]\s*$`）誤配 bootloader 自身 prompt，在板子仍卡在 bootloader 的最危險時刻誤解除。
+- **絕不 gate**：human console bytes、interactive lease TX、agent 顯式命令（session 已是 `READY` 時）。與 #114「刻意進 bootloader」的需求相容——human/lease 送鍵永遠放行。已知限制：本欄位只 gate 上述自動 probe，**不會**降級 `session.state`；若自發重開機與進行中的 agent 命令競速、session 仍（名義上）停在 `READY`，該顯式命令仍可能在倒數期間打到 UART——此為待補的 follow-up（需要新 state 或 arbiter 層 gate），本次未修。
+- 若板子仍卡在 bootloader（例如 human 手動打斷倒數），`prpl-template` 已補上 `bootloader_prompts`（`=> `、`U-Boot> `），可直接用 `interactive-open --allow-attached` 開 recovery lease 打 `boot` 脫困，不必再走 `device release` + 外部工具的迂迴流程。
 
 ## 日誌與輸出
 
@@ -1194,10 +1325,20 @@ targets:
 CLI 查詢：
 
 ```bash
-serialwrap log tail-text --selector COM0 --from-seq 0 --limit 200
-serialwrap log tail-raw  --selector COM0 --from-seq 0 --limit 200
+serialwrap log tail-text --selector COM0 --limit 200                 # latest 模式（預設）：最新 200 筆
+serialwrap log tail-raw  --selector COM0 --limit 200                 # 同上，含權威欄位
+serialwrap log tail-raw  --selector COM0 --from-seq 100 --limit 200  # range 模式：自 seq > 100 增量讀取
 serialwrap wal export --from-seq 0 --limit 500
 ```
+
+`log tail-raw` / `log tail-text` 有兩種模式（#124）：
+
+- **latest 模式（預設，省略 `--from-seq`）**：回傳符合條件的**最新 N 筆**（seq 升冪），對應「看目前板子輸出到哪」的最常見用法。
+- **range 模式（顯式 `--from-seq N`，含 0）**：維持舊語意——自 `seq > N` 起回傳**最舊的 N 筆**，供增量讀取與老 client 相容。
+
+兩者回應皆附 metadata 欄位：`from_seq`（實際使用值，latest 模式為 `null`）、`last_seq`（回傳紀錄的最大 seq，無紀錄為 `null`，可作下次 `--from-seq` 增量起點）、`current_seq`（WAL 目前 seq 計數）、`returned`（回傳筆數：`tail-raw` 計 WAL records、`tail-text` 計文字行數）、`truncated`（是否還有符合但被 `--limit` 截掉的紀錄：latest 模式指視窗**之前**還有更舊紀錄、range 模式指視窗**之後**還有更新紀錄）。
+
+注意：查詢與 `truncated` 判定**僅涵蓋現行 `raw.wal.ndjson`**。WAL 輪替（rotation）後更舊紀錄保存在 `raw.wal.ndjson.<時戳>` 歸檔檔，不列入判定——rotation 剛發生時 latest 模式可能回不足 `--limit` 筆且 `truncated=false`；需要歸檔紀錄請直接讀取歸檔檔（`log tail-*` 與 `wal export` 皆僅讀現行檔）。
 
 ### WAL 管理
 
@@ -1219,8 +1360,9 @@ serialwrap wal current-seq
 
 說明：
 
-- `log tail-text` 偏向人類閱讀，不輸出 metadata header。
+- `log tail-text` 偏向人類閱讀（`lines` 為純文字行，另附 `from_seq`／`last_seq`／`current_seq`／`returned`／`truncated` metadata，#124）。
 - `log tail-raw` / `wal export` 仍保留完整權威欄位。
+- `log tail-raw` / `log tail-text` 預設為 latest 模式（最新 N 筆）；顯式 `--from-seq N`（含 0）走 range 增量語意（見上方「WAL 查詢」）。
 - 可用 `SERIALWRAP_WAL_DIR` 覆寫 WAL / mirror log 目錄，例如放到 `~/b-log`；這不會改動 daemon socket / lock 的 `RUN_DIR`。
 - `stream tail` 為 legacy alias；新設計優先使用 `cmd result-tail`。
 
@@ -1398,7 +1540,8 @@ CLI（`bind` 只改 device、`recover`/`clear` 沿用舊 profile）。在 produc
    by-id **明確綁到 `uboot-template`**（繞過 auto-detect）。
 3. **把板子弄進 U-Boot**：開 interactive lease → 送 `reboot` → 接著以 ~0.3s 間隔持續送鍵
    （space）約 30 秒，攔截「Hit any key to stop autoboot」視窗；若是 boot menu，送對應鍵
-   （例如 `0` = Exit）掉到 U-Boot console（prompt 例如 `U-Boot> `）。
+   （例如 `0` = Exit）掉到 U-Boot console（prompt 例如 `U-Boot> `）。（#130 的 boot quiet
+   window 只 gate `source=system` 的自動 probe，**不擋 interactive lease 鍵擊**，此手法不受影響。）
 4. **走完整 serialwrap 路徑驗證**：`session self-test`（期望 `OK`/`probe_ok=True`/`READY`）→
    `cmd submit --cmd 'printenv' --mode line`（期望框出 env dump）。
 5. **還原**：送 `boot` 回正常 OS → 停 throwaway daemon → `device attach --selector COMx` 收回
@@ -1439,8 +1582,8 @@ CLI（`bind` 只改 device、`recover`/`clear` 沿用舊 profile）。在 produc
 >
 > 注意事項：(1) **不要用 `pkill -f "minicom -D ..."`**——pattern 會 self-match 你自己的 shell
 > cmdline；改用 `pgrep -x minicom` 取 PID 再 `kill`。(2) minicom 在 broker pts 上常顯示
-> `Offline`（DCD 未拉起），不影響輸入轉送。(3) `log tail-raw` 預設 `from-seq=0`（最舊起算），
-> 驗證最新輸出要看 minicom 畫面或帶較大 `--limit`/`--from-seq`。
+> `Offline`（DCD 未拉起），不影響輸入轉送。(3) `log tail-raw` 預設為 latest 模式（最新 N 筆，#124），
+> 直接 `serialwrap log tail-raw --selector COMx --limit 50` 即可驗證最新輸出；要從特定 seq 增量讀取才帶 `--from-seq`。
 
 ## Remote Support（ssh-tunnel 遠端連線）
 
@@ -1623,7 +1766,7 @@ serialwrap doctor    # 驗證環境
 
 <!-- BEGIN: cli-help marker="serialwrap-help" -->
 usage: serialwrap [-h] [--version] [--socket SOCKET] [--endpoint ENDPOINT]
-                  [--timeout TIMEOUT_S]
+                  [--timeout TIMEOUT_S] [--retries RETRIES]
                   <group> ...
 
 serialwrap client（支援本機 Unix socket 與遠端 endpoint）
@@ -1633,7 +1776,8 @@ options:
   --version            顯示版本後離開
   --socket SOCKET      本機 daemon 的 Unix socket 路徑（未指定時依 config.yaml 與 XDG 執行期目錄解析，可用 SERIALWRAP_RUN_DIR 覆寫）
   --endpoint ENDPOINT  遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）
-  --timeout TIMEOUT_S  RPC timeout 秒數（預設: 5.0）
+  --timeout TIMEOUT_S  RPC timeout 秒數（未指定：一般方法 5.0；長操作 session attach/recover/self-test/console-attach 自動採固定 45.0 的 floor，#123）
+  --retries RETRIES    TIMEOUT／連線失敗時的重試次數，僅作用於冪等唯讀方法白名單（指數退避 0.5s 起、單次上限 5s；預設: 0）
 
 command groups:
   <group>

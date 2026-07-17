@@ -226,7 +226,10 @@ sequenceDiagram
 #### 命令限制
 
 - 命令字串不得含有 `\n` 換行字元。`arbiter.submit()` 會在入口檢查，若偵測到換行則拒絕並回傳 `error_code: CMD_CONTAINS_NEWLINE`。
-- 命令長度 > 4 KB 回 warning，> 16 KB 拒絕（`CMD_TOO_LONG`）。
+- 命令長度（UTF-8 位元組）> 4 KB 回 warning（`CMD_LENGTH_WARNING`），> 16 KB 拒絕（`CMD_TOO_LONG`）。broker 對接受的命令**不做截斷**，全量寫出到 UART。
+- 上述為 **broker 對單一 command 參數的上限**；**target 端 tty line buffer（常見 4096 bytes）的物理單行限制**是另一回事——即使 broker 接受，過長單行仍可能在 target 端被截斷，兩者需分開考量。target 端單行上限為 target-dependent（依 target 的 OS／tty 驅動而異，例如 Linux N_TTY 常見 4096），broker 無從權威得知，故**不經 `limits` 欄位暴露**，僅於文件提示常見值。
+- broker 送出時會補尾端 `\n`（`uart_io` 的 `send_command`；含換行的命令已在入口被拒，故必補），on-wire 單行位元組數 = 命令 UTF-8 位元組數 + 1。
+- 上限可執行期查詢（#129）：`health.status`（CLI `serialwrap daemon status`）回應的 `limits` 欄位——`max_submit_cmd_bytes`（硬上限）、`warn_submit_cmd_bytes`（軟上限）、`reject_error_code`、`newline_error_code`、`warning_code`、`newline_forbidden`——上限值與錯誤碼／警告碼字串皆直接引用 `sw_core/arbiter.py` 常數（單一事實來源），client 不需硬編碼。
 - 長命令建議拆分為多步驟或使用 `file.push` 傳輸 script 後在 target 執行。
 
 ### 6.2 background
@@ -301,6 +304,18 @@ Agent 收到 sentinel 後應短暫 sleep 後重試，而非視為錯誤。
 - 保留 `partial: true`（原始命令的輸出可能不完整）
 
 這讓 caller 可以區分「命令失敗但 session 仍可用」與「session 完全失聯」。
+
+#### 佇列 flush 語意（`FLUSHED_BY_RECOVERY`，#128）
+
+session 因 recovery/re-attach 離開 `READY`（`_on_detached` → `arbiter.unregister_session`）時，該 session 的 PriorityQueue 會被丟棄；佇列中**尚未啟動**（`status=accepted`）的命令一律以終端態終結：
+
+- `status: error`
+- `error_code: FLUSHED_BY_RECOVERY`
+- `done_at` 設為 flush 當下
+
+語意：該命令**未被執行**（從未送進 UART），client 對這些 `cmd_id` 的 `command.get` 收到此終端態即應於 session 回 `READY` 後重送。in-flight（`running`/`interactive`）命令不重複標記，由 worker 以真實結果終結。flush 使記錄轉為可淘汰並即刻釋放 `CMD_PENDING_MAX` pending 額度——修掉 stale accepted 記錄永久佔額度、導致該 session 直到 daemon 重啟前一律 `SESSION_QUEUE_FULL` 的洩漏。
+
+所有 detach 類路徑（含 recovery、`session clear`、device release、rebind、熱拔、re-attach 等 `_on_detached` 上游）皆以 `FLUSHED_BY_RECOVERY` 終結未啟動命令；daemon shutdown（`service.stop()`）則用 `FLUSHED_BY_SHUTDOWN`。兩者語意相同＝命令未執行、可於 session 回 `READY` 後重送。
 
 ### 6.5 長命令 keepalive hint
 
@@ -430,6 +445,34 @@ dynamic 自動偵測 session 的 COM 編號**依裝置 by-id 字典序確定性�
 
 - 直接走 reattach
 - attach 流程只做被動 prompt probe，不自動 login
+
+### 9.3 U-Boot autoboot 保護（boot quiet window，#130）
+
+DUT 重開機時，U-Boot autoboot 倒數窗（`Hit any key to stop autoboot`）收到任何 byte 即中斷開機、卡在 bootloader prompt。daemon 以 **boot quiet window** 防止自動 probe 落入此視窗：
+
+**觸發（arm）**：
+
+1. `_handle_reboot_command` 收到 reboot 類指令**當下**（送出命令前）即設定，不等 banner。
+2. RX 路徑（`_on_bridge_rx`）偵測到 boot banner——以 `BOOT_BANNER_PATTERNS`（`U-Boot`、`Hit any key to stop autoboot`；大小寫敏感 substring）比對 rolling tail（`BOOT_BANNER_TAIL_CHARS=256` 字元，跨 chunk 邊界）。倒數每 tick 會延長視窗。此路徑涵蓋 DUT 自行重開／斷電重開。
+
+**效果**：視窗內（`BOOT_QUIET_WINDOW_S=180s`）gate 所有 `source=system` 的自動 probe TX——這裡的「自動」指呼叫端不需人為觸發 UART 寫入本身，**手動觸發的 RPC（`session attach`／`session recover`）一樣受 gate**，因為它們最終都會走到下列同一批共用 probe/按鍵函式（#130 review 收斂前，這幾條路徑各自遺漏過 gate，現已逐一補上）：
+
+- reboot recovery 迴圈（`_spawn_reboot_recovery`）：純被動等 RX；deadline 延伸至「視窗結束 + 一輪 `hard_timeout_s`」，上限為「一個完整視窗 + 一輪 probe 預算」（防 boot-loop 板反覆吐 banner 使執行緒無限延命）。
+- readiness reprobe（`_prepare_reprobe_locked` 與 worker 寫入前的最終驗證 `_reprobe_target_still_valid_locked`）：不 fire、不累加 attempts、不排 backoff。
+- attach probe（`_probe_existing_bridge`）：`session attach`（`attach_session` 的 ATTACHED 分支、無 human lease 時）與 `session recover`（`recover_session` 的 ATTACHED 分支重探）共用同一個 probe 入口，於此單點 gate 同時涵蓋兩條呼叫路徑；掛 bridge 純收 RX，以 `PROMPT_UNAVAILABLE` 停在 `ATTACHED`。
+- 初次 attach（`_attach_by_id`）：掛 bridge 純收 RX，以 `PROMPT_UNAVAILABLE` 停在 `ATTACHED`，視窗解除後由 reprobe／recovery 接手（涵蓋 reboot 期間序列裝置 re-enumerate 的 re-attach）。
+- 命令逾時後的強制按鍵迴圈（`_recover_after_failure` 的 CTRL_C/CTRL_D）：跳過強制按鍵，直接落到既有 timeout 收尾（session 轉 `ATTACHED`）——這是最容易觸發的路徑，agent 正常送命令途中 target 自發重開機、逾時即進入本函式。
+- `session self-test`（`_self_test_impl` 的 READY 分支 nonce probe）：回報 `classification: "AUTOBOOT_QUIET"`，不送 probe。
+
+**解除（clear）**：RX 匹配該 session 的 `login_regex` / `prompt_regex`（開機完成訊號）即刻解除並恢復探測；否則過期自動解除。例外：若命中的尾行本身就是該 session `bootloader_prompts` 名單中的一員（如 U-Boot 自己的 `=> `），視為仍在 bootloader、非開機完成，本輪不解除——寬鬆撰寫的 `prompt_regex`（如 brcm-template `(?m)[>#]\s*$`）會誤配 bootloader 自身 prompt，若不先排除會在板子正卡 bootloader 的最危險時刻誤解除（`_update_boot_quiet_locked` 於解除前先呼叫 `_matches_any_bootloader_prompt`）。
+
+**不 gate**：human console bytes、interactive lease TX、agent 顯式命令（session 已是 `READY` 時，本來就被 READY gate 擋在 arbiter 之前）。與 #114「刻意進 bootloader」相容——human/lease 送鍵永遠放行。
+
+**已知架構限制（未修，待 follow-up issue）**：`boot_quiet_until` 只影響上述自動 probe gate，**不會**降級 `session.state`。若自發重開機與進行中的 agent 命令競速、session 仍（名義上）停在 `READY`，該顯式命令仍可能在 autoboot 倒數期間打到 UART——需要新增 state 或 arbiter 層 gate 才能堵住，本次收斂範圍不含此項。
+
+**觀測**：session 公開欄位 `boot_quiet_remaining_s`（剩餘秒數；`null`＝未啟用/已解除）。
+
+另 `prpl-template` 資產已定義 `bootloader_prompts`（`^=> $`、`^U-Boot> $`），卡 bootloader 時 `interactive-open --allow-attached` 的 recovery lease 可匹配進入。
 
 ## 10. Logging 與輸出層
 

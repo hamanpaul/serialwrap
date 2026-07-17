@@ -11,6 +11,7 @@ import time
 from collections.abc import Sequence
 from typing import Any
 
+from .arbiter import CMD_REJECT_BYTES, CMD_WARN_BYTES
 from .client import _af_unix_available, _parse_endpoint, rpc_call
 from .constants import (
     CONFIG_DIR,
@@ -38,6 +39,52 @@ from .setup_cmd import (
 _USE_DEFAULT_ENV = object()
 LEGACY_DAEMON_ENV_FILE = "~/OPI.env"
 PROFILE_DAEMON_ENV_FILE = "OPI.env"
+
+# --- #123：長操作 RPC 的 socket timeout floor -------------------------------
+# 問題：session recover／attach／self-test／console-attach（recover 升級分支）
+# 的 daemon 端 handler 為同步長操作（對照 sw_core/daemon.py 的
+# BLOCKING_RPC_METHODS），host 過載或走 force recover 路徑時，daemon 端執行
+# 時間會結構性超過 CLI 舊預設 5s socket timeout，CLI 因而回「假性 TIMEOUT」
+# ——daemon 其實健康、操作稍後成功（實測 recover CLI 5.08s 報 TIMEOUT、daemon
+# ~7-8s 後 READY）。
+#
+# floor 推導（code review MINOR-2 修正版，誠實版）：真正會拉長 daemon 端執行
+# 時間的變數是 profile 的 ``timeout_s``（sw_core/config.py；bcm 類平台常設
+# 15s+、且可能多階段 login/ready probe），這個值只存在 daemon 端載入的
+# profile 裡，CLI 完全無從得知。初版曾誤以為「CLI 傳給 daemon 的
+# recover_timeout_s／probe_timeout_s 越大、daemon 端就等越久」，因而讓 floor
+# 隨這兩個參數 + 常數裕度「縮放」；但 sw_core/session_manager.py 的
+# ``_recover_after_failure`` 對 CTRL_C／CTRL_D 兩段等待皆套用
+# ``min(timeout_s, 2.0)`` 硬 cap，超過 2.0 的 recover_timeout_s 對 daemon 端
+# 實際等待時間毫無影響——前提是錯的，floor 不該假裝能靠這個參數精算。
+#
+# 因此改採固定寬鬆常數：CTRL_C 等 prompt 2s + CTRL_D 等 prompt 2s
+# （_recover_after_failure）+ force fallback 硬輪詢 10s（_force_recover 的
+# range(10)×sleep(1.0)）+ bcm 類慢板多階段 login/ready probe 與 attach
+# reprobe 裕度，取 45s 為 recover／attach／self-test／console-attach 統一
+# floor；顯式 --timeout 一律照舊覆蓋。若操作仍逾時，應以 TIMEOUT 錯誤附帶的
+# daemon_reachable／daemon_busy（見 client.py 的 _probe_daemon_after_timeout）
+# 與 ``session list`` 確認 daemon 是否仍在執行，而非把這個 floor 當成精確上界。
+LONG_RPC_TIMEOUT_FLOOR_S = 45.0
+# 一般（非長操作）方法未顯式指定 --timeout 時的預設 RPC timeout，維持既有 5s。
+DEFAULT_RPC_TIMEOUT_S = 5.0
+
+# 落在 daemon 端 BLOCKING_RPC_METHODS、且 CLI 無從得知其真實變動成本
+# （profile timeout_s）的長操作方法：一律採上方固定 floor，不依任何 CLI 側
+# 參數縮放（MINOR-2）。
+_LONG_RPC_METHODS = frozenset({
+    "session.recover",
+    "session.attach",
+    "session.self_test",
+    "session.console_attach",  # recover 升級分支可同步跑數十秒，MAJOR-1 補上
+})
+
+# file.push／file.pull 已知缺口（#123 defer，MINOR-5）：兩者的 chunk 傳輸走
+# UART 逐段 base64 編碼往返，大檔可達分鐘級，遠超一般方法的 5s 預設、幾乎必
+# 假性逾時；但目前 CLI 端沒有任何可靠信號能推得「這次要傳多久」（檔案大小、
+# baud、對端忙碌程度皆未知），貿然給個固定常數一樣是用猜的。留待 follow-up
+# （例如讓 daemon 端回報預期分段數，或改走非阻塞輪詢）另行處理，此處不假裝
+# 已經解決。
 
 
 class EnvFileSourceError(RuntimeError):
@@ -513,8 +560,35 @@ def _resolve_endpoint(args: argparse.Namespace) -> str:
     return chosen
 
 
+def _effective_timeout_s(args: argparse.Namespace, method: str) -> float:
+    """解析本次 RPC 實際使用的 socket timeout（#123）。
+
+    使用者顯式指定全域 ``--timeout`` → 一律照用；未指定（None）→ 一般方法用
+    ``DEFAULT_RPC_TIMEOUT_S``（5s），落在 ``_LONG_RPC_METHODS``（對照 daemon
+    端 ``BLOCKING_RPC_METHODS`` 的 session.recover／session.attach／
+    session.self_test／session.console_attach）改用固定
+    ``LONG_RPC_TIMEOUT_FLOOR_S``，消除「daemon 還在跑、CLI 先報 TIMEOUT」的
+    假性逾時。floor 為固定常數、不隨 recover_timeout_s／probe_timeout_s 縮放
+    （MINOR-2：daemon 端對這兩個 CLI 參數皆有 cap，且真正影響執行時間的是
+    CLI 無從得知的 profile timeout_s）。file.push／file.pull 為已知缺口，
+    暫不納入（見上方常數註解，#123 defer）。
+    """
+    explicit = getattr(args, "timeout_s", None)
+    if explicit is not None:
+        return float(explicit)
+    if method in _LONG_RPC_METHODS:
+        return LONG_RPC_TIMEOUT_FLOOR_S
+    return DEFAULT_RPC_TIMEOUT_S
+
+
 def _run_rpc(args: argparse.Namespace, method: str, params: dict[str, Any]) -> int:
-    resp = rpc_call(_resolve_endpoint(args), method, params, timeout_s=args.timeout_s)
+    resp = rpc_call(
+        _resolve_endpoint(args),
+        method,
+        params,
+        timeout_s=_effective_timeout_s(args, method),
+        retries=int(getattr(args, "retries", 0) or 0),
+    )
     _print(resp)
     if not resp.get("ok"):
         # #94：失敗時除了 stdout 的機器可解析 JSON，另在 stderr 印一行具體 error，
@@ -524,37 +598,62 @@ def _run_rpc(args: argparse.Namespace, method: str, params: dict[str, Any]) -> i
     return 0 if resp.get("ok") else 2
 
 
+# event 子命令 → 實際送出的 RPC method 名對映（NIT-8：先前用佔位字串
+# f"event.{event_cmd}" 查 floor，與 rpc_call 實際送出的 method 名不一致，
+# 例如 "add" 實際送 "event.rule_set" 而非 "event.add"）。目前結果不變
+# （event.* 全不在 _LONG_RPC_METHODS／RETRYABLE_READONLY_METHODS 白名單，
+# 一律維持 DEFAULT_RPC_TIMEOUT_S、不重試），但用真實 method 名查詢才不會在
+# 白名單將來納入 event.* 某個方法時悄悄查錯 key。
+_EVENT_CMD_METHOD = {
+    "add": "event.rule_set",
+    "rm": "event.rule_delete",
+    "list": "event.rule_list",
+    "show": "event.rule_get",
+    "enable": "event.com_enable",
+    "disable": "event.com_disable",
+    "status": "event.com_status",
+    "reset": "event.reset",
+    "reload": "event.reload",
+    "tail": "event.tail",
+}
+
+
 def _dispatch_event(args: argparse.Namespace) -> int:
+    # event.* 皆非長操作、也都不在 RETRYABLE_READONLY_METHODS 白名單（即使是
+    # event.rule_list／event.tail 這類查詢，目前也未列入，見 client.py）：
+    # 未顯式指定 --timeout 時維持一般預設 5s；--retries 於此不轉發——轉發了
+    # 也不會生效，維持現狀（#123）。
+    timeout_s = _effective_timeout_s(args, _EVENT_CMD_METHOD.get(args.event_cmd, f"event.{args.event_cmd}"))
     if args.event_cmd == "add":
         with open(args.file, "r", encoding="utf-8") as f:
             params = json.load(f)
-        result = rpc_call(_resolve_endpoint(args), "event.rule_set", params, timeout_s=args.timeout_s)
+        result = rpc_call(_resolve_endpoint(args), "event.rule_set", params, timeout_s=timeout_s)
     elif args.event_cmd == "rm":
-        result = rpc_call(_resolve_endpoint(args), "event.rule_delete", {"rule_id": args.rule_id}, timeout_s=args.timeout_s)
+        result = rpc_call(_resolve_endpoint(args), "event.rule_delete", {"rule_id": args.rule_id}, timeout_s=timeout_s)
     elif args.event_cmd == "list":
         result = rpc_call(
             _resolve_endpoint(args),
             "event.rule_list",
             {"selector": getattr(args, "selector", None), "owner": getattr(args, "owner", None)},
-            timeout_s=args.timeout_s,
+            timeout_s=timeout_s,
         )
     elif args.event_cmd == "show":
-        result = rpc_call(_resolve_endpoint(args), "event.rule_get", {"rule_id": args.rule_id}, timeout_s=args.timeout_s)
+        result = rpc_call(_resolve_endpoint(args), "event.rule_get", {"rule_id": args.rule_id}, timeout_s=timeout_s)
     elif args.event_cmd == "enable":
-        result = rpc_call(_resolve_endpoint(args), "event.com_enable", {"selector": args.selector}, timeout_s=args.timeout_s)
+        result = rpc_call(_resolve_endpoint(args), "event.com_enable", {"selector": args.selector}, timeout_s=timeout_s)
     elif args.event_cmd == "disable":
-        result = rpc_call(_resolve_endpoint(args), "event.com_disable", {"selector": args.selector}, timeout_s=args.timeout_s)
+        result = rpc_call(_resolve_endpoint(args), "event.com_disable", {"selector": args.selector}, timeout_s=timeout_s)
     elif args.event_cmd == "status":
-        result = rpc_call(_resolve_endpoint(args), "event.com_status", {"selector": getattr(args, "selector", None)}, timeout_s=args.timeout_s)
+        result = rpc_call(_resolve_endpoint(args), "event.com_status", {"selector": getattr(args, "selector", None)}, timeout_s=timeout_s)
     elif args.event_cmd == "reset":
         result = rpc_call(
             _resolve_endpoint(args),
             "event.reset",
             {"rule_id": getattr(args, "rule_id", None), "selector": getattr(args, "selector", None)},
-            timeout_s=args.timeout_s,
+            timeout_s=timeout_s,
         )
     elif args.event_cmd == "reload":
-        result = rpc_call(_resolve_endpoint(args), "event.reload", {}, timeout_s=args.timeout_s)
+        result = rpc_call(_resolve_endpoint(args), "event.reload", {}, timeout_s=timeout_s)
     elif args.event_cmd == "tail":
         result = rpc_call(
             _resolve_endpoint(args),
@@ -565,7 +664,7 @@ def _dispatch_event(args: argparse.Namespace) -> int:
                 "n": args.n,
                 "since_ts": getattr(args, "since", None),
             },
-            timeout_s=args.timeout_s,
+            timeout_s=timeout_s,
         )
     else:
         _print({"ok": False, "error_code": "UNKNOWN_EVENT_CMD", "cmd": args.event_cmd})
@@ -734,7 +833,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"serialwrap {_resolve_version()}", help="顯示版本後離開")
     p.add_argument("--socket", default=None, help="本機 daemon 的 Unix socket 路徑（未指定時依 config.yaml 與 XDG 執行期目錄解析，可用 SERIALWRAP_RUN_DIR 覆寫）")
     p.add_argument("--endpoint", default=None, metavar="ENDPOINT", help="遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）")
-    p.add_argument("--timeout", dest="timeout_s", type=float, default=5.0, help="RPC timeout 秒數（預設: %(default)s）")
+    p.add_argument(
+        "--timeout",
+        dest="timeout_s",
+        type=float,
+        default=None,
+        help="RPC timeout 秒數（未指定：一般方法 5.0；長操作 session attach/recover/self-test/console-attach 自動採固定 45.0 的 floor，#123）",
+    )
+    p.add_argument(
+        "--retries",
+        dest="retries",
+        type=int,
+        default=0,
+        help="TIMEOUT／連線失敗時的重試次數，僅作用於冪等唯讀方法白名單（指數退避 0.5s 起、單次上限 5s；預設: %(default)s）",
+    )
 
     sub = p.add_subparsers(
         dest="cmd",
@@ -886,9 +998,30 @@ def build_parser() -> argparse.ArgumentParser:
         description="向 session 提交命令並取回結果：line 模式看 status，background 模式用 result-tail。",
     )
     cmd_sub = p_cmd.add_subparsers(dest="cmd_cmd", required=True, metavar="<command>")
-    p_cs = cmd_sub.add_parser("submit", help="提交命令到 session（--mode line|background|interactive）")
+    p_cs = cmd_sub.add_parser(
+        "submit",
+        help="提交命令到 session（--mode line|background|interactive）",
+        description=(
+            "提交命令到 session（--mode line|background|interactive）。\n"
+            "\n"
+            "命令長度限制（--cmd 整條字串，以 UTF-8 位元組計；#129）：\n"
+            f"  - > {CMD_WARN_BYTES} bytes：接受但附 CMD_LENGTH_WARNING（過長命令可能造成 UART 緩衝溢位或 prompt timeout）\n"
+            f"  - > {CMD_REJECT_BYTES} bytes：直接拒絕（CMD_TOO_LONG）\n"
+            "  - 含 \\n 換行字元：直接拒絕（CMD_CONTAINS_NEWLINE），請拆成多次獨立提交\n"
+            "\n"
+            "broker 對命令內容不做截斷；上述為 broker 對單一 --cmd 參數的上限，\n"
+            "target 端 tty line buffer（常見 4096 bytes，target-dependent）才是物理單行限制。\n"
+            "上限可由 `serialwrap daemon status` 回應的 limits 欄位執行期查詢，client 不需硬編碼。"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
     p_cs.add_argument("--selector", required=True)
-    p_cs.add_argument("--cmd", dest="command_text", default="")
+    p_cs.add_argument(
+        "--cmd",
+        dest="command_text",
+        default="",
+        help=f"要執行的單行命令（UTF-8 > {CMD_WARN_BYTES} bytes warning、> {CMD_REJECT_BYTES} bytes 拒絕，詳見上方說明）",
+    )
     p_cs.add_argument("--source", default="agent")
     p_cs.add_argument("--mode", default="line")
     p_cs.add_argument("--priority", type=int, default=10)
@@ -924,12 +1057,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_lr = log_sub.add_parser("tail-raw", help="tail raw 日誌（含 timestamp／source／seq／crc）")
     p_lr.add_argument("--selector")
     p_lr.add_argument("--com")
-    p_lr.add_argument("--from-seq", type=int, default=0)
+    p_lr.add_argument(
+        "--from-seq",
+        type=int,
+        default=None,
+        help="省略＝latest 模式（回傳最新 N 筆）；指定 N（含 0）＝range 模式（自 seq>N 起最舊 N 筆，增量讀取用）",
+    )
     p_lr.add_argument("--limit", type=int, default=200)
     p_lt = log_sub.add_parser("tail-text", help="tail 純文字日誌")
     p_lt.add_argument("--selector")
     p_lt.add_argument("--com")
-    p_lt.add_argument("--from-seq", type=int, default=0)
+    p_lt.add_argument(
+        "--from-seq",
+        type=int,
+        default=None,
+        help="省略＝latest 模式（回傳最新 N 筆）；指定 N（含 0）＝range 模式（自 seq>N 起最舊 N 筆，增量讀取用）",
+    )
     p_lt.add_argument("--limit", type=int, default=200)
 
     p_file = sub.add_parser(
@@ -1238,7 +1381,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "log":
         selector = args.selector or args.com
-        params = {"from_seq": args.from_seq, "limit": args.limit}
+        # --from-seq 省略時不放 key → daemon 走 latest 模式（#124）；顯式帶值（含 0）→ range 模式。
+        params = {"limit": args.limit}
+        if args.from_seq is not None:
+            params["from_seq"] = args.from_seq
         if selector:
             params["selector"] = selector
         if args.log_cmd == "tail-raw":

@@ -13,6 +13,13 @@ from .util import now_iso
 CMD_WARN_BYTES = 4096
 CMD_REJECT_BYTES = 16384
 
+# 錯誤碼／警告碼字串的單一事實來源（#129 review）：submit() 的拒絕／警告點與
+# service.py health.status 的 limits 欄位（reject_error_code 等）皆引用此處，
+# 避免同一字串在多處硬編碼而各自漂移。
+ERROR_CMD_TOO_LONG = "CMD_TOO_LONG"
+ERROR_CMD_CONTAINS_NEWLINE = "CMD_CONTAINS_NEWLINE"
+WARNING_CMD_LENGTH = "CMD_LENGTH_WARNING"
+
 
 @dataclasses.dataclass(order=True)
 class _QueuedCommand:
@@ -48,11 +55,22 @@ class CommandArbiter:
             self._threads[session_id] = th
             th.start()
 
-    def unregister_session(self, session_id: str) -> None:
+    def unregister_session(self, session_id: str, error_code: str = "FLUSHED_BY_RECOVERY") -> None:
         with self._lock:
             stop = self._stops.pop(session_id, None)
             pq = self._queues.pop(session_id, None)
             th = self._threads.pop(session_id, None)
+            # 佇列已丟棄：與 pop 在**同一把鎖內**原子終結所有尚未啟動的 queued 命令（#128）。
+            # 否則 stale accepted 記錄永無 done_at、永久計入 _count_pending_locked 佔用
+            # CMD_PENDING_MAX 額度，數次 recovery episode 後該 session 直到 daemon 重啟前
+            # 一律 SESSION_QUEUE_FULL。
+            # 不得延後到鎖外（例如 join 之後）再 flush：舊 worker 卡在 send_cb 超過 join
+            # timeout 時，期間若發生 re-register + 新 submit，遲到的 flush 會把新佇列上的
+            # 健康 accepted 命令誤標終結、永不執行（epoch race，#128 review F1）。
+            # 與 pop 原子完成則不漏不多殺：pop 前入列者必被掃到、pop 後的 submit 回
+            # SESSION_NOT_READY、已 dequeue 的 in-flight 非 accepted 不受影響，
+            # flush 與取件間的殘餘 race 由 worker 的 done_at 防線接住。
+            self._flush_session_locked(session_id, error_code)
         if stop:
             stop.set()
         if pq:
@@ -62,6 +80,43 @@ class CommandArbiter:
                 pass
         if th and th.is_alive() and th is not threading.current_thread():
             th.join(timeout=1.0)
+
+    def flush_session(self, session_id: str, error_code: str = "FLUSHED_BY_RECOVERY") -> int:
+        """終結該 session「尚未啟動」（status=accepted、done_at=None）的佇列命令（#128）。
+
+        鎖外公開入口（保留給測試與未來的顯式 flush 需求）；``unregister_session`` 內
+        改以 ``_flush_session_locked`` 於首段鎖內與 pop queue 原子執行，勿再從該處
+        呼叫本方法（避免 epoch race，#128 review F1）。回傳被 flush 的筆數。
+        """
+        with self._lock:
+            return self._flush_session_locked(session_id, error_code)
+
+    def _flush_session_locked(self, session_id: str, error_code: str) -> int:
+        """flush 實作：須在持有 ``self._lock`` 下呼叫（#128）。
+
+        以 ``status=error`` + ``error_code`` + ``done_at`` 標記終端態：client 對這些 cmd_id 的
+        ``command.get`` 會看到明確的「未執行、可於 session 回 READY 後重送」語意，且記錄
+        轉為可淘汰、pending 額度即刻釋放。in-flight（running/interactive）命令不重複標記，
+        留給 worker 以真實結果終結。
+
+        刻意**不**呼叫 ``_evict_commands_locked()``：``_commands`` 超量（> CMD_HISTORY_MAX）
+        時 evict 可能把剛 flush 的記錄當場淘汰，client 隨後 ``command.get`` 只拿得到
+        CMD_NOT_FOUND 而非 FLUSHED_BY_RECOVERY，喪失「未執行、可重送」語意（#128 review
+        F3）。history 收斂交給後續 submit／worker 終結／cancel 路徑的 evict，增長有界
+        （pending 受 CMD_PENDING_MAX 封頂、已終結者下次 evict 即回收）。
+        """
+        now = now_iso()
+        flushed = 0
+        for rec in self._commands.values():
+            if rec.get("session_id") != session_id:
+                continue
+            if rec.get("done_at") is not None or rec.get("status") != "accepted":
+                continue
+            rec["status"] = "error"
+            rec["error_code"] = error_code
+            rec["done_at"] = now
+            flushed += 1
+        return flushed
 
     def submit(
         self,
@@ -78,7 +133,7 @@ class CommandArbiter:
         if cmd_len > CMD_REJECT_BYTES:
             return {
                 "ok": False,
-                "error_code": "CMD_TOO_LONG",
+                "error_code": ERROR_CMD_TOO_LONG,
                 "cmd_length": cmd_len,
                 "limit": CMD_REJECT_BYTES,
                 "hint": "Command exceeds 16 KB hard limit. Use file-based injection or split into smaller commands.",
@@ -86,7 +141,7 @@ class CommandArbiter:
         cmd_warning = None
         if cmd_len > CMD_WARN_BYTES:
             cmd_warning = {
-                "code": "CMD_LENGTH_WARNING",
+                "code": WARNING_CMD_LENGTH,
                 "cmd_length": cmd_len,
                 "soft_limit": CMD_WARN_BYTES,
                 "hint": "Command exceeds 4 KB soft limit. Long commands may cause UART buffer overflow or prompt timeout.",
@@ -94,7 +149,7 @@ class CommandArbiter:
         if "\n" in command:
             return {
                 "ok": False,
-                "error_code": "CMD_CONTAINS_NEWLINE",
+                "error_code": ERROR_CMD_CONTAINS_NEWLINE,
                 "hint": "Command must not contain embedded newline characters. "
                         "Split into multiple independent submissions.",
             }
@@ -213,7 +268,9 @@ class CommandArbiter:
                 rec = self._commands.get(item.cmd_id)
                 if rec is None:
                     continue
-                if rec.get("status") == "canceled":
+                if rec.get("status") == "canceled" or rec.get("done_at"):
+                    # 已被 cancel 或已被 flush 終結（#128）的記錄：跳過，不得重設 running
+                    # 或執行 send_cb（防 flush 與取件之間的 race 把終端態覆寫回進行中）。
                     continue
                 rec["status"] = "running"
                 rec["started_at"] = now_iso()

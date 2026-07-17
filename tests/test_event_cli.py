@@ -16,7 +16,8 @@ class _StubClient:
         self.calls: list[tuple[str, dict]] = []
         self.responses: dict[str, object] = {}
 
-    def __call__(self, endpoint: str, method: str, params: dict | None = None, timeout_s: float = 5.0) -> object:
+    def __call__(self, endpoint: str, method: str, params: dict | None = None, timeout_s: float = 5.0, retries: int = 0) -> object:
+        # retries 為 #123 新增之 rpc_call 介面（僅唯讀白名單方法會用到），stub 記錄後忽略
         self.calls.append((method, dict(params or {})))
         return self.responses.get(method, {"ok": True, "method": method, "params": params})
 

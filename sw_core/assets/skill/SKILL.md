@@ -36,7 +36,7 @@ description: 透過 serialwrap broker + CLI 進行多 agent UART 存取，提供
 6. `line` 前景命令：`serialwrap cmd status --cmd-id <cmd_id>` 直接讀 stdout。
 7. `background` 命令：`serialwrap cmd result-tail --cmd-id <cmd_id> --from-chunk 0 --limit 100` 增量取回 chunk。
 8. `interactive` 任務：用 `session interactive-open/-send/-status/-close`，不要拿 `cmd submit` 硬跑全螢幕互動程式。
-9. 需要完整證據時：`serialwrap log tail-raw --selector COM0`／`serialwrap wal export`；只要查目前 WAL seq 用 `serialwrap wal current-seq`。
+9. 需要完整證據時：`serialwrap log tail-raw --selector COM0`（預設 latest 模式回最新 N 筆；要增量讀取帶 `--from-seq N`，回應附 `last_seq`/`current_seq`/`truncated` 等 metadata，#124。注意 `truncated` 僅以現行 WAL 檔為範圍——輪替歸檔 `raw.wal.ndjson.<ts>` 不列入，需要更舊紀錄直接讀歸檔檔）／`serialwrap wal export`；只要查目前 WAL seq 用 `serialwrap wal current-seq`。
 
 ## command_capable 與 READY 判定（#51）
 - 一個 session 是否「可下命令」由其 profile 的 `ready_probe` 是否非空決定（`command_capable = bool(profile.ready_probe.strip())`），**與底層是 OS shell 或 bootloader 無關**——只要 `prompt_regex` 對得上、`ready_probe` 能 round-trip 即可進 `READY`（含 U-Boot 之類 bootloader command profile，如 `uboot-template`）。
@@ -74,6 +74,17 @@ serialwrap 另提供原生 MCU flash 端點（與上面 device handoff 互補）
 - `minicom_router.sh` 會提示「DUT 可能仍在開機、serialwrap 正在自動重探」；需要阻塞等 READY 時可設 `MINICOM_WAIT_READY=1`。
 - 若 `reprobe_exhausted=true` 或等待過久仍未 READY，再手動 `serialwrap session recover --selector COM0`（必要時 `--force`）。
 - 懷疑 RX 掉字／狀態被污染：可能是同機多開（two-reader）。`serialwrap daemon status` 的 `multi_open`／`foreign_holders` 欄位與 `serialwrap doctor` 的 `single_daemon` 檢查會掃 `/proc` 報出其他 `serialwrapd` 與 tty 持有者（#101，純偵測）。勿用 `serialwrap daemon start`（systemd 模式會另起非託管 daemon 造成 two-reader）；生命週期用 `serialwrap service ...`。
+
+## Timeout 語意（#123）
+- **呼叫端必須自行處理 timeout**：CLI 回 `TIMEOUT` 只代表「CLI 不再等待」，daemon 端操作可能仍在執行、稍後成功（host 過載時尤然）。看到 TIMEOUT 先讀附帶欄位再決定下一步，勿直接重送寫入類命令。
+- **長操作自動固定 floor**：`session attach`／`session recover`／`session self-test`／`session console-attach`（recover 升級分支可同步跑數十秒）為 daemon 端同步長操作；未指定全域 `--timeout` 時 CLI 自動採固定 45s 的 floor，一般方法維持 5s。顯式指定 `--timeout` 一律照用。floor 為誠實的寬鬆常數——CLI 無從得知 daemon 端 profile 的 `timeout_s`（bcm 類平台常 15s+、多階段 probe），不隨 recover/self-test 的子命令參數縮放（daemon 端對那些參數本就有 2s cap）；仍逾時時改看下一條的診斷欄位與 `session list`。
+- **TIMEOUT 錯誤帶診斷欄位**：`daemon_reachable`（1s `health.ping` 探測）分辨「daemon 死亡／斷線」（false → 檢查 daemon／裝置）與「daemon 忙碌」（true → 操作多半仍在跑，稍候以 `session list`／`self-test` 確認結果）；可達時另附 `daemon_busy`（in-flight `commands`／`sessions` 計數）。
+- **`--retries N` 僅作用唯讀方法**：只有冪等唯讀白名單（`session list`、`health.*`、`device list` 等查詢類）會在 TIMEOUT／連線失敗／`EMPTY_RESPONSE` 時指數退避重試（0.5s 起 ×2、單次上限 5s）；寫入類（attach／recover／submit…）絕不自動重送。白名單呼叫最壞總耗時約 `(retries+1) × timeout_s + 退避總和`。
+
+## U-Boot autoboot 保護（boot quiet window，#130）
+- 對 DUT 下 `reboot` 後 session 停在 `RECOVERING`／`ATTACHED`、且 `session list` 的 `boot_quiet_remaining_s` 有值：**這是正常的 autoboot 保護**，daemon 正在靜默等 DUT 開機（避免自動 probe 打斷 U-Boot autoboot 倒數把板子卡在 `=> `）。**等它自己回 `READY`**（RX 見 login/prompt 即解除、最長 180s），勿反覆下 `session recover`——反覆下也一樣會被 gate 擋下（見下一點），不會提早成功，只會浪費時間。
+- 保護 gate 所有自動 probe/按鍵，**含手動觸發的 RPC**：`session attach`、`session recover`（兩者共用同一個 probe 入口）、`session self-test`（回報 `classification: "AUTOBOOT_QUIET"`）、命令逾時後的強制恢復按鍵，在 quiet window 內都會誠實回報「還在等」而不會送 bytes 進 UART。只有 human console bytes、interactive lease TX、agent 顯式命令（session 已 `READY` 時）不受影響——刻意要進 bootloader（先送 reboot 再於 lease 連打按鍵）仍可行。
+- 若板子已卡在 bootloader prompt（`=> `／`U-Boot> `）：prpl-template 有 `bootloader_prompts`，用 `serialwrap session interactive-open --selector COM0 --allow-attached` 開 recovery lease 打 `boot` 脫困。
 
 ## Remote Support 用法（ssh-tunnel）
 當 Agent 不在 target 所在機器上，而要從遠端 debug UART 時，走 **remote endpoint** 模式。
@@ -129,10 +140,11 @@ serialwrap file pull --selector COM0 --remote /etc/config/wireless --local ./wir
 - 長流命令（`logread -f`、`tcpdump`、kernel debug）一律用 `--mode background` 或設足夠長的 `--cmd-timeout`，避免阻塞共享通道。
 - 每筆自動化命令必填 `--source`，不可省略，確保追蹤性。
 - 卡住時先 `serialwrap session self-test`，再決定是否 `serialwrap session recover`（可加 `--force`）。recover 成功恢復 prompt 時回 `ok: true`（附 `error_code: PROMPT_TIMEOUT_RECOVERED`, `partial: true`），表示 session 可繼續使用。
+- session 於命令排隊期間發生 recovery/re-attach（掉出 `READY`）時，尚未啟動的排隊命令會被終結為 `status=error`、`error_code=FLUSHED_BY_RECOVERY`（#128）——代表該命令**未執行**，等 session 回 `READY` 後重送即可；執行中的命令不受影響，仍以真實結果收尾。所有 detach 類路徑（含 clear/release/熱拔/re-attach）皆用 `FLUSHED_BY_RECOVERY`；daemon shutdown 則用 `FLUSHED_BY_SHUTDOWN`，語意相同＝命令未執行、可於 `READY` 後重送。
 
 ## 短命令原則（Best Practice）
 - **避免 heredoc**：heredoc 經 UART 傳輸時容易遺失字元或打亂 prompt，改用 `echo ... > file` 分步寫入。
-- **單行盡量短**：每條命令控制在 2 KB 以內；> 4 KB 會 warning、> 16 KB 會被 reject（`CMD_TOO_LONG`）。命令不得含 `\n` 換行字元，否則回 `CMD_CONTAINS_NEWLINE`。
+- **單行盡量短**：每條命令控制在 2 KB 以內；UTF-8 位元組 > 4 KB 會 warning、> 16 KB 會被 reject（`CMD_TOO_LONG`）。命令不得含 `\n` 換行字元，否則回 `CMD_CONTAINS_NEWLINE`。broker 不截斷；但 broker 上限與 target 端 tty line buffer（常見 4096 bytes）的物理單行限制是兩回事，過長單行仍可能在 target 端被截斷。上限可由 `serialwrap daemon status` 的 `limits` 欄位執行期查詢，不需硬編碼。
 - **避免 base64 inline**：不要將整個檔案 base64 編碼塞進 `cmd submit`，改用 `serialwrap file push`。
 - **長命令拆分**：管線命令過長時，先寫成 script 檔再 `source` 或 `sh /tmp/script.sh`。
 - **長命令 keepalive**：長時間命令加 `--expected-duration <秒>`，broker 在此期間暫停 prompt timeout 並監控 RX 活動延長等待，避免誤判 PROMPT_TIMEOUT。
@@ -146,7 +158,7 @@ serialwrap cmd submit --selector COM0 --cmd 'ifconfig' --source agent:diag --mod
 serialwrap cmd status --cmd-id <cmd_id>
 serialwrap cmd submit --selector COM0 --cmd 'logread -f' --source agent:diag --mode background --cmd-timeout 300
 serialwrap cmd result-tail --cmd-id <cmd_id> --from-chunk 0 --limit 100
-serialwrap log tail-raw --selector COM0 --from-seq 0 --limit 200
+serialwrap log tail-raw --selector COM0 --limit 200   # latest 模式（預設）：最新 200 筆；--from-seq N 走 range 增量
 serialwrap wal current-seq
 serialwrap device release --selector COM0 --source agent:flash --reason "flash MCU"
 serialwrap device attach --selector COM0

@@ -32,7 +32,8 @@ class _StubClient:
         self.responses = responses
 
     def __call__(self, endpoint: str, method: str, params: dict | None = None,
-                 timeout_s: float = 5.0) -> object:
+                 timeout_s: float = 5.0, retries: int = 0) -> object:
+        # retries 為 #123 新增之 rpc_call 介面（僅唯讀白名單方法會用到），stub 忽略
         return self.responses.get(method, {"ok": True})
 
 
