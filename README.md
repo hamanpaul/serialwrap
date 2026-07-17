@@ -344,10 +344,20 @@ Useful commands:
 ```bash
 serialwrap session log-start --selector COM0
 serialwrap session log-stop --selector COM0
-serialwrap log tail-text --selector COM0 --from-seq 0 --limit 200
+serialwrap log tail-text --selector COM0 --limit 200                 # latest mode (default): newest 200 records
+serialwrap log tail-text --selector COM0 --from-seq 100 --limit 200  # range mode: incremental read from seq > 100
 serialwrap wal export --from-seq 0 --limit 500
 serialwrap wal reset
 ```
+
+`log tail-raw` / `log tail-text` responses carry `from_seq` / `last_seq` /
+`current_seq` / `returned` / `truncated` metadata (#124); `returned` counts WAL
+records for `tail-raw` and text lines for `tail-text`. Queries and the
+`truncated` flag only cover the **current** `raw.wal.ndjson`: records rotated
+into `raw.wal.ndjson.<ts>` archives are not scanned — right after a rotation,
+latest mode may return fewer than `--limit` records with `truncated=false`;
+read the archive files directly if you need older records (`log tail-*` and
+`wal export` both read the current file only).
 
 ### Windows Support
 
@@ -1243,10 +1253,20 @@ targets:
 CLI 查詢：
 
 ```bash
-serialwrap log tail-text --selector COM0 --from-seq 0 --limit 200
-serialwrap log tail-raw  --selector COM0 --from-seq 0 --limit 200
+serialwrap log tail-text --selector COM0 --limit 200                 # latest 模式（預設）：最新 200 筆
+serialwrap log tail-raw  --selector COM0 --limit 200                 # 同上，含權威欄位
+serialwrap log tail-raw  --selector COM0 --from-seq 100 --limit 200  # range 模式：自 seq > 100 增量讀取
 serialwrap wal export --from-seq 0 --limit 500
 ```
+
+`log tail-raw` / `log tail-text` 有兩種模式（#124）：
+
+- **latest 模式（預設，省略 `--from-seq`）**：回傳符合條件的**最新 N 筆**（seq 升冪），對應「看目前板子輸出到哪」的最常見用法。
+- **range 模式（顯式 `--from-seq N`，含 0）**：維持舊語意——自 `seq > N` 起回傳**最舊的 N 筆**，供增量讀取與老 client 相容。
+
+兩者回應皆附 metadata 欄位：`from_seq`（實際使用值，latest 模式為 `null`）、`last_seq`（回傳紀錄的最大 seq，無紀錄為 `null`，可作下次 `--from-seq` 增量起點）、`current_seq`（WAL 目前 seq 計數）、`returned`（回傳筆數：`tail-raw` 計 WAL records、`tail-text` 計文字行數）、`truncated`（是否還有符合但被 `--limit` 截掉的紀錄：latest 模式指視窗**之前**還有更舊紀錄、range 模式指視窗**之後**還有更新紀錄）。
+
+注意：查詢與 `truncated` 判定**僅涵蓋現行 `raw.wal.ndjson`**。WAL 輪替（rotation）後更舊紀錄保存在 `raw.wal.ndjson.<時戳>` 歸檔檔，不列入判定——rotation 剛發生時 latest 模式可能回不足 `--limit` 筆且 `truncated=false`；需要歸檔紀錄請直接讀取歸檔檔（`log tail-*` 與 `wal export` 皆僅讀現行檔）。
 
 ### WAL 管理
 
@@ -1268,8 +1288,9 @@ serialwrap wal current-seq
 
 說明：
 
-- `log tail-text` 偏向人類閱讀，不輸出 metadata header。
+- `log tail-text` 偏向人類閱讀（`lines` 為純文字行，另附 `from_seq`／`last_seq`／`current_seq`／`returned`／`truncated` metadata，#124）。
 - `log tail-raw` / `wal export` 仍保留完整權威欄位。
+- `log tail-raw` / `log tail-text` 預設為 latest 模式（最新 N 筆）；顯式 `--from-seq N`（含 0）走 range 增量語意（見上方「WAL 查詢」）。
 - 可用 `SERIALWRAP_WAL_DIR` 覆寫 WAL / mirror log 目錄，例如放到 `~/b-log`；這不會改動 daemon socket / lock 的 `RUN_DIR`。
 - `stream tail` 為 legacy alias；新設計優先使用 `cmd result-tail`。
 
@@ -1488,8 +1509,8 @@ CLI（`bind` 只改 device、`recover`/`clear` 沿用舊 profile）。在 produc
 >
 > 注意事項：(1) **不要用 `pkill -f "minicom -D ..."`**——pattern 會 self-match 你自己的 shell
 > cmdline；改用 `pgrep -x minicom` 取 PID 再 `kill`。(2) minicom 在 broker pts 上常顯示
-> `Offline`（DCD 未拉起），不影響輸入轉送。(3) `log tail-raw` 預設 `from-seq=0`（最舊起算），
-> 驗證最新輸出要看 minicom 畫面或帶較大 `--limit`/`--from-seq`。
+> `Offline`（DCD 未拉起），不影響輸入轉送。(3) `log tail-raw` 預設為 latest 模式（最新 N 筆，#124），
+> 直接 `serialwrap log tail-raw --selector COMx --limit 50` 即可驗證最新輸出；要從特定 seq 增量讀取才帶 `--from-seq`。
 
 ## Remote Support（ssh-tunnel 遠端連線）
 
