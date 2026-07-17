@@ -891,7 +891,7 @@ serialwrap cmd status --cmd-id <cmd_id>
 
 `command.get` 會直接帶 `stdout`。
 
-**命令限制**：命令字串不得含有 `\n` 換行字元，否則回傳 `CMD_CONTAINS_NEWLINE`。命令長度（UTF-8 位元組）> 4 KB 回 warning（`CMD_LENGTH_WARNING`），> 16 KB 拒絕（`CMD_TOO_LONG`）；broker 對命令內容不做截斷。注意這是 **broker 對單一 `--cmd` 參數的上限**，與 **target 端 tty line buffer（常見 4096 bytes）的物理單行限制**是兩回事——即使 broker 接受，過長單行仍可能在 target 端被截斷。上限可由 `serialwrap daemon status` 回應的 `limits` 欄位執行期查詢（`max_submit_cmd_bytes`／`warn_submit_cmd_bytes`／`reject_error_code`／`newline_forbidden`），client 不需硬編碼（#129）。
+**命令限制**：命令字串不得含有 `\n` 換行字元，否則回傳 `CMD_CONTAINS_NEWLINE`。命令長度（UTF-8 位元組）> 4 KB 回 warning（`CMD_LENGTH_WARNING`），> 16 KB 拒絕（`CMD_TOO_LONG`）；broker 對命令內容不做截斷。注意這是 **broker 對單一 `--cmd` 參數的上限**，與 **target 端 tty line buffer（常見 4096 bytes）的物理單行限制**是兩回事——即使 broker 接受，過長單行仍可能在 target 端被截斷。上限可由 `serialwrap daemon status` 回應的 `limits` 欄位執行期查詢（`max_submit_cmd_bytes`／`warn_submit_cmd_bytes`／`reject_error_code`／`newline_error_code`／`warning_code`／`newline_forbidden`），client 不需硬編碼（#129）。
 
 **長命令 keepalive**：對於 `apt upgrade`、`make`、`python -m unittest` 等長時間命令，可加 `--expected-duration` 提示 broker 延長等待：
 

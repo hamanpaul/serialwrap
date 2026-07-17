@@ -899,7 +899,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  - 含 \\n 換行字元：直接拒絕（CMD_CONTAINS_NEWLINE），請拆成多次獨立提交\n"
             "\n"
             "broker 對命令內容不做截斷；上述為 broker 對單一 --cmd 參數的上限，\n"
-            f"target 端 tty line buffer（常見 {CMD_WARN_BYTES} bytes）才是物理單行限制。\n"
+            "target 端 tty line buffer（常見 4096 bytes，target-dependent）才是物理單行限制。\n"
             "上限可由 `serialwrap daemon status` 回應的 limits 欄位執行期查詢，client 不需硬編碼。"
         ),
         formatter_class=argparse.RawTextHelpFormatter,

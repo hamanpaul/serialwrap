@@ -227,8 +227,9 @@ sequenceDiagram
 
 - 命令字串不得含有 `\n` 換行字元。`arbiter.submit()` 會在入口檢查，若偵測到換行則拒絕並回傳 `error_code: CMD_CONTAINS_NEWLINE`。
 - 命令長度（UTF-8 位元組）> 4 KB 回 warning（`CMD_LENGTH_WARNING`），> 16 KB 拒絕（`CMD_TOO_LONG`）。broker 對接受的命令**不做截斷**，全量寫出到 UART。
-- 上述為 **broker 對單一 command 參數的上限**；**target 端 tty line buffer（常見 4096 bytes）的物理單行限制**是另一回事——即使 broker 接受，過長單行仍可能在 target 端被截斷，兩者需分開考量。
-- 上限可執行期查詢（#129）：`health.status`（CLI `serialwrap daemon status`）回應的 `limits` 欄位——`max_submit_cmd_bytes`（硬上限）、`warn_submit_cmd_bytes`（軟上限）、`reject_error_code`、`newline_forbidden`——值直接引用 `sw_core/arbiter.py` 常數（單一事實來源），client 不需硬編碼。
+- 上述為 **broker 對單一 command 參數的上限**；**target 端 tty line buffer（常見 4096 bytes）的物理單行限制**是另一回事——即使 broker 接受，過長單行仍可能在 target 端被截斷，兩者需分開考量。target 端單行上限為 target-dependent（依 target 的 OS／tty 驅動而異，例如 Linux N_TTY 常見 4096），broker 無從權威得知，故**不經 `limits` 欄位暴露**，僅於文件提示常見值。
+- broker 送出時會補尾端 `\n`（`uart_io` 的 `send_command`；含換行的命令已在入口被拒，故必補），on-wire 單行位元組數 = 命令 UTF-8 位元組數 + 1。
+- 上限可執行期查詢（#129）：`health.status`（CLI `serialwrap daemon status`）回應的 `limits` 欄位——`max_submit_cmd_bytes`（硬上限）、`warn_submit_cmd_bytes`（軟上限）、`reject_error_code`、`newline_error_code`、`warning_code`、`newline_forbidden`——上限值與錯誤碼／警告碼字串皆直接引用 `sw_core/arbiter.py` 常數（單一事實來源），client 不需硬編碼。
 - 長命令建議拆分為多步驟或使用 `file.push` 傳輸 script 後在 target 執行。
 
 ### 6.2 background

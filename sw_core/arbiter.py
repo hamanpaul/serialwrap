@@ -13,6 +13,13 @@ from .util import now_iso
 CMD_WARN_BYTES = 4096
 CMD_REJECT_BYTES = 16384
 
+# 錯誤碼／警告碼字串的單一事實來源（#129 review）：submit() 的拒絕／警告點與
+# service.py health.status 的 limits 欄位（reject_error_code 等）皆引用此處，
+# 避免同一字串在多處硬編碼而各自漂移。
+ERROR_CMD_TOO_LONG = "CMD_TOO_LONG"
+ERROR_CMD_CONTAINS_NEWLINE = "CMD_CONTAINS_NEWLINE"
+WARNING_CMD_LENGTH = "CMD_LENGTH_WARNING"
+
 
 @dataclasses.dataclass(order=True)
 class _QueuedCommand:
@@ -78,7 +85,7 @@ class CommandArbiter:
         if cmd_len > CMD_REJECT_BYTES:
             return {
                 "ok": False,
-                "error_code": "CMD_TOO_LONG",
+                "error_code": ERROR_CMD_TOO_LONG,
                 "cmd_length": cmd_len,
                 "limit": CMD_REJECT_BYTES,
                 "hint": "Command exceeds 16 KB hard limit. Use file-based injection or split into smaller commands.",
@@ -86,7 +93,7 @@ class CommandArbiter:
         cmd_warning = None
         if cmd_len > CMD_WARN_BYTES:
             cmd_warning = {
-                "code": "CMD_LENGTH_WARNING",
+                "code": WARNING_CMD_LENGTH,
                 "cmd_length": cmd_len,
                 "soft_limit": CMD_WARN_BYTES,
                 "hint": "Command exceeds 4 KB soft limit. Long commands may cause UART buffer overflow or prompt timeout.",
@@ -94,7 +101,7 @@ class CommandArbiter:
         if "\n" in command:
             return {
                 "ok": False,
-                "error_code": "CMD_CONTAINS_NEWLINE",
+                "error_code": ERROR_CMD_CONTAINS_NEWLINE,
                 "hint": "Command must not contain embedded newline characters. "
                         "Split into multiple independent submissions.",
             }
