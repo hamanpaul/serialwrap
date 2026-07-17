@@ -9,6 +9,12 @@
 - ``_spawn_reboot_recovery`` 在 quiet window 內不送 probe、deadline 延伸涵蓋
   window 結束後至少一輪 probe、RX 解除後立即恢復探測
 - prpl-template 的 ``bootloader_prompts`` 資產載入
+
+以下為對抗審查（review）findings 收斂後補的回歸測試：
+- ``_self_test_impl`` READY 分支的 nonce probe gate（Finding 1b）
+- ``_recover_after_failure`` 的 CTRL_C/CTRL_D 強制按鍵迴圈 gate（Finding 1c）
+- ``attach_session`` / ``recover_session`` 共用的 ``_probe_existing_bridge`` gate（Finding 2）
+- 寬鬆 prompt_regex 誤配 bootloader prompt 時不得解除 quiet window（Finding 3）
 """
 from __future__ import annotations
 
@@ -75,6 +81,20 @@ class FakeBridge:
         return self.prompt_within_2s
 
     def rx_text_from(self, _offset: int) -> str:
+        return ""
+
+    # _recover_after_failure（CTRL_C/CTRL_D）路徑所需
+    def send_bytes(self, payload: bytes, *, source: str, cmd_id: str | None = None) -> None:
+        self.sent.append((payload, source))
+
+    # _probe_existing_bridge → probe_ready/ensure_ready（attach/recover 共用）所需
+    def clear_rx_buffer(self) -> None:
+        pass
+
+    def wait_for_regex(self, _pattern: str, _timeout: float) -> bool:
+        return self.prompt_within_2s
+
+    def rx_tail(self, max_chars: int = 4096) -> str:
         return ""
 
 
@@ -376,6 +396,204 @@ class TestPrplTemplateBootloaderPrompts(unittest.TestCase):
         tpl = next(t for t in result.templates if t.profile_name == "prpl-template")
         self.assertIn("^=> $", tpl.bootloader_prompts)
         self.assertIn("^U-Boot> $", tpl.bootloader_prompts)
+
+
+class TestSelfTestQuietGate(_ManagerMixin):
+    """#130 review Finding 1b（必修）：self_test 的 READY 分支 nonce probe gate。"""
+
+    def test_ready_session_in_quiet_window_returns_autoboot_quiet(self) -> None:
+        mgr, session = self._make_manager()
+        bridge = FakeBridge()
+        session.bridge = bridge
+        session.state = "READY"
+        session.attached_real_path = "/dev/ttyFAKE0"
+        # 模擬自發重開機：RX 見到 boot banner，但 state 未被降級——boot quiet 只設
+        # boot_quiet_until，不改 session.state（#130 Finding 4，架構層限制，未修）。
+        self._rx(mgr, session, "U-Boot 2022.01 (fake)\r\n")
+        self.assertEqual(session.state, "READY")
+        self.assertTrue(session.boot_quiet_active())
+
+        result = mgr.self_test("COM0", timeout_s=0.2)
+
+        self.assertEqual(result.get("classification"), "AUTOBOOT_QUIET")
+        self.assertEqual(bridge.sent, [], "quiet window 內不得送出 nonce probe")
+
+    def test_gate_is_not_vacuous(self) -> None:
+        """反證：拿掉 gate（boot_quiet_active 恆回 False）時，probe 真的會送出。"""
+        mgr, session = self._make_manager()
+        bridge = FakeBridge(prompt_within_2s=False)
+        session.bridge = bridge
+        session.state = "READY"
+        session.attached_real_path = "/dev/ttyFAKE0"
+        self._rx(mgr, session, "U-Boot 2022.01 (fake)\r\n")
+
+        with mock.patch.object(sm_mod.SessionRuntime, "boot_quiet_active", return_value=False):
+            mgr.self_test("COM0", timeout_s=0.05)
+
+        self.assertTrue(bridge.sent, "拿掉 gate 應該會送出 probe（驗證測試非 vacuous）")
+
+
+class TestRecoverAfterFailureQuietGate(_ManagerMixin):
+    """#130 review Finding 1c（必修）：_recover_after_failure 的 CTRL_C/CTRL_D gate。
+
+    這是最容易觸發的路徑：agent 正常送命令途中 target 自發重開機、逾時觸發本函式。
+    """
+
+    def test_ctrl_c_ctrl_d_skipped_inside_quiet_window(self) -> None:
+        mgr, session = self._make_manager()
+        bridge = FakeBridge(prompt_within_2s=False)
+        session.bridge = bridge
+        session.state = "READY"
+        session.arm_boot_quiet()
+
+        result = mgr._recover_after_failure(
+            session, bridge,
+            cmd_id="cmd-x", timeout_s=1.0, source="agent:test",
+            command="some-long-cmd", prompt_regex=session.profile.prompt_regex, pre_offset=0,
+        )
+
+        self.assertEqual(bridge.sent, [], "quiet window 內不得送 CTRL_C/CTRL_D")
+        self.assertFalse(result.get("ok"))
+        self.assertEqual(result.get("error_code"), "PROMPT_TIMEOUT")
+        self.assertEqual(result.get("recovery_action"), "NONE")
+        self.assertEqual(session.state, "ATTACHED", "應直接落到既有 timeout 收尾（轉 ATTACHED）")
+
+    def test_gate_is_not_vacuous(self) -> None:
+        mgr, session = self._make_manager()
+        bridge = FakeBridge(prompt_within_2s=False)
+        session.bridge = bridge
+        session.state = "READY"
+        session.arm_boot_quiet()
+
+        with mock.patch.object(sm_mod.SessionRuntime, "boot_quiet_active", return_value=False):
+            mgr._recover_after_failure(
+                session, bridge,
+                cmd_id="cmd-x", timeout_s=0.05, source="agent:test",
+                command="some-long-cmd", prompt_regex=session.profile.prompt_regex, pre_offset=0,
+            )
+
+        self.assertTrue(bridge.sent, "拿掉 gate 應該會送出 CTRL_C/CTRL_D（驗證測試非 vacuous）")
+
+
+class TestAttachAndRecoverProbeQuietGate(_ManagerMixin):
+    """#130 review Finding 2（必修）：attach_session 與 recover_session 共用的
+    ``_probe_existing_bridge`` gate——單點 gate 同時涵蓋兩條呼叫路徑。"""
+
+    def _make_attached_with_quiet(self) -> tuple[SessionManager, sm_mod.SessionRuntime, FakeBridge]:
+        mgr, session = self._make_manager()
+        bridge = FakeBridge(prompt_within_2s=False)
+        session.bridge = bridge
+        session.state = "ATTACHED"
+        session.last_error = "PROMPT_UNAVAILABLE"
+        session.arm_boot_quiet()
+        return mgr, session, bridge
+
+    def test_attach_session_gated_during_quiet(self) -> None:
+        mgr, session, bridge = self._make_attached_with_quiet()
+
+        result = mgr.attach_session("COM0")
+
+        self.assertEqual(bridge.sent, [], "quiet window 內 attach_session 不得送 probe")
+        self.assertFalse(result.get("ok"))
+        self.assertEqual(result.get("error_code"), "PROMPT_UNAVAILABLE")
+        self.assertEqual(result["session"]["state"], "ATTACHED")
+
+    def test_recover_session_attached_branch_gated_during_quiet(self) -> None:
+        """額外收斂（超出原 review findings 清單，實作時發現的同類漏洞）：
+        recover_session 的 ATTACHED 分支與 attach_session 共用同一個
+        ``_probe_existing_bridge``，屬同一漏洞類別，一併驗證。"""
+        mgr, session, bridge = self._make_attached_with_quiet()
+
+        result = mgr.recover_session("COM0")
+
+        self.assertEqual(bridge.sent, [], "quiet window 內 recover_session 不得送 probe")
+        self.assertFalse(result.get("recovered", False))
+        self.assertEqual(result.get("error_code"), "PROMPT_UNAVAILABLE")
+
+    def test_gate_is_not_vacuous(self) -> None:
+        mgr, session, bridge = self._make_attached_with_quiet()
+
+        with mock.patch.object(sm_mod.SessionRuntime, "boot_quiet_active", return_value=False):
+            mgr.attach_session("COM0")
+
+        self.assertTrue(bridge.sent, "拿掉 gate 應該會送出 probe（驗證測試非 vacuous）")
+
+
+class TestBootloaderPromptDoesNotClearQuiet(unittest.TestCase):
+    """#130 review Finding 3（必修）：寬鬆 prompt_regex 誤配 bootloader prompt 時不得
+    解除 quiet window（例如 brcm-template 風格 ``(?m)[>#]\\s*$`` 撞上 U-Boot ``=> ``）。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._old_state_path = sm_mod.STATE_PATH
+        sm_mod.STATE_PATH = str(Path(self._tmp.name) / "state.json")
+
+    def tearDown(self) -> None:
+        sm_mod.STATE_PATH = self._old_state_path
+
+    def _make_manager(self, *, bootloader_prompts: tuple[str, ...] = ()) -> tuple[SessionManager, sm_mod.SessionRuntime]:
+        profile = SessionProfile(
+            profile_name="p",
+            com="COM0",
+            act_no=1,
+            alias="lab+1",
+            device_by_id="/dev/serial/by-id/fake",
+            platform="bcm",
+            prompt_regex=r"(?m)[>#]\s*$",
+            login_regex=r"(?mi)login:\s*$",
+            ready_probe="echo __READY__${nonce}",
+            uart=UartProfile(),
+            bootloader_prompts=bootloader_prompts,
+        )
+        mgr = SessionManager(
+            [profile],
+            WalWriter(wal_dir=self._tmp.name),
+            on_ready=lambda _sid: None,
+            on_detached=lambda _sid: None,
+        )
+        session = mgr.get_session("COM0")
+        assert session is not None
+        with mgr._lock:
+            mgr._devices = {
+                profile.device_by_id: DeviceInfo(by_id=profile.device_by_id, real_path="/dev/ttyFAKE0")
+            }
+        return mgr, session
+
+    def _rx(self, mgr: SessionManager, session: sm_mod.SessionRuntime, text: str) -> None:
+        mgr._on_bridge_rx(session.session_id, text.encode("utf-8"))
+
+    def test_uboot_prompt_does_not_clear_quiet_window(self) -> None:
+        mgr, session = self._make_manager(bootloader_prompts=("^=> $", "^CFE> $", r"^BCM\d+>> $"))
+        session.state = "READY"
+        self._rx(mgr, session, "> ")
+        session.arm_boot_quiet()
+        self._rx(mgr, session, "U-Boot 2022.01 (fake)\r\n")
+        self._rx(mgr, session, "Hit any key to stop autoboot:  3 \r")
+        self.assertTrue(session.boot_quiet_active())
+
+        # U-Boot 自己的 "=> " prompt 出現：不得被寬鬆 prompt_regex 誤判為「開機完成」
+        # 而解除 quiet window（板子其實仍卡在 bootloader）。
+        self._rx(mgr, session, "\r\n=> ")
+
+        self.assertTrue(session.boot_quiet_active(), "bootloader prompt 不應解除 quiet window")
+
+    def test_gate_is_not_vacuous_without_bootloader_prompts_configured(self) -> None:
+        """反證：template 未設定 bootloader_prompts（排除清單為空）時，``=> `` 仍會被
+        寬鬆 prompt_regex 誤判為開機完成而解除——證明上一個測試通過並非巧合
+        （例如 ``=> `` 本身就不會命中 prompt_regex）。"""
+        mgr, session = self._make_manager(bootloader_prompts=())
+        session.state = "READY"
+        self._rx(mgr, session, "> ")
+        session.arm_boot_quiet()
+        self._rx(mgr, session, "U-Boot 2022.01 (fake)\r\n")
+        self._rx(mgr, session, "\r\n=> ")
+
+        self.assertFalse(
+            session.boot_quiet_active(),
+            "未設定 bootloader_prompts 時仍會被誤解除（驗證測試非 vacuous）",
+        )
 
 
 if __name__ == "__main__":

@@ -440,15 +440,20 @@ DUT 重開機時，U-Boot autoboot 倒數窗（`Hit any key to stop autoboot`）
 1. `_handle_reboot_command` 收到 reboot 類指令**當下**（送出命令前）即設定，不等 banner。
 2. RX 路徑（`_on_bridge_rx`）偵測到 boot banner——以 `BOOT_BANNER_PATTERNS`（`U-Boot`、`Hit any key to stop autoboot`；大小寫敏感 substring）比對 rolling tail（`BOOT_BANNER_TAIL_CHARS=256` 字元，跨 chunk 邊界）。倒數每 tick 會延長視窗。此路徑涵蓋 DUT 自行重開／斷電重開。
 
-**效果**：視窗內（`BOOT_QUIET_WINDOW_S=180s`）gate 所有 `source=system` 的自動 probe TX——
+**效果**：視窗內（`BOOT_QUIET_WINDOW_S=180s`）gate 所有 `source=system` 的自動 probe TX——這裡的「自動」指呼叫端不需人為觸發 UART 寫入本身，**手動觸發的 RPC（`session attach`／`session recover`）一樣受 gate**，因為它們最終都會走到下列同一批共用 probe/按鍵函式（#130 review 收斂前，這幾條路徑各自遺漏過 gate，現已逐一補上）：
 
 - reboot recovery 迴圈（`_spawn_reboot_recovery`）：純被動等 RX；deadline 延伸至「視窗結束 + 一輪 `hard_timeout_s`」，上限為「一個完整視窗 + 一輪 probe 預算」（防 boot-loop 板反覆吐 banner 使執行緒無限延命）。
 - readiness reprobe（`_prepare_reprobe_locked` 與 worker 寫入前的最終驗證 `_reprobe_target_still_valid_locked`）：不 fire、不累加 attempts、不排 backoff。
-- attach probe（`_attach_by_id`）：掛 bridge 純收 RX，以 `PROMPT_UNAVAILABLE` 停在 `ATTACHED`，視窗解除後由 reprobe／recovery 接手（涵蓋 reboot 期間序列裝置 re-enumerate 的 re-attach）。
+- attach probe（`_probe_existing_bridge`）：`session attach`（`attach_session` 的 ATTACHED 分支、無 human lease 時）與 `session recover`（`recover_session` 的 ATTACHED 分支重探）共用同一個 probe 入口，於此單點 gate 同時涵蓋兩條呼叫路徑；掛 bridge 純收 RX，以 `PROMPT_UNAVAILABLE` 停在 `ATTACHED`。
+- 初次 attach（`_attach_by_id`）：掛 bridge 純收 RX，以 `PROMPT_UNAVAILABLE` 停在 `ATTACHED`，視窗解除後由 reprobe／recovery 接手（涵蓋 reboot 期間序列裝置 re-enumerate 的 re-attach）。
+- 命令逾時後的強制按鍵迴圈（`_recover_after_failure` 的 CTRL_C/CTRL_D）：跳過強制按鍵，直接落到既有 timeout 收尾（session 轉 `ATTACHED`）——這是最容易觸發的路徑，agent 正常送命令途中 target 自發重開機、逾時即進入本函式。
+- `session self-test`（`_self_test_impl` 的 READY 分支 nonce probe）：回報 `classification: "AUTOBOOT_QUIET"`，不送 probe。
 
-**解除（clear）**：RX 匹配該 session 的 `login_regex` / `prompt_regex`（開機完成訊號）即刻解除並恢復探測；否則過期自動解除。
+**解除（clear）**：RX 匹配該 session 的 `login_regex` / `prompt_regex`（開機完成訊號）即刻解除並恢復探測；否則過期自動解除。例外：若命中的尾行本身就是該 session `bootloader_prompts` 名單中的一員（如 U-Boot 自己的 `=> `），視為仍在 bootloader、非開機完成，本輪不解除——寬鬆撰寫的 `prompt_regex`（如 brcm-template `(?m)[>#]\s*$`）會誤配 bootloader 自身 prompt，若不先排除會在板子正卡 bootloader 的最危險時刻誤解除（`_update_boot_quiet_locked` 於解除前先呼叫 `_matches_any_bootloader_prompt`）。
 
-**不 gate**：human console bytes、interactive lease TX、agent 顯式命令（READY gate 本已擋）、手動 `session recover` / `session attach`（顯式介入）。與 #114「刻意進 bootloader」相容。
+**不 gate**：human console bytes、interactive lease TX、agent 顯式命令（session 已是 `READY` 時，本來就被 READY gate 擋在 arbiter 之前）。與 #114「刻意進 bootloader」相容——human/lease 送鍵永遠放行。
+
+**已知架構限制（未修，待 follow-up issue）**：`boot_quiet_until` 只影響上述自動 probe gate，**不會**降級 `session.state`。若自發重開機與進行中的 agent 命令競速、session 仍（名義上）停在 `READY`，該顯式命令仍可能在 autoboot 倒數期間打到 UART——需要新增 state 或 arbiter 層 gate 才能堵住，本次收斂範圍不含此項。
 
 **觀測**：session 公開欄位 `boot_quiet_remaining_s`（剩餘秒數；`null`＝未啟用/已解除）。
 
