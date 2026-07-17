@@ -135,6 +135,7 @@ serialwrap file pull --selector COM0 --remote /etc/config/wireless --local ./wir
 - 長流命令（`logread -f`、`tcpdump`、kernel debug）一律用 `--mode background` 或設足夠長的 `--cmd-timeout`，避免阻塞共享通道。
 - 每筆自動化命令必填 `--source`，不可省略，確保追蹤性。
 - 卡住時先 `serialwrap session self-test`，再決定是否 `serialwrap session recover`（可加 `--force`）。recover 成功恢復 prompt 時回 `ok: true`（附 `error_code: PROMPT_TIMEOUT_RECOVERED`, `partial: true`），表示 session 可繼續使用。
+- session 於命令排隊期間發生 recovery/re-attach（掉出 `READY`）時，尚未啟動的排隊命令會被終結為 `status=error`、`error_code=FLUSHED_BY_RECOVERY`（#128）——代表該命令**未執行**，等 session 回 `READY` 後重送即可；執行中的命令不受影響，仍以真實結果收尾。所有 detach 類路徑（含 clear/release/熱拔/re-attach）皆用 `FLUSHED_BY_RECOVERY`；daemon shutdown 則用 `FLUSHED_BY_SHUTDOWN`，語意相同＝命令未執行、可於 `READY` 後重送。
 
 ## 短命令原則（Best Practice）
 - **避免 heredoc**：heredoc 經 UART 傳輸時容易遺失字元或打亂 prompt，改用 `echo ... > file` 分步寫入。

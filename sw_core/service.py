@@ -498,7 +498,10 @@ class SerialwrapService:
         self._watcher.stop()
         for row in self._sessions.list_sessions():
             sid = row["session_id"]
-            self._arbiter.unregister_session(sid)
+            # daemon shutdown 用 FLUSHED_BY_SHUTDOWN 與 recovery/detach 類路徑區隔（#128
+            # review F2）：兩者對 client 語意相同（命令未執行、可於 READY 後重送），但
+            # 終結碼可辨識是 daemon 停止而非 session recovery。
+            self._arbiter.unregister_session(sid, error_code="FLUSHED_BY_SHUTDOWN")
         try:
             self._flash_endpoint.stop()
         except OSError:
