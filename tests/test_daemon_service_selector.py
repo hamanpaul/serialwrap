@@ -167,7 +167,12 @@ def test_set_socket_creates_config_if_absent(tmp_path):
 
 
 def test_load_exclude_coms_reads_windows_config(tmp_path, monkeypatch):
-    """_load_exclude_coms 應從 config.yaml 的 windows.exclude_coms 讀取排除清單。"""
+    """_load_exclude_coms 應從 config.yaml 的 windows.exclude_coms 讀取排除清單。
+
+    #131：實作移居 device_source（doctor 免拖 daemon stack），service 保留匯入相容，
+    故 CONFIG_DIR 於 device_source 模組層 patch。
+    """
+    import sw_core.device_source as ds_mod
     import sw_core.service as svc_mod
     import yaml
 
@@ -176,17 +181,18 @@ def test_load_exclude_coms_reads_windows_config(tmp_path, monkeypatch):
         yaml.safe_dump({"windows": {"exclude_coms": ["COM1", "COM3"]}}),
         encoding="utf-8",
     )
-    monkeypatch.setattr(svc_mod, "CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(ds_mod, "CONFIG_DIR", str(tmp_path))
 
-    result = svc_mod._load_exclude_coms()
+    result = svc_mod._load_exclude_coms()  # service 端 alias 仍可用
     assert result == {"COM1", "COM3"}
 
 
 def test_load_exclude_coms_returns_empty_when_absent(tmp_path, monkeypatch):
     """config.yaml 不存在或無 windows.exclude_coms 時，回傳空集合。"""
+    import sw_core.device_source as ds_mod
     import sw_core.service as svc_mod
 
-    monkeypatch.setattr(svc_mod, "CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(ds_mod, "CONFIG_DIR", str(tmp_path))
 
     result = svc_mod._load_exclude_coms()
     assert result == set()
@@ -194,6 +200,7 @@ def test_load_exclude_coms_returns_empty_when_absent(tmp_path, monkeypatch):
 
 def test_load_exclude_coms_empty_when_no_windows_section(tmp_path, monkeypatch):
     """config.yaml 有 supervision_mode 但無 windows 段時，回傳空集合。"""
+    import sw_core.device_source as ds_mod
     import sw_core.service as svc_mod
     import yaml
 
@@ -202,7 +209,7 @@ def test_load_exclude_coms_empty_when_no_windows_section(tmp_path, monkeypatch):
         yaml.safe_dump({"supervision_mode": "on-demand"}),
         encoding="utf-8",
     )
-    monkeypatch.setattr(svc_mod, "CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(ds_mod, "CONFIG_DIR", str(tmp_path))
 
     result = svc_mod._load_exclude_coms()
     assert result == set()

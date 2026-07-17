@@ -13,7 +13,30 @@ import os
 import time
 from typing import Protocol
 
+from sw_core.constants import CONFIG_DIR
 from sw_core.device_watcher import DeviceInfo
+
+
+def _load_exclude_coms() -> set[str]:
+    """從 config.yaml 的 windows.exclude_coms 讀取手動排除的 COM port 清單（#84 PORT-4）。
+
+    缺少設定或讀取失敗時回傳空集合。原居 service.py，#131 搬入本模組使 doctor
+    等輕量 consumer 不必為讀一份 YAML 清單匯入整個 daemon stack。
+    """
+    import yaml  # noqa: PLC0415 — 延遲匯入，維持本模組輕量
+
+    try:
+        config_path = os.path.join(CONFIG_DIR, "config.yaml")
+        if not os.path.exists(config_path):
+            return set()
+        with open(config_path, encoding="utf-8") as _fh:
+            data: dict = yaml.safe_load(_fh) or {}
+        coms = data.get("windows", {}).get("exclude_coms", [])
+        if isinstance(coms, list):
+            return {str(c) for c in coms}
+    except Exception:  # noqa: BLE001
+        pass
+    return set()
 
 
 class DeviceSource(Protocol):

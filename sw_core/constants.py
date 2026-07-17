@@ -45,6 +45,8 @@ SOCKET_PATH = os.path.join(RUN_DIR, "serialwrapd.sock")
 # Windows：走 TCP loopback；POSIX：沿用 AF_UNIX SOCKET_PATH。
 # tcp:// URL 不可過 os.path.expanduser，故 Windows 分支直接組字串。
 DEFAULT_TCP_PORT: int = int(os.environ.get("SERIALWRAP_TCP_PORT", "48700"))
+# RPC TCP 僅允許 loopback（#84 PORT-4 server bind 白名單；#131 daemon start 亦共用）。
+LOOPBACK_TCP_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "localhost", "::1"})
 if os.name == "nt" or sys.platform.startswith("win"):
     DEFAULT_ENDPOINT: str = (
         os.environ.get("SERIALWRAP_ENDPOINT")

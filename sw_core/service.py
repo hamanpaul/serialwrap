@@ -15,31 +15,13 @@ from .constants import CONFIG_DIR, DEVICE_BY_ID_DIR, DEVICE_BY_PATH_DIR, EVENTS_
 from .flash_endpoint import FlashEndpoint, detect_mcu_line, pump_endpoint_to_sink
 from .mcu_patterns import McuPatternRegistry
 from .multi_open import detect_multi_open
+from .device_source import _load_exclude_coms  # #131：實作移至 device_source，此處保留匯入相容
 from .device_watcher import DeviceWatcher
 from .event_engine import EventEngine, EngineDeps
 from .event_engine.line_buffer import LineBuffer
 from .session_manager import SessionManager
 from .util import now_iso
 from .wal import WalWriter
-
-def _load_exclude_coms() -> set[str]:
-    """從 config.yaml 的 windows.exclude_coms 讀取手動排除的 COM port 清單（#84 PORT-4）。
-
-    缺少設定或讀取失敗時回傳空集合。
-    """
-    try:
-        config_path = os.path.join(CONFIG_DIR, "config.yaml")
-        if not os.path.exists(config_path):
-            return set()
-        with open(config_path, encoding="utf-8") as _fh:
-            data: dict = yaml.safe_load(_fh) or {}
-        coms = data.get("windows", {}).get("exclude_coms", [])
-        if isinstance(coms, list):
-            return {str(c) for c in coms}
-    except Exception:  # noqa: BLE001
-        pass
-    return set()
-
 
 _HUMAN_INTERACTIVE_COMMANDS = {
     "alsamixer",

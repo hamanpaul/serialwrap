@@ -72,6 +72,8 @@ class TestFlashingState(_Base):
                 self.flash = enabled
             def list_consoles(self):
                 return []
+            def console_endpoint(self):
+                return None  # to_public_dict 需要（#131）
 
         fb = _FakeBridge()
         session = mgr.get_session("COM0")
@@ -96,6 +98,8 @@ class TestFlashingState(_Base):
                 self.flash = enabled
             def list_consoles(self):
                 return []
+            def console_endpoint(self):
+                return None  # to_public_dict 需要（#131）
             def stop(self, *a, **k):
                 self.stopped = True
                 return {}
@@ -147,6 +151,8 @@ class TestFlashingBlocksInjection(_Base):
                 self.flash = enabled
             def list_consoles(self):
                 return []
+            def console_endpoint(self):
+                return None  # to_public_dict 需要（#131）
 
         fb = _FakeBridge()
         mgr.get_session("COM0").bridge = fb
@@ -241,6 +247,7 @@ class TestFlashProbeCriticalGuard(_Base):
 
         class _FB:
             def list_consoles(self): return []
+            def console_endpoint(self): return None  # to_public_dict 需要（#131）
         fb = _FB()
         s.bridge = fb
         s.state = "FLASHING"                                       # flash 進行中

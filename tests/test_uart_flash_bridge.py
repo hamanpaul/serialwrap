@@ -42,6 +42,7 @@ def test_flash_mode_blocks_console_injection(monkeypatch):
         client_id = "c1"
         master_fd = -1
         tx_buffer = bytearray()
+        telnet = None  # raw/PTY client（#131：真 ConsoleClient 的預設值）
 
     # flash OFF：human owner 輸入應送達 → 證明本測試非空轉。
     b.set_flash_mode(False)

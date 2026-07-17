@@ -42,6 +42,9 @@ def test_no_socket_falls_back_to_config(monkeypatch):
 
 
 def test_no_socket_no_config_uses_default(monkeypatch):
+    # 鎖定 posix backend：預設 fallback 自 #131 起平台感知（win → tcp DEFAULT_ENDPOINT），
+    # 本測試 pin 的是 POSIX 既有行為（SOCKET_PATH），在原生 Windows 上也須可跑。
+    monkeypatch.setenv("SERIALWRAP_RPC_BACKEND", "posix")
     monkeypatch.setattr(cli, "_safe_runtime_config", lambda: None)
     assert cli._resolve_endpoint(_ns()) == cli.SOCKET_PATH
 

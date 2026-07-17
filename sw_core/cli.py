@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -10,9 +11,18 @@ import time
 from collections.abc import Sequence
 from typing import Any
 
-from .client import _parse_endpoint, rpc_call
-from .constants import CONFIG_DIR, LOCK_PATH, PROFILE_DIR, SOCKET_PATH
+from .client import _af_unix_available, _parse_endpoint, rpc_call
+from .constants import (
+    CONFIG_DIR,
+    DEFAULT_ENDPOINT,
+    DEFAULT_TCP_PORT,
+    LOCK_PATH,
+    LOOPBACK_TCP_HOSTS,
+    PROFILE_DIR,
+    SOCKET_PATH,
+)
 from .doctor_cmd import run_doctor
+from .platform_backends import select_rpc_backend
 from .runtime_config import RuntimeConfig
 from .service_ctl import service_action
 from .sysenv import force_utf8_stdio
@@ -46,6 +56,64 @@ def _daemon_script_path() -> str:
     return os.path.normpath(os.path.join(here, "..", "serialwrapd.py"))
 
 
+def _repo_version_path() -> str:
+    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "VERSION"))
+
+
+def _resolve_version() -> str:
+    """解析 serialwrap 版本字串（#131 補強：CLI 原本沒有 --version）。
+
+    順序：repo checkout 的 VERSION（原始碼執行最真實）→ 已安裝套件 metadata
+    （pip/pipx）→ PyInstaller 內嵌 assets/VERSION（release exe，serialwrap.spec
+    datas 於打包時帶入）→ "unknown"。
+    """
+    try:
+        with open(_repo_version_path(), encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        pass
+    try:
+        import importlib.metadata  # noqa: PLC0415
+
+        return importlib.metadata.version("serialwrap")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from .assets import read_text  # noqa: PLC0415
+
+        return read_text("VERSION").strip()
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+def _is_loopback_tcp(ep: str) -> bool:
+    """endpoint 是否為 loopback tcp://（#131：Windows `daemon start` 的本機 bind 白名單）。"""
+    try:
+        transport, address = _parse_endpoint(ep)
+    except ValueError:
+        return False
+    return transport == "tcp" and address[0] in LOOPBACK_TCP_HOSTS
+
+
+def _daemon_spawn_argv() -> list[str] | None:
+    """解析 spawn serialwrapd 的 argv（#131，Windows 路徑）。
+
+    凍結（PyInstaller onefile）→ ``sys.executable`` 同層 serialwrapd.exe →
+    PATH 上的 serialwrapd，全落空回 None；原始碼 checkout → serialwrapd.py；
+    安裝套件（無 repo script）→ ``-m sw_core.daemon``。
+    """
+    if getattr(sys, "frozen", False):
+        sibling = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "serialwrapd.exe")
+        if os.path.isfile(sibling):
+            return [sibling]
+        found = shutil.which("serialwrapd")
+        return [found] if found else None
+    script = _daemon_script_path()
+    if os.path.isfile(script):
+        return [sys.executable, script]
+    return [sys.executable, "-m", "sw_core.daemon"]
+
+
 def _decode_env_text(raw: bytes) -> str:
     return raw.decode("utf-8", errors="surrogateescape")
 
@@ -58,16 +126,52 @@ def _configured_daemon_env_file() -> str | None:
     return value or None
 
 
+def _parse_env_file_simple(path: str) -> dict[str, str]:
+    """最小 env 檔解析（#131，Windows 用）。
+
+    支援 ``KEY=VALUE``、``export KEY=VALUE``、``#`` 註解與空行、單/雙引號包覆；
+    不做變數展開與 shell 語意。Windows 上不得經 bash source——Git Bash 的
+    ``env -0`` 會把整個環境 MSYS 化（PATH 轉成 ``/c/...`` 冒號分隔），
+    spawn 出的 serialwrapd 會拿到 Windows 無法使用的環境（#131 review）。
+    """
+    out: dict[str, str] = {}
+    with open(path, encoding="utf-8", errors="surrogateescape") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].lstrip()
+            key, sep, value = line.partition("=")
+            key = key.strip()
+            if not sep or not key:
+                continue
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                value = value[1:-1]
+            out[key] = value
+    return out
+
+
 def _load_daemon_start_env_files(env_files: Sequence[str]) -> tuple[dict[str, str], list[str]]:
     env = dict(os.environ)
     loaded_paths: list[str] = []
     seen_paths: set[str] = set()
+    use_simple_parser = _rpc_backend_is_win()  # #131：Windows 不經 bash（見 _parse_env_file_simple）
     for env_file in env_files:
         path = os.path.expanduser(str(env_file).strip())
         if not path or path in seen_paths:
             continue
         seen_paths.add(path)
         if not os.path.isfile(path):
+            continue
+
+        if use_simple_parser:
+            try:
+                env.update(_parse_env_file_simple(path))
+            except OSError as exc:
+                raise EnvFileSourceError(path, f"無法讀取 env 檔：{exc}") from exc
+            loaded_paths.append(path)
             continue
 
         proc = subprocess.run(
@@ -152,8 +256,25 @@ def _probe_healthy_daemon(endpoint: str) -> bool:
 
 
 def _run_daemon_start(args: argparse.Namespace) -> int:
-    if getattr(args, "endpoint", None):
-        _print({"ok": False, "error_code": "REMOTE_NOT_SUPPORTED", "message": "--endpoint 不支援 daemon start（daemon 只能在本機啟動）"})
+    is_win = _rpc_backend_is_win()  # backend 不會於呼叫中途改變，一次判定全函式共用
+    ep_arg = getattr(args, "endpoint", None)
+    if ep_arg and not (is_win and _is_loopback_tcp(ep_arg)):
+        # Windows（win backend）開放 loopback tcp:// 作為本機 bind 位址（#131）；
+        # 其餘（POSIX 一律、win 非 loopback）照舊拒絕，POSIX 訊息逐字保留。
+        if is_win:
+            message = "--endpoint 於 daemon start 僅接受 loopback tcp://（127.0.0.1/localhost/::1）作為本機 bind 位址"
+        else:
+            message = "--endpoint 不支援 daemon start（daemon 只能在本機啟動）"
+        _print({"ok": False, "error_code": "REMOTE_NOT_SUPPORTED", "message": message})
+        return 2
+    if ep_arg and args.socket is not None and args.socket != ep_arg:
+        # 同給 --endpoint 與 --socket 且不一致：冪等探測（走 --endpoint）與 spawn bind
+        # （走 --socket）會指向不同位址，寧可顯式拒絕也不留下歧義（#131 review）。
+        _print({
+            "ok": False,
+            "error_code": "INVALID_ARGS",
+            "message": "--endpoint 與 --socket 不一致；daemon start 請擇一指定 bind 位址",
+        })
         return 2
     # 監管模式 gate（#108 #1）：systemd 模式下重導到 `service start`，避免顯式 daemon
     # start 繞過 unit 管理另起非託管 daemon（對稱於 `daemon stop` → `service stop`）。
@@ -172,11 +293,29 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
     if _probe_healthy_daemon(endpoint):
         _print({"ok": True, "already_running": True, "socket": endpoint})
         return 0
-    # --socket 為 None sentinel（#120 向量 2）：spawn 路徑落到預設 SOCKET_PATH。
-    sock = SOCKET_PATH if args.socket is None else args.socket
+    # --socket 為 None sentinel（#120 向量 2）：spawn 路徑落到平台預設（#131：
+    # win backend → tcp DEFAULT_ENDPOINT，POSIX → SOCKET_PATH 不變）；
+    # Windows 放行的 --endpoint 視為本機 bind 位址。
+    if args.socket is not None:
+        sock = args.socket
+    elif ep_arg:
+        sock = ep_arg
+    else:
+        sock = _local_default_endpoint()
+    if is_win:
+        daemon_argv = _daemon_spawn_argv()
+        if daemon_argv is None:
+            _print({
+                "ok": False,
+                "error_code": "DAEMON_BINARY_NOT_FOUND",
+                "message": "找不到 serialwrapd（serialwrap.exe 同層或 PATH 上皆無）；請確認發行包完整",
+            })
+            return 2
+    else:
+        # POSIX：argv 組法逐字保留既有行為。
+        daemon_argv = [sys.executable, _daemon_script_path()]
     cmd = [
-        sys.executable,
-        _daemon_script_path(),
+        *daemon_argv,
         "--profile-dir",
         args.profile_dir,
         "--socket",
@@ -202,10 +341,27 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
     if args.foreground:
         return subprocess.call(cmd, env=daemon_env)
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, env=daemon_env)
+    popen_kwargs: dict[str, Any] = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "env": daemon_env,
+    }
+    if os.name == "nt":
+        # DETACHED_PROCESS：不掛父 console（關閉視窗不殺 daemon）；
+        # CREATE_NEW_PROCESS_GROUP：隔離父 shell 的 Ctrl+C（#131）。
+        # 以 os.name 而非 rpc backend 判斷：Linux 上模擬 win backend 時
+        # creationflags 會使 Popen ValueError。
+        popen_kwargs["creationflags"] = (
+            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
+    proc = subprocess.Popen(cmd, **popen_kwargs)
 
-    # 等待 daemon 就緒（最多 3 秒）
-    for attempt in range(15):
+    # 等待 daemon 就緒（POSIX 最多 3 秒；win backend 放寬至 10 秒——
+    # PyInstaller onefile 冷啟需先解壓，#131）
+    attempts = 50 if is_win else 15
+    for attempt in range(attempts):
         time.sleep(0.2)
         if proc.poll() is not None:
             _print({"ok": False, "error_code": "DAEMON_EXITED", "pid": proc.pid, "returncode": proc.returncode})
@@ -247,6 +403,36 @@ def _run_daemon_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def _rpc_backend_is_win() -> bool:
+    """CLI 端的 rpc backend 判準（#131）。
+
+    包一層 ``select_rpc_backend()``：``SERIALWRAP_RPC_BACKEND`` 為無法識別的值時
+    不讓 ValueError 穿出 CLI（維持機器可解析 JSON 契約），退回實際平台判斷；
+    daemon 端仍以 select_rpc_backend 嚴格驗證。
+    """
+    try:
+        return select_rpc_backend() == "win"
+    except ValueError:
+        return os.name == "nt" or sys.platform.startswith("win")
+
+
+def _local_default_endpoint() -> str:
+    """本機預設 endpoint（#131）。
+
+    win backend（native Windows，或 ``SERIALWRAP_RPC_BACKEND=win``）→ tcp
+    loopback（與 daemon 的 ``--socket`` 預設一致）：native Windows 直用平台感知
+    ``DEFAULT_ENDPOINT``；POSIX 上以 env 模擬 win backend 時 ``DEFAULT_ENDPOINT``
+    仍是 unix 路徑，改組 tcp 預設（尊重 ``SERIALWRAP_TCP_PORT``），避免把 unix
+    路徑餵給 win 後端的 TcpRpcServer。其餘 → ``SOCKET_PATH``（POSIX 既有行為
+    逐位元組不變）。
+    """
+    if _rpc_backend_is_win():
+        if DEFAULT_ENDPOINT.startswith("tcp://"):
+            return DEFAULT_ENDPOINT
+        return f"tcp://127.0.0.1:{DEFAULT_TCP_PORT}"
+    return SOCKET_PATH
+
+
 def _endpoint_alive(ep: str) -> bool:
     """對 unix socket endpoint 做 0.2s connect 探測（#108 #2）。
 
@@ -261,7 +447,18 @@ def _endpoint_alive(ep: str) -> bool:
     except ValueError:
         return True
     if transport != "unix":
+        # POSIX：tcp endpoint 一律視為可連、跳過探測（#108 原語意，可能是 ssh tunnel）。
+        # win backend（#131）：tcp 是本機 canonical 的常態，殘留死 port 的 config 若不
+        # 實測就永遠不會觸發 dangling fallback，改用 lock_win 的 0.2s connect 探測。
+        if transport == "tcp" and _rpc_backend_is_win():
+            from .lock_win import _endpoint_alive as _tcp_alive  # 純 socket，msvcrt 為 lazy
+
+            return _tcp_alive(ep)
         return True
+    if not _af_unix_available():
+        # native Windows：無 AF_UNIX，unix endpoint 必然不可連（#131），
+        # 回 False 讓 dangling fallback（#108）得以改連 tcp canonical。
+        return False
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(0.2)
     try:
@@ -299,13 +496,13 @@ def _resolve_endpoint(args: argparse.Namespace) -> str:
             cfg_sock = rc.socket_path()
         except Exception:
             cfg_sock = None
-    chosen = cfg_sock or SOCKET_PATH
+    chosen = cfg_sock or _local_default_endpoint()
     if cfg_sock and chosen == cfg_sock and not _endpoint_alive(cfg_sock):
         try:
             mode = (rc.mode() if rc is not None else None) or "on-demand"
         except Exception:
             mode = "on-demand"
-        canonical = SYSTEM_SOCKET if mode == "systemd-system" else SOCKET_PATH
+        canonical = SYSTEM_SOCKET if mode == "systemd-system" else _local_default_endpoint()
         if canonical != cfg_sock and _endpoint_alive(canonical):
             sys.stderr.write(
                 f"serialwrap: config.yaml socket_path '{cfg_sock}' 不可連，"
@@ -380,14 +577,42 @@ def _dispatch_event(args: argparse.Namespace) -> int:
 # 與 doctor 報告中「advisory（缺少不致命）」的檢查項對應；這些項 ok=False 不
 # 拉低整體 ok（無 systemd 可走 on-demand；無裝置可能只是還沒插線）。
 _DOCTOR_ADVISORY_CHECKS = {"systemd", "wsl_systemd", "devices"}
+# Windows（#131）：PATH／daemon endpoint／裝置皆 advisory（未起 daemon、exe 未入 PATH
+# 不致命）；pyserial 為 Windows 序列埠後端硬依賴 → 非 advisory。
+_DOCTOR_ADVISORY_CHECKS_WIN = {
+    "serialwrap_on_path",
+    "serialwrapd_on_path",
+    "daemon_endpoint",
+    "devices",
+}
+
+
+def _run_skill(args: argparse.Namespace) -> int:
+    """輸出操作指南（skill）原文到 stdout（#131 點 4；唯讀、不需 daemon）。
+
+    ``--platform windows`` → assets/skill/SKILL_WINDOWS.md；``linux`` → SKILL.md；
+    ``auto``（預設）依實際平台選擇。stdout 已由 force_utf8_stdio 保證 UTF-8
+    （cp950/cp1252 console 印 zh-tw 不炸，#118），使用者可直接 ``> SKILL.md`` 重導存檔。
+    """
+    platform = args.platform
+    if platform == "auto":
+        platform = "windows" if sys.platform.startswith("win") else "linux"
+    name = "SKILL_WINDOWS.md" if platform == "windows" else "SKILL.md"
+    from .assets import read_text  # 延遲匯入：僅此子命令需要
+
+    sys.stdout.write(read_text(f"skill/{name}"))
+    return 0
 
 
 def _run_doctor(args: argparse.Namespace) -> int:
     """執行環境診斷並印出 JSON 報告；advisory 項不影響整體 ok。"""
     report = run_doctor()
-    overall_ok = all(
-        item["ok"] or item["check"] in _DOCTOR_ADVISORY_CHECKS for item in report
+    advisory = (
+        _DOCTOR_ADVISORY_CHECKS_WIN
+        if sys.platform.startswith("win")
+        else _DOCTOR_ADVISORY_CHECKS
     )
+    overall_ok = all(item["ok"] or item["check"] in advisory for item in report)
     _print({"ok": overall_ok, "checks": report})
     return 0
 
@@ -506,6 +731,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
+    p.add_argument("--version", action="version", version=f"serialwrap {_resolve_version()}", help="顯示版本後離開")
     p.add_argument("--socket", default=None, help="本機 daemon 的 Unix socket 路徑（未指定時依 config.yaml 與 XDG 執行期目錄解析，可用 SERIALWRAP_RUN_DIR 覆寫）")
     p.add_argument("--endpoint", default=None, metavar="ENDPOINT", help="遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）")
     p.add_argument("--timeout", dest="timeout_s", type=float, default=5.0, help="RPC timeout 秒數（預設: %(default)s）")
@@ -525,7 +751,7 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_sub = p_daemon.add_subparsers(dest="daemon_cmd", required=True, metavar="<command>")
 
     p_ds = daemon_sub.add_parser("start", help="啟動 daemon（--foreground 可前景執行；systemd 模式重導 service start）")
-    p_ds.add_argument("--profile-dir", default=PROFILE_DIR)
+    p_ds.add_argument("--profile-dir", default=PROFILE_DIR, help="profile YAML 目錄（預設: %(default)s）")
     p_ds.add_argument("--lock", default=LOCK_PATH)
     p_ds.add_argument("--foreground", action="store_true")
     p_ds.add_argument(
@@ -848,12 +1074,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser(
         "doctor",
-        help="診斷安裝與執行環境（Python／PyYAML／PATH／dialout／systemd／裝置）",
+        help="診斷安裝與執行環境（平台感知：Linux 檢 dialout／systemd／by-id 裝置，Windows 檢 pyserial／daemon endpoint／COM 列舉）",
         description=(
-            "對安裝與執行環境做一系列唯讀檢查並印出 JSON 報告。\n"
-            "systemd／wsl_systemd／devices 為 advisory（缺少不致命，不拉低整體 ok）。"
+            "對安裝與執行環境做一系列唯讀檢查並印出 JSON 報告（依平台選擇檢查清單，#131）。\n"
+            "Linux：systemd／wsl_systemd／devices 為 advisory（缺少不致命，不拉低整體 ok）。\n"
+            "Windows：serialwrap_on_path／serialwrapd_on_path／daemon_endpoint／devices 為 advisory。"
         ),
         formatter_class=argparse.RawTextHelpFormatter,
+    )
+
+    p_skill = sub.add_parser(
+        "skill",
+        help="輸出操作指南（skill）原文到 stdout（--platform windows 為 Windows 操作指南）",
+        description=(
+            "把內嵌的 serialwrap 操作指南（agent skill／操作手冊）原文印到 stdout（#131）。\n"
+            "唯讀、不需 daemon；可重導存檔：serialwrap skill --platform windows > SKILL_WINDOWS.md"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    p_skill.add_argument(
+        "--platform",
+        choices=("auto", "linux", "windows"),
+        default="auto",
+        help="指南平台；auto（預設）依目前平台選擇",
     )
 
     return p
@@ -1059,6 +1302,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "doctor":
         return _run_doctor(args)
+
+    if args.cmd == "skill":
+        return _run_skill(args)
 
     _print({"ok": False, "error_code": "INVALID_ARGS"})
     return 2

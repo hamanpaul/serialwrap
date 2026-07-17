@@ -34,12 +34,37 @@ from .constants import (
 )
 from .device_watcher import DeviceInfo
 from .login_fsm import detect_template, ensure_ready, probe_ready
-from .uart_io import PreservedConsoles, UARTBridge
+from .uart_io import PreservedConsoles, UARTBridge, _pty_available
 from .util import clean_text, now_iso
 from .wal import WalWriter
 
 
 _ATTACHED_CONSOLE_LEASE_TIMEOUT_S = 86400.0
+
+
+def _replace_state_file(tmp_path: str, dst_path: str, *, retry: bool | None = None) -> None:
+    """``os.replace`` 包裝（#133）：Windows 上對 ``PermissionError`` 短退避重試。
+
+    Windows 的 ``MoveFileEx(REPLACE_EXISTING)`` 在目的檔被讀者（``_load_state``、
+    測試、防毒）短暫持有 handle 時會 ``WinError 5``；POSIX ``rename()`` 無此限制，
+    故 ``retry`` 預設依 ``os.name``（nt → 重試、其餘 → 裸 replace、行為不變）。
+    重試耗盡上拋，讓持續性失敗（ACL 壞掉等）可見而非靜默吞掉。
+    """
+    if retry is None:
+        retry = os.name == "nt"
+    if not retry:
+        os.replace(tmp_path, dst_path)
+        return
+    delay_s = 0.01
+    for attempt in range(6):
+        try:
+            os.replace(tmp_path, dst_path)
+            return
+        except PermissionError:
+            if attempt == 5:
+                raise
+            time.sleep(delay_s)
+            delay_s *= 2
 
 
 def device_sort_key(by_id: str, by_path: str | None) -> tuple[str, str]:
@@ -283,15 +308,17 @@ class SessionRuntime:
 
     def to_public_dict(self) -> dict[str, Any]:
         console_count = 0
+        console_endpoint = None
         if self.bridge is not None:
             console_count = len(self.bridge.list_consoles())
+            console_endpoint = self.bridge.console_endpoint()
         elif self.retained_consoles is not None:
             console_count = len(self.retained_consoles.clients)
         vtty_path = self.vtty_path
         if vtty_path is None and self.retained_consoles is not None:
             vtty_path = self.retained_consoles.primary_vtty()
         outstanding = len(self.background_cmd_ids) + (1 if self.foreground_busy else 0)
-        return {
+        payload: dict[str, Any] = {
             "session_id": self.session_id,
             "profile": self.profile.profile_name,
             "com": self.profile.com,
@@ -334,6 +361,12 @@ class SessionRuntime:
                 "byte_count": self.active_capture.byte_count,
             } if self.active_capture else None,
         }
+        # Windows TCP console 連線端點（#131 點 3）：無 PTY 平台恆輸出（bridge 未起時
+        # 為 null，schema 跨 session 狀態穩定，consumer 不需處理 key 忽有忽無）；
+        # POSIX（有 PTY）不加 key → session 輸出逐位元組不變。
+        if console_endpoint is not None or not _pty_available():
+            payload["console_endpoint"] = console_endpoint
+        return payload
 
 
 class SessionManager:
@@ -358,6 +391,9 @@ class SessionManager:
         self._on_detached = on_detached
         self._on_console_line = on_console_line
         self._lock = threading.RLock()
+        # state.json 寫入序列化（#133）：多 attach 執行緒並發 os.replace 同一目的檔在
+        # Windows 會 WinError 5；獨立於 self._lock（snapshot 用），I/O 段專用、不巢狀他鎖。
+        self._state_io_lock = threading.Lock()
         self._rx_observers: list[Callable[[str, bytes, int], None]] = []
         self._sessions: dict[str, SessionRuntime] = {}
         self._aliases = AliasRegistry()
@@ -510,29 +546,36 @@ class SessionManager:
         # 在「直接覆寫 state.json」中途失敗留下截斷檔，致 _load_state 解析失敗而靜默全棄（含 RELEASED
         # 交接狀態）→ 重啟後 daemon 重新 attach 已交給 flasher/人類的 tty 形成 two-reader（#82）。
         # 每次取唯一 temp 名（mkstemp）：_save_state 可能由多執行緒並發呼叫（device 自動綁定／attach），
-        # 固定 temp 名會在並發 os.replace 時互踩（FileNotFoundError）。唯一名 → 並發安全、last-writer-wins。
-        fd, tmp_path = tempfile.mkstemp(dir=state_dir, prefix="state.json.tmp.")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fp:
-                fp.write(payload)
-                fp.flush()
-                os.fsync(fp.fileno())
-            os.replace(tmp_path, self._state_path)
-            # 目錄 fsync：確保 state.json 的目錄 entry 持久化（POSIX 語意）。
-            # Windows（nt）：os.O_RDONLY 開目錄會拋 Permission Denied；NTFS 自行管理一致性，跳過即可（#84 PORT-4）。
-            if sys.platform != "win32":
-                dir_fd = os.open(state_dir, os.O_RDONLY)
-                try:
-                    os.fsync(dir_fd)
-                finally:
-                    os.close(dir_fd)
-        finally:
-            # os.replace 成功後 tmp 已不存在；中途失敗時清掉半寫 temp，且絕不動到原 state.json。
+        # 固定 temp 名會在並發 os.replace 時互踩（FileNotFoundError）。
+        # I/O 段以 _state_io_lock 序列化（#133）：唯一 temp 名只保證 temp 不互踩，
+        # 並發 os.replace 到同一目的檔在 Windows 仍會 WinError 5（MoveFileEx 對被
+        # 開啟的目的檔 access denied）；序列化後仍為 last-writer-wins（snapshot 在
+        # self._lock 內建立，後進鎖者持較新快照）。鎖序 self._lock → _state_io_lock
+        # 單向，I/O 段內不取其他鎖，無倒置。
+        with self._state_io_lock:
+            fd, tmp_path = tempfile.mkstemp(dir=state_dir, prefix="state.json.tmp.")
             try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except OSError:
-                pass
+                with os.fdopen(fd, "w", encoding="utf-8") as fp:
+                    fp.write(payload)
+                    fp.flush()
+                    os.fsync(fp.fileno())
+                # Windows 對外部讀者的瞬時 handle 另以退避重試兜底（#133）。
+                _replace_state_file(tmp_path, self._state_path)
+                # 目錄 fsync：確保 state.json 的目錄 entry 持久化（POSIX 語意）。
+                # Windows（nt）：os.O_RDONLY 開目錄會拋 Permission Denied；NTFS 自行管理一致性，跳過即可（#84 PORT-4）。
+                if sys.platform != "win32":
+                    dir_fd = os.open(state_dir, os.O_RDONLY)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
+            finally:
+                # os.replace 成功後 tmp 已不存在；中途失敗時清掉半寫 temp，且絕不動到原 state.json。
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except OSError:
+                    pass
 
     def _next_dynamic_com(self) -> str:
         """分配下一個可用的 COM 編號（須在 self._lock 內呼叫）。

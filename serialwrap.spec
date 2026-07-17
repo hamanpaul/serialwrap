@@ -8,8 +8,9 @@
 #   serial  — pyserial（_PySerialPort 後端，Windows UART，#84 PORT-1）
 #   yaml    — PyYAML（config 載入）
 
-# 內嵌 sw_core/assets 目錄到打包內的 sw_core/assets
-datas = [("sw_core/assets", "sw_core/assets")]
+# 內嵌 sw_core/assets 目錄到打包內的 sw_core/assets；
+# VERSION 一併帶入 assets（#131：`serialwrap --version` 在 frozen exe 的版本來源）
+datas = [("sw_core/assets", "sw_core/assets"), ("VERSION", "sw_core/assets")]
 
 # ---------- serialwrapd ----------
 a_d = Analysis(

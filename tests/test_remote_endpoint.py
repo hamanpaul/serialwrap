@@ -67,6 +67,7 @@ class TestRpcCallEndpointBranch(unittest.TestCase):
         self.assertFalse(resp.get("ok"))
         self.assertEqual(resp.get("error_code"), "INVALID_ENDPOINT")
 
+    @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "需 AF_UNIX（原生 Windows 無此屬性，#131）")
     def test_unix_path_uses_af_unix(self) -> None:
         mock_sock = MagicMock()
         mock_sock.recv.return_value = self._make_ok_response()
@@ -78,6 +79,7 @@ class TestRpcCallEndpointBranch(unittest.TestCase):
         mock_socket_cls.assert_called_once_with(socket.AF_UNIX, socket.SOCK_STREAM)
         mock_sock.connect.assert_called_once_with("/tmp/fake.sock")
 
+    @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "需 AF_UNIX（原生 Windows 無此屬性，#131）")
     def test_unix_scheme_uses_af_unix(self) -> None:
         mock_sock = MagicMock()
         mock_sock.recv.return_value = self._make_ok_response()
