@@ -8,3 +8,6 @@ from . import p0  # noqa: F401
 from . import p1_console  # noqa: F401
 from . import p1_cmd  # noqa: F401
 from . import p1_wal  # noqa: F401
+from . import p1_restart  # noqa: F401
+from . import p1_handoff  # noqa: F401
+from . import p1_hotplug  # noqa: F401
