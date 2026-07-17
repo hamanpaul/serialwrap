@@ -9,6 +9,11 @@ profiles:
     login_regex: "(?mi)^login:\\s*$"
     password_regex: "(?mi)^password:\\s*$"
     ready_probe: "echo __READY__${nonce}"
+    # #130：U-Boot bootloader prompt（常見為 "=> "；部分板實測為大寫 "U-Boot> "）。
+    # 卡在 bootloader 時，interactive-open --allow-attached 的 recovery lease 需比對此清單。
+    bootloader_prompts:
+      - "^=> $"
+      - "^U-Boot> $"
     uart:
       baud: 115200
       data_bits: 8

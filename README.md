@@ -293,6 +293,29 @@ serialwrap session recover --selector COM0
 characters for a `READY` shell, and finally reattaches when the bridge is gone
 but the device remains present.
 
+#### U-Boot autoboot protection (boot quiet window, #130)
+
+When a DUT reboots, any byte received during U-Boot's
+`Hit any key to stop autoboot` countdown interrupts boot and strands the board
+at the bootloader prompt (`=> `). The daemon now guards this window natively —
+no caller action required:
+
+- **Armed** the moment an agent submits a reboot-class command (before any
+  banner), and whenever RX shows a boot banner (`U-Boot` version line or the
+  autoboot countdown line — this also covers spontaneous/power-cycle reboots).
+- **Effect**: while active (180 s default), all automatic `source=system`
+  probe TX (reboot recovery, readiness reprobe, attach probe) is gated;
+  the daemon waits passively on RX. `session list` exposes the remaining time
+  as `boot_quiet_remaining_s`.
+- **Released** immediately when RX matches the session's `login_regex` /
+  `prompt_regex` (boot-complete signal) — recovery resumes at once and the
+  session returns to `READY` automatically; otherwise it expires after 180 s.
+- **Never gated**: human console bytes, interactive lease TX, and explicit
+  agent commands. Deliberately entering the bootloader (e.g. #114) still works.
+- If a board does end up stuck in the bootloader, `prpl-template` now defines
+  `bootloader_prompts` (`=> `, `U-Boot> `), so the
+  `interactive-open --allow-attached` recovery lease can type `boot` to escape.
+
 ### Logs and Evidence
 
 Default output paths:
@@ -1143,6 +1166,18 @@ recover 行為分成三種：
 
 只有 **agent 明確送出 reboot 類指令** 時，daemon 才會進入 `RECOVERING`，並在 target 回來後自動重新 login / 回到 `READY`。
 
+### U-Boot autoboot 保護（boot quiet window，#130）
+
+DUT 重開機時，U-Boot 的「`Hit any key to stop autoboot`」倒數窗只要收到任何 byte 就會中斷開機、把板子卡在 bootloader prompt（`=> `）。舊版 daemon 的自動 probe（reboot recovery / readiness reprobe 送的 `\n`）必然落入這個視窗，session 從此回不到 `READY`。daemon 現在**內建 boot quiet window 保護**，呼叫端不需做任何事：
+
+- **觸發**：
+  1. agent 送出 reboot 類指令**當下**即進入 quiet window（不等 banner——真板從 shutdown 訊息到 banner 可能間隔數秒，且 U-Boot 可能吃到 banner 前緩衝的 bytes）；
+  2. RX 看到 boot banner（`U-Boot` 版本行、`Hit any key to stop autoboot` 倒數行）——涵蓋 **DUT 自行重開／斷電重開**的非計畫性情境。
+- **效果**：視窗內（預設 180s，`BOOT_QUIET_WINDOW_S`；實測目標板完整開機約 150s + 裕度）**gate 所有 `source=system` 的自動 probe TX**——reboot recovery 迴圈、readiness reprobe、attach probe 全部改為純被動等 RX。`session list` 的 `boot_quiet_remaining_s` 欄位可觀測剩餘秒數。
+- **解除**：RX 匹配該 session 的 `login_regex` / `prompt_regex`（開機完成訊號）**即刻解除**，recovery 立即恢復探測、自動回 `READY`；否則 180s 過期自動解除。
+- **絕不 gate**：human console bytes、interactive lease TX、agent 顯式命令（本來就被 READY gate 擋）。與 #114「刻意進 bootloader」的需求相容——human/lease 送鍵永遠放行。
+- 若板子仍卡在 bootloader（例如 human 手動打斷倒數），`prpl-template` 已補上 `bootloader_prompts`（`=> `、`U-Boot> `），可直接用 `interactive-open --allow-attached` 開 recovery lease 打 `boot` 脫困，不必再走 `device release` + 外部工具的迂迴流程。
+
 ## 日誌與輸出
 
 | 檔案 | 說明 |
@@ -1398,7 +1433,8 @@ CLI（`bind` 只改 device、`recover`/`clear` 沿用舊 profile）。在 produc
    by-id **明確綁到 `uboot-template`**（繞過 auto-detect）。
 3. **把板子弄進 U-Boot**：開 interactive lease → 送 `reboot` → 接著以 ~0.3s 間隔持續送鍵
    （space）約 30 秒，攔截「Hit any key to stop autoboot」視窗；若是 boot menu，送對應鍵
-   （例如 `0` = Exit）掉到 U-Boot console（prompt 例如 `U-Boot> `）。
+   （例如 `0` = Exit）掉到 U-Boot console（prompt 例如 `U-Boot> `）。（#130 的 boot quiet
+   window 只 gate `source=system` 的自動 probe，**不擋 interactive lease 鍵擊**，此手法不受影響。）
 4. **走完整 serialwrap 路徑驗證**：`session self-test`（期望 `OK`/`probe_ok=True`/`READY`）→
    `cmd submit --cmd 'printenv' --mode line`（期望框出 env dump）。
 5. **還原**：送 `boot` 回正常 OS → 停 throwaway daemon → `device attach --selector COMx` 收回

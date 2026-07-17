@@ -431,6 +431,29 @@ dynamic 自動偵測 session 的 COM 編號**依裝置 by-id 字典序確定性�
 - 直接走 reattach
 - attach 流程只做被動 prompt probe，不自動 login
 
+### 9.3 U-Boot autoboot 保護（boot quiet window，#130）
+
+DUT 重開機時，U-Boot autoboot 倒數窗（`Hit any key to stop autoboot`）收到任何 byte 即中斷開機、卡在 bootloader prompt。daemon 以 **boot quiet window** 防止自動 probe 落入此視窗：
+
+**觸發（arm）**：
+
+1. `_handle_reboot_command` 收到 reboot 類指令**當下**（送出命令前）即設定，不等 banner。
+2. RX 路徑（`_on_bridge_rx`）偵測到 boot banner——以 `BOOT_BANNER_PATTERNS`（`U-Boot`、`Hit any key to stop autoboot`；大小寫敏感 substring）比對 rolling tail（`BOOT_BANNER_TAIL_CHARS=256` 字元，跨 chunk 邊界）。倒數每 tick 會延長視窗。此路徑涵蓋 DUT 自行重開／斷電重開。
+
+**效果**：視窗內（`BOOT_QUIET_WINDOW_S=180s`）gate 所有 `source=system` 的自動 probe TX——
+
+- reboot recovery 迴圈（`_spawn_reboot_recovery`）：純被動等 RX；deadline 延伸至「視窗結束 + 一輪 `hard_timeout_s`」，上限為「一個完整視窗 + 一輪 probe 預算」（防 boot-loop 板反覆吐 banner 使執行緒無限延命）。
+- readiness reprobe（`_prepare_reprobe_locked` 與 worker 寫入前的最終驗證 `_reprobe_target_still_valid_locked`）：不 fire、不累加 attempts、不排 backoff。
+- attach probe（`_attach_by_id`）：掛 bridge 純收 RX，以 `PROMPT_UNAVAILABLE` 停在 `ATTACHED`，視窗解除後由 reprobe／recovery 接手（涵蓋 reboot 期間序列裝置 re-enumerate 的 re-attach）。
+
+**解除（clear）**：RX 匹配該 session 的 `login_regex` / `prompt_regex`（開機完成訊號）即刻解除並恢復探測；否則過期自動解除。
+
+**不 gate**：human console bytes、interactive lease TX、agent 顯式命令（READY gate 本已擋）、手動 `session recover` / `session attach`（顯式介入）。與 #114「刻意進 bootloader」相容。
+
+**觀測**：session 公開欄位 `boot_quiet_remaining_s`（剩餘秒數；`null`＝未啟用/已解除）。
+
+另 `prpl-template` 資產已定義 `bootloader_prompts`（`^=> $`、`^U-Boot> $`），卡 bootloader 時 `interactive-open --allow-attached` 的 recovery lease 可匹配進入。
+
 ## 10. Logging 與輸出層
 
 ### 10.1 RAW WAL

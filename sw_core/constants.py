@@ -97,6 +97,24 @@ REPROBE_MAX_INTERVAL_S: float = 15.0
 REPROBE_MAX_ATTEMPTS: int = 10
 """readiness 自動重探的最大嘗試次數。"""
 
+# U-Boot autoboot 保護（#130）：boot quiet window
+BOOT_BANNER_PATTERNS: tuple[str, ...] = (
+    "U-Boot",
+    "Hit any key to stop autoboot",
+)
+"""boot banner 偵測樣式（**大小寫敏感的 substring 比對，非 regex**）。
+
+選 substring 而非 regex：樣式為固定字面字串、比對成本低，且配合呼叫端的
+rolling tail 對 RX chunk 任意切割位置最穩健（見 ``login_fsm.detect_boot_banner``）。"""
+BOOT_QUIET_WINDOW_S: float = 180.0
+"""偵測到 boot banner（或 agent 送出 reboot 命令）後，system probe TX 的靜默秒數。
+
+實測 prpl 平台目標板完整開機約 150s，加裕度取 180s。RX 見到該 session 的 login/prompt
+（開機完成訊號）會提前解除；quiet window 只擋 source=system 的自動 probe，
+不擋 human console bytes、interactive lease TX 與 agent 顯式命令。"""
+BOOT_BANNER_TAIL_CHARS: int = 256
+"""banner 偵測用 rolling RX tail 的長度（字元）；跨 chunk 邊界拼接比對。"""
+
 # 記憶體上限（#81）：防止長壽 daemon 下無界 in-memory 結構成長至 OOM。
 BG_CAPTURE_MAX_BYTES: int = 4 * 1024 * 1024
 """單一 background capture 在記憶體保留的 chunk 總位元組上限；超過則丟最舊（環形），dropped_chunks 累計。"""

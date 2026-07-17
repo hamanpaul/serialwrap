@@ -7,7 +7,19 @@ import uuid
 
 from .auth import SessionAuth
 from .config import ProfileTemplate, SessionProfile
+from .constants import BOOT_BANNER_PATTERNS
 from .uart_io import UARTBridge
+
+
+def detect_boot_banner(text: str) -> bool:
+    """``text`` 是否含 boot banner 樣式（U-Boot 版本行／autoboot 倒數行）（#130）。
+
+    採**大小寫敏感的 substring 比對**（非 regex）：樣式為固定字面字串、
+    成本低，且對 RX chunk 任意切割位置容忍度高（呼叫端以 rolling tail 餵入）。
+    """
+    if not text:
+        return False
+    return any(pattern in text for pattern in BOOT_BANNER_PATTERNS)
 
 
 def _wait_or_fail(bridge: UARTBridge, pattern: str, timeout_s: float, err: str) -> tuple[bool, str | None]:

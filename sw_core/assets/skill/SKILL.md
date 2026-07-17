@@ -75,6 +75,11 @@ serialwrap 另提供原生 MCU flash 端點（與上面 device handoff 互補）
 - 若 `reprobe_exhausted=true` 或等待過久仍未 READY，再手動 `serialwrap session recover --selector COM0`（必要時 `--force`）。
 - 懷疑 RX 掉字／狀態被污染：可能是同機多開（two-reader）。`serialwrap daemon status` 的 `multi_open`／`foreign_holders` 欄位與 `serialwrap doctor` 的 `single_daemon` 檢查會掃 `/proc` 報出其他 `serialwrapd` 與 tty 持有者（#101，純偵測）。勿用 `serialwrap daemon start`（systemd 模式會另起非託管 daemon 造成 two-reader）；生命週期用 `serialwrap service ...`。
 
+## U-Boot autoboot 保護（boot quiet window，#130）
+- 對 DUT 下 `reboot` 後 session 停在 `RECOVERING`／`ATTACHED`、且 `session list` 的 `boot_quiet_remaining_s` 有值：**這是正常的 autoboot 保護**，daemon 正在靜默等 DUT 開機（避免自動 probe 打斷 U-Boot autoboot 倒數把板子卡在 `=> `）。**等它自己回 `READY`**（RX 見 login/prompt 即解除、最長 180s），勿反覆下 `session recover`。
+- 保護只 gate `source=system` 的自動 probe；human console、interactive lease、agent 顯式命令不受影響——刻意要進 bootloader（先送 reboot 再於 lease 連打按鍵）仍可行。
+- 若板子已卡在 bootloader prompt（`=> `／`U-Boot> `）：prpl-template 有 `bootloader_prompts`，用 `serialwrap session interactive-open --selector COM0 --allow-attached` 開 recovery lease 打 `boot` 脫困。
+
 ## Remote Support 用法（ssh-tunnel）
 當 Agent 不在 target 所在機器上，而要從遠端 debug UART 時，走 **remote endpoint** 模式。
 - daemon 仍跑在 **target 所在主機**；Agent 端只透過 `--endpoint tcp://host:port` 連到遠端 daemon。
