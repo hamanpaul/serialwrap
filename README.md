@@ -522,6 +522,23 @@ focused debugging:
 python3 -m unittest discover -s tests -v
 ```
 
+### Real-hardware stability suite (#122)
+
+After deploying a new build to this machine (a system with a production daemon
+and two real boards), run the manual, unattended real-hardware stability suite.
+It drives the installed `serialwrap` CLI against the live daemon and real boards
+(post-deployment acceptance) — it does not import `sw_core`, is not collected by
+`pytest`, is not run in CI, and is not packaged into the wheel.
+
+```bash
+python3 -m realhw --tier p0,p1                    # P0 smoke (×8) + P1 core stability (×20)
+python3 -m realhw --tier longrun --duration 48h   # unattended long run (default 32h when omitted)
+```
+
+Reports land in `~/b-log/realhw-reports/<ts>/`. See
+[`docs/func-test/realhw-stability-checklist.md`](./docs/func-test/realhw-stability-checklist.md)
+for the per-case checklist and the P2 manual procedures.
+
 ### Further Reading
 
 - Detailed design and API contract: [`docs/serialwrap-spec.md`](./docs/serialwrap-spec.md)
@@ -1511,6 +1528,17 @@ python3 -m pytest tests/test_session_bind.py -v
 python3 -m unittest tests.test_multiagent_e2e -v
 python3 -m unittest tests.test_session_bind -v
 ```
+
+### 實機穩定性測試（#122）
+
+重大更新**部署到本機系統後**（有 production daemon＋兩塊真板），跑手動觸發、無人在場的實機穩定性套件。它用已安裝的 `serialwrap` CLI 操作 live daemon 與真板（部署驗收）——**不 import `sw_core`、不被 `pytest` 收集、不進 CI、不入 wheel**。
+
+```bash
+python3 -m realhw --tier p0,p1                    # P0 煙霧（×8）＋P1 核心穩定性（×20）
+python3 -m realhw --tier longrun --duration 48h   # 長跑無人看護（省略 --duration 時預設 32h）
+```
+
+報告落 `~/b-log/realhw-reports/<ts>/`。逐 case 對照與 P2 手動程序見 [`docs/func-test/realhw-stability-checklist.md`](./docs/func-test/realhw-stability-checklist.md)。
 
 ### 32h 長時間穩定度測試摘要
 
