@@ -79,6 +79,11 @@ EVENTS_LOG_ROTATE_BYTES = 10 * 1024 * 1024
 EVENTS_LOG_BACKUP_COUNT = 3
 
 
+# 帳密解析終態（#140）：profile 宣告帳密來源但解析為空時，session 進此終態，
+# login 流程不對 Login:/Password: 送空字串、自動 reprobe 亦不再重試；需操作者補
+# 帳密後手動 attach/recover 才重試。與「板子尚未到 login prompt」的 LOGIN_REQUIRED 區分。
+ERROR_CREDENTIALS_UNRESOLVED: str = "CREDENTIALS_UNRESOLVED"
+
 # bootloader recovery 用常數
 MAX_RECOVERY_LEASE_S: float = 120.0
 """recovery interactive lease 最長持續秒數。"""

@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from sw_core.auth import SessionAuth, parse_env_file, resolve_session_auth
+from sw_core.auth import AuthResolution, SessionAuth, parse_env_file, resolve_session_auth
 from sw_core.config import SessionProfile, UartProfile
 
 
@@ -92,7 +92,7 @@ class TestResolveSessionAuth(unittest.TestCase):
 
             sp = _make_shell_profile(env_file=env_path)
             with mock.patch.dict(os.environ, {}, clear=True):
-                auth = resolve_session_auth(sp)
+                auth, _ = resolve_session_auth(sp)
 
             self.assertEqual(auth.username, "haman")
             self.assertEqual(auth.password, "secret")
@@ -101,7 +101,7 @@ class TestResolveSessionAuth(unittest.TestCase):
         """沒有 env_file 時，fallback 到 os.environ（向後相容）。"""
         sp = _make_shell_profile(env_file=None)
         with mock.patch.dict(os.environ, {"SW_OPI_U": "global_user", "SW_OPI_P": "global_pass"}, clear=False):
-            auth = resolve_session_auth(sp)
+            auth, _ = resolve_session_auth(sp)
 
         self.assertEqual(auth.username, "global_user")
         self.assertEqual(auth.password, "global_pass")
@@ -114,7 +114,7 @@ class TestResolveSessionAuth(unittest.TestCase):
 
             sp = _make_shell_profile(env_file=env_path)
             with mock.patch.dict(os.environ, {"SW_OPI_U": "global_user", "SW_OPI_P": "global_pass"}, clear=False):
-                auth = resolve_session_auth(sp)
+                auth, _ = resolve_session_auth(sp)
 
             self.assertEqual(auth.username, "local_user")
             self.assertEqual(auth.password, "local_pass")
@@ -123,7 +123,7 @@ class TestResolveSessionAuth(unittest.TestCase):
         """env_file 不存在時不崩潰，fallback 到 os.environ。"""
         sp = _make_shell_profile(env_file="/tmp/nonexistent-serialwrap-env")
         with mock.patch.dict(os.environ, {"SW_OPI_U": "fallback_u", "SW_OPI_P": "fallback_p"}, clear=False):
-            auth = resolve_session_auth(sp)
+            auth, _ = resolve_session_auth(sp)
 
         self.assertEqual(auth.username, "fallback_u")
         self.assertEqual(auth.password, "fallback_p")
@@ -132,7 +132,7 @@ class TestResolveSessionAuth(unittest.TestCase):
         """user_env 無值時使用 username 欄位。"""
         sp = _make_shell_profile(user_env=None, username="direct_user")
         with mock.patch.dict(os.environ, {}, clear=True):
-            auth = resolve_session_auth(sp)
+            auth, _ = resolve_session_auth(sp)
 
         self.assertEqual(auth.username, "direct_user")
 
@@ -140,7 +140,7 @@ class TestResolveSessionAuth(unittest.TestCase):
         """profile 無帳密設定時回傳空 auth。"""
         sp = _make_shell_profile(user_env=None, pass_env=None, username=None)
         with mock.patch.dict(os.environ, {}, clear=True):
-            auth = resolve_session_auth(sp)
+            auth, _ = resolve_session_auth(sp)
 
         self.assertIsNone(auth.username)
         self.assertIsNone(auth.password)
@@ -153,10 +153,76 @@ class TestResolveSessionAuth(unittest.TestCase):
 
             sp = _make_shell_profile(env_file=env_path)
             with mock.patch.dict(os.environ, {"SW_OPI_P": "global_pass"}, clear=True):
-                auth = resolve_session_auth(sp)
+                auth, _ = resolve_session_auth(sp)
 
             self.assertEqual(auth.username, "local_user")
             self.assertEqual(auth.password, "global_pass")
+
+
+class TestAuthResolution(unittest.TestCase):
+    """resolve_session_auth 的 AuthResolution 解析狀態（#140 Task 1）。"""
+
+    def test_env_file_missing(self) -> None:
+        """宣告 env_file 但檔案不存在 → reason=env_file_missing、帶解析絕對路徑、帳密為空。"""
+        with tempfile.TemporaryDirectory() as td:
+            missing = str(Path(td) / "nope.env")
+            sp = _make_shell_profile(env_file=missing, user_env="BRCM_USER", pass_env="BRCM_PASS")
+            with mock.patch.dict(os.environ, {}, clear=True):
+                auth, res = resolve_session_auth(sp)
+
+            self.assertIsInstance(res, AuthResolution)
+            self.assertEqual(res.reason, "env_file_missing")
+            self.assertTrue(res.env_file_path.endswith("nope.env"))
+            self.assertIsNone(auth.username)
+            self.assertIsNone(auth.password)
+
+    def test_key_absent(self) -> None:
+        """env_file 可讀但缺 user_env/pass_env key → reason=key_absent。"""
+        with tempfile.TemporaryDirectory() as td:
+            env_path = Path(td) / "brcm.env"
+            env_path.write_text("OTHER=x\n")
+            sp = _make_shell_profile(env_file=str(env_path), user_env="BRCM_USER", pass_env="BRCM_PASS")
+            with mock.patch.dict(os.environ, {}, clear=True):
+                _, res = resolve_session_auth(sp)
+
+            self.assertEqual(res.reason, "key_absent")
+            self.assertTrue(res.env_file_path.endswith("brcm.env"))
+
+    def test_ok(self) -> None:
+        """env_file 有齊全 user/pass → reason=ok。"""
+        with tempfile.TemporaryDirectory() as td:
+            env_path = Path(td) / "brcm.env"
+            env_path.write_text("BRCM_USER=admin\nBRCM_PASS=admin\n")
+            sp = _make_shell_profile(env_file=str(env_path), user_env="BRCM_USER", pass_env="BRCM_PASS")
+            with mock.patch.dict(os.environ, {}, clear=True):
+                auth, res = resolve_session_auth(sp)
+
+            self.assertEqual(res.reason, "ok")
+            self.assertEqual(auth.username, "admin")
+            self.assertEqual(auth.password, "admin")
+
+    def test_not_configured(self) -> None:
+        """profile 未宣告任何帳密來源 → reason=not_configured、env_file_path 為 None。"""
+        sp = _make_shell_profile(env_file=None, user_env=None, pass_env=None, username=None)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            _, res = resolve_session_auth(sp)
+
+        self.assertEqual(res.reason, "not_configured")
+        self.assertIsNone(res.env_file_path)
+
+    def test_os_environ_fallback_is_ok(self) -> None:
+        """env_file 不存在但 os.environ 補齊帳密 → reason=ok（不誤判 env_file_missing）。
+
+        對應既有 test_env_file_missing_graceful 行為：env_file 缺失時仍以 os.environ
+        fallback，此時帳密解析成功、不應阻擋 session。
+        """
+        sp = _make_shell_profile(env_file="/tmp/nonexistent-serialwrap-env")
+        with mock.patch.dict(os.environ, {"SW_OPI_U": "u", "SW_OPI_P": "p"}, clear=True):
+            auth, res = resolve_session_auth(sp)
+
+        self.assertEqual(res.reason, "ok")
+        self.assertEqual(auth.username, "u")
+        self.assertEqual(auth.password, "p")
 
 
 if __name__ == "__main__":
