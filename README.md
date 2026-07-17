@@ -293,6 +293,28 @@ serialwrap session recover --selector COM0
 characters for a `READY` shell, and finally reattaches when the bridge is gone
 but the device remains present.
 
+#### Timeout semantics (#123)
+
+Callers must handle RPC timeouts themselves — a CLI `TIMEOUT` only means the
+CLI stopped waiting; the daemon-side operation may still complete successfully
+afterwards. `session attach`, `session recover`, and `session self-test` are
+long operations executed synchronously on the daemon side: when `--timeout` is
+not given, the CLI automatically applies a wider floor (≥ 30 s, derived from
+the recover-path cost — Ctrl-C 2 s + Ctrl-D 2 s + force polling 10 s +
+attach/probe margin) instead of the general 5 s default. An explicit
+`--timeout` always wins.
+
+`TIMEOUT` errors now include `daemon_reachable` (from a fresh 1 s
+`health.ping` probe) and, when reachable, a `daemon_busy` context
+(`commands`/`sessions` counts from `health.status`), so callers can tell a
+dead or disconnected daemon apart from a healthy daemon still working on a
+long operation.
+
+`--retries N` (default 0) enables exponential-backoff retries (0.5 s base,
+×2) on `TIMEOUT`/connect failure for idempotent read-only methods only
+(`session list`, `health.*`, `device list`, ...); write methods are never
+retried automatically.
+
 ### Logs and Evidence
 
 Default output paths:
@@ -1143,6 +1165,18 @@ recover 行為分成三種：
 
 只有 **agent 明確送出 reboot 類指令** 時，daemon 才會進入 `RECOVERING`，並在 target 回來後自動重新 login / 回到 `READY`。
 
+### Timeout 語意（#123）
+
+呼叫端必須自行處理 RPC timeout——CLI 回 `TIMEOUT` 只代表「CLI 不再等待」，daemon 端操作可能仍在執行、稍後成功。`session attach`／`session recover`／`session self-test` 屬 daemon 端同步執行的**長操作**：未指定 `--timeout` 時，CLI 對這三個方法自動採較寬 floor（≥ 30 秒；由 recover 路徑成本推導——Ctrl-C 等待 2s + Ctrl-D 等待 2s + force 硬輪詢 10s + attach/probe 裕度），而非一般方法的預設 5 秒。顯式指定 `--timeout` 時一律照用。
+
+`TIMEOUT` 錯誤 JSON 現在附帶 `daemon_reachable`（以新連線做 1 秒 `health.ping` 探測），可達時再附 `daemon_busy` 上下文（`health.status` 的 `commands`／`sessions` 計數），供呼叫端分辨「device 斷線／daemon 死亡」與「daemon 忙碌、長操作仍在跑」：
+
+```json
+{"daemon_busy":{"commands":3,"sessions":2},"daemon_reachable":true,"error_code":"TIMEOUT","ok":false}
+```
+
+`--retries N`（預設 0，行為不變）僅對**冪等唯讀方法白名單**（`session list`、`health.*`、`device list` 等查詢類）在 `TIMEOUT`／連線失敗時做指數退避重試（0.5s 起、每次 ×2）；寫入類方法（attach／recover／submit…）絕不自動重送——CLI 逾時當下 daemon 可能仍在執行，重送會重複動作。
+
 ## 日誌與輸出
 
 | 檔案 | 說明 |
@@ -1623,7 +1657,7 @@ serialwrap doctor    # 驗證環境
 
 <!-- BEGIN: cli-help marker="serialwrap-help" -->
 usage: serialwrap [-h] [--version] [--socket SOCKET] [--endpoint ENDPOINT]
-                  [--timeout TIMEOUT_S]
+                  [--timeout TIMEOUT_S] [--retries RETRIES]
                   <group> ...
 
 serialwrap client（支援本機 Unix socket 與遠端 endpoint）
@@ -1633,7 +1667,8 @@ options:
   --version            顯示版本後離開
   --socket SOCKET      本機 daemon 的 Unix socket 路徑（未指定時依 config.yaml 與 XDG 執行期目錄解析，可用 SERIALWRAP_RUN_DIR 覆寫）
   --endpoint ENDPOINT  遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）
-  --timeout TIMEOUT_S  RPC timeout 秒數（預設: 5.0）
+  --timeout TIMEOUT_S  RPC timeout 秒數（未指定：一般方法 5.0；長操作 session attach/recover/self-test 自動採 ≥30 的較寬 floor，#123）
+  --retries RETRIES    TIMEOUT／連線失敗時的重試次數，僅作用於冪等唯讀方法白名單（指數退避 0.5s 起；預設: 0）
 
 command groups:
   <group>

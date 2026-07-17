@@ -75,6 +75,12 @@ serialwrap 另提供原生 MCU flash 端點（與上面 device handoff 互補）
 - 若 `reprobe_exhausted=true` 或等待過久仍未 READY，再手動 `serialwrap session recover --selector COM0`（必要時 `--force`）。
 - 懷疑 RX 掉字／狀態被污染：可能是同機多開（two-reader）。`serialwrap daemon status` 的 `multi_open`／`foreign_holders` 欄位與 `serialwrap doctor` 的 `single_daemon` 檢查會掃 `/proc` 報出其他 `serialwrapd` 與 tty 持有者（#101，純偵測）。勿用 `serialwrap daemon start`（systemd 模式會另起非託管 daemon 造成 two-reader）；生命週期用 `serialwrap service ...`。
 
+## Timeout 語意（#123）
+- **呼叫端必須自行處理 timeout**：CLI 回 `TIMEOUT` 只代表「CLI 不再等待」，daemon 端操作可能仍在執行、稍後成功（host 過載時尤然）。看到 TIMEOUT 先讀附帶欄位再決定下一步，勿直接重送寫入類命令。
+- **長操作自動較寬 floor**：`session attach`／`session recover`／`session self-test` 為 daemon 端同步長操作；未指定全域 `--timeout` 時 CLI 自動採 ≥30s 的 floor（recover 另隨子命令 `--timeout` 成長），一般方法維持 5s。顯式指定 `--timeout` 一律照用。
+- **TIMEOUT 錯誤帶診斷欄位**：`daemon_reachable`（1s `health.ping` 探測）分辨「daemon 死亡／斷線」（false → 檢查 daemon／裝置）與「daemon 忙碌」（true → 操作多半仍在跑，稍候以 `session list`／`self-test` 確認結果）；可達時另附 `daemon_busy`（in-flight `commands`／`sessions` 計數）。
+- **`--retries N` 僅作用唯讀方法**：只有冪等唯讀白名單（`session list`、`health.*`、`device list` 等查詢類）會在 TIMEOUT／連線失敗時指數退避重試（0.5s 起 ×2）；寫入類（attach／recover／submit…）絕不自動重送。
+
 ## Remote Support 用法（ssh-tunnel）
 當 Agent 不在 target 所在機器上，而要從遠端 debug UART 時，走 **remote endpoint** 模式。
 - daemon 仍跑在 **target 所在主機**；Agent 端只透過 `--endpoint tcp://host:port` 連到遠端 daemon。

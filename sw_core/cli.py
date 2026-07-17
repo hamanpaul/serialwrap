@@ -39,6 +39,30 @@ _USE_DEFAULT_ENV = object()
 LEGACY_DAEMON_ENV_FILE = "~/OPI.env"
 PROFILE_DAEMON_ENV_FILE = "OPI.env"
 
+# --- #123：長操作 RPC 的 socket timeout floor -------------------------------
+# 問題：session recover／attach／self-test 的 daemon 端 handler 為同步長操作
+# （對照 sw_core/daemon.py 的 BLOCKING_RPC_METHODS），host 過載或走 force
+# recover 路徑時，daemon 端執行時間會結構性超過 CLI 舊預設 5s socket timeout，
+# CLI 因而回「假性 TIMEOUT」——daemon 其實健康、操作稍後成功（實測 recover
+# CLI 5.08s 報 TIMEOUT、daemon ~7-8s 後 READY）。
+#
+# floor 推導（sw_core/session_manager.py 的 recover 全路徑下限）：
+#   CTRL_C 等 prompt 2s + CTRL_D 等 prompt 2s（_recover_after_failure）
+#   + force fallback 硬輪詢 10s（_force_recover 的 range(10)×sleep(1.0)）
+#   + clear／reattach 後 login／ready probe 時間（依 profile timeout_s，
+#     數秒～十餘秒不等）
+#   ⇒ 固定成本下限約 14s，再加 attach probe 裕度，取 30s 為統一 floor。
+LONG_RPC_TIMEOUT_FLOOR_S = 30.0
+# recover：daemon 端把 CLI 的 --timeout（recover_timeout_s）用於 probe 等待，
+# 固定成本（CTRL_C 2s + CTRL_D 2s + force 10s 輪詢 + attach probe 裕度）另計，
+# 預留 25s 常數裕度隨參數成長。
+RECOVER_TIMEOUT_MARGIN_S = 25.0
+# attach／self-test：無 force 輪詢，固定成本較小（probe／login／reprobe），
+# 預留 15s 裕度。
+ATTACH_SELF_TEST_TIMEOUT_MARGIN_S = 15.0
+# 一般（非長操作）方法未顯式指定 --timeout 時的預設 RPC timeout，維持既有 5s。
+DEFAULT_RPC_TIMEOUT_S = 5.0
+
 
 class EnvFileSourceError(RuntimeError):
     def __init__(self, path: str, message: str) -> None:
@@ -513,8 +537,39 @@ def _resolve_endpoint(args: argparse.Namespace) -> str:
     return chosen
 
 
+def _effective_timeout_s(args: argparse.Namespace, method: str) -> float:
+    """解析本次 RPC 實際使用的 socket timeout（#123）。
+
+    使用者顯式指定全域 ``--timeout`` → 一律照用；未指定（None）→ 一般方法用
+    ``DEFAULT_RPC_TIMEOUT_S``（5s），長操作方法（session.recover／
+    session.attach／session.self_test，對照 daemon 端 BLOCKING_RPC_METHODS）
+    改用依該操作參數推得的 floor，消除「daemon 還在跑、CLI 先報 TIMEOUT」的
+    假性逾時。file.push／file.pull 已有自己的傳輸節奏，暫不納入（#123）。
+    """
+    explicit = getattr(args, "timeout_s", None)
+    if explicit is not None:
+        return float(explicit)
+    if method == "session.recover":
+        # daemon 端以 recover_timeout_s 做 probe 等待，外加固定成本（見常數註解）
+        recover_timeout_s = float(getattr(args, "recover_timeout_s", 2.0))
+        return max(LONG_RPC_TIMEOUT_FLOOR_S, recover_timeout_s + RECOVER_TIMEOUT_MARGIN_S)
+    if method == "session.self_test":
+        probe_timeout_s = float(getattr(args, "probe_timeout_s", 2.0))
+        return max(LONG_RPC_TIMEOUT_FLOOR_S, probe_timeout_s + ATTACH_SELF_TEST_TIMEOUT_MARGIN_S)
+    if method == "session.attach":
+        # attach 無 CLI 層 timeout 參數；固定 floor 已含 reprobe／login 最壞裕度
+        return LONG_RPC_TIMEOUT_FLOOR_S
+    return DEFAULT_RPC_TIMEOUT_S
+
+
 def _run_rpc(args: argparse.Namespace, method: str, params: dict[str, Any]) -> int:
-    resp = rpc_call(_resolve_endpoint(args), method, params, timeout_s=args.timeout_s)
+    resp = rpc_call(
+        _resolve_endpoint(args),
+        method,
+        params,
+        timeout_s=_effective_timeout_s(args, method),
+        retries=int(getattr(args, "retries", 0) or 0),
+    )
     _print(resp)
     if not resp.get("ok"):
         # #94：失敗時除了 stdout 的機器可解析 JSON，另在 stderr 印一行具體 error，
@@ -525,36 +580,38 @@ def _run_rpc(args: argparse.Namespace, method: str, params: dict[str, Any]) -> i
 
 
 def _dispatch_event(args: argparse.Namespace) -> int:
+    # event.* 皆非長操作：未顯式指定 --timeout 時維持一般預設 5s（#123）
+    timeout_s = _effective_timeout_s(args, f"event.{args.event_cmd}")
     if args.event_cmd == "add":
         with open(args.file, "r", encoding="utf-8") as f:
             params = json.load(f)
-        result = rpc_call(_resolve_endpoint(args), "event.rule_set", params, timeout_s=args.timeout_s)
+        result = rpc_call(_resolve_endpoint(args), "event.rule_set", params, timeout_s=timeout_s)
     elif args.event_cmd == "rm":
-        result = rpc_call(_resolve_endpoint(args), "event.rule_delete", {"rule_id": args.rule_id}, timeout_s=args.timeout_s)
+        result = rpc_call(_resolve_endpoint(args), "event.rule_delete", {"rule_id": args.rule_id}, timeout_s=timeout_s)
     elif args.event_cmd == "list":
         result = rpc_call(
             _resolve_endpoint(args),
             "event.rule_list",
             {"selector": getattr(args, "selector", None), "owner": getattr(args, "owner", None)},
-            timeout_s=args.timeout_s,
+            timeout_s=timeout_s,
         )
     elif args.event_cmd == "show":
-        result = rpc_call(_resolve_endpoint(args), "event.rule_get", {"rule_id": args.rule_id}, timeout_s=args.timeout_s)
+        result = rpc_call(_resolve_endpoint(args), "event.rule_get", {"rule_id": args.rule_id}, timeout_s=timeout_s)
     elif args.event_cmd == "enable":
-        result = rpc_call(_resolve_endpoint(args), "event.com_enable", {"selector": args.selector}, timeout_s=args.timeout_s)
+        result = rpc_call(_resolve_endpoint(args), "event.com_enable", {"selector": args.selector}, timeout_s=timeout_s)
     elif args.event_cmd == "disable":
-        result = rpc_call(_resolve_endpoint(args), "event.com_disable", {"selector": args.selector}, timeout_s=args.timeout_s)
+        result = rpc_call(_resolve_endpoint(args), "event.com_disable", {"selector": args.selector}, timeout_s=timeout_s)
     elif args.event_cmd == "status":
-        result = rpc_call(_resolve_endpoint(args), "event.com_status", {"selector": getattr(args, "selector", None)}, timeout_s=args.timeout_s)
+        result = rpc_call(_resolve_endpoint(args), "event.com_status", {"selector": getattr(args, "selector", None)}, timeout_s=timeout_s)
     elif args.event_cmd == "reset":
         result = rpc_call(
             _resolve_endpoint(args),
             "event.reset",
             {"rule_id": getattr(args, "rule_id", None), "selector": getattr(args, "selector", None)},
-            timeout_s=args.timeout_s,
+            timeout_s=timeout_s,
         )
     elif args.event_cmd == "reload":
-        result = rpc_call(_resolve_endpoint(args), "event.reload", {}, timeout_s=args.timeout_s)
+        result = rpc_call(_resolve_endpoint(args), "event.reload", {}, timeout_s=timeout_s)
     elif args.event_cmd == "tail":
         result = rpc_call(
             _resolve_endpoint(args),
@@ -565,7 +622,7 @@ def _dispatch_event(args: argparse.Namespace) -> int:
                 "n": args.n,
                 "since_ts": getattr(args, "since", None),
             },
-            timeout_s=args.timeout_s,
+            timeout_s=timeout_s,
         )
     else:
         _print({"ok": False, "error_code": "UNKNOWN_EVENT_CMD", "cmd": args.event_cmd})
@@ -734,7 +791,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"serialwrap {_resolve_version()}", help="顯示版本後離開")
     p.add_argument("--socket", default=None, help="本機 daemon 的 Unix socket 路徑（未指定時依 config.yaml 與 XDG 執行期目錄解析，可用 SERIALWRAP_RUN_DIR 覆寫）")
     p.add_argument("--endpoint", default=None, metavar="ENDPOINT", help="遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）")
-    p.add_argument("--timeout", dest="timeout_s", type=float, default=5.0, help="RPC timeout 秒數（預設: %(default)s）")
+    p.add_argument(
+        "--timeout",
+        dest="timeout_s",
+        type=float,
+        default=None,
+        help="RPC timeout 秒數（未指定：一般方法 5.0；長操作 session attach/recover/self-test 自動採 ≥30 的較寬 floor，#123）",
+    )
+    p.add_argument(
+        "--retries",
+        dest="retries",
+        type=int,
+        default=0,
+        help="TIMEOUT／連線失敗時的重試次數，僅作用於冪等唯讀方法白名單（指數退避 0.5s 起；預設: %(default)s）",
+    )
 
     sub = p.add_subparsers(
         dest="cmd",
