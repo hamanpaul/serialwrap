@@ -1,6 +1,0 @@
----
-type: fix
-issue: 123
-scope: cli
----
-修復 host 過載／長操作下 CLI 假性 TIMEOUT（daemon 端 recover/attach/self-test/console-attach 為同步長操作，執行時間結構性超過 CLI 舊預設 5s socket timeout；實測 recover CLI 5.08s 報 TIMEOUT、daemon 其實健康且 ~7-8s 後成功），並收斂 review 意見。修法：(1) 全域 `--timeout` 預設改 None，未顯式指定時長操作（session.recover/attach/self_test/console_attach，對照 daemon 端 BLOCKING_RPC_METHODS——console_attach 的 recover 升級分支可同步跑數十秒，先前遺漏，review MAJOR-1 補上）一律採固定 45s 的 timeout floor，一般方法維持 5s、顯式指定一律照用；floor 為誠實推導的寬鬆常數（CTRL_C 2s + CTRL_D 2s + force 硬輪詢 10s + bcm 類慢板多階段 login/ready probe 裕度），不再依 CLI 端 `recover_timeout_s`／`probe_timeout_s` 做「+25s／+15s」縮放——daemon 端對這兩個參數皆有 `min(x, 2.0)` cap，超過 2.0 對執行時間無作用，該推導前提是錯的（review MINOR-2，四處文件與測試同步改寫為誠實版）；(2) TIMEOUT 錯誤 enrich——逾時後以新連線補 1s `health.ping` 輕量探測，錯誤 JSON 附 `daemon_reachable`（bool），可達時再附 `daemon_busy`（`health.status` 的 in-flight commands/sessions 計數），供呼叫端分辨「daemon 死亡/斷線」與「daemon 忙碌、操作仍在跑」（探測總預算 ≤2s，另加 2.5s wall-clock deadline 兜底避免探測本身拖時間，review MINOR-3）；(3) 全域 `--retries N`（預設 0、行為不變），僅對冪等唯讀方法白名單（session list、health.*、device list 等查詢類；console_list 額外 prune 已死 console，該副作用冪等、retry 安全，review MINOR-4）在 TIMEOUT／連線失敗／`EMPTY_RESPONSE`（review NIT-6，與 SOCKET_ERROR 同等可重試）時做指數退避重試（0.5s 起 ×2、單次上限 5s，review NIT-7），寫入類絕不自動重送；file.push/file.pull 暫不納入 floor——誠實列為已知缺口、defer 至 follow-up（review MINOR-5）；event.\* 子命令改用實際送出的 RPC method 名查詢 floor／retry（review NIT-8）。
