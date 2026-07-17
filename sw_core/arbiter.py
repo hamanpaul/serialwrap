@@ -62,6 +62,34 @@ class CommandArbiter:
                 pass
         if th and th.is_alive() and th is not threading.current_thread():
             th.join(timeout=1.0)
+        # 佇列已丟棄：終結所有尚未啟動的 queued 命令。否則 stale accepted 記錄永無 done_at、
+        # 永久計入 _count_pending_locked 佔用 CMD_PENDING_MAX 額度，數次 recovery episode 後
+        # 該 session 直到 daemon 重啟前一律 SESSION_QUEUE_FULL（#128）。
+        self.flush_session(session_id)
+
+    def flush_session(self, session_id: str, error_code: str = "FLUSHED_BY_RECOVERY") -> int:
+        """終結該 session「尚未啟動」（status=accepted、done_at=None）的佇列命令（#128）。
+
+        以 ``status=error`` + ``error_code``（預設 ``FLUSHED_BY_RECOVERY``）+ ``done_at`` 標記終端態：
+        client 對這些 cmd_id 的 ``command.get`` 會看到明確的「未執行、可於 session 回 READY 後重送」
+        語意，且記錄轉為可淘汰、pending 額度即刻釋放。in-flight（running/interactive）命令不重複
+        標記，留給 worker 以真實結果終結。回傳被 flush 的筆數。
+        """
+        now = now_iso()
+        flushed = 0
+        with self._lock:
+            for rec in self._commands.values():
+                if rec.get("session_id") != session_id:
+                    continue
+                if rec.get("done_at") is not None or rec.get("status") != "accepted":
+                    continue
+                rec["status"] = "error"
+                rec["error_code"] = error_code
+                rec["done_at"] = now
+                flushed += 1
+            if flushed:
+                self._evict_commands_locked()  # 終結即收斂 history，不必等下一次 submit
+        return flushed
 
     def submit(
         self,
@@ -213,7 +241,9 @@ class CommandArbiter:
                 rec = self._commands.get(item.cmd_id)
                 if rec is None:
                     continue
-                if rec.get("status") == "canceled":
+                if rec.get("status") == "canceled" or rec.get("done_at"):
+                    # 已被 cancel 或已被 flush 終結（#128）的記錄：跳過，不得重設 running
+                    # 或執行 send_cb（防 flush 與取件之間的 race 把終端態覆寫回進行中）。
                     continue
                 rec["status"] = "running"
                 rec["started_at"] = now_iso()

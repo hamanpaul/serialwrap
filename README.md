@@ -293,6 +293,15 @@ serialwrap session recover --selector COM0
 characters for a `READY` shell, and finally reattaches when the bridge is gone
 but the device remains present.
 
+When recovery demotes a session out of `READY` (or the session re-attaches),
+queued commands that have not started yet are terminated with `status=error`
+and `error_code: FLUSHED_BY_RECOVERY` (#128). Such a command was never sent to
+the UART — resubmit it once the session is back to `READY`. The in-flight
+command keeps running and is finalized by the worker with its real result.
+Flushing also releases the per-session pending quota immediately, so stale
+queue entries can no longer pin the session at `SESSION_QUEUE_FULL` until a
+daemon restart.
+
 ### Logs and Evidence
 
 Default output paths:
@@ -1140,6 +1149,8 @@ recover 行為分成三種：
 3. bridge 已不存在但裝置還在：直接 reattach
 
 若 `READY` 路徑中的 `Ctrl-C` / `Ctrl-D` 都救不回 prompt，session 會降級成 `ATTACHED`，保留 bridge 與 console，交由 human/minicom 接手。
+
+recovery 把 session 降出 `READY`（或 session 重新 attach）時，佇列中**尚未啟動**的命令會以 `status=error`、`error_code: FLUSHED_BY_RECOVERY` 終結（#128）。此類命令**從未送進 UART**——client 收到即代表未執行，應於 session 回 `READY` 後重送；正在執行中（in-flight）的命令不受影響，仍由 worker 以真實結果終結。flush 同時立即釋放 per-session pending 額度，stale 佇列記錄不再永久佔額度、把 session 卡死在 `SESSION_QUEUE_FULL` 直到 daemon 重啟。
 
 只有 **agent 明確送出 reboot 類指令** 時，daemon 才會進入 `RECOVERING`，並在 target 回來後自動重新 login / 回到 `READY`。
 

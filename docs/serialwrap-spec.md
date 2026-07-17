@@ -302,6 +302,16 @@ Agent 收到 sentinel 後應短暫 sleep 後重試，而非視為錯誤。
 
 這讓 caller 可以區分「命令失敗但 session 仍可用」與「session 完全失聯」。
 
+#### 佇列 flush 語意（`FLUSHED_BY_RECOVERY`，#128）
+
+session 因 recovery/re-attach 離開 `READY`（`_on_detached` → `arbiter.unregister_session`）時，該 session 的 PriorityQueue 會被丟棄；佇列中**尚未啟動**（`status=accepted`）的命令一律以終端態終結：
+
+- `status: error`
+- `error_code: FLUSHED_BY_RECOVERY`
+- `done_at` 設為 flush 當下
+
+語意：該命令**未被執行**（從未送進 UART），client 對這些 `cmd_id` 的 `command.get` 收到此終端態即應於 session 回 `READY` 後重送。in-flight（`running`/`interactive`）命令不重複標記，由 worker 以真實結果終結。flush 使記錄轉為可淘汰並即刻釋放 `CMD_PENDING_MAX` pending 額度——修掉 stale accepted 記錄永久佔額度、導致該 session 直到 daemon 重啟前一律 `SESSION_QUEUE_FULL` 的洩漏。
+
 ### 6.5 長命令 keepalive hint
 
 `command.submit` 支援選填的 `expected_duration_s` 參數，用於提示 broker 該命令預期的執行時間。機制包含：
