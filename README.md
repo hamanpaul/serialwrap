@@ -281,7 +281,9 @@ serialwrap daemon status
 Common classifications include `OK`, `DEVICE_MISSING`,
 `DEVICE_REBOUND_REQUIRED`, `BRIDGE_DOWN`, `VTTY_STALE`,
 `TARGET_UNRESPONSIVE`, `LOGIN_REQUIRED`, `ATTACHED_NOT_READY`,
-`REBOOTING`, `HUMAN_INTERACTIVE_ACTIVE`, and `PASSTHROUGH`.
+`REBOOTING`, `HUMAN_INTERACTIVE_ACTIVE`, `PASSTHROUGH`, and
+`AUTOBOOT_QUIET` (#130 — a boot quiet window is active; wait for it to
+clear or expire, don't retry in a loop).
 
 Use `recover` for unhealthy sessions:
 
@@ -342,6 +344,44 @@ for idempotent read-only methods only (`session list`, `health.*`,
 `device list`, ...); write methods are never retried automatically. Worst-case
 total wall time for a whitelisted call is roughly
 `(retries + 1) × timeout_s + sum of the (capped) backoff delays`.
+
+#### U-Boot autoboot protection (boot quiet window, #130)
+
+When a DUT reboots, any byte received during U-Boot's
+`Hit any key to stop autoboot` countdown interrupts boot and strands the board
+at the bootloader prompt (`=> `). The daemon now guards this window natively —
+no caller action required:
+
+- **Armed** the moment an agent submits a reboot-class command (before any
+  banner), and whenever RX shows a boot banner (`U-Boot` version line or the
+  autoboot countdown line — this also covers spontaneous/power-cycle reboots).
+- **Effect**: while active (180 s default), every automatic `source=system`
+  probe TX is gated — reboot recovery loop, readiness reprobe, attach probe
+  (`attach_session`'s `ATTACHED`-branch probe and `recover_session`'s
+  `ATTACHED`-branch reprobe share one probe entry point, gated at that single
+  point), the forced CTRL_C/CTRL_D keystrokes sent after a command timeout,
+  and `session self-test`'s READY-branch nonce probe (reported back as
+  classification `AUTOBOOT_QUIET`). The daemon waits passively on RX instead.
+  `session list` exposes the remaining time as `boot_quiet_remaining_s`.
+- **Released** immediately when RX matches the session's `login_regex` /
+  `prompt_regex` (boot-complete signal) — recovery resumes at once and the
+  session returns to `READY` automatically; otherwise it expires after 180 s.
+  Exception: if the matched line is itself one of the session's
+  `bootloader_prompts` (e.g. U-Boot's own `=> `), it is *not* treated as
+  boot-complete and the window stays active — a loosely written
+  `prompt_regex` (e.g. `[>#]\s*$`) would otherwise misfire on the bootloader's
+  own prompt and clear the window at the worst possible moment.
+- **Never gated**: human console bytes, interactive lease TX, and explicit
+  agent commands (once a session is `READY`). Deliberately entering the
+  bootloader (e.g. #114) still works. Known limitation: this field only gates
+  the automatic probes above — it does not demote `session.state`, so if a
+  spontaneous reboot races an in-flight agent command while the session is
+  still (nominally) `READY`, that explicit command can still hit the UART
+  during the countdown. Tracked as a follow-up (needs a dedicated state or
+  arbiter-level gate), not fixed here.
+- If a board does end up stuck in the bootloader, `prpl-template` now defines
+  `bootloader_prompts` (`=> `, `U-Boot> `), so the
+  `interactive-open --allow-attached` recovery lease can type `boot` to escape.
 
 ### Logs and Evidence
 
@@ -1152,6 +1192,7 @@ serialwrap session self-test --selector COM0
 - `REBOOTING`：agent 已送出 reboot 類指令，正在等待 target 重開機完畢後自動 relogin
 - `HUMAN_INTERACTIVE_ACTIVE`：human console 目前握有 interactive ownership，不適合 agent 干預
 - `PASSTHROUGH`：platform 設為 passthrough，session 已 ATTACHED，適合透明 bridge 模式
+- `AUTOBOOT_QUIET`（#130）：session 名義上是 `READY`，但已進入 boot quiet window（自發重開機的過渡態），不送 nonce probe；等它自己解除或過期，勿反覆呼叫
 
 ### FAQ：開機窗連不到、minicom 顯示 broker not ready
 
@@ -1220,6 +1261,18 @@ floor 誠實說明：CLI 完全無從得知 daemon 端 profile 的 `timeout_s`�
 ```
 
 `--retries N`（預設 0，行為不變）僅對**冪等唯讀方法白名單**（`session list`、`health.*`、`device list` 等查詢類）在 `TIMEOUT`／連線失敗／`EMPTY_RESPONSE` 時做指數退避重試（0.5s 起、每次 ×2、單次 delay 上限 5s）；寫入類方法（attach／recover／submit…）絕不自動重送——CLI 逾時當下 daemon 可能仍在執行，重送會重複動作。白名單呼叫最壞總耗時約為 `(retries+1) × timeout_s + 退避總和（已個別夾在 5s）`。
+
+### U-Boot autoboot 保護（boot quiet window，#130）
+
+DUT 重開機時，U-Boot 的「`Hit any key to stop autoboot`」倒數窗只要收到任何 byte 就會中斷開機、把板子卡在 bootloader prompt（`=> `）。舊版 daemon 的自動 probe（reboot recovery / readiness reprobe 送的 `\n`）必然落入這個視窗，session 從此回不到 `READY`。daemon 現在**內建 boot quiet window 保護**，呼叫端不需做任何事：
+
+- **觸發**：
+  1. agent 送出 reboot 類指令**當下**即進入 quiet window（不等 banner——真板從 shutdown 訊息到 banner 可能間隔數秒，且 U-Boot 可能吃到 banner 前緩衝的 bytes）；
+  2. RX 看到 boot banner（`U-Boot` 版本行、`Hit any key to stop autoboot` 倒數行）——涵蓋 **DUT 自行重開／斷電重開**的非計畫性情境。
+- **效果**：視窗內（預設 180s，`BOOT_QUIET_WINDOW_S`；實測目標板完整開機約 150s + 裕度）**gate 所有 `source=system` 的自動 probe TX**——reboot recovery 迴圈、readiness reprobe、attach probe（`attach_session` 的 ATTACHED 分支與 `recover_session` 的 ATTACHED 分支重探共用同一個 probe 入口，於此單點一起 gate）、命令逾時後的 CTRL_C/CTRL_D 強制按鍵、`session self-test` READY 分支的 nonce probe（回報 `AUTOBOOT_QUIET` 分類）全部改為純被動等 RX。`session list` 的 `boot_quiet_remaining_s` 欄位可觀測剩餘秒數。
+- **解除**：RX 匹配該 session 的 `login_regex` / `prompt_regex`（開機完成訊號）**即刻解除**，recovery 立即恢復探測、自動回 `READY`；否則 180s 過期自動解除。例外：若命中的尾行本身就是該 session 的 `bootloader_prompts`（如 U-Boot 自己的 `=> `），**不**視為開機完成、window 續留——避免寬鬆撰寫的 `prompt_regex`（如 `[>#]\s*$`）誤配 bootloader 自身 prompt，在板子仍卡在 bootloader 的最危險時刻誤解除。
+- **絕不 gate**：human console bytes、interactive lease TX、agent 顯式命令（session 已是 `READY` 時）。與 #114「刻意進 bootloader」的需求相容——human/lease 送鍵永遠放行。已知限制：本欄位只 gate 上述自動 probe，**不會**降級 `session.state`；若自發重開機與進行中的 agent 命令競速、session 仍（名義上）停在 `READY`，該顯式命令仍可能在倒數期間打到 UART——此為待補的 follow-up（需要新 state 或 arbiter 層 gate），本次未修。
+- 若板子仍卡在 bootloader（例如 human 手動打斷倒數），`prpl-template` 已補上 `bootloader_prompts`（`=> `、`U-Boot> `），可直接用 `interactive-open --allow-attached` 開 recovery lease 打 `boot` 脫困，不必再走 `device release` + 外部工具的迂迴流程。
 
 ## 日誌與輸出
 
@@ -1487,7 +1540,8 @@ CLI（`bind` 只改 device、`recover`/`clear` 沿用舊 profile）。在 produc
    by-id **明確綁到 `uboot-template`**（繞過 auto-detect）。
 3. **把板子弄進 U-Boot**：開 interactive lease → 送 `reboot` → 接著以 ~0.3s 間隔持續送鍵
    （space）約 30 秒，攔截「Hit any key to stop autoboot」視窗；若是 boot menu，送對應鍵
-   （例如 `0` = Exit）掉到 U-Boot console（prompt 例如 `U-Boot> `）。
+   （例如 `0` = Exit）掉到 U-Boot console（prompt 例如 `U-Boot> `）。（#130 的 boot quiet
+   window 只 gate `source=system` 的自動 probe，**不擋 interactive lease 鍵擊**，此手法不受影響。）
 4. **走完整 serialwrap 路徑驗證**：`session self-test`（期望 `OK`/`probe_ok=True`/`READY`）→
    `cmd submit --cmd 'printenv' --mode line`（期望框出 env dump）。
 5. **還原**：送 `boot` 回正常 OS → 停 throwaway daemon → `device attach --selector COMx` 收回
