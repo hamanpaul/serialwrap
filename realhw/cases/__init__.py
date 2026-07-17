@@ -11,3 +11,4 @@ from . import p1_wal  # noqa: F401
 from . import p1_restart  # noqa: F401
 from . import p1_handoff  # noqa: F401
 from . import p1_hotplug  # noqa: F401
+from . import longrun  # noqa: F401
