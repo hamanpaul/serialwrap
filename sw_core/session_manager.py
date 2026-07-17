@@ -2580,14 +2580,16 @@ class SessionManager:
                     time.sleep(min(1.0, quiet_until - now))
                     continue
                 if bridge is not None:
+                    credentials_terminal = False
                     try:
                         auth, auth_res = resolve_session_auth(session.profile)
                         if self._credentials_declared_but_unresolved(session.profile, auth_res):
-                            # 宣告帳密但解析空：recovery 不送 ensure_ready 空 probe，記終態續等逾時收尾（#140）。
+                            # 宣告帳密但解析空：recovery 不送 ensure_ready 空 probe，記終態（#140）。
                             self._emit_credentials_unresolved_warning(
                                 session_id, session.profile.com, auth_res
                             )
                             ok, err = False, ERROR_CREDENTIALS_UNRESOLVED
+                            credentials_terminal = True
                         else:
                             ok, err = ensure_ready(bridge, session.profile, auth=auth)
                     except Exception:  # noqa: BLE001 — login/probe 非預期例外不得殺死 worker（致 session 永卡 RECOVERING）（#79 STA-6）
@@ -2618,6 +2620,14 @@ class SessionManager:
                         if session is None or session.bridge is not bridge:
                             continue
                         session.last_error = err
+                    if credentials_terminal:
+                        # NIT-1（#140 review）：CREDENTIALS_UNRESOLVED 為已知終態，補帳密前
+                        # 每輪重解析都必然再命中同一 gate（僅空轉 1s + env_file stat）。既知終態
+                        # 即 break，交由迴圈後的逾時收尾把 session 收斂成 ATTACHED（last_error 已是
+                        # CREDENTIALS_UNRESOLVED，收尾的 `or RECOVERY_TIMEOUT` 不覆寫）——與空轉到
+                        # deadline 的終態完全一致，只是不再空轉。僅此終態 break；其餘 not-ok
+                        # （PROMPT_TIMEOUT 等暫時性錯誤）續迴圈重試。
+                        break
                 elif by_id and by_id in self._devices:
                     self._spawn_attach(by_id)
                 time.sleep(1.0)

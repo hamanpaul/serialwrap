@@ -7,9 +7,11 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from sw_core import constants
 from sw_core.config import SessionProfile, UartProfile
@@ -118,7 +120,10 @@ class TestCredentialsUnresolvedGate(_Base):
         session.state = "ATTACHED"
         session.bridge = bridge
 
-        result = mgr._probe_existing_bridge(session, bridge)
+        # 隔離 os.environ：resolve_session_auth 會 fallback 到 os.environ.get(user_env/pass_env)，
+        # 若測機恰有 BRCM_USER/BRCM_PASS 會使帳密解析成功（reason=ok）→ gate 不 fire → 偽失敗。
+        with mock.patch.dict(os.environ, {}, clear=True):
+            result = mgr._probe_existing_bridge(session, bridge)
 
         self.assertTrue(result.get("ok"))
         self.assertEqual(session.state, "ATTACHED")
@@ -166,8 +171,10 @@ class TestCredentialsUnresolvedGate(_Base):
         session.state = "ATTACHED"
         session.bridge = bridge
 
-        mgr._probe_existing_bridge(session, bridge)
-        mgr._probe_existing_bridge(session, bridge)  # 重入不得再寫一次
+        # 同上：隔離 os.environ，避免測機殘留 BRCM_USER/BRCM_PASS 讓 gate 不 fire。
+        with mock.patch.dict(os.environ, {}, clear=True):
+            mgr._probe_existing_bridge(session, bridge)
+            mgr._probe_existing_bridge(session, bridge)  # 重入不得再寫一次
 
         rows = mgr._wal.tail_raw(com="COM0", limit=200)
         events = [
