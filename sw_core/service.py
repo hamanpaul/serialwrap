@@ -9,7 +9,7 @@ from typing import Any
 
 import yaml
 
-from .arbiter import CommandArbiter
+from .arbiter import CMD_REJECT_BYTES, CMD_WARN_BYTES, CommandArbiter
 from .config import ProfileTemplate, SessionProfile
 from .constants import CONFIG_DIR, DEVICE_BY_ID_DIR, DEVICE_BY_PATH_DIR, EVENTS_DIR, EVENTS_RUNTIME_DIR, EVENTS_LOG_PATH, TTYMCU_PATH
 from .flash_endpoint import FlashEndpoint, detect_mcu_line, pump_endpoint_to_sink
@@ -516,6 +516,16 @@ class SerialwrapService:
                 "commands": len(self._arbiter.snapshot()),
                 "wal_path": self._wal.wal_path,
                 "mirror_path": self._wal.mirror_path,
+                # #129：暴露可查詢的命令長度上限，讓 client 執行期查詢而非硬編碼。
+                # 值直接引用 sw_core.arbiter 常數（單一事實來源）；此為 broker 對
+                # command.submit 單一 --cmd 參數的 UTF-8 位元組上限，與 target 端
+                # tty line buffer（常見 4096）的物理單行限制是兩回事。
+                "limits": {
+                    "max_submit_cmd_bytes": CMD_REJECT_BYTES,
+                    "warn_submit_cmd_bytes": CMD_WARN_BYTES,
+                    "reject_error_code": "CMD_TOO_LONG",
+                    "newline_forbidden": True,
+                },
             }
             if warnings:
                 result["warnings"] = warnings

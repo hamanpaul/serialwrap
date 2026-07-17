@@ -1,14 +1,22 @@
-"""Issue #27 — 命令換行符拒絕的單元測試。
+"""Issue #27 — 命令換行符拒絕的單元測試；Issue #129 — 上限可查詢性。
 
 驗證 CommandArbiter.submit() 在命令包含嵌入換行符時正確拒絕，
 並確認 CMD_TOO_LONG 優先於 CMD_CONTAINS_NEWLINE。
+另驗 health.status（daemon status）暴露的 limits 欄位與 arbiter 常數一致（#129），
+讓 client 執行期查詢而非硬編碼上限。
 """
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 from unittest.mock import MagicMock
 
-from sw_core.arbiter import CMD_REJECT_BYTES, CommandArbiter
+from sw_core.arbiter import CMD_REJECT_BYTES, CMD_WARN_BYTES, CommandArbiter
+
+try:
+    import state_iso  # pytest／unittest discover：tests/ 在 sys.path
+except ImportError:  # python3 -m unittest tests.test_x（repo root 跑法，#120）
+    from tests import state_iso
 
 
 class TestNewlineReject(unittest.TestCase):
@@ -55,6 +63,36 @@ class TestNewlineReject(unittest.TestCase):
         result = self._submit(long_cmd)
         self.assertFalse(result["ok"])
         self.assertEqual(result["error_code"], "CMD_TOO_LONG")
+
+
+class TestLimitsExposure(unittest.TestCase):
+    """Issue #129 — health.status（daemon status）必須暴露可查詢的命令長度上限。
+
+    limits 值直接引用 ``sw_core.arbiter`` 常數比對（單一事實來源），
+    常數若調整，本測試不需改動即自動對齊。
+    """
+
+    def setUp(self) -> None:
+        state_iso.isolate_testcase(self)  # #120 per-file 隔離（unittest 不載 conftest）
+
+    def test_health_status_exposes_limits(self) -> None:
+        """health.status 回應須含 limits 欄位，且值等於 arbiter 常數。"""
+        from sw_core.service import SerialwrapService
+
+        svc = SerialwrapService([])
+        fake = {"multi_open": False, "daemons": [], "holders": {}, "holders_status": "ok"}
+        with mock.patch("sw_core.service.detect_multi_open", return_value=fake):
+            st = svc.rpc("health.status", {})
+        self.assertTrue(st["ok"])
+        self.assertEqual(
+            st["limits"],
+            {
+                "max_submit_cmd_bytes": CMD_REJECT_BYTES,
+                "warn_submit_cmd_bytes": CMD_WARN_BYTES,
+                "reject_error_code": "CMD_TOO_LONG",
+                "newline_forbidden": True,
+            },
+        )
 
 
 if __name__ == "__main__":

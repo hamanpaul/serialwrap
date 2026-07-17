@@ -11,6 +11,7 @@ import time
 from collections.abc import Sequence
 from typing import Any
 
+from .arbiter import CMD_REJECT_BYTES, CMD_WARN_BYTES
 from .client import _af_unix_available, _parse_endpoint, rpc_call
 from .constants import (
     CONFIG_DIR,
@@ -886,9 +887,30 @@ def build_parser() -> argparse.ArgumentParser:
         description="向 session 提交命令並取回結果：line 模式看 status，background 模式用 result-tail。",
     )
     cmd_sub = p_cmd.add_subparsers(dest="cmd_cmd", required=True, metavar="<command>")
-    p_cs = cmd_sub.add_parser("submit", help="提交命令到 session（--mode line|background|interactive）")
+    p_cs = cmd_sub.add_parser(
+        "submit",
+        help="提交命令到 session（--mode line|background|interactive）",
+        description=(
+            "提交命令到 session（--mode line|background|interactive）。\n"
+            "\n"
+            "命令長度限制（--cmd 整條字串，以 UTF-8 位元組計；#129）：\n"
+            f"  - > {CMD_WARN_BYTES} bytes：接受但附 CMD_LENGTH_WARNING（過長命令可能造成 UART 緩衝溢位或 prompt timeout）\n"
+            f"  - > {CMD_REJECT_BYTES} bytes：直接拒絕（CMD_TOO_LONG）\n"
+            "  - 含 \\n 換行字元：直接拒絕（CMD_CONTAINS_NEWLINE），請拆成多次獨立提交\n"
+            "\n"
+            "broker 對命令內容不做截斷；上述為 broker 對單一 --cmd 參數的上限，\n"
+            f"target 端 tty line buffer（常見 {CMD_WARN_BYTES} bytes）才是物理單行限制。\n"
+            "上限可由 `serialwrap daemon status` 回應的 limits 欄位執行期查詢，client 不需硬編碼。"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
     p_cs.add_argument("--selector", required=True)
-    p_cs.add_argument("--cmd", dest="command_text", default="")
+    p_cs.add_argument(
+        "--cmd",
+        dest="command_text",
+        default="",
+        help=f"要執行的單行命令（UTF-8 > {CMD_WARN_BYTES} bytes warning、> {CMD_REJECT_BYTES} bytes 拒絕，詳見上方說明）",
+    )
     p_cs.add_argument("--source", default="agent")
     p_cs.add_argument("--mode", default="line")
     p_cs.add_argument("--priority", type=int, default=10)

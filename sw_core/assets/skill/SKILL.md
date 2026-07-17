@@ -132,7 +132,7 @@ serialwrap file pull --selector COM0 --remote /etc/config/wireless --local ./wir
 
 ## 短命令原則（Best Practice）
 - **避免 heredoc**：heredoc 經 UART 傳輸時容易遺失字元或打亂 prompt，改用 `echo ... > file` 分步寫入。
-- **單行盡量短**：每條命令控制在 2 KB 以內；> 4 KB 會 warning、> 16 KB 會被 reject（`CMD_TOO_LONG`）。命令不得含 `\n` 換行字元，否則回 `CMD_CONTAINS_NEWLINE`。
+- **單行盡量短**：每條命令控制在 2 KB 以內；UTF-8 位元組 > 4 KB 會 warning、> 16 KB 會被 reject（`CMD_TOO_LONG`）。命令不得含 `\n` 換行字元，否則回 `CMD_CONTAINS_NEWLINE`。broker 不截斷；但 broker 上限與 target 端 tty line buffer（常見 4096 bytes）的物理單行限制是兩回事，過長單行仍可能在 target 端被截斷。上限可由 `serialwrap daemon status` 的 `limits` 欄位執行期查詢，不需硬編碼。
 - **避免 base64 inline**：不要將整個檔案 base64 編碼塞進 `cmd submit`，改用 `serialwrap file push`。
 - **長命令拆分**：管線命令過長時，先寫成 script 檔再 `source` 或 `sh /tmp/script.sh`。
 - **長命令 keepalive**：長時間命令加 `--expected-duration <秒>`，broker 在此期間暫停 prompt timeout 並監控 RX 活動延長等待，避免誤判 PROMPT_TIMEOUT。

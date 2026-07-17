@@ -226,7 +226,9 @@ sequenceDiagram
 #### 命令限制
 
 - 命令字串不得含有 `\n` 換行字元。`arbiter.submit()` 會在入口檢查，若偵測到換行則拒絕並回傳 `error_code: CMD_CONTAINS_NEWLINE`。
-- 命令長度 > 4 KB 回 warning，> 16 KB 拒絕（`CMD_TOO_LONG`）。
+- 命令長度（UTF-8 位元組）> 4 KB 回 warning（`CMD_LENGTH_WARNING`），> 16 KB 拒絕（`CMD_TOO_LONG`）。broker 對接受的命令**不做截斷**，全量寫出到 UART。
+- 上述為 **broker 對單一 command 參數的上限**；**target 端 tty line buffer（常見 4096 bytes）的物理單行限制**是另一回事——即使 broker 接受，過長單行仍可能在 target 端被截斷，兩者需分開考量。
+- 上限可執行期查詢（#129）：`health.status`（CLI `serialwrap daemon status`）回應的 `limits` 欄位——`max_submit_cmd_bytes`（硬上限）、`warn_submit_cmd_bytes`（軟上限）、`reject_error_code`、`newline_forbidden`——值直接引用 `sw_core/arbiter.py` 常數（單一事實來源），client 不需硬編碼。
 - 長命令建議拆分為多步驟或使用 `file.push` 傳輸 script 後在 target 執行。
 
 ### 6.2 background
