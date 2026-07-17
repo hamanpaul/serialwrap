@@ -297,12 +297,23 @@ but the device remains present.
 
 Callers must handle RPC timeouts themselves — a CLI `TIMEOUT` only means the
 CLI stopped waiting; the daemon-side operation may still complete successfully
-afterwards. `session attach`, `session recover`, and `session self-test` are
-long operations executed synchronously on the daemon side: when `--timeout` is
-not given, the CLI automatically applies a wider floor (≥ 30 s, derived from
-the recover-path cost — Ctrl-C 2 s + Ctrl-D 2 s + force polling 10 s +
-attach/probe margin) instead of the general 5 s default. An explicit
-`--timeout` always wins.
+afterwards. `session attach`, `session recover`, `session self-test`, and
+`session console-attach` (its recover-upgrade branch can run synchronously for
+tens of seconds) are long operations executed synchronously on the daemon
+side: when `--timeout` is not given, the CLI automatically applies a fixed
+45 s floor instead of the general 5 s default. An explicit `--timeout` always
+wins.
+
+Honest note on that floor: the CLI cannot know the daemon-side profile's
+`timeout_s` (some platforms, e.g. `bcm`, set 15 s+ with multi-stage
+login/ready probing), which is what actually drives how long these operations
+take — so 45 s is a generous constant, not a value derived from any
+per-call parameter. (An earlier version tried to scale the floor with the
+CLI-side `recover_timeout_s`/`probe_timeout_s` flags, but the daemon caps
+those at 2 s internally, so values above that had no effect — that derivation
+was retracted.) If an operation still times out, check the `TIMEOUT` error's
+`daemon_reachable`/`daemon_busy` fields (below) and `session list` to see
+whether the daemon is still working on it.
 
 `TIMEOUT` errors now include `daemon_reachable` (from a fresh 1 s
 `health.ping` probe) and, when reachable, a `daemon_busy` context
@@ -311,9 +322,11 @@ dead or disconnected daemon apart from a healthy daemon still working on a
 long operation.
 
 `--retries N` (default 0) enables exponential-backoff retries (0.5 s base,
-×2) on `TIMEOUT`/connect failure for idempotent read-only methods only
-(`session list`, `health.*`, `device list`, ...); write methods are never
-retried automatically.
+×2, capped at 5 s per delay) on `TIMEOUT`/connect failure/`EMPTY_RESPONSE`
+for idempotent read-only methods only (`session list`, `health.*`,
+`device list`, ...); write methods are never retried automatically. Worst-case
+total wall time for a whitelisted call is roughly
+`(retries + 1) × timeout_s + sum of the (capped) backoff delays`.
 
 ### Logs and Evidence
 
@@ -1167,7 +1180,9 @@ recover 行為分成三種：
 
 ### Timeout 語意（#123）
 
-呼叫端必須自行處理 RPC timeout——CLI 回 `TIMEOUT` 只代表「CLI 不再等待」，daemon 端操作可能仍在執行、稍後成功。`session attach`／`session recover`／`session self-test` 屬 daemon 端同步執行的**長操作**：未指定 `--timeout` 時，CLI 對這三個方法自動採較寬 floor（≥ 30 秒；由 recover 路徑成本推導——Ctrl-C 等待 2s + Ctrl-D 等待 2s + force 硬輪詢 10s + attach/probe 裕度），而非一般方法的預設 5 秒。顯式指定 `--timeout` 時一律照用。
+呼叫端必須自行處理 RPC timeout——CLI 回 `TIMEOUT` 只代表「CLI 不再等待」，daemon 端操作可能仍在執行、稍後成功。`session attach`／`session recover`／`session self-test`／`session console-attach`（recover 升級分支可同步跑數十秒）屬 daemon 端同步執行的**長操作**：未指定 `--timeout` 時，CLI 對這四個方法自動採固定 45 秒 floor，而非一般方法的預設 5 秒。顯式指定 `--timeout` 時一律照用。
+
+floor 誠實說明：CLI 完全無從得知 daemon 端 profile 的 `timeout_s`（部分平台如 `bcm` 常設 15 秒以上、且可能多階段 login/ready probe）——真正拉長 daemon 端執行時間的其實是這個值，45 秒只是一個寬鬆常數，不是依任何單次呼叫的參數精算出來的上界。（初版曾試著讓 floor 隨 CLI 端 `recover_timeout_s`／`probe_timeout_s` 縮放，但 daemon 端對這兩個參數皆有 2 秒 cap、超過就無作用，該推導已撤回。）若操作仍逾時，可用下方 `TIMEOUT` 錯誤附帶的 `daemon_reachable`／`daemon_busy` 欄位與 `session list` 確認 daemon 是否仍在執行。
 
 `TIMEOUT` 錯誤 JSON 現在附帶 `daemon_reachable`（以新連線做 1 秒 `health.ping` 探測），可達時再附 `daemon_busy` 上下文（`health.status` 的 `commands`／`sessions` 計數），供呼叫端分辨「device 斷線／daemon 死亡」與「daemon 忙碌、長操作仍在跑」：
 
@@ -1175,7 +1190,7 @@ recover 行為分成三種：
 {"daemon_busy":{"commands":3,"sessions":2},"daemon_reachable":true,"error_code":"TIMEOUT","ok":false}
 ```
 
-`--retries N`（預設 0，行為不變）僅對**冪等唯讀方法白名單**（`session list`、`health.*`、`device list` 等查詢類）在 `TIMEOUT`／連線失敗時做指數退避重試（0.5s 起、每次 ×2）；寫入類方法（attach／recover／submit…）絕不自動重送——CLI 逾時當下 daemon 可能仍在執行，重送會重複動作。
+`--retries N`（預設 0，行為不變）僅對**冪等唯讀方法白名單**（`session list`、`health.*`、`device list` 等查詢類）在 `TIMEOUT`／連線失敗／`EMPTY_RESPONSE` 時做指數退避重試（0.5s 起、每次 ×2、單次 delay 上限 5s）；寫入類方法（attach／recover／submit…）絕不自動重送——CLI 逾時當下 daemon 可能仍在執行，重送會重複動作。白名單呼叫最壞總耗時約為 `(retries+1) × timeout_s + 退避總和（已個別夾在 5s）`。
 
 ## 日誌與輸出
 
@@ -1667,8 +1682,8 @@ options:
   --version            顯示版本後離開
   --socket SOCKET      本機 daemon 的 Unix socket 路徑（未指定時依 config.yaml 與 XDG 執行期目錄解析，可用 SERIALWRAP_RUN_DIR 覆寫）
   --endpoint ENDPOINT  遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）
-  --timeout TIMEOUT_S  RPC timeout 秒數（未指定：一般方法 5.0；長操作 session attach/recover/self-test 自動採 ≥30 的較寬 floor，#123）
-  --retries RETRIES    TIMEOUT／連線失敗時的重試次數，僅作用於冪等唯讀方法白名單（指數退避 0.5s 起；預設: 0）
+  --timeout TIMEOUT_S  RPC timeout 秒數（未指定：一般方法 5.0；長操作 session attach/recover/self-test/console-attach 自動採固定 45.0 的 floor，#123）
+  --retries RETRIES    TIMEOUT／連線失敗時的重試次數，僅作用於冪等唯讀方法白名單（指數退避 0.5s 起、單次上限 5s；預設: 0）
 
 command groups:
   <group>
