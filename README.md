@@ -310,6 +310,31 @@ hot unplug, re-attach — terminate not-yet-started commands with
 the same semantics: the command was never executed and can be resubmitted once
 the session is `READY` again.
 
+#### Credential resolution (`CREDENTIALS_UNRESOLVED`, #140)
+
+When a profile declares a credential source (`user_env`, `pass_env`, or
+`env_file`) but resolution yields empty credentials — the `env_file` is
+missing/unreadable/missing the key, and `os.environ` does not fill the gap —
+the daemon no longer sends empty strings at the `Login:`/`Password:` prompt in a
+silent `Login incorrect` loop. Instead the session enters the terminal
+`last_error=CREDENTIALS_UNRESOLVED` state (distinct from `LOGIN_REQUIRED`, which
+means the board simply awaits a manual login), does **not** auto-reprobe, and
+emits a one-time log + WAL warning naming the **actual resolved absolute
+`env_file` path** and the reason (`env_file_missing` / `env_file_unreadable` /
+`key_absent`) — never the credential values. Profiles that declare no credential
+source (passwordless/auto-login) are unaffected.
+
+Key gotcha — where the file must live: a relative `env_file` in a profile YAML
+resolves against the **daemon's profile directory**, not your XDG
+`~/.config/serialwrap/profiles/`. For a systemd-system install that directory is
+`/etc/serialwrap/profiles/`; for a pipx/XDG install it is
+`~/.config/serialwrap/profiles/`. The warning's absolute path shows exactly
+where the daemon looked — put the credential file there. Recovery: add the
+credentials at the correct path, then re-run `serialwrap session attach` (or
+`session recover`) to re-resolve — this is a terminal state that never retries
+on its own, so a manual attach/recover (or a daemon restart, which re-reads
+`env_file`) is required.
+
 #### Timeout semantics (#123)
 
 Callers must handle RPC timeouts themselves — a CLI `TIMEOUT` only means the
@@ -382,6 +407,17 @@ no caller action required:
 - If a board does end up stuck in the bootloader, `prpl-template` now defines
   `bootloader_prompts` (`=> `, `U-Boot> `), so the
   `interactive-open --allow-attached` recovery lease can type `boot` to escape.
+  With #114 that same lease can also be opened **during the autoboot countdown
+  itself**: when the session is `ATTACHED` and the RX tail shows a boot banner
+  (`Hit any key to stop autoboot` / a `U-Boot` version line) rather than a
+  settled `bootloader_prompts` line, `interactive-open --allow-attached` still
+  grants the recovery lease and marks the response `boot_interrupt: true`. An
+  agent that flashed bad firmware — and would otherwise watch the board autoboot
+  the broken image — can grab this window, hammer keys via `interactive-send` to
+  stop autoboot at `=> `, then drive U-Boot to reflash. The lease's TX is never
+  gated by the boot quiet window (#130), so keystrokes land during the
+  countdown. A plain bootloader-prompt hit omits `boot_interrupt` (additive,
+  backward compatible).
 
 ### Logs and Evidence
 
@@ -1057,6 +1093,8 @@ serialwrap session interactive-close --interactive-id <iid>
 
 成功回傳 `recovery_mode: true`。若 session 已有 human interactive lease，daemon 會自動暫停並在 close 後恢復。
 
+**autoboot 倒數窗中斷（#114）**：`--allow-attached` 的授予條件已擴充——除了板子已停在 bootloader prompt（`=> `／`U-Boot> `）外，當 session 為 `ATTACHED`、RX tail 尚未出現 `bootloader_prompts` 命中但命中 boot banner（`Hit any key to stop autoboot` 倒數行／`U-Boot` 版本行，複用 #130 `detect_boot_banner` 單一事實來源）時，也會授予 recovery lease，並在回應多帶 `boot_interrupt: true`。用途：agent 燒壞 fw 後，若板子會 autoboot 載入壞 image，可在倒數窗搶開 lease → 以 `interactive-send` 連打按鍵中斷 autoboot 停在 `=> ` → 再逐字驅動 U-Boot 重燒 fw。此 lease 的 TX **不受** #130 boot quiet window gate（human/lease 送鍵永不 gate），故倒數窗內連打按鍵有效。bootloader prompt 命中的既有路徑回應**不含** `boot_interrupt`（additive、向後相容）。
+
 ## 檔案傳輸
 
 內建 `file push` / `file pull` 透過 UART base64 分段傳輸檔案，取代不可靠的 inline base64 / heredoc workaround。
@@ -1193,6 +1231,12 @@ serialwrap session self-test --selector COM0
 - `HUMAN_INTERACTIVE_ACTIVE`：human console 目前握有 interactive ownership，不適合 agent 干預
 - `PASSTHROUGH`：platform 設為 passthrough，session 已 ATTACHED，適合透明 bridge 模式
 - `AUTOBOOT_QUIET`（#130）：session 名義上是 `READY`，但已進入 boot quiet window（自發重開機的過渡態），不送 nonce probe；等它自己解除或過期，勿反覆呼叫
+
+### 帳密解析終態 `CREDENTIALS_UNRESOLVED`（#140）
+
+當 profile **宣告了帳密來源**（`user_env`／`pass_env`／`env_file` 任一）但解析為空——`env_file` 缺失／不可讀／缺 key，且 `os.environ` 也沒補齊——daemon **不再**對 `Login:`／`Password:` 送空字串、陷入靜默的 `Login incorrect` 迴圈。改為：session 進入終態 `last_error=CREDENTIALS_UNRESOLVED`（與「板子只是尚未手動登入」的 `LOGIN_REQUIRED` 明確區分）、**不自動重探**，並輸出一次性 log + WAL 警告，內含 **env_file 實際解析的絕對路徑**與原因（`env_file_missing`／`env_file_unreadable`／`key_absent`），**絕不含帳密值**。未宣告帳密來源（passwordless／auto-login）者行為完全不變。
+
+**關鍵排查點——帳密檔要放哪**：profile YAML 內的**相對** `env_file` 是**相對 daemon 的 profile-dir** 解析，**不是**你的 XDG `~/.config/serialwrap/profiles/`。systemd-system 安裝的 profile-dir 為 `/etc/serialwrap/profiles/`；pipx/XDG 安裝才是 `~/.config/serialwrap/profiles/`。警告訊息印出的絕對路徑就是 daemon 實際查找的位置——把帳密檔放到那裡。**恢復**：把帳密補到正確路徑後，手動 `serialwrap session attach`（或 `session recover`）重新解析即可；daemon 重啟後也會重讀 `env_file`。此為明確終態、不會自動重試（避免反覆送空帳密），故補帳密後**必須**手動 attach/recover 或重啟 daemon 才會重試。
 
 ### FAQ：開機窗連不到、minicom 顯示 broker not ready
 

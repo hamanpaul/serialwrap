@@ -280,6 +280,8 @@ Agent 收到 sentinel 後應短暫 sleep 後重試，而非視為錯誤。
 
 > bootloader recovery lease（`allow_attached=True`）、recovery lease 的 stash/restore、`MAX_RECOVERY_LEASE_S` clamp、`recovery_mode` 欄位語意、idle human lease soft-preempt 與 orphan console liveness 等逐項行為，canonical 規格見 [`openspec/specs/session-interactive/spec.md`](../openspec/specs/session-interactive/spec.md)（#53）。本概覽不再追蹤這些細節。
 
+> **#114 續補（autoboot 倒數窗）**：`allow_attached=True` 的授予條件除既有 bootloader prompt 命中（`ATTACHED` 且 RX tail 末行匹配 `bootloader_prompts`）外，擴充至 RX tail 命中 boot banner（`detect_boot_banner`，比對 `BOOT_BANNER_PATTERNS`＝autoboot 倒數行／`U-Boot` 版本行，複用 #130 單一事實來源）——即 autoboot 倒數當下。此情境同樣授予 recovery lease（`recovery_mode=True`），並於回應標 `boot_interrupt: true`（bootloader prompt 命中則省略此欄位，additive、向後相容），供呼叫端於倒數窗連打按鍵中斷 autoboot 進 `=>`。此 lease 的 TX 不受 #130 boot quiet window gate。詳見 canonical 規格 [`openspec/specs/session-interactive/spec.md`](../openspec/specs/session-interactive/spec.md)。
+
 ### 6.4 recover
 
 適用：
@@ -472,7 +474,7 @@ DUT 重開機時，U-Boot autoboot 倒數窗（`Hit any key to stop autoboot`）
 
 **觀測**：session 公開欄位 `boot_quiet_remaining_s`（剩餘秒數；`null`＝未啟用/已解除）。
 
-另 `prpl-template` 資產已定義 `bootloader_prompts`（`^=> $`、`^U-Boot> $`），卡 bootloader 時 `interactive-open --allow-attached` 的 recovery lease 可匹配進入。
+另 `prpl-template` 資產已定義 `bootloader_prompts`（`^=> $`、`^U-Boot> $`），卡 bootloader 時 `interactive-open --allow-attached` 的 recovery lease 可匹配進入。#114 進一步讓同一 lease 可在 **autoboot 倒數當下**開啟（RX tail 命中 boot banner 而尚未停在 `bootloader_prompts` 時，`interactive-open --allow-attached` 授予 lease 並回 `boot_interrupt: true`）：lease TX 不受本節 quiet window gate（human/lease 送鍵永不 gate），agent 可於倒數窗連打按鍵刻意中斷 autoboot 停在 `=>`。見 §6.3 與 [`openspec/specs/session-interactive/spec.md`](../openspec/specs/session-interactive/spec.md)。
 
 ## 10. Logging 與輸出層
 
@@ -706,7 +708,9 @@ targets:
 
 ### 13.3 Platform 行為
 
-**`platform=shell`**：generic Linux login。可使用 `user_env` / `pass_env` 做帳密。帳密解析採用 **per-session 隔離**：在每次 session attach 時，`sw_core/auth.py` 的 `resolve_session_auth()` 會從 `env_file` 解析帳密（純 Python 解析，不 fork shell），不同 COM / template 可用不同的 `env_file` 指向不同帳密。查找順序為：`env_file` 內的 key → `os.environ` fallback → `username` 欄位。相對路徑會以該 YAML 所在目錄解析。若 profile 沒有宣告 `env_file`，帳密仍從 daemon 的 `os.environ` 讀取（向後相容）。若裝置 login prompt 會帶 hostname（例如 `orangepi3 login:`），建議 `login_regex` 使用 `(?mi)^.*login:\\s*$`。若裝置已自動登入並直接出現 prompt，daemon 會略過 login 流程，直接做 `ready_probe`。
+**`platform=shell`**：generic Linux login。可使用 `user_env` / `pass_env` 做帳密。帳密解析採用 **per-session 隔離**：在每次 session attach 時，`sw_core/auth.py` 的 `resolve_session_auth()` 會從 `env_file` 解析帳密（純 Python 解析，不 fork shell），不同 COM / template 可用不同的 `env_file` 指向不同帳密。查找順序為：`env_file` 內的 key → `os.environ` fallback → `username` 欄位。相對路徑會以該 YAML 所在目錄（即 daemon 的 profile-dir，systemd-system 為 `/etc/serialwrap/profiles/`、pipx/XDG 為 `~/.config/serialwrap/profiles/`）解析。若 profile 沒有宣告 `env_file`，帳密仍從 daemon 的 `os.environ` 讀取（向後相容）。若裝置 login prompt 會帶 hostname（例如 `orangepi3 login:`），建議 `login_regex` 使用 `(?mi)^.*login:\\s*$`。若裝置已自動登入並直接出現 prompt，daemon 會略過 login 流程，直接做 `ready_probe`。
+
+**帳密解析狀態與 `CREDENTIALS_UNRESOLVED` 終態（#140）**：`resolve_session_auth()` 除回傳 `SessionAuth` 外，另回一個 `AuthResolution`，其 `reason` 為 `ok` / `env_file_missing` / `env_file_unreadable` / `key_absent` / `not_configured` 之一，並帶「實際解析到的 env_file 絕對路徑」。只要 `username`／`password` 皆非空即為 `ok`（即使 env_file 缺失、只要 `os.environ` 補齊亦然，避免誤擋可用帳密）。當 profile **宣告了帳密來源**（`user_env`／`pass_env`／`env_file` 任一）但 `reason` 非 `ok`（帳密為空）時，login 流程 **不對** `Login:`／`Password:` 送空字串，session 標 `last_error=CREDENTIALS_UNRESOLVED`（與「板子尚未到 login prompt」的 `LOGIN_REQUIRED` 區分），且此為明確終態——自動 reprobe 不再反覆送空帳密，需操作者補帳密後手動 `session attach`／`recover`（或重啟 daemon 重讀 env_file）才重試。進入此態時 daemon 輸出一次 log + WAL 警告（去重），內含 env_file 實際解析絕對路徑與 `reason`，**絕不含帳密值**。profile **未宣告**帳密來源（`not_configured`）者行為完全不變（既有 passwordless/auto-login 路徑不受影響）。
 
 **`platform=bcm`**：Broadcom 原生平台（如 BCM968575）。登入後 target 進入 BCM CLI shell（`>`），需再執行 `post_login_cmd`（通常是 `sh`）才進到 Linux shell（`#`）。`timeout_s` 建議加大（15s+），因 Broadcom 登入流程較慢。
 

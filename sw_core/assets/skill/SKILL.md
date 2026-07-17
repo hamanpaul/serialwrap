@@ -66,11 +66,13 @@ serialwrap 另提供原生 MCU flash 端點（與上面 device handoff 互補）
 - `session interactive-open` 在 READY 路徑遇到既有 human lease 但 `human_active=False` 時，會把 human **soft-preempt 降級**（console 不中斷、其鍵入進 deferred buffer），agent 取得控制權並回 `soft_preempted`；agent `interactive-close` 後還原 human lease 並**回放** deferred buffer。human 仍 active 或既有為 agent lease 則維持 `SESSION_INTERACTIVE_BUSY`。
 - 解決孤兒 minicom 假性佔用 console 導致 co-work 卡住的問題：死孤兒（console peer 已關）由 self-test 時 detach；活著但 idle 的 console 只降級、不自動 detach（清理交由 agent 主動 `session recover` / `session console-detach`）。
 - bootloader recovery（#44）：板子掉進 bootloader 時 session 為 `ATTACHED`，可用 `serialwrap session interactive-open --selector COM0 --allow-attached`（需通過 bootloader prompt 比對）開 recovery lease；READY 下此 flag 無作用。
+- bootloader recovery 於 **autoboot 倒數窗**（#114）：`--allow-attached` 的授予條件已擴充——除板子已停在 bootloader prompt（`=> `／`U-Boot> `）外，session 為 `ATTACHED` 且 RX tail 命中 boot banner（`Hit any key to stop autoboot` 倒數行／`U-Boot` 版本行）時也授予 lease，回應多帶 `boot_interrupt: true`。**用途（agent 自救壞 fw）**：燒壞 fw 後若板子會 autoboot 載入壞 image，在倒數窗 `interactive-open --allow-attached` 搶開 lease → 以 `interactive-send` 連打按鍵（如 space）中斷 autoboot 停在 `=> ` → 再逐字驅動 U-Boot 重燒。lease TX 不受 #130 boot quiet window gate，倒數窗內連打按鍵有效。
 
 ## FAQ：開機窗連不到 / broker not ready（#69）
 - 先跑 `serialwrap session self-test --selector COM0` 與 `serialwrap session list`，看 `classification`、`state`、`last_error`、`reprobe_attempts`、`reprobe_exhausted`。
 - `ATTACHED_NOT_READY` + `last_error=PROMPT_UNAVAILABLE` / `PROMPT_TIMEOUT`：通常是 attach 撞 DUT 開機窗、prompt 尚未出現；daemon 會等 RX 閒置後自動重探，成功會回 `READY`。
 - `BRIDGE_DOWN` + `DETACHED` + `*_PROMPT_TIMEOUT`：若 device 還在位，daemon 會重新走 attach/probe 路徑。
+- `last_error=CREDENTIALS_UNRESOLVED`（#140）：profile 宣告了帳密來源（`user_env`／`pass_env`／`env_file`）但解析為空（env_file 缺失／不可讀／缺 key）。這是**終態、不自動重探**——daemon 刻意不再對 login prompt 送空帳密，故反覆 `session recover` 不會成功。**排查**：profile YAML 內的相對 `env_file` 相對 **daemon profile-dir** 解析（systemd-system＝`/etc/serialwrap/profiles/`、pipx/XDG＝`~/.config/serialwrap/profiles/`），**不是** shell CWD 或你的 XDG config——log/WAL 警告會印出實際解析的絕對路徑與原因（不含帳密值）。把帳密檔補到該路徑後，手動 `serialwrap session attach`／`recover`（或重啟 daemon）即重試。
 - `minicom_router.sh` 會提示「DUT 可能仍在開機、serialwrap 正在自動重探」；需要阻塞等 READY 時可設 `MINICOM_WAIT_READY=1`。
 - 若 `reprobe_exhausted=true` 或等待過久仍未 READY，再手動 `serialwrap session recover --selector COM0`（必要時 `--force`）。
 - 懷疑 RX 掉字／狀態被污染：可能是同機多開（two-reader）。`serialwrap daemon status` 的 `multi_open`／`foreign_holders` 欄位與 `serialwrap doctor` 的 `single_daemon` 檢查會掃 `/proc` 報出其他 `serialwrapd` 與 tty 持有者（#101，純偵測）。勿用 `serialwrap daemon start`（systemd 模式會另起非託管 daemon 造成 two-reader）；生命週期用 `serialwrap service ...`。
@@ -85,6 +87,7 @@ serialwrap 另提供原生 MCU flash 端點（與上面 device handoff 互補）
 - 對 DUT 下 `reboot` 後 session 停在 `RECOVERING`／`ATTACHED`、且 `session list` 的 `boot_quiet_remaining_s` 有值：**這是正常的 autoboot 保護**，daemon 正在靜默等 DUT 開機（避免自動 probe 打斷 U-Boot autoboot 倒數把板子卡在 `=> `）。**等它自己回 `READY`**（RX 見 login/prompt 即解除、最長 180s），勿反覆下 `session recover`——反覆下也一樣會被 gate 擋下（見下一點），不會提早成功，只會浪費時間。
 - 保護 gate 所有自動 probe/按鍵，**含手動觸發的 RPC**：`session attach`、`session recover`（兩者共用同一個 probe 入口）、`session self-test`（回報 `classification: "AUTOBOOT_QUIET"`）、命令逾時後的強制恢復按鍵，在 quiet window 內都會誠實回報「還在等」而不會送 bytes 進 UART。只有 human console bytes、interactive lease TX、agent 顯式命令（session 已 `READY` 時）不受影響——刻意要進 bootloader（先送 reboot 再於 lease 連打按鍵）仍可行。
 - 若板子已卡在 bootloader prompt（`=> `／`U-Boot> `）：prpl-template 有 `bootloader_prompts`，用 `serialwrap session interactive-open --selector COM0 --allow-attached` 開 recovery lease 打 `boot` 脫困。
+- 若板子會 autoboot 載入壞 image、想**刻意中斷** autoboot（#114）：不必等它停在 `=> `——在倒數窗（RX 見 `Hit any key to stop autoboot`／`U-Boot` banner）即可 `serialwrap session interactive-open --selector COM0 --allow-attached` 搶開 lease（回應帶 `boot_interrupt: true`），再以 `interactive-send` 連打按鍵中斷 autoboot 停在 `=> ` 後救 fw。lease 送鍵不受 boot quiet window gate。
 
 ## Remote Support 用法（ssh-tunnel）
 當 Agent 不在 target 所在機器上，而要從遠端 debug UART 時，走 **remote endpoint** 模式。
