@@ -495,6 +495,60 @@ class TestInteractiveOpenAllowAttached(unittest.TestCase):
         self.assertEqual(resp["error_code"], "SESSION_NOT_READY")
         self.assertEqual(resp.get("error_detail"), "NOT_BOOTLOADER")
 
+    # ── 3b: autoboot 倒數窗 banner 授予（#114）─────────────────────────
+
+    def test_allow_attached_opens_lease_on_autoboot_countdown(self) -> None:
+        """ATTACHED + rx_tail 含 autoboot 倒數行但不匹配 bootloader_prompts →
+        依 detect_boot_banner 授予 recovery lease，回應標 boot_interrupt=True。"""
+        mgr, session, bridge = self._make_mgr_attached(
+            bootloader_prompts=(r"^=> ",),
+            rx_tail_str="Hit any key to stop autoboot:  2 ",
+        )
+        resp = mgr.interactive_open("COM0", owner="agent:test", allow_attached=True)
+        self.assertTrue(resp["ok"])
+        self.assertIs(resp.get("boot_interrupt"), True)
+        self.assertTrue(resp["recovery_mode"])
+        lease = mgr._interactive[resp["interactive_id"]]
+        self.assertTrue(lease.recovery_mode)
+
+    def test_allow_attached_bootloader_prompt_no_boot_interrupt(self) -> None:
+        """ATTACHED + rx_tail 末行匹配 bootloader_prompts（=> ）→ 授予 recovery
+        lease，但回應不含（或非 True）boot_interrupt。"""
+        mgr, session, bridge = self._make_mgr_attached(
+            bootloader_prompts=(r"^=> ",),
+            rx_tail_str="boot output\n=> ",
+        )
+        resp = mgr.interactive_open("COM0", owner="agent:test", allow_attached=True)
+        self.assertTrue(resp["ok"])
+        self.assertIsNot(resp.get("boot_interrupt"), True)
+        self.assertTrue(resp["recovery_mode"])
+        lease = mgr._interactive[resp["interactive_id"]]
+        self.assertTrue(lease.recovery_mode)
+
+    def test_allow_attached_rejects_when_neither_prompt_nor_banner(self) -> None:
+        """ATTACHED + 一般 shell log（無 => 亦無 banner）→ NOT_BOOTLOADER。"""
+        mgr, session, bridge = self._make_mgr_attached(
+            bootloader_prompts=(r"^=> ",),
+            rx_tail_str="root@dut:~# ls\nbin  etc  usr",
+        )
+        resp = mgr.interactive_open("COM0", owner="agent:test", allow_attached=True)
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error_code"], "SESSION_NOT_READY")
+        self.assertEqual(resp.get("error_detail"), "NOT_BOOTLOADER")
+
+    def test_allow_attached_ready_state_skips_banner_check(self) -> None:
+        """READY + allow_attached=True 即使 rx_tail 含 banner 亦不檢查 banner，
+        走原 READY 路徑：recovery_mode False、無 boot_interrupt。"""
+        mgr, session, bridge = self._make_mgr_attached(
+            bootloader_prompts=(r"^=> ",),
+            rx_tail_str="Hit any key to stop autoboot:  2 ",
+        )
+        session.state = "READY"
+        resp = mgr.interactive_open("COM0", owner="agent:test", allow_attached=True)
+        self.assertTrue(resp["ok"])
+        self.assertFalse(resp.get("recovery_mode", True))
+        self.assertIsNot(resp.get("boot_interrupt"), True)
+
     # ── 4: unhealthy bridge ────────────────────────────────────────────
 
     def test_allow_attached_rejects_serial_not_alive(self) -> None:

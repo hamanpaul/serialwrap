@@ -3160,13 +3160,22 @@ class SessionManager:
                     rx_tail_raw = session.bridge.rx_tail(BOOTLOADER_RX_TAIL_BYTES)
                     rx_tail_clean = clean_text(rx_tail_raw)
                     matched = _matches_any_bootloader_prompt(rx_tail_clean, session.profile.bootloader_prompts)
+                    # #114：末行匹配 bootloader prompt（如 => ）為既有路徑；若未匹配，
+                    # 但 RX tail 命中 boot banner（U-Boot 版本行／autoboot 倒數行，複用
+                    # #130 detect_boot_banner 單一事實來源），視為 autoboot 倒數窗，同樣
+                    # 授予 recovery lease，並在回應標 boot_interrupt=True 供呼叫端連打按鍵
+                    # 中斷 autoboot。兩者皆未命中才維持 NOT_BOOTLOADER。
+                    boot_interrupt = False
                     if matched is None:
-                        return {
-                            "ok": False,
-                            "error_code": "SESSION_NOT_READY",
-                            "selector": selector,
-                            "error_detail": "NOT_BOOTLOADER",
-                        }
+                        if detect_boot_banner(rx_tail_clean):
+                            boot_interrupt = True
+                        else:
+                            return {
+                                "ok": False,
+                                "error_code": "SESSION_NOT_READY",
+                                "selector": selector,
+                                "error_detail": "NOT_BOOTLOADER",
+                            }
 
                     # 清除 expired lease（避免 BUSY 誤判）；若 close 需要 resume，
                     # 先在 lock 外完成 post-close，再重新評估是否要 stash human。
@@ -3216,6 +3225,12 @@ class SessionManager:
                                 "error_code": "SESSION_INTERACTIVE_BUSY",
                                 "interactive_session_id": session.interactive_session_id,
                             }
+
+                        # #114：banner 命中（autoboot 倒數窗）授予的 recovery lease，
+                        # 於回應標 boot_interrupt=True；bootloader prompt 命中則省略此欄位
+                        # （additive，與既有回應相容）。BUSY 路徑已提前 return，不會到此。
+                        if boot_interrupt:
+                            result["boot_interrupt"] = True
 
                 else:
                     return {"ok": False, "error_code": "SESSION_NOT_READY", "selector": selector}
