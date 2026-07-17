@@ -135,8 +135,15 @@ def test_inflight_running_command_survives_flush():
         release.set()
 
 
-# ── (d) flush 後 _evict 生效：_commands 大小受控 ──
-def test_flush_triggers_eviction_keeps_commands_bounded(monkeypatch):
+# ── (d) flush 不主動 evict：剛 flush 的記錄仍可 get 到終端態，收斂交給後續 submit ──
+def test_flush_keeps_flushed_records_gettable_then_converges(monkeypatch):
+    """flush 內不呼叫 _evict_commands_locked（#128 review F3）：_commands 超量
+    （> CMD_HISTORY_MAX）時 flush 當下 evict 可能把剛 flush 的記錄當場淘汰，
+    client 隨後 get 只拿得到 CMD_NOT_FOUND 而非 FLUSHED_BY_RECOVERY。
+
+    斷言：(1) flush 後所有被 flush 的 cmd_id 仍可 get 到 error + FLUSHED_BY_RECOVERY；
+    (2) 後續 submit 觸發的 evict 能把 _commands 收斂回上限（增長有界）。
+    """
     monkeypatch.setattr(arbiter_mod, "CMD_HISTORY_MAX", 3)
     monkeypatch.setattr(arbiter_mod, "CMD_PENDING_MAX", 100)
     release = threading.Event()
@@ -146,19 +153,102 @@ def test_flush_triggers_eviction_keeps_commands_bounded(monkeypatch):
         arb.register_session(sid)
         blk = arb.submit(session_id=sid, command="blocking", source="t", mode="fg", timeout_s=1.0)
         assert _wait_until(lambda: _status(arb, blk["cmd_id"])["status"] == "running")
+        queued_ids = []
         for i in range(10):
-            arb.submit(session_id=sid, command=f"c{i}", source="t", mode="fg", timeout_s=1.0)
+            r = arb.submit(session_id=sid, command=f"c{i}", source="t", mode="fg", timeout_s=1.0)
+            queued_ids.append(r["cmd_id"])
         with arb._lock:
-            assert len(arb._commands) == 11        # flush 前：全 pending、無一可淘汰
+            assert len(arb._commands) == 11        # 遠超 CMD_HISTORY_MAX=3：flush 當下若 evict 必淘汰
 
-        arb.unregister_session(sid)                # flush 終結 10 筆 → 立即可被 evict
+        arb.unregister_session(sid)                # flush 終結 10 筆，但不得當場 evict
 
+        # (1) 剛 flush 的記錄一律仍可 get 到終端態（不得 CMD_NOT_FOUND）
+        for cid in queued_ids:
+            rec = _status(arb, cid)
+            assert rec["status"] == "error"
+            assert rec["error_code"] == "FLUSHED_BY_RECOVERY"
+
+        # (2) 收斂交給後續 submit 的 evict：re-register + submit 後 _commands 有界
+        arb.register_session(sid)
+        nxt = arb.submit(session_id=sid, command="next", source="t", mode="fg", timeout_s=1.0)
+        assert nxt["ok"], nxt
+        assert _wait_until(lambda: _status(arb, nxt["cmd_id"])["done_at"] is not None)
         with arb._lock:
             # 已終結記錄收斂回 CMD_HISTORY_MAX 上限；僅 in-flight blocking 額外保留
-            assert sum(1 for r in arb._commands.values() if r.get("done_at")) <= 3
             assert len(arb._commands) <= 3 + 1
     finally:
         release.set()
+        arb.unregister_session(sid)
+
+
+# ── F1 epoch race 回歸：unregister 的 join 視窗內 re-register + 新 submit 不得被誤殺 ──
+def test_reregister_submit_during_unregister_join_window_not_flushed():
+    """epoch race 回歸（#128 review F1）：unregister_session 的 flush 必須與 pop queue
+    在同一把鎖內原子完成。若延後到 join(1.0) 之後才 flush（舊行為），舊 worker 卡在
+    send_cb 超過 join timeout 時，期間 re-register + 新 submit 的健康 accepted 命令
+    會被遲到的 flush 誤標 FLUSHED_BY_RECOVERY、永不執行。
+
+    重現法：blocking-old 卡住舊 worker（> join timeout）→ 背景執行 unregister →
+    等第一段鎖完成（佇列已 pop）進入 join 視窗 → re-register + 提交 blocking-new 與
+    fresh（fresh 排在 blocking-new 之後，保證跨越整個 join 視窗仍停留在 accepted）→
+    等 unregister 返回 → 斷言 fresh 未被誤殺、放行後正常執行到 done。
+    """
+    release_old = threading.Event()
+    release_new = threading.Event()
+
+    def _send(_sess, command, *_a, **_k):
+        if command == "blocking-old":
+            release_old.wait(timeout=30.0)
+        elif command == "blocking-new":
+            release_new.wait(timeout=30.0)
+        return {"ok": True, "stdout": ""}
+
+    arb = CommandArbiter(send_cb=_send)
+    sid = "s"
+    try:
+        arb.register_session(sid)
+        blk = arb.submit(session_id=sid, command="blocking-old", source="t", mode="fg", timeout_s=1.0)
+        assert _wait_until(lambda: _status(arb, blk["cmd_id"])["status"] == "running")
+        stale = arb.submit(session_id=sid, command="stale", source="t", mode="fg", timeout_s=1.0)
+        assert stale["ok"], stale
+
+        th = threading.Thread(target=arb.unregister_session, args=(sid,))
+        th.start()
+
+        # 等 unregister 第一段鎖完成（佇列已 pop）；舊 worker 仍卡 send_cb，
+        # unregister 停在 join(1.0) 視窗內。
+        def _unregistered() -> bool:
+            with arb._lock:
+                return sid not in arb._queues
+        assert _wait_until(_unregistered)
+
+        # join 視窗內 re-register + 新 submit（epoch race 的觸發序列）
+        arb.register_session(sid)
+        blk2 = arb.submit(session_id=sid, command="blocking-new", source="t", mode="fg", timeout_s=1.0)
+        assert blk2["ok"], blk2
+        fresh = arb.submit(session_id=sid, command="fresh", source="t", mode="fg", timeout_s=1.0)
+        assert fresh["ok"], fresh
+
+        th.join(timeout=10.0)          # 舊碼在此之前執行遲到 flush → 誤殺 fresh
+        assert not th.is_alive()
+
+        # stale（舊佇列上的命令）已於第一段鎖內被原子 flush
+        rec = _status(arb, stale["cmd_id"])
+        assert rec["status"] == "error"
+        assert rec["error_code"] == "FLUSHED_BY_RECOVERY"
+
+        # fresh 不得被誤標終端態；放行 blocking-new 後照常執行到 done
+        rec = _status(arb, fresh["cmd_id"])
+        assert rec["error_code"] is None, rec   # 舊碼：FLUSHED_BY_RECOVERY（誤殺）
+        release_new.set()
+        assert _wait_until(lambda: _status(arb, fresh["cmd_id"])["done_at"] is not None)
+        rec = _status(arb, fresh["cmd_id"])
+        assert rec["status"] == "done"
+        assert rec["error_code"] is None
+    finally:
+        release_old.set()
+        release_new.set()
+        arb.unregister_session(sid)
 
 
 # ── flush/consume race 防線：已終結（done_at 非 None）的取件一律跳過 ──
@@ -167,7 +257,10 @@ def test_worker_skips_already_flushed_item():
     同一筆 item 時必須跳過（不得重設 running、不得執行 send_cb）。
 
     以 flush_session() 直呼模擬（佇列不丟棄）：blocking 卡住 worker → queued 進佇列
-    → flush 終結 queued → 放行 worker → worker 取到 queued 的 item。
+    → flush 終結 queued → 在 queued 之後入列 marker（同 priority、counter 較大 →
+    PriorityQueue FIFO 保證 marker 在 queued 之後被消費）→ 放行 worker → 等 marker
+    done，即確定性證明 worker 已消化（跳過）queued 的 item——取代 sleep 的假綠風險
+    （#128 review F4）。
     """
     release = threading.Event()
     executed: list[str] = []
@@ -189,14 +282,119 @@ def test_worker_skips_already_flushed_item():
         flushed = arb.flush_session(sid)
         assert flushed == 1
 
-        release.set()  # worker 繼續 → 取到 queued 的 item → 必須跳過
-        assert _wait_until(lambda: _status(arb, blk["cmd_id"])["done_at"] is not None)
-        time.sleep(0.1)  # 給 worker 消化佇列的餘裕
+        marker = arb.submit(session_id=sid, command="marker", source="t", mode="fg", timeout_s=1.0)
+        assert marker["ok"], marker
+
+        release.set()  # worker 繼續 → 取到 queued 的 item（必須跳過）→ 再取 marker
+        assert _wait_until(lambda: _status(arb, marker["cmd_id"])["status"] == "done")
 
         rec = _status(arb, queued["cmd_id"])
         assert rec["status"] == "error"                     # 終端態不被 worker 覆寫回 running
         assert rec["error_code"] == "FLUSHED_BY_RECOVERY"
         assert "queued" not in executed                     # send_cb 未被執行
+        assert "marker" in executed                         # marker 已消費 → queued 必已被處理過
     finally:
         release.set()
         arb.unregister_session(sid)
+
+
+# ══ service 層釘測（#128 review F2 / F5-2）══════════════════════════════════
+# 手法沿用 tests/test_issue28_bg_lifecycle.py：mock 掉 I/O 元件（WalWriter /
+# SessionManager / DeviceWatcher），但保留**真實 CommandArbiter** 走完整 flush 路徑。
+
+def _make_mock_service():
+    """建立最小化 SerialwrapService：I/O 元件以 mock 替代、arbiter 為真實實例。"""
+    from unittest.mock import patch
+
+    from sw_core.config import SessionProfile
+
+    profiles: list[SessionProfile] = []
+    with (
+        patch("sw_core.service.WalWriter"),
+        patch("sw_core.service.SessionManager"),
+        patch("sw_core.service.DeviceWatcher"),
+    ):
+        from sw_core.service import SerialwrapService
+
+        svc = SerialwrapService(profiles)
+    return svc
+
+
+def _mock_exec(release: threading.Event):
+    """SessionManager.execute_command 替身：command == "blocking" 卡住直到 release。"""
+
+    def _exec(session_id, command, source, cmd_id, *, timeout_s, mode, expected_duration_s=None):
+        if command == "blocking":
+            release.wait(timeout=10.0)
+        return {"ok": True, "stdout": ""}
+
+    return _exec
+
+
+# ── F2：daemon shutdown（service.stop）以 FLUSHED_BY_SHUTDOWN 終結未啟動命令 ──
+def test_service_stop_flushes_with_shutdown_code():
+    """service.stop() 對每個 session 的 unregister 帶 error_code=FLUSHED_BY_SHUTDOWN
+    （#128 review F2）：與 recovery/detach 類路徑（FLUSHED_BY_RECOVERY）區隔終結碼，
+    語意相同＝命令未執行、可於 READY 後重送。
+    """
+    from unittest.mock import MagicMock
+
+    svc = _make_mock_service()
+    sid = "COM0"
+    release = threading.Event()
+    svc._sessions.execute_command = _mock_exec(release)
+    try:
+        svc._arbiter.register_session(sid)
+        blk = svc._arbiter.submit(session_id=sid, command="blocking", source="t", mode="fg", timeout_s=5.0)
+        assert _wait_until(lambda: svc._arbiter.get(blk["cmd_id"])["command"]["status"] == "running")
+        queued = svc._arbiter.submit(session_id=sid, command="queued", source="t", mode="fg", timeout_s=5.0)
+        assert queued["ok"], queued
+
+        # stop() 的其餘停機面向（engine/watcher/flash endpoint）以 mock 隔離，聚焦 arbiter 終結碼
+        svc._running = True
+        svc._engine = MagicMock()
+        svc._watcher = MagicMock()
+        svc._flash_endpoint = MagicMock()
+        svc._sessions.list_sessions = MagicMock(return_value=[{"session_id": sid}])
+        svc.stop()
+
+        rec = svc._arbiter.get(queued["cmd_id"])["command"]
+        assert rec["status"] == "error"
+        assert rec["error_code"] == "FLUSHED_BY_SHUTDOWN"   # 非 FLUSHED_BY_RECOVERY
+        assert rec["done_at"] is not None
+    finally:
+        release.set()
+
+
+# ── F5-2：bg 命令被 flush 後 result_tail 走 arbiter fallback 回 FLUSHED_BY_RECOVERY ──
+def test_result_tail_flushed_bg_falls_back_with_flushed_by_recovery():
+    """bg 命令尚未啟動即被 flush（BackgroundCapture 從未建立）時，command.result_tail
+    經 _bg_fallback_from_arbiter 合成回應：ok + status=error +
+    error_code=FLUSHED_BY_RECOVERY + 空 chunks——而非 CMD_NOT_FOUND（#128 review F5-2）。
+    """
+    from unittest.mock import MagicMock
+
+    svc = _make_mock_service()
+    sid = "COM0"
+    release = threading.Event()
+    svc._sessions.execute_command = _mock_exec(release)
+    try:
+        svc._arbiter.register_session(sid)
+        blk = svc._arbiter.submit(session_id=sid, command="blocking", source="t", mode="bg", timeout_s=5.0)
+        assert _wait_until(lambda: svc._arbiter.get(blk["cmd_id"])["command"]["status"] == "running")
+        queued = svc._arbiter.submit(session_id=sid, command="sleep 999", source="t", mode="bg", timeout_s=5.0)
+        assert queued["ok"], queued
+
+        svc._arbiter.unregister_session(sid)   # flush：queued 終結為 FLUSHED_BY_RECOVERY
+
+        # BackgroundCapture 從未建立 → SessionManager 回 CMD_NOT_FOUND → 走 arbiter fallback
+        svc._sessions.get_background_result = MagicMock(
+            return_value={"ok": False, "error_code": "CMD_NOT_FOUND", "cmd_id": queued["cmd_id"]},
+        )
+        result = svc.rpc("command.result_tail", {"cmd_id": queued["cmd_id"], "from_chunk": 0})
+        assert result["ok"], result
+        assert result["status"] == "error"
+        assert result["error_code"] == "FLUSHED_BY_RECOVERY"
+        assert result["chunks"] == []
+    finally:
+        release.set()
