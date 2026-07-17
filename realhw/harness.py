@@ -103,3 +103,48 @@ def write_reports(report_dir: Path, meta: dict[str, Any], results: list[tuple[st
     (report_dir / "report.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
     (report_dir / "report.md").write_text(render_report_md(meta, results, hints), encoding="utf-8")
+
+
+@dataclasses.dataclass
+class Ctx:
+    cfg: dict
+    report_dir: Path
+    case_dir: Path
+    sw: Any
+    tmux: Any
+    usbipd: Any
+    systemd: Any
+
+    def note(self, name: str, content: str) -> str:
+        """寫 evidence 檔，回傳相對路徑（進 CaseResult.evidence）。"""
+        self.case_dir.mkdir(parents=True, exist_ok=True)
+        p = self.case_dir / name
+        p.write_text(content, encoding="utf-8")
+        return str(p.relative_to(self.report_dir))
+
+
+def run_cases(cases: list[Case], ctx: Ctx, *, boards: list[str]) -> list[tuple[str, CaseResult]]:
+    results: list[tuple[str, CaseResult]] = []
+    broken_by: str | None = None
+    for case in cases:
+        ctx.case_dir = ctx.report_dir / case.id
+        if broken_by and ("two_boards" in case.requires or case.destructive):
+            results.append((case.id, CaseResult("SKIP", reason=f"前置不滿足（{broken_by} 後板卡未恢復）")))
+            continue
+        t0 = time.monotonic()
+        try:
+            r = case.run(ctx)
+        except Exception as exc:  # case 內未捕捉例外＝FAIL，不中止套件
+            r = CaseResult("FAIL", reason=f"未捕捉例外：{exc!r}")
+        r.duration_s = time.monotonic() - t0
+        results.append((case.id, r))
+        # case 間恢復檢查：兩板 READY 才續跑依賴板卡的 case
+        not_ready = [b for b in boards if ctx.sw.session(b).get("state") != "READY"]
+        if not_ready:
+            for b in not_ready:
+                ctx.sw.run("device", "attach", "--selector", b)
+            time.sleep(5)
+            not_ready = [b for b in boards if not ctx.sw.wait_state(b, "READY", timeout_s=60)]
+        if not_ready and broken_by is None:
+            broken_by = case.id
+    return results
