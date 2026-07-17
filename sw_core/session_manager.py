@@ -1840,7 +1840,7 @@ class SessionManager:
                 return {"ok": True, "session": current.to_public_dict()}
 
         if session.profile.login_regex:
-            auth = resolve_session_auth(session.profile)
+            auth, auth_res = resolve_session_auth(session.profile)
             if auth.username and auth.password:
                 ok, err = ensure_ready(bridge, session.profile, auth=auth)
             else:
@@ -1960,7 +1960,7 @@ class SessionManager:
                 # reprobe / reboot recovery 流程接手升 READY。
                 ok, err = False, "PROMPT_UNAVAILABLE"
             elif require_login:
-                auth = resolve_session_auth(profile)
+                auth, auth_res = resolve_session_auth(profile)
                 if auth.username and auth.password:
                     ok, err = ensure_ready(bridge, profile, auth=auth)
                     if not ok:
@@ -2180,7 +2180,7 @@ class SessionManager:
             if not command_capable:
                 ok, err = False, None
             elif require_login:
-                auth = resolve_session_auth(profile)
+                auth, auth_res = resolve_session_auth(profile)
                 if auth.username and auth.password:
                     ok, err = ensure_ready(bridge, profile, auth=auth)
                     if not ok:
@@ -2502,7 +2502,7 @@ class SessionManager:
                     continue
                 if bridge is not None:
                     try:
-                        auth = resolve_session_auth(session.profile)
+                        auth, auth_res = resolve_session_auth(session.profile)
                         ok, err = ensure_ready(bridge, session.profile, auth=auth)
                     except Exception:  # noqa: BLE001 — login/probe 非預期例外不得殺死 worker（致 session 永卡 RECOVERING）（#79 STA-6）
                         import logging
