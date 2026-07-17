@@ -787,6 +787,103 @@ class TestUARTBridgeTcpConsole(unittest.TestCase):
             time.sleep(0.05)
         self.assertTrue(dropped)
 
+    # ───────── suspend 期間連入的 console 不得即時取得 raw ownership（#134）─────────
+
+    def test_console_connected_during_suspend_is_deferred_until_resume(self) -> None:
+        """agent 命令進行中（suspend）連入的首個 console：輸入須走 deferred（不直寫
+        UART 汙染命令），resume 時才接手 raw ownership 並 flush。"""
+        self._bridge.suspend_interactive()  # agent 命令開始（此時尚無任何 console）
+        try:
+            s = self._connect()
+            try:
+                _drain_sock(s)
+                self.assertIsNone(
+                    self._bridge.snapshot()["interactive_owner"],
+                    "suspend 期間不得即時授予 raw ownership",
+                )
+                s.sendall(b"pwn\r")
+                time.sleep(0.3)
+                self.assertNotIn(
+                    b"pwn", bytes(self._fake.written),
+                    "suspend 期間 console 輸入不得直寫 UART（須 deferred）",
+                )
+                self._bridge.resume_interactive()
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and b"pwn\r" not in bytes(self._fake.written):
+                    time.sleep(0.02)
+                self.assertIn(b"pwn\r", bytes(self._fake.written), "resume 須 flush deferred")
+                owner = self._bridge.snapshot()["interactive_owner"]
+                self.assertTrue(
+                    owner and owner.startswith("human:"),
+                    f"resume 後新 console 應接手 raw ownership，got {owner!r}",
+                )
+            finally:
+                s.close()
+        finally:
+            # 對稱性保險（Copilot review：snapshot 無 suspend_depth 鍵，改無條件 resume——
+            # 本測試僅 suspend 一次，depth 歸 0 後重複 resume 為 no-op）
+            self._bridge.resume_interactive()
+
+    def test_console_during_suspend_with_prior_owner_stays_secondary(self) -> None:
+        """suspend 前已有 owner：期間連入的第二個 console 維持 line-buffer，
+        resume 後 ownership 還給原 owner。"""
+        a = self._connect()
+        try:
+            _drain_sock(a)
+            owner_before = self._bridge.snapshot()["interactive_owner"]
+            self.assertTrue(owner_before and owner_before.startswith("human:"))
+            self._bridge.suspend_interactive()
+            try:
+                b = self._connect()
+                try:
+                    _drain_sock(b)
+                finally:
+                    pass
+            finally:
+                # 對稱性清理（Copilot review）：中途例外也不得遺留 suspend 影響後續測試；
+                # depth 歸 0 後重複 resume 為 no-op。
+                self._bridge.resume_interactive()
+            try:
+                self.assertEqual(
+                    self._bridge.snapshot()["interactive_owner"], owner_before,
+                    "resume 後 ownership 應還給原 owner，而非期間連入的第二個 console",
+                )
+            finally:
+                b.close()
+        finally:
+            a.close()
+
+    def test_suspended_owner_disconnect_before_resume_cleans_bookkeeping(self) -> None:
+        """suspend 期間成為 _suspended_owner 的 console 於 resume 前斷線（#136 review）：
+        斷線路徑須讓位 _suspended_owner 並清 deferred——否則 resume 會把 ownership
+        還原成已不存在的 human:<id>，之後任何新連線都無法再取得 raw ownership。"""
+        self._bridge.suspend_interactive()
+        try:
+            a = self._connect()
+            _drain_sock(a)
+            a.sendall(b"orphan")  # 進 deferred buffer
+            time.sleep(0.2)
+            a.close()  # resume 前斷線
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and self._bridge.snapshot()["consoles"]:
+                time.sleep(0.05)
+            self.assertEqual(self._bridge.snapshot()["consoles"], [], "斷線應被 console loop 收屍")
+        finally:
+            self._bridge.resume_interactive()
+        self.assertIsNone(
+            self._bridge.snapshot()["interactive_owner"],
+            "resume 不得把 ownership 還原成已斷線的 console",
+        )
+        self.assertNotIn(b"orphan", bytes(self._fake.written), "斷線 console 的 deferred 不得流入 UART")
+        # 後續新連線必須能正常取得 raw ownership（簿記未卡死）
+        b = self._connect()
+        try:
+            _drain_sock(b)
+            owner = self._bridge.snapshot()["interactive_owner"]
+            self.assertTrue(owner and owner.startswith("human:"), f"新連線應可取得 ownership，got {owner!r}")
+        finally:
+            b.close()
+
     # ───────── Telnet 相容模式（#131 點 5）─────────
 
     def test_greeting_sent_on_accept(self) -> None:

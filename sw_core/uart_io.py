@@ -360,8 +360,15 @@ class UARTBridge:
             # 首個 human console 自動取得 raw interactive ownership（對齊 Linux console-attach；
             # Windows 無 session_manager 代為授予，故於 bridge 層授予，使方向鍵/Tab 即時透傳，
             # 且 agent 命令時走 suspend/resume coexistence、連線不中斷）。
-            if self._interactive_owner is None:
+            # #134：suspend 期間（agent 命令執行中）_interactive_owner 被暫存為 None，
+            # 不得誤判為「首個 console」即時授予——owner 路徑會繞過 deferred buffer
+            # 直寫 UART、汙染 agent 命令輸出。改記到 _suspended_owner（原本為 None
+            # 時），期間輸入走既有 deferred 分支累積，resume 時無縫接手 raw 並 flush；
+            # suspend 前已有 owner 者維持第二 console 的 line-buffer 行為。
+            if self._interactive_owner is None and self._suspend_depth == 0:
                 self._interactive_owner = f"human:{client_id}"
+            elif self._suspend_depth > 0 and self._suspended_owner is None:
+                self._suspended_owner = f"human:{client_id}"
 
     def _console_loop(self) -> None:
         listener = self._console_listener
@@ -464,6 +471,15 @@ class UARTBridge:
                 self._primary_client_id = next_client.client_id if next_client is not None else None
             if self._interactive_owner == f"human:{client_id}":
                 self._interactive_owner = None
+            if self._suspended_owner == f"human:{client_id}":
+                # suspend 期間斷線的（未來）owner（#136 review）：讓位 _suspended_owner，
+                # 否則 resume 會把 ownership 還原成已不存在的 client，之後任何新連線都
+                # 拿不到 raw ownership。刻意**不**比照 detach_console 歸零 _agent_active/
+                # _suspend_depth——suspend 簿記由 agent 命令路徑持有，命令仍在跑，歸零會
+                # 讓後續新連線立即取得 raw、重演 #134 的直寫汙染；讓位後新連線走 #134
+                # 的 elif 接手 _suspended_owner，於 resume 時取得 ownership。
+                self._suspended_owner = None
+            self._deferred_buffers.pop(client_id, None)
         self._close_console_client(client)
 
     def reap_stale_consoles(self, *, held_slave_paths: set[str] | None = None) -> list[ConsoleClient]:
