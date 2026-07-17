@@ -61,7 +61,40 @@ serialwrap cmd submit --selector COM0 --cmd "cat /proc/version" --source agent:d
 > 不是 Windows 裝置管理員的實體 `COM5`/`COM7`；對應關係看 `session list`
 > 的 `attached_real_path`（如 `\\.\COM5`）。
 
-## 4. 找到 human console 的連線端口
+## 4. Profile 設定
+
+profile 與 Linux 版同一套規則，路徑在家目錄的 `.config`：
+
+```
+%USERPROFILE%\.config\serialwrap\profiles\*.yaml   ← template 與 targets 定義
+%USERPROFILE%\.config\serialwrap\config.yaml       ← supervision_mode / socket_path / windows.exclude_coms
+```
+
+覆寫優先序：`daemon start --profile-dir` > `SERIALWRAP_PROFILE_DIR` > `XDG_CONFIG_HOME` > 預設。
+
+YAML 三個頂層區段：
+
+- `defaults`：全域預設（如 `log_dir`、`max_sessions`）。
+- `profiles`：template 定義（`platform`、`prompt_regex`、`login_regex`、`ready_probe`、`uart.*` 等）。
+- `targets`：**明確綁定** COM → template → 裝置。Windows 上 `device_by_id` 填實體 COM 名：
+
+```yaml
+targets:
+  - act_no: 1
+    com: COM0
+    profile: prpl-template
+    device_by_id: COM5     # Windows：實體 COM 名（Linux 為 /dev/serial/by-id/...）
+```
+
+- **沒有 `targets` 時**全走動態偵測：daemon 對每個非藍牙 COM 自動建 session、以
+  template 偵測認 profile（`session list` 的 `profile_source: "detected"`）。此時
+  `daemon status` 的 warning `no_profiles_loaded` 是正常的——它指「沒有明確
+  targets 綁定」，不代表 template 沒載入。
+- 查看生效結果：`serialwrap session list`（`profile`／`profile_source`／
+  `attached_real_path`）；查 profile 檔本身直接開 YAML（`type`／`notepad`）。
+- 改完 profile 後 `serialwrap daemon stop` ＋ `serialwrap daemon start` 重載。
+
+## 5. 找到 human console 的連線端口
 
 每個 session 有一個 `127.0.0.1:<port>` 的 TCP console listener（Windows 無
 PTY 的替代，#84 PORT-2）。port 為隨機配置，從 `session list` 讀：
@@ -74,7 +107,7 @@ serialwrap session list
 `session console-attach --selector COM0` 的回傳亦帶 `endpoint` 與
 `protocol: "telnet"`。
 
-## 5. Tera Term 連線（建議走 Telnet）
+## 6. Tera Term 連線（建議走 Telnet）
 
 console listener 講 **Telnet**（server 主動協商 char-mode + 遠端回顯，#131）：
 
@@ -89,12 +122,12 @@ console listener 講 **Telnet**（server 主動協商 char-mode + 遠端回顯�
 - New-line Transmit：`CR` 或 `CR+LF` 皆可（telnet 層會把 Enter 正規化為單一 CR）。
 - **Local echo：不要勾**（遠端回顯已由 telnet 協商接手）。
 
-## 6. PuTTY／telnet.exe 連線
+## 7. PuTTY／telnet.exe 連線
 
 - PuTTY：Connection type 選 **Telnet**，Host `127.0.0.1`、Port 填 console port。
 - Windows 內建 telnet client（選用功能）：`telnet 127.0.0.1 <port>`。
 
-## 7. Raw（Service: Other）備援模式
+## 8. Raw（Service: Other）備援模式
 
 仍可用 Tera Term「Other」或 PuTTY「Raw」連入，但：
 
@@ -104,7 +137,7 @@ console listener 講 **Telnet**（server 主動協商 char-mode + 遠端回顯�
 - client 端行為（行緩衝、無 local echo 抑制、Nagle）不受 server 控制，
   體驗不如 Telnet 模式。**建議一律走 Telnet**。
 
-## 8. Windows 與 Linux 差異對照
+## 9. Windows 與 Linux 差異對照
 
 | 面向 | Linux | Windows |
 |------|-------|---------|
@@ -116,7 +149,7 @@ console listener 講 **Telnet**（server 主動協商 char-mode + 遠端回顯�
 | MCU 燒錄 | `/dev/ttyMCU` PTY-bridge（#55） | `device release` 釋放 COM → 外部燒錄工具獨佔 → `device attach` 收回（#54 語意） |
 | 單例防護 | flock + socket probe | msvcrt 檔鎖 + TCP probe |
 
-## 9. MCU 燒錄（device release / attach）
+## 10. MCU 燒錄（device release / attach）
 
 Windows 燒錄工具直接獨佔開 `COMx`，serialwrap 只需讓出 handle：
 
@@ -126,7 +159,7 @@ serialwrap device release --selector COM0 --source agent:flash --reason "flash M
 serialwrap device attach --selector COM0
 ```
 
-## 10. 疑難排解
+## 11. 疑難排解
 
 - 任何指令連不上 → `serialwrap doctor` 看 `daemon_endpoint`；未在跑則
   `serialwrap daemon start`。

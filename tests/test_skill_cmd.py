@@ -31,6 +31,7 @@ def test_skill_windows_prints_asset_verbatim(capsys: pytest.CaptureFixture[str])
     assert out == _asset_text("SKILL_WINDOWS.md")
     assert "Tera Term" in out
     assert "Telnet" in out
+    assert "Profile 設定" in out  # #131 補強：profile 章節（路徑/三區段/targets 範例）
 
 
 def test_skill_linux_prints_existing_skill(capsys: pytest.CaptureFixture[str]) -> None:

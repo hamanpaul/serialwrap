@@ -56,6 +56,36 @@ def _daemon_script_path() -> str:
     return os.path.normpath(os.path.join(here, "..", "serialwrapd.py"))
 
 
+def _repo_version_path() -> str:
+    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "VERSION"))
+
+
+def _resolve_version() -> str:
+    """解析 serialwrap 版本字串（#131 補強：CLI 原本沒有 --version）。
+
+    順序：repo checkout 的 VERSION（原始碼執行最真實）→ 已安裝套件 metadata
+    （pip/pipx）→ PyInstaller 內嵌 assets/VERSION（release exe，serialwrap.spec
+    datas 於打包時帶入）→ "unknown"。
+    """
+    try:
+        with open(_repo_version_path(), encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        pass
+    try:
+        import importlib.metadata  # noqa: PLC0415
+
+        return importlib.metadata.version("serialwrap")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from .assets import read_text  # noqa: PLC0415
+
+        return read_text("VERSION").strip()
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
 def _is_loopback_tcp(ep: str) -> bool:
     """endpoint 是否為 loopback tcp://（#131：Windows `daemon start` 的本機 bind 白名單）。"""
     try:
@@ -701,6 +731,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
+    p.add_argument("--version", action="version", version=f"serialwrap {_resolve_version()}", help="顯示版本後離開")
     p.add_argument("--socket", default=None, help="本機 daemon 的 Unix socket 路徑（未指定時依 config.yaml 與 XDG 執行期目錄解析，可用 SERIALWRAP_RUN_DIR 覆寫）")
     p.add_argument("--endpoint", default=None, metavar="ENDPOINT", help="遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）")
     p.add_argument("--timeout", dest="timeout_s", type=float, default=5.0, help="RPC timeout 秒數（預設: %(default)s）")
@@ -720,7 +751,7 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_sub = p_daemon.add_subparsers(dest="daemon_cmd", required=True, metavar="<command>")
 
     p_ds = daemon_sub.add_parser("start", help="啟動 daemon（--foreground 可前景執行；systemd 模式重導 service start）")
-    p_ds.add_argument("--profile-dir", default=PROFILE_DIR)
+    p_ds.add_argument("--profile-dir", default=PROFILE_DIR, help="profile YAML 目錄（預設: %(default)s）")
     p_ds.add_argument("--lock", default=LOCK_PATH)
     p_ds.add_argument("--foreground", action="store_true")
     p_ds.add_argument(
