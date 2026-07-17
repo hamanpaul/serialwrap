@@ -16,7 +16,7 @@ from collections import deque
 from typing import Any, Callable
 
 from .alias_registry import AliasRegistry
-from .auth import resolve_session_auth
+from .auth import AuthResolution, resolve_session_auth
 from .config import ProfileTemplate, SessionProfile
 from .constants import (
     BG_CAPTURE_MAX_BYTES,
@@ -25,6 +25,7 @@ from .constants import (
     BOOT_BANNER_TAIL_CHARS,
     BOOT_QUIET_WINDOW_S,
     BOOTLOADER_RX_TAIL_BYTES,
+    ERROR_CREDENTIALS_UNRESOLVED,
     HUMAN_ACTIVE_WINDOW_S,
     LOG_DIR,
     MAX_RECOVERY_LEASE_S,
@@ -263,6 +264,9 @@ class SessionRuntime:
     reprobe_attempts: int = 0
     next_reprobe_at: float | None = None
     reprobe_exhausted: bool = False
+    # 帳密解析終態一次性示警去重（#140）：進入 CREDENTIALS_UNRESOLVED 已告警即設 True，
+    # 抑制 recovery 迴圈逐輪重複告警；手動 attach/recover（重新介入）時重置為 False。
+    credentials_warned: bool = False
     # device handoff（issue #54）
     released_by: str | None = None
     released_at: str | None = None
@@ -796,6 +800,54 @@ class SessionManager:
     def _reset_reprobe_progress_locked(self, session: SessionRuntime) -> None:
         session.reset_reprobe_progress()
 
+    # --- 帳密解析終態（#140）---------------------------------------------------
+    @staticmethod
+    def _credentials_declared_but_unresolved(
+        profile: SessionProfile, auth_res: AuthResolution
+    ) -> bool:
+        """profile 宣告了帳密來源、但解析結果非 ok（帳密為空）。
+
+        純函式：``not_configured``（未宣告帳密）因 ``user_env``/``pass_env``/``env_file``
+        皆空而回 False，故未宣告帳密的 passwordless/auto-login 路徑完全不受影響。
+        """
+        declared = bool(profile.user_env or profile.pass_env or profile.env_file)
+        return declared and auth_res.reason != "ok"
+
+    def _emit_credentials_unresolved_warning(
+        self, session_id: str, com: str, auth_res: AuthResolution
+    ) -> None:
+        """進入 CREDENTIALS_UNRESOLVED 終態時輸出一次 log + WAL 警告（#140）。
+
+        以 ``session.credentials_warned`` 去重，避免 recovery 迴圈逐輪重複告警。
+        訊息含 env_file 實際解析路徑與 reason，**絕不含帳密值**（WAL payload 為空）。
+        """
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None or session.credentials_warned:
+                return
+            session.credentials_warned = True
+        import logging
+        logging.getLogger("serialwrap").warning(
+            "session %s 帳密解析未完成（reason=%s, env_file=%s）：不對 login prompt 送空帳密，"
+            "標記 CREDENTIALS_UNRESOLVED 終態，請補齊帳密後手動 attach/recover",
+            com, auth_res.reason, auth_res.env_file_path or "-",
+        )
+        try:
+            self._wal.append(
+                com=com,
+                direction="META",
+                source="system",
+                payload=b"",
+                meta={
+                    "event": "credentials_unresolved",
+                    "reason": auth_res.reason,
+                    "env_file": auth_res.env_file_path or "",
+                },
+            )
+        except Exception:
+            # 稽核寫入為 best-effort，不得讓告警路徑拋出中斷 attach/recovery。
+            pass
+
     def _is_reprobe_prompt_error(self, state: str, last_error: str | None) -> bool:
         if not last_error:
             return False
@@ -849,6 +901,11 @@ class SessionManager:
         if not by_id or by_id in self._released_by_ids or by_id not in self._devices:
             return None
         if session.state in {"READY", "RELEASED", "FLASHING", "ATTACHING", "RECOVERING"}:
+            return None
+        # 帳密解析終態（#140）：CREDENTIALS_UNRESOLVED 為明確終態，不自動重探
+        # （否則反覆對 login prompt 送空帳密）；需操作者補帳密後手動 attach/recover。
+        # （_is_reprobe_prompt_error 已隱含排除此錯，這裡顯式早退以自我說明並防未來回歸。）
+        if session.last_error == ERROR_CREDENTIALS_UNRESOLVED:
             return None
         if session.reprobe_exhausted:
             return None
@@ -1561,6 +1618,8 @@ class SessionManager:
                 elif session.state == "ATTACHED":
                     bridge = session.bridge
                     should_probe = True
+                    # 手動 attach 為重新介入：允許重解析後再告警一次（#140）。
+                    session.credentials_warned = False
                 else:
                     # bridge 存在、無 human lease、非 ATTACHED（READY / FLASHING / RECOVERING 等）：
                     # 統一走契約，command-capable 卡在非 READY/ATTACHING → ok:False + 狀態專用 error_code。
@@ -1574,6 +1633,8 @@ class SessionManager:
                 session.state = "ATTACHING"
                 session.last_error = None
                 self._reset_reprobe_progress_locked(session)
+                # 手動 attach 為重新介入：允許重解析後再告警一次（#140）。
+                session.credentials_warned = False
         post.execute()
         if result is not None:
             return result
@@ -1841,7 +1902,13 @@ class SessionManager:
 
         if session.profile.login_regex:
             auth, auth_res = resolve_session_auth(session.profile)
-            if auth.username and auth.password:
+            if self._credentials_declared_but_unresolved(session.profile, auth_res):
+                # 宣告帳密但解析空：不進 login/probe（不對 prompt 送空帳密），標終態（#140）。
+                self._emit_credentials_unresolved_warning(
+                    session.session_id, session.profile.com, auth_res
+                )
+                ok, err = False, ERROR_CREDENTIALS_UNRESOLVED
+            elif auth.username and auth.password:
                 ok, err = ensure_ready(bridge, session.profile, auth=auth)
             else:
                 ok, err = probe_ready(bridge, session.profile)
@@ -1961,7 +2028,13 @@ class SessionManager:
                 ok, err = False, "PROMPT_UNAVAILABLE"
             elif require_login:
                 auth, auth_res = resolve_session_auth(profile)
-                if auth.username and auth.password:
+                if self._credentials_declared_but_unresolved(profile, auth_res):
+                    # 宣告帳密但解析空：不 probe/login，掛橋停 ATTACHED 終態（#140）。
+                    self._emit_credentials_unresolved_warning(
+                        session_id, profile.com, auth_res
+                    )
+                    ok, err = False, ERROR_CREDENTIALS_UNRESOLVED
+                elif auth.username and auth.password:
                     ok, err = ensure_ready(bridge, profile, auth=auth)
                     if not ok:
                         preserved = bridge.stop(preserve_consoles=True)
@@ -2181,7 +2254,13 @@ class SessionManager:
                 ok, err = False, None
             elif require_login:
                 auth, auth_res = resolve_session_auth(profile)
-                if auth.username and auth.password:
+                if self._credentials_declared_but_unresolved(profile, auth_res):
+                    # 宣告帳密但解析空：不 probe/login，掛橋停 ATTACHED 終態（#140）。
+                    self._emit_credentials_unresolved_warning(
+                        session_id, profile.com, auth_res
+                    )
+                    ok, err = False, ERROR_CREDENTIALS_UNRESOLVED
+                elif auth.username and auth.password:
                     ok, err = ensure_ready(bridge, profile, auth=auth)
                     if not ok:
                         bridge.stop()
@@ -2503,7 +2582,14 @@ class SessionManager:
                 if bridge is not None:
                     try:
                         auth, auth_res = resolve_session_auth(session.profile)
-                        ok, err = ensure_ready(bridge, session.profile, auth=auth)
+                        if self._credentials_declared_but_unresolved(session.profile, auth_res):
+                            # 宣告帳密但解析空：recovery 不送 ensure_ready 空 probe，記終態續等逾時收尾（#140）。
+                            self._emit_credentials_unresolved_warning(
+                                session_id, session.profile.com, auth_res
+                            )
+                            ok, err = False, ERROR_CREDENTIALS_UNRESOLVED
+                        else:
+                            ok, err = ensure_ready(bridge, session.profile, auth=auth)
                     except Exception:  # noqa: BLE001 — login/probe 非預期例外不得殺死 worker（致 session 永卡 RECOVERING）（#79 STA-6）
                         import logging
                         logging.getLogger("serialwrap").warning(
@@ -3494,6 +3580,8 @@ class SessionManager:
             # 顯式人工 recover 視為重新介入：先清掉 reprobe 上限/進度，讓自動重探可在之後重新接手。
             # 否則 exhausted 的 ATTACHED session 一旦手動 recover 仍失敗，將永遠被 reconcile 跳過（Finding 4）。
             self._reset_reprobe_progress_locked(session)
+            # 手動 recover 為重新介入：補帳密後允許重解析並再告警一次（#140）。
+            session.credentials_warned = False
             if session.bridge is None:
                 by_id = session.profile.device_by_id
                 if by_id and by_id in self._devices:
