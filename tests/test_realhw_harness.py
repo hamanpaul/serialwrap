@@ -1,6 +1,8 @@
 """#122 realhw harness 純邏輯單測（不碰 live）。"""
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from realhw import harness
@@ -42,3 +44,25 @@ def test_parse_duration(s, secs):
 def test_parse_duration_rejects_garbage():
     with pytest.raises(ValueError):
         harness.parse_duration("soon")
+
+
+def test_report_md_lists_all_and_details_failures(tmp_path):
+    results = [
+        ("p0-doctor", harness.CaseResult("PASS", duration_s=1.2)),
+        ("p1-con-fanout", harness.CaseResult("FAIL", reason="marker 未出現",
+                                             evidence={"pane": "p1-con-fanout/pane.txt"})),
+        ("p1-hp-cycle", harness.CaseResult("SKIP", reason="前置不滿足：COM1 非 READY")),
+    ]
+    hints = {"p1-con-fanout": ("先確認 console 沒掉回 line-buffer",)}
+    meta = {"version": "0.2.2", "git": "abc123", "tiers": "p0,p1", "started_at": "2026-07-02T10:00:00"}
+    md = harness.render_report_md(meta, results, hints)
+    assert "PASS: 1" in md and "FAIL: 1" in md and "SKIP: 1" in md
+    assert "p1-con-fanout" in md and "marker 未出現" in md
+    assert "先確認 console 沒掉回 line-buffer" in md          # 診斷提示進報告
+    assert "p1-con-fanout/pane.txt" in md                      # evidence 連結
+
+    harness.write_reports(tmp_path, meta, results, hints)
+    data = json.loads((tmp_path / "report.json").read_text())
+    assert data["meta"]["git"] == "abc123"
+    assert data["results"][1]["verdict"] == "FAIL"
+    assert (tmp_path / "report.md").exists()
