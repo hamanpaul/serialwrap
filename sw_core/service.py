@@ -21,7 +21,7 @@ from .event_engine import EventEngine, EngineDeps
 from .event_engine.line_buffer import LineBuffer
 from .session_manager import SessionManager
 from .util import now_iso
-from .wal import WalWriter
+from .wal import WalWriter, rows_to_text_lines
 
 _HUMAN_INTERACTIVE_COMMANDS = {
     "alsamixer",
@@ -790,12 +790,12 @@ class SerialwrapService:
                 if not result.get("ok") and result.get("error_code") == "CMD_NOT_FOUND":
                     result = self._bg_fallback_from_arbiter(cmd_id, from_chunk)
                 return result
-            # Deprecated legacy path: fall back to raw WAL tail by selector.
-
-        if method in {"result.tail", "log.tail_raw"}:
+            # Deprecated legacy 路徑：無 cmd_id 時 fallback 到 raw WAL tail by selector。
+            # 注意：此路徑維持舊的 from_seq 增量語意（未帶視同 0）且不加 metadata，
+            # 與 log.tail_raw 的 latest 預設（#124）刻意分離，勿合併分支。
             com = params.get("com")
             selector = str(com or params.get("selector") or "")
-            from_seq = int(params.get("from_seq") or 0)
+            legacy_from_seq = int(params.get("from_seq") or 0)
             limit = int(params.get("limit") or 200)
             target_com: str | None = None
             if selector:
@@ -803,13 +803,16 @@ class SerialwrapService:
                 if not state.get("ok"):
                     return state
                 target_com = str(state["session"]["com"])
-            rows = self._wal.tail_raw(from_seq=from_seq, com=target_com, limit=limit)
+            rows = self._wal.tail_raw(from_seq=legacy_from_seq, com=target_com, limit=limit)
             return {"ok": True, "records": rows}
 
-        if method == "log.tail_text":
+        if method in {"log.tail_raw", "log.tail_text"}:
             com = params.get("com")
             selector = str(com or params.get("selector") or "")
-            from_seq = int(params.get("from_seq") or 0)
+            # params 未帶 from_seq key → None → latest 模式（回傳最新 N 筆，#124）；
+            # 顯式帶值（含 0）→ 舊 range 增量語意（老 client 相容）。
+            raw_from_seq = params.get("from_seq")
+            from_seq: int | None = int(raw_from_seq) if raw_from_seq is not None else None
             limit = int(params.get("limit") or 200)
             target_com: str | None = None
             if selector:
@@ -817,8 +820,25 @@ class SerialwrapService:
                 if not state.get("ok"):
                     return state
                 target_com = str(state["session"]["com"])
-            lines = self._wal.tail_text(from_seq=from_seq, com=target_com, limit=limit)
-            return {"ok": True, "lines": lines}
+            rows, truncated = self._wal.tail_raw_with_meta(
+                from_seq=from_seq, com=target_com, limit=limit
+            )
+            # metadata（#124）：
+            # - from_seq：實際使用值（latest 模式為 null）
+            # - last_seq：回傳紀錄的最大 seq（無紀錄時 null），可作下次 range 增量起點
+            # - current_seq：WAL 目前的 seq 計數
+            # - returned：回傳筆數（tail_raw 計 records、tail_text 計 lines）
+            # - truncated：latest 模式＝視窗前還有更舊符合紀錄；range 模式＝視窗後還有更新符合紀錄
+            meta: dict[str, Any] = {
+                "from_seq": from_seq,
+                "last_seq": rows[-1]["seq"] if rows else None,
+                "current_seq": self._wal.current_seq,
+                "truncated": truncated,
+            }
+            if method == "log.tail_raw":
+                return {"ok": True, "records": rows, "returned": len(rows), **meta}
+            lines = rows_to_text_lines(rows)
+            return {"ok": True, "lines": lines, "returned": len(lines), **meta}
 
         if method == "wal.range":
             from_seq = int(params.get("from_seq") or 0)

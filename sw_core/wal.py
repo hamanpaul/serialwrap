@@ -6,6 +6,8 @@ import os
 import threading
 import time
 import zlib
+from collections import deque
+from collections.abc import Iterator
 from typing import Any
 
 from .constants import DEFAULT_WAL_ROTATE_BYTES, WAL_DIR
@@ -154,10 +156,8 @@ class WalWriter:
             self._seq = 0
             return {"ok": True, "previous_seq": prev_seq, "rotated_suffix": ts}
 
-    def tail_raw(self, *, from_seq: int = 0, com: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
-        out: list[dict[str, Any]] = []
-        if not os.path.exists(self._wal_path):
-            return out
+    def _iter_matching(self, com: str | None) -> Iterator[dict[str, Any]]:
+        """逐行掃 WAL 檔，產出通過解析與 com 過濾的紀錄（seq 為 int 才算有效）。"""
         with open(self._wal_path, "r", encoding="utf-8", errors="replace") as fp:
             for line in fp:
                 line = line.strip()
@@ -169,31 +169,80 @@ class WalWriter:
                     continue
                 if not isinstance(obj, dict):
                     continue
-                seq = obj.get("seq")
-                if not isinstance(seq, int) or seq <= from_seq:
+                if not isinstance(obj.get("seq"), int):
                     continue
                 if com and obj.get("com") != com:
                     continue
-                out.append(obj)
-                if len(out) >= limit:
-                    break
-        return out
+                yield obj
 
-    def tail_text(self, *, from_seq: int = 0, com: str | None = None, limit: int = 200) -> list[str]:
+    def tail_raw(
+        self, *, from_seq: int | None = None, com: str | None = None, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        """回傳 WAL 紀錄列（seq 升冪）。
+
+        - ``from_seq=None``（預設）：**latest 模式**——回傳符合條件的最新 ``limit`` 筆（#124）。
+        - ``from_seq=N``（int，含 0）：**range 模式**——回傳 ``seq > N`` 起最舊的
+          ``limit`` 筆（舊語意，供增量讀取與老 client 相容）。
+        """
+        rows, _ = self.tail_raw_with_meta(from_seq=from_seq, com=com, limit=limit)
+        return rows
+
+    def tail_raw_with_meta(
+        self, *, from_seq: int | None = None, com: str | None = None, limit: int = 200
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """同 ``tail_raw``，另回傳 ``truncated``：是否還有符合條件但被 limit 截掉的紀錄。
+
+        truncated 語意：
+
+        - latest 模式（``from_seq=None``）：True 表示回傳視窗**之前**還有更舊的符合紀錄。
+        - range 模式（``from_seq=N``）：True 表示回傳視窗**之後**還有更新的符合紀錄。
+        """
+        if not os.path.exists(self._wal_path):
+            return [], False
+        if from_seq is None:
+            # latest 模式：deque(maxlen=limit) 只留掃描到的最後 limit 筆，天然維持 seq 升冪。
+            window: deque[dict[str, Any]] = deque(maxlen=max(limit, 0))
+            total = 0
+            for obj in self._iter_matching(com):
+                total += 1
+                window.append(obj)
+            rows = list(window)
+            return rows, total > len(rows)
+        out: list[dict[str, Any]] = []
+        truncated = False
+        for obj in self._iter_matching(com):
+            if obj["seq"] <= from_seq:
+                continue
+            if len(out) >= limit:
+                # 已收滿又遇到符合紀錄 → 視窗之後還有資料。
+                truncated = True
+                break
+            out.append(obj)
+        return out, truncated
+
+    def tail_text(
+        self, *, from_seq: int | None = None, com: str | None = None, limit: int = 200
+    ) -> list[str]:
+        """同 ``tail_raw`` 的兩種模式（``limit`` 計 WAL 紀錄筆數，非文字行數），輸出可讀文字行。"""
         rows = self.tail_raw(from_seq=from_seq, com=com, limit=limit)
-        chunks: list[str] = []
-        for row in rows:
-            payload = base64.b64decode(row.get("payload_b64", ""), validate=False)
-            chunks.append(to_printable(payload))
-        text = "".join(chunks)
-        if not text:
-            return []
-        lines = text.splitlines()
-        if text.endswith("\n"):
-            return lines
-        if not lines:
-            return [text]
-        consumed = sum(len(line) for line in lines) + max(len(lines) - 1, 0)
-        if consumed < len(text):
-            lines.append(text[consumed:])
+        return rows_to_text_lines(rows)
+
+
+def rows_to_text_lines(rows: list[dict[str, Any]]) -> list[str]:
+    """把 WAL 紀錄列解碼為人類可讀文字行；無換行結尾的 partial 尾段保留為最後一行。"""
+    chunks: list[str] = []
+    for row in rows:
+        payload = base64.b64decode(row.get("payload_b64", ""), validate=False)
+        chunks.append(to_printable(payload))
+    text = "".join(chunks)
+    if not text:
+        return []
+    lines = text.splitlines()
+    if text.endswith("\n"):
         return lines
+    if not lines:
+        return [text]
+    consumed = sum(len(line) for line in lines) + max(len(lines) - 1, 0)
+    if consumed < len(text):
+        lines.append(text[consumed:])
+    return lines

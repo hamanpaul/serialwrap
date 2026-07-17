@@ -924,12 +924,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_lr = log_sub.add_parser("tail-raw", help="tail raw 日誌（含 timestamp／source／seq／crc）")
     p_lr.add_argument("--selector")
     p_lr.add_argument("--com")
-    p_lr.add_argument("--from-seq", type=int, default=0)
+    p_lr.add_argument(
+        "--from-seq",
+        type=int,
+        default=None,
+        help="省略＝latest 模式（回傳最新 N 筆）；指定 N（含 0）＝range 模式（自 seq>N 起最舊 N 筆，增量讀取用）",
+    )
     p_lr.add_argument("--limit", type=int, default=200)
     p_lt = log_sub.add_parser("tail-text", help="tail 純文字日誌")
     p_lt.add_argument("--selector")
     p_lt.add_argument("--com")
-    p_lt.add_argument("--from-seq", type=int, default=0)
+    p_lt.add_argument(
+        "--from-seq",
+        type=int,
+        default=None,
+        help="省略＝latest 模式（回傳最新 N 筆）；指定 N（含 0）＝range 模式（自 seq>N 起最舊 N 筆，增量讀取用）",
+    )
     p_lt.add_argument("--limit", type=int, default=200)
 
     p_file = sub.add_parser(
@@ -1238,7 +1248,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "log":
         selector = args.selector or args.com
-        params = {"from_seq": args.from_seq, "limit": args.limit}
+        # --from-seq 省略時不放 key → daemon 走 latest 模式（#124）；顯式帶值（含 0）→ range 模式。
+        params = {"limit": args.limit}
+        if args.from_seq is not None:
+            params["from_seq"] = args.from_seq
         if selector:
             params["selector"] = selector
         if args.log_cmd == "tail-raw":
