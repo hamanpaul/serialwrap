@@ -338,3 +338,35 @@ def test_open_tunnel_fail_closed_removes_state_on_bind_unverified(tmp_path):
     finally:
         with contextlib.suppress(Exception):
             spawn.procs["p"].wait(timeout=2)
+
+
+def test_open_tunnel_already_running_noop(tmp_path):
+    spec = rt.TunnelSpec(role="expose", ssh_target="u@h", port=7777, forward_src="/s.sock")
+    identity = rt.compute_identity(spec)
+    reg = rt.Registry(str(tmp_path))
+    with reg.lock():
+        reg.write({
+            "listen_port": 7777, "status": "active", "role": "expose",
+            "identity": identity, "pid": os.getpid(),
+            "pid_start_ticks": rt.read_pid_start_ticks(os.getpid()),
+        })
+
+    def _spawner_should_not_be_called(argv, control_path, log_path):
+        raise AssertionError("已存活且 identity 相同時不應呼叫 spawner")
+
+    res = rt.open_tunnel(spec, str(tmp_path), spawner=_spawner_should_not_be_called,
+                         runner=lambda a: (0, ""), ping=lambda ep: True)
+    assert res["ok"] is True
+    assert res["already_running"] is True
+
+
+def test_terminate_pgid_reaps_and_returns_promptly():
+    proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    pgid = os.getpgid(proc.pid)
+    rt._terminate_pgid(pgid)
+    assert proc.poll() is not None
+    try:
+        result = os.waitpid(proc.pid, os.WNOHANG)
+    except ChildProcessError:
+        result = None
+    assert result is None or result[0] == proc.pid

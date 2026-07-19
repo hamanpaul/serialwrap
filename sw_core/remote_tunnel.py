@@ -344,6 +344,20 @@ class _Clock(Protocol):
     def sleep(self, seconds: float) -> None: ...
 
 
+def _reap_pgid(pgid: int) -> None:
+    """reap 已結束的同群子行程，避免 zombie 讓 killpg(pgid,0) 誤判仍存活。
+
+    僅在本行程為該子行程之父時有效（生產 CLI 與測試皆是）；非父行程時 os.waitpid
+    會拋 ChildProcessError，靜默忽略。"""
+    while True:
+        try:
+            reaped, _ = os.waitpid(-pgid, os.WNOHANG)
+        except (ChildProcessError, ProcessLookupError, OSError):
+            return
+        if reaped == 0:
+            return
+
+
 def _terminate_pgid(
     pgid: int,
     *,
@@ -356,11 +370,19 @@ def _terminate_pgid(
     安全性（例如遠端 bind 未經確認為 loopback）的隧道行程。`ProcessLookupError`
     （群組已消失）／`PermissionError`（非我方行程，理論上不會發生）皆吞掉，
     不讓拆除動作本身拋例外。
+
+    輪詢迴圈每次疊代開頭先 `_reap_pgid()`：被 SIGTERM 殺死的子行程若不被
+    父行程回收會留下 zombie，而 zombie 的 pgid slot 仍在，導致
+    `os.killpg(pgid, 0)` 存活探測持續誤判「仍存活」直到跑滿整個
+    `timeout` 才 fallback 到（對 zombie 而言是 no-op 的）SIGKILL。本行程
+    通常即為該子行程之父（生產 CLI 的 `subprocess.Popen` 單 fork，以及本模組
+    測試 fixture），故主動 reap 可讓 teardown 及時收斂，不必吃滿整個逾時。
     """
     with contextlib.suppress(ProcessLookupError, PermissionError):
         os.killpg(pgid, signal.SIGTERM)
     waited = 0.0
     while waited < timeout:
+        _reap_pgid(pgid)
         try:
             os.killpg(pgid, 0)  # 存活探測：不送訊號，僅檢查群組是否還在
         except ProcessLookupError:
@@ -369,6 +391,7 @@ def _terminate_pgid(
         waited += 0.1
     with contextlib.suppress(ProcessLookupError, PermissionError):
         os.killpg(pgid, signal.SIGKILL)
+    _reap_pgid(pgid)
 
 
 def open_tunnel(
@@ -409,7 +432,10 @@ def open_tunnel(
     with reg.lock():
         existing = reg.read(listen_port)
         if existing:
-            alive = pid_alive(int(existing.get("pid", -1)), existing.get("pid_start_ticks"))
+            existing_pid = int(existing.get("pid", -1))
+            # pid<=0 一律視為死亡：os.kill(-1, 0) 會 POSIX-broadcast 且無條件成功，
+            # 若讓 pid_alive() 收到非正值 pid，缺 pid 欄位的殘缺 state 會被誤判「存活」。
+            alive = existing_pid > 0 and pid_alive(existing_pid, existing.get("pid_start_ticks"))
             if alive and existing.get("identity") == identity:
                 return {"ok": True, "already_running": True, **_public(existing)}
             if alive and existing.get("identity") != identity:
