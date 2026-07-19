@@ -299,20 +299,31 @@ def make_role_probe(
         ])
         if rc != 0 or not out.strip():
             raise TunnelError("REMOTE_BIND_UNVERIFIED", "無法在 relay 驗證遠端 bind")
-        if _bind_has_wildcard(out, spec.port):
+        if not _bind_is_loopback_only(out, spec.port):
             raise TunnelError("REMOTE_BIND_UNVERIFIED", out.strip()[:200])
         return True
     return _probe
 
 
-def _bind_has_wildcard(ss_out: str, port: int) -> bool:
-    """ss 輸出中該 port 是否綁在非 loopback 位址（0.0.0.0 / :: / *）。"""
+def _bind_is_loopback_only(ss_out: str, port: int) -> bool:
+    """ss 輸出中該 port 的所有 bind 位址是否皆為 loopback（allowlist，fail-closed）。
+
+    掃描每一行，取所有以 `:{port}` 結尾的 token，解出位址（`rsplit(":", 1)`
+    取冒號前段，並去除 IPv6 的方括號）。只要找到至少一個 bind token，且全部
+    位址皆屬於 loopback（`127.0.0.1`／`127.*`／`::1`），才回傳 True。
+
+    任何非 loopback 位址（wildcard `0.0.0.0`/`::`/`*`/空字串、特定介面 IP 如
+    `10.0.0.5`、global IPv6 等）→ 回傳 False。完全找不到 bind token → 回傳
+    False（fail-closed，寧可誤判不安全也不誤判安全）。
+    """
+    found = False
     for line in ss_out.splitlines():
         if f":{port}" not in line:
             continue
         for tok in line.split():
             if tok.endswith(f":{port}"):
                 addr = tok.rsplit(":", 1)[0].strip("[]")
-                if addr in ("0.0.0.0", "::", "*", ""):
-                    return True
-    return False
+                found = True
+                if not (addr == "127.0.0.1" or addr.startswith("127.") or addr == "::1"):
+                    return False
+    return found

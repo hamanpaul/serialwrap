@@ -229,6 +229,26 @@ def test_role_probe_expose_tcp_accepts_loopback():
     assert probe() is True
 
 
+def test_role_probe_expose_tcp_rejects_interface_ip():
+    def runner(argv):
+        return (0, "LISTEN 0 128 10.0.0.5:7777 0.0.0.0:*")
+    probe = rt.make_role_probe(
+        rt.TunnelSpec(role="expose", ssh_target="u@h", port=7777, forward_src="/s.sock"),
+        "/cp", "tcp://127.0.0.1:7777", runner=runner, ping=lambda ep: True)
+    with pytest.raises(rt.TunnelError) as ei:
+        probe()
+    assert ei.value.code == "REMOTE_BIND_UNVERIFIED"
+
+
+def test_role_probe_expose_tcp_accepts_ipv6_loopback():
+    def runner(argv):
+        return (0, "LISTEN 0 128 [::1]:7777 [::]:*")
+    probe = rt.make_role_probe(
+        rt.TunnelSpec(role="expose", ssh_target="u@h", port=7777, forward_src="/s.sock"),
+        "/cp", "tcp://127.0.0.1:7777", runner=runner, ping=lambda ep: True)
+    assert probe() is True
+
+
 def test_role_probe_expose_remote_socket_skips_bind_check():
     def runner(argv):
         raise AssertionError("unix 模式不應跑 ss")
