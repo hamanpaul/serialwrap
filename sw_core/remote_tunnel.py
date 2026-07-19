@@ -12,11 +12,15 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
+import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
+
+from .client import rpc_call as _rpc_call
 
 # `[user@]host:port`——host 允許 ssh_config alias（不含 '@'/':' 的一段）。
 _TARGET_RE = re.compile(r"^(?:(?P<user>[^@:]+)@)?(?P<host>[^@:]+):(?P<port>\d+)$")
@@ -568,3 +572,80 @@ def _public(state: dict) -> dict:
             f"{state.get('endpoint', 'tcp://127.0.0.1:%d' % state['listen_port'])}"
         )
     return out
+
+
+def guard_platform() -> None:
+    """本期 remote 隧道僅支援 POSIX；native Windows 明確拒絕（改走手動 ssh -R）。"""
+    if os.name == "nt":
+        raise TunnelError(
+            "REMOTE_NOT_SUPPORTED",
+            "native Windows 本期不支援 serialwrap remote；請手動 ssh -R（見 SKILL_WINDOWS.md）",
+        )
+
+
+def resolve_ssh_bin(via: str) -> str:
+    """以 `shutil.which` 探索 ssh／autossh 執行檔路徑；PATH 找不到即 fail-closed。"""
+    name = "autossh" if via == "autossh" else "ssh"
+    path = shutil.which(name)
+    if not path:
+        raise TunnelError("SSH_NOT_FOUND", f"PATH 找不到 {name}")
+    return path
+
+
+def real_spawner(
+    argv: list[str], control_path: str, log_path: str
+) -> tuple[int, int, int | None, Callable[[], str]]:
+    """以 `subprocess.Popen` 背景常駐產生 ssh/autossh 行程，供 `open_tunnel` 的 `spawner` 參數注入。
+
+    `start_new_session=True` 讓子行程獨立成一個新 process group（獨立 pgid），
+    供之後 `_terminate_pgid()` 以 `killpg` 整組拆除（含 ssh 本身衍生的子行程）；
+    stdout/stderr 皆導向 `log_path`，供 readiness 失敗時的 `stderr_tail_fn` 讀取
+    診斷訊息。父行程端的 log handle 在 `Popen` 後即關閉——子行程已透過
+    `stdout=`/`stderr=` 取得自己 dup 過的 fd，父行程端保留原 handle 只會洩漏 fd。
+    """
+    os.makedirs(os.path.dirname(control_path), exist_ok=True)
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    log = open(log_path, "ab", buffering=0)
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=log,
+            start_new_session=True,
+            close_fds=True,
+        )
+    finally:
+        log.close()  # 子行程已 dup 走自己的 fd；父行程端不再需要，避免 fd 洩漏
+    pgid = os.getpgid(proc.pid)
+    start_ticks = read_pid_start_ticks(proc.pid)
+
+    def _stderr_tail() -> str:
+        """讀取 spawn log 尾端（供 `TUNNEL_SPAWN_FAILED` 附診斷訊息）；每次呼叫以路徑重新開檔，
+        不依賴上方已關閉的 `log` handle。"""
+        try:
+            with open(log_path, "rb") as fh:
+                return fh.read()[-500:].decode("utf-8", "replace")
+        except OSError:
+            return ""
+
+    return proc.pid, pgid, start_ticks, _stderr_tail
+
+
+def make_runner() -> Callable[[list[str]], tuple[int, str]]:
+    """回傳 real `subprocess.run` runner，供 `make_ssh_check`／`make_role_probe` 的 `runner` 參數注入。"""
+    def _run(argv: list[str]) -> tuple[int, str]:
+        proc = subprocess.run(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, timeout=10.0, check=False,
+        )
+        return proc.returncode, proc.stdout or ""
+    return _run
+
+
+def real_ping(endpoint: str) -> bool:
+    """以既有 RPC client 呼叫 `health.ping` 探測 endpoint 是否就緒；任何例外一律視為未就緒。"""
+    try:
+        return bool(_rpc_call(endpoint, "health.ping", {}, timeout_s=2.0).get("ok"))
+    except Exception:  # noqa: BLE001 — probe 失敗不讓例外穿越，僅視為未就緒
+        return False

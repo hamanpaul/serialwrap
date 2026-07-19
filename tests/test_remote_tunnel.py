@@ -413,3 +413,32 @@ def test_close_terminates_and_removes(tmp_path):
 
 def test_close_missing_is_idempotent(tmp_path):
     assert rt.close(str(tmp_path), 12345) == {"ok": True, "closed": []}
+
+
+def test_resolve_ssh_bin_missing(monkeypatch):
+    monkeypatch.setattr(rt.shutil, "which", lambda name: None)
+    with pytest.raises(rt.TunnelError) as ei:
+        rt.resolve_ssh_bin("ssh")
+    assert ei.value.code == "SSH_NOT_FOUND"
+
+
+def test_guard_platform_rejects_windows(monkeypatch):
+    monkeypatch.setattr(rt.os, "name", "nt")
+    with pytest.raises(rt.TunnelError) as ei:
+        rt.guard_platform()
+    assert ei.value.code == "REMOTE_NOT_SUPPORTED"
+
+
+def test_real_ping_uses_client(monkeypatch):
+    # 注意：不可寫成 `seen.setdefault("ep", ep) or {"ok": True}`——setdefault
+    # 首次呼叫回傳剛設定的 ep（truthy 字串），`or` 短路後整條表達式會變成該字串
+    # 而非 dict，導致 real_ping 對字串呼叫 .get() 拋例外、被吞成 False。
+    seen = {}
+
+    def _fake_rpc_call(ep, m, p, timeout_s):
+        seen["ep"] = ep
+        return {"ok": True}
+
+    monkeypatch.setattr(rt, "_rpc_call", _fake_rpc_call)
+    assert rt.real_ping("tcp://127.0.0.1:7777") is True
+    assert seen["ep"] == "tcp://127.0.0.1:7777"
