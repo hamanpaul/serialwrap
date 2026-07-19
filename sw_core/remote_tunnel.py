@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 
 # `[user@]host:port`——host 允許 ssh_config alias（不含 '@'/':' 的一段）。
@@ -150,12 +151,12 @@ def wait_ready(
     pid: int,
     start_ticks: int | None,
     *,
-    ssh_check,          # () -> bool：master 連線＋forward 建立
-    role_probe,         # () -> bool：-R 遠端 bind loopback；-L health.ping。可 raise TunnelError
-    sleep,              # (float) -> None
-    monotonic,          # () -> float
-    alive,              # () -> bool：行程是否仍活
-    stderr_tail,        # () -> str：spawn log 的 stderr 尾（供 TUNNEL_SPAWN_FAILED）
+    ssh_check: Callable[[], bool],          # master 連線＋forward 建立
+    role_probe: Callable[[], bool],         # -R 遠端 bind loopback；-L health.ping。可 raise TunnelError
+    sleep: Callable[[float], None],         # sleep(float)
+    monotonic: Callable[[], float],         # 單調時鐘 epoch (float)
+    alive: Callable[[], bool],              # 行程是否仍活
+    stderr_tail: Callable[[], str],         # spawn log 的 stderr 尾（供 TUNNEL_SPAWN_FAILED）
 ) -> str:
     """回 'active'（就緒）或 'starting'（逾時但行程仍活）；行程死亡 → TUNNEL_SPAWN_FAILED。
 
