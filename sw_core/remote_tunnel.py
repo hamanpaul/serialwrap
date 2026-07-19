@@ -12,8 +12,11 @@ import hashlib
 import json
 import os
 import re
+import signal
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Protocol
 
 # `[user@]host:port`——host 允許 ssh_config alias（不含 '@'/':' 的一段）。
 _TARGET_RE = re.compile(r"^(?:(?P<user>[^@:]+)@)?(?P<host>[^@:]+):(?P<port>\d+)$")
@@ -327,3 +330,144 @@ def _bind_is_loopback_only(ss_out: str, port: int) -> bool:
                 if not (addr == "127.0.0.1" or addr.startswith("127.") or addr == "::1"):
                     return False
     return found
+
+
+class _Clock(Protocol):
+    """注入時鐘介面（結構化型別）：需提供 `monotonic()` 與 `sleep(seconds)`。
+
+    預設不注入時直接使用標準函式庫 `time` 模組（其 `monotonic`/`sleep`
+    天然滿足此介面）；測試可注入假時鐘加速 readiness 輪詢。
+    """
+
+    def monotonic(self) -> float: ...
+
+    def sleep(self, seconds: float) -> None: ...
+
+
+def _terminate_pgid(
+    pgid: int,
+    *,
+    timeout: float = 5.0,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """SIGTERM 後有界等待行程群組消失，逾時仍存活才 SIGKILL（fail-closed 拆除）。
+
+    用於 `open_tunnel` readiness 失敗時的收尾：確保不留下已 spawn 但未驗證
+    安全性（例如遠端 bind 未經確認為 loopback）的隧道行程。`ProcessLookupError`
+    （群組已消失）／`PermissionError`（非我方行程，理論上不會發生）皆吞掉，
+    不讓拆除動作本身拋例外。
+    """
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pgid, signal.SIGTERM)
+    waited = 0.0
+    while waited < timeout:
+        try:
+            os.killpg(pgid, 0)  # 存活探測：不送訊號，僅檢查群組是否還在
+        except ProcessLookupError:
+            return
+        sleep(0.1)
+        waited += 0.1
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pgid, signal.SIGKILL)
+
+
+def open_tunnel(
+    spec: TunnelSpec,
+    run_dir: str,
+    *,
+    spawner: Callable[[list[str], str, str], tuple[int, int, int | None, Callable[[], str]]],
+    runner: Callable[[list[str]], tuple[int, str]],
+    ping: Callable[[str], bool],
+    ssh_check_factory: Callable[..., Callable[[], bool]] = make_ssh_check,
+    role_probe_factory: Callable[..., Callable[[], bool]] = make_role_probe,
+    clock: _Clock | None = None,
+) -> dict:
+    """編排單一隧道的完整開啟流程：spawn → durable state → readiness → active/starting。
+
+    流程（`spawner(argv, control_path, log_path) -> (pid, pgid, start_ticks, stderr_tail_fn)`）：
+
+    1. 持 `Registry.lock()`：identity 衝突檢查 → `spawner` 產生行程 →
+       **立即寫入 `status="spawning"` 的 durable state** → 釋放鎖。
+       （不在鎖內跑 readiness，避免長時間輪詢阻塞 `remote list`/`remote close`
+       等其他需要鎖的操作。）
+    2. 鎖外跑 `wait_ready`：成功回 `active`／`starting`，重新取鎖寫回 state。
+    3. `wait_ready` raise `TunnelError`（含 `REMOTE_BIND_UNVERIFIED`、
+       `TUNNEL_SPAWN_FAILED`）→ **fail-closed**：`_terminate_pgid()` 拆除已 spawn
+       的行程群組，並移除 durable state（不留下未驗證安全性的暴露隧道），
+       然後 re-raise。
+
+    同 `listen_port` 已有存活且相同 identity 的隧道視為冪等（`already_running`
+    no-op）；存活但不同 identity 視為衝突（raise `TUNNEL_CONFLICT`，避免竊佔
+    他人隧道或造成埠位混用）；已死亡的殘留 state 視為過期，覆寫重來。
+    """
+    reg = Registry(run_dir)
+    listen_port = spec.local if (spec.role == "connect" and spec.local is not None) else spec.port
+    identity = compute_identity(spec)
+    control_path = reg.control_path(listen_port)
+
+    # ── identity 衝突檢查 → spawn → 立即寫 durable state（持鎖）──
+    with reg.lock():
+        existing = reg.read(listen_port)
+        if existing:
+            alive = pid_alive(int(existing.get("pid", -1)), existing.get("pid_start_ticks"))
+            if alive and existing.get("identity") == identity:
+                return {"ok": True, "already_running": True, **_public(existing)}
+            if alive and existing.get("identity") != identity:
+                raise TunnelError(
+                    "TUNNEL_CONFLICT",
+                    f"port {listen_port} 已有不同 identity 的隧道，請先 remote close {listen_port}",
+                )
+            reg.remove(listen_port)  # 死 state → 視為過期，覆寫
+
+        log_path = os.path.join(reg.remote_dir, f"{listen_port}.log")
+        pid, pgid, start_ticks, stderr_tail = spawner(build_argv(spec, control_path), control_path, log_path)
+        state = {
+            "identity": identity, "status": "spawning", "role": spec.role,
+            "pid": pid, "pgid": pgid, "pid_start_ticks": start_ticks,
+            "target": spec.ssh_target, "listen_port": listen_port,
+            "remote_bind": spec.remote_socket or f"127.0.0.1:{spec.port}",
+            "forward_target": spec.forward_src, "via": spec.via,
+            "control_path": control_path, "endpoint": endpoint_for(spec),
+        }
+        reg.write(state)
+
+    # ── readiness（不持鎖，避免阻塞其他操作）──
+    active_clock: _Clock = clock or time  # type: ignore[assignment]
+    monotonic = active_clock.monotonic
+    sleep = active_clock.sleep
+    endpoint = endpoint_for(spec)
+    ssh_check = ssh_check_factory(spec, control_path, runner=runner)
+    role_probe = role_probe_factory(spec, control_path, endpoint, runner=runner, ping=ping)
+
+    try:
+        status = wait_ready(
+            spec, pid, start_ticks,
+            ssh_check=ssh_check, role_probe=role_probe,
+            sleep=sleep, monotonic=monotonic,
+            alive=lambda: pid_alive(pid, start_ticks),
+            stderr_tail=stderr_tail,
+        )
+    except TunnelError:
+        # fail-closed：拆除已 spawn 的行程群組並移除 state，不留下暴露隧道。
+        _terminate_pgid(pgid, sleep=sleep)
+        with reg.lock():
+            reg.remove(listen_port)
+        raise
+
+    with reg.lock():
+        state["status"] = status
+        reg.write(state)
+    return {"ok": True, **_public(state)}
+
+
+def _public(state: dict) -> dict:
+    """對外可見欄位（去掉 control_path 等內部細節）。"""
+    keys = ("status", "role", "pid", "listen_port", "target", "remote_bind",
+            "forward_target", "via", "endpoint", "identity")
+    out = {k: state[k] for k in keys if k in state}
+    if state.get("role") == "expose":
+        out["remote_hint"] = (
+            f"agent 端用 serialwrap --endpoint "
+            f"{state.get('endpoint', 'tcp://127.0.0.1:%d' % state['listen_port'])}"
+        )
+    return out

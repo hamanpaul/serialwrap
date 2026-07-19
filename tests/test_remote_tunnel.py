@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
@@ -267,3 +268,73 @@ def test_role_probe_connect_uses_health_ping():
         runner=lambda argv: (0, ""), ping=lambda ep: seen.setdefault("ep", ep) or True)
     assert probe() is True
     assert seen["ep"] == "tcp://127.0.0.1:7777"
+
+
+# Task 6: open_tunnel 編排（spawn → durable state → readiness → active/starting）
+class _FakeProc:
+    def __init__(self, pid):
+        self.pid = pid
+
+    def poll(self):
+        return None
+
+
+def _fake_spawner(alive=True, stderr=""):
+    procs = {}
+
+    def spawn(argv, control_path, log_path):
+        # `start_new_session=True`：讓存活分支的子行程落在獨立 pgid，
+        # 不與目前跑 pytest 的行程共用 process group——否則
+        # `_terminate_pgid` 的 fail-closed teardown 對 pgid 送
+        # `os.killpg(SIGTERM)` 時會連 pytest 本身一併殺死（已實測驗證）。
+        proc = subprocess.Popen(["sleep", "30"], start_new_session=True) if alive \
+            else subprocess.Popen(["true"])
+        if not alive:
+            proc.wait()
+        procs["p"] = proc
+        return proc.pid, os.getpgid(proc.pid) if alive else proc.pid, \
+            rt.read_pid_start_ticks(proc.pid), (lambda: stderr)
+    spawn.procs = procs
+    return spawn
+
+
+def test_open_tunnel_expose_active(tmp_path):
+    spec = rt.TunnelSpec(role="expose", ssh_target="u@h", port=7777, forward_src="/s.sock")
+    spawn = _fake_spawner(alive=True)
+    try:
+        res = rt.open_tunnel(spec, str(tmp_path), spawner=spawn,
+                             runner=lambda a: (0, "LISTEN 0 128 127.0.0.1:7777 *:*"),
+                             ping=lambda ep: True)
+        assert res["ok"] and res["status"] == "active" and res["role"] == "expose"
+        reg = rt.Registry(str(tmp_path))
+        assert reg.read(7777)["status"] == "active"
+    finally:
+        spawn.procs["p"].terminate(); spawn.procs["p"].wait()
+
+
+def test_open_tunnel_conflict_same_port_diff_identity(tmp_path):
+    reg = rt.Registry(str(tmp_path))
+    with reg.lock():
+        reg.write({"listen_port": 7777, "status": "active", "role": "expose",
+                   "identity": "OTHER", "pid": os.getpid(),
+                   "pid_start_ticks": rt.read_pid_start_ticks(os.getpid())})
+    spec = rt.TunnelSpec(role="expose", ssh_target="u@h", port=7777, forward_src="/s.sock")
+    with pytest.raises(rt.TunnelError) as ei:
+        rt.open_tunnel(spec, str(tmp_path), spawner=_fake_spawner(),
+                       runner=lambda a: (0, ""), ping=lambda ep: True)
+    assert ei.value.code == "TUNNEL_CONFLICT"
+
+
+def test_open_tunnel_fail_closed_removes_state_on_bind_unverified(tmp_path):
+    spec = rt.TunnelSpec(role="expose", ssh_target="u@h", port=7777, forward_src="/s.sock")
+    spawn = _fake_spawner(alive=True)
+    try:
+        with pytest.raises(rt.TunnelError) as ei:
+            rt.open_tunnel(spec, str(tmp_path), spawner=spawn,
+                           runner=lambda a: (0, "LISTEN 0 128 0.0.0.0:7777 *:*"),  # wildcard
+                           ping=lambda ep: True)
+        assert ei.value.code == "REMOTE_BIND_UNVERIFIED"
+        assert rt.Registry(str(tmp_path)).read(7777) is None  # 拆除、不留暴露隧道
+    finally:
+        with contextlib.suppress(Exception):
+            spawn.procs["p"].wait(timeout=2)
