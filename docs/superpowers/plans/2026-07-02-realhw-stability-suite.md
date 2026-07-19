@@ -4,7 +4,7 @@
 
 **Goal:** 建立手動觸發、無人在場的實機穩定性套件 `python3 -m realhw`：P0 煙霧＋P1 核心穩定性全自動、長跑（預設 32h）無人看護＋事後分析，報告落 `~/b-log/realhw-reports/`。
 
-**Architecture:** 獨立 stdlib-only Python harness（`realhw/`，不入 wheel、不被 pytest 收集）：Case registry＋preflight＋continue-on-failure 執行引擎＋JSON/MD 報告；drivers 以 subprocess 包已安裝 `serialwrap` CLI／tmux／usbipd／systemd。**測部署後系統**——不 import sw_core。權威設計＝`docs/superpowers/specs/2026-07-02-realhw-stability-suite-design.md`（含完整 case 目錄與坑）；OpenSpec＝`openspec/changes/realhw-stability-suite-122/`。
+**Architecture:** 獨立 stdlib-only Python harness（`realhw/`，不入 wheel、不被 pytest 收集）：Case registry＋preflight＋continue-on-failure 執行引擎＋JSON/MD 報告；drivers 以 subprocess 包已安裝 `serialwrap` CLI／tmux／usbipd／systemd。**測部署後系統**——不 import sw_core。權威設計＝`docs/superpowers/specs/2026-07-02-realhw-stability-suite-design.md`（含完整 case 目錄與坑）；OpenSpec＝`openspec/changes/archive/2026-07-19-realhw-stability-suite-122/`（實作 PR 內已歸檔）。
 
 **Tech Stack:** Python 3.10+ stdlib（dataclasses/subprocess/json/argparse）、PyYAML（config，runtime 既有依賴）、tmux、usbipd-win、systemd（NOPASSWD sudo）。
 

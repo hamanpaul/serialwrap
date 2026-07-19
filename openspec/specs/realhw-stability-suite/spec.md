@@ -1,7 +1,8 @@
 # realhw-stability-suite Specification
 
 ## Purpose
-TBD - created by archiving change realhw-stability-suite-122. Update Purpose after archive.
+定義 serialwrap **實機穩定性測試套件**（`python3 -m realhw`）的能力契約：一套獨立、stdlib-only、操作已部署 live daemon 與真實 UART 板卡的 harness（不 import `sw_core`、不進 CI、不入 wheel、`pytest tests/` 不收集），提供 tier 化 case 選擇與執行、部署前 preflight 守門、P0 煙霧與 P1 核心穩定性 case、無人看護長跑與事後分析，用於持續驗證多 agent／多 human console 共用單一 UART 的 broker 在真機上的長期穩定性。
+
 ## Requirements
 ### Requirement: tier 化 case 執行與選擇
 套件 SHALL 以 `python3 -m realhw` 執行，支援 `--tier`（`p0`／`p1`／`longrun`，可逗號多選）、`--only <case-id>`、`--skip <case-id>`、`--list`、`--report-dir`、`--duration`（僅 longrun，預設 32h，接受 `<N>h/<N>m/<N>s`）。`longrun` tier MUST NOT 被 `p0`/`p1` 隱含，必須顯式指定。Case SHALL 固定順序、彼此獨立、continue-on-failure（單 case FAIL 記錄後續跑）。套件 MUST NOT 被 `pytest tests/` 收集、MUST NOT 打包進 wheel。
