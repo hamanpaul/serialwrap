@@ -142,6 +142,41 @@ def pid_alive(pid: int, start_ticks: int | None) -> bool:
     return current == start_ticks
 
 
+_POLL_INTERVAL_S = 0.2
+
+
+def wait_ready(
+    spec: TunnelSpec,
+    pid: int,
+    start_ticks: int | None,
+    *,
+    ssh_check,          # () -> bool：master 連線＋forward 建立
+    role_probe,         # () -> bool：-R 遠端 bind loopback；-L health.ping。可 raise TunnelError
+    sleep,              # (float) -> None
+    monotonic,          # () -> float
+    alive,              # () -> bool：行程是否仍活
+    stderr_tail,        # () -> str：spawn log 的 stderr 尾（供 TUNNEL_SPAWN_FAILED）
+) -> str:
+    """回 'active'（就緒）或 'starting'（逾時但行程仍活）；行程死亡 → TUNNEL_SPAWN_FAILED。
+
+    role_probe 可 raise TunnelError（例如 REMOTE_BIND_UNVERIFIED），會直接傳播。
+    """
+    deadline = monotonic() + spec.ready_timeout
+    while True:
+        if not alive():
+            # 行程已死亡，取得 stderr 尾並拋出錯誤
+            tail = (stderr_tail() or "").strip()
+            # 僅保留最後 500 字元（避免長文本）
+            if len(tail) > 500:
+                tail = tail[-500:]
+            raise TunnelError("TUNNEL_SPAWN_FAILED", tail)
+        if ssh_check() and role_probe():   # role_probe 可 raise（REMOTE_BIND_UNVERIFIED）
+            return "active"
+        if monotonic() >= deadline:
+            return "starting"
+        sleep(_POLL_INTERVAL_S)
+
+
 class Registry:
     """`<run_dir>/remote/` 下的 per-tunnel state JSON + flock 序列化。"""
 

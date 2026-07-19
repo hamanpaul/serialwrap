@@ -137,3 +137,61 @@ def test_lock_is_exclusive_serialized(tmp_path):
     with reg.lock():
         reg.write({"listen_port": 1, "status": "spawning", "role": "connect"})
     assert reg.read(1)["status"] == "spawning"
+
+
+# Task 4: readiness 狀態機（注入式 probe）
+class _Clock:
+    """注入時鐘，用於測試 wait_ready。"""
+    def __init__(self):
+        self.t = 0.0
+    def monotonic(self):
+        return self.t
+    def sleep(self, dt):
+        self.t += dt
+
+
+def _spec_R():
+    """測試用的 expose spec。"""
+    return rt.TunnelSpec(role="expose", ssh_target="u@h", port=7777, forward_src="/s.sock",
+                         ready_timeout=5.0)
+
+
+def test_wait_ready_active_when_check_and_probe_ok():
+    clk = _Clock()
+    st = rt.wait_ready(_spec_R(), pid=1, start_ticks=1,
+                       ssh_check=lambda: True, role_probe=lambda: True,
+                       sleep=clk.sleep, monotonic=clk.monotonic,
+                       alive=lambda: True, stderr_tail=lambda: "")
+    assert st == "active"
+
+
+def test_wait_ready_starting_on_timeout_process_alive():
+    clk = _Clock()
+    st = rt.wait_ready(_spec_R(), pid=1, start_ticks=1,
+                       ssh_check=lambda: False, role_probe=lambda: False,
+                       sleep=clk.sleep, monotonic=clk.monotonic,
+                       alive=lambda: True, stderr_tail=lambda: "")
+    assert st == "starting"
+
+
+def test_wait_ready_spawn_failed_when_process_dies():
+    clk = _Clock()
+    with pytest.raises(rt.TunnelError) as ei:
+        rt.wait_ready(_spec_R(), pid=1, start_ticks=1,
+                      ssh_check=lambda: False, role_probe=lambda: False,
+                      sleep=clk.sleep, monotonic=clk.monotonic,
+                      alive=lambda: False, stderr_tail=lambda: "Permission denied (publickey).")
+    assert ei.value.code == "TUNNEL_SPAWN_FAILED"
+    assert "publickey" in (ei.value.message or "")
+
+
+def test_wait_ready_remote_bind_unverified_propagates():
+    clk = _Clock()
+    def probe():
+        raise rt.TunnelError("REMOTE_BIND_UNVERIFIED", "0.0.0.0:7777")
+    with pytest.raises(rt.TunnelError) as ei:
+        rt.wait_ready(_spec_R(), pid=1, start_ticks=1,
+                      ssh_check=lambda: True, role_probe=probe,
+                      sleep=clk.sleep, monotonic=clk.monotonic,
+                      alive=lambda: True, stderr_tail=lambda: "")
+    assert ei.value.code == "REMOTE_BIND_UNVERIFIED"
