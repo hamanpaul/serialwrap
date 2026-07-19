@@ -250,3 +250,69 @@ class Registry:
         for p in (self.state_path(listen_port), self.control_path(listen_port)):
             with contextlib.suppress(OSError):
                 os.unlink(p)
+
+
+def endpoint_for(spec: TunnelSpec) -> str:
+    """回傳本機可探測的 endpoint（`-L`／direct 皆落在本機 loopback）。"""
+    local = spec.local if spec.local is not None else spec.port
+    return f"tcp://127.0.0.1:{local}"
+
+
+def make_ssh_check(
+    spec: TunnelSpec,
+    control_path: str,
+    *,
+    runner: Callable[[list[str]], tuple[int, str]],
+) -> Callable[[], bool]:
+    """回傳 `() -> bool`：以既有 master 連線跑 `ssh -O check` 確認 control socket 存活。"""
+    def _check() -> bool:
+        rc, _ = runner(["ssh", "-O", "check", "-o", f"ControlPath={control_path}", spec.ssh_target])
+        return rc == 0
+    return _check
+
+
+def make_role_probe(
+    spec: TunnelSpec,
+    control_path: str,
+    endpoint: str,
+    *,
+    runner: Callable[[list[str]], tuple[int, str]],
+    ping: Callable[[str], bool],
+) -> Callable[[], bool]:
+    """回傳 `() -> bool`：依 role 選擇對應 readiness 判定，可 raise TunnelError（REMOTE_BIND_UNVERIFIED）。
+
+    - connect：以 `ping(endpoint)` 驗證本機端可用。
+    - expose + remote_socket（unix）：遠端 bind 天然限定於該 socket 路徑，fail-closed 免驗證。
+    - expose + tcp：借 master 連線在 relay 端跑 `ss` 驗遠端 bind 為 loopback；
+      查不到／查失敗／wildcard bind 一律視為不安全，raise REMOTE_BIND_UNVERIFIED。
+    """
+    def _probe() -> bool:
+        if spec.role == "connect":
+            return bool(ping(endpoint))
+        # expose：unix socket 模式天然 fail-closed，免 ss 驗證
+        if spec.remote_socket:
+            return True
+        # tcp 模式：以 master 連線在 relay 跑 ss，驗遠端 bind 為 loopback（fail-closed）
+        rc, out = runner([
+            "ssh", "-o", f"ControlPath={control_path}", spec.ssh_target,
+            "ss", "-ltnH", f"sport = :{spec.port}",
+        ])
+        if rc != 0 or not out.strip():
+            raise TunnelError("REMOTE_BIND_UNVERIFIED", "無法在 relay 驗證遠端 bind")
+        if _bind_has_wildcard(out, spec.port):
+            raise TunnelError("REMOTE_BIND_UNVERIFIED", out.strip()[:200])
+        return True
+    return _probe
+
+
+def _bind_has_wildcard(ss_out: str, port: int) -> bool:
+    """ss 輸出中該 port 是否綁在非 loopback 位址（0.0.0.0 / :: / *）。"""
+    for line in ss_out.splitlines():
+        if f":{port}" not in line:
+            continue
+        for tok in line.split():
+            if tok.endswith(f":{port}"):
+                addr = tok.rsplit(":", 1)[0].strip("[]")
+                if addr in ("0.0.0.0", "::", "*", ""):
+                    return True
+    return False

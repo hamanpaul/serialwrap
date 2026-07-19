@@ -195,3 +195,55 @@ def test_wait_ready_remote_bind_unverified_propagates():
                       sleep=clk.sleep, monotonic=clk.monotonic,
                       alive=lambda: True, stderr_tail=lambda: "")
     assert ei.value.code == "REMOTE_BIND_UNVERIFIED"
+
+
+# Task 5: probe 具體實作（ssh -O check / ss 遠端 bind / health.ping）
+def test_ssh_check_true_on_rc0():
+    calls = []
+    def runner(argv):
+        calls.append(argv)
+        return (0, "")
+    chk = rt.make_ssh_check(rt.TunnelSpec(role="expose", ssh_target="u@h", port=1),
+                            "/cp", runner=runner)
+    assert chk() is True
+    assert "-O" in calls[0] and "check" in calls[0]
+
+
+def test_role_probe_expose_tcp_rejects_wildcard():
+    def runner(argv):
+        return (0, "LISTEN 0 128 0.0.0.0:7777 0.0.0.0:*")
+    probe = rt.make_role_probe(
+        rt.TunnelSpec(role="expose", ssh_target="u@h", port=7777, forward_src="/s.sock"),
+        "/cp", "tcp://127.0.0.1:7777", runner=runner, ping=lambda ep: True)
+    with pytest.raises(rt.TunnelError) as ei:
+        probe()
+    assert ei.value.code == "REMOTE_BIND_UNVERIFIED"
+
+
+def test_role_probe_expose_tcp_accepts_loopback():
+    def runner(argv):
+        return (0, "LISTEN 0 128 127.0.0.1:7777 0.0.0.0:*")
+    probe = rt.make_role_probe(
+        rt.TunnelSpec(role="expose", ssh_target="u@h", port=7777, forward_src="/s.sock"),
+        "/cp", "tcp://127.0.0.1:7777", runner=runner, ping=lambda ep: True)
+    assert probe() is True
+
+
+def test_role_probe_expose_remote_socket_skips_bind_check():
+    def runner(argv):
+        raise AssertionError("unix 模式不應跑 ss")
+    probe = rt.make_role_probe(
+        rt.TunnelSpec(role="expose", ssh_target="u@h", port=7777, forward_src="/s.sock",
+                      remote_socket="/relay/x.sock"),
+        "/cp", "", runner=runner, ping=lambda ep: True)
+    assert probe() is True
+
+
+def test_role_probe_connect_uses_health_ping():
+    seen = {}
+    probe = rt.make_role_probe(
+        rt.TunnelSpec(role="connect", ssh_target="u@relay", port=7777, local=7777),
+        "/cp", "tcp://127.0.0.1:7777",
+        runner=lambda argv: (0, ""), ping=lambda ep: seen.setdefault("ep", ep) or True)
+    assert probe() is True
+    assert seen["ep"] == "tcp://127.0.0.1:7777"
