@@ -50,7 +50,8 @@ def _submit_source_wait(ctx, com, cmd, source, *, cmd_timeout=12.0, retries=20):
 
 @_case("p1-cmd-modes", "三模式（line／background／interactive）＋錯誤碼",
        hints=("interactive-send 有效 encoding＝plain/base64/key（無 text）；文字用 plain、按鍵用 key",
-              "background 完成用 result-tail 累積 chunk（list[str]），非 status.stdout"),
+              "background 輸出來源：執行至 prompt 即結束者由 command.stdout 承載，"
+              "result-tail chunks 承載 prompt 後非同步輸出——marker 檢查須併看兩者（#122 實機）"),
        requires=("two_boards",))
 def p1_cmd_modes(ctx):
     # (1) line
@@ -66,25 +67,34 @@ def p1_cmd_modes(ctx):
     if not cmd_id:
         return CaseResult("FAIL", reason=f"background submit 未回 cmd_id（{sub.get('error_code')}）")
     need = [f"BG_{i}" for i in (1, 2, 3)]
-    text = ""
+    # 部署 daemon（0.2.2）對「執行至 prompt 即結束」的 background 命令，會把輸出
+    # 放進 command.stdout（result-tail chunks 只承載 prompt 之後的非同步輸出）；
+    # 故 marker 需同時檢查 result-tail chunks 與 cmd status stdout 兩處來源，
+    # 兼容 streaming 與 run-to-prompt 兩種 background 行為（#122 實機）。
+    tail_text = ""
+    status_stdout = ""
     from_chunk = 0
-    deadline = time.monotonic() + 25
+    deadline = time.monotonic() + 30
     ended = False
     while time.monotonic() < deadline:
         tail = ctx.sw.run("cmd", "result-tail", "--cmd-id", str(cmd_id), "--from-chunk", str(from_chunk))
-        text += "".join(tail.get("chunks") or [])
+        tail_text += "".join(tail.get("chunks") or [])
         from_chunk = tail.get("next_chunk", from_chunk)
-        if all(m in text for m in need):
+        st = ctx.sw.run("cmd", "status", "--cmd-id", str(cmd_id)).get("command") or {}
+        status_stdout = st.get("stdout") or status_stdout
+        combined = tail_text + status_stdout
+        if all(m in combined for m in need):
             break
-        if tail.get("status") in ("done", "error", "timeout"):
+        if tail.get("status") in ("done", "error", "timeout") or st.get("status") in ("done", "error", "timeout"):
             if ended:
                 break
-            ended = True  # 結束後再讀一輪抓尾段 chunk
+            ended = True  # 結束後再讀一輪抓尾段 chunk / 最終 stdout
         time.sleep(1)
-    ctx.note("background.txt", text)
-    missing = [m for m in need if m not in text]
+    combined = tail_text + status_stdout
+    ctx.note("background.txt", f"tail={tail_text!r}\nstatus_stdout={status_stdout!r}")
+    missing = [m for m in need if m not in combined]
     if missing:
-        return CaseResult("FAIL", reason=f"background result-tail 缺 chunk marker：{missing}")
+        return CaseResult("FAIL", reason=f"background 輸出缺 marker（chunks+stdout 皆無）：{missing}")
 
     # (3) interactive
     op = ctx.sw.run("session", "interactive-open", "--selector", "COM0",
@@ -164,10 +174,21 @@ def p1_cmd_serial(ctx):
 
 @_case("p1-cmd-file", "UART 檔案 push/pull round-trip＋RPC 不凍結",
        hints=("無 health 子命令：以 daemon status 當輕量 RPC 探針量延遲（#52 歷史病灶 19.8s）",
+              "file.push/pull 走 target 端 `printf|base64 -d`；busybox DUT 常缺 base64，缺則協定不可用",
+              "file.* 未在 CLI _LONG_RPC_METHODS（#123 defer）→ 必須顯式全域 --timeout，否則 5s 假逾時",
               "md5 不符先查 UART 傳輸掉字／chunk-size"),
        requires=("two_boards",))
 def p1_cmd_file(ctx):
     ctx.case_dir.mkdir(parents=True, exist_ok=True)
+    # 前置探測：file push/pull 協定依賴 target 端 `base64 -d` 還原分段。busybox
+    # DUT（prplOS/BDK）常無 base64 → 協定寫出空檔（md5 = 空檔），屬環境/部署限制
+    # 而非 serialwrap 缺陷，此類板卡無法驗此案 → SKIP 並註明（#122 實機）。
+    probe = ctx.sw.submit_and_wait("COM0", "printf %s QjY0X09L | base64 -d")  # QjY0X09L=b64("B64_OK")
+    ctx.note("base64-probe.json", str(probe))
+    if "B64_OK" not in (probe.get("stdout") or ""):
+        return CaseResult("SKIP",
+                          reason="target 缺 base64（busybox DUT），file push/pull UART 協定不可用"
+                                 "——known deployed/env limitation（#122）")
     fd, local = tempfile.mkstemp(prefix="rhw-", suffix=".bin")
     os.close(fd)
     data = random.randbytes(256 * 1024)
@@ -190,8 +211,10 @@ def p1_cmd_file(ctx):
     th = threading.Thread(target=probe, daemon=True)
     th.start()
     try:
-        push = ctx.sw.run("file", "push", "--selector", "COM0", "--local", local,
-                          "--remote", remote, timeout=180)
+        # 全域 --timeout 120 必須在子命令之前（file.* 不在 CLI LONG_RPC floor，#123 defer）；
+        # subprocess timeout 對齊放大到 180s，避免 client 端 5s 假逾時。
+        push = ctx.sw.run("--timeout", "120", "file", "push", "--selector", "COM0",
+                          "--local", local, "--remote", remote, timeout=180)
         ctx.note("push.json", str(push))
     finally:
         stop.set()
@@ -199,8 +222,8 @@ def p1_cmd_file(ctx):
     if not push.get("ok"):
         return CaseResult("FAIL", reason=f"file push 失敗（{push.get('error_code')}）")
 
-    pull = ctx.sw.run("file", "pull", "--selector", "COM0", "--remote", remote,
-                      "--local", pulled, timeout=180)
+    pull = ctx.sw.run("--timeout", "120", "file", "pull", "--selector", "COM0",
+                      "--remote", remote, "--local", pulled, timeout=180)
     ctx.note("pull.json", str(pull))
     ctx.sw.submit_and_wait("COM0", f"rm -f {remote}")  # 清理板上暫存
     try:

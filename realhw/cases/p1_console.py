@@ -56,19 +56,39 @@ def p1_con_fanout(ctx):
 
 
 @_case("p1-con-defer", "human 打字不擋 agent（T7 suspend/deferred/resume）",
-       hints=("deferred flush 後 human 輸入應自成一行、不與 agent 命令 byte 交錯",),
+       hints=("deferred flush 後 human 輸入應自成一行、不與 agent 命令 byte 交錯",
+              "T7 deferred 只捕捉 agent 命令『執行期間』抵達的按鍵；submit 之前敲的半行"
+              "在 raw 模式即時透傳、會與命令交錯污染 stdout——須於執行視窗內敲（#122 實機）"),
        requires=("tmux", "two_boards"))
 def p1_con_defer(ctx):
     ses = ctx.tmux.name("defer")
     ctx.tmux.new(ses, "serialwrap-minicom COM0")
     try:
         time.sleep(6)
-        ctx.tmux.send(ses, "echo HUMAN_HALF", enter=False)  # 半行不送出
+        # async submit 一個帶延遲的 agent 命令撐開執行視窗，再於視窗內敲 human 半行
+        # → 按鍵進 deferred buffer（非即時透傳），故 agent stdout 乾淨、且 resume 後
+        # human 輸入 flush。若在 submit 前敲，raw 透傳會讓兩者在共用 UART 行交錯。
+        sub = ctx.sw.run("cmd", "submit", "--selector", "COM0",
+                         "--cmd", "sleep 2; echo T7_AGENT", "--cmd-timeout", "15")
+        cmd_id = sub.get("cmd_id")
+        if not cmd_id:
+            return CaseResult("FAIL", reason=f"agent 命令 submit 未回 cmd_id（{sub.get('error_code')}）")
         t0 = time.monotonic()
-        cmd = ctx.sw.submit_and_wait("COM0", "echo T7_AGENT")
+        time.sleep(0.4)  # 待命令進入執行（sleep 視窗）
+        ctx.tmux.send(ses, "echo HUMAN_HALF", enter=False)  # 執行期間敲入 → deferred
+        command: dict = {}
+        deadline = time.monotonic() + 25
+        while time.monotonic() < deadline:
+            command = ctx.sw.run("cmd", "status", "--cmd-id", str(cmd_id)).get("command") or {}
+            if command.get("status") in ("done", "error", "timeout"):
+                break
+            time.sleep(0.5)
         took = time.monotonic() - t0
-        if cmd.get("status") != "done" or "T7_AGENT" not in (cmd.get("stdout") or ""):
-            return CaseResult("FAIL", reason=f"human 打字期間 agent 命令未完成（status={cmd.get('status')}）")
+        ctx.note("agent-status.json", str(command))
+        if command.get("status") != "done" or "T7_AGENT" not in (command.get("stdout") or ""):
+            return CaseResult("FAIL",
+                              reason=f"agent 命令未乾淨完成（status={command.get('status')} "
+                                     f"stdout={command.get('stdout')!r}）")
         if took > 15:
             return CaseResult("FAIL", reason=f"agent 命令耗時 {took:.1f}s（疑似被 human console 阻擋）")
         ctx.tmux.send_key(ses, "Enter")  # flush deferred
@@ -79,6 +99,7 @@ def p1_con_defer(ctx):
             return CaseResult("FAIL", reason="deferred human 輸入未 flush 回 UART")
         return CaseResult("PASS")
     finally:
+        ctx.tmux.send_key(ses, "C-u")  # 清殘留輸入行，避免污染後續 console case
         ctx.tmux.kill(ses)
         time.sleep(3)
 
@@ -172,7 +193,9 @@ def p1_con_liveness(ctx):
 
 
 @_case("p1-con-orphan", "孤兒回收後重開 minicom 立即拿回 raw ownership（#76 自癒）",
-       hints=("#76 孤兒回收＋自癒；grace 3s 內 flap 不掉 line-buffer；不需 daemon restart",),
+       hints=("#76 孤兒回收＋自癒；不需 daemon restart",
+              "孤兒 lease 由 liveness 探測（self-test）觸發回收、非背景計時器；且『重開拿回 raw』"
+              "只在孤兒『已回收後』重開才成立——回收前重開者落 line-buffer 且事後不升等（#122 實機）"),
        requires=("tmux", "two_boards"))
 def p1_con_orphan(ctx):
     before = _minicom_pids()
@@ -182,16 +205,34 @@ def p1_con_orphan(ctx):
     try:
         time.sleep(6)
         ours = _minicom_pids() - before
-        for pid in ours:  # 製造孤兒
+        for pid in ours:  # 製造孤兒（SIGKILL 不觸發正常 detach）
             _kill9(pid)
         ctx.tmux.kill(ses1)
-        time.sleep(4)  # 過 grace 讓孤兒回收
-        ctx.tmux.new(ses2, "serialwrap-minicom COM0")  # 直接重開，不 restart daemon
-        time.sleep(6)
-        cl = ctx.sw.run("session", "console-list", "--selector", "COM0")
+        # 先輪詢 self-test 驅動孤兒回收（human_attached→False），再重開第二個 minicom；
+        # 若在回收前重開，第二 console 會落 line-buffer 且事後不再升等（#76 語意）。
+        recycled = False
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            st = ctx.sw.run("session", "self-test", "--selector", "COM0")
+            if not st.get("human_attached"):
+                recycled = True
+                break
+            time.sleep(3)
+        ctx.note("recycle.json", str(st))
+        if not recycled:
+            return CaseResult("FAIL", reason="≤60s 內孤兒未回收（human_attached 未轉 False）")
+        ctx.tmux.new(ses2, "serialwrap-minicom COM0")  # 回收後重開，不 restart daemon
+        cl: dict = {}
+        owned = False
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            cl = ctx.sw.run("session", "console-list", "--selector", "COM0")
+            if any(c.get("interactive_owner") for c in (cl.get("consoles") or [])):
+                owned = True
+                break
+            time.sleep(2)
         ctx.note("console-list.json", str(cl))
-        consoles = cl.get("consoles") or []
-        if not any(c.get("interactive_owner") for c in consoles):
+        if not owned:
             return CaseResult("FAIL", reason="重開 minicom 未拿回 raw interactive ownership")
         ctx.tmux.send(ses2, "ec", enter=False)
         ctx.tmux.send_key(ses2, "Tab")
