@@ -87,7 +87,7 @@ serialwrap remote close all                  # 拆除全部
   - `--socket EP`：`-R` 時要暴露的本機 daemon endpoint（預設 = `_resolve_endpoint` 解析結果）。
   - `--remote-socket PATH`（**硬化模式**，R1 finding 1／R2 finding 1）：`-R` 時遠端改建 **unix socket** 而非 tcp loopback port，用檔案權限把關；**成對地** `-L` 亦以 `--remote-socket PATH` 指定要連的 relay-side unix socket（雙 NAT 全鏈需兩側配對，見 §4.2）。agent 端仍用回傳的 `tcp://127.0.0.1:<local>`。**共享／多租戶 relay 建議必開**；省略則預設 tcp loopback（便利但受 §8 殘留風險）。
   - `--ready-timeout S`：readiness 確認上限（預設 10s）；逾時仍未確認 forward 建立 → 回 `starting`（見 §4）。
-  - `--ssh-opt "..."`：透傳額外 ssh 參數（可重複），例如 `-o ServerAliveInterval=30`、`-p 2222`。
+  - `--ssh-opt "..."`：透傳額外 ssh 參數（可重複），例如 `-p 2222`、`-J jumphost`。
 - 所有子動作輸出緊湊 JSON（`ensure_ascii=False, separators=(",",":")`，含 `ok`），對齊 CLI 慣例。
 
 ## 4. 行為規格
@@ -176,7 +176,7 @@ serialwrap --endpoint tcp://127.0.0.1:7777 session list
 ## 5. 隧道 argv 組裝
 
 - 基底：`["ssh","-N","-T", *default_opts, *ssh_opts, direction_args, ssh_target]`，spawn 時 `stdin=DEVNULL`（配合 `BatchMode=yes`，禁互動認證卡死——finding 3）。
-- 預設 `-o`（可被 `--ssh-opt` 覆寫）：
+- 預設 `-o`（置於 `--ssh-opt` 前；OpenSSH 取同鍵首個，故這些預設**權威不可被 --ssh-opt 覆寫**，刻意固定 BatchMode／ExitOnForwardFailure／ControlPath 等）：
   - `BatchMode=yes`：禁密碼／passphrase 互動提示；認證只走金鑰／agent，失敗即退出而非卡住。
   - `ExitOnForwardFailure=yes`：forward 建不起即 ssh 退出，供 readiness 判死（配合 §4.0）。
   - `ControlMaster=auto`、`ControlPath=<run>/remote/cm-<id>`、`ControlPersist=no`：供 `ssh -O check` readiness 探測與精準 teardown。

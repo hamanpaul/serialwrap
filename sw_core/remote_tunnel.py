@@ -68,7 +68,7 @@ def compute_identity(spec: TunnelSpec) -> str:
 
 
 def default_ssh_opts(control_path: str) -> list[str]:
-    """readiness／安全預設 -o（可被使用者 --ssh-opt 覆寫，故置於其前）。"""
+    """readiness／安全預設 -o。置於使用者 --ssh-opt 之前：OpenSSH 取同鍵的第一個 -o，故這些預設為權威、使用者 --ssh-opt 無法覆寫（BatchMode／ExitOnForwardFailure／ControlPath 等必須固定，刻意如此）。"""
     return [
         "-o", "BatchMode=yes",            # 禁互動認證，失敗即退出不卡死
         "-o", "ExitOnForwardFailure=yes",  # forward 建不起即退出，供 readiness 判死
