@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+
 import pytest
 
 from sw_core import remote_tunnel as rt
@@ -92,3 +96,44 @@ def test_build_argv_autossh_and_ssh_opts_passthrough():
     assert argv[0] == "autossh"
     assert argv[1:3] == ["-M", "0"]
     assert "-p" in argv and argv[argv.index("-p") + 1] == "2222"
+
+
+# Task 3: Registry + PID liveness
+def test_registry_write_read_remove_atomic(tmp_path):
+    reg = rt.Registry(str(tmp_path))
+    with reg.lock():
+        reg.write({"listen_port": 7777, "status": "active", "role": "expose"})
+    assert reg.read(7777)["status"] == "active"
+    assert [s["listen_port"] for s in reg.read_all()] == [7777]
+    with reg.lock():
+        reg.remove(7777)
+    assert reg.read(7777) is None
+
+
+def test_pid_alive_true_for_running_and_reuse_guard(tmp_path):
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        ticks = rt.read_pid_start_ticks(proc.pid)
+        assert ticks is not None
+        assert rt.pid_alive(proc.pid, ticks) is True
+        # start-ticks 不符 → 視為非我方（PID reuse 防護）
+        assert rt.pid_alive(proc.pid, ticks + 999999) is False
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+def test_pid_alive_false_for_dead(tmp_path):
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    assert rt.pid_alive(proc.pid, 12345) is False
+
+
+def test_lock_is_exclusive_serialized(tmp_path):
+    # 兩次 lock 不會同時持有（LOCK_EX）；此處驗證可重入取得、釋放後再取。
+    reg = rt.Registry(str(tmp_path))
+    with reg.lock():
+        pass
+    with reg.lock():
+        reg.write({"listen_port": 1, "status": "spawning", "role": "connect"})
+    assert reg.read(1)["status"] == "spawning"

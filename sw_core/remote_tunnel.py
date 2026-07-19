@@ -6,7 +6,11 @@ docs/superpowers/specs/2026-07-19-remote-tunnel-cli-design.md。
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
+import json
+import os
 import re
 from dataclasses import dataclass
 
@@ -101,3 +105,112 @@ def build_argv(spec: TunnelSpec, control_path: str) -> list[str]:
     argv += _direction_args(spec)
     argv.append(spec.ssh_target)
     return argv
+
+
+def read_pid_start_ticks(pid: int) -> int | None:
+    """Linux /proc/<pid>/stat 第 22 欄（starttime，clock ticks）。非 Linux／不存在回 None。"""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None
+    # comm 欄可能含空白/括號，故從最後一個 ')' 之後切。
+    rparen = data.rfind(b")")
+    if rparen < 0:
+        return None
+    fields = data[rparen + 2:].split()
+    # 切點後的 fields[0] 為 state(第3欄)，starttime 為第22欄 → index 22-3 = 19。
+    if len(fields) <= 19:
+        return None
+    try:
+        return int(fields[19])
+    except ValueError:
+        return None
+
+
+def pid_alive(pid: int, start_ticks: int | None) -> bool:
+    """檢測 PID 是否存活，並以 start_ticks 防 PID 重用。"""
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    if start_ticks is None:
+        return True  # 無 /proc（非 Linux）→ best-effort pid-only
+    current = read_pid_start_ticks(pid)
+    if current is None:
+        return True
+    return current == start_ticks
+
+
+class Registry:
+    """`<run_dir>/remote/` 下的 per-tunnel state JSON + flock 序列化。"""
+
+    def __init__(self, run_dir: str) -> None:
+        self.run_dir = run_dir
+        self.remote_dir = os.path.join(run_dir, "remote")
+
+    def _ensure_dir(self) -> None:
+        """確保遠端目錄存在。"""
+        os.makedirs(self.remote_dir, exist_ok=True)
+
+    @contextlib.contextmanager
+    def lock(self):
+        """Exclusive flock 保護同步讀寫。"""
+        self._ensure_dir()
+        lock_path = os.path.join(self.remote_dir, ".registry.lock")
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+    def control_path(self, listen_port: int) -> str:
+        """控制端點路徑（ssh -o ControlPath）。"""
+        return os.path.join(self.remote_dir, f"cm-{listen_port}")
+
+    def state_path(self, listen_port: int) -> str:
+        """狀態檔路徑。"""
+        return os.path.join(self.remote_dir, f"{listen_port}.json")
+
+    def write(self, state: dict) -> None:
+        """原子寫入狀態（先 tmp 再 replace）。"""
+        self._ensure_dir()
+        path = self.state_path(int(state["listen_port"]))
+        tmp = f"{path}.tmp.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        os.replace(tmp, path)  # atomic
+
+    def read(self, listen_port: int) -> dict | None:
+        """讀取單一隧道狀態，不存在回 None。"""
+        try:
+            with open(self.state_path(listen_port), "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def read_all(self) -> list[dict]:
+        """讀取全部隧道狀態。"""
+        out: list[dict] = []
+        try:
+            names = os.listdir(self.remote_dir)
+        except OSError:
+            return out
+        for name in sorted(names):
+            if name.endswith(".json"):
+                try:
+                    with open(os.path.join(self.remote_dir, name), "r", encoding="utf-8") as fh:
+                        out.append(json.load(fh))
+                except (OSError, json.JSONDecodeError):
+                    continue
+        return out
+
+    def remove(self, listen_port: int) -> None:
+        """刪除隧道狀態與控制端點。"""
+        for p in (self.state_path(listen_port), self.control_path(listen_port)):
+            with contextlib.suppress(OSError):
+                os.unlink(p)
