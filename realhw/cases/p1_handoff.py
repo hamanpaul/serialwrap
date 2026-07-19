@@ -27,7 +27,10 @@ def _force_ready(ctx, com: str, timeout_s: float) -> None:
 
 @_case("p1-ho-cycle", "release→外部獨佔→attach 回 DEVICE_STILL_HELD→收回 READY",
        hints=("foreign_holders 只掃 serialwrapd fd，外部 minicom 不列入——僅供參考",
-              "DEVICE_STILL_HELD 靠 _probe_external_holder 掃 /proc；kill 外部後才收得回"),
+              "DEVICE_STILL_HELD 靠 _probe_external_holder 掃 /proc；kill 外部後才收得回",
+              "收回後回 READY 靠 login FSM 重登：brcm/BDK 板需 credential（#140）——"
+              "deployed daemon 缺 #140 修正時可能靜默送空帳密卡 ATTACHED 不回 READY，"
+              "FAIL 時先查 daemon 版本與 profile env_file 帳密"),
        requires=("two_boards",))
 def p1_ho_cycle(ctx):
     ready_wait = ctx.cfg["timeouts"]["ready_wait_s"]

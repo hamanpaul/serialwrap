@@ -49,7 +49,10 @@ def _wait_left_ready(ctx, com: str, timeout_s: float) -> str | None:
 
 @_case("p1-hp-cycle", "COM1 熱移除轉 DETACHED、COM0 不受擾、回插自動回原 COM READY",
        hints=("熱插沿用 DETACHED-rebind：同 by-id 板回原 COM 空槽（#100）",
-              "busid 不在 usbipd list＝換線，SKIP 非 FAIL"),
+              "busid 不在 usbipd list＝換線，SKIP 非 FAIL",
+              "回插後回 READY 靠 attach+login FSM：brcm/BDK 板需 credential（#140）——"
+              "deployed daemon 缺 #140 修正時可能卡 ATTACHED 不回 READY；"
+              "usbipd re-attach 失敗殘留 exported 需 Windows 端處置，非 harness 缺陷"),
        requires=("two_boards",))
 def p1_hp_cycle(ctx):
     ready_wait = ctx.cfg["timeouts"]["ready_wait_s"]
