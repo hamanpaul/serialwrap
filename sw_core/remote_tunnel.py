@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 # `[user@]host:port`——host 允許 ssh_config alias（不含 '@'/':' 的一段）。
 _TARGET_RE = re.compile(r"^(?:(?P<user>[^@:]+)@)?(?P<host>[^@:]+):(?P<port>\d+)$")
@@ -65,3 +65,39 @@ def compute_identity(spec: TunnelSpec) -> str:
         )
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def default_ssh_opts(control_path: str) -> list[str]:
+    """readiness／安全預設 -o（可被使用者 --ssh-opt 覆寫，故置於其前）。"""
+    return [
+        "-o", "BatchMode=yes",            # 禁互動認證，失敗即退出不卡死
+        "-o", "ExitOnForwardFailure=yes",  # forward 建不起即退出，供 readiness 判死
+        "-o", "ControlMaster=auto",
+        "-o", f"ControlPath={control_path}",
+        "-o", "ControlPersist=no",
+        "-o", "ServerAliveInterval=30",
+        "-o", "ServerAliveCountMax=3",
+    ]
+
+
+def _direction_args(spec: TunnelSpec) -> list[str]:
+    """組裝 -R 或 -L 與其隧道規格（bind:destination）。"""
+    if spec.role == "expose":
+        if spec.remote_socket:
+            bind = spec.remote_socket                      # 遠端 unix socket（硬化）
+        else:
+            bind = f"127.0.0.1:{spec.port}"                # 顯式遠端 loopback bind
+        return ["-R", f"{bind}:{spec.forward_src}"]
+    # connect：顯式本機 loopback bind
+    local = spec.local if spec.local is not None else spec.port
+    dest = spec.remote_socket if spec.remote_socket else f"localhost:{spec.port}"
+    return ["-L", f"127.0.0.1:{local}:{dest}"]
+
+
+def build_argv(spec: TunnelSpec, control_path: str) -> list[str]:
+    """完整 ssh/autossh argv（含方向 -R/-L、預設 -o、--ssh-opt 透傳、target）。"""
+    base = ["autossh", "-M", "0"] if spec.via == "autossh" else ["ssh"]
+    argv = [*base, "-N", "-T", *default_ssh_opts(control_path), *spec.ssh_opts]
+    argv += _direction_args(spec)
+    argv.append(spec.ssh_target)
+    return argv
