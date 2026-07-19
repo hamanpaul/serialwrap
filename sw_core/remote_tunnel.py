@@ -477,8 +477,10 @@ def open_tunnel(
             alive=lambda: pid_alive(pid, start_ticks),
             stderr_tail=stderr_tail,
         )
-    except TunnelError:
-        # fail-closed：拆除已 spawn 的行程群組並移除 state，不留下暴露隧道。
+    except BaseException:
+        # fail-closed：teardown 對任何 readiness 例外都要觸發（不只 TunnelError；
+        # 含 probe 逾時、Ctrl-C 等），拆除已 spawn 的行程群組並移除 state，
+        # 不留下暴露隧道，再原樣 re-raise。
         _terminate_pgid(pgid, sleep=sleep)
         with reg.lock():
             reg.remove(listen_port)
@@ -635,10 +637,19 @@ def real_spawner(
 def make_runner() -> Callable[[list[str]], tuple[int, str]]:
     """回傳 real `subprocess.run` runner，供 `make_ssh_check`／`make_role_probe` 的 `runner` 參數注入。"""
     def _run(argv: list[str]) -> tuple[int, str]:
-        proc = subprocess.run(
-            argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, timeout=10.0, check=False,
-        )
+        try:
+            proc = subprocess.run(
+                argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=10.0, check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            # probe 逾時視為「未就緒」而非崩潰：保持在 readiness 狀態機內
+            # （回傳非 0 rc → role_probe/ssh_check 判 False → wait_ready 續 poll
+            # 或逾時回 "starting"），不讓 TimeoutExpired 穿越到 open_tunnel。
+            partial = exc.output or ""
+            if isinstance(partial, bytes):
+                partial = partial.decode("utf-8", "replace")
+            return 124, f"probe timeout: {partial}"[:500]
         return proc.returncode, proc.stdout or ""
     return _run
 

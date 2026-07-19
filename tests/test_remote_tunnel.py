@@ -442,3 +442,41 @@ def test_real_ping_uses_client(monkeypatch):
     monkeypatch.setattr(rt, "_rpc_call", _fake_rpc_call)
     assert rt.real_ping("tcp://127.0.0.1:7777") is True
     assert seen["ep"] == "tcp://127.0.0.1:7777"
+
+
+# Task 8 review fix：fail-closed 涵蓋 probe 逾時與任意 readiness 例外
+def test_make_runner_timeout_returns_nonzero(monkeypatch):
+    """`subprocess.run` 逾時拋 `TimeoutExpired` 時，`make_runner()` 的 `_run` 需吞下並
+    回傳非 0 rc（非崩潰），讓逾時留在 readiness 狀態機內（probe 回 False 續 poll）。"""
+    def _raise_timeout(argv, stdout=None, stderr=None, text=None, timeout=None, check=None):
+        raise subprocess.TimeoutExpired(cmd=["x"], timeout=10.0)
+
+    monkeypatch.setattr(rt.subprocess, "run", _raise_timeout)
+    rc, msg = rt.make_runner()(["x"])
+    assert rc != 0
+    assert isinstance(msg, str)
+
+
+def test_open_tunnel_teardown_on_nontunnel_exception(tmp_path):
+    """readiness 階段丟出非 `TunnelError`（例如 `RuntimeError`）時，`open_tunnel` 仍需
+    fail-closed：拆除已 spawn 的行程群組、移除 durable state，再原樣 re-raise。"""
+    spec = rt.TunnelSpec(role="expose", ssh_target="u@h", port=7777, forward_src="/s.sock")
+    spawn = _fake_spawner(alive=True)
+
+    def _raising_role_probe_factory(spec, control_path, endpoint, *, runner, ping):
+        def _probe():
+            raise RuntimeError("probe 爆炸（非 TunnelError）")
+        return _probe
+
+    try:
+        with pytest.raises(RuntimeError):
+            rt.open_tunnel(
+                spec, str(tmp_path), spawner=spawn,
+                runner=lambda a: (0, ""), ping=lambda ep: True,
+                role_probe_factory=_raising_role_probe_factory,
+            )
+        assert spawn.procs["p"].poll() is not None  # 已被 teardown 終止
+        assert rt.Registry(str(tmp_path)).read(7777) is None  # state 已移除，fail-closed
+    finally:
+        with contextlib.suppress(Exception):
+            spawn.procs["p"].wait(timeout=2)
