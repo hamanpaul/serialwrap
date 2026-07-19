@@ -370,3 +370,46 @@ def test_terminate_pgid_reaps_and_returns_promptly():
     except ChildProcessError:
         result = None
     assert result is None or result[0] == proc.pid
+
+
+# Task 7: status（prune 死 state + orphan scan）與 close（killpg 整組 + verify + error-state）
+def test_status_prunes_dead_and_lists_alive(tmp_path):
+    reg = rt.Registry(str(tmp_path))
+    # `start_new_session=True`：獨立 pgid，避免與目前跑 pytest 的行程共用
+    # process group（見上方 `_fake_spawner`／`test_terminate_pgid_reaps_and_returns_promptly`
+    # 的既有慣例與理由；本測試雖不對 live 呼叫 killpg，仍統一套用避免僥倖依賴）。
+    live = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        with reg.lock():
+            reg.write({"listen_port": 7777, "status": "active", "role": "expose",
+                       "pid": live.pid, "pgid": os.getpgid(live.pid),
+                       "pid_start_ticks": rt.read_pid_start_ticks(live.pid),
+                       "target": "u@h"})
+            reg.write({"listen_port": 7778, "status": "active", "role": "connect",
+                       "pid": 999999, "pgid": 999999, "pid_start_ticks": 1, "target": "u@r"})
+        res = rt.status(str(tmp_path))
+        ports = {t["listen_port"] for t in res["tunnels"]}
+        assert 7777 in ports and 7778 not in ports  # 死的被 prune
+    finally:
+        live.terminate(); live.wait()
+
+
+def test_close_terminates_and_removes(tmp_path):
+    reg = rt.Registry(str(tmp_path))
+    # `start_new_session=True`：務必獨立 pgid——`close()` 會對 pgid 送
+    # `os.killpg(SIGTERM)`；若沿用 pytest 本身的 pgid，會連 pytest 行程一併
+    # 殺死（已實測驗證：無此旗標時子行程與呼叫者同 pgid，killpg 會連呼叫者
+    # 一起中止，整個測試行程被 SIGTERM 中斷而非乾淨地跑完斷言）。
+    live = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    with reg.lock():
+        reg.write({"listen_port": 7777, "status": "active", "role": "expose",
+                   "pid": live.pid, "pgid": os.getpgid(live.pid),
+                   "pid_start_ticks": rt.read_pid_start_ticks(live.pid), "target": "u@h"})
+    res = rt.close(str(tmp_path), 7777)
+    assert 7777 in res["closed"]
+    assert reg.read(7777) is None
+    assert live.poll() is not None  # 已被終止
+
+
+def test_close_missing_is_idempotent(tmp_path):
+    assert rt.close(str(tmp_path), 12345) == {"ok": True, "closed": []}

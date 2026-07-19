@@ -486,6 +486,77 @@ def open_tunnel(
     return {"ok": True, **_public(state)}
 
 
+def status(run_dir: str) -> dict:
+    """列出所有隧道；就地 prune 已死的 state，並掃描孤兒 control socket。
+
+    pid<=0（缺 pid 欄位的殘缺 state）一律視為死亡並 prune，不呼叫
+    `pid_alive()`（同 `open_tunnel` 的 pid<=0 守衛慣例：`os.kill(-1, 0)` 會
+    POSIX-broadcast 且無條件成功，會把殘缺 state 誤判為存活）。
+    """
+    reg = Registry(run_dir)
+    tunnels: list[dict] = []
+    with reg.lock():
+        for st in reg.read_all():
+            pid = int(st.get("pid", -1))
+            if pid > 0 and pid_alive(pid, st.get("pid_start_ticks")):
+                out = _public(st)
+                out["alive"] = True
+                tunnels.append(out)
+            else:
+                reg.remove(int(st["listen_port"]))  # prune 死 state
+        # orphan scan：cm-* control socket 檔案存在卻無對應 state
+        # （ssh master 仍活著，但 state 遺失／未寫入的孤兒）。
+        try:
+            for name in sorted(os.listdir(reg.remote_dir)):
+                if name.startswith("cm-") and not reg.read(_port_of_cm(name)):
+                    tunnels.append({
+                        "status": "orphan",
+                        "control_path": os.path.join(reg.remote_dir, name),
+                        "alive": True,
+                    })
+        except OSError:
+            pass
+    return {"ok": True, "tunnels": tunnels}
+
+
+def _port_of_cm(name: str) -> int:
+    """從 `cm-<port>` 控制端點檔名解析 port；解析失敗回 -1（不會命中任何 state）。"""
+    try:
+        return int(name[len("cm-"):])
+    except ValueError:
+        return -1
+
+
+def close(run_dir: str, selector: str | int, *, sleep: Callable[[float], None] = time.sleep) -> dict:
+    """依 `selector`（port 或 `"all"`）關閉隧道：驗活 → killpg 整組行程 → wait → remove。
+
+    找不到對應 port（已被 prune 或本就不存在）視為冪等 no-op，回
+    `{"ok": True, "closed": []}`，不視為錯誤。`_terminate_pgid` 拆除失敗時
+    保留 `status="error"` 的 state（不 remove），供後續人工排查；pid<=0
+    的殘缺 state 直接跳過 killpg、視為已死並 remove（同 `status` 的守衛慣例）。
+    """
+    reg = Registry(run_dir)
+    closed: list[int] = []
+    with reg.lock():
+        targets = reg.read_all()
+        if str(selector) != "all":
+            targets = [s for s in targets if str(s.get("listen_port")) == str(selector)]
+        for st in targets:
+            port = int(st["listen_port"])
+            pid = int(st.get("pid", -1))
+            pgid = int(st.get("pgid", pid))
+            if pid > 0 and pid_alive(pid, st.get("pid_start_ticks")):
+                try:
+                    _terminate_pgid(pgid, sleep=sleep)
+                except Exception:  # noqa: BLE001 — 拆除失敗不讓例外穿越 RPC/CLI 邊界，改記錄 error 狀態
+                    st["status"] = "error"
+                    reg.write(st)
+                    continue
+            reg.remove(port)
+            closed.append(port)
+    return {"ok": True, "closed": closed}
+
+
 def _public(state: dict) -> dict:
     """對外可見欄位（去掉 control_path 等內部細節）。"""
     keys = ("status", "role", "pid", "listen_port", "target", "remote_bind",
