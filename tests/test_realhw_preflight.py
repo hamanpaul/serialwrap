@@ -108,6 +108,23 @@ def test_external_testpilot_refuses_suite():
     assert not ok and any("testpilot" in p for p in problems)
 
 
+def test_external_testpilot_ignores_own_pid(monkeypatch):
+    me = os.getpid()
+    monkeypatch.setattr(
+        preflight,
+        "_run",
+        lambda argv, timeout=30.0: SimpleNamespace(
+            returncode=0,
+            stdout=(
+                f"{me} testpilot run serialwrap_reliability --case p0-doctor\n"
+                "4321 testpilot run wifi_llapi --case smoke\n"
+            ),
+            stderr="",
+        ),
+    )
+    assert preflight._external_testpilot() == ["4321 testpilot run wifi_llapi --case smoke"]
+
+
 def test_boards_missing_attributed_to_windows_daemon():
     ok, problems = preflight.evaluate(_checks(
         boards_ready=["COM0"], win_daemon_present=True, win_daemon_holds=("COM1",)))

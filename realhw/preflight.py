@@ -202,7 +202,19 @@ def acquire_benchlock(lock_path: Path) -> int | None:
 
 def _external_testpilot() -> list[str]:
     cp = _run(["pgrep", "-af", r"testpilot ru[n]"])
-    return [ln for ln in cp.stdout.splitlines() if ln.strip()]
+    me = os.getpid()
+    out: list[str] = []
+    for ln in cp.stdout.splitlines():
+        parts = ln.split(None, 1)
+        if not parts:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        if pid != me and ln.strip():
+            out.append(ln)
+    return out
 
 
 def collect(cfg: dict, sw, repo_root, *, benchlock_ok: bool = True, win=None) -> Checks:
