@@ -89,27 +89,26 @@ serialwrap 另提供原生 MCU flash 端點（與上面 device handoff 互補）
 - 若板子已卡在 bootloader prompt（`=> `／`U-Boot> `）：prpl-template 有 `bootloader_prompts`，用 `serialwrap session interactive-open --selector COM0 --allow-attached` 開 recovery lease 打 `boot` 脫困。
 - 若板子會 autoboot 載入壞 image、想**刻意中斷** autoboot（#114）：不必等它停在 `=> `——在倒數窗（RX 見 `Hit any key to stop autoboot`／`U-Boot` banner）即可 `serialwrap session interactive-open --selector COM0 --allow-attached` 搶開 lease（回應帶 `boot_interrupt: true`），再以 `interactive-send` 連打按鍵中斷 autoboot 停在 `=> ` 後救 fw。lease 送鍵不受 boot quiet window gate。
 
-## Remote Support 用法（ssh-tunnel）
-當 Agent 不在 target 所在機器上，而要從遠端 debug UART 時，走 **remote endpoint** 模式。
-- daemon 仍跑在 **target 所在主機**；Agent 端只透過 `--endpoint tcp://host:port` 連到遠端 daemon。
-- 正式環境優先使用 **ssh-tunnel**。
+## Remote Support 用法（serialwrap remote，ssh-tunnel）
 
-target 端（暴露 daemon socket，務必 bind 127.0.0.1）：
+Agent 要從遠端操作本機 UART 時：**在 UART host（daemon 所在機）** 跑一行反向隧道，agent 端照舊用 `--endpoint`。daemon 不重啟、不做預設。
+
 ```bash
-socat TCP-LISTEN:7777,bind=127.0.0.1,reuseaddr,fork \
-      UNIX-CONNECT:/run/serialwrap/serialwrapd.sock &
+# UART host（有 serialwrapd）：把本機 daemon 反向推到對端（-R 為預設）
+serialwrap remote tester@AGENT_OR_RELAY:7777
 ```
-（socket 路徑依監管模式：systemd-system 預設 `/run/serialwrap/serialwrapd.sock`；實際值見 `~/.config/serialwrap/config.yaml` 的 `socket_path`。）
-RD / Agent 端：
-```bash
-ssh -N -L 127.0.0.1:7777:127.0.0.1:7777 remote_user@target_host
-serialwrap --endpoint tcp://127.0.0.1:7777 session list
-```
-注意事項：
-- `serialwrap daemon start` 不支援 `--endpoint`。
-- `file push` / `file pull` 的 `--local` 路徑是 **daemon 所在 host/container** 的路徑，不是 Agent 本機路徑。
-- 正式環境 `socat` 必須 `bind=127.0.0.1`，不可直接暴露到外網。
-- 隔離煙測可跑 `./tools/docker/remote_smoke.sh`，不代表 production 暴露方式。
+
+Agent 端連線（依拓樸擇一）：
+
+- **direct**（agent host 就是上面 ssh 的對端）：直接
+  `serialwrap --endpoint tcp://127.0.0.1:7777 session list`
+- **relay / 雙 NAT**（agent 與 UART host 互不可達，各自對 relay 撥出）：agent 端先
+  `serialwrap remote -L tester@RELAY:7777`（回傳 `endpoint`），再用該 endpoint。
+
+管理：`serialwrap remote`（列隧道）、`serialwrap remote close 7777|all`（拆除）。
+回傳 `status`：`active`＝就緒可用；`starting`＝尚未確認（慢速認證／上游未就緒），需再 `remote status` 或重試。
+
+安全：隧道讓對端全權操控 DUT。**只用單租戶／可信 relay**；共享 relay 加 `--remote-socket /path`（遠端改建檔案權限把關的 unix socket）。`-R` tcp 模式若偵測遠端被 `GatewayPorts` 綁到對外，會拒絕（`REMOTE_BIND_UNVERIFIED`）。
 
 ## Event Trigger Engine
 用於 UART RX 觸發自動化 handler。**先呼叫 `serialwrap event status`** 確認狀態再 enable/disable，避免假設狀態。

@@ -149,7 +149,17 @@ console listener 講 **Telnet**（server 主動協商 char-mode + 遠端回顯�
 | MCU 燒錄 | `/dev/ttyMCU` PTY-bridge（#55） | `device release` 釋放 COM → 外部燒錄工具獨佔 → `device attach` 收回（#54 語意） |
 | 單例防護 | flock + socket probe | msvcrt 檔鎖 + TCP probe |
 
-## 10. MCU 燒錄（device release / attach）
+## 10. Remote Support（native Windows：本期不支援 serialwrap remote）
+
+native Windows 執行 `serialwrap remote` 回 `REMOTE_NOT_SUPPORTED`。需遠端存取時**手動**建反向隧道：
+
+```powershell
+ssh -N -R 7777:127.0.0.1:48700 user@AGENT_OR_RELAY
+```
+
+（Windows daemon 為 TCP loopback `48700`。）agent 端照舊 `serialwrap --endpoint tcp://127.0.0.1:7777`。
+
+## 11. MCU 燒錄（device release / attach）
 
 Windows 燒錄工具直接獨佔開 `COMx`，serialwrap 只需讓出 handle：
 
@@ -159,7 +169,7 @@ serialwrap device release --selector COM0 --source agent:flash --reason "flash M
 serialwrap device attach --selector COM0
 ```
 
-## 11. 疑難排解
+## 12. 疑難排解
 
 - 任何指令連不上 → `serialwrap doctor` 看 `daemon_endpoint`；未在跑則
   `serialwrap daemon start`。
