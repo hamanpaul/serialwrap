@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -149,3 +150,289 @@ def test_filter_for_run_explicit_id_includes_destructive():
     cases = core.build_case_dicts([_mk_case("a"), _mk_case("b", destructive=True)], CFG)
     got = core.filter_for_run(cases, {"b"})
     assert [case["id"] for case in got] == ["b"]
+
+
+# ---------------------------------------------------------------- Task 4：判決抄寫與執行編排
+def test_result_to_dict_copies_case_result_shape():
+    core.ensure_realhw_importable()
+    from realhw import harness
+
+    result = harness.CaseResult(
+        "FAIL",
+        reason="oops",
+        evidence={"a": "x.txt"},
+        duration_s=1.25,
+        category="test",
+        reason_code="boom",
+    )
+    assert core.result_to_dict(result) == {
+        "verdict": "FAIL",
+        "reason": "oops",
+        "category": "test",
+        "reason_code": "boom",
+        "evidence": {"a": "x.txt"},
+        "duration_s": 1.25,
+    }
+
+
+def test_failure_payload_pass_is_none():
+    assert core.failure_payload({"verdict": "PASS"}) is None
+
+
+def test_failure_payload_fail_copies_classification():
+    payload = core.failure_payload({
+        "verdict": "FAIL", "reason": "fan-out 斷線", "category": "test",
+        "reason_code": "console_fanout_lost",
+        "evidence": {"pane": "p1-con/pane.txt"}, "duration_s": 1.0,
+    })
+    assert payload == {
+        "category": "test",
+        "reason_code": "console_fanout_lost",
+        "comment": "fan-out 斷線",
+        "evidence": ["p1-con/pane.txt"],
+        "metadata": {"realhw_verdict": "FAIL"},
+    }
+
+
+def test_failure_payload_runtime_skip_defaults_environment():
+    payload = core.failure_payload({"verdict": "SKIP", "reason": "base64 缺", "category": "",
+                                    "reason_code": "base64_missing", "evidence": {}})
+    assert payload["category"] == "environment"
+
+
+def test_failure_payload_fail_without_category_stays_empty():
+    payload = core.failure_payload({"verdict": "FAIL", "reason": "boom", "category": "",
+                                    "reason_code": "uncaught_exception", "evidence": {}})
+    assert payload["category"] == ""
+
+
+def test_runtime_skip_broken_by_and_missing_caps():
+    meta_dep = {"requires": ["two_boards"], "destructive": False}
+    assert core.runtime_skip(meta_dep, {}, "p1-hp-cycle") == (
+        "broken_by:p1-hp-cycle", "前置不滿足（p1-hp-cycle 後板卡未恢復）")
+    meta_rm = {"requires": ["docker"], "destructive": False}
+    assert core.runtime_skip(meta_rm, {"docker": "docker_unavailable"}, None) == (
+        "docker_unavailable", "能力缺項：docker")
+    assert core.runtime_skip(meta_rm, {}, None) is None
+    assert core.runtime_skip({"requires": [], "destructive": False}, {}, "x") is None
+
+
+def test_runtime_skip_consumes_missing_capabilities_output():
+    """整合斷言（防靜默失效）：Phase 1 missing_capabilities 的實際輸出必須能直接餵 runtime_skip。"""
+    core.ensure_realhw_importable()
+    from realhw import preflight
+
+    caps = preflight.Capabilities(remote_capability=False, deployed_version="", docker=False)
+    missing = preflight.missing_capabilities(caps)
+    assert core.runtime_skip({"requires": ["remote_capability"], "destructive": False},
+                             missing, None) == (
+        "remote_capability_missing", "能力缺項：remote_capability")
+    assert core.runtime_skip({"requires": ["docker"], "destructive": False},
+                             missing, None) == (
+        "docker_unavailable", "能力缺項：docker")
+
+
+def test_make_skip_result_shape():
+    r = core.make_skip_result("docker_unavailable", "能力缺項：docker")
+    assert (r.verdict, r.category, r.reason_code) == ("SKIP", "environment", "docker_unavailable")
+
+
+def test_build_ctx_injects_win_cli(monkeypatch, tmp_path):
+    core.ensure_realhw_importable()
+    from realhw import drivers
+
+    class FakeSwCli:
+        pass
+
+    class FakeTmuxCtl:
+        def __init__(self, prefix: str) -> None:
+            self.prefix = prefix
+
+    class FakeUsbipd:
+        def __init__(self, exe: str) -> None:
+            self.exe = exe
+
+    class FakeSystemd:
+        pass
+
+    class FakeWinSwCli:
+        def __init__(self, exe: str) -> None:
+            self.exe = exe
+
+    monkeypatch.setattr(drivers, "SwCli", FakeSwCli)
+    monkeypatch.setattr(drivers, "TmuxCtl", FakeTmuxCtl)
+    monkeypatch.setattr(drivers, "Usbipd", FakeUsbipd)
+    monkeypatch.setattr(drivers, "Systemd", FakeSystemd)
+    monkeypatch.setattr(drivers, "WinSwCli", FakeWinSwCli)
+    ctx = core.build_ctx({
+        "tmux_prefix": "realhw",
+        "usbipd_exe": "/x/usbipd.exe",
+        "win_serialwrap_exe": "/mnt/c/serialwrap.exe",
+    }, tmp_path)
+    assert isinstance(ctx.sw, FakeSwCli)
+    assert isinstance(ctx.tmux, FakeTmuxCtl) and ctx.tmux.prefix == "realhw"
+    assert isinstance(ctx.usbipd, FakeUsbipd) and ctx.usbipd.exe == "/x/usbipd.exe"
+    assert isinstance(ctx.systemd, FakeSystemd)
+    assert isinstance(ctx.win, FakeWinSwCli) and ctx.win.exe == "/mnt/c/serialwrap.exe"
+    assert ctx.report_dir == tmp_path and ctx.case_dir == tmp_path
+
+
+def test_run_case_blackbox_pass_and_uncaught(monkeypatch, tmp_path):
+    core.ensure_realhw_importable()
+    from realhw import harness
+
+    ok = harness.Case(id="fake-ok", tier="p0", title="ok",
+                      run=lambda ctx: harness.CaseResult("PASS"))
+
+    def _boom(ctx):
+        raise RuntimeError("爆")
+
+    bad = harness.Case(id="fake-bad", tier="p0", title="bad", run=_boom)
+    monkeypatch.setattr(harness, "REGISTRY", [ok, bad])
+    ctx = SimpleNamespace(report_dir=tmp_path, case_dir=tmp_path)
+
+    r1 = core.run_case_blackbox("fake-ok", ctx)
+    assert r1.verdict == "PASS" and r1.duration_s >= 0.0
+    assert ctx.case_dir == tmp_path / "fake-ok"
+
+    r2 = core.run_case_blackbox("fake-bad", ctx)
+    assert (r2.verdict, r2.category, r2.reason_code) == ("FAIL", "", "uncaught_exception")
+
+    r3 = core.run_case_blackbox("no-such", ctx)
+    assert (r3.verdict, r3.category, r3.reason_code) == (
+        "FAIL", "configuration", "invalid_case_config")
+
+
+class _FakeSw:
+    """恢復流程 fake：第一輪回報非 READY、恢復後 READY。"""
+
+    def __init__(self, initial_state: str) -> None:
+        self.state = initial_state
+        self.calls: list[tuple[str, ...]] = []
+
+    def session(self, com: str) -> dict:
+        return {"com": com, "state": self.state}
+
+    def run(self, *args: str, **kw) -> dict:
+        self.calls.append(args)
+        self.state = "READY"
+        return {"ok": True}
+
+    def wait_state(self, com: str, want: str, *, timeout_s: float, poll_s: float = 2.0) -> bool:
+        return self.state == want
+
+
+def test_recover_boards_dispatches_state_aware_verb(monkeypatch):
+    monkeypatch.setattr(core.time, "sleep", lambda s: None)
+    sw = _FakeSw("ATTACHED")
+    ctx = SimpleNamespace(sw=sw)
+    left = core.recover_boards(ctx, ["COM0"])
+    assert left == []
+    assert sw.calls == [("session", "recover", "--selector", "COM0")]
+
+
+def test_recover_boards_ready_is_noop():
+    sw = _FakeSw("READY")
+    assert core.recover_boards(SimpleNamespace(sw=sw), ["COM0", "COM1"]) == []
+    assert sw.calls == []
+
+
+def test_sweep_tmux_kills_only_prefix(monkeypatch):
+    ran: list[list[str]] = []
+
+    def fake_run(argv, capture_output=True, text=True):
+        ran.append(list(argv))
+        if argv[:2] == ["tmux", "ls"]:
+            return SimpleNamespace(stdout="realhw-p0con-1\nother-sess\nrealhw-lrhuman-2\n",
+                                   returncode=0)
+        return SimpleNamespace(stdout="", returncode=0)
+
+    monkeypatch.setattr(core.subprocess, "run", fake_run)
+    killed = core.sweep_tmux("realhw")
+    assert killed == ["realhw-p0con-1", "realhw-lrhuman-2"]
+    assert ["tmux", "kill-session", "-t", "other-sess"] not in ran
+
+
+def test_checkpoint_index():
+    assert core.checkpoint_index("checkpoint-007", fallback=9) == 7
+    assert core.checkpoint_index("weird", fallback=9) == 9
+
+
+def test_longrun_runner_join_and_snapshots(tmp_path):
+    snaps = tmp_path / "snapshots.ndjson"
+    snaps.write_text('{"t":0}\n{"t":300}\n', encoding="utf-8")
+    sentinel = object()
+    runner = core.LongrunRunner(run_fn=lambda: sentinel, snapshots_path=snaps, duration_s=0)
+    runner.start()
+    progress = runner.wait_checkpoint(1, 1)
+    assert progress == {"checkpoint": 1, "total": 1, "snapshots_seen": 2, "finished": True}
+    assert runner.result() is sentinel
+
+
+def test_longrun_runner_skipped_mode():
+    r = core.make_skip_result("docker_unavailable", "能力缺項：docker")
+    runner = core.LongrunRunner.skipped(r)
+    progress = runner.wait_checkpoint(1, 3)
+    assert progress["finished"] is True and progress["snapshots_seen"] == 0
+    assert runner.result() is r
+
+
+def test_run_preflight_acquires_benchlock_and_collects_missing(monkeypatch, tmp_path):
+    """防靜默失效雙斷言：benchlock 有被嘗試取鎖並注入 collect；missing_caps 有被收集。"""
+    core.ensure_realhw_importable()
+    from realhw import preflight
+
+    lockfile = tmp_path / "bench.lock"
+    seen: dict = {}
+    monkeypatch.setattr(preflight, "bench_lock_path", lambda: lockfile)
+    real_acquire = preflight.acquire_benchlock
+
+    def spy_acquire(path):
+        seen["acquire_path"] = Path(path)
+        return real_acquire(path)
+
+    monkeypatch.setattr(preflight, "acquire_benchlock", spy_acquire)
+
+    def fake_collect(cfg, sw, root, *, benchlock_ok=True, win=None):
+        seen["benchlock_ok"] = benchlock_ok
+        seen["win_passed"] = win is not None
+        return "CHECKS"
+
+    monkeypatch.setattr(preflight, "collect", fake_collect)
+    monkeypatch.setattr(preflight, "evaluate", lambda c: (True, []))
+    caps = preflight.Capabilities(remote_capability=True,
+                                  deployed_version="serialwrap 0.2.3", docker=False)
+    monkeypatch.setattr(preflight, "collect_capabilities", lambda sw: caps)
+
+    out = core.run_preflight({"boards": [], "win_serialwrap_exe": ""})
+    assert seen["acquire_path"] == lockfile
+    assert seen["benchlock_ok"] is True
+    assert seen["win_passed"] is True
+    assert out["ok"] is True
+    assert out["missing_caps"] == {"docker": "docker_unavailable"}
+    assert out["deployed_version"] == "serialwrap 0.2.3"
+    assert out["benchlock_fd"] is not None
+
+
+def test_run_preflight_refuses_when_benchlock_held(monkeypatch, tmp_path):
+    core.ensure_realhw_importable()
+    from realhw import preflight
+
+    lockfile = tmp_path / "bench.lock"
+    monkeypatch.setattr(preflight, "bench_lock_path", lambda: lockfile)
+    held_fd = preflight.acquire_benchlock(lockfile)
+    assert held_fd is not None
+
+    def fake_collect(cfg, sw, root, *, benchlock_ok=True, win=None):
+        return {"benchlock_ok": benchlock_ok}
+
+    monkeypatch.setattr(preflight, "collect", fake_collect)
+    monkeypatch.setattr(
+        preflight, "evaluate",
+        lambda c: (c["benchlock_ok"],
+                   [] if c["benchlock_ok"] else ["bench 互斥：benchlock 已被持有（拒跑）"]))
+    out = core.run_preflight({"boards": [], "win_serialwrap_exe": ""})
+    assert out["ok"] is False
+    assert out["benchlock_fd"] is None
+    assert any("benchlock" in p for p in out["problems"])
+    assert out["missing_caps"] == {} and out["deployed_version"] == ""
