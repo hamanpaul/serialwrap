@@ -41,3 +41,55 @@ def load_registry() -> list[Any]:
     from realhw import harness
 
     return list(harness.REGISTRY)
+
+
+def synth_longrun_steps(duration_s: int, interval_s: int) -> list[dict[str, Any]]:
+    """duration/interval → N 個 checkpoint step（最少 1）。"""
+    n = max(1, int(duration_s) // max(1, int(interval_s)))
+    return [
+        {"id": f"checkpoint-{i:03d}", "action": "longrun_checkpoint", "target": "bench"}
+        for i in range(1, n + 1)
+    ]
+
+
+def case_to_dict(case: Any, cfg: dict[str, Any]) -> dict[str, Any]:
+    """realhw Case → testpilot case dict 最小形狀。"""
+    devices = {
+        str(board["com"]): {
+            "role": str(board.get("alias", "")),
+            "serial": str(board.get("serial", "")),
+            "busid": str(board.get("busid", "")),
+            "platform": str(board.get("platform", "")),
+        }
+        for board in cfg.get("boards", [])
+    }
+    if case.tier == "longrun":
+        interval_s = int((cfg.get("longrun") or {}).get("snapshot_interval_s") or 300)
+        steps = synth_longrun_steps(int(cfg.get("duration_s") or 0), interval_s)
+    else:
+        steps = [{"id": "exec", "action": "run_case", "target": "bench"}]
+    return {
+        "id": case.id,
+        "name": case.title,
+        "topology": {"devices": devices},
+        "steps": steps,
+        "pass_criteria": ["realhw_case_verdict"],
+        "metadata": {
+            "tier": case.tier,
+            "destructive": bool(case.destructive),
+            "requires": list(case.requires),
+            "hints": list(case.hints),
+        },
+    }
+
+
+def build_case_dicts(registry: list[Any], cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """整個 registry → case dicts（維持註冊順序）。"""
+    return [case_to_dict(case, cfg) for case in registry]
+
+
+def filter_for_run(cases: list[dict[str, Any]], requested_ids: set[str]) -> list[dict[str, Any]]:
+    """預設排除 destructive；顯式點名時允許。"""
+    if requested_ids:
+        return [case for case in cases if case["id"] in requested_ids]
+    return [case for case in cases if not (case.get("metadata") or {}).get("destructive")]
