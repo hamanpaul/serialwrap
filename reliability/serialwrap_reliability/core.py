@@ -54,15 +54,17 @@ def synth_longrun_steps(duration_s: int, interval_s: int) -> list[dict[str, Any]
 
 def case_to_dict(case: Any, cfg: dict[str, Any]) -> dict[str, Any]:
     """realhw Case → testpilot case dict 最小形狀。"""
-    devices = {
-        str(board["com"]): {
+    devices: dict[str, dict[str, str]] = {}
+    for index, board in enumerate(cfg.get("boards", [])):
+        com = board.get("com")
+        if not com:
+            raise ValueError(f"boards[{index}] 缺 'com' 欄位（board={board!r}）")
+        devices[str(com)] = {
             "role": str(board.get("alias", "")),
             "serial": str(board.get("serial", "")),
             "busid": str(board.get("busid", "")),
             "platform": str(board.get("platform", "")),
         }
-        for board in cfg.get("boards", [])
-    }
     if case.tier == "longrun":
         interval_s = int((cfg.get("longrun") or {}).get("snapshot_interval_s") or 300)
         steps = synth_longrun_steps(int(cfg.get("duration_s") or 0), interval_s)

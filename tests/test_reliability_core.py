@@ -115,6 +115,13 @@ def test_case_to_dict_longrun_synthesizes_checkpoints():
     ]
 
 
+def test_case_to_dict_missing_com_fails_loud():
+    bad_cfg = dict(CFG)
+    bad_cfg["boards"] = [{"alias": "dut-only"}]
+    with pytest.raises(ValueError, match=r"boards\[0\].*com"):
+        core.case_to_dict(_mk_case("bad"), bad_cfg)
+
+
 def test_build_case_dicts_preserves_registry_order():
     got = core.build_case_dicts([_mk_case("a"), _mk_case("b"), _mk_case("c")], CFG)
     assert [case["id"] for case in got] == ["a", "b", "c"]
