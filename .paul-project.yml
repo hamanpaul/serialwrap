@@ -2,6 +2,14 @@ policy_profile: flat
 policy_version: "1.0.10"
 # 內容分類（R-21）：serialwrap 為通用序列工具、無雇主機密 → 維持 public
 tier: shareable
+secret_scan:
+  # R-21 結構偵測器（比對「斜線 home 斜線 使用者名稱 斜線」樣式）誤判：以下檔案內含
+  # docker 測試映像內建的 tester 帳號 home 目錄路徑（tools/docker/remote_tunnel_test.sh
+  # 三拓樸驗收用），該帳號僅存在於一次性測試容器內，非任何真人開發者的本機個人路徑，允許放行。
+  allow:
+    - "Dockerfile"
+    - "tools/docker/remote_tunnel_test.sh"
+    - "tools/docker/uart_harness.py"
 code_paths:
   - "sw_core/**"
   - "tools/**"
