@@ -735,7 +735,10 @@ def _run_remote(args: argparse.Namespace) -> int:
 
         forward_src = None
         if role == "expose":
-            forward_src = _forward_src_from_endpoint(_resolve_endpoint(args))
+            try:
+                forward_src = _forward_src_from_endpoint(_resolve_endpoint(args))
+            except ValueError as exc:
+                raise rt.TunnelError("INVALID_ENDPOINT", str(exc)) from exc
 
         spec = rt.TunnelSpec(
             role=role,

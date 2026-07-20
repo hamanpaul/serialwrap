@@ -45,3 +45,12 @@ def test_remote_open_dispatches_to_open_tunnel(tmp_path, monkeypatch, capsys):
     assert rc == 0 and obj["status"] == "active"
     assert captured["spec"].role == "expose"  # -R 預設
     assert captured["spec"].ssh_target == "tester@relay"
+
+
+def test_remote_malformed_endpoint_returns_json_error(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("SERIALWRAP_RUN_DIR", str(tmp_path))
+    monkeypatch.setattr(rt, "resolve_ssh_bin", lambda via: "/usr/bin/ssh")
+    rc, obj = _run(["--endpoint", "http://badscheme:1", "remote", "tester@relay:7777"], capsys)
+    assert rc == 1 and obj is not None
+    assert obj["ok"] is False
+    assert obj["error_code"] == "INVALID_ENDPOINT"
