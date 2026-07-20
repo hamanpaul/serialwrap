@@ -219,6 +219,11 @@ class Registry:
         """狀態檔路徑。"""
         return os.path.join(self.remote_dir, f"{listen_port}.json")
 
+    def log_path(self, listen_port: int) -> str:
+        """spawn log 路徑（ssh/autossh stdout+stderr 導向處）；單一事實來源，
+        `open_tunnel` 與 `remove()` 皆須經此取得，避免路徑格式各自為政。"""
+        return os.path.join(self.remote_dir, f"{listen_port}.log")
+
     def write(self, state: dict) -> None:
         """原子寫入狀態（先 tmp 再 replace）。"""
         self._ensure_dir()
@@ -253,8 +258,8 @@ class Registry:
         return out
 
     def remove(self, listen_port: int) -> None:
-        """刪除隧道狀態與控制端點。"""
-        for p in (self.state_path(listen_port), self.control_path(listen_port)):
+        """刪除隧道狀態、控制端點與 spawn log（三者同生命週期，避免 `.log` 隨重試累積殘留）。"""
+        for p in (self.state_path(listen_port), self.control_path(listen_port), self.log_path(listen_port)):
             with contextlib.suppress(OSError):
                 os.unlink(p)
 
@@ -449,7 +454,7 @@ def open_tunnel(
                 )
             reg.remove(listen_port)  # 死 state → 視為過期，覆寫
 
-        log_path = os.path.join(reg.remote_dir, f"{listen_port}.log")
+        log_path = reg.log_path(listen_port)
         pid, pgid, start_ticks, stderr_tail = spawner(build_argv(spec, control_path), control_path, log_path)
         state = {
             "identity": identity, "status": "spawning", "role": spec.role,

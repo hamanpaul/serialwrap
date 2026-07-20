@@ -41,9 +41,15 @@ RUN useradd -m -s /bin/bash tester \
     && ssh-keygen -A
 
 # ssh client：測試容器間互連免 host-key 確認（僅此測試映像；passwordless key 已限定用途，
-# 不對外流通）。置於 ssh_config 最前段——OpenSSH 對同鍵取第一個設定值，故本段權威。
-RUN { printf 'Host *\n    StrictHostKeyChecking no\n    UserKnownHostsFile /dev/null\n    LogLevel ERROR\n\n'; cat /etc/ssh/ssh_config; } > /etc/ssh/ssh_config.new \
-    && mv /etc/ssh/ssh_config.new /etc/ssh/ssh_config
+# 不對外流通）。**僅**寫入 `tester`（唯一會執行 `serialwrap remote`／因而 spawn ssh 的帳號，
+# 見 tools/docker/remote_tunnel_test.sh 全數 `docker exec -u tester ... serialwrap remote`）
+# 的 per-user `~/.ssh/config`，不動全域 `/etc/ssh/ssh_config`——避免弱化映像內其他使用者／
+# 行程（如 otheruser、root）的 host-key 驗證基準。OpenSSH 依序讀 command-line → per-user
+# config → 系統 config，同鍵取第一個設定值，故 per-user config 已足夠權威、無需碰系統檔。
+RUN printf 'Host *\n    StrictHostKeyChecking no\n    UserKnownHostsFile /dev/null\n    LogLevel ERROR\n' \
+      > /home/tester/.ssh/config \
+    && chown tester:tester /home/tester/.ssh/config \
+    && chmod 600 /home/tester/.ssh/config
 
 # sshd 預設：GatewayPorts no（loopback-only remote bind，R2 finding 2 的安全基準）。
 RUN sed -i \

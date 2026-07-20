@@ -111,6 +111,23 @@ def test_registry_write_read_remove_atomic(tmp_path):
     assert reg.read(7777) is None
 
 
+def test_registry_remove_also_deletes_log(tmp_path):
+    """`.log`（ssh stdout/stderr）須與 state/control socket 同生命週期清除，
+    否則重試/失敗會在 `<run_dir>/remote/` 下累積孤兒 `.log`。"""
+    reg = rt.Registry(str(tmp_path))
+    with reg.lock():
+        reg.write({"listen_port": 7777, "status": "active", "role": "expose"})
+    log_path = reg.log_path(7777)
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    with open(log_path, "w", encoding="utf-8") as fh:
+        fh.write("ssh spawn log\n")
+    assert os.path.exists(log_path)
+    with reg.lock():
+        reg.remove(7777)
+    assert reg.read(7777) is None
+    assert not os.path.exists(log_path)
+
+
 def test_pid_alive_true_for_running_and_reuse_guard(tmp_path):
     proc = subprocess.Popen(["sleep", "30"])
     try:

@@ -47,6 +47,53 @@ def test_remote_open_dispatches_to_open_tunnel(tmp_path, monkeypatch, capsys):
     assert captured["spec"].ssh_target == "tester@relay"
 
 
+def test_remote_local_with_default_role_is_invalid_args(tmp_path, monkeypatch, capsys):
+    """--local 僅用於 -L（connect）；預設（-R/expose）帶入須擋在 CLI 層，不靜默略過。"""
+    monkeypatch.setenv("SERIALWRAP_RUN_DIR", str(tmp_path))
+    monkeypatch.setattr(rt, "resolve_ssh_bin", lambda via: "/usr/bin/ssh")
+    rc, obj = _run(["remote", "--local", "7000", "tester@relay:7777"], capsys)
+    assert rc == 1 and obj["error_code"] == "INVALID_ARGS"
+
+
+def test_remote_local_with_R_is_invalid_args(tmp_path, monkeypatch, capsys):
+    """--local 僅用於 -L（connect）；明確帶 -R 仍須擋。"""
+    monkeypatch.setenv("SERIALWRAP_RUN_DIR", str(tmp_path))
+    monkeypatch.setattr(rt, "resolve_ssh_bin", lambda via: "/usr/bin/ssh")
+    rc, obj = _run(["remote", "-R", "--local", "7000", "tester@relay:7777"], capsys)
+    assert rc == 1 and obj["error_code"] == "INVALID_ARGS"
+
+
+def test_remote_local_zero_is_invalid_args(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("SERIALWRAP_RUN_DIR", str(tmp_path))
+    monkeypatch.setattr(rt, "resolve_ssh_bin", lambda via: "/usr/bin/ssh")
+    rc, obj = _run(["remote", "-L", "--local", "0", "tester@relay:7777"], capsys)
+    assert rc == 1 and obj["error_code"] == "INVALID_ARGS"
+
+
+def test_remote_local_too_large_is_invalid_args(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("SERIALWRAP_RUN_DIR", str(tmp_path))
+    monkeypatch.setattr(rt, "resolve_ssh_bin", lambda via: "/usr/bin/ssh")
+    rc, obj = _run(["remote", "-L", "--local", "99999", "tester@relay:7777"], capsys)
+    assert rc == 1 and obj["error_code"] == "INVALID_ARGS"
+
+
+def test_remote_local_valid_with_L_dispatches(tmp_path, monkeypatch, capsys):
+    """有效範圍內的 --local 搭 -L 仍照常派送到 open_tunnel。"""
+    monkeypatch.setenv("SERIALWRAP_RUN_DIR", str(tmp_path))
+    captured = {}
+
+    def fake_open(spec, run_dir, **kw):
+        captured["spec"] = spec
+        return {"ok": True, "status": "active", "role": "connect", "listen_port": spec.local}
+
+    monkeypatch.setattr(rt, "open_tunnel", fake_open)
+    monkeypatch.setattr(rt, "resolve_ssh_bin", lambda via: "/usr/bin/ssh")
+    rc, obj = _run(["remote", "-L", "--local", "7000", "tester@relay:7777"], capsys)
+    assert rc == 0 and obj["status"] == "active"
+    assert captured["spec"].role == "connect"
+    assert captured["spec"].local == 7000
+
+
 def test_remote_malformed_endpoint_returns_json_error(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("SERIALWRAP_RUN_DIR", str(tmp_path))
     monkeypatch.setattr(rt, "resolve_ssh_bin", lambda via: "/usr/bin/ssh")

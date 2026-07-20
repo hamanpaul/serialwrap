@@ -743,6 +743,11 @@ def _run_remote(args: argparse.Namespace) -> int:
         if args.reverse and args.forward:
             raise rt.TunnelError("INVALID_ARGS", "-R 與 -L 不可同時指定")
         role = "connect" if args.forward else "expose"  # -R 預設
+        # --local 僅對 -L（connect）有意義；-R/預設帶入視為誤用，早擋而非交給 ssh 晚爆
+        if args.local is not None and role == "expose":
+            raise rt.TunnelError("INVALID_ARGS", "--local 僅用於 -L（connect）")
+        if args.local is not None and not (1 <= args.local <= 65535):
+            raise rt.TunnelError("INVALID_ARGS", f"--local 超出範圍：{args.local}")
         ssh_target, port = rt.parse_target(words[0])
         rt.resolve_ssh_bin("autossh" if args.autossh else "ssh")
 
