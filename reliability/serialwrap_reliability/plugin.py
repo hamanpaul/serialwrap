@@ -38,6 +38,13 @@ class Plugin(PluginBase):
     def name(self) -> str:
         return "serialwrap_reliability"
 
+    @property
+    def version(self) -> str:
+        return "0.1.0"
+
+    def execution_policy(self, case: dict[str, Any]) -> dict[str, Any]:
+        return {"mode": "sequential", "max_concurrency": 1}
+
     def _plugin_root(self) -> Path:
         return Path(getattr(self, "plugin_root", Path(__file__).resolve().parent))
 
@@ -204,14 +211,19 @@ class Plugin(PluginBase):
         core.sweep_tmux(str(self.ctx.cfg.get("tmux_prefix") or "realhw"))
 
     def verify_install(self) -> list[tuple[bool, str]]:
+        cfg: dict[str, Any] | None = None
         checks: list[tuple[bool, str]] = [
             (shutil.which("serialwrap") is not None, "serialwrap CLI 在 PATH"),
             (shutil.which("tmux") is not None, "tmux 可用"),
+            (shutil.which("minicom") is not None, "minicom 可用"),
             ((self._plugin_root() / "agent-config.yaml").is_file(), "agent-config.yaml 存在"),
             ((self._plugin_root() / "testbed.yaml.example").is_file(), "testbed.yaml.example 存在"),
         ]
         try:
-            checks.append((bool(self._load_cfg().get("boards")), "testbed 至少一塊板"))
+            cfg = self._load_cfg()
+            usbipd = str(cfg.get("usbipd_exe", ""))
+            checks.append((bool(usbipd) and Path(usbipd).exists(), f"usbipd 存在（{usbipd or '未設定'}）"))
+            checks.append((bool(cfg.get("boards")), "testbed 至少一塊板"))
         except Exception as exc:
             checks.append((False, f"testbed.yaml.example 載入失敗：{exc!r}"))
         try:
@@ -220,3 +232,15 @@ class Plugin(PluginBase):
         except Exception as exc:
             checks.append((False, f"realhw 載入失敗：{exc!r}"))
         return checks
+
+    def capture_dut_firmware_version(self, config: Any, cases: list[dict[str, Any]]) -> dict[str, Any]:
+        deployed = str(self.run_meta.get("version", "")).strip()
+        return {"git": deployed} if deployed else {}
+
+    def create_reporter(self) -> Any:
+        from serialwrap_reliability.reporter import ReliabilityReporter
+
+        return ReliabilityReporter(plugin=self)
+
+    def report_formats(self) -> list[str]:
+        return ["md", "json"]

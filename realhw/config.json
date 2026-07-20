@@ -12,7 +12,7 @@
     {"com": "COM1", "alias": "sta-prpl", "serial": "AQ00OAQ7", "busid": "8-2", "platform": "brcm", "profile": "brcm-template"}
   ],
   "usbipd_exe": "/mnt/c/Program Files/usbipd-win/usbipd.exe",
-  "win_serialwrap_exe": "",
+  "win_serialwrap_exe": "/mnt/c/serialwrap/serialwrap.exe",
   "tmux_prefix": "realhw",
   "timeouts": {"ready_wait_s": 180, "reboot_wait_s": 300, "human_active_window_s": 60},
   "longrun": {"snapshot_interval_s": 300, "agent_workers": 4}

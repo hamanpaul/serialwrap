@@ -77,7 +77,7 @@ def test_load_registry_populated_unique():
 
 def test_core_modules_do_not_import_testpilot():
     pkg = REPO_ROOT / "reliability" / "serialwrap_reliability"
-    for name in ("__init__.py", "core.py"):
+    for name in sorted(path.name for path in pkg.glob("*.py") if path.name != "plugin.py"):
         text = (pkg / name).read_text(encoding="utf-8")
         bad = [line for line in text.splitlines() if re.match(r"\s*(import|from)\s+testpilot", line)]
         assert not bad, f"{name} 不得 import testpilot：{bad}"

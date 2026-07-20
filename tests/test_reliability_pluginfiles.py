@@ -37,7 +37,7 @@ def test_testbed_example_equivalent_to_config_json():
     cfg_yaml = testbed_loader.testbed_to_cfg(raw)
     cfg_json = testbed_loader.config_json_to_cfg(REPO_ROOT / "realhw" / "config.json")
     assert cfg_yaml["boards"] == cfg_json["boards"]
-    for key in ("usbipd_exe", "tmux_prefix", "timeouts", "longrun"):
+    for key in ("usbipd_exe", "win_serialwrap_exe", "tmux_prefix", "timeouts", "longrun"):
         assert cfg_yaml[key] == cfg_json[key], f"{key} 兩來源不一致"
     assert cfg_yaml["duration_s"] == 900
     assert cfg_yaml.get("win_serialwrap_exe")
@@ -56,3 +56,6 @@ def test_plugin_source_contract():
     text = (PKG / "plugin.py").read_text(encoding="utf-8")
     assert re.search(r'^\s*api_version\s*=\s*"1\.1"', text, re.M)
     assert re.search(r"from testpilot\.api import .*PluginBase", text)
+    assert re.search(r"^\s*def\s+execution_policy\(", text, re.M)
+    assert re.search(r"^\s*def\s+create_reporter\(", text, re.M)
+    assert re.search(r"^\s*def\s+report_formats\(", text, re.M)
