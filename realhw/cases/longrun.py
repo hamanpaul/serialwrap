@@ -494,8 +494,19 @@ def lr_mixed(ctx) -> CaseResult:
     if tot_submit >= 10 and tot_error / max(tot_submit, 1) > 0.5:
         reasons.append(f"命令錯誤率過高：{tot_error}/{tot_submit}")
 
+    reason_code = ""
+    if analysis["daemon_death_at"] is not None or major.get("kind") == "daemon_death":
+        reason_code = "daemon_died"
+    elif major.get("kind") == "both_boards_stuck":
+        reason_code = "both_boards_stuck"
+    elif long_stuck:
+        reason_code = "board_stuck"
+    elif reasons:
+        reason_code = "cmd_error_rate_high"
+
     verdict = "FAIL" if reasons else "PASS"
     evidence = {"analysis": _rel(analysis_path), "events": _rel(events_path),
                 "snapshots": _rel(snaps_path)}
     return CaseResult(verdict, reason="；".join(reasons) or "長跑完成、無重大事件",
+                      category="test" if reasons else "", reason_code=reason_code,
                       evidence=evidence)

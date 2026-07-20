@@ -36,13 +36,15 @@ def p1_ho_cycle(ctx):
     ready_wait = ctx.cfg["timeouts"]["ready_wait_s"]
     attached = ctx.sw.session("COM1").get("attached_real_path")
     if not attached:
-        return CaseResult("FAIL", reason="COM1 無 attached_real_path，無法起外部持有者")
+        return CaseResult("FAIL", reason="COM1 無 attached_real_path，無法起外部持有者",
+                          category="test", reason_code="attached_path_missing")
     rel = ctx.sw.run("device", "release", "--selector", "COM1",
                      "--source", "agent:realhw", "--reason", "realhw p1-ho-cycle")
     ctx.note("release.json", str(rel))
     s = ctx.sw.session("COM1")
     if s.get("state") != "RELEASED":
-        return CaseResult("FAIL", reason=f"release 後 COM1 非 RELEASED（{s.get('state')}）")
+        return CaseResult("FAIL", reason=f"release 後 COM1 非 RELEASED（{s.get('state')}）",
+                          category="test", reason_code="release_state_wrong")
     ses = ctx.tmux.name("hocycle")
     started = False
     try:
@@ -53,16 +55,20 @@ def p1_ho_cycle(ctx):
         att = ctx.sw.run("device", "attach", "--selector", "COM1")
         ctx.note("attach-held.json", str(att))
         if att.get("error_code") != "DEVICE_STILL_HELD":
-            return CaseResult("FAIL", reason=f"外部持有時 attach 未回 DEVICE_STILL_HELD（{att.get('error_code')}）")
+            return CaseResult("FAIL",
+                              reason=f"外部持有時 attach 未回 DEVICE_STILL_HELD（{att.get('error_code')}）",
+                              category="test", reason_code="still_held_not_detected")
         ctx.tmux.kill(ses)
         started = False
         time.sleep(2)
         att2 = ctx.sw.run("device", "attach", "--selector", "COM1")
         ctx.note("attach-ok.json", str(att2))
         if not ctx.sw.wait_state("COM1", "READY", timeout_s=ready_wait):
-            return CaseResult("FAIL", reason="kill 外部 minicom 後 attach 未回 READY")
+            return CaseResult("FAIL", reason="kill 外部 minicom 後 attach 未回 READY",
+                              category="test", reason_code="reclaim_ready_timeout")
         if ctx.sw.session("COM0").get("state") != "READY":
-            return CaseResult("FAIL", reason="交接期間 COM0（prpl）被擾動、非 READY")
+            return CaseResult("FAIL", reason="交接期間 COM0（prpl）被擾動、非 READY",
+                              category="test", reason_code="bystander_disturbed")
         return CaseResult("PASS")
     finally:
         if started:
@@ -81,21 +87,27 @@ def p1_ho_persist(ctx):
                      "--source", "agent:realhw", "--reason", "realhw p1-ho-persist")
     ctx.note("release.json", str(rel))
     if ctx.sw.session("COM1").get("state") != "RELEASED":
-        return CaseResult("FAIL", reason="release 後 COM1 非 RELEASED")
+        return CaseResult("FAIL", reason="release 後 COM1 非 RELEASED",
+                          category="test", reason_code="release_state_wrong")
     try:
         rc = ctx.systemd.restart()
         if rc != 0:
-            return CaseResult("FAIL", reason=f"systemctl restart 回 rc={rc}")
+            return CaseResult("FAIL", reason=f"systemctl restart 回 rc={rc}",
+                              category="environment", reason_code="systemd_restart_failed")
         if not ctx.sw.wait_state("COM0", "READY", timeout_s=reboot_wait):
-            return CaseResult("FAIL", reason="restart 後 COM0 未回 READY")
+            return CaseResult("FAIL", reason="restart 後 COM0 未回 READY",
+                              category="test", reason_code="restart_ready_timeout")
         s1 = ctx.sw.session("COM1")
         ctx.note("com1-after-restart.json", str(s1))
         if s1.get("state") != "RELEASED":
-            return CaseResult("FAIL", reason=f"restart 後 COM1 未保持 RELEASED（{s1.get('state')}），被搶回")
+            return CaseResult("FAIL",
+                              reason=f"restart 後 COM1 未保持 RELEASED（{s1.get('state')}），被搶回",
+                              category="test", reason_code="released_not_persisted")
         att = ctx.sw.run("device", "attach", "--selector", "COM1")
         ctx.note("attach.json", str(att))
         if not ctx.sw.wait_state("COM1", "READY", timeout_s=ready_wait):
-            return CaseResult("FAIL", reason="attach 後 COM1 未回 READY")
+            return CaseResult("FAIL", reason="attach 後 COM1 未回 READY",
+                              category="test", reason_code="reclaim_ready_timeout")
         return CaseResult("PASS")
     finally:
         _force_ready(ctx, "COM1", ready_wait)

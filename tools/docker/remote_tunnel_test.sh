@@ -550,15 +550,29 @@ topology_gatewayports_failclosed() {
 
 # ══════════════════════════ main ══════════════════════════
 main() {
+  local sel="${1:-all}"
+  case "$sel" in
+    direct|nat_host|dual_nat|gwports|all) : ;;
+    *) fail "未知拓樸參數：${sel}（可用：direct|nat_host|dual_nat|gwports|all）" ;;
+  esac
+
   log "build image: ${IMAGE_TAG}"
   DOCKER_BUILDKIT=1 docker build --progress=plain -t "${IMAGE_TAG}" "${ROOT_DIR}" || fail "docker build 失敗"
 
-  topology_direct
-  topology_nat_host
-  topology_dual_nat
-  topology_gatewayports_failclosed
+  case "$sel" in
+    direct)   topology_direct ;;
+    nat_host) topology_nat_host ;;
+    dual_nat) topology_dual_nat ;;
+    gwports)  topology_gatewayports_failclosed ;;
+    all)
+      topology_direct
+      topology_nat_host
+      topology_dual_nat
+      topology_gatewayports_failclosed
+      ;;
+  esac
 
   log "remote-tunnel acceptance: PASS"
 }
 
-main
+main "${1:-all}"

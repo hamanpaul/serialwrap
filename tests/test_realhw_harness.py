@@ -77,3 +77,87 @@ def test_recovery_command_is_state_aware():
     assert harness.recovery_command(None) == ("session", "recover")
     # 只有 RELEASED 才允許 device attach
     assert harness.recovery_command("ATTACHED") != ("device", "attach")
+
+
+def test_case_result_classification_fields_default_empty():
+    r = harness.CaseResult("PASS")
+    assert r.category == ""
+    assert r.reason_code == ""
+    r2 = harness.CaseResult("FAIL", reason="x", category="test", reason_code="cross_talk")
+    assert (r2.category, r2.reason_code) == ("test", "cross_talk")
+
+
+def test_report_shows_category_column_and_json_fields(tmp_path):
+    results = [
+        ("a", harness.CaseResult("PASS", duration_s=0.1)),
+        ("b", harness.CaseResult("FAIL", reason="斷言不過", category="test",
+                                 reason_code="cross_talk")),
+        ("c", harness.CaseResult("SKIP", reason="缺 base64", category="environment",
+                                 reason_code="base64_missing")),
+    ]
+    meta = {"version": "0.2.3", "git": "abc", "tiers": "p0", "started_at": "t"}
+    md = harness.render_report_md(meta, results, {})
+    assert "| 分類 |" in md
+    assert "test/cross_talk" in md
+    assert "environment/base64_missing" in md
+    harness.write_reports(tmp_path, meta, results, {})
+    data = json.loads((tmp_path / "report.json").read_text())
+    assert data["results"][1]["category"] == "test"
+    assert data["results"][1]["reason_code"] == "cross_talk"
+    assert data["results"][0]["category"] == ""
+
+
+def test_run_cases_uncaught_exception_is_inconclusive(tmp_path):
+    def boom(ctx):
+        raise RuntimeError("kaboom")
+
+    cases = [harness.Case(id="x", tier="p0", title="x", run=boom)]
+    ctx = harness.Ctx(cfg={}, report_dir=tmp_path, case_dir=tmp_path,
+                      sw=None, tmux=None, usbipd=None, systemd=None)
+    results = harness.run_cases(cases, ctx, boards=[])
+    (cid, r), = results
+    assert cid == "x"
+    assert r.verdict == "FAIL"
+    assert r.category == ""
+    assert r.reason_code == "uncaught_exception"
+
+
+def test_load_cfg_reads_config_json_with_defaults(tmp_path):
+    p = tmp_path / "config.json"
+    p.write_text('{"boards": [], "usbipd_exe": "/x", "tmux_prefix": "t"}', encoding="utf-8")
+    cfg = harness.load_cfg(p)
+    assert cfg["usbipd_exe"] == "/x"
+    assert cfg["win_serialwrap_exe"] == ""
+
+
+def test_load_cfg_injected_dict_equivalent(tmp_path):
+    facts = {"boards": [{"com": "COM0", "serial": "S1", "busid": "1-1"}],
+             "usbipd_exe": "/x", "tmux_prefix": "t"}
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps(facts), encoding="utf-8")
+    assert harness.load_cfg(p) == harness.load_cfg(injected=facts)
+    assert harness.load_cfg(injected=facts)["win_serialwrap_exe"] == ""
+    assert "win_serialwrap_exe" not in facts
+
+
+def test_run_cases_family_gate_runtime_skip(tmp_path):
+    ran = []
+
+    def ok_run(ctx):
+        ran.append(1)
+        return harness.CaseResult("PASS")
+
+    cases = [
+        harness.Case(id="rm-x", tier="remote", title="x", run=ok_run,
+                     requires=("docker", "remote_capability")),
+        harness.Case(id="p0-y", tier="p0", title="y", run=ok_run, requires=("two_boards",)),
+    ]
+    ctx = harness.Ctx(cfg={}, report_dir=tmp_path, case_dir=tmp_path,
+                      sw=None, tmux=None, usbipd=None, systemd=None)
+    results = harness.run_cases(cases, ctx, boards=[],
+                                missing_caps={"docker": "docker_unavailable"})
+    assert results[0][1].verdict == "SKIP"
+    assert results[0][1].category == "environment"
+    assert results[0][1].reason_code == "docker_unavailable"
+    assert results[1][1].verdict == "PASS"
+    assert ran == [1]

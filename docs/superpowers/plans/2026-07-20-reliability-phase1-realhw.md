@@ -1825,7 +1825,7 @@ def _start_ssh_peer(ctx, tag: str) -> tuple[str, str, Path | None]:
                         capture_output=True, text=True).stdout.strip()
     ctx.case_dir.mkdir(parents=True, exist_ok=True)
     key = ctx.case_dir / "id_ed25519"
-    cp = subprocess.run(["docker", "cp", f"{name}:/home/tester/.ssh/id_ed25519", str(key)],
+    cp = subprocess.run(["docker", "cp", f"{name}:<tester-home>/.ssh/id_ed25519", str(key)],
                         capture_output=True, text=True)
     if cp.returncode != 0 or not key.exists():
         return name, "", None
@@ -2182,7 +2182,7 @@ python3 -m policy_check --repo . \
   --pr-base-ref main --pr-head-ref feature/serialwrap-reliability-plugin
 ```
 
-預期：PASS（R-09 由 Task 16 fragment 滿足；R-18 由 checklist/README 滿足；R-21 無絕對 home 路徑——`grep -rn "/home/" realhw/ tools/docker/remote_tunnel_test.sh` 應只剩容器內路徑 `/home/tester`，屬容器 namespace 非 bench home，歷來即存在於 script、不受影響）。
+預期：PASS（R-09 由 Task 16 fragment 滿足；R-18 由 checklist/README 滿足；R-21 無 bench home 絕對路徑——若 grep `/home/`，只允許容器 namespace 的既有腳本內容；本 plan 不再直寫任何實際 home 字面）。
 
 - [ ] **Step 3:【真機-人工閘】營運前置 redeploy 0.2.3+remote**（操作者執行；spec §6）：
 

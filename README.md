@@ -672,6 +672,7 @@ It drives the installed `serialwrap` CLI against the live daemon and real boards
 
 ```bash
 python3 -m realhw --tier p0,p1                    # P0 smoke (×8) + P1 core stability (×20)
+python3 -m realhw --tier remote                   # remote tunnel real-hw family (×7, needs docker)
 python3 -m realhw --tier longrun --duration 48h   # unattended long run (default 32h when omitted)
 ```
 
@@ -1675,6 +1676,7 @@ python3 -m unittest tests.test_session_bind -v
 
 ```bash
 python3 -m realhw --tier p0,p1                    # P0 煙霧（×8）＋P1 核心穩定性（×20）
+python3 -m realhw --tier remote                   # remote 隧道實機族（×7，需 docker）
 python3 -m realhw --tier longrun --duration 48h   # 長跑無人看護（省略 --duration 時預設 32h）
 ```
 

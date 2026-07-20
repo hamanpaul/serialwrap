@@ -46,31 +46,38 @@ def p1_rst_daemon(ctx):
         if (st.get("byte_count") or 0) > 0:
             noisy[b["com"]] = st.get("byte_count")
     if noisy:
-        return CaseResult("SKIP", reason=f"板不安靜（byte_count={noisy}），跳過重啟避免打斷 log")
+        return CaseResult("SKIP", reason=f"板不安靜（byte_count={noisy}），跳過重啟避免打斷 log",
+                          category="environment", reason_code="board_noisy")
 
     rc = ctx.systemd.restart()
     if rc != 0:
-        return CaseResult("FAIL", reason=f"systemctl restart 回 rc={rc}（NOPASSWD sudo 未設？）")
+        return CaseResult("FAIL", reason=f"systemctl restart 回 rc={rc}（NOPASSWD sudo 未設？）",
+                          category="environment", reason_code="systemd_restart_failed")
     for b in boards:
         if not ctx.sw.wait_state(b["com"], "READY", timeout_s=ctx.cfg["timeouts"]["reboot_wait_s"]):
-            return CaseResult("FAIL", reason=f"{b['com']} restart 後未回 READY")
+            return CaseResult("FAIL", reason=f"{b['com']} restart 後未回 READY",
+                              category="test", reason_code="restart_ready_timeout")
     pid1 = ctx.systemd.main_pid()
     ctx.note("pids.txt", f"before={pid0} after={pid1}")
     if pid1 == 0 or pid1 == pid0:
-        return CaseResult("FAIL", reason=f"MainPID 未變更（{pid0}->{pid1}），restart 未生效")
+        return CaseResult("FAIL", reason=f"MainPID 未變更（{pid0}->{pid1}），restart 未生效",
+                          category="environment", reason_code="systemd_restart_ineffective")
     for b in boards:
         now, was = ctx.sw.session(b["com"]), before[b["com"]]
         if now.get("device_by_id") != was.get("device_by_id"):
-            return CaseResult("FAIL", reason=f"{b['com']} by-id 對調（#100 startup rank 退化）")
+            return CaseResult("FAIL", reason=f"{b['com']} by-id 對調（#100 startup rank 退化）",
+                              category="test", reason_code="com_rank_flipped")
         if now.get("profile") != was.get("profile"):
-            return CaseResult("FAIL", reason=f"{b['com']} profile 漂移（#95）：{was.get('profile')}->{now.get('profile')}")
+            return CaseResult("FAIL",
+                              reason=f"{b['com']} profile 漂移（#95）：{was.get('profile')}->{now.get('profile')}",
+                              category="test", reason_code="profile_drift")
     return CaseResult("PASS")
 
 
 @_case("p1-rst-reboot", "target reboot 後自動恢復 READY＋console 存活＋WAL 連續",
        hints=("reboot status 可能 timeout（prplOS 回 prompt 後才斷）——容忍",
               "console client 應跨 reboot 存活（daemon 保 bridge，走 RECOVERING）"),
-       requires=("two_boards",))
+       requires=("two_boards", "deployed_recent"))
 def p1_rst_reboot(ctx):
     att = ctx.sw.run("session", "console-attach", "--selector", "COM0", "--label", "realhw")
     vtty, cid = att.get("vtty"), att.get("client_id")
@@ -95,13 +102,16 @@ def p1_rst_reboot(ctx):
         end_seq = ctx.sw.run("wal", "current-seq").get("seq") or 0
         ctx.note("state-seq.txt", f"seq={seen} saw_transition={saw_transition} wal {start_seq}->{end_seq}")
         if not ok_ready:
-            return CaseResult("FAIL", reason=f"reboot 後未在時限內自動回 READY（狀態序列={seen}）")
+            return CaseResult("FAIL", reason=f"reboot 後未在時限內自動回 READY（狀態序列={seen}）",
+                              category="test", reason_code="reboot_ready_timeout")
         cl = ctx.sw.run("session", "console-list", "--selector", "COM0")
         ctx.note("console-list.json", str(cl))
         if cid and not any(c.get("client_id") == cid for c in cl.get("consoles") or []):
-            return CaseResult("FAIL", reason="reboot 後 console client 未存活")
+            return CaseResult("FAIL", reason="reboot 後 console client 未存活",
+                              category="test", reason_code="console_dropped")
         if end_seq <= start_seq:
-            return CaseResult("FAIL", reason=f"WAL 未跨 reboot 連續記錄（seq {start_seq}->{end_seq}）")
+            return CaseResult("FAIL", reason=f"WAL 未跨 reboot 連續記錄（seq {start_seq}->{end_seq}）",
+                              category="test", reason_code="wal_not_continuous")
         return CaseResult("PASS")
     finally:
         if vtty:
@@ -114,7 +124,7 @@ def p1_rst_reboot(ctx):
 @_case("p1-rst-bootwindow", "開機窗 clear+attach 不卡死、最終自動 READY（#69/#94）",
        hints=("attach 回應非致命 error_code 或 ok 皆可；降級斷言＝最終自動 READY 即 PASS",
               "reprobe_attempts 實況記進 evidence"),
-       requires=("two_boards",))
+       requires=("two_boards", "deployed_recent"))
 def p1_rst_bootwindow(ctx):
     try:
         rc = ctx.sw.submit_and_wait("COM0", "reboot", cmd_timeout=10)
@@ -124,7 +134,8 @@ def p1_rst_bootwindow(ctx):
         att = ctx.sw.run("session", "attach", "--selector", "COM0")
         ctx.note("attach.json", str(att))  # 非致命 error_code 或 ok 皆記錄
         if not ctx.sw.wait_state("COM0", "READY", timeout_s=ctx.cfg["timeouts"]["reboot_wait_s"]):
-            return CaseResult("FAIL", reason="開機窗 attach 後未在時限內自動回 READY")
+            return CaseResult("FAIL", reason="開機窗 attach 後未在時限內自動回 READY",
+                              category="test", reason_code="bootwindow_ready_timeout")
         s = ctx.sw.session("COM0")
         ctx.note("final-session.json", str(s))  # 含 reprobe_attempts / reprobe_exhausted
         return CaseResult("PASS")
@@ -144,5 +155,6 @@ def p1_rst_recover(ctx):
     ctx.note("selftest.json", f"gen0={gen0} " + str(st))
     if not (st.get("probe_ok") and st.get("classification") == "OK"):
         return CaseResult("FAIL",
-                          reason=f"recover 後 self-test 未 OK（classification={st.get('classification')} probe_ok={st.get('probe_ok')}）")
+                          reason=f"recover 後 self-test 未 OK（classification={st.get('classification')} probe_ok={st.get('probe_ok')}）",
+                          category="test", reason_code="recover_selftest_failed")
     return CaseResult("PASS")

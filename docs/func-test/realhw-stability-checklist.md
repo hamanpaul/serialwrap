@@ -2,7 +2,7 @@
 
 > 本清單是 `python3 -m realhw` 套件的**權威描述與手動 fallback**。suite 是它的可執行形式；本文件是它的可讀對照與 P2 手動索引。
 > 每次重大更新**部署到本機系統後**執行——用已安裝的 `serialwrap` CLI 操作 live daemon 與兩塊真板（部署驗收），**不是**在沙箱裡跑 repo 程式碼（那是開發期驗證，見 P2 前置的 throwaway 隔離法）。
-> case id 與 `python3 -m realhw --list` 完全一致（P0×8＋P1×20＋longrun×1，共 29 條）。
+> case id 與 `python3 -m realhw --list` 完全一致（P0×8＋P1×20＋remote×7＋longrun×1，共 36 條）。
 > 路徑一律以 `~` / `$HOME` 表示，不寫絕對 home 字面。
 
 ## 本機環境基準
@@ -17,12 +17,24 @@
 | 兩板 | COM0＝`dut-prpl`（serial `AC01QZT0`、platform prpl）；COM1＝`sta-prpl`（serial `AQ00OAQ7`、platform brcm/BDK） |
 | usbipd busid | COM0＝`8-1`、COM1＝`8-2`（**換線會變**，每輪跑前 `usbipd list` 重驗） |
 | 組態 | `realhw/config.json`（stdlib-only 契約；機器特定值；timeouts：ready_wait 180s／reboot_wait 300s／human_active_window 60s） |
+| Windows 端 serialwrap.exe | `realhw/config.json` 的 `win_serialwrap_exe`（`/mnt/c/...`；空＝不可用，hp 救援鏈與 windows_daemon 診斷降級） |
 
 ---
 
 ## 前置作業（preflight，任一不過整場拒跑）
 
 suite 於 `realhw/preflight.py` 自動執行以下六項；手動跑時亦逐項確認。**跑本套件期間不得同時跑 `pytest tests/`**（#120 live guard 會把本套件對 live 的操作誤判為污染而 FAIL；suite 偵測到其他 pytest 會拒跑）。
+
+### E. 兩級判決新增項（reliability plugin Phase 1）
+
+**suite-refuse 追加**：
+- `benchlock`：取得 `~/.local/state/serialwrap/bench.lock` flock 且 `pgrep -af 'testpilot ru[n]'` 無進行中的外部 testpilot run——reliability 與 wifi_llapi 不可同跑，拿不到即整場拒跑。
+- `windows_daemon` 診斷：`WinSwCli` 探測 Windows 端 serialwrapd（存在＋持有清單烙進 run meta）；Windows 端持有目標裝置時，「兩板 READY」缺項訊息歸因 `windows_daemon_holds_device`。
+
+**family-gate（capabilities，缺項不擋整場、對應 case 執行期 SKIP＝FailEnv）**：
+- `remote_capability`：部署 CLI 有 `remote` 子命令（`serialwrap remote status` 回 ok）→ 缺＝rm-live 族 SKIP（`remote_capability_missing`）。
+- `deployed_recent`：部署版本 ≥0.2.3（`serialwrap --version`）→ 缺＝宣告該 requires 的 case SKIP（`deployed_daemon_stale`）。
+- `docker`：docker CLI＋daemon 可達 → 缺＝remote 族 SKIP（`docker_unavailable`）。image 建置延遲到第一個 rm-topo case。
 
 ### A. 部署新鮮度
 
@@ -149,6 +161,26 @@ sudo -n systemctl restart serialwrap            # 最後手段（會重偵測所
 |---|---|---|---|---|
 | `p1-hp-cycle` ⚡ | 同板拔插回原槽 | `usbipd list`（驗 COM1 busid 存在）→`usbipd detach -b <COM1 busid>`→輪詢 COM1 離開 READY→`usbipd attach -w -b <busid>` | ≤30s COM1 轉非 READY、COM0 不受擾；回插後 COM1 自動回原 COM READY、`device_by_id` 含 serial | busid 不在 `usbipd list`＝換線→**SKIP**（非 FAIL）；熱插沿用 DETACHED-rebind（同 by-id 回空槽 #100）；還原：缺席 busid 補 `attach`＋兩板等 READY |
 | `p1-hp-reorder` ⚡ | 反序插拔＋restart COM 不對調（#100） | `usbipd list`（驗兩板 busid）→`detach` 兩板→**反序** `attach`（COM1 busid 先）→兩板回原 COM→`sudo -n systemctl restart serialwrap` | 反序回插後兩板各回原 COM（by-id 認板、非列舉序）；restart 後 startup rank 下仍 COM0=AC01QZT0/COM1=AQ00OAQ7 | real_path 可能翻轉（記 evidence）、by-id 不變；還原：兩 busid 補 `attach`＋restart 後等兩板 READY |
+
+---
+
+## remote 族（tier=remote，7 條，全非破壞性；`--tier remote` 顯式指定）
+
+驗 `serialwrap remote` 的部署後實機面。第一層 rm-topo 包裝 `tools/docker/remote_tunnel_test.sh`（容器封閉世界＋假 UART，驗工具鏈）；第二層 rm-live 對部署 daemon＋真板（容器只當 ssh 對端）。
+
+| case | 內容 | 手動等效 |
+|---|---|---|
+| rm-topo-direct | direct：-R expose＋-L connect＋close/prune 全流程 | `bash tools/docker/remote_tunnel_test.sh direct` |
+| rm-topo-nat-host | NAT→host relay＋攻擊者容器隔離 | `bash tools/docker/remote_tunnel_test.sh nat_host` |
+| rm-topo-dual-nat | 雙 NAT relay＋兩側繞行隔離 | `bash tools/docker/remote_tunnel_test.sh dual_nat` |
+| rm-topo-gwports | GatewayPorts/--remote-socket fail-closed | `bash tools/docker/remote_tunnel_test.sh gwports` |
+| rm-live-e2e | host `-R` expose 至容器→容器內 `--endpoint tcp://127.0.0.1:7777` session list＋`cmd submit COM0 echo <marker>`→真板回 marker、WAL source=`agent:rhwremote`→close 後 registry/log 淨空、無孤兒 ssh、daemon pid 全程不變 | `serialwrap remote tester@<容器IP>:7777` 後於容器內操作 |
+| rm-live-orphan | `kill -9` 隧道 ssh→`remote status` prune 自癒→重開成功 | `kill -9 <ssh pid>; serialwrap remote status` |
+| rm-live-cycle | open/close ×5 registry 不累積、daemon 零觸碰 | 迴圈 `serialwrap remote ...` / `remote close all` |
+
+requires：rm-topo→docker；rm-live→docker＋two_boards＋remote_capability（缺項執行期 SKIP＝FailEnv）。容器前綴：rm-topo＝`sw-rt-*`、rm-live＝`rhwlive-*`，各自 teardown。
+
+報表 `report.md` / `report.json` 會帶 `分類`（category/reason_code）欄：case 內斷言失敗預設 `test`，明確外因為 `environment`，組態錯為 `configuration`，未捕捉例外留空分類對應 Inconclusive。
 
 ---
 
