@@ -5,6 +5,8 @@ import re
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "reliability"))
 
@@ -14,6 +16,14 @@ from serialwrap_reliability import core  # noqa: E402
 def test_repo_root_locates_worktree():
     assert core.REPO_ROOT == REPO_ROOT
     assert (core.REPO_ROOT / "realhw" / "harness.py").is_file()
+
+
+def test_resolve_repo_root_rejects_non_editable_layout(tmp_path):
+    fake = tmp_path / "venv" / "lib" / "python3.12" / "site-packages" / "serialwrap_reliability" / "core.py"
+    fake.parent.mkdir(parents=True)
+    fake.write_text("", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="editable 安裝"):
+        core.resolve_repo_root(fake)
 
 
 def test_ensure_realhw_importable_idempotent():
