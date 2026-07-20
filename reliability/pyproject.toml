@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "serialwrap-reliability"
+version = "0.1.0"
+description = "serialwrap 實機穩定性套件（realhw）的 testpilot plugin 殼（dev-only editable）"
+requires-python = ">=3.10"
+dependencies = [
+    "testpilot-core>=0.3.4,<1.0",
+]
+
+[project.entry-points."testpilot.plugins"]
+serialwrap_reliability = "serialwrap_reliability.plugin:Plugin"
+
+[tool.hatch.build.targets.wheel]
+packages = ["serialwrap_reliability"]
