@@ -1,6 +1,7 @@
 """Phase 2 plugin core（serialwrap_reliability.core）純邏輯單測——不 import testpilot、不碰 live。"""
 from __future__ import annotations
 
+import os
 import re
 import sys
 from pathlib import Path
@@ -377,6 +378,23 @@ def test_longrun_runner_skipped_mode():
     assert runner.result() is r
 
 
+def test_longrun_runner_result_joins_even_if_thread_already_finished():
+    class FakeThread:
+        def __init__(self) -> None:
+            self.joined = False
+
+        def is_alive(self) -> bool:
+            return False
+
+        def join(self) -> None:
+            self.joined = True
+
+    runner = core.LongrunRunner.skipped("done")
+    runner._thread = FakeThread()
+    assert runner.result() == "done"
+    assert runner._thread.joined is True
+
+
 def test_run_preflight_acquires_benchlock_and_collects_missing(monkeypatch, tmp_path):
     """防靜默失效雙斷言：benchlock 有被嘗試取鎖並注入 collect；missing_caps 有被收集。"""
     core.ensure_realhw_importable()
@@ -414,6 +432,24 @@ def test_run_preflight_acquires_benchlock_and_collects_missing(monkeypatch, tmp_
     assert out["benchlock_fd"] is not None
 
 
+def test_run_preflight_closes_benchlock_on_collect_error(monkeypatch, tmp_path):
+    core.ensure_realhw_importable()
+    from realhw import preflight
+
+    lockfile = tmp_path / "bench.lock"
+    monkeypatch.setattr(preflight, "bench_lock_path", lambda: lockfile)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("collect boom")
+
+    monkeypatch.setattr(preflight, "collect", boom)
+    with pytest.raises(RuntimeError, match="collect boom"):
+        core.run_preflight({"boards": [], "win_serialwrap_exe": ""})
+    fd = preflight.acquire_benchlock(lockfile)
+    assert fd is not None
+    os.close(fd)
+
+
 def test_run_preflight_refuses_when_benchlock_held(monkeypatch, tmp_path):
     core.ensure_realhw_importable()
     from realhw import preflight
@@ -435,4 +471,5 @@ def test_run_preflight_refuses_when_benchlock_held(monkeypatch, tmp_path):
     assert out["ok"] is False
     assert out["benchlock_fd"] is None
     assert any("benchlock" in p for p in out["problems"])
+    os.close(held_fd)
     assert out["missing_caps"] == {} and out["deployed_version"] == ""

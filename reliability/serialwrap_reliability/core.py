@@ -1,6 +1,7 @@
 """serialwrap_reliability 核心邏輯——不 import testpilot 的薄 adapter。"""
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -286,7 +287,7 @@ class LongrunRunner:
 
     def result(self) -> Any:
         """取回結果；未完成時 join。"""
-        if self._thread is not None and self._thread.is_alive():
+        if self._thread is not None:
             self._thread.join()
         return self._result
 
@@ -299,18 +300,23 @@ def run_preflight(cfg: dict[str, Any]) -> dict[str, Any]:
     sw = drivers.SwCli()
     win = drivers.WinSwCli(cfg["win_serialwrap_exe"])
     lock_fd = preflight.acquire_benchlock(preflight.bench_lock_path())
-    checks = preflight.collect(cfg, sw, REPO_ROOT, benchlock_ok=lock_fd is not None, win=win)
-    ok, problems = preflight.evaluate(checks)
-    missing_caps: dict[str, str] = {}
-    deployed_version = ""
-    if ok:
-        caps = preflight.collect_capabilities(sw)
-        missing_caps = dict(preflight.missing_capabilities(caps))
-        deployed_version = str(caps.deployed_version).strip()
-    return {
-        "ok": bool(ok),
-        "problems": list(problems),
-        "missing_caps": missing_caps,
-        "deployed_version": deployed_version,
-        "benchlock_fd": lock_fd,
-    }
+    try:
+        checks = preflight.collect(cfg, sw, REPO_ROOT, benchlock_ok=lock_fd is not None, win=win)
+        ok, problems = preflight.evaluate(checks)
+        missing_caps: dict[str, str] = {}
+        deployed_version = ""
+        if ok:
+            caps = preflight.collect_capabilities(sw)
+            missing_caps = dict(preflight.missing_capabilities(caps))
+            deployed_version = str(caps.deployed_version).strip()
+        return {
+            "ok": bool(ok),
+            "problems": list(problems),
+            "missing_caps": missing_caps,
+            "deployed_version": deployed_version,
+            "benchlock_fd": lock_fd,
+        }
+    except Exception:
+        if lock_fd is not None:
+            os.close(lock_fd)
+        raise
