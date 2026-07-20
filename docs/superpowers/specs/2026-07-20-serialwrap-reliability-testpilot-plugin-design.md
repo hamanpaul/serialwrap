@@ -37,7 +37,7 @@ wifi_llapi 視 serialwrap 為*環境*（session 掛掉→FailEnv、修環境重�
 **明列不做（v2 deferred）**：
 - lr-mixed 加 remote worker（隧道 48h 耐久／autossh 重連）。
 - `-L` 連真遠端 daemon 的 live 案（`rm-topo-direct` 已含容器側 `-L`）。
-- PassAfterRemediation（v1 remediation 關閉，靠 realhw 內建 `recovery_command`）。
+- PassAfterRemediation（v1 remediation 動作三重鎖死、僅留 snapshot 通道；恢復靠 realhw 內建 `recovery_command`）。
 - wifi_llapi 側共用 benchlock（本案單邊實作，不改 wifi_llapi）。
 
 ## 3. 整體架構
@@ -91,7 +91,7 @@ testpilot run serialwrap_reliability
 ### 關鍵設計決策
 
 1. **config 單一 loader、雙來源**：`realhw.load_cfg()` 接受 config.json（standalone）或 testbed.yaml 合成 dict（plugin）。bench 機台事實（busid/serial/COM 映射/usbipd 路徑/**Windows 端 serialwrap.exe 路徑**）以 testbed.yaml 為正統，config.json 為 standalone 後備；雙來源等價性由單測保證。
-2. **執行策略**：`execution_policy` → `{mode: sequential, max_concurrency: 1}`；`agent-config.yaml` 設 `retry.max_attempts: 1`（重跑對真機 case 無意義且危險）、remediation `enabled: false`。
+2. **執行策略**：`execution_policy` → `{mode: sequential, max_concurrency: 1}`；`agent-config.yaml` 顯式設 `retry.max_attempts: 1`（core 預設 2；重跑對真機 case 無意義且危險）。remediation 設 `enabled: true` **僅作 failure_snapshot 擷取通道**（實地考證：core 於 disabled 時不寫 snapshot，所有 FAIL 退化 Inconclusive、分類全滅），實際修復動作以三重防線鎖死（max_attempts=1 使 on_retry 永不 dispatch／不覆寫 decision hooks／`allowed_actions: []`）；`hooks.enabled_hooks` 必含 `on_failure`。
 3. **longrun 走 default run_loop**（已驗證 core 的 band 攤平對無 band case 無害）：一個 case、N 個 checkpoint step（discover 時合成）、always-pass criteria 防中斷、判決集中在收尾 evaluate；進度監控看 realhw 增量寫的 `snapshots.ndjson`（testpilot 的 agent_trace 於 case 結束才落盤，非長跑監控來源）。
 4. **報告身分**：`--dut-fw-ver` 語意＝**deployed serialwrap 版本**（preflight 自動取自 `serialwrap --version`/daemon status 烙進 meta）；板卡 fw 降為環境 metadata。
 5. **benchlock 歸屬 realhw preflight（Phase 1）**：flock（`~/.local/state/serialwrap/bench.lock`）＋pgrep 偵測進行中的外部 `testpilot run`——standalone realhw run 同樣受保護，plugin 經 `prepare_run()` 的 preflight gate 天然繼承，不在 plugin 殼重複實作。動機：reliability 與 wifi_llapi 不可同跑（reliability 會 restart daemon/拔 USB）。

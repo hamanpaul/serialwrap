@@ -14,7 +14,7 @@ serialwrap 是 wifi_llapi 等 testpilot 測試的信任基礎——broker 壞了
   - `tools/docker/remote_tunnel_test.sh` 加逐拓樸分派參數（微改）。
 - **Phase 2（testpilot plugin 殼，dev-only）**：
   - 新 `reliability/` 發行單位（pyproject＋entry point `testpilot.plugins`；editable-only、永不 release；release wheel 零改動）。
-  - `serialwrap_reliability` package：`plugin.py`（PluginBase 薄轉接）＋`core.py`（不 import testpilot 的核心邏輯，CI 可測）＋testbed loader（testbed.yaml 與 config.json 雙來源等價）＋自訂 reporter（md/json 重用 realhw 報告）＋`agent-config.yaml`（sequential、max_attempts=1、remediation off）。
+  - `serialwrap_reliability` package：`plugin.py`（PluginBase 薄轉接）＋`core.py`（不 import testpilot 的核心邏輯，CI 可測）＋testbed loader（testbed.yaml 與 config.json 雙來源等價）＋自訂 reporter（md/json 重用 realhw 報告）＋`agent-config.yaml`（sequential、max_attempts=1、remediation=snapshot-only：enabled true 但動作三重鎖死——core 於 disabled 時不寫 failure_snapshot 會使分類全滅）。
   - longrun 以 checkpoint-case 模型走 default run_loop（steps 於 discover 合成、always-pass criteria、判決集中收尾）。
 
 ## Capabilities

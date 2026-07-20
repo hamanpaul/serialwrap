@@ -31,7 +31,8 @@
 4. **config 單一 loader 雙來源**：`realhw.load_cfg()` 吃 config.json（standalone）或 testbed.yaml 合成 dict（plugin）；等價性單測保證；Windows 端 serialwrap.exe 路徑進 testbed。
 5. **分類契約**：`CaseResult.category`（environment|session|configuration|test）＋`reason_code`（自由字串）；case 內斷言失敗預設 `test`（板卡健康由 preflight＋case 間恢復保證——單一裁決線）；執行期 SKIP＝`environment`；未捕捉例外＝空 category→Inconclusive。選擇期排除（destructive 未 opt-in）在 `prepare_run` 過濾、不進報表。
 6. **preflight 兩級判決**：suite-refuse（六項＋benchlock）與 family-gate（capabilities dict→requires 未滿足的 case 執行期 SKIP）。benchlock 歸 realhw preflight（standalone 同樣受保護、plugin 天然繼承）。
-7. **longrun checkpoint-case**：default run_loop＋`execution_policy{sequential, max_concurrency:1}`＋`retry.max_attempts:1`＋always-pass step criteria；判決集中收尾 evaluate 讀 longrun-analysis；進度監控走 realhw 自寫 `snapshots.ndjson`。
+7. **longrun checkpoint-case**：default run_loop＋`execution_policy{sequential, max_concurrency:1}`＋`retry.max_attempts:1`＋always-pass step criteria（execute_step 一律回 success=True——core 於 step 失敗會跳過 evaluate、`_last_failure` 無人寫→Inconclusive，判決權必須集中 evaluate）；判決集中收尾 evaluate 讀 longrun-analysis；進度監控走 realhw 自寫 `snapshots.ndjson`。
+8. **remediation＝snapshot 通道而非修復**：`enabled: true`（disabled 時 core 不寫 failure_snapshot、全 FAIL 退化 Inconclusive）＋三重鎖死動作（max_attempts:1／不覆寫 decision hooks／`allowed_actions: []`）；`hooks.enabled_hooks` 必含 `on_failure`。契約檔單測釘死此組態。
 8. **hp 救援鏈為純決策函式**：注入探測結果→回傳 action 序列；subprocess 執行薄層分離，可完整單測。
 9. **rm-topo 包裝而非移植**：`remote_tunnel_test.sh` 加 `$1` 逐拓樸分派（微改），realhw case shell out、exit code＋log 尾段→verdict＋evidence；image 建置延遲到第一個 rm-topo case。
 
