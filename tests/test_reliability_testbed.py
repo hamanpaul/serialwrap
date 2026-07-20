@@ -86,10 +86,35 @@ def test_two_sources_equivalent(tmp_path):
     assert cfg_json == cfg_yaml
 
 
+def test_config_json_reorders_boards_to_match_testbed_equivalence(tmp_path):
+    p = tmp_path / "config.json"
+    reversed_cfg = dict(CONFIG_JSON)
+    reversed_cfg["boards"] = list(reversed(CONFIG_JSON["boards"]))
+    p.write_text(json.dumps(reversed_cfg, ensure_ascii=False), encoding="utf-8")
+    cfg_json = testbed_loader.config_json_to_cfg(p, duration="15m")
+    assert [b["com"] for b in cfg_json["boards"]] == ["COM0", "COM1"]
+    assert cfg_json == testbed_loader.testbed_to_cfg(TESTBED_RAW)
+
+
 def test_testbed_boards_sorted_by_selector():
     cfg = testbed_loader.testbed_to_cfg(TESTBED_RAW)
     assert [b["com"] for b in cfg["boards"]] == ["COM0", "COM1"]
     assert cfg["boards"][1]["profile"] == "brcm-template"
+
+
+def test_selector_natural_sort_handles_com10():
+    raw = {
+        "testbed": {
+            "devices": {
+                "A": {"selector": "COM10", "alias": "ten"},
+                "B": {"selector": "COM2", "alias": "two"},
+                "C": {"selector": "COM1", "alias": "one"},
+            },
+            "serialwrap_reliability": {},
+        }
+    }
+    cfg = testbed_loader.testbed_to_cfg(raw)
+    assert [b["com"] for b in cfg["boards"]] == ["COM1", "COM2", "COM10"]
 
 
 def test_testbed_duration_converted_and_stripped():
@@ -153,3 +178,37 @@ testbed:
         encoding="utf-8",
     )
     assert testbed_loader.load_testbed_cfg(p) == testbed_loader.testbed_to_cfg(TESTBED_RAW)
+
+
+def test_loader_uses_public_realhw_load_cfg(monkeypatch, tmp_path):
+    import realhw
+
+    calls: list[tuple[object, object]] = []
+
+    def fake_load_cfg(config_path=None, *, injected=None):
+        calls.append((config_path, injected))
+        if injected is not None:
+            return {
+                "boards": injected["boards"],
+                "usbipd_exe": injected.get("usbipd_exe", ""),
+                "win_serialwrap_exe": injected.get("win_serialwrap_exe", ""),
+                "tmux_prefix": injected.get("tmux_prefix", "realhw"),
+                "timeouts": injected.get("timeouts", {}),
+                "longrun": injected.get("longrun", {}),
+            }
+        return {
+            "boards": CONFIG_JSON["boards"],
+            "usbipd_exe": CONFIG_JSON["usbipd_exe"],
+            "win_serialwrap_exe": CONFIG_JSON["win_serialwrap_exe"],
+            "tmux_prefix": CONFIG_JSON["tmux_prefix"],
+            "timeouts": CONFIG_JSON["timeouts"],
+            "longrun": CONFIG_JSON["longrun"],
+        }
+
+    monkeypatch.setattr(realhw, "load_cfg", fake_load_cfg)
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps(CONFIG_JSON, ensure_ascii=False), encoding="utf-8")
+    testbed_loader.testbed_to_cfg(TESTBED_RAW)
+    testbed_loader.config_json_to_cfg(p, duration="15m")
+    assert calls[0][1] is not None
+    assert calls[1][0] == p
