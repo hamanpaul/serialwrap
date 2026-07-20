@@ -4,13 +4,15 @@
     "harness 主要用 com/serial/busid；platform/profile 僅供 case 判讀。",
     "busid 換線會變：每輪跑前 usbipd list 驗證存在（config 只存 serial→期望 COM 映射）。",
     "COM1 現為 brcm/BDK（曾為 prpl，alias 沿用歷史命名）。",
-    "本檔為 stdlib json（非 YAML）——維持 realhw stdlib-only 契約，勿引入第三方解析器。"
+    "本檔為 stdlib json（非 YAML）——維持 realhw stdlib-only 契約，勿引入第三方解析器。",
+    "win_serialwrap_exe：Windows 端 serialwrap.exe 的 /mnt/c 路徑；空字串＝不可用（探測與救援降級 no-op）。"
   ],
   "boards": [
     {"com": "COM0", "alias": "dut-prpl", "serial": "AC01QZT0", "busid": "8-1", "platform": "prpl"},
     {"com": "COM1", "alias": "sta-prpl", "serial": "AQ00OAQ7", "busid": "8-2", "platform": "brcm", "profile": "brcm-template"}
   ],
   "usbipd_exe": "/mnt/c/Program Files/usbipd-win/usbipd.exe",
+  "win_serialwrap_exe": "/mnt/c/serialwrap/serialwrap.exe",
   "tmux_prefix": "realhw",
   "timeouts": {"ready_wait_s": 180, "reboot_wait_s": 300, "human_active_window_s": 60},
   "longrun": {"snapshot_interval_s": 300, "agent_workers": 4}

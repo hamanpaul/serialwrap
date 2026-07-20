@@ -19,12 +19,14 @@ class CaseResult:
     reason: str = ""
     evidence: dict[str, str] = dataclasses.field(default_factory=dict)
     duration_s: float = 0.0
+    category: str = ""
+    reason_code: str = ""
 
 
 @dataclasses.dataclass(frozen=True)
 class Case:
     id: str
-    tier: str  # p0 | p1 | longrun
+    tier: str  # p0 | p1 | remote | longrun
     title: str
     run: Callable[[Any], CaseResult]
     destructive: bool = False
@@ -55,6 +57,10 @@ def select_cases(registry: list[Case], *, tiers: list[str], only: str | None, sk
 
 
 _DUR = re.compile(r"^(\d+)([hms])$")
+_CFG_DEFAULTS: dict[str, Any] = {
+    "win_serialwrap_exe": "",
+    "tmux_prefix": "realhw",
+}
 
 
 def parse_duration(text: str) -> int:
@@ -63,6 +69,19 @@ def parse_duration(text: str) -> int:
         raise ValueError(f"duration 格式須為 <N>h/<N>m/<N>s：{text!r}")
     n, unit = int(m.group(1)), m.group(2)
     return n * {"h": 3600, "m": 60, "s": 1}[unit]
+
+
+def load_cfg(config_path: Path | None = None, *,
+             injected: dict[str, Any] | None = None) -> dict[str, Any]:
+    """realhw 組態單一入口：讀 config.json 或使用注入 dict。"""
+    if injected is not None:
+        cfg: dict[str, Any] = dict(injected)
+    else:
+        path = config_path or Path(__file__).parent / "config.json"
+        cfg = json.loads(path.read_text(encoding="utf-8"))
+    for key, val in _CFG_DEFAULTS.items():
+        cfg.setdefault(key, val)
+    return cfg
 
 
 def render_report_md(meta: dict[str, Any], results: list[tuple[str, CaseResult]],
@@ -77,16 +96,21 @@ def render_report_md(meta: dict[str, Any], results: list[tuple[str, CaseResult]]
         f"- tiers：{meta.get('tiers')}；開始：{meta.get('started_at')}",
         f"- 結果：PASS: {counts['PASS']}／FAIL: {counts['FAIL']}／SKIP: {counts['SKIP']}",
         "",
-        "| case | verdict | 時間(s) | 說明 |",
-        "|---|---|---|---|",
+        "| case | verdict | 分類 | 時間(s) | 說明 |",
+        "|---|---|---|---|---|",
     ]
     for cid, r in results:
-        lines.append(f"| {cid} | {r.verdict} | {r.duration_s:.1f} | {r.reason} |")
+        cat = r.category or "-"
+        if r.reason_code:
+            cat = f"{cat}/{r.reason_code}"
+        lines.append(f"| {cid} | {r.verdict} | {cat} | {r.duration_s:.1f} | {r.reason} |")
     fails = [(cid, r) for cid, r in results if r.verdict == "FAIL"]
     if fails:
         lines += ["", "## 失敗案例"]
         for cid, r in fails:
             lines += ["", f"### {cid}", f"- 原因：{r.reason}"]
+            if r.category or r.reason_code:
+                lines.append(f"- 分類：{r.category or '(空＝Inconclusive)'}／{r.reason_code or '-'}")
             for h in hints.get(cid, ()):
                 lines.append(f"- 提示：{h}")
             for k, v in r.evidence.items():
@@ -99,6 +123,7 @@ def write_reports(report_dir: Path, meta: dict[str, Any], results: list[tuple[st
     report_dir.mkdir(parents=True, exist_ok=True)
     payload = {"meta": meta, "results": [
         {"id": cid, "verdict": r.verdict, "reason": r.reason,
+         "category": r.category, "reason_code": r.reason_code,
          "duration_s": r.duration_s, "evidence": r.evidence} for cid, r in results]}
     (report_dir / "report.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -114,6 +139,7 @@ class Ctx:
     tmux: Any
     usbipd: Any
     systemd: Any
+    win: Any = None
 
     def note(self, name: str, content: str) -> str:
         """寫 evidence 檔，回傳相對路徑（進 CaseResult.evidence）。"""
@@ -140,19 +166,31 @@ def recovery_command(state: str | None) -> tuple[str, ...]:
     return ("session", "recover")
 
 
-def run_cases(cases: list[Case], ctx: Ctx, *, boards: list[str]) -> list[tuple[str, CaseResult]]:
+def run_cases(cases: list[Case], ctx: Ctx, *, boards: list[str],
+              missing_caps: dict[str, str] | None = None) -> list[tuple[str, CaseResult]]:
     results: list[tuple[str, CaseResult]] = []
     broken_by: str | None = None
+    caps_missing = missing_caps or {}
     for case in cases:
         ctx.case_dir = ctx.report_dir / case.id
         if broken_by and ("two_boards" in case.requires or case.destructive):
-            results.append((case.id, CaseResult("SKIP", reason=f"前置不滿足（{broken_by} 後板卡未恢復）")))
+            results.append((case.id, CaseResult(
+                "SKIP", reason=f"前置不滿足（{broken_by} 後板卡未恢復）",
+                category="environment", reason_code=f"broken_by:{broken_by}")))
+            continue
+        lacking = [req for req in case.requires if req in caps_missing]
+        if lacking:
+            results.append((case.id, CaseResult(
+                "SKIP",
+                reason=f"能力缺項（family-gate）：{','.join(caps_missing[r] for r in lacking)}",
+                category="environment", reason_code=caps_missing[lacking[0]])))
             continue
         t0 = time.monotonic()
         try:
             r = case.run(ctx)
         except Exception as exc:  # case 內未捕捉例外＝FAIL，不中止套件
-            r = CaseResult("FAIL", reason=f"未捕捉例外：{exc!r}")
+            r = CaseResult("FAIL", reason=f"未捕捉例外：{exc!r}",
+                           category="", reason_code="uncaught_exception")
         r.duration_s = time.monotonic() - t0
         results.append((case.id, r))
         # case 間恢復檢查：兩板 READY 才續跑依賴板卡的 case。依各板當前狀態選語意正確的

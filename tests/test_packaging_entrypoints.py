@@ -41,3 +41,45 @@ def test_pyproject_declares_entrypoints_and_deps():
     assert scripts["serialwrapd"] == "sw_core.daemon:main"
     assert any(d.lower().startswith("pyyaml") for d in data["project"]["dependencies"])
     assert data["project"]["requires-python"] == ">=3.10"
+
+
+def test_reliability_dev_only_dist_contract():
+    import importlib
+    import pathlib
+    import sys
+    import tomllib
+
+    repo_root = pathlib.Path(__file__).resolve().parent.parent
+    data = tomllib.loads((repo_root / "reliability" / "pyproject.toml").read_text(encoding="utf-8"))
+
+    build_system = data["build-system"]
+    assert build_system["requires"] == ["hatchling"]
+    assert build_system["build-backend"] == "hatchling.build"
+
+    project = data["project"]
+    assert project["name"] == "serialwrap-reliability"
+    assert project["version"] == "0.1.0"
+    assert project["requires-python"] == ">=3.10"
+    assert project["dependencies"] == ["testpilot-core>=0.3.4,<1.0"]
+    assert project["entry-points"]["testpilot.plugins"] == {
+        "serialwrap_reliability": "serialwrap_reliability.plugin:Plugin"
+    }
+    assert data["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"] == [
+        "serialwrap_reliability"
+    ]
+    main_data = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))
+    main_packages = main_data["tool"]["setuptools"]["packages"]
+    assert "serialwrap_reliability" not in main_packages
+    assert all("reliability" not in name for name in main_packages)
+    assert not any("find" in str(key) for key in main_data["tool"]["setuptools"])
+
+    sys.path.insert(0, str(repo_root / "reliability"))
+    try:
+        pkg = importlib.import_module("serialwrap_reliability")
+        assert pkg.__version__ == "0.1.0"
+        assert pkg.PLUGIN_API_VERSION == "1.1"
+        plugin_py = repo_root / "reliability" / "serialwrap_reliability" / "plugin.py"
+        assert plugin_py.is_file()
+    finally:
+        sys.path.remove(str(repo_root / "reliability"))
+        sys.modules.pop("serialwrap_reliability", None)

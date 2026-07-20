@@ -1,0 +1,24 @@
+# serialwrap_reliability 執行策略（testpilot RunnerSelector 消費；位置＝plugin_root）。
+version: 1
+execution:
+  scope: per_case
+  mode: sequential
+  max_concurrency: 1
+  failure_policy: retry_then_fail_and_continue
+  retry:
+    max_attempts: 1
+  timeout:
+    base_seconds: 120
+    per_step_seconds: 60
+    max_seconds: 900
+hooks:
+  enabled_hooks:
+    - pre_case
+    - post_case
+    - on_failure
+  fail_open: true
+remediation:
+  # enabled 在這裡是 FailureSnapshot 擷取開關；若設 false，所有 FAIL 都會退化成
+  # Inconclusive。真正的動作阻擋來自 max_attempts=1 與 plugin 不覆寫 decision hooks。
+  enabled: true
+  allowed_actions: []

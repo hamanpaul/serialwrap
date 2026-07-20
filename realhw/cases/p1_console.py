@@ -48,7 +48,8 @@ def p1_con_fanout(ctx):
         ctx.note("pane.txt", pane)
         missing = [m for m in markers if not find_marker(pane, m)]
         if missing:
-            return CaseResult("FAIL", reason=f"console 畫面缺 marker：{missing}")
+            return CaseResult("FAIL", reason=f"console 畫面缺 marker：{missing}",
+                              category="test", reason_code="console_fanout_lost")
         return CaseResult("PASS")
     finally:
         ctx.tmux.kill(ses)
@@ -72,7 +73,9 @@ def p1_con_defer(ctx):
                          "--cmd", "sleep 2; echo T7_AGENT", "--cmd-timeout", "15")
         cmd_id = sub.get("cmd_id")
         if not cmd_id:
-            return CaseResult("FAIL", reason=f"agent 命令 submit 未回 cmd_id（{sub.get('error_code')}）")
+            return CaseResult("FAIL",
+                              reason=f"agent 命令 submit 未回 cmd_id（{sub.get('error_code')}）",
+                              category="test", reason_code="submit_no_cmd_id")
         t0 = time.monotonic()
         time.sleep(0.4)  # 待命令進入執行（sleep 視窗）
         ctx.tmux.send(ses, "echo HUMAN_HALF", enter=False)  # 執行期間敲入 → deferred
@@ -88,15 +91,18 @@ def p1_con_defer(ctx):
         if command.get("status") != "done" or "T7_AGENT" not in (command.get("stdout") or ""):
             return CaseResult("FAIL",
                               reason=f"agent 命令未乾淨完成（status={command.get('status')} "
-                                     f"stdout={command.get('stdout')!r}）")
+                                     f"stdout={command.get('stdout')!r}）",
+                              category="test", reason_code="defer_interleaved")
         if took > 15:
-            return CaseResult("FAIL", reason=f"agent 命令耗時 {took:.1f}s（疑似被 human console 阻擋）")
+            return CaseResult("FAIL", reason=f"agent 命令耗時 {took:.1f}s（疑似被 human console 阻擋）",
+                              category="test", reason_code="defer_agent_blocked")
         ctx.tmux.send_key(ses, "Enter")  # flush deferred
         time.sleep(2)
         pane = ctx.tmux.capture(ses)
         ctx.note("pane.txt", pane)
         if not find_marker(pane, "HUMAN_HALF"):
-            return CaseResult("FAIL", reason="deferred human 輸入未 flush 回 UART")
+            return CaseResult("FAIL", reason="deferred human 輸入未 flush 回 UART",
+                              category="test", reason_code="defer_flush_lost")
         return CaseResult("PASS")
     finally:
         ctx.tmux.send_key(ses, "C-u")  # 清殘留輸入行，避免污染後續 console case
@@ -121,7 +127,8 @@ def p1_con_busy(ctx):
         iid = res.get("interactive_id") or ""
         if res.get("error_code") != "SESSION_INTERACTIVE_BUSY":
             return CaseResult("FAIL",
-                              reason=f"human_active 窗內 agent 竟奪權（error_code={res.get('error_code')} ok={res.get('ok')}）")
+                              reason=f"human_active 窗內 agent 竟奪權（error_code={res.get('error_code')} ok={res.get('ok')}）",
+                              category="test", reason_code="busy_gate_bypassed")
         return CaseResult("PASS")
     finally:
         _close_lease(ctx, iid)  # 萬一意外拿到 lease，收回
@@ -147,7 +154,8 @@ def p1_con_softpreempt(ctx):
         iid = res.get("interactive_id") or ""
         if not (res.get("ok") and res.get("soft_preempted") and iid):
             return CaseResult("FAIL",
-                              reason=f"idle human lease 未被軟奪（ok={res.get('ok')} soft_preempted={res.get('soft_preempted')}）")
+                              reason=f"idle human lease 未被軟奪（ok={res.get('ok')} soft_preempted={res.get('soft_preempted')}）",
+                              category="test", reason_code="soft_preempt_denied")
         _close_lease(ctx, iid)
         iid = ""
         time.sleep(2)
@@ -155,7 +163,8 @@ def p1_con_softpreempt(ctx):
         ctx.note("console-list.json", str(cl))
         consoles = cl.get("consoles") or []
         if not any(c.get("interactive_owner") for c in consoles):
-            return CaseResult("FAIL", reason="close 後原 human console owner 未恢復")
+            return CaseResult("FAIL", reason="close 後原 human console owner 未恢復",
+                              category="test", reason_code="owner_not_restored")
         return CaseResult("PASS")
     finally:
         _close_lease(ctx, iid)
@@ -175,7 +184,8 @@ def p1_con_liveness(ctx):
         time.sleep(6)
         ours = _minicom_pids() - before
         if not ours:
-            return CaseResult("FAIL", reason="未偵測到本套件新起的 minicom PID")
+            return CaseResult("FAIL", reason="未偵測到本套件新起的 minicom PID",
+                              category="environment", reason_code="minicom_spawn_failed")
         for pid in ours:
             _kill9(pid)  # 模擬 crash（SIGKILL 不觸發正常 detach）
         ctx.note("killed-pids.txt", str(sorted(ours)))
@@ -186,7 +196,8 @@ def p1_con_liveness(ctx):
                 ctx.note("selftest.json", str(st))
                 return CaseResult("PASS")
             time.sleep(3)
-        return CaseResult("FAIL", reason="≤60s 內 human_attached 未轉 false（孤兒未回收）")
+        return CaseResult("FAIL", reason="≤60s 內 human_attached 未轉 false（孤兒未回收）",
+                          category="test", reason_code="orphan_not_recycled")
     finally:
         ctx.tmux.kill(ses)
         time.sleep(3)
@@ -220,7 +231,8 @@ def p1_con_orphan(ctx):
             time.sleep(3)
         ctx.note("recycle.json", str(st))
         if not recycled:
-            return CaseResult("FAIL", reason="≤60s 內孤兒未回收（human_attached 未轉 False）")
+            return CaseResult("FAIL", reason="≤60s 內孤兒未回收（human_attached 未轉 False）",
+                              category="test", reason_code="orphan_not_recycled")
         ctx.tmux.new(ses2, "serialwrap-minicom COM0")  # 回收後重開，不 restart daemon
         cl: dict = {}
         owned = False
@@ -233,14 +245,16 @@ def p1_con_orphan(ctx):
             time.sleep(2)
         ctx.note("console-list.json", str(cl))
         if not owned:
-            return CaseResult("FAIL", reason="重開 minicom 未拿回 raw interactive ownership")
+            return CaseResult("FAIL", reason="重開 minicom 未拿回 raw interactive ownership",
+                              category="test", reason_code="raw_ownership_not_granted")
         ctx.tmux.send(ses2, "ec", enter=False)
         ctx.tmux.send_key(ses2, "Tab")
         time.sleep(2)
         pane = ctx.tmux.capture(ses2)
         ctx.note("pane.txt", pane)
         if "echo" not in strip_ansi(pane):
-            return CaseResult("FAIL", reason="Tab 補完未出現（raw 路徑疑掉回 line-buffer）")
+            return CaseResult("FAIL", reason="Tab 補完未出現（raw 路徑疑掉回 line-buffer）",
+                              category="test", reason_code="raw_fallback_linebuffer")
         ctx.tmux.send_key(ses2, "C-u")
         return CaseResult("PASS")
     finally:
@@ -265,9 +279,12 @@ def p1_con_second(ctx):
         consoles = cl.get("consoles") or []
         owners = [c for c in consoles if c.get("interactive_owner")]
         if len(owners) != 1:
-            return CaseResult("FAIL", reason=f"interactive_owner 數應為 1，實為 {len(owners)}（consoles={len(consoles)}）")
+            return CaseResult("FAIL",
+                              reason=f"interactive_owner 數應為 1，實為 {len(owners)}（consoles={len(consoles)}）",
+                              category="test", reason_code="owner_count_mismatch")
         if len(consoles) < 2:
-            return CaseResult("FAIL", reason=f"第二 console 未建立（consoles={len(consoles)}）")
+            return CaseResult("FAIL", reason=f"第二 console 未建立（consoles={len(consoles)}）",
+                              category="test", reason_code="second_console_missing")
         return CaseResult("PASS")
     finally:
         ctx.tmux.kill(ses1)

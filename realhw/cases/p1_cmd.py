@@ -58,14 +58,16 @@ def p1_cmd_modes(ctx):
     line = ctx.sw.submit_and_wait("COM0", "echo MODE_LINE")
     ctx.note("line.json", str(line))
     if "MODE_LINE" not in (line.get("stdout") or ""):
-        return CaseResult("FAIL", reason=f"line 模式 stdout 未含 marker（status={line.get('status')}）")
+        return CaseResult("FAIL", reason=f"line 模式 stdout 未含 marker（status={line.get('status')}）",
+                          category="test", reason_code="cmd_marker_missing")
 
     # (2) background：輪詢 result-tail 累積 chunk 收齊 BG_1..3
     sub = ctx.sw.run("cmd", "submit", "--selector", "COM0", "--mode", "background",
                      "--cmd", "for i in 1 2 3; do echo BG_$i; sleep 1; done", "--cmd-timeout", "15")
     cmd_id = sub.get("cmd_id")
     if not cmd_id:
-        return CaseResult("FAIL", reason=f"background submit 未回 cmd_id（{sub.get('error_code')}）")
+        return CaseResult("FAIL", reason=f"background submit 未回 cmd_id（{sub.get('error_code')}）",
+                          category="test", reason_code="submit_no_cmd_id")
     need = [f"BG_{i}" for i in (1, 2, 3)]
     # 部署 daemon（0.2.2）對「執行至 prompt 即結束」的 background 命令，會把輸出
     # 放進 command.stdout（result-tail chunks 只承載 prompt 之後的非同步輸出）；
@@ -94,14 +96,16 @@ def p1_cmd_modes(ctx):
     ctx.note("background.txt", f"tail={tail_text!r}\nstatus_stdout={status_stdout!r}")
     missing = [m for m in need if m not in combined]
     if missing:
-        return CaseResult("FAIL", reason=f"background 輸出缺 marker（chunks+stdout 皆無）：{missing}")
+        return CaseResult("FAIL", reason=f"background 輸出缺 marker（chunks+stdout 皆無）：{missing}",
+                          category="test", reason_code="background_output_missing")
 
     # (3) interactive
     op = ctx.sw.run("session", "interactive-open", "--selector", "COM0",
                     "--owner", "agent:realhw", "--timeout", "20")
     iid = op.get("interactive_id") or ""
     if not iid:
-        return CaseResult("FAIL", reason=f"interactive-open 未回 interactive_id（{op.get('error_code')}）")
+        return CaseResult("FAIL", reason=f"interactive-open 未回 interactive_id（{op.get('error_code')}）",
+                          category="test", reason_code="interactive_open_failed")
     try:
         ctx.sw.run("session", "interactive-send", "--interactive-id", iid,
                    "--data", "echo IA_OK", "--encoding", "plain")
@@ -111,7 +115,8 @@ def p1_cmd_modes(ctx):
         stt = ctx.sw.run("session", "interactive-status", "--interactive-id", iid)
         ctx.note("interactive-status.json", str(stt))
         if "IA_OK" not in (stt.get("screen") or ""):
-            return CaseResult("FAIL", reason="interactive 畫面未見 IA_OK")
+            return CaseResult("FAIL", reason="interactive 畫面未見 IA_OK",
+                              category="test", reason_code="interactive_echo_missing")
     finally:
         ctx.sw.run("session", "interactive-close", "--interactive-id", iid)
 
@@ -119,7 +124,9 @@ def p1_cmd_modes(ctx):
     err = ctx.sw.run("cmd", "submit", "--selector", "COM9", "--cmd", "echo x", "--cmd-timeout", "5")
     ctx.note("error.json", str(err))
     if err.get("error_code") != "SESSION_NOT_FOUND":
-        return CaseResult("FAIL", reason=f"不存在 selector 未回 SESSION_NOT_FOUND（{err.get('error_code')}）")
+        return CaseResult("FAIL",
+                          reason=f"不存在 selector 未回 SESSION_NOT_FOUND（{err.get('error_code')}）",
+                          category="test", reason_code="error_code_contract")
     return CaseResult("PASS")
 
 
@@ -151,10 +158,12 @@ def p1_cmd_serial(ctx):
         submits_by_source[w["source"]] = w["submits"]
         for marker, status, stdout in w["outs"]:
             if status != "done" or marker not in stdout:
-                return CaseResult("FAIL", reason=f"{w['source']} {marker} 未完成（status={status}）")
+                return CaseResult("FAIL", reason=f"{w['source']} {marker} 未完成（status={status}）",
+                                  category="test", reason_code="serial_cmd_incomplete")
             foreign = [m for m in all_markers if m != marker and m in stdout]
             if foreign:
-                return CaseResult("FAIL", reason=f"{w['source']} stdout cross-talk 混入 {foreign}")
+                return CaseResult("FAIL", reason=f"{w['source']} stdout cross-talk 混入 {foreign}",
+                                  category="test", reason_code="cross_talk")
 
     # WAL TX 計數 == 各 source 提交數（本輪 start_seq 起算，避開歷史）
     exp = ctx.sw.run("wal", "export", "--from-seq", str(start_seq))
@@ -168,7 +177,8 @@ def p1_cmd_serial(ctx):
     for source, want in submits_by_source.items():
         if tx_by_source.get(source, 0) != want:
             return CaseResult("FAIL",
-                              reason=f"{source} WAL TX 計數 {tx_by_source.get(source, 0)} != 提交數 {want}")
+                              reason=f"{source} WAL TX 計數 {tx_by_source.get(source, 0)} != 提交數 {want}",
+                              category="test", reason_code="wal_tx_count_mismatch")
     return CaseResult("PASS")
 
 
@@ -188,7 +198,8 @@ def p1_cmd_file(ctx):
     if "B64_OK" not in (probe.get("stdout") or ""):
         return CaseResult("SKIP",
                           reason="target 缺 base64（busybox DUT），file push/pull UART 協定不可用"
-                                 "——known deployed/env limitation（#122）")
+                                 "——known deployed/env limitation（#122）",
+                          category="environment", reason_code="base64_missing")
     fd, local = tempfile.mkstemp(prefix="rhw-", suffix=".bin")
     os.close(fd)
     data = random.randbytes(256 * 1024)
@@ -221,7 +232,8 @@ def p1_cmd_file(ctx):
             stop.set()
             th.join(timeout=5)
         if not push.get("ok"):
-            return CaseResult("FAIL", reason=f"file push 失敗（{push.get('error_code')}）")
+            return CaseResult("FAIL", reason=f"file push 失敗（{push.get('error_code')}）",
+                              category="test", reason_code="file_push_failed")
 
         pull = ctx.sw.run("--timeout", "120", "file", "pull", "--selector", "COM0",
                           "--remote", remote, "--local", pulled, timeout=180)
@@ -231,11 +243,15 @@ def p1_cmd_file(ctx):
             with open(pulled, "rb") as fh:
                 dst_md5 = hashlib.md5(fh.read()).hexdigest()
         except OSError as exc:
-            return CaseResult("FAIL", reason=f"pull 檔案讀取失敗：{exc!r}")
+            return CaseResult("FAIL", reason=f"pull 檔案讀取失敗：{exc!r}",
+                              category="test", reason_code="file_pull_read_failed")
         if dst_md5 != src_md5:
-            return CaseResult("FAIL", reason=f"round-trip md5 不符（src={src_md5} dst={dst_md5}）")
+            return CaseResult("FAIL", reason=f"round-trip md5 不符（src={src_md5} dst={dst_md5}）",
+                              category="test", reason_code="file_md5_mismatch")
         if max_lat["v"] >= 3.0:
-            return CaseResult("FAIL", reason=f"push 期間 RPC 探針最大延遲 {max_lat['v']:.1f}s（≥3s，疑 event loop 凍結）")
+            return CaseResult("FAIL",
+                              reason=f"push 期間 RPC 探針最大延遲 {max_lat['v']:.1f}s（≥3s，疑 event loop 凍結）",
+                              category="test", reason_code="rpc_freeze")
         return CaseResult("PASS")
     finally:
         # local（mkstemp）在所有 return 路徑（含 push 失敗早退）都須清除，避免長跑殘檔。

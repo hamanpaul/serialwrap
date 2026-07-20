@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import time
+from pathlib import Path
 
 _ANSI = re.compile(r"\x1b(?:\[[0-9;?]*[A-Za-z]|\([A-Za-z]|[=>])")
 
@@ -33,6 +34,72 @@ def parse_usbipd_list(output: str) -> list[str]:
             if m:
                 busids.append(m.group(1))
     return busids
+
+
+def parse_win_held(payload: dict) -> list[dict]:
+    """Windows 端 session list → 仍持有裝置 handle 的 session。"""
+    held: list[dict] = []
+    for s in payload.get("sessions") or []:
+        state = (s.get("state") or "").upper()
+        if state in ("DETACHED", "RELEASED", ""):
+            continue
+        held.append({
+            "com": s.get("com") or "",
+            "state": state,
+            "device_by_id": s.get("device_by_id") or "",
+        })
+    return held
+
+
+def match_held_for_serial(held: list[dict], serial: str) -> dict | None:
+    for item in held:
+        if serial and serial in (item.get("device_by_id") or ""):
+            return item
+    if held and not any(item.get("device_by_id") for item in held):
+        return held[0]
+    return None
+
+
+def plan_hp_rescue(win_available: bool, held_com: str | None, retries_done: int,
+                   *, max_retries: int = 2) -> tuple[str, ...]:
+    if retries_done >= max_retries:
+        return ("fail_attended",)
+    if win_available and held_com:
+        return (f"win_release:{held_com}", "attach_retry")
+    return ("attach_retry",)
+
+
+def classify_topology_run(rc: int, log_tail: str) -> tuple[str, str, str, str]:
+    tail = log_tail or ""
+    if rc == 0:
+        if "SKIP：" in tail:
+            return ("SKIP", "environment", "docker_unavailable", "script 回報 docker 不可用（SKIP）")
+        return ("PASS", "", "", "")
+    if rc == -1:
+        return ("FAIL", "environment", "harness_timeout", "realhw wrapper 整體逾時遭終止")
+    fail_lines = [ln.strip() for ln in tail.splitlines() if "FAIL:" in ln]
+    reason = fail_lines[-1] if fail_lines else f"script 異常結束 rc={rc}（log 尾段無 FAIL 行）"
+    if "docker build 失敗" in tail:
+        return ("FAIL", "environment", "docker_build_failed", reason)
+    if "逾時未就緒" in tail:
+        return ("FAIL", "environment", "harness_not_ready", reason)
+    return ("FAIL", "test", "tunnel_assertion_failed", reason)
+
+
+def remote_state_dir(env: dict[str, str] | None = None) -> Path:
+    e = os.environ if env is None else env
+    run = (e.get("SERIALWRAP_RUN_DIR") or "").strip()
+    if run:
+        return Path(os.path.expanduser(run)) / "remote"
+    state = (e.get("SERIALWRAP_STATE_DIR") or "").strip()
+    if state:
+        return Path(os.path.expanduser(state)) / "remote"
+    xrt = (e.get("XDG_RUNTIME_DIR") or "").strip()
+    if xrt:
+        return Path(xrt) / "serialwrap" / "remote"
+    state_home = (e.get("XDG_STATE_HOME") or "").strip()
+    base = Path(os.path.expanduser(state_home)) if state_home else Path.home() / ".local/state"
+    return base / "serialwrap" / "run" / "remote"
 
 
 def _run(argv: list[str], timeout: float = 30.0) -> subprocess.CompletedProcess:
@@ -124,8 +191,8 @@ class Usbipd:
     def detach(self, busid: str) -> None:
         _run([self._exe, "detach", "-b", busid])
 
-    def attach(self, busid: str) -> None:
-        _run([self._exe, "attach", "-w", "-b", busid], timeout=60)
+    def attach(self, busid: str) -> int:
+        return _run([self._exe, "attach", "-w", "-b", busid], timeout=60).returncode
 
 
 class Systemd:
@@ -140,3 +207,33 @@ class Systemd:
             return int(out.strip().split("=", 1)[1])
         except (IndexError, ValueError):
             return 0
+
+
+class WinSwCli:
+    """Windows 端 serialwrap.exe 薄包裝。"""
+
+    def __init__(self, exe: str) -> None:
+        self._exe = exe or ""
+
+    def available(self) -> bool:
+        return bool(self._exe) and Path(self._exe).exists()
+
+    def run(self, *args: str, timeout: float = 30.0) -> dict:
+        if not self.available():
+            return {"_rc": -1, "_stderr": "win serialwrap.exe 未設定或不存在", "_raw": ""}
+        cp = _run([self._exe, *args], timeout=timeout)
+        out = cp.stdout.strip()
+        try:
+            data = json.loads(out) if out else {}
+        except json.JSONDecodeError:
+            data = {"_raw": out}
+        data["_rc"] = cp.returncode
+        data["_stderr"] = cp.stderr.strip()
+        return data
+
+    def held_devices(self) -> list[dict]:
+        return parse_win_held(self.run("session", "list"))
+
+    def release(self, com: str) -> dict:
+        return self.run("device", "release", "--selector", com,
+                        "--source", "agent:realhw", "--reason", "realhw hp-rescue")
