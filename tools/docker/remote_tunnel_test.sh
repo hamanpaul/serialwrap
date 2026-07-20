@@ -324,13 +324,14 @@ topology_direct() {
 topology_nat_host() {
   log "=== 拓樸 2／NAT→host：uart(NAT) + relay 同網段（net_a），agent CLI colocate 在 relay ==="
   local net="net_a_${SUFFIX}"
-  local uart="sw-rt-uart2-${SUFFIX}" relay="sw-rt-relay2-${SUFFIX}"
+  local uart="sw-rt-uart2-${SUFFIX}" relay="sw-rt-relay2-${SUFFIX}" attacker="sw-rt-attacker2-${SUFFIX}"
   local ep="tcp://127.0.0.1:7777"
   local sock=/home/tester/.sw-relay/relay-sw.sock
 
   mk_net "$net"
   start_uart "$uart" "$net"
   start_role "$relay" "$net"
+  start_plain "$attacker" "$net"
   wait_uart_ready "$uart"
 
   assert_default_off "$uart" "$relay" "$ep" root
@@ -343,6 +344,16 @@ topology_nat_host() {
   assert_session_and_cmd "$relay" root "$ep"
   assert_pid_unchanged "$uart" "$pid_before" "拓樸2 tcp expose 後"
   assert_loopback_bind "$relay" 7777
+
+  # 斷言⑤延伸（R2 review finding：補真攻擊者連線隔離斷言，不只是 ss 位址檢查）——
+  # attacker 是與 relay 同網段（net_a）的獨立容器，直連 relay 的「非 loopback」容器位址
+  # （tcp://<relay-container>:7777，不是合法 agent 用的 relay 自身 127.0.0.1）應失敗，
+  # 證明轉發真的只綁 relay loopback、network 上其他 host 連不進來。
+  local atk_out; atk_out=$(endpoint_exec "$attacker" root "tcp://${relay}:7777" daemon status)
+  assert_ok_false "$atk_out" "拓樸2 attacker（net_a，非 loopback 位址）應無法連 ${relay}:7777"
+  [[ "$(jpath "$atk_out" error_code)" == "SOCKET_ERROR" ]] \
+    || fail "拓樸2 attacker（net_a）：預期 error_code=SOCKET_ERROR，實得：$atk_out"
+  log "assertion⑤延伸（跨容器攻擊者隔離，tcp 模式）PASS：拓樸2"
 
   # 斷言⑥ 前半：relay 上第二個本機使用者（otheruser）tcp loopback 模式「可連」（已知殘留風險）
   local other_out; other_out=$(endpoint_exec "$relay" otheruser "$ep" daemon status)
@@ -376,7 +387,7 @@ topology_nat_host() {
   assert_default_off "$uart" "$relay" "$ep" root
   assert_pid_unchanged "$uart" "$pid_before" "拓樸2 remote-socket close 後（assertion④）"
 
-  teardown_now "$uart" "$relay" -- "$net"
+  teardown_now "$uart" "$relay" "$attacker" -- "$net"
   log "=== 拓樸 2／NAT→host：PASS ==="
 }
 
@@ -384,7 +395,7 @@ topology_nat_host() {
 topology_dual_nat() {
   log "=== 拓樸 3／NAT←client：net_a=uart+relay、net_b=agent+relay，uart 與 agent 無共網段 ==="
   local neta="net_a_${SUFFIX}" netb="net_b_${SUFFIX}"
-  local uart="sw-rt-uart3-${SUFFIX}" relay="sw-rt-relay3-${SUFFIX}" agent="sw-rt-agent3-${SUFFIX}"
+  local uart="sw-rt-uart3-${SUFFIX}" relay="sw-rt-relay3-${SUFFIX}" agent="sw-rt-agent3-${SUFFIX}" attacker="sw-rt-attacker3-${SUFFIX}"
   local ep="tcp://127.0.0.1:7777"
   local sock=/home/tester/.sw-relay/relay-sw.sock
 
@@ -395,6 +406,7 @@ topology_dual_nat() {
   docker network connect "$netb" "$relay"
   sshd_up "$relay"
   start_plain "$agent" "$netb"
+  start_plain "$attacker" "$neta"
   wait_uart_ready "$uart"
 
   # 確認雙 NAT 隔離：uart 與 agent 互不可達
@@ -436,6 +448,21 @@ except OSError:
   assert_pid_unchanged "$uart" "$pid_before" "拓樸3 tcp 端到端後"
   assert_loopback_bind "$relay" 7777
 
+  # 斷言⑤延伸（R2 review finding：雙 NAT 拓樸也補真攻擊者連線隔離斷言）——
+  # attacker 與 relay/uart 同 net_a，直連 relay 的「非 loopback」容器位址應失敗。
+  local atk_out; atk_out=$(endpoint_exec "$attacker" root "tcp://${relay}:7777" daemon status)
+  assert_ok_false "$atk_out" "拓樸3 attacker（net_a，非 loopback 位址）應無法連 ${relay}:7777"
+  [[ "$(jpath "$atk_out" error_code)" == "SOCKET_ERROR" ]] \
+    || fail "拓樸3 attacker（net_a）：預期 error_code=SOCKET_ERROR，實得：$atk_out"
+  # agent 雖是合法一方，但這裡繞過自己的 -L 轉發、改直連 relay 的容器位址（非 relay 自身
+  # 127.0.0.1）：relay port 只綁 loopback，即使是 net_b 上「已授權」的 host 這樣連也該失敗，
+  # 證明合法路徑必須經過 relay 自身的 127.0.0.1（-L 轉發），而不是網路可達即可連。
+  local agent_direct_out; agent_direct_out=$(endpoint_exec "$agent" root "tcp://${relay}:7777" daemon status)
+  assert_ok_false "$agent_direct_out" "拓樸3 agent（net_b，繞過 -L 直連）應無法連 ${relay}:7777"
+  [[ "$(jpath "$agent_direct_out" error_code)" == "SOCKET_ERROR" ]] \
+    || fail "拓樸3 agent（net_b 繞過 -L）：預期 error_code=SOCKET_ERROR，實得：$agent_direct_out"
+  log "assertion⑤延伸（跨容器攻擊者隔離：net_a attacker + net_b agent 繞過 -L 直連皆失敗）PASS：拓樸3"
+
   role_close_all "$agent" >/dev/null
   uart_close_all "$uart" >/dev/null
   sleep 1
@@ -463,7 +490,7 @@ except OSError:
   assert_role_default_off "$agent"
   assert_pid_unchanged "$uart" "$pid_before" "拓樸3 remote-socket close 後（assertion④）"
 
-  teardown_now "$uart" "$relay" "$agent" -- "$neta" "$netb"
+  teardown_now "$uart" "$relay" "$agent" "$attacker" -- "$neta" "$netb"
   log "=== 拓樸 3／NAT←client：PASS ==="
 }
 
@@ -472,6 +499,7 @@ topology_gatewayports_failclosed() {
   log "=== 額外／斷言⑦：GatewayPorts yes relay 的 fail-closed 驗證 ==="
   local net="net_gw_${SUFFIX}"
   local uart="sw-rt-uartgw-${SUFFIX}" relay="sw-rt-relaygw-${SUFFIX}"
+  local ep="tcp://127.0.0.1:7777"
   local sock=/home/tester/.sw-relay/gw.sock
 
   mk_net "$net"
@@ -507,6 +535,14 @@ topology_gatewayports_failclosed() {
 
   uart_close_all "$uart" >/dev/null
   docker exec "$relay" rm -f "$sock" >/dev/null 2>&1 || true
+  sleep 1
+
+  # 補：⑦b（--remote-socket 成功案例）的 teardown 收尾重查（原本只有⑦a tcp fail-closed
+  # 分支有此複查，remote-socket 成功分支的 close 若有 teardown 迴歸不會被抓到）。
+  # 沿用其他拓樸關閉後共用的 assert_default_off（無殘留 state／ssh 行程、endpoint 不可連）。
+  assert_default_off "$uart" "$relay" "$ep" root
+  assert_pid_unchanged "$uart" "$pid_before" "assertion⑦ remote-socket close 後（收尾重查）"
+  log "assertion⑦c（--remote-socket close 後收尾重查：復歸預設不啟用）PASS"
 
   teardown_now "$uart" "$relay" -- "$net"
   log "=== 額外／斷言⑦：PASS ==="
