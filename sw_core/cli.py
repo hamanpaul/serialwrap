@@ -703,6 +703,93 @@ def _run_skill(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_remote(args: argparse.Namespace) -> int:
+    """serialwrap remote 分派：words → status / close / open。
+
+    ``sw_core.remote_tunnel`` 於此延遲匯入（而非 cli.py 模組層級）：該模組硬依賴
+    ``fcntl``（POSIX-only），cli.py 頂層需在 Windows 也能正常 import，故不得在
+    模組層級引入；`guard_platform()` 在 open 分支對 native Windows fail-closed
+    拒絕（``REMOTE_NOT_SUPPORTED``），status／close 分支則本期不受限（純讀寫
+    ``<run_dir>/remote/`` 下的 state 檔）。全程例外皆經 ``except rt.TunnelError``
+    轉為 JSON，不讓例外穿越 CLI 邊界。
+    """
+    from . import remote_tunnel as rt  # noqa: PLC0415
+
+    run_dir = _remote_run_dir()
+    words = list(getattr(args, "words", []) or [])
+    try:
+        if not words or words[0] == "status":
+            _print(rt.status(run_dir))
+            return 0
+        if words[0] == "close":
+            selector = words[1] if len(words) > 1 else "all"
+            _print(rt.close(run_dir, selector))
+            return 0
+
+        rt.guard_platform()
+        if args.reverse and args.forward:
+            raise rt.TunnelError("INVALID_ARGS", "-R 與 -L 不可同時指定")
+        role = "connect" if args.forward else "expose"  # -R 預設
+        ssh_target, port = rt.parse_target(words[0])
+        rt.resolve_ssh_bin("autossh" if args.autossh else "ssh")
+
+        forward_src = None
+        if role == "expose":
+            forward_src = _forward_src_from_endpoint(_resolve_endpoint(args))
+
+        spec = rt.TunnelSpec(
+            role=role,
+            ssh_target=ssh_target,
+            port=port,
+            local=args.local,
+            forward_src=forward_src,
+            remote_socket=args.remote_socket,
+            via="autossh" if args.autossh else "ssh",
+            ssh_opts=tuple(args.ssh_opt),
+            ready_timeout=args.ready_timeout,
+        )
+        res = rt.open_tunnel(
+            spec,
+            run_dir,
+            spawner=rt.real_spawner,
+            runner=rt.make_runner(),
+            ping=rt.real_ping,
+        )
+        _print(res)
+        return 0
+    except rt.TunnelError as exc:
+        _print({"ok": False, "error_code": exc.code, "message": exc.message or exc.code})
+        return 1
+
+
+def _forward_src_from_endpoint(endpoint: str) -> str:
+    """把 ``_resolve_endpoint`` 解出的 endpoint 轉成 ssh ``-R`` 的本機轉發源。
+
+    unix endpoint → 原樣回傳 AF_UNIX 路徑；tcp endpoint → 改指 ``127.0.0.1:<port>``
+    （對端只需連到本機 loopback 上該 daemon 監聽的 port，host 部分無意義）。
+    """
+    transport, address = _parse_endpoint(endpoint)
+    if transport == "unix":
+        return address  # AF_UNIX 路徑
+    host, tcp_port = address
+    return f"127.0.0.1:{tcp_port}"
+
+
+def _remote_run_dir() -> str:
+    """remote state 落在 ``<run_dir>/remote/``。
+
+    **於呼叫時讀 env**（不可用 import-time ``constants.SOCKET_PATH`` 之類的凍結值）：
+    測試以 ``monkeypatch.setenv("SERIALWRAP_RUN_DIR", ...)`` 於 import 之後覆寫，
+    需要每次呼叫都即時生效，才能達到 per-test 隔離。
+    """
+    run = os.environ.get("SERIALWRAP_RUN_DIR")
+    if run and run.strip():
+        return os.path.expanduser(run)
+    from . import constants  # noqa: PLC0415
+
+    return constants.RUN_DIR
+
+
 def _run_doctor(args: argparse.Namespace) -> int:
     """執行環境診斷並印出 JSON 報告；advisory 項不影響整體 ok。"""
     report = run_doctor()
@@ -1115,6 +1202,54 @@ def build_parser() -> argparse.ArgumentParser:
     mcu_sub.add_parser("patterns", help="列出所有已知 MCU 家族 flash pattern（family／probe／expect／baud）")
     mcu_sub.add_parser("status", help="顯示 flash 端點狀態：候選 COM port 清單與目前是否 flashing")
 
+    p_remote = sub.add_parser(
+        "remote",
+        help="按需開關 ssh 反向隧道，讓遠端 agent 連本機 daemon（-R 預設 expose）",
+        description=(
+            "serialwrap remote：外包系統 ssh 建立 -R（expose，把本機 daemon 推到對端）／"
+            "-L（connect，relay 情境把對端 port 拉回本機 loopback）隧道，background 常駐。\n"
+            "  serialwrap remote user@host:7777        # -R 預設：expose 本機 daemon\n"
+            "  serialwrap remote -L user@relay:7777    # connect（relay/雙 NAT）\n"
+            "  serialwrap remote                        # 列目前隧道（status）\n"
+            "  serialwrap remote close 7777|all         # 拆除\n"
+            "安全：只透過 ssh-tunnel、單租戶/可信 relay 或 --remote-socket；不可對網路直接開放。"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_remote.add_argument("words", nargs="*", help="[user@]host:port ｜ status ｜ close <port|all>")
+    # 註：-R/-L 刻意不用 add_mutually_exclusive_group()——argparse 對同群組 store_true
+    # 旗標的互斥是在 parse_args 當場 parser.error() → SystemExit(2)（usage 訊息印到
+    # stderr），會讓「同時給 -R -L」整條命令繞過 _run_remote() 的 try/except
+    # TunnelError，無法回傳本 CLI 一貫的機器可解析 JSON
+    # {"ok": false, "error_code": ...} 邊界契約（「例外不得穿越 CLI 邊界」慣例）。
+    # 改成兩個獨立旗標，互斥檢查留給 _run_remote() 內顯式判斷並 raise
+    # TunnelError("INVALID_ARGS")。
+    p_remote.add_argument("-R", dest="reverse", action="store_true", help="reverse/expose（預設）")
+    p_remote.add_argument("-L", dest="forward", action="store_true", help="forward/connect（relay）")
+    p_remote.add_argument("--autossh", action="store_true", help="以 autossh 斷線自動重連")
+    p_remote.add_argument("--local", type=int, default=None, help="-L 本機 loopback port（預設=對端 port）")
+    p_remote.add_argument(
+        "--remote-socket",
+        dest="remote_socket",
+        default=None,
+        help="硬化：-R 建遠端 unix socket／-L 連該 socket（共享 relay 建議）",
+    )
+    p_remote.add_argument(
+        "--ready-timeout",
+        dest="ready_timeout",
+        type=float,
+        default=10.0,
+        help="readiness 確認上限秒數（逾時回 starting）",
+    )
+    p_remote.add_argument(
+        "--ssh-opt",
+        dest="ssh_opt",
+        action="append",
+        default=[],
+        help="透傳額外 ssh 參數（可重複），如 --ssh-opt=-p --ssh-opt=2222",
+    )
+    # 註：--socket / --endpoint / --timeout 為既有全域參數，_resolve_endpoint 會取用。
+
     p_event = sub.add_parser(
         "event",
         help="event-trigger 規則註冊與 matcher 控制",
@@ -1451,6 +1586,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "skill":
         return _run_skill(args)
+
+    if args.cmd == "remote":
+        return _run_remote(args)
 
     _print({"ok": False, "error_code": "INVALID_ARGS"})
     return 2
