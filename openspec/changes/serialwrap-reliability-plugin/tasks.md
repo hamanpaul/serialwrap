@@ -30,11 +30,11 @@
 
 ## 5. Phase 2a — plugin dist 與核心（reliability/）
 
-- [ ] 5.1 `reliability/pyproject.toml`（dist 名/deps/entry point/api_version 常數）＋`serialwrap_reliability/` 骨架；驗 release wheel 內容不變
-- [ ] 5.2 RED＋GREEN：`core.py`（不 import testpilot）：REGISTRY→case dicts 映射（tier/destructive/requires metadata、destructive 預設過濾）、CaseResult→`_last_failure` 抄寫、longrun steps 合成——serialwrap `tests/` 直測
-- [ ] 5.3 RED＋GREEN：testbed loader（testbed.yaml→cfg 合成；與 config.json 雙來源等價單測）
-- [ ] 5.4 `plugin.py`（PluginBase glue：name/api_version/discover_cases/prepare_run=preflight gate/setup_env=Ctx 一次建置/execute_step=black-box/evaluate/teardown）＋`agent-config.yaml`（sequential、max_attempts=1、remediation=snapshot-only：enabled true＋max_attempts=1＋不覆寫 decision hooks；hooks 含 on_failure）
-- [ ] 5.5 `reporter.py`（create_reporter/report_formats=["md","json"]，重用 realhw 報告＋run meta 烙 deployed 版本）
+- [x] 5.1 `reliability/pyproject.toml`（dist 名/deps/entry point/api_version 常數）＋`serialwrap_reliability/` 骨架；驗 release wheel 內容不變
+- [x] 5.2 RED＋GREEN：`core.py`（不 import testpilot）：REGISTRY→case dicts 映射（tier/destructive/requires metadata、destructive 預設過濾）、CaseResult→`_last_failure` 抄寫、longrun steps 合成——serialwrap `tests/` 直測
+- [x] 5.3 RED＋GREEN：testbed loader（testbed.yaml→cfg 合成；與 config.json 雙來源等價單測）
+- [x] 5.4 `plugin.py`（PluginBase glue：name/api_version/discover_cases/prepare_run=preflight gate/setup_env=Ctx 一次建置/execute_step=black-box/evaluate/teardown）＋`agent-config.yaml`（sequential、max_attempts=1、remediation=snapshot-only：enabled true＋max_attempts=1＋不覆寫 decision hooks；hooks 含 on_failure）
+- [x] 5.5 `reporter.py`（create_reporter/report_formats=["md","json"]，重用 realhw 報告＋run meta 烙 deployed 版本）
 
 ## 6. Phase 2b — bench 整合驗收（plugin）
 
@@ -47,4 +47,4 @@
 ## 7. 收尾
 
 - [x] 7.1 changelog fragment（R-09）＋docs 對齊（README/checklist，R-16/R-18）
-- [ ] 7.2 `python3 -m pytest -q tests/` 無新失敗＋`python3 -m policy_check --repo .`（帶 PR 參數）通過
+- [x] 7.2 `python3 -m pytest -q tests/` 無新失敗＋`python3 -m policy_check --repo .`（帶 PR 參數）通過

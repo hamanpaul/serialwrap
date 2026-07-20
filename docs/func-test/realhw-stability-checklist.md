@@ -317,3 +317,15 @@ Windows 無 PTY，human console 改走 `127.0.0.1` TCP listener（預設 RPC `tc
 - 實作計畫（逐 case 規格）：`docs/superpowers/plans/2026-07-02-realhw-stability-suite.md`
 - CLI 契約與狀態機：`README.md`、`docs/serialwrap-spec.md`
 - 政策（測試/policy/分支/commit）：`CLAUDE.md`
+
+---
+
+## testpilot plugin 入口（Phase 2，dev-only）
+
+realhw 的第二個前端；引擎與 case 完全同一套，選擇/分診/trace/報表交給 testpilot。
+
+- 安裝（僅 editable；永不 release）：`cd ~/prj_arc/testpilot && uv pip install -e ~/prj_pri/serialwrap/reliability`
+- bench 事實正本：`reliability/serialwrap_reliability/testbed.yaml.example`（testpilot 每次 run 會把它覆蓋到 `configs/testbed.yaml`——改正本，勿改 staged 副本）；與 `realhw/config.json` 的等價性由 `tests/test_reliability_pluginfiles.py` 釘死。
+- 常用命令：`testpilot list-plugins`／`testpilot list-cases serialwrap_reliability`／`testpilot run serialwrap_reliability --case p0-doctor`。
+- 分診契約：PASS→Pass；FAIL 依 `CaseResult.category` 落 FailTest/FailEnv/FailConfig；執行期 SKIP→FailEnv；未捕捉例外→Inconclusive。破壞性 case 預設不進 run，`--case` 顯式點名才執行。
+- 長跑：`lr-mixed` 於 discover 依 testbed `longrun.duration`/`snapshot_interval_s` 合成 N 個 checkpoint step；進度看 realhw 的 `snapshots.ndjson`，判決集中收尾。

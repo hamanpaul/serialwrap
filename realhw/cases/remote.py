@@ -137,8 +137,21 @@ def _start_ssh_peer(ctx, tag: str) -> tuple[str, str, Path | None]:
                         capture_output=True, text=True).stdout.strip()
     ctx.case_dir.mkdir(parents=True, exist_ok=True)
     key = ctx.case_dir / "id_ed25519"
-    cp = subprocess.run(["docker", "cp", f"{name}:/home/tester/.ssh/id_ed25519", str(key)],
-                        capture_output=True, text=True)
+    temp_key = f"/tmp/{name}-id_ed25519"
+    exported = subprocess.run(
+        ["docker", "exec", "-u", "tester", name, "bash", "-lc",
+         f"install -m 600 ~/.ssh/id_ed25519 {temp_key}"],
+        capture_output=True,
+        text=True,
+    )
+    if exported.returncode != 0:
+        return name, "", None
+    try:
+        cp = subprocess.run(["docker", "cp", f"{name}:{temp_key}", str(key)],
+                            capture_output=True, text=True)
+    finally:
+        subprocess.run(["docker", "exec", "-u", "tester", name, "rm", "-f", temp_key],
+                       capture_output=True, text=True)
     if cp.returncode != 0 or not key.exists():
         return name, "", None
     key.chmod(0o600)
