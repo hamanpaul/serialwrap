@@ -6,3 +6,4 @@
 from __future__ import annotations
 
 __version__ = "0.1.0"
+PLUGIN_API_VERSION = "1.1"

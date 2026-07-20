@@ -77,6 +77,7 @@ def test_reliability_dev_only_dist_contract():
     try:
         pkg = importlib.import_module("serialwrap_reliability")
         assert pkg.__version__ == "0.1.0"
+        assert pkg.PLUGIN_API_VERSION == "1.1"
         plugin_py = repo_root / "reliability" / "serialwrap_reliability" / "plugin.py"
         assert not plugin_py.exists()  # Task 6 前只有 dist 骨架，plugin glue 尚未落地
     finally:
