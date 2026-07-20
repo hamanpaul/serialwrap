@@ -123,7 +123,7 @@ def test_run_cases_uncaught_exception_is_inconclusive(tmp_path):
 - [ ] **Step 2: 跑測試確認失敗**：
 
 ```bash
-cd /home/paul_chen/prj_pri/serialwrap/.worktrees/reliability-plugin
+# （於本 worktree 根目錄執行）
 python3 -m pytest -q tests/test_realhw_harness.py
 ```
 
