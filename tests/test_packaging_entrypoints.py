@@ -67,11 +67,18 @@ def test_reliability_dev_only_dist_contract():
     assert data["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"] == [
         "serialwrap_reliability"
     ]
+    main_data = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))
+    main_packages = main_data["tool"]["setuptools"]["packages"]
+    assert "serialwrap_reliability" not in main_packages
+    assert all("reliability" not in name for name in main_packages)
+    assert not any("find" in str(key) for key in main_data["tool"]["setuptools"])
 
     sys.path.insert(0, str(repo_root / "reliability"))
     try:
         pkg = importlib.import_module("serialwrap_reliability")
         assert pkg.__version__ == "0.1.0"
+        plugin_py = repo_root / "reliability" / "serialwrap_reliability" / "plugin.py"
+        assert not plugin_py.exists()  # Task 6 前只有 dist 骨架，plugin glue 尚未落地
     finally:
-        sys.path.pop(0)
+        sys.path.remove(str(repo_root / "reliability"))
         sys.modules.pop("serialwrap_reliability", None)
