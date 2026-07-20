@@ -28,3 +28,7 @@ cli:
     help_args: ["--help"]
     reflected_in: "README.md"
     marker: "serialwrap-device-help"
+  - command: "./serialwrap remote"
+    help_args: ["--help"]
+    reflected_in: "README.md"
+    marker: "serialwrap-remote-help"

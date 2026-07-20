@@ -474,23 +474,163 @@ Linux `/dev/ttyMCU` PTY bridge model is not used.
 
 ### Remote Support
 
-Remote operation is normally done through an SSH tunnel. The remote FAE host
-exposes the daemon Unix socket to loopback TCP with `socat`, and the RD host
-forwards that port through SSH:
+When an FAE engineer overseas (a US/EU telecom customer site) uses serialwrap
+to reach a DUT, RD in Taiwan can use `serialwrap remote` to let an agent issue
+commands to the remote daemon: a pure CLI convenience layer that shells out to
+the system `ssh` to build an `-R` (reverse/expose, default) or `-L`
+(forward/connect, relay/double-NAT) tunnel, running detached in the
+background. **The daemon itself is unchanged**, and no separate `socat` is
+needed — `ssh -R` can forward a remote TCP port directly to a local AF_UNIX
+socket (OpenSSH >= 6.7).
+
+#### Architecture overview (direct)
+
+```
+[FAE site, running serialwrapd]                       [Taiwan RD / agent host]
+serialwrap remote tester@AGENT_HOST:7777  --ssh -R-->  tcp://127.0.0.1:7777
+(-R: reverse-push the local daemon socket to the peer)  serialwrap --endpoint tcp://127.0.0.1:7777
+```
+
+When the agent and the UART host can't reach each other directly (double NAT
+/ relay), the agent side instead runs `serialwrap remote -L` (below).
+
+#### UART host side: open the tunnel (one line)
 
 ```bash
-# On the FAE host — the daemon socket is <run-dir>/serialwrapd.sock
-# (default $XDG_RUNTIME_DIR/serialwrap; override with SERIALWRAP_SOCKET).
-socat TCP-LISTEN:7777,bind=127.0.0.1,reuseaddr,fork \
-      UNIX-CONNECT:"$XDG_RUNTIME_DIR/serialwrap/serialwrapd.sock" &
+# -R is the default: reverse-push the local daemon to 127.0.0.1:7777 on tester@AGENT_OR_RELAY
+serialwrap remote tester@AGENT_OR_RELAY:7777
+```
 
-# On the RD host
-ssh -N -L 127.0.0.1:7777:127.0.0.1:7777 fae_user@fae_host
+`serialwrap remote` (`sw_core/remote_tunnel.py`) behavior:
+
+- **Background daemonization**: `ssh` / `--autossh` runs in its own process
+  group in the background; the command returns immediately.
+- **flock registry**: state lives under `<run-dir>/remote/` (`<port>.json` +
+  a `cm-<port>` ssh control socket), serialized with an flock so concurrent
+  `remote` / `remote close` calls don't race.
+- **Readiness confirmation**: returns `status`: `active` = verified and
+  ready; `starting` = timed out (default 10s, tunable via `--ready-timeout`)
+  but the process is still alive and not yet confirmed — query
+  `serialwrap remote` again or retry.
+- **Idempotency / conflict detection**: re-running against the same port with
+  the same identity (a hash of role/target/port/local/remote_socket/via/
+  ssh-opt, etc.) is an `already_running` no-op; a different identity is
+  rejected with `TUNNEL_CONFLICT` (so you can't accidentally hijack someone
+  else's tunnel or collide on a port).
+
+#### Agent-side connection
+
+- **Direct** (the agent host is the ssh peer above):
+  ```bash
+  serialwrap --endpoint tcp://127.0.0.1:7777 session list
+  serialwrap --endpoint tcp://127.0.0.1:7777 cmd submit --selector COM0 --cmd "uname -a"
+  ```
+- **Relay / double NAT** (agent and UART host can't reach each other; both
+  dial out to a relay): the agent side first runs
+  ```bash
+  serialwrap remote -L tester@RELAY:7777   # connect: pull relay's 7777 back to local loopback
+  ```
+  and uses the returned `endpoint` (`tcp://127.0.0.1:7777` by default, or
+  whatever port `--local` specified) as `--endpoint`.
+
+#### Tunnel management
+
+```bash
+serialwrap remote                   # list all current tunnels (status)
+serialwrap remote close 7777        # tear down a single tunnel
+serialwrap remote close all         # tear down everything
+```
+
+#### `--remote-socket` hardening (recommended for shared relays)
+
+By default `-R` opens a `127.0.0.1:<port>` TCP loopback bind on the peer; if
+the relay is a **multi-tenant shared host**, other local users could in
+principle still reach that loopback port. Adding `--remote-socket
+/path/to.sock` instead creates a **unix socket** on the peer, gated by file
+permissions (extending the local daemon socket's 0660 semantics to the
+relay). Both `-R` and `-L` must point at the same path:
+
+```bash
+# UART host (-R)
+serialwrap remote --remote-socket /tmp/sw-relay.sock tester@RELAY:7777
+# agent host (-L, paired)
+serialwrap remote -L --remote-socket /tmp/sw-relay.sock tester@RELAY:7777
+```
+
+#### Security and trust boundary
+
+- The tunnel gives the peer **full control over the DUT**
+  (`command.submit`, `file.push`, `daemon.stop` are all reachable; the
+  daemon adds no token auth — trust is delegated entirely to ssh). **Use
+  only single-tenant / trusted relays**; shared relays must pair with
+  `--remote-socket` above.
+- In `-R` tcp-loopback mode (without `--remote-socket`), readiness reuses
+  the ssh master connection to run `ss` on the peer and verify the remote
+  bind is **loopback only**; if it can't be verified, the check fails, or a
+  non-loopback bind is detected (e.g. the peer's sshd has `GatewayPorts`
+  exposing the port to `0.0.0.0`), it **fails closed** and returns
+  `REMOTE_BIND_UNVERIFIED`, tearing down the already-spawned ssh process so
+  no unverified, exposed tunnel is left behind.
+
+#### Limitations and caveats
+
+- `daemon start` does **not support** `--endpoint` (the daemon can only be
+  started locally; it returns `REMOTE_NOT_SUPPORTED`).
+- **`file.push` / `file.pull`'s `local_path` is a path on the daemon side
+  (UART host)**, not on the agent's local machine; to transfer a local file,
+  first scp/rsync it to the UART host, then have the daemon do the file
+  transfer. WAL and mirror-log paths returned by the RPC are likewise
+  UART-host paths.
+- **Native Windows does not support `serialwrap remote` in this release**:
+  running it returns `REMOTE_NOT_SUPPORTED` (see the manual equivalent
+  below).
+- For an isolated two-container check, run `./tools/docker/remote_smoke.sh`
+  directly; the full flow is documented in
+  [`func-test/README.md`](./func-test/README.md) under the **Remote Support
+  Docker test flow**.
+
+#### Manual `ssh -R` / `-L` equivalent (without `serialwrap remote`)
+
+If you'd rather not use the convenience layer, you can still run ssh by hand
+(this is exactly what `serialwrap remote` generates internally):
+
+```bash
+# -R equivalent (expose, run on the UART host; no socat needed — ssh -R
+# forwards straight to a local unix socket)
+# the socket path is <run-dir>/serialwrapd.sock (RUN_DIR defaults to
+# $XDG_RUNTIME_DIR/serialwrap; override with SERIALWRAP_SOCKET)
+ssh -N -R 127.0.0.1:7777:"$XDG_RUNTIME_DIR/serialwrap/serialwrapd.sock" tester@AGENT_OR_RELAY
+
+# -L equivalent (connect, relay scenario, run on the agent host)
+ssh -N -L 127.0.0.1:7777:127.0.0.1:7777 tester@RELAY
+
+# agent side unchanged
 serialwrap --endpoint tcp://127.0.0.1:7777 session list
 ```
 
-Never expose the TCP bridge on a non-loopback interface; serialwrap RPC can
-submit commands, transfer files, and control the daemon.
+Native Windows (daemon listens on TCP loopback `48700`) manual reverse
+tunnel:
+
+```powershell
+ssh -N -R 7777:127.0.0.1:48700 user@AGENT_OR_RELAY
+```
+
+#### Docker smoke test
+
+To quickly verify the current repo's remote-support works across
+containers, run:
+
+```bash
+./tools/docker/remote_smoke.sh
+```
+
+This script:
+
+1. builds `serialwrap:remote-smoke`
+2. creates an isolated bridge network (no fixed IP, no MAC pinning)
+3. starts a remote daemon container (fake target + `serialwrapd` + `socat`)
+4. starts a client container and verifies `daemon status` / `session list` /
+   `cmd submit` / `cmd status`
 
 ### Event Trigger Engine
 
@@ -1629,90 +1769,107 @@ CLI（`bind` 只改 device、`recover`/`clear` 沿用舊 profile）。在 produc
 > `Offline`（DCD 未拉起），不影響輸入轉送。(3) `log tail-raw` 預設為 latest 模式（最新 N 筆，#124），
 > 直接 `serialwrap log tail-raw --selector COMx --limit 50` 即可驗證最新輸出；要從特定 seq 增量讀取才帶 `--from-seq`。
 
-## Remote Support（ssh-tunnel 遠端連線）
+## Remote Support（serialwrap remote 隧道）
 
-當 FAE 在海外（美國 / 歐洲電信客戶端）用 serialwrap 連接 DUT，台灣 RD 可透過 **ssh-tunnel** 讓 agent 對遠端 daemon 下命令，無需修改 daemon 端程式。
+當 FAE 在海外（美國／歐洲電信客戶端）用 serialwrap 連接 DUT，台灣 RD 可用 `serialwrap remote` 讓 agent 對遠端 daemon 下命令：純 CLI 便利層，外包系統 `ssh` 建立 `-R`（reverse／expose，預設）或 `-L`（forward／connect，relay／雙 NAT 情境）隧道，background 常駐；**daemon 端零改動**，也不需要另跑 `socat`——`ssh -R` 可直接把遠端 TCP port 轉發到本機的 AF_UNIX socket（OpenSSH ≥ 6.7）。
 
-### 架構概覽
+### 架構概覽（direct）
 
 ```
-[台灣 RD]                              [FAE 現場]
- agent (CLI)                           serialwrapd
-   |                                        |
-   | tcp://127.0.0.1:7777                   |
-   +--> ssh tunnel (ssh -L) -->--> socat <--> Unix socket
+[FAE 現場，跑 serialwrapd]                          [台灣 RD / agent host]
+serialwrap remote tester@AGENT_HOST:7777  --ssh -R-->  tcp://127.0.0.1:7777
+（-R：本機 daemon socket 反向推到對端）                serialwrap --endpoint tcp://127.0.0.1:7777
 ```
 
-### FAE 端設定（一次性）
+agent 與 UART host 互不可達（雙 NAT／relay）時，改由 agent 端另跑 `serialwrap remote -L`（見下）。
 
-**步驟 1**：以 `socat` 將 Unix socket 暴露成 TCP（**只 bind loopback，不可對外**）：
+### UART host 端：起隧道（一行）
 
 ```bash
-# socket 為 <run-dir>/serialwrapd.sock（RUN_DIR 預設 $XDG_RUNTIME_DIR/serialwrap，可 SERIALWRAP_SOCKET 覆寫）
-socat TCP-LISTEN:7777,bind=127.0.0.1,reuseaddr,fork \
-      UNIX-CONNECT:"$XDG_RUNTIME_DIR/serialwrap/serialwrapd.sock" &
+# -R 為預設：把本機 daemon 反向推到 tester@AGENT_OR_RELAY 的 127.0.0.1:7777
+serialwrap remote tester@AGENT_OR_RELAY:7777
 ```
 
-> ⚠️ **安全注意**：
-> - 必須 `bind=127.0.0.1`，絕對不能省略，否則 port 會暴露在 0.0.0.0
-> - serialwrap RPC 包含 `command.submit`、`file.push`、`daemon.stop`，**任何可連到此 port 的機器都能完全遠端操控 DUT**
-> - 永遠只透過 ssh-tunnel 使用，不可直接對網路開放
+`serialwrap remote`（`sw_core/remote_tunnel.py`）行為：
 
-**步驟 2**：在 FAE 的 sshd 確認允許 `AllowTcpForwarding yes`（預設通常已開）。
+- **background 常駐**：`ssh`／`--autossh` 以獨立 process group 背景執行，指令立即回傳。
+- **flock registry**：狀態落在 `<run-dir>/remote/`（`<port>.json` + `cm-<port>` ssh control socket），以 flock 序列化並發的 `remote` / `remote close` 操作。
+- **readiness 確認**：回傳 `status`：`active`＝已驗證就緒可用；`starting`＝逾時（預設 10s，`--ready-timeout` 可調）但行程仍存活、尚未確認，需再 `serialwrap remote` 查或重試。
+- **冪等 / 衝突偵測**：同 port 重複執行且 identity（role/target/port/local/remote_socket/via/ssh-opt 等雜湊）相同 → `already_running` no-op；identity 不同 → 拒絕並回 `TUNNEL_CONFLICT`（避免竊佔他人隧道或造成埠位混用）。
 
-### 台灣 RD 端設定
+### Agent 端連線
 
-**建立 ssh-tunnel**：
+- **direct**（agent host 就是上面 ssh 的對端）：
+  ```bash
+  serialwrap --endpoint tcp://127.0.0.1:7777 session list
+  serialwrap --endpoint tcp://127.0.0.1:7777 cmd submit --selector COM0 --cmd "uname -a"
+  ```
+- **relay / 雙 NAT**（agent 與 UART host 互不可達，各自對 relay 撥出）：agent 端先
+  ```bash
+  serialwrap remote -L tester@RELAY:7777   # connect：把 relay 上的 7777 拉回本機 loopback
+  ```
+  回傳的 `endpoint`（預設 `tcp://127.0.0.1:7777`，或 `--local` 指定的 port）即為 agent 該用的 `--endpoint`。
 
-```bash
-ssh -N -L 127.0.0.1:7777:127.0.0.1:7777 fae_user@fae_host
-```
-
-| 參數 | 說明 |
-|---|---|
-| `-N` | 不開 shell，只轉發 port |
-| `-L 127.0.0.1:7777:127.0.0.1:7777` | 本機 7777 → FAE host 127.0.0.1:7777 |
-
-若要保持常駐，可加 `-f` 或用 autossh：
-
-```bash
-autossh -M 0 -N -L 127.0.0.1:7777:127.0.0.1:7777 fae_user@fae_host
-```
-
-**確認 tunnel 通**：
-
-```bash
-serialwrap --endpoint tcp://127.0.0.1:7777 daemon status
-```
-
-### `--endpoint` 參數
-
-CLI 支援 `--endpoint`，優先於 `--socket`：
-
-```bash
-# CLI 遠端查詢 session 列表
-serialwrap --endpoint tcp://127.0.0.1:7777 session list
-
-# CLI 遠端提交命令
-serialwrap --endpoint tcp://127.0.0.1:7777 cmd submit \
-    --selector COM0 --cmd "uname -a"
-```
-
-支援的 endpoint 格式：
+支援的 `--endpoint` 格式：
 
 | 格式 | 用途 |
 |---|---|
 | `<run-dir>/serialwrapd.sock` | 本機 Unix socket（預設；RUN_DIR 預設 `$XDG_RUNTIME_DIR/serialwrap`，可 `SERIALWRAP_SOCKET` 覆寫） |
 | `unix://<run-dir>/serialwrapd.sock` | 本機 Unix socket（顯式 `unix://` 前綴） |
-| `tcp://127.0.0.1:7777` | 透過 ssh-tunnel 連接遠端 daemon |
+| `tcp://127.0.0.1:7777` | 透過隧道連接遠端 daemon（`serialwrap remote` 或手動 ssh 皆可） |
+
+### 隧道管理
+
+```bash
+serialwrap remote                   # 列目前所有隧道（status）
+serialwrap remote close 7777        # 拆除單一隧道
+serialwrap remote close all         # 拆除全部
+```
+
+### `--remote-socket` 硬化（共享 relay 建議必開）
+
+預設 `-R` 在對端開 `127.0.0.1:<port>` 的 TCP loopback bind；relay 若為**多租戶共享主機**，同機其他使用者理論上仍可能連到該 loopback port。加 `--remote-socket /path/to.sock` 後改在對端建 **unix socket**，以檔案權限把關（等同把本機 daemon socket 的 0660 語意延伸到 relay）；`-R`／`-L` 兩端須成對指定同一路徑：
+
+```bash
+# UART host（-R）
+serialwrap remote --remote-socket /tmp/sw-relay.sock tester@RELAY:7777
+# agent host（-L，成對）
+serialwrap remote -L --remote-socket /tmp/sw-relay.sock tester@RELAY:7777
+```
+
+### 安全性與信任邊界
+
+- 隧道讓對端**全權操控 DUT**（`command.submit`、`file.push`、`daemon.stop` 皆可達；daemon 不加 token 驗證，認證完全委由 ssh）。**只用於單租戶／可信 relay**；共享 relay 務必搭配上面的 `--remote-socket`。
+- `-R` 的 tcp loopback 模式（未帶 `--remote-socket`）readiness 會借用 ssh master 連線在對端跑 `ss` 驗證遠端 bind 是否**僅 loopback**；查不到、查失敗、或偵測到非 loopback bind（例如對端 sshd 開了 `GatewayPorts` 把 port 暴露到 `0.0.0.0`）一律 **fail-closed** 拒絕並回 `REMOTE_BIND_UNVERIFIED`，同時 teardown 已 spawn 的 ssh 行程，不留下未驗證安全性的暴露隧道。
 
 ### 限制與注意事項
 
-- `daemon start` **不支援** `--endpoint`（daemon 只能在本機啟動，會回 `REMOTE_NOT_SUPPORTED`）
-- **`file.push / file.pull` 的 `local_path` 是 FAE host（daemon 端）的路徑**，不是 RD 本機路徑。若 RD 要傳輸本機檔案，需先透過 scp/rsync 傳到 FAE host，再由 daemon 執行 file transfer
-- WAL 路徑、mirror log 路徑等回傳值也都是 FAE host 上的路徑
-- 認證完全委由 ssh 本身，daemon 不加 token 驗證
-- 若要做隔離式雙 container 驗證，可直接執行 `./tools/docker/remote_smoke.sh`；完整流程說明在 [`func-test/README.md`](./func-test/README.md) 的 **Remote Support Docker test flow**
+- `daemon start` **不支援** `--endpoint`（daemon 只能在本機啟動，會回 `REMOTE_NOT_SUPPORTED`）。
+- **`file.push` / `file.pull` 的 `local_path` 是 daemon 端（UART host）的路徑**，不是 agent 本機路徑；agent 若要傳輸本機檔案，需先透過 scp/rsync 傳到 UART host，再由 daemon 執行 file transfer。WAL、mirror log 等路徑回傳值同理。
+- **native Windows 本期不支援** `serialwrap remote`：執行會回 `REMOTE_NOT_SUPPORTED`（見下方手動等價）。
+- 若要做隔離式雙 container 驗證，可直接執行 `./tools/docker/remote_smoke.sh`；完整流程說明在 [`func-test/README.md`](./func-test/README.md) 的 **Remote Support Docker test flow**。
+
+### 手動 `ssh -R` / `-L` 等價（不透過 `serialwrap remote`）
+
+不想用便利層時，也可以照舊手動下 ssh（`serialwrap remote` 內部即產生等價 argv）：
+
+```bash
+# -R 等價（expose，於 UART host 執行；免 socat，ssh -R 直接轉發到本機 unix socket）
+# socket 路徑為 <run-dir>/serialwrapd.sock（RUN_DIR 預設 $XDG_RUNTIME_DIR/serialwrap，可 SERIALWRAP_SOCKET 覆寫）
+ssh -N -R 127.0.0.1:7777:"$XDG_RUNTIME_DIR/serialwrap/serialwrapd.sock" tester@AGENT_OR_RELAY
+
+# -L 等價（connect，relay 情境於 agent host 執行）
+ssh -N -L 127.0.0.1:7777:127.0.0.1:7777 tester@RELAY
+
+# agent 端照舊
+serialwrap --endpoint tcp://127.0.0.1:7777 session list
+```
+
+native Windows（daemon 走 TCP loopback `48700`）手動反向隧道：
+
+```powershell
+ssh -N -R 7777:127.0.0.1:48700 user@AGENT_OR_RELAY
+```
 
 ### Docker smoke test
 
@@ -1835,6 +1992,7 @@ command groups:
     file               透過 UART 推送／拉取檔案
     wal                write-ahead log 匯出／重設／seq 查詢
     mcu                MCU flash pattern 查詢與 flash 端點狀態
+    remote             按需開關 ssh 反向隧道，讓遠端 agent 連本機 daemon（-R 預設 expose）
     event              event-trigger 規則註冊與 matcher 控制
     supervision-mode   顯示有效的監管模式（on-demand、systemd-user 或 systemd-system）
     service            透過 systemctl 管理 serialwrap systemd service（systemd 監管模式適用）
@@ -1922,6 +2080,36 @@ options:
   -h, --help  show this help message and exit
 <!-- END: cli-help marker="serialwrap-device-help" -->
 
+`serialwrap remote --help`：
+
+<!-- BEGIN: cli-help marker="serialwrap-remote-help" -->
+usage: serialwrap remote [-h] [-R] [-L] [--autossh] [--local LOCAL]
+                         [--remote-socket REMOTE_SOCKET]
+                         [--ready-timeout READY_TIMEOUT] [--ssh-opt SSH_OPT]
+                         [words ...]
+
+serialwrap remote：外包系統 ssh 建立 -R（expose，把本機 daemon 推到對端）／-L（connect，relay 情境把對端 port 拉回本機 loopback）隧道，background 常駐。
+  serialwrap remote user@host:7777        # -R 預設：expose 本機 daemon
+  serialwrap remote -L user@relay:7777    # connect（relay/雙 NAT）
+  serialwrap remote                        # 列目前隧道（status）
+  serialwrap remote close 7777|all         # 拆除
+安全：只透過 ssh-tunnel、單租戶/可信 relay 或 --remote-socket；不可對網路直接開放。
+
+positional arguments:
+  words                 [user@]host:port ｜ status ｜ close <port|all>
+
+options:
+  -h, --help            show this help message and exit
+  -R                    reverse/expose（預設）
+  -L                    forward/connect（relay）
+  --autossh             以 autossh 斷線自動重連
+  --local LOCAL         -L 本機 loopback port（預設=對端 port）
+  --remote-socket REMOTE_SOCKET
+                        硬化：-R 建遠端 unix socket／-L 連該 socket（共享 relay 建議）
+  --ready-timeout READY_TIMEOUT
+                        readiness 確認上限秒數（逾時回 starting）
+  --ssh-opt SSH_OPT     透傳額外 ssh 參數（可重複），如 --ssh-opt=-p --ssh-opt=2222
+<!-- END: cli-help marker="serialwrap-remote-help" -->
 
 ```bash
 # 啟動 daemon（on-demand 模式手動啟動；systemd 模式下此命令會自動 route 到 service start）
