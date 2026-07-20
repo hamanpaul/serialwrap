@@ -198,45 +198,48 @@ def p1_cmd_file(ctx):
     remote = "/tmp/rhw.bin"
     pulled = os.path.join(str(ctx.case_dir), "rhw-pulled.bin")
 
-    stop = threading.Event()
-    max_lat = {"v": 0.0}
-
-    def probe():
-        while not stop.is_set():
-            t0 = time.monotonic()
-            ctx.sw.run("daemon", "status")  # 輕量 RPC；無獨立 health ping 子命令
-            max_lat["v"] = max(max_lat["v"], time.monotonic() - t0)
-            time.sleep(0.5)
-
-    th = threading.Thread(target=probe, daemon=True)
-    th.start()
     try:
-        # 全域 --timeout 120 必須在子命令之前（file.* 不在 CLI LONG_RPC floor，#123 defer）；
-        # subprocess timeout 對齊放大到 180s，避免 client 端 5s 假逾時。
-        push = ctx.sw.run("--timeout", "120", "file", "push", "--selector", "COM0",
-                          "--local", local, "--remote", remote, timeout=180)
-        ctx.note("push.json", str(push))
-    finally:
-        stop.set()
-        th.join(timeout=5)
-    if not push.get("ok"):
-        return CaseResult("FAIL", reason=f"file push 失敗（{push.get('error_code')}）")
+        stop = threading.Event()
+        max_lat = {"v": 0.0}
 
-    pull = ctx.sw.run("--timeout", "120", "file", "pull", "--selector", "COM0",
-                      "--remote", remote, "--local", pulled, timeout=180)
-    ctx.note("pull.json", str(pull))
-    ctx.sw.submit_and_wait("COM0", f"rm -f {remote}")  # 清理板上暫存
-    try:
-        dst_md5 = hashlib.md5(open(pulled, "rb").read()).hexdigest()
-    except OSError as exc:
-        return CaseResult("FAIL", reason=f"pull 檔案讀取失敗：{exc!r}")
+        def probe():
+            while not stop.is_set():
+                t0 = time.monotonic()
+                ctx.sw.run("daemon", "status")  # 輕量 RPC；無獨立 health ping 子命令
+                max_lat["v"] = max(max_lat["v"], time.monotonic() - t0)
+                time.sleep(0.5)
+
+        th = threading.Thread(target=probe, daemon=True)
+        th.start()
+        try:
+            # 全域 --timeout 120 必須在子命令之前（file.* 不在 CLI LONG_RPC floor，#123 defer）；
+            # subprocess timeout 對齊放大到 180s，避免 client 端 5s 假逾時。
+            push = ctx.sw.run("--timeout", "120", "file", "push", "--selector", "COM0",
+                              "--local", local, "--remote", remote, timeout=180)
+            ctx.note("push.json", str(push))
+        finally:
+            stop.set()
+            th.join(timeout=5)
+        if not push.get("ok"):
+            return CaseResult("FAIL", reason=f"file push 失敗（{push.get('error_code')}）")
+
+        pull = ctx.sw.run("--timeout", "120", "file", "pull", "--selector", "COM0",
+                          "--remote", remote, "--local", pulled, timeout=180)
+        ctx.note("pull.json", str(pull))
+        ctx.sw.submit_and_wait("COM0", f"rm -f {remote}")  # 清理板上暫存
+        try:
+            with open(pulled, "rb") as fh:
+                dst_md5 = hashlib.md5(fh.read()).hexdigest()
+        except OSError as exc:
+            return CaseResult("FAIL", reason=f"pull 檔案讀取失敗：{exc!r}")
+        if dst_md5 != src_md5:
+            return CaseResult("FAIL", reason=f"round-trip md5 不符（src={src_md5} dst={dst_md5}）")
+        if max_lat["v"] >= 3.0:
+            return CaseResult("FAIL", reason=f"push 期間 RPC 探針最大延遲 {max_lat['v']:.1f}s（≥3s，疑 event loop 凍結）")
+        return CaseResult("PASS")
     finally:
+        # local（mkstemp）在所有 return 路徑（含 push 失敗早退）都須清除，避免長跑殘檔。
         try:
             os.unlink(local)
         except OSError:
             pass
-    if dst_md5 != src_md5:
-        return CaseResult("FAIL", reason=f"round-trip md5 不符（src={src_md5} dst={dst_md5}）")
-    if max_lat["v"] >= 3.0:
-        return CaseResult("FAIL", reason=f"push 期間 RPC 探針最大延遲 {max_lat['v']:.1f}s（≥3s，疑 event loop 凍結）")
-    return CaseResult("PASS")

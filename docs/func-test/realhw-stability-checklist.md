@@ -16,7 +16,7 @@
 | 報告輸出 | `~/b-log/realhw-reports/<YYMMDD-HHMMSS>/` |
 | 兩板 | COM0＝`dut-prpl`（serial `AC01QZT0`、platform prpl）；COM1＝`sta-prpl`（serial `AQ00OAQ7`、platform brcm/BDK） |
 | usbipd busid | COM0＝`8-1`、COM1＝`8-2`（**換線會變**，每輪跑前 `usbipd list` 重驗） |
-| 組態 | `realhw/config.yaml`（機器特定值；timeouts：ready_wait 180s／reboot_wait 300s／human_active_window 60s） |
+| 組態 | `realhw/config.json`（stdlib-only 契約；機器特定值；timeouts：ready_wait 180s／reboot_wait 300s／human_active_window 60s） |
 
 ---
 

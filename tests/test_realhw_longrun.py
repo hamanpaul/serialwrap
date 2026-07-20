@@ -53,3 +53,26 @@ def test_analyze_empty_inputs():
     assert a["pid_changes"] == 0
     assert a["daemon_death_at"] is None
     assert a["rss_trend"] == {"first_kb": 0, "last_kb": 0, "delta_kb": 0}
+
+
+def test_analyze_no_zero_duration_stuck_at_tail():
+    # 最後一筆快照剛好非 READY（如 daemon death 後 sessions 清空）→不得產生 0 秒 stuck 段（Copilot #5）。
+    snapshots = [
+        {"t": 0, "sessions": {"COM0": "READY"}, "rss_kb": 1, "pid": 1},
+        {"t": 300, "sessions": {"COM0": "READY"}, "rss_kb": 1, "pid": 1},
+        {"t": 600, "sessions": {}, "rss_kb": 0, "pid": 0},  # 尾快照非 READY，open_from==last_t
+    ]
+    a = longrun.analyze(snapshots, [])
+    assert a["stuck_attached"] == []
+    assert all(s["duration_s"] > 0 for s in a["stuck_attached"])
+
+
+def test_analyze_records_genuine_stuck_at_tail():
+    # 尾端連續非 READY 且時長>0→仍須封口記錄（guard 不誤殺真實 stuck）。
+    snapshots = [
+        {"t": 0, "sessions": {"COM0": "READY"}, "rss_kb": 1, "pid": 1},
+        {"t": 300, "sessions": {"COM0": "ATTACHED"}, "rss_kb": 1, "pid": 1},
+        {"t": 600, "sessions": {"COM0": "ATTACHED"}, "rss_kb": 1, "pid": 1},
+    ]
+    a = longrun.analyze(snapshots, [])
+    assert a["stuck_attached"] == [{"com": "COM0", "from_t": 300, "to_t": 600, "duration_s": 300}]

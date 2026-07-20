@@ -66,3 +66,14 @@ def test_report_md_lists_all_and_details_failures(tmp_path):
     assert data["meta"]["git"] == "abc123"
     assert data["results"][1]["verdict"] == "FAIL"
     assert (tmp_path / "report.md").exists()
+
+
+def test_recovery_command_is_state_aware():
+    # case 間恢復依狀態選語意正確動詞，不再一律 device attach（會強搶已交接的裝置，Copilot #2）。
+    assert harness.recovery_command("RELEASED") == ("device", "attach")   # 交接出去→收回
+    assert harness.recovery_command("DETACHED") == ("session", "attach")  # 無 bridge→建立
+    assert harness.recovery_command("ATTACHED") == ("session", "recover")  # 不健康→重建 bridge
+    assert harness.recovery_command("RECOVERING") == ("session", "recover")
+    assert harness.recovery_command(None) == ("session", "recover")
+    # 只有 RELEASED 才允許 device attach
+    assert harness.recovery_command("ATTACHED") != ("device", "attach")

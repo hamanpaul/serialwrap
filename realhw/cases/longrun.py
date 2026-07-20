@@ -79,7 +79,9 @@ def analyze(snapshots: list[dict], events: list[dict]) -> dict:
                     open_from = None
             elif open_from is None:
                 open_from = t
-        if open_from is not None:  # 收尾仍非 READY→以最後快照 t 封口
+        # 收尾仍非 READY→以最後快照 t 封口；僅 duration>0 才記，避免「最後一筆快照剛好
+        # 非 READY 或 sessions 缺該 COM（如 daemon death 後清空）」產生無意義的 0 秒 stuck 段。
+        if open_from is not None and last_t > open_from:
             stuck.append({"com": com, "from_t": open_from, "to_t": last_t,
                           "duration_s": last_t - open_from})
 

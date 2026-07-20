@@ -3,11 +3,10 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import json
 import subprocess
 import sys
 from pathlib import Path
-
-import yaml
 
 from . import cases  # noqa: F401  # import 觸發 case 註冊
 from . import drivers, harness, preflight
@@ -23,7 +22,7 @@ def main() -> int:
     ap.add_argument("--list", action="store_true")
     args = ap.parse_args()
 
-    cfg = yaml.safe_load((Path(__file__).parent / "config.yaml").read_text())
+    cfg = json.loads((Path(__file__).parent / "config.json").read_text())
     cfg["duration_s"] = harness.parse_duration(args.duration)
     tiers = [t.strip() for t in args.tier.split(",") if t.strip()]
     selected = harness.select_cases(harness.REGISTRY, tiers=tiers, only=args.only,

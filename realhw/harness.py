@@ -123,6 +123,23 @@ class Ctx:
         return str(p.relative_to(self.report_dir))
 
 
+def recovery_command(state: str | None) -> tuple[str, ...]:
+    """依 session 狀態選語意正確的恢復動詞（對齊 CLI help，勿一律 device attach）：
+
+    - ``RELEASED``：已交接給外部工具→``device attach`` 收回（外部仍持有時回 DEVICE_STILL_HELD）。
+    - ``DETACHED``：無 bridge→``session attach`` 建立 bridge。
+    - 其餘不健康（``ATTACHED``/``ATTACHING``/``RECOVERING``…非 READY）：``session recover``
+      重建 bridge（TARGET_UNRESPONSIVE 用 recover，非 device attach）。
+
+    純函式、無副作用，供 :func:`run_cases` 的 case 間恢復與單測使用。
+    """
+    if state == "RELEASED":
+        return ("device", "attach")
+    if state == "DETACHED":
+        return ("session", "attach")
+    return ("session", "recover")
+
+
 def run_cases(cases: list[Case], ctx: Ctx, *, boards: list[str]) -> list[tuple[str, CaseResult]]:
     results: list[tuple[str, CaseResult]] = []
     broken_by: str | None = None
@@ -138,11 +155,14 @@ def run_cases(cases: list[Case], ctx: Ctx, *, boards: list[str]) -> list[tuple[s
             r = CaseResult("FAIL", reason=f"未捕捉例外：{exc!r}")
         r.duration_s = time.monotonic() - t0
         results.append((case.id, r))
-        # case 間恢復檢查：兩板 READY 才續跑依賴板卡的 case
+        # case 間恢復檢查：兩板 READY 才續跑依賴板卡的 case。依各板當前狀態選語意正確的
+        # 恢復動詞（RELEASED→device attach 收回；DETACHED→session attach；其餘不健康→
+        # session recover），而非一律 device attach（後者會強搶已正式交接出去的裝置）。
         not_ready = [b for b in boards if ctx.sw.session(b).get("state") != "READY"]
         if not_ready:
             for b in not_ready:
-                ctx.sw.run("device", "attach", "--selector", b)
+                verb = recovery_command(ctx.sw.session(b).get("state"))
+                ctx.sw.run(*verb, "--selector", b)
             time.sleep(5)
             not_ready = [b for b in boards if not ctx.sw.wait_state(b, "READY", timeout_s=60)]
         if not_ready and broken_by is None:
