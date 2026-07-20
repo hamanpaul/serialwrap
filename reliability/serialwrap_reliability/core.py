@@ -59,6 +59,8 @@ def case_to_dict(case: Any, cfg: dict[str, Any]) -> dict[str, Any]:
         com = board.get("com")
         if not com:
             raise ValueError(f"boards[{index}] 缺 'com' 欄位（board={board!r}）")
+        if str(com) in devices:
+            raise ValueError(f"boards[{index}] 的 com={com!r} 與前面的 board 重複，topology key 碰撞")
         devices[str(com)] = {
             "role": str(board.get("alias", "")),
             "serial": str(board.get("serial", "")),

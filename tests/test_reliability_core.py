@@ -122,6 +122,16 @@ def test_case_to_dict_missing_com_fails_loud():
         core.case_to_dict(_mk_case("bad"), bad_cfg)
 
 
+def test_case_to_dict_duplicate_com_fails_loud():
+    bad_cfg = dict(CFG)
+    bad_cfg["boards"] = [
+        {"com": "COM0", "alias": "dut"},
+        {"com": "COM0", "alias": "sta"},
+    ]
+    with pytest.raises(ValueError, match=r"COM0.*重複|COM0.*碰撞"):
+        core.case_to_dict(_mk_case("dup"), bad_cfg)
+
+
 def test_build_case_dicts_preserves_registry_order():
     got = core.build_case_dicts([_mk_case("a"), _mk_case("b"), _mk_case("c")], CFG)
     assert [case["id"] for case in got] == ["a", "b", "c"]
