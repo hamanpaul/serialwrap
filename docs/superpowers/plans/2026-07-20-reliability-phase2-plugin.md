@@ -60,47 +60,78 @@
 
 ## Interfaces（每任務 Consumes/Produces 的權威簽章表）
 
-**Phase 1 交付（本 plan 消費，Task 0 檢核）：**
+**Phase 1 交付（本 plan 消費，Task 0 硬檢核）：簽章以 Phase 1 plan `2026-07-20-reliability-phase1-realhw.md` 的「介面總表」為準，逐條如下。**
 
 ```python
-# realhw/harness.py（Phase 1 後）
+# realhw/__init__.py＋harness.py（Phase 1 後）
+def load_cfg(config_path: Path | None = None, *,
+             injected: dict[str, Any] | None = None) -> dict[str, Any]
+    # 組態單一 loader、雙來源共用正規化（_CFG_DEFAULTS：win_serialwrap_exe=""、tmux_prefix="realhw"）。
+    # injected 非 None＝淺複製採用、不讀檔（Phase 2 以 testbed.yaml 合成 dict 注入）。
+    # 注意：config.json 路徑「不」剝 "_" 開頭註解鍵（_readme 會留在 cfg）。
+
 @dataclasses.dataclass
-class CaseResult:
+class CaseResult:                      # ⚠️ 實際欄位順序：category/reason_code 附加在「尾端」
     verdict: str                       # PASS | FAIL | SKIP
     reason: str = ""
-    category: str = ""                 # "" | environment | session | configuration | test
-    reason_code: str = ""              # 自由字串（進 trace）
     evidence: dict[str, str] = field(default_factory=dict)
     duration_s: float = 0.0
+    category: str = ""                 # "" | environment | session | configuration | test
+    reason_code: str = ""              # 自由字串（進 trace）
+    # ⇒ 本 plan 一律 keyword 建構/讀取，不依賴位置參數
 
 @dataclasses.dataclass(frozen=True)
 class Case:
-    id: str; tier: str; title: str
+    id: str; tier: str; title: str     # tier ∈ p0 | p1 | remote | longrun
     run: Callable[[Any], CaseResult]
     destructive: bool = False
     requires: tuple[str, ...] = ()
     hints: tuple[str, ...] = ()
 
 REGISTRY: list[Case]                                   # import realhw.cases 後填滿（29+7 條）
+# Ctx（Phase 1 後）：既有欄位（cfg/report_dir/case_dir/sw/tmux/usbipd/systemd）之外新增
+#     win: Any = None                  # WinSwCli；None/不可用＝hp 救援鏈降級 no-op
 def recovery_command(state: str | None) -> tuple[str, ...]
+def run_cases(cases, ctx, *, boards: list[str],
+              missing_caps: dict[str, str] | None = None) -> list[tuple[str, CaseResult]]
 def write_reports(report_dir: Path, meta: dict, results: list[tuple[str, CaseResult]],
                   hints: dict[str, tuple[str, ...]]) -> None
 def parse_duration(text: str) -> int                   # "15m" -> 900
 
-# realhw/preflight.py（Phase 1 後；collect/evaluate 簽章不變，Checks 增欄含 benchlock/windows_daemon）
-def collect(cfg: dict, sw, repo_root) -> Checks        # I/O 收集（含 benchlock flock 嘗試，句柄由模組持有）
+# realhw/preflight.py（Phase 1 後）
+def collect(cfg: dict, sw, repo_root, *, benchlock_ok: bool = True, win=None) -> Checks
+    # ⚠️ benchlock_ok「預設 True」＝呼叫端不主動取鎖注入就永遠不檢查——plugin 路徑
+    #    必須自己 acquire_benchlock 後注入（見 core.run_preflight），否則互斥保護靜默失效。
 def evaluate(c: Checks) -> tuple[bool, list[str]]      # suite-refuse 判定（純函式）
-def capabilities(cfg: dict, sw) -> dict[str, bool]     # family-gate：鍵對齊 Case.requires 詞彙
-                                                       # （"docker"/"remote_capability"/"two_boards"/"tmux"…）
+def bench_lock_path() -> Path                          # ~/.local/state/serialwrap/bench.lock
+def acquire_benchlock(lock_path: Path) -> int | None   # 非阻塞 flock；成功回 fd（持有到行程結束、
+                                                       # 勿 close——flock 天性自動釋放）；被占回 None
 
-# realhw/drivers.py（既有，不變）
+@dataclasses.dataclass(frozen=True)
+class Capabilities:
+    remote_capability: bool            # 部署 CLI 有 remote 子命令
+    deployed_version: str              # `serialwrap --version` 原始字串
+    docker: bool                       # docker CLI＋daemon 可達
+def collect_capabilities(sw) -> Capabilities           # I/O 收集層
+def missing_capabilities(caps, *, minimum=(0, 2, 3)) -> dict[str, str]
+    # 「缺項名 → reason_code」；空 dict＝全滿足。鍵域＝Case.requires 詞彙：
+    #   remote_capability→remote_capability_missing／deployed_recent→deployed_daemon_stale／
+    #   docker→docker_unavailable（two_boards/tmux 屬 suite-refuse 詞彙、不在鍵域）
+
+# realhw/drivers.py（Phase 1 後）
 class SwCli:  def run(*args, timeout=30.0) -> dict;  def sessions() -> list[dict]
               def session(com) -> dict;  def submit_and_wait(...) -> dict
               def wait_state(com, want, *, timeout_s, poll_s=2.0) -> bool
 class TmuxCtl(prefix); class Usbipd(exe); class Systemd
+class WinSwCli(exe):  def available() -> bool;  def held_devices() -> list[dict]
+    # exe＝cfg["win_serialwrap_exe"]（/mnt/c 路徑；空字串＝Windows 端不可用、降級 no-op）
 ```
 
-> 若 Phase 1 實際落地的 `capabilities` 名稱/簽章不同，唯一調整點是 `core.run_preflight()`（已用 `getattr` 防禦式消費）；其餘任務零波及。
+> **消費方式＝硬依賴、fail-loud**：`core.run_preflight()`／`core.build_ctx()` 直呼上述名稱，
+> Phase 1 缺席時 import/AttributeError 直接讓 `prepare_run()` 炸＝整場 gate FAIL。**禁止
+> getattr 防禦式消費**——防禦式＝靜默失效（benchlock 不取＝互斥保護消失；capabilities 不收
+> ＝family-gate 永不觸發，缺前提的 remote/deployed_recent case 會跑出誤導性 FAIL）。
+> Task 0 的硬檢核就是為此把關。
 
 **testpilot-core 消費面（bench venv 才存在）：** `testpilot.api.PluginBase`、`testpilot.api.PreparedRun`——僅 `plugin.py` 引用。
 
@@ -135,15 +166,26 @@ class TmuxCtl(prefix); class Usbipd(exe); class Systemd
 cd ~/prj_pri/serialwrap/.worktrees/reliability-plugin
 git branch --show-current    # 期望：feature/serialwrap-reliability-plugin
 python3 - <<'EOF'
-import dataclasses, sys
+import dataclasses, inspect, sys
 sys.path.insert(0, ".")
-from realhw import harness, preflight
+import realhw
+from realhw import drivers, harness, preflight
+
 fields = {f.name for f in dataclasses.fields(harness.CaseResult)}
 assert {"category", "reason_code"} <= fields, f"Phase 1 未就位：CaseResult 缺分類欄 {fields}"
-if not callable(getattr(preflight, "capabilities", None)):
-    print("[warn] preflight.capabilities 缺席——family-gate 將 degrade（core.run_preflight 回空 capabilities，僅影響 requires→SKIP，suite-refuse 不受影響）")
+assert callable(getattr(realhw, "load_cfg", None)), "Phase 1 未就位：realhw.load_cfg 缺"
+# 硬檢核（fail-loud）：這些名稱缺任何一個，Phase 2 的 benchlock/family-gate 都會靜默失效
+for name in ("bench_lock_path", "acquire_benchlock",
+             "collect_capabilities", "missing_capabilities"):
+    assert callable(getattr(preflight, name, None)), f"Phase 1 未就位：preflight.{name} 缺"
+sig = inspect.signature(preflight.collect)
+assert {"benchlock_ok", "win"} <= set(sig.parameters), \
+    f"Phase 1 未就位：preflight.collect 缺 benchlock_ok/win 參數（{sig}）"
+assert callable(getattr(drivers, "WinSwCli", None)), "Phase 1 未就位：drivers.WinSwCli 缺"
+assert "missing_caps" in inspect.signature(harness.run_cases).parameters, \
+    "Phase 1 未就位：run_cases 缺 missing_caps 參數"
 import realhw.cases  # noqa
-print(f"REGISTRY={len(harness.REGISTRY)} cases；CaseResult fields OK")
+print(f"REGISTRY={len(harness.REGISTRY)} cases；Phase 1 介面全數就位")
 EOF
 # 期望：REGISTRY=36 cases（Phase 1 remote 族已入；仍為 29 表示 Phase 1 remote 未 merge——STOP、先 rebase）
 ```
@@ -501,7 +543,7 @@ git commit -m "feat(reliability): case dict 映射、longrun checkpoints 合成�
 ### Task 4: core.py——判決抄寫／runtime skip／black-box 執行／恢復清殘／LongrunRunner（openspec 5.2 後半，TDD）
 
 **Interfaces** — Consumes：`CaseResult`（含 Phase 1 分類欄）、`harness.REGISTRY`、`harness.recovery_command`、`SwCli`/`preflight`；Produces：
-`result_to_dict(result) -> dict`、`failure_payload(result_dict) -> dict | None`（＝`case["_last_failure"]` 形狀，對齊 C6）、`runtime_skip(case_meta, capabilities, broken_by) -> tuple[str, str] | None`、`make_skip_result(reason_code, comment) -> CaseResult`、`run_case_blackbox(case_id, ctx) -> CaseResult`、`build_ctx(cfg, report_dir) -> Ctx`、`recover_boards(ctx, boards, *, ready_timeout_s=60.0) -> list[str]`、`sweep_tmux(prefix) -> list[str]`、`checkpoint_index(step_id, *, fallback) -> int`、`class LongrunRunner`、`run_preflight(cfg) -> dict`。
+`result_to_dict(result) -> dict`、`failure_payload(result_dict) -> dict | None`（＝`case["_last_failure"]` 形狀，對齊 C6）、`runtime_skip(case_meta, missing_caps: dict[str, str], broken_by) -> tuple[str, str] | None`（`missing_caps`＝Phase 1 `missing_capabilities` 輸出原樣）、`make_skip_result(reason_code, comment) -> CaseResult`、`run_case_blackbox(case_id, ctx) -> CaseResult`、`build_ctx(cfg, report_dir) -> Ctx`（含 `win=WinSwCli(cfg["win_serialwrap_exe"])` 注入）、`recover_boards(ctx, boards, *, ready_timeout_s=60.0) -> list[str]`、`sweep_tmux(prefix) -> list[str]`、`checkpoint_index(step_id, *, fallback) -> int`、`class LongrunRunner`、`run_preflight(cfg) -> dict`（回 `ok`/`problems`/`missing_caps`/`deployed_version`/`benchlock_fd`；benchlock 主動取鎖注入 collect）。
 
 - [ ] **Step 1: RED——append 到 `tests/test_reliability_core.py`**
 
@@ -538,16 +580,31 @@ def test_failure_payload_fail_without_category_stays_empty():
     assert payload["category"] == ""  # 空 category → core coerce inconclusive → Inconclusive（誠實）
 
 
-def test_runtime_skip_broken_by_and_capabilities():
+def test_runtime_skip_broken_by_and_missing_caps():
     meta_dep = {"requires": ["two_boards"], "destructive": False}
     assert core.runtime_skip(meta_dep, {}, "p1-hp-cycle") == (
         "broken_by:p1-hp-cycle", "前置不滿足（p1-hp-cycle 後板卡未恢復）")
     meta_rm = {"requires": ["docker"], "destructive": False}
-    assert core.runtime_skip(meta_rm, {"docker": False}, None) == (
+    # missing_caps＝preflight.missing_capabilities 輸出形狀：缺項名 → reason_code
+    assert core.runtime_skip(meta_rm, {"docker": "docker_unavailable"}, None) == (
         "docker_unavailable", "能力缺項：docker")
-    assert core.runtime_skip(meta_rm, {"docker": True}, None) is None
-    assert core.runtime_skip(meta_rm, {}, None) is None  # capabilities 未回報該鍵＝不擋（preflight 已把關）
+    assert core.runtime_skip(meta_rm, {}, None) is None  # 不在缺項清單＝可跑
     assert core.runtime_skip({"requires": [], "destructive": False}, {}, "x") is None
+
+
+def test_runtime_skip_consumes_missing_capabilities_output():
+    """整合斷言（防靜默失效）：Phase 1 missing_capabilities 的實際輸出必須能直接餵 runtime_skip。"""
+    core.ensure_realhw_importable()
+    from realhw import preflight
+
+    caps = preflight.Capabilities(remote_capability=False, deployed_version="", docker=False)
+    missing = preflight.missing_capabilities(caps)
+    assert core.runtime_skip({"requires": ["remote_capability"], "destructive": False},
+                             missing, None) == (
+        "remote_capability_missing", "能力缺項：remote_capability")
+    assert core.runtime_skip({"requires": ["docker"], "destructive": False},
+                             missing, None) == (
+        "docker_unavailable", "能力缺項：docker")
 
 
 def test_make_skip_result_shape():
@@ -655,25 +712,65 @@ def test_longrun_runner_skipped_mode():
     assert runner.result() is r
 
 
-def test_run_preflight_refuse_and_ok(monkeypatch):
+def test_run_preflight_acquires_benchlock_and_collects_missing(monkeypatch, tmp_path):
+    """防靜默失效雙斷言：benchlock 有被嘗試取鎖並注入 collect；missing_caps 有被收集。"""
     core.ensure_realhw_importable()
-    from realhw import drivers, preflight
+    from realhw import preflight
 
-    monkeypatch.setattr(preflight, "collect", lambda cfg, sw, root: "CHECKS")
-    monkeypatch.setattr(preflight, "evaluate", lambda c: (False, ["板卡未 READY：COM1"]))
-    out = core.run_preflight({"boards": []})
-    assert out == {"ok": False, "problems": ["板卡未 READY：COM1"],
-                   "capabilities": {}, "deployed_version": ""}
+    lockfile = tmp_path / "bench.lock"
+    seen: dict = {}
+    monkeypatch.setattr(preflight, "bench_lock_path", lambda: lockfile)
+    real_acquire = preflight.acquire_benchlock
 
+    def spy_acquire(path):
+        seen["acquire_path"] = Path(path)
+        return real_acquire(path)
+
+    monkeypatch.setattr(preflight, "acquire_benchlock", spy_acquire)
+
+    def fake_collect(cfg, sw, root, *, benchlock_ok=True, win=None):
+        seen["benchlock_ok"] = benchlock_ok
+        seen["win_passed"] = win is not None
+        return "CHECKS"
+
+    monkeypatch.setattr(preflight, "collect", fake_collect)
     monkeypatch.setattr(preflight, "evaluate", lambda c: (True, []))
-    monkeypatch.setattr(preflight, "capabilities",
-                        lambda cfg, sw: {"docker": True}, raising=False)
-    monkeypatch.setattr(drivers.SwCli, "run",
-                        lambda self, *a, **k: {"_raw": "serialwrap 0.2.3", "_rc": 0})
-    out = core.run_preflight({"boards": []})
+    caps = preflight.Capabilities(remote_capability=True,
+                                  deployed_version="serialwrap 0.2.3", docker=False)
+    monkeypatch.setattr(preflight, "collect_capabilities", lambda sw: caps)
+
+    out = core.run_preflight({"boards": [], "win_serialwrap_exe": ""})
+    assert seen["acquire_path"] == lockfile   # benchlock 有被嘗試取鎖（collect 預設 True 陷阱已繞開）
+    assert seen["benchlock_ok"] is True       # 取鎖結果有注入 collect
+    assert seen["win_passed"] is True         # WinSwCli 有注入（windows_daemon 診斷）
     assert out["ok"] is True
-    assert out["capabilities"] == {"docker": True}
+    assert out["missing_caps"] == {"docker": "docker_unavailable"}  # 走真 missing_capabilities 判定
     assert out["deployed_version"] == "serialwrap 0.2.3"
+    assert out["benchlock_fd"] is not None
+
+
+def test_run_preflight_refuses_when_benchlock_held(monkeypatch, tmp_path):
+    core.ensure_realhw_importable()
+    from realhw import preflight
+
+    lockfile = tmp_path / "bench.lock"
+    monkeypatch.setattr(preflight, "bench_lock_path", lambda: lockfile)
+    held_fd = preflight.acquire_benchlock(lockfile)   # 先占住（模擬另一場 run 進行中）
+    assert held_fd is not None
+
+    def fake_collect(cfg, sw, root, *, benchlock_ok=True, win=None):
+        return {"benchlock_ok": benchlock_ok}
+
+    monkeypatch.setattr(preflight, "collect", fake_collect)
+    monkeypatch.setattr(
+        preflight, "evaluate",
+        lambda c: (c["benchlock_ok"],
+                   [] if c["benchlock_ok"] else ["bench 互斥：benchlock 已被持有（拒跑）"]))
+    out = core.run_preflight({"boards": [], "win_serialwrap_exe": ""})
+    assert out["ok"] is False
+    assert out["benchlock_fd"] is None
+    assert any("benchlock" in p for p in out["problems"])
+    assert out["missing_caps"] == {} and out["deployed_version"] == ""
 ```
 
 - [ ] **Step 2: 跑 RED**
@@ -687,18 +784,9 @@ python3 -m pytest -q tests/test_reliability_core.py
 
 ```python
 # ---------------------------------------------------------------- 判決抄寫（openspec Scenario「分類抄寫落桶」）
-#: Case.requires 詞彙 → FailEnv reason_code（分類映射總表；未列者退 <req>_missing）
-REQUIRES_REASON: dict[str, str] = {
-    "docker": "docker_unavailable",
-    "remote_capability": "remote_capability_missing",
-    "two_boards": "two_boards_missing",
-    "tmux": "tmux_missing",
-}
-
-
-def requires_reason(req: str) -> str:
-    """requires 項 → reason_code（family-gate 執行期 SKIP 用）。"""
-    return REQUIRES_REASON.get(req, f"{req}_missing")
+# 注意：requires→reason_code 的詞彙**單一持有者是 Phase 1 的 preflight.missing_capabilities**
+# （remote_capability_missing／deployed_daemon_stale／docker_unavailable）；本模組不自建對照表，
+# runtime_skip 直接消費其輸出 dict，避免兩份詞彙漂移。
 
 
 def result_to_dict(result: Any) -> dict[str, Any]:
@@ -737,21 +825,22 @@ def failure_payload(result_dict: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def runtime_skip(case_meta: dict[str, Any], capabilities: dict[str, bool],
+def runtime_skip(case_meta: dict[str, Any], missing_caps: dict[str, str],
                  broken_by: str | None) -> tuple[str, str] | None:
     """執行期 SKIP 判定：回傳 (reason_code, comment)；None＝可跑。
 
     - broken_by：前一 case 弄壞板卡未恢復——沿用 run_cases 規則（requires two_boards
       或 destructive 的後續 case SKIP＝FailEnv/broken_by:<id>）。
-    - capabilities family-gate：requires 中被 preflight 標為 False 的能力 → SKIP；
-      capabilities 未回報該鍵＝不擋（suite-refuse 已把關基本盤）。
+    - family-gate：``missing_caps``＝Phase 1 ``preflight.missing_capabilities`` 的輸出
+      （缺項名→reason_code）；requires 命中缺項鍵即 SKIP、reason_code 直接取自 dict 值。
+      不在缺項清單＝可跑（two_boards/tmux 屬 suite-refuse 詞彙、不在鍵域，不會被誤殺）。
     """
     requires = [str(r) for r in (case_meta.get("requires") or [])]
     if broken_by and ("two_boards" in requires or case_meta.get("destructive")):
         return (f"broken_by:{broken_by}", f"前置不滿足（{broken_by} 後板卡未恢復）")
     for req in requires:
-        if req in capabilities and not capabilities[req]:
-            return (requires_reason(req), f"能力缺項：{req}")
+        if req in missing_caps:
+            return (missing_caps[req], f"能力缺項：{req}")
     return None
 
 
@@ -766,7 +855,11 @@ def make_skip_result(reason_code: str, comment: str) -> Any:
 
 # ---------------------------------------------------------------- black-box 執行與 bench 編排
 def build_ctx(cfg: dict[str, Any], report_dir: Path) -> Any:
-    """建 realhw Ctx（drivers 實體化；setup_env 建一次、整場重用）。"""
+    """建 realhw Ctx（drivers 實體化；setup_env 建一次、整場重用）。
+
+    ``win`` 必須注入（對齊 Phase 1 standalone 接線）：不注入＝Ctx.win 預設 None，
+    p1-hp-cycle 的 Windows 端救援鏈在 plugin 路徑會靜默降級 no-op。
+    """
     ensure_realhw_importable()
     from realhw import drivers, harness
 
@@ -776,6 +869,7 @@ def build_ctx(cfg: dict[str, Any], report_dir: Path) -> Any:
         tmux=drivers.TmuxCtl(str(cfg.get("tmux_prefix") or "realhw")),
         usbipd=drivers.Usbipd(str(cfg.get("usbipd_exe") or "")),
         systemd=drivers.Systemd(),
+        win=drivers.WinSwCli(str(cfg.get("win_serialwrap_exe") or "")),
     )
 
 
@@ -901,26 +995,41 @@ class LongrunRunner:
 
 # ---------------------------------------------------------------- preflight gate（openspec：prepare_run＝gate）
 def run_preflight(cfg: dict[str, Any]) -> dict[str, Any]:
-    """realhw preflight（suite-refuse gate；含 Phase 1 benchlock）＋capabilities＋deployed 版本。
+    """realhw preflight（suite-refuse gate）＋family-gate 缺項＋deployed 版本。
 
-    Phase 1 契約：``preflight.collect(cfg, sw, repo_root)``／``evaluate(checks)`` 簽章不變；
-    ``capabilities(cfg, sw)`` 為 Phase 1 新增——此處以 getattr 防禦式消費（缺席時 degrade
-    成空 dict：family-gate 不啟動、suite-refuse 不受影響）。
+    對齊 Phase 1 standalone 接線（realhw/__main__.py）；**硬依賴、fail-loud**——Phase 1
+    名稱缺席時 AttributeError 直接炸穿 prepare_run＝整場 gate FAIL，禁止 getattr 防禦
+    （防禦式＝靜默失效）。三個關鍵步驟：
 
-    回傳 ``{"ok": bool, "problems": list[str], "capabilities": dict[str, bool],
-    "deployed_version": str}``。
+    1. **benchlock 由呼叫端主動取鎖注入**：``collect`` 的 ``benchlock_ok`` 參數預設
+       True——不先 ``acquire_benchlock(bench_lock_path())`` 再注入，互斥保護永不生效
+       （Phase 1 契約陷阱）。取得的 fd 由呼叫端持有到行程結束、勿 close（flock 天性
+       隨行程終止自動釋放）。
+    2. **windows_daemon 診斷**：以 ``cfg["win_serialwrap_exe"]`` 建 WinSwCli 注入 collect
+       （空字串＝Windows 端不可用、探測降級）。
+    3. **family-gate**：suite-refuse 通過後 ``collect_capabilities`` →
+       ``missing_capabilities``——「缺項名→reason_code」dict 原樣供 runtime_skip 消費。
+
+    回傳 ``{"ok": bool, "problems": list[str], "missing_caps": dict[str, str],
+    "deployed_version": str, "benchlock_fd": int | None}``。
     """
     ensure_realhw_importable()
     from realhw import drivers, preflight
 
     sw = drivers.SwCli()
-    checks = preflight.collect(cfg, sw, REPO_ROOT)
+    win = drivers.WinSwCli(str(cfg.get("win_serialwrap_exe") or ""))
+    lock_fd = preflight.acquire_benchlock(preflight.bench_lock_path())
+    checks = preflight.collect(cfg, sw, REPO_ROOT,
+                               benchlock_ok=lock_fd is not None, win=win)
     ok, problems = preflight.evaluate(checks)
-    caps_fn = getattr(preflight, "capabilities", None)
-    caps = dict(caps_fn(cfg, sw)) if (ok and callable(caps_fn)) else {}
-    deployed = str(sw.run("--version").get("_raw", "")).strip() if ok else ""
-    return {"ok": bool(ok), "problems": list(problems),
-            "capabilities": caps, "deployed_version": deployed}
+    missing_caps: dict[str, str] = {}
+    deployed = ""
+    if ok:
+        caps = preflight.collect_capabilities(sw)
+        missing_caps = dict(preflight.missing_capabilities(caps))
+        deployed = str(caps.deployed_version).strip()
+    return {"ok": bool(ok), "problems": list(problems), "missing_caps": missing_caps,
+            "deployed_version": deployed, "benchlock_fd": lock_fd}
 ```
 
 - [ ] **Step 4: 跑 GREEN＋commit**
@@ -936,7 +1045,7 @@ git commit -m "feat(reliability): 判決抄寫、runtime skip、black-box 執行
 
 ### Task 5: testbed_loader——雙來源等價（openspec 5.3，TDD）
 
-**Interfaces** — Consumes：`TestbedConfig.raw` 形狀（C13；整份 YAML dict，頂層 `testbed:`）、`realhw/config.json` 形狀、`harness.parse_duration`；Produces：`testbed_to_cfg(raw: dict) -> dict`（純函式）、`config_json_to_cfg(path, *, duration=None) -> dict`、`load_testbed_cfg(path) -> dict`。等價律：**同一組 bench 事實，兩條路合成的 cfg dict 相等**（openspec Scenario「雙來源等價」）。
+**Interfaces** — Consumes：`TestbedConfig.raw` 形狀（C13；整份 YAML dict，頂層 `testbed:`）、`realhw/config.json` 形狀、**`realhw.load_cfg(config_path=None, *, injected=None)`（Phase 1 單一 loader——兩來源都必須經它正規化）**、`harness.parse_duration`；Produces：`testbed_to_cfg(raw: dict) -> dict`（合成 facts 後走 `load_cfg(injected=...)`）、`config_json_to_cfg(path, *, duration=None) -> dict`（走 `load_cfg(path)`＋剝 `_` 註解鍵）、`load_testbed_cfg(path) -> dict`。等價律：**同一組 bench 事實，兩條路合成的 cfg dict 相等**——由「同走 `load_cfg` 正規化」結構性保證，非兩份平行實作（openspec Scenario「雙來源等價」）。
 
 - [ ] **Step 1: RED——建立 `tests/test_reliability_testbed.py`**
 
@@ -1040,13 +1149,14 @@ python3 -m pytest -q tests/test_reliability_testbed.py
 ```python
 """testbed.yaml（plugin）與 config.json（standalone）雙來源 → 同形 realhw cfg dict。
 
-等價律（openspec Requirement「組態來源與雙來源等價」）：同一組 bench 事實，
-兩條路合成的 cfg dict **相等**——由 tests/test_reliability_testbed.py 釘死。
+等價律（openspec Requirement「組態來源與雙來源等價」）：兩條路**都經 Phase 1 的
+``realhw.load_cfg`` 單一正規化**（injected／config_path 兩入口、共用 _CFG_DEFAULTS），
+等價由結構保證、再由 tests/test_reliability_testbed.py 釘死——本模組只負責
+「testbed 形狀 → facts dict」的搬運，不得自建第二套正規化。
 不 import testpilot；PyYAML 僅在 load_testbed_cfg 內延遲 import（serialwrap 執行期既有依賴）。
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -1082,27 +1192,35 @@ def testbed_to_cfg(raw: dict[str, Any]) -> dict[str, Any]:
                 board[key] = dev[key]
         boards.append(board)
 
-    cfg: dict[str, Any] = {"boards": boards}
+    facts: dict[str, Any] = {"boards": boards}
     for key in _SECTION_KEYS:
         if key in section:
-            cfg[key] = section[key]
+            facts[key] = section[key]
 
     longrun = dict(section.get("longrun") or {})
     duration = longrun.pop("duration", None)
     if longrun or "longrun" in section:
-        cfg["longrun"] = longrun
+        facts["longrun"] = longrun
+
+    # 與 config.json 路徑同走 Phase 1 單一正規化（_CFG_DEFAULTS）——等價律的結構保證
+    cfg = harness.load_cfg(injected=facts)
     if duration:
         cfg["duration_s"] = harness.parse_duration(str(duration))
     return cfg
 
 
 def config_json_to_cfg(path: Path | str, *, duration: str | None = None) -> dict[str, Any]:
-    """standalone config.json → cfg（丟棄 ``_`` 開頭註解鍵；duration 換算 duration_s）。"""
+    """standalone config.json → cfg。
+
+    走 Phase 1 ``load_cfg(config_path)``（單一正規化），再剝 ``_`` 開頭註解鍵——
+    load_cfg 本身不剝（_readme 會留在 cfg，standalone 無害），但等價比對需要對稱形狀；
+    ``duration``（如 "15m"）換算頂層 ``duration_s``（對應 standalone 的 --duration flag）。
+    """
     ensure_realhw_importable()
     from realhw import harness
 
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    cfg = {k: v for k, v in data.items() if not str(k).startswith("_")}
+    cfg = {k: v for k, v in harness.load_cfg(Path(path)).items()
+           if not str(k).startswith("_")}
     if duration:
         cfg["duration_s"] = harness.parse_duration(duration)
     return cfg
@@ -1340,7 +1458,8 @@ class Plugin(PluginBase):
         self.ctx: Any = None                           # realhw Ctx（setup_env 建一次）
         # 內部狀態
         self._cfg: dict[str, Any] | None = None
-        self._capabilities: dict[str, bool] = {}
+        self._missing_caps: dict[str, str] = {}   # Phase 1 missing_capabilities 輸出（family-gate）
+        self._benchlock_fd: int | None = None     # benchlock fd——持有到行程結束、勿 close
         self._broken_by: str | None = None
         self._longruns: dict[str, core.LongrunRunner] = {}
 
@@ -1378,11 +1497,16 @@ class Plugin(PluginBase):
     def prepare_run(self, case_ids: Sequence[str] | None) -> PreparedRun:
         cfg = self._load_cfg()
         pf = core.run_preflight(cfg)
+        # benchlock fd 持有到行程結束（flock 隨行程終止自動釋放，勿 close）；拿不到時
+        # evaluate 已把拒跑理由放進 problems → 下面 raise。
+        self._benchlock_fd = pf["benchlock_fd"]
         for note in pf["problems"]:
             print(f"[preflight] {note}")
         if not pf["ok"]:
             raise PreflightRefused("preflight 拒跑：" + "；".join(pf["problems"]))
-        self._capabilities = dict(pf["capabilities"])
+        self._missing_caps = dict(pf["missing_caps"])
+        for name, code in self._missing_caps.items():
+            print(f"[preflight] 能力缺項（family-gate）：{name}——對應 case 執行期 SKIP（{code}）")
         head = subprocess.run(
             ["git", "-C", str(core.REPO_ROOT), "rev-parse", "--short", "HEAD"],
             capture_output=True, text=True).stdout.strip()
@@ -1404,7 +1528,7 @@ class Plugin(PluginBase):
         cases = core.filter_for_run(self.discover_cases(), requested)
         return PreparedRun(cases=cases, artifacts={
             "realhw_meta": dict(self.run_meta),
-            "capabilities": dict(self._capabilities),
+            "missing_caps": dict(self._missing_caps),
         })
 
     # ------------------------------------------------------------------ 生命週期
@@ -1424,7 +1548,7 @@ class Plugin(PluginBase):
         if str(step.get("action") or "run_case") == "longrun_checkpoint":
             return self._execute_checkpoint(case, step, case_id, meta, t0)
 
-        skip = core.runtime_skip(meta, self._capabilities, self._broken_by)
+        skip = core.runtime_skip(meta, self._missing_caps, self._broken_by)
         if skip is not None:
             reason_code, comment = skip
             result = core.make_skip_result(reason_code, comment)
@@ -1443,7 +1567,7 @@ class Plugin(PluginBase):
                             case_id: str, meta: dict[str, Any], t0: float) -> dict[str, Any]:
         runner = self._longruns.get(case_id)
         if runner is None:
-            skip = core.runtime_skip(meta, self._capabilities, self._broken_by)
+            skip = core.runtime_skip(meta, self._missing_caps, self._broken_by)
             if skip is not None:
                 reason_code, comment = skip
                 runner = core.LongrunRunner.skipped(core.make_skip_result(reason_code, comment))
@@ -1978,3 +2102,4 @@ kill $FAKE
 4. **execute_step 一律回 success=True（C3）**——引擎在 step 失敗時跳過 evaluate，`_last_failure` 將無人寫（→Inconclusive）；spec 的「evaluate 依 verdict 回布林並抄分類」隱含判決權在 evaluate，本 plan 把它明文化為 adapter 規則。
 5. **`testpilot run` 起跑會對 live daemon `wal reset`（C14）**——spec 未提；屬 core 預設 run capture 行為（daemon 不會被停）。對 realhw case 無影響（case 內自取 seq 窗口），已記入 Task 9 注意事項。
 6. **agent-config 缺 `retry.max_attempts` 時預設 2（C9）**——「重跑對真機危險」的保證必須靠顯式 `max_attempts: 1`，已由契約單測釘死。
+7. **Phase 1 契約陷阱（複審修正，防靜默失效）**——(a) `preflight.collect` 的 `benchlock_ok` 參數**預設 True**：呼叫端不先 `acquire_benchlock(bench_lock_path())` 再注入，benchlock 互斥保護在 plugin 路徑永不生效；(b) family-gate 真實介面是 `collect_capabilities(sw) -> Capabilities`＋`missing_capabilities(caps) -> dict[缺項名→reason_code]`（**沒有** `capabilities(cfg, sw)` 這個名稱——早版 plan 的 getattr 防禦式消費會永遠拿到 None、family-gate 靜默失效）。`core.run_preflight` 已改硬依賴接線（fail-loud），並以 `test_run_preflight_acquires_benchlock_and_collects_missing`／`test_run_preflight_refuses_when_benchlock_held`／`test_runtime_skip_consumes_missing_capabilities_output` 釘死防回歸；`build_ctx` 同步注入 `win=WinSwCli(cfg["win_serialwrap_exe"])`（不注入＝Ctx.win 預設 None，hp 救援鏈在 plugin 路徑靜默降級）；testbed loader 兩來源改同走 `realhw.load_cfg` 單一正規化（等價律結構保證）。
