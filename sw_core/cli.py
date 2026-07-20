@@ -708,16 +708,29 @@ def _run_remote(args: argparse.Namespace) -> int:
 
     ``sw_core.remote_tunnel`` 於此延遲匯入（而非 cli.py 模組層級）：該模組硬依賴
     ``fcntl``（POSIX-only），cli.py 頂層需在 Windows 也能正常 import，故不得在
-    模組層級引入；`guard_platform()` 在 open 分支對 native Windows fail-closed
-    拒絕（``REMOTE_NOT_SUPPORTED``），status／close 分支則本期不受限（純讀寫
-    ``<run_dir>/remote/`` 下的 state 檔）。全程例外皆經 ``except rt.TunnelError``
-    轉為 JSON，不讓例外穿越 CLI 邊界。
+    模組層級引入。在匯入之前先於此函式最頂端攔截 native Windows（``os.name ==
+    "nt"``），統一回 ``REMOTE_NOT_SUPPORTED`` JSON——涵蓋 status／close／open 三條
+    路徑，避免 ``import remote_tunnel`` 觸發的 ``ModuleNotFoundError``（缺
+    ``fcntl``）穿越此函式與 ``main()`` 變成原始 traceback。open 分支內的
+    ``rt.guard_platform()`` 為 defense-in-depth，保留不動。全程例外皆經
+    ``except rt.TunnelError`` 與 catch-all ``except Exception`` 轉為 JSON，不讓
+    例外穿越 CLI 邊界。
     """
+    if os.name == "nt":
+        _print(
+            {
+                "ok": False,
+                "error_code": "REMOTE_NOT_SUPPORTED",
+                "message": "native Windows 本期不支援 serialwrap remote；請手動 ssh -R（見 SKILL_WINDOWS.md）",
+            }
+        )
+        return 1
+
     from . import remote_tunnel as rt  # noqa: PLC0415
 
-    run_dir = _remote_run_dir()
-    words = list(getattr(args, "words", []) or [])
     try:
+        run_dir = _remote_run_dir()
+        words = list(getattr(args, "words", []) or [])
         if not words or words[0] == "status":
             _print(rt.status(run_dir))
             return 0
@@ -762,6 +775,9 @@ def _run_remote(args: argparse.Namespace) -> int:
         return 0
     except rt.TunnelError as exc:
         _print({"ok": False, "error_code": exc.code, "message": exc.message or exc.code})
+        return 1
+    except Exception as exc:  # noqa: BLE001 — 任何非預期例外不得穿越 CLI 邊界
+        _print({"ok": False, "error_code": "INTERNAL_ERROR", "message": str(exc)})
         return 1
 
 

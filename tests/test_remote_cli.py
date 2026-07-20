@@ -54,3 +54,35 @@ def test_remote_malformed_endpoint_returns_json_error(tmp_path, monkeypatch, cap
     assert rc == 1 and obj is not None
     assert obj["ok"] is False
     assert obj["error_code"] == "INVALID_ENDPOINT"
+
+
+def test_remote_windows_returns_not_supported(tmp_path, monkeypatch, capsys):
+    """native Windows：guard 需在 `import remote_tunnel`（頂層 import fcntl）之前
+    就攔截，status／open 兩條路徑皆須回 JSON REMOTE_NOT_SUPPORTED，不得拋例外。
+    """
+    monkeypatch.setenv("SERIALWRAP_RUN_DIR", str(tmp_path))
+    monkeypatch.setattr(cli.os, "name", "nt")
+
+    rc, obj = _run(["remote"], capsys)
+    assert rc == 1 and obj is not None
+    assert obj["ok"] is False
+    assert obj["error_code"] == "REMOTE_NOT_SUPPORTED"
+
+    rc, obj = _run(["remote", "u@h:7777"], capsys)
+    assert rc == 1 and obj is not None
+    assert obj["ok"] is False
+    assert obj["error_code"] == "REMOTE_NOT_SUPPORTED"
+
+
+def test_remote_internal_error_is_json_not_traceback(tmp_path, monkeypatch, capsys):
+    """非 TunnelError 例外（如壞掉的 SERIALWRAP_RUN_DIR）不得穿越 CLI 邊界，
+    須經 catch-all 轉為 JSON INTERNAL_ERROR。"""
+    bad_parent = tmp_path / "not_a_dir"
+    bad_parent.write_text("i am a file, not a directory")
+    monkeypatch.setenv("SERIALWRAP_RUN_DIR", str(bad_parent / "sub"))
+    monkeypatch.setattr(rt, "resolve_ssh_bin", lambda via: "/usr/bin/ssh")
+
+    rc, obj = _run(["remote", "tester@relay:7777"], capsys)
+    assert rc == 1 and obj is not None
+    assert obj["ok"] is False
+    assert "error_code" in obj
