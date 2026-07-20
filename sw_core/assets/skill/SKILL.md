@@ -110,6 +110,25 @@ Agent 端連線（依拓樸擇一）：
 
 安全：隧道讓對端全權操控 DUT。**只用單租戶／可信 relay**；共享 relay 加 `--remote-socket /path`（遠端改建檔案權限把關的 unix socket）。`-R` tcp 模式若偵測遠端被 `GatewayPorts` 綁到對外，會拒絕（`REMOTE_BIND_UNVERIFIED`）。
 
+### `--remote-socket` 模式：agent 端連線格式與已知落差
+
+硬化後對端**不開 TCP port**，只落地一個檔案權限管控的 unix socket。agent 端連線指令要相應改為：
+
+```bash
+serialwrap --endpoint unix:///path/to.sock session list
+```
+
+**已知落差**：`serialwrap remote` 回傳 JSON 裡的 `remote_hint` 欄位固定顯示 `tcp://127.0.0.1:<port>`，**不會**因為用了 `--remote-socket` 而更新——照抄會連不上（該 port 根本沒開）。硬化模式下請忽略 `remote_hint`，改用 `unix://` + 該次回傳的 `remote_bind` 欄位組出正確 endpoint。
+
+### 給「隧道對端」agent 的操作提醒
+
+若你是被交接 `--endpoint`（tcp 或 unix）的那一端，而非起隧道的那一端：
+
+- 每筆命令帶 `--source agent:<your-name>`，方便回溯是誰下的。
+- 這條隧道等同對端全權操控 DUT／STA（`command.submit`／`file.push`／`daemon.stop` 皆可達，daemon 不做額外身分驗證，安全性完全靠 ssh）。共用硬體時，動作前先 `session self-test` 確認目前狀態、無人在用再下手。
+- 隧道是背景 ssh process，不是常駐服務；UART host 重開機或該 ssh process 被殺掉都會讓連線失效。你這端沒有權限重建，遇到 `SOCKET_ERROR` 或連不上時回報給 UART host 那邊的操作者，不要自行嘗試繞過。
+- 不要直接碰 `/dev/ttyUSB*`；一切透過 `serialwrap` CLI 走 broker 仲裁（見上方「安全規則」）。
+
 ## Event Trigger Engine
 用於 UART RX 觸發自動化 handler。**先呼叫 `serialwrap event status`** 確認狀態再 enable/disable，避免假設狀態。
 ```bash
