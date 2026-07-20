@@ -33,14 +33,14 @@
 - [ ] 5.1 `reliability/pyproject.toml`（dist 名/deps/entry point/api_version 常數）＋`serialwrap_reliability/` 骨架；驗 release wheel 內容不變
 - [ ] 5.2 RED＋GREEN：`core.py`（不 import testpilot）：REGISTRY→case dicts 映射（tier/destructive/requires metadata、destructive 預設過濾）、CaseResult→`_last_failure` 抄寫、longrun steps 合成——serialwrap `tests/` 直測
 - [ ] 5.3 RED＋GREEN：testbed loader（testbed.yaml→cfg 合成；與 config.json 雙來源等價單測）
-- [ ] 5.4 `plugin.py`（PluginBase glue：name/api_version/discover_cases/prepare_run=preflight gate/setup_env=Ctx 一次建置/execute_step=black-box/evaluate/teardown）＋`agent-config.yaml`（sequential、max_attempts=1、remediation off）
+- [ ] 5.4 `plugin.py`（PluginBase glue：name/api_version/discover_cases/prepare_run=preflight gate/setup_env=Ctx 一次建置/execute_step=black-box/evaluate/teardown）＋`agent-config.yaml`（sequential、max_attempts=1、remediation=snapshot-only：enabled true＋max_attempts=1＋不覆寫 decision hooks；hooks 含 on_failure）
 - [ ] 5.5 `reporter.py`（create_reporter/report_formats=["md","json"]，重用 realhw 報告＋run meta 烙 deployed 版本）
 
 ## 6. Phase 2b — bench 整合驗收（plugin）
 
 - [ ] 6.1 editable install → `testpilot list-plugins`/`list-cases` 36 條 → `run --case p0-doctor` 冒煙（agent_trace/diagnostic_status/報表全鏈）
 - [ ] 6.2 雙前端一致性：standalone 與 plugin 各跑 P0＋P1 非破壞性，逐案 verdict 比對（不一致歸因）
-- [ ] 6.3 分類落桶驗證：停 docker→FailEnv、testbed 錯 busid→FailConfig、真實 FAIL→FailTest
+- [ ] 6.3 分類落桶驗證：停 docker→FailEnv、testbed 錯 serial→FailConfig（serial 為穩定身分鍵；busid 隨插拔變動不宜作 mismatch 測試欄位）、真實 FAIL→FailTest
 - [ ] 6.4 longrun 短跑（checkpoint 版 `--duration 15m`）驗步進模型＋reporter
 - [ ] 6.5 benchlock 實測（模擬 wifi_llapi run 進行中→整場拒跑）
 
