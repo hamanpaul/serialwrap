@@ -40,11 +40,11 @@ policy_version: 1.0.14
   ```bash
   python3 -m policy_check --repo .
   ```
-- policy engine pinned SHA：`ee87a6d5ed91209d944934a2559f4f2622fd1ac2`。
+- policy engine pinned SHA：`451c2680fb3a1f977fcbc8007baaa7dbe415cf03`（v1.0.14）。
 - 安裝命令：
   ```bash
   python3 -m pip install --user --disable-pip-version-check \
-    "git+https://github.com/hamanpaul/paulsha-conventions.git@ee87a6d5ed91209d944934a2559f4f2622fd1ac2"
+    "git+https://github.com/hamanpaul/paulsha-conventions.git@451c2680fb3a1f977fcbc8007baaa7dbe415cf03"
   ```
 
 ## Agent 檔案同步政策
