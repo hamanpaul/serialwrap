@@ -1,6 +1,6 @@
-<!-- managed-by: hamanpaul/paulsha-conventions@v1.0.10 -->
+<!-- managed-by: hamanpaul/paulsha-conventions@v1.0.14 -->
 <!-- CLAUDE.md 為單一事實來源；AGENTS.md / GEMINI.md / .github/copilot-instructions.md 為指向本檔的 symlink，只需維護本檔 -->
-policy_version: 1.0.10
+policy_version: 1.0.14
 <!-- policy_version 為 policy_check R-14 machine-readable marker；需保持裸行格式，請勿移入 frontmatter 或 code block。 -->
 
 # serialwrap — AI Agent Policy Checklist
@@ -58,7 +58,7 @@ policy_version: 1.0.10
     ln -sf CLAUDE.md GEMINI.md
     ln -sf ../CLAUDE.md .github/copilot-instructions.md
     ```
-- 本檔首行保留 `<!-- managed-by: hamanpaul/paulsha-conventions@v1.0.10 -->`，第 3 行保留裸行 `policy_version: 1.0.10`（R-14 machine-readable marker，勿移入 frontmatter 或 code block）。
+- 本檔首行保留 `<!-- managed-by: hamanpaul/paulsha-conventions@v1.0.14 -->`，第 3 行保留裸行 `policy_version: 1.0.14`（R-14 machine-readable marker，勿移入 frontmatter 或 code block）。
 
 ## PR 政策
 

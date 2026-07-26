@@ -10,11 +10,11 @@ permissions:
 
 jobs:
   project-policy:
-    uses: hamanpaul/paulsha-conventions/.github/workflows/reusable-policy-check.yml@ee87a6d5ed91209d944934a2559f4f2622fd1ac2 # v1.0.10
+    uses: hamanpaul/paulsha-conventions/.github/workflows/reusable-policy-check.yml@451c2680fb3a1f977fcbc8007baaa7dbe415cf03 # v1.0.14
     with:
       policy_profile: flat
-      policy_version: "1.0.10"
-      policy_engine_ref: ee87a6d5ed91209d944934a2559f4f2622fd1ac2
+      policy_version: "1.0.14"
+      policy_engine_ref: 451c2680fb3a1f977fcbc8007baaa7dbe415cf03
 
   publish:
     runs-on: ubuntu-latest

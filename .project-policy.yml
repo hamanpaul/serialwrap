@@ -1,5 +1,5 @@
 policy_profile: flat
-policy_version: "1.0.10"
+policy_version: "1.0.14"
 # 內容分類（R-21）：serialwrap 為通用序列工具、無雇主機密 → 維持 public
 tier: shareable
 secret_scan:
@@ -40,3 +40,16 @@ cli:
     help_args: ["--help"]
     reflected_in: "README.md"
     marker: "serialwrap-remote-help"
+preflight:
+  steps:
+    - name: openspec
+      kind: validation
+      argv: ["openspec", "validate", "--all", "--strict"]
+      when_path_exists: "openspec"
+      timeout_seconds: 300
+    - name: tests
+      kind: tests
+      argv: ["python3", "-m", "pytest", "-q", "tests/"]
+      timeout_seconds: 1800
+conventions_engine:
+  repo: hamanpaul/paulsha-conventions
