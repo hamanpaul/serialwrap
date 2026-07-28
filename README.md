@@ -1,3 +1,5 @@
+> **Fact:** `serialwrap` 是 UART / device-session raw physical evidence 的唯一 authority，負責 real-device ownership、single-writer arbitration、WAL 與 recovery semantics。
+
 # serialwrap
 
 > **[English](#english)** ｜ **[繁體中文](#繁體中文)**
