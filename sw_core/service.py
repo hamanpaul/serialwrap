@@ -35,7 +35,7 @@ from .device_source import _load_exclude_coms  # #131：實作移至 device_sour
 from .device_watcher import DeviceWatcher
 from .event_engine import EventEngine, EngineDeps
 from .event_engine.line_buffer import LineBuffer
-from .file_transfer import DEFAULT_CHUNK_SIZE
+from .file_transfer import _ACK_MODES, DEFAULT_CHUNK_SIZE
 from .session_manager import SessionManager
 from .util import now_iso
 from .version import resolve_version
@@ -976,6 +976,10 @@ class SerialwrapService:
                 )
             except (TypeError, ValueError):
                 return {"ok": False, "error_code": "INVALID_ARGS"}
+            # ack_mode 白名單（#161）：非法值即拒，不讓未知模式流進傳輸層。
+            ack_mode = str(params.get("ack_mode") or "auto")
+            if ack_mode not in _ACK_MODES:
+                return {"ok": False, "error_code": "INVALID_ARGS"}
             source = str(params.get("source") or "agent")
             if not selector or not local_path or not remote_path:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
@@ -988,6 +992,7 @@ class SerialwrapService:
                 remote_path=remote_path,
                 chunk_size=chunk_size,
                 chunk_timeout_s=chunk_timeout_s,
+                ack_mode=ack_mode,
                 source=source,
             )
 
@@ -1001,6 +1006,10 @@ class SerialwrapService:
                     float(chunk_timeout_raw) if chunk_timeout_raw is not None else None
                 )
             except (TypeError, ValueError):
+                return {"ok": False, "error_code": "INVALID_ARGS"}
+            # ack_mode（#161）：pull 側本次僅做白名單驗證、介面對齊（echo-ACK 節流僅
+            # 作用於 push 的 chunk 命令行；pull 單行短命令不走 paced，故不轉傳）。
+            if str(params.get("ack_mode") or "auto") not in _ACK_MODES:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
             source = str(params.get("source") or "agent")
             if not selector or not remote_path:

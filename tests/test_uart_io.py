@@ -590,3 +590,114 @@ class TestRxStats(unittest.TestCase):
         bridge._handle_serial_rx(b"cd")
         self.assertEqual(bridge.rx_total_bytes(), 8)
         self.assertEqual(bridge.snapshot()["rx_total_bytes"], 8)
+
+
+class TestSendCommandEchoPaced(unittest.TestCase):
+    """#161：send_command_echo_paced／_await_echo_progress／cancel_input_line。
+
+    不 start()、不碰真實序列埠：monkeypatch send_bytes 記錄送出 bytes，並以可控的
+    echo 函式把回顯餵進 _append_rx_text，模擬板端逐段 echo／插噪音／停滯。
+    """
+
+    CMD = "printf '%s' 'QUJDREVGRw==' | base64 -d >> /tmp/.sw_upload_0123456789ab && echo done-0123"
+
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._wal = mock.Mock()
+        self._bridge = UARTBridge(
+            com="COM0",
+            device_path="/dev/null",
+            profile=UartProfile(),
+            wal=self._wal,
+        )
+        self._sent: list[bytes] = []
+
+    def tearDown(self) -> None:
+        self._bridge.stop()
+        self._tmpdir.cleanup()
+
+    def _install_send(self, echo_fn) -> None:
+        """monkeypatch send_bytes：記錄送出 bytes，echo_fn(data)->bytes|None 為板端回顯。"""
+
+        def fake_send(data: bytes, *, source: str = "", cmd_id=None, log: bool = True, **_kw) -> None:
+            self._sent.append(bytes(data))
+            echo = echo_fn(bytes(data))
+            if echo:
+                self._bridge._append_rx_text(echo)
+
+        self._bridge.send_bytes = fake_send  # type: ignore[assignment]
+
+    def test_paced_send_all_slices_acked_then_newline(self) -> None:
+        """正常逐段確認：每段 echo 同步到達 → ok=True，換行最後單獨送出。"""
+        self._install_send(lambda data: data)  # 板端原樣 echo
+        result = self._bridge.send_command_echo_paced(
+            self.CMD, source="file_transfer", cmd_id="ft-1", slice_size=16)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["acked_chars"], len(self.CMD))
+        self.assertEqual(result["sent_chars"], len(self.CMD))
+        self.assertEqual(self._sent[-1], b"\n", "換行必須在全段確認後單獨送出")
+        self.assertEqual(b"".join(self._sent), self.CMD.encode() + b"\n")
+        for piece in self._sent[:-1]:
+            self.assertLessEqual(len(piece), 16)
+
+    def test_noise_between_slices_still_matches(self) -> None:
+        """slice 間插入 printk 噪音與 ANSI 殘字：移動起點 find 仍逐段比對成功。"""
+
+        def noisy_echo(data: bytes) -> bytes:
+            return b"\r\n[  12.345678] printk noise\x1b[0m\r\n" + data
+
+        self._install_send(noisy_echo)
+        result = self._bridge.send_command_echo_paced(
+            self.CMD, source="file_transfer", slice_size=16)
+        self.assertTrue(result["ok"], f"噪音插入不應造成停滯：{result}")
+        self.assertEqual(result["acked_chars"], len(self.CMD))
+
+    def test_echo_crlf_normalized(self) -> None:
+        """板端 echo 帶 CR/LF 折行：去 CR/LF 正規化後仍比對成功。"""
+        self._install_send(lambda data: data.replace(b" ", b" \r\n"))
+        result = self._bridge.send_command_echo_paced(
+            self.CMD, source="file_transfer", slice_size=16)
+        self.assertTrue(result["ok"])
+
+    def test_echo_stall_returns_not_ok_without_newline(self) -> None:
+        """echo 停滯：第二段起無 echo → ok=False、acked 停在第一段、絕不送換行。"""
+        state = {"count": 0}
+
+        def stalling_echo(data: bytes) -> bytes | None:
+            state["count"] += 1
+            return data if state["count"] == 1 else None  # 只 echo 第一段
+
+        self._install_send(stalling_echo)
+        result = self._bridge.send_command_echo_paced(
+            self.CMD, source="file_transfer", slice_size=16, echo_timeout_s=0.05)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["acked_chars"], 16)
+        self.assertEqual(result["sent_chars"], 32, "停滯後不得再送後續 slice")
+        self.assertNotIn(b"\n", b"".join(self._sent), "停滯時換行不得送出（命令不得執行）")
+
+    def test_wal_single_record_per_command(self) -> None:
+        """WAL 一命令一筆 TX：成功記全文＋換行；停滯記實際已送出的部分。"""
+        self._install_send(lambda data: data)
+        self._bridge.send_command_echo_paced(
+            self.CMD, source="file_transfer", cmd_id="ft-9", slice_size=16)
+        self._wal.append.assert_called_once()
+        kwargs = self._wal.append.call_args.kwargs
+        self.assertEqual(kwargs["payload"], self.CMD.encode() + b"\n")
+        self.assertEqual(kwargs["direction"], "TX")
+        self.assertEqual(kwargs["cmd_id"], "ft-9")
+
+        self._wal.append.reset_mock()
+        self._sent.clear()
+        self._install_send(lambda data: None)  # 全程無 echo
+        result = self._bridge.send_command_echo_paced(
+            self.CMD, source="file_transfer", slice_size=16, echo_timeout_s=0.05)
+        self.assertFalse(result["ok"])
+        self._wal.append.assert_called_once()
+        partial = self._wal.append.call_args.kwargs["payload"]
+        self.assertEqual(partial, self.CMD.encode()[:16], "停滯時 WAL 記實際送出的部分")
+
+    def test_cancel_input_line_sends_ctrl_u_newline(self) -> None:
+        """cancel_input_line：送 \\x15＋\\n（Ctrl-U 清行＋換行重取 prompt）。"""
+        self._install_send(lambda data: None)
+        self._bridge.cancel_input_line(source="file_transfer")
+        self.assertEqual(self._sent, [b"\x15\n"])

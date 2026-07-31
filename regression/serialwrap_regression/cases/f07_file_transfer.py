@@ -9,16 +9,23 @@
 逾時，需 ≥ RPC timeout 加緩衝，否則會在 RPC 真正逾時前就被 Python 端
 ``subprocess.TimeoutExpired`` 打斷）。
 
-timeout 估算基準（#157 修復後）：``DEFAULT_CHUNK_SIZE=512`` → 64KB≈129 chunks、
-1MB=2048 chunks；以每 chunk 真實往返 0.1–0.3s 估，64KB≈13–39s、1MB≈205–614s，
-timeout 取悲觀上界加緩衝，實際值待真機驗證校準。
+timeout 估算基準（#161 echo-ACK 後）：``DEFAULT_CHUNK_SIZE=512`` → 64KB≈129 chunks、
+1MB=2048 chunks；push 預設走 echo-paced（單行 ~741 字元拆 ~12 個 64-char slice、
+逐段等 echo 回讀），每 chunk ≈ 12 slice 往返（~20–35ms/slice）＋prompt 等待，
+估 0.3–0.5s/chunk → 64KB≈39–65s（180s 上界仍足）、1MB≈614–1024s（≈10–17 分，
+取 1500s 上界；plan 決策 4——維持 echo-paced 預設路徑，不用 ``--ack-mode none``
+換吞吐，回歸防線要驗的是新機制）。實際值待真機驗證校準。
 
-已知殘留缺口（#157 範圍外）：``sw_core/uart_io.py`` 的 RX 視窗上限 131072 字元
+echo 停滯（``TRANSFER_ECHO_STALL``，#161）歸獨立 reason_code
+``transfer_echo_stall``（不併進 ``_TIMEOUT_CODES``），使「新機制自身失效」與一般
+逾時／連線層失敗可辨識。
+
+已知殘留缺口（#157/#161 範圍外）：``sw_core/uart_io.py`` 的 RX 視窗上限 131072 字元
 （#158 改為絕對偏移記帳，但視窗仍有界、被修剪頭段永久丟失），``pull_file`` 不分段
 一次讀全部——1MB 檔案 base64 輸出 ~1.4MB 遠超上限，``_SENTINEL_BEGIN`` 必被踢出
-視窗 → ``PULL_PARSE_FAILED``。故 ``f7-larger-file-not-truncated`` 於 #157 修復後
-push 端可成功，pull 端仍預期 SKIP（``transfer_environment_failure``）待 follow-up；
-``f7-binary-roundtrip-md5``（64KB，base64 ~88.6KB 在上限內）應轉綠。
+視窗 → ``PULL_PARSE_FAILED``。故 ``f7-larger-file-not-truncated`` push 端可成功，
+pull 端仍預期 SKIP（``transfer_environment_failure``）待 follow-up（另開 issue 追蹤）；
+``f7-binary-roundtrip-md5``（64KB，base64 ~88.6KB 在上限內）於 #161 後預期 COM0 轉綠。
 """
 from __future__ import annotations
 
@@ -94,7 +101,14 @@ def _transfer_failure_verdict(resp: dict[str, Any], *, verb: str,
 def _environment_skip(resp: dict[str, Any], *, verb: str) -> CaseResult:
     """push/pull 未完成傳輸（逾時或其他明確失敗），非「完成但內容有誤」，判環境性 SKIP。"""
     code = str(resp.get("error_code") or "unknown")
-    reason_code = "transfer_timeout" if code in _TIMEOUT_CODES else "transfer_environment_failure"
+    if code == "TRANSFER_ECHO_STALL":
+        # #161：echo-ACK 節流自身停滯（板端 echo 跟不上／console 死結）。獨立
+        # reason_code 使新機制失效可辨識，不與一般逾時混同（plan 決策 5）。
+        reason_code = "transfer_echo_stall"
+    elif code in _TIMEOUT_CODES:
+        reason_code = "transfer_timeout"
+    else:
+        reason_code = "transfer_environment_failure"
     return CaseResult(
         "SKIP",
         reason=f"{verb} 未完成（error_code={code}），視為環境因素而非程式回歸",
@@ -153,7 +167,8 @@ def _binary_roundtrip_on(ctx, com):
             return CaseResult("SKIP", reason="板端缺 base64／md5sum（探測確認）",
                               category="environment", reason_code="target_tool_missing")
 
-        # chunk 512 下 64KB≈129 chunks（原 2048 時 33），timeout 同比放大（見 module docstring）
+        # chunk 512 下 64KB≈129 chunks；echo-paced 估 39–65s（#161，見 module docstring），
+        # 180s 上界仍足、不調整。
         push = _push(ctx, com, src_path, remote_path, rpc_timeout_s=180, proc_timeout_s=200)
         ctx.note(f"{com}-push.json", str(push))
         if not push.get("ok"):
@@ -189,14 +204,16 @@ def _larger_file_on(ctx, com):
             return CaseResult("SKIP", reason="板端缺 base64／md5sum（探測確認）",
                               category="environment", reason_code="target_tool_missing")
 
-        # chunk 512 下 1MB=2048 chunks，悲觀估 205–614s（見 module docstring）；取 640 上界。
+        # chunk 512 下 1MB=2048 chunks，echo-paced 估 614–1024s（≈10–17 分，#161）；
+        # 取 1500s 上界（plan 決策 4：維持 echo-paced 預設路徑、不用 --ack-mode none
+        # 換吞吐——回歸防線要驗的是新機制）。
         # 註：pull 端在 RX 視窗 128KiB 上限修復前仍預期 PULL_PARSE_FAILED → SKIP。
-        push = _push(ctx, com, src_path, remote_path, rpc_timeout_s=640, proc_timeout_s=660)
+        push = _push(ctx, com, src_path, remote_path, rpc_timeout_s=1500, proc_timeout_s=1520)
         ctx.note(f"{com}-push.json", str(push))
         if not push.get("ok"):
             return _transfer_failure_verdict(push, verb="push", tools_present=tools_present)
 
-        pull = _pull(ctx, com, remote_path, dst_path, rpc_timeout_s=640, proc_timeout_s=660)
+        pull = _pull(ctx, com, remote_path, dst_path, rpc_timeout_s=1500, proc_timeout_s=1520)
         ctx.note(f"{com}-pull.json", str(pull))
         if not pull.get("ok"):
             return _transfer_failure_verdict(pull, verb="pull", tools_present=tools_present)
@@ -221,7 +238,8 @@ def _larger_file_on(ctx, com):
 
 
 _ENV_SKIP_CODES = frozenset({
-    "transfer_timeout", "transfer_environment_failure", "target_tool_missing"})
+    "transfer_timeout", "transfer_environment_failure", "target_tool_missing",
+    "transfer_echo_stall"})
 
 
 def _run_on_boards(ctx, runner, *, case_tag: str):
@@ -246,14 +264,18 @@ def _run_on_boards(ctx, runner, *, case_tag: str):
 
 
 @_case("f7-binary-roundtrip-md5", "binary round-trip md5 一致（含 null byte）",
-       issues=("#32", "#21"),
-       hints=("逐板嘗試：prpl 板受無流控節流限制（#157 後續 issue 追蹤），bcm 板"
-              "（timeout_s 配置齊）為 #157 機制的實證面。",))
+       issues=("#32", "#21", "#161"),
+       hints=("逐板嘗試：prpl 板的無流控節流掉字由 #161 echo-ACK 修復（push 預設走"
+              "echo-paced，預期 COM0 轉綠）；停滯時 reason_code=transfer_echo_stall"
+              "可辨識新機制失效。",))
 def f7_binary_roundtrip_md5(ctx):
     return _run_on_boards(ctx, _binary_roundtrip_on, case_tag="rt")
 
 
-@_case("f7-larger-file-not-truncated", "1MB 檔案 push→pull 不靜默截斷", issues=("#21",),
-       hints=("逐板嘗試（同 f7-binary-roundtrip-md5）。",))
+@_case("f7-larger-file-not-truncated", "1MB 檔案 push→pull 不靜默截斷",
+       issues=("#21", "#161"),
+       hints=("逐板嘗試（同 f7-binary-roundtrip-md5）；echo-paced 下 1MB push 約"
+              "10–17 分，timeout 上界 1500s；pull 端受 RX 視窗 128KiB 上限仍預期"
+              "SKIP（待 follow-up issue）。",))
 def f7_larger_file_not_truncated(ctx):
     return _run_on_boards(ctx, _larger_file_on, case_tag="big")

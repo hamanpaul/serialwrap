@@ -4131,6 +4131,7 @@ class SessionManager:
         remote_path: str,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         chunk_timeout_s: float | None = None,
+        ack_mode: str = "auto",
         source: str = "agent",
     ) -> dict[str, Any]:
         """將 host 端檔案推送到 target。
@@ -4138,6 +4139,10 @@ class SessionManager:
         ``chunk_timeout_s``（#157）：單一 chunk 等待 target 回 prompt 的逾時；
         ``None`` 時沿用 ``profile.timeout_s``（夾 ``_MIN_FILE_CHUNK_TIMEOUT_S`` 地板），
         取代舊版寫死的 10.0s——bcm 類慢板已調大的 ``timeout_s`` 因此自動生效。
+
+        ``ack_mode``（#161）：chunk 命令行送出方式（``auto``/``echo``/``none``），
+        見 :func:`sw_core.file_transfer.push_file`；slice 大小與 echo 逾時維持模組
+        固定保守值（plan 決策 2，不開放自適應）。
         """
         from .file_transfer import push_file
 
@@ -4185,6 +4190,7 @@ class SessionManager:
                 timeout_s=effective_timeout_s,
                 prompt_regex=prompt_regex,
                 source=source,
+                ack_mode=ack_mode,
             )
         finally:
             with self._lock:

@@ -16,6 +16,7 @@ from .config import UartProfile
 from .constants import DEFERRED_INPUT_MAX_BYTES, RX_RATE_WINDOW_S
 from .serial_port import SerialPort, open_serial_port
 from .telnet_console import TELNET_GREETING, TelnetFilter, escape_iac
+from .util import strip_ansi
 from .wal import WalWriter
 
 # 序列埠的 termios/fcntl 設定與 _BAUD_MAP 已收斂進 sw_core/serial_port.py 的 SerialPort
@@ -955,6 +956,91 @@ class UARTBridge:
         if not payload.endswith(b"\n"):
             payload += b"\n"
         self.send_bytes(payload, source=source, cmd_id=cmd_id)
+
+    def send_command_echo_paced(
+        self,
+        cmd: str,
+        *,
+        source: str,
+        cmd_id: str | None = None,
+        slice_size: int = 64,
+        echo_timeout_s: float = 2.0,
+    ) -> dict[str, Any]:
+        """以 echo 回讀節流送出單行命令（#161）：逐 slice 送、板端 echo 確認才送下一段。
+
+        無流控（flow_control: none）真機 console 上長命令行會被節流掉字；本原語把命令
+        本文切成 ``slice_size`` 短段，每段送出後等 `_await_echo_progress()` 在 RX 中比對到
+        該段 echo 才續送——echo 即天然的應用層流控。**全部 slice 確認後才送 ``\\n``**，
+        故 echo 停滯時換行尚未送出＝命令未執行＝呼叫端可安全重試（配 `cancel_input_line()`
+        恢復半行）。WAL 維持一命令一筆 TX（成功記全文＋換行；停滯記實際已送出的部分）。
+
+        回傳 ``{"ok", "acked_chars", "sent_chars"}``；``ok=False`` 表示某段 echo 逾時停滯。
+        """
+        body = cmd.rstrip("\n")
+        slice_size = max(1, slice_size)
+        slices = [body[i : i + slice_size] for i in range(0, len(body), slice_size)]
+        pre = self.rx_snapshot_len()
+        sent_chars = 0
+        acked_chars = 0
+        sent_payload = b""
+        for idx, piece in enumerate(slices):
+            data = piece.encode("utf-8", errors="replace")
+            self.send_bytes(data, source=source, cmd_id=cmd_id, log=False)
+            sent_payload += data
+            sent_chars += len(piece)
+            acked_chars = self._await_echo_progress(slices[: idx + 1], pre, echo_timeout_s)
+            if acked_chars < sent_chars:
+                # echo 停滯：換行未送出、命令未執行；只記實際送出的 bytes（單筆稽核）。
+                if sent_payload:
+                    self.wal.append(
+                        com=self.com, direction="TX", source=source,
+                        payload=sent_payload, cmd_id=cmd_id,
+                    )
+                return {"ok": False, "acked_chars": acked_chars, "sent_chars": sent_chars}
+        self.send_bytes(b"\n", source=source, cmd_id=cmd_id, log=False)
+        self.wal.append(
+            com=self.com, direction="TX", source=source,
+            payload=sent_payload + b"\n", cmd_id=cmd_id,
+        )
+        return {"ok": True, "acked_chars": acked_chars, "sent_chars": sent_chars}
+
+    def _await_echo_progress(
+        self, expected_cumulative: list[str], from_offset: int, timeout_s: float
+    ) -> int:
+        """等待已送出的 slice 串列依序全數出現在 echo 中；回傳已確認的累計字元數。
+
+        比對法：`rx_text_from(from_offset)` 經 `strip_ansi()`＋去 CR/LF 正規化後，
+        以**移動起點** ``find`` 逐 slice 依序比對——slice 之間允許任意雜訊（printk、
+        終端控制殘字），吸收板端在 echo 間插入的非同步輸出。先檢查再 sleep（echo 常
+        已同步到達）、poll 0.01s。逾時回傳當下已比對到的累計字元數（部分進度）。
+        """
+        deadline = time.monotonic() + timeout_s
+        while True:
+            text = strip_ansi(self.rx_text_from(from_offset)).replace("\r", "").replace("\n", "")
+            pos = 0
+            acked = 0
+            complete = True
+            for piece in expected_cumulative:
+                found = text.find(piece, pos)
+                if found < 0:
+                    complete = False
+                    break
+                pos = found + len(piece)
+                acked += len(piece)
+            if complete:
+                return acked
+            if time.monotonic() >= deadline:
+                return acked
+            time.sleep(0.01)
+
+    def cancel_input_line(self, *, source: str) -> None:
+        """取消板端輸入緩衝中的半行（#161）：送 Ctrl-U（\\x15）清行＋換行重取 prompt。
+
+        供 echo 停滯後復原用——換行尚未送出、命令未執行，Ctrl-U 清掉已累積的半行輸入，
+        換行讓 shell 重新給 prompt。不做 per-platform 分歧：不吃 Ctrl-U 的 CLI（如 bcm
+        原生 CLI）後果僅是多一個無效字元＋一次換行（既有 prompt 重取），無破壞性。
+        """
+        self.send_bytes(b"\x15\n", source=source, cmd_id=None)
 
     def send_secret(self, secret: str) -> None:
         payload = secret.encode("utf-8", errors="replace")

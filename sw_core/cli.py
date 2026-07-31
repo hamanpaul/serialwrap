@@ -1201,6 +1201,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_fp.add_argument("--chunk-size", dest="chunk_size", type=int, default=DEFAULT_CHUNK_SIZE)
     p_fp.add_argument("--chunk-timeout", dest="chunk_timeout_s", type=float, default=None,
                       help="單一 chunk 等待 target 回應的逾時秒數（預設：沿用 profile timeout_s，#157）")
+    p_fp.add_argument("--ack-mode", dest="ack_mode", choices=["auto", "echo", "none"],
+                      default="auto",
+                      help="chunk 命令行送出方式（#161）：auto=有 echo-ACK 原語即節流（預設）、"
+                           "echo=強制 echo-ACK、none=legacy 整行送出（急件換吞吐）")
     p_fp.add_argument("--source", default="agent")
     p_fl = file_sub.add_parser("pull", help="透過 UART 從 target 拉取檔案到本機")
     p_fl.add_argument("--selector", required=True)
@@ -1208,6 +1212,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_fl.add_argument("--local", default=None)
     p_fl.add_argument("--chunk-timeout", dest="chunk_timeout_s", type=float, default=None,
                       help="整段 base64 讀取的逾時秒數（預設：沿用 profile timeout_s，#157）")
+    p_fl.add_argument("--ack-mode", dest="ack_mode", choices=["auto", "echo", "none"],
+                      default="auto",
+                      help="介面對齊 file push（#161）；pull 端目前僅驗證、不影響行為")
     p_fl.add_argument("--source", default="agent")
 
     p_wal = sub.add_parser(
@@ -1565,6 +1572,7 @@ def main(argv: list[str] | None = None) -> int:
                 "local_path": args.local,
                 "remote_path": args.remote,
                 "chunk_size": args.chunk_size,
+                "ack_mode": args.ack_mode,
                 "source": args.source,
             }
             # 不顯式帶就不佔 RPC payload 欄位——daemon 端走 profile timeout_s 推導（#157）
@@ -1575,6 +1583,7 @@ def main(argv: list[str] | None = None) -> int:
             p: dict[str, Any] = {
                 "selector": args.selector,
                 "remote_path": args.remote,
+                "ack_mode": args.ack_mode,
                 "source": args.source,
             }
             if args.local is not None:
