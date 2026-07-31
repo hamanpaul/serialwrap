@@ -21,6 +21,13 @@
   file_push/file_pull gate、四個 READY 轉移點與 reboot 提前返回的 clear_boot_quiet）
 - ``TestSubmitQuietGate``：service 層（第一層 submit-time gate、queue race 終態、
   human 來源不受 gate）
+
+#162——quiet 清空改綁 READY 再確認（askconsole 啟用 banner 污染 stdout 的根修）：
+- ``TestReadyReconfirmGate``：``ready_reconfirm_pending`` 生命週期、pending-only
+  仍 gate（quiet 過期／RX prompt 解除不放行）、六個 READY 確認點清 pending、
+  reprobe 引擎的 READY 再確認分支（三態表＋端到端）
+- ``TestReadyReconfirmSubmitGate``：service 層 pending-only submit 拒絕
+  （``retry_after_s`` 固定 5.0）與確認後放行
 """
 from __future__ import annotations
 
@@ -795,8 +802,9 @@ class TestSubmitQuietGate(unittest.TestCase):
         self.assertEqual(resp["session"]["state"], "READY", "error payload 應附完整 session dict")
         self.assertNotIn("cmd_id", resp, "submit-time 拒絕為純 RPC 錯誤，不產生 cmd_id")
 
-        # quiet 解除後同一 submit 必須被接受（READY ⇒ 放行的 service 層對照）。
-        session.clear_boot_quiet()
+        # READY 再確認落定（#162 起 clear_boot_quiet 不再解除 agent gate）後，
+        # 同一 submit 必須被接受（READY ⇒ 放行的 service 層對照）。
+        session.confirm_ready()
         resp2 = self.svc.rpc(
             "command.submit",
             {"selector": "COM0", "cmd": "echo hi", "source": "agent:test"},
@@ -854,6 +862,281 @@ class TestSubmitQuietGate(unittest.TestCase):
         self.assertTrue(resp["ok"], "human 來源不受第一層 gate")
         rec = self._wait_terminal(resp["cmd_id"])
         self.assertEqual(rec["status"], "done", "human 來源亦不受第二層 gate（命令真的執行）")
+
+
+class TestReadyReconfirmGate(_ManagerMixin):
+    """#162：quiet 清空改綁 READY 再確認——agent gate 的解除不再依賴 quiet 過期，
+    須由 READY 確認點（nonce probe 實證）呼叫 ``confirm_ready()`` 清除。
+
+    根因（#162 設計實證）：askconsole 停在「Please press Enter to activate this
+    console」既不匹配 login_regex 也不匹配 prompt_regex → quiet 只能靠 180s 過期
+    清空；期間 session 名義 READY 無人重新確認，第一個 agent 命令的 ``\\n`` 觸發
+    askconsole 啟用、stdout 吃到啟用 banner。"""
+
+    def test_public_dict_exposes_ready_reconfirm_pending(self) -> None:
+        mgr, session = self._make_manager()
+        session.state = "READY"
+        self.assertFalse(session.to_public_dict()["ready_reconfirm_pending"])
+        session.arm_boot_quiet()
+        self.assertTrue(session.to_public_dict()["ready_reconfirm_pending"])
+
+    def _make_ready_pending_only(
+        self, *, prompt_within_2s: bool = True
+    ) -> tuple[SessionManager, sm_mod.SessionRuntime, FakeBridge]:
+        """READY＋pending-only（quiet 已過期）：#162 的受測過渡態。"""
+        mgr, session = self._make_manager()
+        bridge = FakeBridge(prompt_within_2s=prompt_within_2s)
+        session.bridge = bridge
+        session.state = "READY"
+        session.arm_boot_quiet()
+        session.boot_quiet_until = time.monotonic() - 1.0  # 模擬 180s 視窗過期
+        self.assertFalse(session.boot_quiet_active())
+        self.assertTrue(session.ready_reconfirm_pending)
+        return mgr, session, bridge
+
+    def test_quiet_expiry_keeps_agent_gate(self) -> None:
+        """quiet 過期但 pending 未清 → agent 顯式命令仍被 AUTOBOOT_QUIET 擋、零 TX。
+        （#162 oracle：舊行為在此放行、第一個命令 stdout 吃到 askconsole 啟用 banner。）"""
+        mgr, session, bridge = self._make_ready_pending_only()
+
+        result = mgr.execute_command(session.session_id, "echo hi", "agent:test", "cmd-1")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_code"], "AUTOBOOT_QUIET")
+        self.assertEqual(bridge.sent, [], "pending 期間 gate 拒絕必須零 TX 副作用")
+
+    def test_prompt_regex_clear_keeps_pending(self) -> None:
+        """RX prompt 解除只清 quiet（TX 靜默維度，#130 行為不變）；agent gate 仍須
+        等 READY 再確認——askconsole 情境 prompt 可能來自 banner 前的殘影或部分匹配。"""
+        mgr, session = self._make_manager()
+        bridge = FakeBridge()
+        session.bridge = bridge
+        session.state = "READY"
+        self._rx(mgr, session, "U-Boot 2022.01 (fake)\r\n")
+        self.assertTrue(session.boot_quiet_active())
+
+        self._rx(mgr, session, "boot done\r\nroot@prplOS:~# ")
+
+        self.assertEqual(session.boot_quiet_until, 0.0, "prompt 仍應解除 quiet（#130）")
+        self.assertTrue(session.ready_reconfirm_pending, "pending 不得被 RX prompt 清除")
+        result = mgr.execute_command(session.session_id, "echo hi", "agent:test", "cmd-1")
+        self.assertEqual(result.get("error_code"), "AUTOBOOT_QUIET")
+        self.assertEqual(bridge.sent, [])
+
+    def test_file_push_pull_gated_when_pending(self) -> None:
+        mgr, session, bridge = self._make_ready_pending_only()
+
+        push = mgr.file_push(
+            "COM0", local_path="/nonexistent/f", remote_path="/tmp/f", source="agent:test"
+        )
+        pull = mgr.file_pull("COM0", remote_path="/tmp/f", source="agent:test")
+
+        for result in (push, pull):
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["error_code"], "AUTOBOOT_QUIET")
+        self.assertEqual(bridge.sent, [])
+
+    def test_human_source_not_gated_when_pending(self) -> None:
+        """human 來源循 #130/#139 慣例永遠放行（#114 刻意進 bootloader 相容）。"""
+        mgr, session, bridge = self._make_ready_pending_only(prompt_within_2s=True)
+
+        result = mgr.execute_command(session.session_id, "echo hi", "human:tester", "cmd-1")
+
+        self.assertTrue(result["ok"])
+        self.assertIn(("echo hi", "human:tester"), bridge.sent)
+
+    def test_ready_confirm_sites_clear_pending(self) -> None:
+        """READY 確認點逐一清 pending（#162 接線驗證）。
+
+        涵蓋：attach probe（``_probe_existing_bridge`` ok 分支，經 attach_session）、
+        reboot 2s prompt-return（``_handle_reboot_command``）、reboot recovery ok
+        （``_spawn_reboot_recovery``）、self-test nonce 成功（``_self_test_impl``）、
+        attach 落定（``_attach_by_id`` 靜態路徑）。"""
+        # --- 1) _probe_existing_bridge ok 分支（attach_session ATTACHED 路徑）---
+        mgr, session, bridge = self._make_ready_pending_only()
+        session.state = "ATTACHED"
+        session.last_error = "PROMPT_UNAVAILABLE"
+        result = mgr.attach_session("COM0")
+        self.assertTrue(result["ok"])
+        self.assertEqual(session.state, "READY")
+        self.assertFalse(session.ready_reconfirm_pending, "attach probe READY 應清 pending")
+        follow = mgr.execute_command(session.session_id, "echo hi", "agent:test", "cmd-f1")
+        self.assertTrue(follow["ok"], "確認後 agent 命令不得再被 gate")
+
+        # --- 2) _handle_reboot_command 2s prompt-return 分支 ---
+        mgr, session, bridge = self._make_ready_pending_only()
+        result = mgr._handle_reboot_command(
+            session, bridge, command="reboot", source="agent:test",
+            cmd_id="cmd-r", timeout_s=10.0, execution_mode="line",
+        )
+        self.assertTrue(result["ok"])
+        self.assertFalse(session.ready_reconfirm_pending, "prompt-return 應清 pending")
+
+        # --- 3) _spawn_reboot_recovery ok 分支 ---
+        mgr, session, bridge = self._make_ready_pending_only()
+        session.state = "RECOVERING"
+        session.recovering = True
+        with mock.patch.object(sm_mod, "ensure_ready", return_value=(True, None)):
+            mgr._spawn_reboot_recovery(session.session_id, timeout_s=5.0)
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and session.state != "READY":
+                time.sleep(0.05)
+        self.assertEqual(session.state, "READY")
+        self.assertFalse(session.ready_reconfirm_pending, "reboot recovery READY 應清 pending")
+
+        # --- 4) _self_test_impl READY nonce 成功分支 ---
+        mgr, session, bridge = self._make_ready_pending_only()
+        session.attached_real_path = "/dev/ttyFAKE0"
+        result = mgr.self_test("COM0", timeout_s=0.2)
+        self.assertEqual(result.get("classification"), "OK")
+        self.assertFalse(session.ready_reconfirm_pending, "self-test nonce 成功應清 pending")
+
+        # --- 5) _attach_by_id READY 落定（靜態路徑）---
+        mgr, session = self._make_manager()
+        session.state = "DETACHED"
+        session.arm_boot_quiet()
+        session.boot_quiet_until = time.monotonic() - 1.0
+        attach_bridge = FakeBridge(prompt_within_2s=True)
+        attach_bridge.vtty_path = "/tmp/fake-vtty"
+        attach_bridge.start = lambda: None
+        with mock.patch.object(sm_mod, "UARTBridge", return_value=attach_bridge):
+            mgr._attach_by_id(session.profile.device_by_id)
+        self.assertEqual(session.state, "READY")
+        self.assertFalse(session.ready_reconfirm_pending, "_attach_by_id READY 落定應清 pending")
+
+    def test_reconfirm_probe_clears_pending_and_allows_execute(self) -> None:
+        """#162 主流程：reprobe 引擎在 TX 靜默結束（RX idle）後補一輪確認 probe，
+        confirm_ready 清 pending，agent 命令恢復放行；該 probe 的 ``\\n``＋nonce
+        順帶消耗 askconsole 啟用 banner。"""
+        mgr, session, bridge = self._make_ready_pending_only()
+        session.last_rx_mono = time.monotonic() - constants.REPROBE_RX_IDLE_S - 0.5
+
+        gated = mgr.execute_command(session.session_id, "echo hi", "agent:test", "cmd-0")
+        self.assertEqual(gated.get("error_code"), "AUTOBOOT_QUIET")
+
+        mgr.reconcile_readiness()
+        mgr.join_reprobe_workers(5.0)
+
+        self.assertTrue(bridge.sent, "確認 probe 必須實際送出（消耗 askconsole banner）")
+        self.assertEqual(session.state, "READY")
+        self.assertFalse(session.ready_reconfirm_pending)
+        follow = mgr.execute_command(session.session_id, "echo hi", "agent:test", "cmd-1")
+        self.assertTrue(follow["ok"], "確認 probe 後 agent 命令不得再被 gate")
+
+    def test_prepare_reprobe_ready_branch(self) -> None:
+        """``_prepare_reprobe_locked`` READY 分支三態表：
+        (a) READY 無 pending → 不排 probe（既有行為）；
+        (b) READY＋pending 但 quiet 進行中 → 不排（TX 靜默優先）；
+        (c) READY＋pending 且 quiet 已過期 → 排確認 probe。"""
+        mgr, session = self._make_manager()
+        bridge = FakeBridge(prompt_within_2s=True)
+        session.bridge = bridge
+        session.state = "READY"
+        now = 100.0
+        session.last_rx_mono = now - constants.REPROBE_RX_IDLE_S - 0.1
+
+        with mgr._lock:
+            # (a) 無 pending
+            session.ready_reconfirm_pending = False
+            session.boot_quiet_until = 0.0
+            self.assertIsNone(mgr._prepare_reprobe_locked(session, now))
+            # (b) pending＋quiet 進行中
+            session.ready_reconfirm_pending = True
+            session.boot_quiet_until = now + 100.0
+            self.assertIsNone(mgr._prepare_reprobe_locked(session, now))
+            # (c) pending＋quiet 過期
+            session.boot_quiet_until = now - 1.0
+            prepared = mgr._prepare_reprobe_locked(session, now)
+            self.assertIsNotNone(prepared)
+            action, prepared_session, prepared_bridge, _by_id = prepared
+            self.assertEqual(action, "probe")
+            self.assertIs(prepared_session, session)
+            self.assertIs(prepared_bridge, bridge)
+
+    def test_probe_quiet_early_exit_keeps_ready_last_error(self) -> None:
+        """``_probe_existing_bridge`` quiet 早退分支（3.3）：READY session 不得被
+        合成 PROMPT_UNAVAILABLE 覆寫 last_error（名義 READY 的 last_error 恆為
+        None，覆寫會讓 session list 呈現自相矛盾）；ATTACHED 維持 #130 原行為。"""
+        mgr, session, bridge = self._make_ready_pending_only()
+        session.arm_boot_quiet()  # quiet 重新進行中
+        result = mgr._probe_existing_bridge(session, bridge)
+        self.assertTrue(result["ok"])
+        self.assertIsNone(session.last_error, "READY 不得被覆寫 last_error")
+        self.assertEqual(bridge.sent, [], "quiet 內不得送 probe")
+
+        session.state = "ATTACHED"
+        result = mgr._probe_existing_bridge(session, bridge)
+        self.assertTrue(result["ok"])
+        self.assertEqual(session.last_error, "PROMPT_UNAVAILABLE", "ATTACHED 維持原行為")
+
+
+class TestReadyReconfirmSubmitGate(unittest.TestCase):
+    """#162 service 層 submit-time gate：pending-only（quiet 已過期）仍拒收，
+    ``retry_after_s`` 固定 5.0（≈RX idle 3s＋一輪 backoff，計畫裁決 1）。"""
+
+    def setUp(self) -> None:
+        state_iso.isolate_testcase(self)  # #120 per-file 隔離（unittest 不載 conftest）
+        self.svc = SerialwrapService([])
+
+    def _inject_ready_pending_only(self) -> sm_mod.SessionRuntime:
+        profile = SessionProfile(
+            profile_name="p",
+            com="COM0",
+            act_no=1,
+            alias="lab+1",
+            device_by_id="/dev/serial/by-id/fake",
+            platform="prpl",
+            prompt_regex=r"(?m)^root@prplOS:.*# ",
+            login_regex="",
+            ready_probe="echo __READY__${nonce}",
+            uart=UartProfile(),
+        )
+        session = sm_mod.SessionRuntime(session_id="p:COM0", profile=profile)
+        session.bridge = FakeBridge(prompt_within_2s=True)
+        session.state = "READY"
+        session.arm_boot_quiet()
+        session.boot_quiet_until = time.monotonic() - 1.0  # quiet 過期、pending 留著
+        with self.svc._sessions._lock:
+            self.svc._sessions._sessions[session.session_id] = session
+        self.svc._arbiter.register_session(session.session_id)
+        self.addCleanup(self.svc._arbiter.unregister_session, session.session_id)
+        return session
+
+    def test_submit_time_gate_pending_only(self) -> None:
+        session = self._inject_ready_pending_only()
+
+        resp = self.svc.rpc(
+            "command.submit",
+            {"selector": "COM0", "cmd": "echo hi", "source": "agent:test"},
+        )
+
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error_code"], "AUTOBOOT_QUIET")
+        self.assertEqual(resp["retry_after_s"], 5.0, "pending-only 固定 5.0（裁決 1）")
+        self.assertIn("重新確認 READY", resp["hint"])
+        self.assertNotIn("cmd_id", resp, "submit-time 拒絕為純 RPC 錯誤，不產生 cmd_id")
+        self.assertIsNone(
+            resp["session"]["boot_quiet_remaining_s"],
+            "pending-only 過渡態：quiet 已過期、僅 pending 撐住 gate",
+        )
+        self.assertTrue(resp["session"]["ready_reconfirm_pending"])
+
+        # READY 再確認落定後放行（對照組）。
+        session.confirm_ready()
+        resp2 = self.svc.rpc(
+            "command.submit",
+            {"selector": "COM0", "cmd": "echo hi", "source": "agent:test"},
+        )
+        self.assertTrue(resp2["ok"])
+        # 收斂 worker，避免 cleanup 時殘留 in-flight。
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            rec = self.svc.rpc("command.get", {"cmd_id": resp2["cmd_id"]}).get("command") or {}
+            if rec.get("status") in ("done", "error", "interactive"):
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("對照組命令未在 5s 內達終態")
 
 
 if __name__ == "__main__":

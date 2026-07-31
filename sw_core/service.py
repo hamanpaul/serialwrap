@@ -26,6 +26,7 @@ from .constants import (
     EVENTS_DIR,
     EVENTS_RUNTIME_DIR,
     EVENTS_LOG_PATH,
+    READY_RECONFIRM_RETRY_S,
     TTYMCU_PATH,
 )
 from .flash_endpoint import FlashEndpoint, detect_mcu_line, pump_endpoint_to_sink
@@ -609,6 +610,18 @@ class SerialwrapService:
                     "error_code": ERROR_AUTOBOOT_QUIET,
                     "retry_after_s": remaining,
                     "hint": "boot quiet window 進行中（疑似板卡自發重開機）；等 session 重新確認 READY 後重送",
+                    "session": session,
+                }
+            # #162 pending-only：quiet 已過期但 READY 尚未經 nonce probe 再確認——
+            # askconsole（prpl/OpenWrt askfirst）停在啟用提示時，第一個命令的 "\n"
+            # 會觸發啟用、stdout 吃到 banner；等 reprobe 引擎的確認 probe（其 "\n"
+            # 順帶消耗 banner）confirm_ready 後才放行。回應形狀與 quiet 分支一致。
+            if session.get("ready_reconfirm_pending"):
+                return None, {
+                    "ok": False,
+                    "error_code": ERROR_AUTOBOOT_QUIET,
+                    "retry_after_s": READY_RECONFIRM_RETRY_S,
+                    "hint": "boot quiet window 已結束但 READY 尚未重新確認；等 daemon 重新確認 READY 後重送",
                     "session": session,
                 }
         return str(session["session_id"]), None

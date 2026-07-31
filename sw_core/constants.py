@@ -147,6 +147,11 @@ ERROR_AUTOBOOT_QUIET: str = "AUTOBOOT_QUIET"
 路徑不受此 gate（#114 刻意進 bootloader 永遠可行）。"""
 BOOT_BANNER_TAIL_CHARS: int = 256
 """banner 偵測用 rolling RX tail 的長度（字元）；跨 chunk 邊界拼接比對。"""
+READY_RECONFIRM_RETRY_S: float = 5.0
+"""pending-only（quiet 已過期、READY 尚未再確認）submit 拒絕的建議重試秒數（#162）。
+
+固定值（裁決 1）＝約 RX idle 前置 ``REPROBE_RX_IDLE_S``（3s）＋一輪 reprobe backoff；
+消費端只當提示，動態值增加契約面而無實益。"""
 
 # 記憶體上限（#81）：防止長壽 daemon 下無界 in-memory 結構成長至 OOM。
 BG_CAPTURE_MAX_BYTES: int = 4 * 1024 * 1024

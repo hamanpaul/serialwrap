@@ -304,17 +304,24 @@ def f9_uboot_readonly_and_console_kept(ctx):
 
 
 def _wait_quiet_cleared(ctx, com: str, *, timeout_s: float) -> tuple[bool, dict]:
-    """等 boot quiet window 真正清空（state=READY 且 ``boot_quiet_remaining_s`` 歸零）。
+    """等 boot quiet window 真正清空（state=READY、``boot_quiet_remaining_s`` 歸零，
+    且 ``ready_reconfirm_pending`` 已被 READY 再確認清除）。
 
     #139 的自發重開機流程 state **全程停留 READY**——``wait_state(READY)`` 對它是
     no-op（首輪驗收實證：誤用它導致 quiet 窗未清就重送、假 FAIL，且級聯污染下一案）。
+    #162 起 quiet 過期不再等於可下命令：agent gate 綁 READY 再確認（nonce probe），
+    須加等 ``ready_reconfirm_pending`` 歸 False（舊 daemon 無此欄位→falsy，向下相容）。
     等待「板子真的可下命令」一律以本函式為準。回傳 (是否清空, 最後一次 session dict)。
     """
     deadline = time.monotonic() + timeout_s
     last: dict = {}
     while time.monotonic() < deadline:
         last = ctx.sw.session(com)
-        if last.get("state") == "READY" and last.get("boot_quiet_remaining_s") is None:
+        if (
+            last.get("state") == "READY"
+            and last.get("boot_quiet_remaining_s") is None
+            and not last.get("ready_reconfirm_pending")
+        ):
             return True, last
         time.sleep(2.0)
     return False, last
