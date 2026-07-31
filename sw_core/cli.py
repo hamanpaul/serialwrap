@@ -672,15 +672,17 @@ def _dispatch_event(args: argparse.Namespace) -> int:
 # 拉低整體 ok（無 systemd 可走 on-demand；無裝置可能只是還沒插線）。
 # other_serialwrap_installs（#154）：純診斷資訊，偵測到多份不同版本安裝也不應
 # 讓整體 doctor 判定失敗——呼應 (b) _warn_version_mismatch 的「勿擋」精神。
-_DOCTOR_ADVISORY_CHECKS = {"systemd", "wsl_systemd", "devices", "other_serialwrap_installs"}
+_DOCTOR_ADVISORY_CHECKS = {"systemd", "wsl_systemd", "devices", "other_serialwrap_installs", "wal_dir"}
 # Windows（#131）：PATH／daemon endpoint／裝置皆 advisory（未起 daemon、exe 未入 PATH
 # 不致命）；pyserial 為 Windows 序列埠後端硬依賴 → 非 advisory。
+# wal_dir（#148）：shell/daemon WAL_DIR 不一致僅 WARN，不拉低整體 ok。
 _DOCTOR_ADVISORY_CHECKS_WIN = {
     "serialwrap_on_path",
     "serialwrapd_on_path",
     "daemon_endpoint",
     "devices",
     "other_serialwrap_installs",
+    "wal_dir",
 }
 
 

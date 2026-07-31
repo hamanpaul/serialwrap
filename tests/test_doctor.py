@@ -6,6 +6,7 @@
   裝置列舉，不再有 dialout／systemd／wsl_systemd／single_daemon。
 - #154：`serialwrapd_on_path` 後新增 `other_serialwrap_installs`（同機多份安裝
   版本一致性診斷），Linux／Windows 兩份清單皆刻意更新（非誤傷）。
+- #148：新增 `wal_dir` 檢查，兩份清單同步更新。
 """
 from __future__ import annotations
 
@@ -28,6 +29,7 @@ LINUX_CHECKS = [
     "systemd",
     "supervision_mode",
     "single_daemon",
+    "wal_dir",
     "devices",
     "wsl_systemd",
 ]
@@ -41,6 +43,7 @@ WINDOWS_CHECKS = [
     "other_serialwrap_installs",
     "supervision_mode",
     "daemon_endpoint",
+    "wal_dir",
     "devices",
 ]
 
@@ -187,23 +190,30 @@ class TestCliAdvisorySets:
             {"check": "other_serialwrap_installs", "ok": False},
             {"check": "supervision_mode", "ok": True},
             {"check": "daemon_endpoint", "ok": False},
+            {"check": "wal_dir", "ok": True},
             {"check": "devices", "ok": False},
         ]
+        assert "wal_dir" in cli._DOCTOR_ADVISORY_CHECKS_WIN
         assert all(
             item["ok"] or item["check"] in cli._DOCTOR_ADVISORY_CHECKS_WIN for item in report
         )
-        report[2]["ok"] = False  # pyserial 掛
+        report[-2]["ok"] = False  # wal_dir 掛（shell/daemon 不一致）仍應被 advisory 吸收
+        assert all(
+            item["ok"] or item["check"] in cli._DOCTOR_ADVISORY_CHECKS_WIN for item in report
+        )
+        report[2]["ok"] = False  # pyserial 掛（非 advisory）
         assert not all(
             item["ok"] or item["check"] in cli._DOCTOR_ADVISORY_CHECKS_WIN for item in report
         )
 
     def test_linux_advisory_set_includes_other_serialwrap_installs(self):
         """#154：新增 other_serialwrap_installs 為 advisory——純診斷資訊，偵測到
-        多份不同版本安裝也不應讓整體 doctor 判定失敗（呼應 (b) 的「勿擋」精神）。"""
+        多份不同版本安裝也不應讓整體 doctor 判定失敗（呼應 (b) 的「勿擋」精神）。
+        #148：wal_dir（shell/daemon WAL_DIR 不一致）亦為 advisory、僅 WARN 不擋。"""
         from sw_core import cli
 
         assert cli._DOCTOR_ADVISORY_CHECKS == {
-            "systemd", "wsl_systemd", "devices", "other_serialwrap_installs",
+            "systemd", "wsl_systemd", "devices", "other_serialwrap_installs", "wal_dir",
         }
 
 
@@ -288,3 +298,55 @@ class TestOtherSerialwrapInstalls:
         )
         run_doctor(fx=fx, platform="linux")
         assert fx.timeouts and all(t == 2.0 for t in fx.timeouts)
+
+
+class TestWalDirCheck:
+    """#148：doctor 印出 daemon 實際生效 WAL_DIR，shell 覆寫不一致時 WARN。"""
+
+    def _item(self, monkeypatch, *, reachable, wal_path=None, env=None, platform="linux"):
+        def _fake_rpc(endpoint, method, params, timeout_s=0.5, **kw):
+            assert method == "health.status"
+            if not reachable:
+                return {"ok": False, "error_code": "SOCKET_ERROR"}
+            return {"ok": True, "wal_path": wal_path}
+        monkeypatch.setattr("sw_core.client.rpc_call", _fake_rpc)
+        monkeypatch.setattr("sw_core.cli._safe_runtime_config", lambda: None)
+        if env is None:
+            monkeypatch.delenv("SERIALWRAP_WAL_DIR", raising=False)
+        else:
+            monkeypatch.setenv("SERIALWRAP_WAL_DIR", env)
+        report = run_doctor(fx=FakeEffects(systemd=True, in_groups={"dialout"}), platform=platform)
+        return next(i for i in report if i["check"] == "wal_dir")
+
+    def test_daemon_unreachable_is_informational_ok(self, monkeypatch):
+        item = self._item(monkeypatch, reachable=False)
+        assert item["ok"] is True
+        assert item["fix"] == ""
+
+    def test_daemon_reachable_no_shell_override_is_ok(self, monkeypatch):
+        # 刻意避開 /home/<user>/ 前綴（R-21 結構偵測器會誤觸個人絕對路徑掃描）。
+        item = self._item(monkeypatch, reachable=True,
+                           wal_path="/srv/serialwrap-state/wal/raw.wal.ndjson")
+        assert item["ok"] is True
+        assert "/srv/serialwrap-state/wal" in item["detail"]
+
+    def test_shell_override_matching_daemon_is_ok(self, monkeypatch):
+        item = self._item(monkeypatch, reachable=True,
+                           wal_path="/srv/custom-wal/raw.wal.ndjson",
+                           env="/srv/custom-wal")
+        assert item["ok"] is True
+
+    def test_shell_override_mismatch_warns_with_systemd_hint(self, monkeypatch):
+        item = self._item(monkeypatch, reachable=True,
+                           wal_path="/srv/serialwrap-state/wal/raw.wal.ndjson",
+                           env="/srv/b-log")
+        assert item["ok"] is False
+        assert "b-log" in item["detail"] and "serialwrap-state/wal" in item["detail"]
+        assert "systemd" in item["fix"] and "Environment=" in item["fix"]
+
+    def test_wal_dir_check_present_in_linux_and_windows_lists(self, monkeypatch):
+        monkeypatch.delenv("SERIALWRAP_WAL_DIR", raising=False)
+        with mock.patch("sw_core.client.rpc_call", lambda *a, **k: {"ok": False}):
+            linux = {i["check"] for i in run_doctor(fx=FakeEffects(systemd=True, in_groups={"dialout"}), platform="linux")}
+            win = {i["check"] for i in run_doctor(fx=FakeEffects(systemd=False, in_groups=set()), platform="win32")}
+        assert "wal_dir" in linux and "wal_dir" in win

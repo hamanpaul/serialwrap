@@ -277,6 +277,65 @@ def _check_devices_windows() -> dict:
     }
 
 
+def _check_wal_dir() -> dict:
+    """WAL 目錄一致性（#148）：印出 daemon 實際生效的 WAL_DIR；shell 端顯式覆寫
+    ``SERIALWRAP_WAL_DIR`` 但與 daemon 回報不一致時 WARN（ok=False，advisory，
+    不拉低整體 ok）。
+
+    daemon 未在跑／連不上時降級為 informational（ok=True）——doctor 常在啟動
+    daemon 前執行，「連不到」本身不是這項檢查要抓的錯誤。RPC 探測沿用其餘
+    advisory 檢查的 0.5s 短逾時、經 ``rpc_call`` 的『永不拋例外』契約
+    （``sw_core/client.py`` 的 ``_rpc_call_once`` 只回 dict、不 raise），故本函式
+    不需要外層 try/except 仍保有 ``run_doctor`` 『永不拋例外』的整體契約。
+    """
+    from sw_core.cli import _local_default_endpoint, _safe_runtime_config  # 延遲匯入避免循環
+    from sw_core.client import rpc_call
+    from sw_core.constants import WAL_DIR as local_wal_dir  # noqa: N811 — 僅供 fallback 顯示
+
+    rc = _safe_runtime_config()
+    cfg_sock = None
+    if rc is not None:
+        try:
+            cfg_sock = rc.socket_path()
+        except Exception:  # noqa: BLE001
+            cfg_sock = None
+    endpoint = cfg_sock or _local_default_endpoint()
+
+    resp = rpc_call(endpoint, "health.status", {}, timeout_s=0.5)
+    if not resp.get("ok") or not resp.get("wal_path"):
+        return {
+            "check": "wal_dir",
+            "ok": True,
+            "detail": f"daemon 未在跑或無法連線，僅顯示本地端解析值：WAL_DIR={local_wal_dir}",
+            "fix": "",
+        }
+
+    daemon_wal_dir = os.path.dirname(str(resp["wal_path"]))
+    shell_override = os.environ.get("SERIALWRAP_WAL_DIR", "").strip()
+    mismatch = bool(shell_override) and (
+        os.path.normpath(os.path.expanduser(shell_override)) != os.path.normpath(daemon_wal_dir)
+    )
+    if mismatch:
+        return {
+            "check": "wal_dir",
+            "ok": False,
+            "detail": f"daemon 實際生效 WAL_DIR={daemon_wal_dir}，與 shell SERIALWRAP_WAL_DIR={shell_override} 不一致",
+            "fix": (
+                "daemon 由 systemd 管理時 unit 不會繼承 shell 匯出的 env（.bashrc 的 export 對它無效）："
+                "需在 unit 加 Environment=SERIALWRAP_WAL_DIR=<path> 後 systemctl daemon-reload "
+                "並 `serialwrap service restart`；on-demand/前景啟動則需在同一個帶該 env 的 shell "
+                "重跑 `serialwrap daemon stop && serialwrap daemon start`。查詢一律以 "
+                "`serialwrap daemon status` 的 wal_path 為準，不要用 shell env 去猜"
+            ),
+        }
+    return {
+        "check": "wal_dir",
+        "ok": True,
+        "detail": f"daemon 實際生效 WAL_DIR={daemon_wal_dir}",
+        "fix": "",
+    }
+
+
 def run_doctor(fx=None, home=None, *, platform: str | None = None) -> list[dict]:
     """執行所有環境檢查並回傳結果清單（每項皆唯讀、永不拋例外）。
 
@@ -307,6 +366,7 @@ def run_doctor(fx=None, home=None, *, platform: str | None = None) -> list[dict]
             _check_other_serialwrap_installs(fx),
             _check_supervision_mode(home),
             _check_daemon_endpoint(),
+            _check_wal_dir(),
             _check_devices_windows(),
         ]
     return [
@@ -319,6 +379,7 @@ def run_doctor(fx=None, home=None, *, platform: str | None = None) -> list[dict]
         _check_systemd(fx),
         _check_supervision_mode(home),
         _check_single_daemon(),
+        _check_wal_dir(),
         _check_devices(),
         _check_wsl_systemd(fx),
     ]

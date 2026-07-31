@@ -471,6 +471,17 @@ latest mode may return fewer than `--limit` records with `truncated=false`;
 read the archive files directly if you need older records (`log tail-*` and
 `wal export` both read the current file only).
 
+`~/b-log` is **not** the WAL — it only holds agent-triggered on-demand session
+captures. The authoritative WAL always lives under `SERIALWRAP_WAL_DIR`
+(default `~/.local/state/serialwrap/wal/`). A shell-exported
+`SERIALWRAP_WAL_DIR` (e.g. in `.bashrc`) only affects processes started from
+that shell; a systemd-managed daemon does **not** inherit it (the generated
+unit carries no such `Environment=` line by default) and keeps writing to its
+own resolved default regardless. Run `serialwrap daemon status`
+(`wal_path`/`mirror_path` fields) or `serialwrap doctor` (new `wal_dir` check,
+warns on shell/daemon mismatch) to see the path the *live* daemon actually
+uses.
+
 ### Windows Support
 
 Windows uses pyserial for `COMx` access and a loopback TCP RPC endpoint instead
@@ -1550,6 +1561,15 @@ DUT 重開機時，U-Boot 的「`Hit any key to stop autoboot`」倒數窗只要
 | 預設 `~/.local/state/serialwrap/state.json`（可由 `SERIALWRAP_STATE_DIR` 覆寫；舊版為 `/tmp/serialwrap/state.json`） | alias 與 binding 持久化 |
 | Agent log `~/b-log/{COM}_{YYMMDD}-{HHMMSS}.log` | Agent 觸發式 per-session 日誌，純文字 RX 內容 |
 
+`~/b-log` **不是** WAL——它只存放 agent 觸發式的 on-demand session capture。權威
+WAL 一律落在 `SERIALWRAP_WAL_DIR`（預設 `~/.local/state/serialwrap/wal/`）。
+在 shell 裡（例如 `.bashrc`）匯出的 `SERIALWRAP_WAL_DIR` 只對從該 shell 啟動的
+行程有效；systemd 託管的 daemon **不會**繼承它（產生的 unit 預設不含對應的
+`Environment=` 那一行），仍會照自己解析出的預設路徑寫下去。要看 *live* daemon
+實際在用的路徑，請跑 `serialwrap daemon status`（`wal_path`／`mirror_path`
+欄位）或 `serialwrap doctor`（新增的 `wal_dir` 檢查，shell/daemon 不一致時
+會 WARN）。
+
 ### Agent 日誌 (log start/stop)
 
 Agent 可對特定 COM port 啟停日誌：
@@ -1630,7 +1650,7 @@ serialwrap wal current-seq
 - `log tail-text` 偏向人類閱讀（`lines` 為純文字行，另附 `from_seq`／`last_seq`／`current_seq`／`returned`／`truncated` metadata，#124）。
 - `log tail-raw` / `wal export` 仍保留完整權威欄位。
 - `log tail-raw` / `log tail-text` 預設為 latest 模式（最新 N 筆）；顯式 `--from-seq N`（含 0）走 range 增量語意（見上方「WAL 查詢」）。
-- 可用 `SERIALWRAP_WAL_DIR` 覆寫 WAL / mirror log 目錄，例如放到 `~/b-log`；這不會改動 daemon socket / lock 的 `RUN_DIR`。
+- 可用 `SERIALWRAP_WAL_DIR` 覆寫 WAL / mirror log 目錄（例如另一顆磁碟或 `~/wal-archive`；**勿**與 agent capture 用的 `~/b-log` 混用，兩者用途不同見上方說明）；這不會改動 daemon socket / lock 的 `RUN_DIR`。systemd 託管的 daemon 不會繼承此 shell env，需寫進 unit 的 `Environment=` 才會生效——`serialwrap doctor` 的 `wal_dir` 檢查會印出實際生效路徑並在不一致時 WARN。
 - `stream tail` 為 legacy alias；新設計優先使用 `cmd result-tail`。
 
 ## 跨平台序列埠與 Windows human console（#84 PORT-1/PORT-2）

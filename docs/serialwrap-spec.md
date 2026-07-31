@@ -511,7 +511,7 @@ DUT 重開機時，U-Boot autoboot 倒數窗（`Hit any key to stop autoboot`）
 - 接近透明 console 視角
 - 不附帶每行 metadata prefix
 
-預設目錄是 `/tmp/serialwrap/wal/`。若只想改 WAL / mirror log 的位置，可設定 `SERIALWRAP_WAL_DIR`（例如 `~/b-log`）；這不會改動 daemon socket / lock 的 runtime 目錄。
+預設目錄是 XDG state home 下的 `~/.local/state/serialwrap/wal/`（可用 `SERIALWRAP_WAL_DIR` 覆寫；舊版預設為 `/tmp/serialwrap/wal/`）。**`~/b-log` 是 §10.4 的 agent on-demand capture 位置，不是 WAL**，勿把 `SERIALWRAP_WAL_DIR` 指到那裡。systemd 託管的 daemon 不繼承 shell 匯出的 env（unit 預設不含對應 `Environment=`），改這個變數對已在跑的 systemd daemon 無效；`serialwrap doctor` 的 `wal_dir` 檢查會印出 daemon 實際生效路徑，並在 shell 端有覆寫卻與其不一致時 WARN。
 
 ### 10.4 Agent per-session capture
 
