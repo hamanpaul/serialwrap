@@ -965,11 +965,17 @@ class SerialwrapService:
             selector = str(params.get("selector") or "")
             local_path = str(params.get("local_path") or "")
             remote_path = str(params.get("remote_path") or "")
-            # max(1, ...) 防呆：chunk_size<=0 會讓 _split_chunks 的 range(step=0)
-            # 丟未捕捉 ValueError 穿越 RPC 邊界（違反本 repo RPC 慣例）。
-            chunk_size = max(1, int(params.get("chunk_size") or DEFAULT_CHUNK_SIZE))
-            chunk_timeout_raw = params.get("chunk_timeout_s")
-            chunk_timeout_s = float(chunk_timeout_raw) if chunk_timeout_raw is not None else None
+            # 轉型全包 try（Copilot review）：非數字/空字串的 chunk_size／chunk_timeout_s
+            # 不得讓 ValueError/TypeError 穿越 RPC 邊界；max(1, ...) 防 _split_chunks
+            # 的 range(step=0)。
+            try:
+                chunk_size = max(1, int(params.get("chunk_size") or DEFAULT_CHUNK_SIZE))
+                chunk_timeout_raw = params.get("chunk_timeout_s")
+                chunk_timeout_s = (
+                    float(chunk_timeout_raw) if chunk_timeout_raw is not None else None
+                )
+            except (TypeError, ValueError):
+                return {"ok": False, "error_code": "INVALID_ARGS"}
             source = str(params.get("source") or "agent")
             if not selector or not local_path or not remote_path:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
@@ -989,8 +995,13 @@ class SerialwrapService:
             selector = str(params.get("selector") or "")
             remote_path = str(params.get("remote_path") or "")
             local_path = params.get("local_path")
-            chunk_timeout_raw = params.get("chunk_timeout_s")
-            chunk_timeout_s = float(chunk_timeout_raw) if chunk_timeout_raw is not None else None
+            try:  # 同 file.push：轉型例外不得穿越 RPC 邊界（Copilot review）
+                chunk_timeout_raw = params.get("chunk_timeout_s")
+                chunk_timeout_s = (
+                    float(chunk_timeout_raw) if chunk_timeout_raw is not None else None
+                )
+            except (TypeError, ValueError):
+                return {"ok": False, "error_code": "INVALID_ARGS"}
             source = str(params.get("source") or "agent")
             if not selector or not remote_path:
                 return {"ok": False, "error_code": "INVALID_ARGS"}

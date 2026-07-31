@@ -166,6 +166,25 @@ class TestServiceRpcParams(unittest.TestCase):
         m.assert_called_once()
         return m
 
+    def test_push_invalid_chunk_timeout_returns_invalid_args(self) -> None:
+        """Copilot review：非數字 chunk_timeout_s 不得讓 ValueError 穿越 RPC 邊界。"""
+        base = {"selector": "COM0", "local_path": "/tmp/a", "remote_path": "/tmp/b"}
+        resp = self.svc.rpc("file.push", {**base, "chunk_timeout_s": "abc"})
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error_code"], "INVALID_ARGS")
+
+    def test_push_invalid_chunk_size_returns_invalid_args(self) -> None:
+        base = {"selector": "COM0", "local_path": "/tmp/a", "remote_path": "/tmp/b"}
+        resp = self.svc.rpc("file.push", {**base, "chunk_size": "xyz"})
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error_code"], "INVALID_ARGS")
+
+    def test_pull_invalid_chunk_timeout_returns_invalid_args(self) -> None:
+        resp = self.svc.rpc("file.pull", {"selector": "COM0", "remote_path": "/tmp/b",
+                                          "chunk_timeout_s": ""})
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error_code"], "INVALID_ARGS")
+
     def test_push_defaults(self) -> None:
         """不帶 chunk_size/chunk_timeout_s → DEFAULT_CHUNK_SIZE／None。"""
         m = self._rpc_push({})
