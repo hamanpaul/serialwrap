@@ -50,8 +50,13 @@ def test_plugin_execute_step_always_success():
     assert '"success": False' not in text
 
 
-def test_testbed_example_loads_with_boards():
-    cfg = core.load_testbed(PLUGIN_ROOT / "testbed.yaml.example")
+def test_testbed_example_loads_with_boards(tmp_path):
+    # 複製到隔離目錄再載入：plugin 目錄若存在本機 testbed.yaml（bench 實跑產物、
+    # gitignored）會覆蓋 example，直接原地載入會讓本測試依環境浮動。
+    example = tmp_path / "testbed.yaml.example"
+    example.write_text((PLUGIN_ROOT / "testbed.yaml.example").read_text(encoding="utf-8"),
+                       encoding="utf-8")
+    cfg = core.load_testbed(example)
     assert cfg["allow_destructive"] is False
     coms = [b["com"] for b in cfg["boards"]]
     assert coms == ["COM0", "COM1"]

@@ -18,80 +18,61 @@ def _case(id, title, issues, hints=(), requires=(), destructive=False):
 
 
 @_case(
-    "f8-foreign-holder-reported",
-    "外部 tty 持有者被動偵測（真 foreign holder 開/關）",
+    "f8-tty-holders-reported",
+    "daemon status 正確回報各板 tty 持有者（#101 被動偵測基線）",
     issues=("#101", "#53"),
     hints=(
-        "broker console（serialwrap-minicom）持的是 PTY、不是 UART tty——#101 的 foreign holder"
-        "指『直接開真實 tty 的外部行程』，故本 case 以 O_RDONLY|O_NONBLOCK 開 tty fd（不讀不寫、"
-        "不消耗 bytes）扮演 foreign holder。",
-        "baseline 的 foreign_holders 本就含 daemon 自身持有的 tty——oracle 用『新 pid 出現/消失』"
-        "的相對變化，不判空。",
+        "首輪實測教訓：`detect_multi_open()` 只掃 `_is_serialwrapd()` 判定的 serialwrapd 行程"
+        "之 fd——任意外部行程（python O_RDONLY 開 tty）不在 #101 的偵測範圍，勿以此設計 oracle；"
+        "泛用外部持有者偵測屬新需求、非回歸標的。",
+        "健康基線＝每板真實 tty（realpath of device_by_id）在 foreign_holders 映射到主 daemon"
+        " pid（唯一 reader），且 doctor 的 single_daemon 檢查一致。",
     ),
 )
-def f8_foreign_holder_reported(ctx):
-    """以非阻塞唯讀 fd 短暫持有真實 tty，驗 foreign_holders 回報該 pid、釋放後消失（#101 #53）。"""
+def f8_tty_holders_reported(ctx):
+    """#101 被動偵測契約基線：foreign_holders 須正確映射每板 tty→serialwrapd 持有者 pid，
+    doctor 的 single_daemon 與之一致。偵測面壞掉（掃描失效、映射空缺、pid 錯置）即回歸。"""
     import os
-    import subprocess
 
-    com = ctx.cfg["boards"][0]["com"]
-    sess = ctx.sw.session(com)
-    ctx.note("session.json", str(sess))
-    by_id = sess.get("device_by_id") or ""
-    dev = os.path.realpath(by_id) if by_id else ""
-    if not (dev.startswith("/dev/") and os.path.exists(dev)):
-        return CaseResult("SKIP", reason=f"無法從 session 解析 tty 裝置路徑（device_by_id={by_id!r}）",
-                          category="environment", reason_code="device_path_unresolved")
+    status = ctx.sw.run("daemon", "status")
+    ctx.note("daemon-status.json", str(status))
+    holders = status.get("foreign_holders") or {}
+    daemon_pid = status.get("pid")
+    if not daemon_pid:
+        return CaseResult("FAIL", reason="daemon status 未回 pid，無法比對持有者",
+                          category="test", reason_code="daemon_pid_missing")
 
-    before = ctx.sw.run("daemon", "status")
-    ctx.note("daemon-status-before.json", str(before))
-
-    # foreign holder：開 fd 後純 sleep——不 read/write、不動 termios，對線路零干擾。
-    holder = subprocess.Popen(
-        ["python3", "-c",
-         f"import os,time; os.open({dev!r}, os.O_RDONLY | os.O_NONBLOCK); time.sleep(30)"],
-    )
-    try:
-        detected = False
-        deadline = time.monotonic() + 15
-        during = {}
-        while time.monotonic() < deadline:
-            during = ctx.sw.run("daemon", "status")
-            holders = during.get("foreign_holders") or {}
-            if any(int(pid) == holder.pid for pid in holders.values()):
-                detected = True
-                break
-            time.sleep(2)
-        ctx.note("daemon-status-during.json", str(during))
-        if not detected:
+    for board in ctx.cfg["boards"]:
+        com = board["com"]
+        sess = ctx.sw.session(com)
+        by_id = sess.get("device_by_id") or ""
+        dev = os.path.realpath(by_id) if by_id else ""
+        if not (dev.startswith("/dev/") and os.path.exists(dev)):
+            return CaseResult("SKIP", reason=f"{com} 無法解析 tty 路徑（device_by_id={by_id!r}）",
+                              category="environment", reason_code="device_path_unresolved")
+        if dev not in holders:
             return CaseResult(
                 "FAIL",
-                reason=f"外部行程（pid={holder.pid}）持有 {dev} 期間 foreign_holders 未回報它（#101/#53 回歸）",
-                category="test", reason_code="foreign_holder_not_reported",
+                reason=f"{com} 的 tty（{dev}）未出現在 foreign_holders（#101 回歸：持有者掃描失效）",
+                category="test", reason_code="tty_holder_not_reported",
             )
-    finally:
-        holder.terminate()
-        try:
-            holder.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            holder.kill()  # terminate 未果就硬殺，絕不留 rogue 持有者
-            holder.wait(timeout=5)
+        if int(holders[dev]) != int(daemon_pid):
+            return CaseResult(
+                "FAIL",
+                reason=f"{com} 的 tty 持有者 pid={holders[dev]} ≠ 主 daemon pid={daemon_pid}"
+                "（#101 回歸：持有者歸屬錯置，或存在未偵測的 two-reader）",
+                category="test", reason_code="tty_holder_wrong_pid",
+            )
 
-    # 釋放後：該 pid 不得殘留（stale）。
-    gone = False
-    deadline = time.monotonic() + 15
-    after = {}
-    while time.monotonic() < deadline:
-        after = ctx.sw.run("daemon", "status")
-        holders = after.get("foreign_holders") or {}
-        if not any(int(pid) == holder.pid for pid in holders.values()):
-            gone = True
-            break
-        time.sleep(2)
-    ctx.note("daemon-status-after.json", str(after))
-    if not gone:
-        return CaseResult("FAIL", reason=f"foreign holder 結束後 foreign_holders 仍列 pid={holder.pid}（stale，#53 回歸）",
-                          category="test", reason_code="foreign_holder_stale")
+    doc = ctx.sw.run("doctor")
+    ctx.note("doctor.json", str(doc))
+    single = next((c for c in (doc.get("checks") or []) if c.get("check") == "single_daemon"), {})
+    if not single.get("ok"):
+        return CaseResult(
+            "FAIL",
+            reason=f"doctor single_daemon 檢查未過（{single!r}），與 daemon status 偵測不一致",
+            category="test", reason_code="doctor_single_daemon_inconsistent",
+        )
     return CaseResult("PASS")
 
 

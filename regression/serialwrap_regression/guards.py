@@ -107,11 +107,15 @@ _TA_ENV_DIRS: tuple[str, ...] = (
 )
 
 
-def throwaway_env(workdir: Path, by_id_dir: Path) -> dict[str, str]:
-    """組 throwaway daemon 的隔離 env（純函式）：全部目錄壓進 workdir 下、by-id 指 sandbox。"""
+def throwaway_env(workdir: Path, by_id_dir: Path, run_dir: Path) -> dict[str, str]:
+    """組 throwaway daemon 的隔離 env（純函式）：state/wal/config/profiles 壓進 workdir、
+    by-id 指 sandbox；**RUN_DIR 必須是獨立短路徑**——socket 落在 RUN_DIR 下，AF_UNIX
+    `sun_path` 上限 107 字元，workdir 巢狀在 report 目錄樹（`~/b-log/regression-reports/
+    tp-<ts>/<case-id>/ta/`）下必然超限（首輪實測 108/111 字元必現 OSError）。
+    """
     env = dict(os.environ)
     mapping = {
-        "SERIALWRAP_RUN_DIR": workdir / "run",
+        "SERIALWRAP_RUN_DIR": run_dir,
         "SERIALWRAP_STATE_DIR": workdir / "state",
         "SERIALWRAP_WAL_DIR": workdir / "wal",
         "SERIALWRAP_BY_ID_DIR": by_id_dir,
@@ -138,15 +142,20 @@ class ThrowawayDaemon:
         self._profile_yaml = profile_yaml
         self._env: dict[str, str] = {}
         self._proc_pgid: int | None = None
+        self._run_dir: Path | None = None
 
     def __enter__(self) -> "ThrowawayDaemon":
-        for sub in ("run", "state", "wal", "config", "profiles"):
+        import tempfile
+
+        for sub in ("state", "wal", "config", "profiles"):
             (self._workdir / sub).mkdir(parents=True, exist_ok=True)
         self._by_id_dir.mkdir(parents=True, exist_ok=True)
         (self._workdir / "profiles" / "default.yaml").write_text(
             self._profile_yaml, encoding="utf-8"
         )
-        self._env = throwaway_env(self._workdir, self._by_id_dir)
+        # RUN_DIR 用 /tmp 下短路徑（socket 的 AF_UNIX 107 字元上限，見 throwaway_env docstring）。
+        self._run_dir = Path(tempfile.mkdtemp(prefix="swreg-ta-", dir="/tmp"))
+        self._env = throwaway_env(self._workdir, self._by_id_dir, self._run_dir)
         daemon_exe = str(Path(self._exe).with_name("serialwrapd"))
         log = open(self._workdir / "daemon.log", "ab")
         proc = subprocess.Popen(
@@ -205,7 +214,11 @@ class ThrowawayDaemon:
                 os.killpg(self._proc_pgid, 15)
             except (ProcessLookupError, PermissionError):
                 pass
-        # workdir 保留當 evidence，不刪。
+        # workdir（state/wal/daemon.log）保留當 evidence；短路徑 run dir 清掉不留 socket。
+        if self._run_dir is not None:
+            import shutil
+
+            shutil.rmtree(self._run_dir, ignore_errors=True)
 
 
 def sh_quote(text: str) -> str:

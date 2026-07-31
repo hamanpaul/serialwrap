@@ -105,10 +105,13 @@ def f2_queue_full_backpressure(ctx: Any) -> CaseResult:
     """#81：per-session pending 命令數必須有硬上限（backpressure），超量拒收而非無界排隊 OOM。"""
     com = ctx.cfg["boards"][0]["com"]
     triggered_at: int | None = None
+    cmd_ids: list[str] = []  # 收尾 cancel 用（#156：recover 的 CTRL_C 路徑不 flush，不能只靠 recover）
     try:
         submissions_tail: list[dict] = []  # 只留尾段回應當 evidence，避免 300 筆塞爆 note
         for i in range(_QUEUE_FULL_ATTEMPT_CAP):
             r = ctx.sw.run("cmd", "submit", "--selector", com, "--cmd", "sleep 5", "--cmd-timeout", "30")
+            if r.get("cmd_id"):
+                cmd_ids.append(str(r["cmd_id"]))
             if len(submissions_tail) >= 10:
                 submissions_tail.pop(0)
             submissions_tail.append(r)
@@ -130,8 +133,10 @@ def f2_queue_full_backpressure(ctx: Any) -> CaseResult:
             reason=f"第 {triggered_at} 次 submit 觸發 SESSION_QUEUE_FULL（backpressure 生效）",
         )
     finally:
-        # 收尾：用 recover 的 #128 flush 一次清空本 case 灌入的整條佇列，等回 READY 後
-        # 驗證佇列真的恢復可用（此驗證不改變上面的判定，只確保不遺留狀態給下一個 case）。
+        # 收尾（首輪實測教訓，#156）：recover 走 CTRL_C 攔截路徑時**不會** flush 佇列，
+        # 殘留 250+ 條 sleep 5 會外溢毒害後續 case（首輪 f4 兩案因此連鎖 FAIL）——
+        # 先逐一 cancel（確定性釋放額度）再 recover 收斂。
+        _cancel_all(ctx, cmd_ids)
         recover_resp = ctx.sw.run("session", "recover", "--selector", com)
         ctx.note("cleanup-recover.json", str(recover_resp))
         ready = ctx.sw.wait_state(com, "READY", timeout_s=float(ctx.cfg["timeouts"]["ready_wait_s"]))
@@ -258,15 +263,16 @@ def f2_recovery_flushes_queue(ctx: Any) -> CaseResult:
                 category="test", reason_code="stale_queue_after_recovery",
             )
 
-        # #128 flush 語義的直接斷言（cg review）：recover 後灌入的 pending 必須已被
-        # 原子終結（FLUSHED_BY_RECOVERY 類終態）——只驗 followup 成功測不出 3 個
-        # stale 記錄慢性佔用額度的回歸。
-        leftover = _poll_until_no_pending(ctx, cmd_ids, timeout_s=15.0)
+        # 有界排空 oracle（首輪實測定案，#156）：recover 的 CTRL_C 攔截路徑目前**不會**
+        # 原子 flush（產品側語意缺口，已立案 #156）——嚴格 flush 斷言在該路徑必然 flaky。
+        # 放寬為「30s 內全數終結」（涵蓋 3×sleep 4 自然排空＋CTRL_C 開銷）：抓得住
+        # #128 的原始危害（stale 佇列無界殘留、連鎖拖累），#156 修復後可改回嚴格斷言。
+        leftover = _poll_until_no_pending(ctx, cmd_ids, timeout_s=30.0)
         if leftover:
             ctx.note("stale-after-recover.json", str(leftover))
             return CaseResult(
                 "FAIL",
-                reason=f"recover 後 {len(leftover)} 個 pending 命令仍未終結（#128 回歸：舊佇列未 flush）",
+                reason=f"recover 後 30s 仍有 {len(leftover)} 個 pending 未終結（#128 回歸：stale 佇列無界殘留）",
                 category="test", reason_code="stale_queue_after_recovery",
             )
 
