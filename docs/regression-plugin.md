@@ -76,6 +76,15 @@ doctor 全綠、testbed 板卡 READY、tmux/minicom 存在、無殘留 throwaway
 - **一律拒送（raise）**：`saveenv`、`env save`、`env default`、`setenv`（任何變數）、flash 寫入（`sf`/`nand`/`mmc write`）、`tftpboot`、任何串接（`;`／換行／`&&`／`|`）。
 - 每個 F9 case 收尾必經 `guards.ensure_ready`——板子回 READY 才回報 verdict，不得留在 U-Boot prompt。
 
+## 目前已知紅燈／SKIP（2026-07-31 首日三輪實測基準）
+
+| case | 狀態 | 原因 |
+|---|---|---|
+| `f4-background-result-tail-consistent` | **FAIL（刻意保留的紅燈哨兵）** | #159：background quiet-window 對快速完成命令整段吞輸出且回 `lost: False`——case 正確抓到產品缺陷，**勿改 oracle 遷就**；#159 修復即轉綠 |
+| `f7-binary-roundtrip-md5`／`f7-larger-file-not-truncated` | SKIP（`transfer_timeout`） | #157：`file.push` per-chunk timeout 寫死 10s＋長單行 chunk 真機易截斷；修復後轉有效防線 |
+
+另有已立案的產品側觀察：#156（recover CTRL_C 路徑不 flush 佇列，f2-recovery 已放寬為 30s 有界排空）、#158（快速迴圈偶發 PROMPT_TIMEOUT，f2-history 容忍 ≤3 次）。各 issue 修復後可收緊對應 oracle。
+
 ## 從新修好的 bug 新增 case（SOP）
 
 > CLAUDE.md「回歸 case 政策」：修 bug issue 時必須評估歸屬——pytest 可覆蓋→pytest；需實機才驗得到→本 plugin。PR 描述記錄評估結論。

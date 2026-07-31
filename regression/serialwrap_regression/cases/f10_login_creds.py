@@ -206,7 +206,18 @@ def _wait_state(ta: guards.ThrowawayDaemon, com: str, want: str, *,
     return last
 
 
-def _wait_credentials_unresolved(ta: guards.ThrowawayDaemon, *, timeout_s: float) -> dict[str, Any]:
+def _ta_com(listing: dict[str, Any]) -> str:
+    """取 throwaway 唯一動態 session 的實際 COM 編號。
+
+    round 3 實測教訓：sandbox 只有一條線，但動態編號**不保證是 COM0**（該輪拿到 COM1，
+    硬編碼 COM0 → SESSION_NOT_FOUND 假陽性）——一律從 listing 動態解析。
+    """
+    sessions = listing.get("sessions") or [{}]
+    return str(sessions[0].get("com") or "COM0")
+
+
+def _wait_credentials_unresolved(ta: guards.ThrowawayDaemon, com: str, *,
+                                 timeout_s: float) -> dict[str, Any]:
     """輪詢 sandbox ``session list``，等 ``last_error`` 落地 ``CREDENTIALS_UNRESOLVED``。
 
     回傳 ``{"found": bool, "listing": dict}``（``listing`` 為最後一次 ``session list`` 回應，
@@ -216,7 +227,7 @@ def _wait_credentials_unresolved(ta: guards.ThrowawayDaemon, *, timeout_s: float
     listing: dict[str, Any] = {}
     while time.monotonic() < deadline:
         listing = ta.run("session", "list")
-        if _session_by_com(listing, "COM0").get("last_error") == "CREDENTIALS_UNRESOLVED":
+        if _session_by_com(listing, com).get("last_error") == "CREDENTIALS_UNRESOLVED":
             return {"found": True, "listing": listing}
         time.sleep(2.0)
     return {"found": False, "listing": listing}
@@ -333,10 +344,11 @@ def f10_unresolved_creds_terminal(ctx: Any) -> CaseResult:
                         evidence={"listing_initial": "ta-session-list-initial.json"},
                     )
                 else:
-                    attach = ta.run("session", "attach", "--selector", "COM0", timeout=60)
+                    ta_com = _ta_com(listing0)  # 動態解析，勿硬編碼 COM0（round 3 教訓）
+                    attach = ta.run("session", "attach", "--selector", ta_com, timeout=60)
                     attach_note = ctx.note("ta-attach.json", str(attach))
 
-                    poll = _wait_credentials_unresolved(ta, timeout_s=60.0)
+                    poll = _wait_credentials_unresolved(ta, ta_com, timeout_s=60.0)
                     listing_note = ctx.note("ta-session-list-after-attach.json", str(poll["listing"]))
                     terminal = (attach.get("error_code") == "CREDENTIALS_UNRESOLVED") or poll["found"]
 
@@ -353,7 +365,7 @@ def f10_unresolved_creds_terminal(ctx: Any) -> CaseResult:
                         time.sleep(20)
                         listing2 = ta.run("session", "list")
                         listing2_note = ctx.note("ta-session-list-plus20s.json", str(listing2))
-                        sess2 = _session_by_com(listing2, "COM0")
+                        sess2 = _session_by_com(listing2, ta_com)
                         if sess2.get("last_error") != "CREDENTIALS_UNRESOLVED" or sess2.get("state") == "ATTACHING":
                             result = CaseResult(
                                 "FAIL",
@@ -476,10 +488,11 @@ def f10_creds_fixed_then_ready(ctx: Any) -> CaseResult:
                         evidence={"listing_initial": "ta-session-list-initial.json"},
                     )
                 else:
-                    attach = ta.run("session", "attach", "--selector", "COM0", timeout=60)
+                    ta_com = _ta_com(listing0)  # 動態解析，勿硬編碼 COM0（round 3 教訓）
+                    attach = ta.run("session", "attach", "--selector", ta_com, timeout=60)
                     attach_note = ctx.note("ta-attach.json", str(attach))
 
-                    sess = _wait_state(ta, "COM0", "READY", timeout_s=60.0)
+                    sess = _wait_state(ta, ta_com, "READY", timeout_s=60.0)
                     sess_note = ctx.note("ta-session-after-wait.json", str(sess))
                     if sess.get("state") != "READY":
                         wal_text = ta.wal_text()
