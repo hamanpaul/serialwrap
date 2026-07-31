@@ -2,7 +2,7 @@
 
 ## Context
 
-#155 已完成 62 個 closed issue 盤點與四項裁示，定案 10 個 Scenario Family（F1–F10）。既有基礎：realhw（Case/CaseResult、preflight、benchlock、drivers）與 serialwrap-reliability plugin（testpilot 薄殼模式、三大契約陷阱實證）。bench：COM0=prpl（BGW720，U-Boot 2024.04、autoboot 3s 已實證）、COM1=bcm；部署版 serialwrap 0.2.4；testpilot venv 現綁 stale 0.2.1（#154，OPEN）。權威設計全文見 `docs/superpowers/specs/2026-07-31-testpilot-regression-plugin-design.md`。
+#155 已完成 62 個 closed issue 盤點與四項裁示，定案 10 個 Scenario Family（F1–F10）。既有基礎：realhw（Case/CaseResult、preflight、benchlock、drivers）與 serialwrap-reliability plugin（testpilot 薄殼模式、三大契約陷阱實證）。bench：COM0=prpl（U-Boot 2024.04、autoboot 3s 已實證）、COM1=bcm；部署版 serialwrap 0.2.4；testpilot venv 現綁 stale 0.2.1（#154，OPEN）。權威設計全文見 `docs/superpowers/specs/2026-07-31-testpilot-regression-plugin-design.md`。
 
 ## Goals / Non-Goals
 

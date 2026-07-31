@@ -127,7 +127,7 @@ oracle 一律＝「當初的錯誤行為不得再現」。預估 29–31 cases�
 | F9 開機/U-Boot〔P0〕 | #69 #130 #44 #14 #20 | reboot 後 3s autoboot 窗內 daemon 不送 system probe、板子不卡 `=>`；quiet window 不擋 human bytes／agent 顯式命令；開機中 attach 失敗須自動 reprobe 終回 READY；U-Boot 停留不踢 human console；reboot 後 recover 語義可靠；收尾必回 READY | **是（reboot）** |
 | F10 登入帳密〔P1〕 | #140 #19 | 帳密解析空→`CREDENTIALS_UNRESOLVED` 終態、不送空帳密敲 login、reprobe 不重試；補帳密後 attach 正常；bcm 登入路徑有可診斷錯誤 | **是（throwaway＋release）** |
 
-bench 基準（#155 盤點）：COM0=prpl（BGW720，U-Boot 2024.04、autoboot 3s 已實證）、COM1=bcm；只測這兩平台，shell/passthrough/Airoha 情境不納入。COM1 的 U-Boot 具備性於首次 reboot 時確認，沒有就該 case 對 COM1 SKIP。
+bench 基準（#155 盤點）：COM0=prpl（U-Boot 2024.04、autoboot 3s 已實證）、COM1=bcm；只測這兩平台，shell/passthrough/Airoha 情境不納入。COM1 的 U-Boot 具備性於首次 reboot 時確認，沒有就該 case 對 COM1 SKIP。
 
 ## preflight（重用＋擴充）
 

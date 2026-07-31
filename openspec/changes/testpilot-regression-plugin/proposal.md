@@ -28,5 +28,5 @@ serialwrap 已有 1300+ pytest（mock/PTY）與 serialwrap-reliability 穩定性
 - 新目錄 `regression/`（獨立 hatchling dist，entry-point `testpilot.plugins`）；不動 release wheel。
 - `realhw/drivers.py`（SwCli 建構子小改，向後相容）。
 - `README.md`、`docs/regression-plugin.md`、`CLAUDE.md`、`.github/pull_request_template.md`、`tests/`。
-- 執行期依賴 bench：COM0=prpl（BGW720）、COM1=bcm 兩板、部署版 serialwrap 0.2.4、benchlock 與 reliability／wifi_llapi 互斥。
+- 執行期依賴 bench：COM0=prpl、COM1=bcm 兩板、部署版 serialwrap 0.2.4、benchlock 與 reliability／wifi_llapi 互斥。
 - ops（非 repo 程式碼）：testpilot venv serialwrap 0.2.1→0.2.4 升級，記錄於 #154。

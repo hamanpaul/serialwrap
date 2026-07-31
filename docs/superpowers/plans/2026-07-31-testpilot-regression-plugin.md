@@ -22,7 +22,7 @@
 - 每 task 完成即 commit（繁中 Conventional Commits＋`Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>` trailer）。
 - 已知 flaky（非本案破壞）：`test_multiagent_e2e::test_five_agents_three_rounds_no_conflict`、`test_human_agent_coexist` 的 t1/t2/t8。
 
-**既有事實（勿再考古）：** error codes `CMD_TOO_LONG`/`CMD_CONTAINS_NEWLINE`/`CMD_LENGTH_WARNING`/`CMD_NOT_FOUND`/`SESSION_QUEUE_FULL`/`CREDENTIALS_UNRESOLVED`（`sw_core/arbiter.py`、`sw_core/constants.py`）；`daemon status` 回 `limits.max_submit_cmd_bytes`/`warn_submit_cmd_bytes` 與 `multi_open`/`foreign_holders`；CLI 有 `session activity`/`console-list`/`interactive-*`/`cmd result-tail`/`log tail-raw|tail-text`/`file push|pull`/`device release`；0.2.4 失敗時 stderr 有 `serialwrap: <method> failed: <CODE>` 一行。bench：COM0=prpl（BGW720、U-Boot 2024.04、autoboot 3s）、COM1=bcm；COM1 U-Boot 具備性未確認（case 內偵測、無則 SKIP）。
+**既有事實（勿再考古）：** error codes `CMD_TOO_LONG`/`CMD_CONTAINS_NEWLINE`/`CMD_LENGTH_WARNING`/`CMD_NOT_FOUND`/`SESSION_QUEUE_FULL`/`CREDENTIALS_UNRESOLVED`（`sw_core/arbiter.py`、`sw_core/constants.py`）；`daemon status` 回 `limits.max_submit_cmd_bytes`/`warn_submit_cmd_bytes` 與 `multi_open`/`foreign_holders`；CLI 有 `session activity`/`console-list`/`interactive-*`/`cmd result-tail`/`log tail-raw|tail-text`/`file push|pull`/`device release`；0.2.4 失敗時 stderr 有 `serialwrap: <method> failed: <CODE>` 一行。bench：COM0=prpl（U-Boot 2024.04、autoboot 3s）、COM1=bcm；COM1 U-Boot 具備性未確認（case 內偵測、無則 SKIP）。
 
 ---
 
