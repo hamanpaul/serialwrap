@@ -43,17 +43,39 @@ _TIMEOUT_CODES = frozenset({
 })
 
 
-def _tool_missing_skip(resp: dict[str, Any]) -> CaseResult | None:
-    """push/pull 回應含 base64／md5sum 缺失徵兆時判 SKIP；否則回 None 讓呼叫端續走。"""
-    code = str(resp.get("error_code") or "")
+def _probe_target_tools(ctx: Any, com: str) -> bool | None:
+    """實測板端是否具備 base64＋md5sum：True＝都在、False＝缺、None＝探測本身失敗。
+
+    區分 cg review 抓到的雙重含義：``CHECKSUM_VERIFY_FAILED``／``BASE64_DECODE_FAILED``
+    既可能是板端缺工具（環境、SKIP），也可能是工具都在但傳輸真的壞掉（#32 類回歸、FAIL）。
+    先探測工具存在性，後續判定才能分流。
+    """
+    probe = ctx.sw.submit_and_wait(
+        com, "command -v base64 >/dev/null && command -v md5sum >/dev/null && echo TOOLS_OK")
+    ctx.note("tools-probe.json", str(probe))
+    if probe.get("status") != "done":
+        return None
+    return "TOOLS_OK" in (probe.get("stdout") or "")
+
+
+def _transfer_failure_verdict(resp: dict[str, Any], *, verb: str,
+                              tools_present: bool | None) -> CaseResult:
+    """push/pull 非 ok 的統一分流：逾時／連線層→環境 SKIP；工具徵兆碼→依探測結果分流
+    （工具在＝#32 類真回歸 FAIL；工具不在或未知＝環境 SKIP）；其餘明確失敗→環境 SKIP。"""
+    code = str(resp.get("error_code") or "unknown")
     if code in _TOOL_MISSING_CODES:
+        if tools_present is True:
+            return CaseResult(
+                "FAIL",
+                reason=f"{verb} 失敗（error_code={code}）且板端 base64/md5sum 皆在"
+                       "——非工具缺失，屬傳輸損壞（#32 類回歸）",
+                category="test", reason_code="binary_roundtrip_mismatch",
+            )
         return CaseResult(
-            "SKIP",
-            reason=f"板端疑缺 base64／md5sum（error_code={code}）",
-            category="environment",
-            reason_code="target_tool_missing",
+            "SKIP", reason=f"板端疑缺 base64／md5sum（error_code={code}，工具探測={tools_present}）",
+            category="environment", reason_code="target_tool_missing",
         )
-    return None
+    return _environment_skip(resp, verb=verb)
 
 
 def _environment_skip(resp: dict[str, Any], *, verb: str) -> CaseResult:
@@ -116,19 +138,20 @@ def f7_binary_roundtrip_md5(ctx):
     dst_path = ctx.case_dir / "f7-rt-dst.bin.gz"
     src_path.write_bytes(payload)
     try:
+        tools_present = _probe_target_tools(ctx, com)
+        if tools_present is False:
+            return CaseResult("SKIP", reason="板端缺 base64／md5sum（探測確認）",
+                              category="environment", reason_code="target_tool_missing")
+
         push = _push(ctx, com, src_path, remote_path, rpc_timeout_s=90, proc_timeout_s=110)
         ctx.note("push.json", str(push))
         if not push.get("ok"):
-            return _tool_missing_skip(push) or CaseResult(
-                "FAIL", reason=f"push 未完成：error_code={push.get('error_code')}",
-                category="test", reason_code="binary_roundtrip_mismatch")
+            return _transfer_failure_verdict(push, verb="push", tools_present=tools_present)
 
         pull = _pull(ctx, com, remote_path, dst_path, rpc_timeout_s=90, proc_timeout_s=110)
         ctx.note("pull.json", str(pull))
         if not pull.get("ok"):
-            return _tool_missing_skip(pull) or CaseResult(
-                "FAIL", reason=f"pull 未完成：error_code={pull.get('error_code')}",
-                category="test", reason_code="binary_roundtrip_mismatch")
+            return _transfer_failure_verdict(pull, verb="pull", tools_present=tools_present)
 
         md5_src = hashlib.md5(payload).hexdigest()
         md5_dst = hashlib.md5(dst_path.read_bytes()).hexdigest()
@@ -152,15 +175,20 @@ def f7_larger_file_not_truncated(ctx):
     dst_path = ctx.case_dir / "f7-big-dst.bin"
     src_path.write_bytes(payload)
     try:
+        tools_present = _probe_target_tools(ctx, com)
+        if tools_present is False:
+            return CaseResult("SKIP", reason="板端缺 base64／md5sum（探測確認）",
+                              category="environment", reason_code="target_tool_missing")
+
         push = _push(ctx, com, src_path, remote_path, rpc_timeout_s=120, proc_timeout_s=140)
         ctx.note("push.json", str(push))
         if not push.get("ok"):
-            return _tool_missing_skip(push) or _environment_skip(push, verb="push")
+            return _transfer_failure_verdict(push, verb="push", tools_present=tools_present)
 
         pull = _pull(ctx, com, remote_path, dst_path, rpc_timeout_s=120, proc_timeout_s=140)
         ctx.note("pull.json", str(pull))
         if not pull.get("ok"):
-            return _tool_missing_skip(pull) or _environment_skip(pull, verb="pull")
+            return _transfer_failure_verdict(pull, verb="pull", tools_present=tools_present)
 
         # push/pull 皆回報成功，才是這個 case 真正要抓的回歸：內容是否被靜默截斷。
         dst_bytes = dst_path.read_bytes()

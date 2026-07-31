@@ -71,7 +71,11 @@ def f8_foreign_holder_reported(ctx):
             )
     finally:
         holder.terminate()
-        holder.wait(timeout=10)
+        try:
+            holder.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            holder.kill()  # terminate 未果就硬殺，絕不留 rogue 持有者
+            holder.wait(timeout=5)
 
     # 釋放後：該 pid 不得殘留（stale）。
     gone = False
@@ -108,28 +112,16 @@ def f8_second_daemon_detected(ctx):
     profile_yaml = "profiles: {}\ntargets: {}\n"  # 最小合法 YAML（無 target，動態偵測池也是空的）
 
     result = None
+    ta_cm = guards.ThrowawayDaemon(
+        exe=str(ctx.cfg["serialwrap_exe"]),
+        workdir=workdir,
+        by_id_dir=by_id_dir,
+        profile_yaml=profile_yaml,
+    )
+    # except 範圍只包 __enter__：body 內的例外（如 prod daemon status 異常）不得被
+    # 誤判成「throwaway 未就緒」的環境 SKIP。
     try:
-        with guards.ThrowawayDaemon(
-            exe=str(ctx.cfg["serialwrap_exe"]),
-            workdir=workdir,
-            by_id_dir=by_id_dir,
-            profile_yaml=profile_yaml,
-        ):
-            time.sleep(1)  # 讓 prod daemon 下一輪 /proc 掃描有機會反映第二個 serialwrapd
-            during = ctx.sw.run("daemon", "status")
-            ctx.note("prod-daemon-status-during.json", str(during))
-            daemons = (during.get("multi_open_detail") or {}).get("daemons") or []
-            detected = bool(during.get("multi_open")) or len(daemons) > 1
-            if not detected:
-                result = CaseResult(
-                    "FAIL",
-                    reason="throwaway 第二個 daemon 存在期間，prod daemon status 未偵測到 multi_open"
-                    "（#101 回歸）",
-                    category="test",
-                    reason_code="second_daemon_not_detected",
-                    evidence={"during": "prod-daemon-status-during.json"},
-                )
-            # with 區塊結束（__exit__）會 kill throwaway daemon，prod 全程未被寫入。
+        ta_cm.__enter__()
     except RuntimeError as exc:
         log_path = workdir / "daemon.log"
         log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else "(無 daemon.log)"
@@ -140,6 +132,30 @@ def f8_second_daemon_detected(ctx):
             category="environment",
             reason_code="throwaway_start_failed",
         )
+    try:
+        # multi_open 掃描為 on-demand，但保險起見輪詢至多 15s（同 family 首 case 慣例）。
+        detected = False
+        during: dict = {}
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            during = ctx.sw.run("daemon", "status")
+            daemons = (during.get("multi_open_detail") or {}).get("daemons") or []
+            if bool(during.get("multi_open")) or len(daemons) > 1:
+                detected = True
+                break
+            time.sleep(2)
+        ctx.note("prod-daemon-status-during.json", str(during))
+        if not detected:
+            result = CaseResult(
+                "FAIL",
+                reason="throwaway 第二個 daemon 存在期間，prod daemon status 未偵測到 multi_open"
+                "（#101 回歸）",
+                category="test",
+                reason_code="second_daemon_not_detected",
+                evidence={"during": "prod-daemon-status-during.json"},
+            )
+    finally:
+        ta_cm.__exit__(None, None, None)  # kill throwaway daemon，prod 全程未被寫入
 
     # with 區塊退出後應恢復單一 daemon——落 evidence 供比對，不另立硬性 reason_code。
     after = ctx.sw.run("daemon", "status")

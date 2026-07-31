@@ -33,6 +33,8 @@ def _await_terminal(ctx: Any, cmd_id: Any, *, timeout_s: float, poll_s: float = 
         if last.get("status") in ("done", "error", "timeout"):
             return last
         time.sleep(poll_s)
+    # 逾時仍未終結（cg review）：best-effort cancel，不讓殘留 pending 拖累後續 case。
+    ctx.sw.run("cmd", "cancel", "--cmd-id", str(cmd_id))
     return last
 
 
@@ -150,6 +152,16 @@ def f6_two_boards_no_starvation(ctx: Any) -> CaseResult:
     if errors:
         return CaseResult("FAIL", reason="；".join(errors), category="test",
                           reason_code="thread_exception", evidence={"timeline": timeline_path})
+
+    # COM1 短命令必須「真的成功」才進入時序比較（cg review）：快速失敗（error 立即回）
+    # 的 b_done 會極小、時序比較恆過＝假 PASS。
+    if b_result.get("status") != "done" or "fast" not in (b_result.get("stdout") or ""):
+        return CaseResult(
+            "FAIL",
+            reason=f"COM1 短命令未正常完成（status={b_result.get('status')!r}），無法驗證互不餓死",
+            category="test", reason_code="short_cmd_failed",
+            evidence={"timeline": timeline_path},
+        )
 
     if b_done >= a_deadline:
         return CaseResult(

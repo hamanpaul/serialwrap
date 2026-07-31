@@ -158,11 +158,16 @@ class ThrowawayDaemon:
             start_new_session=True,
         )
         self._proc_pgid = proc.pid
-        deadline = time.monotonic() + 20
-        while time.monotonic() < deadline:
-            if self.run("daemon", "status").get("ok"):
-                return self
-            time.sleep(1.0)
+        try:
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                if self.run("daemon", "status").get("ok"):
+                    return self
+                time.sleep(1.0)
+        except BaseException:
+            # 任何非預期例外（如 subprocess.TimeoutExpired）都不得洩漏 daemon 子行程。
+            self.__exit__(None, None, None)
+            raise
         self.__exit__(None, None, None)
         raise RuntimeError(f"throwaway daemon 未在 20s 內就緒（log：{self._workdir}/daemon.log）")
 
