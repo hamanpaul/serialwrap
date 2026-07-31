@@ -63,7 +63,7 @@ doctor 全綠、testbed 板卡 READY、tmux/minicom 存在、無殘留 throwaway
 | F6 RPC 不凍結 | #80 #52 | 長操作中 `daemon status` 往返不凍結、雙板互不餓死 | 否 |
 | F7 檔案傳輸 | #21 #32 | binary round-trip md5 一致、不靜默截斷；板缺工具 SKIP | 否 |
 | F8 daemon 單一性 | #101 #53 | `multi_open`／`foreign_holders` 正確回報第二 daemon 與 tty 持有者 | 否 |
-| F9 開機/U-Boot | #69 #130 #44 #14 #20 | autoboot 窗不被 probe 打斷、quiet window 不擋 human/agent、開機中 attach 自動 reprobe、U-Boot 停留不踢 console | **是（reboot）** |
+| F9 開機/U-Boot | #69 #130 #139 #44 #14 #20 | autoboot 窗不被 probe 打斷、quiet window 不擋 human／真 READY 後的 agent 命令、自發重開機過渡態 agent 命令被 `AUTOBOOT_QUIET` 攔下（#139）、開機中 attach 自動 reprobe、U-Boot 停留不踢 console | **是（reboot）** |
 | F10 登入帳密 | #140 #19 | 帳密解析空→`CREDENTIALS_UNRESOLVED` 終態不送空帳密、補帳密後恢復 | **是（throwaway＋release）** |
 | F11 RX 洪水/傳輸層 | #153 #150 | 洪水下 probe 失敗分類為 `RX_FLOOD`（等排空、排空後自癒回 READY）、`rx_bytes_last_10s`／`last_rx_age_s`／`last_tx_age_s`／`last_error_detail` 觀測面存在且合理（真 usbip stall 需人工操作、排除自動化，heuristic 由 pytest 覆蓋） | **部分（flood case 佔用 COM0 數十秒）** |
 

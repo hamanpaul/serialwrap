@@ -18,7 +18,16 @@ from .arbiter import (
     CommandArbiter,
 )
 from .config import ProfileTemplate, SessionProfile
-from .constants import CONFIG_DIR, DEVICE_BY_ID_DIR, DEVICE_BY_PATH_DIR, EVENTS_DIR, EVENTS_RUNTIME_DIR, EVENTS_LOG_PATH, TTYMCU_PATH
+from .constants import (
+    CONFIG_DIR,
+    DEVICE_BY_ID_DIR,
+    DEVICE_BY_PATH_DIR,
+    ERROR_AUTOBOOT_QUIET,
+    EVENTS_DIR,
+    EVENTS_RUNTIME_DIR,
+    EVENTS_LOG_PATH,
+    TTYMCU_PATH,
+)
 from .flash_endpoint import FlashEndpoint, detect_mcu_line, pump_endpoint_to_sink
 from .mcu_patterns import McuPatternRegistry
 from .multi_open import detect_multi_open
@@ -564,7 +573,9 @@ class SerialwrapService:
         }
         return result
 
-    def _resolve_session_id(self, selector: str) -> tuple[str | None, dict[str, Any] | None]:
+    def _resolve_session_id(
+        self, selector: str, *, source: str = "agent"
+    ) -> tuple[str | None, dict[str, Any] | None]:
         state = self._sessions.get_session_state(selector)
         if not state.get("ok"):
             return None, state
@@ -580,6 +591,22 @@ class SerialwrapService:
                     "session": session,
                 }
             return None, {"ok": False, "error_code": "SESSION_NOT_READY", "session": session}
+        # #139 submit-time gate（第一層）：state 名義上仍 READY 但 boot quiet window 已
+        # arm（疑似板卡自發重開機的過渡態）時，非 human 來源的顯式命令即時拒絕——bytes
+        # 若送出會落入 U-Boot autoboot 倒數窗打斷開機、以 PROMPT_TIMEOUT 吞掉。此拒絕
+        # 零 UART 副作用、可重試；session 重新確認 READY 時 quiet 同步解除（session_manager
+        # 各 READY 轉移點 clear_boot_quiet）。human console／interactive lease 不經此路徑，
+        # source 前綴檢查為 belt-and-suspenders（與 execute_command 慣例一致）。
+        if not source.startswith("human:"):
+            remaining = session.get("boot_quiet_remaining_s")
+            if remaining is not None:
+                return None, {
+                    "ok": False,
+                    "error_code": ERROR_AUTOBOOT_QUIET,
+                    "retry_after_s": remaining,
+                    "hint": "boot quiet window 進行中（疑似板卡自發重開機）；等 session 重新確認 READY 後重送",
+                    "session": session,
+                }
         return str(session["session_id"]), None
 
     def rpc(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -779,7 +806,7 @@ class SerialwrapService:
             expected_duration_s: float | None = float(raw_ed) if raw_ed is not None else None
             if not selector:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
-            session_id, err = self._resolve_session_id(selector)
+            session_id, err = self._resolve_session_id(selector, source=source)
             if err is not None:
                 return err
             assert session_id is not None
@@ -927,7 +954,7 @@ class SerialwrapService:
             source = str(params.get("source") or "agent")
             if not selector or not local_path or not remote_path:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
-            session_id, err = self._resolve_session_id(selector)
+            session_id, err = self._resolve_session_id(selector, source=source)
             if err is not None:
                 return err
             return self._sessions.file_push(
@@ -948,7 +975,7 @@ class SerialwrapService:
             source = str(params.get("source") or "agent")
             if not selector or not remote_path:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
-            session_id, err = self._resolve_session_id(selector)
+            session_id, err = self._resolve_session_id(selector, source=source)
             if err is not None:
                 return err
             return self._sessions.file_pull(

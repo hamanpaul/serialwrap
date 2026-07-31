@@ -285,7 +285,11 @@ Common classifications include `OK`, `DEVICE_MISSING`,
 `TARGET_UNRESPONSIVE`, `LOGIN_REQUIRED`, `ATTACHED_NOT_READY`,
 `REBOOTING`, `HUMAN_INTERACTIVE_ACTIVE`, `PASSTHROUGH`,
 `AUTOBOOT_QUIET` (#130 — a boot quiet window is active; wait for it to
-clear or expire, don't retry in a loop), and `RX_FLOOD` (#153 — the
+clear or expire, don't retry in a loop. Since #139 the same string is also
+returned as a retryable `error_code` when an agent submits
+`cmd submit` / `file push` / `file pull` during this transitional window —
+zero UART side effects; resend once the session re-confirms `READY`), and
+`RX_FLOOD` (#153 — the
 console is being flooded (`rx_bytes_last_10s` above threshold); the probe
 drowned, the target is not dead. Wait for the flood to drain — the daemon
 auto-reprobes back to `READY` — instead of recovering/rebuilding the
@@ -406,14 +410,21 @@ no caller action required:
   boot-complete and the window stays active — a loosely written
   `prompt_regex` (e.g. `[>#]\s*$`) would otherwise misfire on the bootloader's
   own prompt and clear the window at the worst possible moment.
-- **Never gated**: human console bytes, interactive lease TX, and explicit
-  agent commands (once a session is `READY`). Deliberately entering the
-  bootloader (e.g. #114) still works. Known limitation: this field only gates
-  the automatic probes above — it does not demote `session.state`, so if a
-  spontaneous reboot races an in-flight agent command while the session is
-  still (nominally) `READY`, that explicit command can still hit the UART
-  during the countdown. Tracked as a follow-up (needs a dedicated state or
-  arbiter-level gate), not fixed here.
+- **Never gated**: human console bytes and interactive lease TX.
+  Deliberately entering the bootloader (e.g. #114) still works.
+- **Explicit agent commands** (#139, closing the former known limitation):
+  the window still does not demote `session.state`, but
+  `cmd submit` / `file push` / `file pull` are rejected with a retryable
+  **`AUTOBOOT_QUIET`** `error_code` — only during the transitional state
+  where the window is armed and the session has *not* re-confirmed `READY`
+  (i.e. a suspected spontaneous reboot while the state nominally reads
+  `READY`). The rejection is immediate and has zero UART side effects
+  (previously those bytes landed in the autoboot countdown and the command
+  died 10 s later as `PROMPT_TIMEOUT`). The moment any READY transition
+  lands (probe / attach / reboot recovery success) the window is cleared
+  in the same locked section — after a re-confirmed `READY`, explicit agent
+  commands always pass. To deliberately drive the bootloader, use
+  `interactive-open --allow-attached` (#114), which is never gated.
 - If a board does end up stuck in the bootloader, `prpl-template` now defines
   `bootloader_prompts` (`=> `, `U-Boot> `), so the
   `interactive-open --allow-attached` recovery lease can type `boot` to escape.
@@ -1425,7 +1436,7 @@ serialwrap session self-test --selector COM0
 - `REBOOTING`：agent 已送出 reboot 類指令，正在等待 target 重開機完畢後自動 relogin
 - `HUMAN_INTERACTIVE_ACTIVE`：human console 目前握有 interactive ownership，不適合 agent 干預
 - `PASSTHROUGH`：platform 設為 passthrough，session 已 ATTACHED，適合透明 bridge 模式
-- `AUTOBOOT_QUIET`（#130）：session 名義上是 `READY`，但已進入 boot quiet window（自發重開機的過渡態），不送 nonce probe；等它自己解除或過期，勿反覆呼叫
+- `AUTOBOOT_QUIET`（#130）：session 名義上是 `READY`，但已進入 boot quiet window（自發重開機的過渡態），不送 nonce probe；等它自己解除或過期，勿反覆呼叫。#139 起同一字串也作為 `cmd submit`／`file push`／`file pull` 在此過渡態的**可重試 `error_code`**——即時拒絕、零 UART 副作用（bytes 不落入 autoboot 倒數窗），session 重新確認 `READY` 後重送即可
 - `RX_FLOOD`（#153）：console 正被大量輸出灌爆（`rx_bytes_last_10s` 超閾 ≥20000B/10s），probe 被洪水淹沒——**不是 target 死了**。`recommended_action=wait`：等排空（daemon 於 RX 閒置 3s 後自動重探升 `READY`），勿 recover/重建 session
 
 ### 帳密解析終態 `CREDENTIALS_UNRESOLVED`（#140）
@@ -1526,7 +1537,8 @@ DUT 重開機時，U-Boot 的「`Hit any key to stop autoboot`」倒數窗只要
   2. RX 看到 boot banner（`U-Boot` 版本行、`Hit any key to stop autoboot` 倒數行）——涵蓋 **DUT 自行重開／斷電重開**的非計畫性情境。
 - **效果**：視窗內（預設 180s，`BOOT_QUIET_WINDOW_S`；實測目標板完整開機約 150s + 裕度）**gate 所有 `source=system` 的自動 probe TX**——reboot recovery 迴圈、readiness reprobe、attach probe（`attach_session` 的 ATTACHED 分支與 `recover_session` 的 ATTACHED 分支重探共用同一個 probe 入口，於此單點一起 gate）、命令逾時後的 CTRL_C/CTRL_D 強制按鍵、`session self-test` READY 分支的 nonce probe（回報 `AUTOBOOT_QUIET` 分類）全部改為純被動等 RX。`session list` 的 `boot_quiet_remaining_s` 欄位可觀測剩餘秒數。
 - **解除**：RX 匹配該 session 的 `login_regex` / `prompt_regex`（開機完成訊號）**即刻解除**，recovery 立即恢復探測、自動回 `READY`；否則 180s 過期自動解除。例外：若命中的尾行本身就是該 session 的 `bootloader_prompts`（如 U-Boot 自己的 `=> `），**不**視為開機完成、window 續留——避免寬鬆撰寫的 `prompt_regex`（如 `[>#]\s*$`）誤配 bootloader 自身 prompt，在板子仍卡在 bootloader 的最危險時刻誤解除。
-- **絕不 gate**：human console bytes、interactive lease TX、agent 顯式命令（session 已是 `READY` 時）。與 #114「刻意進 bootloader」的需求相容——human/lease 送鍵永遠放行。已知限制：本欄位只 gate 上述自動 probe，**不會**降級 `session.state`；若自發重開機與進行中的 agent 命令競速、session 仍（名義上）停在 `READY`，該顯式命令仍可能在倒數期間打到 UART——此為待補的 follow-up（需要新 state 或 arbiter 層 gate），本次未修。
+- **絕不 gate**：human console bytes、interactive lease TX。與 #114「刻意進 bootloader」的需求相容——human/lease 送鍵永遠放行。
+- **agent 顯式命令（#139，原已知限制已收斂）**：本欄位仍**不會**降級 `session.state`，但 agent 顯式命令（`cmd submit`／`file push`／`file pull`）僅在「quiet armed 且 session 尚未重新確認 `READY`」的過渡態（疑似板卡自發重開機、state 名義上停 `READY`）被 **`AUTOBOOT_QUIET`**（可重試）拒絕——submit-time 即時回錯（附 `retry_after_s`、不產生 cmd_id）、execute-time 第二層堵 queue race（`cmd status` 終態可觀測）；兩層皆零 UART 副作用（舊行為：bytes 落入 autoboot 倒數窗、10s 後以 `PROMPT_TIMEOUT` 吞掉）。session 重新確認 `READY`（任一 READY 轉移點）即同步解除，READY 後 agent 命令永遠放行；刻意進 bootloader 請走 `interactive-open --allow-attached`（#114，不受 gate）。
 - 若板子仍卡在 bootloader（例如 human 手動打斷倒數），`prpl-template` 已補上 `bootloader_prompts`（`=> `、`U-Boot> `），可直接用 `interactive-open --allow-attached` 開 recovery lease 打 `boot` 脫困，不必再走 `device release` + 外部工具的迂迴流程。
 
 ## 日誌與輸出

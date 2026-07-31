@@ -134,8 +134,17 @@ BOOT_QUIET_WINDOW_S: float = 180.0
 """偵測到 boot banner（或 agent 送出 reboot 命令）後，system probe TX 的靜默秒數。
 
 實測 prpl 平台目標板完整開機約 150s，加裕度取 180s。RX 見到該 session 的 login/prompt
-（開機完成訊號）會提前解除；quiet window 只擋 source=system 的自動 probe，
-不擋 human console bytes、interactive lease TX 與 agent 顯式命令。"""
+（開機完成訊號）會提前解除；quiet window 擋 source=system 的自動 probe，
+不擋 human console bytes 與 interactive lease TX；agent 顯式命令自 #139 起僅在
+「quiet armed 且 session 尚未重新確認 READY」的過渡態被 ``AUTOBOOT_QUIET`` 拒絕
+（可重試），session 回 READY 即同步解除。"""
+ERROR_AUTOBOOT_QUIET: str = "AUTOBOOT_QUIET"
+"""boot quiet window 過渡態的可重試錯誤碼（#139；字串沿用 self-test classification，
+統一為單一常數）。session 名義上仍 READY 但 quiet window 已 arm（疑似板卡自發重開機）
+時，agent 顯式命令（command.submit／file.push／file.pull）被此碼即時拒絕、零 UART
+副作用（bytes 不落入 U-Boot autoboot 倒數窗）；session 重新確認 READY（任一 READY
+轉移點）即同步 clear，呼叫端等 READY 後重送即可。human console／interactive lease
+路徑不受此 gate（#114 刻意進 bootloader 永遠可行）。"""
 BOOT_BANNER_TAIL_CHARS: int = 256
 """banner 偵測用 rolling RX tail 的長度（字元）；跨 chunk 邊界拼接比對。"""
 

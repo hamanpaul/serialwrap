@@ -154,7 +154,8 @@ class TestServiceRpcParams(unittest.TestCase):
         from sw_core.service import SerialwrapService
 
         self.svc = SerialwrapService([])
-        self.svc._resolve_session_id = lambda _sel: ("p:COM0", None)
+        # #139 起 _resolve_session_id 增 keyword-only `source` 參數，stub 需吸收。
+        self.svc._resolve_session_id = lambda _sel, **_kw: ("p:COM0", None)
 
     def _rpc_push(self, params: dict) -> mock.Mock:
         m = mock.Mock(return_value={"ok": True})

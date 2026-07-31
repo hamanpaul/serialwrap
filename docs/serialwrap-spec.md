@@ -468,9 +468,9 @@ DUT 重開機時，U-Boot autoboot 倒數窗（`Hit any key to stop autoboot`）
 
 **解除（clear）**：RX 匹配該 session 的 `login_regex` / `prompt_regex`（開機完成訊號）即刻解除並恢復探測；否則過期自動解除。例外：若命中的尾行本身就是該 session `bootloader_prompts` 名單中的一員（如 U-Boot 自己的 `=> `），視為仍在 bootloader、非開機完成，本輪不解除——寬鬆撰寫的 `prompt_regex`（如 brcm-template `(?m)[>#]\s*$`）會誤配 bootloader 自身 prompt，若不先排除會在板子正卡 bootloader 的最危險時刻誤解除（`_update_boot_quiet_locked` 於解除前先呼叫 `_matches_any_bootloader_prompt`）。
 
-**不 gate**：human console bytes、interactive lease TX、agent 顯式命令（session 已是 `READY` 時，本來就被 READY gate 擋在 arbiter 之前）。與 #114「刻意進 bootloader」相容——human/lease 送鍵永遠放行。
+**不 gate**：human console bytes、interactive lease TX。與 #114「刻意進 bootloader」相容——human/lease 送鍵永遠放行。
 
-**已知架構限制（未修，待 follow-up issue）**：`boot_quiet_until` 只影響上述自動 probe gate，**不會**降級 `session.state`。若自發重開機與進行中的 agent 命令競速、session 仍（名義上）停在 `READY`，該顯式命令仍可能在 autoboot 倒數期間打到 UART——需要新增 state 或 arbiter 層 gate 才能堵住，本次收斂範圍不含此項。
+**agent 顯式命令的過渡態 gate（#139，原「已知架構限制」已收斂）**：`boot_quiet_until` 仍**不**降級 `session.state`，但 agent 顯式命令（`command.submit`／`file.push`／`file.pull`）僅在「quiet armed 且 session 尚未重新確認 `READY`」的過渡態（自發重開機、state 名義上停 `READY`）被 **`AUTOBOOT_QUIET`**（可重試）拒絕——雙層 gate：(1) submit-time（`service._resolve_session_id`，讀 `boot_quiet_remaining_s`，拒絕回應附 `retry_after_s`＋session dict、不產生 cmd_id）；(2) execute-time（`execute_command`／`file_push`／`file_pull` 的 locked 開頭，堵「submit 通過後 banner 才到、命令已在 arbiter queue」的競態，arbiter 把 error_code 寫回命令記錄、`cmd status` 可觀測）。兩層皆零 UART 副作用、命令可於 READY 後重送。session 重新確認 `READY`（`_probe_existing_bridge`／`_attach_by_id` 兩路徑／`_spawn_reboot_recovery` 的 READY 轉移點）即同步 `clear_boot_quiet()`——READY 後 agent 命令永遠放行；「板其實沒重開」（reboot 後 2s 內 prompt 回來）的提前返回分支亦補清。刻意進 bootloader 請走 `interactive-open --allow-attached`（#114，不受 gate）。
 
 **觀測**：session 公開欄位 `boot_quiet_remaining_s`（剩餘秒數；`null`＝未啟用/已解除）。
 
