@@ -17,13 +17,20 @@ if TYPE_CHECKING:
 _SENTINEL_BEGIN = "===SW_XFER_BEGIN==="
 _SENTINEL_END = "===SW_XFER_END==="
 
+# 預設 chunk 大小（#157）：512B 的 base64 為 ceil(512/3)*4=684 字元，加上
+# `printf '%s' '' | base64 -d >> /tmp/.sw_upload_<12hex>` 樣板約 57 字元固定
+# 開銷 ≈ 741 字元——相對 issue 實證會截斷的 ~2789 字元（chunk=2048）約 3.8x
+# 安全餘裕。注意：此值是依 #157 附的截斷長度反推的保守估計、非真機量測值；
+# 呼叫端可經 CLI `--chunk-size`／RPC `chunk_size` 覆寫。
+DEFAULT_CHUNK_SIZE = 512
+
 
 def push_file(
     bridge: UARTBridge,
     local_path: str,
     remote_path: str,
     *,
-    chunk_size: int = 2048,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
     timeout_s: float = 10.0,
     prompt_regex: str,
     source: str = "file_transfer",

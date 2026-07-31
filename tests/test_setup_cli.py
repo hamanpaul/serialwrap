@@ -33,6 +33,23 @@ def test_setup_writes_config_to_xdg_config_dir_readable_by_supervision_mode(tmp_
     assert capsys.readouterr().out.strip() == "on-demand"
 
 
+def test_setup_prints_console_hint_for_serialwrap_minicom(tmp_path, monkeypatch, capsys):
+    """#149：setup 完成後主動提示 human console 入口指令，避免 operator 誤敲未走
+    broker 的裸 `minicom -D /dev/ttyUSBx`（two-reader）。"""
+    import json
+
+    monkeypatch.setenv("SERIALWRAP_CONFIG_DIR", str(tmp_path / "cfg"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cli = _reload()
+
+    assert cli.main(["setup", "--on-demand"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "console_hint" in payload
+    assert "serialwrap-minicom" in payload["console_hint"]
+
+
 def teardown_module(module):
     import sw_core.constants
     import sw_core.cli

@@ -11,6 +11,7 @@ from typing import Any
 from unittest import mock
 
 from sw_core.file_transfer import (
+    DEFAULT_CHUNK_SIZE,
     _extract_between_sentinels,
     _split_chunks,
     pull_file,
@@ -438,6 +439,64 @@ class TestExtractBetweenSentinels(unittest.TestCase):
         )
         result = _extract_between_sentinels(text)
         self.assertEqual(result, clean_b64)
+
+
+class TestPushFileDefaultChunkSize(unittest.TestCase):
+    """#157：DEFAULT_CHUNK_SIZE=512 且未帶 chunk_size 時真的從預設值生效。"""
+
+    def _push_default(self, data: bytes) -> tuple[dict[str, Any], "_FakeBridge"]:
+        """以預設 chunk_size 跑 push_file，回傳 (result, bridge)。"""
+        import math
+
+        md5 = hashlib.md5(data).hexdigest()
+        n_chunks = max(1, math.ceil(len(data) / DEFAULT_CHUNK_SIZE))
+        bridge = _FakeBridge()
+        for _ in range(n_chunks):
+            bridge.enqueue_rx(f"ok\r\n{_PROMPT}")
+        bridge.enqueue_rx(f"{md5}  /tmp/.sw_upload_test\r\n{_PROMPT}")
+        bridge.enqueue_rx(f"{_PROMPT}")
+
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            f.write(data)
+            local = f.name
+        try:
+            result = push_file(
+                bridge, local, "/tmp/dest.bin",
+                prompt_regex=_PROMPT_REGEX,
+            )
+        finally:
+            os.unlink(local)
+        return result, bridge
+
+    def test_default_chunk_size_is_512(self) -> None:
+        self.assertEqual(DEFAULT_CHUNK_SIZE, 512)
+
+    def test_default_effective_not_legacy_2048(self) -> None:
+        """1200B → 預設 512 應切 3 段（若殘留 2048 只會有 1 段）。"""
+        data = os.urandom(1200)
+        result, bridge = self._push_default(data)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["chunks"], 3)
+        # 命令序列 = 3 chunk + 1 md5sum + 1 mv
+        self.assertEqual(len(bridge.commands), 5)
+        chunk_cmds = [c for c in bridge.commands if "base64 -d" in c]
+        self.assertEqual(len(chunk_cmds), 3)
+
+    def test_exact_multiple_of_default(self) -> None:
+        """恰為 DEFAULT_CHUNK_SIZE 整數倍：1024B → 2 段。"""
+        data = b"X" * (DEFAULT_CHUNK_SIZE * 2)
+        result, _ = self._push_default(data)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["chunks"], 2)
+
+    def test_remainder_one_byte(self) -> None:
+        """整數倍餘 1 byte：1025B → 3 段（尾段 1 byte）。"""
+        data = b"X" * (DEFAULT_CHUNK_SIZE * 2 + 1)
+        result, _ = self._push_default(data)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["chunks"], 3)
+        chunks = _split_chunks(data, DEFAULT_CHUNK_SIZE)
+        self.assertEqual(len(chunks[-1]), 1)
 
 
 class TestPullParseFailed(unittest.TestCase):

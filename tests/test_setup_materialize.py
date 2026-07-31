@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import os
+
 
 def test_materialize_copies_profiles_and_symlinks_skill(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
@@ -19,6 +21,9 @@ def test_materialize_copies_profiles_and_symlinks_skill(tmp_path, monkeypatch):
     assert link.is_symlink()
     assert (link / "SKILL.md").is_file()  # symlink 指向已物化的 skill
     assert (tmp_path / ".local" / "bin" / "serialwrap-minicom").is_file()
+    # #149：不只存在，還要是可執行的（doctor 的 serialwrap_minicom_on_path 靠
+    # PATH 上找得到「可執行」二進位，補上目前只靠隱含信任 chmod 0o755 的斷言缺口）。
+    assert os.access(tmp_path / ".local" / "bin" / "serialwrap-minicom", os.X_OK)
 
 
 def test_materialize_does_not_overwrite_existing_profiles(tmp_path, monkeypatch):

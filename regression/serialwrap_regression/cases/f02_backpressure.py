@@ -9,9 +9,13 @@
 - history（``_commands`` dict）淘汰只作用於已終結（有 ``done_at``）記錄，且在多個終結點
   （worker 完成／cancel／submit 後）即時收斂，理論上使 daemon 常駐記憶體不隨命令數無界成長
   （#81）。
-- ``session recover`` 觸發 ``unregister_session`` → 於同一把鎖內把該 session 尚未啟動的
-  accepted 命令原子標記為 ``FLUSHED_BY_RECOVERY`` 終態，釋放 pending 額度，避免舊佇列殘留
-  造成往後每次 submit 都連鎖 ``SESSION_QUEUE_FULL``（#128）。
+- ``session recover`` / 命令逾時內部觸發的 recovery 有兩條 flush 掛點，皆把該 session
+  尚未啟動的 accepted 命令原子標記為 ``FLUSHED_BY_RECOVERY`` 終態、釋放 pending 額度，
+  避免舊佇列殘留造成往後每次 submit 都連鎖 ``SESSION_QUEUE_FULL``：
+  (a) session 真的離線 → ``unregister_session`` 內建 flush（#128）；
+  (b) CTRL_C/CTRL_D 攔截成功、session 全程停留 READY 未離線 → ``_recover_after_failure``
+      經 ``on_command_flush`` callback 直呼 ``arbiter.flush_session()``（#156，補上 (a)
+      天生跳過的分支）。
 """
 from __future__ import annotations
 
@@ -105,7 +109,7 @@ def f2_queue_full_backpressure(ctx: Any) -> CaseResult:
     """#81：per-session pending 命令數必須有硬上限（backpressure），超量拒收而非無界排隊 OOM。"""
     com = ctx.cfg["boards"][0]["com"]
     triggered_at: int | None = None
-    cmd_ids: list[str] = []  # 收尾 cancel 用（#156：recover 的 CTRL_C 路徑不 flush，不能只靠 recover）
+    cmd_ids: list[str] = []  # 收尾 cancel 用（多層防線；recover 的 flush 已修復 #156，此處保留不刪）
     try:
         submissions_tail: list[dict] = []  # 只留尾段回應當 evidence，避免 300 筆塞爆 note
         for i in range(_QUEUE_FULL_ATTEMPT_CAP):
@@ -133,9 +137,9 @@ def f2_queue_full_backpressure(ctx: Any) -> CaseResult:
             reason=f"第 {triggered_at} 次 submit 觸發 SESSION_QUEUE_FULL（backpressure 生效）",
         )
     finally:
-        # 收尾（首輪實測教訓，#156）：recover 走 CTRL_C 攔截路徑時**不會** flush 佇列，
-        # 殘留 250+ 條 sleep 5 會外溢毒害後續 case（首輪 f4 兩案因此連鎖 FAIL）——
-        # 先逐一 cancel（確定性釋放額度）再 recover 收斂。
+        # 收尾（歷史教訓，#156 已修復）：首輪實測時 recover 的 CTRL_C 攔截路徑不會 flush
+        # 佇列，殘留 250+ 條 sleep 5 曾外溢毒害後續 case（首輪 f4 兩案因此連鎖 FAIL）。
+        # 此處 cancel-then-recover 保留作多層防線，非因 recover flush 仍失效。
         _cancel_all(ctx, cmd_ids)
         recover_resp = ctx.sw.run("session", "recover", "--selector", com)
         ctx.note("cleanup-recover.json", str(recover_resp))
@@ -158,6 +162,8 @@ def f2_queue_full_backpressure(ctx: Any) -> CaseResult:
         "誠實界定（cg review）：CMD_HISTORY_MAX=512，200 輪不必然觸發淘汰——本 case 驗的是"
         "「RSS 增量有界」的粗防線；完整淘汰驗證屬長跑域（serialwrap-reliability soak），"
         "本 plugin 維持分鐘級不擴大輪數。",
+        "迴圈零容忍（#158 已修）：任一輪 echo x 未 done 即 FAIL——原偶發 PROMPT_TIMEOUT"
+        "根因＝RX 視窗修剪破壞 offset 語意，修復後不得再現；失敗輪 result 記入 evidence。",
     ),
 )
 def f2_history_bounded_rss(ctx: Any) -> CaseResult:
@@ -177,29 +183,22 @@ def f2_history_bounded_rss(ctx: Any) -> CaseResult:
 
     first_cmd_id: str | None = None
     last_cmd_id: str | None = None
-    iteration_failures: list[dict] = []
     for i in range(200):
         # settle/poll 壓到 0.3/0.2s：200 輪維持在 ~3 分鐘內（預設 1.5/0.5 會拖到 7 分鐘+）。
         result = ctx.sw.submit_and_wait(com, "echo x", cmd_timeout=6.0, settle_s=0.3, poll_s=0.2)
         if result.get("status") != "done":
-            # 快速迴圈偶發 PROMPT_TIMEOUT（#158：累積劣化或板端 console 噪音，2/2 於百次級
-            # 重現、輪次不定）——容忍 ≤3 次記 evidence 續跑，RSS 有界 oracle 不受影響；
-            # 超容忍才視為劣化徵兆 FAIL。#158 修復後可收緊為零容忍。
-            iteration_failures.append({"iteration": i, "result": result})
-            if len(iteration_failures) > 3:
-                ctx.note("iteration-failures.json", str(iteration_failures))
-                return CaseResult(
-                    "FAIL",
-                    reason=f"200 輪內 {len(iteration_failures)} 次 echo x 未完成（>3 容忍，#158 劣化徵兆）",
-                    category="test", reason_code="submit_loop_failed",
-                )
-            continue
+            # 零容忍（#158 已修）：快速迴圈的 PROMPT_TIMEOUT 根因＝RX 視窗修剪破壞 offset
+            # 語意（絕對偏移記帳後根治），任一輪未完成即為錯誤行為再現，恢復即紅。
+            ctx.note("iteration-failures.json", str([{"iteration": i, "result": result}]))
+            return CaseResult(
+                "FAIL",
+                reason=f"第 {i} 輪 echo x 未完成（status={result.get('status')!r}，#158 錯誤行為零再現 oracle）",
+                category="test", reason_code="submit_loop_failed",
+            )
         cmd_id = result.get("cmd_id")
         if first_cmd_id is None:
             first_cmd_id = cmd_id
         last_cmd_id = cmd_id
-    if iteration_failures:
-        ctx.note("iteration-failures.json", str(iteration_failures))
 
     # 淘汰行為觀察（記錄用，不影響判定）：history 淘汰只保證全域上限，不保證特定一筆
     # 必被淘汰或保留——取決於同期還有多少其他命令流量。
@@ -236,10 +235,81 @@ def f2_history_bounded_rss(ctx: Any) -> CaseResult:
     return CaseResult("PASS", reason=f"RSS 增量 {delta_kb}kB（<{_RSS_GROWTH_BUDGET_KB}kB）")
 
 
+# 唯讀 grep 值（sw_core/uart_io.py，勿 import）：
+#   _rx_max_chars = 131072（UARTBridge RX 視窗上限，觸頂即前端修剪）
+# 預熱必須推超過此值才能使緩衝飽和：awk 每輪印 1200 行 ×（37 字元＋行尾）≈ 47KB，
+# 3 輪 ≈ 140KB > 131072，確定性跨界。
+_RX_MAX_CHARS_GREPPED = 131072
+_PREHEAT_ROUNDS = 3
+_PREHEAT_CMD = (
+    "awk 'BEGIN{for(i=0;i<1200;i++)print \"PAD-0123456789abcdef-0123456789abcdef\"}'"
+)
+
+
+@_case(
+    "f2-rx-window-crossing-prompt",
+    "RX 視窗飽和跨界後 prompt 匹配不失效（offset 絕對偏移語意）",
+    issues=("#158",),
+    hints=(
+        "決定性重演（非等自然累積）：先以 awk 大輸出把 RX 緩衝推超過 _rx_max_chars=131072"
+        "（唯讀 grep 常數，禁 import sw_core）使視窗飽和，再連發 echo x——修前飽和後首輪即"
+        "PROMPT_TIMEOUT（rx_snapshot_len 恆等於上限、切片永遠空字串）。",
+        "115200 baud 下預熱 ~140KB 需 ~12s+，預熱輪 cmd_timeout 放 60s；預熱本身失敗屬"
+        "environment（preheat_failed），非受測行為。",
+        "收尾必經 READY 還原：修前失敗路徑 recovery 會 CTRL_D 誤登出 console 轉 ATTACHED，"
+        "finally 內 wait_state→（必要時）session recover→echo ok 驗收。",
+    ),
+)
+def f2_rx_window_crossing_prompt(ctx: Any) -> CaseResult:
+    """#158：RX 視窗有界修剪破壞 offset 語意——緩衝飽和後 ``rx_snapshot_len()`` 恆等於
+    131072，``wait_for_regex_from(pattern, pre_offset)`` 切片永遠空字串，prompt 永不匹配
+    → PROMPT_TIMEOUT、stdout 空、recovery 誤送 CTRL_D 登出 console。修復＝絕對串流偏移
+    記帳；本 case 決定性重演跨界並驗證錯誤行為零再現。
+    """
+    com = ctx.cfg["boards"][0]["com"]
+    if ctx.sw.session(com).get("state") != "READY":
+        return CaseResult("SKIP", reason=f"{com} 非 READY，無法執行前景命令",
+                          category="environment", reason_code="board_not_ready")
+    try:
+        # 預熱：把 RX 緩衝推超過 _rx_max_chars 使視窗飽和（3×~47KB ≈ 140KB > 131072）。
+        for i in range(_PREHEAT_ROUNDS):
+            r = ctx.sw.submit_and_wait(com, _PREHEAT_CMD, cmd_timeout=60)
+            if r.get("status") != "done":
+                ctx.note("preheat-failure.json", str({"round": i, "result": {
+                    k: v for k, v in r.items() if k != "stdout"}}))
+                return CaseResult(
+                    "FAIL",
+                    reason=f"預熱第 {i} 輪大輸出命令未完成（status={r.get('status')!r}，非受測行為）",
+                    category="environment", reason_code="preheat_failed",
+                )
+
+        # 跨界迴圈：飽和態下連發短命令。修前：首輪即 PROMPT_TIMEOUT（典型簽名：
+        # error_code==PROMPT_TIMEOUT 且 stdout 空）。
+        for i in range(30):
+            result = ctx.sw.submit_and_wait(com, "echo x", cmd_timeout=6.0, settle_s=0.3, poll_s=0.2)
+            if result.get("status") != "done":
+                ctx.note("crossing-failure.json", str({"iteration": i, "result": result}))
+                return CaseResult(
+                    "FAIL",
+                    reason=(f"RX 視窗飽和後第 {i} 輪 echo x 未完成（status={result.get('status')!r}，"
+                            f"error_code={result.get('error_code')!r}；#158 回歸：prompt 於視窗跨界失效）"),
+                    category="test", reason_code="prompt_lost_at_rx_window_bound",
+                )
+        return CaseResult("PASS", reason="RX 視窗飽和跨界後 30 輪 echo x 全數完成（offset 語意未被修剪破壞）")
+    finally:
+        # 收尾（倣 f2-queue-full）：修前失敗路徑會 CTRL_D 登出 console 並轉 ATTACHED，必須還原。
+        ready = ctx.sw.wait_state(com, "READY", timeout_s=float(ctx.cfg["timeouts"]["ready_wait_s"]))
+        if not ready:
+            ctx.sw.run("session", "recover", "--selector", com)
+            ready = ctx.sw.wait_state(com, "READY", timeout_s=float(ctx.cfg["timeouts"]["ready_wait_s"]))
+        post = ctx.sw.submit_and_wait(com, "echo ok", cmd_timeout=10.0) if ready else {}
+        ctx.note("cleanup-echo-ok.json", str({"ready": ready, "post": post}))
+
+
 @_case(
     "f2-recovery-flushes-queue",
     "session recover 後舊佇列已 flush，立即 submit 不再連鎖 QUEUE_FULL",
-    issues=("#128",),
+    issues=("#128", "#156"),
     hints=(
         "已知行為（repo 既有事實）：recover 回應可能是 TIMEOUT 但實際已成功——判定不得看"
         "recover 本身的回應，只看 wait_state 是否真的回到 READY。",
@@ -272,16 +342,19 @@ def f2_recovery_flushes_queue(ctx: Any) -> CaseResult:
                 category="test", reason_code="stale_queue_after_recovery",
             )
 
-        # 有界排空 oracle（首輪實測定案，#156）：recover 的 CTRL_C 攔截路徑目前**不會**
-        # 原子 flush（產品側語意缺口，已立案 #156）——嚴格 flush 斷言在該路徑必然 flaky。
-        # 放寬為「30s 內全數終結」（涵蓋 3×sleep 4 自然排空＋CTRL_C 開銷）：抓得住
-        # #128 的原始危害（stale 佇列無界殘留、連鎖拖累），#156 修復後可改回嚴格斷言。
-        leftover = _poll_until_no_pending(ctx, cmd_ids, timeout_s=30.0)
+        # 嚴格排空 oracle（#156 已修復，收緊為嚴格斷言）：recover 的 CTRL_C 攔截路徑現在
+        # 經 on_command_flush callback 於 return 前同步呼叫 arbiter.flush_session()，
+        # 3 個 accepted 命令必於 recover RPC 回應前已被原子終結。門檻抓「1 個自然完成
+        # （worst case 第 1 個 sleep 4 已被 worker 取走進入 running，需自然跑完 ~4-5s，
+        # 不受 flush 影響）＋ CTRL_C/CTRL_D 偵測開銷（≤2×2s）＋ poll 粒度 1s」＝10s 上限，
+        # 仍比舊 30s 收緊 3 倍以上；此處若回歸 flaky/FAIL 即代表某條 recover 成功路徑
+        # 又漏接 flush。
+        leftover = _poll_until_no_pending(ctx, cmd_ids, timeout_s=10.0)
         if leftover:
             ctx.note("stale-after-recover.json", str(leftover))
             return CaseResult(
                 "FAIL",
-                reason=f"recover 後 30s 仍有 {len(leftover)} 個 pending 未終結（#128 回歸：stale 佇列無界殘留）",
+                reason=f"recover 後 10s 仍有 {len(leftover)} 個 pending 未終結（#128／#156 回歸：flush 未原子生效）",
                 category="test", reason_code="stale_queue_after_recovery",
             )
 

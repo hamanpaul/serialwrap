@@ -4,6 +4,11 @@
 - dialout 群組缺漏時 ok=False 並給出 usermod 修復提示。
 - Windows（#131 點 4）：檢查清單改為 pyserial／PATH／daemon endpoint／SERIALCOMM
   裝置列舉，不再有 dialout／systemd／wsl_systemd／single_daemon。
+- #154：`serialwrapd_on_path` 後新增 `other_serialwrap_installs`（同機多份安裝
+  版本一致性診斷），Linux／Windows 兩份清單皆刻意更新（非誤傷）。
+- #148：新增 `wal_dir` 檢查，兩份清單同步更新。
+- #149：Linux 清單於 `dialout` 之後新增 human console 就緒檢查組
+  `serialwrap_minicom_on_path`／`jq_on_path`／`minicom_on_path`（皆 advisory）。
 """
 from __future__ import annotations
 
@@ -21,10 +26,16 @@ LINUX_CHECKS = [
     "pyyaml",
     "serialwrap_on_path",
     "serialwrapd_on_path",
+    "other_serialwrap_installs",
     "dialout",
+    # #149：human console 就緒檢查組（wrapper／jq／minicom 是否在 PATH）。
+    "serialwrap_minicom_on_path",
+    "jq_on_path",
+    "minicom_on_path",
     "systemd",
     "supervision_mode",
     "single_daemon",
+    "wal_dir",
     "devices",
     "wsl_systemd",
 ]
@@ -35,8 +46,10 @@ WINDOWS_CHECKS = [
     "pyserial",
     "serialwrap_on_path",
     "serialwrapd_on_path",
+    "other_serialwrap_installs",
     "supervision_mode",
     "daemon_endpoint",
+    "wal_dir",
     "devices",
 ]
 
@@ -59,6 +72,62 @@ def test_doctor_dialout_ok_when_member():
     report = run_doctor(fx=FakeEffects(systemd=True, in_groups={"dialout"}), platform="linux")
     item = next(i for i in report if i["check"] == "dialout")
     assert item["ok"] is True and item["fix"] == ""
+
+
+class TestHumanConsoleReadinessChecks:
+    """#149：human console 就緒檢查組——`serialwrap-minicom`／`jq`／`minicom` 是否在
+    PATH，比照既有 `_check_dialout` 的測試先例，用 `FakeEffects(which={...})` 控制。"""
+
+    def test_doctor_reports_serialwrap_minicom_missing_with_fix(self):
+        fx = FakeEffects(systemd=True, in_groups={"dialout"})  # which 留空
+        report = run_doctor(fx=fx, platform="linux")
+        item = next(i for i in report if i["check"] == "serialwrap_minicom_on_path")
+        assert item["ok"] is False
+        assert "serialwrap setup" in item["fix"]
+
+    def test_doctor_serialwrap_minicom_ok_when_on_path(self):
+        # 刻意避開 /home/<user>/ 前綴（R-21 結構偵測器會誤觸個人絕對路徑掃描）。
+        path = "/opt/serialwrap/bin/serialwrap-minicom"
+        fx = FakeEffects(
+            systemd=True, in_groups={"dialout"},
+            which={"serialwrap-minicom": path},
+        )
+        report = run_doctor(fx=fx, platform="linux")
+        item = next(i for i in report if i["check"] == "serialwrap_minicom_on_path")
+        assert item["ok"] is True and item["fix"] == ""
+        assert item["detail"] == path
+
+    def test_doctor_reports_jq_missing_with_fix(self):
+        fx = FakeEffects(systemd=True, in_groups={"dialout"})
+        report = run_doctor(fx=fx, platform="linux")
+        item = next(i for i in report if i["check"] == "jq_on_path")
+        assert item["ok"] is False
+        assert "apt install jq" in item["fix"]
+
+    def test_doctor_jq_ok_when_on_path(self):
+        fx = FakeEffects(
+            systemd=True, in_groups={"dialout"},
+            which={"jq": "/usr/bin/jq"},
+        )
+        report = run_doctor(fx=fx, platform="linux")
+        item = next(i for i in report if i["check"] == "jq_on_path")
+        assert item["ok"] is True and item["fix"] == ""
+
+    def test_doctor_reports_minicom_binary_missing_with_fix(self):
+        fx = FakeEffects(systemd=True, in_groups={"dialout"})
+        report = run_doctor(fx=fx, platform="linux")
+        item = next(i for i in report if i["check"] == "minicom_on_path")
+        assert item["ok"] is False
+        assert "apt install minicom" in item["fix"]
+
+    def test_doctor_minicom_binary_ok_when_on_path(self):
+        fx = FakeEffects(
+            systemd=True, in_groups={"dialout"},
+            which={"minicom": "/usr/bin/minicom"},
+        )
+        report = run_doctor(fx=fx, platform="linux")
+        item = next(i for i in report if i["check"] == "minicom_on_path")
+        assert item["ok"] is True and item["fix"] == ""
 
 
 def test_doctor_python_check_passes_on_current_interpreter():
@@ -180,19 +249,186 @@ class TestCliAdvisorySets:
             {"check": "pyserial", "ok": True},
             {"check": "serialwrap_on_path", "ok": False},
             {"check": "serialwrapd_on_path", "ok": False},
+            {"check": "other_serialwrap_installs", "ok": False},
             {"check": "supervision_mode", "ok": True},
             {"check": "daemon_endpoint", "ok": False},
+            {"check": "wal_dir", "ok": True},
             {"check": "devices", "ok": False},
         ]
+        assert "wal_dir" in cli._DOCTOR_ADVISORY_CHECKS_WIN
         assert all(
             item["ok"] or item["check"] in cli._DOCTOR_ADVISORY_CHECKS_WIN for item in report
         )
-        report[2]["ok"] = False  # pyserial 掛
+        report[-2]["ok"] = False  # wal_dir 掛（shell/daemon 不一致）仍應被 advisory 吸收
+        assert all(
+            item["ok"] or item["check"] in cli._DOCTOR_ADVISORY_CHECKS_WIN for item in report
+        )
+        report[2]["ok"] = False  # pyserial 掛（非 advisory）
         assert not all(
             item["ok"] or item["check"] in cli._DOCTOR_ADVISORY_CHECKS_WIN for item in report
         )
 
-    def test_linux_advisory_set_unchanged(self):
+    def test_linux_advisory_set_includes_human_console_checks_149(self):
+        """#154：新增 other_serialwrap_installs 為 advisory——純診斷資訊，偵測到
+        多份不同版本安裝也不應讓整體 doctor 判定失敗（呼應 (b) 的「勿擋」精神）。
+        #148：wal_dir（shell/daemon WAL_DIR 不一致）亦為 advisory、僅 WARN 不擋。
+        #149（刻意擴充，比照 #131 平台感知變更的先例）：human console 就緒檢查組
+        （serialwrap_minicom_on_path／jq_on_path／minicom_on_path）同為 advisory——
+        純 agent-only headless 部署不需要 human console，缺席不該拉低整體 ok。"""
         from sw_core import cli
 
-        assert cli._DOCTOR_ADVISORY_CHECKS == {"systemd", "wsl_systemd", "devices"}
+        assert cli._DOCTOR_ADVISORY_CHECKS == {
+            "systemd", "wsl_systemd", "devices", "other_serialwrap_installs", "wal_dir",
+            "serialwrap_minicom_on_path", "jq_on_path", "minicom_on_path",
+        }
+
+
+class TestOtherSerialwrapInstalls:
+    """#154：`_check_other_serialwrap_installs`——同機 PATH 上多份 serialwrap 安裝的
+    版本一致性診斷。"""
+
+    def _item(self, report):
+        return next(i for i in report if i["check"] == "other_serialwrap_installs")
+
+    def test_no_path_match_is_ok_and_skips_subprocess(self):
+        fx = FakeEffects(systemd=True, in_groups={"dialout"})  # which_all 預設空
+        report = run_doctor(fx=fx, platform="linux")
+        item = self._item(report)
+        assert item["ok"] is True
+        assert fx.calls == []
+
+    def test_single_install_is_ok_and_skips_subprocess(self):
+        fx = FakeEffects(
+            systemd=True, in_groups={"dialout"},
+            which_all={"serialwrap": ["/usr/local/bin/serialwrap"]},
+        )
+        report = run_doctor(fx=fx, platform="linux")
+        item = self._item(report)
+        assert item["ok"] is True
+        assert item["detail"] == "僅偵測到目前這份"
+        assert fx.calls == []  # trivially single 時不跑 subprocess（效能設計）
+
+    def test_two_installs_same_version_is_ok(self):
+        path_a, path_b = "/opt/a/serialwrap", "/opt/b/serialwrap"
+        fx = FakeEffects(
+            systemd=True, in_groups={"dialout"},
+            which_all={"serialwrap": [path_a, path_b]},
+            commands={
+                (path_a, "--version"): (0, "serialwrap 0.2.4", ""),
+                (path_b, "--version"): (0, "serialwrap 0.2.4", ""),
+            },
+        )
+        report = run_doctor(fx=fx, platform="linux")
+        item = self._item(report)
+        assert item["ok"] is True
+        assert path_a in item["detail"] and path_b in item["detail"]
+
+    def test_two_installs_different_version_is_not_ok(self):
+        path_a, path_b = "/opt/a/serialwrap", "/opt/b/serialwrap"
+        fx = FakeEffects(
+            systemd=True, in_groups={"dialout"},
+            which_all={"serialwrap": [path_a, path_b]},
+            commands={
+                (path_a, "--version"): (0, "serialwrap 0.2.4", ""),
+                (path_b, "--version"): (0, "serialwrap 0.2.1", ""),
+            },
+        )
+        report = run_doctor(fx=fx, platform="linux")
+        item = self._item(report)
+        assert item["ok"] is False
+        assert "0.2.4" in item["detail"] and "0.2.1" in item["detail"]
+        assert item["fix"]
+
+    def test_timeout_or_nonzero_rc_marked_unavailable_not_raised(self):
+        """某路徑 --version 逾時／非零 rc → 該筆列為「無法取得」，不拋例外；
+        與其他已解析版本不同即 ok=False（可疑訊號，不靜默吞掉）。"""
+        path_a, path_b = "/opt/a/serialwrap", "/opt/b/serialwrap"
+        fx = FakeEffects(
+            systemd=True, in_groups={"dialout"},
+            which_all={"serialwrap": [path_a, path_b]},
+            commands={
+                (path_a, "--version"): (0, "serialwrap 0.2.4", ""),
+                (path_b, "--version"): (-1, "", "TIMEOUT"),
+            },
+        )
+        report = run_doctor(fx=fx, platform="linux")
+        item = self._item(report)
+        assert item["ok"] is False
+        assert "無法取得" in item["detail"]
+
+    def test_run_called_with_short_timeout(self):
+        path_a, path_b = "/opt/a/serialwrap", "/opt/b/serialwrap"
+        fx = FakeEffects(
+            systemd=True, in_groups={"dialout"},
+            which_all={"serialwrap": [path_a, path_b]},
+        )
+        run_doctor(fx=fx, platform="linux")
+        assert fx.timeouts and all(t == 2.0 for t in fx.timeouts)
+
+
+class TestWalDirCheck:
+    """#148：doctor 印出 daemon 實際生效 WAL_DIR，shell 覆寫不一致時 WARN。"""
+
+    def _item(self, monkeypatch, *, reachable, wal_path=None, env=None, platform="linux"):
+        def _fake_rpc(endpoint, method, params, timeout_s=0.5, **kw):
+            assert method == "health.status"
+            if not reachable:
+                return {"ok": False, "error_code": "SOCKET_ERROR"}
+            return {"ok": True, "wal_path": wal_path}
+        monkeypatch.setattr("sw_core.client.rpc_call", _fake_rpc)
+        monkeypatch.setattr("sw_core.cli._safe_runtime_config", lambda: None)
+        if env is None:
+            monkeypatch.delenv("SERIALWRAP_WAL_DIR", raising=False)
+        else:
+            monkeypatch.setenv("SERIALWRAP_WAL_DIR", env)
+        report = run_doctor(fx=FakeEffects(systemd=True, in_groups={"dialout"}), platform=platform)
+        return next(i for i in report if i["check"] == "wal_dir")
+
+    def test_daemon_unreachable_is_informational_ok(self, monkeypatch):
+        item = self._item(monkeypatch, reachable=False)
+        assert item["ok"] is True
+        assert item["fix"] == ""
+
+    def test_daemon_reachable_no_shell_override_is_ok(self, monkeypatch):
+        # 刻意避開 /home/<user>/ 前綴（R-21 結構偵測器會誤觸個人絕對路徑掃描）。
+        item = self._item(monkeypatch, reachable=True,
+                           wal_path="/srv/serialwrap-state/wal/raw.wal.ndjson")
+        assert item["ok"] is True
+        assert "/srv/serialwrap-state/wal" in item["detail"]
+
+    def test_shell_override_matching_daemon_is_ok(self, monkeypatch):
+        item = self._item(monkeypatch, reachable=True,
+                           wal_path="/srv/custom-wal/raw.wal.ndjson",
+                           env="/srv/custom-wal")
+        assert item["ok"] is True
+
+    def test_shell_override_mismatch_warns_with_systemd_hint(self, monkeypatch):
+        item = self._item(monkeypatch, reachable=True,
+                           wal_path="/srv/serialwrap-state/wal/raw.wal.ndjson",
+                           env="/srv/b-log")
+        assert item["ok"] is False
+        assert "b-log" in item["detail"] and "serialwrap-state/wal" in item["detail"]
+        assert "systemd" in item["fix"] and "Environment=" in item["fix"]
+
+    def test_wal_dir_check_present_in_linux_and_windows_lists(self, monkeypatch):
+        monkeypatch.delenv("SERIALWRAP_WAL_DIR", raising=False)
+        with mock.patch("sw_core.client.rpc_call", lambda *a, **k: {"ok": False}):
+            linux = {i["check"] for i in run_doctor(fx=FakeEffects(systemd=True, in_groups={"dialout"}), platform="linux")}
+            win = {i["check"] for i in run_doctor(fx=FakeEffects(systemd=False, in_groups=set()), platform="win32")}
+        assert "wal_dir" in linux and "wal_dir" in win
+
+
+class TestAdvisoryStamp:
+    """run_doctor 對 per-check 蓋章 advisory 欄位（機器消費者契約，#148 整合修正）。"""
+
+    def test_linux_report_carries_advisory_field(self):
+        report = run_doctor(fx=FakeEffects(systemd=True, in_groups={"dialout"}), platform="linux")
+        by_name = {c["check"]: c for c in report}
+        assert by_name["wal_dir"]["advisory"] is True
+        assert by_name["python"]["advisory"] is False
+
+    def test_windows_report_carries_advisory_field(self):
+        report = run_doctor(fx=FakeEffects(systemd=False, in_groups=set()), platform="win32")
+        by_name = {c["check"]: c for c in report}
+        assert by_name["wal_dir"]["advisory"] is True
+        assert by_name["python"]["advisory"] is False

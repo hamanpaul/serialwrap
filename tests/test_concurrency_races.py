@@ -3,6 +3,7 @@
 - RACE-1：RX fan-out 改在持 _state_lock 下逐一寫入（消除 snapshot-fd-then-close 之 use-after-close）。
 - STA-4：規則 regex 加 ReDoS 靜態防護（長度上限 + 巢狀量詞拒絕）。
 """
+import collections
 import fcntl
 import os
 import threading
@@ -28,6 +29,8 @@ def _bridge(tmp_path):
     b._rx_lock = threading.Lock()
     b._rx_text = ""
     b._rx_max_chars = 1000
+    b._rx_window = collections.deque()  # #153 RX 速率視窗
+    b._rx_total_bytes = 0  # #150 raw RX 累計
     b._on_rx_data = None
     return b
 

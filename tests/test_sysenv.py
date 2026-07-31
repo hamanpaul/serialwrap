@@ -57,6 +57,106 @@ def test_system_effects_which_and_groups_do_not_raise():
 
 
 # ---------------------------------------------------------------------------
+# which_all()／run(timeout_s=...)（#154：doctor 多份安裝診斷需要）
+# ---------------------------------------------------------------------------
+
+import os
+import stat
+import tempfile
+
+
+def _make_executable(path):
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("#!/bin/sh\necho hi\n")
+    os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def test_system_effects_which_all_finds_all_matches_in_path_order(monkeypatch):
+    from sw_core.sysenv import SystemEffects
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dir_a = os.path.join(tmp, "a")
+        dir_b = os.path.join(tmp, "b")
+        os.mkdir(dir_a)
+        os.mkdir(dir_b)
+        path_a = os.path.join(dir_a, "myserialwrap")
+        path_b = os.path.join(dir_b, "myserialwrap")
+        _make_executable(path_a)
+        _make_executable(path_b)
+        monkeypatch.setenv("PATH", os.pathsep.join([dir_a, dir_b]))
+
+        fx = SystemEffects()
+        got = fx.which_all("myserialwrap")
+        assert got == [path_a, path_b]
+
+
+def test_system_effects_which_all_excludes_non_executable(monkeypatch):
+    from sw_core.sysenv import SystemEffects
+
+    with tempfile.TemporaryDirectory() as tmp:
+        non_exec = os.path.join(tmp, "myserialwrap")
+        with open(non_exec, "w", encoding="utf-8") as fh:
+            fh.write("not executable\n")
+        monkeypatch.setenv("PATH", tmp)
+
+        fx = SystemEffects()
+        assert fx.which_all("myserialwrap") == []
+
+
+def test_system_effects_which_all_empty_when_no_match(monkeypatch):
+    from sw_core.sysenv import SystemEffects
+
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setenv("PATH", tmp)
+        fx = SystemEffects()
+        assert fx.which_all("definitely-not-a-binary-xyz") == []
+
+
+def test_system_effects_run_default_timeout_none_unchanged_behavior():
+    """不帶 timeout_s（既有呼叫）行為與修改前逐位元組相同：正常完成、不逾時。"""
+    from sw_core.sysenv import SystemEffects
+
+    fx = SystemEffects()
+    rc, out, err = fx.run(["python3", "-c", "print('ok')"])
+    assert rc == 0
+    assert "ok" in out
+
+
+def test_system_effects_run_timeout_returns_sentinel_not_raises():
+    from sw_core.sysenv import SystemEffects
+
+    fx = SystemEffects()
+    rc, out, err = fx.run(["sleep", "5"], timeout_s=0.1)
+    assert (rc, out, err) == (-1, "", "TIMEOUT")
+
+
+def test_fake_effects_which_all_default_empty():
+    from sw_core.sysenv import FakeEffects
+
+    fx = FakeEffects()
+    assert fx.which_all("serialwrap") == []
+
+
+def test_fake_effects_which_all_returns_configured_list():
+    from sw_core.sysenv import FakeEffects
+
+    fx = FakeEffects(which_all={"serialwrap": ["/a/serialwrap", "/b/serialwrap"]})
+    assert fx.which_all("serialwrap") == ["/a/serialwrap", "/b/serialwrap"]
+    assert fx.which_all("absent") == []
+
+
+def test_fake_effects_run_accepts_and_records_timeout_s():
+    from sw_core.sysenv import FakeEffects
+
+    fx = FakeEffects(commands={("x",): (0, "out", "")})
+    rc, out, _err = fx.run(["x"], timeout_s=2.0)
+    assert (rc, out) == (0, "out")
+    assert fx.timeouts == [2.0]
+    fx.run(["y"])  # 未帶 timeout_s → 記錄 None，介面對齊、行為不變
+    assert fx.timeouts == [2.0, None]
+
+
+# ---------------------------------------------------------------------------
 # force_utf8_stdio（#118）：Windows console 預設 cp1252 印繁中 help 會 UnicodeEncodeError，
 # CLI 進入點在 win32 需把 stdout/stderr 重設為 UTF-8；非 Windows 為 no-op。
 # ---------------------------------------------------------------------------

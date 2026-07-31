@@ -25,7 +25,10 @@ from .constants import (
     BOOT_BANNER_TAIL_CHARS,
     BOOT_QUIET_WINDOW_S,
     BOOTLOADER_RX_TAIL_BYTES,
+    ERROR_AUTOBOOT_QUIET,
     ERROR_CREDENTIALS_UNRESOLVED,
+    ERROR_RX_FLOOD,
+    ERROR_TRANSPORT_STALL,
     HUMAN_ACTIVE_WINDOW_S,
     LOG_DIR,
     MAX_RECOVERY_LEASE_S,
@@ -33,17 +36,25 @@ from .constants import (
     REPROBE_MAX_ATTEMPTS,
     REPROBE_MAX_INTERVAL_S,
     REPROBE_RX_IDLE_S,
+    RX_FLOOD_BYTES_PER_10S,
     STATE_PATH,
     _HUMAN_PEER_GRACE_S,
 )
 from .device_watcher import DeviceInfo
+from .file_transfer import DEFAULT_CHUNK_SIZE
 from .login_fsm import detect_boot_banner, detect_template, ensure_ready, probe_ready
+from .transport_stall import classify_probe_failure, transport_stall_hint
 from .uart_io import PreservedConsoles, UARTBridge, _pty_available
 from .util import clean_text, now_iso
 from .wal import WalWriter
 
 
 _ATTACHED_CONSOLE_LEASE_TIMEOUT_S = 86400.0
+
+# 檔案傳輸每段等待逾時的下限（#157）：未顯式帶 chunk_timeout_s 時沿用
+# profile.timeout_s，但夾一個地板防止 profile 被設過低導致傳輸必逾時。
+_MIN_FILE_CHUNK_TIMEOUT_S = 5.0   # push 每個 chunk 等待下限
+_MIN_FILE_PULL_TIMEOUT_S = 30.0   # pull 整段讀取等待下限（維持原 30.0 行為基準）
 
 
 def _replace_state_file(tmp_path: str, dst_path: str, *, retry: bool | None = None) -> None:
@@ -235,7 +246,9 @@ class _PostCloseAction:
 class SessionRuntime:
     session_id: str
     profile: SessionProfile
-    last_error: str | None = None
+    # last_error 已改為 property（見下方 _last_error；#150）：值變更時自動清
+    # last_error_detail，一處根除 stale detail。建構子不再接受 last_error=
+    # （全 repo 建構皆僅 session_id+profile，已 grep 驗證）。
     detached_at: str | None = None
     last_ready_at: str | None = None
     vtty_path: str | None = None
@@ -267,6 +280,12 @@ class SessionRuntime:
     # 帳密解析終態一次性示警去重（#140）：進入 CREDENTIALS_UNRESOLVED 已告警即設 True，
     # 抑制 recovery 迴圈逐輪重複告警；手動 attach/recover（重新介入）時重置為 False。
     credentials_warned: bool = False
+    # last_error 的人類可讀補充（#150）：目前僅 TRANSPORT_STALL 會帶 host 層復原提示；
+    # last_error property setter 於值變更時自動清空，不殘留 stale detail。
+    last_error_detail: str | None = None
+    # transport stall 一次性示警去重（#150，仿 credentials_warned 慣例）：
+    # 已告警即設 True；_mark_session_rx（RX 恢復）時重臂為 False。
+    transport_stall_warned: bool = False
     # device handoff（issue #54）
     released_by: str | None = None
     released_at: str | None = None
@@ -283,11 +302,14 @@ class SessionRuntime:
     #     分支共用的唯一 probe 入口）
     #   - _recover_after_failure 的 CTRL_C/CTRL_D 強制按鍵迴圈（agent 命令逾時觸發）
     #   - _self_test_impl 的 READY 分支 nonce probe
-    # **絕不** gate human console bytes、interactive lease TX 與 agent 顯式命令
-    # （與 #114「刻意進 bootloader」的未來需求相容：human/lease 送鍵永遠放行）。
-    # 已知架構限制（#130 Finding 4，未修、待 follow-up issue）：本欄位只影響上述自動 probe
-    # gate，**不**改動 session.state；spontaneous reboot 時 state 可能仍停在 READY，此狀態下
-    # agent 顯式命令仍可能撞上 autoboot（不受本欄位保護，需要新 state 或 arbiter 層 gate）。
+    # **絕不** gate human console bytes 與 interactive lease TX（與 #114「刻意進
+    # bootloader」相容：human/lease 送鍵永遠放行）。
+    # #130 Finding 4 已由 #139 收斂：本欄位仍**不**改動 session.state，但 agent 顯式
+    # 命令（command.submit／file.push／file.pull）在「quiet armed 且 session 尚未重新
+    # 確認 READY」的過渡態被雙層 gate（submit-time：service._resolve_session_id；
+    # execute-time：execute_command／file_push／file_pull）以可重試的 AUTOBOOT_QUIET
+    # 即時拒絕、零 UART 副作用；任一 READY 轉移點落定時同步 clear_boot_quiet()，
+    # 故 session 回 READY 後 agent 顯式命令永遠放行。
     boot_quiet_until: float = 0.0
     # banner 偵測用 rolling RX tail（跨 chunk 邊界）；純內部狀態，不出 to_public_dict。
     boot_banner_tail: str = ""
@@ -296,6 +318,20 @@ class SessionRuntime:
     # recovery lease stash（Phase B issue #44）
     _stashed_human_lease: InteractiveLease | None = dataclasses.field(default=None, repr=False)
     _state: str = dataclasses.field(default="DETACHED", init=False, repr=False)
+    _last_error: str | None = dataclasses.field(default=None, init=False, repr=False)
+
+    @property
+    def last_error(self) -> str | None:
+        return self._last_error
+
+    @last_error.setter
+    def last_error(self, value: str | None) -> None:
+        # 值變更時自動清 detail（#150）：detail 永遠只描述當前 last_error，
+        # 呼叫端如需附 detail，須在設定 last_error **之後**再設 last_error_detail。
+        prev = getattr(self, "_last_error", None)
+        if prev != value:
+            self.last_error_detail = None
+        self._last_error = value
 
     @property
     def state(self) -> str:
@@ -361,6 +397,18 @@ class SessionRuntime:
             console_endpoint = self.bridge.console_endpoint()
         elif self.retained_consoles is not None:
             console_count = len(self.retained_consoles.clients)
+        # RX 速率指標（#153）：getattr 防禦——既有多個測試 FakeBridge 無 rx_stats，
+        # 回傳非 dict（如 MagicMock）也一律視為不支援 → 欄位為 None。
+        rx_stats: dict[str, Any] | None = None
+        rx_stats_fn = getattr(self.bridge, "rx_stats", None) if self.bridge is not None else None
+        if callable(rx_stats_fn):
+            try:
+                candidate = rx_stats_fn()
+            except Exception:
+                candidate = None
+            if isinstance(candidate, dict):
+                rx_stats = candidate
+        now_mono = time.monotonic()
         vtty_path = self.vtty_path
         if vtty_path is None and self.retained_consoles is not None:
             vtty_path = self.retained_consoles.primary_vtty()
@@ -377,6 +425,8 @@ class SessionRuntime:
             "command_capable": self.profile.command_capable,
             "state": self.state,
             "last_error": self.last_error,
+            # last_error 的人類可讀補充（#150）：TRANSPORT_STALL 時帶 host 層復原提示。
+            "last_error_detail": self.last_error_detail,
             "detached_at": self.detached_at,
             "last_ready_at": self.last_ready_at,
             "vtty": vtty_path,
@@ -402,6 +452,17 @@ class SessionRuntime:
                 else None
             ),
             "idle_for_ms": self.compute_idle_ms(),
+            # RX/TX 單邊年齡（#150）：idle_for_ms 取 max(rx,tx) 會被 probe/human TX 拉小，
+            # stall（RX 單邊凍結）在 session list 看不出來；此兩欄讓 operator 一眼判讀。
+            "last_rx_age_s": (
+                round(now_mono - self.last_rx_mono, 1) if self.last_rx_mono > 0.0 else None
+            ),
+            "last_tx_age_s": (
+                round(now_mono - self.last_tx_mono, 1) if self.last_tx_mono > 0.0 else None
+            ),
+            # RX 速率指標（#153）：bridge 無/不支援 rx_stats 時為 None。
+            "rx_bytes_last_10s": rx_stats.get("rx_bytes_last_10s") if rx_stats else None,
+            "rx_rate_bps": rx_stats.get("rx_rate_bps") if rx_stats else None,
             "outstanding_commands": outstanding,
             "activity_classification": self.classify_activity(),
             "released_by": self.released_by,
@@ -434,6 +495,7 @@ class SessionManager:
         on_ready: Callable[[str], None],
         on_detached: Callable[[str], None],
         on_console_line: Callable[[str, str, str], None] | None = None,
+        on_command_flush: Callable[[str, str], None] | None = None,
         state_path: str | None = None,
     ) -> None:
         # state.json 路徑注入（#120）：daemon 走 default（模組層 STATE_PATH），測試注入 tmp。
@@ -444,6 +506,7 @@ class SessionManager:
         self._on_ready = on_ready
         self._on_detached = on_detached
         self._on_console_line = on_console_line
+        self._on_command_flush = on_command_flush
         self._lock = threading.RLock()
         # state.json 寫入序列化（#133）：多 attach 執行緒並發 os.replace 同一目的檔在
         # Windows 會 WinError 5；獨立於 self._lock（snapshot 用），I/O 段專用、不巢狀他鎖。
@@ -848,18 +911,126 @@ class SessionManager:
             # 稽核寫入為 best-effort，不得讓告警路徑拋出中斷 attach/recovery。
             pass
 
+    # --- RX 指標防禦讀取與 probe 失敗精煉（#150 #153）---------------------------
+    @staticmethod
+    def _bridge_rx_bytes_last_10s(bridge: Any) -> int | None:
+        """defensive 讀 bridge.rx_stats()['rx_bytes_last_10s']（#153）。
+
+        測試 fake bridge 無此法／回傳非 dict（MagicMock）時一律回 None（視為不支援）。
+        """
+        fn = getattr(bridge, "rx_stats", None)
+        if not callable(fn):
+            return None
+        try:
+            stats = fn()
+        except Exception:
+            return None
+        if not isinstance(stats, dict):
+            return None
+        value = stats.get("rx_bytes_last_10s")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return int(value)
+
+    @staticmethod
+    def _bridge_rx_total(bridge: Any) -> int | None:
+        """defensive 讀 bridge.rx_total_bytes()（#150）；不支援時回 None。"""
+        fn = getattr(bridge, "rx_total_bytes", None)
+        if not callable(fn):
+            return None
+        try:
+            value = fn()
+        except Exception:
+            return None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return int(value)
+
+    def _refine_probe_failure(
+        self,
+        session: SessionRuntime,
+        bridge: UARTBridge,
+        err: str | None,
+        rx_before: int | None,
+    ) -> tuple[str | None, str | None]:
+        """probe 失敗碼的 transport 層精煉（#150，單一 choke point）。
+
+        回傳 ``(err, detail)``：翻轉為 TRANSPORT_STALL 時 detail 帶 host 層復原提示，
+        並做一次性 log + WAL META 告警（``transport_stall_warned`` 去重、RX 恢復重臂）；
+        其餘原樣直通、detail=None。**只在真的送過 probe 後呼叫**——boot-quiet 合成的
+        PROMPT_UNAVAILABLE（沒送 probe、且 quiet 代表剛有 RX）不得經此。不得在持有
+        self._lock 時呼叫（內部會取鎖做去重）。
+        """
+        if err is None:
+            return None, None
+        rx_after = self._bridge_rx_total(bridge)
+        if rx_before is None or rx_after is None:
+            return err, None
+        now = time.monotonic()
+        refined, flipped = classify_probe_failure(
+            err,
+            rx_delta=rx_after - rx_before,
+            last_rx_mono=session.last_rx_mono,
+            now=now,
+        )
+        if not flipped:
+            return err, None
+        rx_age_s = now - session.last_rx_mono
+        real_path = getattr(bridge, "device_path", None)
+        detail = transport_stall_hint(real_path, rx_age_s)
+        emit = False
+        with self._lock:
+            current = self._sessions.get(session.session_id)
+            if current is not None and not current.transport_stall_warned:
+                current.transport_stall_warned = True
+                emit = True
+        if emit:
+            import logging
+            logging.getLogger("serialwrap").warning(
+                "session %s 疑似 transport stall（零 RX %.1fs、probe 全程無 echo，real_path=%s）：%s",
+                session.profile.com, rx_age_s, real_path or "-", detail,
+            )
+            try:
+                self._wal.append(
+                    com=session.profile.com,
+                    direction="META",
+                    source="system",
+                    payload=b"",
+                    meta={
+                        "event": "transport_stall_suspected",
+                        "real_path": real_path or "",
+                        "rx_age_s": round(rx_age_s, 1),
+                    },
+                )
+            except Exception:
+                # 稽核寫入為 best-effort，不得讓告警路徑拋出中斷 attach/recovery。
+                pass
+        return refined, detail
+
     def _is_reprobe_prompt_error(self, state: str, last_error: str | None) -> bool:
+        # RX_FLOOD（#153）／TRANSPORT_STALL（#150）必須保留 reprobe 資格：
+        # - RX_FLOOD：洪水中 _rx_idle_enough 天然退避，排空後 3s 內自動接手升 READY
+        #   ——漏加會讓 flood session 永不自動重探、卡死 ATTACHED（比原病更糟）。
+        # - TRANSPORT_STALL：probe 是無害 newline，誤判時可自癒（RX 一恢復，下次
+        #   probe 見 echo → delta>0 → 回原分類或升 READY）。
         if not last_error:
             return False
         prompt_related = (
             last_error == "PROMPT_UNAVAILABLE"
             or last_error == "PROMPT_TIMEOUT"
             or last_error.endswith("_PROMPT_TIMEOUT")
+            or last_error == ERROR_RX_FLOOD
+            or last_error == ERROR_TRANSPORT_STALL
         )
         if state == "ATTACHED":
             return prompt_related
         if state == "DETACHED":
-            return last_error == "PROMPT_TIMEOUT" or last_error.endswith("_PROMPT_TIMEOUT")
+            return (
+                last_error == "PROMPT_TIMEOUT"
+                or last_error.endswith("_PROMPT_TIMEOUT")
+                or last_error == ERROR_RX_FLOOD
+                or last_error == ERROR_TRANSPORT_STALL
+            )
         return False
 
     def _rx_idle_enough(self, session: SessionRuntime, now: float) -> bool:
@@ -1762,6 +1933,8 @@ class SessionManager:
         """Update session's last_rx_at / last_rx_mono. Cheap; safe outside lock."""
         session.last_rx_at = now_iso()
         session.last_rx_mono = time.monotonic()
+        # RX 恢復即重臂 transport stall 一次性告警（#150）：下次再 stall 允許再告警一次。
+        session.transport_stall_warned = False
 
     def _update_boot_quiet_locked(self, session: SessionRuntime, chunk: str) -> None:
         """依 RX 內容維護 boot quiet window（#130）。須在 ``self._lock`` 內呼叫。
@@ -1772,7 +1945,8 @@ class SessionManager:
         - quiet window 進行中，RX 匹配該 session template 的 ``login_regex`` 或
           ``prompt_regex``（開機完成訊號）→ 立即解除，讓 recovery / reprobe 恢復探測。
           但尾行先命中 ``bootloader_prompts``（見下方 Finding 3 說明）時例外不解除。
-        - 只影響 source=system 的自動 probe gate；不 gate human/lease/agent TX。
+        - gate source=system 的自動 probe 與（#139）非 human 來源的 agent 顯式命令
+          （submit/execute/file 傳輸雙層 gate）；不 gate human console／lease TX。
 
         比對用 rolling tail（``BOOT_BANNER_TAIL_CHARS`` 字元）跨 chunk 邊界拼接，
         容忍 banner／prompt 被 RX 讀取切割。
@@ -1837,9 +2011,24 @@ class SessionManager:
             # #130：quiet window 維護須看見**所有** RX（含 foreground 期間），
             # 故置於 foreground_busy gate 之前。
             self._update_boot_quiet_locked(session, chunk)
+            # background capture 無條件接收 RX（#159）：不受 foreground_busy 影響——
+            # background 命令自己送出後、等 prompt 比對成功前的整段等待期間
+            # foreground_busy 也是 True（fg/bg 共用同一段等待邏輯），若被 gate 掉，
+            # 快速完成的命令會在 chunk 機制真正掛上前就把全部輸出送完。
+            # 已終結（status != "active"）的 capture 仍會被 continue 跳過；新的
+            # 非-background 命令開始時，既有 active background capture 已在
+            # _execute_command_inner 進入 busy 前先行終結，故不會被新命令自己的
+            # TX echo 汙染。
+            for cmd_id in list(session.background_cmd_ids):
+                capture = self._background.get(cmd_id)
+                if capture is None or capture.status != "active":
+                    continue
+                capture.add_chunk(chunk, BG_CAPTURE_MAX_BYTES)
+                capture.last_activity_mono = time.monotonic()
+                capture.last_seq = self._wal.current_seq
             if session.foreground_busy:
                 return
-            # agent log capture
+            # agent log capture（維持原行為：foreground 期間不寫 agent log）
             cap = session.active_capture
             if cap is not None and cap.status == "active":
                 fp = self._capture_fps.get(cap.capture_id)
@@ -1851,13 +2040,6 @@ class SessionManager:
                         cap.line_count += chunk.count("\n")
                     except Exception:
                         pass
-            for cmd_id in list(session.background_cmd_ids):
-                capture = self._background.get(cmd_id)
-                if capture is None or capture.status != "active":
-                    continue
-                capture.add_chunk(chunk, BG_CAPTURE_MAX_BYTES)
-                capture.last_activity_mono = time.monotonic()
-                capture.last_seq = self._wal.current_seq
 
     def _handle_bridge_down(self, session_id: str, bridge: UARTBridge, reason: str) -> None:
         by_id: str | None = None
@@ -1900,6 +2082,9 @@ class SessionManager:
                 current.last_error = "PROMPT_UNAVAILABLE"
                 return {"ok": True, "session": current.to_public_dict()}
 
+        # #150：probe 前採樣 raw RX 累計，失敗後取差精煉 transport stall。
+        rx_before = self._bridge_rx_total(bridge)
+
         if session.profile.login_regex:
             auth, auth_res = resolve_session_auth(session.profile)
             if self._credentials_declared_but_unresolved(session.profile, auth_res):
@@ -1914,6 +2099,12 @@ class SessionManager:
                 ok, err = probe_ready(bridge, session.profile)
         else:
             ok, err = probe_ready(bridge, session.profile)
+
+        # #150：真的送過 probe 且失敗 → transport 層精煉（CREDENTIALS_UNRESOLVED
+        # 不屬可精煉集合，經此為 no-op）。
+        err_detail: str | None = None
+        if not ok:
+            err, err_detail = self._refine_probe_failure(session, bridge, err, rx_before)
 
         notify_ready = False
         with self._lock:
@@ -1931,6 +2122,14 @@ class SessionManager:
             current.pending_auto_login = False
             if ok:
                 current.state = "READY"
+                # #139：READY＝ready probe 實際成功＝板已開完機；殘留 quiet window
+                # （probe 期間 banner 才 arm、尚未被 prompt 解除／過期）不得再 gate
+                # agent 顯式命令——保證「READY 後立即 submit 必成功」恆真，gate 生效
+                # 窗口精確等於「banner arm 之後、session 尚未重新確認 READY 之前」。
+                # 已知殘留競態（#139 risks，需知悉）：probe 在 lock 外成功後、本 lock
+                # 內 READY 落定前，真 banner 恰好 arm 會被此 clear 抹掉一次——依賴
+                # U-Boot 多行 banner／倒數行後續 RX re-arm 補位，殘留窗小但非零。
+                current.clear_boot_quiet()
                 current.last_error = None
                 current.last_ready_at = now_iso()
                 self._reset_reprobe_progress_locked(current)
@@ -1938,6 +2137,7 @@ class SessionManager:
             else:
                 current.state = "ATTACHED"
                 current.last_error = err
+                current.last_error_detail = err_detail
             result = current.to_public_dict()
         if notify_ready:
             self._on_ready(session.session_id)
@@ -2015,6 +2215,8 @@ class SessionManager:
 
         try:
             bridge.start()
+            # #150：probe 前採樣 raw RX 累計（bridge 剛 start，計數從 0 起）。
+            rx_before = self._bridge_rx_total(bridge)
             with self._lock:
                 boot_quiet = session.boot_quiet_active()
             if not command_capable:
@@ -2037,6 +2239,8 @@ class SessionManager:
                 elif auth.username and auth.password:
                     ok, err = ensure_ready(bridge, profile, auth=auth)
                     if not ok:
+                        # #150：於 bridge.stop() 前精煉（stop 後計數仍可讀，但語意上先取）。
+                        err, err_detail = self._refine_probe_failure(session, bridge, err, rx_before)
                         preserved = bridge.stop(preserve_consoles=True)
                         with self._lock:
                             self._store_retained_consoles_locked(
@@ -2047,6 +2251,7 @@ class SessionManager:
                             )
                             session.state = "DETACHED"
                             session.last_error = err
+                            session.last_error_detail = err_detail
                             session.detached_at = now_iso()
                             session.bridge = None
                             session.attached_real_path = None
@@ -2057,6 +2262,12 @@ class SessionManager:
                     ok, err = probe_ready(bridge, profile)
             else:
                 ok, err = probe_ready(bridge, profile)
+
+            # #150：失敗才精煉；boot-quiet 合成的 PROMPT_UNAVAILABLE 沒送 probe、
+            # 且 quiet 代表剛有 RX，刻意排除不精煉。
+            err_detail: str | None = None
+            if not ok and not boot_quiet:
+                err, err_detail = self._refine_probe_failure(session, bridge, err, rx_before)
 
             notify_ready = False
             with self._lock:
@@ -2089,6 +2300,8 @@ class SessionManager:
                 session.retained_consoles = None
                 if ok:
                     session.state = "READY"
+                    # #139：READY 即解除 boot quiet gate（詳見 _probe_existing_bridge 註解）。
+                    session.clear_boot_quiet()
                     session.last_error = None
                     session.last_ready_at = now_iso()
                     session.recovering = False
@@ -2099,6 +2312,7 @@ class SessionManager:
                 else:
                     session.state = "ATTACHED"
                     session.last_error = err
+                    session.last_error_detail = err_detail
                     session.recovering = False
                     session.recovery_started_at = None
                 self._restore_retained_human_console_locked(session)
@@ -2250,6 +2464,8 @@ class SessionManager:
 
         try:
             bridge.start()
+            # #150：probe 前採樣 raw RX 累計（dynamic 路徑無 boot-quiet gate）。
+            rx_before = self._bridge_rx_total(bridge)
             if not command_capable:
                 ok, err = False, None
             elif require_login:
@@ -2263,10 +2479,13 @@ class SessionManager:
                 elif auth.username and auth.password:
                     ok, err = ensure_ready(bridge, profile, auth=auth)
                     if not ok:
+                        # #150：於 bridge.stop() 前精煉。
+                        err, err_detail = self._refine_probe_failure(session, bridge, err, rx_before)
                         bridge.stop()
                         with self._lock:
                             session.state = "DETACHED"
                             session.last_error = err
+                            session.last_error_detail = err_detail
                             session.detached_at = now_iso()
                             session.bridge = None
                             session.vtty_path = None
@@ -2277,6 +2496,11 @@ class SessionManager:
                     ok, err = probe_ready(bridge, profile)
             else:
                 ok, err = probe_ready(bridge, profile)
+
+            # #150：失敗才精煉（dynamic 路徑無 boot-quiet 合成錯，不需排除）。
+            err_detail: str | None = None
+            if not ok:
+                err, err_detail = self._refine_probe_failure(session, bridge, err, rx_before)
 
             notify_ready = False
             with self._lock:
@@ -2303,6 +2527,8 @@ class SessionManager:
                 session.bridge_generation += 1
                 if ok:
                     session.state = "READY"
+                    # #139：READY 即解除 boot quiet gate（詳見 _probe_existing_bridge 註解）。
+                    session.clear_boot_quiet()
                     session.last_error = None
                     session.last_ready_at = now_iso()
                     session.recovering = False
@@ -2315,6 +2541,7 @@ class SessionManager:
                 else:
                     session.state = "ATTACHED"
                     session.last_error = err
+                    session.last_error_detail = err_detail
                     session.recovering = False
                     session.recovery_started_at = None
             if notify_ready:
@@ -2607,6 +2834,8 @@ class SessionManager:
                             if session.state in {"FLASHING", "RELEASED"}:
                                 return
                             session.state = "READY"
+                            # #139：READY 即解除 boot quiet gate（詳見 _probe_existing_bridge 註解）。
+                            session.clear_boot_quiet()
                             session.last_error = None
                             session.last_ready_at = now_iso()
                             session.recovering = False
@@ -2672,9 +2901,12 @@ class SessionManager:
             )
             self._background[cmd_id] = capture
             self._evict_background_locked()
-        if chunks:
-            for c in chunks:
-                capture.add_chunk(c, BG_CAPTURE_MAX_BYTES)
+            # 僅「先前未掛載」（如 line 模式逾時）才回填 chunks；background 模式已
+            # 於命令送出前掛載並經 _on_bridge_rx 即時累積，此處收到的 chunks 是同
+            # 一段 RX 的全量重讀，重複疊加會造成 result_tail 內容重複（#159 review）。
+            if chunks:
+                for c in chunks:
+                    capture.add_chunk(c, BG_CAPTURE_MAX_BYTES)
         capture.last_seq = self._wal.current_seq
         capture.last_activity_mono = time.monotonic()
         capture.status = "error" if error_code else "done"
@@ -2702,6 +2934,11 @@ class SessionManager:
         self._mark_session_tx(session)
         bridge.send_command(command, source=source, cmd_id=cmd_id)
         if bridge.wait_for_regex_from(prompt_regex, pre_offset, min(timeout_s, 2.0)):
+            # #139（belt-and-suspenders）：2s 內 prompt 回來＝板其實沒重開。RX 解除
+            # 檢查（_update_boot_quiet_locked）通常已清 quiet，但 prompt 被 RX chunk
+            # 切割 miss 時，若不補清，READY session 會白白被 agent gate 到 180s 過期。
+            with self._lock:
+                session.clear_boot_quiet()
             raw_text = bridge.rx_text_from(pre_offset)
             stdout = self._extract_command_stdout(raw_text, command, prompt_regex)
             return {
@@ -2776,6 +3013,13 @@ class SessionManager:
                 return {"ok": False, "error_code": "FLASHING_BUSY", "selector": session.profile.com}
             if session is None or session.bridge is None or session.state != "READY":
                 return {"ok": False, "error_code": "SESSION_NOT_READY"}
+            # #139 execute-time gate（第二層，堵 queue race）：submit 通過第一層後、worker
+            # 執行前 banner 才到（命令已在 arbiter queue）的競態於此攔下。arbiter._worker
+            # 會把本 error_code 寫回命令記錄（status=error），`cmd status` 可觀測；命令
+            # 未送 UART、零副作用，READY 重新確認後可重送。human 來源循 #130 慣例放行
+            # （#114 刻意進 bootloader：human console／lease 送鍵永不 gate）。
+            if not source.startswith("human:") and session.boot_quiet_active():
+                return {"ok": False, "error_code": ERROR_AUTOBOOT_QUIET, "selector": session.profile.com}
             if session.recovering:
                 return {"ok": False, "error_code": "SESSION_RECOVERING"}
             lease, post = self._refresh_interactive_locked(session)
@@ -2866,6 +3110,25 @@ class SessionManager:
                     session.fg_cmd_expected_duration_s = None
         pre_offset = bridge.rx_snapshot_len()
         try:
+            if normalized_mode == "background":
+                # #159：capture 必須在命令送出「之前」掛好——快速完成的命令會在
+                # prompt 比對成功前就把全部輸出送完，若等 matched 之後才回溯建立
+                # capture，這段輸出永遠不會經過 add_chunk()（result_tail 拿到空
+                # chunks 卻回 lost:False 的假保證）。配合 _on_bridge_rx 對應修改
+                # （background capture 不再被 foreground_busy 擋住），此後全程
+                # （含下方等待迴圈與 CTRL_C 復原）RX 都會即時進 add_chunk()。
+                with self._lock:
+                    capture = BackgroundCapture(
+                        cmd_id=cmd_id,
+                        session_id=session.session_id,
+                        from_seq=self._wal.current_seq + 1,
+                        quiet_window_s=session.profile.quiet_window_s,
+                        created_at=now_iso(),
+                        last_seq=self._wal.current_seq,
+                    )
+                    self._background[cmd_id] = capture
+                    self._evict_background_locked()
+                    session.background_cmd_ids.append(cmd_id)
             self._mark_session_tx(session)
             bridge.send_command(command, source=source, cmd_id=cmd_id)
 
@@ -2910,18 +3173,7 @@ class SessionManager:
                 "partial": False,
             }
             if normalized_mode == "background":
-                capture = BackgroundCapture(
-                    cmd_id=cmd_id,
-                    session_id=session.session_id,
-                    from_seq=self._wal.current_seq + 1,
-                    quiet_window_s=session.profile.quiet_window_s,
-                    created_at=now_iso(),
-                    last_seq=self._wal.current_seq,
-                )
-                with self._lock:
-                    self._background[cmd_id] = capture
-                    self._evict_background_locked()
-                    session.background_cmd_ids.append(cmd_id)
+                # capture 已於命令送出前掛好並即時累積（#159），此處僅回填回應欄位。
                 result["background_capture_id"] = cmd_id
             return result
         finally:
@@ -2983,6 +3235,13 @@ class SessionManager:
                             error_code="PROMPT_TIMEOUT_RECOVERED",
                         )
                         self._reset_reprobe_progress_locked(session)
+                    # #156：CTRL_C/CTRL_D 攔截成功時 session 全程停留 READY、不觸發 detach，
+                    # 既有「detach 才 flush」路徑（_on_detached → arbiter.unregister_session，#128）
+                    # 天生跳過本分支。顯式呼叫 flush callback 補上同一 FLUSHED_BY_RECOVERY 終態語意；
+                    # 鎖外呼叫比照 _transition_to_attached→_on_detached 的既有慣例，
+                    # 避免 SessionManager._lock 與 CommandArbiter._lock 巢狀。
+                    if self._on_command_flush is not None:
+                        self._on_command_flush(session.session_id, "FLUSHED_BY_RECOVERY")
                     return {
                         "ok": True,
                         "error_code": "PROMPT_TIMEOUT_RECOVERED",
@@ -3489,9 +3748,21 @@ class SessionManager:
                                 recommended_action = "recover_interactive"
                                 extra = {"matched_prompt": matched, "rx_tail": rx_tail_evidence}
                             else:
-                                classification = "ATTACHED_NOT_READY"
-                                recommended_action = "console_attach"
-                                extra = {}
+                                # RX 洪水分類（#153）：last_error 已標 RX_FLOOD 或當下
+                                # RX 速率仍超閾 → 明確告知「等排空」而非 ATTACHED_NOT_READY
+                                # （後者會誤導上層去重建 session）。BOOTLOADER 判定優先。
+                                flood_bytes = self._bridge_rx_bytes_last_10s(bridge)
+                                if session.last_error == ERROR_RX_FLOOD or (
+                                    flood_bytes is not None
+                                    and flood_bytes >= RX_FLOOD_BYTES_PER_10S
+                                ):
+                                    classification = "RX_FLOOD"
+                                    recommended_action = "wait"
+                                    extra = {"rx_bytes_last_10s": flood_bytes}
+                                else:
+                                    classification = "ATTACHED_NOT_READY"
+                                    recommended_action = "console_attach"
+                                    extra = {}
                         result = {
                             "ok": True,
                             "classification": classification,
@@ -3506,14 +3777,15 @@ class SessionManager:
                         }
                     elif session.boot_quiet_active():
                         # #130 review Finding 1b（必修）：session.state 仍是 READY，但
-                        # RX 已見到 boot banner——因 boot quiet 目前只設 boot_quiet_until
-                        # 不改 session.state（架構層限制，見 Finding 4／#130 follow-up），
-                        # 會出現「state=READY 但已在 quiet window」的過渡態。此時不送
-                        # nonce probe（等同一般 probe，一樣會打斷 U-Boot autoboot），直接
-                        # 誠實回報仍在 quiet window，等 RX 見 login/prompt 或逾時解除。
+                        # RX 已見到 boot banner——因 boot quiet 只設 boot_quiet_until
+                        # 不改 session.state，會出現「state=READY 但已在 quiet window」
+                        # 的過渡態（#139 起 agent 顯式命令在此過渡態同樣被 AUTOBOOT_QUIET
+                        # 拒絕，README §boot quiet window）。此時不送 nonce probe（等同
+                        # 一般 probe，一樣會打斷 U-Boot autoboot），直接誠實回報仍在
+                        # quiet window，等 RX 見 login/prompt 或逾時解除。
                         result = {
                             "ok": True,
-                            "classification": "AUTOBOOT_QUIET",
+                            "classification": ERROR_AUTOBOOT_QUIET,
                             "session": session.to_public_dict(),
                             "recommended_action": "wait",
                             **lease_context,
@@ -3556,6 +3828,22 @@ class SessionManager:
             self._mark_session_tx(session)
             bridge.send_command(probe, source="system:self_test", cmd_id=None)
             if not bridge.wait_for_regex_from(nonce, offset, timeout_s):
+                # RX 洪水分類（#153）：nonce 被洪水淹沒 ≠ target 死了——RX 速率超閾時
+                # 回 RX_FLOOD＋wait（而非 TARGET_UNRESPONSIVE＋recover），避免上層對
+                # 活著的 console 做徒勞的 recover/重建。
+                flood_bytes = self._bridge_rx_bytes_last_10s(bridge)
+                if flood_bytes is not None and flood_bytes >= RX_FLOOD_BYTES_PER_10S:
+                    return {
+                        "ok": True,
+                        "classification": "RX_FLOOD",
+                        "session": session.to_public_dict(),
+                        "attached_real_path": attached_real_path,
+                        "current_real_path": current_real_path,
+                        "probe_ok": False,
+                        "rx_bytes_last_10s": flood_bytes,
+                        "recommended_action": "wait",
+                        **lease_context,
+                    }
                 return {
                     "ok": True,
                     "classification": "TARGET_UNRESPONSIVE",
@@ -3841,10 +4129,16 @@ class SessionManager:
         *,
         local_path: str,
         remote_path: str,
-        chunk_size: int = 2048,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        chunk_timeout_s: float | None = None,
         source: str = "agent",
     ) -> dict[str, Any]:
-        """將 host 端檔案推送到 target。"""
+        """將 host 端檔案推送到 target。
+
+        ``chunk_timeout_s``（#157）：單一 chunk 等待 target 回 prompt 的逾時；
+        ``None`` 時沿用 ``profile.timeout_s``（夾 ``_MIN_FILE_CHUNK_TIMEOUT_S`` 地板），
+        取代舊版寫死的 10.0s——bcm 類慢板已調大的 ``timeout_s`` 因此自動生效。
+        """
         from .file_transfer import push_file
 
         suspend_human_interactive = False
@@ -3854,6 +4148,11 @@ class SessionManager:
             session = self.get_session(selector)
             if session is None or session.bridge is None or session.state != "READY":
                 return {"ok": False, "error_code": "SESSION_NOT_READY"}
+            # #139：同 execute_command 的第二層 gate——file 傳輸直寫 bridge、不經
+            # execute_command，須各自補 gate（僅開始前擋；傳輸中 banner 到達不中途
+            # abort，由傳輸自然 timeout，屬既有行為）。
+            if not source.startswith("human:") and session.boot_quiet_active():
+                return {"ok": False, "error_code": ERROR_AUTOBOOT_QUIET, "selector": session.profile.com}
             if session.recovering:
                 return {"ok": False, "error_code": "SESSION_RECOVERING"}
             lease, post = self._refresh_interactive_locked(session)
@@ -3864,12 +4163,17 @@ class SessionManager:
                     busy_result = {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY"}
             bridge = session.bridge
             prompt_regex = session.profile.prompt_regex
+            profile_timeout_s = session.profile.timeout_s
             if busy_result is None:
                 session.foreground_busy = True
 
         post.execute()
         if busy_result is not None:
             return busy_result
+        effective_timeout_s = (
+            chunk_timeout_s if chunk_timeout_s is not None
+            else max(profile_timeout_s, _MIN_FILE_CHUNK_TIMEOUT_S)
+        )
         if suspend_human_interactive:
             bridge.suspend_interactive()
         try:
@@ -3878,7 +4182,7 @@ class SessionManager:
                 local_path,
                 remote_path,
                 chunk_size=chunk_size,
-                timeout_s=10.0,
+                timeout_s=effective_timeout_s,
                 prompt_regex=prompt_regex,
                 source=source,
             )
@@ -3894,9 +4198,15 @@ class SessionManager:
         *,
         remote_path: str,
         local_path: str | None = None,
+        chunk_timeout_s: float | None = None,
         source: str = "agent",
     ) -> dict[str, Any]:
-        """從 target 拉取檔案到 host。"""
+        """從 target 拉取檔案到 host。
+
+        ``chunk_timeout_s``（#157）：整段 base64 讀取的逾時；``None`` 時沿用
+        ``profile.timeout_s``（夾 ``_MIN_FILE_PULL_TIMEOUT_S`` 地板，維持舊版
+        30.0s 行為基準），取代舊版寫死的 30.0s。
+        """
         from .file_transfer import pull_file
 
         suspend_human_interactive = False
@@ -3906,6 +4216,9 @@ class SessionManager:
             session = self.get_session(selector)
             if session is None or session.bridge is None or session.state != "READY":
                 return {"ok": False, "error_code": "SESSION_NOT_READY"}
+            # #139：同 file_push 的 gate（pull 同樣直寫 bridge、不經 execute_command）。
+            if not source.startswith("human:") and session.boot_quiet_active():
+                return {"ok": False, "error_code": ERROR_AUTOBOOT_QUIET, "selector": session.profile.com}
             if session.recovering:
                 return {"ok": False, "error_code": "SESSION_RECOVERING"}
             lease, post = self._refresh_interactive_locked(session)
@@ -3916,12 +4229,17 @@ class SessionManager:
                     busy_result = {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY"}
             bridge = session.bridge
             prompt_regex = session.profile.prompt_regex
+            profile_timeout_s = session.profile.timeout_s
             if busy_result is None:
                 session.foreground_busy = True
 
         post.execute()
         if busy_result is not None:
             return busy_result
+        effective_timeout_s = (
+            chunk_timeout_s if chunk_timeout_s is not None
+            else max(profile_timeout_s, _MIN_FILE_PULL_TIMEOUT_S)
+        )
         if suspend_human_interactive:
             bridge.suspend_interactive()
         try:
@@ -3929,7 +4247,7 @@ class SessionManager:
                 bridge,
                 remote_path,
                 local_path,
-                timeout_s=30.0,
+                timeout_s=effective_timeout_s,
                 prompt_regex=prompt_regex,
                 source=source,
             )

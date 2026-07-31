@@ -46,6 +46,12 @@ class FakeBridge:
     def reap_stale_consoles(self, *, held_slave_paths=None):
         return []
 
+    def rx_total_bytes(self) -> int:
+        # #150：_probe_existing_bridge 於 probe 前後採樣 raw RX 累計。回固定 0 使
+        # delta 恆 0，但本檔的 session last_rx_mono 皆為新鮮值（或 0），refine 的
+        # 年齡/曾有 RX 條款不觸發 → 既有斷言不變。
+        return 0
+
 
 class TestReadinessReprobe(unittest.TestCase):
     def setUp(self) -> None:

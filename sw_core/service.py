@@ -18,7 +18,16 @@ from .arbiter import (
     CommandArbiter,
 )
 from .config import ProfileTemplate, SessionProfile
-from .constants import CONFIG_DIR, DEVICE_BY_ID_DIR, DEVICE_BY_PATH_DIR, EVENTS_DIR, EVENTS_RUNTIME_DIR, EVENTS_LOG_PATH, TTYMCU_PATH
+from .constants import (
+    CONFIG_DIR,
+    DEVICE_BY_ID_DIR,
+    DEVICE_BY_PATH_DIR,
+    ERROR_AUTOBOOT_QUIET,
+    EVENTS_DIR,
+    EVENTS_RUNTIME_DIR,
+    EVENTS_LOG_PATH,
+    TTYMCU_PATH,
+)
 from .flash_endpoint import FlashEndpoint, detect_mcu_line, pump_endpoint_to_sink
 from .mcu_patterns import McuPatternRegistry
 from .multi_open import detect_multi_open
@@ -26,8 +35,10 @@ from .device_source import _load_exclude_coms  # #131：實作移至 device_sour
 from .device_watcher import DeviceWatcher
 from .event_engine import EventEngine, EngineDeps
 from .event_engine.line_buffer import LineBuffer
+from .file_transfer import DEFAULT_CHUNK_SIZE
 from .session_manager import SessionManager
 from .util import now_iso
+from .version import resolve_version
 from .wal import WalWriter, rows_to_text_lines
 
 _HUMAN_INTERACTIVE_COMMANDS = {
@@ -217,6 +228,8 @@ class SerialwrapService:
         self._running = False
         self._started_at: str | None = None
         self._profile_count = len(profiles)
+        # #154：daemon 啟動時算一次、常駐於 instance，避免每次 RPC 都重開 VERSION 檔案。
+        self._version = resolve_version()
 
         self._arbiter = CommandArbiter(self._send_cb)
         self._sessions = SessionManager(
@@ -227,6 +240,7 @@ class SerialwrapService:
             on_ready=self._on_ready,
             on_detached=self._on_detached,
             on_console_line=self._on_console_line,
+            on_command_flush=self._on_command_flush,
             state_path=state_path,
         )
         self._engine = EventEngine(EngineDeps(
@@ -269,6 +283,12 @@ class SerialwrapService:
 
     def _on_detached(self, session_id: str) -> None:
         self._arbiter.unregister_session(session_id)
+
+    def _on_command_flush(self, session_id: str, error_code: str) -> None:
+        # #156：session 仍停留 READY（CTRL_C/CTRL_D 攔截成功、未觸發 detach）時，
+        # SessionManager 藉本 callback 顯式要求排空該 session 尚未執行的排隊命令，
+        # 補上原本只在 _on_detached 才會發生的 FLUSHED_BY_RECOVERY 終態語意。
+        self._arbiter.flush_session(session_id, error_code)
 
     def _engine_rx_observer(self, com: str, data: bytes, wal_seq: int) -> None:
         with self._engine_buffers_lock:
@@ -519,6 +539,7 @@ class SerialwrapService:
             result: dict[str, Any] = {
                 "ok": True,
                 "pid": os.getpid(),
+                "version": self._version,  # #154：CLI/daemon 版本可診斷性
                 "running": self._running,
                 "started_at": self._started_at,
                 "sessions": len(sessions),
@@ -556,7 +577,9 @@ class SerialwrapService:
         }
         return result
 
-    def _resolve_session_id(self, selector: str) -> tuple[str | None, dict[str, Any] | None]:
+    def _resolve_session_id(
+        self, selector: str, *, source: str = "agent"
+    ) -> tuple[str | None, dict[str, Any] | None]:
         state = self._sessions.get_session_state(selector)
         if not state.get("ok"):
             return None, state
@@ -572,9 +595,40 @@ class SerialwrapService:
                     "session": session,
                 }
             return None, {"ok": False, "error_code": "SESSION_NOT_READY", "session": session}
+        # #139 submit-time gate（第一層）：state 名義上仍 READY 但 boot quiet window 已
+        # arm（疑似板卡自發重開機的過渡態）時，非 human 來源的顯式命令即時拒絕——bytes
+        # 若送出會落入 U-Boot autoboot 倒數窗打斷開機、以 PROMPT_TIMEOUT 吞掉。此拒絕
+        # 零 UART 副作用、可重試；session 重新確認 READY 時 quiet 同步解除（session_manager
+        # 各 READY 轉移點 clear_boot_quiet）。human console／interactive lease 不經此路徑，
+        # source 前綴檢查為 belt-and-suspenders（與 execute_command 慣例一致）。
+        if not source.startswith("human:"):
+            remaining = session.get("boot_quiet_remaining_s")
+            if remaining is not None:
+                return None, {
+                    "ok": False,
+                    "error_code": ERROR_AUTOBOOT_QUIET,
+                    "retry_after_s": remaining,
+                    "hint": "boot quiet window 進行中（疑似板卡自發重開機）；等 session 重新確認 READY 後重送",
+                    "session": session,
+                }
         return str(session["session_id"]), None
 
     def rpc(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """RPC 平面分派器的薄包裝（#154）：委派 `_dispatch()`，並在回應為 dict 時
+        補上 daemon 版本欄位。`health()` 已顯式帶 `version`，`setdefault` 對它是
+        no-op（同一個 `self._version`）；對其餘所有 method（health.ping／mcu.*／
+        session.*／event.*…）則是唯一補上版本欄位的地方——不需要逐一 handler 加。
+        `getattr` 防呆：既有測試會以 `__new__` 繞過 `__init__` 建構輕量 stub 物件
+        （如 `tests/test_profile_pin_sticky.py::TestRpc`），此時 `_version` 未設，
+        版本欄位就此略過而非拋 AttributeError。
+        """
+        result = self._dispatch(method, params)
+        version = getattr(self, "_version", None)
+        if isinstance(result, dict) and version is not None:
+            result.setdefault("version", version)
+        return result
+
+    def _dispatch(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         if method == "health.ping":
             return {"ok": True, "pong": True}
         if method == "health.status":
@@ -771,7 +825,7 @@ class SerialwrapService:
             expected_duration_s: float | None = float(raw_ed) if raw_ed is not None else None
             if not selector:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
-            session_id, err = self._resolve_session_id(selector)
+            session_id, err = self._resolve_session_id(selector, source=source)
             if err is not None:
                 return err
             assert session_id is not None
@@ -911,11 +965,21 @@ class SerialwrapService:
             selector = str(params.get("selector") or "")
             local_path = str(params.get("local_path") or "")
             remote_path = str(params.get("remote_path") or "")
-            chunk_size = int(params.get("chunk_size") or 2048)
+            # 轉型全包 try（Copilot review）：非數字/空字串的 chunk_size／chunk_timeout_s
+            # 不得讓 ValueError/TypeError 穿越 RPC 邊界；max(1, ...) 防 _split_chunks
+            # 的 range(step=0)。
+            try:
+                chunk_size = max(1, int(params.get("chunk_size") or DEFAULT_CHUNK_SIZE))
+                chunk_timeout_raw = params.get("chunk_timeout_s")
+                chunk_timeout_s = (
+                    float(chunk_timeout_raw) if chunk_timeout_raw is not None else None
+                )
+            except (TypeError, ValueError):
+                return {"ok": False, "error_code": "INVALID_ARGS"}
             source = str(params.get("source") or "agent")
             if not selector or not local_path or not remote_path:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
-            session_id, err = self._resolve_session_id(selector)
+            session_id, err = self._resolve_session_id(selector, source=source)
             if err is not None:
                 return err
             return self._sessions.file_push(
@@ -923,6 +987,7 @@ class SerialwrapService:
                 local_path=local_path,
                 remote_path=remote_path,
                 chunk_size=chunk_size,
+                chunk_timeout_s=chunk_timeout_s,
                 source=source,
             )
 
@@ -930,16 +995,24 @@ class SerialwrapService:
             selector = str(params.get("selector") or "")
             remote_path = str(params.get("remote_path") or "")
             local_path = params.get("local_path")
+            try:  # 同 file.push：轉型例外不得穿越 RPC 邊界（Copilot review）
+                chunk_timeout_raw = params.get("chunk_timeout_s")
+                chunk_timeout_s = (
+                    float(chunk_timeout_raw) if chunk_timeout_raw is not None else None
+                )
+            except (TypeError, ValueError):
+                return {"ok": False, "error_code": "INVALID_ARGS"}
             source = str(params.get("source") or "agent")
             if not selector or not remote_path:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
-            session_id, err = self._resolve_session_id(selector)
+            session_id, err = self._resolve_session_id(selector, source=source)
             if err is not None:
                 return err
             return self._sessions.file_pull(
                 selector,
                 remote_path=remote_path,
                 local_path=str(local_path) if local_path else None,
+                chunk_timeout_s=chunk_timeout_s,
                 source=source,
             )
 

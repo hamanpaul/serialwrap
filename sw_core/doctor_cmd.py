@@ -52,16 +52,56 @@ def _check_pyyaml() -> dict:
     }
 
 
-def _check_on_path(fx, name: str, fix_hint: str = "確認 ~/.local/bin 在 PATH（pipx ensurepath）") -> dict:
-    """指定二進位是否在 PATH 上。``fix_hint`` 預設值即原 Linux 字串（輸出不變）。"""
+def _check_on_path(
+    fx,
+    name: str,
+    fix_hint: str = "確認 ~/.local/bin 在 PATH（pipx ensurepath）",
+    *,
+    check_name: str | None = None,
+) -> dict:
+    """指定二進位是否在 PATH 上。``fix_hint`` 預設值即原 Linux 字串（輸出不變）。
+
+    ``check_name``（keyword-only，#149）：覆寫回報鍵，供含連字號的二進位名稱
+    （如 ``serialwrap-minicom``）產生底線命名的 ``serialwrap_minicom_on_path``，
+    與既有 ``serialwrap_on_path``／``serialwrapd_on_path`` 命名一致；預設
+    ``None`` 時沿用 ``f"{name}_on_path"``，既有呼叫端行為逐字不變。
+    """
     path = fx.which(name)
     ok = path is not None
     return {
-        "check": f"{name}_on_path",
+        "check": check_name or f"{name}_on_path",
         "ok": ok,
         "detail": path or "找不到",
         "fix": "" if ok else fix_hint,
     }
+
+
+def _check_other_serialwrap_installs(fx) -> dict:
+    """同機 PATH 上是否有多份不同版本的 serialwrap 安裝（#154）。
+
+    純診斷資訊：只看得見「呼叫 doctor 這個行程的 PATH」上找得到的安裝——以絕對
+    路徑呼叫、venv bin/ 不在 PATH 上的情境（如 TestPilot）看不到，那類漂移的
+    即時防線是 CLI 每次 RPC 的 client↔daemon 版本比對（見 cli.py
+    `_warn_version_mismatch`），與 PATH 無關。0 或 1 筆時視為健康、不另跑
+    subprocess（trivially single）。
+    """
+    paths = fx.which_all("serialwrap")
+    if len(paths) <= 1:
+        detail = "僅偵測到目前這份" if paths else "PATH 上找不到 serialwrap（可能以絕對路徑呼叫）"
+        return {"check": "other_serialwrap_installs", "ok": True, "detail": detail, "fix": ""}
+    versions: list[str] = []
+    entries: list[str] = []
+    for p in paths:
+        rc, out, _err = fx.run([p, "--version"], timeout_s=2.0)
+        v = out.strip() if rc == 0 and out.strip() else "無法取得"
+        versions.append(v)
+        entries.append(f"{p}={v}")
+    ok = len(set(versions)) == 1
+    fix = "" if ok else (
+        "確認各安裝版本一致，或統一改呼叫同一份"
+        "（建議 pipx 系統安裝／以絕對路徑或 SERIALWRAP_ENDPOINT 釘住）"
+    )
+    return {"check": "other_serialwrap_installs", "ok": ok, "detail": "；".join(entries), "fix": fix}
 
 
 def _check_dialout(fx) -> dict:
@@ -249,6 +289,79 @@ def _check_devices_windows() -> dict:
     }
 
 
+def _check_wal_dir() -> dict:
+    """WAL 目錄一致性（#148）：印出 daemon 實際生效的 WAL_DIR；shell 端顯式覆寫
+    ``SERIALWRAP_WAL_DIR`` 但與 daemon 回報不一致時 WARN（ok=False，advisory，
+    不拉低整體 ok）。
+
+    daemon 未在跑／連不上時降級為 informational（ok=True）——doctor 常在啟動
+    daemon 前執行，「連不到」本身不是這項檢查要抓的錯誤。RPC 探測沿用其餘
+    advisory 檢查的 0.5s 短逾時、經 ``rpc_call`` 的『永不拋例外』契約
+    （``sw_core/client.py`` 的 ``_rpc_call_once`` 只回 dict、不 raise），故本函式
+    不需要外層 try/except 仍保有 ``run_doctor`` 『永不拋例外』的整體契約。
+    """
+    from sw_core.cli import _local_default_endpoint, _safe_runtime_config  # 延遲匯入避免循環
+    from sw_core.client import rpc_call
+    from sw_core.constants import WAL_DIR as local_wal_dir  # noqa: N811 — 僅供 fallback 顯示
+
+    rc = _safe_runtime_config()
+    cfg_sock = None
+    if rc is not None:
+        try:
+            cfg_sock = rc.socket_path()
+        except Exception:  # noqa: BLE001
+            cfg_sock = None
+    endpoint = cfg_sock or _local_default_endpoint()
+
+    resp = rpc_call(endpoint, "health.status", {}, timeout_s=0.5)
+    if not resp.get("ok") or not resp.get("wal_path"):
+        return {
+            "check": "wal_dir",
+            "ok": True,
+            "detail": f"daemon 未在跑或無法連線，僅顯示本地端解析值：WAL_DIR={local_wal_dir}",
+            "fix": "",
+        }
+
+    daemon_wal_dir = os.path.dirname(str(resp["wal_path"]))
+    shell_override = os.environ.get("SERIALWRAP_WAL_DIR", "").strip()
+    mismatch = bool(shell_override) and (
+        os.path.normpath(os.path.expanduser(shell_override)) != os.path.normpath(daemon_wal_dir)
+    )
+    if mismatch:
+        return {
+            "check": "wal_dir",
+            "ok": False,
+            "detail": f"daemon 實際生效 WAL_DIR={daemon_wal_dir}，與 shell SERIALWRAP_WAL_DIR={shell_override} 不一致",
+            "fix": (
+                "daemon 由 systemd 管理時 unit 不會繼承 shell 匯出的 env（.bashrc 的 export 對它無效）："
+                "需在 unit 加 Environment=SERIALWRAP_WAL_DIR=<path> 後 systemctl daemon-reload "
+                "並 `serialwrap service restart`；on-demand/前景啟動則需在同一個帶該 env 的 shell "
+                "重跑 `serialwrap daemon stop && serialwrap daemon start`。查詢一律以 "
+                "`serialwrap daemon status` 的 wal_path 為準，不要用 shell env 去猜"
+            ),
+        }
+    return {
+        "check": "wal_dir",
+        "ok": True,
+        "detail": f"daemon 實際生效 WAL_DIR={daemon_wal_dir}",
+        "fix": "",
+    }
+
+
+# advisory 檢查名單（單一事實來源；sw_core/cli.py re-export 沿用）：這些項 ok=False
+# 僅屬 WARN 性質，不拉低 doctor 整體 ok；機器消費者（realhw/regression preflight 的
+# 「doctor 全綠」判定）依 run_doctor 蓋章的 per-check `advisory` 欄位識別，
+# 避免 advisory WARN（如 #148 的 shell/daemon WAL_DIR 不一致提醒）誤觸 suite-refuse。
+DOCTOR_ADVISORY_CHECKS = frozenset({
+    "systemd", "wsl_systemd", "devices", "other_serialwrap_installs", "wal_dir",
+    "serialwrap_minicom_on_path", "jq_on_path", "minicom_on_path",
+})
+DOCTOR_ADVISORY_CHECKS_WIN = frozenset({
+    "serialwrap_on_path", "serialwrapd_on_path", "daemon_endpoint",
+    "devices", "other_serialwrap_installs", "wal_dir",
+})
+
+
 def run_doctor(fx=None, home=None, *, platform: str | None = None) -> list[dict]:
     """執行所有環境檢查並回傳結果清單（每項皆唯讀、永不拋例外）。
 
@@ -257,8 +370,10 @@ def run_doctor(fx=None, home=None, *, platform: str | None = None) -> list[dict]
         home:     使用者家目錄（目前僅 supervision_mode 取用，保留供測試）。
         platform: 平台字串（``sys.platform`` 語意）；``None`` 時取實際平台。
                   ``win*`` → Windows 檢查清單（#131 點 4：pyserial／PATH／daemon
-                  endpoint／SERIALCOMM 裝置），其餘 → 原 Linux 清單逐字不變
-                  （dialout／systemd／single_daemon／by-id devices／wsl_systemd）。
+                  endpoint／SERIALCOMM 裝置），其餘 → Linux 清單（dialout／
+                  human console 就緒組：serialwrap-minicom／jq／minicom 是否在
+                  PATH（#149）／systemd／single_daemon／by-id devices／
+                  wsl_systemd）。
 
     Returns:
         檢查結果清單，每項為
@@ -266,29 +381,54 @@ def run_doctor(fx=None, home=None, *, platform: str | None = None) -> list[dict]
     """
     fx = fx if fx is not None else SystemEffects()
     plat = platform if platform is not None else sys.platform
+    advisory = DOCTOR_ADVISORY_CHECKS_WIN if plat.startswith("win") else DOCTOR_ADVISORY_CHECKS
+
+    def _stamp(report: list[dict]) -> list[dict]:
+        # per-check 蓋章 advisory：機器消費者（preflight）據此不把 WARN 當 FAIL。
+        for item in report:
+            item["advisory"] = item.get("check") in advisory
+        return report
+
     if plat.startswith("win"):
         # Windows 單例由 WindowsSingletonLock（msvcrt 檔鎖 + TCP probe）強制，
         # 無 /proc 可掃 → 不移植 single_daemon；dialout/systemd/wsl_systemd 不適用。
         win_path_hint = "將 serialwrap.exe / serialwrapd.exe 所在目錄加入 PATH"
-        return [
+        return _stamp([
             _check_python(),
             _check_pyyaml(),
             _check_pyserial(),
             _check_on_path(fx, "serialwrap", win_path_hint),
             _check_on_path(fx, "serialwrapd", win_path_hint),
+            _check_other_serialwrap_installs(fx),
             _check_supervision_mode(home),
             _check_daemon_endpoint(),
+            _check_wal_dir(),
             _check_devices_windows(),
-        ]
-    return [
+        ])
+    return _stamp([
         _check_python(),
         _check_pyyaml(),
         _check_on_path(fx, "serialwrap"),
         _check_on_path(fx, "serialwrapd"),
+        _check_other_serialwrap_installs(fx),
         _check_dialout(fx),
+        # human console 就緒檢查組（#149）：wrapper／jq／minicom 是否在 PATH——
+        # doctor 全綠不等於 human console 真能動，補齊這個空白（見 issue #149
+        # root_cause）。三項皆 fx.which() 純查表、無 I/O 副作用。
+        _check_on_path(
+            fx, "serialwrap-minicom", check_name="serialwrap_minicom_on_path",
+            fix_hint=(
+                "執行 `serialwrap setup` 物化 minicom wrapper 到 ~/.local/bin"
+                "（並確認該目錄在 PATH，可用 pipx ensurepath）；"
+                "human console 一律經 serialwrap-minicom COMx，勿直接對 tty 開 minicom（避免與 daemon two-reader 衝突）"
+            ),
+        ),
+        _check_on_path(fx, "jq", fix_hint="安裝 jq（Debian/Ubuntu/Mint: sudo apt install jq）——serialwrap-minicom wrapper 解析 session 狀態需要"),
+        _check_on_path(fx, "minicom", fix_hint="安裝 minicom（Debian/Ubuntu/Mint: sudo apt install minicom）"),
         _check_systemd(fx),
         _check_supervision_mode(home),
         _check_single_daemon(),
+        _check_wal_dir(),
         _check_devices(),
         _check_wsl_systemd(fx),
-    ]
+    ])

@@ -15,6 +15,12 @@
 - ``_recover_after_failure`` 的 CTRL_C/CTRL_D 強制按鍵迴圈 gate（Finding 1c）
 - ``attach_session`` / ``recover_session`` 共用的 ``_probe_existing_bridge`` gate（Finding 2）
 - 寬鬆 prompt_regex 誤配 bootloader prompt 時不得解除 quiet window（Finding 3）
+
+#139（#130 Finding 4 收斂）——agent 顯式命令的雙層 AUTOBOOT_QUIET gate：
+- ``TestAgentQuietGateExecute``：session_manager 層（第二層 execute-time gate、
+  file_push/file_pull gate、四個 READY 轉移點與 reboot 提前返回的 clear_boot_quiet）
+- ``TestSubmitQuietGate``：service 層（第一層 submit-time gate、queue race 終態、
+  human 來源不受 gate）
 """
 from __future__ import annotations
 
@@ -29,9 +35,15 @@ from sw_core import constants
 from sw_core.config import SessionProfile, UartProfile, load_profiles
 from sw_core.device_watcher import DeviceInfo
 from sw_core.login_fsm import detect_boot_banner
+from sw_core.service import SerialwrapService
 from sw_core.session_manager import SessionManager
 import sw_core.session_manager as sm_mod
 from sw_core.wal import WalWriter
+
+try:
+    import state_iso  # pytest／unittest discover：tests/ 在 sys.path
+except ImportError:  # python3 -m unittest tests.test_x（repo root 跑法，#120）
+    from tests import state_iso
 
 
 class FakeBridge:
@@ -594,6 +606,254 @@ class TestBootloaderPromptDoesNotClearQuiet(unittest.TestCase):
             session.boot_quiet_active(),
             "未設定 bootloader_prompts 時仍會被誤解除（驗證測試非 vacuous）",
         )
+
+
+class TestAgentQuietGateExecute(_ManagerMixin):
+    """#139 第二層 gate（session_manager 層）：READY 但 quiet armed 的過渡態，
+    agent 顯式命令／file 傳輸被 AUTOBOOT_QUIET 即時拒絕、零 UART 副作用；
+    READY 轉移點與「板其實沒重開」提前返回同步 clear quiet。"""
+
+    def _make_ready_with_quiet(
+        self, *, prompt_within_2s: bool = False
+    ) -> tuple[SessionManager, sm_mod.SessionRuntime, FakeBridge]:
+        mgr, session = self._make_manager()
+        bridge = FakeBridge(prompt_within_2s=prompt_within_2s)
+        session.bridge = bridge
+        session.state = "READY"
+        session.arm_boot_quiet()
+        return mgr, session, bridge
+
+    def test_execute_gated_when_quiet_armed_on_ready(self) -> None:
+        mgr, session, bridge = self._make_ready_with_quiet()
+
+        result = mgr.execute_command(session.session_id, "echo hi", "agent:test", "cmd-1")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_code"], "AUTOBOOT_QUIET")
+        self.assertEqual(result["selector"], "COM0")
+        self.assertEqual(bridge.sent, [], "gate 拒絕必須零 TX 副作用（bytes 不得落入 autoboot 窗）")
+
+    def test_execute_human_source_not_gated(self) -> None:
+        """human 來源循 #130 慣例永遠放行（#114 刻意進 bootloader 相容）。"""
+        mgr, session, bridge = self._make_ready_with_quiet(prompt_within_2s=True)
+
+        result = mgr.execute_command(session.session_id, "echo hi", "human:tester", "cmd-1")
+
+        self.assertTrue(result["ok"])
+        self.assertIn(("echo hi", "human:tester"), bridge.sent)
+
+    def test_ready_transition_clears_quiet(self) -> None:
+        """READY ⇒ clear（相容性關鍵）：probe 期間 banner 才 arm 的殘留 quiet，
+        在 ``_probe_existing_bridge`` 設 READY 的同一 locked 區塊被清掉——
+        f9-quiet-window-agent-passthrough 的 pytest 對照（防 gate 誤傷真 READY）。
+
+        註：quiet 已 armed 時 ``_probe_existing_bridge`` 入口即被 #130 Finding 2 gate
+        擋下（不送 probe），故以「wait_for_regex 期間 arm」模擬 banner 與 probe 競速
+        的唯一真實路徑。"""
+        mgr, session = self._make_manager()
+
+        class _BannerDuringProbeBridge(FakeBridge):
+            def __init__(self, target: sm_mod.SessionRuntime) -> None:
+                super().__init__(prompt_within_2s=True)
+                self._target = target
+
+            def wait_for_regex(self, _pattern: str, _timeout: float) -> bool:
+                self._target.arm_boot_quiet()  # 模擬 probe 進行中 banner 才到
+                return True
+
+        bridge = _BannerDuringProbeBridge(session)
+        session.bridge = bridge
+        session.state = "ATTACHED"
+        session.last_error = "PROMPT_UNAVAILABLE"
+
+        result = mgr.attach_session("COM0")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(session.state, "READY")
+        self.assertEqual(session.boot_quiet_until, 0.0, "READY 落定必須同步 clear quiet")
+        follow = mgr.execute_command(session.session_id, "echo hi", "agent:test", "cmd-2")
+        self.assertTrue(follow["ok"], "READY 後 agent 命令不得再被 gate")
+
+    def test_reboot_prompt_return_clears_quiet(self) -> None:
+        """板其實沒重開（2s 內 prompt 回來）：提前返回分支補清 quiet，
+        避免 READY session 白白被 gate 到 180s 過期（belt-and-suspenders）。"""
+        mgr, session = self._make_manager()
+        bridge = FakeBridge(prompt_within_2s=True)
+        session.bridge = bridge
+        session.state = "READY"
+
+        result = mgr._handle_reboot_command(
+            session,
+            bridge,
+            command="reboot",
+            source="agent:test",
+            cmd_id="cmd-1",
+            timeout_s=10.0,
+            execution_mode="line",
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(session.boot_quiet_until, 0.0)
+        follow = mgr.execute_command(session.session_id, "echo hi", "agent:test", "cmd-2")
+        self.assertTrue(follow["ok"])
+
+    def test_file_push_gated(self) -> None:
+        mgr, session, bridge = self._make_ready_with_quiet()
+
+        result = mgr.file_push(
+            "COM0", local_path="/nonexistent/f", remote_path="/tmp/f", source="agent:test"
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_code"], "AUTOBOOT_QUIET")
+        self.assertEqual(bridge.sent, [])
+
+    def test_file_pull_gated(self) -> None:
+        mgr, session, bridge = self._make_ready_with_quiet()
+
+        result = mgr.file_pull("COM0", remote_path="/tmp/f", source="agent:test")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_code"], "AUTOBOOT_QUIET")
+        self.assertEqual(bridge.sent, [])
+
+    def test_reboot_recovery_ready_clears_quiet(self) -> None:
+        """``_spawn_reboot_recovery`` 成功設 READY 時同步 clear（probe 期間 banner
+        才 arm 的競態面，與 _probe_existing_bridge 同語意）。"""
+        mgr, session = self._make_manager()
+        bridge = FakeBridge()
+        session.bridge = bridge
+        session.state = "RECOVERING"
+        session.recovering = True
+
+        def fake_ensure_ready(_bridge, _sp, auth=None):
+            session.arm_boot_quiet()  # 模擬 ensure_ready（lock 外）期間 banner 才到
+            return True, None
+
+        with mock.patch.object(sm_mod, "ensure_ready", side_effect=fake_ensure_ready):
+            mgr._spawn_reboot_recovery(session.session_id, timeout_s=5.0)
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and session.state != "READY":
+                time.sleep(0.05)
+
+        self.assertEqual(session.state, "READY")
+        self.assertEqual(session.boot_quiet_until, 0.0, "recovery READY 落定必須同步 clear quiet")
+
+
+class TestSubmitQuietGate(unittest.TestCase):
+    """#139 第一層 gate（service 層 submit-time）：照 test_command_guard.py 手法建
+    ``SerialwrapService([])``，直接注入 READY SessionRuntime 驗 RPC 邊界行為。"""
+
+    def setUp(self) -> None:
+        state_iso.isolate_testcase(self)  # #120 per-file 隔離（unittest 不載 conftest）
+        self.svc = SerialwrapService([])
+
+    def _inject_ready_session(self, *, arm_quiet: bool) -> sm_mod.SessionRuntime:
+        profile = SessionProfile(
+            profile_name="p",
+            com="COM0",
+            act_no=1,
+            alias="lab+1",
+            device_by_id="/dev/serial/by-id/fake",
+            platform="prpl",
+            prompt_regex=r"(?m)^root@prplOS:.*# ",
+            login_regex="",
+            ready_probe="echo __READY__${nonce}",
+            uart=UartProfile(),
+        )
+        session = sm_mod.SessionRuntime(session_id="p:COM0", profile=profile)
+        session.bridge = FakeBridge(prompt_within_2s=True)
+        session.state = "READY"
+        if arm_quiet:
+            session.arm_boot_quiet()
+        with self.svc._sessions._lock:
+            self.svc._sessions._sessions[session.session_id] = session
+        self.svc._arbiter.register_session(session.session_id)
+        self.addCleanup(self.svc._arbiter.unregister_session, session.session_id)
+        return session
+
+    def _wait_terminal(self, cmd_id: str, timeout_s: float = 5.0) -> dict:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            rec = self.svc.rpc("command.get", {"cmd_id": cmd_id}).get("command") or {}
+            if rec.get("status") in ("done", "error", "interactive"):
+                return rec
+            time.sleep(0.02)
+        self.fail(f"命令 {cmd_id} 在 {timeout_s}s 內未達終態")
+
+    def test_command_submit_rejected_with_retry_after(self) -> None:
+        session = self._inject_ready_session(arm_quiet=True)
+
+        resp = self.svc.rpc(
+            "command.submit",
+            {"selector": "COM0", "cmd": "echo hi", "source": "agent:test"},
+        )
+
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error_code"], "AUTOBOOT_QUIET")
+        self.assertGreater(resp["retry_after_s"], 0)
+        self.assertEqual(resp["session"]["state"], "READY", "error payload 應附完整 session dict")
+        self.assertNotIn("cmd_id", resp, "submit-time 拒絕為純 RPC 錯誤，不產生 cmd_id")
+
+        # quiet 解除後同一 submit 必須被接受（READY ⇒ 放行的 service 層對照）。
+        session.clear_boot_quiet()
+        resp2 = self.svc.rpc(
+            "command.submit",
+            {"selector": "COM0", "cmd": "echo hi", "source": "agent:test"},
+        )
+        self.assertTrue(resp2["ok"])
+        self.assertTrue(resp2.get("cmd_id"))
+        self._wait_terminal(resp2["cmd_id"])  # 收斂 worker，避免 cleanup 時殘留 in-flight
+
+    def test_file_push_pull_submit_time_gate(self) -> None:
+        self._inject_ready_session(arm_quiet=True)
+
+        push = self.svc.rpc(
+            "file.push",
+            {"selector": "COM0", "local_path": "/tmp/x", "remote_path": "/tmp/y",
+             "source": "agent:test"},
+        )
+        pull = self.svc.rpc(
+            "file.pull",
+            {"selector": "COM0", "remote_path": "/tmp/y", "source": "agent:test"},
+        )
+
+        for resp in (push, pull):
+            self.assertFalse(resp["ok"])
+            self.assertEqual(resp["error_code"], "AUTOBOOT_QUIET")
+
+    def test_queue_race_terminalizes_as_autoboot_quiet(self) -> None:
+        """submit 通過第一層後 banner 才到（命令已在 arbiter queue）：worker 執行時被
+        第二層攔下，``command.get`` 終態 status=error＋AUTOBOOT_QUIET（驗 arbiter 的
+        error_code 傳遞與可重送語意）。以持有 SessionManager RLock 讓時序確定：worker
+        的 execute_command 會阻塞在鎖上，直到本執行緒 arm 完 quiet 才放行。"""
+        session = self._inject_ready_session(arm_quiet=False)
+        mgr = self.svc._sessions
+
+        with mgr._lock:  # RLock：同執行緒 reentrant，worker 執行緒被擋在 execute_command
+            resp = self.svc.rpc(
+                "command.submit",
+                {"selector": "COM0", "cmd": "echo hi", "source": "agent:test"},
+            )
+            self.assertTrue(resp["ok"], "quiet 未 arm 時第一層必須放行")
+            cmd_id = resp["cmd_id"]
+            session.arm_boot_quiet()
+
+        rec = self._wait_terminal(cmd_id)
+        self.assertEqual(rec["status"], "error")
+        self.assertEqual(rec["error_code"], "AUTOBOOT_QUIET")
+
+    def test_human_source_submit_not_gated(self) -> None:
+        self._inject_ready_session(arm_quiet=True)
+
+        resp = self.svc.rpc(
+            "command.submit",
+            {"selector": "COM0", "cmd": "echo hi", "source": "human:x"},
+        )
+
+        self.assertTrue(resp["ok"], "human 來源不受第一層 gate")
+        rec = self._wait_terminal(resp["cmd_id"])
+        self.assertEqual(rec["status"], "done", "human 來源亦不受第二層 gate（命令真的執行）")
 
 
 if __name__ == "__main__":
