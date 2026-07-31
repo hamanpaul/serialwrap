@@ -38,11 +38,15 @@
 - **THEN** p0/p1 照跑；rm-live 族 case 執行期 SKIP＝`FailEnv/remote_capability_missing`，整場不拒跑
 
 ### Requirement: 測試部署後系統
-所有 case 的驅動 SHALL 經由已安裝的 `serialwrap` CLI（subprocess）操作 live daemon 與真板；套件 MUST NOT import `sw_core`、MUST NOT 直接修改 daemon 的 state/config 檔案。破壞性 case SHALL 帶 `destructive` 標記並自行還原（release 後收回、reboot 後等 READY）；harness SHALL 於 case 之間驗證兩板 READY，不 READY 時嘗試恢復一次，仍失敗則後續依賴板卡的 case 記 SKIP。
+所有 case 的驅動 SHALL 經由已安裝的 `serialwrap` CLI（subprocess）操作 live daemon 與真板；CLI 執行檔 SHALL 可由呼叫端注入路徑（`SwCli` 建構子參數，預設 `"serialwrap"` 走 PATH，既有行為不變），供在 PATH 受污染環境（如綁 stale client 的 venv，#154）中 pin 定部署版執行檔。套件 MUST NOT import `sw_core`、MUST NOT 直接修改 daemon 的 state/config 檔案。破壞性 case SHALL 帶 `destructive` 標記並自行還原（release 後收回、reboot 後等 READY）；harness SHALL 於 case 之間驗證兩板 READY，不 READY 時嘗試恢復一次，仍失敗則後續依賴板卡的 case 記 SKIP。
 
 #### Scenario: case 弄髒環境不擴散
 - **WHEN** 某 destructive case 結束後板卡未回 READY
 - **THEN** harness 嘗試一次恢復（如 `device attach`／等待），仍失敗則後續依賴 case 記 SKIP 而非 FAIL，報告載明起因 case
+
+#### Scenario: 注入執行檔路徑生效
+- **WHEN** 呼叫端以絕對路徑建構 `SwCli`
+- **THEN** 所有 serialwrap 子命令經該執行檔執行，不經 PATH 解析；未注入時行為與既有版本相同
 
 ### Requirement: 報告與 evidence
 每輪執行 SHALL 產出 `report.json`（run metadata＋逐 case verdict/reason/duration/evidence 路徑）與 `report.md`（摘要表＋失敗案例診斷）至 `~/b-log/realhw-reports/<timestamp>/`（`--report-dir` 可覆寫）；每 case 的 evidence（執行命令與輸出、tmux capture-pane 快照、相關檔案引用）SHALL 落於該 case 子目錄。FAIL 的失敗訊息 SHALL 附上該 case 宣告的診斷提示（歷來已知坑）。
