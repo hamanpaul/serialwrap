@@ -28,3 +28,4 @@ tags
 
 # brag 影片的 HyperFrames 生成專案（產出 brag.mp4/brag.gif 已提交；source 不入版控）
 brag-output/composition/
+regression/serialwrap_regression/testbed.yaml

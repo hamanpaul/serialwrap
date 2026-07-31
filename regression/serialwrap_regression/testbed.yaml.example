@@ -1,0 +1,18 @@
+# serialwrap_regression testbed 範例。
+# 實跑時可在同目錄放 testbed.yaml 覆蓋（如 allow_destructive: true）；缺檔即用本檔。
+serialwrap_exe: ~/.local/bin/serialwrap  # pinned 部署版 CLI（#154 防線；勿走 PATH）
+allow_destructive: false                 # true 才跑 F9（reboot）／F10（throwaway 交接）
+tmux_prefix: swreg
+boards:
+  - com: COM0
+    alias: dut-prpl
+    serial: AC01QZT0
+    platform: prpl
+  - com: COM1
+    alias: com1-brcm
+    serial: AQ00OAQ7
+    platform: bcm
+timeouts:
+  ready_wait_s: 180
+  boot_wait_s: 240
+  cmd_timeout_s: 12

@@ -682,6 +682,33 @@ Reports land in `~/b-log/realhw-reports/<ts>/`. See
 [`docs/func-test/realhw-stability-checklist.md`](./docs/func-test/realhw-stability-checklist.md)
 for the per-case checklist and the P2 manual procedures.
 
+### TestPilot regression suite (#155)
+
+Bugs that only reproduced on real hardware are locked in as a TestPilot plugin
+(`serialwrap_regression`, under `regression/`): 10 scenario families mapped to
+closed issues, minutes-scale, meant to run often (after changes / before
+releases). Unlike the stability suite above (soak / disruption), it asks one
+question — *did anything we already fixed break again?* Every case pins the
+deployed CLI path and preflight refuses to run on client↔daemon version skew
+(#154 guard).
+
+```bash
+# one-off: install the plugin into the TestPilot venv (editable, dev-only)
+~/.local/share/testpilot/.venv/bin/pip install -e regression/
+
+testpilot list-plugins                                        # serialwrap_regression appears
+testpilot run serialwrap_regression                           # non-destructive families
+testpilot run serialwrap_regression --case f3-fail-error-code # single case
+```
+
+Destructive families (F9 boot/U-Boot — reboots boards; F10 credential
+isolation — temporary device handoff) are gated: create
+`regression/serialwrap_regression/testbed.yaml` with `allow_destructive: true`
+to include them (they record SKIP otherwise). Reports land in
+`~/b-log/regression-reports/tp-<ts>/`. Case↔issue mapping and the "add a case
+for a newly fixed bug" SOP:
+[`docs/regression-plugin.md`](./docs/regression-plugin.md).
+
 ### Further Reading
 
 - Detailed design and API contract: [`docs/serialwrap-spec.md`](./docs/serialwrap-spec.md)
@@ -1683,6 +1710,21 @@ python3 -m realhw --tier longrun --duration 48h   # 長跑無人看護（省略 
 ```
 
 報告落 `~/b-log/realhw-reports/<ts>/`。逐 case 對照與 P2 手動程序見 [`docs/func-test/realhw-stability-checklist.md`](./docs/func-test/realhw-stability-checklist.md)。
+
+### TestPilot 回歸測試（#155）
+
+只有實機才現形的已修 bug，固化成 TestPilot plugin（`serialwrap_regression`，位於 `regression/`）：10 個 Scenario Family 對應已 CLOSED 的 issue，分鐘級、常跑（改動後／發版前）。與上方穩定性套件（soak／插拔破壞）不同，它只問一件事——**以前修好的，有沒有壞回去？** 每個 case 都 pin 部署版 CLI 路徑，preflight 在 client↔daemon 版本歪斜時整場拒跑（#154 防線）。
+
+```bash
+# 一次性：把 plugin 裝進 TestPilot venv（editable、dev-only）
+~/.local/share/testpilot/.venv/bin/pip install -e regression/
+
+testpilot list-plugins                                        # 應出現 serialwrap_regression
+testpilot run serialwrap_regression                           # 非破壞性 family
+testpilot run serialwrap_regression --case f3-fail-error-code # 單一 case
+```
+
+破壞性 family（F9 開機/U-Boot——會 reboot 板子；F10 帳密隔離——暫時 device 交接）受 gate 管控：在 `regression/serialwrap_regression/testbed.yaml` 設 `allow_destructive: true` 才會跑（否則記 SKIP）。報告落 `~/b-log/regression-reports/tp-<ts>/`。case↔issue 對照與「從新修好的 bug 新增 case」SOP 見 [`docs/regression-plugin.md`](./docs/regression-plugin.md)。
 
 ### 32h 長時間穩定度測試摘要
 

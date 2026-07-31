@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "serialwrap-regression"
+version = "0.1.0"
+description = "serialwrap 已修 bug 的實機回歸 testpilot plugin（#155，dev-only editable）"
+requires-python = ">=3.10"
+dependencies = [
+    "testpilot-core>=0.3.4,<1.0",
+]
+
+[project.entry-points."testpilot.plugins"]
+serialwrap_regression = "serialwrap_regression.plugin:Plugin"
+
+[tool.hatch.build.targets.wheel]
+packages = ["serialwrap_regression"]

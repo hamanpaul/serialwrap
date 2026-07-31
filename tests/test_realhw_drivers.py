@@ -20,6 +20,23 @@ def test_parse_usbipd_list_maps_busids():
     assert got == ["8-1", "8-2"]
 
 
+def test_swcli_exe_injectable(monkeypatch):
+    """#155：SwCli 可注入執行檔路徑（#154 pin 防線）；未注入時維持裸 PATH 行為。"""
+    import subprocess
+
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(argv, timeout=30.0):
+        captured["argv"] = list(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(drivers, "_run", fake_run)
+    drivers.SwCli(exe="/opt/bin/serialwrap").run("doctor")
+    assert captured["argv"][0] == "/opt/bin/serialwrap"
+    drivers.SwCli().run("doctor")
+    assert captured["argv"][0] == "serialwrap"
+
+
 def test_strip_ansi():
     assert drivers.strip_ansi("a\x1b[31mred\x1b[0mb\x1b(B") == "aredb"
 

@@ -34,6 +34,14 @@ policy_version: 1.0.15
 - 既有失敗：`tests/test_multiagent_e2e.py::TestMultiAgentE2E::test_five_agents_three_rounds_no_conflict`（agent TX count mismatch，pre-existing）。
 - 不得引入**新的**測試失敗。
 
+## 回歸 case 政策（#155）
+
+- **修復 bug issue 時必須評估回歸測試歸屬**：
+  - pytest／mock 可覆蓋 → 加 pytest（照舊）。
+  - **需實機才驗得到**（真板 boot 時序、USB 列舉順序、真實登入、外部工具搶 tty、長時真實負載等）→ 必須在 `regression/`（TestPilot plugin `serialwrap_regression`）新增回歸 case，`issues` 欄掛上對應 issue 編號。
+  - **PR 描述須記錄評估結論**（新增了哪個 case，或 pytest 已覆蓋／為何免加）。
+- 新增 case 的 SOP 與 family↔issue 對照見 `docs/regression-plugin.md`；執行方式見 README「TestPilot 回歸測試」章。
+
 ## Policy Check 政策
 
 - 完成任何 phase 前，必須執行：
