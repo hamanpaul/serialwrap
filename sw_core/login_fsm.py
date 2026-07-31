@@ -7,8 +7,49 @@ import uuid
 
 from .auth import SessionAuth
 from .config import ProfileTemplate, SessionProfile
-from .constants import BOOT_BANNER_PATTERNS
+from .constants import BOOT_BANNER_PATTERNS, ERROR_RX_FLOOD, RX_FLOOD_BYTES_PER_10S
 from .uart_io import UARTBridge
+
+# RX 洪水可遮蔽的失敗碼集合（#153）：這些碼在「console 被灌爆」時全是同一個病灶
+# （probe/等待被洪水淹沒），反分類為 RX_FLOOD 讓上層知道該等排空而非重建 session。
+# LOGIN_REQUIRED／CREDENTIALS_*／USER_ENV_MISSING 等**不在**集合內，永不被遮蔽
+# （login prompt 可見＝可行動，優先於 flood）。
+_FLOOD_MASKABLE_ERRORS = frozenset({
+    "PROMPT_UNAVAILABLE",
+    "READY_NONCE_TIMEOUT",
+    "READY_PROMPT_TIMEOUT",
+    "POST_LOGIN_CMD_TIMEOUT",
+    "LOGIN_PROMPT_TIMEOUT",
+})
+
+
+def _maybe_reclassify_flood(bridge: UARTBridge, err: str | None) -> str | None:
+    """probe 失敗碼的 RX 洪水反分類（#153，單一 choke point）。
+
+    err 屬 ``_FLOOD_MASKABLE_ERRORS`` 或以 ``_PROMPT_TIMEOUT`` 結尾時，查
+    ``bridge.rx_stats()``；視窗內 raw RX bytes 超過 ``RX_FLOOD_BYTES_PER_10S``
+    即回 ``RX_FLOOD``，否則原樣。對不支援 ``rx_stats`` 的 bridge（測試 fake）
+    一律原樣直通（getattr 防禦），行為零變更。
+    """
+    if err is None:
+        return err
+    if err not in _FLOOD_MASKABLE_ERRORS and not err.endswith("_PROMPT_TIMEOUT"):
+        return err
+    stats_fn = getattr(bridge, "rx_stats", None)
+    if not callable(stats_fn):
+        return err
+    try:
+        stats = stats_fn()
+    except Exception:
+        return err
+    if not isinstance(stats, dict):
+        return err
+    value = stats.get("rx_bytes_last_10s")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return err
+    if value >= RX_FLOOD_BYTES_PER_10S:
+        return ERROR_RX_FLOOD
+    return err
 
 
 def detect_boot_banner(text: str) -> bool:
@@ -123,19 +164,27 @@ def _maybe_login(bridge: UARTBridge, sp: SessionProfile, auth: SessionAuth | Non
 
 
 def probe_ready(bridge: UARTBridge, sp: SessionProfile) -> tuple[bool, str | None]:
+    # #153：兩個公開出口統一包裝失敗碼，所有 sink（attach/recover/reprobe/auto-login）
+    # 自動涵蓋 RX 洪水反分類；成功路徑（err=None）不受影響。
     if not _probe_prompt(bridge, sp):
-        return False, _classify_non_ready_state(bridge, sp)
-    return _finalize_ready(bridge, sp)
+        return False, _maybe_reclassify_flood(bridge, _classify_non_ready_state(bridge, sp))
+    ok, err = _finalize_ready(bridge, sp)
+    if not ok:
+        return ok, _maybe_reclassify_flood(bridge, err)
+    return ok, err
 
 
 def ensure_ready(bridge: UARTBridge, sp: SessionProfile, auth: SessionAuth | None = None) -> tuple[bool, str | None]:
     if not _probe_prompt(bridge, sp):
         ok, err = _maybe_login(bridge, sp, auth)
         if err is not None:
-            return ok, err
+            return ok, _maybe_reclassify_flood(bridge, err)
         if not ok:
-            return False, _prompt_timeout_error(sp)
-    return _finalize_ready(bridge, sp)
+            return False, _maybe_reclassify_flood(bridge, _prompt_timeout_error(sp))
+    ok, err = _finalize_ready(bridge, sp)
+    if not ok:
+        return ok, _maybe_reclassify_flood(bridge, err)
+    return ok, err
 
 
 # ---------------------------------------------------------------------------

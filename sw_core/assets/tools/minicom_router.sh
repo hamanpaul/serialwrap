@@ -146,6 +146,8 @@ _find_first_reprobe_row() {
         ((.last_error // "") == "PROMPT_UNAVAILABLE")
         or ((.last_error // "") == "PROMPT_TIMEOUT")
         or ((.last_error // "") | endswith("_PROMPT_TIMEOUT"))
+        or ((.last_error // "") == "RX_FLOOD")
+        or ((.last_error // "") == "TRANSPORT_STALL")
         or ((.reprobe_attempts // 0) > 0)
         or (.reprobe_exhausted // false)
       )
@@ -158,6 +160,8 @@ _row_needs_reprobe_hint() {
     (((.last_error // "") == "PROMPT_UNAVAILABLE")
       or ((.last_error // "") == "PROMPT_TIMEOUT")
       or ((.last_error // "") | endswith("_PROMPT_TIMEOUT"))
+      or ((.last_error // "") == "RX_FLOOD")
+      or ((.last_error // "") == "TRANSPORT_STALL")
       or ((.reprobe_attempts // 0) > 0)
       or (.reprobe_exhausted // false))
   ')" == "true" ]]

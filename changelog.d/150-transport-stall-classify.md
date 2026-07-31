@@ -1,0 +1,5 @@
+---
+type: fix
+scope: session_manager
+---
+Transport stall 分類與觀測面（#150）：WSL2＋usbip 偶發 USB read-endpoint stall（TX 通、RX 全凍，dmesg `urb stopped: -32`）過去被折疊進 `PROMPT_UNAVAILABLE`／`LOGIN_PROMPT_TIMEOUT`，誤導 operator 去 power-cycle DUT 或反覆 recover（皆無效）。新增：(1) 純偵測模組 `sw_core/transport_stall.py`——probe 全程零 raw RX（連 echo 都無，`UARTBridge.rx_total_bytes()` 新計數器取差）＋該 session 曾有 RX＋`last_rx_age_s >= 30s` 才翻轉為新錯誤碼 **`TRANSPORT_STALL`**（與 #153 RX_FLOOD 高 RX 特徵天然互斥）；(2) 三個 probe 落地點（`_probe_existing_bridge`／`_attach_by_id`／`_attach_by_id_dynamic`）經單一 choke point `_refine_probe_failure` 精煉，boot-quiet 合成錯不精煉；(3) `last_error_detail` 新欄位附可複製的 host 層復原指令（USB busid authorized 0→1 toggle／usbipd detach+attach），`last_error` 改 property、值變更自動清 detail；一次性 log＋WAL META（`transport_stall_suspected`，RX 恢復重臂）；(4) session 公開 dict 新增 `last_rx_age_s`／`last_tx_age_s`（RX 單邊凍結一眼可判，`idle_for_ms` 看不出）；(5) `TRANSPORT_STALL` 保留自動重探資格（RX 恢復即自癒回原分類或 READY）；`minicom_router.sh`／SKILL.md／README（含 WSL2+usbip 復原 SOP）同步。回歸 plugin F11 新增 `f11-last-rx-age-sane` 觀測面 case（真 usbip stall 依 #155 裁定排除自動化、heuristic 由 pytest 覆蓋）。

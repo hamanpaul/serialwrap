@@ -283,9 +283,17 @@ serialwrap daemon status
 Common classifications include `OK`, `DEVICE_MISSING`,
 `DEVICE_REBOUND_REQUIRED`, `BRIDGE_DOWN`, `VTTY_STALE`,
 `TARGET_UNRESPONSIVE`, `LOGIN_REQUIRED`, `ATTACHED_NOT_READY`,
-`REBOOTING`, `HUMAN_INTERACTIVE_ACTIVE`, `PASSTHROUGH`, and
+`REBOOTING`, `HUMAN_INTERACTIVE_ACTIVE`, `PASSTHROUGH`,
 `AUTOBOOT_QUIET` (#130 — a boot quiet window is active; wait for it to
-clear or expire, don't retry in a loop).
+clear or expire, don't retry in a loop), and `RX_FLOOD` (#153 — the
+console is being flooded (`rx_bytes_last_10s` above threshold); the probe
+drowned, the target is not dead. Wait for the flood to drain — the daemon
+auto-reprobes back to `READY` — instead of recovering/rebuilding the
+session). A `TRANSPORT_STALL` `last_error` (#150) means TX works but zero
+RX was seen for 30s+ and the probe got no echo at all: a suspected
+USB/usbip read-endpoint stall (`urb stopped: -32` in host dmesg) that
+serialwrap cannot self-heal — follow `last_error_detail` for the host-side
+USB re-enumeration command, and check dmesg before power-cycling the DUT.
 
 Use `recover` for unhealthy sessions:
 
@@ -1418,6 +1426,7 @@ serialwrap session self-test --selector COM0
 - `HUMAN_INTERACTIVE_ACTIVE`：human console 目前握有 interactive ownership，不適合 agent 干預
 - `PASSTHROUGH`：platform 設為 passthrough，session 已 ATTACHED，適合透明 bridge 模式
 - `AUTOBOOT_QUIET`（#130）：session 名義上是 `READY`，但已進入 boot quiet window（自發重開機的過渡態），不送 nonce probe；等它自己解除或過期，勿反覆呼叫
+- `RX_FLOOD`（#153）：console 正被大量輸出灌爆（`rx_bytes_last_10s` 超閾 ≥20000B/10s），probe 被洪水淹沒——**不是 target 死了**。`recommended_action=wait`：等排空（daemon 於 RX 閒置 3s 後自動重探升 `READY`），勿 recover/重建 session
 
 ### 帳密解析終態 `CREDENTIALS_UNRESOLVED`（#140）
 
@@ -1429,7 +1438,7 @@ serialwrap session self-test --selector COM0
 
 若 `session attach` 剛好撞上 DUT 開機窗，target 仍在噴 boot log 或 prompt 尚未出現，session 可能暫時停在非 `READY`：
 
-> **`session attach` 回傳契約（#94）**：command-capable session 未能自動達 `READY` 時，`session attach` 會回**非零 exit（`2`）+ 頂層 `error_code`**（如 `PROMPT_UNAVAILABLE`），CLI 並在 stderr 印一行具體錯誤（早期版本一律回 `ok:true`、錯誤只埋在 `session.last_error`，上層因而拿到空 error）。這是「尚未達 READY」的**誠實回報、可重試**——daemon 會有界自動重探、通常數秒內回 `READY`——**非致命**；自動化上層應據此 retry/wait，勿當永久失敗。（仍回 `ok:true` 的例外：`READY`、`ATTACHING`（attach 進行中）、`RELEASED`（裝置已 release、回 `recommended_action=device_attach`、需 `device attach` 重取）、`platform=passthrough`（停 `ATTACHED` 即成功）。）
+> **`session attach` 回傳契約（#94）**：command-capable session 未能自動達 `READY` 時，`session attach` 會回**非零 exit（`2`）+ 頂層 `error_code`**（如 `PROMPT_UNAVAILABLE`、`RX_FLOOD`），CLI 並在 stderr 印一行具體錯誤（早期版本一律回 `ok:true`、錯誤只埋在 `session.last_error`，上層因而拿到空 error）。這是「尚未達 READY」的**誠實回報、可重試**——daemon 會有界自動重探、通常數秒內回 `READY`（`RX_FLOOD` 為洪水排空後 3s 內接手，#153）——**非致命**；自動化上層應據此 retry/wait，勿當永久失敗。（仍回 `ok:true` 的例外：`READY`、`ATTACHING`（attach 進行中）、`RELEASED`（裝置已 release、回 `recommended_action=device_attach`、需 `device attach` 重取）、`platform=passthrough`（停 `ATTACHED` 即成功）。）
 
 ```bash
 serialwrap session self-test --selector COM0
@@ -1440,9 +1449,24 @@ serialwrap session list
 
 1. `ATTACHED_NOT_READY` 且 `last_error=PROMPT_UNAVAILABLE` / `PROMPT_TIMEOUT`：bridge 還在，通常是 prompt 尚未可用；daemon 會在 RX 閒置後依 `reprobe_attempts` / `next_reprobe_at` 做有界自動重探，成功後回 `READY`。
 2. `BRIDGE_DOWN` 且 session 為 `DETACHED`、`last_error` 為 `*_PROMPT_TIMEOUT`：裝置仍在位時 daemon 會重新走 attach/probe 路徑。
-3. `reprobe_exhausted=true` 或等待過久仍未 READY：手動執行 `serialwrap session recover --selector COM0`（必要時加 `--force`）。
+3. `last_error=RX_FLOOD`（#153）：console 正被灌爆（session 的 `rx_bytes_last_10s` ≥20000）——**等排空、勿重建**。洪水停止、RX 閒置 3s 後 daemon 自動重探升 `READY`；以 `session list` 的 `rx_bytes_last_10s`／`rx_rate_bps` 觀測排空進度。
+4. `last_error=TRANSPORT_STALL`（#150）：TX 通、RX 凍（`last_rx_age_s` ≥30s 且 probe 全程連 echo 都無）——見下方「Transport stall 判讀與復原」，serialwrap 無法自復，需 host 層 USB re-enumeration。
+5. `reprobe_exhausted=true` 或等待過久仍未 READY：手動執行 `serialwrap session recover --selector COM0`（必要時加 `--force`）。
 
 `minicom_router.sh` 在偵測到這類狀態時會提示「DUT 可能仍在開機、serialwrap 正在自動重探」；若希望它阻塞等待 READY 後再開 minicom，可設 `MINICOM_WAIT_READY=1`。
+
+### Transport stall（USB/usbip RX 凍結）判讀與復原（#150）
+
+WSL2＋usbip 環境偶發 USB read-endpoint stall：**TX 正常、RX 完全凍結**——human console 打字無回應、probe 送得出去但連 echo 都收不到，host `dmesg` 常見 `urb stopped: -32`。過去這被折疊進 `PROMPT_UNAVAILABLE`，誤導 operator 去 power-cycle DUT 或反覆 recover。現在：
+
+- **分類**：probe 失敗＋probe 全程零 raw RX＋該 session 曾有 RX 且 `last_rx_age_s` ≥30s → `last_error=TRANSPORT_STALL`，`last_error_detail` 附可複製的復原指令；daemon 另輸出一次性 log 與 WAL META（`transport_stall_suspected`）。
+- **觀測**：`session list`／`session activity` 的 `last_rx_age_s`（RX 年齡）與 `last_tx_age_s`（TX 年齡）可直接看出「TX 新鮮、RX 陳舊」的單邊凍結特徵（`idle_for_ms` 取兩者較新值、看不出）。
+- **復原 SOP**（serialwrap 的 recover／release+attach 都救不了，需 host 層 USB re-enumeration）：
+  1. 先 `dmesg | tail` 佐證（`urb stopped: -32`／usbip 錯誤）——**排除 DUT 斷電/當機**（同樣會零 RX）。
+  2. authorized toggle 重新枚舉：`sudo sh -c 'echo 0 > /sys/bus/usb/devices/<busid>/authorized; echo 1 > /sys/bus/usb/devices/<busid>/authorized'`（busid 見 `last_error_detail`）。
+  3. usbip 環境亦可在 Windows 側 `usbipd detach`／`usbipd attach` 重掛。
+  4. 裝置重新枚舉後 daemon 自動 re-attach；必要時 `serialwrap session attach --selector COM0`。
+- **誤判自癒**：TRANSPORT_STALL 不喪失自動重探資格——RX 一恢復，下一輪 probe 見到 echo 即回原分類或升 `READY`。
 
 ### 同機多開（two-reader）偵測（#101）
 

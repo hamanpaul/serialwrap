@@ -84,6 +84,25 @@ EVENTS_LOG_BACKUP_COUNT = 3
 # 帳密後手動 attach/recover 才重試。與「板子尚未到 login prompt」的 LOGIN_REQUIRED 區分。
 ERROR_CREDENTIALS_UNRESOLVED: str = "CREDENTIALS_UNRESOLVED"
 
+# RX 洪水分類（#153）：probe 失敗且 RX 速率超閾時，把 PROMPT_UNAVAILABLE 類錯誤
+# 反分類為 RX_FLOOD——「console 被灌爆」與「console 死了」不再擠同一個錯誤碼。
+# 語意：等排空（daemon 於 RX 閒置後自動重探接手），勿重建 session。
+ERROR_RX_FLOOD: str = "RX_FLOOD"
+RX_RATE_WINDOW_S: float = 10.0
+"""UARTBridge RX 速率統計視窗（秒）；rx_stats() 回報此視窗內的 raw bytes。"""
+RX_FLOOD_BYTES_PER_10S: int = 20_000
+"""視窗內 raw RX bytes 達此值即視為洪水（≈2KB/s 持續，115200 線速的 ~17%）。
+僅在 probe 失敗後才據此反分類；正常 idle 板視窗內近 0，誤判面窄。"""
+
+# transport stall 分類（#150）：probe 全程零 raw RX（連 echo 都無）、且該 session 曾有
+# RX 但已凍結逾閾時，把 PROMPT_UNAVAILABLE／*_PROMPT_TIMEOUT 精煉為 TRANSPORT_STALL
+# （疑似 USB/usbip read-endpoint stall，dmesg 常見 `urb stopped: -32`）——serialwrap 的
+# recover/release+attach 無法自復，需 host 層 USB re-enumeration，勿誤導去 power-cycle DUT。
+ERROR_TRANSPORT_STALL: str = "TRANSPORT_STALL"
+TRANSPORT_STALL_MIN_RX_AGE_S: float = 30.0
+"""last_rx 距今至少此秒數才允許翻轉為 TRANSPORT_STALL。reprobe backoff 上限 15s、
+最多 10 次≈2 分鐘，30s 門檻保證 exhausted 前必有多次 probe 落在門檻後、能完成翻轉。"""
+
 # bootloader recovery 用常數
 MAX_RECOVERY_LEASE_S: float = 120.0
 """recovery interactive lease 最長持續秒數。"""

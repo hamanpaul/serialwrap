@@ -171,6 +171,46 @@ class TestSessionPublicDict(unittest.TestCase):
         self.assertLess(s.to_public_dict()["idle_for_ms"], 100)
 
 
+class TestSessionRxTxAgeFields(unittest.TestCase):
+    """#150 — to_public_dict 的 RX/TX 單邊年齡與 last_error_detail 欄位。"""
+
+    def test_public_dict_contains_age_and_detail_fields(self) -> None:
+        s = _make_session("READY")
+        d = s.to_public_dict()
+        for key in ("last_rx_age_s", "last_tx_age_s", "last_error_detail"):
+            self.assertIn(key, d, f"missing field {key}")
+
+    def test_age_none_when_never_active(self) -> None:
+        s = _make_session("READY")
+        d = s.to_public_dict()
+        self.assertIsNone(d["last_rx_age_s"])
+        self.assertIsNone(d["last_tx_age_s"])
+
+    def test_age_reflects_monotonic_distance(self) -> None:
+        s = _make_session("READY")
+        s.last_rx_mono = time.monotonic() - 40.0
+        s.last_tx_mono = time.monotonic() - 1.0
+        d = s.to_public_dict()
+        self.assertAlmostEqual(d["last_rx_age_s"], 40.0, delta=1.0)
+        self.assertAlmostEqual(d["last_tx_age_s"], 1.0, delta=1.0)
+
+    def test_last_error_setter_clears_detail_on_change(self) -> None:
+        """last_error 值變更 → detail 自動清空（stale detail 根除線）。"""
+        s = _make_session()
+        s.last_error = "TRANSPORT_STALL"
+        s.last_error_detail = "hint"
+        s.last_error = "PROMPT_UNAVAILABLE"
+        self.assertIsNone(s.last_error_detail)
+
+    def test_last_error_same_value_keeps_detail(self) -> None:
+        """同值重設不清 detail（逐輪 reprobe 同碼時 detail 保留）。"""
+        s = _make_session()
+        s.last_error = "TRANSPORT_STALL"
+        s.last_error_detail = "hint"
+        s.last_error = "TRANSPORT_STALL"
+        self.assertEqual(s.last_error_detail, "hint")
+
+
 class TestSessionManagerActivityHooks(unittest.TestCase):
     """SessionManager 內 RX / TX 標記助手在實際路徑被呼叫的整合測試。"""
 

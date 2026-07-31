@@ -4,8 +4,12 @@ from __future__ import annotations
 import dataclasses
 from typing import Any, Callable
 
-# 執行順序（#155 定案）：非破壞性 family 在前、破壞性（F9→F10）壓軸。
-FAMILY_ORDER: tuple[str, ...] = ("F3", "F1", "F5", "F6", "F2", "F4", "F7", "F8", "F9", "F10")
+# 執行順序（#155 定案；#150/#153 批次擴充）：非破壞性 family 在前、破壞性壓軸。
+# F11＝RX 洪水/傳輸層（#153 flood 為 destructive、殿後避免殘 log 污染他 family 基線）；
+# F12 由對應 case 檔另行補列（順序此處一次到位，後續不再改動）。
+FAMILY_ORDER: tuple[str, ...] = (
+    "F3", "F1", "F5", "F6", "F2", "F4", "F7", "F8", "F12", "F9", "F10", "F11",
+)
 
 
 @dataclasses.dataclass(frozen=True)

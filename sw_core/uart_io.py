@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import collections
 import dataclasses
 import errno
 import os
@@ -12,7 +13,7 @@ import uuid
 from typing import Any, Callable
 
 from .config import UartProfile
-from .constants import DEFERRED_INPUT_MAX_BYTES
+from .constants import DEFERRED_INPUT_MAX_BYTES, RX_RATE_WINDOW_S
 from .serial_port import SerialPort, open_serial_port
 from .telnet_console import TELNET_GREETING, TelnetFilter, escape_iac
 from .wal import WalWriter
@@ -22,6 +23,10 @@ from .wal import WalWriter
 # 使 `import sw_core.uart_io` 在 Windows 不再因 top-level import termios/fcntl 而失敗。
 
 _STALE_CONSOLE_GRACE_S = 2.0
+
+# RX 速率視窗筆數硬上限（#153 防呆）：異常高頻小 chunk 下 deque 也不無界成長；
+# 時間剪枝為主，此上限僅兜底（deque maxlen 自動丟最舊）。
+_RX_WINDOW_MAX_ENTRIES = 4096
 
 
 def _pty_available() -> bool:
@@ -145,6 +150,15 @@ class UARTBridge:
         # _rx_trimmed + len(_rx_text)（絕對偏移），使緩衝飽和修剪後既有 offset 仍可
         # 正確切片，prompt 匹配不再因「長度恆等於視窗上限」而永遠落空。
         self._rx_trimmed = 0
+        # RX 速率統計視窗（#153）：(mono_ts, raw_byte_len) 佇列，_rx_lock 保護。計的是
+        # raw serial bytes（clean_text 之前，ANSI/雜訊照算——對洪水最誠實），供 rx_stats()
+        # 回報最近 RX_RATE_WINDOW_S 秒的量；maxlen 為筆數防呆上限。
+        self._rx_window: collections.deque[tuple[float, int]] = collections.deque(
+            maxlen=_RX_WINDOW_MAX_ENTRIES
+        )
+        # raw RX 累計計數器（#150）：單調遞增、clear_rx_buffer() 不歸零；供 probe 前後
+        # 取差判定「probe 全程零 RX（連 echo 都無）」的 transport stall 特徵。
+        self._rx_total_bytes = 0
         self._preserved_consoles = preserved_consoles
         self._clients: dict[str, ConsoleClient] = {}
         self._interactive_owner: str | None = None
@@ -622,13 +636,24 @@ class UARTBridge:
 
     def _append_rx_text(self, payload: bytes) -> None:
         text = payload.decode("utf-8", errors="replace")
+        now = time.monotonic()
         with self._rx_lock:
+            # raw bytes 記帳（#153 速率視窗＋#150 累計計數）：同一鎖內單點維護。
+            self._rx_total_bytes += len(payload)
+            self._rx_window.append((now, len(payload)))
+            self._prune_rx_window_locked(now)
             self._rx_text += text
             overflow = len(self._rx_text) - self._rx_max_chars
             if overflow > 0:
                 # 視窗修剪必須記帳（#158）：丟棄的字元數推進 _rx_trimmed，維持絕對偏移語意。
                 self._rx_text = self._rx_text[overflow:]
                 self._rx_trimmed += overflow
+
+    def _prune_rx_window_locked(self, now: float) -> None:
+        """剪除速率視窗中超過 RX_RATE_WINDOW_S 的舊項（#153）；須持 _rx_lock。"""
+        window = self._rx_window
+        while window and now - window[0][0] > RX_RATE_WINDOW_S:
+            window.popleft()
 
     def _handle_serial_rx(self, data: bytes) -> None:
         self.wal.append(com=self.com, direction="RX", source="device", payload=data)
@@ -963,6 +988,32 @@ class UARTBridge:
         with self._rx_lock:
             return self._rx_trimmed + len(self._rx_text)
 
+    def rx_stats(self) -> dict[str, Any]:
+        """最近 ``RX_RATE_WINDOW_S`` 秒的 raw RX bytes 統計（#153）。
+
+        - ``rx_bytes_last_10s``：視窗內 raw serial bytes 總量（ANSI/雜訊照算）。
+        - ``rx_rate_bps``：視窗平均速率（bytes/s，取整）。
+
+        供 probe 失敗的 RX_FLOOD 反分類與 session 公開指標露出使用。
+        """
+        now = time.monotonic()
+        with self._rx_lock:
+            self._prune_rx_window_locked(now)
+            total = sum(size for _, size in self._rx_window)
+        return {
+            "rx_bytes_last_10s": total,
+            "rx_rate_bps": int(total / RX_RATE_WINDOW_S),
+        }
+
+    def rx_total_bytes(self) -> int:
+        """累計 raw RX bytes（#150）：單調遞增，``clear_rx_buffer()`` 不歸零。
+
+        probe 前後取差＝probe 全程實際收到的 raw bytes；差為 0（連 echo 都無）
+        是 transport stall（USB/usbip read-endpoint 凍結）的關鍵特徵。
+        """
+        with self._rx_lock:
+            return self._rx_total_bytes
+
     def rx_text_from(self, from_offset: int) -> str:
         """以絕對偏移取文字（#158）；頭段已被修剪時降級回傳現存全窗（不失敗、不回空）。"""
         with self._rx_lock:
@@ -1112,6 +1163,7 @@ class UARTBridge:
         consoles = self.list_consoles()
         with self._rx_lock:
             rx_dropped_chars = self._rx_trimmed  # 視窗修剪/clear 累計丟棄量（#158 鑑識用）
+            rx_total_bytes = self._rx_total_bytes  # raw RX 累計（#150 鑑識用，單調遞增）
         with self._state_lock:
             serial_fd = self._serial_fd
             port = self._serial
@@ -1165,6 +1217,8 @@ class UARTBridge:
             # RX 視窗累計丟棄字元數（#158）：>0 代表曾觸頂修剪或 clear，供日後鑑識同類
             # 「offset 跨界」問題（絕對偏移語意下不再致病，僅觀測）。
             "rx_dropped_chars": rx_dropped_chars,
+            # raw RX 累計 bytes（#150）：單調遞增、clear 不歸零，供 transport stall 鑑識。
+            "rx_total_bytes": rx_total_bytes,
         }
 
     def try_grant_interactive_if_idle(self, owner: str) -> bool:

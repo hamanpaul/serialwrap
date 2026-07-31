@@ -501,3 +501,92 @@ class TestRxOffsetBoundedBuffer(unittest.TestCase):
         self.assertEqual(bridge.snapshot()["rx_dropped_chars"], 0)
         self._fill(bridge._rx_max_chars + 40)
         self.assertEqual(bridge.snapshot()["rx_dropped_chars"], 40)
+
+
+class TestRxStats(unittest.TestCase):
+    """#153：UARTBridge RX 速率統計視窗（rx_stats）。
+
+    不 start()、不碰真實序列埠；直接餵 _append_rx_text 並以可控時鐘驗證
+    視窗剪枝、平均速率與筆數上限防呆。計量以 raw bytes（含 ANSI）為準。
+    """
+
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        wal = WalWriter(wal_dir=self._tmpdir.name)
+        self._bridge = UARTBridge(
+            com="COM0",
+            device_path="/dev/null",
+            profile=UartProfile(),
+            wal=wal,
+        )
+        self._clock = {"t": 0.0}
+
+    def tearDown(self) -> None:
+        self._bridge.stop()
+        self._tmpdir.cleanup()
+
+    def _monotonic(self) -> float:
+        return self._clock["t"]
+
+    def test_window_prunes_entries_older_than_10s(self) -> None:
+        """視窗只含最近 10s 的 bytes；超窗舊項剪除、rx_rate_bps 為視窗平均。"""
+        import sw_core.uart_io as uart_io_mod
+
+        bridge = self._bridge
+        with mock.patch.object(uart_io_mod.time, "monotonic", side_effect=self._monotonic):
+            self._clock["t"] = 0.0
+            bridge._append_rx_text(b"a" * 1000)
+            self._clock["t"] = 5.0
+            bridge._append_rx_text(b"b" * 2000)
+            self._clock["t"] = 12.0
+            bridge._append_rx_text(b"c" * 4000)
+            stats = bridge.rx_stats()
+        # t=12：t=0 的 1000B 已超窗（age 12 > 10）剪除；剩 2000+4000。
+        self.assertEqual(stats["rx_bytes_last_10s"], 6000)
+        self.assertEqual(stats["rx_rate_bps"], 600)  # 6000 / 10s
+
+    def test_raw_bytes_counted_including_ansi(self) -> None:
+        """計量以 raw bytes 為準：ANSI/控制碼照算（對洪水最誠實）。"""
+        import sw_core.uart_io as uart_io_mod
+
+        bridge = self._bridge
+        with mock.patch.object(uart_io_mod.time, "monotonic", side_effect=self._monotonic):
+            bridge._append_rx_text(b"ab\x1b[0m")
+            stats = bridge.rx_stats()
+        self.assertEqual(stats["rx_bytes_last_10s"], 6)
+
+    def test_stats_drop_to_zero_after_window_passes(self) -> None:
+        """視窗滑過後 rx_stats 歸零（rx_stats 讀取時亦剪枝）。"""
+        import sw_core.uart_io as uart_io_mod
+
+        bridge = self._bridge
+        with mock.patch.object(uart_io_mod.time, "monotonic", side_effect=self._monotonic):
+            self._clock["t"] = 0.0
+            bridge._append_rx_text(b"x" * 5000)
+            self._clock["t"] = 30.0
+            stats = bridge.rx_stats()
+        self.assertEqual(stats["rx_bytes_last_10s"], 0)
+        self.assertEqual(stats["rx_rate_bps"], 0)
+
+    def test_window_entry_hard_cap(self) -> None:
+        """同一瞬間灌超過 4096 筆：deque maxlen 防呆丟最舊，不無界成長。"""
+        import sw_core.uart_io as uart_io_mod
+
+        bridge = self._bridge
+        with mock.patch.object(uart_io_mod.time, "monotonic", side_effect=self._monotonic):
+            for _ in range(5000):
+                bridge._append_rx_text(b"z")
+            stats = bridge.rx_stats()
+        self.assertEqual(len(bridge._rx_window), 4096)
+        self.assertEqual(stats["rx_bytes_last_10s"], 4096)
+
+    def test_rx_total_bytes_monotonic_and_clear_immune(self) -> None:
+        """#150：rx_total_bytes 單調遞增、clear_rx_buffer 不歸零；snapshot 露出。"""
+        bridge = self._bridge
+        bridge._handle_serial_rx(b"ab\x1b[0m")
+        self.assertEqual(bridge.rx_total_bytes(), 6)
+        bridge.clear_rx_buffer()
+        self.assertEqual(bridge.rx_total_bytes(), 6, "clear 後 raw RX 累計不得歸零")
+        bridge._handle_serial_rx(b"cd")
+        self.assertEqual(bridge.rx_total_bytes(), 8)
+        self.assertEqual(bridge.snapshot()["rx_total_bytes"], 8)
