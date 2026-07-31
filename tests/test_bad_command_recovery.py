@@ -50,6 +50,25 @@ class TestBadCommandRecovery(unittest.TestCase):
         session.state = "READY"
         return mgr, session, bridge
 
+    def _setup_ready_session_with_flush_tracker(self):
+        """建立一個 READY session，並回傳 (mgr, session, bridge, flush_calls)。
+
+        flush_calls 收集 on_command_flush callback 的每次呼叫（#156）。
+        """
+        flush_calls: list[tuple[str, str]] = []
+        profiles = [self._make_profile()]
+        mgr = SessionManager(
+            profiles, WalWriter(wal_dir=self._tmp.name),
+            on_ready=lambda _: None, on_detached=lambda _: None,
+            on_command_flush=lambda sid, code: flush_calls.append((sid, code)),
+        )
+        session = mgr.get_session("COM0")
+        assert session is not None
+        bridge = mock.MagicMock()
+        session.bridge = bridge
+        session.state = "READY"
+        return mgr, session, bridge, flush_calls
+
     def test_bad_command_timeout_then_ctrl_c_recover(self) -> None:
         """壞命令（如 cat 不帶 EOF）→ prompt timeout → Ctrl-C recover → 回 READY。"""
         mgr, session, bridge = self._setup_ready_session()
@@ -168,6 +187,53 @@ class TestBadCommandRecovery(unittest.TestCase):
         self.assertEqual(tail["status"], "error")
         self.assertEqual(tail["error_code"], "PROMPT_TIMEOUT")
         self.assertEqual(tail["chunks"], ["partial output only"])
+
+    def test_ctrl_c_recovery_invokes_flush_callback(self) -> None:
+        """#156：CTRL_C 攔截成功 recover 時，on_command_flush callback 須被呼叫一次。"""
+        mgr, session, bridge, flush_calls = self._setup_ready_session_with_flush_tracker()
+
+        # keepalive 迴圈：pre_offset(10), pre_rx(10), wait→False, silence_check(10)→靜默
+        # 進入 recover：CTRL_C offset(20), wait→True
+        bridge.rx_snapshot_len.side_effect = [10, 10, 10, 20]
+        bridge.wait_for_regex_from.side_effect = [False, True]
+        bridge.rx_text_from.return_value = "partial line\n$ "
+
+        resp = mgr.execute_command("p:COM0", "cat", "agent:test", "cid-flush1", timeout_s=0.1)
+
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["error_code"], "PROMPT_TIMEOUT_RECOVERED")
+        self.assertEqual(flush_calls, [(session.session_id, "FLUSHED_BY_RECOVERY")])
+
+    def test_timeout_without_recovery_does_not_double_flush(self) -> None:
+        """#156：CTRL_C/CTRL_D 皆失敗（走既有 on_detached 路徑）時，
+        新的 on_command_flush callback 不應被呼叫——兩條 flush 掛點互斥。
+        """
+        flush_calls: list[tuple[str, str]] = []
+        detached_calls: list[str] = []
+        profiles = [self._make_profile()]
+        mgr = SessionManager(
+            profiles, WalWriter(wal_dir=self._tmp.name),
+            on_ready=lambda _: None,
+            on_detached=lambda sid: detached_calls.append(sid),
+            on_command_flush=lambda sid, code: flush_calls.append((sid, code)),
+        )
+        session = mgr.get_session("COM0")
+        assert session is not None
+        bridge = mock.MagicMock()
+        session.bridge = bridge
+        session.state = "READY"
+
+        # 全部 wait_for_regex = False（連 Ctrl-C 後也沒回 prompt）
+        bridge.rx_snapshot_len.side_effect = [10, 10, 10, 20, 30]
+        bridge.wait_for_regex_from.side_effect = [False, False, False]
+        bridge.rx_text_from.return_value = "partial output only"
+
+        resp = mgr.execute_command("p:COM0", "totally-broken", "agent:test", "cid-nodouble", timeout_s=0.1)
+
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error_code"], "PROMPT_TIMEOUT")
+        self.assertEqual(flush_calls, [])
+        self.assertEqual(detached_calls, [session.session_id])
 
 
 if __name__ == "__main__":

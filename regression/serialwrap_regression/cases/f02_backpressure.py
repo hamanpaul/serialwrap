@@ -9,9 +9,13 @@
 - history（``_commands`` dict）淘汰只作用於已終結（有 ``done_at``）記錄，且在多個終結點
   （worker 完成／cancel／submit 後）即時收斂，理論上使 daemon 常駐記憶體不隨命令數無界成長
   （#81）。
-- ``session recover`` 觸發 ``unregister_session`` → 於同一把鎖內把該 session 尚未啟動的
-  accepted 命令原子標記為 ``FLUSHED_BY_RECOVERY`` 終態，釋放 pending 額度，避免舊佇列殘留
-  造成往後每次 submit 都連鎖 ``SESSION_QUEUE_FULL``（#128）。
+- ``session recover`` / 命令逾時內部觸發的 recovery 有兩條 flush 掛點，皆把該 session
+  尚未啟動的 accepted 命令原子標記為 ``FLUSHED_BY_RECOVERY`` 終態、釋放 pending 額度，
+  避免舊佇列殘留造成往後每次 submit 都連鎖 ``SESSION_QUEUE_FULL``：
+  (a) session 真的離線 → ``unregister_session`` 內建 flush（#128）；
+  (b) CTRL_C/CTRL_D 攔截成功、session 全程停留 READY 未離線 → ``_recover_after_failure``
+      經 ``on_command_flush`` callback 直呼 ``arbiter.flush_session()``（#156，補上 (a)
+      天生跳過的分支）。
 """
 from __future__ import annotations
 
@@ -105,7 +109,7 @@ def f2_queue_full_backpressure(ctx: Any) -> CaseResult:
     """#81：per-session pending 命令數必須有硬上限（backpressure），超量拒收而非無界排隊 OOM。"""
     com = ctx.cfg["boards"][0]["com"]
     triggered_at: int | None = None
-    cmd_ids: list[str] = []  # 收尾 cancel 用（#156：recover 的 CTRL_C 路徑不 flush，不能只靠 recover）
+    cmd_ids: list[str] = []  # 收尾 cancel 用（多層防線；recover 的 flush 已修復 #156，此處保留不刪）
     try:
         submissions_tail: list[dict] = []  # 只留尾段回應當 evidence，避免 300 筆塞爆 note
         for i in range(_QUEUE_FULL_ATTEMPT_CAP):
@@ -133,9 +137,9 @@ def f2_queue_full_backpressure(ctx: Any) -> CaseResult:
             reason=f"第 {triggered_at} 次 submit 觸發 SESSION_QUEUE_FULL（backpressure 生效）",
         )
     finally:
-        # 收尾（首輪實測教訓，#156）：recover 走 CTRL_C 攔截路徑時**不會** flush 佇列，
-        # 殘留 250+ 條 sleep 5 會外溢毒害後續 case（首輪 f4 兩案因此連鎖 FAIL）——
-        # 先逐一 cancel（確定性釋放額度）再 recover 收斂。
+        # 收尾（歷史教訓，#156 已修復）：首輪實測時 recover 的 CTRL_C 攔截路徑不會 flush
+        # 佇列，殘留 250+ 條 sleep 5 曾外溢毒害後續 case（首輪 f4 兩案因此連鎖 FAIL）。
+        # 此處 cancel-then-recover 保留作多層防線，非因 recover flush 仍失效。
         _cancel_all(ctx, cmd_ids)
         recover_resp = ctx.sw.run("session", "recover", "--selector", com)
         ctx.note("cleanup-recover.json", str(recover_resp))
@@ -305,7 +309,7 @@ def f2_rx_window_crossing_prompt(ctx: Any) -> CaseResult:
 @_case(
     "f2-recovery-flushes-queue",
     "session recover 後舊佇列已 flush，立即 submit 不再連鎖 QUEUE_FULL",
-    issues=("#128",),
+    issues=("#128", "#156"),
     hints=(
         "已知行為（repo 既有事實）：recover 回應可能是 TIMEOUT 但實際已成功——判定不得看"
         "recover 本身的回應，只看 wait_state 是否真的回到 READY。",
@@ -338,16 +342,19 @@ def f2_recovery_flushes_queue(ctx: Any) -> CaseResult:
                 category="test", reason_code="stale_queue_after_recovery",
             )
 
-        # 有界排空 oracle（首輪實測定案，#156）：recover 的 CTRL_C 攔截路徑目前**不會**
-        # 原子 flush（產品側語意缺口，已立案 #156）——嚴格 flush 斷言在該路徑必然 flaky。
-        # 放寬為「30s 內全數終結」（涵蓋 3×sleep 4 自然排空＋CTRL_C 開銷）：抓得住
-        # #128 的原始危害（stale 佇列無界殘留、連鎖拖累），#156 修復後可改回嚴格斷言。
-        leftover = _poll_until_no_pending(ctx, cmd_ids, timeout_s=30.0)
+        # 嚴格排空 oracle（#156 已修復，收緊為嚴格斷言）：recover 的 CTRL_C 攔截路徑現在
+        # 經 on_command_flush callback 於 return 前同步呼叫 arbiter.flush_session()，
+        # 3 個 accepted 命令必於 recover RPC 回應前已被原子終結。門檻抓「1 個自然完成
+        # （worst case 第 1 個 sleep 4 已被 worker 取走進入 running，需自然跑完 ~4-5s，
+        # 不受 flush 影響）＋ CTRL_C/CTRL_D 偵測開銷（≤2×2s）＋ poll 粒度 1s」＝10s 上限，
+        # 仍比舊 30s 收緊 3 倍以上；此處若回歸 flaky/FAIL 即代表某條 recover 成功路徑
+        # 又漏接 flush。
+        leftover = _poll_until_no_pending(ctx, cmd_ids, timeout_s=10.0)
         if leftover:
             ctx.note("stale-after-recover.json", str(leftover))
             return CaseResult(
                 "FAIL",
-                reason=f"recover 後 30s 仍有 {len(leftover)} 個 pending 未終結（#128 回歸：stale 佇列無界殘留）",
+                reason=f"recover 後 10s 仍有 {len(leftover)} 個 pending 未終結（#128／#156 回歸：flush 未原子生效）",
                 category="test", reason_code="stale_queue_after_recovery",
             )
 

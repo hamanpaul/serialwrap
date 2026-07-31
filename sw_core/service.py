@@ -227,6 +227,7 @@ class SerialwrapService:
             on_ready=self._on_ready,
             on_detached=self._on_detached,
             on_console_line=self._on_console_line,
+            on_command_flush=self._on_command_flush,
             state_path=state_path,
         )
         self._engine = EventEngine(EngineDeps(
@@ -269,6 +270,12 @@ class SerialwrapService:
 
     def _on_detached(self, session_id: str) -> None:
         self._arbiter.unregister_session(session_id)
+
+    def _on_command_flush(self, session_id: str, error_code: str) -> None:
+        # #156：session 仍停留 READY（CTRL_C/CTRL_D 攔截成功、未觸發 detach）時，
+        # SessionManager 藉本 callback 顯式要求排空該 session 尚未執行的排隊命令，
+        # 補上原本只在 _on_detached 才會發生的 FLUSHED_BY_RECOVERY 終態語意。
+        self._arbiter.flush_session(session_id, error_code)
 
     def _engine_rx_observer(self, com: str, data: bytes, wal_seq: int) -> None:
         with self._engine_buffers_lock:

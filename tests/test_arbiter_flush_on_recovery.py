@@ -398,3 +398,37 @@ def test_result_tail_flushed_bg_falls_back_with_flushed_by_recovery():
         assert result["chunks"] == []
     finally:
         release.set()
+
+
+# ══ #156：SessionManager.on_command_flush → SerialwrapService._on_command_flush 接線 ══
+# 驗的是 service.py 這端「callback 接線正確」，與 tests/test_bad_command_recovery.py
+# 驗的「callback 在正確時機被觸發」互補，合起來覆蓋整條路徑
+# （_recover_after_failure → SerialwrapService._on_command_flush → CommandArbiter.flush_session）。
+
+def test_service_on_command_flush_delegates_to_arbiter_flush_session():
+    """SerialwrapService._on_command_flush(session_id, error_code) 須直接委派給
+    CommandArbiter.flush_session，效果與既有 unregister_session flush 一致：
+    尚未啟動的排隊命令終結為 error/error_code，in-flight 命令不受影響。
+    """
+    svc = _make_mock_service()
+    sid = "COM0"
+    release = threading.Event()
+    svc._sessions.execute_command = _mock_exec(release)
+    try:
+        svc._arbiter.register_session(sid)
+        blk = svc._arbiter.submit(session_id=sid, command="blocking", source="t", mode="fg", timeout_s=5.0)
+        assert _wait_until(lambda: svc._arbiter.get(blk["cmd_id"])["command"]["status"] == "running")
+        queued = svc._arbiter.submit(session_id=sid, command="queued", source="t", mode="fg", timeout_s=5.0)
+        assert queued["ok"], queued
+
+        svc._on_command_flush(sid, "FLUSHED_BY_RECOVERY")   # 模擬 SessionManager 觸發回呼
+
+        rec = svc._arbiter.get(queued["cmd_id"])["command"]
+        assert rec["status"] == "error"
+        assert rec["error_code"] == "FLUSHED_BY_RECOVERY"
+        assert rec["done_at"] is not None
+        # in-flight blocking 不受影響
+        assert svc._arbiter.get(blk["cmd_id"])["command"]["status"] == "running"
+    finally:
+        release.set()
+        svc._arbiter.unregister_session(sid)

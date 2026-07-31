@@ -87,6 +87,10 @@ class CommandArbiter:
         鎖外公開入口（保留給測試與未來的顯式 flush 需求）；``unregister_session`` 內
         改以 ``_flush_session_locked`` 於首段鎖內與 pop queue 原子執行，勿再從該處
         呼叫本方法（避免 epoch race，#128 review F1）。回傳被 flush 的筆數。
+
+        #156：``SerialwrapService._on_command_flush`` 已呼叫本方法（掛在
+        ``SessionManager._recover_after_failure`` 的 CTRL_C/CTRL_D 攔截成功路徑，
+        session 全程停留 READY、不經過 ``unregister_session``）——已有呼叫方，非死碼。
         """
         with self._lock:
             return self._flush_session_locked(session_id, error_code)

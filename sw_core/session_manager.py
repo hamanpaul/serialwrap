@@ -434,6 +434,7 @@ class SessionManager:
         on_ready: Callable[[str], None],
         on_detached: Callable[[str], None],
         on_console_line: Callable[[str, str, str], None] | None = None,
+        on_command_flush: Callable[[str, str], None] | None = None,
         state_path: str | None = None,
     ) -> None:
         # state.json 路徑注入（#120）：daemon 走 default（模組層 STATE_PATH），測試注入 tmp。
@@ -444,6 +445,7 @@ class SessionManager:
         self._on_ready = on_ready
         self._on_detached = on_detached
         self._on_console_line = on_console_line
+        self._on_command_flush = on_command_flush
         self._lock = threading.RLock()
         # state.json 寫入序列化（#133）：多 attach 執行緒並發 os.replace 同一目的檔在
         # Windows 會 WinError 5；獨立於 self._lock（snapshot 用），I/O 段專用、不巢狀他鎖。
@@ -3002,6 +3004,13 @@ class SessionManager:
                             error_code="PROMPT_TIMEOUT_RECOVERED",
                         )
                         self._reset_reprobe_progress_locked(session)
+                    # #156：CTRL_C/CTRL_D 攔截成功時 session 全程停留 READY、不觸發 detach，
+                    # 既有「detach 才 flush」路徑（_on_detached → arbiter.unregister_session，#128）
+                    # 天生跳過本分支。顯式呼叫 flush callback 補上同一 FLUSHED_BY_RECOVERY 終態語意；
+                    # 鎖外呼叫比照 _transition_to_attached→_on_detached 的既有慣例，
+                    # 避免 SessionManager._lock 與 CommandArbiter._lock 巢狀。
+                    if self._on_command_flush is not None:
+                        self._on_command_flush(session.session_id, "FLUSHED_BY_RECOVERY")
                     return {
                         "ok": True,
                         "error_code": "PROMPT_TIMEOUT_RECOVERED",
