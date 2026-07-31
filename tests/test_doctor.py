@@ -4,6 +4,8 @@
 - dialout 群組缺漏時 ok=False 並給出 usermod 修復提示。
 - Windows（#131 點 4）：檢查清單改為 pyserial／PATH／daemon endpoint／SERIALCOMM
   裝置列舉，不再有 dialout／systemd／wsl_systemd／single_daemon。
+- #154：`serialwrapd_on_path` 後新增 `other_serialwrap_installs`（同機多份安裝
+  版本一致性診斷），Linux／Windows 兩份清單皆刻意更新（非誤傷）。
 """
 from __future__ import annotations
 
@@ -21,6 +23,7 @@ LINUX_CHECKS = [
     "pyyaml",
     "serialwrap_on_path",
     "serialwrapd_on_path",
+    "other_serialwrap_installs",
     "dialout",
     "systemd",
     "supervision_mode",
@@ -35,6 +38,7 @@ WINDOWS_CHECKS = [
     "pyserial",
     "serialwrap_on_path",
     "serialwrapd_on_path",
+    "other_serialwrap_installs",
     "supervision_mode",
     "daemon_endpoint",
     "devices",
@@ -180,6 +184,7 @@ class TestCliAdvisorySets:
             {"check": "pyserial", "ok": True},
             {"check": "serialwrap_on_path", "ok": False},
             {"check": "serialwrapd_on_path", "ok": False},
+            {"check": "other_serialwrap_installs", "ok": False},
             {"check": "supervision_mode", "ok": True},
             {"check": "daemon_endpoint", "ok": False},
             {"check": "devices", "ok": False},
@@ -192,7 +197,94 @@ class TestCliAdvisorySets:
             item["ok"] or item["check"] in cli._DOCTOR_ADVISORY_CHECKS_WIN for item in report
         )
 
-    def test_linux_advisory_set_unchanged(self):
+    def test_linux_advisory_set_includes_other_serialwrap_installs(self):
+        """#154：新增 other_serialwrap_installs 為 advisory——純診斷資訊，偵測到
+        多份不同版本安裝也不應讓整體 doctor 判定失敗（呼應 (b) 的「勿擋」精神）。"""
         from sw_core import cli
 
-        assert cli._DOCTOR_ADVISORY_CHECKS == {"systemd", "wsl_systemd", "devices"}
+        assert cli._DOCTOR_ADVISORY_CHECKS == {
+            "systemd", "wsl_systemd", "devices", "other_serialwrap_installs",
+        }
+
+
+class TestOtherSerialwrapInstalls:
+    """#154：`_check_other_serialwrap_installs`——同機 PATH 上多份 serialwrap 安裝的
+    版本一致性診斷。"""
+
+    def _item(self, report):
+        return next(i for i in report if i["check"] == "other_serialwrap_installs")
+
+    def test_no_path_match_is_ok_and_skips_subprocess(self):
+        fx = FakeEffects(systemd=True, in_groups={"dialout"})  # which_all 預設空
+        report = run_doctor(fx=fx, platform="linux")
+        item = self._item(report)
+        assert item["ok"] is True
+        assert fx.calls == []
+
+    def test_single_install_is_ok_and_skips_subprocess(self):
+        fx = FakeEffects(
+            systemd=True, in_groups={"dialout"},
+            which_all={"serialwrap": ["/usr/local/bin/serialwrap"]},
+        )
+        report = run_doctor(fx=fx, platform="linux")
+        item = self._item(report)
+        assert item["ok"] is True
+        assert item["detail"] == "僅偵測到目前這份"
+        assert fx.calls == []  # trivially single 時不跑 subprocess（效能設計）
+
+    def test_two_installs_same_version_is_ok(self):
+        path_a, path_b = "/opt/a/serialwrap", "/opt/b/serialwrap"
+        fx = FakeEffects(
+            systemd=True, in_groups={"dialout"},
+            which_all={"serialwrap": [path_a, path_b]},
+            commands={
+                (path_a, "--version"): (0, "serialwrap 0.2.4", ""),
+                (path_b, "--version"): (0, "serialwrap 0.2.4", ""),
+            },
+        )
+        report = run_doctor(fx=fx, platform="linux")
+        item = self._item(report)
+        assert item["ok"] is True
+        assert path_a in item["detail"] and path_b in item["detail"]
+
+    def test_two_installs_different_version_is_not_ok(self):
+        path_a, path_b = "/opt/a/serialwrap", "/opt/b/serialwrap"
+        fx = FakeEffects(
+            systemd=True, in_groups={"dialout"},
+            which_all={"serialwrap": [path_a, path_b]},
+            commands={
+                (path_a, "--version"): (0, "serialwrap 0.2.4", ""),
+                (path_b, "--version"): (0, "serialwrap 0.2.1", ""),
+            },
+        )
+        report = run_doctor(fx=fx, platform="linux")
+        item = self._item(report)
+        assert item["ok"] is False
+        assert "0.2.4" in item["detail"] and "0.2.1" in item["detail"]
+        assert item["fix"]
+
+    def test_timeout_or_nonzero_rc_marked_unavailable_not_raised(self):
+        """某路徑 --version 逾時／非零 rc → 該筆列為「無法取得」，不拋例外；
+        與其他已解析版本不同即 ok=False（可疑訊號，不靜默吞掉）。"""
+        path_a, path_b = "/opt/a/serialwrap", "/opt/b/serialwrap"
+        fx = FakeEffects(
+            systemd=True, in_groups={"dialout"},
+            which_all={"serialwrap": [path_a, path_b]},
+            commands={
+                (path_a, "--version"): (0, "serialwrap 0.2.4", ""),
+                (path_b, "--version"): (-1, "", "TIMEOUT"),
+            },
+        )
+        report = run_doctor(fx=fx, platform="linux")
+        item = self._item(report)
+        assert item["ok"] is False
+        assert "無法取得" in item["detail"]
+
+    def test_run_called_with_short_timeout(self):
+        path_a, path_b = "/opt/a/serialwrap", "/opt/b/serialwrap"
+        fx = FakeEffects(
+            systemd=True, in_groups={"dialout"},
+            which_all={"serialwrap": [path_a, path_b]},
+        )
+        run_doctor(fx=fx, platform="linux")
+        assert fx.timeouts and all(t == 2.0 for t in fx.timeouts)

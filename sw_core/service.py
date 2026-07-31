@@ -38,6 +38,7 @@ from .event_engine.line_buffer import LineBuffer
 from .file_transfer import DEFAULT_CHUNK_SIZE
 from .session_manager import SessionManager
 from .util import now_iso
+from .version import resolve_version
 from .wal import WalWriter, rows_to_text_lines
 
 _HUMAN_INTERACTIVE_COMMANDS = {
@@ -227,6 +228,8 @@ class SerialwrapService:
         self._running = False
         self._started_at: str | None = None
         self._profile_count = len(profiles)
+        # #154：daemon 啟動時算一次、常駐於 instance，避免每次 RPC 都重開 VERSION 檔案。
+        self._version = resolve_version()
 
         self._arbiter = CommandArbiter(self._send_cb)
         self._sessions = SessionManager(
@@ -536,6 +539,7 @@ class SerialwrapService:
             result: dict[str, Any] = {
                 "ok": True,
                 "pid": os.getpid(),
+                "version": self._version,  # #154：CLI/daemon 版本可診斷性
                 "running": self._running,
                 "started_at": self._started_at,
                 "sessions": len(sessions),
@@ -610,6 +614,21 @@ class SerialwrapService:
         return str(session["session_id"]), None
 
     def rpc(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """RPC 平面分派器的薄包裝（#154）：委派 `_dispatch()`，並在回應為 dict 時
+        補上 daemon 版本欄位。`health()` 已顯式帶 `version`，`setdefault` 對它是
+        no-op（同一個 `self._version`）；對其餘所有 method（health.ping／mcu.*／
+        session.*／event.*…）則是唯一補上版本欄位的地方——不需要逐一 handler 加。
+        `getattr` 防呆：既有測試會以 `__new__` 繞過 `__init__` 建構輕量 stub 物件
+        （如 `tests/test_profile_pin_sticky.py::TestRpc`），此時 `_version` 未設，
+        版本欄位就此略過而非拋 AttributeError。
+        """
+        result = self._dispatch(method, params)
+        version = getattr(self, "_version", None)
+        if isinstance(result, dict) and version is not None:
+            result.setdefault("version", version)
+        return result
+
+    def _dispatch(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         if method == "health.ping":
             return {"ok": True, "pong": True}
         if method == "health.status":

@@ -36,6 +36,9 @@ from .setup_cmd import (
     materialize_assets,
     reconcile,
 )
+# 版本解析（#154：邏輯搬到 sw_core/version.py，daemon 端也能共用；此處保留原名
+# 重新匯出，既有呼叫點（含 --version flag、其餘既有引用）原樣不動）。
+from .version import _repo_version_path, resolve_version as _resolve_version
 
 _USE_DEFAULT_ENV = object()
 LEGACY_DAEMON_ENV_FILE = "~/OPI.env"
@@ -102,36 +105,6 @@ def _print(obj: dict[str, Any]) -> None:
 def _daemon_script_path() -> str:
     here = os.path.dirname(os.path.abspath(__file__))
     return os.path.normpath(os.path.join(here, "..", "serialwrapd.py"))
-
-
-def _repo_version_path() -> str:
-    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "VERSION"))
-
-
-def _resolve_version() -> str:
-    """解析 serialwrap 版本字串（#131 補強：CLI 原本沒有 --version）。
-
-    順序：repo checkout 的 VERSION（原始碼執行最真實）→ 已安裝套件 metadata
-    （pip/pipx）→ PyInstaller 內嵌 assets/VERSION（release exe，serialwrap.spec
-    datas 於打包時帶入）→ "unknown"。
-    """
-    try:
-        with open(_repo_version_path(), encoding="utf-8") as fh:
-            return fh.read().strip()
-    except OSError:
-        pass
-    try:
-        import importlib.metadata  # noqa: PLC0415
-
-        return importlib.metadata.version("serialwrap")
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        from .assets import read_text  # noqa: PLC0415
-
-        return read_text("VERSION").strip()
-    except Exception:  # noqa: BLE001
-        return "unknown"
 
 
 def _is_loopback_tcp(ep: str) -> bool:
@@ -582,6 +555,25 @@ def _effective_timeout_s(args: argparse.Namespace, method: str) -> float:
     return DEFAULT_RPC_TIMEOUT_S
 
 
+def _warn_version_mismatch(resp: dict[str, Any]) -> None:
+    """client／daemon 版本不一致時在 stderr 印一行警告（#154，勿擋、純副作用）。
+
+    daemon 端 ``SerialwrapService.rpc()`` wrapper 對每個回應都會 ``setdefault``
+    帶上 ``version`` 欄位；本函式在 CLI 收到回應後就地比對。舊版 daemon（本欄位
+    加入前部署）回應無此欄位時靜默略過——不是新增的假警報，只是無從比對。
+    """
+    daemon_version = resp.get("version")
+    if not isinstance(daemon_version, str) or not daemon_version.strip():
+        return
+    cli_version = _resolve_version()
+    if cli_version in ("unknown", daemon_version):
+        return
+    sys.stderr.write(
+        f"serialwrap: client 版本 {cli_version} 與 daemon 版本 {daemon_version} 不一致"
+        "（建議統一安裝來源或重啟 daemon 對齊版本；serialwrap doctor 可查其他安裝）\n"
+    )
+
+
 def _run_rpc(args: argparse.Namespace, method: str, params: dict[str, Any]) -> int:
     resp = rpc_call(
         _resolve_endpoint(args),
@@ -596,6 +588,7 @@ def _run_rpc(args: argparse.Namespace, method: str, params: dict[str, Any]) -> i
         # 讓依 Unix 慣例讀 stderr 解釋非零 exit 的 consumer 不再拿到空字串。
         err = resp.get("error_code") or resp.get("message") or "UNKNOWN_ERROR"
         sys.stderr.write(f"serialwrap: {method} failed: {err}\n")
+    _warn_version_mismatch(resp)
     return 0 if resp.get("ok") else 2
 
 
@@ -671,12 +664,15 @@ def _dispatch_event(args: argparse.Namespace) -> int:
         _print({"ok": False, "error_code": "UNKNOWN_EVENT_CMD", "cmd": args.event_cmd})
         return 2
     _print(result)
+    _warn_version_mismatch(result)
     return 0 if result.get("ok") else 2
 
 
 # 與 doctor 報告中「advisory（缺少不致命）」的檢查項對應；這些項 ok=False 不
 # 拉低整體 ok（無 systemd 可走 on-demand；無裝置可能只是還沒插線）。
-_DOCTOR_ADVISORY_CHECKS = {"systemd", "wsl_systemd", "devices"}
+# other_serialwrap_installs（#154）：純診斷資訊，偵測到多份不同版本安裝也不應
+# 讓整體 doctor 判定失敗——呼應 (b) _warn_version_mismatch 的「勿擋」精神。
+_DOCTOR_ADVISORY_CHECKS = {"systemd", "wsl_systemd", "devices", "other_serialwrap_installs"}
 # Windows（#131）：PATH／daemon endpoint／裝置皆 advisory（未起 daemon、exe 未入 PATH
 # 不致命）；pyserial 為 Windows 序列埠後端硬依賴 → 非 advisory。
 _DOCTOR_ADVISORY_CHECKS_WIN = {
@@ -684,6 +680,7 @@ _DOCTOR_ADVISORY_CHECKS_WIN = {
     "serialwrapd_on_path",
     "daemon_endpoint",
     "devices",
+    "other_serialwrap_installs",
 }
 
 

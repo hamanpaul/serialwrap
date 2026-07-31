@@ -5,6 +5,10 @@
   已安裝套件 metadata（pip/pipx）→ PyInstaller 內嵌 assets/VERSION（release
   exe，serialwrap.spec datas）→ "unknown"。
 - `--profile-dir`：原本無 help 字串、不顯示預設路徑。
+- #154：版本解析邏輯搬到 `sw_core/version.py`（daemon 端亦需共用），`cli.py` 改為
+  重新匯出；monkeypatch 目標須改打 `sw_core.version` 模組本身——`resolve_version()`
+  內部呼叫的 `_repo_version_path()` 綁定在 `version.py` 自己的模組命名空間，patch
+  `cli.` 上的重新匯出名稱不會影響函式內部實際呼叫到的物件。
 """
 from __future__ import annotations
 
@@ -15,6 +19,7 @@ from unittest import mock
 import pytest
 
 from sw_core import cli
+from sw_core import version as version_module
 
 _REPO_VERSION = (Path(__file__).parent.parent / "VERSION").read_text(encoding="utf-8").strip()
 
@@ -25,7 +30,7 @@ class TestResolveVersion:
 
     def test_frozen_fallback_reads_bundled_assets(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """repo VERSION 不存在（frozen/安裝環境）→ metadata → assets/VERSION。"""
-        monkeypatch.setattr(cli, "_repo_version_path", lambda: "/nonexistent/VERSION")
+        monkeypatch.setattr(version_module, "_repo_version_path", lambda: "/nonexistent/VERSION")
         with (
             mock.patch("importlib.metadata.version", side_effect=Exception("not installed")),
             mock.patch("sw_core.assets.read_text", return_value="9.9.9\n"),
@@ -33,7 +38,7 @@ class TestResolveVersion:
             assert cli._resolve_version() == "9.9.9"
 
     def test_all_sources_missing_reports_unknown(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(cli, "_repo_version_path", lambda: "/nonexistent/VERSION")
+        monkeypatch.setattr(version_module, "_repo_version_path", lambda: "/nonexistent/VERSION")
         with (
             mock.patch("importlib.metadata.version", side_effect=Exception("not installed")),
             mock.patch("sw_core.assets.read_text", side_effect=FileNotFoundError),

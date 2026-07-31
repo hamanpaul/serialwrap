@@ -65,8 +65,18 @@ def stale_client_note(path_version: str, pinned_version: str) -> str | None:
 
 
 def daemon_version_probe(sw: Any) -> str:
-    """從 daemon pid 的 cmdline 找到其 venv python，以 importlib.metadata 取套件版本。"""
-    pid = sw.run("daemon", "status").get("pid")
+    """取得 daemon 版本：優先讀 `daemon status` 的 `version` 欄位（#154 快路徑）。
+
+    `version` 欄位由 `SerialwrapService.rpc()` wrapper 對每個回應補上（daemon 端
+    #154 修復）；只有該欄位缺席（對到修復前部署的舊 daemon）才落回原本繞路
+    ——從 daemon pid 的 cmdline 找到其 venv python，以 importlib.metadata 取套件
+    版本。向下相容：舊 daemon 行為與修復前完全相同，非破壞性變更。
+    """
+    status = sw.run("daemon", "status")
+    version = status.get("version")
+    if isinstance(version, str) and version.strip():
+        return version.strip()
+    pid = status.get("pid")
     if not pid:
         return ""
     try:

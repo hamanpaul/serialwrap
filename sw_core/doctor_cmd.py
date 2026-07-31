@@ -64,6 +64,34 @@ def _check_on_path(fx, name: str, fix_hint: str = "確認 ~/.local/bin 在 PATH�
     }
 
 
+def _check_other_serialwrap_installs(fx) -> dict:
+    """同機 PATH 上是否有多份不同版本的 serialwrap 安裝（#154）。
+
+    純診斷資訊：只看得見「呼叫 doctor 這個行程的 PATH」上找得到的安裝——以絕對
+    路徑呼叫、venv bin/ 不在 PATH 上的情境（如 TestPilot）看不到，那類漂移的
+    即時防線是 CLI 每次 RPC 的 client↔daemon 版本比對（見 cli.py
+    `_warn_version_mismatch`），與 PATH 無關。0 或 1 筆時視為健康、不另跑
+    subprocess（trivially single）。
+    """
+    paths = fx.which_all("serialwrap")
+    if len(paths) <= 1:
+        detail = "僅偵測到目前這份" if paths else "PATH 上找不到 serialwrap（可能以絕對路徑呼叫）"
+        return {"check": "other_serialwrap_installs", "ok": True, "detail": detail, "fix": ""}
+    versions: list[str] = []
+    entries: list[str] = []
+    for p in paths:
+        rc, out, _err = fx.run([p, "--version"], timeout_s=2.0)
+        v = out.strip() if rc == 0 and out.strip() else "無法取得"
+        versions.append(v)
+        entries.append(f"{p}={v}")
+    ok = len(set(versions)) == 1
+    fix = "" if ok else (
+        "確認各安裝版本一致，或統一改呼叫同一份"
+        "（建議 pipx 系統安裝／以絕對路徑或 SERIALWRAP_ENDPOINT 釘住）"
+    )
+    return {"check": "other_serialwrap_installs", "ok": ok, "detail": "；".join(entries), "fix": fix}
+
+
 def _check_dialout(fx) -> dict:
     """目前使用者是否屬於 dialout 群組（存取 /dev/ttyUSB* 必需）。"""
     ok = fx.user_in_group("dialout")
@@ -276,6 +304,7 @@ def run_doctor(fx=None, home=None, *, platform: str | None = None) -> list[dict]
             _check_pyserial(),
             _check_on_path(fx, "serialwrap", win_path_hint),
             _check_on_path(fx, "serialwrapd", win_path_hint),
+            _check_other_serialwrap_installs(fx),
             _check_supervision_mode(home),
             _check_daemon_endpoint(),
             _check_devices_windows(),
@@ -285,6 +314,7 @@ def run_doctor(fx=None, home=None, *, platform: str | None = None) -> list[dict]
         _check_pyyaml(),
         _check_on_path(fx, "serialwrap"),
         _check_on_path(fx, "serialwrapd"),
+        _check_other_serialwrap_installs(fx),
         _check_dialout(fx),
         _check_systemd(fx),
         _check_supervision_mode(home),

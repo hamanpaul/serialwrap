@@ -38,7 +38,7 @@ testpilot run serialwrap_regression --case f3-fail-error-code  # 單一 case
 
 doctor 全綠、testbed 板卡 READY、tmux/minicom 存在、無殘留 throwaway daemon、無並行 pytest、state 無污染哨兵、benchlock 取得、無外部 testpilot run，以及——
 
-- **版本 gate（#154）**：pinned CLI `--version` 與 daemon 版本（讀 daemon pid 的 venv `importlib.metadata`）不一致 → 整場拒跑。
+- **版本 gate（#154）**：pinned CLI `--version` 與 daemon 版本（優先讀 `daemon status` 的 `version` 欄位；欄位缺席才落回讀 daemon pid 的 venv `importlib.metadata`）不一致 → 整場拒跑。
 - PATH 上解析到的 serialwrap 若與 pinned 不同版（如 venv stale client），記入 preflight notes（不擋——本 plugin 不使用它）。
 
 ## 分診契約（serialwrap＝受測物）
@@ -66,8 +66,9 @@ doctor 全綠、testbed 板卡 READY、tmux/minicom 存在、無殘留 throwaway
 | F9 開機/U-Boot | #69 #130 #139 #44 #14 #20 | autoboot 窗不被 probe 打斷、quiet window 不擋 human／真 READY 後的 agent 命令、自發重開機過渡態 agent 命令被 `AUTOBOOT_QUIET` 攔下（#139）、開機中 attach 自動 reprobe、U-Boot 停留不踢 console | **是（reboot）** |
 | F10 登入帳密 | #140 #19 | 帳密解析空→`CREDENTIALS_UNRESOLVED` 終態不送空帳密、補帳密後恢復 | **是（throwaway＋release）** |
 | F11 RX 洪水/傳輸層 | #153 #150 | 洪水下 probe 失敗分類為 `RX_FLOOD`（等排空、排空後自癒回 READY）、`rx_bytes_last_10s`／`last_rx_age_s`／`last_tx_age_s`／`last_error_detail` 觀測面存在且合理（真 usbip stall 需人工操作、排除自動化，heuristic 由 pytest 覆蓋） | **部分（flood case 佔用 COM0 數十秒）** |
+| F12 診斷保真 | #154 | `daemon status` 直接帶 `version` 欄位（不靠 `/proc cmdline + importlib.metadata` 繞路）、且與 pinned CLI `--version` 一致——版本欄位悄悄消失時 preflight 的 fallback 會靜默接手掩蓋，僅此 case 斷言快路徑本身 | 否 |
 
-執行順序＝F3→F1→F5→F6→F2→F4→F7→F8→F12→F9→F10→F11（破壞性壓軸；F11 flood 殿後避免殘 log 污染他 family 基線；F12 預留、由對應 case 檔補列）。
+執行順序＝F3→F1→F5→F6→F2→F4→F7→F8→F12→F9→F10→F11（破壞性壓軸；F11 flood 殿後避免殘 log 污染他 family 基線）。
 
 ## U-Boot 唯讀護欄（F9 硬約束）
 
