@@ -92,6 +92,9 @@ doctor 全綠、testbed 板卡 READY、tmux/minicom 存在、無殘留 throwaway
 RX 視窗修剪破壞 offset 語意（絕對偏移記帳根治）：`f2-history-bounded-rss` 已收緊為零容忍
 （任一輪未 done 即 FAIL），並新增決定性重演 case `f2-rx-window-crossing-prompt`。其餘 issue
 修復後可收緊對應 oracle。
+| `f9-spontaneous-reboot-agent-gated` | **FAIL（刻意保留的紅燈哨兵）** | #162：連續重開機後延遲 banner 污染後續命令 stdout（quiet 清空判定過早）——case 的 gate 攔截／quiet 等待／收尾防級聯四段皆驗證正確，紅在「清空後重送」段抓到 #162；修復即轉綠 |
+| （bench 事實）COM1 bcm 板 | — | busybox 映像未編入 `base64` applet——F7 逐板 fallback 的「bcm 實證 #157」客觀上不可行（`target_tool_missing` 為真實板端限制，非探測 bug；`md5sum` 存在）|
+
 
 ## 從新修好的 bug 新增 case（SOP）
 
