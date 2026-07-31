@@ -37,6 +37,7 @@ from .constants import (
     _HUMAN_PEER_GRACE_S,
 )
 from .device_watcher import DeviceInfo
+from .file_transfer import DEFAULT_CHUNK_SIZE
 from .login_fsm import detect_boot_banner, detect_template, ensure_ready, probe_ready
 from .uart_io import PreservedConsoles, UARTBridge, _pty_available
 from .util import clean_text, now_iso
@@ -44,6 +45,11 @@ from .wal import WalWriter
 
 
 _ATTACHED_CONSOLE_LEASE_TIMEOUT_S = 86400.0
+
+# 檔案傳輸每段等待逾時的下限（#157）：未顯式帶 chunk_timeout_s 時沿用
+# profile.timeout_s，但夾一個地板防止 profile 被設過低導致傳輸必逾時。
+_MIN_FILE_CHUNK_TIMEOUT_S = 5.0   # push 每個 chunk 等待下限
+_MIN_FILE_PULL_TIMEOUT_S = 30.0   # pull 整段讀取等待下限（維持原 30.0 行為基準）
 
 
 def _replace_state_file(tmp_path: str, dst_path: str, *, retry: bool | None = None) -> None:
@@ -3869,10 +3875,16 @@ class SessionManager:
         *,
         local_path: str,
         remote_path: str,
-        chunk_size: int = 2048,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        chunk_timeout_s: float | None = None,
         source: str = "agent",
     ) -> dict[str, Any]:
-        """將 host 端檔案推送到 target。"""
+        """將 host 端檔案推送到 target。
+
+        ``chunk_timeout_s``（#157）：單一 chunk 等待 target 回 prompt 的逾時；
+        ``None`` 時沿用 ``profile.timeout_s``（夾 ``_MIN_FILE_CHUNK_TIMEOUT_S`` 地板），
+        取代舊版寫死的 10.0s——bcm 類慢板已調大的 ``timeout_s`` 因此自動生效。
+        """
         from .file_transfer import push_file
 
         suspend_human_interactive = False
@@ -3892,12 +3904,17 @@ class SessionManager:
                     busy_result = {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY"}
             bridge = session.bridge
             prompt_regex = session.profile.prompt_regex
+            profile_timeout_s = session.profile.timeout_s
             if busy_result is None:
                 session.foreground_busy = True
 
         post.execute()
         if busy_result is not None:
             return busy_result
+        effective_timeout_s = (
+            chunk_timeout_s if chunk_timeout_s is not None
+            else max(profile_timeout_s, _MIN_FILE_CHUNK_TIMEOUT_S)
+        )
         if suspend_human_interactive:
             bridge.suspend_interactive()
         try:
@@ -3906,7 +3923,7 @@ class SessionManager:
                 local_path,
                 remote_path,
                 chunk_size=chunk_size,
-                timeout_s=10.0,
+                timeout_s=effective_timeout_s,
                 prompt_regex=prompt_regex,
                 source=source,
             )
@@ -3922,9 +3939,15 @@ class SessionManager:
         *,
         remote_path: str,
         local_path: str | None = None,
+        chunk_timeout_s: float | None = None,
         source: str = "agent",
     ) -> dict[str, Any]:
-        """從 target 拉取檔案到 host。"""
+        """從 target 拉取檔案到 host。
+
+        ``chunk_timeout_s``（#157）：整段 base64 讀取的逾時；``None`` 時沿用
+        ``profile.timeout_s``（夾 ``_MIN_FILE_PULL_TIMEOUT_S`` 地板，維持舊版
+        30.0s 行為基準），取代舊版寫死的 30.0s。
+        """
         from .file_transfer import pull_file
 
         suspend_human_interactive = False
@@ -3944,12 +3967,17 @@ class SessionManager:
                     busy_result = {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY"}
             bridge = session.bridge
             prompt_regex = session.profile.prompt_regex
+            profile_timeout_s = session.profile.timeout_s
             if busy_result is None:
                 session.foreground_busy = True
 
         post.execute()
         if busy_result is not None:
             return busy_result
+        effective_timeout_s = (
+            chunk_timeout_s if chunk_timeout_s is not None
+            else max(profile_timeout_s, _MIN_FILE_PULL_TIMEOUT_S)
+        )
         if suspend_human_interactive:
             bridge.suspend_interactive()
         try:
@@ -3957,7 +3985,7 @@ class SessionManager:
                 bridge,
                 remote_path,
                 local_path,
-                timeout_s=30.0,
+                timeout_s=effective_timeout_s,
                 prompt_regex=prompt_regex,
                 source=source,
             )

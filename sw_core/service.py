@@ -26,6 +26,7 @@ from .device_source import _load_exclude_coms  # #131：實作移至 device_sour
 from .device_watcher import DeviceWatcher
 from .event_engine import EventEngine, EngineDeps
 from .event_engine.line_buffer import LineBuffer
+from .file_transfer import DEFAULT_CHUNK_SIZE
 from .session_manager import SessionManager
 from .util import now_iso
 from .wal import WalWriter, rows_to_text_lines
@@ -918,7 +919,11 @@ class SerialwrapService:
             selector = str(params.get("selector") or "")
             local_path = str(params.get("local_path") or "")
             remote_path = str(params.get("remote_path") or "")
-            chunk_size = int(params.get("chunk_size") or 2048)
+            # max(1, ...) 防呆：chunk_size<=0 會讓 _split_chunks 的 range(step=0)
+            # 丟未捕捉 ValueError 穿越 RPC 邊界（違反本 repo RPC 慣例）。
+            chunk_size = max(1, int(params.get("chunk_size") or DEFAULT_CHUNK_SIZE))
+            chunk_timeout_raw = params.get("chunk_timeout_s")
+            chunk_timeout_s = float(chunk_timeout_raw) if chunk_timeout_raw is not None else None
             source = str(params.get("source") or "agent")
             if not selector or not local_path or not remote_path:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
@@ -930,6 +935,7 @@ class SerialwrapService:
                 local_path=local_path,
                 remote_path=remote_path,
                 chunk_size=chunk_size,
+                chunk_timeout_s=chunk_timeout_s,
                 source=source,
             )
 
@@ -937,6 +943,8 @@ class SerialwrapService:
             selector = str(params.get("selector") or "")
             remote_path = str(params.get("remote_path") or "")
             local_path = params.get("local_path")
+            chunk_timeout_raw = params.get("chunk_timeout_s")
+            chunk_timeout_s = float(chunk_timeout_raw) if chunk_timeout_raw is not None else None
             source = str(params.get("source") or "agent")
             if not selector or not remote_path:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
@@ -947,6 +955,7 @@ class SerialwrapService:
                 selector,
                 remote_path=remote_path,
                 local_path=str(local_path) if local_path else None,
+                chunk_timeout_s=chunk_timeout_s,
                 source=source,
             )
 

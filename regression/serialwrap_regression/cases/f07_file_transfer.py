@@ -8,6 +8,17 @@
 ``file`` 子命令**之前**）＋對應的 ``SwCli.run(timeout=...)``（subprocess 層
 逾時，需 ≥ RPC timeout 加緩衝，否則會在 RPC 真正逾時前就被 Python 端
 ``subprocess.TimeoutExpired`` 打斷）。
+
+timeout 估算基準（#157 修復後）：``DEFAULT_CHUNK_SIZE=512`` → 64KB≈129 chunks、
+1MB=2048 chunks；以每 chunk 真實往返 0.1–0.3s 估，64KB≈13–39s、1MB≈205–614s，
+timeout 取悲觀上界加緩衝，實際值待真機驗證校準。
+
+已知殘留缺口（#157 範圍外）：``sw_core/uart_io.py`` 的 RX 視窗上限 131072 字元
+（#158 改為絕對偏移記帳，但視窗仍有界、被修剪頭段永久丟失），``pull_file`` 不分段
+一次讀全部——1MB 檔案 base64 輸出 ~1.4MB 遠超上限，``_SENTINEL_BEGIN`` 必被踢出
+視窗 → ``PULL_PARSE_FAILED``。故 ``f7-larger-file-not-truncated`` 於 #157 修復後
+push 端可成功，pull 端仍預期 SKIP（``transfer_environment_failure``）待 follow-up；
+``f7-binary-roundtrip-md5``（64KB，base64 ~88.6KB 在上限內）應轉綠。
 """
 from __future__ import annotations
 
@@ -143,12 +154,13 @@ def f7_binary_roundtrip_md5(ctx):
             return CaseResult("SKIP", reason="板端缺 base64／md5sum（探測確認）",
                               category="environment", reason_code="target_tool_missing")
 
-        push = _push(ctx, com, src_path, remote_path, rpc_timeout_s=90, proc_timeout_s=110)
+        # chunk 512 下 64KB≈129 chunks（原 2048 時 33），timeout 同比放大（見 module docstring）
+        push = _push(ctx, com, src_path, remote_path, rpc_timeout_s=180, proc_timeout_s=200)
         ctx.note("push.json", str(push))
         if not push.get("ok"):
             return _transfer_failure_verdict(push, verb="push", tools_present=tools_present)
 
-        pull = _pull(ctx, com, remote_path, dst_path, rpc_timeout_s=90, proc_timeout_s=110)
+        pull = _pull(ctx, com, remote_path, dst_path, rpc_timeout_s=180, proc_timeout_s=200)
         ctx.note("pull.json", str(pull))
         if not pull.get("ok"):
             return _transfer_failure_verdict(pull, verb="pull", tools_present=tools_present)
@@ -180,12 +192,14 @@ def f7_larger_file_not_truncated(ctx):
             return CaseResult("SKIP", reason="板端缺 base64／md5sum（探測確認）",
                               category="environment", reason_code="target_tool_missing")
 
-        push = _push(ctx, com, src_path, remote_path, rpc_timeout_s=120, proc_timeout_s=140)
+        # chunk 512 下 1MB=2048 chunks，悲觀估 205–614s（見 module docstring）；取 640 上界。
+        # 註：pull 端在 RX 視窗 128KiB 上限修復前仍預期 PULL_PARSE_FAILED → SKIP。
+        push = _push(ctx, com, src_path, remote_path, rpc_timeout_s=640, proc_timeout_s=660)
         ctx.note("push.json", str(push))
         if not push.get("ok"):
             return _transfer_failure_verdict(push, verb="push", tools_present=tools_present)
 
-        pull = _pull(ctx, com, remote_path, dst_path, rpc_timeout_s=120, proc_timeout_s=140)
+        pull = _pull(ctx, com, remote_path, dst_path, rpc_timeout_s=640, proc_timeout_s=660)
         ctx.note("pull.json", str(pull))
         if not pull.get("ok"):
             return _transfer_failure_verdict(pull, verb="pull", tools_present=tools_present)

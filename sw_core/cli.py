@@ -13,6 +13,7 @@ from typing import Any
 
 from .arbiter import CMD_REJECT_BYTES, CMD_WARN_BYTES
 from .client import _af_unix_available, _parse_endpoint, rpc_call
+from .file_transfer import DEFAULT_CHUNK_SIZE
 from .constants import (
     CONFIG_DIR,
     DEFAULT_ENDPOINT,
@@ -1196,12 +1197,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_fp.add_argument("--selector", required=True)
     p_fp.add_argument("--local", required=True)
     p_fp.add_argument("--remote", required=True)
-    p_fp.add_argument("--chunk-size", dest="chunk_size", type=int, default=2048)
+    p_fp.add_argument("--chunk-size", dest="chunk_size", type=int, default=DEFAULT_CHUNK_SIZE)
+    p_fp.add_argument("--chunk-timeout", dest="chunk_timeout_s", type=float, default=None,
+                      help="單一 chunk 等待 target 回應的逾時秒數（預設：沿用 profile timeout_s，#157）")
     p_fp.add_argument("--source", default="agent")
     p_fl = file_sub.add_parser("pull", help="透過 UART 從 target 拉取檔案到本機")
     p_fl.add_argument("--selector", required=True)
     p_fl.add_argument("--remote", required=True)
     p_fl.add_argument("--local", default=None)
+    p_fl.add_argument("--chunk-timeout", dest="chunk_timeout_s", type=float, default=None,
+                      help="整段 base64 讀取的逾時秒數（預設：沿用 profile timeout_s，#157）")
     p_fl.add_argument("--source", default="agent")
 
     p_wal = sub.add_parser(
@@ -1553,17 +1558,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "file":
         if args.file_cmd == "push":
-            return _run_rpc(
-                args,
-                "file.push",
-                {
-                    "selector": args.selector,
-                    "local_path": args.local,
-                    "remote_path": args.remote,
-                    "chunk_size": args.chunk_size,
-                    "source": args.source,
-                },
-            )
+            params = {
+                "selector": args.selector,
+                "local_path": args.local,
+                "remote_path": args.remote,
+                "chunk_size": args.chunk_size,
+                "source": args.source,
+            }
+            # 不顯式帶就不佔 RPC payload 欄位——daemon 端走 profile timeout_s 推導（#157）
+            if args.chunk_timeout_s is not None:
+                params["chunk_timeout_s"] = args.chunk_timeout_s
+            return _run_rpc(args, "file.push", params)
         if args.file_cmd == "pull":
             p: dict[str, Any] = {
                 "selector": args.selector,
@@ -1572,6 +1577,8 @@ def main(argv: list[str] | None = None) -> int:
             }
             if args.local is not None:
                 p["local_path"] = args.local
+            if args.chunk_timeout_s is not None:
+                p["chunk_timeout_s"] = args.chunk_timeout_s
             return _run_rpc(args, "file.pull", p)
 
     if args.cmd == "wal" and args.wal_cmd == "export":
