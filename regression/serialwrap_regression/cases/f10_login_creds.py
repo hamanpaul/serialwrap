@@ -173,6 +173,24 @@ def _session_by_com(listing: dict[str, Any], com: str) -> dict[str, Any]:
     return {}
 
 
+def _wait_dynamic_sessions(ta: guards.ThrowawayDaemon, *, timeout_s: float = 20.0,
+                           poll_s: float = 2.0) -> dict[str, Any]:
+    """等 throwaway 的 DeviceWatcher 完成首掃、動態 session 出現在 ``session list``。
+
+    round 2 實測教訓：``daemon status`` ok 只保證 RPC server 起來；session 註冊晚於
+    PROBE 開始（WAL 已見探測 bytes、list 仍空）——單次查詢必撞時序競態（3/3 重現）。
+    回傳最後一次 listing（逾時仍回，呼叫端自行判空）。
+    """
+    deadline = time.monotonic() + timeout_s
+    listing: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        listing = ta.run("session", "list")
+        if listing.get("sessions"):
+            return listing
+        time.sleep(poll_s)
+    return listing
+
+
 def _wait_state(ta: guards.ThrowawayDaemon, com: str, want: str, *,
                 timeout_s: float, poll_s: float = 2.0) -> dict[str, Any]:
     """輪詢 throwaway ``session list`` 到指定 state（``ThrowawayDaemon`` 無 ``SwCli.wait_state``
@@ -304,7 +322,7 @@ def f10_unresolved_creds_terminal(ctx: Any) -> CaseResult:
                 exe=str(ctx.cfg["serialwrap_exe"]), workdir=workdir,
                 by_id_dir=by_id_dir, profile_yaml=profile_yaml,
             ) as ta:
-                listing0 = ta.run("session", "list")
+                listing0 = _wait_dynamic_sessions(ta, timeout_s=20.0)
                 ctx.note("ta-session-list-initial.json", str(listing0))
                 if not (listing0.get("sessions") or []):
                     result = CaseResult(
@@ -448,7 +466,7 @@ def f10_creds_fixed_then_ready(ctx: Any) -> CaseResult:
                 exe=str(ctx.cfg["serialwrap_exe"]), workdir=workdir,
                 by_id_dir=by_id_dir, profile_yaml=profile_yaml,
             ) as ta:
-                listing0 = ta.run("session", "list")
+                listing0 = _wait_dynamic_sessions(ta, timeout_s=20.0)
                 ctx.note("ta-session-list-initial.json", str(listing0))
                 if not (listing0.get("sessions") or []):
                     result = CaseResult(
