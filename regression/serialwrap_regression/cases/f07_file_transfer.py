@@ -61,8 +61,10 @@ def _probe_target_tools(ctx: Any, com: str) -> bool | None:
     既可能是板端缺工具（環境、SKIP），也可能是工具都在但傳輸真的壞掉（#32 類回歸、FAIL）。
     先探測工具存在性，後續判定才能分流。
     """
+    # 用 which 而非 command -v（聚焦複驗實證：bcm 板 shell 無 `command` builtin，
+    # `command -v` 回 'sh: command: not found' 被誤判成工具缺失）。busybox which 皆備。
     probe = ctx.sw.submit_and_wait(
-        com, "command -v base64 >/dev/null && command -v md5sum >/dev/null && echo TOOLS_OK")
+        com, "which base64 >/dev/null 2>&1 && which md5sum >/dev/null 2>&1 && echo TOOLS_OK")
     ctx.note(f"{com}-tools-probe.json", str(probe))
     if probe.get("status") != "done":
         return None

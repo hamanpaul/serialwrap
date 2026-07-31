@@ -303,21 +303,6 @@ def f9_uboot_readonly_and_console_kept(ctx):
         guards.ensure_ready(ctx, com, timeout_s=boot_wait_s)
 
 
-@_case(
-    "f9-spontaneous-reboot-agent-gated",
-    "自發重開機（daemon 不知情）期間 agent 顯式命令必須被 AUTOBOOT_QUIET 擋下",
-    issues=("#139", "#130"),
-    requires=("tmux",),
-    hints=(
-        "受測窗口＝『state=READY 且 boot_quiet_remaining_s 非 null』的過渡態（human console"
-        " 送 reboot、daemon 視角為自發重開機、state 停留 READY）；90s 內未觀測到該組合屬"
-        " 時序未現形（SKIP/environment），非產品回歸。",
-        "FAIL 判定＝當初錯誤行為再現：quiet 窗內 agent 命令被放行（status=done）或被"
-        " PROMPT_TIMEOUT 吞掉（bytes 已打進 autoboot 窗）。",
-        "state-quiet-timeline.txt 的 (state, boot_quiet_remaining_s) 時序可順帶佐證"
-        " round-3 抖動歸因（premature READY + banner re-arm）。",
-    ),
-)
 def _wait_quiet_cleared(ctx, com: str, *, timeout_s: float) -> tuple[bool, dict]:
     """等 boot quiet window 真正清空（state=READY 且 ``boot_quiet_remaining_s`` 歸零）。
 
@@ -335,6 +320,21 @@ def _wait_quiet_cleared(ctx, com: str, *, timeout_s: float) -> tuple[bool, dict]
     return False, last
 
 
+@_case(
+    "f9-spontaneous-reboot-agent-gated",
+    "自發重開機（daemon 不知情）期間 agent 顯式命令必須被 AUTOBOOT_QUIET 擋下",
+    issues=("#139", "#130"),
+    requires=("tmux",),
+    hints=(
+        "受測窗口＝『state=READY 且 boot_quiet_remaining_s 非 null』的過渡態（human console"
+        " 送 reboot、daemon 視角為自發重開機、state 停留 READY）；90s 內未觀測到該組合屬"
+        " 時序未現形（SKIP/environment），非產品回歸。",
+        "FAIL 判定＝當初錯誤行為再現：quiet 窗內 agent 命令被放行（status=done）或被"
+        " PROMPT_TIMEOUT 吞掉（bytes 已打進 autoboot 窗）。",
+        "state-quiet-timeline.txt 的 (state, boot_quiet_remaining_s) 時序可順帶佐證"
+        " round-3 抖動歸因（premature READY + banner re-arm）。",
+    ),
+)
 def f9_spontaneous_reboot_agent_gated(ctx):
     """#139（#130 Finding 4 收斂）：human console 送 reboot（daemon 視角＝自發重開機、
     session 名義上停 READY、RX banner arm quiet）期間，agent 顯式命令不得再被放行——
