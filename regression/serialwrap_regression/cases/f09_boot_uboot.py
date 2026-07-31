@@ -318,6 +318,23 @@ def f9_uboot_readonly_and_console_kept(ctx):
         " round-3 抖動歸因（premature READY + banner re-arm）。",
     ),
 )
+def _wait_quiet_cleared(ctx, com: str, *, timeout_s: float) -> tuple[bool, dict]:
+    """等 boot quiet window 真正清空（state=READY 且 ``boot_quiet_remaining_s`` 歸零）。
+
+    #139 的自發重開機流程 state **全程停留 READY**——``wait_state(READY)`` 對它是
+    no-op（首輪驗收實證：誤用它導致 quiet 窗未清就重送、假 FAIL，且級聯污染下一案）。
+    等待「板子真的可下命令」一律以本函式為準。回傳 (是否清空, 最後一次 session dict)。
+    """
+    deadline = time.monotonic() + timeout_s
+    last: dict = {}
+    while time.monotonic() < deadline:
+        last = ctx.sw.session(com)
+        if last.get("state") == "READY" and last.get("boot_quiet_remaining_s") is None:
+            return True, last
+        time.sleep(2.0)
+    return False, last
+
+
 def f9_spontaneous_reboot_agent_gated(ctx):
     """#139（#130 Finding 4 收斂）：human console 送 reboot（daemon 視角＝自發重開機、
     session 名義上停 READY、RX banner arm quiet）期間，agent 顯式命令不得再被放行——
@@ -400,27 +417,31 @@ def f9_spontaneous_reboot_agent_gated(ctx):
                     evidence={"gate-cmd-final": final_path, "state-quiet-timeline": timeline_path},
                 )
 
-        # 等板子真正開完機回 READY。
-        if not ctx.sw.wait_state(com, "READY", timeout_s=boot_wait_s):
+        # 等板子真正開完機且 quiet window 清空——不能用 wait_state(READY)（state 全程
+        # READY、no-op），必須等 boot_quiet_remaining_s 歸零（首輪驗收假 FAIL 教訓）。
+        cleared, last_sess = _wait_quiet_cleared(ctx, com, timeout_s=boot_wait_s)
+        ctx.note("quiet-cleared.json", str({"cleared": cleared, "session": last_sess}))
+        if not cleared:
             tail = ctx.sw.run("log", "tail-text", "--selector", com)
             tail_text = "\n".join(tail.get("lines") or [])
             tail_path = ctx.note("boot-log-tail.txt", tail_text)
             if "=>" in tail_text or "U-Boot>" in tail_text:
                 return CaseResult(
                     "FAIL",
-                    reason=f"{boot_wait_s:.0f}s 內未回 READY，log tail 顯示卡在 U-Boot prompt"
+                    reason=f"{boot_wait_s:.0f}s 內 quiet 未清空，log tail 顯示卡在 U-Boot prompt"
                     "（gate 漏擋、bytes 打斷 autoboot）",
                     category="test", reason_code="autoboot_interrupted",
                     evidence={"boot-log-tail": tail_path, "state-quiet-timeline": timeline_path},
                 )
             return CaseResult(
                 "FAIL",
-                reason=f"{boot_wait_s:.0f}s 內未回 READY，且 log tail 未見 U-Boot prompt（開機異常）",
+                reason=f"{boot_wait_s:.0f}s 內 quiet window 未清空"
+                f"（state={last_sess.get('state')!r} quiet={last_sess.get('boot_quiet_remaining_s')!r}），開機異常",
                 category="test", reason_code="boot_not_ready",
                 evidence={"boot-log-tail": tail_path, "state-quiet-timeline": timeline_path},
             )
 
-        # READY 後重送同 echo：必須成功（READY ⇒ clear 的相容性約束）。
+        # quiet 清空後重送同 echo：必須成功（READY＋quiet 清空 ⇒ gate 解除的相容性約束）。
         follow = ctx.sw.submit_and_wait(com, f"echo {marker}", cmd_timeout=10.0)
         follow_path = ctx.note("after-ready-echo.json", str(follow))
         if follow.get("status") != "done" or marker not in (follow.get("stdout") or ""):
@@ -437,6 +458,8 @@ def f9_spontaneous_reboot_agent_gated(ctx):
             evidence={"state-quiet-timeline": timeline_path, "after-ready-echo": follow_path},
         )
     finally:
-        # 收尾還原：任何路徑不得把板留在 U-Boot／非 READY。
+        # 收尾還原：任何路徑不得把板留在 U-Boot／非 READY，**且不得把仍在倒數的
+        # quiet window 留給下一案**（首輪驗收實證：殘留 quiet 級聯拖垮 f9-uboot 案）。
         ctx.tmux.kill(ses)
         guards.ensure_ready(ctx, com, timeout_s=boot_wait_s)
+        _wait_quiet_cleared(ctx, com, timeout_s=boot_wait_s)

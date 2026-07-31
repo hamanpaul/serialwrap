@@ -83,8 +83,7 @@ doctor 全綠、testbed 板卡 READY、tmux/minicom 存在、無殘留 throwaway
 | case | 狀態 | 原因 |
 |---|---|---|
 | `f4-background-result-tail-consistent` | **FAIL（刻意保留的紅燈哨兵）** | #159：background quiet-window 對快速完成命令整段吞輸出且回 `lost: False`——case 正確抓到產品缺陷，**勿改 oracle 遷就**；#159 修復即轉綠 |
-| `f7-binary-roundtrip-md5` | SKIP（`transfer_timeout`） | #157 已修（chunk timeout 改沿用 profile `timeout_s`、`DEFAULT_CHUNK_SIZE` 2048→512、CLI/RPC 增 `--chunk-timeout`／`chunk_timeout_s`）——修復後應轉綠（64KB base64 ~88.6KB 在 RX 視窗上限內），待真機驗證確認 |
-| `f7-larger-file-not-truncated` | SKIP（`transfer_timeout`→預期轉 `transfer_environment_failure`） | #157 修復後 push 端可成功，但 pull 端因獨立的 RX 視窗 128KiB 上限（`sw_core/uart_io.py` `_rx_max_chars=131072`；#158 改絕對偏移記帳但視窗仍有界、被修剪頭段永久丟失）仍會 `PULL_PARSE_FAILED`（1MB base64 ~1.4MB 遠超上限、`_SENTINEL_BEGIN` 被踢出視窗）——非 #157 範圍，待 follow-up |
+| `f7-binary-roundtrip-md5`／`f7-larger-file-not-truncated` | 逐板嘗試（prpl 環境性失敗→試 bcm；全板失敗才 SKIP `transfer_env_all_boards`） | #157 已修 chunk/timeout 參數面；真機驗收揭露更深根因＝prpl console 無流控節流掉字（512B chunk echo 於 ~73% 斷）＋prpl-template 缺 `timeout_s` 未受益於推導——見 #161（逐行 ACK／流控後續） |
 
 #156（recover CTRL_C 路徑不 flush 佇列）已修——根因＝`SessionManager` 無管道通知
 `CommandArbiter` flush，新增 `on_command_flush` callback 補上該分支（`session_manager.py`

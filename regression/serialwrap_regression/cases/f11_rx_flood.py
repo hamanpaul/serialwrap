@@ -132,17 +132,21 @@ def f11_flood_probe_classified(ctx):
                 category="test", reason_code="rx_metric_missing")
             return result
 
-        # 3. 造有界洪水：30000 行×~14B≈420KB，115200 線速需 ~35-40s 排空；
-        #    loop 背景化（&）後 prompt 立返。submit done/error 皆接受（洪水已啟動）。
+        # 3. 造有界洪水（首輪驗收調校）：短行 echo 受板端 shell 逐次開銷限制、吞吐變異大
+        #    （首驗兩次 SKIP：一次沒建立、一次 probe 從縫隙擠過）——改長行密集洪水：
+        #    200 字元 payload 純 shell 字串自乘（busybox 相容、無 printf %0.s 依賴），
+        #    8000 行×~206B≈1.6MB，115200 線速下飽和 ~140s，probe 縫隙大幅縮小。
         flood = ctx.sw.run(
             "cmd", "submit", "--selector", com,
-            "--cmd", "for i in $(seq 1 30000); do echo FLOOD_$i; done &",
+            "--cmd", "P=FFFFFFFFFF; P=$P$P$P$P$P; P=$P$P$P$P; "
+                     "for i in $(seq 1 8000); do echo $i $P; done &",
             "--cmd-timeout", "8", timeout=30.0)
         ctx.note("flood-submit.json", str(flood))
 
-        # 4. 確認洪水建立：<=10s 內 rx_bytes_last_10s 達閾值。
+        # 4. 確認洪水建立：<=20s 內 rx_bytes_last_10s 達閾值（長行洪水爬升較快，
+        #    但保留寬裕窗口容忍板端排程抖動）。
         established = False
-        deadline = time.monotonic() + 10.0
+        deadline = time.monotonic() + 20.0
         while time.monotonic() < deadline:
             metric = _rx_metric(ctx.sw.session(com))
             if isinstance(metric, (int, float)) and metric >= _FLOOD_THRESHOLD:
@@ -153,7 +157,7 @@ def f11_flood_probe_classified(ctx):
         if not established:
             result = CaseResult(
                 "SKIP",
-                reason=f"{com} 10s 內 rx_bytes_last_10s 未達 {_FLOOD_THRESHOLD}（板端 echo 過慢屬能力缺失非回歸）",
+                reason=f"{com} 20s 內 rx_bytes_last_10s 未達 {_FLOOD_THRESHOLD}（板端 echo 過慢屬能力缺失非回歸）",
                 category="environment", reason_code="flood_not_established")
             return result
 
@@ -206,8 +210,8 @@ def f11_flood_probe_classified(ctx):
                 category="test", reason_code="rx_metric_zero_during_flood")
             return result
 
-        # 7. 排空：輪詢指標退回閾值下（洪水有界 ~40s，deadline 120s）。
-        drain_deadline = time.monotonic() + 120.0
+        # 7. 排空：輪詢指標退回閾值下（長行洪水 ~1.6MB、飽和 ~140s，deadline 240s）。
+        drain_deadline = time.monotonic() + 240.0
         while time.monotonic() < drain_deadline:
             metric = _rx_metric(ctx.sw.session(com))
             if isinstance(metric, (int, float)) and metric < _FLOOD_THRESHOLD:

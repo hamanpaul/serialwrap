@@ -63,7 +63,7 @@ def _probe_target_tools(ctx: Any, com: str) -> bool | None:
     """
     probe = ctx.sw.submit_and_wait(
         com, "command -v base64 >/dev/null && command -v md5sum >/dev/null && echo TOOLS_OK")
-    ctx.note("tools-probe.json", str(probe))
+    ctx.note(f"{com}-tools-probe.json", str(probe))
     if probe.get("status") != "done":
         return None
     return "TOOLS_OK" in (probe.get("stdout") or "")
@@ -136,10 +136,7 @@ def _cleanup_local(*paths: Path) -> None:
             pass
 
 
-@_case("f7-binary-roundtrip-md5", "binary round-trip md5 一致（含 null byte）",
-       issues=("#32", "#21"))
-def f7_binary_roundtrip_md5(ctx):
-    com = ctx.cfg["boards"][0]["com"]
+def _binary_roundtrip_on(ctx, com):
     remote_path = "/tmp/swreg_rt.bin"
     ctx.case_dir.mkdir(parents=True, exist_ok=True)
     # gzip 壓縮亂數 bytes：header FLG 欄位恆為 0x00，實質保證含 null byte（#32 的
@@ -156,12 +153,12 @@ def f7_binary_roundtrip_md5(ctx):
 
         # chunk 512 下 64KB≈129 chunks（原 2048 時 33），timeout 同比放大（見 module docstring）
         push = _push(ctx, com, src_path, remote_path, rpc_timeout_s=180, proc_timeout_s=200)
-        ctx.note("push.json", str(push))
+        ctx.note(f"{com}-push.json", str(push))
         if not push.get("ok"):
             return _transfer_failure_verdict(push, verb="push", tools_present=tools_present)
 
         pull = _pull(ctx, com, remote_path, dst_path, rpc_timeout_s=180, proc_timeout_s=200)
-        ctx.note("pull.json", str(pull))
+        ctx.note(f"{com}-pull.json", str(pull))
         if not pull.get("ok"):
             return _transfer_failure_verdict(pull, verb="pull", tools_present=tools_present)
 
@@ -177,9 +174,7 @@ def f7_binary_roundtrip_md5(ctx):
         _cleanup_local(src_path, dst_path)
 
 
-@_case("f7-larger-file-not-truncated", "1MB 檔案 push→pull 不靜默截斷", issues=("#21",))
-def f7_larger_file_not_truncated(ctx):
-    com = ctx.cfg["boards"][0]["com"]
+def _larger_file_on(ctx, com):
     remote_path = "/tmp/swreg_big.bin"
     ctx.case_dir.mkdir(parents=True, exist_ok=True)
     payload = os.urandom(1024 * 1024)
@@ -195,12 +190,12 @@ def f7_larger_file_not_truncated(ctx):
         # chunk 512 下 1MB=2048 chunks，悲觀估 205–614s（見 module docstring）；取 640 上界。
         # 註：pull 端在 RX 視窗 128KiB 上限修復前仍預期 PULL_PARSE_FAILED → SKIP。
         push = _push(ctx, com, src_path, remote_path, rpc_timeout_s=640, proc_timeout_s=660)
-        ctx.note("push.json", str(push))
+        ctx.note(f"{com}-push.json", str(push))
         if not push.get("ok"):
             return _transfer_failure_verdict(push, verb="push", tools_present=tools_present)
 
         pull = _pull(ctx, com, remote_path, dst_path, rpc_timeout_s=640, proc_timeout_s=660)
-        ctx.note("pull.json", str(pull))
+        ctx.note(f"{com}-pull.json", str(pull))
         if not pull.get("ok"):
             return _transfer_failure_verdict(pull, verb="pull", tools_present=tools_present)
 
@@ -221,3 +216,42 @@ def f7_larger_file_not_truncated(ctx):
     finally:
         _cleanup_remote(ctx, com, remote_path)
         _cleanup_local(src_path, dst_path)
+
+
+_ENV_SKIP_CODES = frozenset({
+    "transfer_timeout", "transfer_environment_failure", "target_tool_missing"})
+
+
+def _run_on_boards(ctx, runner, *, case_tag: str):
+    """逐板嘗試（首輪批次驗收調校，#157）：COM0（prpl 無顯式 timeout_s、且真機實測
+    存在無流控節流掉字的傳輸層限制）環境性失敗時改試 COM1（bcm 有 timeout_s 配置、
+    可實證 #157 chunk/timeout 機制）。第一個決定性結果（PASS 或 test-FAIL）即回傳；
+    全數環境性 SKIP 才 SKIP（彙整逐板 reason）。"""
+    outcomes = []
+    for board in ctx.cfg.get("boards") or []:
+        com = str(board["com"])
+        r = runner(ctx, com)
+        outcomes.append(f"{com}: {r.verdict}/{r.reason_code or '-'}")
+        if not (r.verdict == "SKIP" and (r.reason_code or "") in _ENV_SKIP_CODES):
+            r.reason = f"[{com}] {r.reason}" if r.reason else f"[{com}]"
+            return r
+    ctx.note(f"{case_tag}-board-outcomes.txt", "\n".join(outcomes))
+    return CaseResult(
+        "SKIP",
+        reason="全部板卡皆環境性失敗：" + "；".join(outcomes),
+        category="environment", reason_code="transfer_env_all_boards",
+    )
+
+
+@_case("f7-binary-roundtrip-md5", "binary round-trip md5 一致（含 null byte）",
+       issues=("#32", "#21"),
+       hints=("逐板嘗試：prpl 板受無流控節流限制（#157 後續 issue 追蹤），bcm 板"
+              "（timeout_s 配置齊）為 #157 機制的實證面。",))
+def f7_binary_roundtrip_md5(ctx):
+    return _run_on_boards(ctx, _binary_roundtrip_on, case_tag="rt")
+
+
+@_case("f7-larger-file-not-truncated", "1MB 檔案 push→pull 不靜默截斷", issues=("#21",),
+       hints=("逐板嘗試（同 f7-binary-roundtrip-md5）。",))
+def f7_larger_file_not_truncated(ctx):
+    return _run_on_boards(ctx, _larger_file_on, case_tag="big")
