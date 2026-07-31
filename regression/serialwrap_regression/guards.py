@@ -96,12 +96,16 @@ def ensure_ready(ctx: Any, com: str, *, timeout_s: float, recover: bool = True) 
     return ctx.sw.wait_state(com, "READY", timeout_s=timeout_s)
 
 
-# throwaway daemon 覆寫的目錄變數（對齊 tests/conftest.py 的隔離維度子集）
+# throwaway daemon 覆寫的目錄變數（對齊 tests/conftest.py 的隔離維度子集）。
+# BY_PATH 必須一併沙盒化（round 4 實測）：DeviceWatcher 的 extra_scan_dirs 掃 by-path，
+# 漏覆寫會讓 throwaway 看到主機真實 /dev/serial/by-path、間歇把 PROD 在用的裝置撈進
+# 偵測池並對其並行探測（two-reader 風險）。
 _TA_ENV_DIRS: tuple[str, ...] = (
     "SERIALWRAP_RUN_DIR",
     "SERIALWRAP_STATE_DIR",
     "SERIALWRAP_WAL_DIR",
     "SERIALWRAP_BY_ID_DIR",
+    "SERIALWRAP_BY_PATH_DIR",
     "SERIALWRAP_CONFIG_DIR",
     "SERIALWRAP_PROFILE_DIR",
 )
@@ -119,6 +123,7 @@ def throwaway_env(workdir: Path, by_id_dir: Path, run_dir: Path) -> dict[str, st
         "SERIALWRAP_STATE_DIR": workdir / "state",
         "SERIALWRAP_WAL_DIR": workdir / "wal",
         "SERIALWRAP_BY_ID_DIR": by_id_dir,
+        "SERIALWRAP_BY_PATH_DIR": workdir / "bypath",  # 空目錄＝主機 by-path 對 throwaway 不可見
         "SERIALWRAP_CONFIG_DIR": workdir / "config",
         "SERIALWRAP_PROFILE_DIR": workdir / "profiles",
     }
@@ -147,7 +152,7 @@ class ThrowawayDaemon:
     def __enter__(self) -> "ThrowawayDaemon":
         import tempfile
 
-        for sub in ("state", "wal", "config", "profiles"):
+        for sub in ("state", "wal", "config", "profiles", "bypath"):
             (self._workdir / sub).mkdir(parents=True, exist_ok=True)
         self._by_id_dir.mkdir(parents=True, exist_ok=True)
         (self._workdir / "profiles" / "default.yaml").write_text(

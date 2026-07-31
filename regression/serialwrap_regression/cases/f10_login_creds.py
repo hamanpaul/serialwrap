@@ -206,14 +206,18 @@ def _wait_state(ta: guards.ThrowawayDaemon, com: str, want: str, *,
     return last
 
 
-def _ta_com(listing: dict[str, Any]) -> str:
-    """取 throwaway 唯一動態 session 的實際 COM 編號。
+def _ta_com(listing: dict[str, Any], serial: str) -> str:
+    """取 throwaway 內目標板（依 serial 比對 device_by_id）的實際 COM 編號。
 
-    round 3 實測教訓：sandbox 只有一條線，但動態編號**不保證是 COM0**（該輪拿到 COM1，
-    硬編碼 COM0 → SESSION_NOT_FOUND 假陽性）——一律從 listing 動態解析。
+    round 3 教訓：動態編號**不保證是 COM0**（硬編碼 → SESSION_NOT_FOUND 假陽性）。
+    round 4 教訓：也不能取第一筆——sandbox 隔離若有任何洩漏（當時是 by-path 未沙盒化，
+    PROD 裝置混進偵測池），第一筆可能是別人的板子；一律以 serial 比對選取。
     """
-    sessions = listing.get("sessions") or [{}]
-    return str(sessions[0].get("com") or "COM0")
+    sessions = listing.get("sessions") or []
+    for s in sessions:
+        if serial and serial in str(s.get("device_by_id") or ""):
+            return str(s.get("com"))
+    return str((sessions or [{}])[0].get("com") or "COM0")
 
 
 def _wait_credentials_unresolved(ta: guards.ThrowawayDaemon, com: str, *,
@@ -344,7 +348,7 @@ def f10_unresolved_creds_terminal(ctx: Any) -> CaseResult:
                         evidence={"listing_initial": "ta-session-list-initial.json"},
                     )
                 else:
-                    ta_com = _ta_com(listing0)  # 動態解析，勿硬編碼 COM0（round 3 教訓）
+                    ta_com = _ta_com(listing0, str(board.get("serial") or ""))  # serial 比對選取（round 3/4 教訓）
                     attach = ta.run("session", "attach", "--selector", ta_com, timeout=60)
                     attach_note = ctx.note("ta-attach.json", str(attach))
 
@@ -488,7 +492,7 @@ def f10_creds_fixed_then_ready(ctx: Any) -> CaseResult:
                         evidence={"listing_initial": "ta-session-list-initial.json"},
                     )
                 else:
-                    ta_com = _ta_com(listing0)  # 動態解析，勿硬編碼 COM0（round 3 教訓）
+                    ta_com = _ta_com(listing0, str(board.get("serial") or ""))  # serial 比對選取（round 3/4 教訓）
                     attach = ta.run("session", "attach", "--selector", ta_com, timeout=60)
                     attach_note = ctx.note("ta-attach.json", str(attach))
 
