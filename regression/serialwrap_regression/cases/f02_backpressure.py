@@ -158,6 +158,8 @@ def f2_queue_full_backpressure(ctx: Any) -> CaseResult:
         "誠實界定（cg review）：CMD_HISTORY_MAX=512，200 輪不必然觸發淘汰——本 case 驗的是"
         "「RSS 增量有界」的粗防線；完整淘汰驗證屬長跑域（serialwrap-reliability soak），"
         "本 plugin 維持分鐘級不擴大輪數。",
+        "迴圈零容忍（#158 已修）：任一輪 echo x 未 done 即 FAIL——原偶發 PROMPT_TIMEOUT"
+        "根因＝RX 視窗修剪破壞 offset 語意，修復後不得再現；失敗輪 result 記入 evidence。",
     ),
 )
 def f2_history_bounded_rss(ctx: Any) -> CaseResult:
@@ -177,29 +179,22 @@ def f2_history_bounded_rss(ctx: Any) -> CaseResult:
 
     first_cmd_id: str | None = None
     last_cmd_id: str | None = None
-    iteration_failures: list[dict] = []
     for i in range(200):
         # settle/poll 壓到 0.3/0.2s：200 輪維持在 ~3 分鐘內（預設 1.5/0.5 會拖到 7 分鐘+）。
         result = ctx.sw.submit_and_wait(com, "echo x", cmd_timeout=6.0, settle_s=0.3, poll_s=0.2)
         if result.get("status") != "done":
-            # 快速迴圈偶發 PROMPT_TIMEOUT（#158：累積劣化或板端 console 噪音，2/2 於百次級
-            # 重現、輪次不定）——容忍 ≤3 次記 evidence 續跑，RSS 有界 oracle 不受影響；
-            # 超容忍才視為劣化徵兆 FAIL。#158 修復後可收緊為零容忍。
-            iteration_failures.append({"iteration": i, "result": result})
-            if len(iteration_failures) > 3:
-                ctx.note("iteration-failures.json", str(iteration_failures))
-                return CaseResult(
-                    "FAIL",
-                    reason=f"200 輪內 {len(iteration_failures)} 次 echo x 未完成（>3 容忍，#158 劣化徵兆）",
-                    category="test", reason_code="submit_loop_failed",
-                )
-            continue
+            # 零容忍（#158 已修）：快速迴圈的 PROMPT_TIMEOUT 根因＝RX 視窗修剪破壞 offset
+            # 語意（絕對偏移記帳後根治），任一輪未完成即為錯誤行為再現，恢復即紅。
+            ctx.note("iteration-failures.json", str([{"iteration": i, "result": result}]))
+            return CaseResult(
+                "FAIL",
+                reason=f"第 {i} 輪 echo x 未完成（status={result.get('status')!r}，#158 錯誤行為零再現 oracle）",
+                category="test", reason_code="submit_loop_failed",
+            )
         cmd_id = result.get("cmd_id")
         if first_cmd_id is None:
             first_cmd_id = cmd_id
         last_cmd_id = cmd_id
-    if iteration_failures:
-        ctx.note("iteration-failures.json", str(iteration_failures))
 
     # 淘汰行為觀察（記錄用，不影響判定）：history 淘汰只保證全域上限，不保證特定一筆
     # 必被淘汰或保留——取決於同期還有多少其他命令流量。
@@ -234,6 +229,77 @@ def f2_history_bounded_rss(ctx: Any) -> CaseResult:
             category="test", reason_code="rss_unbounded_growth",
         )
     return CaseResult("PASS", reason=f"RSS 增量 {delta_kb}kB（<{_RSS_GROWTH_BUDGET_KB}kB）")
+
+
+# 唯讀 grep 值（sw_core/uart_io.py，勿 import）：
+#   _rx_max_chars = 131072（UARTBridge RX 視窗上限，觸頂即前端修剪）
+# 預熱必須推超過此值才能使緩衝飽和：awk 每輪印 1200 行 ×（37 字元＋行尾）≈ 47KB，
+# 3 輪 ≈ 140KB > 131072，確定性跨界。
+_RX_MAX_CHARS_GREPPED = 131072
+_PREHEAT_ROUNDS = 3
+_PREHEAT_CMD = (
+    "awk 'BEGIN{for(i=0;i<1200;i++)print \"PAD-0123456789abcdef-0123456789abcdef\"}'"
+)
+
+
+@_case(
+    "f2-rx-window-crossing-prompt",
+    "RX 視窗飽和跨界後 prompt 匹配不失效（offset 絕對偏移語意）",
+    issues=("#158",),
+    hints=(
+        "決定性重演（非等自然累積）：先以 awk 大輸出把 RX 緩衝推超過 _rx_max_chars=131072"
+        "（唯讀 grep 常數，禁 import sw_core）使視窗飽和，再連發 echo x——修前飽和後首輪即"
+        "PROMPT_TIMEOUT（rx_snapshot_len 恆等於上限、切片永遠空字串）。",
+        "115200 baud 下預熱 ~140KB 需 ~12s+，預熱輪 cmd_timeout 放 60s；預熱本身失敗屬"
+        "environment（preheat_failed），非受測行為。",
+        "收尾必經 READY 還原：修前失敗路徑 recovery 會 CTRL_D 誤登出 console 轉 ATTACHED，"
+        "finally 內 wait_state→（必要時）session recover→echo ok 驗收。",
+    ),
+)
+def f2_rx_window_crossing_prompt(ctx: Any) -> CaseResult:
+    """#158：RX 視窗有界修剪破壞 offset 語意——緩衝飽和後 ``rx_snapshot_len()`` 恆等於
+    131072，``wait_for_regex_from(pattern, pre_offset)`` 切片永遠空字串，prompt 永不匹配
+    → PROMPT_TIMEOUT、stdout 空、recovery 誤送 CTRL_D 登出 console。修復＝絕對串流偏移
+    記帳；本 case 決定性重演跨界並驗證錯誤行為零再現。
+    """
+    com = ctx.cfg["boards"][0]["com"]
+    if ctx.sw.session(com).get("state") != "READY":
+        return CaseResult("SKIP", reason=f"{com} 非 READY，無法執行前景命令",
+                          category="environment", reason_code="board_not_ready")
+    try:
+        # 預熱：把 RX 緩衝推超過 _rx_max_chars 使視窗飽和（3×~47KB ≈ 140KB > 131072）。
+        for i in range(_PREHEAT_ROUNDS):
+            r = ctx.sw.submit_and_wait(com, _PREHEAT_CMD, cmd_timeout=60)
+            if r.get("status") != "done":
+                ctx.note("preheat-failure.json", str({"round": i, "result": {
+                    k: v for k, v in r.items() if k != "stdout"}}))
+                return CaseResult(
+                    "FAIL",
+                    reason=f"預熱第 {i} 輪大輸出命令未完成（status={r.get('status')!r}，非受測行為）",
+                    category="environment", reason_code="preheat_failed",
+                )
+
+        # 跨界迴圈：飽和態下連發短命令。修前：首輪即 PROMPT_TIMEOUT（典型簽名：
+        # error_code==PROMPT_TIMEOUT 且 stdout 空）。
+        for i in range(30):
+            result = ctx.sw.submit_and_wait(com, "echo x", cmd_timeout=6.0, settle_s=0.3, poll_s=0.2)
+            if result.get("status") != "done":
+                ctx.note("crossing-failure.json", str({"iteration": i, "result": result}))
+                return CaseResult(
+                    "FAIL",
+                    reason=(f"RX 視窗飽和後第 {i} 輪 echo x 未完成（status={result.get('status')!r}，"
+                            f"error_code={result.get('error_code')!r}；#158 回歸：prompt 於視窗跨界失效）"),
+                    category="test", reason_code="prompt_lost_at_rx_window_bound",
+                )
+        return CaseResult("PASS", reason="RX 視窗飽和跨界後 30 輪 echo x 全數完成（offset 語意未被修剪破壞）")
+    finally:
+        # 收尾（倣 f2-queue-full）：修前失敗路徑會 CTRL_D 登出 console 並轉 ATTACHED，必須還原。
+        ready = ctx.sw.wait_state(com, "READY", timeout_s=float(ctx.cfg["timeouts"]["ready_wait_s"]))
+        if not ready:
+            ctx.sw.run("session", "recover", "--selector", com)
+            ready = ctx.sw.wait_state(com, "READY", timeout_s=float(ctx.cfg["timeouts"]["ready_wait_s"]))
+        post = ctx.sw.submit_and_wait(com, "echo ok", cmd_timeout=10.0) if ready else {}
+        ctx.note("cleanup-echo-ok.json", str({"ready": ready, "post": post}))
 
 
 @_case(

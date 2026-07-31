@@ -405,3 +405,99 @@ class TestSnapshotDecisionFieldsAndAtomicGrant(unittest.TestCase):
             bridge.resume_interactive()
             bridge.stop()
             tmpdir.cleanup()
+
+
+class TestRxOffsetBoundedBuffer(unittest.TestCase):
+    """#158：RX 視窗有界修剪不得破壞 offset 語意（絕對串流偏移記帳）。
+
+    根因重演：`_rx_text` 觸頂修剪前端但不記帳 → `rx_snapshot_len()` 飽和後恆等於視窗上限
+    → `wait_for_regex_from(pattern, pre_offset)` 切片永遠空字串 → prompt 永不匹配 →
+    PROMPT_TIMEOUT、stdout 空、recovery 誤送 CTRL_D。本組測試把 `_rx_max_chars` 縮到 256
+    保持毫秒級，直接餵 `_append_rx_text`（不 start()，不碰真實序列埠）。
+    """
+
+    RESPONSE = b"echo x\r\nx\r\nroot@prplOS:/# "
+
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        wal = WalWriter(wal_dir=self._tmpdir.name)
+        self._bridge = UARTBridge(
+            com="COM0",
+            device_path="/dev/null",
+            profile=UartProfile(),
+            wal=wal,
+        )
+        self._bridge._rx_max_chars = 256
+
+    def tearDown(self) -> None:
+        self._bridge.stop()
+        self._tmpdir.cleanup()
+
+    def _fill(self, n_chars: int) -> None:
+        """灌 n_chars 個 filler 字元進 RX 緩衝。"""
+        self._bridge._append_rx_text(b"." * n_chars)
+
+    def test_prompt_match_survives_trim_crossing(self) -> None:
+        """#158 精確重演：回應 append 恰好觸發視窗修剪（跨界），prompt 仍必須匹配得到。"""
+        bridge = self._bridge
+        self._fill(bridge._rx_max_chars - 10)
+        pre = bridge.rx_snapshot_len()
+        bridge._append_rx_text(self.RESPONSE)  # 跨界 → 觸發前端修剪
+        self.assertTrue(
+            bridge.wait_for_regex_from(r"root@prplOS", pre, 0.5),
+            "跨界修剪後 prompt 匹配不到（#158 回歸：offset 語意被修剪破壞）",
+        )
+        self.assertEqual(bridge.rx_text_from(pre), self.RESPONSE.decode("utf-8"))
+
+    def test_saturated_buffer_still_matches(self) -> None:
+        """飽和態（對應實機失敗當下）：緩衝已在上限，pre 取於飽和後，回應仍必須匹配得到。"""
+        bridge = self._bridge
+        self._fill(bridge._rx_max_chars)  # 恰好觸頂
+        pre = bridge.rx_snapshot_len()
+        bridge._append_rx_text(self.RESPONSE)
+        self.assertTrue(
+            bridge.wait_for_regex_from(r"root@prplOS", pre, 0.5),
+            "飽和緩衝下 prompt 匹配不到（#158 回歸）",
+        )
+        self.assertEqual(bridge.rx_text_from(pre), self.RESPONSE.decode("utf-8"))
+
+    def test_snapshot_len_monotonic_after_saturation(self) -> None:
+        """飽和後持續 append，rx_snapshot_len() 必須每次嚴格遞增（釘死靜默偵測誤判）。"""
+        bridge = self._bridge
+        self._fill(bridge._rx_max_chars)
+        prev = bridge.rx_snapshot_len()
+        for _ in range(5):
+            bridge._append_rx_text(b"tick\r\n")
+            cur = bridge.rx_snapshot_len()
+            self.assertGreater(
+                cur, prev,
+                "飽和後 rx_snapshot_len 未嚴格遞增（#158 回歸：靜默偵測在飽和下恆真）",
+            )
+            prev = cur
+
+    def test_offset_in_trimmed_head_returns_window(self) -> None:
+        """offset 落在已修剪頭段：降級回傳現存全窗（非空、不拋例外），而非丟失回空。"""
+        bridge = self._bridge
+        pre = bridge.rx_snapshot_len()  # =0
+        self._fill(2 * bridge._rx_max_chars)
+        text = bridge.rx_text_from(pre)
+        self.assertEqual(len(text), bridge._rx_max_chars)
+        with bridge._rx_lock:
+            self.assertEqual(text, bridge._rx_text)
+
+    def test_clear_rx_buffer_keeps_offsets_monotonic(self) -> None:
+        """clear_rx_buffer 後絕對偏移不得回退；clear 前的舊 offset 讀到 clear 後新資料。"""
+        bridge = self._bridge
+        self._fill(100)
+        pre = bridge.rx_snapshot_len()
+        bridge.clear_rx_buffer()
+        self.assertGreaterEqual(bridge.rx_snapshot_len(), pre, "clear 後絕對偏移回退")
+        bridge._append_rx_text(b"new")
+        self.assertEqual(bridge.rx_text_from(pre), "new")
+
+    def test_snapshot_exposes_rx_dropped_chars(self) -> None:
+        """snapshot() 暴露 rx_dropped_chars（累計丟棄量）供鑑識；未修剪時為 0。"""
+        bridge = self._bridge
+        self.assertEqual(bridge.snapshot()["rx_dropped_chars"], 0)
+        self._fill(bridge._rx_max_chars + 40)
+        self.assertEqual(bridge.snapshot()["rx_dropped_chars"], 40)

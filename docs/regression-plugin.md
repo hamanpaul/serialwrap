@@ -56,7 +56,7 @@ doctor 全綠、testbed 板卡 READY、tmux/minicom 存在、無殘留 throwaway
 | Family | 對應已修 issue | 回歸標的 | 破壞性 |
 |---|---|---|---|
 | F1 命令契約 | #23 #27 #129 #19 #15 | limits 可查、`CMD_TOO_LONG`／`CMD_CONTAINS_NEWLINE` 拒收不卡死、近上限不登出、cmd_id 不消失 | 否 |
-| F2 背壓 | #81 #128 | `SESSION_QUEUE_FULL` backpressure、history/capture 淘汰、recovery flush 佇列 | 否 |
+| F2 背壓 | #81 #128 #158 | `SESSION_QUEUE_FULL` backpressure、history/capture 淘汰、recovery flush 佇列、RX 視窗飽和跨界 prompt 不失效 | 否 |
 | F3 失敗可觀測性 | #94 #16 #124 | 失敗必有非空 `error_code`＋stderr、log tail 預設取最新、錯誤指名 selector | 否 |
 | F4 狀態語義 | #34 #26 #28 | activity 分類可區分、background result-tail 不漏不重、interactive 中 line cmd 行為明確 | 否 |
 | F5 console 共存 | #78 #7 #8 #42 #11 #53 | raw ownership 多輪 suspend/resume 不丟、deferred 不丟鍵、對端消失回收、不掛 stale pts | 否 |
@@ -83,7 +83,7 @@ doctor 全綠、testbed 板卡 READY、tmux/minicom 存在、無殘留 throwaway
 | `f4-background-result-tail-consistent` | **FAIL（刻意保留的紅燈哨兵）** | #159：background quiet-window 對快速完成命令整段吞輸出且回 `lost: False`——case 正確抓到產品缺陷，**勿改 oracle 遷就**；#159 修復即轉綠 |
 | `f7-binary-roundtrip-md5`／`f7-larger-file-not-truncated` | SKIP（`transfer_timeout`） | #157：`file.push` per-chunk timeout 寫死 10s＋長單行 chunk 真機易截斷；修復後轉有效防線 |
 
-另有已立案的產品側觀察：#156（recover CTRL_C 路徑不 flush 佇列，f2-recovery 已放寬為 30s 有界排空）、#158（快速迴圈偶發 PROMPT_TIMEOUT，f2-history 容忍 ≤3 次）。各 issue 修復後可收緊對應 oracle。
+另有已立案的產品側觀察：#156（recover CTRL_C 路徑不 flush 佇列，f2-recovery 已放寬為 30s 有界排空）。#158（快速迴圈偶發 PROMPT_TIMEOUT）已修——根因＝RX 視窗修剪破壞 offset 語意（絕對偏移記帳根治）：`f2-history-bounded-rss` 已收緊為零容忍（任一輪未 done 即 FAIL），並新增決定性重演 case `f2-rx-window-crossing-prompt`。其餘 issue 修復後可收緊對應 oracle。
 
 ## 從新修好的 bug 新增 case（SOP）
 

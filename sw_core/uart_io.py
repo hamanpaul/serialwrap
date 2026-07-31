@@ -140,6 +140,11 @@ class UARTBridge:
         self._rx_lock = threading.Lock()
         self._rx_text = ""
         self._rx_max_chars = 131072
+        # 絕對串流偏移記帳（#158）：_rx_trimmed 為 _rx_text[0] 對應的絕對偏移（已被視窗
+        # 修剪或 clear 丟棄的累計字元數），單調不減。rx_snapshot_len() 回傳
+        # _rx_trimmed + len(_rx_text)（絕對偏移），使緩衝飽和修剪後既有 offset 仍可
+        # 正確切片，prompt 匹配不再因「長度恆等於視窗上限」而永遠落空。
+        self._rx_trimmed = 0
         self._preserved_consoles = preserved_consoles
         self._clients: dict[str, ConsoleClient] = {}
         self._interactive_owner: str | None = None
@@ -619,8 +624,11 @@ class UARTBridge:
         text = payload.decode("utf-8", errors="replace")
         with self._rx_lock:
             self._rx_text += text
-            if len(self._rx_text) > self._rx_max_chars:
-                self._rx_text = self._rx_text[-self._rx_max_chars :]
+            overflow = len(self._rx_text) - self._rx_max_chars
+            if overflow > 0:
+                # 視窗修剪必須記帳（#158）：丟棄的字元數推進 _rx_trimmed，維持絕對偏移語意。
+                self._rx_text = self._rx_text[overflow:]
+                self._rx_trimmed += overflow
 
     def _handle_serial_rx(self, data: bytes) -> None:
         self.wal.append(com=self.com, direction="RX", source="device", payload=data)
@@ -931,6 +939,9 @@ class UARTBridge:
 
     def clear_rx_buffer(self) -> None:
         with self._rx_lock:
+            # 保持絕對偏移單調（#158）：clear 也視為丟棄，推進 _rx_trimmed。持舊 offset 的
+            # 讀取會拿到「clear 後新到的資料」（語意正確），而非 aliasing 到不相干的舊位置。
+            self._rx_trimmed += len(self._rx_text)
             self._rx_text = ""
 
     def wait_for_regex(self, pattern: str, timeout_s: float) -> bool:
@@ -945,12 +956,18 @@ class UARTBridge:
         return False
 
     def rx_snapshot_len(self) -> int:
+        """回傳 RX 串流的**絕對偏移**（#158）：已修剪/清除的累計量＋現存緩衝長度。
+
+        單調不減；有 RX 進來就嚴格遞增，不受視窗修剪影響（飽和前後語意一致）。
+        """
         with self._rx_lock:
-            return len(self._rx_text)
+            return self._rx_trimmed + len(self._rx_text)
 
     def rx_text_from(self, from_offset: int) -> str:
+        """以絕對偏移取文字（#158）；頭段已被修剪時降級回傳現存全窗（不失敗、不回空）。"""
         with self._rx_lock:
-            return self._rx_text[from_offset:]
+            rel = from_offset - self._rx_trimmed
+            return self._rx_text if rel <= 0 else self._rx_text[rel:]
 
     def rx_tail(self, max_chars: int = 4096) -> str:
         with self._rx_lock:
@@ -961,7 +978,9 @@ class UARTBridge:
         regex = re.compile(pattern)
         while time.monotonic() < deadline:
             with self._rx_lock:
-                snapshot = self._rx_text[from_offset:]
+                # 每次持鎖重算相對偏移（#158）：等待期間 _rx_trimmed 可能因視窗修剪推進。
+                rel = max(0, from_offset - self._rx_trimmed)
+                snapshot = self._rx_text[rel:]
             if regex.search(snapshot):
                 return True
             time.sleep(0.05)
@@ -1091,6 +1110,8 @@ class UARTBridge:
 
     def snapshot(self) -> dict[str, Any]:
         consoles = self.list_consoles()
+        with self._rx_lock:
+            rx_dropped_chars = self._rx_trimmed  # 視窗修剪/clear 累計丟棄量（#158 鑑識用）
         with self._state_lock:
             serial_fd = self._serial_fd
             port = self._serial
@@ -1141,6 +1162,9 @@ class UARTBridge:
             "suspended_owner": suspended_owner,
             "flash_mode": flash_mode,
             "primary_client_id": primary_client_id,
+            # RX 視窗累計丟棄字元數（#158）：>0 代表曾觸頂修剪或 clear，供日後鑑識同類
+            # 「offset 跨界」問題（絕對偏移語意下不再致病，僅觀測）。
+            "rx_dropped_chars": rx_dropped_chars,
         }
 
     def try_grant_interactive_if_idle(self, owner: str) -> bool:
