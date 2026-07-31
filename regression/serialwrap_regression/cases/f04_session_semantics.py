@@ -95,9 +95,9 @@ def f4_activity_classification(ctx):
 @_case("f4-background-result-tail-consistent",
        "background 命令的 result-tail 增量拼接須不漏不重", issues=("#28",),
        hints=(
-           "round 2 實測（2026-07-31）：本 case 100% 重現 #159——BackgroundCapture 的"
-           " quiet-window 對快速完成命令整段吞輸出且回 lost:False。紅燈屬正確抓到產品缺陷，"
-           "#159 修復後即轉綠，勿改 oracle 遷就。",
+           "#159 已修（capture 於命令送出前掛載＋background RX 不再被 foreground_busy"
+           " 擋住），本 case 為其常駐回歸防線：round 2 實測（2026-07-31）曾 100% 重現"
+           "快速完成命令整段吞輸出且回 lost:False；若再轉紅屬回歸，勿改 oracle 遷就。",
        ))
 def f4_background_result_tail_consistent(ctx):
     """#28：background 模式輸出經 result-tail 增量讀取，曾發生 chunk 邊界漏段或重複段。

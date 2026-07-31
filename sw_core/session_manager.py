@@ -1837,9 +1837,24 @@ class SessionManager:
             # #130：quiet window 維護須看見**所有** RX（含 foreground 期間），
             # 故置於 foreground_busy gate 之前。
             self._update_boot_quiet_locked(session, chunk)
+            # background capture 無條件接收 RX（#159）：不受 foreground_busy 影響——
+            # background 命令自己送出後、等 prompt 比對成功前的整段等待期間
+            # foreground_busy 也是 True（fg/bg 共用同一段等待邏輯），若被 gate 掉，
+            # 快速完成的命令會在 chunk 機制真正掛上前就把全部輸出送完。
+            # 已終結（status != "active"）的 capture 仍會被 continue 跳過；新的
+            # 非-background 命令開始時，既有 active background capture 已在
+            # _execute_command_inner 進入 busy 前先行終結，故不會被新命令自己的
+            # TX echo 汙染。
+            for cmd_id in list(session.background_cmd_ids):
+                capture = self._background.get(cmd_id)
+                if capture is None or capture.status != "active":
+                    continue
+                capture.add_chunk(chunk, BG_CAPTURE_MAX_BYTES)
+                capture.last_activity_mono = time.monotonic()
+                capture.last_seq = self._wal.current_seq
             if session.foreground_busy:
                 return
-            # agent log capture
+            # agent log capture（維持原行為：foreground 期間不寫 agent log）
             cap = session.active_capture
             if cap is not None and cap.status == "active":
                 fp = self._capture_fps.get(cap.capture_id)
@@ -1851,13 +1866,6 @@ class SessionManager:
                         cap.line_count += chunk.count("\n")
                     except Exception:
                         pass
-            for cmd_id in list(session.background_cmd_ids):
-                capture = self._background.get(cmd_id)
-                if capture is None or capture.status != "active":
-                    continue
-                capture.add_chunk(chunk, BG_CAPTURE_MAX_BYTES)
-                capture.last_activity_mono = time.monotonic()
-                capture.last_seq = self._wal.current_seq
 
     def _handle_bridge_down(self, session_id: str, bridge: UARTBridge, reason: str) -> None:
         by_id: str | None = None
@@ -2672,9 +2680,12 @@ class SessionManager:
             )
             self._background[cmd_id] = capture
             self._evict_background_locked()
-        if chunks:
-            for c in chunks:
-                capture.add_chunk(c, BG_CAPTURE_MAX_BYTES)
+            # 僅「先前未掛載」（如 line 模式逾時）才回填 chunks；background 模式已
+            # 於命令送出前掛載並經 _on_bridge_rx 即時累積，此處收到的 chunks 是同
+            # 一段 RX 的全量重讀，重複疊加會造成 result_tail 內容重複（#159 review）。
+            if chunks:
+                for c in chunks:
+                    capture.add_chunk(c, BG_CAPTURE_MAX_BYTES)
         capture.last_seq = self._wal.current_seq
         capture.last_activity_mono = time.monotonic()
         capture.status = "error" if error_code else "done"
@@ -2866,6 +2877,25 @@ class SessionManager:
                     session.fg_cmd_expected_duration_s = None
         pre_offset = bridge.rx_snapshot_len()
         try:
+            if normalized_mode == "background":
+                # #159：capture 必須在命令送出「之前」掛好——快速完成的命令會在
+                # prompt 比對成功前就把全部輸出送完，若等 matched 之後才回溯建立
+                # capture，這段輸出永遠不會經過 add_chunk()（result_tail 拿到空
+                # chunks 卻回 lost:False 的假保證）。配合 _on_bridge_rx 對應修改
+                # （background capture 不再被 foreground_busy 擋住），此後全程
+                # （含下方等待迴圈與 CTRL_C 復原）RX 都會即時進 add_chunk()。
+                with self._lock:
+                    capture = BackgroundCapture(
+                        cmd_id=cmd_id,
+                        session_id=session.session_id,
+                        from_seq=self._wal.current_seq + 1,
+                        quiet_window_s=session.profile.quiet_window_s,
+                        created_at=now_iso(),
+                        last_seq=self._wal.current_seq,
+                    )
+                    self._background[cmd_id] = capture
+                    self._evict_background_locked()
+                    session.background_cmd_ids.append(cmd_id)
             self._mark_session_tx(session)
             bridge.send_command(command, source=source, cmd_id=cmd_id)
 
@@ -2910,18 +2940,7 @@ class SessionManager:
                 "partial": False,
             }
             if normalized_mode == "background":
-                capture = BackgroundCapture(
-                    cmd_id=cmd_id,
-                    session_id=session.session_id,
-                    from_seq=self._wal.current_seq + 1,
-                    quiet_window_s=session.profile.quiet_window_s,
-                    created_at=now_iso(),
-                    last_seq=self._wal.current_seq,
-                )
-                with self._lock:
-                    self._background[cmd_id] = capture
-                    self._evict_background_locked()
-                    session.background_cmd_ids.append(cmd_id)
+                # capture 已於命令送出前掛好並即時累積（#159），此處僅回填回應欄位。
                 result["background_capture_id"] = cmd_id
             return result
         finally:
