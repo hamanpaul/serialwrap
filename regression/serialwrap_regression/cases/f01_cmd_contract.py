@@ -138,7 +138,7 @@ def f1_cmdid_survives_timeout(ctx):
     status = None
     st: dict = {}
     while time.monotonic() < deadline:
-        st = ctx.sw.run("cmd", "status", "--cmd-id", cmd_id)
+        st = ctx.sw.run("cmd", "status", "--cmd-id", str(cmd_id))
         if st.get("error_code") == "CMD_NOT_FOUND":
             break
         command = st.get("command") or {}

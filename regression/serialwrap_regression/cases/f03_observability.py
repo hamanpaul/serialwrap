@@ -72,7 +72,7 @@ def f3_log_tail_latest(ctx):
     if (cmd.get("status") or "") != "done" or marker not in (cmd.get("stdout") or ""):
         return CaseResult("FAIL", reason=f"submit echo 未正常完成（status={cmd.get('status')}），無法驗證 log tail-text 行為",
                           category="environment", reason_code="submit_precondition_failed")
-    tail = ctx.sw.run("log", "tail-text", "--selector", "COM0")
+    tail = ctx.sw.run("log", "tail-text", "--selector", com)
     ctx.note("tail-text.json", str(tail))
     lines = tail.get("lines") or []
     if not any(marker in line for line in lines):

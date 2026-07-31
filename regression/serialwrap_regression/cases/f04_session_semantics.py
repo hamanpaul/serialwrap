@@ -123,7 +123,7 @@ def f4_background_result_tail_consistent(ctx):
     last_resp: dict = {}
     deadline = time.monotonic() + 60.0
     while time.monotonic() < deadline:
-        r = ctx.sw.run("cmd", "result-tail", "--cmd-id", cmd_id, "--from-chunk", str(from_chunk))
+        r = ctx.sw.run("cmd", "result-tail", "--cmd-id", str(cmd_id), "--from-chunk", str(from_chunk))
         last_resp = r
         chunks = r.get("chunks") or []
         parts.extend(str(c) for c in chunks)
@@ -218,7 +218,7 @@ def f4_interactive_line_cmd_defined(ctx):
         st: dict = {}
         deadline = time.monotonic() + 45.0
         while time.monotonic() < deadline:
-            st = ctx.sw.run("cmd", "status", "--cmd-id", cmd_id)
+            st = ctx.sw.run("cmd", "status", "--cmd-id", str(cmd_id))
             command = st.get("command") or {}
             status = command.get("status")
             if status in ("done", "error", "timeout"):
