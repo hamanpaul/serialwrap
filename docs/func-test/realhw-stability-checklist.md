@@ -96,7 +96,7 @@ sudo -n systemctl restart serialwrap            # 最後手段（會重偵測所
 
 | case id | 驗什麼 | 手動等效命令 | 判定 | 坑 |
 |---|---|---|---|---|
-| `p0-doctor` | daemon 與環境健康 | `serialwrap doctor`；`serialwrap session list` | doctor `checks[].ok` 全綠；兩板 `state==READY`；`device_by_id` 含各板 serial（COM0/AC01QZT0、COM1/AQ00OAQ7） | 名稱鍵是 `check`；同款晶片 by-id 相同須靠 serial 區辨 |
+| `p0-doctor` | daemon 與環境健康 | `serialwrap doctor`；`serialwrap session list`；`serialwrap-minicom --help` | doctor `checks[].ok` 全綠（含新 `serialwrap_minicom_on_path`／`jq_on_path`／`minicom_on_path`，#149）；兩板 `state==READY`；`device_by_id` 含各板 serial（COM0/AC01QZT0、COM1/AQ00OAQ7）；`serialwrap-minicom --help` 印出 minicom usage 且結束碼 0 | 名稱鍵是 `check`；同款晶片 by-id 相同須靠 serial 區辨；`--help` 會對某個 READY session 做一次短暫 console-attach/detach（非破壞性、wrapper 收尾自動 detach），避免與正在進行的其他 human console 操作同時執行以免混淆歸因 |
 | `p0-cmd-async` | agent 命令端到端 | `serialwrap cmd submit --selector COM0 --cmd 'echo P0_$RANDOM' --cmd-timeout 12`→隔一拍`serialwrap cmd status --cmd-id <id>` | status `done`、stdout 含 marker（雙板逐板序列化） | submit 後立刻讀 status 有 line race，要隔拍輪詢；雙板 back-to-back 會撞 foreground busy |
 | `p0-console-raw` | minicom 連線＋raw ownership | tmux 起 `serialwrap-minicom COM0`；`serialwrap session console-list --selector COM0`；send-keys 半個 `ec`+`Tab`；capture-pane | 至少一個 `interactive_owner:true`；Tab 補完出現 `echo` | 方向鍵/Tab 失效＝掉回 line-buffer（orphan lease #76/#99）；minicom 顯示 Offline（DCD 未拉）不影響輸入 |
 | `p0-clear-reattach` | session clear 自動恢復 | `serialwrap session clear --selector COM0`；輪詢 `session list` | `ready_wait_s`（180s）內回 READY | clear 沿用舊 profile，不會改偵測 |

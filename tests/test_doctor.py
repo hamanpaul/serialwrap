@@ -7,6 +7,8 @@
 - #154：`serialwrapd_on_path` 後新增 `other_serialwrap_installs`（同機多份安裝
   版本一致性診斷），Linux／Windows 兩份清單皆刻意更新（非誤傷）。
 - #148：新增 `wal_dir` 檢查，兩份清單同步更新。
+- #149：Linux 清單於 `dialout` 之後新增 human console 就緒檢查組
+  `serialwrap_minicom_on_path`／`jq_on_path`／`minicom_on_path`（皆 advisory）。
 """
 from __future__ import annotations
 
@@ -26,6 +28,10 @@ LINUX_CHECKS = [
     "serialwrapd_on_path",
     "other_serialwrap_installs",
     "dialout",
+    # #149：human console 就緒檢查組（wrapper／jq／minicom 是否在 PATH）。
+    "serialwrap_minicom_on_path",
+    "jq_on_path",
+    "minicom_on_path",
     "systemd",
     "supervision_mode",
     "single_daemon",
@@ -66,6 +72,62 @@ def test_doctor_dialout_ok_when_member():
     report = run_doctor(fx=FakeEffects(systemd=True, in_groups={"dialout"}), platform="linux")
     item = next(i for i in report if i["check"] == "dialout")
     assert item["ok"] is True and item["fix"] == ""
+
+
+class TestHumanConsoleReadinessChecks:
+    """#149：human console 就緒檢查組——`serialwrap-minicom`／`jq`／`minicom` 是否在
+    PATH，比照既有 `_check_dialout` 的測試先例，用 `FakeEffects(which={...})` 控制。"""
+
+    def test_doctor_reports_serialwrap_minicom_missing_with_fix(self):
+        fx = FakeEffects(systemd=True, in_groups={"dialout"})  # which 留空
+        report = run_doctor(fx=fx, platform="linux")
+        item = next(i for i in report if i["check"] == "serialwrap_minicom_on_path")
+        assert item["ok"] is False
+        assert "serialwrap setup" in item["fix"]
+
+    def test_doctor_serialwrap_minicom_ok_when_on_path(self):
+        # 刻意避開 /home/<user>/ 前綴（R-21 結構偵測器會誤觸個人絕對路徑掃描）。
+        path = "/opt/serialwrap/bin/serialwrap-minicom"
+        fx = FakeEffects(
+            systemd=True, in_groups={"dialout"},
+            which={"serialwrap-minicom": path},
+        )
+        report = run_doctor(fx=fx, platform="linux")
+        item = next(i for i in report if i["check"] == "serialwrap_minicom_on_path")
+        assert item["ok"] is True and item["fix"] == ""
+        assert item["detail"] == path
+
+    def test_doctor_reports_jq_missing_with_fix(self):
+        fx = FakeEffects(systemd=True, in_groups={"dialout"})
+        report = run_doctor(fx=fx, platform="linux")
+        item = next(i for i in report if i["check"] == "jq_on_path")
+        assert item["ok"] is False
+        assert "apt install jq" in item["fix"]
+
+    def test_doctor_jq_ok_when_on_path(self):
+        fx = FakeEffects(
+            systemd=True, in_groups={"dialout"},
+            which={"jq": "/usr/bin/jq"},
+        )
+        report = run_doctor(fx=fx, platform="linux")
+        item = next(i for i in report if i["check"] == "jq_on_path")
+        assert item["ok"] is True and item["fix"] == ""
+
+    def test_doctor_reports_minicom_binary_missing_with_fix(self):
+        fx = FakeEffects(systemd=True, in_groups={"dialout"})
+        report = run_doctor(fx=fx, platform="linux")
+        item = next(i for i in report if i["check"] == "minicom_on_path")
+        assert item["ok"] is False
+        assert "apt install minicom" in item["fix"]
+
+    def test_doctor_minicom_binary_ok_when_on_path(self):
+        fx = FakeEffects(
+            systemd=True, in_groups={"dialout"},
+            which={"minicom": "/usr/bin/minicom"},
+        )
+        report = run_doctor(fx=fx, platform="linux")
+        item = next(i for i in report if i["check"] == "minicom_on_path")
+        assert item["ok"] is True and item["fix"] == ""
 
 
 def test_doctor_python_check_passes_on_current_interpreter():
@@ -206,14 +268,18 @@ class TestCliAdvisorySets:
             item["ok"] or item["check"] in cli._DOCTOR_ADVISORY_CHECKS_WIN for item in report
         )
 
-    def test_linux_advisory_set_includes_other_serialwrap_installs(self):
+    def test_linux_advisory_set_includes_human_console_checks_149(self):
         """#154：新增 other_serialwrap_installs 為 advisory——純診斷資訊，偵測到
         多份不同版本安裝也不應讓整體 doctor 判定失敗（呼應 (b) 的「勿擋」精神）。
-        #148：wal_dir（shell/daemon WAL_DIR 不一致）亦為 advisory、僅 WARN 不擋。"""
+        #148：wal_dir（shell/daemon WAL_DIR 不一致）亦為 advisory、僅 WARN 不擋。
+        #149（刻意擴充，比照 #131 平台感知變更的先例）：human console 就緒檢查組
+        （serialwrap_minicom_on_path／jq_on_path／minicom_on_path）同為 advisory——
+        純 agent-only headless 部署不需要 human console，缺席不該拉低整體 ok。"""
         from sw_core import cli
 
         assert cli._DOCTOR_ADVISORY_CHECKS == {
             "systemd", "wsl_systemd", "devices", "other_serialwrap_installs", "wal_dir",
+            "serialwrap_minicom_on_path", "jq_on_path", "minicom_on_path",
         }
 
 

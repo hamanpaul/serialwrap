@@ -52,12 +52,24 @@ def _check_pyyaml() -> dict:
     }
 
 
-def _check_on_path(fx, name: str, fix_hint: str = "確認 ~/.local/bin 在 PATH（pipx ensurepath）") -> dict:
-    """指定二進位是否在 PATH 上。``fix_hint`` 預設值即原 Linux 字串（輸出不變）。"""
+def _check_on_path(
+    fx,
+    name: str,
+    fix_hint: str = "確認 ~/.local/bin 在 PATH（pipx ensurepath）",
+    *,
+    check_name: str | None = None,
+) -> dict:
+    """指定二進位是否在 PATH 上。``fix_hint`` 預設值即原 Linux 字串（輸出不變）。
+
+    ``check_name``（keyword-only，#149）：覆寫回報鍵，供含連字號的二進位名稱
+    （如 ``serialwrap-minicom``）產生底線命名的 ``serialwrap_minicom_on_path``，
+    與既有 ``serialwrap_on_path``／``serialwrapd_on_path`` 命名一致；預設
+    ``None`` 時沿用 ``f"{name}_on_path"``，既有呼叫端行為逐字不變。
+    """
     path = fx.which(name)
     ok = path is not None
     return {
-        "check": f"{name}_on_path",
+        "check": check_name or f"{name}_on_path",
         "ok": ok,
         "detail": path or "找不到",
         "fix": "" if ok else fix_hint,
@@ -344,8 +356,10 @@ def run_doctor(fx=None, home=None, *, platform: str | None = None) -> list[dict]
         home:     使用者家目錄（目前僅 supervision_mode 取用，保留供測試）。
         platform: 平台字串（``sys.platform`` 語意）；``None`` 時取實際平台。
                   ``win*`` → Windows 檢查清單（#131 點 4：pyserial／PATH／daemon
-                  endpoint／SERIALCOMM 裝置），其餘 → 原 Linux 清單逐字不變
-                  （dialout／systemd／single_daemon／by-id devices／wsl_systemd）。
+                  endpoint／SERIALCOMM 裝置），其餘 → Linux 清單（dialout／
+                  human console 就緒組：serialwrap-minicom／jq／minicom 是否在
+                  PATH（#149）／systemd／single_daemon／by-id devices／
+                  wsl_systemd）。
 
     Returns:
         檢查結果清單，每項為
@@ -376,6 +390,19 @@ def run_doctor(fx=None, home=None, *, platform: str | None = None) -> list[dict]
         _check_on_path(fx, "serialwrapd"),
         _check_other_serialwrap_installs(fx),
         _check_dialout(fx),
+        # human console 就緒檢查組（#149）：wrapper／jq／minicom 是否在 PATH——
+        # doctor 全綠不等於 human console 真能動，補齊這個空白（見 issue #149
+        # root_cause）。三項皆 fx.which() 純查表、無 I/O 副作用。
+        _check_on_path(
+            fx, "serialwrap-minicom", check_name="serialwrap_minicom_on_path",
+            fix_hint=(
+                "執行 `serialwrap setup` 物化 minicom wrapper 到 ~/.local/bin"
+                "（並確認該目錄在 PATH，可用 pipx ensurepath）；"
+                "human console 一律經 serialwrap-minicom COMx，勿直接對 tty 開 minicom（避免與 daemon two-reader 衝突）"
+            ),
+        ),
+        _check_on_path(fx, "jq", fix_hint="安裝 jq（Debian/Ubuntu/Mint: sudo apt install jq）——serialwrap-minicom wrapper 解析 session 狀態需要"),
+        _check_on_path(fx, "minicom", fix_hint="安裝 minicom（Debian/Ubuntu/Mint: sudo apt install minicom）"),
         _check_systemd(fx),
         _check_supervision_mode(home),
         _check_single_daemon(),

@@ -99,6 +99,13 @@ console views, command result capture, and diagnostics.
 - **jq** — required by the broker minicom route
 - **minicom** — required for human console workflows on Linux/WSL
 
+Human console must always go through the broker wrapper, `serialwrap-minicom
+COMx` (materialized to `~/.local/bin` by `serialwrap setup`) — never open
+`minicom -D /dev/ttyUSBx` directly, or it will fight the daemon for the tty
+(two-reader). See [Human Console Coexistence](#human-console-coexistence).
+`serialwrap doctor` checks that the wrapper, `jq`, and `minicom` are all on
+PATH.
+
 For serial devices on Linux, add the user to `dialout` and log in again:
 
 ```bash
@@ -131,6 +138,16 @@ serialwrap cmd status --cmd-id <cmd_id>
 
 For local development, run `./install.sh`; it performs the same package install
 and `serialwrap setup` flow from the checkout.
+
+For a human console, use the broker wrapper instead of raw minicom:
+
+```bash
+serialwrap-minicom COM0
+```
+
+Do **not** run `minicom -D /dev/ttyUSBx` directly — it bypasses the broker and
+races the daemon for the tty (two-reader). See
+[Human Console Coexistence](#human-console-coexistence) for details.
 
 ### Architecture
 
@@ -767,8 +784,9 @@ for a newly fixed bug" SOP:
 
 - Python 3.10+
 - `pyyaml`：`pipx install` 會自動帶入，無需手動安裝
-- `jq`：`minicom_router.sh` 需要（router/human console 路徑）
-- `minicom`：human console 路徑需要
+- `jq`：`serialwrap-minicom`（由 `minicom_router.sh` 物化而來）解析 session 狀態需要，不要直接 `minicom -D /dev/ttyUSBx`
+- `minicom`：human console 路徑需要，一律經 `serialwrap-minicom COMx` 呼叫，不要直接 `minicom -D /dev/ttyUSBx`（會與 daemon 搶 tty，two-reader）
+- 以上三項（`serialwrap-minicom`／`jq`／`minicom`）`serialwrap doctor` 皆會檢查是否在 PATH
 
 ## 系統方塊圖
 
@@ -1010,9 +1028,9 @@ serialwrap doctor    # 驗證環境
 ```
 
 - dialout：`sudo usermod -aG dialout $USER`（之後重新登入）。
+- **human console 用 `serialwrap-minicom COM0`（`serialwrap setup` 已自動物化到 `~/.local/bin`），不要直接 `minicom -D /dev/ttyUSBx`**（會與 daemon 搶 tty，two-reader）。
 - WSL 啟用 systemd：於 `/etc/wsl.conf` 設 `[boot]\nsystemd=true` 後 `wsl --shutdown`（否則 `serialwrap setup` 退回 on-demand）。
 - 本機開發安裝：`./install.sh`（= `pipx install <repo>` + `serialwrap setup`）。
-- minicom broker wrapper 現為 `serialwrap-minicom COMx`（取代舊的 `~/.paul_tools/minicom`）。
 
 ```bash
 # 啟動 daemon 後快速驗證
@@ -1375,7 +1393,7 @@ ocp-mcu-upgrade -d "$XDG_RUNTIME_DIR/serialwrap/dev/ttyMCU" -b 115200 -t 8 -e -s
 
 ## 多 minicom 使用
 
-`minicom_router.sh` 會：
+`serialwrap-minicom`（由 `minicom_router.sh` 物化而來）會：
 
 1. 視需要自動啟動 daemon
 2. 視需要對 selector 執行 `session attach`
@@ -1386,14 +1404,14 @@ ocp-mcu-upgrade -d "$XDG_RUNTIME_DIR/serialwrap/dev/ttyMCU" -b 115200 -t 8 -e -s
 
 ```bash
 # 自動選第一個 READY，否則退而求其次選 ATTACHED session
-minicom
+serialwrap-minicom
 
 # 指定 COM 或 alias
-minicom COM1
-minicom default+2
+serialwrap-minicom COM1
+serialwrap-minicom default+2
 
-# 無 broker 時直接 fallback raw device
-minicom -D /dev/ttyUSB0
+# 無 broker 時直接 fallback raw device（僅示意 wrapper 內部 fallback 語意，不要自己手動這樣開）
+serialwrap-minicom -D /dev/ttyUSB0
 ```
 
 重要限制：
@@ -2087,9 +2105,9 @@ serialwrap doctor    # 驗證環境
 ```
 
 - dialout：`sudo usermod -aG dialout $USER`（之後重新登入）。
+- **human console 用 `serialwrap-minicom COM0`（`serialwrap setup` 已自動物化到 `~/.local/bin`），不要直接 `minicom -D /dev/ttyUSBx`**（會與 daemon 搶 tty，two-reader）。
 - WSL 啟用 systemd：於 `/etc/wsl.conf` 設 `[boot]\nsystemd=true` 後 `wsl --shutdown`（否則 `serialwrap setup` 退回 on-demand）。
 - 本機開發安裝：`./install.sh`（= `pipx install <repo>` + `serialwrap setup`）。
-- minicom broker wrapper 現為 `serialwrap-minicom COMx`（取代舊的 `~/.paul_tools/minicom`）。
 
 依賴：Python 3.10+（`pipx install` 自動帶入 `pyyaml`）；human console 路徑另需 `jq` 與 `minicom`。
 
@@ -2127,7 +2145,7 @@ command groups:
     supervision-mode   顯示有效的監管模式（on-demand、systemd-user 或 systemd-system）
     service            透過 systemctl 管理 serialwrap systemd service（systemd 監管模式適用）
     setup              安裝資產並設定監管模式（systemd-user／systemd-system／on-demand）
-    doctor             診斷安裝與執行環境（平台感知：Linux 檢 dialout／systemd／by-id 裝置，Windows 檢 pyserial／daemon endpoint／COM 列舉）
+    doctor             診斷安裝與執行環境（平台感知：Linux 檢 dialout／systemd／by-id 裝置／human console 就緒（serialwrap-minicom／jq／minicom），Windows 檢 pyserial／daemon endpoint／COM 列舉）
     skill              輸出操作指南（skill）原文到 stdout（--platform windows 為 Windows 操作指南）
 
 examples:

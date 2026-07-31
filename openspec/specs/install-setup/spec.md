@@ -51,7 +51,7 @@ TBD - created by archiving change install-flow-systemd-pipx. Update Purpose afte
 
 #### Scenario: 診斷輸出
 - **WHEN** 執行 `serialwrap doctor`
-- **THEN** 逐項回報 python 版本／PyYAML／`serialwrap`+`serialwrapd` 在 PATH／dialout 成員／systemd 與 unit 狀態／`supervision_mode`／socket 可連／`/dev/serial/by-id` 裝置／（WSL）systemd 旗標，並對失敗項印修復指令
+- **THEN** 逐項回報 python 版本／PyYAML／`serialwrap`+`serialwrapd` 在 PATH／dialout 成員／human console 就緒組（`serialwrap-minicom`／`jq`／`minicom` 是否在 PATH，advisory，#149）／systemd 與 unit 狀態／`supervision_mode`／socket 可連／`/dev/serial/by-id` 裝置／（WSL）systemd 旗標，並對失敗項印修復指令
 
 ### Requirement: legacy ~/.paul_tools 遷移
 `setup` SHALL 偵測既有 `~/.paul_tools` 安裝並引導退役（停 legacy daemon、備份移除影子 `serialwrap`/`serialwrapd.py`/`minicom` symlink、提示移除 `PATH` 行）。

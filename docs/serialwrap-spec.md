@@ -420,6 +420,21 @@ dynamic 自動偵測 session 的 COM 編號**依裝置 by-id 字典序確定性�
   - `foreign_holders`（`{tty_real_path: pid}`）：持有目前 attach 中 tty 的 pid。
   - `multi_open_detail`：`{"daemons": [{"pid": N}, ...], "holders_status": "ok" | "permission" | "unknown"}`。`holders_status` 在跨 uid 讀不到 `/proc/<pid>/fd` 時降級為 `permission`、procfs 不可用時為 `unknown`，此降級資訊本身即為輸出契約的一部分。
 
+### 8.6 human console 就緒檢查組（#149）
+
+`serialwrap doctor`（Linux）於 `dialout` 之後、`systemd` 之前新增三項純 `fx.which()`
+查表檢查（advisory，缺席不拉低整體 `ok`，與 `devices`／`systemd` 同哲學）：
+
+- `serialwrap_minicom_on_path`：broker minicom wrapper 本體（`serialwrap setup` 物化到
+  `~/.local/bin/serialwrap-minicom`）是否在 PATH。
+- `jq_on_path`：`serialwrap-minicom`（由 `minicom_router.sh` 物化而來）解析 `session
+  list` JSON 所需。
+- `minicom_on_path`：wrapper 實際呼叫的 `minicom` 二進位是否在 PATH。
+
+`serialwrap setup` 完成時的輸出另加 `console_hint` 一行，主動提示 human console 一律
+經 `serialwrap-minicom COMx`，勿直接對 tty 開裸 `minicom -D /dev/ttyUSBx`（會與 daemon
+搶 tty，two-reader）。
+
 ## 9. self_test 與 recover
 
 ### 9.1 `session.self_test`

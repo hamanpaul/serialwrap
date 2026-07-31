@@ -672,7 +672,14 @@ def _dispatch_event(args: argparse.Namespace) -> int:
 # 拉低整體 ok（無 systemd 可走 on-demand；無裝置可能只是還沒插線）。
 # other_serialwrap_installs（#154）：純診斷資訊，偵測到多份不同版本安裝也不應
 # 讓整體 doctor 判定失敗——呼應 (b) _warn_version_mismatch 的「勿擋」精神。
-_DOCTOR_ADVISORY_CHECKS = {"systemd", "wsl_systemd", "devices", "other_serialwrap_installs", "wal_dir"}
+# serialwrap_minicom_on_path／jq_on_path／minicom_on_path（#149）：human console
+# 就緒檢查組，與 devices／systemd 同哲學——純 agent-only headless 部署不需要
+# human console，缺席不該拉低整體 ok（但 realhw／regression 的 preflight 各自
+# 用 all() 硬性把關，兩層各司其職，見 #149 design risks）。
+_DOCTOR_ADVISORY_CHECKS = {
+    "systemd", "wsl_systemd", "devices", "other_serialwrap_installs", "wal_dir",
+    "serialwrap_minicom_on_path", "jq_on_path", "minicom_on_path",
+}
 # Windows（#131）：PATH／daemon endpoint／裝置皆 advisory（未起 daemon、exe 未入 PATH
 # 不致命）；pyserial 為 Windows 序列埠後端硬依賴 → 非 advisory。
 # wal_dir（#148）：shell/daemon WAL_DIR 不一致僅 WARN，不拉低整體 ok。
@@ -921,6 +928,9 @@ def _run_setup(args: argparse.Namespace) -> int:
         "legacy": legacy,
         "setup": result,
         "doctor_hint": "serialwrap doctor 可驗證環境",
+        # #149：setup 完成後主動把 minicom 入口指令交到手上，避免 operator 誤敲
+        # 未走 broker 的裸 `minicom -D /dev/ttyUSBx`（two-reader 衝突）。
+        "console_hint": "human console 請用 serialwrap-minicom COMx（勿直接 minicom -D /dev/ttyUSBx，避免與 daemon two-reader 衝突）",
     }
     pending_sudo = result.get("pending_sudo")
     if pending_sudo:
@@ -1380,10 +1390,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser(
         "doctor",
-        help="診斷安裝與執行環境（平台感知：Linux 檢 dialout／systemd／by-id 裝置，Windows 檢 pyserial／daemon endpoint／COM 列舉）",
+        help="診斷安裝與執行環境（平台感知：Linux 檢 dialout／systemd／by-id 裝置／human console 就緒（serialwrap-minicom／jq／minicom），Windows 檢 pyserial／daemon endpoint／COM 列舉）",
         description=(
             "對安裝與執行環境做一系列唯讀檢查並印出 JSON 報告（依平台選擇檢查清單，#131）。\n"
-            "Linux：systemd／wsl_systemd／devices 為 advisory（缺少不致命，不拉低整體 ok）。\n"
+            "Linux：systemd／wsl_systemd／devices／serialwrap_minicom_on_path／jq_on_path／\n"
+            "minicom_on_path 為 advisory（缺少不致命，不拉低整體 ok；#149）。\n"
             "Windows：serialwrap_on_path／serialwrapd_on_path／daemon_endpoint／devices 為 advisory。"
         ),
         formatter_class=argparse.RawTextHelpFormatter,
