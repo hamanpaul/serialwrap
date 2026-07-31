@@ -137,3 +137,31 @@ def test_boards_missing_attributed_to_windows_daemon():
 def test_boards_missing_without_windows_attribution_unchanged():
     ok, problems = preflight.evaluate(_checks(boards_ready=["COM0"]))
     assert not ok and any("COM1" in p and "windows_daemon" not in p for p in problems)
+
+
+class _FakeSwDoctor:
+    """_doctor_ok 專用假 SwCli：只回應 doctor。"""
+
+    def __init__(self, checks):
+        self._checks = checks
+
+    def run(self, *args, **kwargs):
+        assert args == ("doctor",)
+        return {"ok": True, "checks": self._checks}
+
+
+def test_doctor_ok_tolerates_advisory_red():
+    """advisory 項（如 #148 wal_dir WARN）ok=False 不得觸發 suite-refuse。"""
+    checks = [
+        {"check": "python", "ok": True, "advisory": False},
+        {"check": "wal_dir", "ok": False, "advisory": True},
+    ]
+    assert preflight._doctor_ok(_FakeSwDoctor(checks)) is True
+
+
+def test_doctor_ok_refuses_on_real_red():
+    checks = [
+        {"check": "python", "ok": True, "advisory": False},
+        {"check": "dialout", "ok": False, "advisory": False},
+    ]
+    assert preflight._doctor_ok(_FakeSwDoctor(checks)) is False

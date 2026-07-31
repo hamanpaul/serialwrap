@@ -348,6 +348,20 @@ def _check_wal_dir() -> dict:
     }
 
 
+# advisory 檢查名單（單一事實來源；sw_core/cli.py re-export 沿用）：這些項 ok=False
+# 僅屬 WARN 性質，不拉低 doctor 整體 ok；機器消費者（realhw/regression preflight 的
+# 「doctor 全綠」判定）依 run_doctor 蓋章的 per-check `advisory` 欄位識別，
+# 避免 advisory WARN（如 #148 的 shell/daemon WAL_DIR 不一致提醒）誤觸 suite-refuse。
+DOCTOR_ADVISORY_CHECKS = frozenset({
+    "systemd", "wsl_systemd", "devices", "other_serialwrap_installs", "wal_dir",
+    "serialwrap_minicom_on_path", "jq_on_path", "minicom_on_path",
+})
+DOCTOR_ADVISORY_CHECKS_WIN = frozenset({
+    "serialwrap_on_path", "serialwrapd_on_path", "daemon_endpoint",
+    "devices", "other_serialwrap_installs", "wal_dir",
+})
+
+
 def run_doctor(fx=None, home=None, *, platform: str | None = None) -> list[dict]:
     """執行所有環境檢查並回傳結果清單（每項皆唯讀、永不拋例外）。
 
@@ -367,11 +381,19 @@ def run_doctor(fx=None, home=None, *, platform: str | None = None) -> list[dict]
     """
     fx = fx if fx is not None else SystemEffects()
     plat = platform if platform is not None else sys.platform
+    advisory = DOCTOR_ADVISORY_CHECKS_WIN if plat.startswith("win") else DOCTOR_ADVISORY_CHECKS
+
+    def _stamp(report: list[dict]) -> list[dict]:
+        # per-check 蓋章 advisory：機器消費者（preflight）據此不把 WARN 當 FAIL。
+        for item in report:
+            item["advisory"] = item.get("check") in advisory
+        return report
+
     if plat.startswith("win"):
         # Windows 單例由 WindowsSingletonLock（msvcrt 檔鎖 + TCP probe）強制，
         # 無 /proc 可掃 → 不移植 single_daemon；dialout/systemd/wsl_systemd 不適用。
         win_path_hint = "將 serialwrap.exe / serialwrapd.exe 所在目錄加入 PATH"
-        return [
+        return _stamp([
             _check_python(),
             _check_pyyaml(),
             _check_pyserial(),
@@ -382,8 +404,8 @@ def run_doctor(fx=None, home=None, *, platform: str | None = None) -> list[dict]
             _check_daemon_endpoint(),
             _check_wal_dir(),
             _check_devices_windows(),
-        ]
-    return [
+        ])
+    return _stamp([
         _check_python(),
         _check_pyyaml(),
         _check_on_path(fx, "serialwrap"),
@@ -409,4 +431,4 @@ def run_doctor(fx=None, home=None, *, platform: str | None = None) -> list[dict]
         _check_wal_dir(),
         _check_devices(),
         _check_wsl_systemd(fx),
-    ]
+    ])

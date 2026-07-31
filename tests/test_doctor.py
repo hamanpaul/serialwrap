@@ -416,3 +416,19 @@ class TestWalDirCheck:
             linux = {i["check"] for i in run_doctor(fx=FakeEffects(systemd=True, in_groups={"dialout"}), platform="linux")}
             win = {i["check"] for i in run_doctor(fx=FakeEffects(systemd=False, in_groups=set()), platform="win32")}
         assert "wal_dir" in linux and "wal_dir" in win
+
+
+class TestAdvisoryStamp:
+    """run_doctor 對 per-check 蓋章 advisory 欄位（機器消費者契約，#148 整合修正）。"""
+
+    def test_linux_report_carries_advisory_field(self):
+        report = run_doctor(fx=FakeEffects(systemd=True, in_groups={"dialout"}), platform="linux")
+        by_name = {c["check"]: c for c in report}
+        assert by_name["wal_dir"]["advisory"] is True
+        assert by_name["python"]["advisory"] is False
+
+    def test_windows_report_carries_advisory_field(self):
+        report = run_doctor(fx=FakeEffects(systemd=False, in_groups=set()), platform="win32")
+        by_name = {c["check"]: c for c in report}
+        assert by_name["wal_dir"]["advisory"] is True
+        assert by_name["python"]["advisory"] is False

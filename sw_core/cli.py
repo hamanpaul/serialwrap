@@ -23,7 +23,7 @@ from .constants import (
     PROFILE_DIR,
     SOCKET_PATH,
 )
-from .doctor_cmd import run_doctor
+from .doctor_cmd import DOCTOR_ADVISORY_CHECKS, DOCTOR_ADVISORY_CHECKS_WIN, run_doctor
 from .platform_backends import select_rpc_backend
 from .runtime_config import RuntimeConfig
 from .service_ctl import service_action
@@ -676,21 +676,13 @@ def _dispatch_event(args: argparse.Namespace) -> int:
 # 就緒檢查組，與 devices／systemd 同哲學——純 agent-only headless 部署不需要
 # human console，缺席不該拉低整體 ok（但 realhw／regression 的 preflight 各自
 # 用 all() 硬性把關，兩層各司其職，見 #149 design risks）。
-_DOCTOR_ADVISORY_CHECKS = {
-    "systemd", "wsl_systemd", "devices", "other_serialwrap_installs", "wal_dir",
-    "serialwrap_minicom_on_path", "jq_on_path", "minicom_on_path",
-}
+# 單一事實來源移至 doctor_cmd（run_doctor 會對 per-check 蓋章 `advisory` 欄位，
+# 供 preflight 類機器消費者識別 WARN；此處 re-export 維持既有名稱與測試相容）。
+_DOCTOR_ADVISORY_CHECKS = DOCTOR_ADVISORY_CHECKS
 # Windows（#131）：PATH／daemon endpoint／裝置皆 advisory（未起 daemon、exe 未入 PATH
 # 不致命）；pyserial 為 Windows 序列埠後端硬依賴 → 非 advisory。
 # wal_dir（#148）：shell/daemon WAL_DIR 不一致僅 WARN，不拉低整體 ok。
-_DOCTOR_ADVISORY_CHECKS_WIN = {
-    "serialwrap_on_path",
-    "serialwrapd_on_path",
-    "daemon_endpoint",
-    "devices",
-    "other_serialwrap_installs",
-    "wal_dir",
-}
+_DOCTOR_ADVISORY_CHECKS_WIN = DOCTOR_ADVISORY_CHECKS_WIN
 
 
 def _run_skill(args: argparse.Namespace) -> int:

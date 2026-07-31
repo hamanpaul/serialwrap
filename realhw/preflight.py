@@ -129,9 +129,14 @@ def _git_behind(repo_root: Path) -> int:
 
 
 def _doctor_ok(sw) -> bool:
+    """doctor 全綠判定；advisory 項（run_doctor 蓋章 `advisory: true`，如 #148 的
+    shell/daemon WAL_DIR 不一致 WARN）不視為 FAIL——WARN 誤觸 suite-refuse 會讓
+    有 legacy env export 的 bench 永遠拒跑。"""
     doc = sw.run("doctor")
     checks = doc.get("checks") or []
-    return bool(checks) and all(c.get("ok", False) for c in checks)
+    return bool(checks) and all(
+        c.get("ok", False) or c.get("advisory", False) for c in checks
+    )
 
 
 def _tools_missing(cfg: dict) -> list[str]:
