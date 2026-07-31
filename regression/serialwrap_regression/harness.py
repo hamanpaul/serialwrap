@@ -38,6 +38,9 @@ def register(case: Case) -> Case:
 
 def load_registry() -> list[Case]:
     """import cases package 觸發全部 register()（process-wide、冪等），回傳淺拷貝。"""
+    from serialwrap_regression.preflight import ensure_realhw_importable
+
+    ensure_realhw_importable()  # cases 檔頂層 import realhw.harness.CaseResult 需要
     from serialwrap_regression import cases  # noqa: F401  觸發自動載入
 
     return list(REGISTRY)
