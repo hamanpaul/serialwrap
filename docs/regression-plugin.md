@@ -83,7 +83,7 @@ doctor 全綠、testbed 板卡 READY、tmux/minicom 存在、無殘留 throwaway
 | case | 狀態 | 原因 |
 |---|---|---|
 | `f4-background-result-tail-consistent` | **FAIL（刻意保留的紅燈哨兵）** | #159：background quiet-window 對快速完成命令整段吞輸出且回 `lost: False`——case 正確抓到產品缺陷，**勿改 oracle 遷就**；#159 修復即轉綠 |
-| `f7-binary-roundtrip-md5`／`f7-larger-file-not-truncated` | 逐板嘗試（prpl 環境性失敗→試 bcm；全板失敗才 SKIP `transfer_env_all_boards`） | #161 echo-ACK 已交付且安全網驗證正確（停滯即中止、命令未執行、`TRANSFER_ECHO_STALL` 可診斷）；prpl/COM0 仍在**固定的第 449–512 字元**停滯（調 timeout 2.0→5.0 位置不變＝回顯從未到達，屬傳輸層問題）→ **#166** 追蹤。COM1(bcm) 板端缺 `base64` applet，屬獨立板端限制 |
+| `f7-binary-roundtrip-md5`／`f7-larger-file-not-truncated` | 逐板嘗試；兩板皆 SKIP `target_tool_missing`（誠實判定） | **#166 根因翻案**：傳輸層無罪（手工 base64 往返 md5 完全一致），**兩塊 bench 板都沒有 `base64`**（PATH 與 busybox applet 皆無；`md5sum`／`openssl` 有）——協定硬依賴 `base64` 才是根因。先前 COM0「工具齊全」是探測 sentinel 誤判（命令本文含 `TOOLS_OK`、回顯即恆真，已改用 `TOOLS_$((6*7))`）。另附帶：prpl console 有 **505 字元單行上限**（超過即靜默截斷、status 仍 done），是 chunk 512 撞 `TRANSFER_ECHO_STALL` 的原因 |
 
 #156（recover CTRL_C 路徑不 flush 佇列）已修——根因＝`SessionManager` 無管道通知
 `CommandArbiter` flush，新增 `on_command_flush` callback 補上該分支（`session_manager.py`
