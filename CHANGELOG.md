@@ -4,6 +4,99 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-01
+
+### Added
+- 新增 daemon／CLI 版本可診斷性（#154）：daemon 端 `health.status`（`daemon status`）過去完全不帶版本欄位，只有 CLI 自帶的 `_resolve_version()`（#131）可用，daemon 端無等價解析器可用（架構慣例：daemon 不依賴 cli.py 這層 client），逼得 preflight 得繞 `/proc cmdline + importlib.metadata` 才問得到 daemon 版本。修法：(1) 新模組 `sw_core/version.py`，把版本解析邏輯搬出 `cli.py`（改為重新匯出、既有呼叫點不動），供 daemon／CLI 共用；(2) `SerialwrapService.__init__` 常駐 `self._version`，`health()` 顯式帶 `version` 欄位；`rpc()` 機械改名為 `_dispatch()`，新增薄 `rpc()` wrapper 對所有 method 回應 `setdefault("version", ...)`，不需逐一 handler 加；(3) CLI 新增 `_warn_version_mismatch()`，`_run_rpc()`／`_dispatch_event()` 兩條路徑收到回應後即比對 client／daemon 版本，不一致時印一行 stderr 警告（純副作用、不擋、舊版 daemon 無此欄位時靜默略過）；(4) `sw_core/sysenv.py` 新增 `Effects.which_all()`（掃 PATH 全部相符可執行檔，`shutil.which()` 只回第一個）與 `run(..., timeout_s=...)`（doctor 對 PATH 上未知來源二進位跑 `--version` 的「永不卡住」防線）；(5) doctor 新增 `other_serialwrap_installs` 檢查（advisory），偵測同機 PATH 上多份 serialwrap 安裝版本是否一致。已知限制：doctor 檢查只看得見呼叫行程 PATH 上的安裝，絕對路徑呼叫（如 TestPilot venv）看不到，該類漂移的即時防線是 (3)。回歸 plugin：preflight 的 `daemon_version_probe()` 改為優先讀 `status.get("version")`（欄位缺席才落回原 `/proc` fallback，向下相容），新開 family **F12**（診斷保真）與 case `f12-version-reported-consistent`（`cases/f12_diagnostics.py`），驗證版本欄位悄悄消失不被 preflight 的 fallback 靜默掩蓋。
+- 新增 `serialwrap_regression` TestPilot 回歸 plugin（#155）：把已 CLOSED 且有實際修正、只有實機才驗得到的 bug 固化成 10 個 Scenario Family（F1 命令契約／F2 背壓／F3 失敗可觀測性／F4 狀態語義／F5 console 共存／F6 RPC 不凍結／F7 檔案傳輸／F8 daemon 單一性／F9 開機-U-Boot／F10 登入帳密）約 30 個實機回歸 case。含 #154 防線（testbed pin `serialwrap_exe`＋preflight client↔daemon 版本 gate）、`allow_destructive` gate、U-Boot 唯讀護欄（`UBootConsole` 白名單）、`ThrowawayDaemon` 隔離；realhw `SwCli` 支援注入執行檔路徑（預設行為不變）。文件：README「TestPilot 回歸測試」雙語章節、`docs/regression-plugin.md`（family↔issue 對照＋新增 case SOP）、CLAUDE.md 條件式回歸 case 政策。
+
+### Changed
+- 同步 hamanpaul project policy 1.0.14 → 1.0.15：`.project-policy.yml`、`Policy Check` workflow **與** `Publish Release` workflow（`uses:` 與 `policy_engine_ref` 雙重釘選至 `a764806046c410eb4f254ac0b6a8aec8b7559dab`）、canonical `CLAUDE.md`（symlink `AGENTS.md` / `GEMINI.md` / `.github/copilot-instructions.md` 自動跟隨，含內文兩處內嵌 pinned SHA 安裝指令引用）全數同步至 v1.0.15。
+
+### Fixed
+- 自發重開機過渡態的 agent 顯式命令 gate（#139，收斂 #130 Finding 4 已知架構限制）：DUT 自發重開機（或過早 READY 競速）時 session 名義上仍停 `READY`，agent 顯式命令過去被放行、bytes 落入 U-Boot autoboot 倒數窗打斷開機、10s 後以 `PROMPT_TIMEOUT` 吞掉。修正：(1) 新常數 `ERROR_AUTOBOOT_QUIET`（字串沿用 self-test classification `AUTOBOOT_QUIET`，統一單一常數）；(2) **submit-time gate（第一層）**——`service._resolve_session_id` 增 `source` 參數，非 human 來源且 `boot_quiet_remaining_s` 非 null 時即時拒絕（附 `retry_after_s`＋session dict、不產生 cmd_id），`command.submit`／`file.push`／`file.pull` 三呼叫端傳入實際 source；(3) **execute-time gate（第二層）**——`execute_command`／`file_push`／`file_pull` locked 開頭補同語意 gate，堵「submit 通過後 banner 才到、命令已在 arbiter queue」的競態（arbiter 把 error_code 寫回、`cmd status` 可觀測、零 UART 副作用、可重送）；(4) **READY ⇒ 清除 gate（相容性關鍵）**——四個 READY 轉移點（`_probe_existing_bridge`／`_attach_by_id` 兩路徑／`_spawn_reboot_recovery`）同 locked 區塊 `clear_boot_quiet()`，另 `_handle_reboot_command`「板其實沒重開」提前返回分支補清（belt-and-suspenders），保證「READY 後立即 submit 必成功」恆真、gate 生效窗口精確等於過渡態；human console／interactive lease 循 #130 慣例永不 gate（#114 刻意進 bootloader 相容）。README（en/zh）、`docs/serialwrap-spec.md` §9.3、SKILL.md 同步改寫。回歸 plugin：F9 新增 `f9-spontaneous-reboot-agent-gated`（destructive，human console reboot 模擬自發重開機、驗雙層 gate 與 READY 後重送），`f9-quiet-window-agent-passthrough` 增 `AUTOBOOT_QUIET` 有界重試（stale-READY 窗訊號），oracle 本體「（真）READY 後命令必須成功」不變。
+- 新增 `serialwrap doctor` 的 `wal_dir` 診斷項並修正誤導性文件（#148）：systemd 託管的
+  daemon 不會繼承 shell 匯出的 `SERIALWRAP_WAL_DIR`（`render_system_unit()` 產生的 unit
+  本就不含對應 `Environment=` 那一行，`.bashrc` 的 export 對它無效），daemon 仍照自己
+  解析出的預設路徑（XDG state home）持續寫入；使用者卻常誤把 `SERIALWRAP_WAL_DIR` 指到
+  `~/b-log`（那其實是 §10.4 agent on-demand capture 目錄，語意完全不同），造成「我以為
+  WAL 在 A，daemon 實際寫在 B」的落差，且舊版 `doctor` 完全沒有任何一項能揭露 daemon
+  實際生效的 WAL 路徑，只能用猜的。
+  
+  修法：`sw_core/doctor_cmd.py` 新增 `_check_wal_dir()`——經既有 `health.status` RPC
+  （0.5s 短逾時、`rpc_call` 永不拋例外）讀 daemon 實際回報的 `wal_path`，與 shell 端
+  `SERIALWRAP_WAL_DIR`（若有顯式覆寫）比對：daemon 未在跑／連不上時降級為 informational
+  （`ok=True`，doctor 常在啟動 daemon 前執行，「連不到」本身不是這項要抓的錯誤）；一致
+  或無 shell 覆寫時 `ok=True`；不一致時 `ok=False` 並在 `fix` 附 systemd `Environment=`
+  與 on-demand 重啟兩種修復指引。掛入 Linux（`single_daemon` 之後、`devices` 之前）與
+  Windows（`daemon_endpoint` 之後、`devices` 之前）兩份檢查清單；`cli.py` 的
+  `_DOCTOR_ADVISORY_CHECKS`／`_DOCTOR_ADVISORY_CHECKS_WIN` 同步加入 `wal_dir`，避免
+  shell/daemon 不一致把整體 `doctor` 的 `ok` 拉成 `false`（WARN 語意，不擋）。
+  
+  同時修正 `README.md`（英/繁中 Logs and Evidence／日誌與輸出章節＋既有誤導範例）與
+  `docs/serialwrap-spec.md` §10.2（過期的 `/tmp/serialwrap/wal/` 預設路徑敘述＋主動建議
+  把 `SERIALWRAP_WAL_DIR` 指到 `~/b-log` 的誤導範例），明確區分「WAL（權威）」與
+  「`~/b-log`（agent on-demand capture）」兩種用途，並說明 systemd daemon 不繼承 shell env
+  的行為。
+  
+  回歸 plugin：`f12-wal-path-live`（`cases/f12_diagnostics.py`，F12 診斷保真 family，
+  非破壞性）驗證 `daemon status` 的 `wal_path` 真實存在、送一筆命令後 mtime 前進（非死
+  路徑），以及 `doctor` 報告含 `wal_dir` 檢查項；`docs/regression-plugin.md` 的 F12 對照
+  列同步補上 #148。
+- 補齊 `serialwrap doctor` 的 human console 就緒檢查組，並修正 README 自相矛盾的
+  `minicom` 範例（#149）：`doctor` 過去只驗 `serialwrap`／`serialwrapd` 是否在 PATH，
+  完全沒驗證 `serialwrap-minicom`（human console broker wrapper 本體）、`jq`、`minicom`
+  （`sw_core/assets/tools/minicom_router.sh` 的執行期依賴）是否就緒——doctor 全綠不代表
+  human console 真能動。同時 `README.md` 繁中「多 minicom 使用」段落自 2026-06-22 改名
+  commit 起就帶著 stale code block（`minicom` / `minicom -D /dev/ttyUSB0` 等未改名的
+  裸指令），與同段落下方「不要直接打 `minicom`」的警語自相矛盾，讀者照抄該 code block
+  正好重現本 issue 的錯誤重現步驟。
+  
+  修法：(1) `sw_core/doctor_cmd.py` 的 `_check_on_path()` 新增 keyword-only
+  `check_name` 參數（既有呼叫端 100% 相容），供 `serialwrap-minicom` 產生底線命名
+  `serialwrap_minicom_on_path`；Linux 檢查清單於 `dialout` 之後、`systemd` 之前插入
+  `serialwrap_minicom_on_path`／`jq_on_path`／`minicom_on_path` 三項（純 `fx.which()`
+  查表、無 I/O 副作用）。(2) `sw_core/cli.py` 的 `_DOCTOR_ADVISORY_CHECKS` 納入新三項
+  （與 `devices`／`systemd` 同哲學：headless agent-only 部署不需要 human console，缺席
+  不拉低整體 `ok`）；`_run_setup()` payload 新增 `console_hint` 主動提示
+  `serialwrap-minicom COMx`；`doctor` 子命令 help／description 同步補一句（R-16）。
+  (3) `README.md`：英文 Prerequisites／Quick Start 補走 wrapper 的提示與範例；繁中
+  `## 依賴`／`## 快速開始`（含結尾同名的 `## 安裝` 附錄區塊）把 `serialwrap-minicom`
+  提示提升為第 2 條並加粗；`## 多 minicom 使用` 段落的 stale code block 全面改用
+  `serialwrap-minicom`，並在最後一行加註解澄清「僅示意 wrapper 內部 fallback 語意」，
+  消除與下方警語的自相矛盾；`serialwrap --help` 的 `cli-help` marker 區塊（R-16 pinned）
+  同步以實際指令輸出重新產生。
+  
+  真機驗證：本變更 100% 由 pytest 覆蓋（3 個新 check 為純 `fx.which()` 查表，
+  `FakeEffects` 可完全模擬每種 PATH 組合；不涉及 daemon/PTY/UART，不符合
+  `docs/regression-plugin.md` 的 realhw case 定位），故未新增 TestPilot
+  `serialwrap_regression` case；`docs/func-test/realhw-stability-checklist.md` 的
+  `p0-doctor` row 追加 `serialwrap-minicom --help` 手動等效命令與新三項 check 的驗收
+  判定，讓既有 bench smoke 近似「免費」獲得覆蓋。
+  
+  已知風險（見 PR 描述）：`realhw/preflight.py::_doctor_ok()` 與
+  `regression/serialwrap_regression/preflight.py` 皆用 `all()`（不分 advisory）判定
+  suite-refuse，新 `jq_on_path` 一旦落地會讓「bench 是否裝了 jq」首次成為真機測試套件
+  的 preflight 硬門檻——本批次僅以 pytest 驗證（任務範圍禁止對 live daemon 做
+  attach/console 等寫操作），**合併前仍建議在真機 bench 手動跑一次 `serialwrap doctor`
+  確認新三項皆 `ok:true`**，避免 realhw／regression suite 意外全面拒跑。
+- Transport stall 分類與觀測面（#150）：WSL2＋usbip 偶發 USB read-endpoint stall（TX 通、RX 全凍，dmesg `urb stopped: -32`）過去被折疊進 `PROMPT_UNAVAILABLE`／`LOGIN_PROMPT_TIMEOUT`，誤導 operator 去 power-cycle DUT 或反覆 recover（皆無效）。新增：(1) 純偵測模組 `sw_core/transport_stall.py`——probe 全程零 raw RX（連 echo 都無，`UARTBridge.rx_total_bytes()` 新計數器取差）＋該 session 曾有 RX＋`last_rx_age_s >= 30s` 才翻轉為新錯誤碼 **`TRANSPORT_STALL`**（與 #153 RX_FLOOD 高 RX 特徵天然互斥）；(2) 三個 probe 落地點（`_probe_existing_bridge`／`_attach_by_id`／`_attach_by_id_dynamic`）經單一 choke point `_refine_probe_failure` 精煉，boot-quiet 合成錯不精煉；(3) `last_error_detail` 新欄位附可複製的 host 層復原指令（USB busid authorized 0→1 toggle／usbipd detach+attach），`last_error` 改 property、值變更自動清 detail；一次性 log＋WAL META（`transport_stall_suspected`，RX 恢復重臂）；(4) session 公開 dict 新增 `last_rx_age_s`／`last_tx_age_s`（RX 單邊凍結一眼可判，`idle_for_ms` 看不出）；(5) `TRANSPORT_STALL` 保留自動重探資格（RX 恢復即自癒回原分類或 READY）；`minicom_router.sh`／SKILL.md／README（含 WSL2+usbip 復原 SOP）同步。回歸 plugin F11 新增 `f11-last-rx-age-sane` 觀測面 case（真 usbip stall 依 #155 裁定排除自動化、heuristic 由 pytest 覆蓋）。
+- RX 洪水分類（#153）：console 被大量輸出灌爆時，probe 失敗過去被折疊進 `PROMPT_UNAVAILABLE`／`TARGET_UNRESPONSIVE`（「灌爆」與「死了」擠同一碼），上層被誤導去重建 session 而非等排空。新增：(1) `UARTBridge` RX 速率統計視窗（`rx_stats()`，最近 10s raw bytes，含 ANSI）；(2) `login_fsm` 兩個公開出口（`probe_ready`／`ensure_ready`）統一反分類——probe 失敗且 `rx_bytes_last_10s >= 20000`（`RX_FLOOD_BYTES_PER_10S`）時回新錯誤碼 **`RX_FLOOD`**（`LOGIN_REQUIRED`／`CREDENTIALS_*` 永不被遮蔽）；(3) self-test 於洪水中回 `classification=RX_FLOOD`＋`recommended_action=wait`（ATTACHED 與 READY nonce probe 兩分支，BOOTLOADER 優先序不變）；(4) `RX_FLOOD` 保留自動重探資格——洪水中 RX-idle 閘天然退避、排空後 3s 內自動接手升 `READY`（自癒）；(5) session 公開 dict 新增 `rx_bytes_last_10s`／`rx_rate_bps` 欄位；`minicom_router.sh`／SKILL.md／README 契約同步。回歸 plugin 新增 F11 family 與 `f11-flood-probe-classified`（destructive）實機 case。
+- 修復 `session recover`／命令逾時內部觸發 recovery 時，CTRL_C/CTRL_D 攔截成功路徑不 flush 舊佇列的缺口（#156）：`#128` 建立的 flush 機制唯一掛點是「detach」事件（`_on_detached` → `CommandArbiter.unregister_session`），但 `SessionManager._recover_after_failure()` 的 CTRL_C/CTRL_D 攔截成功分支語意是「session 沒有真的離線」，全程停留 `READY`、不觸發 detach，因而天生跳過既有 flush 路徑——該 session 尚未啟動的排隊命令永久卡在 `accepted`，佔用 `CMD_PENDING_MAX` 額度，之後每次 submit 連鎖 `SESSION_QUEUE_FULL`。`session.recover` RPC 在 `READY` 狀態下沿用同一段程式碼，受相同缺口影響。
+  
+  修法：`SessionManager` 新增第 4 個建構子 callback `on_command_flush: Callable[[str, str], None] | None`（預設 `None`，向下相容）；CTRL_C/CTRL_D 攔截成功分支於鎖外顯式呼叫 `self._on_command_flush(session.session_id, "FLUSHED_BY_RECOVERY")`，補上與 detach 路徑相同的終態語意。`SerialwrapService` 新增 `_on_command_flush()` 方法，直接委派 `CommandArbiter.flush_session()`（既有公開方法，`arbiter.py` 本身無需改動）。刻意不動「human interactive promotion」分支（`source.startswith("human:")`）：那是暫時把 raw 控制權交給人類，不是宣告佇列作廢，其餘排隊命令在人類結束 interactive lease 後仍是合法待執行工作。
+  
+  回歸 plugin：`f2-recovery-flushes-queue`（`issues` 疊加 `#156`）的排空 oracle 由首輪實測時因本缺口被迫放寬的 30s 收緊為 10s 嚴格斷言；相關歷史註解（`f2_queue_full_backpressure` 收尾、module docstring）同步更新為「已修復」。
+- 修復 `file.push`／`file.pull` 每段等待逾時寫死常數、與 profile 完全脫鉤（#157）：`SessionManager.file_push()` 原固定 `timeout_s=10.0`（`file_pull()` 固定 30.0），即使 bcm 類慢板已把 `profile.timeout_s` 調大也從未生效。改為未顯式指定時沿用 `profile.timeout_s`（push 夾 5.0s、pull 夾 30.0s 地板），並於 CLI（`--chunk-timeout`）／RPC（`chunk_timeout_s`）開放顯式覆寫。同時將 `DEFAULT_CHUNK_SIZE` 由 2048 降為 512（單行 base64 命令 ~2789 字元在真機 UART console 實證會被截斷——issue 附 WAL 證據；512B → 單行 ~741 字元，~3.8x 安全餘裕；此值為依截斷證據反推的保守估計、非真機量測值），四處各自硬寫的 2048 收斂為 `sw_core/file_transfer.py` 單一常數。`file.push` RPC 對 `chunk_size<=0` 夾 `max(1, ...)` 防呆，避免 `ValueError` 穿越 RPC 邊界。已知殘留缺口（#157 範圍外）：`pull_file` 不分段一次讀全部，受 RX 視窗 128KiB 上限（`sw_core/uart_io.py`）限制，base64 輸出超過上限的大檔 pull 仍會 `PULL_PARSE_FAILED`，`f7-larger-file-not-truncated` 因此仍預期 SKIP，待 follow-up。
+- 修復 RX 視窗有界修剪破壞 offset 語意（#158）：`UARTBridge` 的 `_rx_text` 觸頂（131072 字元）修剪前端但不記帳，使 `rx_snapshot_len()` 飽和後恆等於視窗上限、`wait_for_regex_from()`／`rx_text_from()` 以舊 offset 切片永遠空字串——prompt 永不匹配 → 快速命令迴圈於百次級必中 PROMPT_TIMEOUT（stdout 空），且 recovery 同因匹配不到 CTRL_C 拿回的 prompt 而續送 CTRL_D 誤登出 console。改為**絕對串流偏移**記帳：新增 `_rx_trimmed`（修剪／clear 累計丟棄量，單調不減），`rx_snapshot_len()` 回傳絕對偏移、切片 API 每次持鎖重算相對偏移，頭段已修剪時降級回傳現存全窗；`clear_rx_buffer()` 亦推進基準保持單調（同時修復飽和下 RX 靜默偵測恆真的隱性誤判）。`bridge.snapshot()` 新增 `rx_dropped_chars` 欄位供鑑識。回歸 plugin：`f2-history-bounded-rss` 收緊為零容忍（移除 ≤3 次 PROMPT_TIMEOUT 容忍，恢復即紅），新增決定性重演 case `f2-rx-window-crossing-prompt`（awk 大輸出推飽和 RX 視窗後連發短命令，驗證 prompt 跨界不失效）。
+- 修復 background 模式快速完成命令整段輸出遺失且回 `lost: False` 假保證（#159）：複合根因——`BackgroundCapture` 在 prompt 比對成功「之後」才回溯建立（快速完成命令的全部輸出都落在建立之前，`chunks` 恆空）、`_on_bridge_rx` 用 `foreground_busy` gate 連坐擋掉 background capture 的 RX 累積（bg 命令自己的等待視窗內 `foreground_busy=True`）、`maybe_finalize()` 的 quiet-window 活動時鐘建立在從未被真實餵過資料的空殼物件上（首次輪詢即誤判 `done`）。修法三段：capture 於命令送出「之前」掛好（`from_seq` 語意由「TX 寫入 WAL 後」略前移為「TX WAL 記錄本身」，metadata 精度差異）；`_on_bridge_rx` 的 background 累積迴圈移到 `foreground_busy` gate 之前（agent-log capture 維持原 gate 行為）；`_set_terminal_capture_locked` 僅「先前未掛載」（line 模式逾時）分支回填 chunks，避免 CTRL_C 復原路徑對已即時累積的 capture 全量重讀重複疊加。修後 `last_activity_mono` 被真實 RX 正確推進、quiet-window 判定誠實，`dropped_chunks`／`lost` 如實反映唯一剩餘遺失來源（環形上限主動丟棄）。回歸 plugin：`f4-background-result-tail-consistent` oracle 不變，hints 改註「#159 已修，本 case 為其常駐回歸防線」。
+- 修復 `file.push` 在無流控（`flow_control: none`）真機 console 上被節流靜默掉字（#161，#157 真機驗收揭露的更深根因——512B chunk 的 echo 於 ~73% 處斷掉）：新增 `UARTBridge.send_command_echo_paced()` 原語，把 chunk 命令行拆成 64 字元短 slice 逐段送出，每段等板端 echo 回讀確認（`_await_echo_progress()` 以 strip-ANSI＋去 CR/LF 正規化、移動起點 find 逐 slice 比對，吸收 slice 間 printk 噪音）才續送——echo 即天然的應用層流控；**全行確認後才送換行**，故 echo 停滯時命令必未執行，以 `cancel_input_line()`（Ctrl-U＋換行）清半行復原後回新錯誤碼 `TRANSFER_ECHO_STALL`（含 `chunks_sent`／`acked_chars` 診斷欄），可安全重試。`push_file()` 以 `ack_mode` 選路：`auto`（預設，bridge 支援即節流、否則 legacy 不破第三方 fake bridge）／`echo`（強制，缺原語回 `ECHO_ACK_UNSUPPORTED`）／`none`（legacy 整行送出，急件換吞吐）；CLI（`--ack-mode`）／RPC（`ack_mode`，白名單驗證）打通，#157 的 `chunk_size`／`chunk_timeout_s` 參數面與優先序完整保留。WAL 維持一命令一筆 TX。F7 回歸案：`transfer_echo_stall` 獨立 reason_code（不併一般逾時）、1MB 案 timeout 調升 1500s（echo-paced 約 10–17 分）。已知限制（範圍外、待另開 issue）：pull 側受 RX 視窗 128KiB 上限，1MB pull 仍 `PULL_PARSE_FAILED`。
+  
+  **review 收斂＋實機調校**：(1) `send_command_echo_paced` 的 `cmd.rstrip("\n")` 改 `rstrip("\r\n")`（Copilot review）——CRLF 結尾的命令會把 `\r` 留在 body 尾端當命令本文送出，板端多半直接當換行執行命令（早於本原語自己送的 `\n`），破壞「全段確認才送換行＝停滯時命令未執行＝可安全重試」的核心不變量；且 `_await_echo_progress` 的比對已把 RX 的 CR/LF 正規化掉，該字元永遠 ack 不到、必然假性 stall。(2) `push_file()` 模組入口補 `ack_mode` 白名單（Copilot review），非法值回 `INVALID_ARGS`（形狀與 RPC 層一致、另附 `ack_mode`）——`push_file` 亦被 `SessionManager.file_push` 與非 RPC 呼叫端直接呼叫，只在 RPC 層驗證會讓 `ack_mode="ehco"` 這類手誤從那些路徑漏進來、**靜默降級**成 legacy 整行送出而失去無流控保護。(3) echo 逾時調校：`DEFAULT_ECHO_TIMEOUT_S` 2.0 → **5.0**，並由 `SessionManager.file_push` 依 profile `timeout_s` 推導（`max(profile.timeout_s, _MIN_FILE_ECHO_TIMEOUT_S)`，比照 #157 `chunk_timeout_s`；新增可選參數 `echo_timeout_s=None`）——實機兩案都在**第 8 個 slice（448/512 字元）確定性卡住**，固定的失敗位置說明不是隨機掉字，而是板端累積輸入到某長度後 echo 延遲超過 2s，被誤判成停滯；bcm 類已調大 `timeout_s` 的慢板因此自動放寬。調高只影響失敗路徑的等待上限，成功路徑吞吐不變。
+- quiet 清空改綁 READY 再確認（#162，f9-spontaneous 紅燈哨兵根修）：連續重開機後，agent 第一個命令的 stdout 吃到 prpl/OpenWrt askconsole「Please press Enter to activate this console」啟用 banner、命令文字被 askfirst 吞掉（status=done 假成功、marker 遺失）。設計實證推翻 issue 原假說——污染不是 RX buffer 殘留，而是 askconsole 提示既不匹配 `login_regex` 也不匹配 `prompt_regex` → quiet window 只能靠 180s 過期清空，期間 session 名義 `READY` 且 reprobe 跳過 READY、無人重新確認，過期即開 gate。修正：(1) `SessionRuntime` 新增 transient `ready_reconfirm_pending`（`arm_boot_quiet()` 置 True；不進 `_save_state`），`to_public_dict()` 新增同名欄位（additive）；(2) **agent gate 改判統一入口 `agent_gate_active()`**（`boot_quiet_active() or ready_reconfirm_pending`）——execute-time 三處（`execute_command`／`file_push`／`file_pull`）與 submit-time（`service._resolve_session_id`，pending-only 時 `retry_after_s` 固定 `READY_RECONFIRM_RETRY_S=5.0`、hint 改「等 daemon 重新確認 READY 後重送」，回應形狀不變）；(3) **解除唯一路徑＝READY 確認點呼叫新 `confirm_ready()`**（`clear_boot_quiet()`＋清 pending）——`_probe_existing_bridge` ok／`_attach_by_id` 兩路徑 READY 落定／`_spawn_reboot_recovery` ok／`_handle_reboot_command` 2s prompt-return／`_self_test_impl` READY nonce 成功共六點；quiet 的 RX prompt 解除與過期維持只清 TX 靜默維度；(4) **reprobe 引擎新增 READY 再確認分支**——`_prepare_reprobe_locked`／`_reprobe_target_still_valid_locked` 放行「READY＋pending 且 quiet 已結束」的確認 probe（沿用既有 RX-idle／backoff／human-active／single-flight 守衛），probe 的 `\n`＋nonce 順帶消耗 askconsole 啟用 banner，成功即 `confirm_ready()`、失敗誠實降 `ATTACHED`；`_probe_existing_bridge` quiet 早退分支對 `state==READY` 不再覆寫 `last_error=PROMPT_UNAVAILABLE`。回歸 plugin：`f09` 的 `_wait_quiet_cleared` 加等 `ready_reconfirm_pending` 歸 False（舊 daemon 無欄位→falsy 向下相容），`f9-spontaneous-reboot-agent-gated` 由紅燈哨兵改記常駐防線。README（en/zh）、`docs/serialwrap-spec.md` §9.3、`docs/regression-plugin.md`、SKILL.md 同步。
+  
+  **回歸修（實機事故 2026-07-31，f9-quiet-window-agent-passthrough 9 分鐘零收斂）**：初版 #162 引入三個缺陷，本次一併修正並補回歸測試。(A) **pending 有界化＋明確失敗終態**——`ready_reconfirm_pending` 原本只有一個 clearer（`confirm_ready()`，且要求對 UART probe 成功），沒有 deadline／attempt 上限／失敗終態；只要確認 probe 的任一守衛長期不成立（`reprobe_exhausted` latch 只在 READY **轉移**點解開、而「已經是 READY」的 session 不會再轉移／RX 洪水下 `_rx_idle_enough` 永不成立／human console 持續活躍／RX 週期性出現字面 `U-Boot` 重臂 quiet），pending 就永久 True，`AUTOBOOT_QUIET`（可重試）遂變成**永遠不可能成功的「可重試」錯誤**、把 agent driver 的重試迴圈拖進無界迴圈。新增 `ready_reconfirm_deadline`／`ready_reconfirm_attempts`／`ready_reconfirm_failed` 三個 transient 欄位、常數 `READY_RECONFIRM_MAX_S=300`（＝180s quiet＋120s，**重臂不延長 deadline**）／`READY_RECONFIRM_MAX_ATTEMPTS=5`／`ERROR_READY_UNCONFIRMED`，並新增 pending 的第二個也是最後一個 clearer`expire_ready_reconfirm()`；逾時／逾次後四個 gate（`execute_command`／`file_push`／`file_pull`／`service._resolve_session_id`）改回**不可重試**的 `READY_UNCONFIRMED`（不帶 `retry_after_s`、帶 `recommended_action="self_test"`），`to_public_dict()` additive 新增 `ready_reconfirm_failed`／`ready_reconfirm_remaining_s`。(B) **autoboot 保護涵蓋 agent-reboot 路徑**——(B1) `_recover_after_failure` 的 CTRL_C/CTRL_D gate 由「迴圈外評估一次」改為**逐 byte 重驗**：兩次寫入間隔最長 2s、恰好落在 U-Boot autoboot 3s 倒數窗內，WAL 物證顯示 CTRL-D 在 quiet armed 後 1.48s 才寫出、直接把板子留在 `=> `；(B2) banner 偵測比對窗改為「舊 tail 尾段＋**整個** chunk」（只有保存才截 256 字元），舊碼 `(tail+chunk)[-256:]` 會截掉大 chunk 的**開頭**，實機兩個含 `U-Boot` 的 banner chunk（345/354 字元）都因此漏判；(B3) `_handle_reboot_command` 的 2s prompt-return **不再**是 READY 確認點（改回只 `clear_boot_quiet()`）——prpl/OpenWrt 的 `reboot` 非同步，shell 11ms 內就重印 prompt 但板子確實在重開，舊碼的 `confirm_ready()` 是假確認、正是本次事故的入口。(C) **bootloader 卡死可診斷**——新增 `ERROR_BOOTLOADER_STUCK` 與 `UBOOT_FALLBACK_PROMPTS`；readiness probe 失敗且 RX tail 尾行命中 bootloader prompt 時落**有理由的**終態（`last_error=BOOTLOADER_STUCK`＋`reprobe_exhausted`＋pending 立即終結），取代原本「第 10 次靜默 exhausted、state/last_error 不變、不發事件」的無資訊放棄；`self_test`／`recover` 據此回`classification="BOOTLOADER"`＋`recommended_action="recover_interactive"`；profile 缺 `bootloader_prompts` 時退回 fallback 樣式（線上 prpl-template 實測就漏配），並新增 `serialwrap doctor` 的 `profile_bootloader_prompts` advisory 檢查指出配置漂移。(D) READY 再確認 probe 在寫 bytes 前先驗 bootloader 證據，命中即不送、直接落終態。
+
 ## [0.2.4] - 2026-07-20
 
 ### Added
