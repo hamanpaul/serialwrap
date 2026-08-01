@@ -24,6 +24,23 @@ _SENTINEL_END = "===SW_XFER_END==="
 # 呼叫端可經 CLI `--chunk-size`／RPC `chunk_size` 覆寫。
 DEFAULT_CHUNK_SIZE = 512
 
+# echo-ACK 節流預設（#161）：slice 64 字元、每段 echo 等待 `DEFAULT_ECHO_TIMEOUT_S`。
+# 停滯＝板端連 echo 都跟不上或 console 死結，此時換行尚未送出＝命令未執行＝可安全重試。
+DEFAULT_ECHO_SLICE_SIZE = 64
+DEFAULT_ECHO_TIMEOUT_S = 5.0
+"""單一 slice 等待 echo 回讀的預設逾時（秒）。
+
+2.0 → 5.0（#161 實機調校）：真機兩案都在**第 8 個 slice（448/512 字元）確定性卡住**
+——固定的失敗位置說明不是隨機掉字，而是板端在累積輸入到某長度後 echo 延遲超過 2s
+（printk 插隊、console 節流），2.0s 對慢板偏緊、把「還在追」誤判成「停滯」。
+5.0 為新的**下限**；實際生效值由 :meth:`SessionManager.file_push` 依 profile
+``timeout_s`` 推導（``max(profile.timeout_s, DEFAULT_ECHO_TIMEOUT_S)``，比照 #157
+``chunk_timeout_s`` 的推導精神），故 bcm 類已調大 ``timeout_s`` 的慢板自動放寬。
+調高只影響**失敗路徑**的等待上限：echo 正常到達時 `_await_echo_progress` 立即返回，
+成功路徑的吞吐不受影響。"""
+
+_ACK_MODES = ("auto", "echo", "none")
+
 
 def push_file(
     bridge: UARTBridge,
@@ -34,10 +51,38 @@ def push_file(
     timeout_s: float = 10.0,
     prompt_regex: str,
     source: str = "file_transfer",
+    ack_mode: str = "auto",
+    echo_slice_size: int = DEFAULT_ECHO_SLICE_SIZE,
+    echo_timeout_s: float = DEFAULT_ECHO_TIMEOUT_S,
 ) -> dict[str, Any]:
-    """將 host 端檔案推送到 target（透過 UART base64 分段傳輸）。"""
+    """將 host 端檔案推送到 target（透過 UART base64 分段傳輸）。
+
+    ``ack_mode``（#161）——chunk 命令行的送出方式：
+
+    - ``auto``（預設）：bridge 具 ``send_command_echo_paced`` 即走 echo-ACK 節流，
+      否則退回 legacy 整行送出（第三方／測試用 fake bridge 不破）。
+    - ``echo``：強制 echo-ACK；bridge 不支援時回 ``ECHO_ACK_UNSUPPORTED``。
+    - ``none``：維持 legacy 整行送出（急件換吞吐、放棄無流控保護）。
+
+    echo-ACK 路徑上，chunk 命令行拆成 ``echo_slice_size`` 短段逐段送出，每段等板端
+    echo 回讀確認再續送（echo 即天然應用層流控）；echo 停滯時以 ``cancel_input_line()``
+    清半行後回 ``TRANSFER_ECHO_STALL``——換行未送出＝命令未執行＝可安全重試。
+    """
+    # ack_mode 白名單（Copilot review）：與 RPC 層（service.py `file.push`）同一道
+    # 檢查，但這裡是**模組入口**——`push_file` 亦被 `SessionManager.file_push` 與
+    # 非 RPC 呼叫端（測試／未來的內部流程）直接呼叫，只在 RPC 層驗證會讓未知模式從
+    # 那些路徑漏進來並靜默降級成 legacy 整行送出（`ack_mode="ehco"` 這類手誤會悄悄
+    # 失去無流控保護）。回應形狀與 RPC 層一致（`INVALID_ARGS`），另附 `ack_mode` 便於定位。
+    if ack_mode not in _ACK_MODES:
+        return {"ok": False, "error_code": "INVALID_ARGS", "ack_mode": ack_mode}
     if not os.path.isfile(local_path):
         return {"ok": False, "error_code": "LOCAL_FILE_NOT_FOUND", "local_path": local_path}
+
+    paced_send = getattr(bridge, "send_command_echo_paced", None)
+    if ack_mode == "none":
+        paced_send = None
+    elif ack_mode == "echo" and not callable(paced_send):
+        return {"ok": False, "error_code": "ECHO_ACK_UNSUPPORTED"}
 
     data = _read_local_file(local_path)
     md5_expected = hashlib.md5(data).hexdigest()
@@ -52,7 +97,28 @@ def push_file(
         op = ">" if idx == 0 else ">>"
         cmd = f"printf '%s' '{b64}' | base64 -d {op} {shlex.quote(tmp_name)}"
         pre = bridge.rx_snapshot_len()
-        bridge.send_command(cmd, source=source, cmd_id=f"{cmd_id_prefix}-{idx}")
+        if callable(paced_send):
+            paced = paced_send(
+                cmd,
+                source=source,
+                cmd_id=f"{cmd_id_prefix}-{idx}",
+                slice_size=echo_slice_size,
+                echo_timeout_s=echo_timeout_s,
+            )
+            if not paced.get("ok"):
+                # echo 停滯：換行未送出＝命令未執行；清半行復原後回報（可安全重試）。
+                bridge.cancel_input_line(source=source)
+                _cleanup_remote(bridge, tmp_name, prompt_regex, timeout_s, source, cmd_id_prefix)
+                return {
+                    "ok": False,
+                    "error_code": "TRANSFER_ECHO_STALL",
+                    "chunks_sent": idx,
+                    "chunks_total": total,
+                    "acked_chars": paced.get("acked_chars"),
+                    "sent_chars": paced.get("sent_chars"),
+                }
+        else:
+            bridge.send_command(cmd, source=source, cmd_id=f"{cmd_id_prefix}-{idx}")
         if not bridge.wait_for_regex_from(prompt_regex, pre, timeout_s):
             _cleanup_remote(bridge, tmp_name, prompt_regex, timeout_s, source, cmd_id_prefix)
             return {

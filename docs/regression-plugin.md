@@ -61,7 +61,7 @@ doctor 全綠、testbed 板卡 READY、tmux/minicom 存在、無殘留 throwaway
 | F4 狀態語義 | #34 #26 #28 | activity 分類可區分、background result-tail 不漏不重、interactive 中 line cmd 行為明確 | 否 |
 | F5 console 共存 | #78 #7 #8 #42 #11 #53 | raw ownership 多輪 suspend/resume 不丟、deferred 不丟鍵、對端消失回收、不掛 stale pts | 否 |
 | F6 RPC 不凍結 | #80 #52 | 長操作中 `daemon status` 往返不凍結、雙板互不餓死 | 否 |
-| F7 檔案傳輸 | #21 #32 | binary round-trip md5 一致、不靜默截斷；板缺工具 SKIP | 否 |
+| F7 檔案傳輸 | #21 #32 #161 | binary round-trip md5 一致、不靜默截斷；板缺工具 SKIP；push 預設走 #161 echo-ACK 節流（echo 停滯獨立 reason_code `transfer_echo_stall`） | 否 |
 | F8 daemon 單一性 | #101 #53 | `multi_open`／`foreign_holders` 正確回報第二 daemon 與 tty 持有者 | 否 |
 | F9 開機/U-Boot | #69 #130 #139 #44 #14 #20 | autoboot 窗不被 probe 打斷、quiet window 不擋 human／真 READY 後的 agent 命令、自發重開機過渡態 agent 命令被 `AUTOBOOT_QUIET` 攔下（#139）、開機中 attach 自動 reprobe、U-Boot 停留不踢 console | **是（reboot）** |
 | F10 登入帳密 | #140 #19 | 帳密解析空→`CREDENTIALS_UNRESOLVED` 終態不送空帳密、補帳密後恢復 | **是（throwaway＋release）** |
@@ -83,7 +83,7 @@ doctor 全綠、testbed 板卡 READY、tmux/minicom 存在、無殘留 throwaway
 | case | 狀態 | 原因 |
 |---|---|---|
 | `f4-background-result-tail-consistent` | **FAIL（刻意保留的紅燈哨兵）** | #159：background quiet-window 對快速完成命令整段吞輸出且回 `lost: False`——case 正確抓到產品缺陷，**勿改 oracle 遷就**；#159 修復即轉綠 |
-| `f7-binary-roundtrip-md5`／`f7-larger-file-not-truncated` | 逐板嘗試（prpl 環境性失敗→試 bcm；全板失敗才 SKIP `transfer_env_all_boards`） | #157 已修 chunk/timeout 參數面；真機驗收揭露更深根因＝prpl console 無流控節流掉字（512B chunk echo 於 ~73% 斷）＋prpl-template 缺 `timeout_s` 未受益於推導——見 #161（逐行 ACK／流控後續） |
+| `f7-binary-roundtrip-md5`／`f7-larger-file-not-truncated` | 逐板嘗試（prpl 環境性失敗→試 bcm；全板失敗才 SKIP `transfer_env_all_boards`） | #161 echo-ACK 已交付且安全網驗證正確（停滯即中止、命令未執行、`TRANSFER_ECHO_STALL` 可診斷）；prpl/COM0 仍在**固定的第 449–512 字元**停滯（調 timeout 2.0→5.0 位置不變＝回顯從未到達，屬傳輸層問題）→ **#166** 追蹤。COM1(bcm) 板端缺 `base64` applet，屬獨立板端限制 |
 
 #156（recover CTRL_C 路徑不 flush 佇列）已修——根因＝`SessionManager` 無管道通知
 `CommandArbiter` flush，新增 `on_command_flush` callback 補上該分支（`session_manager.py`

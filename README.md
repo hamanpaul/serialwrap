@@ -263,6 +263,25 @@ serialwrap file pull --selector COM0 --remote /etc/config/wireless --local ./wir
 
 The session must be `READY`, and the target must provide `base64` and `md5sum`.
 
+On consoles without flow control (`flow_control: none`), long chunk command
+lines get throttled and characters are silently dropped. `file push` therefore
+defaults to echo-ACK pacing (#161): each chunk line is sent in short slices,
+and the next slice goes out only after the target's echo confirms the previous
+one — the newline is sent only after the whole line is confirmed, so an echo
+stall (`TRANSFER_ECHO_STALL`) means the command never executed and the push
+can be safely retried. `--ack-mode {auto,echo,none}` controls this: `auto`
+(default) paces when the bridge supports it, `echo` forces pacing, `none`
+keeps the legacy full-line send (any other value is rejected with
+`INVALID_ARGS`, at the RPC layer *and* at the `push_file()` module entry — an
+unknown mode must never silently degrade to the unpaced path). Trade-off:
+pacing costs throughput — a 1 MB push takes roughly 10–17 minutes; for urgent
+transfers on a link known to have flow control, `--ack-mode none` restores the
+fast path. The per-slice echo timeout floor is 5 s and the effective value is
+derived from the profile's `timeout_s` (`max(profile.timeout_s, 5.0)`, same
+spirit as #157's `chunk_timeout_s`), so boards with a widened `timeout_s` get a
+proportionally wider echo window. It only bounds the failure path: when echo
+arrives normally the wait returns immediately.
+
 ### MCU Firmware Workflows
 
 For external flash tools that need exclusive access to the raw UART, release the
@@ -1384,6 +1403,8 @@ serialwrap file pull --selector COM0 --remote /etc/config/wireless --local ./wir
 ```
 
 傳輸完成後自動進行 md5 校驗。Session 必須處於 `READY` 狀態，target 需有 `base64` 與 `md5sum`。
+
+無流控 console（`flow_control: none`）上，長 chunk 命令行會被節流靜默掉字。故 `file push` 預設走 **echo-ACK 節流**（#161）：chunk 命令行拆成短 slice 逐段送出，每段等板端 echo 回讀確認才續送——換行在**全行確認後**才送出，因此 echo 停滯（`TRANSFER_ECHO_STALL`）時命令必未執行、可安全重試。`--ack-mode {auto,echo,none}` 控制此行為：`auto`（預設）＝bridge 支援即節流；`echo`＝強制節流；`none`＝維持 legacy 整行送出；其餘值一律 `INVALID_ARGS`（RPC 層**與** `push_file()` 模組入口各一道，避免未知模式靜默降級成無保護的整行送出）。取捨：節流犧牲吞吐——1MB push 約 10–17 分鐘；急件且鏈路確認有流控時可用 `--ack-mode none` 走快路徑。單一 slice 的 echo 等待逾時**下限 5s**，實際值依 profile `timeout_s` 推導（`max(profile.timeout_s, 5.0)`，比照 #157 `chunk_timeout_s` 的推導精神）——實機兩案都在第 8 個 slice（448/512 字元）確定性卡住，原本的 2.0s 對慢板偏緊、把「還在追」誤判成「停滯」。此值只約束**失敗路徑**的等待上限，echo 正常到達時立即返回、成功路徑吞吐不變。
 
 詳見設計文件：[`docs/design-file-transfer.md`](./docs/design-file-transfer.md)。
 

@@ -17,9 +17,10 @@ from unittest import mock
 import sw_core.session_manager as sm_mod
 from sw_core.cli import build_parser, main
 from sw_core.config import SessionProfile, UartProfile
-from sw_core.file_transfer import DEFAULT_CHUNK_SIZE
+from sw_core.file_transfer import DEFAULT_CHUNK_SIZE, DEFAULT_ECHO_TIMEOUT_S
 from sw_core.session_manager import (
     _MIN_FILE_CHUNK_TIMEOUT_S,
+    _MIN_FILE_ECHO_TIMEOUT_S,
     _MIN_FILE_PULL_TIMEOUT_S,
     SessionManager,
 )
@@ -109,6 +110,73 @@ class TestFilePushChunkTimeout(_ManagerMixin):
         mgr, _ = self._make_mgr_ready(timeout_s=10.0)
         m = self._push(mgr)
         self.assertEqual(m.call_args.kwargs["chunk_size"], DEFAULT_CHUNK_SIZE)
+
+    def test_ack_mode_default_auto_forwarded(self) -> None:
+        """#161：未帶 ack_mode → push_file 收到 "auto"。"""
+        mgr, _ = self._make_mgr_ready(timeout_s=10.0)
+        m = self._push(mgr)
+        self.assertEqual(m.call_args.kwargs["ack_mode"], "auto")
+
+    def test_ack_mode_explicit_forwarded(self) -> None:
+        """#161：顯式 ack_mode="none" 原樣透傳。"""
+        mgr, _ = self._make_mgr_ready(timeout_s=10.0)
+        m = self._push(mgr, ack_mode="none")
+        self.assertEqual(m.call_args.kwargs["ack_mode"], "none")
+
+
+class TestFilePushEchoTimeout(_ManagerMixin):
+    """#161 實機調校：echo_timeout_s 依 profile.timeout_s 推導＋地板 5.0。
+
+    動機：實機兩案都在**第 8 個 slice（448/512 字元）確定性卡住**——固定的失敗位置
+    說明不是隨機掉字，而是板端累積輸入到某長度後 echo 延遲超過原本的 2.0s，
+    `_await_echo_progress` 把「還在追」誤判成「停滯」。推導方式比照 #157 的
+    `chunk_timeout_s`：`max(profile.timeout_s, 下限)`。
+    """
+
+    def _push(self, mgr: SessionManager, **kwargs) -> mock.Mock:
+        with mock.patch("sw_core.file_transfer.push_file",
+                        return_value={"ok": True}) as m:
+            resp = mgr.file_push("COM0", local_path="/tmp/src", remote_path="/tmp/dst",
+                                 **kwargs)
+        self.assertTrue(resp["ok"])
+        m.assert_called_once()
+        return m
+
+    def test_floor_is_five_seconds(self) -> None:
+        """地板即 DEFAULT_ECHO_TIMEOUT_S＝5.0（由 2.0 調高，#161 實機調校）。"""
+        self.assertEqual(DEFAULT_ECHO_TIMEOUT_S, 5.0)
+        self.assertEqual(_MIN_FILE_ECHO_TIMEOUT_S, DEFAULT_ECHO_TIMEOUT_S)
+
+    def test_floor_applies_on_tiny_profile_timeout(self) -> None:
+        """profile.timeout_s=1.0 極端低 → 夾到地板 5.0（不得比舊值 2.0 還緊）。"""
+        mgr, _ = self._make_mgr_ready(timeout_s=1.0)
+        m = self._push(mgr)
+        self.assertEqual(m.call_args.kwargs["echo_timeout_s"], 5.0)
+
+    def test_default_prpl_profile_timeout_derives_ten(self) -> None:
+        """prpl 預設 timeout_s=10.0 → 10.0（推導生效，不是永遠等於地板）。"""
+        mgr, _ = self._make_mgr_ready(timeout_s=10.0)
+        m = self._push(mgr)
+        self.assertEqual(m.call_args.kwargs["echo_timeout_s"], 10.0)
+
+    def test_larger_profile_timeout_widens_echo_window(self) -> None:
+        """bcm 類慢板 timeout_s=20.0 → 20.0（已調大的 profile 自動放寬 echo 等待）。"""
+        mgr, _ = self._make_mgr_ready(timeout_s=20.0)
+        m = self._push(mgr)
+        self.assertEqual(m.call_args.kwargs["echo_timeout_s"], 20.0)
+
+    def test_explicit_echo_timeout_overrides_derivation(self) -> None:
+        """顯式 echo_timeout_s=1.5 優先於推導值（可為測試/急件壓低）。"""
+        mgr, _ = self._make_mgr_ready(timeout_s=20.0)
+        m = self._push(mgr, echo_timeout_s=1.5)
+        self.assertEqual(m.call_args.kwargs["echo_timeout_s"], 1.5)
+
+    def test_echo_and_chunk_timeouts_are_independent(self) -> None:
+        """兩個推導互不干擾：顯式 chunk_timeout_s 不得連動改到 echo_timeout_s。"""
+        mgr, _ = self._make_mgr_ready(timeout_s=20.0)
+        m = self._push(mgr, chunk_timeout_s=5.0)
+        self.assertEqual(m.call_args.kwargs["timeout_s"], 5.0)
+        self.assertEqual(m.call_args.kwargs["echo_timeout_s"], 20.0)
 
 
 class TestFilePullChunkTimeout(_ManagerMixin):
@@ -215,6 +283,37 @@ class TestServiceRpcParams(unittest.TestCase):
         self.assertTrue(resp["ok"])
         self.assertEqual(m.call_args.kwargs["chunk_timeout_s"], 12.5)
 
+    def test_push_ack_mode_whitelist_rejects_unknown(self) -> None:
+        """#161：file.push ack_mode 非白名單（auto/echo/none）→ INVALID_ARGS。"""
+        base = {"selector": "COM0", "local_path": "/tmp/a", "remote_path": "/tmp/b"}
+        resp = self.svc.rpc("file.push", {**base, "ack_mode": "bogus"})
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error_code"], "INVALID_ARGS")
+
+    def test_push_ack_mode_default_and_forwarding(self) -> None:
+        """#161：不帶 ack_mode → "auto"；顯式合法值原樣透傳。"""
+        m = self._rpc_push({})
+        self.assertEqual(m.call_args.kwargs["ack_mode"], "auto")
+        for mode in ("auto", "echo", "none"):
+            m = self._rpc_push({"ack_mode": mode})
+            self.assertEqual(m.call_args.kwargs["ack_mode"], mode)
+
+    def test_pull_ack_mode_whitelist_rejects_unknown(self) -> None:
+        """#161：file.pull 同樣驗 ack_mode 白名單（介面對齊；合法值不影響行為）。"""
+        resp = self.svc.rpc("file.pull", {"selector": "COM0", "remote_path": "/tmp/b",
+                                          "ack_mode": "bogus"})
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error_code"], "INVALID_ARGS")
+
+    def test_pull_ack_mode_valid_accepted(self) -> None:
+        """#161：pull 帶合法 ack_mode 仍正常執行（驗證不轉傳、不炸）。"""
+        m = mock.Mock(return_value={"ok": True})
+        self.svc._sessions.file_pull = m
+        resp = self.svc.rpc("file.pull", {"selector": "COM0", "remote_path": "/tmp/a",
+                                          "ack_mode": "echo"})
+        self.assertTrue(resp["ok"])
+        self.assertNotIn("ack_mode", m.call_args.kwargs)
+
 
 class TestCliArgsAndParams(unittest.TestCase):
     """CLI argparse 層：--chunk-size 預設、--chunk-timeout 解析與 RPC params 組裝。"""
@@ -265,6 +364,29 @@ class TestCliArgsAndParams(unittest.TestCase):
         method, params = self._dispatch(self._PULL_ARGV)
         self.assertEqual(method, "file.pull")
         self.assertNotIn("chunk_timeout_s", params)
+
+    def test_ack_mode_default_auto(self) -> None:
+        """#161：--ack-mode 預設 auto，push/pull 皆組進 params。"""
+        args = build_parser().parse_args(self._PUSH_ARGV)
+        self.assertEqual(args.ack_mode, "auto")
+        method, params = self._dispatch(self._PUSH_ARGV)
+        self.assertEqual(params["ack_mode"], "auto")
+        method, params = self._dispatch(self._PULL_ARGV)
+        self.assertEqual(params["ack_mode"], "auto")
+
+    def test_ack_mode_explicit_parsed_and_forwarded(self) -> None:
+        """#161：--ack-mode none/echo 解析並組進 RPC params。"""
+        method, params = self._dispatch([*self._PUSH_ARGV, "--ack-mode", "none"])
+        self.assertEqual(method, "file.push")
+        self.assertEqual(params["ack_mode"], "none")
+        method, params = self._dispatch([*self._PULL_ARGV, "--ack-mode", "echo"])
+        self.assertEqual(method, "file.pull")
+        self.assertEqual(params["ack_mode"], "echo")
+
+    def test_ack_mode_invalid_choice_rejected(self) -> None:
+        """#161：非白名單值被 argparse choices 擋在 CLI 層（SystemExit 2）。"""
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args([*self._PUSH_ARGV, "--ack-mode", "bogus"])
 
 
 if __name__ == "__main__":
