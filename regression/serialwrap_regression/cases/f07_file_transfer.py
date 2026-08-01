@@ -68,14 +68,20 @@ def _probe_target_tools(ctx: Any, com: str) -> bool | None:
     既可能是板端缺工具（環境、SKIP），也可能是工具都在但傳輸真的壞掉（#32 類回歸、FAIL）。
     先探測工具存在性，後續判定才能分流。
     """
-    # 用 which 而非 command -v（聚焦複驗實證：bcm 板 shell 無 `command` builtin，
-    # `command -v` 回 'sh: command: not found' 被誤判成工具缺失）。busybox which 皆備。
+    # 用 which 而非 command -v（bcm 板 shell 無 `command` builtin，`command -v` 回
+    # 'sh: command: not found' 被誤判成工具缺失）。busybox which 皆備。
+    #
+    # sentinel 必須是**命令本文裡不會出現的字串**（#166 實證）：舊版用
+    # `... && echo TOOLS_OK` 再判 `"TOOLS_OK" in stdout`，但命令回顯本身就含
+    # 該字面，只要板端有回顯就恆為真——COM0(prpl) 因此被誤判成「工具齊全」，
+    # 走進 push 後才在傳輸尾端以 CHECKSUM_MISMATCH 收場。改用算式讓期望輸出
+    # （TOOLS_42）只可能來自實際執行結果。
     probe = ctx.sw.submit_and_wait(
-        com, "which base64 >/dev/null 2>&1 && which md5sum >/dev/null 2>&1 && echo TOOLS_OK")
+        com, "which base64 >/dev/null 2>&1 && which md5sum >/dev/null 2>&1 && echo TOOLS_$((6*7))")
     ctx.note(f"{com}-tools-probe.json", str(probe))
     if probe.get("status") != "done":
         return None
-    return "TOOLS_OK" in (probe.get("stdout") or "")
+    return "TOOLS_42" in (probe.get("stdout") or "")
 
 
 def _transfer_failure_verdict(resp: dict[str, Any], *, verb: str,
