@@ -12,6 +12,7 @@ from unittest import mock
 
 from sw_core.file_transfer import (
     DEFAULT_CHUNK_SIZE,
+    DEFAULT_ECHO_TIMEOUT_S,
     _extract_between_sentinels,
     _split_chunks,
     pull_file,
@@ -554,9 +555,11 @@ class TestPushAckModeRouting(unittest.TestCase):
         self.assertEqual(len(bridge.commands), 2)
         self.assertIn("md5sum", bridge.commands[0])
         self.assertIn("mv", bridge.commands[1])
-        # 預設 slice/timeout 傳遞（固定保守值，plan 決策 2）
+        # 預設 slice 固定保守值（plan 決策 2）；echo timeout 下限 5.0（#161 實機調校，
+        # 真機兩案都在第 8 個 slice＝448/512 字元確定性卡住，2.0s 對慢板偏緊）。
         self.assertEqual(bridge.paced_kwargs[0]["slice_size"], 64)
-        self.assertEqual(bridge.paced_kwargs[0]["echo_timeout_s"], 2.0)
+        self.assertEqual(bridge.paced_kwargs[0]["echo_timeout_s"], DEFAULT_ECHO_TIMEOUT_S)
+        self.assertEqual(DEFAULT_ECHO_TIMEOUT_S, 5.0)
 
     def test_auto_falls_back_on_legacy_bridge(self) -> None:
         """auto＋bridge 無 paced 方法（第三方 fake bridge）→ legacy send_command 不破。"""
@@ -612,6 +615,42 @@ class TestPushAckModeRouting(unittest.TestCase):
                            echo_slice_size=32, echo_timeout_s=1.5)
         self.assertTrue(result["ok"])
         self.assertEqual(bridge.paced_kwargs[0], {"slice_size": 32, "echo_timeout_s": 1.5})
+
+    def test_invalid_ack_mode_rejected_at_module_entry(self) -> None:
+        """非法 ack_mode → INVALID_ARGS（Copilot review），與 RPC 層同形狀。
+
+        RPC 層（`service.py` 的 `file.push`）已有白名單，但 `push_file` 也被
+        `SessionManager.file_push` 與非 RPC 呼叫端直接呼叫；只在 RPC 層驗證會讓
+        未知模式從那些路徑漏進來並**靜默降級**成 legacy 整行送出——`ack_mode="ehco"`
+        這類手誤會悄悄失去無流控保護，而呼叫端看到的是一次成功的 push。
+        """
+        data = b"G" * 30
+        bridge = _FakePacedBridge()
+        local = self._make_local(data)
+
+        for bad in ("ehco", "ECHO", "", "auto ", "true"):
+            with self.subTest(ack_mode=bad):
+                bridge.commands.clear()
+                bridge.paced_commands.clear()
+                result = push_file(bridge, local, "/tmp/dest", prompt_regex=_PROMPT_REGEX,
+                                   ack_mode=bad)
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["error_code"], "INVALID_ARGS")
+                self.assertEqual(result["ack_mode"], bad)
+                self.assertEqual(bridge.commands, [], "拒絕時不得送出任何命令")
+                self.assertEqual(bridge.paced_commands, [])
+
+    def test_valid_ack_modes_all_accepted(self) -> None:
+        """反向斷言（白名單非 vacuous）：三個合法值都不得被入口檢查誤擋。"""
+        for mode in ("auto", "echo", "none"):
+            with self.subTest(ack_mode=mode):
+                data = b"H" * 30
+                bridge = _FakePacedBridge()
+                self._enqueue_happy_path(bridge, data, n_chunks=1)
+                local = self._make_local(data)
+                result = push_file(bridge, local, "/tmp/dest", prompt_regex=_PROMPT_REGEX,
+                                   ack_mode=mode)
+                self.assertTrue(result["ok"], f"{mode} 應被接受：{result}")
 
 
 class TestPushEchoStall(unittest.TestCase):

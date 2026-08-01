@@ -41,7 +41,7 @@ from .constants import (
     _HUMAN_PEER_GRACE_S,
 )
 from .device_watcher import DeviceInfo
-from .file_transfer import DEFAULT_CHUNK_SIZE
+from .file_transfer import DEFAULT_CHUNK_SIZE, DEFAULT_ECHO_TIMEOUT_S
 from .login_fsm import detect_boot_banner, detect_template, ensure_ready, probe_ready
 from .transport_stall import classify_probe_failure, transport_stall_hint
 from .uart_io import PreservedConsoles, UARTBridge, _pty_available
@@ -55,6 +55,10 @@ _ATTACHED_CONSOLE_LEASE_TIMEOUT_S = 86400.0
 # profile.timeout_s，但夾一個地板防止 profile 被設過低導致傳輸必逾時。
 _MIN_FILE_CHUNK_TIMEOUT_S = 5.0   # push 每個 chunk 等待下限
 _MIN_FILE_PULL_TIMEOUT_S = 30.0   # pull 整段讀取等待下限（維持原 30.0 行為基準）
+# echo-ACK 單一 slice 等待下限（#161 實機調校）：同樣依 profile.timeout_s 推導、夾地板，
+# 地板即 file_transfer.DEFAULT_ECHO_TIMEOUT_S（5.0）——真機兩案都在第 8 個 slice
+# （448/512 字元）確定性卡住，2.0s 對慢板偏緊。
+_MIN_FILE_ECHO_TIMEOUT_S = DEFAULT_ECHO_TIMEOUT_S
 
 
 def _replace_state_file(tmp_path: str, dst_path: str, *, retry: bool | None = None) -> None:
@@ -4132,6 +4136,7 @@ class SessionManager:
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         chunk_timeout_s: float | None = None,
         ack_mode: str = "auto",
+        echo_timeout_s: float | None = None,
         source: str = "agent",
     ) -> dict[str, Any]:
         """將 host 端檔案推送到 target。
@@ -4141,8 +4146,13 @@ class SessionManager:
         取代舊版寫死的 10.0s——bcm 類慢板已調大的 ``timeout_s`` 因此自動生效。
 
         ``ack_mode``（#161）：chunk 命令行送出方式（``auto``/``echo``/``none``），
-        見 :func:`sw_core.file_transfer.push_file`；slice 大小與 echo 逾時維持模組
-        固定保守值（plan 決策 2，不開放自適應）。
+        見 :func:`sw_core.file_transfer.push_file`；slice 大小維持模組固定保守值
+        （plan 決策 2，不開放自適應）。
+
+        ``echo_timeout_s``（#161 實機調校）：單一 slice 等待 echo 回讀的逾時；
+        ``None`` 時比照 ``chunk_timeout_s`` 的推導精神沿用 ``profile.timeout_s``
+        （夾 ``_MIN_FILE_ECHO_TIMEOUT_S``＝5.0 地板）——bcm 類已調大 ``timeout_s``
+        的慢板因此自動放寬。調高只影響失敗路徑的等待上限，成功路徑吞吐不變。
         """
         from .file_transfer import push_file
 
@@ -4179,6 +4189,10 @@ class SessionManager:
             chunk_timeout_s if chunk_timeout_s is not None
             else max(profile_timeout_s, _MIN_FILE_CHUNK_TIMEOUT_S)
         )
+        effective_echo_timeout_s = (
+            echo_timeout_s if echo_timeout_s is not None
+            else max(profile_timeout_s, _MIN_FILE_ECHO_TIMEOUT_S)
+        )
         if suspend_human_interactive:
             bridge.suspend_interactive()
         try:
@@ -4191,6 +4205,7 @@ class SessionManager:
                 prompt_regex=prompt_regex,
                 source=source,
                 ack_mode=ack_mode,
+                echo_timeout_s=effective_echo_timeout_s,
             )
         finally:
             with self._lock:

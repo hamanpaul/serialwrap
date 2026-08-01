@@ -976,7 +976,12 @@ class UARTBridge:
 
         回傳 ``{"ok", "acked_chars", "sent_chars"}``；``ok=False`` 表示某段 echo 逾時停滯。
         """
-        body = cmd.rstrip("\n")
+        # 同時去 CR（Copilot review）：呼叫端傳入 CRLF 結尾的命令時，只 rstrip("\n")
+        # 會把 "\r" 留在 body 尾端當成命令本文——該字元會被送出、板端多半直接當換行
+        # 執行命令（早於本函式自己送的 "\n"），破壞「全段確認才送換行＝停滯時命令尚未
+        # 執行＝可安全重試」的核心不變量；且 _await_echo_progress 的比對已把 RX 的
+        # CR/LF 正規化掉，這個 "\r" 永遠 ack 不到，必然變成假性 stall。
+        body = cmd.rstrip("\r\n")
         slice_size = max(1, slice_size)
         slices = [body[i : i + slice_size] for i in range(0, len(body), slice_size)]
         pre = self.rx_snapshot_len()

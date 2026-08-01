@@ -696,6 +696,35 @@ class TestSendCommandEchoPaced(unittest.TestCase):
         partial = self._wal.append.call_args.kwargs["payload"]
         self.assertEqual(partial, self.CMD.encode()[:16], "停滯時 WAL 記實際送出的部分")
 
+    def test_crlf_terminated_command_strips_cr_too(self) -> None:
+        """CRLF 結尾的命令：``\\r`` 必須與 ``\\n`` 一起去掉（Copilot review）。
+
+        只 rstrip("\\n") 會把 ``\\r`` 留在 body 尾端當命令本文送出：
+        (1) 板端多半直接把它當換行執行命令——早於本函式自己送的 ``\\n``，
+            破壞「全段確認才送換行＝停滯時命令未執行＝可安全重試」的核心不變量；
+        (2) `_await_echo_progress` 的比對已把 RX 的 CR/LF 正規化掉，該字元永遠
+            ack 不到，必然變成假性 stall。
+        """
+        self._install_send(lambda data: data)
+
+        result = self._bridge.send_command_echo_paced(
+            self.CMD + "\r\n", source="file_transfer", slice_size=16)
+
+        self.assertTrue(result["ok"], f"CRLF 結尾不得造成假性 stall：{result}")
+        self.assertEqual(result["sent_chars"], len(self.CMD), "\\r 不得計入命令本文")
+        self.assertEqual(b"".join(self._sent), self.CMD.encode() + b"\n")
+        self.assertNotIn(b"\r", b"".join(self._sent), "\\r 絕不得送上 UART")
+
+    def test_lf_only_termination_unchanged(self) -> None:
+        """反向斷言：既有 LF 結尾行為逐字不變（rstrip 放寬不得改動正常路徑）。"""
+        self._install_send(lambda data: data)
+
+        result = self._bridge.send_command_echo_paced(
+            self.CMD + "\n", source="file_transfer", slice_size=16)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(b"".join(self._sent), self.CMD.encode() + b"\n")
+
     def test_cancel_input_line_sends_ctrl_u_newline(self) -> None:
         """cancel_input_line：送 \\x15＋\\n（Ctrl-U 清行＋換行重取 prompt）。"""
         self._install_send(lambda data: None)
