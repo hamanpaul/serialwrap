@@ -96,6 +96,12 @@ RX 視窗修剪破壞 offset 語意（絕對偏移記帳根治）：`f2-history-
 | （bench 事實）COM1 bcm 板 | — | busybox 映像未編入 `base64` applet——F7 逐板 fallback 的「bcm 實證 #157」客觀上不可行（`target_tool_missing` 為真實板端限制，非探測 bug；`md5sum` 存在）|
 
 
+## 部署後置檢查（實機環境）
+
+`serialwrap doctor` 的 **`profile_bootloader_prompts`**（advisory）會比對線上 `~/.config/serialwrap/profiles/default.yaml` 與出貨資產 `sw_core/assets/profiles/default.yaml`。**舊部署環境的線上 profile 不會自動跟隨新資產更新**——2026-08-01 實測本 bench 的 `prpl-template` 就缺 `bootloader_prompts`，導致 `BOOTLOADER` 分類、recovery lease 授予、boot-quiet 的 bootloader 守衛整條 no-op（daemon 卡在 bootloader 時給不出任何可行動訊號）。
+
+修法：`serialwrap setup` 重新物化資產，或備份後手動把出貨資產對應 template 的 `bootloader_prompts` 段落補進線上檔，restart daemon 後確認該檢查轉綠。**新部署環境或升級後請一併檢查。**
+
 ## 從新修好的 bug 新增 case（SOP）
 
 > CLAUDE.md「回歸 case 政策」：修 bug issue 時必須評估歸屬——pytest 可覆蓋→pytest；需實機才驗得到→本 plugin。PR 描述記錄評估結論。
