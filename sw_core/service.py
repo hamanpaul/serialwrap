@@ -26,6 +26,9 @@ from .constants import (
     EVENTS_DIR,
     EVENTS_RUNTIME_DIR,
     EVENTS_LOG_PATH,
+    ERROR_READY_UNCONFIRMED,
+    READY_RECONFIRM_MAX_ATTEMPTS,
+    READY_RECONFIRM_MAX_S,
     READY_RECONFIRM_RETRY_S,
     TTYMCU_PATH,
 )
@@ -603,6 +606,23 @@ class SerialwrapService:
         # 各 READY 轉移點 clear_boot_quiet）。human console／interactive lease 不經此路徑，
         # source 前綴檢查為 belt-and-suspenders（與 execute_command 慣例一致）。
         if not source.startswith("human:"):
+            # #162 有界化（優先於兩個可重試分支）：pending 已逾 READY_RECONFIRM_MAX_S／
+            # READY_RECONFIRM_MAX_ATTEMPTS 落終態——daemon 已無自動路徑可解，回**不可
+            # 重試**的 READY_UNCONFIRMED（刻意不帶 retry_after_s）。若仍回 AUTOBOOT_QUIET，
+            # 呼叫端（回歸 case 的重試迴圈、任何 agent driver）會被一個永遠不可能成功的
+            # 「可重試」錯誤拖進無界迴圈——這正是 #162 引入的回歸。
+            if session.get("ready_reconfirm_failed"):
+                return None, {
+                    "ok": False,
+                    "error_code": ERROR_READY_UNCONFIRMED,
+                    "hint": (
+                        f"READY 已逾 {READY_RECONFIRM_MAX_S:.0f}s／"
+                        f"{READY_RECONFIRM_MAX_ATTEMPTS} 次未能經 nonce probe 再確認"
+                        "（可能卡在 bootloader）；請 session self-test 取分類後 interactive-open 處理"
+                    ),
+                    "recommended_action": "self_test",
+                    "session": session,
+                }
             remaining = session.get("boot_quiet_remaining_s")
             if remaining is not None:
                 return None, {

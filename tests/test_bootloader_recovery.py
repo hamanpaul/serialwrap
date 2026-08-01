@@ -176,12 +176,34 @@ class TestSelfTestBootloaderClassification(unittest.TestCase):
         # 不應發送 probe
         bridge.send_command.assert_not_called()
 
-    def test_empty_bootloader_prompts_falls_back_to_attached_not_ready(self) -> None:
-        """bootloader_prompts 為空 → 維持 ATTACHED_NOT_READY（向後相容）。"""
+    def test_empty_bootloader_prompts_uses_uboot_fallback(self) -> None:
+        """bootloader_prompts 為空 → 退回 ``UBOOT_FALLBACK_PROMPTS`` 仍認得（#162 C1）。
+
+        語意變更：舊行為是「缺配置就整條 no-op（ATTACHED_NOT_READY）」。實機證實
+        線上 ``~/.config/serialwrap/profiles/default.yaml`` 的 prpl-template 就缺此
+        欄位（出貨資產有），漂移下 operator 拿不到任何可行動訊號——板子明明停在
+        ``=> `` 卻被告知去 console_attach。fallback 讓偵測在漂移下仍成立；
+        ``serialwrap doctor`` 的 ``profile_bootloader_prompts`` 另有 WARN 指出重新物化。
+        """
         profile = _make_profile(bootloader_prompts=())
         mgr, bridge = self._make_manager_with_device(profile)
 
         bridge.rx_tail.return_value = "=> "
+
+        resp = mgr.self_test("COM0")
+
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["classification"], "BOOTLOADER")
+        self.assertEqual(resp["recommended_action"], "recover_interactive")
+        self.assertEqual(resp["matched_prompt"], "^=> $")
+
+    def test_empty_bootloader_prompts_non_uboot_tail_stays_attached_not_ready(self) -> None:
+        """反向斷言（fallback is not vacuous）：缺配置且 tail 非 bootloader prompt
+        時仍維持 ATTACHED_NOT_READY——fallback 不得把任何東西都判成 BOOTLOADER。"""
+        profile = _make_profile(bootloader_prompts=())
+        mgr, bridge = self._make_manager_with_device(profile)
+
+        bridge.rx_tail.return_value = "linux login: "
 
         resp = mgr.self_test("COM0")
 

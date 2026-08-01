@@ -152,6 +152,39 @@ READY_RECONFIRM_RETRY_S: float = 5.0
 
 固定值（裁決 1）＝約 RX idle 前置 ``REPROBE_RX_IDLE_S``（3s）＋一輪 reprobe backoff；
 消費端只當提示，動態值增加契約面而無實益。"""
+READY_RECONFIRM_MAX_S: float = BOOT_QUIET_WINDOW_S + 120.0
+"""``ready_reconfirm_pending`` 的存活上限秒數（#162 有界化）。
+
+300s＝180s quiet window＋120s（涵蓋 quiet 過期後至少一輪完整 reprobe backoff：
+RX idle 3s 前置＋backoff 上限 15s×數次）。逾此上限仍未經 nonce probe 再確認即落
+``READY_UNCONFIRMED`` 終態——pending 不得無界，否則 ``AUTOBOOT_QUIET``（可重試）
+會變成「永遠不可能成功的可重試錯誤」，把 agent driver 的重試迴圈拖進無界迴圈。"""
+READY_RECONFIRM_MAX_ATTEMPTS: int = 5
+"""``ready_reconfirm_pending`` 允許的最大確認 probe 失敗次數（#162 有界化）。
+
+與 ``REPROBE_MAX_ATTEMPTS``（10，ATTACHED readiness 重探）刻意分離：READY 再確認
+是「已 READY 的 session 補一次實證」，連 5 次拿不到 prompt 即應交回 operator，
+不必耗完整個 ATTACHED 重探預算。"""
+ERROR_READY_UNCONFIRMED: str = "READY_UNCONFIRMED"
+"""READY 再確認落終態的**不可重試**錯誤碼（#162 有界化）。
+
+與 ``AUTOBOOT_QUIET`` 的差異即「可重試 vs 不可重試」：pending 逾
+``READY_RECONFIRM_MAX_S`` 或逾 ``READY_RECONFIRM_MAX_ATTEMPTS`` 後 daemon 已無
+自動路徑可解，回應**不帶** ``retry_after_s``、改帶 ``recommended_action="self_test"``，
+讓呼叫端停止重試並取分類。"""
+ERROR_BOOTLOADER_STUCK: str = "BOOTLOADER_STUCK"
+"""readiness probe 失敗且 RX tail 命中 bootloader prompt 時的 ``last_error``（#162 C 組）。
+
+取代原本「第 N 次 probe 失敗 → ``reprobe_exhausted=True``、state/last_error 不變、
+不發事件」的**靜默放棄**：終態改為有理由、可觀測、可分類（``self_test`` /
+``recover`` 回 ``classification="BOOTLOADER"`` + ``recommended_action="recover_interactive"``）。"""
+UBOOT_FALLBACK_PROMPTS: tuple[str, ...] = ("^=> $", "^U-Boot> $", "^CFE> $")
+"""profile 未配置 ``bootloader_prompts`` 時的 fallback bootloader prompt 樣式（#162 C 組）。
+
+實務動機：出貨資產 ``sw_core/assets/profiles/*.yaml`` 的 prpl-template 帶
+``bootloader_prompts``，但線上 ``~/.config/serialwrap/profiles/*.yaml`` 可能是舊版
+物化結果而缺此欄位（配置漂移），使 bootloader 偵測整條 no-op。fallback 讓偵測在
+漂移下仍成立；``serialwrap doctor`` 另有 WARN 指出重新物化。"""
 
 # 記憶體上限（#81）：防止長壽 daemon 下無界 in-memory 結構成長至 OOM。
 BG_CAPTURE_MAX_BYTES: int = 4 * 1024 * 1024

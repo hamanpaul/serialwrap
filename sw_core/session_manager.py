@@ -26,18 +26,23 @@ from .constants import (
     BOOT_QUIET_WINDOW_S,
     BOOTLOADER_RX_TAIL_BYTES,
     ERROR_AUTOBOOT_QUIET,
+    ERROR_BOOTLOADER_STUCK,
     ERROR_CREDENTIALS_UNRESOLVED,
+    ERROR_READY_UNCONFIRMED,
     ERROR_RX_FLOOD,
     ERROR_TRANSPORT_STALL,
     HUMAN_ACTIVE_WINDOW_S,
     LOG_DIR,
     MAX_RECOVERY_LEASE_S,
+    READY_RECONFIRM_MAX_ATTEMPTS,
+    READY_RECONFIRM_MAX_S,
     REPROBE_BACKOFF_S,
     REPROBE_MAX_ATTEMPTS,
     REPROBE_MAX_INTERVAL_S,
     REPROBE_RX_IDLE_S,
     RX_FLOOD_BYTES_PER_10S,
     STATE_PATH,
+    UBOOT_FALLBACK_PROMPTS,
     _HUMAN_PEER_GRACE_S,
 )
 from .device_watcher import DeviceInfo
@@ -323,6 +328,16 @@ class SessionRuntime:
     # agent 顯式命令 gate 改判 agent_gate_active()（quiet or pending），解除的
     # 唯一路徑＝READY 經 nonce probe 再確認；確認 probe 的 "\n" 順帶消耗 banner。
     ready_reconfirm_pending: bool = False
+    # pending 的有界化欄位（#162 回歸修）：pending 若無 deadline／無 attempt 上限／
+    # 無失敗終態，`AUTOBOOT_QUIET`（可重試）會變成「永遠不可能成功的可重試錯誤」——
+    # 只要確認 probe 的任一守衛長期不成立（reprobe_exhausted latch／RX 洪水／human
+    # 持續活躍／banner 週期性重臂），pending 就永久 True，把 agent driver 的重試迴圈
+    # 拖進無界迴圈。deadline 於「首次」置位時設定，**重臂不延長**（否則週期性 banner
+    # 可把期限推到無限）。逾時或逾次由 expire_ready_reconfirm() 落 ready_reconfirm_failed
+    # 終態（不可重試的 READY_UNCONFIRMED）。三者皆 transient，不進 _save_state。
+    ready_reconfirm_deadline: float = 0.0
+    ready_reconfirm_attempts: int = 0
+    ready_reconfirm_failed: bool = False
     # MCU 燒錄狀態（issue #55）：僅 runtime transient，不寫 _save_state / to_public_dict
     flash_prev_state: str | None = None
     # recovery lease stash（Phase B issue #44）
@@ -394,7 +409,16 @@ class SessionRuntime:
         self.boot_quiet_until = base + BOOT_QUIET_WINDOW_S
         self.boot_banner_tail = ""
         # #162：一旦疑似重開機，agent gate 需等 READY 經 nonce probe 再確認才解除。
-        self.ready_reconfirm_pending = True
+        # **重臂不延長 deadline**：banner／倒數行會在整段開機過程反覆抵達（每次都
+        # 呼叫本函式），若每次都把期限往後推，pending 的有界性即失效——週期性出現
+        # 字面 "U-Boot" 的 RX（cat /proc/cmdline、dmesg…）就能讓 gate 永久 armed。
+        # 期限只在「pending 由 False 翻 True」的那一刻起算。
+        if not self.ready_reconfirm_pending:
+            self.ready_reconfirm_pending = True
+            self.ready_reconfirm_deadline = base + READY_RECONFIRM_MAX_S
+            self.ready_reconfirm_attempts = 0
+            # 新一輪疑似重開機＝新的確認週期，清掉上一輪的終態旗標。
+            self.ready_reconfirm_failed = False
 
     def clear_boot_quiet(self) -> None:
         """解除 boot quiet window 並清空 rolling tail（#130）。
@@ -408,19 +432,58 @@ class SessionRuntime:
     def confirm_ready(self) -> None:
         """READY 再確認落定（#162）：清 quiet 與 agent gate 的唯一入口。
 
-        由各 READY 確認點呼叫（attach probe／reboot recovery／reboot 2s
-        prompt-return／self-test nonce 成功）——皆為「對 UART 實際驗證過 prompt
-        或 nonce」的時點。
+        由各 READY 確認點呼叫（attach probe／reboot recovery／self-test nonce
+        成功）——皆為「對 UART 實際驗證過 prompt 或 nonce」的時點。**不**包含
+        reboot 命令 2s 內 prompt 回顯（見 ``_handle_reboot_command``）：prpl/OpenWrt
+        的 ``reboot`` 是非同步的，shell 會立刻重印 prompt，該回顯不是 READY 實證。
+
+        清 pending 的同時清掉全部有界化欄位，維持「成功是唯一正常出口」語意。
         """
         self.clear_boot_quiet()
         self.ready_reconfirm_pending = False
+        self.ready_reconfirm_deadline = 0.0
+        self.ready_reconfirm_attempts = 0
+        self.ready_reconfirm_failed = False
+
+    def expire_ready_reconfirm(self, now: float | None = None, *, force: bool = False) -> bool:
+        """pending 逾時／逾次 → 落 ``ready_reconfirm_failed`` 終態（#162 有界化）。
+
+        這是 ``ready_reconfirm_pending`` 的**第二個、也是最後一個** clearer
+        （另一個是成功路徑的 ``confirm_ready()``）。回傳本次是否真的翻轉，供呼叫端
+        決定是否要記事件／落 last_error。
+
+        ``force=True``：已有確定證據（如 RX tail 命中 bootloader prompt）證明自動
+        確認不可能成功時，跳過時間／次數判定直接落終態。
+        """
+        if not self.ready_reconfirm_pending:
+            return False
+        base = time.monotonic() if now is None else now
+        if not force:
+            deadline_hit = self.ready_reconfirm_deadline > 0.0 and base >= self.ready_reconfirm_deadline
+            attempts_hit = self.ready_reconfirm_attempts >= READY_RECONFIRM_MAX_ATTEMPTS
+            if not deadline_hit and not attempts_hit:
+                return False
+        self.ready_reconfirm_pending = False
+        self.ready_reconfirm_failed = True
+        return True
+
+    def ready_reconfirm_remaining_s(self, now: float | None = None) -> float | None:
+        """pending 距 deadline 的剩餘秒數；非 pending／無 deadline 時 None。"""
+        if not self.ready_reconfirm_pending or self.ready_reconfirm_deadline <= 0.0:
+            return None
+        base = time.monotonic() if now is None else now
+        return round(max(self.ready_reconfirm_deadline - base, 0.0), 1)
 
     def agent_gate_active(self, now: float | None = None) -> bool:
         """agent 顯式命令 gate 的統一判定（#162）。
 
         quiet 進行中 **或** READY 再確認 pending 皆須 gate——quiet 過期只代表
         「180s 沒再看到 banner」，不代表 session 已重新確認可下命令。
+
+        判定前先跑 ``expire_ready_reconfirm()``：pending 逾時／逾次即翻終態，之後
+        本函式對它回 False，由呼叫端改回不可重試的 ``READY_UNCONFIRMED``。
         """
+        self.expire_ready_reconfirm(now)
         return self.boot_quiet_active(now) or self.ready_reconfirm_pending
 
     def to_public_dict(self) -> dict[str, Any]:
@@ -488,6 +551,11 @@ class SessionRuntime:
             # #162：READY 再確認 pending（quiet 過期不清，READY 確認點才清）。
             # True 期間 agent 顯式命令被 AUTOBOOT_QUIET gate。
             "ready_reconfirm_pending": self.ready_reconfirm_pending,
+            # #162 有界化：pending 逾時／逾次落定的終態旗標；True 時 agent 顯式命令
+            # 改回**不可重試**的 READY_UNCONFIRMED（帶 recommended_action，不帶
+            # retry_after_s）。remaining 供 operator 判讀還有多久落終態。
+            "ready_reconfirm_failed": self.ready_reconfirm_failed,
+            "ready_reconfirm_remaining_s": self.ready_reconfirm_remaining_s(),
             "idle_for_ms": self.compute_idle_ms(),
             # RX/TX 單邊年齡（#150）：idle_for_ms 取 max(rx,tx) 會被 probe/human TX 拉小，
             # stall（RX 單邊凍結）在 session list 看不出來；此兩欄讓 operator 一眼判讀。
@@ -900,6 +968,61 @@ class SessionManager:
     def _reset_reprobe_progress_locked(self, session: SessionRuntime) -> None:
         session.reset_reprobe_progress()
 
+    # --- agent 顯式命令 gate（#139/#162）----------------------------------------
+    def _agent_gate_reject_locked(self, session: SessionRuntime) -> dict[str, Any] | None:
+        """execute_command／file_push／file_pull 共用的 gate 判定；須在 ``self._lock`` 內。
+
+        回傳拒絕回應（dict）或 ``None``（放行）。兩種拒絕語意刻意分離：
+
+        - ``AUTOBOOT_QUIET``（**可重試**，帶 ``retry_after_s``）：quiet window 進行中
+          或 READY 再確認 pending 但仍在有界期限內——daemon 有自動路徑會解（RX 見
+          prompt／確認 probe 成功），呼叫端等一下重送即可。
+        - ``READY_UNCONFIRMED``（**不可重試**，帶 ``recommended_action``）：pending 已
+          逾 ``READY_RECONFIRM_MAX_S`` 或逾 ``READY_RECONFIRM_MAX_ATTEMPTS``，或已由
+          bootloader 證據直接落終態——daemon 已無自動路徑，繼續重試只會無界迴圈。
+        """
+        # 先評估有界化終態：agent_gate_active() 內部亦會呼叫，此處顯式呼叫以確保
+        # 「先落終態、再判 gate」的順序，讓 failed 旗標在同一個 lock 區間內即時可讀。
+        session.expire_ready_reconfirm()
+        if session.ready_reconfirm_failed:
+            return {
+                "ok": False,
+                "error_code": ERROR_READY_UNCONFIRMED,
+                "selector": session.profile.com,
+                "hint": (
+                    f"READY 已逾 {READY_RECONFIRM_MAX_S:.0f}s／"
+                    f"{READY_RECONFIRM_MAX_ATTEMPTS} 次未能經 nonce probe 再確認"
+                    "（可能卡在 bootloader）；請 session self-test 取分類後 interactive-open 處理"
+                ),
+                "recommended_action": "self_test",
+            }
+        if session.agent_gate_active():
+            return {
+                "ok": False,
+                "error_code": ERROR_AUTOBOOT_QUIET,
+                "selector": session.profile.com,
+            }
+        return None
+
+    # --- bootloader 卡死偵測（#162 C 組）----------------------------------------
+    @staticmethod
+    def _bootloader_evidence(session: SessionRuntime, bridge: UARTBridge | None) -> str | None:
+        """RX tail 尾行是否為 bootloader prompt；回傳命中的 pattern 或 ``None``。
+
+        純讀取、無副作用。樣式來源優先 ``profile.bootloader_prompts``，缺配置時退回
+        ``UBOOT_FALLBACK_PROMPTS``——線上 ``~/.config/serialwrap/profiles/*.yaml`` 的
+        prpl-template 實測就漏了此欄位（出貨資產有），漂移下若不 fallback，整條
+        bootloader 偵測都是 no-op，operator 拿不到任何可行動訊號。
+        """
+        if bridge is None:
+            return None
+        try:
+            tail = clean_text(bridge.rx_tail(BOOTLOADER_RX_TAIL_BYTES))
+        except Exception:
+            return None
+        patterns = session.profile.bootloader_prompts or UBOOT_FALLBACK_PROMPTS
+        return _matches_any_bootloader_prompt(tail, patterns)
+
     # --- 帳密解析終態（#140）---------------------------------------------------
     @staticmethod
     def _credentials_declared_but_unresolved(
@@ -1110,6 +1233,11 @@ class SessionManager:
             return None
         if session.state in {"RELEASED", "FLASHING", "ATTACHING", "RECOVERING"}:
             return None
+        # #162 有界化：排 probe 前先評估 pending 是否已逾時／逾次落終態——落定後
+        # pending 為 False，下方 READY 分支自然不再排 probe，gate 也改回不可重試的
+        # READY_UNCONFIRMED（見 _agent_gate_reject_locked）。
+        if session.state == "READY":
+            session.expire_ready_reconfirm(now)
         # #162 READY 再確認分支：名義 READY＋pending（quiet 已結束）才排確認 probe——
         # 該 probe 的 "\n"+nonce 順帶消耗 askconsole 啟用 banner，成功後 confirm_ready
         # 解除 agent gate。quiet 進行中維持 #130 TX 靜默（本函式下方 quiet gate 亦擋）。
@@ -1125,11 +1253,17 @@ class SessionManager:
         # （_is_reprobe_prompt_error 已隱含排除此錯，這裡顯式早退以自我說明並防未來回歸。）
         if session.last_error == ERROR_CREDENTIALS_UNRESOLVED:
             return None
-        if session.reprobe_exhausted:
-            return None
-        if session.reprobe_attempts >= REPROBE_MAX_ATTEMPTS:
+        if session.reprobe_exhausted or session.reprobe_attempts >= REPROBE_MAX_ATTEMPTS:
             session.reprobe_exhausted = True
             session.next_reprobe_at = None
+            # #162 有界化（回歸修）：``reprobe_exhausted`` 是為 ATTACHED readiness 重探
+            # 設計的 latch（第 10 次失敗後靜默停手，且只在 READY **轉移** 點才被
+            # _reset_reprobe_progress_locked 解開）。一個「已經是 READY」的 session 不會
+            # 再轉移 → latch 永遠解不開 → 確認 probe 永遠排不上 → pending 永久 True →
+            # agent 命令永久 AUTOBOOT_QUIET。這是最短的無界路徑，必須改成落終態而非
+            # 靜默凍結。
+            if ready_reconfirm:
+                session.expire_ready_reconfirm(now, force=True)
             return None
         if session.next_reprobe_at is not None and now < session.next_reprobe_at:
             return None
@@ -1179,8 +1313,26 @@ class SessionManager:
             result_state = result_session.get("state") if isinstance(result_session, dict) else current.state
             if current.state == "READY" or result_state == "READY":
                 self._reset_reprobe_progress_locked(current)
-            else:
-                self._record_reprobe_attempt_locked(current, now)
+                return
+            self._record_reprobe_attempt_locked(current, now)
+            # #162 有界化（A6）：確認 probe 每失敗一次即累加，逾 READY_RECONFIRM_MAX_ATTEMPTS
+            # 落終態。pending 期間的失敗才算——非 pending 的 ATTACHED readiness 重探不計。
+            if current.ready_reconfirm_pending:
+                current.ready_reconfirm_attempts += 1
+                current.expire_ready_reconfirm(now)
+            # #162 C 組：probe 失敗且 RX tail 尾行是 bootloader prompt → 板子卡在
+            # bootloader，繼續重探沒有意義（prpl-template 的 prompt_regex 在數學上不可能
+            # 匹配 `=> `）。舊行為是「第 10 次靜默 exhausted、state/last_error 不變、不發
+            # 事件、不做分類」——既不自復也不告訴任何人為什麼。改為**有理由的終態**：
+            # last_error=BOOTLOADER_STUCK（self_test / recover 據此回 BOOTLOADER 分類與
+            # recover_interactive 建議）、立即 exhausted、pending 直接落 READY_UNCONFIRMED。
+            matched = self._bootloader_evidence(current, bridge)
+            if matched is not None:
+                current.last_error = ERROR_BOOTLOADER_STUCK
+                current.last_error_detail = f"matched_prompt={matched}"
+                current.reprobe_exhausted = True
+                current.next_reprobe_at = None
+                current.expire_ready_reconfirm(now, force=True)
 
     def _reprobe_probe_lock_locked(self, session_id: str) -> threading.Lock:
         """取得（必要時建立）per-session probe 互斥鎖；須在持有 self._lock 時呼叫。"""
@@ -1207,8 +1359,21 @@ class SessionManager:
             return False
         # #162：READY 需再確認 pending 才 valid（pending 已被其他確認點清掉＝
         # 不必再 probe）；_is_reprobe_prompt_error 檢查僅施於 ATTACHED。
-        if session.state == "READY" and not session.ready_reconfirm_pending:
-            return False
+        if session.state == "READY":
+            # #162 有界化：寫 probe bytes 前先評估逾時／逾次終態（本函式是 READY
+            # 分支唯一的「daemon 主動 TX」授權點——#130 之後 READY 原本是「daemon
+            # 絕不主動寫」的，#162 新開了這條 TX 面，必須自帶終止條件）。
+            session.expire_ready_reconfirm(now)
+            if not session.ready_reconfirm_pending:
+                return False
+            # D1：quiet 過期後若 RX tail 顯示板子仍卡在 bootloader，就**不要**再對它
+            # 送 "\n"+nonce——那是 U-Boot 下的可執行文字，且確認在數學上不可能成功
+            # （prpl-template 的 prompt_regex 匹配不到 `=> `）。直接落 C 組終態。
+            # （last_error 不動：名義 READY 的 last_error 恆為 None 是既有不變量，
+            #   分類資訊由 self_test／recover 於當下重新從 RX tail 取得。）
+            if self._bootloader_evidence(session, bridge) is not None:
+                session.expire_ready_reconfirm(now, force=True)
+                return False
         if session.reprobe_exhausted:
             return False
         if session.state == "ATTACHED" and not self._is_reprobe_prompt_error(session.state, session.last_error):
@@ -2004,11 +2169,20 @@ class SessionManager:
 
         比對用 rolling tail（``BOOT_BANNER_TAIL_CHARS`` 字元）跨 chunk 邊界拼接，
         容忍 banner／prompt 被 RX 讀取切割。
+
+        #162 回歸修：**比對窗＝舊 tail 尾段 + 整個 chunk（不截尾）**，只有「保存」
+        才截到 ``BOOT_BANNER_TAIL_CHARS``。舊碼 ``(tail + chunk)[-256:]`` 對單一
+        chunk 長度 > 256 的情況會把 chunk **開頭** 截掉——實機 WAL seq=79（345 字元，
+        含 ``U-Boot TPL 2024.04``）與 seq=88（354 字元，含 ``Found FIT format U-Boot``）
+        兩個 banner chunk 都因此漏判，quiet 晚了 0.85s 才 arm，正好讓 CTRL-C/CTRL-D
+        兩發都通過 gate。rolling tail 原本的用途（跨 chunk 切割的 banner）不受影響：
+        舊 tail 仍完整接在 chunk 前面。
         """
-        tail = (session.boot_banner_tail + chunk)[-BOOT_BANNER_TAIL_CHARS:]
-        if detect_boot_banner(tail):
+        window = session.boot_banner_tail[-BOOT_BANNER_TAIL_CHARS:] + chunk
+        if detect_boot_banner(window):
             session.arm_boot_quiet()
             return
+        tail = window[-BOOT_BANNER_TAIL_CHARS:]
         session.boot_banner_tail = tail
         if session.boot_quiet_until <= 0.0:
             return
@@ -2997,13 +3171,20 @@ class SessionManager:
         self._mark_session_tx(session)
         bridge.send_command(command, source=source, cmd_id=cmd_id)
         if bridge.wait_for_regex_from(prompt_regex, pre_offset, min(timeout_s, 2.0)):
-            # #139（belt-and-suspenders）：2s 內 prompt 回來＝板其實沒重開。RX 解除
-            # 檢查（_update_boot_quiet_locked）通常已清 quiet，但 prompt 被 RX chunk
-            # 切割 miss 時，若不補清，READY session 會白白被 agent gate 到 180s 過期。
-            # #162：prompt 實際回應命令＝READY 實證，屬確認點——confirm_ready 清 pending
-            # （單靠 RX 解除只清 quiet、不清 pending，此處必須走確認點入口）。
+            # #139（belt-and-suspenders）：2s 內 prompt 回來，RX 解除檢查
+            # （_update_boot_quiet_locked）通常已清 quiet，但 prompt 被 RX chunk 切割
+            # miss 時，若不補清，READY session 會白白被 TX 靜默擋到 180s 過期。
+            #
+            # #162 回歸修：此處**只清 TX 靜默維度（clear_boot_quiet），不 confirm_ready**。
+            # prpl/OpenWrt 的 `reboot` 是**非同步**的——shell 立刻重印 prompt（實機
+            # WAL：TX `reboot\n` 後 11ms 就收到 `reboot\r\nroot@prplOS:/# `）但板子確實
+            # 在重開。把它當成「READY 已再確認」是假陰性：pending 被清掉後，agent 的
+            # 下一個命令會在 stale-READY 窗被放行、落進正在 shutdown 的系統，逾時後
+            # 升級成 CTRL-C/CTRL-D 強制按鍵，正好打在 U-Boot autoboot 倒數上。
+            # 保留 pending → 後續真 banner 抵達時 gate 已是關的，且 agent 命令要等
+            # 確認 probe（nonce 實證）成功才放行。
             with self._lock:
-                session.confirm_ready()
+                session.clear_boot_quiet()
             raw_text = bridge.rx_text_from(pre_offset)
             stdout = self._extract_command_stdout(raw_text, command, prompt_regex)
             return {
@@ -3083,10 +3264,13 @@ class SessionManager:
             # 會把本 error_code 寫回命令記錄（status=error），`cmd status` 可觀測；命令
             # 未送 UART、零副作用，READY 重新確認後可重送。human 來源循 #130 慣例放行
             # （#114 刻意進 bootloader：human console／lease 送鍵永不 gate）。
-            # #162：改判 agent_gate_active()——quiet 過期不再解除 gate，須等 READY
-            # 經 nonce probe 再確認（confirm_ready）才放行。
-            if not source.startswith("human:") and session.agent_gate_active():
-                return {"ok": False, "error_code": ERROR_AUTOBOOT_QUIET, "selector": session.profile.com}
+            # #162：改判 _agent_gate_reject_locked()——quiet 過期不再解除 gate，須等
+            # READY 經 nonce probe 再確認（confirm_ready）才放行；pending 逾時／逾次
+            # 則改回不可重試的 READY_UNCONFIRMED。
+            if not source.startswith("human:"):
+                gate = self._agent_gate_reject_locked(session)
+                if gate is not None:
+                    return gate
             if session.recovering:
                 return {"ok": False, "error_code": "SESSION_RECOVERING"}
             lease, post = self._refresh_interactive_locked(session)
@@ -3287,8 +3471,19 @@ class SessionManager:
         # 送命令途中 target 自發重開機、逾時進入本函式）。跳過強制按鍵，直接落到下方既有
         # timeout 收尾（session 轉 ATTACHED），讓 autoboot 在無人打擾下自然跑完；window 解
         # 除後由既有 reprobe / reboot recovery 接手升 READY。
+        # 迴圈外快速早退（省掉整段設置）；真正的授權判定在迴圈**內**逐 byte 重驗。
         if not session.boot_quiet_active():
             for action_name, payload in (("CTRL_C", b"\x03"), ("CTRL_D", b"\x04")):
+                # #162 回歸修（實機事故 2026-07-31）：gate 必須逐 byte 重驗。第二個 byte
+                # （CTRL-D）在第一個之後最多 min(timeout_s, 2.0) 秒才寫出，而 U-Boot
+                # autoboot 倒數窗實測就是 3 秒——CTRL-C 送出後 banner 才抵達、quiet 於
+                # 兩次寫入之間 arm 的情境下，舊碼（gate 只在迴圈外評估一次）會照送
+                # CTRL-D 打斷 autoboot，把板子留在 `=> ` 一路卡到人工介入。
+                # WAL 物證：seq=87 `\x03`(23:39:11.414) → seq=94 banner arm(23:39:11.948)
+                # → seq=103 `\x04`(23:39:13.424，armed 後 1.48s) → seq=104 `=> `。
+                with self._lock:
+                    if session.boot_quiet_active():
+                        break
                 offset = bridge.rx_snapshot_len()
                 self._mark_session_tx(session)
                 bridge.send_bytes(payload, source="system:recover", cmd_id=None)
@@ -3350,7 +3545,12 @@ class SessionManager:
         session = self.get_session(selector)
         if session is None:
             return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
-        return {"ok": True, "session": session.to_public_dict()}
+        with self._lock:
+            # #162 有界化：service 層 submit-time gate 讀的是這份快照，須在序列化前
+            # 先評估 pending 是否已逾時／逾次落終態，否則 submit gate 會永遠看到
+            # pending=True、永遠回可重試的 AUTOBOOT_QUIET。
+            session.expire_ready_reconfirm()
+            return {"ok": True, "session": session.to_public_dict()}
 
     def attach_console(self, selector: str, *, label: str | None = None) -> dict[str, Any]:
         post = _PostCloseAction()
@@ -3804,12 +4004,20 @@ class SessionManager:
                             recommended_action = "wait_or_console_attach"
                             extra = {}
                         else:
-                            # BOOTLOADER detection：讀取 RX tail 並比對 bootloader prompts
+                            # BOOTLOADER detection：讀取 RX tail 並比對 bootloader prompts。
+                            # #162 C 組：樣式缺配置時退回 UBOOT_FALLBACK_PROMPTS（線上
+                            # profile 漂移下仍認得）；reprobe 路徑已判定 BOOTLOADER_STUCK
+                            # 時，即使此刻 tail 已被其他 RX 推走也維持分類（有理由的終態）。
                             rx_tail_raw = bridge.rx_tail(BOOTLOADER_RX_TAIL_BYTES)
                             rx_tail_evidence = clean_text(rx_tail_raw)
                             matched = _matches_any_bootloader_prompt(
-                                rx_tail_evidence, session.profile.bootloader_prompts
+                                rx_tail_evidence,
+                                session.profile.bootloader_prompts or UBOOT_FALLBACK_PROMPTS,
                             )
+                            if matched is None and session.last_error == ERROR_BOOTLOADER_STUCK:
+                                matched = (session.last_error_detail or "").removeprefix(
+                                    "matched_prompt="
+                                ) or ERROR_BOOTLOADER_STUCK
                             if matched is not None:
                                 classification = "BOOTLOADER"
                                 recommended_action = "recover_interactive"
@@ -4006,6 +4214,15 @@ class SessionManager:
             }
             if not recovered:
                 payload["error_code"] = result["session"].get("last_error") or "SESSION_NOT_READY"
+                # #162 C3：手動 recover 失敗且 RX tail 顯示板子卡在 bootloader → 回可
+                # 行動分類，取代目前無資訊的 PROMPT_UNAVAILABLE（operator 才知道要開
+                # interactive 手動 `boot`，而不是繼續無效重試）。
+                matched = self._bootloader_evidence(session, bridge)
+                if matched is not None or payload["error_code"] == ERROR_BOOTLOADER_STUCK:
+                    payload["classification"] = "BOOTLOADER"
+                    payload["recommended_action"] = "recover_interactive"
+                    if matched is not None:
+                        payload["matched_prompt"] = matched
                 if force:
                     return self._force_recover(session)
             return payload
@@ -4221,9 +4438,12 @@ class SessionManager:
                 return {"ok": False, "error_code": "SESSION_NOT_READY"}
             # #139：同 execute_command 的第二層 gate——file 傳輸直寫 bridge、不經
             # execute_command，須各自補 gate（僅開始前擋；傳輸中 banner 到達不中途
-            # abort，由傳輸自然 timeout，屬既有行為）。#162：改判 agent_gate_active()。
-            if not source.startswith("human:") and session.agent_gate_active():
-                return {"ok": False, "error_code": ERROR_AUTOBOOT_QUIET, "selector": session.profile.com}
+            # abort，由傳輸自然 timeout，屬既有行為）。
+            # #162：改判 _agent_gate_reject_locked()（AUTOBOOT_QUIET／READY_UNCONFIRMED）。
+            if not source.startswith("human:"):
+                gate = self._agent_gate_reject_locked(session)
+                if gate is not None:
+                    return gate
             if session.recovering:
                 return {"ok": False, "error_code": "SESSION_RECOVERING"}
             lease, post = self._refresh_interactive_locked(session)
@@ -4288,9 +4508,11 @@ class SessionManager:
             if session is None or session.bridge is None or session.state != "READY":
                 return {"ok": False, "error_code": "SESSION_NOT_READY"}
             # #139：同 file_push 的 gate（pull 同樣直寫 bridge、不經 execute_command）。
-            # #162：改判 agent_gate_active()。
-            if not source.startswith("human:") and session.agent_gate_active():
-                return {"ok": False, "error_code": ERROR_AUTOBOOT_QUIET, "selector": session.profile.com}
+            # #162：改判 _agent_gate_reject_locked()（AUTOBOOT_QUIET／READY_UNCONFIRMED）。
+            if not source.startswith("human:"):
+                gate = self._agent_gate_reject_locked(session)
+                if gate is not None:
+                    return gate
             if session.recovering:
                 return {"ok": False, "error_code": "SESSION_RECOVERING"}
             lease, post = self._refresh_interactive_locked(session)

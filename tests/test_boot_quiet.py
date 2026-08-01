@@ -31,6 +31,7 @@
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 import tempfile
 import time
@@ -493,6 +494,279 @@ class TestRecoverAfterFailureQuietGate(_ManagerMixin):
 
         self.assertTrue(bridge.sent, "拿掉 gate 應該會送出 CTRL_C/CTRL_D（驗證測試非 vacuous）")
 
+    def test_ctrl_d_skipped_when_quiet_arms_between_bytes(self) -> None:
+        """核心回歸（實機事故 2026-07-31，#162 回歸修 B1）：gate 必須逐 byte 重驗。
+
+        兩個 byte 之間隔著 ``min(timeout_s, 2.0)`` 的等待，而 U-Boot autoboot 倒數窗
+        實測就是 3 秒。CTRL-C 送出後 banner 才抵達（WAL seq=87 → seq=94，0.53s），
+        舊碼把 gate 放在迴圈外只評估一次，於是 CTRL-D（seq=103，quiet armed 後 1.48s）
+        照送不誤、打斷 autoboot，把板子留在 ``=> `` 直到人工介入。
+        """
+        mgr, session = self._make_manager()
+
+        class _BannerBetweenBytesBridge(FakeBridge):
+            """第一次 wait（CTRL-C 之後）副作用地餵入 U-Boot banner。"""
+
+            def __init__(self, target: sm_mod.SessionRuntime) -> None:
+                super().__init__(prompt_within_2s=False)
+                self._target = target
+                self.waits = 0
+
+            def wait_for_regex_from(self, _pattern: str, _offset: int, _timeout: float) -> bool:
+                self.waits += 1
+                if self.waits == 1:
+                    self._target.arm_boot_quiet()  # 模擬 seq=94 `\r\n\r\nU-Boot 2024.04`
+                return False
+
+        bridge = _BannerBetweenBytesBridge(session)
+        session.bridge = bridge
+        session.state = "READY"
+        self.assertFalse(session.boot_quiet_active(), "起點：quiet 未 armed，CTRL-C 合法放行")
+
+        mgr._recover_after_failure(
+            session, bridge,
+            cmd_id="cmd-x", timeout_s=1.0, source="agent:test",
+            command="echo AFTER_BOOT", prompt_regex=session.profile.prompt_regex, pre_offset=0,
+        )
+
+        payloads = [p for p, _src in bridge.sent]
+        self.assertEqual(payloads, [b"\x03"], "quiet 於兩 byte 之間 arm → CTRL-D 必須被擋下")
+        self.assertNotIn(b"\x04", payloads, "CTRL-D 落在 autoboot 倒數窗＝板子卡 U-Boot 的直接肇因")
+
+    def test_ctrl_c_still_sent_when_quiet_never_arms(self) -> None:
+        """逐 byte 重驗不得誤傷正常路徑（B1 非 vacuous 反向斷言）：quiet 全程未 arm
+        時兩個 byte 都要照送。"""
+        mgr, session = self._make_manager()
+        bridge = FakeBridge(prompt_within_2s=False)
+        session.bridge = bridge
+        session.state = "READY"
+
+        mgr._recover_after_failure(
+            session, bridge,
+            cmd_id="cmd-x", timeout_s=0.05, source="agent:test",
+            command="echo hi", prompt_regex=session.profile.prompt_regex, pre_offset=0,
+        )
+
+        self.assertEqual([p for p, _src in bridge.sent], [b"\x03", b"\x04"])
+
+
+class TestBootBannerChunkWindow(_ManagerMixin):
+    """#162 回歸修 B2：banner 偵測比對窗不得截掉大 chunk 的**開頭**。
+
+    舊碼 ``(tail + chunk)[-BOOT_BANNER_TAIL_CHARS:]``（256 字元）對單一 chunk 長度
+    > 256 的情況會把 chunk 頭部直接丟掉。實機 WAL 的兩個 banner chunk（345/354 字元）
+    都因此漏判，quiet 晚 0.85s 才 arm，正好讓 CTRL-C/CTRL-D 兩發都通過 gate。
+    """
+
+    # WAL seq=79 @23:39:11.100（345 字元）：banner 在 chunk **開頭**、後接大量開機訊息。
+    _SEQ79 = (
+        "U-Boot TPL 2024.04 (Jul 09 2025 - 10:12:31 +0000)\r\n"
+        + "DDR init done\r\n" * 24
+        + "Trying to boot from RAM\r\n"
+    )
+    # WAL seq=88 @23:39:11.567（354 字元）：banner 在 chunk 前段、後接大量環境載入訊息。
+    _SEQ88 = (
+        "NOTICE:  BL2: v2.10.0\r\n"
+        + "Found FIT format U-Boot image at 0x40200000\r\n"
+        + "Loading Environment from SPI Flash... OK\r\n" * 10
+    )
+
+    def test_banner_at_head_of_large_chunk_arms_quiet(self) -> None:
+        for name, payload in (("seq79", self._SEQ79), ("seq88", self._SEQ88)):
+            with self.subTest(chunk=name):
+                mgr, session = self._make_manager()
+                session.state = "READY"
+                cleaned = sm_mod.clean_text(payload)
+                self.assertGreater(
+                    len(cleaned) - cleaned.index("U-Boot"), constants.BOOT_BANNER_TAIL_CHARS,
+                    "前提：banner 必須落在最後 BOOT_BANNER_TAIL_CHARS 之外才能重現截頭",
+                )
+                self._rx(mgr, session, payload)
+                self.assertTrue(
+                    session.boot_quiet_active(),
+                    f"{name}：含 U-Boot 的大 chunk 必須 arm quiet（舊碼在此漏判）",
+                )
+
+    def test_rolling_tail_still_catches_cross_chunk_split(self) -> None:
+        """B2 不得打壞 rolling tail 原本的用途：banner 被 RX 切成兩段仍要命中。"""
+        mgr, session = self._make_manager()
+        session.state = "READY"
+        self._rx(mgr, session, "reboot: Restarting system\r\nU-B")
+        self.assertFalse(session.boot_quiet_active(), "前半段不足以命中")
+        self._rx(mgr, session, "oot 2024.04 (fake)\r\n")
+        self.assertTrue(session.boot_quiet_active(), "跨 chunk 拼接後須命中")
+
+    def test_large_non_banner_chunk_does_not_arm(self) -> None:
+        """反向斷言：不含 banner 的大 chunk 不得誤 arm（比對窗放寬不等於放水）。"""
+        mgr, session = self._make_manager()
+        session.state = "READY"
+        self._rx(mgr, session, "x" * 1024)
+        self.assertFalse(session.boot_quiet_active())
+
+
+class TestRebootPromptReturnKeepsPending(_ManagerMixin):
+    """#162 回歸修 B3：非同步 ``reboot`` 的 prompt 回顯不是 READY 實證。
+
+    實機 WAL：TX ``reboot\\n``（seq=1）後 **11ms** 就收到
+    ``reboot\\r\\nroot@prplOS:/# ``（seq=2）——prpl/OpenWrt 的 reboot 是非同步的，
+    shell 立刻重印 prompt 但板子確實在重開。舊碼在此呼叫 ``confirm_ready()``，
+    pending 被清 → agent 的下一個命令在 stale-READY 窗被放行 → 落進正在 shutdown
+    的系統 → 逾時升級成 CTRL-C/CTRL-D → 打在 autoboot 倒數上。
+    """
+
+    def test_reboot_prompt_return_keeps_pending(self) -> None:
+        mgr, session = self._make_manager()
+        bridge = FakeBridge(prompt_within_2s=True)
+        session.bridge = bridge
+        session.state = "READY"
+
+        result = mgr._handle_reboot_command(
+            session, bridge, command="reboot", source="agent:test",
+            cmd_id="cmd-1", timeout_s=10.0, execution_mode="line",
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(session.boot_quiet_until, 0.0, "TX 靜默維度仍解除（#130/#139 不變）")
+        self.assertTrue(
+            session.ready_reconfirm_pending,
+            "非同步 reboot 的 prompt 回顯不足以宣告 READY 已再確認",
+        )
+
+    def test_next_agent_command_gated_after_reboot(self) -> None:
+        """事故入口封堵：reboot 之後的 agent 命令必須被 gate，不得在 stale-READY 窗放行。"""
+        mgr, session = self._make_manager()
+        bridge = FakeBridge(prompt_within_2s=True)
+        session.bridge = bridge
+        session.state = "READY"
+
+        mgr._handle_reboot_command(
+            session, bridge, command="reboot", source="agent:test",
+            cmd_id="cmd-1", timeout_s=10.0, execution_mode="line",
+        )
+        sent_before = list(bridge.sent)
+        follow = mgr.execute_command(session.session_id, "echo AFTER_BOOT", "agent:test", "cmd-2")
+
+        self.assertFalse(follow["ok"])
+        self.assertEqual(follow["error_code"], "AUTOBOOT_QUIET")
+        self.assertEqual(bridge.sent, sent_before, "gate 拒絕必須零 TX 副作用")
+
+    def test_confirm_probe_after_reboot_restores_execute(self) -> None:
+        """#139 不變量維持：真 READY（nonce probe 實證）後 agent 命令必成功。"""
+        mgr, session = self._make_manager()
+        bridge = FakeBridge(prompt_within_2s=True)
+        session.bridge = bridge
+        session.state = "READY"
+
+        mgr._handle_reboot_command(
+            session, bridge, command="reboot", source="agent:test",
+            cmd_id="cmd-1", timeout_s=10.0, execution_mode="line",
+        )
+        session.last_rx_mono = time.monotonic() - constants.REPROBE_RX_IDLE_S - 0.5
+        mgr.reconcile_readiness()
+        mgr.join_reprobe_workers(5.0)
+
+        self.assertFalse(session.ready_reconfirm_pending, "確認 probe 成功應清 pending")
+        follow = mgr.execute_command(session.session_id, "echo hi", "agent:test", "cmd-2")
+        self.assertTrue(follow["ok"])
+
+
+class TestBootloaderStuckDetection(_ManagerMixin):
+    """#162 C 組：daemon 認得自己卡在 bootloader，並回可行動的錯誤／分類。
+
+    舊行為：readiness probe 連續失敗 → 第 10 次 ``reprobe_exhausted=True``、state 與
+    last_error 都不變、不發事件、不做分類——**靜默放棄**，operator 手上沒有任何
+    daemon 給的可行動訊號（實機 9 分鐘零收斂即此）。
+    """
+
+    class _UbootTailBridge(FakeBridge):
+        def __init__(self) -> None:
+            super().__init__(prompt_within_2s=False)
+
+        def rx_tail(self, max_chars: int = 4096) -> str:
+            return "Loading Environment from SPI Flash... OK\r\n=> \r\n=> \r\n=> "
+
+    def _make_stuck(self, *, bootloader_prompts: tuple[str, ...] | None = None):
+        mgr, session = self._make_manager()
+        if bootloader_prompts is not None:
+            session.profile = dataclasses.replace(
+                session.profile, bootloader_prompts=list(bootloader_prompts)
+            )
+        bridge = self._UbootTailBridge()
+        session.bridge = bridge
+        session.state = "ATTACHED"
+        session.last_error = "PROMPT_UNAVAILABLE"
+        return mgr, session, bridge
+
+    def test_reprobe_failure_on_uboot_prompt_sets_bootloader_stuck(self) -> None:
+        mgr, session, bridge = self._make_stuck(bootloader_prompts=("^=> $", "^U-Boot> $"))
+
+        mgr._finish_probe_reprobe(
+            session.session_id, bridge,
+            {"ok": True, "session": {"state": "ATTACHED"}}, time.monotonic(),
+        )
+
+        self.assertEqual(session.last_error, "BOOTLOADER_STUCK")
+        self.assertIn("matched_prompt=", session.last_error_detail or "")
+        self.assertTrue(session.reprobe_exhausted, "卡 bootloader 時不再無效重探")
+        self.assertIsNone(session.next_reprobe_at)
+
+    def test_bootloader_detection_falls_back_when_profile_lacks_prompts(self) -> None:
+        """線上 ``~/.config/serialwrap/profiles/default.yaml`` 的 prpl-template 實測
+        缺 ``bootloader_prompts``（出貨資產有）——漂移下 fallback 仍須認得。"""
+        mgr, session, bridge = self._make_stuck(bootloader_prompts=())
+        self.assertEqual(tuple(session.profile.bootloader_prompts), ())
+
+        mgr._finish_probe_reprobe(
+            session.session_id, bridge,
+            {"ok": True, "session": {"state": "ATTACHED"}}, time.monotonic(),
+        )
+
+        self.assertEqual(session.last_error, "BOOTLOADER_STUCK")
+
+    def test_non_bootloader_tail_keeps_silent_reprobe_path(self) -> None:
+        """反向斷言：tail 不是 bootloader prompt 時不得誤標（gate is not vacuous）。"""
+        mgr, session = self._make_manager()
+        bridge = FakeBridge(prompt_within_2s=False)  # rx_tail 回 ""
+        session.bridge = bridge
+        session.state = "ATTACHED"
+        session.last_error = "PROMPT_UNAVAILABLE"
+
+        mgr._finish_probe_reprobe(
+            session.session_id, bridge,
+            {"ok": True, "session": {"state": "ATTACHED"}}, time.monotonic(),
+        )
+
+        self.assertEqual(session.last_error, "PROMPT_UNAVAILABLE")
+        self.assertFalse(session.reprobe_exhausted)
+
+    def test_self_test_returns_bootloader_classification_after_stuck(self) -> None:
+        mgr, session, bridge = self._make_stuck(bootloader_prompts=())
+        session.attached_real_path = "/dev/ttyFAKE0"
+        session.last_error = "BOOTLOADER_STUCK"
+
+        result = mgr.self_test("COM0", timeout_s=0.2)
+
+        self.assertEqual(result.get("classification"), "BOOTLOADER")
+        self.assertEqual(result.get("recommended_action"), "recover_interactive")
+
+    def test_ready_reconfirm_probe_not_sent_when_bootloader_detected(self) -> None:
+        """D1：quiet 過期後若 RX tail 顯示仍卡 bootloader，就不要再對它送 probe bytes。"""
+        mgr, session = self._make_manager()
+        bridge = self._UbootTailBridge()
+        session.bridge = bridge
+        session.state = "READY"
+        session.arm_boot_quiet()
+        session.boot_quiet_until = time.monotonic() - 1.0
+        now = time.monotonic()
+
+        with mgr._lock:
+            valid = mgr._reprobe_target_still_valid_locked(session, bridge, now)
+
+        self.assertFalse(valid, "卡 bootloader 時不得授權 daemon 主動 TX")
+        self.assertEqual(bridge.sent, [])
+        self.assertFalse(session.ready_reconfirm_pending, "應直接落終態，而非無限 pending")
+        self.assertTrue(session.ready_reconfirm_failed)
+
 
 class TestAttachAndRecoverProbeQuietGate(_ManagerMixin):
     """#130 review Finding 2（必修）：attach_session 與 recover_session 共用的
@@ -681,9 +955,14 @@ class TestAgentQuietGateExecute(_ManagerMixin):
         follow = mgr.execute_command(session.session_id, "echo hi", "agent:test", "cmd-2")
         self.assertTrue(follow["ok"], "READY 後 agent 命令不得再被 gate")
 
-    def test_reboot_prompt_return_clears_quiet(self) -> None:
-        """板其實沒重開（2s 內 prompt 回來）：提前返回分支補清 quiet，
-        避免 READY session 白白被 gate 到 180s 過期（belt-and-suspenders）。"""
+    def test_reboot_prompt_return_clears_quiet_only(self) -> None:
+        """2s 內 prompt 回來：提前返回分支只補清 **TX 靜默維度**（quiet），
+        避免 READY session 白白被靜默擋到 180s 過期（belt-and-suspenders）。
+
+        語意變更（#162 回歸修）：此分支**不再** confirm_ready——prpl/OpenWrt 的
+        ``reboot`` 是非同步的，shell 立刻重印 prompt 但板子確實在重開，該回顯不是
+        READY 實證。agent gate 由 ``ready_reconfirm_pending`` 撐住，見
+        ``test_reboot_prompt_return_keeps_pending``。"""
         mgr, session = self._make_manager()
         bridge = FakeBridge(prompt_within_2s=True)
         session.bridge = bridge
@@ -700,9 +979,7 @@ class TestAgentQuietGateExecute(_ManagerMixin):
         )
 
         self.assertTrue(result["ok"])
-        self.assertEqual(session.boot_quiet_until, 0.0)
-        follow = mgr.execute_command(session.session_id, "echo hi", "agent:test", "cmd-2")
-        self.assertTrue(follow["ok"])
+        self.assertEqual(session.boot_quiet_until, 0.0, "TX 靜默維度須解除（#130/#139）")
 
     def test_file_push_gated(self) -> None:
         mgr, session, bridge = self._make_ready_with_quiet()
@@ -949,9 +1226,12 @@ class TestReadyReconfirmGate(_ManagerMixin):
         """READY 確認點逐一清 pending（#162 接線驗證）。
 
         涵蓋：attach probe（``_probe_existing_bridge`` ok 分支，經 attach_session）、
-        reboot 2s prompt-return（``_handle_reboot_command``）、reboot recovery ok
-        （``_spawn_reboot_recovery``）、self-test nonce 成功（``_self_test_impl``）、
-        attach 落定（``_attach_by_id`` 靜態路徑）。"""
+        reboot recovery ok（``_spawn_reboot_recovery``）、self-test nonce 成功
+        （``_self_test_impl``）、attach 落定（``_attach_by_id`` 靜態路徑）。
+
+        #162 回歸修後 reboot 2s prompt-return **不再**是確認點（非同步 reboot 的
+        prompt 回顯不是 READY 實證），移到 ``test_reboot_prompt_return_keeps_pending``
+        以反向斷言釘住。"""
         # --- 1) _probe_existing_bridge ok 分支（attach_session ATTACHED 路徑）---
         mgr, session, bridge = self._make_ready_pending_only()
         session.state = "ATTACHED"
@@ -963,16 +1243,7 @@ class TestReadyReconfirmGate(_ManagerMixin):
         follow = mgr.execute_command(session.session_id, "echo hi", "agent:test", "cmd-f1")
         self.assertTrue(follow["ok"], "確認後 agent 命令不得再被 gate")
 
-        # --- 2) _handle_reboot_command 2s prompt-return 分支 ---
-        mgr, session, bridge = self._make_ready_pending_only()
-        result = mgr._handle_reboot_command(
-            session, bridge, command="reboot", source="agent:test",
-            cmd_id="cmd-r", timeout_s=10.0, execution_mode="line",
-        )
-        self.assertTrue(result["ok"])
-        self.assertFalse(session.ready_reconfirm_pending, "prompt-return 應清 pending")
-
-        # --- 3) _spawn_reboot_recovery ok 分支 ---
+        # --- 2) _spawn_reboot_recovery ok 分支 ---
         mgr, session, bridge = self._make_ready_pending_only()
         session.state = "RECOVERING"
         session.recovering = True
@@ -984,14 +1255,14 @@ class TestReadyReconfirmGate(_ManagerMixin):
         self.assertEqual(session.state, "READY")
         self.assertFalse(session.ready_reconfirm_pending, "reboot recovery READY 應清 pending")
 
-        # --- 4) _self_test_impl READY nonce 成功分支 ---
+        # --- 3) _self_test_impl READY nonce 成功分支 ---
         mgr, session, bridge = self._make_ready_pending_only()
         session.attached_real_path = "/dev/ttyFAKE0"
         result = mgr.self_test("COM0", timeout_s=0.2)
         self.assertEqual(result.get("classification"), "OK")
         self.assertFalse(session.ready_reconfirm_pending, "self-test nonce 成功應清 pending")
 
-        # --- 5) _attach_by_id READY 落定（靜態路徑）---
+        # --- 4) _attach_by_id READY 落定（靜態路徑）---
         mgr, session = self._make_manager()
         session.state = "DETACHED"
         session.arm_boot_quiet()
