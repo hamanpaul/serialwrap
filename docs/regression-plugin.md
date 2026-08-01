@@ -74,7 +74,7 @@ doctor 全綠、testbed 板卡 READY、tmux/minicom 存在、無殘留 throwaway
 
 由 `guards.UBootConsole` 在 harness 層強制（單測釘死），case 無法繞過：
 
-- **允許**：中斷 autoboot、白名單唯讀命令（`printenv`、`bdinfo`、`version`、`help`、`echo`）、以 `boot`／`reset` 離開。
+- **允許**：中斷 autoboot、白名單唯讀命令（`printenv`、`bdinfo`、`version`、`help`、`echo`）、以 `reset`（預設，完整硬重開）或 `boot` 離開。**脫困與收尾一律優先 `reset`**（operator 裁示 2026-08-01）：`boot` 只從當前 bootloader 狀態續走，做過互動後續走的狀態不保證乾淨。
 - **一律拒送（raise）**：`saveenv`、`env save`、`env default`、`setenv`（任何變數）、flash 寫入（`sf`/`nand`/`mmc write`）、`tftpboot`、任何串接（`;`／換行／`&&`／`|`）。
 - 每個 F9 case 收尾必經 `guards.ensure_ready`——板子回 READY 才回報 verdict，不得留在 U-Boot prompt。
 

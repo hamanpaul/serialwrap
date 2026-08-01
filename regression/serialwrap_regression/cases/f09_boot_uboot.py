@@ -289,12 +289,12 @@ def f9_uboot_readonly_and_console_kept(ctx):
                 evidence={"printenv": printenv_path},
             )
 
-        ub.leave("boot")  # 讓板子正常繼續開完機
+        ub.leave("reset")  # 完整硬重開（operator 裁示：脫困一律 reset）
         left = True
         if not guards.ensure_ready(ctx, com, timeout_s=boot_wait_s):
             return CaseResult(
                 "FAIL",
-                reason=f"leave('boot') 後 {boot_wait_s:.0f}s 內未回 READY（板子疑似留在 U-Boot）",
+                reason=f"leave('reset') 後 {boot_wait_s:.0f}s 內未回 READY（板子疑似留在 U-Boot）",
                 category="test", reason_code="board_left_in_uboot",
                 evidence={"printenv": printenv_path},
             )
@@ -306,9 +306,9 @@ def f9_uboot_readonly_and_console_kept(ctx):
         if interrupted and not left:
             try:
                 if ub is not None:
-                    ub.leave("boot")
+                    ub.leave("reset")
             except Exception:
-                ctx.tmux.send(ses, "boot")  # 護欄異常時的最後手段，仍只送 boot
+                ctx.tmux.send(ses, "reset")  # 護欄異常時的最後手段，仍只送 reset
         ctx.tmux.kill(ses)
         # 雙保險：不論上面哪個分支提前 return，都再確認一次板子確實回到 READY。
         guards.ensure_ready(ctx, com, timeout_s=boot_wait_s)
