@@ -348,6 +348,82 @@ def _check_wal_dir() -> dict:
     }
 
 
+def _profile_templates_missing_bootloader_prompts(
+    asset_text: str, live_text: str
+) -> list[str]:
+    """純函式：出貨資產有 ``bootloader_prompts`` 而線上檔沒有的 template 名單。
+
+    只比對兩邊都存在的 template，且只看「資產有、線上無（或為空）」的方向——線上
+    自行加配置不算漂移。YAML 解析失敗一律回空清單（doctor 不得因此失敗）。
+    """
+    try:
+        import yaml
+    except Exception:  # pragma: no cover - 環境相依
+        return []
+    try:
+        asset = yaml.safe_load(asset_text) or {}
+        live = yaml.safe_load(live_text) or {}
+    except Exception:  # noqa: BLE001
+        return []
+    asset_profiles = asset.get("profiles") or {}
+    live_profiles = live.get("profiles") or {}
+    if not isinstance(asset_profiles, dict) or not isinstance(live_profiles, dict):
+        return []
+    drifted: list[str] = []
+    for name, tpl in asset_profiles.items():
+        if not isinstance(tpl, dict) or not tpl.get("bootloader_prompts"):
+            continue
+        live_tpl = live_profiles.get(name)
+        if not isinstance(live_tpl, dict):
+            continue
+        if not live_tpl.get("bootloader_prompts"):
+            drifted.append(str(name))
+    return sorted(drifted)
+
+
+def _check_profile_bootloader_prompts() -> dict:
+    """線上 profile 是否漏了出貨資產有的 ``bootloader_prompts``（#162 C4，WARN）。
+
+    實務動機：線上 ``~/.config/serialwrap/profiles/default.yaml`` 若為舊版物化結果，
+    prpl-template 會缺此欄位，使「卡在 bootloader」的偵測（quiet 解除守衛、
+    recovery lease 授予、self-test BOOTLOADER 分類）整條 no-op——operator 手上拿不到
+    任何 daemon 給的可行動訊號。既有測試只驗資產、驗不到線上檔，故補這項。
+    （偵測本身另有 ``UBOOT_FALLBACK_PROMPTS`` 兜底，故此項僅 advisory WARN。）
+    """
+    from sw_core.constants import PROFILE_DIR
+
+    asset_path = os.path.join(os.path.dirname(__file__), "assets", "profiles", "default.yaml")
+    live_path = os.path.join(PROFILE_DIR, "default.yaml")
+    try:
+        with open(asset_path, encoding="utf-8") as fh:
+            asset_text = fh.read()
+    except Exception:  # noqa: BLE001 - 資產不可讀時本檢查無意義，不得拋出
+        return {"check": "profile_bootloader_prompts", "ok": True, "detail": "資產不可讀，略過", "fix": ""}
+    try:
+        with open(live_path, encoding="utf-8") as fh:
+            live_text = fh.read()
+    except Exception:  # noqa: BLE001 - 尚未 setup 物化過，非漂移
+        return {
+            "check": "profile_bootloader_prompts",
+            "ok": True,
+            "detail": f"線上 profile 未物化（{live_path}），略過",
+            "fix": "",
+        }
+
+    drifted = _profile_templates_missing_bootloader_prompts(asset_text, live_text)
+    if not drifted:
+        return {"check": "profile_bootloader_prompts", "ok": True, "detail": "與出貨資產一致", "fix": ""}
+    return {
+        "check": "profile_bootloader_prompts",
+        "ok": False,
+        "detail": f"線上 {live_path} 的 {', '.join(drifted)} 缺 bootloader_prompts（出貨資產有）",
+        "fix": (
+            "重新物化資產或手動補上：備份現有檔後執行 `serialwrap setup`，"
+            "或把 sw_core/assets/profiles/default.yaml 對應 template 的 bootloader_prompts 段落補進線上檔"
+        ),
+    }
+
+
 # advisory 檢查名單（單一事實來源；sw_core/cli.py re-export 沿用）：這些項 ok=False
 # 僅屬 WARN 性質，不拉低 doctor 整體 ok；機器消費者（realhw/regression preflight 的
 # 「doctor 全綠」判定）依 run_doctor 蓋章的 per-check `advisory` 欄位識別，
@@ -355,10 +431,12 @@ def _check_wal_dir() -> dict:
 DOCTOR_ADVISORY_CHECKS = frozenset({
     "systemd", "wsl_systemd", "devices", "other_serialwrap_installs", "wal_dir",
     "serialwrap_minicom_on_path", "jq_on_path", "minicom_on_path",
+    "profile_bootloader_prompts",
 })
 DOCTOR_ADVISORY_CHECKS_WIN = frozenset({
     "serialwrap_on_path", "serialwrapd_on_path", "daemon_endpoint",
     "devices", "other_serialwrap_installs", "wal_dir",
+    "profile_bootloader_prompts",
 })
 
 
@@ -403,6 +481,7 @@ def run_doctor(fx=None, home=None, *, platform: str | None = None) -> list[dict]
             _check_supervision_mode(home),
             _check_daemon_endpoint(),
             _check_wal_dir(),
+            _check_profile_bootloader_prompts(),
             _check_devices_windows(),
         ])
     return _stamp([
@@ -429,6 +508,7 @@ def run_doctor(fx=None, home=None, *, platform: str | None = None) -> list[dict]
         _check_supervision_mode(home),
         _check_single_daemon(),
         _check_wal_dir(),
+        _check_profile_bootloader_prompts(),
         _check_devices(),
         _check_wsl_systemd(fx),
     ])

@@ -74,7 +74,7 @@ doctor 全綠、testbed 板卡 READY、tmux/minicom 存在、無殘留 throwaway
 
 由 `guards.UBootConsole` 在 harness 層強制（單測釘死），case 無法繞過：
 
-- **允許**：中斷 autoboot、白名單唯讀命令（`printenv`、`bdinfo`、`version`、`help`、`echo`）、以 `boot`／`reset` 離開。
+- **允許**：中斷 autoboot、白名單唯讀命令（`printenv`、`bdinfo`、`version`、`help`、`echo`）、以 `reset`（預設，完整硬重開）或 `boot` 離開。**脫困與收尾一律優先 `reset`**（operator 裁示 2026-08-01）：`boot` 只從當前 bootloader 狀態續走，做過互動後續走的狀態不保證乾淨。
 - **一律拒送（raise）**：`saveenv`、`env save`、`env default`、`setenv`（任何變數）、flash 寫入（`sf`/`nand`/`mmc write`）、`tftpboot`、任何串接（`;`／換行／`&&`／`|`）。
 - 每個 F9 case 收尾必經 `guards.ensure_ready`——板子回 READY 才回報 verdict，不得留在 U-Boot prompt。
 
@@ -92,9 +92,15 @@ doctor 全綠、testbed 板卡 READY、tmux/minicom 存在、無殘留 throwaway
 RX 視窗修剪破壞 offset 語意（絕對偏移記帳根治）：`f2-history-bounded-rss` 已收緊為零容忍
 （任一輪未 done 即 FAIL），並新增決定性重演 case `f2-rx-window-crossing-prompt`。其餘 issue
 修復後可收緊對應 oracle。
-| `f9-spontaneous-reboot-agent-gated` | **FAIL（刻意保留的紅燈哨兵）** | #162：連續重開機後延遲 banner 污染後續命令 stdout（quiet 清空判定過早）——case 的 gate 攔截／quiet 等待／收尾防級聯四段皆驗證正確，紅在「清空後重送」段抓到 #162；修復即轉綠 |
+| `f9-spontaneous-reboot-agent-gated` | 常駐防線（#162 已修，預期綠） | 原 #162 紅燈哨兵：連續重開機後延遲 banner 污染後續命令 stdout（quiet 清空判定過早）。#162 修復＝quiet 清空改綁 READY 再確認（`ready_reconfirm_pending`＋reprobe 確認 probe 消耗 askconsole banner），`_wait_quiet_cleared` 已加等 pending 歸 False；本 case 轉為常駐防線，再紅即回歸 |
 | （bench 事實）COM1 bcm 板 | — | busybox 映像未編入 `base64` applet——F7 逐板 fallback 的「bcm 實證 #157」客觀上不可行（`target_tool_missing` 為真實板端限制，非探測 bug；`md5sum` 存在）|
 
+
+## 部署後置檢查（實機環境）
+
+`serialwrap doctor` 的 **`profile_bootloader_prompts`**（advisory）會比對線上 `~/.config/serialwrap/profiles/default.yaml` 與出貨資產 `sw_core/assets/profiles/default.yaml`。**舊部署環境的線上 profile 不會自動跟隨新資產更新**——2026-08-01 實測本 bench 的 `prpl-template` 就缺 `bootloader_prompts`，導致 `BOOTLOADER` 分類、recovery lease 授予、boot-quiet 的 bootloader 守衛整條 no-op（daemon 卡在 bootloader 時給不出任何可行動訊號）。
+
+修法：`serialwrap setup` 重新物化資產，或備份後手動把出貨資產對應 template 的 `bootloader_prompts` 段落補進線上檔，restart daemon 後確認該檢查轉綠。**新部署環境或升級後請一併檢查。**
 
 ## 從新修好的 bug 新增 case（SOP）
 

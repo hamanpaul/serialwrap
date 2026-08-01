@@ -9,6 +9,9 @@
 - #148：新增 `wal_dir` 檢查，兩份清單同步更新。
 - #149：Linux 清單於 `dialout` 之後新增 human console 就緒檢查組
   `serialwrap_minicom_on_path`／`jq_on_path`／`minicom_on_path`（皆 advisory）。
+- #162：新增 `profile_bootloader_prompts`（線上 profile 是否漏了出貨資產有的
+  `bootloader_prompts`；配置漂移會讓 bootloader 卡死偵測整條 no-op），兩份清單同步
+  更新、同為 advisory（偵測本身另有 UBOOT_FALLBACK_PROMPTS 兜底）。
 """
 from __future__ import annotations
 
@@ -36,6 +39,7 @@ LINUX_CHECKS = [
     "supervision_mode",
     "single_daemon",
     "wal_dir",
+    "profile_bootloader_prompts",
     "devices",
     "wsl_systemd",
 ]
@@ -50,6 +54,7 @@ WINDOWS_CHECKS = [
     "supervision_mode",
     "daemon_endpoint",
     "wal_dir",
+    "profile_bootloader_prompts",
     "devices",
 ]
 
@@ -253,13 +258,14 @@ class TestCliAdvisorySets:
             {"check": "supervision_mode", "ok": True},
             {"check": "daemon_endpoint", "ok": False},
             {"check": "wal_dir", "ok": True},
+            {"check": "profile_bootloader_prompts", "ok": True},
             {"check": "devices", "ok": False},
         ]
         assert "wal_dir" in cli._DOCTOR_ADVISORY_CHECKS_WIN
         assert all(
             item["ok"] or item["check"] in cli._DOCTOR_ADVISORY_CHECKS_WIN for item in report
         )
-        report[-2]["ok"] = False  # wal_dir 掛（shell/daemon 不一致）仍應被 advisory 吸收
+        report[-3]["ok"] = False  # wal_dir 掛（shell/daemon 不一致）仍應被 advisory 吸收
         assert all(
             item["ok"] or item["check"] in cli._DOCTOR_ADVISORY_CHECKS_WIN for item in report
         )
@@ -280,6 +286,7 @@ class TestCliAdvisorySets:
         assert cli._DOCTOR_ADVISORY_CHECKS == {
             "systemd", "wsl_systemd", "devices", "other_serialwrap_installs", "wal_dir",
             "serialwrap_minicom_on_path", "jq_on_path", "minicom_on_path",
+            "profile_bootloader_prompts",
         }
 
 
@@ -432,3 +439,69 @@ class TestAdvisoryStamp:
         by_name = {c["check"]: c for c in report}
         assert by_name["wal_dir"]["advisory"] is True
         assert by_name["python"]["advisory"] is False
+
+
+class TestProfileBootloaderPromptsDrift:
+    """#162 C4：線上 profile 漏了出貨資產有的 ``bootloader_prompts`` → advisory WARN。
+
+    盲點來源：既有 ``tests/test_boot_quiet.py::TestPrplTemplateBootloaderPrompts``
+    只驗**出貨資產**，驗不到線上 ``~/.config/serialwrap/profiles/*.yaml``。實機的
+    prpl-template 就是漂移狀態（只有 brcm-template 有），使 bootloader 卡死偵測
+    整條 no-op——正是事故當下 operator 拿不到任何可行動訊號的原因之一。
+    """
+
+    ASSET = (
+        "profiles:\n"
+        "  prpl-template:\n"
+        "    platform: prpl\n"
+        "    bootloader_prompts:\n"
+        "      - \"^=> $\"\n"
+        "  brcm-template:\n"
+        "    platform: bcm\n"
+        "    bootloader_prompts:\n"
+        "      - \"^CFE> $\"\n"
+    )
+
+    def _drift(self, live: str):
+        from sw_core.doctor_cmd import _profile_templates_missing_bootloader_prompts
+
+        return _profile_templates_missing_bootloader_prompts(self.ASSET, live)
+
+    def test_detects_missing_template(self):
+        live = (
+            "profiles:\n"
+            "  prpl-template:\n"
+            "    platform: prpl\n"
+            "  brcm-template:\n"
+            "    platform: bcm\n"
+            "    bootloader_prompts:\n"
+            "      - \"^CFE> $\"\n"
+        )
+        assert self._drift(live) == ["prpl-template"]
+
+    def test_no_drift_when_aligned(self):
+        assert self._drift(self.ASSET) == []
+
+    def test_ignores_templates_absent_from_live(self):
+        """線上沒有的 template 不算漂移（可能是刻意精簡的自訂 profile）。"""
+        live = (
+            "profiles:\n"
+            "  brcm-template:\n"
+            "    platform: bcm\n"
+            "    bootloader_prompts:\n"
+            "      - \"^CFE> $\"\n"
+        )
+        assert self._drift(live) == []
+
+    def test_malformed_yaml_returns_empty(self):
+        """doctor 永不拋例外：線上檔壞掉時本項降級為「無漂移」而非崩潰。"""
+        assert self._drift("profiles: [oops\n") == []
+
+    def test_check_present_in_both_platform_lists(self):
+        with mock.patch("sw_core.client.rpc_call", lambda *a, **k: {"ok": False}):
+            linux = {i["check"] for i in run_doctor(
+                fx=FakeEffects(systemd=True, in_groups={"dialout"}), platform="linux")}
+            win = {i["check"] for i in run_doctor(
+                fx=FakeEffects(systemd=False, in_groups=set()), platform="win32")}
+        assert "profile_bootloader_prompts" in linux
+        assert "profile_bootloader_prompts" in win

@@ -26,6 +26,10 @@ from .constants import (
     EVENTS_DIR,
     EVENTS_RUNTIME_DIR,
     EVENTS_LOG_PATH,
+    ERROR_READY_UNCONFIRMED,
+    READY_RECONFIRM_MAX_ATTEMPTS,
+    READY_RECONFIRM_MAX_S,
+    READY_RECONFIRM_RETRY_S,
     TTYMCU_PATH,
 )
 from .flash_endpoint import FlashEndpoint, detect_mcu_line, pump_endpoint_to_sink
@@ -602,6 +606,23 @@ class SerialwrapService:
         # 各 READY 轉移點 clear_boot_quiet）。human console／interactive lease 不經此路徑，
         # source 前綴檢查為 belt-and-suspenders（與 execute_command 慣例一致）。
         if not source.startswith("human:"):
+            # #162 有界化（優先於兩個可重試分支）：pending 已逾 READY_RECONFIRM_MAX_S／
+            # READY_RECONFIRM_MAX_ATTEMPTS 落終態——daemon 已無自動路徑可解，回**不可
+            # 重試**的 READY_UNCONFIRMED（刻意不帶 retry_after_s）。若仍回 AUTOBOOT_QUIET，
+            # 呼叫端（回歸 case 的重試迴圈、任何 agent driver）會被一個永遠不可能成功的
+            # 「可重試」錯誤拖進無界迴圈——這正是 #162 引入的回歸。
+            if session.get("ready_reconfirm_failed"):
+                return None, {
+                    "ok": False,
+                    "error_code": ERROR_READY_UNCONFIRMED,
+                    "hint": (
+                        f"READY 已逾 {READY_RECONFIRM_MAX_S:.0f}s／"
+                        f"{READY_RECONFIRM_MAX_ATTEMPTS} 次未能經 nonce probe 再確認"
+                        "（可能卡在 bootloader）；請 session self-test 取分類後 interactive-open 處理"
+                    ),
+                    "recommended_action": "self_test",
+                    "session": session,
+                }
             remaining = session.get("boot_quiet_remaining_s")
             if remaining is not None:
                 return None, {
@@ -609,6 +630,18 @@ class SerialwrapService:
                     "error_code": ERROR_AUTOBOOT_QUIET,
                     "retry_after_s": remaining,
                     "hint": "boot quiet window 進行中（疑似板卡自發重開機）；等 session 重新確認 READY 後重送",
+                    "session": session,
+                }
+            # #162 pending-only：quiet 已過期但 READY 尚未經 nonce probe 再確認——
+            # askconsole（prpl/OpenWrt askfirst）停在啟用提示時，第一個命令的 "\n"
+            # 會觸發啟用、stdout 吃到 banner；等 reprobe 引擎的確認 probe（其 "\n"
+            # 順帶消耗 banner）confirm_ready 後才放行。回應形狀與 quiet 分支一致。
+            if session.get("ready_reconfirm_pending"):
+                return None, {
+                    "ok": False,
+                    "error_code": ERROR_AUTOBOOT_QUIET,
+                    "retry_after_s": READY_RECONFIRM_RETRY_S,
+                    "hint": "boot quiet window 已結束但 READY 尚未重新確認；等 daemon 重新確認 READY 後重送",
                     "session": session,
                 }
         return str(session["session_id"]), None

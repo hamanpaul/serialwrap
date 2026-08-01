@@ -76,8 +76,13 @@ class UBootConsole:
         time.sleep(settle_s)
         return self._capture()
 
-    def leave(self, via: str = "boot") -> None:
-        """以 boot／reset 離開 U-Boot（讓板子正常開完機）；其他方式 raise。"""
+    def leave(self, via: str = "reset") -> None:
+        """離開 U-Boot（讓板子正常開完機）；其他方式 raise。
+
+        預設 ``reset``（operator 裁示 2026-08-01）：`reset` 是完整硬重開，回到與
+        一般開機同一路徑；`boot` 只從當前 U-Boot 狀態續走開機流程，若先前已在
+        bootloader 下做過任何互動，續走的狀態不保證乾淨。脫困與收尾一律優先 reset。
+        """
         if via not in LEAVE_ALLOWED:
             raise UBootGuardError(f"非法離開方式：{via!r}（允許：{LEAVE_ALLOWED}）")
         self._ctx.tmux.send(self._ses, via, enter=True)

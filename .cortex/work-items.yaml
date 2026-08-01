@@ -1,0 +1,12 @@
+version: 1
+work_items:
+  issue-162-ready-reconfirm:
+    title: "#162 quiet 清空改綁 READY 再確認（消除 askconsole banner 污染 stdout）"
+    links:
+      - kind: github_issue
+        ref: "162"
+  issue-161-echo-ack-push:
+    title: "#161 file.push echo-ACK 節流（無流控 console 的傳輸完整性）"
+    links:
+      - kind: github_issue
+        ref: "161"

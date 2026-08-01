@@ -134,6 +134,17 @@ def f9_quiet_window_agent_passthrough(ctx):
                 category="test", reason_code="quiet_window_blocks_agent",
                 evidence={"after-boot-echo": follow_path},
             )
+        if follow.get("error_code") == "READY_UNCONFIRMED":
+            # #162 有界化終態：daemon 已無自動路徑可解（多半板子卡在 bootloader），
+            # 重試迴圈在此**必須**停手——這正是有界化要防的「永遠不可能成功的可重試錯誤」。
+            return CaseResult(
+                "FAIL",
+                reason="READY 再確認逾時／逾次落 READY_UNCONFIRMED 終態"
+                f"（recommended_action={follow.get('recommended_action')}）；"
+                "多半是板子卡在 bootloader，需 self-test 取分類後 interactive-open 處理",
+                category="test", reason_code="ready_unconfirmed",
+                evidence={"after-boot-echo": follow_path},
+            )
         if follow.get("status") != "done" or marker not in (follow.get("stdout") or ""):
             return CaseResult(
                 "FAIL",
@@ -278,12 +289,12 @@ def f9_uboot_readonly_and_console_kept(ctx):
                 evidence={"printenv": printenv_path},
             )
 
-        ub.leave("boot")  # 讓板子正常繼續開完機
+        ub.leave("reset")  # 完整硬重開（operator 裁示：脫困一律 reset）
         left = True
         if not guards.ensure_ready(ctx, com, timeout_s=boot_wait_s):
             return CaseResult(
                 "FAIL",
-                reason=f"leave('boot') 後 {boot_wait_s:.0f}s 內未回 READY（板子疑似留在 U-Boot）",
+                reason=f"leave('reset') 後 {boot_wait_s:.0f}s 內未回 READY（板子疑似留在 U-Boot）",
                 category="test", reason_code="board_left_in_uboot",
                 evidence={"printenv": printenv_path},
             )
@@ -295,26 +306,38 @@ def f9_uboot_readonly_and_console_kept(ctx):
         if interrupted and not left:
             try:
                 if ub is not None:
-                    ub.leave("boot")
+                    ub.leave("reset")
             except Exception:
-                ctx.tmux.send(ses, "boot")  # 護欄異常時的最後手段，仍只送 boot
+                ctx.tmux.send(ses, "reset")  # 護欄異常時的最後手段，仍只送 reset
         ctx.tmux.kill(ses)
         # 雙保險：不論上面哪個分支提前 return，都再確認一次板子確實回到 READY。
         guards.ensure_ready(ctx, com, timeout_s=boot_wait_s)
 
 
 def _wait_quiet_cleared(ctx, com: str, *, timeout_s: float) -> tuple[bool, dict]:
-    """等 boot quiet window 真正清空（state=READY 且 ``boot_quiet_remaining_s`` 歸零）。
+    """等 boot quiet window 真正清空（state=READY、``boot_quiet_remaining_s`` 歸零，
+    且 ``ready_reconfirm_pending`` 已被 READY 再確認清除）。
 
     #139 的自發重開機流程 state **全程停留 READY**——``wait_state(READY)`` 對它是
     no-op（首輪驗收實證：誤用它導致 quiet 窗未清就重送、假 FAIL，且級聯污染下一案）。
+    #162 起 quiet 過期不再等於可下命令：agent gate 綁 READY 再確認（nonce probe），
+    須加等 ``ready_reconfirm_pending`` 歸 False（舊 daemon 無此欄位→falsy，向下相容）。
+    #162 有界化：pending 逾時／逾次會落 ``ready_reconfirm_failed`` 終態——此時 pending
+    雖為 False 但命令會被不可重試的 ``READY_UNCONFIRMED`` 拒絕，故不得視為「已清空」，
+    立即回 False 讓上層走 FAIL 診斷路徑（等下去也不會好）。
     等待「板子真的可下命令」一律以本函式為準。回傳 (是否清空, 最後一次 session dict)。
     """
     deadline = time.monotonic() + timeout_s
     last: dict = {}
     while time.monotonic() < deadline:
         last = ctx.sw.session(com)
-        if last.get("state") == "READY" and last.get("boot_quiet_remaining_s") is None:
+        if last.get("ready_reconfirm_failed"):
+            return False, last
+        if (
+            last.get("state") == "READY"
+            and last.get("boot_quiet_remaining_s") is None
+            and not last.get("ready_reconfirm_pending")
+        ):
             return True, last
         time.sleep(2.0)
     return False, last
