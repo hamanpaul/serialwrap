@@ -83,7 +83,7 @@ doctor 全綠、testbed 板卡 READY、tmux/minicom 存在、無殘留 throwaway
 | case | 狀態 | 原因 |
 |---|---|---|
 | `f4-background-result-tail-consistent` | **FAIL（刻意保留的紅燈哨兵）** | #159：background quiet-window 對快速完成命令整段吞輸出且回 `lost: False`——case 正確抓到產品缺陷，**勿改 oracle 遷就**；#159 修復即轉綠 |
-| `f7-binary-roundtrip-md5`／`f7-larger-file-not-truncated` | 逐板嘗試（prpl 環境性失敗→試 bcm；全板失敗才 SKIP `transfer_env_all_boards`） | #157 已修 chunk/timeout 參數面；真機驗收揭露更深根因＝prpl console 無流控節流掉字（512B chunk echo 於 ~73% 斷）——**#161 echo-ACK 修復後 push 預設走 echo-paced，`f7-binary-roundtrip-md5` 預期 COM0 轉綠**；echo 停滯歸獨立 reason_code `transfer_echo_stall` 可辨識新機制失效。已知限制（#161 範圍外、待另開 issue）：pull 側受 RX 視窗 128KiB 上限（`sw_core/uart_io.py`），1MB pull 的 base64 輸出 ~1.4MB 必 `PULL_PARSE_FAILED`——`f7-larger-file-not-truncated` pull 端仍預期 SKIP |
+| `f7-binary-roundtrip-md5`／`f7-larger-file-not-truncated` | 逐板嘗試（prpl 環境性失敗→試 bcm；全板失敗才 SKIP `transfer_env_all_boards`） | #161 echo-ACK 已交付且安全網驗證正確（停滯即中止、命令未執行、`TRANSFER_ECHO_STALL` 可診斷）；prpl/COM0 仍在**固定的第 449–512 字元**停滯（調 timeout 2.0→5.0 位置不變＝回顯從未到達，屬傳輸層問題）→ **#166** 追蹤。COM1(bcm) 板端缺 `base64` applet，屬獨立板端限制 |
 
 #156（recover CTRL_C 路徑不 flush 佇列）已修——根因＝`SessionManager` 無管道通知
 `CommandArbiter` flush，新增 `on_command_flush` callback 補上該分支（`session_manager.py`
