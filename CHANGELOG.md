@@ -4,6 +4,82 @@
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-08-11
+
+### Fixed
+- CLI 失敗時 stderr 不再丟棄具體錯誤原因（#172）。
+  
+  - `_run_rpc`：原本 `resp.get("error_code") or resp.get("message")` 的 `or` 短路，讓有
+    `error_code` 時 `message` 永遠不會出現在 stderr——對 `SOCKET_ERROR` 來說，`message`
+    正是 `str(OSError)`（errno 與連線細節），三種截然不同的根因（socket 路徑算錯／daemon
+    已死／權限不符）被壓成同一個字串，只讀 stderr 的呼叫端（如 testpilot）事後無法定案。
+    現在 stderr 一行同時輸出 `error_code`、`message`（有值才追加）與 `hint`（有值才追加），
+    形狀為 `serialwrap: {method} failed: {code}[: {message}][（hint: ...)]`；
+    `serialwrap: {method} failed: {code}` 這段前綴逐字保留，既有以 substring 比對
+    `failed: SOCKET_ERROR` 之類的下游不受影響。
+  - 新增 `_mirror_err()` helper，補齊先前只 `_print()` JSON 到 stdout、exit 非零時 stderr
+    卻全空的多個出口：`daemon start` 的 `--endpoint` 拒收 / `--endpoint`,`--socket` 不一致 /
+    systemd 監管模式重導 `service start`（含 `NEEDS_SUDO`）/ Windows 找不到 daemon binary /
+    env file 載入失敗 / daemon 提前結束 / daemon 逾時未就緒；`daemon stop` 重導
+    `service stop` 與 on-demand `daemon.stop` 失敗；`event` 未知子命令與各 `event.*` RPC
+    失敗；`remote`（native Windows 不支援 / tunnel 例外 / 未預期例外）；`setup` 的
+    `FLASHING_BUSY` 兩處；`service` 子命令失敗；未知頂層子命令的 `INVALID_ARGS`。stdout
+    的 JSON 契約與 `ok:True` 路徑完全不動。
+  - 對應實地事故：systemd-system 模式未帶 `--with-sudo` 執行 `daemon start`
+    時，呼叫端原本只拿到 `serialwrap: daemon start failed: ` 這種冒號後空白的字面，
+    現在會看到 `NEEDS_SUDO` 與代跑提示（hint）。
+- 修正 daemon endpoint 無法被非 wrapper client 發現的問題（#173）：POSIX 上
+  `serialwrapd` 過去只有 Windows 後端才會把實際 bind 的 socket 寫回
+  `config.yaml`（理由是「POSIX on-demand 模式下 CLI 一定算得出同一個
+  `SOCKET_PATH` 預設值」），但部署 wrapper 若以 `SERIALWRAP_STATE_DIR` 把 socket
+  搬離 XDG 預設路徑，任何不經過該 wrapper 的 client（例如其他工具內嵌的
+  venv、CI runner）就永遠連不到健康運作中的 daemon，只會拿到
+  `SOCKET_ERROR`，且沒有任何診斷指出真正原因；更危險的是，這類「探測失敗」
+  的 client 若接著自己觸發 on-demand `daemon start`，會在 XDG 預設路徑另外
+  spawn 出第二個 daemon，兩個 daemon 同時開同一批裝置（two-reader）。
+  
+  三處修法：
+  
+  1. **daemon.py**：拿掉 `_write_config_endpoint()` 呼叫外層「僅 Windows」的
+     gate，改為 server 啟動成功後全平台無條件寫入 `config.yaml` 的
+     `socket_path`（`_write_config_endpoint` 本身不變，仍是 best-effort、失敗
+     只記 stderr、不影響 daemon 運行）。讓「daemon 實際綁在哪」有一個與呼叫端
+     環境變數無關的單一事實來源。
+  2. **doctor**：新增 `endpoint_reachable` 檢查（非 advisory，會拉低整體
+     `ok`）。以與 CLI 相同的解析 seam 得出本 client 會連上的 endpoint 與其來源
+     （`config.yaml` 或平台預設），並掃 `/proc` 找出實際執行中的 `serialwrapd`
+     行程與其 `--socket` 引數：沒有任何 daemon 行程時視為 on-demand 模式正常
+     （advisory ok）；有行程但本 client 解析到的 endpoint 連不上時明確判定
+     `not ok`，`detail` 同時列出本 client 解析到的路徑（含來源）與實際執行中
+     daemon 綁定的路徑，方便一分鐘內定位落差，而不是像本次事故那樣耗掉一整個
+     下午。
+  3. **`serialwrap daemon start`（on-demand spawn 防線）**：spawn 新 daemon
+     前先掃 `/proc`，若已有 `serialwrapd` 行程且其 `--socket` 與本次 spawn
+     目標不同，預設拒絕（`error_code=DAEMON_ALREADY_RUNNING_ELSEWHERE`，訊息
+     帶出兩個路徑與修復提示），避免同一批裝置被兩個 daemon 同時開啟；新增
+     `--force-spawn` 供已確認情境下跳過此防線。既有「同一個 socket」的冪等
+     探測路徑不受影響。
+  
+  `sw_core/multi_open.py` 的 `detect_multi_open()` 同步擴充：每個偵測到的
+  daemon 項目現在附帶從 cmdline 擷取到的 `socket`（供上述 doctor 檢查與 spawn
+  防線共用；擷取不到時為 `None`，呼叫端須視為「無法判定、保守處理」）。
+  
+  README.md 與 `docs/serialwrap-spec.md` 補充「自訂 wrapper 若以
+  `SERIALWRAP_STATE_DIR` 搬移 socket，必須讓 config.yaml 同步（本修正後
+  daemon 啟動即自動寫入，不需再手動處理）」的說明。
+- login FSM 硬化：`POST_LOGIN_CMD_TIMEOUT` 混淆三種原因且 `last_error_detail` 恆為 `null`、`brcm-template` 的 `prompt_regex` 未錨定行首在洪流／banner 板上可誤配登入成功。
+  
+  - **送 `post_login_cmd` 前的 login guard**：`login_fsm._finalize_ready()` 送出前先查 rx tail 是否命中 `login_regex`／`password_regex`（`login_fsm.matches_login_or_password()`）——命中就代表 `prompt_regex` 誤配（如 BDK login banner 的 `#####` 裝飾線／CEVENT 洪流被誤配成 prompt）、`_maybe_login` 整段被跳過，此時**絕不**把 `post_login_cmd` 當帳密送進 login prompt，直接回可行動的 `LOGIN_REQUIRED`。
+  - **失敗分流**：`POST_LOGIN_CMD_TIMEOUT`／`READY_NONCE_TIMEOUT` 逾時後，若 rx tail 已回到 login/password prompt（憑證錯導致板子重印 `login:`，或 guard 仍漏接的邊界情況），改分流為 `LOGIN_REQUIRED`，不再與「登入成功但指令無回應」擠同一個 timeout 碼。`LOGIN_REQUIRED` 依既有 RX_FLOOD 反分類原則永不被遮蔽。
+  - **`last_error_detail` 帶 rx tail**：`session_manager._refine_probe_failure()`（attach/recover/reprobe/自動登入五處呼叫共用的單一 choke point）在 login FSM 失敗碼（`login_fsm.LOGIN_FSM_DETAIL_ERRORS`）未被翻轉為 `TRANSPORT_STALL` 時，附上失敗當下的 rx tail（`clean_text()` 去控制碼／ANSI 後截尾 300 字元），取代舊行為恆為 `null`。
+  - **出貨 `brcm-template` 的 `prompt_regex` 錨定行首**：`(?m)[>#]\s*$` → `(?m)^(?:.*[^>#\s])?[>#][ \t]*$`，並排除連續 `#`/`>` 裝飾線；`login_regex` 維持不錨定行首（getty 是 `<hostname> login: `，錨定會打壞這個最常見格式）。
+  - **login recovery lease**：`session_manager.interactive_open(..., allow_attached=True)` 的 `ATTACHED` 分支，bootloader prompt／boot banner 皆未命中時再檢查 rx tail 是否命中 `login_regex`／`password_regex`——命中則同樣授予 recovery lease，回應標 `login_required: true`（比照既有 `boot_interrupt` 欄位模式），讓 agent／人可用 `interactive-send` 打帳密把 session 救回 `READY`，不必整個 `device release`。三者皆未命中才維持既有 `NOT_BOOTLOADER`。
+  - **`serialwrap profile test --profile <name> --sample <file> [--profile-dir DIR]`**：離線診斷子命令，不連 daemon、不碰任何 UART，對樣本文字跑 prompt/login/password/bootloader regex，stdout 印 JSON 回報命中結果，供 operator 收緊 regex 前先驗證，不必上板試錯。
+  
+  canonical 規格見 `openspec/specs/session-interactive/spec.md`（interactive_open 的 login recovery lease 分支）；`README.md` / `docs/serialwrap-spec.md` 同步。
+  
+  **regression-case 評估**：mock/unit 已覆蓋 guard／分流／last_error_detail／regex 四類樣本／login recovery lease／`profile test` CLI，共 5 個新測試檔＋既有 login FSM／RX_FLOOD／bootloader-recovery 回歸線全綠。「真板 login banner 誤配」（S2'／S4）屬只有實機才驗得到的行為，建議新增 F10（登入帳密 family）realhw case 作 follow-up，不在本 PR 實作。
+
 ## [0.3.0] - 2026-08-01
 
 ### Added
