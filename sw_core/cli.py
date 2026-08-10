@@ -353,7 +353,20 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
     if not is_win and not getattr(args, "force_spawn", False):
         conflict = _find_conflicting_daemon(sock)
         if conflict is not None:
-            existing_socket = conflict.get("socket") or "未知（無法從 /proc 讀出 --socket，可能是舊版 daemon）"
+            known_socket = conflict.get("socket")
+            existing_socket = known_socket or "未知（無法從 /proc 讀出 --socket，可能是舊版 daemon）"
+            # review：socket 讀不出來時不可把佔位字串塞進 --socket 建議（不可用且誤導），
+            # 改建議先以 daemon status / multi_open_detail 確認，逃生門只剩 --force-spawn。
+            if known_socket:
+                hint = (
+                    f"改用 --socket {known_socket} 指向現有 daemon；"
+                    "確認後要強制另起才加 --force-spawn"
+                )
+            else:
+                hint = (
+                    "先用 `serialwrap daemon status`（看 multi_open_detail）確認現有 daemon 的 "
+                    "socket；確認後要強制另起才加 --force-spawn"
+                )
             _print({
                 "ok": False,
                 "error_code": "DAEMON_ALREADY_RUNNING_ELSEWHERE",
@@ -362,7 +375,7 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
                     f"與本次 daemon start 目標 {sock} 不同；為避免同一批裝置被兩個 daemon "
                     "同時開啟（two-reader），預設拒絕再 spawn 一個。"
                 ),
-                "hint": f"改用 --socket {existing_socket} 指向現有 daemon；確認後要強制另起才加 --force-spawn",
+                "hint": hint,
                 "existing_socket": conflict.get("socket"),
                 "existing_pid": conflict["pid"],
                 "target_socket": sock,
@@ -602,8 +615,20 @@ def _resolve_default_endpoint_with_source() -> tuple[str, str]:
             cfg_sock = rc.socket_path()
         except Exception:  # noqa: BLE001
             cfg_sock = None
-    source = "config.yaml" if cfg_sock else "預設（SOCKET_PATH，受 SERIALWRAP_STATE_DIR/XDG 環境變數影響）"
-    return _resolve_endpoint(_NoOverrideArgs()), source
+    resolved = _resolve_endpoint(_NoOverrideArgs())
+    if cfg_sock:
+        # review：_resolve_endpoint 可能因 #108 dangling fallback 改連 canonical
+        # endpoint（回傳值 ≠ config.yaml 記錄）；來源標籤必須如實區分，否則 doctor
+        # 顯示「來源：config.yaml」但實際連線位址不是，診斷會誤導。
+        if resolved == cfg_sock:
+            source = "config.yaml"
+        else:
+            source = (
+                f"config.yaml（記錄 {cfg_sock} 不可連，#108 dangling fallback 改用 canonical）"
+            )
+    else:
+        source = "預設（SOCKET_PATH，受 SERIALWRAP_STATE_DIR/XDG 環境變數影響）"
+    return resolved, source
 
 
 def _effective_timeout_s(args: argparse.Namespace, method: str) -> float:

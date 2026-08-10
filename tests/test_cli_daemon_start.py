@@ -359,6 +359,29 @@ class TestDaemonStartSpawnGuard(unittest.TestCase):
         self.assertIn("/run/serialwrap/serialwrapd.sock", payload["message"])
         self.assertIn("--force-spawn", payload["hint"])
 
+    def test_reject_hint_without_socket_does_not_suggest_placeholder(self) -> None:
+        """review：/proc 讀不出既有 daemon 的 --socket 時，hint 不得建議
+        `--socket <佔位字串>`（不可用且誤導）；改建議 daemon status 確認 + --force-spawn。"""
+        conflict = {"pid": 2114, "socket": None}
+        with (
+            mock.patch("sw_core.cli.should_auto_spawn", return_value=True),
+            mock.patch("sw_core.cli._probe_healthy_daemon", return_value=False),
+            mock.patch("sw_core.cli._find_conflicting_daemon", return_value=conflict),
+            mock.patch("sw_core.cli.subprocess.Popen") as popen,
+            mock.patch("sw_core.cli._print") as printer,
+        ):
+            rc = cli._run_daemon_start(self._args())
+
+        self.assertEqual(rc, 2)
+        popen.assert_not_called()
+        payload = printer.call_args.args[0]
+        self.assertEqual(payload["error_code"], "DAEMON_ALREADY_RUNNING_ELSEWHERE")
+        self.assertIsNone(payload["existing_socket"])
+        self.assertNotIn("--socket 未知", payload["hint"])
+        self.assertNotIn("--socket 未知", payload["message"])
+        self.assertIn("daemon status", payload["hint"])
+        self.assertIn("--force-spawn", payload["hint"])
+
     def test_force_spawn_bypasses_guard(self) -> None:
         proc = mock.Mock(pid=4321, returncode=None)
         proc.poll.return_value = None

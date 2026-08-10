@@ -108,5 +108,42 @@ class TestCheckEndpointReachable(unittest.TestCase):
         self.assertIn("未知", result["detail"])
 
 
+class TestResolveDefaultEndpointSourceLabel(unittest.TestCase):
+    """review：#108 dangling fallback 使 _resolve_endpoint 回傳值 ≠ config.yaml 記錄時，
+    來源標籤必須如實標示 fallback，不得仍寫「config.yaml」誤導 doctor 判讀。"""
+
+    def test_source_label_marks_dangling_fallback(self) -> None:
+        from sw_core.cli import _resolve_default_endpoint_with_source
+
+        rc = mock.MagicMock()
+        rc.socket_path.return_value = "/tmp/wrapper/serialwrapd.sock"  # config 記錄（已 dangling）
+        with (
+            mock.patch("sw_core.cli._safe_runtime_config", return_value=rc),
+            mock.patch(
+                "sw_core.cli._resolve_endpoint",
+                return_value="/run/user/1000/serialwrap/serialwrapd.sock",  # fallback 後的 canonical
+            ),
+        ):
+            endpoint, source = _resolve_default_endpoint_with_source()
+        self.assertEqual(endpoint, "/run/user/1000/serialwrap/serialwrapd.sock")
+        self.assertIn("fallback", source)
+        self.assertIn("/tmp/wrapper/serialwrapd.sock", source)
+
+    def test_source_label_plain_config_when_resolved_matches(self) -> None:
+        from sw_core.cli import _resolve_default_endpoint_with_source
+
+        rc = mock.MagicMock()
+        rc.socket_path.return_value = "/tmp/wrapper/serialwrapd.sock"
+        with (
+            mock.patch("sw_core.cli._safe_runtime_config", return_value=rc),
+            mock.patch(
+                "sw_core.cli._resolve_endpoint",
+                return_value="/tmp/wrapper/serialwrapd.sock",
+            ),
+        ):
+            endpoint, source = _resolve_default_endpoint_with_source()
+        self.assertEqual(source, "config.yaml")
+
+
 if __name__ == "__main__":
     unittest.main()
