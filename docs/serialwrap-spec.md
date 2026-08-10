@@ -418,7 +418,44 @@ dynamic 自動偵測 session 的 COM 編號**依裝置 by-id 字典序確定性�
 - **`serialwrap daemon status`**（RPC `health.status`）→ 回應加欄位：
   - `multi_open`（bool）。
   - `foreign_holders`（`{tty_real_path: pid}`）：持有目前 attach 中 tty 的 pid。
-  - `multi_open_detail`：`{"daemons": [{"pid": N}, ...], "holders_status": "ok" | "permission" | "unknown"}`。`holders_status` 在跨 uid 讀不到 `/proc/<pid>/fd` 時降級為 `permission`、procfs 不可用時為 `unknown`，此降級資訊本身即為輸出契約的一部分。
+  - `multi_open_detail`：`{"daemons": [{"pid": N, "socket": "<path>" | null}, ...], "holders_status": "ok" | "permission" | "unknown"}`。`holders_status` 在跨 uid 讀不到 `/proc/<pid>/fd` 時降級為 `permission`、procfs 不可用時為 `unknown`，此降級資訊本身即為輸出契約的一部分。`socket`（#173）為從各 daemon `--socket` 引數擷取的值（`sw_core/multi_open.py` 的 `_extract_socket_arg`），擷取不到時為 `null`。
+
+### 8.5a Endpoint 發現與跨進程一致性（#173）
+
+**根因**：POSIX `serialwrapd` 過去只有 Windows 後端會把有效 bind endpoint 寫回
+`config.yaml::socket_path`（`sw_core/daemon.py` `_write_config_endpoint`，理由是「POSIX
+on-demand 模式 CLI 一定算得出同一個 `SOCKET_PATH` 預設值」）。當部署 wrapper 以
+`SERIALWRAP_STATE_DIR` 之類的環境變數把 socket 搬離 XDG 預設路徑時，這個假設不成立：
+任何不經過該 wrapper 的 client 永遠解析不到 daemon 實際綁定的路徑，只會拿到
+`SOCKET_ERROR`，且沒有任何診斷指出真正原因；若該 client 進一步觸發 on-demand
+`daemon start`，還可能在 XDG 預設路徑另外 spawn 出第二個 daemon（two-reader）。
+
+**修法**（三個獨立防線）：
+
+1. **無條件寫入**：`_run_async` 於 `server.start()` 成功後呼叫
+   `_write_effective_endpoint(args)`（薄 wrapper，逕呼 `_write_config_endpoint`），全平台
+   一律寫入，不再有 `select_rpc_backend() == "win"` 的 gate。POSIX／Windows 現在行為對稱。
+2. **doctor `endpoint_reachable` 檢查**（`sw_core/doctor_cmd.py`，非 advisory）：
+   - 以與 CLI 相同的解析 seam（`cli._resolve_default_endpoint_with_source`，本質是
+     `_resolve_endpoint` 套一個「未帶 `--endpoint`/`--socket`」的 args 替身）得出本 client
+     會連上的 endpoint 與其來源（`config.yaml` 或平台預設）。
+   - 掃 `/proc` 找執行中的 `serialwrapd` 行程（沿用 `detect_multi_open`）。
+   - 判定：無 daemon 行程 → `ok=True`（on-demand 模式正常，不掛入
+     `DOCTOR_ADVISORY_CHECKS` 是因為「有行程但連不上」這個真正異常必須拉低整體 `ok`，
+     而非被 advisory 吞掉）；有行程且本 client 解析到的 endpoint 連不上 → `ok=False`，
+     `detail` 同時列出本 client 解析到的路徑（含來源）與實際執行中 daemon 綁定的路徑。
+3. **`daemon start` on-demand spawn 防線**（`cli._run_daemon_start`）：既有的「探測
+   `_resolve_endpoint(args)` 是否已有健康 daemon」冪等路徑之後、實際 `subprocess.Popen`
+   spawn 之前，新增 `cli._find_conflicting_daemon(sock)`——ground-truth 直接掃 `/proc`
+   （不依賴 `config.yaml`，因為後者正是本 issue 想修的東西，暫時失準時不能拿來當唯一防線）：
+   若找到「行程存在且其 `--socket` 與本次 spawn 目標 `sock` 不同」的 `serialwrapd`，回傳
+   `error_code=DAEMON_ALREADY_RUNNING_ELSEWHERE`（訊息帶出兩個路徑與修復提示），
+   `rc=2`、不 spawn。新增 CLI flag `--force-spawn` 可跳過此防線；與目標 `sock` 相同的既有
+   daemon 不算衝突（既有冪等探測已經處理）。
+
+**已知邊界**：`--force-spawn` 是使用者顯式的逃生門，不做進一步限制；`_find_conflicting_daemon`
+在找到第一個 socket 不同的行程即回傳，多個既有 daemon 並存時只回報其中一個（診斷已足夠指向
+「有衝突」，逐一列舉留給 `serialwrap daemon status` 的 `multi_open_detail`）。
 
 ### 8.6 human console 就緒檢查組（#149）
 

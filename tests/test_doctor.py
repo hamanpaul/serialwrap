@@ -38,6 +38,8 @@ LINUX_CHECKS = [
     "systemd",
     "supervision_mode",
     "single_daemon",
+    # #173：本 client 解析到的 endpoint 是否與實際執行中 daemon 一致且可連。
+    "endpoint_reachable",
     "wal_dir",
     "profile_bootloader_prompts",
     "devices",
@@ -161,7 +163,7 @@ class TestWindowsDoctor:
 
     def test_windows_has_no_linux_only_checks(self):
         names = {i["check"] for i in self._win_report()}
-        assert names.isdisjoint({"dialout", "systemd", "wsl_systemd", "single_daemon"})
+        assert names.isdisjoint({"dialout", "systemd", "wsl_systemd", "single_daemon", "endpoint_reachable"})
 
     def test_pyserial_ok_when_importable(self):
         item = next(i for i in self._win_report() if i["check"] == "pyserial")

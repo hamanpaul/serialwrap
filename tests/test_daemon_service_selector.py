@@ -132,6 +132,45 @@ def test_write_config_endpoint_writes_socket_path(tmp_path, monkeypatch):
     assert rc.mode() == "on-demand"  # supervision_mode 不應被覆蓋
 
 
+# ──────────────────────── _write_effective_endpoint ────────────────────────
+# #173：POSIX 也要無條件寫入 config.yaml socket_path（先前只有 win backend 會寫）。
+
+
+def test_write_effective_endpoint_called_unconditionally_on_posix(monkeypatch, tmp_path):
+    """posix 後端：_write_effective_endpoint 仍須呼叫 _write_config_endpoint（#173 回歸 pin）。
+
+    先前 _run_async 內用 ``if select_rpc_backend() == "win":`` gate 住這個呼叫，POSIX
+    永遠不寫 config.yaml——本測試把 gate 拿掉後的行為釘住：即使後端明確是 posix，
+    _write_effective_endpoint 仍要以 ``args.socket`` 呼叫一次 _write_config_endpoint。
+    """
+    import sw_core.platform_backends as pb
+    monkeypatch.setattr(pb, "select_rpc_backend", lambda backend=None: "posix")
+
+    import sw_core.daemon as daemon_mod
+    calls: list[str] = []
+    monkeypatch.setattr(daemon_mod, "_write_config_endpoint", lambda ep: calls.append(ep))
+
+    args = daemon_mod.build_parser().parse_args(["--socket", str(tmp_path / "custom.sock")])
+    daemon_mod._write_effective_endpoint(args)
+
+    assert calls == [str(tmp_path / "custom.sock")]
+
+
+def test_write_effective_endpoint_called_unconditionally_on_win(monkeypatch, tmp_path):
+    """win 後端：既有行為（#84 PORT-4）不應被本次重構破壞，仍要呼叫一次。"""
+    import sw_core.platform_backends as pb
+    monkeypatch.setattr(pb, "select_rpc_backend", lambda backend=None: "win")
+
+    import sw_core.daemon as daemon_mod
+    calls: list[str] = []
+    monkeypatch.setattr(daemon_mod, "_write_config_endpoint", lambda ep: calls.append(ep))
+
+    args = daemon_mod.build_parser().parse_args(["--socket", "tcp://127.0.0.1:48700"])
+    daemon_mod._write_effective_endpoint(args)
+
+    assert calls == ["tcp://127.0.0.1:48700"]
+
+
 # ─────────────────────── RuntimeConfig.set_socket ──────────────────────────
 
 

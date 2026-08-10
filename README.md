@@ -1587,7 +1587,16 @@ serialwrap daemon status   # multi_open / foreign_holders 欄位
 - **`serialwrap daemon status`**：回應加三個欄位：
   - `multi_open`（bool）：是否偵測到一個以上 `serialwrapd`。
   - `foreign_holders`（`{tty_real_path: pid}`）：哪個 pid 持有目前 attach 中的 tty。
-  - `multi_open_detail`：`{"daemons": [{"pid": N}, ...], "holders_status": "ok" | "permission" | "unknown"}`。`holders_status` 在跨 uid 讀不到 `/proc/<pid>/fd` 時降級為 `permission`（仍確認另有 daemon 存在，但無法判定持有哪條 tty）；procfs 不可用時為 `unknown`。
+  - `multi_open_detail`：`{"daemons": [{"pid": N, "socket": "<path>" | null}, ...], "holders_status": "ok" | "permission" | "unknown"}`。`holders_status` 在跨 uid 讀不到 `/proc/<pid>/fd` 時降級為 `permission`（仍確認另有 daemon 存在，但無法判定持有哪條 tty）；procfs 不可用時為 `unknown`。`socket`（#173）是從各 daemon 的 `--socket` 引數擷取的值，讀不到時為 `null`。
+
+#### 自訂安裝路徑與 config.yaml 同步（#173）
+
+`serialwrapd` 啟動成功後一律把有效 bind endpoint 寫回 `config.yaml::socket_path`（POSIX／Windows 皆同）；任何未帶 `--socket`/`--endpoint` 的 client 都靠這個欄位發現 daemon 實際在哪。**若你的部署 wrapper 用環境變數（如 `SERIALWRAP_STATE_DIR`）把 socket 搬離 XDG 預設路徑，不需要再手動同步——daemon 自己會把實際生效的路徑寫進 `config.yaml`**。唯一要注意的是：不同的 wrapper／呼叫方之間 `SERIALWRAP_CONFIG_DIR`（或 `XDG_CONFIG_HOME`）必須解析到同一份 `config.yaml`，否則各自讀寫互不相干的檔案，等同沒有同步。
+
+兩個防線可提早抓到落差：
+
+- `serialwrap doctor` 的 `endpoint_reachable` 檢查：無 `serialwrapd` 行程在跑時為 advisory ok（on-demand 模式尚未啟動不是異常）；有行程在跑但本 client 解析到的 endpoint 連不上時判定 `not ok`，`detail` 同時列出本 client 解析到的路徑（含來源：`config.yaml` 或平台預設）與實際執行中 daemon 綁定的路徑。
+- `serialwrap daemon start` 的 on-demand spawn 防線：spawn 新 daemon 前先掃 `/proc`，若已有 `serialwrapd` 綁在與本次目標不同的 socket，預設拒絕（`error_code=DAEMON_ALREADY_RUNNING_ELSEWHERE`），避免同一批裝置被兩個 daemon 同時開啟（two-reader）；確認要另起一個獨立 daemon 才加 `--force-spawn`。同一個 socket 的既有冪等探測（已有健康 daemon 時 no-op）不受影響。
 
 ### Recover
 
@@ -1755,7 +1764,7 @@ serialwrap wal current-seq
 
 Windows daemon 以 **TCP loopback** 取代 AF_UNIX 做 RPC 控制通道，使 serialwrap CLI/agent 在 Windows 擁有完整指令路徑：
 
-- **RPC endpoint**：預設 `tcp://127.0.0.1:48700`，可以 `--socket` 參數或環境變數 `SERIALWRAP_ENDPOINT`（覆寫整個 endpoint，如 `tcp://127.0.0.1:50000`）、`SERIALWRAP_TCP_PORT`（僅覆寫 port 部分）覆寫。daemon 啟動後會把有效 endpoint 寫入 `config.yaml::socket_path`，CLI `_resolve_endpoint` 自動讀取。
+- **RPC endpoint**：預設 `tcp://127.0.0.1:48700`，可以 `--socket` 參數或環境變數 `SERIALWRAP_ENDPOINT`（覆寫整個 endpoint，如 `tcp://127.0.0.1:50000`）、`SERIALWRAP_TCP_PORT`（僅覆寫 port 部分）覆寫。daemon 啟動後會把有效 endpoint 寫入 `config.yaml::socket_path`，CLI `_resolve_endpoint` 自動讀取（#173 起 POSIX daemon 亦同，見下方「自訂安裝路徑與 config.yaml 同步」）。
 - **Singleton 鎖**：`msvcrt.locking`（`LK_NBLCK`）+ TCP connect 探測（`WindowsSingletonLock`，`sw_core/lock_win.py`）。語意與 POSIX `SingletonLock`（flock + Unix socket probe）對齊：endpoint 可連 → `DAEMON_ALREADY_RUNNING`；stale → 取得 msvcrt 檔鎖。
 - **COM 列舉與藍牙排除**：從 Windows registry `HKLM\HARDWARE\DEVICEMAP\SERIALCOMM` 列舉所有 COM port（`WindowsDeviceSource`，`sw_core/device_source.py`）；雙重排除藍牙——BTHENUM PortName 掃描（主判據）+ `bthmodem` device path 啟發式（兜底），確保藍牙裝置**永不被接管**。額外手動排除清單：`config.yaml::windows.exclude_coms`（如 `["COM3"]`）。
 - **閒置非藍牙 COM 自動接管**：偵測到不在排除清單的 COM 時，daemon 以 `passthrough` profile 自動建立 session（可觀察 UART 輸出；需要下命令請先 pin 適當 profile 並 attach）。已持續被外部程序佔用的 COM **不會每輪自動輪詢重試**（與 POSIX dynamic-session 同語意；需拔插或手動 `session bind`/`session clear` 觸發）。

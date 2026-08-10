@@ -348,6 +348,75 @@ def _check_wal_dir() -> dict:
     }
 
 
+def _check_endpoint_reachable(proc_root: str = "/proc") -> dict:
+    """本 client 解析到的 endpoint 是否與實際執行中的 daemon 一致且可連（#173）。
+
+    根因：POSIX daemon 過去不寫 config.yaml 的 socket_path，加上部署 wrapper 常以
+    ``SERIALWRAP_STATE_DIR`` 搬移 socket，使『daemon 實際在哪』與『本 client 會解析到
+    哪』可能永久分歧，且此前沒有任何診斷指出這件事。
+
+    判定（與 CLI 相同的解析 seam，見 :func:`sw_core.cli._resolve_default_endpoint_with_source`）：
+
+    - ``/proc`` 掃不到任何 serialwrapd 行程 → advisory ok（on-demand 模式尚未啟動
+      daemon 本身不是異常）。
+    - 有 daemon 行程，本 client 解析到的 endpoint 可連 → ok。
+    - 有 daemon 行程，但本 client 解析到的 endpoint 連不上 → **not ok**，detail 同時
+      點出本 client 解析到的路徑（含來源）與實際執行中 daemon 綁定的路徑，方便 operator
+      在一分鐘內對照 SERIALWRAP_STATE_DIR／config.yaml 是否同步（而非像事故現場那樣
+      耗掉一整個下午）。
+    """
+    from sw_core.cli import _endpoint_alive, _resolve_default_endpoint_with_source  # 延遲匯入避免循環
+    from .multi_open import detect_multi_open
+
+    try:
+        resolved, source = _resolve_default_endpoint_with_source()
+    except Exception as exc:  # pragma: no cover - 探測永不拋
+        return {
+            "check": "endpoint_reachable",
+            "ok": True,
+            "detail": f"無法解析本 client 的 endpoint（{exc}），略過",
+            "fix": "",
+        }
+
+    mo = detect_multi_open(proc_root=proc_root)
+    daemons = mo["daemons"]
+    if not daemons:
+        return {
+            "check": "endpoint_reachable",
+            "ok": True,
+            "detail": f"未偵測到執行中的 serialwrapd（on-demand 模式正常）；本 client 解析到 {resolved}（來源：{source}）",
+            "fix": "",
+        }
+
+    try:
+        reachable = _endpoint_alive(resolved)
+    except Exception:  # pragma: no cover - 探測永不拋
+        reachable = False
+    if reachable:
+        return {
+            "check": "endpoint_reachable",
+            "ok": True,
+            "detail": f"本 client 解析到 {resolved}（來源：{source}），可連上執行中 daemon",
+            "fix": "",
+        }
+
+    daemon_sockets = sorted({d.get("socket") or "未知（無法從 /proc 讀出 --socket）" for d in daemons})
+    daemon_desc = "、".join(daemon_sockets)
+    return {
+        "check": "endpoint_reachable",
+        "ok": False,
+        "detail": (
+            f"本 client 解析到 {resolved}（來源：{source}）連不上；"
+            f"目前執行中 daemon 綁在 {daemon_desc}"
+        ),
+        "fix": (
+            "確認本 client 的 SERIALWRAP_STATE_DIR/config.yaml 是否與該 daemon 一致"
+            "（可用 --socket/--endpoint 明確指定該路徑繞過解析；"
+            "daemon 若為 #173 修正後版本，重啟一次即會把實際 socket 同步寫回 config.yaml）"
+        ),
+    }
+
+
 def _profile_templates_missing_bootloader_prompts(
     asset_text: str, live_text: str
 ) -> list[str]:
@@ -507,6 +576,7 @@ def run_doctor(fx=None, home=None, *, platform: str | None = None) -> list[dict]
         _check_systemd(fx),
         _check_supervision_mode(home),
         _check_single_daemon(),
+        _check_endpoint_reachable(),
         _check_wal_dir(),
         _check_profile_bootloader_prompts(),
         _check_devices(),

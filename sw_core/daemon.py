@@ -87,6 +87,19 @@ def _write_config_endpoint(endpoint: str) -> None:
         sys.stderr.write(f"serialwrapd: 寫入 config.yaml endpoint 失敗（非致命）: {exc}\n")
 
 
+def _write_effective_endpoint(args: argparse.Namespace) -> None:
+    """server 啟動成功後，把有效 bind endpoint 寫入 config.yaml（全平台，#173）。
+
+    先前僅 Windows（``select_rpc_backend() == "win"``）呼叫 :func:`_write_config_endpoint`，
+    理由是「POSIX on-demand 模式下 CLI 一定算得出同一個 SOCKET_PATH 預設值，不需要
+    config.yaml 記錄」。這個假設在部署 wrapper 以 ``SERIALWRAP_STATE_DIR`` 搬移 socket
+    位置時不成立：任何不經過該 wrapper 的 client（如其他工具內嵌的 venv）永遠連不到
+    daemon，且沒有任何診斷機制能指出這件事（#173 根因）。改為全平台無條件寫入，讓
+    「daemon 實際綁在哪」有一個與呼叫端 env 無關的單一事實來源。
+    """
+    _write_config_endpoint(args.socket)
+
+
 def _make_windows_passthrough_templates(
     templates: list[ProfileTemplate],
 ) -> list[ProfileTemplate]:
@@ -172,11 +185,10 @@ async def _run_async(args: argparse.Namespace) -> int:
     try:
         service.start()
         await server.start()
-        # Windows：server 啟動後寫入有效 tcp endpoint，CLI _resolve_endpoint 靠此發現 daemon（#84 PORT-4）。
-        # POSIX 不需要：systemd setup 已寫 config，on-demand 模式 CLI 直接 fallback 到 SOCKET_PATH 預設值。
-        from sw_core.platform_backends import select_rpc_backend  # noqa: PLC0415
-        if select_rpc_backend() == "win":
-            _write_config_endpoint(args.socket)
+        # server 啟動後寫入有效 endpoint，CLI _resolve_endpoint 靠此發現 daemon
+        # （#84 PORT-4 起 Windows 皆如此；#173 起 POSIX 也無條件寫入，理由見
+        # _write_effective_endpoint docstring）。
+        _write_effective_endpoint(args)
         await stop_event.wait()
     finally:
         await server.stop()
