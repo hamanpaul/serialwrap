@@ -29,3 +29,6 @@ tags
 # brag 影片的 HyperFrames 生成專案（產出 brag.mp4/brag.gif 已提交；source 不入版控）
 brag-output/composition/
 regression/serialwrap_regression/testbed.yaml
+
+# session-local dispatch/runtime artifacts（勿入版控；R-21 教訓 2026-08-11）
+runtime/
