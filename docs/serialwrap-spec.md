@@ -609,6 +609,22 @@ background mode 的 `command.result_tail` 在 capture 尚未建立時，會回�
 - `serialwrap wal export`
 - `serialwrap session pin|unpin`
 
+#### CLI 失敗輸出（stdout JSON + stderr 一行，#94／#172）
+
+任何子命令回應 `ok:false`（或非 RPC 的內部錯誤出口，如 `daemon start` 監管模式
+gate、`REMOTE_NOT_SUPPORTED`、`INVALID_ARGS`）且 exit code 非零時：
+
+- **stdout**：機器可解析 JSON（契約不變，含 `ok`／`error_code`／`message`／`hint` 等欄位）。
+- **stderr**：固定補一行 `serialwrap: {method 或 context} failed: {error_code}[: {message}][（hint: ...)]`。
+  - `{error_code}` 一定露出（下游可用 substring 比對，如 `failed: SOCKET_ERROR`）；
+    `message`／`hint` 有值才追加在後，缺席不補空段。
+  - #172 修正前：`_run_rpc` 用 `error_code or message` 短路，有 `error_code` 時
+    `message` 永遠看不到——`SOCKET_ERROR` 的 `message` 正是 `str(OSError)`（區分
+    socket 路徑算錯／daemon 已死／權限不符的關鍵資訊），且多個非 RPC 錯誤出口
+    （`daemon start`／`daemon stop`／`event`／`remote`／`setup`／`service` 等）
+    完全不印 stderr，只讀 stderr 判讀失敗原因的呼叫端（如 testpilot）因此拿到空
+    字串或只有 code 沒有原因。現已涵蓋所有「`_print(ok:false)` + 非零 exit」出口。
+
 #### session pin / unpin（動態裝置 profile 持久化，#95）
 
 `serialwrap session pin --selector <COM|alias|by-id|by-path> --profile <name>` 把裝置釘到指定 profile（最高優先，繞過動態偵測，跨重啟保留）；`serialwrap session unpin --selector <...>` 解除 pin（保留自動 sticky）。
