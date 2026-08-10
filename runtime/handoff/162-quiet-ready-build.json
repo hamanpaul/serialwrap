@@ -1,0 +1,100 @@
+{
+  "branch": "feature/162-quiet-ready-build",
+  "completed_at": "2026-08-06T03:33:15.780661+00:00",
+  "completion": "exited",
+  "completion_record_hash": null,
+  "completion_record_path": null,
+  "exit_code": 0,
+  "gate_reason": "persona-catalog-unreadable",
+  "gate_status": "needs_human",
+  "gate_verdict": {
+    "candidate": "8f3632a75037b9f2845589d81540454145c7d287",
+    "details": {
+      "ancestry": {
+        "args": [
+          "-C",
+          "/home/paul_chen/prj_pri/serialwrap",
+          "merge-base",
+          "--is-ancestor",
+          "9dc214a93e14ef960e10b4bfc4ceb1e8ad7a5c90",
+          "8f3632a75037b9f2845589d81540454145c7d287"
+        ],
+        "returncode": 0,
+        "status": "ok",
+        "stderr": "",
+        "stdout": ""
+      },
+      "branch": "feature/162-quiet-ready-build",
+      "candidate": "8f3632a75037b9f2845589d81540454145c7d287",
+      "candidate_worktree_head": "8f3632a75037b9f2845589d81540454145c7d287",
+      "candidate_worktree_status": {
+        "status": "ok",
+        "stderr": "",
+        "stdout": ""
+      },
+      "checks": [],
+      "dispatch_base": "9dc214a93e14ef960e10b4bfc4ceb1e8ad7a5c90",
+      "full_suite": {
+        "base": null,
+        "candidate": null,
+        "cleanup": null,
+        "comparison": null,
+        "status": "skipped"
+      },
+      "persona_catalog": {
+        "commit": "9dc214a93e14ef960e10b4bfc4ceb1e8ad7a5c90",
+        "error": {
+          "args": [
+            "-C",
+            "/home/paul_chen/prj_pri/serialwrap",
+            "show",
+            "9dc214a93e14ef960e10b4bfc4ceb1e8ad7a5c90:paulsha_cortex/persona/personas.yaml"
+          ],
+          "returncode": 128,
+          "status": "non-zero",
+          "stderr": "fatal: path 'paulsha_cortex/persona/personas.yaml' does not exist in '9dc214a93e14ef960e10b4bfc4ceb1e8ad7a5c90'\n",
+          "stdout": ""
+        },
+        "path": "paulsha_cortex/persona/personas.yaml"
+      },
+      "repo_root": "/home/paul_chen/prj_pri/serialwrap",
+      "required_artifact_diff": {
+        "args": [
+          "-C",
+          "/home/paul_chen/prj_pri/serialwrap",
+          "-c",
+          "core.quotepath=false",
+          "diff",
+          "--name-only",
+          "9dc214a93e14ef960e10b4bfc4ceb1e8ad7a5c90..8f3632a75037b9f2845589d81540454145c7d287"
+        ],
+        "returncode": 0,
+        "status": "ok",
+        "stderr": "",
+        "stdout": "README.md\nchangelog.d/162-ready-reconfirm-gate.md\ndocs/regression-plugin.md\ndocs/serialwrap-spec.md\nregression/serialwrap_regression/cases/f09_boot_uboot.py\nsw_core/assets/skill/SKILL.md\nsw_core/constants.py\nsw_core/service.py\nsw_core/session_manager.py\ntests/test_boot_quiet.py\n"
+      },
+      "required_artifacts": [],
+      "scope": {
+        "changed_paths": [],
+        "status": "skipped",
+        "violations": []
+      },
+      "tests": [],
+      "worktree": "/home/paul_chen/prj_pri/serialwrap-worktrees/feature-162-quiet-ready-build"
+    },
+    "schema_version": 1,
+    "slice_id": "162-quiet-ready-build",
+    "status": "needs_human",
+    "summary": "persona-catalog-unreadable"
+  },
+  "job_id": "162-quiet-ready-build-8",
+  "plan_hash": "91b58914f9be309ee3e04e50a39988815b692a2966604138ed7f96a6e72d3ebf",
+  "review_evaluation_hash": null,
+  "review_evaluation_path": null,
+  "slice_id": "162-quiet-ready-build",
+  "slice_state": "needs_human",
+  "spec_hash": "57e6e45fc012fe3ed162a309d80c7e77b0a07fe4ed7f533bdbe18a8caebe5e33",
+  "verification_evidence_hash": "81c199058043685f078689f3787989508707c45a58e4f5ecf2ecb1b6ef4f5ed5",
+  "verification_evidence_path": "/home/paul_chen/.agents/coordinator/evidence/verification/162-quiet-ready-build-8f3632a75037b9f2845589d81540454145c7d287.json",
+  "verification_hash": "eaa4129a694ed38ec44f57272855fda189ebfb25c373cff9fe9a2f0c76d40acc"
+}

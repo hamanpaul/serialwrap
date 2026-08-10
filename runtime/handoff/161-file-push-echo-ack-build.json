@@ -1,0 +1,100 @@
+{
+  "branch": "feature/161-file-push-echo-ack-build",
+  "completed_at": "2026-08-06T03:33:16.044013+00:00",
+  "completion": "exited",
+  "completion_record_hash": null,
+  "completion_record_path": null,
+  "exit_code": 0,
+  "gate_reason": "persona-catalog-unreadable",
+  "gate_status": "needs_human",
+  "gate_verdict": {
+    "candidate": "7ae0698398c26afacc7ea11a54aa5df1ebe80d1c",
+    "details": {
+      "ancestry": {
+        "args": [
+          "-C",
+          "/home/paul_chen/prj_pri/serialwrap",
+          "merge-base",
+          "--is-ancestor",
+          "9dc214a93e14ef960e10b4bfc4ceb1e8ad7a5c90",
+          "7ae0698398c26afacc7ea11a54aa5df1ebe80d1c"
+        ],
+        "returncode": 0,
+        "status": "ok",
+        "stderr": "",
+        "stdout": ""
+      },
+      "branch": "feature/161-file-push-echo-ack-build",
+      "candidate": "7ae0698398c26afacc7ea11a54aa5df1ebe80d1c",
+      "candidate_worktree_head": "7ae0698398c26afacc7ea11a54aa5df1ebe80d1c",
+      "candidate_worktree_status": {
+        "status": "ok",
+        "stderr": "",
+        "stdout": ""
+      },
+      "checks": [],
+      "dispatch_base": "9dc214a93e14ef960e10b4bfc4ceb1e8ad7a5c90",
+      "full_suite": {
+        "base": null,
+        "candidate": null,
+        "cleanup": null,
+        "comparison": null,
+        "status": "skipped"
+      },
+      "persona_catalog": {
+        "commit": "9dc214a93e14ef960e10b4bfc4ceb1e8ad7a5c90",
+        "error": {
+          "args": [
+            "-C",
+            "/home/paul_chen/prj_pri/serialwrap",
+            "show",
+            "9dc214a93e14ef960e10b4bfc4ceb1e8ad7a5c90:paulsha_cortex/persona/personas.yaml"
+          ],
+          "returncode": 128,
+          "status": "non-zero",
+          "stderr": "fatal: path 'paulsha_cortex/persona/personas.yaml' does not exist in '9dc214a93e14ef960e10b4bfc4ceb1e8ad7a5c90'\n",
+          "stdout": ""
+        },
+        "path": "paulsha_cortex/persona/personas.yaml"
+      },
+      "repo_root": "/home/paul_chen/prj_pri/serialwrap",
+      "required_artifact_diff": {
+        "args": [
+          "-C",
+          "/home/paul_chen/prj_pri/serialwrap",
+          "-c",
+          "core.quotepath=false",
+          "diff",
+          "--name-only",
+          "9dc214a93e14ef960e10b4bfc4ceb1e8ad7a5c90..7ae0698398c26afacc7ea11a54aa5df1ebe80d1c"
+        ],
+        "returncode": 0,
+        "status": "ok",
+        "stderr": "",
+        "stdout": "README.md\nchangelog.d/161-file-push-echo-ack.md\ndocs/regression-plugin.md\nregression/serialwrap_regression/cases/f07_file_transfer.py\nsw_core/cli.py\nsw_core/file_transfer.py\nsw_core/service.py\nsw_core/session_manager.py\nsw_core/uart_io.py\ntests/test_file_transfer.py\ntests/test_file_transfer_chunk_config.py\ntests/test_uart_io.py\n"
+      },
+      "required_artifacts": [],
+      "scope": {
+        "changed_paths": [],
+        "status": "skipped",
+        "violations": []
+      },
+      "tests": [],
+      "worktree": "/home/paul_chen/prj_pri/serialwrap-worktrees/feature-161-file-push-echo-ack-build"
+    },
+    "schema_version": 1,
+    "slice_id": "161-file-push-echo-ack-build",
+    "status": "needs_human",
+    "summary": "persona-catalog-unreadable"
+  },
+  "job_id": "161-file-push-echo-ack-build-9",
+  "plan_hash": "d7ee6774f3fbd441f16d83f02869e6abaf9808d280bc090c2dfd8fa521406207",
+  "review_evaluation_hash": null,
+  "review_evaluation_path": null,
+  "slice_id": "161-file-push-echo-ack-build",
+  "slice_state": "needs_human",
+  "spec_hash": "00b01f6a16d27d205a702b0d6dc4fafe4a9254eb30abddad820ee9c84b721992",
+  "verification_evidence_hash": "c14a6dfa2565d8f1391de110f5ec63f21c0b288258768fc3640975390427dee4",
+  "verification_evidence_path": "/home/paul_chen/.agents/coordinator/evidence/verification/161-file-push-echo-ack-build-7ae0698398c26afacc7ea11a54aa5df1ebe80d1c.json",
+  "verification_hash": "eaa4129a694ed38ec44f57272855fda189ebfb25c373cff9fe9a2f0c76d40acc"
+}
