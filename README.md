@@ -41,7 +41,7 @@ materializes profiles, the broker minicom wrapper, and daemon supervision, see
 including diagrams and field validation notes, see [繁體中文](#繁體中文).
 
 ```bash
-pipx install "git+https://github.com/hamanpaul/serialwrap@v0.3.0"
+pipx install "git+https://github.com/hamanpaul/serialwrap@v0.3.1"
 serialwrap setup
 serialwrap doctor
 ```
@@ -119,7 +119,7 @@ On WSL, enable systemd in `/etc/wsl.conf` and run `wsl --shutdown`; otherwise
 
 ```bash
 # Managed install
-pipx install "git+https://github.com/hamanpaul/serialwrap@v0.3.0"
+pipx install "git+https://github.com/hamanpaul/serialwrap@v0.3.1"
 serialwrap setup
 serialwrap doctor
 
@@ -1082,7 +1082,7 @@ flowchart TD
 
 ```bash
 # 安裝（正式流程）
-pipx install "git+https://github.com/hamanpaul/serialwrap@v0.3.0"
+pipx install "git+https://github.com/hamanpaul/serialwrap@v0.3.1"
 serialwrap setup     # 物化 profiles/skill/minicom、設定 daemon（systemd 或 on-demand fallback）
 serialwrap doctor    # 驗證環境
 ```
@@ -2177,7 +2177,7 @@ Handler **建議**：
 ## 安裝
 
 ```bash
-pipx install "git+https://github.com/hamanpaul/serialwrap@v0.3.0"
+pipx install "git+https://github.com/hamanpaul/serialwrap@v0.3.1"
 serialwrap setup     # 物化 profiles/skill/minicom、設定 daemon（systemd 或 on-demand fallback）
 serialwrap doctor    # 驗證環境
 ```
