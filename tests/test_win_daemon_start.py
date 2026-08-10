@@ -46,6 +46,10 @@ def _run_with_mocks(args, monkeypatch, backend: str, rpc_side_effect=None):
     with (
         mock.patch("sw_core.cli._safe_runtime_config", return_value=None),
         mock.patch("sw_core.cli._probe_healthy_daemon", return_value=False),
+        # #173：spawn 防線會掃真實 /proc；測試固定回報「無衝突」，避免測到本機真的在跑的
+        # daemon 而使這批既有 spawn 路徑測試變成環境相依（見 TestConflictingDaemonGuard
+        # 另外對此防線本身做隔離的 fake /proc 驗證）。
+        mock.patch("sw_core.cli._find_conflicting_daemon", return_value=None),
         mock.patch("sw_core.cli._resolve_daemon_start_env_files", return_value=[]),
         mock.patch("sw_core.cli._load_daemon_start_env_files", return_value=({}, [])),
         mock.patch("sw_core.cli.subprocess.Popen", return_value=proc) as popen,

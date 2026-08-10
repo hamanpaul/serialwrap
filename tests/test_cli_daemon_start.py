@@ -4,6 +4,7 @@ import argparse
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from sw_core import cli
@@ -73,6 +74,8 @@ targets:
         with (
             mock.patch("sw_core.cli.should_auto_spawn", return_value=True),
             mock.patch("sw_core.cli._probe_healthy_daemon", return_value=False),
+            # #173：spawn 防線掃真實 /proc，固定回報「無衝突」避免測到本機真實 daemon。
+            mock.patch("sw_core.cli._find_conflicting_daemon", return_value=None),
             mock.patch("sw_core.cli._resolve_daemon_start_env_files", return_value=["/tmp/OPI.env"]),
             mock.patch("sw_core.cli._load_daemon_start_env_files", return_value=({"SW_OPI_U": "haman"}, ["/tmp/OPI.env"])),
             mock.patch("sw_core.cli.subprocess.Popen", return_value=proc) as popen,
@@ -101,6 +104,8 @@ targets:
         with (
             mock.patch("sw_core.cli.should_auto_spawn", return_value=True),
             mock.patch("sw_core.cli._probe_healthy_daemon", return_value=False),
+            # #173：spawn 防線掃真實 /proc，固定回報「無衝突」避免測到本機真實 daemon。
+            mock.patch("sw_core.cli._find_conflicting_daemon", return_value=None),
             mock.patch("sw_core.cli._resolve_daemon_start_env_files", return_value=["/tmp/OPI.env"]),
             mock.patch("sw_core.cli._load_daemon_start_env_files", side_effect=cli.EnvFileSourceError("/tmp/OPI.env", "bad env")),
             mock.patch("sw_core.cli._print") as printer,
@@ -128,6 +133,8 @@ targets:
         with (
             mock.patch("sw_core.cli._safe_runtime_config", return_value=None),
             mock.patch("sw_core.cli._probe_healthy_daemon", return_value=False) as probe,
+            # #173：spawn 防線掃真實 /proc，固定回報「無衝突」避免測到本機真實 daemon。
+            mock.patch("sw_core.cli._find_conflicting_daemon", return_value=None),
             mock.patch("sw_core.cli._resolve_daemon_start_env_files", return_value=[]),
             mock.patch("sw_core.cli._load_daemon_start_env_files", return_value=({}, [])),
             mock.patch("sw_core.cli.subprocess.Popen", return_value=proc) as popen,
@@ -263,6 +270,137 @@ class TestDaemonStartSupervision(unittest.TestCase):
         self.assertTrue(printer.call_args.args[0]["ok"])
         # 確認走 on-demand RPC daemon.stop（非 systemd 重導），且未 traceback
         self.assertEqual(rpc.call_args.args[1], "daemon.stop")
+
+
+def _make_fake_proc(proc_root, spec: dict) -> None:
+    """依 spec 佈置 fake /proc：{pid: {"cmdline": str}}（鏡射 test_multi_open_detect）。"""
+    proc_root.mkdir(parents=True, exist_ok=True)
+    for pid, info in spec.items():
+        pdir = proc_root / str(pid)
+        pdir.mkdir()
+        (pdir / "cmdline").write_bytes(info.get("cmdline", "").encode())
+        (pdir / "fd").mkdir()
+
+
+class TestFindConflictingDaemon(unittest.TestCase):
+    """`cli._find_conflicting_daemon`（#173 spawn 防線的純函式部分，掃 fake /proc）。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.proc = Path(self._tmp.name) / "proc"
+
+    def test_no_daemons_returns_none(self) -> None:
+        _make_fake_proc(self.proc, {"3000": {"cmdline": "bash\0"}})
+        self.assertIsNone(cli._find_conflicting_daemon("/tmp/target.sock", proc_root=str(self.proc)))
+
+    def test_same_socket_returns_none(self) -> None:
+        """既有 daemon 就綁在同一個 sock：既有冪等探測路徑已處理，本防線不重複擋。"""
+        _make_fake_proc(
+            self.proc,
+            {"2114": {"cmdline": "python\0serialwrapd.py\0--socket\0/tmp/target.sock\0"}},
+        )
+        self.assertIsNone(cli._find_conflicting_daemon("/tmp/target.sock", proc_root=str(self.proc)))
+
+    def test_different_socket_returns_conflict(self) -> None:
+        _make_fake_proc(
+            self.proc,
+            {"2114": {"cmdline": "python\0serialwrapd.py\0--socket\0/run/serialwrap/serialwrapd.sock\0"}},
+        )
+        conflict = cli._find_conflicting_daemon("/tmp/target.sock", proc_root=str(self.proc))
+        self.assertIsNotNone(conflict)
+        self.assertEqual(conflict["pid"], 2114)
+        self.assertEqual(conflict["socket"], "/run/serialwrap/serialwrapd.sock")
+
+    def test_unknown_socket_returns_conflict(self) -> None:
+        """--socket 擷取不到（None）仍視為衝突——無法排除是同機另一個 daemon 佔用中。"""
+        _make_fake_proc(self.proc, {"2114": {"cmdline": "python\0serialwrapd.py\0"}})
+        conflict = cli._find_conflicting_daemon("/tmp/target.sock", proc_root=str(self.proc))
+        self.assertIsNotNone(conflict)
+        self.assertIsNone(conflict["socket"])
+
+
+class TestDaemonStartSpawnGuard(unittest.TestCase):
+    """`daemon start` on-demand spawn 前的『同機已有其他 socket 的 daemon』防線（#173）。"""
+
+    def _args(self, **overrides) -> argparse.Namespace:
+        base = dict(
+            profile_dir="/tmp/profiles",
+            socket="/tmp/target.sock",
+            lock="/tmp/serialwrap.lock",
+            foreground=False,
+            with_sudo=False,
+            endpoint=None,
+            force_spawn=False,
+        )
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def test_rejects_spawn_when_conflicting_daemon_found(self) -> None:
+        conflict = {"pid": 2114, "socket": "/run/serialwrap/serialwrapd.sock"}
+        with (
+            mock.patch("sw_core.cli.should_auto_spawn", return_value=True),
+            mock.patch("sw_core.cli._probe_healthy_daemon", return_value=False),
+            mock.patch("sw_core.cli._find_conflicting_daemon", return_value=conflict) as finder,
+            mock.patch("sw_core.cli.subprocess.Popen") as popen,
+            mock.patch("sw_core.cli._print") as printer,
+        ):
+            rc = cli._run_daemon_start(self._args())
+
+        self.assertEqual(rc, 2)
+        popen.assert_not_called()
+        finder.assert_called_once_with("/tmp/target.sock")
+        payload = printer.call_args.args[0]
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error_code"], "DAEMON_ALREADY_RUNNING_ELSEWHERE")
+        self.assertEqual(payload["existing_socket"], "/run/serialwrap/serialwrapd.sock")
+        self.assertEqual(payload["existing_pid"], 2114)
+        self.assertEqual(payload["target_socket"], "/tmp/target.sock")
+        self.assertIn("/run/serialwrap/serialwrapd.sock", payload["message"])
+        self.assertIn("--force-spawn", payload["hint"])
+
+    def test_force_spawn_bypasses_guard(self) -> None:
+        proc = mock.Mock(pid=4321, returncode=None)
+        proc.poll.return_value = None
+        with (
+            mock.patch("sw_core.cli.should_auto_spawn", return_value=True),
+            mock.patch("sw_core.cli._probe_healthy_daemon", return_value=False),
+            mock.patch("sw_core.cli._find_conflicting_daemon") as finder,
+            mock.patch("sw_core.cli._resolve_daemon_start_env_files", return_value=[]),
+            mock.patch("sw_core.cli._load_daemon_start_env_files", return_value=({}, [])),
+            mock.patch("sw_core.cli.subprocess.Popen", return_value=proc) as popen,
+            mock.patch("sw_core.cli.rpc_call", side_effect=[{"ok": True}, {"ok": True}]),
+            mock.patch("sw_core.cli.time.sleep"),
+            mock.patch("sw_core.cli._print") as printer,
+        ):
+            rc = cli._run_daemon_start(self._args(force_spawn=True))
+
+        self.assertEqual(rc, 0)
+        finder.assert_not_called()
+        popen.assert_called_once()
+        self.assertTrue(printer.call_args.args[0]["ok"])
+
+    def test_no_conflict_spawns_normally(self) -> None:
+        """同 socket（或無其他 daemon）：既有冪等/spawn 路徑不變。"""
+        proc = mock.Mock(pid=4321, returncode=None)
+        proc.poll.return_value = None
+        with (
+            mock.patch("sw_core.cli.should_auto_spawn", return_value=True),
+            mock.patch("sw_core.cli._probe_healthy_daemon", return_value=False),
+            mock.patch("sw_core.cli._find_conflicting_daemon", return_value=None) as finder,
+            mock.patch("sw_core.cli._resolve_daemon_start_env_files", return_value=[]),
+            mock.patch("sw_core.cli._load_daemon_start_env_files", return_value=({}, [])),
+            mock.patch("sw_core.cli.subprocess.Popen", return_value=proc) as popen,
+            mock.patch("sw_core.cli.rpc_call", side_effect=[{"ok": True}, {"ok": True}]),
+            mock.patch("sw_core.cli.time.sleep"),
+            mock.patch("sw_core.cli._print") as printer,
+        ):
+            rc = cli._run_daemon_start(self._args())
+
+        self.assertEqual(rc, 0)
+        finder.assert_called_once_with("/tmp/target.sock")
+        popen.assert_called_once()
+        self.assertTrue(printer.call_args.args[0]["ok"])
 
 
 if __name__ == "__main__":

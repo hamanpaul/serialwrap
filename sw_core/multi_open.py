@@ -62,6 +62,27 @@ def _is_serialwrapd(proc_root: str, pid: int) -> bool:
     return False
 
 
+def _extract_socket_arg(proc_root: str, pid: int) -> str | None:
+    """讀 ``/proc/<pid>/cmdline`` 擷取 ``--socket`` 參數值（#173）。
+
+    支援 ``--socket X``（分開兩個 argv）與 ``--socket=X``（單一 argv）兩種形式，
+    對應 :func:`sw_core.daemon.build_parser` 用 argparse 產生的 argv。讀不到 cmdline
+    或找不到 ``--socket`` 一律回傳 ``None``（呼叫端須視為「無法判定，保守當作衝突」）。
+    """
+    try:
+        with open(f"{proc_root}/{pid}/cmdline", "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return None
+    parts = [p.decode("utf-8", "surrogateescape") for p in raw.split(b"\0") if p]
+    for i, part in enumerate(parts):
+        if part == "--socket" and i + 1 < len(parts):
+            return parts[i + 1]
+        if part.startswith("--socket="):
+            return part[len("--socket="):]
+    return None
+
+
 def detect_multi_open(proc_root: str = "/proc", tty_paths: list[str] | None = None) -> dict:
     """偵測同機多開與 tty 持有者。
 
@@ -70,7 +91,10 @@ def detect_multi_open(proc_root: str = "/proc", tty_paths: list[str] | None = No
         tty_paths: 要比對持有者的 tty real_path 清單（daemon status 帶入已 attach 的裝置）。
 
     Returns:
-        ``{multi_open, daemons:[{pid}], holders:{tty:pid}, holders_status}``。
+        ``{multi_open, daemons:[{pid, socket}], holders:{tty:pid}, holders_status}``。
+        每個 daemon 的 ``socket``（#173）為從其 cmdline 擷取的 ``--socket`` 參數值，
+        擷取不到時為 ``None``（呼叫端如 ``serialwrap daemon start`` 的 spawn 防線、
+        doctor 的 ``endpoint_reachable`` 須視為「無法判定，保守處理」）。
         ``holders_status``：
 
         - ``ok``：所有 daemon 的 fd 都讀得到。
@@ -83,7 +107,11 @@ def detect_multi_open(proc_root: str = "/proc", tty_paths: list[str] | None = No
     except OSError:
         return {"multi_open": False, "daemons": [], "holders": {}, "holders_status": "unknown"}
 
-    daemons = [{"pid": pid} for pid in pids if _is_serialwrapd(proc_root, pid)]
+    daemons = [
+        {"pid": pid, "socket": _extract_socket_arg(proc_root, pid)}
+        for pid in pids
+        if _is_serialwrapd(proc_root, pid)
+    ]
 
     holders: dict[str, int] = {}
     status = "ok"

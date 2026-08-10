@@ -276,6 +276,28 @@ def _probe_healthy_daemon(endpoint: str) -> bool:
     return bool(resp.get("ok"))
 
 
+def _find_conflicting_daemon(sock: str, proc_root: str = "/proc") -> dict[str, Any] | None:
+    """POSIX：掃 /proc 找是否已有 serialwrapd 綁在與 ``sock`` 不同的 socket（#173）。
+
+    ground-truth 來自 /proc（實際 argv），不依賴 config.yaml——後者在本 issue 修正前可能
+    從未寫入，修正後也可能因為多份安裝／舊 daemon 尚未重啟而暫時失準。
+
+    Returns:
+        第一個「行程存在且其 ``--socket`` 與 ``sock`` 不同」的 daemon 資訊
+        （``{"pid": int, "socket": str | None}``）；沒有 daemon，或既有 daemon 就綁在
+        同一個 ``sock``（既有冪等探測路徑已處理），回傳 ``None``。socket 從 cmdline 擷取
+        不到時（``None``，可能是舊版 daemon 或非典型 argv）仍視為衝突，因為無法排除是
+        同機另一個 daemon 佔用中。
+    """
+    from .multi_open import detect_multi_open  # noqa: PLC0415
+
+    mo = detect_multi_open(proc_root=proc_root)
+    for d in mo["daemons"]:
+        if d.get("socket") != sock:
+            return d
+    return None
+
+
 def _run_daemon_start(args: argparse.Namespace) -> int:
     is_win = _rpc_backend_is_win()  # backend 不會於呼叫中途改變，一次判定全函式共用
     ep_arg = getattr(args, "endpoint", None)
@@ -323,6 +345,29 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
         sock = ep_arg
     else:
         sock = _local_default_endpoint()
+    # POSIX spawn 防線（#173）：冪等探測（上方 endpoint probe）只看「本 client 解析到的
+    # endpoint 是否健康」，config.yaml 記錄與實際 daemon 綁定的 socket 可能分歧（本 issue
+    # 根因）。直接掃 /proc 找 ground-truth：若已有 serialwrapd 綁在與本次 spawn 目標不同的
+    # socket，預設拒絕再開一個，避免同一批裝置被兩個 daemon 同時開啟（two-reader）。
+    # --force-spawn 可跳過；win backend 無 /proc 可掃，不適用。
+    if not is_win and not getattr(args, "force_spawn", False):
+        conflict = _find_conflicting_daemon(sock)
+        if conflict is not None:
+            existing_socket = conflict.get("socket") or "未知（無法從 /proc 讀出 --socket，可能是舊版 daemon）"
+            _print({
+                "ok": False,
+                "error_code": "DAEMON_ALREADY_RUNNING_ELSEWHERE",
+                "message": (
+                    f"偵測到另一個 serialwrapd（pid={conflict['pid']}）綁在 {existing_socket}，"
+                    f"與本次 daemon start 目標 {sock} 不同；為避免同一批裝置被兩個 daemon "
+                    "同時開啟（two-reader），預設拒絕再 spawn 一個。"
+                ),
+                "hint": f"改用 --socket {existing_socket} 指向現有 daemon；確認後要強制另起才加 --force-spawn",
+                "existing_socket": conflict.get("socket"),
+                "existing_pid": conflict["pid"],
+                "target_socket": sock,
+            })
+            return 2
     if is_win:
         daemon_argv = _daemon_spawn_argv()
         if daemon_argv is None:
@@ -532,6 +577,33 @@ def _resolve_endpoint(args: argparse.Namespace) -> str:
             )
             return canonical
     return chosen
+
+
+class _NoOverrideArgs:
+    """最小 args 替身：模擬『未帶 --endpoint/--socket』的一般 client 呼叫（#173 doctor 用）。"""
+
+    endpoint = None
+    socket = None
+
+
+def _resolve_default_endpoint_with_source() -> tuple[str, str]:
+    """比照一般未帶 ``--endpoint``/``--socket`` 的 client，解析其會連上的 endpoint，並回傳來源標籤。
+
+    來源標籤：``"config.yaml"``（讀到 config.yaml 記錄的 ``socket_path``）或
+    ``"預設"``（config.yaml 缺席／不可讀，落到 ``SOCKET_PATH``／``DEFAULT_ENDPOINT`` 平台
+    預設，可受 ``SERIALWRAP_STATE_DIR``／``SERIALWRAP_RUN_DIR`` 等環境變數影響）。
+    endpoint 本身透過 :func:`_resolve_endpoint` 解析（含 #108 dangling fallback），
+    故 doctor 據此得出的診斷與 CLI 實際行為不會分歧（#173）。
+    """
+    rc = _safe_runtime_config()
+    cfg_sock = None
+    if rc is not None:
+        try:
+            cfg_sock = rc.socket_path()
+        except Exception:  # noqa: BLE001
+            cfg_sock = None
+    source = "config.yaml" if cfg_sock else "預設（SOCKET_PATH，受 SERIALWRAP_STATE_DIR/XDG 環境變數影響）"
+    return _resolve_endpoint(_NoOverrideArgs()), source
 
 
 def _effective_timeout_s(args: argparse.Namespace, method: str) -> float:
@@ -985,6 +1057,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="systemd-system 模式下，daemon start 重導至 service start 時以 sudo 執行",
+    )
+    p_ds.add_argument(
+        "--force-spawn",
+        dest="force_spawn",
+        action="store_true",
+        default=False,
+        help=(
+            "跳過『已有其他 socket 的 serialwrapd 在跑』防線，強制在本次目標 socket "
+            "另外 spawn（#173；預設拒絕，避免同機誤開第二個 daemon 造成 two-reader）"
+        ),
     )
 
     p_dstop = daemon_sub.add_parser("stop", help="停止執行中的 daemon")
