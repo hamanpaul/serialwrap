@@ -947,8 +947,13 @@ def _profile_test_check(pattern: str, sample_text: str) -> dict[str, Any]:
     m = regex.search(sample_text)
     if not m:
         return {"pattern": pattern, "matched": False, "matched_line": None, "error": None}
-    prefix_lines = sample_text[: m.end()].splitlines()
-    matched_line = prefix_lines[-1] if prefix_lines else m.group()
+    # review：matched_line 必須是命中處所在的**完整原始行**（供 operator 目視核對），
+    # 舊寫法 sample_text[:m.end()] 取尾行，regex 只命中行內片段時會回截斷片段。
+    line_start = sample_text.rfind("\n", 0, m.start()) + 1
+    line_end = sample_text.find("\n", m.start())
+    if line_end == -1:
+        line_end = len(sample_text)
+    matched_line = sample_text[line_start:line_end]
     return {"pattern": pattern, "matched": True, "matched_line": matched_line, "error": None}
 
 

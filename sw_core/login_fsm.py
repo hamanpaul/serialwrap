@@ -9,6 +9,7 @@ from .auth import SessionAuth
 from .config import ProfileTemplate, SessionProfile
 from .constants import BOOT_BANNER_PATTERNS, ERROR_RX_FLOOD, RX_FLOOD_BYTES_PER_10S
 from .uart_io import UARTBridge
+from .util import clean_text
 
 # RX 洪水可遮蔽的失敗碼集合（#153）：這些碼在「console 被灌爆」時全是同一個病灶
 # （probe/等待被洪水淹沒），反分類為 RX_FLOOD 讓上層知道該等排空而非重建 session。
@@ -130,7 +131,7 @@ def _probe_prompt(bridge: UARTBridge, sp: SessionProfile) -> bool:
 
 def _classify_non_ready_state(bridge: UARTBridge, sp: SessionProfile) -> str:
     snapshot = bridge.rx_tail()
-    if re.search(sp.login_regex, snapshot):
+    if matches_login_or_password(snapshot, sp):
         return "LOGIN_REQUIRED"
     return "PROMPT_UNAVAILABLE"
 
@@ -138,17 +139,22 @@ def _classify_non_ready_state(bridge: UARTBridge, sp: SessionProfile) -> str:
 def matches_login_or_password(text: str, sp: SessionProfile) -> bool:
     """``text`` 是否命中 ``sp`` 的 ``login_regex`` 或 ``password_regex``（#174）。
 
-    invalid regex 容錯（略過該 pattern，不拋例外）。跨 login FSM 內部 guard／分流
-    與 ``session_manager.interactive_open`` 的 login recovery lease 共用同一判準，
-    避免兩處各自維護一份、語意漂移。
+    比對前先 ``clean_text()`` 去除 ANSI/控制碼（review）：``rx_tail()`` 回原始
+    buffer，帶色彩輸出的 login prompt（如 ``\\x1b[1m(none) login:\\x1b[0m``）
+    在 raw 比對下會漏判，login guard 就會把 ``post_login_cmd`` 送進 login
+    prompt——正是本 guard 要防的事故。invalid regex 容錯（略過該 pattern，
+    不拋例外）。跨 login FSM 內部 guard／分流與
+    ``session_manager.interactive_open`` 的 login recovery lease 共用同一判準
+    （``_classify_non_ready_state`` 亦收斂到本函式），避免多處各自維護、語意漂移。
     """
     if not text:
         return False
+    cleaned = clean_text(text)
     for pattern in (sp.login_regex, sp.password_regex):
         if not pattern:
             continue
         try:
-            if re.search(pattern, text):
+            if re.search(pattern, cleaned) or re.search(pattern, text):
                 return True
         except re.error:
             continue

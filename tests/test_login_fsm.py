@@ -241,6 +241,23 @@ class TestMatchesLoginOrPassword(unittest.TestCase):
     def test_matches_getty_hostname_login(self) -> None:
         self.assertTrue(matches_login_or_password("(none) login: ", self._profile()))
 
+    def test_matches_ansi_colored_login_prompt(self) -> None:
+        """review：rx_tail 是原始 buffer，帶 ANSI 色彩的 login prompt 不得漏判——
+        漏判會讓 login guard 失效、post_login_cmd 被送進 login prompt。"""
+        self.assertTrue(
+            matches_login_or_password("\x1b[1m(none) login: \x1b[0m", self._profile())
+        )
+
+    def test_classify_non_ready_state_sees_ansi_login(self) -> None:
+        """_classify_non_ready_state 收斂到同一判準：ANSI login prompt → LOGIN_REQUIRED。"""
+        from unittest import mock
+
+        from sw_core.login_fsm import _classify_non_ready_state
+
+        bridge = mock.MagicMock()
+        bridge.rx_tail.return_value = "\x1b[1m(none) login: \x1b[0m"
+        self.assertEqual(_classify_non_ready_state(bridge, self._profile()), "LOGIN_REQUIRED")
+
     def test_matches_password_prompt(self) -> None:
         self.assertTrue(matches_login_or_password("Password: ", self._profile()))
 
