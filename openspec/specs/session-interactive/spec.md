@@ -15,10 +15,11 @@
 3. `session.state == "ATTACHED"` 且 `bridge.snapshot()["running"]` 與 `["serial_alive"]` 與 `["vtty_alive"]` 皆 True → 對 `bridge.rx_tail(BOOTLOADER_RX_TAIL_BYTES)` 依序判定：
    - 末行匹配 `profile.bootloader_prompts` 任一條（bootloader prompt，如 `=>`）→ 開 lease（`recovery_mode=True`），回應 `boot_interrupt` 省略或為 `False`。
    - 否則，RX tail 命中 boot banner（`detect_boot_banner`，比對 `BOOT_BANNER_PATTERNS`＝`U-Boot` 版本行／`Hit any key to stop autoboot` autoboot 倒數行；#130 既有單一事實來源）→ 開 lease（`recovery_mode=True`），回應標 `boot_interrupt: True`（表「autoboot 倒數窗中斷模式」，供呼叫端連打按鍵中斷 autoboot）。
-   - 兩者皆未命中 → 回 `SESSION_NOT_READY`、`error_detail: "NOT_BOOTLOADER"`。
+   - 否則，RX tail 命中該 session 的 `login_regex` 或 `password_regex`（`login_fsm.matches_login_or_password`；#174）→ 開 lease（`recovery_mode=True`），回應標 `login_required: True`（表「板子健康、只差登入」，供呼叫端用 `interactive-send` 打帳密把 session 救回 `READY`，不必整個 `device release`）。
+   - 三者皆未命中 → 回 `SESSION_NOT_READY`、`error_detail: "NOT_BOOTLOADER"`。
 4. 其他 state（`ATTACHING` / `RECOVERING` / `PASSTHROUGH` 等）→ 回 `SESSION_NOT_READY`。
 
-banner 命中所授予的 lease 與 prompt 命中者相同（`recovery_mode=True`、`owner` 沿用 `--owner`，預設 `agent`、human lease stash/restore 行為一致）；差異僅在回應的 `boot_interrupt` 欄位。此 lease 的 TX 不受 #130 boot quiet window gate（human/lease TX 永不 gate），故 agent 可於倒數窗連打按鍵中斷 autoboot。
+banner／login 命中所授予的 lease 與 prompt 命中者相同（`recovery_mode=True`、`owner` 沿用 `--owner`，預設 `agent`、human lease stash/restore 行為一致）；差異僅在回應的 `boot_interrupt` / `login_required` 欄位（兩者互斥、additive，向後相容）。此 lease 的 TX 不受 #130 boot quiet window gate（human/lease TX 永不 gate），故 agent 可於倒數窗連打按鍵中斷 autoboot，或於 login lease 下用 `interactive-send` 打帳密。
 
 #### Scenario: allow_attached=False rejects ATTACHED state
 
@@ -38,9 +39,15 @@ banner 命中所授予的 lease 與 prompt 命中者相同（`recovery_mode=True
 - **AND** caller 呼叫 `interactive_open(selector, allow_attached=True)`
 - **THEN** result `ok` 為 `True`、回傳 `interactive_id`、該 lease `recovery_mode == True`，且回應 `boot_interrupt == True`
 
-#### Scenario: allow_attached=True rejects ATTACHED without bootloader nor banner match
+#### Scenario: allow_attached=True opens lease when RX tail is at a login/password prompt
 
-- **WHEN** `session.state == "ATTACHED"`、bridge healthy、`bridge.rx_tail(512)` 既不匹配任何 `bootloader_prompts` 也不命中 `detect_boot_banner`
+- **WHEN** `session.state == "ATTACHED"`、bridge healthy、`bridge.rx_tail(512)` 未匹配 `bootloader_prompts` 也未命中 `detect_boot_banner`，但命中該 session 的 `login_regex` 或 `password_regex`
+- **AND** caller 呼叫 `interactive_open(selector, allow_attached=True)`
+- **THEN** result `ok` 為 `True`、回傳 `interactive_id`、該 lease `recovery_mode == True`，且回應 `login_required == True`（`boot_interrupt` 省略或非 `True`）
+
+#### Scenario: allow_attached=True rejects ATTACHED without bootloader, banner, nor login/password match
+
+- **WHEN** `session.state == "ATTACHED"`、bridge healthy、`bridge.rx_tail(512)` 既不匹配任何 `bootloader_prompts`、不命中 `detect_boot_banner`，也不匹配 `login_regex` / `password_regex`
 - **AND** caller 呼叫 `interactive_open(selector, allow_attached=True)`
 - **THEN** result `ok` 為 `False`、`error_code` 為 `"SESSION_NOT_READY"`、`error_detail` 為 `"NOT_BOOTLOADER"`
 

@@ -4,7 +4,12 @@ from unittest import mock
 
 from sw_core.auth import SessionAuth
 from sw_core.config import SessionProfile, UartProfile
-from sw_core.login_fsm import ensure_ready, probe_ready
+from sw_core.login_fsm import (
+    LOGIN_FSM_DETAIL_ERRORS,
+    ensure_ready,
+    matches_login_or_password,
+    probe_ready,
+)
 
 
 class TestLoginFsm(unittest.TestCase):
@@ -72,6 +77,189 @@ class TestLoginFsm(unittest.TestCase):
         bridge.send_command.assert_called_once_with("", source="system")
         bridge.send_secret.assert_not_called()
         bridge.clear_rx_buffer.assert_called_once_with()
+
+
+class _FakeBcmBridge:
+    """login guard／分流測試用 fake bridge：wait_for_regex 與 rx_tail 皆走預排序列。"""
+
+    def __init__(self, *, wait_results: list, rx_tail_sequence: list[str]) -> None:
+        self._wait_results = list(wait_results)
+        self._rx_tail_sequence = list(rx_tail_sequence)
+        self.sent: list[str] = []
+
+    def clear_rx_buffer(self) -> None:
+        pass
+
+    def send_command(self, cmd: str, *, source: str, cmd_id: str | None = None) -> None:
+        self.sent.append(cmd)
+
+    def send_secret(self, secret: str) -> None:
+        self.sent.append("<secret>")
+
+    def wait_for_regex(self, pattern: str, timeout_s: float) -> bool:
+        return self._wait_results.pop(0)
+
+    def rx_tail(self, max_chars: int = 4096) -> str:
+        if self._rx_tail_sequence:
+            return self._rx_tail_sequence.pop(0)
+        return ""
+
+
+class TestLoginFsmHardening(unittest.TestCase):
+    """#174：post_login_cmd 送出前的 login guard、失敗分流、regex 四類樣本。"""
+
+    def _make_bcm_profile(self, **overrides) -> SessionProfile:
+        defaults: dict = dict(
+            profile_name="brcm-template",
+            com="COM1",
+            act_no=1,
+            alias="brcm+1",
+            device_by_id="/dev/serial/by-id/bcm",
+            platform="bcm",
+            prompt_regex=r"(?m)^(?:.*[^>#\s])?[>#][ \t]*$",
+            login_regex=r"(?mi)login:\s*$",
+            password_regex=r"(?mi)password:\s*$",
+            post_login_cmd="sh",
+            ready_probe="echo __READY__${nonce}",
+            timeout_s=0.01,
+            uart=UartProfile(),
+        )
+        defaults.update(overrides)
+        return SessionProfile(**defaults)
+
+    def test_guard_never_sends_post_login_cmd_into_login_prompt(self) -> None:
+        """S2'：prompt_regex 誤配成功，但 rx tail 其實仍在 login prompt——
+        絕不能把 post_login_cmd 當帳密送出去，直接回可行動的 LOGIN_REQUIRED。"""
+        bridge = _FakeBcmBridge(
+            wait_results=[True],  # _probe_prompt 誤配成功
+            rx_tail_sequence=["(none) login: "],  # guard 讀到的 rx tail
+        )
+        profile = self._make_bcm_profile()
+
+        ok, err = probe_ready(bridge, profile)
+
+        self.assertFalse(ok)
+        self.assertEqual(err, "LOGIN_REQUIRED")
+        self.assertNotIn("sh", bridge.sent)
+
+    def test_post_login_cmd_timeout_reclassified_to_login_required(self) -> None:
+        """POST_LOGIN_CMD_TIMEOUT 逾時後 rx tail 已回到 login prompt → 改分流為 LOGIN_REQUIRED。"""
+        bridge = _FakeBcmBridge(
+            wait_results=[True, False],  # probe 成功、post_login_cmd 逾時
+            rx_tail_sequence=["", "login: "],  # guard 通過、逾時後讀到 login prompt
+        )
+        profile = self._make_bcm_profile()
+
+        ok, err = probe_ready(bridge, profile)
+
+        self.assertFalse(ok)
+        self.assertEqual(err, "LOGIN_REQUIRED")
+        self.assertIn("sh", bridge.sent)
+
+    def test_post_login_cmd_timeout_stays_when_not_at_login_prompt(self) -> None:
+        """POST_LOGIN_CMD_TIMEOUT 逾時但 rx tail 非 login/password prompt → 原碼不變（回歸線）。"""
+        bridge = _FakeBcmBridge(
+            wait_results=[True, False],
+            rx_tail_sequence=["", "some garbage output\n"],
+        )
+        profile = self._make_bcm_profile()
+
+        ok, err = probe_ready(bridge, profile)
+
+        self.assertFalse(ok)
+        self.assertEqual(err, "POST_LOGIN_CMD_TIMEOUT")
+
+    def test_ready_nonce_timeout_reclassified_to_login_required(self) -> None:
+        """READY_NONCE_TIMEOUT 逾時後 rx tail 已回到 password prompt → 改分流為 LOGIN_REQUIRED。"""
+        bridge = _FakeBcmBridge(
+            wait_results=[True, True, False],  # probe 成功、post_login_cmd 成功、nonce 逾時
+            rx_tail_sequence=["", "Password: "],
+        )
+        profile = self._make_bcm_profile()
+
+        ok, err = probe_ready(bridge, profile)
+
+        self.assertFalse(ok)
+        self.assertEqual(err, "LOGIN_REQUIRED")
+
+    def test_ready_nonce_timeout_stays_when_not_at_login_prompt(self) -> None:
+        """READY_NONCE_TIMEOUT 逾時但 rx tail 非 login/password prompt → 原碼不變（回歸線）。"""
+        bridge = _FakeBcmBridge(
+            wait_results=[True, True, False],
+            rx_tail_sequence=["", "garbage\n"],
+        )
+        profile = self._make_bcm_profile()
+
+        ok, err = probe_ready(bridge, profile)
+
+        self.assertFalse(ok)
+        self.assertEqual(err, "READY_NONCE_TIMEOUT")
+
+    def test_guard_skipped_when_no_post_login_cmd(self) -> None:
+        """post_login_cmd 為空的 platform（如 shell）不受 guard 影響（回歸線）。"""
+        bridge = mock.MagicMock()
+        bridge.wait_for_regex.side_effect = [False, True, True, True, True, True]
+        profile = SessionProfile(
+            profile_name="opi-shell",
+            com="COM2",
+            act_no=3,
+            alias="default+3",
+            device_by_id="/dev/serial/by-id/tty2",
+            platform="shell",
+            prompt_regex=r".*[$#] $",
+            login_regex=r"(?mi)^.*login:\s*$",
+            password_regex=r"(?mi)^password:\s*$",
+            ready_probe="echo __READY__${nonce}",
+            user_env="SW_OPI_U",
+            pass_env="SW_OPI_P",
+            uart=UartProfile(),
+        )
+        with mock.patch.dict(os.environ, {"SW_OPI_U": "haman", "SW_OPI_P": "secret"}, clear=False):
+            ok, err = ensure_ready(bridge, profile)
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+
+
+class TestMatchesLoginOrPassword(unittest.TestCase):
+    """matches_login_or_password() 純函式：login guard 與 interactive_open 共用判準。"""
+
+    def _profile(self, **overrides) -> SessionProfile:
+        defaults: dict = dict(
+            profile_name="p",
+            com="COM0",
+            act_no=1,
+            alias="p+1",
+            device_by_id="/dev/serial/by-id/p",
+            platform="bcm",
+            login_regex=r"(?mi)login:\s*$",
+            password_regex=r"(?mi)password:\s*$",
+            uart=UartProfile(),
+        )
+        defaults.update(overrides)
+        return SessionProfile(**defaults)
+
+    def test_matches_getty_hostname_login(self) -> None:
+        self.assertTrue(matches_login_or_password("(none) login: ", self._profile()))
+
+    def test_matches_password_prompt(self) -> None:
+        self.assertTrue(matches_login_or_password("Password: ", self._profile()))
+
+    def test_no_match_on_unrelated_text(self) -> None:
+        self.assertFalse(matches_login_or_password("root@dut:~# ls\n", self._profile()))
+
+    def test_empty_text_no_match(self) -> None:
+        self.assertFalse(matches_login_or_password("", self._profile()))
+
+    def test_invalid_regex_tolerated(self) -> None:
+        """login_regex 為 invalid regex 時不拋例外，續檢查 password_regex。"""
+        profile = self._profile(login_regex="(unterminated", password_regex=r"(?mi)password:\s*$")
+        self.assertTrue(matches_login_or_password("Password: ", profile))
+
+    def test_login_fsm_detail_errors_contains_login_required(self) -> None:
+        """LOGIN_FSM_DETAIL_ERRORS 涵蓋 LOGIN_REQUIRED 與 POST_LOGIN_CMD_TIMEOUT（回歸線）。"""
+        self.assertIn("LOGIN_REQUIRED", LOGIN_FSM_DETAIL_ERRORS)
+        self.assertIn("POST_LOGIN_CMD_TIMEOUT", LOGIN_FSM_DETAIL_ERRORS)
+        self.assertIn("READY_NONCE_TIMEOUT", LOGIN_FSM_DETAIL_ERRORS)
 
 
 class TestDetectTemplate(unittest.TestCase):

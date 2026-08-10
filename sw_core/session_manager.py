@@ -47,7 +47,14 @@ from .constants import (
 )
 from .device_watcher import DeviceInfo
 from .file_transfer import DEFAULT_CHUNK_SIZE, DEFAULT_ECHO_TIMEOUT_S
-from .login_fsm import detect_boot_banner, detect_template, ensure_ready, probe_ready
+from .login_fsm import (
+    LOGIN_FSM_DETAIL_ERRORS,
+    detect_boot_banner,
+    detect_template,
+    ensure_ready,
+    matches_login_or_password,
+    probe_ready,
+)
 from .transport_stall import classify_probe_failure, transport_stall_hint
 from .uart_io import PreservedConsoles, UARTBridge, _pty_available
 from .util import clean_text, now_iso
@@ -142,6 +149,25 @@ def _matches_any_bootloader_prompt(
             # invalid regex → 略過
             continue
     return None
+
+
+def _login_fsm_rx_tail_detail(bridge: Any) -> str | None:
+    """login FSM 失敗碼的 rx tail 摘要（#174）：清除控制碼／ANSI 後截尾 300 字元。
+
+    找不到 ``rx_tail`` 或讀取例外一律回 None（getattr 防禦，對不支援 rx_tail 的
+    fake bridge 行為零變更）；rx tail 為空亦回 None，不寫入空字串 detail。
+    """
+    tail_fn = getattr(bridge, "rx_tail", None)
+    if not callable(tail_fn):
+        return None
+    try:
+        raw = tail_fn()
+    except Exception:
+        return None
+    if not raw:
+        return None
+    cleaned = clean_text(raw)[-300:]
+    return cleaned or None
 
 
 def _is_reboot_command(command: str) -> bool:
@@ -1121,7 +1147,9 @@ class SessionManager:
 
         回傳 ``(err, detail)``：翻轉為 TRANSPORT_STALL 時 detail 帶 host 層復原提示，
         並做一次性 log + WAL META 告警（``transport_stall_warned`` 去重、RX 恢復重臂）；
-        其餘原樣直通、detail=None。**只在真的送過 probe 後呼叫**——boot-quiet 合成的
+        未翻轉但 ``err`` 屬 login FSM 失敗碼（``LOGIN_FSM_DETAIL_ERRORS``，#174）時，
+        detail 帶失敗當下的 rx tail（截尾去控制碼），取代恆為 null 的現況；其餘原樣
+        直通、detail=None。**只在真的送過 probe 後呼叫**——boot-quiet 合成的
         PROMPT_UNAVAILABLE（沒送 probe、且 quiet 代表剛有 RX）不得經此。不得在持有
         self._lock 時呼叫（內部會取鎖做去重）。
         """
@@ -1138,6 +1166,8 @@ class SessionManager:
             now=now,
         )
         if not flipped:
+            if err in LOGIN_FSM_DETAIL_ERRORS:
+                return err, _login_fsm_rx_tail_detail(bridge)
             return err, None
         rx_age_s = now - session.last_rx_mono
         real_path = getattr(bridge, "device_path", None)
@@ -3704,11 +3734,20 @@ class SessionManager:
                     # 但 RX tail 命中 boot banner（U-Boot 版本行／autoboot 倒數行，複用
                     # #130 detect_boot_banner 單一事實來源），視為 autoboot 倒數窗，同樣
                     # 授予 recovery lease，並在回應標 boot_interrupt=True 供呼叫端連打按鍵
-                    # 中斷 autoboot。兩者皆未命中才維持 NOT_BOOTLOADER。
+                    # 中斷 autoboot。
+                    # #174：兩者皆未命中時，再檢查 rx tail 是否命中 login_regex／
+                    # password_regex——board 完全健康、只差有人打帳密是「session 卡住但
+                    # 板子正常」最常見的情境，語意上比 bootloader recovery 更安全（不必
+                    # 整個 device release 出去）。命中則同樣授予 lease，回應標
+                    # login_required=True，讓呼叫端用 interactive-send 打帳密救回 READY。
+                    # 三者皆未命中才維持 NOT_BOOTLOADER。
                     boot_interrupt = False
+                    login_required = False
                     if matched is None:
                         if detect_boot_banner(rx_tail_clean):
                             boot_interrupt = True
+                        elif matches_login_or_password(rx_tail_clean, session.profile):
+                            login_required = True
                         else:
                             return {
                                 "ok": False,
@@ -3771,6 +3810,10 @@ class SessionManager:
                         # （additive，與既有回應相容）。BUSY 路徑已提前 return，不會到此。
                         if boot_interrupt:
                             result["boot_interrupt"] = True
+                        # #174：login/password prompt 命中授予的 recovery lease，於回應
+                        # 標 login_required=True（比照 boot_interrupt 欄位模式，additive）。
+                        if login_required:
+                            result["login_required"] = True
 
                 else:
                     return {"ok": False, "error_code": "SESSION_NOT_READY", "selector": selector}

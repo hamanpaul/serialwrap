@@ -22,6 +22,25 @@ _FLOOD_MASKABLE_ERRORS = frozenset({
     "LOGIN_PROMPT_TIMEOUT",
 })
 
+# login FSM 會產生的失敗碼集合（#174）：session_manager 的 _refine_probe_failure
+# 據此把 last_error_detail 補上失敗當下的 rx tail（截尾去控制碼），取代恆為 null
+# 的現況。與 _FLOOD_MASKABLE_ERRORS 刻意分離——後者管「能否被 RX_FLOOD 遮蔽」，
+# 本集合管「是否附 rx tail 佐證」，兩者交集但不相同（如 LOGIN_REQUIRED 只在本集合）。
+LOGIN_FSM_DETAIL_ERRORS: frozenset[str] = frozenset({
+    "USER_ENV_MISSING",
+    "PASS_ENV_REQUIRED",
+    "PASS_ENV_MISSING",
+    "LOGIN_USER_REQUIRED",
+    "LOGIN_PROMPT_TIMEOUT",
+    "BCM_PROMPT_TIMEOUT",
+    "SHELL_PROMPT_TIMEOUT",
+    "PRPL_PROMPT_TIMEOUT",
+    "POST_LOGIN_CMD_TIMEOUT",
+    "READY_NONCE_TIMEOUT",
+    "READY_PROMPT_TIMEOUT",
+    "LOGIN_REQUIRED",
+})
+
 
 def _maybe_reclassify_flood(bridge: UARTBridge, err: str | None) -> str | None:
     """probe 失敗碼的 RX 洪水反分類（#153，單一 choke point）。
@@ -116,11 +135,43 @@ def _classify_non_ready_state(bridge: UARTBridge, sp: SessionProfile) -> str:
     return "PROMPT_UNAVAILABLE"
 
 
+def matches_login_or_password(text: str, sp: SessionProfile) -> bool:
+    """``text`` 是否命中 ``sp`` 的 ``login_regex`` 或 ``password_regex``（#174）。
+
+    invalid regex 容錯（略過該 pattern，不拋例外）。跨 login FSM 內部 guard／分流
+    與 ``session_manager.interactive_open`` 的 login recovery lease 共用同一判準，
+    避免兩處各自維護一份、語意漂移。
+    """
+    if not text:
+        return False
+    for pattern in (sp.login_regex, sp.password_regex):
+        if not pattern:
+            continue
+        try:
+            if re.search(pattern, text):
+                return True
+        except re.error:
+            continue
+    return False
+
+
 def _finalize_ready(bridge: UARTBridge, sp: SessionProfile) -> tuple[bool, str | None]:
     if sp.post_login_cmd:
+        # #174 login guard：prompt_regex 誤配（如 BDK login banner 的 "###" 裝飾線／
+        # CEVENT 洪流誤配成 prompt）會讓 _probe_prompt 假成功、整段 _maybe_login 被
+        # 跳過。送 post_login_cmd 前先查 rx tail 是否其實仍在 login/password prompt——
+        # 命中就絕不把它當帳密送出去，直接回可行動的 LOGIN_REQUIRED。
+        if matches_login_or_password(bridge.rx_tail(), sp):
+            return False, "LOGIN_REQUIRED"
         bridge.send_command(sp.post_login_cmd, source="system")
         ok, err = _wait_or_fail(bridge, sp.prompt_regex, sp.timeout_s, "POST_LOGIN_CMD_TIMEOUT")
         if not ok:
+            # #174 分流：POST_LOGIN_CMD_TIMEOUT 逾時後 rx tail 若已在 login/password
+            # prompt（憑證錯導致板子重印 login:，或上面的 guard 仍漏接的邊界情況），
+            # 改回可行動的 LOGIN_REQUIRED，不再與「登入成功但 post_login_cmd 無回應」
+            # 擠同一個 timeout 碼。
+            if matches_login_or_password(bridge.rx_tail(), sp):
+                return False, "LOGIN_REQUIRED"
             return ok, err
 
     nonce = uuid.uuid4().hex[:8]
@@ -128,6 +179,10 @@ def _finalize_ready(bridge: UARTBridge, sp: SessionProfile) -> tuple[bool, str |
     bridge.send_command(probe, source="system")
     ok, err = _wait_or_fail(bridge, nonce, sp.timeout_s, "READY_NONCE_TIMEOUT")
     if not ok:
+        # #174 分流：同上，nonce 等不到時 rx tail 若已回到 login/password prompt，
+        # 同樣改回 LOGIN_REQUIRED。
+        if matches_login_or_password(bridge.rx_tail(), sp):
+            return False, "LOGIN_REQUIRED"
         return ok, err
     ok, err = _wait_or_fail(bridge, sp.prompt_regex, sp.timeout_s, "READY_PROMPT_TIMEOUT")
     if not ok:
