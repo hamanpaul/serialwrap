@@ -102,6 +102,47 @@ def _print(obj: dict[str, Any]) -> None:
     sys.stdout.write("\n")
 
 
+def _format_err_line(resp: dict[str, Any], *, context: str | None = None) -> str:
+    """把失敗回應組成一行 stderr 訊息（#172）：``error_code`` 一定露出，``message``／``hint``
+    有值才追加，不覆蓋、不省略。
+
+    **相容性關鍵**：``serialwrap: {context} failed: {code}`` 這段形狀不變（下游以
+    substring 比對，例如 ``failed: SOCKET_ERROR``）；``message``／``hint`` 只能「追加在
+    後」。若無 ``error_code`` 但有 ``message``，沿用 #94 既有 fallback（message 頂替
+    code 欄位），避免同一句話重複出現兩次。
+    """
+    error_code = resp.get("error_code")
+    message = resp.get("message")
+    if error_code:
+        code_str = error_code
+    elif message:
+        code_str = message
+        message = None
+    else:
+        code_str = "UNKNOWN_ERROR"
+    prefix = f"{context} " if context else ""
+    line = f"serialwrap: {prefix}failed: {code_str}"
+    if message:
+        line += f": {message}"
+    hint = resp.get("hint")
+    if hint:
+        line += f"（hint: {hint}）"
+    return line
+
+
+def _mirror_err(resp: dict[str, Any], *, context: str | None = None) -> None:
+    """在 stderr 補一行具體錯誤（#172）：涵蓋 ``_run_rpc`` 以外所有「``_print``
+    (ok:False) + 非零 exit」出口，避免只讀 stderr 判讀失敗原因的 consumer（如
+    testpilot）拿到空字串。
+
+    ``ok`` 為真時 no-op；``_run_rpc`` 已有自己的 stderr 行（見下方），不得再對其
+    呼叫本函式，否則會雙印同一筆錯誤。
+    """
+    if resp.get("ok"):
+        return
+    sys.stderr.write(_format_err_line(resp, context=context) + "\n")
+
+
 def _daemon_script_path() -> str:
     here = os.path.dirname(os.path.abspath(__file__))
     return os.path.normpath(os.path.join(here, "..", "serialwrapd.py"))
@@ -286,16 +327,20 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
             message = "--endpoint 於 daemon start 僅接受 loopback tcp://（127.0.0.1/localhost/::1）作為本機 bind 位址"
         else:
             message = "--endpoint 不支援 daemon start（daemon 只能在本機啟動）"
-        _print({"ok": False, "error_code": "REMOTE_NOT_SUPPORTED", "message": message})
+        resp = {"ok": False, "error_code": "REMOTE_NOT_SUPPORTED", "message": message}
+        _print(resp)
+        _mirror_err(resp, context="daemon start")
         return 2
     if ep_arg and args.socket is not None and args.socket != ep_arg:
         # 同給 --endpoint 與 --socket 且不一致：冪等探測（走 --endpoint）與 spawn bind
         # （走 --socket）會指向不同位址，寧可顯式拒絕也不留下歧義（#131 review）。
-        _print({
+        resp = {
             "ok": False,
             "error_code": "INVALID_ARGS",
             "message": "--endpoint 與 --socket 不一致；daemon start 請擇一指定 bind 位址",
-        })
+        }
+        _print(resp)
+        _mirror_err(resp, context="daemon start")
         return 2
     # 監管模式 gate（#108 #1）：systemd 模式下重導到 `service start`，避免顯式 daemon
     # start 繞過 unit 管理另起非託管 daemon（對稱於 `daemon stop` → `service stop`）。
@@ -306,6 +351,10 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
         resp = service_action("start", mode=mode, with_sudo=getattr(args, "with_sudo", False))
         resp["_routed_to"] = "service start"
         _print(resp)
+        # #172：service_action 的 NEEDS_SUDO／NO_SYSTEMD 等非 ok 回應原本只落在
+        # stdout JSON，stderr 全空——呼叫端（如 testpilot）只讀 stderr 時完全看不到
+        # 原因。
+        _mirror_err(resp, context="daemon start")
         return 0 if resp.get("ok") else 2
     # on-demand：spawn 前先對「使用者實際會連到的 endpoint」冪等探測，已有健康 daemon 則
     # no-op（#108 #1）。用 _resolve_endpoint 而非裸 args.socket，避免 config 記錄的 daemon
@@ -326,11 +375,13 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
     if is_win:
         daemon_argv = _daemon_spawn_argv()
         if daemon_argv is None:
-            _print({
+            resp = {
                 "ok": False,
                 "error_code": "DAEMON_BINARY_NOT_FOUND",
                 "message": "找不到 serialwrapd（serialwrap.exe 同層或 PATH 上皆無）；請確認發行包完整",
-            })
+            }
+            _print(resp)
+            _mirror_err(resp, context="daemon start")
             return 2
     else:
         # POSIX：argv 組法逐字保留既有行為。
@@ -357,6 +408,7 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
         if env_files:
             payload["env_files"] = [os.path.expanduser(path) for path in env_files]
         _print(payload)
+        _mirror_err(payload, context="daemon start")
         return 2
 
     if args.foreground:
@@ -385,7 +437,9 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
     for attempt in range(attempts):
         time.sleep(0.2)
         if proc.poll() is not None:
-            _print({"ok": False, "error_code": "DAEMON_EXITED", "pid": proc.pid, "returncode": proc.returncode})
+            resp = {"ok": False, "error_code": "DAEMON_EXITED", "pid": proc.pid, "returncode": proc.returncode}
+            _print(resp)
+            _mirror_err(resp, context="daemon start")
             return 2
         resp = rpc_call(sock, "health.ping", {}, timeout_s=0.5)
         if resp.get("ok"):
@@ -399,7 +453,9 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
             _print(result)
             return 0
 
-    _print({"ok": False, "error_code": "DAEMON_NOT_READY", "pid": proc.pid})
+    not_ready_resp = {"ok": False, "error_code": "DAEMON_NOT_READY", "pid": proc.pid}
+    _print(not_ready_resp)
+    _mirror_err(not_ready_resp, context="daemon start")
     return 2
 
 
@@ -414,11 +470,14 @@ def _run_daemon_stop(args: argparse.Namespace) -> int:
         resp = service_action("stop", mode=mode, with_sudo=with_sudo)
         resp["_routed_to"] = "service stop"
         _print(resp)
+        _mirror_err(resp, context="daemon stop")
         return 0 if resp.get("ok") else 2
-    # on-demand 模式：維持原有 RPC daemon.stop 路徑
+    # on-demand 模式：維持原有 RPC daemon.stop 路徑（不經 _run_rpc，故沿用其 stderr
+    # 格式，context 用實際 method 名，與 _run_rpc 的輸出一致，#172）
     resp = rpc_call(_resolve_endpoint(args), "daemon.stop", {}, timeout_s=2.0)
     if not resp.get("ok"):
         _print(resp)
+        _mirror_err(resp, context="daemon.stop")
         return 2
     _print(resp)
     return 0
@@ -586,8 +645,12 @@ def _run_rpc(args: argparse.Namespace, method: str, params: dict[str, Any]) -> i
     if not resp.get("ok"):
         # #94：失敗時除了 stdout 的機器可解析 JSON，另在 stderr 印一行具體 error，
         # 讓依 Unix 慣例讀 stderr 解釋非零 exit 的 consumer 不再拿到空字串。
-        err = resp.get("error_code") or resp.get("message") or "UNKNOWN_ERROR"
-        sys.stderr.write(f"serialwrap: {method} failed: {err}\n")
+        # #172：原本 `error_code or message` 短路讓有 error_code 時 message 永遠
+        # 看不到——SOCKET_ERROR 的 message 正是 errno + socket 路徑，不能丟。改用
+        # 與 `_mirror_err` 共用的 `_format_err_line`：code 一定露出，message／hint
+        # 追加在後，不覆蓋、不省略。不改呼叫 `_mirror_err`（會雙印同一行），本函式
+        # 自己組線。
+        sys.stderr.write(_format_err_line(resp, context=method) + "\n")
     _warn_version_mismatch(resp)
     return 0 if resp.get("ok") else 2
 
@@ -617,7 +680,8 @@ def _dispatch_event(args: argparse.Namespace) -> int:
     # event.rule_list／event.tail 這類查詢，目前也未列入，見 client.py）：
     # 未顯式指定 --timeout 時維持一般預設 5s；--retries 於此不轉發——轉發了
     # 也不會生效，維持現狀（#123）。
-    timeout_s = _effective_timeout_s(args, _EVENT_CMD_METHOD.get(args.event_cmd, f"event.{args.event_cmd}"))
+    method_name = _EVENT_CMD_METHOD.get(args.event_cmd, f"event.{args.event_cmd}")
+    timeout_s = _effective_timeout_s(args, method_name)
     if args.event_cmd == "add":
         with open(args.file, "r", encoding="utf-8") as f:
             params = json.load(f)
@@ -661,10 +725,16 @@ def _dispatch_event(args: argparse.Namespace) -> int:
             timeout_s=timeout_s,
         )
     else:
-        _print({"ok": False, "error_code": "UNKNOWN_EVENT_CMD", "cmd": args.event_cmd})
+        unknown_resp = {"ok": False, "error_code": "UNKNOWN_EVENT_CMD", "cmd": args.event_cmd}
+        _print(unknown_resp)
+        _mirror_err(unknown_resp, context="event")
         return 2
     _print(result)
     _warn_version_mismatch(result)
+    # #172：本函式的 rpc_call 不經 _run_rpc，其自帶的 stderr 行覆蓋不到這裡；
+    # 用真實 method 名（與 timeout 解析同一份 method_name）維持與 _run_rpc 一致
+    # 的輸出形狀。
+    _mirror_err(result, context=method_name)
     return 0 if result.get("ok") else 2
 
 
@@ -716,13 +786,13 @@ def _run_remote(args: argparse.Namespace) -> int:
     例外穿越 CLI 邊界。
     """
     if os.name == "nt":
-        _print(
-            {
-                "ok": False,
-                "error_code": "REMOTE_NOT_SUPPORTED",
-                "message": "native Windows 本期不支援 serialwrap remote；請手動 ssh -R（見 SKILL_WINDOWS.md）",
-            }
-        )
+        resp = {
+            "ok": False,
+            "error_code": "REMOTE_NOT_SUPPORTED",
+            "message": "native Windows 本期不支援 serialwrap remote；請手動 ssh -R（見 SKILL_WINDOWS.md）",
+        }
+        _print(resp)
+        _mirror_err(resp, context="remote")
         return 1
 
     from . import remote_tunnel as rt  # noqa: PLC0415
@@ -778,10 +848,14 @@ def _run_remote(args: argparse.Namespace) -> int:
         _print(res)
         return 0
     except rt.TunnelError as exc:
-        _print({"ok": False, "error_code": exc.code, "message": exc.message or exc.code})
+        resp = {"ok": False, "error_code": exc.code, "message": exc.message or exc.code}
+        _print(resp)
+        _mirror_err(resp, context="remote")
         return 1
     except Exception as exc:  # noqa: BLE001 — 任何非預期例外不得穿越 CLI 邊界
-        _print({"ok": False, "error_code": "INTERNAL_ERROR", "message": str(exc)})
+        resp = {"ok": False, "error_code": "INTERNAL_ERROR", "message": str(exc)}
+        _print(resp)
+        _mirror_err(resp, context="remote")
         return 1
 
 
@@ -865,8 +939,10 @@ def _run_setup(args: argparse.Namespace) -> int:
 
     # 4. flash 護欄前置：進行中且未 force → 立即中止，不物化、不動模式（Codex #1c）。
     if any_flashing and not args.force:
-        _print({"ok": False, "error_code": "FLASHING_BUSY",
-                "message": "flash 進行中，拒絕 setup（可用 --force 覆寫）"})
+        resp = {"ok": False, "error_code": "FLASHING_BUSY",
+                "message": "flash 進行中，拒絕 setup（可用 --force 覆寫）"}
+        _print(resp)
+        _mirror_err(resp, context="setup")
         return 2
 
     # 5. 物化套件資產到使用者可寫位置。
@@ -907,12 +983,14 @@ def _run_setup(args: argparse.Namespace) -> int:
             config_path=os.path.join(CONFIG_DIR, "config.yaml"),
         )
     except FlashingBusy as exc:
-        _print({
+        resp = {
             "ok": False,
             "error_code": "FLASHING_BUSY",
             "message": str(exc),
             "legacy": legacy,
-        })
+        }
+        _print(resp)
+        _mirror_err(resp, context="setup")
         return 2
 
     payload: dict[str, Any] = {
@@ -1618,6 +1696,7 @@ def main(argv: list[str] | None = None) -> int:
         mode = _default_runtime_config().mode() or "on-demand"
         result = service_action(args.action, mode=mode, with_sudo=args.with_sudo)
         _print(result)
+        _mirror_err(result, context=f"service {args.action}")
         return 0 if result.get("ok") else 2
 
     if args.cmd == "setup":
@@ -1632,7 +1711,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "remote":
         return _run_remote(args)
 
-    _print({"ok": False, "error_code": "INVALID_ARGS"})
+    invalid_resp = {"ok": False, "error_code": "INVALID_ARGS"}
+    _print(invalid_resp)
+    _mirror_err(invalid_resp)
     return 2
 
 
