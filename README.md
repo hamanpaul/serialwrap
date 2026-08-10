@@ -1221,8 +1221,10 @@ profiles:
       xonxoff: false
   brcm-template:
     platform: bcm
-    prompt_regex: "(?m)[>#]\\s*$"
-    login_regex: "(?mi)login:\\s*$"
+    # #174：錨定行首＋排除連續 '#'/'>' 裝飾線（BDK login banner 的 "#####" 分隔行
+    # 與 CEVENT 洪流都不會誤配成 prompt）。可用 `serialwrap profile test` 離線驗證。
+    prompt_regex: "(?m)^(?:.*[^>#\\s])?[>#][ \\t]*$"
+    login_regex: "(?mi)login:\\s*$"  # 勿錨定行首：getty 是 "<hostname> login: "（#174）
     password_regex: "(?mi)password:\\s*$"
     post_login_cmd: "sh"         # 登入後自動執行，從 BCM shell (>) 切到 Linux shell (#)
     user_env: "BRCM_USER"
@@ -2222,6 +2224,7 @@ command groups:
     service            透過 systemctl 管理 serialwrap systemd service（systemd 監管模式適用）
     setup              安裝資產並設定監管模式（systemd-user／systemd-system／on-demand）
     doctor             診斷安裝與執行環境（平台感知：Linux 檢 dialout／systemd／by-id 裝置／human console 就緒（serialwrap-minicom／jq／minicom），Windows 檢 pyserial／daemon endpoint／COM 列舉）
+    profile            離線 profile regex 診斷（免連 daemon／免碰 UART）
     skill              輸出操作指南（skill）原文到 stdout（--platform windows 為 Windows 操作指南）
 
 examples:

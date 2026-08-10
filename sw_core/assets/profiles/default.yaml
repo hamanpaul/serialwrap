@@ -39,7 +39,14 @@ profiles:
       xonxoff: false
   brcm-template:
     platform: bcm
-    prompt_regex: "(?m)[>#]\\s*$"
+    # #174：錨定行首＋排除連續 '#'/'>' 裝飾線（如 BDK login banner 的 "#####" 分隔
+    # 行）。舊版 "(?m)[>#]\\s*$" 會匹配 buffer 任意位置以 '>'/'#' 結尾的行，在洪流
+    # 板（CEVENT ... DRIVER -- E_RADIO/40 這類持續輸出）與 banner 裝飾線下皆會誤配
+    # 成 prompt，讓 login FSM 整段跳過、把 post_login_cmd 當帳密送進 login prompt。
+    # serialwrap profile test 可離線用樣本驗證本 regex。
+    prompt_regex: "(?m)^(?:.*[^>#\\s])?[>#][ \\t]*$"
+    # 勿錨定行首：getty 標準格式是 "<hostname> login: "（如 "(none) login: "），
+    # 行首前面帶 hostname，錨定 ^login: 會打壞這個最常見的格式（#174 S4）。
     login_regex: "(?mi)login:\\s*$"
     password_regex: "(?mi)password:\\s*$"
     post_login_cmd: "sh"

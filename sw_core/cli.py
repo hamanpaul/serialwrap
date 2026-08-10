@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -1106,6 +1107,110 @@ def _run_setup(args: argparse.Namespace) -> int:
     return 0
 
 
+def _profile_test_check(pattern: str, sample_text: str) -> dict[str, Any]:
+    """單一 regex 對樣本文字的命中檢查（#174 profile test 共用）。
+
+    invalid regex 不拋例外，回報於 ``error`` 欄位；命中時 ``matched_line`` 帶
+    命中處所在的完整行（供 operator 目視核對，而非只給 match span）。
+    """
+    if not pattern:
+        return {"pattern": pattern, "matched": False, "matched_line": None, "error": None}
+    try:
+        regex = re.compile(pattern)
+    except re.error as exc:
+        return {"pattern": pattern, "matched": False, "matched_line": None, "error": str(exc)}
+    m = regex.search(sample_text)
+    if not m:
+        return {"pattern": pattern, "matched": False, "matched_line": None, "error": None}
+    # review：matched_line 必須是命中處所在的**完整原始行**（供 operator 目視核對），
+    # 舊寫法 sample_text[:m.end()] 取尾行，regex 只命中行內片段時會回截斷片段。
+    line_start = sample_text.rfind("\n", 0, m.start()) + 1
+    line_end = sample_text.find("\n", m.start())
+    if line_end == -1:
+        line_end = len(sample_text)
+    matched_line = sample_text[line_start:line_end]
+    return {"pattern": pattern, "matched": True, "matched_line": matched_line, "error": None}
+
+
+def _profile_test_last_nonblank_line(text: str) -> str | None:
+    """取樣本文字最後一個非空白行（供 bootloader_prompts 檢查用）。
+
+    與 ``session_manager._matches_any_bootloader_prompt`` 的比對基準一致
+    （bootloader recovery gate 只看 rx tail 的最後一個非空行，非整段 buffer）。
+    """
+    for line in reversed(text.splitlines()):
+        if line.strip():
+            return line
+    return None
+
+
+def _profile_test_bootloader_check(pattern: str, last_line: str | None) -> dict[str, Any]:
+    """單一 bootloader_prompts pattern 對「最後一個非空白行」的命中檢查。
+
+    刻意與 ``_profile_test_check``（整段文字 ``re.search``）分開：bootloader
+    prompt 的實際 gate 邏輯只看 rx tail 最後一行，混用整段比對會誤導 operator
+    （見 ``session_manager._matches_any_bootloader_prompt``）。
+    """
+    if not pattern:
+        return {"pattern": pattern, "matched": False, "matched_line": None, "error": None}
+    try:
+        regex = re.compile(pattern)
+    except re.error as exc:
+        return {"pattern": pattern, "matched": False, "matched_line": None, "error": str(exc)}
+    if last_line is not None and regex.search(last_line):
+        return {"pattern": pattern, "matched": True, "matched_line": last_line, "error": None}
+    return {"pattern": pattern, "matched": False, "matched_line": None, "error": None}
+
+
+def _run_profile_test(args: argparse.Namespace) -> int:
+    """離線驗證 profile 的 prompt/login/password/bootloader regex 是否命中樣本文字（#174）。
+
+    純讀檔＋``re.search``：不連 daemon、不碰任何 UART。exit code 恆為 0（純診斷，
+    命中與否皆非錯誤——讓 operator 在改 regex 前先離線驗證，不必上板試錯導致
+    session 卡死）。
+    """
+    from .config import load_profiles
+
+    profile_dir = getattr(args, "profile_dir", None) or PROFILE_DIR
+    result = load_profiles(profile_dir)
+    tpl = next((t for t in result.templates if t.profile_name == args.profile), None)
+    if tpl is None:
+        _print({
+            "ok": False,
+            "error_code": "UNKNOWN_PROFILE",
+            "profile": args.profile,
+            "profile_dir": profile_dir,
+            "available": sorted({t.profile_name for t in result.templates}),
+        })
+        return 0
+
+    try:
+        with open(args.sample, "r", encoding="utf-8", errors="replace") as fp:
+            sample_text = fp.read()
+    except OSError as exc:
+        _print({"ok": False, "error_code": "SAMPLE_READ_FAILED", "message": str(exc)})
+        return 0
+
+    last_line = _profile_test_last_nonblank_line(sample_text)
+    checks: dict[str, Any] = {
+        "prompt_regex": _profile_test_check(tpl.prompt_regex, sample_text),
+        "login_regex": _profile_test_check(tpl.login_regex, sample_text),
+        "password_regex": _profile_test_check(tpl.password_regex, sample_text),
+        "bootloader_prompts": [
+            _profile_test_bootloader_check(pattern, last_line) for pattern in tpl.bootloader_prompts
+        ],
+    }
+    _print({
+        "ok": True,
+        "profile": tpl.profile_name,
+        "platform": tpl.platform,
+        "profile_dir": profile_dir,
+        "sample": args.sample,
+        "checks": checks,
+    })
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="serialwrap",
@@ -1584,6 +1689,32 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawTextHelpFormatter,
     )
 
+    p_profile = sub.add_parser(
+        "profile",
+        help="離線 profile regex 診斷（免連 daemon／免碰 UART）",
+        description="離線驗證 profile 的 prompt/login/password/bootloader regex 是否命中一段樣本文字（#174）。",
+    )
+    profile_sub = p_profile.add_subparsers(dest="profile_cmd", required=True, metavar="<command>")
+    p_ptest = profile_sub.add_parser(
+        "test",
+        help="對樣本文字逐一跑 prompt/login/password/bootloader regex，回報是否命中",
+        description=(
+            "從 --profile-dir 載入 profile YAML，找出 --profile 指定的 template，\n"
+            "對 --sample 檔案內容依序跑 prompt_regex／login_regex／password_regex／\n"
+            "bootloader_prompts（逐條），stdout 印 JSON 回報各 regex 是否命中與命中的行。\n"
+            "純離線診斷：不連 daemon、不碰任何 UART，exit code 恆為 0。"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    p_ptest.add_argument("--profile", required=True, help="要測試的 template 名稱（如 brcm-template）")
+    p_ptest.add_argument("--sample", required=True, help="樣本文字檔路徑（如一段真實 console capture log）")
+    p_ptest.add_argument(
+        "--profile-dir",
+        dest="profile_dir",
+        default=PROFILE_DIR,
+        help="profile YAML 目錄（預設: %(default)s）",
+    )
+
     p_skill = sub.add_parser(
         "skill",
         help="輸出操作指南（skill）原文到 stdout（--platform windows 為 Windows 操作指南）",
@@ -1805,6 +1936,10 @@ def main(argv: list[str] | None = None) -> int:
         _print(result)
         _mirror_err(result, context=f"service {args.action}")
         return 0 if result.get("ok") else 2
+
+    if args.cmd == "profile":
+        if args.profile_cmd == "test":
+            return _run_profile_test(args)
 
     if args.cmd == "setup":
         return _run_setup(args)

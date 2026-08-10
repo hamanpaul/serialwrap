@@ -282,6 +282,8 @@ Agent 收到 sentinel 後應短暫 sleep 後重試，而非視為錯誤。
 
 > **#114 續補（autoboot 倒數窗）**：`allow_attached=True` 的授予條件除既有 bootloader prompt 命中（`ATTACHED` 且 RX tail 末行匹配 `bootloader_prompts`）外，擴充至 RX tail 命中 boot banner（`detect_boot_banner`，比對 `BOOT_BANNER_PATTERNS`＝autoboot 倒數行／`U-Boot` 版本行，複用 #130 單一事實來源）——即 autoboot 倒數當下。此情境同樣授予 recovery lease（`recovery_mode=True`），並於回應標 `boot_interrupt: true`（bootloader prompt 命中則省略此欄位，additive、向後相容），供呼叫端於倒數窗連打按鍵中斷 autoboot 進 `=>`。此 lease 的 TX 不受 #130 boot quiet window gate。詳見 canonical 規格 [`openspec/specs/session-interactive/spec.md`](../openspec/specs/session-interactive/spec.md)。
 
+> **#174 續補（login recovery lease）**：bootloader prompt 與 boot banner 皆未命中時，`allow_attached=True` 再檢查 RX tail 是否命中該 session 的 `login_regex` 或 `password_regex`（`login_fsm.matches_login_or_password`）——board 完全健康、只差有人打帳密，語意上比 bootloader recovery 更安全（不必整個 `device release` 出去）。命中則同樣授予 recovery lease（`recovery_mode=True`），回應標 `login_required: true`（比照 `boot_interrupt` 欄位模式，additive），供呼叫端用 `interactive-send` 打帳密把 session 救回 `READY`。三者（bootloader prompt／boot banner／login-password）皆未命中才回 `SESSION_NOT_READY` + `NOT_BOOTLOADER`。詳見 canonical 規格 [`openspec/specs/session-interactive/spec.md`](../openspec/specs/session-interactive/spec.md)。
+
 ### 6.4 recover
 
 適用：
@@ -645,6 +647,7 @@ background mode 的 `command.result_tail` 在 capture 尚未建立時，會回�
 - `serialwrap stream tail` (legacy alias，對應 `result.tail`)
 - `serialwrap wal export`
 - `serialwrap session pin|unpin`
+- `serialwrap profile test --profile <name> --sample <file> [--profile-dir DIR]`（#174，純離線診斷）
 
 #### CLI 失敗輸出（stdout JSON + stderr 一行，#94／#172）
 
@@ -671,6 +674,10 @@ gate、`REMOTE_NOT_SUPPORTED`、`INVALID_ARGS`）且 exit code 非零時：
 - `session list` 的 `profile_source` 欄位顯示來源：`pin` / `sticky` / `detected` / `fallback` / `yaml-target`。
 - 錯誤碼：`UNKNOWN_PROFILE`（profile 名不存在）、`PROFILE_IS_EXPLICIT`（對 YAML explicit-target 裝置 pin/unpin）、`DEVICE_NOT_FOUND`（selector 解析不到裝置）、`INVALID_ARGS`（缺 selector/profile）。
 - **生效時機**：pin/unpin 寫入後不主動重新 attach；對已存在的 session，**下次 daemon 重啟生效**（重啟時 session 重建走動態偵測路徑才重讀 pin/sticky）。執行期 `clear`/`attach` 沿用既有 session 的 profile、不重選。
+
+#### profile test（離線 regex 診斷，#174）
+
+`serialwrap profile test --profile <name> --sample <file> [--profile-dir DIR]` 不連 daemon、不碰任何 UART：從 `--profile-dir`（預設 `PROFILE_DIR`）載入 profile YAML，找出名為 `<name>` 的 template，對 `--sample` 檔案的文字內容跑 `prompt_regex` / `login_regex` / `password_regex`（整段文字 `re.search`，比對基準同 `wait_for_regex`）與 `bootloader_prompts`（清單逐條，僅比對樣本**最後一個非空白行**，比對基準同 `_matches_any_bootloader_prompt` 的 recovery gate 語意），stdout 印 JSON 回報各 regex 是否命中與命中的行，exit code 恆為 0（純診斷、不因未命中而失敗）。用途：operator 自訂／收緊 regex 前，先拿一段真實 console 文字（例如外部 minicom capture log 的片段）離線驗證，不必上板試錯導致 session 卡死。
 
 ### 11.2 RPC
 
@@ -789,6 +796,8 @@ targets:
 **帳密解析狀態與 `CREDENTIALS_UNRESOLVED` 終態（#140）**：`resolve_session_auth()` 除回傳 `SessionAuth` 外，另回一個 `AuthResolution`，其 `reason` 為 `ok` / `env_file_missing` / `env_file_unreadable` / `key_absent` / `not_configured` 之一，並帶「實際解析到的 env_file 絕對路徑」。只要 `username`／`password` 皆非空即為 `ok`（即使 env_file 缺失、只要 `os.environ` 補齊亦然，避免誤擋可用帳密）。當 profile **宣告了帳密來源**（`user_env`／`pass_env`／`env_file` 任一）但 `reason` 非 `ok`（帳密為空）時，login 流程 **不對** `Login:`／`Password:` 送空字串，session 標 `last_error=CREDENTIALS_UNRESOLVED`（與「板子尚未到 login prompt」的 `LOGIN_REQUIRED` 區分），且此為明確終態——自動 reprobe 不再反覆送空帳密，需操作者補帳密後手動 `session attach`／`recover`（或重啟 daemon 重讀 env_file）才重試。進入此態時 daemon 輸出一次 log + WAL 警告（去重），內含 env_file 實際解析絕對路徑與 `reason`，**絕不含帳密值**。profile **未宣告**帳密來源（`not_configured`）者行為完全不變（既有 passwordless/auto-login 路徑不受影響）。
 
 **`platform=bcm`**：Broadcom 原生平台（如 BCM968575）。登入後 target 進入 BCM CLI shell（`>`），需再執行 `post_login_cmd`（通常是 `sh`）才進到 Linux shell（`#`）。`timeout_s` 建議加大（15s+），因 Broadcom 登入流程較慢。
+
+**login FSM 硬化（#174）**：`login_fsm._finalize_ready()` 送出 `post_login_cmd` 前，先以 `login_fsm.matches_login_or_password()` 檢查 rx tail 是否命中該 session 的 `login_regex` / `password_regex`——命中就代表 `prompt_regex` 誤配（例如 BDK login banner 的 `#####` 裝飾線、CEVENT 洪流誤配成 prompt）、`_probe_prompt` 假成功、整段 `_maybe_login` 被跳過，此時**絕不**把 `post_login_cmd` 當帳密送進 login prompt，直接回可行動的 `LOGIN_REQUIRED`。同一檢查也用於**失敗分流**：`POST_LOGIN_CMD_TIMEOUT`／`READY_NONCE_TIMEOUT` 逾時後，若 rx tail 已回到 login/password prompt（憑證錯導致板子重印 `login:`，或前述 guard 仍漏接），改回 `LOGIN_REQUIRED`，不再與「登入成功但指令無回應」擠同一個 timeout 碼；`LOGIN_REQUIRED` 依既有原則永不被 RX_FLOOD 反分類遮蔽（login prompt 可見＝可行動）。所有 login FSM 失敗碼（`login_fsm.LOGIN_FSM_DETAIL_ERRORS`：`LOGIN_REQUIRED`／`LOGIN_PROMPT_TIMEOUT`／`*_PROMPT_TIMEOUT`／`POST_LOGIN_CMD_TIMEOUT`／`READY_NONCE_TIMEOUT`／`USER_ENV_MISSING`／`PASS_ENV_*` 等）在 `session_manager._refine_probe_failure()`（attach/recover/reprobe/自動登入共用的單一 choke point）未被翻轉為 `TRANSPORT_STALL` 時，`last_error_detail` 會帶上失敗當下的 rx tail（`clean_text()` 去控制碼／ANSI 後取最後 300 字元），取代舊行為恆為 `null`。出貨 `brcm-template` 的 `prompt_regex` 亦已錨定行首並排除連續 `#`/`>` 裝飾線（見 §13.2 範例），可用 `serialwrap profile test --profile <name> --sample <file>` 離線驗證 prompt/login/password/bootloader regex 對一段真實 console 文字的匹配結果，不必上板試錯。
 
 **`platform=prpl`**：prplOS 平台。`prompt_regex` 應匹配 prompt prefix，例如 `(?m)^root@prplOS:.*# `。不依賴行尾錨點，以適應 prompt 後接 driver / kernel log 的情境。`ready_probe` 保持最小 `echo __READY__${nonce}`。
 
