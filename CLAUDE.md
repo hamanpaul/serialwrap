@@ -31,7 +31,8 @@ policy_version: 1.0.15
   ```
   （注意：unittest 不載入 `tests/conftest.py` 的強制 env 隔離與 live guard 防線，僅 state/WAL/events 維度有 per-file 隔離（`tests/state_iso.py`）；**有 production daemon 的機器一律以 pytest 為準**，#120。）
 - pytest 下的隔離行為（#120）：`tests/conftest.py` 會硬覆寫 9 個 `SERIALWRAP_*` 目錄變數並 pop 5 個高優先變數（外層 shell export 無效），並於 suite 結束執行 live guard（state/WAL/config/daemon 四維快照比對；逃生閥 `SERIALWRAP_LIVE_GATE=warn`，warn 下結構性破壞仍 FAIL——warn 為明知風險的 opt-in：daemon TX/state 變更僅示警，開發者需自行確認；daemon 維度多層探測 system→user systemd→唯讀 RPC on-demand，全不可達才 SKIP，#121）。
-- 既有失敗：`tests/test_multiagent_e2e.py::TestMultiAgentE2E::test_five_agents_three_rounds_no_conflict`（agent TX count mismatch，pre-existing）。
+- **目前無已知恆定失敗**（2026-08-11 校正）：本機全套 `python3 -m pytest -q tests/` 為 `1636 passed, 16 skipped`（0 failed）。舊版本檔曾把 `tests/test_multiagent_e2e.py::TestMultiAgentE2E::test_five_agents_three_rounds_no_conflict`（agent TX count mismatch）列為 pre-existing 失敗，該 case 單獨連跑 5/5 通過、全套亦通過，**該註記已過期並移除**；看到它紅燈請當成真實回歸處理，不要當成既有基線。
+- **「已知 flaky」不得當作放行理由**：口耳相傳曾把 PTY-heavy 測試（`tests/test_human_agent_coexist.py`、`tests/test_multiagent_e2e.py`、`tests/test_multiagent_stress.py`、`tests/test_flash_pump.py`、`tests/test_flash_service_wiring.py`、`tests/test_agent_defer_tx.py`）在多 suite 併發下的失敗歸因為 `/dev/pts` 競態。2026-08-11 以 host＋worktree 併發度 2／6／12 共 25 次重跑**無法重現**（每次皆 `33 passed`；pty 峰值 63／上限 4096、load 峰值 7.5／20 cores），故此說法**目前無證據支持**。看到這幾支紅燈請**預設當成真實回歸**處理；要主張是環境問題，須提出「同範圍連跑兩次、失敗集合不同」的實測，並先排除洩漏的 throwaway daemon 與系統飽和。
 - 不得引入**新的**測試失敗。
 
 ## 回歸 case 政策（#155）
