@@ -1,5 +1,5 @@
 policy_profile: flat
-policy_version: "1.0.15"
+policy_version: "1.0.17"
 # 內容分類（R-21）：serialwrap 為通用序列工具、無雇主機密 → 維持 public
 tier: shareable
 secret_scan:
