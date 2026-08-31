@@ -1288,6 +1288,50 @@ serialwrap service restart
 
 `others-template` 使用 `platform=passthrough`。attach 時不做 prompt/login/ready 限制，只建立 broker bridge，讓 `ttyUSB` 與 broker 建出的 `ttyPTS` 直接透傳；這類 session 會停在 `ATTACHED`，適合不認識的設備先用 minicom/human console 觀察。
 
+### 範例：debug probe（如 TI XDS110）passthrough explicit target（#186）
+
+TI XDS110 這類 debug probe 是 composite USB 裝置，會列舉出兩個 CDC-ACM 介面（application
+console + auxiliary data port），兩者都沒有 Linux shell prompt，動態偵測只會不斷收到
+`PROMPT_UNAVAILABLE`。以下是一份可直接放進 `profiles/*.yaml` 的 explicit target 範例
+（`<FW_VERSION>` / `<PROBE_SERIAL>` 為佔位符，換成實際探棒的值）：
+
+```yaml
+profiles:
+  xds110-passthrough:
+    platform: passthrough
+    prompt_regex: ".*"
+    login_regex: "$^"
+    password_regex: "$^"
+    ready_probe: ""
+    uart:
+      baud: 921600        # 實測值：許多 debug probe 的 application console 不是 115200，
+                           # 套用前務必先用 human console 量測，不要照抄模板預設值
+      data_bits: 8
+      parity: N
+      stop_bits: 1
+      flow_control: none
+      xonxoff: false
+targets:
+  - act_no: 1
+    com: COM0
+    alias: probe-console
+    profile: xds110-passthrough
+    device_by_id: /dev/serial/by-id/usb-Texas_Instruments_XDS110__<FW_VERSION>__Embed_with_CMSIS-DAP_<PROBE_SERIAL>-if00
+```
+
+兩個容易踩到的坑：
+
+1. **探棒韌體版本內嵌在 by-id 字串裡**：`XDS110__<FW_VERSION>__...` 這段版本號是 by-id
+   路徑的一部分，探棒韌體升級後整串 by-id 會變，`targets` 的綁定會安靜地永久失效——
+   session 停在 `DETACHED`，症狀跟「裝置沒插」完全一樣、沒有任何診斷指出原因。升級探棒
+   韌體後務必回來同步更新這裡的 `device_by_id`（相關硬化建議見 issue #186）。
+2. **UART baud 不是模板預設的 115200**：debug probe 的 application console 實際 baud
+   常常更高（本例實測 921600）。套用 `prpl-template` 之類假設 115200 的模板會導致完全
+   收不到可辨識的 prompt，`session list` 的 WAL rx 計數會停在 0；`prpl-template` 也會
+   對這種非 Linux shell 的 console（如 OpenThread 的 `>` prompt）持續 `PROMPT_UNAVAILABLE`
+   reprobe。應改用像上面這種 `platform: passthrough` 的專用 profile，並先用 minicom
+   手動量測正確 baud 再套用。
+
 ### Auto-detect 流程
 
 當 DeviceWatcher 偵測到新 UART 裝置且沒有任何 explicit binding 匹配時，daemon 會自動執行 template 偵測：
