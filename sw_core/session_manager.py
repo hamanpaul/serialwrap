@@ -680,9 +680,22 @@ class SessionManager:
         self._last_console_reap_at: float = 0.0
 
         self._load_state()
+        # #186：一個 explicit YAML target 自己宣告的 device_by_id 對其他 target 而言必須排他。
+        # 若某 session 的持久化 binding override 剛好等於「另一個 target 自己在 YAML 宣告」的
+        # device_by_id（多半是舊版 _attach_by_id DETACHED-rebind fallback 在該 target 尚未配置
+        # 前，把這顆當時無人認領的裝置誤借給別的 DETACHED target、又持久化下來的殘留紀錄——見
+        # issue #186），這筆 override 已不具權威性：這顆裝置現在有明確主人，不能再讓別的 target
+        # 頂著這筆 override 繼續佔用它。改用該 target 自己的 YAML 宣告值，並清掉這筆過期 override，
+        # 避免下次載入再誤用；同時讓「哪個 target 真正拿到這顆裝置」不再取決於 profile 檔案的
+        # 載入順序（self._sessions insertion order 只在後面 exact-match 時當 tiebreak）。
+        declared_by_ids = {p.device_by_id for p in profiles if p.device_by_id}
         for p in profiles:
             sid = f"{p.profile_name}:{p.com}"
-            device_by_id = self._binding_overrides.get(sid, p.device_by_id)
+            override = self._binding_overrides.get(sid)
+            if override and override != p.device_by_id and override in declared_by_ids:
+                del self._binding_overrides[sid]
+                override = None
+            device_by_id = override if override else p.device_by_id
             if not device_by_id:
                 continue
             profile = dataclasses.replace(p, device_by_id=device_by_id)
