@@ -531,7 +531,34 @@ class SerialwrapService:
         except OSError:
             pass
 
+    def _wal_missing_response(self, health: dict[str, Any]) -> dict[str, Any] | None:
+        """WAL 已寫過紀錄但現行檔不存在 → 明確錯誤，不用空陣列 + ok:true 帶過（#189）。
+
+        ``current_seq == 0`` 代表這個 daemon 從來沒寫過任何紀錄（全新啟動、尚無 UART
+        流量），此時檔案不存在是正常的，不誤報。
+        """
+        if health["wal_file_exists"] or health["current_seq"] <= 0:
+            return None
+        return {
+            "ok": False,
+            "error_code": "WAL_MISSING",
+            "wal_path": health["wal_path"],
+            "wal_dir": health["wal_dir"],
+            "wal_dir_exists": health["wal_dir_exists"],
+            "wal_file_exists": False,
+            "current_seq": health["current_seq"],
+            "hint": (
+                f"WAL 已寫過 {health['current_seq']} 筆紀錄，但現行 WAL 檔不存在——稽核紀錄"
+                "在 daemon 運行期間被移除（常見於外部工具 rmtree WAL 目錄）。消失期間的"
+                "紀錄無法復原；daemon 會在下一次寫入時自動重建目錄續寫。以 "
+                "`serialwrap doctor` 的 wal_writable 檢查確認目錄狀態。"
+            ),
+        }
+
     def health(self) -> dict[str, Any]:
+        # WAL 健康在 self._lock 之外先取（含 stat/access 等檔案系統呼叫），不在
+        # RPC 路由層持鎖期間做 I/O。
+        wal_health = self._wal.health()
         with self._lock:
             sessions = self._sessions.list_sessions()
             devices = self._sessions.list_devices()
@@ -551,6 +578,9 @@ class SerialwrapService:
                 "commands": len(self._arbiter.snapshot()),
                 "wal_path": self._wal.wal_path,
                 "mirror_path": self._wal.mirror_path,
+                # #189：稽核紀錄的活體健康（目錄／檔案存在性、可寫性、寫入失敗與自癒
+                # 重建次數）。doctor 的 wal_writable 檢查即消費此欄位。
+                "wal": wal_health,
                 # #129：暴露可查詢的命令長度上限，讓 client 執行期查詢而非硬編碼。
                 # 上限值與錯誤碼／警告碼字串皆直接引用 sw_core.arbiter 常數（單一
                 # 事實來源）；此為 broker 對 command.submit 單一 --cmd 參數的 UTF-8
@@ -939,6 +969,10 @@ class SerialwrapService:
                 if not state.get("ok"):
                     return state
                 target_com = str(state["session"]["com"])
+            wal_health = self._wal.health()
+            missing = self._wal_missing_response(wal_health)
+            if missing is not None:
+                return missing
             rows, truncated = self._wal.tail_raw_with_meta(
                 from_seq=from_seq, com=target_com, limit=limit
             )
@@ -950,11 +984,15 @@ class SerialwrapService:
             # - truncated：latest 模式＝視窗前還有更舊符合紀錄；range 模式＝視窗後還有更新符合紀錄
             #   scope：僅以現行 WAL 檔為範圍——輪替歸檔 raw.wal.ndjson.<ts> 不列入判定
             #  （rotation 剛發生時 latest 模式可能回不足 limit 筆且 truncated=False，#124 review）
+            # - wal_path / wal_file_exists（#189）：讓呼叫端一眼分辨「查得到但沒資料」
+            #   與「稽核檔案不見了」——先前兩者都只是 ok:true + 空陣列
             meta: dict[str, Any] = {
                 "from_seq": from_seq,
                 "last_seq": rows[-1]["seq"] if rows else None,
                 "current_seq": self._wal.current_seq,
                 "truncated": truncated,
+                "wal_path": wal_health["wal_path"],
+                "wal_file_exists": wal_health["wal_file_exists"],
             }
             if method == "log.tail_raw":
                 return {"ok": True, "records": rows, "returned": len(rows), **meta}
@@ -965,10 +1003,25 @@ class SerialwrapService:
             from_seq = int(params.get("from_seq") or 0)
             to_seq = int(params.get("to_seq") or 0)
             limit = int(params.get("limit") or 1000)
+            wal_health = self._wal.health()
+            missing = self._wal_missing_response(wal_health)
+            if missing is not None:
+                return missing
             rows = self._wal.tail_raw(from_seq=from_seq, com=None, limit=limit)
             if to_seq > 0:
                 rows = [r for r in rows if int(r.get("seq", 0)) <= to_seq]
-            return {"ok": True, "records": rows}
+            # #189：請求區間落在已輪替掉的範圍時明確標示。先前「這個區間本來就沒有
+            # 紀錄」與「曾經存在但已被 rotate 掉」都只回空陣列 + ok:true + rc=0，
+            # 呼叫端無從分辨，事故回溯就是在這裡斷掉的。
+            available = self._wal.available_from_seq()
+            return {
+                "ok": True,
+                "records": rows,
+                "wal_path": wal_health["wal_path"],
+                "wal_file_exists": wal_health["wal_file_exists"],
+                "available_from_seq": available,
+                "rotated_out": bool(available is not None and from_seq + 1 < available),
+            }
 
         if method == "wal.reset":
             return self._wal.reset()

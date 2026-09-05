@@ -548,6 +548,22 @@ latest mode may return fewer than `--limit` records with `truncated=false`;
 read the archive files directly if you need older records (`log tail-*` and
 `wal export` both read the current file only).
 
+`WAL_MISSING` (#189): if the WAL file is gone while `current_seq > 0` — records
+were written and the audit trail has since been removed, typically because an
+external tool deleted the WAL directory — `log tail-raw` / `log tail-text` /
+`wal export` return `ok: false` with `error_code: "WAL_MISSING"` and the actual
+`wal_path`, instead of `ok: true` plus an empty array. Every response (success
+or not) carries `wal_path` and `wal_file_exists` so a caller can tell "queried
+fine, no matching records" apart from "the audit file is gone". A brand-new
+daemon that has not written anything yet (`current_seq == 0`) is not an error.
+The daemon recreates a deleted WAL directory on its next append and logs a
+warning; records written while it was missing are unrecoverable. `wal export`
+additionally reports `available_from_seq` and `rotated_out`, so a range that
+predates the current file is stated explicitly rather than coming back empty.
+`serialwrap doctor`'s `wal_writable` check verifies the directory really exists
+and is writable — unlike `wal_dir`, which only compares the shell and daemon
+values and is advisory.
+
 `~/b-log` is **not** the WAL — it only holds agent-triggered on-demand session
 captures. The authoritative WAL always lives under `SERIALWRAP_WAL_DIR`
 (default `~/.local/state/serialwrap/wal/`). A shell-exported
@@ -1766,6 +1782,12 @@ serialwrap wal export --from-seq 0 --limit 500
 兩者回應皆附 metadata 欄位：`from_seq`（實際使用值，latest 模式為 `null`）、`last_seq`（回傳紀錄的最大 seq，無紀錄為 `null`，可作下次 `--from-seq` 增量起點）、`current_seq`（WAL 目前 seq 計數）、`returned`（回傳筆數：`tail-raw` 計 WAL records、`tail-text` 計文字行數）、`truncated`（是否還有符合但被 `--limit` 截掉的紀錄：latest 模式指視窗**之前**還有更舊紀錄、range 模式指視窗**之後**還有更新紀錄）。
 
 注意：查詢與 `truncated` 判定**僅涵蓋現行 `raw.wal.ndjson`**。WAL 輪替（rotation）後更舊紀錄保存在 `raw.wal.ndjson.<時戳>` 歸檔檔，不列入判定——rotation 剛發生時 latest 模式可能回不足 `--limit` 筆且 `truncated=false`；需要歸檔紀錄請直接讀取歸檔檔（`log tail-*` 與 `wal export` 皆僅讀現行檔）。
+
+**WAL 檔案不存在時不再靜默回空（`WAL_MISSING`，#189）**：若 `current_seq > 0`（已寫過紀錄）而現行 WAL 檔不存在——代表稽核紀錄在 daemon 運行期間被移除，常見於外部工具刪掉整個 WAL 目錄——`log tail-raw` / `log tail-text` / `wal export` 一律回 `ok: false` ＋ `error_code: "WAL_MISSING"` ＋ 實際 `wal_path`，而不是 `ok: true` ＋ 空陣列 ＋ rc=0。所有回應（成功與否）都帶 `wal_path` 與 `wal_file_exists`，讓呼叫端分辨「查得到但沒有符合的紀錄」與「稽核檔案不見了」。全新 daemon 尚未寫過任何紀錄（`current_seq == 0`）時檔案不存在屬正常，不誤報。
+
+daemon 在下一次 append 時會**自動重建**被刪掉的 WAL 目錄並輸出告警，但消失期間的紀錄無法復原。`wal export` 另回 `available_from_seq`（現行檔最小 seq）與 `rotated_out`（請求區間是否落在已輪替掉的範圍），使「這個區間本來就沒紀錄」與「曾經存在但已被 rotate 掉」不再都只是空陣列。
+
+`serialwrap doctor` 的 **`wal_writable`** 檢查會實際驗證該目錄存在且可寫，**非 advisory**（稽核紀錄整個消失會拉低 doctor 整體 ok）；既有的 `wal_dir` 檢查只比對 shell/daemon 的 WAL_DIR 是否一致、維持 advisory WARN，兩者各司其職。
 
 ### WAL 管理
 

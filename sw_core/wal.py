@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import threading
 import time
@@ -12,6 +13,10 @@ from typing import Any
 
 from .constants import DEFAULT_WAL_ROTATE_BYTES, WAL_DIR
 from .util import dumps_stable, monotonic_ns, now_iso, to_printable
+
+# 模組層 logger：append 的頻率等同 UART RX，而 logging.getLogger() 每次呼叫都會
+# 進 logging.Manager 取全域鎖——不可放在這條熱路徑上（#189）。
+_LOG = logging.getLogger("serialwrap")
 
 
 class WalWriter:
@@ -24,6 +29,10 @@ class WalWriter:
         self._mirror_path = os.path.join(self._wal_dir, "raw.mirror.log")
         self._lock = threading.Lock()
         self._seq = 0
+        # 稽核健康計數（#189）：WAL 目錄可能被外部工具整個刪掉，而服務先前對此毫無所覺。
+        self._write_failures = 0
+        self._last_write_error: str | None = None
+        self._recreated_count = 0
         os.makedirs(self._wal_dir, exist_ok=True)
         self._load_last_seq()
 
@@ -126,18 +135,95 @@ class WalWriter:
                 # 輪替失敗不丟資料（仍寫入既有檔），但標記供觀測；conditional key 維持常態 record 向後相容。
                 record["rotation_failed"] = True
             try:
-                with open(self._wal_path, "a", encoding="utf-8") as wal_fp:
-                    wal_fp.write(dumps_stable(record))
-                    wal_fp.write("\n")
-                with open(self._mirror_path, "a", encoding="utf-8") as mirror_fp:
-                    mirror_fp.write(to_printable(payload))
+                self._write_record_locked(record, payload)
             except OSError as exc:
-                # 稽核寫入失敗（ENOSPC/EROFS/權限/fd 耗盡）不得讓資料平面（RX reader thread）崩潰（#79 STA-1）。
-                # best-effort：標記 loss、告警，仍回傳 record 讓上游照常 fan-out 給 console、續處理後續 RX。
-                record["loss_flag"] = True
-                import logging
-                logging.getLogger("serialwrap").warning("WAL append 寫入失敗（best-effort 略過）：%s", exc)
+                # #189：稽核目錄可能在 daemon 運行期間被外部工具整個刪掉（實地事故：
+                # testpilot 的 clean_wal() rmtree 硬編路徑 /tmp/serialwrap/wal）。append
+                # 每次都重開檔，故下一筆寫入立刻撞到 ENOENT——在這裡自癒重建目錄並重試
+                # 一次，而不是連續六天安靜地把稽核紀錄寫進虛空、seq 一路累加到 126 萬。
+                try:
+                    os.makedirs(self._wal_dir, exist_ok=True)
+                    self._write_record_locked(record, payload)
+                except OSError as retry_exc:
+                    # 重建也失敗（ENOSPC/EROFS/權限/fd 耗盡）不得讓資料平面（RX reader
+                    # thread）崩潰（#79 STA-1）。best-effort：標記 loss、告警，仍回傳
+                    # record 讓上游照常 fan-out 給 console、續處理後續 RX。
+                    record["loss_flag"] = True
+                    self._write_failures += 1
+                    self._last_write_error = f"{type(retry_exc).__name__}: {retry_exc}"
+                    _LOG.warning("WAL append 寫入失敗（best-effort 略過）：%s", retry_exc)
+                else:
+                    self._recreated_count += 1
+                    self._last_write_error = f"{type(exc).__name__}: {exc}"
+                    _LOG.warning(
+                        "WAL 目錄 %s 消失，已重建並續寫（原因：%s）；消失期間的紀錄無法復原",
+                        self._wal_dir, exc,
+                    )
         return record
+
+    def _write_record_locked(self, record: dict[str, Any], payload: bytes) -> None:
+        """雙軌 append：權威 ndjson ＋ 人類可讀鏡像。須在 ``self._lock`` 內呼叫。"""
+        with open(self._wal_path, "a", encoding="utf-8") as wal_fp:
+            wal_fp.write(dumps_stable(record))
+            wal_fp.write("\n")
+        with open(self._mirror_path, "a", encoding="utf-8") as mirror_fp:
+            mirror_fp.write(to_printable(payload))
+
+    def health(self) -> dict[str, Any]:
+        """稽核紀錄的活體健康（#189）。
+
+        先前唯一能問的只有 ``current_seq``，而它在 WAL 目錄被刪掉之後仍會繼續累加——
+        於是 ``current_seq=1261000`` 與 ``records=[]`` 可以同時出現在同一個回應裡，
+        沒有任何欄位指出檔案不見了。這裡把檔案系統的實況一次攤開。
+
+        ``healthy`` 的判準：目錄存在且可寫，且不出現「已寫過紀錄但現行檔不存在」。
+        ``current_seq == 0`` 時檔案尚未建立是正常的（全新 daemon、還沒有 UART 流量），
+        不算故障。
+        """
+        wal_dir_exists = os.path.isdir(self._wal_dir)
+        wal_file_exists = os.path.exists(self._wal_path)
+        wal_dir_writable = wal_dir_exists and os.access(self._wal_dir, os.W_OK)
+        # 刻意**不取 self._lock**：該鎖在每一筆 append 的檔案寫入全程持有，而 append
+        # 的頻率等同 UART RX。health() 由 health.status / log.tail_* / wal.range 呼叫，
+        # 這些都在 daemon 單執行緒 asyncio dispatcher 內同步執行——在此等 WAL 寫鎖等於
+        # 讓診斷查詢被資料平面的寫入節奏拖住，凍結整個 RPC loop。這裡讀的是四個
+        # int/str 欄位的診斷快照，GIL 下各自的讀取為原子；快照內部略有時間差對
+        # 「稽核檔在不在」的判定無影響。
+        seq = self._seq
+        failures = self._write_failures
+        last_error = self._last_write_error
+        recreated = self._recreated_count
+        return {
+            "wal_dir": self._wal_dir,
+            "wal_path": self._wal_path,
+            "wal_dir_exists": wal_dir_exists,
+            "wal_file_exists": wal_file_exists,
+            "wal_dir_writable": wal_dir_writable,
+            "current_seq": seq,
+            "write_failures": failures,
+            "last_write_error": last_error,
+            "recreated_count": recreated,
+            "healthy": bool(
+                wal_dir_exists
+                and wal_dir_writable
+                and not (seq > 0 and not wal_file_exists)
+            ),
+        }
+
+    def available_from_seq(self) -> int | None:
+        """現行 WAL 檔中最小的 seq；檔案不存在或無有效紀錄時回 ``None``（#189）。
+
+        用來分辨「這個區間本來就沒有紀錄」與「這個區間曾經存在，但已被輪替掉」——
+        對呼叫端是完全不同的結論，先前兩者都只是空陣列 ＋ ``ok:true``。
+        """
+        if not os.path.exists(self._wal_path):
+            return None
+        try:
+            for obj in self._iter_matching(None):
+                return int(obj["seq"])
+        except OSError:
+            return None
+        return None
 
     def reset(self) -> dict[str, Any]:
         """輪替現有 WAL 檔案並重設 seq 計數器。不需重啟 daemon。"""
