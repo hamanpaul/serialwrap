@@ -94,6 +94,17 @@ class TestWalHealth(_WalBase):
         self.assertIsNotNone(health["last_write_error"])
         self.assertFalse(health["healthy"])
 
+    @unittest.skipIf(os.geteuid() == 0, "root 繞過權限檢查，此案在 root 下無意義")
+    def test_non_traversable_dir_is_not_writable(self):
+        """目錄只有 W_OK 沒有 X_OK 時進不去、建不了檔，不得判為可寫。"""
+        self._append()
+        os.chmod(self.wal_dir, 0o600)          # rw- but no traverse
+        self.addCleanup(os.chmod, self.wal_dir, 0o700)
+
+        health = self.wal.health()
+        self.assertFalse(health["wal_dir_writable"])
+        self.assertFalse(health["healthy"])
+
     def test_available_from_seq_tracks_current_file(self):
         for _ in range(3):
             self._append()
@@ -155,6 +166,19 @@ class TestReadPathsReportMissing(_ServiceBase):
         resp = svc.rpc("wal.range", {"from_seq": 0, "limit": 100})
         self.assertTrue(resp["ok"])
         self.assertEqual(resp["records"], [])
+
+    def test_current_seq_comes_from_the_same_snapshot(self):
+        """回應內的 current_seq 必須與同一份 wal_health 快照一致（且不再取 WAL 寫鎖）。"""
+        for _ in range(3):
+            self._append()
+        with mock.patch.object(
+            type(self.wal), "current_seq",
+            new=property(lambda _self: (_ for _ in ()).throw(
+                AssertionError("不得經 current_seq property 取 WAL 寫鎖"))),
+        ):
+            resp = self._service().rpc("log.tail_raw", {})
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["current_seq"], 3)
 
     def test_normal_read_carries_wal_path_and_existence(self):
         """「查得到但沒資料」與「檔案不見了」必須能分辨——正常路徑也要帶這兩個欄位。"""

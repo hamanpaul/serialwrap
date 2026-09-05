@@ -182,7 +182,10 @@ class WalWriter:
         """
         wal_dir_exists = os.path.isdir(self._wal_dir)
         wal_file_exists = os.path.exists(self._wal_path)
-        wal_dir_writable = wal_dir_exists and os.access(self._wal_dir, os.W_OK)
+        # 目錄要能建立/開啟檔案，需同時具備寫入（W_OK）與 traverse（X_OK）權限——
+        # 只驗 W_OK 會把 0600 這類「寫得進 inode 但進不去」的目錄誤判為可寫，
+        # 使 healthy / doctor 的 wal_writable 漏報（Copilot review）。
+        wal_dir_writable = wal_dir_exists and os.access(self._wal_dir, os.W_OK | os.X_OK)
         # 刻意**不取 self._lock**：該鎖在每一筆 append 的檔案寫入全程持有，而 append
         # 的頻率等同 UART RX。health() 由 health.status / log.tail_* / wal.range 呼叫，
         # 這些都在 daemon 單執行緒 asyncio dispatcher 內同步執行——在此等 WAL 寫鎖等於

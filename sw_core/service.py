@@ -989,7 +989,11 @@ class SerialwrapService:
             meta: dict[str, Any] = {
                 "from_seq": from_seq,
                 "last_seq": rows[-1]["seq"] if rows else None,
-                "current_seq": self._wal.current_seq,
+                # current_seq 取自上面同一份 wal_health 快照：`WalWriter.current_seq`
+                # property 會取 WAL 寫鎖（append 全程持有），在此讀等於讓診斷路徑被
+                # 資料平面的寫入節奏拖住、凍結單執行緒的 RPC loop；用快照亦保證回應
+                # 內的 WAL 狀態彼此一致（Copilot review）。
+                "current_seq": wal_health["current_seq"],
                 "truncated": truncated,
                 "wal_path": wal_health["wal_path"],
                 "wal_file_exists": wal_health["wal_file_exists"],
