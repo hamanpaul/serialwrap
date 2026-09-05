@@ -2456,6 +2456,12 @@ class SessionManager:
             self._attach_by_id_dynamic(by_id)
             return
 
+        # 既有 session 的 profile 再解析（#181）：pin 逃生口與「fallback 只是暫時分類」。
+        # 必須在下方開 bridge 之前做——偵測需要自己的 PROBE bridge，且換 template 會連
+        # uart 參數（baud 等）一起換掉。本方法原地 mutate 同一個 session 物件，故上面
+        # 取得的 session 區域變數在此之後仍然有效。
+        self._reresolve_profile_on_reattach(by_id)
+
         with self._lock:
             if session is None:
                 return
@@ -2659,6 +2665,198 @@ class SessionManager:
         if generic is not None:
             return generic
         return next((t for t in self._templates if t.platform == "passthrough"), None)
+
+    def _rematerialize_profile_locked(
+        self, session: SessionRuntime, tpl: ProfileTemplate, source: str
+    ) -> bool:
+        """把既有 session 的 profile 換成另一個 template（#181）。
+
+        須在 ``self._lock`` 內、且 ``session.bridge is None`` 時呼叫。保留 ``com``／
+        ``act_no``／``device_by_id``；alias 只在仍是「舊 template 自動產生」的
+        ``<profile_name>+<act_no>`` 形式時跟著改名，使用者自訂過的一律保留。
+        ``session_id`` 依新 profile_name 重算（``_session_from_template`` 的
+        ``f"{profile_name}:{com}"`` 規則），並同步搬移所有以 session_id 為 key 的結構。
+
+        刻意**原地 mutate** ``session`` 物件而非重建：``retained_consoles``（保留給
+        human minicom 的 PTY）、boot quiet 狀態等執行期欄位都掛在這個物件上，重建會把
+        正掛著的 human console 一併丟掉——那正是 #182 抱怨的代價。
+
+        回傳是否真的換過。新 session_id 已被別的 session 佔用時不動作（回 ``False``），
+        避免把兩個 session 併成一個。
+        """
+        old_sid = session.session_id
+        old_profile = session.profile
+        new_sid = f"{tpl.profile_name}:{old_profile.com}"
+        if new_sid != old_sid and new_sid in self._sessions:
+            return False
+        auto_alias = f"{old_profile.profile_name}+{old_profile.act_no}"
+        alias = (
+            f"{tpl.profile_name}+{old_profile.act_no}"
+            if old_profile.alias == auto_alias
+            else old_profile.alias
+        )
+        session.profile = dataclasses.replace(
+            old_profile,
+            profile_name=tpl.profile_name,
+            alias=alias,
+            platform=tpl.platform,
+            prompt_regex=tpl.prompt_regex,
+            login_regex=tpl.login_regex,
+            password_regex=tpl.password_regex,
+            post_login_cmd=tpl.post_login_cmd,
+            ready_probe=tpl.ready_probe,
+            username=tpl.username,
+            user_env=tpl.user_env,
+            pass_env=tpl.pass_env,
+            env_file=tpl.env_file,
+            timeout_s=tpl.timeout_s,
+            quiet_window_s=tpl.quiet_window_s,
+            hard_timeout_s=tpl.hard_timeout_s,
+            log_dir=tpl.log_dir,
+            bootloader_prompts=tpl.bootloader_prompts,
+            uart=tpl.uart,
+        )
+        session.profile_source = source
+        self._reset_reprobe_progress_locked(session)
+        if new_sid != old_sid:
+            session.session_id = new_sid
+            # 以 comprehension 重建而非 pop+insert：保留 _sessions 的插入順序（#186 的
+            # exact-match tiebreak 與 DETACHED-rebind 候選排序都看得到這個順序）。
+            self._sessions = {
+                (new_sid if sid == old_sid else sid): row
+                for sid, row in self._sessions.items()
+            }
+            if old_sid in self._binding_overrides:
+                self._binding_overrides[new_sid] = self._binding_overrides.pop(old_sid)
+            probe_lock = self._reprobe_probe_locks.pop(old_sid, None)
+            if probe_lock is not None:
+                self._reprobe_probe_locks[new_sid] = probe_lock
+            if old_sid in self._loaded_released:
+                self._loaded_released[new_sid] = self._loaded_released.pop(old_sid)
+        if alias != old_profile.alias:
+            self._aliases.unassign(old_profile.alias)
+        self._aliases.set_for_session(session.session_id, alias)
+        return True
+
+    def _suggest_profile_from_rx(self, bridge: UARTBridge) -> str | None:
+        """拿最近的 RX 比對所有非 passthrough template 的 ``prompt_regex``（#181）。
+
+        判斷邏輯與 ``serialwrap profile test`` 同源——#181 的實測正是「把真實 prompt
+        餵給 `profile test` 會命中 prpl-template，只是那個判斷從來沒被套用到這個
+        session 上」。這裡把它接到 ``self_test`` 的診斷輸出，讓掉進 catch-all 的
+        session 至少能被告知「你看起來是哪一種」。
+
+        passthrough template 一律跳過：``others-template`` 的 ``prompt_regex`` 是
+        ``.*``、恆真，建議回它等於沒建議。
+        """
+        if not self._templates:
+            return None
+        try:
+            snapshot = clean_text(bridge.rx_tail(BOOTLOADER_RX_TAIL_BYTES))
+        except Exception:
+            return None
+        if not snapshot:
+            return None
+        for tpl in self._templates:
+            if tpl.platform == "passthrough":
+                continue
+            try:
+                if re.search(tpl.prompt_regex, snapshot):
+                    return tpl.profile_name
+            except re.error:
+                continue
+        return None
+
+    def _reresolve_profile_on_reattach(self, by_id: str) -> None:
+        """既有 session 重新 attach 前重新解析 profile（#181）。
+
+        #95 建立的四層優先序（pin > sticky > detect > fallback）只實作在
+        ``_attach_by_id_dynamic``——也就是「該裝置**從未**建過 session」的路徑。既有
+        session 走 ``_attach_by_id``，它以 ``device_by_id`` 找到 session 後就原封不動
+        沿用 ``session.profile``；而 ``clear_session`` 只 detach bridge、**不刪 session
+        物件**，於是「``session pin`` + ``session clear``」對既有 session 完全沒有效果。
+        pin 的說明是「最高優先，繞過偵測」，是使用者唯一被告知的逃生口，實際卻是被
+        接受、被持久化，然後被忽略（#181 問題 1）。本方法補上這條路徑。
+
+        另外 ``fallback``（catch-all，如 ``others-template``）是**未經量測**的分類：
+        attach 當下板子還在噴 log、沒有乾淨 prompt 就會掉進來，而它的空 ``ready_probe``
+        使 ``command_capable`` 永久為 false，形成沒有出口的單向門（#181 問題 2/3）。
+        它不具權威性，因此重新 attach 時再給一次偵測機會；``detected``／``sticky`` 是
+        量測過的、``yaml-target`` 是人為宣告的，一律不動。
+
+        偵測會送 ``\r``，故 boot quiet window（#130，U-Boot autoboot 保護）內不做；
+        session 已有 bridge 時也不做（再開 PROBE bridge 會造成 two-reader）。
+        """
+        from .config import UartProfile
+
+        with self._lock:
+            session = next(
+                (s for s in self._sessions.values() if s.profile.device_by_id == by_id),
+                None,
+            )
+            if session is None or session.profile_source == "yaml-target":
+                return
+            if session.bridge is not None:
+                return
+            if session.state == "RELEASED" or by_id in self._released_by_ids:
+                return
+            pin_name = self._profile_pins.get(by_id)
+            pinned_tpl = self._template_by_name(pin_name) if pin_name else None
+            if pinned_tpl is not None:
+                # 解析得到的 pin 為最高優先：改用它並繞過偵測（契約即「繞過偵測」）。
+                # 已經是該 profile 時不必動作，但同樣不往下偵測。
+                if pinned_tpl.profile_name != session.profile.profile_name:
+                    if self._rematerialize_profile_locked(session, pinned_tpl, "pin"):
+                        self._save_state()
+                return
+            # **無法解析的 pin**（指向已移除或改名的 profile）視同無 pin，繼續往下偵測——
+            # 與 _attach_by_id_dynamic 的四層優先序一致（那裡 `tpl is None` 時同樣會落到
+            # sticky/detect）。若只因「state.json 裡留著一個字串」就 return，fallback
+            # session 會被一筆失效的 pin 永久卡在「不套用 pin、也不再偵測」的死角。
+            if session.profile_source != "fallback" or not self._templates:
+                return
+            if session.boot_quiet_active():
+                return
+            dev = self._devices.get(by_id)
+            if dev is None:
+                return
+            real_path = dev.real_path
+
+        # 以獨立 PROBE bridge 偵測，與 _attach_by_id_dynamic 對稱：此刻 session.bridge
+        # 為 None（上面已確認），裝置未被本 daemon 開著。同一 by_id 的並發 attach 由
+        # _spawn_attach 的 _attach_inflight 擋掉。
+        probe_bridge = UARTBridge("PROBE", real_path, UartProfile(), self._wal)
+        detected: ProfileTemplate | None = None
+        try:
+            probe_bridge.start()
+            detected = detect_template(probe_bridge, self._templates)
+        except Exception:
+            detected = None
+        finally:
+            try:
+                probe_bridge.stop()
+            except Exception:
+                pass
+        if detected is None:
+            return
+
+        with self._lock:
+            # 釋鎖期間狀態可能已變（hotplug／release／另一條路徑改了 profile），重驗。
+            session = next(
+                (s for s in self._sessions.values() if s.profile.device_by_id == by_id),
+                None,
+            )
+            if session is None or session.bridge is not None:
+                return
+            if session.profile_source != "fallback":
+                return
+            if detected.profile_name == session.profile.profile_name:
+                return
+            if self._rematerialize_profile_locked(session, detected, "detected"):
+                self._save_state()
+        # sticky（_profile_detected）刻意不在此寫入：既有不變量是「達 READY 的正向偵測
+        # 才寫 sticky」（_maybe_persist_sticky），profile_source 現已是 "detected"，
+        # 後續 attach 流程走到 READY 時會照既有路徑寫入。
 
     def _attach_by_id_dynamic(self, by_id: str) -> None:
         """動態偵測 template 並建立新 session。"""
@@ -4055,6 +4253,26 @@ class SessionManager:
                             classification = "PASSTHROUGH"
                             recommended_action = "console_attach"
                             extra: dict[str, Any] = {}
+                            # #181：fallback 是**未經量測**的 catch-all 分類，且空
+                            # ready_probe 讓 command_capable 永久 false。把最近的 RX 拿去
+                            # 比對所有 template，命中就直接給出可執行的出口，而不是只回
+                            # console_attach——後者會讓使用者以為只能改設定檔＋重啟 daemon。
+                            # 顯式宣告的 passthrough（yaml-target，如 uboot-template）是人為
+                            # 決定，不在此勸退。
+                            if session.profile_source == "fallback":
+                                suggested = self._suggest_profile_from_rx(bridge)
+                                if suggested is not None:
+                                    com = session.profile.com
+                                    recommended_action = "pin_profile"
+                                    extra = {
+                                        "suggested_profile": suggested,
+                                        "hint": (
+                                            f"此 session 為未經量測的 fallback 分類，RX 內容匹配 "
+                                            f"{suggested}。套用：serialwrap session pin --selector "
+                                            f"{com} --profile {suggested} 之後 serialwrap session "
+                                            f"clear --selector {com}。"
+                                        ),
+                                    }
                         elif session.last_error == "LOGIN_REQUIRED":
                             classification = "LOGIN_REQUIRED"
                             recommended_action = "console_attach"

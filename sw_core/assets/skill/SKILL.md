@@ -40,7 +40,14 @@ description: 透過 serialwrap broker + CLI 進行多 agent UART 存取，提供
 
 ## command_capable 與 READY 判定（#51）
 - 一個 session 是否「可下命令」由其 profile 的 `ready_probe` 是否非空決定（`command_capable = bool(profile.ready_probe.strip())`），**與底層是 OS shell 或 bootloader 無關**——只要 `prompt_regex` 對得上、`ready_probe` 能 round-trip 即可進 `READY`（含 U-Boot 之類 bootloader command profile，如 `uboot-template`）。
-- **非 command-capable**（無 `ready_probe`，如 `others-template`、未設 `ready_probe` 的 passthrough）：session 維持 `ATTACHED`、**不**轉 `READY`；此時 `cmd submit` 回 `PROFILE_NOT_COMMAND_CAPABLE`（附 hint：要下命令請設定 `ready_probe` 或改用具 prompt 的 profile）。
+- **非 command-capable**（無 `ready_probe`，如 `others-template`、未設 `ready_probe` 的 passthrough）：session 維持 `ATTACHED`、**不**轉 `READY`；此時 `cmd submit` 回 `PROFILE_NOT_COMMAND_CAPABLE`。
+- `command_capable` **純粹由 profile 的 `ready_probe` 決定**，與 session state 或 console 是否被佔用無關——COM 上掛著 human console 一樣能下命令，看到這個錯誤不要往「session 被佔用」排查（#181）。
+- **卡在 `others-template` fallback 時的出口（#181）**：先 `serialwrap session self-test --selector <COM>`；若回 `recommended_action: "pin_profile"` 與 `suggested_profile`（daemon 拿最近 RX 比對過所有 template 的 `prompt_regex`），照它給的兩行套用即可：
+  ```bash
+  serialwrap session pin   --selector <COM> --profile <suggested_profile>
+  serialwrap session clear --selector <COM>   # 下一次 attach 就套用，不必重啟 daemon
+  ```
+  `fallback` 是**未經量測**的暫時分類（attach 當下板子還在噴 boot log 就會掉進來），下一次 attach 本來也會自動再偵測一次；pin 則是繞過偵測的權威指定。`yaml-target` 的 session 不接受 pin（回 `PROFILE_IS_EXPLICIT`）。
 - `SESSION_NOT_READY` 保留給「`command_capable` 為 True 但尚未通過 probe（仍 `ATTACHED`）」的情形——這種等 probe 完成或 `session recover` 即可。
 - `serialwrap session self-test` 的最外層 result 直接帶 `command_capable` 欄位，不必鑽進巢狀 dict 判斷。
 

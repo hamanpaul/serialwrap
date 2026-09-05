@@ -595,7 +595,14 @@ class SerialwrapService:
                 return None, {
                     "ok": False,
                     "error_code": "PROFILE_NOT_COMMAND_CAPABLE",
-                    "hint": "此 profile 僅支援 console；要下命令請設定 ready_probe 或改用具 prompt 的 profile。",
+                    "hint": (
+                        "此 profile 僅支援 console。command_capable 純粹由 profile 的 "
+                        "ready_probe 決定，與 session state 或 console 是否被佔用無關。"
+                        "要下命令：先 `serialwrap session self-test --selector <COM>` 看有無 "
+                        "suggested_profile，再 `serialwrap session pin --selector <COM> "
+                        "--profile <template>` 釘定、`serialwrap session clear --selector <COM>` "
+                        "套用；或為該 profile 設定 ready_probe。"
+                    ),
                     "session": session,
                 }
             return None, {"ok": False, "error_code": "SESSION_NOT_READY", "session": session}
