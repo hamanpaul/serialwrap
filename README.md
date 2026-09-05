@@ -205,6 +205,17 @@ Profile selection precedence:
 pin > sticky > dynamic detection > others-template fallback
 ```
 
+This precedence is re-applied on **every attach**, not just when a device is
+seen for the first time (#181). Two consequences: `session pin` is a real escape
+hatch — pin, then `session clear` to re-attach, and the session picks the pinned
+template up without restarting the daemon; and the `others-template` fallback is
+treated as **provisional** — a session that landed there (typically because the
+board was still spewing boot logs at attach time, so nothing was ever measured)
+gets another detection attempt on its next attach. Sessions resolved from an
+explicit YAML `target`, from sticky, or from a successful detection are
+authoritative and are never re-resolved. Detection sends `\r`, so it is skipped
+inside the boot quiet window that protects U-Boot autoboot.
+
 Use stable `/dev/serial/by-id/` or `/dev/serial/by-path/` selectors rather than
 volatile `/dev/ttyUSB*` names. If several boards use the same USB-serial chip
 and therefore share the same by-id value, prefer by-path.
@@ -1120,7 +1131,9 @@ serialwrap cmd status --cmd-id <cmd_id>
 - profile 解析優先序：pin > sticky（偵測達 READY 後自動記住）> 動態偵測 > others-template fallback。
 - `session list` 的 `profile_source` 欄位顯示來源：`pin` / `sticky` / `detected` / `fallback` / `yaml-target`。
 - 錯誤碼：`UNKNOWN_PROFILE`（profile 名不存在）、`PROFILE_IS_EXPLICIT`（對 YAML explicit-target 裝置 pin/unpin）、`DEVICE_NOT_FOUND`（selector 解析不到裝置）、`INVALID_ARGS`（缺 selector/profile）。
-- **生效時機**：pin/unpin 寫入後不主動重新 attach；對已存在的 session，**下次 daemon 重啟生效**（重啟時 session 重建走動態偵測路徑才重讀 pin/sticky）。執行期 `clear`/`attach` 沿用既有 session 的 profile、不重選。
+- **生效時機（#181 起）**：pin/unpin 寫入後**不主動**重新 attach，但**下一次 attach 就會套用**——對已存在的 session 執行 `serialwrap session clear --selector <COM>` 即可，不必重啟 daemon。pin 命中時繞過偵測（不開 PROBE bridge），session_id 依新 profile 名重算（如 `others-template:COM2` → `prpl-template:COM2`），COM 號、`act_no`、`device_by_id` 與使用者自訂 alias 均保留，掛在該 session 上的 human console 也不會被丟掉。
+- **fallback 是暫時分類（#181）**：掉進 `others-template` 的 session 多半是 attach 當下板子還在噴 boot log、根本沒量測過（`last_probe_at` 為 `null`），而它的空 `ready_probe` 會讓 `command_capable` 永久為 false。因此 `profile_source` 為 `fallback` 的 session 在**下一次 attach 時會再偵測一次**；`yaml-target` / `sticky` / `detected` 是宣告過或量測過的，一律不重解析。偵測會送 `\r`，故 boot quiet window（U-Boot autoboot 保護，#130）內跳過。
+- **卡在 fallback 時的排查順序**：`serialwrap session self-test --selector <COM>` → 若回 `recommended_action: "pin_profile"` 與 `suggested_profile`，照它給的 `session pin` + `session clear` 兩行套用即可。`command_capable` 純粹由 profile 的 `ready_probe` 決定，**與 session state 或 console 是否被佔用無關**（COM 掛著 console 一樣能下命令），不要往「session 被佔用」的方向排查。
 
 ### COM 編號確定性綁定 by-id（#100）
 
