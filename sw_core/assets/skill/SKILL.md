@@ -37,6 +37,7 @@ description: 透過 serialwrap broker + CLI 進行多 agent UART 存取，提供
 7. `background` 命令：`serialwrap cmd result-tail --cmd-id <cmd_id> --from-chunk 0 --limit 100` 增量取回 chunk。
 8. `interactive` 任務：用 `session interactive-open/-send/-status/-close`，不要拿 `cmd submit` 硬跑全螢幕互動程式。
 9. 需要完整證據時：`serialwrap log tail-raw --selector COM0`（預設 latest 模式回最新 N 筆；要增量讀取帶 `--from-seq N`，回應附 `last_seq`/`current_seq`/`truncated` 等 metadata，#124。注意 `truncated` 僅以現行 WAL 檔為範圍——輪替歸檔 `raw.wal.ndjson.<ts>` 不列入，需要更舊紀錄直接讀歸檔檔）／`serialwrap wal export`；只要查目前 WAL seq 用 `serialwrap wal current-seq`。
+   - **`error_code: WAL_MISSING`（#189）**：已寫過紀錄但現行 WAL 檔不存在＝稽核紀錄在 daemon 運行期間被刪掉（常見於外部工具 rmtree 掉 WAL 目錄），該區段**無法復原**。不要當成「這段時間沒有輸出」。daemon 會在下一次寫入自動重建目錄續寫；用 `serialwrap doctor` 的 `wal_writable` 檢查確認目錄狀態。所有回應都帶 `wal_path` / `wal_file_exists`，可據此分辨「查得到但沒資料」與「檔案不見了」。
 
 ## command_capable 與 READY 判定（#51）
 - 一個 session 是否「可下命令」由其 profile 的 `ready_probe` 是否非空決定（`command_capable = bool(profile.ready_probe.strip())`），**與底層是 OS shell 或 bootloader 無關**——只要 `prompt_regex` 對得上、`ready_probe` 能 round-trip 即可進 `READY`（含 U-Boot 之類 bootloader command profile，如 `uboot-template`）。

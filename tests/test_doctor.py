@@ -7,6 +7,8 @@
 - #154：`serialwrapd_on_path` 後新增 `other_serialwrap_installs`（同機多份安裝
   版本一致性診斷），Linux／Windows 兩份清單皆刻意更新（非誤傷）。
 - #148：新增 `wal_dir` 檢查，兩份清單同步更新。
+- #189：新增 `wal_writable` 檢查（非 advisory；`wal_dir` 只比對一致性、從不檢查路徑
+  是否存在，實地事故中對著已被 rmtree 的目錄回 ok:true），兩份清單同步更新。
 - #149：Linux 清單於 `dialout` 之後新增 human console 就緒檢查組
   `serialwrap_minicom_on_path`／`jq_on_path`／`minicom_on_path`（皆 advisory）。
 - #162：新增 `profile_bootloader_prompts`（線上 profile 是否漏了出貨資產有的
@@ -41,6 +43,7 @@ LINUX_CHECKS = [
     # #173：本 client 解析到的 endpoint 是否與實際執行中 daemon 一致且可連。
     "endpoint_reachable",
     "wal_dir",
+    "wal_writable",
     "profile_bootloader_prompts",
     "devices",
     "wsl_systemd",
@@ -56,6 +59,7 @@ WINDOWS_CHECKS = [
     "supervision_mode",
     "daemon_endpoint",
     "wal_dir",
+    "wal_writable",
     "profile_bootloader_prompts",
     "devices",
 ]

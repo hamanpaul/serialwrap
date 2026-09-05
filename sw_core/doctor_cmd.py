@@ -289,6 +289,72 @@ def _check_devices_windows() -> dict:
     }
 
 
+def _check_wal_writable() -> dict:
+    """WAL 可寫性（#189）：daemon 回報的 WAL 目錄是否**真的存在且可寫**。
+
+    #148 的 ``wal_dir`` 檢查只比對 shell/daemon 的 WAL_DIR 是否一致並印出路徑，
+    **從不檢查該路徑是否存在**——實地事故中它對著一個已被 rmtree 的目錄回 ok:true，
+    而 daemon 已經對著虛空累加 seq 六天、該 bench 的 console 紀錄全部無法回溯。
+    這一項本可以在六天前就抓到。
+
+    本檢查**非 advisory**：稽核紀錄整個消失必須拉低 doctor 整體 ok（``wal_dir``
+    的一致性提醒維持 advisory WARN，兩者各司其職）。daemon 未在跑／連不上／舊版
+    daemon 不回 ``wal`` 欄位時降級為 informational（ok=True），與 ``wal_dir`` 同
+    哲學——doctor 常在啟動 daemon 前執行，「連不到」不是這項要抓的錯誤。
+    """
+    from sw_core.cli import _local_default_endpoint, _safe_runtime_config  # 延遲匯入避免循環
+    from sw_core.client import rpc_call
+
+    rc = _safe_runtime_config()
+    cfg_sock = None
+    if rc is not None:
+        try:
+            cfg_sock = rc.socket_path()
+        except Exception:  # noqa: BLE001
+            cfg_sock = None
+    endpoint = cfg_sock or _local_default_endpoint()
+
+    resp = rpc_call(endpoint, "health.status", {}, timeout_s=0.5)
+    wal = resp.get("wal") if isinstance(resp, dict) else None
+    if not resp.get("ok") or not isinstance(wal, dict):
+        return {
+            "check": "wal_writable",
+            "ok": True,
+            "detail": "daemon 未在跑、無法連線，或為不回報 wal 健康欄位的舊版 daemon；略過",
+            "fix": "",
+        }
+    if wal.get("healthy"):
+        detail = f"WAL 目錄可寫：{wal.get('wal_dir')}（current_seq={wal.get('current_seq')}）"
+        if wal.get("recreated_count"):
+            detail += f"；曾自癒重建 {wal['recreated_count']} 次（消失期間的紀錄無法復原）"
+        return {"check": "wal_writable", "ok": True, "detail": detail, "fix": ""}
+
+    reasons: list[str] = []
+    if not wal.get("wal_dir_exists"):
+        reasons.append("目錄不存在")
+    elif not wal.get("wal_dir_writable"):
+        reasons.append("目錄不可寫")
+    if int(wal.get("current_seq") or 0) > 0 and not wal.get("wal_file_exists"):
+        reasons.append(f"已寫過 {wal.get('current_seq')} 筆紀錄但現行 WAL 檔不存在")
+    if wal.get("write_failures"):
+        reasons.append(
+            f"append 失敗 {wal['write_failures']} 次（最後一次：{wal.get('last_write_error')}）"
+        )
+    return {
+        "check": "wal_writable",
+        "ok": False,
+        "detail": f"WAL 目錄 {wal.get('wal_dir')} 異常：{'；'.join(reasons) or '未知'}",
+        "fix": (
+            "確認沒有外部工具刪除該目錄（已知案例：testpilot 的 clean_wal() 會 rmtree "
+            "硬編路徑 /tmp/serialwrap/wal，見 hamanpaul/testpilot-core#36）。daemon 會在"
+            "下一次寫入時自動重建目錄續寫，但消失期間的紀錄無法復原；需要持久稽核請把 "
+            "WAL_DIR 指向非 /tmp 的路徑（systemd 模式在 unit 加 "
+            "Environment=SERIALWRAP_WAL_DIR=<path> 後 systemctl daemon-reload 並 "
+            "`serialwrap service restart`）"
+        ),
+    }
+
+
 def _check_wal_dir() -> dict:
     """WAL 目錄一致性（#148）：印出 daemon 實際生效的 WAL_DIR；shell 端顯式覆寫
     ``SERIALWRAP_WAL_DIR`` 但與 daemon 回報不一致時 WARN（ok=False，advisory，
@@ -550,6 +616,7 @@ def run_doctor(fx=None, home=None, *, platform: str | None = None) -> list[dict]
             _check_supervision_mode(home),
             _check_daemon_endpoint(),
             _check_wal_dir(),
+            _check_wal_writable(),
             _check_profile_bootloader_prompts(),
             _check_devices_windows(),
         ])
@@ -578,6 +645,7 @@ def run_doctor(fx=None, home=None, *, platform: str | None = None) -> list[dict]
         _check_single_daemon(),
         _check_endpoint_reachable(),
         _check_wal_dir(),
+        _check_wal_writable(),
         _check_profile_bootloader_prompts(),
         _check_devices(),
         _check_wsl_systemd(fx),
