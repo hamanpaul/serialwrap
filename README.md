@@ -606,7 +606,7 @@ socket (OpenSSH >= 6.7).
 `serialwrap remote` does **not** implement NAT traversal. It creates, verifies
 and manages the lifecycle of an SSH forward on a target that is *already*
 reachable. Where that reachability comes from — a routable address, a corporate
-LAN, an ssh jump host, or an overlay/private network (Cloudflare Zero Trust
+LAN, an SSH jump host, or an overlay/private network (Cloudflare Zero Trust
 private network, Tailscale, WireGuard, ZeroTier, a site-to-site VPN) — is
 outside serialwrap's concern. All it needs is an `ssh_target` the system `ssh`
 can connect to.
@@ -2107,7 +2107,7 @@ CLI（`bind` 只改 device、`recover`/`clear` 沿用舊 profile）。在 produc
 
 ### 責任邊界：可達性不是 serialwrap 的職責
 
-`serialwrap remote` **不實作 NAT traversal**，它只在一個**本來就可達**的 SSH target 上建立、驗證與管理 forward 的 lifecycle。可達性從哪來——公網位址、公司 LAN、ssh jump host，或既有的 overlay／private network（Cloudflare Zero Trust private network、Tailscale、WireGuard、ZeroTier、site-to-site VPN）——都在 serialwrap 的關注範圍之外；它只需要一個系統 `ssh` 連得到的 `ssh_target`。
+`serialwrap remote` **不實作 NAT traversal**，它只在一個**本來就可達**的 SSH target 上建立、驗證與管理 forward 的 lifecycle。可達性從哪來——公網位址、公司 LAN、SSH jump host，或既有的 overlay／private network（Cloudflare Zero Trust private network、Tailscale、WireGuard、ZeroTier、site-to-site VPN）——都在 serialwrap 的關注範圍之外；它只需要一個系統 `ssh` 連得到的 `ssh_target`。
 
 ```
 serialwrap RPC          session / command / file / log

@@ -96,7 +96,7 @@ serialwrap 另提供原生 MCU flash 端點（與上面 device handoff 互補）
 
 Agent 要從遠端操作本機 UART 時：**在 UART host（daemon 所在機）** 跑一行反向隧道，agent 端照舊用 `--endpoint`。daemon 不重啟、不做預設。
 
-**責任邊界**：`serialwrap remote` 不做 NAT traversal，只在一個**本來就可達**的 SSH target 上管理 forward 的 lifecycle。可達性由外部提供——公網位址、公司 LAN、ssh jump host，或 overlay／private network（Cloudflare Zero Trust、Tailscale、WireGuard、ZeroTier、VPN）皆可。provider 專屬細節寫在 `ssh_config`（host alias、`ProxyJump`）或 `--ssh-opt`，**不要**去找 `--cloudflare`／`--tailscale` 這類旗標，serialwrap 刻意不提供。
+**責任邊界**：`serialwrap remote` 不做 NAT traversal，只在一個**本來就可達**的 SSH target 上管理 forward 的 lifecycle。可達性由外部提供——公網位址、公司 LAN、SSH jump host，或 overlay／private network（Cloudflare Zero Trust、Tailscale、WireGuard、ZeroTier、VPN）皆可。provider 專屬細節寫在 `ssh_config`（host alias、`ProxyJump`）或 `--ssh-opt`，**不要**去找 `--cloudflare`／`--tailscale` 這類旗標，serialwrap 刻意不提供。
 
 ```bash
 # UART host（有 serialwrapd）：把本機 daemon 反向推到對端（-R 為預設）
