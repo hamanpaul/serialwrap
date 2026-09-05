@@ -195,8 +195,10 @@ class TestPinEscapeHatch(_Base):
         self.assertEqual(session.profile_source, "yaml-target")
 
     def test_pin_to_unknown_profile_is_a_noop(self):
+        """pin 指向不存在的 template 時不得亂改 profile。"""
         mgr = self._mgr()
         self._fallback_session(mgr)
+        self._no_bridge()
         self._no_detect()
         mgr._profile_pins[BY_ID] = "no-such-template"
 
@@ -205,6 +207,55 @@ class TestPinEscapeHatch(_Base):
         session = mgr._sessions["others-template:COM2"]
         self.assertEqual(session.profile.profile_name, "others-template")
         self.assertEqual(session.profile_source, "fallback")
+
+    def test_unknown_pin_does_not_block_fallback_redetection(self):
+        """失效的 pin（profile 已移除或改名）不得把 fallback session 永久卡死。
+
+        與 ``_attach_by_id_dynamic`` 的四層優先序一致：那裡 pin 解析不到 template 時
+        照樣會落到 sticky/detect。若這裡只因 state.json 留著一個字串就早退，session
+        會停在「不套用 pin、也不再偵測」的死角，而使用者看不出原因。
+        """
+        mgr = self._mgr()
+        self._fallback_session(mgr)
+        self._no_bridge()
+        orig = sm_mod.detect_template
+        sm_mod.detect_template = lambda *a, **k: PRPL
+        self.addCleanup(lambda: setattr(sm_mod, "detect_template", orig))
+        mgr._profile_pins[BY_ID] = "no-such-template"
+
+        mgr._reresolve_profile_on_reattach(BY_ID)
+
+        session = mgr._sessions["prpl-template:COM2"]
+        self.assertEqual(session.profile.profile_name, "prpl-template")
+        self.assertEqual(session.profile_source, "detected")
+
+    def test_resolvable_pin_still_bypasses_detection(self):
+        """可解析的 pin 仍必須繞過偵測——上面的放寬不得把 pin 的契約一起放掉。"""
+        mgr = self._mgr()
+        self._fallback_session(mgr)
+        names = self._no_bridge()
+        calls = self._no_detect()
+        mgr._profile_pins[BY_ID] = "prpl-template"
+
+        mgr._reresolve_profile_on_reattach(BY_ID)
+
+        self.assertEqual(calls, [])
+        self.assertNotIn("PROBE", names)
+        self.assertEqual(mgr._sessions["prpl-template:COM2"].profile_source, "pin")
+
+    def test_pin_already_applied_does_not_trigger_detection(self):
+        """pin 與現行 profile 相同時是 no-op，但仍不得往下偵測。"""
+        mgr = self._mgr()
+        session = self._fallback_session(mgr)
+        session.profile_source = "pin"
+        self._no_bridge()
+        calls = self._no_detect()
+        mgr._profile_pins[BY_ID] = "others-template"
+
+        mgr._reresolve_profile_on_reattach(BY_ID)
+
+        self.assertEqual(calls, [])
+        self.assertEqual(mgr._sessions["others-template:COM2"].profile_source, "pin")
 
     def test_no_rekey_when_target_session_id_taken(self):
         """新 session_id 已被別的 session 佔用時不動作，避免把兩個 session 併成一個。"""

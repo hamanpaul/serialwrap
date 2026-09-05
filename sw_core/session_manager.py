@@ -2801,13 +2801,18 @@ class SessionManager:
             if session.state == "RELEASED" or by_id in self._released_by_ids:
                 return
             pin_name = self._profile_pins.get(by_id)
-            if pin_name:
-                # pin 存在即為最高優先：命中與否都不再往下偵測（契約是「繞過偵測」）。
-                tpl = self._template_by_name(pin_name)
-                if tpl is not None and tpl.profile_name != session.profile.profile_name:
-                    if self._rematerialize_profile_locked(session, tpl, "pin"):
+            pinned_tpl = self._template_by_name(pin_name) if pin_name else None
+            if pinned_tpl is not None:
+                # 解析得到的 pin 為最高優先：改用它並繞過偵測（契約即「繞過偵測」）。
+                # 已經是該 profile 時不必動作，但同樣不往下偵測。
+                if pinned_tpl.profile_name != session.profile.profile_name:
+                    if self._rematerialize_profile_locked(session, pinned_tpl, "pin"):
                         self._save_state()
                 return
+            # **無法解析的 pin**（指向已移除或改名的 profile）視同無 pin，繼續往下偵測——
+            # 與 _attach_by_id_dynamic 的四層優先序一致（那裡 `tpl is None` 時同樣會落到
+            # sticky/detect）。若只因「state.json 裡留著一個字串」就 return，fallback
+            # session 會被一筆失效的 pin 永久卡在「不套用 pin、也不再偵測」的死角。
             if session.profile_source != "fallback" or not self._templates:
                 return
             if session.boot_quiet_active():
