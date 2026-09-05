@@ -92,6 +92,12 @@ def rm_topo_dual_nat(ctx):
     return _run_topology(ctx, "dual_nat")
 
 
+@_case("rm-topo-agent-pull", "方向反轉：agent 端 -L 拉 uart 的 serialwrapd.sock（無 -R、無 relay）",
+       hints=_TOPO_HINTS, requires=("docker",))
+def rm_topo_agent_pull(ctx):
+    return _run_topology(ctx, "agent_pull")
+
+
 @_case("rm-topo-gwports", "GatewayPorts/--remote-socket fail-closed＋teardown 複查",
        hints=_TOPO_HINTS, requires=("docker",))
 def rm_topo_gwports(ctx):

@@ -677,7 +677,29 @@ serialwrap --endpoint tcp://127.0.0.1:7777 session list
 `--autossh` keeps the ssh transport alive across drops; the overlay's own
 reconnect is the provider's business, not serialwrap's.
 
-#### Topology 2 (fallback): double NAT with no reachability provider — public relay
+#### Topology 2: the UART host is reachable — the agent pulls with `-L` (no `-R`, no relay)
+
+The mirror image of topology 1, and usually the right shape for "a developer wants
+to reach a bench that sits behind NAT": whatever provides reachability lets the
+**agent** ssh **into** the UART host, so the agent pulls the daemon socket back to
+its own loopback. The UART host runs no `serialwrap remote` at all.
+
+```bash
+# agent host (the developer's machine) — nothing runs on the UART host
+serialwrap remote -L --remote-socket /run/serialwrap/serialwrapd.sock tester@dut:7777
+serialwrap --endpoint tcp://127.0.0.1:7777 session list
+```
+
+Take the `--remote-socket` path from `serialwrap daemon status` on the UART host
+(`<run-dir>/serialwrapd.sock`); it is that daemon's own socket, so the ssh user must
+be in the group that owns it (0660) or the forward comes up while `health.ping`
+never succeeds and readiness stays `starting`. Combined with an SSH-over-overlay
+provider this gives an outbound-only path on both ends — the shape remote-desktop
+tools use — without operating a relay of your own. Verified end to end by the
+`agent_pull` docker topology (`tools/docker/remote_tunnel_test.sh`, realhw case
+`rm-topo-agent-pull`).
+
+#### Topology 3 (fallback): double NAT with no reachability provider — public relay
 
 When neither side can reach the other at all, both dial out to a relay both can
 reach: the UART host pushes with `-R`, the agent pulls with `-L` (below).
@@ -744,7 +766,10 @@ the relay is a **multi-tenant shared host**, other local users could in
 principle still reach that loopback port. Adding `--remote-socket
 /path/to.sock` instead creates a **unix socket** on the peer, gated by file
 permissions (extending the local daemon socket's 0660 semantics to the
-relay). Both `-R` and `-L` must point at the same path:
+relay). In the **relay** shapes, `-R` and `-L` are two ends of one hop and must
+point at the same path — this pairing requirement does **not** apply to topology 2
+above, where `-L` alone targets the UART host's own daemon socket and there is no
+`-R` to pair with:
 
 ```bash
 # UART host (-R)
@@ -770,6 +795,15 @@ serialwrap remote -L --remote-socket /tmp/sw-relay.sock tester@RELAY:7777
 
 #### Limitations and caveats
 
+- **`BatchMode=yes` is forced and cannot be overridden.** The readiness/safety
+  defaults are emitted *before* your `--ssh-opt` values and OpenSSH honours the
+  first occurrence of a given key, so `BatchMode`, `ExitOnForwardFailure` and the
+  `ControlPath` settings are authoritative by design. Consequence: **no
+  interactive authentication of any kind**. Authentication must already be
+  non-interactive when the tunnel is opened — with a reachability provider whose
+  credentials expire (Cloudflare Access tokens, for instance), an expired token
+  makes ssh fail immediately with no useful diagnostic, so unattended use needs a
+  service token or a refresh performed beforehand.
 - `daemon start` does **not support** `--endpoint` (the daemon can only be
   started locally; it returns `REMOTE_NOT_SUPPORTED`).
 - **`file.push` / `file.pull`'s `local_path` is a path on the daemon side
@@ -2176,7 +2210,21 @@ serialwrap --endpoint tcp://127.0.0.1:7777 session list
 
 `--autossh` 負責 ssh transport 的連線續命；overlay 自身的 reconnect 由 provider 處理，不是 serialwrap 的事。
 
-### 拓樸二（fallback）：無可達性 provider 的雙 NAT——public relay
+### 拓樸二：UART host 可達——agent 用 `-L` 直接拉（無 `-R`、無 relay）
+
+拓樸一的鏡像，也是「開發機想連一台在 NAT 後的 bench」通常該用的形狀：由 reachability provider 讓 **agent 主動 ssh 進 UART host**，agent 把對方的 daemon socket 拉回自己的 loopback。**UART host 端完全不需要跑 `serialwrap remote`。**
+
+```bash
+# agent 端（開發機）——UART host 端什麼都不用做
+serialwrap remote -L --remote-socket /run/serialwrap/serialwrapd.sock tester@dut:7777
+serialwrap --endpoint tcp://127.0.0.1:7777 session list
+```
+
+`--remote-socket` 的路徑取自 UART host 上 `serialwrap daemon status` 回報的值（`<run-dir>/serialwrapd.sock`）。那是該 daemon 自己的 socket，因此 ssh 登入的帳號必須在擁有它的群組內（0660）——否則 forward 建得起來但 `health.ping` 不通，readiness 會停在 `starting`。
+
+搭配把 SSH 架在 overlay 上的 provider，這個形狀讓**兩端都只有出站連線**（遠端桌面工具用的就是這個模型），而且不必自己營運 relay。已由 `agent_pull` docker 拓樸端到端驗證（`tools/docker/remote_tunnel_test.sh`，realhw case `rm-topo-agent-pull`）。
+
+### 拓樸三（fallback）：無可達性 provider 的雙 NAT——public relay
 
 兩端完全互不可達時，才各自對一台雙方都連得到的 relay 撥出：UART host 用 `-R` 推上去，agent 用 `-L` 拉回來（見下）。
 
@@ -2231,7 +2279,7 @@ serialwrap remote close all         # 拆除全部
 
 ### `--remote-socket` 硬化（共享 relay 建議必開）
 
-預設 `-R` 在對端開 `127.0.0.1:<port>` 的 TCP loopback bind；relay 若為**多租戶共享主機**，同機其他使用者理論上仍可能連到該 loopback port。加 `--remote-socket /path/to.sock` 後改在對端建 **unix socket**，以檔案權限把關（等同把本機 daemon socket 的 0660 語意延伸到 relay）；`-R`／`-L` 兩端須成對指定同一路徑：
+預設 `-R` 在對端開 `127.0.0.1:<port>` 的 TCP loopback bind；relay 若為**多租戶共享主機**，同機其他使用者理論上仍可能連到該 loopback port。加 `--remote-socket /path/to.sock` 後改在對端建 **unix socket**，以檔案權限把關（等同把本機 daemon socket 的 0660 語意延伸到 relay）。在 **relay 類**形狀中，`-R` 與 `-L` 是同一跳的兩端，須成對指定同一路徑；此配對要求**不適用於上面的拓樸二**——該形狀只有 `-L`，指向的是 UART host 自己的 daemon socket，沒有 `-R` 可配對：
 
 ```bash
 # UART host（-R）
@@ -2247,6 +2295,7 @@ serialwrap remote -L --remote-socket /tmp/sw-relay.sock tester@RELAY:7777
 
 ### 限制與注意事項
 
+- **`BatchMode=yes` 為強制、無法覆寫。** readiness／安全預設 `-o` 置於使用者 `--ssh-opt` **之前**，而 OpenSSH 對同一個 key 取第一個出現的值，因此 `BatchMode`、`ExitOnForwardFailure` 與 `ControlPath` 這組設定是刻意設計成權威、使用者蓋不掉的。後果是**不接受任何互動式認證**：開隧道當下認證就必須已經是非互動的。若 reachability provider 的憑證會過期（例如 Cloudflare Access 的 token），過期時 ssh 會直接失敗且**不會給出有用的診斷訊息**——無人值守情境需改用 service token，或事先完成 refresh。
 - `daemon start` **不支援** `--endpoint`（daemon 只能在本機啟動，會回 `REMOTE_NOT_SUPPORTED`）。
 - **`file.push` / `file.pull` 的 `local_path` 是 daemon 端（UART host）的路徑**，不是 agent 本機路徑；agent 若要傳輸本機檔案，需先透過 scp/rsync 傳到 UART host，再由 daemon 執行 file transfer。WAL、mirror log 等路徑回傳值同理。
 - **native Windows 本期不支援** `serialwrap remote`：執行會回 `REMOTE_NOT_SUPPORTED`（見下方手動等價）。

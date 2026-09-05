@@ -111,14 +111,23 @@ Agent 要從遠端操作本機 UART 時：**在 UART host（daemon 所在機）*
 serialwrap remote tester@AGENT_OR_RELAY:7777
 ```
 
-Agent 端連線（依拓樸擇一）：
+Agent 端連線（依「誰連得到誰」擇一）：
 
-- **direct（preferred）**（agent host 就是上面 ssh 的對端）：直接
+- **direct**（agent host 就是上面 ssh 的對端）：直接
   `serialwrap --endpoint tcp://127.0.0.1:7777 session list`。
   兩端已有 overlay／private network 互相可達時，**即使都在 NAT 後也走這條**——`-R` 直接落在 agent 的 loopback，不需要 relay、不需要成對的 `-L`。
+- **agent-pull**（反過來：**agent 連得到 UART host**，例如開發機要連一台在 NAT 後的 bench）：
+  **UART host 端什麼都不用跑**，由 agent 主動把對方的 daemon socket 拉回自己的 loopback：
+  ```bash
+  serialwrap remote -L --remote-socket <UART host 的 serialwrapd.sock> tester@dut:7777
+  serialwrap --endpoint tcp://127.0.0.1:7777 session list
+  ```
+  socket 路徑取自 UART host 上 `serialwrap daemon status` 的值；ssh 帳號要在擁有該 socket 的群組內（0660），否則 forward 建得起來但 `health.ping` 不通、readiness 停在 `starting`。此形狀**只有 `-L`、沒有 `-R`**，不適用「兩端須成對指定同一 `--remote-socket` 路徑」那條（那是 relay 硬化情境的規則）。
 - **relay / 雙 NAT（fallback）**（兩端**完全**互不可達，各自對 relay 撥出）：agent 端先
   `serialwrap remote -L tester@RELAY:7777`（回傳 `endpoint`），再用該 endpoint。
   這是「無 overlay、無路由」時的退路，不是跨雙 NAT 的唯一解法。
+
+**`BatchMode=yes` 為強制、`--ssh-opt` 蓋不掉**：不接受任何互動式認證，開隧道當下認證就必須已是非互動的。provider 憑證會過期時（如 Cloudflare Access token），過期會讓 ssh 直接失敗且無有用診斷——無人值守需用 service token 或事先 refresh。
 
 管理：`serialwrap remote`（列隧道）、`serialwrap remote close 7777|all`（拆除）。
 回傳 `status`：`active`＝就緒可用；`starting`＝尚未確認（慢速認證／上游未就緒），需再 `remote status` 或重試。
