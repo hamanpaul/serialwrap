@@ -96,6 +96,8 @@ serialwrap 另提供原生 MCU flash 端點（與上面 device handoff 互補）
 
 Agent 要從遠端操作本機 UART 時：**在 UART host（daemon 所在機）** 跑一行反向隧道，agent 端照舊用 `--endpoint`。daemon 不重啟、不做預設。
 
+**責任邊界**：`serialwrap remote` 不做 NAT traversal，只在一個**本來就可達**的 SSH target 上管理 forward 的 lifecycle。可達性由外部提供——公網位址、公司 LAN、ssh jump host，或 overlay／private network（Cloudflare Zero Trust、Tailscale、WireGuard、ZeroTier、VPN）皆可。provider 專屬細節寫在 `ssh_config`（host alias、`ProxyJump`）或 `--ssh-opt`，**不要**去找 `--cloudflare`／`--tailscale` 這類旗標，serialwrap 刻意不提供。
+
 ```bash
 # UART host（有 serialwrapd）：把本機 daemon 反向推到對端（-R 為預設）
 serialwrap remote tester@AGENT_OR_RELAY:7777
@@ -103,10 +105,12 @@ serialwrap remote tester@AGENT_OR_RELAY:7777
 
 Agent 端連線（依拓樸擇一）：
 
-- **direct**（agent host 就是上面 ssh 的對端）：直接
-  `serialwrap --endpoint tcp://127.0.0.1:7777 session list`
-- **relay / 雙 NAT**（agent 與 UART host 互不可達，各自對 relay 撥出）：agent 端先
+- **direct（preferred）**（agent host 就是上面 ssh 的對端）：直接
+  `serialwrap --endpoint tcp://127.0.0.1:7777 session list`。
+  兩端已有 overlay／private network 互相可達時，**即使都在 NAT 後也走這條**——`-R` 直接落在 agent 的 loopback，不需要 relay、不需要成對的 `-L`。
+- **relay / 雙 NAT（fallback）**（兩端**完全**互不可達，各自對 relay 撥出）：agent 端先
   `serialwrap remote -L tester@RELAY:7777`（回傳 `endpoint`），再用該 endpoint。
+  這是「無 overlay、無路由」時的退路，不是跨雙 NAT 的唯一解法。
 
 管理：`serialwrap remote`（列隧道）、`serialwrap remote close 7777|all`（拆除）。
 回傳 `status`：`active`＝就緒可用；`starting`＝尚未確認（慢速認證／上游未就緒），需再 `remote status` 或重試。
@@ -150,12 +154,15 @@ serialwrap event tail --rule-id owner.name -n 20
 
 ## 透過 UART 推送／拉取檔案
 ```bash
-serialwrap file push --selector COM0 --local ./fw.bin --remote /tmp/fw.bin --source agent:diag
+serialwrap file push --selector COM0 --local ./probe.sh --remote /tmp/probe.sh --source agent:diag
 serialwrap file pull --selector COM0 --remote /etc/config/wireless --local ./wireless.bak --source agent:diag
 ```
 - `--remote`／`--local` 必填於 push；pull 省略 `--local` 時回傳檔案內容。
 - `--chunk-size` 預設 2048（push）。
 - remote 模式下 `--local` 指 daemon 所在 host 的路徑。
+- **適用範圍＝小檔（設定檔、腳本、探針等，數十 KB 內）**。UART 115200 baud 的原始上限約 11 KB/s，echo-ACK 節流後更低（1 MB 約 10–17 分鐘）——`file push` 的設計目標本來就不是大檔。
+- **大檔走網路通道，不走 UART**：firmware image 這類檔案，只要 DUT 有 SSH／TFTP／HTTP 可達，一律用 SCP／TFTP 傳輸，serialwrap 只負責控制面（以 `cmd submit` 觸發板端的 `scp`／`tftp`／`wget` 並觀察結果）。實測一顆 81 MB image 走 SCP 經 LAN 數秒完成；同一顆走 UART 即使通道完全穩定也需兩小時以上。
+- `file push` 用在大檔只能是**確認 DUT 無任何網路通道後**的明確 fallback，並在紀錄裡說明原因。
 
 ## 安全規則
 - 禁止 Agent 直接寫 `/dev/ttyUSB*` 或 `/dev/ttyACM*`。
@@ -169,7 +176,7 @@ serialwrap file pull --selector COM0 --remote /etc/config/wireless --local ./wir
 ## 短命令原則（Best Practice）
 - **避免 heredoc**：heredoc 經 UART 傳輸時容易遺失字元或打亂 prompt，改用 `echo ... > file` 分步寫入。
 - **單行盡量短**：每條命令控制在 2 KB 以內；UTF-8 位元組 > 4 KB 會 warning、> 16 KB 會被 reject（`CMD_TOO_LONG`）。命令不得含 `\n` 換行字元，否則回 `CMD_CONTAINS_NEWLINE`。broker 不截斷；但 broker 上限與 target 端 tty line buffer（常見 4096 bytes）的物理單行限制是兩回事，過長單行仍可能在 target 端被截斷。上限可由 `serialwrap daemon status` 的 `limits` 欄位執行期查詢，不需硬編碼。
-- **避免 base64 inline**：不要將整個檔案 base64 編碼塞進 `cmd submit`，改用 `serialwrap file push`。
+- **避免 base64 inline**：不要將整個檔案 base64 編碼塞進 `cmd submit`。小檔（數十 KB 內）改用 `serialwrap file push`；firmware image 這類大檔在 DUT 有網路通道時一律走 SCP／TFTP，不要交給 `file push`（界線見「透過 UART 推送／拉取檔案」）。
 - **長命令拆分**：管線命令過長時，先寫成 script 檔再 `source` 或 `sh /tmp/script.sh`。
 - **長命令 keepalive**：長時間命令加 `--expected-duration <秒>`，broker 在此期間暫停 prompt timeout 並監控 RX 活動延長等待，避免誤判 PROMPT_TIMEOUT。
 - **line vs background**：`line` 命令直接看 `cmd status`，不要用 `cmd result-tail`（那是給 `background` capture 用的）。

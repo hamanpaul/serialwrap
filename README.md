@@ -257,11 +257,20 @@ serialwrap session console-detach --selector COM0 --client-id <client_id>
 checksum verification:
 
 ```bash
-serialwrap file push --selector COM0 --local ./firmware.bin --remote /tmp/firmware.bin
+serialwrap file push --selector COM0 --local ./probe.sh --remote /tmp/probe.sh
 serialwrap file pull --selector COM0 --remote /etc/config/wireless --local ./wireless.bak
 ```
 
 The session must be `READY`, and the target must provide `base64` and `md5sum`.
+
+**Scope — small files only.** `file push` is meant for config files, scripts and
+probes (tens of KB). A UART at 115200 baud tops out around 11 KB/s raw, and the
+echo-ACK pacing below lowers that further, so an 81 MB firmware image would take
+hours even on a perfectly stable link. Whenever the DUT is reachable over
+SSH/TFTP/HTTP, move large files with SCP/TFTP and let serialwrap drive only the
+control plane — `cmd submit` to trigger the board-side `scp`/`tftp`/`wget` and
+watch the result. Reach for `file push` on a large file only as an explicit
+fallback, after confirming the DUT has no network path at all, and record why.
 
 On consoles without flow control (`flow_control: none`), long chunk command
 lines get throttled and characters are silently dropped. `file push` therefore
@@ -592,7 +601,33 @@ background. **The daemon itself is unchanged**, and no separate `socat` is
 needed — `ssh -R` can forward a remote TCP port directly to a local AF_UNIX
 socket (OpenSSH >= 6.7).
 
-#### Architecture overview (direct)
+#### Responsibility boundary: reachability is not serialwrap's job
+
+`serialwrap remote` does **not** implement NAT traversal. It creates, verifies
+and manages the lifecycle of an SSH forward on a target that is *already*
+reachable. Where that reachability comes from — a routable address, a corporate
+LAN, an ssh jump host, or an overlay/private network (Cloudflare Zero Trust
+private network, Tailscale, WireGuard, ZeroTier, a site-to-site VPN) — is
+outside serialwrap's concern. All it needs is an `ssh_target` the system `ssh`
+can connect to.
+
+```
+serialwrap RPC          session / command / file / log
+      |
+serialwrap remote       -R / -L / lifecycle / readiness / registry
+      |
+reachability provider   LAN / Cloudflare / Tailscale / WireGuard / VPN / jump host
+      |
+physical network        NAT / CGNAT / corporate LAN / firewall
+```
+
+Provider-specific detail belongs in `ssh_config` (a host alias, `ProxyJump`) or
+in `--ssh-opt`, never in serialwrap's own CLI. There is deliberately no
+`--cloudflare` / `--tailscale` flag and no provider SDK or runtime dependency:
+auth, routing, DNS and device policy already live with the provider, and
+swapping providers must not require a serialwrap code change.
+
+#### Topology 1 (preferred): the agent host is reachable — `-R` lands on it directly
 
 ```
 [FAE site, running serialwrapd]                       [Taiwan RD / agent host]
@@ -600,8 +635,33 @@ serialwrap remote tester@AGENT_HOST:7777  --ssh -R-->  tcp://127.0.0.1:7777
 (-R: reverse-push the local daemon socket to the peer)  serialwrap --endpoint tcp://127.0.0.1:7777
 ```
 
-When the agent and the UART host can't reach each other directly (double NAT
-/ relay), the agent side instead runs `serialwrap remote -L` (below).
+An overlay/private network is a perfectly good source of that reachability, and
+with one in place this stays the normal topology **even across a double NAT** —
+no relay and no paired `-L`:
+
+```bash
+# UART host
+serialwrap remote --autossh agent:7777
+
+# agent
+serialwrap --endpoint tcp://127.0.0.1:7777 session list
+```
+
+`--autossh` keeps the ssh transport alive across drops; the overlay's own
+reconnect is the provider's business, not serialwrap's.
+
+#### Topology 2 (fallback): double NAT with no reachability provider — public relay
+
+When neither side can reach the other at all, both dial out to a relay both can
+reach: the UART host pushes with `-R`, the agent pulls with `-L` (below).
+
+```
+UART host  -- ssh -R -->  public relay  <-- ssh -L --  agent
+```
+
+This is the fallback for "no overlay, no route" — not the only way to cross a
+double NAT. The `-R` listener keeps the same trust boundary in both topologies
+(loopback bind, or a remote unix socket with `--remote-socket`).
 
 #### UART host side: open the tunnel (one line)
 
@@ -1442,13 +1502,15 @@ serialwrap session interactive-close --interactive-id <iid>
 
 ```bash
 # 推送本地檔案到 target
-serialwrap file push --selector COM0 --local ./firmware.bin --remote /tmp/firmware.bin
+serialwrap file push --selector COM0 --local ./probe.sh --remote /tmp/probe.sh
 
 # 從 target 拉取檔案到本地
 serialwrap file pull --selector COM0 --remote /etc/config/wireless --local ./wireless.bak
 ```
 
 傳輸完成後自動進行 md5 校驗。Session 必須處於 `READY` 狀態，target 需有 `base64` 與 `md5sum`。
+
+**適用範圍＝小檔**。`file push` 針對設定檔、腳本、探針這類數十 KB 內的檔案。UART 115200 baud 的原始上限約 11 KB/s，再加上下述 echo-ACK 節流會更低——一顆 81 MB 的 firmware image 即使通道完全穩定也要數小時。只要 DUT 有 SSH／TFTP／HTTP 可達，大檔一律走 SCP／TFTP，serialwrap 只負責控制面（以 `cmd submit` 觸發板端的 `scp`／`tftp`／`wget` 並觀察結果）。大檔用 `file push` 只能是**確認 DUT 無任何網路通道後**的明確 fallback，並在紀錄裡說明原因。
 
 無流控 console（`flow_control: none`）上，長 chunk 命令行會被節流靜默掉字。故 `file push` 預設走 **echo-ACK 節流**（#161）：chunk 命令行拆成短 slice 逐段送出，每段等板端 echo 回讀確認才續送——換行在**全行確認後**才送出，因此 echo 停滯（`TRANSFER_ECHO_STALL`）時命令必未執行、可安全重試。`--ack-mode {auto,echo,none}` 控制此行為：`auto`（預設）＝bridge 支援即節流；`echo`＝強制節流；`none`＝維持 legacy 整行送出；其餘值一律 `INVALID_ARGS`（RPC 層**與** `push_file()` 模組入口各一道，避免未知模式靜默降級成無保護的整行送出）。取捨：節流犧牲吞吐——1MB push 約 10–17 分鐘；急件且鏈路確認有流控時可用 `--ack-mode none` 走快路徑。單一 slice 的 echo 等待逾時**下限 5s**，實際值依 profile `timeout_s` 推導（`max(profile.timeout_s, 5.0)`，比照 #157 `chunk_timeout_s` 的推導精神）——實機兩案都在第 8 個 slice（448/512 字元）確定性卡住，原本的 2.0s 對慢板偏緊、把「還在追」誤判成「停滯」。此值只約束**失敗路徑**的等待上限，echo 正常到達時立即返回、成功路徑吞吐不變。
 
@@ -2043,7 +2105,23 @@ CLI（`bind` 只改 device、`recover`/`clear` 沿用舊 profile）。在 produc
 
 當 FAE 在海外（美國／歐洲電信客戶端）用 serialwrap 連接 DUT，台灣 RD 可用 `serialwrap remote` 讓 agent 對遠端 daemon 下命令：純 CLI 便利層，外包系統 `ssh` 建立 `-R`（reverse／expose，預設）或 `-L`（forward／connect，relay／雙 NAT 情境）隧道，background 常駐；**daemon 端零改動**，也不需要另跑 `socat`——`ssh -R` 可直接把遠端 TCP port 轉發到本機的 AF_UNIX socket（OpenSSH ≥ 6.7）。
 
-### 架構概覽（direct）
+### 責任邊界：可達性不是 serialwrap 的職責
+
+`serialwrap remote` **不實作 NAT traversal**，它只在一個**本來就可達**的 SSH target 上建立、驗證與管理 forward 的 lifecycle。可達性從哪來——公網位址、公司 LAN、ssh jump host，或既有的 overlay／private network（Cloudflare Zero Trust private network、Tailscale、WireGuard、ZeroTier、site-to-site VPN）——都在 serialwrap 的關注範圍之外；它只需要一個系統 `ssh` 連得到的 `ssh_target`。
+
+```
+serialwrap RPC          session / command / file / log
+      │
+serialwrap remote       -R / -L / lifecycle / readiness / registry
+      │
+reachability provider   LAN / Cloudflare / Tailscale / WireGuard / VPN / jump host
+      │
+physical network        NAT / CGNAT / 公司 LAN / firewall
+```
+
+provider 專屬的細節屬於 `ssh_config`（host alias、`ProxyJump`）或 `--ssh-opt`，**不進 serialwrap 的 CLI**。刻意不提供 `--cloudflare`／`--tailscale` 之類的旗標，也不引入任何 provider SDK 或執行期依賴：auth、routing、DNS、device policy 本來就該由 provider 負責，而更換 connectivity provider 時 serialwrap 不應需要改 code。
+
+### 拓樸一（preferred）：agent host 可達——`-R` 直接落在它身上
 
 ```
 [FAE 現場，跑 serialwrapd]                          [台灣 RD / agent host]
@@ -2051,7 +2129,27 @@ serialwrap remote tester@AGENT_HOST:7777  --ssh -R-->  tcp://127.0.0.1:7777
 （-R：本機 daemon socket 反向推到對端）                serialwrap --endpoint tcp://127.0.0.1:7777
 ```
 
-agent 與 UART host 互不可達（雙 NAT／relay）時，改由 agent 端另跑 `serialwrap remote -L`（見下）。
+overlay／private network 是合法的可達性來源；只要有 overlay，**即使兩端都在 NAT 後**這仍是常態拓樸——不需要 relay，也不需要成對的 `-L`：
+
+```bash
+# UART host
+serialwrap remote --autossh agent:7777
+
+# agent
+serialwrap --endpoint tcp://127.0.0.1:7777 session list
+```
+
+`--autossh` 負責 ssh transport 的連線續命；overlay 自身的 reconnect 由 provider 處理，不是 serialwrap 的事。
+
+### 拓樸二（fallback）：無可達性 provider 的雙 NAT——public relay
+
+兩端完全互不可達時，才各自對一台雙方都連得到的 relay 撥出：UART host 用 `-R` 推上去，agent 用 `-L` 拉回來（見下）。
+
+```
+UART host  -- ssh -R -->  public relay  <-- ssh -L --  agent
+```
+
+這是「無 overlay、無路由」情境的 fallback，**不是**跨雙 NAT 的唯一解法。兩種拓樸下 `-R` listener 的信任邊界一致（loopback bind，或以 `--remote-socket` 改用遠端 unix socket）。
 
 ### UART host 端：起隧道（一行）
 

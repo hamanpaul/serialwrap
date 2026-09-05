@@ -57,6 +57,19 @@ agent/RD 端  ── ssh -L 7777:127.0.0.1:7777 ──►  UART host（FAE）─
 - 不做 relay 伺服器、不做隧道健康自動修復以外的 orchestration。
 - 不改變既有 `--endpoint` 語意；agent 端 direct 情境仍用既有 `--endpoint tcp://…`。
 - **native Windows UART host 本期不支援**（R2 finding 4）：lifecycle 全用 POSIX primitive，Windows 無等價；native Windows 執行 `remote` 回 `REMOTE_NOT_SUPPORTED`，defer 至 §13（Windows 現行仍可手動 `ssh -R`）。
+- **不實作 NAT traversal、不綁 connectivity provider**（2026-09-05 補充，#185）：`serialwrap remote` 只在一個**本來就可達**的 SSH target 上管理 forward lifecycle；可達性由外部的 reachability provider 提供（LAN／Cloudflare Zero Trust／Tailscale／WireGuard／ZeroTier／VPN／jump host）。**不新增 `--cloudflare`／`--tailscale` 之類的 provider-specific 旗標，不引入任何 provider SDK 或執行期依賴**——provider 的 auth／routing／DNS／device policy 本就在 serialwrap 之外，且既有 `ssh_config` alias／`ProxyJump`／`--ssh-opt` 已足以承載這些細節；更換 provider 時 serialwrap 不應需要改 code。
+
+### 拓樸模型（2026-09-05 補充，#185）
+
+本設計原文把雙 NAT 唯一地描述為 `UART host -R→ relay ←-L- agent`。實務上該 relay 鏈是**兩端完全互不可達時的 fallback**，不是雙 NAT 的唯一解法：
+
+| 拓樸 | 條件 | 形式 |
+|---|---|---|
+| preferred | overlay／private network 已提供互相可達性 | `UART host --(overlay)--> agent:sshd`，`-R` 直接落在 agent loopback；**不需要成對的 `-L`** |
+| fallback | 無 overlay、無路由，兩端皆不可達 | `UART host -R→ public relay ←-L- agent`（本設計原文的鏈路） |
+| legacy/direct | agent host 本來就可被撥入 | 同 §3 的 direct |
+
+三者共用同一套指令與同一組信任邊界規則（loopback bind 不變量、`--remote-socket` 硬化、單租戶 relay 要求），實作不需改動——因此 #185 為純文件變更。`--autossh` 負責 ssh transport 續命；overlay 自身的 reconnect 由 provider 處理。
 
 ## 3. 使用者介面（CLI surface）
 
