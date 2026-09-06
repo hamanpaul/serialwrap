@@ -1,5 +1,5 @@
 ---
-type: docs
+type: change
 issue: 188
 scope: docs
 ---

@@ -1,6 +1,6 @@
 """realhw case 模組——import 各子模組觸發 register()。
 
-P0×8＋P1×20＋remote×7＋longrun×1。
+P0×8＋P1×20＋remote×8＋longrun×1。
 """
 from __future__ import annotations
 

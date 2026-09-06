@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# serialwrap remote 隧道 docker 三拓樸驗收（設計 spec §11.2）。
+# serialwrap remote 隧道 docker 四拓樸驗收（設計 spec §11.2；agent_pull 為後補，#見 CLAUDE.md 任務）。
 #
-# 以真 sshd + 真 `serialwrap remote`（外包系統 ssh）跑三種拓樸，全過才算通過：
-#   拓樸 1 direct        uart + agent 同網段
-#   拓樸 2 NAT→host      uart（NAT）+ relay 同網段，agent CLI colocate 在 relay
-#   拓樸 3 NAT←client    net_a=uart+relay、net_b=agent+relay，雙 NAT，僅能經 relay
+# 以真 sshd + 真 `serialwrap remote`（外包系統 ssh）跑四種拓樸，全過才算通過：
+#   拓樸 1 direct        uart + agent 同網段（uart 端 -R expose）
+#   拓樸 2 NAT→host      uart（NAT）+ relay 同網段，agent CLI colocate 在 relay（uart 端 -R expose）
+#   拓樸 3 NAT←client    net_a=uart+relay、net_b=agent+relay，雙 NAT，僅能經 relay（uart -R + agent -L）
+#   拓樸 4 agent_pull    uart + agent 同網段，方向反轉：agent 端主動 -L 拉 uart 的 serialwrapd.sock，
+#                        uart 端不需 -R、不需第三方 relay（sshd 改跑在 uart 容器上）
 # 另跑一組額外驗收（GatewayPorts yes fail-closed）覆蓋斷言⑦。
 #
-# 每個拓樸驗證（缺一不可，對照 spec §11.2 / task-12-brief）：
+# 每個拓樸驗證（缺一不可，對照 spec §11.2 / task-12-brief；拓樸4 沿用同一組①-⑤，無 NAT/relay 故不適用⑥⑦⑧）：
 #   ① 預設不啟用：remote status 空、無 state 檔、無 ssh/autossh 行程、--endpoint 連線失敗（SOCKET_ERROR）
 #   ② 手動啟動後：agent 端 session list 有 READY、cmd submit→cmd status 得 done 且輸出正確
 #   ③ serialwrapd 不重啟：daemon pid 全程不變
@@ -187,7 +189,31 @@ uart_state_files() {
   docker exec -u tester "${UART_ENV_ARGS[@]}" "$1" bash -c 'ls "$SERIALWRAP_RUN_DIR"/remote/*.json 2>/dev/null'
 }
 
-# ── connect 端（-L，僅拓樸 3 用）：固定 RUN_DIR，無 daemon，不需動態 env 檔 ──
+# ── 拓樸4／agent_pull 專用：uart 容器上跑 sshd + 推算其 serialwrapd.sock 路徑 ──
+uart_sshd_up() {  # uart_sshd_up <container>
+  # start_uart 以 `docker run -u tester` 起主行程；docker exec 不帶 -u 會繼承該
+  # 預設使用者（非 root），讀不到 0600 的 host key（"no hostkeys available -- exiting"）。
+  # 其他拓樸的 sshd_up() 用在 start_plain/start_role（無 -u，預設 root）建的容器上
+  # 不受影響，此處對 uart 容器強制 -u root。
+  docker exec -u root "$1" bash -c "mkdir -p /run/sshd && /usr/sbin/sshd -f /etc/ssh/sshd_config" \
+    || fail "$1：sshd 啟動失敗（拓樸4 agent_pull 需要 uart 端跑 sshd）"
+}
+uart_socket_path() {  # uart_socket_path <container> — daemon harness 的 socket_path = RUN_DIR/serialwrapd.sock
+                      # （func-test/lib/daemon_harness.py 的 self._socket_path = self._root/"run"/"serialwrapd.sock"），
+                      # 供拓樸4 --remote-socket 用；RUN_DIR 為 tempfile 動態路徑，須讀 sw-uart.env 取得。
+  local c=$1 run_dir
+  # 在容器內 source 後再取值，而非自行 sed 取右值：uart_harness.py 是以
+  # shlex.quote() 寫出（tools/docker/uart_harness.py:87），sed 會把引號一併帶進路徑，
+  # 使 --remote-socket 指向不存在的 socket。目前 tempfile 路徑不含需引號的字元故
+  # 看不出差異，但那是會靜默壞掉的脆弱寫法（Copilot review）。
+  run_dir=$(docker exec -u tester "$c" bash -c \
+    'set -a; . /home/tester/sw-uart.env; printf "%s" "$SERIALWRAP_RUN_DIR"') \
+    || fail "$c：讀不到／source 不了 sw-uart.env（harness 未就緒？）"
+  [[ -n "$run_dir" ]] || fail "$c：sw-uart.env 缺 SERIALWRAP_RUN_DIR"
+  echo "${run_dir}/serialwrapd.sock"
+}
+
+# ── connect 端（-L，拓樸 3 dual_nat 與拓樸 4 agent_pull 用）：固定 RUN_DIR，無 daemon，不需動態 env 檔 ──
 ROLE_RUN_DIR=/home/tester/.sw-run
 role_exec() { local c=$1; shift; docker exec -u tester -e SERIALWRAP_RUN_DIR="${ROLE_RUN_DIR}" "$c" serialwrap "$@"; }
 role_open() { local c=$1; shift; role_exec "$c" remote "$@"; }
@@ -494,6 +520,53 @@ except OSError:
   log "=== 拓樸 3／NAT←client：PASS ==="
 }
 
+# ══════════════════════════ 拓樸 4／agent_pull（方向反轉：agent -L 拉 uart）══════════════════════════
+topology_agent_pull() {
+  log "=== 拓樸 4／agent_pull：uart + agent 同網段，agent 端主動 -L 拉 uart 的 serialwrapd.sock（無 -R、無 relay）==="
+  local net="net_agent_pull_${SUFFIX}"
+  local uart="sw-rt-uartap-${SUFFIX}" agent="sw-rt-agentap-${SUFFIX}" attacker="sw-rt-attackerap-${SUFFIX}"
+  local ep="tcp://127.0.0.1:7777"
+
+  mk_net "$net"
+  start_uart "$uart" "$net"
+  start_plain "$agent" "$net"     # 只需 ssh client（image 內建），不需 sshd
+  start_plain "$attacker" "$net"
+  wait_uart_ready "$uart"
+  uart_sshd_up "$uart"            # 方向反轉：sshd 改跑在 uart 容器上，agent 主動連進來
+
+  # 斷言①：agent 尚未 -L 前，其自身 remote 狀態應為空；uart 從未呼叫 remote，順帶驗證同型別檢查
+  assert_default_off "$uart" "$agent" "$ep" root
+  assert_role_default_off "$agent"
+  local pid_before; pid_before=$(uart_daemon_pid "$uart")
+  local uart_sock; uart_sock=$(uart_socket_path "$uart")
+  log "  uart serialwrapd.sock = ${uart_sock}"
+
+  local open_json; open_json=$(role_open "$agent" -L --remote-socket "$uart_sock" "tester@${uart}:7777")
+  assert_ok_true "$open_json" "拓樸4 agent -L pull connect"
+  assert_field_eq "$open_json" status active "拓樸4 agent -L pull connect"
+
+  assert_session_and_cmd "$agent" root "$ep"
+  assert_pid_unchanged "$uart" "$pid_before" "拓樸4 -L pull 後"
+
+  # 斷言⑤：loopback 不變量（-L 轉發只綁 agent 自身 127.0.0.1）+ 獨立 attacker 容器連不到
+  assert_loopback_bind "$agent" 7777
+  local atk_out; atk_out=$(endpoint_exec "$attacker" root "tcp://${agent}:7777" daemon status)
+  assert_ok_false "$atk_out" "拓樸4 attacker 應無法連 ${agent}:7777"
+  [[ "$(jpath "$atk_out" error_code)" == "SOCKET_ERROR" ]] \
+    || fail "拓樸4 attacker：預期 error_code=SOCKET_ERROR，實得：$atk_out"
+  log "assertion⑤（loopback+attacker 隔離）PASS：拓樸4"
+
+  local closed; closed=$(role_close_all "$agent")
+  assert_ok_true "$closed" "拓樸4 remote close all"
+  sleep 1
+  assert_default_off "$uart" "$agent" "$ep" root
+  assert_role_default_off "$agent"
+  assert_pid_unchanged "$uart" "$pid_before" "拓樸4 close 後（assertion④）"
+
+  teardown_now "$uart" "$agent" "$attacker" -- "$net"
+  log "=== 拓樸 4／agent_pull：PASS ==="
+}
+
 # ══════════════════════════ 額外／斷言⑦：GatewayPorts yes fail-closed ══════════════════════════
 topology_gatewayports_failclosed() {
   log "=== 額外／斷言⑦：GatewayPorts yes relay 的 fail-closed 驗證 ==="
@@ -552,22 +625,24 @@ topology_gatewayports_failclosed() {
 main() {
   local sel="${1:-all}"
   case "$sel" in
-    direct|nat_host|dual_nat|gwports|all) : ;;
-    *) fail "未知拓樸參數：${sel}（可用：direct|nat_host|dual_nat|gwports|all）" ;;
+    direct|nat_host|dual_nat|agent_pull|gwports|all) : ;;
+    *) fail "未知拓樸參數：${sel}（可用：direct|nat_host|dual_nat|agent_pull|gwports|all）" ;;
   esac
 
   log "build image: ${IMAGE_TAG}"
   DOCKER_BUILDKIT=1 docker build --progress=plain -t "${IMAGE_TAG}" "${ROOT_DIR}" || fail "docker build 失敗"
 
   case "$sel" in
-    direct)   topology_direct ;;
-    nat_host) topology_nat_host ;;
-    dual_nat) topology_dual_nat ;;
-    gwports)  topology_gatewayports_failclosed ;;
+    direct)     topology_direct ;;
+    nat_host)   topology_nat_host ;;
+    dual_nat)   topology_dual_nat ;;
+    agent_pull) topology_agent_pull ;;
+    gwports)    topology_gatewayports_failclosed ;;
     all)
       topology_direct
       topology_nat_host
       topology_dual_nat
+      topology_agent_pull
       topology_gatewayports_failclosed
       ;;
   esac
