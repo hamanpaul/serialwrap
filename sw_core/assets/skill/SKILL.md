@@ -129,6 +129,19 @@ Agent 端連線（依「誰連得到誰」擇一）：
 
 **`BatchMode=yes` 為強制、`--ssh-opt` 蓋不掉**：不接受任何互動式認證，開隧道當下認證就必須已是非互動的。provider 憑證會過期時（如 Cloudflare Access token），過期會讓 ssh 直接失敗且無有用診斷——無人值守需用 service token 或事先 refresh。
 
+**實例：Cloudflare 當 reachability provider**（雙 NAT、本機不裝 overlay、不自養 relay；agent 在本機、bench 在遠端）——bench 只跑 `cloudflared`、**不跑 `serialwrap remote`**：
+- Quick Tunnel（無帳號無網域，hostname 每次重啟換）：bench `cloudflared tunnel --url ssh://localhost:22`，抄它印出的 `*.trycloudflare.com`。
+- Named Tunnel 不開 Access（帳號裡有網域，hostname 固定）：bench 一次性 `cloudflared tunnel login` → `tunnel create <name>` → `tunnel route dns <name> <hostname>` → `~/.cloudflared/config.yml`（ingress `service: ssh://localhost:22`）→ `tunnel run <name>` 或 `sudo cloudflared service install`。
+
+本機兩條路線同一行（`cloudflared` 只是這條 ssh 的 per-connection helper，放 `--ssh-opt`、**不要**寫進 `~/.ssh/config`）：
+```bash
+serialwrap remote -L --autossh --remote-socket /run/serialwrap/serialwrapd.sock \
+  --ssh-opt=-o --ssh-opt='ProxyCommand=cloudflared access ssh --hostname %h' \
+  tester@<hostname>:7777
+serialwrap --endpoint tcp://127.0.0.1:7777 session list
+```
+前提（bench）：sshd 只開金鑰（`PasswordAuthentication no`，hostname 對外可達）、本機公鑰在 `tester` 的 `authorized_keys`、`tester` 在 `dialout`（socket 0660）。`--remote-socket` 取 bench 的 `config.yaml` `socket_path`。**先用純 ssh 驗** `ssh -o 'ProxyCommand=cloudflared access ssh --hostname %h' tester@<hostname> hostname`，通了再接 serialwrap。不開 Access（其瀏覽器 token 會過期、撞 `BatchMode=yes` 靜默失敗）；日後要加請用 service token。完整兩條路線與對照表見 README「實例：以 Cloudflare 當 reachability provider」。
+
 管理：`serialwrap remote`（列隧道）、`serialwrap remote close 7777|all`（拆除）。
 回傳 `status`：`active`＝就緒可用；`starting`＝尚未確認（慢速認證／上游未就緒），需再 `remote status` 或重試。
 
