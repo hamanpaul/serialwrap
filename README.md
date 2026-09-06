@@ -775,6 +775,8 @@ development bench.
 ```bash
 # bench — keep it running (e.g. in tmux). Prints something like
 #   https://quiet-otter-lamp.trycloudflare.com
+# Use only the hostname part (quiet-otter-lamp.trycloudflare.com) and drop the
+# "https://" — an ssh target is a hostname, not a URL.
 cloudflared tunnel --url ssh://localhost:22
 ```
 
@@ -802,6 +804,9 @@ sudo cloudflared service install
 ```
 
 **Your machine** — identical for both routes; substitute the hostname.
+(`cloudflared access ssh` is simply the name of the cloudflared subcommand that
+proxies ssh through a Tunnel; using it does **not** turn on Cloudflare Access, the
+identity-policy product — neither route here enables that.)
 
 ```bash
 serialwrap remote -L --autossh \
@@ -2380,6 +2385,8 @@ bench 端有兩條路線，本機的指令兩條路線相同。
 ```bash
 # bench——放著跑（例如放 tmux 裡）。會印出類似
 #   https://quiet-otter-lamp.trycloudflare.com
+# 只取 hostname 那段（quiet-otter-lamp.trycloudflare.com）、去掉「https://」——
+# ssh 的目標是 hostname，不是 URL。
 cloudflared tunnel --url ssh://localhost:22
 ```
 
@@ -2406,6 +2413,7 @@ sudo cloudflared service install
 ```
 
 **本機**——兩條路線完全一樣，換 hostname 即可。
+（`cloudflared access ssh` 只是 cloudflared 那個「把 ssh 經 Tunnel 代理出去」的子命令名稱；用它**不等於**啟用 Cloudflare Access——那是身份政策產品，這裡兩條路線都沒有開。）
 
 ```bash
 serialwrap remote -L --autossh \

@@ -130,10 +130,10 @@ Agent 端連線（依「誰連得到誰」擇一）：
 **`BatchMode=yes` 為強制、`--ssh-opt` 蓋不掉**：不接受任何互動式認證，開隧道當下認證就必須已是非互動的。provider 憑證會過期時（如 Cloudflare Access token），過期會讓 ssh 直接失敗且無有用診斷——無人值守需用 service token 或事先 refresh。
 
 **實例：Cloudflare 當 reachability provider**（雙 NAT、本機不裝 overlay、不自養 relay；agent 在本機、bench 在遠端）——bench 只跑 `cloudflared`、**不跑 `serialwrap remote`**：
-- Quick Tunnel（無帳號無網域，hostname 每次重啟換）：bench `cloudflared tunnel --url ssh://localhost:22`，抄它印出的 `*.trycloudflare.com`。
+- Quick Tunnel（無帳號無網域，hostname 每次重啟換）：bench `cloudflared tunnel --url ssh://localhost:22`，抄它印出的 hostname（`*.trycloudflare.com`，**去掉 `https://`**——ssh 目標是 hostname 不是 URL）。
 - Named Tunnel 不開 Access（帳號裡有網域，hostname 固定）：bench 一次性 `cloudflared tunnel login` → `tunnel create <name>` → `tunnel route dns <name> <hostname>` → `~/.cloudflared/config.yml`（ingress `service: ssh://localhost:22`）→ `tunnel run <name>` 或 `sudo cloudflared service install`。
 
-本機兩條路線同一行（`cloudflared` 只是這條 ssh 的 per-connection helper，放 `--ssh-opt`、**不要**寫進 `~/.ssh/config`）：
+本機兩條路線同一行（`cloudflared` 只是這條 ssh 的 per-connection helper，放 `--ssh-opt`、**不要**寫進 `~/.ssh/config`；`access ssh` 只是子命令名稱、走 Tunnel 就會用到，**不代表**啟用 Access 身份政策）：
 ```bash
 serialwrap remote -L --autossh --remote-socket /run/serialwrap/serialwrapd.sock \
   --ssh-opt=-o --ssh-opt='ProxyCommand=cloudflared access ssh --hostname %h' \
