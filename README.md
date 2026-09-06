@@ -751,6 +751,109 @@ serialwrap remote tester@AGENT_OR_RELAY:7777
   and uses the returned `endpoint` (`tcp://127.0.0.1:7777` by default, or
   whatever port `--local` specified) as `--endpoint`.
 
+#### Worked example: Cloudflare as the reachability provider (double NAT, no self-hosted relay)
+
+The situation this solves: the agent (Claude Code, TestPilot, a script) runs on
+**your** machine and drives a bench through your *local* `serialwrap` CLI; both
+machines sit behind NAT; you do not want an overlay client or a system-wide ssh
+relationship to the bench on your machine — only the ssh that `serialwrap remote`
+spawns should reach it; and you do not want to operate a relay VPS.
+
+This is topology 2 (agent-pull) with Cloudflare Tunnel making the bench's `sshd`
+reachable by hostname. The bench runs `cloudflared`, **not** `serialwrap remote`.
+On your machine `cloudflared` is only a per-connection `ProxyCommand` helper handed
+to serialwrap's ssh via `--ssh-opt` — no TUN, no route, nothing resident — which is
+why it goes in `--ssh-opt` rather than `~/.ssh/config`. Both ends make outbound
+connections only, so double NAT is irrelevant.
+
+Two routes on the bench; the command on your machine is the same for both.
+
+**Route A — Quick Tunnel.** No Cloudflare account, no domain. The hostname
+changes on every restart (like a tmate token) and there is no SLA — fine for a
+development bench.
+
+```bash
+# bench — keep it running (e.g. in tmux). Prints something like
+#   https://quiet-otter-lamp.trycloudflare.com
+# Use only the hostname part (quiet-otter-lamp.trycloudflare.com) and drop the
+# "https://" — an ssh target is a hostname, not a URL.
+cloudflared tunnel --url ssh://localhost:22
+```
+
+**Route B — Named Tunnel, without Access.** Needs a domain in your Cloudflare
+account; gives a stable hostname.
+
+```bash
+# bench, one-time
+cloudflared tunnel login                                   # browser: authorise, pick the zone
+cloudflared tunnel create serialwrap-bench                 # prints <UUID>
+cloudflared tunnel route dns serialwrap-bench dut.example.com
+cat > ~/.cloudflared/config.yml <<EOF
+tunnel: <UUID>
+credentials-file: /home/<you>/.cloudflared/<UUID>.json
+ingress:
+  - hostname: dut.example.com
+    service: ssh://localhost:22
+  - service: http_status:404
+EOF
+
+# bench, keep it running — in tmux…
+cloudflared tunnel run serialwrap-bench
+# …or as a boot-time service
+sudo cloudflared service install
+```
+
+**Your machine** — identical for both routes; substitute the hostname.
+(`cloudflared access ssh` is simply the name of the cloudflared subcommand that
+proxies ssh through a Tunnel; using it does **not** turn on Cloudflare Access, the
+identity-policy product — neither route here enables that.)
+
+```bash
+serialwrap remote -L --autossh \
+  --remote-socket /run/serialwrap/serialwrapd.sock \
+  --ssh-opt=-o --ssh-opt='ProxyCommand=cloudflared access ssh --hostname %h' \
+  tester@dut.example.com:7777
+
+serialwrap --endpoint tcp://127.0.0.1:7777 session list
+serialwrap --endpoint tcp://127.0.0.1:7777 cmd submit --selector COM0 --cmd "uname -a" --source agent:me
+```
+
+| | Quick Tunnel | Named Tunnel (no Access) |
+|---|---|---|
+| Needs | nothing — not even an account | a domain in your Cloudflare account |
+| One-time bench setup | none | `login` → `create` → `route dns` → `config.yml` |
+| Hostname | rotates on restart | stable (so `--autossh` is worth it) |
+| Auth | ssh keys only | ssh keys only |
+| `BatchMode` / token expiry | n/a | n/a — no Access, so no token |
+
+One-time prerequisites on the bench, identical for both routes: `sshd` running
+with `PasswordAuthentication no` (the hostname is publicly reachable — your key is
+the only gate), your public key in `tester`'s `authorized_keys`, and `tester` in
+the group that owns the daemon socket (`dialout` on the default systemd-system
+install; the socket is `0660`). Take `--remote-socket` from the bench's
+`~/.config/serialwrap/config.yaml` (`socket_path`); `/run/serialwrap/serialwrapd.sock`
+is the systemd-system default.
+
+Check the milestone with plain ssh before involving serialwrap — if this prints the
+bench's hostname, the `serialwrap remote` line above will work; if it does not, the
+problem is in the cloudflared/sshd layer, not in serialwrap:
+
+```bash
+ssh -o 'ProxyCommand=cloudflared access ssh --hostname %h' tester@dut.example.com hostname
+```
+
+Deliberately not covered: putting Cloudflare Access in front of the hostname. Access
+is built for publishing a service to an organisation under identity policy; for "me
+reaching my own bench" it is the wrong size, and its browser-login token expires —
+which collides with serialwrap's forced `BatchMode=yes` and fails silently. If you
+add Access later, use a service token (`cloudflared access ssh --service-token-id …
+--service-token-secret …`).
+
+For orientation: a self-hosted relay (topology 3) is functionally equivalent — the
+only difference is who runs the rendezvous. tmate is the same "someone else runs the
+relay, a random token to meet" model, but it bridges a terminal, not a socket, so it
+serves the agent-on-the-bench case and not this one.
+
 #### Tunnel management
 
 ```bash
@@ -2268,6 +2371,79 @@ serialwrap remote tester@AGENT_OR_RELAY:7777
 | `<run-dir>/serialwrapd.sock` | 本機 Unix socket（預設；RUN_DIR 預設 `$XDG_RUNTIME_DIR/serialwrap`，可 `SERIALWRAP_SOCKET` 覆寫） |
 | `unix://<run-dir>/serialwrapd.sock` | 本機 Unix socket（顯式 `unix://` 前綴） |
 | `tcp://127.0.0.1:7777` | 透過隧道連接遠端 daemon（`serialwrap remote` 或手動 ssh 皆可） |
+
+### 實例：以 Cloudflare 當 reachability provider（雙 NAT、不自養 relay）
+
+要解的情境：agent（Claude Code／TestPilot／腳本）跑在**你的**機器上，透過**本機**的 `serialwrap` CLI 操作遠端 bench；兩台都在 NAT 後；你不想在本機裝 overlay client、也不想對 bench 建立系統級的 ssh 關係——只有 `serialwrap remote` 派生的那條 ssh 過去；而且不想自己養一台 relay VPS。
+
+這就是拓樸二（agent-pull）配上 Cloudflare Tunnel 讓 bench 的 `sshd` 以 hostname 可達。**bench 跑的是 `cloudflared`，不是 `serialwrap remote`**。本機的 `cloudflared` 只是 serialwrap 那條 ssh 的 per-connection `ProxyCommand` helper——沒有 TUN、沒有路由、沒有常駐——所以它放在 `--ssh-opt` 而不是 `~/.ssh/config`。兩端都只有出站連線，雙 NAT 無所謂。
+
+bench 端有兩條路線，本機的指令兩條路線相同。
+
+**路線 A — Quick Tunnel。** 不需要 Cloudflare 帳號、不需要網域。hostname 每次重啟會換（像 tmate 的 token）、無 SLA——開發 bench 夠用。
+
+```bash
+# bench——放著跑（例如放 tmux 裡）。會印出類似
+#   https://quiet-otter-lamp.trycloudflare.com
+# 只取 hostname 那段（quiet-otter-lamp.trycloudflare.com）、去掉「https://」——
+# ssh 的目標是 hostname，不是 URL。
+cloudflared tunnel --url ssh://localhost:22
+```
+
+**路線 B — Named Tunnel，不開 Access。** 需要帳號裡掛著一個網域；換來固定 hostname。
+
+```bash
+# bench，一次性
+cloudflared tunnel login                                   # 瀏覽器授權、選網域
+cloudflared tunnel create serialwrap-bench                 # 印出 <UUID>
+cloudflared tunnel route dns serialwrap-bench dut.example.com
+cat > ~/.cloudflared/config.yml <<EOF
+tunnel: <UUID>
+credentials-file: /home/<你>/.cloudflared/<UUID>.json
+ingress:
+  - hostname: dut.example.com
+    service: ssh://localhost:22
+  - service: http_status:404
+EOF
+
+# bench，常駐——放 tmux…
+cloudflared tunnel run serialwrap-bench
+# …或裝成開機服務
+sudo cloudflared service install
+```
+
+**本機**——兩條路線完全一樣，換 hostname 即可。
+（`cloudflared access ssh` 只是 cloudflared 那個「把 ssh 經 Tunnel 代理出去」的子命令名稱；用它**不等於**啟用 Cloudflare Access——那是身份政策產品，這裡兩條路線都沒有開。）
+
+```bash
+serialwrap remote -L --autossh \
+  --remote-socket /run/serialwrap/serialwrapd.sock \
+  --ssh-opt=-o --ssh-opt='ProxyCommand=cloudflared access ssh --hostname %h' \
+  tester@dut.example.com:7777
+
+serialwrap --endpoint tcp://127.0.0.1:7777 session list
+serialwrap --endpoint tcp://127.0.0.1:7777 cmd submit --selector COM0 --cmd "uname -a" --source agent:me
+```
+
+| | Quick Tunnel | Named Tunnel（不開 Access） |
+|---|---|---|
+| 需要 | 什麼都不用——連帳號都不用 | 帳號裡掛著一個網域 |
+| bench 一次性設定 | 無 | `login` → `create` → `route dns` → `config.yml` |
+| hostname | 每次重啟換 | 固定（所以 `--autossh` 才有意義） |
+| 認證 | 純 ssh 金鑰 | 純 ssh 金鑰 |
+| `BatchMode`／token 過期 | 不適用 | 不適用——不開 Access 就沒有 token |
+
+bench 上的一次性前提，兩條路線相同：`sshd` 有跑且 `PasswordAuthentication no`（hostname 對外可達——金鑰是唯一的門）、本機公鑰在 `tester` 的 `authorized_keys`、`tester` 在擁有 daemon socket 的群組內（預設 systemd-system 安裝是 `dialout`；socket 為 `0660`）。`--remote-socket` 的路徑取自 bench 的 `~/.config/serialwrap/config.yaml`（`socket_path`）；systemd-system 預設是 `/run/serialwrap/serialwrapd.sock`。
+
+接 serialwrap 之前先用純 ssh 驗里程碑——印得出 bench 的 hostname，上面那行 `serialwrap remote` 就一定通；印不出來，問題在 cloudflared／sshd 那層，跟 serialwrap 無關：
+
+```bash
+ssh -o 'ProxyCommand=cloudflared access ssh --hostname %h' tester@dut.example.com hostname
+```
+
+刻意不寫的：在 hostname 前面加 Cloudflare Access。Access 是「把服務發佈給組織、用身份政策管」的工具，對「我連我自己的 bench」是錯的量級；而且它的瀏覽器登入 token 會過期——撞上 serialwrap 強制的 `BatchMode=yes` 會靜默失敗。日後真要加，請用 service token（`cloudflared access ssh --service-token-id … --service-token-secret …`）。
+
+定位用的對照：自養 relay（拓樸三）功能等價，差別只在誰養會合點。tmate 是同一種「別人養 relay、隨機 token 會合」的模型，但它橋的是 terminal 而不是 socket，所以它服務的是 agent 跑在 bench 上的情境，不是這一個。
 
 ### 隧道管理
 
