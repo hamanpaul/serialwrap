@@ -201,11 +201,15 @@ uart_sshd_up() {  # uart_sshd_up <container>
 uart_socket_path() {  # uart_socket_path <container> — daemon harness 的 socket_path = RUN_DIR/serialwrapd.sock
                       # （func-test/lib/daemon_harness.py 的 self._socket_path = self._root/"run"/"serialwrapd.sock"），
                       # 供拓樸4 --remote-socket 用；RUN_DIR 為 tempfile 動態路徑，須讀 sw-uart.env 取得。
-  local c=$1 content run_dir
-  content=$(docker exec -u tester "$c" cat /home/tester/sw-uart.env 2>/dev/null) \
-    || fail "$c：讀不到 sw-uart.env（harness 未就緒？）"
-  run_dir=$(printf '%s\n' "$content" | sed -n 's/^export SERIALWRAP_RUN_DIR=//p' | head -n1)
-  [[ -n "$run_dir" ]] || fail "$c：sw-uart.env 缺 SERIALWRAP_RUN_DIR：$content"
+  local c=$1 run_dir
+  # 在容器內 source 後再取值，而非自行 sed 取右值：uart_harness.py 是以
+  # shlex.quote() 寫出（tools/docker/uart_harness.py:87），sed 會把引號一併帶進路徑，
+  # 使 --remote-socket 指向不存在的 socket。目前 tempfile 路徑不含需引號的字元故
+  # 看不出差異，但那是會靜默壞掉的脆弱寫法（Copilot review）。
+  run_dir=$(docker exec -u tester "$c" bash -c \
+    'set -a; . /home/tester/sw-uart.env; printf "%s" "$SERIALWRAP_RUN_DIR"') \
+    || fail "$c：讀不到／source 不了 sw-uart.env（harness 未就緒？）"
+  [[ -n "$run_dir" ]] || fail "$c：sw-uart.env 缺 SERIALWRAP_RUN_DIR"
   echo "${run_dir}/serialwrapd.sock"
 }
 
