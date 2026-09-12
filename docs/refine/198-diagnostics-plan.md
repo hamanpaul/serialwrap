@@ -52,7 +52,7 @@ rpc_trace { endpoint_transport, endpoint_id, endpoint_source, method, elapsed_ms
 ```
 
 - `endpoint_source` 必須描述**同一次實際決策**：`--endpoint`、`--socket`、
-  `config.yaml`、平台預設，或 `config.yaml -> canonical fallback`。把現有解析邏輯
+  執行期 config.yaml、平台預設，或 `config.yaml -> canonical fallback`。把現有解析邏輯
   收斂為一次回傳 resolution metadata；`_run_rpc`、event、daemon start 的既有呼叫
   使用該結果，不可先 probe 一次再重新 resolve，避免 #108 fallback TOCTOU/行為漂移。
 - `method` 用真正送出的 RPC method（例如 `event.rule_set`，不可用 `event.add`）；
@@ -92,10 +92,10 @@ rpc_trace { endpoint_transport, endpoint_id, endpoint_source, method, elapsed_ms
 - `sw_core/client.py`：保留 `rpc_call()` 回應 dict 形狀；以 optional internal trace
   sink／metadata 傳遞 `OSError.errno`、實際 attempts、elapsed，避免把私有 errno 欄位
   泄漏到 stdout JSON。
-- `tests/test_cli_diagnostics.py`（新增）：fake AF_UNIX/TCP server 與 patched OSError
+- 新增 CLI diagnostics 測試模組（建議檔名 test_cli_diagnostics.py）：fake AF_UNIX/TCP server 與 patched OSError
   覆蓋 endpoint source、method、success/failure、errno、timeout、顯式 retries、
   no-param/no-secret；沿用 `tests/test_cli_stderr_full_error.py`，不改其 #172 相容斷言。
-- 不在 Phase 1 修改 `daemon.py`、`rpc_posix.py`、`service.py`、`session_manager.py`
+- 不在 Phase 1 修改 `sw_core/daemon.py`、`sw_core/rpc_posix.py`、`sw_core/service.py`、`sw_core/session_manager.py`
   或啟動真 daemon/UART。
 
 ## 後續分期（不納入首批完成條件）
@@ -133,6 +133,6 @@ session id 的最小化識別），並以現有 `last_state_change_at`／`last_e
 ## Root review / 放行條件
 
 - Root 須逐項核對 source 行號與 live issues：[#171](https://github.com/hamanpaul/serialwrap/issues/171)、[#172](https://github.com/hamanpaul/serialwrap/issues/172)、[#198](https://github.com/hamanpaul/serialwrap/issues/198)；不得以本文件取代實作證據。
-- Root 合併後執行 `python3 -m pytest -q tests/` 與 `python3 -m policy_check --repo .`；至少核對上述新增/既有 targeted tests、stdout/stderr 相容、跨平台 seam。pytest 本輪由 root 統一執行。
+- Root 本輪合併後執行現有 `python3 -m pytest -q tests/` 與 `python3 -m policy_check --repo .`；新增 trace tests 與 trace 相容性驗收須待實作後執行，本輪不把方案驗收視為已測。pytest 由 root 統一執行。
 - 尚未驗證項：daemon log sink/rotation 的成本與 systemd 行為、Windows 實際 errno 文字、
   長時間 logger overhead、真機 state trace。這些是明列 residual/defer，不可在本輪宣稱已修復。

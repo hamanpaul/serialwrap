@@ -25,7 +25,7 @@ worktree 的 trace 佐證，不以靜態掃描宣稱「不存在其他 writer／
 ### Command arbiter：接受多 client，正常 epoch 內逐一執行
 
 - `sw_core/arbiter.py:46-56` 以 `session_id` 建立 queue／worker；
-  `:125-213` 在同一把 lock 下 admission、record、enqueue，並非 writer token。
+  `:125-213` 在同一把 lock 下做 admission 與 record；`pq.put()` 在鎖外，並非 writer token。
 - `sw_core/service.py:887-910` 的 `command.submit` 只把來源標在 `source`；
   多個 client 可同時得到 `ok=true,status=accepted`，之後由該 session queue
   序列化。故「兩個 command writer 競爭只有一個成功」不符合現有 API。
@@ -44,7 +44,7 @@ worktree 的 trace 佐證，不以靜態掃描宣稱「不存在其他 writer／
 ### Interactive lease：才是「競爭只有一個 lease」的語意
 
 - `sw_core/session_manager.py:230-248` 的 `InteractiveLease` 以
-  `interactive_id` 作 capability；`:3067-3090` 在 lock 內登記唯一
+  `interactive_id` 作 lease handle；`:3067-3090` 在 lock 內登記唯一
   `session.interactive_session_id` 並設定 bridge raw owner。
 - `interactive_open`（`:3862-3930`）對既有 agent lease 回
   `SESSION_INTERACTIVE_BUSY`；human lease 若近期有輸入同樣 busy，若 idle 則
@@ -97,10 +97,10 @@ worktree 的 trace 佐證，不以靜態掃描宣稱「不存在其他 writer／
    `send_bytes` 次數為零；保留現有 expired case，補 close／replacement／unknown。
 2. **第二 console 語意固定**：owner A + secondary B 的整合測試須 assert B 的 raw
    bytes 不直通，而 newline 是 line-buffer broker command；若產品真正要
-   read-only，先新增明確 capability／ACL API，再測拒絕，不得從 owner bool 推論。
+   read-only，先確認具體 consumer 與授權需求，再另案設計 ACL；本輪不新增此能力，也不得從 owner bool 推論。
 3. **file-transfer contention**：用 blocking fake bridge 競爭兩個 `file.push`／
    `file.pull`（並至少一個 command path），明定是序列化或拒絕，assert 不發生
-   logical transfer 交錯；若刻意不共用 gate，須把它列為 scope 外契約。
+   logical transfer 交錯；若重現交錯，列為需修復的 P1，不以「不經 arbiter」排除核心仲裁責任。
 4. **reconnect end-to-end**：human peer 在 grace 內斷線／重連、逾 grace 後以舊
    id 發送，以及新 client 依公開流程取得 lease；確認舊 id 不可跨 close 寫入。
 5. **recovery epoch integration**：阻塞舊 `send_cb` 後 re-register／換 bridge，

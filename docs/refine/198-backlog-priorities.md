@@ -11,8 +11,8 @@
 | 0 | [#198](https://github.com/hamanpaul/serialwrap/issues/198) | **P1 gate** | 先守 single-writer、lease、raw evidence 與可診斷恢復；「STOP」只擋無 consumer 的泛化平台／協定／壓測，不撤既有介面。 |
 | 1 | [#166](https://github.com/hamanpaul/serialwrap/issues/166) | **P1** | issue comment 有兩板實測：板端缺 `base64`，prpl 約 505 字元單行上限；file push 既有 consumer 目前不可用且有資料正確性風險。先做 decoder 偵測／`openssl` fallback、依 profile 上限推導 chunk，保留 checksum 與 stall fail-closed。 |
 | 2 | [#199](https://github.com/hamanpaul/serialwrap/issues/199) | **P1 小修** | Windows backend 是既有 consumer；`st_rdev` 例外可能在 holder 掃描前中止 attach/reclaim。先防禦性取值，但不能把 `/proc` 不可用時的空 `pids` 當成 Windows 排他安全已證明。 |
-| 3 | [#182](https://github.com/hamanpaul/serialwrap/issues/182) | **P2** | #181 已讓 fallback/pin 的 COM2 修復不必重啟；reload 仍只為新增／修改 template、explicit target 與載入版本可見性提供操作成本改善。先做 fail-closed、可驗證的 memory-only contract，不為便利破壞 ownership。 |
-| 4 | [#171](https://github.com/hamanpaul/serialwrap/issues/171) | **P2 分階段** | 遠端事故需要控制平面證據；現行有零散 warning（非 issue 所述「完全沒有 logging」），但無 verbosity／`SERIALWRAP_LOG_LEVEL` 契約。Phase 1 只做 CLI endpoint 來源／errno／既有 error formatter；daemon method/耗時與 session transition 放後續。大型 dashboard、全流量 dump STOP；WAL 遺失另由 #189 處理。 |
+| 3 | [#171](https://github.com/hamanpaul/serialwrap/issues/171) | **P1 最小切片** | 遠端事故需要控制平面證據；現行有零散 warning，但無 verbosity／`SERIALWRAP_LOG_LEVEL` 契約。Phase 1 記錄當次 CLI endpoint 來源／errno／RPC method／耗時／error code；保留 #172 既有 formatter。Daemon／session trace 放後續；WAL 遺失已由 #189 處理。 |
+| 4 | [#182](https://github.com/hamanpaul/serialwrap/issues/182) | **P2** | #181 已讓使用既有 template 的 fallback/pin 修復不必重啟；reload 仍為新增／修改 template、explicit target 與載入版本可見性提供操作成本改善。先做 fail-closed、可驗證的 memory-only contract，不為便利破壞 ownership。 |
 | 5 | [#197](https://github.com/hamanpaul/serialwrap/issues/197) | **P2 驗證票** | `remote` 是既有 POSIX CLI／SSH consumer，docker 拓樸已有驗證；尚缺 Cloudflare Quick/Named Tunnel 的 bench 實跑。完成前提與 E2E 證據，不新增 provider SDK 或泛化平台。 |
 
 這不是把 remote、Windows 或 file-transfer 一概 STOP：它們各有既有 consumer；只是 #166/#199 先修正正確性邊界，#197 先做外部環境驗證。上述排序是風險與操作成本排序，不是使用頻率推估。
