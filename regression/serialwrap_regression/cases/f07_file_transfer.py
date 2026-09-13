@@ -1,7 +1,8 @@
 """F7 檔案傳輸完整性（#21 #32）：binary round-trip md5 一致、不靜默截斷。
 
 ``serialwrap file push``／``file pull`` 走 base64 分段＋md5 校驗（見
-``sw_core/file_transfer.py``，本檔僅唯讀 grep 鍵名，未 import）。已知缺口
+``sw_core/file_transfer.py``，本檔僅唯讀 grep 鍵名，未 import）；板端缺 base64
+時應由 OpenSSL fallback 完成，只有兩路皆不可用才誠實 SKIP。已知缺口
 （#123 defer，MINOR-5）：這兩個 RPC 方法**不在** CLI 的長操作白名單，未顯式
 帶 ``--timeout`` 會沿用一般方法的 5.0s 預設，對多 chunk 的實際傳輸而言形同
 必逾時──故本檔一律顯式帶較寬的 RPC ``--timeout``（global flag，需置於
@@ -25,7 +26,7 @@ echo 停滯（``TRANSFER_ECHO_STALL``，#161）歸獨立 reason_code
 一次讀全部——1MB 檔案 base64 輸出 ~1.4MB 遠超上限，``_SENTINEL_BEGIN`` 必被踢出
 視窗 → ``PULL_PARSE_FAILED``。故 ``f7-larger-file-not-truncated`` push 端可成功，
 pull 端仍預期 SKIP（``transfer_environment_failure``）待 follow-up（另開 issue 追蹤）；
-``f7-binary-roundtrip-md5``（64KB，base64 ~88.6KB 在上限內）於 #161 後預期 COM0 轉綠。
+``f7-binary-roundtrip-md5``（64KB，base64 ~88.6KB 在上限內）於 #161/#166 後預期 COM0 轉綠。
 """
 from __future__ import annotations
 
@@ -48,10 +49,13 @@ def _case(id, title, issues, hints=(), requires=(), destructive=False):
     return deco
 
 
-# push_file／pull_file（sw_core/file_transfer.py）在 target 缺 md5sum／base64
-# 時的可觀測徵兆：md5sum 缺失 → _remote_md5 抓不到 32 hex → CHECKSUM_VERIFY_FAILED；
-# base64 缺失 → sentinel 內夾帶的非 base64 內容解碼失敗 → BASE64_DECODE_FAILED。
-_TOOL_MISSING_CODES = frozenset({"CHECKSUM_VERIFY_FAILED", "BASE64_DECODE_FAILED"})
+# push_file／pull_file（sw_core/file_transfer.py）在 target 缺傳輸工具時會
+# 於 probe 階段明確回報；若 probe 後工具失效，也不能只因 prompt 回來就算成功。
+_TOOL_MISSING_CODES = frozenset({
+    "TARGET_DECODER_MISSING", "TARGET_ENCODER_MISSING",
+    "TARGET_DECODER_FAILED", "TARGET_ENCODER_FAILED",
+    "CHECKSUM_VERIFY_FAILED", "BASE64_DECODE_FAILED",
+})
 
 # 逾時／連線層失敗徵兆：RPC 客戶端層的 TIMEOUT／SOCKET_ERROR／EMPTY_RESPONSE
 # （sw_core/client.py），以及 file_transfer 內部逐段等待逾時的 TRANSFER_TIMEOUT／
@@ -62,7 +66,7 @@ _TIMEOUT_CODES = frozenset({
 
 
 def _probe_target_tools(ctx: Any, com: str) -> bool | None:
-    """實測板端是否具備 base64＋md5sum：True＝都在、False＝缺、None＝探測本身失敗。
+    """實測板端是否具備可用的雙向工具鏈：True＝有任一完整鏈、False＝缺、None＝探測失敗。
 
     區分 cg review 抓到的雙重含義：``CHECKSUM_VERIFY_FAILED``／``BASE64_DECODE_FAILED``
     既可能是板端缺工具（環境、SKIP），也可能是工具都在但傳輸真的壞掉（#32 類回歸、FAIL）。
@@ -71,17 +75,32 @@ def _probe_target_tools(ctx: Any, com: str) -> bool | None:
     # 用 which 而非 command -v（bcm 板 shell 無 `command` builtin，`command -v` 回
     # 'sh: command: not found' 被誤判成工具缺失）。busybox which 皆備。
     #
-    # sentinel 必須是**命令本文裡不會出現的字串**（#166 實證）：舊版用
+    # sentinel 必須是**命令本文裡不會出現完整值**的字串（#166 實證）：舊版用
     # `... && echo TOOLS_OK` 再判 `"TOOLS_OK" in stdout`，但命令回顯本身就含
-    # 該字面，只要板端有回顯就恆為真——COM0(prpl) 因此被誤判成「工具齊全」，
-    # 走進 push 後才在傳輸尾端以 CHECKSUM_MISMATCH 收場。改用算式讓期望輸出
-    # （TOOLS_42）只可能來自實際執行結果。
+    # 該字面，只要板端有回顯就恆為真。此處用實際解碼／編碼結果，再以算式
+    # 產生 `TOOLS_B64_42`／`TOOLS_OPENSSL_42`，避免 echo 假陽性。
     probe = ctx.sw.submit_and_wait(
-        com, "which base64 >/dev/null 2>&1 && which md5sum >/dev/null 2>&1 && echo TOOLS_$((6*7))")
+        com, _target_tools_probe_command(),
+    )
     ctx.note(f"{com}-tools-probe.json", str(probe))
     if probe.get("status") != "done":
         return None
-    return "TOOLS_42" in (probe.get("stdout") or "")
+    stdout = probe.get("stdout") or ""
+    return "TOOLS_B64_42" in stdout or "TOOLS_OPENSSL_42" in stdout
+
+
+def _target_tools_probe_command() -> str:
+    """F7 實機 probe：雙向 codec 與 md5sum 均實際成功才輸出 sentinel。"""
+    return (
+        "if which md5sum >/dev/null 2>&1 && "
+        "test \"$(printf '%s' 'c3ctcHJvYmU=' | base64 -d 2>/dev/null)\" = 'sw-probe' && "
+        "test \"$(printf '%s' 'sw-probe' | base64 2>/dev/null)\" = 'c3ctcHJvYmU='; "
+        "then printf '%s\\n' 'TOOLS_B64_'$((6*7)); "
+        "elif which md5sum >/dev/null 2>&1 && "
+        "test \"$(printf '%s' 'c3ctcHJvYmU=' | openssl enc -base64 -d -A 2>/dev/null)\" = 'sw-probe' && "
+        "test \"$(printf '%s' 'sw-probe' | openssl enc -base64 2>/dev/null)\" = 'c3ctcHJvYmU='; "
+        "then printf '%s\\n' 'TOOLS_OPENSSL_'$((6*7)); fi"
+    )
 
 
 def _transfer_failure_verdict(resp: dict[str, Any], *, verb: str,
@@ -93,12 +112,12 @@ def _transfer_failure_verdict(resp: dict[str, Any], *, verb: str,
         if tools_present is True:
             return CaseResult(
                 "FAIL",
-                reason=f"{verb} 失敗（error_code={code}）且板端 base64/md5sum 皆在"
+                reason=f"{verb} 失敗（error_code={code}）且板端可用傳輸工具鏈皆在"
                        "——非工具缺失，屬傳輸損壞（#32 類回歸）",
                 category="test", reason_code="binary_roundtrip_mismatch",
             )
         return CaseResult(
-            "SKIP", reason=f"板端疑缺 base64／md5sum（error_code={code}，工具探測={tools_present}）",
+            "SKIP", reason=f"板端疑缺 base64／OpenSSL／md5sum（error_code={code}，工具探測={tools_present}）",
             category="environment", reason_code="target_tool_missing",
         )
     return _environment_skip(resp, verb=verb)
@@ -170,7 +189,7 @@ def _binary_roundtrip_on(ctx, com):
     try:
         tools_present = _probe_target_tools(ctx, com)
         if tools_present is False:
-            return CaseResult("SKIP", reason="板端缺 base64／md5sum（探測確認）",
+            return CaseResult("SKIP", reason="板端缺 base64／OpenSSL／md5sum（探測確認）",
                               category="environment", reason_code="target_tool_missing")
 
         # chunk 512 下 64KB≈129 chunks；echo-paced 估 39–65s（#161，見 module docstring），
@@ -207,7 +226,7 @@ def _larger_file_on(ctx, com):
     try:
         tools_present = _probe_target_tools(ctx, com)
         if tools_present is False:
-            return CaseResult("SKIP", reason="板端缺 base64／md5sum（探測確認）",
+            return CaseResult("SKIP", reason="板端缺 base64／OpenSSL／md5sum（探測確認）",
                               category="environment", reason_code="target_tool_missing")
 
         # chunk 512 下 1MB=2048 chunks，echo-paced 估 614–1024s（≈10–17 分，#161）；
@@ -270,7 +289,7 @@ def _run_on_boards(ctx, runner, *, case_tag: str):
 
 
 @_case("f7-binary-roundtrip-md5", "binary round-trip md5 一致（含 null byte）",
-       issues=("#32", "#21", "#161"),
+       issues=("#32", "#21", "#161", "#166"),
        hints=("逐板嘗試：prpl 板的無流控節流掉字由 #161 echo-ACK 修復（push 預設走"
               "echo-paced，預期 COM0 轉綠）；停滯時 reason_code=transfer_echo_stall"
               "可辨識新機制失效。",))
@@ -279,7 +298,7 @@ def f7_binary_roundtrip_md5(ctx):
 
 
 @_case("f7-larger-file-not-truncated", "1MB 檔案 push→pull 不靜默截斷",
-       issues=("#21", "#161"),
+       issues=("#21", "#161", "#166"),
        hints=("逐板嘗試（同 f7-binary-roundtrip-md5）；echo-paced 下 1MB push 約"
               "10–17 分，timeout 上界 1500s；pull 端受 RX 視窗 128KiB 上限仍預期"
               "SKIP（待 follow-up issue）。",))

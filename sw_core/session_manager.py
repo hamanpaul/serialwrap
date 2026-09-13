@@ -68,8 +68,8 @@ _ATTACHED_CONSOLE_LEASE_TIMEOUT_S = 86400.0
 _MIN_FILE_CHUNK_TIMEOUT_S = 5.0   # push 每個 chunk 等待下限
 _MIN_FILE_PULL_TIMEOUT_S = 30.0   # pull 整段讀取等待下限（維持原 30.0 行為基準）
 # echo-ACK 單一 slice 等待下限（#161 實機調校）：同樣依 profile.timeout_s 推導、夾地板，
-# 地板即 file_transfer.DEFAULT_ECHO_TIMEOUT_S（5.0）——真機兩案都在第 8 個 slice
-# （448/512 字元）確定性卡住，2.0s 對慢板偏緊。
+# 地板即 file_transfer.DEFAULT_ECHO_TIMEOUT_S（5.0）。#166 已確認 448/512 的實機症狀
+# 是板端缺 base64 與 prpl 約 505 字元單行限制的下游結果，並非 timeout 根因。
 _MIN_FILE_ECHO_TIMEOUT_S = DEFAULT_ECHO_TIMEOUT_S
 
 
@@ -972,6 +972,7 @@ class SessionManager:
             quiet_window_s=tpl.quiet_window_s,
             hard_timeout_s=tpl.hard_timeout_s,
             log_dir=tpl.log_dir,
+            max_console_line_chars=tpl.max_console_line_chars,
             bootloader_prompts=tpl.bootloader_prompts,
             uart=tpl.uart,
         )
@@ -2823,6 +2824,7 @@ class SessionManager:
             quiet_window_s=tpl.quiet_window_s,
             hard_timeout_s=tpl.hard_timeout_s,
             log_dir=tpl.log_dir,
+            max_console_line_chars=tpl.max_console_line_chars,
             bootloader_prompts=tpl.bootloader_prompts,
             uart=tpl.uart,
         )
@@ -4860,6 +4862,7 @@ class SessionManager:
             bridge = session.bridge
             prompt_regex = session.profile.prompt_regex
             profile_timeout_s = session.profile.timeout_s
+            max_console_line_chars = session.profile.max_console_line_chars
             if busy_result is None:
                 operation, busy_result = self._begin_foreground_operation_locked(session)
 
@@ -4889,6 +4892,7 @@ class SessionManager:
                 source=source,
                 ack_mode=ack_mode,
                 echo_timeout_s=effective_echo_timeout_s,
+                max_console_line_chars=max_console_line_chars,
             )
         finally:
             try:
@@ -4939,6 +4943,7 @@ class SessionManager:
             bridge = session.bridge
             prompt_regex = session.profile.prompt_regex
             profile_timeout_s = session.profile.timeout_s
+            max_console_line_chars = session.profile.max_console_line_chars
             if busy_result is None:
                 operation, busy_result = self._begin_foreground_operation_locked(session)
 
@@ -4961,6 +4966,7 @@ class SessionManager:
                 timeout_s=effective_timeout_s,
                 prompt_regex=prompt_regex,
                 source=source,
+                max_console_line_chars=max_console_line_chars,
             )
         finally:
             try:
