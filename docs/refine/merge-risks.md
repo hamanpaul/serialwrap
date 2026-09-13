@@ -19,9 +19,10 @@
 - CLI trace 與 holder stat 已有候選、隔離測試及 Sol 審查；不再列為「尚未實作」。
   CLI trace 不處理 daemon sink／rotation；holder 的 missing-attribute 測試不是
   native Windows 成功證據，空 `/proc` 結果也不是外部 holder 排他證明。
-- Ownership 的 operation cleanup 候選已通過定向測試，但 root 另以真 UARTBridge
-  RX handler＋mock TX 重現「傳輸途中新 console 被授予 raw owner」；此項待修，
-  不能以 logical admission 的其他測試通過宣稱整體安全。
+- Ownership 的新 console raw grant 與 raw RX 檢查至實際 write 窗口均已由 root
+  重現並修正，另補 deferred 回放、鎖外 I/O 與 FLASHING 優先驗證。可支持的範圍
+  是本輪決定性操作序列；不外推外部 process、所有未盤點 callback、真板背壓或
+  整個 recovery 生命週期的物理排他，詳見 [ownership 交付](198-ownership-delivery.md)。
 - #166 尚無實作：指定 Sonnet 額度不足；Opus 審查也未能執行。替換指定模型須由
   使用者決定。Ownership Sol 審查遭平台中止亦未取得有效結果。
 - #182 reload 與 #197 Cloudflare 真 E2E 繼續分票追蹤，見

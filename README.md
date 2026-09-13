@@ -256,6 +256,13 @@ so arrow keys, Tab, and escape sequences behave like a direct minicom session.
 When an agent submits a command, the daemon suspends human raw mode, runs the
 agent command, then resumes the human console and flushes deferred input.
 
+Foreground commands and file transfers share operation admission: competing direct
+writers receive `SESSION_BUSY`; normal multi-client `command.submit` queue acceptance
+is unchanged. A console joining during an operation can still observe output and use
+the line broker, but raw ownership waits until admission reopens. Already-received
+human raw input is deferred and replayed; FLASHING retains its input-drop policy.
+See the [ownership contract and test boundaries](docs/refine/198-ownership-delivery.md).
+
 ```bash
 serialwrap-minicom COM0
 serialwrap session console-list --selector COM0
@@ -1232,6 +1239,12 @@ sequenceDiagram
 ```
 
 ### Human lease 的閒置降級（soft preempt）與孤兒清理
+
+前景命令與檔案傳輸共用 operation admission：競爭的 direct writer 回
+`SESSION_BUSY`，正常多 client 的 `command.submit` queue 接受契約不變。
+操作中新加入的 console 仍可觀察輸出並經 line broker 提交，但 raw ownership
+需等 admission 重開；已接收的人類 raw 輸入會暫存並回放，FLASHING 則保留
+原有丟棄輸入政策。詳見 [ownership 契約與測試界線](docs/refine/198-ownership-delivery.md)。
 
 human console（minicom）持有的 interactive lease 是**禮讓**機制、不是硬鎖：
 

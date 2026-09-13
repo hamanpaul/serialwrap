@@ -5,7 +5,7 @@
 已完成本 worktree 的 ownership admission 與 operation/epoch cleanup 實作及
 pytest 驗證；尚未包含真機 UART、live daemon、merge 或部署驗證。root 整合時需
 保留本文件與 `changelog.d/198-ownership.md`，並將共享
-`session_manager.py` 與其他 task 逐 hunk 合併。
+`sw_core/session_manager.py` 與其他 task 逐 hunk 合併。
 
 ## 修復內容
 
@@ -63,7 +63,7 @@ python3 -m pytest -q tests/test_flashing_state.py tests/test_arbiter_flush_on_re
 36 passed, 6 subtests passed in 10.75s
 ```
 
-`test_refine_ownership.py` 使用 Event/barrier、SessionManager 及可記錄 TX 的
+`tests/test_refine_ownership.py` 使用 Event/barrier、SessionManager 及可記錄 TX 的
 fake bridge；包含 push↔push、command↔pull、pull↔command、execute inner 前置
 窗口、bridge detach/re-register epoch、interactive open/send/interactive command
 防旁路，以及 post-close/resume 例外的 cleanup fault injection。沒有使用 sleep
@@ -105,3 +105,46 @@ Barrier 以 `try/finally` 釋放，避免 assertion 失敗遺留卡住 worker。
 - operation token 不可能取代外部 process 的不可控寫入，也不宣稱所有未盤點
   callback 都不存在；若後續新增繞過 SessionManager 的 writer，必須重新接入
   相同 admission/epoch 邊界並補 behavior test。
+
+## Root review 後續修正（2026-09-13）
+
+初始候選 `6d946ec` 仍有兩項 root 獨立重現的缺口，已於 Luna max 候選
+`9ac9d12` 修正，整合為 `aa278db`／`cda607f`：
+
+1. 傳輸期間新 console 仍可被授予 human raw owner：root 隔離 RED 1 failed
+   （0.13s）。現在 manager 發佈 operation token 前先關 bridge admission，
+   POSIX／TCP 新 console 沿 line broker，human raw grant 留待 gate 重開。
+2. raw RX 通過檢查後、真正寫入前才關 gate，舊 bytes 仍會插入：root 以真
+   `send_bytes` 與 write lock、mock 最底層 `_write_all` 重現 RED 1 failed
+   （0.06s）。現在用 thread-local 內部身分標示 console raw 路徑，在 write→state
+   鎖序內重驗 gate，不以呼叫者可指定的 `source` 字串作權限判斷。
+
+被擋住的已接收 raw bytes 進 bounded deferred buffer，不靜默丟失；收尾在
+manager lock 內核對 operation／session／bridge／generation 並擷取回放資料，
+在 lock 外做 UART I/O，最後才依身分清 busy。已有 TCP human owner 但 manager
+尚無 lease 的情境亦有回放 assertion。原有 agent interactive 接管不排入 human
+pending；FLASHING 仍先丟棄輸入，不可改成延後回放。
+
+關鍵新 assertions（均在 `tests/test_refine_ownership.py`）：
+
+- `test_new_console_during_transfer_does_not_send_raw`、pull／command 對應案例及
+  `test_new_console_gate_reopens_after_operation_exception`。
+- `test_raw_write_rechecks_admission_at_actual_write`：關 gate 時零實際 write，
+  開 gate 後只回放一次。
+- `test_operation_finish_replays_raw_bytes_without_manager_lease`：真 write 邊界
+  回放一次，另一 thread 可取得 manager lock。
+- `test_interactive_command_replaces_existing_human_bridge_owner`：未啟動的真
+  UARTBridge 驗 agent owner replacement，不以缺 gate 的 fake bridge 自證。
+- Root 另增 `tests/test_refine_flash_precedence.py`：raw RX 快照後同時關 admission
+  並進入 FLASHING，驗證不寫入、不排 deferred、不得延後回放。
+
+worker 最終全套：1705 passed、16 skipped、44 subtests，93.42s；policy
+24 pass、0 fail、2 warn。Root 候選定向兩組：63 passed／6 subtests（2.66s）及
+65 passed／9 skipped／9 subtests（8.77s）；合併 ownership、CLI、holder 與 root
+FLASHING assertion 後定向 45 passed／2 subtests（0.42s）。完整整合結果另見
+[merge-summary](merge-summary.md)。Sol 的 ownership 審查由平台中止、Opus 受額度
+限制，這些測試與 root review 不代表已完成指定雙審。
+
+回歸歸屬：本輪已重現的排程／gate／回放缺陷可由 pytest、PTY／socketpair 與
+最底層 write 替身覆蓋，因此不新增實機 `regression/` case。真板、native Windows、
+長時 UART 背壓及外部 process 持有者仍需另外驗證，不以本輪離線綠燈代替。

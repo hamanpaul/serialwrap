@@ -18,6 +18,10 @@
 - **WHEN** raw owner 存在，secondary console 輸入 bytes 後換行
 - **THEN** 原始 bytes 不直接 TX，完整行只經 broker 提交。
 
+#### Scenario: 操作期間新 console
+- **WHEN** foreground command、file push 或 file pull 已取得 operation admission，新的 POSIX 或 TCP human console 加入
+- **THEN** console 可觀察輸出並沿 line-buffer broker 提交，但不能在操作期間取得 raw TX；操作成功或例外結束後依既有 lease、suspend 與 FLASHING 條件恢復 admission。原有 agent interactive owner 的授予語意不因新增 human gate 而改變。
+
 ### Requirement: recovery epoch 隔離
 系統 SHALL 以決定性測試驗證舊操作不寫新 bridge、也不清除新 epoch 的 busy 狀態；未被證實的其他生命週期界線明列而非宣稱全稱安全。
 

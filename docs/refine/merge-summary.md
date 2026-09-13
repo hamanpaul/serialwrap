@@ -2,6 +2,8 @@
 
 日期：2026-09-12。程式基準：`cf2aaba9004c18a82a6a5e4e0dcc66ea7211aeb1`。
 
+本檔保留 2026-09-12 方案盤點；最新實作與驗證見末段「2026-09-13 實作階段」。
+
 ## 交付範圍
 
 本輪交付為盤點、可執行方案與 #198 校正，未實作新診斷／reload／ownership gate。
@@ -49,7 +51,7 @@ Root review 結論：**處理方案 PASS**。錯誤引用、首批範圍及相�
 | 工作 | 原始候選 | 本地狀態／獨立驗證 |
 |---|---|---|
 | #166 transfer | 無 | Sonnet xhigh 啟動即 weekly limit；未改檔、未擅自換模型 |
-| Ownership | Luna max `6d946ec` | root 定向 83 passed；再現新 console 於 transfer 中途取得 raw owner，已交原 worker 修正，尚未整合 |
+| Ownership | Luna max `6d946ec` → `9ac9d12` | root 重現兩個 raw 競態並修正；定向 63 passed 及另一組 65 passed／9 skipped；整合為 `aa278db`／`cda607f`，指定雙審仍未完成 |
 | #171 CLI-only trace | Copilot gpt-5.4 xhigh `9b7ef46` → `59cd1f9` → `1c1d98d` | Sol xhigh 兩次指出 MAJOR 並修正後 PASS；root 定向 96 passed、2 subtests；整合為 `f962fb2`、`da6f85f`、`be35aeb` |
 | #199 holder stat | Antigravity gemini-3.8-flash-high／high `d6fc3f2` | Sol xhigh PASS；root holder/flash 90 passed、6 subtests；整合為 `ce16b92` |
 
@@ -62,3 +64,21 @@ Root 確認並處置的 CLI 缺陷：`daemon start` already-running 前置 probe
 審查限制：Opus xhigh 同樣受 weekly limit 阻擋；ownership 的 Sol 審查由平台中止，
 沒有有效裁決。未完成指定雙審，不宣稱全部 review PASS。
 此階段尚未 push、建立 PR、驗證 CI、merge 或安裝；#198 保持未完成。
+
+### Root 完整整合驗證
+
+production 整合基準 `cda607f`，另含 root 新增的 FLASHING/raw gate 交叉 assertion
+`tests/test_refine_flash_precedence.py`：
+
+- `python3 -m pytest -q tests/`：**1729 passed、16 skipped、46 subtests，95.03s，exit 0**；
+  沒有 live-guard FAIL／WARN／SKIP。先前 cancel fixture 的失敗未以 flaky 放行，已用
+  queued barrier／terminal poll 修正並納入此綠燈。
+- `openspec validate --all --strict`：**22 passed、0 failed**；未 archive 尚缺 #166 的變更。
+- 帶 main／feature refs 的 `policy_check`：**24 pass、0 fail、2 warn**；R-19／R-22
+  繼續列管，沒有設定豁免。這是本地 policy 檢查，不是具有 PR metadata 的 preflight
+  或遠端 CI／review 證據。
+- root 本輪已確認缺陷的處置與本地整合驗證通過；指定雙審、#166、PR／CI／merge
+  及安裝部署均未完成。#171 的 daemon logging、#182／#197 仍按分期追蹤。
+
+成果在隔離分支保留，可接續原計畫；Claude 指定模型額度不足時，不自行替換模型
+或把已完成的三路候選當成整張 #198 結案。

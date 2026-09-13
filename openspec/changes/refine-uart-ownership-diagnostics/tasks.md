@@ -5,8 +5,8 @@
 
 ## 2. Ownership
 
-- [ ] 2.1 正反例：stale ID、secondary console、reconnect grace、transfer contention、recovery epoch。
-- [ ] 2.2 修復重現競態並完成定向測試；未覆蓋界線列管。
+- [x] 2.1 正反例：stale ID、secondary console、reconnect grace、transfer contention、recovery epoch。
+- [x] 2.2 修復重現競態並完成定向測試；未覆蓋界線列管。
 
 ## 3. CLI trace
 
