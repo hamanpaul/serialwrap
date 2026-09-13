@@ -1026,6 +1026,18 @@ class SessionManager:
     def _reset_reprobe_progress_locked(self, session: SessionRuntime) -> None:
         session.reset_reprobe_progress()
 
+    @staticmethod
+    def _set_bridge_interactive_admission(
+        bridge: UARTBridge, allowed: bool
+    ) -> list[tuple[str, bytes]]:
+        """切換 bridge raw ownership gate；舊 fake bridge 沒有 seam 時維持相容。"""
+        setter = getattr(bridge, "_set_interactive_admission", None)
+        if callable(setter):
+            result = setter(allowed)
+            if isinstance(result, list):
+                return result
+        return []
+
     def _begin_foreground_operation_locked(
         self,
         session: SessionRuntime,
@@ -1050,6 +1062,9 @@ class SessionManager:
             bridge=bridge,
             bridge_generation=session.bridge_generation,
         )
+        # 先關 bridge raw grant，再發佈 manager operation token；如此 TCP accept
+        # 或 POSIX console attach 不會在 admission→實際 suspend 的窗口取得 raw。
+        self._set_bridge_interactive_admission(bridge, False)
         session._foreground_operation = operation
         session.foreground_busy = True
         session.fg_cmd_started_mono = time.monotonic()
@@ -1068,14 +1083,36 @@ class SessionManager:
         """
         if operation is None:
             return
-        with self._lock:
-            current = self._sessions.get(operation.session_id)
-            if current is not session or session._foreground_operation is not operation:
-                return
-            session._foreground_operation = None
-            session.foreground_busy = False
-            session.fg_cmd_started_mono = None
-            session.fg_cmd_expected_duration_s = None
+        flush_data: list[tuple[str, bytes]] = []
+        try:
+            with self._lock:
+                current = self._sessions.get(operation.session_id)
+                if (
+                    current is not session
+                    or session._foreground_operation is not operation
+                    or session.bridge is not operation.bridge
+                    or session.bridge_generation != operation.bridge_generation
+                ):
+                    return
+                # gate/owner 旗標與 deferred payload 在 manager lock 內擷取；真正 I/O
+                # 放在 lock 外，token 則留到 replay 完成後才清除，避免全域 manager lock
+                # 被背壓中的 UART write 卡住。
+                flush_data = self._set_bridge_interactive_admission(operation.bridge, True)
+            for source, payload in flush_data:
+                operation.bridge.send_bytes(payload, source=source, cmd_id=None)
+        finally:
+            with self._lock:
+                current = self._sessions.get(operation.session_id)
+                if (
+                    current is session
+                    and session._foreground_operation is operation
+                    and session.bridge is operation.bridge
+                    and session.bridge_generation == operation.bridge_generation
+                ):
+                    session._foreground_operation = None
+                    session.foreground_busy = False
+                    session.fg_cmd_started_mono = None
+                    session.fg_cmd_expected_duration_s = None
 
     # --- agent 顯式命令 gate（#139/#162）----------------------------------------
     def _agent_gate_reject_locked(self, session: SessionRuntime) -> dict[str, Any] | None:
@@ -3894,7 +3931,9 @@ class SessionManager:
                     timeout_s=max(session.profile.hard_timeout_s, _ATTACHED_CONSOLE_LEASE_TIMEOUT_S),
                 )
                 payload["interactive_session_id"] = lease.interactive_id
-                payload["interactive_owner"] = True
+                payload["interactive_owner"] = not (
+                    session.foreground_busy or session._foreground_operation is not None
+                )
             payload["session"] = session.to_public_dict()
             result = {"ok": True, **payload}
         post.execute()

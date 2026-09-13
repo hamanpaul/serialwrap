@@ -143,6 +143,10 @@ class UARTBridge:
         self._thread: threading.Thread | None = None
         self._write_lock = threading.Lock()
         self._state_lock = threading.RLock()
+        # 僅由 _handle_console_rx 傳入的 identity token；raw console gate 不以可偽造
+        # 的 source 字串判斷授權，且 send_bytes 會在實際 write 前重新驗證 admission。
+        self._console_raw_token = object()
+        self._console_raw_context = threading.local()
         self._rx_lock = threading.Lock()
         self._rx_text = ""
         self._rx_max_chars = 131072
@@ -163,6 +167,11 @@ class UARTBridge:
         self._preserved_consoles = preserved_consoles
         self._clients: dict[str, ConsoleClient] = {}
         self._interactive_owner: str | None = None
+        # SessionManager 的 foreground operation admission gate：操作一旦取得
+        # manager token，新的 raw owner 只能先排入 pending／line broker，不能繞過
+        # token 直接寫 UART。gate 開放後才提升 pending owner。
+        self._interactive_admission_blocked: bool = False
+        self._pending_interactive_owner: str | None = None
         self._agent_active: bool = False
         self._suspended_owner: str | None = None
         self._suspend_depth: int = 0  # suspend/resume 巢狀深度（#78 可重入）
@@ -298,6 +307,8 @@ class UARTBridge:
             self._clients = {}
             self._primary_client_id = None
             self._interactive_owner = None
+            self._interactive_admission_blocked = False
+            self._pending_interactive_owner = None
             self._suspended_owner = None
             self._agent_active = False
             self._suspend_depth = 0
@@ -386,7 +397,14 @@ class UARTBridge:
             # 時），期間輸入走既有 deferred 分支累積，resume 時無縫接手 raw 並 flush；
             # suspend 前已有 owner 者維持第二 console 的 line-buffer 行為。
             if self._interactive_owner is None and self._suspend_depth == 0:
-                self._interactive_owner = f"human:{client_id}"
+                owner = f"human:{client_id}"
+                if self._interactive_admission_blocked:
+                    # foreground operation 已 admission；保留首個 client，待 operation
+                    # 完成後再提升，期間輸入會走 line-buffer。
+                    if self._pending_interactive_owner is None:
+                        self._pending_interactive_owner = owner
+                else:
+                    self._interactive_owner = owner
             elif self._suspend_depth > 0 and self._suspended_owner is None:
                 self._suspended_owner = f"human:{client_id}"
 
@@ -491,6 +509,8 @@ class UARTBridge:
                 self._primary_client_id = next_client.client_id if next_client is not None else None
             if self._interactive_owner == f"human:{client_id}":
                 self._interactive_owner = None
+            if self._pending_interactive_owner == f"human:{client_id}":
+                self._pending_interactive_owner = None
             if self._suspended_owner == f"human:{client_id}":
                 # suspend 期間斷線的（未來）owner（#136 review）：讓位 _suspended_owner，
                 # 否則 resume 會把 ownership 還原成已不存在的 client，之後任何新連線都
@@ -746,15 +766,69 @@ class UARTBridge:
                 # 避免人類鍵入 / agent 注入汙染 flasher 的 SBL binary 串流（C2）。
                 return
             owner = self._interactive_owner
+            admission_blocked = getattr(self, "_interactive_admission_blocked", False)
             agent_active = self._agent_active
             suspended = self._suspended_owner
 
         if owner == f"human:{client.client_id}":
-            # 僅在真實 human owner 鍵入時記錄時間（#53），供 human_active 時間窗判定。
+            expected_owner = owner
+            send_raw = False
             with self._state_lock:
-                self._last_human_input_at = time.monotonic()
-            self.send_bytes(data, source=f"human:{client.client_id}", cmd_id=None)
-            return
+                # 重新核對 gate，堵住 RX 已快照 owner、manager 隨後 admission 的窗口。
+                owner_now = self._interactive_owner
+                blocked_now = getattr(self, "_interactive_admission_blocked", False)
+                if owner_now == expected_owner and not blocked_now:
+                    # 僅在真實 human owner 鍵入時記錄時間（#53），供 human_active 時間窗判定。
+                    self._last_human_input_at = time.monotonic()
+                    send_raw = True
+                elif owner_now == expected_owner and blocked_now:
+                    # operation admission 到 suspend_interactive() 之間也必須先 defer；
+                    # 否則既有 human owner 會在 lock 外 suspend 前繞過 foreground gate 直 TX。
+                    buf = self._deferred_buffers.get(client.client_id)
+                    if buf is None:
+                        buf = bytearray()
+                        self._deferred_buffers[client.client_id] = buf
+                    buf.extend(data)
+                    if len(buf) > DEFERRED_INPUT_MAX_BYTES:
+                        del buf[: len(buf) - DEFERRED_INPUT_MAX_BYTES]
+                    return
+                else:
+                    # owner 在 snapshot 後已改變（例如 suspend/close），以下重新走
+                    # line-buffer／deferred 分支，不得沿用舊 owner 直 TX。
+                    owner = owner_now
+                    admission_blocked = blocked_now
+                    agent_active = self._agent_active
+                    suspended = self._suspended_owner
+            if send_raw:
+                raw_context = getattr(self, "_console_raw_context", None)
+                previous_token = (
+                    getattr(raw_context, "token", None) if raw_context is not None else None
+                )
+                previous_client_id = (
+                    getattr(raw_context, "client_id", None) if raw_context is not None else None
+                )
+                if raw_context is not None:
+                    raw_context.token = getattr(self, "_console_raw_token", None)
+                    raw_context.client_id = client.client_id
+                try:
+                    self.send_bytes(data, source=expected_owner, cmd_id=None)
+                finally:
+                    if raw_context is not None:
+                        if previous_token is None:
+                            try:
+                                del raw_context.token
+                            except AttributeError:
+                                pass
+                        else:
+                            raw_context.token = previous_token
+                        if previous_client_id is None:
+                            try:
+                                del raw_context.client_id
+                            except AttributeError:
+                                pass
+                        else:
+                            raw_context.client_id = previous_client_id
+                return
 
         if agent_active and suspended == f"human:{client.client_id}":
             with self._state_lock:
@@ -869,12 +943,31 @@ class UARTBridge:
         # （#69 Finding 2 round2）：否則檢查與寫入之間若 flash 開啟，非 flash byte 仍會寫出汙染 SBL。
         with self._write_lock:
             with self._state_lock:
+                raw_context = getattr(self, "_console_raw_context", None)
+                raw_token = getattr(raw_context, "token", None)
                 if self._flash_mode and not _allow_during_flash:
                     # FLASHING 期間僅允許 flasher 自身寫入（內部能力 _allow_during_flash，僅 flash_tx 帶）；
                     # 丟棄其他所有來源（system probe / reconcile 自動重探 / self_test / agent / command 注入等），
                     # 防止競態下把 bytes 寫進燒錄中的 device、汙染 SBL binary 串流（C2，#69 Finding 1）。
                     # 注意：授權不綁使用者可控的 `source` 稽核字串（cmd submit 可帶任意 source），
                     # 否則 source="flash-..." 的命令會繞過此 gate（#69 Finding round3）。
+                    return
+                if (
+                    raw_token is not None
+                    and raw_token is getattr(self, "_console_raw_token", None)
+                    and getattr(self, "_interactive_admission_blocked", False)
+                ):
+                    # raw console send 的線性化點在 write lock 內、實際寫入前；
+                    # admission 若已關閉，改排入既有 deferred buffer，待 gate 開放後回放。
+                    client_id = getattr(raw_context, "client_id", None)
+                    if client_id:
+                        buf = self._deferred_buffers.get(client_id)
+                        if buf is None:
+                            buf = bytearray()
+                            self._deferred_buffers[client_id] = buf
+                        buf.extend(payload)
+                        if len(buf) > DEFERRED_INPUT_MAX_BYTES:
+                            del buf[: len(buf) - DEFERRED_INPUT_MAX_BYTES]
                     return
                 port = self._serial
                 serial_fd = self._serial_fd
@@ -1166,6 +1259,8 @@ class UARTBridge:
                 self._primary_client_id = next_client.client_id if next_client is not None else None
             if self._interactive_owner == f"human:{client_id}":
                 self._interactive_owner = None
+            if self._pending_interactive_owner == f"human:{client_id}":
+                self._pending_interactive_owner = None
             if self._suspended_owner == f"human:{client_id}":
                 # 被 suspend 的 human console 斷線：放棄整個 suspend 簿記（保護對象已消失），
                 # 後續未配對的 resume 因 depth 歸 0 成 no-op（#78）。
@@ -1205,9 +1300,55 @@ class UARTBridge:
         with self._state_lock:
             return client_id in self._clients
 
+    def _promote_pending_interactive_owner_locked(self) -> None:
+        """在 admission 開放且未 suspend 時提升待命 raw owner；呼叫者須持 state lock。"""
+        if (
+            getattr(self, "_interactive_admission_blocked", False)
+            or self._interactive_owner is not None
+            or self._suspend_depth > 0
+            or self._suspended_owner is not None
+        ):
+            return
+        pending = getattr(self, "_pending_interactive_owner", None)
+        if pending is None:
+            return
+        client_id = pending.split(":", 1)[1] if pending.startswith("human:") else ""
+        if not pending.startswith("human:"):
+            # interactive command 的 agent owner 沒有 console client；仍須保留
+            # bridge owner，避免 gate 開放後 TCP accept 誤把 human 當成 raw owner。
+            self._interactive_owner = pending
+        elif client_id and client_id in self._clients:
+            self._interactive_owner = pending
+        self._pending_interactive_owner = None
+
+    def _set_interactive_admission(self, allowed: bool) -> list[tuple[str, bytes]]:
+        """切換 foreground raw admission，回傳待在鎖外回放的 deferred payload。"""
+        flush_data: list[tuple[str, bytes]] = []
+        with self._state_lock:
+            self._interactive_admission_blocked = not allowed
+            if allowed:
+                self._promote_pending_interactive_owner_locked()
+                if self._suspend_depth == 0 and self._suspended_owner is None:
+                    for client_id, buf in self._deferred_buffers.items():
+                        if buf:
+                            flush_data.append((f"human:{client_id}", bytes(buf)))
+                    self._deferred_buffers.clear()
+        return flush_data
+
     def set_interactive_owner(self, owner: str | None) -> None:
         with self._state_lock:
+            # foreground admission 只攔 human raw grant；agent interactive owner
+            # 是既有 command lease 語意，不應因 gate 導致舊 human owner 被保留。
+            if (
+                owner is not None
+                and owner.startswith("human:")
+                and self._interactive_admission_blocked
+            ):
+                self._pending_interactive_owner = owner
+                return
             self._interactive_owner = owner
+            if owner is None:
+                self._pending_interactive_owner = None
 
     def suspend_interactive(self) -> None:
         """暫時掛起 human interactive ownership，切換到 deferred 模式。
@@ -1243,6 +1384,7 @@ class UARTBridge:
             self._interactive_owner = self._suspended_owner
             self._agent_active = False
             self._suspended_owner = None
+            self._promote_pending_interactive_owner_locked()
             for client_id, buf in self._deferred_buffers.items():
                 if buf:
                     flush_data.append((f"human:{client_id}", bytes(buf)))
@@ -1321,6 +1463,8 @@ class UARTBridge:
         with self._state_lock:
             if (
                 self._interactive_owner is None
+                and not self._interactive_admission_blocked
+                and self._pending_interactive_owner is None
                 and self._suspended_owner is None
                 and not self._agent_active
                 and not self._flash_mode
