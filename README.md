@@ -279,7 +279,24 @@ serialwrap file push --selector COM0 --local ./probe.sh --remote /tmp/probe.sh
 serialwrap file pull --selector COM0 --remote /etc/config/wireless --local ./wireless.bak
 ```
 
-The session must be `READY`, and the target must provide `base64` and `md5sum`.
+The session must be `READY`, and the target must provide `md5sum` plus a usable
+`base64` or OpenSSL encoder/decoder. Transfer probes verify actual output before
+choosing `base64` first or falling back to OpenSSL; command echo is not proof of
+tool availability. Missing tools return `TARGET_DECODER_MISSING` (push) or
+`TARGET_ENCODER_MISSING` (pull).
+
+For a console with a measured line limit, set `max_console_line_chars` on the
+profile template or target, for example `max_console_line_chars: 505`. The value
+is a positive integer counting the complete command's UTF-8 bytes, excluding its
+terminating newline; it is not a character-count or a platform default. Push
+caps the requested chunk size after allowing for Base64 expansion and shell
+overhead. Both directions also check probe, checksum, move and cleanup commands
+as applicable; a budget too small for required commands returns
+`CONSOLE_LINE_LIMIT_TOO_SMALL` before transmitting. An omitted template value
+or `null` leaves the existing chunk setting (default 512 raw bytes) uncapped.
+A target inherits an omitted value from its template; an explicit target `null`
+clears that limit. A measured limit is still required on affected boards;
+upgrading does not set every prpl console to 505.
 
 **Scope — small files only.** `file push` is meant for config files, scripts and
 probes (tens of KB). A UART at 115200 baud tops out around 11 KB/s raw, and the
@@ -290,8 +307,9 @@ control plane — `cmd submit` to trigger the board-side `scp`/`tftp`/`wget` and
 watch the result. Reach for `file push` on a large file only as an explicit
 fallback, after confirming the DUT has no network path at all, and record why.
 
-On consoles without flow control (`flow_control: none`), long chunk command
-lines get throttled and characters are silently dropped. `file push` therefore
+Long command lines may exceed a console's input limit; #166 separately confirmed
+missing Base64 tools and an approximately 505-byte limit on one prpl board.
+Increasing the timeout cannot repair truncation. `file push` nevertheless
 defaults to echo-ACK pacing (#161): each chunk line is sent in short slices,
 and the next slice goes out only after the target's echo confirms the previous
 one — the newline is sent only after the whole line is confirmed, so an echo
@@ -1696,11 +1714,13 @@ serialwrap file push --selector COM0 --local ./probe.sh --remote /tmp/probe.sh
 serialwrap file pull --selector COM0 --remote /etc/config/wireless --local ./wireless.bak
 ```
 
-傳輸完成後自動進行 md5 校驗。Session 必須處於 `READY` 狀態，target 需有 `base64` 與 `md5sum`。
+傳輸完成後自動進行 md5 校驗。Session 必須處於 `READY` 狀態，target 需有 `md5sum` 及可用的 `base64` 或 OpenSSL 編解碼器。傳輸前以實際輸出驗證工具，優先 `base64`、不可用時 fallback 至 OpenSSL；命令回顯不算工具可用的證據。全部不可用時，push 回 `TARGET_DECODER_MISSING`，pull 回 `TARGET_ENCODER_MISSING`。
+
+已量測 console 行長限制時，可在 profile template 或 target 設定，例如 `max_console_line_chars: 505`。值須為正整數，計算完整命令的 UTF-8 bytes（不含結尾換行），不是字元個數，也不是平台預設。Push 扣除 Base64 膨脹及 shell 開銷後限制要求的 chunk 大小；雙向傳輸也檢查各自的 probe、checksum、move、cleanup 等控制命令。預算容不下必要命令時，在任何 TX 前回 `CONSOLE_LINE_LIMIT_TOO_SMALL`。Template 省略或設 `null` 則不限制既有 chunk 設定（預設 512 raw bytes）；target 省略會繼承 template，明設 `null` 才清除該限制。受影響的板仍須依量測設定，升級不會把所有 prpl console 自動設成 505。
 
 **適用範圍＝小檔**。`file push` 針對設定檔、腳本、探針這類數十 KB 內的檔案。UART 115200 baud 的原始上限約 11 KB/s，再加上下述 echo-ACK 節流會更低——一顆 81 MB 的 firmware image 即使通道完全穩定也要數小時。只要 DUT 有 SSH／TFTP／HTTP 可達，大檔一律走 SCP／TFTP，serialwrap 只負責控制面（以 `cmd submit` 觸發板端的 `scp`／`tftp`／`wget` 並觀察結果）。大檔用 `file push` 只能是**確認 DUT 無任何網路通道後**的明確 fallback，並在紀錄裡說明原因。
 
-無流控 console（`flow_control: none`）上，長 chunk 命令行會被節流靜默掉字。故 `file push` 預設走 **echo-ACK 節流**（#161）：chunk 命令行拆成短 slice 逐段送出，每段等板端 echo 回讀確認才續送——換行在**全行確認後**才送出，因此 echo 停滯（`TRANSFER_ECHO_STALL`）時命令必未執行、可安全重試。`--ack-mode {auto,echo,none}` 控制此行為：`auto`（預設）＝bridge 支援即節流；`echo`＝強制節流；`none`＝維持 legacy 整行送出；其餘值一律 `INVALID_ARGS`（RPC 層**與** `push_file()` 模組入口各一道，避免未知模式靜默降級成無保護的整行送出）。取捨：節流犧牲吞吐——1MB push 約 10–17 分鐘；急件且鏈路確認有流控時可用 `--ack-mode none` 走快路徑。單一 slice 的 echo 等待逾時**下限 5s**，實際值依 profile `timeout_s` 推導（`max(profile.timeout_s, 5.0)`，比照 #157 `chunk_timeout_s` 的推導精神）——實機兩案都在第 8 個 slice（448/512 字元）確定性卡住，原本的 2.0s 對慢板偏緊、把「還在追」誤判成「停滯」。此值只約束**失敗路徑**的等待上限，echo 正常到達時立即返回、成功路徑吞吐不變。
+長命令可能超過 console 的輸入上限；#166 已分別確認工具缺失及一塊 prpl 板約 505-byte 的行長限制，增加 timeout 不能修復截斷。`file push` 仍預設走 **echo-ACK 節流**（#161）：chunk 命令行拆成短 slice 逐段送出，每段等板端 echo 回讀確認才續送——換行在**全行確認後**才送出，因此 echo 停滯（`TRANSFER_ECHO_STALL`）時該命令未執行、可安全重試。`--ack-mode {auto,echo,none}` 控制此行為：`auto`（預設）＝bridge 支援即節流；`echo`＝強制節流；`none`＝維持 legacy 整行送出；其餘值一律 `INVALID_ARGS`（RPC 層**與** `push_file()` 模組入口各一道，避免未知模式靜默降級成無保護的整行送出）。取捨：節流犧牲吞吐——1MB push 約 10–17 分鐘；急件且鏈路確認有流控時可用 `--ack-mode none` 走快路徑。單一 slice 的 echo 等待逾時**下限 5s**，實際值依 profile `timeout_s` 推導（`max(profile.timeout_s, 5.0)`，比照 #157 `chunk_timeout_s`）。此值只約束**失敗路徑**的等待上限，echo 正常到達時立即返回、成功路徑吞吐不變；不把加大 timeout 當成 #166 的修法。
 
 詳見設計文件：[`docs/design-file-transfer.md`](./docs/design-file-transfer.md)。
 

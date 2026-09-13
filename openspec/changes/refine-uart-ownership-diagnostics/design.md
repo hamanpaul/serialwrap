@@ -2,6 +2,8 @@
 
 基準 main cf2aaba；先前盤點位於 docs/refine。使用者已批准依 #198 範圍開工，實作者為 Sonnet xhigh、Luna max、Copilot gpt-5.4 xhigh、agy gemini-3.8-flash high；Opus xhigh 與 Sol xhigh 審查。所有工作在獨立分支，root 合併及實測。
 
+2026-09-13 接手更新：Sonnet xhigh 因週額度未開工的 #166，由使用者明確批准交予 Luna max。此批准不豁免指定審查或更動功能範圍。
+
 ## Goals / Non-Goals
 
 目標是四個可獨立驗收切片。非目標是 generic ACL、daemon logging、reload、公開 tunnel 部署、安裝或操作現有 UART。#171 全票、#182、#197 維持獨立待辦。

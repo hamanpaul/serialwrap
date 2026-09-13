@@ -1,7 +1,7 @@
 ## 1. 傳輸可攜性
 
-- [ ] 1.1 RED：decoder fallback／echo 假陽性／505-byte budget／過小預算。
-- [ ] 1.2 GREEN：雙向工具 fallback、profile budget、checksum 與 echo 安全網；regression 對齊。
+- [x] 1.1 RED：decoder fallback／echo 假陽性／505-byte budget／過小預算。
+- [x] 1.2 GREEN：雙向工具 fallback、profile budget、checksum 與 echo 安全網；regression 對齊。
 
 ## 2. Ownership
 
@@ -19,6 +19,6 @@
 
 ## 5. 整合交付
 
-- [ ] 5.1 Root 整合、雙語 README、完整 pytest、policy、回歸測試歸屬與成效記錄。
+- [x] 5.1 Root 整合、雙語 README、完整 pytest、policy、回歸測試歸屬與成效記錄。
 - [ ] 5.2 Opus 與 Sol 指定模型審查、逐條獨立驗證、修正後重審。
 - [ ] 5.3 OpenSpec archive、PR／CI／exact-head merge 驗證及 #198 結案證據對齊。

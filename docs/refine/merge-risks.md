@@ -23,8 +23,12 @@
   重現並修正，另補 deferred 回放、鎖外 I/O 與 FLASHING 優先驗證。可支持的範圍
   是本輪決定性操作序列；不外推外部 process、所有未盤點 callback、真板背壓或
   整個 recovery 生命週期的物理排他，詳見 [ownership 交付](198-ownership-delivery.md)。
-- #166 尚無實作：指定 Sonnet 額度不足；Opus 審查也未能執行。替換指定模型須由
-  使用者決定。Ownership Sol 審查遭平台中止亦未取得有效結果。
+- #166 已由使用者批准 Luna max 接手，經 Sol scoped 重審及 root 完整本地整合驗證；
+  Opus 審查仍因額度未能執行。Ownership Sol 審查遭平台中止亦未取得有效結果，
+  不把 Task 1 的 PASS 當成全案指定雙審完成。
+- #166 的設定須依板端量測；不因升級而自動為所有 prpl 設 505。僅本地受控 shell
+  驗證 OpenSSL 並不能證明 DUT 工具版本、line cap、長時 throughput 或真實 UART
+  都通過；既有 1MB pull 超過 RX 視窗的限制也未在此修復。
 - #182 reload 與 #197 Cloudflare 真 E2E 繼續分票追蹤，見
   [後續安排與成效量測界線](198-followup-validation.md)。本地候選尚未部署。
 - 回復方式：所有 production 候選仍留在獨立 feature/fix 分支；若否決，可不採納

@@ -50,7 +50,7 @@ Root review 結論：**處理方案 PASS**。錯誤引用、首批範圍及相�
 
 | 工作 | 原始候選 | 本地狀態／獨立驗證 |
 |---|---|---|
-| #166 transfer | 無 | Sonnet xhigh 啟動即 weekly limit；未改檔、未擅自換模型 |
+| #166 transfer | 使用者批准 Luna max 接手，`3b3c793` → `6fee966`／`ed8750e` | Sol scoped 重審 PASS；root 定向 130 passed／24 subtests，整合為 `5b1deee`／`04c54ec`／`d2d1a28`；最新整合驗證見末段 |
 | Ownership | Luna max `6d946ec` → `9ac9d12` | root 重現兩個 raw 競態並修正；定向 63 passed 及另一組 65 passed／9 skipped；整合為 `aa278db`／`cda607f`，指定雙審仍未完成 |
 | #171 CLI-only trace | Copilot gpt-5.4 xhigh `9b7ef46` → `59cd1f9` → `1c1d98d` | Sol xhigh 兩次指出 MAJOR 並修正後 PASS；root 定向 96 passed、2 subtests；整合為 `f962fb2`、`da6f85f`、`be35aeb` |
 | #199 holder stat | Antigravity gemini-3.8-flash-high／high `d6fc3f2` | Sol xhigh PASS；root holder/flash 90 passed、6 subtests；整合為 `ce16b92` |
@@ -65,7 +65,7 @@ Root 確認並處置的 CLI 缺陷：`daemon start` already-running 前置 probe
 沒有有效裁決。未完成指定雙審，不宣稱全部 review PASS。
 此階段尚未 push、建立 PR、驗證 CI、merge 或安裝；#198 保持未完成。
 
-### Root 完整整合驗證
+### Root 完整整合驗證（#166 接手前的歷史基準）
 
 production 整合基準 `cda607f`，另含 root 新增的 FLASHING/raw gate 交叉 assertion
 `tests/test_refine_flash_precedence.py`：
@@ -82,3 +82,44 @@ production 整合基準 `cda607f`，另含 root 新增的 FLASHING/raw gate 交�
 
 成果在隔離分支保留，可接續原計畫；Claude 指定模型額度不足時，不自行替換模型
 或把已完成的三路候選當成整張 #198 結案。
+
+### #166 Luna 接手更新
+
+使用者明確批准 Luna max 接替尚未開工的 Sonnet；不豁免 Opus／Sol 審查要求。
+初版候選 `3b3c79310426dc6fe3959e73c2705bf555af8117` 與兩個修正 commit 已保留在
+`fix/166-transfer-portability`，最新 HEAD `ed8750ef7acb450b1fb97c6d15a4bab9a190f146`。
+Root 先確認實際 OpenSSL `-A` 解碼、marker 換行、
+md5sum 檔名碰撞及 profile 物化問題的修正；定向 116 passed／16 subtests。
+受控 shell 不等同真板，且上述 1729 passed 的整合基準不涵蓋此新候選。
+
+Sol 首輪 spec/quality FAIL 的 3 個 MAJOR（預檢記憶體配置放大、pull 負向缺測、
+target override/null 缺測）均交原 Luna 修正；root 另採納 GNU md5sum 反斜線格式
+回歸及 partial-output encoder 失敗辨識為同輪修復。配置放大由 root 有界重現：
+1-byte 檔案曾先配置 749,913 bytes 作預檢，不以「最後 checksum 正確」放行資源問題。
+
+fix1 全套曾出現 event counter 測試紅燈，未以單跑通過豁免：原 fixture 將 handler
+marker 存在當成 counter 儲存完成，實際時序為 handler 結束後才寫 counter。
+額外 `ed8750e` 只加入 dispatcher 完成等待並保留原正反斷言，不改 event production；
+重跑完整 `1713 passed, 16 skipped, 60 subtests, 96.88s`。此為 worker 結果，
+Sol scoped 重審已逐項 ADDRESSED、spec/quality PASS，另執行具名 10 cases 通過。
+
+### Luna 接手後的 root 最終本地驗證
+
+以 governed 模式納入三個 commit，沒有文字衝突；逐 hunk 核對 manager 僅新增設定
+傳遞，既有 operation admission／identity cleanup 保留。Production 基準 `d2d1a28`，
+另含 root 的 `tests/test_refine_transfer_integration.py` 5 個交叉測試與文件同步。
+
+- 整合定向：**61 passed、16 subtests，1.22s**；驗 0-TX 過小預算、UTF-8 路徑、probe
+  期間 competing transfer 拒絕、OpenSSL-only 在 505-byte 預算下的多 chunk／空檔傳輸。
+- 完整 `python3 -m pytest -q tests/`：**1763 passed、16 skipped、62 subtests，99.94s，exit 0**；
+  live guard 未回報異常。
+- `openspec validate --all --strict`：**22 passed、0 failed**。
+- `python3 -m policy_check --repo . --pr-base-ref main --pr-head-ref feature/198-refine-delivery`：
+  **24 pass、0 fail、2 warn**。Worker `fix/` 的 R-12 問題在真正 `feature/` 整合分支
+  驗為 PASS；R-19 gate 解析與 R-22 的 118 既有引用提醒仍列管，沒有豁免。
+- 雙語 README 說明 target 省略繼承、explicit null 清除；F7 兩 case 已掛 #166 並保留
+  真板後續驗證，不把本機 shell 或歷史 SKIP 當成實機轉綠。
+
+Root 對 **Task 1 修正及本地整合驗證判定 PASS**；這不是 #198 全部指定審查完成。
+Opus xhigh 仍受週額度限制，ownership Sol 仍缺有效裁決；未重派該平台中止審查。
+因此 OpenSpec 5.2／5.3 保持未完成，未 archive、push、PR、CI、merge、安裝或重啟服務。

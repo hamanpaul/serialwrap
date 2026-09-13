@@ -52,7 +52,8 @@ probe 282 bytes、encoder probe 273 bytes；空資料 chunk 為 base64 100 bytes
 因此 `max_console_line_chars: 505` 會自動縮小使用者指定的 `chunk_size`；若 probe、固定
 命令或空 chunk 都放不進預算，會回傳 `CONSOLE_LINE_LIMIT_TOO_SMALL` 且不送出資料命令。
 以上述代表路徑計算，最長 OpenSSL append 樣板為 116 bytes，505 budget 的保守 raw
-上限為 `(505 - 116) // 4 * 3 = 291` bytes；更長的實際路徑會再依完整命令縮小。
+上限為 `(505 - 116) // 4 * 3 = 291` bytes。目前資料 chunk 使用固定長度的暫存名稱，
+目的路徑較長只影響完整 mv 等控制命令的預算檢查，不會再依目的路徑縮小 chunk。
 `0` 或其他無效值不是合法的「小預算」，會在 profile 解析時拒絕。
 
 ## 回歸範圍與未驗證項
