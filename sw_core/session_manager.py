@@ -1839,7 +1839,8 @@ class SessionManager:
         except OSError:
             target = real_path
         try:
-            target_rdev = os.stat(real_path).st_rdev
+            target_res = os.stat(real_path)
+            target_rdev = getattr(target_res, "st_rdev", 0)
         except OSError:
             target_rdev = 0
         holders: set[int] = set()
@@ -1869,7 +1870,8 @@ class SessionManager:
                 # 比對同一個 char device，避免漏判導致 attach 誤判可收回、重回 two-reader race。
                 if not matched and target_rdev:
                     try:
-                        if os.stat(fd_path).st_rdev == target_rdev:
+                        fd_res = os.stat(fd_path)
+                        if getattr(fd_res, "st_rdev", 0) == target_rdev:
                             matched = True
                     except OSError:
                         pass
