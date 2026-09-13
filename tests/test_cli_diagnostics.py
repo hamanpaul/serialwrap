@@ -1,0 +1,383 @@
+"""#171：CLI RPC trace 最小診斷事件。
+
+驗收重點：
+1. 預設 stdout/stderr 契約不變；`-v` 或有效 `SERIALWRAP_LOG_LEVEL` 才輸出 trace。
+2. trace 只含白名單欄位，且 method / endpoint source 反映當次實際 RPC。
+3. errno 只取最後一次主請求 attempt；retry 後 success 與 TIMEOUT enrich 不得殘留 errno。
+4. trace logger 與 root/serialwrap logger 隔離，重複呼叫 `main()` 不得重複掛 handler 或殘留 verbosity。
+"""
+from __future__ import annotations
+
+import errno
+import io
+import json
+import logging
+import os
+import re
+import socket
+import tempfile
+import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from typing import Any
+from unittest import mock
+
+import sw_core.client as client
+from sw_core import cli
+
+
+TRACE_KEYS = {
+    "endpoint_transport",
+    "endpoint_id",
+    "endpoint_source",
+    "method",
+    "elapsed_ms",
+    "error_code",
+    "errno",
+    "errno_name",
+    "retry_count",
+    "timeout_s",
+}
+
+
+class _TcpReplySocket:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self._response = json.dumps(payload).encode("utf-8") + b"\n"
+        self.timeout: float | None = None
+        self.sent: list[bytes] = []
+        self.closed = False
+
+    def settimeout(self, timeout_s: float) -> None:
+        self.timeout = timeout_s
+
+    def sendall(self, payload: bytes) -> None:
+        self.sent.append(payload)
+
+    def recv(self, _size: int) -> bytes:
+        if self._response is None:
+            return b""
+        response, self._response = self._response, None
+        return response
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class CliDiagnosticsMixin:
+    def _invoke_main(
+        self,
+        argv: list[str],
+        *,
+        env: dict[str, str] | None = None,
+    ) -> tuple[int, str, str]:
+        out = io.StringIO()
+        err = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, env or {}, clear=False),
+            redirect_stdout(out),
+            redirect_stderr(err),
+        ):
+            rc = cli.main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def _stderr_json_lines(self, stderr_text: str) -> list[dict[str, Any]]:
+        traces: list[dict[str, Any]] = []
+        for raw_line in stderr_text.splitlines():
+            line = raw_line.strip()
+            if not line.startswith("{"):
+                continue
+            traces.append(json.loads(line))
+        return traces
+
+    def _assert_trace_shape(self, trace: dict[str, Any]) -> None:
+        self.assertEqual(set(trace), TRACE_KEYS)
+        self.assertIsInstance(trace["elapsed_ms"], int)
+        self.assertGreaterEqual(trace["elapsed_ms"], 0)
+
+    def _assert_sha256_hex(self, value: str) -> None:
+        self.assertRegex(value, r"^[0-9a-f]{64}$")
+
+
+class TestCliTraceOutput(CliDiagnosticsMixin, unittest.TestCase):
+    def test_default_stdout_stderr_bytes_remain_unchanged(self) -> None:
+        with mock.patch(
+            "sw_core.cli.rpc_call",
+            return_value={"ok": True, "sessions": []},
+        ):
+            rc, out, err = self._invoke_main(["session", "list"])
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, '{"ok":true,"sessions":[]}\n')
+        self.assertEqual(err, "")
+
+    def test_verbose_emits_single_trace_and_next_main_resets_to_quiet(self) -> None:
+        with mock.patch(
+            "sw_core.cli.rpc_call",
+            return_value={"ok": True, "sessions": []},
+        ):
+            rc1, out1, err1 = self._invoke_main(["-v", "session", "list"])
+            rc2, out2, err2 = self._invoke_main(["session", "list"])
+
+        self.assertEqual((rc1, out1), (0, '{"ok":true,"sessions":[]}\n'))
+        self.assertEqual((rc2, out2, err2), (0, '{"ok":true,"sessions":[]}\n', ""))
+
+        traces = self._stderr_json_lines(err1)
+        self.assertEqual(len(traces), 1)
+        self._assert_trace_shape(traces[0])
+        self.assertEqual(traces[0]["method"], "session.list")
+        self.assertEqual(traces[0]["endpoint_source"], "default")
+        logger = logging.getLogger("serialwrap.cli_trace")
+        self.assertFalse(logger.propagate)
+        self.assertEqual(
+            sum(bool(getattr(handler, "_serialwrap_cli_trace_handler", False)) for handler in logger.handlers),
+            1,
+        )
+
+    def test_env_log_level_controls_trace_and_verbose_overrides_env(self) -> None:
+        with mock.patch(
+            "sw_core.cli.rpc_call",
+            return_value={"ok": True, "sessions": []},
+        ):
+            rc_info, _out_info, err_info = self._invoke_main(
+                ["session", "list"],
+                env={"SERIALWRAP_LOG_LEVEL": "INFO"},
+            )
+            rc_invalid, _out_invalid, err_invalid = self._invoke_main(
+                ["session", "list"],
+                env={"SERIALWRAP_LOG_LEVEL": "NOT_A_LEVEL"},
+            )
+            rc_override, _out_override, err_override = self._invoke_main(
+                ["-v", "session", "list"],
+                env={"SERIALWRAP_LOG_LEVEL": "ERROR"},
+            )
+
+        self.assertEqual(rc_info, 0)
+        self.assertEqual(len(self._stderr_json_lines(err_info)), 1)
+        self.assertEqual(rc_invalid, 0)
+        self.assertEqual(self._stderr_json_lines(err_invalid), [])
+        self.assertEqual(rc_override, 0)
+        self.assertEqual(len(self._stderr_json_lines(err_override)), 1)
+
+    def test_config_fallback_trace_uses_single_resolution_without_extra_probe(self) -> None:
+        fake_rc = mock.Mock()
+        fake_rc.socket_path.return_value = "/tmp/sw171-config.sock"
+        fake_rc.mode.return_value = "systemd-system"
+        with (
+            mock.patch("sw_core.cli._default_runtime_config", return_value=fake_rc),
+            mock.patch(
+                "sw_core.cli._endpoint_alive",
+                side_effect=lambda endpoint: endpoint == cli.SYSTEM_SOCKET,
+            ) as endpoint_alive,
+            mock.patch(
+                "sw_core.cli.rpc_call",
+                return_value={"ok": True, "sessions": []},
+            ),
+        ):
+            rc, _out, err = self._invoke_main(["-v", "session", "list"])
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            [call.args[0] for call in endpoint_alive.call_args_list],
+            ["/tmp/sw171-config.sock", cli.SYSTEM_SOCKET],
+        )
+        traces = self._stderr_json_lines(err)
+        self.assertEqual(len(traces), 1)
+        trace = traces[0]
+        self._assert_trace_shape(trace)
+        self.assertEqual(trace["endpoint_transport"], "unix")
+        self.assertEqual(trace["endpoint_source"], "config.yaml -> canonical fallback")
+        self._assert_sha256_hex(trace["endpoint_id"])
+
+    def test_event_rule_set_trace_uses_actual_method_and_hides_params(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            rule_path = os.path.join(td, "rule.json")
+            with open(rule_path, "w", encoding="utf-8") as fp:
+                json.dump(
+                    {
+                        "rule_id": "sw171-rule",
+                        "selector": "COM0",
+                        "secret": "top-secret-token",
+                        "command": "echo should-not-leak",
+                    },
+                    fp,
+                )
+            with mock.patch(
+                "sw_core.cli.rpc_call",
+                return_value={"ok": True, "saved": True},
+            ):
+                rc, _out, err = self._invoke_main(
+                    ["-v", "--socket", "/tmp/sw171-event.sock", "event", "add", "--file", rule_path]
+                )
+
+        self.assertEqual(rc, 0)
+        traces = self._stderr_json_lines(err)
+        self.assertEqual(len(traces), 1)
+        trace = traces[0]
+        self._assert_trace_shape(trace)
+        self.assertEqual(trace["method"], "event.rule_set")
+        self.assertEqual(trace["endpoint_source"], "--socket")
+        self.assertEqual(trace["endpoint_transport"], "unix")
+        self._assert_sha256_hex(trace["endpoint_id"])
+        trace_text = json.dumps(trace, ensure_ascii=False, separators=(",", ":"))
+        self.assertNotIn("top-secret-token", trace_text)
+        self.assertNotIn("echo should-not-leak", trace_text)
+        self.assertNotIn("sw171-rule", trace_text)
+        self.assertNotIn("/tmp/sw171-event.sock", trace_text)
+
+
+@unittest.skipUnless(hasattr(socket, "AF_UNIX"), "需 AF_UNIX（原生 Windows 無此屬性）")
+class TestCliTraceErrno(CliDiagnosticsMixin, unittest.TestCase):
+    def test_missing_unix_socket_records_enoent(self) -> None:
+        missing = "/tmp/sw171-cli-trace-missing.sock"
+        rc, out, err = self._invoke_main(["-v", "--socket", missing, "session", "list"])
+
+        self.assertEqual(rc, 2)
+        self.assertEqual(json.loads(out)["error_code"], "SOCKET_ERROR")
+        traces = self._stderr_json_lines(err)
+        self.assertEqual(len(traces), 1)
+        trace = traces[0]
+        self._assert_trace_shape(trace)
+        self.assertEqual(trace["error_code"], "SOCKET_ERROR")
+        self.assertEqual(trace["errno"], errno.ENOENT)
+        self.assertEqual(trace["errno_name"], "ENOENT")
+        self.assertEqual(trace["endpoint_transport"], "unix")
+        self.assertEqual(trace["endpoint_source"], "--socket")
+        self._assert_sha256_hex(trace["endpoint_id"])
+
+    def test_unix_permission_error_records_eacces(self) -> None:
+        fake_sock = mock.MagicMock()
+        fake_sock.connect.side_effect = PermissionError(errno.EACCES, "Permission denied")
+        with mock.patch("sw_core.client.socket.socket", return_value=fake_sock):
+            rc, out, err = self._invoke_main(
+                ["-v", "--socket", "/tmp/sw171-no-access.sock", "session", "list"]
+            )
+
+        self.assertEqual(rc, 2)
+        self.assertEqual(json.loads(out)["error_code"], "SOCKET_ERROR")
+        traces = self._stderr_json_lines(err)
+        self.assertEqual(len(traces), 1)
+        trace = traces[0]
+        self.assertEqual(trace["errno"], errno.EACCES)
+        self.assertEqual(trace["errno_name"], "EACCES")
+
+    def test_timeout_enrich_socket_error_does_not_pollute_main_errno(self) -> None:
+        def fake_once(
+            _endpoint: str,
+            method: str,
+            _params: dict[str, Any],
+            *,
+            req_id: int = 1,
+            timeout_s: float = 5.0,
+        ) -> dict[str, Any]:
+            del req_id, timeout_s
+            if method == "session.recover":
+                return {"ok": False, "error_code": "TIMEOUT"}
+            if method == "health.ping":
+                return {"ok": False, "error_code": "SOCKET_ERROR", "message": "[Errno 111] refused"}
+            raise AssertionError(f"unexpected method {method}")
+
+        with mock.patch.object(client, "_rpc_call_once", side_effect=fake_once):
+            rc, out, err = self._invoke_main(
+                ["-v", "session", "recover", "--selector", "COM0"]
+            )
+
+        self.assertEqual(rc, 2)
+        self.assertEqual(json.loads(out)["error_code"], "TIMEOUT")
+        traces = self._stderr_json_lines(err)
+        self.assertEqual(len(traces), 1)
+        trace = traces[0]
+        self.assertEqual(trace["error_code"], "TIMEOUT")
+        self.assertIsNone(trace["errno"])
+        self.assertIsNone(trace["errno_name"])
+
+
+class TestCliTraceTcpAndRetry(CliDiagnosticsMixin, unittest.TestCase):
+    def test_loopback_tcp_connection_refused_keeps_visible_host_port(self) -> None:
+        with mock.patch(
+            "sw_core.client.socket.create_connection",
+            side_effect=ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused"),
+        ):
+            rc, out, err = self._invoke_main(
+                ["-v", "--endpoint", "tcp://127.0.0.1:48700", "session", "list"]
+            )
+
+        self.assertEqual(rc, 2)
+        self.assertEqual(json.loads(out)["error_code"], "SOCKET_ERROR")
+        traces = self._stderr_json_lines(err)
+        self.assertEqual(len(traces), 1)
+        trace = traces[0]
+        self._assert_trace_shape(trace)
+        self.assertEqual(trace["endpoint_transport"], "tcp")
+        self.assertEqual(trace["endpoint_id"], "127.0.0.1:48700")
+        self.assertEqual(trace["errno"], errno.ECONNREFUSED)
+        self.assertEqual(trace["errno_name"], "ECONNREFUSED")
+
+    def test_retry_success_clears_errno_and_reports_retry_count(self) -> None:
+        reply_sock = _TcpReplySocket({"ok": True, "sessions": []})
+        with (
+            mock.patch(
+                "sw_core.client.socket.create_connection",
+                side_effect=[
+                    ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused"),
+                    reply_sock,
+                ],
+            ),
+            mock.patch("sw_core.client.time.sleep"),
+        ):
+            rc, out, err = self._invoke_main(
+                [
+                    "-v",
+                    "--endpoint",
+                    "tcp://127.0.0.1:48700",
+                    "--retries",
+                    "1",
+                    "session",
+                    "list",
+                ]
+            )
+
+        self.assertEqual(rc, 0)
+        self.assertTrue(json.loads(out)["ok"])
+        traces = self._stderr_json_lines(err)
+        self.assertEqual(len(traces), 1)
+        trace = traces[0]
+        self._assert_trace_shape(trace)
+        self.assertIsNone(trace["error_code"])
+        self.assertEqual(trace["retry_count"], 1)
+        self.assertIsNone(trace["errno"])
+        self.assertIsNone(trace["errno_name"])
+
+
+class TestCliTraceLoggerIsolation(CliDiagnosticsMixin, unittest.TestCase):
+    def test_trace_logger_does_not_propagate_to_root_or_serialwrap_logger(self) -> None:
+        root_stream = io.StringIO()
+        serialwrap_stream = io.StringIO()
+        root_handler = logging.StreamHandler(root_stream)
+        serialwrap_handler = logging.StreamHandler(serialwrap_stream)
+        root_logger = logging.getLogger()
+        serialwrap_logger = logging.getLogger("serialwrap")
+        old_root_level = root_logger.level
+        old_serialwrap_level = serialwrap_logger.level
+        root_logger.addHandler(root_handler)
+        serialwrap_logger.addHandler(serialwrap_handler)
+        root_logger.setLevel(logging.INFO)
+        serialwrap_logger.setLevel(logging.INFO)
+        try:
+            with mock.patch(
+                "sw_core.cli.rpc_call",
+                return_value={"ok": True, "sessions": []},
+            ):
+                rc, _out, err = self._invoke_main(["-v", "session", "list"])
+        finally:
+            root_logger.removeHandler(root_handler)
+            serialwrap_logger.removeHandler(serialwrap_handler)
+            root_logger.setLevel(old_root_level)
+            serialwrap_logger.setLevel(old_serialwrap_level)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self._stderr_json_lines(err)), 1)
+        self.assertEqual(root_stream.getvalue(), "")
+        self.assertEqual(serialwrap_stream.getvalue(), "")
+
+
+if __name__ == "__main__":
+    unittest.main()

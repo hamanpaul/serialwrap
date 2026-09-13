@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import errno as errno_mod
 import json
 import socket
+import threading
 import time
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -56,6 +59,18 @@ _PROBE_DEADLINE_S = 2.5
 
 # 探測方法自身逾時不再遞迴探測（也避免 doctor 等 0.5s ping 逾時被探測拖慢）。
 _PROBE_METHODS = ("health.ping", "health.status")
+
+_RPC_TRACE_STATE = threading.local()
+
+
+def _set_last_attempt_errno(value: int | None) -> None:
+    _RPC_TRACE_STATE.last_attempt_errno = value
+
+
+def _take_last_attempt_errno() -> int | None:
+    value = getattr(_RPC_TRACE_STATE, "last_attempt_errno", None)
+    _RPC_TRACE_STATE.last_attempt_errno = None
+    return value if isinstance(value, int) else None
 
 
 def _parse_endpoint(endpoint: str) -> tuple[str, tuple[str, int] | str]:
@@ -112,6 +127,7 @@ def rpc_call(
     req_id: int = 1,
     timeout_s: float = 5.0,
     retries: int = 0,
+    trace_sink: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """執行 RPC 呼叫（#123 起附 TIMEOUT enrich 與唯讀 retry）。
 
@@ -138,18 +154,35 @@ def rpc_call(
     既有欄位不動（additive），呼叫端可據此分辨「daemon 死了／斷線」與
     「daemon 活著但長操作還在跑」。
     """
+    started_at = time.monotonic()
     attempts = 1 + max(0, int(retries)) if method in RETRYABLE_READONLY_METHODS else 1
     delay_s = _RETRY_BACKOFF_BASE_S
     resp: dict[str, Any] = {"ok": False, "error_code": "TIMEOUT"}
+    retry_count = 0
+    last_main_attempt_errno: int | None = None
     for attempt in range(attempts):
         resp = _rpc_call_once(socket_path, method, params, req_id=req_id, timeout_s=timeout_s)
+        last_main_attempt_errno = _take_last_attempt_errno()
         if resp.get("ok") or resp.get("error_code") not in _RETRYABLE_TRANSIENT_ERROR_CODES:
+            retry_count = attempt
             break
         if attempt + 1 < attempts:
+            retry_count = attempt + 1
             time.sleep(min(delay_s, _RETRY_BACKOFF_MAX_S))
             delay_s *= 2
     if not resp.get("ok") and resp.get("error_code") == "TIMEOUT" and method not in _PROBE_METHODS:
         resp.update(_probe_daemon_after_timeout(socket_path))
+    if trace_sink is not None:
+        trace_sink({
+            "elapsed_ms": max(0, int((time.monotonic() - started_at) * 1000)),
+            "retry_count": retry_count,
+            "errno": last_main_attempt_errno,
+            "errno_name": (
+                errno_mod.errorcode.get(last_main_attempt_errno)
+                if last_main_attempt_errno is not None
+                else None
+            ),
+        })
     return resp
 
 
@@ -187,6 +220,7 @@ def _probe_daemon_after_timeout(endpoint: str) -> dict[str, Any]:
 
 def _rpc_call_once(socket_path: str, method: str, params: dict[str, Any], *, req_id: int = 1, timeout_s: float = 5.0) -> dict[str, Any]:
     """單發 RPC 呼叫（無 retry、無 TIMEOUT enrich；#123 由 ``rpc_call`` 包裝）。"""
+    _set_last_attempt_errno(None)
     try:
         transport, address = _parse_endpoint(socket_path)
     except ValueError as exc:
@@ -209,6 +243,7 @@ def _rpc_call_once(socket_path: str, method: str, params: dict[str, Any], *, req
     except socket.timeout:
         return {"ok": False, "error_code": "TIMEOUT"}
     except OSError as exc:
+        _set_last_attempt_errno(exc.errno if isinstance(exc.errno, int) else None)
         return {"ok": False, "error_code": "SOCKET_ERROR", "message": str(exc)}
 
     try:
@@ -232,6 +267,7 @@ def _rpc_call_once(socket_path: str, method: str, params: dict[str, Any], *, req
     except socket.timeout:
         return {"ok": False, "error_code": "TIMEOUT"}
     except OSError as exc:
+        _set_last_attempt_errno(exc.errno if isinstance(exc.errno, int) else None)
         return {"ok": False, "error_code": "SOCKET_ERROR", "message": str(exc)}
     finally:
         sock.close()
