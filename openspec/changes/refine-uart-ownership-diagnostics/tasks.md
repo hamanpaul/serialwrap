@@ -10,12 +10,12 @@
 
 ## 3. CLI trace
 
-- [ ] 3.1 RED：相容性、白名單、last-attempt errno、來源一致及無額外 RPC。
-- [ ] 3.2 GREEN：單次解析 metadata、trace logger、全 CLI RPC 路徑及文件。
+- [x] 3.1 RED：相容性、白名單、last-attempt errno、來源一致及無額外 RPC。
+- [x] 3.2 GREEN：單次解析 metadata、trace logger、全 CLI RPC 路徑及文件。
 
 ## 4. Holder 可攜性
 
-- [ ] 4.1 RED/GREEN：兩處缺 st_rdev、正常 rdev、path-match、無 /proc。
+- [x] 4.1 RED/GREEN：兩處缺 st_rdev、正常 rdev、path-match、無 /proc。
 
 ## 5. 整合交付
 

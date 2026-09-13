@@ -30,6 +30,19 @@ python3 -m pytest -q tests/test_profile_reresolve_on_attach.py tests/test_profil
 
 ## 成效記錄與量測限制
 
+### CLI trace 候選的額外重播
+
+root 對 CLI trace 候選 `9b7ef46` 與原 main `cf2aaba`，各做 5 次「新建暫存目錄中不存在的 Unix socket」操作；候選分別測 quiet 與 verbose，共 15 次 CLI subprocess。每次都是 `session list`，顯式指定不存在的 socket，不觸 production endpoint。5/5 quiet 的 exit/stdout/stderr 逐字等同 baseline；5/5 verbose 的 exit/stdout 不變，stderr 保留既有 error line 並只多 1 筆 trace。
+
+trace assertion：來源 `--socket`、method `session.list`、error `SOCKET_ERROR`、errno `2/ENOENT`、retry_count `0`、endpoint 為 64 字元雜湊且無原始 path/basename。整個 CLI wall time：baseline 48.954–56.929 ms、quiet 50.679–54.548 ms、verbose 54.908–60.108 ms；trace 內部 RPC elapsed 以整數毫秒表示，本例為 0。這是單機短跑、包含 Python 啟動與排程雜訊，不據此主張 logging overhead 的穩定上限或人工定位收益。
+
+CLI 修正兩輪並通過 Sol 聚焦重審後，root 對整合候選 `be35aeb` 與 main
+`cf2aaba` 重做同等 15 次 subprocess 驗證：**PASS**。5/5 quiet 的
+exit/stdout/stderr 逐字相同，5/5 verbose 維持 exit/stdout 與既有 stderr 錯誤，
+並符合上述單筆 trace assertions。這輪 wall time：baseline 49.713–54.286 ms、
+quiet 51.327–69.141 ms、verbose 53.135–65.333 ms；差異未排除排程雜訊。
+本次為本地候選的 CLI 驗證，仍不是 installed runtime／真實 daemon／UART 證據。
+
 | 指標 | 本輪可確認值／狀態 | 真實 pilot 必須另外記錄 |
 |---|---|---|
 | 故障定位時間 | 92 個離線回歸 assertion 在 0.80s 收斂；尚無受測 operator 對照定位時間 | 從首次失敗至正確分類的單調時間，不能用 CLI duration 取代 |

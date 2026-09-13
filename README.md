@@ -539,6 +539,15 @@ no caller action required:
 
 ### Logs and Evidence
 
+For CLI-only RPC diagnostics, run `serialwrap -v session list` (`-vv` selects
+DEBUG), or set `SERIALWRAP_LOG_LEVEL=INFO` when no verbosity flag is given.
+The dedicated stderr trace reports endpoint source, method, duration, last-request
+errno and existing retry count; stdout JSON and default quiet output stay unchanged.
+Unix paths and non-loopback TCP endpoints are hashed; trace excludes command,
+parameters, response bodies and UART payload. Existing error messages are unchanged
+and may still contain paths. Enabling trace adds no RPC, probe or retry; it is not
+daemon file logging. See the [CLI trace contract](docs/refine/198-cli-trace-delivery.md).
+
 Default output paths:
 
 | File | Purpose |
@@ -1921,6 +1930,13 @@ DUT 重開機時，U-Boot 的「`Hit any key to stop autoboot`」倒數窗只要
 - **卡 bootloader 的可診斷終態（#162）**：readiness probe 失敗且 RX tail 尾行命中 bootloader prompt 時，session 的 `last_error` 改為 `BOOTLOADER_STUCK`、停止無效重探，`session self-test` 與 `session recover` 回 `classification: "BOOTLOADER"` ＋ `recommended_action: "recover_interactive"`——取代舊版「第 10 次靜默 exhausted、state/last_error 不變、不發事件」的無資訊放棄。
 
 ## 日誌與輸出
+
+CLI 端 RPC 診斷可用 `serialwrap -v session list`（`-vv` 選 DEBUG），未帶 verbosity
+旗標時也可設 `SERIALWRAP_LOG_LEVEL=INFO`。專用 stderr trace 記錄 endpoint 來源、
+method、耗時、最後主請求的 errno 與既有 retry 次數；stdout JSON 與預設安靜輸出不變。
+Unix path 與非 loopback TCP endpoint 以雜湊表示，trace 不含命令、參數、回應內文或
+UART payload；既有錯誤訊息未改，仍可能包含路徑。開啟 trace 不增加 RPC、probe 或
+retry，也不等於 daemon 檔案日誌。詳見 [CLI trace 契約](docs/refine/198-cli-trace-delivery.md)。
 
 | 檔案 | 說明 |
 |------|------|

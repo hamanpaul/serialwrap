@@ -1,6 +1,7 @@
 # #198 整合風險與回復方式
 
-本輪只有文件變更；採用方案不代表 production 修改或真機放行。
+下表為 2026-09-12 文件階段的歷史風險；2026-09-13 已產生 production 候選，
+最新狀態見下方更新。採用方案不代表真機放行。
 
 | 項目 | 影響與邊界 | 後續驗證／責任 |
 |---|---|---|
@@ -12,3 +13,18 @@
 | 順位與效益 | 排序根據現有事故與 source，未取得使用頻率、耗時或收益比較 | 下次操作以有界樣本記錄定位、重試、人工協調及維護成本，再調整順序 |
 
 回復方式：文件提交均在 `docs/198-refine-review` 分支，可用後續修訂提交更正；不需重啟 daemon 或回復 UART 狀態。#198 編修前已在本地工作目錄保存原文；若需撤回外部文字，先核對 issue 最新版本以保留他人後續編輯，再套用所需更正。未刪除 WAL／runtime／既有 untracked 檔案。
+
+## 2026-09-13 更新
+
+- CLI trace 與 holder stat 已有候選、隔離測試及 Sol 審查；不再列為「尚未實作」。
+  CLI trace 不處理 daemon sink／rotation；holder 的 missing-attribute 測試不是
+  native Windows 成功證據，空 `/proc` 結果也不是外部 holder 排他證明。
+- Ownership 的 operation cleanup 候選已通過定向測試，但 root 另以真 UARTBridge
+  RX handler＋mock TX 重現「傳輸途中新 console 被授予 raw owner」；此項待修，
+  不能以 logical admission 的其他測試通過宣稱整體安全。
+- #166 尚無實作：指定 Sonnet 額度不足；Opus 審查也未能執行。替換指定模型須由
+  使用者決定。Ownership Sol 審查遭平台中止亦未取得有效結果。
+- #182 reload 與 #197 Cloudflare 真 E2E 繼續分票追蹤，見
+  [後續安排與成效量測界線](198-followup-validation.md)。本地候選尚未部署。
+- 回復方式：所有 production 候選仍留在獨立 feature/fix 分支；若否決，可不採納
+  個別候選或在整合分支以明確反向提交修正，不需動 live daemon／UART／WAL。

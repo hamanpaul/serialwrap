@@ -39,3 +39,26 @@ Root review 結論：**處理方案 PASS**。錯誤引用、首批範圍及相�
 
 [#198 修訂內容](198-issue-body.md) 為外部 issue 的可審查版本，保持未完成項目與 OPEN 狀態。
 [殘餘風險與回復方式](merge-risks.md) 記錄本輪未驗證邊界。
+
+## 2026-09-13 實作階段（尚未結案）
+
+以上 2026-09-12 為歷史盤點結果，不代表本節的 production 候選已交付。
+實作計畫與共同 BASE 為 `ae1296e`，整合分支為 `feature/198-refine-delivery`。
+本節依 change-merger-v2 governed 模式逐 hunk 核對共享檔案，沒有部署或重啟服務。
+
+| 工作 | 原始候選 | 本地狀態／獨立驗證 |
+|---|---|---|
+| #166 transfer | 無 | Sonnet xhigh 啟動即 weekly limit；未改檔、未擅自換模型 |
+| Ownership | Luna max `6d946ec` | root 定向 83 passed；再現新 console 於 transfer 中途取得 raw owner，已交原 worker 修正，尚未整合 |
+| #171 CLI-only trace | Copilot gpt-5.4 xhigh `9b7ef46` → `59cd1f9` → `1c1d98d` | Sol xhigh 兩次指出 MAJOR 並修正後 PASS；root 定向 96 passed、2 subtests；整合為 `f962fb2`、`da6f85f`、`be35aeb` |
+| #199 holder stat | Antigravity gemini-3.8-flash-high／high `d6fc3f2` | Sol xhigh PASS；root holder/flash 90 passed、6 subtests；整合為 `ce16b92` |
+
+Root 確認並處置的 CLI 缺陷：`daemon start` already-running 前置 probe 缺 trace；
+以及以 `TypeError` 訊息判斷相容性而重送 mutating RPC。第二項透過已記錄請求後
+拋例外的隔離測試證明原來會送兩次，修正後只送一次且原例外上拋。
+最終 CLI 片段另有 15 次 baseline/quiet/verbose 子行程重播，見
+[後續安排與有界成效](198-followup-validation.md)。
+
+審查限制：Opus xhigh 同樣受 weekly limit 阻擋；ownership 的 Sol 審查由平台中止，
+沒有有效裁決。未完成指定雙審，不宣稱全部 review PASS。
+此階段尚未 push、建立 PR、驗證 CI、merge 或安裝；#198 保持未完成。
