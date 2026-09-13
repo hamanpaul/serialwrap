@@ -10,7 +10,7 @@ CLI SHALL 使用專用 serialwrap.cli_trace logger（propagate=False、冪等 ha
 ### Requirement: 單次來源與白名單
 trace SHALL 僅輸出 endpoint_transport、endpoint_id、endpoint_source、method、elapsed_ms、error_code、errno、errno_name、retry_count、timeout_s。Unix path 全部雜湊成固定長度 SHA-256 ID；TCP 僅 literal loopback host+port 可見，其他雜湊；不得加入 params、command、UART、secret、owner 或完整 response。
 
-#### Scenario: fallback 与 event
+#### Scenario: fallback 與 event
 - **WHEN** config endpoint 失聯而採 canonical fallback，或送 event.rule_set
 - **THEN** trace 與當次實際解析的 endpoint/source、真正 RPC method 一致，無第二次 probe。
 

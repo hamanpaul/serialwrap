@@ -8,7 +8,7 @@
 
 ## Decisions
 
-- 傳輸偵測必須驗證工具真正可用，不以 command echo 的 substring 當成功；base64 優先、OpenSSL fallback，push/pull 一致。profile 可選 max_console_line_chars 表示命令 UTF-8 bytes（不含終止換行）；未設定維持既有 chunk 上限，設定後以实际 shell 樣板最壞開銷計算，過小 fail closed。505 僅為既有板量測與測試 fixture，不能由 platform 名稱套用。
+- 傳輸偵測必須驗證工具真正可用，不以 command echo 的 substring 當成功；base64 優先、OpenSSL fallback，push/pull 一致。profile 可選 max_console_line_chars 表示命令 UTF-8 bytes（不含終止換行）；未設定維持既有 chunk 上限，設定後以實際 shell 樣板最壞開銷計算，過小 fail closed。505 僅為既有板量測與測試 fixture，不能由 platform 名稱套用。
 - Ownership 先用 barrier/event 重現再修復。file.push/pull 與 command 操作不得 logical interleave；採 manager 鎖內 admission，忙時明確拒絕且不 TX，不新增外部 token API。每次操作持有原 session／bridge 身分，舊操作 finally 不得清除新 epoch 狀態。正常 command queue 多 client accepted 的契約保留。
 - CLI trace 只增加 optional internal metadata 與專用 logger，不改 rpc_call response dict。endpoint resolution 一次產生 endpoint+source；不增加 probe/retry。errno 只屬最後主請求，TIMEOUT 不等於未執行。
 - holder 僅對缺 st_rdev 使用 getattr(..., 0) 保守 fallback，保持既有 char device 比對。無 /proc 不能證明沒有 holder。
