@@ -783,11 +783,7 @@ def _call_rpc_endpoint(
     if retries is not None:
         rpc_kwargs["retries"] = retries
     if trace_sink is not None:
-        try:
-            return rpc_call(endpoint, method, params, trace_sink=trace_sink, **rpc_kwargs)
-        except TypeError as exc:
-            if "trace_sink" not in str(exc):
-                raise
+        return rpc_call(endpoint, method, params, trace_sink=trace_sink, **rpc_kwargs)
     return rpc_call(endpoint, method, params, **rpc_kwargs)
 
 

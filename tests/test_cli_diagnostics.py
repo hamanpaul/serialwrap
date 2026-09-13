@@ -416,6 +416,45 @@ class TestCliTraceDaemonStart(CliDiagnosticsMixin, unittest.TestCase):
         self.assertIsNone(first["errno"])
 
 
+class TestCliTraceNoExtraRpcOnTraceSinkFailure(CliDiagnosticsMixin, unittest.TestCase):
+    def test_mutating_rpc_typeerror_after_send_is_not_retried(self) -> None:
+        cases = [
+            (
+                ["-v", "session", "recover", "--selector", "COM0"],
+                "session.recover",
+            ),
+            (
+                ["-v", "cmd", "submit", "--selector", "COM0", "--cmd", "echo hi"],
+                "command.submit",
+            ),
+        ]
+
+        for argv, expected_method in cases:
+            calls: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+
+            def fake_rpc_call(
+                endpoint: str,
+                method: str,
+                params: dict[str, Any],
+                *,
+                timeout_s: float = 5.0,
+                retries: int = 0,
+                trace_sink: Any = None,
+            ) -> dict[str, Any]:
+                calls.append((endpoint, dict(params), {"timeout_s": timeout_s, "retries": retries, "trace_sink": trace_sink}))
+                raise TypeError("trace_sink error after request was sent")
+
+            with self.subTest(method=expected_method):
+                with mock.patch("sw_core.cli.rpc_call", side_effect=fake_rpc_call):
+                    with self.assertRaises(TypeError):
+                        self._invoke_main(argv)
+
+                self.assertEqual(len(calls), 1, "主請求送出後不得因 trace_sink 相關 TypeError 再呼叫第二次 RPC")
+                self.assertEqual(calls[0][0], cli.SOCKET_PATH)
+                self.assertEqual(calls[0][2]["retries"], 0)
+                self.assertIsNotNone(calls[0][2]["trace_sink"])
+
+
 class TestCliTraceLoggerIsolation(CliDiagnosticsMixin, unittest.TestCase):
     def test_trace_logger_does_not_propagate_to_root_or_serialwrap_logger(self) -> None:
         root_stream = io.StringIO()

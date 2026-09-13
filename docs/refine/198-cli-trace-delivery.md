@@ -53,6 +53,7 @@ stderr trace 僅輸出一行白名單 JSON，欄位固定如下：
 
 - `elapsed_ms` 由 `client.rpc_call()` 入口量到最終回應，**包含**既有 retry/backoff 與 TIMEOUT enrich。
 - `retry_count` 只反映既有唯讀白名單 retry；mutating RPC 沒有新增 retry。
+- trace wrapper 不會因 `trace_sink`/logger 相關內部錯誤而自動重送主請求；主請求次數仍只受既有 client retry policy 與使用者明確 `--retries` 控制。
 - `errno` 只取最後一次 **主請求** attempt 的 `OSError.errno`：
   - retry 後成功 → `errno=null`
   - TIMEOUT 後 enrich 的 `health.ping` / `health.status` 若失敗，也**不會**污染主請求 trace
@@ -80,6 +81,7 @@ serialwrap -v --endpoint tcp://127.0.0.1:48700 event status --selector COM0
   - `--help` 露出 `-v/--verbose`
   - `-v` / `SERIALWRAP_LOG_LEVEL` precedence
   - `daemon start` already-running 與前置 probe failure trace
+  - `trace_sink` 相關 `TypeError` 不得造成 `session.recover` / `command.submit` 額外 RPC
   - 重複 `main()` 不殘留 trace/handler
   - `ENOENT` / `ECONNREFUSED` / `EACCES`
   - retry 後 success `errno=null`
