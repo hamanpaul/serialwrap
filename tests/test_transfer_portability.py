@@ -36,6 +36,7 @@ _ENCODER_OK = "SW_XFER_ENCODER_B64_42"
 _CHUNK_OK = "SW_XFER_CHUNK_42"
 _MD5_OK = "SW_XFER_MD5_42"
 _MV_OK = "SW_XFER_MV_42"
+_ENCODER_FAILED = "SW_XFER_ENCODER_FAILED_42"
 
 
 def _marker_expr(marker: str) -> str:
@@ -50,11 +51,16 @@ class _PortabilityBridge:
 
     def __init__(self, tools: set[str] | None = None, *, fail_chunk: bool = False,
                  fail_md5: bool = False, fail_mv: bool = False,
+                 fail_encoder: bool = False, fail_encoder_partial: bool = False,
+                 fail_encoder_no_marker: bool = False,
                  echo_old_markers: bool = False) -> None:
         self.tools = set(tools or ())
         self.fail_chunk = fail_chunk
         self.fail_md5 = fail_md5
         self.fail_mv = fail_mv
+        self.fail_encoder = fail_encoder
+        self.fail_encoder_partial = fail_encoder_partial
+        self.fail_encoder_no_marker = fail_encoder_no_marker
         self.echo_old_markers = echo_old_markers
         self.commands: list[str] = []
         self._rx_text = ""
@@ -132,6 +138,11 @@ class _PortabilityBridge:
             if not match:
                 return
             path = shlex.split(match.group(1))[0]
+            if self.fail_encoder:
+                if not self.fail_encoder_no_marker:
+                    prefix = "partial-base64" if self.fail_encoder_partial else ""
+                    self._rx_text += prefix + _ENCODER_FAILED
+                return
             payload = self.remote.get(path, b"")
             self._rx_text += _SENTINEL_BEGIN
             if "openssl enc" in cmd:
@@ -224,6 +235,80 @@ class TestTransferPortability(unittest.TestCase):
         self.assertEqual(result["error_code"], "TARGET_DECODER_MISSING")
         self.assertEqual(len(bridge.commands), 1)
 
+    def test_all_encoder_tools_missing_rejects_without_creating_local_file(self) -> None:
+        bridge = _PortabilityBridge()
+        out = self._local(b"keep")
+
+        result = pull_file(bridge, "/tmp/remote", out, prompt_regex=_PROMPT_RE)
+
+        self.assertEqual(result["error_code"], "TARGET_ENCODER_MISSING")
+        self.assertEqual(Path(out).read_bytes(), b"keep")
+        self.assertEqual(len(bridge.commands), 1)
+
+    def test_echoing_encoder_probe_text_does_not_count_as_probe_success(self) -> None:
+        bridge = _PortabilityBridge()
+
+        def _echo_only(cmd: str, **kwargs: Any) -> None:
+            del kwargs
+            bridge.commands.append(cmd)
+            bridge._rx_text += cmd + "\r\n" + _PROMPT
+
+        bridge.send_command = _echo_only
+        out = self._local(b"keep")
+
+        result = pull_file(bridge, "/tmp/remote", out, prompt_regex=_PROMPT_RE)
+
+        self.assertEqual(result["error_code"], "TARGET_ENCODER_MISSING")
+        self.assertEqual(Path(out).read_bytes(), b"keep")
+
+    def test_encoder_failure_after_probe_is_explicit_and_preserves_local_file(self) -> None:
+        bridge = _PortabilityBridge({"base64", "md5sum"}, fail_encoder=True)
+        out = self._local(b"keep")
+
+        result = pull_file(bridge, "/tmp/remote", out, prompt_regex=_PROMPT_RE)
+
+        self.assertEqual(result["error_code"], "TARGET_ENCODER_FAILED")
+        self.assertEqual(Path(out).read_bytes(), b"keep")
+
+    def test_encoder_partial_output_then_failure_marker_is_explicit(self) -> None:
+        bridge = _PortabilityBridge(
+            {"base64", "md5sum"}, fail_encoder=True, fail_encoder_partial=True,
+        )
+        out = self._local(b"keep")
+
+        result = pull_file(bridge, "/tmp/remote", out, prompt_regex=_PROMPT_RE)
+
+        self.assertEqual(result["error_code"], "TARGET_ENCODER_FAILED")
+        self.assertEqual(Path(out).read_bytes(), b"keep")
+
+    def test_missing_encoder_failure_marker_remains_parse_failure(self) -> None:
+        bridge = _PortabilityBridge(
+            {"base64", "md5sum"}, fail_encoder=True, fail_encoder_no_marker=True,
+        )
+        out = self._local(b"keep")
+
+        result = pull_file(bridge, "/tmp/remote", out, prompt_regex=_PROMPT_RE)
+
+        self.assertEqual(result["error_code"], "PULL_PARSE_FAILED")
+        self.assertEqual(Path(out).read_bytes(), b"keep")
+
+    def test_line_budget_probe_payload_is_bounded_by_source_size(self) -> None:
+        bridge = _PortabilityBridge({"base64", "md5sum"})
+        local = self._local(b"x")
+
+        with mock.patch(
+            "sw_core.file_transfer.base64.b64encode", wraps=base64.b64encode,
+        ) as encode:
+            result = push_file(
+                bridge, local, "/tmp/dest", chunk_size=1_000_000,
+                max_console_line_chars=1_000_000, prompt_regex=_PROMPT_RE,
+            )
+
+        self.assertTrue(result["ok"], result)
+        sizes = [len(call.args[0]) for call in encode.call_args_list]
+        self.assertEqual(sizes[0], 1)
+        self.assertLessEqual(max(sizes), 1)
+
     def test_probe_timeout_is_not_reported_as_missing_tool(self) -> None:
         bridge = _PortabilityBridge()
         bridge.wait_for_regex_from = lambda pattern, offset, timeout: False
@@ -269,6 +354,25 @@ class TestTransferPortability(unittest.TestCase):
                     self.assertEqual(pulled["md5"], hashlib.md5(payload).hexdigest())
                 finally:
                     Path(remote).unlink(missing_ok=True)
+
+    def test_only_openssl_roundtrip_remote_path_with_backslash(self) -> None:
+        bridge = _LocalShellBridge()
+        self.addCleanup(bridge.close)
+        local = self._local(b"backslash filename payload")
+        remote = str(Path(bridge._tmp.name) / "remote\\name")
+        out = self._local(b"keep")
+        try:
+            pushed = push_file(
+                bridge, local, remote, prompt_regex=_ANCHORED_PROMPT_RE,
+            )
+            self.assertTrue(pushed["ok"], pushed)
+            pulled = pull_file(
+                bridge, remote, out, prompt_regex=_ANCHORED_PROMPT_RE,
+            )
+            self.assertTrue(pulled["ok"], pulled)
+            self.assertEqual(Path(out).read_bytes(), b"backslash filename payload")
+        finally:
+            Path(remote).unlink(missing_ok=True)
 
     def test_505_budget_bounds_every_push_and_pull_command(self) -> None:
         bridge = _PortabilityBridge({"base64", "md5sum"})
@@ -394,6 +498,45 @@ class TestTransferProfileBudget(unittest.TestCase):
             with self.subTest(value=value), tempfile.TemporaryDirectory() as td:
                 Path(td, "profile.yaml").write_text(
                     f"profiles:\n  p:\n    max_console_line_chars: {value!r}\ntargets: []\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaises(ValueError):
+                    load_profiles(td)
+
+    def test_yaml_target_budget_inherits_overrides_and_clears_template(self) -> None:
+        cases = (
+            ("", 505),
+            ("    max_console_line_chars: 777\n", 777),
+            ("    max_console_line_chars: null\n", None),
+        )
+        for target_field, expected in cases:
+            with self.subTest(target_field=target_field), tempfile.TemporaryDirectory() as td:
+                Path(td, "profile.yaml").write_text(
+                    "profiles:\n"
+                    "  p:\n"
+                    "    max_console_line_chars: 505\n"
+                    "targets:\n"
+                    "  - profile: p\n"
+                    "    com: COM0\n"
+                    "    device_by_id: /dev/serial/by-id/a\n"
+                    f"{target_field}",
+                    encoding="utf-8",
+                )
+                result = load_profiles(td)
+                self.assertEqual(result.profiles[0].max_console_line_chars, expected)
+
+    def test_invalid_yaml_target_budget_is_rejected(self) -> None:
+        for value in (True, 0, -1, "777", 1.5):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as td:
+                Path(td, "profile.yaml").write_text(
+                    "profiles:\n"
+                    "  p:\n"
+                    "    max_console_line_chars: 505\n"
+                    "targets:\n"
+                    "  - profile: p\n"
+                    "    com: COM0\n"
+                    "    device_by_id: /dev/serial/by-id/a\n"
+                    f"    max_console_line_chars: {value!r}\n",
                     encoding="utf-8",
                 )
                 with self.assertRaises(ValueError):

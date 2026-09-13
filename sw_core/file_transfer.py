@@ -163,7 +163,8 @@ def push_file(
     if max_console_line_chars is not None:
         # raw_capacity 是以最長 overhead 計算，但此處再用實際 decoder／實際
         # encoded 長度確認；這也涵蓋 base64 4/3 ceiling 的邊界。
-        probe_chunk = base64.b64encode(b"\0" * effective_chunk_size).decode("ascii")
+        probe_size = min(effective_chunk_size, len(data))
+        probe_chunk = base64.b64encode(b"\0" * probe_size).decode("ascii")
         if _line_budget_exceeded(
             tuple(_chunk_command(probe_chunk, decoder, op, tmp_name) for op in (">", ">>")),
             max_console_line_chars,
@@ -311,7 +312,7 @@ def pull_file(
     raw_text = bridge.rx_text_from(pre)
     b64_content = _extract_between_sentinels(raw_text, command=cmd)
     if b64_content is None:
-        if _runtime_sentinel_seen(
+        if _failure_sentinel_seen(
             raw_text, _ENCODER_FAILURE_SENTINEL, command=cmd
         ):
             return {"ok": False, "error_code": "TARGET_ENCODER_FAILED"}
@@ -408,6 +409,12 @@ def _runtime_sentinel_seen(text: str, sentinel: str, *, command: str | None = No
     """只在 command echo 之後找到完整 sentinel 才算 target 成功。"""
     output = _strip_command_echo(text, command)
     return re.search(rf"(?:^|\r?\n){re.escape(sentinel)}(?:\r?\n|$)", output) is not None
+
+
+def _failure_sentinel_seen(text: str, sentinel: str, *, command: str | None = None) -> bool:
+    """辨識失敗 sentinel；允許它黏在 encoder 已輸出的 partial bytes 後。"""
+    output = _strip_command_echo(text, command)
+    return re.search(rf"{re.escape(sentinel)}(?:\r?\n|$)", output) is not None
 
 
 def _probe_shell_error(text: str, command: str) -> bool:
@@ -559,7 +566,9 @@ def _remote_md5(
     # 否則 remote path 恰好含 32 個十六進位字元時會把檔名誤當 checksum。
     before_sentinel = output[: output.find(_MD5_SENTINEL)]
     for line in before_sentinel.splitlines():
-        match = re.match(r"\s*([0-9a-fA-F]{32})(?:\s|$)", line)
+        # GNU md5sum 在檔名含反斜線／換行等需 escaping 時，會在整行前加
+        # 一個反斜線；digest 仍是第一欄，兩種格式都要接受。
+        match = re.match(r"\s*(?:\\)?([0-9a-fA-F]{32})(?:\s|$)", line)
         if match:
             return match.group(1).lower()
     return None
