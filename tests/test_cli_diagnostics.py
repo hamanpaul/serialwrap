@@ -187,6 +187,18 @@ class TestCliTraceOutput(CliDiagnosticsMixin, unittest.TestCase):
         self.assertEqual(trace["endpoint_source"], "config.yaml -> canonical fallback")
         self._assert_sha256_hex(trace["endpoint_id"])
 
+    def test_help_includes_verbose_flag_and_precedence_text(self) -> None:
+        out = io.StringIO()
+        with self.assertRaises(SystemExit):
+            with redirect_stdout(out):
+                cli.main(["--help"])
+
+        help_text = out.getvalue()
+        self.assertIn("-v, --verbose", help_text)
+        self.assertIn("-v=INFO", help_text)
+        self.assertIn("-vv=DEBUG", help_text)
+        self.assertIn("SERIALWRAP_LOG_LEVEL", help_text)
+
     def test_event_rule_set_trace_uses_actual_method_and_hides_params(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             rule_path = os.path.join(td, "rule.json")
@@ -345,6 +357,63 @@ class TestCliTraceTcpAndRetry(CliDiagnosticsMixin, unittest.TestCase):
         self.assertEqual(trace["retry_count"], 1)
         self.assertIsNone(trace["errno"])
         self.assertIsNone(trace["errno_name"])
+
+
+class TestCliTraceDaemonStart(CliDiagnosticsMixin, unittest.TestCase):
+    def test_daemon_start_already_running_success_emits_single_probe_trace(self) -> None:
+        with (
+            mock.patch("sw_core.cli._safe_runtime_config", return_value=None),
+            mock.patch("sw_core.cli.rpc_call", return_value={"ok": True}) as rpc,
+        ):
+            rc, out, err = self._invoke_main(
+                ["-v", "--socket", "/tmp/sw171-already-running.sock", "daemon", "start"]
+            )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(rpc.call_count, 1)
+        self.assertEqual(rpc.call_args.args[1], "health.ping")
+        self.assertEqual(json.loads(out), {"ok": True, "already_running": True, "socket": "/tmp/sw171-already-running.sock"})
+        traces = self._stderr_json_lines(err)
+        self.assertEqual(len(traces), 1)
+        trace = traces[0]
+        self._assert_trace_shape(trace)
+        self.assertEqual(trace["method"], "health.ping")
+        self.assertEqual(trace["endpoint_source"], "--socket")
+        self.assertIsNone(trace["error_code"])
+
+    def test_daemon_start_probe_failure_is_traced_before_spawn_wait_loop(self) -> None:
+        proc = mock.Mock(pid=4321, returncode=None)
+        proc.poll.return_value = None
+        rpc_responses = [
+            {"ok": False, "error_code": "SOCKET_ERROR", "message": "[Errno 2] missing"},
+            {"ok": True},
+            {"ok": True, "warnings": ["no_profiles_loaded"]},
+        ]
+        with (
+            mock.patch("sw_core.cli._safe_runtime_config", return_value=None),
+            mock.patch("sw_core.cli._find_conflicting_daemon", return_value=None),
+            mock.patch("sw_core.cli._resolve_daemon_start_env_files", return_value=[]),
+            mock.patch("sw_core.cli._load_daemon_start_env_files", return_value=({}, [])),
+            mock.patch("sw_core.cli.subprocess.Popen", return_value=proc),
+            mock.patch("sw_core.cli.time.sleep"),
+            mock.patch("sw_core.cli.rpc_call", side_effect=rpc_responses) as rpc,
+        ):
+            rc, out, err = self._invoke_main(
+                ["-v", "--socket", "/tmp/sw171-probe-fail.sock", "daemon", "start"]
+            )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(rpc.call_count, 3)
+        methods = [call.args[1] for call in rpc.call_args_list]
+        self.assertEqual(methods, ["health.ping", "health.ping", "health.status"])
+        self.assertEqual(json.loads(out), {"ok": True, "pid": 4321, "socket": "/tmp/sw171-probe-fail.sock", "warnings": ["no_profiles_loaded"]})
+        traces = self._stderr_json_lines(err)
+        self.assertEqual([trace["method"] for trace in traces], ["health.ping", "health.ping", "health.status"])
+        first = traces[0]
+        self._assert_trace_shape(first)
+        self.assertEqual(first["endpoint_source"], "--socket")
+        self.assertEqual(first["error_code"], "SOCKET_ERROR")
+        self.assertIsNone(first["errno"])
 
 
 class TestCliTraceLoggerIsolation(CliDiagnosticsMixin, unittest.TestCase):

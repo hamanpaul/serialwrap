@@ -11,11 +11,12 @@
   - `-vv` → `DEBUG`
   - 未帶 `-v` 時，才讀 `SERIALWRAP_LOG_LEVEL`
   - 無效 `SERIALWRAP_LOG_LEVEL` 靜默退回 `WARNING`
+  - `serialwrap --help` 與 README `serialwrap-help` marker 已同步公開此旗標
 - CLI trace 使用專用 logger `serialwrap.cli_trace`：
   - `propagate=False`
   - 自有 `stderr` handler 冪等重設，不污染 root / `serialwrap` logger
   - 預設 `WARNING`，所以既有 stdout/stderr 契約維持不變
-- `_run_rpc()`、`event` 分派與 `daemon stop`，以及 `daemon start` 就緒等待內的既有 RPC 呼叫，統一走同一個 trace wrapper。
+- `_run_rpc()`、`event` 分派、`daemon stop`，以及 `daemon start` **前置 health probe / 就緒等待** 內的既有 RPC 呼叫，統一走同一個 trace wrapper。
 - `sw_core.client.rpc_call()` 新增 **內部用** `trace_sink` metadata 通道，只回報：
   - `elapsed_ms`
   - `retry_count`
@@ -76,7 +77,9 @@ serialwrap -v --endpoint tcp://127.0.0.1:48700 event status --selector COM0
 
 - 新增 `tests/test_cli_diagnostics.py`：
   - 預設 byte compatibility
+  - `--help` 露出 `-v/--verbose`
   - `-v` / `SERIALWRAP_LOG_LEVEL` precedence
+  - `daemon start` already-running 與前置 probe failure trace
   - 重複 `main()` 不殘留 trace/handler
   - `ENOENT` / `ECONNREFUSED` / `EACCES`
   - retry 後 success `errno=null`

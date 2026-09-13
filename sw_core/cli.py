@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass
 import json
 import logging
@@ -10,6 +11,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Sequence
 from typing import Any
@@ -320,11 +322,55 @@ def _resolve_daemon_start_env_files(profile_dir: str) -> list[str]:
 
 def _probe_healthy_daemon(endpoint: str) -> bool:
     """對 endpoint 做 health.ping 存活探測；連得上且 ok 視為已有健康 daemon。"""
+    trace_ctx = getattr(_DAEMON_START_PROBE_TRACE, "context", None)
+    logger = None
+    resolved = None
+    trace_meta: dict[str, Any] = {}
+    trace_enabled = False
+    if trace_ctx is not None:
+        args, resolved = trace_ctx
+        logger = configure_cli_trace_logger(_trace_verbose(args))
+        trace_enabled = logger.isEnabledFor(logging.INFO)
     try:
-        resp = rpc_call(endpoint, "health.ping", {}, timeout_s=0.5)
+        resp = _call_rpc_endpoint(
+            endpoint,
+            "health.ping",
+            {},
+            timeout_s=0.5,
+            trace_sink=trace_meta.update if trace_enabled else None,
+        )
     except Exception:  # noqa: BLE001
         return False
+    if trace_enabled and logger is not None and resolved is not None:
+        emit_rpc_trace(
+            logger=logger,
+            endpoint=resolved.endpoint,
+            endpoint_source=resolved.source,
+            method="health.ping",
+            timeout_s=0.5,
+            response=resp,
+            metadata=trace_meta,
+        )
     return bool(resp.get("ok"))
+
+
+_DAEMON_START_PROBE_TRACE = threading.local()
+
+
+@contextmanager
+def _daemon_start_probe_trace(args: argparse.Namespace, resolved: _ResolvedEndpoint):
+    previous = getattr(_DAEMON_START_PROBE_TRACE, "context", None)
+    _DAEMON_START_PROBE_TRACE.context = (args, resolved)
+    try:
+        yield
+    finally:
+        if previous is None:
+            try:
+                delattr(_DAEMON_START_PROBE_TRACE, "context")
+            except AttributeError:
+                pass
+        else:
+            _DAEMON_START_PROBE_TRACE.context = previous
 
 
 def _find_conflicting_daemon(sock: str, proc_root: str = "/proc") -> dict[str, Any] | None:
@@ -391,8 +437,11 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
     # on-demand：spawn 前先對「使用者實際會連到的 endpoint」冪等探測，已有健康 daemon 則
     # no-op（#108 #1）。用 _resolve_endpoint 而非裸 args.socket，避免 config 記錄的 daemon
     # 在非預設 socket 時 probe miss 又 spawn 出第二個（two-reader）。
-    endpoint = _resolve_endpoint(args)
-    if _probe_healthy_daemon(endpoint):
+    resolved_endpoint = _resolve_endpoint_info(args)
+    endpoint = resolved_endpoint.endpoint
+    with _daemon_start_probe_trace(args, resolved_endpoint):
+        already_running = _probe_healthy_daemon(endpoint)
+    if already_running:
         _print({"ok": True, "already_running": True, "socket": endpoint})
         return 0
     # --socket 為 None sentinel（#120 向量 2）：spawn 路徑落到平台預設（#131：
@@ -721,6 +770,27 @@ def _trace_verbose(args: argparse.Namespace) -> int:
     return int(getattr(args, "verbose", 0) or 0)
 
 
+def _call_rpc_endpoint(
+    endpoint: str,
+    method: str,
+    params: dict[str, Any],
+    *,
+    timeout_s: float,
+    retries: int | None = None,
+    trace_sink: Any = None,
+) -> dict[str, Any]:
+    rpc_kwargs: dict[str, Any] = {"timeout_s": timeout_s}
+    if retries is not None:
+        rpc_kwargs["retries"] = retries
+    if trace_sink is not None:
+        try:
+            return rpc_call(endpoint, method, params, trace_sink=trace_sink, **rpc_kwargs)
+        except TypeError as exc:
+            if "trace_sink" not in str(exc):
+                raise
+    return rpc_call(endpoint, method, params, **rpc_kwargs)
+
+
 def _rpc_call_traced(
     args: argparse.Namespace,
     resolved: _ResolvedEndpoint,
@@ -733,12 +803,14 @@ def _rpc_call_traced(
     logger = configure_cli_trace_logger(_trace_verbose(args))
     trace_enabled = logger.isEnabledFor(logging.INFO)
     trace_meta: dict[str, Any] = {}
-    rpc_kwargs: dict[str, Any] = {"timeout_s": timeout_s}
-    if retries is not None:
-        rpc_kwargs["retries"] = retries
-    if trace_enabled:
-        rpc_kwargs["trace_sink"] = trace_meta.update
-    resp = rpc_call(resolved.endpoint, method, params, **rpc_kwargs)
+    resp = _call_rpc_endpoint(
+        resolved.endpoint,
+        method,
+        params,
+        timeout_s=timeout_s,
+        retries=retries,
+        trace_sink=trace_meta.update if trace_enabled else None,
+    )
     if trace_enabled:
         emit_rpc_trace(
             logger=logger,
@@ -1321,7 +1393,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawTextHelpFormatter,
     )
     p.add_argument("--version", action="version", version=f"serialwrap {_resolve_version()}", help="顯示版本後離開")
-    p.add_argument("-v", "--verbose", action="count", default=0, help=argparse.SUPPRESS)
+    p.add_argument("-v", "--verbose", action="count", default=0, help="提高 CLI trace 詳細度（-v=INFO，-vv=DEBUG；優先於 SERIALWRAP_LOG_LEVEL）")
     p.add_argument("--socket", default=None, help="本機 daemon 的 Unix socket 路徑（未指定時依 config.yaml 與 XDG 執行期目錄解析，可用 SERIALWRAP_RUN_DIR 覆寫）")
     p.add_argument("--endpoint", default=None, metavar="ENDPOINT", help="遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）")
     p.add_argument(
