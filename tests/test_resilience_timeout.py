@@ -107,10 +107,18 @@ class TestCommandCancel(unittest.TestCase):
     def test_canceled_command_skipped_by_worker(self) -> None:
         """排隊中被 cancel 的命令，worker 取出後應跳過不執行。"""
         call_log: list[str] = []
-        original_cb = self._slow_cb
+        cmd1_started = threading.Event()
+        cmd1_release = threading.Event()
+        cmd3_done = threading.Event()
 
         def tracking_cb(session_id, command, source, cmd_id, timeout_s, mode, expected_duration_s=None):
             call_log.append(command)
+            if command == "cmd1":
+                cmd1_started.set()
+                if not cmd1_release.wait(timeout=5.0):
+                    raise AssertionError("cmd1 barrier 未釋放")
+            if command == "cmd3":
+                cmd3_done.set()
             return {"ok": True, "stdout": f"done:{command}"}
 
         self.arbiter.unregister_session("s1")
@@ -120,27 +128,52 @@ class TestCommandCancel(unittest.TestCase):
         # 送 3 個命令
         r1 = self.arbiter.submit(session_id="s1", command="cmd1", source="a",
                                  mode="fg", timeout_s=1.0)
-        r2 = self.arbiter.submit(session_id="s1", command="cmd2", source="a",
-                                 mode="fg", timeout_s=1.0)
-        r3 = self.arbiter.submit(session_id="s1", command="cmd3", source="a",
-                                 mode="fg", timeout_s=1.0)
+        self.assertTrue(r1["ok"])
+        self.assertTrue(cmd1_started.wait(timeout=5.0), "cmd1 未進入在途 barrier")
 
-        # 立即 cancel cmd2
-        self.arbiter.cancel(r2["cmd_id"])
+        try:
+            r2 = self.arbiter.submit(session_id="s1", command="cmd2", source="a",
+                                     mode="fg", timeout_s=1.0)
+            r3 = self.arbiter.submit(session_id="s1", command="cmd3", source="a",
+                                     mode="fg", timeout_s=1.0)
+            self.assertTrue(r2["ok"])
+            self.assertTrue(r3["ok"])
 
-        # 等全部執行完
-        for _ in range(100):
-            i1 = self.arbiter.get(r1["cmd_id"])
-            i3 = self.arbiter.get(r3["cmd_id"])
-            if (i1["ok"] and i1["command"]["status"] == "done" and
-                    i3["ok"] and i3["command"]["status"] == "done"):
-                break
-            time.sleep(0.05)
+            # cmd1 被 barrier 停住時，cmd2/cmd3 已確定仍在 queue；此時才取消 cmd2。
+            canceled = self.arbiter.cancel(r2["cmd_id"])
+            self.assertTrue(canceled["ok"])
+            self.assertEqual(canceled["status"], "canceled")
+            info2 = self.arbiter.get(r2["cmd_id"])
+            self.assertTrue(info2["ok"])
+            self.assertEqual(info2["command"]["status"], "canceled")
 
-        # cmd2 不應被執行
-        self.assertNotIn("cmd2", call_log)
-        self.assertIn("cmd1", call_log)
-        self.assertIn("cmd3", call_log)
+            cmd1_release.set()
+            self.assertTrue(cmd3_done.wait(timeout=5.0), "cmd3 callback 未在 cmd1 釋放後執行")
+
+            # callback 入口的 Event 早於 worker 寫入終態；只接受實際 arbiter record 的
+            # terminal status，避免把 callback 已回傳誤當成 worker 已完成。
+            deadline = time.monotonic() + 5.0
+            info3 = self.arbiter.get(r3["cmd_id"])
+            while (
+                info3.get("ok")
+                and info3["command"].get("status") not in {"done", "error", "canceled", "interactive"}
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+                info3 = self.arbiter.get(r3["cmd_id"])
+
+            # cmd2 不應被執行
+            self.assertNotIn("cmd2", call_log)
+            self.assertIn("cmd1", call_log)
+            self.assertIn("cmd3", call_log)
+            info1 = self.arbiter.get(r1["cmd_id"])
+            self.assertEqual(info1["command"]["status"], "done")
+            self.assertTrue(info3["ok"])
+            self.assertEqual(info3["command"]["status"], "done")
+        finally:
+            # 即使上述 assertion 失敗，也不能把 daemon worker 永久卡在測試 barrier。
+            cmd1_release.set()
+            cmd3_done.wait(timeout=5.0)
 
 
 class TestLoginTimeout(unittest.TestCase):
