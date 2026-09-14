@@ -33,3 +33,17 @@
   [後續安排與成效量測界線](198-followup-validation.md)。本地候選尚未部署。
 - 回復方式：所有 production 候選仍留在獨立 feature/fix 分支；若否決，可不採納
   個別候選或在整合分支以明確反向提交修正，不需動 live daemon／UART／WAL。
+
+## 2026-09-14 補充修正更新
+
+使用者已批准 Sol 接替 Opus 的補充審查；該次發現的 log-level、setup trace、
+F7 checksum 分流，以及完整測試暴露的 closed-stream handler 缺陷，皆經 Luna
+修正、Sol scoped 複審與 root 獨立驗證。原候選 `9cbbf5a` 整合為 `8ec820e`，
+兩者完整 tracked tree 相同；精確命令與結果見 [整合紀錄](merge-summary.md)。
+
+| 項目 | 現況與界線 | 下一步／回復 |
+|---|---|---|
+| 本波 4 項修正 | Sol Spec／Quality PASS；root 完整 1772 passed／16 skipped | 若需撤回，於整合分支建立明確反向提交，不碰 live state |
+| F7 完整性判定 | checksum mismatch 必須紅燈；不能據此判定所有失敗都是程式根因或傳輸已成功 | 真板重跑另行授權；其他工具／timeout／解析分類維持原契約 |
+| 全範圍 review | ownership 的平台中止仍無有效裁決；補充 Sol 不覆蓋該範圍 | 需使用者處理平台授權限制或安排可接受的人工審查；不以重派繞過 |
+| 外部交付 | 未 PR／CI／merge／關票，未部署 | 指定 gates 完成且取得明確 publication 方向後才繼續；不提前 archive |

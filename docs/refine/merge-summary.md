@@ -123,3 +123,47 @@ Sol scoped 重審已逐項 ADDRESSED、spec/quality PASS，另執行具名 10 ca
 Root 對 **Task 1 修正及本地整合驗證判定 PASS**；這不是 #198 全部指定審查完成。
 Opus xhigh 仍受週額度限制，ownership Sol 仍缺有效裁決；未重派該平台中止審查。
 因此 OpenSpec 5.2／5.3 保持未完成，未 archive、push、PR、CI、merge、安裝或重啟服務。
+
+## 2026-09-14 補充審查修正（本地完成，整票尚未結案）
+
+使用者批准以 Sol xhigh 接替 Opus 的補充審查席位；範圍為 Task 1／3／4，
+不包含先前被平台中止、尚無有效裁決的 ownership 審查。
+Sol 首輪 SCOPED FAIL 後，root 逐條重現並交單一 Luna max 修正：
+
+- 無法轉成整數的 log-level 環境值曾使一般 RPC CLI 在送出前崩潰。
+- `setup` 的兩個既有 RPC 漏接 trace；修正保留各自 try／解析、原方法順序、
+  0.5 秒 timeout 及 best-effort 行為，不增加 probe 或 RPC。
+- F7 將明確 `CHECKSUM_MISMATCH` 降為 SKIP；這是既有未補的驗收缺口，現在
+  一律回 `FAIL/test/binary_roundtrip_mismatch`，並在跨板執行中立即停止。
+- 首次完整測試另暴露已關閉 stderr capture 被 handler flush 的生命週期缺陷。
+  當次為 **7 failed、1764 passed、16 skipped、65 subtests，98.92s**，沒有以
+  定向綠燈放行；補真 `TemporaryFile` RED 後修正自有 handler 重建。
+
+Luna 修正 commit 為 `9cbbf5ae229e043f41b1ff2715c070f903b11036`，Sol scoped
+複審判定 R1–R4 全部 ADDRESSED、Spec／Quality PASS，無新 BLOCKER／MAJOR。
+Root 依 change-merger-v2 governed 模式整合為
+`8ec820e5807b8991bbaf1b292277e54c3e4bad6e`；沒有文字衝突，
+`git diff --exit-code 9cbbf5a 8ec820e` 確認完整 tracked tree 相同。
+
+### 本輪 root 獨立驗證
+
+- 候選定向：**97 passed、1 skipped、21 subtests，0.52s**。
+- 候選完整 `python3 -m pytest -q tests/`：**1772 passed、16 skipped、65 subtests，
+  96.89s，exit 0**；不是重用 worker 的 94.91s 結果，live guard 未回報異常。
+- 整合後 unit／integration：**69 passed、1 skipped、5 subtests，0.44s**，
+  涵蓋 CLI、F7、setup、Windows daemon-start seam 及傳輸交叉測試。
+- Root 的原版／候選 R4 對照：原版重設 closed-file stream 拋 ValueError；候選
+  連續 3 輪各有 1 個自有 handler、1 筆輸出、propagate=False。
+- `openspec validate --all --strict`：**22 passed、0 failed**；只驗證，不 archive。
+- 預設及帶 main／feature refs 的 `python3 -m policy_check --repo .` 均為
+  **24 pass、0 fail、2 warn**；R-19 gate 解析、R-22 的 118 既有引用繼續列管，
+  沒有豁免，亦不冒稱包含 PR metadata 的 preflight 或遠端 CI 已通過。
+
+F7 的 FAIL 表示資料完整性驗收失敗，不等於已定位其根因；`CHECKSUM_MISMATCH`
+也不代表遠端檔案已搬移或整個 push／pull RPC 已成功。`MOVE_FAILED`、已列管的
+1MB `PULL_PARSE_FAILED` 與缺工具等仍按原契約分流，不把所有非 ok 一律 FAIL。
+
+以上為受審修正與本地整合驗證通過，不是 #198 全範圍審查或外部交付完成。
+Ownership 指定審查仍缺有效裁決，沒有重派或繞過平台限制；OpenSpec 5.2／5.3
+保持未完成。未 archive、push、建立 PR、執行遠端 CI、merge 至 main、關票、
+安裝、重啟服務或操作真 UART。
