@@ -22,7 +22,7 @@ from typing import Any
 from unittest import mock
 
 import sw_core.client as client
-from sw_core import cli
+from sw_core import cli, cli_trace
 
 
 TRACE_KEYS = {
@@ -156,6 +156,39 @@ class TestCliTraceOutput(CliDiagnosticsMixin, unittest.TestCase):
         self.assertEqual(self._stderr_json_lines(err_invalid), [])
         self.assertEqual(rc_override, 0)
         self.assertEqual(len(self._stderr_json_lines(err_override)), 1)
+
+    def test_invalid_numeric_log_level_falls_back_quietly_and_still_sends_rpc(self) -> None:
+        """未知數字環境值不得在一般 RPC CLI 送出前拋 ValueError。"""
+        for raw in ("--1", "²", "9" * 5000):
+            with self.subTest(raw=raw):
+                with mock.patch(
+                    "sw_core.cli.rpc_call",
+                    return_value={"ok": True, "sessions": []},
+                ) as rpc:
+                    rc, out, err = self._invoke_main(
+                        ["--socket", "/tmp/sw198-invalid-log-level.sock", "session", "list"],
+                        env={"SERIALWRAP_LOG_LEVEL": raw},
+                    )
+
+                self.assertEqual(rc, 0)
+                self.assertEqual(out, '{"ok":true,"sessions":[]}' + "\n")
+                rpc.assert_called_once()
+                self.assertEqual(self._stderr_json_lines(err), [])
+
+    def test_numeric_log_level_and_whitespace_name_remain_supported(self) -> None:
+        self.assertEqual(cli_trace._parse_log_level("  INFO  "), logging.INFO)
+        self.assertEqual(cli_trace._parse_log_level("20"), logging.INFO)
+        self.assertEqual(cli_trace.resolve_cli_trace_level(0, {"SERIALWRAP_LOG_LEVEL": " 10 "}), logging.DEBUG)
+
+    def test_trace_logger_recovers_when_previous_stream_was_closed(self) -> None:
+        with tempfile.TemporaryFile(mode="w+") as previous_stream:
+            cli_trace.configure_cli_trace_logger(1, stream=previous_stream)
+
+        current_stream = io.StringIO()
+        logger = cli_trace.configure_cli_trace_logger(1, stream=current_stream)
+        logger.info("closed-stream recovery")
+
+        self.assertEqual(current_stream.getvalue(), "closed-stream recovery\n")
 
     def test_config_fallback_trace_uses_single_resolution_without_extra_probe(self) -> None:
         fake_rc = mock.Mock()
@@ -414,6 +447,123 @@ class TestCliTraceDaemonStart(CliDiagnosticsMixin, unittest.TestCase):
         self.assertEqual(first["endpoint_source"], "--socket")
         self.assertEqual(first["error_code"], "SOCKET_ERROR")
         self.assertIsNone(first["errno"])
+
+
+class TestCliTraceSetup(CliDiagnosticsMixin, unittest.TestCase):
+    def _run_isolated_setup(
+        self,
+        argv: list[str],
+        *,
+        flashing: bool = False,
+        health_ok: bool = True,
+    ) -> dict[str, Any]:
+        calls: list[dict[str, Any]] = []
+        runtime = mock.Mock()
+        runtime.mode.return_value = "on-demand"
+        effects = mock.Mock()
+        effects.has_systemd.return_value = False
+
+        def fake_rpc(
+            endpoint: str,
+            method: str,
+            params: dict[str, Any],
+            *,
+            timeout_s: float = 5.0,
+            retries: int = 0,
+            trace_sink: Any = None,
+        ) -> dict[str, Any]:
+            calls.append({
+                "endpoint": endpoint,
+                "method": method,
+                "params": dict(params),
+                "timeout_s": timeout_s,
+                "retries": retries,
+                "trace_sink": trace_sink,
+            })
+            if trace_sink is not None:
+                trace_sink({"elapsed_ms": 1, "retry_count": 0, "errno": None, "errno_name": None})
+            if method == "health.ping":
+                return {"ok": health_ok, **({} if health_ok else {"error_code": "SOCKET_ERROR"})}
+            if method == "mcu.status":
+                return {"ok": True, "flashing": flashing}
+            raise AssertionError(f"unexpected method: {method}")
+
+        with (
+            mock.patch("sw_core.sysenv.SystemEffects", return_value=effects),
+            mock.patch("sw_core.cli._default_runtime_config", return_value=runtime),
+            mock.patch(
+                "sw_core.cli._resolve_endpoint_info",
+                return_value=cli._ResolvedEndpoint("/tmp/sw198-setup.sock", "--socket"),
+            ) as resolve_endpoint,
+            mock.patch("sw_core.cli.detect_legacy_install", return_value=[]),
+            mock.patch("sw_core.cli.materialize_assets") as materialize,
+            mock.patch("sw_core.cli.ensure_wsl_systemd", return_value={"needs_restart": False}),
+            mock.patch("sw_core.cli.reconcile", return_value={"mode": "on-demand"}) as reconcile,
+            mock.patch("sw_core.cli.rpc_call", side_effect=fake_rpc),
+        ):
+            rc, out, err = self._invoke_main(argv, env={"SERIALWRAP_LOG_LEVEL": "WARNING"})
+
+        return {
+            "rc": rc,
+            "out": out,
+            "err": err,
+            "calls": calls,
+            "resolve_count": resolve_endpoint.call_count,
+            "materialize": materialize,
+            "reconcile": reconcile,
+        }
+
+    def test_setup_success_trace_covers_existing_probe_rpcs_without_changing_sequence(self) -> None:
+        quiet = self._run_isolated_setup(["setup", "--on-demand"])
+        verbose = self._run_isolated_setup(["-v", "setup", "--on-demand"])
+
+        quiet_sequence = [(item["method"], item["timeout_s"]) for item in quiet["calls"]]
+        verbose_sequence = [(item["method"], item["timeout_s"]) for item in verbose["calls"]]
+        self.assertEqual(quiet_sequence, [("health.ping", 0.5), ("mcu.status", 0.5)])
+        self.assertEqual(verbose_sequence, quiet_sequence)
+        self.assertEqual(quiet["resolve_count"], 2)
+        self.assertEqual(verbose["resolve_count"], 2)
+        self.assertEqual(quiet["rc"], 0)
+        self.assertEqual(verbose["rc"], 0)
+        self.assertEqual(self._stderr_json_lines(quiet["err"]), [])
+        self.assertEqual(
+            [trace["method"] for trace in self._stderr_json_lines(verbose["err"])],
+            ["health.ping", "mcu.status"],
+        )
+        self.assertEqual(json.loads(quiet["out"])["ok"], True)
+        self.assertEqual(json.loads(verbose["out"])["ok"], True)
+
+    def test_setup_flashing_early_return_keeps_traced_probe_and_skips_mutations(self) -> None:
+        result = self._run_isolated_setup(["-v", "setup", "--on-demand"], flashing=True)
+
+        self.assertEqual(result["rc"], 2)
+        self.assertEqual(
+            [(item["method"], item["timeout_s"]) for item in result["calls"]],
+            [("health.ping", 0.5), ("mcu.status", 0.5)],
+        )
+        self.assertEqual(
+            [trace["method"] for trace in self._stderr_json_lines(result["err"])],
+            ["health.ping", "mcu.status"],
+        )
+        self.assertEqual(json.loads(result["out"])["error_code"], "FLASHING_BUSY")
+        result["materialize"].assert_not_called()
+        result["reconcile"].assert_not_called()
+
+    def test_setup_health_ping_failure_still_sends_mcu_status_probe(self) -> None:
+        result = self._run_isolated_setup(
+            ["-v", "setup", "--on-demand"],
+            health_ok=False,
+        )
+
+        self.assertEqual(result["rc"], 0)
+        self.assertEqual(
+            [item["method"] for item in result["calls"]],
+            ["health.ping", "mcu.status"],
+        )
+        self.assertEqual(
+            [trace["method"] for trace in self._stderr_json_lines(result["err"])],
+            ["health.ping", "mcu.status"],
+        )
 
 
 class TestCliTraceNoExtraRpcOnTraceSinkFailure(CliDiagnosticsMixin, unittest.TestCase):

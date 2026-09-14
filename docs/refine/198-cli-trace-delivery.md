@@ -16,7 +16,7 @@
   - `propagate=False`
   - 自有 `stderr` handler 冪等重設，不污染 root / `serialwrap` logger
   - 預設 `WARNING`，所以既有 stdout/stderr 契約維持不變
-- `_run_rpc()`、`event` 分派、`daemon stop`，以及 `daemon start` **前置 health probe / 就緒等待** 內的既有 RPC 呼叫，統一走同一個 trace wrapper。
+- `_run_rpc()`、`event` 分派、`daemon stop`、`setup` 的既有 `health.ping`／`mcu.status` 前置檢查，以及 `daemon start` **前置 health probe / 就緒等待** 內的既有 RPC 呼叫，統一走同一個 trace wrapper。`setup` 仍保留每個 probe 各自一次 endpoint 解析、0.5 秒 timeout、原本的順序與 best-effort／`FLASHING_BUSY` 行為；trace 不新增 probe 或 RPC。
 - `sw_core.client.rpc_call()` 新增 **內部用** `trace_sink` metadata 通道，只回報：
   - `elapsed_ms`
   - `retry_count`
@@ -80,7 +80,8 @@ serialwrap -v --endpoint tcp://127.0.0.1:48700 event status --selector COM0
   - 預設 byte compatibility
   - `--help` 露出 `-v/--verbose`
   - `-v` / `SERIALWRAP_LOG_LEVEL` precedence
-  - `daemon start` already-running 與前置 probe failure trace
+- `daemon start` already-running 與前置 probe failure trace
+- `setup` 的 `health.ping`／`mcu.status` success、health failure、`FLASHING_BUSY` early return，以及 quiet/verbose 相同 RPC 順序、次數與 0.5 秒 timeout
   - `trace_sink` 相關 `TypeError` 不得造成 `session.recover` / `command.submit` 額外 RPC
   - 重複 `main()` 不殘留 trace/handler
   - `ENOENT` / `ECONNREFUSED` / `EACCES`
@@ -88,6 +89,7 @@ serialwrap -v --endpoint tcp://127.0.0.1:48700 event status --selector COM0
   - TIMEOUT enrich 不污染主請求 errno
   - config fallback source 與 probe 次數
   - `event.rule_set` 真正 method 與 trace 白名單
-  - logger 隔離
+- logger 隔離
+- `SERIALWRAP_LOG_LEVEL` 的空白、有效名稱／合法數字，以及 `--1`、`²`、過長數字等無效值安靜回 `WARNING`；一般 RPC CLI 仍正常送出一次 RPC
 - 相關既有 CLI / endpoint / event / timeout / Windows seam 測試已回歸。
 - 本缺陷可用 pytest + transport seam 完整覆蓋，**不需新增 `regression/` 真機 case**；本輪也沒有宣稱實際 Windows、真 daemon 或真 UART 驗證。

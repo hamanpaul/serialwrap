@@ -1,0 +1,9 @@
+---
+type: fix
+issue: 198
+scope: diagnostics
+---
+#198 補充 review fix：未知 `SERIALWRAP_LOG_LEVEL` 安靜回退 `WARNING`；`setup` 的既有
+`health.ping`／`mcu.status` RPC 接入 CLI trace 且保留原 probe 順序、timeout、best-effort
+與 `FLASHING_BUSY` 行為；F7 對明確 `CHECKSUM_MISMATCH` 回報
+`FAIL/test/binary_roundtrip_mismatch`，不再被工具探測結果降為環境 `SKIP`。

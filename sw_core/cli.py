@@ -1192,11 +1192,17 @@ def _run_setup(args: argparse.Namespace) -> int:
     daemon_running = False
     any_flashing = False
     try:
-        daemon_running = bool(rpc_call(_resolve_endpoint(args), "health.ping", {}, timeout_s=0.5).get("ok"))
+        resolved = _resolve_endpoint_info(args)
+        daemon_running = bool(
+            _rpc_call_traced(args, resolved, "health.ping", {}, timeout_s=0.5).get("ok")
+        )
     except Exception:
         daemon_running = False
     try:
-        any_flashing = bool(rpc_call(_resolve_endpoint(args), "mcu.status", {}, timeout_s=0.5).get("flashing"))
+        resolved = _resolve_endpoint_info(args)
+        any_flashing = bool(
+            _rpc_call_traced(args, resolved, "mcu.status", {}, timeout_s=0.5).get("flashing")
+        )
     except Exception:
         any_flashing = False
 

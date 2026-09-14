@@ -30,6 +30,15 @@ bytes，後續 failure sentinel 黏在其後仍會辨識，真正缺 marker 則�
 `PULL_PARSE_FAILED`。pull 的遠端 md5 缺失或無法解析時回傳 `CHECKSUM_VERIFY_FAILED`，
 不寫出未驗證的本地檔案；GNU `md5sum` 對含反斜線檔名的 escaped digest 格式也會解析。
 
+## F7 回歸 oracle 補充
+
+`CHECKSUM_MISMATCH` 表示傳輸已完成但 round-trip 內容明確不一致，屬產品完整性回歸，
+F7 一律回報 `FAIL`／`category=test`／`reason_code=binary_roundtrip_mismatch`，不受
+`tools_present=True`、`False` 或 `None` 影響。這與工具缺失／工具執行失敗，以及
+`PULL_PARSE_FAILED`、`MOVE_FAILED`、逾時等未完成傳輸的環境性 `SKIP` 分流不同；不能把
+所有非 `ok` 回應一概升為 FAIL。逐板執行遇到此明確 checksum FAIL 會立即停止，不讓
+後續板卡的 PASS 掩蓋第一個完整性失敗。
+
 ## 單行成本
 
 所有命令在 TX 前以 `len(command.encode("utf-8"))` 檢查。push 的 raw chunk 上限依兩種

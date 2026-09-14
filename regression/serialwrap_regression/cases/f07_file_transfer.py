@@ -105,9 +105,18 @@ def _target_tools_probe_command() -> str:
 
 def _transfer_failure_verdict(resp: dict[str, Any], *, verb: str,
                               tools_present: bool | None) -> CaseResult:
-    """push/pull 非 ok 的統一分流：逾時／連線層→環境 SKIP；工具徵兆碼→依探測結果分流
-    （工具在＝#32 類真回歸 FAIL；工具不在或未知＝環境 SKIP）；其餘明確失敗→環境 SKIP。"""
+    """push/pull 非 ok 的統一分流。
+
+    ``CHECKSUM_MISMATCH`` 是已完成傳輸後的明確完整性失敗，無論工具探測結果都必須
+    讓 F7 紅燈；工具缺失／工具執行錯誤、逾時與其他未完成傳輸則保留原有環境分流。
+    """
     code = str(resp.get("error_code") or "unknown")
+    if code == "CHECKSUM_MISMATCH":
+        return CaseResult(
+            "FAIL",
+            reason=f"{verb} 完成但 checksum 不一致（error_code={code}）",
+            category="test", reason_code="binary_roundtrip_mismatch",
+        )
     if code in _TOOL_MISSING_CODES:
         if tools_present is True:
             return CaseResult(

@@ -22,7 +22,12 @@ def _parse_log_level(raw: str | None) -> int | None:
     if not value:
         return None
     if value.lstrip("-").isdigit():
-        return int(value)
+        try:
+            return int(value)
+        except ValueError:
+            # Unicode digit lookalikes (例如 ``²``)、重複負號與超過 Python
+            # 整數轉換上限的輸入都視為未知設定，不能讓診斷設定擊穿 CLI。
+            return None
     levels = {
         "CRITICAL": logging.CRITICAL,
         "FATAL": logging.FATAL,
@@ -69,7 +74,16 @@ def configure_cli_trace_logger(
         setattr(handler, _TRACE_HANDLER_ATTR, True)
         logger.addHandler(handler)
     if getattr(handler, "stream", None) is not target_stream:
-        handler.setStream(target_stream)
+        try:
+            handler.setStream(target_stream)
+        except (OSError, ValueError):
+            # pytest/caller-owned capture stream 可能在兩次 CLI 呼叫間已關閉；
+            # trace handler 必須自癒，不能讓診斷設定反過來擊穿一般 RPC CLI。
+            logger.removeHandler(handler)
+            handler = logging.StreamHandler(target_stream)
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            setattr(handler, _TRACE_HANDLER_ATTR, True)
+            logger.addHandler(handler)
     return logger
 
 
