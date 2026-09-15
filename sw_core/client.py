@@ -173,7 +173,7 @@ def rpc_call(
     if not resp.get("ok") and resp.get("error_code") == "TIMEOUT" and method not in _PROBE_METHODS:
         resp.update(_probe_daemon_after_timeout(socket_path))
     if trace_sink is not None:
-        trace_sink({
+        trace_metadata = {
             "elapsed_ms": max(0, int((time.monotonic() - started_at) * 1000)),
             "retry_count": retry_count,
             "errno": last_main_attempt_errno,
@@ -182,7 +182,12 @@ def rpc_call(
                 if last_main_attempt_errno is not None
                 else None
             ),
-        })
+        }
+        try:
+            trace_sink(trace_metadata)
+        except Exception:
+            # 診斷回呼是 best-effort，不得覆蓋已完成的 RPC 結果；不攔截 BaseException。
+            pass
     return resp
 
 

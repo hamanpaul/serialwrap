@@ -692,6 +692,82 @@ class TestCliTraceNoExtraRpcOnTraceSinkFailure(CliDiagnosticsMixin, unittest.Tes
                 self.assertIsNotNone(calls[0][2]["trace_sink"])
 
 
+class TestRpcCallTraceSink(unittest.TestCase):
+    def test_sink_exception_preserves_success_and_failure_rpc_responses(self) -> None:
+        endpoint = "/tmp/sw201-trace-sink.sock"
+        responses = (
+            {"ok": True, "value": "completed"},
+            {"ok": False, "error_code": "REQUEST_REJECTED", "message": "unchanged"},
+        )
+
+        for response in responses:
+            with self.subTest(ok=response["ok"]):
+                sink_calls: list[dict[str, Any]] = []
+
+                def failing_sink(metadata: dict[str, Any]) -> None:
+                    sink_calls.append(metadata)
+                    raise RuntimeError("diagnostic sink failed")
+
+                with mock.patch.object(
+                    client, "_rpc_call_once", return_value=response
+                ) as rpc_call_once:
+                    result = client.rpc_call(
+                        endpoint,
+                        "command.submit",
+                        {"selector": "COM0", "cmd": "echo once"},
+                        trace_sink=failing_sink,
+                    )
+
+                self.assertIs(result, response)
+                self.assertEqual(rpc_call_once.call_count, 1)
+                self.assertEqual(len(sink_calls), 1)
+
+    def test_successful_sink_receives_metadata_once(self) -> None:
+        response = {"ok": True, "value": "completed"}
+        metadata_items: list[dict[str, Any]] = []
+
+        with mock.patch.object(
+            client, "_rpc_call_once", return_value=response
+        ) as rpc_call_once:
+            result = client.rpc_call(
+                "/tmp/sw201-trace-sink.sock",
+                "command.submit",
+                {"selector": "COM0", "cmd": "echo once"},
+                trace_sink=metadata_items.append,
+            )
+
+        self.assertIs(result, response)
+        rpc_call_once.assert_called_once()
+        self.assertEqual(len(metadata_items), 1)
+        self.assertEqual(
+            set(metadata_items[0]),
+            {"elapsed_ms", "retry_count", "errno", "errno_name"},
+        )
+        self.assertGreaterEqual(metadata_items[0]["elapsed_ms"], 0)
+        self.assertEqual(metadata_items[0]["retry_count"], 0)
+        self.assertIsNone(metadata_items[0]["errno"])
+        self.assertIsNone(metadata_items[0]["errno_name"])
+
+    def test_sink_does_not_swallow_keyboard_interrupt_or_system_exit(self) -> None:
+        for exception_type in (KeyboardInterrupt, SystemExit):
+            with self.subTest(exception_type=exception_type.__name__):
+                def interrupt_sink(_metadata: dict[str, Any]) -> None:
+                    raise exception_type()
+
+                with mock.patch.object(
+                    client, "_rpc_call_once", return_value={"ok": True}
+                ) as rpc_call_once:
+                    with self.assertRaises(exception_type):
+                        client.rpc_call(
+                            "/tmp/sw201-trace-sink.sock",
+                            "command.submit",
+                            {"selector": "COM0", "cmd": "echo once"},
+                            trace_sink=interrupt_sink,
+                        )
+
+                rpc_call_once.assert_called_once()
+
+
 class TestCliTraceLoggerIsolation(CliDiagnosticsMixin, unittest.TestCase):
     def test_trace_logger_does_not_propagate_to_root_or_serialwrap_logger(self) -> None:
         root_stream = io.StringIO()

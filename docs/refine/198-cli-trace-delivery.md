@@ -55,6 +55,7 @@ stderr trace 僅輸出一行白名單 JSON，欄位固定如下：
 - `elapsed_ms` 由 `client.rpc_call()` 入口量到最終回應，**包含**既有 retry/backoff 與 TIMEOUT enrich。
 - `retry_count` 只反映既有唯讀白名單 retry；mutating RPC 沒有新增 retry。
 - trace wrapper 不會因 `trace_sink`/logger 相關內部錯誤而自動重送主請求；主請求次數仍只受既有 client retry policy 與使用者明確 `--retries` 控制。
+- `rpc_call()` 的可選 `trace_sink` 為 best-effort：callback 的一般 `Exception` 不會覆蓋已完成的 RPC 成功／失敗結果、不觸發 retry 或 TIMEOUT enrich；`KeyboardInterrupt`、`SystemExit` 等 `BaseException` 不攔截。
 - `errno` 只取最後一次 **主請求** attempt 的 `OSError.errno`：
   - retry 後成功 → `errno=null`
   - TIMEOUT 後 enrich 的 `health.ping` / `health.status` 若失敗，也**不會**污染主請求 trace

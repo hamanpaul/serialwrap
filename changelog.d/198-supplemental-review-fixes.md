@@ -8,3 +8,4 @@ scope: diagnostics
 `health.ping`／`mcu.status` RPC 接入 CLI trace 且保留原 probe 順序、timeout、best-effort
 與 `FLASHING_BUSY` 行為；F7 對明確 `CHECKSUM_MISMATCH` 回報
 `FAIL/test/binary_roundtrip_mismatch`，不再被工具探測結果降為環境 `SKIP`。
+`rpc_call()` 的 trace sink 例外也採 best-effort，不覆蓋既有 RPC 結果或重試／enrich 行為。
