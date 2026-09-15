@@ -1,0 +1,22 @@
+name: Architecture source review
+on:
+  pull_request:
+    paths: ['.github/workflows/architecture-source-review.yml']
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: 匯出唯讀 Git 來源供離線架構驗證
+        run: git bundle create /tmp/serialwrap-architecture-source.bundle HEAD
+      - uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1
+        with:
+          name: serialwrap-architecture-source
+          path: /tmp/serialwrap-architecture-source.bundle
+          retention-days: 1
