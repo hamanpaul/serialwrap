@@ -1,0 +1,1102 @@
+{
+  "schema_version": 1,
+  "document_type": "architecture-facts",
+  "repository": {
+    "url": "https://github.com/hamanpaul/serialwrap",
+    "revision": "cf2aaba9004c18a82a6a5e4e0dcc66ea7211aeb1"
+  },
+  "scope": {
+    "name": "serialwrap：命令主線、Session 控制、human 共用與可選 I/O 支線",
+    "includes": [
+      "以 line 命令呈現主要呼叫鏈，節點編號不是 Cortex WorkflowRun",
+      "command、session、lease、background capture 分開建模",
+      "profile/裝置偵測/readiness 與 state.json 真正持久化欄位",
+      "human console、WAL、事件觸發、檔案傳輸及 flash/handoff 支線"
+    ],
+    "excludes": [
+      "未合併 refine 計畫與待修 issue 不提升為已實作架構",
+      "installer/systemd 與 SSH/Cloudflare 可達性細節",
+      "不建立原始碼不存在的 Persona/Card/AgentInstance/WorkflowRun 模型",
+      "不主張本次有連接實體 DUT 或驗證 Windows 實機"
+    ]
+  },
+  "components": [
+    {
+      "id": "arbiter",
+      "label": "3 命令排程",
+      "type": "messagebus",
+      "sublabel": "CommandArbiter",
+      "responsibility": "每個 ready session 建 PriorityQueue 與 worker。依 priority/counter 排隊；submit 回 accepted＋cmd_id，worker 才標 running 並呼叫 execute_command；pending 有上限。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/arbiter.py",
+          "line": 36,
+          "end_line": 56,
+          "excerpt_sha256": "ee1b56fcd61cff8300d8623051b1e53b89af8be614f7980e07571ee4469fdd71",
+          "claim": "每 session 的 queue、worker 與命令記憶體。"
+        },
+        {
+          "path": "sw_core/arbiter.py",
+          "line": 125,
+          "end_line": 213,
+          "excerpt_sha256": "1c27648369ba8f7b8339633dfa4ef25d92e11dbfea96403f9b4d5b735a70e148",
+          "claim": "admission、accepted 與 priority queue。"
+        },
+        {
+          "path": "sw_core/arbiter.py",
+          "line": 260,
+          "end_line": 318,
+          "excerpt_sha256": "e4ced0acd6b067c7bc8adffdf54f288b3049c6f0c2496217c59324c2f949354e",
+          "claim": "單一 worker 取件、running 與 callback。"
+        }
+      ]
+    },
+    {
+      "id": "bridge",
+      "label": "5 UARTBridge",
+      "type": "backend",
+      "sublabel": "單一 owner；TX／RX",
+      "responsibility": "Bridge 開啟 SerialPort 後以單一 RX loop 讀取；write lock 序列化 TX，flash gate 限定燒錄寫入。RX 同時送 console、記憶體窗口、WAL 與 session observers。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/uart_io.py",
+          "line": 240,
+          "end_line": 276,
+          "excerpt_sha256": "a91b1eb6d7567469b9ea4be39768831aa3901c77526f5a1ebbfdaa27ec471cd2",
+          "claim": "SerialPort 與 RX loop 啟動。"
+        },
+        {
+          "path": "sw_core/uart_io.py",
+          "line": 659,
+          "end_line": 674,
+          "excerpt_sha256": "be2a236ba4100608c30455111cbeb2a0de17b2cd284f51fab7df858487706878",
+          "claim": "RX WAL、buffer、observer 與 console fanout。"
+        },
+        {
+          "path": "sw_core/uart_io.py",
+          "line": 859,
+          "end_line": 891,
+          "excerpt_sha256": "fdf50c036976329df3421870e89a424d7ad901b5f94e355cdf45c84f8c33a7a6",
+          "claim": "write lock、flash gate 與 TX WAL。"
+        }
+      ]
+    },
+    {
+      "id": "capture",
+      "label": "BackgroundCapture",
+      "type": "database",
+      "sublabel": "後續 RX／result-tail",
+      "responsibility": "background 送出時先建立 capture，prompt 返回即可結束 submission；後續 RX 仍可追加 capture。capture 與 command record 分開，command done 不代表背景工作已完成。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 192,
+          "end_line": 226,
+          "excerpt_sha256": "ebf1d17884b83ece0822bcde268872018cfd29a4c9abf69385131f84ad8bc553",
+          "claim": "BackgroundCapture 欄位、狀態與 payload。"
+        },
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 3551,
+          "end_line": 3679,
+          "excerpt_sha256": "91197f507115911f9ba7dc4191f0a76b259898ff0326590c37934ae4db30b913",
+          "claim": "background_capture_id 與 prompt 返回。"
+        },
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 4566,
+          "end_line": 4591,
+          "excerpt_sha256": "e360bef120d9b1707efd35f876d38df2a1c4390d674530ce767ac673a4e36d68",
+          "claim": "增量結果查詢。"
+        }
+      ]
+    },
+    {
+      "id": "cli",
+      "label": "1 CLI／Agent",
+      "type": "frontend",
+      "sublabel": "RPC 呼叫／查詢結果",
+      "responsibility": "CLI 經 rpc_call 連 daemon。command.submit 為單發寫操作；transport TIMEOUT 不表示目標命令已取消，不能無條件重送。唯讀白名單可退避重試。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/client.py",
+          "line": 9,
+          "end_line": 44,
+          "excerpt_sha256": "5099ec2facff743f9c3028622e3635b96bc246bb7febfca72a5b2c3c9ce51a80",
+          "claim": "限定唯讀／冪等 RPC 重試；寫入不能自動重送。"
+        },
+        {
+          "path": "sw_core/client.py",
+          "line": 107,
+          "end_line": 153,
+          "excerpt_sha256": "2301162e07f9dfed874438fd262ef9286e399bf7647b601bea933e47bebdab00",
+          "claim": "RPC 請求回應與 timeout 行為。"
+        }
+      ]
+    },
+    {
+      "id": "command-records",
+      "label": "Command records",
+      "type": "database",
+      "sublabel": "accepted→running→終態",
+      "responsibility": "CommandArbiter._commands 的有界記憶體紀錄，worker/cancel/flush 寫入，command.get 讀取。狀態有 accepted/running/done/error/canceled/interactive；不是 durable job registry。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/arbiter.py",
+          "line": 36,
+          "end_line": 44,
+          "excerpt_sha256": "febbcc5fa730fed9175154ed314c15b7d16cd9e361cfba95ecc80fd3de95079c",
+          "claim": "_commands 為記憶體 dict。"
+        },
+        {
+          "path": "sw_core/arbiter.py",
+          "line": 241,
+          "end_line": 246,
+          "excerpt_sha256": "277d328008e8deda5d20ff4325ef8c45550b2d339c524a14e187b0ec6f554dc5",
+          "claim": "command.get 讀回副本。"
+        },
+        {
+          "path": "sw_core/arbiter.py",
+          "line": 260,
+          "end_line": 318,
+          "excerpt_sha256": "e4ced0acd6b067c7bc8adffdf54f288b3049c6f0c2496217c59324c2f949354e",
+          "claim": "執行結果寫回真實 command 狀態。"
+        }
+      ]
+    },
+    {
+      "id": "event-handler",
+      "label": "外部 handler",
+      "type": "external",
+      "sublabel": "subprocess／timeout",
+      "responsibility": "事件 handler 由 Dispatcher 在獨立的 subprocess 執行，受並行與 timeout 管理；handler 不是核心 Session 狀態 owner，重新呼叫 CLI 仍走 RPC 與 admission。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/event_engine/dispatcher.py",
+          "line": 153,
+          "end_line": 235,
+          "excerpt_sha256": "a340ef79d43660c6f243f3a8f346bbbed69e6b921cf4014e78f5f04c616b6b25",
+          "claim": "handler subprocess 生命週期。"
+        }
+      ]
+    },
+    {
+      "id": "events",
+      "label": "Event Engine",
+      "type": "backend",
+      "sublabel": "RX → matcher → handler",
+      "responsibility": "啟用的 COM 才把完整 RX line 送規則 matcher；Dispatcher 執行 handler，counter 與事件日誌另記。它是觀測／觸發支線，不代替 command arbiter 或 readiness 判定。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/event_engine/engine.py",
+          "line": 46,
+          "end_line": 105,
+          "excerpt_sha256": "6e3f30a8d5b2d7265ee4f64d847b771219cba37d8afdb8eee779ef7115fa1193",
+          "claim": "matcher/dispatcher 與 enabled COM feed。"
+        },
+        {
+          "path": "sw_core/event_engine/engine.py",
+          "line": 274,
+          "end_line": 288,
+          "excerpt_sha256": "2831b4fdaefe5ccd8ddd4fecfdaf2928b9a6817b248fe3cad30b11f9024b537c",
+          "claim": "規則命中後觸發 handler。"
+        },
+        {
+          "path": "sw_core/service.py",
+          "line": 297,
+          "end_line": 304,
+          "excerpt_sha256": "c6f66d22f686e5677a15d496d0051ae2ee62c72bbf540597e8214b97eb9506a6",
+          "claim": "line buffer 送 event engine。"
+        }
+      ]
+    },
+    {
+      "id": "execute",
+      "label": "4 命令執行",
+      "type": "backend",
+      "sublabel": "execute_command",
+      "responsibility": "這是 SessionManager 內的執行函式，不是獨立服務。出列後再驗 READY/FLASHING/lease；line/background 記 RX offset、送原始 command、等待 prompt_regex 並擷取 stdout；終結後恢復 human。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 3486,
+          "end_line": 3549,
+          "excerpt_sha256": "14835aefcfdae4c89400c2c6eabf7fe4535bf7fee4004f4655a0ee20a09189e9",
+          "claim": "出列後再驗狀態／lease 與 suspend/finally resume。"
+        },
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 3551,
+          "end_line": 3679,
+          "excerpt_sha256": "91197f507115911f9ba7dc4191f0a76b259898ff0326590c37934ae4db30b913",
+          "claim": "三種 mode、raw command、RX offset、prompt/timeout 判定。"
+        }
+      ]
+    },
+    {
+      "id": "file-transfer",
+      "label": "file.push／pull",
+      "type": "backend",
+      "sublabel": "分段 base64／ACK",
+      "responsibility": "檔案傳輸是另外的 RPC 操作：SessionManager 檢查 session 與 lease、暫停 human，透過 bridge callbacks 執行傳輸；不是將整個檔案塞進 command.submit queue。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 4692,
+          "end_line": 4779,
+          "excerpt_sha256": "b007fcd450c02f61215be682d91502be1a6b93757b8cb6443d07d0fc716d0312",
+          "claim": "獨立檔案傳輸仲裁與 bridge callback。"
+        },
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 4781,
+          "end_line": 4847,
+          "excerpt_sha256": "658640012d9e2ee28bb1d2fcffb010a49ae03d23bd569cece715971332034cf8",
+          "claim": "檔案拉取獨立路徑。"
+        }
+      ]
+    },
+    {
+      "id": "flasher",
+      "label": "外部 flasher",
+      "type": "external",
+      "sublabel": "ttyMCU／已釋出裝置",
+      "responsibility": "外部燒錄工具可使用 broker flash endpoint，或由使用者先 device.release 再直接獨佔 raw device；後者必須顯式 device.attach 才收回。",
+      "basis": "declared",
+      "evidence": [
+        {
+          "path": "README.md",
+          "line": 1685,
+          "end_line": 1728,
+          "excerpt_sha256": "b7a65748246bc6533170b4a654ec5a2d642ba485b86b8b23ac220135226b447e",
+          "claim": "兩條不同燒錄路徑與明確交接方式。"
+        }
+      ]
+    },
+    {
+      "id": "handoff",
+      "label": "Flash／交接",
+      "type": "backend",
+      "sublabel": "FLASHING ≠ RELEASED",
+      "responsibility": "FlashEndpoint 匹配 flasher sync，唯一命中才 bridge；FLASHING 排他 gate 結束後恢復先前 session。device.release 則關閉 FD、持久化 RELEASED、不自動搶回，需 device.attach。兩者不能混成同一恢復。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/service.py",
+          "line": 378,
+          "end_line": 462,
+          "excerpt_sha256": "2fa0567b11ebe1caa245a2cc434f0600aaca1165f9664eb1caf89fbb0162998f",
+          "claim": "認線、gate、flash bridge 與 finally 收尾。"
+        },
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 1732,
+          "end_line": 1756,
+          "excerpt_sha256": "58de363e47ae5359448a5a7c8cebd9f6336b2386b787f38b4ce2ad26afccde8a",
+          "claim": "RELEASED 交接。"
+        },
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 1815,
+          "end_line": 1832,
+          "excerpt_sha256": "314281e71b98fa222eec434073274d2f9772531fc3de027eba3a3ed19cb36ef4",
+          "claim": "FLASHING 收尾恢復之前狀態。"
+        }
+      ]
+    },
+    {
+      "id": "human",
+      "label": "Human console",
+      "type": "frontend",
+      "sublabel": "minicom／PTY／TCP",
+      "responsibility": "人工 console 經 broker attach；raw RX 廣播給各 console。raw 鍵入與 agent 共用同一 bridge；agent 忙碌時輸入暫存而非交錯 TX。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/uart_io.py",
+          "line": 730,
+          "end_line": 781,
+          "excerpt_sha256": "6482f0feabbf9b47e59c0fd83522b38ffdc2522dda36e71046a3e33513cc8cde",
+          "claim": "human 輸入路徑、deferred 與行模式。"
+        },
+        {
+          "path": "sw_core/uart_io.py",
+          "line": 1131,
+          "end_line": 1157,
+          "excerpt_sha256": "ebc941ad2a32086f9ef62f28b9108f0fb1fcd1af2c20b1ddd8a4b7974fcb5cb7",
+          "claim": "建立 broker console 端點。"
+        }
+      ]
+    },
+    {
+      "id": "lease",
+      "label": "互動租約",
+      "type": "backend",
+      "sublabel": "InteractiveLease",
+      "responsibility": "SessionManager 持有互動 lease；active human 會阻擋 agent，idle human 可 soft preempt 並保留 console。此節點是 lease 仲裁邏輯，不是另一個 Agent process。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 3862,
+          "end_line": 4040,
+          "excerpt_sha256": "d56280b177090049c56e332aad2bdb28f9f4195ad3bc76d01c130d4af80200a2",
+          "claim": "人類 lease 活躍判定、soft preempt、互斥與 bootloader recovery。"
+        },
+        {
+          "path": "sw_core/uart_io.py",
+          "line": 1212,
+          "end_line": 1251,
+          "excerpt_sha256": "0c2b79a0a3b6e53efe683bf5dc703a565f92a4bbcf936d646a936d3d524c2b82",
+          "claim": "suspend/resume 巢狀計數與暫存回放。"
+        }
+      ]
+    },
+    {
+      "id": "profiles",
+      "label": "Profiles／契約",
+      "type": "external",
+      "sublabel": "prompt／probe／UART",
+      "responsibility": "ProfileTemplate／SessionProfile 定義登入、prompt、ready_probe、UART 與 timeout；不是 Persona，也不是派工進度。只有非空白 ready_probe 才具有 command_capable。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/config.py",
+          "line": 21,
+          "end_line": 78,
+          "excerpt_sha256": "251eba8fa35bd29f6b03e9f0c162d52f56bff10529cb0069181a5ff78436ad78",
+          "claim": "profile schema 與 command_capable 判準。"
+        }
+      ]
+    },
+    {
+      "id": "recovery",
+      "label": "Timeout／Recovery",
+      "type": "backend",
+      "sublabel": "Ctrl-C → Ctrl-D → 降階",
+      "responsibility": "agent prompt timeout 在非 boot quiet 時依序 Ctrl-C/Ctrl-D；恢復 prompt 回 partial 並 flush 尚未開始命令，否則降 ATTACHED。一般失敗不盲目重送，也不自動 force recover；human timeout 可提升 interactive。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 3681,
+          "end_line": 3787,
+          "excerpt_sha256": "df3f5bf297cf29ca93577de4fc3cf879b93c4fdedf0821dade41cc07c579da80",
+          "claim": "human 特例、Ctrl-C/D、partial、flush 與 ATTACHED。"
+        },
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 4431,
+          "end_line": 4516,
+          "excerpt_sha256": "6bc803a9247ce7573f8a6799f93a97d6fbd330ada68bb0137d2981fb325c23be",
+          "claim": "顯式 recover 與 force 分支。"
+        }
+      ]
+    },
+    {
+      "id": "service",
+      "label": "2 RPC／Service",
+      "type": "backend",
+      "sublabel": "selector／READY gate",
+      "responsibility": "serialwrapd 接 Unix/TCP RPC；SerialwrapService 路由操作、resolve selector、檢查 command_capable、READY、quiet/flash 等 admission 條件後呼叫 arbiter。拒絕時尚未入列。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/daemon.py",
+          "line": 128,
+          "end_line": 198,
+          "excerpt_sha256": "3cc566b93d652cd145eb58ee1b469cf84aacd0e77c780dc965a5b76d0af0d0f5",
+          "claim": "daemon 建 service 與 server 並啟動生命週期。"
+        },
+        {
+          "path": "sw_core/service.py",
+          "line": 614,
+          "end_line": 684,
+          "excerpt_sha256": "a0892e037b9fe8a592bf732570b64efdfeeadaf1542f92b3d82d6a40fd1bc87a",
+          "claim": "命令 admission 的實際拒絕條件。"
+        },
+        {
+          "path": "sw_core/service.py",
+          "line": 885,
+          "end_line": 922,
+          "excerpt_sha256": "86c38b7b6739e643bf1dc56ba9b5eedb15c07b313bbeb1b96bb8c8843d15c7d5",
+          "claim": "command.submit、get 與結果查詢 RPC。"
+        }
+      ]
+    },
+    {
+      "id": "sessions",
+      "label": "SessionManager",
+      "type": "backend",
+      "sublabel": "attach／probe／狀態",
+      "responsibility": "管理 SessionRuntime、profile/alias/by-id、attach 與登入 readiness、console/lease 與 recovery。runtime 狀態留在記憶體；僅指定 bindings、pins、RELEASED 等寫入 state.json。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 622,
+          "end_line": 713,
+          "excerpt_sha256": "8392ef66774625c44182168f008dace791e92bfba835c553699a67d988ba1280",
+          "claim": "SessionManager 初始化、鎖與 callback。"
+        },
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 2132,
+          "end_line": 2160,
+          "excerpt_sha256": "3f713986dd2ef3eae0558b1b5ec4ab567178f8cf4d1c8e119e1cea4907268527",
+          "claim": "更新裝置並觸發 attach。"
+        },
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 2427,
+          "end_line": 2631,
+          "excerpt_sha256": "38515c4746bf5d0d81e122db73ce542e8d11ff806e475b411102000caf32ec2d",
+          "claim": "建立 bridge、登入／probe、設定 READY 或 ATTACHED。"
+        }
+      ]
+    },
+    {
+      "id": "state-store",
+      "label": "state.json",
+      "type": "database",
+      "sublabel": "綁定／pin／RELEASED",
+      "responsibility": "持久化 aliases、bindings、released、profile_pins、profile_detected；不是 command 佇列／命令歷程或所有瞬時 session 狀態的資料庫。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 785,
+          "end_line": 843,
+          "excerpt_sha256": "88d31bffe157772dd07dc8cd77ca7395c57bbfe8f810b9187cbe724100e59296",
+          "claim": "實際持久化欄位與原子替換。"
+        }
+      ]
+    },
+    {
+      "id": "target",
+      "label": "6 UART／DUT",
+      "type": "external",
+      "sublabel": "raw bytes／prompt",
+      "responsibility": "真正執行目標 command 的是 UART 對端裝置，不是 daemon。daemon 依 profile prompt 辨界判斷回傳，並未對每條任意命令可靠擷取 shell exit code。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 3551,
+          "end_line": 3679,
+          "excerpt_sha256": "91197f507115911f9ba7dc4191f0a76b259898ff0326590c37934ae4db30b913",
+          "claim": "以 prompt 邊界擷取，沒有任意 shell exit code 擷取契約。"
+        },
+        {
+          "path": "sw_core/uart_io.py",
+          "line": 954,
+          "end_line": 958,
+          "excerpt_sha256": "950c3f840657060a87bc015a1dbd2632c3d287dd4b434d8aa68f0316484bd53a",
+          "claim": "送出原始命令加換行。"
+        }
+      ]
+    },
+    {
+      "id": "wal",
+      "label": "WAL／mirror",
+      "type": "database",
+      "sublabel": "bytes／seq／source",
+      "responsibility": "WalWriter 以 seq、COM、direction、source、cmd_id 記 RX/TX；raw WAL 是可追溯 byte 記錄，mirror 是文字投影。它不派工，也不能單憑有 log 宣告命令成功。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/uart_io.py",
+          "line": 659,
+          "end_line": 674,
+          "excerpt_sha256": "be2a236ba4100608c30455111cbeb2a0de17b2cd284f51fab7df858487706878",
+          "claim": "bridge 記 RX。"
+        },
+        {
+          "path": "sw_core/uart_io.py",
+          "line": 859,
+          "end_line": 891,
+          "excerpt_sha256": "fdf50c036976329df3421870e89a424d7ad901b5f94e355cdf45c84f8c33a7a6",
+          "claim": "bridge 記 TX。"
+        },
+        {
+          "path": "sw_core/wal.py",
+          "line": 104,
+          "end_line": 162,
+          "excerpt_sha256": "0cd19874d0b816479a021c871f80caf76dea90642f14705432c54abe2dfaadc9",
+          "claim": "WAL 欄位、lock、seq 與 mirror 寫入。"
+        }
+      ]
+    },
+    {
+      "id": "watcher",
+      "label": "DeviceWatcher",
+      "type": "backend",
+      "sublabel": "added／removed／tick",
+      "responsibility": "裝置來源每次掃描後回呼 service 更新 SessionManager；週期 tick 觸發 readiness reconciliation。Watcher 不執行命令也不擁有全部 session 狀態。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/device_watcher.py",
+          "line": 52,
+          "end_line": 68,
+          "excerpt_sha256": "6f01f0e8cda026fc1e53c9c508f5a1ac20c217a7bf5867fe99397774bb7c7960",
+          "claim": "裝置差異與週期回呼。"
+        },
+        {
+          "path": "sw_core/service.py",
+          "line": 264,
+          "end_line": 270,
+          "excerpt_sha256": "46f2c436af226748a80d0a74e90fb80b742205448426c19c14cddb2208c953c1",
+          "claim": "watcher 綁定 device change 與 reconcile_readiness。"
+        }
+      ]
+    }
+  ],
+  "boundaries": [],
+  "relations": [
+    {
+      "id": "arbiter-to-command-records",
+      "from": "arbiter",
+      "to": "command-records",
+      "label": "cmd_id／status",
+      "variant": "default",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/arbiter.py",
+          "line": 241,
+          "end_line": 318,
+          "excerpt_sha256": "2b9f270dd7d5673536be980b9fa2f4ae47513a9a90ad5d1bd825c05509052f45",
+          "claim": "get_command 讀取紀錄、worker 寫入狀態。"
+        }
+      ]
+    },
+    {
+      "id": "arbiter-to-execute",
+      "from": "arbiter",
+      "to": "execute",
+      "label": "worker → running",
+      "variant": "emphasis",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/arbiter.py",
+          "line": 260,
+          "end_line": 318,
+          "excerpt_sha256": "e4ced0acd6b067c7bc8adffdf54f288b3049c6f0c2496217c59324c2f949354e",
+          "claim": "worker 呼叫 send callback，再保存命令結果。"
+        }
+      ]
+    },
+    {
+      "id": "bridge-to-events",
+      "from": "bridge",
+      "to": "events",
+      "label": "RX 觀測 → line",
+      "variant": "dashed",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/service.py",
+          "line": 297,
+          "end_line": 304,
+          "excerpt_sha256": "c6f66d22f686e5677a15d496d0051ae2ee62c72bbf540597e8214b97eb9506a6",
+          "claim": "RX observer 累積完整行並交 EventEngine。"
+        }
+      ]
+    },
+    {
+      "id": "bridge-to-human",
+      "from": "bridge",
+      "to": "human",
+      "label": "廣播 RX",
+      "variant": "dashed",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/uart_io.py",
+          "line": 859,
+          "end_line": 891,
+          "excerpt_sha256": "fdf50c036976329df3421870e89a424d7ad901b5f94e355cdf45c84f8c33a7a6",
+          "claim": "RX fan-out 含已連線 console。"
+        }
+      ]
+    },
+    {
+      "id": "bridge-to-target",
+      "from": "bridge",
+      "to": "target",
+      "label": "raw TX",
+      "variant": "emphasis",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/uart_io.py",
+          "line": 659,
+          "end_line": 674,
+          "excerpt_sha256": "be2a236ba4100608c30455111cbeb2a0de17b2cd284f51fab7df858487706878",
+          "claim": "bridge 對 serial port 寫入並記錄 TX。"
+        }
+      ]
+    },
+    {
+      "id": "bridge-to-wal",
+      "from": "bridge",
+      "to": "wal",
+      "label": "RX／TX ＋ seq",
+      "variant": "default",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/uart_io.py",
+          "line": 859,
+          "end_line": 891,
+          "excerpt_sha256": "fdf50c036976329df3421870e89a424d7ad901b5f94e355cdf45c84f8c33a7a6",
+          "claim": "RX 寫入 WAL、將 seq 附於 observers 回呼。"
+        }
+      ]
+    },
+    {
+      "id": "capture-to-service",
+      "from": "capture",
+      "to": "service",
+      "label": "result.tail 查詢",
+      "variant": "dashed",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/service.py",
+          "line": 928,
+          "end_line": 951,
+          "excerpt_sha256": "42bc1da73de813576629f81de29593fb54e064685f6ea8d5e4b908a57489e9da",
+          "claim": "result.tail 先查 capture，找不到時回退 arbiter 記錄。"
+        }
+      ]
+    },
+    {
+      "id": "cli-to-service",
+      "from": "cli",
+      "to": "service",
+      "label": "JSON RPC",
+      "variant": "emphasis",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/client.py",
+          "line": 9,
+          "end_line": 44,
+          "excerpt_sha256": "5099ec2facff743f9c3028622e3635b96bc246bb7febfca72a5b2c3c9ce51a80",
+          "claim": "client 透過 RPC endpoint 呼叫 daemon。"
+        }
+      ]
+    },
+    {
+      "id": "command-records-to-service",
+      "from": "command-records",
+      "to": "service",
+      "label": "command.get 回讀",
+      "variant": "dashed",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/service.py",
+          "line": 912,
+          "end_line": 919,
+          "excerpt_sha256": "265cc752ec869cb99700a0cf09423789d368dc2adc2018ec3e7179411ff92e47",
+          "claim": "RPC command.get 由 arbiter.get_command 取得紀錄。"
+        }
+      ]
+    },
+    {
+      "id": "events-to-event-handler",
+      "from": "events",
+      "to": "event-handler",
+      "label": "命中規則才啟動",
+      "variant": "dashed",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/event_engine/engine.py",
+          "line": 274,
+          "end_line": 288,
+          "excerpt_sha256": "2831b4fdaefe5ccd8ddd4fecfdaf2928b9a6817b248fe3cad30b11f9024b537c",
+          "claim": "matcher 命中後 dispatch handler。"
+        }
+      ]
+    },
+    {
+      "id": "execute-to-arbiter",
+      "from": "execute",
+      "to": "arbiter",
+      "label": "回傳執行結果",
+      "variant": "default",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/arbiter.py",
+          "line": 260,
+          "end_line": 318,
+          "excerpt_sha256": "e4ced0acd6b067c7bc8adffdf54f288b3049c6f0c2496217c59324c2f949354e",
+          "claim": "callback 結果轉為命令狀態與 result。"
+        }
+      ]
+    },
+    {
+      "id": "execute-to-bridge",
+      "from": "execute",
+      "to": "bridge",
+      "label": "送 raw／等 prompt",
+      "variant": "emphasis",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 3551,
+          "end_line": 3679,
+          "excerpt_sha256": "91197f507115911f9ba7dc4191f0a76b259898ff0326590c37934ae4db30b913",
+          "claim": "execute inner 以 bridge 送 bytes 並等待 prompt。"
+        }
+      ]
+    },
+    {
+      "id": "execute-to-capture",
+      "from": "execute",
+      "to": "capture",
+      "label": "background 分支",
+      "variant": "dashed",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 3551,
+          "end_line": 3679,
+          "excerpt_sha256": "91197f507115911f9ba7dc4191f0a76b259898ff0326590c37934ae4db30b913",
+          "claim": "background 命令送出前建立 capture，與 command result 分離。"
+        }
+      ]
+    },
+    {
+      "id": "execute-to-lease",
+      "from": "execute",
+      "to": "lease",
+      "label": "互斥／暫停／恢復",
+      "variant": "dashed",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 3486,
+          "end_line": 3549,
+          "excerpt_sha256": "14835aefcfdae4c89400c2c6eabf7fe4535bf7fee4004f4655a0ee20a09189e9",
+          "claim": "命令執行前重驗 lease，並暫停與恢復 human interactive。"
+        }
+      ]
+    },
+    {
+      "id": "execute-to-recovery",
+      "from": "execute",
+      "to": "recovery",
+      "label": "prompt 未返回",
+      "variant": "dashed",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 3625,
+          "end_line": 3679,
+          "excerpt_sha256": "464f97d49b2cdf25b450048bc8889f44ee249ad5629e61b7a34f180167aabde5",
+          "claim": "等待 prompt 失敗時呼叫 recovery。"
+        }
+      ]
+    },
+    {
+      "id": "file-transfer-to-bridge",
+      "from": "file-transfer",
+      "to": "bridge",
+      "label": "分段傳輸",
+      "variant": "dashed",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 4692,
+          "end_line": 4779,
+          "excerpt_sha256": "b007fcd450c02f61215be682d91502be1a6b93757b8cb6443d07d0fc716d0312",
+          "claim": "file_push 直接使用 bridge callback，不走 command queue。"
+        }
+      ]
+    },
+    {
+      "id": "flasher-to-handoff",
+      "from": "flasher",
+      "to": "handoff",
+      "label": "認線／顯式交接",
+      "variant": "dashed",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/service.py",
+          "line": 378,
+          "end_line": 462,
+          "excerpt_sha256": "2fa0567b11ebe1caa245a2cc434f0600aaca1165f9664eb1caf89fbb0162998f",
+          "claim": "FlashEndpoint 收 flasher sync 並唯一匹配後開啟 flash gate。"
+        }
+      ]
+    },
+    {
+      "id": "handoff-to-bridge",
+      "from": "handoff",
+      "to": "bridge",
+      "label": "排他 TX／釋出 FD",
+      "variant": "dashed",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/service.py",
+          "line": 423,
+          "end_line": 462,
+          "excerpt_sha256": "b214d67ab6454ffd377a2c862dbe7685d6079811cd5299bfbd5b691be1269f82",
+          "claim": "命中後限定 bridge flash pump；finally exit_flashing。"
+        }
+      ]
+    },
+    {
+      "id": "handoff-to-sessions",
+      "from": "handoff",
+      "to": "sessions",
+      "label": "FLASHING／RELEASED",
+      "variant": "dashed",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 1732,
+          "end_line": 1832,
+          "excerpt_sha256": "aeb9287dee59cf90d4950611d049404484066c71947107312d916ce6d88bed76",
+          "claim": "release 與 flash entry/exit 各自有不同狀態與恢復條件。"
+        }
+      ]
+    },
+    {
+      "id": "human-to-lease",
+      "from": "human",
+      "to": "lease",
+      "label": "raw owner／暫存",
+      "variant": "default",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/uart_io.py",
+          "line": 1212,
+          "end_line": 1251,
+          "excerpt_sha256": "0c2b79a0a3b6e53efe683bf5dc703a565f92a4bbcf936d646a936d3d524c2b82",
+          "claim": "human raw 輸入依 interactive owner 與 busy 狀態路由。"
+        }
+      ]
+    },
+    {
+      "id": "lease-to-bridge",
+      "from": "lease",
+      "to": "bridge",
+      "label": "授權 raw TX",
+      "variant": "dashed",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 3862,
+          "end_line": 4040,
+          "excerpt_sha256": "d56280b177090049c56e332aad2bdb28f9f4195ad3bc76d01c130d4af80200a2",
+          "claim": "SessionManager 依 lease owner 和狀態授權 bridge TX。"
+        }
+      ]
+    },
+    {
+      "id": "profiles-to-sessions",
+      "from": "profiles",
+      "to": "sessions",
+      "label": "套用 profile",
+      "variant": "default",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 622,
+          "end_line": 713,
+          "excerpt_sha256": "8392ef66774625c44182168f008dace791e92bfba835c553699a67d988ba1280",
+          "claim": "SessionManager 由 profiles 初始化 SessionRuntime 與 bindings。"
+        }
+      ]
+    },
+    {
+      "id": "recovery-to-arbiter",
+      "from": "recovery",
+      "to": "arbiter",
+      "label": "清列；不自動重送",
+      "variant": "dashed",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/service.py",
+          "line": 292,
+          "end_line": 295,
+          "excerpt_sha256": "afdbad658f29385b9ea59d80c6581219493076a57d2d6d9b28555d54ec89dded",
+          "claim": "SessionManager recovery callback 交 arbiter.flush_session。"
+        }
+      ]
+    },
+    {
+      "id": "service-to-arbiter",
+      "from": "service",
+      "to": "arbiter",
+      "label": "入列 accepted",
+      "variant": "emphasis",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/service.py",
+          "line": 885,
+          "end_line": 922,
+          "excerpt_sha256": "86c38b7b6739e643bf1dc56ba9b5eedb15c07b313bbeb1b96bb8c8843d15c7d5",
+          "claim": "通過 admission 後呼叫 arbiter.submit。"
+        }
+      ]
+    },
+    {
+      "id": "service-to-file-transfer",
+      "from": "service",
+      "to": "file-transfer",
+      "label": "file.push／pull",
+      "variant": "dashed",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/service.py",
+          "line": 1061,
+          "end_line": 1125,
+          "excerpt_sha256": "b07739638a23a65b154a376c59ca25549c718bbf73f07eeab8bead4eaddfbb73",
+          "claim": "Service 路由 file.push 與 file.pull 到 SessionManager。"
+        }
+      ]
+    },
+    {
+      "id": "service-to-sessions",
+      "from": "service",
+      "to": "sessions",
+      "label": "attach／recover",
+      "variant": "dashed",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/service.py",
+          "line": 614,
+          "end_line": 684,
+          "excerpt_sha256": "a0892e037b9fe8a592bf732570b64efdfeeadaf1542f92b3d82d6a40fd1bc87a",
+          "claim": "Service 解析 Session、檢查 ready 與處理 attach 等操作。"
+        }
+      ]
+    },
+    {
+      "id": "sessions-to-arbiter",
+      "from": "sessions",
+      "to": "arbiter",
+      "label": "READY 註冊；detach 清列",
+      "variant": "dashed",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/service.py",
+          "line": 286,
+          "end_line": 295,
+          "excerpt_sha256": "3252315cce04f3d9e49b25c30619bfb128ddbdf86b95e34f95fd372a931801e4",
+          "claim": "READY 註冊 session worker，detach 解除註冊。"
+        }
+      ]
+    },
+    {
+      "id": "sessions-to-bridge",
+      "from": "sessions",
+      "to": "bridge",
+      "label": "建立／關閉 bridge",
+      "variant": "dashed",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 2427,
+          "end_line": 2631,
+          "excerpt_sha256": "38515c4746bf5d0d81e122db73ce542e8d11ff806e475b411102000caf32ec2d",
+          "claim": "attach/probe 路徑建立 bridge 並更新 readiness。"
+        }
+      ]
+    },
+    {
+      "id": "sessions-to-state-store",
+      "from": "sessions",
+      "to": "state-store",
+      "label": "原子儲存指定欄位",
+      "variant": "default",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 785,
+          "end_line": 843,
+          "excerpt_sha256": "88d31bffe157772dd07dc8cd77ca7395c57bbfe8f810b9187cbe724100e59296",
+          "claim": "只儲存 aliases/bindings/released/profile pins/detected。"
+        }
+      ]
+    },
+    {
+      "id": "target-to-bridge",
+      "from": "target",
+      "to": "bridge",
+      "label": "RX bytes",
+      "variant": "default",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/uart_io.py",
+          "line": 859,
+          "end_line": 891,
+          "excerpt_sha256": "fdf50c036976329df3421870e89a424d7ad901b5f94e355cdf45c84f8c33a7a6",
+          "claim": "RX loop 讀取 serial port 後 fan-out。"
+        }
+      ]
+    },
+    {
+      "id": "watcher-to-sessions",
+      "from": "watcher",
+      "to": "sessions",
+      "label": "裝置變更／重探",
+      "variant": "default",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "sw_core/service.py",
+          "line": 258,
+          "end_line": 270,
+          "excerpt_sha256": "9f74d7ba546adf9f34d944d32ab6c425a07f36f2d6d2d804fc8dd73c307fd82e",
+          "claim": "Watcher 透過 device callback 與 readiness reconciliation 更新 session。"
+        }
+      ]
+    }
+  ],
+  "unknowns": [
+    {
+      "id": "physical-readiness",
+      "question": "此文件未對實際 DUT 執行 readiness、flashing 或檔案傳輸驗收。",
+      "impact": "source-backed 流程與 HTML 驗證不是實機端到端完成證據。"
+    }
+  ],
+  "conflicts": []
+}
