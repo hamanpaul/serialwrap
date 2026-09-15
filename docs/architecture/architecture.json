@@ -1,0 +1,1241 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "serialwrap｜命令、Session 與 UART",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/hamanpaul/serialwrap",
+      "revision": "cf2aaba9004c18a82a6a5e4e0dcc66ea7211aeb1",
+      "provider": "github"
+    },
+    "viewBox": [
+      1386,
+      828
+    ]
+  },
+  "components": [
+    {
+      "id": "arbiter",
+      "type": "messagebus",
+      "label": "3 命令排程",
+      "sublabel": "CommandArbiter",
+      "sources": [
+        {
+          "path": "sw_core/arbiter.py",
+          "line": 36,
+          "end_line": 56
+        },
+        {
+          "path": "sw_core/arbiter.py",
+          "line": 125,
+          "end_line": 213
+        },
+        {
+          "path": "sw_core/arbiter.py",
+          "line": 260,
+          "end_line": 318
+        }
+      ],
+      "pos": [
+        441.6,
+        295.8
+      ],
+      "size": [
+        133.2,
+        56.4
+      ]
+    },
+    {
+      "id": "bridge",
+      "type": "backend",
+      "label": "5 UARTBridge",
+      "sublabel": "單一 owner；TX／RX",
+      "sources": [
+        {
+          "path": "sw_core/uart_io.py",
+          "line": 240,
+          "end_line": 276
+        },
+        {
+          "path": "sw_core/uart_io.py",
+          "line": 659,
+          "end_line": 674
+        },
+        {
+          "path": "sw_core/uart_io.py",
+          "line": 859,
+          "end_line": 891
+        }
+      ],
+      "pos": [
+        925.8,
+        295.8
+      ],
+      "size": [
+        133.2,
+        56.4
+      ]
+    },
+    {
+      "id": "capture",
+      "type": "database",
+      "label": "BackgroundCapture",
+      "sublabel": "後續 RX／result-tail",
+      "sources": [
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 192,
+          "end_line": 226
+        },
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 3551,
+          "end_line": 3679
+        },
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 4566,
+          "end_line": 4591
+        }
+      ],
+      "pos": [
+        498.0,
+        630.6
+      ],
+      "size": [
+        133.2,
+        56.4
+      ]
+    },
+    {
+      "id": "cli",
+      "type": "frontend",
+      "label": "1 CLI／Agent",
+      "sublabel": "RPC 呼叫／查詢結果",
+      "sources": [
+        {
+          "path": "sw_core/client.py",
+          "line": 9,
+          "end_line": 44
+        },
+        {
+          "path": "sw_core/client.py",
+          "line": 107,
+          "end_line": 153
+        }
+      ],
+      "pos": [
+        21.6,
+        295.8
+      ],
+      "size": [
+        133.2,
+        56.4
+      ]
+    },
+    {
+      "id": "command-records",
+      "type": "database",
+      "label": "Command records",
+      "sublabel": "accepted→running→終態",
+      "sources": [
+        {
+          "path": "sw_core/arbiter.py",
+          "line": 36,
+          "end_line": 44
+        },
+        {
+          "path": "sw_core/arbiter.py",
+          "line": 241,
+          "end_line": 246
+        },
+        {
+          "path": "sw_core/arbiter.py",
+          "line": 260,
+          "end_line": 318
+        }
+      ],
+      "pos": [
+        328.2,
+        466.8
+      ],
+      "size": [
+        133.2,
+        56.4
+      ]
+    },
+    {
+      "id": "event-handler",
+      "type": "external",
+      "label": "外部 handler",
+      "sublabel": "subprocess／timeout",
+      "sources": [
+        {
+          "path": "sw_core/event_engine/dispatcher.py",
+          "line": 153,
+          "end_line": 235
+        }
+      ],
+      "pos": [
+        1104.0,
+        709.8
+      ],
+      "size": [
+        133.2,
+        56.4
+      ]
+    },
+    {
+      "id": "events",
+      "type": "backend",
+      "label": "Event Engine",
+      "sublabel": "RX → matcher → handler",
+      "sources": [
+        {
+          "path": "sw_core/event_engine/engine.py",
+          "line": 46,
+          "end_line": 105
+        },
+        {
+          "path": "sw_core/event_engine/engine.py",
+          "line": 274,
+          "end_line": 288
+        },
+        {
+          "path": "sw_core/service.py",
+          "line": 297,
+          "end_line": 304
+        }
+      ],
+      "pos": [
+        869.4,
+        709.8
+      ],
+      "size": [
+        133.2,
+        56.4
+      ]
+    },
+    {
+      "id": "execute",
+      "type": "backend",
+      "label": "4 命令執行",
+      "sublabel": "execute_command",
+      "sources": [
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 3486,
+          "end_line": 3549
+        },
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 3551,
+          "end_line": 3679
+        }
+      ],
+      "pos": [
+        684.6,
+        295.8
+      ],
+      "size": [
+        133.2,
+        56.4
+      ]
+    },
+    {
+      "id": "file-transfer",
+      "type": "backend",
+      "label": "file.push／pull",
+      "sublabel": "分段 base64／ACK",
+      "sources": [
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 4692,
+          "end_line": 4779
+        },
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 4781,
+          "end_line": 4847
+        }
+      ],
+      "pos": [
+        798.0,
+        10.8
+      ],
+      "size": [
+        133.2,
+        56.4
+      ]
+    },
+    {
+      "id": "flasher",
+      "type": "external",
+      "label": "外部 flasher",
+      "sublabel": "ttyMCU／已釋出裝置",
+      "sources": [
+        {
+          "path": "README.md",
+          "line": 1685,
+          "end_line": 1728
+        }
+      ],
+      "pos": [
+        1097.4,
+        89.4
+      ],
+      "size": [
+        133.2,
+        56.4
+      ]
+    },
+    {
+      "id": "handoff",
+      "type": "backend",
+      "label": "Flash／交接",
+      "sublabel": "FLASHING ≠ RELEASED",
+      "sources": [
+        {
+          "path": "sw_core/service.py",
+          "line": 378,
+          "end_line": 462
+        },
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 1732,
+          "end_line": 1756
+        },
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 1815,
+          "end_line": 1832
+        }
+      ],
+      "pos": [
+        904.8,
+        155.4
+      ],
+      "size": [
+        133.2,
+        56.4
+      ]
+    },
+    {
+      "id": "human",
+      "type": "frontend",
+      "label": "Human console",
+      "sublabel": "minicom／PTY／TCP",
+      "sources": [
+        {
+          "path": "sw_core/uart_io.py",
+          "line": 730,
+          "end_line": 781
+        },
+        {
+          "path": "sw_core/uart_io.py",
+          "line": 1131,
+          "end_line": 1157
+        }
+      ],
+      "pos": [
+        1111.2,
+        523.8
+      ],
+      "size": [
+        133.2,
+        56.4
+      ]
+    },
+    {
+      "id": "lease",
+      "type": "backend",
+      "label": "互動租約",
+      "sublabel": "InteractiveLease",
+      "sources": [
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 3862,
+          "end_line": 4040
+        },
+        {
+          "path": "sw_core/uart_io.py",
+          "line": 1212,
+          "end_line": 1251
+        }
+      ],
+      "pos": [
+        847.8,
+        523.8
+      ],
+      "size": [
+        133.2,
+        56.4
+      ]
+    },
+    {
+      "id": "profiles",
+      "type": "external",
+      "label": "Profiles／契約",
+      "sublabel": "prompt／probe／UART",
+      "sources": [
+        {
+          "path": "sw_core/config.py",
+          "line": 21,
+          "end_line": 78
+        }
+      ],
+      "pos": [
+        235.2,
+        110.4
+      ],
+      "size": [
+        133.2,
+        56.4
+      ]
+    },
+    {
+      "id": "recovery",
+      "type": "backend",
+      "label": "Timeout／Recovery",
+      "sublabel": "Ctrl-C → Ctrl-D → 降階",
+      "sources": [
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 3681,
+          "end_line": 3787
+        },
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 4431,
+          "end_line": 4516
+        }
+      ],
+      "pos": [
+        649.2,
+        466.8
+      ],
+      "size": [
+        133.2,
+        56.4
+      ]
+    },
+    {
+      "id": "service",
+      "type": "backend",
+      "label": "2 RPC／Service",
+      "sublabel": "selector／READY gate",
+      "sources": [
+        {
+          "path": "sw_core/daemon.py",
+          "line": 128,
+          "end_line": 198
+        },
+        {
+          "path": "sw_core/service.py",
+          "line": 614,
+          "end_line": 684
+        },
+        {
+          "path": "sw_core/service.py",
+          "line": 885,
+          "end_line": 922
+        }
+      ],
+      "pos": [
+        220.2,
+        295.8
+      ],
+      "size": [
+        133.2,
+        56.4
+      ]
+    },
+    {
+      "id": "sessions",
+      "type": "backend",
+      "label": "SessionManager",
+      "sublabel": "attach／probe／狀態",
+      "sources": [
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 622,
+          "end_line": 713
+        },
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 2132,
+          "end_line": 2160
+        },
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 2427,
+          "end_line": 2631
+        }
+      ],
+      "pos": [
+        441.6,
+        182.4
+      ],
+      "size": [
+        133.2,
+        56.4
+      ]
+    },
+    {
+      "id": "state-store",
+      "type": "database",
+      "label": "state.json",
+      "sublabel": "綁定／pin／RELEASED",
+      "sources": [
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 785,
+          "end_line": 843
+        }
+      ],
+      "pos": [
+        655.8,
+        60.6
+      ],
+      "size": [
+        133.2,
+        56.4
+      ]
+    },
+    {
+      "id": "target",
+      "type": "external",
+      "label": "6 UART／DUT",
+      "sublabel": "raw bytes／prompt",
+      "sources": [
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 3551,
+          "end_line": 3679
+        },
+        {
+          "path": "sw_core/uart_io.py",
+          "line": 954,
+          "end_line": 958
+        }
+      ],
+      "pos": [
+        1140.6,
+        295.8
+      ],
+      "size": [
+        133.2,
+        56.4
+      ]
+    },
+    {
+      "id": "wal",
+      "type": "database",
+      "label": "WAL／mirror",
+      "sublabel": "bytes／seq／source",
+      "sources": [
+        {
+          "path": "sw_core/uart_io.py",
+          "line": 659,
+          "end_line": 674
+        },
+        {
+          "path": "sw_core/uart_io.py",
+          "line": 859,
+          "end_line": 891
+        },
+        {
+          "path": "sw_core/wal.py",
+          "line": 104,
+          "end_line": 162
+        }
+      ],
+      "pos": [
+        1162.2,
+        395.4
+      ],
+      "size": [
+        133.2,
+        56.4
+      ]
+    },
+    {
+      "id": "watcher",
+      "type": "backend",
+      "label": "DeviceWatcher",
+      "sublabel": "added／removed／tick",
+      "sources": [
+        {
+          "path": "sw_core/device_watcher.py",
+          "line": 52,
+          "end_line": 68
+        },
+        {
+          "path": "sw_core/service.py",
+          "line": 264,
+          "end_line": 270
+        }
+      ],
+      "pos": [
+        441.6,
+        75.6
+      ],
+      "size": [
+        133.2,
+        56.4
+      ]
+    }
+  ],
+  "boundaries": [],
+  "connections": [
+    {
+      "id": "arbiter-to-command-records",
+      "from": "arbiter",
+      "to": "command-records",
+      "label": "cmd_id／status",
+      "variant": "default",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "via": [
+        [
+          508.2,
+          397.2
+        ],
+        [
+          394.8,
+          397.2
+        ]
+      ],
+      "labelAt": [
+        445.8,
+        382.2
+      ]
+    },
+    {
+      "id": "arbiter-to-execute",
+      "from": "arbiter",
+      "to": "execute",
+      "label": "worker → running",
+      "variant": "emphasis"
+    },
+    {
+      "id": "bridge-to-events",
+      "from": "bridge",
+      "to": "events",
+      "label": "RX 觀測 → line",
+      "variant": "dashed",
+      "fromSide": "right",
+      "toSide": "top",
+      "via": [
+        [
+          1080.0,
+          324.0
+        ],
+        [
+          1080.0,
+          466
+        ],
+        [
+          1326.0,
+          466
+        ],
+        [
+          1326.0,
+          677.4
+        ],
+        [
+          936.0,
+          677.4
+        ]
+      ],
+      "labelAt": [
+        1236.6,
+        664.2
+      ]
+    },
+    {
+      "id": "bridge-to-human",
+      "from": "bridge",
+      "to": "human",
+      "label": "廣播 RX",
+      "variant": "dashed",
+      "fromSide": "right",
+      "toSide": "top",
+      "via": [
+        [
+          1086.6,
+          324.0
+        ],
+        [
+          1086.6,
+          466.8
+        ],
+        [
+          1177.8,
+          466.8
+        ]
+      ],
+      "labelAt": [
+        1123,
+        431
+      ]
+    },
+    {
+      "id": "bridge-to-target",
+      "from": "bridge",
+      "to": "target",
+      "label": "raw TX",
+      "variant": "emphasis"
+    },
+    {
+      "id": "bridge-to-wal",
+      "from": "bridge",
+      "to": "wal",
+      "label": "RX／TX ＋ seq",
+      "variant": "default",
+      "fromSide": "right",
+      "toSide": "top",
+      "via": [
+        [
+          1115.4,
+          324.0
+        ],
+        [
+          1115.4,
+          375.0
+        ],
+        [
+          1228.8,
+          375.0
+        ]
+      ],
+      "labelAt": [
+        1228.2,
+        385.8
+      ]
+    },
+    {
+      "id": "capture-to-service",
+      "from": "capture",
+      "to": "service",
+      "label": "result.tail 查詢",
+      "variant": "dashed",
+      "fromSide": "left",
+      "toSide": "bottom",
+      "via": [
+        [
+          214.8,
+          658.8
+        ],
+        [
+          214.8,
+          393.0
+        ],
+        [
+          286.8,
+          393.0
+        ]
+      ],
+      "labelAt": [
+        361.8,
+        645.0
+      ]
+    },
+    {
+      "id": "cli-to-service",
+      "from": "cli",
+      "to": "service",
+      "label": "JSON RPC",
+      "variant": "emphasis"
+    },
+    {
+      "id": "command-records-to-service",
+      "from": "command-records",
+      "to": "service",
+      "label": "command.get 回讀",
+      "variant": "dashed",
+      "fromSide": "left",
+      "toSide": "bottom",
+      "via": [
+        [
+          286.8,
+          495.0
+        ],
+        [
+          286.8,
+          371.4
+        ]
+      ],
+      "labelAt": [
+        285.0,
+        422.4
+      ]
+    },
+    {
+      "id": "events-to-event-handler",
+      "from": "events",
+      "to": "event-handler",
+      "label": "命中規則才啟動",
+      "variant": "dashed"
+    },
+    {
+      "id": "execute-to-arbiter",
+      "from": "execute",
+      "to": "arbiter",
+      "label": "回傳執行結果",
+      "variant": "default",
+      "fromSide": "top",
+      "toSide": "top",
+      "via": [
+        [
+          751.2,
+          267.6
+        ],
+        [
+          508.2,
+          267.6
+        ]
+      ],
+      "labelAt": [
+        615.6,
+        255.0
+      ]
+    },
+    {
+      "id": "execute-to-bridge",
+      "from": "execute",
+      "to": "bridge",
+      "label": "送 raw／等 prompt",
+      "variant": "emphasis"
+    },
+    {
+      "id": "execute-to-capture",
+      "from": "execute",
+      "to": "capture",
+      "label": "background 分支",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "right",
+      "via": [
+        [
+          751.2,
+          408.0
+        ],
+        [
+          790.8,
+          408.0
+        ],
+        [
+          790.8,
+          658.8
+        ]
+      ],
+      "labelAt": [
+        790.8,
+        602.4
+      ]
+    },
+    {
+      "id": "execute-to-lease",
+      "from": "execute",
+      "to": "lease",
+      "label": "互斥／暫停／恢復",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "left",
+      "via": [
+        [
+          751.2,
+          375.6
+        ],
+        [
+          834.0,
+          375.6
+        ],
+        [
+          834.0,
+          552.0
+        ]
+      ],
+      "labelAt": [
+        853.2,
+        444.0
+      ]
+    },
+    {
+      "id": "execute-to-recovery",
+      "from": "execute",
+      "to": "recovery",
+      "label": "prompt 未返回",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "via": [
+        [
+          751.2,
+          391.8
+        ],
+        [
+          715.8,
+          391.8
+        ]
+      ],
+      "labelAt": [
+        710,
+        366
+      ]
+    },
+    {
+      "id": "file-transfer-to-bridge",
+      "from": "file-transfer",
+      "to": "bridge",
+      "label": "分段傳輸",
+      "variant": "dashed",
+      "fromSide": "right",
+      "toSide": "top",
+      "via": [
+        [
+          1290.6,
+          39.0
+        ],
+        [
+          1290.6,
+          240.0
+        ],
+        [
+          1011.0,
+          240.0
+        ],
+        [
+          992.4,
+          240.0
+        ]
+      ],
+      "labelAt": [
+        1290.6,
+        184.8
+      ]
+    },
+    {
+      "id": "flasher-to-handoff",
+      "from": "flasher",
+      "to": "handoff",
+      "label": "認線／顯式交接",
+      "variant": "dashed",
+      "fromSide": "left",
+      "toSide": "top",
+      "via": [
+        [
+          1069.2,
+          117.6
+        ],
+        [
+          1069.2,
+          133.8
+        ],
+        [
+          971.4,
+          133.8
+        ]
+      ],
+      "labelAt": [
+        1019.4,
+        123.0
+      ]
+    },
+    {
+      "id": "handoff-to-bridge",
+      "from": "handoff",
+      "to": "bridge",
+      "label": "排他 TX／釋出 FD",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "via": [
+        [
+          971.4,
+          267.0
+        ],
+        [
+          1026.0,
+          267.0
+        ],
+        [
+          1026.0,
+          285.0
+        ],
+        [
+          992.4,
+          285.0
+        ]
+      ],
+      "labelAt": [
+        1019,
+        228
+      ]
+    },
+    {
+      "id": "handoff-to-sessions",
+      "from": "handoff",
+      "to": "sessions",
+      "label": "FLASHING／RELEASED",
+      "variant": "dashed",
+      "fromSide": "left",
+      "toSide": "right",
+      "via": [
+        [
+          599.4,
+          183.6
+        ],
+        [
+          599.4,
+          210.6
+        ]
+      ],
+      "labelAt": [
+        741,
+        168
+      ]
+    },
+    {
+      "id": "human-to-lease",
+      "from": "human",
+      "to": "lease",
+      "label": "raw owner／暫存",
+      "variant": "default"
+    },
+    {
+      "id": "lease-to-bridge",
+      "from": "lease",
+      "to": "bridge",
+      "label": "授權 raw TX",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "via": [
+        [
+          914.4,
+          469.8
+        ],
+        [
+          914.4,
+          422.4
+        ],
+        [
+          992.4,
+          422.4
+        ]
+      ],
+      "labelAt": [
+        933.0,
+        418.8
+      ]
+    },
+    {
+      "id": "profiles-to-sessions",
+      "from": "profiles",
+      "to": "sessions",
+      "label": "套用 profile",
+      "variant": "default",
+      "fromSide": "right",
+      "toSide": "left",
+      "via": [
+        [
+          402.6,
+          138.6
+        ],
+        [
+          402.6,
+          210.6
+        ]
+      ],
+      "labelAt": [
+        429.6,
+        153.6
+      ]
+    },
+    {
+      "id": "recovery-to-arbiter",
+      "from": "recovery",
+      "to": "arbiter",
+      "label": "清列；不自動重送",
+      "variant": "dashed",
+      "fromSide": "left",
+      "toSide": "bottom",
+      "via": [
+        [
+          572.4,
+          495.0
+        ],
+        [
+          572.4,
+          380.4
+        ],
+        [
+          508.2,
+          380.4
+        ]
+      ],
+      "labelAt": [
+        597.0,
+        427.8
+      ]
+    },
+    {
+      "id": "service-to-arbiter",
+      "from": "service",
+      "to": "arbiter",
+      "label": "入列 accepted",
+      "variant": "emphasis"
+    },
+    {
+      "id": "service-to-file-transfer",
+      "from": "service",
+      "to": "file-transfer",
+      "label": "file.push／pull",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "left",
+      "via": [
+        [
+          286.8,
+          271.2
+        ],
+        [
+          175.2,
+          271.2
+        ],
+        [
+          175.2,
+          39.0
+        ]
+      ],
+      "labelAt": [
+        538.8,
+        25.8
+      ]
+    },
+    {
+      "id": "service-to-sessions",
+      "from": "service",
+      "to": "sessions",
+      "label": "attach／recover",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "left",
+      "via": [
+        [
+          286.8,
+          210.6
+        ]
+      ],
+      "labelAt": [
+        329.4,
+        231.0
+      ]
+    },
+    {
+      "id": "sessions-to-arbiter",
+      "from": "sessions",
+      "to": "arbiter",
+      "label": "READY 註冊；detach 清列",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        502.2,
+        252.6
+      ]
+    },
+    {
+      "id": "sessions-to-bridge",
+      "from": "sessions",
+      "to": "bridge",
+      "label": "建立／關閉 bridge",
+      "variant": "dashed",
+      "fromSide": "right",
+      "toSide": "top",
+      "via": [
+        [
+          754.8,
+          210.6
+        ],
+        [
+          754.8,
+          249.6
+        ],
+        [
+          992.4,
+          249.6
+        ]
+      ],
+      "labelAt": [
+        826.2,
+        236.4
+      ]
+    },
+    {
+      "id": "sessions-to-state-store",
+      "from": "sessions",
+      "to": "state-store",
+      "label": "原子儲存指定欄位",
+      "variant": "default",
+      "fromSide": "right",
+      "toSide": "bottom",
+      "via": [
+        [
+          600.6,
+          210.6
+        ],
+        [
+          600.6,
+          143.4
+        ],
+        [
+          722.4,
+          143.4
+        ]
+      ],
+      "labelAt": [
+        683.4,
+        128.4
+      ]
+    },
+    {
+      "id": "target-to-bridge",
+      "from": "target",
+      "to": "bridge",
+      "label": "RX bytes",
+      "variant": "default",
+      "fromSide": "bottom",
+      "toSide": "bottom",
+      "via": [
+        [
+          1207.2,
+          363.0
+        ],
+        [
+          992.4,
+          363.0
+        ]
+      ],
+      "labelAt": [
+        1133,
+        391
+      ]
+    },
+    {
+      "id": "watcher-to-sessions",
+      "from": "watcher",
+      "to": "sessions",
+      "label": "裝置變更／重探",
+      "variant": "default",
+      "labelAt": [
+        508.2,
+        159.0
+      ]
+    }
+  ],
+  "cards": []
+}

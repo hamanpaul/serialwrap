@@ -151,6 +151,8 @@ races the daemon for the tty (two-reader). See
 
 ### Architecture
 
+[Interactive architecture and command-flow diagram](docs/architecture/architecture.html) — source-pinned facts and reproduction notes in [docs/architecture](docs/architecture/README.md). Open the downloaded HTML in a browser; this is the runtime call path, not a Cortex workflow.
+
 The broker path is:
 
 ```text
@@ -1073,6 +1075,8 @@ for a newly fixed bug" SOP:
 - 以上三項（`serialwrap-minicom`／`jq`／`minicom`）`serialwrap doctor` 皆會檢查是否在 PATH
 
 ## 系統方塊圖
+
+[互動式流程架構圖](docs/architecture/architecture.html) — [來源與重建說明](docs/architecture/README.md)。以瀏覽器開啟下載的 HTML 驗收；中央編號是實際呼叫鏈，不是 Cortex workflow。
 
 ```mermaid
 flowchart LR
