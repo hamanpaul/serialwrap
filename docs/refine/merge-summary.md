@@ -231,3 +231,15 @@ Root 已重新讀取 ownership 完整差異、檢查反例與跨模組接線，�
 OpenSpec 封存只代表本地實作、審查與規格收斂；外部 PR／CI／exact-head merge
 仍須取得 GitHub 證據才可把 goal 標完成。UART 回歸維持發版前 DEFERRED，
 不安裝、重啟、部署或操作 live 系統。
+
+## PR 201 追加 finding 的最小整合
+
+第一版 PR 的三個 CI checks 全綠後，合併前發現新 review thread：
+trace sink 例外會覆蓋主 RPC 結果。Root 重現後交原 Luna max 窄修，
+再由 root 複審，不把既有綠燈當成免修依據。
+策略採單一四檔 cherry-pick，無文字／介面衝突，不引入新的 logging 架構。
+
+候選 `da01a83` 整合為 `583eee7`；worker full 1777 passed／16 skipped／71 subtests，
+root 定向 29 passed／11 subtests，另驗 retry／TIMEOUT enrich 呼叫次數與回應身分。
+Root 裁決 ADDRESSED／PASS，詳見 [最終審查追加紀錄](198-root-final-review.md)。
+送出前重跑完整 preflight，送出後核對同一新 HEAD 的 CI 與 thread。

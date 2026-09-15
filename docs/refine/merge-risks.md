@@ -71,3 +71,8 @@ root 重現、Luna 局部修正，再由兩席各自重審 `d26c5f9` 並判 SCOP
 前表「等待 ownership reviewer／平台授權」不再是現行 gate；原 Sol 中止仍保持
 無裁決，不能改記為雙席 PASS。外部交付依正式 preflight、PR checks／review threads
 與 exact-head merge 證據放行，真 UART 及平台邊界不變。
+
+PR 201 的追加修補只把 trace callback 一般例外改為 best-effort，主 RPC、retry、
+enrich 與 BaseException 不變。Root 已重現、複驗並採納此最小界線。
+代價是失敗的診斷 callback 不再往主流程拋錯；不另加可能再次失敗的 logger。
+若需撤回，針對 `583eee7` 建立反向提交，不 reset 其他交付或操作 live state。

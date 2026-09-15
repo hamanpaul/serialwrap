@@ -8,7 +8,8 @@ ownership 審查並負責最終整合裁決；不是兩席 Sol 審查，也不�
 也不能推論整個 ownership 範圍不可再做一般程式正確性審查。
 
 未處置的缺陷／驗收缺口判 FAIL；已明文列管、影響有界的殘餘風險不單獨判 FAIL。
-本輪沒有新實作、沒有連真 UART，也沒有放寬 assertions。
+首輪沒有新實作；PR 出現的新 finding 與後續窄修列於末節。全程沒有連真 UART，
+也沒有放寬 assertions。
 
 ## 候選與方法
 
@@ -67,3 +68,24 @@ native Windows、外部 process 持 tty、真板背壓、所有未盤點 callbac
 不在此次保證內。既有 1MB pull RX 視窗限制、daemon trace／reload／Cloudflare
 分期仍依 [後續驗證安排](198-followup-validation.md) 追蹤。
 未安裝、重啟、操作 live config/state/WAL 或真板。
+
+## PR 201 追加審查與修補
+
+合併前 Copilot 對 `client.rpc_call()` 提出 trace sink 例外覆蓋主 RPC 結果的缺口。
+Root 以真 rpc_call、mock transport 與 raising sink 獨立重現：
+主請求成功且只有一次，外層卻拋 RuntimeError。此項採納並修復，不以先前 PASS 抵銷。
+
+- Luna RED：`TestRpcCallTraceSink` 為 2 failed、3 passed、2 subtests，0.10s，exit 1。
+- 最小修補只對 trace callback 捕獲一般 Exception；不包主 RPC／retry／enrich，
+  不新增 log 或重送，KeyboardInterrupt／SystemExit 仍傳出。
+- Luna commit `da01a83eec38901cb00f084f9001f9420cfebe06`，
+  整合為 `583eee7`；僅 client、診斷測試、CLI 交付文件與既有 fragment 四檔。
+- Luna 完整 pytest：**1777 passed、16 skipped、71 subtests，98.31s，exit 0**。
+- Root 整合後定向：**29 passed、11 subtests，0.30s，exit 0**。
+- Root 另驗證唯讀一次 retry 後成功仍回原 dict、sink 一次且 retry_count=1；
+  mutating TIMEOUT 保留既有 enrich、原 dict、主請求一次，即使 retries=3 亦不重送。
+- Root 複審四檔差異及實跑：**finding ADDRESSED、Spec／Quality PASS**。
+  受審與整合的 production／tests／regression 相同，ownership 未變。
+
+最終整合仍需重新 preflight、推送後的遠端 CI 與 thread 處置，才可合併；
+第一版 PR 的綠燈不能替代修補後 HEAD 的檢查。
