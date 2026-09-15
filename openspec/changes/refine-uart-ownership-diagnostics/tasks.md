@@ -22,3 +22,9 @@
 - [x] 5.1 Root 整合、雙語 README、完整 pytest、policy、回歸測試歸屬與成效記錄。
 - [ ] 5.2 指定審查、逐條獨立驗證、修正後重審（已批准獨立 Sol 雙審；最新補修兩席皆 scoped PASS，ownership 審查仍未完成）。
 - [ ] 5.3 OpenSpec archive、PR／CI／exact-head merge 驗證及 #198 結案證據對齊。
+
+## 驗收分期（2026-09-15 確認）
+
+本機無 UART environment；真機回歸延後至發版前有設備時執行，重大更新的穩定性驗收另在部署後執行。兩者不列為本輪 1–4 實作／本地驗證的先決條件，不因未接板取消或降低現有 pytest／policy assertions。既有及必要的實機 case 仍需保留；未跑寫 DEFERRED，不寫 PASS。
+
+5.2 的 ownership 缺口是沒有有效獨立審查裁決，不是無 UART；本次測試分期不把平台中止改寫成審查通過。5.3 也不代表已授權本輪安裝、部署或操作真板。具體發版／部署證據見 `docs/refine/198-followup-validation.md`。

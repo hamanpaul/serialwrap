@@ -2,6 +2,36 @@
 
 日期：2026-09-13。這份紀錄區分本輪重播、待實作功能與待外部環境驗證；不把執行測試的時間當成人工節省時間。
 
+## 2026-09-15 驗收階段裁決
+
+使用者確認目前本機沒有 UART environment，實機測試先延後。Root 負責既定技術取捨及測試分層；不要求使用者逐條判斷 admission、回放、epoch cleanup 等實作是否正確。
+
+依 [專案政策](../../CLAUDE.md) 的 pytest／回歸 case 要求與 [README](../../README.md) 的實機章節，採下列分期。
+這不是免驗，也不是改寫既有 FAIL：本輪可執行的離線驗證照常要求通過。
+
+| 階段 | 必要證據與處理 | 本輪無 UART 的影響 |
+|---|---|---|
+| 本地開發／程式審查 | 真正 RED→GREEN、決定性競態／例外測試、完整 pytest、policy、精確候選的審查結果；必要實機回歸 case 的歸屬評估 | 不阻擋；使用隔離 fake transport、PTY／socketpair，不連真板、不降低 assertions |
+| PR／整案收尾 | 完整 review gate、OpenSpec archive、具體 PR／CI／exact-head merge 與 issue 證據，不能用本地測試代替遠端結果 | 不因缺 UART 額外擋住；但不免除程式審查或遠端流程，也不自動授權 push／merge |
+| 發版前實機回歸 | 在有設備的隔離 bench，對預定發布候選執行受影響的 TestPilot regression，保存版本及逐 case 結果 | **DEFERRED — no UART environment**；保留待驗項，不標 PASS，不作為目前開發的先決條件 |
+| 重大更新部署後 | 對已安裝 CLI／daemon 與真板跑實機穩定性套件，確認 runtime 與部署狀態 | 本輪未部署／未執行，不以 offline suite 代替 |
+
+README 另外建議有設備時在改動後常跑實機回歸；不應把「發版前補驗」誤寫成只有發版前才允許測試。
+本次沒有降低 release 或部署證據要求，也沒有批准建立 UART 環境、安裝候選、重啟 daemon、reset／reboot 板卡或建立 tunnel。
+
+### 留待有環境時的最小實機清單
+
+- #166：依板端實際工具能力及量測行長跑 binary roundtrip／checksum 與較長檔案案例；保留 OpenSSL fallback、echo stall 與 RX 視窗界線。505 是板端量測，不對所有 prpl 自動套用；1MB pull 的既有 RX 邊界未宣稱修復。
+- #198 ownership：真 UART 下的 agent 命令與 human console 共存、傳輸期間輸入的延後回放、斷線／重連後恢復；機械期待沿既有契約，不新增 read-only ACL。僅在另有授權時執行會 reset／reboot 或干擾現場的案例。
+- #199／Windows：實際目標平台的 holder／外部工具斷線行為；Linux mock 缺 st_rdev 的通過不是 native Windows 已驗證。
+- #197：維持獨立追蹤票及下表的隔離／授權前提，不因本輪無 UART 轉成已完成的 Cloudflare 驗收。
+
+每次實機驗證須記錄候選 SHA、已安裝 CLI／daemon 版本及一致性、平台／板卡／profile、case ID、時間、結果、報告位置及未驗原因。版本不一致、checksum FAIL 等不能以「缺環境」改成 PASS；沒有執行就是 DEFERRED。既有執行與新增 case SOP 見 [回歸插件文件](../regression-plugin.md)。
+
+### 審查工具限制另列
+
+Ownership 已有實作與 root 離線驗證紀錄；原獨立 reviewer 被平台中止，沒有有效裁決。這不是硬體缺席，也不是已確認 production defect。無 UART 的延後決定不會把該席中止改成 PASS，亦不授權繞過平台限制。其他範圍的雙席 scoped PASS 不能替代這個缺口。
+
 ## 後續承接
 
 | 追蹤票 | 下一份可獨立驗收交付 | 前提／停止條件 | 不能宣稱的事 |

@@ -4,6 +4,8 @@
 
 2026-09-13 接手更新：Sonnet xhigh 因週額度未開工的 #166，由使用者明確批准交予 Luna max。此批准不豁免指定審查或更動功能範圍。
 
+2026-09-15 更新：使用者明確批准 Luna max 實作與兩個獨立 Sol xhigh 審查席次；另確認本機無 UART environment，實機驗證延後至有設備的發版前回歸／部署後驗收，不構成本輪本地開發與審查的硬門檻。技術取捨及測試分層由 root 負責，不要求使用者重新裁決既定實作。
+
 ## Goals / Non-Goals
 
 目標是四個可獨立驗收切片。非目標是 generic ACL、daemon logging、reload、公開 tunnel 部署、安裝或操作現有 UART。#171 全票、#182、#197 維持獨立待辦。
@@ -18,7 +20,7 @@
 
 ## Risks / Trade-offs
 
-- 真板 console、實際 Windows、Cloudflare 帳戶不由 mock 證明 → 列為獨立平台驗證，新增／對齊 regression 案例但不操作現有服務。
+- 真板 console、實際 Windows、Cloudflare 帳戶不由 mock 證明 → 列為獨立平台驗證，新增／對齊 regression 案例但不操作現有服務。本輪真 UART 測試明列 DEFERRED（no UART environment），不是 PASS；不可因此跳過可執行的離線測試，也不要求在這輪建立現場環境。詳細交付階段與證據欄位見 `docs/refine/198-followup-validation.md`。
 - SHA-256 endpoint ID 僅減少 raw path 洩漏，不是強匿名 → 不記 params、command、response、owner、credential；既有 stderr error line 維持。
 - 恢復交接較多共享狀態 → 用舊 callback 停住、重建 bridge 後釋放的決定性測試驗證；不能只用 source grep 宣稱安全。
 - 額外工具 probe 增加少量傳輸控制命令 → 記錄 probe 次數與成本；不得降低 checksum／echo stall 判定。

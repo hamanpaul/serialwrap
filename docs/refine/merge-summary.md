@@ -201,3 +201,16 @@ Root 依最小差異方案整合為 `3906b5ee043802de68e1376f7f9e1abf73d6469a`�
 有效裁決，與模型額度不足不同；未藉本次模型替換重派或繞過。OpenSpec 5.2／5.3
 仍未完成，不提前 archive。未 push／PR／遠端 CI／merge main／關票／安裝或操作 live 系統。
 Python 3.10 的 API 缺席路徑有相容寫法，但本輪沒有實際 Python 3.10／Windows／真板證據。
+
+## 2026-09-15 無 UART 環境的驗收分期
+
+使用者確認本機沒有 UART environment，實機測試可先延後；root 將本地開發／審查、
+發版前 regression 與重大更新部署後穩定性驗收分開記錄。
+這符合原計畫不操作真板及 issue 將本地／平台證據分列的範圍，不是豁免已知缺陷。
+本輪完整 pytest／policy／程式審查要求不降級，真 UART 明列 DEFERRED，
+不作為目前開發的先決條件；具體待驗清單與證據欄位見
+[後續驗證與驗收分期](198-followup-validation.md)。
+
+這次只調整計畫與交付紀錄，沒有修改 production／tests／regression，
+也沒有重跑未變更的完整 suite。前節的 1774 passed 仍是具名歷史執行結果，不冒稱本輪新跑。
+Ownership 的獨立審查仍缺有效裁決，與 UART 無環境分開列管；不提前 archive 或冒稱全案雙審完成。
