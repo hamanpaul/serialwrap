@@ -68,8 +68,8 @@ _ATTACHED_CONSOLE_LEASE_TIMEOUT_S = 86400.0
 _MIN_FILE_CHUNK_TIMEOUT_S = 5.0   # push 每個 chunk 等待下限
 _MIN_FILE_PULL_TIMEOUT_S = 30.0   # pull 整段讀取等待下限（維持原 30.0 行為基準）
 # echo-ACK 單一 slice 等待下限（#161 實機調校）：同樣依 profile.timeout_s 推導、夾地板，
-# 地板即 file_transfer.DEFAULT_ECHO_TIMEOUT_S（5.0）——真機兩案都在第 8 個 slice
-# （448/512 字元）確定性卡住，2.0s 對慢板偏緊。
+# 地板即 file_transfer.DEFAULT_ECHO_TIMEOUT_S（5.0）。#166 已確認 448/512 的實機症狀
+# 是板端缺 base64 與 prpl 約 505 字元單行限制的下游結果，並非 timeout 根因。
 _MIN_FILE_ECHO_TIMEOUT_S = DEFAULT_ECHO_TIMEOUT_S
 
 
@@ -259,6 +259,20 @@ class SessionCapture:
     status: str = "active"
 
 
+@dataclasses.dataclass(frozen=True)
+class _ForegroundOperation:
+    """同一 session/bridge epoch 的內部操作身分。
+
+    ``foreground_busy`` 是對外狀態欄位，單獨不足以安全清理：舊 bridge 的
+    callback 可能在 re-register 後才進入 finally。此 token 僅在 manager lock
+    內建立／比對，不公開成 RPC 或 public session schema。
+    """
+
+    session_id: str
+    bridge: "UARTBridge"
+    bridge_generation: int
+
+
 @dataclasses.dataclass
 class _PostCloseAction:
     """lock 外需要執行的 bridge 操作，由 _close_interactive_locked 回傳。
@@ -295,6 +309,7 @@ class SessionRuntime:
     pending_auto_login: bool = False
     interactive_session_id: str | None = None
     foreground_busy: bool = False
+    _foreground_operation: _ForegroundOperation | None = dataclasses.field(default=None, repr=False)
     background_cmd_ids: list[str] = dataclasses.field(default_factory=list)
     active_capture: SessionCapture | None = None
     retained_consoles: PreservedConsoles | None = None
@@ -957,6 +972,7 @@ class SessionManager:
             quiet_window_s=tpl.quiet_window_s,
             hard_timeout_s=tpl.hard_timeout_s,
             log_dir=tpl.log_dir,
+            max_console_line_chars=tpl.max_console_line_chars,
             bootloader_prompts=tpl.bootloader_prompts,
             uart=tpl.uart,
         )
@@ -1010,6 +1026,94 @@ class SessionManager:
 
     def _reset_reprobe_progress_locked(self, session: SessionRuntime) -> None:
         session.reset_reprobe_progress()
+
+    @staticmethod
+    def _set_bridge_interactive_admission(
+        bridge: UARTBridge, allowed: bool
+    ) -> list[tuple[str, bytes]]:
+        """切換 bridge raw ownership gate；舊 fake bridge 沒有 seam 時維持相容。"""
+        setter = getattr(bridge, "_set_interactive_admission", None)
+        if callable(setter):
+            result = setter(allowed)
+            if isinstance(result, list):
+                return result
+        return []
+
+    def _begin_foreground_operation_locked(
+        self,
+        session: SessionRuntime,
+        *,
+        expected_duration_s: float | None = None,
+    ) -> tuple[_ForegroundOperation | None, dict[str, Any] | None]:
+        """以 session/bridge 身分原子取得前景操作 admission。
+
+        呼叫者必須已確認 session 可執行且持有 ``self._lock``。正常 command
+        queue 仍由 arbiter 逐一呼叫此處；只有同一 session 的 direct manager
+        writer 會在既有操作期間得到 ``SESSION_BUSY``。
+        """
+        bridge = session.bridge
+        if bridge is None or session.foreground_busy or session._foreground_operation is not None:
+            return None, {
+                "ok": False,
+                "error_code": "SESSION_BUSY",
+                "selector": session.profile.com,
+            }
+        operation = _ForegroundOperation(
+            session_id=session.session_id,
+            bridge=bridge,
+            bridge_generation=session.bridge_generation,
+        )
+        # 先關 bridge raw grant，再發佈 manager operation token；如此 TCP accept
+        # 或 POSIX console attach 不會在 admission→實際 suspend 的窗口取得 raw。
+        self._set_bridge_interactive_admission(bridge, False)
+        session._foreground_operation = operation
+        session.foreground_busy = True
+        session.fg_cmd_started_mono = time.monotonic()
+        session.fg_cmd_expected_duration_s = expected_duration_s
+        return operation, None
+
+    def _finish_foreground_operation(
+        self,
+        session: SessionRuntime,
+        operation: _ForegroundOperation | None,
+    ) -> None:
+        """只清理仍屬於本 session/operation token 的 busy 狀態。
+
+        舊 epoch callback 在 bridge 重建後即使晚到，也不得清除新 operation 的
+        admission；detach/re-register 會先把 token 置空，這裡因此是安全 no-op。
+        """
+        if operation is None:
+            return
+        flush_data: list[tuple[str, bytes]] = []
+        try:
+            with self._lock:
+                current = self._sessions.get(operation.session_id)
+                if (
+                    current is not session
+                    or session._foreground_operation is not operation
+                    or session.bridge is not operation.bridge
+                    or session.bridge_generation != operation.bridge_generation
+                ):
+                    return
+                # gate/owner 旗標與 deferred payload 在 manager lock 內擷取；真正 I/O
+                # 放在 lock 外，token 則留到 replay 完成後才清除，避免全域 manager lock
+                # 被背壓中的 UART write 卡住。
+                flush_data = self._set_bridge_interactive_admission(operation.bridge, True)
+            for source, payload in flush_data:
+                operation.bridge.send_bytes(payload, source=source, cmd_id=None)
+        finally:
+            with self._lock:
+                current = self._sessions.get(operation.session_id)
+                if (
+                    current is session
+                    and session._foreground_operation is operation
+                    and session.bridge is operation.bridge
+                    and session.bridge_generation == operation.bridge_generation
+                ):
+                    session._foreground_operation = None
+                    session.foreground_busy = False
+                    session.fg_cmd_started_mono = None
+                    session.fg_cmd_expected_duration_s = None
 
     # --- agent 顯式命令 gate（#139/#162）----------------------------------------
     def _agent_gate_reject_locked(self, session: SessionRuntime) -> dict[str, Any] | None:
@@ -1697,7 +1801,12 @@ class SessionManager:
                 lease.status = "closed"
         session.interactive_session_id = None
         session._stashed_human_lease = None  # 清除 recovery lease stash，避免跨 bridge 殘留
+        # 舊 operation callback 可能仍在 join timeout 外執行；切換 bridge epoch
+        # 時先撤銷其 token，避免遲到 finally 觸碰新 session 的 busy 狀態。
+        session._foreground_operation = None
         session.foreground_busy = False
+        session.fg_cmd_started_mono = None
+        session.fg_cmd_expected_duration_s = None
         self._stop_capture_locked(session)
         for cmd_id in list(session.background_cmd_ids):
             capture = self._background.get(cmd_id)
@@ -1839,7 +1948,8 @@ class SessionManager:
         except OSError:
             target = real_path
         try:
-            target_rdev = os.stat(real_path).st_rdev
+            target_res = os.stat(real_path)
+            target_rdev = getattr(target_res, "st_rdev", 0)
         except OSError:
             target_rdev = 0
         holders: set[int] = set()
@@ -1869,7 +1979,8 @@ class SessionManager:
                 # 比對同一個 char device，避免漏判導致 attach 誤判可收回、重回 two-reader race。
                 if not matched and target_rdev:
                     try:
-                        if os.stat(fd_path).st_rdev == target_rdev:
+                        fd_res = os.stat(fd_path)
+                        if getattr(fd_res, "st_rdev", 0) == target_rdev:
                             matched = True
                     except OSError:
                         pass
@@ -2713,6 +2824,7 @@ class SessionManager:
             quiet_window_s=tpl.quiet_window_s,
             hard_timeout_s=tpl.hard_timeout_s,
             log_dir=tpl.log_dir,
+            max_console_line_chars=tpl.max_console_line_chars,
             bootloader_prompts=tpl.bootloader_prompts,
             uart=tpl.uart,
         )
@@ -3498,6 +3610,7 @@ class SessionManager:
         suspend_human_interactive = False
         post = _PostCloseAction()
         busy_result: dict[str, Any] | None = None
+        operation: _ForegroundOperation | None = None
         with self._lock:
             session = self._sessions.get(session_id)
             if session is not None and session.state == "FLASHING":
@@ -3518,6 +3631,10 @@ class SessionManager:
                     return gate
             if session.recovering:
                 return {"ok": False, "error_code": "SESSION_RECOVERING"}
+            if normalized_mode == "interactive" and (
+                session.foreground_busy or session._foreground_operation is not None
+            ):
+                return {"ok": False, "error_code": "SESSION_BUSY", "selector": session.profile.com}
             lease, post = self._refresh_interactive_locked(session)
             if lease is not None and normalized_mode != "interactive":
                 if not source.startswith("human:") and lease.owner.startswith("human:"):
@@ -3528,16 +3645,22 @@ class SessionManager:
                         "error_code": "SESSION_INTERACTIVE_BUSY",
                         "interactive_session_id": session.interactive_session_id,
                     }
+            if busy_result is None:
+                operation, busy_result = self._begin_foreground_operation_locked(
+                    session,
+                    expected_duration_s=expected_duration_s,
+                )
             bridge = session.bridge
             prompt_regex = session.profile.prompt_regex
 
-        post.execute()
-        if busy_result is not None:
-            return busy_result
-        if suspend_human_interactive:
-            bridge.suspend_interactive()
-
+        human_suspended = False
         try:
+            post.execute()
+            if busy_result is not None:
+                return busy_result
+            if suspend_human_interactive:
+                bridge.suspend_interactive()
+                human_suspended = True
             return self._execute_command_inner(
                 session, bridge, command, source, cmd_id,
                 timeout_s=timeout_s, normalized_mode=normalized_mode,
@@ -3545,8 +3668,11 @@ class SessionManager:
                 expected_duration_s=expected_duration_s,
             )
         finally:
-            if suspend_human_interactive:
-                bridge.resume_interactive()
+            try:
+                if human_suspended:
+                    bridge.resume_interactive()
+            finally:
+                self._finish_foreground_operation(session, operation)
 
     def _execute_command_inner(
         self,
@@ -3580,103 +3706,88 @@ class SessionManager:
             }
 
         with self._lock:
-            session.foreground_busy = True
-            session.fg_cmd_started_mono = time.monotonic()
-            session.fg_cmd_expected_duration_s = expected_duration_s
             if normalized_mode != "background":
                 for bg_cmd_id in list(session.background_cmd_ids):
                     capture = self._background.get(bg_cmd_id)
                     if capture is not None:
                         capture.status = "done"
         if _is_reboot_command(command):
-            try:
-                return self._handle_reboot_command(
-                    session,
-                    bridge,
-                    command=command,
-                    source=source,
-                    cmd_id=cmd_id,
-                    timeout_s=timeout_s,
-                    execution_mode=normalized_mode,
-                )
-            finally:
-                with self._lock:
-                    session.foreground_busy = False
-                    session.fg_cmd_started_mono = None
-                    session.fg_cmd_expected_duration_s = None
+            return self._handle_reboot_command(
+                session,
+                bridge,
+                command=command,
+                source=source,
+                cmd_id=cmd_id,
+                timeout_s=timeout_s,
+                execution_mode=normalized_mode,
+            )
         pre_offset = bridge.rx_snapshot_len()
-        try:
-            if normalized_mode == "background":
-                # #159：capture 必須在命令送出「之前」掛好——快速完成的命令會在
-                # prompt 比對成功前就把全部輸出送完，若等 matched 之後才回溯建立
-                # capture，這段輸出永遠不會經過 add_chunk()（result_tail 拿到空
-                # chunks 卻回 lost:False 的假保證）。配合 _on_bridge_rx 對應修改
-                # （background capture 不再被 foreground_busy 擋住），此後全程
-                # （含下方等待迴圈與 CTRL_C 復原）RX 都會即時進 add_chunk()。
-                with self._lock:
-                    capture = BackgroundCapture(
-                        cmd_id=cmd_id,
-                        session_id=session.session_id,
-                        from_seq=self._wal.current_seq + 1,
-                        quiet_window_s=session.profile.quiet_window_s,
-                        created_at=now_iso(),
-                        last_seq=self._wal.current_seq,
-                    )
-                    self._background[cmd_id] = capture
-                    self._evict_background_locked()
-                    session.background_cmd_ids.append(cmd_id)
-            self._mark_session_tx(session)
-            bridge.send_command(command, source=source, cmd_id=cmd_id)
-
-            # — heartbeat / keepalive 迴圈 —
-            effective_timeout = timeout_s
-            if expected_duration_s is not None:
-                effective_timeout = max(timeout_s, expected_duration_s)
-            silence_limit = min(timeout_s, 30.0)
-            deadline = time.monotonic() + effective_timeout
-            matched = False
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                wait_chunk = min(silence_limit, remaining)
-                pre_rx = bridge.rx_snapshot_len()
-                if bridge.wait_for_regex_from(prompt_regex, pre_offset, wait_chunk):
-                    matched = True
-                    break
-                if bridge.rx_snapshot_len() == pre_rx:
-                    # 真正靜默，不再等待
-                    break
-                # 有 RX 活動，繼續等待
-
-            if not matched:
-                return self._recover_after_failure(
-                    session,
-                    bridge,
-                    cmd_id=cmd_id,
-                    timeout_s=timeout_s,
-                    source=source,
-                    command=command,
-                    prompt_regex=prompt_regex,
-                    pre_offset=pre_offset,
-                )
-            raw_text = bridge.rx_text_from(pre_offset)
-            stdout = self._extract_command_stdout(raw_text, command, prompt_regex)
-            result: dict[str, Any] = {
-                "ok": True,
-                "execution_mode": normalized_mode,
-                "stdout": stdout,
-                "partial": False,
-            }
-            if normalized_mode == "background":
-                # capture 已於命令送出前掛好並即時累積（#159），此處僅回填回應欄位。
-                result["background_capture_id"] = cmd_id
-            return result
-        finally:
+        if normalized_mode == "background":
+            # #159：capture 必須在命令送出「之前」掛好——快速完成的命令會在
+            # prompt 比對成功前就把全部輸出送完，若等 matched 之後才回溯建立
+            # capture，這段輸出永遠不會經過 add_chunk()（result_tail 拿到空
+            # chunks 卻回 lost:False 的假保證）。配合 _on_bridge_rx 對應修改
+            # （background capture 不再被 foreground_busy 擋住），此後全程
+            # （含下方等待迴圈與 CTRL_C 復原）RX 都會即時進 add_chunk()。
             with self._lock:
-                session.foreground_busy = False
-                session.fg_cmd_started_mono = None
-                session.fg_cmd_expected_duration_s = None
+                capture = BackgroundCapture(
+                    cmd_id=cmd_id,
+                    session_id=session.session_id,
+                    from_seq=self._wal.current_seq + 1,
+                    quiet_window_s=session.profile.quiet_window_s,
+                    created_at=now_iso(),
+                    last_seq=self._wal.current_seq,
+                )
+                self._background[cmd_id] = capture
+                self._evict_background_locked()
+                session.background_cmd_ids.append(cmd_id)
+        self._mark_session_tx(session)
+        bridge.send_command(command, source=source, cmd_id=cmd_id)
+
+        # — heartbeat / keepalive 迴圈 —
+        effective_timeout = timeout_s
+        if expected_duration_s is not None:
+            effective_timeout = max(timeout_s, expected_duration_s)
+        silence_limit = min(timeout_s, 30.0)
+        deadline = time.monotonic() + effective_timeout
+        matched = False
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            wait_chunk = min(silence_limit, remaining)
+            pre_rx = bridge.rx_snapshot_len()
+            if bridge.wait_for_regex_from(prompt_regex, pre_offset, wait_chunk):
+                matched = True
+                break
+            if bridge.rx_snapshot_len() == pre_rx:
+                # 真正靜默，不再等待
+                break
+            # 有 RX 活動，繼續等待
+
+        if not matched:
+            return self._recover_after_failure(
+                session,
+                bridge,
+                cmd_id=cmd_id,
+                timeout_s=timeout_s,
+                source=source,
+                command=command,
+                prompt_regex=prompt_regex,
+                pre_offset=pre_offset,
+            )
+        raw_text = bridge.rx_text_from(pre_offset)
+        stdout = self._extract_command_stdout(raw_text, command, prompt_regex)
+        result: dict[str, Any] = {
+            "ok": True,
+            "execution_mode": normalized_mode,
+            "stdout": stdout,
+            "partial": False,
+        }
+        if normalized_mode == "background":
+            # capture 已於命令送出前掛好並即時累積（#159），此處僅回填回應欄位。
+            result["background_capture_id"] = cmd_id
+        return result
 
     def _recover_after_failure(
         self,
@@ -3822,7 +3933,9 @@ class SessionManager:
                     timeout_s=max(session.profile.hard_timeout_s, _ATTACHED_CONSOLE_LEASE_TIMEOUT_S),
                 )
                 payload["interactive_session_id"] = lease.interactive_id
-                payload["interactive_owner"] = True
+                payload["interactive_owner"] = not (
+                    session.foreground_busy or session._foreground_operation is not None
+                )
             payload["session"] = session.to_public_dict()
             result = {"ok": True, **payload}
         post.execute()
@@ -3877,6 +3990,8 @@ class SessionManager:
                     return {"ok": False, "error_code": "SESSION_NOT_READY", "selector": selector}
 
                 if session.state == "READY":
+                    if session.foreground_busy or session._foreground_operation is not None:
+                        return {"ok": False, "error_code": "SESSION_BUSY", "selector": session.profile.com}
                     # READY 一律走既有路徑；allow_attached 在 READY 下不改變語意。
                     existing, post = self._refresh_interactive_locked(session)
                     if post.needs_resume:
@@ -4080,6 +4195,8 @@ class SessionManager:
                 elif session.state == "FLASHING":
                     # FLASHING 期間禁止任何注入，避免汙染 SBL binary（C2）。
                     result = {"ok": False, "error_code": "FLASHING_BUSY", "interactive_id": interactive_id}
+                elif session.foreground_busy or session._foreground_operation is not None:
+                    result = {"ok": False, "error_code": "SESSION_BUSY", "interactive_id": interactive_id}
                 else:
                     payload = self._encode_interactive_payload(data, encoding)
                     self._mark_session_tx(session)
@@ -4721,6 +4838,7 @@ class SessionManager:
         suspend_human_interactive = False
         post = _PostCloseAction()
         busy_result: dict[str, Any] | None = None
+        operation: _ForegroundOperation | None = None
         with self._lock:
             session = self.get_session(selector)
             if session is None or session.bridge is None or session.state != "READY":
@@ -4744,23 +4862,26 @@ class SessionManager:
             bridge = session.bridge
             prompt_regex = session.profile.prompt_regex
             profile_timeout_s = session.profile.timeout_s
+            max_console_line_chars = session.profile.max_console_line_chars
             if busy_result is None:
-                session.foreground_busy = True
+                operation, busy_result = self._begin_foreground_operation_locked(session)
 
-        post.execute()
-        if busy_result is not None:
-            return busy_result
-        effective_timeout_s = (
-            chunk_timeout_s if chunk_timeout_s is not None
-            else max(profile_timeout_s, _MIN_FILE_CHUNK_TIMEOUT_S)
-        )
-        effective_echo_timeout_s = (
-            echo_timeout_s if echo_timeout_s is not None
-            else max(profile_timeout_s, _MIN_FILE_ECHO_TIMEOUT_S)
-        )
-        if suspend_human_interactive:
-            bridge.suspend_interactive()
+        human_suspended = False
         try:
+            post.execute()
+            if busy_result is not None:
+                return busy_result
+            effective_timeout_s = (
+                chunk_timeout_s if chunk_timeout_s is not None
+                else max(profile_timeout_s, _MIN_FILE_CHUNK_TIMEOUT_S)
+            )
+            effective_echo_timeout_s = (
+                echo_timeout_s if echo_timeout_s is not None
+                else max(profile_timeout_s, _MIN_FILE_ECHO_TIMEOUT_S)
+            )
+            if suspend_human_interactive:
+                bridge.suspend_interactive()
+                human_suspended = True
             return push_file(
                 bridge,
                 local_path,
@@ -4771,12 +4892,14 @@ class SessionManager:
                 source=source,
                 ack_mode=ack_mode,
                 echo_timeout_s=effective_echo_timeout_s,
+                max_console_line_chars=max_console_line_chars,
             )
         finally:
-            with self._lock:
-                session.foreground_busy = False
-            if suspend_human_interactive:
-                bridge.resume_interactive()
+            try:
+                if human_suspended:
+                    bridge.resume_interactive()
+            finally:
+                self._finish_foreground_operation(session, operation)
 
     def file_pull(
         self,
@@ -4798,6 +4921,7 @@ class SessionManager:
         suspend_human_interactive = False
         post = _PostCloseAction()
         busy_result: dict[str, Any] | None = None
+        operation: _ForegroundOperation | None = None
         with self._lock:
             session = self.get_session(selector)
             if session is None or session.bridge is None or session.state != "READY":
@@ -4819,19 +4943,22 @@ class SessionManager:
             bridge = session.bridge
             prompt_regex = session.profile.prompt_regex
             profile_timeout_s = session.profile.timeout_s
+            max_console_line_chars = session.profile.max_console_line_chars
             if busy_result is None:
-                session.foreground_busy = True
+                operation, busy_result = self._begin_foreground_operation_locked(session)
 
-        post.execute()
-        if busy_result is not None:
-            return busy_result
-        effective_timeout_s = (
-            chunk_timeout_s if chunk_timeout_s is not None
-            else max(profile_timeout_s, _MIN_FILE_PULL_TIMEOUT_S)
-        )
-        if suspend_human_interactive:
-            bridge.suspend_interactive()
+        human_suspended = False
         try:
+            post.execute()
+            if busy_result is not None:
+                return busy_result
+            effective_timeout_s = (
+                chunk_timeout_s if chunk_timeout_s is not None
+                else max(profile_timeout_s, _MIN_FILE_PULL_TIMEOUT_S)
+            )
+            if suspend_human_interactive:
+                bridge.suspend_interactive()
+                human_suspended = True
             return pull_file(
                 bridge,
                 remote_path,
@@ -4839,9 +4966,11 @@ class SessionManager:
                 timeout_s=effective_timeout_s,
                 prompt_regex=prompt_regex,
                 source=source,
+                max_console_line_chars=max_console_line_chars,
             )
         finally:
-            with self._lock:
-                session.foreground_busy = False
-            if suspend_human_interactive:
-                bridge.resume_interactive()
+            try:
+                if human_suspended:
+                    bridge.resume_interactive()
+            finally:
+                self._finish_foreground_operation(session, operation)

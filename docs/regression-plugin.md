@@ -61,7 +61,7 @@ doctor 全綠、testbed 板卡 READY、tmux/minicom 存在、無殘留 throwaway
 | F4 狀態語義 | #34 #26 #28 | activity 分類可區分、background result-tail 不漏不重、interactive 中 line cmd 行為明確 | 否 |
 | F5 console 共存 | #78 #7 #8 #42 #11 #53 | raw ownership 多輪 suspend/resume 不丟、deferred 不丟鍵、對端消失回收、不掛 stale pts | 否 |
 | F6 RPC 不凍結 | #80 #52 | 長操作中 `daemon status` 往返不凍結、雙板互不餓死 | 否 |
-| F7 檔案傳輸 | #21 #32 #161 | binary round-trip md5 一致、不靜默截斷；板缺工具 SKIP；push 預設走 #161 echo-ACK 節流（echo 停滯獨立 reason_code `transfer_echo_stall`） | 否 |
+| F7 檔案傳輸 | #21 #32 #161 #166 | binary round-trip md5 一致、不靜默截斷；可用 base64 或 OpenSSL 搭配 md5sum，不因只缺 base64 就 SKIP；明確 `CHECKSUM_MISMATCH` 一律為 `FAIL/test/binary_roundtrip_mismatch`，不受工具探測值影響；`PULL_PARSE_FAILED`、`MOVE_FAILED`、逾時等未完成傳輸維持環境 `SKIP`；push 預設走 #161 echo-ACK 節流（echo 停滯獨立 reason_code `transfer_echo_stall`） | 否 |
 | F8 daemon 單一性 | #101 #53 | `multi_open`／`foreign_holders` 正確回報第二 daemon 與 tty 持有者 | 否 |
 | F9 開機/U-Boot | #69 #130 #139 #44 #14 #20 | autoboot 窗不被 probe 打斷、quiet window 不擋 human／真 READY 後的 agent 命令、自發重開機過渡態 agent 命令被 `AUTOBOOT_QUIET` 攔下（#139）、開機中 attach 自動 reprobe、U-Boot 停留不踢 console | **是（reboot）** |
 | F10 登入帳密 | #140 #19 | 帳密解析空→`CREDENTIALS_UNRESOLVED` 終態不送空帳密、補帳密後恢復 | **是（throwaway＋release）** |
@@ -79,6 +79,11 @@ doctor 全綠、testbed 板卡 READY、tmux/minicom 存在、無殘留 throwaway
 - 每個 F9 case 收尾必經 `guards.ensure_ready`——板子回 READY 才回報 verdict，不得留在 U-Boot prompt。
 
 ## 目前已知紅燈／SKIP（2026-07-31 首日三輪實測基準）
+
+以下保留歷史 bench 結果，不是 #166 候選的實機驗收。#166 增加工具 fallback 及
+profile 行長預算後，F7 需使用對應版本重新執行；受影響板須先依量測設定
+`max_console_line_chars`，不能用舊的「缺 base64」SKIP 證明新 fallback 不可用，
+也不能以本地 shell／pytest 結果宣稱真板已轉綠。
 
 | case | 狀態 | 原因 |
 |---|---|---|

@@ -74,6 +74,9 @@ class TestEventEngine(unittest.TestCase):
         self.engine.start()
         self.engine.feed_line("COM0", "panic", wal_seq=1)
         self._wait_for_file(marker, timeout=3.0)
+        # handler 先建立 marker，counter 要等 dispatcher 完成 post-fire save 才可讀。
+        assert self.engine._dispatcher is not None
+        self.engine._dispatcher.flush_for_test(timeout=3.0)
         store = CounterStore(self.runtime_dir)
         self.assertGreater(store.load("o.x").fires, 0)
         self.engine.com_disable("COM0")

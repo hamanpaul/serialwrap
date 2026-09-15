@@ -35,9 +35,24 @@ class _FakeBridge:
         self._rx_responses.append(text)
 
     def send_command(self, cmd: str, *, source: str, cmd_id: str | None = None) -> None:
+        # #166：工具探測本身不佔既有「資料／md5／mv 命令」計數，並以實際
+        # sentinel 模擬 target 執行結果；單純 command echo 不得算成功。
+        if "SW_XFER_DECODER_B64_" in cmd:
+            self._rx_text += "SW_XFER_DECODER_B64_42\r\n" + _PROMPT
+            return
+        if "SW_XFER_ENCODER_B64_" in cmd:
+            self._rx_text += "SW_XFER_ENCODER_B64_42\r\n" + _PROMPT
+            return
         self.commands.append(cmd)
         if self._rx_responses:
-            self._rx_text += self._rx_responses.pop(0)
+            response = self._rx_responses.pop(0)
+            if "SW_XFER_CHUNK_" in cmd and "SW_XFER_CHUNK_42" not in response:
+                response = response.replace(_PROMPT, "SW_XFER_CHUNK_42\r\n" + _PROMPT, 1)
+            elif "SW_XFER_MD5_" in cmd and "SW_XFER_MD5_42" not in response:
+                response = response.replace(_PROMPT, "SW_XFER_MD5_42\r\n" + _PROMPT, 1)
+            elif "SW_XFER_MV_" in cmd and "SW_XFER_MV_42" not in response:
+                response = response.replace(_PROMPT, "SW_XFER_MV_42\r\n" + _PROMPT, 1)
+            self._rx_text += response
 
     def rx_snapshot_len(self) -> int:
         return len(self._rx_text)
@@ -517,7 +532,10 @@ class _FakePacedBridge(_FakeBridge):
             return {"ok": False, "acked_chars": 48, "sent_chars": 128}
         self.paced_commands.append(cmd)
         if self._rx_responses:
-            self._rx_text += self._rx_responses.pop(0)
+            response = self._rx_responses.pop(0)
+            if "SW_XFER_CHUNK_42" not in response:
+                response = response.replace(_PROMPT, "SW_XFER_CHUNK_42\r\n" + _PROMPT, 1)
+            self._rx_text += response
         return {"ok": True, "acked_chars": len(cmd), "sent_chars": len(cmd)}
 
     def cancel_input_line(self, *, source: str) -> None:

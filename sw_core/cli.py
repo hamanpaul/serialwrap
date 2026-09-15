@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+from dataclasses import dataclass
 import json
+import logging
 import os
 import re
 import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Sequence
 from typing import Any
@@ -24,6 +28,7 @@ from .constants import (
     PROFILE_DIR,
     SOCKET_PATH,
 )
+from .cli_trace import configure_cli_trace_logger, emit_rpc_trace
 from .doctor_cmd import DOCTOR_ADVISORY_CHECKS, DOCTOR_ADVISORY_CHECKS_WIN, run_doctor
 from .platform_backends import select_rpc_backend
 from .runtime_config import RuntimeConfig
@@ -96,6 +101,12 @@ class EnvFileSourceError(RuntimeError):
     def __init__(self, path: str, message: str) -> None:
         super().__init__(message)
         self.path = path
+
+
+@dataclass(frozen=True)
+class _ResolvedEndpoint:
+    endpoint: str
+    source: str
 
 
 def _print(obj: dict[str, Any]) -> None:
@@ -311,11 +322,55 @@ def _resolve_daemon_start_env_files(profile_dir: str) -> list[str]:
 
 def _probe_healthy_daemon(endpoint: str) -> bool:
     """對 endpoint 做 health.ping 存活探測；連得上且 ok 視為已有健康 daemon。"""
+    trace_ctx = getattr(_DAEMON_START_PROBE_TRACE, "context", None)
+    logger = None
+    resolved = None
+    trace_meta: dict[str, Any] = {}
+    trace_enabled = False
+    if trace_ctx is not None:
+        args, resolved = trace_ctx
+        logger = configure_cli_trace_logger(_trace_verbose(args))
+        trace_enabled = logger.isEnabledFor(logging.INFO)
     try:
-        resp = rpc_call(endpoint, "health.ping", {}, timeout_s=0.5)
+        resp = _call_rpc_endpoint(
+            endpoint,
+            "health.ping",
+            {},
+            timeout_s=0.5,
+            trace_sink=trace_meta.update if trace_enabled else None,
+        )
     except Exception:  # noqa: BLE001
         return False
+    if trace_enabled and logger is not None and resolved is not None:
+        emit_rpc_trace(
+            logger=logger,
+            endpoint=resolved.endpoint,
+            endpoint_source=resolved.source,
+            method="health.ping",
+            timeout_s=0.5,
+            response=resp,
+            metadata=trace_meta,
+        )
     return bool(resp.get("ok"))
+
+
+_DAEMON_START_PROBE_TRACE = threading.local()
+
+
+@contextmanager
+def _daemon_start_probe_trace(args: argparse.Namespace, resolved: _ResolvedEndpoint):
+    previous = getattr(_DAEMON_START_PROBE_TRACE, "context", None)
+    _DAEMON_START_PROBE_TRACE.context = (args, resolved)
+    try:
+        yield
+    finally:
+        if previous is None:
+            try:
+                delattr(_DAEMON_START_PROBE_TRACE, "context")
+            except AttributeError:
+                pass
+        else:
+            _DAEMON_START_PROBE_TRACE.context = previous
 
 
 def _find_conflicting_daemon(sock: str, proc_root: str = "/proc") -> dict[str, Any] | None:
@@ -382,8 +437,11 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
     # on-demand：spawn 前先對「使用者實際會連到的 endpoint」冪等探測，已有健康 daemon 則
     # no-op（#108 #1）。用 _resolve_endpoint 而非裸 args.socket，避免 config 記錄的 daemon
     # 在非預設 socket 時 probe miss 又 spawn 出第二個（two-reader）。
-    endpoint = _resolve_endpoint(args)
-    if _probe_healthy_daemon(endpoint):
+    resolved_endpoint = _resolve_endpoint_info(args)
+    endpoint = resolved_endpoint.endpoint
+    with _daemon_start_probe_trace(args, resolved_endpoint):
+        already_running = _probe_healthy_daemon(endpoint)
+    if already_running:
         _print({"ok": True, "already_running": True, "socket": endpoint})
         return 0
     # --socket 為 None sentinel（#120 向量 2）：spawn 路徑落到平台預設（#131：
@@ -395,6 +453,10 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
         sock = ep_arg
     else:
         sock = _local_default_endpoint()
+    daemon_resolution = _ResolvedEndpoint(
+        sock,
+        "--socket" if args.socket is not None else "--endpoint" if ep_arg else "default",
+    )
     # POSIX spawn 防線（#173）：冪等探測（上方 endpoint probe）只看「本 client 解析到的
     # endpoint 是否健康」，config.yaml 記錄與實際 daemon 綁定的 socket 可能分歧（本 issue
     # 根因）。直接掃 /proc 找 ground-truth：若已有 serialwrapd 綁在與本次 spawn 目標不同的
@@ -500,12 +562,24 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
             _print(resp)
             _mirror_err(resp, context="daemon start")
             return 2
-        resp = rpc_call(sock, "health.ping", {}, timeout_s=0.5)
+        resp = _rpc_call_traced(
+            args,
+            daemon_resolution,
+            "health.ping",
+            {},
+            timeout_s=0.5,
+        )
         if resp.get("ok"):
             result: dict[str, Any] = {"ok": True, "pid": proc.pid, "socket": sock}
             if loaded_env_files:
                 result["env_files"] = loaded_env_files
-            health = rpc_call(sock, "health.status", {}, timeout_s=1.0)
+            health = _rpc_call_traced(
+                args,
+                daemon_resolution,
+                "health.status",
+                {},
+                timeout_s=1.0,
+            )
             warnings = health.get("warnings")
             if warnings:
                 result["warnings"] = warnings
@@ -533,7 +607,8 @@ def _run_daemon_stop(args: argparse.Namespace) -> int:
         return 0 if resp.get("ok") else 2
     # on-demand 模式：維持原有 RPC daemon.stop 路徑（不經 _run_rpc，故沿用其 stderr
     # 格式，context 用實際 method 名，與 _run_rpc 的輸出一致，#172）
-    resp = rpc_call(_resolve_endpoint(args), "daemon.stop", {}, timeout_s=2.0)
+    resolved = _resolve_endpoint_info(args)
+    resp = _rpc_call_traced(args, resolved, "daemon.stop", {}, timeout_s=2.0)
     if not resp.get("ok"):
         _print(resp)
         _mirror_err(resp, context="daemon.stop")
@@ -609,7 +684,7 @@ def _endpoint_alive(ep: str) -> bool:
         sock.close()
 
 
-def _resolve_endpoint(args: argparse.Namespace) -> str:
+def _resolve_endpoint_info(args: argparse.Namespace) -> _ResolvedEndpoint:
     """回傳實際連接 endpoint。
 
     優先序：``--endpoint`` > 明確傳入的 ``--socket`` > config.yaml 記錄的有效 socket
@@ -623,11 +698,11 @@ def _resolve_endpoint(args: argparse.Namespace) -> str:
     """
     ep = getattr(args, "endpoint", None)
     if ep:
-        return ep
+        return _ResolvedEndpoint(ep, "--endpoint")
     if args.socket is not None:
         # 有傳即明確（#120 向量 2）：不得與 import-time 預設值比對——測試以 env 覆寫 RUN_DIR 時
         # 傳入值恰等於預設 SOCKET_PATH，等值比對會誤判為「未指定」而 fallback 到 live config。
-        return args.socket
+        return _ResolvedEndpoint(args.socket, "--socket")
     rc = _safe_runtime_config()
     cfg_sock = None
     if rc is not None:
@@ -648,8 +723,12 @@ def _resolve_endpoint(args: argparse.Namespace) -> str:
                 f"依 supervision_mode={mode} 改用 '{canonical}'；"
                 f"如需修正請更新 config.yaml 或重跑 serialwrap setup。\n"
             )
-            return canonical
-    return chosen
+            return _ResolvedEndpoint(canonical, "config.yaml -> canonical fallback")
+    return _ResolvedEndpoint(chosen, "config.yaml" if cfg_sock else "default")
+
+
+def _resolve_endpoint(args: argparse.Namespace) -> str:
+    return _resolve_endpoint_info(args).endpoint
 
 
 class _NoOverrideArgs:
@@ -677,18 +756,68 @@ def _resolve_default_endpoint_with_source() -> tuple[str, str]:
             cfg_sock = None
     resolved = _resolve_endpoint(_NoOverrideArgs())
     if cfg_sock:
-        # review：_resolve_endpoint 可能因 #108 dangling fallback 改連 canonical
-        # endpoint（回傳值 ≠ config.yaml 記錄）；來源標籤必須如實區分，否則 doctor
-        # 顯示「來源：config.yaml」但實際連線位址不是，診斷會誤導。
         if resolved == cfg_sock:
             source = "config.yaml"
         else:
             source = (
                 f"config.yaml（記錄 {cfg_sock} 不可連，#108 dangling fallback 改用 canonical）"
             )
-    else:
-        source = "預設（SOCKET_PATH，受 SERIALWRAP_STATE_DIR/XDG 環境變數影響）"
-    return resolved, source
+        return resolved, source
+    return resolved, "預設（SOCKET_PATH，受 SERIALWRAP_STATE_DIR/XDG 環境變數影響）"
+
+
+def _trace_verbose(args: argparse.Namespace) -> int:
+    return int(getattr(args, "verbose", 0) or 0)
+
+
+def _call_rpc_endpoint(
+    endpoint: str,
+    method: str,
+    params: dict[str, Any],
+    *,
+    timeout_s: float,
+    retries: int | None = None,
+    trace_sink: Any = None,
+) -> dict[str, Any]:
+    rpc_kwargs: dict[str, Any] = {"timeout_s": timeout_s}
+    if retries is not None:
+        rpc_kwargs["retries"] = retries
+    if trace_sink is not None:
+        return rpc_call(endpoint, method, params, trace_sink=trace_sink, **rpc_kwargs)
+    return rpc_call(endpoint, method, params, **rpc_kwargs)
+
+
+def _rpc_call_traced(
+    args: argparse.Namespace,
+    resolved: _ResolvedEndpoint,
+    method: str,
+    params: dict[str, Any],
+    *,
+    timeout_s: float,
+    retries: int | None = None,
+) -> dict[str, Any]:
+    logger = configure_cli_trace_logger(_trace_verbose(args))
+    trace_enabled = logger.isEnabledFor(logging.INFO)
+    trace_meta: dict[str, Any] = {}
+    resp = _call_rpc_endpoint(
+        resolved.endpoint,
+        method,
+        params,
+        timeout_s=timeout_s,
+        retries=retries,
+        trace_sink=trace_meta.update if trace_enabled else None,
+    )
+    if trace_enabled:
+        emit_rpc_trace(
+            logger=logger,
+            endpoint=resolved.endpoint,
+            endpoint_source=resolved.source,
+            method=method,
+            timeout_s=timeout_s,
+            response=resp,
+            metadata=trace_meta,
+        )
+    return resp
 
 
 def _effective_timeout_s(args: argparse.Namespace, method: str) -> float:
@@ -732,8 +861,10 @@ def _warn_version_mismatch(resp: dict[str, Any]) -> None:
 
 
 def _run_rpc(args: argparse.Namespace, method: str, params: dict[str, Any]) -> int:
-    resp = rpc_call(
-        _resolve_endpoint(args),
+    resolved = _resolve_endpoint_info(args)
+    resp = _rpc_call_traced(
+        args,
+        resolved,
         method,
         params,
         timeout_s=_effective_timeout_s(args, method),
@@ -780,39 +911,73 @@ def _dispatch_event(args: argparse.Namespace) -> int:
     # 也不會生效，維持現狀（#123）。
     method_name = _EVENT_CMD_METHOD.get(args.event_cmd, f"event.{args.event_cmd}")
     timeout_s = _effective_timeout_s(args, method_name)
+    resolved = _resolve_endpoint_info(args)
     if args.event_cmd == "add":
         with open(args.file, "r", encoding="utf-8") as f:
             params = json.load(f)
-        result = rpc_call(_resolve_endpoint(args), "event.rule_set", params, timeout_s=timeout_s)
+        result = _rpc_call_traced(args, resolved, "event.rule_set", params, timeout_s=timeout_s)
     elif args.event_cmd == "rm":
-        result = rpc_call(_resolve_endpoint(args), "event.rule_delete", {"rule_id": args.rule_id}, timeout_s=timeout_s)
+        result = _rpc_call_traced(
+            args,
+            resolved,
+            "event.rule_delete",
+            {"rule_id": args.rule_id},
+            timeout_s=timeout_s,
+        )
     elif args.event_cmd == "list":
-        result = rpc_call(
-            _resolve_endpoint(args),
+        result = _rpc_call_traced(
+            args,
+            resolved,
             "event.rule_list",
             {"selector": getattr(args, "selector", None), "owner": getattr(args, "owner", None)},
             timeout_s=timeout_s,
         )
     elif args.event_cmd == "show":
-        result = rpc_call(_resolve_endpoint(args), "event.rule_get", {"rule_id": args.rule_id}, timeout_s=timeout_s)
+        result = _rpc_call_traced(
+            args,
+            resolved,
+            "event.rule_get",
+            {"rule_id": args.rule_id},
+            timeout_s=timeout_s,
+        )
     elif args.event_cmd == "enable":
-        result = rpc_call(_resolve_endpoint(args), "event.com_enable", {"selector": args.selector}, timeout_s=timeout_s)
+        result = _rpc_call_traced(
+            args,
+            resolved,
+            "event.com_enable",
+            {"selector": args.selector},
+            timeout_s=timeout_s,
+        )
     elif args.event_cmd == "disable":
-        result = rpc_call(_resolve_endpoint(args), "event.com_disable", {"selector": args.selector}, timeout_s=timeout_s)
+        result = _rpc_call_traced(
+            args,
+            resolved,
+            "event.com_disable",
+            {"selector": args.selector},
+            timeout_s=timeout_s,
+        )
     elif args.event_cmd == "status":
-        result = rpc_call(_resolve_endpoint(args), "event.com_status", {"selector": getattr(args, "selector", None)}, timeout_s=timeout_s)
+        result = _rpc_call_traced(
+            args,
+            resolved,
+            "event.com_status",
+            {"selector": getattr(args, "selector", None)},
+            timeout_s=timeout_s,
+        )
     elif args.event_cmd == "reset":
-        result = rpc_call(
-            _resolve_endpoint(args),
+        result = _rpc_call_traced(
+            args,
+            resolved,
             "event.reset",
             {"rule_id": getattr(args, "rule_id", None), "selector": getattr(args, "selector", None)},
             timeout_s=timeout_s,
         )
     elif args.event_cmd == "reload":
-        result = rpc_call(_resolve_endpoint(args), "event.reload", {}, timeout_s=timeout_s)
+        result = _rpc_call_traced(args, resolved, "event.reload", {}, timeout_s=timeout_s)
     elif args.event_cmd == "tail":
-        result = rpc_call(
-            _resolve_endpoint(args),
+        result = _rpc_call_traced(
+            args,
+            resolved,
             "event.tail",
             {
                 "rule_id": getattr(args, "rule_id", None),
@@ -1027,11 +1192,17 @@ def _run_setup(args: argparse.Namespace) -> int:
     daemon_running = False
     any_flashing = False
     try:
-        daemon_running = bool(rpc_call(_resolve_endpoint(args), "health.ping", {}, timeout_s=0.5).get("ok"))
+        resolved = _resolve_endpoint_info(args)
+        daemon_running = bool(
+            _rpc_call_traced(args, resolved, "health.ping", {}, timeout_s=0.5).get("ok")
+        )
     except Exception:
         daemon_running = False
     try:
-        any_flashing = bool(rpc_call(_resolve_endpoint(args), "mcu.status", {}, timeout_s=0.5).get("flashing"))
+        resolved = _resolve_endpoint_info(args)
+        any_flashing = bool(
+            _rpc_call_traced(args, resolved, "mcu.status", {}, timeout_s=0.5).get("flashing")
+        )
     except Exception:
         any_flashing = False
 
@@ -1224,6 +1395,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawTextHelpFormatter,
     )
     p.add_argument("--version", action="version", version=f"serialwrap {_resolve_version()}", help="顯示版本後離開")
+    p.add_argument("-v", "--verbose", action="count", default=0, help="提高 CLI trace 詳細度（-v=INFO，-vv=DEBUG；優先於 SERIALWRAP_LOG_LEVEL）")
     p.add_argument("--socket", default=None, help="本機 daemon 的 Unix socket 路徑（未指定時依 config.yaml 與 XDG 執行期目錄解析，可用 SERIALWRAP_RUN_DIR 覆寫）")
     p.add_argument("--endpoint", default=None, metavar="ENDPOINT", help="遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）")
     p.add_argument(

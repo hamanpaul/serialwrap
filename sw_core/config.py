@@ -36,6 +36,7 @@ class ProfileTemplate:
     log_dir: str | None = None
     uart: UartProfile = dataclasses.field(default_factory=UartProfile)
     bootloader_prompts: tuple[str, ...] = ()
+    max_console_line_chars: int | None = None
 
     @property
     def command_capable(self) -> bool:
@@ -66,6 +67,7 @@ class SessionProfile:
     log_dir: str | None = None
     uart: UartProfile = dataclasses.field(default_factory=UartProfile)
     bootloader_prompts: tuple[str, ...] = ()
+    max_console_line_chars: int | None = None
 
     @property
     def command_capable(self) -> bool:
@@ -97,6 +99,19 @@ def _as_opt_str(v: Any) -> str | None:
         return None
     s = str(v).strip()
     return s if s else None
+
+
+def _as_max_console_line_chars(v: Any, default: int | None = None) -> int | None:
+    """解析 console 單行上限；只接受正整數或 ``None``。
+
+    ``bool`` 雖是 Python 的 ``int`` 子類別，但在 YAML profile 中把 true/false
+    當成行長會掩蓋設定錯誤，因此明確排除。字串與浮點值也不做隱式轉型。
+    """
+    if v is None:
+        return default
+    if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+        raise ValueError("max_console_line_chars 必須是正整數或 null")
+    return v
 
 
 def _as_str_keep_empty(v: Any, default: str) -> str:
@@ -145,6 +160,7 @@ def _template_from_dict(name: str, raw: dict[str, Any], *, base_dir: str) -> Pro
         quiet_window_s=_as_float(raw.get("quiet_window_s"), 2.0),
         hard_timeout_s=_as_float(raw.get("hard_timeout_s"), 60.0),
         log_dir=_resolve_opt_path(raw.get("log_dir"), base_dir=base_dir),
+        max_console_line_chars=_as_max_console_line_chars(raw.get("max_console_line_chars")),
         uart=_load_uart(raw.get("uart")),
         bootloader_prompts=tuple(s for s in raw["bootloader_prompts"] if isinstance(s, str))
         if isinstance(raw.get("bootloader_prompts"), list)
@@ -248,6 +264,11 @@ def _merge_session(
         quiet_window_s=_as_float(target.get("quiet_window_s"), template.quiet_window_s),
         hard_timeout_s=_as_float(target.get("hard_timeout_s"), template.hard_timeout_s),
         log_dir=log_dir,
+        max_console_line_chars=(
+            _as_max_console_line_chars(target.get("max_console_line_chars"))
+            if "max_console_line_chars" in target
+            else template.max_console_line_chars
+        ),
         uart=_load_uart(target.get("uart"), default=template.uart),
         bootloader_prompts=template.bootloader_prompts,
     )
