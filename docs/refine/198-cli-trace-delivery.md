@@ -16,6 +16,7 @@
   - `propagate=False`
   - 自有 `stderr` handler 冪等重設，不污染 root / `serialwrap` logger
   - 預設 `WARNING`，所以既有 stdout/stderr 契約維持不變
+- 數字型 `SERIALWRAP_LOG_LEVEL` 最多接受 4300 位數字（不計合法負號）；超過固定上限即安靜回退 `WARNING`，不受 Python 全域整數字串轉換限制是否關閉影響。
 - `_run_rpc()`、`event` 分派、`daemon stop`、`setup` 的既有 `health.ping`／`mcu.status` 前置檢查，以及 `daemon start` **前置 health probe / 就緒等待** 內的既有 RPC 呼叫，統一走同一個 trace wrapper。`setup` 仍保留每個 probe 各自一次 endpoint 解析、0.5 秒 timeout、原本的順序與 best-effort／`FLASHING_BUSY` 行為；trace 不新增 probe 或 RPC。
 - `sw_core.client.rpc_call()` 新增 **內部用** `trace_sink` metadata 通道，只回報：
   - `elapsed_ms`
@@ -90,6 +91,6 @@ serialwrap -v --endpoint tcp://127.0.0.1:48700 event status --selector COM0
   - config fallback source 與 probe 次數
   - `event.rule_set` 真正 method 與 trace 白名單
 - logger 隔離
-- `SERIALWRAP_LOG_LEVEL` 的空白、有效名稱／合法數字，以及 `--1`、`²`、過長數字等無效值安靜回 `WARNING`；一般 RPC CLI 仍正常送出一次 RPC
+- `SERIALWRAP_LOG_LEVEL` 的空白、有效名稱、整數層級值（例如 `20`、`5000`）及 4300 位邊界／合法負號維持可用；未知值（`--1`、`²`）及超過 4300 位的數字字串（包括 5000 位字串）安靜回 `WARNING`。固定上限在 Python digit limit 預設及停用時皆成立，並驗一般 RPC CLI 仍正常單送一次 RPC 及 `-v/-vv` 優先序
 - 相關既有 CLI / endpoint / event / timeout / Windows seam 測試已回歸。
 - 本缺陷可用 pytest + transport seam 完整覆蓋，**不需新增 `regression/` 真機 case**；本輪也沒有宣稱實際 Windows、真 daemon 或真 UART 驗證。

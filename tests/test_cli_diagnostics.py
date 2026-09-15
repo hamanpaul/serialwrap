@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import socket
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -178,7 +179,93 @@ class TestCliTraceOutput(CliDiagnosticsMixin, unittest.TestCase):
     def test_numeric_log_level_and_whitespace_name_remain_supported(self) -> None:
         self.assertEqual(cli_trace._parse_log_level("  INFO  "), logging.INFO)
         self.assertEqual(cli_trace._parse_log_level("20"), logging.INFO)
+        self.assertEqual(cli_trace._parse_log_level("5000"), 5000)
         self.assertEqual(cli_trace.resolve_cli_trace_level(0, {"SERIALWRAP_LOG_LEVEL": " 10 "}), logging.DEBUG)
+
+    def test_numeric_log_level_has_a_fixed_4300_digit_boundary(self) -> None:
+        get_digit_limit = getattr(sys, "get_int_max_str_digits", None)
+        set_digit_limit = getattr(sys, "set_int_max_str_digits", None)
+        previous_limit = (
+            get_digit_limit()
+            if callable(get_digit_limit) and callable(set_digit_limit)
+            else None
+        )
+        try:
+            if previous_limit is not None:
+                set_digit_limit(0)
+
+            boundary = "9" * 4300
+            over_boundary = "9" * 4301
+            self.assertIsNotNone(cli_trace._parse_log_level(boundary))
+            self.assertIsNotNone(cli_trace._parse_log_level("-" + boundary))
+            self.assertIsNone(cli_trace._parse_log_level(over_boundary))
+            self.assertIsNone(cli_trace._parse_log_level("-" + over_boundary))
+            self.assertEqual(
+                cli_trace.resolve_cli_trace_level(
+                    1, {"SERIALWRAP_LOG_LEVEL": "9" * 5000}
+                ),
+                logging.INFO,
+            )
+            self.assertEqual(
+                cli_trace.resolve_cli_trace_level(
+                    2, {"SERIALWRAP_LOG_LEVEL": "9" * 5000}
+                ),
+                logging.DEBUG,
+            )
+        finally:
+            if previous_limit is not None:
+                set_digit_limit(previous_limit)
+
+    def test_5000_digit_log_level_warns_with_default_and_disabled_digit_limit(self) -> None:
+        get_digit_limit = getattr(sys, "get_int_max_str_digits", None)
+        set_digit_limit = getattr(sys, "set_int_max_str_digits", None)
+        previous_limit = (
+            get_digit_limit()
+            if callable(get_digit_limit) and callable(set_digit_limit)
+            else None
+        )
+        default_limit = getattr(sys.int_info, "default_max_str_digits", None)
+        limits = (
+            [default_limit, 0]
+            if previous_limit is not None and isinstance(default_limit, int) and default_limit > 0
+            else [None]
+        )
+        raw = "9" * 5000
+        try:
+            for digit_limit in limits:
+                with self.subTest(python_digit_limit=digit_limit):
+                    if digit_limit is not None:
+                        set_digit_limit(digit_limit)
+
+                    warning_stream = io.StringIO()
+                    logger = cli_trace.configure_cli_trace_logger(
+                        0,
+                        stream=warning_stream,
+                        env={"SERIALWRAP_LOG_LEVEL": raw},
+                    )
+                    self.assertEqual(logger.level, logging.WARNING)
+                    self.assertTrue(logger.isEnabledFor(logging.WARNING))
+                    logger.warning("R1 WARNING fallback is visible")
+                    self.assertEqual(
+                        warning_stream.getvalue(), "R1 WARNING fallback is visible\n"
+                    )
+
+                    with mock.patch(
+                        "sw_core.cli.rpc_call",
+                        return_value={"ok": True, "sessions": []},
+                    ) as rpc:
+                        rc, out, err = self._invoke_main(
+                            ["--socket", "/tmp/sw198-digit-limit.sock", "session", "list"],
+                            env={"SERIALWRAP_LOG_LEVEL": raw},
+                        )
+
+                    self.assertEqual(rc, 0)
+                    self.assertEqual(out, '{"ok":true,"sessions":[]}\n')
+                    self.assertEqual(err, "")
+                    rpc.assert_called_once()
+        finally:
+            if previous_limit is not None:
+                set_digit_limit(previous_limit)
 
     def test_trace_logger_recovers_when_previous_stream_was_closed(self) -> None:
         with tempfile.TemporaryFile(mode="w+") as previous_stream:

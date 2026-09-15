@@ -13,6 +13,7 @@ from .constants import LOOPBACK_TCP_HOSTS
 
 TRACE_LOGGER_NAME = "serialwrap.cli_trace"
 _TRACE_HANDLER_ATTR = "_serialwrap_cli_trace_handler"
+_MAX_NUMERIC_LOG_LEVEL_DIGITS = 4300
 
 
 def _parse_log_level(raw: str | None) -> int | None:
@@ -21,12 +22,15 @@ def _parse_log_level(raw: str | None) -> int | None:
     value = raw.strip()
     if not value:
         return None
-    if value.lstrip("-").isdigit():
+    digits = value.lstrip("-")
+    if digits.isdigit():
+        if len(digits) > _MAX_NUMERIC_LOG_LEVEL_DIGITS:
+            return None
         try:
             return int(value)
         except ValueError:
-            # Unicode digit lookalikes (例如 ``²``)、重複負號與超過 Python
-            # 整數轉換上限的輸入都視為未知設定，不能讓診斷設定擊穿 CLI。
+            # Unicode digit lookalikes (例如 ``²``) 與重複負號仍視為未知設定，
+            # 不能讓診斷設定擊穿 CLI。
             return None
     levels = {
         "CRITICAL": logging.CRITICAL,
