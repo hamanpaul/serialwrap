@@ -167,3 +167,37 @@ F7 的 FAIL 表示資料完整性驗收失敗，不等於已定位其根因；`C
 Ownership 指定審查仍缺有效裁決，沒有重派或繞過平台限制；OpenSpec 5.2／5.3
 保持未完成。未 archive、push、建立 PR、執行遠端 CI、merge 至 main、關票、
 安裝、重啟服務或操作真 UART。
+
+## 2026-09-15 Luna 實作與獨立 Sol 雙審更新
+
+使用者明確批准 Luna max 接手實作及兩個獨立 Sol xhigh 席次。已完成的實作不重做；
+針對最新補修補齊第二席獨立審查，第二席先不讀第一席 verdict，找到 R1 尚存缺口：
+`PYTHONINTMAXSTRDIGITS=0` 時，5000 位 log-level 數字仍可成為巨大 logger level，
+沒有如文件承諾回到 WARNING。Root 獨立重現後採納，未以另一席 PASS 抵銷。
+
+Luna 以 `d26c5f94e8a5ee921dfceb98532c8363870743dc` 只修 4 檔，
+在整數轉換前固定拒絕超過 4300 位的數字（不計合法負號），補真正 logger.level、
+warning 可見、CLI 單次 RPC、正負邊界與相容性測試；正常數值 20／5000 仍保留。
+兩席各自對 BASE `9cbbf5a` → HEAD `d26c5f9` 重審，均為
+**R1 ADDRESSED、Spec PASS、Quality PASS、SCOPED PASS，無 BLOCKER／MAJOR**。
+
+Root 依最小差異方案整合為 `3906b5ee043802de68e1376f7f9e1abf73d6469a`，
+無文字衝突；受審候選與整合版的 production／tests／regression 及本波文件完全相同。
+
+### 本輪驗證與界線
+
+- Luna RED：**2 failed、1 passed、1 subtests，0.08s，exit 1**，是預期的數字上限缺口。
+- Luna 最終全套：**1774 passed、16 skipped、67 subtests，94.02s，exit 0**。
+- Root 另跑全套：**1774 passed、16 skipped、67 subtests，95.44s，exit 0**；
+  四檔於執行前／候選 commit 後的 SHA-256 相同，非重用 worker 日誌。
+- 第一席 R1 定向：**5 passed、5 subtests，0.11s**；第二席：**4 passed、5 subtests，0.09s**。
+  兩席另各自在 digit limit=0 下用真 parser/logger 複驗，不把無 INFO trace 當充分證據。
+- Root 整合後 CLI／F7／setup／Windows seam：**55 passed、1 skipped、7 subtests，0.36s**。
+  這個 skip 是原生 Windows detach 旗標對測；本 Linux 環境未驗該平台。
+- Root policy：**24 pass、0 fail、2 warn**；警示仍為 R-19 gate 解析及 R-22 的
+  118 既有懸空引用，沒有 exemption。OpenSpec strict：**22 passed、0 failed**。
+
+以上補修雙席通過，不代表 #198 全範圍審查完成。Ownership 原席的平台中止仍無
+有效裁決，與模型額度不足不同；未藉本次模型替換重派或繞過。OpenSpec 5.2／5.3
+仍未完成，不提前 archive。未 push／PR／遠端 CI／merge main／關票／安裝或操作 live 系統。
+Python 3.10 的 API 缺席路徑有相容寫法，但本輪沒有實際 Python 3.10／Windows／真板證據。

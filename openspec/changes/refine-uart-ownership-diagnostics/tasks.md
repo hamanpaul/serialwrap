@@ -20,5 +20,5 @@
 ## 5. 整合交付
 
 - [x] 5.1 Root 整合、雙語 README、完整 pytest、policy、回歸測試歸屬與成效記錄。
-- [ ] 5.2 指定審查、逐條獨立驗證、修正後重審（已批准 Sol 接替 Opus 補充審查；ownership 審查仍未完成）。
+- [ ] 5.2 指定審查、逐條獨立驗證、修正後重審（已批准獨立 Sol 雙審；最新補修兩席皆 scoped PASS，ownership 審查仍未完成）。
 - [ ] 5.3 OpenSpec archive、PR／CI／exact-head merge 驗證及 #198 結案證據對齊。

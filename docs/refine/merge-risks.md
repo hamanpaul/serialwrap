@@ -47,3 +47,18 @@ F7 checksum 分流，以及完整測試暴露的 closed-stream handler 缺陷，
 | F7 完整性判定 | checksum mismatch 必須紅燈；不能據此判定所有失敗都是程式根因或傳輸已成功 | 真板重跑另行授權；其他工具／timeout／解析分類維持原契約 |
 | 全範圍 review | ownership 的平台中止仍無有效裁決；補充 Sol 不覆蓋該範圍 | 需使用者處理平台授權限制或安排可接受的人工審查；不以重派繞過 |
 | 外部交付 | 未 PR／CI／merge／關票，未部署 | 指定 gates 完成且取得明確 publication 方向後才繼續；不提前 archive |
+
+## 2026-09-15 獨立雙審補修更新
+
+第二個獨立 Sol 席發現超長數字在 Python digit limit 停用時不會回 WARNING，
+root 重現、Luna 局部修正，再由兩席各自重審 `d26c5f9` 並判 SCOPED PASS。
+修正已整合為 `3906b5e`；精確 SHA 與各方測試結果見 [整合紀錄](merge-summary.md)。
+
+| 項目 | 現況與界線 | 下一步／回復 |
+|---|---|---|
+| 數字長度上限 | 自有固定 4300 位上限，不依賴 Python 停用／提高 digit limit；合法負號不計，原本可解析的正常數值保留 | 固定上限對齊既有 Python 預設邊界；若調整需同步文件和正反測試 |
+| 雙審範圍 | 兩個獨立 Sol 席已審過最新 R1 補修，R2–R4 無新變更；root full 1774 passed／16 skipped | 只支持所列 local candidate，不外推至未審 ownership 或真機／平台 |
+| 未完成 gates | ownership 平台中止仍無有效裁決，OpenSpec 5.2／5.3 未完成 | 需處理平台授權限制或安排人工審查；不以模型替換繞過、不提前 archive |
+
+回復方式：保留獨立候選分支；若需撤回本波，於 integration 另建針對 `3906b5e`
+的反向提交，不 reset 既有工作、不修改 live daemon／UART／WAL。未執行任何回復操作。
