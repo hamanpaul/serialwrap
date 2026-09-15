@@ -62,3 +62,12 @@ root 重現、Luna 局部修正，再由兩席各自重審 `d26c5f9` 並判 SCOP
 
 回復方式：保留獨立候選分支；若需撤回本波，於 integration 另建針對 `3906b5e`
 的反向提交，不 reset 既有工作、不修改 live daemon／UART／WAL。未執行任何回復操作。
+
+## 2026-09-15 Root 接手裁決
+
+使用者最後指定由 root 審查並完成 goal。Root 已完成 ownership 與最終整合審查，
+本輪完整 1774 passed／16 skipped、定向 56 passed，沒有未處置 BLOCKER／MAJOR，
+詳見 [root 最終審查](198-root-final-review.md)。
+前表「等待 ownership reviewer／平台授權」不再是現行 gate；原 Sol 中止仍保持
+無裁決，不能改記為雙席 PASS。外部交付依正式 preflight、PR checks／review threads
+與 exact-head merge 證據放行，真 UART 及平台邊界不變。

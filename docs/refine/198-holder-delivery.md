@@ -4,7 +4,7 @@
 
 - **Issue**: [#199](https://github.com/hamanpaul/serialwrap/issues/199)
 - **Task**: Task 4（#199 缺 `st_rdev` 的 holder 探測修復）
-- **規範依據**: `openspec/changes/refine-uart-ownership-diagnostics/specs/holder-probe-portability/spec.md`
+- **規範依據**: `openspec/specs/holder-probe-portability/spec.md`
 
 在 `sw_core/session_manager.py` 的 `_probe_external_holder` 函式中，程式碼原先直接存取 `os.stat(real_path).st_rdev` 與 `os.stat(fd_path).st_rdev`。在非 POSIX（如 Windows）環境下，`os.stat()` 所回傳的 `stat_result` 物件不具備 POSIX 意義的 `st_rdev` 屬性。當執行期存取該屬性時，會拋出未被 `try ... except OSError:` 捕獲的 `AttributeError`，導致整個 holder 探測流程崩潰中斷。
 

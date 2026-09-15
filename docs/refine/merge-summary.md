@@ -2,7 +2,7 @@
 
 日期：2026-09-12。程式基準：`cf2aaba9004c18a82a6a5e4e0dcc66ea7211aeb1`。
 
-本檔保留 2026-09-12 方案盤點；最新實作與驗證見末段「2026-09-13 實作階段」。
+本檔依日期保留歷史盤點；現行裁決見末段「2026-09-15 Root 接手最終審查」。
 
 ## 交付範圍
 
@@ -214,3 +214,20 @@ Python 3.10 的 API 缺席路徑有相容寫法，但本輪沒有實際 Python 3
 這次只調整計畫與交付紀錄，沒有修改 production／tests／regression，
 也沒有重跑未變更的完整 suite。前節的 1774 passed 仍是具名歷史執行結果，不冒稱本輪新跑。
 Ownership 的獨立審查仍缺有效裁決，與 UART 無環境分開列管；不提前 archive 或冒稱全案雙審完成。
+
+## 2026-09-15 Root 接手最終審查
+
+使用者最新指示「由你審，把這個 goal 跑完」取代尚未完成的 reviewer 席次安排。
+Root 已重新讀取 ownership 完整差異、檢查反例與跨模組接線，裁決本次範圍
+**PASS，無未處置 BLOCKER／MAJOR**；不把原 Sol 平台中止算作審查通過。
+前述等待 reviewer 的段落均為歷史狀態，最新依 [root 最終審查](198-root-final-review.md)。
+
+受審 HEAD 為 `09a0c2550bd652623d3175afcbb9e544e857b07a`，本輪重新執行：
+
+- 完整 pytest：**1774 passed、16 skipped、67 subtests，96.39s，exit 0**。
+- ownership／arbiter／raw／transfer integration 定向：**56 passed，15.04s，exit 0**。
+- 本地 policy：**24 pass、0 fail、2 warn**；正式 PR metadata preflight 另行執行。
+
+OpenSpec 封存只代表本地實作、審查與規格收斂；外部 PR／CI／exact-head merge
+仍須取得 GitHub 證據才可把 goal 標完成。UART 回歸維持發版前 DEFERRED，
+不安裝、重啟、部署或操作 live 系統。

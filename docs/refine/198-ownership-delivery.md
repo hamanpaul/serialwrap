@@ -2,6 +2,10 @@
 
 ## 狀態
 
+2026-09-15 最新：使用者指定由 root 接替未完成審查；已完成最終讀碼、反例核對與
+實跑，裁決 PASS，詳見 [root 最終審查](198-root-final-review.md)。
+下方 Sol 中止的文字為先前紀錄，不再是等待中的交付門檻，也不改稱 Sol PASS。
+
 已完成本 worktree 的 ownership admission 與 operation/epoch cleanup 實作及
 pytest 驗證；尚未包含真機 UART、live daemon、merge 或部署驗證。root 整合時需
 保留本文件與 `changelog.d/198-ownership.md`，並將共享

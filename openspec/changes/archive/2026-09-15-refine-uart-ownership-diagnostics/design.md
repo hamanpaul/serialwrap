@@ -8,6 +8,10 @@
 
 ## Goals / Non-Goals
 
+2026-09-15 最後授權：使用者指定「由你審，把這個 goal 跑完」，由 root 接替
+未完成的 ownership 審查及最終交付裁決，完成 PR／CI／merge／結案。
+已完成的 Sol scoped 審查保留其範圍；原失敗席次不再作為等待門檻，不冒稱雙席 PASS。
+
 目標是四個可獨立驗收切片。非目標是 generic ACL、daemon logging、reload、公開 tunnel 部署、安裝或操作現有 UART。#171 全票、#182、#197 維持獨立待辦。
 
 ## Decisions

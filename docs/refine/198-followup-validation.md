@@ -30,7 +30,11 @@ README 另外建議有設備時在改動後常跑實機回歸；不應把「發�
 
 ### 審查工具限制另列
 
-Ownership 已有實作與 root 離線驗證紀錄；原獨立 reviewer 被平台中止，沒有有效裁決。這不是硬體缺席，也不是已確認 production defect。無 UART 的延後決定不會把該席中止改成 PASS，亦不授權繞過平台限制。其他範圍的雙席 scoped PASS 不能替代這個缺口。
+原獨立 reviewer 曾被平台中止，沒有有效裁決，也沒有具體 production defect。
+2026-09-15 使用者明確指定「由你審，把這個 goal 跑完」；root 已完成
+[最終審查](198-root-final-review.md) 並裁決本輪範圍 PASS。
+原中止紀錄不改成 Sol PASS，其他範圍的 scoped 雙審也不冒充 ownership 審查。
+本次交付不再等待原失敗席次；實機 DEFERRED 與程式審查仍分開記錄。
 
 ## 後續承接
 
