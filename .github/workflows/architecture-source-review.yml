@@ -13,7 +13,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: 匯出唯讀 Git 來源供離線架構驗證
+      - name: 匯出既有來源與中斷候選供離線續作
         run: git bundle create /tmp/serialwrap-architecture-source.bundle HEAD
       - uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1
         with:
