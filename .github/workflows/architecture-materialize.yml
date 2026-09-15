@@ -64,6 +64,7 @@ jobs:
       - name: 原生產出與真正 file 瀏覽器驗收
         run: |
           mkdir -p /tmp/serialwrap-architecture-review
+          git show HEAD:tools/architecture_browser.py > tools/architecture_browser.py
           node .archify-engine/archify/bin/archify.mjs deliver architecture docs/architecture/architecture.json docs/architecture/architecture.html --repo-root . --quality showcase --json > /tmp/serialwrap-architecture-review/initial-delivery.json
           python -m pytest -q tests/test_architecture_docs.py
           python tools/architecture_review.py --archify-root .archify-engine/archify --output /tmp/serialwrap-architecture-review/delivery.json
