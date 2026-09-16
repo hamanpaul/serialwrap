@@ -821,7 +821,10 @@ account; gives a stable hostname.
 
 ```bash
 # bench, one-time
-cloudflared tunnel login                                   # browser: authorise, pick the zone
+# browser: sign in, then SELECT THE ZONE and click Authorize — only then does
+# ~/.cloudflared/cert.pem appear; until it does, cloudflared just keeps printing
+# "Waiting for login..." (signing in to the account alone is not enough)
+cloudflared tunnel login
 cloudflared tunnel create serialwrap-bench                 # prints <UUID>
 cloudflared tunnel route dns serialwrap-bench dut.example.com
 cat > ~/.cloudflared/config.yml <<EOF
@@ -835,9 +838,23 @@ EOF
 
 # bench, keep it running — in tmux…
 cloudflared tunnel run serialwrap-bench
-# …or as a boot-time service
-sudo cloudflared service install
+# …or as a boot-time service. Under sudo, `~` is /root, so a bare
+# `service install` fails with "Cannot determine default configuration path":
+# put the config and the tunnel credentials under /etc/cloudflared and name
+# the config explicitly with --config.
+sudo mkdir -p /etc/cloudflared
+sudo install -m 600 ~/.cloudflared/<UUID>.json /etc/cloudflared/<UUID>.json
+sed 's#^credentials-file:.*#credentials-file: /etc/cloudflared/<UUID>.json#' \
+  ~/.cloudflared/config.yml | sudo tee /etc/cloudflared/config.yml >/dev/null
+sudo cloudflared --config /etc/cloudflared/config.yml service install
+sudo journalctl -u cloudflared -n 5 -o cat        # expect "Registered tunnel connection"
 ```
+
+Route B was run end to end on 2026-09-16 with cloudflared 2026.9.1 on a WSL2
+Ubuntu 24.04 bench: plain ssh round trip through the Tunnel ≈ 3 s, and
+`cmd submit` over `serialwrap remote -L` returned real UART output. The two
+comments above are the only places the walkthrough differed from what actually
+happened.
 
 **Your machine** — identical for both routes; substitute the hostname.
 (`cloudflared access ssh` is simply the name of the cloudflared subcommand that
@@ -2447,7 +2464,9 @@ cloudflared tunnel --url ssh://localhost:22
 
 ```bash
 # bench，一次性
-cloudflared tunnel login                                   # 瀏覽器授權、選網域
+# 瀏覽器：登入後必須「選 zone，再按 Authorize」，~/.cloudflared/cert.pem 才會落地；
+# 在那之前 cloudflared 只會一直印 "Waiting for login..."（只登入帳號不夠）
+cloudflared tunnel login
 cloudflared tunnel create serialwrap-bench                 # 印出 <UUID>
 cloudflared tunnel route dns serialwrap-bench dut.example.com
 cat > ~/.cloudflared/config.yml <<EOF
@@ -2461,9 +2480,20 @@ EOF
 
 # bench，常駐——放 tmux…
 cloudflared tunnel run serialwrap-bench
-# …或裝成開機服務
-sudo cloudflared service install
+# …或裝成開機服務。sudo 之下 `~` 是 /root，直接 `service install` 會報
+# "Cannot determine default configuration path"：把 config 與該 tunnel 的憑證
+# 搬到 /etc/cloudflared，並用 --config 明確指定。
+sudo mkdir -p /etc/cloudflared
+sudo install -m 600 ~/.cloudflared/<UUID>.json /etc/cloudflared/<UUID>.json
+sed 's#^credentials-file:.*#credentials-file: /etc/cloudflared/<UUID>.json#' \
+  ~/.cloudflared/config.yml | sudo tee /etc/cloudflared/config.yml >/dev/null
+sudo cloudflared --config /etc/cloudflared/config.yml service install
+sudo journalctl -u cloudflared -n 5 -o cat        # 期望看到 "Registered tunnel connection"
 ```
+
+路線 B 已於 2026-09-16 以 cloudflared 2026.9.1 在 WSL2 Ubuntu 24.04 bench 端到端實跑：
+純 ssh 經 Tunnel 往返約 3 秒，`serialwrap remote -L` 之上的 `cmd submit` 拿到真實 UART
+輸出。上面兩處註解就是實跑與原步驟唯二不符的地方。
 
 **本機**——兩條路線完全一樣，換 hostname 即可。
 （`cloudflared access ssh` 只是 cloudflared 那個「把 ssh 經 Tunnel 代理出去」的子命令名稱；用它**不等於**啟用 Cloudflare Access——那是身份政策產品，這裡兩條路線都沒有開。）
