@@ -131,7 +131,7 @@ Agent 端連線（依「誰連得到誰」擇一）：
 
 **實例：Cloudflare 當 reachability provider**（雙 NAT、本機不裝 overlay、不自養 relay；agent 在本機、bench 在遠端）——bench 只跑 `cloudflared`、**不跑 `serialwrap remote`**：
 - Quick Tunnel（無帳號無網域，hostname 每次重啟換）：bench `cloudflared tunnel --url ssh://localhost:22`，抄它印出的 hostname（`*.trycloudflare.com`，**去掉 `https://`**——ssh 目標是 hostname 不是 URL）。
-- Named Tunnel 不開 Access（帳號裡有網域，hostname 固定）：bench 一次性 `cloudflared tunnel login` → `tunnel create <name>` → `tunnel route dns <name> <hostname>` → `~/.cloudflared/config.yml`（ingress `service: ssh://localhost:22`）→ `tunnel run <name>` 或 `sudo cloudflared service install`。
+- Named Tunnel 不開 Access（帳號裡有網域，hostname 固定）：bench 一次性 `cloudflared tunnel login` → `tunnel create <name>` → `tunnel route dns <name> <hostname>` → `~/.cloudflared/config.yml`（ingress `service: ssh://localhost:22`）→ `tunnel run <name>` 或 `sudo cloudflared service install`。兩個實跑坑（2026-09-16，cloudflared 2026.9.1）：`tunnel login` 的瀏覽器頁要**選 zone 再按 Authorize** cert.pem 才落地；`service install` 在 sudo 下 `~` 是 /root 找不到設定，要先把 `config.yml` 與 `<UUID>.json` 搬到 `/etc/cloudflared/` 再 `sudo cloudflared --config /etc/cloudflared/config.yml service install`。
 
 本機兩條路線同一行（`cloudflared` 只是這條 ssh 的 per-connection helper，放 `--ssh-opt`、**不要**寫進 `~/.ssh/config`；`access ssh` 只是子命令名稱、走 Tunnel 就會用到，**不代表**啟用 Access 身份政策）：
 ```bash
