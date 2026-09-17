@@ -1,3 +1,7 @@
+---
+work_item: issue-203-serialwrap-connect-code-alias
+---
+
 ## 1. bench_registry 模組（RED first）
 
 - [ ] 1.1 寫失敗測試 `tests/test_bench_registry.py`：合法 benches.yaml 載入回 frozen entry、`ssh_opts` 原樣保留；provider 專屬鍵（`cloudflare:`/`tailscale:`）被拒；`target` 缺 user 報錯不補當前使用者。確認 RED 為「模組不存在／函式未實作」的正當理由。

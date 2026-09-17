@@ -1,3 +1,7 @@
+---
+work_item: issue-203-serialwrap-connect-code-alias
+---
+
 ## Context
 
 `serialwrap remote -L` 已能在 SSH 可達性由外部（Cloudflare Named Tunnel 等）解決後，把 remote daemon 的 unix socket 拉回 host loopback（agent-pull，#193/#197）。目前一切靠手打長參數，且 `remote_tunnel.py` 已具備 spawn／registry／readiness 全套邏輯。本設計在其上加一層「代號別名」，讓 host 端以一個代號完成連線與後續命令定址，remote 端與管理端以 `tools/` 腳本一鍵完成佈署。

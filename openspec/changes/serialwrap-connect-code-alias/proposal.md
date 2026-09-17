@@ -1,3 +1,7 @@
+---
+work_item: issue-203-serialwrap-connect-code-alias
+---
+
 ## Why
 
 #197 已證明 Cloudflare Named Tunnel 能讓「一台待測機一個永久代號、遠端 agent 拿代號就接上該機所有 UART」（2026-09-17 雙機 CP-1~CP-4 通過）。但每次連線要手打一長串 `remote -L --ssh-opt=… ProxyCommand=… -i …`，且之後每條命令都要帶 `--endpoint`，離 AnyDesk「一個 ID 就連」還很遠。本變更收斂 host 端與 remote 端的操作摩擦，**不改安全模型（仍是 SSH 金鑰）、不綁 provider（維持 #185）**。
