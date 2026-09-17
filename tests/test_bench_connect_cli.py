@@ -1,0 +1,180 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import textwrap
+
+import pytest
+
+from sw_core import cli
+from sw_core import remote_tunnel as rt
+
+
+def _write_yaml(path: Path, content: str) -> None:
+    path.write_text(textwrap.dedent(content).lstrip(), encoding="utf-8")
+
+
+def _write_benches_file(path: Path) -> None:
+    _write_yaml(
+        path,
+        """
+        benches:
+          eit-test:
+            target: eit@eit-test.hamanpaul.cc
+            remote_socket: /tmp/serialwrap/serialwrapd.sock
+            local_port: 7777
+            ssh_opts:
+              - "-o"
+              - "ProxyCommand=cloudflared access ssh --hostname %h"
+              - "-i"
+              - "~/.ssh/id_ed25519_serialwrap_bench"
+            autossh: true
+        """,
+    )
+
+
+def _bench_state_path() -> Path:
+    return Path(os.environ["SERIALWRAP_STATE_DIR"]) / "benches.state.json"
+
+
+def _read_endpoint_memory(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        pytest.fail("benches.state.json 必須維持 object")
+    benches = payload.get("benches")
+    if benches is None:
+        return payload
+    if not isinstance(benches, dict):
+        pytest.fail("benches.state.json 的 benches 欄位必須是 object")
+    return benches
+
+
+def _connect_subparser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser | None:
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            subparser = action.choices.get("connect")
+            if isinstance(subparser, argparse.ArgumentParser):
+                return subparser
+    return None
+
+
+def _run_connect(argv: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, dict | None]:
+    parser = cli.build_parser()
+    if _connect_subparser(parser) is None:
+        pytest.fail("serialwrap connect 尚未實作；Task 2.1 先以 RED 測試鎖定 connect CLI 契約")
+    try:
+        parser.parse_args(["connect", *argv])
+    except SystemExit as exc:
+        pytest.fail(f"serialwrap connect 參數契約尚未完成：{exc.code}")
+    try:
+        rc = cli.main(["connect", *argv])
+    except SystemExit as exc:
+        pytest.fail(f"serialwrap connect 不應以 SystemExit 結束：{exc.code}")
+    out = capsys.readouterr().out
+    return rc, json.loads(out) if out.strip() else None
+
+
+def test_connect_known_code_opens_connect_tunnel_with_bench_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    benches_path = tmp_path / "benches.yaml"
+    _write_benches_file(benches_path)
+    monkeypatch.setenv("SERIALWRAP_BENCHES_FILE", str(benches_path))
+    state_path = _bench_state_path()
+    state_path.unlink(missing_ok=True)
+
+    captured: dict[str, object] = {}
+
+    def fake_open(spec, run_dir, **kwargs):
+        captured["spec"] = spec
+        captured["run_dir"] = run_dir
+        return {
+            "ok": True,
+            "status": "active",
+            "role": spec.role,
+            "listen_port": spec.local or spec.port,
+        }
+
+    monkeypatch.setattr(rt, "open_tunnel", fake_open)
+
+    rc, obj = _run_connect(["eit-test"], capsys)
+
+    assert rc == 0
+    assert obj is not None
+    assert obj["ok"] is True
+    assert obj["status"] == "active"
+    spec = captured["spec"]
+    assert spec.role == "connect"
+    assert spec.ssh_target == "eit@eit-test.hamanpaul.cc"
+    assert spec.port == 7777
+    assert (spec.local or spec.port) == 7777
+    assert spec.remote_socket == "/tmp/serialwrap/serialwrapd.sock"
+    assert spec.via == "autossh"
+    assert spec.ssh_opts == (
+        "-o",
+        "ProxyCommand=cloudflared access ssh --hostname %h",
+        "-i",
+        "~/.ssh/id_ed25519_serialwrap_bench",
+    )
+
+
+def test_connect_unknown_code_returns_structured_json_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    benches_path = tmp_path / "benches.yaml"
+    _write_benches_file(benches_path)
+    monkeypatch.setenv("SERIALWRAP_BENCHES_FILE", str(benches_path))
+
+    rc, obj = _run_connect(["missing-code"], capsys)
+
+    assert rc == 1
+    assert obj is not None
+    assert obj["ok"] is False
+    assert "error_code" in obj
+
+
+def test_connect_close_closes_tunnel_and_clears_endpoint_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    benches_path = tmp_path / "benches.yaml"
+    _write_benches_file(benches_path)
+    monkeypatch.setenv("SERIALWRAP_BENCHES_FILE", str(benches_path))
+
+    state_path = _bench_state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "eit-test": "tcp://127.0.0.1:7777",
+                "spare-bench": "tcp://127.0.0.1:7788",
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_close(run_dir, selector, **kwargs):
+        captured["run_dir"] = run_dir
+        captured["selector"] = selector
+        return {"ok": True, "closed": [7777]}
+
+    monkeypatch.setattr(rt, "close", fake_close)
+
+    rc, obj = _run_connect(["eit-test", "--close"], capsys)
+
+    assert rc == 0
+    assert obj is not None
+    assert obj["ok"] is True
+    assert obj["closed"] == [7777]
+    assert str(captured["selector"]) == "7777"
+    entries = _read_endpoint_memory(state_path)
+    assert "eit-test" not in entries
+    assert entries["spare-bench"] == "tcp://127.0.0.1:7788"
