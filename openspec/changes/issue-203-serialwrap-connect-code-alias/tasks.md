@@ -4,8 +4,8 @@ work_item: issue-203-serialwrap-connect-code-alias
 
 ## 1. bench_registry 模組（RED first）
 
-- [ ] 1.1 寫失敗測試 `tests/test_bench_registry.py`：合法 benches.yaml 載入回 frozen entry、`ssh_opts` 原樣保留；provider 專屬鍵（`cloudflare:`/`tailscale:`）被拒；`target` 缺 user 報錯不補當前使用者。確認 RED 為「模組不存在／函式未實作」的正當理由。
-- [ ] 1.2 實作 `sw_core/bench_registry.py`：frozen `BenchEntry` dataclass、`load_benches(path)`、`resolve(code)`，schema 驗證（拒 provider 專屬鍵、強制 `user@host`），`SERIALWRAP_BENCHES_FILE` 覆寫。轉綠。
+- [x] 1.1 寫失敗測試 `tests/test_bench_registry.py`：合法 benches.yaml 載入回 frozen entry、`ssh_opts` 原樣保留；provider 專屬鍵（`cloudflare:`/`tailscale:`）被拒；`target` 缺 user 報錯不補當前使用者。確認 RED 為「模組不存在／函式未實作」的正當理由。
+- [x] 1.2 實作 `sw_core/bench_registry.py`：frozen `BenchEntry` dataclass、`load_benches(path)`、`resolve(code)`，schema 驗證（拒 provider 專屬鍵、強制 `user@host`），`SERIALWRAP_BENCHES_FILE` 覆寫。轉綠。
 - [ ] 1.3 `to_remote_argv(entry)`：展開成等價 `remote -L` 的 argv，重用 `remote_tunnel` 既有 spawn，不重造 build。加對應測試。
 
 ## 2. connect / benches / --bench（host 端 CLI）
@@ -26,10 +26,10 @@ work_item: issue-203-serialwrap-connect-code-alias
 
 - [ ] 4.1 README（中英雙語）新增 connect 別名層與 enroll 流程；`benches.yaml` schema 文件化（R-16/R-18）。
 - [ ] 4.2 `docs/**` 對齊；`sw_core/assets/skill/SKILL.md` 補精簡版。
-- [ ] 4.3 新增 `changelog.d/203-serialwrap-connect-code-alias.md` fragment（type `feat`，issue 203）。
+- [x] 4.3 新增 `changelog.d/203-serialwrap-connect-code-alias.md` fragment（type `feat`，issue 203）。
 
 ## 5. 收斂
 
-- [ ] 5.1 `python3 -m pytest -q tests/` 全綠、無新失敗。
-- [ ] 5.2 `python3 -m policy_check --repo .`（帶 PR 參數複現 CI）通過。
-- [ ] 5.3 openspec 驗證 `openspec validate --change serialwrap-connect-code-alias`（若適用）；archive 於實作＋review 通過後。
+- [x] 5.1 `python3 -m pytest -q tests/` 全綠、無新失敗。
+- [x] 5.2 `python3 -m policy_check --repo .`（帶 PR 參數複現 CI）通過。
+- [x] 5.3 openspec 驗證 `openspec validate --change serialwrap-connect-code-alias`（若適用）；archive 於實作＋review 通過後。
