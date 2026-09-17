@@ -10,3 +10,8 @@ work_items:
     links:
       - kind: github_issue
         ref: "161"
+  issue-203-serialwrap-connect-code-alias:
+    title: "#203 serialwrap connect 代號別名層（host 端）＋ bench enroll（remote 端）"
+    links:
+      - kind: github_issue
+        ref: "203"
