@@ -87,14 +87,36 @@ def _stub_resolve_ssh_bin(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(rt, "resolve_ssh_bin", lambda via: f"/usr/bin/{via}")
 
 
+def _expected_connect_identity() -> str:
+    return rt.compute_identity(
+        rt.TunnelSpec(
+            role="connect",
+            ssh_target="eit@eit-test.hamanpaul.cc",
+            port=7777,
+            remote_socket="/tmp/serialwrap/serialwrapd.sock",
+            via="autossh",
+            ssh_opts=(
+                "-o",
+                "ProxyCommand=cloudflared access ssh --hostname %h",
+                "-i",
+                "~/.ssh/id_ed25519_serialwrap_bench",
+            ),
+        )
+    )
+
+
 @pytest.mark.parametrize(
     "argv",
     [
         ["connect"],
         ["connect", "eit-test", "--bogus"],
         ["--timeout", "connect", "eit-test"],
+        ["--timeout=connect", "eit-test"],
         ["--endpoint", "connect", "eit-test"],
+        ["--endpoint=connect", "eit-test"],
         ["--socket", "connect", "eit-test"],
+        ["--socket=connect", "eit-test"],
+        ["--retries=connect", "eit-test"],
     ],
 )
 def test_connect_parse_errors_return_structured_invalid_args(
@@ -287,6 +309,71 @@ def test_connect_close_closes_tunnel_and_clears_endpoint_memory(
     assert entries["spare-bench"] == "tcp://127.0.0.1:7788"
 
 
+@pytest.mark.parametrize(
+    "existing_tunnel",
+    [
+        {
+            "listen_port": 7777,
+            "status": "active",
+            "role": "expose",
+            "identity": "expose-tunnel-identity",
+            "endpoint": "tcp://127.0.0.1:7777",
+        },
+        {
+            "listen_port": 7777,
+            "status": "active",
+            "role": "connect",
+            "identity": "other-bench-connect-identity",
+            "endpoint": "tcp://127.0.0.1:7777",
+        },
+    ],
+)
+def test_connect_close_rejects_conflicting_stateful_tunnel_without_closing_or_clearing_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    existing_tunnel: dict[str, object],
+) -> None:
+    benches_path = tmp_path / "benches.yaml"
+    _write_benches_file(benches_path)
+    monkeypatch.setenv("SERIALWRAP_BENCHES_FILE", str(benches_path))
+
+    state_path = _bench_state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "eit-test": "tcp://127.0.0.1:7777",
+                "spare-bench": "tcp://127.0.0.1:7788",
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+
+    close_calls: list[str] = []
+
+    def fake_close(run_dir, selector, **kwargs):
+        close_calls.append(str(selector))
+        return {"ok": True, "closed": [7777]}
+
+    monkeypatch.setattr(rt, "close", fake_close)
+    monkeypatch.setattr(rt, "status", lambda run_dir: {"ok": True, "tunnels": [existing_tunnel]})
+
+    rc, obj = _run_connect(["eit-test", "--close"], capsys)
+
+    assert rc == 1
+    assert obj is not None
+    assert obj["ok"] is False
+    assert obj["error_code"] == "TUNNEL_CONFLICT"
+    assert close_calls == []
+    entries = _read_endpoint_memory(state_path)
+    assert entries["eit-test"] == "tcp://127.0.0.1:7777"
+    assert entries["spare-bench"] == "tcp://127.0.0.1:7788"
+
+
 def test_connect_close_keeps_endpoint_memory_when_tunnel_still_exists(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -320,6 +407,7 @@ def test_connect_close_keeps_endpoint_memory_when_tunnel_still_exists(
                     "listen_port": 7777,
                     "status": "active",
                     "role": "connect",
+                    "identity": _expected_connect_identity(),
                     "endpoint": "tcp://127.0.0.1:7777",
                 }
             ],
