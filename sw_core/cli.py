@@ -1475,6 +1475,8 @@ def _run_remote(args: argparse.Namespace) -> int:
         _print(resp)
         _mirror_err(resp, context="remote")
         return 1
+    except _EndpointResolutionError as exc:
+        return _print_endpoint_resolution_error(exc, context="remote")
     except Exception as exc:  # noqa: BLE001 — 任何非預期例外不得穿越 CLI 邊界
         resp = {"ok": False, "error_code": "INTERNAL_ERROR", "message": str(exc)}
         _print(resp)

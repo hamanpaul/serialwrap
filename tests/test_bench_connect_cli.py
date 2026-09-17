@@ -672,6 +672,7 @@ def test_bench_requires_connect_hint_and_skips_local_fallback_when_endpoint_not_
     [
         ["--bench", "eit-missing", "daemon", "stop"],
         ["--bench", "eit-missing", "event", "list"],
+        ["--bench", "eit-missing", "remote", "tester@relay:7777"],
     ],
 )
 def test_bench_missing_endpoint_returns_structured_error_for_direct_cli_paths(
@@ -687,6 +688,8 @@ def test_bench_missing_endpoint_returns_structured_error_for_direct_cli_paths(
         return {"ok": True}
 
     monkeypatch.setattr(cli, "rpc_call", fake_rpc_call)
+    monkeypatch.setattr(rt, "resolve_ssh_bin", lambda via: f"/usr/bin/{via}")
+    monkeypatch.setattr(rt, "open_tunnel", lambda *args, **kwargs: pytest.fail("remote 不應繼續開隧道"))
 
     rc, obj = _run_main(argv, capsys)
 
