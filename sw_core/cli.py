@@ -1086,6 +1086,59 @@ def _remember_bench_endpoint(code: str, endpoint: str | None) -> None:
     _write_bench_state_doc(path, payload)
 
 
+def _status_has_tunnel_port(status_resp: dict[str, Any], listen_port: int) -> bool:
+    tunnels = status_resp.get("tunnels")
+    if not isinstance(tunnels, list):
+        raise ValueError("remote status 回應缺少 tunnels 清單")
+    for tunnel in tunnels:
+        if not isinstance(tunnel, dict):
+            continue
+        try:
+            port = int(tunnel.get("listen_port"))
+        except (TypeError, ValueError):
+            continue
+        if port == listen_port:
+            return True
+    return False
+
+
+def _connect_tunnel_present(rt: Any, run_dir: str, listen_port: int) -> bool:
+    status_resp = rt.status(run_dir)
+    if not isinstance(status_resp, dict):
+        raise rt.TunnelError("TUNNEL_STATUS_ERROR", "remote status 回應格式異常")
+    if not status_resp.get("ok"):
+        code = status_resp.get("error_code")
+        message = status_resp.get("message")
+        raise rt.TunnelError(
+            str(code) if isinstance(code, str) and code else "TUNNEL_STATUS_ERROR",
+            str(message) if isinstance(message, str) and message else "無法確認 tunnel 狀態",
+        )
+    try:
+        return _status_has_tunnel_port(status_resp, listen_port)
+    except ValueError as exc:
+        raise rt.TunnelError("TUNNEL_STATUS_ERROR", str(exc)) from exc
+
+
+def _rollback_connect_open(rt: Any, run_dir: str, listen_port: int) -> str | None:
+    try:
+        close_resp = rt.close(run_dir, str(listen_port))
+    except Exception as exc:  # noqa: BLE001 — rollback 只做 best-effort，錯誤需回報但不覆蓋主錯誤
+        return f"rollback close 失敗：{exc}"
+    if not isinstance(close_resp, dict):
+        return "rollback close 回應格式異常"
+    if not close_resp.get("ok"):
+        message = close_resp.get("message")
+        code = close_resp.get("error_code")
+        detail = str(message) if isinstance(message, str) and message else str(code or close_resp)
+        return f"rollback close 失敗：{detail}"
+    try:
+        if _connect_tunnel_present(rt, run_dir, listen_port):
+            return f"rollback 後 local_port={listen_port} tunnel 仍存在"
+    except Exception as exc:  # noqa: BLE001 — rollback 驗證失敗需明確帶回，但不再丟第二個主錯誤
+        return f"rollback 後無法確認 tunnel 是否已關閉：{exc}"
+    return None
+
+
 def _run_connect(args: argparse.Namespace) -> int:
     if os.name == "nt":
         resp = {
@@ -1114,6 +1167,15 @@ def _run_connect(args: argparse.Namespace) -> int:
         if args.close:
             res = rt.close(run_dir, str(entry.local_port))
             if res.get("ok"):
+                if _connect_tunnel_present(rt, run_dir, entry.local_port):
+                    resp = {
+                        "ok": False,
+                        "error_code": "TUNNEL_STILL_ACTIVE",
+                        "message": f"local_port={entry.local_port} 的 tunnel 仍存在，未清除 endpoint 記憶",
+                    }
+                    _print(resp)
+                    _mirror_err(resp, context="connect")
+                    return 1
                 try:
                     _remember_bench_endpoint(args.code, None)
                 except ValueError as exc:
@@ -1146,9 +1208,21 @@ def _run_connect(args: argparse.Namespace) -> int:
             try:
                 _remember_bench_endpoint(args.code, f"tcp://127.0.0.1:{entry.local_port}")
             except ValueError as exc:
-                raise rt.TunnelError("INVALID_BENCH_STATE", str(exc)) from exc
+                rollback_detail = _rollback_connect_open(rt, run_dir, entry.local_port)
+                resp = {"ok": False, "error_code": "INVALID_BENCH_STATE", "message": str(exc)}
+                if rollback_detail is not None:
+                    resp["rollback_warning"] = rollback_detail
+                _print(resp)
+                _mirror_err(resp, context="connect")
+                return 1
             except OSError as exc:
-                raise rt.TunnelError("BENCH_STATE_IO_ERROR", str(exc)) from exc
+                rollback_detail = _rollback_connect_open(rt, run_dir, entry.local_port)
+                resp = {"ok": False, "error_code": "BENCH_STATE_IO_ERROR", "message": str(exc)}
+                if rollback_detail is not None:
+                    resp["rollback_warning"] = rollback_detail
+                _print(resp)
+                _mirror_err(resp, context="connect")
+                return 1
         _print(res)
         if not res.get("ok"):
             _mirror_err(res, context="connect")
@@ -2048,10 +2122,33 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _looks_like_connect_invocation(argv: Sequence[str]) -> bool:
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token in ("--socket", "--endpoint", "--timeout", "--retries"):
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return token == "connect"
+    return False
+
+
 def main(argv: list[str] | None = None) -> int:
     force_utf8_stdio()  # Windows console cp1252 印繁中 help 會崩（#118），須在 parse_args 前
+    effective_argv = list(sys.argv[1:] if argv is None else argv)
     p = build_parser()
-    args = p.parse_args(argv)
+    try:
+        args = p.parse_args(effective_argv)
+    except SystemExit as exc:
+        if exc.code == 2 and _looks_like_connect_invocation(effective_argv):
+            resp = {"ok": False, "error_code": "INVALID_ARGS"}
+            _print(resp)
+            _mirror_err(resp, context="connect")
+            return 1
+        raise
 
     if args.cmd == "daemon":
         if args.daemon_cmd == "start":

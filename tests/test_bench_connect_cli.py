@@ -62,6 +62,15 @@ def _connect_subparser(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
     return None
 
 
+def _run_main(argv: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, dict | None]:
+    try:
+        rc = cli.main(argv)
+    except SystemExit as exc:
+        pytest.fail(f"cli.main({argv!r}) 不應以 SystemExit 結束：{exc.code}")
+    out = capsys.readouterr().out
+    return rc, json.loads(out) if out.strip() else None
+
+
 def _run_connect(argv: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, dict | None]:
     parser = cli.build_parser()
     if _connect_subparser(parser) is None:
@@ -70,12 +79,19 @@ def _run_connect(argv: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[i
         parser.parse_args(["connect", *argv])
     except SystemExit as exc:
         pytest.fail(f"serialwrap connect 參數契約尚未完成：{exc.code}")
-    try:
-        rc = cli.main(["connect", *argv])
-    except SystemExit as exc:
-        pytest.fail(f"serialwrap connect 不應以 SystemExit 結束：{exc.code}")
-    out = capsys.readouterr().out
-    return rc, json.loads(out) if out.strip() else None
+    return _run_main(["connect", *argv], capsys)
+
+
+@pytest.mark.parametrize("argv", [["connect"], ["connect", "eit-test", "--bogus"]])
+def test_connect_parse_errors_return_structured_invalid_args(
+    argv: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc, obj = _run_main(argv, capsys)
+
+    assert rc == 1
+    assert obj is not None
+    assert obj["ok"] is False
+    assert obj["error_code"] == "INVALID_ARGS"
 
 
 def test_connect_known_code_opens_connect_tunnel_with_bench_settings(
@@ -167,6 +183,7 @@ def test_connect_close_closes_tunnel_and_clears_endpoint_memory(
         return {"ok": True, "closed": [7777]}
 
     monkeypatch.setattr(rt, "close", fake_close)
+    monkeypatch.setattr(rt, "status", lambda run_dir: {"ok": True, "tunnels": []})
 
     rc, obj = _run_connect(["eit-test", "--close"], capsys)
 
@@ -178,3 +195,96 @@ def test_connect_close_closes_tunnel_and_clears_endpoint_memory(
     entries = _read_endpoint_memory(state_path)
     assert "eit-test" not in entries
     assert entries["spare-bench"] == "tcp://127.0.0.1:7788"
+
+
+def test_connect_close_keeps_endpoint_memory_when_tunnel_still_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    benches_path = tmp_path / "benches.yaml"
+    _write_benches_file(benches_path)
+    monkeypatch.setenv("SERIALWRAP_BENCHES_FILE", str(benches_path))
+
+    state_path = _bench_state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "eit-test": "tcp://127.0.0.1:7777",
+                "spare-bench": "tcp://127.0.0.1:7788",
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(rt, "close", lambda run_dir, selector, **kwargs: {"ok": True, "closed": [7777]})
+    monkeypatch.setattr(
+        rt,
+        "status",
+        lambda run_dir: {
+            "ok": True,
+            "tunnels": [
+                {
+                    "listen_port": 7777,
+                    "status": "active",
+                    "role": "connect",
+                    "endpoint": "tcp://127.0.0.1:7777",
+                }
+            ],
+        },
+    )
+
+    rc, obj = _run_connect(["eit-test", "--close"], capsys)
+
+    assert rc == 1
+    assert obj is not None
+    assert obj["ok"] is False
+    assert obj["error_code"] == "TUNNEL_STILL_ACTIVE"
+    entries = _read_endpoint_memory(state_path)
+    assert entries["eit-test"] == "tcp://127.0.0.1:7777"
+    assert entries["spare-bench"] == "tcp://127.0.0.1:7788"
+
+
+def test_connect_rolls_back_tunnel_when_state_write_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    benches_path = tmp_path / "benches.yaml"
+    _write_benches_file(benches_path)
+    monkeypatch.setenv("SERIALWRAP_BENCHES_FILE", str(benches_path))
+    state_path = _bench_state_path()
+    state_path.unlink(missing_ok=True)
+
+    monkeypatch.setattr(
+        rt,
+        "open_tunnel",
+        lambda spec, run_dir, **kwargs: {
+            "ok": True,
+            "status": "active",
+            "role": spec.role,
+            "listen_port": spec.local or spec.port,
+        },
+    )
+    rollback_calls: list[str] = []
+
+    def fake_close(run_dir, selector, **kwargs):
+        rollback_calls.append(str(selector))
+        return {"ok": True, "closed": [7777]}
+
+    monkeypatch.setattr(rt, "close", fake_close)
+    monkeypatch.setattr(rt, "status", lambda run_dir: {"ok": True, "tunnels": []})
+
+    def boom(path: str, payload: dict[str, object]) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(cli, "_write_bench_state_doc", boom)
+
+    rc, obj = _run_connect(["eit-test"], capsys)
+
+    assert rc == 1
+    assert obj is not None
+    assert obj["ok"] is False
+    assert obj["error_code"] == "BENCH_STATE_IO_ERROR"
+    assert rollback_calls == ["7777"]
+    assert _read_endpoint_memory(state_path) == {}
