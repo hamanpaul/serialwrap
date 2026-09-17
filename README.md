@@ -2706,6 +2706,7 @@ command groups:
     wal                write-ahead log 匯出／重設／seq 查詢
     mcu                MCU flash pattern 查詢與 flash 端點狀態
     remote             按需開關 ssh 反向隧道，讓遠端 agent 連本機 daemon（-R 預設 expose）
+    connect            以 bench 代號建立或拆除 connect 隧道
     event              event-trigger 規則註冊與 matcher 控制
     supervision-mode   顯示有效的監管模式（on-demand、systemd-user 或 systemd-system）
     service            透過 systemctl 管理 serialwrap systemd service（systemd 監管模式適用）

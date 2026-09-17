@@ -1035,6 +1035,136 @@ def _run_skill(args: argparse.Namespace) -> int:
     return 0
 
 
+def _bench_state_path() -> str:
+    state_dir = os.environ.get("SERIALWRAP_STATE_DIR")
+    if state_dir is None or not state_dir.strip():
+        state_home = os.environ.get("XDG_STATE_HOME") or os.path.join(
+            os.path.expanduser("~"), ".local", "state"
+        )
+        state_dir = os.path.join(state_home, "serialwrap")
+    return os.path.join(os.path.expanduser(state_dir), "benches.state.json")
+
+
+def _load_bench_state_doc(path: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not os.path.exists(path):
+        payload: dict[str, Any] = {}
+        return payload, payload
+    with open(path, "r", encoding="utf-8") as fp:
+        payload = json.load(fp)
+    if not isinstance(payload, dict):
+        raise ValueError("benches.state.json 必須是 object")
+    benches = payload.get("benches")
+    if benches is None:
+        return payload, payload
+    if not isinstance(benches, dict):
+        raise ValueError("benches.state.json 的 benches 欄位必須是 object")
+    return payload, benches
+
+
+def _write_bench_state_doc(path: str, payload: dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fp:
+            json.dump(payload, fp, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _remember_bench_endpoint(code: str, endpoint: str | None) -> None:
+    path = _bench_state_path()
+    payload, benches = _load_bench_state_doc(path)
+    if endpoint is None:
+        benches.pop(code, None)
+    else:
+        benches[code] = endpoint
+    _write_bench_state_doc(path, payload)
+
+
+def _run_connect(args: argparse.Namespace) -> int:
+    if os.name == "nt":
+        resp = {
+            "ok": False,
+            "error_code": "REMOTE_NOT_SUPPORTED",
+            "message": "native Windows 本期不支援 serialwrap connect；請手動 ssh -L（見 SKILL_WINDOWS.md）",
+        }
+        _print(resp)
+        _mirror_err(resp, context="connect")
+        return 1
+
+    from . import bench_registry  # noqa: PLC0415
+    from . import remote_tunnel as rt  # noqa: PLC0415
+
+    try:
+        rt.guard_platform()
+        try:
+            entry = bench_registry.resolve(args.code)
+        except KeyError as exc:
+            message = exc.args[0] if exc.args else str(exc)
+            raise rt.TunnelError("UNKNOWN_BENCH_CODE", message) from exc
+        except ValueError as exc:
+            raise rt.TunnelError("INVALID_BENCH_CONFIG", str(exc)) from exc
+
+        run_dir = _remote_run_dir()
+        if args.close:
+            res = rt.close(run_dir, str(entry.local_port))
+            if res.get("ok"):
+                try:
+                    _remember_bench_endpoint(args.code, None)
+                except ValueError as exc:
+                    raise rt.TunnelError("INVALID_BENCH_STATE", str(exc)) from exc
+                except OSError as exc:
+                    raise rt.TunnelError("BENCH_STATE_IO_ERROR", str(exc)) from exc
+            _print(res)
+            if not res.get("ok"):
+                _mirror_err(res, context="connect")
+            return 0 if res.get("ok") else 1
+
+        via = "autossh" if entry.autossh else "ssh"
+        rt.resolve_ssh_bin(via)
+        spec = rt.TunnelSpec(
+            role="connect",
+            ssh_target=entry.target,
+            port=entry.local_port,
+            remote_socket=entry.remote_socket,
+            via=via,
+            ssh_opts=entry.ssh_opts,
+        )
+        res = rt.open_tunnel(
+            spec,
+            run_dir,
+            spawner=rt.real_spawner,
+            runner=rt.make_runner(),
+            ping=rt.real_ping,
+        )
+        if res.get("ok"):
+            try:
+                _remember_bench_endpoint(args.code, f"tcp://127.0.0.1:{entry.local_port}")
+            except ValueError as exc:
+                raise rt.TunnelError("INVALID_BENCH_STATE", str(exc)) from exc
+            except OSError as exc:
+                raise rt.TunnelError("BENCH_STATE_IO_ERROR", str(exc)) from exc
+        _print(res)
+        if not res.get("ok"):
+            _mirror_err(res, context="connect")
+        return 0 if res.get("ok") else 1
+    except rt.TunnelError as exc:
+        resp = {"ok": False, "error_code": exc.code, "message": exc.message or exc.code}
+        _print(resp)
+        _mirror_err(resp, context="connect")
+        return 1
+    except Exception as exc:  # noqa: BLE001 — 任何非預期例外不得穿越 CLI 邊界
+        resp = {"ok": False, "error_code": "INTERNAL_ERROR", "message": str(exc)}
+        _print(resp)
+        _mirror_err(resp, context="connect")
+        return 1
+
+
 def _run_remote(args: argparse.Namespace) -> int:
     """serialwrap remote 分派：words → status / close / open。
 
@@ -1749,6 +1879,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     # 註：--socket / --endpoint / --timeout 為既有全域參數，_resolve_endpoint 會取用。
 
+    p_connect = sub.add_parser(
+        "connect",
+        help="以 bench 代號建立或拆除 connect 隧道",
+        description="從 benches.yaml 解析 bench 代號，重用既有 remote -L spawn 路徑建立或拆除隧道。",
+    )
+    p_connect.add_argument("code", help="benches.yaml 的 bench 代號")
+    p_connect.add_argument(
+        "--close",
+        action="store_true",
+        help="拆除該代號對應 local_port 的隧道，並清除 endpoint 記憶",
+    )
+
     p_event = sub.add_parser(
         "event",
         help="event-trigger 規則註冊與 matcher 控制",
@@ -2121,6 +2263,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "skill":
         return _run_skill(args)
+
+    if args.cmd == "connect":
+        return _run_connect(args)
 
     if args.cmd == "remote":
         return _run_remote(args)

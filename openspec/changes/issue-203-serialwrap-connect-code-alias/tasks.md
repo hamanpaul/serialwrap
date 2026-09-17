@@ -11,7 +11,7 @@ work_item: issue-203-serialwrap-connect-code-alias
 ## 2. connect / benches / --bench（host 端 CLI）
 
 - [x] 2.1 寫失敗測試：`connect <code>` 展開參數等價於手打 `remote -L`（以 mock spawn 驗 argv）；未知代號回 `{ok:false,error_code}` 不丟例外；`--close` 拆隧道並清 endpoint 記憶。
-- [ ] 2.2 實作 `serialwrap connect <code>` / `--close` subparser（`sw_core/cli.py`），呼叫 `bench_registry` + 既有 `remote_tunnel.open_tunnel`/`close`；成功寫 endpoint 記憶（`$XDG_STATE/serialwrap/benches.state.json`，緊湊 `sort_keys` JSON）。轉綠。
+- [x] 2.2 實作 `serialwrap connect <code>` / `--close` subparser（`sw_core/cli.py`），呼叫 `bench_registry` + 既有 `remote_tunnel.open_tunnel`/`close`；成功寫 endpoint 記憶（`$XDG_STATE/serialwrap/benches.state.json`，緊湊 `sort_keys` JSON）。轉綠。
 - [ ] 2.3 寫失敗測試：`--bench <code>` 端點解析優先序（`--endpoint` > `--socket` > `--bench` > config）；未 connect 的代號回明確錯誤、不 fallback 本機 daemon。
 - [ ] 2.4 實作全域 `--bench` 參數與 `_resolve_endpoint` 優先序調整。轉綠。
 - [ ] 2.5 實作 `serialwrap benches`（list 代號 + endpoint 記憶／alive 狀態）＋測試。
