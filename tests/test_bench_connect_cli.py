@@ -83,7 +83,20 @@ def _run_connect(argv: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[i
     return _run_main(["connect", *argv], capsys)
 
 
-@pytest.mark.parametrize("argv", [["connect"], ["connect", "eit-test", "--bogus"]])
+def _stub_resolve_ssh_bin(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(rt, "resolve_ssh_bin", lambda via: f"/usr/bin/{via}")
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["connect"],
+        ["connect", "eit-test", "--bogus"],
+        ["--timeout", "connect", "eit-test"],
+        ["--endpoint", "connect", "eit-test"],
+        ["--socket", "connect", "eit-test"],
+    ],
+)
 def test_connect_parse_errors_return_structured_invalid_args(
     argv: list[str], capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -101,6 +114,7 @@ def test_connect_known_code_opens_connect_tunnel_with_bench_settings(
     benches_path = tmp_path / "benches.yaml"
     _write_benches_file(benches_path)
     monkeypatch.setenv("SERIALWRAP_BENCHES_FILE", str(benches_path))
+    _stub_resolve_ssh_bin(monkeypatch)
     state_path = _bench_state_path()
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text(
@@ -378,6 +392,7 @@ def test_connect_rolls_back_tunnel_when_state_write_fails(
     benches_path = tmp_path / "benches.yaml"
     _write_benches_file(benches_path)
     monkeypatch.setenv("SERIALWRAP_BENCHES_FILE", str(benches_path))
+    _stub_resolve_ssh_bin(monkeypatch)
     state_path = _bench_state_path()
     state_path.unlink(missing_ok=True)
 
@@ -421,6 +436,7 @@ def test_connect_does_not_rollback_existing_tunnel_when_state_write_fails(
     benches_path = tmp_path / "benches.yaml"
     _write_benches_file(benches_path)
     monkeypatch.setenv("SERIALWRAP_BENCHES_FILE", str(benches_path))
+    _stub_resolve_ssh_bin(monkeypatch)
     state_path = _bench_state_path()
     state_path.unlink(missing_ok=True)
 

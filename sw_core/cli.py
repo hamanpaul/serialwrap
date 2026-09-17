@@ -2178,6 +2178,8 @@ def _looks_like_connect_invocation(argv: Sequence[str]) -> bool:
     while index < len(argv):
         token = argv[index]
         if token in ("--socket", "--endpoint", "--timeout", "--retries"):
+            if index + 1 < len(argv) and argv[index + 1] == "connect":
+                return True
             index += 2
             continue
         if token.startswith("-"):
