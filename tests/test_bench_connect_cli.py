@@ -83,6 +83,14 @@ def _run_connect(argv: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[i
     return _run_main(["connect", *argv], capsys)
 
 
+def _parse_bench_args(argv: list[str]) -> argparse.Namespace:
+    parser = cli.build_parser()
+    try:
+        return parser.parse_args(argv)
+    except SystemExit as exc:
+        pytest.fail(f"serialwrap --bench 參數契約尚未完成：{exc.code}")
+
+
 def _stub_resolve_ssh_bin(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(rt, "resolve_ssh_bin", lambda via: f"/usr/bin/{via}")
 
@@ -560,3 +568,99 @@ def test_connect_does_not_rollback_existing_tunnel_when_state_write_fails(
     assert obj["error_code"] == "BENCH_STATE_IO_ERROR"
     assert rollback_calls == []
     assert _read_endpoint_memory(state_path) == {}
+
+
+def test_bench_routes_session_list_to_remembered_endpoint_before_config_fallback(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state_path = _bench_state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {"eit-test": "tcp://127.0.0.1:7777"},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+
+    class _RC:
+        def socket_path(self) -> str:
+            return "/cfg/live.sock"
+
+        def mode(self) -> str:
+            return "on-demand"
+
+    monkeypatch.setattr(cli, "_safe_runtime_config", lambda: _RC())
+    monkeypatch.setattr(cli, "_endpoint_alive", lambda endpoint: True)
+
+    captured: dict[str, object] = {}
+
+    def fake_rpc_call(endpoint, method, params, **kwargs):
+        captured["endpoint"] = endpoint
+        captured["method"] = method
+        captured["params"] = params
+        return {"ok": True, "sessions": []}
+
+    monkeypatch.setattr(cli, "rpc_call", fake_rpc_call)
+
+    args = _parse_bench_args(["--bench", "eit-test", "session", "list"])
+
+    assert args.bench == "eit-test"
+
+    rc, obj = _run_main(["--bench", "eit-test", "session", "list"], capsys)
+
+    assert rc == 0
+    assert obj == {"ok": True, "sessions": []}
+    assert captured == {
+        "endpoint": "tcp://127.0.0.1:7777",
+        "method": "session.list",
+        "params": {},
+    }
+
+
+def test_bench_requires_connect_hint_and_skips_local_fallback_when_endpoint_not_remembered(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state_path = _bench_state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {"other-bench": "tcp://127.0.0.1:7788"},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+
+    class _RC:
+        def socket_path(self) -> str:
+            return "/cfg/live.sock"
+
+        def mode(self) -> str:
+            return "on-demand"
+
+    monkeypatch.setattr(cli, "_safe_runtime_config", lambda: _RC())
+    monkeypatch.setattr(cli, "_endpoint_alive", lambda endpoint: True)
+
+    rpc_calls: list[tuple[str, str, dict[str, object]]] = []
+
+    def fake_rpc_call(endpoint, method, params, **kwargs):
+        rpc_calls.append((endpoint, method, params))
+        return {"ok": True, "sessions": []}
+
+    monkeypatch.setattr(cli, "rpc_call", fake_rpc_call)
+
+    args = _parse_bench_args(["--bench", "eit-02", "session", "list"])
+
+    assert args.bench == "eit-02"
+
+    rc, obj = _run_main(["--bench", "eit-02", "session", "list"], capsys)
+
+    assert rc != 0
+    assert obj is not None
+    assert obj["ok"] is False
+    assert "connect" in str(obj.get("message", ""))
+    assert rpc_calls == []
