@@ -10,6 +10,7 @@ import yaml
 _ALLOWED_ENTRY_KEYS = frozenset(
     {"target", "remote_socket", "local_port", "ssh_opts", "autossh"}
 )
+_ALLOWED_ROOT_KEYS = frozenset({"benches"})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -58,15 +59,11 @@ def _require_string(raw: Any, *, field_name: str, code: str) -> str:
 
 
 def _require_port(raw: Any, *, code: str) -> int:
-    if isinstance(raw, bool):
+    if isinstance(raw, bool) or not isinstance(raw, int):
         raise ValueError(f'bench "{code}" 的 local_port 必須是整數')
-    try:
-        value = int(raw)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f'bench "{code}" 的 local_port 必須是整數') from exc
-    if value <= 0:
-        raise ValueError(f'bench "{code}" 的 local_port 必須大於 0')
-    return value
+    if raw < 1 or raw > 65535:
+        raise ValueError(f'bench "{code}" 的 local_port 必須介於 1 到 65535')
+    return raw
 
 
 def _require_ssh_opts(raw: Any, *, code: str) -> tuple[str, ...]:
@@ -109,10 +106,21 @@ def _validate_allowed_keys(raw: dict[str, Any], *, code: str) -> None:
         raise ValueError(f'bench "{code}" 缺少必要欄位 {names}')
 
 
+def _validate_root_keys(raw: dict[str, Any]) -> None:
+    unexpected = sorted(str(key) for key in raw.keys() if key not in _ALLOWED_ROOT_KEYS)
+    if unexpected:
+        allowed = ", ".join(sorted(_ALLOWED_ROOT_KEYS))
+        names = ", ".join(unexpected)
+        raise ValueError(f"benches.yaml 包含不支援根欄位 {names}；只能使用 {allowed}")
+
+
 def _entry_from_raw(code: str, raw: Any) -> BenchEntry:
     obj = _require_mapping(raw, context=f'bench "{code}"')
     _validate_allowed_keys(obj, code=code)
-    target = _validate_target(_require_string(obj["target"], field_name="target", code=code), code=code)
+    target = _validate_target(
+        _require_string(obj["target"], field_name="target", code=code),
+        code=code,
+    )
     remote_socket = _require_string(obj["remote_socket"], field_name="remote_socket", code=code)
     local_port = _require_port(obj["local_port"], code=code)
     ssh_opts = _require_ssh_opts(obj["ssh_opts"], code=code)
@@ -131,8 +139,11 @@ def load_benches(path: str) -> dict[str, BenchEntry]:
     if not os.path.exists(resolved_path):
         return {}
     with open(resolved_path, "r", encoding="utf-8") as fp:
-        loaded = yaml.safe_load(fp) or {}
+        loaded = yaml.safe_load(fp)
+    if loaded is None:
+        loaded = {}
     root = _require_mapping(loaded, context="benches.yaml")
+    _validate_root_keys(root)
     benches_raw = root.get("benches", {})
     benches_obj = _require_mapping(benches_raw, context="benches.yaml 的 benches")
     benches: dict[str, BenchEntry] = {}
