@@ -11,6 +11,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Sequence
@@ -78,6 +79,8 @@ PROFILE_DAEMON_ENV_FILE = "OPI.env"
 LONG_RPC_TIMEOUT_FLOOR_S = 45.0
 # 一般（非長操作）方法未顯式指定 --timeout 時的預設 RPC timeout，維持既有 5s。
 DEFAULT_RPC_TIMEOUT_S = 5.0
+_BENCH_STATE_IO_LOCK = threading.Lock()
+_CONNECT_BOUNDARY_GLOBAL_OPTIONS = frozenset({"--socket", "--endpoint", "--timeout", "--retries"})
 
 # 落在 daemon 端 BLOCKING_RPC_METHODS、且 CLI 無從得知其真實變動成本
 # （profile timeout_s）的長操作方法：一律採上方固定 floor，不依任何 CLI 側
@@ -1035,6 +1038,285 @@ def _run_skill(args: argparse.Namespace) -> int:
     return 0
 
 
+def _bench_state_path() -> str:
+    state_dir = os.environ.get("SERIALWRAP_STATE_DIR")
+    if state_dir is None or not state_dir.strip():
+        state_home = os.environ.get("XDG_STATE_HOME") or os.path.join(
+            os.path.expanduser("~"), ".local", "state"
+        )
+        state_dir = os.path.join(state_home, "serialwrap")
+    return os.path.join(os.path.expanduser(state_dir), "benches.state.json")
+
+
+@contextmanager
+def _lock_bench_state_doc(path: str):
+    state_dir = os.path.dirname(path) or "."
+    os.makedirs(state_dir, exist_ok=True)
+    if os.name == "nt":
+        with _BENCH_STATE_IO_LOCK:
+            yield
+        return
+    import fcntl  # noqa: PLC0415 -- connect 的 bench state 只在 POSIX 路徑要求 cross-process 鎖
+
+    lock_path = f"{path}.lock"
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        with _BENCH_STATE_IO_LOCK:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _load_bench_state_doc(path: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not os.path.exists(path):
+        payload: dict[str, Any] = {}
+        return payload, payload
+    with open(path, "r", encoding="utf-8") as fp:
+        payload = json.load(fp)
+    if not isinstance(payload, dict):
+        raise ValueError("benches.state.json 必須是 object")
+    benches = payload.get("benches")
+    if benches is None:
+        return payload, payload
+    if not isinstance(benches, dict):
+        raise ValueError("benches.state.json 的 benches 欄位必須是 object")
+    return payload, benches
+
+
+def _write_bench_state_doc(path: str, payload: dict[str, Any]) -> None:
+    state_dir = os.path.dirname(path) or "."
+    os.makedirs(state_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=state_dir, prefix=f"{os.path.basename(path)}.tmp.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fp:
+            fd = -1
+            json.dump(payload, fp, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        os.replace(tmp_path, path)
+    except Exception:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _remember_bench_endpoint(code: str, endpoint: str | None) -> None:
+    path = _bench_state_path()
+    with _lock_bench_state_doc(path):
+        payload, benches = _load_bench_state_doc(path)
+        if endpoint is None:
+            benches.pop(code, None)
+        else:
+            benches[code] = endpoint
+        _write_bench_state_doc(path, payload)
+
+
+def _tunnel_listen_port(tunnel: dict[str, Any]) -> int | None:
+    control_path = tunnel.get("control_path")
+    try:
+        return int(tunnel.get("listen_port"))
+    except (TypeError, ValueError):
+        if not isinstance(control_path, str):
+            return None
+        control_name = os.path.basename(control_path)
+        if not control_name.startswith("cm-"):
+            return None
+        try:
+            return int(control_name[len("cm-") :])
+        except ValueError:
+            return None
+
+
+def _status_tunnels(rt: Any, run_dir: str) -> list[dict[str, Any]]:
+    status_resp = rt.status(run_dir)
+    if not isinstance(status_resp, dict):
+        raise rt.TunnelError("TUNNEL_STATUS_ERROR", "remote status 回應格式異常")
+    if not status_resp.get("ok"):
+        code = status_resp.get("error_code")
+        message = status_resp.get("message")
+        raise rt.TunnelError(
+            str(code) if isinstance(code, str) and code else "TUNNEL_STATUS_ERROR",
+            str(message) if isinstance(message, str) and message else "無法確認 tunnel 狀態",
+        )
+    tunnels = status_resp.get("tunnels")
+    if not isinstance(tunnels, list):
+        raise rt.TunnelError("TUNNEL_STATUS_ERROR", "remote status 回應缺少 tunnels 清單")
+    return [tunnel for tunnel in tunnels if isinstance(tunnel, dict)]
+
+
+def _connect_tunnel_present(rt: Any, run_dir: str, listen_port: int) -> bool:
+    return any(
+        _tunnel_listen_port(tunnel) == listen_port
+        for tunnel in _status_tunnels(rt, run_dir)
+    )
+
+
+def _find_stateful_tunnel_for_port(
+    rt: Any, run_dir: str, listen_port: int
+) -> dict[str, Any] | None:
+    for tunnel in _status_tunnels(rt, run_dir):
+        if tunnel.get("status") == "orphan":
+            continue
+        if _tunnel_listen_port(tunnel) == listen_port:
+            return tunnel
+    return None
+
+
+def _ensure_connect_close_target_matches(
+    rt: Any, run_dir: str, spec: Any
+) -> None:
+    listen_port = spec.local if spec.local is not None else spec.port
+    existing = _find_stateful_tunnel_for_port(rt, run_dir, listen_port)
+    if existing is None:
+        return
+    expected_identity = rt.compute_identity(spec)
+    if existing.get("role") == spec.role and existing.get("identity") == expected_identity:
+        return
+    raise rt.TunnelError(
+        "TUNNEL_CONFLICT",
+        f"local_port={listen_port} 已有不相符的 stateful tunnel；僅可關閉相符的 connect tunnel",
+    )
+
+
+def _rollback_connect_open(rt: Any, run_dir: str, listen_port: int) -> str | None:
+    try:
+        close_resp = rt.close(run_dir, str(listen_port))
+    except Exception as exc:  # noqa: BLE001 — rollback 只做 best-effort，錯誤需回報但不覆蓋主錯誤
+        return f"rollback close 失敗：{exc}"
+    if not isinstance(close_resp, dict):
+        return "rollback close 回應格式異常"
+    if not close_resp.get("ok"):
+        message = close_resp.get("message")
+        code = close_resp.get("error_code")
+        detail = str(message) if isinstance(message, str) and message else str(code or close_resp)
+        return f"rollback close 失敗：{detail}"
+    try:
+        if _connect_tunnel_present(rt, run_dir, listen_port):
+            return f"rollback 後 local_port={listen_port} tunnel 仍存在"
+    except Exception as exc:  # noqa: BLE001 — rollback 驗證失敗需明確帶回，但不再丟第二個主錯誤
+        return f"rollback 後無法確認 tunnel 是否已關閉：{exc}"
+    return None
+
+
+def _run_connect(args: argparse.Namespace) -> int:
+    if os.name == "nt":
+        resp = {
+            "ok": False,
+            "error_code": "REMOTE_NOT_SUPPORTED",
+            "message": "native Windows 本期不支援 serialwrap connect；請手動 ssh -L（見 SKILL_WINDOWS.md）",
+        }
+        _print(resp)
+        _mirror_err(resp, context="connect")
+        return 1
+
+    from . import bench_registry  # noqa: PLC0415
+    from . import remote_tunnel as rt  # noqa: PLC0415
+
+    try:
+        rt.guard_platform()
+        try:
+            entry = bench_registry.resolve(args.code)
+        except KeyError as exc:
+            message = exc.args[0] if exc.args else str(exc)
+            raise rt.TunnelError("UNKNOWN_BENCH_CODE", message) from exc
+        except ValueError as exc:
+            raise rt.TunnelError("INVALID_BENCH_CONFIG", str(exc)) from exc
+
+        run_dir = _remote_run_dir()
+        via = "autossh" if entry.autossh else "ssh"
+        spec = rt.TunnelSpec(
+            role="connect",
+            ssh_target=entry.target,
+            port=entry.local_port,
+            remote_socket=entry.remote_socket,
+            via=via,
+            ssh_opts=entry.ssh_opts,
+        )
+        if args.close:
+            _ensure_connect_close_target_matches(rt, run_dir, spec)
+            res = rt.close(run_dir, str(entry.local_port))
+            if res.get("ok"):
+                if _connect_tunnel_present(rt, run_dir, entry.local_port):
+                    resp = {
+                        "ok": False,
+                        "error_code": "TUNNEL_STILL_ACTIVE",
+                        "message": f"local_port={entry.local_port} 的 tunnel 仍存在，未清除 endpoint 記憶",
+                    }
+                    _print(resp)
+                    _mirror_err(resp, context="connect")
+                    return 1
+                try:
+                    _remember_bench_endpoint(args.code, None)
+                except ValueError as exc:
+                    raise rt.TunnelError("INVALID_BENCH_STATE", str(exc)) from exc
+                except OSError as exc:
+                    raise rt.TunnelError("BENCH_STATE_IO_ERROR", str(exc)) from exc
+            _print(res)
+            if not res.get("ok"):
+                _mirror_err(res, context="connect")
+            return 0 if res.get("ok") else 1
+
+        rt.resolve_ssh_bin(via)
+        res = rt.open_tunnel(
+            spec,
+            run_dir,
+            spawner=rt.real_spawner,
+            runner=rt.make_runner(),
+            ping=rt.real_ping,
+        )
+        if res.get("ok"):
+            should_rollback = not bool(res.get("already_running"))
+            try:
+                _remember_bench_endpoint(args.code, f"tcp://127.0.0.1:{entry.local_port}")
+            except ValueError as exc:
+                rollback_detail = (
+                    _rollback_connect_open(rt, run_dir, entry.local_port)
+                    if should_rollback
+                    else None
+                )
+                resp = {"ok": False, "error_code": "INVALID_BENCH_STATE", "message": str(exc)}
+                if rollback_detail is not None:
+                    resp["rollback_warning"] = rollback_detail
+                _print(resp)
+                _mirror_err(resp, context="connect")
+                return 1
+            except OSError as exc:
+                rollback_detail = (
+                    _rollback_connect_open(rt, run_dir, entry.local_port)
+                    if should_rollback
+                    else None
+                )
+                resp = {"ok": False, "error_code": "BENCH_STATE_IO_ERROR", "message": str(exc)}
+                if rollback_detail is not None:
+                    resp["rollback_warning"] = rollback_detail
+                _print(resp)
+                _mirror_err(resp, context="connect")
+                return 1
+        _print(res)
+        if not res.get("ok"):
+            _mirror_err(res, context="connect")
+        return 0 if res.get("ok") else 1
+    except rt.TunnelError as exc:
+        resp = {"ok": False, "error_code": exc.code, "message": exc.message or exc.code}
+        _print(resp)
+        _mirror_err(resp, context="connect")
+        return 1
+    except Exception as exc:  # noqa: BLE001 — 任何非預期例外不得穿越 CLI 邊界
+        resp = {"ok": False, "error_code": "INTERNAL_ERROR", "message": str(exc)}
+        _print(resp)
+        _mirror_err(resp, context="connect")
+        return 1
+
+
 def _run_remote(args: argparse.Namespace) -> int:
     """serialwrap remote 分派：words → status / close / open。
 
@@ -1749,6 +2031,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     # 註：--socket / --endpoint / --timeout 為既有全域參數，_resolve_endpoint 會取用。
 
+    p_connect = sub.add_parser(
+        "connect",
+        help="以 bench 代號建立或拆除 connect 隧道",
+        description="從 benches.yaml 解析 bench 代號，重用既有 remote -L spawn 路徑建立或拆除隧道。",
+    )
+    p_connect.add_argument("code", help="benches.yaml 的 bench 代號")
+    p_connect.add_argument(
+        "--close",
+        action="store_true",
+        help="拆除該代號對應 local_port 的隧道，並清除 endpoint 記憶",
+    )
+
     p_event = sub.add_parser(
         "event",
         help="event-trigger 規則註冊與 matcher 控制",
@@ -1906,10 +2200,38 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _looks_like_connect_invocation(argv: Sequence[str]) -> bool:
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        option, has_equals, value = token.partition("=")
+        if option in _CONNECT_BOUNDARY_GLOBAL_OPTIONS:
+            if has_equals and value == "connect":
+                return True
+            if index + 1 < len(argv) and argv[index + 1] == "connect":
+                return True
+            index += 1 if has_equals else 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return token == "connect"
+    return False
+
+
 def main(argv: list[str] | None = None) -> int:
     force_utf8_stdio()  # Windows console cp1252 印繁中 help 會崩（#118），須在 parse_args 前
+    effective_argv = list(sys.argv[1:] if argv is None else argv)
     p = build_parser()
-    args = p.parse_args(argv)
+    try:
+        args = p.parse_args(effective_argv)
+    except SystemExit as exc:
+        if exc.code == 2 and _looks_like_connect_invocation(effective_argv):
+            resp = {"ok": False, "error_code": "INVALID_ARGS"}
+            _print(resp)
+            _mirror_err(resp, context="connect")
+            return 1
+        raise
 
     if args.cmd == "daemon":
         if args.daemon_cmd == "start":
@@ -2121,6 +2443,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "skill":
         return _run_skill(args)
+
+    if args.cmd == "connect":
+        return _run_connect(args)
 
     if args.cmd == "remote":
         return _run_remote(args)
