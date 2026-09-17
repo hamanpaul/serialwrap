@@ -233,6 +233,41 @@ class TestDaemonStartSupervision(unittest.TestCase):
         self.assertTrue(payload.get("already_running"))
         self.assertEqual(payload["socket"], "/tmp/cfg-live-108.sock")
 
+    def test_ondemand_idempotent_ignores_bench_endpoint_and_keeps_local_probe(self) -> None:
+        """`--bench` 只屬 client 定址；daemon start 仍須 probe 本機/no-bench 路徑。"""
+        args = argparse.Namespace(
+            profile_dir="/tmp/profiles",
+            socket=None,
+            lock="/tmp/serialwrap.lock",
+            foreground=False,
+            with_sudo=False,
+            endpoint=None,
+            bench="eit-test",
+        )
+        fake_rc = mock.Mock()
+        fake_rc.mode.return_value = "on-demand"
+        fake_rc.socket_path.return_value = "/tmp/local-only.sock"
+        with (
+            mock.patch("sw_core.cli._safe_runtime_config", return_value=fake_rc),
+            mock.patch(
+                "sw_core.cli._load_bench_state_doc",
+                return_value=({}, {"eit-test": "tcp://127.0.0.1:7777"}),
+            ) as load_bench,
+            mock.patch("sw_core.cli._endpoint_alive", return_value=True),
+            mock.patch("sw_core.cli._probe_healthy_daemon", return_value=True) as probe,
+            mock.patch("sw_core.cli.subprocess.Popen") as popen,
+            mock.patch("sw_core.cli._print") as printer,
+        ):
+            rc = cli._run_daemon_start(args)
+
+        self.assertEqual(rc, 0)
+        load_bench.assert_not_called()
+        popen.assert_not_called()
+        probe.assert_called_once_with("/tmp/local-only.sock")
+        payload = printer.call_args.args[0]
+        self.assertTrue(payload.get("already_running"))
+        self.assertEqual(payload["socket"], "/tmp/local-only.sock")
+
     def test_unreadable_config_does_not_traceback(self) -> None:
         """config.yaml 損壞 → daemon start 退化為 on-demand 路徑、不 traceback（Codex Important #1）。"""
         args = argparse.Namespace(

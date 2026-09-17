@@ -126,6 +126,20 @@ def _print(obj: dict[str, Any]) -> None:
     sys.stdout.write("\n")
 
 
+def _print_endpoint_resolution_error(exc: _EndpointResolutionError, *, context: str) -> int:
+    resp = {"ok": False, "error_code": exc.code, "message": exc.message}
+    _print(resp)
+    _mirror_err(resp, context=context)
+    return 1
+
+
+def _print_internal_error(*, context: str, exc: Exception) -> int:
+    resp = {"ok": False, "error_code": "INTERNAL_ERROR", "message": str(exc)}
+    _print(resp)
+    _mirror_err(resp, context=context)
+    return 1
+
+
 def _format_err_line(resp: dict[str, Any], *, context: str | None = None) -> str:
     """把失敗回應組成一行 stderr 訊息（#172）：``error_code`` 一定露出，``message``／``hint``
     有值才追加，不覆蓋、不省略。
@@ -447,9 +461,11 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
         _mirror_err(resp, context="daemon start")
         return 0 if resp.get("ok") else 2
     # on-demand：spawn 前先對「使用者實際會連到的 endpoint」冪等探測，已有健康 daemon 則
-    # no-op（#108 #1）。用 _resolve_endpoint 而非裸 args.socket，避免 config 記錄的 daemon
-    # 在非預設 socket 時 probe miss 又 spawn 出第二個（two-reader）。
-    resolved_endpoint = _resolve_endpoint_info(args)
+    # no-op（#108 #1）。但 daemon start 仍是本機操作：即使帶了 --bench，也必須忽略
+    # remembered remote endpoint，沿用無 bench 的本機解析路徑；否則遠端健康時會誤判
+    # 本機 already_running。仍保留完整 endpoint 解析（非裸 args.socket），避免 config
+    # 記錄的 daemon 在非預設 socket 時 probe miss 又 spawn 出第二個（two-reader）。
+    resolved_endpoint = _resolve_local_endpoint_info(args)
     endpoint = resolved_endpoint.endpoint
     with _daemon_start_probe_trace(args, resolved_endpoint):
         already_running = _probe_healthy_daemon(endpoint)
@@ -605,28 +621,33 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
 
 
 def _run_daemon_stop(args: argparse.Namespace) -> int:
-    # 用 _safe_runtime_config 避免 config.yaml 壞 YAML 時 traceback；讀不到退化 on-demand
-    # 路徑（與 daemon start / _resolve_endpoint 的容錯一致，#108 PR #112 review）。
-    rc = _safe_runtime_config()
-    mode = (rc.mode() if rc is not None else None) or "on-demand"
-    if mode.startswith("systemd"):
-        # systemd 模式：將 daemon stop 重導到 service stop，避免繞開 unit 管理
-        with_sudo = getattr(args, "with_sudo", False)
-        resp = service_action("stop", mode=mode, with_sudo=with_sudo)
-        resp["_routed_to"] = "service stop"
+    try:
+        # 用 _safe_runtime_config 避免 config.yaml 壞 YAML 時 traceback；讀不到退化 on-demand
+        # 路徑（與 daemon start / _resolve_endpoint 的容錯一致，#108 PR #112 review）。
+        rc = _safe_runtime_config()
+        mode = (rc.mode() if rc is not None else None) or "on-demand"
+        if mode.startswith("systemd"):
+            # systemd 模式：將 daemon stop 重導到 service stop，避免繞開 unit 管理
+            with_sudo = getattr(args, "with_sudo", False)
+            resp = service_action("stop", mode=mode, with_sudo=with_sudo)
+            resp["_routed_to"] = "service stop"
+            _print(resp)
+            _mirror_err(resp, context="daemon stop")
+            return 0 if resp.get("ok") else 2
+        # on-demand 模式：維持原有 RPC daemon.stop 路徑（不經 _run_rpc，故沿用其 stderr
+        # 格式，context 用實際 method 名，與 _run_rpc 的輸出一致，#172）
+        resolved = _resolve_endpoint_info(args)
+        resp = _rpc_call_traced(args, resolved, "daemon.stop", {}, timeout_s=2.0)
+        if not resp.get("ok"):
+            _print(resp)
+            _mirror_err(resp, context="daemon.stop")
+            return 2
         _print(resp)
-        _mirror_err(resp, context="daemon stop")
-        return 0 if resp.get("ok") else 2
-    # on-demand 模式：維持原有 RPC daemon.stop 路徑（不經 _run_rpc，故沿用其 stderr
-    # 格式，context 用實際 method 名，與 _run_rpc 的輸出一致，#172）
-    resolved = _resolve_endpoint_info(args)
-    resp = _rpc_call_traced(args, resolved, "daemon.stop", {}, timeout_s=2.0)
-    if not resp.get("ok"):
-        _print(resp)
-        _mirror_err(resp, context="daemon.stop")
-        return 2
-    _print(resp)
-    return 0
+        return 0
+    except _EndpointResolutionError as exc:
+        return _print_endpoint_resolution_error(exc, context="daemon.stop")
+    except Exception as exc:  # noqa: BLE001 — 任何非預期例外不得穿越 CLI 邊界
+        return _print_internal_error(context="daemon.stop", exc=exc)
 
 
 def _rpc_backend_is_win() -> bool:
@@ -759,6 +780,17 @@ def _resolve_endpoint_info(args: argparse.Namespace) -> _ResolvedEndpoint:
             )
             return _ResolvedEndpoint(canonical, "config.yaml -> canonical fallback")
     return _ResolvedEndpoint(chosen, "config.yaml" if cfg_sock else "default")
+
+
+def _resolve_local_endpoint_info(args: argparse.Namespace) -> _ResolvedEndpoint:
+    """本機操作的 endpoint 解析：忽略 ``--bench``，其餘優先序維持既有行為。"""
+    return _resolve_endpoint_info(
+        argparse.Namespace(
+            endpoint=getattr(args, "endpoint", None),
+            socket=getattr(args, "socket", None),
+            bench=None,
+        )
+    )
 
 
 def _resolve_endpoint(args: argparse.Namespace) -> str:
@@ -899,10 +931,7 @@ def _run_rpc(args: argparse.Namespace, method: str, params: dict[str, Any]) -> i
     try:
         resolved = _resolve_endpoint_info(args)
     except _EndpointResolutionError as exc:
-        resp = {"ok": False, "error_code": exc.code, "message": exc.message}
-        _print(resp)
-        _mirror_err(resp, context=method)
-        return 1
+        return _print_endpoint_resolution_error(exc, context=method)
     resp = _rpc_call_traced(
         args,
         resolved,
@@ -952,94 +981,99 @@ def _dispatch_event(args: argparse.Namespace) -> int:
     # 也不會生效，維持現狀（#123）。
     method_name = _EVENT_CMD_METHOD.get(args.event_cmd, f"event.{args.event_cmd}")
     timeout_s = _effective_timeout_s(args, method_name)
-    resolved = _resolve_endpoint_info(args)
-    if args.event_cmd == "add":
-        with open(args.file, "r", encoding="utf-8") as f:
-            params = json.load(f)
-        result = _rpc_call_traced(args, resolved, "event.rule_set", params, timeout_s=timeout_s)
-    elif args.event_cmd == "rm":
-        result = _rpc_call_traced(
-            args,
-            resolved,
-            "event.rule_delete",
-            {"rule_id": args.rule_id},
-            timeout_s=timeout_s,
-        )
-    elif args.event_cmd == "list":
-        result = _rpc_call_traced(
-            args,
-            resolved,
-            "event.rule_list",
-            {"selector": getattr(args, "selector", None), "owner": getattr(args, "owner", None)},
-            timeout_s=timeout_s,
-        )
-    elif args.event_cmd == "show":
-        result = _rpc_call_traced(
-            args,
-            resolved,
-            "event.rule_get",
-            {"rule_id": args.rule_id},
-            timeout_s=timeout_s,
-        )
-    elif args.event_cmd == "enable":
-        result = _rpc_call_traced(
-            args,
-            resolved,
-            "event.com_enable",
-            {"selector": args.selector},
-            timeout_s=timeout_s,
-        )
-    elif args.event_cmd == "disable":
-        result = _rpc_call_traced(
-            args,
-            resolved,
-            "event.com_disable",
-            {"selector": args.selector},
-            timeout_s=timeout_s,
-        )
-    elif args.event_cmd == "status":
-        result = _rpc_call_traced(
-            args,
-            resolved,
-            "event.com_status",
-            {"selector": getattr(args, "selector", None)},
-            timeout_s=timeout_s,
-        )
-    elif args.event_cmd == "reset":
-        result = _rpc_call_traced(
-            args,
-            resolved,
-            "event.reset",
-            {"rule_id": getattr(args, "rule_id", None), "selector": getattr(args, "selector", None)},
-            timeout_s=timeout_s,
-        )
-    elif args.event_cmd == "reload":
-        result = _rpc_call_traced(args, resolved, "event.reload", {}, timeout_s=timeout_s)
-    elif args.event_cmd == "tail":
-        result = _rpc_call_traced(
-            args,
-            resolved,
-            "event.tail",
-            {
-                "rule_id": getattr(args, "rule_id", None),
-                "selector": getattr(args, "selector", None),
-                "n": args.n,
-                "since_ts": getattr(args, "since", None),
-            },
-            timeout_s=timeout_s,
-        )
-    else:
-        unknown_resp = {"ok": False, "error_code": "UNKNOWN_EVENT_CMD", "cmd": args.event_cmd}
-        _print(unknown_resp)
-        _mirror_err(unknown_resp, context="event")
-        return 2
-    _print(result)
-    _warn_version_mismatch(result)
-    # #172：本函式的 rpc_call 不經 _run_rpc，其自帶的 stderr 行覆蓋不到這裡；
-    # 用真實 method 名（與 timeout 解析同一份 method_name）維持與 _run_rpc 一致
-    # 的輸出形狀。
-    _mirror_err(result, context=method_name)
-    return 0 if result.get("ok") else 2
+    try:
+        resolved = _resolve_endpoint_info(args)
+        if args.event_cmd == "add":
+            with open(args.file, "r", encoding="utf-8") as f:
+                params = json.load(f)
+            result = _rpc_call_traced(args, resolved, "event.rule_set", params, timeout_s=timeout_s)
+        elif args.event_cmd == "rm":
+            result = _rpc_call_traced(
+                args,
+                resolved,
+                "event.rule_delete",
+                {"rule_id": args.rule_id},
+                timeout_s=timeout_s,
+            )
+        elif args.event_cmd == "list":
+            result = _rpc_call_traced(
+                args,
+                resolved,
+                "event.rule_list",
+                {"selector": getattr(args, "selector", None), "owner": getattr(args, "owner", None)},
+                timeout_s=timeout_s,
+            )
+        elif args.event_cmd == "show":
+            result = _rpc_call_traced(
+                args,
+                resolved,
+                "event.rule_get",
+                {"rule_id": args.rule_id},
+                timeout_s=timeout_s,
+            )
+        elif args.event_cmd == "enable":
+            result = _rpc_call_traced(
+                args,
+                resolved,
+                "event.com_enable",
+                {"selector": args.selector},
+                timeout_s=timeout_s,
+            )
+        elif args.event_cmd == "disable":
+            result = _rpc_call_traced(
+                args,
+                resolved,
+                "event.com_disable",
+                {"selector": args.selector},
+                timeout_s=timeout_s,
+            )
+        elif args.event_cmd == "status":
+            result = _rpc_call_traced(
+                args,
+                resolved,
+                "event.com_status",
+                {"selector": getattr(args, "selector", None)},
+                timeout_s=timeout_s,
+            )
+        elif args.event_cmd == "reset":
+            result = _rpc_call_traced(
+                args,
+                resolved,
+                "event.reset",
+                {"rule_id": getattr(args, "rule_id", None), "selector": getattr(args, "selector", None)},
+                timeout_s=timeout_s,
+            )
+        elif args.event_cmd == "reload":
+            result = _rpc_call_traced(args, resolved, "event.reload", {}, timeout_s=timeout_s)
+        elif args.event_cmd == "tail":
+            result = _rpc_call_traced(
+                args,
+                resolved,
+                "event.tail",
+                {
+                    "rule_id": getattr(args, "rule_id", None),
+                    "selector": getattr(args, "selector", None),
+                    "n": args.n,
+                    "since_ts": getattr(args, "since", None),
+                },
+                timeout_s=timeout_s,
+            )
+        else:
+            unknown_resp = {"ok": False, "error_code": "UNKNOWN_EVENT_CMD", "cmd": args.event_cmd}
+            _print(unknown_resp)
+            _mirror_err(unknown_resp, context="event")
+            return 2
+        _print(result)
+        _warn_version_mismatch(result)
+        # #172：本函式的 rpc_call 不經 _run_rpc，其自帶的 stderr 行覆蓋不到這裡；
+        # 用真實 method 名（與 timeout 解析同一份 method_name）維持與 _run_rpc 一致
+        # 的輸出形狀。
+        _mirror_err(result, context=method_name)
+        return 0 if result.get("ok") else 2
+    except _EndpointResolutionError as exc:
+        return _print_endpoint_resolution_error(exc, context=method_name)
+    except Exception as exc:  # noqa: BLE001 — 任何非預期例外不得穿越 CLI 邊界
+        return _print_internal_error(context=method_name, exc=exc)
 
 
 # 與 doctor 報告中「advisory（缺少不致命）」的檢查項對應；這些項 ok=False 不
@@ -1508,18 +1542,19 @@ def _run_setup(args: argparse.Namespace) -> int:
     old = _default_runtime_config().mode() or "on-demand"
 
     # 3. daemon/flash 偵測：best-effort，連不到一律 False，不阻擋 setup。
-    #    flash 偵測須在物化「之前」——否則燒錄中仍會先覆寫 profiles/wrappers/skill 才報錯（Codex #1c）。
+    #    setup 仍是本機操作，probe 必須忽略 --bench；flash 偵測須在物化「之前」——
+    #    否則燒錄中仍會先覆寫 profiles/wrappers/skill 才報錯（Codex #1c）。
     daemon_running = False
     any_flashing = False
     try:
-        resolved = _resolve_endpoint_info(args)
+        resolved = _resolve_local_endpoint_info(args)
         daemon_running = bool(
             _rpc_call_traced(args, resolved, "health.ping", {}, timeout_s=0.5).get("ok")
         )
     except Exception:
         daemon_running = False
     try:
-        resolved = _resolve_endpoint_info(args)
+        resolved = _resolve_local_endpoint_info(args)
         any_flashing = bool(
             _rpc_call_traced(args, resolved, "mcu.status", {}, timeout_s=0.5).get("flashing")
         )

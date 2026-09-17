@@ -665,3 +665,34 @@ def test_bench_requires_connect_hint_and_skips_local_fallback_when_endpoint_not_
     assert obj["ok"] is False
     assert "connect" in str(obj.get("message", ""))
     assert rpc_calls == []
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--bench", "eit-missing", "daemon", "stop"],
+        ["--bench", "eit-missing", "event", "list"],
+    ],
+)
+def test_bench_missing_endpoint_returns_structured_error_for_direct_cli_paths(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], argv: list[str]
+) -> None:
+    state_path = _bench_state_path()
+    state_path.unlink(missing_ok=True)
+
+    rpc_calls: list[tuple[str, str, dict[str, object]]] = []
+
+    def fake_rpc_call(endpoint, method, params, **kwargs):
+        rpc_calls.append((endpoint, method, params))
+        return {"ok": True}
+
+    monkeypatch.setattr(cli, "rpc_call", fake_rpc_call)
+
+    rc, obj = _run_main(argv, capsys)
+
+    assert rc == 1
+    assert obj is not None
+    assert obj["ok"] is False
+    assert obj["error_code"] == "BENCH_ENDPOINT_NOT_REMEMBERED"
+    assert "serialwrap connect eit-missing" in str(obj.get("message", ""))
+    assert rpc_calls == []
