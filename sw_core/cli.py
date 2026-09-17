@@ -626,8 +626,14 @@ def _run_daemon_stop(args: argparse.Namespace) -> int:
         # 路徑（與 daemon start / _resolve_endpoint 的容錯一致，#108 PR #112 review）。
         rc = _safe_runtime_config()
         mode = (rc.mode() if rc is not None else None) or "on-demand"
-        if mode.startswith("systemd"):
-            # systemd 模式：將 daemon stop 重導到 service stop，避免繞開 unit 管理
+        explicit_target = (
+            bool(getattr(args, "endpoint", None))
+            or getattr(args, "socket", None) is not None
+            or bool(getattr(args, "bench", None))
+        )
+        if mode.startswith("systemd") and not explicit_target:
+            # systemd 模式下，只有未指定 endpoint target 的本機預設 daemon stop
+            # 才重導到 service stop；顯式 target（含 --bench）必須先尊重 endpoint 解析。
             with_sudo = getattr(args, "with_sudo", False)
             resp = service_action("stop", mode=mode, with_sudo=with_sudo)
             resp["_routed_to"] = "service stop"

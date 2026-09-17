@@ -306,6 +306,26 @@ class TestDaemonStartSupervision(unittest.TestCase):
         # 確認走 on-demand RPC daemon.stop（非 systemd 重導），且未 traceback
         self.assertEqual(rpc.call_args.args[1], "daemon.stop")
 
+    def test_daemon_stop_with_bench_in_systemd_mode_resolves_endpoint_before_service_route(self) -> None:
+        """systemd 模式下帶 --bench 時仍需走 bench state；查無記憶不可 fallback 停本機 service。"""
+        args = cli.build_parser().parse_args(["--bench", "eit-missing", "daemon", "stop"])
+        fake_rc = mock.Mock()
+        fake_rc.mode.return_value = "systemd-user"
+        with (
+            mock.patch("sw_core.cli._safe_runtime_config", return_value=fake_rc),
+            mock.patch("sw_core.cli._load_bench_state_doc", return_value=({}, {})),
+            mock.patch("sw_core.cli.service_action", return_value={"ok": True}) as svc,
+            mock.patch("sw_core.cli._print") as printer,
+        ):
+            rc = cli._run_daemon_stop(args)
+
+        self.assertEqual(rc, 1)
+        svc.assert_not_called()
+        payload = printer.call_args.args[0]
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error_code"], "BENCH_ENDPOINT_NOT_REMEMBERED")
+        self.assertIn("serialwrap connect eit-missing", payload["message"])
+
 
 def _make_fake_proc(proc_root, spec: dict) -> None:
     """依 spec 佈置 fake /proc：{pid: {"cmdline": str}}（鏡射 test_multi_open_detect）。"""
