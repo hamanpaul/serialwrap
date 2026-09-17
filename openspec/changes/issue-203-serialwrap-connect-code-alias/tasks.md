@@ -5,7 +5,7 @@ work_item: issue-203-serialwrap-connect-code-alias
 ## 1. bench_registry 模組（RED first）
 
 - [x] 1.1 寫失敗測試 `tests/test_bench_registry.py`：合法 benches.yaml 載入回 frozen entry、`ssh_opts` 原樣保留；provider 專屬鍵（`cloudflare:`/`tailscale:`）被拒；`target` 缺 user 報錯不補當前使用者。確認 RED 為「模組不存在／函式未實作」的正當理由。
-- [ ] 1.2 實作 `sw_core/bench_registry.py`：frozen `BenchEntry` dataclass、`load_benches(path)`、`resolve(code)`，schema 驗證（拒 provider 專屬鍵、強制 `user@host`），`SERIALWRAP_BENCHES_FILE` 覆寫。轉綠。
+- [x] 1.2 實作 `sw_core/bench_registry.py`：frozen `BenchEntry` dataclass、`load_benches(path)`、`resolve(code)`，schema 驗證（拒 provider 專屬鍵、強制 `user@host`），`SERIALWRAP_BENCHES_FILE` 覆寫。轉綠。
 - [ ] 1.3 `to_remote_argv(entry)`：展開成等價 `remote -L` 的 argv，重用 `remote_tunnel` 既有 spawn，不重造 build。加對應測試。
 
 ## 2. connect / benches / --bench（host 端 CLI）
