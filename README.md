@@ -2678,7 +2678,7 @@ serialwrap doctor    # 驗證環境
 
 <!-- BEGIN: cli-help marker="serialwrap-help" -->
 usage: serialwrap [-h] [--version] [-v] [--socket SOCKET]
-                  [--endpoint ENDPOINT] [--timeout TIMEOUT_S]
+                  [--endpoint ENDPOINT] [--bench CODE] [--timeout TIMEOUT_S]
                   [--retries RETRIES]
                   <group> ...
 
@@ -2690,6 +2690,7 @@ options:
   -v, --verbose        提高 CLI trace 詳細度（-v=INFO，-vv=DEBUG；優先於 SERIALWRAP_LOG_LEVEL）
   --socket SOCKET      本機 daemon 的 Unix socket 路徑（未指定時依 config.yaml 與 XDG 執行期目錄解析，可用 SERIALWRAP_RUN_DIR 覆寫）
   --endpoint ENDPOINT  遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）
+  --bench CODE         使用 connect 記住的 bench 代號解析 endpoint（優先序低於 --endpoint/--socket，高於 config fallback）
   --timeout TIMEOUT_S  RPC timeout 秒數（未指定：一般方法 5.0；長操作 session attach/recover/self-test/console-attach 自動採固定 45.0 的 floor，#123）
   --retries RETRIES    TIMEOUT／連線失敗時的重試次數，僅作用於冪等唯讀方法白名單（指數退避 0.5s 起、單次上限 5s；預設: 0）
 
