@@ -11,6 +11,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Sequence
@@ -78,6 +79,7 @@ PROFILE_DAEMON_ENV_FILE = "OPI.env"
 LONG_RPC_TIMEOUT_FLOOR_S = 45.0
 # 一般（非長操作）方法未顯式指定 --timeout 時的預設 RPC timeout，維持既有 5s。
 DEFAULT_RPC_TIMEOUT_S = 5.0
+_BENCH_STATE_IO_LOCK = threading.Lock()
 
 # 落在 daemon 端 BLOCKING_RPC_METHODS、且 CLI 無從得知其真實變動成本
 # （profile timeout_s）的長操作方法：一律採上方固定 floor，不依任何 CLI 側
@@ -1045,6 +1047,29 @@ def _bench_state_path() -> str:
     return os.path.join(os.path.expanduser(state_dir), "benches.state.json")
 
 
+@contextmanager
+def _lock_bench_state_doc(path: str):
+    state_dir = os.path.dirname(path) or "."
+    os.makedirs(state_dir, exist_ok=True)
+    if os.name == "nt":
+        with _BENCH_STATE_IO_LOCK:
+            yield
+        return
+    import fcntl  # noqa: PLC0415 -- connect 的 bench state 只在 POSIX 路徑要求 cross-process 鎖
+
+    lock_path = f"{path}.lock"
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        with _BENCH_STATE_IO_LOCK:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 def _load_bench_state_doc(path: str) -> tuple[dict[str, Any], dict[str, Any]]:
     if not os.path.exists(path):
         payload: dict[str, Any] = {}
@@ -1062,13 +1087,20 @@ def _load_bench_state_doc(path: str) -> tuple[dict[str, Any], dict[str, Any]]:
 
 
 def _write_bench_state_doc(path: str, payload: dict[str, Any]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp_path = f"{path}.tmp.{os.getpid()}"
+    state_dir = os.path.dirname(path) or "."
+    os.makedirs(state_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=state_dir, prefix=f"{os.path.basename(path)}.tmp.")
     try:
-        with open(tmp_path, "w", encoding="utf-8") as fp:
+        with os.fdopen(fd, "w", encoding="utf-8") as fp:
+            fd = -1
             json.dump(payload, fp, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         os.replace(tmp_path, path)
     except Exception:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
             os.unlink(tmp_path)
         except OSError:
@@ -1078,12 +1110,13 @@ def _write_bench_state_doc(path: str, payload: dict[str, Any]) -> None:
 
 def _remember_bench_endpoint(code: str, endpoint: str | None) -> None:
     path = _bench_state_path()
-    payload, benches = _load_bench_state_doc(path)
-    if endpoint is None:
-        benches.pop(code, None)
-    else:
-        benches[code] = endpoint
-    _write_bench_state_doc(path, payload)
+    with _lock_bench_state_doc(path):
+        payload, benches = _load_bench_state_doc(path)
+        if endpoint is None:
+            benches.pop(code, None)
+        else:
+            benches[code] = endpoint
+        _write_bench_state_doc(path, payload)
 
 
 def _status_has_tunnel_port(status_resp: dict[str, Any], listen_port: int) -> bool:

@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import threading
 import textwrap
 
 import pytest
@@ -101,7 +102,16 @@ def test_connect_known_code_opens_connect_tunnel_with_bench_settings(
     _write_benches_file(benches_path)
     monkeypatch.setenv("SERIALWRAP_BENCHES_FILE", str(benches_path))
     state_path = _bench_state_path()
-    state_path.unlink(missing_ok=True)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {"spare-bench": "tcp://127.0.0.1:7788"},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
 
     captured: dict[str, object] = {}
 
@@ -136,6 +146,9 @@ def test_connect_known_code_opens_connect_tunnel_with_bench_settings(
         "-i",
         "~/.ssh/id_ed25519_serialwrap_bench",
     )
+    entries = _read_endpoint_memory(state_path)
+    assert entries["eit-test"] == "tcp://127.0.0.1:7777"
+    assert entries["spare-bench"] == "tcp://127.0.0.1:7788"
 
 
 def test_connect_unknown_code_returns_structured_json_error(
@@ -151,6 +164,69 @@ def test_connect_unknown_code_returns_structured_json_error(
     assert obj is not None
     assert obj["ok"] is False
     assert "error_code" in obj
+
+
+def test_remember_bench_endpoint_serializes_concurrent_updates_and_preserves_all_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = _bench_state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {"existing-bench": "tcp://127.0.0.1:7000"},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+
+    real_load = cli._load_bench_state_doc
+    load_gate = threading.Barrier(2)
+    start_gate = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def gated_load(path: str):
+        payload, benches = real_load(path)
+        try:
+            load_gate.wait(timeout=0.5)
+        except threading.BrokenBarrierError:
+            pass
+        return payload, benches
+
+    monkeypatch.setattr(cli, "_load_bench_state_doc", gated_load)
+
+    def worker(code: str, endpoint: str) -> None:
+        try:
+            start_gate.wait(timeout=1.0)
+            cli._remember_bench_endpoint(code, endpoint)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(
+            target=worker,
+            args=("bench-a", "tcp://127.0.0.1:7001"),
+            name="remember-bench-a",
+        ),
+        threading.Thread(
+            target=worker,
+            args=("bench-b", "tcp://127.0.0.1:7002"),
+            name="remember-bench-b",
+        ),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5.0)
+
+    assert not [thread.name for thread in threads if thread.is_alive()]
+    assert errors == []
+    assert _read_endpoint_memory(state_path) == {
+        "bench-a": "tcp://127.0.0.1:7001",
+        "bench-b": "tcp://127.0.0.1:7002",
+        "existing-bench": "tcp://127.0.0.1:7000",
+    }
 
 
 def test_connect_close_closes_tunnel_and_clears_endpoint_memory(
