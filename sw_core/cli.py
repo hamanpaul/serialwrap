@@ -1093,10 +1093,19 @@ def _status_has_tunnel_port(status_resp: dict[str, Any], listen_port: int) -> bo
     for tunnel in tunnels:
         if not isinstance(tunnel, dict):
             continue
+        control_path = tunnel.get("control_path")
         try:
             port = int(tunnel.get("listen_port"))
         except (TypeError, ValueError):
-            continue
+            if not isinstance(control_path, str):
+                continue
+            control_name = os.path.basename(control_path)
+            if not control_name.startswith("cm-"):
+                continue
+            try:
+                port = int(control_name[len("cm-") :])
+            except ValueError:
+                continue
         if port == listen_port:
             return True
     return False
@@ -1205,10 +1214,15 @@ def _run_connect(args: argparse.Namespace) -> int:
             ping=rt.real_ping,
         )
         if res.get("ok"):
+            should_rollback = not bool(res.get("already_running"))
             try:
                 _remember_bench_endpoint(args.code, f"tcp://127.0.0.1:{entry.local_port}")
             except ValueError as exc:
-                rollback_detail = _rollback_connect_open(rt, run_dir, entry.local_port)
+                rollback_detail = (
+                    _rollback_connect_open(rt, run_dir, entry.local_port)
+                    if should_rollback
+                    else None
+                )
                 resp = {"ok": False, "error_code": "INVALID_BENCH_STATE", "message": str(exc)}
                 if rollback_detail is not None:
                     resp["rollback_warning"] = rollback_detail
@@ -1216,7 +1230,11 @@ def _run_connect(args: argparse.Namespace) -> int:
                 _mirror_err(resp, context="connect")
                 return 1
             except OSError as exc:
-                rollback_detail = _rollback_connect_open(rt, run_dir, entry.local_port)
+                rollback_detail = (
+                    _rollback_connect_open(rt, run_dir, entry.local_port)
+                    if should_rollback
+                    else None
+                )
                 resp = {"ok": False, "error_code": "BENCH_STATE_IO_ERROR", "message": str(exc)}
                 if rollback_detail is not None:
                     resp["rollback_warning"] = rollback_detail
