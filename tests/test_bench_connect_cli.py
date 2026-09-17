@@ -117,6 +117,7 @@ def _expected_connect_identity() -> str:
     "argv",
     [
         ["connect"],
+        ["--bench", "eit-test", "connect"],
         ["connect", "eit-test", "--bogus"],
         ["--timeout", "connect", "eit-test"],
         ["--timeout=connect", "eit-test"],

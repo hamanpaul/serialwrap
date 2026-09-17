@@ -80,7 +80,9 @@ LONG_RPC_TIMEOUT_FLOOR_S = 45.0
 # 一般（非長操作）方法未顯式指定 --timeout 時的預設 RPC timeout，維持既有 5s。
 DEFAULT_RPC_TIMEOUT_S = 5.0
 _BENCH_STATE_IO_LOCK = threading.Lock()
-_CONNECT_BOUNDARY_GLOBAL_OPTIONS = frozenset({"--socket", "--endpoint", "--timeout", "--retries"})
+_CONNECT_BOUNDARY_GLOBAL_OPTIONS = frozenset(
+    {"--socket", "--endpoint", "--bench", "--timeout", "--retries"}
+)
 
 # 落在 daemon 端 BLOCKING_RPC_METHODS、且 CLI 無從得知其真實變動成本
 # （profile timeout_s）的長操作方法：一律採上方固定 floor，不依任何 CLI 側
@@ -110,6 +112,13 @@ class EnvFileSourceError(RuntimeError):
 class _ResolvedEndpoint:
     endpoint: str
     source: str
+
+
+class _EndpointResolutionError(RuntimeError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
 
 def _print(obj: dict[str, Any]) -> None:
@@ -690,9 +699,10 @@ def _endpoint_alive(ep: str) -> bool:
 def _resolve_endpoint_info(args: argparse.Namespace) -> _ResolvedEndpoint:
     """回傳實際連接 endpoint。
 
-    優先序：``--endpoint`` > 明確傳入的 ``--socket`` > config.yaml 記錄的有效 socket
-    > 預設 ``SOCKET_PATH``。讀 config 是為了讓 systemd-system 裝完後 CLI 連到系統 daemon 的
-    socket（``/run/serialwrap/...``）而非使用者 XDG socket（Codex #1a）。
+    優先序：``--endpoint`` > 明確傳入的 ``--socket`` > ``--bench`` 記住的 endpoint
+    > config.yaml 記錄的有效 socket > 預設 ``SOCKET_PATH``。讀 config 是為了讓
+    systemd-system 裝完後 CLI 連到系統 daemon 的 socket（``/run/serialwrap/...``）
+    而非使用者 XDG socket（Codex #1a）。
 
     dangling fallback（#108 #2）：當選用的 config socket 為不可連的 unix socket 時，
     依 ``supervision_mode`` 推 canonical endpoint（``systemd-system`` → ``SYSTEM_SOCKET``、
@@ -706,6 +716,27 @@ def _resolve_endpoint_info(args: argparse.Namespace) -> _ResolvedEndpoint:
         # 有傳即明確（#120 向量 2）：不得與 import-time 預設值比對——測試以 env 覆寫 RUN_DIR 時
         # 傳入值恰等於預設 SOCKET_PATH，等值比對會誤判為「未指定」而 fallback 到 live config。
         return _ResolvedEndpoint(args.socket, "--socket")
+    bench_code = getattr(args, "bench", None)
+    if bench_code:
+        path = _bench_state_path()
+        try:
+            _payload, benches = _load_bench_state_doc(path)
+        except ValueError as exc:
+            raise _EndpointResolutionError("INVALID_BENCH_STATE", str(exc)) from exc
+        except OSError as exc:
+            raise _EndpointResolutionError("BENCH_STATE_IO_ERROR", str(exc)) from exc
+        endpoint = benches.get(bench_code)
+        if endpoint is None:
+            raise _EndpointResolutionError(
+                "BENCH_ENDPOINT_NOT_REMEMBERED",
+                f'bench "{bench_code}" 尚未記住 endpoint；請先執行 serialwrap connect {bench_code}',
+            )
+        if not isinstance(endpoint, str) or not endpoint.strip():
+            raise _EndpointResolutionError(
+                "INVALID_BENCH_STATE",
+                f'bench "{bench_code}" 的 endpoint 記憶損壞；請重新執行 serialwrap connect {bench_code}',
+            )
+        return _ResolvedEndpoint(endpoint.strip(), "--bench")
     rc = _safe_runtime_config()
     cfg_sock = None
     if rc is not None:
@@ -735,14 +766,15 @@ def _resolve_endpoint(args: argparse.Namespace) -> str:
 
 
 class _NoOverrideArgs:
-    """最小 args 替身：模擬『未帶 --endpoint/--socket』的一般 client 呼叫（#173 doctor 用）。"""
+    """最小 args 替身：模擬『未帶 --endpoint/--socket/--bench』的一般 client 呼叫（#173 doctor 用）。"""
 
     endpoint = None
     socket = None
+    bench = None
 
 
 def _resolve_default_endpoint_with_source() -> tuple[str, str]:
-    """比照一般未帶 ``--endpoint``/``--socket`` 的 client，解析其會連上的 endpoint，並回傳來源標籤。
+    """比照一般未帶 ``--endpoint``/``--socket``/``--bench`` 的 client，解析其會連上的 endpoint，並回傳來源標籤。
 
     來源標籤：``"config.yaml"``（讀到 config.yaml 記錄的 ``socket_path``）或
     ``"預設"``（config.yaml 缺席／不可讀，落到 ``SOCKET_PATH``／``DEFAULT_ENDPOINT`` 平台
@@ -864,7 +896,13 @@ def _warn_version_mismatch(resp: dict[str, Any]) -> None:
 
 
 def _run_rpc(args: argparse.Namespace, method: str, params: dict[str, Any]) -> int:
-    resolved = _resolve_endpoint_info(args)
+    try:
+        resolved = _resolve_endpoint_info(args)
+    except _EndpointResolutionError as exc:
+        resp = {"ok": False, "error_code": exc.code, "message": exc.message}
+        _print(resp)
+        _mirror_err(resp, context=method)
+        return 1
     resp = _rpc_call_traced(
         args,
         resolved,
@@ -1681,6 +1719,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--socket", default=None, help="本機 daemon 的 Unix socket 路徑（未指定時依 config.yaml 與 XDG 執行期目錄解析，可用 SERIALWRAP_RUN_DIR 覆寫）")
     p.add_argument("--endpoint", default=None, metavar="ENDPOINT", help="遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）")
     p.add_argument(
+        "--bench",
+        default=None,
+        metavar="CODE",
+        help="使用 connect 記住的 bench 代號解析 endpoint（優先序低於 --endpoint/--socket，高於 config fallback）",
+    )
+    p.add_argument(
         "--timeout",
         dest="timeout_s",
         type=float,
@@ -2029,7 +2073,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="透傳額外 ssh 參數（可重複），如 --ssh-opt=-p --ssh-opt=2222",
     )
-    # 註：--socket / --endpoint / --timeout 為既有全域參數，_resolve_endpoint 會取用。
+    # 註：--socket / --endpoint / --bench / --timeout 為全域參數，_resolve_endpoint 會取用。
 
     p_connect = sub.add_parser(
         "connect",
