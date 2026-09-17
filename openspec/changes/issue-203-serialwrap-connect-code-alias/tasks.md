@@ -26,10 +26,10 @@ work_item: issue-203-serialwrap-connect-code-alias
 
 - [ ] 4.1 README（中英雙語）新增 connect 別名層與 enroll 流程；`benches.yaml` schema 文件化（R-16/R-18）。
 - [ ] 4.2 `docs/**` 對齊；`sw_core/assets/skill/SKILL.md` 補精簡版。
-- [ ] 4.3 新增 `changelog.d/203-serialwrap-connect-code-alias.md` fragment（type `feat`，issue 203）。
+- [x] 4.3 新增 `changelog.d/203-serialwrap-connect-code-alias.md` fragment（type `feat`，issue 203）。
 
 ## 5. 收斂
 
-- [ ] 5.1 `python3 -m pytest -q tests/` 全綠、無新失敗。
-- [ ] 5.2 `python3 -m policy_check --repo .`（帶 PR 參數複現 CI）通過。
-- [ ] 5.3 openspec 驗證 `openspec validate --change serialwrap-connect-code-alias`（若適用）；archive 於實作＋review 通過後。
+- [x] 5.1 `python3 -m pytest -q tests/` 全綠、無新失敗。
+- [x] 5.2 `python3 -m policy_check --repo .`（帶 PR 參數複現 CI）通過。
+- [x] 5.3 openspec 驗證 `openspec validate --change serialwrap-connect-code-alias`（若適用）；archive 於實作＋review 通過後。
