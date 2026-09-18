@@ -80,9 +80,10 @@ LONG_RPC_TIMEOUT_FLOOR_S = 45.0
 # 一般（非長操作）方法未顯式指定 --timeout 時的預設 RPC timeout，維持既有 5s。
 DEFAULT_RPC_TIMEOUT_S = 5.0
 _BENCH_STATE_IO_LOCK = threading.Lock()
-_CONNECT_BOUNDARY_GLOBAL_OPTIONS = frozenset(
+_JSON_BOUNDARY_GLOBAL_OPTIONS = frozenset(
     {"--socket", "--endpoint", "--bench", "--timeout", "--retries"}
 )
+_JSON_BOUNDARY_COMMANDS = frozenset({"connect", "benches"})
 
 # 落在 daemon 端 BLOCKING_RPC_METHODS、且 CLI 無從得知其真實變動成本
 # （profile timeout_s）的長操作方法：一律採上方固定 floor，不依任何 CLI 側
@@ -748,22 +749,17 @@ def _resolve_endpoint_info(args: argparse.Namespace) -> _ResolvedEndpoint:
         path = _bench_state_path()
         try:
             _payload, benches = _load_bench_state_doc(path)
+            endpoint = _remembered_bench_endpoint(benches, bench_code)
         except ValueError as exc:
             raise _EndpointResolutionError("INVALID_BENCH_STATE", str(exc)) from exc
         except OSError as exc:
             raise _EndpointResolutionError("BENCH_STATE_IO_ERROR", str(exc)) from exc
-        endpoint = benches.get(bench_code)
         if endpoint is None:
             raise _EndpointResolutionError(
                 "BENCH_ENDPOINT_NOT_REMEMBERED",
                 f'bench "{bench_code}" 尚未記住 endpoint；請先執行 serialwrap connect {bench_code}',
             )
-        if not isinstance(endpoint, str) or not endpoint.strip():
-            raise _EndpointResolutionError(
-                "INVALID_BENCH_STATE",
-                f'bench "{bench_code}" 的 endpoint 記憶損壞；請重新執行 serialwrap connect {bench_code}',
-            )
-        return _ResolvedEndpoint(endpoint.strip(), "--bench")
+        return _ResolvedEndpoint(endpoint, "--bench")
     rc = _safe_runtime_config()
     cfg_sock = None
     if rc is not None:
@@ -1165,6 +1161,55 @@ def _load_bench_state_doc(path: str) -> tuple[dict[str, Any], dict[str, Any]]:
     return payload, benches
 
 
+def _remembered_bench_endpoint(benches: dict[str, Any], code: str) -> str | None:
+    endpoint = benches.get(code)
+    if endpoint is None:
+        return None
+    if not isinstance(endpoint, str) or not endpoint.strip():
+        raise ValueError(
+            f'bench "{code}" 的 endpoint 記憶損壞；請重新執行 serialwrap connect {code}'
+        )
+    endpoint = endpoint.strip()
+    try:
+        transport, address = _parse_endpoint(endpoint)
+    except ValueError as exc:
+        raise ValueError(
+            f'bench "{code}" 的 endpoint 記憶損壞；請重新執行 serialwrap connect {code}'
+        ) from exc
+    if transport != "tcp":
+        raise ValueError(
+            f'bench "{code}" 的 endpoint 記憶損壞；請重新執行 serialwrap connect {code}'
+        )
+    host, _port = address
+    if host not in LOOPBACK_TCP_HOSTS:
+        raise ValueError(
+            f'bench "{code}" 的 endpoint 記憶損壞；請重新執行 serialwrap connect {code}'
+        )
+    return endpoint
+
+
+def _remembered_bench_alive(endpoint: str | None, alive_ports: set[int]) -> bool:
+    if endpoint is None:
+        return False
+    try:
+        transport, address = _parse_endpoint(endpoint)
+    except ValueError:
+        return False
+    if transport != "tcp":
+        return False
+    host, port = address
+    return host in LOOPBACK_TCP_HOSTS and port in alive_ports
+
+
+def _remembered_bench_port(benches: dict[str, Any], code: str) -> int | None:
+    endpoint = _remembered_bench_endpoint(benches, code)
+    if endpoint is None:
+        return None
+    _transport, address = _parse_endpoint(endpoint)
+    _host, port = address
+    return port
+
+
 def _write_bench_state_doc(path: str, payload: dict[str, Any]) -> None:
     state_dir = os.path.dirname(path) or "."
     os.makedirs(state_dir, exist_ok=True)
@@ -1320,14 +1365,33 @@ def _run_connect(args: argparse.Namespace) -> int:
             ssh_opts=entry.ssh_opts,
         )
         if args.close:
-            _ensure_connect_close_target_matches(rt, run_dir, spec)
-            res = rt.close(run_dir, str(entry.local_port))
+            close_port = entry.local_port
+            path = _bench_state_path()
+            try:
+                _payload, benches = _load_bench_state_doc(path)
+                remembered_port = _remembered_bench_port(benches, args.code)
+            except ValueError as exc:
+                raise rt.TunnelError("INVALID_BENCH_STATE", str(exc)) from exc
+            except OSError as exc:
+                raise rt.TunnelError("BENCH_STATE_IO_ERROR", str(exc)) from exc
+            if remembered_port is not None:
+                close_port = remembered_port
+            close_spec = rt.TunnelSpec(
+                role="connect",
+                ssh_target=entry.target,
+                port=close_port,
+                remote_socket=entry.remote_socket,
+                via=via,
+                ssh_opts=entry.ssh_opts,
+            )
+            _ensure_connect_close_target_matches(rt, run_dir, close_spec)
+            res = rt.close(run_dir, str(close_port))
             if res.get("ok"):
-                if _connect_tunnel_present(rt, run_dir, entry.local_port):
+                if _connect_tunnel_present(rt, run_dir, close_port):
                     resp = {
                         "ok": False,
                         "error_code": "TUNNEL_STILL_ACTIVE",
-                        "message": f"local_port={entry.local_port} 的 tunnel 仍存在，未清除 endpoint 記憶",
+                        "message": f"local_port={close_port} 的 tunnel 仍存在，未清除 endpoint 記憶",
                     }
                     _print(resp)
                     _mirror_err(resp, context="connect")
@@ -1392,6 +1456,76 @@ def _run_connect(args: argparse.Namespace) -> int:
         resp = {"ok": False, "error_code": "INTERNAL_ERROR", "message": str(exc)}
         _print(resp)
         _mirror_err(resp, context="connect")
+        return 1
+
+
+def _run_benches(args: argparse.Namespace) -> int:
+    del args
+    if os.name == "nt":
+        resp = {
+            "ok": False,
+            "error_code": "REMOTE_NOT_SUPPORTED",
+            "message": "native Windows 本期不支援 serialwrap benches；請直接檢視 benches.yaml 與 endpoint 記憶",
+        }
+        _print(resp)
+        _mirror_err(resp, context="benches")
+        return 1
+
+    from . import bench_registry  # noqa: PLC0415
+    from . import remote_tunnel as rt  # noqa: PLC0415
+
+    try:
+        rt.guard_platform()
+        try:
+            configured_benches = bench_registry.load_configured_benches()
+        except ValueError as exc:
+            raise rt.TunnelError("INVALID_BENCH_CONFIG", str(exc)) from exc
+
+        path = _bench_state_path()
+        try:
+            _payload, remembered = _load_bench_state_doc(path)
+        except ValueError as exc:
+            raise rt.TunnelError("INVALID_BENCH_STATE", str(exc)) from exc
+        except OSError as exc:
+            raise rt.TunnelError("BENCH_STATE_IO_ERROR", str(exc)) from exc
+
+        alive_ports: set[int] = set()
+        for tunnel in _status_tunnels(rt, _remote_run_dir()):
+            if tunnel.get("role") != "connect":
+                continue
+            port = _tunnel_listen_port(tunnel)
+            if port is not None:
+                alive_ports.add(port)
+
+        benches: list[dict[str, Any]] = []
+        for code in sorted(configured_benches):
+            try:
+                endpoint = _remembered_bench_endpoint(remembered, code)
+            except ValueError as exc:
+                raise rt.TunnelError("INVALID_BENCH_STATE", str(exc)) from exc
+            benches.append(
+                {
+                    "alive": _remembered_bench_alive(endpoint, alive_ports),
+                    "code": code,
+                    "endpoint": endpoint,
+                }
+            )
+
+        resp = {
+            "ok": True,
+            "benches": benches,
+        }
+        _print(resp)
+        return 0
+    except rt.TunnelError as exc:
+        resp = {"ok": False, "error_code": exc.code, "message": exc.message or exc.code}
+        _print(resp)
+        _mirror_err(resp, context="benches")
+        return 1
+    except Exception as exc:  # noqa: BLE001 — 任何非預期例外不得穿越 CLI 邊界
+        resp = {"ok": False, "error_code": "INTERNAL_ERROR", "message": str(exc)}
+        _print(resp)
+        _mirror_err(resp, context="benches")
         return 1
 
 
@@ -2130,6 +2264,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="拆除該代號對應 local_port 的隧道，並清除 endpoint 記憶",
     )
 
+    sub.add_parser(
+        "benches",
+        help="列出 benches.yaml 代號與記住的 endpoint/tunnel 狀態",
+        description="列出 benches.yaml 各代號、目前記住的 endpoint，以及本機 connect tunnel 是否仍存活。",
+    )
+
     p_event = sub.add_parser(
         "event",
         help="event-trigger 規則註冊與 matcher 控制",
@@ -2287,23 +2427,23 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _looks_like_connect_invocation(argv: Sequence[str]) -> bool:
+def _json_boundary_command_from_argv(argv: Sequence[str]) -> str | None:
     index = 0
     while index < len(argv):
         token = argv[index]
         option, has_equals, value = token.partition("=")
-        if option in _CONNECT_BOUNDARY_GLOBAL_OPTIONS:
-            if has_equals and value == "connect":
-                return True
-            if index + 1 < len(argv) and argv[index + 1] == "connect":
-                return True
+        if option in _JSON_BOUNDARY_GLOBAL_OPTIONS:
+            if has_equals and value in _JSON_BOUNDARY_COMMANDS:
+                return value
+            if index + 1 < len(argv) and argv[index + 1] in _JSON_BOUNDARY_COMMANDS:
+                return str(argv[index + 1])
             index += 1 if has_equals else 2
             continue
         if token.startswith("-"):
             index += 1
             continue
-        return token == "connect"
-    return False
+        return token if token in _JSON_BOUNDARY_COMMANDS else None
+    return None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2313,10 +2453,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = p.parse_args(effective_argv)
     except SystemExit as exc:
-        if exc.code == 2 and _looks_like_connect_invocation(effective_argv):
+        boundary_cmd = _json_boundary_command_from_argv(effective_argv)
+        if exc.code == 2 and boundary_cmd is not None:
             resp = {"ok": False, "error_code": "INVALID_ARGS"}
             _print(resp)
-            _mirror_err(resp, context="connect")
+            _mirror_err(resp, context=boundary_cmd)
             return 1
         raise
 
@@ -2533,6 +2674,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "connect":
         return _run_connect(args)
+
+    if args.cmd == "benches":
+        return _run_benches(args)
 
     if args.cmd == "remote":
         return _run_remote(args)

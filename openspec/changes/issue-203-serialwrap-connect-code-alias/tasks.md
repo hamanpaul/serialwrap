@@ -15,7 +15,8 @@ work_item: issue-203-serialwrap-connect-code-alias
 - [x] 2.2 實作 `serialwrap connect <code>` / `--close` subparser（`sw_core/cli.py`），呼叫 `bench_registry` + 既有 `remote_tunnel.open_tunnel`/`close`；成功寫 endpoint 記憶（`$XDG_STATE/serialwrap/benches.state.json`，緊湊 `sort_keys` JSON）。轉綠。
 - [x] 2.3 寫失敗測試：`--bench <code>` 端點解析優先序（`--endpoint` > `--socket` > `--bench` > config）；未 connect 的代號回明確錯誤、不 fallback 本機 daemon。
 - [x] 2.4 實作全域 `--bench` 參數與 `_resolve_endpoint` 優先序調整。轉綠。
-- [ ] 2.5 實作 `serialwrap benches`（list 代號 + endpoint 記憶／alive 狀態）＋測試。
+- [x] 2.5a 寫失敗測試：`serialwrap benches` 必須列出 benches.yaml 各代號與其目前 endpoint 記憶／alive 狀態；確認 RED 為 CLI 子命令尚未實作的正當理由。
+- [x] 2.5b 實作 `serialwrap benches`（list 代號 + endpoint 記憶／alive 狀態），令 2.5a 轉綠。
 
 ## 3. tools 佈署腳本（provider-specific）
 
@@ -31,6 +32,6 @@ work_item: issue-203-serialwrap-connect-code-alias
 
 ## 5. 收斂
 
-- [ ] 5.1 `python3 -m pytest -q tests/` 全綠、無新失敗（本 card 新增 RED regression，待後續實作轉綠後再勾）。
+- [x] 5.1 `python3 -m pytest -q tests/` 全綠、無新失敗（本 card 新增 RED regression，待後續實作轉綠後再勾）。
 - [x] 5.2 `python3 -m policy_check --repo .`（帶 PR 參數複現 CI）通過。
 - [x] 5.3 openspec 驗證 `openspec validate --change serialwrap-connect-code-alias`（若適用）；archive 於實作＋review 通過後。
