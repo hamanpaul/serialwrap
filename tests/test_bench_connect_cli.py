@@ -63,6 +63,15 @@ def _connect_subparser(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
     return None
 
 
+def _benches_subparser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser | None:
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            subparser = action.choices.get("benches")
+            if isinstance(subparser, argparse.ArgumentParser):
+                return subparser
+    return None
+
+
 def _run_main(argv: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, dict | None]:
     try:
         rc = cli.main(argv)
@@ -81,6 +90,17 @@ def _run_connect(argv: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[i
     except SystemExit as exc:
         pytest.fail(f"serialwrap connect 參數契約尚未完成：{exc.code}")
     return _run_main(["connect", *argv], capsys)
+
+
+def _run_benches(capsys: pytest.CaptureFixture[str]) -> tuple[int, dict | None]:
+    parser = cli.build_parser()
+    if _benches_subparser(parser) is None:
+        pytest.fail("serialwrap benches 尚未實作；Task 2.5 先以 RED 測試鎖定 benches CLI 契約")
+    try:
+        parser.parse_args(["benches"])
+    except SystemExit as exc:
+        pytest.fail(f"serialwrap benches 參數契約尚未完成：{exc.code}")
+    return _run_main(["benches"], capsys)
 
 
 def _parse_bench_args(argv: list[str]) -> argparse.Namespace:
@@ -699,3 +719,68 @@ def test_bench_missing_endpoint_returns_structured_error_for_direct_cli_paths(
     assert obj["error_code"] == "BENCH_ENDPOINT_NOT_REMEMBERED"
     assert "serialwrap connect eit-missing" in str(obj.get("message", ""))
     assert rpc_calls == []
+
+
+def test_benches_lists_each_code_with_endpoint_memory_and_alive_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    benches_path = tmp_path / "benches.yaml"
+    _write_yaml(
+        benches_path,
+        """
+        benches:
+          eit-offline:
+            target: eit@eit-offline.hamanpaul.cc
+            remote_socket: /tmp/serialwrap/serialwrapd.sock
+            local_port: 7788
+            ssh_opts: []
+            autossh: false
+          eit-test:
+            target: eit@eit-test.hamanpaul.cc
+            remote_socket: /tmp/serialwrap/serialwrapd.sock
+            local_port: 7777
+            ssh_opts:
+              - "-o"
+              - "ProxyCommand=cloudflared access ssh --hostname %h"
+            autossh: true
+        """,
+    )
+    monkeypatch.setenv("SERIALWRAP_BENCHES_FILE", str(benches_path))
+
+    state_path = _bench_state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {"eit-test": "tcp://127.0.0.1:7777"},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        rt,
+        "status",
+        lambda run_dir: {
+            "ok": True,
+            "tunnels": [
+                {
+                    "listen_port": 7777,
+                    "role": "connect",
+                    "alive": True,
+                }
+            ],
+        },
+    )
+
+    rc, obj = _run_benches(capsys)
+
+    assert rc == 0
+    assert obj is not None
+    assert obj["ok"] is True
+    benches = {item["code"]: item for item in obj["benches"]}
+    assert benches["eit-offline"]["endpoint"] is None
+    assert benches["eit-offline"]["alive"] is False
+    assert benches["eit-test"]["endpoint"] == "tcp://127.0.0.1:7777"
+    assert benches["eit-test"]["alive"] is True
