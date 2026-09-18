@@ -1169,7 +1169,23 @@ def _remembered_bench_endpoint(benches: dict[str, Any], code: str) -> str | None
         raise ValueError(
             f'bench "{code}" 的 endpoint 記憶損壞；請重新執行 serialwrap connect {code}'
         )
-    return endpoint.strip()
+    endpoint = endpoint.strip()
+    try:
+        transport, address = _parse_endpoint(endpoint)
+    except ValueError as exc:
+        raise ValueError(
+            f'bench "{code}" 的 endpoint 記憶損壞；請重新執行 serialwrap connect {code}'
+        ) from exc
+    if transport != "tcp":
+        raise ValueError(
+            f'bench "{code}" 的 endpoint 記憶損壞；請重新執行 serialwrap connect {code}'
+        )
+    host, _port = address
+    if host not in LOOPBACK_TCP_HOSTS:
+        raise ValueError(
+            f'bench "{code}" 的 endpoint 記憶損壞；請重新執行 serialwrap connect {code}'
+        )
+    return endpoint
 
 
 def _remembered_bench_alive(endpoint: str | None, alive_ports: set[int]) -> bool:
@@ -1447,6 +1463,8 @@ def _run_benches(args: argparse.Namespace) -> int:
 
         alive_ports: set[int] = set()
         for tunnel in _status_tunnels(rt, _remote_run_dir()):
+            if tunnel.get("role") != "connect":
+                continue
             port = _tunnel_listen_port(tunnel)
             if port is not None:
                 alive_ports.add(port)
