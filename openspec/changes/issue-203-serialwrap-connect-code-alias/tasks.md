@@ -16,7 +16,7 @@ work_item: issue-203-serialwrap-connect-code-alias
 - [x] 2.3 寫失敗測試：`--bench <code>` 端點解析優先序（`--endpoint` > `--socket` > `--bench` > config）；未 connect 的代號回明確錯誤、不 fallback 本機 daemon。
 - [x] 2.4 實作全域 `--bench` 參數與 `_resolve_endpoint` 優先序調整。轉綠。
 - [x] 2.5a 寫失敗測試：`serialwrap benches` 必須列出 benches.yaml 各代號與其目前 endpoint 記憶／alive 狀態；確認 RED 為 CLI 子命令尚未實作的正當理由。
-- [ ] 2.5b 實作 `serialwrap benches`（list 代號 + endpoint 記憶／alive 狀態），令 2.5a 轉綠。
+- [x] 2.5b 實作 `serialwrap benches`（list 代號 + endpoint 記憶／alive 狀態），令 2.5a 轉綠。
 
 ## 3. tools 佈署腳本（provider-specific）
 
