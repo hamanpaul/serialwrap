@@ -1172,6 +1172,19 @@ def _remembered_bench_endpoint(benches: dict[str, Any], code: str) -> str | None
     return endpoint.strip()
 
 
+def _remembered_bench_alive(endpoint: str | None, alive_ports: set[int]) -> bool:
+    if endpoint is None:
+        return False
+    try:
+        transport, address = _parse_endpoint(endpoint)
+    except ValueError:
+        return False
+    if transport != "tcp":
+        return False
+    host, port = address
+    return host in LOOPBACK_TCP_HOSTS and port in alive_ports
+
+
 def _write_bench_state_doc(path: str, payload: dict[str, Any]) -> None:
     state_dir = os.path.dirname(path) or "."
     os.makedirs(state_dir, exist_ok=True)
@@ -1438,16 +1451,20 @@ def _run_benches(args: argparse.Namespace) -> int:
             if port is not None:
                 alive_ports.add(port)
 
+        benches: list[dict[str, Any]] = []
+        for code in sorted(configured_benches):
+            endpoint = _remembered_bench_endpoint(remembered, code)
+            benches.append(
+                {
+                    "alive": _remembered_bench_alive(endpoint, alive_ports),
+                    "code": code,
+                    "endpoint": endpoint,
+                }
+            )
+
         resp = {
             "ok": True,
-            "benches": [
-                {
-                    "alive": entry.local_port in alive_ports,
-                    "code": code,
-                    "endpoint": _remembered_bench_endpoint(remembered, code),
-                }
-                for code, entry in sorted(configured_benches.items())
-            ],
+            "benches": benches,
         }
         _print(resp)
         return 0

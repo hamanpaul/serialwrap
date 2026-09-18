@@ -32,6 +32,6 @@ work_item: issue-203-serialwrap-connect-code-alias
 
 ## 5. 收斂
 
-- [ ] 5.1 `python3 -m pytest -q tests/` 全綠、無新失敗（本 card 新增 RED regression，待後續實作轉綠後再勾）。
+- [x] 5.1 `python3 -m pytest -q tests/` 全綠、無新失敗（本 card 新增 RED regression，待後續實作轉綠後再勾）。
 - [x] 5.2 `python3 -m policy_check --repo .`（帶 PR 參數複現 CI）通過。
 - [x] 5.3 openspec 驗證 `openspec validate --change serialwrap-connect-code-alias`（若適用）；archive 於實作＋review 通過後。

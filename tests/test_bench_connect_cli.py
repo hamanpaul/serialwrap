@@ -784,3 +784,58 @@ def test_benches_lists_each_code_with_endpoint_memory_and_alive_state(
     assert benches["eit-offline"]["alive"] is False
     assert benches["eit-test"]["endpoint"] == "tcp://127.0.0.1:7777"
     assert benches["eit-test"]["alive"] is True
+
+
+def test_benches_alive_follows_remembered_endpoint_when_config_local_port_drifted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    benches_path = tmp_path / "benches.yaml"
+    _write_yaml(
+        benches_path,
+        """
+        benches:
+          eit-test:
+            target: eit@eit-test.hamanpaul.cc
+            remote_socket: /tmp/serialwrap/serialwrapd.sock
+            local_port: 7788
+            ssh_opts: []
+            autossh: false
+        """,
+    )
+    monkeypatch.setenv("SERIALWRAP_BENCHES_FILE", str(benches_path))
+
+    state_path = _bench_state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {"eit-test": "tcp://127.0.0.1:7777"},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        rt,
+        "status",
+        lambda run_dir: {
+            "ok": True,
+            "tunnels": [
+                {
+                    "listen_port": 7777,
+                    "role": "connect",
+                    "alive": True,
+                }
+            ],
+        },
+    )
+
+    rc, obj = _run_benches(capsys)
+
+    assert rc == 0
+    assert obj is not None
+    assert obj["ok"] is True
+    benches = {item["code"]: item for item in obj["benches"]}
+    assert benches["eit-test"]["endpoint"] == "tcp://127.0.0.1:7777"
+    assert benches["eit-test"]["alive"] is True
