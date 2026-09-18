@@ -8,6 +8,8 @@ import textwrap
 
 import pytest
 
+from sw_core import cli
+
 
 def _write_yaml(path, content: str) -> None:
     path.write_text(textwrap.dedent(content).lstrip(), encoding="utf-8")
@@ -225,3 +227,38 @@ def test_load_benches_rejects_non_integer_or_out_of_range_local_port(
     module = _bench_registry()
     with pytest.raises(ValueError, match=message):
         module.load_benches(str(benches_path))
+
+
+def test_to_remote_argv_expands_connect_equivalent_remote_args_without_reordering_ssh_opts() -> None:
+    module = _bench_registry()
+    if not hasattr(module, "to_remote_argv"):
+        pytest.fail(
+            "sw_core.bench_registry 缺少 to_remote_argv()；Task 1.3 先以 RED 測試鎖定 remote -L argv 契約"
+        )
+
+    entry = module.BenchEntry(
+        target="eit@eit-test.hamanpaul.cc",
+        remote_socket="/tmp/serialwrap/serialwrapd.sock",
+        local_port=7777,
+        ssh_opts=(
+            "-o",
+            "ProxyCommand=cloudflared access ssh --hostname %h",
+            "-i",
+            "~/.ssh/id_ed25519_serialwrap_bench",
+        ),
+        autossh=True,
+    )
+
+    args = cli.build_parser().parse_args(["remote", *module.to_remote_argv(entry)])
+
+    assert args.forward is True
+    assert args.reverse is False
+    assert args.autossh is True
+    assert args.remote_socket == "/tmp/serialwrap/serialwrapd.sock"
+    assert args.ssh_opt == [
+        "-o",
+        "ProxyCommand=cloudflared access ssh --hostname %h",
+        "-i",
+        "~/.ssh/id_ed25519_serialwrap_bench",
+    ]
+    assert args.words == ["eit@eit-test.hamanpaul.cc:7777"]

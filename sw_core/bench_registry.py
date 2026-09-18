@@ -22,6 +22,15 @@ class BenchEntry:
     autossh: bool = False
 
 
+def to_remote_argv(entry: BenchEntry) -> list[str]:
+    argv = ["-L", "--remote-socket", entry.remote_socket]
+    if entry.autossh:
+        argv.append("--autossh")
+    argv.extend(f"--ssh-opt={item}" for item in entry.ssh_opts)
+    argv.append(f"{entry.target}:{entry.local_port}")
+    return argv
+
+
 def _env_path(name: str, default: str) -> str:
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
