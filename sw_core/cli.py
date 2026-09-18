@@ -1201,6 +1201,15 @@ def _remembered_bench_alive(endpoint: str | None, alive_ports: set[int]) -> bool
     return host in LOOPBACK_TCP_HOSTS and port in alive_ports
 
 
+def _remembered_bench_port(benches: dict[str, Any], code: str) -> int | None:
+    endpoint = _remembered_bench_endpoint(benches, code)
+    if endpoint is None:
+        return None
+    _transport, address = _parse_endpoint(endpoint)
+    _host, port = address
+    return port
+
+
 def _write_bench_state_doc(path: str, payload: dict[str, Any]) -> None:
     state_dir = os.path.dirname(path) or "."
     os.makedirs(state_dir, exist_ok=True)
@@ -1356,14 +1365,33 @@ def _run_connect(args: argparse.Namespace) -> int:
             ssh_opts=entry.ssh_opts,
         )
         if args.close:
-            _ensure_connect_close_target_matches(rt, run_dir, spec)
-            res = rt.close(run_dir, str(entry.local_port))
+            close_port = entry.local_port
+            path = _bench_state_path()
+            try:
+                _payload, benches = _load_bench_state_doc(path)
+                remembered_port = _remembered_bench_port(benches, args.code)
+            except ValueError as exc:
+                raise rt.TunnelError("INVALID_BENCH_STATE", str(exc)) from exc
+            except OSError as exc:
+                raise rt.TunnelError("BENCH_STATE_IO_ERROR", str(exc)) from exc
+            if remembered_port is not None:
+                close_port = remembered_port
+            close_spec = rt.TunnelSpec(
+                role="connect",
+                ssh_target=entry.target,
+                port=close_port,
+                remote_socket=entry.remote_socket,
+                via=via,
+                ssh_opts=entry.ssh_opts,
+            )
+            _ensure_connect_close_target_matches(rt, run_dir, close_spec)
+            res = rt.close(run_dir, str(close_port))
             if res.get("ok"):
-                if _connect_tunnel_present(rt, run_dir, entry.local_port):
+                if _connect_tunnel_present(rt, run_dir, close_port):
                     resp = {
                         "ok": False,
                         "error_code": "TUNNEL_STILL_ACTIVE",
-                        "message": f"local_port={entry.local_port} 的 tunnel 仍存在，未清除 endpoint 記憶",
+                        "message": f"local_port={close_port} 的 tunnel 仍存在，未清除 endpoint 記憶",
                     }
                     _print(resp)
                     _mirror_err(resp, context="connect")

@@ -338,6 +338,97 @@ def test_connect_close_closes_tunnel_and_clears_endpoint_memory(
     assert entries["spare-bench"] == "tcp://127.0.0.1:7788"
 
 
+def test_connect_close_uses_remembered_endpoint_port_when_config_local_port_drifted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    benches_path = tmp_path / "benches.yaml"
+    _write_yaml(
+        benches_path,
+        """
+        benches:
+          eit-test:
+            target: eit@eit-test.hamanpaul.cc
+            remote_socket: /tmp/serialwrap/serialwrapd.sock
+            local_port: 7788
+            ssh_opts:
+              - "-o"
+              - "ProxyCommand=cloudflared access ssh --hostname %h"
+              - "-i"
+              - "~/.ssh/id_ed25519_serialwrap_bench"
+            autossh: true
+        """,
+    )
+    monkeypatch.setenv("SERIALWRAP_BENCHES_FILE", str(benches_path))
+
+    state_path = _bench_state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "eit-test": "tcp://127.0.0.1:7777",
+                "spare-bench": "tcp://127.0.0.1:7788",
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+
+    active_ports = {7777}
+    close_calls: list[str] = []
+
+    def fake_close(run_dir, selector, **kwargs):
+        close_calls.append(str(selector))
+        if str(selector) == "7777":
+            active_ports.discard(7777)
+            return {"ok": True, "closed": [7777]}
+        return {"ok": True, "closed": [7788]}
+
+    def fake_status(run_dir):
+        tunnels: list[dict[str, object]] = []
+        if 7777 in active_ports:
+            tunnels.append(
+                {
+                    "listen_port": 7777,
+                    "status": "active",
+                    "role": "connect",
+                    "identity": rt.compute_identity(
+                        rt.TunnelSpec(
+                            role="connect",
+                            ssh_target="eit@eit-test.hamanpaul.cc",
+                            port=7777,
+                            remote_socket="/tmp/serialwrap/serialwrapd.sock",
+                            via="autossh",
+                            ssh_opts=(
+                                "-o",
+                                "ProxyCommand=cloudflared access ssh --hostname %h",
+                                "-i",
+                                "~/.ssh/id_ed25519_serialwrap_bench",
+                            ),
+                        )
+                    ),
+                    "endpoint": "tcp://127.0.0.1:7777",
+                }
+            )
+        return {"ok": True, "tunnels": tunnels}
+
+    monkeypatch.setattr(rt, "close", fake_close)
+    monkeypatch.setattr(rt, "status", fake_status)
+
+    rc, obj = _run_connect(["eit-test", "--close"], capsys)
+
+    assert rc == 0
+    assert obj is not None
+    assert obj["ok"] is True
+    assert obj["closed"] == [7777]
+    assert close_calls == ["7777"]
+    assert active_ports == set()
+    entries = _read_endpoint_memory(state_path)
+    assert "eit-test" not in entries
+    assert entries["spare-bench"] == "tcp://127.0.0.1:7788"
+
+
 @pytest.mark.parametrize(
     "existing_tunnel",
     [
