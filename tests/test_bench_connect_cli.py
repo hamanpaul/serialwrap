@@ -786,6 +786,47 @@ def test_benches_lists_each_code_with_endpoint_memory_and_alive_state(
     assert benches["eit-test"]["alive"] is True
 
 
+def test_benches_corrupted_remembered_endpoint_returns_invalid_bench_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    benches_path = tmp_path / "benches.yaml"
+    _write_yaml(
+        benches_path,
+        """
+        benches:
+          eit-test:
+            target: eit@eit-test.hamanpaul.cc
+            remote_socket: /tmp/serialwrap/serialwrapd.sock
+            local_port: 7777
+            ssh_opts: []
+            autossh: false
+        """,
+    )
+    monkeypatch.setenv("SERIALWRAP_BENCHES_FILE", str(benches_path))
+
+    state_path = _bench_state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {"eit-test": ""},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(rt, "status", lambda run_dir: {"ok": True, "tunnels": []})
+
+    rc, obj = _run_benches(capsys)
+
+    assert rc == 1
+    assert obj is not None
+    assert obj["ok"] is False
+    assert obj["error_code"] == "INVALID_BENCH_STATE"
+    assert "serialwrap connect eit-test" in str(obj["message"])
+
+
 def test_benches_alive_follows_remembered_endpoint_when_config_local_port_drifted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

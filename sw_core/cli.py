@@ -1453,7 +1453,10 @@ def _run_benches(args: argparse.Namespace) -> int:
 
         benches: list[dict[str, Any]] = []
         for code in sorted(configured_benches):
-            endpoint = _remembered_bench_endpoint(remembered, code)
+            try:
+                endpoint = _remembered_bench_endpoint(remembered, code)
+            except ValueError as exc:
+                raise rt.TunnelError("INVALID_BENCH_STATE", str(exc)) from exc
             benches.append(
                 {
                     "alive": _remembered_bench_alive(endpoint, alive_ports),
