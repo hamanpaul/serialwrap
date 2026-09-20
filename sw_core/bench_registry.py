@@ -162,8 +162,12 @@ def load_benches(path: str) -> dict[str, BenchEntry]:
     return benches
 
 
+def load_configured_benches() -> dict[str, BenchEntry]:
+    return load_benches(_default_benches_path())
+
+
 def resolve(code: str) -> BenchEntry:
-    benches = load_benches(_default_benches_path())
+    benches = load_configured_benches()
     try:
         return benches[code]
     except KeyError as exc:
