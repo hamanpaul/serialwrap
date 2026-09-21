@@ -27,8 +27,8 @@ work_item: issue-203-serialwrap-connect-code-alias
 
 ## 4. 文件與對外契約
 
-- [ ] 4.1 README（中英雙語）新增 connect 別名層與 enroll 流程；`benches.yaml` schema 文件化（R-16/R-18）。
-- [ ] 4.2 `docs/**` 對齊；`sw_core/assets/skill/SKILL.md` 補精簡版。
+- [x] 4.1 README（中英雙語）新增 connect 別名層與 enroll 流程；`benches.yaml` schema 文件化（R-16/R-18）。
+- [x] 4.2 `docs/**` 對齊；`sw_core/assets/skill/SKILL.md` 補精簡版。
 - [x] 4.3 新增 `changelog.d/203-serialwrap-connect-code-alias.md` fragment（type `feat`，issue 203）。
 
 ## 5. 收斂
