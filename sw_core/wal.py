@@ -19,6 +19,21 @@ from .util import dumps_stable, monotonic_ns, now_iso, to_printable
 _LOG = logging.getLogger("serialwrap")
 
 
+def _fsync_dir(path: str) -> None:
+    """rename 後 fsync 目錄，確保目錄 entry 持久化（POSIX 語意）。
+
+    Windows（nt）：``os.open`` 不可開目錄，會拋 Permission denied；NTFS 自行管理目錄
+    一致性，直接跳過（比照 session_manager._save_state 的 #84 PORT-4 守衛；#218）。
+    """
+    if os.name == "nt":
+        return
+    dir_fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 class WalWriter:
     def __init__(self, wal_dir: str | None = None, rotate_bytes: int = DEFAULT_WAL_ROTATE_BYTES) -> None:
         # None-sentinel：於建構時解析模組層 WAL_DIR（#120）——def-time default 會在類別定義時
@@ -88,11 +103,7 @@ class WalWriter:
                 ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
                 dst = f"{path}.{ts}"
                 os.replace(path, dst)
-                dir_fd = os.open(os.path.dirname(path), os.O_RDONLY)
-                try:
-                    os.fsync(dir_fd)
-                finally:
-                    os.close(dir_fd)
+                _fsync_dir(os.path.dirname(path))
             except OSError as exc:
                 rotation_failed = True
                 import logging
@@ -237,11 +248,7 @@ class WalWriter:
                 if os.path.exists(path) and os.path.getsize(path) > 0:
                     dst = f"{path}.{ts}"
                     os.replace(path, dst)
-            dir_fd = os.open(self._wal_dir, os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
+            _fsync_dir(self._wal_dir)
             self._seq = 0
             return {"ok": True, "previous_seq": prev_seq, "rotated_suffix": ts}
 

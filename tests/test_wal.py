@@ -145,3 +145,71 @@ class TestWalTailLatest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestWalWindowsDirFsync(unittest.TestCase):
+    """#218：Windows（nt）不允許 ``os.open`` 開目錄；reset()/_rotate_if_needed() 的
+    POSIX「rename 後 fsync 目錄」慣用法須比照 session_manager #84 PORT-4 跳過。"""
+
+    @staticmethod
+    def _deny_dir_open(real_open):
+        """模擬 Windows：對目錄 os.open → PermissionError（EACCES），檔案照常。"""
+        import os as _os
+
+        def _open(path, flags, *args, **kwargs):
+            if _os.path.isdir(path):
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_open(path, flags, *args, **kwargs)
+
+        return _open
+
+    def test_reset_on_windows_rotates_and_zeroes_seq_without_dir_fsync(self) -> None:
+        import os
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as td:
+            wal = WalWriter(wal_dir=td, rotate_bytes=10_000_000)
+            wal.append(com="COM0", direction="RX", source="uart", payload=b"x\n")
+            self.assertEqual(wal.current_seq, 1)
+            with mock.patch("os.name", "nt"), mock.patch(
+                "os.open", side_effect=self._deny_dir_open(os.open)
+            ):
+                result = wal.reset()
+            archives = list(Path(td).glob("raw.wal.ndjson.*"))
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["previous_seq"], 1)
+        self.assertEqual(wal.current_seq, 0)
+        self.assertEqual(len(archives), 1, archives)
+
+    def test_rotate_if_needed_on_windows_is_not_degraded(self) -> None:
+        import os
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as td:
+            wal = WalWriter(wal_dir=td, rotate_bytes=1)
+            wal.append(com="COM0", direction="RX", source="uart", payload=b"first\n")
+            with mock.patch("os.name", "nt"), mock.patch(
+                "os.open", side_effect=self._deny_dir_open(os.open)
+            ):
+                degraded = wal._rotate_if_needed()
+            self.assertFalse(degraded)
+            archives = list(Path(td).glob("raw.wal.ndjson.*"))
+            self.assertEqual(len(archives), 1, archives)
+
+    def test_reset_on_posix_still_fsyncs_directory(self) -> None:
+        import os
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as td:
+            wal = WalWriter(wal_dir=td, rotate_bytes=10_000_000)
+            wal.append(com="COM0", direction="RX", source="uart", payload=b"x\n")
+            opened: list[str] = []
+            real_open = os.open
+
+            def _spy(path, flags, *args, **kwargs):
+                opened.append(str(path))
+                return real_open(path, flags, *args, **kwargs)
+
+            with mock.patch("os.name", "posix"), mock.patch("os.open", side_effect=_spy):
+                wal.reset()
+        self.assertIn(str(Path(td)), opened)
