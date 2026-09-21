@@ -907,6 +907,105 @@ only difference is who runs the rendezvous. tmate is the same "someone else runs
 relay, a random token to meet" model, but it bridges a terminal, not a socket, so it
 serves the agent-on-the-bench case and not this one.
 
+#### Bench codes: `connect <code>` instead of the long line
+
+Everything above works, but the command you actually type every day is long
+enough to keep in a note file, and it encodes the bench's identity (user, host,
+socket, key, ProxyCommand) inline. The bench-code layer moves that identity into
+a config file so the daily command becomes one word — the AnyDesk shape: **one
+bench, one code that never changes.**
+
+```bash
+serialwrap connect eit-test                       # open the tunnel for that code
+serialwrap --bench eit-test session list          # address it by code, no --endpoint
+serialwrap --bench eit-test cmd submit --selector COM0 --cmd "uname -a" --source agent:me
+serialwrap benches                                # what codes exist, and are they up
+serialwrap connect eit-test --close               # tear it down
+```
+
+`connect` is a thin wrapper: it resolves the code, expands it into the exact
+`remote -L` argv shown earlier and reuses the same spawn path. Nothing about the
+transport or the security model changes — it is still ssh with your key.
+
+**`benches.yaml`** lives at `~/.config/serialwrap/benches.yaml` (override with
+`SERIALWRAP_BENCHES_FILE`; `SERIALWRAP_CONFIG_DIR` and `XDG_CONFIG_HOME` are both
+honoured). All five per-bench keys are **required** — there are no optional
+fields, so a half-written entry fails loudly instead of silently defaulting:
+
+```yaml
+benches:
+  eit-test:                                        # the code — your choice, this is the alias
+    target: eit@eit-test.example.com               # user@host; the user is yours to maintain
+    remote_socket: /tmp/serialwrap/serialwrapd.sock  # the bench's own daemon socket
+    local_port: 7777                               # loopback port on your machine
+    ssh_opts:
+      - "-o"
+      - "ProxyCommand=cloudflared access ssh --hostname %h"
+      - "-i"
+      - "~/.ssh/id_ed25519_serialwrap_bench"
+    autossh: true
+```
+
+| key | type | meaning |
+|---|---|---|
+| `target` | `user@host` | ssh target. **The username is maintained here, by you** — serialwrap never infers it and never substitutes the current user. |
+| `remote_socket` | path | the daemon socket *on the bench*; take it from that machine's `config.yaml` (`socket_path`) or `serialwrap daemon status` |
+| `local_port` | 1–65535 | loopback port the tunnel lands on locally |
+| `ssh_opts` | list of strings | passed through to ssh verbatim, one list item per argv element |
+| `autossh` | bool | keep the ssh transport alive across drops |
+
+The schema is **provider-neutral by construction**: the loader rejects any key
+outside that set, so a `cloudflare:` or `tailscale:` block is a load error, not a
+silently ignored field. Provider-specific detail reaches ssh only through
+`ssh_opts` — the same rule as `--ssh-opt`, now written down once per bench
+instead of retyped per command.
+
+**Endpoint memory.** A successful `connect` records the resulting endpoint in
+`$XDG_STATE_HOME/serialwrap/benches.state.json` (or `SERIALWRAP_STATE_DIR`), which
+is what lets later commands say `--bench <code>` with no `--endpoint`. Resolution
+order is `--endpoint` > `--socket` > `--bench` > the `config.yaml` fallback. A code
+that has not been connected yet returns an explicit error rather than quietly
+falling back to your local daemon — the failure mode that would otherwise run a
+command against the wrong machine.
+
+`serialwrap benches` lists every configured code with its remembered endpoint and
+whether the tunnel is still up:
+
+```json
+{"benches":[{"alive":true,"code":"eit-test","endpoint":"tcp://127.0.0.1:7777"}],"ok":true}
+```
+
+#### Issuing and enrolling a bench (`tools/`)
+
+Two scripts turn the one-time setup above into two commands. They are
+**provider-specific and deliberately live in `tools/`, not in the CLI** — the
+`sw_core` surface stays provider-neutral.
+
+```bash
+# management side — mint a code: create the tunnel, route DNS, build the bundle,
+# write the benches.yaml entry
+tools/bench-issue.sh --domain example.com eit-test
+
+# bench side — consume that bundle: install cloudflared, deploy /etc/cloudflared,
+# install the service, force key-only sshd, append the controller key, verify
+sudo tools/bench-enroll.sh --bundle /path/to/handoff/eit-test
+```
+
+`bench-issue.sh` requires a domain (`--domain`, or `BENCH_ISSUE_DOMAIN` /
+`SERIALWRAP_BENCH_DOMAIN`) and exits non-zero without one. It emits
+`handoff/<code>/` containing the tunnel credentials, a `config.yml` and the
+controller's public key — hand that directory to the bench over a channel you
+trust, and the bench never needs a browser login or your account-level
+`cert.pem`.
+
+`bench-enroll.sh` ends with two checkpoints and fails non-zero if either does
+not hold: **CP-1** `Registered tunnel connection` in the cloudflared journal,
+**CP-2** a self-ssh through the tunnel succeeds. It touches only its own sshd
+drop-in (`sshd_config.d/serialwrap-bench-key-only.conf`) and **reloads** rather
+than restarts sshd, so an ssh session running the script does not cut itself
+off; it does not modify any existing serialwrap configuration. Both scripts take
+`--dry-run` and `--help`.
+
 #### Tunnel management
 
 ```bash
@@ -2527,6 +2626,71 @@ ssh -o 'ProxyCommand=cloudflared access ssh --hostname %h' tester@dut.example.co
 刻意不寫的：在 hostname 前面加 Cloudflare Access。Access 是「把服務發佈給組織、用身份政策管」的工具，對「我連我自己的 bench」是錯的量級；而且它的瀏覽器登入 token 會過期——撞上 serialwrap 強制的 `BatchMode=yes` 會靜默失敗。日後真要加，請用 service token（`cloudflared access ssh --service-token-id … --service-token-secret …`）。
 
 定位用的對照：自養 relay（拓樸三）功能等價，差別只在誰養會合點。tmate 是同一種「別人養 relay、隨機 token 會合」的模型，但它橋的是 terminal 而不是 socket，所以它服務的是 agent 跑在 bench 上的情境，不是這一個。
+
+### bench 代號：用 `connect <code>` 取代那條長指令
+
+上面那些都能用，但每天真正要敲的那一行長到得存在筆記裡，而且把 bench 的身分（帳號、hostname、socket、金鑰、ProxyCommand）全寫死在指令裡。代號層把那份身分搬進設定檔，讓日常指令縮成一個詞——就是 AnyDesk 的形狀：**一台 bench 一個永遠不變的代號**。
+
+```bash
+serialwrap connect eit-test                       # 為該代號開隧道
+serialwrap --bench eit-test session list          # 用代號定址，不必帶 --endpoint
+serialwrap --bench eit-test cmd submit --selector COM0 --cmd "uname -a" --source agent:me
+serialwrap benches                                # 有哪些代號、目前通不通
+serialwrap connect eit-test --close               # 拆掉
+```
+
+`connect` 只是薄包裝：解析代號、展開成前面那條一模一樣的 `remote -L` argv，再重用同一條 spawn 路徑。傳輸方式與安全模型完全沒變——仍然是帶你自己金鑰的 ssh。
+
+**`benches.yaml`** 放在 `~/.config/serialwrap/benches.yaml`（可用 `SERIALWRAP_BENCHES_FILE` 覆寫；`SERIALWRAP_CONFIG_DIR` 與 `XDG_CONFIG_HOME` 都會被尊重）。每個 bench 的五個欄位**全部必填**——沒有選填欄位，所以寫一半的條目會直接報錯，而不是靜默套用預設值：
+
+```yaml
+benches:
+  eit-test:                                        # 代號——你自己取，這就是別名
+    target: eit@eit-test.example.com               # user@host；帳號由你維護
+    remote_socket: /tmp/serialwrap/serialwrapd.sock  # bench 自己的 daemon socket
+    local_port: 7777                               # 本機的 loopback port
+    ssh_opts:
+      - "-o"
+      - "ProxyCommand=cloudflared access ssh --hostname %h"
+      - "-i"
+      - "~/.ssh/id_ed25519_serialwrap_bench"
+    autossh: true
+```
+
+| 欄位 | 型別 | 意義 |
+|---|---|---|
+| `target` | `user@host` | ssh 目標。**帳號在這裡由你維護**——serialwrap 不推導、也不會代入目前登入使用者。 |
+| `remote_socket` | 路徑 | **bench 上**的 daemon socket；取自那台的 `config.yaml`（`socket_path`）或 `serialwrap daemon status` |
+| `local_port` | 1–65535 | 隧道在本機落地的 loopback port |
+| `ssh_opts` | 字串陣列 | 原樣傳給 ssh，一個 argv 元素一列 |
+| `autossh` | 布林 | 斷線時維持 ssh 傳輸存活 |
+
+這份 schema **在結構上就是 provider-neutral**：loader 會拒絕該集合以外的任何欄位，所以寫 `cloudflare:` 或 `tailscale:` 區塊是載入錯誤，不是被靜默忽略的欄位。provider 專屬細節只能經由 `ssh_opts` 抵達 ssh——跟 `--ssh-opt` 同一條規則，只是現在每台 bench 寫一次，不必每條指令重打。
+
+**endpoint 記憶。** `connect` 成功後會把產生的 endpoint 記在 `$XDG_STATE_HOME/serialwrap/benches.state.json`（或 `SERIALWRAP_STATE_DIR`），後續指令才能只寫 `--bench <code>` 而不帶 `--endpoint`。解析優先序是 `--endpoint` > `--socket` > `--bench` > `config.yaml` fallback。尚未 connect 的代號會回明確錯誤，**不會**靜默 fallback 到本機 daemon——那正是會把命令送錯機器的失敗模式。
+
+`serialwrap benches` 列出所有已設定的代號、記住的 endpoint，以及隧道是否還活著：
+
+```json
+{"benches":[{"alive":true,"code":"eit-test","endpoint":"tcp://127.0.0.1:7777"}],"ok":true}
+```
+
+### 發代號與入列（`tools/`）
+
+兩支腳本把上面那些一次性設定收斂成兩條指令。它們是 **provider-specific，刻意放在 `tools/` 而不是 CLI 裡**——`sw_core` 的介面維持 provider-neutral。
+
+```bash
+# 管理端——發一個代號：建 tunnel、設 DNS、打包 bundle、寫 benches.yaml 條目
+tools/bench-issue.sh --domain example.com eit-test
+
+# bench 端——消化那個 bundle：裝 cloudflared、佈署 /etc/cloudflared、裝服務、
+# sshd 改金鑰限定、追加 controller 公鑰、驗證
+sudo tools/bench-enroll.sh --bundle /path/to/handoff/eit-test
+```
+
+`bench-issue.sh` 需要 domain（`--domain`，或 `BENCH_ISSUE_DOMAIN`／`SERIALWRAP_BENCH_DOMAIN`），沒給就非零退出。它會產出 `handoff/<code>/`，內含 tunnel 憑證、`config.yml` 與 controller 公鑰——用你信任的管道把這個目錄交給 bench，bench 端就**不需要瀏覽器登入、也拿不到你帳號層級的 `cert.pem`**。
+
+`bench-enroll.sh` 結束前跑兩個檢查點，任一不成立即非零退出：**CP-1** cloudflared journal 出現 `Registered tunnel connection`、**CP-2** 經隧道 self-ssh 成功。它只碰自己的 sshd drop-in（`sshd_config.d/serialwrap-bench-key-only.conf`），而且是 **reload 不是 restart**，所以正在跑這支腳本的那條 ssh 不會把自己切斷；它也不會改動任何既有的 serialwrap 設定。兩支都支援 `--dry-run` 與 `--help`。
 
 ### 隧道管理
 

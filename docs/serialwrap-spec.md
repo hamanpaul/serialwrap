@@ -633,6 +633,9 @@ background mode 的 `command.result_tail` 在 capture 尚未建立時，會回�
 - 全域 transport 參數：
   - `--socket <path>`（預設，本機 Unix socket）
   - `--endpoint <endpoint>`（優先於 `--socket`，支援 `unix://` / `tcp://`）
+  - `--bench <code>`（#203，以 `connect` 記住的 bench 代號解析 endpoint；優先序
+    `--endpoint` > `--socket` > `--bench` > config fallback。未 connect 的代號回
+    明確錯誤，不 fallback 本機 daemon）
 - `serialwrap daemon start|stop|status`
 - `serialwrap device list`
 - `serialwrap session list|bind|attach|clear`
@@ -648,6 +651,11 @@ background mode 的 `command.result_tail` 在 capture 尚未建立時，會回�
 - `serialwrap wal export`
 - `serialwrap session pin|unpin`
 - `serialwrap profile test --profile <name> --sample <file> [--profile-dir DIR]`（#174，純離線診斷）
+- `serialwrap remote [-R|-L] ...|close <port>|all`（ssh 隧道 lifecycle；可達性由外部 provider 提供）
+- `serialwrap connect <code> [--close]`（#203，bench 代號別名層；解析 `benches.yaml`
+  後展開成等價 `remote -L` argv 並重用同一條 spawn 路徑，成功時寫入 endpoint 記憶
+  `$XDG_STATE_HOME/serialwrap/benches.state.json`）
+- `serialwrap benches`（#203，列出 `benches.yaml` 各代號、記住的 endpoint 與 tunnel alive 狀態）
 
 #### CLI 失敗輸出（stdout JSON + stderr 一行，#94／#172）
 

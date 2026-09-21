@@ -142,6 +142,21 @@ serialwrap --endpoint tcp://127.0.0.1:7777 session list
 ```
 前提（bench）：sshd 只開金鑰（`PasswordAuthentication no`，hostname 對外可達）、本機公鑰在 `tester` 的 `authorized_keys`、`tester` 在 `dialout`（socket 0660）。`--remote-socket` 取 bench 的 `config.yaml` `socket_path`。**先用純 ssh 驗** `ssh -o 'ProxyCommand=cloudflared access ssh --hostname %h' tester@<hostname> hostname`，通了再接 serialwrap。不開 Access（其瀏覽器 token 會過期、撞 `BatchMode=yes` 靜默失敗）；日後要加請用 service token。完整兩條路線與對照表見 README「實例：以 Cloudflare 當 reachability provider」。
 
+**bench 代號層（#203）**：上面那條長指令可以收成一個代號——一台 bench 一個不變的代號（AnyDesk 形狀）。
+
+```bash
+serialwrap connect eit-test                  # 依代號開隧道（內部展開成同一條 remote -L）
+serialwrap --bench eit-test session list     # 用代號定址，免帶 --endpoint
+serialwrap benches                           # 列代號 + 記住的 endpoint + alive
+serialwrap connect eit-test --close          # 拆隧道並清 endpoint 記憶
+```
+
+`benches.yaml`（`~/.config/serialwrap/benches.yaml`，`SERIALWRAP_BENCHES_FILE` 可覆寫）每個 bench **五個欄位全部必填**：`target`（`user@host`，**帳號由 host 端自己維護，serialwrap 不推導也不代入當前使用者**）、`remote_socket`（bench 上的 socket 路徑）、`local_port`、`ssh_opts`（字串陣列，原樣傳 ssh）、`autossh`（布林）。loader **拒絕**這五個以外的任何欄位——寫 `cloudflare:`／`tailscale:` 是載入錯誤，schema 在結構上就 provider-neutral（#185）。
+
+endpoint 記憶在 `$XDG_STATE_HOME/serialwrap/benches.state.json`。端點解析優先序 `--endpoint` > `--socket` > `--bench` > config fallback；**未 connect 的代號回明確錯誤、不會靜默 fallback 到本機 daemon**（否則會把命令送錯機器）。
+
+佈署腳本在 `tools/`（provider-specific，刻意不進 CLI）：`tools/bench-issue.sh --domain <domain> <code>`（管理端建 tunnel／設 DNS／產 `handoff/<code>/` bundle／寫 benches.yaml；沒給 domain 即非零退出）、`sudo tools/bench-enroll.sh --bundle <dir>`（bench 端裝 cloudflared／佈署 `/etc/cloudflared`／裝服務／sshd 金鑰限定並 **reload 不 restart**／追加公鑰／跑 CP-1 journal `Registered tunnel connection` 與 CP-2 self-ssh）。bench 端因此**不需要瀏覽器登入、也拿不到管理端的 `cert.pem`**。細節見 README「bench 代號」與「發代號與入列」。
+
 管理：`serialwrap remote`（列隧道）、`serialwrap remote close 7777|all`（拆除）。
 回傳 `status`：`active`＝就緒可用；`starting`＝尚未確認（慢速認證／上游未就緒），需再 `remote status` 或重試。
 
