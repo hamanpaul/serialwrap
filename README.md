@@ -810,11 +810,30 @@ development bench.
 
 ```bash
 # bench — keep it running (e.g. in tmux). Prints something like
-#   https://quiet-otter-lamp.trycloudflare.com
-# Use only the hostname part (quiet-otter-lamp.trycloudflare.com) and drop the
-# "https://" — an ssh target is a hostname, not a URL.
-cloudflared tunnel --url ssh://localhost:22
+#   https://england-diesel-bras-belle.trycloudflare.com
+# Use only the hostname part and drop the "https://" — an ssh target is a
+# hostname, not a URL.
+#
+# --config with an EMPTY file is not optional if this bench already runs a
+# Named Tunnel: cloudflared's default search path includes
+# /etc/cloudflared/config.yml, so a bare `tunnel --url` silently inherits that
+# file's `tunnel:`/`credentials-file:` and starts a SECOND CONNECTOR FOR YOUR
+# NAMED TUNNEL instead of a Quick Tunnel. It still prints a trycloudflare
+# hostname, but that hostname refuses the proxy handshake ("websocket: bad
+# handshake" from both `access ssh` and `access tcp`) — and meanwhile the edge
+# load-balances your production hostname across the extra replica.
+# Check the startup line: `Settings: map[...]` must NOT contain cred-file.
+: > /tmp/qt-empty.yml
+cloudflared --config /tmp/qt-empty.yml tunnel --url ssh://localhost:22
 ```
+
+Route A was run end to end on 2026-09-21 with cloudflared 2026.9.1 against the
+same bench as Route B: plain ssh through the Quick Tunnel ≈ 2.4 s, `serialwrap
+remote -L` reached `status: active` on the first try in ≈ 2.8 s, and
+`cmd submit` returned real UART output. `cloudflared access ssh` needs no
+account and no Access for a `*.trycloudflare.com` hostname. The inherited-config
+trap above is the only place the walkthrough differed from what actually
+happened.
 
 **Route B — Named Tunnel, without Access.** Needs a domain in your Cloudflare
 account; gives a stable hostname.
@@ -2553,11 +2572,26 @@ bench 端有兩條路線，本機的指令兩條路線相同。
 
 ```bash
 # bench——放著跑（例如放 tmux 裡）。會印出類似
-#   https://quiet-otter-lamp.trycloudflare.com
-# 只取 hostname 那段（quiet-otter-lamp.trycloudflare.com）、去掉「https://」——
-# ssh 的目標是 hostname，不是 URL。
-cloudflared tunnel --url ssh://localhost:22
+#   https://england-diesel-bras-belle.trycloudflare.com
+# 只取 hostname 那段、去掉「https://」——ssh 的目標是 hostname，不是 URL。
+#
+# 這台 bench 若已經在跑 Named Tunnel，--config 指向一個「空檔」就不是可選的：
+# cloudflared 的預設搜尋路徑含 /etc/cloudflared/config.yml，裸的 `tunnel --url`
+# 會靜默沿用該檔的 `tunnel:`／`credentials-file:`，於是起的不是 Quick Tunnel，
+# 而是**你那條 Named Tunnel 的第二個 connector**。它照樣印出一個 trycloudflare
+# hostname，但那個 hostname 會拒絕 proxy handshake（`access ssh` 與 `access tcp`
+# 都回 "websocket: bad handshake"）；同時 edge 還會把你的 production hostname
+# 分流到這個多出來的 replica。
+# 檢查啟動時那行 `Settings: map[...]`，裡面**不可以**出現 cred-file。
+: > /tmp/qt-empty.yml
+cloudflared --config /tmp/qt-empty.yml tunnel --url ssh://localhost:22
 ```
+
+路線 A 已於 2026-09-21 以 cloudflared 2026.9.1 對同一台 bench 端到端實跑：純 ssh 經
+Quick Tunnel 往返約 2.4 秒，`serialwrap remote -L` 一次就到 `status: active`（約 2.8
+秒），`cmd submit` 拿到真實 UART 輸出。對 `*.trycloudflare.com` 用 `cloudflared access
+ssh` **不需要帳號、也不需要 Access**。上面那個沿用設定的陷阱，就是實跑與原步驟唯一不符
+的地方。
 
 **路線 B — Named Tunnel，不開 Access。** 需要帳號裡掛著一個網域；換來固定 hostname。
 
