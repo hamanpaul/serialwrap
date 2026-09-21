@@ -4,6 +4,292 @@
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-09-21
+
+### Added
+- 新增全域 `--bench <code>` 參數：以 `connect` 記住的 bench 代號解析 endpoint，讓後續命令免帶 `--endpoint`。
+  
+  - 端點解析優先序為 `--endpoint` > `--socket` > `--bench` > config fallback；`--bench` 指向尚未 connect 的代號時回明確錯誤，不靜默 fallback 到本機 daemon。
+  - 同步修補 `daemon start`／`daemon stop`（含 systemd 模式 route）與 `remote` 路徑對 bench endpoint 的定址與錯誤處理。
+  - README 內嵌的 `serialwrap --help` 區塊同步更新（R-16）。
+- 新增 bench 佈署腳本（provider-specific，刻意放 `tools/` 不進 `sw_core`，維持 #185 provider-neutral）：
+  
+  - `tools/bench-issue.sh <code>`：管理端一鍵發代號——`tunnel create`／`route dns`／產 cloudflared config／打包 `handoff/<code>/` 憑證包／寫入 `benches.yaml`。domain 由 `--domain` 或 `BENCH_ISSUE_DOMAIN`／`SERIALWRAP_BENCH_DOMAIN` 提供，未給即非零退出。
+  - `tools/bench-enroll.sh --bundle <dir>`：bench 端一鍵入列——安裝 cloudflared（帶 `NEEDRESTART_SUSPEND=1`）→ 佈署 `/etc/cloudflared/` → 以 `--config` 做 service install → 加 sshd 金鑰限定 drop-in 並 `reload`（不 restart）→ 追加 controller 公鑰 → 跑 CP-1/CP-2 檢查點。任一步失敗即非零退出，且不改動既有 serialwrap 設定。
+  - 兩支皆支援 `--help` 與 dry-run，shellcheck 乾淨；`tests/test_bench_tools_cli.py` 以 pytest 包裝覆蓋參數解析與檢查點分支，不需實機。
+- 新增 `serialwrap benches`：列出 `benches.yaml` 的各 bench 代號、`connect` 記住的 endpoint 與 tunnel alive 狀態，讓操作者不必自己去翻 `benches.state.json`。
+  
+  - `bench_registry` 新增 `load_configured_benches()`，供 CLI 直接取全部代號（`resolve()` 改為呼叫它，行為不變）。
+  - endpoint 記憶改為嚴格驗證：非字串／空值／非 `tcp://`／非 loopback host 一律視為記憶損壞並回明確錯誤，不再靜默當成「未 connect」。
+  - alive 判定改為比對記住的 endpoint 實際 port，而非 `benches.yaml` 宣告的 `local_port`。
+  - `connect --code --close` 同步改用記住的 port 拆隧道；tunnel 仍存在時不清除 endpoint 記憶。
+  - README 內嵌的 `serialwrap --help` 區塊同步更新（R-16）。
+- 新增 `serialwrap connect <code>` 代號連線子命令：從 `benches.yaml` 解析代號，展開成等價的
+  `remote -L` 參數並重用既有 spawn 路徑建立隧道，成功後把 loopback endpoint 記入
+  `benches.state.json`；`--close` 拆除該代號的隧道並清除 endpoint 記憶。
+  
+  - 未知代號、參數錯誤一律走既有 `TunnelError` → CLI JSON `{ok:false,error_code}` 邊界，例外不穿越 CLI。
+  - 建立失敗時回滾已開的隧道；拆除前驗證隧道歸屬，避免誤關他人或孤兒隧道。
+  - endpoint state 更新序列化，避免併發寫入互相覆蓋。
+- 新增 provider-neutral 的 bench registry 載入層（`sw_core/bench_registry.py`），讓
+  `benches.yaml` 可定義 `target`、`remote_socket`、`local_port`、`ssh_opts`、
+  `autossh`，並強制 schema 驗證：拒絕 provider 專屬欄位、要求 `user@host`、
+  保留 `ssh_opts` 原樣與 `SERIALWRAP_BENCHES_FILE` 覆寫行為。
+- `sw_core/bench_registry.py` 新增 `to_remote_argv(entry)`：把 `BenchEntry` 展開成等價 `serialwrap remote -L` 的 argv（`--remote-socket`、逐項 `--ssh-opt`、`--autossh`、`user@host:port`），供 `connect` 重用既有 spawn 路徑而不重造隧道建構邏輯。
+
+### Changed
+- CLI 新增最小控制平面 RPC trace：`-v`/`-vv` 與 `SERIALWRAP_LOG_LEVEL` 可在 stderr 輸出單行白名單 JSON，記錄實際 RPC method、endpoint 來源、遮罩後 endpoint 識別、elapsed、error_code、retry 次數與最後一次主請求 attempt 的 errno。
+  
+  - 新增專用 `serialwrap.cli_trace` logger，`propagate=False` 且 handler 冪等，不污染 root / `serialwrap` logger；預設 `WARNING`，因此既有 stdout/stderr 契約維持不變。
+  - `_run_rpc()`、event 路徑、`daemon stop` 與 `daemon start` 的**前置 health probe／就緒等待** CLI RPC 呼叫統一走同一個 trace wrapper；`event add` 會正確記錄真正送出的 `event.rule_set` method。
+  - `-v` / `--verbose` 為公開 help 旗標，README `serialwrap-help` marker 同步更新，不再以隱藏旗標繞過 R-16。
+  - trace wrapper 不再因 `trace_sink` 相關 `TypeError` 退回第二次 `rpc_call()`；mutating RPC 維持無額外重送契約。
+  - Unix socket path 一律 SHA-256；TCP 僅對 loopback literal 保留 `host:port`。trace 不輸出 params、command、secret、raw endpoint path 或完整 response。
+  - `sw_core.client.rpc_call()` 新增內部 metadata sink：`elapsed_ms` 含既有 retry/backoff/TIMEOUT enrich，`errno` 僅取最後一次**主請求** attempt 的 `OSError.errno`，因此 retry 後 success 與 TIMEOUT enrich 失敗都不會留下錯誤 errno。
+  
+  **regression-case 評估**：新增 `tests/test_cli_diagnostics.py`，搭配既有 CLI / endpoint / timeout / event / Windows seam 測試即可完整覆蓋；此變更只碰 client/CLI transport seam，不依賴真板、真 daemon 或外部工具搶 tty，故不需新增 `regression/` 真機 case。
+- 釐清兩條對外契約的邊界，皆為純文件變更、不動實作。
+  
+  - **`file push` 的檔案大小與通道界線（#188）**：`SKILL.md` 的「避免 base64 inline」原本只寫
+    「改用 `serialwrap file push`」，照這條規則走 agent 會把整包 firmware image 也交給
+    `file push`。實測一顆 81 MB image 走 SCP 經 LAN 數秒完成；同一顆走 UART 115200
+    （原始上限約 11 KB/s，echo-ACK 節流後更低）即使通道穩定也需數小時。現在明訂
+    `file push` 適用**數十 KB 內的小檔**（設定檔／腳本／探針），DUT 有 SSH／TFTP／HTTP
+    通道時大檔一律走 SCP／TFTP、serialwrap 只負責控制面，`file push` 用於大檔僅能是
+    「確認無網路通道後」的明確 fallback。`README.md`（中英雙語）與 `SKILL.md` 的範例
+    一併從 `./firmware.bin` 改為 `./probe.sh`——原範例本身正是要避免的反面示範。
+  - **`serialwrap remote` 的責任邊界與拓樸模型（#185）**：明訂 `serialwrap remote`
+    **不實作 NAT traversal**，只在一個本來就可達的 SSH target 上管理 forward lifecycle；
+    可達性由外部 reachability provider 提供（LAN／Cloudflare Zero Trust／Tailscale／
+    WireGuard／ZeroTier／VPN／jump host），新增責任分層圖。拓樸重新分級：overlay 已提供
+    互相可達性時，`UART host -R→ agent` 為 **preferred**（即使兩端皆在 NAT 後也不需要
+    relay 或成對的 `-L`）；public relay 的 `-R/-L` 鏈降為兩端完全互不可達時的
+    **fallback**，不再是雙 NAT 的唯一描述。明文記錄刻意**不提供** `--cloudflare`／
+    `--tailscale` 之類 provider-specific 旗標、不引入 provider SDK 或執行期依賴——
+    provider 細節屬於 `ssh_config` alias／`ProxyJump`／`--ssh-opt`。既有 loopback bind
+    不變量、`--remote-socket` 硬化與單租戶 relay 要求在所有拓樸下維持不變。
+  
+  同時涵蓋 #185。`code_paths`（`**/*.py`／`**/*.sh`／`scripts/**`）未變動，本 fragment
+  為自願記錄以利 release 收斂。
+- 補上 `serialwrap remote` 的 **agent-pull** 形狀：測試覆蓋、文件範例，以及兩處會誤導的敘述。
+  不改 `sw_core/` 任何實作——現行程式碼本來就支援，缺的是驗證與文件。
+  
+  - **agent-pull 形狀**（`serialwrap remote -L --remote-socket <UART host 的 socket> user@dut:7777`）：
+    agent 主動 ssh 進 UART host、把對方的 `serialwrapd.sock` 拉回自己的 loopback，
+    **UART host 端不需跑 `-R`、不需任何 relay**。這是「開發機要連一台在 NAT 後的 bench」
+    最自然的形狀，搭配把 SSH 架在 overlay 上的 provider 即得到兩端皆只有出站連線的路徑
+    （遠端桌面工具用的模型），且不必自己營運 relay。
+    `sw_core/remote_tunnel.py` 早已支援——`_direction_args()` 的 connect 分支對「對端是誰」
+    無任何假設，全檔亦無強制 `-L` 必須配 `-R` 的檢核——但三個既有 docker 拓樸
+    （`direct`／`nat_host`／`dual_nat`）**全是 UART host 用 `-R` 推出去**，方向相反的
+    agent-pull 從未被測過，README／SKILL 也沒有任何範例。
+  - **新增第 4 個 docker 拓樸 `agent_pull`**（`tools/docker/remote_tunnel_test.sh`）：
+    方向反轉，sshd 改跑在 uart 容器、agent 容器主動連入。斷言粒度比照 `topology_direct()`
+    ——①預設不啟用 ②session list＋cmd submit/status ③daemon pid 全程不變
+    ④close all 後乾淨復歸 ⑤loopback 不變量＋獨立 attacker 容器連不到。
+    `realhw/cases/remote.py` 註冊 `rm-topo-agent-pull`（`remote` tier ×7 → ×8）。
+    - 兩個新 helper：`uart_sshd_up()` 強制以 `-u root` 在 uart 容器起 sshd
+      （`start_uart` 用 `docker run -u tester`，`docker exec` 不帶 `-u` 會繼承該非 root
+      使用者、讀不到 0600 的 host key 而 `no hostkeys available -- exiting`；既有
+      `sshd_up()` 只用在 `start_plain`/`start_role` 建的 root 容器上，未踩過此坑）；
+      `uart_socket_path()` 讀 uart 容器的 `sw-uart.env` 推算 `RUN_DIR/serialwrapd.sock`
+      （`DaemonHarness` 用 tempdir，路徑每次啟動都不同，不能寫死）。
+  - **`BatchMode=yes` 為強制且不可覆寫**（README 中英雙語＋SKILL.md）：readiness／安全預設
+    `-o` 置於使用者 `--ssh-opt` 之前，OpenSSH 取同鍵第一個值，故蓋不掉（刻意如此）。
+    後果是不接受任何互動式認證；provider 憑證會過期時（如 Cloudflare Access token），
+    過期會讓 ssh 直接失敗且無有用診斷，無人值守需用 service token 或事先 refresh。
+    此限制先前完全沒有記載。
+  - **修正 `--remote-socket` 的配對敘述**：原文「`-R`／`-L` 兩端須成對指定同一路徑」的脈絡
+    是共享 relay 的硬化情境，但照字面讀會讓人以為 agent-pull 不合法。改為明確界定該配對
+    要求只適用 relay 類形狀。
+  - 順帶修掉 `role_exec` 一段「connect 端（-L，僅拓樸 3 用）」的過期註解（拓樸 4 也用它）。
+  
+  **regression-case 評估**：本變更的驗證面**就是** `regression/`／realhw 這一側——新增的
+  `rm-topo-agent-pull` 即為回歸 case，涵蓋 pytest 無法覆蓋的部分（真 sshd、真 ssh forward、
+  真 unix socket 轉發、跨容器隔離）。不需另加 pytest：`sw_core/` 零改動，無新的 in-process
+  行為可測；既有 `tests/test_remote_tunnel.py`／`test_remote_cli.py` 已覆蓋 argv 組裝與 CLI 解析。
+- README（中英雙語）與 `SKILL.md` 新增「以 Cloudflare 當 reachability provider」的可操作實例。純文件變更，`sw_core/` 零改動。
+  
+  - **情境**：agent 跑在本機、bench 在遠端，兩端皆在 NAT 後；本機不裝 overlay client、不對 bench 建立系統級 ssh 關係——只有 `serialwrap remote` 派生的那條 ssh 過去；不自養 relay VPS。這是 #193 拓樸二（agent-pull）的實例化：Cloudflare Tunnel 讓 bench 的 sshd 以 hostname 可達，bench 只跑 `cloudflared`、**不跑 `serialwrap remote`**；本機的 `cloudflared` 只是 serialwrap 那條 ssh 的 per-connection `ProxyCommand` helper，透過 `--ssh-opt` 傳入而非寫進 `~/.ssh/config`。
+  - **兩條路線**：Quick Tunnel（無帳號無網域，hostname 每次重啟換，`cloudflared tunnel --url ssh://localhost:22` 一行）與 Named Tunnel 不開 Access（帳號裡有網域，hostname 固定，`tunnel login` → `create` → `route dns` → `config.yml`）。本機指令兩條路線相同。附對照表、bench 一次性前提（sshd key-only／pubkey／`dialout`）、以及「先用純 ssh 驗 ProxyCommand」的里程碑。
+  - **刻意不寫 Access**：它是把服務發佈給組織的企業形狀工具，對「我連我自己的 bench」是錯的量級；其瀏覽器登入 token 會過期、撞上 serialwrap 強制的 `BatchMode=yes` 會靜默失敗。只註明日後要加需用 service token。
+  - 附自養 relay（拓樸三）與 tmate 的一句話對照，避免讀者再繞一次：前者功能等價、差在誰養會合點；後者同為「別人養 relay＋token 會合」但只橋 terminal 不傳 socket。
+  - 寫進文件的 `cloudflared` 旗標（`tunnel --url`／`access ssh --hostname`／`--service-token-id`／`--service-token-secret`／`tunnel route dns [TUNNEL] [HOSTNAME]`／`service install`）已對 cloudflared 2026.8.3 的 `--help` 逐一核對；`ssh://` ingress scheme 以離線 `tunnel ingress validate` 驗證為 OK。未實際開 tunnel（會把本機 sshd 曝到公網），Cloudflare 端到端待帳號加上網域後由使用者實跑。
+- README（中英雙語）與 `SKILL.md` 的 Cloudflare 路線 B（Named Tunnel）補上 2026-09-16 真機實跑發現的兩個坑，並註明已驗證版本。純文件變更，`sw_core/` 程式碼零改動。
+  
+  - **`tunnel login` 要選 zone 再按 Authorize**：只登入 Cloudflare 帳號不會產生 `~/.cloudflared/cert.pem`，cloudflared 會一直印 `Waiting for login...`。
+  - **`sudo cloudflared service install` 找不到設定**：sudo 之下 `~` 是 `/root`，直接執行報 `Cannot determine default configuration path`。步驟改為把 `config.yml` 與該 tunnel 的 `<UUID>.json` 搬到 `/etc/cloudflared/`、改寫 `credentials-file` 路徑，再以 `--config` 明確指定安裝，並以 journal 的 `Registered tunnel connection` 當檢查點。
+  - 註記路線 B 已以 cloudflared 2026.9.1 於 WSL2 Ubuntu 24.04 bench 端到端實跑（純 ssh 往返約 3 秒、`cmd submit` 取得真實 UART 輸出），對應 #197 Phase 2／Phase 3 的 Named Tunnel 部分；Quick Tunnel（Phase 1）與重開機測試仍待做，故本 PR 不關閉 #197。
+- README（中英雙語）新增「新 bench 佈署檢查清單」：把原本分散在 Cloudflare 實例、bench 代號、發代號與入列三節的資訊，收斂成一份可逐項打勾的操作清單——每網域一次的帳號前提、新 bench 在跑腳本前要自備的條件（含 socket 路徑確認與監管模式選擇）、三條佈署指令、controller 端驗收步驟，以及「已跑 Named Tunnel 的 bench 不可裸跑 `cloudflared tunnel --url`」的陷阱。
+- 回填 Cloudflare 路線 A（Quick Tunnel）的真機實跑結果與一個新坑：bench 若已跑 Named Tunnel，裸的 `cloudflared tunnel --url ssh://localhost:22` 會沿用 `/etc/cloudflared/config.yml` 的 `tunnel:`／`credentials-file:`，起出來的是**該 Named Tunnel 的第二個 connector** 而非 Quick Tunnel——仍會印出 trycloudflare hostname，但該 hostname 一律回 `websocket: bad handshake`，且 production hostname 會被 edge 分流到這個多出來的 replica。必須以 `--config <空檔>` 隔離，並檢查啟動的 `Settings: map[...]` 不含 cred-file。同步標註路線 A 已驗證版本與延遲數據（README 中英兩段＋SKILL.md）。
+- 架構事實層（#200）：
+  - 新增 serialwrap 來源固定的原生 Archify 流程架構 HTML 與 facts／JSON，區分命令呼叫鏈、Session、lease、背景結果及實體證據。
+  - 補齊中英 README 入口、文件負控制與只讀 Architecture HTML CI；不改 runtime、不部署 github.io，清除中斷留下的一次性傳輸檔。
+  - 交付驗收包含來源雜湊核對、原生 HTML 逐位元組重建及 CI 中實際 file:// 瀏覽器測試；驗證紀錄與最終 CI 狀態附於 PR，並與使用者流程驗收、實機 E2E 分開記錄。
+- 文件對齊 bench 代號層：README 中英雙語新增「bench 代號」與「發代號與入列」兩節（`connect`／`benches`／`--bench` 用法、`benches.yaml` 五個必填欄位 schema 與 provider-neutral 約束、endpoint 記憶與解析優先序、`tools/` 兩支佈署腳本的職責與檢查點）；`docs/serialwrap-spec.md` §11.1 補 `--bench` 與 `remote`／`connect`／`benches`；`sw_core/assets/skill/SKILL.md` 補精簡版供 agent 取用。
+- 同步 hamanpaul project policy 1.0.15 → 1.0.17：`.project-policy.yml`、`Policy Check` workflow **與** `Publish Release` workflow（`uses:` 與 `policy_engine_ref` 雙重釘選至 `9e7fabbf0b5eea9ad933fa6798764b723934a0b7`）、canonical `CLAUDE.md`（symlink `AGENTS.md` / `GEMINI.md` / `.github/copilot-instructions.md` 自動跟隨，含內文兩處內嵌 pinned SHA 安裝指令引用）全數同步至 v1.0.17。1.0.16／1.0.17 對下游 repo 未新增或變更任何規則，僅上游引擎自身的 distribution identity、runtime bundle 與 release workflow 修正，故本次為純版本同步；其中 1.0.16 引入的引擎版本 gate（執行中引擎版本與 repo 宣告的 `policy_version` 不符即 fail-loud）是本次同步的實益。
+
+### Fixed
+- 檔案傳輸新增 base64／OpenSSL 雙向工具 fallback 與可選的 `max_console_line_chars` 單行預算；
+  以實際成功 sentinel 驗證 probe、chunk、checksum 與搬移，避免命令回顯或 prompt 假成功。
+  profile 不足以容納固定命令時會在 TX 前回報 `CONSOLE_LINE_LIMIT_TOO_SMALL`。
+  preflight 的驗證 payload 受實際檔案長度封頂；pull 的 encoder 失效、partial failure
+  marker、GNU escaped `md5sum` 與 YAML target budget 物化均有回歸防線。
+- `session pin` 對既有 session 恢復生效，`others-template` fallback 不再是沒有出口的單向門。
+  
+  - **根因**：#95 建立的四層優先序（pin > sticky > detect > fallback）只實作在
+    `_attach_by_id_dynamic`——也就是「該裝置**從未**建過 session」的路徑。既有 session 走
+    `_attach_by_id`，它以 `device_by_id` 找到 session 後就原封不動沿用 `session.profile`；
+    而 `clear_session` 只 detach bridge、**不刪 session 物件**，於是 re-attach 又回到
+    `_attach_by_id`。結果是 `session pin` 被接受、被寫進 `state.json`（key 正確），然後
+    在 attach 時被完全忽略——連 `session clear` 強制重新 attach 也一樣。pin 的說明是
+    「最高優先，繞過偵測」，是使用者唯一被告知的逃生口，而它是壞的；配上 fallback 的空
+    `ready_probe` 讓 `command_capable` 永久 false，掉進 `others-template` 後**沒有任何 CLI
+    途徑**能救回，只能改設定檔再重啟 daemon（#182 描述的代價）。
+  - **修法**：新增 `_reresolve_profile_on_reattach()`，在 `_attach_by_id` 開 bridge **之前**
+    重新解析既有 session 的 profile：
+    - **pin**：命中且與現行 profile 不同即改用該 template，`profile_source` 標 `pin`。pin
+      存在即為最高優先，命中與否都不再往下偵測（維持「繞過偵測」契約，不開 PROBE bridge）。
+    - **fallback 視為暫時分類**：`profile_source == "fallback"` 是**未經量測**的結果
+      （attach 當下板子還在噴 boot log、`last_probe_at` 為 `null` 就會掉進來），因此下一次
+      attach 以獨立 PROBE bridge 再偵測一次（與 `_attach_by_id_dynamic` 對稱）。
+      `yaml-target` / `sticky` / `detected` 是宣告過或量測過的，一律不重解析。
+    - 偵測會送 `\r`，故 boot quiet window（#130 U-Boot autoboot 保護）內跳過；session 已有
+      bridge 時也跳過（避免再開 PROBE bridge 造成 two-reader）。
+  - **`_rematerialize_profile_locked()`**：原地 mutate 既有 session 物件而非重建——
+    `retained_consoles`（保留給 human minicom 的 PTY）、boot quiet 狀態等執行期欄位都掛在
+    該物件上，重建會把正掛著的 human console 一併丟掉。保留 `com` / `act_no` /
+    `device_by_id`；alias 只在仍是自動產生的 `<profile_name>+<act_no>` 形式時跟著改名，
+    使用者自訂過的一律保留。`session_id` 依新 profile 名重算（`others-template:COM2` →
+    `prpl-template:COM2`），並同步搬移 `_sessions`（以 comprehension 重建以保留插入順序，
+    #186 的 tiebreak 看得到它）／`_binding_overrides`／`_reprobe_probe_locks`／
+    `_loaded_released`／alias registry。新 session_id 已被別的 session 佔用時不動作，
+    避免把兩個 session 併成一個。
+  - **`self-test` 給得出可執行的出口**：`profile_source == "fallback"` 的 PASSTHROUGH 分類
+    改為把最近的 RX 餵給所有非 passthrough template 的 `prompt_regex`（`_suggest_profile_from_rx`，
+    與 `serialwrap profile test` 同源的判斷），命中則回 `recommended_action: "pin_profile"`
+    ＋ `suggested_profile` ＋可直接照抄的兩行 hint，而不是只回 `console_attach`。
+    `others-template` 這類 passthrough template 的 `prompt_regex` 是 `.*`、恆真，一律排除在
+    建議之外。顯式宣告的 passthrough（`yaml-target`，如 `uboot-template` target）不勸退。
+  - **`PROFILE_NOT_COMMAND_CAPABLE` 的 hint** 改為寫出可用的動詞（`session self-test` →
+    `session pin` → `session clear`），並明講 `command_capable` 純粹由 `ready_probe` 決定、
+    **與 session state 或 console 是否被佔用無關**——#181 的排查一開始正是被「COM2 有
+    console 佔用所以不能下命令」帶偏（實測 COM1 同樣掛著 console 卻能正常 `cmd submit`）。
+  - **文件**：`README.md`（中英雙語）的 profile 解析優先序補上「每次 attach 都重新套用」與
+    fallback 的暫時性；`session pin / unpin` 段落原本寫「對已存在的 session 下次 daemon
+    重啟才生效」已過期，改為 `pin` + `session clear` 即可。`SKILL.md` 補 fallback 出口 SOP
+    與 `command_capable` 的判準澄清。
+  
+  **regression-case 評估**：新增 `tests/test_profile_reresolve_on_attach.py`（22 個 pytest，
+  修復前全數可重現地 FAIL）——涵蓋 pin 對既有 fallback session 生效、session_id 重算與
+  COM／act_no／alias 保留、pin 命中不開 PROBE bridge、跨重啟、`yaml-target` 不受影響、
+  未知 profile no-op、session_id 佔用時不合併、fallback 再偵測、偵測仍失敗時維持原狀、
+  boot quiet 內不偵測、`detected` 不重偵測、已有 bridge 時不偵測、`_attach_by_id` 確實接上
+  再解析，以及 `self-test` 的建議與 hint 文字。全部為 in-process session-state 與純函式
+  邏輯，unit/mock 已完整覆蓋，**不需**新增 `regression/`（TestPilot 實機）case——本修復
+  不依賴真板 boot 時序、USB 列舉順序或外部工具搶 tty。
+- explicit `targets` binding 的 `device_by_id` 現在對其他 target 排他：restart 後不再受
+  profile 檔案載入順序（`self._sessions` insertion order）擺佈而把裝置指派給錯的
+  session。
+  
+  - **根因**：`SessionManager.__init__` 套用持久化 `_binding_overrides`（`session.bind`
+    或 `_attach_by_id` 的 DETACHED-rebind fallback 留下的紀錄）時，未檢查該值是否與
+    「另一個 explicit target 自己在 YAML 宣告」的 `device_by_id` 衝突。實測（TI XDS110
+    探棒兩個 CDC-ACM port）：`00-com2-prpl.yaml` 綁 `COM2` 到一顆未插著的 CH340；另一份
+    profile 檔把 `COM3`/`COM4` explicit 綁到 XDS110 的 `-if00`/`-if03`（皆在線）。
+    `systemctl restart serialwrap` 後 `COM2` 佔用了 `-if00`、`COM3` 反而 `DETACHED`；
+    把 XDS110 的 profile 檔改名成排序上先載入即可讓結果反過來——即裝置指派實際上是
+    first-come-by-load-order。
+  - **修法**：`__init__` 建 session 前先收集本次載入的所有 explicit target `device_by_id`
+    宣告集合；套用某 session 的持久化 override 時，若該值與**另一個** target 自己宣告
+    的值衝突，視為過期殘留紀錄，改用該 target 自己的 YAML 宣告值，並清掉這筆過期
+    override，避免下次載入再誤用。修復後「哪個 target 拿到哪顆裝置」不再依賴 profile
+    檔案載入順序。
+  - 刻意不動 `_attach_by_id` 的 DETACHED-rebind fallback 本體：那條路徑同時也是
+    `test_session_bind.py::test_auto_bind_on_device_attach` 涵蓋的既有功能（`targets`
+    用佔位符 `device_by_id`、讓任意上線裝置依 `act_no` 自動填入指定 COM slot），與本次
+    要修的「明確裝置被搶走」不是同一件事，收窄修復範圍避免波及該功能。
+  - **文件**：`README.md` 新增「範例：debug probe（如 TI XDS110）passthrough explicit
+    target」小節，附可直接套用的 profile 範例，並記錄兩個 bench 排查坑：探棒韌體版本
+    內嵌在 by-id 字串裡（升級韌體後綁定會安靜失效）、UART baud 常非模板預設的
+    115200（本例實測 921600）。
+  
+  **regression-case 評估**：`tests/test_explicit_target_device_ownership.py` 新增兩個
+  pytest（重建 restart 情境本身、驗證結果與 profile 傳入順序無關），修復前皆可重現地
+  FAIL、修復後 PASS；純 in-process session-state 邏輯，unit/mock 已完整覆蓋，不需另加
+  `regression/`（TestPilot real-hw）case。
+- WAL 檔案不存在時不再靜默回 `ok:true` ＋ 空陣列；daemon 會自癒重建被刪掉的 WAL 目錄。
+  
+  - **事故**：daemon 同一 PID 連續運行六天，`log tail-raw` / `log tail-text` /
+    `wal export` 全部回 `ok:true` ＋ 空陣列 ＋ rc=0，而 `current_seq` 已累加到
+    1,261,000——WAL 目錄被外部工具 rmtree 掉了（testpilot 的 `clean_wal()`，已於
+    hamanpaul/testpilot-core#36 追蹤），服務對此毫無所覺、也不告訴任何人。該 bench
+    六天的 console 紀錄因此無法回溯，兩輪事故取證落空。`doctor` 的 `wal_dir` 檢查
+    當時回的是 ok:true——它只比對 shell/daemon 的 WAL_DIR 是否一致並印出路徑，
+    **從不檢查該路徑是否存在**。
+  - **機制修正**：issue 原文推測是「daemon 對著已 unlink 的 fd 續寫」。實際不是——
+    `append()` 每筆都重新 `open(path, "a")`，被刪掉的是**整個目錄**，於是每次 append
+    都以 `FileNotFoundError` 失敗、被既有的 `except OSError` best-effort 分支吞掉
+    （#79 STA-1 的「稽核寫入失敗不得讓 RX thread 崩潰」），而 `_seq` 照常累加。
+    告警確實有發，但走 `logging` 而沒有任何 log 落地（正是 #171 的論點）。
+  - **自癒**：`append()` 撞到 `OSError` 時先 `os.makedirs(wal_dir, exist_ok=True)`
+    並重試一次；成功即續寫並告警（記 `recreated_count`），重試仍失敗才維持既有的
+    best-effort 標 loss 行為（記 `write_failures` / `last_write_error`）。因為每筆
+    append 都重開檔，目錄被刪之後**下一筆寫入**就會偵測到並修好，不需要另開週期性
+    自檢執行緒。
+  - **讀取路徑誠實化**：`WalWriter.health()` 攤開 `wal_dir` / `wal_path` /
+    `wal_dir_exists` / `wal_file_exists` / `wal_dir_writable` / `current_seq` /
+    `write_failures` / `last_write_error` / `recreated_count` / `healthy`。
+    `log.tail_raw` / `log.tail_text` / `wal.range`（＝`serialwrap wal export`）在
+    「`current_seq > 0` 但現行檔不存在」時回 `ok:false` ＋
+    `error_code: "WAL_MISSING"` ＋ 實際 `wal_path` ＋ 可行動 hint。
+    **`current_seq == 0` 不誤報**——全新 daemon 尚無 UART 流量時檔案本來就還沒建立。
+    成功路徑也一律帶 `wal_path` / `wal_file_exists`，讓呼叫端分辨「查得到但沒有符合
+    的紀錄」與「稽核檔案不見了」。
+  - **輪替可分辨**：`wal.range` 另回 `available_from_seq`（現行檔最小 seq）與
+    `rotated_out`（請求區間是否落在已輪替掉的範圍），使「這個區間本來就沒有紀錄」與
+    「曾經存在但已被 rotate 掉」不再都只是空陣列。
+  - **`doctor` 新增 `wal_writable` 檢查**（消費 `health.status` 新增的 `wal` 欄位）：
+    實際驗證目錄存在且可寫，**非 advisory**——稽核紀錄整個消失必須拉低 doctor 整體
+    ok。既有 `wal_dir`（shell/daemon 一致性）維持 advisory WARN，兩者各司其職。
+    `tests/test_doctor.py` 的兩份 pinned 清單同步更新。
+  
+  **契約變更**：WAL 檔案缺失時三條讀取路徑由 `ok:true` 改為 `ok:false` ＋
+  `WAL_MISSING`。這是本 issue 的核心訴求（先前的靜默成功正是讓事故延續六天的原因）。
+  只讀 `records` / `lines` 的呼叫端行為不變（仍是空的）；檢查 `ok` 的呼叫端會開始看到
+  失敗——那正是期望的行為。
+  
+  **regression-case 評估**：新增 `tests/test_wal_missing_detection.py`（19 個 pytest，
+  修復前 18 個可重現地 FAIL）——涵蓋 health 欄位、rmtree 後自癒重建並告警、重建後可再
+  讀、重建失敗時標 loss 且不崩、`available_from_seq`、三條讀取路徑回 `WAL_MISSING`、
+  全新 daemon 不誤報、成功路徑帶 `wal_path`/`wal_file_exists`、`rotated_out` 判定、
+  `health.status` 暴露 wal 健康，以及 doctor `wal_writable` 的四種情形與非 advisory
+  性質。全部可用 tmpdir ＋ `shutil.rmtree` 精確模擬，**不需**新增 `regression/`
+  （TestPilot 實機）case——本修復不依賴真板時序或外部工具。
+- Session ownership 補強（#198）：
+  - 補強同一 session 的 foreground/file transfer admission 與 operation
+    epoch cleanup；競爭 writer 會以 `SESSION_BUSY` 拒絕且不產生 UART TX，舊
+    bridge callback 不會清除新 epoch 的 busy 狀態。
+  - 操作期間的新 POSIX／TCP human console 延後取得 raw ownership；raw write 在
+    實際寫入前重驗 admission，已接收輸入進 bounded deferred buffer。收尾在
+    manager lock 外回放，保留 agent interactive 接管與 FLASHING 優先丟棄政策。
+- #198 補充 review fix：未知 `SERIALWRAP_LOG_LEVEL` 安靜回退 `WARNING`，數字值固定最多
+  4300 位（不計合法負號），超限不受 Python 整數字串轉換限制設定影響；`setup` 的既有
+  `health.ping`／`mcu.status` RPC 接入 CLI trace 且保留原 probe 順序、timeout、best-effort
+  與 `FLASHING_BUSY` 行為；F7 對明確 `CHECKSUM_MISMATCH` 回報
+  `FAIL/test/binary_roundtrip_mismatch`，不再被工具探測結果降為環境 `SKIP`。
+  `rpc_call()` 的 trace sink 例外也採 best-effort，不覆蓋既有 RPC 結果或重試／enrich 行為。
+- 修復 `SessionManager._probe_external_holder` 在非 POSIX 或 Windows 環境下因 `os.stat` 結果缺乏 `st_rdev` 屬性而拋出 `AttributeError` 的問題。
+  
+  - **根因**：`_probe_external_holder` 直接存取 `os.stat(real_path).st_rdev` 與 `os.stat(fd_path).st_rdev`，原僅以 `try ... except OSError` 包裹。在非 POSIX / Windows 等缺少 `st_rdev` 屬性的環境下，直接存取會引發未捕獲的 `AttributeError`，中斷 holder 探測與狀態判斷。
+  - **修法**：兩處皆改以 `getattr(..., "st_rdev", 0)` 防禦性取得。若值為 `0`，依契約不視為裝置同一性證據（由既有 `if not matched and target_rdev:` 排除），避免跨裝置誤配；同 path 字串比對及正常 POSIX char-device 裝置比對維持原有邏輯。
+  - **測試與邊界**：新增 `tests/test_holder_probe_portability.py`，驗證 endpoint 缺 `st_rdev`、fd 缺 `st_rdev`、正常 POSIX `st_rdev` 匹配、不同 `st_rdev` 不誤判、同 path 匹配、`rdev=0` 不誤判、無 `/proc` 安全回傳空結果等情境。
+  - **regression-case 評估**：本變更屬 in-process 平台相容屬性存取，pytest 邊界測試已完整覆蓋；真實 Windows 序列埠與外部 flasher 斷線為既有實機回歸項目，本輪不假稱實機通過，無需新增 `regression/` 案例。
+- Windows（nt）上 `wal reset` 與 WAL 大小輪替不再對目錄做 POSIX fsync：`os.open(<dir>)` 在 Windows
+  會拋 Permission denied，導致 `wal.reset` RPC 回 EXCEPTION（檔案已輪替但 seq 未歸零）、
+  每次輪替誤記「WAL 輪替失敗」警告。兩處抽成 `_fsync_dir()`，nt 跳過（比照 session_manager
+  #84 PORT-4 守衛），POSIX 行為不變。
+
 ## [0.3.1] - 2026-08-11
 
 ### Fixed

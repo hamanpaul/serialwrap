@@ -8,7 +8,7 @@
 
 已完成本 worktree 的 ownership admission 與 operation/epoch cleanup 實作及
 pytest 驗證；尚未包含真機 UART、live daemon、merge 或部署驗證。root 整合時需
-保留本文件與 `changelog.d/198-ownership.md`，並將共享
+保留本文件與 #198 的 changelog fragment（已於 v0.3.2 收斂進 `CHANGELOG.md`），並將共享
 `sw_core/session_manager.py` 與其他 task 逐 hunk 合併。
 
 ## 修復內容
