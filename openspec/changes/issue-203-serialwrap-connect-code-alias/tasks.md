@@ -20,9 +20,10 @@ work_item: issue-203-serialwrap-connect-code-alias
 
 ## 3. tools 佈署腳本（provider-specific）
 
-- [ ] 3.1 `tools/bench-issue.sh <code>`：`tunnel create`/`route dns`/產 config/打包 `handoff/<code>/`/寫 benches.yaml；domain 由 env/參數、未提供即非零退出。shellcheck 乾淨。
-- [ ] 3.2 `tools/bench-enroll.sh --bundle <dir>`：cloudflared 安裝（`NEEDRESTART_SUSPEND=1`）→ `/etc/cloudflared/` 放置 → `--config` service install → sshd 金鑰限定（reload）→ 追加 host 公鑰 → 跑 CP-1/CP-2 印結果；失敗非零退出；不動既有 serialwrap 設定。shellcheck 乾淨。
-- [ ] 3.3 加輕量測試：以 `--help`/dry-run 模式覆蓋參數解析與檢查點分支（pytest 包裝呼叫，不需實機）。
+- [x] 3.0 寫 RED regression test `tests/test_bench_tools_cli.py`：鎖定 `tools/bench-issue.sh` / `tools/bench-enroll.sh` 的基本 CLI 契約（`--help` 與必要輸入 guard）；目前腳本缺失／契約未落地時應合理 RED。
+- [x] 3.1 `tools/bench-issue.sh <code>`：`tunnel create`/`route dns`/產 config/打包 `handoff/<code>/`/寫 benches.yaml；domain 由 env/參數、未提供即非零退出。shellcheck 乾淨。
+- [x] 3.2 `tools/bench-enroll.sh --bundle <dir>`：cloudflared 安裝（`NEEDRESTART_SUSPEND=1`）→ `/etc/cloudflared/` 放置 → `--config` service install → sshd 金鑰限定（reload）→ 追加 host 公鑰 → 跑 CP-1/CP-2 印結果；失敗非零退出；不動既有 serialwrap 設定。shellcheck 乾淨。
+- [x] 3.3 加輕量測試：以 `--help`/dry-run 模式覆蓋參數解析與檢查點分支（pytest 包裝呼叫，不需實機）。
 
 ## 4. 文件與對外契約
 
