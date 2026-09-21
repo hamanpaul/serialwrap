@@ -1025,6 +1025,68 @@ than restarts sshd, so an ssh session running the script does not cut itself
 off; it does not modify any existing serialwrap configuration. Both scripts take
 `--dry-run` and `--help`.
 
+#### New bench deployment checklist
+
+The material above is organised by concept; this is the same thing as an
+operational checklist for "I have a new machine with a UART on it".
+
+**Once per domain — not per bench.** The account-level credential stays on the
+management machine and is never handed to a bench.
+
+- [ ] The domain is in your Cloudflare account.
+- [ ] `cloudflared tunnel login` has been run once on the management machine, and
+      `~/.cloudflared/cert.pem` exists. In the browser you must **select the zone
+      and click Authorize**; signing in alone leaves cloudflared printing
+      `Waiting for login...` forever and no cert appears.
+- [ ] The controller has an ssh keypair for benches
+      (e.g. `~/.ssh/id_ed25519_serialwrap_bench`).
+
+**On the new bench, before the scripts run.** None of this is automated — the
+enroll script assumes it.
+
+- [ ] Linux with `sshd` running, and outbound 443/TCP plus QUIC/UDP allowed.
+- [ ] serialwrap installed and already seeing the UARTs: `serialwrap session list`
+      shows the COMs as `READY` locally.
+- [ ] The login user is in the group that owns the daemon socket (`dialout` by
+      default; the socket is `0660`). If this is wrong the tunnel still comes up
+      but readiness stays at `starting`.
+- [ ] `sudo` available for the enroll script.
+- [ ] **Note the real socket path**: `grep socket_path ~/.config/serialwrap/config.yaml`.
+      The issue script defaults to `/run/serialwrap/serialwrapd.sock` (the
+      systemd-system location); an `on-demand` bench uses
+      `/tmp/serialwrap/serialwrapd.sock` and you must pass `--remote-socket`.
+- [ ] **Decide the supervision mode now.** Under `on-demand` there is no systemd
+      unit and the socket lives in `/tmp`, so after a reboot the tunnel returns
+      but `serialwrapd` does not — the endpoint stays `SOCKET_ERROR` until
+      someone starts it by hand. If the bench must recover unattended, install it
+      in a systemd supervision mode.
+
+**Three commands.**
+
+- [ ] Management side: `tools/bench-issue.sh --domain <domain> <code>` →
+      creates the tunnel, routes DNS, writes `handoff/<code>/`, adds the
+      `benches.yaml` entry.
+- [ ] Hand `handoff/<code>/` to the bench over a channel you trust (it contains
+      that tunnel's credentials).
+- [ ] Bench side: `sudo tools/bench-enroll.sh --bundle <dir>` → installs
+      cloudflared, deploys `/etc/cloudflared`, installs the service, forces
+      key-only sshd, appends the controller key, then verifies **CP-1**
+      (`Registered tunnel connection` in the journal) and **CP-2** (self-ssh
+      through the tunnel). Non-zero exit if either fails.
+
+**Confirm from the controller.**
+
+- [ ] `serialwrap connect <code>` → `status: active`
+- [ ] `serialwrap --bench <code> session list` → the COMs are `READY`
+- [ ] `serialwrap --bench <code> cmd submit --selector COM0 --cmd "uname -a" --source agent:me`
+      → `status: done` with real UART output
+
+**One trap worth repeating.** If this bench already runs a Named Tunnel, never
+run a bare `cloudflared tunnel --url …` on it: it inherits
+`/etc/cloudflared/config.yml` and becomes a second connector for your production
+tunnel, splitting that hostname's traffic. Use `--config` with an empty file, as
+in Route A above.
+
 #### Tunnel management
 
 ```bash
@@ -2725,6 +2787,39 @@ sudo tools/bench-enroll.sh --bundle /path/to/handoff/eit-test
 `bench-issue.sh` 需要 domain（`--domain`，或 `BENCH_ISSUE_DOMAIN`／`SERIALWRAP_BENCH_DOMAIN`），沒給就非零退出。它會產出 `handoff/<code>/`，內含 tunnel 憑證、`config.yml` 與 controller 公鑰——用你信任的管道把這個目錄交給 bench，bench 端就**不需要瀏覽器登入、也拿不到你帳號層級的 `cert.pem`**。
 
 `bench-enroll.sh` 結束前跑兩個檢查點，任一不成立即非零退出：**CP-1** cloudflared journal 出現 `Registered tunnel connection`、**CP-2** 經隧道 self-ssh 成功。它只碰自己的 sshd drop-in（`sshd_config.d/serialwrap-bench-key-only.conf`），而且是 **reload 不是 restart**，所以正在跑這支腳本的那條 ssh 不會把自己切斷；它也不會改動任何既有的 serialwrap 設定。兩支都支援 `--dry-run` 與 `--help`。
+
+### 新 bench 佈署檢查清單
+
+上面幾節是按概念組織的；這一節是同一件事的操作版——「我手上有一台新機器、上面掛著 UART」要做什麼。
+
+**每個網域一次，不是每台一次。** 帳號級憑證只留在管理端，永遠不交給任何 bench。
+
+- [ ] 網域已掛在你的 Cloudflare 帳號下。
+- [ ] 管理端跑過一次 `cloudflared tunnel login`，且 `~/.cloudflared/cert.pem` 已存在。瀏覽器那一步**必須選 zone 再按 Authorize**；只登入帳號的話 cloudflared 會一直印 `Waiting for login...`、cert 不會落地。
+- [ ] controller 有一組給 bench 用的 ssh 金鑰對（例如 `~/.ssh/id_ed25519_serialwrap_bench`）。
+
+**新 bench 在跑腳本之前要先具備的。** 這些腳本都不做，是 enroll 的前提。
+
+- [ ] Linux、`sshd` 有跑，且可對外出站 443/TCP 與 QUIC/UDP。
+- [ ] serialwrap 已安裝且認得到 UART：在 bench 本機 `serialwrap session list` 看得到 COM 為 `READY`。
+- [ ] 登入帳號在擁有 daemon socket 的群組內（預設 `dialout`；socket 為 `0660`）。這項不對的話隧道還是建得起來，但 readiness 會停在 `starting`。
+- [ ] 有 `sudo` 可供 enroll 腳本使用。
+- [ ] **先確認真正的 socket 路徑**：`grep socket_path ~/.config/serialwrap/config.yaml`。issue 腳本預設寫 `/run/serialwrap/serialwrapd.sock`（systemd-system 的位置）；`on-demand` 的 bench 實際是 `/tmp/serialwrap/serialwrapd.sock`，必須自己帶 `--remote-socket`。
+- [ ] **監管模式現在就決定。** `on-demand` 沒有 systemd unit、socket 在 `/tmp`，所以重開機後隧道會回來、但 `serialwrapd` 不會——endpoint 會一直是 `SOCKET_ERROR`，直到有人手動起它。若這台 bench 需要無人值守自動恢復，安裝時就要選 systemd 監管模式。
+
+**三條指令。**
+
+- [ ] 管理端：`tools/bench-issue.sh --domain <網域> <code>` → 建 tunnel、設 DNS、產 `handoff/<code>/`、寫入 `benches.yaml` 條目。
+- [ ] 用你信任的管道把 `handoff/<code>/` 交給 bench（裡面是那條 tunnel 的憑證）。
+- [ ] bench 端：`sudo tools/bench-enroll.sh --bundle <dir>` → 裝 cloudflared、佈署 `/etc/cloudflared`、裝服務、sshd 改金鑰限定、追加 controller 公鑰，最後驗 **CP-1**（journal 出現 `Registered tunnel connection`）與 **CP-2**（經隧道 self-ssh）。任一不成立即非零退出。
+
+**回到 controller 驗收。**
+
+- [ ] `serialwrap connect <code>` → `status: active`
+- [ ] `serialwrap --bench <code> session list` → 各 COM 為 `READY`
+- [ ] `serialwrap --bench <code> cmd submit --selector COM0 --cmd "uname -a" --source agent:me` → `status: done` 且拿到真實 UART 輸出
+
+**一個值得再講一次的陷阱。** 這台 bench 若已經在跑 Named Tunnel，**絕對不要**在它上面裸跑 `cloudflared tunnel --url …`：它會沿用 `/etc/cloudflared/config.yml`，變成你那條 production tunnel 的第二個 connector，把該 hostname 的流量分走。要用 `--config` 指向空檔，作法見上面的路線 A。
 
 ### 隧道管理
 
