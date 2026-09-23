@@ -30,4 +30,3 @@ scope: setup
   （另 2 個既有失敗與 pyserial/minicom 環境相依，與本次改動無關，非
   新增迴歸）；已手動重現「`config.yaml` 設好遠端 endpoint 後重跑
   `serialwrap setup --on-demand`」情境，確認 `socket_path` 不再被覆寫。
-  修正 policy checklist
