@@ -1730,7 +1730,38 @@ def _run_setup(args: argparse.Namespace) -> int:
         return 0
 
     # 6. 有效 socket：systemd-system 走系統固定 socket，其餘走使用者 XDG 預設（Codex #1a/#1b）。
-    effective_socket = SYSTEM_SOCKET if target == "systemd-system" else SOCKET_PATH
+    # 例外（#222）：POSIX（非 win backend）上，setup 自然算出的本機預設
+    # （SOCKET_PATH／SYSTEM_SOCKET）永遠是檔案路徑，絕不會是 tcp://；若使用者
+    # 未顯式帶 --socket/--endpoint，而 config.yaml 既有 socket_path 已是
+    # tcp:// endpoint（不論是否 loopback——reverse SSH tunnel 的本質正是把
+    # 遠端 daemon 映成本機 loopback 位址，不能用「是否 loopback」排除這個
+    # 案例），必然是使用者手動指向遠端 daemon，應保留原值、不強制改回本機
+    # 預設——否則每次 setup／install.sh 都會把使用者的遠端拓樸設定悄悄打回
+    # 本機路徑，導致後續指令連到一個根本沒有 daemon 監聽的本機 socket
+    # （SOCKET_ERROR）。systemd-system 模式仍固定走系統 socket；win backend
+    # 上本機預設本就是 tcp://，不套用此例外（該情境不是本 bug 的成因，維持
+    # 原有可隨埠號環境變數變動的行為）。
+    preserved_remote_socket: str | None = None
+    if (
+        target != "systemd-system"
+        and not _rpc_backend_is_win()
+        and not args.socket
+        and not getattr(args, "endpoint", None)
+    ):
+        existing_rc = _safe_runtime_config()
+        existing_socket = existing_rc.socket_path() if existing_rc is not None else None
+        if isinstance(existing_socket, str) and existing_socket:
+            try:
+                transport, _address = _parse_endpoint(existing_socket)
+            except ValueError:
+                transport = None
+            if transport == "tcp":
+                preserved_remote_socket = existing_socket
+    effective_socket = (
+        preserved_remote_socket
+        if preserved_remote_socket is not None
+        else (SYSTEM_SOCKET if target == "systemd-system" else SOCKET_PATH)
+    )
 
     # 7. reconcile（先停舊、再起新）；flash 進行中除非 force 否則拒絕。
     try:
