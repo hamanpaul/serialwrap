@@ -94,6 +94,7 @@ policy_version: 1.0.17
 | `policy-exempt:issue-link` | 免 PR↔issue closing-keyword（R-17）|
 | `policy-exempt:docs-sync` | 免 docs/README 對齊（R-18，WARN）|
 | `policy-exempt:doc-reference` | 免 doc 懸空引用（R-22）|
+| `policy-exempt:branch-name` | 免分支命名慣例（R-12；`fix/` / `hotfix/` 等非 `feature/` 前綴分支合入 `main` 時使用；CI workflow 對 `fix/*` 自動注入此豁免）|
 | `release:<version>` | 免 VERSION↔最新 tag 一致（R-07；release PR 於 tag 建立前）|
 
 ## 語言政策
