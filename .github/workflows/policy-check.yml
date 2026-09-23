@@ -8,6 +8,6 @@ jobs:
   policy:
     uses: hamanpaul/paulsha-conventions/.github/workflows/reusable-policy-check.yml@9e7fabbf0b5eea9ad933fa6798764b723934a0b7 # v1.0.17
     with:
-      policy_profile: flat
+      policy_profile: "flat"
       policy_version: "1.0.17"
-      policy_engine_ref: 9e7fabbf0b5eea9ad933fa6798764b723934a0b7
+      policy_engine_ref: "9e7fabbf0b5eea9ad933fa6798764b723934a0b7"
