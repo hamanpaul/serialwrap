@@ -33,11 +33,13 @@ jobs:
 
       - name: Compute effective labels
         id: labels
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
         run: |
           # CLAUDE.md 允許 fix/ 前綴分支，自動補上 policy-exempt:branch-name 豁免 R-12
-          LABELS="${{ join(github.event.pull_request.labels.*.name, ',') }}"
-          HEAD="${{ github.head_ref }}"
-          if [[ "$HEAD" == fix/* || "$HEAD" == hotfix/* ]]; then
+          LABELS="$PR_LABELS"
+          if [[ "$HEAD_REF" == fix/* || "$HEAD_REF" == hotfix/* ]]; then
             if [[ -n "$LABELS" ]]; then
               LABELS="$LABELS,policy-exempt:branch-name"
             else
