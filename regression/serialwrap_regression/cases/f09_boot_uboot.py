@@ -1,7 +1,8 @@
 """F9 開機時序與 U-Boot 保護（#69 #130 #139 #44 #14 #20）——全 destructive，收尾必回 READY。
 
-五個 case 都固定操作 COM0（bench 事實：prpl 板、U-Boot 2024.04、autoboot 窗實測 3
-秒）；COM1（bcm）的 U-Boot 具備性未確認，本檔暫不涉及。每個 case 的收尾都必須呼叫
+本檔 case 都固定操作 COM0（bench 事實：prpl 板、U-Boot 2024.04、autoboot 窗實測 3
+秒）；COM1（bcm）的 U-Boot 具備性未確認，#224 BRCM 登入回歸另見
+``f09_brcm_reboot_login.py``。每個 case 的收尾都必須呼叫
 ``guards.ensure_ready``——任何路徑都不得把板子留在 U-Boot 或非 READY 狀態就結束。
 """
 from __future__ import annotations
