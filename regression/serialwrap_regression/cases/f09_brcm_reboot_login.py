@@ -47,9 +47,11 @@ def _wal_markers(ctx: Any, com: str, start_seq: int) -> tuple[set[str], list[str
     for _ in range(20):
         page = ctx.sw.run("log", "tail-raw", "--selector", com,
                           "--from-seq", str(cursor), "--limit", "200")
-        if not page.get("ok") or page.get("truncated"):
-            return seen, timeline, "wal_unavailable_or_truncated"
+        if not page.get("ok") or not page.get("wal_file_exists", True):
+            return seen, timeline, "wal_unavailable"
         records = page.get("records") or []
+        if not records and page.get("truncated"):
+            return seen, timeline, "wal_page_stalled"
         for rec in records:
             try:
                 payload = base64.b64decode(rec.get("payload_b64") or "", validate=True)
@@ -69,7 +71,9 @@ def _wal_markers(ctx: Any, com: str, start_seq: int) -> tuple[set[str], list[str
                 seen.add(tag)
                 timeline.append(f"seq={rec.get('seq')} {tag}")
             cursor = max(cursor, int(rec.get("seq") or cursor))
-        if len(records) < 200 or cursor >= int(page.get("current_seq") or 0):
+        # range 模式的 truncated=True 表示後面「還有」紀錄，必須翻下一頁；
+        # 不是 WAL 內容遺失（#124）。
+        if not page.get("truncated"):
             return seen, timeline, None
     return seen, timeline, "wal_page_limit"
 

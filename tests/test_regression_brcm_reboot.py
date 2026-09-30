@@ -93,8 +93,23 @@ def test_brcm_reboot_case_skips_when_spaced_prompt_not_exercised(monkeypatch):
     assert result.reason_code == "spaced_prompt_not_observed"
 
 
-def test_wal_markers_rejects_truncated_history():
+def test_wal_markers_pages_through_truncated_range():
+    pages = iter([
+        {"ok": True, "truncated": True, "records": [
+            _record(11, "RX", b"\r\n > "), _record(12, "TX", b"sh\n")]},
+        {"ok": True, "truncated": False, "records": [
+            _record(13, "TX", b"echo __READY__abc123\n"),
+            _record(14, "RX", b"__READY__abc123\r\n# ")]},
+    ])
+    ctx = SimpleNamespace(sw=SimpleNamespace(run=lambda *_args: next(pages)))
+    marks, timeline, error = case._wal_markers(ctx, "COM1", 10)
+    assert error is None
+    assert len(timeline) == 4
+    assert marks == {"spaced_bdk_prompt", "post_login_sh", "ready_probe_tx", "ready_probe_rx"}
+
+
+def test_wal_markers_rejects_missing_wal():
     ctx = SimpleNamespace(sw=SimpleNamespace(run=lambda *_args: {
-        "ok": True, "truncated": True, "records": []}))
+        "ok": False, "error_code": "WAL_MISSING", "records": []}))
     _marks, _timeline, error = case._wal_markers(ctx, "COM1", 10)
-    assert error == "wal_unavailable_or_truncated"
+    assert error == "wal_unavailable"

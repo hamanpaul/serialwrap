@@ -18,6 +18,7 @@ testpilot run serialwrap_regression --case f3-fail-error-code  # 單一 case
 - **何時跑**：改動 sw_core／daemon 行為後（非破壞集，分鐘級）；發版前（含 destructive 全跑）。
 - **報告**：`~/b-log/regression-reports/tp-<ts>/report.md`／`report.json`，每條列 family、對應 issues、分類與 evidence 連結。
 - **bench 互斥**：與 reliability／wifi_llapi 共用 benchlock（`~/.local/state/serialwrap/bench.lock`），他者持鎖即整場拒跑。
+- **Windows 限定執行**：Windows 的 TestPilot venv 可 `pip install --no-deps -e regression/`；於 `regression/serialwrap_regression/testbed.yaml` 指定已安裝、與 daemon 同版的 `serialwrap_exe`、`platform: bcm` STA 及 `allow_destructive: true`，再跑 `testpilot run serialwrap_regression --case f9-brcm-spaced-prompt-reboot-login`。Windows preflight 檢查 daemon／doctor／WAL／板卡 READY／版本及 benchlock；其餘依賴 tmux/minicom/PTY 的 case 在 Windows 記 SKIP，不當作可執行。此 case 會重開 STA，測後仍須確認 READY。#224 的 WAL range 模式 `truncated=true` 代表**還有下一頁**，不是紀錄遺失。
 - **背景啟動注意**：preflight 的外部 testpilot 偵測用 `pgrep -af 'testpilot ru[n]'`——若你的包裝行程（如 `bash -c "... testpilot run ..."`）cmdline 含該字面字串會**自我匹配拒跑**；背景跑請用不含該字串的 launcher script（首輪實測實證）。
 
 ## testbed 組態

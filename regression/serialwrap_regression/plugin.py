@@ -6,6 +6,7 @@ remediation enabled:true 僅作 FailureSnapshot 通道；retry.max_attempts=1。
 from __future__ import annotations
 
 import datetime as dt
+import os
 import shutil
 import subprocess
 import time
@@ -121,6 +122,8 @@ class Plugin(PluginBase):
             self._broken_by,
             allow_destructive=bool(self._load_cfg().get("allow_destructive")),
         )
+        if os.name == "nt" and case_id != "f9-brcm-spaced-prompt-reboot-login":
+            skip = ("windows_case_unsupported", "此 case 依賴 POSIX 工具／裝置，Windows 只支援 BRCM reboot case")
         if skip is not None:
             reason_code, comment = skip
             result = core.make_skip_result(reason_code, comment)
@@ -167,11 +170,14 @@ class Plugin(PluginBase):
 
     def verify_install(self) -> list[tuple[bool, str]]:
         checks: list[tuple[bool, str]] = [
-            (shutil.which("tmux") is not None, "tmux 可用"),
-            (shutil.which("minicom") is not None, "minicom 可用"),
             ((self._plugin_root() / "agent-config.yaml").is_file(), "agent-config.yaml 存在"),
             ((self._plugin_root() / "testbed.yaml.example").is_file(), "testbed.yaml.example 存在"),
         ]
+        if os.name != "nt":
+            checks.extend([
+                (shutil.which("tmux") is not None, "tmux 可用"),
+                (shutil.which("minicom") is not None, "minicom 可用"),
+            ])
         try:
             cfg = self._load_cfg()
             exe = Path(str(cfg.get("serialwrap_exe", "")))
