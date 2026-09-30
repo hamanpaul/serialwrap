@@ -202,6 +202,10 @@ def recover_boards(ctx: Any, boards: list[str], *, ready_timeout_s: float = 60.0
 def sweep_tmux(prefix: str) -> list[str]:
     """掃掉殘留 tmux session（收尾）。"""
     import subprocess
+    import shutil
+
+    if shutil.which("tmux") is None:
+        return []
 
     cp = subprocess.run(["tmux", "ls", "-F", "#{session_name}"], capture_output=True, text=True)
     killed: list[str] = []

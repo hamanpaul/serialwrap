@@ -103,7 +103,8 @@ def remote_state_dir(env: dict[str, str] | None = None) -> Path:
 
 
 def _run(argv: list[str], timeout: float = 30.0) -> subprocess.CompletedProcess:
-    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    return subprocess.run(argv, capture_output=True, text=True, encoding="utf-8",
+                          errors="replace", timeout=timeout)
 
 
 class SwCli:
