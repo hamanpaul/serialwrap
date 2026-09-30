@@ -115,6 +115,11 @@ sudo usermod -aG dialout "$USER"
 On WSL, enable systemd in `/etc/wsl.conf` and run `wsl --shutdown`; otherwise
 `serialwrap setup` falls back to on-demand daemon supervision.
 
+For an existing on-demand TCP client, use `serialwrap setup --on-demand` or
+`./install.sh --on-demand` to preserve its configured endpoint. Automatic
+setup may select systemd and change supervision modes; see the
+[scope and limitations](docs/setup-tcp-endpoint.md).
+
 ### Quick Start
 
 ```bash
@@ -1556,6 +1561,7 @@ serialwrap doctor    # 驗證環境
 - **human console 用 `serialwrap-minicom COM0`（`serialwrap setup` 已自動物化到 `~/.local/bin`），不要直接 `minicom -D /dev/ttyUSBx`**（會與 daemon 搶 tty，two-reader）。
 - WSL 啟用 systemd：於 `/etc/wsl.conf` 設 `[boot]\nsystemd=true` 後 `wsl --shutdown`（否則 `serialwrap setup` 退回 on-demand）。
 - 本機開發安裝：`./install.sh`（= `pipx install <repo>` + `serialwrap setup`）。
+- 既有 on-demand TCP 客戶端請用 `serialwrap setup --on-demand` 或 `./install.sh --on-demand` 保存 endpoint；auto 安裝可能切換至 systemd，詳見[適用範圍與限制](docs/setup-tcp-endpoint.md)。
 
 ```bash
 # 啟動 daemon 後快速驗證
@@ -2964,6 +2970,7 @@ serialwrap doctor    # 驗證環境
 - **human console 用 `serialwrap-minicom COM0`（`serialwrap setup` 已自動物化到 `~/.local/bin`），不要直接 `minicom -D /dev/ttyUSBx`**（會與 daemon 搶 tty，two-reader）。
 - WSL 啟用 systemd：於 `/etc/wsl.conf` 設 `[boot]\nsystemd=true` 後 `wsl --shutdown`（否則 `serialwrap setup` 退回 on-demand）。
 - 本機開發安裝：`./install.sh`（= `pipx install <repo>` + `serialwrap setup`）。
+- 既有 on-demand TCP 客戶端請用 `serialwrap setup --on-demand` 或 `./install.sh --on-demand` 保存 endpoint；auto 安裝可能切換至 systemd，詳見[適用範圍與限制](docs/setup-tcp-endpoint.md)。
 
 依賴：Python 3.10+（`pipx install` 自動帶入 `pyyaml`）；human console 路徑另需 `jq` 與 `minicom`。
 

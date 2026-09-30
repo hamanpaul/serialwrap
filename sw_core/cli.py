@@ -1730,22 +1730,17 @@ def _run_setup(args: argparse.Namespace) -> int:
         return 0
 
     # 6. 有效 socket：systemd-system 走系統固定 socket，其餘走使用者 XDG 預設（Codex #1a/#1b）。
-    # 例外（#222）：POSIX（非 win backend）上，setup 自然算出的本機預設
-    # （SOCKET_PATH／SYSTEM_SOCKET）永遠是檔案路徑，絕不會是 tcp://；若使用者
-    # 未顯式帶 --socket/--endpoint，而 config.yaml 既有 socket_path 已是
-    # tcp:// endpoint（不論是否 loopback——reverse SSH tunnel 的本質正是把
-    # 遠端 daemon 映成本機 loopback 位址，不能用「是否 loopback」排除這個
-    # 案例），必然是使用者手動指向遠端 daemon，應保留原值、不強制改回本機
-    # 預設——否則每次 setup／install.sh 都會把使用者的遠端拓樸設定悄悄打回
-    # 本機路徑，導致後續指令連到一個根本沒有 daemon 監聽的本機 socket
-    # （SOCKET_ERROR）。systemd-system 模式仍固定走系統 socket；win backend
-    # 上本機預設本就是 tcp://，不套用此例外（該情境不是本 bug 的成因，維持
-    # 原有可隨埠號環境變數變動的行為）。
+    # on-demand 同模式刷新時保留既有有效 TCP 設定（含 loopback tunnel）。
+    # TCP 只代表已選用的連線方式，不能據此推定 daemon 的位置；不以可達性
+    # 決定是否保留，避免 tunnel 暫時斷線就丟失設定。模式轉換與 systemd 管理
+    # 本機 daemon 的流程仍走原本預設，不混用 TCP client 設定與本機 unit。
+    # win backend 的本機預設也是 TCP，本次不改其行為。顯式 endpoint 旗標
+    # 仍沿用既有 setup 契約：供探測使用，但不把參數值寫回 config。
     preserved_remote_socket: str | None = None
     if (
-        target != "systemd-system"
+        old == target == "on-demand"
         and not _rpc_backend_is_win()
-        and not args.socket
+        and args.socket is None
         and not getattr(args, "endpoint", None)
     ):
         existing_rc = _safe_runtime_config()
