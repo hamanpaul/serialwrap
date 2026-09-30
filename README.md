@@ -201,6 +201,13 @@ matching, login prompts, ready probes, credentials environment variable names,
 and UART settings. Targets may be explicit, or the daemon can auto-detect a
 template from the current UART output.
 
+The shipped `brcm-template` accepts spaces or tabs before and after BDK prompts
+such as ` > ` and ` # `, while retaining the line-start anchor and rejecting
+repeated `#`/`>` banner decorations. Existing installations must update their
+`brcm-template.prompt_regex` (check it offline with `serialwrap profile test`)
+and reload the daemon; a package upgrade does not update an already loaded
+session's profile.
+
 Profile selection precedence:
 
 ```text
@@ -1690,7 +1697,8 @@ profiles:
     platform: bcm
     # #174：錨定行首＋排除連續 '#'/'>' 裝飾線（BDK login banner 的 "#####" 分隔行
     # 與 CEVENT 洪流都不會誤配成 prompt）。可用 `serialwrap profile test` 離線驗證。
-    prompt_regex: "(?m)^(?:.*[^>#\\s])?[>#][ \\t]*$"
+    # #224：接受裸提示符前的水平空白（如 " > "），仍排除連續 '#'/'>' 裝飾線。
+    prompt_regex: "(?m)^(?:[ \\t]*|.*[^>#\\s])[>#][ \\t]*$"
     login_regex: "(?mi)login:\\s*$"  # 勿錨定行首：getty 是 "<hostname> login: "（#174）
     password_regex: "(?mi)password:\\s*$"
     post_login_cmd: "sh"         # 登入後自動執行，從 BCM shell (>) 切到 Linux shell (#)
@@ -1735,6 +1743,8 @@ profiles:
 `op3-template` 沿用 generic shell login 模型，適合 Orange Pi / Debian shell。`user_env` / `pass_env` 是每個 profile 自己指定的登入帳密環境變數名稱。CLI / daemon 不會把密碼寫進 YAML 或 WAL。`env_file` 指向同目錄 env 檔，帳密在每次 session attach 時**per-session 解析**，不會污染 daemon 全域環境。不同 COM 可以用不同的 `env_file`，達到 per-session 帳密隔離。
 
 `brcm-template` 用於 Broadcom 原生平台（如 BCM968575）。登入後 target 進入 BCM CLI shell（提示符 `>`），需要再執行 `sh` 才會進到 Linux shell（`#`）。`post_login_cmd: "sh"` 讓 daemon 在成功登入後自動送出此命令，完成兩階段切換。`timeout_s: 15` 因為 Broadcom 登入流程較慢而加長。
+
+提示符前後可以有 space／tab，例如 ` > ` 與 ` # `；`prompt_regex` 保留行首錨定並排除連續 `#`／`>` 的 banner 裝飾線。已有 profile 的安裝需同步更新其 `brcm-template.prompt_regex`（可用 `serialwrap profile test` 離線驗證），並在 daemon 重新載入後才會生效；只更新套件不會讓已載入的 session 自動採用新設定。
 
 建議把 env 檔直接放在 profile 旁邊，例如：
 
