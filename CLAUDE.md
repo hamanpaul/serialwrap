@@ -1,6 +1,6 @@
-<!-- managed-by: hamanpaul/paulsha-conventions@v1.0.17 -->
+<!-- managed-by: hamanpaul/paulsha-conventions@v1.0.18 -->
 <!-- CLAUDE.md 為單一事實來源；AGENTS.md / GEMINI.md / .github/copilot-instructions.md 為指向本檔的 symlink，只需維護本檔 -->
-policy_version: 1.0.17
+policy_version: 1.0.18
 <!-- policy_version 為 policy_check R-14 machine-readable marker；需保持裸行格式，請勿移入 frontmatter 或 code block。 -->
 
 # serialwrap — AI Agent Policy Checklist
@@ -12,6 +12,7 @@ policy_version: 1.0.17
 - **禁止直接 commit 到 `main` 分支**，所有變更必須透過 PR。
 - 跨多個子項目或長期功能開發，建議使用 `git worktree` 避免分支污染。
 - 分支命名慣例：`feature/<issue-id>-<short-desc>`、`fix/<issue-id>-<short-desc>`。
+- `.project-policy.yml` 明確設定 `branch_source.allowed_prefixes: [feature, fix]`，由 v1.0.18 的 R-12 原生驗證兩種分支；不使用自動豁免。若 PR 的 base 本身為這兩種分支，來源必須是同 slug 的 `wt/<slug>/<subtask>`。
 
 ## 變更紀錄政策
 
@@ -49,11 +50,11 @@ policy_version: 1.0.17
   ```bash
   python3 -m policy_check --repo .
   ```
-- policy engine pinned SHA：`9e7fabbf0b5eea9ad933fa6798764b723934a0b7`（v1.0.17）。
+- policy engine pinned SHA：`7539d5252159eac50e278ec2a3bcbc5189d396ab`（v1.0.18）。
 - 安裝命令：
   ```bash
   python3 -m pip install --user --disable-pip-version-check \
-    "git+https://github.com/hamanpaul/paulsha-conventions.git@9e7fabbf0b5eea9ad933fa6798764b723934a0b7"
+    "git+https://github.com/hamanpaul/paulsha-conventions.git@7539d5252159eac50e278ec2a3bcbc5189d396ab"
   ```
 
 ## Agent 檔案同步政策
@@ -67,7 +68,7 @@ policy_version: 1.0.17
     ln -sf CLAUDE.md GEMINI.md
     ln -sf ../CLAUDE.md .github/copilot-instructions.md
     ```
-- 本檔首行保留 `<!-- managed-by: hamanpaul/paulsha-conventions@v1.0.17 -->`，第 3 行保留裸行 `policy_version: 1.0.17`（R-14 machine-readable marker，勿移入 frontmatter 或 code block）。
+- 本檔首行保留 `<!-- managed-by: hamanpaul/paulsha-conventions@v1.0.18 -->`，第 3 行保留裸行 `policy_version: 1.0.18`（R-14 machine-readable marker，勿移入 frontmatter 或 code block）。
 
 ## PR 政策
 

@@ -44,7 +44,9 @@ profiles:
     # 板（CEVENT ... DRIVER -- E_RADIO/40 這類持續輸出）與 banner 裝飾線下皆會誤配
     # 成 prompt，讓 login FSM 整段跳過、把 post_login_cmd 當帳密送進 login prompt。
     # serialwrap profile test 可離線用樣本驗證本 regex。
-    prompt_regex: "(?m)^(?:.*[^>#\\s])?[>#][ \\t]*$"
+    # #224：BDK 的裸提示符可帶前導 space/tab（如 " > "）；僅接受水平空白，
+    # 不放寬連續 '#'/'>' 裝飾線，也不讓空白跨行吞掉 banner。
+    prompt_regex: "(?m)^(?:[ \\t]*|.*[^>#\\s])[>#][ \\t]*$"
     # 勿錨定行首：getty 標準格式是 "<hostname> login: "（如 "(none) login: "），
     # 行首前面帶 hostname，錨定 ^login: 會打壞這個最常見的格式（#174 S4）。
     login_regex: "(?mi)login:\\s*$"

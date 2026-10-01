@@ -14,5 +14,6 @@ POSIX backend 的 `serialwrap setup --on-demand` 在同模式刷新時保留
   socket，並非持久化旗標值。詳見 `docs/setup-tcp-endpoint.md`。
 - 原 PR 的四個新增案例改為隔離測試矩陣，補重跑冪等、一般 RPC 路由、
   斷線保存及各排除邊界；不使用真實 TCP endpoint 或系統控制指令。
-- 還原與產品修復無關的 inline policy workflow 與自動豁免說明；R-12
-  的中央 conventions 問題另行處理，本變更不繞過規則。
+- policy engine 與 PR／release reusable workflow 同步釘選正式 v1.0.18；
+  manifest 明確啟用 `branch_source.allowed_prefixes: [feature, fix]`，
+  由中央 R-12 原生驗證既有分支契約，不注入自動豁免 label。

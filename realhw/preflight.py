@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import dataclasses
-import fcntl
+try:
+    import fcntl
+except ModuleNotFoundError:  # Windows 只載入共用的 parse_version；鎖由 regression preflight 處理。
+    fcntl = None
 import json
 import os
 import re
@@ -195,6 +198,8 @@ def bench_lock_path() -> Path:
 
 
 def acquire_benchlock(lock_path: Path) -> int | None:
+    if fcntl is None:
+        raise RuntimeError("realhw benchlock 僅支援 POSIX；Windows 請使用 regression preflight")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
     try:

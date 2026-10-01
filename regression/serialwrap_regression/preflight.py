@@ -6,6 +6,7 @@ reliability／wifi_llapi 共用同一把（bench 互斥、整場拒跑）。
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -23,6 +24,7 @@ def _repo_root() -> Path:
 
 
 REPO_ROOT: Path = _repo_root()
+_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 
 
 def ensure_realhw_importable() -> Path:
@@ -36,31 +38,29 @@ def ensure_realhw_importable() -> Path:
 
 def version_gate(cli_version: str, daemon_version: str) -> str | None:
     """pinned CLI 與 daemon 版本必須一致；解析失敗或不齊回問題字串（suite-refuse）。"""
-    ensure_realhw_importable()
-    from realhw.preflight import parse_version
-
-    a, b = parse_version(cli_version), parse_version(daemon_version)
+    a = _VERSION_RE.search(cli_version or "")
+    b = _VERSION_RE.search(daemon_version or "")
     if a is None or b is None:
         return f"版本解析失敗：cli={cli_version!r} daemon={daemon_version!r}（#154 gate）"
-    if a != b:
+    va = tuple(map(int, a.groups()))
+    vb = tuple(map(int, b.groups()))
+    if va != vb:
         return (
-            f"client↔daemon 版本不齊：cli={'.'.join(map(str, a))} "
-            f"daemon={'.'.join(map(str, b))}（#154 gate，suite-refuse）"
+            f"client↔daemon 版本不齊：cli={'.'.join(map(str, va))} "
+            f"daemon={'.'.join(map(str, vb))}（#154 gate，suite-refuse）"
         )
     return None
 
 
 def stale_client_note(path_version: str, pinned_version: str) -> str | None:
     """PATH 上 serialwrap 與 pinned 不一致時的診斷 note（不擋——本 plugin 不用 PATH）。"""
-    ensure_realhw_importable()
-    from realhw.preflight import parse_version
-
-    a, b = parse_version(path_version), parse_version(pinned_version)
-    if a is None or b is None or a == b:
+    a = _VERSION_RE.search(path_version or "")
+    b = _VERSION_RE.search(pinned_version or "")
+    if a is None or b is None or tuple(map(int, a.groups())) == tuple(map(int, b.groups())):
         return None
     return (
-        f"警告：PATH 上 serialwrap={'.'.join(map(str, a))} 與 pinned "
-        f"{'.'.join(map(str, b))} 不一致（不擋；#154 stale client 徵兆）"
+        f"警告：PATH 上 serialwrap={'.'.join(map(str, map(int, a.groups())))} 與 pinned "
+        f"{'.'.join(map(str, map(int, b.groups())))} 不一致（不擋；#154 stale client 徵兆）"
     )
 
 
@@ -97,9 +97,72 @@ def _tools_missing() -> list[str]:
     return [t for t in ("tmux", "minicom") if not shutil.which(t)]
 
 
+def _run_preflight_windows(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Windows 單板回歸前置檢查；僅支援不依賴 POSIX 工具的 case。
+
+    不 import ``realhw.preflight``（其 fcntl/pgrep/PTY 假設只適用 POSIX）。
+    仍共用 bench.lock，確認 daemon、doctor、雙板 READY 與 pinned 版本。
+    """
+    import msvcrt
+    from realhw import drivers
+
+    exe = Path(str(cfg["serialwrap_exe"]))
+    problems: list[str] = []
+    notes: list[str] = []
+    if not exe.is_file():
+        problems.append(f"pinned serialwrap 不存在：{exe}")
+    lock_path = Path.home() / ".local" / "state" / "serialwrap" / "bench.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_BINARY, 0o600)
+    try:
+        os.lseek(lock_fd, 0, os.SEEK_SET)
+        try:
+            msvcrt.locking(lock_fd, msvcrt.LK_NBLCK, 1)
+        except OSError:
+            problems.append("bench.lock 已被其他測試持有")
+            os.close(lock_fd)
+            lock_fd = None
+        sw = drivers.SwCli(exe=str(exe))
+        daemon = sw.run("daemon", "status")
+        if not daemon.get("ok") or not daemon.get("running"):
+            problems.append("serialwrap daemon 未運行")
+        if daemon.get("multi_open"):
+            problems.append("偵測到多個 daemon／UART holder")
+        if not (daemon.get("wal") or {}).get("healthy"):
+            problems.append("WAL 不健康")
+        doctor = sw.run("doctor")
+        checks = doctor.get("checks") or []
+        if not doctor.get("ok") or not checks or any(
+            not (c.get("ok") or c.get("advisory")) for c in checks
+        ):
+            problems.append("serialwrap doctor 未通過")
+        ready = {s.get("com") for s in sw.sessions() if s.get("state") == "READY"}
+        missing = [str(b["com"]) for b in cfg["boards"] if b["com"] not in ready]
+        if missing:
+            problems.append("板卡未 READY：" + ",".join(missing))
+        cli_version = str(sw.run("--version").get("_raw", "")).strip()
+        gate = version_gate(cli_version, daemon_version_probe(sw))
+        if gate:
+            problems.append(gate)
+        return {
+            "ok": not problems,
+            "problems": problems,
+            "notes": notes,
+            "missing_caps": {"posix": "windows_posix_tools_unavailable"},
+            "deployed_version": cli_version,
+            "benchlock_fd": lock_fd,
+        }
+    except Exception:
+        if lock_fd is not None:
+            os.close(lock_fd)
+        raise
+
+
 def run_preflight(cfg: dict[str, Any]) -> dict[str, Any]:
     """收集＋判定；回 {ok, problems, notes, missing_caps, deployed_version, benchlock_fd}。"""
     ensure_realhw_importable()
+    if os.name == "nt":
+        return _run_preflight_windows(cfg)
     from realhw import drivers, preflight as rp
 
     exe = str(cfg["serialwrap_exe"])
