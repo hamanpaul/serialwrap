@@ -1,5 +1,8 @@
 name: Policy Check
-on: [pull_request]
+on:
+  pull_request:
+    # R-11 驗 PR body；完成測試後勾選驗收項目時必須取新的 event context。
+    types: [opened, synchronize, reopened, edited]
 
 permissions:
   contents: read

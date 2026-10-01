@@ -17,3 +17,5 @@ POSIX backend 的 `serialwrap setup --on-demand` 在同模式刷新時保留
 - policy engine 與 PR／release reusable workflow 同步釘選正式 v1.0.18；
   manifest 明確啟用 `branch_source.allowed_prefixes: [feature, fix]`，
   由中央 R-12 原生驗證既有分支契約，不注入自動豁免 label。
+- Policy Check 同時響應 PR 內文更新，R-11 以最新驗收勾選與 event context 重驗；
+  不以舊事件快照重跑或豁免宣告檢查。
