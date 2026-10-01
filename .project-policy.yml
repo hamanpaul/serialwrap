@@ -1,5 +1,8 @@
 policy_profile: flat
-policy_version: "1.0.17"
+policy_version: "1.0.18"
+# R-12：正式啟用既有 feature/ 與 fix/ 分支契約，不使用豁免 label。
+branch_source:
+  allowed_prefixes: [feature, fix]
 # 內容分類（R-21）：serialwrap 為通用序列工具、無雇主機密 → 維持 public
 tier: shareable
 secret_scan:

@@ -1730,7 +1730,33 @@ def _run_setup(args: argparse.Namespace) -> int:
         return 0
 
     # 6. 有效 socket：systemd-system 走系統固定 socket，其餘走使用者 XDG 預設（Codex #1a/#1b）。
-    effective_socket = SYSTEM_SOCKET if target == "systemd-system" else SOCKET_PATH
+    # on-demand 同模式刷新時保留既有有效 TCP 設定（含 loopback tunnel）。
+    # TCP 只代表已選用的連線方式，不能據此推定 daemon 的位置；不以可達性
+    # 決定是否保留，避免 tunnel 暫時斷線就丟失設定。模式轉換與 systemd 管理
+    # 本機 daemon 的流程仍走原本預設，不混用 TCP client 設定與本機 unit。
+    # win backend 的本機預設也是 TCP，本次不改其行為。顯式 endpoint 旗標
+    # 仍沿用既有 setup 契約：供探測使用，但不把參數值寫回 config。
+    preserved_remote_socket: str | None = None
+    if (
+        old == target == "on-demand"
+        and not _rpc_backend_is_win()
+        and args.socket is None
+        and not getattr(args, "endpoint", None)
+    ):
+        existing_rc = _safe_runtime_config()
+        existing_socket = existing_rc.socket_path() if existing_rc is not None else None
+        if isinstance(existing_socket, str) and existing_socket:
+            try:
+                transport, _address = _parse_endpoint(existing_socket)
+            except ValueError:
+                transport = None
+            if transport == "tcp":
+                preserved_remote_socket = existing_socket
+    effective_socket = (
+        preserved_remote_socket
+        if preserved_remote_socket is not None
+        else (SYSTEM_SOCKET if target == "systemd-system" else SOCKET_PATH)
+    )
 
     # 7. reconcile（先停舊、再起新）；flash 進行中除非 force 否則拒絕。
     try:
