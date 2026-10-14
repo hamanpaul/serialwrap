@@ -298,7 +298,9 @@ def _ensure_console_unlocked(
     if not prompt:
         bridge.clear_rx_buffer()
         bridge.send_command("", source="system")
-        prompt = bridge.wait_for_regex(sp.prompt_regex, min(1.0, sp.console_unlock_idle_s))
+        # RX 靜默門檻與 prompt 回應期限是不同量測。低 idle 設定仍須給
+        # reader／target 排程足夠時間，避免已解鎖 shell 被誤判成 lock。
+        prompt = bridge.wait_for_regex(sp.prompt_regex, min(1.0, max(0.0, deadline - time.monotonic())))
     if not prompt:
         if not _wait_console_idle(bridge, sp, deadline):
             return False, "CONSOLE_UNLOCK_IDLE_TIMEOUT"

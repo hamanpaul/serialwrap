@@ -46,6 +46,7 @@ targets:
 2. 目前尾行是 CFE prompt 時立即拒絕送字元。歷史 Linux prompt 不作為目前狀態。
 3. 已有目前 shell prompt 時直接驗 nonce。新 attach 尚未收到 prompt 時，靜默
    滿額後才送空行辨識，避免把解鎖值當成已解鎖 shell 的命令。
+   空行回應窗最多一秒且受流程剩餘期限限制，與 RX idle 門檻分開計算。
 4. 空行沒有取得 shell prompt 時，再等待滿額 RX 靜默，才以 `send_secret` 送出
    解鎖值與 Enter。TX 不進 WAL；此流程適用於不回顯解鎖值的 console lock。
 5. 清除舊 buffer 後，要求獨立的 nonce 輸出行與 shell prompt；命令 echo 不算 READY。

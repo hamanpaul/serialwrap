@@ -28,7 +28,7 @@ def profile(**overrides) -> SessionProfile:
         device_by_id="/dev/serial/by-id/test-smart4", platform="shell",
         prompt_regex=r"(?m)^root@Speedport Smart 4 Typ [AB]:[^\r\n]*# ?$",
         login_regex="$^", password_regex="$^", console_unlock_env="SMART4R_CONSOLE_UNLOCK",
-        console_unlock_idle_s=0.08, timeout_s=0.6, hard_timeout_s=2.0,
+        console_unlock_idle_s=0.08, timeout_s=2.5, hard_timeout_s=3.0,
         bootloader_prompts=(r"(?m)^CFE>\s*$",),
     )
     values.update(overrides)
@@ -41,7 +41,7 @@ def packaged_profile(**overrides) -> SessionProfile:
     template = next(tpl for tpl in load_profiles(str(asset_dir)).templates if tpl.profile_name == "smart4R-profile")
     values = {field.name: getattr(template, field.name) for field in dataclasses.fields(template)}
     values.update(com="COM0", act_no=1, alias="smart4", device_by_id="/dev/serial/by-id/test-smart4",
-                  console_unlock_idle_s=0.08, timeout_s=0.4, hard_timeout_s=0.5)
+                  console_unlock_idle_s=0.08, timeout_s=2.5, hard_timeout_s=3.0)
     values.update(overrides)
     return SessionProfile(**values)
 
