@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 import os
 from typing import Any
 
@@ -30,6 +31,8 @@ class ProfileTemplate:
     user_env: str | None = None
     pass_env: str | None = None
     env_file: str | None = None
+    console_unlock_env: str | None = None
+    console_unlock_idle_s: float = 5.0
     timeout_s: float = 10.0
     quiet_window_s: float = 2.0
     hard_timeout_s: float = 60.0
@@ -61,6 +64,8 @@ class SessionProfile:
     user_env: str | None = None
     pass_env: str | None = None
     env_file: str | None = None
+    console_unlock_env: str | None = None
+    console_unlock_idle_s: float = 5.0
     timeout_s: float = 10.0
     quiet_window_s: float = 2.0
     hard_timeout_s: float = 60.0
@@ -114,6 +119,21 @@ def _as_max_console_line_chars(v: Any, default: int | None = None) -> int | None
     return v
 
 
+def _as_unlock_idle(v: Any, default: float = 5.0) -> float:
+    """console 解鎖必須等待有界且正值的實際 RX 靜默時間。"""
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        raise ValueError("console_unlock_idle_s 必須是有限正數")
+    try:
+        value = float(v)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("console_unlock_idle_s 必須是有限正數") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("console_unlock_idle_s 必須是有限正數")
+    return value
+
+
 def _as_str_keep_empty(v: Any, default: str) -> str:
     if v is None:
         return default
@@ -156,6 +176,8 @@ def _template_from_dict(name: str, raw: dict[str, Any], *, base_dir: str) -> Pro
         user_env=_as_opt_str(raw.get("user_env") or raw.get("username_env") or raw.get("login_env")),
         pass_env=_as_opt_str(raw.get("pass_env") or raw.get("password_env") or raw.get("pw_env")),
         env_file=_resolve_opt_path(raw.get("env_file"), base_dir=base_dir),
+        console_unlock_env=_as_opt_str(raw.get("console_unlock_env")),
+        console_unlock_idle_s=_as_unlock_idle(raw.get("console_unlock_idle_s")),
         timeout_s=_as_float(raw.get("timeout_s"), 10.0),
         quiet_window_s=_as_float(raw.get("quiet_window_s"), 2.0),
         hard_timeout_s=_as_float(raw.get("hard_timeout_s"), 60.0),
@@ -260,6 +282,13 @@ def _merge_session(
         env_file=_resolve_opt_path(target.get("env_file"), base_dir=base_dir)
         if "env_file" in target
         else template.env_file,
+        console_unlock_env=(
+            _as_opt_str(target.get("console_unlock_env"))
+            if "console_unlock_env" in target else template.console_unlock_env
+        ),
+        console_unlock_idle_s=_as_unlock_idle(
+            target.get("console_unlock_idle_s"), template.console_unlock_idle_s
+        ),
         timeout_s=_as_float(target.get("timeout_s"), template.timeout_s),
         quiet_window_s=_as_float(target.get("quiet_window_s"), template.quiet_window_s),
         hard_timeout_s=_as_float(target.get("hard_timeout_s"), template.hard_timeout_s),

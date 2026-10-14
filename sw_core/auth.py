@@ -20,7 +20,8 @@ class SessionAuth:
     """attach / login 時使用的帳密，已解析為明文值。"""
 
     username: str | None = None
-    password: str | None = None
+    password: str | None = dataclasses.field(default=None, repr=False)
+    console_unlock: str | None = dataclasses.field(default=None, repr=False)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -32,13 +33,14 @@ class AuthResolution:
 
     ``reason`` 取值：
 
-    - ``ok``：帳密成功解析（``username`` 與 ``password`` 皆非空）。
+    - ``ok``：帳密成功解析（``username`` 與 ``password`` 皆非空），或宣告
+      ``console_unlock_env`` 時已解析非空解鎖值。
     - ``env_file_missing``：profile 宣告 ``env_file``、但解析絕對路徑不存在，
       且帳密無法由其他來源補齊。
     - ``env_file_unreadable``：``env_file`` 存在但讀取／解析失敗，且帳密無法補齊。
     - ``key_absent``：宣告了帳密來源、但缺 ``user_env``/``pass_env`` 指定的 key
       或其值為空（含 env_file 可讀但缺 key、或無 env_file 而 os.environ 缺 key）。
-    - ``not_configured``：profile 未宣告任何帳密來源（三者皆無）。
+    - ``not_configured``：profile 未宣告任何帳密或解鎖來源。
 
     ``env_file_path``：profile 宣告 ``env_file`` 時帶 ``os.path.expanduser`` 後的
     絕對路徑（供示警訊息指出實際解析位置）；未宣告時為 ``None``。
@@ -87,7 +89,8 @@ def resolve_session_auth(sp: SessionProfile) -> tuple[SessionAuth, AuthResolutio
     3. ``sp.username`` 欄位（最低優先）
 
     回傳 ``(SessionAuth, AuthResolution)``。``AuthResolution.reason`` 反映
-    「帳密是否真的解析成功」：只要 ``username``/``password`` 皆非空即為 ``ok``
+    「帳密是否真的解析成功」：``username``/``password`` 皆非空，或已宣告並解析
+    console 解鎖值，即為 ``ok``
     （即使 env_file 缺失、只要 os.environ 補齊亦然，避免誤擋可用帳密）；解析為空
     才依來源狀況細分成 ``env_file_missing`` / ``env_file_unreadable`` /
     ``key_absent`` / ``not_configured``，供上層 gate 與示警使用。
@@ -118,13 +121,16 @@ def resolve_session_auth(sp: SessionProfile) -> tuple[SessionAuth, AuthResolutio
     if sp.pass_env:
         password = local_env.get(sp.pass_env) or os.environ.get(sp.pass_env)
 
-    auth = SessionAuth(username=username, password=password)
+    console_unlock: str | None = None
+    if sp.console_unlock_env:
+        console_unlock = local_env.get(sp.console_unlock_env) or os.environ.get(sp.console_unlock_env)
+    auth = SessionAuth(username=username, password=password, console_unlock=console_unlock)
 
     # --- reason 判定（#140）---
-    declared = bool(sp.user_env or sp.pass_env or sp.env_file)
+    declared = bool(sp.user_env or sp.pass_env or sp.env_file or sp.console_unlock_env)
     if not declared:
         reason = "not_configured"
-    elif username and password:
+    elif (console_unlock if sp.console_unlock_env else username and password):
         # 帳密確實解析成功（不論來自 env_file 或 os.environ fallback）→ ok，不阻擋。
         reason = "ok"
     elif env_file_state == "missing":

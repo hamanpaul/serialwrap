@@ -171,6 +171,9 @@ def _login_fsm_rx_tail_detail(bridge: Any) -> str | None:
 
 
 def _is_reboot_command(command: str) -> bool:
+    # PDF ST-06 使用的立即 SysRq reboot。限定完整單一命令，不猜測 shell 串接。
+    if re.fullmatch(r"\s*echo\s+(?:b|'b'|\"b\")\s*>\s*/proc/sysrq-trigger\s*", command):
+        return True
     try:
         tokens = shlex.split(command, posix=True)
     except ValueError:
@@ -968,6 +971,8 @@ class SessionManager:
             user_env=tpl.user_env,
             pass_env=tpl.pass_env,
             env_file=tpl.env_file,
+            console_unlock_env=tpl.console_unlock_env,
+            console_unlock_idle_s=tpl.console_unlock_idle_s,
             timeout_s=tpl.timeout_s,
             quiet_window_s=tpl.quiet_window_s,
             hard_timeout_s=tpl.hard_timeout_s,
@@ -1180,8 +1185,13 @@ class SessionManager:
         純函式：``not_configured``（未宣告帳密）因 ``user_env``/``pass_env``/``env_file``
         皆空而回 False，故未宣告帳密的 passwordless/auto-login 路徑完全不受影響。
         """
-        declared = bool(profile.user_env or profile.pass_env or profile.env_file)
+        declared = bool(profile.user_env or profile.pass_env or profile.env_file or profile.console_unlock_env)
         return declared and auth_res.reason != "ok"
+
+    @staticmethod
+    def _boot_quiet_blocks_probe(session: SessionRuntime, now: float | None = None) -> bool:
+        """隱藏 lock 由 FSM 被動等待 RX 靜默；一般 profile 保留 180 秒 gate。"""
+        return session.boot_quiet_active(now) and not session.profile.console_unlock_env
 
     def _emit_credentials_unresolved_warning(
         self, session_id: str, com: str, auth_res: AuthResolution
@@ -1395,7 +1405,7 @@ class SessionManager:
         ready_reconfirm = (
             session.state == "READY"
             and session.ready_reconfirm_pending
-            and not session.boot_quiet_active(now)
+            and not self._boot_quiet_blocks_probe(session, now)
         )
         if session.state == "READY" and not ready_reconfirm:
             return None
@@ -1421,7 +1431,7 @@ class SessionManager:
         # #130：boot quiet window 內不自動重探（probe 的 "\n" 會打斷 U-Boot autoboot）。
         # 不累加 attempts、不排 backoff——window 解除（RX 見 login/prompt）或過期後，
         # 下一個 tick 立即恢復既有 reprobe 流程。
-        if session.boot_quiet_active(now):
+        if self._boot_quiet_blocks_probe(session, now):
             return None
         # #162：READY 再確認分支不看 last_error（名義 READY 的 last_error 恆 None，
         # _is_reprobe_prompt_error 對 READY 必回 False）；其餘守衛（backoff／RX idle／
@@ -1531,7 +1541,7 @@ class SessionManager:
             return False
         # #130：job 收集後、worker 實際寫入前 boot banner 才抵達 → 最終驗證擋下，
         # 不得對 autoboot 倒數中的 UART 送 probe bytes。
-        if session.boot_quiet_active(now):
+        if self._boot_quiet_blocks_probe(session, now):
             return False
         if self._human_active_locked(session, now):
             return False
@@ -2464,7 +2474,7 @@ class SessionManager:
             current = self._sessions.get(session.session_id)
             if current is None or current.bridge is not bridge:
                 return {"ok": False, "error_code": "SESSION_NOT_READY"}
-            if current.boot_quiet_active():
+            if self._boot_quiet_blocks_probe(current):
                 # #162：READY（再確認 pending）走到這裡＝quiet 又被 re-arm——不得以
                 # 合成 PROMPT_UNAVAILABLE 覆寫 READY 的 last_error（名義 READY 的
                 # last_error 恆 None，覆寫會讓 session list 呈現矛盾）；ATTACHED
@@ -2476,7 +2486,7 @@ class SessionManager:
         # #150：probe 前採樣 raw RX 累計，失敗後取差精煉 transport stall。
         rx_before = self._bridge_rx_total(bridge)
 
-        if session.profile.login_regex:
+        if session.profile.login_regex or session.profile.console_unlock_env:
             auth, auth_res = resolve_session_auth(session.profile)
             if self._credentials_declared_but_unresolved(session.profile, auth_res):
                 # 宣告帳密但解析空：不進 login/probe（不對 prompt 送空帳密），標終態（#140）。
@@ -2484,7 +2494,7 @@ class SessionManager:
                     session.session_id, session.profile.com, auth_res
                 )
                 ok, err = False, ERROR_CREDENTIALS_UNRESOLVED
-            elif auth.username and auth.password:
+            elif auth.console_unlock or (auth.username and auth.password):
                 ok, err = ensure_ready(bridge, session.profile, auth=auth)
             else:
                 ok, err = probe_ready(bridge, session.profile)
@@ -2592,7 +2602,7 @@ class SessionManager:
             gen_before = session.bridge_generation
             session_id = session.session_id
             profile = session.profile
-            require_login = session.pending_auto_login or bool(profile.login_regex)
+            require_login = session.pending_auto_login or bool(profile.login_regex or profile.console_unlock_env)
             # 以 ready_probe 判定可否下命令；非 command-capable（含無 ready_probe 的
             # passthrough）僅停在 ATTACHED 不 probe，有 ready_probe 的 passthrough
             # 也要能走 probe 進 READY。
@@ -2616,7 +2626,7 @@ class SessionManager:
             # #150：probe 前採樣 raw RX 累計（bridge 剛 start，計數從 0 起）。
             rx_before = self._bridge_rx_total(bridge)
             with self._lock:
-                boot_quiet = session.boot_quiet_active()
+                boot_quiet = self._boot_quiet_blocks_probe(session)
             if not command_capable:
                 ok = False
                 err = None
@@ -2634,7 +2644,7 @@ class SessionManager:
                         session_id, profile.com, auth_res
                     )
                     ok, err = False, ERROR_CREDENTIALS_UNRESOLVED
-                elif auth.username and auth.password:
+                elif auth.console_unlock or (auth.username and auth.password):
                     ok, err = ensure_ready(bridge, profile, auth=auth)
                     if not ok:
                         # #150：於 bridge.stop() 前精煉（stop 後計數仍可讀，但語意上先取）。
@@ -2820,6 +2830,8 @@ class SessionManager:
             user_env=tpl.user_env,
             pass_env=tpl.pass_env,
             env_file=tpl.env_file,
+            console_unlock_env=tpl.console_unlock_env,
+            console_unlock_idle_s=tpl.console_unlock_idle_s,
             timeout_s=tpl.timeout_s,
             quiet_window_s=tpl.quiet_window_s,
             hard_timeout_s=tpl.hard_timeout_s,
@@ -3040,7 +3052,7 @@ class SessionManager:
             session.last_error = None
             gen_before = session.bridge_generation
             session_id = session.session_id
-            require_login = session.pending_auto_login or bool(profile.login_regex)
+            require_login = session.pending_auto_login or bool(profile.login_regex or profile.console_unlock_env)
             # 與 _attach_by_id 一致，以 ready_probe 判定可否下命令。
             command_capable = profile.command_capable
 
@@ -3068,7 +3080,7 @@ class SessionManager:
                         session_id, profile.com, auth_res
                     )
                     ok, err = False, ERROR_CREDENTIALS_UNRESOLVED
-                elif auth.username and auth.password:
+                elif auth.console_unlock or (auth.username and auth.password):
                     ok, err = ensure_ready(bridge, profile, auth=auth)
                     if not ok:
                         # #150：於 bridge.stop() 前精煉。
@@ -3385,7 +3397,7 @@ class SessionManager:
                     bridge = session.bridge
                     by_id = session.profile.device_by_id
                     quiet_until = session.boot_quiet_until
-                    quiet_active = session.boot_quiet_active()
+                    quiet_active = self._boot_quiet_blocks_probe(session)
                 now = time.monotonic()
                 if quiet_active:
                     # #130 review Finding 6（順修）：改呼叫 boot_quiet_active() 統一入口，
@@ -3525,6 +3537,9 @@ class SessionManager:
         # 若 target 其實沒重開（2s 內 prompt 回來），RX 解除檢查會立即清掉本視窗。
         with self._lock:
             session.arm_boot_quiet()
+        if session.profile.console_unlock_env:
+            # 已重開的舊 root prompt 不可在 recovery 中被當成解鎖證據。
+            bridge.clear_rx_buffer()
         self._mark_session_tx(session)
         bridge.send_command(command, source=source, cmd_id=cmd_id)
         if bridge.wait_for_regex_from(prompt_regex, pre_offset, min(timeout_s, 2.0)):

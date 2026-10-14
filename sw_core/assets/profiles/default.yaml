@@ -68,6 +68,25 @@ profiles:
       stop_bits: 1
       flow_control: none
       xonxoff: false
+  # 只支援明確 targets 綁定；動態偵測跳過 console_unlock_env 模板。
+  smart4R-profile:
+    platform: shell
+    prompt_regex: '(?m)^root@Speedport Smart 4 Typ [AB]:[^\r\n]*# ?$'
+    login_regex: '$^'
+    password_regex: '$^'
+    console_unlock_env: SMART4R_CONSOLE_UNLOCK
+    console_unlock_idle_s: 5
+    ready_probe: 'echo __READY__${nonce}'
+    timeout_s: 120
+    hard_timeout_s: 240
+    bootloader_prompts:
+      - '(?m)^CFE>\s*$'
+    uart:
+      baud: 115200
+      data_bits: 8
+      parity: N
+      stop_bits: 1
+      flow_control: none
   uboot-template:
     platform: passthrough
     prompt_regex: "(?mi)^(=>|u-boot>|cfe>) $"

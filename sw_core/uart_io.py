@@ -164,6 +164,7 @@ class UARTBridge:
         # raw RX 累計計數器（#150）：單調遞增、clear_rx_buffer() 不歸零；供 probe 前後
         # 取差判定「probe 全程零 RX（連 echo 都無）」的 transport stall 特徵。
         self._rx_total_bytes = 0
+        self._last_rx_mono = time.monotonic()
         self._preserved_consoles = preserved_consoles
         self._clients: dict[str, ConsoleClient] = {}
         self._interactive_owner: str | None = None
@@ -661,6 +662,7 @@ class UARTBridge:
         with self._rx_lock:
             # raw bytes 記帳（#153 速率視窗＋#150 累計計數）：同一鎖內單點維護。
             self._rx_total_bytes += len(payload)
+            self._last_rx_mono = now
             self._rx_window.append((now, len(payload)))
             self._prune_rx_window_locked(now)
             self._rx_text += text
@@ -1197,6 +1199,11 @@ class UARTBridge:
         """
         with self._rx_lock:
             return self._rx_total_bytes
+
+    def rx_idle_s(self) -> float:
+        """自最近實際 UART RX 起的靜默秒數；清 buffer 不會重設。"""
+        with self._rx_lock:
+            return max(0.0, time.monotonic() - self._last_rx_mono)
 
     def rx_text_from(self, from_offset: int) -> str:
         """以絕對偏移取文字（#158）；頭段已被修剪時降級回傳現存全窗（不失敗、不回空）。"""

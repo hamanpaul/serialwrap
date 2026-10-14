@@ -206,6 +206,18 @@ matching, login prompts, ready probes, credentials environment variable names,
 and UART settings. Targets may be explicit, or the daemon can auto-detect a
 template from the current UART output.
 
+The shipped `smart4R-profile` supports Smart 4 Typ A/B's hidden console lock.
+Bind the physical UART through an explicit target or a pin: dynamic detection
+skips unlock profiles. Supply `SMART4R_CONSOLE_UNLOCK` to the daemon environment
+or a private `env_file`; YAML stores only `console_unlock_env` and
+`console_unlock_idle_s: 5`. Attach and reboot recovery wait for five seconds of
+actual RX silence before probing, skip the secret when a shell prompt is already
+available, and reject a CFE prompt. A standalone nonce output confirms READY;
+the unlock TX is excluded from WAL. The exact command
+`echo b > /proc/sysrq-trigger` also enters reboot recovery. Existing profiles
+retain their boot quiet behavior. See [Smart4 console lock](docs/smart4-console-lock.md)
+for deployment and timing evidence.
+
 The shipped `brcm-template` accepts spaces or tabs before and after BDK prompts
 such as ` > ` and ` # `, while retaining the line-start anchor and rejecting
 repeated `#`/`>` banner decorations. Existing installations must update their
@@ -1587,6 +1599,15 @@ serialwrap cmd status --cmd-id <cmd_id>
 ## Profile 與目標綁定
 
 `profiles/*.yaml` 以 template + targets 定義 platform、prompt、login、ready probe 與 UART 參數。
+
+內建 `smart4R-profile` 支援 Smart 4 Typ A/B 的隱藏 console lock。請用 explicit
+target 或 pin 綁定實體 UART；動態偵測會跳過解鎖 profile。解鎖值由 daemon 環境中的
+`SMART4R_CONSOLE_UNLOCK` 或私有 `env_file` 提供，YAML 僅存 `console_unlock_env`
+與 `console_unlock_idle_s: 5`。Attach 與 reboot recovery 等待實際 RX 靜默五秒後
+才 probe；已有 shell prompt 時跳過 secret，遇 CFE prompt 則拒絕送字元。獨立 nonce
+輸出確認 READY，unlock TX 不寫入 WAL。精確命令 `echo b > /proc/sysrq-trigger`
+也會進入 reboot recovery。其他 profile 保留既有 boot quiet 行為。部署與時序證據
+見 [Smart4 console lock](docs/smart4-console-lock.md)。
 
 **targets 區段為可選**：若省略或留空，daemon 會在偵測到新 UART 裝置時，自動使用 `detect_template()` 比對各 template 的 `prompt_regex` / `login_regex`，匹配成功即動態建立 session；全不匹配則 fallback 到 passthrough。已有 explicit binding 的裝置仍走原本路徑，不受影響。
 
