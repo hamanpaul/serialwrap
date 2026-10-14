@@ -220,6 +220,29 @@ def test_fresh_unlocked_attach_never_sends_secret_as_shell_command(hardware):
     assert b"dummy-unlock" not in target.lines
 
 
+@pytest.mark.parametrize("async_after_prompt", [False, True])
+def test_prompt_arriving_during_second_idle_wait_skips_unlock(hardware, monkeypatch, async_after_prompt):
+    """空行回應超過一秒，但在第二次靜默等待內到達，不可注入 secret。"""
+    target, bridge, _ = hardware
+    target.locked = False
+    target.async_after_prompt = async_after_prompt
+    original_prompt = target.prompt
+    first_prompt = True
+
+    def delayed_prompt():
+        nonlocal first_prompt
+        if first_prompt:
+            first_prompt = False
+            time.sleep(1.25)
+        original_prompt()
+
+    monkeypatch.setattr(target, "prompt", delayed_prompt)
+    sp = packaged_profile(console_unlock_idle_s=0.5, timeout_s=5.0, hard_timeout_s=6.0)
+    assert ensure_ready(bridge, sp, SessionAuth(console_unlock="dummy-unlock")) == (True, None)
+    assert b"dummy-unlock" not in target.lines
+    assert any(line.startswith(b"echo __READY__") for line in target.lines)
+
+
 def test_history_prompt_before_boot_cannot_skip_unlock(hardware):
     target, bridge, _ = hardware
     target.prompt()

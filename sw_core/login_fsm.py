@@ -306,6 +306,10 @@ def _ensure_console_unlocked(
             return False, "CONSOLE_UNLOCK_IDLE_TIMEOUT"
         if _console_at_bootloader(bridge, sp):
             return False, "CONSOLE_UNLOCK_BOOTLOADER"
+        # 此 buffer 已在空行 probe 前清空；接受等待期間到達的新 prompt，
+        # 即使後面緊接非同步 log，也不可把 secret 送成已解鎖 shell 的命令。
+        if re.search(sp.prompt_regex, clean_text(bridge.rx_text_from(0))) is not None:
+            return _finalize_ready(bridge, sp)
         idle_s = bridge.rx_idle_s()
         if idle_s < sp.console_unlock_idle_s:
             return False, "CONSOLE_UNLOCK_IDLE_TIMEOUT"

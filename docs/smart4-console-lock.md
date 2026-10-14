@@ -47,7 +47,9 @@ targets:
 3. 已有目前 shell prompt 時直接驗 nonce。新 attach 尚未收到 prompt 時，靜默
    滿額後才送空行辨識，避免把解鎖值當成已解鎖 shell 的命令。
    空行回應窗最多一秒且受流程剩餘期限限制，與 RX idle 門檻分開計算。
-4. 空行沒有取得 shell prompt 時，再等待滿額 RX 靜默，才以 `send_secret` 送出
+4. 空行沒有取得 shell prompt 時，再等待滿額 RX 靜默並重新檢查此次空行後的新 RX，
+   容忍 prompt 後緊接非同步 log，不使用空行前的歷史 prompt。
+   若延遲回覆已證明 shell 解鎖，直接驗 nonce；否則才以 `send_secret` 送出
    解鎖值與 Enter。TX 不進 WAL；此流程適用於不回顯解鎖值的 console lock。
 5. 清除舊 buffer 後，要求獨立的 nonce 輸出行與 shell prompt；命令 echo 不算 READY。
 
