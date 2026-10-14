@@ -35,6 +35,17 @@ def profile(**overrides) -> SessionProfile:
     return SessionProfile(**values)
 
 
+def packaged_profile(**overrides) -> SessionProfile:
+    """使用出貨模板的真實 regex，只縮短假板的等待秒數。"""
+    asset_dir = Path(__file__).parents[1] / "sw_core/assets/profiles"
+    template = next(tpl for tpl in load_profiles(str(asset_dir)).templates if tpl.profile_name == "smart4R-profile")
+    values = {field.name: getattr(template, field.name) for field in dataclasses.fields(template)}
+    values.update(com="COM0", act_no=1, alias="smart4", device_by_id="/dev/serial/by-id/test-smart4",
+                  console_unlock_idle_s=0.08, timeout_s=0.4, hard_timeout_s=0.5)
+    values.update(overrides)
+    return SessionProfile(**values)
+
+
 class Wal:
     def __init__(self):
         self.entries = []
@@ -56,6 +67,7 @@ class Target:
         self.bootloader = bootloader
         self.echo_secret = echo_secret
         self.execute_nonce = True
+        self.async_after_prompt = False
         self.lines = []
         self.received = []
         self.last_boot = 0.0
@@ -67,7 +79,9 @@ class Target:
         os.write(self.master, data)
 
     def prompt(self):
-        self.emit(b"\r\nroot@Speedport Smart 4 Typ B:/# ")
+        suffix = b"newWifiSensingStatus=Off\r\nwifiSensingStatus=Off\r\n" if self.async_after_prompt else b""
+        # 同一 write：UART reader 不保證 prompt 與非同步 log 會被切成兩個 RX chunk。
+        self.emit(b"\r\nroot@Speedport Smart 4 Typ B:/# " + suffix)
 
     def boot(self):
         self.locked = True
@@ -99,6 +113,8 @@ class Target:
                     continue
                 if line.startswith(b"echo __READY__"):
                     self.emit((line[5:] if self.execute_nonce else line) + b"\r\n")
+                if line == b"echo __ST06_MARKER__":
+                    self.emit(b"__ST06_BEGIN__\r\nVALUE\r\n__ST06_RC__=0\r\n__ST06_END__\r\n")
                 self.prompt()
 
     def close(self):
@@ -219,6 +235,38 @@ def test_echoed_nonce_command_is_not_ready_evidence(hardware):
     target.locked = False
     target.execute_nonce = False
     assert ensure_ready(bridge, profile(), SessionAuth(console_unlock="dummy-unlock")) == (False, "READY_NONCE_TIMEOUT")
+
+
+def test_packaged_nonce_accepts_prompt_and_async_log_in_same_write(hardware):
+    target, bridge, _ = hardware
+    target.locked = False
+    target.async_after_prompt = True
+    assert ensure_ready(bridge, packaged_profile(), SessionAuth(console_unlock="dummy-unlock")) == (True, None)
+    assert b"dummy-unlock" not in target.lines
+
+
+def test_packaged_marker_command_finishes_without_recovery_keys_on_async_log(hardware, tmp_path):
+    target, bridge, wal = hardware
+    target.locked = False
+    target.async_after_prompt = True
+    manager, session = make_manager(tmp_path, packaged_profile(), target, wal)
+    session.bridge = bridge
+    session.state = "READY"
+    result = manager.execute_command(session.session_id, "echo __ST06_MARKER__", "agent:test", "async-prompt-case", timeout_s=0.15)
+    assert result["ok"] and not result["partial"], result
+    assert "__ST06_BEGIN__" in result["stdout"] and "__ST06_RC__=0" in result["stdout"] and "__ST06_END__" in result["stdout"]
+    assert target.lines == [b"echo __ST06_MARKER__"]
+    assert not any(b"\x03" in data or b"\x04" in data for _, data in target.received)
+
+
+@pytest.mark.parametrize("text", [
+    "log root@Speedport Smart 4 Typ B:~# ",
+    "root@Speedport Smart 4 Typ C:~# ",
+    "root@unrelated-host:~# ",
+    "CFE> ",
+])
+def test_packaged_prompt_keeps_hostname_line_start_boundary(text):
+    assert re.search(packaged_profile().prompt_regex, text) is None
 
 
 def test_cfe_prompt_blocks_all_tx(hardware):

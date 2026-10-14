@@ -15,7 +15,7 @@ profile 檔，再重新載入。不要另放一份只含 Smart4 的 YAML 於共�
 profiles:
   smart4R-profile:
     platform: shell
-    prompt_regex: '(?m)^root@Speedport Smart 4 Typ [AB]:[^\r\n]*# ?$'
+    prompt_regex: '(?m)^root@Speedport Smart 4 Typ [AB]:[^\r\n#]*#[ \t]*'
     login_regex: '$^'
     password_regex: '$^'
     console_unlock_env: SMART4R_CONSOLE_UNLOCK
@@ -71,3 +71,9 @@ console unlock attempt com=COM0 rx_idle_s=5.012 required_idle_s=5.000
 `CONSOLE_UNLOCK_BOOTLOADER` 表示目前仍在 CFE，
 `CONSOLE_UNLOCK_PROMPT_TIMEOUT` 表示送 unlock 後沒有取得 shell prompt。
 成功的 attach/recover 必須同時取得 READY 與 nonce 證據。
+
+Smart4 的非同步 Wi-Fi log 可能直接接在 shell prompt 後面，同一次 UART RX
+包含 `root@Speedport Smart 4 Typ B:~# newWifiSensingStatus=Off`。模板保留 hostname
+行首與 `#` 邊界，但不要求 prompt 位於行尾；因此 nonce 與已完成的命令仍可正確
+辨識，不會因為 log 黏尾誤觸發 timeout／Ctrl-C recovery。PTY 回歸測試直接讀取
+出貨模板，涵蓋 nonce READY 與 `SessionManager.execute_command()` 的非 partial 結果。

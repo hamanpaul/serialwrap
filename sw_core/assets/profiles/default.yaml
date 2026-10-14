@@ -71,7 +71,8 @@ profiles:
   # 只支援明確 targets 綁定；動態偵測跳過 console_unlock_env 模板。
   smart4R-profile:
     platform: shell
-    prompt_regex: '(?m)^root@Speedport Smart 4 Typ [AB]:[^\r\n]*# ?$'
+    # prompt 後可立即接非同步 log；只錨定 hostname 行首與 shell '#' 邊界。
+    prompt_regex: '(?m)^root@Speedport Smart 4 Typ [AB]:[^\r\n#]*#[ \t]*'
     login_regex: '$^'
     password_regex: '$^'
     console_unlock_env: SMART4R_CONSOLE_UNLOCK
