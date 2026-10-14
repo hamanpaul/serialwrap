@@ -141,6 +141,18 @@ serialwrap cmd submit --selector COM0 --mode line --source agent:diag --cmd "ifc
 serialwrap cmd status --cmd-id <cmd_id>
 ```
 
+For noisy consoles that omit the shell prompt, `cmd submit --completion-regex`
+can wait for a command-specific producer marker in `line` or `background` mode.
+Use fresh, anchored markers with a numeric exit code and a separate END line;
+command echo alone does not prove completion. The regex must compile, fit within
+1024 UTF-8 bytes, and not match an empty string; invalid values return
+`INVALID_COMPLETION_REGEX` before queueing or TX. Omitting it preserves prompt
+waiting. Stdout extraction trims only a profile prompt after the completion
+marker, preserving responses following an earlier prompt redraw. Completion
+markers remain available for caller validation. `command.get` and WAL META record the
+setting; reboot continues through its existing recovery flow. See
+[command completion](docs/command-completion.md).
+
 For local development, run `./install.sh`; it performs the same package install
 and `serialwrap setup` flow from the checkout.
 
@@ -1871,6 +1883,15 @@ serialwrap cmd status --cmd-id <cmd_id>
 ```
 
 `command.get` 會直接帶 `stdout`。
+
+對於沒有回 shell prompt 的 noisy console，`cmd submit --completion-regex` 可在
+`line` 或 `background` 模式等待命令專屬的 producer 完成標記。請使用每次新產生、
+錨定行首的標記，包含數字 exit code 與獨立 END 行；命令 echo 本身不算完成證據。
+Regex 必須可編譯、不超過 1024 UTF-8 bytes 且不能匹配空串；無效值在排隊／TX 前
+回 `INVALID_COMPLETION_REGEX`。省略時沿用等待 prompt 的行為。Stdout 仍以 profile
+prompt 擷取，但只裁切完成標記之後的 prompt，保留早先 prompt redraw 之後的結果
+與完成標記供呼叫端驗證；`command.get` 與 WAL META 記錄設定，
+reboot 保留既有 recovery 流程。詳見[命令完成條件](docs/command-completion.md)。
 
 **命令限制**：命令字串不得含有 `\n` 換行字元，否則回傳 `CMD_CONTAINS_NEWLINE`。命令長度（UTF-8 位元組）> 4 KB 回 warning（`CMD_LENGTH_WARNING`），> 16 KB 拒絕（`CMD_TOO_LONG`）；broker 對命令內容不做截斷。注意這是 **broker 對單一 `--cmd` 參數的上限**，與 **target 端 tty line buffer（常見 4096 bytes）的物理單行限制**是兩回事——即使 broker 接受，過長單行仍可能在 target 端被截斷。上限可由 `serialwrap daemon status` 回應的 `limits` 欄位執行期查詢（`max_submit_cmd_bytes`／`warn_submit_cmd_bytes`／`reject_error_code`／`newline_error_code`／`warning_code`／`newline_forbidden`），client 不需硬編碼（#129）。
 

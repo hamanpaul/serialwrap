@@ -18,6 +18,7 @@ from typing import Any, Callable
 from .alias_registry import AliasRegistry
 from .auth import AuthResolution, resolve_session_auth
 from .config import ProfileTemplate, SessionProfile
+from .command_completion import ERROR_INVALID_COMPLETION_REGEX, valid_completion_regex
 from .constants import (
     BG_CAPTURE_MAX_BYTES,
     BG_CAPTURE_MAX_COUNT,
@@ -3176,10 +3177,18 @@ class SessionManager:
             last = match
         return last.start() if last is not None else None
 
-    def _extract_command_stdout(self, text: str, command: str, prompt_regex: str) -> str:
+    def _extract_command_stdout(
+        self, text: str, command: str, prompt_regex: str, *, completion_regex: str | None = None,
+    ) -> str:
         cleaned = clean_text(text)
         prompt_start = self._last_prompt_start(cleaned, prompt_regex)
-        if prompt_start is not None:
+        # producer 完成模式下，前置 echo redraw／遲來舊 prompt 不能裁掉其後結果。
+        # 仍使用 profile prompt 擷取，但只裁掉完成標記之後的尾 prompt。
+        completion = re.search(completion_regex, text) if completion_regex is not None else None
+        completion_end = len(clean_text(text[:completion.end()])) if completion is not None else None
+        if prompt_start is not None and (
+            completion_regex is None or (completion_end is not None and prompt_start >= completion_end)
+        ):
             cleaned = cleaned[:prompt_start]
         lines = cleaned.lstrip("\n").splitlines()
         if command:
@@ -3620,7 +3629,10 @@ class SessionManager:
         timeout_s: float = 10.0,
         mode: str = "line",
         expected_duration_s: float | None = None,
+        completion_regex: str | None = None,
     ) -> dict[str, Any]:
+        if not valid_completion_regex(completion_regex):
+            return {"ok": False, "error_code": ERROR_INVALID_COMPLETION_REGEX}
         normalized_mode = {"fg": "line", "bg": "background"}.get(mode, mode)
         suspend_human_interactive = False
         post = _PostCloseAction()
@@ -3681,6 +3693,7 @@ class SessionManager:
                 timeout_s=timeout_s, normalized_mode=normalized_mode,
                 prompt_regex=prompt_regex,
                 expected_duration_s=expected_duration_s,
+                completion_regex=completion_regex,
             )
         finally:
             try:
@@ -3701,6 +3714,7 @@ class SessionManager:
         normalized_mode: str,
         prompt_regex: str,
         expected_duration_s: float | None = None,
+        completion_regex: str | None = None,
     ) -> dict[str, Any]:
         if normalized_mode == "interactive":
             with self._lock:
@@ -3737,6 +3751,11 @@ class SessionManager:
                 execution_mode=normalized_mode,
             )
         pre_offset = bridge.rx_snapshot_len()
+        if completion_regex is not None:
+            self._wal.append(
+                com=session.profile.com, direction="META", source="system", cmd_id=cmd_id,
+                payload=b"", meta={"event": "command_completion", "completion_regex": completion_regex},
+            )
         if normalized_mode == "background":
             # #159：capture 必須在命令送出「之前」掛好——快速完成的命令會在
             # prompt 比對成功前就把全部輸出送完，若等 matched 之後才回溯建立
@@ -3772,7 +3791,7 @@ class SessionManager:
                 break
             wait_chunk = min(silence_limit, remaining)
             pre_rx = bridge.rx_snapshot_len()
-            if bridge.wait_for_regex_from(prompt_regex, pre_offset, wait_chunk):
+            if bridge.wait_for_regex_from(completion_regex or prompt_regex, pre_offset, wait_chunk):
                 matched = True
                 break
             if bridge.rx_snapshot_len() == pre_rx:
@@ -3792,7 +3811,7 @@ class SessionManager:
                 pre_offset=pre_offset,
             )
         raw_text = bridge.rx_text_from(pre_offset)
-        stdout = self._extract_command_stdout(raw_text, command, prompt_regex)
+        stdout = self._extract_command_stdout(raw_text, command, prompt_regex, completion_regex=completion_regex)
         result: dict[str, Any] = {
             "ok": True,
             "execution_mode": normalized_mode,

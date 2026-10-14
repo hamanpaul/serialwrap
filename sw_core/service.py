@@ -18,6 +18,7 @@ from .arbiter import (
     CommandArbiter,
 )
 from .config import ProfileTemplate, SessionProfile
+from .command_completion import ERROR_INVALID_COMPLETION_REGEX, valid_completion_regex
 from .constants import (
     CONFIG_DIR,
     DEVICE_BY_ID_DIR,
@@ -303,8 +304,11 @@ class SerialwrapService:
         for line in buf.feed(data):
             self._engine.feed_line(com, line, wal_seq)
 
-    def _send_cb(self, session_id: str, command: str, source: str, cmd_id: str, timeout_s: float, mode: str, expected_duration_s: float | None = None) -> dict[str, Any]:
-        return self._sessions.execute_command(session_id, command, source, cmd_id, timeout_s=timeout_s, mode=mode, expected_duration_s=expected_duration_s)
+    def _send_cb(self, session_id: str, command: str, source: str, cmd_id: str, timeout_s: float, mode: str, expected_duration_s: float | None = None, completion_regex: str | None = None) -> dict[str, Any]:
+        options: dict[str, Any] = {"timeout_s": timeout_s, "mode": mode, "expected_duration_s": expected_duration_s}
+        if completion_regex is not None:
+            options["completion_regex"] = completion_regex
+        return self._sessions.execute_command(session_id, command, source, cmd_id, **options)
 
     def _on_console_line(self, session_id: str, client_id: str, line: str) -> None:
         mode = _human_console_mode(line)
@@ -885,6 +889,9 @@ class SerialwrapService:
             return self._sessions.unassign_alias(alias)
 
         if method == "command.submit":
+            completion_regex = params.get("completion_regex")
+            if not valid_completion_regex(completion_regex):
+                return {"ok": False, "error_code": ERROR_INVALID_COMPLETION_REGEX}
             selector = str(params.get("selector") or params.get("com") or params.get("alias") or "")
             cmd = str(params.get("cmd") or params.get("command") or "")
             source = str(params.get("source") or "agent")
@@ -907,6 +914,7 @@ class SerialwrapService:
                 timeout_s=timeout_s,
                 priority=priority,
                 expected_duration_s=expected_duration_s,
+                completion_regex=completion_regex,
             )
 
         if method == "command.get":

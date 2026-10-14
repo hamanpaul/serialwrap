@@ -8,6 +8,7 @@ import uuid
 from typing import Any, Callable
 
 from .constants import CMD_HISTORY_MAX, CMD_PENDING_MAX
+from .command_completion import ERROR_INVALID_COMPLETION_REGEX, valid_completion_regex
 from .util import now_iso
 
 CMD_WARN_BYTES = 4096
@@ -31,10 +32,11 @@ class _QueuedCommand:
     mode: str = dataclasses.field(compare=False)
     timeout_s: float = dataclasses.field(compare=False)
     expected_duration_s: float | None = dataclasses.field(default=None, compare=False)
+    completion_regex: str | None = dataclasses.field(default=None, compare=False)
 
 
 class CommandArbiter:
-    def __init__(self, send_cb: Callable[[str, str, str, str, float, str, float | None], dict[str, Any]]) -> None:
+    def __init__(self, send_cb: Callable[..., dict[str, Any]]) -> None:
         self._send_cb = send_cb
         self._lock = threading.Lock()
         self._queues: dict[str, queue.PriorityQueue[_QueuedCommand]] = {}
@@ -132,7 +134,10 @@ class CommandArbiter:
         timeout_s: float,
         priority: int = 10,
         expected_duration_s: float | None = None,
+        completion_regex: str | None = None,
     ) -> dict[str, Any]:
+        if not valid_completion_regex(completion_regex):
+            return {"ok": False, "error_code": ERROR_INVALID_COMPLETION_REGEX}
         cmd_len = len(command.encode("utf-8", errors="replace"))
         if cmd_len > CMD_REJECT_BYTES:
             return {
@@ -169,6 +174,7 @@ class CommandArbiter:
             "execution_mode": {"fg": "line", "bg": "background"}.get(mode, mode),
             "timeout_s": timeout_s,
             "expected_duration_s": expected_duration_s,
+            "completion_regex": completion_regex,
             "priority": priority,
             "status": "accepted",
             "created_at": now,
@@ -206,7 +212,7 @@ class CommandArbiter:
             counter = self._counter
             self._commands[cmd_id] = rec
             self._evict_commands_locked()
-        pq.put(_QueuedCommand(sort_key=(priority, counter), cmd_id=cmd_id, session_id=session_id, command=command, source=source, mode=mode, timeout_s=timeout_s, expected_duration_s=expected_duration_s))
+        pq.put(_QueuedCommand(sort_key=(priority, counter), cmd_id=cmd_id, session_id=session_id, command=command, source=source, mode=mode, timeout_s=timeout_s, expected_duration_s=expected_duration_s, completion_regex=completion_regex))
         result: dict[str, Any] = {"ok": True, "cmd_id": cmd_id, "status": "accepted", "session_id": session_id}
         if cmd_warning is not None:
             result["warning"] = cmd_warning
@@ -280,7 +286,9 @@ class CommandArbiter:
                 rec["started_at"] = now_iso()
 
             try:
-                result = self._send_cb(session_id, item.command, item.source, item.cmd_id, item.timeout_s, item.mode, item.expected_duration_s)
+                args = (session_id, item.command, item.source, item.cmd_id, item.timeout_s, item.mode, item.expected_duration_s)
+                # 未指定時保留既有 callback 七參數契約；新欄位以可選 keyword 傳遞。
+                result = self._send_cb(*args, completion_regex=item.completion_regex) if item.completion_regex is not None else self._send_cb(*args)
             except Exception:
                 with self._lock:
                     rec = self._commands.get(item.cmd_id)
