@@ -141,6 +141,18 @@ serialwrap cmd submit --selector COM0 --mode line --source agent:diag --cmd "ifc
 serialwrap cmd status --cmd-id <cmd_id>
 ```
 
+For noisy consoles that omit the shell prompt, `cmd submit --completion-regex`
+can wait for a command-specific producer marker in `line` or `background` mode.
+Use fresh, anchored markers with a numeric exit code and a separate END line;
+command echo alone does not prove completion. The regex must compile, fit within
+1024 UTF-8 bytes, and not match an empty string; invalid values return
+`INVALID_COMPLETION_REGEX` before queueing or TX. Omitting it preserves prompt
+waiting. Stdout extraction trims only a profile prompt after the completion
+marker, preserving responses following an earlier prompt redraw. Completion
+markers remain available for caller validation. `command.get` and WAL META record the
+setting; reboot continues through its existing recovery flow. See
+[command completion](docs/command-completion.md).
+
 For local development, run `./install.sh`; it performs the same package install
 and `serialwrap setup` flow from the checkout.
 
@@ -205,6 +217,18 @@ Profiles live under `profiles/*.yaml` and define platform behavior, prompt
 matching, login prompts, ready probes, credentials environment variable names,
 and UART settings. Targets may be explicit, or the daemon can auto-detect a
 template from the current UART output.
+
+The shipped `smart4R-profile` supports Smart 4 Typ A/B's hidden console lock.
+Bind the physical UART through an explicit target or a pin: dynamic detection
+skips unlock profiles. Supply `SMART4R_CONSOLE_UNLOCK` to the daemon environment
+or a private `env_file`; YAML stores only `console_unlock_env` and
+`console_unlock_idle_s: 5`. Attach and reboot recovery wait for five seconds of
+actual RX silence before probing, skip the secret when a shell prompt is already
+available, and reject a CFE prompt. A standalone nonce output confirms READY;
+the unlock TX is excluded from WAL. The exact command
+`echo b > /proc/sysrq-trigger` also enters reboot recovery. Existing profiles
+retain their boot quiet behavior. See [Smart4 console lock](docs/smart4-console-lock.md)
+for deployment and timing evidence.
 
 The shipped `brcm-template` accepts spaces or tabs before and after BDK prompts
 such as ` > ` and ` # `, while retaining the line-start anchor and rejecting
@@ -1588,6 +1612,15 @@ serialwrap cmd status --cmd-id <cmd_id>
 
 `profiles/*.yaml` 以 template + targets 定義 platform、prompt、login、ready probe 與 UART 參數。
 
+內建 `smart4R-profile` 支援 Smart 4 Typ A/B 的隱藏 console lock。請用 explicit
+target 或 pin 綁定實體 UART；動態偵測會跳過解鎖 profile。解鎖值由 daemon 環境中的
+`SMART4R_CONSOLE_UNLOCK` 或私有 `env_file` 提供，YAML 僅存 `console_unlock_env`
+與 `console_unlock_idle_s: 5`。Attach 與 reboot recovery 等待實際 RX 靜默五秒後
+才 probe；已有 shell prompt 時跳過 secret，遇 CFE prompt 則拒絕送字元。獨立 nonce
+輸出確認 READY，unlock TX 不寫入 WAL。精確命令 `echo b > /proc/sysrq-trigger`
+也會進入 reboot recovery。其他 profile 保留既有 boot quiet 行為。部署與時序證據
+見 [Smart4 console lock](docs/smart4-console-lock.md)。
+
 **targets 區段為可選**：若省略或留空，daemon 會在偵測到新 UART 裝置時，自動使用 `detect_template()` 比對各 template 的 `prompt_regex` / `login_regex`，匹配成功即動態建立 session；全不匹配則 fallback 到 passthrough。已有 explicit binding 的裝置仍走原本路徑，不受影響。
 
 ### session pin / unpin（動態裝置 profile 持久化，#95）
@@ -1850,6 +1883,15 @@ serialwrap cmd status --cmd-id <cmd_id>
 ```
 
 `command.get` 會直接帶 `stdout`。
+
+對於沒有回 shell prompt 的 noisy console，`cmd submit --completion-regex` 可在
+`line` 或 `background` 模式等待命令專屬的 producer 完成標記。請使用每次新產生、
+錨定行首的標記，包含數字 exit code 與獨立 END 行；命令 echo 本身不算完成證據。
+Regex 必須可編譯、不超過 1024 UTF-8 bytes 且不能匹配空串；無效值在排隊／TX 前
+回 `INVALID_COMPLETION_REGEX`。省略時沿用等待 prompt 的行為。Stdout 仍以 profile
+prompt 擷取，但只裁切完成標記之後的 prompt，保留早先 prompt redraw 之後的結果
+與完成標記供呼叫端驗證；`command.get` 與 WAL META 記錄設定，
+reboot 保留既有 recovery 流程。詳見[命令完成條件](docs/command-completion.md)。
 
 **命令限制**：命令字串不得含有 `\n` 換行字元，否則回傳 `CMD_CONTAINS_NEWLINE`。命令長度（UTF-8 位元組）> 4 KB 回 warning（`CMD_LENGTH_WARNING`），> 16 KB 拒絕（`CMD_TOO_LONG`）；broker 對命令內容不做截斷。注意這是 **broker 對單一 `--cmd` 參數的上限**，與 **target 端 tty line buffer（常見 4096 bytes）的物理單行限制**是兩回事——即使 broker 接受，過長單行仍可能在 target 端被截斷。上限可由 `serialwrap daemon status` 回應的 `limits` 欄位執行期查詢（`max_submit_cmd_bytes`／`warn_submit_cmd_bytes`／`reject_error_code`／`newline_error_code`／`warning_code`／`newline_forbidden`），client 不需硬編碼（#129）。
 

@@ -2131,6 +2131,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_cs.add_argument("--priority", type=int, default=10)
     p_cs.add_argument("--cmd-timeout", dest="cmd_timeout_s", type=float, default=10.0)
     p_cs.add_argument("--expected-duration", dest="expected_duration_s", type=float, default=None)
+    p_cs.add_argument("--completion-regex", default=None, help="每命令完成 regex（最多 1024 UTF-8 bytes）；省略則等待 profile prompt")
     p_cg = cmd_sub.add_parser("status", help="查詢命令狀態與 stdout（line 模式讀這裡）")
     p_cg.add_argument("--cmd-id", required=True)
     p_cr = cmd_sub.add_parser("result-tail", help="增量讀取 background 命令的結果 chunk")
@@ -2587,6 +2588,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "cmd":
         if args.cmd_cmd == "submit":
+            from .command_completion import ERROR_INVALID_COMPLETION_REGEX, valid_completion_regex
+            if not valid_completion_regex(args.completion_regex):
+                _print({"ok": False, "error_code": ERROR_INVALID_COMPLETION_REGEX})
+                return 1
             submit_params: dict[str, Any] = {
                 "selector": args.selector,
                 "cmd": args.command_text,
@@ -2597,6 +2602,8 @@ def main(argv: list[str] | None = None) -> int:
             }
             if args.expected_duration_s is not None:
                 submit_params["expected_duration_s"] = args.expected_duration_s
+            if args.completion_regex is not None:
+                submit_params["completion_regex"] = args.completion_regex
             return _run_rpc(args, "command.submit", submit_params)
         if args.cmd_cmd == "status":
             return _run_rpc(args, "command.get", {"cmd_id": args.cmd_id})

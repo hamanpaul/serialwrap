@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import logging
 import re
 import time
 import uuid
@@ -182,8 +183,16 @@ def _finalize_ready(bridge: UARTBridge, sp: SessionProfile) -> tuple[bool, str |
 
     nonce = uuid.uuid4().hex[:8]
     probe = sp.ready_probe.replace("${nonce}", nonce)
+    if sp.console_unlock_env:
+        # 隱藏 lock 的舊 prompt 與 terminal echo 都不能作為解鎖證據。
+        bridge.clear_rx_buffer()
     bridge.send_command(probe, source="system")
-    ok, err = _wait_or_fail(bridge, nonce, sp.timeout_s, "READY_NONCE_TIMEOUT")
+    nonce_pattern = (
+        rf"(?m)^__READY__{re.escape(nonce)}\r?$"
+        if sp.console_unlock_env and sp.ready_probe == "echo __READY__${nonce}"
+        else nonce
+    )
+    ok, err = _wait_or_fail(bridge, nonce_pattern, sp.timeout_s, "READY_NONCE_TIMEOUT")
     if not ok:
         # #174 分流：同上，nonce 等不到時 rx tail 若已回到 login/password prompt，
         # 同樣改回 LOGIN_REQUIRED。
@@ -236,6 +245,8 @@ def probe_ready(bridge: UARTBridge, sp: SessionProfile) -> tuple[bool, str | Non
 
 
 def ensure_ready(bridge: UARTBridge, sp: SessionProfile, auth: SessionAuth | None = None) -> tuple[bool, str | None]:
+    if sp.console_unlock_env:
+        return _ensure_console_unlocked(bridge, sp, auth)
     if not _probe_prompt(bridge, sp):
         ok, err = _maybe_login(bridge, sp, auth)
         if err is not None:
@@ -246,6 +257,71 @@ def ensure_ready(bridge: UARTBridge, sp: SessionProfile, auth: SessionAuth | Non
     if not ok:
         return ok, _maybe_reclassify_flood(bridge, err)
     return ok, err
+
+
+def _console_at_bootloader(bridge: UARTBridge, sp: SessionProfile) -> bool:
+    """只看目前尾行，已離開 CFE 的歷史 banner 不阻擋 Linux console。"""
+    tail = _console_tail_line(bridge)
+    return any(re.search(pattern, tail) for pattern in sp.bootloader_prompts)
+
+
+def _console_tail_line(bridge: UARTBridge) -> str:
+    return clean_text(bridge.rx_tail()).rstrip("\r\n").split("\n")[-1]
+
+
+def _wait_console_idle(bridge: UARTBridge, sp: SessionProfile, deadline: float) -> bool:
+    """每筆真實 RX 都重設靜默計時；此階段完全不送 UART bytes。"""
+    start = time.monotonic()
+    while time.monotonic() < deadline:
+        if time.monotonic() - start >= sp.console_unlock_idle_s and bridge.rx_idle_s() >= sp.console_unlock_idle_s:
+            return True
+        time.sleep(min(0.05, max(0.001, deadline - time.monotonic())))
+    return False
+
+
+def _ensure_console_unlocked(
+    bridge: UARTBridge, sp: SessionProfile, auth: SessionAuth | None,
+) -> tuple[bool, str | None]:
+    """隱藏 console lock：靜默後辨識 prompt，必要時才送不記錄的 secret。"""
+    secret = auth.console_unlock if auth is not None else None
+    if not secret:
+        return False, "CREDENTIALS_UNRESOLVED"
+    deadline = time.monotonic() + sp.timeout_s
+    if not _wait_console_idle(bridge, sp, deadline):
+        return False, "CONSOLE_UNLOCK_IDLE_TIMEOUT"
+    if _console_at_bootloader(bridge, sp):
+        return False, "CONSOLE_UNLOCK_BOOTLOADER"
+
+    # 新 bridge 未必收到早已顯示的 shell prompt；靜默滿額後才送空行辨識，
+    # 避免把 secret 當成已解鎖 shell 的可執行命令。
+    prompt = re.search(sp.prompt_regex, _console_tail_line(bridge)) is not None
+    if not prompt:
+        bridge.clear_rx_buffer()
+        bridge.send_command("", source="system")
+        # RX 靜默門檻與 prompt 回應期限是不同量測。低 idle 設定仍須給
+        # reader／target 排程足夠時間，避免已解鎖 shell 被誤判成 lock。
+        prompt = bridge.wait_for_regex(sp.prompt_regex, min(1.0, max(0.0, deadline - time.monotonic())))
+    if not prompt:
+        if not _wait_console_idle(bridge, sp, deadline):
+            return False, "CONSOLE_UNLOCK_IDLE_TIMEOUT"
+        if _console_at_bootloader(bridge, sp):
+            return False, "CONSOLE_UNLOCK_BOOTLOADER"
+        # 此 buffer 已在空行 probe 前清空；接受等待期間到達的新 prompt，
+        # 即使後面緊接非同步 log，也不可把 secret 送成已解鎖 shell 的命令。
+        if re.search(sp.prompt_regex, clean_text(bridge.rx_text_from(0))) is not None:
+            return _finalize_ready(bridge, sp)
+        idle_s = bridge.rx_idle_s()
+        if idle_s < sp.console_unlock_idle_s:
+            return False, "CONSOLE_UNLOCK_IDLE_TIMEOUT"
+        logging.getLogger("serialwrap").info(
+            "console unlock attempt com=%s rx_idle_s=%.3f required_idle_s=%.3f",
+            sp.com, idle_s, sp.console_unlock_idle_s,
+        )
+        bridge.clear_rx_buffer()
+        bridge.send_secret(secret)
+        if not bridge.wait_for_regex(sp.prompt_regex, sp.timeout_s):
+            return False, "CONSOLE_UNLOCK_PROMPT_TIMEOUT"
+    return _finalize_ready(bridge, sp)
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +346,7 @@ def detect_template(
     # 第一輪：嘗試 prompt_regex（已處於可操作 prompt）
     login_candidate: ProfileTemplate | None = None
     for tpl in templates:
-        if tpl.platform == "passthrough":
+        if tpl.platform == "passthrough" or tpl.console_unlock_env:
             continue
         try:
             if re.search(tpl.prompt_regex, snapshot):

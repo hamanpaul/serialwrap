@@ -125,6 +125,7 @@ REPROBE_MAX_ATTEMPTS: int = 10
 BOOT_BANNER_PATTERNS: tuple[str, ...] = (
     "U-Boot",
     "Hit any key to stop autoboot",
+    "CFE version ",
 )
 """boot banner 偵測樣式（**大小寫敏感的 substring 比對，非 regex**）。
 
