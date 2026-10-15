@@ -56,7 +56,7 @@
 | SC-20 | 新子命令 `daemon restart`：systemd 與 windows 模式轉為 `service restart`；on-demand 模式執行 stop、等待結束、再 start（同一 endpoint） | §4.2 #14 | 雙邊 |
 | SC-21 | `remote stop <port\|all>` 作為 `remote close` 的別名，原名照常可用 | §4.2 #17 | 雙邊 |
 | SC-22 | `supervision-mode set <mode> [--force] [--with-sudo]`：輸出 JSON，走與 setup 相同的 reconcile；不帶參數時維持輸出純文字 | §4.2 #16 | Rust-only（1B） |
-| SC-23 | `setup --rollback`、版本目錄、Current／Previous、規格 §12.1 的七步更新流程；第 2 步交接安全檢查不受 `--force` 影響（Flash／FileTransfer 等不可安全中止操作進行中一律拒絕，不停止監管或 daemon）；第 3 步停止只經 SC-11 `daemon.handoff_stop` 原子交接（CLI 預檢後才開始的 `file.push`／flash 由 daemon 判定忙碌而拒絕；daemon 不支援或結果不明時 fail-closed，不送一般 `daemon.stop`、不硬停，R1-F1）；中斷復原的 `install-journal.json` 在停用前即持久保存原始入口／current／config／監管 enabled・running／daemon 快照，備份完整提交（`backup_complete`）前不切換，復原失敗保留 journal（R1-F5，P4 Task 12） | §4.2 #19、§12.1 | Rust-only（1B） |
+| SC-23 | `setup --rollback`、版本目錄、Current／Previous、規格 §12.1 的七步更新流程；第 2 步交接安全檢查不受 `--force` 影響（Flash／FileTransfer 等不可安全中止操作進行中一律拒絕，不停止監管或 daemon）；第 3 步停止只經 SC-11 `daemon.handoff_stop` 原子交接（CLI 預檢後才開始的 `file.push`／flash 由 daemon 判定忙碌而拒絕；daemon 不支援或結果不明時 fail-closed，不送一般 `daemon.stop`、不硬停，R1-F1）；第 7 步回退與 journal 中斷復原停止目前在跑的 daemon（第 6 步起已對外服務的新版）同樣只經 `daemon.handoff_stop`（`reason:"revert"`），忙碌、不支援或結果不明時保留 journal、不硬停、不切換回 Previous，待 daemon 閒置後由下一次 `setup` 完成回退（R2-F6）；中斷復原的 `install-journal.json` 在停用前即持久保存原始入口／current／config／監管 enabled・running／daemon 快照，備份完整提交（`backup_complete`）前不切換，復原失敗保留 journal（R1-F5，P4 Task 12） | §4.2 #19、§12.1 | Rust-only（1B） |
 | SC-24 | 監管模式 `windows-task`（`ExecutionTimeLimit=PT0S`）與 `windows-service` | §6.1、OD-03、OD-12 | Rust-only（1B） |
 | SC-25 | release manifest，以及 doctor 的 `version_pairing` 檢查 | §9.5、OD-13 | Rust-only |
 | SC-26 | Windows event handler：`exec` 走 CreateProcess 加 Job；`shell` 走 `cmd.exe /d /s /c`；timeout 時 TerminateJobObject；env 白名單另加 `SYSTEMROOT`、`COMSPEC`、`PATHEXT`、`TEMP`、`TMP`、`USERPROFILE` | §5.5 | Rust-only（owner #6） |
@@ -82,7 +82,7 @@
 | DF-14 | daemon 啟動順序改為：initial scan → `prepare_dynamic_rank` → watcher.start，消除 #100 殘留的 race |
 | DF-15 | RX observer、event engine、background capture 改用該 RX chunk 的精確 WAL seq |
 | DF-16 | Windows `setup` 的 skill link 在不能建 symlink 時改為複製目錄 |
-| DF-17 | WAL 與 mirror 寫入失敗時只重試失敗的那個檔，不再產生重複 seq 的 WAL 行 |
+| DF-17 | WAL 與 mirror 寫入失敗時只重試失敗的那個檔，不再產生重複 seq 的 WAL 行；部分寫入後只補寫剩餘 bytes（依已寫長度 `sent`），補寫再失敗則於下一筆前以 `\n` 終結殘行，不產生被串接的 NDJSON 行（P1 T02 第 3 點、Rust arch §4.5 `WalWriteError`／§5.8 第 5 點，R2-F3） |
 
 ### 1.3 既有核准：BC-01～BC-05
 
@@ -273,7 +273,7 @@
 | UIO-12.1-e | POSIX 忽略 `xonxoff` | — | KEEP | 兩平台的差異收在 PAL 內 | P5 | no |
 | UIO-12.2-a | 沒有 drain | §5.2 | SPEC SC-04 | — | P1/P5 | no |
 | UIO-12.2-b | `_write_all` 遇 EAGAIN 無限重試、無法取消 | §5.2.3 | SPEC SC-04 | 改為可喚醒、可取消 | P1/P5 | no |
-| UIO-12.2-c | 送出前檢查只有兩項 | §5.2.2 | SPEC SC-04 | fence：授權重驗與 OS 實際提交在同一臨界區（Rust `FenceSubmitGate`、Python `_tx_fence_lock` 臨界區內單次非阻塞 `os.write`，`_state_lock` 只做 pre-check），鎖只跨非阻塞提交、不跨完成等待；禁止「驗證→放鎖→write」（R0-F1，arch §5.4 第 3 點；P1 T20、P5 Task 9 測試） | P5 | no |
+| UIO-12.2-c | 送出前檢查只有兩項 | §5.2.2 | SPEC SC-04 | fence：授權重驗與 OS 實際提交在同一臨界區（Rust `FenceSubmitGate`、Python `_tx_fence_lock` 臨界區內單次非阻塞 `os.write`，`_state_lock` 只做 pre-check），鎖只跨非阻塞提交、不跨完成等待；禁止「驗證→放鎖→write」（R0-F1，arch §5.4 第 3 點；P1 T20、P5 Task 9 測試）。範圍含自動登入、密碼與 ready／reconfirm probe：Python 不得以 `permit=None`（只查 drain／flash）送出，改帶 `system_probe` permit＋`login_gen`，每次提交重驗 Quiet、世代與 Drain；`_boot_quiet_blocks_probe` 只是 pre-check（R2-F1，§5.2.1；P1 T20 `test_login_probe_quiet_armed_after_precheck_before_submit_zero_tx`、P7 Task 7 `login_probe_authorized_then_quiet_arm_before_os_submit_is_zero_tx`） | P5 | no |
 | UIO-12.2-d | 沒有 TX 三態 | BC-03 | BC | — | P1/P5 | no |
 | UIO-12.3-a | TX WAL 記整段或完全不記 | §8.1 | SPEC SC-07 | — | P1/P5 | no |
 | UIO-12.3-b | TX WAL 在 write 鎖之外才 append | §8.1 | SPEC SC-07 | — | P1/P5 | no |
@@ -294,6 +294,7 @@
 | UIO-12.9-d | FlashHolderGone 後還原為 `flash_prev_state` | §5.3「回 ATTACHED」 | KEEP | 候選本來就是非 command_capable，實際結果都是 ATTACHED | P8 | no |
 | UIO-12.9-e | holder 從未 armed 時等 1800 s；ACK 判定用 substring 並整段回放 | — | KEEP | 基線 | P8 | no |
 | UIO-12.9-f | baud 只鏡射一次 | — | KEEP | 基線 | P8 | no |
+| UIO-12.9-g | 端點停止旗標（`flash_endpoint.py` 的 `self._stop`）與每次 flash 的局部停止 Event（`service.py:434`）分離；holder gone 只結束本次 pump，端點繼續服務下一次燒錄 | §7.1「穩定 symlink」、§5.3「回 ATTACHED」 | KEEP | Rust 拆為 `EndpointShutdown`（只由 `FlashEndpoint::stop`／Drop 設）與每次 `on_flash_open` 新建的 `FlashRunCancel`（`is_cancelled` 同時反映 shutdown，使 daemon 停止可中止進行中的 flash）；P8 Task 9 `two_consecutive_flashes_same_endpoint`、`shutdown_at_second_flash_start`、黑箱 `test_two_flashes_same_daemon`（R2-F5） | P8 | no |
 | UIO-12.10-a | CR 與 LF 分在兩個 chunk 時多送一個空行 | — | KEEP | 已知缺陷 | P6 | no |
 | UIO-12.10-b | 每個 chunk 獨立 UTF-8 解碼 | — | KEEP | 基線 | P5 | no |
 | UIO-12.10-c | prune 時在鎖內掃 `/proc` | — | IMPL | 效能 | P6 | no |
@@ -480,11 +481,11 @@ Rust 依基線逐字承接以上行為。要修正時另開 issue，並登記新
 
 ## 5. 統計
 
-第 2 節共 296 列（ID 不重複），依「裁決」欄的第一個代號歸類：
+第 2 節共 297 列（ID 不重複），依「裁決」欄的第一個代號歸類：
 
 | 裁決 | 列數 |
 |---|---|
-| KEEP（保留基線並凍結；含 KEEP＋DOC 等以保留為主者） | 151 |
+| KEEP（保留基線並凍結；含 KEEP＋DOC 等以保留為主者） | 152 |
 | SPEC（依定稿規格變更，SC） | 31 |
 | NEW（規格要求的新功能，SC） | 14 |
 | FIX（缺陷／安全修正，DF） | 25 |
@@ -492,6 +493,6 @@ Rust 依基線逐字承接以上行為。要修正時另開 issue，並登記新
 | DOC（只修文件或勘誤） | 26 |
 | TEST（修測試資產） | 11 |
 | IMPL（內部實作差異） | 19 |
-| **合計** | **296** |
+| **合計** | **297** |
 
 登記項目：SC-01～SC-27（27 項）、DF-01～DF-17（17 項），另有既有核准的 BC-01～05。7 列標為需擁有者確認，對應第 3 節的 7 項（第 1 項含 3 列交叉引用），均已附預設值。

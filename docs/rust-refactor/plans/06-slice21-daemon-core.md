@@ -633,7 +633,10 @@ impl FakeWalFs {
     pub fn external_unlink(&self, path: &Path);                    // POSIX 語意：路徑消失、handle 存活、unlinked()=true
     pub fn external_replace(&self, path: &Path, bytes: &[u8]);     // 新 identity 佔用路徑
     pub fn hold_external_reader(&self, path: &Path) -> ExternalHandle; // Windows pending-delete 語意：unlink 後路徑保留到 handle drop
-    pub fn fail_next_writes(&self, path: &Path, n: usize, err: PalError);
+    pub fn fail_next_writes(&self, path: &Path, n: usize, err: PalError);   // 接下來 n 次 write_all_flush 不寫任何 byte，回 Err(WalWriteError{sent:0, error:err})
+    pub fn fail_next_write_partial(&self, path: &Path, accept: usize, err: PalError); // 下一次 write_all_flush 只附加前 min(accept, len-1) bytes，回 Err(WalWriteError{sent:<實際附加數>, error:err})（R2-F3）；與 fail_next_writes 依呼叫順序排入同一佇列
+    pub fn write_calls(&self, path: &Path) -> Vec<Vec<u8>>;        // 依序記錄每次 write_all_flush 收到的 bytes（斷言「只補寫剩餘部分」用）
+    pub fn open_calls(&self, path: &Path) -> usize;                // open_append 成功次數（斷言 sent==0 分支有重開）
     pub fn fail_next_renames(&self, n: usize, err: PalError);
     pub fn fail_next_opens(&self, path: &Path, n: usize, err: PalError);
     pub fn sync_calls(&self, path: &Path) -> usize;
@@ -740,6 +743,7 @@ fn fake_clock_sleep_wakes_on_advance_and_wall_jump_keeps_mono() {
 | `fail_close_reports_error` | `fail_close(e)` 後 `CloseReceipt{closed:false, excl_cleared:false, error:Some(_)}` |
 | `wal_fs_external_unlink_keeps_handle` | `open_append` → `external_unlink` → `file.unlinked() == Ok(true)`、`path_identity == Ok(None)` |
 | `wal_fs_pending_delete_with_external_reader` | `hold_external_reader` 後 `external_unlink`：`path_identity` 仍回 `Some(old)`、`open_append` 回 `Err(kind=AccessDenied)` 直到 handle drop |
+| `wal_fs_partial_write_reports_sent_and_keeps_prefix`（R2-F3） | `fail_next_write_partial(p, 4, PalError::io(28, "[Errno 28] No space left on device"))`；`file.write_all_flush(b"abcdefgh\n")` → `Err(e)`、`e.sent == 4`、`e.error.py_message == "[Errno 28] No space left on device"`、`contents(p) == Some(b"abcd")`；再 `write_all_flush(b"efgh\n")` → `Ok(())`、`contents(p) == Some(b"abcdefgh\n")`、`write_calls(p) == [b"abcdefgh\n", b"efgh\n"]`；`fail_next_writes(p, 1, e)` 後寫入 → `Err(e2)`、`e2.sent == 0`、內容不變 |
 | `mem_stream_roundtrip` | 一端寫 `b"x\n"`，另一端讀到相同 bytes；`close_write` 後讀回 0 |
 | `on_tx_reply_pushes_rx_once` | `on_tx_reply(b"echo hi\n", b"hi\r\n# ")` → 寫 `b"echo hi\n"` 後 `read` 讀到 reply；再寫一次不再推 |
 | `on_tx_match_echoes_nonce` | `on_tx_match(r"^echo __READY__([0-9a-f]{8})$", |l| …)` → 寫 `b"echo __READY__ab12cd34\n"` 後讀到含 `__READY__ab12cd34` 的回覆 |
@@ -760,12 +764,13 @@ Expected：FAIL，`not implemented: slice21 T1 FakeSerialBackend::add_device`。
 - writer.write_gated：`writes+=1`；`cancel.is_cancelled()` 已為真 → `TxResult{outcome: NotSubmitted, error: Some(Cancelled)}`（**只有** fake 在呼叫前取消時才回 NotSubmitted；真實 PAL 由 TxWriter 在呼叫前決定）；依 steps 處理。**所有**「接受 bytes」的動作都放在傳給 `gate.submit` 的 `os_submit` 閉包內（閉包內 `os_submits+=1`、呼叫 `on_os_submit` hook、把 bytes 推入 `tx`）；`gate.submit` 回 `Err(SubmitRevoked)` 時依 arch §4.2 回 `NotSubmitted` 或 `Completed(k)`＋`cancelled`，不再提交。`BlockUntilCancel`／`BlockForever` 先經 gate 提交 `accept_before_cancel`／全部 bytes，再於**閉包外**以 `cond.wait_while(!cancelled)`／等 `blocked_release`（不持 Fence 鎖）；`PauseBeforeSubmit` 在第一次 `gate.submit` 前、`PauseInsideSubmit` 在閉包內、`AcceptThenWouldBlock(n)` 在閉包回 `WouldBlock` 後於閉包外等待 `release_pause`。`write`（無 gate）＝`write_gated(.., &AlwaysOpen)`，供既有 PAL 自測沿用。
 - reader.read：有資料 → 複製最多 `buf.len()`；`woken` → 清旗標回 `Woken`；逾時回 `TimedOut`。
 - FakeWalFs identity 以遞增 `u128` 產生，`FileIdentity(1, id)`。
+- FakeWalFs 寫入失敗佇列（per path，`fail_next_writes` 與 `fail_next_write_partial` 依呼叫順序排入）：每次 `write_all_flush` 先記入 `write_calls`，佇列首項為 `Full(err)` → 不附加、回 `WalWriteError{sent:0, error}`；`Partial(accept, err)` → 附加 `bytes[..min(accept, len-1)]`、回 `WalWriteError{sent:<附加數>, error}`；佇列空 → 全部附加、回 `Ok(())`。`sent` 必須等於實際附加到檔案的 bytes 數（arch §4.5 `WalWriteError`）。
 - `sw_pal::fakes` 只在 `feature = "test-fakes"` 編譯（`#[cfg(feature = "test-fakes")] pub mod fakes;`）。
 
 - [ ] **Step 4：執行並確認 PASS**
 
 Run：`cargo test -p sw-pal --features test-fakes --test fakes_selftest`
-Expected：18 passed。
+Expected：19 passed。
 
 - [ ] **Step 5：Commit**
 
@@ -1423,7 +1428,7 @@ git commit -m "feat(sw-pal): 裝置來源掃描、藍牙排除、測試裝置 al
 - Test: `crates/sw-pal/tests/wal_fs.rs`
 
 **Interfaces:**
-- Consumes：arch §4.5 `WalFs`／`WalFile`／`FileIdentity`。
+- Consumes：arch §4.5 `WalFs`／`WalFile`／`FileIdentity`／`WalWriteError`（`write_all_flush` 失敗必帶 `sent`，R2-F3）。
 - Produces：`native().wal_fs`；`pub fn sw_pal::conformance::wal_fs_suite(fs: Arc<dyn WalFs>, dir: &Path, external: &dyn ExternalFsOps)`，`pub trait ExternalFsOps { fn unlink(&self, p: &Path); fn replace_with(&self, p: &Path, bytes: &[u8]); fn hold_reader(&self, p: &Path) -> Box<dyn Send>; }`（native 版用另一個行程或 std::fs；fake 版用 `FakeWalFs`）。
 
 - [ ] **Step 1：寫失敗測試**
@@ -1459,6 +1464,12 @@ fn fake_conformance() {
 | `sync_is_callable` | `file.sync()` 與 `fs.sync_dir(dir)` 回 `Ok(())` |
 | `read_all_sees_unflushed_free_writes` | `write_all_flush(b"a\n")` 後 `fs.read_all(path) == Ok(Some(b"a\n"))`；不存在 → `Ok(None)`（Task 0 已把 `read_all` 納入 trait） |
 
+POSIX 原生專屬（部分寫入進度，R2-F3；規格 §15.7.1：OS 內部的 partial completion 以決定性 fault test 覆蓋）：
+
+| 測試名 | 精確斷言 |
+|---|---|
+| `posix_rlimit_fsize_partial_write_reports_sent` | 以 `std::env::current_exe()` re-exec 本測試 binary 為子行程（env `SW_PAL_FSIZE_CHILD=1`，避免 rlimit 影響其他測試 thread）；子行程 `signal(SIGXFSZ, SIG_IGN)`＋`setrlimit(RLIMIT_FSIZE, 10)` 後 `open_append(p)`、`write_all_flush(&[b'x'; 64])` → `Err(e)`、`e.sent == 10`、`e.error.os_code == Some(libc::EFBIG)`、`e.error.py_message == "[Errno 27] File too large"`；檔案大小恰 10；子行程以 exit 0 回報、父行程斷言 exit status 與檔案內容 `== [b'x'; 10]` |
+
 Windows 原生專屬：
 
 | 測試名 | 精確斷言 |
@@ -1475,8 +1486,8 @@ Expected：`fake_conformance` PASS，`native_conformance` FAIL：`not implemente
 
 - [ ] **Step 3：實作**
 
-- POSIX：`open(O_WRONLY|O_APPEND|O_CREAT|O_CLOEXEC, 0o666)`（umask 生效）；`write_all_flush` 迴圈 `write` 直到全寫（EINTR 重試），無 user-space buffer；`sync` = `fsync`；`identity` = `fstat (st_dev, st_ino)` → `FileIdentity(dev as u128, ino as u128)`；`unlinked` = `st_nlink == 0`；`path_identity` = `stat`（ENOENT → `None`）；`rename_noreplace_or_suffix`：Linux `renameat2(RENAME_NOREPLACE)`，`EEXIST` → 依序試 `.1`、`.2`…；`EINVAL`／`ENOSYS` → `link(from,to)` + `unlink(from)`；`sync_dir` = `open(dir, O_RDONLY)` + `fsync`；`dir_writable` = `access(W_OK|X_OK)`。
-- Windows：`CreateFileW(FILE_APPEND_DATA|SYNCHRONIZE, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL)`；`sync` = `FlushFileBuffers`；`identity` = `FileIdInfo`；`unlinked` = `FileStandardInfo.DeletePending`；`path_identity`：`CreateFileW(0 access, share RWD, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS)`，`ERROR_FILE_NOT_FOUND|ERROR_PATH_NOT_FOUND` → `None`，`ERROR_ACCESS_DENIED`（delete pending）→ `Err(kind=AccessDenied)`；`rename_noreplace_or_suffix` 用 `MoveFileExW(flags=0)`，`ERROR_ALREADY_EXISTS` → 下一個後綴；`sync_dir` 回 `Ok(())`；`dir_writable` = 目錄存在且無 `FILE_ATTRIBUTE_READONLY`。
+- POSIX：`open(O_WRONLY|O_APPEND|O_CREAT|O_CLOEXEC, 0o666)`（umask 生效）；`write_all_flush` 迴圈 `write(bytes[sent..])` 直到全寫（EINTR 重試），無 user-space buffer；每次成功 `write` 累加 `sent`，`write` 回 0 → `WalWriteError{sent, error: PalError::io(EIO, "[Errno 5] Input/output error")}`、回 -1（非 EINTR）→ `WalWriteError{sent, error: <errno 對應 PalError>}`，**不得**丟棄已累加的 `sent`（arch §4.5，R2-F3）；`sync` = `fsync`；`identity` = `fstat (st_dev, st_ino)` → `FileIdentity(dev as u128, ino as u128)`；`unlinked` = `st_nlink == 0`；`path_identity` = `stat`（ENOENT → `None`）；`rename_noreplace_or_suffix`：Linux `renameat2(RENAME_NOREPLACE)`，`EEXIST` → 依序試 `.1`、`.2`…；`EINVAL`／`ENOSYS` → `link(from,to)` + `unlink(from)`；`sync_dir` = `open(dir, O_RDONLY)` + `fsync`；`dir_writable` = `access(W_OK|X_OK)`。
+- Windows：`CreateFileW(FILE_APPEND_DATA|SYNCHRONIZE, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL)`；`write_all_flush` 迴圈 `WriteFile`，以每次 `lpNumberOfBytesWritten` 累加 `sent`，失敗時同樣回 `WalWriteError{sent, error}`；`sync` = `FlushFileBuffers`；`identity` = `FileIdInfo`；`unlinked` = `FileStandardInfo.DeletePending`；`path_identity`：`CreateFileW(0 access, share RWD, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS)`，`ERROR_FILE_NOT_FOUND|ERROR_PATH_NOT_FOUND` → `None`，`ERROR_ACCESS_DENIED`（delete pending）→ `Err(kind=AccessDenied)`；`rename_noreplace_or_suffix` 用 `MoveFileExW(flags=0)`，`ERROR_ALREADY_EXISTS` → 下一個後綴；`sync_dir` 回 `Ok(())`；`dir_writable` = 目錄存在且無 `FILE_ATTRIBUTE_READONLY`。
 - 每個 `WalFile` 的 `close` 只能呼叫一次（`self: Box<Self>`），`Drop` 未 close 時也關 handle（唯一關閉點，規格 §8.2）。
 
 - [ ] **Step 4：執行並確認 PASS**
@@ -1627,6 +1638,49 @@ fn reopen_failure_marks_unhealthy_and_trips_sink() {
     assert_eq!(h.last_write_error.as_deref(), Some("OSError: [Errno 28] No space left on device"));
     assert_eq!(*sink.0.lock().unwrap(), vec![false, true]);          // register 時初始化 false，之後轉 true
 }
+
+#[test]
+fn wal_partial_write_suffix_failure_terminates_tail_next_record_parses() {   // R2-F3；對應 P1 T02 test_partial_write_suffix_failure_terminates_tail
+    let (w, fs, _) = writer(67_108_864);
+    let wal = Path::new("/w/raw.wal.ndjson");
+    let enospc = || sw_pal::PalError::io(28, "[Errno 28] No space left on device");
+    fs.fail_next_write_partial(wal, 10, enospc());                     // 第一次只寫出 JSON 前綴 10 bytes 即 ENOSPC
+    fs.fail_next_writes(wal, 1, enospc());                             // 補寫剩餘部分也失敗
+    let a = w.append(req("RX", "device", b"x", None));
+    assert_eq!(a, WalAppend { seq: 1, ok: false, loss_flag: true });
+    let calls = fs.write_calls(wal);
+    let line1 = calls[0].clone();
+    assert_eq!(calls, vec![line1.clone(), line1[10..].to_vec()]);      // 只補寫 data[sent..]，絕不整行重寫
+    assert_eq!(fs.open_calls(wal), 1);                                  // 補寫在同一 handle，不重開
+    assert_eq!(fs.contents(wal).unwrap(), line1[..10].to_vec());        // 檔案只有前綴，沒有「前綴＋完整行」
+    let h = w.health();
+    assert_eq!(h.write_failures, 1);
+    assert!(!h.healthy);                                                // 補寫失敗不得標為健康
+    assert_eq!(h.unhealthy_reason, Some("write_failed"));
+    assert_eq!(h.last_write_error.as_deref(), Some("OSError: [Errno 28] No space left on device"));
+
+    let b = w.append(req("RX", "device", b"y", None));
+    assert_eq!(b, WalAppend { seq: 2, ok: true, loss_flag: false });
+    let calls = fs.write_calls(wal);
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[2][0], b'\n');                                     // 先終結殘行（dirty_tail，arch §5.8 第 5 點）
+    let mut expect = line1[..10].to_vec(); expect.extend_from_slice(&calls[2]);
+    let bytes = fs.contents(wal).unwrap();
+    assert_eq!(bytes, expect);
+    let text = String::from_utf8(bytes).unwrap();
+    let lines: Vec<&str> = text.split_terminator('\n').collect();
+    assert_eq!(lines.len(), 2);
+    assert!(sw_proto::pyjson::loads(lines[0]).is_err());                // 殘行獨立成行，讀取端判為無效
+    let rec = sw_proto::pyjson::loads(lines[1]).unwrap();
+    assert_eq!(rec.as_dict().unwrap().get("seq"), Some(&PyValue::from(2)));
+    assert!(lines.iter().all(|l| l.matches("\"seq\":").count() <= 1)); // 無串接的 NDJSON 行
+    let (rows, _) = w.tail_raw_with_meta(None, None, 100).unwrap();
+    assert_eq!(rows.len(), 1);                                          // 讀取 API 略過殘行、只回 seq 2
+    assert_eq!(rows[0].get("seq"), Some(&PyValue::from(2)));
+    let h = w.health();
+    assert!(h.healthy);
+    assert_eq!(h.unhealthy_reason, None);
+}
 ```
 
 其餘案例：
@@ -1648,6 +1702,10 @@ fn reopen_failure_marks_unhealthy_and_trips_sink() {
 | `meta_not_in_com0_tail` | 重建 META 後 `tail_raw_with_meta(None, Some("COM0"), 100)` 不含 META；`com=None` 時含 |
 | `wal_contract_golden_matches_p1` | 讀 P1 `contracts/golden/wal/*.json`（Python 擷取的紀錄位元組）逐案以同輸入重放，輸出位元組相同 |
 | `wal_write_failure_twice_sets_loss_flag_and_consumes_seq` | WAL 寫入連續失敗 2 次 → 回 `WalAppend{seq:1, ok:false, loss_flag:true}`、`write_failures==1`；下一筆成功 `seq==2`（seq 缺口保留，04 §1.7） |
+| `wal_partial_write_then_failure_completes_suffix_only`（R2-F3；對應 P1 `test_partial_write_then_eio_completes_suffix_only`） | `fail_next_write_partial(wal, 10, PalError::io(5, "[Errno 5] Input/output error"))`、補寫成功 → `WalAppend{seq:1, ok:true, loss_flag:false}`；`write_calls(wal) == [line, line[10..]]`；`open_calls(wal) == 1`（同 handle 補寫、不重開）；`contents(wal) == line`（恰一行、`loads` 成功、全檔 `"seq":1` 只出現一次，且不含 `line[..10] ++ line`）；`write_failures == 0`、`healthy == true` |
+| `wal_zero_sent_failure_rewrites_whole_line_after_reopen`（R2-F3） | `fail_next_writes(wal, 1, EIO)`（`sent == 0`）→ `ok:true`；`write_calls(wal) == [line, line]`、`open_calls(wal) == 2`（關閉→`ensure_dir`→重開後整行重寫一次）；`contents(wal) == line`；`write_failures == 0` |
+| `wal_reopen_retry_partial_sets_dirty_tail`（R2-F3） | `fail_next_writes(wal, 1, EIO)` 後接 `fail_next_write_partial(wal, 7, EIO)`（整行重寫時又只寫 7 bytes）→ `WalAppend{seq:1, ok:false, loss_flag:true}`；`write_calls(wal) == [line1, line1]`（不做第三次嘗試）、`contents(wal) == line1[..7]`；下一筆 append → `write_calls(wal)[2][0] == b'\n'`、檔案依 `\n` 分成兩行：第一行 `loads` 失敗、第二行 `seq == 2` 可解析 |
+| `mirror_partial_write_completes_suffix_only`（R2-F3） | `fail_next_write_partial(mirror, 3, EACCES)`、補寫成功 → `contents(mirror) == to_printable(payload)`（無重複前綴）、`write_calls(mirror) == [p, p[3..]]`；WAL 只一行 seq=1（DF-17）；`write_failures == 0` |
 | `startup_seq_is_max_int_seq_in_current_file` | 預置檔含 seq 5、9、7、壞行、`{"seq":"x"}` → `current_seq()==9`；下一筆 `seq==10`；`available_from_seq()==Some(5)` |
 | `reset_renames_nonempty_files_independent_suffix` | `reset()` → `WalReset{previous_seq:N, rotated_suffix:<WAL 實際歸檔後綴>}`；預置同秒歸檔 `raw.wal.ndjson.20261015-030617` 時回 `"20261015-030617.1"`，mirror 依自身既有歸檔獨立取後綴；空檔不改名；下一筆 seq=1 |
 | `reset_rename_error_propagates_and_keeps_seq` | rename 失敗 → `Err(_)`，`current_seq()` 不變（呼叫端轉 `EXCEPTION`） |
@@ -1682,8 +1740,8 @@ pub fn append(&self, r: WalAppendReq<'_>) -> WalAppend {
         crc32_hex: crc, payload_b64: b64, loss_flag: r.loss_flag, meta: r.meta.unwrap_or_default(),
         rotation_failed: rotation_failed.then_some(true) };
     let line = rec.to_line();                             // DISK_STABLE + "\n"
-    let wal_ok = self.write_with_one_retry(&mut g, Target::Wal, line.as_bytes());
-    let mir_ok = if r.payload.is_empty() { true } else { self.write_with_one_retry(&mut g, Target::Mirror, printable.as_bytes()) };
+    let wal_ok = self.write_target_locked(&mut g, Target::Wal, line.as_bytes());      // sent／dirty_tail 協定（arch §5.8 第 5 點，R2-F3）
+    let mir_ok = if r.payload.is_empty() { true } else { self.write_target_locked(&mut g, Target::Mirror, printable.as_bytes()) };
     let ok = wal_ok && mir_ok;
     if !wal_ok { g.write_failures += 1; }
     if !mir_ok { g.write_failures += 1; }                 // P1：mirror 重試失敗同樣計入並更新 last_write_error
@@ -1692,7 +1750,14 @@ pub fn append(&self, r: WalAppendReq<'_>) -> WalAppend {
 }
 ```
 
-- `write_with_one_retry`：寫失敗 → `ensure_dir` → 依錯誤決定重開該 handle（ENOENT 類 → 重開並記 `reason:"dir_missing"` META 於下一次成功寫入前）→ 再寫一次；只重試失敗的那個檔（DF-17）。`last_write_error = format!("{}: {}", e.py_exc_name(), e.py_message)`（`PalError::py_exc_name`，Task 0）。
+- `write_target_locked(g, t, data) -> bool`（取代原「失敗就整行重寫一次」的 `write_with_one_retry`，R2-F3；逐條對齊 P1 T02 第 3 點 `PartialWriteError.sent`／`_dirty_tail` 協定）：只重試失敗的那個檔（DF-17），每檔最多一次重試；以 `WalWriteError.sent` 承接已寫進度：
+  1. `g.dirty_tail[t]` 為真 → 本次資料改為 `buf = b"\n" ++ data`、`term = 1`；否則 `buf = data`、`term = 0`。handle 為 None 時先 `open_append`（開檔失敗視為 `sent == 0`）。
+  2. 第一次 `write_all_flush(buf)`：`Ok` → 清 `dirty_tail[t]`、回 true（之後任何錯誤都不得重寫本筆）。
+  3. `Err(WalWriteError{sent: 0, ..})` → 關閉該 handle → `ensure_dir` → 重開（ENOENT 類 → 記 `reason:"dir_missing"` META 於下一次成功寫入前）→ **整段** `buf` 重寫一次。
+  4. `Err(WalWriteError{sent: k, ..})`，`0 < k < buf.len()` → **不得重寫整段、不得重開**；同一 handle 只補寫 `buf[k..]` 一次。
+  5. 重試結果：成功 → 清 `dirty_tail[t]`、回 true。失敗 → 以「本次已確認總長 `c`」（步驟 3 為重寫那次的 `sent`；步驟 4 為 `k + 補寫的 sent`）判定：`term < c < buf.len()` → `dirty_tail[t] = true`（殘行留待下一筆先以 `\n` 終結）；`c <= term` → 未產生新殘行，`dirty_tail[t] = (c < term)`（終結 `\n` 尚未寫出才保留旗標）；回 false。不做第三次嘗試。
+  6. 旗標以 WAL／mirror 為單位（與 P1 `_dirty_tail[which]` 相同）；rotate／自癒重建後的新檔若旗標仍為真，首次寫入同樣先寫 `\n`（空行由讀取端略過，與 P1 位元組一致）。
+  `last_write_error = format!("{}: {}", e.error.py_exc_name(), e.error.py_message)`（取最後一次錯誤；`PalError::py_exc_name`，Task 0）。WAL 回 false（含部分寫入後補寫失敗）即「首次＋重試皆失敗」，由 `update_health_locked` 設 `unhealthy_reason="write_failed"`；下一筆完整寫出才清除。
 - 自癒：`check_identity_locked` 比對 `fs.path_identity(wal_path)` 與 `file.identity()`、`file.unlinked()`；`None`／`unlinked` → `reason:"external_unlink"`，不同 identity → `"replaced"`，路徑 `AccessDenied`（Windows pending delete）→ `"external_unlink"`；保存 `previous_identity = format!("{}:{}", id.0, id.1)`、範圍 `[file_first_seq, seq]`（`file_first_seq` 未知時 `null`、`range_known:false`）；關舊 handle；重開最多 3 次（間隔 `clock.sleep(10/50/200 ms)`）；成功 → `recreated_count += 1`、寫 META（外層 `dir:"META"`、`source:"system"`、`cmd_id:null`、`com:"WAL"`（P1 T05 凍結，不用觸發的 com）、`loss_flag:true`，`seq` 消耗一號）、`file_first_seq = META seq`；失敗 → `unhealthy_reason="recreate_failed"`、fanout `set_wal_unhealthy(true)`，之後每筆 append 仍受同一個 50 ms mono 節流，到期時再做一輪有界（3 次）重試（P1 T05 第 5 點），成功後清除並 fanout `false`。mirror 的 identity 檢查同節流、只重開不寫 META。
 - rotate／reset 照 arch §5.8（同一鎖內 flush、`sync()`、`rename_noreplace_or_suffix`、成功才關舊 handle、開新檔、`sync_dir`；size 以「開檔時 `fs.size()` ＋ 已寫 bytes」追蹤）。
 - `health`：不取主鎖，以 `AtomicU64`／`ArcSwap` 等價快照；`healthy = dir_exists && dir_writable && !(seq>0 && !file_exists) && unhealthy_reason.is_none()`。`WalWriter::open` 不開檔（lazy，P1）但評估 `fs.dir_writable(dir)`：不可寫 → `unhealthy_reason="dir_unwritable"` 並在 `set_health_sink` 時立即 fanout `true`。
@@ -1702,7 +1767,7 @@ pub fn append(&self, r: WalAppendReq<'_>) -> WalAppend {
 - [ ] **Step 4：執行並確認 PASS**
 
 Run：`cargo test -p sw-core --features test-fakes --test wal_writer && cargo test -p sw-pal --features test-fakes --test wal_fs`
-Expected：`wal_writer` PASS（29 項：4 個程式碼案例＋25 列表格）。
+Expected：`wal_writer` PASS（34 項：5 個程式碼案例＋29 列表格；含 R2-F3 的部分寫入 4 列＋1 程式碼案例）。
 
 - [ ] **Step 5：Commit**
 
@@ -3214,6 +3279,7 @@ fn submit_during_agent_lease_is_rejected_at_execute_time() {
 | `open_attached_rescue_three_arms` | ATTACHED＋`allow_attached` 三種 RX tail：bootloader prompt 命中 → `recovery_mode:true` 且**無** `boot_interrupt`／`login_required` 鍵；banner → `boot_interrupt:true`；login／password prompt → `login_required:true`（#174，CREDENTIALS_UNRESOLVED session 的救回路徑） |
 | `lease_send_after_close_is_zero_tx` | lease close 後以舊 `interactive_id` `InteractiveSend` → `INTERACTIVE_NOT_FOUND`；已排入 TxWriter 但未寫出的舊 `LeaseOwner` job 被 fence `OwnerMismatch` 拒絕（`write_calls` 不增，§11.3 不回放失效上下文） |
 | `lease_send_after_expiry_or_quiet_is_zero_tx` | lease 到期或 banner 觸發 quiet re-arm 後，先前已排入的 `LeaseOwner` job → `OwnerMismatch`，零 TX |
+| `rescue_lease_send_during_quiet_reaches_uart`（R2-F2，規格 §5.2.1「有效 Lease 可中斷 autoboot」） | ATTACHED、RX `Hit any key to stop autoboot:  3` 觸發 quiet（`fence.quiet_active == true`）；`InteractiveOpen{allow_attached:true}` → `recovery_mode:true`、`boot_interrupt:true`；之後 `InteractiveSend{data:"ctrl-c",encoding:"key"}`（permit 於 send 當下以現行 `owner_gen` 建構）→ `{"ok":true,"interactive_id":…,"bytes":1}`、`write_calls() == [b"\x03"]`、TX WAL 恰 1 行 `source == "agent:…"`；送出後 `quiet_active` 仍為 true。對照：另一 rig 為 READY 且 banner 已觸發 quiet、同時持有效 agent lease——`CmdSubmit` → `AUTOBOOT_QUIET`＋`retry_after_s`、`write_calls()` 不增，而該 lease 的 `InteractiveSend` 照常寫出 1 次；lease 到期後同一 `InteractiveSend` → `INTERACTIVE_EXPIRED`、`write_calls()` 不增 |
 | `send_encodings` | `plain` UTF-8 replace；`base64` 非 strict（`"aGk=\n!"` → `b"hi"`）；`key` 的 9 個鍵值；未知 → `Err(PyErr("INVALID_INTERACTIVE_ENCODING"))` |
 | `send_expired_closes` | `timeout_s=1` advance 1.001 s → `{"ok":false,"error_code":"INTERACTIVE_EXPIRED","interactive_id":…}`；之後 `INTERACTIVE_NOT_FOUND` |
 | `status_touches_and_returns_screen` | `status` 延長期限；回 `{"ok":true,"interactive_id","owner","status":"active","recovery_mode":false,"screen":<clean_text(tail(2048))>,"session"}` |

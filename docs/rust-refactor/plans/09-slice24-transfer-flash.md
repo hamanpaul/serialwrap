@@ -1470,7 +1470,7 @@ fn device_detached_during_flashing_is_deferred() {
 - Create: `crates/sw-core/src/flash_endpoint/detect.rs`、`coordinator.rs`、`pump.rs`、`holder_watch.rs`
 - Modify: `crates/sw-core/src/uart_bridge.rs`（Reader thread：WAL append 之後、console fan-out 之前呼叫 `FlashCoordinator::rx_observer`；`IoWorker`／`OpenedBridge` 加 `line_control: Arc<dyn SerialLineControl>`，於 `split()` 前自 Task 7 `SerialHandle::line_control()` 取得）
 - Modify: `crates/sw-core/src/session_manager.rs`（`pub fn tx_for(&self, com: &str) -> Option<TxWriterHandle>`、`pub fn line_control_for(&self, com: &str) -> Option<Arc<dyn SerialLineControl>>`、`pub fn send_control(&self, com: &str, ev: ControlEvent) -> bool`；皆取 actor 目前 `conn_epoch` 的值，epoch 失效回 None）
-- Create: `crates/sw-core/tests/support/flash_rig.rs`（測試作者交付：`FlashRig`／`Mcu`，以 fakes 組裝；原計畫放 `src/flash_endpoint/testkit.rs` 改為測試支援檔）；Modify: `crates/sw-core/tests/support/mod.rs`（P5 06 Task 11 已建；只追加 `pub mod flash_rig;`）
+- Create: `crates/sw-core/tests/support/flash_rig.rs`（測試作者交付：`FlashRig`／`Mcu`，以 fakes 組裝；含 R2-F5 所需 `holder_sequence`、`run_until_state`、`coord()`、`endpoint()`、`endpoint_shutdown()`、`events_of`、`flash_mode`、`flash_critical`、`ttymcu_link_exists`、`stop_endpoint`、`stop_endpoint_on_next_run_registered`（於 `current_run` 登記後、第一個 probe 前在另一 thread 呼叫 `stop()`，回傳可 `join_within` 取 `EndpointStopReceipt` 的 handle）；原計畫放 `src/flash_endpoint/testkit.rs` 改為測試支援檔）；Modify: `crates/sw-core/tests/support/mod.rs`（P5 06 Task 11 已建；只追加 `pub mod flash_rig;`）
 - Test: `crates/sw-core/tests/flash_coordinator.rs`、`tests/contract_blackbox/test_s24_flash_endpoint.py`（fixtures `fake_mcu`、`FakeFlasher` 由 Task 0 提供）
 
 **Interfaces:**
@@ -1487,47 +1487,63 @@ fn device_detached_during_flashing_is_deferred() {
   // coordinator.rs
   #[derive(Debug, Clone, PartialEq)]
   pub struct LastDetect { pub status: DetectStatus, pub com: Option<String>, pub family: Option<String>, pub hits: Vec<(String, Option<String>)> }
-  pub struct FlashCoordinator { /* mgr, registry, clock, uart_excl, Mutex<FlashShared> */ }
+  // 兩層停止旗標（R2-F5；對照 Python：flash_endpoint.py 的 self._stop 為端點停止旗標，service.py:434 每次 flash 另建局部 threading.Event）
+  /// 端點停止旗標：只由 FlashEndpoint::stop／Drop（daemon 停止序）設定；端點 thread 迴圈只看它。整個 daemon 生命週期一個。
+  #[derive(Clone)] pub struct EndpointShutdown { /* Arc<AtomicBool> + Arc<dyn IoWaker>（喚醒端點 thread 的 wait_readable） */ }
+  impl EndpointShutdown { pub fn new(waker: Arc<dyn IoWaker>) -> Self; pub fn set(&self); pub fn is_set(&self) -> bool; }
+  /// 單次 flash 的取消旗標：on_flash_open 進入時新建（每次 open 一個新值，絕不重用），由 detection probe、pump、holder watcher 共用；
+  /// is_cancelled() == 本身已取消 || endpoint_shutdown.is_set()。holder watcher 結束（armed→空、或 max 逾時）只呼叫 cancel()，**不得**設 EndpointShutdown。
+  #[derive(Clone)] pub struct FlashRunCancel { /* own: Arc<AtomicBool>, shutdown: EndpointShutdown, waker: Arc<dyn IoWaker> */ }
+  impl FlashRunCancel { pub fn new(shutdown: &EndpointShutdown, waker: Arc<dyn IoWaker>) -> Self; pub fn cancel(&self); pub fn is_cancelled(&self) -> bool; }
+  pub struct FlashCoordinator { /* mgr, registry, clock, uart_excl, endpoint_shutdown, Mutex<FlashShared>（含 current_run: Option<FlashRunCancel>） */ }
   impl FlashCoordinator {
       pub fn new(mgr: Arc<SessionManager>, registry: Arc<McuPatternRegistry>, clock: Arc<dyn Clock>,
-                 uart_excl: Arc<dyn UartExclusive>, console: Arc<dyn ConsoleTransportFactory>, stop: StopFlag) -> Arc<Self>;
+                 uart_excl: Arc<dyn UartExclusive>, console: Arc<dyn ConsoleTransportFactory>, endpoint_shutdown: EndpointShutdown) -> Arc<Self>;
+      /// 進入時於 shared 鎖內建立新 FlashRunCancel 並登記為 current_run；返回前於同鎖內清回 None（之後 FlashRunCancel 不再被任何 thread 參照）
       pub fn on_flash_open(&self, io: &mut FlashPtyIo, first: &[u8]);       // service.py:381-462 等價
+      /// FlashEndpoint::stop 呼叫：同一 shared 鎖內設 endpoint_shutdown 並 wake current_run（若有）——與 on_flash_open 的登記互斥，無遺失喚醒
+      pub fn request_shutdown(&self);
+      #[cfg(feature = "test-fakes")] pub fn current_run_for_test(&self) -> Option<FlashRunCancel>;
       pub fn rx_observer(&self, com: &str, data: &[u8]);                   // service.py:363-379 等價，非阻塞
       pub fn active_com(&self) -> Option<String>;
       pub fn last_detect(&self) -> Option<LastDetect>;
   }
   pub struct FlashPtyIo { pub master: Box<dyn ConsoleIo>, pub slave_path: String, pub slave_ref: PtySlaveRef }
   // flash_endpoint.rs
-  pub struct FlashEndpoint { /* thread "serialwrap-ttyMCU", stop flag, waker, Arc<AtomicBool> active */ }
+  pub struct FlashEndpoint { /* thread "serialwrap-ttyMCU", endpoint_shutdown: EndpointShutdown, waker, Arc<AtomicBool> active */ }
   impl FlashEndpoint {
       /// caps.flash_endpoint=false → Ok(None)；否則 create_pty → tty_setraw → link → 起 thread
       pub fn start(pal: &Platform, link_path: &Path, coord: Arc<FlashCoordinator>, grace: Duration)
           -> PalResult<Option<FlashEndpoint>>;
       pub fn is_flashing(&self) -> bool;
-      pub fn stop(self) -> EndpointStopReceipt;   // set 共用 StopFlag → 喚醒全部等待 → join 端點與 holder thread（各 2.0 s）→ 關 master/slave → unlink
+      #[cfg(feature = "test-fakes")] pub fn thread_alive_for_test(&self) -> bool;   // 端點 thread 尚未結束
+      pub fn stop(self) -> EndpointStopReceipt;   // coord.request_shutdown()（設 EndpointShutdown＋wake 本次 FlashRunCancel）→ 喚醒端點 thread → join 端點與 holder thread（各 2.0 s）→ 關 master/slave → unlink
+      // 只有 stop()／Drop 會設 EndpointShutdown；單次 flash 結束（holder gone、pump NotSubmitted／Eof、max 逾時）只取消該次 FlashRunCancel，端點 thread 繼續服務下一次 open
   }
   pub struct EndpointStopReceipt { pub joined: bool, pub stalled_threads: Vec<&'static str>, pub unlinked: bool }
   // joined=false 時不得宣稱清理完成：WARNING log 列出 stalled_threads，daemon 停止序照常往下（Task 12）並把它列入 incomplete（最終 exit 1），但不關閉仍被 stalled thread 使用的 master
   impl Drop for FlashEndpoint { fn drop(&mut self); }   // 未呼叫 stop 的任何退出路徑（含 panic unwind）仍 unlink ttyMCU
   // holder_watch.rs
-  pub fn watch_flasher_disconnect(excl: &dyn UartExclusive, slave_path: &str, stop: &StopFlag,
+  // 迴圈條件 !run.is_cancelled()；結束（armed 後歸零、max 逾時、run 已取消）一律 run.cancel()；簽章不接受 EndpointShutdown
+  pub fn watch_flasher_disconnect(excl: &dyn UartExclusive, slave_path: &str, run: &FlashRunCancel,
                                   clock: &dyn Clock, poll: Duration, max: Duration);
   // pump.rs
   pub fn pump_endpoint_to_sink(master: &mut dyn ConsoleIo, sink: &mut dyn FnMut(&[u8]) -> bool,
-                               stop: &StopFlag, chunk: usize, select: Duration);  // sink 回 false（NotSubmitted）即結束
+                               run: &FlashRunCancel, chunk: usize, select: Duration);  // sink 回 false（NotSubmitted）、Eof 或 run.is_cancelled() 即結束
   ```
 
 **行為（逐字對照 `inventory/06` §9、`flash_endpoint.py`、`service.py:146-499`）：**
-1. 端點 thread（對照 `flash_endpoint.py:170-195`）：先等可讀：`master.wait_readable(grace)`（等價 `select`）——`TimedOut`／`Woken` → 檢查 stop 後繼續，**從不寫 master**；**等待本身失敗**（等價 `select` 的 `OSError`）→ thread 結束（WARNING log）。可讀後 `master.read(buf[4096])`：`Data(n)` → `first = buf[..n]`；**讀取錯誤或 `Eof`** → `first = b""`（等價 `os.read` 的 `OSError`／`BlockingIOError`），照常往下。若 `active` 未設：設 active → 同步呼叫 `on_flash_open(io, first)`（panic 以 `catch_unwind` 吸收並 WARNING）→ 清 active。未匹配時 `first` 已被讀掉、不回放。
-2. `on_flash_open`：`collect_flash_candidates_and_mark()` → 建 `by_id→com`（略過無 by_id 者）→ `detect_mcu_line`，`ProbeTransport::probe` 實作：
-   - com 不在 map → false；送 `FlashSyncProbeStart{probe_id}`（`probe_id` 由 coordinator 單調遞增）；`Err(_)` → false。
+1. 端點 thread（對照 `flash_endpoint.py:170-195`）：先等可讀：`master.wait_readable(grace)`（等價 `select`）——`TimedOut`／`Woken` → 檢查 `endpoint_shutdown`（設定才結束 thread）後繼續，**從不寫 master**；迴圈條件只看 `EndpointShutdown`，**不**看任何 `FlashRunCancel`——`on_flash_open` 返回（不論 matched→holder gone、none、ambiguous 或 cancel）後回到等待，繼續服務下一次 flasher open（與 Python `flash_endpoint.py:171` 只看 `self._stop` 相同，R2-F5）；**等待本身失敗**（等價 `select` 的 `OSError`）→ thread 結束（WARNING log）。可讀後 `master.read(buf[4096])`：`Data(n)` → `first = buf[..n]`；**讀取錯誤或 `Eof`** → `first = b""`（等價 `os.read` 的 `OSError`／`BlockingIOError`），照常往下。若 `active` 未設：設 active → 同步呼叫 `on_flash_open(io, first)`（panic 以 `catch_unwind` 吸收並 WARNING）→ 清 active。未匹配時 `first` 已被讀掉、不回放。
+2. `on_flash_open`：先於 shared 鎖內新建本次 `run = FlashRunCancel::new(&endpoint_shutdown, waker)` 並登記 `current_run=Some(run)`（之後的 detection、holder watcher、pump 只拿這個 `run`）→ `collect_flash_candidates_and_mark()` → 建 `by_id→com`（略過無 by_id 者）→ `detect_mcu_line`，`ProbeTransport::probe` 實作：
+   - `run.is_cancelled()` → false（不送 `FlashSyncProbeStart`、零 TX；涵蓋 daemon 停止與本次 open 同時發生）；com 不在 map → false；送 `FlashSyncProbeStart{probe_id}`（`probe_id` 由 coordinator 單調遞增）；`Err(_)` → false。
    - 重置 `rx_buffers[com]=[]`；以 `TxClass::FlashProbe`（`permit.probe_id=Some(probe_id)`）經 `mgr.tx_for(com)` 送 `first`（`first` 為空時改送 pattern `probe_bytes`）；失敗 → `FlashProbeReleased` → false。
-   - 在 `timeout_ms` 內每 20 ms（經 `Clock`，並檢查共用 `StopFlag`）檢查 `expect` 是否為 buffer 的子字串；命中 → `acks[by_id]=buffer 全段`、`held.insert(com, probe_id)`、true（**不**送 Released）；逾時或 stop → `FlashProbeReleased` → false。
+   - 在 `timeout_ms` 內每 20 ms（經 `Clock`，並檢查本次 `run.is_cancelled()`，含 `endpoint_shutdown`）檢查 `expect` 是否為 buffer 的子字串；命中 → `acks[by_id]=buffer 全段`、`held.insert(com, probe_id)`、true（**不**送 Released）；逾時或 cancelled → `FlashProbeReleased` → false。
+   - detection 結束後若 `run.is_cancelled()`（即使已有命中）→ 視同非 matched 處理（第 3 點），不進 FLASHING、不回放 ACK。
 3. 記錄 `last_detect = {status, com, family, hits:[(by_id, com)]}`；非 matched → 對所有 held 送 `FlashProbeReleased`、unmark 全部候選、return（端點保持沉默）。
 4. matched：`fallback_baud = registry.get(family).baud`；`ack = acks[by_id]`；送 `FlashSyncMatched{held[com]}`；其他 held 全部 Released；unmark 全部候選；`active_com=com`、`master_writer = io.master.clone_writer()`。
-5. 起 holder watch thread（`slave_path`、poll 0.5 s、max 1800 s）：`pids` 非空 → armed；armed 後為空 → 結束；結束一律設 stop。
+5. 起 holder watch thread（`slave_path`、本次 `run`、poll 0.5 s、max 1800 s）：`pids` 非空 → armed；armed 後為空 → 結束；結束一律 `run.cancel()`（等價 Python `service.py:483` 對 `service.py:434` 局部 Event 的 `stop.set()`）——**只**取消本次 flash 的 pump，**絕不**設 `EndpointShutdown`（R2-F5：否則第一次正常燒錄結束即停掉常駐端點，第二次燒錄無法認線、回放 ACK）。
 6. `mgr.line_control_for(com).mirror_termios_from(slave_ref, Some(fallback_baud))`（Task 7：B0 視為未設）；`ack` 非空 → `master_writer.try_write(ack)` 一次（錯誤與部分寫入忽略）；`pump_endpoint_to_sink`（不重送 `first`）：每筆 `TxClass::Flash` 一筆 WAL TX `source:"flash"`；`NotSubmitted` → 結束。
-7. finally：`active_com=None`、`master_writer=None`、`rx_buffers.remove(com)`、送 `FlashHolderGone{probe_id}`；外層 finally：所有仍 held 者 Released、unmark 全部。
+7. finally：`run.cancel()` → join 本次 holder watch thread（被 `run` 的 waker 喚醒，上限 2.0 s；逾時 WARNING 並由 `stop()` 列入 `stalled_threads`）→ `active_com=None`、`master_writer=None`、`rx_buffers.remove(com)`、送 `FlashHolderGone{probe_id}`；外層 finally：所有仍 held 者 Released、unmark 全部、shared 鎖內 `current_run=None`。`EndpointShutdown` 在整個 `on_flash_open` 內不被寫入。
    獨占不變式（R0-F3 延伸檢查）：實體 MCU UART 在整個 flash 期間由既有 bridge handle 持有，**不**因 flash 開始／結束而 close／reopen（不經 `CloseToken`）；`/dev/ttyMCU` 端點 slave 由 `create_pty` 建立、daemon 同持 master＋slave keepalive，daemon **絕不**對端點 slave 設 `TIOCEXCL`、也不以 `open_exclusive` 開它，故 flasher 每次關閉後可再開。外部 flasher 自行設 TIOCEXCL 後未清除而離開的情形（keepalive 使 tty 物件不釋放、下一次 flasher open 會 EBUSY）屬 Python 基線同樣存在的行為，本 Phase 不改產品行為，只以 `endpoint_reopen_after_flasher_set_excl_recorded` 記錄並於 PR 登記為 DF 候選。
 8. `rx_observer(com, data)`（reader thread）：持 shared 鎖：若 `rx_buffers` 有 com → extend 並保留最後 4096；`active = active_com == com`；鎖外 `active` 時 `master_writer.try_write(data)`（錯誤忽略、不重試、不阻塞）。
 
@@ -1535,6 +1551,7 @@ fn device_detached_during_flashing_is_deferred() {
 
 ```rust
 // crates/sw-core/tests/flash_coordinator.rs
+use std::time::Duration;
 use sw_core::flash_endpoint::detect::{detect_mcu_line, DetectResult, DetectStatus, ProbeTransport};
 mod support;
 use support::flash_rig::{FlashRig, Mcu};
@@ -1586,6 +1603,74 @@ fn endpoint_never_writes_when_unbridged() {
     assert_eq!(rig.last_detect_json(), r#"{"status":"none","com":null,"family":null,"hits":[]}"#);
     assert_eq!(rig.state("COM0"), "ATTACHED");
 }
+
+// R2-F5：單次 flash 結束（holder gone）只取消該次 FlashRunCancel，常駐端點必須繼續服務下一次燒錄
+#[test]
+fn two_consecutive_flashes_same_endpoint() {
+    let mut rig = FlashRig::posix_fake();
+    rig.add_passthrough("COM0", "by-id/mcu", Mcu::ti_sbl());
+    rig.holder_sequence(&[vec![4242], vec![4242], vec![]]);           // 第一次 flash：armed 後歸零
+    rig.flasher_write(b"\x55\x55");
+    rig.run_until_flashing("COM0");
+    let run1 = rig.coord().current_run_for_test().expect("第一次 flash 有 run");
+    rig.advance_secs(1.5);                                             // holder watcher 第 3 次 poll → 結束
+    rig.run_until_state("COM0", "ATTACHED");
+    assert!(run1.is_cancelled(), "holder gone 取消本次 run");
+    assert!(!rig.endpoint_shutdown().is_set(), "holder gone 不得設 EndpointShutdown");
+    assert!(rig.endpoint().thread_alive_for_test(), "端點 thread 必須仍在服務");
+    assert!(rig.coord().current_run_for_test().is_none());
+    assert!(rig.ttymcu_link_exists());
+    assert_eq!(rig.events_of("COM0", "FlashHolderGone").len(), 1);
+
+    rig.holder_sequence(&[vec![4343], vec![4343], vec![]]);           // 第二次 flash（新 flasher）
+    rig.flasher_write(b"\x55\x55");
+    rig.run_until_flashing("COM0");
+    let run2 = rig.coord().current_run_for_test().expect("第二次 flash 有新 run");
+    assert!(!run2.is_cancelled(), "第二次 run 為新建值，不沿用第一次已取消的旗標");
+    assert_eq!(rig.serial_tx("COM0"), vec![b"\x55\x55".to_vec(), b"\x55\x55".to_vec()], "第二次 sync 仍轉送 MCU");
+    assert_eq!(rig.master_writes(), vec![b"\x00\xcc".to_vec(), b"\x00\xcc".to_vec()], "第二次 ACK 仍回放");
+    let starts = rig.events_of("COM0", "FlashSyncProbeStart");
+    assert_eq!(starts.len(), 2);
+    assert_ne!(starts[0].probe_id, starts[1].probe_id);
+    rig.flasher_write(b"\x03\x10\x20");
+    rig.pump_once();
+    assert_eq!(rig.serial_tx("COM0").last().unwrap(), b"\x03\x10\x20");
+    rig.advance_secs(1.5);
+    rig.run_until_state("COM0", "ATTACHED");
+    assert_eq!(rig.events_of("COM0", "FlashHolderGone").len(), 2);
+    assert!(rig.endpoint().thread_alive_for_test());
+    let r = rig.stop_endpoint();
+    assert_eq!((r.joined, r.unlinked), (true, true));
+    assert!(r.stalled_threads.is_empty());
+}
+
+// R2-F5：daemon 停止恰在第二次 flash 開始時到達——本次 run 必須立即視為取消，零 TX、不進 FLASHING、stop 正常收斂
+#[test]
+fn shutdown_at_second_flash_start() {
+    let mut rig = FlashRig::posix_fake();
+    rig.add_passthrough("COM0", "by-id/mcu", Mcu::ti_sbl());
+    rig.holder_sequence(&[vec![4242], vec![4242], vec![]]);
+    rig.flasher_write(b"\x55\x55");
+    rig.run_until_flashing("COM0");
+    rig.advance_secs(1.5);
+    rig.run_until_state("COM0", "ATTACHED");                          // 第一次 flash 正常結束
+    // hook：第二次 on_flash_open 登記 current_run 之後、第一個 ProbeTransport::probe 之前呼叫 stop()（另一 thread）
+    let stopper = rig.stop_endpoint_on_next_run_registered();
+    rig.flasher_write(b"\x55\x55");
+    let r = stopper.join_within(Duration::from_secs(2));
+    assert_eq!((r.joined, r.unlinked), (true, true), "stop 在 2.0 s 內返回並收斂");
+    assert!(r.stalled_threads.is_empty());
+    assert!(rig.endpoint_shutdown().is_set());
+    assert_eq!(rig.serial_tx("COM0"), vec![b"\x55\x55".to_vec()], "第二次 sync 零 TX");
+    assert_eq!(rig.master_writes(), vec![b"\x00\xcc".to_vec()], "第二次不回放 ACK");
+    assert_eq!(rig.events_of("COM0", "FlashSyncProbeStart").len(), 1, "第二次未開始 probe");
+    assert_eq!(rig.events_of("COM0", "FlashSyncMatched").len(), 1);
+    assert_eq!(rig.events_of("COM0", "FlashHolderGone").len(), 1);
+    assert_eq!(rig.state("COM0"), "ATTACHED");
+    assert_eq!(rig.flash_mode("COM0"), "Off");
+    assert!(!rig.flash_critical("COM0"), "候選已 unmark");
+    assert!(!rig.ttymcu_link_exists());
+}
 ```
 
 其餘族：
@@ -1596,7 +1681,7 @@ fn endpoint_never_writes_when_unbridged() {
 | `wait_readable_error_ends_thread` | `wait_readable` 回錯誤 | 端點 thread 結束、WARNING、未呼叫 `on_flash_open` |
 | `candidate_without_by_id_is_skipped` | 候選 `by_id=None` | 不呼叫 `ProbeTransport::probe`、不計入 hits |
 | `stop_during_multi_candidate_probe` | 三候選、probe 第二個時 `stop()` | `stop()` 在 2.0 s 內返回 `joined:true`；held 全部 Released、unmark 全部候選 |
-| `stop_while_holder_present` | FLASHING、holder 恆存在 | `stop()` 喚醒 holder watcher 與 pump，`joined:true`、`FlashHolderGone` 已送、link 已移除 |
+| `stop_while_holder_present` | FLASHING、holder 恆存在 | `stop()` 經 `request_shutdown` 設 `EndpointShutdown` 並 wake 本次 `FlashRunCancel`（`is_cancelled()==true`）→ 喚醒 holder watcher 與 pump，`joined:true`、`FlashHolderGone` 已送、link 已移除 |
 | `stop_reports_stalled_thread` | 注入不回應 stop 的 pump sink | `joined:false`、`stalled_threads==["pump"]`、不關 master、`unlinked:true` |
 | `drop_without_stop_unlinks` | `FlashEndpoint` 直接 drop | `ttyMCU` link 已移除 |
 | `ack_substring_not_prefix` | MCU 回 `ff 00 cc 01` | matched；回放 `ff 00 cc 01` 整段 |
@@ -1605,11 +1690,12 @@ fn endpoint_never_writes_when_unbridged() {
 | `held_gate_kept_during_ambiguity_scan` | 兩候選、第一個命中 | 掃第二個期間第一個 `flash_mode==Probe(_)` |
 | `matched_releases_other_held` | 三候選、只一個命中 | 另兩個 `flash_mode==Off` |
 | `flash_critical_unmarked_after_matched` | matched | 全部候選 `flash_critical==false` |
-| `holder_watch_armed_then_gone` | holder 序列 `[pid],[pid],[]` | 第 3 次 poll 後 stop；`FlashHolderGone`；state ATTACHED |
-| `holder_watch_never_armed_hits_max` | holder 恆空 | FakeClock 推進 1800 s 才 stop |
+| `holder_watch_armed_then_gone` | holder 序列 `[pid],[pid],[]` | 第 3 次 poll 後本次 `run.is_cancelled()==true`；`endpoint_shutdown.is_set()==false`、`thread_alive_for_test()==true`；`FlashHolderGone`；state ATTACHED（R2-F5） |
+| `holder_watch_never_armed_hits_max` | holder 恆空 | FakeClock 推進 1800 s 才 `run.cancel()`（1799.5 s 時 `is_cancelled()==false`）；`endpoint_shutdown.is_set()==false`、端點 thread 仍在 |
 | `holder_watch_permission_status_never_arms` | `HolderScanStatus::Permission` | 同上（`/proc` 不可讀與無 holder 不可區分） |
-| `pump_stops_on_not_submitted` | pump 中 fence freeze | pump 結束、`FlashHolderGone` 已送 |
+| `pump_stops_on_not_submitted` | pump 中 fence freeze | pump 結束、本次 run 取消並 join holder watcher、`FlashHolderGone` 已送；`endpoint_shutdown.is_set()==false`、端點 thread 仍在 |
 | `pump_stops_on_master_eof` | master `Eof` | 同上 |
+| `holder_watch_signature_has_no_endpoint_shutdown`（compile-fail doctest，`holder_watch.rs`；R2-F5） | 以 `&EndpointShutdown` 呼叫 `watch_flasher_disconnect`／`pump_endpoint_to_sink` | 編譯失敗（型別不符）——holder watcher 與 pump 結構上不可能停止端點 |
 | `baud_mirror_uses_slave_speed` | slave speed B57600 | serial `mirror_termios_from` 被呼叫一次、fallback 115200 |
 | `baud_mirror_once_only` | flash 中途 slave 改 B9600 | 不再鏡射（UIO-12.9-f） |
 | `rx_observer_non_blocking` | master writer `try_write` 回 `Ok(0)` | reader thread 不阻塞、不重試 |
@@ -1671,11 +1757,32 @@ def test_baud_mirrored_once_from_flasher(sw_env, fake_mcu):
     time.sleep(0.5)
     assert fake_mcu.current_speed() == termios.B57600, "只在 flash 開始時鏡射一次"
     fl.close()
+
+@pytest.mark.contract("case:s24-flash-holder-gone")
+def test_two_flashes_same_daemon(sw_env, fake_mcu):
+    """R2-F5：第一次 flash 正常結束（holder gone）後，同一 daemon 的常駐端點仍能認線並回放 ACK。"""
+    sw_env.start(targets={"COM0": fake_mcu}, profile="passthrough")
+    sw_env.wait_state("COM0", "ATTACHED", timeout=10)
+    link = sw_env.run_dir / "dev" / "ttyMCU"
+    for round_no in (1, 2):
+        fl = FakeFlasher(link, baud=115200)
+        fl.write(b"\x55\x55")
+        assert fl.read_exact(2, timeout=3.0) == b"\x00\xcc", f"第 {round_no} 次 ACK 回放"
+        assert sw_env.session("COM0")["state"] == "FLASHING"
+        fl.write(b"\x03\x10\x20")
+        sw_env.wait_until(lambda: fake_mcu.rx_log().endswith(b"\x03\x10\x20"), timeout=3)
+        time.sleep(1.2)                # holder-probe armed
+        fl.close()
+        sw_env.wait_until(lambda: sw_env.session("COM0")["state"] == "ATTACHED", timeout=5)
+        assert link.is_symlink(), f"第 {round_no} 次結束後端點 link 仍在"
+        assert sw_env.rpc("mcu.status", {})["flashing"] is False
+    assert fake_mcu.rx_log().count(b"\x55\x55") == 2, "兩次 sync 各轉送一次"
+    assert fake_mcu.rx_log().count(b"\x03\x10\x20") == 2
 ```
 
 - [ ] **Step 2：執行並確認 FAIL**：`cargo test -p sw-core --features test-fakes --test flash_coordinator` → FAIL；黑箱對 Python 基線 PASS、對 Rust artifact FAIL。
 - [ ] **Step 3：commit 測試**：`test(flash): 新增 /dev/ttyMCU 認線、ACK 回放、pump 與 holder-probe 失敗測試`
-- [ ] **Step 4：實作**：依上列 8 點；holder watch 與 pump 各為獨立 thread（`serialwrap-ttyMCU-holder`、pump 跑在端點 thread 內，與 Python 相同）；detection、pump、holder watcher 共用同一 `StopFlag`（含 waker），等待一律經 `Clock`。
+- [ ] **Step 4：實作**：依上列 8 點；holder watch 與 pump 各為獨立 thread（`serialwrap-ttyMCU-holder`、pump 跑在端點 thread 內，與 Python 相同）；停止旗標分兩層（R2-F5）：`EndpointShutdown` 只由 `FlashEndpoint::stop`／Drop 設定、只控制端點 thread 迴圈；每次 `on_flash_open` 新建一個 `FlashRunCancel`，由該次 detection、pump、holder watcher 共用（含 waker），holder gone／pump 結束只 `cancel()` 本次 run，`is_cancelled()` 同時反映 `EndpointShutdown` 使 daemon 停止能中止進行中的 flash；`request_shutdown` 與 `current_run` 登記同鎖，避免遺失喚醒；等待一律經 `Clock`。`two_consecutive_flashes_same_endpoint`、`shutdown_at_second_flash_start`、黑箱 `test_two_flashes_same_daemon` 必須 PASS。
 - [ ] **Step 5：執行並確認 PASS**：Rust 測試、黑箱兩側全 PASS；`scripts/rust/win-test.sh --package sw-core`（`windows_caps_no_endpoint`）。
 - [ ] **Step 6：commit**：`feat(flash): 承接 /dev/ttyMCU 端點、sync 回放、pump 與 holder-probe`
 
@@ -1871,7 +1978,7 @@ def test_released_survives_two_restarts_and_replug(sw_env, shell_target):
                                         #   已越過 gate 的 inflight attach 納入步驟 3 的 drain 集合；也擋住步驟 2 flash 結束時 SC-32 延後的 DeviceDetached reconcile 觸發重開
   1b. watcher.stop()                    # P5 ②：停 DeviceWatcher thread 並 join；channel 殘留 Delta 由 1a gate 丟棄
   1c. engine.close_intake()             # P7 Task 15：matcher 停、dispatcher 不再 spawn handler；已在跑的 handler 不中斷，與步驟 3～5 並行
-  2. flash_endpoint.stop()              # 共用 StopFlag + wake + join 2.0 s；pump 結束 → FlashHolderGone；unlink ttyMCU（Task 9 receipt）
+  2. flash_endpoint.stop()              # 設 EndpointShutdown（唯一設定點）＋wake 本次 FlashRunCancel + join 2.0 s；pump 結束 → FlashHolderGone；unlink ttyMCU（Task 9 receipt）
                                         #   receipt.joined==false 或 unlinked==false → incomplete.push("flash endpoint stop incomplete: <stalled_threads 以 , 串接>")
   3. 所有 session Phase 1（fence frozen、RunCancel、TransferAbort）——進行中 file transfer 的 OpRunner 因 Cancelled 立即返回（XFER-ABORT-01）
   4. server.join_handlers(剩餘預算)     # handler 收到 EXCEPTION 回覆後結束；逾時者 WARNING 列出 method，不再等待
@@ -1964,7 +2071,7 @@ def test_restart_on_failure_keeps_released_and_wal_seq(sw_env, shell_target, tra
 | `shutdown_unreaped_handler_exits_1`（`shutdown_order.rs`，fake 平台；R1-F2） | `FakeHandlerSpawner::ignore_abort()` 的 handler（rule `r1`）執行中送 stop，其餘全部收斂 | 停止序照常走完至 `lock.release`；`run_with_hooks` 回 **1**；stderr 恰含一行 `serialwrapd: shutdown incomplete: event handlers not reaped: r1\n` |
 | `drain_total_cap_5s`（`shutdown_order.rs`） | 一個 worker 卡住不回條 | 5 s（FakeClock）後仍繼續後續步驟；log WARNING 列出 stalled session；exit code 見 `shutdown_stalled_worker_exits_1`（為 1，不得為 0） |
 | `shutdown_stalled_worker_exits_1`（`shutdown_order.rs`，fake 平台＋FakeClock；R1-F4，修正前必 FAIL） | COM0 為 READY 且前景命令已提交 TX 後 writer `BlockForever`（不回 `WorkerStoppedReceipt`）；COM1 正常；送 stop | `run_with_hooks` 回 **1**；stderr 恰含一行 `serialwrapd: shutdown incomplete: drain stalled: t:COM0\n`（不含 COM1）；COM1 的排隊命令仍為 `FLUSHED_BY_SHUTDOWN`；WAL 仍 `sync_close`、lock 仍釋放；自 stop 起到返回（FakeClock）≤ 2.0 s＋5 s |
-| `shutdown_flash_stop_incomplete_exits_1`（`shutdown_order.rs`，fake 平台；R1-F4） | 以 `run_with_hooks` 的 test-fakes hook `block_flash_endpoint_stop`（本 Task 新增於 P5 `DaemonHooks`，產品 build 不存在）使 `serialwrap-ttyMCU` thread 忽略 StopFlag → join 2.0 s 逾時，`FlashEndpoint::stop` 回 `EndpointStopReceipt{joined:false, stalled_threads:["serialwrap-ttyMCU"], …}`；其餘全部收斂 | 停止序 3～7 照常執行；`run_with_hooks` 回 **1**；stderr 恰含一行 `serialwrapd: shutdown incomplete: flash endpoint stop incomplete: serialwrap-ttyMCU\n` |
+| `shutdown_flash_stop_incomplete_exits_1`（`shutdown_order.rs`，fake 平台；R1-F4） | 以 `run_with_hooks` 的 test-fakes hook `block_flash_endpoint_stop`（本 Task 新增於 P5 `DaemonHooks`，產品 build 不存在）使 `serialwrap-ttyMCU` thread 忽略 `EndpointShutdown` → join 2.0 s 逾時，`FlashEndpoint::stop` 回 `EndpointStopReceipt{joined:false, stalled_threads:["serialwrap-ttyMCU"], …}`；其餘全部收斂 | 停止序 3～7 照常執行；`run_with_hooks` 回 **1**；stderr 恰含一行 `serialwrapd: shutdown incomplete: flash endpoint stop incomplete: serialwrap-ttyMCU\n` |
 | `shutdown_multiple_failures_accumulate_exits_1`（`shutdown_order.rs`，fake 平台；R1-F4） | `block_flash_endpoint_stop`（flash receipt `joined:false`）＋handler 逾時（`file.push`）＋COM0 drain stalled＋WAL `sync` 失敗同時注入 | `run_with_hooks` 回 **1**；stderr 恰為單行 `serialwrapd: shutdown incomplete: flash endpoint stop incomplete: serialwrap-ttyMCU; rpc handlers did not converge: file.push; drain stalled: t:COM0; WAL sync failed: <py_message>\n`（順序依停止序）；`lock.release` 仍執行 |
 | `shutdown_all_converged_exits_0`（`shutdown_order.rs`，fake 平台） | 全部步驟收斂 | `run_with_hooks` 回 0；stderr 不含 `shutdown incomplete` |
 | `panic_exits_1`（`shutdown_order.rs`） | 注入 panic | exit code 1 |
@@ -2085,6 +2192,7 @@ P4 已交付 §12.1 七步與 `safety_check`（05 L1617-1654：`mcu.status`(0.5 
   - busy 條件：`state=="FLASHING"` 或 `foreground_busy==true` 或 `interactive_session_id` 非 null → `SESSION_BUSY`（detail 每筆加 `interactive_session_id`；message 不變）。背景 capture 為被動 RX、可安全中止，不列入（理由寫入 P4 文字）。
   - daemon 健康三態：**確認不存在**（連線被拒或 socket／TCP 端點不存在，且 `ProcScan` 找不到 `serialwrapd`）→ 視為通過；**健康**→ 照常檢查；**未知**（RPC timeout、壞回應、連線成功但回應不可解析、行程存在但 RPC 不通）→ 拒絕，碼依 05 Task 12 錯誤表：探測 RPC 逾時／壞回應／連線失敗回該 RPC 的碼（`TIMEOUT`／`INVALID_RESPONSE`／`SOCKET_ERROR`，detail `probe:<method>`），行程存在但 RPC 不通回 `DEVICE_STILL_HELD`（detail `pids`），兩者 detail 皆加 `{"health":"unknown","reason":…}`；**`--force` 不可略過**（健康不明時可能正處 FLASHING／FileTransfer，停 daemon 無法撤銷 DUT 已發生的部分燒寫）。
   - 步驟 3 交接（R1-F1）：停用後送 `daemon.handoff_stop`，**不送**一般 `daemon.stop`；daemon 回忙碌或交接無法確認 → 還原 enabled、不硬停、不切換；CLI 不得以第二次 `session.list` 取代 daemon 原子判定。
+  - 步驟 7 回退與 journal 復原（R2-F6，05 Task 12 `stop_for_revert`）：停止步驟 6 已啟動、已對外服務的 Rust daemon 同樣只送 `daemon.handoff_stop{"reason":"revert"}`；Rust daemon 對 `reason:"revert"` 的 busy 判定與凍結語意與 `"update"` 相同；忙碌／不明 → 不硬停、不切換回 Previous、journal 保留。
   - `--force` 對 update／rollback 的 busy、健康三態、身分確認與步驟 3 交接**全部無效**；帶 `--force` 的拒絕結果與未帶時逐欄相同，只多 detail `force_ignored:true`，且不得 disable／stop 監管、不得送 `daemon.stop`。一般 `setup`（非 update 路徑）的 Python 對等 `--force` 覆寫不變。
 
 - [ ] **Step 1：寫失敗測試**
@@ -2115,7 +2223,9 @@ P4 已交付 §12.1 七步與 `safety_check`（05 L1617-1654：`mcu.status`(0.5 
 | `rollback_refuses_while_interactive_send`（黑箱） | interactive lease 開啟、`interactive_send` 進行中 | `SESSION_BUSY`；DUT 端收到完整 payload |
 | `rollback_cross_stage_state_compat_released`（黑箱，`posix_pty`，`rust_only`） | Current＝Stage 2（Rust daemon）、Previous＝Stage 1B（Python daemon）；Current 下 release COM0 後 `setup --rollback` | Previous daemon 讀同一 `state.json`：COM0 仍 RELEASED；`device attach` 成功並 READY |
 | `rollback_cross_stage_ready_never_double_held`（黑箱，`posix_pty`，`rust_only`） | 同上兩版；COM0 為 READY（Rust daemon 持有 tty）時 `setup --rollback`，全程 `HolderSampler(slave_path, 0.01)` | `max_concurrent()<=1`；Rust daemon pid 消失後 Python daemon pid 才出現；最終 READY |
-| `rollback_verifies_pairing` | Previous manifest 與實際 sha 不符 | 回到 Current，保存失敗證據（P4 行為，以 Rust daemon 再跑） |
+| `rollback_verifies_pairing` | Previous manifest 與實際 sha 不符 | 回到 Current，保存失敗證據（P4 行為，以 Rust daemon 再跑）；停止 Previous daemon 只經 `daemon.handoff_stop{"reason":"revert"}`、stubd 未收到 `daemon.stop` |
+| `revert_refuses_while_new_rust_daemon_pushing`（黑箱，Rust daemon，`posix_pty`，`process_rpc`；R2-F6，CLI 側為 05 `revert_refuses_while_new_daemon_pushing`，修正前必 FAIL） | 更新到 Rust daemon 的 dev bundle，以 `SW_TEST_UPDATE_PAUSE_AFTER=start_and_verify:started`＋`SW_TEST_UPDATE_FORCE_VERIFY_FAIL=smoke_failed` 在新版啟動後暫停，期間對新版開始 1 MiB `file push`，再放行 | `setup` exit 2、`revert_pending:true`、`revert_error{error_code:"SESSION_BUSY",handoff:"refused"}`；新版 trace 無 `BeginDrain`／`TransferAbort`、`daemon status.pid` 不變；push 正常完成且 DUT 端 md5 正確；`current-release.json` 仍為新版、journal 保留；push 完成後再跑 `setup` → 交接 ok、`SessionsDrained{flushed:[],stalled:[]}`、回到 Previous 且 `version_pairing.ok` |
+| `journal_recovery_refuses_while_new_rust_daemon_flashing`（黑箱，fakemcu，`posix_pty`；R2-F6，CLI 側為 05 `journal_recovery_refuses_while_new_daemon_flashing`） | dev bundle 在新版啟動後以 test hook 模擬 updater 被殺（`SW_TEST_UPDATE_CRASH_AT=start_and_verify:after_effect`），fakemcu 對新版開始燒錄後執行 `setup` | `FLASHING_BUSY`／`install_recover`、`recovered_journal.ok:false`、journal 逐位元組不變；新版未停止、flash 完成 `Return error code : 0x0`、燒後 session 回 `ATTACHED`；之後再跑 `setup` 才回到 Previous |
 
 - [ ] **Step 2：執行並確認 FAIL**：`cargo test -p sw-cli --test update_guard` → 新增三態與 lease 列 FAIL（P4 既有列 PASS）；`cargo test -p sw-core --test admission`、`cargo test -p sw-daemon --test handoff_stop` → FAIL（`METHOD_NOT_FOUND`／`AdmissionGate` 未實作）；黑箱對 Rust bundle FAIL（`rust_only` 兩列在 Python 側 SKIP 並已於 `cases.yaml` 登記）。
 - [ ] **Step 3：commit 測試**：`test(setup): 新增更新／回滾守衛對 Rust daemon 的驗證與 fail-closed 測試`

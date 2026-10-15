@@ -22,7 +22,7 @@
 - CLI stdout JSON：`json.dumps(..., ensure_ascii=False, sort_keys=True, separators=(",", ":"))`＋`\n` 等價（`pyjson` `CLI_STDOUT` profile）；`benches.state.json`、remote registry 用 `DISK_STABLE`；`config.yaml` 用 `yaml11::emit::safe_dump(allow_unicode=true, sort_keys=true)`。
 - Windows RPC 預設 `tcp://127.0.0.1:48700`；信任範圍＝整機本機使用者（OD-12），文件不得宣稱「同使用者隔離」；`remote` 經 ssh 暴露時信任範圍延伸至通過該 ssh 驗證者。
 - Windows 監管預設 `windows-task`，`ExecutionTimeLimit=PT0S`（OD-03、§6.1）；`windows-service` 依 OD-12 不得在多人共用機器部署，本 Phase 只產生 `pending_sudo` 指令，不自動安裝。
-- 所有 reconcile、更新、回滾均不得讓舊監管項與新監管項同時拉起不同版本（§6.1）；舊 daemon 須確認結束（ping 不通且行程消失，上限 10 s，SC-12）才啟動新者。任何停止監管 daemon 的路徑（含 `windows-task`）一律走共用 `graceful_stop`：先停用拉起能力 → RPC `daemon.stop`（2.0 s，觸發 SC-11 有序關機）→ 等待結束（≤10 s）→ 逾時才硬終止或回 `TIMEOUT` 且不切換（§12.1 步驟 3）。**update／rollback 例外**（R1-F1，§12.1 步驟 2～3）：第 3 步改送 `daemon.handoff_stop`，由 daemon 在共同 admission 邊界內原子完成 busy 判定、凍結所有新操作與發 token 後才停止；交接被拒或無法確認時不送 `daemon.stop`、不硬停、不切換。CLI 端 `session.list` 預檢不能關閉「預檢後新操作進入」窗口，SC-11 shutdown drain 會中止（非等待完成）進行中的傳輸與 flash。
+- 所有 reconcile、更新、回滾均不得讓舊監管項與新監管項同時拉起不同版本（§6.1）；舊 daemon 須確認結束（ping 不通且行程消失，上限 10 s，SC-12）才啟動新者。任何停止監管 daemon 的路徑（含 `windows-task`）一律走共用 `graceful_stop`：先停用拉起能力 → RPC `daemon.stop`（2.0 s，觸發 SC-11 有序關機）→ 等待結束（≤10 s）→ 逾時才硬終止或回 `TIMEOUT` 且不切換（§12.1 步驟 3）。**update／rollback 例外**（R1-F1，§12.1 步驟 2～3）：第 3 步改送 `daemon.handoff_stop`，由 daemon 在共同 admission 邊界內原子完成 busy 判定、凍結所有新操作與發 token 後才停止；交接被拒或無法確認時不送 `daemon.stop`、不硬停、不切換。CLI 端 `session.list` 預檢不能關閉「預檢後新操作進入」窗口，SC-11 shutdown drain 會中止（非等待完成）進行中的傳輸與 flash。**回退與中斷復原同屬此例外**（R2-F6）：步驟 6 啟動的新版 daemon 在驗收前已對外服務、可能已受理 `file.push`／flash，故步驟 7 回退與 `recover_journal` 停止「目前在跑的 daemon（可能為新版）」也只經 `daemon.handoff_stop`（`reason:"revert"`）；忙碌、不支援或結果不明時保留 journal、不送 `daemon.stop`、不硬停、不切換回 Previous，待下一次 `setup` 在 daemon 閒置後完成回退。
 - Stage 1 版本單位是「Rust CLI＋Python daemon runtime／程式碼＋設定資產＋監管定義」組合（§12.1）；`setup --rollback` 不得只切換 CLI；不得改寫 `--version` 或 status 字串湊配對（§9.5）。
 - CLI 不搜尋 `PATH` 尋找另一份 serialwrap 或 Python（§4.3）；daemon 定位只依 DF-05 順序。
 - 本環境不得對真實主機做破壞性變更：測試一律以 `HOME`、`XDG_*`、`SERIALWRAP_*` 隔離目錄與 PATH stub（`systemctl`、`sudo`、`loginctl`、`ssh`、`autossh`、`schtasks`、`sc.exe`、`powershell.exe`）執行；真實 `systemctl --user serialwrap`、`/etc/systemd`、`/etc/wsl.conf`、Windows Task Scheduler 的註冊只在 owner 授權的 `cap_supervisor_runtime__*` 測試執行（預設 ignored）。
@@ -35,7 +35,7 @@
 2. **委派殘留造成假綠**：每個群組改原生後必須從 `DELEGATED_GROUPS` 移除；黑箱 bundle 的 `python_cli_delegate.entry` 指向 sentinel（被呼叫即寫 marker 並 exit 97），任何漏網委派都會讓測試失敗（Task 1、14）。
 3. **Windows 程序語意**：存活判定絕不用等同 `os.kill(pid,0)` 的終止呼叫；`remote close` 先核對根 PID 的 CreationTime 等於 `TunnelProc.start_ticks`，再以 Toolhelp32 parent 鏈＋CreationTime 收集整棵樹終止；ProcScan 必須辨識 `serialwrapd.exe` 並把 launcher 與其 Python 子行程去重，否則每個 Stage 1 daemon 都被漏掃或誤判為多開（Task 4、5）。
 4. **SC-18 首次需求啟動只在「請求從未送出」時重送**：僅 connect 階段 PAL kind 為 `ConnectionRefused`／`NotFound`、endpoint 來源為預設本機 endpoint、且方法不是 `health.ping`／`health.status`／`daemon.stop` 時才在跨行程鎖內 auto-start 並重送一次；send／recv 階段失敗、`TIMEOUT`、`EMPTY_RESPONSE`、`PermissionDenied`、明確 `--endpoint/--socket/--bench` 一律不重送（Task 7）。
-5. **安裝切換的原子性與可回復**：整筆 update／rollback 持有安裝根目錄跨行程鎖；`*.new`→`*.old.<ts>`→正式名的每一步失敗都要能回到完整 Previous（CLI、launcher、Python runtime、設定、監管定義與其**已註冊狀態**一起），`current-release.json` 只在切換全部成功後改寫、`install-journal.json` 記錄進度供中斷復原——journal 在**任何停用／停止前**就持久保存原始入口、`current-release.json`、config、監管（mode、endpoint、enabled、running、已註冊內容）與 daemon 快照，備份拆成 `backup_started`→`backup_complete`（manifest sha256 入 journal）→`entries_switching`，完整備份提交前不得切換，中斷復原只用 journal 內的原始值，復原失敗時 journal 位元組不變保留且不進行本次 op（R1-F5，Task 12 逐點中斷注入測試）；安全檢查無法確認時一律拒絕（fail-closed）；update／rollback 的交接安全檢查（Flash、FileTransfer、活躍寫入、lease、recovering、身分與探測）**不受 `--force` 影響**（§12.1 步驟 2，Task 12）；停止前的最終交接判定只能是 daemon 原子 `daemon.handoff_stop`（busy 判定＋凍結新操作＋token 同一臨界區），審查須確認 update／rollback 路徑不存在任何一般 `daemon.stop` 或「預檢通過即停止」的分支（R1-F1）；版本配對、health、WAL、狀態相容或 smoke 任一失敗即自動回退並保留失敗證據（Task 11、12）。
+5. **安裝切換的原子性與可回復**：整筆 update／rollback 持有安裝根目錄跨行程鎖；`*.new`→`*.old.<ts>`→正式名的每一步失敗都要能回到完整 Previous（CLI、launcher、Python runtime、設定、監管定義與其**已註冊狀態**一起），`current-release.json` 只在切換全部成功後改寫、`install-journal.json` 記錄進度供中斷復原——journal 在**任何停用／停止前**就持久保存原始入口、`current-release.json`、config、監管（mode、endpoint、enabled、running、已註冊內容）與 daemon 快照，備份拆成 `backup_started`→`backup_complete`（manifest sha256 入 journal）→`entries_switching`，完整備份提交前不得切換，中斷復原只用 journal 內的原始值，復原失敗時 journal 位元組不變保留且不進行本次 op（R1-F5，Task 12 逐點中斷注入測試）；安全檢查無法確認時一律拒絕（fail-closed）；update／rollback 的交接安全檢查（Flash、FileTransfer、活躍寫入、lease、recovering、身分與探測）**不受 `--force` 影響**（§12.1 步驟 2，Task 12）；停止前的最終交接判定只能是 daemon 原子 `daemon.handoff_stop`（busy 判定＋凍結新操作＋token 同一臨界區），審查須確認 update／rollback 路徑（含步驟 7 回退與 `recover_journal` 的復原變體，R2-F6）不存在任何一般 `daemon.stop` 或「預檢通過即停止」的分支（R1-F1）；版本配對、health、WAL、狀態相容或 smoke 任一失敗即自動回退並保留失敗證據（Task 11、12）。
 
 ---
 
@@ -326,10 +326,10 @@ pub fn posix_caps() -> Capabilities;  pub fn windows_caps() -> Capabilities;   /
 | `with_fs_fault_replace_suffix(s)` | 以 `FaultFs` 包住 fs |
 | `with_new_daemon_reporting_version(v)` | 新 spawn 的 daemon `health.status.version` 回 v |
 | `with_crash_at(point: &str)`、`clear_crash()`、`journal_json() -> Option<serde_json::Value>`、`journal_bytes() -> Option<Vec<u8>>`、`config_bytes() -> Vec<u8>`、`recover() -> Option<sw_cli::rollback::RecoveryReport>`、常數 `CRASH_POINTS: &[&str]` | Task 12 中斷注入（R1-F5）：`Ctx` 的 `#[cfg(feature="test-fakes")]` `FaultPlan` 在指名的 crash point（`"<journal_step>:<before_effect|after_effect>"` 或步驟內點如 `"backup_started:after_config_copy"`、`"entries_switching:after_first_rename"`）讓 `sw_cli::run` 立即回 `(137,"","")`，不執行任何後續副作用或 Drop 以外的清理（等同行程被殺；lock guard 的 Drop 視同 OS 釋放）；fake service／rpc／procs／fs 狀態保留供下一次 `run`。`recover()` 直接呼叫 `recover_journal`（持 `install_lock`）。`CRASH_POINTS` 列舉 Task 12 每個 `JournalStep` 的 `before_effect`／`after_effect` 與上列步驟內點，Task 12 實作新增 crash point 時必須同步補進此常數（`crash_points_cover_every_journal_step` 測試核對） |
-| `with_supervisor_state(mode, enabled, running)`、`with_idle_daemon(ep, pid)`、`with_spawn_exits(rc)`、`service().query_now() -> {enabled: Option<bool>, running: bool}`、`rpc_now(ep, method) -> serde_json::Value` | Task 12 中斷注入用的**有狀態**監管／daemon 模型：`with_supervisor_state` 寫 config 的 `supervision_mode` 並讓 `FakeServiceCtl` 依 `set_enabled`／`start`／`stop`／`install` 動作維護 enabled／running（`query_script` 由此狀態推導，`TaskQuery::NotRunning("Disabled")`＝enabled false）；`with_idle_daemon` 讓 endpoint 的 `health.ping`／`mcu.status`／`session.list` 回閒置 daemon（`flashing:false`、單一 COM0 READY 無 busy）、`ProcScan` 回該 pid，收到 `daemon.handoff_stop` 時回 `{"ok":true,"stopping":true,"handoff_token":<32 hex>}`（R1-F1；update／rollback 的唯一停止 RPC）、收到 `daemon.stop`（使用者停止或步驟 7 停新版）時直接接受，兩者之後皆依 `with_daemon_alive_then_gone` 語意結束、之後 `start`／spawn 再復活；`with_spawn_exits(rc)` 讓下一次 spawn 的 daemon 立即以 rc 結束；`service().actions()` 的動作字串為 `ServiceAction::as_str()`（`start`、`stop`、`set_enabled:<b>`、`install`…）；`query_now`／`rpc_now` 讀當下模型狀態 |
+| `with_supervisor_state(mode, enabled, running)`、`with_idle_daemon(ep, pid)`、`with_spawn_exits(rc)`、`service().query_now() -> {enabled: Option<bool>, running: bool}`、`rpc_now(ep, method) -> serde_json::Value` | Task 12 中斷注入用的**有狀態**監管／daemon 模型：`with_supervisor_state` 寫 config 的 `supervision_mode` 並讓 `FakeServiceCtl` 依 `set_enabled`／`start`／`stop`／`install` 動作維護 enabled／running（`query_script` 由此狀態推導，`TaskQuery::NotRunning("Disabled")`＝enabled false）；`with_idle_daemon` 讓 endpoint 的 `health.ping`／`mcu.status`／`session.list` 回閒置 daemon（`flashing:false`、單一 COM0 READY 無 busy）、`ProcScan` 回該 pid，收到 `daemon.handoff_stop` 時回 `{"ok":true,"stopping":true,"handoff_token":<32 hex>}`（R1-F1；update／rollback 的唯一停止 RPC）、收到 `daemon.stop`（僅使用者明確停止；update／rollback 含步驟 7 回退與 journal 復原一律不送，R2-F6）時直接接受，兩者之後皆依 `with_daemon_alive_then_gone` 語意結束、之後 `start`／spawn 再復活；`with_new_daemon_handoff_script(&[&str])`（R2-F6）只作用於**由 update／rollback 步驟 6（`start_and_verify`）啟動的 daemon 實例**：自設定起它收到的第 k 個 `daemon.handoff_stop` 回 `lines[k]`（例如 `SESSION_BUSY`＋`ops:["file.push"]`、`FLASHING_BUSY`＋`ops:["flash"]`、`METHOD_NOT_FOUND`，或特殊字串 `"<recv_timeout>"` 模擬 recv 逾時），非 grant 回應時該實例**不結束**、ping 持續 ok、`ProcScan` 仍回其 pid；lines 用盡後回閒置 grant 並依上述語意結束（模擬「新版已受理的傳輸／燒錄完成後才閒置」）；`with_spawn_exits(rc)` 讓下一次 spawn 的 daemon 立即以 rc 結束；`service().actions()` 的動作字串為 `ServiceAction::as_str()`（`start`、`stop`、`set_enabled:<b>`、`install`…）；`query_now`／`rpc_now` 讀當下模型狀態 |
 | `run(&[&str]) -> (i32, String, String)`、`run_from_bundle(&[&str])` | 以 `sw_cli::run` 執行；`run_from_bundle` 先把 `current_exe` 指到 `bundle_dir()/bin/serialwrap` |
 | `calls()`、`process()`、`rpc()`、`tunnel()`、`service()`、`clock()` | 取替身 |
-| `event_order() -> EventOrder`；`EventOrder::index_of(&str) -> usize` | 合併 `rpc:<method>`、`run:<argv join ' '>`、`spawn:<argv0>`、`service:<action>` 事件，依 `FakeClock` 單調序號（同時刻依發生序）；`rpc:health.ping#gone` 指「第一次回 refused 的 ping」；找不到即 panic |
+| `event_order() -> EventOrder`；`EventOrder::index_of(&str) -> usize`、`EventOrder::index_of_nth(&str, n: usize) -> usize`（第 n 次出現，0 起算；R2-F6）；`rpc_params(&t, method)`／`rpc_params_nth(&t, method, n)`（該方法第一次／第 n 次請求的 params） | 合併 `rpc:<method>`、`run:<argv join ' '>`、`spawn:<argv0>`、`service:<action>` 事件，依 `FakeClock` 單調序號（同時刻依發生序）；`rpc:health.ping#gone` 指「第一次回 refused 的 ping」；找不到即 panic |
 | 自由函式 `json(&str)`、`s`、`i`、`b`、`dict`、`list`、`argv_list`、`sha256_hex`、`manifest_fixture(v)`、`alive_state(role, pid)`、`alive_state_with_identity(role, pid, id)`、常數 `B1_YAML` | 斷言輔助 |
 
 `tests/contract_blackbox/mgmt_fixtures.py`（以 `pytest_plugins` 載入；**沿用** P3 `tests/contract_blackbox/{bb_harness,bb_stubd,bb_faketarget,bb_daemon}.py` 與其 fixtures `env`、`stubd`、`py_daemon`、`faketarget`、marker `rust_only`）只新增：`stub_path`（PATH 前置 stubs/bin，並保留 `/usr/bin:/bin`）、`stub_log` 讀取器、`no_delegation`（測後斷言 `SW_DELEGATE_MARKER` 不存在）、`mgmt_bundle`（`mkbundle.sh --dev --delegate-sentinel --print-dir` 產物，提供 `.cli`、`.root`、`.materialized_bin`）、`run_wrapper(path, args, env) -> CompletedProcess`（以 `bash` 執行物化 wrapper，逾時 30 s）、`live_daemon`（以 P3 `PyDaemon`＋`FakeTarget` 在隔離 env 啟動真 Python daemon，提供 `.endpoint` 與 `.console_list(com)`——後者以 `bb_stubd` 內的最小 NDJSON client 送 `session.console_list`，不經產品）、`pytest.mark.case(id)` 註冊。受測實作判定一律用 `bb_harness.is_rust()`（`SERIALWRAP_AB_LABEL` 以 `rust` 開頭，P3 L384-395）；Rust 輪的命令列為 `SERIALWRAP_CLI_EXE=<bundle>/bin/serialwrap SERIALWRAP_AB_LABEL=rust-1b python3 -m pytest …`。
@@ -1083,7 +1083,7 @@ pub struct StopReport { pub graceful: bool, pub ran: Vec<Vec<String>>, pub rc: O
 pub enum StopFailure { Timeout { phase: &'static str, id: DaemonIdentity }, Service(ServiceResult) }
 pub fn graceful_stop(ctx: &mut Ctx, mode: &SupervisionMode, endpoint: &str, with_sudo: bool, keep_disabled: bool,
                      phase: &'static str) -> Result<StopReport, StopFailure>;   // ＝ graceful_stop_with(.., StopRpc::Plain)
-pub enum StopRpc { Plain, Handoff { reason: &'static str /* "update"|"rollback" */ } }   // R1-F1；Handoff 只由 Task 12 使用
+pub enum StopRpc { Plain, Handoff { reason: &'static str /* "update"|"rollback"|"revert" */ } }   // R1-F1；Handoff 只由 Task 12 使用（"revert"：步驟 7 回退與 recover_journal 停止目前在跑的 daemon，R2-F6）
 pub fn graceful_stop_with(ctx: &mut Ctx, mode: &SupervisionMode, endpoint: &str, with_sudo: bool, keep_disabled: bool,
                           phase: &'static str, rpc: StopRpc) -> Result<StopReport, StopFailure>;
 // StopFailure 另加 Handoff(HandoffError)（Task 12 型別）：交接被拒或無法確認，未硬停；StopReport 另加 handoff_token: Option<String>
@@ -1125,7 +1125,7 @@ pub fn maybe_autostart_on_demand(ctx: &mut Ctx, method: &str, resolved: &Resolve
 `graceful_stop`（§12.1 步驟 3；Rust-only 路徑與 update／rollback 共用）：
 1. `id = capture_daemon_identity(endpoint)`；
 2. supervised：`set_enabled(false)`（windows-task `/Change /DISABLE`；systemd 不呼叫——systemd 的 `service stop` 維持雙邊行為，只有 update／rollback 呼叫端另行 disable）；
-3. `StopRpc::Plain`：RPC `daemon.stop`（2.0 s，觸發 SC-11 有序關機；連不上不算失敗）。`StopRpc::Handoff`（update／rollback，Task 12；R1-F1）：改送 `daemon.handoff_stop`（`request_handoff_stop`），**不送** `daemon.stop`；`Err(HandoffError)` → 立即回 `Err(StopFailure::Handoff)`，不做第 4、5 步（不等待、不 `hard_stop`），`keep_disabled` 由呼叫端還原；`Ok(grant)` → 記 `handoff_token` 後續第 4 步。`daemon stop`／`service stop|restart`／`daemon restart`／reconcile 一律 `Plain`（使用者明確要求停止，SC-11 drain 中止進行中操作屬預期，非交接）；
+3. `StopRpc::Plain`：RPC `daemon.stop`（2.0 s，觸發 SC-11 有序關機；連不上不算失敗）。`StopRpc::Handoff`（update／rollback，Task 12；R1-F1）：改送 `daemon.handoff_stop`（`request_handoff_stop`），**不送** `daemon.stop`；`Err(HandoffError)` → 立即回 `Err(StopFailure::Handoff)`，不做第 4、5 步（不等待、不 `hard_stop`），`keep_disabled` 由呼叫端還原；`Ok(grant)` → 記 `handoff_token` 後續第 4 步。`daemon stop`／`service stop|restart`／`daemon restart`／reconcile 一律 `Plain`（使用者明確要求停止，SC-11 drain 中止進行中操作屬預期，非交接）；Task 12 的**每一個**停止點——步驟 3 停舊版、步驟 7 回退停新版、`recover_journal` 復原變體停目前在跑的 daemon——一律 `Handoff`，Task 12 不得呼叫 `graceful_stop`（`Plain`）（R2-F6：新版 daemon 自步驟 6 起已對外服務，回退的停止與正向更新同樣可能撞上已受理的傳輸／燒錄）；
 4. `wait_daemon_gone(endpoint, &id, 10s)`；成功 → 第 6 步；
 5. 逾時 → `hard_stop`（windows-task `/End`、windows-service `sc.exe stop`、systemd `stop`、on-demand 無）後再 `wait_daemon_gone(.., 5s)`；仍未結束 → `Err(Timeout{phase, id})`；
 6. `keep_disabled==false` 時 `set_enabled(true)`（`service stop` 只停不改登入自啟設定；`/End`／`daemon.stop` 以 exit 0 結束不觸發 RestartOnFailure）；`graceful = 未執行 hard_stop`。
@@ -1876,7 +1876,9 @@ impl StepName { pub fn as_str(&self) -> &'static str; }   // "lock","verify","sa
 pub struct StepRecord { pub step: StepName, pub ok: bool, pub detail: PyDict }
 pub struct UpdateReport { pub ok: bool, pub op: &'static str /* "install"|"update"|"rollback" */, pub from_version: Option<String>, pub to_version: String,
                           pub steps: Vec<StepRecord>, pub backup_dir: Option<PathBuf>, pub reverted: bool, pub error_code: Option<&'static str>,
-                          pub phase: Option<&'static str>, pub reason: Option<String>, pub message: Option<String> }
+                          pub phase: Option<&'static str>, pub reason: Option<String>, pub message: Option<String>,
+                          pub revert_pending: bool /* R2-F6：回退因新版交接被拒／無法確認而暫緩，journal 保留 */,
+                          pub revert_error: Option<PyDict> /* {error_code, phase:"update_revert", handoff|handoff_outcome, busy|probe|pids} */ }
 pub struct SupervisorSnapshot { pub mode: SupervisionMode, pub endpoint: String, pub enabled: Option<bool>, pub running: bool,
                                 pub registration: Option<PathBuf> /* 匯出的 Task XML／unit 檔複本 */ }
 pub struct BackupSet { pub dir: PathBuf, pub supervisor: SupervisorSnapshot }
@@ -1897,7 +1899,8 @@ pub enum HandoffError {
     Busy { code: &'static str /* "FLASHING_BUSY"|"SESSION_BUSY" */, busy: PyList },    // daemon 原子判定為忙碌：未凍結、未停止
     Unconfirmed { code: String, probe: &'static str /* "daemon.handoff_stop" */, outcome: &'static str /* "refused"|"unknown" */ },
 }
-pub fn request_handoff_stop(ctx: &Ctx, endpoint: &str, reason: &str /* "update"|"rollback" */) -> Result<HandoffGrant, HandoffError>;
+pub fn request_handoff_stop(ctx: &Ctx, endpoint: &str, reason: &str /* "update"|"rollback"|"revert" */) -> Result<HandoffGrant, HandoffError>;
+// reason 為 01 SC-11-handoff 的自由字串參數（`str(params.get("reason") or "update")`，未限定值、busy 判定與凍結語意不因 reason 而異）；"revert" 由步驟 7 與 recover_journal 使用（R2-F6）
 // RPC daemon.handoff_stop {"reason":…}（2.0 s、不重試、不觸發 SC-18）：
 //   {"ok":true,"stopping":true,"handoff_token":<32 hex>} → Ok；
 //   {"ok":false,"error_code":"FLASHING_BUSY"|"SESSION_BUSY","busy":[…]} → Busy；
@@ -1930,8 +1933,14 @@ pub fn persist_original_snapshot(ctx: &Ctx, root: &InstallRoot, sup: &Supervisor
 // 在**任何**停用／停止之前執行：匯出已註冊監管內容、複製 config.yaml、記錄穩定入口與 current-release.json 到 snapshot_dir，每檔 fsync＋sync_dir
 pub struct RecoveryReport { pub ok: bool, pub from_step: &'static str, pub backup_used: bool, pub journal_kept: bool,
                             pub restored: PyDict /* current、entries、config、supervisor{enabled,running}、daemon_version */,
-                            pub error_code: Option<&'static str>, pub reason: Option<String>, pub message: Option<String> }
+                            pub error_code: Option<&'static str>, pub reason: Option<String>, pub message: Option<String>,
+                            pub detail: PyDict /* R2-F6：交接被拒時的 handoff／busy 或 probe／handoff_outcome／pids；其他情況為空 */ }
 pub fn recover_journal(ctx: &mut Ctx, root: &InstallRoot) -> Option<RecoveryReport>;
+pub enum RevertStop { Absent, Stopped { token: String, graceful: bool }, Deferred(HandoffError) }   // R2-F6
+pub fn stop_for_revert(ctx: &mut Ctx, mode: &SupervisionMode, endpoint: &str, with_sudo: bool, phase: &'static str) -> Result<RevertStop, StopFailure>;
+// 步驟 7 與 recover_journal 復原變體共用、唯一的停止入口：確認不存在 → Absent（零 RPC 停止）；否則只經 graceful_stop_with(StopRpc::Handoff{reason:"revert"})；
+// Busy／Unconfirmed → Deferred（未硬停、enabled 已還原為交接前值、journal 未改寫）；交接 ok 後等待逾時才 hard_stop。內部不得呼叫 graceful_stop（Plain）或送 daemon.stop。
+// 行程在但 RPC 不通（connect 失敗）→ Deferred(Unconfirmed{code:"DEVICE_STILL_HELD", outcome:"refused"})，detail 帶 pids。
 // 無 journal → None。ok:true 才刪 journal 與 snapshot_dir；ok:false → journal 與 snapshot_dir 原樣保留（位元組不變），呼叫端以 rc 2 結束、不進行本次 op。
 pub fn run_install(ctx: &mut Ctx, bundle_dir: &Path, ns: &Namespace) -> UpdateReport;
 // force_requested：使用者是否帶 `--force`。update／rollback 路徑**只用於回報**（safety_check 步驟 detail 記 `force_ignored:true`），
@@ -1959,16 +1968,18 @@ pub fn run_rollback(ctx: &mut Ctx, with_sudo: bool, force_requested: bool) -> Up
 | tty 仍被持有 | `DEVICE_STILL_HELD` | `update_confirm_released` | `pids`、`paths` |
 | 新版啟動失敗 | `DAEMON_EXITED`／`DAEMON_NOT_READY`／`TIMEOUT` | `update_start_and_verify` | `reverted`、`revert_error` |
 | 新版驗收失敗 | `INTERNAL_ERROR` | `update_start_and_verify` | `pairing_mismatch`／`health_failed`／`wal_unhealthy`／`state_incompatible`／`smoke_failed`、`pairing_diffs`、`reverted` |
+| 步驟 5／6 失敗後回退，但新版 daemon 交接被拒（驗收期間已受理 `file.push`／flash 等）或無法確認（`METHOD_NOT_FOUND`、格式不符、逾時、行程在但 RPC 不通）（R2-F6） | 頂層仍為原失敗碼（上兩列）；回退失敗放 `revert_error.error_code`（daemon 回的 `FLASHING_BUSY`／`SESSION_BUSY`，或原碼／`INVALID_RESPONSE`／`TIMEOUT`／`SOCKET_ERROR`／`DEVICE_STILL_HELD`） | 頂層 `update_start_and_verify`；`revert_error.phase:"update_revert"` | `reverted:false`、`revert_pending:true`、`revert_error{error_code,phase,handoff:"refused"\|handoff_outcome:"refused"\|"unknown",busy\|probe:"daemon.handoff_stop"\|pids}`、hint；未送 `daemon.stop`、未硬停、入口／current／config 仍為新版、監管 enabled 還原為快照值、journal 與 `snapshot_dir` 保留（下一次 `setup` 經 `recover_journal` 完成回退） |
 | 寫 journal 或原始快照失敗（磁碟滿、權限） | `INTERNAL_ERROR` | `update_journal` | `journal_write_failed`、`journal_step`；該步副作用一律未執行 |
 | 中斷復原：journal 無法解析、`original` 缺漏、snapshot 檔 sha256 不符 | `INTERNAL_ERROR` | `install_recover` | `journal_corrupt`／`snapshot_missing`／`snapshot_mismatch`、`journal_step`；journal 保留 |
 | 中斷復原：需用備份但 `backup_manifest_sha256` 缺或備份檔驗證不符 | `INTERNAL_ERROR` | `install_recover` | `backup_incomplete`、`journal_step`、`backup_dir`；journal 保留、不啟動任何版本 |
 | 中斷復原：舊 daemon／holder 仍在、或還原後 Previous 驗收失敗 | `DEVICE_STILL_HELD`／`TIMEOUT`／`DAEMON_EXITED`／`DAEMON_NOT_READY`／`INTERNAL_ERROR` | `install_recover` | 同步驟 4／6 的附加欄位；journal 保留 |
+| 中斷復原（「已開始切換」類）：目前在跑的 daemon（可能為新版）交接被拒或無法確認（R2-F6） | daemon 回的 `FLASHING_BUSY`／`SESSION_BUSY`，或原碼／`INVALID_RESPONSE`／`TIMEOUT`／`SOCKET_ERROR`／`DEVICE_STILL_HELD` | `install_recover` | `handoff:"refused"`＋`busy`，或 `probe:"daemon.handoff_stop"`＋`handoff_outcome`、`journal_step`、hint；`recovered_journal.ok:false`、journal 與 `snapshot_dir` 逐位元組保留、未送 `daemon.stop`、未硬停、不切換回 Previous、不進行本次 op |
 
 行為（update 與 rollback 共用；rollback 的「新版本」＝Previous；首次安裝見文末）：
 0. **lock＋journal**（R1-F5：journal 必須自帶回到完整 Previous 的原始資料）：`install_lock`（Task 11）取得後才 `read_current`；每個 `JournalStep` 在其副作用**開始前** `write_journal`（fsync＋`sync_dir`），寫入失敗即中止（`update_journal`，見上表）；成功或完整回退且 Previous 驗收通過後才刪 journal 與 `snapshot_dir`。中斷時 `doctor` 的 `version_pairing` 會顯示不一致，fix 指向 `serialwrap setup`。任何分支（install／update／rollback）開始前若有 `install-journal.json` → `recover_journal`，依**內部** `journal.step` 分三類（輸出 `recovered_journal:<RecoveryReport>`）：
    - **無副作用**（`lock`、`verify`、`safety_check`）：尚未動到監管、daemon、入口或設定（`stage_version` 的 `versions/<v>` 屬未啟用目錄，不需還原）→ 直接刪 journal；`from_step` 照記、`backup_used:false`。
    - **已停用／已停止、尚未切換**（`snapshot_taken`、`stop_supervisor`、`confirm_released`、`backup_started`、`backup_complete`）：先核對 `snapshot_sha256` 與 `original` 完整（缺 → `snapshot_missing`／`snapshot_mismatch`，journal 保留）；再核對穩定入口、`current-release.json`、`config.yaml` 與 `original.entries`／`original.current`／`config_sha256` 相同（不同 → 依「已開始切換」處理，但只在 `backup_manifest_sha256` 存在時，否則 `backup_incomplete`）；**不得**呼叫 `restore_backup`、不得讀 `backup_dir`（`backup_started` 時的 `*.partial` 目錄改名為 `*.incomplete` 保留為證據，`backup_used:false`）。接著還原監管與 daemon 到**原始**值：`set_enabled(original.supervisor.enabled)`（mode 不支援 enabled 時略過）；`original.daemon` 為 Some（停止前 daemon 健康在跑）且目前 ping 不通 → 先確認舊行程樹已全數結束且 POSIX `serialwrapd_tty_holders(original.daemon.attached_paths)` 為空（仍在 → `DEVICE_STILL_HELD`／`install_recover`，不啟動，§12.1「不能強行啟動上一版搶同一 UART」），再依 `original.daemon_start` 重新啟動舊版本（`supervised` → `action(Start)`；`on_demand_internal` → 以舊穩定入口執行內部 start 流程），並以步驟 6 的 1～5 驗收**舊版本**（版本＝`original.current.bundle_version`、快照 session 的 `com` 仍在、RELEASED 仍為 RELEASED）；`original.daemon` 為 None → 不啟動任何 daemon、`running` 保持 false。
-   - **已開始切換**（`entries_switching`、`start_and_verify`、`revert_to_previous`）：先以 `backup_manifest_sha256` 驗證 `backup_dir/manifest.json`，再逐檔核對 manifest 內 sha256；任一不符或欄位缺 → `backup_incomplete`，journal 保留、不啟動任何版本（fail-closed）。驗證通過才執行步驟 7 的**復原變體**（見步驟 7），其 entries、current、監管 enabled／running 與 daemon 啟動路徑一律取自 `journal.original`，不依賴行程記憶體中的 `SwitchReport`／`SupervisorSnapshot`。
+   - **已開始切換**（`entries_switching`、`start_and_verify`、`revert_to_previous`）：先以 `backup_manifest_sha256` 驗證 `backup_dir/manifest.json`，再逐檔核對 manifest 內 sha256；任一不符或欄位缺 → `backup_incomplete`，journal 保留、不啟動任何版本（fail-closed）。驗證通過才執行步驟 7 的**復原變體**（見步驟 7；停止目前在跑的 daemon 只經 `stop_for_revert` 交接，忙碌或不明 → `ok:false`、journal 逐位元組保留、不硬停、不切換，R2-F6），其 entries、current、監管 enabled／running 與 daemon 啟動路徑一律取自 `journal.original`，不依賴行程記憶體中的 `SwitchReport`／`SupervisorSnapshot`。
    - 任一類還原失敗 → `RecoveryReport.ok:false`、`journal_kept:true`、journal 與 `snapshot_dir` 位元組不變，`setup` 以 rc 2 結束且**不**進行本次 op（輸出 `{"ok":false,"error_code",…,"phase":"install_recover","recovered_journal":<report>}`）；成功 → 刪 journal 後繼續本次 op。
 1. **verify**：update：`parse_manifest(<bundle>/release-manifest.json)`＋`verify_bundle`＋**state_schema 相容性**（Current 與新 manifest 的 `components.daemon.state_schema` 不同 → 拒絕；只有新 manifest 宣告 `components.daemon.state_migration:{from,to,id,approval_ref}` 且 `id` 列於 `contracts/behavior_changes.yaml` 已核准項時才允許——Stage 1 沒有任何核准遷移，故一律拒絕，§12.1「如确需不相容變更，必須先核准遷移／回復方案」）＋`stage_version`；rollback：`read_current` 有 `previous` 且 `versions/<prev>` 存在且 `verify_bundle` 通過且 state_schema 相同，否則依上表（原因字串：`current-release.json 不存在`／`未記錄 previous`／`版本目錄 <dir> 不存在`／`版本目錄驗證失敗`）。
 2. **safety_check**（fail-closed；**不受 `--force` 影響**——§12.1 步驟 2「檢查 Flash、FileTransfer、活躍寫入與其他不可安全中止操作；不符合交接條件時拒絕更新」沒有覆寫條款，且步驟 3 起的 daemon 停止（SC-11 shutdown drain）會取消傳輸、停止 flash pump，行程安全退出無法撤銷 DUT 上已發生的部分燒寫／部分寫檔。本步是**提早拒絕的預檢**（不動監管與 daemon），交接授權以步驟 3 的 daemon 原子交接為準。故 busy 判定、身分確認與 RPC 探測在 update／rollback 一律執行；帶 `--force` 時只在本步 detail 記 `force_ignored:true`，結果與未帶時逐欄相同。一般 `setup`（Task 10，非 update 路徑）的 `--force` 覆寫 flashing 為 Python 對等行為，不適用於此）：
@@ -1988,8 +1999,12 @@ pub fn run_rollback(ctx: &mut Ctx, with_sudo: bool, force_requested: bool) -> Up
    4. 狀態相容：`session.list` ok；快照中每個 session 的 `com` 仍在；快照時為 RELEASED 者仍為 RELEASED（不得被自動 attach）；
    5. 可操作性 smoke：唯讀 `device.list`、`alias.list` 皆 ok。
    daemon 於步驟 3 前未在跑 → 只驗 1 與 manifest 配對，不 spawn。
-7. **revert_to_previous**（步驟 5 或 6 失敗、或 `recover_journal`）：`graceful_stop` 剛啟動者（同步驟 3、4，10 s）→ `revert_entries` → `restore_backup(本次備份, include_state=false)`（config → 定義檔 → 重新註冊）→ `write_current(舊值)` → 依舊 `SupervisorSnapshot` 還原 enabled／running → 舊版本以步驟 6 的 1～5 驗收。輸出依上表，detail 帶 `reverted:true|false`、`pairing_diffs`、`revert_error`（若有）；失敗證據（各步驟 detail、新版 daemon 最後 `health.status` 或 spawn 錯誤）保存到 `<backup_dir>/failure.json`。
-   **復原變體**（`recover_journal` 的「已開始切換」類；行程記憶體已遺失）：先 `write_journal{step:revert_to_previous}` → 對 endpoint ping 與 ProcScan：有 daemon（可能是新版）→ `graceful_stop`＋`wait_daemon_gone`（10 s，失敗 → `TIMEOUT`／`install_recover`，journal 保留）→ 以 `original.entries` 還原穩定入口（`restore_entries_from_snapshot`：Symlink 重指 `target`；Copy 由 `versions/<original.current.dir>/bin/<n>` 複製並核對 `sha256` 等於快照值，不符 → 失敗；Absent 刪除）→ `restore_backup(backup_dir, include_state=false)` → `write_current(original.current)`（逐欄等於快照）→ 確認 tty holder 已釋放後依 `original.supervisor.enabled`／`original.daemon`／`original.daemon_start` 還原 enabled 與 running → 步驟 6 的 1～5 驗收舊版本。全部通過才刪 journal；`failure.json` 另記 `recovered_from_step`。
+7. **revert_to_previous**（步驟 5 或 6 失敗、或 `recover_journal`）：**停止目前在跑的 daemon 只經原子交接**（R2-F6；§12.1 步驟 3 的「安全停止」與步驟 2 的「不符合交接條件時拒絕」同樣適用於回退：步驟 6 的新版 daemon 一啟動就對外服務，驗收期間外部 client 可能已讓它受理 `file.push`／`file.pull`／flash sync-probe／命令，一般 `daemon.stop` 觸發的 SC-11 drain Phase 1 會 `TransferAbort`／停 flash pump，無法撤銷 DUT 上的部分寫檔／燒寫——與 R1-F1 修正的正向競態相同）。`stop_for_revert(ctx, mode, ep, phase)`：
+   - **確認不存在**：`health.ping`(0.5) 失敗**且** `ProcScan::serialwrapd_instances()` 查無 endpoint 對應實例（含步驟 6 spawn 的 pid；例如 `DAEMON_EXITED` 或步驟 5 失敗而從未啟動）→ 不送任何停止 RPC，直接進入還原。ProcScan 失敗不算確認不存在。
+   - **其他一律**（ping ok，或 ping 不通但行程仍在、或 ProcScan 失敗）→ `graceful_stop_with(mode, keep_disabled=true, phase, StopRpc::Handoff{reason:"revert"})`（`mode`＝啟動該 daemon 的組合：in-process 為步驟 6 的目標 mode；復原變體為目前 config 的 mode），**不送** `daemon.stop`、**不**呼叫 `graceful_stop`（`Plain`）。`Ok(grant)` → detail 記 `revert_handoff_token`，等待結束（≤10 s），逾時才 `hard_stop`（此時已凍結、無不可中止操作）；ping 不通但行程仍在時交接 connect 失敗即為 `Unconfirmed`（無 RPC 通道可原子確認閒置）。
+   - **`Err(Handoff(Busy|Unconfirmed))` → 回退暫緩（fail-closed）**：**不** `hard_stop`、**不** `revert_entries`／`restore_backup`／`write_current`、不切換監管註冊（新版維持 Current 且繼續服務其已受理的操作）；監管 enabled 還原為交接前的值（in-process＝步驟 6 設定的 `original.supervisor.enabled`；復原變體＝交接前 `query()` 值）；journal 與 `snapshot_dir` **逐位元組保留**（本子步驟在 `write_journal{step:revert_to_previous}` **之前**執行，故 journal 仍停在 `entries_switching`／`start_and_verify`；交接 ok 後中斷，下一次復原見 daemon 已不存在即直接還原，冪等）。in-process 輸出頂層維持原失敗碼與 `phase:"update_start_and_verify"`，另帶 `reverted:false`、`revert_pending:true`、`revert_error{error_code:<daemon 回碼或 Unconfirmed 碼>, phase:"update_revert", handoff:"refused"＋busy | probe:"daemon.handoff_stop"＋handoff_outcome | pids}`、hint `新版 daemon 仍有進行中的傳輸／燒錄（或無法確認），未中止、尚未回退；完成後再執行 serialwrap setup 以回到 <prev>`（`unknown`／`METHOD_NOT_FOUND` 時另指示以 `serialwrap daemon status` 確認無進行中操作，必要時由使用者明確 `serialwrap daemon stop` 後重跑 `setup`）；`failure.json` 照寫並加 `revert_deferred:true`。
+   交接成功（或確認不存在）後：`write_journal{step:revert_to_previous}` → `revert_entries` → `restore_backup(本次備份, include_state=false)`（config → 定義檔 → 重新註冊）→ `write_current(舊值)` → 依舊 `SupervisorSnapshot` 還原 enabled／running → 舊版本以步驟 6 的 1～5 驗收。輸出依上表，detail 帶 `reverted:true|false`、`pairing_diffs`、`revert_error`（若有）；失敗證據（各步驟 detail、新版 daemon 最後 `health.status` 或 spawn 錯誤）保存到 `<backup_dir>/failure.json`。
+   **復原變體**（`recover_journal` 的「已開始切換」類；行程記憶體已遺失）：先 `stop_for_revert(phase:"install_recover_wait_stop")`（同上；有 daemon（可能是新版，且可能自上次 updater 中斷後已服務很久）→ 只經 `daemon.handoff_stop{"reason":"revert"}`，**不送** `daemon.stop`；`Busy`／`Unconfirmed` → `RecoveryReport{ok:false, journal_kept:true, error_code:<daemon 回碼或 Unconfirmed 碼>}`＋`handoff:"refused"`＋`busy` 或 `probe:"daemon.handoff_stop"`＋`handoff_outcome`，`phase:"install_recover"`，journal 與 `snapshot_dir` 逐位元組不變、不硬停、不切換、`setup` rc 2 且不進行本次 op；交接 ok 後 `wait_daemon_gone`（10 s，逾時才 `hard_stop`，仍失敗 → `TIMEOUT`／`install_recover`，journal 保留））→ `write_journal{step:revert_to_previous}` → 以 `original.entries` 還原穩定入口（`restore_entries_from_snapshot`：Symlink 重指 `target`；Copy 由 `versions/<original.current.dir>/bin/<n>` 複製並核對 `sha256` 等於快照值，不符 → 失敗；Absent 刪除）→ `restore_backup(backup_dir, include_state=false)` → `write_current(original.current)`（逐欄等於快照）→ 確認 tty holder 已釋放後依 `original.supervisor.enabled`／`original.daemon`／`original.daemon_start` 還原 enabled 與 running → 步驟 6 的 1～5 驗收舊版本。全部通過才刪 journal；`failure.json` 另記 `recovered_from_step`。
 
 **首次安裝**（`ExeLocation::External`＋manifest、`read_current` 為 None）：lock → verify＋`stage_version` → `materialize_assets(force)`（Task 10，含 skill link 與 wrappers）→ `switch_entries` → `resolve_target_mode`（Windows 預設 `windows-task`）→ effective socket（Task 10 步驟 7）→ `reconcile(old = config.mode or on-demand, target)`（寫入 config 的 `supervision_mode`／`socket_path`、註冊並啟動監管）→ `write_current{previous:None}` → 步驟 6 驗收（supervised 時）。失敗 → 移除本次 `bin` 入口與 config 變更（以本次備份還原）並回報。首次安裝同樣在 `materialize_assets` 之前 `persist_original_snapshot`（`original.current:None`、入口多為 `Absent`、`config.yaml` 複本或 `config_sha256:None`、`daemon` 依當下 ping）並寫 `snapshot_taken`，中斷復原依步驟 0：刪除 `Absent` 入口、以 snapshot 的 `config.yaml` 還原（或刪除本次新建者）、解除本次註冊、`original.daemon` 為 None 時不啟動任何 daemon。輸出 `{"ok":true,"install":<report>,"setup":<reconcile 結果>,"legacy","doctor_hint","console_hint"[,"pending_sudo"]}`。
 
@@ -2317,6 +2332,95 @@ fn journal_recovery_failure_keeps_journal_and_skips_op() {
     assert!(t.rpc().requests().iter().all(|r| r.1 != "daemon.stop"));
     assert_eq!(sw_cli::install_layout::read_current(&t.root()).unwrap().unwrap().bundle_version, "0.4.0");
 }
+// R2-F6：步驟 6 的新版 daemon 一啟動就對外服務；步驟 7 回退與 recover_journal 停止它時只能經原子交接，
+// 新版已受理的 file.push／flash 不得被 SC-11 drain 中止（修正前必 FAIL：舊實作以 graceful_stop 送一般 daemon.stop）
+const BUSY_PUSH: &str = "{\"ok\":false,\"error_code\":\"SESSION_BUSY\",\"busy\":[{\"com\":\"COM0\",\"state\":\"READY\",\"foreground_busy\":true,\"outstanding_commands\":0,\"interactive_session_id\":null,\"recovering\":false,\"ops\":[\"file.push\"]}]}";
+const BUSY_FLASH: &str = "{\"ok\":false,\"error_code\":\"FLASHING_BUSY\",\"busy\":[{\"com\":\"COM0\",\"state\":\"FLASHING\",\"foreground_busy\":false,\"outstanding_commands\":0,\"interactive_session_id\":null,\"recovering\":false,\"ops\":[\"flash\"]}]}";
+fn methods(t: &TestEnv) -> Vec<String> { t.rpc().requests().iter().map(|r| r.1.clone()).collect() }
+fn handoffs(t: &TestEnv) -> usize { methods(t).iter().filter(|m| *m == "daemon.handoff_stop").count() }
+fn assert_revert_deferred_untouched(t: &TestEnv, j0: Option<&[u8]>, new_ver: &str) {
+    assert!(methods(t).iter().all(|m| m != "daemon.stop"), "回退／復原不得送一般 daemon.stop");
+    assert!(!t.calls().iter().any(|c| c.get(1).map(String::as_str) == Some("/End")), "交接被拒或不明時不得硬停");
+    assert_eq!(sw_cli::install_layout::read_current(&t.root()).unwrap().unwrap().bundle_version, new_ver, "不得切換回 Previous");
+    for exe in ["serialwrap.exe", "serialwrapd.exe"] {
+        assert_eq!(std::fs::read(t.root().bin.join(exe)).unwrap(), t.version_bytes(new_ver, &format!("bin/{exe}")), "{exe} 不得被還原");
+    }
+    let st = t.service().query_now();
+    assert_eq!((st.enabled, st.running), (Some(true), true), "新版繼續服務其已受理的操作、監管 enabled 還原為交接前值");
+    assert!(t.journal_json().is_some() && t.root().root.join("install-journal.snapshot").exists(), "journal 與 snapshot_dir 必須保留");
+    if let Some(j0) = j0 { assert_eq!(t.journal_bytes().unwrap(), j0, "journal 必須逐位元組不變"); }
+}
+#[test]
+fn revert_refuses_while_new_daemon_pushing() {
+    let t = TestEnv::windows().with_install_root().with_installed("0.4.0").with_bundle("0.4.1")
+        .with_supervisor_state("windows-task", true, true).with_idle_daemon(TestEnv::win_endpoint(), 4242)
+        .with_new_daemon_reporting_version("0.4.0")        // 新版驗收 pairing_mismatch → 步驟 7
+        .with_new_daemon_handoff_script(&[BUSY_PUSH]);     // 驗收期間外部 client 已讓新版受理 file.push
+    let (cfg0, cur0) = (t.config_bytes(), std::fs::read(t.root().current_file).unwrap());
+    let (rc, out, err) = t.run_from_bundle(&["setup"]);
+    assert_eq!(rc, 2, "{out}");
+    assert!(err.starts_with("serialwrap: setup failed: INTERNAL_ERROR: "));
+    let j = json(&out);
+    assert_eq!((s(&j, "error_code"), s(&j, "phase"), s(&j, "reason")), ("INTERNAL_ERROR", "update_start_and_verify", "pairing_mismatch"));
+    let u = &j["update"];
+    assert_eq!((&u["reverted"], &u["revert_pending"]), (&serde_json::json!(false), &serde_json::json!(true)));
+    let re = &u["revert_error"];
+    assert_eq!((re["error_code"].as_str(), re["phase"].as_str(), re["handoff"].as_str()), (Some("SESSION_BUSY"), Some("update_revert"), Some("refused")));
+    assert_eq!(re["busy"][0]["ops"][0], "file.push");
+    assert_eq!(handoffs(&t), 2, "步驟 3 停舊版 1 次＋步驟 7 停新版 1 次，不重試");
+    assert_eq!(rpc_params_nth(&t, "daemon.handoff_stop", 1)["reason"], "revert");
+    let o = t.event_order();
+    assert!(o.index_of("service:start") < o.index_of_nth("rpc:daemon.handoff_stop", 1), "交接對象是步驟 6 啟動的新版");
+    assert!(o.index_of_nth("rpc:daemon.handoff_stop", 1) < o.index_of_nth("service:set_enabled:true", 1), "拒絕後還原 enabled");
+    assert_revert_deferred_untouched(&t, None, "0.4.1");
+    assert_eq!(t.journal_json().unwrap()["step"], "start_and_verify", "交接被拒前不得推進到 revert_to_previous");
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&std::fs::read(t.backup_dir_of(&j).join("failure.json")).unwrap()).unwrap()["revert_deferred"], true);
+    // 新版已受理的 push 完成（script 用盡 → 交接回閒置 grant）後，下一次 setup 的 recover_journal 才完成回退
+    let rec = t.recover().expect("殘留 journal");
+    assert!(rec.ok, "{:?}", rec.reason);
+    assert_eq!((rec.from_step, rec.backup_used), ("start_and_verify", true));
+    assert_eq!(handoffs(&t), 3);
+    assert_eq!(rpc_params_nth(&t, "daemon.handoff_stop", 2)["reason"], "revert");
+    assert!(methods(&t).iter().all(|m| m != "daemon.stop"));
+    assert_back_to_original(&t, &cfg0, &cur0);
+    assert_eq!(t.rpc_now(TestEnv::win_endpoint(), "health.status")["version"], "0.4.0");
+}
+#[test]
+fn journal_recovery_refuses_while_new_daemon_flashing() {
+    // updater 在新版啟動後、驗收完成前被殺；新版持續對外服務並開始 flash
+    let t = TestEnv::windows().with_install_root().with_installed("0.4.0").with_bundle("0.4.1")
+        .with_supervisor_state("windows-task", true, true).with_idle_daemon(TestEnv::win_endpoint(), 4242)
+        .with_crash_at("start_and_verify:after_effect");
+    let (cfg0, cur0) = (t.config_bytes(), std::fs::read(t.root().current_file).unwrap());
+    assert_eq!(t.run_from_bundle(&["setup"]).0, 137);
+    let t = t.clear_crash().with_new_daemon_reporting_version("0.4.0")
+        .with_new_daemon_handoff_script(&[BUSY_FLASH, BUSY_FLASH]);   // 第一次 recover() 與下一次 setup 時 flash 仍在進行
+    let j0 = t.journal_bytes().unwrap();
+    assert_eq!(t.journal_json().unwrap()["step"], "start_and_verify");
+    let h0 = handoffs(&t);
+    let rec = t.recover().unwrap();
+    assert!(!rec.ok && rec.journal_kept);
+    assert_eq!((rec.from_step, rec.error_code), ("start_and_verify", Some("FLASHING_BUSY")));
+    assert_eq!((&rec.detail["handoff"], &rec.detail["busy"][0]["ops"][0]), (&serde_json::json!("refused"), &serde_json::json!("flash")));
+    assert_eq!(handoffs(&t), h0 + 1);
+    assert_eq!(rpc_params_nth(&t, "daemon.handoff_stop", h0)["reason"], "revert");
+    assert_revert_deferred_untouched(&t, Some(&j0), "0.4.1");
+    // 經 setup 入口同樣 fail-closed，且不進行本次 op
+    let (rc, out, _) = t.run_from_bundle(&["setup"]);
+    assert_eq!(rc, 2);
+    let o = json(&out);
+    assert_eq!((s(&o, "error_code"), s(&o, "phase")), ("FLASHING_BUSY", "install_recover"));
+    assert_eq!((&o["recovered_journal"]["ok"], &o["recovered_journal"]["journal_kept"]), (&serde_json::json!(false), &serde_json::json!(true)));
+    assert_eq!(o["recovered_journal"]["detail"]["handoff"], "refused");
+    assert!(o.get("update").is_none(), "復原未完成不得繼續本次 update");
+    assert_revert_deferred_untouched(&t, Some(&j0), "0.4.1");
+    // flash 完成（script 用盡）→ 交接 ok → 回到完整 Previous
+    let rec = t.recover().unwrap();
+    assert!(rec.ok, "{:?}", rec.reason);
+    assert!(methods(&t).iter().all(|m| m != "daemon.stop"));
+    assert!(!t.calls().iter().any(|c| c.get(1).map(String::as_str) == Some("/End")), "閒置新版正常結束時不得硬停");
+    assert_back_to_original(&t, &cfg0, &cur0);
+}
 #[test]
 fn update_interrupt_injection_every_point_recovers_to_previous() {
     for point in CRASH_POINTS {
@@ -2336,6 +2440,7 @@ fn update_interrupt_injection_every_point_recovers_to_previous() {
         let st = t.service().query_now();                           // FakeServiceCtl 目前的註冊狀態
         assert_eq!((st.enabled, st.running), (Some(true), true), "{point}: 監管必須回到原始 enabled／running");
         assert_eq!(t.rpc_now(TestEnv::win_endpoint(), "health.status")["version"], "0.4.0", "{point}");
+        assert!(t.rpc().requests().iter().all(|r| r.1 != "daemon.stop"), "{point}: update、步驟 7 回退與 journal 復原皆不得送一般 daemon.stop（R2-F6）");
     }
 }
 #[test]
@@ -2347,6 +2452,7 @@ fn crash_points_cover_every_journal_step() {
         }
     }
     assert!(CRASH_POINTS.contains(&"backup_started:after_config_copy") && CRASH_POINTS.contains(&"entries_switching:after_first_rename"));
+    assert!(CRASH_POINTS.contains(&"start_and_verify:started"), "R2-F6：新版已對外服務、驗收前的中斷點");
 }
 ```
 
@@ -2369,7 +2475,7 @@ fn crash_points_cover_every_journal_step() {
 | `update_handoff_unsupported_daemon_refuses_without_stop`（上方程式碼） | `daemon.handoff_stop` 回 `METHOD_NOT_FOUND` → 原碼、`probe:"daemon.handoff_stop"`、`handoff_outcome:"refused"`；無 `daemon.stop`、無 `/End`、不切換 |
 | `update_handoff_recv_timeout_no_hard_stop` | `daemon.handoff_stop` recv timeout → `TIMEOUT`／`update_safety_check`、`handoff_outcome:"unknown"`、hint 含 `serialwrap daemon status`；`set_enabled(true)` 被呼叫、無 `/End`、無 `daemon.stop`、不切換 |
 | `update_handoff_malformed_grant_refuses` | `daemon.handoff_stop` 回 `{"ok":true,"stopping":true}`（缺 token）或 token 非 32 hex → `INVALID_RESPONSE`、`probe:"daemon.handoff_stop"`、無 `/End`、不切換 |
-| `update_never_sends_plain_daemon_stop` | update 與 rollback 的 happy path（含 on-demand 與 windows-task 模式）RPC 序中 `daemon.stop` 出現 0 次、`daemon.handoff_stop` 恰 1 次，`stop_supervisor.detail.handoff_token` 等於 daemon 回傳 token；daemon 不存在（步驟 2 `Ok(None)`）時兩者皆 0 次 |
+| `update_never_sends_plain_daemon_stop` | update 與 rollback 的 happy path（含 on-demand 與 windows-task 模式）RPC 序中 `daemon.stop` 出現 0 次、`daemon.handoff_stop` 恰 1 次，`stop_supervisor.detail.handoff_token` 等於 daemon 回傳 token；daemon 不存在（步驟 2 `Ok(None)`）時兩者皆 0 次。R2-F6 擴充：驗收失敗回退路徑（`pairing_mismatch`／`health_failed`／`wal_unhealthy`／`state_incompatible`／`smoke_failed` 各一，update 與 rollback 各跑）`daemon.stop` 仍 0 次、`daemon.handoff_stop` 恰 2 次（第 2 次 `reason:"revert"`，`start_and_verify`／`revert_to_previous` detail 記 `revert_handoff_token`）、`reverted:true`；新版 spawn 即結束（`with_spawn_exits(1)`，`DAEMON_EXITED`）時交接恰 1 次（新版確認不存在，零停止 RPC）且 `reverted:true` |
 | `update_rpc_down_child_holds_com_blocks` | ping refused 但 ProcScan 仍回 endpoint 對應實例 → `DEVICE_STILL_HELD`／`update_safety_check`、`pids` 含該 pid、無切換 |
 | `update_identity_unknown_blocks` | ping ok、`FakeProcScan::fail()` → `DEVICE_STILL_HELD`、`holder_unknown:true`、無 stop |
 | `update_force_does_not_override_flashing`／`rollback_force_does_not_override_flashing`（上方程式碼） | FLASHING＋`--force` → `FLASHING_BUSY`／`update_safety_check`、steps 止於 `safety_check` 且 detail `force_ignored:true`、無 `skipped`；`service().actions()` 為空、無 `daemon.stop` RPC、`current-release.json` 與 `bin` 未變 |
@@ -2395,8 +2501,8 @@ fn crash_points_cover_every_journal_step() {
 | `switch_never_starts_before_backup_committed`（上方程式碼） | crash 於 `entries_switching:before_effect` → `backup_dir/manifest.json` 已存在且 sha256 等於 journal 的 `backup_manifest_sha256`、無 `*.partial`、入口未變 |
 | `journal_recovery_with_unverifiable_backup_keeps_journal`（上方程式碼） | 半切換後竄改備份 → rc 2、`INTERNAL_ERROR`／`install_recover`／`backup_incomplete`、`recovered_journal.journal_kept:true`、journal 逐位元組不變、無監管動作、無 spawn、無 `/Create /XML` |
 | `journal_recovery_failure_keeps_journal_and_skips_op`（上方程式碼） | 復原時舊版 daemon spawn 立即結束 → rc 2、`DAEMON_EXITED`／`install_recover`、`recovered_journal.ok:false`、journal 逐位元組不變、輸出無 `update` 報告、`daemon.handoff_stop` 只有第一次那 1 次且無 `daemon.stop`、current 仍 0.4.0 |
-| `update_interrupt_injection_every_point_recovers_to_previous`（上方程式碼） | 對 `CRASH_POINTS` 每個點（每個 `JournalStep` 的 before／after＋步驟內點；`revert_to_previous:*` 以 pairing 失敗驅動）注入中斷後 `recover()`：無副作用點可無 journal、其餘必須 `ok:true`；入口、`current-release.json`、`config.yaml` 逐位元組回到原值，監管 `(enabled,running)==(true,true)`，`health.status.version=="0.4.0"`，journal 與 `snapshot_dir` 均刪除 |
-| `crash_points_cover_every_journal_step`（上方程式碼） | `CRASH_POINTS` 涵蓋 11 個 `JournalStep` × {before_effect, after_effect} 與兩個步驟內點 |
+| `update_interrupt_injection_every_point_recovers_to_previous`（上方程式碼） | 對 `CRASH_POINTS` 每個點（每個 `JournalStep` 的 before／after＋步驟內點；`revert_to_previous:*` 以 pairing 失敗驅動）注入中斷後 `recover()`：無副作用點可無 journal、其餘必須 `ok:true`；入口、`current-release.json`、`config.yaml` 逐位元組回到原值，監管 `(enabled,running)==(true,true)`，`health.status.version=="0.4.0"`，journal 與 `snapshot_dir` 均刪除；每個點全程 RPC 序無 `daemon.stop`（R2-F6：`start_and_verify:*`／`revert_to_previous:*` 點的新版停止也只經交接） |
+| `crash_points_cover_every_journal_step`（上方程式碼） | `CRASH_POINTS` 涵蓋 11 個 `JournalStep` × {before_effect, after_effect} 與三個步驟內點（含 R2-F6 的 `start_and_verify:started`） |
 | `journal_write_failure_aborts_before_effect` | `with_fs_fault_replace_suffix("install-journal.json")`（journal 的 atomic replace 失敗）於 `snapshot_taken` → `INTERNAL_ERROR`／`update_journal`／`journal_write_failed`、`journal_step:"snapshot_taken"`、無 `set_enabled`、無 `daemon.stop`／`daemon.handoff_stop` |
 | `rollback_keeps_current_state_same_schema` | 兩版 `state_schema` 相同 → `state.json` 內容維持 Current；`config.yaml` 回到切換前內容 |
 | `update_release_then_rollback_keeps_released` | 更新後 COM1 `device release`（state.json 記 RELEASED）→ rollback → state.json 仍為 RELEASED，Previous daemon 啟動後 COM1 未被自動 attach |
@@ -2414,6 +2520,13 @@ fn crash_points_cover_every_journal_step() {
 | `test_update_rollback_ab_isolated`（黑箱，`rust_only`，`process_rpc`） | 以 `mkbundle.sh --dev --version-override 0.4.0`／`0.4.1` 產兩個自含 bundle（Task 17；兩者 `tree_sha256` 不同），在隔離 install root：安裝 0.4.0 → 更新 0.4.1 → `daemon status.version=="0.4.1"` → `setup --rollback` → `daemon status.version=="0.4.0"` 且 `--version` 為 `serialwrap 0.4.0`、`version_pairing.ok` |
 | `test_update_busy_l15_zero_tx`（黑箱，`rust_only`，`posix_pty`，§0.4） | bridge＋DUT 模擬器上有背景命令進行中 → 更新被拒（`SESSION_BUSY`）；拒絕前後 DUT 端 `wire.ndjson` 無任何新增 TX |
 | `test_update_file_push_after_last_probe_l15`（黑箱，`rust_only`，`posix_pty`，`process_rpc`；R1-F1） | 真 Python daemon（Stage 1 bundle）＋bridge：以 `SW_TEST_UPDATE_PAUSE_AFTER=safety_check` 讓 `setup` 在預檢後暫停（只在 `mkbundle.sh --dev` 以 `test-hooks` feature 編入；正式 bundle 不讀此 env），期間另一 client 開始 1 MiB `file push`，再放行 → `SESSION_BUSY`、`handoff:"refused"`；`daemon status.pid` 不變、WAL 無 shutdown 記錄；push 正常完成且 DUT 端 md5 正確；`current-release.json` 未變 |
+| `revert_refuses_while_new_daemon_pushing`（上方程式碼；R2-F6，修正前必 FAIL） | 新版驗收 `pairing_mismatch`、步驟 7 對新版的交接回 `SESSION_BUSY`＋`ops:["file.push"]` → rc 2、頂層 `INTERNAL_ERROR`／`update_start_and_verify`／`pairing_mismatch`；`update.reverted:false`、`update.revert_pending:true`、`revert_error{error_code:"SESSION_BUSY",phase:"update_revert",handoff:"refused"}`；交接共 2 次、第 2 次 `reason:"revert"` 且晚於步驟 6 `service:start`、拒絕後 `set_enabled:true`；無 `daemon.stop`、無 `/End`；current 與兩個 `bin` 入口仍為 0.4.1、監管 `(enabled,running)==(true,true)`；journal 停在 `start_and_verify`（未推進到 `revert_to_previous`）、`snapshot_dir` 保留、`failure.json.revert_deferred==true`；之後 `recover()`（交接回 grant）→ `ok:true`、`from_step:"start_and_verify"`、`backup_used:true`、交接第 3 次 `reason:"revert"`、仍無 `daemon.stop`、全部回到原值且 `health.status.version=="0.4.0"` |
+| `journal_recovery_refuses_while_new_daemon_flashing`（上方程式碼；R2-F6，修正前必 FAIL） | crash 於 `start_and_verify:after_effect`（新版已啟動並對外服務）後新版開始 flash：`recover()` → `ok:false`、`journal_kept:true`、`error_code:"FLASHING_BUSY"`、`detail.handoff:"refused"`、`detail.busy[0].ops==["flash"]`、交接恰多 1 次且 `reason:"revert"`；journal 逐位元組不變、無 `daemon.stop`、無 `/End`、current／入口仍 0.4.1、監管 `(true,true)`；`setup` 入口 → rc 2、`FLASHING_BUSY`／`install_recover`、`recovered_journal{ok:false,journal_kept:true,detail.handoff:"refused"}`、輸出無 `update`；flash 完成後 `recover()` → `ok:true`、無 `/End`、回到原值 |
+| `revert_handoff_unsupported_new_daemon_keeps_journal`（R2-F6） | `setup --rollback`，Previous 為 P8 Task 14 之前的 Rust artifact：步驟 6 啟動後驗收 `smoke_failed`，`with_new_daemon_handoff_script(&["{\"ok\":false,\"error_code\":\"METHOD_NOT_FOUND\"}"])` → `rollback.reverted:false`、`revert_pending:true`、`revert_error{error_code:"METHOD_NOT_FOUND",phase:"update_revert",probe:"daemon.handoff_stop",handoff_outcome:"refused"}`、hint 含 `serialwrap daemon status` 與 `serialwrap daemon stop`；無 `daemon.stop`（不得退回一般停止）、無 `/End`、journal 保留；之後模擬使用者明確 `serialwrap daemon stop`（Task 7 `Plain`，允許）使 daemon 結束 → `recover()` 判定新版確認不存在、零停止 RPC、`ok:true` 回到 Current |
+| `revert_handoff_recv_timeout_no_hard_stop`（R2-F6） | 新版驗收 `wal_unhealthy`，步驟 7 交接 script `["<recv_timeout>"]` → `revert_error{error_code:"TIMEOUT",handoff_outcome:"unknown"}`、`revert_pending:true`；無 `/End`、無 `daemon.stop`、不切換、journal 保留；`recover_journal` 同情境（crash 於 `start_and_verify:after_effect`）→ `TIMEOUT`／`install_recover`、`detail.handoff_outcome:"unknown"`、journal 逐位元組不變 |
+| `revert_new_daemon_rpc_down_process_alive_defers`（R2-F6） | 步驟 6 新版 `DAEMON_NOT_READY`（ping 持續 refused、`ProcScan` 仍回其 pid）→ 交接 connect 失敗 → `revert_error{error_code:"DEVICE_STILL_HELD",handoff_outcome:"refused",pids:[<new pid>]}`、`revert_pending:true`；不 `hard_stop`、不 `revert_entries`、journal 保留；`FakeProcScan::fail()` 時同樣暫緩（ProcScan 失敗不算確認不存在） |
+| `rollback_revert_refuses_while_previous_daemon_pushing`（R2-F6） | `setup --rollback`：Previous daemon 啟動後驗收 `state_incompatible`、其交接回 `BUSY_PUSH` → 斷言同 `revert_refuses_while_new_daemon_pushing`（鍵為 `rollback`；`current-release.json` 與入口仍為 rollback 目標 0.4.0、尚未回到原 Current 0.4.1）；待 script 用盡 `recover()` 回到 0.4.1 |
+| `test_revert_new_daemon_push_not_aborted_l15`（黑箱，`rust_only`，`posix_pty`，`process_rpc`；R2-F6） | 真 Python daemon（兩個 dev bundle）＋bridge：dev bundle 以 `SW_TEST_UPDATE_PAUSE_AFTER=start_and_verify:started`（新版已啟動、驗收前暫停）與 `SW_TEST_UPDATE_FORCE_VERIFY_FAIL=smoke_failed`（兩者皆只在 `test-hooks` feature 編入，正式 bundle 不讀）執行 `setup`；暫停期間另一 client 對新版開始 1 MiB `file push`，再放行 → `setup` exit 2、`revert_pending:true`、`revert_error.error_code=="SESSION_BUSY"`；新版 `daemon status.pid` 不變、其 WAL 無 shutdown 記錄、push 正常完成且 DUT 端 md5 正確；之後再跑 `setup` → 回退完成、`daemon status.version` 為舊版、`version_pairing.ok`。同 feature 另提供 `SW_TEST_UPDATE_CRASH_AT=<CRASH_POINTS 之一>`（以 `FaultPlan` 在該點讓行程以 137 結束，供 09 Task 14 黑箱的 journal 復原競態使用；`start_and_verify:started`（新版已啟動、驗收開始前）為步驟內點，PAUSE 與 CRASH 皆可用，並加入 `CRASH_POINTS`） |
 | `test_update_push_after_freeze_zero_tx_l15`（黑箱，同上） | 預檢後放行交接、`daemon.handoff_stop` 已回 ok（daemon 凍結中）時另一 client 送 `file push` → 回 `FLUSHED_BY_SHUTDOWN`、`reason:"handoff_frozen"`；DUT 端 `wire.ndjson` 自凍結起無任何新增 TX、DUT 上不存在部分檔案；更新照常完成 |
 
 - [ ] **步驟 2：執行並確認 FAIL**：`cargo test -p sw-cli --test mgmt_update` → `not implemented: P4-T12`。
@@ -2440,7 +2553,7 @@ pub fn run_update(ctx: &mut Ctx, bundle: &Path, mode: &SupervisionMode, with_sud
     if let Err(e) = confirm_released(ctx, &ep, &snap) { restore_enabled(ctx, &j.original()); return r.fail(ConfirmReleased, e); } // journal 保留
     let (backup, sw) = step_or_revert!(r, BackupAndSwitch, backup_and_switch(ctx, &root, &vdir, mode, &mut j)); // BackupStarted → BackupComplete → EntriesSwitching
     j.advance(ctx, &root, JournalStep::StartAndVerify)?;
-    if let Err(e) = start_and_verify(ctx, mode, &snap, &vdir) { return revert_to_previous(ctx, r, backup, sw, &mut j, e); } // 用 j.original() 還原
+    if let Err(e) = start_and_verify(ctx, mode, &snap, &vdir) { return revert_to_previous(ctx, r, backup, sw, &mut j, e); } // 用 j.original() 還原；先 stop_for_revert（只經 Handoff{reason:"revert"}），Deferred → revert_pending、journal 保留、不硬停（R2-F6）
     clear_journal(ctx, &root); r.ok()                                                               // 刪 journal 與 snapshot_dir
 }
 ```

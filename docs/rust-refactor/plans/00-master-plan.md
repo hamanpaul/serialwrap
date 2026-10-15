@@ -116,7 +116,7 @@
 | ID | Task | 測試作者 | 實作者 | 依賴（同 Phase Task） |
 |---|---|---|---|---|
 | P1-T1 | Stage 0 測試設施：替身、平台 skip、TX 結果純型別、Windows 原生 pytest runner | H | L | — |
-| P1-T2 | BC-01a WAL 常駐 handle、每筆 flush、唯一 close、DF-17 | H | L | P1-T1 |
+| P1-T2 | BC-01a WAL 常駐 handle、每筆 flush、唯一 close、DF-17（部分寫入依 `sent` 只補寫剩餘、殘行以 `\n` 終結，R2-F3） | H | L | P1-T1 |
 | P1-T3 | BC-01b Windows `CreateFileW` share-delete handle 與 `win32_files` | G | L | P1-T2 |
 | P1-T4 | BC-01c rotate／reset 於常駐 handle 下同步與 DF-03 歸檔後綴 | G | L | P1-T3 |
 | P1-T5 | BC-01d 外部 unlink／替換／DeletePending 偵測、有界自癒、缺口 META、停止自動 TX | H | L | P1-T4 |
@@ -127,7 +127,7 @@
 | P1-T10 | BC-04 Per-UART 獨占、holder 診斷、Windows ACCESS_DENIED 映射、SC-05 同步收回、DF-04 | G | L | P1-T9 |
 | P1-T11 | Gate 錯誤碼：SC-01、SC-02、SC-03、SC-06、DF-02 | G | L | P1-T10 |
 | P1-T12 | SC-13 lease tick＋tombstone、SC-14 flash probe 資格、SC-16 console 行上限 | H | L | P1-T11 |
-| P1-T20 | OS write 前授權 permit（quiet／release／cancel／lease／owner_gen 零 TX） | H | L | P1-T12 |
+| P1-T20 | OS write 前授權 permit（quiet／release／cancel／lease／owner_gen 零 TX；自動登入／密碼／ready probe 帶 `system_probe` permit＋`login_gen`（R2-F1）；Quiet 不擋有效 interactive lease 救援（R2-F2）） | H | L | P1-T12 |
 | P1-T13 | OD-11／SC-19 隔離實例測試裝置 allowlist | G | H | P1-T20 |
 | P1-T14 | BC-05 Windows `remote -R/-L`、SC-27 `connect`／`benches`、SC-21 `remote stop`、跨行程檔案鎖 | H | L | P1-T13 |
 | P1-T15 | 平台管理：SC-08、SC-09、SC-10、SC-12、SC-20、DF-14 | G | L | P1-T18 |
@@ -196,7 +196,7 @@
 | P4-T9 | `connect`／`benches` 原生（SC-27） | G | H | P4-T8、P4-T17 |
 | P4-T10 | `setup`（資產物化、WSL systemd、reconcile）與 `supervision-mode set`（SC-12、SC-22、SC-24、DF-10～DF-13、DF-16） | G | L | P4-T3、P4-T4、P4-T5、P4-T6、P4-T7、P4-T11 |
 | P4-T11 | 安裝佈局、release manifest 驗證與版本配對 gate（§9.5、§12.1、SC-25） | H | L | P4-T2、P4-T3、P4-T5、P4-T17 |
-| P4-T12 | §12.1 首次安裝、更新流程與 `setup --rollback`（SC-23；步驟 3 經 `daemon.handoff_stop` 交接（R1-F1）、journal 原始快照與分段備份中斷復原（R1-F5）） | G | L | P4-T4、P4-T7、P4-T10、P4-T11、P1-T8 |
+| P4-T12 | §12.1 首次安裝、更新流程與 `setup --rollback`（SC-23；步驟 3、步驟 7 回退與 journal 復原停止 daemon 皆經 `daemon.handoff_stop` 交接（R1-F1、R2-F6）、journal 原始快照與分段備份中斷復原（R1-F5）） | G | L | P4-T4、P4-T7、P4-T10、P4-T11、P1-T8 |
 | P4-T13 | `doctor` 全部檢查原生與 `version_pairing`（SC-25） | G | H | P4-T2、P4-T4、P4-T10、P4-T11 |
 | P4-T14 | 終端類承接（console-attach／detach、`serialwrap-minicom` 端到端、Windows Telnet 提示）與委派集合清空 | H | G | P4-T7、P4-T10 |
 | P4-T15 | Agent 權限模型文件與驗證工具（§10.3）、對外文件同步 | H | G | P4-T6、P4-T7、P4-T8、P4-T9、P4-T10、P4-T11、P4-T12、P4-T13、P4-T14 |
@@ -216,8 +216,8 @@
 | P5-T3 | PAL Windows serial（overlapped、CancelIoEx） | G | L | P5-T2 |
 | P5-T4 | PAL InstanceLock（Tier 1）＋SignalWait | G | L | P5-T3 |
 | P5-T5 | PAL DeviceSource／DeviceWatcher（#100 前提、SERIALCOMM、藍牙排除、OD-11） | H | L | P5-T4 |
-| P5-T6 | PAL WalFs（常駐 handle、identity、share-delete、不覆蓋 rename） | G | L | P5-T5 |
-| P5-T7 | sw-core WalWriter（BC-01、DF-03、DF-17） | H | L | P5-T6 |
+| P5-T6 | PAL WalFs（常駐 handle、identity、share-delete、不覆蓋 rename；`write_all_flush` 失敗回 `WalWriteError.sent`，R2-F3） | G | L | P5-T5 |
+| P5-T7 | sw-core WalWriter（BC-01、DF-03、DF-17；`sent`／`dirty_tail` 重試協定，R2-F3） | H | L | P5-T6 |
 | P5-T8 | sw-core CommandRegistry／SessionQueue（admission、出列、history、SC-06） | H | L | P5-T7 |
 | P5-T9 | sw-core TxWriter＋Fence（送出前檢查、BC-03 三態、SC-07、TX 帳本結算／退休與上限（R1-F8）） | H | L | P5-T8 |
 | P5-T10 | sw-core IoWorker reader＋RxWindow＋哨兵 fan-out | G | L | P5-T9 |
@@ -248,7 +248,7 @@
 | P6-T3 | Line editor、shlex 與 human line mode | H | G | P6-T1 |
 | P6-T4 | DeferredBuffer（BC-02） | G | L | P6-T1 |
 | P6-T5 | 每 console 出向 ring（SC-15） | H | G | P6-T1 |
-| P6-T6 | Ownership 狀態機、human TX lane 與 Fence 整合 | G | L | P6-T2、P6-T3、P6-T4、P6-T5 |
+| P6-T6 | Ownership 狀態機、human TX lane 與 Fence 整合（回放保留 `ReplayHold`／`replay_auth`，D-22，R2-F4） | G | L | P6-T2、P6-T3、P6-T4、P6-T5 |
 | P6-T7 | Interactive lease 差量（tombstone、soft preempt、ATTACHED 救援、stash） | H | L | P6-T2、P6-T3、P6-T4、P6-T5、P6-T6 |
 | P6-T8 | PAL console backends（PTY／TCP／ConsoleMux／com0com） | G | L | P6-T1 |
 | P6-T9 | ConsoleHub runtime 與 RX fan-out | H | L | P6-T8 |
@@ -297,7 +297,7 @@
 | P8-T6 | `file.push`／`file.pull` 的 session 整合與 RPC 分派 | H | L | P8-T0、P8-T5 |
 | P8-T7 | PAL flash 端點能力 | G | L | P8-T0 |
 | P8-T8 | SessionCore FLASHING 仲裁 | H | L | P8-T0 |
-| P8-T9 | FlashEndpoint 執行緒與認線協調 | G | L | P8-T0、P8-T2、P8-T7、P8-T8 |
+| P8-T9 | FlashEndpoint 執行緒與認線協調（`EndpointShutdown` 與每次 flash 的 `FlashRunCancel` 分離，R2-F5） | G | L | P8-T0、P8-T2、P8-T7、P8-T8 |
 | P8-T10 | `mcu.patterns`／`mcu.status` RPC 與 daemon 組裝 | G | L | P8-T9 |
 | P8-T11 | 外部工具裝置交接的黑箱與整合驗證 | H | L | P8-T0、P8-T6、P8-T8 |
 | P8-T12 | systemd 監管整合與有序停止（完整停止序含 stopping gate／watcher／event engine 收尾（R1-F2）；未收斂 exit 1（R1-F4）） | G | L | P8-T6、P8-T9、P8-T11 |
@@ -311,7 +311,7 @@
 |---|---|---|---|---|
 | P9-T1 | 契約檔、schema 與基礎模組 | G | H | — |
 | P9-T2 | 共用基礎測試替身（`tests/stage3_fakes.py`） | H | G | P9-T1 |
-| P9-T3 | A/B manifest 載入、凍結與案例涵蓋檢查（`tools/stage3/ab_manifest.py`） | H | G | P9-T2 |
+| P9-T3 | A/B manifest 載入、凍結與案例涵蓋檢查（`tools/stage3/ab_manifest.py`；`verify_bundle`／`bundle_tree_sha256`，R2-F7） | H | G | P9-T2 |
 | P9-T4 | A→B 資源釋放驗證（`tools/stage3/release_check.py`） | H | L | P9-T3 |
 | P9-T5 | 乾淨 DUT 狀態與實例隔離（`tools/stage3/dut_state.py`） | G | H | P9-T4 |
 | P9-T5B | Suite adapter（`tools/stage3/suites/`） | H | L | P9-T5 |
@@ -324,10 +324,10 @@
 | P9-T11 | 事故追蹤（`tools/stage3/canary_incidents.py`） | G | H | P9-T10 |
 | P9-T12 | Canary policy 凍結、帳本彙總與配額 gate（`tools/stage3/canary_ledger.py`） | L | G | P9-T9 |
 | P9-T13 | 實機回滾演練（`tools/stage3/rollback_drill.py`） | G | L | P9-T12 |
-| P9-T14 | Stage 0～3 出口證據索引（`tools/stage3/evidence_index.py`） | L | G | P9-T7 |
+| P9-T14 | Stage 0～3 出口證據索引（`tools/stage3/evidence_index.py`；Stage 3 target 記錄 `bundle_tree_sha256`，R2-F7） | L | G | P9-T7 |
 | P9-T14B | 證據 ingest（`tools/stage3/evidence_ingest.py`） | H | L | P9-T15 |
 | P9-T15 | OD-09 延後凍結程序與凍結輸出對正式 gate 的讀寫契約（`tools/stage3/od09_freeze.py`；寫入 P2 `thresholds.<key>.per_platform.<os>.<field>`，不改 gate） | L | H | P9-T14 |
-| P9-T16 | Python daemon 退役切換（packaging） | H | L | P9-T13 |
+| P9-T16 | Python daemon 退役切換（packaging；發佈前逐檔重驗 bundle 內容與 tree、`retirement pack`＋`verify-archive` 後只上傳已驗 archive，R2-F7） | H | L | P9-T13 |
 | P9-T17 | `python3 -m tools.stage3` 入口與擁有者程序文件 | G | H | P9-T16 |
 
 ### 跨 Phase 關鍵交接（本次審查定案的唯一 owner）

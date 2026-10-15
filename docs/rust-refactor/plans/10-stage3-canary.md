@@ -33,7 +33,7 @@
 3. **Canary 計數保守**：只計 `^[0-9a-f]{32}$` 的 arbiter `cmd_id`（排除 `ft-*` 檔案傳輸分塊）、`cmd_id` 去重、跨 rotate／reset 不重算、結果不明不計、artifact 歸屬須經 CLI 與 daemon 執行檔 hash 雙重核實，模糊即不計；不同 artifact／平台不自動合併；循環類型有單一類型上限，不得全由 Recovery 湊滿。
 4. **事故不可消失**：PID 變更（含 supervisor 自動恢復、中間夾著失聯快照）在無計畫維護紀錄或可佐證的主機重開時一律開事故；collector 觀測缺口、WAL 擷取異常、自動偵測到的安全訊號自成事故；未結案即阻擋 gate。
 5. **證據不可由人工宣稱**：PASS 只能由 `evidence ingest` 從產生工具的報告推導並複製、逐檔 hash；`evidence_root` 必填；target 以 (stage, platform) 分別指定，並同時凍結 `tool_revision`、`case_list_sha256`、`runtime_digest`。
-6. **退役切換不可提前生效、也不可重建受測物**：Stage 3 bundle 以靜態 `retirement` 標記（無核准欄位）建置與受測；核准只寫在 `packaging/python_daemon_retirement.json`；發佈時 `retirement verify --mode release --bundle-manifest` 要求所建 manifest 的 sha256 等於該平台 Stage 3 target，且直接發佈受測 bundle 本身；回滾演練以真實串口釋放／重新取得（舊程序退出、新程序 READY 時間晚於演練開始、裝置綁定不變、smoke 命令）以及「啟動新版失敗自動回到完整 Previous」判定，而非版本字串或跨重啟的 `bridge_generation`。
+6. **退役切換不可提前生效、也不可重建受測物**：Stage 3 bundle 以靜態 `retirement` 標記（無核准欄位）建置與受測；核准只寫在 `packaging/python_daemon_retirement.json`；發佈時 `retirement verify --mode release --bundle-manifest` 要求所建 manifest 的 sha256 等於該平台 Stage 3 target，**並重算實際 bundle 的每個 component（`verify_bundle`）與整個 bundle 檔案樹 digest（`bundle_tree_sha256`，於設定 Stage 3 target 時凍結）**——manifest 未動而 CLI／daemon／資產被替換、刪除或新增檔案一律拒絕；打包後再以 `retirement verify-archive` 解開最終 archive 重算同一組 digest，只上傳通過驗證的那份位元組（R2-F7）；回滾演練以真實串口釋放／重新取得（舊程序退出、新程序 READY 時間晚於演練開始、裝置綁定不變、smoke 命令）以及「啟動新版失敗自動回到完整 Previous」判定，而非版本字串或跨重啟的 `bridge_generation`。
 
 ---
 
@@ -835,12 +835,24 @@ def runtime_digest(manifest_doc: Mapping[str, Any]) -> str
     #   "daemon": components.daemon.launcher.sha256, "runtime": components.daemon.runtime.sha256 或 None,
     #   "package_tree": components.daemon.package.tree_sha256 或 None, "assets": components.assets,
     #   "supervisor": components.supervisor.definition_sha256 或 None}))；不含版本字串、stage、created_at、retirement，供跨 stage 證據沿用比對（Task 14）
+    # 只雜湊 manifest「宣告值」，**不是**內容驗證；任何「受測物＝此 bundle」的判定都必須另外呼叫 verify_bundle／bundle_tree_sha256（R2-F7）
+def verify_bundle(bundle_dir: Path, manifest_doc: Mapping[str, Any], *, label: str) -> list[str]
+    # 對實際 bundle 目錄逐一重算 manifest 宣告的 component（規則見下）；verify_frozen 每側以 label=f"side {A|B}" 呼叫，
+    # Task 14 set_target（stage "3"）與 Task 16 retirement verify --mode release／verify-archive 以 label=<platform> 呼叫
+def bundle_tree_sha256(bundle_dir: Path) -> str
+    # 整個 bundle 目錄的檔案樹 digest：sorted "<posix relpath>\0<sha256>\n" 的 sha256，涵蓋**所有**一般檔（含 release-manifest.json、
+    # SHA256SUMS、assets、__pycache__／*.pyc，不排除任何檔）；遇 symlink（檔案或目錄）或其他非一般檔（device、FIFO、socket）→
+    # HarnessError("HARNESS_ARTIFACT_MISMATCH", "non-regular file: <relpath>")。與 tree_sha256（排除 __pycache__）不同，用於發佈邊界
 def render_argv(template: Sequence[str], values: Mapping[str, str]) -> list[str]
 ```
 
 `load_manifest` 規則（違反任一 → `HarnessError("HARNESS_MANIFEST_INVALID", detail)`）：schema 驗證（以 stdlib 手寫檢查，不依賴 jsonschema）；`sides[0]` 為 `A`／`baseline`、`sides[1]` 為 `B`／`candidate`；讀兩側 `release-manifest.json` 並依 stage 檢查——`1A`／`1B`：兩側 `components.daemon.implementation == "python"`，A 的 `components.cli.implementation == "python"`、B 為 `"rust"`；`2.1`～`3`：兩側 CLI implementation 相同且 `components.cli.sha256` 相同，A daemon `"python"`、B daemon `"rust"`；`stage=="3"` 時 B 的 manifest `stage=="3"` 且帶 `retirement.python_daemon=="removed"`、`required_case_set=="slice_2.4"`；`suite.adapter == LAYER_ADAPTER[layer]`；`layer=="l1.5"` → `dut.kind ∈ {"local-process","docker","physical-substitute"}`、`suite.selftest_report` 非 null；`dut.kind=="docker"` → `image_digest` 非 null；`dut.transport=="com0com-pair"` → `com_pair` 非 null；`layer in ("l2","l3")` → `dut.kind=="hardware"`、`dut.boards` 非空且兩側 `activate_argv`、`deactivate_argv` 非空；`layer=="l2"` → `suite.testbed_template` 非 null；`layer=="l3"` → `acceptance`、`endpoint`、`suite.realhw_config_template`、`suite.tier` 與 `failure_retention=="on-demand"` 必填；`reverify.enabled` 時 `order == ("B","A")`；所有 argv 模板中的 `{name}` 須屬 `TEMPLATE_KEYS`；`cli_exe` 的 realpath 必須等於 `bundle_dir / components.cli.path`、`daemon_exe` 的 realpath 必須等於 `bundle_dir / components.daemon.launcher.path`（Python 基線若無 launcher，則等於 `components.daemon.entry` 解析後的腳本或 runtime 路徑）——實際執行的檔案即已驗證的 component（arch §10.1）。
 
 `verify_frozen` 回傳違規字串清單（空＝已凍結），逐項格式固定：`"case_list sha256 mismatch: <path>"`、`"case_lock sha256 mismatch: <path>"`、`"tool sha256 mismatch: <path>"`、`"tool tree mismatch: <path>"`、`"allowed_differences sha256 mismatch: <path>"`、`"acceptance sha256 mismatch: <path>"`、`"profile sha256 mismatch: <path>"`、`"suite input sha256 mismatch: <path>"`（selftest_report／testbed_template／realhw_config_template）、`"release manifest sha256 mismatch: side <A|B>"`、`"release component sha256 mismatch: side <A|B> <component>"`（逐一核對 manifest 中帶 `path`＋`sha256` 的物件；`<component>` 為其在 `components` 下的點路徑，例如 `cli`、`daemon.launcher`、`daemon.runtime`）、`"release tree mismatch: side <A|B> <component>"`（依 arch §10.1 演算法重算 `daemon.package.tree_sha256` 與 `python_cli_delegate.tree_sha256` 所涵蓋的已部署 Python 檔案樹，不只看 `python.exe` hash）、`"contract_revision mismatch: manifest <x> repo <y>"`（以 `run(["git","-C",repo_root,"rev-parse","HEAD:contracts"])`）、`"dut image digest mismatch"`（`docker` 時 `run(["docker","image","inspect","--format","{{.Id}}",image])`）、`"file missing: <path>"`，以及 `verify_case_coverage` 的全部結果。Task 6 在每一側執行前**再呼叫一次** `verify_frozen`，確認兩側之間沒有漂移。
+
+`verify_bundle(bundle_dir, manifest_doc, *, label)` 是上列 release 類字串的**唯一**產生者（`verify_frozen` 只把它對兩側的結果串接，因此字串與既有格式逐字相同）：`components` 下每個帶 `path`＋`sha256` 的物件（`cli`、`daemon.launcher`、`daemon.runtime`…）以 `bundle_dir / path` 重算——檔案不存在 → `"file missing: <bundle_dir/path>"`、不符 → `"release component sha256 mismatch: <label> <component>"`；`daemon.package.tree_sha256`、`python_cli_delegate.tree_sha256` 依 arch §10.1 重算 → `"release tree mismatch: <label> <component>"`；`path` 為絕對路徑或正規化後跳出 `bundle_dir` → `"release component path escapes bundle: <label> <component>"`。`components.assets` 只帶 hash、沒有 path（arch §10.1），因此資產內容**只能**由 `bundle_tree_sha256` 守住——發佈邊界必須同時用兩者，不得只用其一。
+
+`tests/test_stage3_ab_manifest.py` 另加（R2-F7）：`test_verify_bundle_strings_match_verify_frozen`（以 `make_bundle` 建 bundle 後改寫 `bin/serialwrapd` → `verify_bundle(b, doc, label="side B") == ["release component sha256 mismatch: side B daemon.launcher"]`，且同一竄改經 `verify_frozen` 得到相同字串）、`test_verify_bundle_missing_cli`（刪 `bin/serialwrap` → `[f"file missing: {b / 'bin' / 'serialwrap'}"]`）、`test_verify_bundle_path_escape`（manifest `components.cli.path="../x"` → 含 `"release component path escapes bundle: side A cli"`）、`test_bundle_tree_sha256_covers_every_file`（基準 digest d0；新增 `assets/skill/SKILL.md`、修改它、刪除它、新增 `bin/__pycache__/x.pyc`、修改 `SHA256SUMS`，每一步 digest 都與前一步不同；把檔案順序改變的同內容樹 → digest 相同）、`test_bundle_tree_sha256_rejects_symlink`（POSIX 下以 `pytest.mark.skipif(os.name == "nt")` 守住：bundle 內放 symlink → `HarnessError` 且 `code == "HARNESS_ARTIFACT_MISMATCH"`）。
 
 `verify_case_coverage`（§11.3「不得刪除案例、縮小分母」、§11.6 Stage 3「完整契約＋L1.5」）回傳：`"required case missing: <id>"`（`required_cases` 中不在 `case_ids` 者）；`"unknown case: <id>"`（`case_ids` 中不在 `cases.yaml` 者）；`"invariant not covered: <invariant_id>"`（`cases.yaml.invariant_ids` 六項中，沒有任何 `case_ids` 內、且 layer 相符的案例引用者；該 layer 在 `cases.yaml` 原本就沒有任何案例引用的 invariant 不列）；`"destructive case without authorization: <id>"`（`authorization` 為 null、`allow_destructive` 為 false 或 `decision_ref` 為 null）；`"authorization board not in dut: <com>"`；`"windows com0com instance without test_device_allowlist"`。任何一筆都使 Task 6 以 `HARNESS_CASE_SET_INCOMPLETE`（授權類為 `HARNESS_AUTHORIZATION_MISSING`）拒絕執行。
 
@@ -2596,7 +2608,7 @@ def test_version_flip_without_reacquire_fails(tmp_path):
 - Marker（P0 T14 檔內 `pytestmark`，非 YAML 登錄）：（`test_stage3_evidence_index.py: {class: core_portable, resources: [memory_only]}`）
 - Test: `tests/test_stage3_evidence_index.py`
 
-**Interfaces — Consumes:** `tests/acceptance/stage_exits.json`、`docs/rust-refactor/evidence/index.json`、P2 `cases.yaml`、Task 3 `FrozenFile`／`runtime_digest`。
+**Interfaces — Consumes:** `tests/acceptance/stage_exits.json`、`docs/rust-refactor/evidence/index.json`、P2 `cases.yaml`、Task 3 `FrozenFile`／`runtime_digest`／`verify_bundle`／`bundle_tree_sha256`。
 **Interfaces — Produces:**
 
 ```python
@@ -2642,9 +2654,14 @@ def environment_id(env_doc: Mapping[str, Any]) -> str      # 鍵必須恰為 ENV
 def load_exit_catalog(path: Path = STAGE_EXITS_PATH) -> dict[str, ExitItem]
 def load_index(path: Path = INDEX_PATH) -> dict
 def set_target(index_path: Path, *, stage: str, platform: str, release_manifest: Path, contract_revision: str, tool_revision: str,
-               case_list_sha256: str, set_by: str, now: str) -> None
+               case_list_sha256: str, set_by: str, now: str, bundle_dir: Path | None = None) -> None
     # 寫 stage_targets[stage][platform] = {"artifact_id": sha256(manifest bytes), "runtime_digest", "contract_revision", "tool_revision",
     # "case_list_sha256", "set_by", "set_at"}，並附加 target_history（不刪舊紀錄）。Linux 與 Windows bundle 的 manifest 必然不同，因此各自一個 target
+    # stage == "3"（受測物即發佈物，R2-F7）：bundle_dir 必填（None → HarnessError("HARNESS_MANIFEST_INVALID", "stage 3 target requires bundle dir")）；
+    # release_manifest 的 realpath 必須等於 bundle_dir/"release-manifest.json"（否則 HARNESS_MANIFEST_INVALID）；
+    # Task 3 verify_bundle(bundle_dir, manifest_doc, label=platform) 必須為 []（否則 HarnessError("HARNESS_ARTIFACT_MISMATCH", 違規清單)，不寫 target）；
+    # target 另記 "bundle_tree_sha256": Task 3 bundle_tree_sha256(bundle_dir)——Task 16 發佈時以它核對整個 bundle 與最終 archive。
+    # 其他 stage 傳入 bundle_dir 時同樣驗證並記錄，未傳則不記（沿用既有行為）
 def add_entry(index_path: Path, entry: EvidenceEntry, *, catalog: Mapping[str, ExitItem]) -> None
     # item 不在目錄 → HARNESS_EVIDENCE_UNKNOWN_ITEM；entry_id 重複 → HARNESS_EVIDENCE_DUPLICATE；
     # platform 不屬該 item（item.platform 為單一平台而不同）、或 result ∈ {PASS, XFAIL} 且 files 為空、或 result ∈ {PASS, XFAIL} 且
@@ -2669,7 +2686,7 @@ def render_report(index: dict, catalog: Mapping[str, ExitItem], *, evidence_root
 
 `stage_status.result`：任一 item `FAIL` → `FAIL`；全部 `SATISFIED` → `PASS`；其他 → `BLOCKED`。`satisfying_entries` 供擁有者把 `behavior_changes.yaml`／`error_codes.yaml` 的對應項目由 `IMPLEMENTED` 改為 `VERIFIED` 時引用（§0.3 生命週期；狀態變更本身屬擁有者步驟，見 Task 17 `evidence-index.md`）。
 
-**`tests/fakes_evidence.py`：** `evidence_index(root, *, stage, artifact_manifest: Path | None = None, contract, tool="t"*40, case_list="0"*64, platforms=("linux","windows")) -> Path`（建 index.json、`evidence/` 目錄，並為每個平台以 `make_bundle(target=…)` 建出不同的 manifest 後設定 target）；`entry(root, item_id, result, *, platform, n=0, files=None, **over) -> EvidenceEntry`（預設 artifact／runtime_digest／contract／tool／case_list 取自該平台 target；`files=None` 時在 `root/evidence/<item>-<platform>-<n>.json` 寫一個 stub 報告並記錄真實 sha256；`environment_id=environment_id(固定 env_doc)`、`produced_at=ts(10+n,0)`、`producer="ingest:test"`）。
+**`tests/fakes_evidence.py`：** `evidence_index(root, *, stage, artifact_manifest: Path | None = None, contract, tool="t"*40, case_list="0"*64, platforms=("linux","windows")) -> Path`（建 index.json、`evidence/` 目錄，並為每個平台以 `make_bundle(target=…)` 建出不同的 manifest 後設定 target；`stage=="3"` 時同時傳 `bundle_dir=<該 bundle 目錄>`）；`entry(root, item_id, result, *, platform, n=0, files=None, **over) -> EvidenceEntry`（預設 artifact／runtime_digest／contract／tool／case_list 取自該平台 target；`files=None` 時在 `root/evidence/<item>-<platform>-<n>.json` 寫一個 stub 報告並記錄真實 sha256；`environment_id=environment_id(固定 env_doc)`、`produced_at=ts(10+n,0)`、`producer="ingest:test"`）。
 
 **Steps:**
 
@@ -2723,6 +2740,10 @@ def test_contract_change_makes_pass_stale(tmp_path):
 | `test_stage_blocked_until_all_items` | Stage 3 只有部分 SATISFIED → `result == "BLOCKED"` |
 | `test_stage_status_lists_satisfying_entries` | SATISFIED 項的 `satisfying_entries` 含對應 entry_id |
 | `test_set_target_per_platform_appends_history` | linux、windows 各設一次、linux 再設一次 → `target_history` 長 3、`stage_targets["3"]["linux"]` 為最後一次、`["windows"]` 不受影響 |
+| `test_set_target_stage3_records_bundle_tree` | `make_bundle(stage="3")` 後 `set_target(stage="3", bundle_dir=b, release_manifest=b/"release-manifest.json")` → `stage_targets["3"]["linux"]["bundle_tree_sha256"] == ab_manifest.bundle_tree_sha256(b)`（Task 3 實作，非替身） |
+| `test_set_target_stage3_requires_bundle_dir` | `stage="3"`、`bundle_dir=None` → `HarnessError`，`code == "HARNESS_MANIFEST_INVALID"`；index 檔位元組不變 |
+| `test_set_target_stage3_refuses_drifted_bundle` | 建 bundle 後改寫 `bin/serialwrapd`（manifest 不動）→ `HarnessError`，`code == "HARNESS_ARTIFACT_MISMATCH"`、detail 含 `"release component sha256 mismatch: linux daemon.launcher"`；index 檔位元組不變 |
+| `test_set_target_stage3_manifest_outside_bundle` | `release_manifest` 指向 bundle 外的同內容複本 → `HarnessError`，`code == "HARNESS_MANIFEST_INVALID"` |
 | `test_environment_id_requires_keys` | 缺 `av_product` → `ValueError`；鍵順序不同 → 同一 id |
 | `test_index_file_stable_format` | 寫出的 index.json `== dumps_report(json.loads(...))` |
 | `test_render_report_marks_owner_blocked` | 報告中 owner_blocked 項目帶「BLOCKED-OWNER」字樣 |
@@ -3021,9 +3042,11 @@ def test_real_p2_acceptance_roundtrip_propose_freeze_check_gate(tmp_path):
 
 **受測物即發佈物**：Stage 3 bundle 在核准前就以最終形狀建置（manifest 只帶靜態標記 `retirement: {"python_daemon": "removed"}`，沒有任何核准或 hash 欄位），以它設定 Stage 3 target、跑完全部 Stage 3 證據；核准只寫進 `packaging/python_daemon_retirement.json`；發佈時以 `retirement verify --mode release --bundle-manifest` 要求所發佈 bundle 的 manifest sha256 等於該平台已記錄的 target，並直接上傳受測 bundle 本身，**不重新建置**（重建會改變 `created_at` 等位元組，使證據失效）。
 
+**manifest 相符不等於內容相符（R2-F7）**：manifest 只是宣告，保留已核准的 manifest、替換 `bin/serialwrapd` 仍會讓「manifest sha256＝target」成立；`runtime_digest` 也只雜湊宣告值。因此發佈邊界必須對**實際位元組**再驗兩層：(1) Task 3 `verify_bundle` 逐一重算 manifest 宣告的 component（CLI、daemon launcher…）；(2) Task 3 `bundle_tree_sha256` 重算整個 bundle 檔案樹，必須等於設定 Stage 3 target 時凍結的 `stage_targets["3"][platform].bundle_tree_sha256`（Task 14 `set_target`）——這一層守住 manifest 只帶 hash、沒有 path 的 `assets`，以及新增的旁載檔（例如 Windows `bin/version.dll`）。打包後再以 `retirement verify-archive` 從**最終 archive 的位元組**解開、重算同兩層，並由同一份已驗證位元組產生 `SHA256SUMS`；release job 只上傳該 archive，避免「驗目錄、傳另一份」的 TOCTOU。
+
 **Files:**
 - Create: `tools/stage3/retirement.py`
-- Create: `tests/fakes_retirement.py`（`retirement_repo(root, *, stage3_result)`：建含證據索引、兩平台 Stage 3 target、`evidence_root` 與 keep 清單目錄的假 repo；`stage3_result ∈ {"PASS","BLOCKED","FAIL"}`）
+- Create: `tests/fakes_retirement.py`（`retirement_repo(root, *, stage3_result)`：建含證據索引、兩平台 Stage 3 target、`evidence_root` 與 keep 清單目錄的假 repo；`stage3_result ∈ {"PASS","BLOCKED","FAIL"}`；兩平台 bundle 位於 `bundles/<platform>/`，以 `make_bundle(stage="3", target=…)` 建立後再放一個資產檔 `assets/skill/SKILL.md`，**之後**才以 `set_target(…, bundle_dir=bundles/<platform>)` 設 target，使 `bundle_tree_sha256` 涵蓋資產；`approved(repo)` 回傳依索引 target 填好核准欄位的 retirement dict；`bundle_args(repo)` 回傳 `{p: repo/"bundles"/p/"release-manifest.json"}`）
 - Modify: `scripts/rust/mkbundle.sh`（新增 `--stage <s>` 與 `--plan-only`；呼叫 `python3 -m tools.stage3 retirement bundle-plan`）
 - Modify: `contracts/release_manifest.schema.json`（新增選填 `retirement`：`{"python_daemon": const "removed"}`；`stage=="3"` 時必填，且 `components.daemon.implementation=="rust"`、無 `python_cli_delegate`、daemon 無 `entry`／`runtime`／`package`；有 `retirement` 時 `stage` 必須為 `"3"`）
 - Modify: `crates/sw-proto/src/release_manifest.rs`（`python_cli_delegate_entry` 改為 `Option<Vec<String>>`：只有帶退役標記的 manifest 可以缺；新增 `ManifestError::RetirementInconsistent(&'static str)`）、P3 委派路徑（`crates/sw-cli/src/delegate.rs`，`None` 時沿用既有 `INTERNAL_ERROR` 路徑，不新增錯誤碼；Stage 3 CLI 已全原生，正常不會走到）、`crates/sw-cli/src/commands/daemon_cmd.rs`（P4 `locate_daemon_argv`）、`crates/sw-daemon/src/launcher.rs`
@@ -3032,7 +3055,7 @@ def test_real_p2_acceptance_roundtrip_propose_freeze_check_gate(tmp_path):
 - Marker（P0 T14 檔內 `pytestmark`，非 YAML 登錄）：（`test_stage3_retirement.py: {class: core_portable, resources: [memory_only]}`、`test_stage3_retirement_posix.py: {class: posix_only, resources: [memory_only]}`）
 - Test: `tests/test_stage3_retirement.py`、`tests/test_stage3_retirement_posix.py`（呼叫 `bash scripts/rust/mkbundle.sh`）、`crates/sw-proto/tests/release_manifest_retirement.rs`、`crates/sw-cli` 內 `daemon_cmd.rs` 的 `#[cfg(test)] mod retired_tests`（`locate_daemon_argv` 為 crate 內函式）、`crates/sw-daemon/tests/launcher_retired.rs`
 
-**Interfaces — Consumes:** Task 14 `stage_status`／`load_index`；Task 3 `runtime_digest`；P3／P4 `ReleaseManifest::parse`、`parse_manifest`；P4 `locate_daemon_argv(ctx)` 與 `launcher.rs`。
+**Interfaces — Consumes:** Task 14 `stage_status`／`load_index`／`stage_targets["3"][platform].bundle_tree_sha256`；Task 3 `runtime_digest`／`verify_bundle`／`bundle_tree_sha256`；P3／P4 `ReleaseManifest::parse`、`parse_manifest`；P4 `locate_daemon_argv(ctx)` 與 `launcher.rs`。
 **Interfaces — Produces（Python）：**
 
 ```python
@@ -3047,12 +3070,21 @@ def bundle_plan(stage: str, retirement: dict, *, dev: bool) -> dict
     # 鍵：stage、retirement_applies、publishable、candidate、manifest_retirement；retirement_applies 為 true 時另有
     # include_python_runtime、include_python_cli_delegate、daemon_implementation
 def github_output(retirement: dict) -> str   # "retired=true\n" 或 "retired=false\n"
+ARCHIVE_SUFFIX: Mapping[str, str] = {"linux": ".tar.gz", "windows": ".zip"}
+def pack_bundle(bundle_dir: Path, out: Path) -> None
+    # 依 out 副檔名（.tar.gz｜.zip）打包；成員為 bundle_dir 內每個一般檔、相對 bundle_dir 的 POSIX relpath（無外層目錄、無 symlink、
+    # 無絕對路徑），依 relpath 排序；遇非一般檔 → HarnessError("HARNESS_ARTIFACT_MISMATCH")。取代 tar／Compress-Archive（後者在
+    # Windows PowerShell 5.1 會寫入反斜線成員名，使跨平台解開後的 relpath 與 bundle_tree_sha256 不一致）
+def verify_archive(retirement: dict, *, repo_root: Path, platform: str, archive: Path) -> tuple[list[str], str]
+    # 回 (violations, archive_sha256)；archive_sha256 為「實際被驗證的那份位元組」的 sha256（只讀檔一次，hash 與解開皆取自同一 bytes）
 ```
 
 `verify` 規則（違規字串前綴固定為 `"retirement:"`）：
 - `retired is False` → 其餘欄位必須為 null（`evidence_index` 除外；`stage3_target_artifact_ids` 兩值為 null），回 `[]`。
 - `retired is True`，`mode=="repo"`：`evidence_index` 存在且 sha256 等於 `evidence_index_sha256`；`approved_by`／`approved_at`／`decision_ref`／`effective_bundle_version` 非 null；`stage3_target_artifact_ids.{linux,windows}` 皆非 null 且分別等於索引 `stage_targets["3"][platform].artifact_id`；`KEEP_PYTHON_TEST_TOOLS` 全部存在。
-- `retired is True`，`mode=="release"`：上述全部，加上 `evidence_root` 必填（缺 → `"retirement: evidence root required"`）且 `stage_status(index,"3", evidence_root=…, cases=…)["result"] == "PASS"`（否則 `"retirement: stage 3 not PASS: <result>"`）；`bundle_manifests` 必須恰含 `linux`、`windows`，每個檔案的 sha256 等於 `stage3_target_artifact_ids[platform]`（`"retirement: bundle manifest mismatch: <platform>"`），且 manifest 帶 `MANIFEST_MARKER`、`bundle_version == effective_bundle_version`。
+- `retired is True`，`mode=="release"`：上述全部，加上 `evidence_root` 必填（缺 → `"retirement: evidence root required"`）且 `stage_status(index,"3", evidence_root=…, cases=…)["result"] == "PASS"`（否則 `"retirement: stage 3 not PASS: <result>"`）；`bundle_manifests` 必須恰含 `linux`、`windows`，每個檔案的 sha256 等於 `stage3_target_artifact_ids[platform]`（`"retirement: bundle manifest mismatch: <platform>"`），且 manifest 帶 `MANIFEST_MARKER`、`bundle_version == effective_bundle_version`；**另對實際 bundle 位元組核對（R2-F7）**——`bundle_dir = bundle_manifests[platform].parent`，檔名必須為 `release-manifest.json`（否則 `"retirement: bundle manifest not at bundle root: <platform>"`）；(a) Task 3 `verify_bundle(bundle_dir, manifest_doc, label=platform)` 的每筆違規 v 轉為 `"retirement: bundle content mismatch: <platform>: <v>"`（CLI、daemon launcher 被替換或刪除在此現形）；(b) `stage_targets["3"][platform]` 缺 `bundle_tree_sha256` → `"retirement: target missing bundle tree: <platform>"`；`bundle_tree_sha256(bundle_dir)` 不等於它 → `"retirement: bundle tree mismatch: <platform>"`（資產檔被改／刪、新增旁載檔在此現形），`bundle_tree_sha256` 拋 `HARNESS_ARTIFACT_MISMATCH` → `"retirement: bundle non-regular file: <platform>"`。(a)(b) 不因 manifest sha256 相符而略過，兩者都執行並全部列出。
+
+`verify_archive` 規則（違規前綴同為 `"retirement:"`；`retired is False` → CLI exit 2、`HARNESS_RETIREMENT_NOT_APPROVED`）：讀 `archive` 一次得 bytes 與 `archive_sha256`；副檔名須等於 `ARCHIVE_SUFFIX[platform]`（`"retirement: archive format mismatch: <platform>"`）；自同一 bytes 解到新建暫存目錄，任何成員為絕對路徑、含 `..`、含反斜線、為 symlink／hardlink／device，或重複 → `"retirement: archive unsafe member: <name>"` 且不再繼續解開；解開後 `release-manifest.json` 的 sha256 須等於 `stage3_target_artifact_ids[platform]`（`"retirement: archive manifest mismatch: <platform>"`）；`verify_bundle(extracted, doc, label=platform)` 每筆 v → `"retirement: archive content mismatch: <platform>: <v>"`；`bundle_tree_sha256(extracted)` 須等於 target 的 `bundle_tree_sha256`（`"retirement: archive tree mismatch: <platform>"`）。CLI `retirement verify-archive --platform P --archive PATH --sha256sums OUT`：violations 為空時才把 `"<archive_sha256>  <archive 檔名>\n"` 寫入 OUT，否則不寫 OUT、exit 1。
 
 `bundle_plan` 規則（P4 對 Stage 1A～2.4 bundle 內容的既有決定不由本 Task 改變；`publishable`、`candidate` 只出現在 plan 與 mkbundle stdout，不寫進 manifest，因此不影響受測 bundle 的位元組）：
 
@@ -3104,7 +3136,7 @@ pub fn resolve_launch(manifest: &ReleaseManifest) -> Result<LaunchPlan, LaunchEr
 - 新增 job `retirement-gate`（ubuntu，`needs: project-policy`）：checkout 後 `python3 -m tools.stage3 retirement github-output >> "$GITHUB_OUTPUT"`（`outputs.retired`）；`retired=true` 時再跑 `python3 -m tools.stage3 retirement verify --mode repo`。
 - 既有 `publish` job：測試 steps（`pytest`）與「Create GitHub Release」不加條件；「Build wheel」與「Upload wheel to release」**整條鏈**加 `if: needs.retirement-gate.outputs.retired != 'true'`（job `needs` 加入 `retirement-gate`）。
 - 既有 `publish-windows-exe` **整個 job** 加 `if: needs.retirement-gate.outputs.retired != 'true'`（避免只跳過 PyInstaller 建置、卻仍執行「Smoke test exes」與「Upload exes」去找不存在的 `dist/*.exe`）。
-- 新增 `publish-stage3-bundle-linux`（`runs-on: [self-hosted, linux, serialwrap-release]`）與 `publish-stage3-bundle-windows`（`runs-on: [self-hosted, windows, serialwrap-release]`），皆 `needs: [retirement-gate, publish]`、`if: needs.retirement-gate.outputs.retired == 'true'`：從 runner 上的 `SW_STAGE3_BUNDLE_DIR`（擁有者保存的受測 bundle）與 `SW_EVIDENCE_ROOT` 執行 `python3 -m tools.stage3 retirement verify --mode release --evidence-root "$SW_EVIDENCE_ROOT" --bundle-manifest linux=… --bundle-manifest windows=…`，通過後把該目錄打包（`tar`／`Compress-Archive`）、附 `SHA256SUMS`，`gh release upload`；這兩個 job **不得**呼叫 `mkbundle.sh` 或 `cargo build`（不重建受測物）。
+- 新增 `publish-stage3-bundle-linux`（`runs-on: [self-hosted, linux, serialwrap-release]`）與 `publish-stage3-bundle-windows`（`runs-on: [self-hosted, windows, serialwrap-release]`），皆 `needs: [retirement-gate, publish]`、`if: needs.retirement-gate.outputs.retired == 'true'`：從 runner 上的 `SW_STAGE3_BUNDLE_DIR`（擁有者保存的受測 bundle）與 `SW_EVIDENCE_ROOT` 執行 `python3 -m tools.stage3 retirement verify --mode release --evidence-root "$SW_EVIDENCE_ROOT" --bundle-manifest linux=… --bundle-manifest windows=…`（含逐 component 與整個檔案樹的實際位元組核對，R2-F7），通過後依序：(1) `python3 -m tools.stage3 retirement pack --bundle-dir "$SW_STAGE3_BUNDLE_DIR/<platform>" --out "$RUNNER_TEMP/serialwrap-<version>-<platform><ARCHIVE_SUFFIX>"`（不得用 `tar`／`Compress-Archive`）；(2) `python3 -m tools.stage3 retirement verify-archive --platform <platform> --archive <同一路徑> --sha256sums "$RUNNER_TEMP/SHA256SUMS-<platform>"`（從最終 archive 位元組重算 manifest、component 與檔案樹 digest；只有通過才產生 `SHA256SUMS-<platform>`）；(3) 上傳前再以 `sha256sum -c`（Windows：`Get-FileHash` 比對）核對 archive 與 `SHA256SUMS-<platform>`；(4) `gh release upload` **只**上傳這兩個檔案。步驟順序固定 verify → pack → verify-archive → 上傳，任一步失敗即中止 job；這兩個 job **不得**呼叫 `mkbundle.sh` 或 `cargo build`（不重建受測物）。
 
 **Steps:**
 
@@ -3145,6 +3177,139 @@ def test_release_requires_tested_bundle_bytes(tmp_path):
     assert "retirement: bundle manifest mismatch: linux" in v
 
 
+def _release(repo, r):
+    return retirement.verify(r, repo_root=repo, mode="release", evidence_root=repo / "evidence",
+                             bundle_manifests=fakes_retirement.bundle_args(repo))
+
+
+def test_release_clean_tested_bundle_passes(tmp_path):                        # 正向對照：未動的受測 bundle 必須通過
+    repo = fakes_retirement.retirement_repo(tmp_path, stage3_result="PASS")
+    assert _release(repo, fakes_retirement.approved(repo)) == []
+
+
+@pytest.mark.parametrize("platform", ["linux", "windows"])
+@pytest.mark.parametrize("rel, component", [("bin/serialwrapd", "daemon.launcher"), ("bin/serialwrap", "cli")])
+def test_release_refuses_swapped_binary_with_approved_manifest(tmp_path, platform, rel, component):   # R2-F7
+    repo = fakes_retirement.retirement_repo(tmp_path, stage3_result="PASS")
+    r = fakes_retirement.approved(repo)
+    bundle = repo / "bundles" / platform
+    manifest_before = (bundle / "release-manifest.json").read_bytes()
+    (bundle / rel).write_bytes(b"#!/bin/sh\necho swapped\n")                  # 受測後替換，manifest 原封不動
+    assert (bundle / "release-manifest.json").read_bytes() == manifest_before
+    assert fakes.sha256_file(bundle / "release-manifest.json") == r["stage3_target_artifact_ids"][platform]
+    v = _release(repo, r)
+    assert f"retirement: bundle manifest mismatch: {platform}" not in v          # manifest 檢查本身仍會通過……
+    assert f"retirement: bundle content mismatch: {platform}: release component sha256 mismatch: {platform} {component}" in v
+    assert f"retirement: bundle tree mismatch: {platform}" in v                 # ……但內容與檔案樹都必須拒絕
+
+
+@pytest.mark.parametrize("rel", ["bin/serialwrapd", "bin/serialwrap"])
+def test_release_refuses_deleted_binary_with_approved_manifest(tmp_path, rel):  # R2-F7
+    repo = fakes_retirement.retirement_repo(tmp_path, stage3_result="PASS")
+    r = fakes_retirement.approved(repo)
+    bundle = repo / "bundles" / "linux"
+    (bundle / rel).unlink()
+    v = _release(repo, r)
+    assert f"retirement: bundle content mismatch: linux: file missing: {bundle / rel}" in v
+    assert "retirement: bundle tree mismatch: linux" in v
+
+
+@pytest.mark.parametrize("op", ["modify", "delete"])
+def test_release_refuses_tampered_asset_with_approved_manifest(tmp_path, op):  # R2-F7：assets 沒有 path，只有檔案樹守得住
+    repo = fakes_retirement.retirement_repo(tmp_path, stage3_result="PASS")
+    r = fakes_retirement.approved(repo)
+    asset = repo / "bundles" / "windows" / "assets" / "skill" / "SKILL.md"
+    if op == "modify":
+        asset.write_text("tampered\n", encoding="utf-8")
+    else:
+        asset.unlink()
+    v = _release(repo, r)
+    assert "retirement: bundle tree mismatch: windows" in v
+    assert not any(x.startswith("retirement: bundle manifest mismatch") for x in v)
+
+
+def test_release_refuses_added_sideload_file(tmp_path):                       # R2-F7：manifest 未宣告的新增檔
+    repo = fakes_retirement.retirement_repo(tmp_path, stage3_result="PASS")
+    r = fakes_retirement.approved(repo)
+    (repo / "bundles" / "windows" / "bin" / "version.dll").write_bytes(b"MZ")
+    assert "retirement: bundle tree mismatch: windows" in _release(repo, r)
+
+
+def test_release_refuses_target_without_bundle_tree(tmp_path):
+    repo = fakes_retirement.retirement_repo(tmp_path, stage3_result="PASS")
+    idx = repo / "docs/rust-refactor/evidence/index.json"
+    doc = json.loads(idx.read_text(encoding="utf-8"))
+    del doc["stage_targets"]["3"]["linux"]["bundle_tree_sha256"]
+    idx.write_text(json.dumps(doc), encoding="utf-8")
+    r = fakes_retirement.approved(repo)                                         # 依修改後索引重算 evidence_index_sha256
+    assert "retirement: target missing bundle tree: linux" in _release(repo, r)
+
+
+def test_verify_archive_accepts_packed_tested_bundle(tmp_path):
+    repo = fakes_retirement.retirement_repo(tmp_path, stage3_result="PASS")
+    r = fakes_retirement.approved(repo)
+    out = tmp_path / "out" / "serialwrap-linux.tar.gz"
+    out.parent.mkdir()
+    retirement.pack_bundle(repo / "bundles" / "linux", out)
+    v, digest = retirement.verify_archive(r, repo_root=repo, platform="linux", archive=out)
+    assert v == [] and digest == fakes.sha256_file(out)
+
+
+@pytest.mark.parametrize("op", ["swap_daemon", "delete_cli", "modify_asset"])
+def test_verify_archive_refuses_archive_built_from_tampered_copy(tmp_path, op):   # R2-F7：最終 archive 與受測物不一致
+    repo = fakes_retirement.retirement_repo(tmp_path, stage3_result="PASS")
+    r = fakes_retirement.approved(repo)
+    copy = tmp_path / "copy"
+    shutil.copytree(repo / "bundles" / "linux", copy)                            # release-manifest.json 位元組相同
+    if op == "swap_daemon":
+        (copy / "bin" / "serialwrapd").write_bytes(b"swapped")
+    elif op == "delete_cli":
+        (copy / "bin" / "serialwrap").unlink()
+    else:
+        (copy / "assets" / "skill" / "SKILL.md").write_text("x", encoding="utf-8")
+    out = tmp_path / "serialwrap-linux.tar.gz"
+    retirement.pack_bundle(copy, out)
+    v, _ = retirement.verify_archive(r, repo_root=repo, platform="linux", archive=out)
+    assert "retirement: archive manifest mismatch: linux" not in v
+    assert "retirement: archive tree mismatch: linux" in v
+    if op == "swap_daemon":
+        assert "retirement: archive content mismatch: linux: release component sha256 mismatch: linux daemon.launcher" in v
+    if op == "delete_cli":
+        assert any(x.startswith("retirement: archive content mismatch: linux: file missing:") and x.endswith("serialwrap")
+                   for x in v)
+
+
+def test_verify_archive_refuses_unsafe_member(tmp_path):
+    repo = fakes_retirement.retirement_repo(tmp_path, stage3_result="PASS")
+    r = fakes_retirement.approved(repo)
+    out = tmp_path / "evil.tar.gz"
+    with tarfile.open(out, "w:gz") as tf:
+        tf.add(repo / "bundles" / "linux" / "release-manifest.json", arcname="release-manifest.json")
+        tf.add(repo / "bundles" / "linux" / "bin" / "serialwrapd", arcname="../serialwrapd")
+    v, _ = retirement.verify_archive(r, repo_root=repo, platform="linux", archive=out)
+    assert "retirement: archive unsafe member: ../serialwrapd" in v
+    assert not (tmp_path / "serialwrapd").exists()                             # 不得解到暫存目錄之外
+
+
+def test_cli_verify_archive_writes_sha256sums_only_when_clean(tmp_path):
+    repo = fakes_retirement.retirement_repo(tmp_path, stage3_result="PASS")
+    fakes_retirement.write_approved(repo)                                       # 把 approved(repo) 寫回 packaging/python_daemon_retirement.json
+    good, bad = tmp_path / "good.tar.gz", tmp_path / "bad.tar.gz"
+    retirement.pack_bundle(repo / "bundles" / "linux", good)
+    (repo / "bundles" / "linux" / "bin" / "serialwrapd").write_bytes(b"swapped")
+    retirement.pack_bundle(repo / "bundles" / "linux", bad)
+    def cli(archive, sums):
+        return subprocess.run([sys.executable, "-m", "tools.stage3", "retirement", "verify-archive", "--repo-root", str(repo),
+                               "--platform", "linux", "--archive", str(archive), "--sha256sums", str(sums)],
+                              cwd=ROOT, capture_output=True, text=True)
+    ok = cli(good, tmp_path / "SUMS-good")
+    assert ok.returncode == 0
+    assert (tmp_path / "SUMS-good").read_text(encoding="utf-8") == f"{fakes.sha256_file(good)}  good.tar.gz\n"
+    ng = cli(bad, tmp_path / "SUMS-bad")
+    assert ng.returncode == 1 and "retirement: archive tree mismatch: linux" in ng.stdout + ng.stderr
+    assert not (tmp_path / "SUMS-bad").exists()
+
+
 def test_release_workflow_gates_python_artifact_chains():
     wf = yaml.safe_load((ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8"))
     jobs = wf["jobs"]
@@ -3164,9 +3329,16 @@ def test_release_workflow_gates_python_artifact_chains():
         runs = " ".join(st.get("run", "") for st in job["steps"])
         assert "retirement verify --mode release" in runs and "--bundle-manifest" in runs
         assert "mkbundle.sh" not in runs and "cargo build" not in runs
+        assert "Compress-Archive" not in runs and not re.search(r"(^|[\s;|&])tar\s", runs)   # R2-F7：只用 retirement pack
+        idx = {key: next(i for i, st in enumerate(job["steps"]) if key in st.get("run", ""))
+               for key in ("retirement verify --mode release", "retirement pack", "retirement verify-archive", "gh release upload")}
+        assert idx["retirement verify --mode release"] < idx["retirement pack"] < idx["retirement verify-archive"] \
+            < idx["gh release upload"], idx
+        upload = job["steps"][idx["gh release upload"]]["run"]
+        assert "SHA256SUMS-" in upload and "SW_STAGE3_BUNDLE_DIR" not in upload   # 只上傳已驗證 archive 與其 SHA256SUMS
 ```
 
-（`fakes_retirement.approved(repo)` 回傳依索引 target 填好核准欄位的 retirement dict。）
+（`fakes_retirement.approved(repo)` 回傳依索引 target 填好核准欄位的 retirement dict；`write_approved(repo)` 另把它寫回 `packaging/python_daemon_retirement.json`；本檔另 import `shutil`、`subprocess`、`sys`、`tarfile`。R2-F7 新增的測試在 Step 2 須全部 FAIL：`verify` 若只比 manifest，`test_release_refuses_*_with_approved_manifest` 與 `test_release_refuses_added_sideload_file` 會因缺少 content／tree 違規而紅燈。）
 
 | 測試名 | 斷言 |
 |---|---|
@@ -3179,12 +3351,15 @@ def test_release_workflow_gates_python_artifact_chains():
 | `test_keep_list_missing_detected` | retirement_repo 刪 `realhw/` → 違規含 `"retirement: keep path missing: realhw"` |
 | `test_index_sha_mismatch` | `evidence_index_sha256` 錯 → 違規含 `"retirement: evidence index sha256 mismatch"` |
 | `test_github_output` | `github_output({"retired": False}) == "retired=false\n"` |
+| `test_pack_bundle_posix_members` | `pack_bundle(bundle, out.zip)` 與 `out.tar.gz` 的成員名皆為排序後的 POSIX relpath（無反斜線、無外層目錄、無目錄項以外的非一般檔），集合等於 bundle 內全部一般檔 |
+| `test_verify_archive_format_must_match_platform` | linux 平台給 `.zip` → 含 `"retirement: archive format mismatch: linux"` |
+| `test_verify_archive_not_retired` | `retired=False` 時 CLI `retirement verify-archive` → exit 2、`HARNESS_RETIREMENT_NOT_APPROVED`，不寫 `--sha256sums` 檔 |
 | `test_schema_stage3_requires_marker` | 以 `contracts/release_manifest.schema.json` 驗證 `make_bundle(stage="3", retirement_marker=False)` → `ValidationError`；`retirement_marker=True` → 通過；`stage="2.4", retirement_marker=True` → `ValidationError` |
 | `test_schema_marker_forbids_python_delegate` | 帶標記的 manifest 加 `python_cli_delegate` → `ValidationError` |
 | `test_manifest_has_no_approval_fields` | schema 的 `retirement` 只允許 `python_daemon` 一鍵（`additionalProperties:false`） |
 | `test_pytest_suite_does_not_depend_on_wheel` | `tests/test_stage3_*.py` 與 `realhw`／`regression` 的 import 不含 `importlib.metadata.version("serialwrap")` 以外的 wheel 依賴（AST 掃描無 `pkg_resources`、無 `importlib.metadata.distribution("serialwrap")`） |
 
-`tests/test_stage3_retirement_posix.py`（`pytestmark = [posix_only, memory_only]`）：`test_mkbundle_plan_only_stage3_candidate`（`bash scripts/rust/mkbundle.sh --target x86_64-unknown-linux-gnu --stage 3 --plan-only` → rc 0，stdout JSON `candidate is True`、`publishable is False`）、`test_mkbundle_plan_only_stage2_after_retire_refused`（以暫存 retirement 檔 `retired:true`、`--stage 2.4` 非 dev → rc 2 且輸出含 `HARNESS_RETIREMENT_INCONSISTENT`）、`test_mkbundle_accepts_existing_flags`（`--dev --out <tmp> --plan-only` 仍可解析，未破壞 P3／P4 旗標）。
+`tests/test_stage3_retirement_posix.py`（`pytestmark = [posix_only, memory_only]`）：`test_mkbundle_plan_only_stage3_candidate`（`bash scripts/rust/mkbundle.sh --target x86_64-unknown-linux-gnu --stage 3 --plan-only` → rc 0，stdout JSON `candidate is True`、`publishable is False`）、`test_mkbundle_plan_only_stage2_after_retire_refused`（以暫存 retirement 檔 `retired:true`、`--stage 2.4` 非 dev → rc 2 且輸出含 `HARNESS_RETIREMENT_INCONSISTENT`）、`test_mkbundle_accepts_existing_flags`（`--dev --out <tmp> --plan-only` 仍可解析，未破壞 P3／P4 旗標）、`test_release_refuses_symlink_in_bundle`（R2-F7：以 `fakes_retirement.retirement_repo` 建好並核准後，把 `bundles/linux/bin/serialwrapd` 換成指向原內容複本的 symlink——`verify_bundle` 依 realpath 讀到相同 bytes——`retirement.verify(…, mode="release", bundle_manifests=fakes_retirement.bundle_args(repo))` 結果仍含 `"retirement: bundle non-regular file: linux"`）、`test_verify_archive_refuses_symlink_member`（tar 內含 `bin/serialwrapd` symlink 成員 → `"retirement: archive unsafe member: bin/serialwrapd"`）。
 
 Rust 測試：
 
@@ -3254,7 +3429,7 @@ fn retired_rust_manifest_runs_native() {
 fixtures 檔：`crates/sw-proto/tests/fixtures/stage3_retired_python_daemon.json`、`stage3_not_retired.json`、`stage3_retired_rust.json`、`stage1b_missing_delegate.json`（依 arch §10.1 形狀；Rust daemon 只有 `launcher`）。
 
 - [ ] **Step 2：Run** `python3 -m pytest -q tests/test_stage3_retirement.py tests/test_stage3_retirement_posix.py` 與 `cargo test -p sw-proto --test release_manifest_retirement -p sw-cli -p sw-daemon` → Expected: FAIL（`ImportError: tools.stage3.retirement`；Rust `unresolved import validate_retirement`、`RetirementInconsistent` 不存在）。
-- [ ] **Step 3：實作**（luna）依規則；Rust 部分只改 `sw-proto`／`sw-cli`／`sw-daemon` 的業務邏輯，不得新增平台 cfg；修改後跑 `python3 scripts/rust/check_cfg_boundary.py`；同步更新 arch §10.1；登錄兩個測試檔。
+- [ ] **Step 3：實作**（luna）依規則；`verify`（release）與 `verify_archive` 必須呼叫 Task 3 的 `verify_bundle`／`bundle_tree_sha256`（不得另寫一份只比 manifest 的捷徑，R2-F7），archive 解開一律用 `tarfile`／`zipfile` 逐成員檢查後寫入暫存目錄（不得 `extractall` 未檢查成員）；Rust 部分只改 `sw-proto`／`sw-cli`／`sw-daemon` 的業務邏輯，不得新增平台 cfg；修改後跑 `python3 scripts/rust/check_cfg_boundary.py`；同步更新 arch §10.1；登錄兩個測試檔。
 - [ ] **Step 4：Run** `python3 -m pytest -q tests/test_stage3_retirement.py tests/test_stage3_retirement_posix.py`、`cargo test --workspace`、`python3 scripts/rust/check_cfg_boundary.py`、`scripts/rust/win-test.sh --package sw-cli --package sw-daemon`（WSL interop，Windows 原生執行）→ Expected: PASS。【BLOCKED-OWNER BO-P9-17】正式 Stage 3 Windows bundle 須在擁有者 Windows 自架 runner 原生 build；本環境的交叉編譯結果不得當作 release artifact。
 - [ ] **Step 5：commit** `feat(packaging): 新增 Python daemon 退役切換並保留 Python 測試工具`（files 含 `tools/stage3/retirement.py`、`tests/fakes_retirement.py`、`scripts/rust/mkbundle.sh`、`contracts/release_manifest.schema.json`、三個 crate 的變更與測試、`.github/workflows/release.yml`、`docs/rust-refactor/plans/rust-architecture.md`、兩個測試檔、fragment）。
 
@@ -3290,7 +3465,7 @@ fixtures 檔：`crates/sw-proto/tests/fixtures/stage3_retired_python_daemon.json
 | `rollback-drill run` | `--cli PATH --platform P --boards COM0,COM1 --expect-current V --expect-previous V --out DIR [--forward-argv JSON] [--corrupt-from BUNDLE] [--start-fail-from BUNDLE] --i-understand-this-restarts-the-daemon` | `run_drill`（缺最後旗標 → exit 2；未給 `--corrupt-from`／`--start-fail-from` → verdict `INCOMPLETE`、exit 1） |
 | `rollback-drill make-corrupted` | `--src BUNDLE --dst DIR` | `make_corrupted_bundle` |
 | `rollback-drill make-start-fail` | `--src BUNDLE --dst DIR` | `make_start_fail_bundle` |
-| `evidence target` | `--index PATH --stage S --platform P --release-manifest PATH --contract-revision REV --tool-revision REV --case-list-sha256 HEX --set-by TEXT` | `set_target` |
+| `evidence target` | `--index PATH --stage S --platform P --release-manifest PATH --contract-revision REV --tool-revision REV --case-list-sha256 HEX --set-by TEXT [--bundle-dir DIR]` | `set_target`（`--stage 3` 時 `--bundle-dir` 必填，記錄 `bundle_tree_sha256`，R2-F7） |
 | `evidence env-id` | `--env JSON_PATH` | `environment_id` |
 | `evidence ingest` | `--index PATH --kind K --item ID --platform P --report PATH --evidence-root DIR --environment JSON_PATH [--release-manifest PATH] [--reuse-of ENTRY_ID]` | `evidence_ingest.ingest`（PASS 的唯一入口） |
 | `evidence add` | `--index PATH --entry JSON_PATH` | `add_entry`（PASS／XFAIL 只接受 `manual-procedure` 項目；其餘一律走 `ingest`） |
@@ -3300,7 +3475,9 @@ fixtures 檔：`crates/sw-proto/tests/fixtures/stage3_retired_python_daemon.json
 | `od09 propose` | `--linux-stats JSON --windows-stats JSON --out PATH` | `propose` |
 | `od09 freeze` | `--acceptance PATH --proposal PATH --decision-id ID --approved-by TEXT [--set <key>.per_platform.<os>.<field>=VALUE ...] --index PATH --evidence-root DIR --addenda PATH --out PATH` | `freeze`（`--out` 寫 ingest 用 JSON） |
 | `od09 check` | `--acceptance PATH --run-started-at ISO` | `check_frozen_before` |
-| `retirement verify` | `[--mode {repo,release}] [--evidence-root DIR] [--bundle-manifest PLATFORM=PATH ...]` | `verify`（`release` 模式且 `retired:false` → exit 2、`HARNESS_RETIREMENT_NOT_APPROVED`） |
+| `retirement verify` | `[--mode {repo,release}] [--evidence-root DIR] [--bundle-manifest PLATFORM=PATH ...]` | `verify`（`release` 模式且 `retired:false` → exit 2、`HARNESS_RETIREMENT_NOT_APPROVED`；release 模式含 `verify_bundle`＋`bundle_tree_sha256` 實際位元組核對，R2-F7） |
+| `retirement pack` | `--bundle-dir DIR --out PATH` | `pack_bundle` |
+| `retirement verify-archive` | `[--repo-root DIR] --platform P --archive PATH --sha256sums OUT` | `verify_archive`；違規 → exit 1 且不寫 OUT；`retired:false` → exit 2、`HARNESS_RETIREMENT_NOT_APPROVED` |
 | `retirement bundle-plan` | `--stage S [--dev]` | `bundle_plan` |
 | `retirement github-output` | — | `github_output` |
 
@@ -3308,12 +3485,12 @@ fixtures 檔：`crates/sw-proto/tests/fixtures/stage3_retired_python_daemon.json
 
 | 文件 | 必含段落 |
 |---|---|
-| `stage3-runbook.md` | 全流程順序：(1) OD-09 延後凍結（BO-P9-12）——**於 Stage 0 出口、任何 Rust 候選長跑（最早為 `S1B-L3-MIXED-48H-WINDOWS`）開始前完成**；一旦索引有任何 `candidate_longrun` entry，`od09 freeze` 即拒絕；凍結後以新 revision 重跑兩平台基線 gate → (2) Canary policy 凍結（`canary policy freeze`，BO-P9-06）→ (3) 以 `mkbundle.sh --stage 3` 建出兩平台 Stage 3 候選 bundle（`retired:false` 即可建；Windows 於自架 runner 原生 build，BO-P9-17），保存受測 bundle 目錄，並以 `evidence target --platform linux|windows` 分別設定 target → (4) Linux L1 契約黑箱與 L1.5 A/B（本環境可跑）→ (5) Windows L1 與 L1.5 A/B（BO-P9-01）→ (6) L2 A/B（BO-P9-02／03）→ (7) release candidate 的 L3 P0＋P1＋remote（BO-P9-18）→ (8) Linux 48h A/B 再 Windows 48h A/B（BO-P9-04／05，依序、約 9 天 bench）→ (9) Canary 兩平台並行累積（BO-P9-07／08）→ (10) 回滾演練含 D7、D8（BO-P9-10／11）→ (11) 事故結案（BO-P9-09）→ (12) 全部以 `evidence ingest` 登錄後 `evidence status --stage 3 --evidence-root …` 為 PASS → (13) 退役裁決（BO-P9-13）：寫 `packaging/python_daemon_retirement.json`（含兩平台 target artifact id）→ (14) release workflow 以 `retirement verify --mode release --bundle-manifest` 核對並**原樣發佈受測 bundle**，不重建；artifact 變更時的證據有效性判定規則（§12.2：不得直接合併不同版本執行量；`runtime_digest` 相同才可 `reuse_of`） |
+| `stage3-runbook.md` | 全流程順序：(1) OD-09 延後凍結（BO-P9-12）——**於 Stage 0 出口、任何 Rust 候選長跑（最早為 `S1B-L3-MIXED-48H-WINDOWS`）開始前完成**；一旦索引有任何 `candidate_longrun` entry，`od09 freeze` 即拒絕；凍結後以新 revision 重跑兩平台基線 gate → (2) Canary policy 凍結（`canary policy freeze`，BO-P9-06）→ (3) 以 `mkbundle.sh --stage 3` 建出兩平台 Stage 3 候選 bundle（`retired:false` 即可建；Windows 於自架 runner 原生 build，BO-P9-17），保存受測 bundle 目錄，並以 `evidence target --stage 3 --platform linux|windows --bundle-dir <受測 bundle 目錄>` 分別設定 target（同時凍結 `bundle_tree_sha256`；之後該目錄任何檔案變動都會使發佈被拒）→ (4) Linux L1 契約黑箱與 L1.5 A/B（本環境可跑）→ (5) Windows L1 與 L1.5 A/B（BO-P9-01）→ (6) L2 A/B（BO-P9-02／03）→ (7) release candidate 的 L3 P0＋P1＋remote（BO-P9-18）→ (8) Linux 48h A/B 再 Windows 48h A/B（BO-P9-04／05，依序、約 9 天 bench）→ (9) Canary 兩平台並行累積（BO-P9-07／08）→ (10) 回滾演練含 D7、D8（BO-P9-10／11）→ (11) 事故結案（BO-P9-09）→ (12) 全部以 `evidence ingest` 登錄後 `evidence status --stage 3 --evidence-root …` 為 PASS → (13) 退役裁決（BO-P9-13）：寫 `packaging/python_daemon_retirement.json`（含兩平台 target artifact id）→ (14) release workflow 以 `retirement verify --mode release --bundle-manifest` 核對 manifest、逐 component 與整個 bundle 檔案樹，再以 `retirement pack` 打包、`retirement verify-archive` 從最終 archive 位元組重驗並產生 `SHA256SUMS`，**原樣發佈受測 bundle**，不重建；artifact 變更時的證據有效性判定規則（§12.2：不得直接合併不同版本執行量；`runtime_digest` 相同才可 `reuse_of`） |
 | `sequential-ab.md` | manifest 欄位說明與 L1.5／L2／L3 範本；三個 suite adapter 的實際呼叫；A→B 釋放驗證失敗的處置（不得手動略過、不得改 `release.timeout_s` 後重跑同一 run_id）；`HARNESS_ARTIFACT_MISMATCH` 的意義；L3 必須 on-demand、明確 endpoint、無外部監管的故障保留；破壞性案例的 `authorization`；Windows com0com 實例的 `test_device_allowlist`；複驗須事前在 manifest 宣告 |
 | `canary.md` | 部署範圍：**Windows 只部署在單人使用的測試工作站**（OD-12：整機本機使用者皆可信，多人共用機在完成多使用者授權前不得部署；文件不得宣稱「同使用者隔離」）；Linux：systemd user service 範本（`ExecStart=/usr/bin/python3 -m tools.stage3 canary collect …`）；Windows：`py -3 sw-canary.pyz collect …` 以工作排程器「登入時」觸發的建立步驟；凍結前列出 Canary 期間所有時區／DST 變更（`utc_offset_changes`）；計畫性重啟前必寫 `canary note`；事故分診表（kind → 必查證據 → 允許的 resolution，含 `harvest_integrity` 與自動 `safety_violation`）；每週 `canary report` |
 | `rollback-drill.md` | 前置（bench 獨占、兩塊板 READY、無 flash／file transfer）、以 `mkbundle.sh --dev --version-override` 建 start-fail 來源 bundle、D0～D8 說明（跨重啟不以 `bridge_generation` 判定）、`--i-understand-this-restarts-the-daemon`、`INCOMPLETE` 與 `limitations` 的意義、失敗時的人工復原步驟 |
 | `od09-deferred-freeze.md` | 時序要求（Stage 0 出口、早於 `S1B-L3-MIXED-48H-WINDOWS`）、`od09 stats → propose → freeze → 重跑基線 gate → check` 命令、`--set` 覆寫的紀錄方式、`owner-decisions-addenda.md` 為附加式紀錄 |
-| `python-daemon-retirement.md` | 退役前置（`evidence status --stage 3` PASS、兩平台 Stage 3 target artifact）、受測 bundle 的保存位置、修改 `packaging/python_daemon_retirement.json` 的欄位、`retirement verify --mode release --evidence-root --bundle-manifest`、不重建受測物的理由、保留清單、不刪除 `sw_core/` 的理由 |
+| `python-daemon-retirement.md` | 退役前置（`evidence status --stage 3` PASS、兩平台 Stage 3 target artifact）、受測 bundle 的保存位置、修改 `packaging/python_daemon_retirement.json` 的欄位、`retirement verify --mode release --evidence-root --bundle-manifest`、不重建受測物的理由、「manifest 相符不等於內容相符」：保存期間受測 bundle 目錄不得有任何寫入（`bundle_tree_sha256` 於 `evidence target` 凍結，任何替換／刪除／新增檔都使發佈被拒）、`retirement pack`／`verify-archive` 與只上傳已驗證 archive 的步驟（R2-F7）、保留清單、不刪除 `sw_core/` 的理由 |
 | `evidence-index.md` | 出口項目錄與 `evidence_kind`、每個 kind 的 `evidence ingest` 命令、entry 欄位（含 `environment_id` 的 env JSON 欄位、`workload_sha256`、`runtime_digest`）、結果語意（SKIP／INFRA_ERROR／INSUFFICIENT 不等於 PASS）、FAIL 不可被後續 PASS 抵銷、`reuse_of` 條件、以 `satisfying_entries` 把 BC／SC／DF 與錯誤碼由 `IMPLEMENTED` 改為 `VERIFIED` 的擁有者步驟（§0.3） |
 
 **Steps:**
@@ -3396,6 +3573,8 @@ def test_od12_single_user_and_no_isolation_claim():
 ```
 
 另加 `test_no_interactive_status_in_procedures`：七份文件與 `tools/stage3/*.py` 皆不含字串 `interactive-status`（`interactive_status` 只允許出現在說明「不得呼叫」的句子中，以 `不得呼叫` 同行判定）。
+
+另加 `test_retirement_procedure_verifies_shipped_bytes`（R2-F7）：`python-daemon-retirement.md` 的 ```` ```bash ```` 區塊中依序出現 `python3 -m tools.stage3 retirement verify --mode release`、`python3 -m tools.stage3 retirement pack`、`python3 -m tools.stage3 retirement verify-archive`（以首次出現位置比較），且全文不含 `Compress-Archive`、不含以 `tar ` 開頭的命令行；`stage3-runbook.md` 中每一行 `python3 -m tools.stage3 evidence target` 且含 `--stage 3` 者都含 `--bundle-dir`。
 
 - [ ] **Step 2：Run** `python3 -m pytest -q tests/test_stage3_cli.py tests/test_stage3_procedures.py` → Expected: FAIL（`ModuleNotFoundError: tools.stage3.__main__`、文件不存在）。
 - [ ] **Step 3：實作**（haiku）`__main__.py` 依子命令表；文件依內容要求撰寫，命令全部可被 parser 解析。

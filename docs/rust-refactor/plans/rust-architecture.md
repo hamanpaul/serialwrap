@@ -548,13 +548,19 @@ pub trait WalFs: Send + Sync {
     fn dir_writable(&self, dir: &Path) -> bool;                               // os.access(W_OK|X_OK) 等價
 }
 pub trait WalFile: Send {
-    fn write_all_flush(&mut self, bytes: &[u8]) -> PalResult<()>;  // user space 不留緩衝；每筆一次 write（可能分多次 syscall）
+    /// user space 不留緩衝；每筆一次呼叫（內部可分多次 syscall，EINTR 重試）。
+    /// 失敗時**必須**回報失敗前 OS 已確認寫出的長度 `sent`（0 ≤ sent < bytes.len()），不得只回 PalError 而遺失進度
+    /// （R2-F3；對應 P1 T02 `PartialWriteError.sent`）。呼叫端據此決定「整行重寫」或「只補寫 bytes[sent..]」（§5.8 第 5 點）。
+    fn write_all_flush(&mut self, bytes: &[u8]) -> Result<(), WalWriteError>;
     fn sync(&mut self) -> PalResult<()>;                           // fsync ｜ FlushFileBuffers
     fn identity(&self) -> PalResult<FileIdentity>;                 // (st_dev, st_ino) ｜ (VolumeSerialNumber, FileId128)
     fn unlinked(&self) -> PalResult<bool>;                         // POSIX st_nlink==0 ｜ Windows FileStandardInfo.DeletePending
     fn close(self: Box<Self>) -> PalResult<()>;
 }
 #[derive(PartialEq, Eq, Clone, Debug)] pub struct FileIdentity(pub u128, pub u128);
+/// WAL／mirror 寫入錯誤：`sent` 為失敗前已交 OS 且確認的 bytes；`error` 為最後一次 OS 錯誤（py_message 照 str(OSError)）。
+/// 開檔失敗等「未呼叫 write」的錯誤由呼叫端視為 `sent == 0`。
+#[derive(Debug, Clone)] pub struct WalWriteError { pub sent: usize, pub error: PalError }
 ```
 
 ### 4.6 `RpcTransport`（client 與 server）
@@ -753,7 +759,7 @@ TxClass 與 gate 規則（規格 §5.2.1）：
 | class | 擋下條件 |
 |---|---|
 | `Command`／`FileTransfer` | `quiet_active`、`reconfirm_pending`；source 以 `human:` 開頭時另見 `DF-02` |
-| `LoginProbe`／`ReadyReconfirm`／`SystemRecoverKey`／`SelfTestProbe` | quiet、`wal_unhealthy`（停止自動 TX，規格 §5.4） |
+| `LoginProbe`／`ReadyReconfirm`／`SystemRecoverKey`／`SelfTestProbe` | quiet、`wal_unhealthy`（停止自動 TX，規格 §5.4）；`LoginProbe`／`ReadyReconfirm`／`SelfTestProbe` 另比對 `fsm_gen`（08 Task 7 `fsm_gen_floor`），與 quiet 一樣在每次 `gate.submit` 臨界區內重跑——出列或呼叫端的 quiet 檢查只算 pre-check（R2-F1；Python Stage 0 對應 02 T20 `tx_class="system_probe"`＋`login_gen`、`set_probe_gate`、`system_permit()`，不含 `system:self_test`） |
 | `HumanRaw` | `owner_gen` 不符時改走 deferred |
 | `LeaseOwner`／`InteractiveOpenCmd` | 不受 quiet 阻擋；`permit.owner_gen != owner_gen`（lease close／expiry／soft preempt／換手後的舊 lease 世代）→ `OwnerMismatch`。此世代檢查在每次 `gate.submit` 臨界區內重跑（R0-F1） |
 | `Flash` | 只在 `FlashMode::Flashing` 時放行 |
@@ -830,14 +836,19 @@ TxWriter 的 job queue 容量 64；滿時 OpRunner 阻塞等待（只有 OpRunne
 
 ### 5.8 WAL Writer（BC-01，`wal.rs`＋`WalFs`）
 
-- `WalWriter { inner: Mutex<WalInner> }`。`WalInner` 持有常駐的 `wal: Box<dyn WalFile>`、`mirror: Box<dyn WalFile>`、`seq`、`file_first_seq`、`last_identity_check_mono`、health 計數。
+- `WalWriter { inner: Mutex<WalInner> }`。`WalInner` 持有常駐的 `wal: Box<dyn WalFile>`、`mirror: Box<dyn WalFile>`、`seq`、`file_first_seq`、`last_identity_check_mono`、`dirty_tail: [bool; 2]`（WAL／mirror 各一，R2-F3）、health 計數。
 - `append(com, dir, source, payload, cmd_id, loss_flag, meta) -> WalAppend{seq, ok}` 的步驟：
   1. 鎖外計算 b64 與 crc32。
   2. 鎖內 `rotate_if_needed`。
   3. `seq += 1`，取 `mono_ns` 與 `wall_us`。
   4. 序列化。
-  5. `wal.write_all_flush(line)`，再 `mirror.write_all_flush(printable)`。WAL 先寫，任一失敗**只重試失敗的那個檔**（`DF-17`）。
-  6. 失敗時設 `loss_flag`、遞增 `write_failures`、記錄 `last_write_error`。
+  5. `wal.write_all_flush(line)`，再 `mirror.write_all_flush(printable)`。WAL 先寫，任一失敗**只重試失敗的那個檔**（`DF-17`）。重試依 `WalWriteError.sent` 承接已寫進度（與 P1 T02 第 3 點的 `sent`／`dirty_tail` 協定逐條一致，R2-F3）；同一 seq 最多出現一次，且不得產生「前綴＋完整行」這類被串接的 NDJSON 行：
+     - 該檔 `dirty_tail` 為真時，本次實際寫出的資料為 `b"\n" ++ data`（先終結上一筆殘行；位元組結果與 P1「先寫 `\n` 再寫該行」相同），以下 `sent` 以合併後長度計。
+     - `sent == 0`（含開檔失敗）：關閉該 handle、`ensure_dir`、重開，**整段**重寫一次。
+     - `0 < sent < len`：**不得重寫整段**；在同一 handle 上只補寫 `data[sent..]` 一次（O_APPEND／FILE_APPEND_DATA＋唯一 writer 持鎖，補寫緊接前綴）。
+     - 重試（整段重寫或補寫）仍失敗：若最終已確認長度落在殘行內（大於終結 `\n` 的長度且小於總長），設 `dirty_tail=true`，下一次對該檔寫入前先終結殘行，殘行成為一筆讀取端判為無效、被略過的獨立行；否則 `dirty_tail=false`。本筆視為該檔寫入失敗。
+     - 全部寫出（含補寫成功）→ 清 `dirty_tail`、本筆該檔成功；`write_all_flush` 已回 `Ok` 後的任何後續錯誤都不得觸發重寫。
+  6. 失敗時設 `loss_flag`、遞增 `write_failures`、記錄 `last_write_error`；WAL 的「首次嘗試＋重試」皆失敗（含部分寫入後補寫失敗）即本筆寫入失敗：`write_failures` 只 +1（每筆每檔最多計一次，與 P1 T02 相同），`unhealthy_reason="write_failed"`，下一筆完整寫出才恢復。
 - **unlink 偵測**：每次 append 時，若距上次檢查 ≥ 50 ms，比對 `path_identity(wal_path) != wal.identity()` 或 `wal.unlinked()`。命中則：
   1. 標記失效。
   2. 保存舊 identity 與 seq 範圍 `[file_first_seq, seq]`。
@@ -915,6 +926,7 @@ TxWriter 的 job queue 容量 64；滿時 OpRunner 阻塞等待（只有 OpRunne
   - 回放時只送 `owner_gen` 等於目前上下文、且 client 仍存活的項目。
   - mailbox 中尚未處理、但帶舊 `owner_gen` 的 `ConsoleInputBytes` 一律丟棄（BC-02 測項）。
   - 沒有發生上下文失效時，照 #53 的正常回放流程。
+  - **回放保留（07 D-22，R2-F4）**：Python 的 resume flush 在 `_foreground_operation` token 釋放前同步寫完（`session_manager.py:3699-3703`、`:1104-1120`）。Rust 回放走非同步 human lane，因此每個回放點建立 `ReplayHold`，在同一次 `Fence::with` 內設 `FenceState.replay_auth = Some(hold_id)`，HumanReplay permit 帶 `replay_hold: Some(hold_id)`。hold 存在期間 `foreground_busy()` 為 true（佇列不出列、`interactive_open`／`send` 回 `SESSION_BUSY`），最後一筆回放結算才釋放並出列。任何不經佇列的新操作取得 ownership 時，先撤銷 `replay_auth`；之後才到 OS 提交點的回放回 `ReplayRevoked`、零 TX，bytes 放回 deferred 前端，等下一個回放點再送。HumanReplay 不比對 `owner_gen`／admission，只比對 `input_epoch` 與 `replay_auth`。
 
 ---
 
@@ -1157,7 +1169,7 @@ connect 與 benches 是否一併納入 Windows 支援，為 `SC-27`（owner 確�
 - 各 crate 的 `#[cfg(test)]` 單元測試與 `tests/` 整合測試。
   - `SessionCore` 以事件序列配合 FakeClock 覆蓋 §5.3 狀態表全部列、BC-02、BC-03、drain、quiet。
   - TxWriter 以 FakeSerial（可注入部分寫入、Unknown、阻塞、取消失敗，以及「授權後、OS 提交前暫停」`PauseBeforeSubmit`、「提交臨界區內暫停」`PauseInsideSubmit`、「部分提交後 EAGAIN 暫停」`AcceptThenWouldBlock`）覆蓋 fence 線性化：在授權通過後、OS 提交前觸發 Quiet／drain／lease 換手（`owner_gen++`）必須零 TX（`os_submits()==0`、`take_tx()` 為空、無 TX WAL）；提交臨界區內的失效呼叫必須阻塞到提交返回；每次 OS 提交時 Fence 鎖必為持有狀態（06 Task 9 `authorized_then_*_before_os_submit_is_zero_tx`、`os_submit_always_inside_fence_critical_section`）。
-  - WalWriter 以 FakeWalFs（可注入 unlink、replace、寫入失敗、rename 失敗）覆蓋。
+  - WalWriter 以 FakeWalFs（可注入 unlink、replace、寫入失敗、部分寫入後失敗（`fail_next_write_partial`，回 `WalWriteError{sent>0}`）、rename 失敗）覆蓋；部分寫入後補寫成功／補寫再失敗兩條路徑都須斷言檔案無「前綴＋完整行」、殘行獨立成行且後續紀錄可解析（06 Task 7 `wal_partial_write_*`，R2-F3）。
 - PAL conformance suite：`sw_pal::conformance::{serial_suite, wal_fs_suite, lock_suite, rpc_suite, console_suite}`。同一套斷言分別跑在 fakes、POSIX PTY、Windows COM pair 上。在 fakes 上通過**不得**計為原生 gate。
 - 資源標記：需要特定資源的測試命名為 `cap_<resource>__<name>` 並加 `#[ignore = "cap:<resource>"]`。resource 取值：`posix_pty`、`windows_com`、`physical_uart`、`supervisor_runtime`、`interactive_desktop`、`process_rpc`。執行時 runner 以 `-- --ignored cap_<resource>__` 選取，被略過的會顯示為 ignored，**不會**算成 pass。`memory_only` 測試不加 ignore。
 - 跨 crate 的 Python golden（pyjson、pycompat、pyre、yaml11、argparse）：`contracts/golden/*.ndjson` 由 pytest 以 python3 產生並 check-in；Rust 測試只讀，不呼叫 Python。
@@ -1260,6 +1272,7 @@ A/B 程序照規格 §15.9：先停 A 並確認資源釋放，才啟動 B；兩�
 - `tree_sha256` 是 sha256 of sorted `"<relpath>\0<sha256>\n"`，涵蓋所有部署的 Python 檔，以補足單看 `python.exe` hash 的不足（規格 §9.5）。
 - Stage 2 起 `daemon.implementation` 改為 `"rust"`，`entry` 移除。
 - 同目錄另有 `SHA256SUMS`。
+- **manifest 是宣告，不是內容證明**（R2-F7）：保留原 manifest、替換 `bin/serialwrapd` 時 `sha256(release-manifest.json)` 不變；`components.assets` 只帶 hash、沒有 path。凡需判定「實際檔案＝受測物」之處（P9 A/B 執行前 `verify_frozen`、Stage 3 `evidence target`、發佈時 `retirement verify --mode release` 與 `retirement verify-archive`），必須以 P9 Task 3 `verify_bundle` 逐一重算帶 `path`＋`sha256`／`tree_sha256` 的 component，並以 `bundle_tree_sha256`（sorted `"<posix relpath>\0<sha256>\n"` 的 sha256，涵蓋 bundle 目錄**全部**一般檔、不排除任何檔、遇 symlink 或非一般檔即拒絕）比對 Stage 3 target 記錄值；發佈只上傳通過 `verify-archive` 的 archive 位元組（P9 Task 14、Task 16）。
 - 建置由 `scripts/rust/mkbundle.sh --target <triple> --stage <s> [--dev]` 負責：組出 Python runtime（Linux 用 venv；Windows 用 embeddable 3.12 加 `pip install --target`），安裝本 repo wheel，產生 manifest。
 
 ### 10.2 安裝佈局與穩定入口
@@ -1269,7 +1282,7 @@ A/B 程序照規格 §15.9：先停 A 並確認資源釋放，才啟動 B；兩�
 | Linux | `${XDG_DATA_HOME:-~/.local/share}/serialwrap/versions/<v>/` | `~/.local/bin/serialwrap`、`~/.local/bin/serialwrapd` 為 symlink，指向 `versions/<v>/bin/*` |
 | Windows | `%LOCALAPPDATA%\Programs\serialwrap\versions\<v>\` | `bin\serialwrap.exe`、`bin\serialwrapd.exe` 為**複本**，另有 `bin\current-release.json` 記錄 `{"bundle_version","dir"}`；不依賴 symlink 權限 |
 
-切換流程：先把新複本寫成 `*.new`，再把舊檔 rename 成 `*.old.<ts>`（執行中的 exe 允許 rename），最後把 `*.new` rename 成正式名稱。至少保留 Current 與 Previous。rollback 流程依規格 §12.1 七步驟（`SC-23`）。第 2 步的交接安全檢查（Flash、FileTransfer、活躍寫入與其他不可安全中止操作）沒有覆寫：update／rollback 帶 `--force` 時仍拒絕，且不停止監管、不送 `daemon.stop`，因為停止 daemon 會中止傳輸或 flash pump，而 DUT 上已發生的部分燒寫無法撤銷。CLI 端預檢只做提早拒絕；第 3 步停止一律經 daemon 原子交接 `daemon.handoff_stop`（§6.2 第 7 步：busy 判定＋凍結新操作＋token 同一臨界區），update／rollback 路徑不送一般 `daemon.stop`；交接被拒或結果不明時不硬停、不切換（R1-F1，P4 Task 12、P1 T08、P8 Task 14）。
+切換流程：先把新複本寫成 `*.new`，再把舊檔 rename 成 `*.old.<ts>`（執行中的 exe 允許 rename），最後把 `*.new` rename 成正式名稱。至少保留 Current 與 Previous。rollback 流程依規格 §12.1 七步驟（`SC-23`）。第 2 步的交接安全檢查（Flash、FileTransfer、活躍寫入與其他不可安全中止操作）沒有覆寫：update／rollback 帶 `--force` 時仍拒絕，且不停止監管、不送 `daemon.stop`，因為停止 daemon 會中止傳輸或 flash pump，而 DUT 上已發生的部分燒寫無法撤銷。CLI 端預檢只做提早拒絕；第 3 步停止一律經 daemon 原子交接 `daemon.handoff_stop`（§6.2 第 7 步：busy 判定＋凍結新操作＋token 同一臨界區），update／rollback 路徑不送一般 `daemon.stop`；交接被拒或結果不明時不硬停、不切換（R1-F1，P4 Task 12、P1 T08、P8 Task 14）。第 7 步回退與 `install-journal.json` 中斷復原同樣只經交接（`reason:"revert"`）停止目前在跑的 daemon：第 6 步的新版一啟動就對外服務，驗收期間可能已受理傳輸或燒錄；交接被拒、不支援或結果不明時保留 journal、不硬停、不切換回 Previous，由下一次 `setup` 在 daemon 閒置後完成回退（R2-F6）。
 
 中斷復原（`install-journal.json`，P4 Task 12）：journal 必須自帶回到完整 Previous 組合所需的原始資料，不依賴行程記憶體或尚未完成的備份。第 3 步停用監管之前，先把原始穩定入口（symlink 目標或複本 sha256）、`current-release.json` 全文、`config.yaml` 複本、監管快照（mode、endpoint、enabled、running、匯出的已註冊內容）與 daemon 快照（是否健康在跑、identity、各 session 的 `attached_real_path`／`com`／`state`、重新啟動路徑）寫入 `install-journal.snapshot/` 與 journal，每次寫入都 fsync 並同步目錄。第 5 步拆成三個持久化階段：`backup_started`（只寫 `*.partial`）→ `backup_complete`（`manifest.json` 最後寫入、目錄改名提交，manifest sha256 記入 journal）→ `entries_switching`。備份提交前不切換任何入口、設定或監管。復原依階段處理：(1) 尚未停用：只刪 journal；(2) 已停用或已停止、尚未切換：不讀備份，依快照還原 enabled 與 running，確認舊行程與 tty holder 已釋放後才重新啟動舊版；(3) 已開始切換：先驗證備份 manifest 與每個檔案，通過後以快照還原入口與 current，再執行第 7 步。任一還原失敗都保留 journal（位元組不變），而且不繼續本次 update 或 rollback。
 
