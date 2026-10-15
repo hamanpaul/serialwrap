@@ -1,0 +1,15 @@
+# R-27 / C13 語意對等 fixture：require_in any 時，B_TWO 只要在任一文件有說明即通過。
+description: require_in any 兩檔，B_TWO 僅存在於 SKILL.md
+codes:
+  - A_ONE
+  - B_TWO
+docs:
+  SKILL.md: |
+    | `A_ONE` | 來源 | 行號 | 意義 A | 處置 A |
+    | `B_TWO` | 來源 | 行號 | 意義 B | 處置 B |
+  SKILL_WINDOWS.md: |
+    | `A_ONE` | 來源 | 行號 | 意義 A | 處置 A |
+require_in: any
+expected:
+  status: PASS
+  missing: []

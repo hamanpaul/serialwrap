@@ -1,0 +1,15 @@
+# R-27 / C13 語意對等 fixture：抽取輸出含註解行、空行與僅含空白的行；這些都不是碼。
+description: 抽取輸出的 # 註解行與空行不計入碼
+codes:
+  - "# extract note"
+  - ""
+  - A_ONE
+  - "   "
+  - "# trailing note"
+docs:
+  SKILL.md: |
+    | `A_ONE` | 來源 | 行號 | 意義 A | 處置 A |
+require_in: all
+expected:
+  status: PASS
+  missing: []
