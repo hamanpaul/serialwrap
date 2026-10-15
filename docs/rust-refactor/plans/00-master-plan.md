@@ -1,0 +1,360 @@
+# serialwrap Rust 重構總體實作計畫（Master Plan）
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** 依 `docs/rust-refactor/serialwrap-rust-spec-final.md`（定稿）與 `docs/rust-refactor/owner-decisions-2026-10-15.md`（OD-01～OD-13）1:1 完成 serialwrap 的 Stage 0～3 重構交付：Python 基線修正（BC-01～05）、契約凍結、外部 bridge 證據工具、Rust CLI（Stage 1A／1B）、Rust daemon 四切片（Slice 2.1～2.4）與 Stage 3 退役前置工具。
+
+**Architecture:** Cargo workspace（`sw-proto`／`sw-pal`／`sw-core`／`sw-daemon`／`sw-cli`），平台相依只在 `sw-pal`；契約先行（`contracts/*.yaml|json` 為權威，Python 與 Rust 都對契約測）；黑箱測試只經部署 artifact（CLI subprocess＋JSON），同一批黑箱案例可指向 Python 或 Rust artifact 做 Sequential A/B。
+
+**Tech Stack:** Rust 1.96（edition 2021，targets `x86_64-unknown-linux-gnu`、`x86_64-pc-windows-gnu`）、Python 3.10+（既有 daemon／測試工具）、pytest、PyYAML、jsonschema（測試工具側）、socat（Spike 4 接線檢查）、Docker（DUT 模擬器）。
+
+**Spec:** `docs/rust-refactor/serialwrap-rust-spec-final.md`、`docs/rust-refactor/owner-decisions-2026-10-15.md`。各分計畫（`docs/rust-refactor/plans/NN-*.md`）引用章節號。
+
+## Global Constraints
+
+- 平台相依 production code 只在 `sw-pal`；其他 crate 禁止 `#[cfg(unix)]`／`#[cfg(windows)]`／`target_os`／`cfg!`／`cfg_attr` 平台分支與 build script 間接分支（§3.1）；允許 `#[cfg(test)]`。
+- RPC／CLI `error_code` 與 session `last_error` 為兩個獨立命名空間（ADR-07、§9.3）；`CREDENTIALS_UNRESOLVED` 只屬後者。
+- 錯誤碼計數由 `contracts/error_codes.yaml` 資料產生，不得硬編碼 78（§9.2、OD-06）。
+- `--retries` 只對 11 個唯讀方法重試：`health.ping`、`health.status`、`session.list`、`session.get_state`、`session.activity`、`session.console_list`、`session.log_status`、`device.list`、`alias.list`、`mcu.patterns`、`mcu.status`（§4.2）；`session.interactive_status` 絕不重試。
+- CLI JSON：`json.dumps(..., ensure_ascii=False, separators=(",", ":"))` 等價輸出；`state.json`／WAL 以 `sort_keys=True`。
+- 背壓上限：`CMD_PENDING_MAX=256`、`CMD_HISTORY_MAX=512`、`BG_CAPTURE_MAX_COUNT=64`、`DEFERRED_INPUT_MAX_BYTES=262144`、EventEngine LineBuffer `16384`、每 Console 出向 Ring `1 MiB`（§5.4）；Actor mailbox／RX／TX／WAL 待處理一律有界。
+- Drain timeout 3,000 ms → `RECOVERING`＋`drain_stalled:true`＋`drain_timeout_epoch`（§5.2.5）。
+- Ready Reconfirm 耗盡：300 秒或 5 次失敗（§5.3）。
+- WAL rotate 門檻 `R` 以 Stage 0 擷取的 Python 常數為準，不自行換算 64 MB（§1.1.3）。
+- Windows 序列埠：`CreateFileW(OPEN_EXISTING, dwShareMode=0)`；WAL handle：`FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE`（§6.2、§8.2）。
+- Windows RPC 預設 `tcp://127.0.0.1:48700`；信任範圍＝整機本機使用者（OD-12），規格與文件不得宣稱「同使用者隔離」。
+- Windows 監管預設 `windows-task`，`ExecutionTimeLimit=PT0S`（OD-03、§6.1）。
+- bridge 位置 `tools/uart_stdio_bridge/`，不得 import `sw_core`／連結 `sw-pal`（OD-07、§15.4.2）。
+- 長跑門檻唯一來源 `realhw/acceptance/longrun_acceptance.yaml`；OD-09 三項已凍結，其餘延後凍結（§14.2、§15.11.4）。
+- repo 政策：不得 commit 到 `main`；每個 code PR 附 `changelog.d/<issue>-<slug>.md`；commit 用 Conventional Commits 繁中 subject，含 `Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>` trailer；完成前跑 `python3 -m pytest -q tests/` 與 `python3 -m policy_check --repo .`。
+- 雙軌同步上限（§12.2「契約先行的雙軌開發」）：Stage 2 期間 Python／Rust 雙軌同步（含測試工具同步、實機重跑、缺陷處理）超過當雙週重構投入的 30% 時，暫停開立下一切片並重新排程；各切片校準報告（06 Task 23 起，07／08／09 出口報告沿用同格式）須列出當期雙軌投入比例。
+- 斷路器（§12.2、OD-02／OD-13）每個切片都適用：2.1～2.4 各自在切片開始時以 `scripts/rust/slice_breaker.py`（06 Task 0b 唯一建立者）凍結必要案例分母與觀測窗口（`tests/acceptance/breaker/slice_2.{1,2,3,4}.json`），出口 gate 判定；不得拆案例或改分母。
+- Spike 9（多使用者 IPC 信任邊界，§13）不在本計畫交付範圍：OD-12 限定單人工作站部署，多使用者部署（含 `windows-service` bench）前須另案交付 RPC token＋ACL 與 Spike 9 證據；P9 退役裁決不得宣稱多使用者隔離。
+
+## Review Focus
+
+1. **舊 epoch／過期事件與晚到 completion**：Release／Recovery 後舊 worker 的 completion 仍到達 → 不得改新 session 狀態，但其 I/O 證據須落 WAL（§5.2.4）。由 Slice 2.1 Task「drain barrier」測試覆蓋。
+2. **部分 TX／結果不明**：OS 只寫出部分 bytes 或結果不明時被中止 → `COMMAND_ABORTED_IN_FLIGHT`（≥1 byte）或凍結映射，且絕不自動重送（BC-03、§5.1.4）。由 Stage 0 BC-03 與 Slice 2.1 測試覆蓋。
+3. **WAL 外部 unlink／外部 reader 持有 handle**：重建 META 帶 `loss_flag:true` 與 `potentially_lost_seq_range`（未知時明示 unknown），重建失敗不得宣稱 WAL 健康，並停止自動 TX（§8.2）。由 Stage 0 BC-01 與 Slice 2.1 WAL 測試覆蓋。
+4. **DeferredBuffer 跨上下文重灌**：清空後 mailbox 中尚未處理的舊按鍵不得再補回 UART（BC-02）。由 Stage 0 BC-02 與 Slice 2.2 測試覆蓋。
+5. **CLI 委派遞迴與參數保真**：Stage 1A Rust CLI 委派到 Python 入口時，不得經 `PATH` 找到自己造成 Rust→Python→Rust 遞迴；stdin／exit code／signal 須原樣保留（§4.3）。由 Stage 1A delegation 測試覆蓋。
+
+---
+
+## 1. 工作包（Phase）與分計畫
+
+| Phase | 對應規格階段 | 分計畫 | 交付 |
+|---|---|---|---|
+| P0 | Stage 0 契約治理 | `01-stage0-contracts.md` | `contracts/*`、契約驗證器、SKILL 受管區段、OD-06 通用規則設定 |
+| P1 | Stage 0 Python BC | `02-stage0-python-bc.md` | BC-01～BC-05、OD-11 allowlist、F12 oracle 修訂、Stage 0 擷取凍結值 |
+| P2 | Stage 0 測試基礎 | `03-stage0-test-infra.md` | `tools/uart_stdio_bridge/`、DUT 模擬器、比較器、func-test 外部模式、`tests/acceptance/`、資源標記、`longrun_acceptance.yaml`＋gate 判定器、release manifest |
+| P3 | Stage 1A | `04-stage1a-rust-cli.md` | Cargo workspace、`sw-proto`、`sw-pal`（client 側）、`sw-cli` 資料面＋固定路徑委派 |
+| P4 | Stage 1B | `05-stage1b-rust-cli-mgmt.md` | daemon／service／supervision-mode／remote／connect／setup／doctor／console-attach、`windows-task`、版本配對、更新／回滾 |
+| P5 | Slice 2.1 | `06-slice21-daemon-core.md` | PAL serial／lock／device／wal_fs／rpc server、WAL、Arbiter、SessionActor、最小 Shell 登入、Quiet Gate、Drain／Release、獨占、有界資源 |
+| P6 | Slice 2.2 | `07-slice22-console.md` | PTY／Telnet Console、Raw／Line、Lease、Soft Preempt、Suspend／Resume、DeferredBuffer |
+| P7 | Slice 2.3 | `08-slice23-login-events.md` | 完整 Login profile、Quiet／Reconfirm、Event Engine、Stall／Recovery |
+| P8 | Slice 2.4 | `09-slice24-transfer-flash.md` | FileTransfer、完整裝置交接、MCU flash／holder-probe、監管整合 |
+| P9 | Stage 3 前置 | `10-stage3-canary.md` | A/B 執行器、Canary 帳本工具、退役切換與回滾演練程序 |
+
+每個 Phase 依序：**計畫（本目錄）→ 測試先行（TDD，紅燈確認）→ 實作 → 雙審（sonnet max＋codex gpt-6.1-sol medium）→ 修正 → 全套測試＋policy_check → commit**。
+
+## 2. 模型分工（使用者指定）
+
+| 角色 | 模型 | 呼叫方式 | 用途 |
+|---|---|---|---|
+| 實作 A | Claude Haiku（effort xhigh） | Workflow `agent(..., {model:'haiku', effort:'xhigh'})` | 範圍明確、介面已定的模組（契約檔、CLI 子命令、schema、測試案例展開） |
+| 實作 B | Codex `gpt-6-luna`（reasoning max） | `codex exec -m gpt-6-luna -c model_reasoning_effort="max" -s workspace-write -C <dir>` | 高風險並行／平台／狀態機（PAL、WAL、Arbiter、SessionActor、Drain barrier、Telnet parser） |
+| 實作 C | agy `gemini-3.8-flash-high` | `agy --model gemini-3.8-flash-high --dangerously-skip-permissions -p '<prompt>'`（cwd＝工作目錄） | 可平行獨立模組（Event Engine、FileTransfer、bridge 工具、DUT 模擬器） |
+| 審查 A | Claude Sonnet（effort max） | Workflow `agent(..., {model:'sonnet', effort:'max'})` | 規格符合度、正確性、安全不變量 |
+| 審查 B | Codex `gpt-6.1-sol`（reasoning medium） | `codex exec -m gpt-6.1-sol -c model_reasoning_effort="medium" -s read-only` | 獨立第二意見 |
+
+原則：同一 Task 的「測試作者」與「實作者」盡量不同模型（降低共同盲點）；審查者永不為該 Task 的實作者。
+
+## 3. 本環境可產出與不可產出的證據
+
+可在本環境（WSL2＋同機 Windows 11 host interop）取得：
+- Linux L1（pytest、cargo test）、Linux L1.5（PTY pair＋bridge＋DUT 模擬器，含 Docker 模式）。
+- Windows 原生 L1：交叉編譯 `x86_64-pc-windows-gnu`，經 WSL interop 在 Windows host 原生執行 Rust 測試（檔案分享旗標、`LockFileEx`、TCP RPC、Task Scheduler XML 產生）；Windows Python（3.10～3.12）可跑 Python 側 Windows 測試。
+
+本環境**無法**產出、須由擁有者排程或授權的項目（各 Phase 交付時以「BLOCKED-OWNER」明列，不得標 PASS）：
+- Spike 1（com0com 驅動安裝，需管理員且屬侵入性變更）、原生 Windows COM handle gate（OD-08：com0com 或實體 USB-UART 直連 Windows）。
+- L2 實機回歸（TestPilot `serialwrap_regression` on live bench）、L3 `realhw` P0／P1／remote、48 小時長跑（OD-10，bench 依序）、>72 小時 `windows-task` 監管驗證（Spike 2）。
+- Canary（每平台 14 活躍日、≥5,000 次 `cmd submit`、≥50 次干擾／交接）、實機回滾演練、Stage 3 退役判定。
+- OD-09 延後凍結項（RSS 預算、最低負載、容許誤差）——需 Python 48h 基線後凍結。
+
+以上項目本計畫交付「可執行的程序、腳本、gate 判定器與證據 schema」，證據本身待擁有者執行。
+
+---
+
+## Cross-plan index
+
+> 跨計畫一致性審查（2026-10-15）產生。ID 規則：`P<phase>-T<分計畫 Task 編號>`（P1 的 `T01`～`T09` 記為 `P1-T1`～`P1-T9`；`0b`、`12b`、`15a`、`21a`、`5B`、`7B`、`14B`、`16-wire`、`18A` 照分計畫原名）。模型代號：**H**＝`haiku-xhigh`（實作 A）、**L**＝`codex-gpt-6-luna-max`（實作 B）、**G**＝`agy-gemini-3.8-flash-high`（實作 C）；審查一律 Sonnet max＋Codex `gpt-6.1-sol` medium，且審查者不得為該 Task 實作者。「依賴」欄只列同 Phase 的執行序前置（取自各分計畫的執行順序／相依表）；跨 Phase 前置列在各 Phase 標題，具體符號以各分計畫 Consumes 段為準。分計畫與本索引不一致時以分計畫為準，並回頭修正本索引。
+
+### P0（`01-stage0-contracts.md`；Phase 前置：—）
+
+| ID | Task | 測試作者 | 實作者 | 依賴（同 Phase Task） |
+|---|---|---|---|---|
+| P0-T1 | 契約目錄 loader 與結構規則 | G | H | — |
+| P0-T2 | AST 碼抽取器（常數傳遞、參數／回傳傳遞、動態前綴） | H | L | P0-T1 |
+| P0-T3 | `contracts/error_codes.yaml`（RPC／CLI error_code 權威目錄） | G | H | P0-T2 |
+| P0-T4 | `contracts/session_last_errors.yaml` 與 `contracts/diagnostic_aux.yaml` | G | H | P0-T3 |
+| P0-T5 | `contracts/behavior_changes.yaml`（BC／SC／DF 登記） | G | H | P0-T4 |
+| P0-T6 | 契約驗證器 CLI（目錄↔抽取↔契約測試↔交叉參照↔文件） | H | G | P0-T5 |
+| P0-T7 | 補齊缺少契約測試的錯誤碼（Python 基線特徵化測試） | H | G | P0-T6 |
+| P0-T8 | `contracts/rpc_schema.json` | G | H | P0-T7 |
+| P0-T9 | `contracts/cli_schema.json` | G | H | P0-T8 |
+| P0-T10 | `contracts/wal_record.schema.json`、`contracts/wal_meta_events.schema.json` 與 `contracts/state_file.schema.json` | H | G | P0-T9 |
+| P0-T11 | SKILL.md 受管區段生成 | G | H | P0-T16 |
+| P0-T12 | `.project-policy.yml` 宣告 OD-06 規則、R-26 同步與 preflight | H | G | P0-T11 |
+| P0-T13 | paulsha-conventions 通用規則 R-27（本地分支，不 push） | H | G | P0-T12 |
+| P0-T14 | pytest 平台／資源 marker 註冊與逐檔標註 | L | H | P0-T1、P0-T2、P0-T3、P0-T4、P0-T5、P0-T6、P0-T7、P0-T8、P0-T9、P0-T10、P0-T11、P0-T12、P0-T13、P0-T16 |
+| P0-T15 | P0 文件勘誤（調和表指派 P0 的 DOC 列）與 P0 列覆蓋閘門 | G | H | P0-T14 |
+| P0-T16 | P0 KEEP 列基線凍結（daemon logging、診斷文字 golden、config quirks） | H | G | P0-T10 |
+
+### P1（`02-stage0-python-bc.md`；Phase 前置：P0）
+
+| ID | Task | 測試作者 | 實作者 | 依賴（同 Phase Task） |
+|---|---|---|---|---|
+| P1-T1 | Stage 0 測試設施：替身、平台 skip、TX 結果純型別、Windows 原生 pytest runner | H | G | — |
+| P1-T2 | BC-01a WAL 常駐 handle、每筆 flush、唯一 close、DF-17 | H | L | P1-T1 |
+| P1-T3 | BC-01b Windows `CreateFileW` share-delete handle 與 `win32_files` | G | L | P1-T2 |
+| P1-T4 | BC-01c rotate／reset 於常駐 handle 下同步與 DF-03 歸檔後綴 | G | L | P1-T3 |
+| P1-T5 | BC-01d 外部 unlink／替換／DeletePending 偵測、有界自癒、缺口 META、停止自動 TX | H | L | P1-T4 |
+| P1-T6 | BC-03／SC-07 TX 三態、TX WAL 只記確認 bytes、可取消寫入、DF-15 精確 wal_seq | G | L | P1-T5 |
+| P1-T7 | SC-04a Bridge 兩段式 Drain 與 `DrainReceipt` | H | L | P1-T6 |
+| P1-T8 | SC-04b Session Drain、release／attach 交接回應、drain 診斷欄位、BC-03 中止映射、SC-11 有序關機 | G | L | P1-T7 |
+| P1-T9 | BC-02 DeferredBuffer 整段清空與上下文標記 | H | L | P1-T8 |
+| P1-T10 | BC-04 Per-UART 獨占、holder 診斷、Windows ACCESS_DENIED 映射、SC-05 同步收回、DF-04 | G | L | P1-T9 |
+| P1-T11 | Gate 錯誤碼：SC-01、SC-02、SC-03、SC-06、DF-02 | G | L | P1-T10 |
+| P1-T12 | SC-13 lease tick＋tombstone、SC-14 flash probe 資格、SC-16 console 行上限 | H | L | P1-T11 |
+| P1-T20 | OS write 前授權 permit（quiet／release／cancel／lease／owner_gen 零 TX） | H | L | P1-T12 |
+| P1-T13 | OD-11／SC-19 隔離實例測試裝置 allowlist | G | H | P1-T20 |
+| P1-T14 | BC-05 Windows `remote -R/-L`、SC-27 `connect`／`benches`、SC-21 `remote stop`、跨行程檔案鎖 | H | L | P1-T13 |
+| P1-T15 | 平台管理：SC-08、SC-09、SC-10、SC-12、SC-20、DF-14 | G | L | P1-T18 |
+| P1-T16 | 缺陷修正群組：DF-01、DF-06、DF-07、DF-08、DF-09、DF-10、DF-11、DF-12、DF-13、DF-16 | H | G（DF-01／06／07／08／09）＋L（DF-10～13／16） | P1-T15 |
+| P1-T17 | F12 `f12-wal-path-live` 與 L3 `p0-wal-live` 改為 seq／marker／CRC oracle | H | G | P1-T16 |
+| P1-T18 | Python 側 release manifest、`tree_sha256`、`version_pairing`、DF-05 daemon 定位 | G | H | P1-T14 |
+| P1-T19 | Stage 0 凍結值擷取與 S1-W WAL 微基準 | H | G | P1-T17 |
+| P1-T21 | Stage 0 實機回歸 case、程序 runbook 與 Spike 3 腳本（撰寫；實跑 BLOCKED-OWNER） | G | H | P1-T19 |
+
+### P2（`03-stage0-test-infra.md`；Phase 前置：P0、P1（T17 F12 oracle））
+
+| ID | Task | 測試作者 | 實作者 | 依賴（同 Phase Task） |
+|---|---|---|---|---|
+| P2-T1 | 套件骨架、獨立依賴、產品邊界守衛與 CI | H | G | — |
+| P2-T2 | 證據格式、CRC golden vectors、EvidenceWriter | G | H（records／clock／manifest／schema）＋L（writer.py） | P2-T9 |
+| P2-T3 | 端點 adapter（POSIX PTY／Windows pySerial） | H | L | P2-T2 |
+| P2-T4 | DUT 行為模型抽離與 stdin/stdout DUT 模擬器 | H | G | P2-T3 |
+| P2-T5 | bridge 核心（方向 worker、背壓、stderr 排空、控制通道、故障動作） | G | L | P2-T4 |
+| P2-T6 | DUT 執行模式：Docker image（`-i` 無 `-t`）與 `local-process` | H | G | P2-T5 |
+| P2-T7 | WAL↔wire 比較器、correlation 與竄改拒絕 | L | G | P2-T6 |
+| P2-T8 | bridge 自測（§15.4.3／Spike 4）與資格報告 | L | G | P2-T7 |
+| P2-T9 | socat 接線 spike 腳本（§15.4.1 第一步；執行順序在 Task 1 之後、Task 2 之前） | H | G | P2-T1 |
+| P2-T10 | func-test 外部 bridge 模式、DaemonHarness 隔離與 artifact 選定、oracle 修復、Windows Telnet console client | G | H（10A）＋L（10B，依賴 10A） | P2-T8 |
+| P2-T11 | §15.7.1 情境腳本與協調器新動作 | H | G | P2-T10 |
+| P2-T12 | `tests/acceptance/cases.yaml` 承接清單、schema、凍結鎖、Stage 0 證據索引、MCU 手動程序登記 | G | H | P2-T11 |
+| P2-T13 | pytest 資源報告、平台 SKIP 閘門、Windows collection 與 hosted Windows L1（`TST-D-4` 報告部分） | G | H | P2-T12 |
+| P2-T14 | L2／L3 平台 adapter（pin＋版本 gate、PID／RSS、bench lock、能力式 SKIP、Telnet human frontend、worker 存活事件） | H | L | P2-T13 |
+| P2-T15 | `longrun_acceptance.yaml`、外層 `release_gate_result` 判定器、長跑觀測器 | L | H | P2-T14 |
+
+### P3（`04-stage1a-rust-cli.md`；Phase 前置：P0、P1（T15 SC-09、T16 DF-06、T18 manifest）、P2（T10、T12））
+
+| ID | Task | 測試作者 | 實作者 | 依賴（同 Phase Task） |
+|---|---|---|---|---|
+| P3-T1 | Cargo workspace 骨架、stub 與 cfg 邊界檢查 | G | H | — |
+| P3-T2 | 黑箱契約 harness（`tests/contract_blackbox/`） | H | G | P3-T1 |
+| P3-T3 | `sw-proto::pyjson` | H | G | P3-T2 |
+| P3-T4 | `sw-proto::pycompat`／`pyfmt`／`pypath` | G | H | P3-T3 |
+| P3-T5 | `sw-proto::pyre`（Python `re` 相容） | H | L | P3-T4 |
+| P3-T6 | `sw-proto::yaml11` 與 `config_types` | H | G | P3-T5 |
+| P3-T7 | `sw-proto` 資料型別（constants、runtime_paths、endpoint、version、rpc_types、wal_types、release_manifest） | G | H | P3-T6 |
+| P3-T8 | 錯誤碼生成與命名空間 | G | H | P3-T7 |
+| P3-T9 | `sw-pal` client 側 | H | L | P3-T8 |
+| P3-T10 | argparse 相容層、`cli_spec` 與委派路由 | G | L | P3-T9 |
+| P3-T11 | `output` 與 `cli_trace` | G | H | P3-T10 |
+| P3-T12 | endpoint 解析（#108）與 bench state | H | G | P3-T11 |
+| P3-T13 | RPC client（白名單重試、退避、TIMEOUT 探測） | G | L | P3-T12 |
+| P3-T14 | 資料面 RPC 指令與 `main` 分派 | G | H | P3-T13 |
+| P3-T15 | `event`／`profile test`／`skill` | G | H | P3-T14 |
+| P3-T16 | Stage 1A 透明委派與 `mkbundle.sh --dev` | H | L | P3-T15 |
+| P3-T17 | Windows 原生 interop 執行（win-runner／win-test／win-blackbox、匯入 DLL 與 100 次啟動檢查） | H | L | P3-T16 |
+| P3-T18 | A/B 比較器、Rust CLI→Python daemon 黑箱與 Stage 1A gate 判定器 | H | G | P3-T17 |
+| P3-T19 | Rust CI workflow 與 Stage 1A 出口 gate | G | H | P3-T18 |
+
+### P4（`05-stage1b-rust-cli-mgmt.md`；Phase 前置：P3（全部））
+
+| ID | Task | 測試作者 | 實作者 | 依賴（同 Phase Task） |
+|---|---|---|---|---|
+| P4-T1 | 介面骨架、P3→P4 遷移、測試替身、黑箱 stub、案例綁定與 golden 擷取工具 | G | H | — |
+| P4-T2 | PAL `SysEnv` 管理面方法與 Windows 登錄讀取（`RegistryView`） | H | L | P4-T1 |
+| P4-T3 | PAL `ServiceCtl`：systemd、`windows-task`（Task XML／schtasks）、`windows-service`（sc.exe） | H | L | P4-T1 |
+| P4-T4 | PAL `ProcessCtl`（spawn／poll／foreground）與 `ProcScan`（POSIX `/proc`、Windows Toolhelp32） | G | L | P4-T1 |
+| P4-T5 | PAL `ProcessTunnel`（BC-05）與 `FsOps` 跨行程鎖／連結 | H | L | P4-T1 |
+| P4-T6 | `config.yaml` 寫入、`service`、`supervision-mode` 查詢（DF-07） | G | H | P4-T2、P4-T3、P4-T5、P4-T17 |
+| P4-T7 | `daemon start/stop/status/restart`、`graceful_stop`、多開預檢與 Windows 首次需求啟動（SC-10、SC-17、SC-18、SC-20、DF-05） | H | L | P4-T3、P4-T4、P4-T6、P4-T11、P4-T17 |
+| P4-T8 | `remote`（`-R`／`-L`／`status`／`close`／`stop` 別名）原生與 BC-05 Windows 路徑（SC-21） | H | L | P4-T2、P4-T5 |
+| P4-T9 | `connect`／`benches` 原生（SC-27） | G | H | P4-T8、P4-T17 |
+| P4-T10 | `setup`（資產物化、WSL systemd、reconcile）與 `supervision-mode set`（SC-12、SC-22、SC-24、DF-10～DF-13、DF-16） | G | L | P4-T3、P4-T4、P4-T5、P4-T6、P4-T7、P4-T11 |
+| P4-T11 | 安裝佈局、release manifest 驗證與版本配對 gate（§9.5、§12.1、SC-25） | H | L | P4-T2、P4-T3、P4-T5、P4-T17 |
+| P4-T12 | §12.1 首次安裝、更新流程與 `setup --rollback`（SC-23） | G | L | P4-T4、P4-T7、P4-T10、P4-T11 |
+| P4-T13 | `doctor` 全部檢查原生與 `version_pairing`（SC-25） | G | H | P4-T2、P4-T4、P4-T10、P4-T11 |
+| P4-T14 | 終端類承接（console-attach／detach、`serialwrap-minicom` 端到端、Windows Telnet 提示）與委派集合清空 | H | G | P4-T7、P4-T10 |
+| P4-T15 | Agent 權限模型文件與驗證工具（§10.3）、對外文件同步 | H | G | P4-T6、P4-T7、P4-T8、P4-T9、P4-T10、P4-T11、P4-T12、P4-T13、P4-T14 |
+| P4-T16 | Stage 1B 整合：全群組黑箱 A/B、L1.5、效能 gate、Windows 原生 L1、契約與案例完成度核對 | G | H | 全部 |
+| P4-T17 | `sw-daemon` launcher、`yaml11::emit`、`bench_registry` 與自含式 dev bundle（P3 明列為 P4 範圍者） | H | L | P4-T1 |
+| P4-T18 | `windows-task` Spike 2 程序、腳本與證據 schema（P2 指派 `win-task-*` 案例） | H | G | P4-T3、P4-T10、P4-T12 |
+
+### P5（`06-slice21-daemon-core.md`；Phase 前置：P0～P4）
+
+| ID | Task | 測試作者 | 實作者 | 依賴（同 Phase Task） |
+|---|---|---|---|---|
+| P5-T0 | 範圍凍結、資源上限與事件延遲契約、介面骨架 | G | H | — |
+| P5-T0b | Slice 2.1 必要案例集合凍結與承接率斷路器（§11.3、§12.2、OD-02、OD-13） | G | H | P5-T0 |
+| P5-T0c | 上游缺漏介面補齊（sw-proto pycompat／Params／RuntimeConfig accessor、sw-pal Clock wall、RpcServerStream） | G | L | P5-T0b |
+| P5-T1 | PAL test-fakes（FakeClock／FakeSerial／FakeWalFs／FakeDeviceSource／MemStream） | H | G | P5-T0c |
+| P5-T2 | PAL POSIX serial＋UartExclusive＋哨兵 PTY | H | L | P5-T1 |
+| P5-T3 | PAL Windows serial（overlapped、CancelIoEx） | G | L | P5-T2 |
+| P5-T4 | PAL InstanceLock（Tier 1）＋SignalWait | G | L | P5-T3 |
+| P5-T5 | PAL DeviceSource／DeviceWatcher（#100 前提、SERIALCOMM、藍牙排除、OD-11） | H | L | P5-T4 |
+| P5-T6 | PAL WalFs（常駐 handle、identity、share-delete、不覆蓋 rename） | G | L | P5-T5 |
+| P5-T7 | sw-core WalWriter（BC-01、DF-03、DF-17） | H | L | P5-T6 |
+| P5-T8 | sw-core CommandRegistry／SessionQueue（admission、出列、history、SC-06） | H | L | P5-T7 |
+| P5-T9 | sw-core TxWriter＋Fence（送出前檢查、BC-03 三態、SC-07） | H | L | P5-T8 |
+| P5-T10 | sw-core IoWorker reader＋RxWindow＋哨兵 fan-out | G | L | P5-T9 |
+| P5-T11 | sw-core SessionCore／Mailbox／Generations／Actor（§5.3 的 2.1 列） | H | L | P5-T10 |
+| P5-T12 | sw-core Two-Phase Drain 核心＋IoWorker 收尾＋Release／Attach（sans-IO 與 IoWorker 層） | G | L | P5-T11 |
+| P5-T13 | sw-core 最小 Login＋帳密＋Quiet Gate＋Profile 能力閘 | H | L | P5-T12 |
+| P5-T14 | sw-core 命令執行、agent Interactive Lease、self-test、capture | G | L | P5-T13 |
+| P5-T12b | Drain／Release 端到端（真 actor＋login＋命令執行） | G | L | P5-T14 |
+| P5-T15a | 黑箱 FakeTarget 擴充（測試資產變更，§10.4） | H | G | P5-T12b |
+| P5-T15 | sw-core StateStore＋AliasRegistry＋state.json 雙向相容 | G | L | P5-T15a |
+| P5-T16 | sw-core SessionManager（裝置、rank #100、動態 session、selector、管理操作） | H | L | P5-T15 |
+| P5-T17 | PAL RpcListener＋sw-daemon framing | G | L | P5-T16 |
+| P5-T18 | sw-daemon 分派器（service.rs／health.rs） | G | H | P5-T17 |
+| P5-T19 | sw-daemon daemon_main（啟動順序、有序關機、exit code） | H | L | P5-T18 |
+| P5-T20 | 黑箱契約與既有套件改指 Rust（F1／F2／F3／F4／F12＋安全骨架） | H | L | P5-T19 |
+| P5-T21a | P2 runner 補動作（測試資產變更，§10.4） | H | G | P5-T20 |
+| P5-T21 | L1.5 bridge 回歸（P2 凍結 2.1 情境＋s21 情境）與事件延遲量測 | G | L | P5-T21a |
+| P5-T22 | Windows 原生 L1 證據與 Slice 2.1 出口 gate 包 | H | G | P5-T21 |
+| P5-T23 | Slice 2.1 完成校準報告（§12.2、OD-02、OD-13） | H | G | P5-T22 |
+
+### P6（`07-slice22-console.md`；Phase 前置：P5）
+
+| ID | Task | 測試作者 | 實作者 | 依賴（同 Phase Task） |
+|---|---|---|---|---|
+| P6-T0 | 契約登記、案例凍結與架構細化 | G | H | — |
+| P6-T1 | 常數、模組骨架與 harness 簽章 | G | H | P6-T0 |
+| P6-T2 | Telnet 協定層 | H | L | P6-T1 |
+| P6-T3 | Line editor、shlex 與 human line mode | H | G | P6-T1 |
+| P6-T4 | DeferredBuffer（BC-02） | G | L | P6-T1 |
+| P6-T5 | 每 console 出向 ring（SC-15） | H | G | P6-T1 |
+| P6-T6 | Ownership 狀態機、human TX lane 與 Fence 整合 | G | L | P6-T2、P6-T3、P6-T4、P6-T5 |
+| P6-T7 | Interactive lease 差量（tombstone、soft preempt、ATTACHED 救援、stash） | H | L | P6-T2、P6-T3、P6-T4、P6-T5、P6-T6 |
+| P6-T8 | PAL console backends（PTY／TCP／ConsoleMux／com0com） | G | L | P6-T1 |
+| P6-T9 | ConsoleHub runtime 與 RX fan-out | H | L | P6-T8 |
+| P6-T10 | RPC 表面、LeaseIndex 路由與 SessionPublic 欄位 | G | L | P6-T6、P6-T7、P6-T9 |
+| P6-T11 | 黑箱契約與既有測試改指 Rust（Linux L1.5） | G | L | P6-T10 |
+| P6-T12 | Windows 原生 console 與選配 com0com | H | L | P6-T11 |
+| P6-T13 | 案例證據對照、文件、全套 gate | G | H | P6-T12 |
+
+### P7（`08-slice23-login-events.md`；Phase 前置：P5、P6）
+
+| ID | Task | 測試作者 | 實作者 | 依賴（同 Phase Task） |
+|---|---|---|---|---|
+| P7-T0 | 介面凍結、模組骨架、登記與案例凍結 | G | H | — |
+| P7-T1 | Python 基線 golden 擷取 | G | H | P7-T0 |
+| P7-T2 | `session_auth.rs`：golden 回歸與 Debug 遮蔽 | G | H | P7-T1 |
+| P7-T3 | `login_fsm.rs`：全平台 Login FSM | H | L | P7-T2 |
+| P7-T4 | `quiet_gate.rs`：Autoboot Quiet＋Ready Reconfirm | H | L | P7-T3 |
+| P7-T5 | `reprobe.rs`：readiness reprobe 與 bootloader 證據 | H | L | P7-T4 |
+| P7-T6 | `transport_stall.rs`＋PAL `UsbTopology`＋`FsOps` 寫入側 | G | L | P7-T5 |
+| P7-T7 | Login run 協調、fence `fsm_gen`、帳密終態與收斂 | H | L | P7-T6 |
+| P7-T8 | `self_test.rs`：self-test 分類與 nonce probe 整合 | G | L | P7-T7 |
+| P7-T9 | `recover.rs`：session recover／force recover | H | L | P7-T8 |
+| P7-T10 | `capture.rs`：agent log capture（reader 端 observer） | G | L | P7-T9 |
+| P7-T11 | Event schema＋`pyre/redos.rs` | H | G | P7-T1 |
+| P7-T12 | `line_buffer.rs`＋`matcher.rs` | H | G | P7-T11 |
+| P7-T13 | `counter.rs`＋`registry.rs`＋`event_log.rs`（含 Python DF-18） | H | G（Rust）；13-py：測試 G／實作 H | P7-T12、P7-T6 |
+| P7-T14 | PAL `HandlerSpawner`（POSIX／Windows，SC-26） | G | L | P7-T13 |
+| P7-T15 | `dispatcher.rs` | H | G | P7-T14 |
+| P7-T16 | EventEngine 組裝與 10 個 `event.*` RPC | H | G | P7-T15 |
+| P7-T16-wire | reader `RxObserver` 接線（DF-15）、`BridgeQueries` 與 daemon 啟停順序 | H | L | P7-T10、P7-T16 |
+| P7-T17 | session RPC 接線（self_test／recover／attach／log_*） | G | H | P7-T7、P7-T8、P7-T9、P7-T10、P7-T16-wire |
+| P7-T18A | 黑箱測試工具擴充（`bb_faketarget`、P7 helper）——Stage T0，獨立 PR | H | G | — |
+| P7-T18 | L1.5 黑箱契約、§11.3 不變量、延遲與背景雜訊、func-test、A/B | G | H | P7-T18A、P7-T17 |
+| P7-T19 | Windows 原生 L1／COM 證據與 Phase gate | G | H | P7-T18 |
+
+### P8（`09-slice24-transfer-flash.md`；Phase 前置：P2～P7）
+
+| ID | Task | 測試作者 | 實作者 | 依賴（同 Phase Task） |
+|---|---|---|---|---|
+| P8-T0 | 上游介面核對與 P8 黑箱共用 fixture | H | G | P2～P7 |
+| P8-T1 | Slice 2.4 案例登記、契約增補登記、斷路器凍結 | H | G | P8-T0 |
+| P8-T2 | `mcu_patterns` registry 與 hex 語意 | G | H | P8-T0 |
+| P8-T3 | File transfer 板端命令樣板與 RX 判定 helper（Python golden） | H | G | P8-T0 |
+| P8-T4 | File transfer 引擎 `push_file`／`pull_file` | H | G | P8-T3 |
+| P8-T5 | `OpTransferPort`：echo-ACK 節流、TX 證據聚合與中止 | G | L | P8-T4 |
+| P8-T6 | `file.push`／`file.pull` 的 session 整合與 RPC 分派 | H | L | P8-T0、P8-T5 |
+| P8-T7 | PAL flash 端點能力 | G | L | P8-T0 |
+| P8-T8 | SessionCore FLASHING 仲裁 | H | L | P8-T0 |
+| P8-T9 | FlashEndpoint 執行緒與認線協調 | G | L | P8-T0、P8-T2、P8-T7、P8-T8 |
+| P8-T10 | `mcu.patterns`／`mcu.status` RPC 與 daemon 組裝 | G | H | P8-T9 |
+| P8-T11 | 外部工具裝置交接的黑箱與整合驗證 | H | L | P8-T0、P8-T6、P8-T8 |
+| P8-T12 | systemd 監管整合與有序停止 | G | L | P8-T6、P8-T9、P8-T11 |
+| P8-T13 | `windows-task` 監管對 Rust daemon 的驗證 | H | L | P8-T12 |
+| P8-T14 | 更新／回滾守衛對 Rust daemon 的驗證與補強（SC-23） | G | H | P8-T6、P8-T9 |
+| P8-T15 | 全部凍結契約的最終覆蓋判定與切片出口腳本 | H | G | P8-T0～14 |
+
+### P9（`10-stage3-canary.md`；Phase 前置：P0～P8（以前置 Phase 交付物為介面））
+
+| ID | Task | 測試作者 | 實作者 | 依賴（同 Phase Task） |
+|---|---|---|---|---|
+| P9-T1 | 契約檔、schema 與基礎模組 | G | H | — |
+| P9-T2 | 共用基礎測試替身（`tests/stage3_fakes.py`） | H | G | P9-T1 |
+| P9-T3 | A/B manifest 載入、凍結與案例涵蓋檢查（`tools/stage3/ab_manifest.py`） | H | G | P9-T2 |
+| P9-T4 | A→B 資源釋放驗證（`tools/stage3/release_check.py`） | H | L | P9-T3 |
+| P9-T5 | 乾淨 DUT 狀態與實例隔離（`tools/stage3/dut_state.py`） | G | H | P9-T4 |
+| P9-T5B | Suite adapter（`tools/stage3/suites/`） | H | L | P9-T5 |
+| P9-T6 | Sequential A/B 執行器（`tools/stage3/ab_runner.py`） | H | L | P9-T14B |
+| P9-T7B | L1.5 A/B 差分（`tools/stage3/ab_diff.py`） | L | H | P9-T5B |
+| P9-T7 | A/B 判定（`tools/stage3/ab_verdict.py`） | L | H | P9-T7B |
+| P9-T8 | Canary WAL 收割與提交計數（`tools/stage3/canary_harvest.py`） | G | L | P9-T6 |
+| P9-T9 | Canary collector 與 zipapp（`tools/stage3/canary_collect.py`） | H | L | P9-T11 |
+| P9-T10 | 干擾／交接分類與活躍日（`tools/stage3/canary_classify.py`） | H | L | P9-T8 |
+| P9-T11 | 事故追蹤（`tools/stage3/canary_incidents.py`） | G | H | P9-T10 |
+| P9-T12 | Canary policy 凍結、帳本彙總與配額 gate（`tools/stage3/canary_ledger.py`） | L | G | P9-T9 |
+| P9-T13 | 實機回滾演練（`tools/stage3/rollback_drill.py`） | G | L | P9-T12 |
+| P9-T14 | Stage 0～3 出口證據索引（`tools/stage3/evidence_index.py`） | L | G | P9-T7 |
+| P9-T14B | 證據 ingest（`tools/stage3/evidence_ingest.py`） | H | L | P9-T15 |
+| P9-T15 | OD-09 延後凍結程序與凍結後 gate 判定（`tools/stage3/od09_freeze.py`） | L | H | P9-T14 |
+| P9-T16 | Python daemon 退役切換（packaging） | H | L | P9-T13 |
+| P9-T17 | `python3 -m tools.stage3` 入口與擁有者程序文件 | G | H | P9-T16 |
+
+### 跨 Phase 關鍵交接（本次審查定案的唯一 owner）
+
+| 介面／檔案 | 唯一建立者 | 後續 Phase 的處置 |
+|---|---|---|
+| 測試檔平台／資源分類 | P0-T14（檔內 `pytestmark`） | P1～P9 不建 `tests/platform_resources.yaml`；Windows collection 排除由 P2-T13 `pytest_ignore_collect`（P1-T1 `win-pytest.sh` 以同規則 AST 掃描） |
+| `contracts/golden/pycompat.tsv` | P3-T4 | P5-T0c 另建 `pycompat_s21.tsv` |
+| `sw_proto::pycompat::{shlex_split, shlex_quote, b2a_base64, strip_ansi, clean_text, uuid4_*, iso_utc_now, strftime_*, py_round, coerce_rpc_bool, a2b_base64_lenient, to_printable}` | P5-T0c | P6-T3 只加 shlex 回歸 golden；P7、P8 直接消費 |
+| `HolderScanStatus` | P4-T1（arch §4.2 名稱） | P5 `HolderReport`／`UartExclusive` 沿用，不重定義 |
+| `FakeClock` | P3-T9（auto-advance）、P4-T1 擴充 | P5-T1 擴充同一型別：`FakeClock::at(mono, wall)`＝threaded 模式 |
+| `device_source/{mod.rs, windows_model.rs}`、`RegistryView`、`read_bt_ports`、`exclude_bluetooth` | P4-T1／T2 | P5-T5 只新增 posix.rs、windows.rs 與 `WindowsDeviceSource` |
+| `FsOps`（`mkdirs`、`remove_file -> PalResult<()>` 等） | P4-T1／T5 | P7-T6 只新增 `open_append`、`create_truncate`、`is_file`、`file_size`、`remove_file_if_exists` |
+| `resolve_config_path`（SC-09） | P3-T7 | P5-T19 委派（P3 沒有 `config_candidates`） |
+| `crates/sw-core/src/mcu_patterns.rs` | P5-T0（骨架） | P8-T2 Modify |
+| `scripts/rust/slice_breaker.py` | P5-T0b | P6-T0、P7-T0、P8-T1 只新增 `breaker/slice_2.x.json` |
+| `contracts/ab_normalization.yaml` | P5-T20 | P9-T7B 只追加鍵 |
+| `tests/acceptance/evidence_index.schema.json` | P2-T12 | P9-T1 另建 `stage3_evidence_index.schema.json` |
+| `tests/contract_blackbox/bb_faketarget.py` | P3-T2 | P5-T15a、P6-T11、P7-T18A 以 keyword-only 擴充（不存在 `contract_blackbox/faketarget.py`） |
+| `behavior_changes.yaml` 新條目欄位 | P0-T1／T5 schema | 一律 `approved_at_revision`＋`ab_participation`，`contracts/` 內不得出現 `contract_revision` 鍵 |
+| SC 編號 | 調和表 SC-01～27 | P6：SC-28、29、31；P7：SC-30；P8：SC-32、33（原稿 SC-31／32 撞號，已改）；`test_bc_real_sc_df_ranges` 依序改為 `range(1,30)∪{31}` → `range(1,32)` → `range(1,34)`；DF-18 屬 P7 |
+
+### 審查後仍未解決（需擁有者或後續 PR 處理）
+
+1. P8-T10（daemon 組裝、flash endpoint 啟動序）與 P8-T14（更新／回滾守衛）由 H 實作，與 P5 §0.4「daemon 生命週期一律 L」的分工說明不一致；P8 已以 Sonnet 逐項核對不變量補償，是否改派 L 待擁有者裁決（本次未改）。
+2. P5-T1（PAL test-fakes，含可注入部分寫入／取消失敗的 `FakeSerial`）由 G 實作；依 P5 自述屬「獨立模組」，未視為違規，但 fakes 的 cancel 語意錯誤會讓 L1 誤綠，建議審查 A 專審。
+3. P1-T1 的 `win-pytest.sh`（Windows 行程樹終止、WSLENV）由 G 實作，P3-T17 同類工作則判為高風險平台改派 L；若改派需同步調整 P1 §0.1 的 Test reviewer 欄（現為 L）。
+4. P7-T18A 的 `bb_faketarget` 擴充鍵（`noise` 等）與 P5-T15a（`noise_interval_s`）可能重複，P7 執行時需合併為單一參數。
+5. P8-T10 新建 `crates/sw-daemon/tests/support/service_rig.rs` 與 P5-T18 `support/mod.rs` 既有 `ServiceRig` 可能同名衝突，P8 執行時應改為擴充既有型別。
+6. arch 文件（`rust-architecture.md`）尚未同步本次定案（`HolderScanStatus` 共用、`FakeClock::at`、`pycompat_s21.tsv`、P8 SC 改號）；由各 owner Task 依其「修訂 arch」步驟寫回。
