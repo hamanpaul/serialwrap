@@ -32,7 +32,7 @@
 2. **門檻凍結時序**：OD-09 延後項 freeze 必須早於任何 Rust 候選長跑（含 Stage 1B 的 `S1B-L3-MIXED-48H-WINDOWS`）；Canary policy 以 `canary policy freeze` 凍結且早於第一個計數紀錄，`tally`／`gate` 逐筆核對 `policy_ref.policy_sha256`；兩者都以程式拒絕事後凍結或事後改 policy（§12.2、§14.2）。
 3. **Canary 計數保守**：只計 `^[0-9a-f]{32}$` 的 arbiter `cmd_id`（排除 `ft-*` 檔案傳輸分塊）、`cmd_id` 去重、跨 rotate／reset 不重算、結果不明不計、artifact 歸屬須經 CLI 與 daemon 執行檔 hash 雙重核實，模糊即不計；不同 artifact／平台不自動合併；循環類型有單一類型上限，不得全由 Recovery 湊滿。
 4. **事故不可消失**：PID 變更（含 supervisor 自動恢復、中間夾著失聯快照）在無計畫維護紀錄或可佐證的主機重開時一律開事故；collector 觀測缺口、WAL 擷取異常、自動偵測到的安全訊號自成事故；未結案即阻擋 gate。
-5. **證據不可由人工宣稱**：PASS 只能由 `evidence ingest` 從產生工具的報告推導並複製、逐檔 hash；`evidence_root` 必填；target 以 (stage, platform) 分別指定，並同時凍結 `tool_revision`、`case_list_sha256`、`runtime_digest`。
+5. **證據不可由人工宣稱**：PASS 只能由 `evidence ingest` 從產生工具的報告推導並複製、逐檔 hash；`evidence_root` 必填；target 以 (stage, platform) 分別指定，並同時凍結 `tool_revision`、`case_list_sha256`、`runtime_digest`；每筆 entry 另保存實際受測內容指紋（`bundle_tree_sha256`／`runtime_tree_sha256`），與 target 不符即過期，同一 manifest 不得換內容重設 target，跨 Stage `reuse_of` 必須 `runtime_tree_sha256` 相等（R3-F2）。
 6. **退役切換不可提前生效、也不可重建受測物**：Stage 3 bundle 以靜態 `retirement` 標記（無核准欄位）建置與受測；核准只寫在 `packaging/python_daemon_retirement.json`；發佈時 `retirement verify --mode release --bundle-manifest` 要求所建 manifest 的 sha256 等於該平台 Stage 3 target，**並重算實際 bundle 的每個 component（`verify_bundle`）與整個 bundle 檔案樹 digest（`bundle_tree_sha256`，於設定 Stage 3 target 時凍結）**——manifest 未動而 CLI／daemon／資產被替換、刪除或新增檔案一律拒絕；打包後再以 `retirement verify-archive` 解開最終 archive 重算同一組 digest，只上傳通過驗證的那份位元組（R2-F7）；回滾演練以真實串口釋放／重新取得（舊程序退出、新程序 READY 時間晚於演練開始、裝置綁定不變、smoke 命令）以及「啟動新版失敗自動回到完整 Previous」判定，而非版本字串或跨重啟的 `bridge_generation`。
 
 ---
@@ -835,7 +835,8 @@ def runtime_digest(manifest_doc: Mapping[str, Any]) -> str
     #   "daemon": components.daemon.launcher.sha256, "runtime": components.daemon.runtime.sha256 或 None,
     #   "package_tree": components.daemon.package.tree_sha256 或 None, "assets": components.assets,
     #   "supervisor": components.supervisor.definition_sha256 或 None}))；不含版本字串、stage、created_at、retirement，供跨 stage 證據沿用比對（Task 14）
-    # 只雜湊 manifest「宣告值」，**不是**內容驗證；任何「受測物＝此 bundle」的判定都必須另外呼叫 verify_bundle／bundle_tree_sha256（R2-F7）
+    # 只雜湊 manifest「宣告值」，**不是**內容驗證；任何「受測物＝此 bundle」的判定都必須另外呼叫 verify_bundle／bundle_tree_sha256（R2-F7）；
+    # 跨 stage 沿用必須同時比對 runtime_tree_sha256（R3-F2），不得只憑 runtime_digest
 def verify_bundle(bundle_dir: Path, manifest_doc: Mapping[str, Any], *, label: str) -> list[str]
     # 對實際 bundle 目錄逐一重算 manifest 宣告的 component（規則見下）；verify_frozen 每側以 label=f"side {A|B}" 呼叫，
     # Task 14 set_target（stage "3"）與 Task 16 retirement verify --mode release／verify-archive 以 label=<platform> 呼叫
@@ -843,6 +844,11 @@ def bundle_tree_sha256(bundle_dir: Path) -> str
     # 整個 bundle 目錄的檔案樹 digest：sorted "<posix relpath>\0<sha256>\n" 的 sha256，涵蓋**所有**一般檔（含 release-manifest.json、
     # SHA256SUMS、assets、__pycache__／*.pyc，不排除任何檔）；遇 symlink（檔案或目錄）或其他非一般檔（device、FIFO、socket）→
     # HarnessError("HARNESS_ARTIFACT_MISMATCH", "non-regular file: <relpath>")。與 tree_sha256（排除 __pycache__）不同，用於發佈邊界
+def runtime_tree_sha256(bundle_dir: Path) -> str
+    # 「實際受測內容」指紋（R3-F2）：與 bundle_tree_sha256 同演算法、同非一般檔拒絕規則，只排除 bundle 根目錄下恰為
+    # "release-manifest.json" 與 "SHA256SUMS" 兩個中繼檔（兩者因 stage／created_at／retirement 而必然隨 stage 改變）；其他任何檔案
+    # （含未列於 manifest 的旁載檔，例如 bin/version.dll、py/**、assets/**、__pycache__）都計入。
+    # 供 Task 14 跨 Stage 沿用（reuse_of）比對：runtime_digest 只雜湊 manifest 宣告值，旁載檔不會讓它改變，不能單獨作為沿用依據
 def render_argv(template: Sequence[str], values: Mapping[str, str]) -> list[str]
 ```
 
@@ -852,7 +858,7 @@ def render_argv(template: Sequence[str], values: Mapping[str, str]) -> list[str]
 
 `verify_bundle(bundle_dir, manifest_doc, *, label)` 是上列 release 類字串的**唯一**產生者（`verify_frozen` 只把它對兩側的結果串接，因此字串與既有格式逐字相同）：`components` 下每個帶 `path`＋`sha256` 的物件（`cli`、`daemon.launcher`、`daemon.runtime`…）以 `bundle_dir / path` 重算——檔案不存在 → `"file missing: <bundle_dir/path>"`、不符 → `"release component sha256 mismatch: <label> <component>"`；`daemon.package.tree_sha256`、`python_cli_delegate.tree_sha256` 依 arch §10.1 重算 → `"release tree mismatch: <label> <component>"`；`path` 為絕對路徑或正規化後跳出 `bundle_dir` → `"release component path escapes bundle: <label> <component>"`。`components.assets` 只帶 hash、沒有 path（arch §10.1），因此資產內容**只能**由 `bundle_tree_sha256` 守住——發佈邊界必須同時用兩者，不得只用其一。
 
-`tests/test_stage3_ab_manifest.py` 另加（R2-F7）：`test_verify_bundle_strings_match_verify_frozen`（以 `make_bundle` 建 bundle 後改寫 `bin/serialwrapd` → `verify_bundle(b, doc, label="side B") == ["release component sha256 mismatch: side B daemon.launcher"]`，且同一竄改經 `verify_frozen` 得到相同字串）、`test_verify_bundle_missing_cli`（刪 `bin/serialwrap` → `[f"file missing: {b / 'bin' / 'serialwrap'}"]`）、`test_verify_bundle_path_escape`（manifest `components.cli.path="../x"` → 含 `"release component path escapes bundle: side A cli"`）、`test_bundle_tree_sha256_covers_every_file`（基準 digest d0；新增 `assets/skill/SKILL.md`、修改它、刪除它、新增 `bin/__pycache__/x.pyc`、修改 `SHA256SUMS`，每一步 digest 都與前一步不同；把檔案順序改變的同內容樹 → digest 相同）、`test_bundle_tree_sha256_rejects_symlink`（POSIX 下以 `pytest.mark.skipif(os.name == "nt")` 守住：bundle 內放 symlink → `HarnessError` 且 `code == "HARNESS_ARTIFACT_MISMATCH"`）。
+`tests/test_stage3_ab_manifest.py` 另加（R2-F7）：`test_verify_bundle_strings_match_verify_frozen`（以 `make_bundle` 建 bundle 後改寫 `bin/serialwrapd` → `verify_bundle(b, doc, label="side B") == ["release component sha256 mismatch: side B daemon.launcher"]`，且同一竄改經 `verify_frozen` 得到相同字串）、`test_verify_bundle_missing_cli`（刪 `bin/serialwrap` → `[f"file missing: {b / 'bin' / 'serialwrap'}"]`）、`test_verify_bundle_path_escape`（manifest `components.cli.path="../x"` → 含 `"release component path escapes bundle: side A cli"`）、`test_bundle_tree_sha256_covers_every_file`（基準 digest d0；新增 `assets/skill/SKILL.md`、修改它、刪除它、新增 `bin/__pycache__/x.pyc`、修改 `SHA256SUMS`，每一步 digest 都與前一步不同；把檔案順序改變的同內容樹 → digest 相同）、`test_bundle_tree_sha256_rejects_symlink`（POSIX 下以 `pytest.mark.skipif(os.name == "nt")` 守住：bundle 內放 symlink → `HarnessError` 且 `code == "HARNESS_ARTIFACT_MISMATCH"`）、`test_runtime_tree_sha256_ignores_only_manifest_metadata`（R3-F2：基準 r0＝`runtime_tree_sha256(b)`、t0＝`bundle_tree_sha256(b)`；改寫 `release-manifest.json` 的 `created_at` 與 `stage`、改寫 `SHA256SUMS` → `runtime_tree_sha256(b) == r0` 且 `bundle_tree_sha256(b) != t0`；還原後新增未列於 manifest 的 `bin/version.dll`（`b"MZ"`）→ `verify_bundle(b, doc, label="side B") == []` 但 `runtime_tree_sha256(b) != r0`、`bundle_tree_sha256(b) != t0`、`runtime_digest(doc)` 不變；新增 `bin/SHA256SUMS`（非根目錄）→ 再次改變 `runtime_tree_sha256`）。
 
 `verify_case_coverage`（§11.3「不得刪除案例、縮小分母」、§11.6 Stage 3「完整契約＋L1.5」）回傳：`"required case missing: <id>"`（`required_cases` 中不在 `case_ids` 者）；`"unknown case: <id>"`（`case_ids` 中不在 `cases.yaml` 者）；`"invariant not covered: <invariant_id>"`（`cases.yaml.invariant_ids` 六項中，沒有任何 `case_ids` 內、且 layer 相符的案例引用者；該 layer 在 `cases.yaml` 原本就沒有任何案例引用的 invariant 不列）；`"destructive case without authorization: <id>"`（`authorization` 為 null、`allow_destructive` 為 false 或 `decision_ref` 為 null）；`"authorization board not in dut: <com>"`；`"windows com0com instance without test_device_allowlist"`。任何一筆都使 Task 6 以 `HARNESS_CASE_SET_INCOMPLETE`（授權類為 `HARNESS_AUTHORIZATION_MISSING`）拒絕執行。
 
@@ -1386,11 +1392,11 @@ def run_ab(manifest_path: Path, *, out_dir: Path, repo_root: Path, run: Runner =
 **執行序（逐字實作；任何 abort 都寫出 `out_dir/ab-report.json` 後回傳）：**
 
 1. `m = load_manifest(manifest_path)`；`out_dir.mkdir(parents=True, exist_ok=False)`（已存在 → `HARNESS_MANIFEST_INVALID`，避免覆寫舊證據）。
-2. `violations = verify_frozen(m, repo_root=repo_root, run=run)`；非空 → verdict `INFRA_ERROR`，reason 依第一筆違規類別：案例涵蓋類 → `HARNESS_CASE_SET_INCOMPLETE`、授權類 → `HARNESS_AUTHORIZATION_MISSING`、其他 → `HARNESS_MANIFEST_DRIFT`；此時**不得**執行任何 `activate`、suite、`cli` 命令。
+2. `violations = verify_frozen(m, repo_root=repo_root, run=run)`；非空 → verdict `INFRA_ERROR`，reason 依第一筆違規類別：案例涵蓋類 → `HARNESS_CASE_SET_INCOMPLETE`、授權類 → `HARNESS_AUTHORIZATION_MISSING`、其他 → `HARNESS_MANIFEST_DRIFT`；此時**不得**執行任何 `activate`、suite、`cli` 命令。通過後對兩側各記一次受測內容指紋（R3-F2）：`trees[label] = {"bundle_tree_sha256": ab_manifest.bundle_tree_sha256(side.bundle_dir), "runtime_tree_sha256": ab_manifest.runtime_tree_sha256(side.bundle_dir)}`；拋 `HARNESS_ARTIFACT_MISMATCH`（非一般檔）→ `INFRA_ERROR`、`HARNESS_MANIFEST_DRIFT`，同樣不執行任何命令。
 3. `m.layer == "l3"` → `od09_freeze.check_frozen_before(repo_root / m.acceptance.path, now())` 非空 → `INFRA_ERROR`、`HARNESS_OD09_NOT_FROZEN`（在 A 開始前拒絕；OD-09「任何 Rust 候選長跑開始前凍結」）。
 4. `rounds = [("A","B")] + ([("B","A")] if m.reverify.enabled else [])`。複驗是否執行在 manifest 預先決定，不看第一輪結果。
 5. 每輪每側依序 `_run_side(label)`：
-   1. 再次 `verify_frozen`（兩側之間的漂移，例如 bundle 檔案在 A 執行期間被改）；非空 → `abort_code = "HARNESS_MANIFEST_DRIFT"`，不執行本側。
+   1. 再次 `verify_frozen`（兩側之間的漂移，例如 bundle 檔案在 A 執行期間被改）；非空 → `abort_code = "HARNESS_MANIFEST_DRIFT"`，不執行本側。另重算本側 `bundle_tree_sha256`／`runtime_tree_sha256`，任一與第 2 步 `trees[label]` 不同 → 同樣 `HARNESS_MANIFEST_DRIFT`、不執行本側（`verify_frozen` 只核對 manifest 宣告的 component，未宣告的旁載檔例如 `bin/version.dll` 只在這裡現形，R3-F2）；本側第 6 步釋放驗證後再重算一次，不同 → `abort_code = "HARNESS_MANIFEST_DRIFT"`（已有 abort_code 時保留原碼並在 notes 加 `"bundle tree changed during side"`），且該側結果不得成為 PASS 依據。
    2. `inst = dut_state.fresh_instance(...)`。
    3. `l2`／`l3`：`run(side.activate_argv, env=inst.env, timeout=600)`，rc≠0 → `abort_code = "HARNESS_SUITE_INFRA_ERROR"`。
    4. `clean = dut_state.verify_clean(...)`；非空 → `HARNESS_DUT_NOT_CLEAN`。
@@ -1402,7 +1408,7 @@ def run_ab(manifest_path: Path, *, out_dir: Path, repo_root: Path, run: Runner =
 6. 每輪兩側完成後產生差分：`l1.5` → `ab_diff.diff_l15(a.report_dir, b.report_dir, registered=…, required_case_ids=…)`（Task 7B）；`l2` → `ab_verdict.compare_l2_reports(a_report, b_report, required_case_ids=…, cases=…, registered_case_changes=…, now=now())`（`a_report`／`b_report` 為各側 `report_dir/testpilot/report.json`）；`l3` → `ab_verdict.compare_l3(a.report_dir/"release-gate.json", b.report_dir/"release-gate.json")`。差分工具丟 `HarnessError` → `INFRA_ERROR`、`HARNESS_COMPARATOR_ERROR`。
 7. `round.verdict, reason, notes = ab_verdict.combine(m.layer, a_status=a.suite.status, b_status=b.suite.status, diff=<第 6 步輸出>, registered=load_registered_changes(repo_root / m.allowed_differences.path))`；`required_case_ids, cases = ab_manifest.required_cases(m, repo_root=repo_root)`；`registered_case_changes` 為 `behavior_changes.yaml` 中 `scope=="both"` 條目的 `case_ids` 展開（case_id → change_id）。
 8. 最終 verdict：所有輪 PASS 才 PASS；否則依 `VERDICT_PRECEDENCE` 取最嚴重者（FAIL 不被 INFRA 遮蔽）。
-9. 寫 `ab-report.json`（`dumps_report`），鍵：`ab_manifest_sha256`、`run_id`、`layer`、`platform`、`stage`、`contract_revision`、`case_list_sha256`、`case_lock_sha256`、`required_case_set`、`case_ids`、`tools`（每項 path 與 sha256／tree_sha256）、`tool_revision`（`git rev-parse HEAD`）、`tools_stage3_tree_sha256`、`dut`（kind、transport、com_pair、image、image_digest、boards）、`authorization`、`endpoint`、`host`（`platform.platform()`、`platform.machine()`、hostname 的 sha256 前 16 hex）、`sides`（每側：`label`、`role`、`release_manifest_sha256`（artifact 身分）、`runtime_digest`、`cli_exe` realpath、`cli_sha256`（實算）、`daemon_exe` realpath、`daemon_sha256`（實算）、`bundle_version`、`daemon_status_version`（suite 期間觀測）、`suite.status`、`suite.rc`、`suite.identity`、`identity_violations`、`clean_violations`、`release.released`、`release.checks`、`cleanup_violations`）、`rounds`、`verdict`、`reason_code`、`started_at`、`finished_at`。鍵名一律 snake_case，報告與測試使用同一鍵 `release_manifest_sha256`。
+9. 寫 `ab-report.json`（`dumps_report`），鍵：`ab_manifest_sha256`、`run_id`、`layer`、`platform`、`stage`、`contract_revision`、`case_list_sha256`、`case_lock_sha256`、`required_case_set`、`case_ids`、`tools`（每項 path 與 sha256／tree_sha256）、`tool_revision`（`git rev-parse HEAD`）、`tools_stage3_tree_sha256`、`dut`（kind、transport、com_pair、image、image_digest、boards）、`authorization`、`endpoint`、`host`（`platform.platform()`、`platform.machine()`、hostname 的 sha256 前 16 hex）、`sides`（每側：`label`、`role`、`release_manifest_sha256`（artifact 身分）、`runtime_digest`、`bundle_tree_sha256`、`runtime_tree_sha256`（第 2 步記錄、第 5.1 步與釋放後皆已核對不變的實際受測內容指紋，R3-F2；Task 14B ingest 以它核對 target）、`cli_exe` realpath、`cli_sha256`（實算）、`daemon_exe` realpath、`daemon_sha256`（實算）、`bundle_version`、`daemon_status_version`（suite 期間觀測）、`suite.status`、`suite.rc`、`suite.identity`、`identity_violations`、`clean_violations`、`release.released`、`release.checks`、`cleanup_violations`）、`rounds`、`verdict`、`reason_code`、`started_at`、`finished_at`。鍵名一律 snake_case，報告與測試使用同一鍵 `release_manifest_sha256`。
 
 **Steps:**
 
@@ -1488,6 +1494,7 @@ def test_release_checked_even_when_suite_raises(tmp_path):
 | `test_reverify_requires_both_rounds_pass` | 第二輪 B functest rc=1 | `res.verdict == "FAIL"` |
 | `test_fail_not_masked_by_infra` | 第一輪 B FAIL、第二輪 ab_diff 丟 `HarnessError` | `res.verdict == "FAIL"` |
 | `test_drift_between_sides_aborts_b` | A 執行期間（`on` effect）改寫 B 的 `bin/serialwrapd` | `reason_code == "HARNESS_MANIFEST_DRIFT"`、無 B functest |
+| `test_sideload_between_sides_aborts_b`（R3-F2） | A 執行期間（`on` effect）在 B 的 bundle 新增未列於 manifest 的 `bin/version.dll`（manifest 不動，`verify_frozen` 仍為 `[]`） | `reason_code == "HARNESS_MANIFEST_DRIFT"`、無 B functest、`verdict != "PASS"` |
 | `test_trimmed_case_ids_refused` | `case_ids` 少一個必要案例 | `reason_code == "HARNESS_CASE_SET_INCOMPLETE"`、無任何 functest |
 | `test_l3_od09_not_frozen_refuses_before_a` | `layer="l3"`、acceptance `thresholds.resources.status: deferred` | `reason_code == "HARNESS_OD09_NOT_FROZEN"`、無任何 `activate`／suite 呼叫 |
 | `test_l3_supervisor_present_refused` | `layer="l3"`、`cli:service status` 回已註冊 | `reason_code == "HARNESS_FAILURE_RETENTION_UNVERIFIED"`，A 仍執行停止與釋放驗證 |
@@ -1495,7 +1502,7 @@ def test_release_checked_even_when_suite_raises(tmp_path):
 | `test_suite_rc_unknown_is_infra` | A functest rc=5 | 該側 `suite.status == "INFRA_ERROR"`、最終 `INFRA_ERROR` |
 | `test_out_dir_exists_refused` | 先建立 out 目錄 | `HarnessError.code == "HARNESS_MANIFEST_INVALID"` |
 | `test_side_env_propagated` | — | 所有 side 命令的 `side` 欄位非 None，B 的 `round` 為 `"1"` |
-| `test_report_records_identity` | — | `report["sides"][1]["release_manifest_sha256"] == m.sides[1].release_manifest.sha256`；`cli_sha256`、`daemon_sha256`、`runtime_digest`、`tool_revision`、`tools_stage3_tree_sha256`、`dut.transport` 存在 |
+| `test_report_records_identity` | — | `report["sides"][1]["release_manifest_sha256"] == m.sides[1].release_manifest.sha256`；`cli_sha256`、`daemon_sha256`、`runtime_digest`、`tool_revision`、`tools_stage3_tree_sha256`、`dut.transport` 存在；`report["sides"][1]["bundle_tree_sha256"] == ab_manifest.bundle_tree_sha256(m.sides[1].bundle_dir)`、`report["sides"][1]["runtime_tree_sha256"] == ab_manifest.runtime_tree_sha256(m.sides[1].bundle_dir)`（R3-F2） |
 | `test_keyboard_interrupt_still_releases` | functest 丟 `KeyboardInterrupt` | `pytest.raises(KeyboardInterrupt)`；之後 `ab-report.json` 存在且 verdict `ABORTED`，A 的釋放驗證已執行 |
 
 - [ ] **Step 2：Run** `python3 -m pytest -q tests/test_stage3_ab_runner.py` → Expected: FAIL（`ImportError`）。
@@ -2366,6 +2373,11 @@ class CanaryGate:
     reasons: tuple[str, ...]
     tally: PlatformTally
     policy_sha256: str
+    ledger_through: str | None   # 帳本版本（R3-F1）：傳入 records 中 platform 相符者（不論是否計入）各自時間欄位的最大值——snapshot／submit_result／
+                                 # harvest_anomaly／note／policy_ref 取 t_wall、submit／wal_signal 取 wall_ts、incident_open 取 opened_at、
+                                 # incident_close 取 closed_at、carryover 取 approved_at（結案／人工開案也推進版本）；以 jsonio.parse_iso 比較，
+                                 # 輸出正規化為 UTC "+00:00" ISO 字串（Task 14 以字典序比較）；無紀錄 → None
+    ledger_records: int          # 帳本版本（R3-F1）：platform 相符且以 record_id 去重後的紀錄筆數；帳本只會附加，故兩者單調不減
 def load_records(paths: Sequence[Path]) -> list[dict]       # 合併多個 host 帳本；以 record_id 去重；malformed 行 → HarnessError("HARNESS_LEDGER_CORRUPT")
 def tally(records: Sequence[dict], policy: CanaryPolicy, *, platform: str, artifact_id: str,
           carryovers: Sequence[dict] = ()) -> PlatformTally
@@ -2382,6 +2394,8 @@ def report_md(gates: Sequence[CanaryGate]) -> str
 3. `failing_incidents` 非空 → `FAIL`。
 4. 收集 INCOMPLETE 理由：`open_incidents` 非空（`"open incidents: <ids>"`）；`len(active_days) < quota.active_days`；`submits < quota.submits`；`cycles_total < quota.cycles_total`；任一 `cycles_by_type[t] < cycles_min_per_type[t]`（`f"cycle type {t}: {n}/{min}"`）；理由非空 → `INCOMPLETE`。
 5. 否則 `PASS`。報告另列 `submits_unknown_result`（含子集 `submits_result_evicted`）、`unreferenced`、各類型被上限截掉的數量。
+
+`ledger_through`／`ledger_records` 於上述判定前即計算（含 `POLICY_NOT_FROZEN` 等早退結果），`canary report --out` 的 JSON 必帶這兩鍵。tally 是累計值，**同一 artifact 的最新一份報告才代表目前狀態**：事後出現的未結案事故使新報告退回 `INCOMPLETE`，Task 14 依帳本版本只以最新報告判定 `S3-CANARY-*`／`S3-INCIDENTS-CLOSED`，舊 PASS 隨之失效（§12.2「未結案事故阻擋退役」，R3-F1）。
 
 Linux 與 Windows 各自獨立呼叫；工具不提供跨平台合計（OD-10：不得以 Linux 量掩蓋 Windows）。CLI（Task 17）的 `canary report` 以 `load_policy(path, addenda_path=docs/rust-refactor/owner-decisions-addenda.md)` 載入，decision_ref 不在 addenda 即拒絕。
 
@@ -2437,6 +2451,7 @@ def test_other_artifact_not_merged(tmp_path):
 | `test_open_incident_blocks` | 加一筆 pid 變更快照對 → `INCOMPLETE`，reasons 以 `"open incidents:"` 開頭 |
 | `test_harvest_anomaly_blocks` | 加一筆 `crc_mismatch` 的 `harvest_anomaly` → `INCOMPLETE`（`harvest_integrity` 未結案） |
 | `test_closed_not_product_defect_unblocks` | 上述 pid 事故以 `environment` 結案 → `PASS` |
+| `test_gate_reports_ledger_version` | `synthetic_canary(days=14, …)` 滿額 → `g.ledger_through == max(platform 相符紀錄各自時間欄位)`、`g.ledger_records == len({record_id})`；再附加一筆時間更晚的 pid 變更快照對 → 新 gate `ledger_through` 嚴格變大、`ledger_records` 增加 2、`result == "INCOMPLETE"`；再以 `canary_incidents.close(..., now=<晚於最後快照>)` 結案該事故 → `ledger_through` 等於該 `closed_at`、`ledger_records` 再增加 1（incident_close 紀錄也推進帳本版本）；windows 紀錄不影響 linux 的兩值；`gate([], …)` → `ledger_through is None`、`ledger_records == 0`（R3-F1） |
 | `test_fixed_in_artifact_fails_same_artifact` | 以 `fixed_in_artifact` 結案 → 對該 artifact `FAIL` |
 | `test_safety_violation_fails` | 手動或自動 `safety_violation`（不論是否結案）→ `FAIL` |
 | `test_pre_freeze_records_ignored` | `frozen_at` 設為 `ts(6, 0)`（synthetic 從第 2 天開始）→ 第 2～5 天（4 天）不計、`pre_freeze_ignored > 0`、`active_days` 只有 10 → `INCOMPLETE` |
@@ -2637,6 +2652,9 @@ class EvidenceEntry:
     result: str
     artifact_id: str            # sha256(release-manifest.json bytes)
     runtime_digest: str         # Task 3 runtime_digest(manifest)
+    bundle_tree_sha256: str | None   # 受測 bundle 全樹指紋（R3-F2）：取自產生端報告（有記錄時，ingest 已核對等於 target）或 ingest 當下 target 的同名值；
+                                     # target 未記 tree（非 Stage 3 且未傳 bundle_dir）時為 None
+    runtime_tree_sha256: str | None  # Task 3 runtime_tree_sha256（排除 release-manifest.json／SHA256SUMS 的全部 runtime 檔）；來源規則同上；跨 Stage reuse_of 比對用
     contract_revision: str
     tool_revision: str
     case_list_sha256: str       # cases.lock.json 的 sha256（不適用者為 "0"*64）
@@ -2649,6 +2667,8 @@ class EvidenceEntry:
     xfail_cases: tuple[str, ...]
     reuse_of: str | None
     note: str
+    ledger_through: str | None  # 僅 evidence_kind=="canary-report"：來源報告的 CanaryGate.ledger_through；其他 kind 必為 None（R3-F1）
+    ledger_records: int | None  # 僅 evidence_kind=="canary-report"：來源報告的 CanaryGate.ledger_records；其他 kind 必為 None
 ENV_KEYS: tuple[str, ...] = ("os_build", "cpu", "ram_mb", "filesystem", "av_product", "drivers", "board_firmware", "toolchains")
 def environment_id(env_doc: Mapping[str, Any]) -> str      # 鍵必須恰為 ENV_KEYS；sha256(dumps_compact(env_doc))
 def load_exit_catalog(path: Path = STAGE_EXITS_PATH) -> dict[str, ExitItem]
@@ -2660,12 +2680,19 @@ def set_target(index_path: Path, *, stage: str, platform: str, release_manifest:
     # stage == "3"（受測物即發佈物，R2-F7）：bundle_dir 必填（None → HarnessError("HARNESS_MANIFEST_INVALID", "stage 3 target requires bundle dir")）；
     # release_manifest 的 realpath 必須等於 bundle_dir/"release-manifest.json"（否則 HARNESS_MANIFEST_INVALID）；
     # Task 3 verify_bundle(bundle_dir, manifest_doc, label=platform) 必須為 []（否則 HarnessError("HARNESS_ARTIFACT_MISMATCH", 違規清單)，不寫 target）；
-    # target 另記 "bundle_tree_sha256": Task 3 bundle_tree_sha256(bundle_dir)——Task 16 發佈時以它核對整個 bundle 與最終 archive。
-    # 其他 stage 傳入 bundle_dir 時同樣驗證並記錄，未傳則不記（沿用既有行為）
+    # target 另記 "bundle_tree_sha256": Task 3 bundle_tree_sha256(bundle_dir)——Task 16 發佈時以它核對整個 bundle 與最終 archive——
+    # 與 "runtime_tree_sha256": Task 3 runtime_tree_sha256(bundle_dir)（R3-F2）。
+    # 同一 manifest 不得換內容（R3-F2）：該 (stage, platform) 的 target_history 中任一筆 artifact_id 等於本次、且記有 bundle_tree_sha256
+    # 而與本次重算值不同 → HarnessError("HARNESS_ARTIFACT_MISMATCH", "bundle tree changed under same manifest: <platform>")，不寫 target、
+    # 不附加 history、index 檔位元組不變（verify_bundle 只核對 manifest 宣告的 component，未宣告的旁載檔如 bin/version.dll 不會讓它失敗；
+    # 要換內容必須重建 bundle，manifest 的 created_at 隨之改變而得到新 artifact_id，舊證據依 item_status 第 2 條過期）
+    # 其他 stage 傳入 bundle_dir 時同樣驗證並記錄（含上列同 manifest 換內容拒絕），未傳則不記（沿用既有行為；但其證據之後不能被
+    # Stage 3 以 reuse_of 沿用，因為沒有 runtime_tree_sha256 可比，見 item_status 第 4 條）
 def add_entry(index_path: Path, entry: EvidenceEntry, *, catalog: Mapping[str, ExitItem]) -> None
     # item 不在目錄 → HARNESS_EVIDENCE_UNKNOWN_ITEM；entry_id 重複 → HARNESS_EVIDENCE_DUPLICATE；
     # platform 不屬該 item（item.platform 為單一平台而不同）、或 result ∈ {PASS, XFAIL} 且 files 為空、或 result ∈ {PASS, XFAIL} 且
-    # producer=="manual" 而 item.evidence_kind != "manual-procedure" → HARNESS_EVIDENCE_INGEST_INVALID；只附加
+    # producer=="manual" 而 item.evidence_kind != "manual-procedure"、或 item.evidence_kind=="canary-report" 而 ledger_records 為 None
+    # （PASS 另要求 ledger_through 非 None）、或其他 kind 而 ledger_through／ledger_records 任一非 None → HARNESS_EVIDENCE_INGEST_INVALID；只附加
 def item_status(index: dict, item: ExitItem, *, evidence_root: Path, cases: Mapping[str, dict]) -> tuple[str, list[str]]
     # "SATISFIED" | "MISSING" | "FAIL" | "STALE" | "HASH_MISMATCH" | "NO_TARGET"
 def stage_status(index: dict, stage: str, *, catalog: Mapping[str, ExitItem], evidence_root: Path, cases: Mapping[str, dict]) -> dict
@@ -2678,19 +2705,20 @@ def render_report(index: dict, catalog: Mapping[str, ExitItem], *, evidence_root
 
 `item_status` 規則——對 item 適用的每個平台 P（`platform:"both"` 時為 linux 與 windows 兩者）以 `stage_targets[item.stage][P]` 分別判定，再合併：
 1. 無該平台 target → `NO_TARGET`。
-2. 取 `item_id` 與 `platform` 皆相符的 entries；`artifact_id`、`contract_revision`、`tool_revision` 都等於 target，且 `item.required_case_set` 非 null 時 `case_list_sha256` 也等於 target 者為「有效集合」，其他為過期（§0.3、§11.6：契約、artifact、工具或案例清單改變後不得沿用舊 PASS）。
+2. 取 `item_id` 與 `platform` 皆相符的 entries；`artifact_id`、`contract_revision`、`tool_revision` 都等於 target，且 `item.required_case_set` 非 null 時 `case_list_sha256` 也等於 target，且 **target 記有 `bundle_tree_sha256` 時 entry 的 `bundle_tree_sha256` 與 `runtime_tree_sha256` 皆非 None 並分別等於 target 的同名值**（R3-F2：manifest 不變而 bundle 內容改變——例如新增未宣告的旁載檔 `bin/version.dll`——時 `artifact_id` 不變，只有內容指紋能讓舊證據過期）者為「有效集合」，其他為過期（§0.3、§11.6：契約、artifact、受測內容、工具或案例清單改變後不得沿用舊 PASS）；因內容指紋過期者 reasons 加 `"bundle tree differs from target: <entry_id>"`。
 3. 有效集合中有 `FAIL` → `FAIL`（同一 artifact 的 FAIL 不被後來的 PASS 抵銷；不得挑選最好一輪）。
-4. 有效集合中存在 `PASS`，或 `XFAIL` 且每個 `xfail_cases` 在 `cases` 中為 `expected: "XFAIL"`、`sentinel` 非 null 且 `sentinel.expires > entry.produced_at`（§11.4：明確 issue、固定特徵、核准期限）→ 再驗：`files` 為空 → `MISSING`；逐一比對 `evidence_root / files[].path` 的 sha256，缺檔或不符 → `HASH_MISMATCH`；`reuse_of` 非 None 時，被引用 entry 必須存在、本身依本規則（遞迴，以已走訪集合偵測循環）為 `PASS` 且檔案驗證通過，且與本 entry 的 `runtime_digest`、`contract_revision`、`tool_revision`、`case_list_sha256`、`workload_sha256`、`environment_id` 全等（比對 `runtime_digest` 而非 `artifact_id`：Stage 3 bundle 的 manifest 因 `stage`／`retirement`／`created_at` 必然與 2.4 不同，但受測 binary 相同時可沿用，§11.6 末段），否則 `STALE`（reasons 說明：`reused entry missing`／`reused entry not PASS`／`reuse cycle`／`reuse identity differs: <field>`）；通過 → `SATISFIED`，`satisfying_entries` 記下該 entry_id。
+3a. **累計型證據只看目前狀態（R3-F1，§12.2「未結案事故阻擋退役」）**：`item.evidence_kind == "canary-report"`（`S3-CANARY-*`、`S3-INCIDENTS-CLOSED`）時，Canary tally 對同一 artifact 是累計的，後出現的未結案事故會讓新報告退為 `INSUFFICIENT` 而不是 `FAIL`；因此步驟 4、5 的「有效集合」改為只含**目前報告**一筆：有效集合中以 `(ledger_through or "", ledger_records, produced_at, entry_id)` 最大者（先依帳本版本，不依匯入時間；同版本時後匯入者為準）。較早的 PASS 不再計入；目前報告非 PASS 而有效集合中有較早 PASS 時，reasons 加 `"superseded: latest canary report <目前 entry_id> is <result>; earlier PASS <entry_id,…> no longer current"`，且 `satisfying_entries` 為空。其他 kind 維持「有效集合中存在 PASS」（後續 SKIP／INSUFFICIENT 不撤銷已驗證的獨立一輪；`test_non_cumulative_pass_not_superseded` 釘住此範圍）。
+4. 有效集合（canary-report 項目為步驟 3a 的目前報告）中存在 `PASS`，或 `XFAIL` 且每個 `xfail_cases` 在 `cases` 中為 `expected: "XFAIL"`、`sentinel` 非 null 且 `sentinel.expires > entry.produced_at`（§11.4：明確 issue、固定特徵、核准期限）→ 再驗：`files` 為空 → `MISSING`；逐一比對 `evidence_root / files[].path` 的 sha256，缺檔或不符 → `HASH_MISMATCH`；`reuse_of` 非 None 時，被引用 entry 必須存在、本身依本規則（遞迴，以已走訪集合偵測循環）為 `PASS` 且檔案驗證通過，且與本 entry 的 `runtime_digest`、`runtime_tree_sha256`、`contract_revision`、`tool_revision`、`case_list_sha256`、`workload_sha256`、`environment_id` 全等（比對 `runtime_digest`＋`runtime_tree_sha256` 而非 `artifact_id`：Stage 3 bundle 的 manifest 因 `stage`／`retirement`／`created_at` 必然與 2.4 不同，但受測 binary 與全部 runtime 檔案相同時可沿用，§11.6 末段「受測 binary、設定…須一致」；`runtime_digest` 只雜湊 manifest 宣告值，未宣告的旁載檔只有 `runtime_tree_sha256` 守得住，R3-F2。任一方 `runtime_tree_sha256` 為 None 一律視為不等，reasons 為 `reuse identity differs: runtime_tree_sha256`），否則 `STALE`（reasons 說明：`reused entry missing`／`reused entry not PASS`／`reuse cycle`／`reuse identity differs: <field>`）；通過 → `SATISFIED`，`satisfying_entries` 記下該 entry_id。
 5. 有效集合僅有 `SKIP`／`INFRA_ERROR`／`INSUFFICIENT`／`XPASS`，或 XFAIL 不符條件 → `MISSING`（reasons 列出結果）；只有過期 entries → `STALE`；完全沒有 → `MISSING`。
 6. 合併：任一平台 `FAIL` → `FAIL`；全部 `SATISFIED` → `SATISFIED`；否則依 `HASH_MISMATCH` > `STALE` > `NO_TARGET` > `MISSING` 取最嚴重者；reasons 以 `"<platform>: "` 為前綴。
 
 `stage_status.result`：任一 item `FAIL` → `FAIL`；全部 `SATISFIED` → `PASS`；其他 → `BLOCKED`。`satisfying_entries` 供擁有者把 `behavior_changes.yaml`／`error_codes.yaml` 的對應項目由 `IMPLEMENTED` 改為 `VERIFIED` 時引用（§0.3 生命週期；狀態變更本身屬擁有者步驟，見 Task 17 `evidence-index.md`）。
 
-**`tests/fakes_evidence.py`：** `evidence_index(root, *, stage, artifact_manifest: Path | None = None, contract, tool="t"*40, case_list="0"*64, platforms=("linux","windows")) -> Path`（建 index.json、`evidence/` 目錄，並為每個平台以 `make_bundle(target=…)` 建出不同的 manifest 後設定 target；`stage=="3"` 時同時傳 `bundle_dir=<該 bundle 目錄>`）；`entry(root, item_id, result, *, platform, n=0, files=None, **over) -> EvidenceEntry`（預設 artifact／runtime_digest／contract／tool／case_list 取自該平台 target；`files=None` 時在 `root/evidence/<item>-<platform>-<n>.json` 寫一個 stub 報告並記錄真實 sha256；`environment_id=environment_id(固定 env_doc)`、`produced_at=ts(10+n,0)`、`producer="ingest:test"`）。
+**`tests/fakes_evidence.py`：** `evidence_index(root, *, stage, artifact_manifest: Path | None = None, contract, tool="t"*40, case_list="0"*64, platforms=("linux","windows")) -> Path`（建 index.json、`evidence/` 目錄，並為每個平台以 `make_bundle(target=…)` 建出不同的 manifest 後設定 target；bundle 固定位於 `root/"bundles"/<platform>`；`set_target` 一律以 `now="2026-10-31T00:00:00+00:00"`（早於任何 `fakes.ts(...)`，使既有 fixture 報告不觸發 Task 14B「報告不得早於 target 內容生效」規則）；`stage=="3"` 時同時傳 `bundle_dir=<該 bundle 目錄>`）；`entry(root, item_id, result, *, platform, n=0, files=None, **over) -> EvidenceEntry`（預設 artifact／runtime_digest／bundle_tree_sha256／runtime_tree_sha256／contract／tool／case_list 取自該平台 target（target 未記 tree 時兩個 tree 欄位為 None）；`files=None` 時在 `root/evidence/<item>-<platform>-<n>.json` 寫一個 stub 報告並記錄真實 sha256；`environment_id=environment_id(固定 env_doc)`、`produced_at=ts(10+n,0)`、`producer="ingest:test"`；item 的 `evidence_kind=="canary-report"` 時預設 `ledger_through=ts(10+n,0)`、`ledger_records=100+n`，其他 kind 兩者為 None，皆可由 `**over` 覆寫）。
 
 **Steps:**
 
-- [ ] **Step 1：寫失敗測試**（luna）`tests/test_stage3_evidence_index.py`（`pytestmark = [core_portable, memory_only]`），關鍵測試：
+- [ ] **Step 1：寫失敗測試**（luna）`tests/test_stage3_evidence_index.py`（`pytestmark = [core_portable, memory_only]`；import `fakes`（`ts`）、`fakes_evidence`），關鍵測試：
 
 ```python
 def _status(idx, root, cat, item_id, cases=None):
@@ -2720,10 +2748,88 @@ def test_contract_change_makes_pass_stale(tmp_path):
     evidence_index.add_entry(idx, fakes_evidence.entry(tmp_path, "S3-ROLLBACK-LINUX", "PASS", platform="linux", contract_revision="c" * 40),
                              catalog=cat)
     assert _status(idx, tmp_path, cat, "S3-ROLLBACK-LINUX")[0] == "STALE"
+
+
+def test_newer_canary_report_revokes_earlier_pass(tmp_path):                 # R3-F1：PASS→新事故→INSUFFICIENT 必須撤銷
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
+    cat = evidence_index.load_exit_catalog()
+    old = fakes_evidence.entry(tmp_path, "S3-CANARY-LINUX", "PASS", platform="linux", n=1,
+                               ledger_through=fakes.ts(20, 0), ledger_records=5000)
+    evidence_index.add_entry(idx, old, catalog=cat)
+    assert _status(idx, tmp_path, cat, "S3-CANARY-LINUX")[0] == "SATISFIED"
+    new = fakes_evidence.entry(tmp_path, "S3-CANARY-LINUX", "INSUFFICIENT", platform="linux", n=2,
+                               ledger_through=fakes.ts(21, 0), ledger_records=5002)   # 帳本新增 pid 變更快照對 → open incident
+    evidence_index.add_entry(idx, new, catalog=cat)
+    status, reasons = _status(idx, tmp_path, cat, "S3-CANARY-LINUX")
+    assert status == "MISSING"
+    assert any(r.startswith(f"linux: superseded: latest canary report {new.entry_id} is INSUFFICIENT") and old.entry_id in r
+               for r in reasons)
+    st = evidence_index.stage_status(evidence_index.load_index(idx), "3", catalog=cat, evidence_root=tmp_path, cases={})
+    assert st["items"]["S3-CANARY-LINUX"]["status"] == "MISSING"
+    assert st["items"]["S3-CANARY-LINUX"]["satisfying_entries"] == []
+    assert st["result"] == "BLOCKED"
+    closed = fakes_evidence.entry(tmp_path, "S3-CANARY-LINUX", "PASS", platform="linux", n=3,
+                                  ledger_through=fakes.ts(22, 0), ledger_records=5003)  # 事故結案後的新報告
+    evidence_index.add_entry(idx, closed, catalog=cat)
+    st = evidence_index.stage_status(evidence_index.load_index(idx), "3", catalog=cat, evidence_root=tmp_path, cases={})
+    assert st["items"]["S3-CANARY-LINUX"]["status"] == "SATISFIED"
+    assert st["items"]["S3-CANARY-LINUX"]["satisfying_entries"] == [closed.entry_id]
+
+
+def test_canary_current_report_ordered_by_ledger_not_ingest_time(tmp_path):  # R3-F1：重新匯入舊 PASS 報告不得復活
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
+    cat = evidence_index.load_exit_catalog()
+    evidence_index.add_entry(idx, fakes_evidence.entry(tmp_path, "S3-INCIDENTS-CLOSED", "INSUFFICIENT", platform="linux", n=1,
+                                                       ledger_through=fakes.ts(21, 0), ledger_records=5002), catalog=cat)
+    evidence_index.add_entry(idx, fakes_evidence.entry(tmp_path, "S3-INCIDENTS-CLOSED", "PASS", platform="linux", n=5,   # 匯入較晚
+                                                       ledger_through=fakes.ts(20, 0), ledger_records=5000), catalog=cat)
+    evidence_index.add_entry(idx, fakes_evidence.entry(tmp_path, "S3-INCIDENTS-CLOSED", "PASS", platform="windows"), catalog=cat)
+    status, reasons = _status(idx, tmp_path, cat, "S3-INCIDENTS-CLOSED")
+    assert status == "MISSING"
+    assert any(r.startswith("linux: superseded: latest canary report ") for r in reasons)
+    assert not any(r.startswith("windows: ") for r in reasons)
+
+
+def test_sideloaded_file_retarget_cannot_reuse_pass(tmp_path):              # R3-F2：受測後加旁載檔再重設 target，舊 PASS 不得沿用
+    # 需 from tools.stage3 import ab_manifest；from tools.stage3.reason_codes import HarnessError
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
+    cat = evidence_index.load_exit_catalog()
+    b = tmp_path / "bundles" / "linux"
+    doc = json.loads((b / "release-manifest.json").read_text(encoding="utf-8"))
+    old = fakes_evidence.entry(tmp_path, "S3-ROLLBACK-LINUX", "PASS", platform="linux", n=1)
+    tgt0 = evidence_index.load_index(idx)["stage_targets"]["3"]["linux"]
+    assert old.bundle_tree_sha256 == tgt0["bundle_tree_sha256"] == ab_manifest.bundle_tree_sha256(b)
+    assert old.runtime_tree_sha256 == tgt0["runtime_tree_sha256"] == ab_manifest.runtime_tree_sha256(b)
+    evidence_index.add_entry(idx, old, catalog=cat)
+    assert _status(idx, tmp_path, cat, "S3-ROLLBACK-LINUX")[0] == "SATISFIED"
+    (b / "bin" / "version.dll").write_bytes(b"MZ")                          # 未列於 manifest 的旁載檔
+    assert ab_manifest.verify_bundle(b, doc, label="linux") == []           # 只看宣告 component：照樣通過
+    before = idx.read_bytes()
+    with pytest.raises(HarnessError) as ei:                                 # 同一 manifest、不同 tree → 拒絕重設
+        evidence_index.set_target(idx, stage="3", platform="linux", release_manifest=b / "release-manifest.json",
+                                  contract_revision="c" * 40, tool_revision="t" * 40, case_list_sha256="0" * 64,
+                                  set_by="t", now=fakes.ts(30, 0), bundle_dir=b)
+    assert ei.value.code == "HARNESS_ARTIFACT_MISMATCH"
+    assert "bundle tree changed under same manifest: linux" in str(ei.value)
+    assert idx.read_bytes() == before
+    # 即使拒絕被繞過（直接改寫 index 把 target 的 tree 換成新值），舊 PASS 也因內容指紋不符而過期
+    raw = json.loads(idx.read_text(encoding="utf-8"))
+    raw["stage_targets"]["3"]["linux"]["bundle_tree_sha256"] = ab_manifest.bundle_tree_sha256(b)
+    raw["stage_targets"]["3"]["linux"]["runtime_tree_sha256"] = ab_manifest.runtime_tree_sha256(b)
+    idx.write_text(json.dumps(raw), encoding="utf-8")
+    status, reasons = _status(idx, tmp_path, cat, "S3-ROLLBACK-LINUX")
+    assert status == "STALE"
+    assert f"linux: bundle tree differs from target: {old.entry_id}" in reasons
+    st = evidence_index.stage_status(evidence_index.load_index(idx), "3", catalog=cat, evidence_root=tmp_path, cases={})
+    assert st["items"]["S3-ROLLBACK-LINUX"]["satisfying_entries"] == []
+    assert st["result"] != "PASS"
 ```
 
 | 測試名 | 斷言 |
 |---|---|
+| `test_non_cumulative_pass_not_superseded` | 範圍釘住（R3-F1 只改累計型）：`S3-ROLLBACK-LINUX`（`drill-report`）先 PASS（n=1）後 INSUFFICIENT（n=2）→ 仍 `SATISFIED`、`satisfying_entries` 為 n=1 的 entry_id |
+| `test_canary_entry_requires_ledger_version` | `S3-CANARY-LINUX` 的 PASS entry `ledger_through=None` 或 `ledger_records=None` → `HARNESS_EVIDENCE_INGEST_INVALID`；`S3-ROLLBACK-LINUX` 的 entry 帶 `ledger_records=1` → 同上；index 檔位元組不變 |
+| `test_canary_fail_still_sticky_under_latest_rule` | `S3-CANARY-WINDOWS` 先 FAIL（`ledger_records=10`）後 PASS（`ledger_records=20`、`ledger_through` 較晚）→ `FAIL`（步驟 3 先於 3a） |
 | `test_unknown_item_rejected` | `add_entry` item `S9-X` → `HARNESS_EVIDENCE_UNKNOWN_ITEM` |
 | `test_duplicate_entry_rejected` | 同 entry 加兩次 → `HARNESS_EVIDENCE_DUPLICATE` |
 | `test_pass_without_files_rejected` | `files=()` 的 PASS → `HARNESS_EVIDENCE_INGEST_INVALID` |
@@ -2734,13 +2840,16 @@ def test_contract_change_makes_pass_stale(tmp_path):
 | `test_case_list_change_stale` | `S3-L2-FULL-AB-LINUX` 的 entry `case_list_sha256` 與 target 不同 → `STALE` |
 | `test_xfail_requires_unexpired_sentinel` | `cases` 該案 `expected:"XFAIL"`、sentinel `expires` 晚於 produced_at → `SATISFIED`；過期 → `MISSING`；`expected:"PASS"` 的案例（例如目前的 f4）→ `MISSING` |
 | `test_hash_mismatch_detected` | `evidence_root` 中檔案被改 → `HASH_MISMATCH`；檔案被刪 → `HASH_MISMATCH` |
-| `test_reuse_by_runtime_digest` | S3 longrun entry `reuse_of` 一筆 S24 entry：兩者 `artifact_id` 不同但 `runtime_digest` 等其餘欄位全同、S24 entry 檔案完整 → `SATISFIED`；`workload_sha256` 不同 → `STALE` |
+| `test_reuse_by_runtime_digest` | S3 longrun entry `reuse_of` 一筆 S24 entry：兩者 `artifact_id` 不同但 `runtime_digest`、`runtime_tree_sha256` 等其餘欄位全同（S24 entry 以 `runtime_tree_sha256=<S3 target 的 runtime_tree_sha256>` 覆寫）、S24 entry 檔案完整 → `SATISFIED`；`workload_sha256` 不同 → `STALE` |
+| `test_reuse_requires_runtime_tree_match`（R3-F2） | 同上組態，但 S24 entry 的 `runtime_tree_sha256` 為「同一 bundle 多一個 `bin/version.dll`」重算的值（`runtime_digest` 仍相同）→ `STALE`，reasons 含 `"linux: reuse identity differs: runtime_tree_sha256"`；S24 entry `runtime_tree_sha256=None`（S24 target 未傳 bundle_dir）→ 同樣 `STALE` 與同一 reason |
+| `test_entry_tree_none_against_tree_target_stale`（R3-F2） | Stage 3 target 記有 tree，entry 以 `bundle_tree_sha256=None, runtime_tree_sha256=None` 覆寫的 PASS → `STALE`；僅 `runtime_tree_sha256` 不同 → `STALE`；非 Stage 3 且未傳 bundle_dir 的 target（無 tree）下兩欄為 None 的 PASS → `SATISFIED`（既有行為不變） |
 | `test_reuse_of_failed_or_missing_entry_stale` | 被引用 entry 為 FAIL、不存在、或其檔案被刪 → `STALE` |
 | `test_reuse_cycle_stale` | A `reuse_of` B、B `reuse_of` A → `STALE`（reasons 含 `reuse cycle`） |
 | `test_stage_blocked_until_all_items` | Stage 3 只有部分 SATISFIED → `result == "BLOCKED"` |
 | `test_stage_status_lists_satisfying_entries` | SATISFIED 項的 `satisfying_entries` 含對應 entry_id |
 | `test_set_target_per_platform_appends_history` | linux、windows 各設一次、linux 再設一次 → `target_history` 長 3、`stage_targets["3"]["linux"]` 為最後一次、`["windows"]` 不受影響 |
-| `test_set_target_stage3_records_bundle_tree` | `make_bundle(stage="3")` 後 `set_target(stage="3", bundle_dir=b, release_manifest=b/"release-manifest.json")` → `stage_targets["3"]["linux"]["bundle_tree_sha256"] == ab_manifest.bundle_tree_sha256(b)`（Task 3 實作，非替身） |
+| `test_set_target_stage3_records_bundle_tree` | `make_bundle(stage="3")` 後 `set_target(stage="3", bundle_dir=b, release_manifest=b/"release-manifest.json")` → `stage_targets["3"]["linux"]["bundle_tree_sha256"] == ab_manifest.bundle_tree_sha256(b)`、`["runtime_tree_sha256"] == ab_manifest.runtime_tree_sha256(b)`（Task 3 實作，非替身）；同一未變動 bundle 再設一次 → 接受（`target_history` 加一筆、tree 相同） |
+| `test_set_target_same_manifest_new_tree_refused`（R3-F2） | `stage="2.4"`、傳 `bundle_dir` 設一次後，在 bundle 新增 `assets/extra.txt`（manifest 不動）再設一次 → `HarnessError`，`code == "HARNESS_ARTIFACT_MISMATCH"`、detail 含 `"bundle tree changed under same manifest: linux"`；index 檔位元組不變（Stage 3 情境由 `test_sideloaded_file_retarget_cannot_reuse_pass` 釘住） |
 | `test_set_target_stage3_requires_bundle_dir` | `stage="3"`、`bundle_dir=None` → `HarnessError`，`code == "HARNESS_MANIFEST_INVALID"`；index 檔位元組不變 |
 | `test_set_target_stage3_refuses_drifted_bundle` | 建 bundle 後改寫 `bin/serialwrapd`（manifest 不動）→ `HarnessError`，`code == "HARNESS_ARTIFACT_MISMATCH"`、detail 含 `"release component sha256 mismatch: linux daemon.launcher"`；index 檔位元組不變 |
 | `test_set_target_stage3_manifest_outside_bundle` | `release_manifest` 指向 bundle 外的同內容複本 → `HarnessError`，`code == "HARNESS_MANIFEST_INVALID"` |
@@ -2783,9 +2892,13 @@ class Derived:
     tool_revision: str | None
     case_list_sha256: str | None
     workload_sha256: str | None
+    bundle_tree_sha256: str | None  # 產生端報告記錄的實際受測內容指紋（R3-F2）：ab-report 取 B 側 sides[1].bundle_tree_sha256（必填，缺 → INGEST_INVALID）；
+    runtime_tree_sha256: str | None #   其他 kind 的報告不記錄受測 bundle 目錄，兩者為 None（改由下方 ingest 的「報告不得早於 target 內容生效」規則守住）
     xfail_cases: tuple[str, ...]
     started_at: str
     files: tuple[Path, ...]         # 需要複製的檔案（報告目錄時為整棵樹）
+    ledger_through: str | None      # 僅 canary-report：報告的 ledger_through（鍵缺漏 → HARNESS_EVIDENCE_INGEST_INVALID）；其他 kind None
+    ledger_records: int | None      # 僅 canary-report：報告的 ledger_records（鍵缺漏或非 int → 同上）；其他 kind None
     note: str
 def derive(kind: str, report: Path, *, item: ExitItem, cases: Mapping[str, dict], lock: Mapping[str, Any],
            release_manifest: Path | None) -> Derived
@@ -2803,13 +2916,13 @@ def ingest(index_path: Path, *, kind: str, item_id: str, platform: str, report: 
 | `bridge-selftest` | P2 bridge 自測報告 | 自測報告 `qualified is True` → PASS；否則 FAIL |
 | `regression-report`／`realhw-report` | TestPilot／realhw `report.json` | 以 Task 7 `compare_l2_reports` 的單側完整性規則（缺項、重複、未知 verdict、必要 SKIP → INSUFFICIENT）；B 側邏輯判 FAIL／XFAIL；全部必要案例 PASS（或核准 XFAIL）→ PASS |
 | `gate-report` | P2 `release-gate.json` | baseline 模式：`baseline_result`（PASS／FAIL／INSUFFICIENT_EVIDENCE→INSUFFICIENT）；candidate 模式：`release_gate_result`（PASS→PASS、FAIL→FAIL、INSUFFICIENT_EVIDENCE／BLOCKED→INSUFFICIENT）；`engine_result.verdict=="FAIL"` 一律 FAIL；artifact 由 `--release-manifest` 提供，且其 `components.cli.sha256` 必須等於 `run.cli_identity.sha256` |
-| `ab-report` | Task 6 `ab-report.json` | `verdict` PASS→PASS、FAIL→FAIL、其他→INFRA_ERROR；artifact＝B 側 `release_manifest_sha256`；`layer` 必須對應 item.layer、`platform` 相符 |
-| `canary-report` | `canary report` JSON | `S3-CANARY-*`：PASS→PASS、FAIL→FAIL、其他→INSUFFICIENT；`S3-INCIDENTS-CLOSED`：`tally.open_incidents==[]` 且 `tally.failing_incidents==[]` 且 `result ∉ {POLICY_NOT_FROZEN, POLICY_CHANGED}` → PASS，有 failing → FAIL，否則 INSUFFICIENT |
+| `ab-report` | Task 6 `ab-report.json` | `verdict` PASS→PASS、FAIL→FAIL、其他→INFRA_ERROR；artifact＝B 側 `release_manifest_sha256`；`bundle_tree_sha256`／`runtime_tree_sha256`＝B 側同名欄位（R3-F2，缺 → INGEST_INVALID）；`layer` 必須對應 item.layer、`platform` 相符 |
+| `canary-report` | `canary report` JSON | `S3-CANARY-*`：PASS→PASS、FAIL→FAIL、其他→INSUFFICIENT；`S3-INCIDENTS-CLOSED`：`tally.open_incidents==[]` 且 `tally.failing_incidents==[]` 且 `result ∉ {POLICY_NOT_FROZEN, POLICY_CHANGED}` → PASS，有 failing → FAIL，否則 INSUFFICIENT。報告必帶 `ledger_through`／`ledger_records`（Task 12 帳本版本），原樣寫入 `Derived` 與 entry；`Derived.started_at`＝`tally.first_counted_wall`（None 時改用 `ledger_through`，兩者皆 None → INGEST_INVALID），供下方「報告不得早於 target 內容生效」規則判定（R3-F2：canary 報告不記 bundle tree，只靠此時刻證明計入的紀錄晚於目前 tree 生效）；Task 14 步驟 3a 只以帳本版本最新的報告判定兩類項目，故後續報告的 INSUFFICIENT 會撤銷先前 PASS（R3-F1） |
 | `drill-report` | Task 13 `drill-report.json` | PASS→PASS、FAIL→FAIL、PRECONDITION_FAILED／INCOMPLETE→INSUFFICIENT；artifact＝報告記錄的 current bundle manifest sha256 |
 | `od09-freeze` | Task 15 freeze 輸出 | 三個延後項皆 `frozen` 且 `check_frozen_before(acceptance, 最早 candidate_longrun entry 的 started_at)` 為空 → PASS；否則 FAIL |
 | `manual-procedure` | 程序紀錄 JSON `{procedure_path, procedure_sha256, result, executed_by, executed_at, artifacts:[…]}` | 原樣取 `result`，但 `procedure_sha256` 必須等於現行程序檔 sha256；只允許 `evidence_kind=="manual-procedure"` 的項目 |
 
-`ingest` 流程：`kind` 必須等於 `item.evidence_kind`；`platform` 必須屬於該 item；取 `stage_targets[item.stage][platform]`（無 → `HARNESS_EVIDENCE_INGEST_INVALID "no target"`）；`Derived.artifact_id`、`contract_revision`、`tool_revision`、`case_list_sha256`（有記錄時）任一與 target 不同 → `HARNESS_EVIDENCE_INGEST_INVALID`（列出欄位）；`environment` 為 `ENV_KEYS` JSON，計算 `environment_id`；把 `Derived.files` 複製到 `evidence_root/<item_id>/<platform>/<now 去冒號>/`（保留相對結構，複製後重算 sha256）；組 `EvidenceEntry(producer=f"ingest:{kind}", runtime_digest=target.runtime_digest, …)` 後呼叫 `add_entry`。
+`ingest` 流程：`kind` 必須等於 `item.evidence_kind`；`platform` 必須屬於該 item；取 `stage_targets[item.stage][platform]`（無 → `HARNESS_EVIDENCE_INGEST_INVALID "no target"`）；`Derived.artifact_id`、`contract_revision`、`tool_revision`、`case_list_sha256`（有記錄時）任一與 target 不同 → `HARNESS_EVIDENCE_INGEST_INVALID`（列出欄位）；**受測內容指紋（R3-F2）**：target 記有 `bundle_tree_sha256` 時——(a) `Derived.bundle_tree_sha256`／`runtime_tree_sha256` 非 None 者必須等於 target 同名值（否則 `HARNESS_EVIDENCE_INGEST_INVALID`，列出欄位）；(b) 兩者為 None（報告未記錄受測 bundle）時，`Derived.started_at` 必須不早於 target 內容生效時刻＝自 `target_history` 尾端往前、與目前 target 的 `artifact_id` 及 `bundle_tree_sha256` 皆相同的連續紀錄中最早的 `set_at`（否則 `HARNESS_EVIDENCE_INGEST_INVALID "report predates target bundle tree"`：target 設定前產生的報告無法證明受測的是此 tree）；entry 的 `bundle_tree_sha256`／`runtime_tree_sha256` 取 target 同名值（target 未記 tree 時為 None）。`reuse_of` 非 None 時（Stage 3 沿用 2.4 長跑），報告屬於被引用 entry 的 artifact，`artifact_id` 與 (a) 改對**被引用 entry**核對（`Derived.artifact_id`、`bundle_tree_sha256`、`runtime_tree_sha256` 有記錄時須等於被引用 entry 的同名值，否則 INGEST_INVALID），(b) 不適用，新 entry 的 artifact／tree 欄位仍取目前 target，沿用是否成立由 Task 14 item_status 第 4 條以 `runtime_digest`＋`runtime_tree_sha256` 判定；`environment` 為 `ENV_KEYS` JSON，計算 `environment_id`；把 `Derived.files` 複製到 `evidence_root/<item_id>/<platform>/<now 去冒號>/`（保留相對結構，複製後重算 sha256）；組 `EvidenceEntry(producer=f"ingest:{kind}", runtime_digest=target.runtime_digest, ledger_through=Derived.ledger_through, ledger_records=Derived.ledger_records, …)` 後呼叫 `add_entry`。**canary-report 防回放（R3-F1）**：複製檔案前，若同 `item_id`／`platform` 的有效集合（Task 14 步驟 2）已有 entry 的 `(ledger_through or "", ledger_records)` 大於本報告者 → `HARNESS_EVIDENCE_INGEST_INVALID "canary report older than ingested <entry_id>"`，index 與 `evidence_root` 皆不變（舊報告不得被重新匯入以覆蓋目前狀態；即使繞過 ingest 直接 `add_entry`，Task 14 步驟 3a 依帳本版本排序仍不讓它成為目前報告）。
 
 **Steps:**
 
@@ -2820,9 +2933,15 @@ def ingest(index_path: Path, *, kind: str, item_id: str, platform: str, report: 
 | `test_ab_report_pass_ingested_and_copied` | 合法 `ab-report.json`（B 側 artifact＝linux target）→ entry `result=="PASS"`、`producer=="ingest:ab-report"`、檔案已複製到 `evidence_root` 且 sha 相符；`item_status` 為 `SATISFIED` |
 | `test_ab_report_artifact_mismatch_rejected` | B 側 `release_manifest_sha256` ≠ target → `HARNESS_EVIDENCE_INGEST_INVALID` |
 | `test_ab_report_tool_revision_mismatch_rejected` | `tool_revision` ≠ target → 同上 |
+| `test_ab_report_bundle_tree_mismatch_rejected`（R3-F2，failing-first） | Stage 3 linux target 設定後在 bundle 新增 `bin/version.dll`；A/B 報告 B 側 `release_manifest_sha256`＝target（manifest 未變）但 `bundle_tree_sha256`／`runtime_tree_sha256` 為含旁載檔的重算值 → `HARNESS_EVIDENCE_INGEST_INVALID`，detail 含 `bundle_tree_sha256` 與 `runtime_tree_sha256`；index.json 位元組與 `evidence_root` 檔案清單皆不變。B 側缺 `bundle_tree_sha256` 鍵 → 同碼 |
+| `test_ingest_entry_records_target_tree`（R3-F2） | 合法 ab-report ingest 後 entry `bundle_tree_sha256 == target["bundle_tree_sha256"]`、`runtime_tree_sha256 == target["runtime_tree_sha256"]`；`drill-report`（報告不記 tree）ingest 後 entry 兩欄同樣等於 target 值 |
+| `test_report_predating_target_tree_rejected`（R3-F2） | `drill-report` 的 `started_at` 早於目前 Stage 3 linux target 內容生效時刻（`target_history` 尾端同 artifact／同 tree 連續紀錄最早的 `set_at`）→ `HARNESS_EVIDENCE_INGEST_INVALID "report predates target bundle tree"`；同一 bundle 未變而再 `set_target` 一次（history 多一筆、tree 相同）後，`started_at` 介於兩次 `set_at` 之間的報告仍被接受 |
 | `test_kind_must_match_item` | `kind="ab-report"` 用於 `S3-ROLLBACK-LINUX` → 同上 |
 | `test_canary_incomplete_is_insufficient` | `result=="INCOMPLETE"` → entry `INSUFFICIENT` |
 | `test_incidents_closed_from_canary_report` | `open_incidents==[]`、`failing_incidents==[]` → `S3-INCIDENTS-CLOSED` 的 entry PASS |
+| `test_canary_new_incident_after_pass_blocks_stage3` | **整合（R3-F1，failing-first）**：Stage 3 兩平台 target；除 `S3-CANARY-LINUX`、`S3-INCIDENTS-CLOSED`（linux）外，其餘每個 Stage 3 item（含 `S3-CANARY-WINDOWS` 與 `S3-INCIDENTS-CLOSED` windows）以 `fakes_evidence.entry(..., "PASS")` 登錄。(1) 以 Task 12 真實 `canary_ledger.gate(fakes_canary.synthetic_canary(days=14, submits_per_day=360, cycles=<滿額五類>, platform="linux", artifact=<linux target artifact_id>, …))` 得 `PASS`，序列化為 `canary report --out` JSON（報告 A），對兩項各 `ingest` → entries `PASS`、`ledger_records == g.ledger_records`；`stage_status(…, "3")["result"] == "PASS"`。(2) 於同一 records 附加時間更晚的 pid 變更快照對（非預期重啟 → `unexplained_pid_change` 未結案）重算 gate → `result == "INCOMPLETE"`、`tally.open_incidents` 非空、`ledger_through` 大於報告 A；寫成報告 B 並 ingest 兩項 → 兩筆 entry 皆 `INSUFFICIENT`。(3) `item_status` 兩項皆 `MISSING`，reasons 各含 `"linux: superseded: latest canary report <B 的 entry_id> is INSUFFICIENT"`；`stage_status(…, "3")["result"] == "BLOCKED"`，兩項 `satisfying_entries == []`。(4) 把該事故以 `environment` 結案後重算 gate（`PASS`、`ledger_through` 再增大）寫成報告 C 並 ingest → `stage_status` 回到 `PASS`，`satisfying_entries` 為 C 的 entry_id |
+| `test_canary_older_report_reingest_rejected` | 承上步驟 (2) 之後，再對 `S3-CANARY-LINUX` ingest 報告 A（帳本版本較舊、內容未改）→ `HARNESS_EVIDENCE_INGEST_INVALID`，detail 含 `"canary report older than ingested <B 的 entry_id>"`；index.json 位元組與 `evidence_root` 檔案清單皆不變；`item_status` 仍為 `MISSING` |
+| `test_canary_report_without_ledger_version_rejected` | `canary report` JSON 刪除 `ledger_records` 鍵 → `HARNESS_EVIDENCE_INGEST_INVALID` |
 | `test_drill_incomplete_is_insufficient` | `verdict=="INCOMPLETE"` → `INSUFFICIENT` |
 | `test_gate_report_engine_fail_wins` | `release_gate_result=="PASS"` 但 `engine_result.verdict=="FAIL"` → FAIL |
 | `test_gate_report_cli_identity_checked` | `--release-manifest` 的 cli sha 與 `run.cli_identity.sha256` 不同 → `HARNESS_EVIDENCE_INGEST_INVALID` |
@@ -3042,11 +3161,11 @@ def test_real_p2_acceptance_roundtrip_propose_freeze_check_gate(tmp_path):
 
 **受測物即發佈物**：Stage 3 bundle 在核准前就以最終形狀建置（manifest 只帶靜態標記 `retirement: {"python_daemon": "removed"}`，沒有任何核准或 hash 欄位），以它設定 Stage 3 target、跑完全部 Stage 3 證據；核准只寫進 `packaging/python_daemon_retirement.json`；發佈時以 `retirement verify --mode release --bundle-manifest` 要求所發佈 bundle 的 manifest sha256 等於該平台已記錄的 target，並直接上傳受測 bundle 本身，**不重新建置**（重建會改變 `created_at` 等位元組，使證據失效）。
 
-**manifest 相符不等於內容相符（R2-F7）**：manifest 只是宣告，保留已核准的 manifest、替換 `bin/serialwrapd` 仍會讓「manifest sha256＝target」成立；`runtime_digest` 也只雜湊宣告值。因此發佈邊界必須對**實際位元組**再驗兩層：(1) Task 3 `verify_bundle` 逐一重算 manifest 宣告的 component（CLI、daemon launcher…）；(2) Task 3 `bundle_tree_sha256` 重算整個 bundle 檔案樹，必須等於設定 Stage 3 target 時凍結的 `stage_targets["3"][platform].bundle_tree_sha256`（Task 14 `set_target`）——這一層守住 manifest 只帶 hash、沒有 path 的 `assets`，以及新增的旁載檔（例如 Windows `bin/version.dll`）。打包後再以 `retirement verify-archive` 從**最終 archive 的位元組**解開、重算同兩層，並由同一份已驗證位元組產生 `SHA256SUMS`；release job 只上傳該 archive，避免「驗目錄、傳另一份」的 TOCTOU。
+**manifest 相符不等於內容相符（R2-F7）**：manifest 只是宣告，保留已核准的 manifest、替換 `bin/serialwrapd` 仍會讓「manifest sha256＝target」成立；`runtime_digest` 也只雜湊宣告值。因此發佈邊界必須對**實際位元組**再驗兩層：(1) Task 3 `verify_bundle` 逐一重算 manifest 宣告的 component（CLI、daemon launcher…）；(2) Task 3 `bundle_tree_sha256` 重算整個 bundle 檔案樹，必須等於設定 Stage 3 target 時凍結的 `stage_targets["3"][platform].bundle_tree_sha256`（Task 14 `set_target`）——這一層守住 manifest 只帶 hash、沒有 path 的 `assets`，以及新增的旁載檔（例如 Windows `bin/version.dll`）。target 的 tree 不是唯一防線（R3-F2）：若受測後新增旁載檔、再對同一 manifest 重設 target，發佈時的 tree 比對會對上新凍結值；因此 Task 14 `set_target` 拒絕「同 artifact_id、不同 tree」，且每筆證據自帶受測內容指紋（`bundle_tree_sha256`／`runtime_tree_sha256`，來自產生端報告或 ingest 當下 target），與 target 不符即過期，`stage_status` 不再是 `PASS`，發佈因 `"retirement: stage 3 not PASS: …"` 被拒。打包後再以 `retirement verify-archive` 從**最終 archive 的位元組**解開、重算同兩層，並由同一份已驗證位元組產生 `SHA256SUMS`；release job 只上傳該 archive，避免「驗目錄、傳另一份」的 TOCTOU。
 
 **Files:**
 - Create: `tools/stage3/retirement.py`
-- Create: `tests/fakes_retirement.py`（`retirement_repo(root, *, stage3_result)`：建含證據索引、兩平台 Stage 3 target、`evidence_root` 與 keep 清單目錄的假 repo；`stage3_result ∈ {"PASS","BLOCKED","FAIL"}`；兩平台 bundle 位於 `bundles/<platform>/`，以 `make_bundle(stage="3", target=…)` 建立後再放一個資產檔 `assets/skill/SKILL.md`，**之後**才以 `set_target(…, bundle_dir=bundles/<platform>)` 設 target，使 `bundle_tree_sha256` 涵蓋資產；`approved(repo)` 回傳依索引 target 填好核准欄位的 retirement dict；`bundle_args(repo)` 回傳 `{p: repo/"bundles"/p/"release-manifest.json"}`）
+- Create: `tests/fakes_retirement.py`（`retirement_repo(root, *, stage3_result)`：建含證據索引、兩平台 Stage 3 target、`evidence_root` 與 keep 清單目錄的假 repo；`stage3_result ∈ {"PASS","BLOCKED","FAIL"}`，entries 一律以 `fakes_evidence.entry(repo, …, n=0)` 登錄（canary-report 項目帳本版本因此為 `ts(10,0)`／100，供 `test_release_refused_after_new_canary_incident` 以 n=7 登錄較新報告）；兩平台 bundle 位於 `bundles/<platform>/`，以 `make_bundle(stage="3", target=…)` 建立後再放一個資產檔 `assets/skill/SKILL.md`，**之後**才以 `set_target(…, bundle_dir=bundles/<platform>)` 設 target，使 `bundle_tree_sha256` 涵蓋資產；`approved(repo)` 回傳依索引 target 填好核准欄位的 retirement dict；`bundle_args(repo)` 回傳 `{p: repo/"bundles"/p/"release-manifest.json"}`）
 - Modify: `scripts/rust/mkbundle.sh`（新增 `--stage <s>` 與 `--plan-only`；呼叫 `python3 -m tools.stage3 retirement bundle-plan`）
 - Modify: `contracts/release_manifest.schema.json`（新增選填 `retirement`：`{"python_daemon": const "removed"}`；`stage=="3"` 時必填，且 `components.daemon.implementation=="rust"`、無 `python_cli_delegate`、daemon 無 `entry`／`runtime`／`package`；有 `retirement` 時 `stage` 必須為 `"3"`）
 - Modify: `crates/sw-proto/src/release_manifest.rs`（`python_cli_delegate_entry` 改為 `Option<Vec<String>>`：只有帶退役標記的 manifest 可以缺；新增 `ManifestError::RetirementInconsistent(&'static str)`）、P3 委派路徑（`crates/sw-cli/src/delegate.rs`，`None` 時沿用既有 `INTERNAL_ERROR` 路徑，不新增錯誤碼；Stage 3 CLI 已全原生，正常不會走到）、`crates/sw-cli/src/commands/daemon_cmd.rs`（P4 `locate_daemon_argv`）、`crates/sw-daemon/src/launcher.rs`
@@ -3235,6 +3354,28 @@ def test_release_refuses_added_sideload_file(tmp_path):                       # 
     assert "retirement: bundle tree mismatch: windows" in _release(repo, r)
 
 
+def test_release_refuses_sideload_after_retarget(tmp_path):                   # R3-F2：加旁載檔後重設 target，舊 PASS 不得帶著新 tree 發佈
+    repo = fakes_retirement.retirement_repo(tmp_path, stage3_result="PASS")
+    idx = repo / "docs/rust-refactor/evidence/index.json"
+    bundle = repo / "bundles" / "windows"
+    (bundle / "bin" / "version.dll").write_bytes(b"MZ")
+    before = idx.read_bytes()
+    with pytest.raises(HarnessError) as ei:                                     # 正規路徑：同 manifest 換 tree → set_target 拒絕
+        tgt = evidence_index.load_index(idx)["stage_targets"]["3"]["windows"]
+        evidence_index.set_target(idx, stage="3", platform="windows", release_manifest=bundle / "release-manifest.json",
+                                  contract_revision=tgt["contract_revision"], tool_revision=tgt["tool_revision"],
+                                  case_list_sha256=tgt["case_list_sha256"], set_by="t", now=fakes.ts(30, 0), bundle_dir=bundle)
+    assert ei.value.code == "HARNESS_ARTIFACT_MISMATCH"
+    assert idx.read_bytes() == before
+    doc = json.loads(idx.read_text(encoding="utf-8"))                            # 繞過：直接改寫索引把 target tree 換成新值
+    doc["stage_targets"]["3"]["windows"]["bundle_tree_sha256"] = ab_manifest.bundle_tree_sha256(bundle)
+    doc["stage_targets"]["3"]["windows"]["runtime_tree_sha256"] = ab_manifest.runtime_tree_sha256(bundle)
+    idx.write_text(json.dumps(doc), encoding="utf-8")
+    v = _release(repo, fakes_retirement.approved(repo))                         # 依修改後索引重算 evidence_index_sha256
+    assert "retirement: bundle tree mismatch: windows" not in v                 # tree 比對本身會被新凍結值騙過……
+    assert "retirement: stage 3 not PASS: BLOCKED" in v                         # ……但所有 windows 舊 PASS 已因內容指紋過期
+
+
 def test_release_refuses_target_without_bundle_tree(tmp_path):
     repo = fakes_retirement.retirement_repo(tmp_path, stage3_result="PASS")
     idx = repo / "docs/rust-refactor/evidence/index.json"
@@ -3243,6 +3384,17 @@ def test_release_refuses_target_without_bundle_tree(tmp_path):
     idx.write_text(json.dumps(doc), encoding="utf-8")
     r = fakes_retirement.approved(repo)                                         # 依修改後索引重算 evidence_index_sha256
     assert "retirement: target missing bundle tree: linux" in _release(repo, r)
+
+
+def test_release_refused_after_new_canary_incident(tmp_path):                 # R3-F1：已登錄的 Canary PASS 被新事故報告撤銷
+    repo = fakes_retirement.retirement_repo(tmp_path, stage3_result="PASS")
+    assert _release(repo, fakes_retirement.approved(repo)) == []             # 對照：撤銷前可退役
+    idx = repo / "docs/rust-refactor/evidence/index.json"
+    cat = evidence_index.load_exit_catalog()
+    for item in ("S3-CANARY-WINDOWS", "S3-INCIDENTS-CLOSED"):                # 新報告：open incident → INSUFFICIENT，帳本版本較新
+        evidence_index.add_entry(idx, fakes_evidence.entry(repo, item, "INSUFFICIENT", platform="windows", n=7), catalog=cat)
+    r = fakes_retirement.approved(repo)                                         # 依修改後索引重算 evidence_index_sha256
+    assert "retirement: stage 3 not PASS: BLOCKED" in _release(repo, r)
 
 
 def test_verify_archive_accepts_packed_tested_bundle(tmp_path):
@@ -3338,7 +3490,7 @@ def test_release_workflow_gates_python_artifact_chains():
         assert "SHA256SUMS-" in upload and "SW_STAGE3_BUNDLE_DIR" not in upload   # 只上傳已驗證 archive 與其 SHA256SUMS
 ```
 
-（`fakes_retirement.approved(repo)` 回傳依索引 target 填好核准欄位的 retirement dict；`write_approved(repo)` 另把它寫回 `packaging/python_daemon_retirement.json`；本檔另 import `shutil`、`subprocess`、`sys`、`tarfile`。R2-F7 新增的測試在 Step 2 須全部 FAIL：`verify` 若只比 manifest，`test_release_refuses_*_with_approved_manifest` 與 `test_release_refuses_added_sideload_file` 會因缺少 content／tree 違規而紅燈。）
+（`fakes_retirement.approved(repo)` 回傳依索引 target 填好核准欄位的 retirement dict；`write_approved(repo)` 另把它寫回 `packaging/python_daemon_retirement.json`；本檔另 import `shutil`、`subprocess`、`sys`、`tarfile`，以及 `from tools.stage3 import evidence_index`、`import fakes_evidence`（`test_release_refused_after_new_canary_incident`，R3-F1）。R2-F7 新增的測試在 Step 2 須全部 FAIL：`verify` 若只比 manifest，`test_release_refuses_*_with_approved_manifest` 與 `test_release_refuses_added_sideload_file` 會因缺少 content／tree 違規而紅燈。）
 
 | 測試名 | 斷言 |
 |---|---|
@@ -3460,12 +3612,12 @@ fixtures 檔：`crates/sw-proto/tests/fixtures/stage3_retired_python_daemon.json
 | `canary incident open` | `--ledger-dir DIR --kind K --platform P --artifact-id ID --summary TEXT [--evidence REF ...]` | `open_manual` |
 | `canary incident close` | `--ledger-dir DIR --policy PATH --id ID --resolution R --note TEXT --closed-by TEXT [--issue-ref REF]` | `close` |
 | `canary incident list` | `--ledger LEDGER [...] --policy PATH [--platform P]` | `current_incidents` |
-| `canary report` | `--policy PATH --addenda PATH --ledger LEDGER [...] --platform P --artifact-id ID [--carryover PATH] [--md] [--out PATH]` | `gate`／`report_md`（`--out` 寫 ingest 用 JSON） |
+| `canary report` | `--policy PATH --addenda PATH --ledger LEDGER [...] --platform P --artifact-id ID [--carryover PATH] [--md] [--out PATH]` | `gate`／`report_md`（`--out` 寫 ingest 用 JSON，必含 `ledger_through`／`ledger_records`，R3-F1） |
 | `canary pack-collector` | `--out PATH` | `pack_collector.pack` |
 | `rollback-drill run` | `--cli PATH --platform P --boards COM0,COM1 --expect-current V --expect-previous V --out DIR [--forward-argv JSON] [--corrupt-from BUNDLE] [--start-fail-from BUNDLE] --i-understand-this-restarts-the-daemon` | `run_drill`（缺最後旗標 → exit 2；未給 `--corrupt-from`／`--start-fail-from` → verdict `INCOMPLETE`、exit 1） |
 | `rollback-drill make-corrupted` | `--src BUNDLE --dst DIR` | `make_corrupted_bundle` |
 | `rollback-drill make-start-fail` | `--src BUNDLE --dst DIR` | `make_start_fail_bundle` |
-| `evidence target` | `--index PATH --stage S --platform P --release-manifest PATH --contract-revision REV --tool-revision REV --case-list-sha256 HEX --set-by TEXT [--bundle-dir DIR]` | `set_target`（`--stage 3` 時 `--bundle-dir` 必填，記錄 `bundle_tree_sha256`，R2-F7） |
+| `evidence target` | `--index PATH --stage S --platform P --release-manifest PATH --contract-revision REV --tool-revision REV --case-list-sha256 HEX --set-by TEXT [--bundle-dir DIR]` | `set_target`（`--stage 3` 時 `--bundle-dir` 必填，記錄 `bundle_tree_sha256`／`runtime_tree_sha256`，R2-F7／R3-F2；同一 manifest 而 tree 不同 → `HARNESS_ARTIFACT_MISMATCH`、不寫索引） |
 | `evidence env-id` | `--env JSON_PATH` | `environment_id` |
 | `evidence ingest` | `--index PATH --kind K --item ID --platform P --report PATH --evidence-root DIR --environment JSON_PATH [--release-manifest PATH] [--reuse-of ENTRY_ID]` | `evidence_ingest.ingest`（PASS 的唯一入口） |
 | `evidence add` | `--index PATH --entry JSON_PATH` | `add_entry`（PASS／XFAIL 只接受 `manual-procedure` 項目；其餘一律走 `ingest`） |
@@ -3491,7 +3643,7 @@ fixtures 檔：`crates/sw-proto/tests/fixtures/stage3_retired_python_daemon.json
 | `rollback-drill.md` | 前置（bench 獨占、兩塊板 READY、無 flash／file transfer）、以 `mkbundle.sh --dev --version-override` 建 start-fail 來源 bundle、D0～D8 說明（跨重啟不以 `bridge_generation` 判定）、`--i-understand-this-restarts-the-daemon`、`INCOMPLETE` 與 `limitations` 的意義、失敗時的人工復原步驟 |
 | `od09-deferred-freeze.md` | 時序要求（Stage 0 出口、早於 `S1B-L3-MIXED-48H-WINDOWS`）、`od09 stats → propose → freeze → 重跑基線 gate → check` 命令、`--set` 覆寫的紀錄方式、`owner-decisions-addenda.md` 為附加式紀錄 |
 | `python-daemon-retirement.md` | 退役前置（`evidence status --stage 3` PASS、兩平台 Stage 3 target artifact）、受測 bundle 的保存位置、修改 `packaging/python_daemon_retirement.json` 的欄位、`retirement verify --mode release --evidence-root --bundle-manifest`、不重建受測物的理由、「manifest 相符不等於內容相符」：保存期間受測 bundle 目錄不得有任何寫入（`bundle_tree_sha256` 於 `evidence target` 凍結，任何替換／刪除／新增檔都使發佈被拒）、`retirement pack`／`verify-archive` 與只上傳已驗證 archive 的步驟（R2-F7）、保留清單、不刪除 `sw_core/` 的理由 |
-| `evidence-index.md` | 出口項目錄與 `evidence_kind`、每個 kind 的 `evidence ingest` 命令、entry 欄位（含 `environment_id` 的 env JSON 欄位、`workload_sha256`、`runtime_digest`）、結果語意（SKIP／INFRA_ERROR／INSUFFICIENT 不等於 PASS）、FAIL 不可被後續 PASS 抵銷、`reuse_of` 條件、以 `satisfying_entries` 把 BC／SC／DF 與錯誤碼由 `IMPLEMENTED` 改為 `VERIFIED` 的擁有者步驟（§0.3） |
+| `evidence-index.md` | 出口項目錄與 `evidence_kind`、每個 kind 的 `evidence ingest` 命令、entry 欄位（含 `environment_id` 的 env JSON 欄位、`workload_sha256`、`runtime_digest`、`bundle_tree_sha256`／`runtime_tree_sha256`）、受測內容指紋規則（同 manifest 換內容不得重設 target；bundle 改變必須重建、舊證據過期；Stage 2.4 長跑要供 Stage 3 `reuse_of` 沿用，其 target 必須以 `--bundle-dir` 設定，R3-F2）、結果語意（SKIP／INFRA_ERROR／INSUFFICIENT 不等於 PASS）、FAIL 不可被後續 PASS 抵銷、canary-report 項目只以帳本版本最新的報告判定（新事故報告撤銷舊 PASS、舊報告不得重新匯入，R3-F1）、`reuse_of` 條件、以 `satisfying_entries` 把 BC／SC／DF 與錯誤碼由 `IMPLEMENTED` 改為 `VERIFIED` 的擁有者步驟（§0.3） |
 
 **Steps:**
 

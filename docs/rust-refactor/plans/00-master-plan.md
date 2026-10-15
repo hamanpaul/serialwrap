@@ -121,13 +121,13 @@
 | P1-T4 | BC-01c rotate／reset 於常駐 handle 下同步與 DF-03 歸檔後綴 | G | L | P1-T3 |
 | P1-T5 | BC-01d 外部 unlink／替換／DeletePending 偵測、有界自癒、缺口 META、停止自動 TX | H | L | P1-T4 |
 | P1-T6 | BC-03／SC-07 TX 三態、TX WAL 只記確認 bytes、可取消寫入、DF-15 精確 wal_seq | G | L | P1-T5 |
-| P1-T7 | SC-04a Bridge 兩段式 Drain 與 `DrainReceipt` | H | L | P1-T6 |
+| P1-T7 | SC-04a Bridge 兩段式 Drain 與 `DrainReceipt`（drain 期限自 `begin_drain` 起算，R3-F3） | H | L | P1-T6 |
 | P1-T8 | SC-04b Session Drain、release／attach 交接回應、drain 診斷欄位、BC-03 中止映射、SC-11 有序關機與 `daemon.handoff_stop` 原子交接（R1-F1） | G | L | P1-T7 |
 | P1-T9 | BC-02 DeferredBuffer 整段清空與上下文標記 | H | L | P1-T8 |
 | P1-T10 | BC-04 Per-UART 獨占、holder 診斷、Windows ACCESS_DENIED 映射、SC-05 同步收回、DF-04 | G | L | P1-T9 |
 | P1-T11 | Gate 錯誤碼：SC-01、SC-02、SC-03、SC-06、DF-02 | G | L | P1-T10 |
 | P1-T12 | SC-13 lease tick＋tombstone、SC-14 flash probe 資格、SC-16 console 行上限 | H | L | P1-T11 |
-| P1-T20 | OS write 前授權 permit（quiet／release／cancel／lease／owner_gen 零 TX；自動登入／密碼／ready probe 帶 `system_probe` permit＋`login_gen`（R2-F1）；Quiet 不擋有效 interactive lease 救援（R2-F2）） | H | L | P1-T12 |
+| P1-T20 | OS write 前授權 permit（quiet／release／cancel／lease／owner_gen 零 TX；自動登入／密碼／ready probe 帶 `system_probe` permit＋`login_gen`（R2-F1）；Quiet 不擋有效 interactive lease 救援（R2-F2）；Windows 持鎖寫入下 drain 取 fence 鎖有上限、3,000 ms 期限自請求起算（R3-F3）） | H | L | P1-T12 |
 | P1-T13 | OD-11／SC-19 隔離實例測試裝置 allowlist | G | H | P1-T20 |
 | P1-T14 | BC-05 Windows `remote -R/-L`、SC-27 `connect`／`benches`、SC-21 `remote stop`、跨行程檔案鎖 | H | L | P1-T13 |
 | P1-T15 | 平台管理：SC-08、SC-09、SC-10、SC-12、SC-20、DF-14 | G | L | P1-T18 |
@@ -311,7 +311,7 @@
 |---|---|---|---|---|
 | P9-T1 | 契約檔、schema 與基礎模組 | G | H | — |
 | P9-T2 | 共用基礎測試替身（`tests/stage3_fakes.py`） | H | G | P9-T1 |
-| P9-T3 | A/B manifest 載入、凍結與案例涵蓋檢查（`tools/stage3/ab_manifest.py`；`verify_bundle`／`bundle_tree_sha256`，R2-F7） | H | G | P9-T2 |
+| P9-T3 | A/B manifest 載入、凍結與案例涵蓋檢查（`tools/stage3/ab_manifest.py`；`verify_bundle`／`bundle_tree_sha256`，R2-F7；`runtime_tree_sha256`，R3-F2） | H | G | P9-T2 |
 | P9-T4 | A→B 資源釋放驗證（`tools/stage3/release_check.py`） | H | L | P9-T3 |
 | P9-T5 | 乾淨 DUT 狀態與實例隔離（`tools/stage3/dut_state.py`） | G | H | P9-T4 |
 | P9-T5B | Suite adapter（`tools/stage3/suites/`） | H | L | P9-T5 |
@@ -322,12 +322,12 @@
 | P9-T9 | Canary collector 與 zipapp（`tools/stage3/canary_collect.py`；結果於 history 淘汰前持續收斂，R1-F6） | H | L | P9-T11 |
 | P9-T10 | 干擾／交接分類與活躍日（`tools/stage3/canary_classify.py`） | H | L | P9-T8 |
 | P9-T11 | 事故追蹤（`tools/stage3/canary_incidents.py`） | G | H | P9-T10 |
-| P9-T12 | Canary policy 凍結、帳本彙總與配額 gate（`tools/stage3/canary_ledger.py`） | L | G | P9-T9 |
+| P9-T12 | Canary policy 凍結、帳本彙總與配額 gate（`tools/stage3/canary_ledger.py`；gate 輸出帳本版本 `ledger_through`／`ledger_records`，R3-F1） | L | G | P9-T9 |
 | P9-T13 | 實機回滾演練（`tools/stage3/rollback_drill.py`） | G | L | P9-T12 |
-| P9-T14 | Stage 0～3 出口證據索引（`tools/stage3/evidence_index.py`；Stage 3 target 記錄 `bundle_tree_sha256`，R2-F7） | L | G | P9-T7 |
-| P9-T14B | 證據 ingest（`tools/stage3/evidence_ingest.py`） | H | L | P9-T15 |
+| P9-T14 | Stage 0～3 出口證據索引（`tools/stage3/evidence_index.py`；Stage 3 target 記錄 `bundle_tree_sha256`，R2-F7；entry 保存受測內容指紋並納入有效性、同 manifest 換 tree 拒絕重設 target，R3-F2；canary-report 項目只以帳本版本最新報告判定，新事故撤銷舊 PASS，R3-F1） | L | G | P9-T7 |
+| P9-T14B | 證據 ingest（`tools/stage3/evidence_ingest.py`；報告受測內容指紋核對 target、報告不得早於 target 內容生效，R3-F2；canary 報告防回放，R3-F1） | H | L | P9-T15 |
 | P9-T15 | OD-09 延後凍結程序與凍結輸出對正式 gate 的讀寫契約（`tools/stage3/od09_freeze.py`；寫入 P2 `thresholds.<key>.per_platform.<os>.<field>`，不改 gate） | L | H | P9-T14 |
-| P9-T16 | Python daemon 退役切換（packaging；發佈前逐檔重驗 bundle 內容與 tree、`retirement pack`＋`verify-archive` 後只上傳已驗 archive，R2-F7） | H | L | P9-T13 |
+| P9-T16 | Python daemon 退役切換（packaging；發佈前逐檔重驗 bundle 內容與 tree、`retirement pack`＋`verify-archive` 後只上傳已驗 archive，R2-F7；旁載檔後重設 target 或新事故報告後拒絕發佈，R3-F1／R3-F2） | H | L | P9-T13 |
 | P9-T17 | `python3 -m tools.stage3` 入口與擁有者程序文件 | G | H | P9-T16 |
 
 ### 跨 Phase 關鍵交接（本次審查定案的唯一 owner）

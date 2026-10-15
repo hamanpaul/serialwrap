@@ -782,7 +782,7 @@ TxWriter 的 job queue 容量 64；滿時 OpRunner 阻塞等待（只有 OpRunne
 5. DeferredBuffer 整段清空，`owner_gen++`（BC-02）。
 6. 依 Python `_detach_session_locked` 契約關閉 lease 與 capture。
 7. 對 reader 呼叫 `IoWaker::wake()`，對 writer 呼叫 `CancelToken::cancel()`。
-8. 排定 `WorkerDrainTimeout{epoch, stop_id}`，3000 ms 後觸發。
+8. 排定 `WorkerDrainTimeout{epoch, stop_id}`，3000 ms 後觸發。期限以 actor 處理該停止請求的 `now` 起算；Phase 1 取 Fence 鎖最多只等一次非阻塞提交（§5.4 第 3 點：POSIX 一次 `write(2)`、Windows 一次 overlapped `WriteFile` 發出），不等完成，所以不會把完成等待算到期限之外。Python 參考實作的 Windows `_PySerialPort` 會在鎖內阻塞寫入，對應的有上限取鎖與共同期限見 P1 T07／T20（R3-F3）。
 
 **Phase 2**（IoWorker 內）：
 
@@ -1273,6 +1273,7 @@ A/B 程序照規格 §15.9：先停 A 並確認資源釋放，才啟動 B；兩�
 - Stage 2 起 `daemon.implementation` 改為 `"rust"`，`entry` 移除。
 - 同目錄另有 `SHA256SUMS`。
 - **manifest 是宣告，不是內容證明**（R2-F7）：保留原 manifest、替換 `bin/serialwrapd` 時 `sha256(release-manifest.json)` 不變；`components.assets` 只帶 hash、沒有 path。凡需判定「實際檔案＝受測物」之處（P9 A/B 執行前 `verify_frozen`、Stage 3 `evidence target`、發佈時 `retirement verify --mode release` 與 `retirement verify-archive`），必須以 P9 Task 3 `verify_bundle` 逐一重算帶 `path`＋`sha256`／`tree_sha256` 的 component，並以 `bundle_tree_sha256`（sorted `"<posix relpath>\0<sha256>\n"` 的 sha256，涵蓋 bundle 目錄**全部**一般檔、不排除任何檔、遇 symlink 或非一般檔即拒絕）比對 Stage 3 target 記錄值；發佈只上傳通過 `verify-archive` 的 archive 位元組（P9 Task 14、Task 16）。
+- **證據綁定受測內容，不只綁 manifest**（R3-F2）：新增未宣告的旁載檔（例如 `bin/version.dll`）時 manifest 與 `artifact_id` 都不變、`verify_bundle` 照樣通過，若只在 target 記 tree，對同一 manifest 重設 target 就能讓舊 PASS 隨未受測內容發佈。因此：(1) 同一 `artifact_id` 不得以不同 `bundle_tree_sha256` 重設 target（P9 Task 14 `set_target` 回 `HARNESS_ARTIFACT_MISMATCH`），換內容必須重建 bundle；(2) A/B 報告每側記錄實際受測的 `bundle_tree_sha256` 與 `runtime_tree_sha256`（同演算法、只排除 bundle 根的 `release-manifest.json`／`SHA256SUMS`），每筆證據 entry 保存兩者並納入有效性判定，與 target 不符即過期；(3) 跨 Stage 沿用（`reuse_of`）除 `runtime_digest`（只雜湊宣告值）外必須 `runtime_tree_sha256` 相等。
 - 建置由 `scripts/rust/mkbundle.sh --target <triple> --stage <s> [--dev]` 負責：組出 Python runtime（Linux 用 venv；Windows 用 embeddable 3.12 加 `pip install --target`），安裝本 repo wheel，產生 manifest。
 
 ### 10.2 安裝佈局與穩定入口
