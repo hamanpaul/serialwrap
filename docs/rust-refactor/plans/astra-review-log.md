@@ -132,3 +132,31 @@
 - R4-F1：Stage 3 `junit`（`S3-L1-RELEASE-CONTRACT-*`）與 `realhw-report`（`S3-L3-P0P1-REMOTE-*`）報告仍不記實際部署內容指紋，沿用 target 回填＋時刻規則；要補須改 P2 報告產生端。`od09-freeze` 與 bundle 內容無關，回填正確。Canary carryover 的計數仍只以 artifact 為鍵。
 - R4-F2：`register_candidate_start` 依靠各長跑程序在開跑前呼叫，未登記的長跑只能由 gate 的 `pre_frozen` 檢查作最後防線攔下。
 - R4-F3：`foreign_owned_readonly_target` 測試依賴系統 `sh` 整條路徑非本身分擁有且 `CapEff==0`，條件不符的環境會 SKIP；實際 `verdict:"blocked"` 證據仍待部署負責人以一般任務 Agent 身分產出（B-13）。
+
+## 第 5 輪後未處理（達上限）
+
+> 第 5 輪審查的最終發現，原文照錄；達審查輪數上限，尚未判定、未修正。
+
+### R5-F1（高）更新交接未阻止 systemd 重新拉起 daemon
+
+- 位置：`docs/rust-refactor/plans/05-stage1b-rust-cli-mgmt.md:1127-1130`
+- 內容：此處對 systemd 不停用監管拉起，Task 12 也只停用 Windows 監管；既有 unit 使用 Restart=on-failure，而 P8 明訂停機未收斂時 exit 1。依計畫推導，取得交接授權的舊實例退出後，新實例可在備份或切換期間重新開啟 UART、受理傳輸；舊實例的 handoff_token 無法授權停止新實例，逾時 hard_stop 亦可能截斷新傳輸。
+- 建議：在 handoff 前可靠抑制 systemd 自動拉起，持久化並於完成或復原時恢復原設定；偵測到新實例須重新交接。新增 exit 1 後自動重啟、切換期間受理 flash 的競態測試。
+
+### R5-F2（高）self-test 被排除於寫入時 Quiet 防線之外
+
+- 位置：`docs/rust-refactor/plans/02-stage0-python-bc.md:2297`
+- 內容：計畫明確讓 system:self_test nonce probe 不受新增 quiet fence 保護。現存 session_manager.py:4482 先檢查 quiet，離鎖後才於 :4533 送 probe；兩者之間收到 boot banner 並重新 arm quiet，nonce 仍可送入 U-Boot、中斷 autoboot。Rust 計畫 06:2250 卻拒絕 SelfTestProbe，另形成未調和的雙軌差異。
+- 建議：將 self-test nonce 納入提交點的 quiet／世代驗證，保留原有診斷回應；新增「初檢通過→banner arm quiet→OS 提交」零 TX 測試，並登記對應契約變更。
+
+### R5-F3（高）單一成功或跳過的測試即可滿足完整 L1 出口
+
+- 位置：`docs/rust-refactor/plans/10-stage3-canary.md:3014`
+- 內容：JUnit 判定只要求 tests>0、無 failure/error 與無平台條件 skip。僅執行一個成功案例，甚至 tests=1、skipped=1 的非平台原因跳過報告，都符合 PASS。L1 的 required_case_set 又被設為 null，後層沒有完整案例分母核對，因此未執行完整黑箱契約仍可滿足 S3-L1-RELEASE-CONTRACT-*。
+- 建議：凍結每平台必要 L1 nodeid 清單，報告實際收集、執行、跳過項目及 runner exit code；缺案、重複、必要案例跳過或執行未完成一律不得 PASS。
+
+### R5-F4（高）未量測部署內容的報告仍被補成 target 證據
+
+- 位置：`docs/rust-refactor/plans/10-stage3-canary.md:3025`
+- 內容：junit、realhw-report 缺少實際受測內容指紋時，ingest 只檢查開始時刻，再以 target 指紋回填。另一份安裝即使 manifest 與 binary 相同、另含旁載 DLL，只要在 target 設定後完成測試，就會被記成乾淨 target 的 PASS。這使完整契約與 P0/P1/remote 出口仍能借用不同部署內容的證據。
+- 建議：讓相關報告產生端量測實際部署內容指紋，納入 TREE_REQUIRED_KINDS；缺失或不符即拒收，禁止 target 回填。新增同 manifest、不同旁載內容的拒收測試。
