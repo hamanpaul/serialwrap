@@ -502,6 +502,7 @@ class PyDaemon:
 - fixtures：`env`（`isolated_env(tmp_path)`）、`stubd`（factory：`stubd(script, transport=...)`，teardown 自動 stop）、`py_daemon`、`faketarget`。
 - `pytest_sessionfinish`：只有在 `config.getoption("confcutdir")` 解析為本目錄（獨立執行）時才斷言 `"sw_core" not in sys.modules`；完整 `pytest tests/` 時由 `test_bb_no_product_import.py` 的 AST 掃描把關（root conftest 的 autouse fixture 會 import `sw_core`，這是預期的）。
 - 獨立執行命令：`python3 -m pytest -q tests/contract_blackbox --confcutdir=tests/contract_blackbox -p no:cacheprovider`。
+- **L1 報告 plugin**（R5 審查後續）：`pytest_configure` 另以 `importlib.util.spec_from_file_location` 依路徑載入 P2 Task 13 的 `tests/resource_report_plugin.py`（`../resource_report_plugin.py`；不經 `tests` 套件 import，避免帶入 root conftest 與 `sw_core`），`has_plugin("sw_resource_report")` 為假才 register。獨立執行時 root conftest 不載入，沒有這一步 `SW_RESOURCE_REPORT` 就不會寫出，P3／P4 gate 的黑箱 L1 列永遠缺檔。測試 `test_bb_standalone_writes_l1_report`（`process_rpc`）：以上方獨立執行命令加 `-k bb_no_product_import` 與 `SW_RESOURCE_REPORT=<tmp>/r.json` 跑子程序 → 報告存在、`format=="l1-results.v1"`、`finished is True`，且 sessionfinish 的 `"sw_core" not in sys.modules` 斷言仍通過。
 - **系統 config 防護**用 `@pytest.fixture(scope="session", autouse=True)` 的 `_no_system_config`（**不用** `pytest_sessionstart`：子目錄 conftest 的 `pytest_sessionstart` 在 `pytest tests/` 完整執行時不會被呼叫）：若系統設定檔（POSIX `/etc/serialwrap/config.yaml`、Windows `%ProgramData%\serialwrap\config.yaml`）存在，`pytest.fail("基礎設施錯誤：系統 config 會穿透隔離（SC-09），證據不足")`，避免受測 CLI 依系統 config 連到正式 daemon。（P1 `resolve_config_path` 尚無系統目錄的測試覆寫入口，列為跨 phase 待辦 §3 B9。）
 - **受測身分交叉檢查**（session autouse fixture `_artifact_identity`）：`is_rust()` 為真時，`cli_prefix()[-1]` 指向的檔案開頭必須是 ELF（`\x7fELF`）或 PE（`MZ`）原生執行檔，且若同目錄上層有 `release-manifest.json`，其 `components.cli.implementation == "rust"`；`is_rust()` 為假時，`cli_prefix()[-1]` 必須是 `#!` 腳本或 `.py`。不符即 `pytest.fail("A/B 標籤與受測 artifact 不符")`，避免標籤打錯讓 `rust_only` 案例錯跳。
 
@@ -1008,7 +1009,7 @@ Golden（`gen_pycompat.py`；POSIX 用本機 python3，Windows 檔用 `py -3.12`
 | `decode_replace`／`decode_strict` | 300 個隨機 byte 序列＋過長編碼、surrogate 編碼、截斷 | `b.decode("utf-8","replace")`／`str(UnicodeDecodeError)` |
 | `oserror` | `(errno, strerror, filename)` 組合、`winerror` 組合 | `str(OSError(...))` |
 | `py_str`／`py_repr` | JSON 值 | `str(v)`／`repr(v)` |
-| `pypath.<fn>` | 每個函式 200 組路徑（含 `//`、`.`、`..`、磁碟代號、UNC、`~`、`~bob`） | `posixpath.*`／`ntpath.*`；expanduser 以固定 env（`HOME=/golden/home`、`USERPROFILE=C:\Users\golden`）與 fake pwd 表 |
+| `pypath.<fn>` | 每個函式 200 組路徑（含 `//`、`.`、`..`、磁碟代號、UNC、`~`、`~bob`） | `posixpath.*`／`ntpath.*`；expanduser 以固定 env（`HOME=/golden/home`、`USERPROFILE=C:\Users\golden`）與 fake pwd 表（目前使用者 → `/golden/pw-home`、`bob` → `/golden/bob-home`，與下方 `FakeHome` 相同） |
 
 - [ ] **Step 1：寫失敗測試**
 
@@ -1021,7 +1022,7 @@ use sw_proto::{pycompat as pc, pyfmt, pypath::{self, PathFlavor}};
 struct FakeHome;
 impl pypath::HomeLookup for FakeHome {
     fn current_user_home(&self) -> Option<String> { Some("/golden/pw-home".into()) }
-    fn user_home(&self, u: &str) -> Option<String> { (u == "bob").then(|| "/home/bob".into()) }
+    fn user_home(&self, u: &str) -> Option<String> { (u == "bob").then(|| "/golden/bob-home".into()) }
 }
 
 fn check(file: &str, f: impl Fn(&str, &str) -> String) {
@@ -2970,7 +2971,7 @@ pub fn run_delegate(ctx: &mut CliCtx, argv_tail: &[std::ffi::OsString], group: &
 規則（arch §7.4 細化）：
 - `classify`（Task 10 實作，規則定義於此）：輸入為 `OsString`，只掃 root 層。值型選項（含唯一前綴縮寫）：`--socket`、`--endpoint`、`--bench`、`--timeout`、`--retries`，`--opt=v` 吃 1 個 token、否則吃 2 個；其他以 `-` 開頭的 token 吃 1 個（`-v`、`-vv`、`--verbose`、`-h`、`--version`、歧義前綴、未知選項）；`--` 之後的第一個 token 視為 group；第一個非選項 token 為 group，屬 `DELEGATED_GROUPS` → `Delegate`，否則 `Native`。這樣凡是含委派 group 的 argv（包括 root 層參數錯誤），一律交給 Python 產生完全相同的輸出。
 - manifest 定位（兩平台同一演算法，無 cfg）：`exe = current_exe()`；若 `<exe 所在目錄>/current-release.json` 存在 → `manifest = <exe 所在目錄>/../<dir>/release-manifest.json`；否則 `manifest = dirname(dirname(realpath(exe)))/release-manifest.json`。
-- entry：`components.python_cli_delegate.entry`；`entry[0]` 為相對路徑時以 manifest 所在目錄為基準以**字串 join** 轉絕對（**不得** `canonicalize`／`realpath`：venv 的 `python3` 是 symlink，解析成 `/usr/bin/python3.12` 後 `-I -m sw_core.cli` 會 `ModuleNotFoundError`）；轉換後必須是存在的檔案；其餘元素原樣。最終 argv = entry ＋ 使用者 `argv[1:]`（`OsString` 原樣）。Windows `CreateProcessW` 一律以該絕對路徑作 `lpApplicationName`（不依命令列首段做 PATH 搜尋）。Windows dev bundle（Task 17 建立）的 entry 為 `["py\\python.exe","-I","-m","sw_core.cli"]`：`py\\` 是 CPython **3.12.3** embeddable（與 arch §10.1 同佈局；不用 venv 的 `py\\Scripts\\python.exe`，因 Windows `py -3.12` 為 3.12.10，argparse 方言不同）。
+- entry：`components.python_cli_delegate.entry`；`entry[0]` 為相對路徑時以 manifest 所在目錄為基準以**字串 join** 轉絕對（**不得** `canonicalize`／`realpath`：venv 的 `python3` 是 symlink，解析成 `/usr/bin/python3.12` 後 `-I -m sw_core.cli` 會 `ModuleNotFoundError`）；轉換後必須是存在的檔案；其餘元素原樣。最終 argv = entry ＋ 使用者 `argv[1:]`（`OsString` 原樣）。Windows `CreateProcessW` 一律以該絕對路徑作 `lpApplicationName`（不依命令列首段做 PATH 搜尋）。Windows dev bundle（Task 17 建立）的 entry 為 `["py\\python.exe","-I","-B","-m","sw_core.cli"]`：`py\\` 是 CPython **3.12.3** embeddable（與 arch §10.1 同佈局；不用 venv 的 `py\\Scripts\\python.exe`，因 Windows `py -3.12` 為 3.12.10，argparse 方言不同）。
 - 遞迴：`depth_raw` 為 None → 0；非 ASCII 十進位 → `Recursion`；`depth >= 2` → `Recursion`；`sha_raw == my_sha` → `Recursion`；否則子行程 env 加三個變數（§0.7）：`SERIALWRAP_DELEGATE_DEPTH=<depth+1>`、`SERIALWRAP_DELEGATE_ARGV_SHA=<my_sha>`、`SERIALWRAP_RELEASE_MANIFEST=<manifest 絕對路徑>`（讓 Python `find_release_manifest()` 在 `python -m sw_core.cli` 下仍找到 bundle manifest，委派後的 `doctor` 才會做 `version_pairing`）。
 - 委派只執行一次：`exec_or_wait` 失敗（`exec failed`）時直接報錯，不重試、不改走 PATH、不換 entry。
 - 錯誤輸出：stdout `{"error_code":"INTERNAL_ERROR","message":"delegation target unavailable: <reason>","ok":false}`（`reason` 為 `release manifest not found: <path>`、`invalid release manifest: <detail>`、`delegate entry not found: <path>`、`exec failed: <py_message>` 之一）或 message `delegation recursion detected`；stderr `serialwrap: <group> failed: INTERNAL_ERROR: <message>`；exit 1。
@@ -2980,7 +2981,7 @@ pub fn run_delegate(ctx: &mut CliCtx, argv_tail: &[std::ffi::OsString], group: &
 1. `cargo build -p sw-cli [--release] --target <triple>`。
 2. `V=$(tr -d ' \n' < VERSION)`；建 `<out>/versions/$V/bin/`，複製 `serialwrap`。
 3. `python3 -m venv --system-site-packages <out>/versions/$V/py`；在其 `site-packages` 寫 `serialwrap_repo.pth`（內容為 repo 絕對路徑），使 `-I -m sw_core.cli` 可 import（`-I` 停用 user site，PyYAML 由系統 site 提供，2026-10-15 已確認 `/usr/lib/python3/dist-packages/yaml`）。
-4. `release-manifest.json`（`DISK_STABLE` 的 Indent(2) 變體、sort_keys、尾端換行）：`schema_version:1`、`bundle_version:$V`、`stage:"1A"`、`created_at`、`target`、`git_revision`（`git rev-parse HEAD`）、`contract_revision`（`git rev-parse HEAD:contracts`）、`components.cli{implementation:"rust",version,git_revision,path:"bin/serialwrap",sha256}`、`components.python_cli_delegate{entry:["py/bin/python3","-I","-m","sw_core.cli"],tree_sha256,runtime_python_version}`、`components.daemon{implementation:"python",version,git_revision,entry:["py/bin/python3","-I","<repo>/serialwrapd.py"],launcher:{path,sha256},runtime:{path:"py/bin/python3",python_version,sha256},package:{name:"serialwrap",version:$V,wheel_sha256:null,tree_sha256}}`、`pairing{rule:"exact",cli_version:$V,daemon_version:$V}`。dev bundle 沒有 Rust launcher 與 wheel：`launcher` 指向 `<repo>/serialwrapd.py` 並記其 sha256、`wheel_sha256` 為 `null`，schema 須允許並在 `description` 註明「dev bundle」；若 P1 schema 不允許，向 P1 提修正而不是省略欄位。`runtime.sha256` 為 `realpath(py/bin/python3)` 的 sha256。`python_version` 由 `py/bin/python3 -c 'import platform;print(platform.python_version())'` 取得，並必須等於 `contracts/cli_help/_meta.json` 的 `python_version`（3.12.3），不符即 exit 1。
+4. `release-manifest.json`（`DISK_STABLE` 的 Indent(2) 變體、sort_keys、尾端換行）：`schema_version:1`、`bundle_version:$V`、`stage:"1A"`、`created_at`、`target`、`git_revision`（`git rev-parse HEAD`）、`contract_revision`（`git rev-parse HEAD:contracts`）、`components.cli{implementation:"rust",version,git_revision,path:"bin/serialwrap",sha256}`、`components.python_cli_delegate{entry:["py/bin/python3","-I","-B","-m","sw_core.cli"],tree_sha256,runtime_python_version}`、`components.daemon{implementation:"python",version,git_revision,entry:["py/bin/python3","-I","-B","<repo>/serialwrapd.py"],launcher:{path,sha256},runtime:{path:"py/bin/python3",python_version,sha256},package:{name:"serialwrap",version:$V,wheel_sha256:null,tree_sha256}}`、`pairing{rule:"exact",cli_version:$V,daemon_version:$V}`。dev bundle 沒有 Rust launcher 與 wheel：`launcher` 指向 `<repo>/serialwrapd.py` 並記其 sha256、`wheel_sha256` 為 `null`，schema 須允許並在 `description` 註明「dev bundle」；若 P1 schema 不允許，向 P1 提修正而不是省略欄位。`runtime.sha256` 為 `realpath(py/bin/python3)` 的 sha256。`python_version` 由 `py/bin/python3 -c 'import platform;print(platform.python_version())'` 取得，並必須等於 `contracts/cli_help/_meta.json` 的 `python_version`（3.12.3），不符即 exit 1。
    兩個 `tree_sha256` 都**直接呼叫 P1 的實作**：`py/bin/python3 -I -c 'import sw_core.release_manifest as m; print(m.package_tree_sha256())'`（`sw_core` 子樹全部檔案、排除 `__pycache__` 與 `*.pyc`、relpath 以 `sw_core/` 起頭、位元組序排序），不得另寫 `sw_core/**/*.py` 版本；mkbundle 自測先以 `contracts/golden/tree_sha256.ndjson` 驗 P1 函式。
 5. 建 `<out>/bin/serialwrap` → `../versions/$V/bin/serialwrap` 的 symlink（驗 realpath 定位）。
 6. 以 `jsonschema` 依 `contracts/release_manifest.schema.json` 驗證 manifest，失敗 exit 1；schema 缺檔 exit 1（訊息 `P1 contracts 缺少`），不得跳過。
@@ -3213,6 +3214,7 @@ Expected：全部 PASS（`-m needs_delegation` 涵蓋 `test_bb_delegation.py` �
 
 **Files:**
 - Create: `scripts/rust/win-runner.sh`、`scripts/rust/win-test.sh`、`scripts/rust/win-blackbox.ps1`、`scripts/rust/win-blackbox.sh`、`scripts/rust/check_win_imports.py`、`scripts/rust/win-startup-100.ps1`、`scripts/rust/win-python-3.12.3.sha256`
+- Create: `scripts/rust/cargo_l1_results.py`（R5-F3：把 cargo libtest 的逐案結果轉成 P2 Task 13 `l1-results.v1`；Linux 原生與 `win-test.sh` 共用）、`tests/test_rust_cargo_l1_results.py`、`tests/fixtures/libtest_sample/`（`--list` 與執行輸出樣本）
 - Modify: `tests/ab_env.py`（`AB_KEYS` 加 `SW_BASELINE_PYTHON`）、`tests/contract_blackbox/bb_harness.py`（Windows `python_baseline_prefix()`／`python_baseline_interpreter()` 在 `SW_BASELINE_PYTHON` 有值時改用它）
 - Test: `tests/test_rust_win_scripts.py`、`tests/test_rust_check_win_imports.py`
 
@@ -3220,10 +3222,11 @@ Expected：全部 PASS（`-m needs_delegation` 涵蓋 `test_bb_delegation.py` �
 - Consumes：Task 1（`data_root()` 與 §0.7 的 runner／linker env 注入規則）、Task 2 harness、Task 16 dev bundle 結構。
 - Produces：
   - `scripts/rust/win-runner.sh <exe> [args…]`：照 arch §9.4 七步驟；exit code 原樣；`SW_WIN_KEEP=1` 保留 staging；`SW_WIN_TIMEOUT` 預設 900；`SW_WIN_EXTRA_FILES`（以 `:` 分隔）一併複製。**測試資料 staging**：在 staging 建 `data\`，複製 `contracts\golden\`、`contracts\cli_help\`、`contracts\{error_codes,session_last_errors}.yaml`、`contracts\cli_schema.json`、`contracts\rpc_schema.json`、`contracts\release_manifest.schema.json`、`tests\contract_blackbox\data\`、`sw_core\assets\skill\`、`sw_core\assets\profiles\`、`VERSION`，並設 `SW_TEST_DATA_DIR=<staging>\data`（WSLENV 以 `/p` 轉換路徑）。
-  - `scripts/rust/win-test.sh [--caps r1,r2] [--package P]… [-- cargo test args]`：照 arch §9.4；偵測 WSL 後 export `CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=<repo>/scripts/rust/win-runner.sh`、`CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc`（不在 WSL 時不設，原生 Windows runner 直接 `cargo test`）；先跑 `check_cfg_boundary.py`；報告 `target/win-test-report/<run_id>.json`：`{"run_id","exes":[{"exe","caps","passed","failed","ignored","exit"}],"overall":"pass"|"fail","evidence_insufficient":[<cap>…]}`。
+  - `scripts/rust/win-test.sh [--caps r1,r2] [--package P]… [-- cargo test args]`：照 arch §9.4；偵測 WSL 後 export `CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=<repo>/scripts/rust/win-runner.sh`、`CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc`（不在 WSL 時不設，原生 Windows runner 直接 `cargo test`）；先跑 `check_cfg_boundary.py`；報告 `target/win-test-report/<run_id>.json`：`{"run_id","exes":[{"exe","caps","passed","failed","ignored","exit"}],"overall":"pass"|"fail","evidence_insufficient":[<cap>…],"l1_results":"<相對路徑>"}`；`l1_results` 指向同目錄以 `cargo_l1_results.py` 產生的 `l1-results.v1`（`platform:"windows"`），計數欄只作摘要，**出口判定一律以 `l1_results` 對凍結 nodeid 清單判定（P2 `l1_judge`），不得以 `passed>0`／`failed==0` 判定**（R5-F3）。
+  - `scripts/rust/cargo_l1_results.py [--platform linux|windows] [--runner <win-runner.sh>] [--list-only] --out <json> -- <cargo test args…>`（R5-F3）：`cargo test --no-run --message-format=json <args>` 取每個 test executable 與其 `target.name`（crate 取 `package_id` 的套件名）；逐一執行 `<exe> --list --format terse`（加 `--ignored` 再列一次以標記 ignored 測試）得 `collected`，nodeid＝`cargo:<crate>::<target.name>::<test name>`；再執行 `<exe>`（只用 stable 旗標，不用 `-Z unstable-options --format json`）並解析 libtest 行 `test <name> ... ok|FAILED|ignored`，產生 `results`（`ok`→`passed`、`FAILED`→`failed`、`ignored`→`skipped`＋`skip_kind:"capability"`（`cap_<res>__` 前綴）或 `"other"`；`--caps` 指定的 `cap_<res>__*` 以 `--ignored` 執行後依實際結果記錄）、`exit_code`＝所有 exe exit 的最大值（任一 exe 被 timeout 殺掉記 124）、`finished`＝全部 exe 都跑完；同一 nodeid 跨 exe 重複時原樣保留兩列（由 `l1_judge` 判 `duplicate`）；`--list-only` 只輸出 `collected`（供 P2 `regen_lock.py --l1-add-only --collect`）。exe 編譯失敗 → `exit_code` 非 0、`finished:false`，不得產生空 `results` 的「成功」報告。
   - `scripts/rust/check_win_imports.py <exe>…`：以 `x86_64-w64-mingw32-objdump -p` 取 `DLL Name:`，allowlist（不分大小寫）：`KERNEL32.dll`、`ADVAPI32.dll`、`WS2_32.dll`、`ntdll.dll`、`bcryptprimitives.dll`、`bcrypt.dll`、`USERENV.dll`、`msvcrt.dll`、`api-ms-win-crt-*.dll`、`api-ms-win-core-*.dll`；明確禁止 `libgcc_s_seh-1.dll`、`libwinpthread-1.dll`、`libstdc++-6.dll`；輸出 JSON `{"exe","imports":[…],"unexpected":[…],"forbidden":[…],"ok"}`，任一 `ok:false` exit 1。
   - `scripts/rust/win-startup-100.ps1 -Exe <win path> -OutDir <win path>`：執行前對 `%TEMP%`、exe 所在目錄、`%LOCALAPPDATA%` 做快照（遞迴列出路徑、大小、`LastWriteTimeUtc`，排除本腳本輸出目錄）；連續 100 次 `& $Exe --version`，逐次記錄開始／結束時間戳、exit code、stdout sha256；執行後再快照並差分，新增的 `*.exe`、`*.dll` 或目錄列入 `new_artifacts`；輸出 `startup-100.json`（`{"runs":[…],"exe_sha256","new_artifacts":[…],"ok"}`；`ok` 只在 100 次 exit 0、輸出一致且 `new_artifacts` 為空時為 true）。EDR 紀錄比對另列 B4，不由本腳本判定。
-  - `scripts/rust/win-blackbox.ps1 -RustExe <win path> -RepoSnapshot <win path> -OutDir <win path> -Python3123 <dir> [-ComPair COMa:COMb] [-Label rust-1a-win]`：在 `%LOCALAPPDATA%\Temp\sw-rust-test\<run_id>\` 建 staging（repo 子集：`serialwrap.py`、`serialwrapd.py`、`sw_core\`、`tests\contract_blackbox\`、`tests\ab_env.py`、`VERSION`、`contracts\`）；`-Python3123` 指向 CPython 3.12.3 embeddable（sha256 與 `win-python-3.12.3.sha256` 相符，否則中止），改寫其 `python312._pth` 加入 staging repo 與 `py -3.12` 的 site-packages（PyYAML 為 3.12 ABI，跨 3.12.x 相容）；建 Windows dev bundle（`bin\serialwrap.exe`、`bin\current-release.json`＝`{"bundle_version":"<V>","dir":"versions\\<V>"}`、`versions\<V>\release-manifest.json`、`versions\<V>\py\`＝上述 3.12.3 embeddable 的複本，entry `["py\\python.exe","-I","-m","sw_core.cli"]`）；依序執行 A（`SERIALWRAP_CLI_EXE=<staging>\serialwrap.py`、`SW_BASELINE_PYTHON=<3.12.3>\python.exe`、label `python-win`）與 B（`SERIALWRAP_CLI_EXE=<bundle>\bin\serialwrap.exe`、label `rust-1a-win`）的 `py -3.12 -m pytest tests\contract_blackbox --confcutdir=tests\contract_blackbox -p no:cacheprovider --junitxml=<a|b>.xml`（pytest 本身可在 3.12.10 執行；受測 Python 基線與委派目標固定 3.12.3）；A 結束後依 Task 18 的釋放規則確認 throwaway daemon 已結束才跑 B；junit 與 `-ComPair` 證據複製到 `-OutDir`。缺 `-Python3123` 時照跑其餘案例，但在輸出加 `"dialect_runtime_missing": true`，比較器把 `test_bb_cli_help`／`test_bb_delegation` 判「證據不足」。
+  - `scripts/rust/win-blackbox.ps1 -RustExe <win path> -RepoSnapshot <win path> -OutDir <win path> -Python3123 <dir> [-ComPair COMa:COMb] [-Label rust-1a-win]`：在 `%LOCALAPPDATA%\Temp\sw-rust-test\<run_id>\` 建 staging（repo 子集：`serialwrap.py`、`serialwrapd.py`、`sw_core\`、`tests\contract_blackbox\`、`tests\ab_env.py`、`tests\resource_report.py`、`tests\resource_report_plugin.py`、`realhw\deployed_content.py`（L1 報告 plugin 與其依賴，R5 審查後續）、`VERSION`、`contracts\`）；`-Python3123` 指向 CPython 3.12.3 embeddable（sha256 與 `win-python-3.12.3.sha256` 相符，否則中止），改寫其 `python312._pth` 加入 staging repo 與 `py -3.12` 的 site-packages（PyYAML 為 3.12 ABI，跨 3.12.x 相容）；建 Windows dev bundle（`bin\serialwrap.exe`、`bin\current-release.json`＝`{"bundle_version":"<V>","dir":"versions\\<V>"}`、`versions\<V>\release-manifest.json`、`versions\<V>\py\`＝上述 3.12.3 embeddable 的複本，entry `["py\\python.exe","-I","-B","-m","sw_core.cli"]`）；依序執行 A（`SERIALWRAP_CLI_EXE=<staging>\serialwrap.py`、`SW_BASELINE_PYTHON=<3.12.3>\python.exe`、label `python-win`）與 B（`SERIALWRAP_CLI_EXE=<bundle>\bin\serialwrap.exe`、label `rust-1a-win`）的 `py -3.12 -m pytest tests\contract_blackbox --confcutdir=tests\contract_blackbox -p no:cacheprovider --junitxml=<a|b>.xml`（pytest 本身可在 3.12.10 執行；受測 Python 基線與委派目標固定 3.12.3）；A 結束後依 Task 18 的釋放規則確認 throwaway daemon 已結束才跑 B；B 輪另帶 `-m "core_portable or windows_native"`（＝`s1a_blackbox` windows selector）與 `SW_RESOURCE_REPORT=<staging>\l1\windows\blackbox\resource-report.json`，並把 `--junitxml` 指向同目錄的 `junit.xml`（R5-F3／R5 審查後續：P3／P4 gate 的 Windows 黑箱 L1 列由此產生）；junit、`l1\` 與 `-ComPair` 證據複製到 `-OutDir`（`<OutDir>\l1\windows\blackbox\`）。缺 `-Python3123` 時照跑其餘案例，但在輸出加 `"dialect_runtime_missing": true`，比較器把 `test_bb_cli_help`／`test_bb_delegation` 判「證據不足」。
   - `scripts/rust/win-blackbox.sh [--no-compare]`：WSL 端包裝：`cargo build -p sw-cli --release --target x86_64-pc-windows-gnu`（linker 以 env 注入）→ `check_win_imports.py` → 呼叫 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w scripts/rust/win-blackbox.ps1)" …` → `win-startup-100.ps1` → 未帶 `--no-compare` 時以 `scripts/rust/ab_compare.py`（Task 18）比較兩個 junit，輸出 `target/win-blackbox/<run_id>/report.json`。Task 17 階段 `ab_compare.py` 尚未交付，只能以 `--no-compare` 執行；完整比較在 Task 19 出口 gate。
 
 **Windows COM 證據（OD-08；擁有者自架 runner）**：`win-blackbox.ps1 -ComPair COMa:COMb` 額外執行：(1) `uart-stdio-bridge selftest --endpoint win-serial --com-pair COMa:COMb --out <OutDir>\com-selftest`（P2 Task 8），必須 `verdict: PASS`；(2) 以 Python daemon（`SERIALWRAP_TEST_DEVICE_ALLOWLIST=COMa`，OD-11 隔離實例）開 COMa、`uart-stdio-bridge run --endpoint win-serial --com COMb` 接 DUT 模擬器，Rust CLI 依序執行 `session list`（輪詢至 `READY`）、`cmd submit --cmd "echo hi"`＋`cmd status`、`device release`、`device attach`、再次輪詢 `READY`，並跑 P1 的 `windows_com` 案例（`SW_TEST_COM_PAIR=COMa:COMb py -3.12 -m pytest -m windows_com tests/`）；證據（命令列、stdout、daemon log、bridge `wire.ndjson`、COM 名稱與 transport_mode）寫入 `<OutDir>\windows-com\`。未帶 `-ComPair` 時輸出 `"windows_com": "BLOCKED-OWNER"`，不得標 PASS。
@@ -3301,6 +3304,11 @@ def test_win_test_report_schema():
     assert all(set(e) >= {"exe", "caps", "passed", "failed", "ignored", "exit"} for e in data["exes"])
     assert (r.returncode == 0) == (data["overall"] == "pass")
     assert data["exes"] and sum(e["passed"] for e in data["exes"]) > 0   # 空集合不得算 pass
+    l1 = json.loads((report.parent / data["l1_results"]).read_text(encoding="utf-8"))   # R5-F3：逐案結果，計數只是摘要
+    assert l1["format"] == "l1-results.v1" and l1["platform"] == "windows" and l1["finished"] is True
+    assert {r["nodeid"] for r in l1["results"]} == set(l1["collected"]) - set(l1["deselected"])
+    assert all(n.startswith("cargo:sw-proto::") for n in l1["collected"])
+    assert sum(r["outcome"] == "passed" for r in l1["results"]) == sum(e["passed"] for e in data["exes"])
 
 
 def test_runner_stages_fixture_dir(win_exe, tmp_path):
@@ -3324,11 +3332,23 @@ def test_win_test_injects_runner_under_wsl(tmp_path):
 
 `tests/test_rust_check_win_imports.py`（`core_portable`、`process_rpc`；以假 `objdump` 輸出測判定邏輯，不需 Windows）：`api-ms-win-core-synch-l1-2-0.dll`＋`KERNEL32.dll` → ok；含 `libgcc_s_seh-1.dll` → `forbidden`、exit 1；含 `foo.dll` → `unexpected`、exit 1；`objdump` 不存在 → exit 2（證據不足，不得 ok）。
 
+`tests/test_rust_cargo_l1_results.py`（`core_portable`、`memory_only`；以 `tests/fixtures/libtest_sample/` 的假 `cargo --message-format=json`、`--list` 與執行輸出驅動，不需真 cargo；R5-F3，failing-first）：
+
+| 測試名 | 斷言 |
+|---|---|
+| `test_collected_from_list_not_from_run` | 樣本 exe `--list` 列 `a`、`b`、`cap_posix_pty__c`（後者在 `--ignored --list` 中），執行輸出只有 `test a ... ok` → `collected` 三筆 `cargo:sw-proto::pyjson_golden::{a,b,cap_posix_pty__c}`；`results` 只有 `a`；以 P2 `l1_judge.judge(out, [a, b], platform="linux")` → `INSUFFICIENT`、`not_run == [<b>]` |
+| `test_ignored_cap_is_skipped_not_pass` | `test cap_posix_pty__c ... ignored` → 該列 `outcome == "skipped"`、`skip_kind == "capability"`；必要集合含 `<c>` → `l1_judge` 為 `INSUFFICIENT`（`skipped_required`） |
+| `test_failed_and_exit_code_recorded` | 一支 exe 輸出 `test b ... FAILED` 且 exit 101 → `<b>` 為 `failed`、報告 `exit_code == 101`、`finished is True`；`l1_judge` → `FAIL` |
+| `test_build_failure_is_not_success` | 假 `cargo --no-run` exit 101（編譯失敗）→ 報告 `finished is False`、`exit_code == 101`、`results == []`；`l1_judge` 對任何非空必要集合 → `INSUFFICIENT` |
+| `test_timeout_marks_unfinished` | 假 runner 對第二支 exe 回 124 → `exit_code == 124`、`finished is False` |
+| `test_duplicate_nodeid_preserved` | 兩支 exe 皆列出同 crate／target／名稱（樣本刻意重複）→ `collected` 中該 nodeid 出現兩次；`l1_judge` → `INSUFFICIENT`、`duplicates` 含之 |
+| `test_list_only_feeds_regen_lock` | `--list-only` 輸出只含 `collected`，以 P2 `regen_lock.py --l1-add-only --set t --platform linux --collect <輸出>` 於暫存 lock 成功登記三筆 |
+
 （`SW_WIN_PRINT_STAGING=1` 為 runner 的除錯旗標：最後在 stderr 印 staging 的 Linux 路徑。）
 
 - [ ] **Step 2：確認紅燈**
 
-Run：`python3 -m pytest -q tests/test_rust_win_scripts.py`
+Run：`python3 -m pytest -q tests/test_rust_win_scripts.py tests/test_rust_cargo_l1_results.py`
 Expected：FAIL（腳本不存在）。
 
 - [ ] **Step 3：commit 測試**
@@ -3343,7 +3363,7 @@ Expected：FAIL（腳本不存在）。
 
 Run：
 ```bash
-python3 -m pytest -q tests/test_rust_win_scripts.py tests/test_rust_check_win_imports.py
+python3 -m pytest -q tests/test_rust_win_scripts.py tests/test_rust_check_win_imports.py tests/test_rust_cargo_l1_results.py
 scripts/rust/win-test.sh --package sw-proto --package sw-pal --package sw-cli     # 含 Task 9 待補的 sw-pal Windows 交叉執行
 scripts/rust/win-blackbox.sh --no-compare
 ```
@@ -3369,6 +3389,7 @@ Expected：pytest PASS；`win-test` 報告 `overall: pass`，`evidence_insuffici
 **Files:**
 - Create: `scripts/rust/ab_compare.py`、`scripts/rust/ab_blackbox.sh`、`scripts/rust/stage1a_gate.py`、`tests/contract_blackbox/test_bb_daemon_e2e.py`、`tests/contract_blackbox/data/e2e_profiles/shell.yaml`、`tests/contract_blackbox/data/coverage_1a.json`、`tests/contract_blackbox/data/applicability.json`
 - Modify: `tests/acceptance/cases.yaml`、`tests/acceptance/cases.lock.json`（以 P2 `regen_lock.py --add-only` 登記本 phase 新增的黑箱 case_id，`cli_stage:"1A"`；不得刪改既有列）
+- Modify: `tests/acceptance/l1_required.lock.json`（只以 P2 `regen_lock.py --l1-add-only` 登記 `s1a_blackbox`、`s1a_delegation`、`s1a_cargo` 的 linux／windows 集合；R5-F3）
 - Modify: `README.md`（English 與繁體中文兩段同步新增「Rust CLI（Stage 1A）建置與 A/B 執行」小節）
 - Test: `tests/test_rust_ab_compare.py`、`tests/test_rust_stage1a_gate.py`、`tests/test_rust_readme_trust_scope.py`
 
@@ -3396,7 +3417,7 @@ Expected：pytest PASS；`win-test` 報告 `overall: pass`，`evidence_insuffici
     另外三種整體判定直接 `result: fail`：任一 junit 為空或 testcase 數為 0（`empty-report`）、同一份 junit 內 testcase id 重複（`duplicate-id`）、junit 解析失敗（`unparseable`）。
     輸出 envelope：`{"a_label","b_label","identity":{"a":{…},"b":{…}},"counts":{…},"cases":[{"id","class","a","b","reason"}],"result":"pass"|"fail","errors":[…]}`；exit 0 只在 `result == "pass"`。
     `identity` 每邊必填欄位（缺欄位、空字串或檔案不存在即 `result: fail`，`errors` 列出）：`cli_path`、`cli_sha256`（比較器自行重算並與傳入值比對）、`cli_implementation`（rust／python）、`daemon_version`、`daemon_git_revision`、`daemon_tree_sha256`（Rust 輪取自 manifest `components.daemon.package.tree_sha256`；Python 輪以 P1 `package_tree_sha256()` 計算）、`daemon_runtime_sha256`、`contract_revision`、`case_list_sha256`（該邊 junit 中 testcase id 排序後的 sha256）、`tool_revision`（本 repo `git rev-parse HEAD`＋`tests/contract_blackbox` 的 tree sha）、`platform`、`config_digest`（`isolated_env` 產生的 config 目錄內容 sha256）、`dut_identity`（stub／FakeTarget／`windows-com:<COMa>` 等）、`evidence_files`（路徑＋sha256 清單）。另斷言 A、B 的 `cli_sha256` 不同、`cli_implementation` 分別為 python／rust、`daemon_tree_sha256` 相同、`case_list_sha256` 相同（不同時已由 `case-set-mismatch` 呈現）。
-  - `scripts/rust/ab_blackbox.sh [--profile debug|release]`：`mkbundle.sh --dev` → 以 `SW_AB_PIDLOG=<run>/a.pids` 執行 A（Python 基線）→ **釋放確認**（規格 §15.9.1 第 3 步；任一項不明即停止、不啟動 B）：`a.pids` 中每個 pid 與其子行程都已結束（`/proc/<pid>` 不存在或為 zombie 已回收，等待上限 10 s）；每個 socket 路徑不存在；每個 lock 檔可被 `flock -n` 取得；掃 `/proc/*/fd` 無任何行程持有 A 的 run／state 目錄內的檔案或 PTY；結果寫 `<run>/release-check.json` → B（`SERIALWRAP_CLI_EXE=<bundle>/bin/serialwrap`、`SERIALWRAP_AB_LABEL=rust-1a`，同樣記 `b.pids`）→ 產生兩邊 identity JSON → `ab_compare.py --required <stage1a_gate.py 輸出的必要清單>` → `target/ab-report/<run_id>.json`。
+  - `scripts/rust/ab_blackbox.sh [--profile debug|release]`：`mkbundle.sh --dev` → 以 `SW_AB_PIDLOG=<run>/a.pids` 執行 A（Python 基線）→ **釋放確認**（規格 §15.9.1 第 3 步；任一項不明即停止、不啟動 B）：`a.pids` 中每個 pid 與其子行程都已結束（`/proc/<pid>` 不存在或為 zombie 已回收，等待上限 10 s）；每個 socket 路徑不存在；每個 lock 檔可被 `flock -n` 取得；掃 `/proc/*/fd` 無任何行程持有 A 的 run／state 目錄內的檔案或 PTY；結果寫 `<run>/release-check.json` → B（`SERIALWRAP_CLI_EXE=<bundle>/bin/serialwrap`、`SERIALWRAP_AB_LABEL=rust-1a`，同樣記 `b.pids`）→ 產生兩邊 identity JSON → `ab_compare.py --required <stage1a_gate.py 輸出的必要清單>` → `target/ab-report/<run_id>.json`。`--l1-out <dir>`（R5 審查後續）：B 輪的 pytest 命令固定為 `s1a_blackbox` linux selector（`tests/contract_blackbox -m "core_portable or posix_only"`），帶 `SW_RESOURCE_REPORT=<dir>/linux/blackbox/resource-report.json` 與 `--junitxml=<dir>/linux/blackbox/junit.xml`；同一份報告也是 `s1a_delegation`（`test_bb_delegation.py` 子集，selector.argv 相同）的判定輸入，不另跑。
   - `scripts/rust/stage1a_gate.py --ab-report <json> [--win-report <json>] [--l15-report <func-test-report.json>] [--windows-com <dir>] --out <json>`：
     1. 分母：讀 `tests/acceptance/cases.lock.json` 的 `sets.cli_1A` 與 `tests/contract_blackbox/data/coverage_1a.json`（`p3_extra` 必要案例，含 console RPC 案例，§0.3）；兩者聯集即 Stage 1A 必要集合。lock 檔缺失或 `sets.cli_1A` 不存在 → `evidence-insufficient`（不得以空集合通過）。
     2. 逐 case 對帳：L1／黑箱層必須在 ab-report 中為 `ok` 或 `rust-only-ok`；L1.5 層必須在 func-test 報告（以 Rust CLI 執行）為 PASS 且 `gate_eligible`；L2／L3 層記 `BLOCKED-OWNER`；缺漏任一必要證據 → `evidence-insufficient`。
@@ -3412,6 +3433,7 @@ Expected：pytest PASS；`win-test` 報告 `overall: pass`，`evidence_insuffici
        | 證據不足不得轉 PASS | gate 本身 | `test_rust_ab_compare.py`、`test_rust_stage1a_gate.py` |
 
     5. `--windows-com` 目錄缺失或無 PASS 證據 → `windows_com: BLOCKED-OWNER`；`--win-report` 缺失 → `windows_l1: evidence-insufficient`。
+    5b. **L1 完整性（R5-F3）**：新增必填 `--l1-results <dir>`，內含 `linux/blackbox/`、`windows/blackbox/`、`linux/cargo/`、`windows/cargo/` 各一份 `l1-results.v1`（pytest 黑箱為 B 輪〔Rust CLI〕以 `SW_RESOURCE_REPORT` 產生的報告＋同目錄 junit：linux 由 `ab_blackbox.sh --l1-out`、windows 由 `win-blackbox.ps1` B 輪產生；cargo 為 `cargo_l1_results.py` 輸出，Windows 取 `win-test` 報告的 `l1_results`）；以 P2 `l1_judge.judge(…, selector=<lock 的 selector>)` 對 `l1_required.lock.json` 判定 6 列：`s1a_blackbox`、`s1a_delegation`（皆取 `<platform>/blackbox/`）、`s1a_cargo`（取 `<platform>/cargo/`）× linux／windows（R5 審查後續：原 `s1a_delegation` 混 pytest 與 cargo 兩種 runner 卻只收一份報告，改為只含 pytest 黑箱子集，委派的 cargo 測試由 `s1a_cargo` 承擔；`delegation/` 目錄不再存在），結果寫入輸出的 `l1:[{"set_id","platform","verdict","reasons","missing","skipped_required","duplicates"}]`。任一 `FAIL` → 該列 `FAIL`；`INSUFFICIENT`／`INVALID`／檔案缺失／set 不存在 → `evidence-insufficient`（`overall` 因而 `FAIL`）。`ab_compare` 的 `ok` 只證明 A、B 一致，**不**證明必要黑箱案例都執行了——兩邊都只跑一個案例也會 `ok`，故不得以 ab-report 或 `win-test` 的 `passed>0` 代替本檢查。三個 set 由 P3 以 P2 `regen_lock.py --l1-add-only` 凍結（selector：`s1a_blackbox`＝argv `tests/contract_blackbox -m <markexpr>`，linux `"core_portable or posix_only"`、windows `"core_portable or windows_native"`；`s1a_delegation`＝同一 argv、`paths:["tests/contract_blackbox/test_bb_delegation.py"]`；`s1a_cargo`＝linux argv `--workspace --all-features`、windows argv `--package sw-proto --package sw-pal --package sw-cli`（與 Step 5 的 `win-test.sh` 相同；Windows 不跑 workspace 其他 crate，該差異由 selector 明載），皆為非 `cap_*` 測試，含 `crates/sw-cli` 的 `delegate_route`／`exec_delegate`），凍結時點依 P2 Task 13：各 Task 在自己的紅燈 commit 登記新增 nodeid（Task 2 起的黑箱測試、Task 16 的委派測試、各 crate 測試），Task 19 只登記 gate 自身測試（R5 審查後續）。
     6. 輸出 `{"required":[…],"cases":[{"id","layer","status","evidence"}],"invariants":[…],"coverage":[…],"overall":"IMPLEMENTED"|"VERIFIED"|"FAIL"}`：任一 `FAIL`／`evidence-insufficient` → `FAIL`；只剩 `BLOCKED-OWNER` → `IMPLEMENTED`；全部 PASS（含 L2／L3 與 Windows COM）才 `VERIFIED`。exit 0 只在非 `FAIL`。
 
 `test_bb_daemon_e2e.py`（`posix_only`、`posix_pty`、`process_rpc`、`needs_py_daemon`；daemon 一律為 Python 基線；對 A 與 B 驗同一組**絕對契約**，不做位元組差分，因 `cmd_id`、時間戳不同。每個 test 以 function-scope fixture 建立自己的 daemon＋FakeTarget 與所需資料，單獨執行與任意順序皆成立）：
@@ -3541,7 +3563,7 @@ def test_identity_cli_sha_recomputed_and_sides_differ(tmp_path):
     assert code == 1
 ```
 
-`tests/test_rust_stage1a_gate.py`（`core_portable`、`process_rpc`；以暫存的假 lock／報告驗判定）：`cli_1A` 集合中有一筆 ab-report 缺 → `FAIL`；lock 檔缺 → `FAIL`（不得空集合通過）；只缺 L2／L3 → `IMPLEMENTED`；`coverage_1a.json` 中某資料面命令只有 stub 證據 → `FAIL`；安全不變量表某列 case 不存在 → `FAIL`；`--windows-com` 缺 → `windows_com: BLOCKED-OWNER` 且 `overall` 不為 `VERIFIED`。
+`tests/test_rust_stage1a_gate.py`（`core_portable`、`process_rpc`；以暫存的假 lock／報告驗判定）：`cli_1A` 集合中有一筆 ab-report 缺 → `FAIL`；lock 檔缺 → `FAIL`（不得空集合通過）；只缺 L2／L3 → `IMPLEMENTED`；`coverage_1a.json` 中某資料面命令只有 stub 證據 → `FAIL`；安全不變量表某列 case 不存在 → `FAIL`；`--windows-com` 缺 → `windows_com: BLOCKED-OWNER` 且 `overall` 不為 `VERIFIED`。另加 R5-F3 failing-first 案例：`test_l1_single_passing_case_is_insufficient`（`s1a_blackbox` 凍結三個 nodeid，`linux/blackbox` 報告只有一個 `passed`、ab-report 兩邊同樣只有該案例且 `result: pass` → `l1` 該列 `INSUFFICIENT`、`missing` 兩筆、`overall == "FAIL"`）、`test_l1_required_skip_is_insufficient`（三案皆在、其一 `skipped`（`skip_kind: "other"`）→ `overall == "FAIL"`，`skipped_required` 含之）、`test_l1_runner_exit_nonzero_is_insufficient`（全部 `passed` 但 `exit_code: 1`→ `FAIL`）、`test_l1_results_missing_is_insufficient`（缺 `windows/cargo/` → `evidence-insufficient`、`overall == "FAIL"`）、`test_l1_full_sets_pass`（四份報告〔兩平台 × blackbox／cargo〕覆蓋三個 set 且 `exit_code: 0`、`finished: true`、`argv` 等於凍結 selector → `l1` 六列全為 `PASS`，其餘條件同 `IMPLEMENTED` 情境時 `overall == "IMPLEMENTED"`）、`test_l1_cargo_argv_not_matching_selector_invalid`（R5 審查後續：`linux/cargo` 報告的 cargo 參數為 `--workspace`、凍結 selector 為 `--workspace --all-features` → 該列 `evidence-insufficient`、`reasons` 含 `selector mismatch`、`overall == "FAIL"`）、`test_l1_delegation_judged_from_blackbox_report`（`s1a_delegation` 由 `<platform>/blackbox/` 報告判定；缺 cargo 報告時只有 `s1a_cargo` 列 `evidence-insufficient`，`s1a_delegation` 仍可 `PASS`）。
 
 `tests/test_rust_readme_trust_scope.py`（`core_portable`、`memory_only`）：`README.md`、`sw_core/assets/skill/*.md` 與 `contracts/cli_help/**/*.json` 的 stdout 文字不得含「同使用者隔離」「same-user isolation」（OD-12）。
 
@@ -3617,7 +3639,8 @@ python3 -m pytest -q tests/test_rust_ci_workflow.py
 python3 scripts/rust/check_cfg_boundary.py && python3 scripts/rust/check_dep_direction.py
 cargo test --workspace --all-features
 SW_REQUIRE_CARGO=1 python3 -m pytest -q tests/
-scripts/rust/ab_blackbox.sh --profile release                      # A/B 黑箱（含 delegation、daemon e2e）→ target/ab-report/<run_id>.json
+scripts/rust/ab_blackbox.sh --profile release --l1-out target/stage1a-evidence/<run_id>/l1   # A/B 黑箱（含 delegation、daemon e2e）→ target/ab-report/<run_id>.json；B 輪 l1-results → l1/linux/blackbox/
+python3 scripts/rust/cargo_l1_results.py --platform linux --out target/stage1a-evidence/<run_id>/l1/linux/cargo/resource-report.json -- --workspace --all-features   # R5-F3：s1a_cargo linux（argv 須等於凍結 selector）
 SERIALWRAP_CLI_EXE=$PWD/target/dev-bundle/bin/serialwrap python3 -m pytest -q tests/test_multiagent_e2e.py tests/test_human_agent_coexist.py   # BB-proc（Task 2 已改讀選擇器）
 SERIALWRAP_CLI_EXE=$PWD/target/dev-bundle/bin/serialwrap python3 func-test/runner.py --mode both \
   --selftest-report ~/b-log/rust-refactor/p2/selftest-linux/selftest-report.json \
@@ -3626,15 +3649,18 @@ SERIALWRAP_CLI_EXE=$PWD/target/dev-bundle/bin/serialwrap python3 func-test/runne
   --selftest-report ~/b-log/rust-refactor/p2/selftest-linux/selftest-report.json \
   --report-dir target/stage1a-evidence/<run_id>/func-test-scenarios                                # L1.5 安全情境
 scripts/rust/win-test.sh --package sw-proto --package sw-pal --package sw-cli
-scripts/rust/win-blackbox.sh                                        # 含 ab_compare、check_win_imports、startup-100
+mkdir -p target/stage1a-evidence/<run_id>/l1/windows/cargo && cp "target/win-test-report/$(jq -r .l1_results target/win-test-report/<run_id>.json)" target/stage1a-evidence/<run_id>/l1/windows/cargo/resource-report.json   # windows cargo l1-results
+scripts/rust/win-blackbox.sh                                        # 含 ab_compare、check_win_imports、startup-100；B 輪 l1-results → target/win-blackbox/<run_id>/l1/windows/blackbox/
+cp -r target/win-blackbox/<run_id>/l1/windows/blackbox target/stage1a-evidence/<run_id>/l1/windows/
 python3 scripts/rust/stage1a_gate.py --ab-report target/ab-report/<run_id>.json \
   --win-report target/win-blackbox/<run_id>/report.json \
+  --l1-results target/stage1a-evidence/<run_id>/l1 \
   --l15-report target/stage1a-evidence/<run_id>/func-test/func-test-report.json \
   --out target/stage1a-evidence/<run_id>/stage1a-gate.json
 python3 -m policy_check --repo .
 ```
 
-Expected：每一行 exit 0；`ab-report` 與 `win-blackbox` 報告 `result: pass`；`stage1a-gate.json` 的 `overall` 為 `IMPLEMENTED`（L2／L3、Windows COM、自架 runner 原生 build 仍為 BLOCKED-OWNER）且無任何 `evidence-insufficient`；GitHub 上 `rust-linux`、`rust-windows-hosted` 兩個 job 綠燈（PR 描述附 run 連結）。P2 前置缺少時對應行記為「證據不足」並在 PR 描述列出，`stage1a_gate.py` 會判 `FAIL`，不得標 PASS。
+Expected：每一行 exit 0；`ab-report` 與 `win-blackbox` 報告 `result: pass`；`target/stage1a-evidence/<run_id>/l1/` 由上列命令寫入（`ab_blackbox.sh --l1-out` 與 `win-blackbox.sh` 的 B 輪報告＋junit、`cargo_l1_results.py … -- --workspace --all-features` 與 `win-test.sh` 報告的 `l1_results`），`stage1a-gate.json` 的 `l1` 六列皆 `PASS`（R5-F3；R5 審查後續補上產生指令並拆分 delegation）；`stage1a-gate.json` 的 `overall` 為 `IMPLEMENTED`（L2／L3、Windows COM、自架 runner 原生 build 仍為 BLOCKED-OWNER）且無任何 `evidence-insufficient`；GitHub 上 `rust-linux`、`rust-windows-hosted` 兩個 job 綠燈（PR 描述附 run 連結）。P2 前置缺少時對應行記為「證據不足」並在 PR 描述列出，`stage1a_gate.py` 會判 `FAIL`，不得標 PASS。
 
 - [ ] **Step 6：commit 實作**
 

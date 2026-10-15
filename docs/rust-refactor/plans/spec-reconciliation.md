@@ -51,12 +51,12 @@
 | SC-15 | 每個 console 的出向 ring 為 1 MiB，滿時 drop-oldest。顯示資料原本就允許丟棄，契約只寫「可丟、不阻塞」 | §5.4 | Rust-only |
 | SC-16 | console line buffer 上限 16385 B；被拒的整行（`CMD_TOO_LONG`、`SESSION_QUEUE_FULL`、`SESSION_NOT_READY`）寫 WARNING log 供診斷 | §5.3、§5.4 | 雙邊 |
 | SC-17 | Windows 的 daemon 多開偵測與 CLI 跨 socket 預檢以行程掃描實作；Windows 的 holders 一律回 `unknown`。`holder_unknown` 是診斷能力的限制，不是獨占失敗：驗收（L3 長跑 `safety_double_holder`）在 Windows 不得以 `holder_unknown` 判證據不足，改以測試端原生 COM 獨占開啟證據判定——daemon 持有期間第二次 `CreateFileW` 被拒（`ERROR_ACCESS_DENIED`）、release 後外部可取得、外部持有時 attach 回 `DEVICE_STILL_HELD`、關閉後重新取得，並綁定受測裝置（`attached_real_path`／`bridge_generation`）與 daemon 程序身分（pid＋建立時間）；缺此證據仍為 INSUFFICIENT_EVIDENCE（P2 Task 15 `winexcl`，R1-F7） | §6.2 | Rust-only |
-| SC-18 | Windows `on-demand` 模式「首次需求啟動」：本機預設 endpoint 連不上時自動 `daemon start` 並重送一次；明確指定 endpoint、bench 或 remote 時不觸發 | §6.1 | Rust-only（1B） |
+| SC-18 | Windows `on-demand` 模式「首次需求啟動」：本機預設 endpoint 連不上時自動 `daemon start` 並重送一次；明確指定 endpoint、bench 或 remote 時不觸發；update／rollback 進行中（`install-journal.json` 存在，含 updater 中斷後未復原）不自動啟動也不重送，stderr 印「自動啟動暫停」提示，且與交接停止共用 `autostart.lock`（R5-F1，SC-23 第 3 步的 on-demand 拉起抑制） | §6.1、§12.1 | Rust-only（1B） |
 | SC-19 | OD-11 測試裝置 allowlist，細節見 §2 `GAP-G-07` | OD-11、§9.4 | 雙邊（P1） |
 | SC-20 | 新子命令 `daemon restart`：systemd 與 windows 模式轉為 `service restart`；on-demand 模式執行 stop、等待結束、再 start（同一 endpoint） | §4.2 #14 | 雙邊 |
 | SC-21 | `remote stop <port\|all>` 作為 `remote close` 的別名，原名照常可用 | §4.2 #17 | 雙邊 |
-| SC-22 | `supervision-mode set <mode> [--force] [--with-sudo]`：輸出 JSON，走與 setup 相同的 reconcile；不帶參數時維持輸出純文字 | §4.2 #16 | Rust-only（1B） |
-| SC-23 | `setup --rollback`、版本目錄、Current／Previous、規格 §12.1 的七步更新流程；第 2 步交接安全檢查不受 `--force` 影響（Flash／FileTransfer 等不可安全中止操作進行中一律拒絕，不停止監管或 daemon）；第 3 步停止只經 SC-11 `daemon.handoff_stop` 原子交接（CLI 預檢後才開始的 `file.push`／flash 由 daemon 判定忙碌而拒絕；daemon 不支援或結果不明時 fail-closed，不送一般 `daemon.stop`、不硬停，R1-F1）；第 7 步回退與 journal 中斷復原停止目前在跑的 daemon（第 6 步起已對外服務的新版）同樣只經 `daemon.handoff_stop`（`reason:"revert"`），忙碌、不支援或結果不明時保留 journal、不硬停、不切換回 Previous，待 daemon 閒置後由下一次 `setup` 完成回退（R2-F6）；中斷復原的 `install-journal.json` 在停用前即持久保存原始入口／current／config／監管 enabled・running／daemon 快照，備份完整提交（`backup_complete`）前不切換，復原失敗保留 journal（R1-F5，P4 Task 12） | §4.2 #19、§12.1 | Rust-only（1B） |
+| SC-22 | `supervision-mode set <mode> [--force] [--with-sudo]`：輸出 JSON，監管指令產生與 config 寫入走與 setup 相同的 reconcile；不帶參數時維持輸出純文字。交接護欄比照 SC-23 第 2～3 步（R1-F3：本命令為 Python 沒有的新命令，Python `setup` 的「探測例外視為 false」「`--force` 覆寫 flashing」「reconcile 送一般 `daemon.stop`」不構成豁免）：切換前執行與 update 相同的 fail-closed 安全檢查，Flash、FileTransfer、命令、lease、recovering、身分不明或探測失敗／逾時／格式異常一律拒絕（`phase:"supervision_set_safety_check"`，既有碼）；停止舊 daemon 只經 SC-11 `daemon.handoff_stop{reason:"supervision_set"}`，忙碌、不支援或結果不明時還原監管 enabled、不硬停、不寫 config；`--force` 不覆寫上述任何判定，只在輸出記 `force_ignored:true`；同模式刷新或只產生 `pending_sudo` 的路徑不交接（不得只凍結不切換）。一般 `setup --<mode> [--force]` 的 Python 對等行為不變（P4 Task 10 參數驗證、Task 12 `run_supervision_switch`） | §4.2 #16、§6.1、§12.1 步驟 2～3（交接條件比照） | Rust-only（1B） |
+| SC-23 | `setup --rollback`、版本目錄、Current／Previous、規格 §12.1 的七步更新流程；第 2 步交接安全檢查不受 `--force` 影響（Flash／FileTransfer 等不可安全中止操作進行中一律拒絕，不停止監管或 daemon）；第 3 步停止只經 SC-11 `daemon.handoff_stop` 原子交接（CLI 預檢後才開始的 `file.push`／flash 由 daemon 判定忙碌而拒絕；daemon 不支援或結果不明時 fail-closed，不送一般 `daemon.stop`、不硬停，R1-F1）；第 7 步回退與 journal 中斷復原停止目前在跑的 daemon（第 6 步起已對外服務的新版）同樣只經 `daemon.handoff_stop`（`reason:"revert"`），忙碌、不支援或結果不明時保留 journal、不硬停、不切換回 Previous，待 daemon 閒置後由下一次 `setup` 完成回退（R2-F6）；中斷復原的 `install-journal.json` 在停用前即持久保存原始入口／current／config／監管 enabled・running／daemon 快照，備份完整提交（`backup_complete`）前不切換，復原失敗保留 journal（R1-F5，P4 Task 12）；第 3 步「停止該實例的監管拉起能力」適用每一種 mode：送 `daemon.handoff_stop` 前先抑制監管拉起並記入 journal——systemd 寫持久 drop-in（`Restart=no`、`RefuseManualStart=yes`）＋`disable` 並以 `systemctl show` 驗證（既有 unit `Restart=on-failure`，交接後停機未收斂 exit 1 時不得在備份／切換期間被拉起），windows-task／windows-service disable 且 hold 期間重新註冊以停用狀態送出，on-demand 持 `autostart.lock` 並以 `install-journal.json` 存在擋 SC-18；hold 只在啟動目標版本前、拒絕還原或中斷復原時撤銷；更新期間外部 `systemctl start`／`service start`／`daemon start`（systemd 路由）會被 systemd 拒絕。交接 token 只授權發出它的實例：等待中、切換前與啟動前偵測到其他實例一律重新交接（被拒 → 不硬停、不切換），`hard_stop` 只對取得 grant 的 identity；同規則適用 SC-22 `supervision-mode set`（R5-F1，P4 Task 3／7／12、P8 Task 14） | §4.2 #19、§6.1、§12.1 | Rust-only（1B） |
 | SC-24 | 監管模式 `windows-task`（`ExecutionTimeLimit=PT0S`）與 `windows-service` | §6.1、OD-03、OD-12 | Rust-only（1B） |
 | SC-25 | release manifest，以及 doctor 的 `version_pairing` 檢查 | §9.5、OD-13 | Rust-only |
 | SC-26 | Windows event handler：`exec` 走 CreateProcess 加 Job；`shell` 走 `cmd.exe /d /s /c`；timeout 時 TerminateJobObject；env 白名單另加 `SYSTEMROOT`、`COMSPEC`、`PATHEXT`、`TEMP`、`TMP`、`USERPROFILE` | §5.5 | Rust-only（owner #6） |
@@ -83,6 +83,7 @@
 | DF-15 | RX observer、event engine、background capture 改用該 RX chunk 的精確 WAL seq |
 | DF-16 | Windows `setup` 的 skill link 在不能建 symlink 時改為複製目錄 |
 | DF-17 | WAL 與 mirror 寫入失敗時只重試失敗的那個檔，不再產生重複 seq 的 WAL 行；部分寫入後只補寫剩餘 bytes（依已寫長度 `sent`），補寫再失敗則於下一筆前以 `\n` 終結殘行，不產生被串接的 NDJSON 行（P1 T02 第 3 點、Rust arch §4.5 `WalWriteError`／§5.8 第 5 點，R2-F3） |
+| DF-19 | `session.self_test` 的 nonce probe（`source:"system:self_test"`）在每次 OS 提交前重驗 boot quiet（任何 profile，含 console unlock；與 pre-check `boot_quiet_active()` 同義）與 bridge 世代／epoch：pre-check 通過後才 arm 的 quiet 使 probe 零 TX，回應改為與 pre-check 同形的 `{"ok":true,"classification":"AUTOBOOT_QUIET","session":…,"recommended_action":"wait",<lease ctx>,"command_capable":…}`，不等 nonce、不 `confirm_ready`。不受 ready reconfirm 擋（self-test 是 `READY_UNCONFIRMED` 的建議出口）、不與 login run 世代掛鉤；FLASHING 中照舊 `TARGET_UNRESPONSIVE`（RPC-H-07）。來源 SES-16.6-08（R5-F2）。DF-18 號保留給 P7（`08` §0.5） |
 
 ### 1.3 既有核准：BC-01～BC-05
 
@@ -102,7 +103,7 @@
 | CLI-11.04 | 沒有 `daemon restart` | 列有 restart | NEW SC-20（雙邊） | 依 §4.2；Python 也加，讓 1A 委派一致並可做 A/B | P1/P4 | no |
 | CLI-11.05 | 只有 `remote close`，沒有 `stop` | 列有 stop | NEW SC-21（雙邊別名） | 名稱不同時做別名，Python 原名保留 | P1/P4 | no |
 | CLI-11.06 | 沒有 `setup --rollback` | 要求 rollback | NEW SC-23（Rust-only） | §12.1 必要功能；依賴版本目錄，只有 Rust bundle 有 | P4 | no |
-| CLI-11.07 | `supervision-mode` 唯讀、輸出純文字 | 要求查詢與切換 | NEW SC-22（Rust-only） | 依 §4.2；不帶參數的行為保留 | P4 | no |
+| CLI-11.07 | `supervision-mode` 唯讀、輸出純文字 | 要求查詢與切換 | NEW SC-22（Rust-only） | 依 §4.2；不帶參數的行為保留；切換的交接護欄比照 §12.1 步驟 2～3、`--force` 不覆寫（R1-F3） | P4 | no |
 | CLI-11.08 | `console-attach/detach` 只是 RPC | 歸在 1B 的終端類 | IMPL | 1A 直接原生承接、不委派；只改排程，不改行為 | P3 | no |
 | CLI-11.09 | `benches` 不送 RPC，依 remote registry 並會 prune | 歸在 1A 的純 RPC | IMPL | 1A 委派 `benches`／`connect`，1B 原生；`--bench` 解析在 1A 原生 | P3/P4 | no |
 | CLI-11.10 | `profile test` 離線執行，依賴 Python `re` | 純 RPC | IMPL＋KEEP | 1A 原生，用 `sw-proto::pyre` | P3 | no |
@@ -261,6 +262,7 @@
 | SES-16.6-05 | nonce 會被命令回顯滿足 | — | KEEP | 登入 FSM 基線 | P7 | no |
 | SES-16.6-06 | 裝置離線的 tick 把 RELEASED 改成 DETACHED | §6.2 | FIX DF-04 | 交接安全 | P1/P5 | no |
 | SES-16.6-07 | dead code | — | IMPL | — | — | no |
+| SES-16.6-08 | `session.self_test` 的 nonce probe 只在 `_lock` 內以 `boot_quiet_active()` 檢查一次，離鎖後才送出（`session_manager.py` 約 4482／4533 行）；其間 RX 看到 boot banner 而 arm quiet 時，nonce 仍寫進 U-Boot、打斷 autoboot。Python T20 原本刻意不把 `system:self_test` 納入提交點 quiet 重驗，Rust `SelfTestProbe` 則被 fence 擋下，形成未調和的雙軌差異（R5-F2） | §5.2.1「Login FSM／Ready Probe：Quiet…期間禁止自動 probe」、§5.2.2 三個檢查位置、§11.3 零 TX | FIX DF-19 | self-test nonce 屬 Ready Probe；提交點以 boot quiet 期限（任何 profile，與 pre-check 同義）與 bridge 世代／epoch 重驗，被擋時回 pre-check 同形的 `AUTOBOOT_QUIET`，零 TX。Python 02 T20（`self_test_probe`）、Rust 06 T9／T14、08 T7／T8（`SelfTestProbe` 看 `quiet_active`、`fsm_gen: None`） | P1/P5/P7 | no |
 
 ### 2.6 盤點 06（UART I/O 與 Console §12）
 
@@ -359,6 +361,7 @@
 | TST-D-16 | `p1-cmd-modes` 呼叫 `interactive-status` | §15.11.3 | KEEP | 屬功能 case，不是觀測用途 | — | no |
 | TST-D-17 | 兩個前端的預設值不同 | — | KEEP | — | — | no |
 | TST-D-18 | 13 個檔案使用 `state_iso` | 文件寫 8 檔 | DOC | — | P0 | no |
+| TST-D-19 | L1 出口沒有凍結的案例分母：P9 `junit` 只要求 `tests>0` 且無 failure、P5 gate 以 `passed ≥ expected_min_passed`、P6 以 `cargo_nonzero.sh`（執行數 >0）與「函式存在」、P7 以 `passed>0`、Stage 0 索引只核檔案 sha256；只跑一個成功案例或必要案例被 skip 仍可 PASS（R5-F3） | §11.3「必要案例集合事先凍結」、§11.4「證據不足不得 PASS」 | TEST | P2 新增 `l1_required.lock.json`（每平台必要 nodeid，add-only）、`l1-results.v1`（逐案結果＋runner exit code＋是否完成）與唯一判定 `l1_judge.py`；缺案、重複、必要案例 skip／未執行、exit 非 0 或未完成一律不得 PASS。只改測試工具與 gate 判定，產品對外行為不變，不登記 SC／DF | P2/P3/P4/P5/P6/P7/P8/P9 | no |
 
 ### 2.9 盤點 09（Event、File、Config 等）
 
@@ -481,18 +484,18 @@ Rust 依基線逐字承接以上行為。要修正時另開 issue，並登記新
 
 ## 5. 統計
 
-第 2 節共 297 列（ID 不重複），依「裁決」欄的第一個代號歸類：
+第 2 節共 299 列（ID 不重複），依「裁決」欄的第一個代號歸類：
 
 | 裁決 | 列數 |
 |---|---|
 | KEEP（保留基線並凍結；含 KEEP＋DOC 等以保留為主者） | 152 |
 | SPEC（依定稿規格變更，SC） | 31 |
 | NEW（規格要求的新功能，SC） | 14 |
-| FIX（缺陷／安全修正，DF） | 25 |
+| FIX（缺陷／安全修正，DF） | 26 |
 | BC（既有核准的 BC-01～05） | 19 |
 | DOC（只修文件或勘誤） | 26 |
-| TEST（修測試資產） | 11 |
+| TEST（修測試資產） | 12 |
 | IMPL（內部實作差異） | 19 |
-| **合計** | **297** |
+| **合計** | **299** |
 
-登記項目：SC-01～SC-27（27 項）、DF-01～DF-17（17 項），另有既有核准的 BC-01～05。7 列標為需擁有者確認，對應第 3 節的 7 項（第 1 項含 3 列交叉引用），均已附預設值。
+登記項目：SC-01～SC-27（27 項）、DF-01～DF-17 與 DF-19（18 項；DF-18 保留給 P7 `08` §0.5），另有既有核准的 BC-01～05。7 列標為需擁有者確認，對應第 3 節的 7 項（第 1 項含 3 列交叉引用），均已附預設值。

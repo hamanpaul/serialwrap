@@ -1316,7 +1316,7 @@ scope: contracts
 - `applies_to.rust.stage`：phases 中最早的 Rust phase：P3→`stage-1a`、P4→`stage-1b`、P5→`slice-2.1`、P6→`slice-2.2`、P7→`slice-2.3`、P8→`slice-2.4`；phases 只有 P1／P2 的項目為 `stage-1a`（Rust CLI 起即承接）。
 - `approved_at_revision: 1`；檔案 `revision: 1`。檔內不寫 `contract_revision`。
 - `compatibility_impact`：寫出對既有 agent／L2／L3 的可觀測差異（例 SC-01：「`RECOVERING` 下 submit 由 `SESSION_NOT_READY` 改為 `SESSION_RECOVERING`；依碼分支的 agent 需新增處理」）。
-- `approval_conditions`：BC 照規格 §9.1「核准範圍與必要驗證」欄逐字；SC／DF 寫調和表該列「理由」。
+- `approval_conditions`：BC 照規格 §9.1「核准範圍與必要驗證」欄逐字；SC／DF 寫調和表該列「理由」。SC-22 另寫調和表 SC-22 列的交接護欄條文（R1-F3：fail-closed 安全檢查、`phase:"supervision_set_safety_check"`、停止只經 `daemon.handoff_stop{reason:"supervision_set"}`、`--force` 不覆寫），`spec_refs` 取該列「規格依據」`["§4.2 #16","§6.1","§12.1"]`。
 
 **BC 項（逐字）：**
 
@@ -1356,7 +1356,9 @@ scope: contracts
 | DF-06 | `df06-client-non-json-response` | DF-15 | `df15-rx-exact-wal-seq` |
 | DF-07 | `df07-bad-config-yaml` | DF-16 | `df16-windows-skill-copy` |
 | DF-08 | `df08-contains-flags-validate` | DF-17 | `df17-wal-mirror-retry-no-dup-seq` |
-| DF-09 | `df09-registry-load-valueerror` | | |
+| DF-09 | `df09-registry-load-valueerror` | DF-19 | `df19-self-test-probe-quiet-fence` |
+
+**SC-23／SC-18 的交接拉起抑制（R5-F1；外部可觀測、Rust-only）**：SC-23 的 `compatibility_impact` 必須寫明「update／rollback／回退／中斷復原（與 SC-22 `supervision-mode set`）送 `daemon.handoff_stop` 前先抑制監管拉起：systemd 模式寫入持久 drop-in `serialwrap.service.d/90-serialwrap-update-hold.conf`（`Restart=no`、`RefuseManualStart=yes`）並 `disable`，期間外部 `systemctl start serialwrap`／`serialwrap service start`／systemd 路由的 `daemon start`／`serialwrap-minicom` 的 `AUTO_START_DAEMON` 會被拒絕，完成、拒絕還原或 `setup` 復原後才撤銷並依原值 enable；updater 中斷時 hold 保留到下一次 `serialwrap setup`；windows-task 在更新期間維持 disabled（重新註冊的 XML `Enabled=false`）；偵測到交接後被拉起或手動啟動的實例會對它重新交接，忙碌時拒絕更新且不中止其操作；新增 phase `update_autostart_hold`／`update_autostart_release`（不新增碼）」，`approval_conditions` 附加「§6.1 不得讓新舊監管項同時拉起、§12.1 步驟 3 先停止該實例的監管拉起能力」。SC-18 的 `compatibility_impact` 必須寫明「`install-journal.json` 存在時不自動啟動、不重送，stderr 印 `serialwrap: on-demand 自動啟動暫停：更新／回滾進行中（install-journal.json 存在），請待 serialwrap setup 完成`；與交接停止共用 `<RUN_DIR>/autostart.lock`」。兩項 `case_ids` 不變（`sc23-setup-rollback`、`sc18-windows-ondemand-autostart` 由 P4 `p4_case_map.yaml` 綁到 05 Task 3／7／12 的 R5-F1 測試）。
 
 `owner_confirmation: pending_default` 的項目與 `owner_item`：SC-08→3、SC-04→4、DF-02→5、SC-26→6、SC-27→7；`default_if_pending` 照調和表 §3「預設」欄逐字。其餘 `not_required`。
 
@@ -1379,7 +1381,7 @@ pending_owner_confirmations:
 
 | id | title | error_codes | case_ids（本檔已有、可作證據者） |
 |---|---|---|---|
-| `zero_tx_on_reject` | 被拒絕且依契約應為零副作用的請求，外部 TX 必須為零 | `error_codes.yaml` 中 `uart_tx == "none"` 且介面含 `rpc` 或 `rec` 的全部碼（實作時由資料產生後貼入，T5 測試核對兩者相等） | `sc01-recovering-submit-open`、`sc02-flashing-submit-open`、`sc03-quiet-retry-after-execute-file` |
+| `zero_tx_on_reject` | 被拒絕且依契約應為零副作用的請求，外部 TX 必須為零 | `error_codes.yaml` 中 `uart_tx == "none"` 且介面含 `rpc` 或 `rec` 的全部碼（實作時由資料產生後貼入，T5 測試核對兩者相等） | `sc01-recovering-submit-open`、`sc02-flashing-submit-open`、`sc03-quiet-retry-after-execute-file`、`df19-self-test-probe-quiet-fence`（R5-F2） |
 | `no_forbidden_interleave` | 不得將不同來源的 bytes 以契約禁止的方式交錯 | `[]` | `[]`（本檔無對應 case；由 P2 `cases.yaml` 以 invariants 欄承接） |
 | `no_stale_context_replay` | Recovery／Release／Reboot／Lease 切換不得回放失效上下文的輸入 | `[FLUSHED_BY_RECOVERY, FLUSHED_BY_SHUTDOWN]` | `bc02-deferred-context-switch-clear`、`bc02-mailbox-stale-input-not-replayed` |
 | `no_reopen_before_handoff` | 舊 I/O worker 未完成交接前，不得另開同一受管端點，亦不得回覆釋放成功 | `[DEVICE_STILL_HELD, SESSION_RECOVERING]` | `sc04-drain-recovering-release-timeout`、`bc04-device-attach-sync-reacquire`、`sc05-device-attach-sync-exclusive` |
@@ -1393,14 +1395,16 @@ pending_owner_confirmations:
 | `test_bc_real_five_bcs_registered` | `{c.id for c in changes if c.kind == "BC"} == {"BC-01","BC-02","BC-03","BC-04","BC-05"}`，每筆 `status != "PROPOSED"`（不凍結字面 APPROVED；P1 翻成 IMPLEMENTED 後仍成立）、`approval.decision_ref == "OD-04"`、`approval.date == "2026-10-15"`、`approval.owner == "hamanpaul"` |
 | `test_bc_real_approval_owner_by_basis` | 每筆 `approval.owner == APPROVAL_OWNER_BY_BASIS[approval.basis]`；SC-19 `basis == "owner_decision"`、`decision_ref == "OD-11"`；所有 DF `basis == "reconciliation"` |
 | `test_bc_real_bc_case_ids_frozen` | BC-03 的 `case_ids == ("bc03-aborted-in-flight-after-1byte","bc03-unknown-outcome-send-failed","bc03-no-auto-resend")`；BC-01 含 `"bc01-f12-oracle-progress"`；BC-01 `related_decisions` 含 `"OD-13"` |
-| `test_bc_real_sc_df_ranges` | SC id 集合等於 `{f"SC-{i:02d}" for i in range(1, 28)}`；DF 集合等於 `{f"DF-{i:02d}" for i in range(1, 18)}`（範圍取自調和表 §1 的編號區間，屬資料而非計數政策） |
+| `test_bc_real_sc_df_ranges` | SC id 集合等於 `{f"SC-{i:02d}" for i in range(1, 28)}`；DF 集合等於 `{f"DF-{i:02d}" for i in range(1, 18)} | {"DF-19"}`（範圍取自調和表 §1 的編號區間，屬資料而非計數政策；DF-18 保留給 P7 `08` §0.5，P7 Task 0 登記後改為 `range(1, 20)`，R5-F2）；DF-19 另斷言 `scope == "both"`、`phases == ["P1", "P5", "P7"]`、`case_ids == ("df19-self-test-probe-quiet-fence",)`、`reconciliation_refs` 含 `"SES-16.6-08"`、`applies_to.rust.stage == "slice-2.1"` |
 | `test_bc_real_rust_only_python_null` | `scope == "rust_only"` 者 `applies_python_min is None`；SC-15、SC-17、SC-18、SC-22、SC-23、SC-24、SC-26 皆為 `rust_only`；SC-25 的 `scope ∈ {"rust_only","python_when_manifest_present"}` |
+| `test_bc_real_sc22_switch_guard_not_force_overridable`（R1-F3） | SC-22：`scope == "rust_only"`、`"§12.1"` 在任一 `spec_refs` 元素內；`approval_conditions` 同時含 `daemon.handoff_stop`、`supervision_set_safety_check` 與 `--force`；`compatibility_impact` 含 `force_ignored`（內容：「`supervision-mode set` 在 Flash、FileTransfer、命令、lease、recovering、身分不明或探測失敗時拒絕切換（`phase:supervision_set_safety_check`，既有碼），`--force` 不覆寫、只回 `force_ignored:true`；停止舊 daemon 只經 `daemon.handoff_stop`，不支援交接的舊 daemon 無法被切換」）；`case_ids == ("sc22-supervision-mode-set",)` 不變 |
 | `test_bc_real_ab_participation` | 每筆 `ab_participation == ("diff" if scope == "both" else "absolute_only")`（P9 消費此欄） |
 | `test_bc_real_no_contract_revision_key` | 原始 YAML 文字不含 `contract_revision:` |
 | `test_bc_real_safety_invariants` | `[i.id for i in safety_invariants] == list(SAFETY_INVARIANTS)`；`zero_tx_on_reject.error_codes` 等於 `{c for c in error_codes if c.uart_tx == "none" and {"rpc","rec"} & set(c.scope.interfaces)}`；`no_auto_resend.error_codes` 等於 `uart_tx ∈ {possible, confirmed}` 的碼集合 |
 | `test_bc_real_pending_items` | `{c.id: c.owner_item for c in changes if c.owner_confirmation == "pending_default"} == {"SC-08": 3, "SC-04": 4, "DF-02": 5, "SC-26": 6, "SC-27": 7}`；`[o.item for o in owner_confirmations] == [1,2,3,4,5,6,7]` |
 | `test_bc_real_case_ids_globally_unique` | 全部 case_ids 無重複 |
 | `test_bc_real_error_code_refs_resolve` | `error_codes.yaml` 每個 `behavior_change` id 都存在於本檔（T6 C10 的前置） |
+| `test_bc_real_sc23_sc18_autostart_hold_registered`（R5-F1） | SC-23 `compatibility_impact` 同時含子字串 `RefuseManualStart=yes`、`Restart=no`、`90-serialwrap-update-hold.conf`、`重新交接`、`update_autostart_hold`；SC-23 `approval_conditions` 含 `§12.1 步驟 3`；SC-18 `compatibility_impact` 含 `install-journal.json` 與 `autostart.lock`；兩者 `scope == "rust_only"`、`case_ids` 分別仍為 `("sc23-setup-rollback",)`、`("sc18-windows-ondemand-autostart",)` |
 
 - [ ] **Step 2：執行並確認 FAIL** — `python3 -m pytest -q tests/test_contracts_catalog.py -k bc_real`；Expected：FAIL（檔案不存在）。
 - [ ] **Step 3：commit 測試** — `git commit -m "test(contracts): 新增行為變更登記的失敗測試"`（含 trailer）。
@@ -1416,7 +1420,7 @@ pending_owner_confirmations:
 type: feat
 scope: contracts
 ---
-新增 `contracts/behavior_changes.yaml`：登記 OD-04 核准的 BC-01～BC-05（核准者、日期、目標版本、核准時 catalog revision、案例 ID、A/B 參與方式、相容性影響、核准條件），以及依定稿規格推導的 SC-01～SC-27 與缺陷修正 DF-01～DF-17、§11.3 六項安全不變量對照，另列 7 項待擁有者確認事項與預設值。
+新增 `contracts/behavior_changes.yaml`：登記 OD-04 核准的 BC-01～BC-05（核准者、日期、目標版本、核准時 catalog revision、案例 ID、A/B 參與方式、相容性影響、核准條件），以及依定稿規格推導的 SC-01～SC-27 與缺陷修正 DF-01～DF-17、DF-19（self-test nonce probe 提交點 quiet 重驗；DF-18 保留給 P7）、§11.3 六項安全不變量對照，另列 7 項待擁有者確認事項與預設值。
 ```
 
 `git add contracts/behavior_changes.yaml changelog.d/rust-p0-behavior-changes.md`；`git commit -m "feat(contracts): 新增 BC/SC/DF 行為變更登記" -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"`

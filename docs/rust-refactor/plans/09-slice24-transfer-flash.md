@@ -1994,7 +1994,7 @@ def test_released_survives_two_restarts_and_replug(sw_env, shell_target):
   第二次 SIGTERM／SIGINT 只記 log，不改變上述步驟與結果。
   ```
   子步驟 1a～1c、5a 屬於 1～7 範圍內，本 Task 文中「1～7」「3～7」皆包含其間的子步驟。1a～1c 必在步驟 3 之前：gate 先於 watcher.stop，使 watcher 最後一輪送出的 Delta 也被擋下；事件派工先關，Phase 1 之後的 RX 不再產生新 handler（R1-F2；P1 Python 順序為 engine.stop → watcher.stop → shutdown_drain，Rust 把 engine 拆成「1c 關 intake」與「5a 有界收斂」，handler 與 drain 並行而不先耗盡 5 s 預算）。
-  上限來源：步驟 2 的 2.0 s 為 Python `FlashEndpoint.stop` join 值；步驟 3～5 與 5a 共用 SC-11／arch §6.1 的 5 s，5a 另含 P7 的 100 ms 回收寬限；不另訂其他總上限。**有界等待與 exit code 分開判定**：任何一步逾時或失敗都不阻擋後續步驟（停止序必定走完 1～7），但失敗會累積到 `incomplete`，最終 exit 1；只有 1～7 全部收斂才 exit 0。未攔截 panic → exit 1。exit 1 讓 `Restart=on-failure`／Task Scheduler RestartOnFailure 能辨識異常停機（`daemon.stop` 觸發的未收斂停機會被監管器重啟；`systemctl stop` 觸發者 unit 標為 failed）。本規則屬 SC-11 細化，延續 P5 Task 19 已登記的 DF 候選（P5 PR 描述），不另立 ID；Python 基線此情境的 exit code 不改（02 Task T08），不屬 A/B 比較範圍，A/B 案例不製造停機未收斂。
+  上限來源：步驟 2 的 2.0 s 為 Python `FlashEndpoint.stop` join 值；步驟 3～5 與 5a 共用 SC-11／arch §6.1 的 5 s，5a 另含 P7 的 100 ms 回收寬限；不另訂其他總上限。**有界等待與 exit code 分開判定**：任何一步逾時或失敗都不阻擋後續步驟（停止序必定走完 1～7），但失敗會累積到 `incomplete`，最終 exit 1；只有 1～7 全部收斂才 exit 0。未攔截 panic → exit 1。exit 1 讓 `Restart=on-failure`／Task Scheduler RestartOnFailure 能辨識異常停機（`daemon.stop` 觸發的未收斂停機會被監管器重啟；`systemctl stop` 觸發者 unit 標為 failed；`daemon.handoff_stop` 觸發者——update／rollback／回退／復原／`supervision-mode set`——同樣可能 exit 1，故 P4 CLI 在送交接前一律 `hold_autostart`（systemd 持久 drop-in `Restart=no`＋`RefuseManualStart=yes`＋`disable`，05 Task 3／7／12，R5-F1），交接觸發的 exit 1 不會在備份／切換期間被拉起；daemon 端不為此改變 exit code）。本規則屬 SC-11 細化，延續 P5 Task 19 已登記的 DF 候選（P5 PR 描述），不另立 ID；Python 基線此情境的 exit code 不改（02 Task T08），不屬 A/B 比較範圍，A/B 案例不製造停機未收斂。
 
 - [ ] **Step 1：寫失敗測試**
 
@@ -2193,7 +2193,9 @@ P4 已交付 §12.1 七步與 `safety_check`（05 L1617-1654：`mcu.status`(0.5 
   - daemon 健康三態：**確認不存在**（連線被拒或 socket／TCP 端點不存在，且 `ProcScan` 找不到 `serialwrapd`）→ 視為通過；**健康**→ 照常檢查；**未知**（RPC timeout、壞回應、連線成功但回應不可解析、行程存在但 RPC 不通）→ 拒絕，碼依 05 Task 12 錯誤表：探測 RPC 逾時／壞回應／連線失敗回該 RPC 的碼（`TIMEOUT`／`INVALID_RESPONSE`／`SOCKET_ERROR`，detail `probe:<method>`），行程存在但 RPC 不通回 `DEVICE_STILL_HELD`（detail `pids`），兩者 detail 皆加 `{"health":"unknown","reason":…}`；**`--force` 不可略過**（健康不明時可能正處 FLASHING／FileTransfer，停 daemon 無法撤銷 DUT 已發生的部分燒寫）。
   - 步驟 3 交接（R1-F1）：停用後送 `daemon.handoff_stop`，**不送**一般 `daemon.stop`；daemon 回忙碌或交接無法確認 → 還原 enabled、不硬停、不切換；CLI 不得以第二次 `session.list` 取代 daemon 原子判定。
   - 步驟 7 回退與 journal 復原（R2-F6，05 Task 12 `stop_for_revert`）：停止步驟 6 已啟動、已對外服務的 Rust daemon 同樣只送 `daemon.handoff_stop{"reason":"revert"}`；Rust daemon 對 `reason:"revert"` 的 busy 判定與凍結語意與 `"update"` 相同；忙碌／不明 → 不硬停、不切換回 Previous、journal 保留。
+  - 交接前抑制監管拉起與重新交接（R5-F1，05 Task 3／7／12）：本 Task 以 Rust daemon 驗證 P4 契約——送 `daemon.handoff_stop` 前 CLI 已對當下 mode `hold_autostart`（systemd 持久 drop-in＋`disable`；windows-task／windows-service disable，hold 期間重新註冊以停用狀態送出；on-demand 持 `autostart.lock`＋journal 擋 SC-18），Rust daemon 交接後以 exit 1（P8 Task 12 停機未收斂）結束時不得被監管器拉起；若 endpoint 仍出現另一個 Rust daemon 實例（hold 前已拉起、hold 失效、手動啟動），它的 `daemon.handoff_stop` 由它自己的 `AdmissionGate` 原子判定（舊 token 對它無效、daemon 不接受外來 token），忙碌即拒絕、CLI 不硬停不切換。daemon 端不新增方法、不改 exit code。
   - `--force` 對 update／rollback 的 busy、健康三態、身分確認與步驟 3 交接**全部無效**；帶 `--force` 的拒絕結果與未帶時逐欄相同，只多 detail `force_ignored:true`，且不得 disable／stop 監管、不得送 `daemon.stop`。一般 `setup`（非 update 路徑）的 Python 對等 `--force` 覆寫不變。
+  - `supervision-mode set`（SC-22，R1-F3，05 Task 12 `run_supervision_switch`）：不屬 Python 對等例外；停止 Rust daemon 只送 `daemon.handoff_stop{"reason":"supervision_set"}`，Rust daemon 對該 reason 的 busy 判定與凍結語意與 `"update"` 相同；忙碌／不明 → CLI 還原 enabled、不硬停、不寫 config，`--force` 無效。
 
 - [ ] **Step 1：寫失敗測試**
 
@@ -2212,6 +2214,8 @@ P4 已交付 §12.1 七步與 `safety_check`（05 L1617-1654：`mcu.status`(0.5 
 | `handoff_file_push_after_last_probe`（`crates/sw-daemon/tests/handoff_stop.rs`，daemon 側；CLI 側同情境為 05 `update_file_push_after_last_probe`，Python A/B 對應 P1 `test_handoff_file_push_after_last_probe`；真 daemon＋FakeSerial；R1-F1，修正前必 FAIL） | `session.list` 閒置後開始 `file.push`（FakeSerial 寫入阻塞），再送 `daemon.handoff_stop{"reason":"update"}` | `{"ok":false,"error_code":"SESSION_BUSY","busy":[{"com":"COM0",…,"ops":["file.push"]}]}`；trace 無 `BeginDrain`／`TransferAbort`；放行後 push `ok:true` 且 FakeSerial 收到完整 payload；再送交接 → `ok:true`、`stopping:true`、token 32 hex、回應無 `version`，之後 trace 才出現 `ServerStopped`，`SessionsDrained{flushed:[],stalled:[]}`、exit 0 |
 | `handoff_flash_races_prepare`（同檔；CLI 側為 05 `update_flash_races_prepare`；R1-F1，修正前必 FAIL） | fakemcu：sync-probe 與 `daemon.handoff_stop{"reason":"rollback"}` 以 Barrier 同時觸發，200 輪；另兩個固定順序案例 | 每輪：交接 ok ⇒ probe 被拒、fakemcu 收到 0 bytes、session 從未 `FLASHING`；probe 先 admit ⇒ 交接回 `FLASHING_BUSY`、daemon 未停止、flash 完成後 `Return error code : 0x0` |
 | `handoff_frozen_rejects_mutating_methods`（同檔） | 交接 ok 後（停止尚未完成前）對 `rpc_schema.json` 中 `side_effects` 非空且 `retryable_readonly==false` 的每個方法送請求 | 皆 `{"ok":false,"error_code":"FLUSHED_BY_SHUTDOWN","reason":"handoff_frozen"}`；FakeSerial 自凍結起零寫入、WAL 無新 TX、`state.json` 未改寫；`health.ping`／`session.list`／`mcu.status` 仍 ok |
+| `handoff_reason_supervision_set_same_semantics`（同檔；R1-F3） | 參數化 reason `update`／`rollback`／`revert`／`supervision_set`：`file.push` ticket 已 admit；或 flash sync-probe ticket；或全閒置 | 前兩者各回 `SESSION_BUSY`（`ops` 含 `file.push`）／`FLASHING_BUSY`、未凍結、push 完成且 sha256 相符；閒置回 32 hex token 且凍結；四個 reason 除 token 外回應逐欄相同 |
+| `supervision_set_force_refuses_rust_daemon_pushing`（`tests/contract_blackbox/test_s24_update_rollback.py`；R1-F3） | Rust daemon（P8 Task 14 後）`file push` 進行中，`serialwrap supervision-mode set systemd-user --force`（stub `systemctl`） | exit 2、`SESSION_BUSY`、`phase:"supervision_set_safety_check"`、`force_ignored:true`；push 完成、daemon pid 不變、stubd／stub `systemctl` 未收到停止、`config.yaml` 位元組不變 |
 | `handoff_busy_lease_and_recovering`（同檔） | lease 開啟；或 IoError drain 進行中 | 各回 `SESSION_BUSY`（`ops:["session.interactive_open"]`／`recovering:true`），未凍結、之後 `command.submit` 照常受理 |
 | `rollback_refuses_push_started_after_probe`（黑箱，Rust daemon，`posix_pty`，`process_rpc`；R1-F1） | dev bundle 以 `SW_TEST_UPDATE_PAUSE_AFTER=safety_check` 在預檢後暫停，期間開始 `file push`，再放行 `setup --rollback`（與 `--force` 各一次） | `SESSION_BUSY`、`handoff:"refused"`、exit 2；`daemon status.pid` 不變、WAL 無 shutdown 記錄；push 正常完成且 DUT 端 md5 正確；`current-release.json` 未變 |
 | `guard_daemon_absent_force_same_as_without` | daemon 確認不存在＋`--force` | 放行進第 3 步，steps 與未帶 `--force` 相同（`--force` 不改變通過路徑） |
@@ -2226,6 +2230,8 @@ P4 已交付 §12.1 七步與 `safety_check`（05 L1617-1654：`mcu.status`(0.5 
 | `rollback_verifies_pairing` | Previous manifest 與實際 sha 不符 | 回到 Current，保存失敗證據（P4 行為，以 Rust daemon 再跑）；停止 Previous daemon 只經 `daemon.handoff_stop{"reason":"revert"}`、stubd 未收到 `daemon.stop` |
 | `revert_refuses_while_new_rust_daemon_pushing`（黑箱，Rust daemon，`posix_pty`，`process_rpc`；R2-F6，CLI 側為 05 `revert_refuses_while_new_daemon_pushing`，修正前必 FAIL） | 更新到 Rust daemon 的 dev bundle，以 `SW_TEST_UPDATE_PAUSE_AFTER=start_and_verify:started`＋`SW_TEST_UPDATE_FORCE_VERIFY_FAIL=smoke_failed` 在新版啟動後暫停，期間對新版開始 1 MiB `file push`，再放行 | `setup` exit 2、`revert_pending:true`、`revert_error{error_code:"SESSION_BUSY",handoff:"refused"}`；新版 trace 無 `BeginDrain`／`TransferAbort`、`daemon status.pid` 不變；push 正常完成且 DUT 端 md5 正確；`current-release.json` 仍為新版、journal 保留；push 完成後再跑 `setup` → 交接 ok、`SessionsDrained{flushed:[],stalled:[]}`、回到 Previous 且 `version_pairing.ok` |
 | `journal_recovery_refuses_while_new_rust_daemon_flashing`（黑箱，fakemcu，`posix_pty`；R2-F6，CLI 側為 05 `journal_recovery_refuses_while_new_daemon_flashing`） | dev bundle 在新版啟動後以 test hook 模擬 updater 被殺（`SW_TEST_UPDATE_CRASH_AT=start_and_verify:after_effect`），fakemcu 對新版開始燒錄後執行 `setup` | `FLASHING_BUSY`／`install_recover`、`recovered_journal.ok:false`、journal 逐位元組不變；新版未停止、flash 完成 `Return error code : 0x0`、燒後 session 回 `ATTACHED`；之後再跑 `setup` 才回到 Previous |
+| `update_rust_daemon_exit1_after_handoff_not_relaunched`（黑箱，Rust daemon，`posix_pty`，`process_rpc`，`supervisor_runtime`；R5-F1，CLI 側為 05 `update_systemd_exit1_after_handoff_not_relaunched`／`test_update_systemd_exit1_not_relaunched_l15`；預設 ignored、擁有者授權） | 真 `systemd --user` 隔離 unit（`Restart=on-failure`、`RestartSec=2`，dev bundle `SERIALWRAP_SYSTEMD_UNIT_NAME=sw-r5f1-<pid>`）跑 Rust daemon（Current）；以 `DaemonHooks.block_flash_endpoint_stop` 的 env 版 `SW_TEST_DAEMON_SHUTDOWN_INCOMPLETE=flash_endpoint`（只在 `test-hooks` feature）讓交接後停機以 exit 1 結束；執行 `setup`（更新到另一 Rust dev bundle） | 舊 daemon stderr 含 `serialwrapd: shutdown incomplete:`、`ExecStopPost` 記錄 `exited:1`；自交接到新版啟動之間 `systemctl --user show -p NRestarts --value` 維持 0、`MainPID` 只出現舊與新兩個 pid（無第三個）、`HolderSampler(slave_path, 0.01)` `max_concurrent()<=1`；更新 `ok:true`、drop-in 已移除、`Restart=on-failure`、`UnitFileState==enabled`；舊版不得在 `entries_switching` 之後被拉起（新版 `health.status.version` 恰為目標版） |
+| `update_switch_window_relaunched_rust_daemon_flash_not_truncated`（黑箱，fakemcu，`posix_pty`，`process_rpc`；R5-F1，CLI 側為 05 `update_relaunched_instance_during_backup_rehandoff_refuses_flash`） | dev bundle 以 `SW_TEST_UPDATE_PAUSE_AFTER=backup_started` 在舊版交接結束、備份進行中暫停；期間手動以舊穩定入口啟動同 endpoint 的 Rust daemon（模擬 hold 失效／手動啟動），fakemcu 對它開始燒錄，再放行 | `setup` exit 2、`FLASHING_BUSY`／`update_confirm_released`、`handoff:"refused"`、`relaunched.pid` 等於手動啟動的 pid；該 daemon trace 無 `BeginDrain`／`TransferAbort`、未收到 `daemon.stop`、flash 完成 `Return error code : 0x0`；`current-release.json` 與穩定入口未變、無 `entries_switching` journal 紀錄、journal 已刪 |
 
 - [ ] **Step 2：執行並確認 FAIL**：`cargo test -p sw-cli --test update_guard` → 新增三態與 lease 列 FAIL（P4 既有列 PASS）；`cargo test -p sw-core --test admission`、`cargo test -p sw-daemon --test handoff_stop` → FAIL（`METHOD_NOT_FOUND`／`AdmissionGate` 未實作）；黑箱對 Rust bundle FAIL（`rust_only` 兩列在 Python 側 SKIP 並已於 `cases.yaml` 登記）。
 - [ ] **Step 3：commit 測試**：`test(setup): 新增更新／回滾守衛對 Rust daemon 的驗證與 fail-closed 測試`
@@ -2262,16 +2268,18 @@ P3～P7 的黑箱與 Rust 測試沒有 `contract` marker，故 ID↔測試的對
   # coverage_plugin.py／import_cargo_results.py 寫 <run_dir>/results-<label>.json：
   #   {"label","platform","cli_exe","cli_sha256","daemon_exe","daemon_sha256","contract_revision",
   #    "cases_yaml_sha256","cases_lock_sha256","tool":{"name","revision"},"started_at","finished_at",
+  #    "collected":[nodeid…],"exit_code":int,"finished":bool,           # R5-F3：runner 實際收集清單、exit code（pytest exitstatus／cargo 各 exe 最大值）與是否跑完
   #    "results":[{"nodeid","outcome":"passed|failed|skipped|xfailed|error","phase":"setup|call|teardown","skip_reason",
   #                "evidence":[{"path","sha256"}]}]}
+  #   （pytest 端 coverage_plugin 與 P2 SW_RESOURCE_REPORT 同源欄位；cargo 端 import_cargo_results.py 以 P3 cargo_l1_results.py 的 collected／exit_code／finished 填寫）
   # contract_coverage.py
   EXTRACTORS: dict[str, Callable[[Path], list[str]]]
   def universe(contracts_dir: Path, cases: Path, lock: Path, cmap: Path) -> dict[str, dict]: ...
   #   id → {kind, platforms, rust_only: bool, l1_only: bool, owner_phase, nodeids: [...], blocked_caps: [...]}
   def load_results(run_dir: Path) -> list[dict]: ...   # 只讀單一 run_dir；拒絕身分不一致（見判定）
   def evaluate(universe: dict, results: list[dict]) -> dict: ...
-  #   {"covered","missing":{owner_phase:[id…]},"blocked_owner":{id: reason},"ab_mismatch","identity_errors"}
-  def main(argv=None) -> int: ...   # missing、ab_mismatch、identity_errors 任一非空 → exit 1
+  #   {"covered","missing":{owner_phase:[id…]},"blocked_owner":{id: reason},"ab_mismatch","identity_errors","incomplete_runs":{label: [reason…]}}
+  def main(argv=None) -> int: ...   # missing、ab_mismatch、identity_errors、incomplete_runs 任一非空 → exit 1
   ```
   ID 規則：`error_code:<CODE>`（`reachable:true`）、`last_error:<VALUE>`（`reachable:true`）、`rpc_method:<name>`（`rpc_schema.json` 的 `x-methods` 鍵，55 個＝54 基線＋P1 T08 併入的 SC-11 `daemon.handoff_stop`，R1-F1）、`cli_cmd:<group> <sub>`（`cli_schema.json` 的 `/commands[*].path`）、`bc:<ID>`（`behavior_changes.yaml` 的 `changes[*].id`，含 SC-32、SC-33）、`schema:wal_record`、`schema:state_file`、`case:<case_id>`（`cases.lock.json` 的 `sets["slice_2.4"]`）。`EXTRACTORS` 的路徑與 P0 實際檔案不同時，於本 Task 同 PR 調整並由 `test_extractors_match_real_contracts` 把關。
 
@@ -2281,6 +2289,7 @@ P3～P7 的黑箱與 Rust 測試沒有 `contract` marker，故 ID↔測試的對
   3. **A/B**：非 `rust_only` 的 ID，對應 nodeid 在同平台 `python-*` 亦須 `passed`（同一 nodeid 結果不一致 → `ab_mismatch`）；`l1_only`（只有 Rust L1 nodeid，如 `ECHO_ACK_UNSUPPORTED`）不做 A/B 比對，以 `cargo:` 結果滿足。
   4. **案例**：`case:` 屬 L2／L3／manual 或 capabilities 含 `physical_uart`／`windows_com`／`interactive_desktop`／`supervisor_runtime`／`longrun_bench` 者，只能列 `blocked_owner`，**不得**計入 covered，直到匯入有效實機證據。
   5. `skipped`、`xfailed`、任何 `phase in {setup, teardown}` 的 `error` 一律不算 PASS。
+  5b. **執行完整性（R5-F3）**：一個 ID 在某平台成立，必須其對應的**每個** nodeid（`nodeids` 全部，不是任一）在該 label 結果中恰有一列 call `passed`、且無同 nodeid 的 setup／teardown `error`；結果檔 `finished is not True`、`exit_code != 0`、`collected` 內有重複 nodeid、`results` 內同一 nodeid 同 phase 多列、或 `results` 的 nodeid 不在 `collected` 內 → 該 label 列入 `incomplete_runs`（附原因），其整檔 `passed` 不得滿足任何 ID（不得挑最好一列、不得以中途中止的輪次湊證據）；對應 nodeid 根本未被收集（`coverage_map.yaml` 寫錯或測試被刪改名）→ 該 ID 列 `missing`（原因 `nodeid not collected: <nodeid>`）。
   6. `missing` 依 `owner_phase` 分組輸出；本 Task 只補 P8 自身 ID 的對應與案例，其他 Phase 的缺口交回該 Phase owner（不由本 Task 代寫他 Phase 的黑箱），出口前必須清零。
 
 - [ ] **Step 1：寫失敗測試**
@@ -2303,7 +2312,8 @@ def _run(*args):
 def _results(run: Path, label: str, platform: str, rows: list[dict], **over) -> Path:
     run.mkdir(parents=True, exist_ok=True)
     doc = {"label": label, "platform": platform, "cli_exe": "x", "cli_sha256": "0" * 64, "daemon_exe": "y",
-           "daemon_sha256": "1" * 64, **REV, "results": rows}
+           "daemon_sha256": "1" * 64, **REV, "collected": sorted({r["nodeid"] for r in rows}), "exit_code": 0, "finished": True,
+           "results": rows}
     doc.update(over)
     p = run / f"results-{label}.json"; p.write_text(json.dumps(doc)); return p
 
@@ -2378,6 +2388,44 @@ def test_windows_only_id_does_not_require_linux(tmp_path):
     out = json.loads((tmp_path / "o.json").read_text())
     assert r.returncode == 0 and "error_code:X_WIN_ONLY" in out["covered"], "Windows-only ID 不需 rust-linux 證據"
 
+def test_all_mapped_nodeids_required_not_any(tmp_path):        # R5-F3，failing-first
+    run = tmp_path / "run8"
+    _results(run, "rust-linux", "linux", [_row("t::g1"), _row("t::g2", "skipped")])
+    _results(run, "python-linux", "linux", [_row("t::g1"), _row("t::g2")])
+    r = _run("--run-dir", str(run), "--json", str(tmp_path / "o.json"), "--only", "rpc_method:mcu.status",
+             "--map", "rpc_method:mcu.status=t::g1,t::g2")
+    assert r.returncode == 1, "一個 nodeid passed、另一個 skipped 不得滿足 ID"
+    assert "rpc_method:mcu.status" in sum(json.loads((tmp_path / "o.json").read_text())["missing"].values(), [])
+
+def test_incomplete_run_cannot_satisfy(tmp_path):              # R5-F3，failing-first
+    for i, over in enumerate([{"exit_code": 2}, {"finished": False}, {"collected": ["t::h", "t::h"]}]):
+        run = tmp_path / f"run9{i}"
+        _results(run, "rust-linux", "linux", [_row("t::h")], **over)
+        _results(run, "python-linux", "linux", [_row("t::h")])
+        r = _run("--run-dir", str(run), "--json", str(tmp_path / "o.json"), "--only", "error_code:SESSION_BUSY",
+                 "--map", "error_code:SESSION_BUSY=t::h")
+        out = json.loads((tmp_path / "o.json").read_text())
+        assert r.returncode == 1 and "rust-linux" in out["incomplete_runs"], over
+        assert "error_code:SESSION_BUSY" not in out["covered"]
+
+def test_duplicate_result_rows_not_best_of(tmp_path):          # R5-F3
+    run = tmp_path / "run10"
+    _results(run, "rust-linux", "linux", [_row("t::k", "failed"), _row("t::k")])
+    _results(run, "python-linux", "linux", [_row("t::k")])
+    r = _run("--run-dir", str(run), "--json", str(tmp_path / "o.json"), "--only", "error_code:SESSION_BUSY",
+             "--map", "error_code:SESSION_BUSY=t::k")
+    out = json.loads((tmp_path / "o.json").read_text())
+    assert r.returncode == 1 and out["incomplete_runs"]["rust-linux"]
+
+def test_mapped_nodeid_not_collected_is_missing(tmp_path):     # R5-F3
+    run = tmp_path / "run11"
+    _results(run, "rust-linux", "linux", [_row("t::m")])
+    _results(run, "python-linux", "linux", [_row("t::m")])
+    _run("--run-dir", str(run), "--json", str(tmp_path / "o.json"), "--only", "error_code:SESSION_BUSY",
+         "--map", "error_code:SESSION_BUSY=t::m,t::renamed")
+    out = json.loads((tmp_path / "o.json").read_text())
+    assert "error_code:SESSION_BUSY" in sum(out["missing"].values(), [])
+
 def test_cargo_results_import_roundtrip(tmp_path):
     imp = ROOT / "scripts" / "rust" / "import_cargo_results.py"
     r = subprocess.run([sys.executable, str(imp), "--fixture", str(ROOT / "tests/fixtures/cargo_results_sample.json"),
@@ -2385,6 +2433,7 @@ def test_cargo_results_import_roundtrip(tmp_path):
     assert r.returncode == 0, r.stderr
     doc = json.loads((tmp_path / "results-rust-linux.json").read_text())
     assert all(row["nodeid"].startswith("cargo:") for row in doc["results"])
+    assert doc["finished"] is True and isinstance(doc["exit_code"], int) and set(doc["collected"]) >= {r["nodeid"] for r in doc["results"]}   # R5-F3
 ```
 （`tests/fixtures/cargo_results_sample.json` 為測試作者交付的小型樣本。）
 
@@ -2404,7 +2453,7 @@ def test_cargo_results_import_roundtrip(tmp_path):
 - [ ] **Step 2：執行並確認 FAIL**：`python3 -m pytest -q tests/test_rust_contract_coverage.py` → FAIL（工具不存在）；階段 A 以 `xfail(strict=True)` 標記維持全套綠燈。
 - [ ] **Step 3：commit 測試**：`test(contracts): 新增凍結契約覆蓋判定測試`
 - [ ] **Step 4：實作**：plugin 以 `pytest_runtest_logreport` 記錄各 phase outcome、`pytest_sessionfinish` 寫檔（`DISK_STABLE` 等價：`sort_keys=True, separators=(",", ":")`）；`contract_coverage.py`／`import_cargo_results.py` stdlib＋PyYAML；填寫 `coverage_map.yaml` 中 P8 自身 ID；移除 xfail。之後執行 `scripts/rust/slice24_exit.sh`；`missing` 中屬 P8 者補案例，屬他 Phase 者依 `owner_phase` 交回該 owner（不得改判定規則、不得代寫）。
-- [ ] **Step 5：執行並確認 PASS**：`python3 -m pytest -q tests/test_rust_contract_coverage.py` → 9 passed；`scripts/rust/slice24_exit.sh` exit 0，`slice24.json` 的 `missing`、`ab_mismatch`、`identity_errors` 為空，`blocked_owner` 只含下節彙總項目。
+- [ ] **Step 5：執行並確認 PASS**：`python3 -m pytest -q tests/test_rust_contract_coverage.py` → 13 passed；`scripts/rust/slice24_exit.sh` exit 0，`slice24.json` 的 `missing`、`ab_mismatch`、`identity_errors`、`incomplete_runs` 為空，`blocked_owner` 只含下節彙總項目。
 - [ ] **Step 6：commit**：`feat(contracts): 加入凍結契約覆蓋判定與 Slice 2.4 出口腳本`
 
 **Changelog fragment：** `changelog.d/rust-p8-contract-coverage.md`（`type: change`、`scope: contracts`）。
@@ -2432,6 +2481,6 @@ def test_cargo_results_import_roundtrip(tmp_path):
 
 ## 切片出口判定（規格 §11.6 Slice 2.4 列）
 
-- **可在本環境宣告完成的部分**：Task 0～15 全部 PASS、`scripts/rust/slice24_exit.sh` exit 0（`missing`、`ab_mismatch`、`identity_errors` 為空，斷路器未觸發）、雙審通過、`python3 -m pytest -q tests/` 與 `python3 -m policy_check --repo .` 通過。狀態記為「實作與 L1／L1.5 完成」。
+- **可在本環境宣告完成的部分**：Task 0～15 全部 PASS、`scripts/rust/slice24_exit.sh` exit 0（`missing`、`ab_mismatch`、`identity_errors`、`incomplete_runs` 為空，斷路器未觸發）、雙審通過、`python3 -m pytest -q tests/` 與 `python3 -m policy_check --repo .` 通過。狀態記為「實作與 L1／L1.5 完成」。
 - **不得宣告 Slice 2.4 出口通過**，直到上表 1～10 全部取得有效證據或裁決，且每筆證據可追溯至相同 artifact（CLI／daemon sha256、契約 revision、案例清單與鎖檔 hash、工具 revision，§11.4）。任何 BLOCKED-OWNER 項以 SKIP、替身或 Linux 結果代替時，一律判為「證據不足」並阻擋出口。
 - **斷路器**：`slice_breaker.py` 判定觸發（連續三週承接率累計增加 < 10 個百分點）或 Stage 2 總日曆預估超過 24 週時，停止候選版本擴大部署、退守已驗收的 Stage 1 artifact 組合並提請擁有者審查／重提 OD-02（規格 §12.2「校準與斷路器」）；安全／平台里程碑只作審查證據，不自動豁免。

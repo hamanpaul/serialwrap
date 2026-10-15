@@ -127,7 +127,7 @@
 | P1-T10 | BC-04 Per-UART 獨占、holder 診斷、Windows ACCESS_DENIED 映射、SC-05 同步收回、DF-04 | G | L | P1-T9 |
 | P1-T11 | Gate 錯誤碼：SC-01、SC-02、SC-03、SC-06、DF-02 | G | L | P1-T10 |
 | P1-T12 | SC-13 lease tick＋tombstone、SC-14 flash probe 資格、SC-16 console 行上限 | H | L | P1-T11 |
-| P1-T20 | OS write 前授權 permit（quiet／release／cancel／lease／owner_gen 零 TX；自動登入／密碼／ready probe 帶 `system_probe` permit＋`login_gen`（R2-F1）；Quiet 不擋有效 interactive lease 救援（R2-F2）；Windows 持鎖寫入下 drain 取 fence 鎖有上限、3,000 ms 期限自請求起算（R3-F3）） | H | L | P1-T12 |
+| P1-T20 | OS write 前授權 permit（quiet／release／cancel／lease／owner_gen 零 TX；自動登入／密碼／ready probe 帶 `system_probe` permit＋`login_gen`（R2-F1）；Quiet 不擋有效 interactive lease 救援（R2-F2）；Windows 持鎖寫入下 drain 取 fence 鎖有上限、3,000 ms 期限自請求起算（R3-F3）；self-test nonce probe 帶 `self_test_probe` permit、提交點重驗 boot quiet 與 bridge 世代，被擋回 `AUTOBOOT_QUIET`（R5-F2，DF-19）） | H | L | P1-T12 |
 | P1-T13 | OD-11／SC-19 隔離實例測試裝置 allowlist | G | H | P1-T20 |
 | P1-T14 | BC-05 Windows `remote -R/-L`、SC-27 `connect`／`benches`、SC-21 `remote stop`、跨行程檔案鎖 | H | L | P1-T13 |
 | P1-T15 | 平台管理：SC-08、SC-09、SC-10、SC-12、SC-20、DF-14 | G | L | P1-T18 |
@@ -150,12 +150,12 @@
 | P2-T7 | WAL↔wire 比較器、correlation 與竄改拒絕 | L | G | P2-T6 |
 | P2-T8 | bridge 自測（§15.4.3／Spike 4）與資格報告 | L | G | P2-T7 |
 | P2-T9 | socat 接線 spike 腳本（§15.4.1 第一步；執行順序在 Task 1 之後、Task 2 之前） | H | G | P2-T1 |
-| P2-T10 | func-test 外部 bridge 模式、DaemonHarness 隔離與 artifact 選定、oracle 修復、Windows Telnet console client | G | H（10A）＋L（10B，依賴 10A） | P2-T8 |
+| P2-T10 | func-test 外部 bridge 模式、DaemonHarness 隔離與 artifact 選定、oracle 修復、Windows Telnet console client；實際部署內容量測 `realhw/deployed_content.py`（各報告產生端共用，R5-F4） | G | H（10A）＋L（10B，依賴 10A） | P2-T8 |
 | P2-T11 | §15.7.1 情境腳本與協調器新動作 | H | G | P2-T10 |
 | P2-T12 | `tests/acceptance/cases.yaml` 承接清單、schema、凍結鎖、Stage 0 證據索引、MCU 手動程序登記 | G | H | P2-T11 |
-| P2-T13 | pytest 資源報告、平台 SKIP 閘門、Windows collection 與 hosted Windows L1（`TST-D-4` 報告部分） | G | H | P2-T12 |
-| P2-T14 | L2／L3 平台 adapter（pin＋版本 gate、PID／RSS、bench lock、能力式 SKIP、Telnet human frontend、worker 存活事件、background 結果執行期收斂 `BgResultTracker`（R1-F6）） | H | L | P2-T13 |
-| P2-T15 | `longrun_acceptance.yaml`、外層 `release_gate_result` 判定器、長跑觀測器、Windows 原生 COM 獨占證據 `winexcl`（R1-F7） | L | H | P2-T14 |
+| P2-T13 | pytest 資源報告、平台 SKIP 閘門、Windows collection 與 hosted Windows L1（`TST-D-4` 報告部分；報告帶 `deployed_content`，R5-F4） | G | H | P2-T12 |
+| P2-T14 | L2／L3 平台 adapter（pin＋版本 gate、PID／RSS、bench lock、能力式 SKIP、Telnet human frontend、worker 存活事件、background 結果執行期收斂 `BgResultTracker`（R1-F6）；realhw／TestPilot `report.json` 帶 `meta.deployed_content`（R5-F4）） | H | L | P2-T13 |
+| P2-T15 | `longrun_acceptance.yaml`、外層 `release_gate_result` 判定器、長跑觀測器、Windows 原生 COM 獨占證據 `winexcl`（R1-F7）；`release-gate.json` 帶 `run.deployed_content`（R5-F4） | L | H | P2-T14 |
 | P2-T16 | OD-09 延後項凍結工具與候選長跑開跑登記（`realhw/acceptance/od09_freeze.py`；延後項唯一寫入者；只讀 Stage 0 索引，不依賴 P3～P9，R4-F2） | L | H | P2-T12、P2-T15 |
 
 ### P3（`04-stage1a-rust-cli.md`；Phase 前置：P0、P1（T15 SC-09、T16 DF-06、T18 manifest）、P2（T10、T12））
@@ -188,16 +188,16 @@
 |---|---|---|---|---|
 | P4-T1 | 介面骨架、P3→P4 遷移、測試替身、黑箱 stub、案例綁定與 golden 擷取工具 | G | H | — |
 | P4-T2 | PAL `SysEnv` 管理面方法與 Windows 登錄讀取（`RegistryView`） | H | L | P4-T1 |
-| P4-T3 | PAL `ServiceCtl`：systemd、`windows-task`（Task XML／schtasks）、`windows-service`（sc.exe） | H | L | P4-T1 |
+| P4-T3 | PAL `ServiceCtl`：systemd、`windows-task`（Task XML／schtasks）、`windows-service`（sc.exe）；交接前監管拉起抑制 `hold_autostart`／`release_autostart`（systemd 持久 drop-in `Restart=no`＋`RefuseManualStart=yes`＋`disable`，R5-F1） | H | L | P4-T1 |
 | P4-T4 | PAL `ProcessCtl`（spawn／poll／foreground）與 `ProcScan`（POSIX `/proc`、Windows Toolhelp32） | G | L | P4-T1 |
 | P4-T5 | PAL `ProcessTunnel`（BC-05）與 `FsOps` 跨行程鎖／連結 | H | L | P4-T1 |
 | P4-T6 | `config.yaml` 寫入、`service`、`supervision-mode` 查詢（DF-07） | G | H | P4-T2、P4-T3、P4-T5、P4-T17 |
-| P4-T7 | `daemon start/stop/status/restart`、`graceful_stop`、多開預檢與 Windows 首次需求啟動（SC-10、SC-17、SC-18、SC-20、DF-05） | H | L | P4-T3、P4-T4、P4-T6、P4-T11、P4-T17 |
+| P4-T7 | `daemon start/stop/status/restart`、`graceful_stop`、多開預檢與 Windows 首次需求啟動（SC-10、SC-17、SC-18、SC-20、DF-05）；`graceful_stop_with(Handoff)` 先 hold 所有 mode、被拉起實例重新交接、`hard_stop` 只對 grant identity，SC-18 於 `install-journal.json` 存在時暫停（R5-F1） | H | L | P4-T3、P4-T4、P4-T6、P4-T11、P4-T17 |
 | P4-T8 | `remote`（`-R`／`-L`／`status`／`close`／`stop` 別名）原生與 BC-05 Windows 路徑（SC-21） | H | L | P4-T2、P4-T5 |
 | P4-T9 | `connect`／`benches` 原生（SC-27） | G | H | P4-T8、P4-T17 |
-| P4-T10 | `setup`（資產物化、WSL systemd、reconcile）與 `supervision-mode set`（SC-12、SC-22、SC-24、DF-10～DF-13、DF-16） | G | L | P4-T3、P4-T4、P4-T5、P4-T6、P4-T7、P4-T11 |
+| P4-T10 | `setup`（資產物化、WSL systemd、reconcile）與 `supervision-mode set` 參數驗證、reconcile `OldStop`（SC-12、SC-22 部分、SC-24、DF-10～DF-13、DF-16；切換執行與交接護欄在 P4-T12，R1-F3） | G | L | P4-T3、P4-T4、P4-T5、P4-T6、P4-T7、P4-T11 |
 | P4-T11 | 安裝佈局、release manifest 驗證與版本配對 gate（§9.5、§12.1、SC-25） | H | L | P4-T2、P4-T3、P4-T5、P4-T17 |
-| P4-T12 | §12.1 首次安裝、更新流程與 `setup --rollback`（SC-23；步驟 3、步驟 7 回退與 journal 復原停止 daemon 皆經 `daemon.handoff_stop` 交接（R1-F1、R2-F6）、journal 原始快照與分段備份中斷復原（R1-F5）） | G | L | P4-T4、P4-T7、P4-T10、P4-T11、P1-T8 |
+| P4-T12 | §12.1 首次安裝、更新流程與 `setup --rollback`（SC-23；步驟 3、步驟 7 回退與 journal 復原停止 daemon 皆經 `daemon.handoff_stop` 交接（R1-F1、R2-F6）、journal 原始快照與分段備份中斷復原（R1-F5）；交接前抑制監管拉起並持久化於 journal、切換前／啟動前重驗 endpoint 並對新實例重新交接、hold 期間重新註冊以停用狀態送出（R5-F1））；`supervision-mode set` 執行入口 `run_supervision_switch`：同一 `safety_check`＋`daemon.handoff_stop{reason:"supervision_set"}`，不受 `--force` 影響（SC-22，R1-F3） | G | L | P4-T4、P4-T7、P4-T10、P4-T11、P1-T8 |
 | P4-T13 | `doctor` 全部檢查原生與 `version_pairing`（SC-25） | G | H | P4-T2、P4-T4、P4-T10、P4-T11 |
 | P4-T14 | 終端類承接（console-attach／detach、`serialwrap-minicom` 端到端、Windows Telnet 提示）與委派集合清空 | H | G | P4-T7、P4-T10 |
 | P4-T15 | Agent 權限模型文件與驗證工具（§10.3）、對外文件同步 | H | G | P4-T6、P4-T7、P4-T8、P4-T9、P4-T10、P4-T11、P4-T12、P4-T13、P4-T14 |
@@ -225,7 +225,7 @@
 | P5-T11 | sw-core SessionCore／Mailbox／Generations／Actor（§5.3 的 2.1 列） | H | L | P5-T10 |
 | P5-T12 | sw-core Two-Phase Drain 核心＋IoWorker 收尾＋Release／Attach（sans-IO 與 IoWorker 層） | G | L | P5-T11 |
 | P5-T13 | sw-core 最小 Login＋帳密＋Quiet Gate＋Profile 能力閘 | H | L | P5-T12 |
-| P5-T14 | sw-core 命令執行、agent Interactive Lease、self-test、capture | G | L | P5-T13 |
+| P5-T14 | sw-core 命令執行、agent Interactive Lease、self-test（`SelfTestProbe` 被 `Quiet` 擋時回 `AUTOBOOT_QUIET`，R5-F2／DF-19）、capture | G | L | P5-T13 |
 | P5-T12b | Drain／Release 端到端（真 actor＋login＋命令執行） | G | L | P5-T14 |
 | P5-T15a | 黑箱 FakeTarget 擴充（測試資產變更，§10.4） | H | G | P5-T12b |
 | P5-T15 | sw-core StateStore＋AliasRegistry＋state.json 雙向相容 | G | L | P5-T15a |
@@ -270,7 +270,7 @@
 | P7-T5 | `reprobe.rs`：readiness reprobe 與 bootloader 證據 | H | L | P7-T4 |
 | P7-T6 | `transport_stall.rs`＋PAL `UsbTopology`＋`FsOps` 寫入側 | G | L | P7-T5 |
 | P7-T7 | Login run 協調、fence `fsm_gen`、帳密終態與收斂 | H | L | P7-T6 |
-| P7-T8 | `self_test.rs`：self-test 分類與 nonce probe 整合 | G | L | P7-T7 |
+| P7-T8 | `self_test.rs`：self-test 分類與 nonce probe 整合（`SelfTestProbe` 看 `quiet_active`、`fsm_gen: None`，console unlock 亦擋，R5-F2） | G | L | P7-T7 |
 | P7-T9 | `recover.rs`：session recover／force recover | H | L | P7-T8 |
 | P7-T10 | `capture.rs`：agent log capture（reader 端 observer） | G | L | P7-T9 |
 | P7-T11 | Event schema＋`pyre/redos.rs` | H | G | P7-T1 |
@@ -303,7 +303,7 @@
 | P8-T11 | 外部工具裝置交接的黑箱與整合驗證 | H | L | P8-T0、P8-T6、P8-T8 |
 | P8-T12 | systemd 監管整合與有序停止（完整停止序含 stopping gate／watcher／event engine 收尾（R1-F2）；未收斂 exit 1（R1-F4）） | G | L | P8-T6、P8-T9、P8-T11 |
 | P8-T13 | `windows-task` 監管對 Rust daemon 的驗證 | H | L | P8-T12 |
-| P8-T14 | 更新／回滾守衛對 Rust daemon 的驗證與補強（SC-23）；Rust `AdmissionGate`＋`daemon.handoff_stop`（SC-11，R1-F1） | G | L | P8-T6、P8-T9 |
+| P8-T14 | 更新／回滾守衛對 Rust daemon 的驗證與補強（SC-23）；Rust `AdmissionGate`＋`daemon.handoff_stop`（SC-11，R1-F1）；Rust daemon 交接後 exit 1 不被 systemd 拉起、切換期間被拉起實例的 flash 不被截斷（R5-F1 黑箱） | G | L | P8-T6、P8-T9 |
 | P8-T15 | 全部凍結契約的最終覆蓋判定與切片出口腳本 | H | G | P8-T0～14 |
 
 ### P9（`10-stage3-canary.md`；Phase 前置：P0～P8（以前置 Phase 交付物為介面））
@@ -315,7 +315,7 @@
 | P9-T3 | A/B manifest 載入、凍結與案例涵蓋檢查（`tools/stage3/ab_manifest.py`；`verify_bundle`／`bundle_tree_sha256`，R2-F7；`runtime_tree_sha256`，R3-F2） | H | G | P9-T2 |
 | P9-T4 | A→B 資源釋放驗證（`tools/stage3/release_check.py`） | H | L | P9-T3 |
 | P9-T5 | 乾淨 DUT 狀態與實例隔離（`tools/stage3/dut_state.py`） | G | H | P9-T4 |
-| P9-T5B | Suite adapter（`tools/stage3/suites/`） | H | L | P9-T5 |
+| P9-T5B | Suite adapter（`tools/stage3/suites/`；`verify_run_identity` 核對 suite 量測的部署內容＝該側凍結 tree，R5-F4） | H | L | P9-T5 |
 | P9-T6 | Sequential A/B 執行器（`tools/stage3/ab_runner.py`） | H | L | P9-T14B |
 | P9-T7B | L1.5 A/B 差分（`tools/stage3/ab_diff.py`） | L | H | P9-T5B |
 | P9-T7 | A/B 判定（`tools/stage3/ab_verdict.py`） | L | H | P9-T7B |
@@ -326,7 +326,7 @@
 | P9-T12 | Canary policy 凍結、帳本彙總與配額 gate（`tools/stage3/canary_ledger.py`；gate 輸出帳本版本 `ledger_through`／`ledger_records`，R3-F1；只計內容指紋等於 target 的紀錄並於報告輸出指紋，R4-F1） | L | G | P9-T9 |
 | P9-T13 | 實機回滾演練（`tools/stage3/rollback_drill.py`；報告記錄 current 部署目錄內容指紋，R4-F1） | G | L | P9-T12 |
 | P9-T14 | Stage 0～3 出口證據索引（`tools/stage3/evidence_index.py`；Stage 3 target 記錄 `bundle_tree_sha256`，R2-F7；entry 保存受測內容指紋並納入有效性、同 manifest 換 tree 拒絕重設 target，R3-F2；canary-report 項目只以帳本版本最新報告判定，新事故撤銷舊 PASS，R3-F1） | L | G | P9-T7 |
-| P9-T14B | 證據 ingest（`tools/stage3/evidence_ingest.py`；報告受測內容指紋核對 target、報告不得早於 target 內容生效，R3-F2；canary 報告防回放，R3-F1；ab／canary／drill 報告缺指紋即拒收、不以 target 回填，R4-F1） | H | L | P9-T15 |
+| P9-T14B | 證據 ingest（`tools/stage3/evidence_ingest.py`；報告受測內容指紋核對 target，R3-F2；canary 報告防回放，R3-F1；ab／canary／drill 報告缺指紋即拒收、不以 target 回填，R4-F1；junit／functest／regression／realhw／gate／manual 一併納入 TREE_REQUIRED_KINDS、移除時刻規則，R5-F4） | H | L | P9-T15 |
 | P9-T15 | OD-09 凍結結果的 Stage 3 消費端（`tools/stage3/od09_consume.py`：`od09-freeze` 報告判定、`S0-OD09-DEFERRED-FROZEN`／`S3-OD09-ALL-FROZEN` 核對、`od09 check` 唯讀委派；凍結工具屬 P2-T16，P9 不寫延後項，R4-F2） | L | H | P9-T14 |
 | P9-T16 | Python daemon 退役切換（packaging；發佈前逐檔重驗 bundle 內容與 tree、`retirement pack`＋`verify-archive` 後只上傳已驗 archive，R2-F7；旁載檔後重設 target 或新事故報告後拒絕發佈，R3-F1／R3-F2） | H | L | P9-T13 |
 | P9-T17 | `python3 -m tools.stage3` 入口與擁有者程序文件 | G | H | P9-T16 |
@@ -348,9 +348,10 @@
 | `contracts/ab_normalization.yaml` | P5-T20 | P9-T7B 只追加鍵 |
 | `longrun_acceptance.yaml` 三個 OD-09 延後項的寫入（`realhw/acceptance/od09_freeze.py`：`freeze`／`check_frozen_before`／`register_candidate_start`、`candidate_longrun_starts.ndjson`）、`docs/rust-refactor/owner-decisions-addenda.md`、`procedures/od09-deferred-freeze.md` | P2-T16（Stage 0；只依賴 P2-T12、P2-T15，R4-F2） | P4 Task 16（B-12）、P8 Task 15（第 8 項）長跑開跑前 `register-candidate`；P9-T6 L3 A/B 呼叫 `check_frozen_before`＋`register_candidate_start`；P9-T15／T14B 只消費 `freeze --out` 報告；P9-T1 不重建 addenda、P9-T17 不重建該程序檔；任何 Phase 不得另寫延後項或手改 acceptance |
 | `tests/acceptance/evidence_index.schema.json` | P2-T12 | P9-T1 另建 `stage3_evidence_index.schema.json` |
+| L1 完整性：`tests/acceptance/l1_required.lock.json`（每平台必要 nodeid 凍結）、`l1_results.schema.json`（`l1-results.v1`＝`SW_RESOURCE_REPORT` v2）、`l1_judge.py`（唯一判定實作）、`regen_lock.py --l1-add-only`；cargo 端 `scripts/rust/cargo_l1_results.py` | P2-T13；cargo 轉換器 P3-T17（R5-F3） | P3-T18、P4-T16、P5-T22、P6-T13、P7-T19、P9-T1 只以 `--l1-add-only` 新增 set，set 內 nodeid 由各 Phase 每個 Task 的紅燈 commit 逐 Task 登記、PR 以 `regen_lock.py --check --base` 防縮減（R5 審查後續）；P3～P9 的 L1 出口與 gate 一律依路徑載入 `l1_judge.py` 判定，不得以 `tests>0`、`passed>0`、`passed≥N` 或函式存在判定；P8-T15 結果檔同帶 `collected`／`exit_code`／`finished` |
 | `tests/contract_blackbox/bb_faketarget.py` | P3-T2 | P5-T15a、P6-T11、P7-T18A 以 keyword-only 擴充（不存在 `contract_blackbox/faketarget.py`） |
 | `behavior_changes.yaml` 新條目欄位 | P0-T1／T5 schema | 一律 `approved_at_revision`＋`ab_participation`，`contracts/` 內不得出現 `contract_revision` 鍵 |
-| SC 編號 | 調和表 SC-01～27 | P6：SC-28、29、31；P7：SC-30；P8：SC-32、33（原稿 SC-31／32 撞號，已改）；`test_bc_real_sc_df_ranges` 依序改為 `range(1,30)∪{31}` → `range(1,32)` → `range(1,34)`；DF-18 屬 P7 |
+| SC 編號 | 調和表 SC-01～27 | P6：SC-28、29、31；P7：SC-30；P8：SC-32、33（原稿 SC-31／32 撞號，已改）；`test_bc_real_sc_df_ranges` 依序改為 `range(1,30)∪{31}` → `range(1,32)` → `range(1,34)`；DF-18 屬 P7；DF-19（self-test nonce probe 提交點 quiet 重驗，R5-F2）由 P0-T5 登記、P1-T20 實作，DF 期望 P0 為 `range(1,18)∪{19}`、P7 Task 0 起為 `range(1,20)` |
 
 ### 審查後仍未解決（需擁有者或後續 PR 處理）
 

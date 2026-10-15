@@ -235,7 +235,7 @@ pub struct Tombstones { /* VecDeque<(String id, &'static str status)> cap 16 */ 
 
 1. **前置階段**：Task 0、Task 1 **完整**執行 Step 1～5（契約登記、必要案例集合凍結、介面骨架、harness 簽章、`cargo_nonzero.sh`、前置符號檢查），全部 commit 後才進入 TDD 階段。Task 1 Step 2 的 `check_p6_prereqs.py` 必須 PASS，否則停止並回報上游缺陷。
 2. **TDD 階段**：依 Task 2 → Task 13 的順序，只執行每個 Task 的「寫失敗測試」與「執行並確認 FAIL」。golden 產生器、測試 helper 與 harness 擴充屬測試步驟，在此階段交付並先自測：竄改一筆 golden 時，對應的 Rust golden 測試必須 FAIL（Task 2、Task 3 的工具自測）。每個 Expected 都要指定真正缺少的行為，也就是 `todo!("P6 Task N")` panic 或具體斷言失敗；不得以缺檔、缺工具或編譯失敗充當紅燈。
-   - Rust：一律帶 `--features test-fakes`（06 測試檔以 `#![cfg(feature = "test-fakes")]` 開頭，沒帶 feature 會整檔被編掉、0 個測試也算通過），並經 `scripts/rust/cargo_nonzero.sh` 執行，它在實際執行的測試數為 0 時 exit 1。
+   - Rust：一律帶 `--features test-fakes`（06 測試檔以 `#![cfg(feature = "test-fakes")]` 開頭，沒帶 feature 會整檔被編掉、0 個測試也算通過），並經 `scripts/rust/cargo_nonzero.sh` 執行，它在實際執行的測試數為 0 時 exit 1。`cargo_nonzero.sh` 只是開發迴圈防呆；切片出口不以「執行數 >0」判定，而以 Task 13 `s22_gate_check.py` 對凍結 nodeid 清單逐案判定（R5-F3）。
    - Python 黑箱：雙邊案例先對 Python 基線（P1 已交付 BC-02／SC-13／SC-16）執行，**必須 PASS**，證明 oracle 成立；再對 Rust artifact 執行，必須 FAIL。Rust-only 案例（SC-28／SC-29／SC-31）以 `rust_only` marker 標記，Python 端為 skipped。
 3. **實作階段**：依 Task 2 → Task 13 的順序執行「實作」「確認 PASS」「commit」。Task 6／7 依賴 Task 2～5 的型別；Task 9 依賴 Task 8；Task 10 依賴 Task 6／7／9；Task 11、12、13 為整合收斂。
 4. 每個 Task 實作完成後，依 master plan 做雙審（審查 A：Claude Sonnet effort max；審查 B：Codex `gpt-6.1-sol` medium），審查者不得是該 Task 的實作者。
@@ -2465,6 +2465,8 @@ git commit -m "feat(rust-windows): 補齊 Windows Telnet console 原生測試與
 **Files:**
 - Modify: `tests/acceptance/slice22_evidence_map.yaml`（Task 0 骨架；本 Task 為每個凍結 case 填 evidence，**不得增刪鍵**）
 - Create: `tests/test_acceptance_slice22.py`
+- Create: `scripts/rust/s22_gate_check.py`、`tests/test_s22_gate_check.py`（R5-F3：`AUTOMATED` 條目與 L1 段的執行證據判定；`tests/test_acceptance_slice22.py` 只驗對照表靜態一致，函式存在不等於已執行且通過）
+- Modify: `tests/acceptance/l1_required.lock.json`（只以 P2 `regen_lock.py --l1-add-only` 登記 `s22_gate:cargo_workspace`、`s22_gate:console_conformance_pty`、`s22_gate:win_test`、`s22_gate:blackbox_rust`，linux／windows 依段；R5-F3）
 - Create: `docs/rust-refactor/procedures/windows-telnet-frontends.md`（Tera Term／PuTTY／`telnet.exe` 互動程序：前置、逐步驟、證據檔名、PASS 條件）、`docs/rust-refactor/procedures/cross-reboot-console.md`（實板 U-Boot autoboot 中斷與 reboot 期間鍵入不回放）、`docs/rust-refactor/procedures/console-echo-loopback.md`（§1.2 Console 按鍵至回顯 SLO：115200 實體 loopback、500 個可識別樣本）
 - Modify: `contracts/behavior_changes.yaml`（SC-28、SC-29、SC-31 `status: IMPLEMENTED`，依 P1 慣例只遞增檔案 `revision`（不寫 `contract_revision` 鍵））
 - Modify: `README.md`（English 與繁體中文兩段同步：human console 段加 Telnet backend 選擇與 Windows Serial console 選配說明、OD-12 信任範圍）
@@ -2534,12 +2536,36 @@ def test_section_11_3_invariants_have_named_tests() -> None:
 
 def test_lock_only_grew_since_task0() -> None:
     assert set(LOCK["sets"]["slice_2.2"]) >= set(EMAP["cases"]), "鎖檔只能 add-only（regen_lock.py --add-only）"
+
+
+def test_automated_tests_are_in_frozen_l1_sets() -> None:   # R5-F3：每個 AUTOMATED 測試都必須在某個凍結 L1 集合內，gate 才會要求它執行且通過
+    l1 = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))["sets"]
+    frozen = {n for sid, plats in l1.items() if sid.startswith("s22_gate:") for p in plats.values() for n in p["nodeids"]}
+    for cid, v in EMAP["cases"].items():
+        if v["status"] == "AUTOMATED":
+            for t in v["tests"]:
+                path, _, name = t.partition("::")
+                if not path.endswith((".py", ".rs")):
+                    continue        # func-test／scenario 執行紀錄另由 L1.5 報告判定，不是 L1 nodeid
+                nid = t if path.endswith(".py") else f"cargo:{path.split('/')[1]}::{pathlib.Path(path).stem}::{name}"
+                assert nid in frozen, (cid, t)
 ```
+
+`tests/test_s22_gate_check.py`（`core_portable`、`memory_only`；合成 fixture，不讀最新報告；R5-F3，failing-first）：`scripts/rust/s22_gate_check.py --l1-results <dir> --map tests/acceptance/slice22_evidence_map.yaml [--lock <l1_required.lock.json>] --out <json>` 讀 `<dir>/<section>/<platform>/resource-report.json`（`l1-results.v1`），對每個 `s22_gate:*` 集合以 P2 `l1_judge.judge` 判定，並要求每個 `AUTOMATED` 條目的每個測試在對應平台的報告中恰一列 `passed`；輸出 `{"sections":[{"set_id","platform","verdict","reasons"}],"cases":[{"case_id","status":"PASS|FAIL|INSUFFICIENT","missing_tests":[…]}],"result":"PASS|FAIL|INSUFFICIENT"}`，exit 0 只在 `PASS`。
+
+| 測試名 | 斷言 |
+|---|---|
+| `test_existing_function_not_executed_is_insufficient` | 對照表某 `AUTOMATED` case 指向 `tests/contract_blackbox/slice22/test_console_pty.py::test_first_console_raw_second_line_buffered`（函式存在），但 `blackbox_rust/linux` 報告沒有該 nodeid → 該 case `INSUFFICIENT`、`missing_tests` 含之、`result == "INSUFFICIENT"`、exit 1 |
+| `test_cargo_nonzero_count_is_not_enough` | `cargo_workspace/linux` 報告 200 列 `passed`，但凍結集合中的 `cargo:sw-core::human_tx_lane::human_raw_partial_not_resent` 不在其中 → 該 section `INSUFFICIENT`（`cargo_nonzero.sh` 的「執行數 >0」會放行） |
+| `test_required_ignored_or_duplicate_insufficient` | `console_conformance_pty` 的必要 `cap_posix_pty__*` 列為 `skipped` → `INSUFFICIENT`；同 nodeid 兩列 → `INSUFFICIENT`；一列 `failed` → `FAIL`、exit 1 |
+| `test_runner_exit_nonzero_insufficient` | 全部必要 nodeid `passed` 但 `exit_code == 101` 或 `finished == false` → `INSUFFICIENT` |
+| `test_cap_windows_com_absent_is_blocked_not_pass` | `win_test/windows` 報告的 `cap_windows_com__*` 為 `skipped`：這些 nodeid 不屬 `s22_gate:win_test` 集合（BLOCKED-OWNER #1、#2 承接），故該 section 仍可 `PASS`；但若把它們登記進集合 → `INSUFFICIENT`（不得以 ignored 充數） |
+| `test_all_present_pass` | 每個集合恰覆蓋、每個 `AUTOMATED` 測試恰一列 `passed`、`exit_code 0`、`finished true` → `result == "PASS"`、exit 0 |
 
 - [ ] **Step 2：執行並確認 FAIL**
 
-Run: `python3 -m pytest -q tests/test_acceptance_slice22.py`
-Expected: FAIL（`test_no_pending_entries` 列出全部 PENDING 鍵；程序文件不存在）。
+Run: `python3 -m pytest -q tests/test_acceptance_slice22.py tests/test_s22_gate_check.py`
+Expected: FAIL（`test_no_pending_entries` 列出全部 PENDING 鍵；程序文件不存在；`s22_gate_check.py` 不存在、`l1_required.lock.json` 尚無 `s22_gate:*` 集合）。
 
 - [ ] **Step 3：實作**
 
@@ -2555,22 +2581,25 @@ Run（Windows 步驟由 orchestrator 執行，見「執行順序」第 5 點）�
 ```bash
 python3 -m pytest -q tests/test_acceptance_slice22.py tests/test_contracts_slice22.py tests/test_contracts_catalog.py
 python3 tests/acceptance/regen_lock.py --check
-scripts/rust/cargo_nonzero.sh --workspace --features test-fakes          # 含 06 全部 L1 測試
-scripts/rust/cargo_nonzero.sh -p sw-pal --features test-fakes --test console_conformance -- --include-ignored cap_posix_pty__
-scripts/rust/win-test.sh --features test-fakes --caps windows_com
+G=target/s22-gate/$(date +%y%m%d-%H%M%S)                                  # R5-F3：出口以逐案 l1-results 判定，cargo_nonzero.sh 只留作開發迴圈防呆
+python3 scripts/rust/cargo_l1_results.py --platform linux --out $G/cargo_workspace/linux/resource-report.json -- --workspace --features test-fakes          # 含 06 全部 L1 測試
+python3 scripts/rust/cargo_l1_results.py --platform linux --out $G/console_conformance_pty/linux/resource-report.json -- -p sw-pal --features test-fakes --test console_conformance -- --include-ignored cap_posix_pty__
+scripts/rust/win-test.sh --features test-fakes --caps windows_com          # 報告的 l1_results 複製到 $G/win_test/windows/resource-report.json
 python3 scripts/rust/check_cfg_boundary.py
 cargo build --release -p sw-cli -p sw-daemon
 SERIALWRAP_AB_LABEL=rust SERIALWRAP_CLI_EXE=$PWD/target/x86_64-unknown-linux-gnu/release/serialwrap SERIALWRAP_DAEMON_EXE=$PWD/target/x86_64-unknown-linux-gnu/release/serialwrapd \
-  python3 -m pytest -q tests/contract_blackbox/slice21 tests/contract_blackbox/slice22     # 前一切片黑箱在 2.2 artifact 上重跑
+  SW_RESOURCE_REPORT=$G/blackbox_rust/linux/resource-report.json \
+  python3 -m pytest -q tests/contract_blackbox/slice21 tests/contract_blackbox/slice22 --junitxml=$G/blackbox_rust/linux/junit.xml   # 前一切片黑箱在 2.2 artifact 上重跑
+python3 scripts/rust/s22_gate_check.py --l1-results $G --map tests/acceptance/slice22_evidence_map.yaml --out $G/s22-gate.json
 python3 -m pytest -q tests/
 python3 -m policy_check --repo .
 ```
-Expected: 全部 PASS；`win-test` 報告中 `cap_windows_com__*` 為 ignored／證據不足（不計 PASS）；`tests/` 全套 0 failed；policy_check 無 FAIL（R-18 docs 對齊已滿足）。
+Expected: 全部 PASS；`s22_gate_check.py` exit 0、`s22-gate.json` 的 `result == "PASS"`（每個 `s22_gate:*` 集合的凍結 nodeid 恰執行一次且 `passed`、每個 `AUTOMATED` 條目的測試都在報告中 `passed`）；`win-test` 報告中 `cap_windows_com__*` 為 ignored／證據不足（不計 PASS，且不屬 `s22_gate:win_test` 集合）；`tests/` 全套 0 failed；policy_check 無 FAIL（R-18 docs 對齊已滿足）。四個 `s22_gate:*` 集合以 P2 `regen_lock.py --l1-add-only` 凍結（R5-F3），時點依 P2 Task 13（R5 審查後續）：P6 各 Task 在自己的紅燈 commit 登記新增 nodeid，本 Task 只登記 gate 自身測試。
 
 - [ ] **Step 5：commit**
 
 ```bash
-git add tests/acceptance/slice22_evidence_map.yaml tests/test_acceptance_slice22.py docs/rust-refactor/procedures/ contracts/behavior_changes.yaml README.md docs/regression-plugin.md changelog.d/rust-s22-docs-acceptance.md
+git add tests/acceptance/slice22_evidence_map.yaml tests/test_acceptance_slice22.py scripts/rust/s22_gate_check.py tests/test_s22_gate_check.py tests/acceptance/l1_required.lock.json docs/rust-refactor/procedures/ contracts/behavior_changes.yaml README.md docs/regression-plugin.md changelog.d/rust-s22-docs-acceptance.md
 git commit -m "docs(rust-console): 完成 Slice 2.2 案例證據對照並更新 console 文件" -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 ```
 

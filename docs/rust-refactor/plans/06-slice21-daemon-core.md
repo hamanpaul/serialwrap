@@ -1935,8 +1935,11 @@ git commit -m "feat(sw-core): 命令 admission、出列與 history 上限" -m "C
 #[derive(Clone, Debug)] pub struct TxPermit { pub op_id: OpId, pub epoch: u64, pub owner_gen: u64, pub fsm_gen: u64, pub class: TxClass,
     pub source: String, pub cmd_id: Option<String>, pub log: bool }
 // 世代規則（Fence::admit 第 6 步）：LeaseOwner／InteractiveOpenCmd／HumanRaw／HumanReplay 需 permit.owner_gen == st.owner_gen；
-// LoginProbe／ReadyReconfirm／SelfTestProbe 需 permit.fsm_gen == st.fsm_gen。lease close／expiry、quiet arm、reboot、drain Phase 1 皆遞增 owner_gen；
+// LoginProbe／ReadyReconfirm 需 permit.fsm_gen == st.fsm_gen。lease close／expiry、quiet arm、reboot、drain Phase 1 皆遞增 owner_gen；
 // quiet arm、reboot、新 epoch 皆遞增 fsm_gen（07 計畫消費 TxPermit 時須帶 fsm_gen，下游對齊）。
+// SelfTestProbe（R5-F2，DF-19）不比對 fsm_gen（self-test 不是 login run，不得被進行中的登入世代取代，SES-16.3b）：
+// 只受 epoch 與 quiet_active 擋——quiet_active 在 arm 的同一次 Fence::with 內設定（任何 profile），與 actor 內 self-test
+// pre-check（classify_pre_probe 的 AUTOBOOT_QUIET 分支）同義，故「pre-check 通過→banner arm→OS 提交」必為零 TX。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)] pub enum FlashMode { Off, Probe(u64), Flashing }
 #[derive(Debug)] pub struct InFlight { pub op_id: OpId, pub len: usize }
 #[derive(Debug)] pub struct FenceState { pub active_epoch: Option<u64>, pub owner_gen: u64, pub fsm_gen: u64, pub frozen: bool, pub quiet_active: bool,
@@ -2249,6 +2252,8 @@ Gate 表（`gate_rules` 參數化測試；每列以 `Fence::admit(&state, &permi
 | `FileTransfer` | `quiet_active` | `Err(Quiet)` |
 | `LoginProbe`／`ReadyReconfirm`／`SystemRecoverKey`／`SelfTestProbe` | `quiet_active` | `Err(Quiet)` |
 | `LoginProbe`／`ReadyReconfirm`／`SystemRecoverKey`／`SelfTestProbe` | `wal_unhealthy` | `Err(WalUnhealthy)` |
+| `SelfTestProbe` | `reconfirm_pending` 且 `quiet_active=false` | `Ok(())`（R5-F2：self-test 是 `READY_UNCONFIRMED` 的建議出口，不受 reconfirm 擋） |
+| `SelfTestProbe` | `permit.fsm_gen != st.fsm_gen`、`quiet_active=false` | `Ok(())`（R5-F2：不比對 fsm_gen） |
 | `Command` | `wal_unhealthy` | `Ok(())`（agent 命令不屬自動 TX） |
 | `LeaseOwner`／`InteractiveOpenCmd` | `quiet_active` | `Ok(())`（05 §7 不被 gate） |
 | `Command` | `reconfirm_pending` 且 `quiet_active=false`，`SystemRecoverKey` 同狀態 | `Err(ReconfirmPending)`／`Ok(())` |
@@ -2364,7 +2369,7 @@ impl TxLedger {
 
 帳本有界性（R1-F8，arch §5.7／§5.10）：`ops.len() ≤ TX_LEDGER_LIVE_MAX`、`unresolved_gaps.len() ≤ TX_LEDGER_UNRESOLVED_GAPS_MAX`、每個 op 的 `wal_gaps.len() ≤ TX_OP_WAL_GAPS_MAX`，因此一個 epoch 的帳本記憶體與該 epoch 送過多少 op 無關；長跑（48 h `lr-mixed` 不重連）下帳本對 RSS 斜率的貢獻為常數。
 
-`Fence::admit` 依 gate 表的檢查順序：`frozen` → `epoch` → `cancelled` → flash 規則 → class 規則（quiet → reconfirm → wal_unhealthy）→ 世代規則（`owner_gen`：`LeaseOwner`／`InteractiveOpenCmd`／`HumanRaw`／`HumanReplay`；`fsm_gen`：`LoginProbe`／`ReadyReconfirm`／`SelfTestProbe`）。drain 時 actor 在**同一把鎖**內設 `frozen=true`、`active_epoch=None`（Task 12），形成 arch §5.4 的線性化邊界。`FenceSubmitGate::submit`：`let mut st = fence.0.lock(); if let Err(r) = Fence::admit(&st, permit) { self.last_reject.set(Some(r)); return Err(SubmitRevoked) } let step = os_submit(); if matches!(step, SubmitStep::Accepted(n) if n > 0) || matches!(step, SubmitStep::Pending) { st.in_flight = Some(InFlight { op_id: permit.op_id, len }) } drop(st); Ok(step)`——`os_submit` 必須是非阻塞提交（Task 2 POSIX 單次 `write(2)`、Task 3 Windows `WriteFile` 發出），任何完成等待都不得放進閉包；code review 以 `grep -n "poll_out_or_wake\|GetOverlappedResult\|WaitForMultipleObjects" crates/sw-pal/src/serial/` 確認這些呼叫都不在 `gate.submit(` 閉包內。
+`Fence::admit` 依 gate 表的檢查順序：`frozen` → `epoch` → `cancelled` → flash 規則 → class 規則（quiet → reconfirm → wal_unhealthy）→ 世代規則（`owner_gen`：`LeaseOwner`／`InteractiveOpenCmd`／`HumanRaw`／`HumanReplay`；`fsm_gen`：`LoginProbe`／`ReadyReconfirm`；`SelfTestProbe` 不比對，R5-F2）。drain 時 actor 在**同一把鎖**內設 `frozen=true`、`active_epoch=None`（Task 12），形成 arch §5.4 的線性化邊界。`FenceSubmitGate::submit`：`let mut st = fence.0.lock(); if let Err(r) = Fence::admit(&st, permit) { self.last_reject.set(Some(r)); return Err(SubmitRevoked) } let step = os_submit(); if matches!(step, SubmitStep::Accepted(n) if n > 0) || matches!(step, SubmitStep::Pending) { st.in_flight = Some(InFlight { op_id: permit.op_id, len }) } drop(st); Ok(step)`——`os_submit` 必須是非阻塞提交（Task 2 POSIX 單次 `write(2)`、Task 3 Windows `WriteFile` 發出），任何完成等待都不得放進閉包；code review 以 `grep -n "poll_out_or_wake\|GetOverlappedResult\|WaitForMultipleObjects" crates/sw-pal/src/serial/` 確認這些呼叫都不在 `gate.submit(` 閉包內。
 
 - [ ] **Step 4：執行並確認 PASS**
 
@@ -3166,6 +3171,7 @@ pub enum OpSpec { Command(QueuedCommand), Recover { timeout_s: f64, force: bool 
                   RebootRecovery { hard_timeout_s: f64 }, DetectTemplate { templates: Vec<ProfileTemplate> } }
 pub enum OpOutcome { CommandResult(PyDict), SendFailed, Recovered { key: &'static str, stdout: String }, PromptTimeout { stdout: String },
                      ToAttached { reason: &'static str }, RebootExpected, RebootRecoveryDone(LoginOutcome), SelfTest(PyDict),
+                     SelfTestRefused(FenceReject) /* R5-F2：nonce probe 的 TxReport.reject == Some(Quiet)；不等 nonce，由 actor 組 AUTOBOOT_QUIET 回應 */,
                      Sent { bytes: usize }, Detected(Option<String>) }
 pub struct OpRunner { /* thread pool size 1 per session（ForegroundSlot） */ }
 impl OpRunner { pub fn spawn(ctx: OpCtx) -> OpRunner; pub fn run(&self, grant: OpGrant, spec: OpSpec); }
@@ -3288,6 +3294,10 @@ fn submit_during_agent_lease_is_rejected_at_execute_time() {
 | `lease_expiry_checks_current_deadline` | 排定的 `LeaseExpiry{deadline: 舊}` 在 touch 之後到達 → 不關閉 |
 | `selftest_order_table` | 依序建構 RELEASED／recovering／DEVICE_MISSING／BRIDGE_DOWN／PASSTHROUGH／LOGIN_REQUIRED／BOOTLOADER（含 fallback prompts）／RX_FLOOD／ATTACHED_NOT_READY／AUTOBOOT_QUIET → 各自 `classification` 與 `recommended_action` 照 05 §11；所有分支含 `command_capable` 與 4 個 LeaseContext 鍵 |
 | `selftest_ok_confirms_ready` | READY＋pending：nonce 回 → `classification:"OK"`、`probe_ok:true`、`ready_reconfirm_pending:false` |
+| `selftest_quiet_armed_after_precheck_before_submit_zero_tx`（R5-F2，DF-19；「pre-check 後才擋或只在出列擋」的實作必紅） | `ActorRig::new(SHELL_PROFILE).ready()`，前置 `fence.quiet_active == false`；`h.dev.script_write(vec![FakeWriteStep::PauseBeforeSubmit])`；送 `SessionRequest::SelfTest{timeout_s:2.0, strict_human_lock:false}`（pre-check 通過、`StartOp(SelfTestProbe)`）；`assert!(h.dev.wait_paused(2s))`（TxWriter 出列快速檢查已過、尚未進 `FenceSubmitGate`）；推 RX `b"U-Boot 2024.04 (Oct 01 2024)\r\n"` 並等 actor 處理（`fence.quiet_active == true`，此步不得阻塞）；`h.dev.release_pause()` → 不推進 FakeClock 即收到回覆（不等 2 s nonce）；回覆鍵序 `["ok","classification","session","recommended_action",<lease ctx 4 鍵>,"command_capable"]`（與 `selftest_order_table` 的 AUTOBOOT_QUIET 列相同）且 `classification == "AUTOBOOT_QUIET"`、`recommended_action == "wait"`、無 `probe_ok`；probe job 已進 PAL（`h.dev.write_calls() == 1`）但被 `FenceSubmitGate` 以 `Quiet` 拒絕：`h.dev.os_submits() == 0`、`h.dev.take_tx().is_empty()`、WAL 無 `source == "system:self_test"` 的 TX；`ready_reconfirm_pending == true`（未 `confirm_ready`）、state 仍 `READY`；之後立即再送 `SelfTest` → 走 pre-check 分支，回覆與前者鍵序及 `ok`／`classification`／`recommended_action` 相同、`os_submits()` 仍為 0 |
+| `selftest_quiet_armed_during_submit_counts_committed`（R5-F2，線性化另一側） | 同上，但 `FakeWriteStep::PauseInsideSubmit`（持 Fence 鎖）；另一 thread 送 banner RX，斷言 actor 的 arm 在 0.2 s 內未完成（等 Fence 鎖）；放行 → probe bytes 恰 1 次 OS 提交、TX WAL 1 行 `source == "system:self_test"`；advance 2 s → `TARGET_UNRESPONSIVE`、`probe_ok:false`；`quiet_active == true` |
+| `selftest_probe_other_reject_zero_tx_matches_python`（R5 審查後續） | 對 `Frozen`（drain 起始）、`StaleEpoch`（release 後）、`Cancelled`、`WalUnhealthy` 各一案：pre-check 通過後、OS 提交前注入該狀態 → `h.dev.writes()` 無 probe bytes、`clock().elapsed() < timeout_s`（不等 nonce）、`session.ready_reconfirm_*` 不變；回應 `error_code` 逐案等於 `contracts/golden/selftest_refused.json` 的 Python 值；`selftest_probe_drain_race_golden`：drain 與 probe 提交競態 1000 次，結果只有「probe 已提交且計入 committed（回 nonce 結果）」或「零 TX＋golden 碼」兩種 |
+| `selftest_during_reconfirm_pending_not_fenced`（R5-F2，回歸防護） | READY＋`reconfirm_pending=true`、`quiet_active=false` → `SelfTest` 的 probe 寫出 1 次、nonce 回 → `OK`；同狀態 `CmdSubmit` → `READY_UNCONFIRMED`、`write_calls()` 只多 probe 那 1 次 |
 | `selftest_unresponsive_counts_attempt` | READY＋pending、nonce 不回 → `TARGET_UNRESPONSIVE`、`ready_reconfirm_attempts` +1 |
 | `selftest_released_external_holder` | RELEASED、holder pids [] 且 `holder_unknown:true` → `external_holder:"none"`、`reclaimable:false`、`recommended_action:"wait_external_flash"`（BC-04：不明不得當安全證明） |
 | `selftest_device_rebound_required` | by-id 現在指向的 realpath ≠ `attached_real_path` → `classification:"DEVICE_REBOUND_REQUIRED"`（L4366） |
@@ -3309,6 +3319,7 @@ Expected：FAIL，`not implemented: slice21 T14 OpRunner::spawn`。
 - reboot：`is_reboot_command` 為真時 actor 在出列時 `quiet.arm(now)`（core 狀態，admission 立即拒絕後續命令），TX 完成後的 `OpFinished` 才設 fence `quiet_active=true`（同一前景槽內不會有其他 Command TX 交錯）。
 - Lease 1 s tick（SC-13）：`Tick` 時 `expired(now)` → `status="expired"`、移入 tombstone（容量 16，FIFO）；`LeaseExpiry` timer 只在 `deadline == lease.last_activity + timeout` 時生效。
 - self-test 依 05 §11 順序；nonce probe 以 `SelfTestProbe` class；`/proc` holder 掃描在 actor 外的 executor thread 進行，再以 `OpFinished(SelfTest)` 回覆。
+- self-test nonce probe 的提交點重驗（R5-F2，DF-19）：actor 在同一次 `on_event` 內完成 `classify_pre_probe`（含 AUTOBOOT_QUIET 分支）並發出 `StartOp(SelfTestProbe)`，permit 帶當下 `epoch`（`fsm_gen` 不參與比對）；pre-check 之後 RX banner 觸發的 arm 在同一次 `Fence::with` 內設 `quiet_active=true`，TxWriter 出列檢查或 `FenceSubmitGate` 以 `Quiet` 拒絕、零 TX。OpRunner 收到 probe 的 `TxReport.reject == Some(FenceReject::Quiet)` 時不呼叫 nonce 等待，直接回 `OpFinished(SelfTestRefused(Quiet))`；actor 以 `classify_pre_probe` 的 AUTOBOOT_QUIET 分支同一組裝函式產生回應（鍵序相同、`session` 取處理當下的 public dict、無 `probe_ok`），不 `confirm_ready`、不動 `ready_reconfirm_*`，human suspend 照常在 `OpFinished` 結束。`reject == Some(Flash)` 維持既有語意：照等 nonce、逾時回 `TARGET_UNRESPONSIVE`（RPC-H-07 KEEP）；其餘 reject（`Frozen`／`StaleEpoch`／`Cancelled`／`WalUnhealthy`／`OwnerMismatch`，R5 審查後續，原寫「不在本條範圍」而與 Python 例外穿出路徑形成雙軌差異）：同樣零 TX（gate 已擋）、**不**等 nonce、不 `confirm_ready`、不動 `ready_reconfirm_*`，OpRunner 回 `OpFinished(SelfTestRefused(r))`，actor 以 `rpc_error_for_fence_reject(r)` 產生與 Python 例外穿出 manager 時相同的 RPC 錯誤（02 T20 第 6 點「其他拒絕原因照 T06／T07／T05 既有路徑」：drain／frozen → 該路徑的碼、stale／cancelled → T07 的碼、WAL unhealthy → T05 `WalUnavailableError` 的碼；對映表與 Python 共用 `contracts/golden/selftest_refused.json`，由 P1 T20 以 Python 實跑產生）；human suspend 照常在 `OpFinished` 結束。Python 對應 02 T20 行為規格第 6 點（`self_test_probe`）。
 - Agent log capture：檔案以 `FsOps` append 開啟，RX 經 `clean_text` 寫入並每 chunk flush；`byte_count += utf8 長度`、`line_count += '\n' 數`。
 
 - [ ] **Step 4：執行並確認 PASS**
@@ -4528,6 +4539,7 @@ git commit -m "test(l15): Slice 2.1 bridge 回歸、安全情境與事件延遲�
 
 **Files:**
 - Create: `scripts/rust/slice21_gate.sh`、`scripts/rust/slice21_gate_judge.py`、`tests/acceptance/slice21_gate_report.schema.json`、`tests/acceptance/slice21_gate_expect.yaml`、`tests/acceptance/slice21_bo.yaml`（BO 清單＋`case_ids`，與本計畫結尾總表同序）、`tests/test_slice21_gate_report.py`、`tests/test_slice21_gate_judge.py`、`tests/contract_blackbox/slice21/test_windows_nocom.py`、`docs/rust-refactor/slice21-owner-runbook.md`、`crates/sw-core/examples/wal_s1w.rs`（規格 §1.2 WAL 指標的 Rust 量測器：以 P1 T19 `scripts/stage0/wal_microbench.py` 凍結的 S1-W 資料混合與取樣口徑驅動 Task 7 `WalWriter`＋Task 6 原生 `WalFs`，輸出單筆寫入 p50／p95／p99 與每次 rotate 停頓；只量測、不改 WAL 行為）
+- Modify: `tests/acceptance/l1_required.lock.json`（只以 P2 `regen_lock.py --l1-add-only` 登記 `s21_core`（linux／windows）與 `s21_gate:<section>`；R5-F3）
 - Test: `tests/test_slice21_gate_report.py`、`tests/test_slice21_gate_judge.py`、`tests/contract_blackbox/slice21/test_windows_nocom.py`
 
 **§1.2 WAL 效能 section（`wal_s1w_perf`，跨計畫審查補入：原計畫無任何 Task 量測 Rust WAL 的 §1.2 指標）：** `cargo run --release -p sw-core --example wal_s1w -- --out target/slice21-gate/<run_id>/wal_s1w.json`；判定門檻逐字取規格 §1.2（Linux 單筆 p50 ≤0.005 ms、p95 ≤0.01 ms、p99 ≤0.02 ms、rotate 最大停頓 ≤3 ms；Windows ≤0.03／0.08／0.20 ms、≤15 ms），量測環境欄位依 §1.1.1；超標記 FAIL 並保留樣本，不得改列觀察值。Windows 原生與 EDR 開啟下的正式量測列 BLOCKED-OWNER（`EVIDENCE_MISSING`，不得 PASS）。
@@ -4544,7 +4556,9 @@ git commit -m "test(l15): Slice 2.1 bridge 回歸、安全情境與事件延遲�
               "platform": {"os": "str", "kernel": "str", "arch": "str"}, "device": "str|null"},
  "sections": [{"name": "linux_l1|linux_cap_posix_pty|windows_native_l1|windows_cap_windows_com|blackbox_python|blackbox_rust|existing_suites_rust|l15_ab|event_latency|wal_s1w_perf|cfg_boundary|pytest_full|policy_check|case_uptake",
                "status": "PASS|FAIL|EVIDENCE_MISSING", "command": "str", "exit": 0, "passed": 0, "failed": 0, "skipped": 0, "deselected": 0,
-               "ignored": 0, "expected_min_passed": 0, "allowed_missing_bo": "BO-S21-NN|null", "log": "relpath"}],
+               "ignored": 0, "required_set": "s21_core|s21_gate:<name>|null", "l1_results": "relpath|null",
+               "l1_verdict": {"verdict": "PASS|FAIL|INSUFFICIENT|INVALID", "reasons": ["str"], "missing": ["nodeid"], "skipped_required": [{}], "duplicates": ["nodeid"], "not_run": ["nodeid"], "required_sha256": "64hex"},
+               "allowed_missing_bo": "BO-S21-NN|null", "log": "relpath"}],
  "case_uptake": {"denominator": 0, "valid_pass": 0, "rate": 0.0, "window_start": "YYYY-MM-DD", "pass_case_ids": ["str"]},
  "pending_decisions": [{"id": "str", "scenario": "str", "evidence": "relpath"}],
  "blocked_owner": [{"id": "BO-S21-NN", "item": "str", "case_ids": ["str"], "status": "BLOCKED-OWNER", "procedure": "docs/rust-refactor/slice21-owner-runbook.md#bo-s21-nn", "evidence": "relpath|null"}],
@@ -4552,7 +4566,7 @@ git commit -m "test(l15): Slice 2.1 bridge 回歸、安全情境與事件延遲�
 ```
 
 判定規則（`scripts/rust/slice21_gate_judge.py`，gate 腳本最後呼叫；純函式可單測）：
-- section `PASS` 的必要條件：`exit == 0`、`failed == 0`、`passed >= expected_min_passed`（取自 `slice_2.1.json` 與本計畫各 Task 的測試數，寫在 `tests/acceptance/slice21_gate_expect.yaml`）、`skipped == 0`、`deselected == 0`、`ignored == 0`（`linux_cap_posix_pty` 以 `--ignored` 執行故 ignored 必為 0）；任一不滿足而 `failed == 0` → `EVIDENCE_MISSING`；`failed > 0` 或 `exit != 0` 且非缺證據 → `FAIL`。
+- **測試類 section**（`linux_l1`、`linux_cap_posix_pty`、`windows_native_l1`、`windows_cap_windows_com`、`blackbox_python`、`blackbox_rust`、`existing_suites_rust`、`pytest_full`）的 `PASS` 必要條件（R5-F3，取代原「`passed >= expected_min_passed`」計數門檻——計數門檻擋不住「以其他測試湊數、必要案例沒跑」與重複計數）：`required_set` 非 null（`linux_l1`／`windows_native_l1`＝`s21_core`，即 P9 `S21-L1-CORE` 的集合；其餘＝`s21_gate:<name>`；對應寫在 `tests/acceptance/slice21_gate_expect.yaml`，nodeid 清單本身只在 P2 `l1_required.lock.json`）、`l1_results` 指向該 section 的 `l1-results.v1`（pytest 段帶 `SW_RESOURCE_REPORT`＋`--junitxml`；cargo 段為 P3 `cargo_l1_results.py`；Windows 段為 `win-test` 報告的 `l1_results`），且 P2 `l1_judge.judge(l1_results, required_for(lock, required_set, platform), platform=…, junit=…)` 為 `PASS`（每個凍結 nodeid 恰執行一次且 `passed`、無重複、無必要案例 skip／ignored／deselected／未執行、runner `exit_code == 0`、`finished`）。`l1_verdict` 為 `FAIL` 或任一列 `failed`／`error` → `FAIL`；`INSUFFICIENT`／`INVALID`／`l1_results` 缺檔／set 不存在 → `EVIDENCE_MISSING`。計數欄（`passed`…`ignored`）只作摘要，仍須與 `l1_results` 一致，不一致 → `EVIDENCE_MISSING`。非測試類 section（`l15_ab`、`event_latency`、`wal_s1w_perf`、`cfg_boundary`、`policy_check`、`case_uptake`）`required_set` 為 null，沿用各自規則（`exit == 0` 且其報告判定 PASS）。各 `s21_core`／`s21_gate:*` 集合以 P2 `regen_lock.py --l1-add-only` 凍結，時點依 P2 Task 13（R5 審查後續）：P5 自 Task 1 起每個 Task 在自己的紅燈 commit 登記新增 nodeid（lock diff 隨該 commit），本 Task 只登記 gate 自身測試；PR 的 `regen_lock.py --check --base` 確保 Phase 內已登記者不消失。
 - 只有 `allowed_missing_bo` 非 null 的 section（`windows_cap_windows_com`→BO-S21-01）可在 `EVIDENCE_MISSING` 下不阻擋。
 - `verdict`：任何 section `FAIL` → `FAIL`；否則任何非豁免 section 為 `EVIDENCE_MISSING`、`identity` 欄位缺漏、或 `--dry-run` → `INCOMPLETE`；全部非豁免 section `PASS` → `READY_FOR_OWNER_EVIDENCE`。本環境永不輸出 `PASS` 作為 Slice 出口。
 
@@ -4574,7 +4588,8 @@ def test_blocked_owner_items_can_never_be_pass():
     assert set(s["properties"]["sections"]["items"]["properties"]["status"]["enum"]) == {"PASS", "FAIL", "EVIDENCE_MISSING"}
     assert set(s["properties"]["verdict"]["enum"]) == {"READY_FOR_OWNER_EVIDENCE", "INCOMPLETE", "FAIL"}
     sec = s["properties"]["sections"]["items"]["required"]
-    assert {"skipped", "deselected", "expected_min_passed", "ignored"} <= set(sec)
+    assert {"skipped", "deselected", "required_set", "l1_results", "l1_verdict", "ignored"} <= set(sec)
+    assert "expected_min_passed" not in s["properties"]["sections"]["items"]["properties"]   # R5-F3：計數門檻已移除
     assert {"cli_sha256", "daemon_sha256", "daemon_implementation", "contracts_revision", "cases_lock_sha256", "tool_revision", "platform"} <= set(s["properties"]["identity"]["required"])
 
 def test_gate_dry_run_lists_all_blocked_owner_items(tmp_path):
@@ -4606,8 +4621,13 @@ def test_bo_case_ids_cover_frozen_windows_cases():
 |---|---|
 | `test_all_skipped_is_not_pass` | section `exit 0, passed 0, skipped 36` → `EVIDENCE_MISSING`；verdict `INCOMPLETE` |
 | `test_zero_tests_is_not_pass` | `cargo test -- --ignored cap_posix_pty__` 輸出 0 tests、exit 0 → `EVIDENCE_MISSING` |
-| `test_below_expected_min_is_missing` | `passed = expected_min_passed - 1` → `EVIDENCE_MISSING` |
-| `test_deselected_counts_as_missing` | `deselected 1` → `EVIDENCE_MISSING` |
+| `test_count_threshold_cannot_substitute_required_nodeids`（R5-F3，failing-first；取代原 `test_below_expected_min_is_missing`） | `linux_l1` 的 `required_set="s21_core"` 凍結 `[cargo:sw-core::wal::a, …::b, …::c]`；`l1_results` 有 50 列 `passed` 但都不是這三個（另跑了其他測試）、`exit 0`、`passed 50` → `EVIDENCE_MISSING`，`l1_verdict.missing` 三筆；verdict `INCOMPLETE`（舊規則 `passed >= expected_min_passed` 會給 PASS） |
+| `test_required_nodeid_ignored_is_missing`（R5-F3） | `linux_cap_posix_pty` 凍結 `cap_posix_pty__x`，其列 `outcome "skipped"`（libtest `ignored`）→ `EVIDENCE_MISSING`、`l1_verdict.skipped_required[0].nodeid` 為之 |
+| `test_duplicate_nodeid_is_missing`（R5-F3） | 同一必要 nodeid 兩列皆 `passed`（兩支 exe 重複執行）→ `EVIDENCE_MISSING`、`l1_verdict.duplicates` 含之；一列 `failed` 一列 `passed` → `FAIL` |
+| `test_runner_exit_or_unfinished_is_missing`（R5-F3） | 全部必要 nodeid `passed` 但 `l1_results.exit_code == 101` 而 section `exit 0`（計數與報告不一致）→ `EVIDENCE_MISSING`；`finished: false` → `EVIDENCE_MISSING` |
+| `test_missing_l1_results_is_missing`（R5-F3） | 測試類 section `l1_results: null` 或檔不存在、或 `required_set` 不在 lock → `EVIDENCE_MISSING`；非測試類 section（`policy_check`）`required_set: null` 不受影響 |
+| `test_full_required_set_pass`（R5-F3） | 每個測試類 section 的凍結 nodeid 各恰一列 `passed`、`exit_code 0`、`finished true`、計數一致 → section `PASS`；搭配其餘 section PASS 與 `windows_cap_windows_com` 缺 → verdict `READY_FOR_OWNER_EVIDENCE` |
+| `test_deselected_counts_as_missing` | `deselected 1`（且該 nodeid 屬 `required_set`）→ `EVIDENCE_MISSING`（`l1_verdict.deselected_required` 非空） |
 | `test_only_allowed_bo_section_may_be_missing` | 只有 `windows_cap_windows_com` 缺 → `READY_FOR_OWNER_EVIDENCE`；`blackbox_rust` 缺 → `INCOMPLETE` |
 | `test_failed_section_is_fail` | 任一 `failed 1` → verdict `FAIL` |
 | `test_identity_required` | 缺 `daemon_sha256` 或 `cases_lock_sha256` → `INCOMPLETE` |
@@ -4633,7 +4653,7 @@ Expected：FAIL，`FileNotFoundError: .../tests/acceptance/slice21_gate_report.s
 
 - [ ] **Step 3：實作**
 
-`scripts/rust/slice21_gate.sh`（bash，`set -euo pipefail`；`--dry-run` 只產生報告骨架與 BLOCKED-OWNER 清單、各 section `EVIDENCE_MISSING`）依序執行並記錄每段 exit／計數：
+`scripts/rust/slice21_gate.sh`（bash，`set -euo pipefail`；`--dry-run` 只產生報告骨架與 BLOCKED-OWNER 清單、各 section `EVIDENCE_MISSING`）依序執行並記錄每段 exit／計數；測試類 section 一律另產 `l1-results.v1` 寫入 `l1_results`（cargo 段以 P3 `cargo_l1_results.py --platform linux --out … -- <該段 cargo 參數>` 執行、取代直接 `cargo test`；pytest 段帶 `SW_RESOURCE_REPORT=<section>/resource-report.json` 與 `--junitxml=<section>/junit.xml`；Windows 段取 `win-test` 報告的 `l1_results`），計數由該檔彙總（R5-F3）：
 
 1. `python3 scripts/rust/check_cfg_boundary.py`
 2. `cargo test --workspace --features test-fakes`
@@ -4641,7 +4661,7 @@ Expected：FAIL，`FileNotFoundError: .../tests/acceptance/slice21_gate_report.s
 4. `scripts/rust/win-test.sh --package sw-pal --package sw-core --package sw-daemon`
 5. `--with-com-pair` 時 `scripts/rust/win-test.sh --caps windows_com --package sw-pal`；否則該 section 寫 `EVIDENCE_MISSING`
 6. `cargo build --release -p sw-daemon -p sw-cli --target x86_64-unknown-linux-gnu` 與 `--target x86_64-pc-windows-gnu`
-7. `python3 -m pytest -q tests/contract_blackbox/slice21 -m cap_posix_pty --junitxml=…`（Python）與 Rust 版（Task 20 Step 2 命令），從 junit 取 `passed/failed/skipped`
+7. `python3 -m pytest -q tests/contract_blackbox/slice21 -m cap_posix_pty --junitxml=…`（Python）與 Rust 版（Task 20 Step 2 命令），兩輪皆帶 `SW_RESOURCE_REPORT`，逐案結果與計數取自 `l1-results.v1`（junit 只作一致性核對）
 8. Task 20 既有套件：兩條 pytest 命令＋三次單 case 的 `func-test/runner.py --case <id>`（逐一核對三個 case 報告）
 9. Task 21 L1.5 命令（`SERIALWRAP_GATE=1`），並把 `event_latency` 三輪結果寫成獨立 section
 9b. 計算 `case_uptake`（Task 0b `slice_breaker.acceptance_rate`）；`s21-exclusive-conflict-plain-open` 已定案（§0.2），計入 `l15_ab` section 判定，**不**列入 `pending_decisions`

@@ -640,6 +640,14 @@ pub trait ServiceCtl: Send + Sync {
     fn install(&self, def: &SupervisorDefinition, with_sudo: bool) -> Vec<CmdRecord>;
     fn uninstall(&self, mode: &SupervisionMode, with_sudo: bool) -> Vec<CmdRecord>;
     fn wait_stopped(&self, mode: &SupervisionMode, timeout: Duration) -> bool;   // SC-12
+    /// R5-F1（§6.1、§12.1 步驟 3）：交接停止前抑制所有監管自動拉起，持久化、只由 release_autostart 撤銷（P4 Task 3）。
+    /// systemd：持久 drop-in `serialwrap.service.d/90-serialwrap-update-hold.conf`（`[Unit] RefuseManualStart=yes`、`[Service] Restart=no`）
+    ///   ＋daemon-reload＋disable（不帶 --now），以 `systemctl show -p Restart -p RefuseManualStart -p UnitFileState` 驗證；
+    /// windows-task：/Change /DISABLE（hold 期間重新註冊的 Task XML `Settings/Enabled=false`）；windows-service：sc.exe config start= disabled；
+    /// on-demand：無監管項（sw-cli 持 autostart.lock，SC-18 另以 install-journal.json 存在為閘門）。
+    fn hold_autostart(&self, mode: &SupervisionMode, with_sudo: bool) -> Result<AutostartHoldRecord, ServiceResult>;
+    fn release_autostart(&self, hold: &AutostartHoldRecord, restore_enabled: Option<bool>, with_sudo: bool) -> Result<Vec<CmdRecord>, ServiceResult>;
+    fn autostart_hold_state(&self, mode: &SupervisionMode) -> HoldState;
 }
 pub struct CmdRecord { pub argv: Vec<String>, pub rc: i32 }   // DF-12：setup 的 "ran" 填實際執行過的命令
 ```
@@ -759,7 +767,7 @@ TxClass 與 gate 規則（規格 §5.2.1）：
 | class | 擋下條件 |
 |---|---|
 | `Command`／`FileTransfer` | `quiet_active`、`reconfirm_pending`；source 以 `human:` 開頭時另見 `DF-02` |
-| `LoginProbe`／`ReadyReconfirm`／`SystemRecoverKey`／`SelfTestProbe` | quiet、`wal_unhealthy`（停止自動 TX，規格 §5.4）；`LoginProbe`／`ReadyReconfirm`／`SelfTestProbe` 另比對 `fsm_gen`（08 Task 7 `fsm_gen_floor`），與 quiet 一樣在每次 `gate.submit` 臨界區內重跑——出列或呼叫端的 quiet 檢查只算 pre-check（R2-F1；Python Stage 0 對應 02 T20 `tx_class="system_probe"`＋`login_gen`、`set_probe_gate`、`system_permit()`，不含 `system:self_test`） |
+| `LoginProbe`／`ReadyReconfirm`／`SystemRecoverKey`／`SelfTestProbe` | quiet、`wal_unhealthy`（停止自動 TX，規格 §5.4）；`LoginProbe`／`ReadyReconfirm` 另比對 `fsm_gen`（08 Task 7 `fsm_gen_floor`），與 quiet 一樣在每次 `gate.submit` 臨界區內重跑——出列或呼叫端的 quiet 檢查只算 pre-check（R2-F1；Python Stage 0 對應 02 T20 `tx_class="system_probe"`＋`login_gen`、`set_probe_gate`、`system_permit()`）。quiet 的判定：`LoginProbe`／`ReadyReconfirm` 看 `auto_probe_blocked`（console unlock 不擋）；`SystemRecoverKey`／`SelfTestProbe` 看 `quiet_active`。`SelfTestProbe`（R5-F2，DF-19）`fsm_gen: None`、不比對 fsm_gen，只以 `epoch`＋`quiet_active` 在提交點重驗，與 actor 內 self-test pre-check（AUTOBOOT_QUIET 分支）同義；被 `Quiet` 擋下時回 pre-check 同形的 `AUTOBOOT_QUIET`、零 TX（06 Task 14 `OpOutcome::SelfTestRefused`）；Python 對應 02 T20 `tx_class="self_test_probe"`、`_gate_self_test_quiet_until`（含 console unlock profile） |
 | `HumanRaw` | `owner_gen` 不符時改走 deferred |
 | `LeaseOwner`／`InteractiveOpenCmd` | 不受 quiet 阻擋；`permit.owner_gen != owner_gen`（lease close／expiry／soft preempt／換手後的舊 lease 世代）→ `OwnerMismatch`。此世代檢查在每次 `gate.submit` 臨界區內重跑（R0-F1） |
 | `Flash` | 只在 `FlashMode::Flashing` 時放行 |
@@ -962,7 +970,7 @@ TxWriter 的 job queue 容量 64；滿時 OpRunner 阻塞等待（只有 OpRunne
 
 其他規定：
 
-- 未攔截的 panic：exit 1。停機未收斂亦 exit 1（見停止順序第 6 步），讓 `Restart=on-failure`／Task Scheduler RestartOnFailure 能辨識異常停機。
+- 未攔截的 panic：exit 1。停機未收斂亦 exit 1（見停止順序第 6 步），讓 `Restart=on-failure`／Task Scheduler RestartOnFailure 能辨識異常停機。由 `daemon.handoff_stop` 觸發的停機同樣可能 exit 1；update／rollback／回退／復原／`supervision-mode set` 的 CLI 在交接前已 `hold_autostart`（§4.8、§10.2，R5-F1），因此不會在切換期間被監管器拉起；daemon 端不為交接改變 exit code。
 - logging 輸出到 stderr，格式 `%(message)s`，只輸出 WARNING 以上，訊息模板逐字照 10 §G-01（`GAP-G-01`）。
 - 無參數執行時，所有路徑都由 env 決定（regression ThrowawayDaemon 依賴此行為）。
 - 執行檔名固定為 `serialwrapd`，以符合 multi_open 的偵測規則。
@@ -1090,7 +1098,7 @@ fn dispatch(&self, method: &str, p: &PyDict) -> Result<PyDict, PyErr> {
 
 **Python entry 的取得**：
 
-- 只從 release manifest 的 `components.python_cli_delegate.entry` 取得絕對 argv，例如 `["<bundle>/py/bin/python3","-I","-m","sw_core.cli"]`；Windows 為 `["<bundle>\\py\\python.exe","-I","-m","sw_core.cli"]`。
+- 只從 release manifest 的 `components.python_cli_delegate.entry` 取得絕對 argv，例如 `["<bundle>/py/bin/python3","-I","-B","-m","sw_core.cli"]`；Windows 為 `["<bundle>\\py\\python.exe","-I","-m","sw_core.cli"]`。
 - manifest 的位置：
   - POSIX：`current_exe()` 的 realpath 的上一層目錄中的 `release-manifest.json`；
   - Windows：`bin\current-release.json` 指向 `versions\<v>\release-manifest.json`（§10.2）。
@@ -1125,7 +1133,7 @@ fn dispatch(&self, method: &str, p: &PyDict) -> Result<PyDict, PyErr> {
 |---|---|---|
 | `windows-task`／`windows-service` 模式 | — | `SC-24` |
 | `setup --rollback` 與版本目錄 | — | `SC-23` |
-| `supervision-mode set` | — | `SC-22` |
+| `supervision-mode set` | — | `SC-22`（交接護欄同 §10.2 update 第 2～3 步、`--force` 不覆寫，R1-F3） |
 | `daemon restart` | — | `SC-20` |
 | `remote stop` | `close` 的別名 | `SC-21` |
 | Windows on-demand 首次需求自動啟動 | — | `SC-18` |
@@ -1224,7 +1232,7 @@ A/B 程序照規格 §15.9：先停 A 並確認資源釋放，才啟動 B；兩�
 1. 執行 `check_cfg_boundary.py`。
 2. `cargo test --target x86_64-pc-windows-gnu --no-run --message-format=json`，從輸出取出所有 `executable`。
 3. 逐一以 win-runner.sh 執行：先跑一般測試；`--caps` 指定的資源再以 `-- --ignored cap_<res>__` 跑一次。
-4. 彙總為 `target/win-test-report/<run_id>.json`，欄位為 `exe`、`caps`、`passed`、`failed`、`ignored`、`exit`。
+4. 彙總為 `target/win-test-report/<run_id>.json`，欄位為 `exe`、`caps`、`passed`、`failed`、`ignored`、`exit`，另以 `scripts/rust/cargo_l1_results.py`（P3 Task 17）寫出逐案的 `l1-results.v1`（`collected` 取自 `<exe> --list`、`results` 取自 libtest 每行結果、`exit_code`、`finished`），報告以 `l1_results` 指向它。計數只作摘要；任何 L1 出口都以 `l1-results.v1` 對 `tests/acceptance/l1_required.lock.json` 事先凍結的 nodeid 清單、經 P2 `tests/acceptance/l1_judge.py` 判定（缺案、重複、必要案例 ignored／skip、未執行、exit 非 0 或未完成一律不是 PASS；不得以 `passed>0` 或 `passed≥N` 判定，R5-F3）。Linux 原生 `cargo test` 與 pytest（`SW_RESOURCE_REPORT` v2）產生同一格式。
 5. 任何一個 exe 失敗即 exit 1。
 
 **COM pair**：`SW_TEST_COM_PAIR=COMa:COMb` 由擁有者在 Spike 1／OD-08 後提供。沒有提供時，`windows_com` 測試保持 ignored，並在報告中標為「證據不足」，不是 PASS。
@@ -1257,10 +1265,10 @@ A/B 程序照規格 §15.9：先停 A 並確認資源釋放，才啟動 B；兩�
     "cli":    {"implementation": "rust",   "version": "0.4.0", "git_revision": "…", "path": "bin/serialwrap.exe",  "sha256": "…"},
     "daemon": {"implementation": "python", "version": "0.4.0", "git_revision": "…",
                "launcher": {"path": "bin/serialwrapd.exe", "sha256": "…"},
-               "entry": ["py/python.exe", "-I", "py/serialwrapd.py"],
+               "entry": ["py/python.exe", "-I", "-B", "py/serialwrapd.py"],
                "runtime": {"path": "py/python.exe", "python_version": "3.12.x", "sha256": "…"},
                "package": {"name": "serialwrap", "version": "0.4.0", "wheel_sha256": "…", "tree_sha256": "…"}},
-    "python_cli_delegate": {"entry": ["py/python.exe", "-I", "-m", "sw_core.cli"], "tree_sha256": "…"},
+    "python_cli_delegate": {"entry": ["py/python.exe", "-I", "-B", "-m", "sw_core.cli"], "tree_sha256": "…"},
     "assets": {"skill_sha256": "…", "skill_windows_sha256": "…", "profiles_sha256": "…"},
     "supervisor": {"default_mode": "windows-task", "definition_sha256": "…"}
   },
@@ -1273,7 +1281,7 @@ A/B 程序照規格 §15.9：先停 A 並確認資源釋放，才啟動 B；兩�
 - Stage 2 起 `daemon.implementation` 改為 `"rust"`，`entry` 移除。
 - 同目錄另有 `SHA256SUMS`。
 - **manifest 是宣告，不是內容證明**（R2-F7）：保留原 manifest、替換 `bin/serialwrapd` 時 `sha256(release-manifest.json)` 不變；`components.assets` 只帶 hash、沒有 path。凡需判定「實際檔案＝受測物」之處（P9 A/B 執行前 `verify_frozen`、Stage 3 `evidence target`、發佈時 `retirement verify --mode release` 與 `retirement verify-archive`），必須以 P9 Task 3 `verify_bundle` 逐一重算帶 `path`＋`sha256`／`tree_sha256` 的 component，並以 `bundle_tree_sha256`（sorted `"<posix relpath>\0<sha256>\n"` 的 sha256，涵蓋 bundle 目錄**全部**一般檔、不排除任何檔、遇 symlink 或非一般檔即拒絕）比對 Stage 3 target 記錄值；發佈只上傳通過 `verify-archive` 的 archive 位元組（P9 Task 14、Task 16）。
-- **證據綁定受測內容，不只綁 manifest**（R3-F2）：新增未宣告的旁載檔（例如 `bin/version.dll`）時 manifest 與 `artifact_id` 都不變、`verify_bundle` 照樣通過，若只在 target 記 tree，對同一 manifest 重設 target 就能讓舊 PASS 隨未受測內容發佈。因此：(1) 同一 `artifact_id` 不得以不同 `bundle_tree_sha256` 重設 target（P9 Task 14 `set_target` 回 `HARNESS_ARTIFACT_MISMATCH`），換內容必須重建 bundle；(2) A/B 報告每側記錄實際受測的 `bundle_tree_sha256` 與 `runtime_tree_sha256`（同演算法、只排除 bundle 根的 `release-manifest.json`／`SHA256SUMS`），每筆證據 entry 保存兩者並納入有效性判定，與 target 不符即過期；(3) 跨 Stage 沿用（`reuse_of`）除 `runtime_digest`（只雜湊宣告值）外必須 `runtime_tree_sha256` 相等；(4) 在 target bundle 目錄以外的安裝上產生的證據——Canary 工作站（collector 每次快照對 `versions/<v>/` 部署目錄重算兩個指紋，stdlib 實作、同演算法）與回滾演練（D1 量測 current 部署目錄）——由產生端記錄實際部署內容的指紋，Canary gate 只計指紋與 target 相同的紀錄、不同內容的執行量不合併；ingest 缺指紋即拒收，不得以 target 值回填（R4-F1，規格 §12.2 Stage 3「使用正式 release artifact」「不得直接合併不同版本的執行量」）。
+- **證據綁定受測內容，不只綁 manifest**（R3-F2）：新增未宣告的旁載檔（例如 `bin/version.dll`）時 manifest 與 `artifact_id` 都不變、`verify_bundle` 照樣通過，若只在 target 記 tree，對同一 manifest 重設 target 就能讓舊 PASS 隨未受測內容發佈。因此：(1) 同一 `artifact_id` 不得以不同 `bundle_tree_sha256` 重設 target（P9 Task 14 `set_target` 回 `HARNESS_ARTIFACT_MISMATCH`），換內容必須重建 bundle；(2) A/B 報告每側記錄實際受測的 `bundle_tree_sha256` 與 `runtime_tree_sha256`（同演算法、只排除 bundle 根的 `release-manifest.json`／`SHA256SUMS`），每筆證據 entry 保存兩者並納入有效性判定，與 target 不符即過期；(3) 跨 Stage 沿用（`reuse_of`）除 `runtime_digest`（只雜湊宣告值）外必須 `runtime_tree_sha256` 相等；(4) 在 target bundle 目錄以外的安裝上產生的證據——Canary 工作站（collector 每次快照對 `versions/<v>/` 部署目錄重算兩個指紋，stdlib 實作、同演算法）與回滾演練（D1 量測 current 部署目錄）——由產生端記錄實際部署內容的指紋，Canary gate 只計指紋與 target 相同的紀錄、不同內容的執行量不合併；ingest 缺指紋即拒收，不得以 target 值回填（R4-F1，規格 §12.2 Stage 3「使用正式 release artifact」「不得直接合併不同版本的執行量」）；(5) 同一規則涵蓋所有執行受測 artifact 的報告（junit、func-test、TestPilot、realhw、`release-gate.json`、手動程序紀錄）：產生端以 P2 Task 10 `realhw/deployed_content.py`（同演算法，依 §10.2 安裝佈局由實際使用的 CLI 定位安裝目錄）在執行前後量測並寫入報告，A/B suite 的量測另須等於該側凍結 tree；target 記有 tree 時缺值、前後不一或不符一律拒收，報告開始時刻不能代替量測（R5-F4，§9.5、§11.4「報告須可追溯至實際受測組合」）。只有不執行 serialwrap artifact 的 OD-09 凍結報告與 bridge 自測不量測。
 - 建置由 `scripts/rust/mkbundle.sh --target <triple> --stage <s> [--dev]` 負責：組出 Python runtime（Linux 用 venv；Windows 用 embeddable 3.12 加 `pip install --target`），安裝本 repo wheel，產生 manifest。
 
 ### 10.2 安裝佈局與穩定入口
@@ -1283,7 +1291,7 @@ A/B 程序照規格 §15.9：先停 A 並確認資源釋放，才啟動 B；兩�
 | Linux | `${XDG_DATA_HOME:-~/.local/share}/serialwrap/versions/<v>/` | `~/.local/bin/serialwrap`、`~/.local/bin/serialwrapd` 為 symlink，指向 `versions/<v>/bin/*` |
 | Windows | `%LOCALAPPDATA%\Programs\serialwrap\versions\<v>\` | `bin\serialwrap.exe`、`bin\serialwrapd.exe` 為**複本**，另有 `bin\current-release.json` 記錄 `{"bundle_version","dir"}`；不依賴 symlink 權限 |
 
-切換流程：先把新複本寫成 `*.new`，再把舊檔 rename 成 `*.old.<ts>`（執行中的 exe 允許 rename），最後把 `*.new` rename 成正式名稱。至少保留 Current 與 Previous。rollback 流程依規格 §12.1 七步驟（`SC-23`）。第 2 步的交接安全檢查（Flash、FileTransfer、活躍寫入與其他不可安全中止操作）沒有覆寫：update／rollback 帶 `--force` 時仍拒絕，且不停止監管、不送 `daemon.stop`，因為停止 daemon 會中止傳輸或 flash pump，而 DUT 上已發生的部分燒寫無法撤銷。CLI 端預檢只做提早拒絕；第 3 步停止一律經 daemon 原子交接 `daemon.handoff_stop`（§6.2 第 7 步：busy 判定＋凍結新操作＋token 同一臨界區），update／rollback 路徑不送一般 `daemon.stop`；交接被拒或結果不明時不硬停、不切換（R1-F1，P4 Task 12、P1 T08、P8 Task 14）。第 7 步回退與 `install-journal.json` 中斷復原同樣只經交接（`reason:"revert"`）停止目前在跑的 daemon：第 6 步的新版一啟動就對外服務，驗收期間可能已受理傳輸或燒錄；交接被拒、不支援或結果不明時保留 journal、不硬停、不切換回 Previous，由下一次 `setup` 在 daemon 閒置後完成回退（R2-F6）。
+切換流程：先把新複本寫成 `*.new`，再把舊檔 rename 成 `*.old.<ts>`（執行中的 exe 允許 rename），最後把 `*.new` rename 成正式名稱。至少保留 Current 與 Previous。rollback 流程依規格 §12.1 七步驟（`SC-23`）。第 2 步的交接安全檢查（Flash、FileTransfer、活躍寫入與其他不可安全中止操作）沒有覆寫：update／rollback 帶 `--force` 時仍拒絕，且不停止監管、不送 `daemon.stop`，因為停止 daemon 會中止傳輸或 flash pump，而 DUT 上已發生的部分燒寫無法撤銷。CLI 端預檢只做提早拒絕；第 3 步停止一律經 daemon 原子交接 `daemon.handoff_stop`（§6.2 第 7 步：busy 判定＋凍結新操作＋token 同一臨界區），update／rollback 路徑不送一般 `daemon.stop`；交接被拒或結果不明時不硬停、不切換（R1-F1，P4 Task 12、P1 T08、P8 Task 14）。第 7 步回退與 `install-journal.json` 中斷復原同樣只經交接（`reason:"revert"`）停止目前在跑的 daemon：第 6 步的新版一啟動就對外服務，驗收期間可能已受理傳輸或燒錄；交接被拒、不支援或結果不明時保留 journal、不硬停、不切換回 Previous，由下一次 `setup` 在 daemon 閒置後完成回退（R2-F6）。第 3 步的「停止該實例的監管拉起能力」適用於**每一種** mode（R5-F1）：既有 systemd unit 為 `Restart=on-failure`，停機未收斂時 daemon exit 1（§6.1 停止順序第 6 步），若只交接不抑制，舊實例結束後會在備份／切換期間被重新拉起（Linux 穩定入口為 symlink，可能指向新版或半切換），開 UART 並受理傳輸，而舊實例的 `handoff_token` 不能授權停止它。故所有交接停止前先 `ServiceCtl::hold_autostart`（§4.8；systemd 持久 drop-in＋disable，windows disable 且 hold 期間重新註冊以停用狀態送出，on-demand 持 `autostart.lock`＋journal 擋 SC-18），原值記入 journal，只在啟動目標版本前、拒絕還原或中斷復原時撤銷；交接只授權發出 token 的實例，等待中、切換前與啟動前偵測到任何其他實例一律重新交接（鏈長上限 3），`hard_stop` 只對取得 grant 的 identity 執行（P4 Task 3／7／12、P8 Task 14）。`supervision-mode set`（`SC-22`，Python 沒有的新命令）同樣停止正在服務的 daemon，故沿用同一組交接護欄而非 `setup` 的 Python 對等行為：同一 fail-closed 安全檢查（探測失敗、逾時、格式異常或身分不明一律拒絕，不視為「未 flashing」）、停止只經 `daemon.handoff_stop{reason:"supervision_set"}`、`--force` 不覆寫；同模式刷新或只列 `pending_sudo` 時不交接，避免只凍結不切換（R1-F3，P4 Task 10 `OldStop::HandedOff`、Task 12 `run_supervision_switch`）。
 
 中斷復原（`install-journal.json`，P4 Task 12）：journal 必須自帶回到完整 Previous 組合所需的原始資料，不依賴行程記憶體或尚未完成的備份。第 3 步停用監管之前，先把原始穩定入口（symlink 目標或複本 sha256）、`current-release.json` 全文、`config.yaml` 複本、監管快照（mode、endpoint、enabled、running、匯出的已註冊內容）與 daemon 快照（是否健康在跑、identity、各 session 的 `attached_real_path`／`com`／`state`、重新啟動路徑）寫入 `install-journal.snapshot/` 與 journal，每次寫入都 fsync 並同步目錄。第 5 步拆成三個持久化階段：`backup_started`（只寫 `*.partial`）→ `backup_complete`（`manifest.json` 最後寫入、目錄改名提交，manifest sha256 記入 journal）→ `entries_switching`。備份提交前不切換任何入口、設定或監管。復原依階段處理：(1) 尚未停用：只刪 journal；(2) 已停用或已停止、尚未切換：不讀備份，依快照還原 enabled 與 running，確認舊行程與 tty holder 已釋放後才重新啟動舊版；(3) 已開始切換：先驗證備份 manifest 與每個檔案，通過後以快照還原入口與 current，再執行第 7 步。任一還原失敗都保留 journal（位元組不變），而且不繼續本次 update 或 rollback。
 

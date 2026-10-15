@@ -116,7 +116,7 @@
 
 ### 0.5 本 Phase 新登記（Task 0 寫入 `contracts/behavior_changes.yaml` 與調和表 §1）
 
-ID 選擇：SC-28／SC-29 已由 P6（07 T0 D-11／D-12）占用，本 Phase 取 **SC-30**；DF-18 未被占用。Task 0 Step 1 以 `contracts/behavior_changes.yaml` 現況再核對一次（P6 尚未合併時仍保留 SC-28／29 給 P6，不得搶號）。
+ID 選擇：SC-28／SC-29 已由 P6（07 T0 D-11／D-12）占用，本 Phase 取 **SC-30**；DF-18 未被占用（DF-19 已由 P0 登記為 self-test nonce probe 的提交點 quiet 重驗、P1 T20 實作，R5-F2；本 Phase 只在 Task 8 承接其 Rust 行為，不重登記）。Task 0 Step 1 以 `contracts/behavior_changes.yaml` 現況再核對一次（P6 尚未合併時仍保留 SC-28／29 給 P6，不得搶號）。
 
 | ID | 內容 | 規格依據 | 範圍 |
 |---|---|---|---|
@@ -134,7 +134,7 @@ ID 選擇：SC-28／SC-29 已由 P6（07 T0 D-11／D-12）占用，本 Phase 取
 | `session_auth.rs`（06 T13） | `SessionAuth`、`AuthResolution{reason: &'static str, env_file_path}`、`parse_env_file(&str)`、`resolve_session_auth(p, env, read)`、`credentials_declared_but_unresolved` | 只補 golden 回歸（env_file 解碼失敗、BOM、universal newline、Unicode 空白、警告模板逐字）；`SessionAuth` 的 `Debug` 改為遮蔽 password／console_unlock（新增行為，RED）。不新增 `Secret`／`AuthReason` 型別 | 2 |
 | `login_fsm.rs`（06 T13） | `LoginIo`、`LoginOutcome{Ready, NotReady, Failed}`、`LoginPlan`、`choose_login_plan`（含 `quiet_blocks` → 合成 `PROMPT_UNAVAILABLE`）、`probe_ready`、`ensure_ready`（shell／prpl／passthrough）、`prompt_timeout_error` | `LoginIo` 加 `cancel: &RunCancel`、`class: TxClass`，`tx` 閉包改回 06 T9 `TxReport`（console unlock 的 INFO log 依 GAP-G-01 丟棄，不需 log 介面）；`LoginOutcome` 加 `Aborted(LoginAbort)`、`Raised(String)`；`ensure_ready` 補 bcm、`post_login_cmd`、console unlock、`maybe_reclassify_flood`；新增 `detect_template`、`matches_any_bootloader_prompt`、`console_at_bootloader`、`is_prompt_timeout_error`；移除 `slice21_unsupported_feature` 的呼叫點 | 3 |
 | `quiet_gate.rs`（06 T13） | `QuietState`（arm／clear_quiet／confirm_ready／expire／remaining_s／reconfirm_remaining_s／on_rx_text）、`QuietTransition`、`detect_boot_banner`、`is_reboot_command`、SC-03 `retry_after_s`、DF-02 | 新增 `boot_quiet_blocks_probe`、`agent_gate_active`、`submit_gate_reject`／`execute_gate_reject` 的 golden 位元組相等、`READY_UNCONFIRMED_HINT` 常數；`quiet_rx` golden 回歸。arm 時改呼叫 07 `invalidate_human_input`（不再 `owner_gen++` 作 deferred 失效） | 4 |
-| `tx_writer.rs`（06 T9）／arch §5.4 | `TxPermit`、`FenceState`、`FenceReject`（8 值）、`TxJob`、`TxReport` | `TxPermit.fsm_gen: Option<u64>`（只有 `LoginProbe`／`ReadyReconfirm`／`SelfTestProbe` 帶值）、`FenceState.fsm_gen_floor`、`FenceState.auto_probe_blocked`、`FenceReject::StaleFsmGen`；admit 規則見 Task 7 | 7 |
+| `tx_writer.rs`（06 T9）／arch §5.4 | `TxPermit`、`FenceState`、`FenceReject`（8 值）、`TxJob`、`TxReport` | `TxPermit.fsm_gen: Option<u64>`（只有 `LoginProbe`／`ReadyReconfirm` 帶值；`SelfTestProbe` 為 `None`、改以 `quiet_active` 擋，R5-F2）、`FenceState.fsm_gen_floor`、`FenceState.auto_probe_blocked`、`FenceReject::StaleFsmGen`；admit 規則見 Task 7 | 7 |
 | `uart_bridge.rs`（06 T10） | `RxShared`、`ReaderCtx`、`spawn_reader` | `RxShared::wait_for_regex_cancellable`＋`RunCancel`；`ReaderCtx.observers: Vec<Arc<dyn RxObserver>>`（WAL append 後依序呼叫，DF-15） | 7、10、16 |
 | `session_core.rs`（06 T11） | `ControlEvent::LoginFinished`、`Effect::{StartLogin, WalMeta, Warn, Notify}`、`begin_stop` | `Effect::CancelLogin`、`StartLogin.kind`、`LoginFinished.report`、`active_login`；reprobe tick；`transport_stall_warned`（`clean_text` 後非空 RX 清除）；login 收斂表；`Effect::CaptureOpen／CaptureClose` 與 `ControlEvent::CaptureOpened／CaptureClosed`；`ForceRecoverPoll` timer | 5、6、7、9、10 |
 | `op_runner.rs`（06 T14） | `OpSpec::{Recover, SelfTestProbe, RebootRecovery, DetectTemplate}`、`OpOutcome` | `Recover` 補 force 輪詢（actor timer）、READY＋force 路徑；`RebootRecovery` 補 SC-30 回等待迴圈 | 7、9 |
@@ -208,7 +208,7 @@ ID 選擇：SC-28／SC-29 已由 P6（07 T0 D-11／D-12）占用，本 Phase 取
 - Modify: `docs/rust-refactor/plans/spec-reconciliation.md`（§1.1 增 SC-30、§1.2 增 DF-18、SC-11 列補 Event Engine 細化、§5 統計）
 - Modify: `contracts/behavior_changes.yaml`（`changes` 增 SC-30、DF-18 兩筆，依 §0.5 欄位；遞增 `revision`）
 - Create: `tests/acceptance/breaker/slice_2.3.json`（凍結快照）、`tests/acceptance/breaker/slice_2.3.snapshots.ndjson`（空檔）：以 06 Task 0b `scripts/rust/slice_breaker.py`（不重建）在 `slice_2.3` 集合凍結的同一 commit 凍結斷路器分母與觀測窗口起訖（規格 §12.2、OD-02／OD-13）；Task 19 Phase gate 以 `slice_breaker.py --freeze tests/acceptance/breaker/slice_2.3.json --snapshots …` 判定，觸發即停止擴大部署並退守 Stage 1
-- Modify: `tests/test_contracts_catalog.py`（`test_bc_real_sc_df_ranges`：SC 期望改 `range(1, 32)`（P6 已登記 SC-28／29／31，07 Task 0 下游通知）、DF 改 `range(1, 19)`；若 P6 尚未合併，本 Task 只在 P6 合併後執行此項）
+- Modify: `tests/test_contracts_catalog.py`（`test_bc_real_sc_df_ranges`：SC 期望改 `range(1, 32)`（P6 已登記 SC-28／29／31，07 Task 0 下游通知）、DF 改 `range(1, 20)`（DF-19 已由 P0 登記、P1 T20 實作，R5-F2；本 Task 補上 DF-18 後區間連續）；若 P6 尚未合併，本 Task 只在 P6 合併後執行此項）
 - Modify: `tests/acceptance/cases.yaml`、`tests/acceptance/cases.lock.json`（以 `regen_lock.py --add-only` 產生；不得手改鎖檔）
 - Modify: `crates/sw-core/src/{login_fsm,quiet_gate,self_test,capture,session_core,tx_writer,uart_bridge,op_runner}.rs`（只追加新公開項，既有函式本體不動）
 - Create: `crates/sw-core/src/{login_run,reprobe,transport_stall,recover,mono}.rs`
@@ -946,12 +946,13 @@ fn refine_flips_only_when_zero_rx_and_frozen_30s_and_warns_once() {
 
 ```rust
 // tx_writer.rs（修訂 06 T9；06 既有欄位不動）
-pub struct TxPermit { /* 06 欄位 */ pub fsm_gen: Option<u64> }        // LoginProbe／ReadyReconfirm／SelfTestProbe 帶 Some(啟動時的 fsm_gen)，其他 class None
+pub struct TxPermit { /* 06 欄位 */ pub fsm_gen: Option<u64> }        // LoginProbe／ReadyReconfirm 帶 Some(啟動時的 fsm_gen)，其他 class（含 SelfTestProbe，R5-F2）None
 pub struct FenceState { /* 06 欄位 */ pub fsm_gen_floor: u64, pub auto_probe_blocked: bool }
 pub enum FenceReject { /* 06 的 8 值 */ StaleFsmGen }
 // admit 規則（Fence 鎖內，依序）：epoch → frozen → permit.fsm_gen==Some(g) && g < st.fsm_gen_floor → StaleFsmGen
-//   → LoginProbe／ReadyReconfirm／SelfTestProbe：auto_probe_blocked → Quiet（取代原「quiet_active 即擋」，使 console unlock 可運作）
-//   → SystemRecoverKey：quiet_active → Quiet（不變）→ 其餘 06 規則不變
+//   → LoginProbe／ReadyReconfirm：auto_probe_blocked → Quiet（取代原「quiet_active 即擋」，使 console unlock 可運作）
+//   → SystemRecoverKey／SelfTestProbe：quiet_active → Quiet（不變；R5-F2：SelfTestProbe 不改用 auto_probe_blocked——self-test
+//     pre-check 對任何 profile 都以 quiet_active 回 AUTOBOOT_QUIET，提交點必須同義，console unlock 的 arm 也擋）→ 其餘 06 規則不變
 // uart_bridge.rs（修訂 06 T10）
 #[derive(Clone)] pub struct RunCancel { /* Arc<AtomicBool>＋對所屬 RxShared condvar 的 notify_all */ }
 impl RunCancel { pub fn new(rx: &Arc<RxShared>) -> Self; pub fn trigger(&self); pub fn is_triggered(&self) -> bool; }
@@ -1046,6 +1047,26 @@ fn console_unlock_probe_passes_while_quiet_active() {
     assert!(rep.reject.is_none());
     assert_eq!(h.fence_floor(), g);
 }
+
+#[test]
+fn self_test_probe_gated_by_quiet_active_even_for_console_unlock() {   // R5-F2，DF-19：舊「SelfTestProbe 看 auto_probe_blocked」必紅
+    for blocks_probe in [true, false] {
+        let h = TxRig::new();
+        h.dev.script_write(vec![sw_pal::fakes::serial::FakeWriteStep::PauseBeforeSubmit]);
+        let r1 = h.submit(TxClass::SelfTestProbe, None, b"echo __READY__ab12cd34\n");
+        assert!(h.dev.wait_paused(std::time::Duration::from_secs(2)));    // pre-check（出列）已過、尚未進 FenceSubmitGate
+        h.fence_arm_quiet(blocks_probe);                                    // console unlock（false）：quiet_active=true、auto_probe_blocked=false
+        h.dev.release_pause();
+        let rep = r1.recv();
+        assert_eq!((rep.result.outcome, rep.reject), (TxOutcome::NotSubmitted, Some(FenceReject::Quiet)), "blocks_probe={blocks_probe}");
+        assert_eq!(h.dev.os_submits(), 0);
+        assert!(h.wal_tx_payloads().is_empty());
+        if !blocks_probe {                                                  // 對照：同狀態的 console unlock login run 仍放行
+            let g = h.fence_floor();
+            assert!(h.submit(TxClass::LoginProbe, Some(g), b"k\n").recv().reject.is_none());
+        }
+    }
+}
 ```
 
 
@@ -1132,11 +1153,11 @@ fn op_login_routes_secret_with_log_false_and_login_probe_class() {
 ## Task 8：`self_test.rs`：self-test 分類與 nonce probe 整合
 
 **Test author model:** agy-gemini-3.8-flash-high　**Implementer model:** codex-gpt-6-luna-max
-**Changelog fragment:** `changelog.d/rust-p7-self-test.md`（`### Added`：self-test 補 RX_FLOOD／bootloader fallback 分類與 Python 位元組相容回應；`### Fixed`：self-test 探測失敗不再計入 reconfirm 次數）
+**Changelog fragment:** `changelog.d/rust-p7-self-test.md`（`### Added`：self-test 補 RX_FLOOD／bootloader fallback 分類與 Python 位元組相容回應；`### Fixed`：self-test 探測失敗不再計入 reconfirm 次數；self-test nonce probe 在送出前一刻偵測到開機 banner（含 console unlock profile）時不送出、回 `AUTOBOOT_QUIET`（DF-19））
 **BLOCKED-OWNER:** 實機 F11 `f11-flood-probe-classified`（RX_FLOOD 分類，B-05）。
 
 **Files:**
-- Modify: `crates/sw-core/src/self_test.rs`（06 T14 既有）、`crates/sw-core/src/op_runner.rs`（`OpSpec::SelfTestProbe`：`TxPermit.fsm_gen`、`RunCancel`）、`crates/sw-core/src/session_core.rs`
+- Modify: `crates/sw-core/src/self_test.rs`（06 T14 既有）、`crates/sw-core/src/op_runner.rs`（`OpSpec::SelfTestProbe`：`TxPermit.fsm_gen: None`（R5-F2）、`SelfTestRefused`、`RunCancel`）、`crates/sw-core/src/session_core.rs`
 - Modify: `crates/sw-core/tests/lease_selftest.rs`（06 T14：`selftest_unresponsive_counts_attempt` 改名並更正，見 §0.6 退役清單）
 - Create: `crates/sw-core/tests/self_test_p7.rs`
 
@@ -1214,14 +1235,16 @@ fn banner_during_self_test_suspend_does_not_replay_stale_human_input() {
 | `st_flashing_goes_to_probe`（新增） | state FLASHING | 進 nonce probe（RPC-H-07 KEEP）；fence `Flash` 擋 TX → `TARGET_UNRESPONSIVE`、不 confirm_ready |
 | `st_probe_flood`（新增） | probe 失敗、20000 | `RX_FLOOD`／`wait`＋`probe_ok:false` |
 | `st_probe_ok_confirms_ready`（回歸） | probe 成功 | `OK`／`none`＋`probe_ok:true`；`ready_reconfirm_pending:false` |
-| `st_probe_quiet_arm_mid_probe_cancels`（新增） | probe 等待中 banner | probe permit 以 `StaleFsmGen` 擋下、`TARGET_UNRESPONSIVE`；零後續 TX |
+| `st_probe_quiet_arm_mid_probe_cancels`（新增） | probe 已提交 OS、等待 nonce 中 banner | probe 照實計為已提交（TX WAL 1 行 `system:self_test`）；nonce 未回 → `TARGET_UNRESPONSIVE`、`probe_ok:false`；不 `confirm_ready`、`quiet_active` 維持；之後無任何 `system:self_test` TX |
+| `st_probe_quiet_armed_after_precheck_before_submit_zero_tx`（回歸：06 T14 `selftest_quiet_armed_after_precheck_before_submit_zero_tx` 已實作，本列改以 golden 位元組斷言；R5-F2，DF-19） | READY、quiet 未啟動；probe job 停在 `FakeWriteStep::PauseBeforeSubmit` 時 RX `U-Boot 2024.04\r\n` | `write_calls()==1`、`os_submits()==0`、無 `system:self_test` TX WAL；回應位元組等於 golden `self_test_responses` 的 AUTOBOOT_QUIET 列（鍵序 `ok,classification,session,recommended_action,<lease ctx>,command_capable`）、無 `probe_ok`；不推進 FakeClock 即回覆；`ready_reconfirm_pending:true` |
+| `st_probe_console_unlock_banner_after_precheck_zero_tx`（新增，R5-F2） | profile 有 `console_unlock_env`；同上窗口內 RX `CFE version 1.0\r\n` | fence `quiet_active=true`、`auto_probe_blocked=false`；probe `reject==Some(Quiet)`、`os_submits()==0`；回應 `AUTOBOOT_QUIET`／`wait`（同上列位元組形狀）；`fsm_gen_floor` 不變（console unlock login run 不受影響） |
 
 另加 SessionCore 整合 `self_test_nonce_probe_uses_offset_and_suspends_human`（新增）：nonce 等待以 `wait_for_regex_cancellable(.., from: Some(offset), ..)`（非整窗）；human raw owner 存在時 P6 `fg_begin`／`fg_finish` 依序發生；成功時 `confirm_ready`。
 
 `lease_selftest.rs` 更正：`selftest_unresponsive_does_not_count_attempt` —— READY＋pending、nonce 不回 → `TARGET_UNRESPONSIVE`、`ready_reconfirm_attempts` **不變**（Python 只在 `_finish_probe_reprobe` 遞增，`session_manager.py:1483`）。
 
 - [ ] **Step 2：執行**：`cargo test -p sw-core --features test-fakes --test self_test_p7 --test lease_selftest` → 新增列 RED；更正後的 `selftest_unresponsive_does_not_count_attempt` RED（06 實作會遞增）；回歸列 PASS。
-- [ ] **Step 3：實作**：照 `session_manager.py:4305-4580` 分支順序與鍵順序擴充 06 本體；nonce probe：`last_probe_at`、`mark_tx`、送 `ready_probe.replace("${nonce}")`（source `system:self_test`、`TxClass::SelfTestProbe`、`fsm_gen: Some(active)`）、`wait_for_regex_cancellable(nonce, Some(offset), timeout_s)`、成功後再等 prompt（結果忽略）、`confirm_ready`；移除 06 中 self-test 失敗遞增 `ready_reconfirm_attempts` 的程式；RELEASED 的 holder 掃描沿用 06（actor 外 executor）。
+- [ ] **Step 3：實作**：照 `session_manager.py:4305-4580` 分支順序與鍵順序擴充 06 本體；nonce probe：`last_probe_at`、`mark_tx`、送 `ready_probe.replace("${nonce}")`（source `system:self_test`、`TxClass::SelfTestProbe`、`fsm_gen: None`——R5-F2：以 `epoch`＋`quiet_active` 在提交點重驗，與 pre-check 同義；不與 login run 的 `fsm_gen_floor` 掛鉤）；probe `TxReport.reject == Some(Quiet)` → 06 T14 `OpOutcome::SelfTestRefused(Quiet)`，actor 以 `SelfTestFinal::assemble("AUTOBOOT_QUIET", …)` 產生與 pre-check 同位元組形狀的回應、不等 nonce、不 `confirm_ready`（Python 對應 02 T20 行為規格第 6 點）；否則 `wait_for_regex_cancellable(nonce, Some(offset), timeout_s)`、成功後再等 prompt（結果忽略）、`confirm_ready`；移除 06 中 self-test 失敗遞增 `ready_reconfirm_attempts` 的程式；RELEASED 的 holder 掃描沿用 06（actor 外 executor）。
 - [ ] **Step 4：執行，預期 PASS**：同 Step 2；`--test command_exec`（06）不退化。
 - [ ] **Step 5：commit**：`feat(rust-selftest): 承接 self-test 完整分類與 Python 相容回應`
 
@@ -2317,6 +2340,7 @@ def test_creds_file_fixed_does_not_auto_probe_until_attach(p7, tmp_path):
 - Create: `crates/sw-daemon/tests/cap_windows_com_p7.rs`（`#[ignore = "cap:windows_com"]`；三案 `cap_windows_com__p7_login_ready`、`cap_windows_com__p7_quiet_banner_zero_tx`、`cap_windows_com__p7_event_fire`）
 - Create: `crates/sw-daemon/tests/support/com_peer.rs`（測試端腳本化 DUT：以 sw-pal serial backend 開 `SW_TEST_COM_PAIR` 的 peer 端（COMb），DSL 與 Task 1 `ScriptedBridge` 相同，記錄收到的全部 bytes）
 - Create: `scripts/rust/p7_gate.sh`、`scripts/rust/p7_gate_report.py`、`tests/test_p7_gate_report.py`
+- Modify: `tests/acceptance/l1_required.lock.json`（只以 P2 `regen_lock.py --l1-add-only` 登記 `p7_gate:*` 各測試列的平台集合；R5-F3）
 - Create: `docs/rust-refactor/evidence/p7-gate-<YYMMDD>.md`（由 `p7_gate_report.py` 產生）、`docs/rust-refactor/evidence/p7-b01-procedure.md`（B-01 擁有者程序）
 
 **Windows COM 案例規格（OD-08、OD-11）：** daemon 以 throwaway 隔離實例啟動（獨立 state／run／wal 目錄），`windows.test_device_allowlist` 只列 COMa（OD-11：僅隔離實例、明確列名）；peer 端 COMb 由測試開啟並扮演 DUT。byte 證據＝peer 收到的全部 bytes 與 daemon WAL 的 TX 記錄逐筆比對（相同順序、相同內容，secret 只出現在 peer 端、不在 WAL）。三案驗收：(1) prpl 腳本登入到 READY、`cmd submit` 成功；(2) READY 後 peer 輸出 U-Boot banner → submit 回 `AUTOBOOT_QUIET`，banner 之後 peer 收到 0 byte；(3) contains 規則命中 → handler（`cmd.exe` shell 路徑）執行、`fire_completed`、Job 結束後無殘留行程。缺 `SW_TEST_COM_PAIR` 時三案保持 ignored，報告標「證據不足」（arch §9.4），gate 對應列為 BLOCKED-OWNER。
@@ -2325,10 +2349,17 @@ def test_creds_file_fixed_does_not_auto_probe_until_attach(p7, tmp_path):
 
 ```python
 # scripts/rust/p7_gate_report.py
-def build_report(results_dir: Path) -> str: ...   # 讀 p7_gate.sh 寫入的 results.json（每列：name、argv、rc、started_at、ended_at、log_path、log_sha256、
-                                                  #   test_counts{passed,failed,ignored}、evidence[]），計算每列狀態並輸出 md
+def build_report(results_dir: Path, *, l1_lock: Path | None = None) -> str: ...   # l1_lock 預設 repo tests/acceptance/l1_required.lock.json；讀 p7_gate.sh 寫入的 results.json（每列：name、argv、rc、started_at、ended_at、log_path、log_sha256、
+                                                  #   test_counts{passed,failed,ignored}、evidence[]，測試列另有 required_set、l1_results），計算每列狀態並輸出 md
 def verify_report(md_path: Path, results_dir: Path) -> list[str]: ...   # 回傳不一致清單：git HEAD、artifact sha256、run_id、log sha256、列狀態重算
-# 狀態規則：PASS ⇔ rc==0 且 passed>0 且 failed==0 且所有 evidence 檔存在且 sha256 相符；能力缺失（記錄於 results.json 的 caps_missing）→ BLOCKED-OWNER＋B 編號；
+TEST_ROWS: frozenset[str]   # 執行測試的列（cargo test --workspace、win-test.sh (non-COM)、win-test.sh --caps windows_com、contract_blackbox *、l15 *、python3 -m pytest -q tests/）
+# 狀態規則（R5-F3：原「rc==0 且 passed>0 且 failed==0」會讓只跑一個測試、或必要測試全被 ignored 的列 PASS，已取代）：
+#   測試列 PASS ⇔ rc==0、required_set 非 null（`p7_gate:<列名 slug>`，nodeid 清單只在 P2 l1_required.lock.json）、l1_results（P2 l1-results.v1；
+#          pytest 列帶 SW_RESOURCE_REPORT＋--junitxml、cargo 列為 P3 cargo_l1_results.py、Windows 列取 win-test 報告的 l1_results）經 P2 l1_judge.judge
+#          判定為 PASS（每個凍結 nodeid 恰一列 passed、無重複、無必要案例 skip／ignored／deselected／未執行、exit_code==0、finished）、test_counts 與
+#          l1_results 彙總相符，且所有 evidence 檔存在且 sha256 相符；l1_judge FAIL 或任一列 failed → FAIL；INSUFFICIENT／INVALID／缺 l1_results → INCOMPLETE；
+#   非測試列（check_cfg_boundary、regen_lock --check、cases.lock slice_2.3 coverage、policy_check）PASS ⇔ rc==0 且 evidence 相符；
+#   能力缺失（記錄於 results.json 的 caps_missing）→ BLOCKED-OWNER＋B 編號（該列的 cap 測試不屬其 required_set）；
 #          其他任何情況 → FAIL 或 INCOMPLETE；B-01～B-08 只有在 owner 提供的證據檔（路徑＋sha256，經 verify）存在時才可為 PASS，否則 BLOCKED-OWNER
 ```
 
@@ -2351,7 +2382,7 @@ def _row(name, rc=0, passed=3, failed=0, ev=()):
 
 def test_zero_tests_is_not_pass(tmp_path):
     md = g.build_report(_results(tmp_path, [_row("win-test.sh (non-COM)", passed=0)]))
-    assert "| win-test.sh (non-COM) | FAIL |" in md
+    assert "| win-test.sh (non-COM) | INCOMPLETE |" in md          # R5-F3：缺 l1_results／0 測試＝證據不足，永不 PASS
 
 def test_missing_com_pair_makes_com_row_blocked_not_pass(tmp_path):
     md = g.build_report(_results(tmp_path, [_row("win-test.sh --caps windows_com", passed=0)], caps_missing=["windows_com"]))
@@ -2363,7 +2394,7 @@ def test_owner_items_blocked_without_evidence_and_pass_with_verified_evidence(tm
 
 def test_verify_detects_tampering(tmp_path):
     d = _results(tmp_path, [_row("cargo test --workspace")]); md = tmp_path / "gate.md"; md.write_text(g.build_report(d), encoding="utf-8")
-    md.write_text(md.read_text(encoding="utf-8").replace("| FAIL |", "| PASS |").replace("abc", "zzz"), encoding="utf-8")
+    md.write_text(md.read_text(encoding="utf-8").replace("| INCOMPLETE |", "| PASS |").replace("abc", "zzz"), encoding="utf-8")
     assert g.verify_report(md, d), "竄改後必須驗證失敗"
 
 def test_required_rows_complete():
@@ -2371,12 +2402,59 @@ def test_required_rows_complete():
         "contract_blackbox p7 A", "contract_blackbox p7 B", "contract_blackbox slice21 B", "contract_blackbox slice22 B",
         "l15 slice21 B", "l15 slice23 B", "func-test brcm-01-login-flow", "func-test ev-01-spawn-handler",
         "regen_lock --check", "cases.lock slice_2.3 coverage", "python3 -m pytest -q tests/", "policy_check"}
+
+# ---- R5-F3：測試列以凍結 nodeid 清單逐案判定（failing-first） ----
+REQ = ["cargo:sw-core::login_fsm::a", "cargo:sw-core::login_fsm::b", "cargo:sw-core::quiet_gate::c"]
+
+def _lock(tmp, sid="p7_gate:cargo-test-workspace", plat="linux", ids=REQ):
+    p = tmp / "l1.lock.json"
+    p.write_text(json.dumps({"schema_version": 1, "sets": {sid: {plat: {"selector": {"paths": [], "markexpr": ""}, "nodeids": sorted(ids)}}}}), encoding="utf-8")
+    return p
+
+def _l1_row(tmp, rows, *, exit_code=0, finished=True, plat="linux", name="cargo test --workspace", sid="p7_gate:cargo-test-workspace"):
+    rep = {"schema_version": 2, "format": "l1-results.v1", "runner": "cargo", "platform": plat, "argv": [], "markexpr": "",
+           "collected": [n for n, _ in rows], "deselected": [], "exit_code": exit_code, "finished": finished, "core_portable_platform_skips": [],
+           "results": [{"nodeid": n, "outcome": o, "skip_kind": "capability" if o == "skipped" else None, "phases": {}} for n, o in rows]}
+    f = tmp / f"{abs(hash(name))}.json"; f.write_text(json.dumps(rep), encoding="utf-8")
+    r = _row(name, passed=sum(o == "passed" for _, o in rows), failed=sum(o == "failed" for _, o in rows))
+    r.update({"required_set": sid, "l1_results": str(f)}); return r
+
+def test_positive_count_without_required_nodeids_is_not_pass(tmp_path):
+    lock = _lock(tmp_path)
+    row = _l1_row(tmp_path, [("cargo:sw-core::other::x", "passed")])          # passed>0、failed==0：舊規則會給 PASS
+    md = g.build_report(_results(tmp_path, [row]), l1_lock=lock)
+    assert "| cargo test --workspace | INCOMPLETE |" in md and "missing" in md
+
+def test_required_ignored_is_not_pass(tmp_path):
+    lock = _lock(tmp_path)
+    row = _l1_row(tmp_path, [(REQ[0], "passed"), (REQ[1], "passed"), (REQ[2], "skipped")])
+    assert "| cargo test --workspace | INCOMPLETE |" in g.build_report(_results(tmp_path, [row]), l1_lock=lock)
+
+def test_duplicate_or_unfinished_is_not_pass(tmp_path):
+    lock = _lock(tmp_path)
+    dup = _l1_row(tmp_path, [(REQ[0], "passed"), (REQ[0], "passed"), (REQ[1], "passed"), (REQ[2], "passed")])
+    assert "| cargo test --workspace | INCOMPLETE |" in g.build_report(_results(tmp_path, [dup]), l1_lock=lock)
+    unf = _l1_row(tmp_path, [(n, "passed") for n in REQ], exit_code=101, finished=False)
+    (tmp_path / "run").rename(tmp_path / "run_dup")
+    assert "| cargo test --workspace | INCOMPLETE |" in g.build_report(_results(tmp_path, [unf]), l1_lock=lock)
+
+def test_test_row_without_l1_results_is_incomplete(tmp_path):
+    md = g.build_report(_results(tmp_path, [_row("cargo test --workspace", passed=500)]), l1_lock=_lock(tmp_path))
+    assert "| cargo test --workspace | INCOMPLETE |" in md
+
+def test_full_required_set_passes(tmp_path):
+    lock = _lock(tmp_path)
+    row = _l1_row(tmp_path, [(n, "passed") for n in REQ] + [("cargo:sw-core::extra::y", "passed")])
+    assert "| cargo test --workspace | PASS |" in g.build_report(_results(tmp_path, [row]), l1_lock=lock)
+    bad = _l1_row(tmp_path, [(REQ[0], "failed"), (REQ[1], "passed"), (REQ[2], "passed")])
+    (tmp_path / "run").rename(tmp_path / "run_ok")
+    assert "| cargo test --workspace | FAIL |" in g.build_report(_results(tmp_path, [bad]), l1_lock=lock)
 ```
 
 - [ ] **Step 2：執行，預期 FAIL**：`python3 -m pytest -q tests/test_p7_gate_report.py`；`cargo test -p sw-daemon --test cap_windows_com_p7 --no-run --target x86_64-pc-windows-gnu`（檔案不存在）。
 - [ ] **Step 3：實作**：
   1. `cap_windows_com_p7.rs`＋`com_peer.rs` 照上方規格。
-  2. `p7_gate.sh`：建立 `target/p7-gate/<run_id>/`，依序執行並把每個子程序的 argv、rc、時間、log（落檔並算 sha256）、測試計數寫入 `results.json`：`check_cfg_boundary.py`；`cargo test --workspace --features test-fakes`；`scripts/rust/win-test.sh --package sw-pal --package sw-core --package sw-daemon`（non-COM 列）；`scripts/rust/win-test.sh --caps windows_com --package sw-daemon --test cap_windows_com_p7`（未設 `SW_TEST_COM_PAIR` → `caps_missing` 加 `windows_com`）；`scripts/rust/run_p7_ab.sh`（p7 A／B、slice21／slice22／l15 回歸、func-test 兩案各自成列，取其 evidence md 的逐案結果）；`python3 tests/acceptance/regen_lock.py --check`；`cases.lock slice_2.3 coverage`（逐一核對 `slice_2.3` 集合每個 `case_id` 在本次結果中為 PASS，或為 BLOCKED-OWNER 且附 B 編號；任何缺漏 → FAIL）；`python3 -m pytest -q tests/`；`python3 -m policy_check --repo .`。全部子程序結束後才呼叫 `p7_gate_report.py build`，寫出綁定本次 `run_id`、`git rev-parse HEAD`、artifact sha256 的 md，最後 `p7_gate_report.py verify` 必須回空清單。
+  2. `p7_gate.sh`：建立 `target/p7-gate/<run_id>/`，依序執行並把每個子程序的 argv、rc、時間、log（落檔並算 sha256）、測試計數寫入 `results.json`；`TEST_ROWS` 每列另寫 `required_set`（`p7_gate:<列名 slug>`）與 `l1_results`（cargo 列改以 P3 `cargo_l1_results.py --out <run>/<slug>/resource-report.json -- <原 cargo 參數>` 執行；pytest／`run_p7_ab.sh` 內的 pytest 帶 `SW_RESOURCE_REPORT` 與 `--junitxml`；Windows 列取 `win-test` 報告的 `l1_results`），各 `p7_gate:*` 集合以 P2 `regen_lock.py --l1-add-only` 凍結（R5-F3；時點依 P2 Task 13：P7 自 Task 0 起每個 Task 在自己的紅燈 commit 登記新增 nodeid，與 `cases.lock` 於 Task 0 凍結同一原則，本 Task 只登記 gate 自身測試，R5 審查後續）：`check_cfg_boundary.py`；`cargo test --workspace --features test-fakes`；`scripts/rust/win-test.sh --package sw-pal --package sw-core --package sw-daemon`（non-COM 列）；`scripts/rust/win-test.sh --caps windows_com --package sw-daemon --test cap_windows_com_p7`（未設 `SW_TEST_COM_PAIR` → `caps_missing` 加 `windows_com`）；`scripts/rust/run_p7_ab.sh`（p7 A／B、slice21／slice22／l15 回歸、func-test 兩案各自成列，取其 evidence md 的逐案結果）；`python3 tests/acceptance/regen_lock.py --check`；`cases.lock slice_2.3 coverage`（逐一核對 `slice_2.3` 集合每個 `case_id` 在本次結果中為 PASS，或為 BLOCKED-OWNER 且附 B 編號；任何缺漏 → FAIL）；`python3 -m pytest -q tests/`；`python3 -m policy_check --repo .`。全部子程序結束後才呼叫 `p7_gate_report.py build`，寫出綁定本次 `run_id`、`git rev-parse HEAD`、artifact sha256 的 md，最後 `p7_gate_report.py verify` 必須回空清單。
 - [ ] **Step 4：執行，預期 PASS**：`python3 -m pytest -q tests/test_p7_gate_report.py`；`scripts/rust/p7_gate.sh`（exit 0 ⇔ 所有 REQUIRED_ROWS 為 PASS 或計算得出的 BLOCKED-OWNER，且 verify 無不一致）。
 - [ ] **Step 5：commit**：`chore(rust-p7): 產出 Slice 2.3 出口證據與 Windows 原生 COM 案例`
 
