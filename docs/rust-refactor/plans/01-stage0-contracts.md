@@ -1996,7 +1996,7 @@ scope: contracts
 
 選項物件欄位：`flags`（list）、`action`（`store`／`store_true`／`count`／`append`／`version`／`help`）、`dest`、`type`（`str`／`int`／`float`／null）、`default`、`choices`（list 或省略）、`required`（bool，僅 true 時寫）、`nargs`（僅非預設時寫）、`metavar`（僅有設定時寫）；positional 以 `"flags": []`＋`"positional": "<dest>"` 表示；mutually exclusive group 以 `"mutex": [{"dests": [<dest>...], "required": bool}]` 寫在其所屬的群組或子命令物件（例：`event reset` 的必選互斥組 `required: true`、`setup` 的 `user／system／on_demand`）。
 
-子命令物件的 `rpc`：本地命令為 null；送 RPC 者為 `{"method": <name>, "params": {<param>: <來源 dest 或常數>}, "omit_when_none": [<param>...], "send_null": [<param>...]}`，照 01 §6 與 CLI-12.09 的 null／省略差異逐字轉寫（值為 None 時省略該鍵者列入 `omit_when_none`，照送 `null` 者列入 `send_null`）。
+子命令物件的 `rpc`：本地命令為 null；送 RPC 者為 `{"method": <name>, "params": {<param>: <來源 dest 或常數>}, "omit_when_none": [<param>...], "omit_when_falsy": [<param>...], "send_null": [<param>...], "local_reject_empty": [<param>...]}`，照 01 §6 與 CLI-12.09 的 null／省略差異逐字轉寫（值為 None 時省略該鍵者列入 `omit_when_none`；值為 falsy（None 或空字串，對應 Python `if args.x:`）時省略者列入 `omit_when_falsy`；照送 `null` 者列入 `send_null`；空字串於本地即被拒絕、不送 RPC 者列入 `local_reject_empty`）。`params` 的鍵順序即 RPC wire 順序（wire 不排序）。
 
 - [ ] **Step 1：寫失敗測試**（`tests/test_contracts_cli_schema.py`；L1 白箱）
 

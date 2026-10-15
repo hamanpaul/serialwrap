@@ -2,7 +2,8 @@
 """CLI 契約 schema 驗證測試（Task P0-T9，L1 白箱）。
 
 驗證 contracts/cli_schema.json 凍結的全域選項、頂層群組、子命令、選項、
-RPC 映射、exit code 總表、重試與逾時清單、環境變數與版本資訊。
+RPC 映射（逐子命令、逐 argv 分支）、exit code 總表、重試與逾時清單（含 AST 完整性掃描）、
+環境變數與版本資訊。
 """
 from __future__ import annotations
 
@@ -34,6 +35,24 @@ _KIND = {
 }
 
 
+# 預設值由環境變數推導（constants.py 於 import 時計算），pytest 隔離目錄每次 mkdtemp 不同，
+# 無法以字面值凍結；schema 以 {"env_default": <常數名>} 記錄來源。本函式只在實際預設值等於
+# sw_core.cli 模組全域（build_parser() 於呼叫時讀取的同一來源）的當次值時才替換，因此仍逐項
+# 驗證「預設值確實來自該常數」，而非放寬為任意值。
+_ENV_DEFAULT_CONSTANTS = {"profile_dir": "PROFILE_DIR", "lock": "LOCK_PATH"}
+
+
+def _canon_default(a: argparse.Action):
+    """回傳 argparse 預設值；環境推導的路徑預設值正規化為 {"env_default": <常數名>}。"""
+    name = _ENV_DEFAULT_CONSTANTS.get(a.dest)
+    if name is not None and isinstance(a.default, str):
+        from sw_core import cli as cli_mod
+
+        if a.default == getattr(cli_mod, name):
+            return {"env_default": name}
+    return a.default
+
+
 def _canon_action(a: argparse.Action) -> dict:
     """將 argparse.Action 物件正規化為與 schema x-global-options / options 相符的 dict。"""
     kind = _KIND.get(type(a), type(a).__name__)
@@ -45,7 +64,7 @@ def _canon_action(a: argparse.Action) -> dict:
     if kind in ("store", "append"):
         out["type"] = "str" if a.type in (None, str) else getattr(a.type, "__name__", repr(a.type))
     if kind not in ("version",):
-        out["default"] = a.default
+        out["default"] = _canon_default(a)
     if a.choices is not None and not isinstance(a.choices, dict):
         out["choices"] = list(a.choices)
     if a.required and a.option_strings:
@@ -88,7 +107,7 @@ def _parser_mutex(parser: argparse.ArgumentParser) -> list[tuple[tuple[str, ...]
 
 
 def _literal_set(path: str, name: str) -> set[str]:
-    """以 AST 解析指定檔案中的集合或 frozenset 賦值字面常數。"""
+    """以 AST 解析指定檔案中的集合、frozenset 或 tuple 賦值字面常數。"""
     tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
     for node in tree.body:
         if isinstance(node, ast.Assign) and any(
@@ -144,43 +163,237 @@ def _scan_env_vars(rel_paths: list[str]) -> set[str]:
     return names
 
 
-def _get_minimal_argv(parser: argparse.ArgumentParser) -> list[str]:
-    """根據子命令 parser 的必要選項、必要互斥組與 positional 參數合成最小合法 argv。"""
-    argv = []
-    handled_actions = set()
-    for g in getattr(parser, "_mutually_exclusive_groups", []):
-        if g.required and g._group_actions:
-            a = g._group_actions[0]
-            handled_actions.add(a)
-            if a.option_strings:
-                flag = a.option_strings[0]
-                if isinstance(a, argparse._StoreTrueAction):
-                    argv.append(flag)
-                else:
-                    argv.extend([flag, "test"])
-    for a in parser._actions:
-        if a in handled_actions or isinstance(
-            a, (argparse._HelpAction, argparse._SubParsersAction)
-        ):
+# --- RPC 映射（逐子命令、逐 argv 分支）-----------------------------------------
+
+_FLAG_ONLY = (argparse._StoreTrueAction, argparse._StoreFalseAction, argparse._CountAction)
+
+
+def _rpc_of(gname: str, scname: str) -> dict:
+    """取得 x-groups 中 `<gname> <scname>` 的 rpc 物件。"""
+    for g in _schema().get("x-groups", []):
+        if g["name"] == gname:
+            for sc in g.get("subcommands") or []:
+                if sc["name"] == scname:
+                    return sc["rpc"]
+    raise AssertionError(f"x-groups 中找不到 {gname} {scname}")
+
+
+def _rpc_cases() -> list:
+    """所有 rpc 非 null 的子命令，供參數化使用（不寫死數量）。"""
+    cases = []
+    for g in _schema().get("x-groups", []):
+        for sc in g.get("subcommands") or []:
+            if sc.get("rpc") is not None:
+                cases.append(pytest.param(g["name"], sc["name"], id=f"{g['name']} {sc['name']}"))
+    return cases
+
+
+def _leaf_parser(gname: str, scname: str) -> argparse.ArgumentParser:
+    """取得 `serialwrap <群組> <子命令>` 的 leaf parser（與 build_parser() 同一物件）。"""
+    from sw_core.cli import build_parser
+
+    top = next(a for a in build_parser()._actions if isinstance(a, argparse._SubParsersAction))
+    group = next(
+        a for a in top.choices[gname]._actions if isinstance(a, argparse._SubParsersAction)
+    )
+    return group.choices[scname]
+
+
+def _sentinel(a: argparse.Action, doc_path: Path) -> str:
+    """為選項／positional 產生可辨識的字面值（各 dest 不同），使參數來源錯配可被偵測。"""
+    if a.dest == "file":
+        return str(doc_path)
+    if a.choices:
+        return str(next(iter(a.choices)))
+    if a.type is int:
+        return "3"
+    if a.type is float:
+        return "2.5"
+    return f"v-{a.dest}"
+
+
+def _param_dests(src: str) -> set[str]:
+    """參數來源對應的 argparse dest（"selector|com" 展開為 selector 與 com）。"""
+    return {"selector", "com"} if src == "selector|com" else {src}
+
+
+def _variants(leaf: argparse.ArgumentParser, rpc: dict, doc_path: Path):
+    """產生 (名稱, 參數動作清單, 值表, 探測參數鍵或 None) 分支。
+
+    minimal：必要選項＋每個必要互斥組的第一成員；alt:<dest>：必要互斥組每個成員各跑一次；
+    full：所有選項（互斥組只取第一成員）。
+    blank:<key>：full 中該參數來源的所有 str dest 改送空字串。探測不依 schema 的省略分類，
+    故 omit_when_none 誤植（應為 omit_when_falsy）或漏列時仍會被偵測。
+    blank-one:<dest>：只清空 selector|com 其中一個 dest，驗證 `or` 的回退。
+    """
+    actions = _non_help(leaf)
+    groups = list(getattr(leaf, "_mutually_exclusive_groups", []))
+    member_dests = {a.dest for g in groups for a in g._group_actions}
+    extra_dests = {a.dest for g in groups for a in g._group_actions[1:]}
+    base = [
+        a for a in actions
+        if a.dest not in member_dests and (not a.option_strings or a.required)
+    ]
+    required_groups = [g for g in groups if g.required]
+    full = [a for a in actions if a.dest not in extra_dests]
+    full_dests = {a.dest for a in full}
+
+    plans: list[tuple[str, list[argparse.Action], set[str], str | None]] = [
+        ("minimal", base + [g._group_actions[0] for g in required_groups], set(), None),
+    ]
+    for g in required_groups:
+        for a in g._group_actions:
+            chosen = [a if h is g else h._group_actions[0] for h in required_groups]
+            plans.append((f"alt:{a.dest}", base + chosen, set(), None))
+    plans.append(("full", full, set(), None))
+
+    by_dest = {a.dest: a for a in actions}
+    for key, src in rpc["params"].items():
+        if key.startswith("$"):
             continue
+        dests = _param_dests(src)
+        if not dests <= full_dests:
+            continue
+        if not all(by_dest[d].type in (None, str) and not by_dest[d].choices for d in dests):
+            continue
+        plans.append((f"blank:{key}", full, dests, key))
+        if len(dests) > 1:
+            for d in sorted(dests):
+                plans.append((f"blank-one:{d}", full, {d}, key))
+
+    for name, acts, blank, probe_key in plans:
+        values = {a.dest: _sentinel(a, doc_path) for a in acts}
+        for d in blank:
+            values[d] = ""
+        yield name, acts, values, probe_key
+
+
+def _argv_tail(acts: list[argparse.Action], values: dict[str, str]) -> list[str]:
+    """將分支轉為子命令之後的 argv（選項先、positional 後）。"""
+    out: list[str] = []
+    for a in acts:
+        if a.option_strings:
+            out.append(a.option_strings[0])
+            if not isinstance(a, _FLAG_ONLY):
+                out.append(values[a.dest])
+    for a in acts:
         if not a.option_strings:
-            if a.choices:
-                argv.append(str(a.choices[0]))
-            elif getattr(a, "type", None) is int:
-                argv.append("1")
-            else:
-                argv.append("test")
-        elif a.required:
-            flag = a.option_strings[0]
-            if isinstance(a, argparse._StoreTrueAction):
-                argv.append(flag)
-            elif a.choices:
-                argv.extend([flag, str(a.choices[0])])
-            elif getattr(a, "type", None) is int:
-                argv.extend([flag, "1"])
-            else:
-                argv.extend([flag, "test"])
-    return argv
+            out.append(values[a.dest])
+    return out
+
+
+def _source_value(src: str, ns: argparse.Namespace):
+    """依 x-conventions.params_source 取得參數值（dest 名 ／ "selector|com"）。"""
+    if src == "selector|com":
+        return ns.selector or ns.com
+    return getattr(ns, src)
+
+
+def _expected_params(rpc: dict, ns: argparse.Namespace, doc_obj: dict) -> dict:
+    """由 schema 與解析後的 namespace 推導應送出的 params（不含 send_null 的 null 判定，另行核對）。"""
+    if "$document" in rpc["params"]:
+        return doc_obj
+    omit_none = set(rpc.get("omit_when_none", []))
+    omit_falsy = set(rpc.get("omit_when_falsy", []))
+    out: dict = {}
+    for key, src in rpc["params"].items():
+        val = _source_value(src, ns)
+        if key in omit_none and val is None:
+            continue
+        if key in omit_falsy and not val:
+            continue
+        out[key] = val
+    return out
+
+
+def test_rpc_cases_nonempty():
+    """x-groups 必須至少登錄一個 rpc 子命令（避免參數化為空而被靜默略過）。"""
+    assert _rpc_cases(), "x-groups 中未找到任何 rpc 非 null 的子命令"
+
+
+@pytest.mark.parametrize("gname,scname", _rpc_cases())
+def test_rpc_mapping_matches_cli(gname, scname, tmp_path):
+    """逐 argv 分支驗證 rpc：method、params 鍵集合與順序、值來源、omit_when_none／omit_when_falsy／send_null／local_reject_empty。
+
+    每個 str 參數來源都以空字串探測（不依 schema 的省略分類）；列於 local_reject_empty 者須本地拒絕（rc≠0、不送 RPC）。
+    """
+    import io
+    from contextlib import redirect_stderr, redirect_stdout
+    from unittest.mock import patch
+
+    from sw_core.cli import build_parser, main
+
+    rpc = _rpc_of(gname, scname)
+    leaf = _leaf_parser(gname, scname)
+    parser = build_parser()
+    doc_path = tmp_path / "rule.json"
+    doc_path.write_text("{}", encoding="utf-8")
+    doc_obj = json.loads(doc_path.read_text(encoding="utf-8"))
+    sock = str(tmp_path / "serialwrapd.sock")
+    send_null = set(rpc.get("send_null", []))
+    union_none: set[str] = set()
+
+    local_reject = set(rpc.get("local_reject_empty", []))
+    for name, acts, values, probe_key in _variants(leaf, rpc, doc_path):
+        tail = _argv_tail(acts, values)
+        argv = ["--socket", sock, gname, scname] + tail
+        ns = parser.parse_args(argv)
+
+        calls: list[tuple[str, dict]] = []
+
+        def _record_rpc(sock_path, method, params, *args, **kwargs):
+            calls.append((method, params))
+            return {"ok": True, "version": "0.3.2"}
+
+        rc = None
+        with patch("sw_core.cli.rpc_call", side_effect=_record_rpc), patch(
+            "sw_core.client.rpc_call", side_effect=_record_rpc
+        ), patch("sw_core.client._rpc_call_once", side_effect=_record_rpc), redirect_stdout(
+            io.StringIO()
+        ), redirect_stderr(
+            io.StringIO()
+        ):
+            try:
+                rc = main(argv)
+            except SystemExit as exc:
+                rc = exc.code
+
+        if probe_key is not None and probe_key in local_reject:
+            assert not calls and rc not in (0, None), (
+                f"{gname} {scname} [{name}] 登錄為本地拒絕空字串，但實際 calls={calls} rc={rc}"
+            )
+            continue
+
+        assert len(calls) == 1, (
+            f"{gname} {scname} [{name}] 預期恰送出 1 次 RPC，實際 {len(calls)} 次（rc={rc}，argv={tail}）"
+        )
+        actual_method, actual = calls[0]
+        assert actual_method == rpc["method"], (
+            f"{gname} {scname} [{name}] method 不符：實際 {actual_method} != 期望 {rpc['method']}"
+        )
+
+        expected = _expected_params(rpc, ns, doc_obj)
+        assert actual == expected, (
+            f"{gname} {scname} [{name}] params 不符：實際 {actual} != 期望 {expected}（argv={tail}）"
+        )
+
+        none_keys = {k for k, v in actual.items() if v is None}
+        assert none_keys <= send_null, (
+            f"{gname} {scname} [{name}] 以 null 送出但未列入 send_null：{none_keys - send_null}"
+        )
+        union_none |= none_keys
+
+        if name == "full" and "$document" not in rpc["params"]:
+            assert list(actual) == list(rpc["params"]), (
+                f"{gname} {scname} wire 鍵順序不符：實際 {list(actual)} != rpc.params {list(rpc['params'])}"
+            )
+
+    assert send_null <= union_none, (
+        f"{gname} {scname} send_null 列出的鍵在任何分支都未以 null 出現：{send_null - union_none}"
+    )
+
+
+# --- 其餘 schema 對照 --------------------------------------------------------
 
 
 def test_global_options_match_build_parser():
@@ -319,86 +532,20 @@ def test_every_subcommand_options_match():
             )
 
 
-def test_rpc_mapping_matches_cli():
-    """驗證每個 rpc 非 null 的子命令呼叫 sw_core.cli.main() 時送出的 method 與 params。"""
-    import io
-    from contextlib import redirect_stderr, redirect_stdout
-    from unittest.mock import patch
-    from sw_core.cli import build_parser, main
-
-    schema = _schema()
-    parser = build_parser()
-    sub_action = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
-
-    tested_count = 0
-    for g in schema.get("x-groups", []):
-        gname = g["name"]
-        subcmds = g.get("subcommands") or []
-        for sc in subcmds:
-            rpc_info = sc.get("rpc")
-            if rpc_info is None:
-                continue
-
-            scname = sc["name"]
-            assert gname in sub_action.choices, f"群組 {gname} 不在 parser choices"
-            gp = sub_action.choices[gname]
-            sc_sub = next(a for a in gp._actions if isinstance(a, argparse._SubParsersAction))
-            assert scname in sc_sub.choices, f"子命令 {gname} {scname} 不在 parser choices"
-            scp = sc_sub.choices[scname]
-
-            min_argv = _get_minimal_argv(scp)
-            argv = ["--socket", "/tmp/dummy.sock", gname, scname] + min_argv
-
-            calls: list[tuple[str, dict]] = []
-
-            def _record_rpc(sock_path, method, params, *args, **kwargs):
-                calls.append((method, params))
-                return {"ok": True, "version": "0.3.2"}
-
-            with patch("sw_core.cli.rpc_call", side_effect=_record_rpc), patch(
-                "sw_core.client.rpc_call", side_effect=_record_rpc
-            ), patch("sw_core.client._rpc_call_once", side_effect=_record_rpc), redirect_stdout(
-                io.StringIO()
-            ), redirect_stderr(
-                io.StringIO()
-            ):
-                try:
-                    main(argv)
-                except SystemExit:
-                    pass
-
-            assert calls, f"呼叫 {argv} 未觸發任何 rpc_call"
-            actual_method, actual_params = calls[0]
-
-            expected_method = rpc_info["method"]
-            assert actual_method == expected_method, (
-                f"{gname} {scname} method 不符：實際 {actual_method} != 期望 {expected_method}"
-            )
-
-            omit_when_none = set(rpc_info.get("omit_when_none", []))
-            send_null = set(rpc_info.get("send_null", []))
-
-            for k in omit_when_none:
-                assert k not in actual_params, (
-                    f"{gname} {scname} 參數 {k} 在未指定時應省略，卻出現在 params: {actual_params}"
-                )
-
-            for k in send_null:
-                assert k in actual_params and actual_params[k] is None, (
-                    f"{gname} {scname} 參數 {k} 在未指定時應送 null，實際為: {actual_params.get(k)}"
-                )
-
-            tested_count += 1
-
-    assert tested_count > 0, "未找到任何含有 rpc 定義的子命令"
-
-
 def test_retry_methods_match_client():
     """驗證 x-retry.methods 等於 sw_core/client.py 的 RETRYABLE_READONLY_METHODS。"""
     schema = _schema()
     expected = _literal_set("sw_core/client.py", "RETRYABLE_READONLY_METHODS")
     actual = set(schema["x-retry"]["methods"])
     assert actual == expected, f"重試方法清單不符：實際 {actual} != 期望 {expected}"
+
+
+def test_timeout_enrich_matches_client():
+    """驗證 x-retry.timeout_enrich.excluded_methods 等於 sw_core/client.py 的 _PROBE_METHODS。"""
+    schema = _schema()
+    expected = _literal_set("sw_core/client.py", "_PROBE_METHODS")
+    actual = set(schema["x-retry"]["timeout_enrich"]["excluded_methods"])
+    assert actual == expected, f"TIMEOUT enrich 排除方法不符：實際 {actual} != 期望 {expected}"
 
 
 def test_long_methods_match_cli():
@@ -415,6 +562,12 @@ def test_env_vars_listed():
     env_entries = schema.get("x-env", [])
     declared = {e["name"] for e in env_entries}
     scanned = _scan_env_vars(["sw_core/cli.py", "sw_core/client.py"])
+    assert scanned >= {
+        "SERIALWRAP_DAEMON_ENV_FILE",
+        "SERIALWRAP_STATE_DIR",
+        "XDG_STATE_HOME",
+        "SERIALWRAP_RUN_DIR",
+    }, f"掃描器未掃到已知環境變數（掃描器失效？）：{scanned}"
     assert scanned.issubset(declared), f"掃描到的環境變數未全數登錄於 x-env：{scanned - declared}"
     assert "SERIALWRAP_LOG_LEVEL" in declared, "SERIALWRAP_LOG_LEVEL 必須在 x-env 中"
 
@@ -457,6 +610,58 @@ def test_fixed_timeouts_have_sources():
             assert val in constants, (
                 f"項目 {item.get('name')} 的數值 {val} 未出現在 {src}（行 {start_line}-{end_line}）中，"
                 f"該處常數包含：{constants}"
+            )
+
+
+def _declared_timeout_ranges(schema: dict) -> list[tuple[str, int, int]]:
+    """x-fixed-timeouts[].source 與 x-timeouts.sources 宣告的 (檔案, 起行, 迄行) 清單。"""
+    sources = [item["source"] for item in schema.get("x-fixed-timeouts", []) if "source" in item]
+    sources += schema.get("x-timeouts", {}).get("sources", [])
+    ranges = []
+    for src in sources:
+        file_part, line_part = src.rsplit(":", 1)
+        start_s, _, end_s = line_part.partition("-")
+        ranges.append((file_part, int(start_s), int(end_s or start_s)))
+    return ranges
+
+
+def _timeout_literal_sites(rel: str) -> list[tuple[int, float]]:
+    """以 AST 找出逾時相關的數值字面值：名稱含 timeout 的關鍵字參數與指派、settimeout／sleep 的位置參數。"""
+    tree = ast.parse((ROOT / rel).read_text(encoding="utf-8"))
+
+    def _num(n) -> bool:
+        return isinstance(n, ast.Constant) and type(n.value) in (int, float)
+
+    sites: list[tuple[int, float]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.keyword):
+            if node.arg and "timeout" in node.arg.lower() and _num(node.value):
+                sites.append((node.value.lineno, node.value.value))
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            if node.value is None or not _num(node.value):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for t in targets:
+                name = t.id if isinstance(t, ast.Name) else getattr(t, "attr", "")
+                if "timeout" in name.lower():
+                    sites.append((node.value.lineno, node.value.value))
+        elif isinstance(node, ast.Call):
+            fn = node.func
+            fname = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", "")
+            if fname in ("settimeout", "sleep"):
+                sites.extend((a.lineno, a.value) for a in node.args if _num(a))
+    return sites
+
+
+def test_timeout_literals_declared():
+    """逾時完整性：cli.py／client.py 內逾時相關的數值字面值都必須落在 x-fixed-timeouts 或 x-timeouts.sources 宣告的行範圍內。"""
+    ranges = _declared_timeout_ranges(_schema())
+    for rel in ("sw_core/cli.py", "sw_core/client.py"):
+        sites = _timeout_literal_sites(rel)
+        assert sites, f"{rel} 未掃到任何逾時字面值（掃描器失效？）"
+        for line, value in sites:
+            assert any(f == rel and a <= line <= b for f, a, b in ranges), (
+                f"{rel}:{line} 的逾時字面值 {value} 未登錄於 x-fixed-timeouts／x-timeouts.sources"
             )
 
 
@@ -507,25 +712,7 @@ def test_exit_codes_consistent_with_catalog():
     """驗證 x-exit-codes 與目錄 error_codes.yaml 的 exit_codes 雙向一致（C15 本地鏡像）。"""
     import yaml
 
-    try:
-        from tools.contracts.catalog import CLI_CONTEXTS
-    except ImportError:
-        CLI_CONTEXTS = (
-            "_run_rpc",
-            "daemon start",
-            "daemon stop",
-            "event",
-            "connect",
-            "benches",
-            "remote",
-            "setup",
-            "service <action>",
-            "cmd submit",
-            "profile test",
-            "doctor",
-            "argparse-boundary",
-            "fallthrough",
-        )
+    from tools.contracts.catalog import CLI_CONTEXTS
 
     schema = _schema()
     x_exit_codes = schema.get("x-exit-codes", [])
@@ -543,15 +730,15 @@ def test_exit_codes_consistent_with_catalog():
         ctx = row["context"]
         schema_exit_map[ctx] = row.get("codes", {})
 
+    # 目錄 exit_codes 為 Mapping[str, int]（plan 01-stage0 §catalog 資料模型；鍵 ∈ CLI_CONTEXTS），
+    # 非 {context, exit} 清單；本測試舊版以清單迭代，與規格及 T3 目錄格式不符，故依規格改為映射。
     catalog_codes = {}
     for item in cat_data.get("codes", []):
         code_name = item["code"]
-        catalog_codes[code_name] = item.get("exit_codes", [])
+        catalog_codes[code_name] = item.get("exit_codes") or {}
 
-    for code_name, exit_list in catalog_codes.items():
-        for entry in exit_list:
-            ctx = entry["context"]
-            exit_val = entry["exit"]
+    for code_name, exit_map in catalog_codes.items():
+        for ctx, exit_val in exit_map.items():
             assert ctx in schema_exit_map, f"目錄碼 {code_name} 的 context {ctx} 不在 x-exit-codes 中"
             assert code_name in schema_exit_map[ctx], (
                 f"目錄碼 {code_name}（context: {ctx}）未登錄於 x-exit-codes"
@@ -564,17 +751,14 @@ def test_exit_codes_consistent_with_catalog():
     for ctx, codes in schema_exit_map.items():
         for code_name, exit_val in codes.items():
             assert code_name in catalog_codes, f"x-exit-codes 中 {ctx} 的碼 {code_name} 不存在於目錄中"
-            matched = any(
-                e.get("context") == ctx and e.get("exit") == exit_val
-                for e in catalog_codes[code_name]
-            )
+            matched = catalog_codes[code_name].get(ctx) == exit_val
             assert matched, (
                 f"x-exit-codes 項 ({ctx}, {code_name}, {exit_val}) 未在目錄 error_codes.yaml 登記"
             )
 
 
 def test_pending_ids_exist():
-    """驗證 x-pending 每筆的 change 存在於 behavior_changes.yaml。"""
+    """驗證 x-pending 每筆的 change 存在於 behavior_changes.yaml（實作後逐筆刪除，故允許為空）。"""
     import yaml
 
     schema = _schema()
@@ -583,7 +767,7 @@ def test_pending_ids_exist():
     bc_data = yaml.safe_load(bc_path.read_text(encoding="utf-8")) or {}
     known_changes = {c["id"] for c in bc_data.get("changes", [])}
     pending = schema.get("x-pending", [])
-    assert pending, "x-pending 不得為空"
+    assert isinstance(pending, list), "x-pending 必須為陣列"
     for p in pending:
         change_id = p.get("change")
         assert change_id in known_changes, (

@@ -1,0 +1,2959 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/hamanpaul/serialwrap/contracts/cli_schema.json",
+  "title": "serialwrap CLI contract",
+  "x-catalog-revision": 1,
+  "x-prog": "serialwrap",
+  "x-conventions": {
+    "params_source": "rpc.params 的值為來源：字串為該子命令 argparse namespace 的 dest，送出 args.<dest> 原值；\"selector|com\" 表示 args.selector or args.com（盤點 01 §6.6 stream tail、§6.7 log tail-raw／tail-text）；{\"$document\": \"file\"} 表示 --file 讀入的整份 JSON 物件即為 RPC params（event add）。",
+    "omit_when_none": "值為 None（未指定且無預設）時省略該鍵；空字串仍送出（對應 Python `is not None`）。",
+    "omit_when_falsy": "值為 falsy（None 或空字串）時省略該鍵（對應 Python `if args.x:`；屬 CLI-12.09「三種處理並存」中的省略 falsy 者）。",
+    "send_null": "未指定時仍以 null 送出該鍵；列於此者必須在某一分支以 null 出現於 wire 上（例如互斥組中未被指定的另一成員）。",
+    "wire_order": "rpc.params 的 JSON 物件鍵順序即 RPC wire 上的鍵順序；RPC wire 不排序（rust-architecture §3.3）。",
+    "source_format": "x-fixed-timeouts[].source、x-timeouts.sources、x-env[].read_by 的位置格式為 `檔案:行` 或 `檔案:起-迄`，相對於 repo 根目錄。",
+    "env_default": {
+      "PROFILE_DIR": "sw_core/constants.py:61。SERIALWRAP_PROFILE_DIR（非空白）否則 <CONFIG_DIR>/profiles；CONFIG_DIR 為 SERIALWRAP_CONFIG_DIR（非空白）否則 $XDG_CONFIG_HOME/serialwrap（預設 ~/.config/serialwrap）。",
+      "LOCK_PATH": "sw_core/constants.py:41。<RUN_DIR>/serialwrapd.lock；RUN_DIR 見 constants.py:28-38：SERIALWRAP_RUN_DIR（非空白）優先；否則 SERIALWRAP_STATE_DIR（非空白）時為 STATE_DIR；否則 $XDG_RUNTIME_DIR/serialwrap；否則 <STATE_DIR>/run。"
+    },
+    "local_reject_empty": "列於 rpc.local_reject_empty 的參數，於空字串時由 CLI 於本地拒絕（不送 RPC、rc≠0）；其餘 str 參數的空字串一律照送（cmd submit 的 completion_regex 經 valid_completion_regex 拒絕空字串，cli.py 本地回 INVALID_COMPLETION_REGEX）。"
+  },
+  "x-global-options": [
+    {
+      "flags": [
+        "--version"
+      ],
+      "action": "version",
+      "dest": null
+    },
+    {
+      "flags": [
+        "-v",
+        "--verbose"
+      ],
+      "action": "count",
+      "dest": "verbose",
+      "default": 0
+    },
+    {
+      "flags": [
+        "--socket"
+      ],
+      "action": "store",
+      "dest": "socket",
+      "type": "str",
+      "default": null
+    },
+    {
+      "flags": [
+        "--endpoint"
+      ],
+      "action": "store",
+      "dest": "endpoint",
+      "type": "str",
+      "default": null,
+      "metavar": "ENDPOINT"
+    },
+    {
+      "flags": [
+        "--bench"
+      ],
+      "action": "store",
+      "dest": "bench",
+      "type": "str",
+      "default": null,
+      "metavar": "CODE"
+    },
+    {
+      "flags": [
+        "--timeout"
+      ],
+      "action": "store",
+      "dest": "timeout_s",
+      "type": "float",
+      "default": null
+    },
+    {
+      "flags": [
+        "--retries"
+      ],
+      "action": "store",
+      "dest": "retries",
+      "type": "int",
+      "default": 0
+    }
+  ],
+  "x-groups": [
+    {
+      "name": "daemon",
+      "stage": "delegate-1a",
+      "local": true,
+      "options": [],
+      "mutex": [],
+      "subcommands": [
+        {
+          "name": "start",
+          "options": [
+            {
+              "flags": [
+                "--profile-dir"
+              ],
+              "action": "store",
+              "dest": "profile_dir",
+              "type": "str",
+              "default": {
+                "env_default": "PROFILE_DIR"
+              }
+            },
+            {
+              "flags": [
+                "--lock"
+              ],
+              "action": "store",
+              "dest": "lock",
+              "type": "str",
+              "default": {
+                "env_default": "LOCK_PATH"
+              }
+            },
+            {
+              "flags": [
+                "--foreground"
+              ],
+              "action": "store_true",
+              "dest": "foreground",
+              "default": false
+            },
+            {
+              "flags": [
+                "--with-sudo"
+              ],
+              "action": "store_true",
+              "dest": "with_sudo",
+              "default": false
+            },
+            {
+              "flags": [
+                "--force-spawn"
+              ],
+              "action": "store_true",
+              "dest": "force_spawn",
+              "default": false
+            }
+          ],
+          "mutex": [],
+          "rpc": null
+        },
+        {
+          "name": "stop",
+          "options": [
+            {
+              "flags": [
+                "--with-sudo"
+              ],
+              "action": "store_true",
+              "dest": "with_sudo",
+              "default": false
+            }
+          ],
+          "mutex": [],
+          "rpc": null
+        },
+        {
+          "name": "status",
+          "options": [],
+          "mutex": [],
+          "rpc": {
+            "method": "health.status",
+            "params": {},
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        }
+      ]
+    },
+    {
+      "name": "device",
+      "stage": "rust-1a",
+      "local": false,
+      "options": [],
+      "mutex": [],
+      "subcommands": [
+        {
+          "name": "list",
+          "options": [],
+          "mutex": [],
+          "rpc": {
+            "method": "device.list",
+            "params": {},
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "release",
+          "options": [
+            {
+              "flags": [
+                "--selector"
+              ],
+              "action": "store",
+              "dest": "selector",
+              "type": "str",
+              "default": null,
+              "required": true
+            },
+            {
+              "flags": [
+                "--source"
+              ],
+              "action": "store",
+              "dest": "source",
+              "type": "str",
+              "default": "cli"
+            },
+            {
+              "flags": [
+                "--reason"
+              ],
+              "action": "store",
+              "dest": "reason",
+              "type": "str",
+              "default": null
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "device.release",
+            "params": {
+              "selector": "selector",
+              "source": "source",
+              "reason": "reason"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": [
+              "reason"
+            ]
+          }
+        },
+        {
+          "name": "attach",
+          "options": [
+            {
+              "flags": [
+                "--selector"
+              ],
+              "action": "store",
+              "dest": "selector",
+              "type": "str",
+              "default": null,
+              "required": true
+            },
+            {
+              "flags": [
+                "--force"
+              ],
+              "action": "store_true",
+              "dest": "force",
+              "default": false
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "device.attach",
+            "params": {
+              "selector": "selector",
+              "force": "force"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        }
+      ]
+    },
+    {
+      "name": "session",
+      "stage": "rust-1a",
+      "local": false,
+      "options": [],
+      "mutex": [],
+      "subcommands": [
+        {
+          "name": "list",
+          "options": [],
+          "mutex": [],
+          "rpc": {
+            "method": "session.list",
+            "params": {},
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "clear",
+          "options": [
+            {
+              "flags": [
+                "--selector"
+              ],
+              "action": "store",
+              "dest": "selector",
+              "type": "str",
+              "default": null,
+              "required": true
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "session.clear",
+            "params": {
+              "selector": "selector"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "bind",
+          "options": [
+            {
+              "flags": [
+                "--selector"
+              ],
+              "action": "store",
+              "dest": "selector",
+              "type": "str",
+              "default": null,
+              "required": true
+            },
+            {
+              "flags": [
+                "--device-by-id"
+              ],
+              "action": "store",
+              "dest": "device_by_id",
+              "type": "str",
+              "default": null,
+              "required": true
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "session.bind",
+            "params": {
+              "selector": "selector",
+              "device_by_id": "device_by_id"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "pin",
+          "options": [
+            {
+              "flags": [
+                "--selector"
+              ],
+              "action": "store",
+              "dest": "selector",
+              "type": "str",
+              "default": null,
+              "required": true
+            },
+            {
+              "flags": [
+                "--profile"
+              ],
+              "action": "store",
+              "dest": "profile",
+              "type": "str",
+              "default": null,
+              "required": true
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "session.pin",
+            "params": {
+              "selector": "selector",
+              "profile": "profile"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "unpin",
+          "options": [
+            {
+              "flags": [
+                "--selector"
+              ],
+              "action": "store",
+              "dest": "selector",
+              "type": "str",
+              "default": null,
+              "required": true
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "session.unpin",
+            "params": {
+              "selector": "selector"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "attach",
+          "options": [
+            {
+              "flags": [
+                "--selector"
+              ],
+              "action": "store",
+              "dest": "selector",
+              "type": "str",
+              "default": null,
+              "required": true
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "session.attach",
+            "params": {
+              "selector": "selector"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "self-test",
+          "options": [
+            {
+              "flags": [
+                "--selector"
+              ],
+              "action": "store",
+              "dest": "selector",
+              "type": "str",
+              "default": null,
+              "required": true
+            },
+            {
+              "flags": [
+                "--probe-timeout"
+              ],
+              "action": "store",
+              "dest": "probe_timeout_s",
+              "type": "float",
+              "default": 2.0
+            },
+            {
+              "flags": [
+                "--strict-human-lock"
+              ],
+              "action": "store_true",
+              "dest": "strict_human_lock",
+              "default": false
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "session.self_test",
+            "params": {
+              "selector": "selector",
+              "timeout_s": "probe_timeout_s",
+              "strict_human_lock": "strict_human_lock"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "activity",
+          "options": [
+            {
+              "flags": [
+                "--selector"
+              ],
+              "action": "store",
+              "dest": "selector",
+              "type": "str",
+              "default": null,
+              "required": true
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "session.activity",
+            "params": {
+              "selector": "selector"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "recover",
+          "options": [
+            {
+              "flags": [
+                "--selector"
+              ],
+              "action": "store",
+              "dest": "selector",
+              "type": "str",
+              "default": null,
+              "required": true
+            },
+            {
+              "flags": [
+                "--timeout"
+              ],
+              "action": "store",
+              "dest": "recover_timeout_s",
+              "type": "float",
+              "default": 2.0
+            },
+            {
+              "flags": [
+                "--force"
+              ],
+              "action": "store_true",
+              "dest": "force",
+              "default": false
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "session.recover",
+            "params": {
+              "selector": "selector",
+              "timeout_s": "recover_timeout_s",
+              "force": "force"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "console-attach",
+          "options": [
+            {
+              "flags": [
+                "--selector"
+              ],
+              "action": "store",
+              "dest": "selector",
+              "type": "str",
+              "default": null,
+              "required": true
+            },
+            {
+              "flags": [
+                "--label"
+              ],
+              "action": "store",
+              "dest": "label",
+              "type": "str",
+              "default": null
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "session.console_attach",
+            "params": {
+              "selector": "selector",
+              "label": "label"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [
+              "label"
+            ],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "console-detach",
+          "options": [
+            {
+              "flags": [
+                "--selector"
+              ],
+              "action": "store",
+              "dest": "selector",
+              "type": "str",
+              "default": null,
+              "required": true
+            },
+            {
+              "flags": [
+                "--client-id"
+              ],
+              "action": "store",
+              "dest": "client_id",
+              "type": "str",
+              "default": null,
+              "required": true
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "session.console_detach",
+            "params": {
+              "selector": "selector",
+              "client_id": "client_id"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "console-list",
+          "options": [
+            {
+              "flags": [
+                "--selector"
+              ],
+              "action": "store",
+              "dest": "selector",
+              "type": "str",
+              "default": null,
+              "required": true
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "session.console_list",
+            "params": {
+              "selector": "selector"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "interactive-open",
+          "options": [
+            {
+              "flags": [
+                "--selector"
+              ],
+              "action": "store",
+              "dest": "selector",
+              "type": "str",
+              "default": null,
+              "required": true
+            },
+            {
+              "flags": [
+                "--owner"
+              ],
+              "action": "store",
+              "dest": "owner",
+              "type": "str",
+              "default": "agent"
+            },
+            {
+              "flags": [
+                "--timeout"
+              ],
+              "action": "store",
+              "dest": "interactive_timeout_s",
+              "type": "float",
+              "default": 60.0
+            },
+            {
+              "flags": [
+                "--command"
+              ],
+              "action": "store",
+              "dest": "command",
+              "type": "str",
+              "default": ""
+            },
+            {
+              "flags": [
+                "--allow-attached"
+              ],
+              "action": "store_true",
+              "dest": "allow_attached",
+              "default": false
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "session.interactive_open",
+            "params": {
+              "selector": "selector",
+              "owner": "owner",
+              "timeout_s": "interactive_timeout_s",
+              "command": "command",
+              "allow_attached": "allow_attached"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "interactive-send",
+          "options": [
+            {
+              "flags": [
+                "--interactive-id"
+              ],
+              "action": "store",
+              "dest": "interactive_id",
+              "type": "str",
+              "default": null,
+              "required": true
+            },
+            {
+              "flags": [
+                "--data"
+              ],
+              "action": "store",
+              "dest": "data",
+              "type": "str",
+              "default": null,
+              "required": true
+            },
+            {
+              "flags": [
+                "--encoding"
+              ],
+              "action": "store",
+              "dest": "encoding",
+              "type": "str",
+              "default": "plain"
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "session.interactive_send",
+            "params": {
+              "interactive_id": "interactive_id",
+              "data": "data",
+              "encoding": "encoding"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "interactive-status",
+          "options": [
+            {
+              "flags": [
+                "--interactive-id"
+              ],
+              "action": "store",
+              "dest": "interactive_id",
+              "type": "str",
+              "default": null,
+              "required": true
+            },
+            {
+              "flags": [
+                "--screen-chars"
+              ],
+              "action": "store",
+              "dest": "screen_chars",
+              "type": "int",
+              "default": 2048
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "session.interactive_status",
+            "params": {
+              "interactive_id": "interactive_id",
+              "screen_chars": "screen_chars"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "interactive-close",
+          "options": [
+            {
+              "flags": [
+                "--interactive-id"
+              ],
+              "action": "store",
+              "dest": "interactive_id",
+              "type": "str",
+              "default": null,
+              "required": true
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "session.interactive_close",
+            "params": {
+              "interactive_id": "interactive_id"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "log-start",
+          "options": [
+            {
+              "flags": [
+                "--selector"
+              ],
+              "action": "store",
+              "dest": "selector",
+              "type": "str",
+              "default": null,
+              "required": true
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "session.log_start",
+            "params": {
+              "selector": "selector"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "log-stop",
+          "options": [
+            {
+              "flags": [
+                "--selector"
+              ],
+              "action": "store",
+              "dest": "selector",
+              "type": "str",
+              "default": null,
+              "required": true
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "session.log_stop",
+            "params": {
+              "selector": "selector"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "log-status",
+          "options": [
+            {
+              "flags": [
+                "--selector"
+              ],
+              "action": "store",
+              "dest": "selector",
+              "type": "str",
+              "default": null,
+              "required": true
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "session.log_status",
+            "params": {
+              "selector": "selector"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        }
+      ]
+    },
+    {
+      "name": "alias",
+      "stage": "rust-1a",
+      "local": false,
+      "options": [],
+      "mutex": [],
+      "subcommands": [
+        {
+          "name": "list",
+          "options": [],
+          "mutex": [],
+          "rpc": {
+            "method": "alias.list",
+            "params": {},
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "set",
+          "options": [
+            {
+              "flags": [
+                "--session-id"
+              ],
+              "action": "store",
+              "dest": "session_id",
+              "type": "str",
+              "default": null,
+              "required": true
+            },
+            {
+              "flags": [
+                "--alias"
+              ],
+              "action": "store",
+              "dest": "alias",
+              "type": "str",
+              "default": null,
+              "required": true
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "alias.set",
+            "params": {
+              "session_id": "session_id",
+              "alias": "alias"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "assign",
+          "options": [
+            {
+              "flags": [
+                "--by-id"
+              ],
+              "action": "store",
+              "dest": "by_id",
+              "type": "str",
+              "default": null,
+              "required": true
+            },
+            {
+              "flags": [
+                "--alias"
+              ],
+              "action": "store",
+              "dest": "alias",
+              "type": "str",
+              "default": null,
+              "required": true
+            },
+            {
+              "flags": [
+                "--profile"
+              ],
+              "action": "store",
+              "dest": "profile",
+              "type": "str",
+              "default": null
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "alias.assign",
+            "params": {
+              "by_id": "by_id",
+              "alias": "alias",
+              "profile": "profile"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [
+              "profile"
+            ],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "unassign",
+          "options": [
+            {
+              "flags": [
+                "--alias"
+              ],
+              "action": "store",
+              "dest": "alias",
+              "type": "str",
+              "default": null,
+              "required": true
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "alias.unassign",
+            "params": {
+              "alias": "alias"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        }
+      ]
+    },
+    {
+      "name": "cmd",
+      "stage": "rust-1a",
+      "local": false,
+      "options": [],
+      "mutex": [],
+      "subcommands": [
+        {
+          "name": "submit",
+          "options": [
+            {
+              "flags": [
+                "--selector"
+              ],
+              "action": "store",
+              "dest": "selector",
+              "type": "str",
+              "default": null,
+              "required": true
+            },
+            {
+              "flags": [
+                "--cmd"
+              ],
+              "action": "store",
+              "dest": "command_text",
+              "type": "str",
+              "default": ""
+            },
+            {
+              "flags": [
+                "--source"
+              ],
+              "action": "store",
+              "dest": "source",
+              "type": "str",
+              "default": "agent"
+            },
+            {
+              "flags": [
+                "--mode"
+              ],
+              "action": "store",
+              "dest": "mode",
+              "type": "str",
+              "default": "line"
+            },
+            {
+              "flags": [
+                "--priority"
+              ],
+              "action": "store",
+              "dest": "priority",
+              "type": "int",
+              "default": 10
+            },
+            {
+              "flags": [
+                "--cmd-timeout"
+              ],
+              "action": "store",
+              "dest": "cmd_timeout_s",
+              "type": "float",
+              "default": 10.0
+            },
+            {
+              "flags": [
+                "--expected-duration"
+              ],
+              "action": "store",
+              "dest": "expected_duration_s",
+              "type": "float",
+              "default": null
+            },
+            {
+              "flags": [
+                "--completion-regex"
+              ],
+              "action": "store",
+              "dest": "completion_regex",
+              "type": "str",
+              "default": null
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "command.submit",
+            "params": {
+              "selector": "selector",
+              "cmd": "command_text",
+              "source": "source",
+              "mode": "mode",
+              "priority": "priority",
+              "timeout_s": "cmd_timeout_s",
+              "expected_duration_s": "expected_duration_s",
+              "completion_regex": "completion_regex"
+            },
+            "omit_when_none": [
+              "completion_regex",
+              "expected_duration_s"
+            ],
+            "omit_when_falsy": [],
+            "local_reject_empty": [
+              "completion_regex"
+            ],
+            "send_null": []
+          }
+        },
+        {
+          "name": "status",
+          "options": [
+            {
+              "flags": [
+                "--cmd-id"
+              ],
+              "action": "store",
+              "dest": "cmd_id",
+              "type": "str",
+              "default": null,
+              "required": true
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "command.get",
+            "params": {
+              "cmd_id": "cmd_id"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "result-tail",
+          "options": [
+            {
+              "flags": [
+                "--cmd-id"
+              ],
+              "action": "store",
+              "dest": "cmd_id",
+              "type": "str",
+              "default": null,
+              "required": true
+            },
+            {
+              "flags": [
+                "--from-chunk"
+              ],
+              "action": "store",
+              "dest": "from_chunk",
+              "type": "int",
+              "default": 0
+            },
+            {
+              "flags": [
+                "--limit"
+              ],
+              "action": "store",
+              "dest": "limit",
+              "type": "int",
+              "default": 200
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "command.result_tail",
+            "params": {
+              "cmd_id": "cmd_id",
+              "from_chunk": "from_chunk",
+              "limit": "limit"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "cancel",
+          "options": [
+            {
+              "flags": [
+                "--cmd-id"
+              ],
+              "action": "store",
+              "dest": "cmd_id",
+              "type": "str",
+              "default": null,
+              "required": true
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "command.cancel",
+            "params": {
+              "cmd_id": "cmd_id"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        }
+      ]
+    },
+    {
+      "name": "stream",
+      "stage": "rust-1a",
+      "local": false,
+      "options": [],
+      "mutex": [],
+      "subcommands": [
+        {
+          "name": "tail",
+          "options": [
+            {
+              "flags": [
+                "--selector"
+              ],
+              "action": "store",
+              "dest": "selector",
+              "type": "str",
+              "default": null
+            },
+            {
+              "flags": [
+                "--com"
+              ],
+              "action": "store",
+              "dest": "com",
+              "type": "str",
+              "default": null
+            },
+            {
+              "flags": [
+                "--from-seq"
+              ],
+              "action": "store",
+              "dest": "from_seq",
+              "type": "int",
+              "default": 0
+            },
+            {
+              "flags": [
+                "--limit"
+              ],
+              "action": "store",
+              "dest": "limit",
+              "type": "int",
+              "default": 200
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "result.tail",
+            "params": {
+              "from_seq": "from_seq",
+              "limit": "limit",
+              "selector": "selector|com"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [
+              "selector"
+            ],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        }
+      ]
+    },
+    {
+      "name": "log",
+      "stage": "rust-1a",
+      "local": false,
+      "options": [],
+      "mutex": [],
+      "subcommands": [
+        {
+          "name": "tail-raw",
+          "options": [
+            {
+              "flags": [
+                "--selector"
+              ],
+              "action": "store",
+              "dest": "selector",
+              "type": "str",
+              "default": null
+            },
+            {
+              "flags": [
+                "--com"
+              ],
+              "action": "store",
+              "dest": "com",
+              "type": "str",
+              "default": null
+            },
+            {
+              "flags": [
+                "--from-seq"
+              ],
+              "action": "store",
+              "dest": "from_seq",
+              "type": "int",
+              "default": null
+            },
+            {
+              "flags": [
+                "--limit"
+              ],
+              "action": "store",
+              "dest": "limit",
+              "type": "int",
+              "default": 200
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "log.tail_raw",
+            "params": {
+              "limit": "limit",
+              "from_seq": "from_seq",
+              "selector": "selector|com"
+            },
+            "omit_when_none": [
+              "from_seq"
+            ],
+            "omit_when_falsy": [
+              "selector"
+            ],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "tail-text",
+          "options": [
+            {
+              "flags": [
+                "--selector"
+              ],
+              "action": "store",
+              "dest": "selector",
+              "type": "str",
+              "default": null
+            },
+            {
+              "flags": [
+                "--com"
+              ],
+              "action": "store",
+              "dest": "com",
+              "type": "str",
+              "default": null
+            },
+            {
+              "flags": [
+                "--from-seq"
+              ],
+              "action": "store",
+              "dest": "from_seq",
+              "type": "int",
+              "default": null
+            },
+            {
+              "flags": [
+                "--limit"
+              ],
+              "action": "store",
+              "dest": "limit",
+              "type": "int",
+              "default": 200
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "log.tail_text",
+            "params": {
+              "limit": "limit",
+              "from_seq": "from_seq",
+              "selector": "selector|com"
+            },
+            "omit_when_none": [
+              "from_seq"
+            ],
+            "omit_when_falsy": [
+              "selector"
+            ],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        }
+      ]
+    },
+    {
+      "name": "file",
+      "stage": "rust-1a",
+      "local": false,
+      "options": [],
+      "mutex": [],
+      "subcommands": [
+        {
+          "name": "push",
+          "options": [
+            {
+              "flags": [
+                "--selector"
+              ],
+              "action": "store",
+              "dest": "selector",
+              "type": "str",
+              "default": null,
+              "required": true
+            },
+            {
+              "flags": [
+                "--local"
+              ],
+              "action": "store",
+              "dest": "local",
+              "type": "str",
+              "default": null,
+              "required": true
+            },
+            {
+              "flags": [
+                "--remote"
+              ],
+              "action": "store",
+              "dest": "remote",
+              "type": "str",
+              "default": null,
+              "required": true
+            },
+            {
+              "flags": [
+                "--chunk-size"
+              ],
+              "action": "store",
+              "dest": "chunk_size",
+              "type": "int",
+              "default": 512
+            },
+            {
+              "flags": [
+                "--chunk-timeout"
+              ],
+              "action": "store",
+              "dest": "chunk_timeout_s",
+              "type": "float",
+              "default": null
+            },
+            {
+              "flags": [
+                "--ack-mode"
+              ],
+              "action": "store",
+              "dest": "ack_mode",
+              "type": "str",
+              "default": "auto",
+              "choices": [
+                "auto",
+                "echo",
+                "none"
+              ]
+            },
+            {
+              "flags": [
+                "--source"
+              ],
+              "action": "store",
+              "dest": "source",
+              "type": "str",
+              "default": "agent"
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "file.push",
+            "params": {
+              "selector": "selector",
+              "local_path": "local",
+              "remote_path": "remote",
+              "chunk_size": "chunk_size",
+              "ack_mode": "ack_mode",
+              "source": "source",
+              "chunk_timeout_s": "chunk_timeout_s"
+            },
+            "omit_when_none": [
+              "chunk_timeout_s"
+            ],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "pull",
+          "options": [
+            {
+              "flags": [
+                "--selector"
+              ],
+              "action": "store",
+              "dest": "selector",
+              "type": "str",
+              "default": null,
+              "required": true
+            },
+            {
+              "flags": [
+                "--remote"
+              ],
+              "action": "store",
+              "dest": "remote",
+              "type": "str",
+              "default": null,
+              "required": true
+            },
+            {
+              "flags": [
+                "--local"
+              ],
+              "action": "store",
+              "dest": "local",
+              "type": "str",
+              "default": null
+            },
+            {
+              "flags": [
+                "--chunk-timeout"
+              ],
+              "action": "store",
+              "dest": "chunk_timeout_s",
+              "type": "float",
+              "default": null
+            },
+            {
+              "flags": [
+                "--ack-mode"
+              ],
+              "action": "store",
+              "dest": "ack_mode",
+              "type": "str",
+              "default": "auto",
+              "choices": [
+                "auto",
+                "echo",
+                "none"
+              ]
+            },
+            {
+              "flags": [
+                "--source"
+              ],
+              "action": "store",
+              "dest": "source",
+              "type": "str",
+              "default": "agent"
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "file.pull",
+            "params": {
+              "selector": "selector",
+              "remote_path": "remote",
+              "ack_mode": "ack_mode",
+              "source": "source",
+              "local_path": "local",
+              "chunk_timeout_s": "chunk_timeout_s"
+            },
+            "omit_when_none": [
+              "chunk_timeout_s",
+              "local_path"
+            ],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        }
+      ]
+    },
+    {
+      "name": "wal",
+      "stage": "rust-1a",
+      "local": false,
+      "options": [],
+      "mutex": [],
+      "subcommands": [
+        {
+          "name": "export",
+          "options": [
+            {
+              "flags": [
+                "--from-seq"
+              ],
+              "action": "store",
+              "dest": "from_seq",
+              "type": "int",
+              "default": 0
+            },
+            {
+              "flags": [
+                "--to-seq"
+              ],
+              "action": "store",
+              "dest": "to_seq",
+              "type": "int",
+              "default": 0
+            },
+            {
+              "flags": [
+                "--limit"
+              ],
+              "action": "store",
+              "dest": "limit",
+              "type": "int",
+              "default": 1000
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "wal.range",
+            "params": {
+              "from_seq": "from_seq",
+              "to_seq": "to_seq",
+              "limit": "limit"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "reset",
+          "options": [],
+          "mutex": [],
+          "rpc": {
+            "method": "wal.reset",
+            "params": {},
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "current-seq",
+          "options": [],
+          "mutex": [],
+          "rpc": {
+            "method": "wal.current_seq",
+            "params": {},
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        }
+      ]
+    },
+    {
+      "name": "mcu",
+      "stage": "rust-1a",
+      "local": false,
+      "options": [],
+      "mutex": [],
+      "subcommands": [
+        {
+          "name": "patterns",
+          "options": [],
+          "mutex": [],
+          "rpc": {
+            "method": "mcu.patterns",
+            "params": {},
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "status",
+          "options": [],
+          "mutex": [],
+          "rpc": {
+            "method": "mcu.status",
+            "params": {},
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        }
+      ]
+    },
+    {
+      "name": "remote",
+      "stage": "delegate-1a",
+      "local": true,
+      "options": [
+        {
+          "flags": [],
+          "action": "store",
+          "dest": "words",
+          "type": "str",
+          "default": null,
+          "positional": "words",
+          "nargs": "*"
+        },
+        {
+          "flags": [
+            "-R"
+          ],
+          "action": "store_true",
+          "dest": "reverse",
+          "default": false
+        },
+        {
+          "flags": [
+            "-L"
+          ],
+          "action": "store_true",
+          "dest": "forward",
+          "default": false
+        },
+        {
+          "flags": [
+            "--autossh"
+          ],
+          "action": "store_true",
+          "dest": "autossh",
+          "default": false
+        },
+        {
+          "flags": [
+            "--local"
+          ],
+          "action": "store",
+          "dest": "local",
+          "type": "int",
+          "default": null
+        },
+        {
+          "flags": [
+            "--remote-socket"
+          ],
+          "action": "store",
+          "dest": "remote_socket",
+          "type": "str",
+          "default": null
+        },
+        {
+          "flags": [
+            "--ready-timeout"
+          ],
+          "action": "store",
+          "dest": "ready_timeout",
+          "type": "float",
+          "default": 10.0
+        },
+        {
+          "flags": [
+            "--ssh-opt"
+          ],
+          "action": "append",
+          "dest": "ssh_opt",
+          "type": "str",
+          "default": []
+        }
+      ],
+      "mutex": [],
+      "subcommands": null
+    },
+    {
+      "name": "connect",
+      "stage": "delegate-1a",
+      "local": true,
+      "options": [
+        {
+          "flags": [],
+          "action": "store",
+          "dest": "code",
+          "type": "str",
+          "default": null,
+          "positional": "code"
+        },
+        {
+          "flags": [
+            "--close"
+          ],
+          "action": "store_true",
+          "dest": "close",
+          "default": false
+        }
+      ],
+      "mutex": [],
+      "subcommands": null
+    },
+    {
+      "name": "benches",
+      "stage": "delegate-1a",
+      "local": true,
+      "options": [],
+      "mutex": [],
+      "subcommands": null
+    },
+    {
+      "name": "event",
+      "stage": "rust-1a",
+      "local": false,
+      "options": [],
+      "mutex": [],
+      "subcommands": [
+        {
+          "name": "add",
+          "options": [
+            {
+              "flags": [
+                "--file"
+              ],
+              "action": "store",
+              "dest": "file",
+              "type": "str",
+              "default": null,
+              "required": true
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "event.rule_set",
+            "params": {
+              "$document": "file"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "rm",
+          "options": [
+            {
+              "flags": [],
+              "action": "store",
+              "dest": "rule_id",
+              "type": "str",
+              "default": null,
+              "positional": "rule_id"
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "event.rule_delete",
+            "params": {
+              "rule_id": "rule_id"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "list",
+          "options": [
+            {
+              "flags": [
+                "--selector"
+              ],
+              "action": "store",
+              "dest": "selector",
+              "type": "str",
+              "default": null
+            },
+            {
+              "flags": [
+                "--owner"
+              ],
+              "action": "store",
+              "dest": "owner",
+              "type": "str",
+              "default": null
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "event.rule_list",
+            "params": {
+              "selector": "selector",
+              "owner": "owner"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": [
+              "owner",
+              "selector"
+            ]
+          }
+        },
+        {
+          "name": "show",
+          "options": [
+            {
+              "flags": [],
+              "action": "store",
+              "dest": "rule_id",
+              "type": "str",
+              "default": null,
+              "positional": "rule_id"
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "event.rule_get",
+            "params": {
+              "rule_id": "rule_id"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "enable",
+          "options": [
+            {
+              "flags": [
+                "--selector"
+              ],
+              "action": "store",
+              "dest": "selector",
+              "type": "str",
+              "default": null,
+              "required": true
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "event.com_enable",
+            "params": {
+              "selector": "selector"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "disable",
+          "options": [
+            {
+              "flags": [
+                "--selector"
+              ],
+              "action": "store",
+              "dest": "selector",
+              "type": "str",
+              "default": null,
+              "required": true
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "event.com_disable",
+            "params": {
+              "selector": "selector"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "status",
+          "options": [
+            {
+              "flags": [
+                "--selector"
+              ],
+              "action": "store",
+              "dest": "selector",
+              "type": "str",
+              "default": null
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "event.com_status",
+            "params": {
+              "selector": "selector"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": [
+              "selector"
+            ]
+          }
+        },
+        {
+          "name": "reset",
+          "options": [
+            {
+              "flags": [
+                "--rule-id"
+              ],
+              "action": "store",
+              "dest": "rule_id",
+              "type": "str",
+              "default": null
+            },
+            {
+              "flags": [
+                "--selector"
+              ],
+              "action": "store",
+              "dest": "selector",
+              "type": "str",
+              "default": null
+            }
+          ],
+          "mutex": [
+            {
+              "dests": [
+                "rule_id",
+                "selector"
+              ],
+              "required": true
+            }
+          ],
+          "rpc": {
+            "method": "event.reset",
+            "params": {
+              "rule_id": "rule_id",
+              "selector": "selector"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": [
+              "rule_id",
+              "selector"
+            ]
+          }
+        },
+        {
+          "name": "reload",
+          "options": [],
+          "mutex": [],
+          "rpc": {
+            "method": "event.reload",
+            "params": {},
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": []
+          }
+        },
+        {
+          "name": "tail",
+          "options": [
+            {
+              "flags": [
+                "--rule-id"
+              ],
+              "action": "store",
+              "dest": "rule_id",
+              "type": "str",
+              "default": null
+            },
+            {
+              "flags": [
+                "--selector"
+              ],
+              "action": "store",
+              "dest": "selector",
+              "type": "str",
+              "default": null
+            },
+            {
+              "flags": [
+                "-n"
+              ],
+              "action": "store",
+              "dest": "n",
+              "type": "int",
+              "default": 50
+            },
+            {
+              "flags": [
+                "--since"
+              ],
+              "action": "store",
+              "dest": "since",
+              "type": "int",
+              "default": null
+            }
+          ],
+          "mutex": [],
+          "rpc": {
+            "method": "event.tail",
+            "params": {
+              "rule_id": "rule_id",
+              "selector": "selector",
+              "n": "n",
+              "since_ts": "since"
+            },
+            "omit_when_none": [],
+            "omit_when_falsy": [],
+            "local_reject_empty": [],
+            "send_null": [
+              "rule_id",
+              "selector",
+              "since_ts"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "supervision-mode",
+      "stage": "delegate-1a",
+      "local": true,
+      "options": [],
+      "mutex": [],
+      "subcommands": null
+    },
+    {
+      "name": "service",
+      "stage": "delegate-1a",
+      "local": true,
+      "options": [
+        {
+          "flags": [],
+          "action": "store",
+          "dest": "action",
+          "type": "str",
+          "default": null,
+          "choices": [
+            "start",
+            "stop",
+            "restart",
+            "status"
+          ],
+          "positional": "action"
+        },
+        {
+          "flags": [
+            "--with-sudo"
+          ],
+          "action": "store_true",
+          "dest": "with_sudo",
+          "default": false
+        }
+      ],
+      "mutex": [],
+      "subcommands": null
+    },
+    {
+      "name": "setup",
+      "stage": "delegate-1a",
+      "local": true,
+      "options": [
+        {
+          "flags": [
+            "--user"
+          ],
+          "action": "store_true",
+          "dest": "user",
+          "default": false
+        },
+        {
+          "flags": [
+            "--system"
+          ],
+          "action": "store_true",
+          "dest": "system",
+          "default": false
+        },
+        {
+          "flags": [
+            "--on-demand"
+          ],
+          "action": "store_true",
+          "dest": "on_demand",
+          "default": false
+        },
+        {
+          "flags": [
+            "--force"
+          ],
+          "action": "store_true",
+          "dest": "force",
+          "default": false
+        },
+        {
+          "flags": [
+            "--with-sudo"
+          ],
+          "action": "store_true",
+          "dest": "with_sudo",
+          "default": false
+        }
+      ],
+      "mutex": [
+        {
+          "dests": [
+            "on_demand",
+            "system",
+            "user"
+          ],
+          "required": false
+        }
+      ],
+      "subcommands": null
+    },
+    {
+      "name": "doctor",
+      "stage": "delegate-1a",
+      "local": true,
+      "options": [],
+      "mutex": [],
+      "subcommands": null
+    },
+    {
+      "name": "profile",
+      "stage": "rust-1a",
+      "local": true,
+      "options": [],
+      "mutex": [],
+      "subcommands": [
+        {
+          "name": "test",
+          "options": [
+            {
+              "flags": [
+                "--profile"
+              ],
+              "action": "store",
+              "dest": "profile",
+              "type": "str",
+              "default": null,
+              "required": true
+            },
+            {
+              "flags": [
+                "--sample"
+              ],
+              "action": "store",
+              "dest": "sample",
+              "type": "str",
+              "default": null,
+              "required": true
+            },
+            {
+              "flags": [
+                "--profile-dir"
+              ],
+              "action": "store",
+              "dest": "profile_dir",
+              "type": "str",
+              "default": {
+                "env_default": "PROFILE_DIR"
+              }
+            }
+          ],
+          "mutex": [],
+          "rpc": null
+        }
+      ]
+    },
+    {
+      "name": "skill",
+      "stage": "rust-1a",
+      "local": true,
+      "options": [
+        {
+          "flags": [
+            "--platform"
+          ],
+          "action": "store",
+          "dest": "platform",
+          "type": "str",
+          "default": "auto",
+          "choices": [
+            "auto",
+            "linux",
+            "windows"
+          ]
+        }
+      ],
+      "mutex": [],
+      "subcommands": null
+    }
+  ],
+  "x-output": {
+    "stdout_json": {
+      "ensure_ascii": false,
+      "sort_keys": true,
+      "separators": [
+        ",",
+        ":"
+      ],
+      "trailing_newline": true
+    },
+    "stderr_error_line": "serialwrap: {context }failed: {code}[: {message}][（hint: {hint}）]",
+    "unknown_error_literal": "UNKNOWN_ERROR",
+    "plain_text_commands": [
+      "supervision-mode",
+      "skill",
+      "--version",
+      "--help",
+      "daemon start --foreground"
+    ]
+  },
+  "x-exit-codes": [
+    {
+      "context": "_run_rpc",
+      "success": 0,
+      "failure": 2,
+      "codes": {
+        "BENCH_ENDPOINT_NOT_REMEMBERED": 1,
+        "BENCH_STATE_IO_ERROR": 1,
+        "INVALID_BENCH_STATE": 1
+      },
+      "note": "RPC 指令 ok:false 為 2；bench endpoint 未記住等錯誤為 1（目錄）"
+    },
+    {
+      "context": "daemon start",
+      "success": 0,
+      "failure": 2,
+      "codes": {
+        "DAEMON_ALREADY_RUNNING_ELSEWHERE": 2,
+        "DAEMON_BINARY_NOT_FOUND": 2,
+        "DAEMON_EXITED": 2,
+        "DAEMON_NOT_READY": 2,
+        "ENV_FILE_SOURCE_FAILED": 2,
+        "INVALID_ARGS": 2,
+        "NEEDS_SUDO": 2,
+        "NO_SYSTEMD": 2,
+        "REMOTE_NOT_SUPPORTED": 2
+      },
+      "note": "含 already_running 成功為 0；--foreground 回傳 daemon 子程序 exit code（不在此表）"
+    },
+    {
+      "context": "daemon stop",
+      "success": 0,
+      "failure": 2,
+      "codes": {
+        "BENCH_ENDPOINT_NOT_REMEMBERED": 1,
+        "BENCH_STATE_IO_ERROR": 1,
+        "INTERNAL_ERROR": 1,
+        "INVALID_BENCH_STATE": 1,
+        "NEEDS_SUDO": 2,
+        "NO_SYSTEMD": 2
+      },
+      "note": "endpoint 解析錯誤為 1；其他例外為 1 + INTERNAL_ERROR（目錄）"
+    },
+    {
+      "context": "event",
+      "success": 0,
+      "failure": 2,
+      "codes": {
+        "BENCH_ENDPOINT_NOT_REMEMBERED": 1,
+        "BENCH_STATE_IO_ERROR": 1,
+        "INTERNAL_ERROR": 1,
+        "INVALID_BENCH_STATE": 1,
+        "UNKNOWN_EVENT_CMD": 2
+      },
+      "note": "任何其他例外（--file 不存在或 JSON 解析失敗）為 1 + INTERNAL_ERROR（目錄）"
+    },
+    {
+      "context": "connect",
+      "success": 0,
+      "failure": 1,
+      "codes": {
+        "BENCH_STATE_IO_ERROR": 1,
+        "INTERNAL_ERROR": 1,
+        "INVALID_BENCH_CONFIG": 1,
+        "INVALID_BENCH_STATE": 1,
+        "REMOTE_BIND_UNVERIFIED": 1,
+        "REMOTE_NOT_SUPPORTED": 1,
+        "SSH_NOT_FOUND": 1,
+        "TUNNEL_CONFLICT": 1,
+        "TUNNEL_SPAWN_FAILED": 1,
+        "TUNNEL_STATUS_ERROR": 1,
+        "TUNNEL_STILL_ACTIVE": 1,
+        "UNKNOWN_BENCH_CODE": 1
+      },
+      "note": "失敗一律 1；argparse JSON 邊界同為 1"
+    },
+    {
+      "context": "benches",
+      "success": 0,
+      "failure": 1,
+      "codes": {
+        "BENCH_STATE_IO_ERROR": 1,
+        "INTERNAL_ERROR": 1,
+        "INVALID_BENCH_CONFIG": 1,
+        "INVALID_BENCH_STATE": 1,
+        "REMOTE_NOT_SUPPORTED": 1,
+        "TUNNEL_STATUS_ERROR": 1
+      },
+      "note": "失敗一律 1；argparse JSON 邊界同為 1"
+    },
+    {
+      "context": "remote",
+      "success": 0,
+      "failure": 1,
+      "codes": {
+        "BENCH_ENDPOINT_NOT_REMEMBERED": 1,
+        "BENCH_STATE_IO_ERROR": 1,
+        "INTERNAL_ERROR": 1,
+        "INVALID_ARGS": 1,
+        "INVALID_BENCH_STATE": 1,
+        "INVALID_ENDPOINT": 1,
+        "INVALID_TARGET": 1,
+        "REMOTE_BIND_UNVERIFIED": 1,
+        "REMOTE_NOT_SUPPORTED": 1,
+        "SSH_NOT_FOUND": 1,
+        "TUNNEL_CONFLICT": 1,
+        "TUNNEL_SPAWN_FAILED": 1
+      },
+      "note": "失敗一律 1"
+    },
+    {
+      "context": "setup",
+      "success": 0,
+      "failure": 2,
+      "codes": {
+        "FLASHING_BUSY": 2
+      },
+      "note": "FLASHING_BUSY 為 2；其他例外不攔截，印 Python traceback（exit 1）"
+    },
+    {
+      "context": "service <action>",
+      "success": 0,
+      "failure": 2,
+      "codes": {
+        "NEEDS_SUDO": 2,
+        "NO_SYSTEMD": 2
+      },
+      "note": "失敗為 2"
+    },
+    {
+      "context": "cmd submit",
+      "success": 0,
+      "failure": 2,
+      "codes": {
+        "INVALID_COMPLETION_REGEX": 1
+      },
+      "note": "INVALID_COMPLETION_REGEX 不連 daemon 為 1；其餘 RPC 失敗為 2"
+    },
+    {
+      "context": "profile test",
+      "success": 0,
+      "failure": 0,
+      "codes": {
+        "SAMPLE_READ_FAILED": 0,
+        "UNKNOWN_PROFILE": 0
+      },
+      "note": "一律 0（含 UNKNOWN_PROFILE、SAMPLE_READ_FAILED）"
+    },
+    {
+      "context": "doctor",
+      "success": 0,
+      "failure": 0,
+      "codes": {},
+      "note": "一律 0（ok:false 也是 0）"
+    },
+    {
+      "context": "argparse-boundary",
+      "success": 0,
+      "failure": 2,
+      "codes": {
+        "INVALID_ARGS": 1
+      },
+      "note": "argparse 錯誤為 2；connect／benches JSON 邊界為 1（目錄 INVALID_ARGS）"
+    },
+    {
+      "context": "fallthrough",
+      "success": 0,
+      "failure": 2,
+      "codes": {
+        "INVALID_ARGS": 2
+      },
+      "note": "無 context：serialwrap: failed: INVALID_ARGS，exit 2"
+    }
+  ],
+  "x-exit-codes-simple": [
+    {
+      "context": "skill",
+      "success": 0,
+      "failure": null,
+      "note": "01 §2.4「—」：無失敗路徑"
+    },
+    {
+      "context": "supervision-mode",
+      "success": 0,
+      "failure": null,
+      "note": "config.yaml 壞 YAML 時印未攔截 traceback（cli.py:311-312 用不安全的 _default_runtime_config()），結束碼為 Python 預設 1，非契約碼"
+    },
+    {
+      "context": "--help/--version",
+      "success": 0,
+      "failure": null,
+      "note": "argparse 內建輸出，無失敗路徑"
+    }
+  ],
+  "x-retry": {
+    "methods": [
+      "health.ping",
+      "health.status",
+      "session.list",
+      "session.get_state",
+      "session.activity",
+      "session.console_list",
+      "session.log_status",
+      "device.list",
+      "alias.list",
+      "mcu.patterns",
+      "mcu.status"
+    ],
+    "excluded_explicit": [
+      "session.interactive_status"
+    ],
+    "transient_codes": [
+      "TIMEOUT",
+      "SOCKET_ERROR",
+      "EMPTY_RESPONSE"
+    ],
+    "backoff_base_s": 0.5,
+    "backoff_factor": 2,
+    "backoff_max_s": 5.0,
+    "event_forwards_retries": false,
+    "timeout_enrich": {
+      "fields": [
+        "daemon_reachable",
+        "daemon_busy"
+      ],
+      "excluded_methods": [
+        "health.ping",
+        "health.status"
+      ],
+      "source": "sw_core/client.py:61（_PROBE_METHODS）、173（TIMEOUT 後 enrich 條件）、194-222（_probe_daemon_after_timeout）"
+    }
+  },
+  "x-timeouts": {
+    "default_rpc_timeout_s": 5.0,
+    "long_rpc_timeout_floor_s": 45.0,
+    "long_methods": [
+      "session.recover",
+      "session.attach",
+      "session.self_test",
+      "session.console_attach"
+    ],
+    "known_gap_methods": {
+      "methods": [
+        "file.push",
+        "file.pull"
+      ],
+      "timeout_s": 5.0
+    },
+    "sources": [
+      "sw_core/cli.py:79",
+      "sw_core/cli.py:81"
+    ]
+  },
+  "x-fixed-timeouts": [
+    {
+      "name": "daemon_stop_wait_s",
+      "value": 2.0,
+      "source": "sw_core/cli.py:647"
+    },
+    {
+      "name": "daemon_start_ping_timeout_s",
+      "value": 0.5,
+      "source": "sw_core/cli.py:599"
+    },
+    {
+      "name": "daemon_start_status_timeout_s",
+      "value": 1.0,
+      "source": "sw_core/cli.py:610"
+    },
+    {
+      "name": "daemon_ready_poll",
+      "posix": {
+        "tries": 15,
+        "interval_s": 0.2
+      },
+      "windows": {
+        "tries": 50,
+        "interval_s": 0.2
+      },
+      "source": "sw_core/cli.py:586-588"
+    },
+    {
+      "name": "healthy_daemon_probe_timeout_s",
+      "value": 0.5,
+      "source": "sw_core/cli.py:366-377"
+    },
+    {
+      "name": "setup_ping_timeout_s",
+      "value": 0.5,
+      "source": "sw_core/cli.py:1694"
+    },
+    {
+      "name": "setup_mcu_status_timeout_s",
+      "value": 0.5,
+      "source": "sw_core/cli.py:1701"
+    },
+    {
+      "name": "doctor_health_status_timeout_s",
+      "value": 0.5,
+      "source": "sw_core/doctor_cmd.py:317"
+    },
+    {
+      "name": "remote_real_ping_timeout_s",
+      "value": 2.0,
+      "source": "sw_core/remote_tunnel.py:665"
+    },
+    {
+      "name": "client_probe_timeout_s",
+      "value": 1.0,
+      "source": "sw_core/client.py:52"
+    },
+    {
+      "name": "client_probe_deadline_s",
+      "value": 2.5,
+      "source": "sw_core/client.py:58"
+    },
+    {
+      "name": "retry_backoff_base_s",
+      "value": 0.5,
+      "source": "sw_core/client.py:38"
+    },
+    {
+      "name": "retry_backoff_max_s",
+      "value": 5.0,
+      "source": "sw_core/client.py:42"
+    },
+    {
+      "name": "unix_endpoint_liveness_socket_timeout_s",
+      "value": 0.2,
+      "source": "sw_core/cli.py:717"
+    },
+    {
+      "name": "win_tcp_liveness_connect_timeout_s",
+      "value": 0.2,
+      "source": "sw_core/lock_win.py:14"
+    },
+    {
+      "name": "remote_readiness_poll_interval_s",
+      "value": 0.2,
+      "source": "sw_core/remote_tunnel.py:153"
+    },
+    {
+      "name": "remote_probe_runner_timeout_s",
+      "value": 10.0,
+      "source": "sw_core/remote_tunnel.py:648"
+    },
+    {
+      "name": "remote_terminate_pgid_timeout_s",
+      "value": 5.0,
+      "source": "sw_core/remote_tunnel.py:373"
+    },
+    {
+      "name": "remote_terminate_pgid_poll_step_s",
+      "value": 0.1,
+      "source": "sw_core/remote_tunnel.py:399"
+    },
+    {
+      "name": "doctor_other_install_version_timeout_s",
+      "value": 2.0,
+      "source": "sw_core/doctor_cmd.py:95"
+    }
+  ],
+  "x-hybrid-rpc": [
+    {
+      "command": "daemon start",
+      "rpc": [
+        {
+          "method": "health.ping",
+          "timeout_s": 0.5,
+          "where": "spawn guard 與就緒輪詢（cli.py:366-377、599）"
+        },
+        {
+          "method": "health.status",
+          "timeout_s": 1.0,
+          "where": "就緒後取 warnings（cli.py:610）"
+        }
+      ]
+    },
+    {
+      "command": "daemon stop",
+      "rpc": [
+        {
+          "method": "daemon.stop",
+          "timeout_s": 2.0,
+          "condition": "RPC daemon.stop 為預設路徑；僅當 supervision_mode 以 systemd 開頭且未指定顯式 target（--endpoint／--socket／--bench）時改走 service stop（cli.py:635）"
+        }
+      ]
+    },
+    {
+      "command": "setup",
+      "rpc": [
+        {
+          "method": "health.ping",
+          "timeout_s": 0.5,
+          "where": "cli.py:1694"
+        },
+        {
+          "method": "mcu.status",
+          "timeout_s": 0.5,
+          "where": "cli.py:1701"
+        }
+      ]
+    },
+    {
+      "command": "doctor",
+      "rpc": [
+        {
+          "method": "health.status",
+          "timeout_s": 0.5,
+          "where": "doctor_cmd.py:317、382"
+        }
+      ]
+    },
+    {
+      "command": "remote",
+      "rpc": [
+        {
+          "method": "health.ping",
+          "timeout_s": 2.0,
+          "condition": "僅 role=connect（remote -L）經 make_role_probe 呼叫；role=expose（-R）不呼叫",
+          "where": "remote_tunnel.py:665 real_ping；cli.py:1603 注入"
+        }
+      ]
+    },
+    {
+      "command": "connect",
+      "rpc": [
+        {
+          "method": "health.ping",
+          "timeout_s": 2.0,
+          "where": "remote_tunnel.py:665 real_ping；cli.py:1416 注入（connect 固定 role=connect）"
+        }
+      ]
+    }
+  ],
+  "x-env": [
+    {
+      "name": "SERIALWRAP_LOG_LEVEL",
+      "read_by": "sw_core/cli_trace.py:53",
+      "default": null,
+      "effect": "CLI trace 層級（呼叫時讀取；-v／-vv 優先）"
+    },
+    {
+      "name": "SERIALWRAP_DAEMON_ENV_FILE",
+      "read_by": "sw_core/cli.py:223、335",
+      "default": null,
+      "effect": "daemon start 的 env 檔來源（有設時 strip 後非空即唯一來源；設為空白則不載入任何 env 檔）",
+      "unset_resolves_to": [
+        "~/OPI.env",
+        "<profile_dir>/OPI.env"
+      ],
+      "unset_source": "sw_core/cli.py:51-52（LEGACY_DAEMON_ENV_FILE、PROFILE_DAEMON_ENV_FILE）",
+      "blank_resolves_to": []
+    },
+    {
+      "name": "SERIALWRAP_STATE_DIR",
+      "read_by": "sw_core/constants.py:27,31；sw_core/cli.py:1116",
+      "default": null,
+      "effect": "STATE_DIR／WAL／bench state 路徑（constants 於 import 時、bench state 於呼叫時）"
+    },
+    {
+      "name": "XDG_STATE_HOME",
+      "read_by": "sw_core/constants.py:22；sw_core/cli.py:1118",
+      "default": null,
+      "effect": "STATE_DIR 與 bench state 的 fallback 根目錄"
+    },
+    {
+      "name": "SERIALWRAP_RUN_DIR",
+      "read_by": "sw_core/constants.py:38；sw_core/cli.py:1641",
+      "default": null,
+      "effect": "RUN_DIR（socket／lock 所在）；remote 執行期目錄（呼叫時）"
+    },
+    {
+      "name": "SERIALWRAP_CONFIG_DIR",
+      "read_by": "sw_core/constants.py:26；sw_core/bench_registry.py:45（benches.yaml 預設路徑，呼叫時）",
+      "default": null,
+      "effect": "CONFIG_DIR（config.yaml、PROFILE_DIR 來源，import 時）"
+    },
+    {
+      "name": "XDG_CONFIG_HOME",
+      "read_by": "sw_core/constants.py:21；sw_core/bench_registry.py:42",
+      "default": null,
+      "effect": "CONFIG_DIR 與 benches.yaml 的 fallback 根目錄"
+    },
+    {
+      "name": "XDG_RUNTIME_DIR",
+      "read_by": "sw_core/constants.py:24",
+      "default": null,
+      "effect": "RUN_DIR 預設（有設且未設 STATE_DIR 覆寫時為 $XDG_RUNTIME_DIR/serialwrap）"
+    },
+    {
+      "name": "SERIALWRAP_PROFILE_DIR",
+      "read_by": "sw_core/constants.py:61",
+      "default": null,
+      "effect": "daemon start 與 profile test 的 --profile-dir 預設值（import 時）"
+    },
+    {
+      "name": "SERIALWRAP_TCP_PORT",
+      "read_by": "sw_core/constants.py:47",
+      "default": "48700",
+      "effect": "DEFAULT_TCP_PORT（import 時）"
+    },
+    {
+      "name": "SERIALWRAP_ENDPOINT",
+      "read_by": "sw_core/constants.py:52、56",
+      "default": null,
+      "effect": "DEFAULT_ENDPOINT（import 時）；POSIX CLI 解析不使用，win 的 _local_default_endpoint 使用"
+    },
+    {
+      "name": "SERIALWRAP_RPC_BACKEND",
+      "read_by": "sw_core/platform_backends.py:24（經 sw_core/cli.py:668 呼叫）",
+      "default": "auto",
+      "effect": "RPC 後端 posix／win 判定（呼叫時）"
+    },
+    {
+      "name": "SERIALWRAP_BENCHES_FILE",
+      "read_by": "sw_core/bench_registry.py:50",
+      "default": null,
+      "effect": "benches.yaml 路徑覆寫（呼叫時）"
+    }
+  ],
+  "x-version": {
+    "flag_output": "serialwrap <VERSION>\n",
+    "stream": "stdout",
+    "mismatch_warning": {
+      "stream": "stderr",
+      "blocking": false,
+      "template": "serialwrap: client 版本 {cli_version} 與 daemon 版本 {daemon_version} 不一致（建議統一安裝來源或重啟 daemon 對齊版本；serialwrap doctor 可查其他安裝）\n"
+    }
+  },
+  "x-delegation-1a": [
+    "daemon",
+    "service",
+    "supervision-mode",
+    "remote",
+    "connect",
+    "benches",
+    "setup",
+    "doctor"
+  ],
+  "x-pending": [
+    {
+      "id": "SC-20",
+      "change": "SC-20",
+      "adds_subcommand": [
+        "daemon",
+        "restart"
+      ]
+    },
+    {
+      "id": "SC-21",
+      "change": "SC-21",
+      "adds_subcommand": [
+        "remote",
+        "stop"
+      ]
+    },
+    {
+      "id": "SC-22",
+      "change": "SC-22",
+      "adds_subcommand": [
+        "supervision-mode",
+        "set"
+      ]
+    },
+    {
+      "id": "SC-23",
+      "change": "SC-23",
+      "adds_option": [
+        "setup",
+        "--rollback"
+      ]
+    }
+  ]
+}
