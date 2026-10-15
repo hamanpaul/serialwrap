@@ -1465,7 +1465,7 @@ pub fn version_line() -> String;           // "serialwrap " + version()
 
 // rpc_types.rs
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Method { HealthPing, HealthStatus, DaemonStop, DeviceList, DeviceRelease, DeviceAttach, SessionList, SessionGetState,
+pub enum Method { HealthPing, HealthStatus, DaemonStop, DaemonHandoffStop /* SC-11，R1-F1；P4 update／rollback 專用 */, DeviceList, DeviceRelease, DeviceAttach, SessionList, SessionGetState,
     SessionClear, SessionBind, SessionPin, SessionUnpin, SessionAttach, SessionSelfTest, SessionActivity, SessionRecover,
     SessionConsoleAttach, SessionConsoleDetach, SessionConsoleList, SessionInteractiveOpen, SessionInteractiveSend,
     SessionInteractiveStatus, SessionInteractiveClose, SessionLogStart, SessionLogStop, SessionLogStatus, AliasList, AliasSet,
@@ -1475,7 +1475,7 @@ pub enum Method { HealthPing, HealthStatus, DaemonStop, DeviceList, DeviceReleas
 impl Method {
     pub fn as_str(&self) -> &str;
     pub fn parse(s: &str) -> Method;
-    pub fn known() -> &'static [&'static str];       // 54 個，順序同 01 §8 再加 session.get_state
+    pub fn known() -> &'static [&'static str];       // 55 個，順序同 01 §8 再加 session.get_state、daemon.handoff_stop（SC-11）
     pub fn is_retryable_readonly(&self) -> bool;     // RETRYABLE_READONLY_METHODS
     pub fn uses_long_timeout(&self) -> bool;         // LONG_RPC_METHODS
 }
@@ -1543,11 +1543,12 @@ fn run(file: &str, native: NativeTraits) {
 
 ```rust
 use sw_proto::rpc_types::Method;
-#[test] fn known_has_54_unique() {
+#[test] fn known_has_55_unique() {
     let k = Method::known();
-    assert_eq!(k.len(), 54);
+    assert_eq!(k.len(), 55);                                   // 54 基線＋daemon.handoff_stop（SC-11，01 x-pending SC-11-handoff）
     let set: std::collections::BTreeSet<_> = k.iter().collect();
-    assert_eq!(set.len(), 54);
+    assert_eq!(set.len(), 55);
+    assert!(!Method::DaemonHandoffStop.is_retryable_readonly() && !Method::DaemonHandoffStop.uses_long_timeout());
     for m in k { assert_eq!(Method::parse(m).as_str(), *m); }
     assert_eq!(Method::parse("x.y"), Method::Unknown("x.y".into()));
 }
@@ -1566,7 +1567,7 @@ fn set<'a>(it: impl IntoIterator<Item = &'a str>) -> std::collections::BTreeSet<
     assert_eq!(l.len(), 4);
 }
 #[test] fn known_equals_p0_rpc_schema_methods() {
-    // 權威集合：P0 T8 contracts/rpc_schema.json 的方法清單（缺檔 → panic，不早退）
+    // 權威集合：P0 T8 contracts/rpc_schema.json 的方法清單＝x-methods 鍵 ∪ x-pending[*].adds_method（P1 T08 併入前後皆為 55；缺檔 → panic，不早退）
     assert_eq!(set(Method::known().iter().copied()), common::rpc_schema_methods().iter().map(String::as_str).collect());
 }
 ```
@@ -2487,10 +2488,10 @@ fn whitelist_method_retries_socket_error_with_backoff() {
 
 #[test]
 fn non_whitelist_never_retries() {
-    // Method::known() 扣掉 11 個白名單＝43 個方法 × 三種 transient 失敗；每種都只能 connect 一次
+    // Method::known() 扣掉 11 個白名單＝44 個方法（含 daemon.handoff_stop）× 三種 transient 失敗；每種都只能 connect 一次
     let wl = sw_proto::constants::RETRYABLE_READONLY_METHODS;
     let methods: Vec<&str> = sw_proto::rpc_types::Method::known().iter().copied().filter(|m| !wl.contains(m)).collect();
-    assert_eq!(methods.len(), 43);
+    assert_eq!(methods.len(), 44);
     for m in methods {
         for (kind, conn_step) in [("refuse", FakeConn::refuse_errno(111, "[Errno 111] Connection refused")),
                                   ("timeout", FakeConn::Timeout),

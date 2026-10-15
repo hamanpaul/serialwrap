@@ -301,11 +301,17 @@ def test_resource_limits_contract_values():
         "rx_rate_window_entries": 4096, "deferred_input_max_bytes": 262144,
         "rpc_connections": 128, "rpc_request_line_bytes": 65536, "interactive_tombstones": 16,
         "drain_timeout_ms": 3000, "mailbox_stash_max": 16,
+        # R1-F8：TX 帳本只保留未結算 op；不得以 drop_oldest／evict 淘汰在途證據
+        "tx_ledger_live_ops": 256, "tx_ledger_unresolved_gaps": 256, "tx_op_wal_gaps": 16, "tx_settle_queue": 256,
     }
     assert {k: by_name[k]["value"] for k in expect} == expect
+    assert {k: by_name[k]["overflow"] for k in ("tx_ledger_live_ops", "tx_ledger_unresolved_gaps", "tx_op_wal_gaps", "tx_settle_queue")} == {
+        "tx_ledger_live_ops": "reject_new_and_drain", "tx_ledger_unresolved_gaps": "merge_oldest",
+        "tx_op_wal_gaps": "merge_oldest", "tx_settle_queue": "retain_entry"}
     for row in limits["limits"]:
         assert row["overflow"] in {"reject", "block_sender", "drop_oldest", "clear_all", "truncate_head",
-                                   "evict_oldest_done", "pause_accept", "close_connection", "timeout", "merge_oldest"}
+                                   "evict_oldest_done", "pause_accept", "close_connection", "timeout", "merge_oldest",
+                                   "reject_new_and_drain", "retain_entry"}
 
 
 EVENTS = {"stop_request", "command_cancel", "lease_expiry", "drain_receipt", "release_request"}
@@ -417,7 +423,7 @@ early_evidence_cases:                  # cases.lock 屬較晚切片、本 Phase 
 ```
 
 `contracts/resource_limits.yaml`：
-- `limits`：每列 `{name, value, unit, overflow, source}`，值與 `test_resource_limits_contract_values` 相同；`overflow` 依 arch §5.10（`mailbox_control: block_sender`（RPC 送端逾時回 `timeout`）、`mailbox_data_chunks: block_sender`、`tx_writer_jobs: block_sender`、`cmd_pending_max: reject`、`cmd_history_max: evict_oldest_done`、`bg_capture_max_chars: truncate_head`、`bg_capture_max_count: evict_oldest_done`、`rx_window_max_chars: truncate_head`、`rx_rate_window_entries: merge_oldest`（合併最舊兩筆、保留 bytes 總和，flood 下不低估 RX_FLOOD 判定）、`deferred_input_max_bytes: clear_all`、`rpc_connections: pause_accept`、`rpc_request_line_bytes: close_connection`、`interactive_tombstones: drop_oldest`、`drain_timeout_ms: timeout`、`mailbox_stash_max: block_sender`）；`source` 寫 arch 章節。
+- `limits`：每列 `{name, value, unit, overflow, source}`，值與 `test_resource_limits_contract_values` 相同；`overflow` 依 arch §5.10（`mailbox_control: block_sender`（RPC 送端逾時回 `timeout`）、`mailbox_data_chunks: block_sender`、`tx_writer_jobs: block_sender`、`cmd_pending_max: reject`、`cmd_history_max: evict_oldest_done`、`bg_capture_max_chars: truncate_head`、`bg_capture_max_count: evict_oldest_done`、`rx_window_max_chars: truncate_head`、`rx_rate_window_entries: merge_oldest`（合併最舊兩筆、保留 bytes 總和，flood 下不低估 RX_FLOOD 判定）、`deferred_input_max_bytes: clear_all`、`rpc_connections: pause_accept`、`rpc_request_line_bytes: close_connection`、`interactive_tombstones: drop_oldest`、`drain_timeout_ms: timeout`、`mailbox_stash_max: block_sender`、`tx_ledger_live_ops: reject_new_and_drain`（新 op 不提交、不建項目，送 `UartIoError{reason:"TX_LEDGER_SATURATED"}` 以 IoError drain 收斂；不淘汰既有項目）、`tx_ledger_unresolved_gaps: merge_oldest`／`tx_op_wal_gaps: merge_oldest`（合併進 `GapOverflow{gaps, bytes, first_op, last_op}`，計數與 bytes 不丟）、`tx_settle_queue: retain_entry`（settle try_send 滿時該 op 留在帳本，`settle_dropped` 計數），R1-F8）；`source` 寫 arch 章節。
 - `event_latency`（§5.3，開工前凍結；`owner`＝PAL／Actor 實作負責人 `codex-gpt-6-luna-max`，`reviewed_by`＝獨立測試審閱者，兩者不同；`method_revision`＝`"2026-10-15.1"`）：`repeats: 3`、`samples_per_run: 500`、`gate_rule: every_run_max_le_max_ms`（每輪樣本最大值都 ≤ 上限才通過；p99 另記為診斷值、不作判定）、`flood_load: {bytes_per_s: 20000, seconds: 30, chunk_bytes: 256}`（= 規格門檻 20000 B／10 s 的 10 倍）、`host_load: "量測期間記錄 /proc/loadavg 與 CPU 數；loadavg 1min > CPU 數時該輪作廢重跑"`。`events`：
 
 | event | accept_point | complete_point | max_ms_idle | max_ms_flood |
@@ -1846,7 +1852,7 @@ git commit -m "feat(sw-core): 命令 admission、出列與 history 上限" -m "C
 ## Task 9：sw-core TxWriter＋Fence（送出前檢查、BC-03 三態、SC-07）
 
 **Test author model:** haiku-xhigh　**Implementer model:** codex-gpt-6-luna-max
-**Changelog fragment:** `changelog.d/rust-s21-txwriter.md`（front matter `type: feat`、`scope: rust-s21`；本文：「Rust 單一 TX 寫入者：每次 OS 提交都在 fence 鎖內重驗 epoch／凍結／Quiet／Reconfirm／WAL 健康／世代／取消後才交 OS（授權與提交同一臨界區，鎖不跨完成等待），TX WAL 只記 OS 確認的 bytes 且順序等於實際寫入順序。」）
+**Changelog fragment:** `changelog.d/rust-s21-txwriter.md`（front matter `type: feat`、`scope: rust-s21`；本文：「Rust 單一 TX 寫入者：每次 OS 提交都在 fence 鎖內重驗 epoch／凍結／Quiet／Reconfirm／WAL 健康／世代／取消後才交 OS（授權與提交同一臨界區，鎖不跨完成等待），TX WAL 只記 OS 確認的 bytes 且順序等於實際寫入順序；TX 帳本只保留未結算 op，終態 op 經 actor 結算後退休，證據缺口另有上限與合併計數。」）
 **BLOCKED-OWNER：** 無。
 
 **Files:**
@@ -1882,28 +1888,71 @@ pub struct FenceSubmitGate<'a> { pub fence: &'a Fence, pub permit: &'a TxPermit,
 impl SubmitGate for FenceSubmitGate<'_> {}
 pub struct TxJob { pub permit: TxPermit, pub payload: Vec<u8>, pub reply: crossbeam_channel::Sender<TxReport> }
 #[derive(Debug, Clone)] pub struct TxReport { pub op_id: OpId, pub epoch: u64, pub result: TxResult, pub wal: Option<WalAppend> /* TX WAL 寫入結果（seq／ok／loss_flag）*/, pub reject: Option<FenceReject> }
-/// epoch 範圍的 TX 帳本：TxWriter 對每個 op 累計，結束時整本交回，finisher 原樣放進 WorkerStoppedReceipt（BC-03 映射的唯一來源）。
+/// epoch 範圍的 TX 帳本（R1-F8：只保留**未結算** op）：TxWriter 對每個 op 累計；actor 判定某 op 終態且證據已收斂後，
+/// 經 `TxWriterHandle::settle` 送出結算，writer 才移除該 op（結算／退休協定見下方註解）。結束時把剩餘帳本交回，
+/// finisher 原樣放進 WorkerStoppedReceipt（BC-03 映射的唯一來源）。**帳本缺項＝該 op 在本 epoch 沒有任何已提交 bytes 的證據**，
+/// 映射同 `confirmed_bytes:0, unknown:false`（→ `FLUSHED_BY_RECOVERY`）；因此只有「確定不再被 BC-03 查詢」的 op 可以移除。
+pub const TX_LEDGER_LIVE_MAX: usize = 256;            // 未結算 op 上限；滿時新 op 一律不提交（見 saturation）
+pub const TX_LEDGER_UNRESOLVED_GAPS_MAX: usize = 256; // 已結算 op 遺留的 WAL 證據缺口上限；溢位合併最舊者進 gaps_overflow
+pub const TX_OP_WAL_GAPS_MAX: usize = 16;             // 單一 op 的 wal_gaps 上限；溢位合併進該 op 的 wal_gaps_overflow
+pub const TX_SETTLE_QUEUE_MAX: usize = 256;           // settle channel 容量
+#[derive(Debug, Clone, Default, PartialEq, Eq)] pub struct GapOverflow { pub gaps: u64, pub bytes: u64, pub first_op: Option<OpId>, pub last_op: Option<OpId> }
 #[derive(Debug, Clone, Default)] pub struct TxOpLedger { pub confirmed_bytes: usize, pub unknown: bool, pub last_error: Option<PalError>,
-    pub wal_ok: bool, pub wal_gaps: Vec<EvidenceGap> /* 已寫出但 TX WAL 失敗 */, pub reply_lost: bool, pub not_submitted: usize }
-#[derive(Debug, Clone, Default)] pub struct TxLedger { pub epoch: u64, pub ops: IndexMap<OpId, TxOpLedger> }
-#[derive(Clone)] pub struct TxWriterHandle { pub jobs: crossbeam_channel::Sender<TxJob> }    // bounded(64)；可被 OpCtx clone 持有
+    pub wal_ok: bool, pub wal_gaps: Vec<EvidenceGap> /* 已寫出但 TX WAL 失敗；≤ TX_OP_WAL_GAPS_MAX */, pub wal_gaps_overflow: GapOverflow,
+    pub reply_lost: bool, pub not_submitted: usize }
+#[derive(Debug, Clone, Default)] pub struct TxLedger { pub epoch: u64, pub ops: IndexMap<OpId, TxOpLedger> /* 只含未結算 op，≤ TX_LEDGER_LIVE_MAX */,
+    pub unresolved_gaps: VecDeque<EvidenceGap> /* 已結算 op 的 wal_gaps 移入此處，≤ TX_LEDGER_UNRESOLVED_GAPS_MAX，FIFO 合併 */,
+    pub gaps_overflow: GapOverflow /* 被合併的缺口計數與 bytes 總和（證據不靜默丟棄，規格 §5.4） */,
+    pub settled_total: u64, pub saturated: bool }
+/// writer thread 每次變更帳本後以 Release 寫入；供測試與 daemon status 診斷讀取（不經 writer thread）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)] pub struct TxLedgerGauge { pub live_ops: usize, pub unresolved_gaps: usize,
+    pub gaps_overflow: u64, pub settled_total: u64, pub settle_dropped: u64, pub saturated: bool }
+#[derive(Clone)] pub struct TxWriterHandle { pub jobs: crossbeam_channel::Sender<TxJob> /* bounded(64)；可被 OpCtx clone 持有 */,
+    settle: crossbeam_channel::Sender<OpId> /* bounded(TX_SETTLE_QUEUE_MAX) */, gauge: Arc<LedgerGaugeCells> }
+impl TxWriterHandle {
+    /// 非阻塞（actor executor 呼叫，不得阻塞 actor）：try_send；Full 時回 false 並 settle_dropped+=1——該 op 留在帳本
+    /// （過度保留、不失證據；最壞情況由 saturation 收斂），Disconnected（writer 已結束）回 false 且不計數。
+    pub fn settle(&self, op_id: OpId) -> bool;
+    pub fn ledger_gauge(&self) -> TxLedgerGauge;
+}
 pub struct TxWriterStop(crossbeam_channel::Sender<()>);     // 只有 IoWorker 持有；send 後 writer 不再接新 job
-pub fn spawn_tx_writer(com: String, writer: Box<dyn SerialWriter>, cancel: CancelToken, fence: Arc<Fence>, wal: Arc<WalWriter>, epoch: u64)
+pub fn spawn_tx_writer(com: String, writer: Box<dyn SerialWriter>, cancel: CancelToken, fence: Arc<Fence>, wal: Arc<WalWriter>, epoch: u64,
+                       control: crossbeam_channel::Sender<ControlEvent> /* saturation 通知；阻塞送（內部事件） */)
     -> (TxWriterHandle, TxWriterStop, std::thread::JoinHandle<(Box<dyn SerialWriter>, TxLedger)>);
-// 結束條件與 Sender 數量無關：收到 TxWriterStop（或所有 Sender drop）即結束；結束前把仍在 jobs 佇列的 job 逐一以
-// NotSubmitted＋Frozen 回報並記入帳本（不呼叫 OS write）。
+// 結束條件與 Sender 數量無關：收到 TxWriterStop（或所有 Sender drop）即結束；結束前先套用 settle 佇列中已到達的結算，
+// 再把仍在 jobs 佇列的 job 逐一以 NotSubmitted＋Frozen 回報並記入帳本（不呼叫 OS write）。
+//
+// 結算／退休協定（R1-F8，arch §5.7）：
+// (1) 只有 actor 能發起結算：SessionCore 在某 op 的**終態處理點**（命令紀錄已 registry.complete 或該 op 的完成事件已套用）
+//     產生 Effect::SettleTx{epoch, op_id}；executor 只在 epoch == 現行 worker epoch 時呼叫 worker.tx().settle(op_id)，
+//     否則丟棄（舊 epoch 的帳本會整本進 receipt，舊 op 若已終態，stale receipt 路徑本就不再碰它）。
+// (2) actor **不得**結算：stop.aborted_op（drain 進行中其 OpFinished 被忽略，結果只由 receipt 帳本決定）、任何尚未終態的 op。
+//     因此結算永遠不會移除 BC-03 仍需查詢的證據——不論 settle 與 TxWriterStop 誰先到達 writer。
+// (3) writer 單執行緒套用結算（select_biased：stop > settle > jobs），套用時該 op 不可能有 job 正在 write_gated；
+//     移除 ops[op_id]，其 wal_gaps／wal_gaps_overflow 移入 unresolved_gaps／gaps_overflow（不丟棄），reply_lost 隨之清除
+//     （actor 已拿到終態）；op 不在帳本（無 TX 或已結算）時為 no-op。結算後同 op 再到達的 job 屬協定違反：照常處理並重建項目，
+//     debug_assert 失敗、release build 記 WARNING（該項目留到 epoch 結束，計入 live 上限）。
+// (4) saturation：新 op_id 的 job 到達時若 ops.len() >= TX_LEDGER_LIVE_MAX，**不淘汰任何既有項目**：該 job 不呼叫 PAL，
+//     回 NotSubmitted＋Frozen 且不建立項目（缺項＝未提交，BC-03 映射正確）；第一次發生時設 saturated=true 並送
+//     ControlEvent::UartIoError{epoch, reason:"TX_LEDGER_SATURATED"}，actor 以既有 IoError drain 收斂（新 epoch 帳本歸零；
+//     不新增 error_code，last_error 依既有 IoError 規則）。既有 op 的後續 job 照常處理，在途證據不被截斷。
 ```
 
 - [ ] **Step 1：寫失敗測試**
 
 ```rust
 #![cfg(feature = "test-fakes")]
-use std::{sync::Arc, time::Duration};
-use sw_core::{tx_writer::*, wal::*};
+use std::{sync::{Arc, Mutex}, time::Duration};
+use sw_core::{mailbox::ControlEvent, tx_writer::*, wal::*};
 use sw_pal::{fakes::{clock::FakeClock, serial::*, wal_fs::FakeWalFs}, *};
 
 struct Rig { fence: Arc<Fence>, wal: Arc<WalWriter>, dev: FakeDevice, h: TxWriterHandle, wfs: Arc<FakeWalFs>, cancel: CancelToken,
-             stop: Option<TxWriterStop>, join: Option<std::thread::JoinHandle<(Box<dyn SerialWriter>, TxLedger)>> }
+             stop: Option<TxWriterStop>, join: Option<std::thread::JoinHandle<(Box<dyn SerialWriter>, TxLedger)>>,
+             ctl: Arc<Mutex<Vec<ControlEvent>>> /* drainer thread 收集 writer 送出的 control 事件，避免 bounded(256) 塞住 writer */ }
+fn wait_gauge(r: &Rig, pred: impl Fn(&TxLedgerGauge) -> bool) -> TxLedgerGauge {   // 每 2 ms 輪詢，2 s 未滿足即 panic 並印出最後 gauge
+    let t0 = std::time::Instant::now();
+    loop { let g = r.h.ledger_gauge(); if pred(&g) { return g } assert!(t0.elapsed() < Duration::from_secs(2), "gauge {g:?}"); std::thread::sleep(Duration::from_millis(2)); }
+}
 fn rig() -> Rig {
     let be = FakeSerialBackend::new(); let dev = be.add_device("/dev/f");
     let h = be.open_exclusive(&DevicePath("/dev/f".into()), &SerialConfig::from_uart_profile(115200, 8, "N", 1, "none", false)).unwrap();
@@ -1912,8 +1961,11 @@ fn rig() -> Rig {
     let wal = Arc::new(WalWriter::open(WalConfig { dir: "/w".into(), rotate_bytes: 1 << 26 }, wfs.clone(), FakeClock::at(1, 1)));
     let fence = Fence::new(); fence.with(|s| s.active_epoch = Some(7));
     let cancel = CancelToken::new(waker);
-    let (h, stop, j) = spawn_tx_writer("COM0".into(), w, cancel.clone(), fence.clone(), wal.clone(), 7);
-    Rig { fence, wal, dev, h, wfs, cancel, stop: Some(stop), join: Some(j) }
+    let (ctl_tx, ctl_rx) = crossbeam_channel::bounded::<ControlEvent>(256);
+    let ctl = Arc::new(Mutex::new(Vec::new()));
+    { let ctl = ctl.clone(); std::thread::spawn(move || for ev in ctl_rx.iter() { ctl.lock().unwrap().push(ev) }); }
+    let (h, stop, j) = spawn_tx_writer("COM0".into(), w, cancel.clone(), fence.clone(), wal.clone(), 7, ctl_tx);
+    Rig { fence, wal, dev, h, wfs, cancel, stop: Some(stop), join: Some(j), ctl }
 }
 fn send(r: &Rig, class: TxClass, op: u64, epoch: u64, payload: &[u8]) -> TxReport {
     let (tx, rx) = crossbeam_channel::bounded(1);
@@ -2074,6 +2126,53 @@ fn os_submit_always_inside_fence_critical_section() {
     assert!(r.dev.os_submits() >= 22);
     assert_eq!(unlocked.load(std::sync::atomic::Ordering::SeqCst), 0, "每次 OS 提交時 Fence 鎖必為持有");
 }
+
+#[test]
+fn ledger_retires_completed_ops_without_reconnect() {     // R1-F8：同一 epoch 長跑、不重連，已結算 op 不得累積
+    let mut r = rig();
+    for i in 0..600u64 {                                     // 超過 CMD_HISTORY_MAX(512)：history 淘汰後帳本也不得殘留
+        assert_eq!(send(&r, TxClass::Command, 1000 + i, 7, b"ok\n").result.outcome, TxOutcome::Completed(3));
+        assert!(r.h.settle(OpId(1000 + i)));                 // 等同 actor 終態處理點的 Effect::SettleTx
+    }
+    let g = wait_gauge(&r, |g| g.settled_total == 600);
+    assert_eq!((g.live_ops, g.unresolved_gaps, g.gaps_overflow, g.settle_dropped, g.saturated), (0, 0, 0, 0, false));
+    assert_eq!(send(&r, TxClass::Command, 5000, 7, b"tail").result.outcome, TxOutcome::Completed(4));   // 未結算 op
+    wait_gauge(&r, |g| g.live_ops == 1);
+    r.stop.as_ref().unwrap().send();
+    let (_w, ledger) = r.join.take().unwrap().join().unwrap();
+    assert_eq!(ledger.ops.keys().copied().collect::<Vec<_>>(), vec![OpId(5000)]);   // 只剩未結算者
+    assert_eq!((ledger.ops[&OpId(5000)].confirmed_bytes, ledger.settled_total), (4, 600));
+    assert!(ledger.unresolved_gaps.is_empty() && ledger.gaps_overflow == GapOverflow::default());
+    assert_eq!(tx_lens(&r).len(), 601);                      // 結算只動記憶體帳本，不動 WAL 證據
+}
+
+#[test]
+fn ledger_retire_racing_drain_preserves_bc03() {          // R1-F8：結算與 drain 競速時，在途 op 的 BC-03 證據不得被淘汰
+    for settle_after_stop in [false, true] {
+        let mut r = rig();
+        assert_eq!(send(&r, TxClass::Command, 1, 7, b"done\n").result.outcome, TxOutcome::Completed(5));   // 已終態的舊命令
+        r.dev.script_write(vec![FakeWriteStep::BlockUntilCancel { accept_before_cancel: 2 }]);
+        let rx2 = send_async(&r, TxClass::Command, 2, 0, b"abcdef");                                       // 前景在途＝aborted_op
+        let t0 = std::time::Instant::now();
+        while r.fence.with(|s| s.in_flight.as_ref().map(|f| f.op_id)) != Some(OpId(2)) {
+            assert!(t0.elapsed() < Duration::from_secs(2)); std::thread::sleep(Duration::from_millis(1));
+        }
+        if !settle_after_stop { assert!(r.h.settle(OpId(1))); }        // writer 卡在 op 2 的完成等待，settle 先排隊
+        r.fence.with(|s| { s.frozen = true; s.active_epoch = None; }); // drain Phase 1 線性化點
+        r.stop.as_ref().unwrap().send();
+        if settle_after_stop { let _ = r.h.settle(OpId(1)); }           // 可能被 stop 後的 settle 收尾套用，也可能 Disconnected
+        r.cancel.cancel();
+        assert_eq!(rx2.recv_timeout(Duration::from_secs(2)).unwrap().result.outcome, TxOutcome::Completed(2));
+        let queued = send_async(&r, TxClass::Command, 3, 0, b"zz");     // stop 後才到：不得寫 OS
+        let (_w, ledger) = r.join.take().unwrap().join().unwrap();
+        let op2 = &ledger.ops[&OpId(2)];                                // aborted_op 永不被結算，帳本必有其證據
+        assert_eq!((op2.confirmed_bytes, op2.unknown), (2, false), "settle_after_stop={settle_after_stop}");
+        if !settle_after_stop { assert!(!ledger.ops.contains_key(&OpId(1))); }   // stop 前已排隊的 settle 必在交帳前套用
+        if let Some(op1) = ledger.ops.get(&OpId(1)) { assert_eq!(op1.confirmed_bytes, 5); }   // 未套用時證據完整、不被部分改寫
+        if let Ok(rep) = queued.recv_timeout(Duration::from_millis(200)) { assert_eq!(rep.result.outcome, TxOutcome::NotSubmitted); }
+        assert_eq!(r.dev.take_tx(), b"done\nab".to_vec());              // 結算不改變任何已寫出／未寫出的事實
+    }
+}
 ```
 
 Gate 表（`gate_rules` 參數化測試；每列以 `Fence::admit(&state, &permit)` 斷言）：
@@ -2109,6 +2208,12 @@ Gate 表（`gate_rules` 參數化測試；每列以 `Fence::admit(&state, &permi
 | `ledger_records_partial_and_unknown` | op1 `AcceptThenError(3)`、op2 `Unknown` → `ledger.ops[op1].confirmed_bytes==3`、`ledger.ops[op2].unknown==true` |
 | `reply_receiver_gone_is_kept_in_ledger` | job 的 reply receiver 先 drop → writer 不 panic，`ledger.ops[op].reply_lost == true`，結果仍在帳本 |
 | `tx_wal_failure_reported_and_gap_listed` | `wfs.fail_next_writes(wal, 2, ENOSPC)` → `TxReport.wal == Some(WalAppend{ok:false, loss_flag:true, ..})`、`ledger.ops[op].wal_gaps.len()==1`（bytes 已寫出、WAL 未落盤） |
+| `settled_op_wal_gaps_move_to_unresolved_set`（R1-F8） | op 9 一個 job 遇 TX WAL 失敗（同上）後 `settle(OpId(9))` → `wait_gauge(live_ops==0 && unresolved_gaps==1)`；stop 後 `ledger.ops` 不含 op 9、`ledger.unresolved_gaps.len()==1` 且 `unresolved_gaps[0].op_id==Some(OpId(9))`、`len==` 該 job 確認 bytes（證據隨結算移轉，不丟棄） |
+| `unresolved_gaps_capped_with_overflow_summary`（R1-F8） | WAL 持續失敗下送 300 個 op（各 1 job、payload 2 bytes）並逐一 settle → `ledger.unresolved_gaps.len()==TX_LEDGER_UNRESOLVED_GAPS_MAX(256)`、保留的是最新 256 筆（`front().op_id==Some(第 45 個 op)`）、`gaps_overflow == GapOverflow{gaps:44, bytes:88, first_op:Some(第 1 個 op), last_op:Some(第 44 個 op)}`；gauge `gaps_overflow==44` |
+| `per_op_wal_gaps_capped`（R1-F8） | WAL 持續失敗下同一 op 送 40 個 job（各 1 byte）且不 settle → `ledger.ops[op].wal_gaps.len()==TX_OP_WAL_GAPS_MAX(16)`、`wal_gaps_overflow.gaps==24`、`wal_gaps_overflow.bytes==24`；`confirmed_bytes==40`（計數不受缺口合併影響） |
+| `ledger_saturation_never_evicts_live_ops`（R1-F8） | 送 256 個不同 op 各 1 job 且都不 settle → 第 257 個新 op 的 job 回 `NotSubmitted`＋`reject==Some(Frozen)`、`dev.write_calls()` 不增、`ledger` 無 op 257 項目；`r.ctl` 恰一個 `UartIoError{epoch:7, reason:"TX_LEDGER_SATURATED"}`（第 258 個新 op 不再重送）；op 1 再送一個 job 仍 `Completed`（既有 op 不受限）；stop 後 `ledger.ops.len()==256`、`ledger.saturated==true`，op 1～256 的 `confirmed_bytes` 全保留 |
+| `settle_unknown_or_already_settled_is_noop`（R1-F8） | `settle(OpId(77))`（無 TX）與對同一已結算 op 重複 settle → `live_ops`、`unresolved_gaps` 不變、不 panic；`settled_total` 只計實際移除的項目 |
+| `settle_queue_full_retains_entry`（R1-F8） | op 1 先完成（不 settle）；writer 卡在 op 99 的 `BlockUntilCancel{accept_before_cancel:1}` 時對 `OpId(1000+i)`（i∈0..256，帳本無此項）settle 256 次皆回 `true`，再 `settle(OpId(1))` 回 `false`、gauge `settle_dropped==1` → stop＋cancel 後 `ledger.ops` 仍含 op 1（`confirmed_bytes` 不變）與 op 99（`confirmed_bytes==1`）：佇列滿只造成過度保留，不失證據 |
 | `lease_owner_job_after_owner_gen_bump_rejected` | `LeaseOwner` permit `owner_gen=3`，送出前 `fence.with(|s| s.owner_gen = 4)`（lease close／expiry）→ `NotSubmitted`＋`OwnerMismatch`，`write_calls()` 不變 |
 | `interactive_open_cmd_after_owner_gen_bump_rejected` | 同上，class `InteractiveOpenCmd` |
 | `login_probe_after_fsm_gen_bump_rejected` | `LoginProbe` permit `fsm_gen=1`、fence `fsm_gen=2`（quiet re-arm）→ `FsmMismatch` |
@@ -2122,12 +2227,21 @@ Expected：FAIL，`not implemented: slice21 T9 spawn_tx_writer`。
 
 ```rust
 fn run(mut self) -> (Box<dyn SerialWriter>, TxLedger) {
-    let mut ledger = TxLedger { epoch: self.epoch, ops: IndexMap::new() };
+    let mut ledger = TxLedger { epoch: self.epoch, ..Default::default() };
     loop {
         let job = crossbeam_channel::select_biased! {
             recv(self.stop) -> _ => break,                                  // 與 Sender 數量無關（OpCtx 持有 clone 也能結束）
+            recv(self.settle) -> s => { if let Ok(op) = s { ledger.settle(op); self.publish_gauge(&ledger); } continue }   // R1-F8 結算
             recv(self.jobs) -> j => match j { Ok(j) => j, Err(_) => break },
         };
+        // R1-F8 saturation：新 op 且未結算項目已達上限 → 不淘汰既有項目、不呼叫 PAL、不建項目（缺項＝未提交）
+        if !ledger.ops.contains_key(&job.permit.op_id) && ledger.ops.len() >= TX_LEDGER_LIVE_MAX {
+            if !ledger.saturated { ledger.saturated = true;
+                let _ = self.control.send(ControlEvent::UartIoError { epoch: self.epoch, reason: "TX_LEDGER_SATURATED".into() }); }
+            let _ = job.reply.send(TxReport { op_id: job.permit.op_id, epoch: self.epoch,
+                result: TxResult { outcome: TxOutcome::NotSubmitted, error: None }, wal: None, reject: Some(FenceReject::Frozen) });
+            self.publish_gauge(&ledger); continue;
+        }
         // 出列快速拒絕（不呼叫 PAL）；通過**不是**授權——授權只發生在 PAL 每次 OS 提交的 FenceSubmitGate 臨界區（R0-F1）
         let pre = self.fence.with(|s| Fence::admit(s, &job.permit));
         let (result, reject) = match pre {
@@ -2145,17 +2259,45 @@ fn run(mut self) -> (Box<dyn SerialWriter>, TxLedger) {
             _ => None,
         };
         let e = ledger.ops.entry(job.permit.op_id).or_default();
-        e.record(&result, reject, wal.as_ref(), &job.payload);              // 累計 confirmed_bytes／unknown／last_error／wal_ok／wal_gaps／not_submitted
+        e.record(&result, reject, wal.as_ref(), &job.payload);              // 累計 confirmed_bytes／unknown／last_error／wal_ok；wal_gaps 超過 TX_OP_WAL_GAPS_MAX 合併進 wal_gaps_overflow；not_submitted
         if job.reply.send(TxReport { op_id: job.permit.op_id, epoch: self.epoch, result, wal, reject }).is_err() { e.reply_lost = true; }
+        self.publish_gauge(&ledger);
     }
+    for op in self.settle.try_iter() { ledger.settle(op); }                   // stop 前已到達的結算先套用（R1-F8；aborted_op 依協定不會在其中）
     for job in self.jobs.try_iter() {                                         // stop 後仍在佇列者：不寫 OS，回 NotSubmitted＋Frozen
-        let e = ledger.ops.entry(job.permit.op_id).or_default(); e.not_submitted += 1;
+        let known = ledger.ops.contains_key(&job.permit.op_id);
+        if known || ledger.ops.len() < TX_LEDGER_LIVE_MAX {                   // 滿載時新 op 不建項目（缺項＝未提交）
+            ledger.ops.entry(job.permit.op_id).or_default().not_submitted += 1;
+        }
         if job.reply.send(TxReport { op_id: job.permit.op_id, epoch: self.epoch,
-            result: TxResult { outcome: TxOutcome::NotSubmitted, error: None }, wal: None, reject: Some(FenceReject::Frozen) }).is_err() { e.reply_lost = true; }
+            result: TxResult { outcome: TxOutcome::NotSubmitted, error: None }, wal: None, reject: Some(FenceReject::Frozen) }).is_err() {
+            if let Some(e) = ledger.ops.get_mut(&job.permit.op_id) { e.reply_lost = true; }
+        }
     }
+    self.publish_gauge(&ledger);
     (self.writer, ledger)
 }
+
+impl TxLedger {
+    /// R1-F8 結算：移除未結算項目，證據缺口移入有界集合（FIFO，溢位合併最舊者進 gaps_overflow，不丟計數與 bytes）。
+    fn settle(&mut self, op: OpId) {
+        let Some(e) = self.ops.shift_remove(&op) else { return };            // 未知或已結算：no-op
+        self.settled_total += 1;
+        self.gaps_overflow.absorb(&e.wal_gaps_overflow);
+        for g in e.wal_gaps {
+            if self.unresolved_gaps.len() == TX_LEDGER_UNRESOLVED_GAPS_MAX {
+                let old = self.unresolved_gaps.pop_front().unwrap(); self.gaps_overflow.absorb_gap(&old);
+            }
+            self.unresolved_gaps.push_back(g);
+        }
+    }
+}
+// GapOverflow::absorb_gap：gaps+=1、bytes+=len、first_op 取最早、last_op 取最新；absorb 合併另一個 GapOverflow。
+// publish_gauge：把 ops.len()／unresolved_gaps.len()／gaps_overflow.gaps／settled_total／saturated 以 Release 寫入 LedgerGaugeCells
+// （settle_dropped 由 TxWriterHandle::settle 自行遞增）。
 ```
+
+帳本有界性（R1-F8，arch §5.7／§5.10）：`ops.len() ≤ TX_LEDGER_LIVE_MAX`、`unresolved_gaps.len() ≤ TX_LEDGER_UNRESOLVED_GAPS_MAX`、每個 op 的 `wal_gaps.len() ≤ TX_OP_WAL_GAPS_MAX`，因此一個 epoch 的帳本記憶體與該 epoch 送過多少 op 無關；長跑（48 h `lr-mixed` 不重連）下帳本對 RSS 斜率的貢獻為常數。
 
 `Fence::admit` 依 gate 表的檢查順序：`frozen` → `epoch` → `cancelled` → flash 規則 → class 規則（quiet → reconfirm → wal_unhealthy）→ 世代規則（`owner_gen`：`LeaseOwner`／`InteractiveOpenCmd`／`HumanRaw`／`HumanReplay`；`fsm_gen`：`LoginProbe`／`ReadyReconfirm`／`SelfTestProbe`）。drain 時 actor 在**同一把鎖**內設 `frozen=true`、`active_epoch=None`（Task 12），形成 arch §5.4 的線性化邊界。`FenceSubmitGate::submit`：`let mut st = fence.0.lock(); if let Err(r) = Fence::admit(&st, permit) { self.last_reject.set(Some(r)); return Err(SubmitRevoked) } let step = os_submit(); if matches!(step, SubmitStep::Accepted(n) if n > 0) || matches!(step, SubmitStep::Pending) { st.in_flight = Some(InFlight { op_id: permit.op_id, len }) } drop(st); Ok(step)`——`os_submit` 必須是非阻塞提交（Task 2 POSIX 單次 `write(2)`、Task 3 Windows `WriteFile` 發出），任何完成等待都不得放進閉包；code review 以 `grep -n "poll_out_or_wake\|GetOverlappedResult\|WaitForMultipleObjects" crates/sw-pal/src/serial/` 確認這些呼叫都不在 `gate.submit(` 閉包內。
 
@@ -2402,6 +2544,7 @@ pub enum Effect {
     Persist { commit_id: u64, delta: StateDelta },
     Notify(ManagerNote),
     Warn(String),                                       // daemon stderr WARNING（GAP-G-01 模板）
+    SettleTx { epoch: u64, op_id: OpId },               // R1-F8：op 終態處理點產生；executor 只對現行 worker epoch 呼叫 tx().settle（非阻塞），其他 epoch 丟棄
 }
 pub struct Effects(pub Vec<Effect>);
 pub struct OpGrant { pub op_id: OpId, pub epoch: u64, pub owner_gen: u64, pub fsm_gen: u64, pub cmd_id: Option<String> }
@@ -2598,7 +2741,7 @@ git commit -m "feat(sw-core): SessionActor 狀態機、世代隔離與有界 mai
 pub struct StopOp { pub id: StopId, pub kind: StopKind, pub epoch: u64, pub waiters: Vec<Reply>, pub started: Mono, pub stalled: bool,
                     pub aborted_op: Option<(OpId, String /*cmd_id*/)> /* Phase 1 當下的前景命令 */, pub post_kind: Option<StopKind> /* drain 中到達的 Removed／Rebound／IoError */ }
 #[derive(Debug, Clone)] pub struct EvidenceGap { pub op_id: Option<OpId>, pub dir: &'static str, pub len: usize, pub error: PalError }
-#[derive(Debug)] pub struct WorkerStoppedReceipt { pub epoch: u64, pub stop_id: StopId, pub ledger: TxLedger /* Task 9；BC-03 映射唯一來源 */,
+#[derive(Debug)] pub struct WorkerStoppedReceipt { pub epoch: u64, pub stop_id: StopId, pub ledger: TxLedger /* Task 9；BC-03 映射唯一來源；只含未結算 op，缺項＝未提交（R1-F8） */,
     pub unrecorded: Vec<EvidenceGap>, pub wal_error: Option<PalError>, pub handle_closed: bool, pub close_error: Option<PalError> }
 pub struct OpenedBridge { pub epoch: u64, pub worker: IoWorker, pub real_path: String }
 pub enum OpenFailure { Held(HolderReport), AccessDenied(HolderReport), NotFound, Other(PalError) }
@@ -2682,6 +2825,10 @@ fn drain_timeout_marks_stalled_and_late_receipt_completes() {
 | `cross_kind_request_during_drain_is_session_recovering` | Release drain 中收到 `Clear`／`Bind`／`Recover{force:false}` → 各自立即回 `{"ok":false,"error_code":"SESSION_RECOVERING","drain_stalled":<bool>,"drain_timeout_epoch":<…>,"session":…}`，不加入 release waiters（§5.2.5 去重只限同 kind） |
 | `internal_events_during_drain_recorded_as_post_kind` | Release drain 中收到 `DeviceDetached(Removed)` → 不另起 drain；receipt 後仍 `RELEASED`（Release 優先）；Recover drain 中收到 Removed → receipt 後 `DETACHED`＋`DEVICE_REMOVED`；`Shutdown` 一律加入 waiters |
 | `stale_receipt_after_reattach_keeps_evidence_only` | release 完成並 `DeviceAttach` 進新 epoch 後，**明確注入**一個舊 `epoch`／`stop_id` 的 receipt（帳本 op `confirmed_bytes:2`）→ 新 session state、fence、registry 中新命令皆不變；只對舊 op 的命令紀錄套 BC-03（若尚未終態）（Review Focus 1、§5.2.4） |
+| `settle_emitted_once_at_terminal_point`（R1-F8） | READY；命令 A `start_foreground_command` → 注入 `OpFinished{op_id:A, outcome: CommandResult(ok)}` → effects 恰一個 `Effect::SettleTx{epoch: conn_epoch, op_id: A}`，且排在 `registry.complete(A)` 之後（`registry.get(A).done_at` 已設）；同一 op 重送 `OpFinished`（重複事件）不再產生 `SettleTx`；`LoginFinished(Ready)` 對 login run 的 op 同樣恰一個 `SettleTx` |
+| `aborted_op_is_never_settled_during_drain`（R1-F8；與 T9 `ledger_retire_racing_drain_preserves_bc03` 成對） | 前景 B 進行中、已終態的 A 尚未處理其 `OpFinished`；`Release` → Phase 1（`aborted_op==B`）→ 依序注入 A 的 `OpFinished`、B 的 `OpFinished(CommandResult)` → effects 含 `SettleTx{op_id:A}`、**不含**任何 `SettleTx{op_id:B}`；receipt 以兩種帳本各跑一次（`B:confirmed 3`＋A 缺項〔settle 已套用〕；`B:confirmed 3`＋`A:confirmed 5`〔settle 被 executor 因 worker 已交 finisher 而丟棄〕）→ 兩次皆 B `COMMAND_ABORTED_IN_FLIGHT`＋`command_aborted_in_flight` META（`confirmed_tx_bytes:3`）、A 維持其原終態不被改寫（已終態者不再套 BC-03）；receipt 之後仍無 `SettleTx{B}`（該 epoch 已結束，帳本隨 receipt 丟棄） |
+| `missing_ledger_entry_maps_to_flushed`（R1-F8） | 前景命令 C 的 receipt 帳本無 C 項目（saturation 下未建項目，或從未提交）且 `aborted_op==C` → `FLUSHED_BY_RECOVERY`（等同 `confirmed_bytes:0, unknown:false`），無 `command_aborted_in_flight` META |
+| `tx_ledger_saturated_drains_as_io_error`（R1-F8） | READY＋`UartIoError{epoch: conn_epoch, reason:"TX_LEDGER_SATURATED"}` → 與 `SERIAL_READ:5` 相同的 IoError drain 路徑（RECOVERING → receipt → 裝置在 → `ATTACHING`＋`OpenBridge`），`Effect::Warn` 一則含 `TX_LEDGER_SATURATED`；無新 `error_code` |
 | `wal_gap_lists_unrecorded_and_still_completes` | receipt `unrecorded` 非空、`handle_closed:true` → release 完成；stderr WARNING 含 `未落盤`；`health().healthy` 由 WalWriter 自身決定（本列不另改） |
 | `close_failure_keeps_recovering_and_no_success` | receipt `handle_closed:false` → state `RECOVERING`、`drain_stalled:true`、release waiter 收 `SESSION_RECOVERING`；`DeviceAttached` 不觸發 open |
 | `release_commit_failure_is_exception_but_memory_released` | `state_store.fail_next_commit(EIO)` → reply `Err(PyErr)`（framing 轉 `EXCEPTION`），state `RELEASED`，`DeviceAttached` 不觸發 open（RPC-H-11、§6.2「提交失敗時不得回覆成功，維持禁止自動 attach」） |
@@ -2712,6 +2859,7 @@ fn drain_timeout_marks_stalled_and_late_receipt_completes() {
 | `blocked_forever_writer_never_sends_receipt` | `BlockForever` → 3 s 內無 receipt（finisher 不設逾時；逾時由 actor 的 DrainTimeout 處理）；`release_block()` 後收到 |
 | `wal_unwritable_during_drain_lists_gap` | drain 期間 `fail_next_writes(wal, ∞)` → receipt `handle_closed:true`、`unrecorded` 非空 |
 | `close_failure_in_receipt` | `fail_close(e)` → receipt `handle_closed:false`、`close_error` 有值 |
+| `receipt_ledger_holds_only_unsettled_ops`（R1-F8） | 經 `worker.tx()` 送 op 1～600 各 1 job 並逐一 `worker.tx().settle(op)`，op 601 送 1 job 不 settle；其中 op 3 的 TX WAL 失敗（`fail_next_writes(wal, 2, ENOSPC)`）→ `begin_stop`＋`finish_async` → receipt `ledger.ops` 鍵集合 `== {601}`、`ledger.settled_total==600`、`unrecorded` 恰含一筆 `op_id==Some(OpId(3))` 的缺口（已結算 op 的證據缺口仍隨 receipt 交回） |
 
 - [ ] **Step 2：執行並確認 FAIL**
 
@@ -2749,8 +2897,9 @@ fn begin_stop(&mut self, kind: StopKind, waiter: Option<Reply>, now: Mono) -> Ef
 }
 ```
 
-- executor 的 `BeginDrain`：`worker.begin_stop()` 後 `worker.finish_async(stop_id, control)`；finisher thread（不設逾時）：join writer thread 取得 `(writer, TxLedger)` → join reader thread 取得 `ReaderExit` → WAL 失敗彙整為 `unrecorded` → `CloseToken::close(reader, writer)` → 送 `WorkerStopped(receipt{ledger, ..})`。`TxWriter` 結束不依賴 Sender 數量（Task 9 `TxWriterStop`）。
+- executor 的 `BeginDrain`：`worker.begin_stop()` 後 `worker.finish_async(stop_id, control)`；finisher thread（不設逾時）：join writer thread 取得 `(writer, TxLedger)` → join reader thread 取得 `ReaderExit` → WAL 失敗彙整為 `unrecorded`（reader 缺口＋`ledger.unresolved_gaps`＋仍在 `ledger.ops` 的各 op `wal_gaps`；合併計數留在 `ledger.gaps_overflow` 與各 op `wal_gaps_overflow`，隨 receipt 交回，R1-F8）→ `CloseToken::close(reader, writer)` → 送 `WorkerStopped(receipt{ledger, ..})`。`TxWriter` 結束不依賴 Sender 數量（Task 9 `TxWriterStop`）。
 - `OpFinished` 優先序：`stop` 進行中且 `OpFinished.epoch == stop.epoch` 且 op 為 `stop.aborted_op` → 不呼叫 `registry.complete`（保留 stdout 於 debug log），最終結果只由 receipt 帳本決定；其他 op 照常處理。
+- TX 帳本結算（R1-F8，Task 9 結算／退休協定）：`SessionCore::settle_tx(op_id, fx)` 是唯一產生 `Effect::SettleTx{epoch: conn_epoch, op_id}` 的地方，每個 op 恰呼叫一次，位置是該 op 的終態處理點且在 `registry.complete` 之後——`OpFinished`（非 aborted_op 時）、`LoginFinished`（login run 的 op）、lease close／expiry（`LeaseOwner`／`InteractiveOpenCmd` op）、self-test 的 `OpFinished(SelfTest)`；`stop.aborted_op` 與尚未終態的 op 一律不結算（其證據只隨 receipt 帳本交回）。`conn_epoch` 為 None 時不產生。executor：`SettleTx.epoch` 等於現行 worker epoch 才呼叫 `worker.tx().settle(op_id)`（非阻塞），否則丟棄。`UartIoError{reason:"TX_LEDGER_SATURATED"}` 走既有 IoError drain，另發 `Effect::Warn("session <sid> TX 帳本未結算 op 達 256 上限，以 IoError drain 收斂（R1-F8）")`。後續 Phase 新增 op 種類（07 human TX、08 reprobe／reconfirm、09 transfer／flash）須在各自終態處理點呼叫 `settle_tx`。
 - 收到 receipt：`epoch`／`stop_id` 不符 → 只對帳本中仍未終態的舊 op 命令紀錄套 BC-03，不改狀態；相符且 `handle_closed` → 對 `aborted_op` 依帳本 `registry.complete(cmd, CmdOutcome::Aborted(class))`（`confirmed_bytes ≥ 1`→InFlight、`0` 且非 unknown→NotSubmitted、`unknown`→Unknown），InFlight 另產生 `Effect::WalMeta{cmd_id, meta:{"event":"command_aborted_in_flight","confirmed_tx_bytes":N,"tx_outcome":"complete"|"partial"}}`（`complete`＝確認 bytes 等於 payload 長度；P1 T08）→ `conn_epoch=None`、`queue_registered=false`、`Notify(SessionDetached)` → 依 kind（`post_kind` 只在 kind 非 Release 時覆寫裝置存在判斷）：Release → `Persist{delta: StateDelta::Released{sid, row: ReleasedRow{by_id, released_by, released_at, reason}}}`，等 `StateCommitted` 成功才 `RELEASED` 並回覆所有 waiters；失敗 → 狀態仍設 `RELEASED`、waiters 收 `Err(PyErr("state.json commit failed: …"))`；Recover／IoError → 裝置在 `ATTACHING`＋`OpenBridge`，否則 `DETACHED`；Removed → `DETACHED`、`last_error:"DEVICE_REMOVED"`；Rebound → `last_error:"DEVICE_REBOUND_REQUIRED"` 後 `OpenBridge`（Task 16）；Shutdown → 回覆 waiter。`handle_closed:false` → `stalled=true`、維持 RECOVERING、waiters 收 SC-04 形狀。收尾時 `drain_stalled=false`，`drain_timeout_epoch` 保留最後一次逾時值（P1 T08 凍結）。
 - `DrainTimeout` 且 StopOp 未完成：`stalled=true`、對外 `drain_stalled:true`、`drain_timeout_epoch=bridge_generation`；Release 的 waiters 收 `{"ok":false,"error_code":"SESSION_RECOVERING","drain_stalled":true,"drain_timeout_epoch":N,"session":…}`（waiters 清空，之後遲到回條照樣完成 release）。
 - Release 回應 `closed_consoles` = 進入 Phase 1 時的 console 數（Python `len(bridge.list_consoles())`；2.1 POSIX 哨兵 = 1、Windows 0）、`aborted_cmd` = 進入 Phase 1 時前景是否忙。收尾時 `last_error` 依 kind 設定（05 §3.1）：Release→`RELEASED`、Clear→`CLEARED`、Bind→`REBOUND`、Removed→`DEVICE_REMOVED`、Rebound→`DEVICE_REBOUND_REQUIRED`、IoError→裝置仍在時覆寫為 `null`（T20）。
@@ -2759,7 +2908,7 @@ fn begin_stop(&mut self, kind: StopKind, waiter: Option<Reply>, now: Mono) -> Ef
 - [ ] **Step 4：執行並確認 PASS**
 
 Run：`cargo test -p sw-core --features test-fakes --test drain_release --test io_worker`
-Expected：PASS（`drain_release` 31 項：2 個程式碼案例＋29 列；`io_worker` 5 項）。
+Expected：PASS（`drain_release` 36 項：2 個程式碼案例＋34 列，含 R1-F8 四列；`io_worker` 6 項）。
 
 - [ ] **Step 5：Commit**
 
@@ -3051,6 +3200,7 @@ fn submit_during_agent_lease_is_rejected_at_execute_time() {
 | `reboot_prompt_returns_quickly_ok_not_partial` | `reboot` 後 `min(timeout, 2 s)` 內 prompt 回來 → `{"ok":true,"partial":false,…}`、quiet 清除但 `ready_reconfirm_pending:true` 保留（#162） |
 | `reboot_flushes_commands_queued_behind_it` | `reboot` 後排隊的 2 筆 → `FLUSHED_BY_RECOVERY`，queue 解除註冊（`queue_registered:false`）直到重新 READY |
 | `recover_keys_wal_source_system_recover` | 救援送出的 `\x03`／`\x04` 的 TX WAL `source == "system:recover"`；ensure_ready 的密碼 TX 為 `source:"system:secret"` 且 `log=false`（WAL 無該行）；self-test probe TX 為 `source:"system:self_test"` |
+| `tx_ledger_bounded_over_long_session_without_reconnect`（R1-F8；`ActorRig` 新增 accessor `tx_ledger_gauge() -> TxLedgerGauge`，讀現行 worker 的 `tx().ledger_gauge()`） | `ActorRig::new(SHELL).ready()` 後同一 epoch 依序 `submit_ok`＋`wait_done` 700 筆 `echo i`（> history 512），其間穿插 20 次 `InteractiveOpen`／`InteractiveSend`／`InteractiveClose`、5 次 `SelfTest`、1 次 `\x03` 救援路徑（`recover_keys_wal_source_system_recover` 的觸發法）→ 全程 `conn_epoch` 不變（未重連）；結束後 `wait` 至 `tx_ledger_gauge().live_ops == 0`（2 s 內），且全程取樣的 `live_ops` 最大值 ≤ 2、`saturated == false`、`settle_dropped == 0`——任一終態處理點漏呼叫 `settle_tx` 都會使本測試失敗 |
 
 `lease_selftest.rs`：
 
@@ -3437,7 +3587,12 @@ impl SessionManager {
     pub fn attached_real_paths(&self) -> Vec<String>;
     pub fn flash_candidates(&self) -> Vec<PyDict>;                           // mcu.status 用（02 §7.2）
     pub fn watcher_sender(&self) -> crossbeam_channel::Sender<WatcherEvent>;   // DeviceWatcher → manager（Delta 轉 update_devices、Tick 轉 on_tick）
-    pub fn shutdown(&self, budget: Duration) -> Vec<(String, bool /* drained */)>;
+    /// SC-11 stopping gate（R1-F2）：持 manager 鎖設 `stopping=true`，冪等。之後 `update_devices`／`WatcherEvent::{Delta,Tick}` 觸發的 attach／reattach、
+    /// `ManagerNote::RequestAttach`、`bootstrap_attach`、`bind`／`clear`／`recover`／`device.attach` 的重開一律**不**呼叫 `SerialOpener::open`、不建立 session 或 worker
+    /// （自動路徑只記 log `shutdown 中，略過 attach <by_id>`；RPC 路徑回 `Err(PyErr("daemon stopping"))`，framing 轉 `EXCEPTION`）。
+    /// gate 設下時已在 inflight set 中、已越過 gate 檢查的 attach worker 不中斷，由 `shutdown` 一併納入 drain 集合（open 尚未返回者等它返回後立即 Phase 1，零 TX）。
+    pub fn begin_shutdown(&self);
+    pub fn shutdown(&self, budget: Duration) -> Vec<(String, bool /* drained */)>;   // 先隱含呼叫 begin_shutdown；drain 集合＝所有有 bridge 的 session ∪ inflight attach
 }
 ```
 
@@ -3498,6 +3653,8 @@ fn rebind_drains_before_reopen() {                                  // Review Fo
 | `alias_set_persists_but_not_applied_after_restart` | `alias_set("t:COM0","x")` → `alias.list` 含 x、重建 manager 後 `resolve("x") == None`（WAL-D15 KEEP） |
 | `alias_unassign_saves_before_check` | 不存在 → `ALIAS_NOT_FOUND`，但 state.json 已重寫一次 |
 | `shutdown_budget_5s` | 一個 session writer `BlockForever` → `shutdown(5s)` 於 5 s（FakeClock）內返回，該 session `drained:false`，其他 `true` |
+| `begin_shutdown_blocks_hotplug_open`（R1-F2，修正前必 FAIL） | READY 的 COM0 之外，`begin_shutdown()` 後經 `watcher_sender()` 送 `Delta{added:["/s/by-id/usb-NEW"]}`、再呼叫 `bootstrap_attach()` 與 `recover("COM0")` → `FakeSerial.open_calls("/s/by-id/usb-NEW") == 0`、COM0 無新 open；`counts().0` 不變（未建動態 session）；`recover` 回 `Err` 且訊息 `daemon stopping`；log 恰含 `shutdown 中，略過 attach /s/by-id/usb-NEW` |
+| `shutdown_includes_inflight_attach`（R1-F2） | 熱插 `/s/by-id/usb-NEW` 使 attach worker 卡在 `FakeSerial::block_open`（已越過 gate）→ 呼叫 `shutdown(5s)` 後放行 open → 回傳清單含該新 session 且 `drained:true`；該 handle `close_count()==1`、FakeTarget 收到 0 bytes（無登入 probe TX）；`shutdown` 返回後不再有任何 open |
 | `released_survives_two_restarts_dynamic` | 動態 session release → 以同一 `state.json` 重建 manager 兩次 → 兩次都 `RELEASED`、`DeviceAttached` 不 open（DF-04；原列於 Task 12，需 StateModel＋manager 故移至此） |
 | `interactive_routes_by_id_without_selector` | `interactive_open` 回 id 後，`route_interactive(id, InteractiveStatus)` 不帶 selector 即到達正確 session；未知 id → `INTERACTIVE_NOT_FOUND`；session drain 後索引移除 |
 | `fanout_registers_every_session_fence` | 建立 3 個 session 後 WAL 轉 unhealthy → 三個 fence 皆 `wal_unhealthy`；熱插第 4 個 → 建立即 `wal_unhealthy == true` |
@@ -3510,7 +3667,7 @@ Expected：FAIL，`not implemented: slice21 T16 SessionManager::new`。
 
 - [ ] **Step 3：實作**
 
-依 05 §2、§14 與 07 §1.5：`prepare_dynamic_rank` 在 manager 鎖內；`device_sort_key` 回 `(by_id, by_path.unwrap_or(""))`（`DeviceInfo` 無 by_path，故第二欄恆空，與 Python 同）；`update_devices` 計算 added／removed／changed，removed → actor `DeviceDetached(Removed)`、changed → `DeviceDetached(Rebound)`（actor 收到回條後才以新 real_path `OpenBridge`）、added → `DeviceAttached`（或建立動態 session）；attach worker per by_id 去重（inflight set）。detect 用 `UartProfile` 預設值開 PROBE handle，`com="PROBE"`，`detect_template` 照 05 §8.3（`sleep(3.0)` 用 `Clock`）；PROBE handle 經 `CloseToken::close` 取得 `closed:true` 後才開正式 handle。管理操作的 `state.json` 寫入都經 `StateModel::apply` → `StateStore::commit_sync`（alias／pin／bind 為同步，失敗回 `Err(PyErr)`）。
+依 05 §2、§14 與 07 §1.5：`prepare_dynamic_rank` 在 manager 鎖內；`device_sort_key` 回 `(by_id, by_path.unwrap_or(""))`（`DeviceInfo` 無 by_path，故第二欄恆空，與 Python 同）；`update_devices` 計算 added／removed／changed，removed → actor `DeviceDetached(Removed)`、changed → `DeviceDetached(Rebound)`（actor 收到回條後才以新 real_path `OpenBridge`）、added → `DeviceAttached`（或建立動態 session）；attach worker per by_id 去重（inflight set）。`begin_shutdown` 與 inflight set 共用 manager 鎖：每個 attach worker 在呼叫 `SerialOpener::open` 前持鎖檢查 `stopping`（為真即放棄、自 inflight 移除），`shutdown` 持鎖取「有 bridge 的 session ∪ inflight」為 drain 集合，故不存在「已越過 gate 卻不在 drain 集合」的 worker（R1-F2）。detect 用 `UartProfile` 預設值開 PROBE handle，`com="PROBE"`，`detect_template` 照 05 §8.3（`sleep(3.0)` 用 `Clock`）；PROBE handle 經 `CloseToken::close` 取得 `closed:true` 後才開正式 handle。管理操作的 `state.json` 寫入都經 `StateModel::apply` → `StateStore::commit_sync`（alias／pin／bind 為同步，失敗回 `Err(PyErr)`）。
 
 - [ ] **Step 4：執行並確認 PASS**
 
@@ -3792,7 +3949,7 @@ git commit -m "feat(sw-daemon): RPC 平面分派、參數轉型與 health.status
 ## Task 19：sw-daemon daemon_main（啟動順序、有序關機、exit code）
 
 **Test author model:** haiku-xhigh　**Implementer model:** codex-gpt-6-luna-max
-**Changelog fragment:** `changelog.d/rust-s21-daemon-main.md`（front matter `type: feat`、`scope: rust-s21`；本文：「Rust serialwrapd：Python 相同的參數、路徑 env 與 exit code（0/1/2/3）；啟動時先掃描、排定 COM、bootstrap attach 再啟 watcher（DF-14）；RPC 綁定後寫 config.yaml 的 socket_path（SC-09 寫入路徑）；關機先停 server、停 watcher、drain 全部 session、WAL sync 再釋放鎖（SC-11），未收斂時以 exit 1 與診斷回報；OD-11 allowlist 僅允許隔離實例。」）
+**Changelog fragment:** `changelog.d/rust-s21-daemon-main.md`（front matter `type: feat`、`scope: rust-s21`；本文：「Rust serialwrapd：Python 相同的參數、路徑 env 與 exit code（0/1/2/3）；啟動時先掃描、排定 COM、bootstrap attach 再啟 watcher（DF-14）；RPC 綁定後寫 config.yaml 的 socket_path（SC-09 寫入路徑）；關機先停 server、設 manager stopping gate、停 watcher、drain 全部 session（含在途 attach）、WAL sync 再釋放鎖（SC-11），未收斂時以 exit 1 與診斷回報；OD-11 allowlist 僅允許隔離實例。」）
 **BLOCKED-OWNER：** (1) systemd-user／systemd-system 監管下以 Rust `serialwrapd` 啟停的實機驗證（L3 P0）；(2) Windows `windows-task` 監管下啟動 Rust daemon（Spike 2）。
 
 **Files:**
@@ -3865,7 +4022,7 @@ fn unreadable_state_json_exits_3_and_releases_lock() {
 | `endpoint_written_after_bind` | 啟動後 `$SERIALWRAP_CONFIG_DIR/config.yaml` 為 `socket_path: <socket>\n`（加上既有 key，PyYAML `safe_dump` 排序）；config 目錄唯讀 → stderr `serialwrapd: 寫入 config.yaml endpoint 失敗（非致命）: <msg>` 且 daemon 存活 |
 | `serialwrap_config_env_read_and_write_target` | 設 `SERIALWRAP_CONFIG=<tmp>/alt.yaml`（含 `windows: {exclude_coms: [COM3]}`）→ daemon 讀此檔（exclude 生效）、endpoint 寫入此檔、`CONFIG_DIR/config.yaml` 未被建立；未設時讀 `CONFIG_DIR` → 系統檔 fallback（唯讀，永不寫入系統檔；P1 T15） |
 | `startup_order_scan_rank_watch` | in-process `run_with_hooks`（FakeDeviceSource 預置 3 個 by-id）：trace 序列前段恰為 `[InitialScan, Rank, UpdateDevices, BootstrapAttach, WatcherStart, Bound, EndpointWritten]`（DF-14；與 P1 `test_service_start_scans_before_watcher_thread` 的 `scan_once → prepare_dynamic_rank → update_devices → bootstrap_attach → watcher.start` 相同）；COM 依 by-id 排序 |
-| `sigterm_graceful_exit_0_and_flushes_queue` | in-process：READY、前景命令 `BlockUntilCancel`、另排隊 2 筆 → 送 stop → trace 後段恰為 `[ServerStopped, WatcherStopped, SessionsDrained{flushed: [(c2,"FLUSHED_BY_SHUTDOWN"),(c3,"FLUSHED_BY_SHUTDOWN")], stalled: []}, WalShutdown{ok:true}, LockReleased]`，`run_with_hooks` 回 0 |
+| `sigterm_graceful_exit_0_and_flushes_queue` | in-process：READY、前景命令 `BlockUntilCancel`、另排隊 2 筆 → 送 stop → trace 後段恰為 `[ServerStopped, ShutdownGate, WatcherStopped, SessionsDrained{flushed: [(c2,"FLUSHED_BY_SHUTDOWN"),(c3,"FLUSHED_BY_SHUTDOWN")], stalled: []}, WalShutdown{ok:true}, LockReleased]`，`run_with_hooks` 回 0 |
 | `real_sigterm_to_started_daemon_exits_0_after_flush` | 實際行程（watcher、actor、RPC、StateStore thread 都已啟動、session READY、有排隊命令）收 `SIGTERM` → exit 0；之後讀 WAL 最後一筆紀錄完整、`FLUSHED_BY_SHUTDOWN` 已寫入 command 紀錄（以停機前最後一次 `command.get` 輪詢驗證）、lock 可被新 daemon 取得 |
 | `shutdown_with_stalled_drain_exits_1_with_diagnostic` | in-process：一個 session writer `BlockForever` → stop → `SessionsDrained{stalled:["t:COM0"]}`，stderr 含 `serialwrapd: shutdown incomplete: drain stalled: t:COM0`，`run_with_hooks` 回 1（不宣告 graceful success）；WAL 仍 sync＋close、lock 仍釋放（行程結束時 kernel 關閉殘留 fd） |
 | `shutdown_wal_sync_failure_exits_1` | WAL `sync` 失敗 → stderr `serialwrapd: shutdown incomplete: WAL sync failed: <py_message>`、回 1 |
@@ -3973,6 +4130,7 @@ fn run_inner(argv: Vec<String>, p: sw_pal::Platform, hooks: &Hooks) -> i32 {
     p.signals.wait_stop(stop_rx);
     let mut incomplete: Vec<String> = Vec::new();
     if !server.stop(Duration::from_secs(10)) { incomplete.push("rpc handlers did not converge".into()); }   // SC-11 ① 停 server（等進行中的 handler 回應）
+    manager.begin_shutdown();                                                                   // ①b stopping gate（R1-F2）：之後熱插／bootstrap／recover 不再 open，channel 殘留 Delta 被丟棄
     watcher.stop();                                                                             // ② 停 watcher（P1：drain 前，避免 drain 中觸發 attach）
     let drained = manager.shutdown(Duration::from_secs(5));                                     // ③ drain 全部 session、FLUSHED_BY_SHUTDOWN
     let stalled: Vec<String> = drained.iter().filter(|(_, ok)| !ok).map(|(s, _)| s.clone()).collect();
@@ -3983,7 +4141,7 @@ fn run_inner(argv: Vec<String>, p: sw_pal::Platform, hooks: &Hooks) -> i32 {
 }
 ```
 
-- `main.rs`：第一個動作 `let p = sw_pal::native(); if let Err(e) = p.signals.install() { eprintln!("{}", e.py_message); exit(1) }`（在建立任何 thread 之前，Task 4）；`std::panic::set_hook` **只**把 panic 訊息與位置寫到 stderr（不呼叫 `exit`，讓 framing／actor／reader 的 `catch_unwind` 能產生 `EXCEPTION` 或 WARNING）；整個 `daemon_main::run` 以 `std::panic::catch_unwind` 包住，未被攔截的 panic → `exit(1)`（arch §6.1「只有未攔截的 panic exit 1」）。先依 P4 launcher 判斷 manifest：`implementation == "python"` → launcher 既有路徑；`"rust"` 或無 manifest（開發 build）→ `daemon_main::run(std::env::args().collect(), p)`。各工作 thread 的 panic 隔離：RX chunk（Task 10）、actor 事件（Task 11）、watcher tick（Task 5，WARNING `device watcher tick 例外，略過本輪`）、RPC handler（Task 17）。
+- `main.rs`：第一個動作 `let p = sw_pal::native(); if let Err(e) = p.signals.install() { eprintln!("{}", e.py_message); exit(1) }`（在建立任何 thread 之前，Task 4）；`std::panic::set_hook` **只**把 panic 訊息與位置寫到 stderr（不呼叫 `exit`，讓 framing／actor／reader 的 `catch_unwind` 能產生 `EXCEPTION` 或 WARNING）；整個 `daemon_main::run` 以 `std::panic::catch_unwind` 包住，未被攔截的 panic → `exit(1)`（arch §6.1「未攔截的 panic：exit 1」；停機未收斂的 exit 1 由 `run` 本身回傳，見下方停機規則）。先依 P4 launcher 判斷 manifest：`implementation == "python"` → launcher 既有路徑；`"rust"` 或無 manifest（開發 build）→ `daemon_main::run(std::env::args().collect(), p)`。各工作 thread 的 panic 隔離：RX chunk（Task 10）、actor 事件（Task 11）、watcher tick（Task 5，WARNING `device watcher tick 例外，略過本輪`）、RPC handler（Task 17）。
 - `resolve_test_allowlist`（SC-19，P1 T13 規格 1～3 逐字）：env `SERIALWRAP_TEST_DEVICE_ALLOWLIST`（逗號分隔、strip、去空）優先（`source:"env"`），否則 `config.yaml windows.test_device_allowlist`（`source:"config"`；`windows_test_device_allowlist()` 回 `Err(())` → `rejected_reason="invalid windows.test_device_allowlist"`）；皆無 → `enabled:false, source:"none"`；啟用時依 STATE、RUN、CONFIG 順序檢查隔離：未設（strip 後空）→ `"not an isolated instance: <VAR> unset"`，`normcase(abspath(expanduser(v)))` 等於預設 → `"not an isolated instance: <VAR> equals default"`，回報第一個違規。
 - `spawn_state_store(&paths, &p, hooks)`：`hooks` 兩個 commit hook 皆 None 時呼叫 `StateStore::spawn`；`test-fakes` 下 `run_with_hooks` 傳入的 `before_state_commit`／`after_state_commit` 經 `StateStore::spawn_with_hooks` 交給 store thread。trace 事件在 `run_inner` 對應位置以 `hooks.trace(...)` 送出（產品為 no-op）。
 - logging：`Effect::Warn` 與 PAL WARNING 一律以 `%(message)s` 格式寫 stderr（GAP-G-01）。

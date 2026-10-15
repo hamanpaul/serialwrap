@@ -1725,7 +1725,7 @@ scope: tests
 
 **Interfaces:**
 - Consumes：盤點 02 §1、§5、§6、§7；03 §4；T3 目錄（C15）；`tests/test_daemon_service_selector.py` 的 service 測試替身。
-- Produces：P3 `sw_proto::rpc_types::Method`（54 個 variant＋`Unknown(String)`）、`Method::is_retryable_readonly()`、`Method::uses_long_timeout()`；P5 framing 與 `SessionPublic::to_public` 欄位順序；`contracts/golden/rpc/line_limit.json`（P5 `06-slice21-daemon-core.md` 讀 `{"max_ok_bytes","first_close_bytes"}`，RPC-H-02）；`tests/contract_blackbox/` 的回應驗證。
+- Produces：P3 `sw_proto::rpc_types::Method`（54 個基線 variant＋SC-11 `x-pending` 的 `daemon.handoff_stop`＝55 個，＋`Unknown(String)`）、`Method::is_retryable_readonly()`、`Method::uses_long_timeout()`；P5 framing 與 `SessionPublic::to_public` 欄位順序；`contracts/golden/rpc/line_limit.json`（P5 `06-slice21-daemon-core.md` 讀 `{"max_ok_bytes","first_close_bytes"}`，RPC-H-02）；`tests/contract_blackbox/` 的回應驗證。
 
 **`contracts/golden/` 目錄慣例（本 Phase 建立，後續 Phase 沿用）：** `contracts/golden/<領域>/<名稱>.{json,ndjson}`；每個 golden 由 `scripts/stage0/capture_*.py`（或各 Phase 指定的 capture 腳本）對真實 Python 基線產生，檔內含 `"captured_by"`（腳本相對路徑）與 `"source"`（被量測的程式位置）；以 `DISK_STABLE`（`ensure_ascii=False, sort_keys=True, separators=(",",":")`＋`\n`）序列化；golden 不得手改，重新擷取須在 commit body 寫明原因與差異。golden 檔屬 `contracts/**`，改動需獨立審閱（§10.4）。
 
@@ -1775,15 +1775,25 @@ scope: tests
      "position": "after multi_open_detail；未啟用時不輸出此鍵",
      "env": "SERIALWRAP_TEST_DEVICE_ALLOWLIST（逗號分隔）", "config": "windows.test_device_allowlist", "precedence": "env > config",
      "isolation": "SERIALWRAP_STATE_DIR、SERIALWRAP_RUN_DIR、SERIALWRAP_CONFIG_DIR 三者皆明確設定且解析後都不等於預設路徑",
-     "refusal": {"stderr": "serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED: <reason>\n", "exit": 2}}
+     "refusal": {"stderr": "serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED: <reason>\n", "exit": 2}},
+    {"id": "SC-11-handoff", "change": "SC-11", "adds_method": "daemon.handoff_stop",
+     "params": {"reason": {"type": "string", "x-coercion": "str(params.get(k) or D)", "default": "update"}},
+     "result": {"ok": {"const": true}, "stopping": {"const": true}, "handoff_token": {"type": "string", "pattern": "^[0-9a-f]{32}$"}},
+     "errors": ["FLASHING_BUSY", "SESSION_BUSY"], "error_order": ["FLASHING_BUSY", "SESSION_BUSY"],
+     "busy_row": ["com", "state", "foreground_busy", "outstanding_commands", "interactive_session_id", "recovering", "ops"],
+     "atomicity": "busy 判定、凍結所有新的有副作用操作與發 token 在 daemon 共同 admission 邊界的同一臨界區完成；busy 時不凍結、不停止；ok 時回應寫出後走 daemon.stop 同一 SC-11 停止路徑",
+     "frozen_rejection": {"error_code": "FLUSHED_BY_SHUTDOWN", "reason": "handoff_frozen", "applies_to": "side_effects 非空且 retryable_readonly == false 的方法＋ttyMCU sync-probe（端點沉默）"},
+     "version_absent": true, "retryable_readonly": false, "blocking": false, "long_timeout": false, "selector_chain": null}
   ]
 }
 ```
 
+（`SC-11-handoff` 由 R1-F1 加入：§12.1 步驟 2～3 要求「不符合交接條件時拒絕更新」後才「要求 daemon 安全停止」，CLI 端預檢與一般 `daemon.stop` 之間的窗口只能由 daemon 原子關閉。P1 T08 併入後 `x-methods` 由 54 增為 55、`x-wire.version_absent_for` 加入 `daemon.handoff_stop`；併入前 P3 `Method::known()` 的權威集合為 `x-methods` 鍵 ∪ `x-pending[*].adds_method`。）
+
 （上方 `"..."` 只示意層級；實作時 `SessionPublic.x-order` 必須逐字列出盤點 02 §6.1 的全部 key，`properties` 逐欄給 type／nullable，`console_endpoint` 標 `"x-conditional": "ConsoleKind::TcpTelnet 或 bridge 有 endpoint"` 且不列入 `required`。SC-19 形狀依調和表 GAP-G-07 定案凍結為 `{"enabled":true,"coms":[...]}`，**不含** `source`；P1 若要加 `source` 須先改調和表與本檔並遞增 revision。）
 
 規則：
-- `x-methods` 恰為 02 §7 的 54 個 method；`params` 每個參數給 `type`、`x-coercion`（取 02 §5.2 表的寫法字串，例 `"int(params.get(k) or D)"`）、`default`；`selector_chain` 取 02 §5.3 的五種之一（`"selector"`、`"selector>session_id>com>alias"`、`"selector>com>alias"`、`"com>selector"`、`"raw_selector"`）或 null；`errors` 取 03 §4 矩陣（`session.attach`、`session.recover` 另含 `"@last_error_passthrough"`）；`retryable_readonly`、`blocking`、`long_timeout` 依 client／daemon／cli 的三個集合；`session.interactive_status` 的 `retryable_readonly` 必須為 false。
+- `x-methods` 恰為 02 §7 的 54 個 method（`daemon.handoff_stop` 於 P0 只在 `x-pending`，P1 T08 併入後為 55，`test_methods_equal_dispatch_plus_daemon_stop` 同 commit 改為 `| {"daemon.stop", "daemon.handoff_stop"}`）；`params` 每個參數給 `type`、`x-coercion`（取 02 §5.2 表的寫法字串，例 `"int(params.get(k) or D)"`）、`default`；`selector_chain` 取 02 §5.3 的五種之一（`"selector"`、`"selector>session_id>com>alias"`、`"selector>com>alias"`、`"com>selector"`、`"raw_selector"`）或 null；`errors` 取 03 §4 矩陣（`session.attach`、`session.recover` 另含 `"@last_error_passthrough"`）；`retryable_readonly`、`blocking`、`long_timeout` 依 client／daemon／cli 的三個集合；`session.interactive_status` 的 `retryable_readonly` 必須為 false。
 - **§9.4 凍結維度**（每個 method 都要有，空 `{}` 由 C18 判 FAIL）：
   - `result`：成功回應的完整 JSON Schema（`type`、`properties`、`required`、`x-order`；可 `$ref` 共用 `$defs`），每個欄位寫 `type`（含 `null`）；§9.4 表列欄位（`multi_open`、`foreign_holders`、`rx_bytes_last_10s`、`last_rx_age_s`、`ready_reconfirm`、`human_active` 等）另加 `x-unit`（如 `"s"`、`"bytes"`、`"pid"`）、`enum`（有列舉時）、`x-updated-by`（更新時機，例 `"ready_reconfirm": "1 s tick；session.list 不主動評估，最遲約 1 s 翻轉（GAP-G-13）"`、`"foreign_holders": "on-demand 掃 /proc；包含 daemon 自身 pid（RPC-D-10／PLT-O-04）"`）。
   - `error_order`：同一請求同時違反多個條件時的判定先後（依 `service.py`／`session_manager.py` 實際檢查順序，例 `command.submit`：`["SESSION_NOT_FOUND","FLASHING_BUSY","SESSION_RECOVERING","SESSION_NOT_READY","AUTOBOOT_QUIET","READY_UNCONFIRMED","CMD_CONTAINS_NEWLINE","CMD_TOO_LONG","INVALID_COMPLETION_REGEX","SESSION_QUEUE_FULL"]`——實作者以程式實讀為準，並為每個 method 的前兩個衝突條件各寫一個 precedence 測試）；`errors` 為集合、`error_order` 為其有序排列，兩者元素集合必須相等。
@@ -3034,7 +3044,7 @@ scope: contracts
 | 對象 | 需修訂內容 | 依據 |
 |---|---|---|
 | `02-stage0-python-bc.md` L28、L2613（DoD） | 「填 `contract_revision`（`git rev-parse HEAD:contracts`）」改為「依狀態推進協定翻 status；`contract_revision` 只記於 release manifest／證據 JSON，不寫入 `contracts/`」 | Global Constraints「revision 命名」 |
-| `02-stage0-python-bc.md` 各 BC／SC／DF 實作 Task | 每個 Task 加一步：同一 commit 內翻 `behavior_changes.yaml` 與相關碼的 status、把 `rpc_schema.json`／`cli_schema.json` 對應 `x-pending` 併入正式欄位並刪除（SC-04 `drain_stalled`／`drain_timeout_epoch`、BC-04 `holder_unknown`、SC-19 `test_device_allowlist`、SC-20 `daemon restart`、SC-21、SC-22、SC-23） | C16、C17 |
+| `02-stage0-python-bc.md` 各 BC／SC／DF 實作 Task | 每個 Task 加一步：同一 commit 內翻 `behavior_changes.yaml` 與相關碼的 status、把 `rpc_schema.json`／`cli_schema.json` 對應 `x-pending` 併入正式欄位並刪除（SC-04 `drain_stalled`／`drain_timeout_epoch`、SC-11 `daemon.handoff_stop`（T08）、BC-04 `holder_unknown`、SC-19 `test_device_allowlist`、SC-20 `daemon restart`、SC-21、SC-22、SC-23） | C16、C17 |
 | `02-stage0-python-bc.md` DoD | 加入 SC-19 與 `TEST_DEVICE_ALLOWLIST_REJECTED` 的翻轉；SC-19 輸出路徑須可被抽取（T3） | C03／C04／C16 |
 | `02-stage0-python-bc.md` SC-19 Task（L1847、L1901） | `health.status.test_device_allowlist` 形狀依調和表 GAP-G-07 為 `{"enabled":true,"coms":[...]}`，移除 `source`；若要保留 `source`，先修調和表與 `rpc_schema.json` 並遞增 revision | T8 `x-pending` SC-19 |
 | `02-stage0-python-bc.md` T18（L2398） | SC-25 scope 值改用 `python_when_manifest_present`（底線，`CHANGE_SCOPES` 之一）；`contracts/release_manifest.schema.json` 由 T18 建立（P0 不建立） | T1 `CHANGE_SCOPES`、檔案總覽 |

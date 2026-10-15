@@ -713,11 +713,11 @@ remote 常數（`remote.py:22-27`）：`_SCRIPT=tools/docker/remote_tunnel_test.
   - base image `python:3.11-slim`；apt 安裝 `jq minicom socat openssh-server openssh-client autossh iproute2`。
   - `COPY . /opt/serialwrap` 後 `pip install --no-cache-dir .`，console_scripts `serialwrap` 與 `serialwrapd` 會進 PATH。
   - 使用者：`tester`（passwordless；內建 ed25519 key `id_ed25519`，`authorized_keys` 為自己；建立 `~/.sw-relay`）與 `otheruser`。
-  - `/home/tester/.ssh/config` 設 `StrictHostKeyChecking no`。
+  - `~tester/.ssh/config` 設 `StrictHostKeyChecking no`。
   - `sshd_config`：`GatewayPorts no`、`PasswordAuthentication no`、`PermitRootLogin no`、`PubkeyAuthentication yes`、`AllowTcpForwarding yes`、`UsePAM no`；另產生 `/etc/ssh/sshd_config.gwyes`（`GatewayPorts yes`）。
   - `CMD ["bash"]`。
 - **`uart_harness.py`**（140 行；給 `remote_tunnel_test.sh` 用）：
-  - 參數：`--selector COM0`、`--ready-timeout 20.0`、`--env-out /home/tester/sw-uart.env`。
+  - 參數：`--selector COM0`、`--ready-timeout 20.0`、`--env-out ~tester/sw-uart.env`。
   - 以 `DaemonHarness(HarnessConfig(target_config=TargetConfig(platform="prpl", boot_banner="boot done\r\nroot@prplOS:/# ", noise_enabled=False, default_response="EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "), com=selector, alias="docker-remote-tunnel"))` 啟動。
   - `_wait_ready` 執行 `/opt/serialwrap/serialwrap --socket S session list`。
   - 把 `_ENV_KEYS=(SERIALWRAP_STATE_DIR, SERIALWRAP_RUN_DIR, SERIALWRAP_BY_ID_DIR, SERIALWRAP_BY_PATH_DIR)` 以 `export K=<shlex.quote>` 寫入 env 檔。
@@ -747,7 +747,7 @@ remote 常數（`remote.py:22-27`）：`_SCRIPT=tools/docker/remote_tunnel_test.
     - ⑦ GatewayPorts yes 時 `-R tcp` 回 `REMOTE_BIND_UNVERIFIED`，`--remote-socket` 仍成功
     - ⑧ 沒有對應 `-R` 時，`-L` 回 `starting`
   - docker 不可用時 exit 0 並印 `SKIP：...`；任一斷言失敗 exit 1，並印 `[serialwrap] FAIL: ...`。
-  - 執行檔來源：容器主行程 `python3 /opt/serialwrap/tools/docker/uart_harness.py`；`uart_exec`、`role_exec` 與 `endpoint_exec` 都用 PATH `serialwrap`（pip 安裝的版本），其中 `role_exec` 固定 `SERIALWRAP_RUN_DIR=/home/tester/.sw-run`。
+  - 執行檔來源：容器主行程 `python3 /opt/serialwrap/tools/docker/uart_harness.py`；`uart_exec`、`role_exec` 與 `endpoint_exec` 都用 PATH `serialwrap`（pip 安裝的版本），其中 `role_exec` 固定 `SERIALWRAP_RUN_DIR=~tester/.sw-run`。
 - **`tools/` 其他檔案**：`architecture_browser.py`(69)、`architecture_review.py`(123)、`bench-enroll.sh`(489)、`bench-issue.sh`(380)。
 
 ---

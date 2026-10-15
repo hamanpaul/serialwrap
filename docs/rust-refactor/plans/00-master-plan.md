@@ -122,7 +122,7 @@
 | P1-T5 | BC-01d 外部 unlink／替換／DeletePending 偵測、有界自癒、缺口 META、停止自動 TX | H | L | P1-T4 |
 | P1-T6 | BC-03／SC-07 TX 三態、TX WAL 只記確認 bytes、可取消寫入、DF-15 精確 wal_seq | G | L | P1-T5 |
 | P1-T7 | SC-04a Bridge 兩段式 Drain 與 `DrainReceipt` | H | L | P1-T6 |
-| P1-T8 | SC-04b Session Drain、release／attach 交接回應、drain 診斷欄位、BC-03 中止映射、SC-11 有序關機 | G | L | P1-T7 |
+| P1-T8 | SC-04b Session Drain、release／attach 交接回應、drain 診斷欄位、BC-03 中止映射、SC-11 有序關機與 `daemon.handoff_stop` 原子交接（R1-F1） | G | L | P1-T7 |
 | P1-T9 | BC-02 DeferredBuffer 整段清空與上下文標記 | H | L | P1-T8 |
 | P1-T10 | BC-04 Per-UART 獨占、holder 診斷、Windows ACCESS_DENIED 映射、SC-05 同步收回、DF-04 | G | L | P1-T9 |
 | P1-T11 | Gate 錯誤碼：SC-01、SC-02、SC-03、SC-06、DF-02 | G | L | P1-T10 |
@@ -154,8 +154,8 @@
 | P2-T11 | §15.7.1 情境腳本與協調器新動作 | H | G | P2-T10 |
 | P2-T12 | `tests/acceptance/cases.yaml` 承接清單、schema、凍結鎖、Stage 0 證據索引、MCU 手動程序登記 | G | H | P2-T11 |
 | P2-T13 | pytest 資源報告、平台 SKIP 閘門、Windows collection 與 hosted Windows L1（`TST-D-4` 報告部分） | G | H | P2-T12 |
-| P2-T14 | L2／L3 平台 adapter（pin＋版本 gate、PID／RSS、bench lock、能力式 SKIP、Telnet human frontend、worker 存活事件） | H | L | P2-T13 |
-| P2-T15 | `longrun_acceptance.yaml`、外層 `release_gate_result` 判定器、長跑觀測器 | L | H | P2-T14 |
+| P2-T14 | L2／L3 平台 adapter（pin＋版本 gate、PID／RSS、bench lock、能力式 SKIP、Telnet human frontend、worker 存活事件、background 結果執行期收斂 `BgResultTracker`（R1-F6）） | H | L | P2-T13 |
+| P2-T15 | `longrun_acceptance.yaml`、外層 `release_gate_result` 判定器、長跑觀測器、Windows 原生 COM 獨占證據 `winexcl`（R1-F7） | L | H | P2-T14 |
 
 ### P3（`04-stage1a-rust-cli.md`；Phase 前置：P0、P1（T15 SC-09、T16 DF-06、T18 manifest）、P2（T10、T12））
 
@@ -196,7 +196,7 @@
 | P4-T9 | `connect`／`benches` 原生（SC-27） | G | H | P4-T8、P4-T17 |
 | P4-T10 | `setup`（資產物化、WSL systemd、reconcile）與 `supervision-mode set`（SC-12、SC-22、SC-24、DF-10～DF-13、DF-16） | G | L | P4-T3、P4-T4、P4-T5、P4-T6、P4-T7、P4-T11 |
 | P4-T11 | 安裝佈局、release manifest 驗證與版本配對 gate（§9.5、§12.1、SC-25） | H | L | P4-T2、P4-T3、P4-T5、P4-T17 |
-| P4-T12 | §12.1 首次安裝、更新流程與 `setup --rollback`（SC-23） | G | L | P4-T4、P4-T7、P4-T10、P4-T11 |
+| P4-T12 | §12.1 首次安裝、更新流程與 `setup --rollback`（SC-23；步驟 3 經 `daemon.handoff_stop` 交接（R1-F1）、journal 原始快照與分段備份中斷復原（R1-F5）） | G | L | P4-T4、P4-T7、P4-T10、P4-T11、P1-T8 |
 | P4-T13 | `doctor` 全部檢查原生與 `version_pairing`（SC-25） | G | H | P4-T2、P4-T4、P4-T10、P4-T11 |
 | P4-T14 | 終端類承接（console-attach／detach、`serialwrap-minicom` 端到端、Windows Telnet 提示）與委派集合清空 | H | G | P4-T7、P4-T10 |
 | P4-T15 | Agent 權限模型文件與驗證工具（§10.3）、對外文件同步 | H | G | P4-T6、P4-T7、P4-T8、P4-T9、P4-T10、P4-T11、P4-T12、P4-T13、P4-T14 |
@@ -219,7 +219,7 @@
 | P5-T6 | PAL WalFs（常駐 handle、identity、share-delete、不覆蓋 rename） | G | L | P5-T5 |
 | P5-T7 | sw-core WalWriter（BC-01、DF-03、DF-17） | H | L | P5-T6 |
 | P5-T8 | sw-core CommandRegistry／SessionQueue（admission、出列、history、SC-06） | H | L | P5-T7 |
-| P5-T9 | sw-core TxWriter＋Fence（送出前檢查、BC-03 三態、SC-07） | H | L | P5-T8 |
+| P5-T9 | sw-core TxWriter＋Fence（送出前檢查、BC-03 三態、SC-07、TX 帳本結算／退休與上限（R1-F8）） | H | L | P5-T8 |
 | P5-T10 | sw-core IoWorker reader＋RxWindow＋哨兵 fan-out | G | L | P5-T9 |
 | P5-T11 | sw-core SessionCore／Mailbox／Generations／Actor（§5.3 的 2.1 列） | H | L | P5-T10 |
 | P5-T12 | sw-core Two-Phase Drain 核心＋IoWorker 收尾＋Release／Attach（sans-IO 與 IoWorker 層） | G | L | P5-T11 |
@@ -228,10 +228,10 @@
 | P5-T12b | Drain／Release 端到端（真 actor＋login＋命令執行） | G | L | P5-T14 |
 | P5-T15a | 黑箱 FakeTarget 擴充（測試資產變更，§10.4） | H | G | P5-T12b |
 | P5-T15 | sw-core StateStore＋AliasRegistry＋state.json 雙向相容 | G | L | P5-T15a |
-| P5-T16 | sw-core SessionManager（裝置、rank #100、動態 session、selector、管理操作） | H | L | P5-T15 |
+| P5-T16 | sw-core SessionManager（裝置、rank #100、動態 session、selector、管理操作、SC-11 stopping gate `begin_shutdown`（R1-F2）） | H | L | P5-T15 |
 | P5-T17 | PAL RpcListener＋sw-daemon framing | G | L | P5-T16 |
 | P5-T18 | sw-daemon 分派器（service.rs／health.rs） | G | H | P5-T17 |
-| P5-T19 | sw-daemon daemon_main（啟動順序、有序關機、exit code） | H | L | P5-T18 |
+| P5-T19 | sw-daemon daemon_main（啟動順序、有序關機（stopping gate 先於 watcher.stop，R1-F2）、exit code） | H | L | P5-T18 |
 | P5-T20 | 黑箱契約與既有套件改指 Rust（F1／F2／F3／F4／F12＋安全骨架） | H | L | P5-T19 |
 | P5-T21a | P2 runner 補動作（測試資產變更，§10.4） | H | G | P5-T20 |
 | P5-T21 | L1.5 bridge 回歸（P2 凍結 2.1 情境＋s21 情境）與事件延遲量測 | G | L | P5-T21a |
@@ -276,7 +276,7 @@
 | P7-T12 | `line_buffer.rs`＋`matcher.rs` | H | G | P7-T11 |
 | P7-T13 | `counter.rs`＋`registry.rs`＋`event_log.rs`（含 Python DF-18） | H | G（Rust）；13-py：測試 G／實作 H | P7-T12、P7-T6 |
 | P7-T14 | PAL `HandlerSpawner`（POSIX／Windows，SC-26） | G | L | P7-T13 |
-| P7-T15 | `dispatcher.rs` | H | G | P7-T14 |
+| P7-T15 | `dispatcher.rs`（含 `close_intake`、`DispatcherStopReport`，R1-F2） | H | G | P7-T14 |
 | P7-T16 | EventEngine 組裝與 10 個 `event.*` RPC | H | G | P7-T15 |
 | P7-T16-wire | reader `RxObserver` 接線（DF-15）、`BridgeQueries` 與 daemon 啟停順序 | H | L | P7-T10、P7-T16 |
 | P7-T17 | session RPC 接線（self_test／recover／attach／log_*） | G | H | P7-T7、P7-T8、P7-T9、P7-T10、P7-T16-wire |
@@ -300,9 +300,9 @@
 | P8-T9 | FlashEndpoint 執行緒與認線協調 | G | L | P8-T0、P8-T2、P8-T7、P8-T8 |
 | P8-T10 | `mcu.patterns`／`mcu.status` RPC 與 daemon 組裝 | G | L | P8-T9 |
 | P8-T11 | 外部工具裝置交接的黑箱與整合驗證 | H | L | P8-T0、P8-T6、P8-T8 |
-| P8-T12 | systemd 監管整合與有序停止 | G | L | P8-T6、P8-T9、P8-T11 |
+| P8-T12 | systemd 監管整合與有序停止（完整停止序含 stopping gate／watcher／event engine 收尾（R1-F2）；未收斂 exit 1（R1-F4）） | G | L | P8-T6、P8-T9、P8-T11 |
 | P8-T13 | `windows-task` 監管對 Rust daemon 的驗證 | H | L | P8-T12 |
-| P8-T14 | 更新／回滾守衛對 Rust daemon 的驗證與補強（SC-23） | G | L | P8-T6、P8-T9 |
+| P8-T14 | 更新／回滾守衛對 Rust daemon 的驗證與補強（SC-23）；Rust `AdmissionGate`＋`daemon.handoff_stop`（SC-11，R1-F1） | G | L | P8-T6、P8-T9 |
 | P8-T15 | 全部凍結契約的最終覆蓋判定與切片出口腳本 | H | G | P8-T0～14 |
 
 ### P9（`10-stage3-canary.md`；Phase 前置：P0～P8（以前置 Phase 交付物為介面））
@@ -319,7 +319,7 @@
 | P9-T7B | L1.5 A/B 差分（`tools/stage3/ab_diff.py`） | L | H | P9-T5B |
 | P9-T7 | A/B 判定（`tools/stage3/ab_verdict.py`） | L | H | P9-T7B |
 | P9-T8 | Canary WAL 收割與提交計數（`tools/stage3/canary_harvest.py`） | G | L | P9-T6 |
-| P9-T9 | Canary collector 與 zipapp（`tools/stage3/canary_collect.py`） | H | L | P9-T11 |
+| P9-T9 | Canary collector 與 zipapp（`tools/stage3/canary_collect.py`；結果於 history 淘汰前持續收斂，R1-F6） | H | L | P9-T11 |
 | P9-T10 | 干擾／交接分類與活躍日（`tools/stage3/canary_classify.py`） | H | L | P9-T8 |
 | P9-T11 | 事故追蹤（`tools/stage3/canary_incidents.py`） | G | H | P9-T10 |
 | P9-T12 | Canary policy 凍結、帳本彙總與配額 gate（`tools/stage3/canary_ledger.py`） | L | G | P9-T9 |

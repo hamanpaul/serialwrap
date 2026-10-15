@@ -271,7 +271,7 @@ macro_rules! pydict { ($($k:expr => $v:expr),* $(,)?) => { ... } }  // 回應依
 
 ### 3.5 `rpc_types.rs`
 
-- `pub enum Method { HealthPing, HealthStatus, DaemonStop, …（共 54 個，02 §7）, Unknown(String) }`，附 `as_str()`／`parse()`。另有 `Method::is_retryable_readonly()`（11 個）與 `Method::uses_long_timeout()`（4 個）。
+- `pub enum Method { HealthPing, HealthStatus, DaemonStop, DaemonHandoffStop, …（共 55 個：02 §7 的 54 個＋SC-11 `daemon.handoff_stop`，R1-F1）, Unknown(String) }`，附 `as_str()`／`parse()`。另有 `Method::is_retryable_readonly()`（11 個）與 `Method::uses_long_timeout()`（4 個）。
 - 參數存取器負責重現 02 §5.2 的強制轉型表：
 
   ```rust
@@ -491,7 +491,8 @@ pub struct CloseReceipt { pub closed: bool, pub excl_cleared: bool, pub error: O
 
 pub trait UartExclusive: Send + Sync {
     /// 只供診斷，不是鎖。POSIX 掃 /proc/*/fd（排除自身 pid；readlink 比對 realpath／原路徑，或比對 st_rdev）；
-    /// Windows 回 { pids:[], holder_unknown:true, status:Unsupported }。
+    /// Windows 回 { pids:[], holder_unknown:true, status:Unsupported }。這只表示診斷能力不足（SC-17），不是獨占失敗；
+    /// Windows 獨占保證來自 open_exclusive 的 dwShareMode=0，驗收以外部第二次開啟被拒／release 後可取得的證據判定（P2 Task 15 winexcl，R1-F7）。
     fn probe_holders(&self, real_path: &str) -> HolderReport;
 }
 ```
@@ -783,7 +784,7 @@ TxWriter 的 job queue 容量 64；滿時 OpRunner 阻塞等待（只有 OpRunne
 2. writer 完成在途寫入，取得 `TxResult`。
 3. WalWriter 記錄所有可確認的 TX；記錄失敗的部分收集到 `unrecorded`。
 4. `CloseToken::close` → `CloseReceipt`（POSIX 先 `TIOCNXCL` 解除獨占再關 fd，見 §4.2；否則 PTY master 仍開啟時 PROBE→正式 bridge 重開、release 後外部工具開啟都會 EBUSY）。
-5. 送出 `WorkerStoppedReceipt { epoch, stop_id, tx_outcomes: Vec<(OpId, TxResult)>, unrecorded: Vec<EvidenceGap>, wal_error: Option<PalError>, handle_closed: bool }`。
+5. 送出 `WorkerStoppedReceipt { epoch, stop_id, tx_outcomes: Vec<(OpId, TxResult)>, unrecorded: Vec<EvidenceGap>, wal_error: Option<PalError>, handle_closed: bool }`。`tx_outcomes` 只含該 epoch **尚未結算**的 op（§5.7 TX 帳本結算協定；P5 實作為 `TxLedger`），缺項等同未提交；已結算 op 遺留的 WAL 證據缺口仍列入 `unrecorded`（有上限，溢位以合併計數交回，不靜默丟棄）。
 
 規則：
 
@@ -815,6 +816,11 @@ TxWriter 的 job queue 容量 64；滿時 OpRunner 阻塞等待（只有 OpRunne
 ### 5.7 TX 結果處置（BC-03）與命令紀錄
 
 - 每個 op 累計 `confirmed_bytes` 與 `unknown: bool`。
+- **TX 帳本結算／退休（R1-F8）**：累計放在 TxWriter 的 epoch 帳本，只保留**未結算** op，不得隨連線存活時間無界增長。
+  - 只有 actor 能結算：op 到達終態處理點（命令紀錄已 `complete`，或其完成事件已套用：`OpFinished`、`LoginFinished`、lease close／expiry、human TX 結算等）後恰送一次 `SettleTx{epoch, op_id}`；executor 只送給現行 epoch 的 TxWriter（非阻塞 `try_send`，容量 256；滿時該 op 留在帳本，屬過度保留、不失證據）。
+  - drain 的 `aborted_op` 與尚未終態的 op **永不結算**，因此 settle 與 drain 不論誰先到達 TxWriter，BC-03 映射所需的在途證據都在 receipt 中；TxWriter 停止前先套用已到達的 settle。帳本缺項的 op 映射同 `confirmed_bytes=0`、非 unknown。
+  - 結算時該 op 的 WAL 證據缺口移入有界的未解決集合（256，溢位合併最舊者為 `{gaps, bytes, first_op, last_op}` 計數）；單一 op 的缺口上限 16，溢位同樣合併。
+  - 未結算 op 達 256：**不淘汰任何在途項目**；新 op 的 job 不交 OS（`NotSubmitted`＋`Frozen`、不建項目），並以 `UartIoError{reason:"TX_LEDGER_SATURATED"}` 走既有 IoError drain 收斂（新 epoch 帳本歸零）。
 - recovery、release、drain 中止在途命令時，命令紀錄依下列規則處置：
   - `confirmed_bytes ≥ 1` → `status:"error"`、`error_code:"COMMAND_ABORTED_IN_FLIGHT"`（`retryable:false`）。
   - 所有寫入都是 `NotSubmitted` 或 `Completed(0)` → `FLUSHED_BY_RECOVERY`。
@@ -868,6 +874,9 @@ TxWriter 的 job queue 容量 64；滿時 OpRunner 阻塞等待（只有 OpRunne
 |---|---|---|
 | control／data lane | 256／1024 chunk | §5.2 |
 | TxWriter job queue | 64 | OpRunner 阻塞 |
+| TX 帳本未結算 op（§5.7） | 256 | 新 op 不提交、不建項目，`UartIoError{TX_LEDGER_SATURATED}` → IoError drain；不淘汰在途證據 |
+| TX 帳本未解決證據缺口／單一 op 缺口 | 256／16 | 合併最舊者為計數（`gaps`、`bytes`），隨 receipt 交回 |
+| TX settle 佇列 | 256 | `try_send` 失敗時該 op 留在帳本（`settle_dropped` 計數） |
 | arbiter pending（`CMD_PENDING_MAX`） | 256 | `SESSION_QUEUE_FULL`（`SC-06` 計數） |
 | arbiter heap | 等於 pending 上限（admission 保證） | — |
 | history | 512 | 淘汰最舊已完成者 |
@@ -927,16 +936,21 @@ TxWriter 的 job queue 容量 64；滿時 OpRunner 阻塞等待（只有 OpRunne
 
 停止順序：
 
-1. server.stop。
+1. server.stop（P8 起拆為 `stop_accept`，handler join 移到 Phase 1 之後）。
+   - 1a. `manager.begin_shutdown()`：stopping gate。之後熱插 Delta／Tick reattach、`RequestAttach`、bootstrap、bind／clear／recover／device.attach 重開一律不開 UART、不建 session 或 worker；已越過 gate 的在途 attach 納入第 2 步的 drain 集合（R1-F2）。
+   - 1b. `watcher.stop()`：停 DeviceWatcher thread 並 join；channel 殘留的 Delta 由 gate 丟棄（P1 順序：watcher 在 drain 前停止）。
+   - 1c. `engine.close_intake()`：matcher 停止、dispatcher 不再 spawn handler；已在跑的 handler 與 drain 並行（P7 起）。
+   - P8 起 flash endpoint stop 位於 1c 之後、第 2 步之前（P8 Task 12）。
 2. 所有 session 依 Phase 1／2 drain，總上限 5 s（`SC-11`）。
 3. 對所有 session `FLUSHED_BY_SHUTDOWN`。
+   - 3a. `engine.stop(第 2 步的共用期限)`：等仍在跑的 handler；逾時以 `HandlerSpawner` 終止整個 process group／Job，再最多 100 ms 回收；未回收者列入 `unreaped`。必在第 4 步前返回，handler 行程樹不得活過 WAL close 與 lock.release（P7 Task 15／16-wire、P8 Task 12）。
 4. WAL sync 並關閉。
 5. lock.release。
-6. exit 0。
+6. 全部收斂 → exit 0；任一步未收斂（flash endpoint 未 join、RPC handler 逾時未結束、drain stalled、event handler 未回收、WAL sync 失敗）→ stderr `serialwrapd: shutdown incomplete: <原因以 "; " 串接>`，exit 1，不宣稱優雅停止。各步驟皆有界等待，失敗不阻擋後續步驟，只累積到最終 exit code（P5 Task 19、P8 Task 12；SC-11 細化，DF 候選；Python 基線此情境 exit code 不改，不屬 A/B 比較範圍）。
 
 其他規定：
 
-- 未攔截的 panic：exit 1。
+- 未攔截的 panic：exit 1。停機未收斂亦 exit 1（見停止順序第 6 步），讓 `Restart=on-failure`／Task Scheduler RestartOnFailure 能辨識異常停機。
 - logging 輸出到 stderr，格式 `%(message)s`，只輸出 WARNING 以上，訊息模板逐字照 10 §G-01（`GAP-G-01`）。
 - 無參數執行時，所有路徑都由 env 決定（regression ThrowawayDaemon 依賴此行為）。
 - 執行檔名固定為 `serialwrapd`，以符合 multi_open 的偵測規則。
@@ -959,6 +973,7 @@ TxWriter 的 job queue 容量 64；滿時 OpRunner 阻塞等待（只有 OpRunne
 5. `id` 取原值，缺省為 null；`method` 不是 str → `{"id":…,"ok":false,"error_code":"INVALID_METHOD"}`（compact，無 version）。
 6. `params` 不是 object → 當成 `{}`。
 7. `method=="daemon.stop"` → `{"id":…,"ok":true,"stopping":true}`，並觸發 stop。
+   `method=="daemon.handoff_stop"`（SC-11 交接停止，R1-F1；P8 Task 14 實作，之前的 Rust artifact 落到第 8 步回 `METHOD_NOT_FOUND`，CLI 據此 fail-closed 拒絕更新）→ 呼叫 `sw_core::admission::AdmissionGate::freeze_if_idle(reason)`：閒置 → `{"id":…,"ok":true,"stopping":true,"handoff_token":<32 hex>}`（無 version）寫出後觸發與 `daemon.stop` 相同的 stop；忙碌 → `{"id":…,"ok":false,"error_code":"FLASHING_BUSY"|"SESSION_BUSY","busy":[{com,state,foreground_busy,outstanding_commands,interactive_session_id,recovering,ops}]}`，不凍結、不停止。`AdmissionGate` 是所有新操作的共同 admission 邊界（單一 `Mutex`，葉鎖，持有時不得送 actor 訊息或做 I/O）：service 分派在把任何「`side_effects` 非空且 `retryable_readonly==false`」的方法交給 SessionActor／CommandRegistry 之前 `admit(kind, com)`（ticket 持有到該操作終態：命令紀錄終態、file 傳輸返回、lease close／expire），flash endpoint 在 sync-probe 寫第一個 byte 前 `admit("flash", com)`（被拒則端點沉默、不進 FLASHING），SessionActor 在狀態轉移時同步發布 `recovering`／`flashing`／`lease` 旗標；`freeze_if_idle` 與 `admit` 同鎖，故操作要嘛在凍結前取得 ticket（交接回忙碌），要嘛在凍結後被拒（`FLUSHED_BY_SHUTDOWN`＋`reason:"handoff_frozen"`，零 TX、零狀態改寫）。SC-11 停止序 Phase 1 的 `TransferAbort`／撤銷前景命令／flash pump 停止是**中止**，只有經交接 ok 的停止才保證沒有可被中止的不可安全中止操作。
 8. 其餘交給 `service.rpc`。
    - handler 回 `Err(PyErr)` 或 panic 時，回 `{"id":…,"ok":false,"error_code":"EXCEPTION","message":…}`，無 version。
    - 正常時 `resp={"id":id}`，再依序併入 result；result 若含 `id` 會覆寫值，但位置仍在第一個。
@@ -1254,7 +1269,9 @@ A/B 程序照規格 §15.9：先停 A 並確認資源釋放，才啟動 B；兩�
 | Linux | `${XDG_DATA_HOME:-~/.local/share}/serialwrap/versions/<v>/` | `~/.local/bin/serialwrap`、`~/.local/bin/serialwrapd` 為 symlink，指向 `versions/<v>/bin/*` |
 | Windows | `%LOCALAPPDATA%\Programs\serialwrap\versions\<v>\` | `bin\serialwrap.exe`、`bin\serialwrapd.exe` 為**複本**，另有 `bin\current-release.json` 記錄 `{"bundle_version","dir"}`；不依賴 symlink 權限 |
 
-切換流程：先把新複本寫成 `*.new`，再把舊檔 rename 成 `*.old.<ts>`（執行中的 exe 允許 rename），最後把 `*.new` rename 成正式名稱。至少保留 Current 與 Previous。rollback 流程依規格 §12.1 七步驟（`SC-23`）。第 2 步的交接安全檢查（Flash、FileTransfer、活躍寫入與其他不可安全中止操作）沒有覆寫：update／rollback 帶 `--force` 時仍拒絕，且不停止監管、不送 `daemon.stop`，因為停止 daemon 會中止傳輸或 flash pump，而 DUT 上已發生的部分燒寫無法撤銷。
+切換流程：先把新複本寫成 `*.new`，再把舊檔 rename 成 `*.old.<ts>`（執行中的 exe 允許 rename），最後把 `*.new` rename 成正式名稱。至少保留 Current 與 Previous。rollback 流程依規格 §12.1 七步驟（`SC-23`）。第 2 步的交接安全檢查（Flash、FileTransfer、活躍寫入與其他不可安全中止操作）沒有覆寫：update／rollback 帶 `--force` 時仍拒絕，且不停止監管、不送 `daemon.stop`，因為停止 daemon 會中止傳輸或 flash pump，而 DUT 上已發生的部分燒寫無法撤銷。CLI 端預檢只做提早拒絕；第 3 步停止一律經 daemon 原子交接 `daemon.handoff_stop`（§6.2 第 7 步：busy 判定＋凍結新操作＋token 同一臨界區），update／rollback 路徑不送一般 `daemon.stop`；交接被拒或結果不明時不硬停、不切換（R1-F1，P4 Task 12、P1 T08、P8 Task 14）。
+
+中斷復原（`install-journal.json`，P4 Task 12）：journal 必須自帶回到完整 Previous 組合所需的原始資料，不依賴行程記憶體或尚未完成的備份。第 3 步停用監管之前，先把原始穩定入口（symlink 目標或複本 sha256）、`current-release.json` 全文、`config.yaml` 複本、監管快照（mode、endpoint、enabled、running、匯出的已註冊內容）與 daemon 快照（是否健康在跑、identity、各 session 的 `attached_real_path`／`com`／`state`、重新啟動路徑）寫入 `install-journal.snapshot/` 與 journal，每次寫入都 fsync 並同步目錄。第 5 步拆成三個持久化階段：`backup_started`（只寫 `*.partial`）→ `backup_complete`（`manifest.json` 最後寫入、目錄改名提交，manifest sha256 記入 journal）→ `entries_switching`。備份提交前不切換任何入口、設定或監管。復原依階段處理：(1) 尚未停用：只刪 journal；(2) 已停用或已停止、尚未切換：不讀備份，依快照還原 enabled 與 running，確認舊行程與 tty holder 已釋放後才重新啟動舊版；(3) 已開始切換：先驗證備份 manifest 與每個檔案，通過後以快照還原入口與 current，再執行第 7 步。任一還原失敗都保留 journal（位元組不變），而且不繼續本次 update 或 rollback。
 
 ### 10.3 版本配對 gate
 

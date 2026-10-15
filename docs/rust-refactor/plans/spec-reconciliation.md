@@ -44,19 +44,19 @@
 | SC-08 | UDS 權限預設 `0600`，新建目錄為 `0700`；只有明確設定 `SERIALWRAP_SOCKET_GROUP` 時才用 `0660` 加 chgrp | ADR-04 | 雙邊（owner #3） |
 | SC-09 | 設定探索順序：`SERIALWRAP_CONFIG`（指定 config.yaml）→ `CONFIG_DIR/config.yaml` → 系統目錄（`/etc/serialwrap/config.yaml` 或 `%ProgramData%\serialwrap\config.yaml`，唯讀 fallback） | §6.1 | 雙邊 |
 | SC-10 | lock 與 socket 路徑在比較時先正規化（abspath、normpath，並去掉 `unix://` 前綴）；Windows Tier 1 改用 `LockFileEx`（與 `msvcrt.locking` 互斥相容） | §6.2 | 雙邊 |
-| SC-11 | 有序關機：drain 所有 worker、關閉 handle、WAL sync，之後才 exit | §6.1 更新流程、§8.1、BC-01 | 雙邊 |
+| SC-11 | 有序關機：drain 所有 worker、關閉 handle、WAL sync，之後才 exit。Rust 細化（P5 Task 19、P8 Task 12；DF 候選）：各步驟有界等待、失敗不阻擋後續步驟，但 flash endpoint 未 join、RPC handler 逾時、drain stalled、WAL sync 失敗任一發生即以 `serialwrapd: shutdown incomplete: …` 診斷與 exit 1 結束，不宣稱優雅停止；只有全部收斂才 exit 0。Python 基線此情境 exit code 不改（以 log 與 `shutdown_drain().graceful` 揭露），不屬 A/B 比較範圍。停止起點（雙邊，R1-F2）：drain 前先設 manager stopping gate（之後熱插／bootstrap／recover 不開 UART、不建 worker，已越過 gate 的在途 attach 納入 drain 集合）、停 watcher、關事件派工 intake；Event handler 行程樹須在 WAL close 前收斂（Python `engine.stop` 無上限等待；Rust 以 drain 共用期限＋process group／Job 終止，未回收記入 `shutdown incomplete`）（P1 T08、P5 Task 16／19、P7 Task 15／16-wire、P8 Task 12）。交接停止（雙邊，R1-F1）：新增 RPC `daemon.handoff_stop`，daemon 在共同 admission 邊界（`AdmissionGate`）同一臨界區內做 busy 判定（flash／sync-probe、已 admit 的命令／file 傳輸／self-test／recover／release、lease、recovering）→ 閒置才凍結所有新的有副作用操作（之後回 `FLUSHED_BY_SHUTDOWN`＋`reason:"handoff_frozen"`、零 TX；ttyMCU 端點沉默）→ 回 `{"ok":true,"stopping":true,"handoff_token"}` 後才走本列停止；忙碌回 `FLASHING_BUSY`／`SESSION_BUSY`＋`busy`，不凍結、不停止。本列 shutdown drain 的 Phase 1 是中止（`TransferAbort`、撤銷前景命令、停 flash pump）而非等待完成，故 §12.1 更新／回滾只能經交接停止。不新增錯誤碼（`FLUSHED_BY_SHUTDOWN` 介面加 `rpc`）；`x-methods` 54→55（Python P1 T08；Rust P8 Task 14；消費者 P4 Task 12） | §6.1 更新流程、§8.1、§12.1 步驟 2～3、BC-01 | 雙邊 |
 | SC-12 | 監管 reconcile 必須確認舊 daemon 已結束（ping 不通且行程消失，上限 10 s）才啟動新 daemon | §6.1 | 雙邊 |
 | SC-13 | Interactive lease 到期除了存取時判定，也由 1 s tick 主動處理（還原 human／回放），並保留 tombstone | §5.1.3、§5.3 | 雙邊 |
 | SC-14 | Flash probe 的資格加上：不在 RELEASED、RECOVERING 或 drain 中，且沒有前景操作 | §5.3 | 雙邊 |
 | SC-15 | 每個 console 的出向 ring 為 1 MiB，滿時 drop-oldest。顯示資料原本就允許丟棄，契約只寫「可丟、不阻塞」 | §5.4 | Rust-only |
 | SC-16 | console line buffer 上限 16385 B；被拒的整行（`CMD_TOO_LONG`、`SESSION_QUEUE_FULL`、`SESSION_NOT_READY`）寫 WARNING log 供診斷 | §5.3、§5.4 | 雙邊 |
-| SC-17 | Windows 的 daemon 多開偵測與 CLI 跨 socket 預檢以行程掃描實作；Windows 的 holders 一律回 `unknown` | §6.2 | Rust-only |
+| SC-17 | Windows 的 daemon 多開偵測與 CLI 跨 socket 預檢以行程掃描實作；Windows 的 holders 一律回 `unknown`。`holder_unknown` 是診斷能力的限制，不是獨占失敗：驗收（L3 長跑 `safety_double_holder`）在 Windows 不得以 `holder_unknown` 判證據不足，改以測試端原生 COM 獨占開啟證據判定——daemon 持有期間第二次 `CreateFileW` 被拒（`ERROR_ACCESS_DENIED`）、release 後外部可取得、外部持有時 attach 回 `DEVICE_STILL_HELD`、關閉後重新取得，並綁定受測裝置（`attached_real_path`／`bridge_generation`）與 daemon 程序身分（pid＋建立時間）；缺此證據仍為 INSUFFICIENT_EVIDENCE（P2 Task 15 `winexcl`，R1-F7） | §6.2 | Rust-only |
 | SC-18 | Windows `on-demand` 模式「首次需求啟動」：本機預設 endpoint 連不上時自動 `daemon start` 並重送一次；明確指定 endpoint、bench 或 remote 時不觸發 | §6.1 | Rust-only（1B） |
 | SC-19 | OD-11 測試裝置 allowlist，細節見 §2 `GAP-G-07` | OD-11、§9.4 | 雙邊（P1） |
 | SC-20 | 新子命令 `daemon restart`：systemd 與 windows 模式轉為 `service restart`；on-demand 模式執行 stop、等待結束、再 start（同一 endpoint） | §4.2 #14 | 雙邊 |
 | SC-21 | `remote stop <port\|all>` 作為 `remote close` 的別名，原名照常可用 | §4.2 #17 | 雙邊 |
 | SC-22 | `supervision-mode set <mode> [--force] [--with-sudo]`：輸出 JSON，走與 setup 相同的 reconcile；不帶參數時維持輸出純文字 | §4.2 #16 | Rust-only（1B） |
-| SC-23 | `setup --rollback`、版本目錄、Current／Previous、規格 §12.1 的七步更新流程；第 2 步交接安全檢查不受 `--force` 影響（Flash／FileTransfer 等不可安全中止操作進行中一律拒絕，不停止監管或 daemon） | §4.2 #19、§12.1 | Rust-only（1B） |
+| SC-23 | `setup --rollback`、版本目錄、Current／Previous、規格 §12.1 的七步更新流程；第 2 步交接安全檢查不受 `--force` 影響（Flash／FileTransfer 等不可安全中止操作進行中一律拒絕，不停止監管或 daemon）；第 3 步停止只經 SC-11 `daemon.handoff_stop` 原子交接（CLI 預檢後才開始的 `file.push`／flash 由 daemon 判定忙碌而拒絕；daemon 不支援或結果不明時 fail-closed，不送一般 `daemon.stop`、不硬停，R1-F1）；中斷復原的 `install-journal.json` 在停用前即持久保存原始入口／current／config／監管 enabled・running／daemon 快照，備份完整提交（`backup_complete`）前不切換，復原失敗保留 journal（R1-F5，P4 Task 12） | §4.2 #19、§12.1 | Rust-only（1B） |
 | SC-24 | 監管模式 `windows-task`（`ExecutionTimeLimit=PT0S`）與 `windows-service` | §6.1、OD-03、OD-12 | Rust-only（1B） |
 | SC-25 | release manifest，以及 doctor 的 `version_pairing` 檢查 | §9.5、OD-13 | Rust-only |
 | SC-26 | Windows event handler：`exec` 走 CreateProcess 加 Job；`shell` 走 `cmd.exe /d /s /c`；timeout 時 TerminateJobObject；env 白名單另加 `SYSTEMROOT`、`COMSPEC`、`PATHEXT`、`TEMP`、`TMP`、`USERPROFILE` | §5.5 | Rust-only（owner #6） |
@@ -351,7 +351,7 @@
 | TST-D-9 | 4 個 func-test case 的 oracle 不成立 | §15.5「保留 oracle」 | TEST | ID 與目的保留；改用既有欄位修復 oracle（`has_interactive` 改看 `consoles[].interactive_owner`；實作 `input_raw`、`any_tx_contains_raw`；`sm-04` 改驗 DETACHED） | P2 | no |
 | TST-D-10 | realhw／reliability 沒有 pin，也沒有 #154 gate | §11.6 | TEST | 新增 `serialwrap_exe` 設定與版本 gate | P2 | no |
 | TST-D-11 | 版本 probe 的 Python fallback 對 Rust 無效 | — | KEEP | Rust daemon 一定回報 version | P2 | no |
-| TST-D-12 | lr-mixed 的 PID 只取自 system systemd；background 回了 `cmd_id` 就算完成 | §15.11 | TEST＋KEEP | PID 改取 `daemon status.pid`；計數口徑不變，以維持基線可比 | P2 | no |
+| TST-D-12 | lr-mixed 的 PID 只取自 system systemd；background 回了 `cmd_id` 就算完成 | §15.11 | TEST＋KEEP | PID 改取 `daemon status.pid`；計數口徑不變，以維持基線可比。release gate 的 background 完成以 `bg_result` 為準，兩側基線使用同一 engine revision。`bg_result` 由 harness 在**執行期**以有界 pending 集合（≤64）收斂，結果即時寫入 `events.ndjson`；收尾只處理未完成項，不得延到長跑結束才逐查。原因是產品 history 只保留 512 筆（`sw_core/arbiter.py:233-251`），逾時查詢會得到 `CMD_NOT_FOUND`。查無一律記 `bg_lost`：該 pair 計 unresolved，並判 INSUFFICIENT_EVIDENCE；不得調大產品 history，也不得當成成功（P2 Task 14 第 7 點、Task 15 `background_result_coverage`；測試 `test_background_results_survive_history_eviction`） | P2 | no |
 | TST-D-13 | Windows bench lock 路徑寫死 | §15.2 | TEST | 新增 testbed 鍵 `bench_lock_path` | P2 | no |
 | TST-D-14 | Windows 上硬性 SKIP | §15.8.4 | TEST | 改為依能力判定（Spike 7） | P2 | no |
 | TST-D-15 | acceptance、contracts、bridge 等目錄不存在 | §3.2 | TEST | P0／P2 建立 | P0/P2 | no |
@@ -419,7 +419,7 @@
 |---|---|---|---|---|---|---|
 | GAP-G-01 | daemon 沒有設定 logging（lastResort，WARNING 以上輸出到 stderr） | §9.3「一次性 log」 | KEEP | 去向、格式與等級照現況凍結；systemd 模式由 journald 承接 | P0/P5 | no |
 | GAP-G-02 | human 輸入的行被拒時靜默丟棄；line buffer 無上限 | §5.3「可診斷」、§5.4 | SPEC SC-16 | 以 log 提供診斷，不改 WAL 契約 | P1/P6 | no |
-| GAP-G-03 | Windows 的 multi_open 與 holder 偵測恆失效 | §6.2、BC-04 | SPEC SC-17＋BC | — | P4/P5 | no |
+| GAP-G-03 | Windows 的 multi_open 與 holder 偵測恆失效 | §6.2、BC-04 | SPEC SC-17＋BC | Python 與 Rust 的 Windows 長跑雙重持有判定改用 P2 Task 15 `winexcl` 獨占開啟證據（不依賴 holder 偵測） | P4/P5 | no |
 | GAP-G-04 | 沒有 artifact 身分 | §9.5 | NEW SC-25 | — | P2/P3 | no |
 | GAP-G-05a | Windows 的 config 與 state 放在 `%USERPROFILE%\.config` 等位置 | §12.1 | KEEP | 相容既有安裝；程式本體放 `%LOCALAPPDATA%\Programs` | P4 | no |
 | GAP-G-05b | Windows release 沒有物化 profiles | §12.1 | NEW（併入 SC-23／SC-24） | Rust setup 會物化 | P4 | no |
@@ -428,7 +428,7 @@
 | GAP-G-07 | 沒有 OD-11 allowlist | OD-11、§9.4 | NEW SC-19 | 定案見本列下方說明 | P1 | no |
 | GAP-G-08 | 訊號、SIGPIPE、stdin、help 的程序層行為 | §4.3 | KEEP | 凍結 | P3 | no |
 | GAP-G-09 | `TRANSPORT_STALL` 的 detail 文字 | §9.4 | KEEP | 位元組級凍結 | P0 | no |
-| GAP-G-10 | 有多處無界資源 | §5.4 | SPEC（可觀測者走 SC-15／SC-16）＋IMPL | 容量見 arch §5.10 | P5 | no |
+| GAP-G-10 | 有多處無界資源 | §5.4 | SPEC（可觀測者走 SC-15／SC-16）＋IMPL | 容量見 arch §5.10；TX 帳本只保留未結算 op，終態 op 由 actor 結算後退休，未結算上限 256 滿時拒新 op 並以 IoError drain 收斂、不淘汰在途證據，WAL 證據缺口 256／每 op 16 溢位合併計數（R1-F8，arch §5.7；P5 T9 `ledger_retires_completed_ops_without_reconnect`、`ledger_retire_racing_drain_preserves_bc03`）；Python Stage 0 `_tx_accounts` 於命令終態結算、FIFO 不淘汰在途 cmd（P1 T06） | P1/P5 | no |
 | GAP-G-11 | 有承接位置未定的模組（util、version、assets、wrapper） | §4.1 | IMPL | 位置見 arch §1.3；wrapper 原樣保留，由 1B 的 setup 物化 | P3/P4 | no |
 | GAP-G-12 | 測試 oracle 引用不存在的 `FOREGROUND_BUSY` | §10.4 | TEST | 以工具 PR 移除 | P2 | no |
 | GAP-G-13 | `session list` 不評估 reconfirm 是否到期 | §9.4 | KEEP | 凍結：最遲約 1 s tick 翻轉 | P0 | no |

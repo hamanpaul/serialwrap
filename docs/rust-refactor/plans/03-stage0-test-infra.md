@@ -137,7 +137,7 @@ tools/docker/{uart_harness,remote_lab}.py                                # Task 
 realhw/{drivers,preflight,harness,__main__}.py  realhw/frontends.py  realhw/procobs.py  realhw/cases/{longrun,p1_cmd,p0,p1_console,p1_wal,p1_restart,p1_handoff,p1_hotplug}.py  # Task 14
 regression/serialwrap_regression/{plugin,preflight,core,guards}.py  regression/serialwrap_regression/cases/{f05_console_coexist,f09_boot_uboot}.py  # Task 14
 reliability/serialwrap_reliability/{core,testbed_loader}.py                # Task 14
-realhw/acceptance/{__init__,longrun_acceptance.yaml,longrun_acceptance.schema.json,gate.py,observer.py,walscan.py}  # Task 15
+realhw/acceptance/{__init__,longrun_acceptance.yaml,longrun_acceptance.schema.json,gate.py,observer.py,walscan.py,winexcl.py}  # Task 15
 realhw/procedures/p2-1-mcu-flash.md                                      # Task 12
 .github/workflows/tests.yml                                              # Task 1（bridge job）、Task 13（`pytest-windows` job、自架 Windows COM job）
 docs/regression-plugin.md  func-test/README.md                           # Task 10、12、14（R-18 文件同步）
@@ -2238,7 +2238,7 @@ def summarize(records: list[dict[str, Any]], *, ignored: list[str], platform: st
 **Files:**
 - Create: `realhw/frontends.py`、`realhw/procobs.py`
 - Modify: `realhw/harness.py`（`Ctx.human`）、`realhw/preflight.py`（`version_gate`、`resolve_serialwrap_exe`、`bench_lock_path(cfg)`、跨平台 `acquire_benchlock`、Windows 的 `_tools_missing`；`_leaked_daemons`／`_other_pytest`／`_external_testpilot` 改用 `procobs.list_processes()`（不再直接 `pgrep`，Windows 上不得 `FileNotFoundError`）；`_state_polluted` 改用 `resolve_state_dir(cfg)`（Windows：`%LOCALAPPDATA%\serialwrap` 或 cfg 覆寫，不寫死 `~/.local/state`）；跨 OS 守衛 `cross_os_holder_check`；`Checks.version_problem`／`exe_identity`／`cross_os_guard`）、`realhw/__main__.py`（`main(argv: list[str] | None = None)`；pin、版本 gate、`meta.started_at_utc`、`meta.cli_identity`、`meta.contract_revision`、`meta.cases_yaml_sha256`、`meta.daemon_identity`、frontend factory、能力計算）、`realhw/config.json`（新增 `serialwrap_exe: ""`、`bench_lock_path: ""`、`human_frontend: "auto"`、`cross_os_probe_argv: []`）
-- Modify: `realhw/cases/longrun.py`（PID 取 `daemon status.pid` 且以 `procobs.pid_alive` 判死亡、RSS 用 `procobs.rss_kb`、human worker 用 `ctx.human`、每個 agent worker 以 `--source agent:rhw{i}` 提交、worker 存活事件、事件加 `wall_ts`、收尾 background 終態掃描、刪 `FOREGROUND_BUSY` 說明）、`realhw/drivers.py`（`SwCli.submit_and_wait(..., source: str | None = None)` 帶 `--source`）、`realhw/cases/p1_cmd.py:35`（容許碼移除 `FOREGROUND_BUSY`，`GAP-G-12`）、`realhw/cases/p0.py`（`p0-console-raw`）、`realhw/cases/p1_console.py`（7 個；`p1-con-liveness`／`p1-con-orphan` 以 `h.crash()` 取代 `pgrep minicom`＋`kill -9`）、`realhw/cases/p1_wal.py`（2 個）、`realhw/cases/p1_restart.py`（`p1-rst-reboot`）：`requires` 由 `tmux` 改為 `human_frontend`，操作改用 `ctx.human`
+- Modify: `realhw/cases/longrun.py`（PID 取 `daemon status.pid` 且以 `procobs.pid_alive` 判死亡、RSS 用 `procobs.rss_kb`、human worker 用 `ctx.human`、每個 agent worker 以 `--source agent:rhw{i}` 提交、worker 存活事件、事件加 `wall_ts`、background 結果於執行期以有界 pending 集合收斂並即時寫入 events 帳本（`BgResultTracker`；收尾只處理仍未結案者）、刪 `FOREGROUND_BUSY` 說明）、`realhw/drivers.py`（`SwCli.submit_and_wait(..., source: str | None = None)` 帶 `--source`）、`realhw/cases/p1_cmd.py:35`（容許碼移除 `FOREGROUND_BUSY`，`GAP-G-12`）、`realhw/cases/p0.py`（`p0-console-raw`）、`realhw/cases/p1_console.py`（7 個；`p1-con-liveness`／`p1-con-orphan` 以 `h.crash()` 取代 `pgrep minicom`＋`kill -9`）、`realhw/cases/p1_wal.py`（2 個）、`realhw/cases/p1_restart.py`（`p1-rst-reboot`）：`requires` 由 `tmux` 改為 `human_frontend`，操作改用 `ctx.human`
 - Modify（補齊實際依賴，使 Windows 能力式 SKIP 生效；現行 `requires` 只有 `("two_boards",)`）：`realhw/cases/p1_restart.py`（`p1-rst-daemon` 加 `supervisor_runtime`）、`realhw/cases/p1_handoff.py`（`p1-ho-cycle` 加 `tmux`（以 `tmux` 起 `minicom -D` 外部持有者，`p1_handoff.py:48-51`）；`p1-ho-persist` 加 `supervisor_runtime`）、`realhw/cases/p1_hotplug.py`（`p1-hp-cycle` 加 `usbipd`；`p1-hp-reorder` 加 `usbipd`、`supervisor_runtime`）
 - Modify: `regression/serialwrap_regression/plugin.py`（移除 `os.name=="nt"` 硬性 SKIP，改能力式）、`regression/serialwrap_regression/preflight.py`（`version_gate` 改由 realhw 匯入、訊息不變；Windows lock 用 `bench_lock_path(cfg)`；回傳平台 `missing_caps`）、`regression/serialwrap_regression/core.py`（`build_ctx` 加 human factory；`platform_missing_caps`）、`regression/serialwrap_regression/guards.py`（`UBootConsole` 改吃 `HumanFrontend`；`_TA_ENV_DIRS` 補 `SERIALWRAP_LOG_DIR`、`SERIALWRAP_EVENTS_DIR`、`SERIALWRAP_EVENTS_RUNTIME_DIR`，與 `tests/conftest.py` 的 9 目錄一致（另保留 `SERIALWRAP_PROFILE_DIR`），避免 throwaway daemon 把 log／events 寫到 live 目錄）、`regression/serialwrap_regression/cases/f05_console_coexist.py`、`f09_boot_uboot.py`（改用 `ctx.human`，`requires=("human_frontend",)`）、`f08_daemon_singleton.py`（second-daemon）與 `f10_login_creds.py`（兩個）`requires` 加 `posix_throwaway_daemon`、`f02_backpressure.py`（RSS 用 `procobs`）、`testbed.yaml.example`（`bench_lock_path`、`human_frontend`）
 - Modify: `reliability/serialwrap_reliability/core.py`（`SwCli(exe=...)`、版本 gate）、`reliability/serialwrap_reliability/testbed_loader.py`（`_SECTION_KEYS` 加 `serialwrap_exe`、`bench_lock_path`、`human_frontend`）、`reliability/testbed.yaml.example`
@@ -2325,9 +2325,34 @@ class Ctx:                                   # 新增最後一個欄位，預設
 2. **PID 與死亡判定**：snapshot 的 `pid` 取 `ctx.sw.run("daemon","status")` 的 `pid`（取代 system-scope `systemctl show`）；RPC 失敗（`_error`／`TIMEOUT`／缺 `pid`）時記 `pid: null` 與 `pid_probe_error`，**不得**記 0。只有「連續 3 次 probe 失敗且 `procobs.pid_alive(last_pid) is False`」或「probe 成功但 pid 與上次不同」才分別判 `daemon_death`／重啟；暫時性 RPC 失敗不停整個長跑。`analyze` 的 `pid_changes`／`daemon_death_at` 把 `null` 視為「無觀測」（跳過，不算變更、不算死亡）。
 3. **RSS**：`rss_kb` 改 `procobs.rss_kb(pid)`（pid 為 null 時記 null）。
 4. **human**：`h = ctx.human("lrhuman", "minicom")`，`alive()` 為 False 時記 `minicom_dead`（事件名不變，維持 `analyze` 相容）並 `close()`＋`open("COM0")`（記 `minicom_open`），每 `uniform(120,300)` 秒 `h.send_line(f"echo HUMAN_TICK_{n}")` 並記 `tick{n}`。
-5. **worker 存活（§15.11.3「測試 worker 存活情況」）**：每個 worker（`agent:rhw0..N-1`、`human`、`orchestrator` snapshot thread）啟動時記 `worker_start`、結束時（含例外）記 `worker_stop{reason}`，並每 300 s 記 `worker_alive`；`analyze` 不讀這些 kind（輸出鍵不變）。
+5. **worker 存活（§15.11.3「測試 worker 存活情況」）**：每個 worker（`agent:rhw0..N-1`、`human`、`orchestrator` snapshot thread、第 7 點的 `bg_resolver` thread）啟動時記 `worker_start`、結束時（含例外）記 `worker_stop{reason}`，並每 300 s 記 `worker_alive`；`analyze` 不讀這些 kind（輸出鍵不變）。
 6. **事件時間**：每筆 events／snapshots 另加 `wall_ts`（UTC ISO，`datetime.now(timezone.utc).isoformat()`），供 Task 15 把 WAL `wall_ts` 與事件對齊；既有 `t` 欄位不變。
-7. **background 終態**：`_do_background` 拿到 `cmd_id` 時記 `submit_accepted{cmd_id}`（不再直接記 `done`）；長跑結束（stop 後、工作者 join 之後）以唯讀 `cmd status --cmd-id` 逐一查詢，記 `bg_result{cmd_id, status, error_code}`：`done` → `done`、`error`／`canceled` → `error{detail}`、查無或非終態 → 留為 unresolved（不得補記 done）。
+7. **background 終態（執行期收斂，不得延至長跑結束才查）**：產品只保留 `CMD_HISTORY_MAX=512` 筆命令紀錄，`_evict_commands_locked` 依 `done_at` 淘汰最舊的已完成紀錄，之後 `cmd status` 回 `{"ok":false,"error_code":"CMD_NOT_FOUND"}`（`sw_core/arbiter.py:233-251`；Rust 依 P6 Task 8 `history_evicts_oldest_done_by_done_at_string` 照搬）。`lr-mixed` 4 個 worker 每輪間隔 `uniform(0.5,2.0)` s，最壞約 8 cmd/s，512 筆約 64 s 就輪替完畢；48 h 有數十萬筆，若收尾才查，絕大多數 background 紀錄早已淘汰。因此：
+   - `_do_background` 拿到 `cmd_id` 時記 `submit_accepted{cmd_id}`（不再直接記 `done`），並呼叫 `bg.add(cmd_id, source=, com=, round_=n, stop=stop)` 放入有界 pending 集合。
+   - 獨立 `bg_resolver` thread（第 5 點的 worker 之一）每 `BG_POLL_INTERVAL_S=1.0` s 對 pending 由舊到新各呼叫一次唯讀 `cmd status --cmd-id`（不觸碰 Lease）。`command.status ∈ {done, error, canceled}` → **立即**寫 `bg_result{cmd_id, status, error_code, latency_s}` 到 `events.ndjson`，並移出 pending。`events.ndjson` 是 append＋flush 的測試端持久帳本。`bg_result` 的 `source`／`com`／`round` 沿用原 submit 的值，讓 gate 的 `pair_key` 對得上。`accepted`／`running` 留在 pending。若 age 超過 `BG_RESOLVE_WARN_S=30` 仍未終態，記一次 `bg_slow{cmd_id, age_s}`；此時命令仍在途，產品不會淘汰它。缺 `status` 或出現未知值時，記一次 `bg_poll_error{cmd_id, detail}` 並繼續留在 pending。RPC 失敗（`_error`／`TIMEOUT`）同樣處理，下一輪重試。
+   - 回 `CMD_NOT_FOUND` → 記 `bg_lost{cmd_id, reason:"CMD_NOT_FOUND", age_s}`，並移出 pending；**不得**記 `bg_result`／`done`。該 pair 在 gate 計為 unresolved，並觸發 Task 15 的 `background_result_coverage`，標示為測試端收斂落後。
+   - pending 上限 `BG_PENDING_MAX=64`（不到 512 的 1/8）。集合滿時 `add` 阻塞 worker，直到有空位或 `stop` 被設定，並記 `bg_backpressure{source, wait_s}`。這是測試端背壓，不丟棄已受理的 cmd_id。`stop` 已設定時照樣加入；可能超過上限，但超出量不多於 agent worker 數，交給收尾處理。
+   - 收尾：stop 且所有 worker join 之後，`bg.final_drain(BG_FINAL_DRAIN_S=30)` **只**查詢仍在 pending 的 cmd_id，方式與上面相同。逾時仍未終態者不補寫任何紀錄，留為 unresolved，並記 `bg_drain{remaining}`。
+   - **不得**為了長跑調大產品 history，例如改 `CMD_HISTORY_MAX`、加環境變數或 CLI 旗標；也不得把 `CMD_NOT_FOUND` 或非終態當成功。
+
+```python
+# realhw/cases/longrun.py（stdlib-only；新增）
+BG_PENDING_MAX = 64
+BG_POLL_INTERVAL_S = 1.0
+BG_RESOLVE_WARN_S = 30.0
+BG_FINAL_DRAIN_S = 30.0
+BG_TERMINAL = frozenset({"done", "error", "canceled"})
+class BgResultTracker:
+    def __init__(self, sw: Any, elog: "_EventLog", *, pending_max: int = BG_PENDING_MAX,
+                 clock: Callable[[], float] = time.monotonic) -> None
+    def add(self, cmd_id: str, *, source: str, com: str, round_: int, stop: threading.Event) -> None
+        # 滿則阻塞（可被 stop 中斷；中斷後仍加入）；阻塞過即記 bg_backpressure
+    def poll_once(self) -> int          # pending 由舊到新各查一次；回本輪移出數（bg_result＋bg_lost）
+    def run(self, stop: threading.Event) -> None   # worker_start／worker_alive／worker_stop（source="bg_resolver"）；每 BG_POLL_INTERVAL_S poll_once
+    def final_drain(self, timeout_s: float = BG_FINAL_DRAIN_S) -> int   # 只查剩餘 pending；回逾時後剩餘數並記 bg_drain
+    def pending_count(self) -> int
+    max_pending_seen: int               # 測試用：觀測到的 pending 峰值
+```
 
 regression Windows：`plugin.execute_step` 不再判斷 `os.name`：刪除 `plugin.py:125-126` 的 `os.name=="nt"` 覆寫，保留既有 `core.runtime_skip(meta, self._missing_caps, self._broken_by, allow_destructive=...)` 呼叫（`core.py:86` 的實際簽章，不改），只在 `setup` 時把 `preflight` 依 `platform_missing_caps` 算出的平台缺項併入 `self._missing_caps`；SKIP 的 `reason_code` 為 `cap_missing:<cap>`、`category="environment"`。`f9-brcm-spaced-prompt-reboot-login` 以外原本在 Windows 一律 SKIP 的案例，凡 `requires` 不含缺少能力者改為實際執行。
 
@@ -2379,7 +2404,13 @@ def test_telnet_frontend_send_line_and_capture(fake_telnet_server, stub_sw):
 | `test_lr_mixed_death_requires_consecutive_and_dead_pid` | 連續 3 次 probe 失敗且 `pid_alive(last)` 為 False → `major daemon_death`；連續 3 次失敗但 `pid_alive` True → 不判死亡 |
 | `test_lr_mixed_agents_use_distinct_sources`（longrun_sources） | stub `SwCli` 記錄 argv：line／background 的 `cmd submit` 皆含 `--source agent:rhw<i>`，四個 worker 的 source 兩兩不同；interactive-open 的 `--owner` 與該 worker source 相同 |
 | `test_lr_mixed_worker_liveness_events` | 2 秒短跑後 events 中每個 worker 各有一筆 `worker_start` 與 `worker_stop`；每筆事件與 snapshot 含 `wall_ts` |
-| `test_lr_mixed_background_terminal_scan` | stub：background 送出得 `cmd_id`，收尾 `cmd status` 分別回 `done`、`error`、查無 → events 依序有 `bg_result` 對應 `done`／`error`；查無者無 `done`（留 unresolved） |
+| `test_background_results_survive_history_eviction`（longrun_sources；先寫、先紅） | 測試端 fake `EvictingCmdStore(history_max=512)` 照 `sw_core/arbiter.py:233-251` 實作：每次 submit 建一筆紀錄，完成時寫遞增 `done_at`；總數 >512 時依 `done_at` 淘汰最舊已完成者；被淘汰的 id 由 `cmd status` 回 `{"ok":false,"error_code":"CMD_NOT_FOUND","cmd_id":id}`。這個 fake 包成 stub `sw.run`。負載共 1,600 筆：1,100 筆 line 填充命令（submit 即 `done`）與 500 筆 background（submit 後第 1 次 `cmd status` 回 `running`、第 2 次起回 `done`）交錯送出；每送 8 筆呼叫一次 `tracker.poll_once()`，最後 `final_drain()`。斷言：(a) `store.evicted_count >= 1600 - 512`，證明確實發生淘汰；(b) 500 個 background `cmd_id` 各恰有 1 筆 `bg_result` 且 `status=="done"`；(c) `bg_lost` 為 0 筆；(d) `tracker.max_pending_seen <= BG_PENDING_MAX`，且 `<= 16`；(e) `final_drain` 期間呼叫 `cmd status` 的次數等於呼叫前的 `pending_count()`（≤ 8），收尾只處理未完成項；(f) `store.history_max == 512`，stub 收到的 argv 不含 `history` 字樣，`longrun.py` AST 中沒有 `CMD_HISTORY_MAX` 的賦值或 env 覆寫；(g) 對照組：用同一 store 與負載、全程不 poll、只在最後 `final_drain()`，得到 `bg_lost` ≥ 400 筆，且這些 `cmd_id` **沒有**任何 `bg_result`／`done`，證明查無不會被當成功 |
+| `test_bg_pending_bounded_backpressure` | `pending_max=4`，store 一律回 `running`：前 4 次 `add` 立即返回；第 5 次在 thread 中阻塞。另一 thread 0.2 s 後讓 store 完成第 1 筆並 `poll_once()`，第 5 次 `add` 才返回。events 有 1 筆 `bg_backpressure` 且 `wait_s >= 0.2`；任一時刻 `pending_count() <= 4`；已受理的 cmd_id 全部保留，沒有任何一筆被丟棄 |
+| `test_bg_result_carries_submit_pair_key` | `add("c1", source="agent:rhw2", com="COM1", round_=9)` 後 store 回 `done`：`bg_result` 的 `source=="agent:rhw2"`、`com=="COM1"`、`round==9`、`cmd_id=="c1"`、`latency_s >= 0`；回 `error` 與 `canceled` 時 `status` 原樣記錄、`error_code` 照抄 |
+| `test_bg_lost_never_counted_done` | store 對 `c1` 回 `CMD_NOT_FOUND`：記 1 筆 `bg_lost{cmd_id:"c1", reason:"CMD_NOT_FOUND"}`，沒有 `bg_result`／`done`；`pending_count()==0`；再 `poll_once()` 不再查 `c1` |
+| `test_bg_poll_error_keeps_pending` | 第 1 次 `cmd status` 回 `{"_error":"TIMEOUT"}`，第 2 次回 `done`：第 1 輪後 `c1` 仍在 pending，`bg_poll_error` 恰 1 筆；第 2 輪記 `bg_result status=done`。未知 `status:"weird"` 持續出現 → `bg_poll_error` 只記 1 筆，`c1` 一直留在 pending 直到收尾 |
+| `test_final_drain_only_pending` | 23 筆 add：20 筆已在執行期以 `bg_result` 結案，3 筆一直 `running`。`final_drain(timeout_s=0.5)` 只對這 3 個 id 呼叫 `cmd status`，已結案的 20 筆零查詢；回傳 3；記 `bg_drain{remaining:3}`；這 3 筆沒有 `bg_result` |
+| `test_lr_mixed_background_resolved_during_run` | `lr-mixed` 以 stub ctx 跑 2 s：background 送出得 `cmd_id`，stub `cmd status` 第 1 次就回 `done`。每個 `bg_result` 的 `t` 都小於 `stop` 事件的 `t`，代表在執行期寫入，不是收尾才查；events 有 `bg_resolver` 的 `worker_start` 與 `worker_stop`；不存在只有 `submit_accepted`、卻已在 store 標為 `done` 而未寫 `bg_result` 的 cmd_id |
 | `test_lr_mixed_human_uses_frontend` | 同上，stub human frontend 收到 `send_line("echo HUMAN_TICK_<n>")`；`analyze` 輸出鍵不變（`per_source`、`stuck_attached`、`pid_changes`、`daemon_death_at`、`rss_trend`） |
 | `test_ported_cases_require_human_frontend` | realhw `p0-console-raw`、7 個 `p1-con-*`、`p1-wal-reset`、`p1-wal-fullrun`、`p1-rst-reboot`、`lr-mixed` 的 `requires` 含 `human_frontend` 且不含 `tmux`；`p0-blog-clean` 仍含 `tmux`；`p1-ho-cycle` 的 `requires` 由本 Task **新增** `tmux` |
 | `test_realhw_requires_reflect_dependencies` | `p1-rst-daemon`、`p1-ho-persist` 含 `supervisor_runtime`；`p1-hp-cycle`、`p1-hp-reorder` 含 `usbipd`；`p1-hp-reorder` 另含 `supervisor_runtime`；在 `platform_missing_caps(os_name="nt")` 下這五案的 runtime skip 皆為 `cap_missing:*`（不會在 Windows 實際執行並因 `sudo`／`systemctl` 失敗） |
@@ -2398,7 +2429,7 @@ def test_telnet_frontend_send_line_and_capture(fake_telnet_server, stub_sw):
 | `test_no_foreground_busy`（no_foreground_busy） | `realhw/`、`regression/` 全部 `.py` 不含字串 `FOREGROUND_BUSY`（`GAP-G-12`） |
 | 既有回歸 | `tests/test_regression_preflight.py`、`test_regression_guards.py`、`test_regression_harness.py`、`test_regression_pluginfiles.py`、`test_regression_brcm_reboot.py`、`test_realhw_preflight.py`、`test_realhw_longrun.py`、`test_realhw_main.py`、`test_realhw_cases.py`、`test_realhw_harness.py`、`test_realhw_drivers.py`、`test_reliability_core.py`、`test_reliability_testbed.py`、`test_reliability_pluginfiles.py`、`test_reliability_reporter.py` 全部維持綠燈。不得修改斷言來遷就；本 Task 預告必須更新的斷言只有：`test_realhw_main.py` 的 `bench_lock_path` stub（零參數 → 接受 `cfg`／`os_name`）、`daemon status` stub 補 `version`、改以 `main(argv)` 呼叫；`test_realhw_longrun.py`／`test_realhw_drivers.py` 中 `cmd submit` argv 多出 `--source`、snapshot pid 來源。每處於 PR 說明並由審查確認語意不變（§10.4） |
 
-- [ ] **T14-2：執行並確認 FAIL**：`python3 -m pytest -q tests/test_realhw_frontends.py tests/test_realhw_procobs.py tests/test_realhw_pin_gate.py tests/test_regression_windows_caps.py tests/test_reliability_pin.py tests/test_no_foreground_busy.py tests/test_realhw_longrun_sources.py` → 函式內 import 的模組不存在、`FOREGROUND_BUSY` 仍存在、硬性 SKIP 仍存在、`--source` 未帶。
+- [ ] **T14-2：執行並確認 FAIL**：`python3 -m pytest -q tests/test_realhw_frontends.py tests/test_realhw_procobs.py tests/test_realhw_pin_gate.py tests/test_regression_windows_caps.py tests/test_reliability_pin.py tests/test_no_foreground_busy.py tests/test_realhw_longrun_sources.py` → 函式內 import 的模組不存在、`FOREGROUND_BUSY` 仍存在、硬性 SKIP 仍存在、`--source` 未帶、`BgResultTracker` 不存在（`test_background_results_survive_history_eviction` 以 ImportError／AttributeError 失敗）。
 - [ ] **T14-3：commit 測試**：`git commit -m "test(regression): 新增 L2/L3 pin 版本 gate、能力式 SKIP 與 Telnet frontend 失敗測試"`。
 
 ### I 步驟
@@ -2414,13 +2445,13 @@ def test_telnet_frontend_send_line_and_capture(fake_telnet_server, stub_sw):
 **Test author model:** codex-gpt-6-luna-max　**Implementer model:** haiku-xhigh
 **Changelog fragment:** `changelog.d/rust-p2-longrun-release-gate.md`（`type: feat`、`scope: realhw`）
 **BLOCKED-OWNER evidence:**
-- Linux 與 Windows 各一次修正後 Python 48 h `lr-mixed` 基線（OD-10：擁有者 bench、依序、同機同板經 usbipd、不可並行），含 `observer.ndjson`、WAL 目錄複本、`release-gate.json`（`mode=baseline`）。
+- Linux 與 Windows 各一次修正後 Python 48 h `lr-mixed` 基線（OD-10：擁有者 bench、依序、同機同板經 usbipd、不可並行），含 `observer.ndjson`、WAL 目錄複本、`release-gate.json`（`mode=baseline`）；Windows 另含 `excl/probes.ndjson`＋`excl/handoff.ndjson`（winexcl 原生 COM 獨占證據，R1-F7；真 `CreateFileW` 行為只能在擁有者 Windows bench 取得）。
 - OD-09 延後凍結項（`resources`、`min_effective_load`、`comparison_uncertainty`）的數值：須在上述基線完成後、任何 Rust 候選長跑前由擁有者裁決並寫入 `longrun_acceptance.yaml`（新 revision，`frozen_at` 早於候選 run）。在此之前所有 candidate 判定必為 `BLOCKED`。
 - `lr-mixed` 故障保留：長跑實例的外部監管自動重啟須關閉或以等價措施稽核（§15.11.2，Spike 8）——由擁有者在 bench 上設定並記錄。
 
 **Files:**
-- Create: `realhw/acceptance/__init__.py`、`realhw/acceptance/longrun_acceptance.yaml`、`realhw/acceptance/longrun_acceptance.schema.json`、`realhw/acceptance/gate.py`、`realhw/acceptance/observer.py`、`realhw/acceptance/walscan.py`、`realhw/acceptance/README.md`（含 48 h 基線執行程序：啟 observer → 啟 realhw longrun → 結束後複製 WAL → 執行 gate）
-- Create: `tests/test_longrun_acceptance_file.py`、`tests/test_longrun_gate.py`、`tests/test_longrun_observer.py`、`tests/test_longrun_walscan.py`
+- Create: `realhw/acceptance/__init__.py`、`realhw/acceptance/longrun_acceptance.yaml`、`realhw/acceptance/longrun_acceptance.schema.json`、`realhw/acceptance/gate.py`、`realhw/acceptance/observer.py`、`realhw/acceptance/walscan.py`、`realhw/acceptance/winexcl.py`（Windows 原生 COM 獨占開啟證據，R1-F7）、`realhw/acceptance/README.md`（含 48 h 基線執行程序：啟 observer →（Windows）`winexcl handoff --phase pre` → 啟 realhw longrun →（Windows）`winexcl handoff --phase post` → 結束後複製 WAL → 執行 gate）
+- Create: `tests/test_longrun_acceptance_file.py`、`tests/test_longrun_gate.py`、`tests/test_longrun_observer.py`、`tests/test_longrun_walscan.py`、`tests/test_longrun_winexcl.py`（`core_portable`、`memory_only`：以注入的假 opener／假 `SwCli` 驗判定，不開真 COM）
 
 **Interfaces:**
 
@@ -2439,6 +2470,7 @@ workload:
   snapshot_interval_s: 300
   observer_interval_s: 10
   max_observation_gap_factor: 2.0
+  windows_excl_probe_interval_s: 300   # Windows 長跑期間第二開啟探測週期（winexcl）；屬 workload 契約，A/B 兩側須相同（計入 workload_contract_sha256）
 counting:
   status: frozen
   frozen_at: "2026-10-15T00:00:00+00:00"
@@ -2449,10 +2481,11 @@ counting:
   worker_error_policy: count_as_unexpected_error
   definitions:
     submitted: "kind == submit"
-    completed: "kind == done，或 kind == bg_result 且 status == done（background 以收尾終態掃描為準；submit_accepted 不算完成）"
+    completed: "kind == done，或 kind == bg_result 且 status == done（background 以執行期收斂即時寫入的 bg_result 為準；submit_accepted 不算完成；bg_lost 不算完成）"
+    bg_lost: "kind == bg_lost（產品 history 淘汰前測試端未取得結果；不是終態，該 pair 計入 unresolved，並使 background_result_coverage 判 INSUFFICIENT_EVIDENCE）"
     expected_rejects: "kind in expected_reject_kinds，或 kind == error 且 detail 屬 expected_reject_error_codes"
     unexpected_errors: "kind == error 且非 expected reject；加上 kind == bg_result 且 status ∈ {error, canceled}；加上 worker_error（每個 (source, round) 至多計 1 次）"
-    unresolved: "submit 之後同 (source, round) 沒有 done／error／busy／worker_error／bg_result 終態（已計入 worker_error 的 pair 不再計 unresolved，避免分子重複）"
+    unresolved: "submit 之後同 (source, round) 沒有 done／error／busy／worker_error／bg_result 終態（bg_lost、bg_slow、bg_poll_error、bg_drain 都不是終態；已計入 worker_error 的 pair 不再計 unresolved，避免分子重複）"
     accepted: "submitted - expected_rejects"
     error_rate: "(unexpected_errors + unresolved) / accepted"
     effective_duration_s: "events stop.t - start.t，扣除 observer 判定該板非 READY 的確定區間（兩端樣本皆非 READY）；逐板計算"
@@ -2523,6 +2556,7 @@ evidence:
   require_observer: true
   require_wal_dir: true
   require_fault_retention_attestation: true   # §15.11.2／Spike 8：observer 首筆記錄監管自動重啟已關閉或等價措施
+  require_windows_exclusive_evidence: true    # §6.2 Windows：雙重持有判定以 dwShareMode=0 獨占開啟證據為準（winexcl），holder_unknown 只作診斷（R1-F7）
   context_time_tolerance_s: 2.0               # WAL wall_ts 與 events wall_ts 對齊容差；落在容差內的判定記為不確定
 ```
 
@@ -2559,6 +2593,7 @@ class GateInputs:
     observer_path: Path | None
     wal_dir: Path | None
     baseline_gate_path: Path | None
+    excl_evidence_path: Path | None = None   # winexcl 證據目錄 `excl/`（probes.ndjson＋handoff.ndjson）；platform=="windows" 時必要（缺 → safety_double_holder INSUFFICIENT_EVIDENCE），linux 忽略
 def load_acceptance(path: Path) -> tuple[dict[str, Any], dict[str, Any]]
     # (內容, {"path","revision","sha256","git_blob_sha1"})；schema 不符 raise ValueError
 def count_commands(events: list[dict[str, Any]], counting: dict[str, Any]) -> dict[str, dict[str, int]]
@@ -2572,13 +2607,16 @@ def stuck_bounds(samples: list[dict[str, Any]], *, interval_s: float) -> dict[st
 def evaluate(inputs: GateInputs) -> dict[str, Any]
 def main(argv: list[str] | None = None) -> int
     # python3 -m realhw.acceptance.gate --report-dir D --case-dir C --acceptance A --platform linux|windows
-    #   --mode baseline|candidate [--observer O] [--wal-dir W] [--baseline-gate B] --out release-gate.json
+    #   --mode baseline|candidate [--observer O] [--wal-dir W] [--baseline-gate B] [--excl-evidence E] --out release-gate.json
 
 # realhw/acceptance/observer.py（stdlib-only；只呼叫唯讀 `daemon status` 與 `session list`，絕不呼叫 interactive-status）
 def sample(sw: Any, boards: list[str]) -> dict[str, Any]
     # {"wall_ts","t_mono","daemon":{"ok","pid","version","multi_open","foreign_holders","holder_unknown","wal_healthy"},"sessions":{com: state},
     #  "procscan":{"other_serialwrapd":[pid...]|null}}（procobs.list_processes；無法列舉為 null）
-def header_record(*, supervision: dict[str, Any], platform: str) -> dict[str, Any]
+def header_record(*, supervision: dict[str, Any], platform: str,
+                  device_binding: dict[str, str | None] | None = None) -> dict[str, Any]
+    # device_binding：observer 啟動時由 `session list` 取每個受測 COM 的 `attached_real_path`（Windows 為 `COMn`），
+    #   寫入 header `"device_binding": {com: path}`；winexcl 探測的裝置必須等於此值，否則該筆證據不可歸屬（R1-F7）
     # observer.ndjson 第一行：{"kind":"header","platform","supervision":{"mode","auto_restart_disabled":bool|null,"evidence":str}}
     # supervision 由 `--supervision-attest FILE`（擁有者填寫的 JSON：mode、auto_restart_disabled、證據說明，如 `systemctl show -p Restart` 輸出）提供；
     # 未提供 → auto_restart_disabled:null
@@ -2608,7 +2646,79 @@ class SafetyContext:
     generation_ends: list[str]                            # 每個 frontend 世代結束的 wall_ts（minicom_dead）
 def build_safety_context(events: list[dict[str, Any]], observer: list[dict[str, Any]]) -> SafetyContext | None
     # events 或 observer 缺 wall_ts → None（呼叫端判 INSUFFICIENT_EVIDENCE）
+
+# realhw/acceptance/winexcl.py（stdlib-only；Windows 以 ctypes kernel32；不 import 產品碼與 uart_stdio_bridge）（R1-F7）
+# 目的：Windows 無法反查 holder（SC-17／GAP-G-03：Python 與 Rust 的 holders 一律 unknown），holder_unknown 恆為 true，
+#   不能作雙重持有的證據來源。§6.2 Windows 的保證是 CreateFileW(OPEN_EXISTING, dwShareMode=0) 的原生獨占開啟本身，
+#   因此改以「獨占開啟結果」取證：daemon 持有期間第二次開啟必被拒；release 後外部可取得；外部持有時 daemon attach 被拒；
+#   外部關閉後 daemon 重新取得。每筆證據綁定受測裝置（`attached_real_path`、`bridge_generation`）與 daemon 程序身分（pid＋建立時間）。
+#   holder_unknown／pids 照記於紀錄供診斷，不作判定依據。
+ERROR_ACCESS_DENIED = 5
+PROBE_SHARE_MODES = (0, FILE_SHARE_READ | FILE_SHARE_WRITE)   # 兩種 share mode 都須被拒：既有 handle 不允許共用（dwShareMode=0 的外部可觀測結果）
+@dataclass(frozen=True)
+class OpenAttempt:
+    share_mode: int
+    opened: bool
+    winerror: int | None              # opened=False → GetLastError()；opened=True → None
+@dataclass(frozen=True)
+class Binding:
+    com: str
+    state: str | None                 # session list 的 state
+    device: str | None                # session list 的 attached_real_path（Windows 為 COMn）
+    bridge_generation: int | None
+    daemon_pid: int | None            # daemon status 的 pid
+    daemon_created_at: int | None     # GetProcessTimes CreationTime（FILETIME 100 ns）；取不到 → None
+Opener = Callable[[str, int], OpenAttempt]
+def win_open(device: str, share_mode: int) -> OpenAttempt
+    # CreateFileW("\\\\.\\" + device, GENERIC_READ|GENERIC_WRITE, share_mode, None, OPEN_EXISTING, 0, None)；
+    # 成功 → 立即 CloseHandle。不呼叫 ReadFile／WriteFile／SetCommState／SetCommMask／PurgeComm／EscapeCommFunction／TransmitCommChar（零 I/O、不動 DTR／RTS）
+def win_hold(device: str) -> ContextManager[OpenAttempt]
+    # 同 win_open(share_mode=0) 但持有 handle 至 context 結束才 CloseHandle（handoff 的外部持有者）；同樣零 I/O
+def process_created_at(pid: int) -> int | None
+def read_binding(sw: Any, com: str) -> Binding          # 只呼叫唯讀 `daemon status` 與 `session list`
+def second_open_probe(sw: Any, com: str, *, expected_device: str, opener: Opener = win_open,
+                      identity: Callable[[int], int | None] = process_created_at,
+                      lock: "ProbeLock") -> dict[str, Any]
+    # 非阻塞取 lock（`<excl_dir>/.probe.lock`，LockFileEx）；取不到 → 不開檔，verdict="skipped"、reason="handoff_in_progress"
+    # before = read_binding；before.state != "READY"、device != expected_device、或 daemon_pid／daemon_created_at 為 None → 不開檔，
+    #   verdict="inconclusive"、reason ∈ {"not_ready","device_unbound","process_identity_unknown"}
+    # 依 PROBE_SHARE_MODES 順序各呼叫 opener 一次 → after = read_binding
+    # verdict：before == after（state READY、device、bridge_generation、daemon_pid、daemon_created_at 全同）時——
+    #   任一 attempt.opened → "violated"（daemon 同一 handle 世代持有期間外部仍取得 handle）；
+    #   全部 opened==False 且 winerror==ERROR_ACCESS_DENIED → "exclusive"；其他 winerror → "inconclusive"、reason="unexpected_winerror"
+    #   before != after → "inconclusive"、reason="binding_changed"（daemon 自行換 handle 世代，無法歸屬；opened 也不判 violated）
+    # 回 {"kind":"excl_probe","wall_ts","com","expected_device","before":Binding,"after":Binding,"attempts":[OpenAttempt],"verdict","reason"}
+def handoff_probe(sw: Any, com: str, *, phase: str, expected_device: str, opener: Opener = win_open,
+                  holder: Callable[[str], ContextManager[OpenAttempt]] = win_hold,
+                  identity: Callable[[int], int | None] = process_created_at,
+                  lock: "ProbeLock", ready_timeout_s: float = 120.0) -> dict[str, Any]
+    # 全程持有 lock（阻塞取得）；steps 依序且名稱固定：
+    #   1 "probe_before"：second_open_probe 必須 "exclusive"
+    #   2 "release"：`device release --selector com` → ok:true，session list 該 COM 為 RELEASED
+    #   3 "hold"：holder(device) 必須 opened（§6.2 交接：release 成功即 daemon handle 已關閉）
+    #   4 "attach_held"：持有期間 `device attach --selector com` 必須 ok:false、error_code=="DEVICE_STILL_HELD"，session 仍 RELEASED；
+    #      回應的 pids／holder_unknown 原樣記入 step（診斷，Windows 預期 pids:[]、holder_unknown:true；不參與 verdict）
+    #   5 "unhold"：關閉外部 handle
+    #   6 "attach"：`device attach --selector com` → ok:true，ready_timeout_s 內 session list 回 READY
+    #   7 "probe_after"：second_open_probe 必須 "exclusive"，且 after.bridge_generation > 步驟 1 的值（重新取得新 handle）、
+    #      daemon_pid／daemon_created_at 與步驟 1 相同（同一程序，非重啟後取得）
+    # verdict：步驟 1／7 任一 "violated"、步驟 3 opened==False 且 winerror==ERROR_ACCESS_DENIED（release 回成功但 handle 仍被持有）、
+    #   或步驟 4 回 ok:true（外部持有時 daemon 仍宣稱取得）→ "violated"；全部符合 → "exclusive"；
+    #   其餘（RPC 失敗、逾時未 READY、程序身分改變、generation 未前進、probe inconclusive）→ "inconclusive"（reason 為首個不符的 step）
+    # 回 {"kind":"excl_handoff","phase":"pre"|"post","wall_ts_start","wall_ts_end","com","expected_device",
+    #     "daemon":{"pid","created_at"},"steps":[{"name","ok","detail"}],"verdict","reason"}
+def main(argv: list[str] | None = None) -> int
+    # python3 -m realhw.acceptance.winexcl handoff --phase pre|post --serialwrap-exe X --boards COM0,COM1
+    #   --observer-header observer.ndjson --excl-dir D
+    #   expected_device 取 observer header 的 device_binding[com]；結果附加到 D/handoff.ndjson；非 Windows → exit 2（"windows only"）
+    #   exit：全部 board verdict=="exclusive" → 0；任一 "violated" → 1；其餘 → 4
+# observer.py（Windows 增補）：run_observer(..., excl_dir: Path | None = None, excl_probe_interval_s: float | None = None)；
+#   platform=="windows" 且兩者皆給 → 每 excl_probe_interval_s 對每個 board 呼叫 second_open_probe（expected_device 取 header device_binding），
+#   附加到 excl_dir/probes.ndjson；CLI `--excl-dir D --excl-probe-interval-s 300`。探測仍只呼叫唯讀 `daemon status`／`session list`，
+#   不得呼叫 `device release`／`attach`（只有 handoff CLI 可呼叫）。linux 不探測、不寫 probes.ndjson。
 ```
+
+**Windows 獨占證據契約（`safety_double_holder` 的 Windows 分支讀取；R1-F7）**：`GateInputs.excl_evidence_path` 指向 `excl/` 目錄，內含 `probes.ndjson`（observer 週期探測）與 `handoff.ndjson`（winexcl CLI）。gate 對 `observer` header `device_binding` 的每個 board 要求：(1) `phase=="pre"` 與 `phase=="post"` 的 `excl_handoff` 各至少一筆 `verdict=="exclusive"`，pre 的 `wall_ts_end` ≤ events `start` 的 `wall_ts`、post 的 `wall_ts_start` ≥ events `stop` 的 `wall_ts`；(2) pre、post 與所有計入的 probe 的 `daemon.pid`／`daemon_created_at` 相同，且等於 observer 全部非 null `daemon.pid`；(3) 每筆紀錄的 `expected_device` 與 `before.device` 等於 header `device_binding[com]`；(4) events `start`～`stop` 期間 `verdict=="exclusive"` 的 probe 時間序列（含 start→首筆、末筆→stop）相鄰間隔 ≤ `max_observation_gap_factor × windows_excl_probe_interval_s`，但 observer 確定非 READY 的區間（兩端樣本皆非 READY）不計入間隔。任一紀錄 `verdict=="violated"` 計入雙重持有事件數（>0 → FAIL，優先於證據不足）；(1)～(4) 任一不滿足或目錄／檔案缺 → INSUFFICIENT_EVIDENCE（`detail.missing`／`detail.gaps`／`detail.reason ∈ {"excl_evidence_missing","handoff_missing","device_unbound","process_identity_mismatch","probe_gap"}`）。`inconclusive`／`skipped` 不計 PASS 也不計 FAIL，只影響間隔。
 
 **判定規則（`evaluate`）**
 
@@ -2621,9 +2731,10 @@ def build_safety_context(events: list[dict[str, Any]], observer: list[dict[str, 
 | `pre_frozen` | evidence | 每個 `status: frozen` 項目的 `frozen_at` < `meta.started_at_utc` | 違反者其相依 check 改 BLOCKED（`detail.reason="NOT_PRE_FROZEN"`） |
 | `frozen_after_baseline` | evidence | candidate：每個原為 deferred、現為 frozen 的項目（該平台）`frozen_at` > baseline gate 的 `run.ended_at_utc` | 違反（基線前或與基線同時凍結）→ 相依 check BLOCKED（`detail.reason="FROZEN_BEFORE_BASELINE"`）；baseline 模式 → NOT_APPLICABLE_BASELINE |
 | `fault_retention_attested` | evidence | observer header `supervision.auto_restart_disabled is True`（§15.11.2、Spike 8） | null 或缺 header → INSUFFICIENT_EVIDENCE；false → INSUFFICIENT_EVIDENCE（故障可能被自動重啟掩蓋） |
-| `worker_liveness` | evidence | events 中每個預期 worker（`agent_workers` 個 agent、`human`、`orchestrator`）各有 `worker_start`，相鄰 `worker_alive` 間隔 ≤ `worker_heartbeat_max_gap_s`，且 `worker_stop` 只在 run 結束時出現 | 任一 worker 缺心跳或提前停止 → INSUFFICIENT_EVIDENCE（`detail` 列 worker 與缺口區段） |
+| `worker_liveness` | evidence | events 中每個預期 worker（`agent_workers` 個 agent、`human`、`orchestrator`、`bg_resolver`）各有 `worker_start`，相鄰 `worker_alive` 間隔 ≤ `worker_heartbeat_max_gap_s`，且 `worker_stop` 只在 run 結束時出現 | 任一 worker 缺心跳或提前停止 → INSUFFICIENT_EVIDENCE（`detail` 列 worker 與缺口區段） |
+| `background_result_coverage` | evidence | events 的 `bg_lost` 筆數：測試端在產品 history（512 筆）淘汰前沒有取得結果（Task 14 第 7 點）；`detail` 另記 `bg_backpressure` 總等待秒數、`bg_slow` 筆數、`bg_drain.remaining` | `bg_lost > 0` → INSUFFICIENT_EVIDENCE（屬工具故障，§15.11.4「工具故障不得判產品 PASS」）。這些 pair 仍以 unresolved 留在 `error_rate` 分子與 `accepted` 分母；本 check 不得把它們移出分母，也不得改判為完成。`bg_drain.remaining`（收尾時產品仍未終態）只計 unresolved，不影響本 check |
 | `safety_unauthorized_tx` | safety | `walscan.unauthorized_tx`（含合法 source 但落在確定禁止窗口者） | >0 → FAIL；缺 WAL、`problems`／`loss_flags` 非空、`context_missing`、或 `uncertain` 非空 → INSUFFICIENT_EVIDENCE |
-| `safety_double_holder` | safety | observer `multi_open==true`、`foreign_holders` 含自身 pid 以外的持有者、或 `procscan.other_serialwrapd` 非空 | >0 → FAIL；缺 observer → INSUFFICIENT_EVIDENCE；`platform=="windows"` 且任一樣本 `holder_unknown` 為 true 或 `procscan` 為 null（Python Windows holder 偵測恆失效，`GAP-G-03`；§6.2「查不到不代表沒有」）→ INSUFFICIENT_EVIDENCE，不得空洞 PASS |
+| `safety_double_holder` | safety | observer `multi_open==true`、`foreign_holders` 含自身 pid 以外的持有者、或 `procscan.other_serialwrapd` 非空 | >0 → FAIL；缺 observer → INSUFFICIENT_EVIDENCE。`platform=="windows"`（R1-F7）：Windows holders 一律 unknown（SC-17／`GAP-G-03`，Python 與 Rust 皆然），`holder_unknown`／`pids` **只作診斷**（`detail.holder_unknown_samples` 記筆數），不作判定依據，也不得因其為 true 判證據不足；改依上方「Windows 獨占證據契約」：任一 `excl_probe`／`excl_handoff` 紀錄 `verdict=="violated"` 計入事件數（>0 → FAIL）；否則 `excl_evidence_path` 缺、契約 (1)～(4) 任一不滿足、或任一 observer 樣本 `procscan` 為 null（多 daemon 偵測靠測試端 ToolHelp32，無法列舉即無證據）→ INSUFFICIENT_EVIDENCE（§6.2「查不到不代表沒有」：缺獨占證據仍不得空洞 PASS）；全部滿足 → PASS |
 | `safety_cross_context_replay` | safety | `walscan.cross_context_replay`（含 `stale_generation`：失效世代的輸入即使只出現一次） | >0 → FAIL；`context_missing` 或相關 `uncertain` 非空 → INSUFFICIENT_EVIDENCE |
 | `safety_dangerous_auto_resend` | safety | `walscan.dangerous_auto_resend` | >0 → FAIL |
 | `liveness_daemon_exit` | liveness | snapshots 的 `daemon_death` major 事件（Task 14：連續 3 次 probe 失敗且 pid 已不存在），或 observer `daemon.ok==false` 連續 ≥3 筆且同期 `procobs.pid_alive` 為 False；`pid: null` 視為無觀測 | 有 → FAIL；`pid: null` 連續超過 `max_observation_gap_factor × snapshot_interval_s` → `observation_gaps` 判 INSUFFICIENT |
@@ -2674,7 +2785,7 @@ def test_baseline_mode_never_claims_non_regression(tmp_path):
     assert all(c["result"] != "BLOCKED" for c in out["checks"])
 ```
 
-（`LongrunFixture` 為測試內建 builder：產生 `report.json`（含 `meta.started_at_utc`、`meta.cli_identity.pinned:true`）、`events.ndjson`、`snapshots.ndjson`（300 s）、`observer.ndjson`（10 s；48 h 以壓縮表示：builder 以參數產生、檔案實際寫出）、WAL 目錄（每個 marker 一筆 TX，crc 正確），以及以全部延後項填入假數值的 acceptance 副本供 PASS 路徑測試。）
+（`LongrunFixture` 為測試內建 builder：產生 `report.json`（含 `meta.started_at_utc`、`meta.cli_identity.pinned:true`）、`events.ndjson`、`snapshots.ndjson`（300 s）、`observer.ndjson`（10 s；48 h 以壓縮表示：builder 以參數產生、檔案實際寫出）、WAL 目錄（每個 marker 一筆 TX，crc 正確），以及以全部延後項填入假數值的 acceptance 副本供 PASS 路徑測試。`platform="windows"` 的 `healthy()` 另產生：observer 每筆 `holder_unknown:true`、`procscan.other_serialwrapd:[]`，header `device_binding={"COM0":"COM5","COM1":"COM6"}`；`excl/handoff.ndjson` 含每板 pre（`wall_ts_end` 早於 `start` 60 s）與 post（`wall_ts_start` 晚於 `stop` 60 s）各一筆 `verdict:"exclusive"`；`excl/probes.ndjson` 每 300 s 每板一筆 `verdict:"exclusive"`；全部紀錄 `daemon.pid==4242`、`daemon_created_at==133000000000000000`，與 observer pid 相同。builder 提供 `drop_excl_evidence()`、`drop_handoff(phase, com)`、`probe_gap(com, start_t, end_t)`、`set_probe(i, **fields)`、`set_handoff(phase, com, **fields)` 供變體測試。）
 
 其餘：
 
@@ -2682,7 +2793,7 @@ def test_baseline_mode_never_claims_non_regression(tmp_path):
 |---|---|
 | `test_acceptance_file_schema`（acceptance_file） | 正式檔以 `longrun_acceptance.schema.json` 驗證通過；`thresholds` 三個 OD-09 立即凍結項 `status=="frozen"`，`resources`／`min_effective_load`／`comparison_uncertainty` 為 `deferred`，且 `per_platform.linux`、`per_platform.windows` 兩組的數值欄位皆為 null；兩平台欄位集合恰為上方「延後項讀寫契約」表（`resources`：`{rss_peak_kb, rss_steady_kb, rss_slope_kb_per_h}`；`min_effective_load`：`{min_completed_per_board_source, max_idle_gap_s}`；`comparison_uncertainty`：`{error_rate_abs_tolerance, throughput_ratio_tolerance, stuck_s_tolerance, max_reruns}`）；schema 拒絕：缺少任一平台、改回單一純量、`per_platform.<os>` 多出欄位、`thresholds.resources.rss_peak_kb` 這類直接掛在 key 下的數值欄位、`comparison_uncertainty.tolerance` 子樹、`status: frozen` 但任一平台任一欄位為 null、`min_completed_per_board_source` 為純量 |
 | `test_allowed_source_regex_matches_engine` | `safety.allowed_tx_source_regex` 匹配 `agent:rhw0`～`agent:rhw7`、`human:<client_id>`、`system`、`system:recover`、`system:self_test`；不匹配 `agent`（未帶 `--source` 的預設值）與 `agent:intruder` |
-| `test_frozen_values_exact` | `max_ratio==0.01`、`min_ratio_of_baseline==0.95`、`min_continuous_duration_s==172800`、`allow_segment_stitching is False`、safety 四項皆 0 且 `waivable is False` |
+| `test_frozen_values_exact` | `max_ratio==0.01`、`min_ratio_of_baseline==0.95`、`min_continuous_duration_s==172800`、`allow_segment_stitching is False`、safety 四項皆 0 且 `waivable is False`、`workload.windows_excl_probe_interval_s==300`、`evidence.require_windows_exclusive_evidence is True` |
 | `test_single_source_of_thresholds` | repo 中除本檔與其 schema、測試外，沒有其他檔案出現 `0.95` 搭配 `throughput` 或 `172800` 字樣（`realhw/`、`reliability/`、`regression/` 掃描） |
 | `test_engine_does_not_import_yaml_or_gate` | `realhw/*.py`、`realhw/cases/*.py`（不含 `realhw/acceptance/gate.py`）AST 無 `import yaml`、無 `realhw.acceptance.gate` |
 | `test_all_frozen_filled_candidate_pass`（gate） | 以填好延後項（`frozen_at` 早於 run）的 acceptance 副本、健康候選與健康基線 → `PASS` |
@@ -2695,7 +2806,8 @@ def test_baseline_mode_never_claims_non_regression(tmp_path):
 | `test_unresolved_stays_in_denominator` | 100 submit、95 done、5 無後續 → `unresolved==5`、`error_rate==0.05` → `error_rate_absolute` FAIL |
 | `test_busy_is_expected_reject` | 100 submit、10 busy、90 done → `accepted==90`、`error_rate==0` |
 | `test_worker_error_counts` | 1 筆 `worker_error`（其 `submit` 已發出）→ 計入 `unexpected_errors` 1 次、`unresolved` 0 次（不重複計分子） |
-| `test_background_counted_by_terminal_scan` | background `submit`＋`submit_accepted` 無 `bg_result` → unresolved；`bg_result status=error` → unexpected_errors；`bg_result status=done` → completed |
+| `test_background_counted_by_runtime_result` | background `submit`＋`submit_accepted` 無 `bg_result` → unresolved；`bg_result status=error` → unexpected_errors；`bg_result status=done` → completed；`bg_result` 以原 submit 的 `(source, round)` 配對 |
+| `test_bg_lost_unresolved_and_insufficient` | 100 筆 background submit：97 筆 `bg_result status=done`、3 筆 `submit_accepted`＋`bg_lost` → `completed==97`、`unresolved==3`、`accepted==100`（分母不縮）、`error_rate==0.03`；`background_result_coverage` 為 INSUFFICIENT_EVIDENCE，`detail.bg_lost==3`；`bg_lost` 不讓任何 pair 計為 completed。另一組：0 筆 `bg_lost`、2 筆收尾 `bg_drain{remaining:2}` → `background_result_coverage` PASS，該 2 筆計 unresolved |
 | `test_effective_hour_excludes_non_ready` | 48 h run 中某板確定非 READY 2 h：該板 `effective_hour==46`，throughput 以 46 h 為分母 |
 | `test_stuck_bounds_open_segment` | 樣本 t=[0,300,600] 狀態 [READY,ATTACHED,ATTACHED]、run_end_t=700 → 一段 `open:true`、`lower=300`、`upper=700` |
 | `test_error_rate_per_board_source` | 整體 0.5% 但板 `COM1`、來源 `agent:rhw2` 為 2% → FAIL |
@@ -2705,7 +2817,24 @@ def test_baseline_mode_never_claims_non_regression(tmp_path):
 | `test_safety_unauthorized_tx_fail` | WAL 有一筆 `source=="agent:intruder"` 的 TX → FAIL |
 | `test_safety_missing_wal_insufficient` | `wal_dir=None` → 四個 safety check 皆 INSUFFICIENT_EVIDENCE |
 | `test_safety_double_holder_fail` | observer 一筆 `multi_open:true` → FAIL |
-| `test_safety_double_holder_windows_unknown_insufficient` | `platform="windows"`、所有樣本 `multi_open:false` 但 `holder_unknown:true` → INSUFFICIENT_EVIDENCE（不得 PASS） |
+| `test_safety_double_holder_windows_exclusive_evidence_pass`（取代舊 `test_safety_double_holder_windows_unknown_insufficient`；R1-F7 配對測試之一，先寫、須先 FAIL：舊規則見 `holder_unknown:true` 即判 INSUFFICIENT） | `platform="windows"` 的 `healthy()`（所有樣本 `multi_open:false`、`holder_unknown:true`、`procscan.other_serialwrapd:[]`，完整 `excl/`）→ `safety_double_holder` 的 `result=="PASS"`、`detail.holder_unknown_samples == len(observer 樣本)`（診斷保留）；同 fixture `mode="baseline"` → `baseline_result=="PASS"`；`mode="candidate"`＋填好延後項的 acceptance → `release_gate_result=="PASS"` |
+| `test_safety_double_holder_windows_missing_evidence_insufficient`（R1-F7 配對測試之二） | 同上 fixture，各變體 `safety_double_holder` 皆 `INSUFFICIENT_EVIDENCE`、不得 PASS：`excl_evidence_path=None` → `detail.reason=="excl_evidence_missing"`；`drop_handoff("post","COM1")` → `reason=="handoff_missing"`、`detail.missing==["handoff:post:COM1"]`；pre 的 `wall_ts_end` 晚於 events `start` → `handoff_missing`；`probe_gap("COM0", 3600, 4500)`（900 s > 2×300，期間 observer COM0 皆 READY）→ `reason=="probe_gap"`、`detail.gaps==[{"com":"COM0","from_t":3600,"to_t":4500}]`；同區間 observer COM0 兩端樣本皆 `RELEASED` → 該缺口不計、PASS；`set_probe(5, expected_device="COM9")` → `device_unbound`；`set_handoff("post","COM0", daemon={"pid":4242,"created_at":133000000000000001})` → `process_identity_mismatch`；全部 probe 改 `verdict:"inconclusive"` → `probe_gap`；任一樣本 `procscan:null` → INSUFFICIENT_EVIDENCE |
+| `test_safety_double_holder_windows_violation_fail` | 完整 `excl/` 但 `set_probe(7, verdict="violated")` → `safety_double_holder` FAIL、`detail.events==1`；`set_handoff("pre","COM1", verdict="violated")` 且同時 `excl_evidence_path` 其餘缺項 → 仍 FAIL（FAIL 優先於證據不足）；`release_gate_result=="FAIL"` |
+| `test_safety_double_holder_linux_ignores_excl_evidence` | `platform="linux"` 健康 fixture、`excl_evidence_path=None`、樣本無 `holder_unknown` 欄 → `safety_double_holder` PASS（Linux 規則不變；`excl/` 只在 Windows 讀） |
+| `test_winexcl_second_open_exclusive`（winexcl；`tests/test_longrun_winexcl.py`） | 假 `SwCli`：before／after 皆 `{state:"READY", attached_real_path:"COM5", bridge_generation:3}`、`daemon status.pid==4242`；`identity` 恆回 `133000000000000000`；假 opener 兩次皆回 `OpenAttempt(opened=False, winerror=5)` → `verdict=="exclusive"`、`[a.share_mode for a in attempts]==[0, 3]`（`FILE_SHARE_READ\|FILE_SHARE_WRITE==3`）、`before==after` |
+| `test_winexcl_second_open_opened_is_violated` | 同上但 share_mode 0 的 attempt 回 `opened=True` → `verdict=="violated"`；`len(attempts)==2`（仍做完兩種 share mode） |
+| `test_winexcl_probe_not_ready_does_not_open` | before `state=="RELEASED"`（或 `ATTACHED`）→ 假 opener 呼叫次數 0、`verdict=="inconclusive"`、`reason=="not_ready"`；`attached_real_path=="COM9"`（≠ expected `COM5`）→ opener 0 次、`reason=="device_unbound"`；`identity` 回 None → opener 0 次、`reason=="process_identity_unknown"` |
+| `test_winexcl_binding_changed_inconclusive` | after `bridge_generation==4`（before 3）：opener 回 `opened=True` → `verdict=="inconclusive"`、`reason=="binding_changed"`（不得判 violated）；opener 回拒絕 → 同樣 `inconclusive` |
+| `test_winexcl_unexpected_winerror_inconclusive` | opener 回 `winerror=2`（FILE_NOT_FOUND）→ `inconclusive`、`reason=="unexpected_winerror"`（不得判 exclusive） |
+| `test_winexcl_probe_skips_when_lock_busy` | 假 lock `try_acquire()` 回 False → opener 0 次、`verdict=="skipped"`、`reason=="handoff_in_progress"` |
+| `test_winexcl_handoff_full_cycle_exclusive` | 假 `SwCli` 腳本：release ok→RELEASED；holder 回 opened；持有期間 attach 回 `{"ok":false,"error_code":"DEVICE_STILL_HELD","pids":[],"holder_unknown":true,"selector":"COM0"}`；unhold 後 attach ok、第 2 次 `session list` 為 READY、`bridge_generation` 3→4；pid／created_at 不變 → `verdict=="exclusive"`；`[s["name"] for s in steps]==["probe_before","release","hold","attach_held","unhold","attach","probe_after"]`；`steps[3]["detail"]["holder_unknown"] is True` 且 `pids==[]`（診斷照記）；假 `SwCli` 呼叫序列中 `device attach` 恰 2 次、`device release` 恰 1 次 |
+| `test_winexcl_handoff_attach_ok_while_held_violated` | 同上但持有期間 attach 回 `ok:true` → `verdict=="violated"`、`reason=="attach_held"` |
+| `test_winexcl_handoff_hold_denied_after_release_violated` | release 回 ok 但 holder 回 `opened=False, winerror=5` → `verdict=="violated"`、`reason=="hold"`；holder 回 `winerror=2` → `inconclusive`、`reason=="hold"` |
+| `test_winexcl_handoff_identity_or_generation_inconclusive` | probe_after 的 `daemon_created_at` 與 probe_before 不同 → `inconclusive`、`reason=="probe_after"`；`bridge_generation` 未前進（仍 3）→ `inconclusive`；attach 後 `ready_timeout_s=0.2` 內未見 READY → `inconclusive`、`reason=="attach"` |
+| `test_winexcl_no_io_calls` | `realhw/acceptance/winexcl.py` 原始碼（AST Name／Attribute／字串常值）不含 `ReadFile`、`WriteFile`、`SetCommState`、`SetCommMask`、`PurgeComm`、`EscapeCommFunction`、`TransmitCommChar`；`win_open`／`win_hold` 的 `CreateFileW` 引數以 monkeypatch 的假 kernel32 記錄：`dwCreationDisposition==OPEN_EXISTING`、`dwDesiredAccess==GENERIC_READ\|GENERIC_WRITE`、`win_hold` 的 `dwShareMode==0`；成功後 `CloseHandle` 恰 1 次 |
+| `test_winexcl_cli_non_windows_exit2` | `os.name != "nt"` 下 `main(["handoff","--phase","pre",...])` → exit 2、stderr 含 `windows only`、不呼叫任何 `SwCli` |
+| `test_observer_windows_excl_probes`（observer） | `platform="windows"`、`excl_dir=tmp`、`excl_probe_interval_s=0.05`、duration 0.3 s、假 opener 回拒絕 → `probes.ndjson` 每板 ≥4 筆 `kind=="excl_probe"`；header 含 `device_binding`；stub `SwCli` 呼叫仍只有 `("daemon","status")` 與 `("session","list")`（`test_observer_readonly_calls` 不變） |
+| `test_observer_linux_no_excl_probes` | `platform="linux"` 即使給 `excl_dir` → 不建立 `probes.ndjson`、不呼叫 opener |
 | `test_cross_context_replay_single_occurrence_fail` | `HUMAN_TICK_5` 於 `tick` 事件後、下一個 `minicom_dead` 之後才首次出現在 WAL TX（只出現一次）→ `cross_context_replay` 1 筆（`stale_generation`）→ FAIL |
 | `test_unauthorized_tx_legit_source_in_forbidden_window` | `agent:rhw1` 的 TX 落在 observer 兩端樣本皆 `RELEASED` 的窗口內 → FAIL；落在窗口邊界 ±1 s → `uncertain` → INSUFFICIENT_EVIDENCE |
 | `test_safety_missing_context_insufficient` | events 缺 `wall_ts` → `build_safety_context` 回 None → `safety_unauthorized_tx`、`safety_cross_context_replay` 皆 INSUFFICIENT_EVIDENCE |
@@ -2731,12 +2860,12 @@ def test_baseline_mode_never_claims_non_regression(tmp_path):
 | `test_walscan_crc_problem` | 一筆 crc 錯 → `problems` 非空 |
 | `test_walscan_archives_included` | 歸檔 `raw.wal.ndjson.20261015-030617` 的紀錄被讀入 |
 
-- [ ] **T15-2：執行並確認 FAIL**：`python3 -m pytest -q tests/test_longrun_acceptance_file.py tests/test_longrun_gate.py tests/test_longrun_observer.py tests/test_longrun_walscan.py` → 模組與檔案不存在。
+- [ ] **T15-2：執行並確認 FAIL**：`python3 -m pytest -q tests/test_longrun_acceptance_file.py tests/test_longrun_gate.py tests/test_longrun_observer.py tests/test_longrun_walscan.py tests/test_longrun_winexcl.py` → 模組與檔案不存在。
 - [ ] **T15-3：commit 測試**：`git commit -m "test(realhw): 新增長跑門檻檔、外層發版判定器與觀測器的失敗測試"`。
 
 ### I 步驟
 
-- [ ] **I15-1：實作** 上列檔案；`README.md` 寫 48 h 基線程序：(1) 確認 bench lock 與無其他 pytest／testpilot；(2) 關閉該實例的監管自動重啟並把設定證據寫成 `supervision-attest.json`（§15.11.2）；(3) 啟 `observer --supervision-attest supervision-attest.json` 背景程序；(4) `python3 -m realhw --tier longrun --duration 48h`（pinned exe）；(5) 結束後複製 `daemon status.wal_path` 所在目錄到 report 目錄 `wal/`；(6) `python3 -m realhw.acceptance.gate --mode baseline ...`；(7) 保存所有 hash。Windows 版步驟改用 `py -3.12` 與 `bench_lock_path`。
+- [ ] **I15-1：實作** 上列檔案；`README.md` 寫 48 h 基線程序：(1) 確認 bench lock 與無其他 pytest／testpilot；(2) 關閉該實例的監管自動重啟並把設定證據寫成 `supervision-attest.json`（§15.11.2）；(3) 啟 `observer --supervision-attest supervision-attest.json` 背景程序（Windows 另加 `--excl-dir <report>/excl --excl-probe-interval-s <workload.windows_excl_probe_interval_s>`）；(3a) Windows：`py -3.12 -m realhw.acceptance.winexcl handoff --phase pre --boards … --observer-header observer.ndjson --excl-dir <report>/excl`，exit 0 才繼續（exit 1 → 停止並保留現場；exit 4 → 排除後重做 pre，不得跳過）；(4) `python3 -m realhw --tier longrun --duration 48h`（pinned exe）；(4a) Windows：longrun 結束後、停止 observer 前執行 `winexcl handoff --phase post`（同參數），結果照實保存（非 0 由 gate 判定）；(5) 結束後複製 `daemon status.wal_path` 所在目錄到 report 目錄 `wal/`；(6) `python3 -m realhw.acceptance.gate --mode baseline ...`（Windows 加 `--excl-dir` 對應的 `--excl-evidence <report>/excl`）；(7) 保存所有 hash（含 `excl/*.ndjson`）。Windows 版步驟改用 `py -3.12` 與 `bench_lock_path`。
 - [ ] **I15-2：執行並確認 PASS**：上列測試全綠；`python3 -m pytest -q tests/` 無新失敗。
 - [ ] **I15-3：commit**：`git commit -m "feat(realhw): 新增 longrun_acceptance.yaml 唯一門檻檔與保留 engine_result 的外層發版判定器"`＋fragment。
 
@@ -2771,7 +2900,7 @@ def test_baseline_mode_never_claims_non_regression(tmp_path):
 | B5 | Windows bench（Spike 7）：Telnet frontend 下 F5／`p0-console-raw`／`p1-con-*`／`lr-mixed` 實跑、共用 bench lock 實際共鎖、Windows RSS | §13 Spike 7、§15.8.4 | 14 | 擁有者 Windows bench |
 | B6 | 破壞性案例授權執行（F9、F10、`f11-flood-probe-classified`、`p1-rst-*`、`p1-ho-*`、`p1-hp-*`） | §11.5「破壞性測試必須顯式授權」 | 12、14 | 擁有者授權與目標板 |
 | B7 | `f4-background-result-tail-consistent` Stage 0 bench 實跑結果；若紅燈，XFAIL 哨兵登記（issue、特徵、期限） | `TST-D-6`、§11.4 | 12 | 擁有者 bench 與核准 |
-| B8 | Linux、Windows 各一次修正後 Python 48 h `lr-mixed` 基線（含 observer、WAL 複本、`release-gate.json` baseline 模式） | OD-10、§11.6、§15.11.5 | 15 | 擁有者 bench，兩平台依序、不可並行，約 5 天 bench 佔用 |
+| B8 | Linux、Windows 各一次修正後 Python 48 h `lr-mixed` 基線（含 observer、WAL 複本、`release-gate.json` baseline 模式；Windows 另含 `excl/probes.ndjson`＋`excl/handoff.ndjson` 原生 COM 獨占證據，R1-F7） | OD-10、§11.6、§15.11.5 | 15 | 擁有者 bench，兩平台依序、不可並行，約 5 天 bench 佔用 |
 | B9 | OD-09 延後凍結項數值（RSS／資源、最低有效負載與樣本、比較不確定性）於基線後、Rust 候選長跑前寫入新 revision | OD-09、§14.2 | 15 | 擁有者裁決 |
 | B10 | 長跑實例關閉監管自動重啟或等價故障保留措施的設定紀錄 | §15.11.2、Spike 8 | 15 | 擁有者 bench 設定 |
 | B11 | `p2-1-mcu-flash-manual` 程序的實機執行與證據 | §11.6 Slice 2.4 | 12 | 擁有者實機（DUT console＋FTDI MCU 線） |

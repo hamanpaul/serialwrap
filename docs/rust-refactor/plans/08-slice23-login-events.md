@@ -125,7 +125,7 @@ ID 選擇：SC-28／SC-29 已由 P6（07 T0 D-11／D-12）占用，本 Phase 取
 
 `behavior_changes.yaml` 條目依 P0 schema（01 T5，頂層鍵 `changes`）撰寫，欄位：`id`、`kind`、`title`、`status`、`approval{owner, date, basis: reconciliation, decision_ref}`、`owner_confirmation: not_required`、`applies_to{python, rust: {stage: slice-2.3}}`、`approved_at_revision`（catalog revision；P0 禁止 `contract_revision` 鍵）、`ab_participation`（SC-30 `absolute_only`、DF-18 `diff`）、`spec_refs`、`reconciliation_refs`、`scope`、`phases: [P7]`（DF-18 另加 `P1`）、`case_ids`、`compatibility_impact`、`approval_conditions`、`related_decisions`。SC-30：`scope: rust_only`、`applies_to.python: null`、`case_ids: [sc30-quiet-mid-login-aborts]`。DF-18：`scope: both`、`applies_to.python: {min_version: <Task 13 commit 當下 VERSION 的下一個 patch>}`、`case_ids: [df18-event-replace-overwrite]`。
 
-**細化（不新增 ID，調和表 §1 對應列補一句）**：SC-11（有序關機總上限 5 s）延伸到 Event Engine：daemon 停止時 `EventEngine::stop(deadline)` 在剩餘預算內等 handler，逾時以 `HandlerSpawner` 終止仍在跑的 process group／Job，並寫 WARNING `event dispatcher shutdown 逾時，終止 %d 個 handler`（Python `shutdown(wait=True)` 無上限，屬 SC-11 已核准範圍；Task 15、Task 16 覆蓋，arch §6.1 補一列）。
+**細化（不新增 ID，調和表 §1 對應列補一句）**：SC-11（有序關機總上限 5 s）延伸到 Event Engine：daemon 停止時先於 drain Phase 1 前 `EventEngine::close_intake()`（matcher 停、不再 spawn handler），drain Phase 2 之後、WAL close 之前 `EventEngine::stop(deadline)` 以 drain 的同一共用期限等 handler，逾時以 `HandlerSpawner` 終止仍在跑的 process group／Job 並最多再等 100 ms 回收，寫 WARNING `event dispatcher shutdown 逾時，終止 %d 個 handler`；仍未回收者列入 `DispatcherStopReport.unreaped` 並使 exit 1（R1-F2；完整停止序見 P8 Task 12）（Python `shutdown(wait=True)` 無上限，屬 SC-11 已核准範圍；Task 15、Task 16 覆蓋，arch §6.1 補一列）。
 
 ### 0.6 與 P5／P6 既有實作的差異表（本 Phase 唯一允許的改動範圍）
 
@@ -1900,8 +1900,10 @@ impl Dispatcher {
     pub fn start(per_daemon_max: usize, spawner: Arc<dyn HandlerSpawner>, counters: Arc<CounterStore>, emit: Arc<dyn Fn(PyDict) + Send + Sync>,
                  env: Arc<dyn SysEnv>, clock: Arc<dyn Clock>) -> Self;
     pub fn dispatch(&self, fire: MatcherFire, matched_line: String);
-    pub fn stop(self, deadline: std::time::Instant) -> usize;   // 等 handler 結束直到 deadline；逾時對仍在跑者 `HandlerAbort::trigger()`（終止 process group／Job）並回傳被終止數，寫 WARNING `event dispatcher shutdown 逾時，終止 %d 個 handler`（SC-11 細化，§0.5）
+    pub fn close_intake(&self);                                 // 冪等；之後 dispatch() 直接丟棄（不 spawn、不計 fire_count），已在跑的 handler 不受影響（R1-F2）
+    pub fn stop(self, deadline: std::time::Instant) -> DispatcherStopReport;   // 先 close_intake；等 handler 結束直到 deadline；逾時對仍在跑者 `HandlerAbort::trigger()`（終止整個 process group／Job），之後最多再等 100 ms 讓 worker 的 `run` 回收子行程樹返回；寫 WARNING `event dispatcher shutdown 逾時，終止 %d 個 handler`（SC-11 細化，§0.5）
 }
+pub struct DispatcherStopReport { pub aborted: usize, pub unreaped: Vec<String> /* 100 ms 寬限後 run 仍未返回的 rule_id，依 rule_id 排序 */ }
 ```
 
 - [ ] **Step 1：寫失敗測試**
@@ -1951,7 +1953,9 @@ fn per_rule_busy_then_saturation_drop_new() {
 | `stdout_tail_decoded_replace` | tail 切在多位元組中間 → 解碼以 U+FFFD 取代 |
 | `shell_handler_uses_platform_argv` | `handler.shell` → `spawner.shell_argv(shell)` 的結果被傳入 |
 | `inherited_env_only_whitelisted_present` | SysEnv 有 `PATH`、`SECRET` → env 只含 `PATH` 與 11 個 `SERIALWRAP_EVENT_*` |
-| `stop_deadline_aborts_running_handlers` | `FakeHandlerSpawner::blocking()` 不 release；`stop(now+200ms)` 在 ≤ 300 ms 內返回、回傳 1、該 handler 的 `HandlerAbort` 已 trigger、WARNING 逐字 |
+| `stop_deadline_aborts_running_handlers` | `FakeHandlerSpawner::blocking()` 不 release；`stop(now+200ms)` 在 ≤ 300 ms 內返回、回傳 `DispatcherStopReport{aborted:1, unreaped:[]}`、該 handler 的 `HandlerAbort` 已 trigger、WARNING 逐字 |
+| `close_intake_rejects_new_dispatch`（R1-F2） | 一個 handler 執行中 → `close_intake()` → 再 `dispatch` 同 rule 與另一 rule 各一次 → `FakeHandlerSpawner.spawn_count()` 不增、`fire_count` 不增；原 handler 不被 abort（`HandlerAbort` 未 trigger），release 後正常完成 |
+| `stop_reports_unreaped_when_run_ignores_abort`（R1-F2） | `FakeHandlerSpawner::ignore_abort()`（本 Task 於 Task 0 的 fake 增補：abort 後 `run` 仍不返回）→ `stop(now+200ms)` 在 ≤ 300 ms 內返回 `{aborted:1, unreaped:["r1"]}`，不無界等待 |
 
 - [ ] **Step 2：執行，預期 FAIL**：`cargo test -p sw-core --features test-fakes --test event_dispatcher`。
 - [ ] **Step 3：實作**：照 09 §3.6 與 `dispatcher.py:150-246`；`duration_ms = (wall_now_ms - start_ms)`（`time.time()` 語意，整數截斷）；worker 為固定 8 執行緒＋有界 job channel（容量 8，`dispatch` 前已以 inflight 檢查保證不阻塞）。
@@ -1983,7 +1987,8 @@ pub struct EventEngine;
 impl EventEngine {
     pub fn new(d: EngineDeps) -> PalResult<Self>;
     pub fn start(&self) -> Result<(), PyErr>;
-    pub fn stop(&self, deadline: std::time::Instant);          // matcher.stop → dispatcher.stop(deadline)（SC-11 細化）
+    pub fn close_intake(&self);                                // 冪等：matcher.stop → dispatcher.close_intake；之後 feed_rx 為 no-op、不再 spawn handler（daemon 停止序於 Phase 1 前呼叫，R1-F2）
+    pub fn stop(&self, deadline: std::time::Instant) -> DispatcherStopReport;   // close_intake（若未呼叫）→ dispatcher.stop(deadline)（SC-11 細化）；daemon 停止序於 drain Phase 2 之後、WAL close 之前呼叫
     pub fn feed_rx(&self, com: &str, data: &[u8], wal_seq: u64);   // per-COM LineBuffer（永不重設，EVT-D-S5）→ enabled 才 feed_line
 // EventEngine 以 `impl RxObserver`（Task 16-wire 定義的 trait）轉呼 feed_rx
     pub fn rule_set(&self, obj: &PyValue) -> Result<Arc<Rule>, UpsertError>;
@@ -2085,7 +2090,7 @@ fn rule_set_response_spreads_raw_with_ok_first() {
 **Files:**
 - Modify: `crates/sw-core/src/uart_bridge.rs`（06 T10 `ReaderCtx.observers`；reader 在 `WalWriter::append` 回傳後以 `WalAppend.seq` 依序呼叫每個 observer，observer panic 以 `catch_unwind` 吞掉，等價 Python `except Exception: pass`）
 - Modify: `crates/sw-core/src/session_manager.rs`（`impl BridgeQueries for SessionManager`：語意逐字照 `session_manager.py:1007-1030`：`active_cmd_id_for`＝該 com 的 session `foreground_busy` 時回字面 `"foreground"`、否則 None（永不回真實 cmd_id，EVT-D-E3 KEEP）；`profile_for`＝`profile.profile_name`；`known_coms`＝`sorted(com)`（升冪）；值由 actor 在狀態改變時發布到 manager 的唯讀快照（`ArcSwap` 等價的 `Mutex<Arc<..>>`），查詢不經 actor mailbox；manager 在建立每個 reader 時注入 `[EventEngine, CaptureObserver]` 兩個 observer）
-- Modify: `crates/sw-daemon/src/daemon_main.rs`（start：engine.start → 註冊 observer 工廠 → initial scan／watcher／bootstrap；stop：server.stop → `engine.stop(剩餘預算)` → session drain（總上限 5 s 由 SC-11 共用））、`docs/rust-refactor/plans/rust-architecture.md` §6.1（同步，Task 0 已登記）
+- Modify: `crates/sw-daemon/src/daemon_main.rs`（start：engine.start → 註冊 observer 工廠 → initial scan／watcher／bootstrap；stop：server.stop → `manager.begin_shutdown()` → watcher.stop → `engine.close_intake()` → session drain（P5 `manager.shutdown(5 s)`；P8 拆為 Phase 1／2）→ `engine.stop(drain 共用期限)` → WAL close（handler 與 drain 並行、共用 SC-11 的 5 s 總上限；`report.unreaped` 非空記入 `incomplete`；P8 Task 12 為完整停止序權威，R1-F2））、`docs/rust-refactor/plans/rust-architecture.md` §6.1（同步，Task 0 已登記）
 - Create: `crates/sw-core/tests/rx_observer_wiring.rs`、`crates/sw-daemon/tests/event_lifecycle.rs`
 
 **Interfaces：**
@@ -2107,7 +2112,8 @@ impl sw_core::event_engine::BridgeQueries for SessionManager { /* known_coms, pr
 | `observer_panic_is_contained` | 一個 observer panic → 下一個 observer 仍收到、reader 不中止 |
 | `bridge_queries_reflect_manager_state` | 兩個 session、一個前景命令中 → `known_coms`、`profile_for` 值正確；前景中的 com → `active_cmd_id_for == Some("foreground")`、閒置 com → None；不存在的 com → None |
 | `engine_started_before_bootstrap_attach`（`event_lifecycle.rs`） | 啟動時 bootstrap attach 產生的第一個 RX chunk 也被 engine 看到 |
-| `shutdown_aborts_long_handler_within_budget` | handler `sleep 60` 執行中送 `daemon.stop` → daemon 在 5 s 內結束、handler 行程樹已不存在、stderr 有 `event dispatcher shutdown 逾時` WARNING |
+| `shutdown_aborts_long_handler_within_budget` | handler `sleep 60` 執行中送 `daemon.stop` → daemon 在 5.1 s 內結束（5 s 共用期限＋100 ms 回收寬限）、handler 行程樹已不存在、stderr 有 `event dispatcher shutdown 逾時` WARNING |
+| `shutdown_closes_event_intake_before_drain`（R1-F2，修正前必 FAIL） | in-process `run_with_hooks`、一條 rule 的 handler 執行中送 stop，以 test-fakes hook 在 `EngineCloseIntake` 之後、drain 開始前令 FakeSerial 再吐一行命中同 rule 與另一 rule 的 RX → trace 後段恰為 `[ServerStopped, ShutdownGate, WatcherStopped, EngineCloseIntake, SessionsDrained{..}, EngineStop{aborted:1, unreaped:[]}, WalShutdown{ok:true}, LockReleased]`（P5 trace 名稱；P8 拆 Phase 1／2 後 `EngineStop` 位於 `drain.phase2`／`flush_shutdown` 之後）；`FakeHandlerSpawner.spawn_count()` 自 `EngineCloseIntake` 起不再增加；`WalShutdown` 之後 events log 與 WAL 皆無新 append |
 
 - [ ] **Step 2：執行，預期 FAIL**：`cargo test -p sw-core --features test-fakes --test rx_observer_wiring`；`cargo test -p sw-daemon --features test-fakes --test event_lifecycle`。
 - [ ] **Step 3：實作**：照上方；observer 清單在 reader 建立時固定（不在熱路徑加鎖）。

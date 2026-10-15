@@ -70,7 +70,7 @@
 | T05 | BC-01d 外部 unlink／替換／DeletePending 偵測、有界自癒、缺口 META、停止自動 TX | BC-01 | haiku-xhigh | agy-gemini-3.8-flash-high | codex-gpt-6-luna-max |
 | T06 | BC-03／SC-07 TX 三態、TX WAL 只記確認 bytes、可取消寫入、DF-15 精確 wal_seq | BC-03、SC-07、DF-15 | agy-gemini-3.8-flash-high | haiku-xhigh | codex-gpt-6-luna-max |
 | T07 | SC-04a Bridge 兩段式 Drain 與 `DrainReceipt` | SC-04 | haiku-xhigh | agy-gemini-3.8-flash-high | codex-gpt-6-luna-max |
-| T08 | SC-04b Session Drain、release／attach 交接回應、drain 診斷欄位、BC-03 中止映射、SC-11 有序關機 | SC-04、BC-03、SC-11 | agy-gemini-3.8-flash-high | haiku-xhigh | codex-gpt-6-luna-max |
+| T08 | SC-04b Session Drain、release／attach 交接回應、drain 診斷欄位、BC-03 中止映射、SC-11 有序關機與 `daemon.handoff_stop` 原子交接 | SC-04、BC-03、SC-11 | agy-gemini-3.8-flash-high | haiku-xhigh | codex-gpt-6-luna-max |
 | T09 | BC-02 DeferredBuffer 整段清空與上下文標記 | BC-02 | haiku-xhigh | agy-gemini-3.8-flash-high | codex-gpt-6-luna-max |
 | T10 | BC-04 Per-UART 獨占、holder 診斷、Windows ACCESS_DENIED 映射、SC-05 同步收回、DF-04 | BC-04、SC-05、DF-04 | agy-gemini-3.8-flash-high | haiku-xhigh | codex-gpt-6-luna-max |
 | T11 | Gate 錯誤碼：SC-01、SC-02、SC-03、SC-06、DF-02 | SC-01/02/03/06、DF-02 | agy-gemini-3.8-flash-high | haiku-xhigh | codex-gpt-6-luna-max |
@@ -937,6 +937,8 @@
   UARTBridge.send_bytes(self, payload: bytes, *, source: str, cmd_id: str | None = None,
                         log: bool = True, _allow_during_flash: bool = False) -> TxResult
   UARTBridge.tx_account(self, cmd_id: str) -> tuple[int, bool]    # (confirmed_bytes 累計, 曾有 unknown)；讀後移除；容量 512 FIFO
+  UARTBridge.tx_settle(self, cmd_id: str) -> None                 # R1-F8：命令終態（非 drain 撤銷路徑）結算＝移除；未知 cmd_id 為 no-op
+  UARTBridge.tx_set_active(self, cmd_id: str | None) -> None      # R1-F8：目前前景命令；FIFO 溢位淘汰時跳過它（不淘汰在途證據）
   SessionManager._on_bridge_rx(self, session_id: str, data: bytes, wal_seq: int | None = None) -> None
   ```
 - Rust 對應：arch §4.2 `TxOutcome { NotSubmitted, Completed(usize), Unknown }`／`TxResult { outcome, error }`、`SerialWriter::write_gated(data, cancel, gate)`（每次 OS 提交經 `SubmitGate`，R0-F1）；§5.4 OS 提交時 fence 與「完成後把 TxResult 交給 WalWriter（只記錄確認的 bytes）」；§5.7 `confirmed_bytes`／`unknown` 累計。**arch §4.2 的 `Unknown` 必須帶已確認前綴**：本 Task 同步修訂 arch §4.2 為 `Unknown { confirmed: usize }`（`confirmed` 為結果不明前 OS 已確認的 bytes，未知尾段＝`len - confirmed`），§5.7 映射改為「`confirmed ≥ 1`（不論最後為 Completed 或 Unknown）→ `COMMAND_ABORTED_IN_FLIGHT`；`Unknown{confirmed:0}` → `SEND_FAILED`」。
@@ -1085,6 +1087,20 @@
           bridge.send_bytes(b"abcd", source="agent:x", cmd_id="c1")
       assert bridge.tx_account("c1") == (7, False)
       assert bridge.tx_account("c1") == (0, False)   # 讀後移除
+
+  def test_tx_account_settled_on_completion_and_active_never_evicted(tmp_path, monkeypatch):   # R1-F8
+      bridge, wal, _ = _posix_bridge(tmp_path, monkeypatch, [1] * 2000)
+      bridge.tx_set_active("fg")
+      bridge.send_bytes(b"f", source="agent:x", cmd_id="fg")          # 最早插入的在途前景命令
+      for i in range(600):                                              # > 512：已完成命令逐一結算，不累積
+          bridge.send_bytes(b"x", source="agent:x", cmd_id=f"c{i}")
+          bridge.tx_settle(f"c{i}")
+      assert set(bridge._tx_accounts) == {"fg"}
+      for i in range(600):                                              # 漏結算（洩漏）時 FIFO 上限仍成立，但跳過 active
+          bridge.send_bytes(b"x", source="agent:x", cmd_id=f"leak{i}")
+      assert len(bridge._tx_accounts) == 512 and "fg" in bridge._tx_accounts
+      assert bridge.tx_account("fg") == (1, False)                      # drain 映射仍拿得到在途證據
+      bridge.tx_settle("nope")                                          # 未知 cmd_id：no-op
   ```
   表格補充：
 
@@ -1107,7 +1123,7 @@
 - [ ] **B1 實作**：
   - `_write_all`：`sent=0`；迴圈 `os.write`；`BlockingIOError`／EAGAIN → `if cancel and cancel.wait(EAGAIN_BACKOFF_S): return TxResult("completed", sent, n_req, "cancelled")`（`EAGAIN_BACKOFF_S=0.01`，`cancel` 為 None 時 `time.sleep(0.01)` 並同時檢查 `self._tx_cancel`，見 T07）；其他 `OSError` → `TxResult("completed", sent, n_req, f"{type(e).__name__}: {e}")`；`n<=0` → `"short_write"`；完成 → `TxResult("completed", n_req, n_req)`。
   - `_PosixSerialPort.write` 委派相同演算法（抽成模組函式 `_posix_write_all(fd, payload, cancel) -> TxResult`，`UARTBridge._write_all` 也呼叫它，消除重複實作）；`_PySerialPort.write`：迴圈中 `SerialTimeoutException`／`SerialException` → `raise TxUnknownError(TxResult("unknown", sent, n, f"{type(exc).__name__}: {exc}"), <現況 errno>) from exc`（`sent` 為已確認前綴）；`not n` → 回 `TxResult("completed", sent, n, "short_write")`；完成回 `completed, n`。
-  - `send_bytes`：持 `_write_lock` 全程；`_state_lock` 內做 flash gate、T05 WAL 不健康檢查、T07 fence、raw deferred（T20 再加 permit 驗證）；鎖外（仍持 `_write_lock`）依相容規則 1／2 寫入取得 `result`（`TxUnknownError` 被捕捉後取其 `.result`，記錄完再重拋同一例外）；**仍持 `_write_lock`** 時：`log and result.confirmed > 0` → `wal.append(TX, payload[:confirmed])`；`log and result.outcome == "unknown"` → META `tx_outcome_unknown`；更新 `_tx_accounts[cmd_id]`（`cmd_id` 非 None 時）；釋放鎖後 `if not result.complete and result.error not in (None, "deferred"): raise TxIncompleteError(result)`（unknown 重拋 `TxUnknownError`；serial 未就緒 raise `SerialNotReady`）；回傳 `result`。
+  - `send_bytes`：持 `_write_lock` 全程；`_state_lock` 內做 flash gate、T05 WAL 不健康檢查、T07 fence、raw deferred（T20 再加 permit 驗證）；鎖外（仍持 `_write_lock`）依相容規則 1／2 寫入取得 `result`（`TxUnknownError` 被捕捉後取其 `.result`，記錄完再重拋同一例外）；**仍持 `_write_lock`** 時：`log and result.confirmed > 0` → `wal.append(TX, payload[:confirmed])`；`log and result.outcome == "unknown"` → META `tx_outcome_unknown`；更新 `_tx_accounts[cmd_id]`（`cmd_id` 非 None 時；R1-F8：新 key 使表超過 512 時淘汰最舊且 `!= self._tx_active_cmd` 的項目並 log WARNING `serialwrap: tx account evicted (cmd_id=%s)`，在途前景命令的累計永不被淘汰）；釋放鎖後 `if not result.complete and result.error not in (None, "deferred"): raise TxIncompleteError(result)`（unknown 重拋 `TxUnknownError`；serial 未就緒 raise `SerialNotReady`）；回傳 `result`。
   - `contracts/wal_meta_events.schema.json` 新增 `tx_outcome_unknown` 分支：`required: [event, requested_bytes, confirmed_bytes, unknown_range, error]`，整數非負、`unknown_range` 兩元素、`x-behavior-change: "BC-03"`。
   - `_handle_serial_rx`：`rec = self.wal.append(...)`；`seq = rec.get("seq")`；呼叫 `self._on_rx_data` 前以 `inspect.signature` 判定是否接受 `wal_seq` 關鍵字（結果以 callback 物件的 `id()` 快取，callback 被替換時重新判定；測試會在建構後直接指派 `_on_rx_data`），接受時 `self._on_rx_data(data, wal_seq=seq)`，否則 `self._on_rx_data(data)`。`SessionManager` 兩處 lambda 改為 `lambda data, wal_seq=None, sid=session_id: self._on_bridge_rx(sid, data, wal_seq)`；`_on_bridge_rx` 以 `wal_seq if wal_seq is not None else self._wal.current_seq` 傳給 observers 與 background capture。
 - [ ] **B2 執行並確認 PASS**：`python3 -m pytest -q tests/test_stage0_tx_outcome.py tests/test_uart_io.py tests/test_serial_port.py tests/test_interactive_raw.py tests/test_file_transfer.py tests/test_event_engine.py tests/test_issue159_bg_fast_capture.py tests/test_agent_defer_tx.py tests/test_human_agent_coexist.py tests/test_multiagent_e2e.py tests/test_uart_flash_bridge.py tests/test_refine_ownership.py tests/test_command_completion.py tests/test_console_unlock.py tests/test_concurrency_races.py tests/test_login_fsm.py`；`python3 -m tools.contracts check`；全套依 §0 第 4 點。
@@ -1245,7 +1261,7 @@
 
 ## Task T08：SC-04b Session Drain、release／attach 交接回應、drain 診斷欄位、BC-03 中止映射、SC-11 有序關機
 
-- **範圍**：SC-04 session 層：斷線、I/O error、release、clear、bind 的 detach 期間為 `RECOVERING`；release 等回條才成功；3,000 ms 逾時 `drain_stalled`／`drain_timeout_epoch`；回條遲到仍完成；去重；drain 中拒絕 attach／重開。`SessionPublic` 在 `capture` 後新增 `drain_stalled`、`drain_timeout_epoch`。BC-03 中止映射（`COMMAND_ABORTED_IN_FLIGHT`／`SEND_FAILED`／`FLUSHED_BY_RECOVERY`，不自動重送）。SC-11 有序關機（drain 所有 worker→關 handle→WAL sync→exit）。依據：規格 §5.2.4、§5.2.5、§5.3、§6.2 交接、§9.4 Drain 列；調和表 SC-04、owner 確認項 #4 預設、ERR-7.3-9；arch §5.5、§5.7、§5.9、§6.1 停止順序。
+- **範圍**：SC-04 session 層：斷線、I/O error、release、clear、bind 的 detach 期間為 `RECOVERING`；release 等回條才成功；3,000 ms 逾時 `drain_stalled`／`drain_timeout_epoch`；回條遲到仍完成；去重；drain 中拒絕 attach／重開。`SessionPublic` 在 `capture` 後新增 `drain_stalled`、`drain_timeout_epoch`。BC-03 中止映射（`COMMAND_ABORTED_IN_FLIGHT`／`SEND_FAILED`／`FLUSHED_BY_RECOVERY`，不自動重送）。SC-11 有序關機（drain 所有 worker→關 handle→WAL sync→exit）；SC-11 交接停止 `daemon.handoff_stop`（共同 admission 邊界內原子 busy 判定＋凍結新操作＋token，供 §12.1 更新／回滾步驟 2～3；R1-F1，見本 Task 末段 C1～C5）。依據：規格 §12.1、§5.2.4、§5.2.5、§5.3、§6.2 交接、§9.4 Drain 列；調和表 SC-04、owner 確認項 #4 預設、ERR-7.3-9；arch §5.5、§5.7、§5.9、§6.1 停止順序。
 - **Test author model**：agy-gemini-3.8-flash-high　**Implementer model**：codex-gpt-6-luna-max
 - **Changelog fragment**：`changelog.d/rust-p1-sc04-session-drain-bc03.md`（`type: feat`，`scope: session`）：release／recover／斷線改為 drain barrier：期間狀態為 RECOVERING，handle 關閉回條後才完成 release；逾時回報 `drain_stalled`；已確認寫出 ≥1 byte 後中止的命令回 `COMMAND_ABORTED_IN_FLIGHT`；daemon 關機先 drain 再同步 WAL。
 - **BLOCKED-OWNER**：(1) L2 F10 `device release`／ThrowawayDaemon 交接案例在實機 bench 重跑；(2) 程序中斷測試（release 持久化提交前後 kill daemon）在實機 bench 驗證 §6.2「重啟仍保持 released」；(3) Windows 原生 COM 上 drain 時限實測（OD-08）。
@@ -1287,6 +1303,10 @@
   SessionManager._await_drain(self, job: _DrainJob) -> DrainReceipt | None   # 不持 self._lock；逾時設 stalled
   SessionManager._complete_drain(self, job: _DrainJob, receipt: DrainReceipt) -> None
   SessionManager.release_device(self, selector: str, *, source: str = "cli", reason: str | None = None) -> dict[str, Any]
+  SessionManager.begin_shutdown(self) -> None
+      # SC-11 stopping gate（R1-F2）：持 self._lock 設 self._shutting_down=True，冪等；之後 update_devices 建動態 session、_spawn_attach、
+      # _attach_by_id／_attach_by_id_dynamic、attach_device、bind／clear 後置重開一律不建 UARTBridge（自動路徑 log `shutdown 中，略過 attach <by_id>`；
+      # RPC 路徑 raise RuntimeError("daemon stopping")，RPC 層轉 EXCEPTION）
   SessionManager.shutdown_drain(self, *, total_timeout_s: float = 5.0) -> dict[str, Any]
       # {"graceful": bool, "stalled": [session_id…]}；graceful＝所有 drain 皆得成功回條
   SessionManager._map_aborted_result(self, cmd_id: str, result: dict[str, Any] | BaseException, *,
@@ -1440,10 +1460,13 @@
   | `test_direct_bridge_stop_timeout_blocks_reopen` | `_attach_by_id` attach 失敗收尾的直接 `bridge.stop()` 逾時（writer 阻塞）→ by_id 在 `_draining_by_ids`、`_spawn_attach(BY_ID)` 不建新 bridge；回條遲到後才可再 attach，preserved consoles 交給 retained 而非洩漏 |
   | `test_failed_close_receipt_keeps_recovering` | `FakePort.close` 擲 `OSError` → 回條 `handle_closed is False`：session 維持 `RECOVERING`、`_pending_drain` 不清、release 回 `SESSION_RECOVERING`（不得 ok）、`attach_device` 不開新 handle、`drain_stalled` 維持 True |
   | `test_aborted_command_not_resent` | 被中止命令的 cmd_id 在 WAL 中只有原本的 TX 紀錄，無重複 payload；`port.writes` 中該 payload 只出現一次 |
+  | `test_drain_abort_mapping_survives_settle_race`（R1-F8） | 真實 arbiter：`c_done` 完成（已 `tx_settle`）後 `c_fg`（`timeout_s=30`）寫出 2 bytes 並等待 prompt；release 與 `bridge.tx_settle("c_done")` 由兩執行緒同時呼叫（barrier）→ `c_fg` 紀錄 `error_code == "COMMAND_ABORTED_IN_FLIGHT"`、META `confirmed_tx_bytes == 2`；`c_done` 紀錄不變；之後 `bridge._tx_accounts` 不含 `c_fg`、`c_done`（drain 映射讀後移除＋結算），且 `c_fg` 在映射前從未被 `tx_settle`（spy） |
   | `test_running_command_aborted_by_release_records_code` | 真實 arbiter、`timeout_s=30` 的命令寫出 ≥1 byte 後 release → **1 s 內** `command.get` 的 `error_code == "COMMAND_ABORTED_IN_FLIGHT"`、`status == "error"`（`wait_for_regex_from` 遇 drain 立即返回、不進 CTRL_C 恢復路徑） |
   | `test_late_completion_does_not_touch_new_session` | 舊命令等待中 release → 回條 → `attach_device` → 新命令開始 → 舊命令的 inner 才返回：新 session 的 `state`、`capture`、lease、`last_error`、`foreground_busy` 皆不被舊命令改動，舊命令紀錄為 `COMMAND_ABORTED_IN_FLIGHT`／`FLUSHED_BY_RECOVERY`，其 I/O 證據仍在 WAL |
   | `test_reject_paths_have_zero_side_effects` | drain 中 `attach_device`、重複 release、drain 中 `command.submit` 的拒絕回應之外：`port.writes == []`、WAL 無新 TX、`state.json` 未改寫 |
   | `test_shutdown_drains_then_closes_wal` | `service.stop()` 呼叫順序（spy）為：各 bridge `begin_drain` → `finish_drain` → `WalWriter.close`；accepted 命令 `FLUSHED_BY_SHUTDOWN`；`shutdown_drain()` 回 `{"graceful": True, "stalled": []}` |
+  | `test_shutdown_gate_blocks_hotplug_after_drain_start`（R1-F2，修正前必 FAIL） | READY 的 COM0；spy 在 `shutdown_drain` 的第一個 `_begin_drain_locked(kind="shutdown")` 時呼叫 `update_devices` 加入新 `/s/by-id/usb-NEW`、再呼叫 `_spawn_attach("/s/by-id/usb-NEW")` → `FakePort` 開檔次數對 usb-NEW 為 0、未建 `UARTBridge`、`session.list` 無新動態 session；log 含 `shutdown 中，略過 attach /s/by-id/usb-NEW`；`attach_device("COM0")` raise `RuntimeError("daemon stopping")`；`shutdown_drain()` 回 `{"graceful": True, "stalled": []}` |
+  | `test_shutdown_waits_inflight_attach_before_wal_close`（R1-F2） | `_attach_by_id("/s/by-id/usb-NEW")` thread 卡在 `FakePort.open`（gate 前已啟動）時呼叫 `service.stop()`，0.2 s 後放行 → spy 順序為「該 thread 結束（bridge 已 `stop()`、port.writes == []）」→ `WalWriter.close`；`WalWriter.close` 後 WAL 無新 append；`service.stop()` 順序 spy 首項為 `begin_shutdown`，且在 `engine.stop`、`watcher.stop` 之前 |
   | `test_shutdown_timeout_is_reported_not_graceful` | 一個 writer 永久阻塞時 `service.stop()` 在 5.5 s 內返回，但 `shutdown_drain()` 回 `graceful is False`、`stalled` 含該 session；`WalWriter.sync` 被呼叫、`WalWriter.close` **未**被呼叫（`wal.closed is False`）；log 含「非優雅停止」 |
   | `test_release_persist_failure_keeps_blocking` | `_save_state` 擲 `OSError` → 例外穿出、記憶體 `RELEASED`、`BY_ID in _released_by_ids`、之後 `_spawn_attach(BY_ID)` 不 attach、`send_bytes(source="system:x")` 無 bridge 可寫 |
   | `test_release_rpc_offloaded_from_event_loop` | （`tests/test_rpc_blocking_offload.py` 新案例）`device.release` 阻塞於 drain 期間，同一 daemon 的 `health.ping` 在 0.5 s 內回應 |
@@ -1459,10 +1482,114 @@
   - 去重：`_begin_drain_locked` 在 `session._pending_drain is not None` 時回傳既有 job，不呼叫 `begin_drain`；release 對既有 release job 等同一個 `done` 事件（等到剩餘時限）。
   - `attach_device`、`_attach_by_id`、`_spawn_attach`：`session._pending_drain is not None` → 不開 bridge；`attach_device` 回凍結形狀。
   - BC-03：`execute_command` 外層以 `try/except BaseException` 包住 inner；若 `cmd_id == job.aborted_cmd_id`（任何仍在 pending 或已完成的 drain job）或捕捉到 `TxIncompleteError`，呼叫 `_map_aborted_result(cmd_id, result_or_exc, bridge=operation.bridge, aborted_by_drain=<是否被 drain 撤銷>)` 依凍結表回傳 `{"ok": False, "error_code": …}`；arbiter 既有 worker 把 `ok:false` 的 `error_code` 寫入紀錄（`status="error"`），不需新欄位。
-  - SC-11：`SessionManager.shutdown_drain(total_timeout_s=5.0)` 對所有有 bridge 的 session 依序 `_begin_drain_locked(kind="shutdown")`，再以共用期限等待，回傳 `{"graceful", "stalled"}`；`SerialwrapService.stop()` 順序改為：engine.stop → watcher.stop → `shutdown_drain()` → arbiter unregister（`FLUSHED_BY_SHUTDOWN`）→ flash endpoint stop → `graceful` 時 `self._wal.close()`，否則依狀態流表只 `sync()` 並記錄非優雅停止；daemon 的 exit code 不因此改變（避免改變監管器重啟語意），非優雅停止只以 log 與 `shutdown_drain` 結果揭露。
+  - TX 累計結算（R1-F8，Rust 對應 P5 T9 結算協定）：`_execute_command_inner` 開始寫入前 `bridge.tx_set_active(cmd_id)`；`execute_command` 的 `finally` 中，**僅當**未走 drain 撤銷映射（`cmd_id != job.aborted_cmd_id`）時呼叫 `bridge.tx_settle(cmd_id)`，再 `bridge.tx_set_active(None)`；drain 撤銷路徑的累計由 `_map_aborted_result` 經 `tx_account` 讀後移除，不得先被 settle 掉。測試：T06 `test_tx_account_settled_on_completion_and_active_never_evicted`，以及本 Task `test_drain_abort_mapping_survives_settle_race`（前景命令在途時 drain Phase 1 撤銷，同時另一已完成命令 settle → 前景命令仍得 `COMMAND_ABORTED_IN_FLIGHT`，`_tx_accounts` 最終不含兩者）。
+  - SC-11：`SessionManager.shutdown_drain(total_timeout_s=5.0)` 先隱含 `begin_shutdown()`，以共用期限 join 已在途的 attach thread（gate 設下前已啟動者；attach thread 在建立 `UARTBridge` 前與安裝 `session.bridge` 前各持 `_lock` 檢查 `_shutting_down`，後者成立時立即 `bridge.stop()`、不送 login probe），再對所有有 bridge 的 session 依序 `_begin_drain_locked(kind="shutdown")`，以同一期限等待，回傳 `{"graceful", "stalled"}`（期限內未結束的 attach thread 以 `attach:<by_id>` 列入 `stalled`、`graceful=False`）；`SerialwrapService.stop()` 順序改為：`self._sessions.begin_shutdown()`（R1-F2，先於 engine.stop 與 watcher.stop，使 handler 執行期間與 watcher 最後一輪的熱插都不開新 UART）→ engine.stop → watcher.stop → `shutdown_drain()` → arbiter unregister（`FLUSHED_BY_SHUTDOWN`）→ flash endpoint stop → `graceful` 時 `self._wal.close()`，否則依狀態流表只 `sync()` 並記錄非優雅停止；daemon 的 exit code 不因此改變（避免改變監管器重啟語意），非優雅停止只以 log 與 `shutdown_drain` 結果揭露。此為 Python 基線行為；Rust daemon（P5 Task 19、P8 Task 12）於同一情境刻意改回 exit 1 加 `serialwrapd: shutdown incomplete: …` 診斷（SC-11 細化、DF 候選，調和表 SC-11 列），不屬 A/B 比較範圍，A/B 案例不製造停機未收斂；本 Task 不得以 Python 的 exit code 作為 Rust 該情境的 oracle。
   - `contracts/wal_meta_events.schema.json` 新增 `command_aborted_in_flight` 分支（`required: [event, confirmed_tx_bytes, tx_outcome]`、`tx_outcome ∈ {complete, partial, unknown}`、`x-behavior-change: "BC-03"`）。
 - [ ] **B2 執行並確認 PASS**：`python3 -m pytest -q tests/test_stage0_session_drain.py tests/test_device_handoff.py tests/test_bootloader_recovery.py tests/test_refine_ownership.py tests/test_session_capture.py tests/test_arbiter_flush_on_recovery.py tests/test_bad_command_recovery.py tests/test_resilience_hotplug.py tests/test_resilience_timeout.py tests/test_session_bind.py tests/test_state_persistence_atomic.py tests/test_state_save_race.py tests/test_flashing_state.py tests/test_rpc_blocking_offload.py tests/test_multiagent_e2e.py tests/test_human_agent_coexist.py tests/test_contracts_rpc_schema.py tests/test_contracts_catalog.py`；`python3 -m tools.contracts check`；全套依 §0 第 4 點。
 - [ ] **B3 commit**：`feat(session): SC-04 drain barrier 與 BC-03 中止映射，release 等 handle 關閉回條才完成`
+
+**SC-11 交接停止 `daemon.handoff_stop`（R1-F1；Stage 1 由 Rust CLI `setup` 更新／回滾呼叫，P4 Task 12 步驟 3）**
+
+背景：P4 update 原本在 CLI 端 `session.list` 預檢後送一般 `daemon.stop`；預檢與停止之間其他 client 可開始 `file.push` 或觸發 ttyMCU flash，而上方 SC-11 shutdown drain 的 Phase 1 會撤銷前景操作（`TransferAbort`）並停止 flash endpoint——是**中止**而非等待完成，DUT 會留下部分檔案／部分燒寫，違反規格 §12.1 步驟 2～3。CLI 無法關閉此窗口，故 daemon 必須提供「busy 判定＋凍結所有新操作＋發交接 token」同一臨界區的原子交接，凍結後才進入 SC-11 停止。
+
+- Files（追加）：Create `sw_core/admission.py`、`tests/test_stage0_handoff_stop.py`；Modify `sw_core/daemon.py`（`daemon.handoff_stop` 與 `daemon.stop` 同層處理）、`sw_core/service.py`（`handoff_stop()`、所有有副作用 RPC 入口 admit）、`sw_core/arbiter.py`（`submit` admit、紀錄終態 `done`）、`sw_core/session_manager.py`（file／self-test／recover／attach／release／clear／bind／lease admit；`recovering`／`flashing`／`lease` 旗標在 `_lock` 內同步發布）、MCU flash endpoint 模組（sync-probe 寫第一個 byte 前 admit）、`contracts/rpc_schema.json`（P0 `x-pending` 的 SC-11 `adds_method: daemon.handoff_stop` 併入 `x-methods` 並刪除該項；`x-wire.version_absent_for` 加 `daemon.handoff_stop`）、`contracts/error_codes.yaml`（`FLUSHED_BY_SHUTDOWN` 的 `scope.interfaces` 加 `rpc`、`meaning` 附註 `reason:"handoff_frozen"`、`contract_tests` 指向本段測試；**不新增碼**）、`tests/test_contracts_rpc_schema.py`（`test_methods_equal_dispatch_plus_daemon_stop` 期望改為 `_dispatch_methods() | {"daemon.stop", "daemon.handoff_stop"}`）。
+- Interfaces（Python；Rust 對應見 arch §6.2 第 7 步與 P8 Task 14）：
+  ```python
+  # sw_core/admission.py —— 共同 admission 邊界。self._lock 為葉鎖：持有時不得呼叫任何其他元件；鎖序 SessionManager._lock → AdmissionGate._lock
+  @dataclass(frozen=True)
+  class Ticket: kind: str; com: str | None; seq: int
+  class AdmissionGate:
+      def admit(self, kind: str, com: str | None) -> Ticket | None    # 已凍結 → None（呼叫端零副作用拒絕）；否則登記 ticket
+      def done(self, ticket: Ticket) -> None                           # 冪等
+      def set_flag(self, com: str, flag: Literal["flashing", "recovering", "lease"], on: bool) -> None
+      def freeze_if_idle(self, reason: str) -> tuple[str | None, dict[str, Any]]
+          # 同一次持鎖內：任一 ticket 或旗標存在 → (None, {"by_com": {com: {"ops": [kind…], "flags": [...]}}, "flashing": bool})、不凍結；
+          # 否則 frozen=True、token=uuid4().hex、回 (token, {})。凍結不可解除（交接只以停止收場）
+      frozen: bool
+  SerialwrapService.handoff_stop(self, params: dict[str, Any]) -> dict[str, Any]
+      # reason=str(params.get("reason") or "update")；token 非 None → {"ok": True, "stopping": True, "handoff_token": token}，daemon 層寫出回應後走 daemon.stop 同一停止路徑（SC-11）
+      # busy → {"ok": False, "error_code": "FLASHING_BUSY"（有 flash ticket 或 flashing 旗標）| "SESSION_BUSY",
+      #          "busy": [{"com","state","foreground_busy","outstanding_commands","interactive_session_id","recovering","ops"}]}（列依 com 排序；state 等欄位於判定後另查 manager，只供回報）
+  ```
+- admission 點（每個都必須在**任何副作用之前**呼叫 `admit`——入列、第一個 TX byte、狀態轉移、`state.json` 改寫）：`rpc_schema.json` 中 `side_effects` 非空且 `retryable_readonly == false` 的全部方法（`command.submit` 的 ticket 持有到命令紀錄終態，等同 `outstanding_commands`；`file.push`／`file.pull`、`session.self_test`、`session.recover`、`device.release` 等持有到 handler 返回；`session.interactive_open` 持有到 lease close／expire）；ttyMCU sync-probe（admit 失敗時端點維持沉默、不轉送任何 byte、session 不進 FLASHING，ticket 持有到離開 FLASHING）。凍結後被拒的 RPC 回 `{"ok": false, "error_code": "FLUSHED_BY_SHUTDOWN", "reason": "handoff_frozen"}`。唯讀方法、`health.*`、`daemon.stop`、`daemon.handoff_stop` 不經 admission。human console 位元組不經 admission（可安全中止，SC-11 照舊處理）。
+- [ ] **C1 寫失敗測試**：`tests/test_stage0_handoff_stop.py`
+  ```python
+  from __future__ import annotations
+  import re
+  import threading
+  import pytest
+  from stage0_fakes import FakePort, make_service, wal_records
+
+  def _rpc(svc, method, params=None):
+      return svc.daemon_dispatch_for_test({"id": 1, "method": method, "params": params or {}})   # 走 daemon.py 同一分派（含 daemon.* 分支）
+
+  def test_handoff_file_push_after_last_probe(tmp_path):
+      gate = threading.Event(); port = FakePort(block=gate)
+      svc = make_service(tmp_path, ready=["COM0"], port=port)
+      assert all(not s["foreground_busy"] for s in _rpc(svc, "session.list")["sessions"])   # CLI 預檢看到閒置
+      payload = b"x" * 65536
+      out: dict = {}
+      t = threading.Thread(target=lambda: out.update(_rpc(svc, "file.push", {"selector": "COM0", "data_b64": payload.hex()})))
+      t.start(); svc.wait_until_admitted("file.push", "COM0", timeout=1.0)              # 預檢之後才開始的 push
+      r = _rpc(svc, "daemon.handoff_stop", {"reason": "update"})
+      assert (r["ok"], r["error_code"]) == (False, "SESSION_BUSY")
+      assert r["busy"][0]["com"] == "COM0" and r["busy"][0]["ops"] == ["file.push"]
+      assert svc.stop_requested is False and svc.admission.frozen is False
+      gate.set(); t.join(10.0)
+      assert out["ok"] is True                                                           # push 完整完成，未被截斷
+      assert b"".join(port.writes).count(b"x") >= len(payload)
+      r2 = _rpc(svc, "daemon.handoff_stop", {"reason": "update"})
+      assert r2["ok"] is True and r2["stopping"] is True and re.fullmatch(r"[0-9a-f]{32}", r2["handoff_token"])
+      assert "version" not in r2 and svc.stop_requested is True
+
+  @pytest.mark.parametrize("first", ["probe", "handoff", "race"])
+  def test_handoff_flash_races_prepare(tmp_path, first):
+      for _ in range(200 if first == "race" else 1):
+          svc, mcu = make_service(tmp_path, ready=["COM0"], with_fake_mcu=True)
+          res: dict = {}
+          probe = lambda: res.__setitem__("probe", svc.flash_endpoint.sync_probe_for_test(b"\x55\x55"))   # flasher 自身 sync bytes
+          handoff = lambda: res.__setitem__("handoff", _rpc(svc, "daemon.handoff_stop", {"reason": "rollback"}))
+          if first == "probe":
+              probe(); handoff()
+              assert res["handoff"]["error_code"] == "FLASHING_BUSY"                      # 預檢後才開始的 flash 必擋下交接
+          elif first == "handoff":
+              handoff(); probe()
+              assert res["handoff"]["ok"] is True
+          else:
+              barrier = threading.Barrier(2)
+              ts = [threading.Thread(target=lambda f=f: (barrier.wait(), f())) for f in (probe, handoff)]
+              [x.start() for x in ts]; [x.join(5.0) for x in ts]
+          if res["handoff"]["ok"]:                                                       # 交接成立 ⇒ probe 必被拒、MCU 零 byte、未進 FLASHING
+              assert res["probe"] == "refused_frozen" and mcu.received == b""
+              assert svc.session_state("COM0") != "FLASHING"
+          else:                                                                          # probe 先 admit ⇒ 交接必為 FLASHING_BUSY、daemon 不停止
+              assert res["handoff"]["error_code"] == "FLASHING_BUSY" and res["probe"] == "admitted"
+              assert svc.stop_requested is False and svc.admission.frozen is False
+          svc.close_for_test()
+
+  def test_push_after_freeze_rejected_zero_tx(tmp_path):
+      port = FakePort(); svc = make_service(tmp_path, ready=["COM0"], port=port)
+      assert _rpc(svc, "daemon.handoff_stop")["ok"] is True
+      before = len([r for r in wal_records(svc.wal) if r["dir"] == "TX"])
+      r = _rpc(svc, "file.push", {"selector": "COM0", "data_b64": "eA=="})
+      assert (r["ok"], r["error_code"], r["reason"]) == (False, "FLUSHED_BY_SHUTDOWN", "handoff_frozen")
+      assert port.writes == [] and len([x for x in wal_records(svc.wal) if x["dir"] == "TX"]) == before
+      assert svc.session_public("COM0")["foreground_busy"] is False
+  ```
+  表格補充（同檔）：
+
+  | 測試名 | 斷言 |
+  |---|---|
+  | `test_command_submit_races_handoff`（200 次 Barrier 競態） | 每次恰為二者之一：交接 ok ⇒ `command.submit` 回 `FLUSHED_BY_SHUTDOWN`／`reason:"handoff_frozen"`、`port.writes == []`、無命令紀錄；submit 被受理 ⇒ 交接回 `SESSION_BUSY`、`ops` 含 `command.submit`、daemon 未停止。不得出現「交接 ok 且命令已入列」 |
+  | `test_every_mutating_method_rejected_after_freeze`（參數化：由 `rpc_schema.json` 取 `side_effects` 非空且 `retryable_readonly == false` 的方法，不硬編碼清單） | 凍結後每個方法皆回 `FLUSHED_BY_SHUTDOWN`／`handoff_frozen`；`port.writes == []`、`state.json` mtime 未變；同時 `health.ping`、`session.list`、`mcu.status` 仍 `ok:true` |
+  | `test_handoff_busy_does_not_freeze` | lease 開啟（`interactive_session_id` 非 null）時交接回 `SESSION_BUSY`、`ops:["session.interactive_open"]`；之後 `command.submit` 照常受理 |
+  | `test_handoff_recovering_flag_is_busy` | `_handle_bridge_down` drain 進行中交接 → `SESSION_BUSY`、`recovering:true` |
+  | `test_handoff_ok_then_sc11_stop_order` | 真 daemon 行程：交接回應行為 `{"id":1,"ok":true,"stopping":true,"handoff_token":…}`（無 `version`）先寫出，之後才 `begin_shutdown`；`shutdown_drain()` 回 `{"graceful": True, "stalled": []}`、無任何 `COMMAND_ABORTED_IN_FLIGHT`／`TransferAbort`；exit 0 |
+  | `test_handoff_stop_contract_merged` | `rpc_schema.json` `x-methods` 含 `daemon.handoff_stop`、`x-pending` 無 `adds_method: daemon.handoff_stop`、`x-wire.version_absent_for` 含之；`error_codes.yaml` `FLUSHED_BY_SHUTDOWN.scope.interfaces` 含 `rpc` |
+- [ ] **C2 執行並確認 FAIL**：`python3 -m pytest -q tests/test_stage0_handoff_stop.py` → 預期 `METHOD_NOT_FOUND`（`daemon.handoff_stop` 未實作）／`AttributeError: admission`。commit：`test(daemon): SC-11 原子交接停止與 admission 競態失敗測試`
+- [ ] **C3 實作**：依上方 Interfaces 與 admission 點；`freeze_if_idle` 與每個 `admit` 共用 `AdmissionGate._lock`，因此任一操作不是在凍結前 admit（ticket 可見 → 交接回 busy），就是在凍結後 admit（被拒、零副作用）；`daemon.py` 在交接 ok 時先寫回應再呼叫既有 stop 觸發（與 `daemon.stop` 同路徑，SC-11 順序不變），busy 時不觸發停止、不凍結。測試輔助（`daemon_dispatch_for_test`、`wait_until_admitted`、`sync_probe_for_test`）放 `tests/stage0_fakes.py`，不進 production 介面。
+- [ ] **C4 執行並確認 PASS**：`python3 -m pytest -q tests/test_stage0_handoff_stop.py tests/test_stage0_session_drain.py tests/test_contracts_rpc_schema.py tests/test_contracts_catalog.py tests/test_flashing_state.py tests/test_multiagent_e2e.py`；`python3 -m tools.contracts check`。
+- [ ] **C5 commit**：`feat(daemon): 新增 daemon.handoff_stop 原子交接，凍結新操作後才有序關機`
 
 ---
 

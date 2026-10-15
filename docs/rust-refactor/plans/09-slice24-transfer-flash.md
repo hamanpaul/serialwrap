@@ -16,7 +16,7 @@
 
 - 平台相依 production code 只在 `sw-pal`；其他 crate 禁止 `#[cfg(unix)]`／`#[cfg(windows)]`／`target_os`／`cfg!`／`cfg_attr` 平台分支與 build script 間接分支（§3.1）；允許 `#[cfg(test)]` 與 `#[cfg(feature = "test-fakes")]`。`/dev/ttyMCU` 是否存在只看 `Capabilities.flash_endpoint`。
 - 需要 `sw_pal::fakes` 的 integration test 一律在該 crate `Cargo.toml` 以 `[[test]] name=… required-features=["test-fakes"]` 宣告；本計畫所有 `cargo test` 命令對這些測試一律帶 `--features test-fakes`（紅燈與綠燈步驟相同）。
-- RPC／CLI `error_code` 與 session `last_error` 為兩個獨立命名空間（ADR-07、§9.3）。本切片新增輸出的碼全部是既有碼：`TRANSFER_*`、`TARGET_*`、`CHECKSUM_*`、`MOVE_*`、`PULL_PARSE_FAILED`、`BASE64_DECODE_FAILED`、`ECHO_ACK_UNSUPPORTED`、`CONSOLE_LINE_LIMIT_TOO_SMALL`、`LOCAL_FILE_NOT_FOUND`、`FLASHING_BUSY`、`DEVICE_STILL_HELD`、`DEVICE_NOT_PRESENT`、`SESSION_BUSY`、`AUTOBOOT_QUIET`（傳輸中途拒絕，SC-33）；更新／回滾守衛沿用 P4 的 `UPDATE_BUSY`／`FLASHING_BUSY`；不得新增錯誤碼。
+- RPC／CLI `error_code` 與 session `last_error` 為兩個獨立命名空間（ADR-07、§9.3）。本切片新增輸出的碼全部是既有碼：`TRANSFER_*`、`TARGET_*`、`CHECKSUM_*`、`MOVE_*`、`PULL_PARSE_FAILED`、`BASE64_DECODE_FAILED`、`ECHO_ACK_UNSUPPORTED`、`CONSOLE_LINE_LIMIT_TOO_SMALL`、`LOCAL_FILE_NOT_FOUND`、`FLASHING_BUSY`、`DEVICE_STILL_HELD`、`DEVICE_NOT_PRESENT`、`SESSION_BUSY`、`AUTOBOOT_QUIET`（傳輸中途拒絕，SC-33）；更新／回滾守衛沿用 P4 的 `SESSION_BUSY`／`FLASHING_BUSY`；不得新增錯誤碼。
 - 錯誤碼計數由 `contracts/error_codes.yaml` 資料產生，不得硬編碼 78（§9.2、OD-06）。
 - `--retries` 只對 11 個唯讀方法重試：`health.ping`、`health.status`、`session.list`、`session.get_state`、`session.activity`、`session.console_list`、`session.log_status`、`device.list`、`alias.list`、`mcu.patterns`、`mcu.status`（§4.2）；`file.push`／`file.pull`／`device.release`／`device.attach` 絕不重試。
 - CLI JSON：`json.dumps(..., ensure_ascii=False, separators=(",", ":"))` 等價輸出（`CLI_STDOUT`）；`state.json`／WAL 以 `sort_keys=True`（`DISK_STABLE`）。
@@ -54,7 +54,7 @@
 | P1 | Python 基線已實作 BC-01～05、SC-02/03/04/05/14、DF-02/04（Stage 0）；`_resolve_session_id` 的 SC-02 由 `command.submit`、`file.push`、`file.pull` 共用（RECOVERING → `SESSION_RECOVERING`、FLASHING → `FLASHING_BUSY`，皆附 `session`）；`sw_core` 為 A/B 的 A 側 |
 | P2 | `tests/acceptance/cases.yaml`（Task 12 schema：`case_id`、`suite`、`source_ref`、`family`、`title`、`contract`、`invariants`、`layer`、`platforms`、`windows_status`、`windows_gap_reason`、`capabilities`、`cli_stage`、`daemon_slice`、`stage0_required`、`prerequisites`、`necessity`、`issues`、`behavior_changes`、`destructive`、`expected`、`sentinel`、`evidence`、`implemented_by`、`cross_slice_reason`；頂層 `invariant_ids` 六項與 `features` 表）、`cases.schema.json`、`cases.lock.json`（`sets["slice_2.4"]`，只能以 `regen_lock.py --add-only` 更新）、已登記的 `f7-*`、`f10-*`、`p1-cmd-file`、`p1-ho-cycle`、`p1-ho-persist`、`p1-rst-daemon`、`lr-mixed`、`win-task-*`、`p2-1-mcu-flash-manual`；`tools/uart_stdio_bridge/`（`wire.ndjson`）、DUT 模擬器、`func-test/scenarios/`（§15.7.1）、`realhw/acceptance/{longrun_acceptance.yaml,gate.py,observer.py}` |
 | P3 | 黑箱 harness `tests/contract_blackbox/{conftest.py,bb_harness.py,bb_stubd.py,bb_faketarget.py,bb_daemon.py,bin/py-serialwrapd}`（`run_cli(args, env=…) -> CliResult(rc, stdout: bytes, stderr: bytes)`、`isolated_env`、`StubDaemon`、`FakeTarget.rx_log()`、`PyDaemon`；fixtures `env`／`stubd`／`py_daemon`／`faketarget`；markers `rust_only` 等）；`sw_proto::pyjson::{PyValue, PyDict, loads, dumps, DumpOpts, Sep}`、`pydict!`、`sw_proto::pypath::{PathFlavor, basename}`、`sw_proto::pycompat::{decode_utf8_replace, splitlines, py_len_chars, py_int_parse, py_truthy}`、`sw_proto::pyfmt::py_str`、`sw_proto::pyre::{compile, PyRegex, PyFlags}`、`sw_proto::runtime_paths::RuntimePaths`、CLI `file push/pull`、`mcu patterns/status`、`device release/attach` 子命令與 params 組裝。**注意**：`pycompat::{shlex_quote, strip_ansi, a2b_base64_lenient, b2a_base64, uuid4_hex}` 不在 04 Task 4 的 Produces，由 P5 06 Task 0c 補齊（跨計畫審查已把 `shlex_quote`、`b2a_base64` 加入 06 T0c 清單）；Task 0 以編譯期核對，缺漏屬上游缺陷（停止並回報，不由本 Phase 代補）；`RuntimePaths` 沒有 `ttymcu_path`，由本 Phase Task 10 新增 |
-| P4 | `sw_pal::ServiceCtl`（`action`／`action_named(mode, name, action, with_sudo)`、`install`、`uninstall`、`wait_stopped`、`set_enabled`）、`ServiceResult{ok, mode, action, rc, stdout, …}`（struct）、`SupervisorDefinition{mode, name, exec, working_dir, …}`、`SystemdCtl`、`WindowsTaskCtl::new(env, fs, clock)`（`service_ctl/windows_task.rs`）、`render_user_unit`／`render_system_unit`、`render_task_xml(&TaskXmlSpec)`、共用 `graceful_stop`（停用拉起→RPC `daemon.stop` 2.0 s→等待 ≤10 s→逾時才硬終止；P4 稱 SC-24-S，已在 Stage 1 實作）、`setup`／`setup --rollback` 七步與 `safety_check`（`FLASHING_BUSY`／`UPDATE_BUSY`，SC-23）、release manifest、`scripts/rust/mkbundle.sh` |
+| P4 | `sw_pal::ServiceCtl`（`action`／`action_named(mode, name, action, with_sudo)`、`install`、`uninstall`、`wait_stopped`、`set_enabled`）、`ServiceResult{ok, mode, action, rc, stdout, …}`（struct）、`SupervisorDefinition{mode, name, exec, working_dir, …}`、`SystemdCtl`、`WindowsTaskCtl::new(env, fs, clock)`（`service_ctl/windows_task.rs`）、`render_user_unit`／`render_system_unit`、`render_task_xml(&TaskXmlSpec)`、共用 `graceful_stop`（停用拉起→RPC `daemon.stop` 2.0 s→等待 ≤10 s→逾時才硬終止；P4 稱 SC-24-S，已在 Stage 1 實作）、`setup`／`setup --rollback` 七步與 `safety_check`（`FLASHING_BUSY`／`SESSION_BUSY`，SC-23；update／rollback 步驟 3 改用 `graceful_stop_with(StopRpc::Handoff)` 送 `daemon.handoff_stop`，R1-F1）、release manifest、`scripts/rust/mkbundle.sh` |
 | P5 | `TxWriterHandle`／`TxJob{permit, payload, reply}`／`TxReport`、`Fence`／`FenceState{…, flash_mode: FlashMode::{Off, Probe(u64), Flashing}, …}`／`FenceReject::{StaleEpoch, Frozen, Quiet, ReconfirmPending, WalUnhealthy, Flash, OwnerMismatch, Cancelled}`（P6 07 D-03 另加 `HumanAdmissionClosed`、`InputStale`；P7 08 T7 另加 `StaleFsmGen`；match 一律含這三個 variant）、`TxPermit{op_id, epoch, owner_gen, class, source, cmd_id, log}`（P6 加 `input_epoch: Option<u64>`、P7 加 `fsm_gen: Option<u64>`；本 Phase 建構點兩者皆填 `None`）、`TxClass::{Flash, FlashProbe, FileTransfer, SystemRecoverKey, SelfTestProbe, …}`、`TxResult`、Two-Phase Drain（`StopOp`、`WorkerStoppedReceipt`、`IoWorker::finish_async`）、`OpRunner::run(grant: OpGrant, spec: OpSpec)`＋`OpCtx{com, sid, profile, rx: Arc<RxShared>, tx: TxWriterHandle, wal, clock, control, rng}`、`OpSpec`／`OpOutcome`、`RxShared::{snapshot_len, text_from, wait_for_regex_from}`、`mailbox::{ControlEvent, DataEvent, Reply}`、`session_core::{SessionRequest, Effect, Effects, SessionCore::on_event(MailboxItem, now)}`、`OpenedBridge{epoch, worker, real_path}`、`StateStore`、`device.release`／`device.attach` 完整路徑（`aborted_cmd`、`closed_consoles`、`DEVICE_STILL_HELD` 預檢、`attach_during_drain_is_session_recovering`、self-test RELEASED 分支、`kill_between_commit_and_reply`；SC-04、SC-05、DF-04、BC-04）、`framing.rs::RpcServer`、`daemon_main`、測試支援 `crates/sw-core/tests/support/mod.rs`（`CoreHarness`、`ActorRig`） |
 | P6 | ConsoleHub、Human raw／line、DeferredBuffer（`DeferredEntry{client_lifetime, input_epoch, bytes}`，07 D-07：無 poison 狀態）、`invalidate_human_input(InvalidateReason::Flash, fx)`（D-02，`input_epoch++`）、`OwnershipState.flash_mode: bool`（`reset_for_stop` 保留）、`ConsoleInputBytes{…, input_epoch, …}`、前景操作 `fg_begin`／`fg_finish`、只 suspend human raw 的 `human_suspend_begin`／`human_suspend_end`（07 T6；不存在 `suspend_interactive`／`resume_interactive`）、`ConsoleTransportFactory::create_pty`、`PtyPair`、`console_pty/posix.rs` |
 | P7 | Quiet Gate（`retry_after_s`，SC-03）、Ready Reconfirm、`submit_gate_reject(public_session, source)`／`execute_gate_reject(q, com, now)`（`_resolve_session_id` 與 `_agent_gate_reject_locked` 等價）、`RxShared::wait_for_regex_cancellable(re, from, timeout, clock, cancel: &RunCancel) -> WaitOutcome`、Event Engine `RxObserver` |
@@ -100,7 +100,7 @@ scripts/rust/win-test.sh --package <crate> [--caps <res>]
 | MCU-STATUS-01 | `mcu.status.flashing` 在 probe／偵測期間即為 `true`（`_flash_active` 於首讀後設定） | KEEP | 調和表 | Task 10 |
 | EVT-D-F4（既有） | pull 受 131072 字元 RX 視窗限制；F7 `f7-larger-file-not-truncated` 的 1 MB pull 因此 `PULL_PARSE_FAILED` → SKIP | KEEP（既有裁決）＋本 Phase 補鎖定測試；needs-owner：§11.6 L2 F7 出口與此 KEEP 衝突，選 (a) 登記 DF（pull 不依賴視窗，雙邊同改）或 (b) P2 `cases.yaml` 標 `expected: XFAIL`＋`sentinel{issue, signature:"PULL_PARSE_FAILED", expires}`；預設＝(b)，未裁決前該 case 列 BLOCKED-OWNER 並阻擋出口 | 調和表 | Task 4、Task 15 |
 
-已刪除的舊增補（本次修訂）：SC-23-G（P4 `safety_check` 已以 `UPDATE_BUSY` 涵蓋，見 Task 14）、SC-24-S（P4 `graceful_stop` 已實作並由 P4 負責登記，見 Task 13）、FLASH-IOERR-01 的 Python 雙邊修改（改為 SC-32 Rust-only）。
+已刪除的舊增補（本次修訂）：SC-23-G（P4 `safety_check` 已以 `SESSION_BUSY` 涵蓋，見 Task 14）、SC-24-S（P4 `graceful_stop` 已實作並由 P4 負責登記，見 Task 13）、FLASH-IOERR-01 的 Python 雙邊修改（改為 SC-32 Rust-only）。
 
 ---
 
@@ -1507,7 +1507,7 @@ fn device_detached_during_flashing_is_deferred() {
       pub fn stop(self) -> EndpointStopReceipt;   // set 共用 StopFlag → 喚醒全部等待 → join 端點與 holder thread（各 2.0 s）→ 關 master/slave → unlink
   }
   pub struct EndpointStopReceipt { pub joined: bool, pub stalled_threads: Vec<&'static str>, pub unlinked: bool }
-  // joined=false 時不得宣稱清理完成：WARNING log 列出 stalled_threads，daemon 停止序照常往下（Task 12），但不關閉仍被 stalled thread 使用的 master
+  // joined=false 時不得宣稱清理完成：WARNING log 列出 stalled_threads，daemon 停止序照常往下（Task 12）並把它列入 incomplete（最終 exit 1），但不關閉仍被 stalled thread 使用的 master
   impl Drop for FlashEndpoint { fn drop(&mut self); }   // 未呼叫 stop 的任何退出路徑（含 panic unwind）仍 unlink ttyMCU
   // holder_watch.rs
   pub fn watch_flasher_disconnect(excl: &dyn UartExclusive, slave_path: &str, stop: &StopFlag,
@@ -1855,26 +1855,39 @@ def test_released_survives_two_restarts_and_replug(sw_env, shell_target):
 **Test author model:** agy-gemini-3.8-flash-high　**Implementer model:** codex-gpt-6-luna-max
 
 **Files:**
-- Modify: `crates/sw-daemon/src/daemon_main.rs`（停止序）
+- Modify: `crates/sw-daemon/src/daemon_main.rs`（停止序；沿用 P5 Task 19 的 `incomplete` 累積與 exit 1 判定，新增 flash 與 handler join 兩個失敗來源，以及 R1-F2 的 event handler 未回收來源；`DaemonHooks` 加 test-fakes 欄位 `block_flash_endpoint_stop: bool`）
 - Modify: `crates/sw-daemon/src/framing.rs`（修訂 P5 `RpcServer::stop`：拆為 `stop_accept(&self)`（停止 accept、不等 handler）與 `join_handlers(self, deadline) -> Vec<String>`（以剩餘預算 join，逾時回仍在執行的 method 清單、不無界等待）；P5 06 L3215「等進行中的 handler 回應」語意同步改寫）
-- Modify: `docs/rust-refactor/plans/rust-architecture.md` §6.1 停止順序（加 flash 步驟與 handler join 位置）
+- Modify: `docs/rust-refactor/plans/rust-architecture.md` §6.1 停止順序（加 stopping gate、watcher.stop、engine intake／stop、flash 步驟與 handler join 位置）
 - Modify: `crates/sw-pal/src/signal.rs`、`crates/sw-pal/src/signal/posix.rs`（如 P5 未覆蓋 SIGTERM 期間的二次訊號）
 - Test: `crates/sw-daemon/tests/shutdown_order.rs`、`tests/contract_blackbox/test_s24_supervision_systemd.py`
 
 **Interfaces:**
-- Consumes：P4 `render_user_unit(exec_start) -> String`（golden 不變）；P5 `SignalWait::wait_stop`、drain、`WalWriter::sync_close`、`InstanceLockGuard::release`；Task 9 `FlashEndpoint::stop`。
+- Consumes：P4 `render_user_unit(exec_start) -> String`（golden 不變）；P5 `SignalWait::wait_stop`、`SessionManager::begin_shutdown`（stopping gate）、`WatcherHandle::stop`、drain、`WalWriter::sync_close`、`InstanceLockGuard::release`；P7 `EventEngine::{close_intake, stop}`（`DispatcherStopReport`）；Task 9 `FlashEndpoint::stop`。
 - Produces（`daemon_main.rs` 停止序，arch §6.1 加上 flash 步驟）：
   ```text
   1. server.stop_accept()               # 只停止 accept，不等進行中的 handler（避免 600 s file.push 卡死停止序）
+  1a. manager.begin_shutdown()          # P5 Task 16 stopping gate（R1-F2）：持 manager 鎖設 stopping；之後熱插 Delta／Tick reattach、RequestAttach、bootstrap、
+                                        #   bind／clear／recover／device.attach 重開一律不 open、不建 session／worker（RPC 路徑回 EXCEPTION `daemon stopping`）；
+                                        #   已越過 gate 的 inflight attach 納入步驟 3 的 drain 集合；也擋住步驟 2 flash 結束時 SC-32 延後的 DeviceDetached reconcile 觸發重開
+  1b. watcher.stop()                    # P5 ②：停 DeviceWatcher thread 並 join；channel 殘留 Delta 由 1a gate 丟棄
+  1c. engine.close_intake()             # P7 Task 15：matcher 停、dispatcher 不再 spawn handler；已在跑的 handler 不中斷，與步驟 3～5 並行
   2. flash_endpoint.stop()              # 共用 StopFlag + wake + join 2.0 s；pump 結束 → FlashHolderGone；unlink ttyMCU（Task 9 receipt）
+                                        #   receipt.joined==false 或 unlinked==false → incomplete.push("flash endpoint stop incomplete: <stalled_threads 以 , 串接>")
   3. 所有 session Phase 1（fence frozen、RunCancel、TransferAbort）——進行中 file transfer 的 OpRunner 因 Cancelled 立即返回（XFER-ABORT-01）
   4. server.join_handlers(剩餘預算)     # handler 收到 EXCEPTION 回覆後結束；逾時者 WARNING 列出 method，不再等待
+                                        #   回傳非空 → incomplete.push("rpc handlers did not converge: <methods 以 , 串接>")
   5. Phase 2 回條（TxWriter 先 flush 聚合 TX，Task 5）＋ arbiter 全部 FLUSHED_BY_SHUTDOWN；步驟 3～5 共用總上限 5 s（SC-11，以 Clock 計）
-  6. WAL flush + sync + close
-  7. lock.release()；Unix socket 檔移除；exit 0（SIGTERM／SIGINT／daemon.stop）
+                                        #   未回條的 session → incomplete.push("drain stalled: <session_id 以 , 串接>")
+  5a. engine.stop(步驟 3～5 的共用期限)  # P7 Task 15：等仍在跑的 handler 至同一 5 s 期限；逾時 HandlerAbort 終止整個 process group／Job，再最多 100 ms 回收；
+                                        #   report.unreaped 非空 → incomplete.push("event handlers not reaped: <rule_id 以 , 串接>")；必在步驟 6 WAL close 前返回
+  6. WAL flush + sync + close           #   Err(e) → incomplete.push("WAL sync failed: <e.py_message>")
+  7. lock.release()；Unix socket 檔移除；
+     incomplete 為空 → exit 0（SIGTERM／SIGINT／daemon.stop）；
+     否則 stderr 寫一行 `serialwrapd: shutdown incomplete: <incomplete 以 "; " 串接>\n` 並 exit 1，不宣告 graceful success（P5 Task 19 L3991 規則原樣沿用）
   第二次 SIGTERM／SIGINT 只記 log，不改變上述步驟與結果。
   ```
-  上限來源：步驟 2 的 2.0 s 為 Python `FlashEndpoint.stop` join 值；步驟 3～5 的 5 s 為 SC-11／arch §6.1；不另訂其他總上限。未攔截 panic → exit 1（供 `Restart=on-failure`）。
+  子步驟 1a～1c、5a 屬於 1～7 範圍內，本 Task 文中「1～7」「3～7」皆包含其間的子步驟。1a～1c 必在步驟 3 之前：gate 先於 watcher.stop，使 watcher 最後一輪送出的 Delta 也被擋下；事件派工先關，Phase 1 之後的 RX 不再產生新 handler（R1-F2；P1 Python 順序為 engine.stop → watcher.stop → shutdown_drain，Rust 把 engine 拆成「1c 關 intake」與「5a 有界收斂」，handler 與 drain 並行而不先耗盡 5 s 預算）。
+  上限來源：步驟 2 的 2.0 s 為 Python `FlashEndpoint.stop` join 值；步驟 3～5 與 5a 共用 SC-11／arch §6.1 的 5 s，5a 另含 P7 的 100 ms 回收寬限；不另訂其他總上限。**有界等待與 exit code 分開判定**：任何一步逾時或失敗都不阻擋後續步驟（停止序必定走完 1～7），但失敗會累積到 `incomplete`，最終 exit 1；只有 1～7 全部收斂才 exit 0。未攔截 panic → exit 1。exit 1 讓 `Restart=on-failure`／Task Scheduler RestartOnFailure 能辨識異常停機（`daemon.stop` 觸發的未收斂停機會被監管器重啟；`systemctl stop` 觸發者 unit 標為 failed）。本規則屬 SC-11 細化，延續 P5 Task 19 已登記的 DF 候選（P5 PR 描述），不另立 ID；Python 基線此情境的 exit code 不改（02 Task T08），不屬 A/B 比較範圍，A/B 案例不製造停機未收斂。
 
 - [ ] **Step 1：寫失敗測試**
 
@@ -1941,16 +1954,25 @@ def test_restart_on_failure_keeps_released_and_wal_seq(sw_env, shell_target, tra
 | `stop_during_flashing_removes_ttymcu`（黑箱，fakemcu＋fakeflasher） | FLASHING 中 `systemctl --user stop` | `exited:0`；`ttyMCU` link 已移除；重啟後 session 為 ATTACHED（FLASHING 不持久化） |
 | `stop_during_push_flushes_wal`（黑箱） | 64 KiB push 進行中 `systemctl --user stop` | 自 stop 到 `exited:0` ≤ 7.0 s（2.0 s flash join＋5 s drain 上限）；WAL 最後一筆可解析且 CRC 正確；shelltarget `rx_log` 中已收到的 chunk 行都有對應 WAL TX；重啟後 DUT 端零新增（無重送） |
 | `shutdown_with_inflight_file_push_within_cap`（`shutdown_order.rs`，fake 平台＋FakeClock） | `file.push` handler 卡在等 prompt 時送 stop | handler 在步驟 3 後收到 `EXCEPTION` 並結束；`join_handlers` 未逾時；總停止時間（FakeClock）≤ 2.0 s＋5 s；exit 0 |
-| `handler_join_timeout_does_not_block`（`shutdown_order.rs`） | 注入不回應 cancel 的 handler | `join_handlers` 於剩餘預算到期返回 `["file.push"]`、WARNING；後續步驟照常、exit 0 |
-| `double_sigterm_still_clean`（`shutdown_order.rs`，fake 平台） | 連送兩次 stop 訊號 | 停止序 1～7 各執行一次；exit 0 |
-| `shutdown_order_steps`（`shutdown_order.rs`） | 記錄各步驟呼叫序 | `["server.stop_accept","flash.stop","drain.phase1","server.join_handlers","drain.phase2","flush_shutdown","wal.sync_close","lock.release"]` |
-| `drain_total_cap_5s`（`shutdown_order.rs`） | 一個 worker 卡住不回條 | 5 s 後仍繼續後續步驟，exit 0；log WARNING 列出 stalled session |
+| `handler_join_timeout_does_not_block`（`shutdown_order.rs`） | 注入不回應 cancel 的 handler | `join_handlers` 於剩餘預算到期返回 `["file.push"]`、WARNING；後續步驟照常（trace 仍含 `drain.phase2`、`flush_shutdown`、`wal.sync_close`、`lock.release` 各一次）；exit code 見 `shutdown_handler_timeout_exits_1`（為 1，不得為 0） |
+| `shutdown_handler_timeout_exits_1`（`shutdown_order.rs`，fake 平台＋FakeClock；R1-F4，修正前必 FAIL） | 同上：一個不回應 cancel 的 `file.push` handler，其餘 session 正常回條、WAL 正常 | `run_with_hooks` 回 **1**；stderr 恰含一行 `serialwrapd: shutdown incomplete: rpc handlers did not converge: file.push\n`；trace 停止序完整走完至 `lock.release`；WAL 已 `sync_close`（`fs.sync_calls(wal) >= 1`）、lock 可被新實例取得；總停止時間（FakeClock）≤ 2.0 s＋5 s |
+| `double_sigterm_still_clean`（`shutdown_order.rs`，fake 平台） | 連送兩次 stop 訊號 | 停止序 1～7（含 1a～1c、5a）各執行一次；exit 0 |
+| `shutdown_order_steps`（`shutdown_order.rs`；R1-F2 修訂，修正前必 FAIL） | 記錄各步驟呼叫序（含一條 event rule 已啟用） | 恰為 `["server.stop_accept","manager.begin_shutdown","watcher.stop","engine.close_intake","flash.stop","drain.phase1","server.join_handlers","drain.phase2","flush_shutdown","engine.stop","wal.sync_close","lock.release"]`；缺 `manager.begin_shutdown`／`watcher.stop`／`engine.close_intake`／`engine.stop` 任一或順序不同即 FAIL |
+| `shutdown_hotplug_after_phase1_never_opens_uart`（`shutdown_order.rs`，fake 平台＋FakeClock；R1-F2，修正前必 FAIL） | COM0 READY；以 test-fakes hook 在 trace 記下 `drain.phase1` 後，(a) 於 `FakeDeviceSource` 新增 `/s/by-id/usb-NEW` 並直接經 `manager.watcher_sender()` 注入 `Delta{added:["/s/by-id/usb-NEW"]}`（模擬 watcher 最後一輪殘留），(b) 對 COM0 注入 `DeviceDetached(Rebound)`＋新 real_path | `FakeSerial.open_calls("/s/by-id/usb-NEW") == 0`、COM0 新 real_path 的 open 次數為 0；自 `manager.begin_shutdown` 起 `manager.spawned_worker_count()`（test-fakes 專用計數器，本 Task 新增）不增；drain 回條集合恰為 `["t:COM0"]`；WAL 無任何 `usb-NEW` 對應 COM 的 TX／RX 紀錄；log 含 `shutdown 中，略過 attach /s/by-id/usb-NEW`；trace 走完至 `lock.release`、`run_with_hooks` 回 0 |
+| `shutdown_inflight_attach_drained_before_wal_close`（`shutdown_order.rs`，fake 平台；R1-F2） | 熱插 `/s/by-id/usb-NEW` 使 attach worker 卡在 `FakeSerial::block_open`（已越過 gate）時送 stop，於 `drain.phase1` 後放行 open | 該 session 出現在 drain 回條集合且 `drained:true`；其 handle `close_count()==1` 且 close 發生在 `wal.sync_close` 之前；FakeTarget 收到 0 bytes；`wal.sync_close` 後 `fs.append_calls(wal)` 不再增加；回 0 |
+| `shutdown_reaps_event_handler_tree`（`shutdown_order.rs`，POSIX 真 `HandlerSpawner`＋fake serial；R1-F2，修正前必 FAIL） | 一條 rule 的 handler 為 `sh -c 'sleep 60 & echo $! > <tmp>/child.pid; sleep 60'`（自身與孫行程同一 process group），確認 `child.pid` 已寫出後送 stop；`engine.close_intake` 後再餵一行命中 RX | 本案用真 `Clock`（handler 期限為 `std::time::Instant`）、無 flash endpoint；自 stop 起 `run_with_hooks` 於實時 ≤ 5.5 s 返回 0（5 s 共用期限＋100 ms 回收寬限＋排程餘裕）；返回時 `kill(-pgid, 0)` 與 `kill(child_pid, 0)` 皆為 `ESRCH`（整個行程樹已終止且已回收，無 zombie：`/proc/<pid>` 不存在）；stderr 含 `event dispatcher shutdown 逾時，終止 1 個 handler`；`engine.close_intake` 之後 spawn 次數為 0；trace 中 `engine.stop` 在 `wal.sync_close` 之前；`wal.sync_close` 後 events log 與 WAL 皆無新 append |
+| `shutdown_unreaped_handler_exits_1`（`shutdown_order.rs`，fake 平台；R1-F2） | `FakeHandlerSpawner::ignore_abort()` 的 handler（rule `r1`）執行中送 stop，其餘全部收斂 | 停止序照常走完至 `lock.release`；`run_with_hooks` 回 **1**；stderr 恰含一行 `serialwrapd: shutdown incomplete: event handlers not reaped: r1\n` |
+| `drain_total_cap_5s`（`shutdown_order.rs`） | 一個 worker 卡住不回條 | 5 s（FakeClock）後仍繼續後續步驟；log WARNING 列出 stalled session；exit code 見 `shutdown_stalled_worker_exits_1`（為 1，不得為 0） |
+| `shutdown_stalled_worker_exits_1`（`shutdown_order.rs`，fake 平台＋FakeClock；R1-F4，修正前必 FAIL） | COM0 為 READY 且前景命令已提交 TX 後 writer `BlockForever`（不回 `WorkerStoppedReceipt`）；COM1 正常；送 stop | `run_with_hooks` 回 **1**；stderr 恰含一行 `serialwrapd: shutdown incomplete: drain stalled: t:COM0\n`（不含 COM1）；COM1 的排隊命令仍為 `FLUSHED_BY_SHUTDOWN`；WAL 仍 `sync_close`、lock 仍釋放；自 stop 起到返回（FakeClock）≤ 2.0 s＋5 s |
+| `shutdown_flash_stop_incomplete_exits_1`（`shutdown_order.rs`，fake 平台；R1-F4） | 以 `run_with_hooks` 的 test-fakes hook `block_flash_endpoint_stop`（本 Task 新增於 P5 `DaemonHooks`，產品 build 不存在）使 `serialwrap-ttyMCU` thread 忽略 StopFlag → join 2.0 s 逾時，`FlashEndpoint::stop` 回 `EndpointStopReceipt{joined:false, stalled_threads:["serialwrap-ttyMCU"], …}`；其餘全部收斂 | 停止序 3～7 照常執行；`run_with_hooks` 回 **1**；stderr 恰含一行 `serialwrapd: shutdown incomplete: flash endpoint stop incomplete: serialwrap-ttyMCU\n` |
+| `shutdown_multiple_failures_accumulate_exits_1`（`shutdown_order.rs`，fake 平台；R1-F4） | `block_flash_endpoint_stop`（flash receipt `joined:false`）＋handler 逾時（`file.push`）＋COM0 drain stalled＋WAL `sync` 失敗同時注入 | `run_with_hooks` 回 **1**；stderr 恰為單行 `serialwrapd: shutdown incomplete: flash endpoint stop incomplete: serialwrap-ttyMCU; rpc handlers did not converge: file.push; drain stalled: t:COM0; WAL sync failed: <py_message>\n`（順序依停止序）；`lock.release` 仍執行 |
+| `shutdown_all_converged_exits_0`（`shutdown_order.rs`，fake 平台） | 全部步驟收斂 | `run_with_hooks` 回 0；stderr 不含 `shutdown incomplete` |
 | `panic_exits_1`（`shutdown_order.rs`） | 注入 panic | exit code 1 |
 | `user_unit_text_unchanged`（`tests/test_systemd_units.py` 既有 golden） | Rust `render_user_unit("%h/.local/bin/serialwrapd")` | 與 Python 位元組相同、無尾端換行 |
 
 - [ ] **Step 2：執行並確認 FAIL**：`cargo test -p sw-daemon --features test-fakes --test shutdown_order` → FAIL；systemd 黑箱 Python PASS、Rust FAIL（本機 `systemctl --user is-system-running` 為 `running`，可實跑）。
 - [ ] **Step 3：commit 測試**：`test(supervision): 新增 systemd 監管有序停止與失敗重啟測試`
-- [ ] **Step 4：實作**：依停止序；flash endpoint 停止在 drain 之前，避免 pump 與 drain 同時持有 fence；handler join 放在 Phase 1 之後，使長 RPC 先被取消再等待；drain 總上限以 `Clock` 計；第二次訊號只記 log。P5 `daemon_main` 與 `framing` 既有測試同步更新步驟名稱。
+- [ ] **Step 4：實作**：依停止序；stopping gate、watcher.stop、engine.close_intake 在 flash.stop 與 Phase 1 之前（R1-F2：Phase 1 之後的熱插或 SC-32 延後 reconcile 不得 open UART、不得新增未納入 drain 的 worker；事件派工不得在 drain 後新增 handler），engine.stop 在 flush_shutdown 之後、wal.sync_close 之前（handler 行程樹不得活過 WAL close 與 lock.release）；flash endpoint 停止在 drain 之前，避免 pump 與 drain 同時持有 fence；handler join 放在 Phase 1 之後，使長 RPC 先被取消再等待；drain 總上限以 `Clock` 計；第二次訊號只記 log；flash receipt、`join_handlers` 回傳、drain stalled、WAL `sync_close` 錯誤依序累積進 `incomplete`，非空時 exit 1（不得改成 WARNING 後 exit 0）。P5 `daemon_main` 與 `framing` 既有測試只同步更新步驟名稱；P5 `shutdown_with_stalled_drain_exits_1_with_diagnostic`、`shutdown_wal_sync_failure_exits_1` 的 exit code 與 stderr 斷言**不得修改**，須維持 PASS。
 - [ ] **Step 5：執行並確認 PASS**：上述兩組在 Rust artifact 皆 PASS。
 - [ ] **Step 6：commit**：`feat(supervision): 承接 systemd 下的有序停止、flash 收尾與失敗重啟`
 
@@ -2047,51 +2069,59 @@ fn cap_supervisor_runtime__task_pt0s_restart_and_graceful_stop() {
 
 ## Task 14：更新／回滾守衛對 Rust daemon 的驗證與補強（SC-23）
 
-P4 已交付 §12.1 七步與 `safety_check`（05 L1617-1654：`mcu.status`(0.5 s).`flashing` → `FLASHING_BUSY`；`session.list`(1.0 s) 任一 `state=="FLASHING"` 或 `foreground_busy` → `UPDATE_BUSY`，detail `busy:[{com,state,foreground_busy}]`；**`--force` 不影響此步**——§12.1 第 2 步不符合交接條件時一律拒絕更新，`--force` 只在 detail 記 `force_ignored:true`，見 05 Task 12 第 2 步）。本 Task **不**另建守衛、不改錯誤碼；只 (a) 對 Rust daemon 驗證 P4 契約；(b) 補 §12.1 第 2 步「活躍寫入與其他不可安全中止操作」中 P4 未涵蓋的 interactive lease；(c) 修正 P4 內部矛盾：Global Constraint「安全檢查無法確認時一律拒絕（fail-closed）」與第 2 步「不健康視為通過」衝突，依 fail-closed 收斂。
+P4 已交付 §12.1 七步與 `safety_check`（05 L1617-1654：`mcu.status`(0.5 s).`flashing` → `FLASHING_BUSY`；`session.list`(1.0 s) 任一 `state=="FLASHING"` 或 `foreground_busy` → `SESSION_BUSY`（P4 不新增 `UPDATE_BUSY`，05 `test_stage1b_adds_no_error_codes`），detail `busy:[{com,state,foreground_busy}]`；**`--force` 不影響此步**——§12.1 第 2 步不符合交接條件時一律拒絕更新，`--force` 只在 detail 記 `force_ignored:true`，見 05 Task 12 第 2 步）。本 Task **不**另建 CLI 守衛、不改錯誤碼；只 (a) 對 Rust daemon 驗證 P4 契約；(b) 補 §12.1 第 2 步「活躍寫入與其他不可安全中止操作」中 P4 未涵蓋的 interactive lease；(c) 修正 P4 內部矛盾：Global Constraint「安全檢查無法確認時一律拒絕（fail-closed）」與第 2 步「不健康視為通過」衝突，依 fail-closed 收斂；(d) **Rust daemon 承接 SC-11 交接停止 `daemon.handoff_stop`**（R1-F1）：P4 步驟 3 不再送一般 `daemon.stop`，而由 daemon 在共同 admission 邊界內原子完成 busy 判定＋凍結新操作＋發 token 後才停止（Python 版由 P1 T08 交付；arch §6.2 第 7 步）。本 Task 之前的 Rust artifact 對此方法回 `METHOD_NOT_FOUND`，P4 會拒絕從其更新／回滾（fail-closed），故 (d) 是 Slice 2.4「監管整合」出口的必要項。
 
 **Test author model:** agy-gemini-3.8-flash-high　**Implementer model:** codex-gpt-6-luna-max（daemon 生命週期／跨 Stage 停止交接，R0-F6；Sonnet 審查須逐項核對不變量，§0.2）
 
 **Files:**
 - Modify: P4 `safety_check` 所在模組（`crates/sw-cli/src/` 的 update 流程；以 P4 實際檔名為準）：busy 條件加 `interactive_session_id != null`；daemon 健康判定改為三態
 - Modify: `docs/rust-refactor/plans/05-stage1b-rust-cli-mgmt.md` 第 2 步文字（同步上述兩點）、P4 `mgmt_update.rs` 既有測試（不改既有斷言，只追加）
-- Test: `crates/sw-cli/tests/update_guard.rs`、`tests/contract_blackbox/test_s24_update_rollback.py`（`HolderSampler` 由 Task 0 提供）
+- Create: `crates/sw-core/src/admission.rs`（`AdmissionGate`，arch §6.2 第 7 步）；Modify: `crates/sw-daemon/src/framing.rs`（`daemon.handoff_stop` 與 `daemon.stop` 同層）、`crates/sw-daemon/src/service.rs`（有副作用方法分派前 `admit`）、CommandRegistry／SessionActor（命令終態 `done`；`recovering`／`flashing`／`lease` 旗標發布）、file transfer 與 flash endpoint（Task 5～9 模組：傳輸返回 `done`；sync-probe 第一個 byte 前 `admit("flash")`）
+- Test: `crates/sw-cli/tests/update_guard.rs`、`crates/sw-core/tests/admission.rs`、`crates/sw-daemon/tests/handoff_stop.rs`、`tests/contract_blackbox/test_s24_update_rollback.py`（`HolderSampler` 由 Task 0 提供）
 
 **Interfaces：**
 - Consumes：P4 `safety_check(ctx, endpoint) -> Result<(), (&'static str, PyDict)>`、`run_update`、`run_rollback`、版本目錄與 Current／Previous、`mkbundle.sh --dev`、`ProcScan`；Task 6、9 的 daemon 行為。
 - 行為變更（寫入 P4 契約）：
-  - busy 條件：`state=="FLASHING"` 或 `foreground_busy==true` 或 `interactive_session_id` 非 null → `UPDATE_BUSY`（detail 每筆加 `interactive_session_id`；message 不變）。背景 capture 為被動 RX、可安全中止，不列入（理由寫入 P4 文字）。
-  - daemon 健康三態：**確認不存在**（連線被拒或 socket／TCP 端點不存在，且 `ProcScan` 找不到 `serialwrapd`）→ 視為通過；**健康**→ 照常檢查；**未知**（RPC timeout、壞回應、連線成功但回應不可解析、行程存在但 RPC 不通）→ 拒絕，回 `UPDATE_BUSY`＋detail `{"health":"unknown","reason":…}`；**`--force` 不可略過**（健康不明時可能正處 FLASHING／FileTransfer，停 daemon 無法撤銷 DUT 已發生的部分燒寫）。
-  - `--force` 對 update／rollback 的 busy、健康三態、身分確認與步驟 3 停用後重檢**全部無效**；帶 `--force` 的拒絕結果與未帶時逐欄相同，只多 detail `force_ignored:true`，且不得 disable／stop 監管、不得送 `daemon.stop`。一般 `setup`（非 update 路徑）的 Python 對等 `--force` 覆寫不變。
+  - busy 條件：`state=="FLASHING"` 或 `foreground_busy==true` 或 `interactive_session_id` 非 null → `SESSION_BUSY`（detail 每筆加 `interactive_session_id`；message 不變）。背景 capture 為被動 RX、可安全中止，不列入（理由寫入 P4 文字）。
+  - daemon 健康三態：**確認不存在**（連線被拒或 socket／TCP 端點不存在，且 `ProcScan` 找不到 `serialwrapd`）→ 視為通過；**健康**→ 照常檢查；**未知**（RPC timeout、壞回應、連線成功但回應不可解析、行程存在但 RPC 不通）→ 拒絕，碼依 05 Task 12 錯誤表：探測 RPC 逾時／壞回應／連線失敗回該 RPC 的碼（`TIMEOUT`／`INVALID_RESPONSE`／`SOCKET_ERROR`，detail `probe:<method>`），行程存在但 RPC 不通回 `DEVICE_STILL_HELD`（detail `pids`），兩者 detail 皆加 `{"health":"unknown","reason":…}`；**`--force` 不可略過**（健康不明時可能正處 FLASHING／FileTransfer，停 daemon 無法撤銷 DUT 已發生的部分燒寫）。
+  - 步驟 3 交接（R1-F1）：停用後送 `daemon.handoff_stop`，**不送**一般 `daemon.stop`；daemon 回忙碌或交接無法確認 → 還原 enabled、不硬停、不切換；CLI 不得以第二次 `session.list` 取代 daemon 原子判定。
+  - `--force` 對 update／rollback 的 busy、健康三態、身分確認與步驟 3 交接**全部無效**；帶 `--force` 的拒絕結果與未帶時逐欄相同，只多 detail `force_ignored:true`，且不得 disable／stop 監管、不得送 `daemon.stop`。一般 `setup`（非 update 路徑）的 Python 對等 `--force` 覆寫不變。
 
 - [ ] **Step 1：寫失敗測試**
 
 | 測試名 | 情境 | 期望 |
 |---|---|---|
 | `guard_flashing_blocks_rollback`（`update_guard.rs`，stubd） | `mcu.status.flashing:true` | P4 `FLASHING_BUSY` JSON（message `flash 進行中，拒絕更新／回滾（--force 不適用，請待 flash 完成後重試）`）、exit 2、未執行任何 stop／切換命令 |
-| `guard_foreground_blocks_rollback` | COM1 `foreground_busy:true` | `UPDATE_BUSY`、detail `busy` 含 `{"com":"COM1",…}`、exit 2 |
-| `guard_interactive_lease_blocks_rollback` | COM0 `interactive_session_id:"i-1"`、`foreground_busy:false` | `UPDATE_BUSY`、detail 含 `interactive_session_id:"i-1"` |
-| `guard_rpc_timeout_refuses` | stubd `session.list` 延遲 > 1.0 s | `UPDATE_BUSY`、`health:"unknown"`、未停止監管 |
-| `guard_malformed_response_refuses` | stubd 回 `reply_raw:"{not json"` | 同上 |
+| `guard_foreground_blocks_rollback` | COM1 `foreground_busy:true` | `SESSION_BUSY`、detail `busy` 含 `{"com":"COM1",…}`、exit 2 |
+| `guard_interactive_lease_blocks_rollback` | COM0 `interactive_session_id:"i-1"`、`foreground_busy:false` | `SESSION_BUSY`、detail 含 `interactive_session_id:"i-1"` |
+| `guard_rpc_timeout_refuses` | stubd `session.list` 延遲 > 1.0 s | `TIMEOUT`、`probe:"session.list"`、`health:"unknown"`、未停止監管 |
+| `guard_malformed_response_refuses` | stubd 回 `reply_raw:"{not json"` | `INVALID_RESPONSE`，其餘同上 |
 | `guard_daemon_absent_passes` | socket 不存在且無 `serialwrapd` 行程 | 放行進第 3 步 |
-| `guard_process_alive_rpc_down_refuses` | socket 不通但 `ProcScan` 找到 `serialwrapd` | `UPDATE_BUSY`、`health:"unknown"` |
+| `guard_process_alive_rpc_down_refuses` | socket 不通但 `ProcScan` 找到 `serialwrapd` | `DEVICE_STILL_HELD`、`pids` 非空、`health:"unknown"` |
 | `guard_force_does_not_override`（參數化，取代原 `guard_force_overrides`） | 上述每一拒絕列（flashing、foreground、interactive lease、RPC timeout、壞回應、行程在但 RPC 不通）各＋`--force`，update 與 `setup --rollback --force` 各跑一次 | 錯誤碼／`phase`／`busy` 與未帶 `--force` 時逐欄相同；`safety_check.detail.force_ignored==true`、無 `skipped`；steps 止於 `safety_check`；監管呼叫序為空（無 `/Change /DISABLE`、`/End`、`systemctl stop`）；stubd 未收到 `daemon.stop`；`current-release.json` 未變 |
-| `guard_force_recheck_after_disable_still_refuses` | 第一次 `session.list` 閒置、停用後第二次 `state:"FLASHING"`，帶 `--force` | `FLASHING_BUSY` 或 `UPDATE_BUSY`、`set_enabled(true)` 已呼叫、stubd 未收到 `daemon.stop` |
+| `guard_force_recheck_after_disable_still_refuses` | `session.list` 閒置、停用後 `daemon.handoff_stop` 回 `FLASHING_BUSY`，帶 `--force` | `FLASHING_BUSY`、`set_enabled(true)` 已呼叫、stubd 未收到 `daemon.stop`、無 `/End` |
+| `gate_admit_vs_freeze_linearizable`（`crates/sw-core/tests/admission.rs`；R1-F1，修正前必 FAIL） | 8 執行緒反覆 `admit("file.push","COM0")`／`done`，1 執行緒 `freeze_if_idle("update")`，10,000 輪（`loom` 不適用時以 Barrier＋隨機 yield） | 每輪恰為二者之一：freeze 回 token ⇒ 其後所有 `admit` 回 `None` 且 freeze 當下 ticket 數為 0；freeze 回 busy ⇒ `frozen==false` 且 busy 的 `ops` 含當下持有的 ticket kind；不得出現「token 發出時仍有 live ticket」 |
+| `handoff_file_push_after_last_probe`（`crates/sw-daemon/tests/handoff_stop.rs`，daemon 側；CLI 側同情境為 05 `update_file_push_after_last_probe`，Python A/B 對應 P1 `test_handoff_file_push_after_last_probe`；真 daemon＋FakeSerial；R1-F1，修正前必 FAIL） | `session.list` 閒置後開始 `file.push`（FakeSerial 寫入阻塞），再送 `daemon.handoff_stop{"reason":"update"}` | `{"ok":false,"error_code":"SESSION_BUSY","busy":[{"com":"COM0",…,"ops":["file.push"]}]}`；trace 無 `BeginDrain`／`TransferAbort`；放行後 push `ok:true` 且 FakeSerial 收到完整 payload；再送交接 → `ok:true`、`stopping:true`、token 32 hex、回應無 `version`，之後 trace 才出現 `ServerStopped`，`SessionsDrained{flushed:[],stalled:[]}`、exit 0 |
+| `handoff_flash_races_prepare`（同檔；CLI 側為 05 `update_flash_races_prepare`；R1-F1，修正前必 FAIL） | fakemcu：sync-probe 與 `daemon.handoff_stop{"reason":"rollback"}` 以 Barrier 同時觸發，200 輪；另兩個固定順序案例 | 每輪：交接 ok ⇒ probe 被拒、fakemcu 收到 0 bytes、session 從未 `FLASHING`；probe 先 admit ⇒ 交接回 `FLASHING_BUSY`、daemon 未停止、flash 完成後 `Return error code : 0x0` |
+| `handoff_frozen_rejects_mutating_methods`（同檔） | 交接 ok 後（停止尚未完成前）對 `rpc_schema.json` 中 `side_effects` 非空且 `retryable_readonly==false` 的每個方法送請求 | 皆 `{"ok":false,"error_code":"FLUSHED_BY_SHUTDOWN","reason":"handoff_frozen"}`；FakeSerial 自凍結起零寫入、WAL 無新 TX、`state.json` 未改寫；`health.ping`／`session.list`／`mcu.status` 仍 ok |
+| `handoff_busy_lease_and_recovering`（同檔） | lease 開啟；或 IoError drain 進行中 | 各回 `SESSION_BUSY`（`ops:["session.interactive_open"]`／`recovering:true`），未凍結、之後 `command.submit` 照常受理 |
+| `rollback_refuses_push_started_after_probe`（黑箱，Rust daemon，`posix_pty`，`process_rpc`；R1-F1） | dev bundle 以 `SW_TEST_UPDATE_PAUSE_AFTER=safety_check` 在預檢後暫停，期間開始 `file push`，再放行 `setup --rollback`（與 `--force` 各一次） | `SESSION_BUSY`、`handoff:"refused"`、exit 2；`daemon status.pid` 不變、WAL 無 shutdown 記錄；push 正常完成且 DUT 端 md5 正確；`current-release.json` 未變 |
 | `guard_daemon_absent_force_same_as_without` | daemon 確認不存在＋`--force` | 放行進第 3 步，steps 與未帶 `--force` 相同（`--force` 不改變通過路徑） |
 | `setup_guard_message_unchanged` | 一般 `setup` 且 flashing | Python 原文 `flash 進行中，拒絕 setup（可用 --force 覆寫）`、exit 2 |
-| `rollback_refuses_while_push`（黑箱，Rust daemon） | `file.push` 進行中 rollback | `UPDATE_BUSY`；push 正常完成且 DUT 端檔案 md5 正確 |
+| `rollback_refuses_while_push`（黑箱，Rust daemon） | `file.push` 進行中 rollback | `SESSION_BUSY`；push 正常完成且 DUT 端檔案 md5 正確 |
 | `rollback_refuses_while_flashing`（黑箱，fakemcu） | FLASHING 中 rollback | `FLASHING_BUSY`；flash 正常完成 |
 | `rollback_force_refuses_while_flashing`（黑箱，fakemcu，`posix_pty`；R0-F4） | FLASHING 中 `setup --rollback --force`；同樣以 `setup --force`（bundle 更新）再跑一次 | 兩者皆 `FLASHING_BUSY`、`phase:"update_safety_check"`、exit 2；拒絕前後 `daemon status.pid` 不變且 `health.ping` 全程 ok；監管仍 enabled（stub 監管呼叫序為空）；fakemcu 收到的燒錄位元組與單獨燒錄時完全相同、flasher `Return error code : 0x0`、燒後 session 回 `ATTACHED`；`current-release.json` 未變 |
-| `rollback_force_refuses_while_push`（黑箱，Rust daemon；R0-F4） | `file.push` 進行中 `setup --rollback --force`；同樣以 `setup --force` 再跑一次 | 兩者皆 `UPDATE_BUSY`、exit 2；`daemon status.pid` 不變、未收到 `daemon.stop`（WAL 無 shutdown 記錄）；push 正常完成且 DUT 端檔案 md5 正確 |
-| `rollback_refuses_while_interactive_send`（黑箱） | interactive lease 開啟、`interactive_send` 進行中 | `UPDATE_BUSY`；DUT 端收到完整 payload |
+| `rollback_force_refuses_while_push`（黑箱，Rust daemon；R0-F4） | `file.push` 進行中 `setup --rollback --force`；同樣以 `setup --force` 再跑一次 | 兩者皆 `SESSION_BUSY`、exit 2；`daemon status.pid` 不變、未收到 `daemon.stop`（WAL 無 shutdown 記錄）；push 正常完成且 DUT 端檔案 md5 正確 |
+| `rollback_refuses_while_interactive_send`（黑箱） | interactive lease 開啟、`interactive_send` 進行中 | `SESSION_BUSY`；DUT 端收到完整 payload |
 | `rollback_cross_stage_state_compat_released`（黑箱，`posix_pty`，`rust_only`） | Current＝Stage 2（Rust daemon）、Previous＝Stage 1B（Python daemon）；Current 下 release COM0 後 `setup --rollback` | Previous daemon 讀同一 `state.json`：COM0 仍 RELEASED；`device attach` 成功並 READY |
 | `rollback_cross_stage_ready_never_double_held`（黑箱，`posix_pty`，`rust_only`） | 同上兩版；COM0 為 READY（Rust daemon 持有 tty）時 `setup --rollback`，全程 `HolderSampler(slave_path, 0.01)` | `max_concurrent()<=1`；Rust daemon pid 消失後 Python daemon pid 才出現；最終 READY |
 | `rollback_verifies_pairing` | Previous manifest 與實際 sha 不符 | 回到 Current，保存失敗證據（P4 行為，以 Rust daemon 再跑） |
 
-- [ ] **Step 2：執行並確認 FAIL**：`cargo test -p sw-cli --test update_guard` → 新增三態與 lease 列 FAIL（P4 既有列 PASS）；黑箱對 Rust bundle FAIL（`rust_only` 兩列在 Python 側 SKIP 並已於 `cases.yaml` 登記）。
+- [ ] **Step 2：執行並確認 FAIL**：`cargo test -p sw-cli --test update_guard` → 新增三態與 lease 列 FAIL（P4 既有列 PASS）；`cargo test -p sw-core --test admission`、`cargo test -p sw-daemon --test handoff_stop` → FAIL（`METHOD_NOT_FOUND`／`AdmissionGate` 未實作）；黑箱對 Rust bundle FAIL（`rust_only` 兩列在 Python 側 SKIP 並已於 `cases.yaml` 登記）。
 - [ ] **Step 3：commit 測試**：`test(setup): 新增更新／回滾守衛對 Rust daemon 的驗證與 fail-closed 測試`
-- [ ] **Step 4：實作**：只改 P4 `safety_check` 的 busy 條件與健康三態判定，並確認 `--force` 未傳入 `safety_check`／步驟 3 重檢（若 P4 實作仍有 force 略過分支，於本 Task 同 PR 移除並更新 P4 測試）；錯誤碼不變、message 依 P4 現行文字（`--force 不適用`）；P4 計畫文字同步。
-- [ ] **Step 5：執行並確認 PASS**：Rust 測試、P4 既有 `cargo test -p sw-cli` 與黑箱 PASS。
-- [ ] **Step 6：commit**：`fix(setup): 更新／回滾守衛納入 interactive lease 並在健康不明時拒絕`
+- [ ] **Step 4：實作**：CLI 側只改 P4 `safety_check` 的 busy 條件與健康三態判定，並確認 `--force` 未傳入 `safety_check`／步驟 3 交接（若 P4 實作仍有 force 略過分支或一般 `daemon.stop` 分支，於本 Task 同 PR 移除並更新 P4 測試）；錯誤碼不變、message 依 P4 現行文字（`--force 不適用`）；P4 計畫文字同步。daemon 側依 arch §6.2 第 7 步實作 `AdmissionGate`＋`daemon.handoff_stop`（與 P1 T08 Python 版同形狀：成功 `{"ok":true,"stopping":true,"handoff_token"}`、忙碌 `FLASHING_BUSY` 優先於 `SESSION_BUSY`、凍結後 `FLUSHED_BY_SHUTDOWN`＋`reason:"handoff_frozen"`），所有 admission 點在任何副作用前 `admit`；以 P1 T08 的 `tests/test_stage0_handoff_stop.py` 對 Rust artifact 跑 A/B（雙邊案例）。
+- [ ] **Step 5：執行並確認 PASS**：Rust 測試（含 `cargo test -p sw-core --test admission`、`cargo test -p sw-daemon --test handoff_stop`）、P4 既有 `cargo test -p sw-cli`、黑箱與 `tests/test_stage0_handoff_stop.py` 對 Rust artifact 的 A/B PASS。
+- [ ] **Step 6：commit**：`fix(setup): 更新／回滾守衛納入 interactive lease、健康不明時拒絕，Rust daemon 承接原子交接停止`
 
 **Changelog fragment：** `changelog.d/rust-p8-update-guard.md`（`type: fix`、`scope: rust-cli`）。
 
@@ -2133,7 +2163,7 @@ P3～P7 的黑箱與 Rust 測試沒有 `contract` marker，故 ID↔測試的對
   #   {"covered","missing":{owner_phase:[id…]},"blocked_owner":{id: reason},"ab_mismatch","identity_errors"}
   def main(argv=None) -> int: ...   # missing、ab_mismatch、identity_errors 任一非空 → exit 1
   ```
-  ID 規則：`error_code:<CODE>`（`reachable:true`）、`last_error:<VALUE>`（`reachable:true`）、`rpc_method:<name>`（`rpc_schema.json` 的 `x-methods` 鍵，54 個）、`cli_cmd:<group> <sub>`（`cli_schema.json` 的 `/commands[*].path`）、`bc:<ID>`（`behavior_changes.yaml` 的 `changes[*].id`，含 SC-32、SC-33）、`schema:wal_record`、`schema:state_file`、`case:<case_id>`（`cases.lock.json` 的 `sets["slice_2.4"]`）。`EXTRACTORS` 的路徑與 P0 實際檔案不同時，於本 Task 同 PR 調整並由 `test_extractors_match_real_contracts` 把關。
+  ID 規則：`error_code:<CODE>`（`reachable:true`）、`last_error:<VALUE>`（`reachable:true`）、`rpc_method:<name>`（`rpc_schema.json` 的 `x-methods` 鍵，55 個＝54 基線＋P1 T08 併入的 SC-11 `daemon.handoff_stop`，R1-F1）、`cli_cmd:<group> <sub>`（`cli_schema.json` 的 `/commands[*].path`）、`bc:<ID>`（`behavior_changes.yaml` 的 `changes[*].id`，含 SC-32、SC-33）、`schema:wal_record`、`schema:state_file`、`case:<case_id>`（`cases.lock.json` 的 `sets["slice_2.4"]`）。`EXTRACTORS` 的路徑與 P0 實際檔案不同時，於本 Task 同 PR 調整並由 `test_extractors_match_real_contracts` 把關。
 
   判定規則：
   1. **身分**：同一 run_dir 內所有結果檔的 `contract_revision`、`cases_yaml_sha256`、`cases_lock_sha256` 必須一致；`rust-*` 結果檔的 `cli_sha256`／`daemon_sha256` 必須彼此一致且等於當輪 artifact 的實際 sha256；`evidence[*].sha256` 必須與檔案相符。不一致 → `identity_errors`，不得跨候選版本或跨輪合併。
@@ -2178,7 +2208,7 @@ def test_extractors_match_real_contracts():
                     ROOT / "tests/acceptance/cases.lock.json", ROOT / "contracts/coverage_map.yaml")
     kinds = {v["kind"] for v in u.values()}
     assert {"error_code", "rpc_method", "cli_cmd", "bc", "schema", "case"} <= kinds
-    assert sum(1 for k in u if k.startswith("rpc_method:")) == 54
+    assert sum(1 for k in u if k.startswith("rpc_method:")) == 55 and "rpc_method:daemon.handoff_stop" in u
     assert "rpc_method:mcu.status" in u and "error_code:FLASHING_BUSY" in u
     assert "bc:SC-32" in u and "bc:SC-33" in u and "case:s24-flash-sync-replay" in u
     assert u["error_code:ECHO_ACK_UNSUPPORTED"]["l1_only"] is True
@@ -2256,7 +2286,7 @@ def test_cargo_results_import_roundtrip(tmp_path):
 5. `SERIALWRAP_CLI_EXE=$RUST_CLI SERIALWRAP_DAEMON_EXE=$RUST_DAEMON SERIALWRAP_AB_LABEL=rust-linux SERIALWRAP_COVERAGE_RUN_DIR=$RUN_DIR python3 -m pytest -q tests/contract_blackbox tests/test_multiagent_e2e.py tests/test_human_agent_coexist.py`
 6. `func-test` 外部模式（P2）以 Rust artifact 執行 13 個既有 case＋§15.7.1 的 11 個情境，結果匯入 `$RUN_DIR`
 7. Windows 正式 gate（arch §1.1、規格 §11.5）：讀取擁有者 Windows 自架 runner 以**原生 build/link** 產生的 artifact 與其 `results-rust-windows.json`（路徑由 `--windows-run <dir>` 傳入，sha256 須與 runner 產出的 `SHA256SUMS` 相符）；未提供 → 該平台 ID 全列 BLOCKED-OWNER
-8. 長跑證據匯入（規格 §11.6、§15.11）：`--longrun <dir>`，內容須含 pinned bundle sha256、對應 Python 48h baseline、停用自動重啟的紀錄、bench lock 紀錄、P2 `realhw/acceptance/gate.py` 的 `release-gate.json`；未提供 → `lr-mixed` 列 BLOCKED-OWNER
+8. 長跑證據匯入（規格 §11.6、§15.11）：`--longrun <dir>`，內容須含 pinned bundle sha256、對應 Python 48h baseline、停用自動重啟的紀錄、bench lock 紀錄、P2 `realhw/acceptance/gate.py` 的 `release-gate.json`（Windows 另須 `excl/probes.ndjson`＋`excl/handoff.ndjson` 原生 COM 獨占證據，P2 Task 15「Windows 獨占證據契約」，R1-F7；`holder_unknown` 只作診斷，不是雙重持有判定依據）；未提供 → `lr-mixed` 列 BLOCKED-OWNER
 9. `python3 scripts/rust/contract_coverage.py --run-dir $RUN_DIR --expect-cli-sha256 $(sha256sum $RUST_CLI|cut -d' ' -f1) --expect-daemon-sha256 $(sha256sum $RUST_DAEMON|cut -d' ' -f1) --json $RUN_DIR/slice24.json`
 10. `python3 scripts/rust/slice_breaker.py --freeze tests/acceptance/breaker/slice_2.4.json --snapshots tests/acceptance/breaker/slice_2.4.snapshots.ndjson --today $(date -u +%F)`（tripped 或 `od02_resubmit` → exit 1 並印退守指示）
 11. `python3 -m policy_check --repo .`
@@ -2284,7 +2314,7 @@ def test_cargo_results_import_roundtrip(tmp_path):
 | 5 | Windows 正式 gate：自架 runner 原生 build/link 的 artifact 與其 L1／L1.5 結果（WSL cross build 不取代） | 全部 platforms 含 windows 的 ID | 擁有者 Windows 自架 runner（arch §1.1、OD-08） | `slice24_exit.sh --windows-run <dir>`（含 `SHA256SUMS`） |
 | 6 | `windows-task` runtime：測試排程工作建立授權、失敗重啟實測、>72 小時 `PT0S`、登入觸發、測試團隊工作站正式安裝 | `s24-sup-wintask-runtime`、`win-task-logon-trigger`、`win-task-single-instance`、`win-task-restart-on-failure`、`win-task-72h`；Task 13 | `SW_TEST_ALLOW_SCHTASKS=1`、Spike 2、互動桌面 | `SW_TEST_ALLOW_SCHTASKS=1 scripts/rust/win-test.sh --package sw-pal --caps supervisor_runtime`；Spike 2 程序 |
 | 7 | 正式 `serialwrap.service`（user／system）以 Rust bundle 實裝與重啟 | `p1-rst-daemon`、`p1-ho-persist`；Task 12 | 擁有者機器或 bench、sudo | `setup --user`／`setup --system --with-sudo` 後執行 #2 |
-| 8 | 雙平台 Rust daemon 各 48 小時 `lr-mixed`（Linux、Windows 依序，同機同板經 usbipd），滿足 OD-09 絕對與相對閘門 | `lr-mixed` | OD-10 bench 排程；pinned bundle、對應 Python 48h baseline、停用自動重啟、bench lock；OD-09 延後凍結項（RSS／資源預算、最低負載、比較容許誤差）須先於 Python 48h 基線後凍結 | `python3 -m realhw --tier longrun --duration 48h`＋P2 `realhw/acceptance/gate.py` → `release-gate.json`；以 `slice24_exit.sh --longrun <dir>` 匯入 |
+| 8 | 雙平台 Rust daemon 各 48 小時 `lr-mixed`（Linux、Windows 依序，同機同板經 usbipd），滿足 OD-09 絕對與相對閘門 | `lr-mixed` | OD-10 bench 排程；pinned bundle、對應 Python 48h baseline、停用自動重啟、bench lock；OD-09 延後凍結項（RSS／資源預算、最低負載、比較容許誤差）須先於 Python 48h 基線後凍結 | `python3 -m realhw --tier longrun --duration 48h`＋P2 `realhw/acceptance/gate.py` → `release-gate.json`（Windows 依 P2 Task 15 README 前後加 `winexcl handoff --phase pre／post`、observer `--excl-dir`、gate `--excl-evidence`）；以 `slice24_exit.sh --longrun <dir>` 匯入 |
 | 9 | Windows 實機回滾（真實串口釋放與重新取得） | Task 14 | 擁有者 Windows 主機＋原生 COM | P4 `setup --rollback` 於 Windows；`failure.json`／步驟紀錄 |
 | 10 | needs-owner 裁決：SC-33（Python 側）、XFER-ABORT-01 是否納入 BC-03、EVT-D-F4／F7 | Task 1 | 擁有者 | `spec-reconciliation.md` needs-owner 清單；未裁決依預設往下做，EVT-D-F4 未裁決則阻擋出口 |
 
