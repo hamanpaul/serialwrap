@@ -1,0 +1,41 @@
+# 本檔宣告「如何從 sw_core 抽出會輸出的碼」（OD-06：repo 以設定宣告抽取路徑，規則本身不內建碼表）。
+schema_version: 1
+roots: ["sw_core/**/*.py"]
+exclude: ["sw_core/assets/**"]
+code_pattern: '^[A-Z][A-Z0-9_]*[A-Z0-9]$'
+dynamic_prefix_pattern: '^[A-Z][A-Z0-9_]*:'
+max_depth: 12
+exclude_functions:
+  # property setter：`self._last_error = value` 的 value 來自所有 `.last_error = X` 指派，已由 attribute_store sink 直接擷取
+  - "sw_core/session_manager.py::SessionRuntime.last_error"
+namespaces:
+  error_code:
+    sinks:
+      - {kind: dict_key, key: error_code}
+      - {kind: subscript_store, key: error_code}
+      - {kind: call_keyword, keyword: error_code}
+      - {kind: param_default, param: error_code}
+      - {kind: call_arg, callee: TunnelError, index: 0}
+      - {kind: call_arg, callee: TunnelError, keyword: code}
+      - {kind: call_arg, callee: _EndpointResolutionError, index: 0}
+      - {kind: call_arg, callee: _EndpointResolutionError, keyword: code}
+      - {kind: call_arg, callee: RuntimeError, index: 0, value_pattern: '^[A-Z][A-Z0-9]*(_[A-Z0-9]+)+$', implies_interface: proc}
+      - {kind: attribute_store, attr: error_code}
+    relays:
+      - {kind: call_method_arg, method: get, arg: error_code}
+      - {kind: subscript_load, key: error_code}
+      - {kind: attribute_load, attr: code}
+      - {kind: attribute_load, attr: error_code}
+    passthrough:
+      - {kind: attribute_load, attr: last_error, emits: last_error_passthrough}
+      - {kind: call_method_arg, method: get, arg: last_error, emits: last_error_passthrough}
+      - {kind: subscript_load, key: last_error, emits: last_error_passthrough}
+  session_last_error:
+    sinks:
+      - {kind: attribute_store, attr: last_error}
+    relays:
+      - {kind: attribute_load, attr: last_error}
+      - {kind: call_method_arg, method: get, arg: last_error}
+    passthrough: []
+allow_unresolved: []
+exclude_values: []

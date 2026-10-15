@@ -698,12 +698,16 @@ namespaces:
       - {kind: call_keyword, keyword: error_code}
       - {kind: param_default, param: error_code}
       - {kind: call_arg, callee: TunnelError, index: 0}
+      - {kind: call_arg, callee: TunnelError, keyword: code}
       - {kind: call_arg, callee: _EndpointResolutionError, index: 0}
+      - {kind: call_arg, callee: _EndpointResolutionError, keyword: code}
       - {kind: call_arg, callee: RuntimeError, index: 0, value_pattern: '^[A-Z][A-Z0-9]*(_[A-Z0-9]+)+$', implies_interface: proc}
+      - {kind: attribute_store, attr: error_code}
     relays:
       - {kind: call_method_arg, method: get, arg: error_code}
       - {kind: subscript_load, key: error_code}
       - {kind: attribute_load, attr: code}
+      - {kind: attribute_load, attr: error_code}
     passthrough:
       - {kind: attribute_load, attr: last_error, emits: last_error_passthrough}
       - {kind: call_method_arg, method: get, arg: last_error, emits: last_error_passthrough}
@@ -723,14 +727,14 @@ exclude_values: []
 
 **抽取語意（實作者照此實作；測試以此為準）：**
 
-1. 檔案集合：`roots` 以 `pathlib.Path(repo_root).glob(pattern)` 的遞迴語意展開（`**` 匹配零或多層目錄，因此 `sw_core/**/*.py` 同時含 `sw_core/cli.py` 與 `sw_core/event_engine/*.py`），只收一般檔案；扣除 `exclude`（同樣以 `Path.glob` 展開後做集合差）；依 repo 相對 POSIX 路徑排序。**不得用 `fnmatch`**（`fnmatch("sw_core/cli.py", "sw_core/**/*.py")` 為 False，會漏掉 `sw_core/` 直層的全部模組）。
+1. 檔案集合：`roots` 以 `pathlib.Path(repo_root).glob(pattern)` 的遞迴語意展開（`**` 匹配零或多層目錄，因此 `sw_core/**/*.py` 同時含 `sw_core/cli.py` 與 `sw_core/event_engine/*.py`），只收一般檔案；扣除 `exclude`（同樣以 `Path.glob` 展開後做集合差）。若 `exclude` 命中目錄，該目錄下所有一般檔案都排除，不依賴 Python 版本對 `dir/**` 的 glob 差異。`roots`／`exclude` 只接受 repo 內相對 pattern，拒絕絕對路徑與 `..`。依 repo 相對 POSIX 路徑排序。**不得用 `fnmatch`**（`fnmatch("sw_core/cli.py", "sw_core/**/*.py")` 為 False，會漏掉 `sw_core/` 直層的全部模組）。
 2. 對每個 namespace 的每個 sink，找出 AST 中對應位置的「值運算式」：
    - `dict_key`：`Dict` 字面中 key 為 `Constant(key)` 的 value；以及 `dict(<key>=X)` 呼叫的 keyword。
-   - `subscript_store`：`Assign`／`AugAssign` target 為 `Subscript(slice=Constant(key))`。
+   - `subscript_store`：`Assign`／`AnnAssign`／`AugAssign` target 為 `Subscript(slice=Constant(key))`；`<任意>.setdefault(Constant(key), value)` 也視為同一種 store。
    - `call_keyword`：任何 `Call` 的 `keyword(arg=keyword)`。
    - `param_default`：`FunctionDef` 參數名等於 `param` 的預設值（含 kw-only）。
-   - `call_arg`：`Call.func` 為 `Name(callee)` 或 `Attribute(attr=callee)` 時第 `index` 個位置參數；`value_pattern` 存在時只收符合的字串常數，不符者**靜默忽略**（例：`RuntimeError("serial not ready")`）。
-   - `attribute_store`：`Assign` target 為 `Attribute(attr=attr)`（不論 receiver）。
+   - `call_arg`：`Call.func` 為 `Name(callee)` 或 `Attribute(attr=callee)` 時的第 `index` 個位置參數，或名為 `keyword` 的關鍵字參數；兩者必須且只能設定一個。`value_pattern` 存在時只收符合的字串常數，不符者**靜默忽略**（例：`RuntimeError("serial not ready")`）。
+   - `attribute_store`：`Assign`／`AnnAssign` target 為 `Attribute(attr=attr)`（不論 receiver）；`setattr(receiver, Constant(attr), value)` 也視為同一種 store。
 3. `resolve(expr, ctx, depth, index=None) -> set[Value]`，`Value` 為 code／dynamic_prefix／passthrough／relay／unresolved 之一：
    1. `Constant(str)`：符合 `code_pattern` → code；`dynamic_prefix_pattern` 不適用於純常數；空字串 → 忽略。其他非空字串：若此值是**明確碼 sink**（`dict_key`、`subscript_store`、`call_keyword`、`param_default`，以及未設 `value_pattern` 的 `call_arg`）經任何傳遞路徑解析出的值 → unresolved(`malformed_code`)（例：`{"error_code": "new-code"}`、`TunnelError("bad code")` 必須 FAIL，不得靜默）；只有設了 `value_pattern` 的 `call_arg`（例 `RuntimeError`）不符 pattern 時才忽略。
    2. `Constant(None)`、`Constant(bool/int)` → 忽略。
@@ -738,16 +742,16 @@ exclude_values: []
    4. `BinOp(Add)` 左運算元為 `Constant(str)` 且符合 `dynamic_prefix_pattern` → 同上；否則 unresolved。
    5. `BoolOp`（`or`／`and`）→ 各運算元聯集；`IfExp` → `body` 與 `orelse` 聯集。
    6. relay 與 passthrough 樣式先於一般規則比對：`call_method_arg` 為 `<任意>.<method>(Constant(arg), ...)`；`subscript_load` 為 `<任意>[Constant(key)]`（Load context）；`attribute_load` 為 `<任意>.<attr>`（Load）。命中 relay → relay（不產生值）**∪ 對其餘位置參數與 `default=` keyword 遞迴 resolve 的結果**（例：`resp.get("error_code", "NEW_CODE")` 產生 `NEW_CODE`；`resp.get("error_code", fallback)` 依 `fallback` 往下解析）；命中 passthrough → passthrough(`emits`) ∪ 同樣的 default 解析結果。
-   7. `Name`：依序找 (a) 同函式內所有對該名的賦值（`Assign`、`AnnAssign`、`AugAssign`、tuple 解包——記錄解包位置作 index、`NamedExpr`、`for` 目標、`with ... as`），取聯集；(b) 若為該函式參數 → 預設值 ∪ 全部呼叫點實參（依「名稱」比對 `Name(func)` 或 `Attribute(attr=func)` 呼叫，位置或 keyword 對應，跳過 `self`／`cls`）；(c) 同模組頂層賦值；(d) `from X import NAME [as A]`（含相對 import，依 package 路徑解析）→ 目標模組頂層賦值。都找不到 → unresolved(`unknown_name`)。
-   8. `Attribute(value=Name(m), attr=A)`，`m` 為 `import X as m`／`from . import m` 解析到的 repo 模組 → 該模組頂層 `A`；`self.A`／`cls.A` → 所屬 class 的 class-level 賦值；都不符 → unresolved(`unknown_name`)。
-   9. `Call`：(a) `<Dict 字面>.get(k[, d])` 或 `Name.get(...)`（Name 解析為 Dict 字面）→ 所有 dict value ∪ `d`；(b) callee 名稱（`Name.id` 或 `Attribute.attr`）在 repo 中有同名 `def`（不論 class）→ 這些函式所有 `return` 運算式的聯集；有 `index` 時取 `Tuple` 第 index 個元素，return 本身是 Name／Call 時把 index 往下傳；函式無任何帶值 return → unresolved(`no_return_value`)；(c) repo 內無同名函式 → unresolved(`unknown_callee`)。
+   7. `Name`：聯集 (a) 同函式內所有對該名的賦值（`Assign`、`AnnAssign`、`AugAssign`、tuple 解包——記錄解包位置作 index、`NamedExpr`、`for` 目標、`with ... as`），以及 (b) 若為該函式參數，其定義 scope 中的預設值與全部可辨識呼叫點實參；參數即使在函式內另有賦值，(a) 與 (b) 仍都要解析。預設值在函式定義所在 scope 解析；位於 class body 時先查 class-level 賦值，再查 module scope，位於函式內時依 enclosing function scope 解析。位置／keyword 實參保留目前的 tuple index，並跳過 bound method 的 `self`／`cls`。呼叫點支援直接名稱／屬性呼叫、同函式或同模組 callable alias，以及 `Thread(target=..., args=...)`；(c) 無 (a)/(b) 候選時再找同模組頂層賦值；(d) `from X import NAME [as A]`（含相對 import 與函式內 import，依 package 路徑解析）→ 目標模組頂層賦值。都找不到 → unresolved(`unknown_name`)。
+   8. `Attribute(value=Name(m), attr=A)`，`m` 為函式或模組內 `import X as m`／`from . import m` 解析到的 repo 模組 → 該模組頂層 `A`；`self.A`／`cls.A` → 聯集所屬 class 的 class-level 與各 method instance assignment，避免 class-level `None` placeholder 隱藏 instance 值；都不符 → unresolved(`unknown_name`)。exception handler 中的 `exc.code` 若對應 repo exception class 的 `__init__` 將參數存入 `.code`，則沿 constructor 呼叫點解析該參數；已由 `call_arg` 宣告的例外類別仍依該 sink 抽取。
+   9. `Call`：(a) `<Dict 字面>.get(k[, d])` 或 `Name.get(...)`（名稱解析為 Dict 字面）→ 所有 dict value ∪ `d`；名稱解析支援 local、module、from-import、module attribute、class／instance attribute、參數與呼叫點，且 dict value 在字典定義 scope 解析。只有確認至少一個 dict source 時才套用 dict lookup；任何其他來源分支無法解析都保留 unresolved。接收者不是可確認的 dict 時，依一般 callee 規則處理，不把任意 `.get()` 當成 dict lookup。(b) callee 名稱（`Name.id` 或 `Attribute.attr`）在 repo 中有同名 `def`（不論 class）→ 這些函式所有 `return` 運算式的聯集；有 `index` 時取 `Tuple` 第 index 個元素，return 本身是 Name／Call 時把 index 往下傳；函式無任何帶值 return → unresolved(`no_return_value`)；(c) repo 內無同名函式 → unresolved(`unknown_callee`)。
    10. `Subscript(value=Dict 字面, slice=Constant)` → 對應 value；`Tuple`／`List` 在有 index 時取該元素。
    11. 其他節點 → unresolved(`unsupported_expr`)。
-   12. 防護：以 `(file, node 起始位置, index)` 為 key 的 visited 集合；重入時回傳 unresolved(`cycle`)，但若同一次 resolve 的其他分支已得到值，`cycle` 不計入結果（只在聯集完全沒有值時保留）；`depth > max_depth` → unresolved(`max_depth`)。
+   12. 防護：每個 sink 建立 traversal state，以 `(file, node 起始位置, index)` 為 key 記錄最淺展開深度、目前遞迴 stack 與被深度截斷的 key。stack 重入回傳 unresolved(`cycle`)，但若同一次 resolve 的其他分支已有值，`cycle` 不計入結果（只在聯集完全沒有值時保留）；相同 key 已在更淺或相同深度完整展開時略過，避免共享／循環呼叫造成指數重算。`depth > max_depth` 先記錄截斷 key；每個 sink 只有在某截斷 key 從未於允許深度展開時才產生一筆 unresolved(`max_depth`)。
 4. `exclude_functions` 內的函式本體不產生 sink（呼叫點傳遞仍照常解析）。
 5. emission 去重鍵為 `(namespace, value, file, line, sink)`；`ExtractionResult.emissions` 依 `(namespace, value, file, line)` 排序。
-6. `allow_unresolved` 以 `(namespace, function, expr)` 比對並扣除，`expr` 一律為 `canon_expr(node)`（`Unresolved.expr` 同樣以 `canon_expr` 產生，3.10～3.12 輸出相同）；沒有比對到任何 unresolved 的 allow 項列入 `stale_allow_unresolved`。`exclude_values` 自 `values()` 結果扣除，並把 `(項, 扣除數)` 記入 `applied_exclusions`；沒對應任何 emission 的列入 `stale_exclude_values`。
-7. `load_extraction_config` 對未知鍵、未知 `kind`、缺必要欄位（`dict_key`／`subscript_store` 需 `key`、`call_keyword` 需 `keyword`、`param_default` 需 `param`、`call_arg` 需 `callee`＋`index`、`attribute_store`／`attribute_load` 需 `attr`、`call_method_arg` 需 `method`＋`arg`、passthrough 需 `emits`、`exclude_values` 需 `category`＋非空 `reason`）、重複 YAML 鍵與 `yaml.YAMLError` raise `ExtractionConfigError`。
+6. `allow_unresolved` 以 `(namespace, function, expr, unresolved_reason)` 比對並扣除，`unresolved_reason` 必須是 extractor 定義的原因碼之一，不能用自由文字 `reason` 代替；`expr` 一律為 `canon_expr(node)`（`Unresolved.expr` 同樣以 `canon_expr` 產生，3.10～3.12 輸出相同）。沒有比對到相同原因的 unresolved 時，allow 項列入 `stale_allow_unresolved`。`exclude_values` 自 `values()` 結果扣除，並把 `(項, 扣除數)` 記入 `applied_exclusions`；沒對應任何 emission 的列入 `stale_exclude_values`。
+7. `load_extraction_config` 對未知鍵、未知 `kind`、缺必要欄位（`dict_key`／`subscript_store` 需 `key`、`call_keyword` 需 `keyword`、`param_default` 需 `param`、`call_arg` 需 `callee` 且 `index`／`keyword` 恰設一個、`allow_unresolved` 需 `unresolved_reason`＋非空 `reason`、`attribute_store`／`attribute_load` 需 `attr`、`call_method_arg` 需 `method`＋`arg`、passthrough 需 `emits`、`exclude_values` 需 `category`＋非空 `reason`）、不在 `catalog.INTERFACES` 的 `implies_interface`、絕對／含 `..` 的 glob、重複 YAML 鍵、無效 UTF-8 與 `yaml.YAMLError` raise `ExtractionConfigError`。掃描到無效 UTF-8 或 Python syntax error 時 raise 含路徑與定位的 `ExtractionError`。
 8. `canon_expr(node)`：遞迴輸出 `<型別名>(<欄位>=<值>,...)`，欄位依 `node._fields` 順序，略過 `ctx`、`type_comment`、`kind` 與值為 `None`／空 list 的欄位；`Constant` 輸出 `Constant(value=<repr>)`；list 以 `[a,b]`。不得呼叫 `ast.unparse` 或 `ast.dump`（兩者輸出隨 Python 版本變動）。
 
 - [ ] **Step 1：寫失敗測試**（`tests/test_contracts_extract.py`）
@@ -1048,7 +1052,7 @@ Expected: 無新失敗。
 type: feat
 scope: contracts
 ---
-新增以 AST 抽出 `sw_core` 會輸出的 error_code 與 session last_error 的抽取器，支援匯入常數、參數預設值、呼叫點參數、回傳 tuple、例外建構參數與動態前綴；抽取規則由 `contracts/code_extraction.yaml` 宣告（OD-06）。
+新增宣告式 AST 抽取器以追蹤 `sw_core` 的 error_code 與 session last_error，涵蓋 scope 正確的預設值、重綁參數、字典查找、callback、tuple 傳遞、例外欄位與動態前綴，並以有界 memoization 保留未解析原因（OD-06）。
 ```
 
 ```bash

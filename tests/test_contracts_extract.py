@@ -15,6 +15,7 @@ import fnmatch
 import importlib
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -428,8 +429,8 @@ def test_exclude_function(tmp_path):
 def test_allow_unresolved_and_stale(tmp_path):
     allow_yaml = textwrap.dedent("""\
         allow_unresolved:
-          - {namespace: error_code, function: "pkg/x.py::f", expr: "Call(func=Name(id='compute'))", reason: "測試：比對得到的項目"}
-          - {namespace: error_code, function: "pkg/x.py::f", expr: "Name(id='nothing')", reason: "測試：比對不到的項目"}""")
+          - {namespace: error_code, function: "pkg/x.py::f", expr: "Call(func=Name(id='compute'))", unresolved_reason: unknown_callee, reason: "測試：比對得到的項目"}
+          - {namespace: error_code, function: "pkg/x.py::f", expr: "Name(id='nothing')", unresolved_reason: unknown_name, reason: "測試：比對不到的項目"}""")
     cfg = _with(BASE_CONFIG, "allow_unresolved: []", allow_yaml)
     res = _run(tmp_path, {"pkg/x.py": """\
         def f():
@@ -437,6 +438,16 @@ def test_allow_unresolved_and_stale(tmp_path):
         """}, config=cfg)
     assert res.unresolved == ()
     assert [a.expr for a in res.stale_allow_unresolved] == ["Name(id='nothing')"]
+
+
+def test_allow_unresolved_matches_the_recorded_reason(tmp_path):
+    allow_yaml = textwrap.dedent("""\
+        allow_unresolved:
+          - {namespace: error_code, function: "pkg/x.py::f", expr: "Call(func=Name(id='compute'))", unresolved_reason: unknown_name, reason: "測試：不應遮蔽其他 unresolved reason"}""")
+    config = _with(BASE_CONFIG, "allow_unresolved: []", allow_yaml)
+    res = _run(tmp_path, {"pkg/x.py": 'def f():\n    return {"error_code": compute()}\n'}, config)
+    assert _reasons(res) == {"unknown_callee"}
+    assert len(res.stale_allow_unresolved) == 1
 
 
 def test_exclude_values_and_stale(tmp_path):
@@ -690,3 +701,342 @@ def test_real_repo_scans_flat_modules():
     # 防 fnmatch 類回歸：sw_core 直層模組必須被掃到
     files = {e.file for e in _real().emissions}
     assert {"sw_core/service.py", "sw_core/session_manager.py", "sw_core/cli.py", "sw_core/arbiter.py"} <= files
+
+
+# ---------------------------------------------------------------------------
+# 審查修正回歸：名稱合併、字典來源、遞迴界線與設定防護
+# ---------------------------------------------------------------------------
+
+def test_parameter_reassignment_keeps_defaults_and_call_arguments(tmp_path):
+    res = _run(tmp_path, {"pkg/x.py": """\
+        def fail(code=None):
+            code = code or "FALLBACK_CODE"
+            return {"error_code": code}
+        def conditional(code=None):
+            if code is None:
+                code = "CONDITIONAL_CODE"
+            return {"error_code": code}
+        def caller():
+            fail("CALLSITE_CODE")
+            conditional("CONDITIONAL_CALLSITE_CODE")
+        """})
+    assert res.values("error_code") == {
+        "FALLBACK_CODE", "CALLSITE_CODE", "CONDITIONAL_CODE", "CONDITIONAL_CALLSITE_CODE",
+    }
+    assert res.unresolved == ()
+
+
+def test_parameter_default_uses_its_defining_scope(tmp_path):
+    res = _run(tmp_path, {"pkg/x.py": """\
+        CODE = "MODULE_DEFAULT_CODE"
+        def fail(code=CODE):
+            CODE = "LOCAL_BODY_CODE"
+            return {"error_code": code}
+        def caller():
+            return fail()
+        """})
+    assert res.values("error_code") == {"MODULE_DEFAULT_CODE"}
+    assert res.unresolved == ()
+
+
+@pytest.mark.parametrize(("source", "expected"), [
+    pytest.param(
+        '''\
+        DEFAULT_CODE = "MODULE_SCOPE_DEFAULT"
+        def fail(error_code=DEFAULT_CODE):
+            DEFAULT_CODE = "BODY_LOCAL_CODE"
+            return {"error_code": error_code}
+        ''',
+        "MODULE_SCOPE_DEFAULT",
+        id="module-scope",
+    ),
+    pytest.param(
+        '''\
+        class C:
+            DEFAULT_CODE = "CLASS_SCOPE_DEFAULT"
+            def fail(error_code=DEFAULT_CODE):
+                DEFAULT_CODE = "BODY_LOCAL_CODE"
+                return {"error_code": error_code}
+        ''',
+        "CLASS_SCOPE_DEFAULT",
+        id="class-scope",
+    ),
+])
+def test_param_default_sink_uses_definition_scope(tmp_path, source, expected):
+    res = _run(tmp_path, {"pkg/x.py": source})
+    assert res.values("error_code") == {expected}
+    assert res.unresolved == ()
+
+
+def test_tuple_index_survives_parameter_callsite(tmp_path):
+    res = _run(tmp_path, {"pkg/x.py": """\
+        def relay(pair):
+            return pair
+        def emit():
+            _, code = relay((None, "TUPLE_PARAMETER_CODE"))
+            return {"error_code": code}
+        """})
+    assert res.values("error_code") == {"TUPLE_PARAMETER_CODE"}
+    assert res.unresolved == ()
+
+
+@pytest.mark.parametrize(("files", "expected"), [
+    pytest.param({
+        "pkg/codes.py": 'TABLE = {"x": "IMPORTED_TABLE_CODE"}\n',
+        "pkg/use.py": """\
+            from .codes import TABLE
+            def f(key):
+                return {"error_code": TABLE.get(key, "IMPORTED_DEFAULT_CODE")}
+            """,
+    }, {"IMPORTED_TABLE_CODE", "IMPORTED_DEFAULT_CODE"}, id="from-import"),
+    pytest.param({
+        "pkg/codes.py": 'TABLE = {"x": "FUNCTION_IMPORTED_TABLE_CODE"}\n',
+        "pkg/use.py": """\
+            def f(key):
+                from .codes import TABLE
+                return {"error_code": TABLE.get(key, "FUNCTION_IMPORT_DEFAULT_CODE")}
+            """,
+    }, {"FUNCTION_IMPORTED_TABLE_CODE", "FUNCTION_IMPORT_DEFAULT_CODE"}, id="function-from-import"),
+    pytest.param({
+        "pkg/codes.py": 'TABLE = {"x": "MODULE_TABLE_CODE"}\n',
+        "pkg/use.py": """\
+            from . import codes as mod
+            def f(key):
+                return {"error_code": mod.TABLE.get(key, "MODULE_DEFAULT_CODE")}
+            """,
+    }, {"MODULE_TABLE_CODE", "MODULE_DEFAULT_CODE"}, id="module-attribute"),
+    pytest.param({"pkg/use.py": """\
+        class C:
+            TABLE = {"x": "CLASS_TABLE_CODE"}
+            def f(self, key):
+                return {"error_code": self.TABLE.get(key, "CLASS_DEFAULT_CODE")}
+        """}, {"CLASS_TABLE_CODE", "CLASS_DEFAULT_CODE"}, id="class-attribute"),
+    pytest.param({"pkg/use.py": """\
+        def use(table, key):
+            return {"error_code": table.get(key, "PARAM_DEFAULT_CODE")}
+        def caller():
+            return use({"x": "PARAM_TABLE_CODE"}, "x")
+        """}, {"PARAM_TABLE_CODE", "PARAM_DEFAULT_CODE"}, id="parameter"),
+])
+def test_dict_get_resolves_supported_sources_in_defining_context(tmp_path, files, expected):
+    res = _run(tmp_path, files)
+    assert res.values("error_code") == expected
+    assert res.unresolved == ()
+
+
+def test_unresolvable_dict_source_is_not_hidden_by_get_default(tmp_path):
+    res = _run(tmp_path, {"pkg/x.py": """\
+        TABLE = {"x": "KNOWN_TABLE_CODE"}
+        TABLE = unknown_table()
+        def f(key):
+            return {"error_code": TABLE.get(key, "FALLBACK_CODE")}
+        """})
+    assert res.values("error_code") == {"KNOWN_TABLE_CODE", "FALLBACK_CODE"}
+    assert _reasons(res) == {"unknown_callee"}
+
+
+def test_custom_get_method_is_resolved_as_a_function(tmp_path):
+    res = _run(tmp_path, {"pkg/x.py": """\
+        class C:
+            def get(self, key, default):
+                return "CUSTOM_GET_CODE"
+        def f(c):
+            return {"error_code": c.get("state", "DEFAULT_CODE")}
+        """})
+    assert res.values("error_code") == {"CUSTOM_GET_CODE"}
+    assert res.unresolved == ()
+
+
+@pytest.mark.parametrize(("assignment", "expected"), [
+    pytest.param('capture.error_code = "CAPTURE_CODE"', "CAPTURE_CODE", id="literal-store"),
+    pytest.param('capture.error_code = error_code or "CAPTURE_FALLBACK_CODE"', "CAPTURE_FALLBACK_CODE", id="parameter-store"),
+])
+def test_attribute_error_code_store_and_relay_are_extracted(tmp_path, assignment, expected):
+    config = _with(
+        BASE_CONFIG,
+        "- {kind: call_keyword, keyword: error_code}",
+        "- {kind: call_keyword, keyword: error_code}\n      - {kind: attribute_store, attr: error_code}",
+    )
+    config = _with(
+        config,
+        "- {kind: attribute_load, attr: code}",
+        "- {kind: attribute_load, attr: code}\n      - {kind: attribute_load, attr: error_code}",
+    )
+    res = _run(tmp_path, {"pkg/x.py": f"""\
+        def store(capture, error_code=None):
+            {assignment}
+        def relay(capture):
+            return {{"error_code": capture.error_code}}
+        def caller(capture):
+            store(capture, "CALLSITE_CAPTURE_CODE")
+        """}, config)
+    expected_values = {expected}
+    if expected == "CAPTURE_FALLBACK_CODE":
+        expected_values.add("CALLSITE_CAPTURE_CODE")
+    assert res.values("error_code") == expected_values
+    assert res.unresolved == ()
+
+
+@pytest.mark.parametrize(("source", "namespace", "config", "expected"), [
+    pytest.param(
+        'def f(rec):\n    rec.setdefault("error_code", "SETDEFAULT_CODE")\n',
+        "error_code", BASE_CONFIG, "SETDEFAULT_CODE", id="setdefault",
+    ),
+    pytest.param(
+        'def f(rec):\n    rec["error_code"]: str = "ANNOTATED_CODE"\n',
+        "error_code", BASE_CONFIG, "ANNOTATED_CODE", id="annotated-subscript",
+    ),
+    pytest.param(
+        'def f(s):\n    s.last_error: str = "ANNOTATED_LAST_ERROR"\n',
+        "session_last_error", BASE_CONFIG, "ANNOTATED_LAST_ERROR", id="annotated-attribute",
+    ),
+    pytest.param(
+        'def f(s):\n    setattr(s, "last_error", "SETATTR_LAST_ERROR")\n',
+        "session_last_error", BASE_CONFIG, "SETATTR_LAST_ERROR", id="setattr",
+    ),
+])
+def test_additional_store_forms_are_extracted(tmp_path, source, namespace, config, expected):
+    res = _run(tmp_path, {"pkg/x.py": source}, config)
+    assert res.values(namespace) == {expected}
+
+
+def test_class_attribute_placeholder_does_not_hide_instance_assignment(tmp_path):
+    res = _run(tmp_path, {"pkg/x.py": """\
+        class C:
+            VALUE = None
+            def set_value(self):
+                self.VALUE = "INSTANCE_ATTRIBUTE_CODE"
+            def get_value(self):
+                return {"error_code": self.VALUE}
+        """})
+    assert res.values("error_code") == {"INSTANCE_ATTRIBUTE_CODE"}
+    assert res.unresolved == ()
+
+
+@pytest.mark.parametrize(("source", "expected"), [
+    pytest.param("""\
+        def fail(code):
+            return {"error_code": code}
+        def caller():
+            cb = fail
+            cb("ALIAS_CALL_CODE")
+        """, "ALIAS_CALL_CODE", id="local-alias"),
+    pytest.param("""\
+        import threading
+        def fail(code):
+            return {"error_code": code}
+        def caller():
+            threading.Thread(target=fail, args=("THREAD_TARGET_CODE",)).start()
+        """, "THREAD_TARGET_CODE", id="thread-target"),
+])
+def test_callable_alias_and_thread_target_arguments_are_followed(tmp_path, source, expected):
+    res = _run(tmp_path, {"pkg/x.py": source})
+    assert res.values("error_code") == {expected}
+    assert res.unresolved == ()
+
+
+def test_custom_exception_code_attribute_is_relayed(tmp_path):
+    res = _run(tmp_path, {"pkg/x.py": """\
+        class CustomError(Exception):
+            def __init__(self, code):
+                self.code = code
+        def raise_it():
+            raise CustomError("CUSTOM_EXCEPTION_CODE")
+        def f():
+            try:
+                raise_it()
+            except CustomError as exc:
+                return {"error_code": exc.code}
+        """})
+    assert res.values("error_code") == {"CUSTOM_EXCEPTION_CODE"}
+    assert res.unresolved == ()
+
+
+def test_nested_function_qualnames_include_enclosing_functions(tmp_path):
+    res = _run(tmp_path, {"pkg/x.py": """\
+        def outer_a():
+            def _run(code):
+                return {"error_code": code}
+            return _run("NESTED_A_CODE")
+        def outer_b():
+            def _run(code):
+                return {"error_code": code}
+            return _run("NESTED_B_CODE")
+        """})
+    assert res.values("error_code") == {"NESTED_A_CODE", "NESTED_B_CODE"}
+    functions = {item.function for item in res.emissions if item.kind == "code"}
+    assert "pkg/x.py::outer_a.<locals>._run" in functions
+    assert "pkg/x.py::outer_b.<locals>._run" in functions
+
+
+def test_directory_glob_exclusion_is_python_version_independent(tmp_path):
+    config = _with(BASE_CONFIG, "exclude: []", 'exclude: ["pkg/skip/**"]')
+    res = _run(tmp_path, {
+        "pkg/keep.py": 'def f(): return {"error_code": "KEEP_CODE"}\n',
+        "pkg/skip/deep/ignored.py": 'def f(): return {"error_code": "IGNORED_CODE"}\n',
+    }, config)
+    assert res.values("error_code") == {"KEEP_CODE"}
+
+
+def test_invalid_interface_is_rejected(tmp_path):
+    config = _with(
+        BASE_CONFIG,
+        "implies_interface: proc",
+        "implies_interface: unknown_interface",
+    )
+    ex = _load()
+    cfg = _write_config(tmp_path, config)
+    with pytest.raises(ex.ExtractionConfigError, match="implies_interface"):
+        ex.load_extraction_config(cfg)
+
+
+@pytest.mark.parametrize("pattern", ["/absolute/**/*.py", "../outside/**/*.py", "pkg/../outside/**/*.py"])
+def test_absolute_and_parent_roots_are_rejected(tmp_path, pattern):
+    ex = _load()
+    cfg = _write_config(tmp_path, _with(BASE_CONFIG, 'roots: ["pkg/**/*.py"]', f'roots: ["{pattern}"]'))
+    with pytest.raises(ex.ExtractionConfigError, match="roots"):
+        ex.load_extraction_config(cfg)
+
+
+def test_non_utf8_config_is_reported_as_config_error(tmp_path):
+    ex = _load()
+    cfg = tmp_path / "bad.yaml"
+    cfg.write_bytes(b"schema_version: \xff")
+    with pytest.raises(ex.ExtractionConfigError, match="無法載入抽取設定"):
+        ex.load_extraction_config(cfg)
+
+
+def test_scanned_syntax_error_is_reported_as_extraction_error(tmp_path):
+    ex = _load()
+    with pytest.raises(ex.ExtractionError, match="無法解析 Python 檔案"):
+        _run(tmp_path, {"pkg/broken.py": "def broken(:\n"})
+
+
+def test_call_arg_sink_supports_keyword_form(tmp_path):
+    config = _with(
+        BASE_CONFIG,
+        "- {kind: call_arg, callee: TunnelError, index: 0}",
+        "- {kind: call_arg, callee: TunnelError, keyword: code}",
+    )
+    res = _run(tmp_path, {"pkg/x.py": 'def f():\n    raise TunnelError(code="KEYWORD_EXCEPTION_CODE")\n'}, config)
+    assert res.values("error_code") == {"KEYWORD_EXCEPTION_CODE"}
+    assert res.unresolved == ()
+
+
+def test_real_repo_depth_traversal_has_no_suppressed_cycle_or_truncation():
+    config = _load().load_extraction_config(ROOT / "contracts" / "code_extraction.yaml")
+    res = _real()
+    assert config.allow_unresolved == ()
+    assert not ({"cycle", "max_depth"} & _reasons(res))
+
+
+def test_many_mutually_recursive_functions_finish_quickly(tmp_path):
+    functions = ['def f0():\n    return f1() or "RECURSIVE_CODE"']
+    functions.extend(f"def f{i}():\n    return f{i + 1}()" for i in range(1, 39))
+    functions.extend(['def f39():\n    return f0()', 'def emit():\n    return {"error_code": f0()}'])
+    source = "\n".join(functions)
+    started = time.monotonic()
+    res = _run(tmp_path, {"pkg/x.py": source})
+    elapsed = time.monotonic() - started
+    assert res.values("error_code") == {"RECURSIVE_CODE"}
+    assert elapsed < 2.0
