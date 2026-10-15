@@ -1,0 +1,1304 @@
+# RPC／CLI error_code 權威目錄（ADR-07、spec §9.2、OD-06）。由 P0-T3 建立，對應盤點 docs/rust-refactor/inventory/03-errors.md。
+# 計數一律由本檔資料產生；驗證器、規則與測試不得以字面數字斷言碼數（OD-06）。
+# 本檔與 session last_error（contracts/session_last_errors.yaml）為獨立命名空間；CREDENTIALS_UNRESOLVED 不得列於本檔。
+# 新增、改名或改狀態的碼，須同步 contracts/behavior_changes.yaml 與 SKILL 受管區段。
+# uart_tx：none＝未送出任何 UART 位元組即回傳；confirmed＝命令或探測位元組已確定送出；possible＝結果不明，不得假設安全。
+# extra_fields 不含共通欄位 ok、error_code、id、version（見盤點 03 §1.1）。
+# retryable：yes＝可在條件滿足後重送；no＝不可直接重送；conditional＝視條件；fix_args＝修正參數或設定後再送。
+schema_version: 1
+revision: 1
+namespace: error_code
+codes:
+  - code: ALIAS_NOT_FOUND
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["alias.unassign"], platforms: [posix, windows]}
+    meaning: "要移除的 alias 不存在"
+    side_effect: "失敗前仍寫入 state.json（_save_state 已先執行），無 UART 副作用"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "以 session list 確認 alias 名稱後再重試"
+    extra_fields: ["alias"]
+    contract_tests: []
+    behavior_change: []
+    sources: ["sw_core/session_manager.py:1735"]
+  - code: AUTOBOOT_QUIET
+    status: EXISTING
+    reachable: true
+    constant: ERROR_AUTOBOOT_QUIET
+    scope: {interfaces: [rpc, rec], methods: ["command.submit", "file.pull", "file.push", "command.get"], platforms: [posix, windows]}
+    meaning: "session 名義為 READY，但 boot quiet 視窗進行中或 READY 再確認尚未完成"
+    side_effect: "無（零 UART 副作用）"
+    retryable: "yes"
+    uart_tx: none
+    agent_action: "依 retry_after_s 等待後重送；manager 層回應無 retry_after_s 時以 5 秒為間隔重試"
+    extra_fields: ["retry_after_s", "hint", "session", "selector"]
+    contract_tests: ["tests/test_boot_quiet.py::TestAgentQuietGateExecute::test_execute_gated_when_quiet_armed_on_ready", "tests/test_boot_quiet.py::TestAgentQuietGateExecute::test_file_pull_gated"]
+    behavior_change: ["SC-03"]
+    sources: ["sw_core/service.py:671", "sw_core/service.py:683", "sw_core/session_manager.py:1155"]
+  - code: BASE64_DECODE_FAILED
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["file.pull"], platforms: [posix, windows]}
+    meaning: "擷取到的 base64 內容無法解碼"
+    side_effect: "不寫本地檔；命令已送出"
+    retryable: "conditional"
+    uart_tx: confirmed
+    agent_action: "檢查目標端 base64 工具與擷取內容後再重試"
+    extra_fields: []
+    contract_tests: []
+    behavior_change: []
+    sources: ["sw_core/file_transfer.py:324"]
+  - code: BENCH_ENDPOINT_NOT_REMEMBERED
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [cli_local], methods: ["_run_rpc", "daemon stop", "event", "remote"], platforms: [posix, windows]}
+    meaning: "--bench 指定的 bench 尚未以 connect 記住 endpoint"
+    side_effect: "無"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "先執行 serialwrap connect 記住該 bench 的 endpoint 後再重試"
+    extra_fields: ["message"]
+    exit_codes: {"_run_rpc": 1, "daemon stop": 1, "event": 1, "remote": 1}
+    contract_tests: ["tests/test_bench_connect_cli.py::test_bench_missing_endpoint_returns_structured_error_for_direct_cli_paths", "tests/test_cli_daemon_start.py::TestDaemonStartSupervision::test_daemon_stop_with_bench_in_systemd_mode_resolves_endpoint_before_service_route"]
+    behavior_change: []
+    sources: ["sw_core/cli.py:758"]
+  - code: BENCH_STATE_IO_ERROR
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [cli_local], methods: ["_run_rpc", "benches", "connect", "daemon stop", "event", "remote"], platforms: [posix, windows]}
+    meaning: "benches.state.json 讀寫失敗（OS 錯誤）"
+    side_effect: "部分路徑會先嘗試 rollback，並以 rollback_warning 回報結果"
+    retryable: "conditional"
+    uart_tx: none
+    agent_action: "檢查 benches.state.json 的權限與磁碟狀態後重試"
+    extra_fields: ["message", "rollback_warning"]
+    exit_codes: {"_run_rpc": 1, "benches": 1, "connect": 1, "daemon stop": 1, "event": 1, "remote": 1}
+    contract_tests: ["tests/test_bench_connect_cli.py::test_connect_does_not_rollback_existing_tunnel_when_state_write_fails", "tests/test_bench_connect_cli.py::test_connect_rolls_back_tunnel_when_state_write_fails"]
+    behavior_change: []
+    sources: ["sw_core/cli.py:756", "sw_core/cli.py:1376", "sw_core/cli.py:1404", "sw_core/cli.py:1440", "sw_core/cli.py:1490"]
+  - code: CHECKSUM_MISMATCH
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["file.pull", "file.push"], platforms: [posix, windows]}
+    meaning: "傳輸後 md5 校驗值不符"
+    side_effect: "push 先清除遠端暫存檔（cleanup）；pull 不寫本地檔"
+    retryable: "conditional"
+    uart_tx: confirmed
+    agent_action: "重新傳輸；若持續不符，檢查來源檔與目標端儲存狀態"
+    extra_fields: ["expected", "actual"]
+    contract_tests: ["tests/test_file_transfer.py::TestPushChecksumMismatch::test_mismatch"]
+    behavior_change: []
+    sources: ["sw_core/file_transfer.py:237", "sw_core/file_transfer.py:334"]
+  - code: CHECKSUM_VERIFY_FAILED
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["file.pull", "file.push"], platforms: [posix, windows]}
+    meaning: "目標端 md5sum 無回應或無法擷取校驗值"
+    side_effect: "push 先清除遠端暫存檔（cleanup）"
+    retryable: "conditional"
+    uart_tx: confirmed
+    agent_action: "確認目標端具備 md5sum 工具後重試"
+    extra_fields: []
+    contract_tests: ["tests/test_transfer_portability.py::TestTransferPortability::test_failed_md5_does_not_write_unverified_pull", "tests/test_transfer_portability.py::TestTransferPortability::test_md5_filename_collision_does_not_count_as_success"]
+    behavior_change: []
+    sources: ["sw_core/file_transfer.py:232", "sw_core/file_transfer.py:330"]
+  - code: CMD_CONTAINS_NEWLINE
+    status: EXISTING
+    reachable: true
+    constant: ERROR_CMD_CONTAINS_NEWLINE
+    scope: {interfaces: [rpc], methods: ["command.submit"], platforms: [posix, windows]}
+    meaning: "命令字串含換行字元，拒絕送入 UART"
+    side_effect: "無（不入列）"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "移除命令中的換行並以單行命令重送"
+    extra_fields: ["hint"]
+    contract_tests: ["tests/test_issue27_newline_reject.py::TestNewlineReject::test_command_with_newline_rejected", "tests/test_issue27_newline_reject.py::TestNewlineReject::test_command_with_only_trailing_newline_rejected"]
+    behavior_change: []
+    sources: ["sw_core/arbiter.py:159"]
+  - code: CMD_NOT_CANCELABLE
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["command.cancel"], platforms: [posix, windows]}
+    meaning: "命令已是 done 或 error 狀態，無法取消"
+    side_effect: "無"
+    retryable: "no"
+    uart_tx: none
+    agent_action: "改以 command.get 讀取既有結果，不需取消"
+    extra_fields: ["cmd_id"]
+    contract_tests: ["tests/test_arbiter_flush_on_recovery.py::test_flushed_command_get_reports_flushed_by_recovery", "tests/test_resilience_timeout.py::TestCommandCancel::test_command_cancel_already_done_returns_error"]
+    behavior_change: []
+    sources: ["sw_core/arbiter.py:260"]
+  - code: CMD_NOT_FOUND
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["command.cancel", "command.get", "command.result_tail", "result.tail"], platforms: [posix, windows]}
+    meaning: "cmd_id 不存在（已被淘汰或從未提交），或 result_tail 無法取得該命令的結果"
+    side_effect: "無"
+    retryable: "no"
+    uart_tx: none
+    agent_action: "確認 cmd_id 來源；命令紀錄只保留有限筆數，紀錄不存在不代表命令未執行，不得因此重送；先以 session self-test、log tail 或 WAL 查證目標狀態，是否重新執行由操作者決定"
+    extra_fields: ["cmd_id"]
+    contract_tests: ["tests/test_issue28_bg_lifecycle.py::TestBgResultTailFallback::test_fg_command_not_eligible_for_fallback", "tests/test_issue28_bg_lifecycle.py::TestBgResultTailFallback::test_result_tail_canceled_after_start_not_synthesized"]
+    behavior_change: []
+    sources: ["sw_core/arbiter.py:251", "sw_core/arbiter.py:258", "sw_core/session_manager.py:4721"]
+  - code: CMD_TOO_LONG
+    status: EXISTING
+    reachable: true
+    constant: ERROR_CMD_TOO_LONG
+    scope: {interfaces: [rpc], methods: ["command.submit"], platforms: [posix, windows]}
+    meaning: "命令的 UTF-8 長度超過硬上限 16384 bytes，拒絕提交"
+    side_effect: "無（不入列）"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "縮短命令內容；超過 4096 bytes 的軟上限仍會成功，但會附 CMD_LENGTH_WARNING 警告（非錯誤碼）"
+    extra_fields: ["cmd_length", "limit", "hint"]
+    contract_tests: ["tests/test_issue27_newline_reject.py::TestNewlineReject::test_command_too_long_takes_priority"]
+    behavior_change: []
+    sources: ["sw_core/arbiter.py:143"]
+  - code: COMMAND_ABORTED_IN_FLIGHT
+    status: APPROVED
+    reachable: false
+    unreachable_reason: "BC-03 已核准；實作與契約測試完成前不得生效"
+    scope: {interfaces: [rec], methods: ["command.get"], platforms: [posix, windows]}
+    meaning: "已確認至少寫出 1 byte 後，因 release 或 recovery 而中止"
+    side_effect: "命令紀錄 status 為 error；已送出部分位元組，不得自動重送"
+    retryable: "no"
+    uart_tx: possible
+    agent_action: "命令已部分送出：勿重送；先以 session self-test 確認目標狀態"
+    extra_fields: []
+    contract_tests: []
+    behavior_change: ["BC-03"]
+  - code: COMMAND_FAILED
+    status: EXISTING
+    reachable: false
+    unreachable_reason: "execute_command 所有 ok:false 皆帶 error_code，此碼僅為合約後備（實務不可達）"
+    scope: {interfaces: [rec], methods: ["command.get"], platforms: [posix, windows]}
+    meaning: "命令結果為 ok:false 但未帶 error_code 時的後備碼"
+    side_effect: "結果不明"
+    retryable: "no"
+    uart_tx: possible
+    agent_action: "視為失敗，先以 session self-test 確認狀態"
+    extra_fields: []
+    contract_tests: []
+    behavior_change: []
+    sources: ["sw_core/arbiter.py:318"]
+  - code: CONSOLE_LINE_LIMIT_TOO_SMALL
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["file.pull", "file.push"], platforms: [posix, windows]}
+    meaning: "profile 的 max_console_line_chars 太小，放不下傳輸必要的命令"
+    side_effect: "首次 TX 前拒絕；若發生於 chunk 迴圈內，會先清除遠端暫存檔（cleanup）"
+    retryable: "no"
+    uart_tx: possible
+    agent_action: "調大 profile 的 max_console_line_chars 後重試"
+    extra_fields: ["max_console_line_chars"]
+    contract_tests: ["tests/test_refine_transfer_integration.py::test_profile_budget_rejects_before_tx_and_releases_operation", "tests/test_refine_transfer_integration.py::test_utf8_path_budget_is_checked_before_probe"]
+    behavior_change: []
+    sources: ["sw_core/file_transfer.py:376"]
+  - code: CONSOLE_NOT_FOUND
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["session.console_detach"], platforms: [posix, windows]}
+    meaning: "指定的 console client_id 不存在"
+    side_effect: "仍會關閉對應的 human lease（若 owner 相符）並更新 vtty 狀態"
+    retryable: "no"
+    uart_tx: none
+    agent_action: "以 console list 取得現存 client_id 後再操作"
+    extra_fields: ["client_id"]
+    contract_tests: []
+    behavior_change: []
+    sources: ["sw_core/session_manager.py:3996"]
+  - code: DAEMON_ALREADY_RUNNING
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [proc], methods: ["serialwrapd"], platforms: [posix, windows]}
+    meaning: "daemon 啟動時發現同一實例鎖已被持有，或 socket 已可連線（非 JSON 回應，以 stderr 行與 exit 2 表示）"
+    side_effect: "無（daemon 拒絕啟動）"
+    retryable: "no"
+    uart_tx: none
+    agent_action: "勿重複啟動；以 serialwrap daemon status 確認既有實例"
+    extra_fields: []
+    contract_tests: ["tests/test_lock_win.py::test_endpoint_alive_refuses", "tests/test_lock_win.py::test_two_locks_same_path_second_raises"]
+    behavior_change: []
+    sources: ["sw_core/lock_posix.py:22", "sw_core/lock_posix.py:40", "sw_core/lock_win.py:37", "sw_core/lock_win.py:50"]
+  - code: DAEMON_ALREADY_RUNNING_ELSEWHERE
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [cli_local], methods: ["daemon start"], platforms: [posix]}
+    meaning: "/proc 發現另一個 serialwrapd 綁定不同 socket（未使用 --force-spawn）"
+    side_effect: "無（不 spawn，且不寫 stderr 行）"
+    retryable: "no"
+    uart_tx: none
+    agent_action: "改用既有 daemon 的 socket，或先停止另一個實例後再啟動"
+    extra_fields: ["message", "hint", "existing_socket", "existing_pid", "target_socket"]
+    exit_codes: {"daemon start": 2}
+    contract_tests: ["tests/test_cli_daemon_start.py::TestDaemonStartSpawnGuard::test_reject_hint_without_socket_does_not_suggest_placeholder", "tests/test_cli_daemon_start.py::TestDaemonStartSpawnGuard::test_rejects_spawn_when_conflicting_daemon_found"]
+    behavior_change: []
+    sources: ["sw_core/cli.py:511"]
+  - code: DAEMON_BINARY_NOT_FOUND
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [cli_local], methods: ["daemon start"], platforms: [posix, windows]}
+    meaning: "Windows 後端找不到 serialwrapd 可執行檔"
+    side_effect: "無"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "確認 serialwrapd 已正確安裝且位於預期路徑後重試"
+    extra_fields: ["message"]
+    exit_codes: {"daemon start": 2}
+    contract_tests: ["tests/test_win_daemon_start.py::TestDaemonSpawnArgv::test_frozen_none_found_makes_daemon_start_fail_cleanly"]
+    behavior_change: []
+    sources: ["sw_core/cli.py:527"]
+  - code: DAEMON_EXITED
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [cli_local], methods: ["daemon start"], platforms: [posix, windows]}
+    meaning: "spawn 後 daemon 行程在就緒前即退出"
+    side_effect: "daemon 行程已結束；回應附 pid 與 returncode"
+    retryable: "conditional"
+    uart_tx: none
+    agent_action: "查看 daemon 的 stderr 並排除原因後再執行 daemon start"
+    extra_fields: ["pid", "returncode"]
+    exit_codes: {"daemon start": 2}
+    contract_tests: []
+    behavior_change: ["DF-05"]
+    sources: ["sw_core/cli.py:589"]
+  - code: DAEMON_NOT_READY
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [cli_local], methods: ["daemon start"], platforms: [posix, windows]}
+    meaning: "spawn 後等待時間內 health.ping 未成功"
+    side_effect: "daemon 行程仍留存執行中，未被終止"
+    retryable: "conditional"
+    uart_tx: none
+    agent_action: "以 serialwrap daemon status 確認是否已就緒；未就緒時檢查 daemon 行程，勿盲目重複 spawn"
+    extra_fields: ["pid"]
+    exit_codes: {"daemon start": 2}
+    contract_tests: ["tests/test_win_daemon_start.py::TestReadinessWindow::test_posix_backend_keeps_15_attempts", "tests/test_win_daemon_start.py::TestReadinessWindow::test_win_backend_waits_50_attempts"]
+    behavior_change: []
+    sources: ["sw_core/cli.py:618"]
+  - code: DEVICE_ALREADY_BOUND
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["session.bind"], platforms: [posix, windows]}
+    meaning: "指定的 by_id 已綁定到其他 session"
+    side_effect: "無"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "以 session list 確認該裝置目前所屬 session，改用其他 by_id 或先解除既有綁定"
+    extra_fields: ["device_by_id", "session_id"]
+    contract_tests: ["tests/test_session_bind.py::TestSessionBind::test_bind_rejects_duplicate_device"]
+    behavior_change: []
+    sources: ["sw_core/session_manager.py:2049"]
+  - code: DEVICE_NOT_BOUND
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["session.attach"], platforms: [posix, windows]}
+    meaning: "session 未設定 device_by_id，無法 attach"
+    side_effect: "無"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "先以 session.bind 綁定裝置後再 attach"
+    extra_fields: ["session"]
+    contract_tests: []
+    behavior_change: []
+    sources: ["sw_core/session_manager.py:2161"]
+  - code: DEVICE_NOT_FOUND
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["session.attach", "session.pin", "session.unpin"], platforms: [posix, windows]}
+    meaning: "指定的裝置或 selector 解析不到對應裝置"
+    side_effect: "attach 版將 state 設為 DETACHED、last_error 設為 DEVICE_NOT_FOUND 並記錄 detached_at；pin 與 unpin 版無附帶副作用"
+    retryable: "conditional"
+    uart_tx: none
+    agent_action: "以 device list 確認裝置在線且 by_id 正確，裝置出現後再 attach"
+    extra_fields: ["session"]
+    contract_tests: ["tests/test_session_bind.py::TestSessionBind::test_attach_returns_device_not_found_when_missing", "tests/test_profile_pin_sticky.py::TestDeviceKey::test_pin_rejects_unstable_ttyusb_selector"]
+    behavior_change: []
+    sources: ["sw_core/session_manager.py:2116", "sw_core/session_manager.py:2127", "sw_core/session_manager.py:2190"]
+  - code: DEVICE_NOT_PRESENT
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["device.attach"], platforms: [posix, windows]}
+    meaning: "by_id 不在目前的裝置清單中（未插入或尚未列舉）"
+    side_effect: "無"
+    retryable: "conditional"
+    uart_tx: none
+    agent_action: "確認裝置已插入且 device list 可見後重試"
+    extra_fields: ["selector", "device_by_id"]
+    contract_tests: ["tests/test_device_handoff.py::TestAttachDevice::test_attach_device_not_present"]
+    behavior_change: []
+    sources: ["sw_core/session_manager.py:2015"]
+  - code: DEVICE_STILL_HELD
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["device.attach"], platforms: [posix, windows]}
+    meaning: "/proc 掃描到外部程式持有該 tty，非 force 的 device attach 被拒（回應不含 holder_unknown，BC-04 尚未實作）"
+    side_effect: "無"
+    retryable: "conditional"
+    uart_tx: none
+    agent_action: "等待外部持有者釋放，或確認可安全中止後以 force 重試"
+    extra_fields: ["pids", "selector"]
+    contract_tests: ["tests/test_device_handoff.py::TestAttachDevice::test_attach_refuses_when_externally_held"]
+    behavior_change: ["BC-04", "SC-05"]
+    sources: ["sw_core/session_manager.py:2020"]
+  - code: ECHO_ACK_UNSUPPORTED
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["file.push"], platforms: [posix, windows]}
+    meaning: "ack_mode 為 echo，但 bridge 不支援 echo 節流送出"
+    side_effect: "無 TX"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "改用其他 ack_mode 重試"
+    extra_fields: []
+    contract_tests: ["tests/test_file_transfer.py::TestPushAckModeRouting::test_echo_forced_on_legacy_bridge_rejected"]
+    behavior_change: []
+    sources: ["sw_core/file_transfer.py:109"]
+  - code: EMPTY_RESPONSE
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [cli_client], methods: [], platforms: [posix, windows]}
+    meaning: "連線已關閉但未收到任何一行回應"
+    side_effect: "請求可能已抵達 daemon，副作用未知"
+    retryable: "conditional"
+    uart_tx: possible
+    agent_action: "僅白名單唯讀方法可由 CLI 重試；其他方法先以 health.ping 確認 daemon 狀態"
+    extra_fields: []
+    contract_tests: ["tests/test_cli_timeout_robustness.py::TestRetryWhitelist::test_non_whitelist_method_not_retried_on_empty_response"]
+    behavior_change: []
+    sources: ["sw_core/client.py:267"]
+  - code: ENV_FILE_SOURCE_FAILED
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [cli_local], methods: ["daemon start"], platforms: [posix, windows]}
+    meaning: "env 檔以 bash -lc source 執行失敗（非 0 退出），或 Windows 讀取檔案時發生 OS 錯誤"
+    side_effect: "無"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "確認 env_file 路徑與內容後重試"
+    extra_fields: ["env_file", "message", "env_files"]
+    exit_codes: {"daemon start": 2}
+    contract_tests: ["tests/test_cli_daemon_start.py::TestCliDaemonStart::test_run_daemon_start_reports_env_source_failure"]
+    behavior_change: []
+    sources: ["sw_core/cli.py:551"]
+  - code: EXCEPTION
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc_frame], methods: ["alias.list", "device.list", "event.com_disable", "event.com_enable", "event.com_status", "event.reload", "event.reset", "event.rule_delete", "event.rule_list", "event.tail", "health.ping", "health.status", "mcu.patterns", "mcu.status", "session.interactive_send", "session.list", "wal.current_seq", "wal.range", "wal.reset"], platforms: [posix, windows]}
+    meaning: "handler 拋出未預期例外，framing 層以 message 回傳（回應無 version）"
+    side_effect: "例外可能發生於命令已送出之後，副作用依例外發生點而定"
+    retryable: "no"
+    uart_tx: possible
+    agent_action: "視為結果不明：先以 command.get 或 session get_state 確認狀態，不可假設未執行而直接重送"
+    extra_fields: ["message"]
+    contract_tests: []
+    behavior_change: []
+    sources: ["sw_core/rpc_posix.py:59"]
+  - code: FLASHING_BUSY
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc, rec, cli_local], methods: ["device.release", "session.attach", "session.bind", "session.clear", "session.interactive_send", "session.recover", "command.get", "setup"], platforms: [posix, windows]}
+    meaning: "session 處於 FLASHING 或 flash 臨界區，命令或操作被拒"
+    side_effect: "無（gate 拒絕）"
+    retryable: "yes"
+    uart_tx: none
+    agent_action: "等待燒錄結束（session 回到 ATTACHED 或 READY）後再重試"
+    extra_fields: ["selector", "session", "interactive_id", "message", "legacy"]
+    exit_codes: {"setup": 2}
+    contract_tests: ["tests/test_attach_error_surface.py::TestAttachErrorSurface::test_attach_flashing_bridge_surfaces_flashing_busy", "tests/test_attach_error_surface.py::TestAttachErrorSurface::test_attach_human_lease_flashing_maps_flashing_busy"]
+    behavior_change: ["SC-02"]
+    sources: ["sw_core/session_manager.py:1838", "sw_core/session_manager.py:3644", "sw_core/session_manager.py:2144", "sw_core/cli.py:1707", "sw_core/cli.py:1778"]
+  - code: FLASH_TARGET_IS_CONSOLE
+    status: EXISTING
+    reachable: false
+    unreachable_reason: "flash_endpoint.resolve_flash_target 無 production 呼叫端，目前不可達"
+    scope: {interfaces: [rpc], methods: [], platforms: [posix, windows]}
+    meaning: "燒錄目標是可下命令的 console 裝置，且未指定 force，拒絕執行"
+    side_effect: "無"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "改選非 console 的燒錄目標；此碼目前 production 不可達，僅作為契約保留"
+    extra_fields: ["hint", "selector"]
+    contract_tests: ["tests/test_flash_guard.py::test_explicit_console_blocked_without_force"]
+    behavior_change: []
+    sources: ["sw_core/flash_endpoint.py:292"]
+  - code: FLUSHED_BY_RECOVERY
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rec], methods: ["command.get", "command.result_tail", "result.tail"], platforms: [posix, windows]}
+    meaning: "命令尚未執行即因 recovery 或 detach 被清空（未送出，可在 READY 後重送）"
+    side_effect: "命令紀錄 status 為 error；未送出，不會寫入 UART"
+    retryable: "yes"
+    uart_tx: none
+    agent_action: "確認 session 已回到 READY 後才可重送"
+    extra_fields: []
+    contract_tests: ["tests/test_arbiter_flush_on_recovery.py::test_flush_keeps_flushed_records_gettable_then_converges", "tests/test_arbiter_flush_on_recovery.py::test_flushed_command_get_reports_flushed_by_recovery"]
+    behavior_change: []
+    sources: ["sw_core/arbiter.py:60", "sw_core/arbiter.py:86"]
+  - code: FLUSHED_BY_SHUTDOWN
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rec], methods: ["command.get", "command.result_tail", "result.tail"], platforms: [posix, windows]}
+    meaning: "daemon 停止時，尚未執行的排隊命令被清空（未送出，可重送）"
+    side_effect: "命令紀錄 status 為 error；未送出"
+    retryable: "yes"
+    uart_tx: none
+    agent_action: "daemon 重新啟動並確認 session 為 READY 後才可重送"
+    extra_fields: []
+    contract_tests: ["tests/test_arbiter_flush_on_recovery.py::test_service_stop_flushes_with_shutdown_code"]
+    behavior_change: []
+    sources: ["sw_core/service.py:532"]
+  - code: FORCE_RECOVER_TIMEOUT
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["session.recover"], platforms: [posix, windows]}
+    meaning: "強制 recover（clear 後重新 attach）在 10 次、每次 1 秒的窗口內未達 READY"
+    side_effect: "已執行 clear_session（detach 並重新 spawn attach），裝置狀態已改變"
+    retryable: "conditional"
+    uart_tx: possible
+    agent_action: "以 session get_state 確認目前狀態後，再決定重試 recover 或處理裝置"
+    extra_fields: ["action", "recovered", "session"]
+    contract_tests: []
+    behavior_change: []
+    sources: ["sw_core/session_manager.py:4686"]
+  - code: INTERACTIVE_EXPIRED
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["session.interactive_send", "session.interactive_status"], platforms: [posix, windows]}
+    meaning: "互動 lease 已逾時失效"
+    side_effect: "lease 標記為 expired 並關閉；可能還原 human lease 並 resume，暫存的 deferred 位元組可能被 flush 到 UART"
+    retryable: "no"
+    uart_tx: possible
+    agent_action: "重新 interactive open 取得新的 lease 後再送出"
+    extra_fields: ["interactive_id"]
+    contract_tests: ["tests/test_bootloader_recovery.py::TestInteractiveOpenAllowAttached::test_interactive_send_expired_recovery_restores_and_returns_expired", "tests/test_bootloader_recovery.py::TestInteractiveOpenAllowAttached::test_interactive_status_expired_recovery_closes_restores"]
+    behavior_change: []
+    sources: ["sw_core/session_manager.py:4224", "sw_core/session_manager.py:4257"]
+  - code: INTERACTIVE_NOT_FOUND
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["session.interactive_close", "session.interactive_send", "session.interactive_status"], platforms: [posix, windows]}
+    meaning: "interactive_id 不存在，或 lease 狀態已不是 active"
+    side_effect: "無"
+    retryable: "no"
+    uart_tx: none
+    agent_action: "重新 interactive open 取得 interactive_id"
+    extra_fields: ["interactive_id"]
+    contract_tests: ["tests/test_refine_ownership.py::TestRefineOwnership::test_human_peer_grace_rejects_old_id_and_allows_new_client", "tests/test_refine_ownership.py::TestRefineOwnership::test_unknown_closed_expired_and_replaced_interactive_ids_do_not_tx"]
+    behavior_change: []
+    sources: ["sw_core/session_manager.py:4218", "sw_core/session_manager.py:4249", "sw_core/session_manager.py:4277"]
+  - code: INTERNAL_ERROR
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [cli_local], methods: ["benches", "connect", "daemon stop", "event", "remote"], platforms: [posix, windows]}
+    meaning: "CLI 本地流程發生未預期例外"
+    side_effect: "無（CLI 本地例外；若發生於 RPC 呼叫之後，daemon 端副作用不在此碼判定範圍）"
+    retryable: "no"
+    uart_tx: none
+    agent_action: "回報例外訊息；勿假設操作已失敗而重送寫入型命令"
+    extra_fields: ["message"]
+    exit_codes: {"benches": 1, "connect": 1, "daemon stop": 1, "event": 1, "remote": 1}
+    contract_tests: []
+    behavior_change: ["DF-07"]
+    sources: ["sw_core/cli.py:138", "sw_core/cli.py:1456", "sw_core/cli.py:1526", "sw_core/cli.py:1615"]
+  - code: INVALID_ARGS
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc, cli_local], methods: ["alias.assign", "command.result_tail", "command.submit", "device.attach", "device.release", "file.pull", "file.push", "log.tail_raw", "log.tail_text", "session.activity", "session.attach", "session.bind", "session.clear", "session.console_attach", "session.console_detach", "session.console_list", "session.interactive_close", "session.interactive_open", "session.interactive_send", "session.interactive_status", "session.log_start", "session.log_status", "session.log_stop", "session.pin", "session.recover", "session.self_test", "session.unpin", "argparse-boundary", "daemon start", "fallthrough", "remote"], platforms: [posix, windows]}
+    meaning: "參數缺漏或型別／值不合法（RPC 分派或 CLI 參數驗證）"
+    side_effect: "無（service 版無附帶欄位）"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "依 CLI 或 RPC 說明修正參數後重送"
+    extra_fields: ["message", "ack_mode", "chunk_size", "max_console_line_chars"]
+    exit_codes: {"argparse-boundary": 1, "daemon start": 2, "fallthrough": 2, "remote": 1}
+    contract_tests: ["tests/test_bench_connect_cli.py::test_connect_parse_errors_return_structured_invalid_args", "tests/test_device_handoff.py::TestDeviceRpc::test_rpc_release_requires_selector"]
+    behavior_change: []
+    sources: ["sw_core/service.py:732", "sw_core/service.py:904", "sw_core/cli.py:442", "sw_core/cli.py:2485", "sw_core/cli.py:1570"]
+  - code: INVALID_BENCH_CONFIG
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [cli_local], methods: ["benches", "connect"], platforms: [posix, windows]}
+    meaning: "benches.yaml 驗證失敗"
+    side_effect: "無"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "修正 benches.yaml 的欄位後重試"
+    extra_fields: ["message"]
+    exit_codes: {"benches": 1, "connect": 1}
+    contract_tests: []
+    behavior_change: []
+    sources: ["sw_core/cli.py:1355", "sw_core/cli.py:1482"]
+  - code: INVALID_BENCH_STATE
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [cli_local], methods: ["_run_rpc", "benches", "connect", "daemon stop", "event", "remote"], platforms: [posix, windows]}
+    meaning: "benches.state.json 結構錯誤"
+    side_effect: "部分路徑會嘗試 rollback，並以 rollback_warning 回報"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "檢查 benches.state.json 內容，結構損壞時需人工修復後重試"
+    extra_fields: ["message", "rollback_warning"]
+    exit_codes: {"_run_rpc": 1, "benches": 1, "connect": 1, "daemon stop": 1, "event": 1, "remote": 1}
+    contract_tests: ["tests/test_bench_connect_cli.py::test_benches_corrupted_remembered_endpoint_returns_invalid_bench_state", "tests/test_bench_connect_cli.py::test_nonempty_corrupted_remembered_endpoint_returns_invalid_bench_state"]
+    behavior_change: []
+    sources: ["sw_core/cli.py:754", "sw_core/cli.py:1374", "sw_core/cli.py:1402", "sw_core/cli.py:1428", "sw_core/cli.py:1488", "sw_core/cli.py:1505"]
+  - code: INVALID_COMPLETION_REGEX
+    status: EXISTING
+    reachable: true
+    constant: ERROR_INVALID_COMPLETION_REGEX
+    scope: {interfaces: [rpc, rec, cli_local], methods: ["command.submit", "command.get", "cmd submit"], platforms: [posix, windows]}
+    meaning: "completion_regex 驗證失敗（空字串、超過 1024 bytes、無法編譯，或可匹配空字串）"
+    side_effect: "無（cmd submit 的本地預檢不連 daemon）"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "修正 completion_regex 後重送"
+    extra_fields: []
+    exit_codes: {"cmd submit": 1}
+    contract_tests: ["tests/test_command_completion.py::test_cli_rejects_invalid_regex_before_rpc", "tests/test_command_completion.py::test_invalid_regex_direct_execute_rejects_before_any_tx"]
+    behavior_change: []
+    sources: ["sw_core/command_completion.py:8", "sw_core/cli.py:2591", "sw_core/service.py:894", "sw_core/arbiter.py:140", "sw_core/session_manager.py:3635"]
+  - code: INVALID_ENDPOINT
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [cli_client, cli_local], methods: ["remote"], platforms: [posix, windows]}
+    meaning: "endpoint 格式錯誤（tcp 缺 host 或 port、unix 路徑非絕對、未知 scheme）"
+    side_effect: "無（client 端本地驗證）"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "改用 tcp://host:port 或絕對 unix socket 路徑格式後重試"
+    extra_fields: ["message"]
+    exit_codes: {"remote": 1}
+    contract_tests: ["tests/test_remote_cli.py::test_remote_malformed_endpoint_returns_json_error", "tests/test_remote_endpoint.py::TestRpcCallEndpointBranch::test_invalid_endpoint_returns_structured_error"]
+    behavior_change: []
+    sources: ["sw_core/client.py:232", "sw_core/cli.py:1585"]
+  - code: INVALID_JSON
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc_frame], methods: [], platforms: [posix, windows]}
+    meaning: "該行不是合法 JSON，連線保持並續讀下一行（回應無 id 與 version，且為非緊湊分隔符）"
+    side_effect: "無"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "修正請求的 JSON 格式後重送"
+    extra_fields: []
+    contract_tests: []
+    behavior_change: []
+    sources: ["sw_core/rpc_posix.py:31"]
+  - code: INVALID_METHOD
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc_frame], methods: [], platforms: [posix, windows]}
+    meaning: "請求的 method 欄位不是字串（回應保留 id，無 version）"
+    side_effect: "無"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "以字串形式的 method 重送"
+    extra_fields: []
+    contract_tests: []
+    behavior_change: []
+    sources: ["sw_core/rpc_posix.py:47"]
+  - code: INVALID_REQUEST
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc_frame], methods: [], platforms: [posix, windows]}
+    meaning: "請求 JSON 不是 object（回應無 id 與 version，且為非緊湊分隔符）"
+    side_effect: "無"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "以 JSON object 格式重送"
+    extra_fields: []
+    contract_tests: []
+    behavior_change: []
+    sources: ["sw_core/rpc_posix.py:38"]
+  - code: INVALID_RESPONSE
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [cli_client], methods: [], platforms: [posix, windows]}
+    meaning: "daemon 回應的 JSON 不是 object"
+    side_effect: "請求可能已抵達 daemon，副作用未知"
+    retryable: "no"
+    uart_tx: possible
+    agent_action: "勿直接重送寫入型命令；先以 health.ping 與 session get_state 確認 daemon 與 session 狀態"
+    extra_fields: []
+    contract_tests: []
+    behavior_change: ["DF-06"]
+    sources: ["sw_core/client.py:270"]
+  - code: INVALID_RULE_SCHEMA
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["event.rule_set"], platforms: [posix, windows]}
+    meaning: "事件規則的 schema 驗證失敗"
+    side_effect: "無"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "依 schema 修正 rule 欄位後重送 event.rule_set"
+    extra_fields: ["error"]
+    contract_tests: []
+    behavior_change: []
+    sources: ["sw_core/service.py:1138"]
+  - code: INVALID_TARGET
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [cli_local], methods: ["remote"], platforms: [posix, windows]}
+    meaning: "remote target 不是 [user@]host:port 格式，或 port 超出範圍"
+    side_effect: "無"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "修正 target 格式後重試"
+    extra_fields: ["message"]
+    exit_codes: {"remote": 1}
+    contract_tests: ["tests/test_remote_cli.py::test_remote_invalid_target", "tests/test_remote_tunnel.py::test_parse_target_rejects_bad"]
+    behavior_change: []
+    sources: ["sw_core/remote_tunnel.py:54"]
+  - code: LOCAL_FILE_NOT_FOUND
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["file.push"], platforms: [posix, windows]}
+    meaning: "daemon 端看不到 local_path（以 daemon 身分判斷檔案是否存在）"
+    side_effect: "無"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "確認路徑存在且 daemon 具讀取權限後重試"
+    extra_fields: ["local_path"]
+    contract_tests: ["tests/test_file_transfer.py::TestPushFileNotFound::test_not_found"]
+    behavior_change: []
+    sources: ["sw_core/file_transfer.py:103"]
+  - code: LOG_OPEN_FAILED
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["session.log_start"], platforms: [posix, windows]}
+    meaning: "session log 檔案開啟失敗（OS 錯誤）"
+    side_effect: "無"
+    retryable: "conditional"
+    uart_tx: none
+    agent_action: "檢查 log 目錄權限與磁碟空間後重試"
+    extra_fields: ["detail"]
+    contract_tests: ["tests/test_session_capture.py::TestLogStartErrorPaths::test_open_permission_denied"]
+    behavior_change: []
+    sources: ["sw_core/session_manager.py:4787"]
+  - code: METHOD_NOT_FOUND
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: [], platforms: [posix, windows]}
+    meaning: "method 不存在"
+    side_effect: "無"
+    retryable: "no"
+    uart_tx: none
+    agent_action: "改用 serialwrap 支援的 method 名稱重送"
+    extra_fields: ["method"]
+    contract_tests: ["tests/test_daemon_version.py::test_rpc_unknown_method_does_not_raise_and_still_gets_version"]
+    behavior_change: []
+    sources: ["sw_core/service.py:1174"]
+  - code: MOVE_FAILED
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["file.push"], platforms: [posix, windows]}
+    meaning: "mv 之後未見 sentinel，無法確認檔案搬移結果"
+    side_effect: "不清除遠端暫存檔，暫存檔可能殘留"
+    retryable: "conditional"
+    uart_tx: possible
+    agent_action: "先確認目標檔與暫存檔狀態，再決定是否重試"
+    extra_fields: []
+    contract_tests: ["tests/test_transfer_portability.py::TestTransferPortability::test_mv_filename_collision_does_not_count_as_success"]
+    behavior_change: []
+    sources: ["sw_core/file_transfer.py:252"]
+  - code: MOVE_TIMEOUT
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["file.push"], platforms: [posix, windows]}
+    meaning: "mv 之後 prompt 逾時，搬移結果不明"
+    side_effect: "不清除遠端暫存檔，暫存檔可能殘留"
+    retryable: "conditional"
+    uart_tx: possible
+    agent_action: "先確認目標檔與暫存檔狀態，再決定是否重試"
+    extra_fields: []
+    contract_tests: []
+    behavior_change: []
+    sources: ["sw_core/file_transfer.py:250"]
+  - code: NEEDS_SUDO
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [cli_local], methods: ["daemon start", "daemon stop", "service <action>"], platforms: [posix]}
+    meaning: "systemd-system 的 start、stop 或 restart 未帶 --with-sudo"
+    side_effect: "無"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "加上 --with-sudo 後重試（提權動作需人工確認）"
+    extra_fields: ["mode", "action", "hint"]
+    exit_codes: {"daemon start": 2, "daemon stop": 2, "service <action>": 2}
+    contract_tests: ["tests/test_cli_stderr_full_error.py::TestNonRpcExitsMirrorStderr::test_daemon_start_needs_sudo_stderr_not_empty", "tests/test_cli_stderr_full_error.py::TestNonRpcExitsMirrorStderr::test_daemon_start_needs_sudo_via_main_exit_code_and_stderr"]
+    behavior_change: []
+    sources: ["sw_core/service_ctl.py:42", "sw_core/cli.py:456", "sw_core/cli.py:639"]
+  - code: NOT_READY
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["session.attach"], platforms: [posix, windows]}
+    meaning: "session 為 command-capable 且狀態非 READY／ATTACHING，又無 last_error 可回報"
+    side_effect: "無"
+    retryable: "conditional"
+    uart_tx: none
+    agent_action: "等待 session 進入 READY 後重試；必要時以 session self-test 取得分類"
+    extra_fields: ["session"]
+    contract_tests: []
+    behavior_change: []
+    sources: ["sw_core/session_manager.py:2146"]
+  - code: NO_ACTIVE_CAPTURE
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["session.log_stop"], platforms: [posix, windows]}
+    meaning: "session 沒有進行中的 log capture"
+    side_effect: "無"
+    retryable: "no"
+    uart_tx: none
+    agent_action: "確認是否已執行 log start；若無進行中的 capture 則無需 stop"
+    extra_fields: ["session"]
+    contract_tests: ["tests/test_session_capture.py::TestLogStartErrorPaths::test_log_stop_no_active_capture", "tests/test_session_capture.py::TestLogStartStop::test_log_stop"]
+    behavior_change: []
+    sources: ["sw_core/session_manager.py:4810"]
+  - code: NO_SYSTEMD
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [cli_local], methods: ["daemon start", "daemon stop", "service <action>"], platforms: [posix, windows]}
+    meaning: "on-demand 或未知的監管模式下呼叫 service 管理動作"
+    side_effect: "無"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "依 supervision_mode 改用正確的 daemon 管理方式（on-demand 使用 daemon start 與 daemon stop）"
+    extra_fields: ["mode", "action", "hint"]
+    exit_codes: {"daemon start": 2, "daemon stop": 2, "service <action>": 2}
+    contract_tests: []
+    behavior_change: []
+    sources: ["sw_core/service_ctl.py:55"]
+  - code: PROFILE_IS_EXPLICIT
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["session.pin", "session.unpin"], platforms: [posix, windows]}
+    meaning: "session 的 profile 來源為 yaml-target，不可 pin 或 unpin"
+    side_effect: "無"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "改為修改 YAML target 設定，而非使用 pin 或 unpin"
+    extra_fields: []
+    contract_tests: ["tests/test_profile_pin_sticky.py::TestPinUnpin::test_pin_explicit_target_by_byid_rejected", "tests/test_profile_pin_sticky.py::TestPinUnpin::test_pin_explicit_target_rejected"]
+    behavior_change: []
+    sources: ["sw_core/session_manager.py:2118", "sw_core/session_manager.py:2129"]
+  - code: PROFILE_NOT_COMMAND_CAPABLE
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["command.submit", "file.pull", "file.push"], platforms: [posix, windows]}
+    meaning: "session 為 ATTACHED 且 profile 不支援命令（command_capable 為 false）"
+    side_effect: "無"
+    retryable: "no"
+    uart_tx: none
+    agent_action: "改用 command-capable 的 profile，或改以 console 進行互動操作"
+    extra_fields: ["hint", "session"]
+    contract_tests: ["tests/test_cowork_session_usability.py::TestCommandCapableGate::test_empty_ready_probe_not_command_capable_cmd_submit"]
+    behavior_change: []
+    sources: ["sw_core/service.py:628"]
+  - code: PROMPT_TIMEOUT
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc, rec], methods: ["command.get", "command.result_tail", "result.tail", "session.recover"], platforms: [posix, windows]}
+    meaning: "命令逾時，且 CTRL-C 與 CTRL-D 都未能救回 prompt"
+    side_effect: "可能已送出 \\x03（CTRL-C）與 \\x04（CTRL-D）；session 轉為 ATTACHED，排隊命令以 FLUSHED_BY_RECOVERY 終結，background capture 以 status=error 結束"
+    retryable: "no"
+    uart_tx: confirmed
+    agent_action: "命令結果不明：先以 session self-test 與 session get_state 確認狀態，再由操作者決定是否重送"
+    extra_fields: ["partial", "recovery_action"]
+    contract_tests: ["tests/test_bad_command_recovery.py::TestBadCommandRecovery::test_timeout_without_recovery_demotes_then_re_ready", "tests/test_bad_command_recovery.py::TestBadCommandRecovery::test_timeout_without_recovery_does_not_double_flush"]
+    behavior_change: []
+    sources: ["sw_core/session_manager.py:3927", "sw_core/session_manager.py:3911"]
+  - code: PROMPT_TIMEOUT_FORCE_RECOVERED
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["session.recover"], platforms: [posix, windows]}
+    meaning: "命令逾時後，經 force clear 與重新 attach 成功（ok:true 回應，非失敗）"
+    side_effect: "已執行 clear 與重新 attach；命令可能已部分執行"
+    retryable: "no"
+    uart_tx: confirmed
+    ok_response: true
+    agent_action: "命令已執行，勿重送；以 session get_state 確認當前狀態"
+    extra_fields: ["partial", "recovery_action", "session"]
+    contract_tests: []
+    behavior_change: []
+    sources: ["sw_core/session_manager.py:3919"]
+  - code: PROMPT_TIMEOUT_RECOVERED
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc, rec], methods: ["command.result_tail", "result.tail", "session.recover"], platforms: [posix, windows]}
+    meaning: "命令逾時後 CTRL-C 或 CTRL-D 救回 prompt（ok:true 回應）；命令紀錄不寫入此碼，僅 capture 保留"
+    side_effect: "已送出 CTRL-C 或 CTRL-D；排隊命令以 FLUSHED_BY_RECOVERY 終結"
+    retryable: "no"
+    uart_tx: confirmed
+    ok_response: true
+    agent_action: "命令已中止且不會自動重送；依 stdout 判斷結果，必要時由操作者決定是否重送"
+    extra_fields: ["stdout", "partial", "recovery_action"]
+    contract_tests: ["tests/test_bad_command_recovery.py::TestBadCommandRecovery::test_bad_command_timeout_then_ctrl_c_recover", "tests/test_bad_command_recovery.py::TestBadCommandRecovery::test_ctrl_c_recovery_invokes_flush_callback"]
+    behavior_change: []
+    sources: ["sw_core/session_manager.py:3897", "sw_core/session_manager.py:3887"]
+  - code: PULL_PARSE_FAILED
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["file.pull"], platforms: [posix, windows]}
+    meaning: "擷取輸出中找不到 sentinel 區段，且無 encoder 失敗 sentinel"
+    side_effect: "命令已送出"
+    retryable: "conditional"
+    uart_tx: confirmed
+    agent_action: "確認目標端 encoder 輸出正常後重試"
+    extra_fields: []
+    contract_tests: ["tests/test_file_transfer.py::TestPullParseFailed::test_no_sentinels", "tests/test_transfer_portability.py::TestTransferPortability::test_missing_encoder_failure_marker_remains_parse_failure"]
+    behavior_change: []
+    sources: ["sw_core/file_transfer.py:319"]
+  - code: READY_UNCONFIRMED
+    status: EXISTING
+    reachable: true
+    constant: ERROR_READY_UNCONFIRMED
+    scope: {interfaces: [rpc, rec], methods: ["command.submit", "file.pull", "file.push", "command.get"], platforms: [posix, windows]}
+    meaning: "READY 再確認逾 300 秒或已達 5 次仍未確認，拒絕 agent 命令"
+    side_effect: "無（零 UART 副作用）"
+    retryable: "no"
+    uart_tx: none
+    agent_action: "勿重送；執行 serialwrap session self-test 取分類，再依分類處理"
+    extra_fields: ["hint", "recommended_action", "session", "selector"]
+    contract_tests: ["tests/test_ready_reconfirm_bounds.py::TestSubmitGateTerminal::test_submit_returns_ready_unconfirmed_after_deadline", "tests/test_ready_reconfirm_bounds.py::TestTerminalErrorShape::test_execute_returns_ready_unconfirmed_not_autoboot_quiet"]
+    behavior_change: []
+    sources: ["sw_core/service.py:655", "sw_core/session_manager.py:1141"]
+  - code: REMOTE_BIND_UNVERIFIED
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [cli_local], methods: ["connect", "remote"], platforms: [posix, windows]}
+    meaning: "expose tcp 模式下 relay 的 ss 驗證失敗，或綁定位址非 loopback"
+    side_effect: "tunnel 行程已啟動但未通過綁定驗證"
+    retryable: "conditional"
+    uart_tx: none
+    agent_action: "確認 relay 僅綁定 loopback 位址後重試"
+    extra_fields: ["message"]
+    exit_codes: {"connect": 1, "remote": 1}
+    contract_tests: ["tests/test_remote_tunnel.py::test_open_tunnel_fail_closed_removes_state_on_bind_unverified", "tests/test_remote_tunnel.py::test_role_probe_expose_tcp_rejects_interface_ip"]
+    behavior_change: []
+    sources: ["sw_core/remote_tunnel.py:313", "sw_core/remote_tunnel.py:315"]
+  - code: REMOTE_NOT_SUPPORTED
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [cli_local], methods: ["benches", "connect", "daemon start", "remote"], platforms: [posix, windows]}
+    meaning: "此平台（原生 Windows）不支援 remote 功能"
+    side_effect: "無"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "改在 WSL2 或 Linux 環境執行 remote 功能"
+    extra_fields: ["message"]
+    exit_codes: {"benches": 1, "connect": 1, "daemon start": 2, "remote": 1}
+    contract_tests: ["tests/test_remote_cli.py::test_remote_windows_returns_not_supported", "tests/test_remote_endpoint.py::TestCliEndpoint::test_daemon_start_rejects_endpoint"]
+    behavior_change: ["SC-27", "BC-05"]
+    sources: ["sw_core/cli.py:434", "sw_core/cli.py:1334", "sw_core/cli.py:1464", "sw_core/cli.py:1545", "sw_core/remote_tunnel.py:586"]
+  - code: RULE_NOT_FOUND
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["event.rule_get"], platforms: [posix, windows]}
+    meaning: "指定的 rule_id 不存在"
+    side_effect: "無"
+    retryable: "no"
+    uart_tx: none
+    agent_action: "以 event rule list 確認 rule_id 後重試"
+    extra_fields: []
+    contract_tests: []
+    behavior_change: []
+    sources: ["sw_core/service.py:1150"]
+  - code: SAMPLE_READ_FAILED
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [cli_local], methods: ["profile test"], platforms: [posix, windows]}
+    meaning: "profile test 讀取樣本檔失敗"
+    side_effect: "無"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "確認樣本檔路徑與讀取權限後重試"
+    extra_fields: ["message"]
+    exit_codes: {"profile test": 0}
+    contract_tests: ["tests/test_cli_profile_test.py::test_profile_test_missing_sample_file_returns_ok_false"]
+    behavior_change: []
+    sources: ["sw_core/cli.py:1885"]
+  - code: SEND_FAILED
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rec], methods: ["command.get", "command.result_tail", "result.tail"], platforms: [posix, windows]}
+    meaning: "send 回呼拋出例外，無法確定命令是否已送出（結果不明）"
+    side_effect: "結果不明，可能已部分或全部送出"
+    retryable: "no"
+    uart_tx: possible
+    agent_action: "勿自動重送；先以 session self-test 與 command.get 確認狀態，再由操作者決定"
+    extra_fields: []
+    contract_tests: ["tests/test_issue28_bg_lifecycle.py::TestBgResultTailFallback::test_result_tail_error_without_capture"]
+    behavior_change: ["BC-03"]
+    sources: ["sw_core/arbiter.py:297"]
+  - code: SESSION_BUSY
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc, rec], methods: ["file.pull", "file.push", "session.interactive_open", "session.interactive_send", "command.get"], platforms: [posix, windows]}
+    meaning: "同一 session 的前景操作仍在進行中"
+    side_effect: "無（拒絕）"
+    retryable: "yes"
+    uart_tx: none
+    agent_action: "等待前景操作完成後重試"
+    extra_fields: ["selector", "interactive_id"]
+    contract_tests: ["tests/test_refine_ownership.py::TestRefineOwnership::test_blocking_command_rejects_competing_pull_without_tx", "tests/test_refine_ownership.py::TestRefineOwnership::test_blocking_pull_rejects_competing_foreground_command_without_tx"]
+    behavior_change: []
+    sources: ["sw_core/session_manager.py:1062", "sw_core/session_manager.py:3664", "sw_core/session_manager.py:4028", "sw_core/session_manager.py:4233"]
+  - code: SESSION_INTERACTIVE_BUSY
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc, rec], methods: ["file.pull", "file.push", "session.interactive_open", "command.get"], platforms: [posix, windows]}
+    meaning: "已有不可搶占的 interactive lease，命令或檔案操作被拒"
+    side_effect: "無（拒絕）"
+    retryable: "yes"
+    uart_tx: none
+    agent_action: "等待 interactive lease 結束（interactive close 或逾時）後重試"
+    extra_fields: ["interactive_session_id"]
+    contract_tests: ["tests/test_bootloader_recovery.py::TestInteractiveOpenAllowAttached::test_allow_attached_rejects_existing_agent_lease", "tests/test_bootloader_recovery.py::TestInteractiveOpenAllowAttached::test_busy_paths_after_expired_recovery_still_run_post_close"]
+    behavior_change: []
+    sources: ["sw_core/session_manager.py:3670", "sw_core/session_manager.py:4065", "sw_core/session_manager.py:4895"]
+  - code: SESSION_NOT_FOUND
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["alias.set", "command.submit", "device.attach", "device.release", "file.pull", "file.push", "log.tail_raw", "log.tail_text", "result.tail", "session.activity", "session.attach", "session.bind", "session.clear", "session.get_state", "session.log_start", "session.log_status", "session.log_stop", "session.recover", "session.self_test"], platforms: [posix, windows]}
+    meaning: "selector 未對應任何 session"
+    side_effect: "無（部分路徑於失敗前仍附帶 lease 脈絡欄位）"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "以 session list 確認 selector 正確後重送"
+    extra_fields: ["selector", "session_id", "interactive_owner", "human_attached", "human_active", "recovery_mode", "command_capable"]
+    contract_tests: ["tests/test_command_guard.py::TestCommandGuard::test_service_no_longer_blocks_incomplete_command_preflight", "tests/test_cowork_session_usability.py::TestSelfTestTopLevelCommandCapable::test_self_test_session_not_found_top_level_command_capable"]
+    behavior_change: []
+    sources: ["sw_core/session_manager.py:1720", "sw_core/session_manager.py:2158", "sw_core/session_manager.py:3937"]
+  - code: SESSION_NOT_READY
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc, rec], methods: ["command.submit", "file.pull", "file.push", "session.attach", "session.console_attach", "session.console_detach", "session.console_list", "session.interactive_open", "session.interactive_send", "session.interactive_status", "session.recover", "command.get"], platforms: [posix, windows]}
+    meaning: "session 狀態不符（非 READY，或 bridge 不存在）"
+    side_effect: "無（gate 拒絕）；例外：session.attach／session.recover 於 probe 之後回此碼時，probe 位元組可能已送出"
+    retryable: "conditional"
+    uart_tx: none
+    agent_action: "等待 session 進入 READY 後重試；必要時以 session self-test 檢查狀態"
+    extra_fields: ["error_detail", "selector", "session", "session_id", "interactive_id"]
+    contract_tests: ["tests/test_bootloader_recovery.py::TestInteractiveOpenAllowAttached::test_allow_attached_false_rejects_attached", "tests/test_cowork_session_usability.py::TestCommandCapableGate::test_command_capable_when_ready_probe_set"]
+    behavior_change: []
+    sources: ["sw_core/service.py:642", "sw_core/arbiter.py:196", "sw_core/session_manager.py:2515", "sw_core/session_manager.py:3646", "sw_core/session_manager.py:4645"]
+  - code: SESSION_QUEUE_FULL
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["command.submit"], platforms: [posix, windows]}
+    meaning: "session 待執行命令已達 256 筆上限"
+    side_effect: "無（不入列）"
+    retryable: "yes"
+    uart_tx: none
+    agent_action: "等待排隊命令完成後重試"
+    extra_fields: ["session_id", "pending", "limit", "hint"]
+    contract_tests: ["tests/test_bounded_memory.py::test_submit_admission_control_rejects_when_pending_full"]
+    behavior_change: []
+    sources: ["sw_core/arbiter.py:202"]
+  - code: SESSION_RECOVERING
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc, rec], methods: ["file.pull", "file.push", "session.attach", "command.get"], platforms: [posix, windows]}
+    meaning: "session 恢復中（RECOVERING），操作暫不可用"
+    side_effect: "無（拒絕）"
+    retryable: "yes"
+    uart_tx: none
+    agent_action: "等待恢復完成（session get_state 不再顯示 RECOVERING）後重試"
+    extra_fields: ["session"]
+    contract_tests: ["tests/test_attach_error_surface.py::TestAttachErrorSurface::test_attach_human_lease_recovering_maps_session_recovering", "tests/test_attach_error_surface.py::TestAttachErrorSurface::test_attach_recovering_bridge_surfaces_error"]
+    behavior_change: ["SC-01", "SC-04"]
+    sources: ["sw_core/session_manager.py:2145", "sw_core/session_manager.py:3660"]
+  - code: SOCKET_ERROR
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [cli_client], methods: [], platforms: [posix, windows]}
+    meaning: "連線失敗（connect 或 send／recv 的 OS 錯誤，或平台不支援 AF_UNIX）"
+    side_effect: "send 或 recv 失敗時，請求是否已抵達 daemon 不明"
+    retryable: "conditional"
+    uart_tx: possible
+    agent_action: "僅白名單唯讀方法可由 CLI 自動重試；其他方法先以 health.ping 確認 daemon 狀態再決定"
+    extra_fields: ["message"]
+    contract_tests: ["tests/test_cli_diagnostics.py::TestCliTraceDaemonStart::test_daemon_start_probe_failure_is_traced_before_spawn_wait_loop", "tests/test_cli_diagnostics.py::TestCliTraceErrno::test_missing_unix_socket_records_enoent"]
+    behavior_change: []
+    sources: ["sw_core/client.py:239", "sw_core/client.py:252", "sw_core/client.py:276"]
+  - code: SOCKET_UNAVAILABLE
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [proc], methods: ["serialwrapd"], platforms: [posix]}
+    meaning: "socket 路徑存在但 connect 失敗（非 ENOENT 與 ECONNREFUSED），非 JSON 回應，以 stderr 行與 exit 2 表示"
+    side_effect: "無（daemon 拒絕啟動）"
+    retryable: "no"
+    uart_tx: none
+    agent_action: "檢查 socket 路徑的權限與殘留檔案後重試"
+    extra_fields: []
+    contract_tests: []
+    behavior_change: []
+    sources: ["sw_core/lock_posix.py:37"]
+  - code: SSH_NOT_FOUND
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [cli_local], methods: ["connect", "remote"], platforms: [posix, windows]}
+    meaning: "PATH 中找不到 ssh 或 autossh"
+    side_effect: "無"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "安裝 OpenSSH 客戶端（ssh 或 autossh）並確認 PATH 後重試"
+    extra_fields: []
+    exit_codes: {"connect": 1, "remote": 1}
+    contract_tests: ["tests/test_remote_tunnel.py::test_resolve_ssh_bin_missing"]
+    behavior_change: []
+    sources: ["sw_core/remote_tunnel.py:598"]
+  - code: STATE_CHANGED
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["session.attach", "session.recover"], platforms: [posix, windows]}
+    meaning: "probe 期間 session 狀態被其他操作改變（進入 FLASHING 或 RELEASED）"
+    side_effect: "probe 可能已送出探測位元組"
+    retryable: "conditional"
+    uart_tx: possible
+    agent_action: "以 session get_state 確認當前狀態後再決定是否重試"
+    extra_fields: ["session"]
+    contract_tests: ["tests/test_attach_error_surface.py::TestAttachErrorSurface::test_attach_passes_through_helper_ok_false"]
+    behavior_change: []
+    sources: ["sw_core/session_manager.py:2521"]
+  - code: TARGET_DECODER_FAILED
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["file.push"], platforms: [posix, windows]}
+    meaning: "chunk 的 sentinel 未見，目標端 decoder 失敗"
+    side_effect: "命令已送出；先清除遠端暫存檔（cleanup）"
+    retryable: "conditional"
+    uart_tx: confirmed
+    agent_action: "重新傳輸；若持續失敗，檢查目標端 decoder"
+    extra_fields: ["chunks_sent", "chunks_total"]
+    contract_tests: ["tests/test_transfer_portability.py::TestTransferPortability::test_later_decoder_failure_is_not_prompt_success"]
+    behavior_change: []
+    sources: ["sw_core/file_transfer.py:219"]
+  - code: TARGET_DECODER_MISSING
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["file.push"], platforms: [posix, windows]}
+    meaning: "目標端沒有 base64 或 openssl decoder"
+    side_effect: "探測命令已送出"
+    retryable: "no"
+    uart_tx: confirmed
+    agent_action: "在目標端安裝 base64 或 openssl 後再重試"
+    extra_fields: []
+    contract_tests: ["tests/test_refine_transfer_integration.py::test_probe_keeps_competing_transfer_out_until_cleanup", "tests/test_transfer_portability.py::TestTransferPortability::test_all_tools_missing_rejects_before_data_or_move"]
+    behavior_change: []
+    sources: ["sw_core/file_transfer.py:522", "sw_core/file_transfer.py:157"]
+  - code: TARGET_ENCODER_FAILED
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["file.pull"], platforms: [posix, windows]}
+    meaning: "目標端 encoder 回報失敗（encoder failure sentinel 出現）"
+    side_effect: "命令已送出"
+    retryable: "conditional"
+    uart_tx: confirmed
+    agent_action: "檢查目標端 encoder 後重試"
+    extra_fields: []
+    contract_tests: ["tests/test_transfer_portability.py::TestTransferPortability::test_encoder_failure_after_probe_is_explicit_and_preserves_local_file", "tests/test_transfer_portability.py::TestTransferPortability::test_encoder_partial_output_then_failure_marker_is_explicit"]
+    behavior_change: []
+    sources: ["sw_core/file_transfer.py:318"]
+  - code: TARGET_ENCODER_MISSING
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["file.pull"], platforms: [posix, windows]}
+    meaning: "目標端沒有可用的 encoder"
+    side_effect: "探測命令已送出"
+    retryable: "no"
+    uart_tx: confirmed
+    agent_action: "在目標端安裝 encoder 後再重試"
+    extra_fields: []
+    contract_tests: ["tests/test_transfer_portability.py::TestTransferPortability::test_all_encoder_tools_missing_rejects_without_creating_local_file", "tests/test_transfer_portability.py::TestTransferPortability::test_echoing_encoder_probe_text_does_not_count_as_probe_success"]
+    behavior_change: []
+    sources: ["sw_core/file_transfer.py:544", "sw_core/file_transfer.py:300"]
+  - code: TEST_DEVICE_ALLOWLIST_REJECTED
+    status: APPROVED
+    reachable: false
+    unreachable_reason: "SC-19 已核准；daemon 拒絕啟動的判定尚未實作"
+    scope: {interfaces: [proc], methods: ["serialwrapd"], platforms: [posix, windows]}
+    meaning: "隔離測試實例的裝置 allowlist 判定不通過（非隔離實例設定了 allowlist）；stderr 印出 serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED 與原因，exit 2"
+    side_effect: "daemon 在任何狀態寫入前拒絕啟動，無 UART 或 state 副作用"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "移除 allowlist 設定，或改在三個隔離目錄均明確設定的實例中使用"
+    extra_fields: []
+    contract_tests: []
+    behavior_change: ["SC-19"]
+  - code: TIMEOUT
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [cli_client], methods: [], platforms: [posix, windows]}
+    meaning: "連線、傳送或接收逾時；白名單唯讀方法可重試，其他方法不可直接重送"
+    side_effect: "請求可能已抵達 daemon 且仍在執行"
+    retryable: "conditional"
+    uart_tx: possible
+    agent_action: "非白名單方法不得直接重送；先以 health.ping 與回應中的 daemon_busy 判斷 daemon 狀態"
+    extra_fields: ["daemon_reachable", "daemon_busy"]
+    contract_tests: ["tests/test_cli_diagnostics.py::TestCliTraceErrno::test_timeout_enrich_socket_error_does_not_pollute_main_errno", "tests/test_cli_timeout_robustness.py::TestRetryWhitelist::test_non_whitelist_method_not_retried"]
+    behavior_change: []
+    sources: ["sw_core/client.py:249", "sw_core/client.py:273", "sw_core/client.py:160"]
+  - code: TRANSFER_ECHO_STALL
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["file.push"], platforms: [posix, windows]}
+    meaning: "echo-ACK 路徑 echo 停滯；換行未送出，命令未執行"
+    side_effect: "已取消輸入行（cancel_input_line）並清除遠端暫存檔（cleanup）"
+    retryable: "yes"
+    uart_tx: confirmed
+    agent_action: "命令未執行，可重新傳輸"
+    extra_fields: ["chunks_sent", "chunks_total", "acked_chars", "sent_chars"]
+    contract_tests: ["tests/test_file_transfer.py::TestPushEchoStall::test_stall_on_second_chunk"]
+    behavior_change: []
+    sources: ["sw_core/file_transfer.py:198"]
+  - code: TRANSFER_PROBE_FAILED
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["file.pull", "file.push"], platforms: [posix, windows]}
+    meaning: "工具探測命令回報 shell 錯誤"
+    side_effect: "探測命令已送出"
+    retryable: "conditional"
+    uart_tx: confirmed
+    agent_action: "確認目標端工具可用後重試"
+    extra_fields: []
+    contract_tests: ["tests/test_transfer_portability.py::TestTransferPortability::test_probe_shell_error_is_not_reported_as_missing_tool"]
+    behavior_change: []
+    sources: ["sw_core/file_transfer.py:521", "sw_core/file_transfer.py:543"]
+  - code: TRANSFER_TIMEOUT
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["file.pull", "file.push"], platforms: [posix, windows]}
+    meaning: "檔案傳輸過程中 prompt 逾時"
+    side_effect: "命令或探測已送出；chunk 版會先清除遠端暫存檔（cleanup）"
+    retryable: "conditional"
+    uart_tx: confirmed
+    agent_action: "確認目標端狀態後重新傳輸"
+    extra_fields: ["chunks_sent", "chunks_total"]
+    contract_tests: ["tests/test_file_transfer.py::TestPushTransferTimeout::test_timeout_on_chunk"]
+    behavior_change: []
+    sources: ["sw_core/file_transfer.py:210", "sw_core/file_transfer.py:310", "sw_core/file_transfer.py:514"]
+  - code: TUNNEL_CONFLICT
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [cli_local], methods: ["connect", "remote"], platforms: [posix, windows]}
+    meaning: "指定的 port 已有身分不同的 tunnel"
+    side_effect: "無（拒絕）"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "關閉既有 tunnel（connect --close）或改用其他 port 後重試"
+    extra_fields: ["message"]
+    exit_codes: {"connect": 1, "remote": 1}
+    contract_tests: ["tests/test_bench_connect_cli.py::test_connect_close_rejects_conflicting_stateful_tunnel_without_closing_or_clearing_state", "tests/test_remote_tunnel.py::test_open_tunnel_conflict_same_port_diff_identity"]
+    behavior_change: []
+    sources: ["sw_core/remote_tunnel.py:451", "sw_core/cli.py:1307"]
+  - code: TUNNEL_SPAWN_FAILED
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [cli_local], methods: ["connect", "remote"], platforms: [posix, windows]}
+    meaning: "ssh 行程在就緒前即結束"
+    side_effect: "tunnel 行程已結束；message 為 stderr 尾段（最多 500 字）"
+    retryable: "conditional"
+    uart_tx: none
+    agent_action: "檢查 ssh 參數與遠端可達性後重試"
+    extra_fields: ["message"]
+    exit_codes: {"connect": 1, "remote": 1}
+    contract_tests: ["tests/test_remote_tunnel.py::test_wait_ready_spawn_failed_when_process_dies"]
+    behavior_change: []
+    sources: ["sw_core/remote_tunnel.py:180"]
+  - code: TUNNEL_STATUS_ERROR
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [cli_local], methods: ["benches", "connect"], platforms: [posix, windows]}
+    meaning: "connect 與 benches 讀取 tunnel 狀態時，回應格式異常或缺少 tunnels 清單（若回應帶 code 則透傳該 code）"
+    side_effect: "無"
+    retryable: "conditional"
+    uart_tx: none
+    agent_action: "檢查 remote 狀態與 ssh 控制通道後重試"
+    extra_fields: ["message"]
+    exit_codes: {"benches": 1, "connect": 1}
+    contract_tests: []
+    behavior_change: []
+    sources: ["sw_core/cli.py:1265", "sw_core/cli.py:1270", "sw_core/cli.py:1275", "sw_core/cli.py:1493"]
+  - code: TUNNEL_STILL_ACTIVE
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [cli_local], methods: ["connect"], platforms: [posix, windows]}
+    meaning: "connect --close 之後 tunnel 仍在運作"
+    side_effect: "不清除 endpoint 記憶"
+    retryable: "conditional"
+    uart_tx: none
+    agent_action: "以 remote status 確認 tunnel 行程狀態後再重試 close"
+    extra_fields: ["message"]
+    exit_codes: {"connect": 1}
+    contract_tests: ["tests/test_bench_connect_cli.py::test_connect_close_keeps_endpoint_memory_when_orphan_tunnel_still_exists", "tests/test_bench_connect_cli.py::test_connect_close_keeps_endpoint_memory_when_tunnel_still_exists"]
+    behavior_change: []
+    sources: ["sw_core/cli.py:1390"]
+  - code: UNKNOWN_BENCH_CODE
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [cli_local], methods: ["connect"], platforms: [posix, windows]}
+    meaning: "bench_registry 找不到指定的 bench code"
+    side_effect: "無"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "以 benches.yaml 內存在的 bench code 重試"
+    extra_fields: ["message"]
+    exit_codes: {"connect": 1}
+    contract_tests: []
+    behavior_change: []
+    sources: ["sw_core/cli.py:1353"]
+  - code: UNKNOWN_EVENT_CMD
+    status: EXISTING
+    reachable: false
+    unreachable_reason: "argparse required=True 攔截，實務不可達"
+    scope: {interfaces: [cli_local], methods: ["event"], platforms: [posix, windows]}
+    meaning: "event 子命令未知"
+    side_effect: "無"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "改用 event 支援的子命令重試"
+    extra_fields: ["cmd"]
+    exit_codes: {"event": 2}
+    contract_tests: []
+    behavior_change: []
+    sources: ["sw_core/cli.py:1064"]
+  - code: UNKNOWN_PROFILE
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc, cli_local], methods: ["profile test", "session.pin"], platforms: [posix, windows]}
+    meaning: "profile 名稱不存在"
+    side_effect: "無"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "以 profile 目錄中存在的名稱重試"
+    extra_fields: ["available", "profile", "profile_dir"]
+    exit_codes: {"profile test": 0}
+    contract_tests: ["tests/test_cli_profile_test.py::test_profile_test_unknown_profile_returns_ok_false", "tests/test_profile_pin_sticky.py::TestPinUnpin::test_pin_unknown_profile_rejected"]
+    behavior_change: []
+    sources: ["sw_core/session_manager.py:2113", "sw_core/cli.py:1870"]
+  - code: WAL_MISSING
+    status: EXISTING
+    reachable: true
+    scope: {interfaces: [rpc], methods: ["log.tail_raw", "log.tail_text", "wal.range"], platforms: [posix, windows]}
+    meaning: "WAL 曾寫入過（current_seq 大於 0）但目前的 WAL 檔不存在"
+    side_effect: "無"
+    retryable: "conditional"
+    uart_tx: none
+    agent_action: "執行 serialwrap doctor 檢查 WAL 目錄與狀態"
+    extra_fields: ["wal_path", "wal_dir", "wal_dir_exists", "wal_file_exists", "current_seq", "hint"]
+    contract_tests: ["tests/test_wal_missing_detection.py::TestReadPathsReportMissing::test_tail_raw_reports_wal_missing", "tests/test_wal_missing_detection.py::TestReadPathsReportMissing::test_tail_text_reports_wal_missing"]
+    behavior_change: []
+    sources: ["sw_core/service.py:545"]
+passthrough:
+  - id: last_error_passthrough
+    namespace_ref: session_last_errors
+    scope: {interfaces: [rpc], methods: ["session.attach", "session.recover"], platforms: [posix, windows]}
+    rule: "session.attach 在 command-capable 且 state 不是 READY／ATTACHING、也不是 FLASHING／RECOVERING 時回 error_code=last_error；session.recover 的 REPROBE 分支未恢復時以 ok:true 回 error_code=last_error 或 SESSION_NOT_READY"
+    owner_confirmation: pending_default
+    reconciliation_refs: [RPC-D-02, ERR-7.2-b, ERR-7.3-1, SES-16.5-02]

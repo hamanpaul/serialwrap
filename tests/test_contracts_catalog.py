@@ -1025,6 +1025,9 @@ def test_ec_shape_quirks_frozen() -> None:
     assert "detail" in by["LOG_OPEN_FAILED"].extra_fields
     assert "retry_after_s" in by["AUTOBOOT_QUIET"].extra_fields
     assert "retry_after_s" not in by["READY_UNCONFIRMED"].extra_fields
+    # 租約識別欄位：Rust 遷移不得丟失 interactive_id（審查追加）
+    assert "interactive_id" in by["INTERACTIVE_EXPIRED"].extra_fields
+    assert "interactive_id" in by["SESSION_NOT_READY"].extra_fields
 
 
 def test_ec_exit_codes_frozen() -> None:
