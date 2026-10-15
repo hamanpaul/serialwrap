@@ -39,3 +39,10 @@
 ## 規格勘誤（Spec Errata）
 
 > 本節由 P0-T15 依調和表（`spec-reconciliation.md`）指派之列填寫。
+
+### T8-ERR-01：`device.list` 非副作用方法（計畫 T8 前提錯誤）
+
+- **來源**：`docs/rust-refactor/plans/01-stage0-contracts.md` Task T8 的 `test_side_effects_declared_for_readonly_whitelist` 列與「`device.list` 的 prune」前提。
+- **事實**：`SessionManager.list_devices()`（`sw_core/session_manager.py`）僅於鎖內對 `_devices` 做排序快照，不 prune、不寫狀態；`_dispatch` 的 `device.list` 分支直接回傳該結果。因此 `device.list` 無副作用。
+- **處置**：`contracts/rpc_schema.json` 的 `x-methods.device.list.side_effects` 記為 `[]`，不自行發明效果。
+- **待計畫擁有者確認**：`test_side_effects_declared_for_readonly_whitelist` 的 `device.list` 斷言由「非空且 idempotent」改為「`side_effects == []`」；此列屬契約測試，修改需獨立審閱（§10.4）。

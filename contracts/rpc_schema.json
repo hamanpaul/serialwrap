@@ -1,0 +1,7281 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/hamanpaul/serialwrap/contracts/rpc_schema.json",
+  "title": "serialwrap RPC contract",
+  "x-catalog-revision": 1,
+  "x-wire": {
+    "framing": "ndjson",
+    "line_strip": true,
+    "empty_line": "ignored_no_response",
+    "max_request_line_bytes": 65536,
+    "max_request_line_unit": "bytes before LF（不含 LF；CRLF 時 CR 計入）",
+    "line_limit_golden": "golden/rpc/line_limit.json",
+    "over_limit": "close_without_response",
+    "params_non_object": "coerced_to_empty_object",
+    "key_order": [
+      "id",
+      "<handler insertion order>",
+      "version"
+    ],
+    "version_position": "last（經 service.rpc 的 setdefault 附加；version_absent_for 之外的回應皆有）",
+    "allow_nan": true,
+    "compact_separators": [
+      ",",
+      ":"
+    ],
+    "early_responses": {
+      "INVALID_JSON": "{\"ok\": false, \"error_code\": \"INVALID_JSON\"}\n",
+      "INVALID_REQUEST": "{\"ok\": false, \"error_code\": \"INVALID_REQUEST\"}\n"
+    },
+    "version_absent_for": [
+      "INVALID_JSON",
+      "INVALID_REQUEST",
+      "INVALID_METHOD",
+      "EXCEPTION",
+      "daemon.stop"
+    ]
+  },
+  "x-generic-errors": [
+    "METHOD_NOT_FOUND",
+    "EXCEPTION",
+    "INVALID_JSON",
+    "INVALID_REQUEST",
+    "INVALID_METHOD",
+    "FLASH_TARGET_IS_CONSOLE"
+  ],
+  "x-generic-error-notes": {
+    "METHOD_NOT_FOUND": "未知 method 的回應（service.py:1174）",
+    "EXCEPTION": "handler 拋例外（rpc_posix.py:59）；無 version",
+    "INVALID_JSON": "framing 早退（無 id、無 version）",
+    "INVALID_REQUEST": "framing 早退（非 object）",
+    "INVALID_METHOD": "method 非 str（無 version）",
+    "FLASH_TARGET_IS_CONSOLE": "catalog methods=[]（rpc 範圍）；resolve_flash_target 目前無 production 呼叫端（reachable: false，03 §3.1）。列於此僅為滿足 rpc 範圍碼皆有宣告位置（test_every_rpc_code_referenced），不代表任何 method 會回傳"
+  },
+  "$defs": {
+    "SessionPublic": {
+      "type": "object",
+      "x-order": [
+        "session_id",
+        "profile",
+        "com",
+        "alias",
+        "act_no",
+        "device_by_id",
+        "platform",
+        "profile_source",
+        "command_capable",
+        "state",
+        "last_error",
+        "last_error_detail",
+        "detached_at",
+        "last_ready_at",
+        "vtty",
+        "attached_real_path",
+        "bridge_generation",
+        "recovering",
+        "interactive_session_id",
+        "foreground_busy",
+        "fg_cmd_expected_duration_s",
+        "console_count",
+        "last_state_change_at",
+        "last_rx_at",
+        "last_tx_at",
+        "last_probe_at",
+        "reprobe_attempts",
+        "next_reprobe_at",
+        "reprobe_exhausted",
+        "boot_quiet_remaining_s",
+        "ready_reconfirm_pending",
+        "ready_reconfirm_failed",
+        "ready_reconfirm_remaining_s",
+        "idle_for_ms",
+        "last_rx_age_s",
+        "last_tx_age_s",
+        "rx_bytes_last_10s",
+        "rx_rate_bps",
+        "outstanding_commands",
+        "activity_classification",
+        "released_by",
+        "released_at",
+        "released_reason",
+        "capture",
+        "console_endpoint"
+      ],
+      "properties": {
+        "session_id": {
+          "type": "string"
+        },
+        "profile": {
+          "type": "string"
+        },
+        "com": {
+          "type": "string"
+        },
+        "alias": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "act_no": {
+          "type": "integer"
+        },
+        "device_by_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "platform": {
+          "type": "string",
+          "x-note": "shell／bcm／prpl／passthrough 等 profile 平台名"
+        },
+        "profile_source": {
+          "type": "string",
+          "enum": [
+            "unknown",
+            "pin",
+            "sticky",
+            "detected",
+            "fallback",
+            "yaml-target"
+          ]
+        },
+        "command_capable": {
+          "type": "boolean"
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "DETACHED",
+            "ATTACHING",
+            "ATTACHED",
+            "READY",
+            "RECOVERING",
+            "RELEASED",
+            "FLASHING"
+          ]
+        },
+        "last_error": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-namespace": "session 命名空間（session_last_errors）；session.attach／session.recover 可原樣外流為 RPC error_code（error_codes passthrough: last_error_passthrough）"
+        },
+        "last_error_detail": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-note": "last_error 的補充說明（例 matched_prompt=…）；無則 null"
+        },
+        "detached_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "last_ready_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "vtty": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "attached_real_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "bridge_generation": {
+          "type": "integer"
+        },
+        "recovering": {
+          "type": "boolean"
+        },
+        "interactive_session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "foreground_busy": {
+          "type": "boolean"
+        },
+        "fg_cmd_expected_duration_s": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "x-unit": "s"
+        },
+        "console_count": {
+          "type": "integer",
+          "x-note": "bridge 存在時 len(bridge.list_consoles())，會 prune 失效 console（副作用）"
+        },
+        "last_state_change_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "last_rx_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "last_tx_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "last_probe_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "reprobe_attempts": {
+          "type": "integer"
+        },
+        "next_reprobe_at": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "x-unit": "s",
+          "x-note": "monotonic 秒，跨程序無意義"
+        },
+        "reprobe_exhausted": {
+          "type": "boolean"
+        },
+        "boot_quiet_remaining_s": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "x-unit": "s"
+        },
+        "ready_reconfirm_pending": {
+          "type": "boolean",
+          "x-updated-by": "1 s tick 更新（expire_ready_reconfirm）；session.list 不主動評估，最遲約 1 s 翻轉（GAP-G-13）"
+        },
+        "ready_reconfirm_failed": {
+          "type": "boolean",
+          "x-updated-by": "1 s tick 更新（expire_ready_reconfirm）；session.list 不主動評估，最遲約 1 s 翻轉（GAP-G-13）"
+        },
+        "ready_reconfirm_remaining_s": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "x-unit": "s",
+          "x-updated-by": "非 pending 時為 null；隨 1 s tick 與 session 狀態同步"
+        },
+        "idle_for_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "x-unit": "ms"
+        },
+        "last_rx_age_s": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "x-unit": "s",
+          "x-updated-by": "請求當下計算（now − 最後 RX 時間）；尚無 RX 時為 null"
+        },
+        "last_tx_age_s": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "x-unit": "s",
+          "x-updated-by": "請求當下計算（now − 最後 TX 時間）；尚無 TX 時為 null"
+        },
+        "rx_bytes_last_10s": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "x-unit": "bytes",
+          "x-note": "bridge rx_stats；不支援時 null",
+          "x-updated-by": "請求當下由 bridge rx_stats 計算（最近 10 s 滑窗）"
+        },
+        "rx_rate_bps": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "x-unit": "bytes/s",
+          "x-note": "int(total / 10.0)",
+          "x-updated-by": "請求當下由 rx_bytes_last_10s 換算（約為 total/10）"
+        },
+        "outstanding_commands": {
+          "type": "integer"
+        },
+        "activity_classification": {
+          "type": "string",
+          "enum": [
+            "offline",
+            "newly-attached",
+            "active",
+            "idle-healthy",
+            "quiet-suspicious"
+          ]
+        },
+        "released_by": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "released_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "released_reason": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ]
+        },
+        "capture": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "x-order": [
+            "capture_id",
+            "log_path",
+            "status",
+            "line_count",
+            "byte_count"
+          ],
+          "properties": {
+            "capture_id": {
+              "type": "string",
+              "x-note": "uuid4（含連字號）"
+            },
+            "log_path": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string"
+            },
+            "line_count": {
+              "type": "integer"
+            },
+            "byte_count": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "capture_id",
+            "log_path",
+            "status",
+            "line_count",
+            "byte_count"
+          ]
+        },
+        "console_endpoint": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-conditional": "ConsoleKind::TcpTelnet 或 bridge 有 endpoint；POSIX 正常不出現"
+        }
+      },
+      "required": [
+        "session_id",
+        "profile",
+        "com",
+        "alias",
+        "act_no",
+        "device_by_id",
+        "platform",
+        "profile_source",
+        "command_capable",
+        "state",
+        "last_error",
+        "last_error_detail",
+        "detached_at",
+        "last_ready_at",
+        "vtty",
+        "attached_real_path",
+        "bridge_generation",
+        "recovering",
+        "interactive_session_id",
+        "foreground_busy",
+        "fg_cmd_expected_duration_s",
+        "console_count",
+        "last_state_change_at",
+        "last_rx_at",
+        "last_tx_at",
+        "last_probe_at",
+        "reprobe_attempts",
+        "next_reprobe_at",
+        "reprobe_exhausted",
+        "boot_quiet_remaining_s",
+        "ready_reconfirm_pending",
+        "ready_reconfirm_failed",
+        "ready_reconfirm_remaining_s",
+        "idle_for_ms",
+        "last_rx_age_s",
+        "last_tx_age_s",
+        "rx_bytes_last_10s",
+        "rx_rate_bps",
+        "outstanding_commands",
+        "activity_classification",
+        "released_by",
+        "released_at",
+        "released_reason",
+        "capture"
+      ],
+      "additionalProperties": false
+    },
+    "LeaseContext": {
+      "type": "object",
+      "x-order": [
+        "interactive_owner",
+        "human_attached",
+        "human_active",
+        "recovery_mode"
+      ],
+      "properties": {
+        "interactive_owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "human_attached": {
+          "type": "boolean"
+        },
+        "human_active": {
+          "type": "boolean",
+          "x-unit": "s（判定窗 HUMAN_ACTIVE_WINDOW_S=60.0）",
+          "x-updated-by": "請求當下由 bridge.last_human_input_at 與 time.monotonic() 判定（session_manager.py _lease_context）"
+        },
+        "recovery_mode": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "interactive_owner",
+        "human_attached",
+        "human_active",
+        "recovery_mode"
+      ]
+    },
+    "CommandRecord": {
+      "type": "object",
+      "x-order": [
+        "cmd_id",
+        "session_id",
+        "command",
+        "source",
+        "mode",
+        "execution_mode",
+        "timeout_s",
+        "expected_duration_s",
+        "completion_regex",
+        "priority",
+        "status",
+        "created_at",
+        "accepted_at",
+        "started_at",
+        "done_at",
+        "error_code",
+        "stdout",
+        "partial",
+        "background_capture_id",
+        "interactive_session_id",
+        "recovery_action"
+      ],
+      "properties": {
+        "cmd_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "command": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "mode": {
+          "type": "string",
+          "x-note": "原樣（未驗證）"
+        },
+        "execution_mode": {
+          "type": "string",
+          "x-note": "{'fg':'line','bg':'background'}.get(mode, mode)；worker 完成後可被覆寫"
+        },
+        "timeout_s": {
+          "type": "number"
+        },
+        "expected_duration_s": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "completion_regex": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "priority": {
+          "type": "integer"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "accepted",
+            "running",
+            "done",
+            "error",
+            "interactive",
+            "canceled"
+          ]
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "accepted_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "started_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "done_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "error_code": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-record-error-codes": [
+            "AUTOBOOT_QUIET",
+            "COMMAND_FAILED",
+            "FLASHING_BUSY",
+            "FLUSHED_BY_RECOVERY",
+            "FLUSHED_BY_SHUTDOWN",
+            "INVALID_COMPLETION_REGEX",
+            "PROMPT_TIMEOUT",
+            "PROMPT_TIMEOUT_RECOVERED",
+            "READY_UNCONFIRMED",
+            "SEND_FAILED",
+            "SESSION_BUSY",
+            "SESSION_INTERACTIVE_BUSY",
+            "SESSION_NOT_READY",
+            "SESSION_RECOVERING"
+          ],
+          "x-note": "命令紀錄層錯誤碼（spec §9.4）；由 error_codes.yaml scope.interfaces 含 rec 且 status 非 APPROVED 之碼推導；COMMAND_ABORTED_IN_FLIGHT（BC-03，APPROVED）未生效，不列入"
+        },
+        "stdout": {
+          "type": "string"
+        },
+        "partial": {
+          "type": "boolean"
+        },
+        "background_capture_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "interactive_session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "recovery_action": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "cmd_id",
+        "session_id",
+        "command",
+        "source",
+        "mode",
+        "execution_mode",
+        "timeout_s",
+        "priority",
+        "status",
+        "created_at",
+        "accepted_at",
+        "stdout",
+        "partial"
+      ],
+      "additionalProperties": false
+    },
+    "WalRecord": {
+      "type": "object",
+      "x-order": [
+        "cmd_id",
+        "com",
+        "crc32",
+        "dir",
+        "len",
+        "loss_flag",
+        "meta",
+        "mono_ts_ns",
+        "payload_b64",
+        "rotation_failed",
+        "seq",
+        "source",
+        "wall_ts"
+      ],
+      "properties": {
+        "cmd_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "com": {
+          "type": "string"
+        },
+        "crc32": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}$"
+        },
+        "dir": {
+          "type": "string",
+          "x-note": "RX／TX／META 等"
+        },
+        "len": {
+          "type": "integer"
+        },
+        "loss_flag": {
+          "type": "boolean"
+        },
+        "meta": {
+          "type": "object"
+        },
+        "mono_ts_ns": {
+          "type": "integer"
+        },
+        "payload_b64": {
+          "type": "string"
+        },
+        "rotation_failed": {
+          "const": true,
+          "type": "boolean"
+        },
+        "seq": {
+          "type": "integer"
+        },
+        "source": {
+          "type": "string"
+        },
+        "wall_ts": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "cmd_id",
+        "com",
+        "crc32",
+        "dir",
+        "len",
+        "loss_flag",
+        "meta",
+        "mono_ts_ns",
+        "payload_b64",
+        "seq",
+        "source",
+        "wall_ts"
+      ],
+      "x-note": "磁碟以 sort_keys 寫入，回傳保持字母序；rotation_failed 僅 rotation 失敗時存在"
+    },
+    "DeviceRow": {
+      "type": "object",
+      "x-order": [
+        "by_id",
+        "real_path"
+      ],
+      "properties": {
+        "by_id": {
+          "type": "string"
+        },
+        "real_path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "by_id",
+        "real_path"
+      ]
+    },
+    "ConsoleRow": {
+      "type": "object",
+      "x-order": [
+        "client_id",
+        "label",
+        "vtty",
+        "interactive_owner"
+      ],
+      "properties": {
+        "client_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{12}$"
+        },
+        "label": {
+          "type": "string"
+        },
+        "vtty": {
+          "type": "string"
+        },
+        "interactive_owner": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "client_id",
+        "label",
+        "vtty",
+        "interactive_owner"
+      ]
+    },
+    "AliasRow": {
+      "type": "object",
+      "x-order": [
+        "session_id",
+        "device_by_id",
+        "profile",
+        "updated_at",
+        "alias"
+      ],
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "x-note": "形式 A：session 別名（與 device_by_id 互斥）"
+        },
+        "device_by_id": {
+          "type": "string",
+          "x-note": "形式 B：device 別名（與 session_id 互斥）"
+        },
+        "profile": {
+          "type": "string",
+          "x-note": "僅形式 B 可能出現"
+        },
+        "updated_at": {
+          "type": "string"
+        },
+        "alias": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "updated_at",
+        "alias"
+      ],
+      "oneOf": [
+        {
+          "required": [
+            "session_id"
+          ]
+        },
+        {
+          "required": [
+            "device_by_id"
+          ]
+        }
+      ],
+      "x-order-new-by-id": [
+        "device_by_id",
+        "updated_at",
+        "profile",
+        "alias"
+      ],
+      "x-order-note": "x-order 為 state.json 重載後（sort_keys）順序；新指派 by-id 列的寫入順序見 x-order-new-by-id（alias_registry.py:44-52）"
+    },
+    "ErrorResponse": {
+      "type": "object",
+      "x-order": [
+        "ok",
+        "error_code"
+      ],
+      "properties": {
+        "ok": {
+          "type": "boolean",
+          "const": false
+        },
+        "error_code": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ok",
+        "error_code"
+      ],
+      "x-note": "其餘欄位依各 method 的 errors 表（見 x-methods.*.errors 與 docs）；此處只凍結 ok／error_code 位置"
+    },
+    "CommandResultTail": {
+      "type": "object",
+      "x-order": [
+        "ok",
+        "cmd_id",
+        "status",
+        "error_code",
+        "from_seq",
+        "last_seq",
+        "from_chunk",
+        "next_chunk",
+        "dropped_chunks",
+        "lost",
+        "chunks"
+      ],
+      "properties": {
+        "ok": {
+          "type": "boolean",
+          "const": true
+        },
+        "cmd_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "accepted",
+            "running",
+            "done",
+            "error",
+            "interactive",
+            "canceled",
+            "active"
+          ]
+        },
+        "error_code": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-record-error-codes": [
+            "AUTOBOOT_QUIET",
+            "COMMAND_FAILED",
+            "FLASHING_BUSY",
+            "FLUSHED_BY_RECOVERY",
+            "FLUSHED_BY_SHUTDOWN",
+            "INVALID_COMPLETION_REGEX",
+            "PROMPT_TIMEOUT",
+            "PROMPT_TIMEOUT_RECOVERED",
+            "READY_UNCONFIRMED",
+            "SEND_FAILED",
+            "SESSION_BUSY",
+            "SESSION_INTERACTIVE_BUSY",
+            "SESSION_NOT_READY",
+            "SESSION_RECOVERING"
+          ],
+          "x-note": "命令紀錄層錯誤碼（spec §9.4）；由 error_codes.yaml scope.interfaces 含 rec 且 status 非 APPROVED 之碼推導；COMMAND_ABORTED_IN_FLIGHT（BC-03，APPROVED）未生效，不列入"
+        },
+        "from_seq": {
+          "type": "integer"
+        },
+        "last_seq": {
+          "type": "integer"
+        },
+        "from_chunk": {
+          "type": "integer"
+        },
+        "next_chunk": {
+          "type": "integer"
+        },
+        "dropped_chunks": {
+          "type": "integer",
+          "x-note": "fallback（無 capture）路徑不含此欄"
+        },
+        "lost": {
+          "type": "boolean"
+        },
+        "chunks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "ok",
+        "cmd_id",
+        "status",
+        "error_code",
+        "from_seq",
+        "last_seq",
+        "from_chunk",
+        "next_chunk",
+        "chunks"
+      ]
+    }
+  },
+  "x-methods": {
+    "alias.assign": {
+      "params": {
+        "by_id": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "alias": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "profile": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-coercion": "str(params.get(k)) if params.get(k) else None",
+          "default": null
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "alias",
+          "device_by_id"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "alias": {
+            "type": "string"
+          },
+          "device_by_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ok",
+          "alias",
+          "device_by_id"
+        ]
+      },
+      "errors": [
+        "INVALID_ARGS"
+      ],
+      "error_order": [
+        "INVALID_ARGS"
+      ],
+      "side_effects": [
+        {
+          "what": "寫入 alias registry、_save_state()；不驗證 by_id 是否存在",
+          "when": "on_success",
+          "idempotent": false
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": null,
+      "status": "EXISTING",
+      "source": "sw_core/service.py:879-885 → assign_alias sw_core/session_manager.py:1726"
+    },
+    "alias.list": {
+      "params": {},
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "aliases"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "aliases": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/AliasRow"
+            }
+          }
+        },
+        "required": [
+          "ok",
+          "aliases"
+        ]
+      },
+      "errors": [],
+      "error_order": [],
+      "side_effects": [],
+      "retryable_readonly": true,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": null,
+      "status": "EXISTING",
+      "source": "sw_core/service.py:871 → list_aliases sw_core/session_manager.py:1004"
+    },
+    "alias.set": {
+      "params": {
+        "session_id": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "alias": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "session_id",
+          "alias"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "alias": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ok",
+          "session_id",
+          "alias"
+        ]
+      },
+      "errors": [
+        "SESSION_NOT_FOUND"
+      ],
+      "error_order": [
+        "SESSION_NOT_FOUND"
+      ],
+      "side_effects": [
+        {
+          "what": "profile.alias 改寫、alias registry 更新、_save_state()（無 INVALID_ARGS 檢查，alias 可為空字串）",
+          "when": "on_success",
+          "idempotent": false
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": null,
+      "status": "EXISTING",
+      "source": "sw_core/service.py:874-877 → set_alias_for_session sw_core/session_manager.py:1716"
+    },
+    "alias.unassign": {
+      "params": {
+        "alias": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "alias"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "alias": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ok",
+          "alias"
+        ]
+      },
+      "errors": [
+        "ALIAS_NOT_FOUND"
+      ],
+      "error_order": [
+        "ALIAS_NOT_FOUND"
+      ],
+      "side_effects": [
+        {
+          "what": "兩種分支皆先 _save_state()（失敗分支仍寫入）",
+          "when": "always",
+          "idempotent": false
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": null,
+      "status": "EXISTING",
+      "source": "sw_core/service.py:887-889 → unassign_alias sw_core/session_manager.py:1731"
+    },
+    "command.cancel": {
+      "params": {
+        "cmd_id": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "cmd_id",
+          "status"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "cmd_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$"
+          },
+          "status": {
+            "type": "string",
+            "const": "canceled"
+          }
+        },
+        "required": [
+          "ok",
+          "cmd_id",
+          "status"
+        ]
+      },
+      "errors": [
+        "CMD_NOT_FOUND",
+        "CMD_NOT_CANCELABLE"
+      ],
+      "error_order": [
+        "CMD_NOT_FOUND",
+        "CMD_NOT_CANCELABLE"
+      ],
+      "side_effects": [
+        {
+          "what": "標記 status=canceled、done_at；running 命令不會被中止（H-10）",
+          "when": "on_success",
+          "idempotent": false
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": null,
+      "status": "EXISTING",
+      "source": "sw_core/service.py:935-937"
+    },
+    "command.get": {
+      "params": {
+        "cmd_id": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "command"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "command": {
+            "$ref": "#/$defs/CommandRecord"
+          }
+        },
+        "required": [
+          "ok",
+          "command"
+        ]
+      },
+      "errors": [
+        "CMD_NOT_FOUND"
+      ],
+      "error_order": [
+        "CMD_NOT_FOUND"
+      ],
+      "side_effects": [],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": null,
+      "status": "EXISTING",
+      "source": "sw_core/service.py:920-922"
+    },
+    "command.result_tail": {
+      "params": {
+        "cmd_id": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "from_chunk": {
+          "type": "integer",
+          "x-coercion": "int(params.get(k) or 0)",
+          "default": 0
+        },
+        "limit": {
+          "type": "integer",
+          "x-coercion": "int(params.get(k) or 200)",
+          "default": 200
+        }
+      },
+      "result": {
+        "$ref": "#/$defs/CommandResultTail"
+      },
+      "errors": [
+        "INVALID_ARGS",
+        "CMD_NOT_FOUND"
+      ],
+      "error_order": [
+        "INVALID_ARGS",
+        "CMD_NOT_FOUND"
+      ],
+      "side_effects": [
+        {
+          "what": "讀取時 maybe_finalize()：quiet_window 後 active→done（冪等）",
+          "when": "always",
+          "idempotent": true
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": true,
+      "long_timeout": false,
+      "selector_chain": null,
+      "status": "EXISTING",
+      "source": "sw_core/service.py:924-933 → get_background_result sw_core/session_manager.py:4717; fallback sw_core/service.py:324-356",
+      "x-notes": {
+        "coercion_exception_precedes_validation": "轉型例外（EXCEPTION）先於 INVALID_ARGS 驗證（02 §5.2）；errors／error_order 無法表示此先後，故註記於此"
+      }
+    },
+    "command.submit": {
+      "params": {
+        "completion_regex": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-coercion": "params.get(k)",
+          "default": null,
+          "x-validator": "valid_completion_regex",
+          "x-note": "None 表示使用 profile prompt；其餘須為有界、非空、不匹配空串的 regex（command_completion.py），否則 INVALID_COMPLETION_REGEX"
+        },
+        "selector": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "com": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "alias": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "cmd": {
+          "type": "string",
+          "x-coercion": "str(params.get(\"cmd\") or params.get(\"command\") or \"\")",
+          "default": "",
+          "x-aliases": [
+            "command"
+          ]
+        },
+        "source": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"agent\")",
+          "default": "agent"
+        },
+        "mode": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"line\")",
+          "default": "line"
+        },
+        "timeout_s": {
+          "type": "number",
+          "x-coercion": "float(params.get(k) or 10.0)",
+          "default": 10.0
+        },
+        "priority": {
+          "type": "integer",
+          "x-coercion": "int(params.get(k) or 10)",
+          "default": 10
+        },
+        "expected_duration_s": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "x-coercion": "float(params.get(k)) if params.get(k) is not None else None",
+          "default": null
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "cmd_id",
+          "status",
+          "session_id",
+          "warning"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "cmd_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$"
+          },
+          "status": {
+            "type": "string",
+            "const": "accepted"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "warning": {
+            "type": "object",
+            "x-order": [
+              "code",
+              "cmd_length",
+              "soft_limit",
+              "hint"
+            ],
+            "properties": {
+              "code": {
+                "type": "string",
+                "const": "CMD_LENGTH_WARNING"
+              },
+              "cmd_length": {
+                "type": "integer"
+              },
+              "soft_limit": {
+                "type": "integer",
+                "const": 4096
+              },
+              "hint": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "cmd_length",
+              "soft_limit",
+              "hint"
+            ]
+          }
+        },
+        "required": [
+          "ok",
+          "cmd_id",
+          "status",
+          "session_id"
+        ]
+      },
+      "errors": [
+        "INVALID_COMPLETION_REGEX",
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND",
+        "PROFILE_NOT_COMMAND_CAPABLE",
+        "SESSION_NOT_READY",
+        "READY_UNCONFIRMED",
+        "AUTOBOOT_QUIET",
+        "CMD_TOO_LONG",
+        "CMD_CONTAINS_NEWLINE",
+        "SESSION_QUEUE_FULL"
+      ],
+      "error_order": [
+        "INVALID_COMPLETION_REGEX",
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND",
+        "PROFILE_NOT_COMMAND_CAPABLE",
+        "SESSION_NOT_READY",
+        "READY_UNCONFIRMED",
+        "AUTOBOOT_QUIET",
+        "CMD_TOO_LONG",
+        "CMD_CONTAINS_NEWLINE",
+        "SESSION_QUEUE_FULL"
+      ],
+      "side_effects": [
+        {
+          "what": "建立 CommandRecord、入 PriorityQueue（sort key (priority, counter)）、淘汰 >512 的已完成歷史",
+          "when": "on_success",
+          "idempotent": false
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": "selector>com>alias",
+      "status": "EXISTING",
+      "source": "sw_core/service.py:891-918 → arbiter.submit sw_core/arbiter.py:127",
+      "x-notes": {
+        "error_order_basis": "03 §4 gate 順序：regex→selector→state→READY_UNCONFIRMED→quiet→長度→換行→queue（pending）",
+        "coercion_exception_precedes_validation": "轉型例外（EXCEPTION）先於 INVALID_ARGS 驗證（02 §5.2）；errors／error_order 無法表示此先後，故註記於此"
+      }
+    },
+    "daemon.stop": {
+      "params": {},
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "stopping"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "stopping": {
+            "type": "boolean",
+            "const": true
+          }
+        },
+        "required": [
+          "ok",
+          "stopping"
+        ]
+      },
+      "errors": [],
+      "error_order": [],
+      "side_effects": [
+        {
+          "what": "觸發 daemon 關閉序列：server.stop → service.stop → lock.release；不關閉 UARTBridge、不寫 state.json（H-16）",
+          "when": "always",
+          "idempotent": false
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": null,
+      "status": "EXISTING",
+      "source": "sw_core/daemon.py:167"
+    },
+    "device.attach": {
+      "params": {
+        "selector": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "force": {
+          "type": "boolean",
+          "x-coercion": "bool(params.get(k))",
+          "default": false
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "already_attached",
+          "session"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "already_attached": {
+            "type": "boolean",
+            "const": true
+          },
+          "session": {
+            "$ref": "#/$defs/SessionPublic"
+          }
+        },
+        "required": [
+          "ok",
+          "session"
+        ]
+      },
+      "errors": [
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND",
+        "DEVICE_NOT_PRESENT",
+        "DEVICE_STILL_HELD"
+      ],
+      "error_order": [
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND",
+        "DEVICE_NOT_PRESENT",
+        "DEVICE_STILL_HELD"
+      ],
+      "side_effects": [
+        {
+          "what": "清 released 標記與 provenance、state=ATTACHING、last_error=None、重置 reprobe、_save_state()、spawn attach 執行緒",
+          "when": "on_success",
+          "idempotent": false
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": "selector",
+      "status": "EXISTING",
+      "source": "sw_core/service.py:737-741 → attach_device sw_core/session_manager.py:2004",
+      "x-notes": {
+        "proc_scan": "force=false 時 /proc 掃描於 event loop 同步執行（非 BLOCKING）；不列為副作用"
+      }
+    },
+    "device.list": {
+      "params": {},
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "devices"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "devices": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/DeviceRow"
+            }
+          }
+        },
+        "required": [
+          "ok",
+          "devices"
+        ]
+      },
+      "errors": [],
+      "error_order": [],
+      "side_effects": [],
+      "retryable_readonly": true,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": null,
+      "status": "EXISTING",
+      "source": "sw_core/service.py:726",
+      "x-notes": {
+        "pure_read": "list_devices 為純讀（session_manager.py list_devices 不 prune）；計畫 device.list prune 前提錯誤，見 spec-errata.md"
+      }
+    },
+    "device.release": {
+      "params": {
+        "selector": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "source": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"cli\")",
+          "default": "cli"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ],
+          "x-coercion": "params.get(k)",
+          "default": null
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "already_released",
+          "session",
+          "closed_consoles",
+          "aborted_cmd"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "already_released": {
+            "type": "boolean",
+            "const": true
+          },
+          "session": {
+            "$ref": "#/$defs/SessionPublic"
+          },
+          "closed_consoles": {
+            "type": "integer"
+          },
+          "aborted_cmd": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "session"
+        ]
+      },
+      "errors": [
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND",
+        "FLASHING_BUSY"
+      ],
+      "error_order": [
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND",
+        "FLASHING_BUSY"
+      ],
+      "side_effects": [
+        {
+          "what": "detach bridge（drop_consoles=True）、lease 關閉、capture 停止、background capture 標 done；arbiter unregister 排隊命令為 FLUSHED_BY_RECOVERY",
+          "when": "on_success",
+          "idempotent": false
+        },
+        {
+          "what": "state=RELEASED，寫入 released_by／released_at／released_reason，by_id 加入 _released_by_ids",
+          "when": "on_success",
+          "idempotent": false
+        },
+        {
+          "what": "_save_state() 失敗時回 EXCEPTION，但記憶體狀態已變更（H-11）",
+          "when": "on_failure",
+          "idempotent": false
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": "selector",
+      "status": "EXISTING",
+      "source": "sw_core/service.py:729-735 → release_device sw_core/session_manager.py:1852"
+    },
+    "event.com_disable": {
+      "params": {
+        "selector": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "selector",
+          "enabled",
+          "active_rules"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "selector": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "active_rules": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "ok",
+          "selector",
+          "enabled",
+          "active_rules"
+        ]
+      },
+      "errors": [],
+      "error_order": [],
+      "side_effects": [
+        {
+          "what": "對受影響規則清 counter，寫 counter_reset／com_disabled 事件",
+          "when": "always",
+          "idempotent": true
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": "raw_selector",
+      "status": "EXISTING",
+      "source": "sw_core/service.py:1133-1172 → event_engine/engine.py"
+    },
+    "event.com_enable": {
+      "params": {
+        "selector": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "selector",
+          "enabled",
+          "active_rules"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "selector": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "active_rules": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "ok",
+          "selector",
+          "enabled",
+          "active_rules"
+        ]
+      },
+      "errors": [],
+      "error_order": [],
+      "side_effects": [
+        {
+          "what": "selector 加入 enabled 集合（空字串亦加入）；寫事件 log",
+          "when": "always",
+          "idempotent": true
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": "raw_selector",
+      "status": "EXISTING",
+      "source": "sw_core/service.py:1133-1172 → event_engine/engine.py"
+    },
+    "event.com_status": {
+      "params": {
+        "selector": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ],
+          "x-coercion": "params.get(k)",
+          "default": null
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "coms",
+          "selector",
+          "enabled",
+          "active_rules"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "coms": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "x-note": "selector 為 None 時"
+          },
+          "selector": {
+            "type": [
+              "string",
+              "number",
+              "boolean"
+            ],
+            "x-note": "selector 原樣回傳（engine.com_status 不轉型）；允許 string／number／boolean，None 走 coms 分支"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "active_rules": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "oneOf": [
+          {
+            "required": [
+              "coms"
+            ]
+          },
+          {
+            "required": [
+              "selector",
+              "enabled",
+              "active_rules"
+            ]
+          }
+        ]
+      },
+      "errors": [],
+      "error_order": [],
+      "side_effects": [],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": "raw_selector",
+      "status": "EXISTING",
+      "source": "sw_core/service.py:1133-1172 → event_engine/engine.py"
+    },
+    "event.reload": {
+      "params": {},
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "added",
+          "removed",
+          "changed"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "added": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "x-note": "順序不穩定（set 差集，H-13）"
+          },
+          "removed": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "changed": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "ok",
+          "added",
+          "removed",
+          "changed"
+        ]
+      },
+      "errors": [],
+      "error_order": [],
+      "side_effects": [
+        {
+          "what": "重新讀取 EVENTS_DIR 規則並替換 matcher",
+          "when": "always",
+          "idempotent": true
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": null,
+      "status": "EXISTING",
+      "source": "sw_core/service.py:1164 → event_engine/engine.py"
+    },
+    "event.reset": {
+      "params": {
+        "rule_id": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ],
+          "x-coercion": "params.get(k)",
+          "default": null
+        },
+        "selector": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ],
+          "x-coercion": "params.get(k)",
+          "default": null
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "cleared"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "cleared": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "ok",
+          "cleared"
+        ]
+      },
+      "errors": [],
+      "error_order": [],
+      "side_effects": [
+        {
+          "what": "清除指定 rule_id 或 selector 的 counter；寫事件 log（rule_id 未驗證，H-01）",
+          "when": "always",
+          "idempotent": true
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": "raw_selector",
+      "status": "EXISTING",
+      "source": "sw_core/service.py:1133-1172 → event_engine/engine.py"
+    },
+    "event.rule_delete": {
+      "params": {
+        "rule_id": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "deleted"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "deleted": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "deleted"
+        ]
+      },
+      "errors": [],
+      "error_order": [],
+      "side_effects": [
+        {
+          "what": "以未驗證 rule_id 組 path 後 unlink（路徑穿越 H-01；DF-01 APPROVED 未實作）",
+          "when": "always",
+          "idempotent": false
+        },
+        {
+          "what": "成功時清 counter、寫事件 log",
+          "when": "on_success",
+          "idempotent": false
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": null,
+      "status": "EXISTING",
+      "source": "sw_core/service.py:1133-1172 → event_engine/engine.py"
+    },
+    "event.rule_get": {
+      "params": {
+        "rule_id": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "rule",
+          "counter"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "rule": {
+            "type": "object",
+            "x-note": "規則原始請求物件（rule.raw）；任意結構，僅保證為 object"
+          },
+          "counter": {
+            "type": "object",
+            "x-order": [
+              "fires",
+              "last_fire_ts",
+              "exhausted"
+            ],
+            "properties": {
+              "fires": {
+                "type": "integer"
+              },
+              "last_fire_ts": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "exhausted": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "fires",
+              "last_fire_ts",
+              "exhausted"
+            ]
+          }
+        },
+        "required": [
+          "ok",
+          "rule",
+          "counter"
+        ]
+      },
+      "errors": [
+        "RULE_NOT_FOUND"
+      ],
+      "error_order": [
+        "RULE_NOT_FOUND"
+      ],
+      "side_effects": [],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": null,
+      "status": "EXISTING",
+      "source": "sw_core/service.py:1133-1172 → event_engine/engine.py"
+    },
+    "event.rule_list": {
+      "params": {
+        "selector": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ],
+          "x-coercion": "params.get(k)",
+          "default": null
+        },
+        "owner": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ],
+          "x-coercion": "params.get(k)",
+          "default": null
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "rules"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "rules": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "x-order": [
+                "rule_id",
+                "owner",
+                "kind",
+                "selectors",
+                "fires",
+                "exhausted",
+                "last_fire_ts"
+              ],
+              "properties": {
+                "rule_id": {
+                  "type": "string"
+                },
+                "owner": {
+                  "type": "string"
+                },
+                "kind": {
+                  "type": "string"
+                },
+                "selectors": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "fires": {
+                  "type": "integer"
+                },
+                "exhausted": {
+                  "type": "boolean"
+                },
+                "last_fire_ts": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "rule_id",
+                "owner",
+                "kind",
+                "selectors",
+                "fires",
+                "exhausted",
+                "last_fire_ts"
+              ]
+            }
+          }
+        },
+        "required": [
+          "ok",
+          "rules"
+        ]
+      },
+      "errors": [],
+      "error_order": [],
+      "side_effects": [],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": "raw_selector",
+      "status": "EXISTING",
+      "source": "sw_core/service.py:1133-1172 → event_engine/engine.py"
+    },
+    "event.rule_set": {
+      "params": {},
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "additionalProperties": true,
+        "x-note": "{'ok': True, **原請求}；原請求的 ok 鍵會覆蓋（H-14）"
+      },
+      "errors": [
+        "INVALID_RULE_SCHEMA"
+      ],
+      "error_order": [
+        "INVALID_RULE_SCHEMA"
+      ],
+      "side_effects": [
+        {
+          "what": "寫 EVENTS_DIR/<owner>.<name>.json（tmp＋rename）、替換 matcher 規則、auto_enable_com_on_load 時 enable COM、寫事件 log",
+          "when": "on_success",
+          "idempotent": false
+        },
+        {
+          "what": "檔案 OSError 回 EXCEPTION（H-11）",
+          "when": "on_failure",
+          "idempotent": false
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": null,
+      "status": "EXISTING",
+      "source": "sw_core/service.py:1133-1172 → event_engine/engine.py（整個 params 即規則物件）",
+      "x-notes": {
+        "x-params-mode": "whole_object: params or {} 即規則物件，無個別欄位轉型"
+      }
+    },
+    "event.tail": {
+      "params": {
+        "rule_id": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ],
+          "x-coercion": "params.get(k)",
+          "default": null
+        },
+        "selector": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ],
+          "x-coercion": "params.get(k)",
+          "default": null
+        },
+        "since_ts": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ],
+          "x-coercion": "params.get(k)",
+          "default": null
+        },
+        "n": {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null"
+          ],
+          "x-coercion": "params.get(k)",
+          "default": null
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "entries"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "entries": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "x-note": "事件列為任意規則輸出物件，結構由事件引擎定義，本契約不逐欄凍結"
+          }
+        },
+        "required": [
+          "ok",
+          "entries"
+        ]
+      },
+      "errors": [],
+      "error_order": [],
+      "side_effects": [],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": "raw_selector",
+      "status": "EXISTING",
+      "source": "sw_core/service.py:1166 → event_engine/engine.py（讀整個 events.ndjson）"
+    },
+    "file.pull": {
+      "params": {
+        "selector": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "remote_path": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "local_path": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-coercion": "str(params.get(k)) if params.get(k) else None",
+          "default": null
+        },
+        "chunk_timeout_s": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "x-coercion": "float(params.get(k)) if params.get(k) is not None else None",
+          "default": null
+        },
+        "ack_mode": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"auto\")",
+          "default": "auto",
+          "x-enum": [
+            "auto",
+            "echo",
+            "none"
+          ],
+          "x-note": "白名單驗證後不轉傳（service.py file.pull 分支：pull 單行短命令不走 paced）；非法值 INVALID_ARGS",
+          "x-forwarded": false
+        },
+        "source": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"agent\")",
+          "default": "agent"
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "bytes",
+          "md5",
+          "local_path"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "bytes": {
+            "type": "integer"
+          },
+          "md5": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$"
+          },
+          "local_path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ok",
+          "bytes",
+          "md5",
+          "local_path"
+        ]
+      },
+      "errors": [
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND",
+        "PROFILE_NOT_COMMAND_CAPABLE",
+        "SESSION_NOT_READY",
+        "READY_UNCONFIRMED",
+        "AUTOBOOT_QUIET",
+        "SESSION_RECOVERING",
+        "SESSION_INTERACTIVE_BUSY",
+        "SESSION_BUSY",
+        "CONSOLE_LINE_LIMIT_TOO_SMALL",
+        "TRANSFER_TIMEOUT",
+        "TRANSFER_PROBE_FAILED",
+        "TARGET_ENCODER_MISSING",
+        "TARGET_ENCODER_FAILED",
+        "PULL_PARSE_FAILED",
+        "BASE64_DECODE_FAILED",
+        "CHECKSUM_VERIFY_FAILED",
+        "CHECKSUM_MISMATCH"
+      ],
+      "error_order": [
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND",
+        "PROFILE_NOT_COMMAND_CAPABLE",
+        "SESSION_NOT_READY",
+        "READY_UNCONFIRMED",
+        "AUTOBOOT_QUIET",
+        "SESSION_RECOVERING",
+        "SESSION_INTERACTIVE_BUSY",
+        "SESSION_BUSY",
+        "CONSOLE_LINE_LIMIT_TOO_SMALL",
+        "TRANSFER_TIMEOUT",
+        "TRANSFER_PROBE_FAILED",
+        "TARGET_ENCODER_MISSING",
+        "TARGET_ENCODER_FAILED",
+        "PULL_PARSE_FAILED",
+        "BASE64_DECODE_FAILED",
+        "CHECKSUM_VERIFY_FAILED",
+        "CHECKSUM_MISMATCH"
+      ],
+      "side_effects": [
+        {
+          "what": "UART TX（讀取 remote 檔）；非冪等",
+          "when": "on_success",
+          "idempotent": false,
+          "x-condition": "僅通過 INVALID_ARGS／SESSION_*／PROFILE_NOT_COMMAND_CAPABLE 等拒絕 gate 後才送出；拒絕路徑零 TX",
+          "x-uart-tx": "possible"
+        },
+        {
+          "what": "寫入 daemon CWD 相對或絕對 local_path（寫檔 OSError 未攔，H-11）",
+          "when": "on_success",
+          "idempotent": false
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": true,
+      "long_timeout": false,
+      "selector_chain": "selector",
+      "status": "EXISTING",
+      "source": "sw_core/service.py:1104-1131 → pull_file sw_core/file_transfer.py:263"
+    },
+    "file.push": {
+      "params": {
+        "selector": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "local_path": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "remote_path": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "chunk_size": {
+          "type": "integer",
+          "x-coercion": "max(1, int(params.get(k) or 512))",
+          "default": 512
+        },
+        "chunk_timeout_s": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "x-coercion": "float(params.get(k)) if params.get(k) is not None else None",
+          "default": null
+        },
+        "ack_mode": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"auto\")",
+          "default": "auto",
+          "x-enum": [
+            "auto",
+            "echo",
+            "none"
+          ],
+          "x-note": "白名單驗證（file_transfer._ACK_MODES）；非法值 INVALID_ARGS"
+        },
+        "source": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"agent\")",
+          "default": "agent"
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "bytes",
+          "chunks",
+          "md5",
+          "remote_path"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "bytes": {
+            "type": "integer"
+          },
+          "chunks": {
+            "type": "integer"
+          },
+          "md5": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$"
+          },
+          "remote_path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ok",
+          "bytes",
+          "chunks",
+          "md5",
+          "remote_path"
+        ]
+      },
+      "errors": [
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND",
+        "PROFILE_NOT_COMMAND_CAPABLE",
+        "SESSION_NOT_READY",
+        "READY_UNCONFIRMED",
+        "AUTOBOOT_QUIET",
+        "SESSION_RECOVERING",
+        "SESSION_INTERACTIVE_BUSY",
+        "SESSION_BUSY",
+        "LOCAL_FILE_NOT_FOUND",
+        "ECHO_ACK_UNSUPPORTED",
+        "CONSOLE_LINE_LIMIT_TOO_SMALL",
+        "TRANSFER_TIMEOUT",
+        "TRANSFER_PROBE_FAILED",
+        "TARGET_DECODER_MISSING",
+        "TRANSFER_ECHO_STALL",
+        "TARGET_DECODER_FAILED",
+        "CHECKSUM_VERIFY_FAILED",
+        "CHECKSUM_MISMATCH",
+        "MOVE_TIMEOUT",
+        "MOVE_FAILED"
+      ],
+      "error_order": [
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND",
+        "PROFILE_NOT_COMMAND_CAPABLE",
+        "SESSION_NOT_READY",
+        "READY_UNCONFIRMED",
+        "AUTOBOOT_QUIET",
+        "SESSION_RECOVERING",
+        "SESSION_INTERACTIVE_BUSY",
+        "SESSION_BUSY",
+        "LOCAL_FILE_NOT_FOUND",
+        "ECHO_ACK_UNSUPPORTED",
+        "CONSOLE_LINE_LIMIT_TOO_SMALL",
+        "TRANSFER_TIMEOUT",
+        "TRANSFER_PROBE_FAILED",
+        "TARGET_DECODER_MISSING",
+        "TRANSFER_ECHO_STALL",
+        "TARGET_DECODER_FAILED",
+        "CHECKSUM_VERIFY_FAILED",
+        "CHECKSUM_MISMATCH",
+        "MOVE_TIMEOUT",
+        "MOVE_FAILED"
+      ],
+      "side_effects": [
+        {
+          "what": "UART 大量 TX（逐段 base64 + echo ack）；非冪等",
+          "when": "on_success",
+          "idempotent": false,
+          "x-condition": "僅通過 INVALID_ARGS／SESSION_*／PROFILE_NOT_COMMAND_CAPABLE／LOCAL_FILE_NOT_FOUND 等拒絕 gate 後才送出；拒絕路徑零 TX",
+          "x-uart-tx": "possible"
+        },
+        {
+          "what": "遠端暫存檔 /tmp/.sw_upload_<12hex>（失敗時 cleanup）後 move 到 remote_path",
+          "when": "on_success",
+          "idempotent": false,
+          "x-condition": "僅通過拒絕 gate 後建立；失敗時清除",
+          "x-uart-tx": "possible"
+        },
+        {
+          "what": "前景 busy 與 human suspend／resume",
+          "when": "always",
+          "idempotent": false
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": true,
+      "long_timeout": false,
+      "selector_chain": "selector",
+      "status": "EXISTING",
+      "source": "sw_core/service.py:1069-1102 → push_file sw_core/file_transfer.py:63"
+    },
+    "health.ping": {
+      "params": {},
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "pong"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "pong": {
+            "type": "boolean",
+            "const": true
+          }
+        },
+        "required": [
+          "ok",
+          "pong"
+        ]
+      },
+      "errors": [],
+      "error_order": [],
+      "side_effects": [],
+      "retryable_readonly": true,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": null,
+      "status": "EXISTING",
+      "source": "sw_core/service.py:706"
+    },
+    "health.status": {
+      "params": {},
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "pid",
+          "version",
+          "running",
+          "started_at",
+          "sessions",
+          "devices",
+          "commands",
+          "wal_path",
+          "mirror_path",
+          "wal",
+          "limits",
+          "warnings",
+          "multi_open",
+          "foreign_holders",
+          "multi_open_detail"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "pid": {
+            "type": "integer",
+            "x-unit": "pid"
+          },
+          "version": {
+            "type": "string",
+            "x-note": "health() 內顯式放置於 pid 之後（setdefault 為 no-op）"
+          },
+          "running": {
+            "type": "boolean"
+          },
+          "started_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "sessions": {
+            "type": "integer"
+          },
+          "devices": {
+            "type": "integer"
+          },
+          "commands": {
+            "type": "integer",
+            "x-note": "arbiter _commands 總數（含已完成歷史，≤ 512＋pending）"
+          },
+          "wal_path": {
+            "type": "string"
+          },
+          "mirror_path": {
+            "type": "string"
+          },
+          "wal": {
+            "type": "object",
+            "x-order": [
+              "wal_dir",
+              "wal_path",
+              "wal_dir_exists",
+              "wal_file_exists",
+              "wal_dir_writable",
+              "current_seq",
+              "write_failures",
+              "last_write_error",
+              "recreated_count",
+              "healthy"
+            ],
+            "properties": {
+              "wal_dir": {
+                "type": "string"
+              },
+              "wal_path": {
+                "type": "string"
+              },
+              "wal_dir_exists": {
+                "type": "boolean"
+              },
+              "wal_file_exists": {
+                "type": "boolean"
+              },
+              "wal_dir_writable": {
+                "type": "boolean"
+              },
+              "current_seq": {
+                "type": "integer"
+              },
+              "write_failures": {
+                "type": "integer"
+              },
+              "last_write_error": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "recreated_count": {
+                "type": "integer"
+              },
+              "healthy": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "wal_dir",
+              "wal_path",
+              "wal_dir_exists",
+              "wal_file_exists",
+              "wal_dir_writable",
+              "current_seq",
+              "write_failures",
+              "last_write_error",
+              "recreated_count",
+              "healthy"
+            ],
+            "x-note": "healthy = dir_exists and dir_writable and not (seq>0 and not file_exists)；不取 WAL 鎖"
+          },
+          "limits": {
+            "type": "object",
+            "x-order": [
+              "max_submit_cmd_bytes",
+              "warn_submit_cmd_bytes",
+              "reject_error_code",
+              "newline_error_code",
+              "warning_code",
+              "newline_forbidden"
+            ],
+            "properties": {
+              "max_submit_cmd_bytes": {
+                "type": "integer",
+                "const": 16384
+              },
+              "warn_submit_cmd_bytes": {
+                "type": "integer",
+                "const": 4096
+              },
+              "reject_error_code": {
+                "type": "string",
+                "const": "CMD_TOO_LONG"
+              },
+              "newline_error_code": {
+                "type": "string",
+                "const": "CMD_CONTAINS_NEWLINE"
+              },
+              "warning_code": {
+                "type": "string",
+                "const": "CMD_LENGTH_WARNING"
+              },
+              "newline_forbidden": {
+                "type": "boolean",
+                "const": true
+              }
+            },
+            "required": [
+              "max_submit_cmd_bytes",
+              "warn_submit_cmd_bytes",
+              "reject_error_code",
+              "newline_error_code",
+              "warning_code",
+              "newline_forbidden"
+            ]
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "no_profiles_loaded",
+                "no_devices_found"
+              ]
+            },
+            "x-note": "僅非空時出現；no_profiles_loaded 只計 explicit targets（H-17）"
+          },
+          "multi_open": {
+            "type": "boolean",
+            "x-updated-by": "請求當下 on-demand 掃 /proc（multi_open.py）；不常駐"
+          },
+          "foreign_holders": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "x-unit": "pid",
+            "x-updated-by": "on-demand 掃 /proc（health.status 呼叫時）；包含 daemon 自身 pid（RPC-D-10／PLT-O-04）",
+            "x-note": "key 為 tty real_path，value 為持有者 pid"
+          },
+          "multi_open_detail": {
+            "type": "object",
+            "x-order": [
+              "daemons",
+              "holders_status"
+            ],
+            "properties": {
+              "daemons": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "x-order": [
+                    "pid",
+                    "socket"
+                  ],
+                  "properties": {
+                    "pid": {
+                      "type": "integer",
+                      "x-unit": "pid"
+                    },
+                    "socket": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "pid",
+                    "socket"
+                  ]
+                }
+              },
+              "holders_status": {
+                "type": "string",
+                "enum": [
+                  "ok",
+                  "permission",
+                  "unknown"
+                ]
+              }
+            },
+            "required": [
+              "daemons",
+              "holders_status"
+            ],
+            "x-updated-by": "請求當下 on-demand 掃 /proc（multi_open.py）；不常駐"
+          }
+        },
+        "required": [
+          "ok",
+          "pid",
+          "version",
+          "running",
+          "started_at",
+          "sessions",
+          "devices",
+          "commands",
+          "wal_path",
+          "mirror_path",
+          "wal",
+          "limits",
+          "multi_open",
+          "foreign_holders",
+          "multi_open_detail"
+        ]
+      },
+      "errors": [],
+      "error_order": [],
+      "side_effects": [
+        {
+          "what": "list_sessions 觸發 console prune（to_public_dict 讀 console_count，冪等）",
+          "when": "always",
+          "idempotent": true
+        },
+        {
+          "what": "detect_multi_open 掃 /proc（唯讀）",
+          "when": "always",
+          "idempotent": true
+        }
+      ],
+      "retryable_readonly": true,
+      "blocking": true,
+      "long_timeout": false,
+      "selector_chain": null,
+      "status": "EXISTING",
+      "source": "sw_core/service.py:708 → health() sw_core/service.py:562-616"
+    },
+    "log.tail_raw": {
+      "params": {
+        "com": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "selector": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "from_seq": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "x-coercion": "None if params.get(k) is None else int(params.get(k))",
+          "default": null,
+          "x-note": "缺省或 null 為 latest 模式；非法值 → INVALID_ARGS"
+        },
+        "limit": {
+          "type": "integer",
+          "x-coercion": "int(params.get(k) or 200)",
+          "default": 200
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "records",
+          "returned",
+          "from_seq",
+          "last_seq",
+          "current_seq",
+          "truncated",
+          "wal_path",
+          "wal_file_exists"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "records": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/WalRecord"
+            }
+          },
+          "returned": {
+            "type": "integer"
+          },
+          "from_seq": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "last_seq": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "current_seq": {
+            "type": "integer"
+          },
+          "truncated": {
+            "type": "boolean",
+            "x-note": "回應因 limit 截斷時為 true"
+          },
+          "wal_path": {
+            "type": "string"
+          },
+          "wal_file_exists": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "records",
+          "returned",
+          "from_seq",
+          "last_seq",
+          "current_seq",
+          "truncated",
+          "wal_path",
+          "wal_file_exists"
+        ]
+      },
+      "errors": [
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND",
+        "WAL_MISSING"
+      ],
+      "error_order": [
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND",
+        "WAL_MISSING"
+      ],
+      "side_effects": [],
+      "retryable_readonly": false,
+      "blocking": true,
+      "long_timeout": false,
+      "selector_chain": "com>selector",
+      "status": "EXISTING",
+      "source": "sw_core/service.py:964-1019 → tail_raw_with_meta sw_core/wal.py:292",
+      "x-notes": {
+        "coercion_order": "from_seq 解析 → limit 轉型 → selector 解析（limit 轉型例外先於 selector 驗證）"
+      }
+    },
+    "log.tail_text": {
+      "params": {
+        "com": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "selector": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "from_seq": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "x-coercion": "None if params.get(k) is None else int(params.get(k))",
+          "default": null,
+          "x-note": "缺省或 null 為 latest 模式；非法值 → INVALID_ARGS"
+        },
+        "limit": {
+          "type": "integer",
+          "x-coercion": "int(params.get(k) or 200)",
+          "default": 200
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "lines",
+          "returned",
+          "from_seq",
+          "last_seq",
+          "current_seq",
+          "truncated",
+          "wal_path",
+          "wal_file_exists"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "returned": {
+            "type": "integer"
+          },
+          "from_seq": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "last_seq": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "current_seq": {
+            "type": "integer"
+          },
+          "truncated": {
+            "type": "boolean",
+            "x-note": "回應因 limit 截斷時為 true"
+          },
+          "wal_path": {
+            "type": "string"
+          },
+          "wal_file_exists": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "lines",
+          "returned",
+          "from_seq",
+          "last_seq",
+          "current_seq",
+          "truncated",
+          "wal_path",
+          "wal_file_exists"
+        ]
+      },
+      "errors": [
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND",
+        "WAL_MISSING"
+      ],
+      "error_order": [
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND",
+        "WAL_MISSING"
+      ],
+      "side_effects": [],
+      "retryable_readonly": false,
+      "blocking": true,
+      "long_timeout": false,
+      "selector_chain": "com>selector",
+      "status": "EXISTING",
+      "source": "sw_core/service.py:964-1019 → rows_to_text_lines",
+      "x-notes": {
+        "coercion_order": "from_seq 解析 → limit 轉型 → selector 解析（limit 轉型例外先於 selector 驗證）"
+      }
+    },
+    "mcu.patterns": {
+      "params": {},
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "patterns"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "patterns": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "x-order": [
+                "family",
+                "probe",
+                "expect",
+                "baud"
+              ],
+              "properties": {
+                "family": {
+                  "type": "string"
+                },
+                "probe": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{2}( [0-9a-f]{2})*$"
+                },
+                "expect": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{2}( [0-9a-f]{2})*$"
+                },
+                "baud": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "family",
+                "probe",
+                "expect",
+                "baud"
+              ]
+            }
+          }
+        },
+        "required": [
+          "ok",
+          "patterns"
+        ]
+      },
+      "errors": [],
+      "error_order": [],
+      "side_effects": [],
+      "retryable_readonly": true,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": null,
+      "status": "EXISTING",
+      "source": "sw_core/service.py:711-715"
+    },
+    "mcu.status": {
+      "params": {},
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "candidates",
+          "flashing",
+          "flashing_com",
+          "last_detect"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "candidates": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "x-order": [
+                "com",
+                "by_id",
+                "real_path",
+                "command_capable"
+              ],
+              "properties": {
+                "com": {
+                  "type": "string"
+                },
+                "by_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "real_path": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "command_capable": {
+                  "type": "boolean",
+                  "const": false
+                }
+              },
+              "required": [
+                "com",
+                "by_id",
+                "real_path",
+                "command_capable"
+              ]
+            }
+          },
+          "flashing": {
+            "type": "boolean"
+          },
+          "flashing_com": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_detect": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "x-order": [
+              "status",
+              "com",
+              "family",
+              "hits"
+            ],
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "matched",
+                  "ambiguous",
+                  "none"
+                ]
+              },
+              "com": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "family": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "hits": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "x-order": [
+                    "by_id",
+                    "com"
+                  ],
+                  "properties": {
+                    "by_id": {
+                      "type": "string"
+                    },
+                    "com": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "by_id",
+                    "com"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "status",
+              "com",
+              "family",
+              "hits"
+            ]
+          }
+        },
+        "required": [
+          "ok",
+          "candidates",
+          "flashing",
+          "flashing_com",
+          "last_detect"
+        ]
+      },
+      "errors": [],
+      "error_order": [],
+      "side_effects": [
+        {
+          "what": "_flash_candidates 呼叫 list_sessions()，經 to_public_dict／bridge.list_consoles 冪等 prune 已失效 console",
+          "when": "always",
+          "idempotent": true
+        }
+      ],
+      "retryable_readonly": true,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": null,
+      "status": "EXISTING",
+      "source": "sw_core/service.py:716-724"
+    },
+    "result.tail": {
+      "params": {
+        "cmd_id": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "from_chunk": {
+          "type": "integer",
+          "x-coercion": "int(params.get(k) or 0)",
+          "default": 0,
+          "x-note": "僅 cmd_id 為真時讀取（cmd_id 分支）"
+        },
+        "limit": {
+          "type": "integer",
+          "x-coercion": "int(params.get(k) or 200)",
+          "default": 200
+        },
+        "com": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "selector": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "from_seq": {
+          "type": "integer",
+          "x-coercion": "int(params.get(k) or 0)",
+          "default": 0
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "cmd_id",
+          "status",
+          "error_code",
+          "from_seq",
+          "last_seq",
+          "from_chunk",
+          "next_chunk",
+          "dropped_chunks",
+          "lost",
+          "chunks",
+          "records"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "cmd_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "accepted",
+              "running",
+              "done",
+              "error",
+              "interactive",
+              "canceled",
+              "active"
+            ]
+          },
+          "error_code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "from_seq": {
+            "type": "integer"
+          },
+          "last_seq": {
+            "type": "integer"
+          },
+          "from_chunk": {
+            "type": "integer"
+          },
+          "next_chunk": {
+            "type": "integer"
+          },
+          "dropped_chunks": {
+            "type": "integer",
+            "x-note": "fallback（無 capture）路徑不含此欄"
+          },
+          "lost": {
+            "type": "boolean"
+          },
+          "chunks": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "records": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/WalRecord"
+            }
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "oneOf": [
+          {
+            "$ref": "#/$defs/CommandResultTail"
+          },
+          {
+            "type": "object",
+            "x-order": [
+              "ok",
+              "records"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean",
+                "const": true
+              },
+              "records": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/WalRecord"
+                }
+              }
+            },
+            "required": [
+              "ok",
+              "records"
+            ]
+          }
+        ],
+        "x-note": "有 cmd_id 走 command.result_tail 同一結構；無 cmd_id（legacy）走 records 分支，無 metadata（D-09）"
+      },
+      "errors": [
+        "CMD_NOT_FOUND",
+        "SESSION_NOT_FOUND"
+      ],
+      "error_order": [
+        "CMD_NOT_FOUND",
+        "SESSION_NOT_FOUND"
+      ],
+      "side_effects": [
+        {
+          "what": "有 cmd_id 時 maybe_finalize()（冪等）；無 cmd_id 時唯讀 WAL",
+          "when": "always",
+          "idempotent": true
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": true,
+      "long_timeout": false,
+      "selector_chain": "com>selector",
+      "status": "EXISTING",
+      "source": "sw_core/service.py:939-962 (legacy)",
+      "x-notes": {
+        "coercion_exception_precedes_validation": "轉型例外（EXCEPTION）先於 INVALID_ARGS 驗證（02 §5.2）；errors／error_order 無法表示此先後，故註記於此"
+      }
+    },
+    "session.activity": {
+      "params": {
+        "selector": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "session_id": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "com": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "alias": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "session"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "session": {
+            "$ref": "#/$defs/SessionPublic"
+          }
+        },
+        "required": [
+          "ok",
+          "session"
+        ]
+      },
+      "errors": [
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND"
+      ],
+      "error_order": [
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND"
+      ],
+      "side_effects": [
+        {
+          "what": "同 session.get_state：expire_ready_reconfirm 與 console prune（冪等）",
+          "when": "always",
+          "idempotent": true
+        }
+      ],
+      "retryable_readonly": true,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": "selector>session_id>com>alias",
+      "status": "EXISTING",
+      "source": "sw_core/service.py:750-760"
+    },
+    "session.attach": {
+      "params": {
+        "selector": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "session_id": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "com": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "alias": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "released",
+          "recommended_action",
+          "session"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "released": {
+            "type": "boolean",
+            "const": true
+          },
+          "recommended_action": {
+            "type": "string"
+          },
+          "session": {
+            "$ref": "#/$defs/SessionPublic"
+          }
+        },
+        "required": [
+          "ok",
+          "session"
+        ]
+      },
+      "errors": [
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND",
+        "DEVICE_NOT_BOUND",
+        "DEVICE_NOT_FOUND",
+        "FLASHING_BUSY",
+        "SESSION_RECOVERING",
+        "SESSION_NOT_READY",
+        "STATE_CHANGED",
+        "NOT_READY",
+        "@last_error_passthrough"
+      ],
+      "error_order": [
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND",
+        "DEVICE_NOT_BOUND",
+        "DEVICE_NOT_FOUND",
+        "FLASHING_BUSY",
+        "SESSION_RECOVERING",
+        "SESSION_NOT_READY",
+        "STATE_CHANGED",
+        "NOT_READY",
+        "@last_error_passthrough"
+      ],
+      "side_effects": [
+        {
+          "what": "ATTACHED 且無 human lease 時送 ready_probe（同步 probe，TX 非冪等）",
+          "when": "on_success",
+          "idempotent": false,
+          "x-condition": "僅通過 DEVICE_NOT_BOUND／DEVICE_NOT_FOUND／FLASHING_BUSY 等拒絕 gate 後才送出；拒絕路徑零 TX",
+          "x-uart-tx": "possible"
+        },
+        {
+          "what": "裝置在且無 bridge 時 state=ATTACHING 並 spawn attach",
+          "when": "on_success",
+          "idempotent": false
+        },
+        {
+          "what": "裝置不在時 state=DETACHED、last_error=DEVICE_NOT_FOUND",
+          "when": "on_failure",
+          "idempotent": false
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": true,
+      "long_timeout": true,
+      "selector_chain": "selector>session_id>com>alias",
+      "status": "EXISTING",
+      "source": "sw_core/service.py:814-818 → attach_session sw_core/session_manager.py:2150"
+    },
+    "session.bind": {
+      "params": {
+        "selector": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "session_id": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "com": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "alias": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "device_by_id": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": "",
+          "x-aliases": [
+            "by_id"
+          ]
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "already_bound",
+          "session"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "already_bound": {
+            "type": "boolean",
+            "const": true
+          },
+          "session": {
+            "$ref": "#/$defs/SessionPublic"
+          }
+        },
+        "required": [
+          "ok",
+          "session"
+        ]
+      },
+      "errors": [
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND",
+        "FLASHING_BUSY",
+        "DEVICE_ALREADY_BOUND"
+      ],
+      "error_order": [
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND",
+        "FLASHING_BUSY",
+        "DEVICE_ALREADY_BOUND"
+      ],
+      "side_effects": [
+        {
+          "what": "detach（REBOUND）、離開 RELEASED、_binding_overrides[sid]=by_id、_save_state()、spawn attach",
+          "when": "on_success",
+          "idempotent": false
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": "selector>session_id>com>alias",
+      "status": "EXISTING",
+      "source": "sw_core/service.py:794-799 → bind_session sw_core/session_manager.py:2034"
+    },
+    "session.clear": {
+      "params": {
+        "selector": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "session_id": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "com": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "alias": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "released",
+          "session"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "released": {
+            "type": "boolean",
+            "const": true
+          },
+          "session": {
+            "$ref": "#/$defs/SessionPublic"
+          }
+        },
+        "required": [
+          "ok",
+          "session"
+        ]
+      },
+      "errors": [
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND",
+        "FLASHING_BUSY"
+      ],
+      "error_order": [
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND",
+        "FLASHING_BUSY"
+      ],
+      "side_effects": [
+        {
+          "what": "detach（last_error=CLEARED）；裝置在時 state=ATTACHING",
+          "when": "on_success",
+          "idempotent": false
+        },
+        {
+          "what": "_save_state() 與 spawn attach 執行緒",
+          "when": "on_success",
+          "idempotent": false
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": "selector>session_id>com>alias",
+      "status": "EXISTING",
+      "source": "sw_core/service.py:782-792 → clear_session sw_core/session_manager.py:1829"
+    },
+    "session.console_attach": {
+      "params": {
+        "selector": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "session_id": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "com": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "alias": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-coercion": "str(params.get(k)) if params.get(k) else None",
+          "default": null
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "client_id",
+          "label",
+          "vtty",
+          "interactive_session_id",
+          "interactive_owner",
+          "endpoint",
+          "transport",
+          "protocol",
+          "session"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "client_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[0-9a-f]{12}$"
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "vtty": {
+            "type": "string",
+            "x-note": "POSIX 為 /dev/pts/N；Windows 為 endpoint"
+          },
+          "interactive_session_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$"
+          },
+          "interactive_owner": {
+            "type": "boolean"
+          },
+          "endpoint": {
+            "type": "string",
+            "x-note": "Windows（無 PTY）時 host:port"
+          },
+          "transport": {
+            "type": "string",
+            "const": "tcp"
+          },
+          "protocol": {
+            "type": "string",
+            "const": "telnet"
+          },
+          "session": {
+            "$ref": "#/$defs/SessionPublic"
+          }
+        },
+        "required": [
+          "ok",
+          "client_id",
+          "label",
+          "vtty",
+          "session"
+        ]
+      },
+      "errors": [
+        "INVALID_ARGS",
+        "SESSION_NOT_READY"
+      ],
+      "error_order": [
+        "INVALID_ARGS",
+        "SESSION_NOT_READY"
+      ],
+      "side_effects": [
+        {
+          "what": "新增 console client；本次新開 human lease（owner human:<client_id>，timeout max(hard_timeout_s, 86400)）",
+          "when": "on_success",
+          "idempotent": false
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": true,
+      "long_timeout": true,
+      "selector_chain": "selector>session_id>com>alias",
+      "status": "EXISTING",
+      "source": "sw_core/service.py:820-825 → attach_console sw_core/session_manager.py:3945"
+    },
+    "session.console_detach": {
+      "params": {
+        "selector": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "session_id": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "com": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "alias": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "client_id": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "client_id",
+          "session"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "client_id": {
+            "type": "string"
+          },
+          "session": {
+            "$ref": "#/$defs/SessionPublic"
+          }
+        },
+        "required": [
+          "ok",
+          "client_id",
+          "session"
+        ]
+      },
+      "errors": [
+        "INVALID_ARGS",
+        "SESSION_NOT_READY",
+        "CONSOLE_NOT_FOUND"
+      ],
+      "error_order": [
+        "INVALID_ARGS",
+        "SESSION_NOT_READY",
+        "CONSOLE_NOT_FOUND"
+      ],
+      "side_effects": [
+        {
+          "what": "session 與 bridge 存在時：human lease（屬該 client）關閉、vtty_path 更新（CONSOLE_NOT_FOUND 仍執行）",
+          "when": "always",
+          "idempotent": false,
+          "x-condition": "SESSION_NOT_READY（session 或 bridge 不存在）早退前不執行"
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": "selector>session_id>com>alias",
+      "status": "EXISTING",
+      "source": "sw_core/service.py:827-832 → detach_console sw_core/session_manager.py:3978"
+    },
+    "session.console_list": {
+      "params": {
+        "selector": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "session_id": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "com": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "alias": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "consoles",
+          "session"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "consoles": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/ConsoleRow"
+            }
+          },
+          "session": {
+            "$ref": "#/$defs/SessionPublic"
+          }
+        },
+        "required": [
+          "ok",
+          "consoles",
+          "session"
+        ]
+      },
+      "errors": [
+        "INVALID_ARGS",
+        "SESSION_NOT_READY"
+      ],
+      "error_order": [
+        "INVALID_ARGS",
+        "SESSION_NOT_READY"
+      ],
+      "side_effects": [
+        {
+          "what": "list_consoles prune 已失效 console（冪等）",
+          "when": "always",
+          "idempotent": true
+        }
+      ],
+      "retryable_readonly": true,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": "selector>session_id>com>alias",
+      "status": "EXISTING",
+      "source": "sw_core/service.py:834-838 → list_consoles sw_core/session_manager.py:4002"
+    },
+    "session.get_state": {
+      "params": {
+        "selector": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "session"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "session": {
+            "$ref": "#/$defs/SessionPublic"
+          }
+        },
+        "required": [
+          "ok",
+          "session"
+        ]
+      },
+      "errors": [
+        "SESSION_NOT_FOUND"
+      ],
+      "error_order": [
+        "SESSION_NOT_FOUND"
+      ],
+      "side_effects": [
+        {
+          "what": "session.expire_ready_reconfirm()：pending 逾時或逾次時翻 ready_reconfirm_failed（冪等）",
+          "when": "always",
+          "idempotent": true
+        },
+        {
+          "what": "to_public_dict 觸發 console prune（冪等）",
+          "when": "always",
+          "idempotent": true
+        }
+      ],
+      "retryable_readonly": true,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": "selector",
+      "status": "EXISTING",
+      "source": "sw_core/service.py:746-748 → get_session_state sw_core/session_manager.py:3934"
+    },
+    "session.interactive_close": {
+      "params": {
+        "interactive_id": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "interactive_id"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "interactive_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$"
+          }
+        },
+        "required": [
+          "ok",
+          "interactive_id"
+        ]
+      },
+      "errors": [
+        "INVALID_ARGS",
+        "INTERACTIVE_NOT_FOUND"
+      ],
+      "error_order": [
+        "INVALID_ARGS",
+        "INTERACTIVE_NOT_FOUND"
+      ],
+      "side_effects": [
+        {
+          "what": "關閉 lease、還原 stashed human lease、resume interactive；session 不在時直接移除",
+          "when": "on_success",
+          "idempotent": false
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": null,
+      "status": "EXISTING",
+      "source": "sw_core/service.py:865-869 → interactive_close sw_core/session_manager.py:4272"
+    },
+    "session.interactive_open": {
+      "params": {
+        "selector": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "session_id": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "com": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "alias": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "owner": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"agent\")",
+          "default": "agent"
+        },
+        "timeout_s": {
+          "type": "number",
+          "x-coercion": "float(params.get(k) or 60.0)",
+          "default": 60.0
+        },
+        "command": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "allow_attached": {
+          "type": "boolean",
+          "x-coercion": "bool(params.get(k))",
+          "default": false
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "interactive_id",
+          "session",
+          "recovery_mode",
+          "soft_preempted",
+          "boot_interrupt",
+          "login_required"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "interactive_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$"
+          },
+          "session": {
+            "$ref": "#/$defs/SessionPublic"
+          },
+          "recovery_mode": {
+            "type": "boolean"
+          },
+          "soft_preempted": {
+            "type": "boolean",
+            "const": true
+          },
+          "boot_interrupt": {
+            "type": "boolean",
+            "const": true
+          },
+          "login_required": {
+            "type": "boolean",
+            "const": true
+          }
+        },
+        "required": [
+          "ok",
+          "interactive_id",
+          "session",
+          "recovery_mode"
+        ]
+      },
+      "errors": [
+        "INVALID_ARGS",
+        "SESSION_NOT_READY",
+        "SESSION_BUSY",
+        "SESSION_INTERACTIVE_BUSY"
+      ],
+      "error_order": [
+        "INVALID_ARGS",
+        "SESSION_NOT_READY",
+        "SESSION_BUSY",
+        "SESSION_INTERACTIVE_BUSY"
+      ],
+      "side_effects": [
+        {
+          "what": "開 interactive lease；可能 suspend human 輸入",
+          "when": "on_success",
+          "idempotent": false
+        },
+        {
+          "what": "command 非空時 bridge.send_command(command, source=owner)，TX 非冪等",
+          "when": "on_success",
+          "idempotent": false
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": "selector>session_id>com>alias",
+      "status": "EXISTING",
+      "source": "sw_core/service.py:840-848 → interactive_open sw_core/session_manager.py:4009",
+      "x-notes": {
+        "flashing_check": "未檢查 FLASHING（FLASHING 狀態走其他狀態 → SESSION_NOT_READY）；不列為副作用",
+        "coercion_exception_precedes_validation": "轉型例外（EXCEPTION）先於 INVALID_ARGS 驗證（02 §5.2）；errors／error_order 無法表示此先後，故註記於此"
+      }
+    },
+    "session.interactive_send": {
+      "params": {
+        "interactive_id": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "data": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "encoding": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"plain\")",
+          "default": "plain"
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "interactive_id",
+          "bytes"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "interactive_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$"
+          },
+          "bytes": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "ok",
+          "interactive_id",
+          "bytes"
+        ]
+      },
+      "errors": [
+        "INVALID_ARGS",
+        "INTERACTIVE_NOT_FOUND",
+        "INTERACTIVE_EXPIRED",
+        "SESSION_NOT_READY",
+        "FLASHING_BUSY",
+        "SESSION_BUSY"
+      ],
+      "error_order": [
+        "INVALID_ARGS",
+        "INTERACTIVE_NOT_FOUND",
+        "INTERACTIVE_EXPIRED",
+        "SESSION_NOT_READY",
+        "FLASHING_BUSY",
+        "SESSION_BUSY"
+      ],
+      "side_effects": [
+        {
+          "what": "send_bytes 到 UART（source=lease.owner），TX 非冪等",
+          "when": "on_success",
+          "idempotent": false
+        },
+        {
+          "what": "lease.touch() 延長租約",
+          "when": "on_success",
+          "idempotent": false
+        },
+        {
+          "what": "encoding 非法時 raise ValueError → EXCEPTION（無 version）",
+          "when": "on_failure",
+          "idempotent": false
+        },
+        {
+          "what": "lease 已逾時：標記 status=expired 並關閉 lease（_close_interactive_locked）",
+          "when": "on_failure",
+          "idempotent": false
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": null,
+      "status": "EXISTING",
+      "source": "sw_core/service.py:850-856 → interactive_send sw_core/session_manager.py:4212"
+    },
+    "session.interactive_status": {
+      "params": {
+        "interactive_id": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "screen_chars": {
+          "type": "integer",
+          "x-coercion": "int(params.get(k) or 2048)",
+          "default": 2048
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "interactive_id",
+          "owner",
+          "status",
+          "recovery_mode",
+          "screen",
+          "session"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "interactive_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$"
+          },
+          "owner": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "recovery_mode": {
+            "type": "boolean"
+          },
+          "screen": {
+            "type": "string"
+          },
+          "session": {
+            "$ref": "#/$defs/SessionPublic"
+          }
+        },
+        "required": [
+          "ok",
+          "interactive_id",
+          "owner",
+          "status",
+          "recovery_mode",
+          "screen",
+          "session"
+        ]
+      },
+      "errors": [
+        "INVALID_ARGS",
+        "INTERACTIVE_NOT_FOUND",
+        "SESSION_NOT_READY",
+        "INTERACTIVE_EXPIRED"
+      ],
+      "error_order": [
+        "INVALID_ARGS",
+        "INTERACTIVE_NOT_FOUND",
+        "SESSION_NOT_READY",
+        "INTERACTIVE_EXPIRED"
+      ],
+      "side_effects": [
+        {
+          "what": "lease.touch() 延長租約（spec §4.2 明列不可重試之理由）",
+          "when": "on_success",
+          "idempotent": false
+        },
+        {
+          "what": "lease 已逾時：標記 status=expired 並關閉 lease（_close_interactive_locked）",
+          "when": "on_failure",
+          "idempotent": false
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": null,
+      "status": "EXISTING",
+      "source": "sw_core/service.py:858-863 → interactive_status sw_core/session_manager.py:4243",
+      "x-notes": {
+        "coercion_exception_precedes_validation": "轉型例外（EXCEPTION）先於 INVALID_ARGS 驗證（02 §5.2）；errors／error_order 無法表示此先後，故註記於此"
+      }
+    },
+    "session.list": {
+      "params": {},
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "sessions"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "sessions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/SessionPublic"
+            }
+          }
+        },
+        "required": [
+          "ok",
+          "sessions"
+        ]
+      },
+      "errors": [],
+      "error_order": [],
+      "side_effects": [
+        {
+          "what": "每個 session 的 to_public_dict 讀 bridge.list_consoles，prune 已失效 console（冪等）",
+          "when": "always",
+          "idempotent": true
+        },
+        {
+          "what": "不主動評估 ready_reconfirm（GAP-G-13）；到期翻轉需待 1 s tick",
+          "when": "always",
+          "idempotent": true
+        }
+      ],
+      "retryable_readonly": true,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": null,
+      "status": "EXISTING",
+      "source": "sw_core/service.py:743; sessions sorted by session_id"
+    },
+    "session.log_start": {
+      "params": {
+        "selector": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "session_id": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "com": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "alias": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "already_active",
+          "capture_id",
+          "log_path",
+          "session"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "already_active": {
+            "type": "boolean",
+            "const": true
+          },
+          "capture_id": {
+            "type": "string"
+          },
+          "log_path": {
+            "type": "string"
+          },
+          "session": {
+            "$ref": "#/$defs/SessionPublic"
+          }
+        },
+        "required": [
+          "ok",
+          "capture_id",
+          "log_path",
+          "session"
+        ]
+      },
+      "errors": [
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND",
+        "LOG_OPEN_FAILED"
+      ],
+      "error_order": [
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND",
+        "LOG_OPEN_FAILED"
+      ],
+      "side_effects": [
+        {
+          "what": "以 append 開啟 {log_dir}/{COM}_{時間}.log；os.makedirs 失敗未被攔（EXCEPTION，H-11）",
+          "when": "on_success",
+          "idempotent": false
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": "selector>session_id>com>alias",
+      "status": "EXISTING",
+      "source": "sw_core/service.py:1051-1055 → log_start sw_core/session_manager.py:4764"
+    },
+    "session.log_status": {
+      "params": {
+        "selector": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "session_id": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "com": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "alias": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "active",
+          "capture_id",
+          "log_path",
+          "line_count",
+          "byte_count",
+          "started_at",
+          "session"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "active": {
+            "type": "boolean"
+          },
+          "capture_id": {
+            "type": "string",
+            "x-note": "uuid4（含連字號）"
+          },
+          "log_path": {
+            "type": "string"
+          },
+          "line_count": {
+            "type": "integer"
+          },
+          "byte_count": {
+            "type": "integer"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "session": {
+            "$ref": "#/$defs/SessionPublic"
+          }
+        },
+        "required": [
+          "ok",
+          "active",
+          "session"
+        ]
+      },
+      "errors": [
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND"
+      ],
+      "error_order": [
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND"
+      ],
+      "side_effects": [
+        {
+          "what": "to_public_dict 觸發 console prune（冪等）",
+          "when": "always",
+          "idempotent": true
+        }
+      ],
+      "retryable_readonly": true,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": "selector>session_id>com>alias",
+      "status": "EXISTING",
+      "source": "sw_core/service.py:1063-1067 → log_status sw_core/session_manager.py:4822"
+    },
+    "session.log_stop": {
+      "params": {
+        "selector": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "session_id": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "com": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "alias": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "capture_id",
+          "log_path",
+          "line_count",
+          "byte_count",
+          "started_at"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "capture_id": {
+            "type": "string"
+          },
+          "log_path": {
+            "type": "string"
+          },
+          "line_count": {
+            "type": "integer"
+          },
+          "byte_count": {
+            "type": "integer"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "ok",
+          "capture_id",
+          "log_path",
+          "line_count",
+          "byte_count",
+          "started_at"
+        ]
+      },
+      "errors": [
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND",
+        "NO_ACTIVE_CAPTURE"
+      ],
+      "error_order": [
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND",
+        "NO_ACTIVE_CAPTURE"
+      ],
+      "side_effects": [
+        {
+          "what": "停止 capture 並關閉檔案",
+          "when": "on_success",
+          "idempotent": false
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": "selector>session_id>com>alias",
+      "status": "EXISTING",
+      "source": "sw_core/service.py:1057-1061 → log_stop sw_core/session_manager.py:4803"
+    },
+    "session.pin": {
+      "params": {
+        "selector": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "session_id": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "com": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "alias": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "profile": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": "",
+          "x-aliases": [
+            "profile_name"
+          ]
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "device_key",
+          "profile"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "device_key": {
+            "type": "string"
+          },
+          "profile": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ok",
+          "device_key",
+          "profile"
+        ]
+      },
+      "errors": [
+        "INVALID_ARGS",
+        "UNKNOWN_PROFILE",
+        "DEVICE_NOT_FOUND",
+        "PROFILE_IS_EXPLICIT"
+      ],
+      "error_order": [
+        "INVALID_ARGS",
+        "UNKNOWN_PROFILE",
+        "DEVICE_NOT_FOUND",
+        "PROFILE_IS_EXPLICIT"
+      ],
+      "side_effects": [
+        {
+          "what": "_profile_pins 寫入、_save_state()（不 reattach；需 session.clear 套用）",
+          "when": "on_success",
+          "idempotent": false
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": "selector>session_id>com>alias",
+      "status": "EXISTING",
+      "source": "sw_core/service.py:801-806 → pin_session sw_core/session_manager.py:2111"
+    },
+    "session.recover": {
+      "params": {
+        "selector": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "session_id": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "com": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "alias": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "timeout_s": {
+          "type": "number",
+          "x-coercion": "float(params.get(k) or 2.0)",
+          "default": 2.0
+        },
+        "force": {
+          "type": "boolean",
+          "x-coercion": "bool(params.get(k))",
+          "default": false
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-note": "session.recover 回應：依分支 oneOf；每分支 x-order 對應 session_manager.py 字面 dict／payload 的鍵序（REPROBE 為 payload 逐步加鍵）",
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "x-note": "所有分支共同欄位"
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "oneOf": [
+          {
+            "type": "object",
+            "x-branch": "SESSION_NOT_FOUND",
+            "x-order": [
+              "ok",
+              "error_code",
+              "selector"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean",
+                "const": false
+              },
+              "error_code": {
+                "type": "string",
+                "const": "SESSION_NOT_FOUND"
+              },
+              "selector": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "ok",
+              "error_code",
+              "selector"
+            ]
+          },
+          {
+            "type": "object",
+            "x-branch": "RELEASED",
+            "x-order": [
+              "ok",
+              "released",
+              "recommended_action",
+              "session"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean",
+                "const": true
+              },
+              "released": {
+                "type": "boolean",
+                "const": true
+              },
+              "recommended_action": {
+                "type": "string"
+              },
+              "session": {
+                "$ref": "#/$defs/SessionPublic"
+              }
+            },
+            "required": [
+              "ok",
+              "released",
+              "recommended_action",
+              "session"
+            ]
+          },
+          {
+            "type": "object",
+            "x-branch": "FLASHING_BUSY",
+            "x-order": [
+              "ok",
+              "error_code",
+              "selector",
+              "session"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean",
+                "const": false
+              },
+              "error_code": {
+                "type": "string",
+                "const": "FLASHING_BUSY"
+              },
+              "selector": {
+                "type": "string"
+              },
+              "session": {
+                "$ref": "#/$defs/SessionPublic"
+              }
+            },
+            "required": [
+              "ok",
+              "error_code",
+              "selector",
+              "session"
+            ]
+          },
+          {
+            "type": "object",
+            "x-branch": "REATTACH",
+            "x-order": [
+              "ok",
+              "recovering",
+              "action",
+              "session"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean",
+                "const": true
+              },
+              "recovering": {
+                "type": "boolean",
+                "const": false
+              },
+              "action": {
+                "type": "string",
+                "const": "REATTACH"
+              },
+              "session": {
+                "$ref": "#/$defs/SessionPublic"
+              }
+            },
+            "required": [
+              "ok",
+              "recovering",
+              "action",
+              "session"
+            ]
+          },
+          {
+            "type": "object",
+            "x-branch": "SESSION_NOT_READY",
+            "x-order": [
+              "ok",
+              "error_code",
+              "session"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean",
+                "const": false
+              },
+              "error_code": {
+                "type": "string",
+                "const": "SESSION_NOT_READY"
+              },
+              "session": {
+                "$ref": "#/$defs/SessionPublic"
+              }
+            },
+            "required": [
+              "ok",
+              "error_code",
+              "session"
+            ]
+          },
+          {
+            "type": "object",
+            "x-branch": "FORCE_CLEAR_REATTACH_OK",
+            "x-order": [
+              "ok",
+              "recovering",
+              "action",
+              "recovered",
+              "session"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean",
+                "const": true
+              },
+              "recovering": {
+                "type": "boolean",
+                "const": false
+              },
+              "action": {
+                "type": "string",
+                "const": "FORCE_CLEAR_REATTACH"
+              },
+              "recovered": {
+                "type": "boolean",
+                "const": true
+              },
+              "session": {
+                "$ref": "#/$defs/SessionPublic"
+              }
+            },
+            "required": [
+              "ok",
+              "recovering",
+              "action",
+              "recovered",
+              "session"
+            ]
+          },
+          {
+            "type": "object",
+            "x-branch": "FORCE_RECOVER_TIMEOUT",
+            "x-order": [
+              "ok",
+              "error_code",
+              "action",
+              "recovered",
+              "session"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean",
+                "const": false
+              },
+              "error_code": {
+                "type": "string",
+                "const": "FORCE_RECOVER_TIMEOUT"
+              },
+              "action": {
+                "type": "string",
+                "const": "FORCE_CLEAR_REATTACH"
+              },
+              "recovered": {
+                "type": "boolean",
+                "const": false
+              },
+              "session": {
+                "type": "object",
+                "x-note": "失敗分支：查無 session 時為 {}（state.get('session', {})）"
+              }
+            },
+            "required": [
+              "ok",
+              "error_code",
+              "action",
+              "recovered",
+              "session"
+            ]
+          },
+          {
+            "type": "object",
+            "x-branch": "REPROBE",
+            "x-order": [
+              "ok",
+              "recovering",
+              "action",
+              "recovered",
+              "session",
+              "error_code",
+              "classification",
+              "recommended_action",
+              "matched_prompt"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean",
+                "const": true
+              },
+              "recovering": {
+                "type": "boolean",
+                "const": false
+              },
+              "action": {
+                "type": "string",
+                "const": "REPROBE"
+              },
+              "recovered": {
+                "type": "boolean"
+              },
+              "session": {
+                "$ref": "#/$defs/SessionPublic"
+              },
+              "error_code": {
+                "type": "string"
+              },
+              "classification": {
+                "type": "string"
+              },
+              "recommended_action": {
+                "type": "string"
+              },
+              "matched_prompt": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "ok",
+              "recovering",
+              "action",
+              "recovered",
+              "session"
+            ]
+          },
+          {
+            "type": "object",
+            "x-branch": "PROBE_FAILED_PASSTHROUGH",
+            "x-order": [
+              "ok",
+              "error_code",
+              "session"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean",
+                "const": false
+              },
+              "error_code": {
+                "type": "string"
+              },
+              "session": {
+                "$ref": "#/$defs/SessionPublic"
+              }
+            },
+            "required": [
+              "ok",
+              "error_code"
+            ]
+          },
+          {
+            "type": "object",
+            "x-branch": "AFTER_FAILURE_PARTIAL",
+            "x-order": [
+              "ok",
+              "error_code",
+              "partial",
+              "recovery_action"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean",
+                "const": false
+              },
+              "error_code": {
+                "type": "string"
+              },
+              "partial": {
+                "type": "boolean"
+              },
+              "recovery_action": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "ok",
+              "error_code",
+              "partial",
+              "recovery_action"
+            ]
+          },
+          {
+            "type": "object",
+            "x-branch": "AFTER_FAILURE_STDOUT",
+            "x-order": [
+              "ok",
+              "error_code",
+              "stdout",
+              "partial",
+              "recovery_action"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean",
+                "const": false
+              },
+              "error_code": {
+                "type": "string"
+              },
+              "stdout": {
+                "type": "string"
+              },
+              "partial": {
+                "type": "boolean"
+              },
+              "recovery_action": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "ok",
+              "error_code",
+              "stdout",
+              "partial",
+              "recovery_action"
+            ]
+          },
+          {
+            "type": "object",
+            "x-branch": "AFTER_FAILURE_SESSION",
+            "x-order": [
+              "ok",
+              "error_code",
+              "partial",
+              "recovery_action",
+              "session"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean",
+                "const": false
+              },
+              "error_code": {
+                "type": "string"
+              },
+              "partial": {
+                "type": "boolean"
+              },
+              "recovery_action": {
+                "type": "string"
+              },
+              "session": {
+                "$ref": "#/$defs/SessionPublic"
+              }
+            },
+            "required": [
+              "ok",
+              "error_code",
+              "partial",
+              "recovery_action",
+              "session"
+            ]
+          },
+          {
+            "type": "object",
+            "x-branch": "AFTER_FAILURE_EXECUTION_MODE",
+            "x-order": [
+              "ok",
+              "execution_mode",
+              "interactive_session_id",
+              "status",
+              "stdout",
+              "partial",
+              "recovery_action"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean",
+                "const": true
+              },
+              "execution_mode": {
+                "type": "string"
+              },
+              "interactive_session_id": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              },
+              "stdout": {
+                "type": "string"
+              },
+              "partial": {
+                "type": "boolean"
+              },
+              "recovery_action": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "ok",
+              "execution_mode",
+              "interactive_session_id",
+              "status",
+              "stdout",
+              "partial",
+              "recovery_action"
+            ]
+          }
+        ]
+      },
+      "errors": [
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND",
+        "FLASHING_BUSY",
+        "SESSION_NOT_READY",
+        "STATE_CHANGED",
+        "FORCE_RECOVER_TIMEOUT",
+        "PROMPT_TIMEOUT",
+        "PROMPT_TIMEOUT_RECOVERED",
+        "PROMPT_TIMEOUT_FORCE_RECOVERED",
+        "@last_error_passthrough"
+      ],
+      "error_order": [
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND",
+        "FLASHING_BUSY",
+        "SESSION_NOT_READY",
+        "STATE_CHANGED",
+        "FORCE_RECOVER_TIMEOUT",
+        "PROMPT_TIMEOUT",
+        "PROMPT_TIMEOUT_RECOVERED",
+        "PROMPT_TIMEOUT_FORCE_RECOVERED",
+        "@last_error_passthrough"
+      ],
+      "side_effects": [
+        {
+          "what": "CTRL_C／CTRL_D（每個等 min(timeout_s, 2.0)）或 probe 送 UART；TX 非冪等",
+          "when": "on_success",
+          "idempotent": false,
+          "x-condition": "僅通過 INVALID_ARGS／SESSION_NOT_FOUND／FLASHING_BUSY／SESSION_NOT_READY 等拒絕 gate 後才送出；拒絕路徑零 TX",
+          "x-uart-tx": "possible"
+        },
+        {
+          "what": "成功 READY 路徑 flush 該 session 排隊命令（FLUSHED_BY_RECOVERY）",
+          "when": "on_success",
+          "idempotent": false
+        },
+        {
+          "what": "clear 路徑：clear_session、credentials_warned=False、_save_state()、reprobe 重置",
+          "when": "on_success",
+          "idempotent": false
+        },
+        {
+          "what": "force 路徑最多 10 次、每次 1 s 輪詢 READY",
+          "when": "always",
+          "idempotent": false,
+          "x-condition": "僅 force=true 且前述路徑失敗後進入"
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": true,
+      "long_timeout": true,
+      "selector_chain": "selector>session_id>com>alias",
+      "status": "EXISTING",
+      "source": "sw_core/service.py:774-780 → recover_session sw_core/session_manager.py:4582",
+      "x-notes": {
+        "coercion_exception_precedes_validation": "轉型例外（EXCEPTION）先於 INVALID_ARGS 驗證（02 §5.2）；errors／error_order 無法表示此先後，故註記於此"
+      }
+    },
+    "session.self_test": {
+      "params": {
+        "selector": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "session_id": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "com": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "alias": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "timeout_s": {
+          "type": "number",
+          "x-coercion": "float(params.get(k) or 2.0)",
+          "default": 2.0
+        },
+        "strict_human_lock": {
+          "type": "boolean",
+          "x-coercion": "_coerce_rpc_bool(params.get(k))",
+          "default": false,
+          "x-notes": {
+            "truthy_strings": [
+              "1",
+              "true",
+              "yes",
+              "on"
+            ],
+            "rule": "字串先 strip+lower，僅上述集合為真，其餘字串為假；int 非零為真；None 為假；其餘型別 bool()"
+          }
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-note": "session.self_test 回應：依分支以 oneOf 驗證；各分支 x-order 對應 session_manager.py 字面 dict 的鍵序，command_capable 於 wrapper self_test() 最後追加",
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "x-note": "所有分支共同欄位"
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "oneOf": [
+          {
+            "type": "object",
+            "x-branch": "SESSION_NOT_FOUND",
+            "x-order": [
+              "ok",
+              "error_code",
+              "selector",
+              "interactive_owner",
+              "human_attached",
+              "human_active",
+              "recovery_mode",
+              "command_capable"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean",
+                "const": false
+              },
+              "error_code": {
+                "type": "string",
+                "const": "SESSION_NOT_FOUND"
+              },
+              "selector": {
+                "type": "string",
+                "x-note": "僅 SESSION_NOT_FOUND 分支（ok:false）；成功分支不含"
+              },
+              "interactive_owner": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "x-note": "lease 擁有者（human:<client>／agent 等）；無 lease 為 null"
+              },
+              "human_attached": {
+                "type": "boolean",
+                "x-updated-by": "請求當下由 lease.owner 是否以 human: 開頭判定"
+              },
+              "human_active": {
+                "type": "boolean",
+                "x-unit": "s（判定窗 HUMAN_ACTIVE_WINDOW_S=60.0）",
+                "x-updated-by": "請求當下由 bridge.last_human_input_at 與 time.monotonic() 判定（session_manager.py _lease_context）"
+              },
+              "recovery_mode": {
+                "type": "boolean"
+              },
+              "command_capable": {
+                "type": "boolean",
+                "x-note": "由 wrapper self_test() 於所有分支最外層追加（session_manager.py）"
+              }
+            },
+            "required": [
+              "ok",
+              "error_code",
+              "selector",
+              "interactive_owner",
+              "human_attached",
+              "human_active",
+              "recovery_mode",
+              "command_capable"
+            ]
+          },
+          {
+            "type": "object",
+            "x-branch": "RELEASED",
+            "x-order": [
+              "ok",
+              "classification",
+              "session",
+              "released_by",
+              "released_at",
+              "reason",
+              "external_holder",
+              "reclaimable",
+              "recommended_action",
+              "interactive_owner",
+              "human_attached",
+              "human_active",
+              "recovery_mode",
+              "command_capable"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean",
+                "const": true
+              },
+              "classification": {
+                "type": "string",
+                "const": "RELEASED"
+              },
+              "session": {
+                "$ref": "#/$defs/SessionPublic"
+              },
+              "released_by": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "released_at": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "date-time"
+              },
+              "reason": {
+                "type": [
+                  "string",
+                  "number",
+                  "boolean",
+                  "object",
+                  "array",
+                  "null"
+                ]
+              },
+              "external_holder": {
+                "anyOf": [
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "integer"
+                    }
+                  },
+                  {
+                    "const": "none"
+                  }
+                ]
+              },
+              "reclaimable": {
+                "type": "boolean"
+              },
+              "recommended_action": {
+                "type": "string",
+                "enum": [
+                  "wait",
+                  "wait_or_detach_console",
+                  "check_cable_or_bind",
+                  "reattach",
+                  "attach",
+                  "recover",
+                  "console_attach",
+                  "pin_profile",
+                  "wait_or_console_attach",
+                  "recover_interactive",
+                  "none",
+                  "device_attach",
+                  "wait_external_flash",
+                  "self_test"
+                ]
+              },
+              "interactive_owner": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "x-note": "lease 擁有者（human:<client>／agent 等）；無 lease 為 null"
+              },
+              "human_attached": {
+                "type": "boolean",
+                "x-updated-by": "請求當下由 lease.owner 是否以 human: 開頭判定"
+              },
+              "human_active": {
+                "type": "boolean",
+                "x-unit": "s（判定窗 HUMAN_ACTIVE_WINDOW_S=60.0）",
+                "x-updated-by": "請求當下由 bridge.last_human_input_at 與 time.monotonic() 判定（session_manager.py _lease_context）"
+              },
+              "recovery_mode": {
+                "type": "boolean"
+              },
+              "command_capable": {
+                "type": "boolean",
+                "x-note": "由 wrapper self_test() 於所有分支最外層追加（session_manager.py）"
+              }
+            },
+            "required": [
+              "ok",
+              "classification",
+              "session",
+              "released_by",
+              "released_at",
+              "reason",
+              "external_holder",
+              "reclaimable",
+              "recommended_action",
+              "interactive_owner",
+              "human_attached",
+              "human_active",
+              "recovery_mode",
+              "command_capable"
+            ]
+          },
+          {
+            "type": "object",
+            "x-branch": "SESSION_RECOVERING",
+            "x-order": [
+              "ok",
+              "classification",
+              "session",
+              "recommended_action",
+              "interactive_owner",
+              "human_attached",
+              "human_active",
+              "recovery_mode",
+              "command_capable"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean",
+                "const": true
+              },
+              "classification": {
+                "type": "string",
+                "const": "SESSION_RECOVERING"
+              },
+              "session": {
+                "$ref": "#/$defs/SessionPublic"
+              },
+              "recommended_action": {
+                "type": "string",
+                "enum": [
+                  "wait",
+                  "wait_or_detach_console",
+                  "check_cable_or_bind",
+                  "reattach",
+                  "attach",
+                  "recover",
+                  "console_attach",
+                  "pin_profile",
+                  "wait_or_console_attach",
+                  "recover_interactive",
+                  "none",
+                  "device_attach",
+                  "wait_external_flash",
+                  "self_test"
+                ]
+              },
+              "interactive_owner": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "x-note": "lease 擁有者（human:<client>／agent 等）；無 lease 為 null"
+              },
+              "human_attached": {
+                "type": "boolean",
+                "x-updated-by": "請求當下由 lease.owner 是否以 human: 開頭判定"
+              },
+              "human_active": {
+                "type": "boolean",
+                "x-unit": "s（判定窗 HUMAN_ACTIVE_WINDOW_S=60.0）",
+                "x-updated-by": "請求當下由 bridge.last_human_input_at 與 time.monotonic() 判定（session_manager.py _lease_context）"
+              },
+              "recovery_mode": {
+                "type": "boolean"
+              },
+              "command_capable": {
+                "type": "boolean",
+                "x-note": "由 wrapper self_test() 於所有分支最外層追加（session_manager.py）"
+              }
+            },
+            "required": [
+              "ok",
+              "classification",
+              "session",
+              "recommended_action",
+              "interactive_owner",
+              "human_attached",
+              "human_active",
+              "recovery_mode",
+              "command_capable"
+            ]
+          },
+          {
+            "type": "object",
+            "x-branch": "HUMAN_INTERACTIVE_ACTIVE",
+            "x-order": [
+              "ok",
+              "classification",
+              "interactive_id",
+              "session",
+              "recommended_action",
+              "interactive_owner",
+              "human_attached",
+              "human_active",
+              "recovery_mode",
+              "command_capable"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean",
+                "const": true
+              },
+              "classification": {
+                "type": "string",
+                "const": "HUMAN_INTERACTIVE_ACTIVE"
+              },
+              "interactive_id": {
+                "type": "string"
+              },
+              "session": {
+                "$ref": "#/$defs/SessionPublic"
+              },
+              "recommended_action": {
+                "type": "string",
+                "enum": [
+                  "wait",
+                  "wait_or_detach_console",
+                  "check_cable_or_bind",
+                  "reattach",
+                  "attach",
+                  "recover",
+                  "console_attach",
+                  "pin_profile",
+                  "wait_or_console_attach",
+                  "recover_interactive",
+                  "none",
+                  "device_attach",
+                  "wait_external_flash",
+                  "self_test"
+                ]
+              },
+              "interactive_owner": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "x-note": "lease 擁有者（human:<client>／agent 等）；無 lease 為 null"
+              },
+              "human_attached": {
+                "type": "boolean",
+                "x-updated-by": "請求當下由 lease.owner 是否以 human: 開頭判定"
+              },
+              "human_active": {
+                "type": "boolean",
+                "x-unit": "s（判定窗 HUMAN_ACTIVE_WINDOW_S=60.0）",
+                "x-updated-by": "請求當下由 bridge.last_human_input_at 與 time.monotonic() 判定（session_manager.py _lease_context）"
+              },
+              "recovery_mode": {
+                "type": "boolean"
+              },
+              "command_capable": {
+                "type": "boolean",
+                "x-note": "由 wrapper self_test() 於所有分支最外層追加（session_manager.py）"
+              }
+            },
+            "required": [
+              "ok",
+              "classification",
+              "interactive_id",
+              "session",
+              "recommended_action",
+              "interactive_owner",
+              "human_attached",
+              "human_active",
+              "recovery_mode",
+              "command_capable"
+            ]
+          },
+          {
+            "type": "object",
+            "x-branch": "DEVICE_MISSING",
+            "x-order": [
+              "ok",
+              "classification",
+              "session",
+              "recommended_action",
+              "interactive_owner",
+              "human_attached",
+              "human_active",
+              "recovery_mode",
+              "command_capable"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean",
+                "const": true
+              },
+              "classification": {
+                "type": "string",
+                "const": "DEVICE_MISSING"
+              },
+              "session": {
+                "$ref": "#/$defs/SessionPublic"
+              },
+              "recommended_action": {
+                "type": "string",
+                "enum": [
+                  "wait",
+                  "wait_or_detach_console",
+                  "check_cable_or_bind",
+                  "reattach",
+                  "attach",
+                  "recover",
+                  "console_attach",
+                  "pin_profile",
+                  "wait_or_console_attach",
+                  "recover_interactive",
+                  "none",
+                  "device_attach",
+                  "wait_external_flash",
+                  "self_test"
+                ]
+              },
+              "interactive_owner": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "x-note": "lease 擁有者（human:<client>／agent 等）；無 lease 為 null"
+              },
+              "human_attached": {
+                "type": "boolean",
+                "x-updated-by": "請求當下由 lease.owner 是否以 human: 開頭判定"
+              },
+              "human_active": {
+                "type": "boolean",
+                "x-unit": "s（判定窗 HUMAN_ACTIVE_WINDOW_S=60.0）",
+                "x-updated-by": "請求當下由 bridge.last_human_input_at 與 time.monotonic() 判定（session_manager.py _lease_context）"
+              },
+              "recovery_mode": {
+                "type": "boolean"
+              },
+              "command_capable": {
+                "type": "boolean",
+                "x-note": "由 wrapper self_test() 於所有分支最外層追加（session_manager.py）"
+              }
+            },
+            "required": [
+              "ok",
+              "classification",
+              "session",
+              "recommended_action",
+              "interactive_owner",
+              "human_attached",
+              "human_active",
+              "recovery_mode",
+              "command_capable"
+            ]
+          },
+          {
+            "type": "object",
+            "x-branch": "DEVICE_REBOUND_REQUIRED",
+            "x-order": [
+              "ok",
+              "classification",
+              "session",
+              "attached_real_path",
+              "current_real_path",
+              "recommended_action",
+              "interactive_owner",
+              "human_attached",
+              "human_active",
+              "recovery_mode",
+              "command_capable"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean",
+                "const": true
+              },
+              "classification": {
+                "type": "string",
+                "const": "DEVICE_REBOUND_REQUIRED"
+              },
+              "session": {
+                "$ref": "#/$defs/SessionPublic"
+              },
+              "attached_real_path": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "current_real_path": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "recommended_action": {
+                "type": "string",
+                "enum": [
+                  "wait",
+                  "wait_or_detach_console",
+                  "check_cable_or_bind",
+                  "reattach",
+                  "attach",
+                  "recover",
+                  "console_attach",
+                  "pin_profile",
+                  "wait_or_console_attach",
+                  "recover_interactive",
+                  "none",
+                  "device_attach",
+                  "wait_external_flash",
+                  "self_test"
+                ]
+              },
+              "interactive_owner": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "x-note": "lease 擁有者（human:<client>／agent 等）；無 lease 為 null"
+              },
+              "human_attached": {
+                "type": "boolean",
+                "x-updated-by": "請求當下由 lease.owner 是否以 human: 開頭判定"
+              },
+              "human_active": {
+                "type": "boolean",
+                "x-unit": "s（判定窗 HUMAN_ACTIVE_WINDOW_S=60.0）",
+                "x-updated-by": "請求當下由 bridge.last_human_input_at 與 time.monotonic() 判定（session_manager.py _lease_context）"
+              },
+              "recovery_mode": {
+                "type": "boolean"
+              },
+              "command_capable": {
+                "type": "boolean",
+                "x-note": "由 wrapper self_test() 於所有分支最外層追加（session_manager.py）"
+              }
+            },
+            "required": [
+              "ok",
+              "classification",
+              "session",
+              "attached_real_path",
+              "current_real_path",
+              "recommended_action",
+              "interactive_owner",
+              "human_attached",
+              "human_active",
+              "recovery_mode",
+              "command_capable"
+            ]
+          },
+          {
+            "type": "object",
+            "x-branch": "BRIDGE_DOWN",
+            "x-order": [
+              "ok",
+              "classification",
+              "session",
+              "current_real_path",
+              "recommended_action",
+              "interactive_owner",
+              "human_attached",
+              "human_active",
+              "recovery_mode",
+              "command_capable"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean",
+                "const": true
+              },
+              "classification": {
+                "type": "string",
+                "const": "BRIDGE_DOWN"
+              },
+              "session": {
+                "$ref": "#/$defs/SessionPublic"
+              },
+              "current_real_path": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "recommended_action": {
+                "type": "string",
+                "enum": [
+                  "wait",
+                  "wait_or_detach_console",
+                  "check_cable_or_bind",
+                  "reattach",
+                  "attach",
+                  "recover",
+                  "console_attach",
+                  "pin_profile",
+                  "wait_or_console_attach",
+                  "recover_interactive",
+                  "none",
+                  "device_attach",
+                  "wait_external_flash",
+                  "self_test"
+                ]
+              },
+              "interactive_owner": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "x-note": "lease 擁有者（human:<client>／agent 等）；無 lease 為 null"
+              },
+              "human_attached": {
+                "type": "boolean",
+                "x-updated-by": "請求當下由 lease.owner 是否以 human: 開頭判定"
+              },
+              "human_active": {
+                "type": "boolean",
+                "x-unit": "s（判定窗 HUMAN_ACTIVE_WINDOW_S=60.0）",
+                "x-updated-by": "請求當下由 bridge.last_human_input_at 與 time.monotonic() 判定（session_manager.py _lease_context）"
+              },
+              "recovery_mode": {
+                "type": "boolean"
+              },
+              "command_capable": {
+                "type": "boolean",
+                "x-note": "由 wrapper self_test() 於所有分支最外層追加（session_manager.py）"
+              }
+            },
+            "required": [
+              "ok",
+              "classification",
+              "session",
+              "current_real_path",
+              "recommended_action",
+              "interactive_owner",
+              "human_attached",
+              "human_active",
+              "recovery_mode",
+              "command_capable"
+            ]
+          },
+          {
+            "type": "object",
+            "x-branch": "VTTY_STALE",
+            "x-order": [
+              "ok",
+              "classification",
+              "session",
+              "attached_vtty",
+              "recommended_action",
+              "interactive_owner",
+              "human_attached",
+              "human_active",
+              "recovery_mode",
+              "command_capable"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean",
+                "const": true
+              },
+              "classification": {
+                "type": "string",
+                "const": "VTTY_STALE"
+              },
+              "session": {
+                "$ref": "#/$defs/SessionPublic"
+              },
+              "attached_vtty": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "recommended_action": {
+                "type": "string",
+                "enum": [
+                  "wait",
+                  "wait_or_detach_console",
+                  "check_cable_or_bind",
+                  "reattach",
+                  "attach",
+                  "recover",
+                  "console_attach",
+                  "pin_profile",
+                  "wait_or_console_attach",
+                  "recover_interactive",
+                  "none",
+                  "device_attach",
+                  "wait_external_flash",
+                  "self_test"
+                ]
+              },
+              "interactive_owner": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "x-note": "lease 擁有者（human:<client>／agent 等）；無 lease 為 null"
+              },
+              "human_attached": {
+                "type": "boolean",
+                "x-updated-by": "請求當下由 lease.owner 是否以 human: 開頭判定"
+              },
+              "human_active": {
+                "type": "boolean",
+                "x-unit": "s（判定窗 HUMAN_ACTIVE_WINDOW_S=60.0）",
+                "x-updated-by": "請求當下由 bridge.last_human_input_at 與 time.monotonic() 判定（session_manager.py _lease_context）"
+              },
+              "recovery_mode": {
+                "type": "boolean"
+              },
+              "command_capable": {
+                "type": "boolean",
+                "x-note": "由 wrapper self_test() 於所有分支最外層追加（session_manager.py）"
+              }
+            },
+            "required": [
+              "ok",
+              "classification",
+              "session",
+              "attached_vtty",
+              "recommended_action",
+              "interactive_owner",
+              "human_attached",
+              "human_active",
+              "recovery_mode",
+              "command_capable"
+            ]
+          },
+          {
+            "type": "object",
+            "x-branch": "AUTOBOOT_QUIET",
+            "x-order": [
+              "ok",
+              "classification",
+              "session",
+              "recommended_action",
+              "interactive_owner",
+              "human_attached",
+              "human_active",
+              "recovery_mode",
+              "command_capable"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean",
+                "const": true
+              },
+              "classification": {
+                "type": "string",
+                "const": "AUTOBOOT_QUIET"
+              },
+              "session": {
+                "$ref": "#/$defs/SessionPublic"
+              },
+              "recommended_action": {
+                "type": "string",
+                "enum": [
+                  "wait",
+                  "wait_or_detach_console",
+                  "check_cable_or_bind",
+                  "reattach",
+                  "attach",
+                  "recover",
+                  "console_attach",
+                  "pin_profile",
+                  "wait_or_console_attach",
+                  "recover_interactive",
+                  "none",
+                  "device_attach",
+                  "wait_external_flash",
+                  "self_test"
+                ]
+              },
+              "interactive_owner": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "x-note": "lease 擁有者（human:<client>／agent 等）；無 lease 為 null"
+              },
+              "human_attached": {
+                "type": "boolean",
+                "x-updated-by": "請求當下由 lease.owner 是否以 human: 開頭判定"
+              },
+              "human_active": {
+                "type": "boolean",
+                "x-unit": "s（判定窗 HUMAN_ACTIVE_WINDOW_S=60.0）",
+                "x-updated-by": "請求當下由 bridge.last_human_input_at 與 time.monotonic() 判定（session_manager.py _lease_context）"
+              },
+              "recovery_mode": {
+                "type": "boolean"
+              },
+              "command_capable": {
+                "type": "boolean",
+                "x-note": "由 wrapper self_test() 於所有分支最外層追加（session_manager.py）"
+              }
+            },
+            "required": [
+              "ok",
+              "classification",
+              "session",
+              "recommended_action",
+              "interactive_owner",
+              "human_attached",
+              "human_active",
+              "recovery_mode",
+              "command_capable"
+            ]
+          },
+          {
+            "type": "object",
+            "x-branch": "ATTACHED_FAMILY",
+            "x-order": [
+              "ok",
+              "classification",
+              "session",
+              "attached_real_path",
+              "current_real_path",
+              "attached_vtty",
+              "bridge_generation",
+              "recommended_action",
+              "suggested_profile",
+              "hint",
+              "matched_prompt",
+              "rx_tail",
+              "rx_bytes_last_10s",
+              "interactive_owner",
+              "human_attached",
+              "human_active",
+              "recovery_mode",
+              "command_capable"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean",
+                "const": true
+              },
+              "classification": {
+                "type": "string",
+                "enum": [
+                  "PASSTHROUGH",
+                  "LOGIN_REQUIRED",
+                  "REBOOTING",
+                  "BOOTLOADER",
+                  "RX_FLOOD",
+                  "ATTACHED_NOT_READY"
+                ]
+              },
+              "session": {
+                "$ref": "#/$defs/SessionPublic"
+              },
+              "attached_real_path": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "current_real_path": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "attached_vtty": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "bridge_generation": {
+                "type": "integer"
+              },
+              "recommended_action": {
+                "type": "string",
+                "enum": [
+                  "wait",
+                  "wait_or_detach_console",
+                  "check_cable_or_bind",
+                  "reattach",
+                  "attach",
+                  "recover",
+                  "console_attach",
+                  "pin_profile",
+                  "wait_or_console_attach",
+                  "recover_interactive",
+                  "none",
+                  "device_attach",
+                  "wait_external_flash",
+                  "self_test"
+                ]
+              },
+              "suggested_profile": {
+                "type": "string"
+              },
+              "hint": {
+                "type": "string"
+              },
+              "matched_prompt": {
+                "type": "string"
+              },
+              "rx_tail": {
+                "type": "string"
+              },
+              "rx_bytes_last_10s": {
+                "type": "integer",
+                "x-unit": "bytes",
+                "x-updated-by": "請求當下由 bridge rx_stats 計算（最近 10 s 滑窗）"
+              },
+              "interactive_owner": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "x-note": "lease 擁有者（human:<client>／agent 等）；無 lease 為 null"
+              },
+              "human_attached": {
+                "type": "boolean",
+                "x-updated-by": "請求當下由 lease.owner 是否以 human: 開頭判定"
+              },
+              "human_active": {
+                "type": "boolean",
+                "x-unit": "s（判定窗 HUMAN_ACTIVE_WINDOW_S=60.0）",
+                "x-updated-by": "請求當下由 bridge.last_human_input_at 與 time.monotonic() 判定（session_manager.py _lease_context）"
+              },
+              "recovery_mode": {
+                "type": "boolean"
+              },
+              "command_capable": {
+                "type": "boolean",
+                "x-note": "由 wrapper self_test() 於所有分支最外層追加（session_manager.py）"
+              }
+            },
+            "required": [
+              "ok",
+              "classification",
+              "session",
+              "attached_real_path",
+              "current_real_path",
+              "attached_vtty",
+              "bridge_generation",
+              "recommended_action",
+              "interactive_owner",
+              "human_attached",
+              "human_active",
+              "recovery_mode",
+              "command_capable"
+            ]
+          },
+          {
+            "type": "object",
+            "x-branch": "RX_FLOOD_POST_PROBE",
+            "x-order": [
+              "ok",
+              "classification",
+              "session",
+              "attached_real_path",
+              "current_real_path",
+              "probe_ok",
+              "rx_bytes_last_10s",
+              "recommended_action",
+              "interactive_owner",
+              "human_attached",
+              "human_active",
+              "recovery_mode",
+              "command_capable"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean",
+                "const": true
+              },
+              "classification": {
+                "type": "string",
+                "const": "RX_FLOOD"
+              },
+              "session": {
+                "$ref": "#/$defs/SessionPublic"
+              },
+              "attached_real_path": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "current_real_path": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "probe_ok": {
+                "type": "boolean"
+              },
+              "rx_bytes_last_10s": {
+                "type": "integer",
+                "x-unit": "bytes",
+                "x-updated-by": "請求當下由 bridge rx_stats 計算（最近 10 s 滑窗）"
+              },
+              "recommended_action": {
+                "type": "string",
+                "enum": [
+                  "wait",
+                  "wait_or_detach_console",
+                  "check_cable_or_bind",
+                  "reattach",
+                  "attach",
+                  "recover",
+                  "console_attach",
+                  "pin_profile",
+                  "wait_or_console_attach",
+                  "recover_interactive",
+                  "none",
+                  "device_attach",
+                  "wait_external_flash",
+                  "self_test"
+                ]
+              },
+              "interactive_owner": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "x-note": "lease 擁有者（human:<client>／agent 等）；無 lease 為 null"
+              },
+              "human_attached": {
+                "type": "boolean",
+                "x-updated-by": "請求當下由 lease.owner 是否以 human: 開頭判定"
+              },
+              "human_active": {
+                "type": "boolean",
+                "x-unit": "s（判定窗 HUMAN_ACTIVE_WINDOW_S=60.0）",
+                "x-updated-by": "請求當下由 bridge.last_human_input_at 與 time.monotonic() 判定（session_manager.py _lease_context）"
+              },
+              "recovery_mode": {
+                "type": "boolean"
+              },
+              "command_capable": {
+                "type": "boolean",
+                "x-note": "由 wrapper self_test() 於所有分支最外層追加（session_manager.py）"
+              }
+            },
+            "required": [
+              "ok",
+              "classification",
+              "session",
+              "attached_real_path",
+              "current_real_path",
+              "probe_ok",
+              "rx_bytes_last_10s",
+              "recommended_action",
+              "interactive_owner",
+              "human_attached",
+              "human_active",
+              "recovery_mode",
+              "command_capable"
+            ]
+          },
+          {
+            "type": "object",
+            "x-branch": "TARGET_UNRESPONSIVE",
+            "x-order": [
+              "ok",
+              "classification",
+              "session",
+              "attached_real_path",
+              "current_real_path",
+              "probe_ok",
+              "recommended_action",
+              "interactive_owner",
+              "human_attached",
+              "human_active",
+              "recovery_mode",
+              "command_capable"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean",
+                "const": true
+              },
+              "classification": {
+                "type": "string",
+                "const": "TARGET_UNRESPONSIVE"
+              },
+              "session": {
+                "$ref": "#/$defs/SessionPublic"
+              },
+              "attached_real_path": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "current_real_path": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "probe_ok": {
+                "type": "boolean"
+              },
+              "recommended_action": {
+                "type": "string",
+                "enum": [
+                  "wait",
+                  "wait_or_detach_console",
+                  "check_cable_or_bind",
+                  "reattach",
+                  "attach",
+                  "recover",
+                  "console_attach",
+                  "pin_profile",
+                  "wait_or_console_attach",
+                  "recover_interactive",
+                  "none",
+                  "device_attach",
+                  "wait_external_flash",
+                  "self_test"
+                ]
+              },
+              "interactive_owner": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "x-note": "lease 擁有者（human:<client>／agent 等）；無 lease 為 null"
+              },
+              "human_attached": {
+                "type": "boolean",
+                "x-updated-by": "請求當下由 lease.owner 是否以 human: 開頭判定"
+              },
+              "human_active": {
+                "type": "boolean",
+                "x-unit": "s（判定窗 HUMAN_ACTIVE_WINDOW_S=60.0）",
+                "x-updated-by": "請求當下由 bridge.last_human_input_at 與 time.monotonic() 判定（session_manager.py _lease_context）"
+              },
+              "recovery_mode": {
+                "type": "boolean"
+              },
+              "command_capable": {
+                "type": "boolean",
+                "x-note": "由 wrapper self_test() 於所有分支最外層追加（session_manager.py）"
+              }
+            },
+            "required": [
+              "ok",
+              "classification",
+              "session",
+              "attached_real_path",
+              "current_real_path",
+              "probe_ok",
+              "recommended_action",
+              "interactive_owner",
+              "human_attached",
+              "human_active",
+              "recovery_mode",
+              "command_capable"
+            ]
+          },
+          {
+            "type": "object",
+            "x-branch": "OK",
+            "x-order": [
+              "ok",
+              "classification",
+              "session",
+              "attached_real_path",
+              "current_real_path",
+              "attached_vtty",
+              "bridge_generation",
+              "probe_ok",
+              "recommended_action",
+              "interactive_owner",
+              "human_attached",
+              "human_active",
+              "recovery_mode",
+              "command_capable"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean",
+                "const": true
+              },
+              "classification": {
+                "type": "string",
+                "const": "OK"
+              },
+              "session": {
+                "$ref": "#/$defs/SessionPublic"
+              },
+              "attached_real_path": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "current_real_path": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "attached_vtty": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "bridge_generation": {
+                "type": "integer"
+              },
+              "probe_ok": {
+                "type": "boolean"
+              },
+              "recommended_action": {
+                "type": "string",
+                "enum": [
+                  "wait",
+                  "wait_or_detach_console",
+                  "check_cable_or_bind",
+                  "reattach",
+                  "attach",
+                  "recover",
+                  "console_attach",
+                  "pin_profile",
+                  "wait_or_console_attach",
+                  "recover_interactive",
+                  "none",
+                  "device_attach",
+                  "wait_external_flash",
+                  "self_test"
+                ]
+              },
+              "interactive_owner": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "x-note": "lease 擁有者（human:<client>／agent 等）；無 lease 為 null"
+              },
+              "human_attached": {
+                "type": "boolean",
+                "x-updated-by": "請求當下由 lease.owner 是否以 human: 開頭判定"
+              },
+              "human_active": {
+                "type": "boolean",
+                "x-unit": "s（判定窗 HUMAN_ACTIVE_WINDOW_S=60.0）",
+                "x-updated-by": "請求當下由 bridge.last_human_input_at 與 time.monotonic() 判定（session_manager.py _lease_context）"
+              },
+              "recovery_mode": {
+                "type": "boolean"
+              },
+              "command_capable": {
+                "type": "boolean",
+                "x-note": "由 wrapper self_test() 於所有分支最外層追加（session_manager.py）"
+              }
+            },
+            "required": [
+              "ok",
+              "classification",
+              "session",
+              "attached_real_path",
+              "current_real_path",
+              "attached_vtty",
+              "bridge_generation",
+              "probe_ok",
+              "recommended_action",
+              "interactive_owner",
+              "human_attached",
+              "human_active",
+              "recovery_mode",
+              "command_capable"
+            ]
+          }
+        ]
+      },
+      "errors": [
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND"
+      ],
+      "error_order": [
+        "INVALID_ARGS",
+        "SESSION_NOT_FOUND"
+      ],
+      "side_effects": [
+        {
+          "what": "送 ready_probe（${nonce} 換成 uuid4 前 8 碼）到 UART（source system:self_test）；TX 非冪等",
+          "when": "on_success",
+          "idempotent": false,
+          "x-condition": "僅於未命中早退分類（SESSION_NOT_FOUND／RELEASED／SESSION_RECOVERING／HUMAN_INTERACTIVE_ACTIVE／DEVICE_MISSING／DEVICE_REBOUND_REQUIRED／BRIDGE_DOWN／VTTY_STALE／AUTOBOOT_QUIET）時才送出",
+          "x-uart-tx": "possible"
+        },
+        {
+          "what": "last_probe_at 更新；human lease 時 suspend／resume interactive",
+          "when": "always",
+          "idempotent": false,
+          "x-condition": "僅 session 存在時（SESSION_NOT_FOUND 早退前不執行）"
+        },
+        {
+          "what": "nonce 回應且 prompt 成立時 confirm_ready()（清 quiet 與 pending）",
+          "when": "on_success",
+          "idempotent": false
+        },
+        {
+          "what": "FLASHING 狀態亦會走 nonce probe 分支（H-07）",
+          "when": "on_success",
+          "idempotent": false,
+          "x-condition": "僅於未命中早退分類（SESSION_NOT_FOUND／RELEASED／SESSION_RECOVERING／HUMAN_INTERACTIVE_ACTIVE／DEVICE_MISSING／DEVICE_REBOUND_REQUIRED／BRIDGE_DOWN／VTTY_STALE／AUTOBOOT_QUIET）時才送出",
+          "x-uart-tx": "possible"
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": true,
+      "long_timeout": true,
+      "selector_chain": "selector>session_id>com>alias",
+      "status": "EXISTING",
+      "source": "sw_core/service.py:762-772 → self_test sw_core/session_manager.py:4286",
+      "x-notes": {
+        "coercion_exception_precedes_validation": "轉型例外（EXCEPTION）先於 INVALID_ARGS 驗證（02 §5.2）；errors／error_order 無法表示此先後，故註記於此"
+      }
+    },
+    "session.unpin": {
+      "params": {
+        "selector": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "session_id": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "com": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        },
+        "alias": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"\")",
+          "default": ""
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "device_key"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "device_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ok",
+          "device_key"
+        ]
+      },
+      "errors": [
+        "INVALID_ARGS",
+        "DEVICE_NOT_FOUND",
+        "PROFILE_IS_EXPLICIT"
+      ],
+      "error_order": [
+        "INVALID_ARGS",
+        "DEVICE_NOT_FOUND",
+        "PROFILE_IS_EXPLICIT"
+      ],
+      "side_effects": [
+        {
+          "what": "_profile_pins 移除、_save_state()",
+          "when": "on_success",
+          "idempotent": false
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": "selector>session_id>com>alias",
+      "status": "EXISTING",
+      "source": "sw_core/service.py:808-812"
+    },
+    "wal.current_seq": {
+      "params": {},
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "seq"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "seq": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "ok",
+          "seq"
+        ]
+      },
+      "errors": [],
+      "error_order": [],
+      "side_effects": [],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": null,
+      "status": "EXISTING",
+      "source": "sw_core/service.py:1048-1049"
+    },
+    "wal.range": {
+      "params": {
+        "from_seq": {
+          "type": "integer",
+          "x-coercion": "int(params.get(k) or 0)",
+          "default": 0
+        },
+        "to_seq": {
+          "type": "integer",
+          "x-coercion": "int(params.get(k) or 0)",
+          "default": 0,
+          "x-forwarded": false,
+          "x-note": "服務層本地過濾（保留 seq ≤ to_seq），不轉傳 WAL 讀取；0 或省略表示不過濾"
+        },
+        "limit": {
+          "type": "integer",
+          "x-coercion": "int(params.get(k) or 1000)",
+          "default": 1000
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "records",
+          "wal_path",
+          "wal_file_exists",
+          "available_from_seq",
+          "rotated_out"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "records": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/WalRecord"
+            }
+          },
+          "wal_path": {
+            "type": "string"
+          },
+          "wal_file_exists": {
+            "type": "boolean"
+          },
+          "available_from_seq": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "rotated_out": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "records",
+          "wal_path",
+          "wal_file_exists",
+          "available_from_seq",
+          "rotated_out"
+        ]
+      },
+      "errors": [
+        "WAL_MISSING"
+      ],
+      "error_order": [
+        "WAL_MISSING"
+      ],
+      "side_effects": [],
+      "retryable_readonly": false,
+      "blocking": true,
+      "long_timeout": false,
+      "selector_chain": null,
+      "status": "EXISTING",
+      "source": "sw_core/service.py:1021-1043",
+      "x-notes": {
+        "coercion_exception_precedes_validation": "轉型例外（EXCEPTION）先於 INVALID_ARGS 驗證（02 §5.2）；errors／error_order 無法表示此先後，故註記於此"
+      }
+    },
+    "wal.reset": {
+      "params": {},
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "previous_seq",
+          "rotated_suffix"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "previous_seq": {
+            "type": "integer"
+          },
+          "rotated_suffix": {
+            "type": "string",
+            "pattern": "^[0-9]{8}-[0-9]{6}$",
+            "x-note": "UTC YYYYmmdd-HHMMSS"
+          }
+        },
+        "required": [
+          "ok",
+          "previous_seq",
+          "rotated_suffix"
+        ]
+      },
+      "errors": [],
+      "error_order": [],
+      "side_effects": [
+        {
+          "what": "持 WAL 鎖；非空的 raw.wal.ndjson／raw.mirror.log rename 成 .<ts>（同秒重名覆蓋，H-19）、fsync 目錄、seq 歸 0",
+          "when": "on_success",
+          "idempotent": false
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": null,
+      "status": "EXISTING",
+      "source": "sw_core/service.py:1045-1046 → wal.py:242-253"
+    }
+  },
+  "x-pending": [
+    {
+      "id": "SC-04",
+      "change": "SC-04",
+      "adds": {
+        "SessionPublic": [
+          "drain_stalled",
+          "drain_timeout_epoch"
+        ]
+      },
+      "position": "after capture, before console_endpoint"
+    },
+    {
+      "id": "BC-04",
+      "change": "BC-04",
+      "adds": {
+        "DEVICE_STILL_HELD": [
+          "holder_unknown"
+        ]
+      }
+    },
+    {
+      "id": "SC-19",
+      "change": "SC-19",
+      "adds": {
+        "health.status": [
+          "test_device_allowlist"
+        ]
+      },
+      "shape": {
+        "test_device_allowlist": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "const": true
+            },
+            "coms": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "enabled",
+            "coms"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "position": "after multi_open_detail；未啟用時不輸出此鍵",
+      "env": "SERIALWRAP_TEST_DEVICE_ALLOWLIST（逗號分隔）",
+      "config": "windows.test_device_allowlist",
+      "precedence": "env > config",
+      "isolation": "SERIALWRAP_STATE_DIR、SERIALWRAP_RUN_DIR、SERIALWRAP_CONFIG_DIR 三者皆明確設定且解析後都不等於預設路徑",
+      "refusal": {
+        "stderr": "serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED: <reason>\n",
+        "exit": 2
+      }
+    },
+    {
+      "id": "SC-11-handoff",
+      "change": "SC-11",
+      "adds_method": "daemon.handoff_stop",
+      "params": {
+        "reason": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or D)",
+          "default": "update"
+        }
+      },
+      "result": {
+        "ok": {
+          "const": true
+        },
+        "stopping": {
+          "const": true
+        },
+        "handoff_token": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        }
+      },
+      "errors": [
+        "FLASHING_BUSY",
+        "SESSION_BUSY"
+      ],
+      "error_order": [
+        "FLASHING_BUSY",
+        "SESSION_BUSY"
+      ],
+      "busy_row": [
+        "com",
+        "state",
+        "foreground_busy",
+        "outstanding_commands",
+        "interactive_session_id",
+        "recovering",
+        "ops"
+      ],
+      "atomicity": "busy 判定、凍結所有新的有副作用操作與發 token 在 daemon 共同 admission 邊界的同一臨界區完成；busy 時不凍結、不停止；ok 時回應寫出後走 daemon.stop 同一 SC-11 停止路徑",
+      "frozen_rejection": {
+        "error_code": "FLUSHED_BY_SHUTDOWN",
+        "reason": "handoff_frozen",
+        "applies_to": "side_effects 非空且 retryable_readonly == false 的方法＋ttyMCU sync-probe（端點沉默）"
+      },
+      "version_absent": true,
+      "retryable_readonly": false,
+      "blocking": false,
+      "long_timeout": false,
+      "selector_chain": null
+    }
+  ]
+}

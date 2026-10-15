@@ -43,7 +43,7 @@ jobs:
           echo "release tag ${TAG_NAME} matches VERSION ${file_version}"
 
       - name: Install test + build dependencies
-        run: python3 -m pip install --disable-pip-version-check pytest pyyaml pyserial build
+        run: python3 -m pip install --disable-pip-version-check pytest pyyaml pyserial jsonschema==4.10.3 build
 
       - name: Run test suite (default install, no re2 -> fail-closed)
         run: python3 -m pytest -q tests/

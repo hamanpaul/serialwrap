@@ -16,6 +16,9 @@ from typing import Any
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+MISSING: Any = object()
+LEASE_KEYS = ["interactive_owner", "human_attached", "human_active", "recovery_mode"]
+ST_EXTRA_KEYS = ["suggested_profile", "hint", "matched_prompt", "rx_tail", "rx_bytes_last_10s"]
 
 
 def _schema() -> dict[str, Any]:
@@ -304,132 +307,555 @@ def test_line_limit_capture_reproducible(tmp_path: Path):
     assert captured == golden
 
 
-def test_params_coercion_match_runtime():
-    """驗證 54 個 RPC method 的參數型別轉換與 schema 中宣告的 default 及 x-coercion 完全相符。"""
-    from unittest.mock import MagicMock
+def _oracle_bool(value: Any) -> bool:
+    """依 schema x-notes（strict_human_lock）的真值表：None→False；bool 原樣；int 非零為真；
+    字串僅 1/true/yes/on（去空白、小寫）為真，其餘字串為假；其餘型別以 bool() 判定。"""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _oracle(expr: str, k: str, value: Any) -> tuple[str, Any]:
+    """以 schema 的 x-coercion 字串求值（期望值由 schema 字串得出，不呼叫產品轉型函式）。"""
+    params = {} if value is MISSING else {k: value}
+    env = {
+        "params": params, "k": k, "str": str, "int": int, "float": float,
+        "bool": bool, "max": max, "_coerce_rpc_bool": _oracle_bool,
+    }
+    try:
+        return "ok", eval(expr, {"__builtins__": {}}, env)  # noqa: S307 - 僅評估本檔 schema 字串
+    except (TypeError, ValueError) as exc:
+        return "raises", exc
+
+
+def _oracle_regex(value: Any) -> bool:
+    """與 command_completion.valid_completion_regex 的可觀測規則一致（本測試值域內）：None 為合法；
+    其餘須為非空字串且可編譯。"""
+    import re
+
+    if value is None:
+        return True
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        re.compile(value)
+    except re.error:
+        return False
+    return True
+
+
+_VALIDATORS = {"valid_completion_regex": _oracle_regex}
+
+
+def _chain_keys(spec: dict[str, Any]) -> list[str]:
+    chain = spec.get("selector_chain")
+    if not chain or chain == "raw_selector":
+        return []
+    return chain.split(">")
+
+
+# 分支選擇鍵：不得放入基線，否則會遮蔽同方法其他參數的觀察（例 result.tail 有 cmd_id 即走 cmd 分支）。
+_NO_BASELINE: dict[str, set[str]] = {"result.tail": {"cmd_id"}}
+# 僅在特定分支才會被產品讀取的參數：補上使其所在分支成立的前提（result.tail 的 from_chunk 只在 cmd_id 分支）。
+_EXTRA_BASE: dict[tuple[str, str], dict[str, Any]] = {("result.tail", "from_chunk"): {"cmd_id": "b_cmd_id"}}
+
+
+def _baseline(spec: dict[str, Any], target: str, method: str = "") -> dict[str, Any]:
+    """組出能通過 guard 的最小請求：其餘必填字串給 b_<name>；selector 鏈只給首鍵（且目標不在鏈上時）。"""
+    chain = _chain_keys(spec)
+    base: dict[str, Any] = {}
+    if chain and target not in chain:
+        base[chain[0]] = f"b_{chain[0]}"
+    for name, p in spec.get("params", {}).items():
+        if name == target or name in chain or name in _NO_BASELINE.get(method, set()):
+            continue
+        if p.get("default") == "" and p.get("type") == "string":
+            base[name] = f"b_{name}"
+    base.update(_EXTRA_BASE.get((method, target), {}))
+    return base
+
+
+class _Recorder:
+    """recording fake：記錄所有 manager／arbiter／engine／wal 方法的呼叫（名稱、位置與關鍵字參數）。"""
+
+    def __init__(self, forced_error: str | None = None) -> None:
+        self.calls: list[tuple[str, tuple, dict]] = []
+        self._forced = forced_error
+
+    def __getattr__(self, name: str):
+        if name.startswith("__"):
+            raise AttributeError(name)
+
+        def _call(*args, **kwargs):
+            self.calls.append((name, args, kwargs))
+            if self._forced is not None:
+                return {"ok": False, "error_code": self._forced}
+            if name == "get_session_state":
+                return {"ok": True, "session": {
+                    "state": "READY", "command_capable": True, "com": "COM0",
+                    "session_id": "p:COM0", "device_by_id": "dev",
+                }}
+            if name.endswith("_with_meta"):  # log.tail／wal.range 等回 (rows, truncated)
+                return ([], False)
+            if name == "health":  # WAL 健康快照：wal_file_exists 為真且 current_seq > 0 才視為可讀
+                return {"ok": True, "wal_file_exists": True, "current_seq": 1}
+            return {"ok": True}
+
+        return _call
+
+    def values(self) -> list[Any]:
+        out: list[Any] = []
+        for _, args, kwargs in self.calls:
+            out.extend(args)
+            out.extend(kwargs.values())
+        return out
+
+
+def _svc() -> Any:
     from sw_core.service import SerialwrapService
 
-    schema = _schema()
+    return SerialwrapService([])
 
-    def _eval_coercion(coercion_expr: str, default: Any, input_val: Any) -> Any:
-        if "int(" in coercion_expr:
-            if input_val is None or input_val == "":
-                return default
-            return int(input_val)
-        elif "float(" in coercion_expr:
-            if input_val is None or input_val == "":
-                return default
-            return float(input_val)
-        elif "str(" in coercion_expr:
-            if input_val is None:
-                return default if default is not None else ""
-            return str(input_val)
-        elif "_coerce_rpc_bool" in coercion_expr:
-            if input_val is None:
-                return default if default is not None else False
-            if isinstance(input_val, str) and input_val.strip().lower() in {"1", "true", "yes", "on"}:
-                return True
-            return False
-        elif "bool(" in coercion_expr:
-            return bool(input_val)
-        elif coercion_expr in ("params.get(k)", "raw"):
-            return default if input_val is None else input_val
-        return input_val
 
-    for method, m_spec in schema["x-methods"].items():
-        params_spec = m_spec.get("params", {})
-        if not params_spec:
+def _run(svc: Any, method: str, params: dict[str, Any], forced: str | None = None) -> tuple[dict[str, Any], _Recorder]:
+    """以 recording fake 替換所有 manager，對真實 _dispatch 送請求。例外比照 serve_connection 映為 EXCEPTION。"""
+    rec = _Recorder(forced)
+    svc._sessions = rec
+    svc._arbiter = rec
+    svc._engine = rec
+    svc._wal = rec
+    try:
+        resp = svc._dispatch(method, params)
+    except Exception:  # noqa: BLE001 - 比照 rpc_posix.serve_connection 的 EXCEPTION 映射
+        resp = {"ok": False, "error_code": "EXCEPTION"}
+    return resp, rec
+
+
+def _same(a: Any, b: Any) -> bool:
+    return type(a) is type(b) and a == b
+
+
+def _dispatch_param_names() -> dict[str, set[str]]:
+    """以 AST 抽出 service._dispatch 每個頂層分支實際讀取的 params.get("…") 名稱集合。"""
+    tree = ast.parse((ROOT / "sw_core" / "service.py").read_text(encoding="utf-8"))
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_dispatch")
+    out: dict[str, set[str]] = {}
+    for node in fn.body:
+        if not isinstance(node, ast.If):
             continue
-        svc = SerialwrapService([])
-        fake_mgr = MagicMock()
-        fake_arb = MagicMock()
-        svc._sessions = fake_mgr
-        svc._arbiter = fake_arb
+        names: set[str] = set()
+        methods: set[str] = set()
+        for c in ast.walk(node.test):
+            if isinstance(c, ast.Compare) and isinstance(c.left, ast.Name) and c.left.id == "method":
+                for comp in c.comparators:
+                    if isinstance(comp, ast.Constant):
+                        methods.add(comp.value)
+                    elif isinstance(comp, (ast.Tuple, ast.List, ast.Set)):
+                        methods |= {e.value for e in comp.elts if isinstance(e, ast.Constant)}
+        for sub in ast.walk(node):
+            if (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute) and sub.func.attr == "get"
+                    and isinstance(sub.func.value, ast.Name) and sub.func.value.id == "params"
+                    and sub.args and isinstance(sub.args[0], ast.Constant)):
+                names.add(sub.args[0].value)
+        for m in methods:
+            out.setdefault(m, set()).update(names)
+    return out
 
-        for p_name, p_info in params_spec.items():
-            coercion = p_info.get("x-coercion", "raw")
-            default_val = p_info.get("default")
-            for val in (None, "10"):
-                expected = _eval_coercion(coercion, default_val, val)
-                assert expected is not None or default_val is None
+
+def test_coercion_expression_matches_default_for_missing_and_none():
+    """機械檢查（不執行產品碼）：x-coercion 對省略與 None 求值必須等於 default（且型別相同）。"""
+    for m, spec in _schema()["x-methods"].items():
+        for k, p in spec.get("params", {}).items():
+            assert "x-coercion" in p, (m, k)
+            for value in (MISSING, None):
+                kind, out = _oracle(p["x-coercion"], k, value)
+                assert kind == "ok", (m, k, out)
+                assert _same(out, p["default"]), (m, k, value, out, p["default"])
+
+
+def test_params_names_match_dispatch_reads():
+    """機械檢查：每個 _dispatch 分支讀取的 params 名稱集合 == schema params 鍵 ∪ x-aliases。"""
+    schema = _schema()
+    ast_names = _dispatch_param_names()
+    for m, spec in schema["x-methods"].items():
+        if m == "daemon.stop":
+            continue
+        expected = set(spec.get("params", {}))
+        for p in spec.get("params", {}).values():
+            expected |= set(p.get("x-aliases", []))
+        assert ast_names.get(m, set()) == expected, (m, sorted(ast_names.get(m, set())), sorted(expected))
+
+
+CASES: tuple[tuple[str, Any], ...] = (
+    ("omitted", MISSING), ("none", None), ("numeric_string", "10"), ("empty_string", ""), ("zero", 0),
+)
+
+
+def test_params_coercion_match_runtime():
+    """執行期：每個 method × 每個 param × {省略, None, "10", "", 0}，recording fake 收到的值必須等於
+    x-coercion 求值結果；求值例外時產品須回 INVALID_ARGS／EXCEPTION 且不得呼叫 manager。"""
+    svc = _svc()
+    dispatched = _dispatch_methods()
+    failures: list[str] = []
+    checked = 0
+    for m, spec in _schema()["x-methods"].items():
+        if m not in dispatched:
+            continue
+        for k, p in spec.get("params", {}).items():
+            for label, value in CASES:
+                params = _baseline(spec, k, m)
+                if value is not MISSING:
+                    params[k] = value
+                kind, expected = _oracle(p["x-coercion"], k, value)
+                resp, rec = _run(svc, m, params)
+                checked += 1
+                if "x-validator" in p and kind == "ok" and value is not MISSING:
+                    if not _VALIDATORS[p["x-validator"]](value):
+                        if not (resp.get("error_code") == "INVALID_COMPLETION_REGEX" and not rec.calls):
+                            failures.append(f"{m}.{k}[{label}] invalid-expected got {resp!r}")
+                        continue
+                if p.get("x-forwarded", True) is False and kind == "ok" and "x-enum" not in p:
+                    continue  # 服務層本地使用、不轉傳（wal.range.to_seq）；由 test_wal_range_to_seq_filters_locally 驗證
+                if "x-enum" in p and kind == "ok":
+                    if expected not in p["x-enum"]:
+                        if not (resp.get("error_code") == "INVALID_ARGS" and not rec.calls):
+                            failures.append(f"{m}.{k}[{label}] enum-reject-expected got {resp!r}")
+                        continue
+                    if resp.get("error_code") == "INVALID_ARGS":
+                        failures.append(f"{m}.{k}[{label}] valid enum rejected {resp!r}")
+                        continue
+                    if p.get("x-forwarded", True) is False:
+                        continue  # 僅驗證、不轉傳（file.pull.ack_mode）
+                if kind == "raises":
+                    if not (resp.get("error_code") in {"INVALID_ARGS", "EXCEPTION"} and not rec.calls):
+                        failures.append(f"{m}.{k}[{label}] raises-expected got {resp!r}")
+                    continue
+                observed = any(_same(v, expected) for v in rec.values())
+                # 假值（""／0／None）可能使產品改走「未提供」分支（例 log.tail 無 selector＝全部 session、
+                # result.tail 無 cmd_id＝legacy 分支），此時不以 manager 收到該假值為準，只要求未回錯誤碼。
+                falsy_branch = not bool(expected) and resp.get("error_code") in (None, "INVALID_ARGS", "EXCEPTION")
+                if not (observed or falsy_branch):
+                    failures.append(f"{m}.{k}[{label}] expected={expected!r} calls={rec.calls!r} resp={resp!r}")
+    assert checked > 100
+    assert not failures, "\n".join(failures[:40])
 
 
 def test_selector_chain_match_runtime():
-    """驗證 selector_chain 宣告的優先順序（單一給定與多鍵並存時）與 service._dispatch 一致。"""
-    from unittest.mock import MagicMock
-    from sw_core.service import SerialwrapService
+    """執行期：selector_chain 非 null 的 30 個 method（24 鏈＋6 raw）。鏈上每一鍵單獨給值時，該值必須
+    出現在某個 manager 呼叫的參數中；同時給鏈上前兩鍵時取較前者（後者不得出現）。raw 方法原樣傳遞。"""
+    svc = _svc()
+    checked = 0
+    for m, spec in _schema()["x-methods"].items():
+        chain_spec = spec.get("selector_chain")
+        if chain_spec is None:
+            continue
+        checked += 1
+        if chain_spec == "raw_selector":
+            resp, rec = _run(svc, m, {"selector": 7})
+            _, expected = _oracle(spec["params"]["selector"]["x-coercion"], "selector", 7)
+            assert any(_same(v, expected) for v in rec.values()), (m, expected, resp, rec.calls)
+            continue
+        chain = _chain_keys(spec)
+        for key in chain:
+            params = _baseline(spec, key, m)
+            params[key] = f"val_{key}"
+            resp, rec = _run(svc, m, params)
+            assert f"val_{key}" in rec.values(), (m, key, resp, rec.calls)
+        if len(chain) >= 2:
+            params = _baseline(spec, chain[0], m)
+            params[chain[0]] = "first"
+            params[chain[1]] = "second"
+            resp, rec = _run(svc, m, params)
+            vals = rec.values()
+            assert "first" in vals and "second" not in vals, (m, resp, rec.calls)
+    assert checked == 30
+
+
+def test_wal_range_to_seq_filters_locally():
+    """wal.range.to_seq 不轉傳 WAL：服務層保留 seq ≤ to_seq；0 或省略不過濾（schema x-forwarded: false）。"""
+    svc = _svc()
+    rows = [{"seq": 5}, {"seq": 20}]
+
+    class _WalRows(_Recorder):
+        def __getattr__(self, name: str):
+            if name == "tail_raw":
+                def _rows(*args, **kwargs):
+                    self.calls.append((name, args, kwargs))
+                    return list(rows)
+                return _rows
+            if name == "health":
+                return lambda *a, **k: {"ok": True, "wal_file_exists": True, "current_seq": 1, "wal_path": "x"}
+            if name == "available_from_seq":
+                return lambda *a, **k: 0
+            return super().__getattr__(name)
+
+    for params, expect in (({"to_seq": 10}, [5]), ({}, [5, 20]), ({"to_seq": 0}, [5, 20])):
+        rec = _WalRows()
+        svc._wal = rec
+        resp = svc._dispatch("wal.range", params)
+        assert [r["seq"] for r in resp.get("records", [])] == expect, (params, resp)
+
+
+def test_event_com_status_selector_scalar_types_validate():
+    """event.com_status 的 selector 原樣傳入引擎：字串、數字、布林的成功回應須符合 result schema；None 走 coms 分支。"""
+    import jsonschema
 
     schema = _schema()
-    for method, m_spec in schema["x-methods"].items():
-        chain = m_spec.get("selector_chain")
-        if not chain or chain == "raw_selector":
-            continue
-        keys = chain.split(">")
-        svc = SerialwrapService([])
-        fake_mgr = MagicMock()
-        svc._sessions = fake_mgr
+    result = schema["x-methods"]["event.com_status"]["result"]
 
-        for k in keys:
-            captured_selector = None
-            def _fake_action(sel, *args, **kwargs):
-                nonlocal captured_selector
-                captured_selector = sel
-                return {"ok": True}
-            fake_mgr.get_session_state.side_effect = _fake_action
-            fake_mgr.activity_session.side_effect = _fake_action
-            svc._dispatch(method, {k: f"val_{k}"})
-            if captured_selector is not None:
-                assert captured_selector == f"val_{k}"
+    class _Engine(_Recorder):
+        def __getattr__(self, name: str):
+            if name == "com_status":
+                def _status(com=None):
+                    if com is None:
+                        return {"coms": ["COM0"]}
+                    return {"selector": com, "enabled": True, "active_rules": []}
+                return _status
+            return super().__getattr__(name)
 
-        if len(keys) >= 2:
-            captured_selector = None
-            def _fake_action(sel, *args, **kwargs):
-                nonlocal captured_selector
-                captured_selector = sel
-                return {"ok": True}
-            fake_mgr.get_session_state.side_effect = _fake_action
-            svc._dispatch(method, {keys[0]: "first", keys[1]: "second"})
-            if captured_selector is not None:
-                assert captured_selector == "first"
+    svc = _svc()
+    svc._engine = _Engine()
+    for sel in ("COM0", 7, True):
+        resp = svc._dispatch("event.com_status", {"selector": sel})
+        assert resp["ok"] is True and resp["selector"] == sel, resp
+        jsonschema.validate(instance=resp, schema={"$defs": schema["$defs"], **result})
+    resp = svc._dispatch("event.com_status", {})
+    jsonschema.validate(instance=resp, schema={"$defs": schema["$defs"], **result})
 
 
 def test_error_order_precedence():
-    """驗證 error_order 集合與 errors 一致，且同時滿足前兩個錯誤條件時判定先後符合順序。"""
+    """執行期：error_order[0] 與 error_order[1] 同時成立時回應 error_order[0]。
+    對 error_order[0] 為 INVALID_ARGS 的方法：無必填參數＋所有 manager 回 error_order[1] → INVALID_ARGS。
+    command.submit：壞 regex 先於 selector guard 與 manager 條件。
+    無法於 service 層同時成立的 method 須明列於 _NOT_SERVICE_TESTABLE 並附理由（不得靜默略過）。"""
+    svc = _svc()
     schema = _schema()
-    for method, m_spec in schema["x-methods"].items():
-        errors = set(m_spec.get("errors", []))
-        error_order = m_spec.get("error_order", [])
-        assert set(error_order) == errors, f"Method {method}: error_order set mismatch"
-        if len(error_order) >= 2:
-            assert error_order[0] != error_order[1]
+    covered: set[str] = set()
+    multi = {m for m, s in schema["x-methods"].items() if len(s.get("error_order", [])) >= 2}
+    for m in sorted(multi):
+        eo = schema["x-methods"][m]["error_order"]
+        if eo[0] != "INVALID_ARGS":
+            continue
+        trigger = _PRECEDENCE_TRIGGER.get(m, {})
+        resp, _ = _run(svc, m, trigger, forced=eo[1])
+        assert resp.get("error_code") == "INVALID_ARGS", (m, eo, resp)
+        covered.add(m)
+    resp, _ = _run(svc, "command.submit", {"completion_regex": "("}, forced="SESSION_NOT_FOUND")
+    assert resp.get("error_code") == "INVALID_COMPLETION_REGEX", resp
+    covered.add("command.submit")
+    not_testable = {m: reason for m, reason in _NOT_SERVICE_TESTABLE.items()}
+    assert multi - covered == set(not_testable), sorted(multi - covered - set(not_testable))
+
+
+# 多數方法的 INVALID_ARGS 為「必填參數缺漏」；log.tail_* 的 INVALID_ARGS 則為 from_seq 非法值（先於 selector 查詢）。
+_PRECEDENCE_TRIGGER: dict[str, dict[str, Any]] = {
+    "log.tail_raw": {"from_seq": "abc", "selector": "COM0"},
+    "log.tail_text": {"from_seq": "abc", "selector": "COM0"},
+}
+
+_NOT_SERVICE_TESTABLE: dict[str, str] = {
+    "command.cancel": "CMD_NOT_FOUND 與 CMD_NOT_CANCELABLE 同出於單一 arbiter 呼叫的內部判定，無法由替身同時造成，留待 P2 整合測試",
+    "result.tail": "cmd_id 分支（CMD_NOT_FOUND）與 com/selector 分支（SESSION_NOT_FOUND）互斥，同一請求不會同時成立",
+}
 
 
 def test_result_schemas_not_placeholders():
-    """驗證每個 x-methods.*.result 與 $defs.* 皆非空物件且具備 type 或 $ref 定義。"""
+    """每個 x-methods.*.result 與 $defs.* 皆非空物件，且具 type、$ref 或 oneOf（C18 的本地鏡像）。"""
     schema = _schema()
     for m, m_spec in schema["x-methods"].items():
         result = m_spec.get("result")
         assert result != {}, f"Method {m} result schema is empty object"
-        assert "type" in result or "$ref" in result, f"Method {m} result missing type/$ref"
-
+        assert "type" in result or "$ref" in result or "oneOf" in result, f"Method {m} result missing type/$ref/oneOf"
     for d, d_spec in schema.get("$defs", {}).items():
         assert d_spec != {}, f"$defs.{d} is empty object"
         assert "type" in d_spec or "$ref" in d_spec, f"$defs.{d} missing type/$ref"
 
 
 def test_side_effects_declared_for_readonly_whitelist():
-    """驗證 retryable_readonly 方法皆宣告 side_effects，且 session.list 與 device.list 之副作用標註為 idempotent。"""
+    """retryable_readonly 方法皆宣告 side_effects；session.list 的效果皆 idempotent。
+    device.list 為純讀（見 spec-errata.md T8-ERR-01），side_effects 必須為空列表。"""
     schema = _schema()
     for m, v in schema["x-methods"].items():
         if v.get("retryable_readonly"):
             assert "side_effects" in v, f"Method {m} missing side_effects field"
             assert isinstance(v["side_effects"], list)
+    assert schema["x-methods"]["device.list"]["side_effects"] == []
+    effects = schema["x-methods"]["session.list"]["side_effects"]
+    assert effects, "session.list side_effects should not be empty"
+    for eff in effects:
+        assert eff.get("idempotent") is True, f"session.list effect {eff} not marked idempotent"
 
-    for m in ("session.list", "device.list"):
-        effects = schema["x-methods"][m]["side_effects"]
-        assert len(effects) > 0, f"Method {m} side_effects should not be empty"
-        for eff in effects:
-            assert eff.get("idempotent") is True, f"Method {m} effect {eff} not marked idempotent"
+
+def test_uart_tx_effects_are_conditional_and_gated():
+    """含 UART TX 的副作用不得宣稱 when=always（拒絕路徑零 TX，§11.3 第 1 項），且必須寫明 x-condition。"""
+    for m, v in _schema()["x-methods"].items():
+        for eff in v.get("side_effects", []):
+            if eff.get("x-uart-tx") is not None:
+                assert eff["when"] != "always", (m, eff["what"])
+                assert eff.get("x-condition"), (m, eff["what"])
+
+
+def test_section_94_fields_carry_unit_and_updated_by():
+    """§9.4 凍結欄位須標 x-updated-by；數值型欄位另須標 x-unit。"""
+    need_updated = {"multi_open", "multi_open_detail", "rx_bytes_last_10s", "rx_rate_bps",
+                    "last_rx_age_s", "last_tx_age_s", "human_active", "ready_reconfirm_pending", "foreign_holders"}
+    need_unit = {"rx_bytes_last_10s", "rx_rate_bps", "last_rx_age_s", "last_tx_age_s"}
+    seen: dict[str, int] = {}
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            props = node.get("properties")
+            if isinstance(props, dict):
+                for name, prop in props.items():
+                    if name in need_updated and isinstance(prop, dict):
+                        seen[name] = seen.get(name, 0) + 1
+                        assert "x-updated-by" in prop, f"{name} missing x-updated-by"
+                        if name in need_unit:
+                            assert "x-unit" in prop, f"{name} missing x-unit"
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(_schema())
+    assert {"multi_open", "human_active", "rx_bytes_last_10s", "last_rx_age_s"} <= set(seen), seen
+
+
+def test_record_error_codes_match_catalog():
+    """CommandRecord／CommandResultTail.error_code 的 x-record-error-codes 與目錄 rec 範圍（非 APPROVED）雙向一致，
+    且目錄 scope.methods 所列的讀取 method 其 errors 或紀錄層清單皆涵蓋該碼。"""
+    schema = _schema()
+    codes, _ = _load_error_codes()
+    rec_entries = [c for c in codes if "rec" in c.scope.interfaces and c.status != "APPROVED"]
+    expected = sorted(c.code for c in rec_entries)
+    for owner in ("CommandRecord", "CommandResultTail"):
+        got = schema["$defs"][owner]["properties"]["error_code"]["x-record-error-codes"]
+        assert got == expected, (owner, sorted(set(got) ^ set(expected)))
+    record = set(expected)
+    for c in rec_entries:
+        for m in c.scope.methods:
+            spec = schema["x-methods"].get(m)
+            if spec is None:
+                continue
+            assert c.code in set(spec.get("errors", [])) | record, (m, c.code)
+
+
+def test_session_list_ready_reconfirm_not_evaluated():
+    """session.list 不主動評估 ready_reconfirm 到期（GAP-G-13）：list_sessions 與 to_public_dict 不得呼叫
+    expire_ready_reconfirm；到期翻轉只由 1 s tick 發生。"""
+    schema = _schema()
+    items = schema["x-methods"]["session.list"]["result"]["properties"]["sessions"]["items"]
+    assert items == {"$ref": "#/$defs/SessionPublic"}
+    props = schema["$defs"]["SessionPublic"]["properties"]
+    assert "1 s tick" in props["ready_reconfirm_pending"].get("x-updated-by", "")
+
+    tree = ast.parse((ROOT / "sw_core" / "session_manager.py").read_text(encoding="utf-8"))
+
+    def calls_expire(fn_name: str) -> bool:
+        fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == fn_name)
+        return any(isinstance(c, ast.Attribute) and c.attr == "expire_ready_reconfirm" for c in ast.walk(fn))
+
+    assert not calls_expire("list_sessions")
+    assert not calls_expire("to_public_dict")
+    assert any(isinstance(c, ast.Attribute) and c.attr == "expire_ready_reconfirm" for c in ast.walk(tree))
+
+    from sw_core.session_manager import SessionRuntime
+    from sw_core.config import SessionProfile
+
+    prof = SessionProfile(
+        profile_name="p", com="COM0", act_no=1, alias="test", device_by_id="usb-test", platform="shell"
+    )
+    rt = SessionRuntime(session_id="p:COM0", profile=prof)
+    rt.state = "READY"
+    rt.ready_reconfirm_pending = True
+    rt.ready_reconfirm_failed = False
+    rt.ready_reconfirm_deadline = 100.0
+    assert rt.to_public_dict()["ready_reconfirm_pending"] is True
+    rt.expire_ready_reconfirm(now=150.0)
+    assert rt.to_public_dict()["ready_reconfirm_pending"] is False
+    assert rt.to_public_dict()["ready_reconfirm_failed"] is True
+
+
+def _source_literal_orders(path: str, fn_names: set[str], append: tuple[str, ...] = ()) -> list[list[str]]:
+    """抽出指定函式內所有含 "ok" 鍵的字面 dict 鍵序；**spread 依來源展開（lease／extra）。"""
+    tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
+    out: list[list[str]] = []
+    for fn in ast.walk(tree):
+        if not (isinstance(fn, ast.FunctionDef) and fn.name in fn_names):
+            continue
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Dict) or not any(isinstance(k, ast.Constant) and k.value == "ok" for k in node.keys):
+                continue
+            keys: list[str] = []
+            for k, v in zip(node.keys, node.values):
+                if k is None:
+                    text = ast.unparse(v)
+                    if "lease" in text:
+                        keys.extend(LEASE_KEYS)
+                    elif text == "extra":
+                        keys.extend(ST_EXTRA_KEYS)
+                    else:
+                        raise AssertionError(f"未知 spread：{text}")
+                else:
+                    keys.append(k.value)
+            for extra in append:
+                if extra not in keys:
+                    keys.append(extra)
+            out.append(keys)
+    return out
+
+
+def _admits(branch: dict[str, Any], keys: list[str]) -> bool:
+    keyset = set(keys)
+    if not set(branch.get("required", [])) <= keyset:
+        return False
+    if not keyset <= set(branch["properties"]):
+        return False
+    return [k for k in branch["x-order"] if k in keyset] == keys
+
+
+def _branches(method: str) -> list[dict[str, Any]]:
+    return _schema()["x-methods"][method]["result"]["oneOf"]
+
+
+def test_self_test_recover_branch_orders_match_source_literals():
+    """session.self_test／session.recover 的每個字面回應鍵序（session_manager.py）必須被某一 oneOf 分支
+    以相同相對順序接受；wrapper self_test() 於最後追加 command_capable。"""
+    st_literals = _source_literal_orders(
+        "sw_core/session_manager.py", {"_self_test_impl"}, append=("command_capable",)
+    )
+    assert st_literals, "no self_test literals found"
+    st_branches = _branches("session.self_test")
+    for keys in st_literals:
+        assert any(_admits(b, keys) for b in st_branches), keys
+
+    rc_literals = _source_literal_orders("sw_core/session_manager.py", {"recover_session", "_force_recover", "_recover_after_failure"})
+    assert rc_literals, "no recover literals found"
+    rc_branches = _branches("session.recover")
+    for keys in rc_literals:
+        assert any(_admits(b, keys) for b in rc_branches), keys
+
+
+def test_session_not_found_runtime_response_validates_branch():
+    """執行期（真實 SessionManager，查無 session）：回應鍵序與值須符合 SESSION_NOT_FOUND 分支。"""
+    import jsonschema
+
+    schema = _schema()
+    svc = _svc()
+    for m in ("session.self_test", "session.recover"):
+        resp = svc._dispatch(m, {"selector": "COM9"})
+        assert resp["ok"] is False and resp["error_code"] == "SESSION_NOT_FOUND", resp
+        assert list(resp) == list(resp), m
+        branch = next(b for b in _branches(m) if b["x-branch"] == "SESSION_NOT_FOUND")
+        assert _admits(branch, list(resp)), (m, list(resp))
+        jsonschema.validate(instance=resp, schema={"$defs": schema["$defs"], **branch})
 
 
 def test_foreign_holders_includes_self_pid(tmp_path: Path):
@@ -452,35 +878,6 @@ def test_foreign_holders_includes_self_pid(tmp_path: Path):
 
     result = detect_multi_open(proc_root=str(proc_root), tty_paths=[fake_tty])
     assert result["holders"].get(fake_tty) == my_pid
-
-
-def test_session_list_ready_reconfirm_not_evaluated():
-    """驗證 session.list 不評估 reconfirm 到期，待 tick 推進後才翻轉（GAP-G-13）。"""
-    schema = _schema()
-    m_spec = schema["x-methods"]["session.list"]
-    props = m_spec["result"]["properties"]["sessions"]["items"]["properties"]
-    assert "1 s tick" in props["ready_reconfirm_pending"].get("x-updated-by", "")
-
-    from sw_core.session_manager import SessionRuntime
-    from sw_core.config import SessionProfile
-
-    prof = SessionProfile(
-        profile_name="p", com="COM0", act_no=1, alias="test", device_by_id="usb-test", platform="shell"
-    )
-    rt = SessionRuntime(session_id="p:COM0", profile=prof)
-    rt.state = "READY"
-    rt.ready_reconfirm_pending = True
-    rt.ready_reconfirm_failed = False
-    rt.ready_reconfirm_deadline = 100.0
-
-    # 不呼叫 expire_ready_reconfirm，to_public_dict 保持原值
-    assert rt.to_public_dict()["ready_reconfirm_pending"] is True
-    assert rt.to_public_dict()["ready_reconfirm_failed"] is False
-
-    # 模擬 1 s tick 呼叫 expire_ready_reconfirm 推進
-    rt.expire_ready_reconfirm(now=150.0)
-    assert rt.to_public_dict()["ready_reconfirm_pending"] is False
-    assert rt.to_public_dict()["ready_reconfirm_failed"] is True
 
 
 def test_pending_ids_exist():
