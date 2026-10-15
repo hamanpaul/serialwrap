@@ -18,6 +18,7 @@ code_paths:
   - "tools/**"
   - "tests/**"
   - "profiles/**"
+  - "contracts/**"
   - "serialwrap"
   - "serialwrapd.py"
   - "install.sh"
@@ -43,12 +44,44 @@ cli:
     help_args: ["--help"]
     reflected_in: "README.md"
     marker: "serialwrap-remote-help"
+# OD-06：凡程式會輸出的 error_code 與 session last_error，都必須在 SKILL 有意義與處置。
+# 規則本體為 paulsha-conventions R-27（通用、不內建碼表）；引擎 pin 升級前由
+# tests/test_contracts_policy_decl.py 與 `python3 -m tools.contracts check` 的 C13 以同語意本地強制。
+diagnostic_codes:
+  - namespace: error_code
+    extract: "python3 -m tools.contracts extract --namespace error_code --format lines"
+    docs: ["sw_core/assets/skill/SKILL.md", "sw_core/assets/skill/SKILL_WINDOWS.md"]
+    entry_pattern: '^\| `(?P<code>[^`]+)` \| [^|\n]* \| [^|\n]* \| (?P<meaning>[^|\n]*\S[^|\n]*) \| (?P<action>[^|\n]*\S[^|\n]*) \|$'
+    require_in: all
+  - namespace: session_last_error
+    extract: "python3 -m tools.contracts extract --namespace session_last_error --format lines"
+    docs: ["sw_core/assets/skill/SKILL.md", "sw_core/assets/skill/SKILL_WINDOWS.md"]
+    entry_pattern: '^\| `(?P<code>[^`]+)` \| [^|\n]* \| [^|\n]* \| (?P<meaning>[^|\n]*\S[^|\n]*) \| (?P<action>[^|\n]*\S[^|\n]*) \|$'
+    require_in: all
+# R-26：SKILL 受管區段必須與契約目錄產生結果一致
+generated_facts:
+  - command: "python3 -m tools.contracts skill-section --namespace error_code"
+    reflected_in: "sw_core/assets/skill/SKILL.md"
+    marker: "error-codes"
+  - command: "python3 -m tools.contracts skill-section --namespace session_last_error"
+    reflected_in: "sw_core/assets/skill/SKILL.md"
+    marker: "session-last-errors"
+  - command: "python3 -m tools.contracts skill-section --namespace error_code"
+    reflected_in: "sw_core/assets/skill/SKILL_WINDOWS.md"
+    marker: "error-codes"
+  - command: "python3 -m tools.contracts skill-section --namespace session_last_error"
+    reflected_in: "sw_core/assets/skill/SKILL_WINDOWS.md"
+    marker: "session-last-errors"
 preflight:
   steps:
     - name: openspec
       kind: validation
       argv: ["openspec", "validate", "--all", "--strict"]
       when_path_exists: "openspec"
+      timeout_seconds: 300
+    - name: contracts
+      kind: validation
+      argv: ["python3", "-m", "tools.contracts", "check"]
       timeout_seconds: 300
     - name: tests
       kind: tests

@@ -44,6 +44,19 @@ policy_version: 1.0.18
   - **PR 描述須記錄評估結論**（新增了哪個 case，或 pytest 已覆蓋／為何免加）。
 - 新增 case 的 SOP 與 family↔issue 對照見 `docs/regression-plugin.md`；執行方式見 README「TestPilot 回歸測試」章。
 
+## 契約治理政策（Rust 重構 P0）
+
+- **`contracts/` 為單一事實來源與權威（ADR-07）**：Python 基線與 Rust 實作皆以此目錄為對外契約進行測試與驗證。
+- **錯誤碼輸出同步**：改動 `sw_core` 的錯誤輸出時，必須同步更新 `contracts/error_codes.yaml` 或 `contracts/session_last_errors.yaml`，並重新產生 SKILL 說明區段（執行 `python3 -m tools.contracts skill-section --namespace error_code` 與 `python3 -m tools.contracts skill-section --namespace session_last_error`，將 stdout 貼入 `SKILL.md` 與 `SKILL_WINDOWS.md` 對應的 4 個受管區塊）。
+- **驗證命令**：完成任何修改前，必須執行契約檢查器確認全綠：
+  ```bash
+  python3 -m tools.contracts check
+  ```
+- **獨立審閱（§10.4）**：修改 `contracts/`、比較器或哨兵的 PR 必須有獨立審閱；產品與契約同時修改（如狀態推進協定的同一 commit）時，PR 描述須分別呈現變更理由及既有基線對照；不得以刪案例、改分母、放寬正規化或把 FAIL 改 SKIP 取得全綠。
+- **無硬編碼計數**：所有診斷碼計數由資料動態產生，驗證器與測試嚴格禁止硬編碼任何計數常數（OD-06）。
+- **狀態推進協定**：實作行為變更（BC／SC／DF）時，依狀態推進協定在同一 commit 將 `contracts/behavior_changes.yaml` 對應變更項 `status` 改為 `IMPLEMENTED`、將碼狀態改為 `IMPLEMENTED`、`reachable` 設為 `true`、補齊 `contract_tests`，並將 `rpc_schema.json`／`cli_schema.json` 中的 `x-pending` 條目併入正式定義。
+- 詳細治理規範、C01～C19 檢查代號與狀態協定見 `docs/contracts-governance.md`。
+
 ## Policy Check 政策
 
 - 完成任何 phase 前，必須執行：
