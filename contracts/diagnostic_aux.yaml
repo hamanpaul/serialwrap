@@ -1,0 +1,138 @@
+# 診斷輔助目錄（spec §9.2～§9.3、盤點 03 §5、§6、§7.2）。由 P0-T4 建立。
+# 本檔與 contracts/error_codes.yaml、contracts/session_last_errors.yaml 不共用計數：warning_codes 與 error_details 不是 error_code。
+# 供 P3 生成 WarningCode、ErrorDetail、Classification、RecommendedAction、RecoveryAction 與 RecoverAction（rust-architecture §3.2）。
+# recommended_actions 為程式中所有 recommended_action 輸出點的值聯集（含 classification 以外的 self_test、device_attach、wait_external_flash、pin_profile、recover_interactive 等），
+# 每個值的來源行以註解列於其上方；T4 測試以 AST 掃描 sw_core/*.py 核對此清單為超集。
+# classifications 為 self-test 的 classification 集合（盤點 03 §6），recommended_actions 欄位為該分類可能輸出的動作（以括號內值拆開）。
+# classifications、recommended_actions、recovery_actions、recover_actions 四個清單皆依 value 升冪排序（Python 字串順序），來源行註解隨項目移動。
+# 數值欄位（value、code）一律逐字保留程式字串；meaning 為繁體中文說明。
+schema_version: 1
+revision: 1
+warning_codes:
+  - code: CMD_LENGTH_WARNING
+    meaning: "命令長度超過 CMD_WARN_BYTES（4096 bytes）時仍接受命令，回應附帶 warning；屬 warning 而非 error_code（sw_core/arbiter.py:22）"
+error_details:
+  - value: NOT_BOOTLOADER
+    parent_code: SESSION_NOT_READY
+    meaning: "session.interactive_open（allow_attached=true）於 session 為 ATTACHED 且 bridge 健康時，RX tail 末行未命中 profile.bootloader_prompts（不使用 UBOOT_FALLBACK_PROMPTS），又無 boot banner、也未命中 login／password 提示，SESSION_NOT_READY 回應附帶的 error_detail（sw_core/session_manager.py:4116）"
+classifications:
+  - value: ATTACHED_NOT_READY
+    recommended_actions: [console_attach]
+    meaning: "已 attach 但尚未 READY，以 console attach 檢視"
+  - value: AUTOBOOT_QUIET
+    recommended_actions: [wait]
+    meaning: "處於 boot quiet 視窗（U-Boot autoboot 倒數），應等待"
+  - value: BOOTLOADER
+    recommended_actions: [recover_interactive]
+    meaning: "rx tail 命中 bootloader 提示（或 last_error 為 BOOTLOADER_STUCK），應以 interactive 方式脫困"
+  - value: BRIDGE_DOWN
+    recommended_actions: [attach, recover]
+    meaning: "bridge 不存在時建議 attach；bridge 存在但 serial 讀取已停時建議 recover"
+  - value: DEVICE_MISSING
+    recommended_actions: [check_cable_or_bind]
+    meaning: "綁定的裝置不在線，應檢查線材或綁定設定"
+  - value: DEVICE_REBOUND_REQUIRED
+    recommended_actions: [reattach]
+    meaning: "裝置 real_path 已改變，需重新 attach"
+  - value: HUMAN_INTERACTIVE_ACTIVE
+    recommended_actions: [wait_or_detach_console]
+    meaning: "嚴格 human 鎖持有中，agent 應等待，或請人類 detach console"
+  - value: LOGIN_REQUIRED
+    recommended_actions: [console_attach]
+    meaning: "session.last_error 為 LOGIN_REQUIRED 時判定（該值由登入流程 rx tail 命中 login 或 password 提示產生，sw_core/session_manager.py:4427），需人類 console 登入"
+  - value: OK
+    recommended_actions: [none]
+    meaning: "健康，無需動作"
+  - value: PASSTHROUGH
+    recommended_actions: [console_attach, pin_profile]
+    meaning: "passthrough 平台不做 login 與 ready 判定；fallback profile 命中 template 時建議 pin_profile"
+  - value: REBOOTING
+    recommended_actions: [wait_or_console_attach]
+    meaning: "reboot 已送出，等待開機或以 console attach 觀察"
+  - value: RELEASED
+    recommended_actions: [device_attach, wait_external_flash]
+    meaning: "session 已 release；裝置可回收時建議 device attach，否則等待外部燒錄工具完成"
+  - value: RX_FLOOD
+    recommended_actions: [wait]
+    meaning: "console 輸出洪水，等待排空後由 daemon 自動重探"
+  - value: SESSION_RECOVERING
+    recommended_actions: [wait]
+    meaning: "session 正在 RECOVERING（reboot 恢復中），應等待"
+  - value: TARGET_UNRESPONSIVE
+    recommended_actions: [recover]
+    meaning: "目標無回應，建議 recover"
+  - value: VTTY_STALE
+    recommended_actions: [console_attach]
+    meaning: "虛擬 tty 已失效，需重新 console attach"
+recommended_actions:
+  # sw_core/session_manager.py:4379
+  - value: attach
+    meaning: "以 session attach 附掛"
+  # sw_core/session_manager.py:4360
+  - value: check_cable_or_bind
+    meaning: "檢查線材或 session bind 設定"
+  # sw_core/session_manager.py:4399、4405、4429、4468（變數）
+  - value: console_attach
+    meaning: "以 console attach 進入人類 console 觀察或操作"
+  # sw_core/session_manager.py:2168、2219、4521（IfExp）、4593
+  - value: device_attach
+    meaning: "以 device attach 重新附掛裝置"
+  # sw_core/session_manager.py:4575
+  - value: none
+    meaning: "無需動作"
+  # sw_core/session_manager.py:4417（變數）
+  - value: pin_profile
+    meaning: "將 fallback 偵測到的 profile pin 進設定（回應附 suggested_profile）"
+  # sw_core/session_manager.py:4370
+  - value: reattach
+    meaning: "重新 attach 裝置"
+  # sw_core/session_manager.py:4390、4558
+  - value: recover
+    meaning: "以 session recover 恢復"
+  # sw_core/session_manager.py:4452（變數）、4652（payload 指派）
+  - value: recover_interactive
+    meaning: "以 interactive 方式脫困 bootloader（interactive-open --allow-attached）"
+  # sw_core/session_manager.py:1150、sw_core/service.py:664
+  - value: self_test
+    meaning: "改以 session self-test 取得分類（READY_UNCONFIRMED 的後續動作）"
+  # sw_core/session_manager.py:4338、4494、4548、4464（變數）
+  - value: wait
+    meaning: "等待後重試"
+  # sw_core/session_manager.py:4521（IfExp）
+  - value: wait_external_flash
+    meaning: "等待外部燒錄工具完成（session 已 release 且裝置被占用）"
+  # sw_core/session_manager.py:4433（變數）
+  - value: wait_or_console_attach
+    meaning: "等待，或以 console attach 觀察"
+  # sw_core/session_manager.py:4352
+  - value: wait_or_detach_console
+    meaning: "等待，或請人類 detach console"
+recovery_actions:
+  # sw_core/session_manager.py:3866（action_name 迴圈）、3902（回應 recovery_action）
+  - value: CTRL_C
+    meaning: "命令逾時後以 CTRL_C 強制按鍵恢復"
+  # sw_core/session_manager.py:3866（action_name 迴圈）、3902（回應 recovery_action）
+  - value: CTRL_D
+    meaning: "CTRL_C 失敗後以 CTRL_D 強制按鍵恢復"
+  # sw_core/session_manager.py:3619
+  - value: EXPECT_REBOOT
+    meaning: "agent 送出 reboot，回應 status recovering 並改由背景恢復迴圈處理"
+  # sw_core/session_manager.py:3923
+  - value: FORCE_CLEAR_REATTACH
+    meaning: "PROMPT_TIMEOUT 後 CTRL_C 與 CTRL_D 皆失敗、命令 source 為 system:recover 時的強制清除後重新附掛（回應 recovery_action）"
+  # sw_core/session_manager.py:3931
+  - value: NONE
+    meaning: "未執行恢復動作（逾時且恢復未成功）"
+  # sw_core/session_manager.py:3602（human reboot）、3856（human 命令逾時）
+  - value: PROMOTE_HUMAN_INTERACTIVE
+    meaning: "human 來源的命令逾時或 reboot 時，改為開 interactive lease 交給該 human（partial 回應）"
+recover_actions:
+  # sw_core/session_manager.py:4681、4689（回應鍵為 action，非 recovery_action）
+  - value: FORCE_CLEAR_REATTACH
+    meaning: "強制清除後重新附掛（session recover force 路徑回應 action）"
+  # sw_core/session_manager.py:4613
+  - value: REATTACH
+    meaning: "bridge 不存在且裝置在線：session recover 回應 action 為重新附掛"
+  # sw_core/session_manager.py:4640
+  - value: REPROBE
+    meaning: "bridge 存在：session recover 回應 action 為重新探測 prompt"

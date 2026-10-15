@@ -1,0 +1,597 @@
+# session last_error 權威目錄（ADR-07、spec §9.3、§10.1）。由 P0-T4 建立，對應盤點 docs/rust-refactor/inventory/03-errors.md §5。
+# 與 contracts/error_codes.yaml 為獨立命名空間：本檔的值不計入 RPC／CLI error_code 數目；CREDENTIALS_UNRESOLVED 不得列於 error_codes.yaml。
+# 計數一律由本檔資料產生；驗證器、規則與測試不得以字面數字斷言筆數（OD-06）。
+# values 依 value 升冪排序（Python 字串順序）；動態前綴以 kind: dynamic_prefix 表示，value 為 `NAME:*`。
+# terminal 不手寫：由 cleared_by（無任何 auto: 項）與 auto_reprobe（兩邊皆 false）推導，T1 驗證器強制一致。
+# cleared_by：列出會把該值設回 null 的清除點（03 §5.3）。auto:＝背景迴圈或裝置事件自動觸發；operator:＝由 RPC 方法或 daemon 重啟觸發。
+# 清除點判定慣例（審查時請特別核對）：
+#   1. reboot 恢復迴圈（sw_core/session_manager.py:3454）由操作者的 reboot 命令啟動並於其內收斂（成功或逾時），成功清除記為 operator:command.submit。
+#   2. 裝置重新出現時的自動 attach（sw_core/session_manager.py:2602）會清除裝置狀態類的值（DEVICE_*、REBOUND、CLEARED、BRIDGE_DOWN:*、ATTACH_FAILED:*）；
+#      對探測結果類的值（登入、帳密、開機、恢復、REPROBE_FAILED）只以同一探測結果重新設回，不列為清除點。
+#   3. agent reboot 的清除點（sw_core/session_manager.py:3610）只在 READY 態觸發，而 READY 名義上 last_error 恆為 null，故不列入任何值。
+# detail 規則：LOGIN_FSM_DETAIL_ERRORS 12 值為 rx tail（截尾 300 字元）；TRANSPORT_STALL 為 transport_stall_hint 文字；BOOTLOADER_STUCK 為 matched_prompt；其餘 null。
+# logging、detail 等描述欄位之模板字串逐字取自程式 format 字串；T16 以 contracts/daemon_logging.yaml 核對。
+# states 含 RECOVERING 者：值由 reboot 恢復迴圈（sw_core/session_manager.py:3441、3466、3432）經 ensure_ready 寫入時，state 仍為 RECOVERING；該迴圈成功收斂（:3454）的清除記為 operator:command.submit。
+schema_version: 1
+revision: 1
+namespace: session_last_error
+values:
+  - value: "ATTACH_FAILED:*"
+    kind: dynamic_prefix
+    reason_forms: ["<ExcClassName>"]
+    reachable: true
+    meaning: "attach 過程中 bridge 啟動或 probe 拋出例外，session 回到 DETACHED；實際值為 ATTACH_FAILED:<例外類別名>"
+    agent_action: "確認 UART 裝置可開啟（權限與是否被其他程式占用）後以 session attach 重試；反覆發生時查看 daemon 日誌"
+    manual_recovery: "排除裝置權限或占用後，以 session attach 手動重試"
+    logging: "無"
+    detail: "null（無附帶 detail）"
+    terminal: false
+    auto_reprobe: {attached: false, detached: false}
+    states: ["DETACHED"]
+    set_by: ["sw_core/session_manager.py:2749 (_attach_by_id)", "sw_core/session_manager.py:3166 (_attach_by_id_dynamic)"]
+    cleared_by: ["auto:裝置事件觸發之 attach 開頭清除@session_manager.py:2602", "operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:daemon restart"]
+    promoted_via: []
+    error_code_namespace: allowed_shared
+    contract_tests: []
+  - value: "BCM_PROMPT_TIMEOUT"
+    kind: named
+    reason_forms: []
+    reachable: true
+    meaning: "platform 為 bcm 時等待 BCM CLI 提示（>）逾時"
+    agent_action: "檢查 profile 的 prompt_regex 與 timeout_s（bcm 建議 15 秒以上）後以 session attach 重試；裝置未回應時先排除線材與 USB 問題"
+    manual_recovery: "通常由 daemon 自動重探；逾期未恢復時以 session attach 手動重試"
+    logging: "無"
+    detail: "clean_text(rx_tail())[-300:]，空則 null"
+    terminal: false
+    auto_reprobe: {attached: true, detached: true}
+    states: ["ATTACHED", "DETACHED", "RECOVERING"]
+    set_by: ["sw_core/login_fsm.py:119-125 (_prompt_timeout_error)"]
+    cleared_by: ["auto:自動重探 DETACHED→ATTACHING@session_manager.py:1463", "auto:自動重探 probe 成功→READY@session_manager.py:2536", "operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:command.submit", "operator:daemon restart"]
+    promoted_via: ["session.attach", "session.recover"]
+    error_code_namespace: allowed_shared
+    contract_tests: []
+  - value: "BOOTLOADER_STUCK"
+    kind: named
+    reason_forms: []
+    reachable: true
+    meaning: "ATTACHED 狀態下自動重探命中 U-Boot 或 bootloader 提示且重探已耗盡；session 停在 ATTACHED，不再自動重探"
+    agent_action: "以 session self-test 取得 classification BOOTLOADER 與 recommended_action recover_interactive，依其指示以 interactive-open --allow-attached 脫困後，再以 session attach 重新進入流程"
+    manual_recovery: "人工經 interactive-open --allow-attached 脫困後，以 session attach 或 session recover 重新進入流程"
+    logging: "無"
+    detail: "matched_prompt=<pattern>（同時寫入 last_error_detail）"
+    terminal: true
+    auto_reprobe: {attached: false, detached: false}
+    states: ["ATTACHED"]
+    set_by: ["sw_core/session_manager.py:1493 (_finish_probe_reprobe)"]
+    cleared_by: ["operator:session.attach", "operator:session.recover", "operator:daemon restart"]
+    promoted_via: ["session.attach", "session.recover"]
+    error_code_namespace: allowed_shared
+    contract_tests: ["tests/test_boot_quiet.py::TestBootloaderStuckDetection::test_reprobe_failure_on_uboot_prompt_sets_bootloader_stuck"]
+  - value: "BRIDGE_DOWN:*"
+    kind: dynamic_prefix
+    reason_forms: ["SERIAL_READ:<errno|ExcName>", "SELECT:<errno|ExcName>"]
+    reachable: true
+    meaning: "UART 讀取或 select 失敗，bridge 已斷，session 轉為 DETACHED；實際值為 BRIDGE_DOWN:<reason>"
+    agent_action: "以 session list 確認裝置在線後執行 session attach 或 session recover；裝置不在線時先排除線材或 USB 問題"
+    manual_recovery: "裝置重新在線後自動附掛，或以 session attach 或 session recover 手動重試"
+    logging: "無"
+    detail: "null（無附帶 detail）"
+    terminal: false
+    auto_reprobe: {attached: false, detached: false}
+    states: ["DETACHED"]
+    set_by: ["sw_core/session_manager.py:2453 (_handle_bridge_down)"]
+    cleared_by: ["auto:bridge down 且裝置在線立即清除@session_manager.py:2456", "auto:裝置事件觸發之 attach 開頭清除@session_manager.py:2602", "operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:daemon restart"]
+    promoted_via: []
+    error_code_namespace: allowed_shared
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapLastError::test_last_error_bridge_down_prefix", "tests/test_contracts_gap_codes.py::TestGapLastError::test_last_error_bridge_down_device_online"]
+  - value: "CLEARED"
+    kind: named
+    reason_forms: []
+    reachable: true
+    meaning: "operator 執行 session clear 後，session 解除綁定並以此值記錄"
+    agent_action: "裝置在線時會立即清除；否則以 session attach 或 device attach 重新附掛後再操作"
+    manual_recovery: "以 session attach 或 device attach 重新附掛"
+    logging: "無"
+    detail: "null（無附帶 detail）"
+    terminal: false
+    auto_reprobe: {attached: false, detached: false}
+    states: ["DETACHED"]
+    set_by: ["sw_core/session_manager.py:1841 (clear_session)"]
+    cleared_by: ["auto:裝置在線立即清除@session_manager.py:1846", "auto:裝置事件觸發之 attach 開頭清除@session_manager.py:2602", "operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:daemon restart"]
+    promoted_via: []
+    error_code_namespace: allowed_shared
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapLastError::test_last_error_cleared", "tests/test_contracts_gap_codes.py::TestGapLastError::test_last_error_cleared_device_online"]
+  - value: "CONSOLE_UNLOCK_BOOTLOADER"
+    kind: named
+    reason_forms: []
+    reachable: true
+    meaning: "console_unlock 步驟遇到 CFE 或 bootloader 提示，不送 secret 並停止後續 TX；login_fsm.py:293 為空行 probe 之前判定（零 TX），login_fsm.py:308 為空行 probe 之後判定（該處之前已送過空行 probe）"
+    agent_action: "以 interactive-open --allow-attached 手動進入 bootloader 處理，完成後以 session attach 重試"
+    manual_recovery: "人工脫困後，以 session attach 或 session recover 重新進入流程，或重啟 daemon"
+    logging: "無"
+    detail: "null（無附帶 detail）"
+    terminal: true
+    auto_reprobe: {attached: false, detached: false}
+    states: ["ATTACHED", "DETACHED", "RECOVERING"]
+    set_by: ["sw_core/login_fsm.py:293", "sw_core/login_fsm.py:308"]
+    cleared_by: ["operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:command.submit", "operator:daemon restart"]
+    promoted_via: ["session.attach", "session.recover"]
+    error_code_namespace: allowed_shared
+    contract_tests: ["tests/test_console_unlock.py::test_cfe_prompt_blocks_all_tx"]
+  - value: "CONSOLE_UNLOCK_IDLE_TIMEOUT"
+    kind: named
+    reason_forms: []
+    reachable: true
+    meaning: "console_unlock 等待 RX 閒置逾時（console 持續有輸出，未能靜默）；從未送出 secret。login_fsm.py:291 為零 TX；login_fsm.py:306、:315 之前已於 :300 送出一次空行 probe（已有 TX，仍未送 secret）"
+    agent_action: "等待 console 靜默後以 session attach 重試；若 console 持續輸出，先排查 RX 洪水（RX_FLOOD）"
+    manual_recovery: "console 靜默後以 session attach 手動重試"
+    logging: "無"
+    detail: "null（無附帶 detail）"
+    terminal: true
+    auto_reprobe: {attached: false, detached: false}
+    states: ["ATTACHED", "DETACHED", "RECOVERING"]
+    set_by: ["sw_core/login_fsm.py:291", "sw_core/login_fsm.py:306", "sw_core/login_fsm.py:315"]
+    cleared_by: ["operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:command.submit", "operator:daemon restart"]
+    promoted_via: ["session.attach", "session.recover"]
+    error_code_namespace: allowed_shared
+    contract_tests: ["tests/test_console_unlock.py::test_continuous_rx_timeout_never_transmits"]
+  - value: "CONSOLE_UNLOCK_PROMPT_TIMEOUT"
+    kind: named
+    reason_forms: []
+    reachable: true
+    meaning: "送出 console_unlock secret 後等不到 prompt（逾時）"
+    agent_action: "此值具自動重探資格；若持續出現，以 session self-test 排查 console 狀態"
+    manual_recovery: "通常由 daemon 自動重探；逾期未恢復時以 session attach 手動重試"
+    logging: "無"
+    detail: "null（無附帶 detail）"
+    terminal: false
+    auto_reprobe: {attached: true, detached: true}
+    states: ["ATTACHED", "DETACHED", "RECOVERING"]
+    set_by: ["sw_core/login_fsm.py:323"]
+    cleared_by: ["auto:自動重探 DETACHED→ATTACHING@session_manager.py:1463", "auto:自動重探 probe 成功→READY@session_manager.py:2536", "operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:command.submit", "operator:daemon restart"]
+    promoted_via: ["session.attach", "session.recover"]
+    error_code_namespace: allowed_shared
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapLastError::test_last_error_console_unlock_prompt_timeout"]
+  - value: "CREDENTIALS_UNRESOLVED"
+    kind: named
+    reason_forms: []
+    reachable: true
+    meaning: "profile 宣告了帳密來源（user_env、pass_env 或 env_file）但解析為空（env_file 缺失、不可讀或缺 key）；屬登入終態，daemon 不對 login prompt 送空帳密，也不自動重探"
+    agent_action: "不要反覆 recover 或 attach；告知使用者補齊 profile 宣告的帳密來源後，再手動 session attach 或 session recover；WARNING 與 WAL 警告會列出實際解析的路徑與原因（不含帳密值）"
+    manual_recovery: "補齊帳密後由使用者明確執行 serialwrap session attach 或 session recover，或重啟 daemon；不得改寫 state.json 假裝恢復"
+    logging: "進入終態時一次性寫入 WAL META credentials_unresolved（reason ∈ env_file_missing／env_file_unreadable／key_absent），並以 daemon logger 輸出一次 WARNING（模板逐字取自 sw_core/session_manager.py:1211 的 format 字串：「session %s 帳密解析未完成（reason=%s, env_file=%s）：不對 login prompt 送空帳密，標記 CREDENTIALS_UNRESOLVED 終態，請補齊帳密後手動 attach/recover」）；兩者皆以 credentials_warned 去重；手動 session attach／recover 會重置 credentials_warned（sw_core/session_manager.py:2181、2196、4605），之後再次進入終態會再告警一次"
+    detail: "null（無附帶 detail）"
+    terminal: true
+    auto_reprobe: {attached: false, detached: false}
+    states: ["ATTACHED", "RECOVERING"]  # RECOVERING：reboot 恢復迴圈（sw_core/session_manager.py:3432）內寫入，break 後收斂為 ATTACHED
+    set_by: ["sw_core/login_fsm.py:288 (console_unlock 無 secret)", "sw_core/session_manager.py:2497 (_probe_existing_bridge)", "sw_core/session_manager.py:2647 (_attach_by_id)", "sw_core/session_manager.py:3083 (_attach_by_id_dynamic)", "sw_core/session_manager.py:3432 (reboot 恢復迴圈)"]
+    cleared_by: ["operator:session.attach", "operator:session.recover", "operator:daemon restart"]
+    promoted_via: ["session.attach", "session.recover"]
+    error_code_namespace: forbidden
+    contract_tests: ["tests/test_credentials_unresolved.py::TestCredentialsUnresolvedGate::test_declared_env_file_missing_marks_credentials_unresolved", "tests/test_console_unlock.py::test_missing_unlock_never_probes_or_sends"]
+  - value: "DEVICE_NOT_FOUND"
+    kind: named
+    reason_forms: []
+    reachable: true
+    meaning: "bind 或 attach 時 device_by_id 不在目前裝置清單中"
+    agent_action: "以 device list 確認裝置已接上，接上後以 session attach 重試"
+    manual_recovery: "裝置接上後以 session attach 或 device attach 重試"
+    logging: "無"
+    detail: "null（無附帶 detail）"
+    terminal: false
+    auto_reprobe: {attached: false, detached: false}
+    states: ["DETACHED"]
+    set_by: ["sw_core/session_manager.py:2091 (bind_session)", "sw_core/session_manager.py:2188 (attach_session)", "sw_core/session_manager.py:2250 (_mark_missing_devices_locked)", "sw_core/session_manager.py:2593 (_attach_by_id)"]
+    cleared_by: ["auto:裝置事件觸發之 attach 開頭清除@session_manager.py:2602", "operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:daemon restart"]
+    promoted_via: []
+    error_code_namespace: allowed_shared
+    contract_tests: ["tests/test_resilience_hotplug.py::TestDeviceHotplug::test_missing_bound_device_sets_detached_diagnostic"]
+  - value: "DEVICE_REBOUND_REQUIRED"
+    kind: named
+    reason_forms: []
+    reachable: true
+    meaning: "同一 device_by_id 的裝置 real_path 改變（rebound），session 轉為 DETACHED"
+    agent_action: "確認新裝置節點正確後以 session attach 重新附掛；若 session 未自動恢復，手動 attach"
+    manual_recovery: "確認裝置節點後以 session attach 重新附掛"
+    logging: "無"
+    detail: "null（無附帶 detail）"
+    terminal: false
+    auto_reprobe: {attached: false, detached: false}
+    states: ["DETACHED"]
+    set_by: ["sw_core/session_manager.py:2280 (update_devices 經 _detach_by_id)"]
+    cleared_by: ["auto:裝置事件觸發之 attach 開頭清除@session_manager.py:2602", "operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:daemon restart"]
+    promoted_via: []
+    error_code_namespace: allowed_shared
+    contract_tests: ["tests/test_resilience_hotplug.py::TestDeviceHotplug::test_device_realpath_change_triggers_reattach"]
+  - value: "DEVICE_REMOVED"
+    kind: named
+    reason_forms: []
+    reachable: true
+    meaning: "裝置自 /dev 消失，session 轉為 DETACHED"
+    agent_action: "確認裝置重新接上後會自動附掛；若未自動恢復，以 session attach 重試"
+    manual_recovery: "裝置重新出現後自動附掛，或以 session attach 手動重試"
+    logging: "無"
+    detail: "null（無附帶 detail）"
+    terminal: false
+    auto_reprobe: {attached: false, detached: false}
+    states: ["DETACHED"]
+    set_by: ["sw_core/session_manager.py:2280 (update_devices 經 _detach_by_id)"]
+    cleared_by: ["auto:裝置事件觸發之 attach 開頭清除@session_manager.py:2602", "operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:daemon restart"]
+    promoted_via: []
+    error_code_namespace: allowed_shared
+    contract_tests: ["tests/test_resilience_hotplug.py::TestDeviceHotplug::test_device_removed_session_goes_detached"]
+  - value: "DEVICE_REMOVED_DURING_ATTACH"
+    kind: named
+    reason_forms: []
+    reachable: true
+    meaning: "attach 收尾時發現裝置已移除（passthrough 不做 probe，收尾才檢查裝置是否仍在）"
+    agent_action: "等裝置重新出現後以 session attach 重試"
+    manual_recovery: "裝置重新出現後以 session attach 手動重試"
+    logging: "無"
+    detail: "null（無附帶 detail）"
+    terminal: false
+    auto_reprobe: {attached: false, detached: false}
+    states: ["DETACHED"]
+    set_by: ["sw_core/session_manager.py:2700 (_attach_by_id)", "sw_core/session_manager.py:3123 (_attach_by_id_dynamic)"]
+    cleared_by: ["auto:裝置事件觸發之 attach 開頭清除@session_manager.py:2602", "operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:daemon restart"]
+    promoted_via: []
+    error_code_namespace: allowed_shared
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapLastError::test_last_error_device_removed_during_attach"]
+  - value: "LOGIN_PROMPT_TIMEOUT"
+    kind: named
+    reason_forms: []
+    reachable: true
+    meaning: "等待 login 提示逾時（未見 login 提示）"
+    agent_action: "此值具自動重探資格；逾期未恢復時檢查 profile 的 login_regex 與 timeout_s，並以 console attach 觀察開機輸出"
+    manual_recovery: "通常由 daemon 自動重探；逾期未恢復時以 session attach 手動重試"
+    logging: "無"
+    detail: "clean_text(rx_tail())[-300:]，空則 null"
+    terminal: false
+    auto_reprobe: {attached: true, detached: true}
+    states: ["ATTACHED", "DETACHED", "RECOVERING"]
+    set_by: ["sw_core/login_fsm.py:214"]
+    cleared_by: ["auto:自動重探 DETACHED→ATTACHING@session_manager.py:1463", "auto:自動重探 probe 成功→READY@session_manager.py:2536", "operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:command.submit", "operator:daemon restart"]
+    promoted_via: ["session.attach", "session.recover"]
+    error_code_namespace: allowed_shared
+    contract_tests: []
+  - value: "LOGIN_REQUIRED"
+    kind: named
+    reason_forms: []
+    reachable: true
+    meaning: "rx tail 命中 login 或 password 提示，但目前流程不自動登入（#174 分流），需要人類 console 介入"
+    agent_action: "以 console attach 進入人類 console 完成登入，或補齊 profile 的登入設定後以 session attach 重試"
+    manual_recovery: "補齊登入設定或由人類 console 登入後，以 session attach 或 session recover 重新進入流程"
+    logging: "無"
+    detail: "clean_text(rx_tail())[-300:]，空則 null"
+    terminal: true
+    auto_reprobe: {attached: false, detached: false}
+    states: ["ATTACHED", "DETACHED", "RECOVERING"]
+    set_by: ["sw_core/login_fsm.py:136", "sw_core/login_fsm.py:172", "sw_core/login_fsm.py:181", "sw_core/login_fsm.py:200"]
+    cleared_by: ["operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:command.submit", "operator:daemon restart"]
+    promoted_via: ["session.attach", "session.recover"]
+    error_code_namespace: allowed_shared
+    contract_tests: ["tests/test_login_error_detail.py::TestLoginFsmErrorDetail::test_login_required_gets_rx_tail_detail"]
+  - value: "LOGIN_USER_REQUIRED"
+    kind: named
+    reason_forms: []
+    reachable: true
+    meaning: "login 提示出現，但未設定帳號（pass_env 有值以進入登入流程）"
+    agent_action: "在 profile 設定 user_env 或補齊帳號環境變數後，以 session attach 重試"
+    manual_recovery: "補齊帳號設定後，以 session attach 或 session recover 手動重新進入流程"
+    logging: "無"
+    detail: "clean_text(rx_tail())[-300:]，空則 null"
+    terminal: true
+    auto_reprobe: {attached: false, detached: false}
+    states: ["ATTACHED", "DETACHED", "RECOVERING"]
+    set_by: ["sw_core/login_fsm.py:219"]
+    cleared_by: ["operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:command.submit", "operator:daemon restart"]
+    promoted_via: ["session.attach", "session.recover"]
+    error_code_namespace: allowed_shared
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapLastError::test_last_error_login_user_required"]
+  - value: "PASS_ENV_MISSING"
+    kind: named
+    reason_forms: []
+    reachable: true
+    meaning: "login 提示需要密碼，但 pass_env 指向的環境變數為空"
+    agent_action: "補齊 profile 的 pass_env 對應環境變數（或 env_file 內的 key）後，以 session attach 重試"
+    manual_recovery: "補齊密碼來源後，以 session attach 或 session recover 手動重新進入流程"
+    logging: "無"
+    detail: "clean_text(rx_tail())[-300:]，空則 null"
+    terminal: true
+    auto_reprobe: {attached: false, detached: false}
+    states: ["ATTACHED", "DETACHED", "RECOVERING"]
+    set_by: ["sw_core/login_fsm.py:115"]
+    cleared_by: ["operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:command.submit", "operator:daemon restart"]
+    promoted_via: ["session.attach", "session.recover"]
+    error_code_namespace: allowed_shared
+    contract_tests: ["tests/test_rx_flood.py::TestFloodReclassify::test_pass_env_missing_never_masked"]
+  - value: "PASS_ENV_REQUIRED"
+    kind: named
+    reason_forms: []
+    reachable: true
+    meaning: "profile 設定了 user_env 但缺 pass_env，login 與 password 提示皆出現"
+    agent_action: "在 profile 補上 pass_env 設定後，以 session attach 重試"
+    manual_recovery: "補上 pass_env 設定後，以 session attach 或 session recover 手動重新進入流程"
+    logging: "無"
+    detail: "clean_text(rx_tail())[-300:]，空則 null"
+    terminal: true
+    auto_reprobe: {attached: false, detached: false}
+    states: ["ATTACHED", "DETACHED", "RECOVERING"]
+    set_by: ["sw_core/login_fsm.py:112"]
+    cleared_by: ["operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:command.submit", "operator:daemon restart"]
+    promoted_via: ["session.attach", "session.recover"]
+    error_code_namespace: allowed_shared
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapLastError::test_last_error_pass_env_required"]
+  - value: "POST_LOGIN_CMD_TIMEOUT"
+    kind: named
+    reason_forms: []
+    reachable: true
+    meaning: "登入成功後執行 post_login_cmd 逾時"
+    agent_action: "檢查 profile 的 post_login_cmd 與 timeout_s（bcm 切換 shell 的情境建議加大）後，以 session attach 重試"
+    manual_recovery: "修正 post_login_cmd 或 timeout_s 後，以 session attach 或 session recover 手動重新進入流程"
+    logging: "無"
+    detail: "clean_text(rx_tail())[-300:]，空則 null"
+    terminal: true
+    auto_reprobe: {attached: false, detached: false}
+    states: ["ATTACHED", "DETACHED", "RECOVERING"]
+    set_by: ["sw_core/login_fsm.py:174"]
+    cleared_by: ["operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:command.submit", "operator:daemon restart"]
+    promoted_via: ["session.attach", "session.recover"]
+    error_code_namespace: allowed_shared
+    contract_tests: ["tests/test_login_error_detail.py::TestLoginFsmErrorDetail::test_post_login_cmd_timeout_gets_rx_tail_detail_when_not_stalled"]
+  - value: "PROMPT_TIMEOUT"
+    kind: named
+    reason_forms: []
+    reachable: true
+    meaning: "命令送出後等不到 prompt，且 CTRL_C／CTRL_D 皆未恢復（或 boot quiet 期間跳過強制按鍵）時，由 _transition_to_attached 轉為 ATTACHED（sw_core/session_manager.py:3913）"
+    agent_action: "此值具自動重探資格；逾期未恢復時以 session recover 或 console attach 檢查 target 狀態"
+    manual_recovery: "通常由 daemon 自動重探；逾期未恢復時以 session recover 手動重試"
+    logging: "無"
+    detail: "null（無附帶 detail）"
+    terminal: false
+    auto_reprobe: {attached: true, detached: true}
+    states: ["ATTACHED"]
+    set_by: ["sw_core/session_manager.py:3356 (_transition_to_attached)"]
+    cleared_by: ["auto:自動重探 probe 成功→READY@session_manager.py:2536", "operator:session.attach", "operator:session.recover", "operator:daemon restart"]
+    promoted_via: ["session.attach", "session.recover"]
+    error_code_namespace: allowed_shared
+    contract_tests: ["tests/test_bad_command_recovery.py::TestBadCommandRecovery::test_timeout_without_recovery_demotes_then_re_ready"]
+  - value: "PROMPT_UNAVAILABLE"
+    kind: named
+    reason_forms: []
+    reachable: true
+    meaning: "attach 後 prompt 不可用（開機窗或 probe 未見 prompt）"
+    agent_action: "attach 撞上 DUT 開機窗時屬暫態，daemon 會等 RX 閒置後自動重探；逾期未恢復時以 console attach 觀察"
+    manual_recovery: "通常由 daemon 於 ATTACHED 狀態自動重探；逾期未恢復時以 session attach 手動重試"
+    logging: "無"
+    detail: "null（無附帶 detail）"
+    terminal: false
+    auto_reprobe: {attached: true, detached: false}
+    states: ["ATTACHED"]
+    set_by: ["sw_core/login_fsm.py:137", "sw_core/session_manager.py:2484 (_probe_existing_bridge)", "sw_core/session_manager.py:2639 (_attach_by_id)"]
+    cleared_by: ["auto:自動重探 probe 成功→READY@session_manager.py:2536", "operator:session.attach", "operator:session.recover", "operator:daemon restart"]
+    promoted_via: ["session.attach", "session.recover"]
+    error_code_namespace: allowed_shared
+    contract_tests: ["tests/test_attach_error_surface.py::TestAttachErrorSurface::test_attach_probe_fail_surfaces_top_level_error"]
+  - value: "PRPL_PROMPT_TIMEOUT"
+    kind: named
+    reason_forms: []
+    reachable: true
+    meaning: "platform 為 prpl（其餘未指定者一律歸此）時等待 prompt 逾時"
+    agent_action: "此值具自動重探資格；逾期未恢復時檢查 profile 的 prompt_regex 與 timeout_s，並以 session attach 重試"
+    manual_recovery: "通常由 daemon 自動重探；逾期未恢復時以 session attach 手動重試"
+    logging: "無"
+    detail: "clean_text(rx_tail())[-300:]，空則 null"
+    terminal: false
+    auto_reprobe: {attached: true, detached: true}
+    states: ["ATTACHED", "DETACHED", "RECOVERING"]
+    set_by: ["sw_core/login_fsm.py:119-125 (_prompt_timeout_error)"]
+    cleared_by: ["auto:自動重探 DETACHED→ATTACHING@session_manager.py:1463", "auto:自動重探 probe 成功→READY@session_manager.py:2536", "operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:command.submit", "operator:daemon restart"]
+    promoted_via: ["session.attach", "session.recover"]
+    error_code_namespace: allowed_shared
+    contract_tests: []
+  - value: "READY_NONCE_TIMEOUT"
+    kind: named
+    reason_forms: []
+    reachable: true
+    meaning: "READY 確認 nonce 逾時（ready_probe 的回聲未出現）"
+    agent_action: "檢查 profile 的 ready_probe 設定與 target 是否可執行命令，修正後以 session attach 重試"
+    manual_recovery: "修正 ready_probe 或 target 狀態後，以 session attach 或 session recover 手動重新進入流程"
+    logging: "無"
+    detail: "clean_text(rx_tail())[-300:]，空則 null"
+    terminal: true
+    auto_reprobe: {attached: false, detached: false}
+    states: ["ATTACHED", "DETACHED", "RECOVERING"]
+    set_by: ["sw_core/login_fsm.py:195"]
+    cleared_by: ["operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:command.submit", "operator:daemon restart"]
+    promoted_via: ["session.attach", "session.recover"]
+    error_code_namespace: allowed_shared
+    contract_tests: ["tests/test_login_fsm.py::TestLoginFsmHardening::test_ready_nonce_timeout_stays_when_not_at_login_prompt"]
+  - value: "READY_PROMPT_TIMEOUT"
+    kind: named
+    reason_forms: []
+    reachable: true
+    meaning: "ready_probe 之後等不到 prompt（逾時）"
+    agent_action: "此值具自動重探資格；逾期未恢復時檢查 profile 的 ready_probe 與 prompt_regex，並以 session attach 重試"
+    manual_recovery: "通常由 daemon 自動重探；逾期未恢復時以 session attach 手動重試"
+    logging: "無"
+    detail: "clean_text(rx_tail())[-300:]，空則 null"
+    terminal: false
+    auto_reprobe: {attached: true, detached: true}
+    states: ["ATTACHED", "DETACHED", "RECOVERING"]
+    set_by: ["sw_core/login_fsm.py:202"]
+    cleared_by: ["auto:自動重探 DETACHED→ATTACHING@session_manager.py:1463", "auto:自動重探 probe 成功→READY@session_manager.py:2536", "operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:command.submit", "operator:daemon restart"]
+    promoted_via: ["session.attach", "session.recover"]
+    error_code_namespace: allowed_shared
+    contract_tests: []
+  - value: "REBOOTING"
+    kind: named
+    reason_forms: []
+    reachable: true
+    meaning: "human 來源的 reboot 命令已送出，session 停留於 ATTACHED，等待 target 重新開機"
+    agent_action: "等待開機完成後以 session self-test 確認狀態；需要立即操作時以 console attach 觀察開機輸出"
+    manual_recovery: "開機完成後以 session attach 或 session recover 重新進入流程"
+    logging: "無"
+    detail: "null（無附帶 detail）"
+    terminal: true
+    auto_reprobe: {attached: false, detached: false}
+    states: ["ATTACHED"]
+    set_by: ["sw_core/session_manager.py:3589 (_handle_reboot_command)"]
+    cleared_by: ["operator:session.attach", "operator:session.recover", "operator:daemon restart"]
+    promoted_via: ["session.attach", "session.recover"]
+    error_code_namespace: allowed_shared
+    contract_tests: ["tests/test_session_bind.py::TestSessionBind::test_human_reboot_command_promotes_attached_interactive"]
+  - value: "REBOUND"
+    kind: named
+    reason_forms: []
+    reachable: true
+    meaning: "session.bind 將 session 改綁到不同 device_by_id，session 轉為 DETACHED"
+    agent_action: "裝置在線時會立即清除；否則以 session attach 重新附掛"
+    manual_recovery: "以 session attach 重新附掛綁定後的裝置"
+    logging: "無"
+    detail: "null（無附帶 detail）"
+    terminal: false
+    auto_reprobe: {attached: false, detached: false}
+    states: ["DETACHED"]
+    set_by: ["sw_core/session_manager.py:2063 (bind_session)"]
+    cleared_by: ["operator:session.bind", "auto:裝置事件觸發之 attach 開頭清除@session_manager.py:2602", "operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:daemon restart"]
+    promoted_via: []
+    error_code_namespace: allowed_shared
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapLastError::test_last_error_rebound", "tests/test_contracts_gap_codes.py::TestGapLastError::test_last_error_rebound_device_online"]
+  - value: "RECOVERY_ERROR"
+    kind: named
+    reason_forms: []
+    reachable: true
+    meaning: "reboot 恢復迴圈中 ensure_ready 拋出例外；worker 不結束，記錄此值並續迴圈"
+    agent_action: "等待恢復逾時收尾後，以 session self-test 取得分類；若仍異常，以 console attach 觀察並以 session recover 重試"
+    manual_recovery: "以 session attach 或 session recover 手動重新進入流程"
+    logging: "無"
+    detail: "null（無附帶 detail）"
+    terminal: true
+    auto_reprobe: {attached: false, detached: false}
+    states: ["RECOVERING", "ATTACHED"]
+    set_by: ["sw_core/session_manager.py:3441 (reboot 恢復迴圈)", "sw_core/session_manager.py:3466 (reboot 恢復迴圈)"]
+    cleared_by: ["operator:command.submit", "operator:session.attach", "operator:session.recover", "operator:daemon restart"]
+    promoted_via: ["session.attach", "session.recover"]
+    error_code_namespace: allowed_shared
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapLastError::test_last_error_recovery_error"]
+  - value: "RECOVERY_TIMEOUT"
+    kind: named
+    reason_forms: []
+    reachable: true
+    meaning: "reboot 恢復逾時收尾；bridge 不存在時轉為 DETACHED，bridge 存在時保留既有的 last_error，無既有值則以此值收尾"
+    agent_action: "以 session self-test 確認分類後，以 session recover 手動重試；bridge 不存在時以 session attach 重新附掛"
+    manual_recovery: "以 session attach 或 session recover 手動重新進入流程"
+    logging: "無"
+    detail: "null（無附帶 detail）"
+    terminal: true
+    auto_reprobe: {attached: false, detached: false}
+    states: ["DETACHED", "ATTACHED"]
+    set_by: ["sw_core/session_manager.py:3490 (reboot 恢復逾時收尾，bridge 為 None)", "sw_core/session_manager.py:3493 (reboot 恢復逾時收尾，bridge 存在)"]
+    cleared_by: ["operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:daemon restart"]
+    promoted_via: ["session.attach", "session.recover"]
+    error_code_namespace: allowed_shared
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapLastError::test_last_error_recovery_timeout"]
+  - value: "RELEASED"
+    kind: named
+    reason_forms: []
+    reachable: true
+    meaning: "session 經 device release 讓出 UART（燒錄或裝置交接），僅操作者可重新附掛；daemon 重啟後由 state.json 還原為 RELEASED，但 last_error 不寫入 state.json，重啟後為 null"
+    agent_action: "燒錄或交接完成後，以 device attach 重新附掛（session attach／recover 對 RELEASED 只回 released:true＋recommended_action=device_attach，不會附掛）；在此之前不要嘗試 probe"
+    manual_recovery: "燒錄或交接完成後，以 device attach 重新附掛（session attach／recover 不會附掛 RELEASED）；或以 session bind 明確改綁其他裝置（覆寫 RELEASED）"
+    logging: "無"
+    detail: "null（無附帶 detail）"
+    terminal: true
+    auto_reprobe: {attached: false, detached: false}
+    states: ["RELEASED", "DETACHED"]  # DETACHED：裝置離線時 _mark_missing_devices_locked（sw_core/session_manager.py:2240）改為 DETACHED，last_error 保留 RELEASED
+    set_by: ["sw_core/session_manager.py:1866 (release_device)"]
+    cleared_by: ["operator:device.attach", "operator:session.bind", "operator:daemon restart"]
+    promoted_via: []
+    error_code_namespace: allowed_shared
+    contract_tests: ["tests/test_device_handoff.py::TestReleaseDevice::test_release_clean_slate_and_provenance"]
+  - value: "REPROBE_FAILED:*"
+    kind: dynamic_prefix
+    reason_forms: ["<ExcClassName>"]
+    reachable: true
+    meaning: "自動重探的 probe 拋出例外；session 保持 ATTACHED，且此類錯誤不具自動重探資格。實際值為 REPROBE_FAILED:<例外類別名>"
+    agent_action: "以 session self-test 排查 bridge 狀態；仍異常時以 session recover 手動重試"
+    manual_recovery: "以 session attach 或 session recover 手動重新進入流程"
+    logging: "無"
+    detail: "null（無附帶 detail）"
+    terminal: true
+    auto_reprobe: {attached: false, detached: false}
+    states: ["ATTACHED"]
+    set_by: ["sw_core/session_manager.py:1584 (自動重探 worker)"]
+    cleared_by: ["operator:session.attach", "operator:session.recover", "operator:daemon restart"]
+    promoted_via: ["session.attach", "session.recover"]
+    error_code_namespace: allowed_shared
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapLastError::test_last_error_reprobe_failed_prefix"]
+  - value: "RX_FLOOD"
+    kind: named
+    reason_forms: []
+    reachable: true
+    meaning: "console 輸出洪水淹沒 probe（rx_bytes_last_10s 超過閾值）；不是 console 死亡"
+    agent_action: "等待 RX 排空，daemon 會於閒置後自動重探並升為 READY；不要反覆 recover 或 attach，以 session list 的 rx_bytes_last_10s 觀察排空進度"
+    manual_recovery: "通常由 daemon 自動重探；排空後仍未恢復時以 session attach 手動重試"
+    logging: "無"
+    detail: "null（無附帶 detail）"
+    terminal: false
+    auto_reprobe: {attached: true, detached: true}
+    states: ["ATTACHED", "DETACHED", "RECOVERING"]
+    set_by: ["sw_core/login_fsm.py:47-73 (_maybe_reclassify_flood)"]
+    cleared_by: ["auto:自動重探 DETACHED→ATTACHING@session_manager.py:1463", "auto:自動重探 probe 成功→READY@session_manager.py:2536", "operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:command.submit", "operator:daemon restart"]
+    promoted_via: ["session.attach", "session.recover"]
+    error_code_namespace: allowed_shared
+    contract_tests: ["tests/test_rx_flood.py::TestFloodReclassify::test_probe_fail_over_threshold_returns_rx_flood"]
+  - value: "SHELL_PROMPT_TIMEOUT"
+    kind: named
+    reason_forms: []
+    reachable: true
+    meaning: "platform 為 shell 時等待 shell 提示（#）逾時"
+    agent_action: "此值具自動重探資格；逾期未恢復時檢查 profile 的 prompt_regex 與 timeout_s，並以 session attach 重試"
+    manual_recovery: "通常由 daemon 自動重探；逾期未恢復時以 session attach 手動重試"
+    logging: "無"
+    detail: "clean_text(rx_tail())[-300:]，空則 null"
+    terminal: false
+    auto_reprobe: {attached: true, detached: true}
+    states: ["ATTACHED", "DETACHED", "RECOVERING"]
+    set_by: ["sw_core/login_fsm.py:119-125 (_prompt_timeout_error)"]
+    cleared_by: ["auto:自動重探 DETACHED→ATTACHING@session_manager.py:1463", "auto:自動重探 probe 成功→READY@session_manager.py:2536", "operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:command.submit", "operator:daemon restart"]
+    promoted_via: ["session.attach", "session.recover"]
+    error_code_namespace: allowed_shared
+    contract_tests: []
+  - value: "TRANSPORT_STALL"
+    kind: named
+    reason_forms: []
+    reachable: true
+    meaning: "probe 全程零 RX 且 RX 凍結 30 秒以上，疑似 USB 或 usbip read-endpoint stall；serialwrap 的 recover 與 release+attach 無法自復"
+    agent_action: "勿先 power-cycle DUT；以 dmesg 佐證後，依 last_error_detail 的 host 層指令做 USB re-enumeration（authorized 0 然後 1 或 usbipd detach 與 attach）"
+    manual_recovery: "host 層 USB re-enumeration 完成後，RX 恢復即自動重臂；仍無法恢復時以 session attach 手動重試"
+    logging: "一次性寫入 WAL META transport_stall_suspected（real_path、rx_age_s 取 1 位小數），並輸出一次 WARNING（模板逐字取自 sw_core/session_manager.py:1311 的 format 字串：「session %s 疑似 transport stall（零 RX %.1fs、probe 全程無 echo，real_path=%s）：%s」）；RX 恢復後重臂（transport_stall_warned 去重）"
+    detail: "transport_stall_hint(real_path, rx_age_s) 的繁中文字（含 busid 時附 sudo sh -c 指令）；位元組級凍結於 contracts/golden/last_error/transport_stall_hint.json（T16，GAP-G-09）"
+    terminal: false
+    auto_reprobe: {attached: true, detached: true}
+    states: ["ATTACHED", "DETACHED"]
+    set_by: ["sw_core/transport_stall.py:41-69 (classify_probe_failure)", "sw_core/session_manager.py:1267-1330 (_refine_probe_failure)"]
+    cleared_by: ["auto:自動重探 DETACHED→ATTACHING@session_manager.py:1463", "auto:自動重探 probe 成功→READY@session_manager.py:2536", "operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:daemon restart"]
+    promoted_via: ["session.attach", "session.recover"]
+    error_code_namespace: allowed_shared
+    contract_tests: ["tests/test_transport_stall.py::TestRefineProbeFailureIntegration::test_zero_delta_probe_failure_flips_and_warns_once"]
+  - value: "USER_ENV_MISSING"
+    kind: named
+    reason_forms: []
+    reachable: false
+    unreachable_reason: "盤點 03 §7.5：login_fsm._maybe_login 以同名變數覆寫 err，回應不會帶出此值（調和表 ERR-7.5-a、GAP-X3）"
+    meaning: "user_env 指定的帳號環境變數缺漏（目前程式不可達，保留於目錄以凍結既有語意）"
+    agent_action: "目前不會由程式回出；若日後遇到，依 user_env 的設定補齊環境變數後以 session attach 重試"
+    manual_recovery: "補齊 user_env 對應的環境變數後，以 session attach 或 session recover 手動重新進入流程"
+    logging: "無"
+    detail: "clean_text(rx_tail())[-300:]，空則 null（LOGIN_FSM_DETAIL_ERRORS 成員，目前不可達）"
+    terminal: true
+    auto_reprobe: {attached: false, detached: false}
+    states: ["ATTACHED", "DETACHED"]
+    set_by: ["sw_core/login_fsm.py:100 (_resolve_login_user；回傳後被 _maybe_login 覆寫，目前不會回出)"]
+    cleared_by: ["operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:daemon restart"]
+    promoted_via: []
+    error_code_namespace: allowed_shared
+    contract_tests: []
