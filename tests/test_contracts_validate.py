@@ -769,16 +769,21 @@ _R27_PARITY_DIR = ROOT / "tests" / "fixtures" / "r27_parity"
 _R27_PARITY_FIXTURES = sorted(_R27_PARITY_DIR.glob("*.yaml"))
 
 
-def _r27_normalize(lines):
-    """與 R-27 規則第 4 條相同：strip 後忽略空行與 `#` 開頭行，依出現順序去重。"""
-    out: list[str] = []
-    for raw in lines:
-        s = str(raw).strip()
-        if not s or s.startswith("#"):
-            continue
-        if s not in out:
-            out.append(s)
-    return out
+@pytest.mark.memory_only
+def test_parity_fixtures_present():
+    """守門測試：確保 parity fixture 存在且至少有 7 個，防止空集無聲 SKIP。"""
+    assert len(_R27_PARITY_FIXTURES) >= 7
+    expected_stems = {
+        "01_all_documented",
+        "02_one_missing",
+        "03_empty_action",
+        "04_require_in_all_two_docs",
+        "05_require_in_any_one_doc",
+        "06_comments_and_blank_lines",
+        "07_require_in_any_both_missing",
+        "08_padded_code_cell",
+    }
+    assert expected_stems.issubset({p.stem for p in _R27_PARITY_FIXTURES})
 
 
 @pytest.mark.memory_only
@@ -790,7 +795,7 @@ def test_c13_parity_fixtures(tmp_path, fixture_path):
         doc = tmp_path / name
         doc.write_text(text, encoding="utf-8")
         docs.append(doc)
-    codes = _r27_normalize(spec["codes"])
+    codes = list(spec["codes"])
     findings = _load("validate").check_doc_coverage(
         codes, docs, _ENTRY_PATTERN, require_in=spec.get("require_in", "all")
     )
@@ -798,6 +803,18 @@ def test_c13_parity_fixtures(tmp_path, fixture_path):
     expected = spec["expected"]
     assert ("FAIL" if hits else "PASS") == expected["status"], fixture_path.name
     assert {f.subject for f in hits} == set(expected["missing"]), fixture_path.name
+
+
+@pytest.mark.memory_only
+def test_c13_code_with_whitespace_fails(tmp_path):
+    doc = tmp_path / "SKILL.md"
+    doc.write_text("| `A_ONE` | 來源 | 行號 | 意義 A | 處置 A |\n", encoding="utf-8")
+    findings = _load("validate").check_doc_coverage(
+        ["A ONE"], [doc], _ENTRY_PATTERN
+    )
+    hits = _find(findings, "C13")
+    assert hits and hits[0].severity == "FAIL"
+    assert "空白" in hits[0].message
 
 
 # ---------------------------------------------------------------------------

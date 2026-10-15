@@ -408,11 +408,14 @@ def check_doc_coverage(
 
     pattern = re.compile(entry_pattern, re.MULTILINE)
 
-    # 規格：strip 後忽略空行與 `#` 開頭行，依出現順序去重
+    # 規格：strip 後忽略空行與 `#` 開頭行，依出現順序去重；碼含空白 → FAIL
     clean_values: list[str] = []
     for raw in values:
         s = str(raw).strip()
         if not s or s.startswith("#"):
+            continue
+        if any(ch.isspace() for ch in s):
+            findings.append(Finding("C13", "FAIL", s, f"診斷碼包含空白字元: {s!r}"))
             continue
         if s not in clean_values:
             clean_values.append(s)

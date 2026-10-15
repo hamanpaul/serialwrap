@@ -1,0 +1,12 @@
+# R-27 / C13 語意對等 fixture：文件反引號內含空白之碼；不可匹配無空白之碼。
+description: 文件中的碼欄含首尾空白，不視為已說明真實碼
+codes:
+  - A_ONE
+docs:
+  SKILL.md: |
+    | ` A_ONE ` | 來源 | 行號 | 意義 A | 處置 A |
+require_in: all
+expected:
+  status: FAIL
+  missing:
+    - A_ONE
