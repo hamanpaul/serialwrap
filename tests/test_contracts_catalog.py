@@ -1463,3 +1463,23 @@ def test_bc_real_sc23_sc18_autostart_hold_registered() -> None:
         assert needle in sc18.compatibility_impact, f"SC-18 compatibility_impact 缺少 '{needle}'"
     assert sc18.scope == "rust_only"
     assert sc18.case_ids == ("sc18-windows-ondemand-autostart",)
+
+
+def test_bc_real_sc21_reference_exact() -> None:
+    """SC-21 規格依據為調和表 §4.2 #17；表格 escaped pipe 曾使參照吞入描述文字，精確斷言防回歸。"""
+    sc21 = _bc_by_id()["SC-21"]
+    assert sc21.approval.decision_ref == "serialwrap-rust-spec-final.md §4.2 #17"
+    assert sc21.spec_refs == ("§4.2 #17",)
+
+
+def test_bc_real_reference_format_guard() -> None:
+    """所有 decision_ref 與 spec_refs 不得含 Markdown 反引號、">" 或 "|"；spec_final 的 decision_ref 必須以定稿規格檔名開頭。"""
+    changes, _, _ = _bc()
+    for c in changes:
+        for ref in (c.approval.decision_ref, *c.spec_refs):
+            for bad in ("`", ">", "|"):
+                assert bad not in ref, f"{c.id} 參照含非法字元 {bad!r}: {ref!r}"
+        if c.approval.basis == "spec_final":
+            assert c.approval.decision_ref.startswith("serialwrap-rust-spec-final.md "), (
+                f"{c.id} spec_final decision_ref 格式錯誤: {c.approval.decision_ref!r}"
+            )
