@@ -239,6 +239,34 @@ def test_load_catalogs_reports_all_missing_files(tmp_path: Path):
         assert name in joined
 
 
+def test_reachable_true_accepts_null_unreachable_reason() -> None:
+    """reachable 為 true 時 unreachable_reason 可為 null（對應 dataclass 欄位 str | None）。"""
+    cat = _load()
+    ec = GOOD_EC.replace("reachable: true", "reachable: true\n    unreachable_reason: null")
+    le = GOOD_LE.replace("reachable: true", "reachable: true\n    unreachable_reason: null")
+    assert cat.validate_error_codes_doc(yaml.safe_load(ec)) == []
+    assert cat.validate_session_last_errors_doc(yaml.safe_load(le)) == []
+
+
+def test_load_catalogs_aggregates_reader_error_across_files(tmp_path: Path) -> None:
+    """控制字元只影響所在檔案；其他檔案的結構問題仍須一併彙整回報（T1 要求所有檔案的問題一次列全）。"""
+    cat = _load()
+    contracts = tmp_path / "contracts"
+    contracts.mkdir()
+    (contracts / "error_codes.yaml").write_text(GOOD_EC + "\x00\n", encoding="utf-8")
+    (contracts / "session_last_errors.yaml").write_text(
+        GOOD_LE.replace("schema_version: 1", "schema_version: 2"), encoding="utf-8")
+    (contracts / "behavior_changes.yaml").write_text(GOOD_BC, encoding="utf-8")
+    (contracts / "diagnostic_aux.yaml").write_text(GOOD_AUX, encoding="utf-8")
+    with pytest.raises(cat.CatalogError) as ei:
+        cat.load_catalogs(tmp_path)
+    joined = "\n".join(ei.value.problems)
+    assert "error_codes.yaml" in joined and "YAML 語法或型別錯誤" in joined
+    assert "session_last_errors.yaml:schema_version" in joined
+    assert "behavior_changes.yaml" not in joined
+    assert "diagnostic_aux.yaml" not in joined
+
+
 STRUCTURAL_CASES = [
     # error_codes 規則
     pytest.param(
@@ -369,9 +397,30 @@ STRUCTURAL_CASES = [
     pytest.param(
         "ec_approved_must_be_unreachable",
         "error_code",
-        GOOD_EC.replace("status: EXISTING", "status: APPROVED"),
-        "APPROVED",
+        GOOD_EC.replace("status: EXISTING", "status: APPROVED").replace("behavior_change: []", "behavior_change: [BC-03]"),
+        ".reachable",
         id="ec_approved_must_be_unreachable",
+    ),
+    pytest.param(
+        "ec_approved_needs_behavior_change",
+        "error_code",
+        GOOD_EC.replace("status: EXISTING", "status: APPROVED").replace("reachable: true", "reachable: false\n    unreachable_reason: 已核准未實作"),
+        ".behavior_change",
+        id="ec_approved_needs_behavior_change",
+    ),
+    pytest.param(
+        "ec_implemented_needs_reachable",
+        "error_code",
+        GOOD_EC.replace("status: EXISTING", "status: IMPLEMENTED").replace("reachable: true", "reachable: false\n    unreachable_reason: 未實作"),
+        ".reachable",
+        id="ec_implemented_needs_reachable",
+    ),
+    pytest.param(
+        "ec_verified_needs_reachable",
+        "error_code",
+        GOOD_EC.replace("status: EXISTING", "status: VERIFIED").replace("reachable: true", "reachable: false\n    unreachable_reason: 未驗證"),
+        ".reachable",
+        id="ec_verified_needs_reachable",
     ),
     pytest.param(
         "ec_implemented_needs_tests",
@@ -390,14 +439,14 @@ STRUCTURAL_CASES = [
     pytest.param(
         "ec_unknown_exit_context",
         "error_code",
-        GOOD_EC.replace("interfaces: [rpc]", "interfaces: [cli_local]").replace("behavior_change: []", 'behavior_change: []\n        exit_codes: {"daemon begin": 2}'),
+        GOOD_EC.replace("interfaces: [rpc]", "interfaces: [cli_local]").replace("behavior_change: []", 'behavior_change: []\n    exit_codes: {"daemon begin": 2}'),
         ".exit_codes",
         id="ec_unknown_exit_context",
     ),
     pytest.param(
         "yaml_duplicate_key",
         "yaml_strict",
-        GOOD_EC.replace('retryable: "no"', 'retryable: "no"\n        retryable: "yes"'),
+        GOOD_EC.replace('retryable: "no"', 'retryable: "no"\n    retryable: "yes"'),
         "重複鍵",
         id="yaml_duplicate_key",
     ),
@@ -407,6 +456,20 @@ STRUCTURAL_CASES = [
         "codes: [",
         "CatalogError",
         id="yaml_syntax_error",
+    ),
+    pytest.param(
+        "yaml_control_char",
+        "yaml_strict",
+        "schema_version: 1\x00\n",
+        "YAML 語法或型別錯誤",
+        id="yaml_control_char",
+    ),
+    pytest.param(
+        "yaml_recursion_depth",
+        "yaml_strict",
+        "a: " + "[" * 5000 + "]" * 5000 + "\n",
+        "YAML 語法或型別錯誤",
+        id="yaml_recursion_depth",
     ),
     pytest.param(
         "ec_harness_prefix_forbidden",
@@ -439,6 +502,97 @@ STRUCTURAL_CASES = [
         ),
         ".namespace_ref",
         id="ec_passthrough_bad_ref",
+    ),
+    pytest.param(
+        "ec_header_schema_version",
+        "error_code",
+        GOOD_EC.replace("schema_version: 1", "schema_version: 2"),
+        "schema_version",
+        id="ec_header_schema_version",
+    ),
+    pytest.param(
+        "ec_header_revision_zero",
+        "error_code",
+        GOOD_EC.replace("revision: 1", "revision: 0"),
+        "revision",
+        id="ec_header_revision_zero",
+    ),
+    pytest.param(
+        "ec_header_namespace",
+        "error_code",
+        GOOD_EC.replace("namespace: error_code", "namespace: session_last_error"),
+        "namespace",
+        id="ec_header_namespace",
+    ),
+    pytest.param(
+        "ec_missing_required_key",
+        "error_code",
+        GOOD_EC.replace("    meaning: 意義\n", ""),
+        "缺少必要鍵 'meaning'",
+        id="ec_missing_required_key",
+    ),
+    pytest.param(
+        "ec_missing_top_key",
+        "error_code",
+        GOOD_EC.replace("passthrough: []\n", ""),
+        "缺少頂層鍵 'passthrough'",
+        id="ec_missing_top_key",
+    ),
+    pytest.param(
+        "ec_unreachable_null_reason",
+        "error_code",
+        GOOD_EC.replace("reachable: true", "reachable: false\n    unreachable_reason: null"),
+        ".unreachable_reason",
+        id="ec_unreachable_null_reason",
+    ),
+    pytest.param(
+        "ec_passthrough_bad_id",
+        "error_code",
+        GOOD_EC.replace(
+            "passthrough: []",
+            textwrap.dedent("""\
+            passthrough:
+              - id: Bad-Id
+                namespace_ref: session_last_errors
+                scope: {interfaces: [rpc], methods: [x.y], platforms: [posix]}
+                rule: 規則
+                owner_confirmation: not_required
+                reconciliation_refs: [ref1]
+            """),
+        ),
+        "passthrough[0](Bad-Id).id",
+        id="ec_passthrough_bad_id",
+    ),
+    pytest.param(
+        "ec_passthrough_duplicate_id",
+        "error_code",
+        GOOD_EC.replace(
+            "passthrough: []",
+            textwrap.dedent("""\
+            passthrough:
+              - id: pt_test
+                namespace_ref: session_last_errors
+                scope: {interfaces: [rpc], methods: [x.y], platforms: [posix]}
+                rule: 規則
+                owner_confirmation: not_required
+                reconciliation_refs: [ref1]
+              - id: pt_test
+                namespace_ref: session_last_errors
+                scope: {interfaces: [rpc], methods: [x.y], platforms: [posix]}
+                rule: 規則
+                owner_confirmation: not_required
+                reconciliation_refs: [ref1]
+            """),
+        ),
+        "passthrough[1](pt_test).id",
+        id="ec_passthrough_duplicate_id",
+    ),
+    pytest.param(
+        "ec_exit_code_value_type",
+        "error_code",
+        GOOD_EC.replace("interfaces: [rpc]", "interfaces: [cli_local]").replace("behavior_change: []", 'behavior_change: []\n    exit_codes: {doctor: "two"}'),
+        "值必須為整數",
+        id="ec_exit_code_value_type",
     ),
     # session_last_errors 規則
     pytest.param(
@@ -473,10 +627,13 @@ STRUCTURAL_CASES = [
         "le_terminal_cannot_reprobe",
         "session_last_error",
         GOOD_LE.replace(
-            "value: FOO_ERROR\n    kind: named\n    reason_forms: []\n    reachable: true\n    meaning: 意義\n    agent_action: 處置\n    manual_recovery: 復原\n    logging: 無\n    detail: 無\n    terminal: false",
-            "value: FOO_ERROR\n    kind: named\n    reason_forms: []\n    reachable: true\n    meaning: 意義\n    agent_action: 處置\n    manual_recovery: 復原\n    logging: 無\n    detail: 無\n    terminal: true",
-        ).replace('cleared_by: ["auto:重探@session_manager.py:200"]', 'cleared_by: ["operator:session.attach"]'),
-        ".terminal",
+            "terminal: false\n    auto_reprobe: {attached: true, detached: false}",
+            "terminal: true\n    auto_reprobe: {attached: true, detached: false}",
+        ).replace(
+            'cleared_by: ["auto:重探@session_manager.py:200"]\n    promoted_via: [session.attach]',
+            'cleared_by: ["operator:session.attach"]\n    promoted_via: [session.attach]',
+        ),
+        "values[1](FOO_ERROR).terminal",
         id="le_terminal_cannot_reprobe",
     ),
     pytest.param(
@@ -505,6 +662,13 @@ STRUCTURAL_CASES = [
         GOOD_LE.replace('cleared_by: ["auto:重探@session_manager.py:200"]', "cleared_by: [whenever]"),
         ".cleared_by",
         id="le_bad_cleared_by",
+    ),
+    pytest.param(
+        "le_unreachable_null_reason",
+        "session_last_error",
+        GOOD_LE.replace("reachable: true", "reachable: false\n    unreachable_reason: null"),
+        "values[1](FOO_ERROR).unreachable_reason",
+        id="le_unreachable_null_reason",
     ),
     # behavior_changes 規則
     pytest.param(
@@ -574,13 +738,7 @@ STRUCTURAL_CASES = [
         "bc_invariant_set_incomplete",
         "behavior_change",
         GOOD_BC.replace(
-            textwrap.dedent("""\
-              - id: no_auto_resend
-                title: 不自動重送
-                spec_ref: "§11.3"
-                error_codes: []
-                case_ids: []
-            """),
+            '  - id: no_auto_resend\n    title: 不自動重送\n    spec_ref: "§11.3"\n    error_codes: []\n    case_ids: []\n',
             "",
         ),
         "safety_invariants",
@@ -589,7 +747,7 @@ STRUCTURAL_CASES = [
     pytest.param(
         "bc_invariant_unknown_case",
         "behavior_change",
-        GOOD_BC.replace("case_ids: [bc01-case-1]", "case_ids: [nope-case]"),
+        GOOD_BC.replace("error_codes: []\n    case_ids: [bc01-case-1]", "error_codes: []\n    case_ids: [nope-case]"),
         "case_ids",
         id="bc_invariant_unknown_case",
     ),
@@ -616,6 +774,30 @@ STRUCTURAL_CASES = [
         GOOD_BC.replace("affects: [BC-01]", "affects: [SC-99]"),
         "affects",
         id="bc_affects_unknown",
+    ),
+    pytest.param(
+        "bc_basis_not_in_enum",
+        "behavior_change",
+        GOOD_BC.replace("basis: owner_decision", "basis: whatever"),
+        ".approval.basis",
+        id="bc_basis_not_in_enum",
+    ),
+    pytest.param(
+        "bc_basis_kind_mismatch",
+        "behavior_change",
+        GOOD_BC.replace("basis: owner_decision", "basis: reconciliation"),
+        "kind 為 BC 時 basis 必須為 owner_decision",
+        id="bc_basis_kind_mismatch",
+    ),
+    pytest.param(
+        "bc_pending_needs_default",
+        "behavior_change",
+        GOOD_BC.replace(
+            "owner_confirmation: not_required\n    owner_item: null\n    default_if_pending: null",
+            "owner_confirmation: pending_default\n    owner_item: 1\n    default_if_pending: null",
+        ),
+        ".default_if_pending",
+        id="bc_pending_needs_default",
     ),
     # diagnostic_aux 規則
     pytest.param(
