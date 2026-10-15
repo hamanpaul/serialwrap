@@ -273,6 +273,7 @@ def _make_repo(
     last_errors=(),
     changes=(),
     rpc=None,
+    cli=None,
     pkg=None,
     tests=None,
     config=None,
@@ -327,7 +328,10 @@ def _make_repo(
         contracts / "rpc_schema.json",
         rpc if rpc is not None else {"$defs": {}, "x-methods": {}, "x-pending": []},
     )
-    _dump_json(contracts / "cli_schema.json", {"x-exit-codes": [], "x-pending": []})
+    _dump_json(
+        contracts / "cli_schema.json",
+        cli if cli is not None else {"x-exit-codes": [], "x-pending": []},
+    )
     _dump_yaml(contracts / "code_extraction.yaml", config if config is not None else _extraction_config())
 
     for rel, src in (pkg if pkg is not None else {"pkg/__init__.py": ""}).items():
@@ -473,6 +477,15 @@ def test_c19_exclusion_warned(tmp_path):
     assert [(f.severity, f.subject) for f in hits if f.severity == "WARN"] == [("WARN", "FOO")]
     # ok 只看 FAIL：WARN 不得使整體判定失敗。
     assert not [f for f in findings if f.severity == "FAIL"]
+
+    all_findings, summary = _load("validate").run_all(tmp_path)
+    assert not any(f.severity == "FAIL" for f in all_findings)
+    assert any(f.check == "C19" and f.severity == "WARN" for f in all_findings)
+
+    proc = _run_cli("check", "--repo", str(tmp_path))
+    assert proc.returncode == 0
+    out = json.loads(proc.stdout)
+    assert out["ok"] is True
 
 
 def test_c19_exclusion_hides_catalog_value(tmp_path):
@@ -874,6 +887,262 @@ def test_cli_bad_config_exit_1(tmp_path):
     proc = _run_cli("extract", "--namespace", "error_code", "--format", "lines", "--repo", str(tmp_path))
     assert proc.returncode == 1
     assert proc.stderr.startswith("contracts: ")
+
+
+# ---------------------------------------------------------------------------
+# 邊界與防禦性回歸測試（P0-T6 評審回饋追加）
+# ---------------------------------------------------------------------------
+
+
+def test_c01_corrupt_catalog_reported(tmp_path):
+    _make_repo(tmp_path, codes=[_code("PLAIN_OK")])
+    (tmp_path / "contracts" / "error_codes.yaml").write_text("corrupted: [yaml", encoding="utf-8")
+    findings, summary = _load("validate").run_all(tmp_path)
+    hits = _find(findings, "C01")
+    assert len(hits) >= 1
+    assert all(f.subject == "contracts" and f.severity == "FAIL" for f in hits)
+
+
+def test_cli_check_only_unknown_code(tmp_path):
+    _make_repo(tmp_path, codes=[_code("PLAIN_OK")])
+    proc = _run_cli("check", "--only", "C99", "--repo", str(tmp_path))
+    assert proc.returncode == 1
+    assert "contracts: unknown check code(s): C99" in proc.stderr
+
+
+def test_cli_check_only_broken_catalog_retains_c01(tmp_path):
+    _make_repo(tmp_path, codes=[_code("PLAIN_OK")])
+    (tmp_path / "contracts" / "error_codes.yaml").write_text("corrupted: [yaml", encoding="utf-8")
+    proc = _run_cli("check", "--only", "C09", "--repo", str(tmp_path))
+    assert proc.returncode == 1
+    out = json.loads(proc.stdout)
+    assert out["ok"] is False
+    assert any(f["check"] == "C01" for f in out["findings"])
+
+
+def test_c14_command_failure_exit_code(tmp_path):
+    (tmp_path / "SKILL.md").write_text(
+        '<!-- BEGIN: generated-fact marker="error-codes" -->\n'
+        "OLD\n"
+        '<!-- END: generated-fact marker="error-codes" -->\n',
+        encoding="utf-8",
+    )
+    policy = {
+        "generated_facts": [
+            {"command": "sh -c 'printf \"OLD\"; exit 7'", "reflected_in": "SKILL.md", "marker": "error-codes"},
+        ]
+    }
+    findings = _load("validate").check_generated_facts(tmp_path, policy)
+    hits = _find(findings, "C14")
+    assert len(hits) == 1
+    assert "exit=7" in hits[0].message
+
+
+def test_c09_dynamic_prefix_requires_colon(tmp_path):
+    _make_repo(
+        tmp_path,
+        last_errors=[
+            _lerr(
+                "ATTACH_FAILED:*",
+                kind="dynamic_prefix",
+                reason_forms=["ATTACH_FAILED:OSError"],
+                contract_tests=[f"{_DUMMY_TEST}::test_bare"],
+            )
+        ],
+        tests={
+            _DUMMY_TEST: """
+            def test_bare():
+                msg = "ATTACH_FAILED"
+                assert msg == "ATTACH_FAILED"
+            """
+        },
+    )
+    cat = _catalog(tmp_path)
+    hits = _find(_load("validate").check_contract_tests(cat, tmp_path), "C09")
+    assert len(hits) == 1
+
+    (tmp_path / _DUMMY_TEST).write_text(
+        textwrap.dedent("""
+        def test_bare():
+            err = "OSError"
+            msg = f"ATTACH_FAILED:{err}"
+            assert msg == "ATTACH_FAILED:OSError"
+        """),
+        encoding="utf-8",
+    )
+    hits_ok = _find(_load("validate").check_contract_tests(cat, tmp_path), "C09")
+    assert len(hits_ok) == 0
+
+
+def test_c09_decorator_does_not_count(tmp_path):
+    _make_repo(
+        tmp_path,
+        codes=[_code("PLAIN_OK", contract_tests=[f"{_DUMMY_TEST}::test_dec_only"])],
+        tests={
+            _DUMMY_TEST: """
+            import pytest
+            @pytest.mark.skip(reason="PLAIN_OK")
+            def test_dec_only():
+                assert True
+            """
+        },
+    )
+    cat = _catalog(tmp_path)
+    hits = _find(_load("validate").check_contract_tests(cat, tmp_path), "C09")
+    assert len(hits) == 1
+    assert "node 本體內找不到該碼" in hits[0].message
+
+
+def test_c15_duplicate_context_and_unregistered_code(tmp_path):
+    _make_repo(
+        tmp_path,
+        codes=[_code("PLAIN_OK", exit_codes={"remote": 0})],
+        cli={
+            "x-exit-codes": [
+                {"context": "remote", "codes": {"GHOST_CODE": 1}},
+                {"context": "remote", "codes": {"PLAIN_OK": 0}},
+            ]
+        },
+    )
+    cat = _catalog(tmp_path)
+    findings = _load("validate").check_schema_refs(cat, tmp_path)
+    hits = _find(findings, "C15")
+    assert any("重複之 context" in f.message for f in hits)
+    assert any("GHOST_CODE" in f.message for f in hits)
+
+
+def test_c15_exit_code_mismatch_both_directions(tmp_path):
+    _make_repo(
+        tmp_path,
+        codes=[_code("PLAIN_OK", exit_codes={"remote": 0})],
+        cli={
+            "x-exit-codes": [
+                {"context": "remote", "codes": {"PLAIN_OK": 2, "EXTRA_CODE": 1}},
+            ]
+        },
+    )
+    cat = _catalog(tmp_path)
+    findings = _load("validate").check_schema_refs(cat, tmp_path)
+    hits = _find(findings, "C15")
+    assert any("PLAIN_OK" in f.subject for f in hits)
+    assert any("EXTRA_CODE" in f.subject for f in hits)
+
+
+def test_c15_context_outside_cli_contexts(tmp_path):
+    _make_repo(
+        tmp_path,
+        codes=[_code("PLAIN_OK")],
+        cli={
+            "x-exit-codes": [
+                {"context": "not_a_valid_context", "codes": {}},
+            ]
+        },
+    )
+    cat = _catalog(tmp_path)
+    hits = _find(_load("validate").check_schema_refs(cat, tmp_path), "C15")
+    assert any("not_a_valid_context" in f.subject for f in hits)
+
+
+def test_c15_missing_schema_files(tmp_path):
+    _make_repo(tmp_path, codes=[_code("PLAIN_OK")])
+    (tmp_path / "contracts" / "rpc_schema.json").unlink()
+    (tmp_path / "contracts" / "cli_schema.json").unlink()
+    cat = _catalog(tmp_path)
+    hits = _find(_load("validate").check_schema_refs(cat, tmp_path), "C15")
+    assert len(hits) == 2
+    assert {f.subject for f in hits} == {"contracts/rpc_schema.json", "contracts/cli_schema.json"}
+
+
+def test_c18_hollow_schema_missing_x_methods(tmp_path):
+    _make_repo(tmp_path, rpc={})
+    cat = _catalog(tmp_path)
+    hits = _find(_load("validate").check_schema_refs(cat, tmp_path), "C18")
+    assert any("x-methods" in f.message for f in hits)
+
+
+def test_c18_empty_properties_object_fails(tmp_path):
+    _make_repo(
+        tmp_path,
+        rpc={
+            "$defs": {},
+            "x-methods": {
+                "health.ping": {
+                    "params": {},
+                    "result": {"type": "object", "properties": {}},
+                    "errors": [],
+                    "error_order": [],
+                    "side_effects": [],
+                }
+            },
+        },
+    )
+    cat = _catalog(tmp_path)
+    hits = _find(_load("validate").check_schema_refs(cat, tmp_path), "C18")
+    assert any("空 properties 佔位符" in f.message for f in hits)
+
+
+def test_c13_missing_doc_fails_even_with_require_in_any(tmp_path):
+    good_doc = tmp_path / "doc_good.md"
+    good_doc.write_text("### `A_CODE`\n- **意義**：說明\n- **處置**：處置\n", encoding="utf-8")
+    missing_doc = tmp_path / "doc_missing.md"
+    findings = _load("validate").check_doc_coverage(["A_CODE"], [good_doc, missing_doc], _ENTRY_PATTERN, require_in="any")
+    hits = _find(findings, "C13")
+    assert any(f.subject == str(missing_doc) and "文件不存在" in f.message for f in hits)
+
+
+def test_c13_invalid_require_in(tmp_path):
+    doc = tmp_path / "doc.md"
+    doc.write_text("### `A_CODE`\n- **意義**：說明\n- **處置**：處置\n", encoding="utf-8")
+    findings = _load("validate").check_doc_coverage(["A_CODE"], [doc], _ENTRY_PATTERN, require_in="unsupported")
+    hits = _find(findings, "C13")
+    assert any("未知的 require_in" in f.message for f in hits)
+
+
+def test_c02_seen_dedupes_per_namespace(tmp_path):
+    _make_repo(
+        tmp_path,
+        pkg={
+            "pkg/mod.py": """
+            def build(rec):
+                rec["error_code"] = "SHARED_GHOST"
+                rec.last_error = "SHARED_GHOST"
+                return {}
+            """
+        },
+    )
+    cat, res = _context(tmp_path)
+    findings = _load("validate").check_catalog_against_emissions(cat, res)
+    hits = _find(findings, "C02")
+    assert len(hits) == 2
+    assert [f.subject for f in hits] == ["SHARED_GHOST", "SHARED_GHOST"]
+
+
+def test_cli_summary_subcommand(tmp_path):
+    _make_repo(tmp_path, codes=[_code("PLAIN_OK")])
+    proc = _run_cli("summary", "--repo", str(tmp_path))
+    assert proc.returncode == 0
+    data = json.loads(proc.stdout)
+    assert "behavior_changes" in data
+    assert "error_code" in data
+    assert "session_last_error" in data
+    assert "safety_invariants" in data
+
+
+def test_cli_effective_subcommand(tmp_path):
+    _make_repo(
+        tmp_path,
+        codes=[_code("PLAIN_OK")],
+        pkg={
+            "pkg/mod.py": """
+            def build():
+                return {"error_code": "PLAIN_OK"}
+            """
+        },
+    )
+    proc = _run_cli("effective", "--namespace", "error_code", "--repo", str(tmp_path))
+    assert proc.returncode == 0
+    lines = proc.stdout.splitlines()
+    assert lines == ["PLAIN_OK"]
 
 
 # Phase 出口測試（P0-T12 Step 1 追加）：真實 repo 的契約檢查必須全綠。
