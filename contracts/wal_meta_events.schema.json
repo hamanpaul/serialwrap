@@ -1,0 +1,187 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "serialwrap WAL META events contract",
+  "x-catalog-revision": 1,
+  "type": "object",
+  "oneOf": [
+    {
+      "title": "credentials_unresolved",
+      "description": "登入憑證未解析警告事件",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "env_file",
+        "event",
+        "reason"
+      ],
+      "properties": {
+        "event": {
+          "const": "credentials_unresolved"
+        },
+        "reason": {
+          "type": "string",
+          "enum": [
+            "not_configured",
+            "ok",
+            "env_file_missing",
+            "env_file_unreadable",
+            "key_absent"
+          ],
+          "description": "未解析原因"
+        },
+        "env_file": {
+          "type": "string",
+          "description": "宣告的 env 檔案路徑（未宣告時為空字串）"
+        }
+      }
+    },
+    {
+      "title": "transport_stall_suspected",
+      "description": "傳輸層停滯疑似警告事件",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event",
+        "real_path",
+        "rx_age_s"
+      ],
+      "properties": {
+        "event": {
+          "const": "transport_stall_suspected"
+        },
+        "real_path": {
+          "type": "string",
+          "description": "tty 裝置路徑（bridge.device_path，如 /dev/ttyUSB0；Windows 為 \\\\.\\COMn；取不到時為空字串）"
+        },
+        "rx_age_s": {
+          "type": "number",
+          "description": "自前次 RX 經過秒數"
+        }
+      }
+    },
+    {
+      "title": "command_completion",
+      "description": "命令帶 completion_regex 時於送出前寫入的稽核事件（外層 cmd_id 為該命令 ID）",
+      "x-outer-record": {
+        "dir": "META",
+        "source": "system",
+        "cmd_id": "string（非 null）"
+      },
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "completion_regex",
+        "event"
+      ],
+      "properties": {
+        "event": {
+          "const": "command_completion"
+        },
+        "completion_regex": {
+          "type": "string",
+          "minLength": 1,
+          "description": "valid_completion_regex 驗證過的完成條件（非空、UTF-8 ≤1024 bytes、不匹配空字串）"
+        }
+      }
+    },
+    {
+      "title": "WAL_RECREATED_AFTER_EXTERNAL_UNLINK",
+      "description": "外部 unlink／刪除後 WAL 重建事件",
+      "x-status": "APPROVED",
+      "x-behavior-change": "BC-01",
+      "x-outer-record": {
+        "dir": "META",
+        "source": "system",
+        "loss_flag": true
+      },
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event",
+        "potentially_lost_seq_range",
+        "previous_identity",
+        "range_known",
+        "reason"
+      ],
+      "properties": {
+        "event": {
+          "const": "WAL_RECREATED_AFTER_EXTERNAL_UNLINK"
+        },
+        "reason": {
+          "type": "string",
+          "enum": [
+            "external_unlink",
+            "replaced",
+            "dir_missing"
+          ],
+          "description": "重建原因"
+        },
+        "previous_identity": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "舊檔案識別資訊（dev:ino；P1 補 pattern ^[0-9]+:[0-9]+$）"
+        },
+        "range_known": {
+          "type": "boolean",
+          "description": "遺失序號區間是否已知"
+        },
+        "potentially_lost_seq_range": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "description": "可能遺失的序號區間；range_known 為 true 時為 [first, last]，為 false 時為 null"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "range_known": {
+                "const": true
+              }
+            },
+            "required": [
+              "range_known"
+            ]
+          },
+          "then": {
+            "properties": {
+              "potentially_lost_seq_range": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "minItems": 2,
+                "maxItems": 2,
+                "x-constraint": "first <= last"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "range_known": {
+                "const": false
+              }
+            },
+            "required": [
+              "range_known"
+            ]
+          },
+          "then": {
+            "properties": {
+              "potentially_lost_seq_range": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

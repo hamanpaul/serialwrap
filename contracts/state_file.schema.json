@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "serialwrap state file contract",
+  "x-catalog-revision": 1,
+  "x-serialization": "DISK_STABLE＋\\n",
+  "x-no-version-field": true,
+  "x-write": "mkstemp(prefix='state.json.tmp.', 0600)→fsync→os.replace→dir fsync（非 Windows）",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "aliases",
+    "bindings",
+    "profile_detected",
+    "profile_pins",
+    "released"
+  ],
+  "properties": {
+    "aliases": {
+      "type": "object",
+      "description": "別名註冊表（key 為別名名稱）",
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "title": "SessionAliasRow",
+            "description": "session 綁定型別名",
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "session_id",
+              "updated_at"
+            ],
+            "properties": {
+              "session_id": {
+                "type": "string",
+                "description": "目標 session ID"
+              },
+              "updated_at": {
+                "type": "string",
+                "description": "更新時間 ISO 8601"
+              }
+            }
+          },
+          {
+            "title": "DeviceByIdAliasRow",
+            "description": "device_by_id 綁定型別名",
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "device_by_id",
+              "updated_at"
+            ],
+            "properties": {
+              "device_by_id": {
+                "type": "string",
+                "description": "裝置 by-id 路徑"
+              },
+              "profile": {
+                "type": "string",
+                "description": "關聯之 profile 名稱（選填）"
+              },
+              "updated_at": {
+                "type": "string",
+                "description": "更新時間 ISO 8601"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "bindings": {
+      "type": "object",
+      "description": "session 與 device_by_id 覆寫綁定（key 為 session_id，value 為 device_by_id）",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "profile_detected": {
+      "type": "object",
+      "description": "動態偵測到的 profile 快取（key 為 by_id，value 為 profile_name）",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "profile_pins": {
+      "type": "object",
+      "description": "鎖定的 profile 設定（key 為 device_key，value 為 profile_name）",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "released": {
+      "type": "object",
+      "description": "交接／釋放狀態紀錄（key 為 session_id）",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "by_id",
+          "reason",
+          "released_at",
+          "released_by"
+        ],
+        "properties": {
+          "by_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "被釋放裝置的 by-id 路徑；無裝置時為 null"
+          },
+          "reason": {
+            "x-note": "RPC 原樣傳入的 JSON 值，不限型別",
+            "description": "釋放原因，可為字串、物件或任意 JSON 值"
+          },
+          "released_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "釋放時間 ISO 8601 字串或 null"
+          },
+          "released_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "發動釋放的來源（如 cli、agent:flash）或 null"
+          }
+        }
+      }
+    }
+  }
+}

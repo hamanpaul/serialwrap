@@ -30,8 +30,10 @@ RECREATED_EVENT = "WAL_RECREATED_AFTER_EXTERNAL_UNLINK"
 
 # 04 §1.3 的三行實跑範例。RX／TX 行逐字保留。
 # META 行的 meta 改為 credentials_unresolved 的實際格式：原範例 {"event":"x"} 不屬於
-# wal_meta_events.schema.json 的封閉 oneOf 列舉，依 plan T10 不可能通過。此為對 plan
-# 「逐字貼入」的唯一偏離，待擁有者或協調者確認。
+# wal_meta_events.schema.json 的封閉 oneOf 列舉，依 plan T10 不可能通過。
+# 註：本檔對 plan T10 測試表有兩處刻意偏離（皆因 META schema 為封閉 oneOf，不放寬 schema 亦不設 catch-all）：
+# 1. test_wal_inventory_examples_validate：範例第 3 行之 {"event":"x"} 替換為 credentials_unresolved。
+# 2. test_wal_records_from_writer_validate：META append 帶有合法的 credentials_unresolved meta（plan 表未給 meta 則產出 {}）。
 _WAL_INVENTORY_LINES = (
     '{"cmd_id":null,"com":"COM0","crc32":"a81bc28c","dir":"RX","len":14,"loss_flag":false,'
     '"meta":{},"mono_ts_ns":5798622898976,"payload_b64":"aGVsbG8NChtbMG0Lf/8=","seq":1,'
@@ -311,6 +313,116 @@ def test_wal_recreated_range_negative() -> None:
     assert _find_key_value(_load_schema(META_SCHEMA), "x-constraint", "first <= last"), (
         'potentially_lost_seq_range 應以 x-constraint: "first <= last" 標示'
     )
+
+
+def test_wal_command_completion_validates() -> None:
+    validator = _wal_validator()
+    record = {
+        "cmd_id": "c_test_01",
+        "com": "COM0",
+        "crc32": "00000000",
+        "dir": "META",
+        "len": 0,
+        "loss_flag": False,
+        "meta": {
+            "event": "command_completion",
+            "completion_regex": "ready>",
+        },
+        "mono_ts_ns": 5798623144560,
+        "payload_b64": "",
+        "seq": 4,
+        "source": "system",
+        "wall_ts": "2026-10-15T03:06:17.664022+00:00",
+    }
+    validator.validate(record)
+
+
+def test_wal_command_completion_invalid_rejected() -> None:
+    from jsonschema import ValidationError
+
+    validator = _wal_validator()
+    base = {
+        "cmd_id": "c_test_01",
+        "com": "COM0",
+        "crc32": "00000000",
+        "dir": "META",
+        "len": 0,
+        "loss_flag": False,
+        "mono_ts_ns": 5798623144560,
+        "payload_b64": "",
+        "seq": 4,
+        "source": "system",
+        "wall_ts": "2026-10-15T03:06:17+00:00",
+    }
+    invalid_metas = [
+        {"event": "command_completion"},  # 缺少 completion_regex
+        {"event": "command_completion", "completion_regex": ""},  # minLength: 1
+        {"event": "command_completion", "completion_regex": 123},  # 非 string
+        {"event": "command_completion", "completion_regex": "ready>", "extra": 1},  # additionalProperties: false
+    ]
+    for meta in invalid_metas:
+        with pytest.raises(ValidationError):
+            validator.validate({**base, "meta": meta})
+
+
+def test_wal_unknown_meta_event_rejected() -> None:
+    from jsonschema import ValidationError
+
+    validator = _wal_validator()
+    base = {
+        "cmd_id": None,
+        "com": "COM0",
+        "crc32": "00000000",
+        "dir": "META",
+        "len": 0,
+        "loss_flag": False,
+        "mono_ts_ns": 5798623144560,
+        "payload_b64": "",
+        "seq": 4,
+        "source": "system",
+        "wall_ts": "2026-10-15T03:06:17+00:00",
+    }
+    for meta in [{"event": "x"}, {"event": "unknown_event"}, {}]:
+        with pytest.raises(ValidationError):
+            validator.validate({**base, "meta": meta})
+
+
+def test_wal_meta_events_drift_guard() -> None:
+    """AST 防漂移防線：掃描 sw_core/*.py 中所有的 direction="META" append，
+    斷言其字面 event 皆定義於 contracts/wal_meta_events.schema.json 的 oneOf 中。
+    """
+    import ast
+
+    meta_schema = _load_schema(META_SCHEMA)
+    defined_events = {
+        _branch_event(b)
+        for b in meta_schema.get("oneOf", [])
+        if _branch_event(b) is not None
+    }
+
+    sw_core_dir = REPO_ROOT / "sw_core"
+    found_events: set[str] = set()
+
+    for py_file in sw_core_dir.glob("*.py"):
+        tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            has_meta_dir = any(
+                kw.arg == "direction" and isinstance(kw.value, ast.Constant) and kw.value.value == "META"
+                for kw in node.keywords
+            )
+            if not has_meta_dir:
+                continue
+            meta_kw = next((kw for kw in node.keywords if kw.arg == "meta"), None)
+            if meta_kw and isinstance(meta_kw.value, ast.Dict):
+                for k, v in zip(meta_kw.value.keys, meta_kw.value.values):
+                    if isinstance(k, ast.Constant) and k.value == "event" and isinstance(v, ast.Constant):
+                        found_events.add(v.value)
+
+    assert found_events, "應至少掃描到 sw_core 中的 baseline META 事件"
+    unregistered = found_events - defined_events
+    assert not unregistered, f"sw_core 中發現未於 {META_SCHEMA} 登錄的 META 事件：{unregistered}"
 
 
 # ---------------------------------------------------------------------------
