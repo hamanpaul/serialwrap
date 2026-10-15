@@ -47,7 +47,7 @@
 |---|---|---|---|
 | P0 | Stage 0 契約治理 | `01-stage0-contracts.md` | `contracts/*`、契約驗證器、SKILL 受管區段、OD-06 通用規則設定 |
 | P1 | Stage 0 Python BC | `02-stage0-python-bc.md` | BC-01～BC-05、OD-11 allowlist、F12 oracle 修訂、Stage 0 擷取凍結值 |
-| P2 | Stage 0 測試基礎 | `03-stage0-test-infra.md` | `tools/uart_stdio_bridge/`、DUT 模擬器、比較器、func-test 外部模式、`tests/acceptance/`、資源標記、`longrun_acceptance.yaml`＋gate 判定器、release manifest |
+| P2 | Stage 0 測試基礎 | `03-stage0-test-infra.md` | `tools/uart_stdio_bridge/`、DUT 模擬器、比較器、func-test 外部模式、`tests/acceptance/`、資源標記、`longrun_acceptance.yaml`＋gate 判定器、OD-09 延後項凍結工具與候選長跑開跑登記（T16，R4-F2）、release manifest |
 | P3 | Stage 1A | `04-stage1a-rust-cli.md` | Cargo workspace、`sw-proto`、`sw-pal`（client 側）、`sw-cli` 資料面＋固定路徑委派 |
 | P4 | Stage 1B | `05-stage1b-rust-cli-mgmt.md` | daemon／service／supervision-mode／remote／connect／setup／doctor／console-attach、`windows-task`、版本配對、更新／回滾 |
 | P5 | Slice 2.1 | `06-slice21-daemon-core.md` | PAL serial／lock／device／wal_fs／rpc server、WAL、Arbiter、SessionActor、最小 Shell 登入、Quiet Gate、Drain／Release、獨占、有界資源 |
@@ -80,7 +80,7 @@
 - Spike 1（com0com 驅動安裝，需管理員且屬侵入性變更）、原生 Windows COM handle gate（OD-08：com0com 或實體 USB-UART 直連 Windows）。
 - L2 實機回歸（TestPilot `serialwrap_regression` on live bench）、L3 `realhw` P0／P1／remote、48 小時長跑（OD-10，bench 依序）、>72 小時 `windows-task` 監管驗證（Spike 2）。
 - Canary（每平台 14 活躍日、≥5,000 次 `cmd submit`、≥50 次干擾／交接）、實機回滾演練、Stage 3 退役判定。
-- OD-09 延後凍結項（RSS 預算、最低負載、容許誤差）——需 Python 48h 基線後凍結。
+- OD-09 延後凍結項（RSS 預算、最低負載、容許誤差）——需 Python 48h 基線後、於正式 Stage 0 出口以 P2-T16 凍結工具凍結（早於 Stage 1B 混合 48 h 長跑；工具不依賴後續 Phase，R4-F2）。
 
 以上項目本計畫交付「可執行的程序、腳本、gate 判定器與證據 schema」，證據本身待擁有者執行。
 
@@ -156,6 +156,7 @@
 | P2-T13 | pytest 資源報告、平台 SKIP 閘門、Windows collection 與 hosted Windows L1（`TST-D-4` 報告部分） | G | H | P2-T12 |
 | P2-T14 | L2／L3 平台 adapter（pin＋版本 gate、PID／RSS、bench lock、能力式 SKIP、Telnet human frontend、worker 存活事件、background 結果執行期收斂 `BgResultTracker`（R1-F6）） | H | L | P2-T13 |
 | P2-T15 | `longrun_acceptance.yaml`、外層 `release_gate_result` 判定器、長跑觀測器、Windows 原生 COM 獨占證據 `winexcl`（R1-F7） | L | H | P2-T14 |
+| P2-T16 | OD-09 延後項凍結工具與候選長跑開跑登記（`realhw/acceptance/od09_freeze.py`；延後項唯一寫入者；只讀 Stage 0 索引，不依賴 P3～P9，R4-F2） | L | H | P2-T12、P2-T15 |
 
 ### P3（`04-stage1a-rust-cli.md`；Phase 前置：P0、P1（T15 SC-09、T16 DF-06、T18 manifest）、P2（T10、T12））
 
@@ -181,7 +182,7 @@
 | P3-T18 | A/B 比較器、Rust CLI→Python daemon 黑箱與 Stage 1A gate 判定器 | H | G | P3-T17 |
 | P3-T19 | Rust CI workflow 與 Stage 1A 出口 gate | G | H | P3-T18 |
 
-### P4（`05-stage1b-rust-cli-mgmt.md`；Phase 前置：P3（全部））
+### P4（`05-stage1b-rust-cli-mgmt.md`；Phase 前置：P3（全部）、P2（T16：B-12 混合 48 h 候選長跑開跑前 `register-candidate`；OD-09 於正式 Stage 0 出口已凍結））
 
 | ID | Task | 測試作者 | 實作者 | 依賴（同 Phase Task） |
 |---|---|---|---|---|
@@ -319,14 +320,14 @@
 | P9-T7B | L1.5 A/B 差分（`tools/stage3/ab_diff.py`） | L | H | P9-T5B |
 | P9-T7 | A/B 判定（`tools/stage3/ab_verdict.py`） | L | H | P9-T7B |
 | P9-T8 | Canary WAL 收割與提交計數（`tools/stage3/canary_harvest.py`） | G | L | P9-T6 |
-| P9-T9 | Canary collector 與 zipapp（`tools/stage3/canary_collect.py`；結果於 history 淘汰前持續收斂，R1-F6） | H | L | P9-T11 |
-| P9-T10 | 干擾／交接分類與活躍日（`tools/stage3/canary_classify.py`） | H | L | P9-T8 |
+| P9-T9 | Canary collector 與 zipapp（`tools/stage3/canary_collect.py`；結果於 history 淘汰前持續收斂，R1-F6；每次快照對部署目錄重算 `bundle_tree_sha256`／`runtime_tree_sha256`，R4-F1） | H | L | P9-T11 |
+| P9-T10 | 干擾／交接分類與活躍日（`tools/stage3/canary_classify.py`；歸屬鍵含內容指紋，R4-F1） | H | L | P9-T8 |
 | P9-T11 | 事故追蹤（`tools/stage3/canary_incidents.py`） | G | H | P9-T10 |
-| P9-T12 | Canary policy 凍結、帳本彙總與配額 gate（`tools/stage3/canary_ledger.py`；gate 輸出帳本版本 `ledger_through`／`ledger_records`，R3-F1） | L | G | P9-T9 |
-| P9-T13 | 實機回滾演練（`tools/stage3/rollback_drill.py`） | G | L | P9-T12 |
+| P9-T12 | Canary policy 凍結、帳本彙總與配額 gate（`tools/stage3/canary_ledger.py`；gate 輸出帳本版本 `ledger_through`／`ledger_records`，R3-F1；只計內容指紋等於 target 的紀錄並於報告輸出指紋，R4-F1） | L | G | P9-T9 |
+| P9-T13 | 實機回滾演練（`tools/stage3/rollback_drill.py`；報告記錄 current 部署目錄內容指紋，R4-F1） | G | L | P9-T12 |
 | P9-T14 | Stage 0～3 出口證據索引（`tools/stage3/evidence_index.py`；Stage 3 target 記錄 `bundle_tree_sha256`，R2-F7；entry 保存受測內容指紋並納入有效性、同 manifest 換 tree 拒絕重設 target，R3-F2；canary-report 項目只以帳本版本最新報告判定，新事故撤銷舊 PASS，R3-F1） | L | G | P9-T7 |
-| P9-T14B | 證據 ingest（`tools/stage3/evidence_ingest.py`；報告受測內容指紋核對 target、報告不得早於 target 內容生效，R3-F2；canary 報告防回放，R3-F1） | H | L | P9-T15 |
-| P9-T15 | OD-09 延後凍結程序與凍結輸出對正式 gate 的讀寫契約（`tools/stage3/od09_freeze.py`；寫入 P2 `thresholds.<key>.per_platform.<os>.<field>`，不改 gate） | L | H | P9-T14 |
+| P9-T14B | 證據 ingest（`tools/stage3/evidence_ingest.py`；報告受測內容指紋核對 target、報告不得早於 target 內容生效，R3-F2；canary 報告防回放，R3-F1；ab／canary／drill 報告缺指紋即拒收、不以 target 回填，R4-F1） | H | L | P9-T15 |
+| P9-T15 | OD-09 凍結結果的 Stage 3 消費端（`tools/stage3/od09_consume.py`：`od09-freeze` 報告判定、`S0-OD09-DEFERRED-FROZEN`／`S3-OD09-ALL-FROZEN` 核對、`od09 check` 唯讀委派；凍結工具屬 P2-T16，P9 不寫延後項，R4-F2） | L | H | P9-T14 |
 | P9-T16 | Python daemon 退役切換（packaging；發佈前逐檔重驗 bundle 內容與 tree、`retirement pack`＋`verify-archive` 後只上傳已驗 archive，R2-F7；旁載檔後重設 target 或新事故報告後拒絕發佈，R3-F1／R3-F2） | H | L | P9-T13 |
 | P9-T17 | `python3 -m tools.stage3` 入口與擁有者程序文件 | G | H | P9-T16 |
 
@@ -345,6 +346,7 @@
 | `crates/sw-core/src/mcu_patterns.rs` | P5-T0（骨架） | P8-T2 Modify |
 | `scripts/rust/slice_breaker.py` | P5-T0b | P6-T0、P7-T0、P8-T1 只新增 `breaker/slice_2.x.json` |
 | `contracts/ab_normalization.yaml` | P5-T20 | P9-T7B 只追加鍵 |
+| `longrun_acceptance.yaml` 三個 OD-09 延後項的寫入（`realhw/acceptance/od09_freeze.py`：`freeze`／`check_frozen_before`／`register_candidate_start`、`candidate_longrun_starts.ndjson`）、`docs/rust-refactor/owner-decisions-addenda.md`、`procedures/od09-deferred-freeze.md` | P2-T16（Stage 0；只依賴 P2-T12、P2-T15，R4-F2） | P4 Task 16（B-12）、P8 Task 15（第 8 項）長跑開跑前 `register-candidate`；P9-T6 L3 A/B 呼叫 `check_frozen_before`＋`register_candidate_start`；P9-T15／T14B 只消費 `freeze --out` 報告；P9-T1 不重建 addenda、P9-T17 不重建該程序檔；任何 Phase 不得另寫延後項或手改 acceptance |
 | `tests/acceptance/evidence_index.schema.json` | P2-T12 | P9-T1 另建 `stage3_evidence_index.schema.json` |
 | `tests/contract_blackbox/bb_faketarget.py` | P3-T2 | P5-T15a、P6-T11、P7-T18A 以 keyword-only 擴充（不存在 `contract_blackbox/faketarget.py`） |
 | `behavior_changes.yaml` 新條目欄位 | P0-T1／T5 schema | 一律 `approved_at_revision`＋`ab_participation`，`contracts/` 內不得出現 `contract_revision` 鍵 |

@@ -2573,7 +2573,7 @@ python3 -m pytest -q tests/ && python3 -m policy_check --repo .
 
 **BLOCKED-OWNER：**
 - Spike 6 實機回滾：在 L2 bench 與 OD-05 Windows 機台（OD-08：com0com DUT-side pair 或實體 USB-UART 直連 Windows）完成「更新→回滾」並證明真實串口被舊版 daemon 釋放、Previous daemon 重新取得（§12.1 末段），不只比對版本字串。
-- §10.3 實際權限下（一般任務 Agent 身分）無法觸發 update／rollback 或替換版本檔的證據（見 Task 15）。
+- §10.3 實際權限下（一般任務 Agent 身分）無法觸發 update／rollback 或替換版本檔的證據（見 Task 15；須為 `verify_agent_perms.py` `verdict:"blocked"`，含 ownership／chmod／DACL 與祖先目錄替換檢查，當下操作被拒不足以成立）。
 
 ---
 
@@ -2761,7 +2761,7 @@ SERIALWRAP_CLI_EXE=$SW_BUNDLE/bin/serialwrap SERIALWRAP_AB_LABEL=rust-1b python3
 ## Task 15：Agent 權限模型文件與驗證工具（§10.3）、對外文件同步
 
 **Test author model:** haiku-xhigh
-**Implementer model:** agy-gemini-3.8-flash-high（文件為主；`verify_agent_perms.py` 屬安全敏感，審查 A 須專審其檔案副作用：只能觸碰 sentinel 檔，對真實 target 不得 rename／replace／delete）
+**Implementer model:** agy-gemini-3.8-flash-high（文件為主；`verify_agent_perms.py` 屬安全敏感，審查 A 須專審其檔案副作用：只能觸碰 sentinel 檔，對真實 target 不得 rename／replace／delete，對 target 與祖先目錄不得 chmod／chown／改 ACL；並專審 restore_checks 判定是否保守：任何證據不足一律 `unknown`，不得落為 `blocked`，R4-F3）
 **Changelog fragment:** `changelog.d/<issue>-rust-p4-agent-permission-docs.md`（`type: docs`，`scope: rust-refactor`）
 
 **Files:**
@@ -2782,12 +2782,52 @@ scripts/rust/verify_agent_perms.py --targets <path>... [--json-out <file>]
     delete：判定規則同 rename（不實際刪除）；
     replace：= rename 判定 AND 父目錄可建立檔案（以 parent_dir_write 的 sentinel 結果）；
     parent_dir_write：在父目錄建立 .permprobe-<pid>-<rand> sentinel、對 sentinel 依序做 write／rename（→ .permprobe-<pid>-<rand>.r）／replace／delete，全部對 sentinel 執行。
-  sentinel 以 try/finally 清除；啟動時先清掉同目錄超過 1 小時的 .permprobe-* 殘留。輸出 JSON：
-  {"identity": "<user or DOMAIN\\user>", "platform": "...", "results": [{"target": str, "op": str, "allowed": bool, "error": str|null}], "blocked": bool}
-  blocked = 所有 op 皆 allowed=false。exit 0（blocked）／3（有任何 allowed）／2（參數錯誤）。
+  sentinel 以 try/finally 清除；啟動時先清掉同目錄超過 1 小時的 .permprobe-* 殘留。
+  上述 op 只回答「此刻的操作是否被拒」，不足以證明 §10.3 的有效權限阻斷（R4-F3：同一身分擁有的 0555 檔，op 全被拒，
+  但該身分可以 chmod 恢復寫權）。因此另做「恢復寫權能力」檢查（restore_checks），對象為每個 target 本身及其**全部祖先目錄**
+  （直到檔案系統根或磁碟根；target 為 symlink 時，lstat 的字面路徑鏈與 realpath 解析後的路徑鏈兩條都檢查）。
+  這些檢查全部唯讀：只做 stat／lstat、os.access、讀取 /proc/self/status、GetNamedSecurityInfoW／GetTokenInformation 查詢，
+  以及「開啟後立即關閉」的 CreateFileW；絕不呼叫 chmod／chown／setfacl／SetSecurityInfo／SetNamedSecurityInfoW。
+    POSIX：
+      owner_chmod：st_uid == os.geteuid() → possible=true（擁有者可 chmod／setfacl 恢復寫權）；否則 false；stat 失敗 → null。
+      ancestor_replace：對每個祖先 A（不含根），parent(A) 對本身分 os.access(W_OK|X_OK) 且（無 sticky bit 或 A 屬於本身分）
+                        → possible=true（可把 A 整個改名移走並放入替換目錄）；否則 false；stat／access 失敗 → null。
+      privilege：euid==0，或 Linux /proc/self/status 的 CapEff 含 CAP_CHOWN(0)／CAP_DAC_OVERRIDE(1)／CAP_FOWNER(3) 任一位
+                 → possible=true；CapEff 全為 0 → false；非 Linux 且 euid!=0、或 /proc/self/status 讀不到 → null。
+    Windows：
+      owner：GetNamedSecurityInfoW(OWNER|DACL) 的 owner SID == token user SID，且 DACL 不含 OWNER RIGHTS（S-1-3-4）ACE
+             → possible=true（擁有者隱含 READ_CONTROL＋WRITE_DAC，可自行改 DACL）；owner 不同 → false；
+             有 OWNER RIGHTS ACE 時改依 dacl_write 結果；查詢失敗 → null。
+      dacl_write：CreateFileW(path, WRITE_DAC, …, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS) 與 CreateFileW(path, WRITE_OWNER, …) 分別嘗試
+                  （開啟即關閉、不改任何 ACL）：任一成功 → true；兩者皆 ERROR_ACCESS_DENIED → false；其他錯誤 → null。
+      ancestor_replace：對每個祖先 A（不含磁碟根），CreateFileW(A, DELETE, …, FILE_FLAG_BACKUP_SEMANTICS) 成功，
+                        且 CreateFileW(parent(A), FILE_ADD_SUBDIRECTORY, …, FILE_FLAG_BACKUP_SEMANTICS) 成功 → true；
+                        任一為 ERROR_ACCESS_DENIED → false；其他錯誤 → null。
+      privilege：token 含 SeTakeOwnershipPrivilege／SeRestorePrivilege／SeBackupPrivilege（不論是否 enabled，可自行啟用）
+                 或已啟用的 BUILTIN\Administrators SID → true；Administrators 僅為 deny-only（UAC 篩選權杖，提升途徑取決於
+                 UAC 原則）→ null；皆無 → false；GetTokenInformation 失敗 → null。
+  輸出 JSON：
+  {"identity": "<user or DOMAIN\\user>", "platform": "...",
+   "results": [{"target": str, "op": str, "allowed": bool, "error": str|null}],
+   "restore_checks": [{"target": str, "path": str, "kind": "owner_chmod"|"owner"|"dacl_write"|"ancestor_replace"|"privilege",
+                       "possible": true|false|null, "detail": str|null}],
+   "verdict": "blocked"|"not_blocked"|"unknown", "blocked": true|false|null}
+  判定（純函式 classify(results, restore_checks) -> (verdict, blocked, exit_code)，可由測試直接 import）：
+    任一 op allowed=true，或任一 restore_check possible=true → verdict="not_blocked"、blocked=false、exit 3；
+    否則若有任一 restore_check possible=null（證據不足）→ verdict="unknown"、blocked=null、exit 4；
+    只有在所有 op allowed=false **且**所有 restore_check possible=false 時 → verdict="blocked"、blocked=true、exit 0。
+    restore_checks 為空（未知平台或檢查未執行）視為證據不足 → unknown／exit 4，不得判 blocked。
+  可測試的純函式（測試以 importlib 載入腳本直接呼叫，依賴全部注入）：
+    classify(results: list[dict], restore_checks: list[dict]) -> tuple[str, bool | None, int]
+    posix_restore_checks(target: str, *, lstat, access, realpath, euid: int, cap_eff: int | None) -> list[dict]
+      （字面鏈＝os.path.abspath(target) 與其祖先、不解析 symlink；解析鏈＝realpath(target) 與其祖先；同一 path 只記一次；
+        每個 path 一筆 owner_chmod、每個非根祖先一筆 ancestor_replace、整份一筆 privilege（path 為 "<process>"））
+    windows_privilege_possible(privileges: set[str], admin: "enabled" | "deny_only" | "absent") -> bool | None
+  報告中的 target／path 一律為 os.path.abspath 後的字串（不 realpath），解析鏈另以 realpath 字串記錄。
+  exit 2（參數錯誤）。exit 3／4 的報告一律不得作為 §10.3「已完成權限阻斷」的證據。
 ```
 
-文件 `agent-permission-model.md` 必含章節（以 `tests/test_rust_deploy_docs.py` 檢查標題存在）：`## 1. 身分清單`（一般任務 Agent、安裝／更新者、daemon 執行身分；由部署負責人填表，表格欄位：身分、帳號、取得方式、允許操作）、`## 2. 受保護路徑`（`%LOCALAPPDATA%\Programs\serialwrap\versions\`、`…\bin\`、`…\backups\`、`…\supervisor\` 與其父目錄；Linux `${DATA_DIR}/versions/`、`~/.local/bin/serialwrap{,d}`）、`## 3. Windows ACL 設定`（`icacls` 指令：移除一般 Agent 身分的 `(W)`／`(M)`／`(D)`、保留 `(RX)`）、`## 4. Linux 權限設定`（安裝者擁有、Agent 身分只讀）、`## 5. 同身分部署的限制`（若 Agent 與安裝者同一帳號，只能宣稱流程約束，不得宣告已完成權限阻斷，§10.3 原文）、`## 6. 驗證程序`（`verify_agent_perms.py` 以 Agent 身分執行、預期 `blocked:true`、證據保存格式）、`## 7. 信任範圍`（OD-12：整機本機使用者可信；`remote` 經 ssh 時延伸至通過 ssh 驗證者；不得宣稱同使用者隔離）。
+文件 `agent-permission-model.md` 必含章節（以 `tests/test_rust_deploy_docs.py` 檢查標題存在）：`## 1. 身分清單`（一般任務 Agent、安裝／更新者、daemon 執行身分；由部署負責人填表，表格欄位：身分、帳號、取得方式、允許操作）、`## 2. 受保護路徑`（`%LOCALAPPDATA%\Programs\serialwrap\versions\`、`…\bin\`、`…\backups\`、`…\supervisor\` 與其父目錄；Linux `${DATA_DIR}/versions/`、`~/.local/bin/serialwrap{,d}`）、`## 3. Windows ACL 設定`（`icacls` 指令：移除一般 Agent 身分的 `(W)`／`(M)`／`(D)`、保留 `(RX)`）、`## 4. Linux 權限設定`（安裝者擁有、Agent 身分只讀）、`## 5. 同身分部署的限制`（若 Agent 與安裝者同一帳號，只能宣稱流程約束，不得宣告已完成權限阻斷，§10.3 原文；並說明同 owner 時擁有者可自行恢復寫權（POSIX chmod、Windows 隱含 WRITE_DAC），即使把檔案設成唯讀，驗證器也會回 `not_blocked`）、`## 6. 驗證程序`（`verify_agent_perms.py` 以 Agent 身分執行、預期 `verdict:"blocked"`／`blocked:true`／exit 0、證據保存格式；須明寫「`verdict` 為 `not_blocked`（exit 3）或 `unknown`（exit 4）的報告不得作為已完成權限阻斷的證據」，以及「受保護路徑或任一祖先目錄由 Agent 身分擁有、或 Agent 身分可改其 DACL 時，即使當下寫入／改名被拒也判 `not_blocked`」，R4-F3）、`## 7. 信任範圍`（OD-12：整機本機使用者可信；`remote` 經 ssh 時延伸至通過 ssh 驗證者；不得宣稱同使用者隔離）。
 
 - [ ] **步驟 1：寫失敗測試**（`tests/test_rust_agent_perm_verifier.py`）
 
@@ -2798,8 +2838,28 @@ import pytest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "rust" / "verify_agent_perms.py"
 
-@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root 會繞過權限位元")
-def test_readonly_tree_reports_blocked(tmp_path):
+import importlib.util, shutil
+from types import SimpleNamespace
+
+def _load():
+    spec = importlib.util.spec_from_file_location("verify_agent_perms", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+def _run(*targets):
+    p = subprocess.run([sys.executable, str(SCRIPT), "--targets", *map(str, targets)], capture_output=True, text=True)
+    return p, json.loads(p.stdout)
+
+posix_only = pytest.mark.skipif(os.name != "posix", reason="POSIX 權限位元")
+not_root = pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root 會繞過權限位元")
+
+@posix_only
+@not_root
+def test_same_owner_readonly_tree_is_not_blocked(tmp_path):
+    # R4-F3 反例（取代舊 test_readonly_tree_reports_blocked）：同一身分擁有的 0555 樹，
+    # 此刻 write／rename／replace／parent_dir_write 全被拒，但擁有者可 chmod 恢復寫權（本測試的 finally 就是這麼做），
+    # 因此不得判為有效阻斷。
     vdir = tmp_path / "versions" / "0.4.0"
     vdir.mkdir(parents=True)
     exe = vdir / "serialwrap"
@@ -2808,22 +2868,158 @@ def test_readonly_tree_reports_blocked(tmp_path):
     vdir.chmod(0o555)
     (tmp_path / "versions").chmod(0o555)
     try:
-        p = subprocess.run([sys.executable, str(SCRIPT), "--targets", str(exe), str(vdir)], capture_output=True, text=True)
-        rep = json.loads(p.stdout)
-        assert p.returncode == 0 and rep["blocked"] is True
+        p, rep = _run(exe, vdir)
+        assert p.returncode == 3
+        assert rep["verdict"] == "not_blocked" and rep["blocked"] is False
         assert {r["op"] for r in rep["results"]} >= {"write", "rename", "replace", "parent_dir_write"}
+        assert not any(r["allowed"] for r in rep["results"])          # 當下操作全被拒 ≠ 有效阻斷
+        owned = {c["path"] for c in rep["restore_checks"] if c["kind"] == "owner_chmod" and c["possible"] is True}
+        assert {str(exe), str(vdir), str(vdir.parent)} <= owned
         assert exe.read_bytes() == b"x"
+        assert stat.S_IMODE(exe.stat().st_mode) == 0o555             # 驗證器本身不得 chmod
+        assert stat.S_IMODE(vdir.stat().st_mode) == 0o555
     finally:
         (tmp_path / "versions").chmod(0o755); vdir.chmod(0o755); exe.chmod(0o755)
+
+def _foreign_readonly_chain(p: Path) -> bool:
+    euid = os.geteuid()
+    real = Path(os.path.realpath(p))
+    for q in [p, *p.parents, real, *real.parents]:
+        if os.lstat(q).st_uid == euid:
+            return False
+        if q != q.parent and os.access(q.parent, os.W_OK):
+            return False
+    return True
+
+def _cap_eff_zero() -> bool:
+    try:
+        line = next(l for l in Path("/proc/self/status").read_text().splitlines() if l.startswith("CapEff:"))
+    except (OSError, StopIteration):
+        return False
+    return int(line.split()[1], 16) == 0
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="依賴 /proc/self/status CapEff")
+@not_root
+def test_foreign_owned_readonly_target_reports_blocked():
+    # 不同 owner 的 fixture：系統 sh（root 擁有、整條祖先鏈對本身分唯讀）
+    target = Path(shutil.which("sh") or "/bin/sh")
+    if not (_foreign_readonly_chain(target) and _cap_eff_zero()):
+        pytest.skip("前提不成立：sh 的路徑鏈不是全由他人擁有且唯讀，或行程具 capability")
+    before = (os.lstat(target).st_ino, os.lstat(target).st_mtime_ns)
+    p, rep = _run(target)
+    assert p.returncode == 0 and rep["verdict"] == "blocked" and rep["blocked"] is True
+    assert rep["results"] and not any(r["allowed"] for r in rep["results"])
+    assert rep["restore_checks"] and all(c["possible"] is False for c in rep["restore_checks"])
+    assert {"owner_chmod", "ancestor_replace", "privilege"} <= {c["kind"] for c in rep["restore_checks"]}
+    assert (os.lstat(target).st_ino, os.lstat(target).st_mtime_ns) == before
 
 def test_writable_tree_reports_not_blocked_and_restores(tmp_path):
     f = tmp_path / "serialwrap"
     f.write_bytes(b"orig")
-    p = subprocess.run([sys.executable, str(SCRIPT), "--targets", str(f)], capture_output=True, text=True)
-    rep = json.loads(p.stdout)
-    assert p.returncode == 3 and rep["blocked"] is False
+    p, rep = _run(f)
+    assert p.returncode == 3 and rep["blocked"] is False and rep["verdict"] == "not_blocked"
     assert f.read_bytes() == b"orig"
     assert not list(tmp_path.glob("*.permprobe*"))
+
+# ---- 純函式（不碰檔案系統）：classify 與 POSIX 恢復能力檢查 ----
+
+DENIED = [{"target": "/opt/sw/serialwrap", "op": "write", "allowed": False, "error": "EACCES"}]
+
+def _chk(v):
+    return [{"target": "t", "path": "t", "kind": "owner_chmod", "possible": v, "detail": None}]
+
+def test_classify_requires_every_restore_check_false():
+    m = _load()
+    assert m.classify(DENIED, _chk(False)) == ("blocked", True, 0)
+    assert m.classify(DENIED, _chk(True)) == ("not_blocked", False, 3)
+    assert m.classify(DENIED, _chk(None)) == ("unknown", None, 4)
+    assert m.classify([dict(DENIED[0], allowed=True)], _chk(None)) == ("not_blocked", False, 3)
+    assert m.classify(DENIED, []) == ("unknown", None, 4)      # 沒做恢復能力檢查 → 證據不足
+
+def _fake(fs, writable, *, euid=1000, cap_eff=0, realpath=lambda p: p, fail=()):
+    def lstat(p):
+        if p in fail:
+            raise PermissionError(p)
+        uid, mode = fs[p]
+        return SimpleNamespace(st_uid=uid, st_mode=mode)
+    return dict(lstat=lstat, access=lambda p, mode: (p in writable) if mode & os.W_OK else True,
+                realpath=realpath, euid=euid, cap_eff=cap_eff)
+
+ROOT_RO = {"/": (0, 0o40755), "/opt/sw": (0, 0o40555), "/opt/sw/serialwrap": (0, 0o100555)}
+
+def test_writable_grandparent_reports_ancestor_replace():
+    m = _load()
+    fs = dict(ROOT_RO, **{"/opt": (0, 0o40777)})               # 只有祖父目錄 /opt 可寫、無 sticky
+    checks = m.posix_restore_checks("/opt/sw/serialwrap", **_fake(fs, {"/opt"}))
+    assert [c["path"] for c in checks if c["kind"] == "ancestor_replace" and c["possible"] is True] == ["/opt/sw"]
+    assert m.classify(DENIED, checks)[0] == "not_blocked"
+
+def test_sticky_grandparent_with_foreign_child_is_blocked():
+    m = _load()
+    fs = dict(ROOT_RO, **{"/opt": (0, 0o41777)})               # sticky 且 /opt/sw 非本身分擁有 → 不能改名
+    checks = m.posix_restore_checks("/opt/sw/serialwrap", **_fake(fs, {"/opt"}))
+    assert checks and all(c["possible"] is False for c in checks)
+    assert m.classify(DENIED, checks) == ("blocked", True, 0)
+
+def test_agent_owned_ancestor_reports_owner_chmod():
+    m = _load()
+    fs = {"/": (0, 0o40755), "/home": (0, 0o40755), "/home/agent": (1000, 0o40555),
+          "/home/agent/bin": (0, 0o40555), "/home/agent/bin/serialwrap": (0, 0o100555)}
+    checks = m.posix_restore_checks("/home/agent/bin/serialwrap", **_fake(fs, set()))
+    assert [c["path"] for c in checks if c["kind"] == "owner_chmod" and c["possible"] is True] == ["/home/agent"]
+    assert m.classify(DENIED, checks)[0] == "not_blocked"
+
+def test_cap_fowner_reports_privilege_and_missing_capeff_is_unknown():
+    m = _load()
+    fs = dict(ROOT_RO, **{"/opt": (0, 0o40755)})
+    checks = m.posix_restore_checks("/opt/sw/serialwrap", **_fake(fs, set(), cap_eff=1 << 3))
+    assert [c["possible"] for c in checks if c["kind"] == "privilege"] == [True]
+    checks = m.posix_restore_checks("/opt/sw/serialwrap", **_fake(fs, set(), cap_eff=None))
+    assert [c["possible"] for c in checks if c["kind"] == "privilege"] == [None]
+    assert m.classify(DENIED, checks) == ("unknown", None, 4)
+
+def test_unreadable_ancestor_is_unknown_not_blocked():
+    m = _load()
+    fs = dict(ROOT_RO, **{"/opt": (0, 0o40755)})
+    checks = m.posix_restore_checks("/opt/sw/serialwrap", **_fake(fs, set(), fail={"/opt"}))
+    assert any(c["path"] == "/opt" and c["possible"] is None for c in checks)
+    assert m.classify(DENIED, checks) == ("unknown", None, 4)
+
+def test_symlink_target_checks_both_chains():
+    m = _load()
+    fs = dict(ROOT_RO, **{"/opt": (0, 0o40755), "/usr": (0, 0o40755), "/usr/bin": (0, 0o40755),
+                          "/usr/bin/serialwrap": (0, 0o120777)})
+    checks = m.posix_restore_checks("/usr/bin/serialwrap",
+                                    **_fake(fs, set(), realpath=lambda p: "/opt/sw/serialwrap" if p == "/usr/bin/serialwrap" else p))
+    paths = {c["path"] for c in checks if c["kind"] == "owner_chmod"}
+    assert {"/usr/bin/serialwrap", "/usr/bin", "/opt/sw/serialwrap", "/opt/sw", "/opt"} <= paths
+
+def test_windows_privilege_table():
+    m = _load()
+    f = m.windows_privilege_possible
+    assert f(set(), "absent") is False
+    assert f({"SeTakeOwnershipPrivilege"}, "absent") is True
+    assert f({"SeRestorePrivilege"}, "absent") is True
+    assert f({"SeBackupPrivilege"}, "absent") is True
+    assert f(set(), "enabled") is True
+    assert f(set(), "deny_only") is None                         # UAC 篩選權杖：證據不足
+
+@pytest.mark.windows_native
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows DACL")
+def test_windows_owner_with_denied_write_is_not_blocked(tmp_path):
+    # Windows 版 R4-F3 反例：本身分擁有的檔案即使 DACL deny (W,D)，擁有者仍隱含 WRITE_DAC，可自行改回
+    f = tmp_path / "serialwrap.exe"
+    f.write_bytes(b"x")
+    subprocess.run(["icacls", str(f), "/deny", f"{os.environ['USERNAME']}:(W,D)"], check=True, capture_output=True)
+    try:
+        p, rep = _run(f)
+        assert p.returncode == 3 and rep["verdict"] == "not_blocked" and rep["blocked"] is False
+        assert [r["allowed"] for r in rep["results"] if r["target"] == str(f) and r["op"] == "write"] == [False]
+        assert any(c["path"] == str(f) and c["kind"] in ("owner", "dacl_write") and c["possible"] is True
+                   for c in rep["restore_checks"])
+        assert f.read_bytes() == b"x"
+    finally:
+        subprocess.run(["icacls", str(f), "/reset"], check=False, capture_output=True)
 ```
 
 表列案例：
@@ -2838,6 +3034,8 @@ def test_writable_tree_reports_not_blocked_and_restores(tmp_path):
 | `test_skill_windows_no_remote_not_supported_claim` | `SKILL_WINDOWS.md` 不含 `本期不支援 serialwrap remote`（P1 已改：本測試初次即 PASS，依 §0.1 附突變檢查證明會轉紅） |
 | `test_error_codes_have_skill_entries` | P0 的 OD-06 規則檢查器對 `contracts/error_codes.yaml` 全碼通過；本 Phase 無新增碼（`test_rust_stage1b_registration.py` 另驗） |
 | `test_verifier_never_touches_real_target` | 對可寫 target 執行後：target 的 inode、mtime、內容皆不變；目錄中無 `.permprobe*` 殘留 |
+| `test_verifier_never_changes_permissions` | 對 0555 target（`tmp_path` 下三層）執行前後，target 與每個祖先目錄的 `st_mode`、`st_uid`、`st_gid` 皆不變（restore_checks 只查詢，不 chmod／chown／setfacl；R4-F3） |
+| `test_deploy_doc_rejects_not_blocked_and_unknown_as_evidence`（`test_rust_deploy_docs.py`） | `agent-permission-model.md` 的 `## 6. 驗證程序` 章節內同時含 `not_blocked`、`unknown`、`不得作為`；`## 5. 同身分部署的限制` 章節含「擁有者可自行恢復寫權」或等義句「同 owner」與 `not_blocked`（R4-F3） |
 | `test_verifier_interrupted_leaves_no_real_change` | 以 `SIGKILL` 在 sentinel 探測中途終止 → target 不變；再次執行會清掉舊 sentinel |
 
 - [ ] **步驟 2：執行並確認 FAIL**：`python3 -m pytest -q tests/test_rust_agent_perm_verifier.py tests/test_rust_deploy_docs.py --runxfail` → 腳本與文件不存在（測試以 `xfail(strict=True, reason="P4-T15 紅燈")` 標示，`--runxfail` 用來確認真的紅；已由 P1 達成的斷言依 §0.1 做突變檢查）。
@@ -2847,7 +3045,7 @@ def test_writable_tree_reports_not_blocked_and_restores(tmp_path):
 
 **BLOCKED-OWNER：**
 - §10.3：部署負責人填寫身分清單（一般任務 Agent、安裝／更新者的實際帳號與有效權限）。
-- 在測試團隊 Windows 工作站以一般任務 Agent 實際身分執行 `verify_agent_perms.py`，取得 `blocked:true` 證據；若兩者同帳號，由擁有者決定接受「流程約束」宣告。
+- 在測試團隊 Windows 工作站以一般任務 Agent 實際身分執行 `verify_agent_perms.py`，取得 `verdict:"blocked"`（`blocked:true`、exit 0，且 restore_checks 全為 `possible:false`）證據；`not_blocked`（exit 3）或 `unknown`（exit 4）一律不得登錄為權限阻斷證據。若兩者同帳號（受保護路徑由 Agent 身分擁有或可改其 DACL，驗證器必然回 `not_blocked`），只能宣稱流程約束，由擁有者決定是否接受該宣告（§10.3）。
 
 ---
 
@@ -2962,7 +3160,7 @@ python3 scripts/rust/check_cfg_boundary.py && python3 -m pytest -q tests/ && pyt
 - §1.2 CLI 暖快取往返 p50／p95／p99 在 §1.1.1 標準量測環境（Linux 原生、Windows OD-05 機台原生 artifact）正式量測（`bench_cli_roundtrip.py` gate 必須為 `PASS`）；Windows 連續 100 次 CLI 不產生解壓檔案或目錄的正式證據；EDR 無新增攔截證據（查詢權限不足時列證據不足）。
 - §11.6 Stage 1B L2：以 Rust CLI 作為 pinned `serialwrap_exe` 在 live bench 跑全部適用 TestPilot `serialwrap_regression` 案例，含已授權破壞集。
 - §11.6 Stage 1B L3：`realhw` P0＋P1＋remote 以 Rust CLI 執行。
-- §11.6／OD-10：Rust CLI＋Python daemon 混合組合 48 小時長跑（至少 Windows 生產目標環境；bench 依序排程，約佔 3 天）——程序與 gate 判定沿用 P2 `longrun_acceptance.yaml`，本 Phase 只把 Rust CLI artifact 填入 manifest。
+- §11.6／OD-10：Rust CLI＋Python daemon 混合組合 48 小時長跑（至少 Windows 生產目標環境；bench 依序排程，約佔 3 天）——程序與 gate 判定沿用 P2 `longrun_acceptance.yaml`，本 Phase 只把 Rust CLI artifact 填入 manifest。這是最早的 Rust 候選長跑（`S1B-L3-MIXED-48H-WINDOWS`）：前置為 OD-09 延後項已於正式 Stage 0 出口以 P2 Task 16 凍結（工具屬 P2，不需等待 P9，R4-F2）；啟動 `python3 -m realhw --tier longrun` 前必須先執行 `py -3.12 -m realhw.acceptance.od09_freeze register-candidate --acceptance realhw/acceptance/longrun_acceptance.yaml --item S1B-L3-MIXED-48H-WINDOWS --platform windows --run-id <run_id> --started-at <now>`，exit 非 0（未凍結 → 5，`HARNESS_OD09_NOT_FROZEN`）即不得開跑；gate 的 `pre_frozen` 仍為最後防線。
 - Spike 2（>72 h `windows-task` 監管，程序見 Task 18）、Spike 6（混合版本與實機回滾）與 OD-08 原生 Windows COM handle 證據（動到 PAL 的 PR 必附）。
 - 正式 release artifact 於 Windows 自架 runner 原生 build/link 與簽署前檢查（`objdump -p` 匯入 DLL 白名單、launcher Subsystem 為 Windows GUI）。
 
@@ -3138,8 +3336,8 @@ evidence schema 必填：`case_id`、`artifact_sha256`（CLI、launcher、runtim
 | B-09 | §1.2 CLI 往返效能在標準量測環境正式量測（Linux 原生、Windows 原生） | §1.1、§1.2 | 16 |
 | B-10 | Stage 1B L2：Rust CLI 為 pinned `serialwrap_exe` 跑全部適用案例含已授權破壞集 | §11.6 | 16 |
 | B-11 | Stage 1B L3：`realhw` P0＋P1＋remote | §11.6 | 16 |
-| B-12 | Rust CLI＋Python daemon 混合組合 48 h 長跑（Windows 生產目標環境，OD-10 依序排程） | §11.6、OD-10 | 16 |
-| B-13 | §10.3 身分清單由部署負責人提供，並以一般任務 Agent 實際身分取得 `verify_agent_perms.py` `blocked:true` 證據 | §10.3 | 12、15 |
+| B-12 | Rust CLI＋Python daemon 混合組合 48 h 長跑（Windows 生產目標環境，OD-10 依序排程）；前置：OD-09 延後項已於 Stage 0 出口以 P2 Task 16 凍結，開跑前 `od09_freeze register-candidate --item S1B-L3-MIXED-48H-WINDOWS`（R4-F2） | §11.6、OD-10、OD-09、§14.2 | 16 |
+| B-13 | §10.3 身分清單由部署負責人提供，並以一般任務 Agent 實際身分取得 `verify_agent_perms.py` `verdict:"blocked"`（exit 0；restore_checks 全 `possible:false`）證據；`not_blocked`／`unknown` 不計，同帳號部署只能登錄流程約束 | §10.3 | 12、15 |
 | B-14 | 測試團隊工作站 `doctor` 全項、`connect`／`--bench` 經真實 relay、TeraTerm／PuTTY 連 `console_endpoint` 實機操作 | §11.6 | 9、13、14 |
 | B-15 | Windows 實機 SERIALCOMM（藍牙＋USB-UART 混合）與 `NtQueryInformationProcess` 在 EDR 下可讀性 | SC-17、07 §1.6 | 2、4 |
 | B-16 | OD-08：所有動到 PAL 的 PR（Task 2、3、4、5、17）必附原生 Windows COM handle 證據（com0com DUT-side pair 或實體 USB-UART） | OD-08 | 2、3、4、5、17 |

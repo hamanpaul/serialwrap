@@ -61,12 +61,12 @@
 
 比照 P0（`01-stage0-contracts.md`「執行順序」）與 P3（`04-stage1a-rust-cli.md` §1），本 Phase **逐 Task** 執行 red→green，不採「先批次寫完全部紅燈」：批次紅燈會讓後段 Task 的失敗原因變成前段尚未實作的 `ModuleNotFoundError`，紅燈沒有鑑別力，且 `tests/` 下頂層 import 不存在模組會使整個 `pytest -q tests/` collection error、遮蔽既有測試。
 
-1. **執行順序**：Task 1 → **Task 9** → Task 2 → 3 → 4 → 5 → 6 → 7 → 8 → 10 → 11 → 12 → 13 → 14 → 15。Task 9（socat 接線 spike）只依賴 Task 1 的套件骨架，依 §15.4.1「先做 socat 接線 spike，再建 Python 正式 bridge」排在 bridge 實作（Task 2～5）之前；spike 結果（`raw_roundtrip`、`no_echo`、`eof_on_child_exit`）任一為 False 時停止並回報，不得開始 Task 3／5。編號保留以利引用。
+1. **執行順序**：Task 1 → **Task 9** → Task 2 → 3 → 4 → 5 → 6 → 7 → 8 → 10 → 11 → 12 → 13 → 14 → 15 → 16。Task 16（OD-09 凍結工具）只依賴 Task 12、15，屬 Stage 0 交付，不得延到後續 Phase（R4-F2）。Task 9（socat 接線 spike）只依賴 Task 1 的套件骨架，依 §15.4.1「先做 socat 接線 spike，再建 Python 正式 bridge」排在 bridge 實作（Task 2～5）之前；spike 結果（`raw_roundtrip`、`no_echo`、`eof_on_child_exit`）任一為 False 時停止並回報，不得開始 Task 3／5。編號保留以利引用。
 2. **每個 Task**：測試作者完成 T 步驟（撰寫失敗測試、執行並確認 FAIL、commit 測試）→ 實作者完成 I 步驟（實作、確認 PASS、commit 實作）→ 才開始下一個 Task。T 步驟的紅燈必須是本 Task 契約的語意失敗（前段 Task 已實作），不是任意的 `ModuleNotFoundError`。每個 Task 的 Interfaces 段落是測試與實作之間的固定契約，測試作者只依 Interfaces 撰寫，不得窺探或預寫實作。
 3. **`tests/` 下的新測試檔**：建立時即依 P0 T14 規則帶 `pytestmark`；對本 Task 尚未實作的模組一律在**函式內** import（P0 慣例），不得在模組頂層 import，確保 T 步驟期間 `python3 -m pytest -q tests/` 仍可完整收集。T 步驟 commit 只在 phase 分支上，不開 PR。
 4. **I 步驟的綠燈範圍**：只要求「本 Task 測試＋已完成 Task 的測試＋既有測試」全綠；`tools/uart_stdio_bridge/tests` 與 `tests/` 的整套全綠在 §3 收尾驗收。I 步驟**不得新增測試**；驗收所需測試一律屬於該 Task 的 T 步驟。
 5. 實作者不得修改該 Task 的測試檔來遷就實作；發現測試本身錯誤時，停下並交回測試作者修正（§10.4「測試工具變更需獨立審閱」），修正以獨立 commit `test(...)` 記錄。func-test case YAML 的 oracle 修復（Task 10）屬測試資產變更：修復前先保存 pre-repair 基線輸出，修復以獨立 commit 提交並由非實作者審閱。
-6. **雙審**：高風險 Task（3、5、7、8、10、14、15）在該 Task I 步驟完成後立即雙審（sonnet max＋codex gpt-6.1-sol medium；審查者不得為該 Task 實作者），修正後才進下一個 Task；其餘 Task 於 Phase 收尾一併雙審。全部 Task 綠燈後跑整體驗收（§3）、修正、開 PR。
+6. **雙審**：高風險 Task（3、5、7、8、10、14、15、16）在該 Task I 步驟完成後立即雙審（sonnet max＋codex gpt-6.1-sol medium；審查者不得為該 Task 實作者），修正後才進下一個 Task；其餘 Task 於 Phase 收尾一併雙審。全部 Task 綠燈後跑整體驗收（§3）、修正、開 PR。
 
 **模型分工**（`00-master-plan.md` §2；測試作者 ≠ 實作者；並行／平台／I/O 狀態機與 Telnet parser 由 `codex-gpt-6-luna-max` 實作；DUT 模擬器與 bridge 周邊工具依 master §2 由 agy 實作）：
 
@@ -87,6 +87,7 @@
 | 13 | pytest 資源報告、平台 SKIP 閘門、Windows collection 與 hosted Windows L1 | agy-gemini-3.8-flash-high | haiku-xhigh |
 | 14 | L2／L3 平台 adapter（pin＋版本 gate、PID／RSS、bench lock、能力式 SKIP、Telnet frontend、worker 存活事件） | haiku-xhigh | codex-gpt-6-luna-max |
 | 15 | `longrun_acceptance.yaml`、外層 `release_gate_result` 判定器、觀測器 | codex-gpt-6-luna-max | haiku-xhigh |
+| 16 | OD-09 延後項凍結工具與候選長跑開跑登記（延後項唯一寫入者） | codex-gpt-6-luna-max | haiku-xhigh |
 
 **測試指令（全 Phase 共用）**
 
@@ -138,6 +139,8 @@ realhw/{drivers,preflight,harness,__main__}.py  realhw/frontends.py  realhw/proc
 regression/serialwrap_regression/{plugin,preflight,core,guards}.py  regression/serialwrap_regression/cases/{f05_console_coexist,f09_boot_uboot}.py  # Task 14
 reliability/serialwrap_reliability/{core,testbed_loader}.py                # Task 14
 realhw/acceptance/{__init__,longrun_acceptance.yaml,longrun_acceptance.schema.json,gate.py,observer.py,walscan.py,winexcl.py}  # Task 15
+realhw/acceptance/{od09_freeze.py,candidate_longrun_starts.ndjson}  tests/{test_od09_freeze,test_longrun_gate_frozen,fakes_od09}.py  # Task 16
+docs/rust-refactor/owner-decisions-addenda.md  docs/rust-refactor/procedures/od09-deferred-freeze.md  # Task 16
 realhw/procedures/p2-1-mcu-flash.md                                      # Task 12
 .github/workflows/tests.yml                                              # Task 1（bridge job）、Task 13（`pytest-windows` job、自架 Windows COM job）
 docs/regression-plugin.md  func-test/README.md                           # Task 10、12、14（R-18 文件同步）
@@ -2446,7 +2449,7 @@ def test_telnet_frontend_send_line_and_capture(fake_telnet_server, stub_sw):
 **Changelog fragment:** `changelog.d/rust-p2-longrun-release-gate.md`（`type: feat`、`scope: realhw`）
 **BLOCKED-OWNER evidence:**
 - Linux 與 Windows 各一次修正後 Python 48 h `lr-mixed` 基線（OD-10：擁有者 bench、依序、同機同板經 usbipd、不可並行），含 `observer.ndjson`、WAL 目錄複本、`release-gate.json`（`mode=baseline`）；Windows 另含 `excl/probes.ndjson`＋`excl/handoff.ndjson`（winexcl 原生 COM 獨占證據，R1-F7；真 `CreateFileW` 行為只能在擁有者 Windows bench 取得）。
-- OD-09 延後凍結項（`resources`、`min_effective_load`、`comparison_uncertainty`）的數值：須在上述基線完成後、任何 Rust 候選長跑前由擁有者裁決並寫入 `longrun_acceptance.yaml`（新 revision，`frozen_at` 早於候選 run）。在此之前所有 candidate 判定必為 `BLOCKED`。
+- OD-09 延後凍結項（`resources`、`min_effective_load`、`comparison_uncertainty`）的數值：須在上述基線完成後、任何 Rust 候選長跑前由擁有者裁決，並以本 Phase Task 16 `python3 -m realhw.acceptance.od09_freeze freeze` 寫入 `longrun_acceptance.yaml`（新 revision，`frozen_at` 早於候選 run；不得手改）——屬正式 Stage 0 出口條件（§12.2 Stage 0 列），不依賴後續 Phase。在此之前所有 candidate 判定必為 `BLOCKED`。
 - `lr-mixed` 故障保留：長跑實例的外部監管自動重啟須關閉或以等價措施稽核（§15.11.2，Spike 8）——由擁有者在 bench 上設定並記錄。
 
 **Files:**
@@ -2560,7 +2563,7 @@ evidence:
   context_time_tolerance_s: 2.0               # WAL wall_ts 與 events wall_ts 對齊容差；落在容差內的判定記為不確定
 ```
 
-延後項的凍結：OD-09 凍結時寫入 `thresholds.<key>.per_platform.linux` 與 `per_platform.windows` **兩組**數值、改該 key 的 `status: frozen`、加 `frozen_at`，並遞增檔案 `revision`。`status` 只有 key 層級一個，涵蓋兩平台；**不支援單一平台先凍結**（凍結需兩平台基線皆完成，由 P9 Task 15 `od09_freeze.freeze` 一次寫入；這是延後項唯一的寫入者）。`frozen_at` 必須晚於兩平台基線 run 的結束時間、早於候選 run 的 `started_at_utc`（§14.2「Python 基線完成後、Rust 候選前」）。
+延後項的凍結：OD-09 凍結時寫入 `thresholds.<key>.per_platform.linux` 與 `per_platform.windows` **兩組**數值、改該 key 的 `status: frozen`、加 `frozen_at`，並遞增檔案 `revision`。`status` 只有 key 層級一個，涵蓋兩平台；**不支援單一平台先凍結**（凍結需兩平台基線皆完成，由本 Phase Task 16 `realhw.acceptance.od09_freeze.freeze` 一次寫入；這是延後項唯一的寫入者，且只依賴 Task 12／15，於正式 Stage 0 出口即可執行；P4／P8／P9 只消費其 `check_frozen_before`、`register_candidate_start` 與 `freeze --out` 報告，R4-F2）。`frozen_at` 必須晚於兩平台基線 run 的結束時間、早於候選 run 的 `started_at_utc`（§14.2「Python 基線完成後、Rust 候選前」）。
 
 **延後項讀寫契約（gate 讀取與 P9 寫入共用；欄位名與型別即介面，任一側不得改名或另設子樹）**：路徑一律 `thresholds.<key>.per_platform.<os>.<field>`，`<os> ∈ {linux, windows}`；gate 只讀 `per_platform[GateInputs.platform]`。
 
@@ -2576,7 +2579,7 @@ evidence:
 | `comparison_uncertainty` | `stuck_s_tolerance` | number ≥ 0 | `stuck_relative` 上下界放寬量 |
 | `comparison_uncertainty` | `max_reruns` | int ≥ 0 | relative check 重跑上限 |
 
-schema 以 `if status == "frozen" then` 要求兩平台上表全部欄位非 null 且符合型別；`status == "deferred"` 時全部為 null。`per_platform.<os>` 不得含上表以外的欄位（`additionalProperties: false`），`thresholds.<key>` 下不得出現 `per_platform` 以外的數值欄位（例如直接在 `thresholds.resources` 下放 `rss_peak_kb`、或 `tolerance`／`rerun_rule` 子樹）。凍結紀錄欄位 `decision_id`、`approved_by`、`overrides`、`proposal_sha256`、`baseline_entry_ids` 由 P9 Task 15 加入 schema。
+schema 以 `if status == "frozen" then` 要求兩平台上表全部欄位非 null 且符合型別；`status == "deferred"` 時全部為 null。`per_platform.<os>` 不得含上表以外的欄位（`additionalProperties: false`），`thresholds.<key>` 下不得出現 `per_platform` 以外的數值欄位（例如直接在 `thresholds.resources` 下放 `rss_peak_kb`、或 `tolerance`／`rerun_rule` 子樹）。凍結紀錄欄位 `decision_id`、`approved_by`、`overrides`、`proposal_sha256`、`baseline_evidence` 由本 Phase Task 16 加入 schema。
 
 ```python
 # realhw/acceptance/gate.py（可 import yaml；引擎模組不得 import 本檔，也不得 import yaml）
@@ -2871,6 +2874,269 @@ def test_baseline_mode_never_claims_non_regression(tmp_path):
 
 ---
 
+## Task 16：OD-09 延後項凍結工具與候選長跑開跑登記（`realhw/acceptance/od09_freeze.py`；延後項唯一寫入者，R4-F2）
+
+**Test author model:** codex-gpt-6-luna-max　**Implementer model:** haiku-xhigh
+**Changelog fragment:** `changelog.d/rust-p2-od09-freeze.md`（`type: feat`、`scope: realhw`）
+**BLOCKED-OWNER evidence:** B9（實際 `stats → propose → freeze → 重跑基線 gate → check` 由擁有者在兩平台基線（B8）完成後、於**正式 Stage 0 出口**執行；必須早於任何 Rust 候選長跑，最早者為 Stage 1B 的 `S1B-L3-MIXED-48H-WINDOWS`）。
+
+**為什麼放在 P2（R4-F2）**：規格 §12.2 Stage 0 列要求「正式 Stage 0 出口須完成延後項目的凍結與證據充分性核對」，§14.2／OD-09 要求凍結早於任何 Rust 候選長跑。凍結工具若放在最後建置的 P9（前置 P0～P8），Stage 1B 48 h 長跑就只能延到 Stage 2 結束後，或靠手改 acceptance（違反單一寫入者）。因此凍結工具與它需要的最小證據核對子集屬於 Stage 0：本 Task **只依賴 P2 Task 12**（`stage0_evidence_index.yaml`＋`check_evidence_index.py`）與 **P2 Task 15**（`longrun_acceptance.yaml`、schema、`gate.py`、`LongrunFixture`），不得 import `tools.stage3`、`sw_core`，不得讀 P9 的 `tests/acceptance/stage_exits.json`、`docs/rust-refactor/evidence/index.json`，也不依賴 P3～P9 任何交付物。P4（Stage 1B 長跑）、P8（Slice 2.4 長跑）與 P9（Stage 3 A/B、證據 ingest）只**消費**本 Task 的 `check_frozen_before`／`register_candidate_start` 與 `freeze --out` 報告，不另寫延後項。
+
+讀寫契約（路徑、欄位名、型別）以 Task 15「延後項讀寫契約」表為唯一來源。本 Task 只補**寫入端**與時序守門：凍結程序（stats → propose → freeze）、`check_frozen_before`、候選長跑開跑登記 `register_candidate_start`，以及「凍結輸出能被正式 gate 原樣讀取」的整合測試；**不改 gate 判定、不改名、不另設 `deferred`／`tolerance`／`rerun_rule` 等子樹**。
+
+**Files:**
+- Create: `realhw/acceptance/od09_freeze.py`（含 `build_parser()`／`main(argv)`；`python3 -m realhw.acceptance.od09_freeze <stats|propose|freeze|check|register-candidate>`）
+- Create: `realhw/acceptance/candidate_longrun_starts.ndjson`（空檔；append-only 的候選長跑開跑登記，只由 `register_candidate_start` 寫入）
+- Create: `docs/rust-refactor/owner-decisions-addenda.md`（附加式紀錄檔，初始只有表頭 `| decision_id | 主題 | 日期 | 內容 |`；本 Task 的 OD-09 凍結與 P9 Task 12 的 Canary policy 凍結都附加到這裡，P9 不重建）
+- Create: `docs/rust-refactor/procedures/od09-deferred-freeze.md`（Stage 0 出口程序；P9 Task 17 只引用，不重建）
+- Create: `tests/fakes_od09.py`（`od09_env`、`longrun_case`、`rerun_baseline_gate`、`ts`）
+- Modify: `realhw/acceptance/longrun_acceptance.schema.json`（只新增凍結紀錄欄位：`status: frozen` 時 `decision_id`、`approved_by`、`overrides`、`proposal_sha256`、`baseline_evidence` 為必填；`per_platform` 形狀與欄位型別沿用 Task 15，不放寬；同一 commit 讓 `tests/test_longrun_gate.py` 的 `LongrunFixture`「填好延後項的 acceptance 副本」補上這五欄，Task 15 既有測試維持綠燈）
+- Modify: `tests/acceptance/stage0_evidence_index.yaml`（兩平台基線項 `id` 固定為 `S0-L3-BASELINE-LINUX-48H`／`S0-L3-BASELINE-WINDOWS-48H`、`artifact_path` 指向該平台 baseline `release-gate.json`；OD-09 項 `id` 固定為 `S0-OD09-DEFERRED-FROZEN`、`artifact_path` 指向 `od09-freeze.json`；三項初始 `status: blocked_owner`。id 與 P9 `stage_exits.json` 同名，供 P9 之後沿用同一證據）
+- Modify: `tests/acceptance/check_evidence_index.py`（新增純函式 `verify_item(index_path: Path, item_id: str, *, root: Path) -> tuple[dict | None, list[str]]`：回傳該項與違規清單（不存在、非 `present`、檔案缺、sha256 不符）；CLI 改為呼叫它，exit code 行為不變）
+- 不修改 `realhw/acceptance/gate.py`：若整合測試因 gate 未依 `per_platform[platform]` 讀值而紅，屬 Task 15 缺陷，回 Task 15 修正並補 Task 15 測試；不得在 `od09_freeze` 內加相容層或寫第二份值
+- Create: `tests/test_od09_freeze.py`、`tests/test_longrun_gate_frozen.py`（皆 `core_portable`＋`memory_only`；呼叫子程序的 `test_stage0_chain_without_later_phases` 改標 `process_rpc`）
+
+**Interfaces — Produces：**
+
+```python
+# realhw/acceptance/od09_freeze.py（可 import yaml 與 realhw.acceptance.gate；不得 import tools.stage3／sw_core）
+DEFERRED_KEYS: tuple[str, ...] = ("resources", "min_effective_load", "comparison_uncertainty")
+PLATFORMS: tuple[str, ...] = ("linux", "windows")
+PER_PLATFORM_FIELDS: Mapping[str, tuple[str, ...]] = {   # 必須等於 Task 15「延後項讀寫契約」表（test_per_platform_fields_match_acceptance）
+    "resources": ("rss_peak_kb", "rss_steady_kb", "rss_slope_kb_per_h"),
+    "min_effective_load": ("min_completed_per_board_source", "max_idle_gap_s"),
+    "comparison_uncertainty": ("error_rate_abs_tolerance", "throughput_ratio_tolerance", "stuck_s_tolerance", "max_reruns"),
+}
+BASELINE_ITEMS: Mapping[str, str] = {"linux": "S0-L3-BASELINE-LINUX-48H", "windows": "S0-L3-BASELINE-WINDOWS-48H"}
+FREEZE_ITEM: str = "S0-OD09-DEFERRED-FROZEN"
+CANDIDATE_LONGRUN_ITEMS: Mapping[str, str] = {   # item_id -> platform；P9 stage_exits.json 的 candidate_longrun 集合必須與此相等
+    "S1B-L3-MIXED-48H-WINDOWS": "windows",
+    "S24-L3-LRMIXED-48H-LINUX": "linux", "S24-L3-LRMIXED-48H-WINDOWS": "windows",
+    "S3-L3-AB-48H-LINUX": "linux", "S3-L3-AB-48H-WINDOWS": "windows",
+}
+LEDGER_PATH: Path      # <repo>/realhw/acceptance/candidate_longrun_starts.ndjson
+OD09_CODES: tuple[str, ...] = ("HARNESS_OD09_BASELINE_INVALID", "HARNESS_OD09_TOO_LATE", "HARNESS_OD09_NOT_FROZEN")
+class Od09Error(Exception):            # .code ∈ OD09_CODES（其他碼 → ValueError）、.detail: list[str]
+    def __init__(self, code: str, detail: list[str] | None = None) -> None
+PROPOSAL_RULES: Mapping[str, str]      # 公式的人類可讀描述，原樣寫入 proposal
+@dataclass(frozen=True)
+class BaselineStats:
+    platform: str
+    artifact_id: str
+    daemon_implementation: str
+    duration_s: int
+    snapshot_interval_s: int
+    max_snapshot_gap_s: int
+    rss_peak_kb: int
+    rss_steady_median_kb: int
+    rss_steady_slope_kb_per_h: float
+    hourly_done: Mapping[str, Mapping[str, int]]    # "<com>|<source>" -> {"min": n, "p10": n, "hours": h}
+    completed_total: Mapping[str, int]              # "<com>|<source>" -> 全程 completed（counting.definitions.completed）
+def workload(acceptance_path: Path) -> Mapping[str, Any]          # 回 acceptance 的 workload 段（時長、間隔、缺口係數唯一來源）
+def baseline_stats(case_dir: Path, *, platform: str, release_manifest: Path) -> BaselineStats
+def validate_baseline(stats: BaselineStats, *, acceptance_path: Path) -> list[str]
+def propose(linux: BaselineStats, windows: BaselineStats, *, baseline_gates: Mapping[str, Path]) -> dict
+def freeze(acceptance_path: Path, proposal: dict, *, decision_id: str, approved_by: str, overrides: Mapping[str, Any],
+           stage0_index: Path, evidence_root: Path, ledger_path: Path = LEDGER_PATH, addenda_path: Path, now: str) -> dict
+def check_frozen_before(acceptance_path: Path, run_started_at: str) -> list[str]
+def register_candidate_start(acceptance_path: Path, *, item_id: str, platform: str, run_id: str, started_at: str,
+                             ledger_path: Path = LEDGER_PATH) -> dict
+def build_parser() -> argparse.ArgumentParser
+def main(argv: list[str] | None = None) -> int   # exit：0 成功／check 無違規；1 check 有違規；2 參數錯或 ValueError；5 Od09Error（stdout {"ok":false,"reason_code","detail"}）
+```
+
+CLI 子命令（`build_parser()`；JSON 一律 compact、`ensure_ascii=False`）：
+
+| 子命令 | 參數 | 呼叫 |
+|---|---|---|
+| `stats` | `--case-dir DIR --platform P --release-manifest PATH --out PATH` | `baseline_stats`＋`validate_baseline`（違規 → exit 1） |
+| `propose` | `--linux-stats JSON --windows-stats JSON --baseline-gate linux=PATH --baseline-gate windows=PATH --out PATH` | `propose` |
+| `freeze` | `--acceptance PATH --proposal PATH --decision-id ID --approved-by TEXT [--set <key>.per_platform.<os>.<field>=VALUE ...] --stage0-index PATH --evidence-root DIR [--ledger PATH] --addenda PATH [--now ISO] --out PATH` | `freeze`（`--now` 預設現在 UTC） |
+| `check` | `--acceptance PATH --run-started-at ISO` | `check_frozen_before` |
+| `register-candidate` | `--acceptance PATH --item ID --platform P --run-id ID --started-at ISO [--ledger PATH]` | `register_candidate_start` |
+
+`baseline_stats`：`duration_s = last_t - first_t`；`max_snapshot_gap_s` 為相鄰快照最大間隔；`snapshot_interval_s` 為間隔中位數；RSS：`peak = max(rss_kb)`，穩態窗＝最後 24 h 快照（與 Task 15 gate `resources` 的 steady／slope 窗相同），`median`、`slope`（最小平方法，kb/h）；`hourly_done`：依 `t // 3600` 分桶，每 (`com`, `source`) 只計 `kind=="done"`，只統計完整小時，取 `min` 與第 10 百分位（nearest-rank）；`completed_total`：每 (`com`, `source`) 全程 completed 數，定義與 `counting.definitions.completed` 相同；`daemon_implementation`、`artifact_id` 取自 `release_manifest`（`components.daemon.implementation`、manifest sha256）。
+
+`validate_baseline` 違規（時長與係數一律讀 `workload(acceptance_path)`，§15.11.4 唯一來源）：`daemon_implementation != "python"`；`duration_s < workload.min_continuous_duration_s`；`max_snapshot_gap_s > workload.max_observation_gap_factor × snapshot_interval_s`（不得拼接 segments）；任一 (`com`,`source`) 的 `min == 0`。
+
+`propose` 固定公式（本計畫先於基線存在而定，**不得在看到基線後修改公式；擁有者只能在 freeze 時以 `overrides` 明示覆寫，覆寫原樣記錄**）。`I = max(linux.snapshot_interval_s, windows.snapshot_interval_s)`；路徑逐字等於 `thresholds.<key>.per_platform.<os>.<field>`：
+
+| 路徑（`thresholds.` 之下） | 值 |
+|---|---|
+| `resources.per_platform.<os>.rss_peak_kb` | `ceil(1.25 × s.rss_peak_kb)` |
+| `resources.per_platform.<os>.rss_steady_kb` | `ceil(1.25 × s.rss_steady_median_kb)` |
+| `resources.per_platform.<os>.rss_slope_kb_per_h` | `max(ceil(2 × s.rss_steady_slope_kb_per_h), 256)` |
+| `min_effective_load.per_platform.<os>.min_completed_per_board_source` | `{"<com>\|<source>": max(1, floor(0.5 × s.completed_total[key]))}`，鍵＝該平台基線出現的全部 (`com`,`source`) |
+| `min_effective_load.per_platform.<os>.max_idle_gap_s` | `3600` |
+| `comparison_uncertainty.per_platform.<os>.error_rate_abs_tolerance` | `0.002` |
+| `comparison_uncertainty.per_platform.<os>.throughput_ratio_tolerance` | `0.02` |
+| `comparison_uncertainty.per_platform.<os>.stuck_s_tolerance` | `I` |
+| `comparison_uncertainty.per_platform.<os>.max_reruns` | `1` |
+
+proposal 形狀與 acceptance 子樹同構：`{"thresholds": {<key>: {"per_platform": {"linux": {...}, "windows": {...}}}}, ...}`，產出後以 `PER_PLATFORM_FIELDS` 自我檢查。另含 `baseline_artifacts`（每平台 `{artifact_id, release_gate_sha256}`，`release_gate_sha256` 取自 `baseline_gates[platform]` 檔案 sha256）、`proposal_rules`、`generated_at`、`acceptance_revision`、`proposal_sha256`（不含自身欄位：`sha256(json.dumps(..., sort_keys=True, separators=(",",":"), ensure_ascii=False))`）。
+
+`freeze` 前置（任一不符 → `Od09Error`，acceptance 檔與 addenda bytes 不變）：
+1. **基線證據（只讀 Stage 0 索引，不依賴 P9）**：對每個平台以 `check_evidence_index.verify_item(stage0_index, BASELINE_ITEMS[p], root=evidence_root)`（依路徑載入 `tests/acceptance/check_evidence_index.py`）取得項目，違規非空 → `HARNESS_OD09_BASELINE_INVALID`；其 `artifact_path` 的 `release-gate.json` 必須 `mode=="baseline"`、`platform==p`、`baseline_result=="PASS"`、`acceptance.sha256` 等於現行 acceptance 檔的 `gate.load_acceptance(...)[1]["sha256"]`（基線以凍結前的同一 revision 判定）、`run.ended_at_utc < now`，且其 sha256 等於 `proposal.baseline_artifacts[p].release_gate_sha256`——任一不符 → `HARNESS_OD09_BASELINE_INVALID`。
+2. **時序**：`ledger_path` 有任何一行（可解析或不可解析皆算）→ `HARNESS_OD09_TOO_LATE`（已有 Rust 候選長跑登記開跑；防止把 acceptance 回退成 deferred 後事後重凍）；acceptance 任一 `thresholds.<DEFERRED_KEYS>.status` 已為 `frozen` → `HARNESS_OD09_TOO_LATE`。
+3. **proposal 完整性**：`proposal_sha256` 重算不符或 `proposal.acceptance_revision` 不等於現行 `revision` → `HARNESS_OD09_BASELINE_INVALID`。
+4. **介面一致性**：acceptance 每個 `DEFERRED_KEYS` 必須有 `per_platform`，平台集合恰為 `PLATFORMS`、每平台欄位集合恰為 `PER_PLATFORM_FIELDS[key]`，proposal 亦同；`overrides` 每個鍵必須是 `"<key>.per_platform.<os>.<field>"` 且指向既有欄位——任一不符 → `HARNESS_OD09_BASELINE_INVALID`（`detail` 列出多出／缺少的路徑）。
+
+通過後對每個 `DEFERRED_KEYS` 改寫 `thresholds.<key>`：`status: frozen`、`frozen_at: now`、保留 `decision: OD-09` 與 `freeze_deadline`、新增 `decision_id`、`approved_by`、`overrides`、`proposal_sha256`、`baseline_evidence`（兩平台各 `{"item_id","artifact_path","sha256"}`），並把 proposal 值（套上 overrides）逐欄寫進**既有的** `thresholds.<key>.per_platform.<os>.<field>`（兩平台一次寫入）；頂層 `revision` 改為 `f"{now 日期}.{n}"`（同日第 n 次）；其他鍵逐值保留；以 PyYAML `safe_dump(sort_keys=False, allow_unicode=True)` 寫回並以 `gate.load_acceptance` 驗證。在 `addenda_path` 附加一列 `| <decision_id> | OD-09 延後項凍結 | <now 日期> | approved_by=<…>；revision=<新 revision>；proposal_sha256=<…>；overrides=<鍵清單或 無> |`。回傳 `{"thresholds":{三鍵寫入後內容},"revision","acceptance_sha256","frozen_at","baseline_evidence","requires_baseline_gate_rerun":true}`；CLI `freeze --out od09-freeze.json` 寫成報告，作為 Stage 0 索引 `S0-OD09-DEFERRED-FROZEN` 的 artifact（之後 P9 Task 14B 以 `od09-freeze` kind ingest 同一檔）。凍結後以新 revision 對兩平台已保存的基線證據離線重跑 `python3 -m realhw.acceptance.gate --mode baseline`，供候選引用（Task 15 `baseline_compatible` 不要求 revision 相同）。
+
+`check_frozen_before(path, ts)`：讀與正式 gate 相同的路徑，回傳違規清單——任一 `DEFERRED_KEYS` 的 `status != "frozen"` → `"<key> not frozen"`；`frozen_at >= ts` → `"<key> frozen after run start"`；`status == "frozen"` 但任一 `per_platform.<os>.<field>` 缺少或為 null → `"<key>.per_platform.<os>.<field> missing"`；`gate.load_acceptance` 拋 schema 錯誤 → `"acceptance schema invalid: <訊息>"`。
+
+`register_candidate_start`：`item_id ∉ CANDIDATE_LONGRUN_ITEMS` 或 `platform != CANDIDATE_LONGRUN_ITEMS[item_id]` 或 `run_id` 已在 ledger → `ValueError`（ledger 不變）；`check_frozen_before(acceptance_path, started_at)` 非空 → `Od09Error("HARNESS_OD09_NOT_FROZEN", detail=violations)`（ledger 不變）；否則以 `"a"` 附加一行 `{"item_id","platform","run_id","started_at","acceptance_revision","acceptance_sha256"}`（`sort_keys`、compact、`flush`＋`fsync`）並回傳該紀錄。**每個 Rust 候選長跑在啟動 `python3 -m realhw --tier longrun` 前必須先登記**（P4 Task 16 B-12、P8 Task 15 第 8 項、P9 Task 6 L3 A/B 的 B 側）；未登記的長跑仍會被 Task 15 gate 的 `pre_frozen` 判 BLOCKED（凍結晚於 `meta.started_at_utc`），登記則讓「未凍結就開跑」在開跑前即被拒。
+
+**凍結後 gate 判定**：沿用 Task 15 gate 既有規則，本 Task 不另定義。
+
+### T 步驟
+
+- [ ] **T16-1：撰寫失敗測試**。`tests/test_od09_freeze.py` 關鍵測試：
+
+```python
+import ast, json, subprocess, sys, textwrap
+from pathlib import Path
+
+import pytest
+
+import fakes_od09
+from realhw.acceptance import od09_freeze   # T 步驟期間改為各測試函式內 import（§1 第 3 條），此處為閱讀方便
+
+ROOT = Path(__file__).resolve().parents[1]
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+
+
+@pytest.mark.process_rpc
+def test_stage0_chain_without_later_phases(tmp_path):
+    # R4-F2：基線 → 凍結 → 登記 → candidate gate 全鏈只用 P2 交付物；任何 P3～P9 模組被 import 即失敗
+    script = textwrap.dedent(f"""
+        import importlib.abc, json, sys
+        BLOCKED = ("tools.stage3", "sw_core")
+        class _Block(importlib.abc.MetaPathFinder):
+            def find_spec(self, name, path=None, target=None):
+                if name.startswith(BLOCKED):
+                    raise ImportError("later-phase module imported: " + name)
+                return None
+        sys.meta_path.insert(0, _Block())
+        sys.path.insert(0, {str(ROOT)!r}); sys.path.insert(0, {str(ROOT / "tests")!r})
+        from pathlib import Path
+        import fakes_od09
+        from realhw.acceptance import gate, od09_freeze
+        env = fakes_od09.od09_env(Path({str(tmp_path)!r}))
+        assert not (env.repo / "tests" / "acceptance" / "stage_exits.json").exists()
+        assert not (env.repo / "docs" / "rust-refactor" / "evidence" / "index.json").exists()
+        prop = od09_freeze.propose(env.linux_stats, env.windows_stats, baseline_gates=env.baseline_gates)
+        od09_freeze.freeze(env.acceptance, prop, decision_id="OD-09-F1", approved_by="owner", overrides={{}},
+                           stage0_index=env.stage0_index, evidence_root=env.evidence_root, ledger_path=env.ledger,
+                           addenda_path=env.addenda, now=fakes_od09.ts(20, 9))
+        od09_freeze.register_candidate_start(env.acceptance, item_id="S1B-L3-MIXED-48H-WINDOWS", platform="windows",
+                                             run_id="s1b-1", started_at=fakes_od09.ts(21, 0), ledger_path=env.ledger)
+        run = fakes_od09.longrun_case(env.repo / "cand", platform="windows", started_at=fakes_od09.ts(21, 0))
+        out = gate.evaluate(run.inputs(mode="candidate", acceptance_path=env.acceptance,
+                                       baseline=fakes_od09.rerun_baseline_gate(env, platform="windows")))
+        res = {{c["id"]: c["result"] for c in out["checks"]}}
+        print(json.dumps({{"res": res, "release": out["release_gate_result"],
+                          "later": sorted(m for m in sys.modules if m.startswith(BLOCKED))}}))
+    """)
+    p = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=300)
+    assert p.returncode == 0, p.stderr
+    got = json.loads(p.stdout.strip().splitlines()[-1])
+    assert got["later"] == []
+    assert got["res"]["resources"] == got["res"]["min_effective_load"] == got["res"]["comparison_uncertainty"] == "PASS"
+    assert got["release"] == "PASS"
+
+
+def test_od09_freeze_imports_only_stage0():
+    src = (ROOT / "realhw" / "acceptance" / "od09_freeze.py").read_text(encoding="utf-8")
+    mods = set()
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Import):
+            mods |= {a.name for a in node.names}
+        elif isinstance(node, ast.ImportFrom) and node.level == 0:
+            mods.add(node.module)
+    allowed_extra = {"yaml", "realhw", "realhw.acceptance", "realhw.acceptance.gate"}
+    assert {m for m in mods if m.split(".")[0] not in sys.stdlib_module_names} <= allowed_extra, mods
+    for banned in ("tools.stage3", "sw_core", "stage_exits.json", "evidence/index.json"):
+        assert banned not in src
+
+
+def test_freeze_refused_after_candidate_registered(tmp_path):
+    env = fakes_od09.od09_env(tmp_path)
+    env.ledger.write_text('{"item_id":"S1B-L3-MIXED-48H-WINDOWS","platform":"windows","run_id":"x",'
+                          '"started_at":"2026-11-19T00:00:00+00:00"}\n', encoding="utf-8")   # 模擬 acceptance 被回退後的重凍
+    before = env.acceptance.read_bytes()
+    prop = od09_freeze.propose(env.linux_stats, env.windows_stats, baseline_gates=env.baseline_gates)
+    with pytest.raises(od09_freeze.Od09Error) as ei:
+        od09_freeze.freeze(env.acceptance, prop, decision_id="OD-09-F1", approved_by="owner", overrides={},
+                           stage0_index=env.stage0_index, evidence_root=env.evidence_root, ledger_path=env.ledger,
+                           addenda_path=env.addenda, now=fakes_od09.ts(20, 9))
+    assert ei.value.code == "HARNESS_OD09_TOO_LATE"
+    assert env.acceptance.read_bytes() == before
+
+
+def test_register_candidate_refused_before_freeze(tmp_path):
+    env = fakes_od09.od09_env(tmp_path)
+    with pytest.raises(od09_freeze.Od09Error) as ei:
+        od09_freeze.register_candidate_start(env.acceptance, item_id="S1B-L3-MIXED-48H-WINDOWS", platform="windows",
+                                             run_id="s1b-1", started_at=fakes_od09.ts(21, 0), ledger_path=env.ledger)
+    assert ei.value.code == "HARNESS_OD09_NOT_FROZEN"
+    assert sorted(ei.value.detail) == sorted(f"{k} not frozen" for k in od09_freeze.DEFERRED_KEYS)
+    assert env.ledger.read_bytes() == b""
+```
+
+（`fakes_od09.od09_env(root, *, linux_rss_peak=40000, linux_slope=10.0, interval=300, duration_s=None, rust_baseline=False)`：在 `root/repo` 建只含 P2 檔的最小 repo 樹——acceptance 與 schema 自 repo 實際 `realhw/acceptance/longrun_acceptance.yaml`、`longrun_acceptance.schema.json` **原樣複製**（變形只能在複本上以 dotted-path 修改單一鍵）、`tests/acceptance/stage0_evidence_index.yaml` 與 `check_evidence_index.py`、`evidence_index.schema.json` 原樣複製；以 `LongrunFixture(...).healthy(hours=48, platform=p, started_at=ts(10,0) 起依序兩平台)`（`started_at` 若 Task 15 builder 尚無，於本 T 步驟以 keyword-only 擴充、預設不變）建兩平台 Python 基線 case_dir，以複本 acceptance 執行 `gate.evaluate(mode="baseline")` 寫出 `evidence_root/<item_id>/release-gate.json`，再把索引複本的兩基線項改為 `present`＋相對路徑＋sha256；`duration_s=None` 時取 `workload.min_continuous_duration_s`；回傳 `SimpleNamespace(repo, acceptance, stage0_index, evidence_root, ledger, addenda, linux_stats, windows_stats, linux_case_dir, windows_case_dir, baseline_gates)`。`longrun_case(dir, *, platform, started_at, rss_peak_kb=None, completed_scale=1.0)` 以 `LongrunFixture` 建健康候選，`inputs(*, mode, acceptance_path, baseline)` 產 `gate.GateInputs`；`rerun_baseline_gate(env, *, platform)` 以凍結後的 acceptance 對 `env.<platform>_case_dir` 執行 `gate.evaluate(mode="baseline")` 並寫出 `release-gate.json`，回傳路徑；`ts(day, hour)` → `f"2026-11-{day:02d}T{hour:02d}:00:00+00:00"`。）
+
+| 測試名 | 斷言 |
+|---|---|
+| `test_od09_env_baselines_present` | 替身自檢：`check_evidence_index.verify_item` 對兩基線項回 `(item, [])` 且 `item["status"] == "present"` |
+| `test_stage0_index_od09_item_ids` | repo 實際 `stage0_evidence_index.yaml` 含 `od09_freeze.BASELINE_ITEMS` 兩值與 `FREEZE_ITEM`，三項 `status == "blocked_owner"` |
+| `test_baseline_stats_from_lr_mixed` | 合成 48h、間隔 300 s → `duration_s == workload.min_continuous_duration_s`、`hourly_done["COM0|agent:rhw0"]["hours"] == 48` |
+| `test_spliced_baseline_rejected` | 中間缺 1 小時快照 → `validate_baseline` 含 `"snapshot gap"` |
+| `test_short_baseline_rejected` | 少 1 小時 → 違規 `"duration"` |
+| `test_thresholds_read_from_workload` | 複本 `min_continuous_duration_s` 改 3600 → 1.5h 基線不因時長違規 |
+| `test_rust_baseline_rejected` | `daemon_implementation == "rust"` → 違規 |
+| `test_load_stop_rejected` | 某來源某完整小時 done=0 → 違規 |
+| `test_proposal_formula_fixed` | `linux_rss_peak=40000, linux_slope=10.0, interval=300` → linux `rss_peak_kb == 50000`、`rss_slope_kb_per_h == 256`；`comparison_uncertainty.per_platform.linux == {"error_rate_abs_tolerance": 0.002, "throughput_ratio_tolerance": 0.02, "stuck_s_tolerance": 300, "max_reruns": 1}`；windows `max_idle_gap_s == 3600`、`min_completed_per_board_source["COM0|agent:rhw0"] == max(1, completed_total//2)`；無 `tolerance`／`rerun_rule` 鍵；`baseline_artifacts.<p>.release_gate_sha256` == 對應檔 sha256 |
+| `test_per_platform_fields_match_acceptance` | `PER_PLATFORM_FIELDS` 每個 key 的欄位集合 == repo 實際 acceptance `thresholds.<key>.per_platform.linux`／`.windows` 鍵集合 |
+| `test_real_acceptance_roundtrip_propose_freeze_check_gate` | 以 repo 實際門檻檔複本走 propose → freeze → `check_frozen_before(ts(21,0)) == []` → `gate.evaluate` candidate：峰值 = 凍結值 − 1 → 三延後項 PASS、整體 PASS；+1 → `resources` FAIL；凍結後檔案無 `deferred` 鍵、欄位集合與凍結前相同、無 null、`thresholds.<key>` 只多出凍結紀錄欄位 |
+| `test_freeze_writes_only_deferred_and_bumps_revision` | 三個已凍結項與其他頂層鍵逐值不變；三延後項 `status == "frozen"`、`decision_id == "OD-09-F1"`、兩平台值 == proposal；`baseline_evidence` 兩筆 `item_id` == `BASELINE_ITEMS` 值且 sha256 == 索引記錄；`revision` 改變；`gate.load_acceptance` 通過 |
+| `test_freeze_records_overrides` | `overrides={"resources.per_platform.linux.rss_peak_kb": 60000}` → linux 值 60000、windows 不變、`overrides` 原樣記錄、addenda 該列含該鍵 |
+| `test_freeze_rejects_unknown_override_path` | `{"resources.rss_budget.linux": 1}` 或 `{"comparison_uncertainty.per_platform.linux.tolerance": 1}` → `HARNESS_OD09_BASELINE_INVALID`、acceptance bytes 不變、addenda 無新列 |
+| `test_freeze_rejects_field_set_mismatch` | 複本刪 `thresholds.resources.per_platform.windows.rss_slope_kb_per_h` → `HARNESS_OD09_BASELINE_INVALID`、`detail` 含該路徑；proposal 刪一欄並重算 sha → 同上；acceptance bytes 不變 |
+| `test_freeze_requires_present_baselines_in_stage0_index` | 各變體皆 `HARNESS_OD09_BASELINE_INVALID` 且 acceptance bytes 不變：windows 項 `status: blocked_owner`；索引 sha256 與檔案不符；baseline gate `baseline_result == "FAIL"`；`mode == "candidate"`；`acceptance.sha256` 與現行檔不同；`run.ended_at_utc >= now`；`proposal.baseline_artifacts.windows.release_gate_sha256` 與索引不符 |
+| `test_refreeze_refused` | 已 frozen 再 freeze → `HARNESS_OD09_TOO_LATE` |
+| `test_freeze_refused_on_malformed_ledger_line` | ledger 只有一行 `{bad` → `HARNESS_OD09_TOO_LATE` |
+| `test_tampered_proposal_rejected` | 改值不更新 sha → `HARNESS_OD09_BASELINE_INVALID`；`acceptance_revision` 不同 → 同上 |
+| `test_check_frozen_before` | 未凍結 → 三條 `not frozen`；凍結於 t，run 於 t+1s → `[]`；t-1s → 三條 `frozen after run start` |
+| `test_check_frozen_before_rejects_null_values` | 正常凍結後把三項 `per_platform.windows` 各欄改回 null → 含 `"comparison_uncertainty.per_platform.windows.max_reruns missing"` 等每個 null 欄位與 `"acceptance schema invalid: …"`，不得回 `[]` |
+| `test_register_candidate_after_freeze_appends` | freeze 於 `ts(20,9)` 後登記 `started_at=ts(21,0)` → ledger 一行，`acceptance_revision` == 新 revision、`acceptance_sha256` == 新檔 sha256；`started_at=ts(20,8)`（早於 `frozen_at`）→ `HARNESS_OD09_NOT_FROZEN`、ledger 仍一行 |
+| `test_register_candidate_rejects_unknown_item_or_platform` | `item_id="S0-L3-P0P1"` → `ValueError`；`S1B-L3-MIXED-48H-WINDOWS` 配 `platform="linux"` → `ValueError`；重複 `run_id` → `ValueError`；三者 ledger bytes 不變 |
+| `test_addenda_append_only` | 兩次（不同 acceptance 檔）freeze → addenda 前段原文不變、新增兩列 |
+| `test_od09_cli_exit_codes` | `main(["check","--acceptance",A,"--run-started-at",T])`：未凍結 → 1、凍結後 → 0；`register-candidate` 未凍結 → 5 且 stdout `reason_code == "HARNESS_OD09_NOT_FROZEN"`；未知 item → 2 |
+| `test_od09_procedure_doc` | `docs/rust-refactor/procedures/od09-deferred-freeze.md` 存在；含 `S1B-L3-MIXED-48H-WINDOWS`、`Stage 0 出口`、`register-candidate`；每個 ```` ```bash ```` 區塊中以 `python3 -m realhw.acceptance.od09_freeze ` 開頭的行皆可被 `od09_freeze.build_parser().parse_args` 解析，且 `stats`、`propose`、`freeze`、`check`、`register-candidate` 五個子命令各至少一行；文件不含 `python3 -m tools.stage3 od09`（寫入端只有 P2） |
+
+`tests/test_longrun_gate_frozen.py`（acceptance 一律為 repo 實際檔複本經本 Task `freeze` 寫出的結果，不得手寫凍結後 acceptance）：
+
+| 測試名 | 斷言 |
+|---|---|
+| `test_deferred_still_blocked` | 未凍結 → 三項 check `BLOCKED`、`release_gate_result == "BLOCKED"` |
+| `test_frozen_resources_fail_over_budget` | freeze 後 linux 峰值 = 凍結值 + 1 → `resources` FAIL、整體 FAIL；以 override 讓兩平台值不同，同一峰值 linux PASS、windows FAIL |
+| `test_frozen_min_load_insufficient` | `COM0\|agent:rhw0` 全程 completed = 下限 − 1 → `min_effective_load` `INSUFFICIENT_EVIDENCE`、`detail` 含該鍵；相鄰 completed 間隔 3601 s → 同上 |
+| `test_frozen_tolerance_band_insufficient` | 錯誤率 = baseline + 0.001 → `error_rate_relative` INSUFFICIENT；+0.003 → FAIL；throughput 為基線 94% → `throughput_relative` INSUFFICIENT |
+| `test_baseline_mode_not_applicable` | baseline 模式、三項已凍結 → 三項 `NOT_APPLICABLE_BASELINE` |
+| `test_all_frozen_candidate_pass` | 候選 `started_at` 晚於 `frozen_at`、基線 gate 以新 revision 重跑 → 三延後項 PASS、整體 PASS |
+
+- [ ] **T16-2：執行並確認 FAIL**：`python3 -m pytest -q tests/test_od09_freeze.py tests/test_longrun_gate_frozen.py` → `ModuleNotFoundError: realhw.acceptance.od09_freeze`（函式內 import），`test_stage0_index_od09_item_ids` 因索引 id 未固定而紅。
+- [ ] **T16-3：commit 測試**：`git commit -m "test(realhw): 新增 OD-09 延後項凍結與候選長跑登記的失敗測試"`（含 `tests/fakes_od09.py`）。
+
+### I 步驟
+
+- [ ] **I16-1：實作** 依規則與公式表；百分位與分桶只用 stdlib；YAML 以 PyYAML；**不修改 `gate.py`**；寫入路徑只用 `thresholds.<key>.per_platform.<os>.<field>`；`od09-deferred-freeze.md` 寫 Stage 0 出口程序：(1) 確認 B8 兩平台基線已登錄於 `stage0_evidence_index.yaml`（`present`＋sha256）；(2) `python3 -m realhw.acceptance.od09_freeze stats …` 兩平台；(3) `propose`；(4) 擁有者核准後 `freeze --acceptance … --proposal … --decision-id … --approved-by … [--set <key>.per_platform.<os>.<field>=VALUE …] --stage0-index tests/acceptance/stage0_evidence_index.yaml --evidence-root … --addenda docs/rust-refactor/owner-decisions-addenda.md --now <ISO> --out od09-freeze.json`；(5) 以新 revision 離線重跑兩平台基線 gate；(6) 把 `S0-OD09-DEFERRED-FROZEN` 改 `present`＋sha256；(7) 此後每個 Rust 候選長跑（最早 `S1B-L3-MIXED-48H-WINDOWS`）開跑前 `register-candidate`；時序：必須在 Stage 0 出口、任何候選長跑前完成，ledger 有任何紀錄後 `freeze` 一律拒絕。
+- [ ] **I16-2：執行並確認 PASS**：上列兩檔＋Task 12、15 測試全綠；`python3 -m pytest -q tests/` 無新失敗。
+- [ ] **I16-3：commit**：`git commit -m "feat(realhw): 新增 OD-09 延後項凍結程序、候選長跑開跑登記與凍結輸出對正式 gate 的整合驗證"`＋fragment（不含 `gate.py`）。
+
+---
+
 ## 3. Phase 整體驗收（全部 Task 綠燈後）
 
 - [ ] `python3 -m pytest -q tools/uart_stdio_bridge/tests` 全綠，連跑 3 次結果一致。
@@ -2884,7 +3150,8 @@ def test_baseline_mode_never_claims_non_regression(tmp_path):
 - [ ] 對外分享的證據以 `uart-stdio-bridge redact` 產生遮罩衍生檔，`redaction-manifest.json` 同時記原始與遮罩 sha256（§15.6.4）。
 - [ ] `python3 tests/acceptance/regen_lock.py --check` exit 0；`python3 tests/acceptance/check_evidence_index.py --stage 0` 的結果（預期 exit 5：B 項未取得）與缺項清單附於 PR 描述，不得宣稱 Stage 0 出口已滿足。
 - [ ] `python3 -m policy_check --repo .` 通過。
-- [ ] 每個 Task 的 `changelog.d/rust-p2-*.md` fragment 已加入（15 個，frontmatter 的 `type`／`scope` 照各 Task 標頭）；PR 描述依 repo 回歸 case 政策（#155）記錄：本 Phase 為測試基礎，不修 bug，故無新增 `regression/` case；L2 案例調整為平台 adapter 與 `requires` 變更，oracle 未改。
+- [ ] `tests/test_od09_freeze.py::test_stage0_chain_without_later_phases` 綠燈：基線 gate → `od09_freeze.freeze` → `register_candidate_start` → candidate gate 三延後項 PASS，過程未 import 任何 `tools.stage3`／`sw_core` 模組（證明正式 Stage 0 出口的 OD-09 凍結不依賴 P3～P9，R4-F2）。
+- [ ] 每個 Task 的 `changelog.d/rust-p2-*.md` fragment 已加入（16 個，frontmatter 的 `type`／`scope` 照各 Task 標頭）；PR 描述依 repo 回歸 case 政策（#155）記錄：本 Phase 為測試基礎，不修 bug，故無新增 `regression/` case；L2 案例調整為平台 adapter 與 `requires` 變更，oracle 未改。
 - [ ] PR 描述列出本文件 §4 的 BLOCKED-OWNER 清單，狀態一律「未取得」，不得標 PASS。
 
 ## 4. BLOCKED-OWNER 證據總表（本環境無法產出；交付為程序、腳本、判定器與 schema）
@@ -2901,7 +3168,7 @@ def test_baseline_mode_never_claims_non_regression(tmp_path):
 | B6 | 破壞性案例授權執行（F9、F10、`f11-flood-probe-classified`、`p1-rst-*`、`p1-ho-*`、`p1-hp-*`） | §11.5「破壞性測試必須顯式授權」 | 12、14 | 擁有者授權與目標板 |
 | B7 | `f4-background-result-tail-consistent` Stage 0 bench 實跑結果；若紅燈，XFAIL 哨兵登記（issue、特徵、期限） | `TST-D-6`、§11.4 | 12 | 擁有者 bench 與核准 |
 | B8 | Linux、Windows 各一次修正後 Python 48 h `lr-mixed` 基線（含 observer、WAL 複本、`release-gate.json` baseline 模式；Windows 另含 `excl/probes.ndjson`＋`excl/handoff.ndjson` 原生 COM 獨占證據，R1-F7） | OD-10、§11.6、§15.11.5 | 15 | 擁有者 bench，兩平台依序、不可並行，約 5 天 bench 佔用 |
-| B9 | OD-09 延後凍結項數值（RSS／資源、最低有效負載與樣本、比較不確定性）於基線後、Rust 候選長跑前寫入新 revision | OD-09、§14.2 | 15 | 擁有者裁決 |
+| B9 | OD-09 延後凍結項數值（RSS／資源、最低有效負載與樣本、比較不確定性）於基線後、正式 Stage 0 出口、任何 Rust 候選長跑（最早 `S1B-L3-MIXED-48H-WINDOWS`）前以 Task 16 `od09_freeze freeze` 寫入新 revision | OD-09、§12.2 Stage 0 列、§14.2 | 15、16 | 擁有者裁決（執行 Task 16 程序 `od09-deferred-freeze.md`） |
 | B10 | 長跑實例關閉監管自動重啟或等價故障保留措施的設定紀錄 | §15.11.2、Spike 8 | 15 | 擁有者 bench 設定 |
 | B11 | `p2-1-mcu-flash-manual` 程序的實機執行與證據 | §11.6 Slice 2.4 | 12 | 擁有者實機（DUT console＋FTDI MCU 線） |
 | B12 | >72 h `windows-task` 監管驗證（Spike 2）—本計畫只登記 `win-task-*` case | §13 Spike 2、OD-03 | 12 | 由 P4 交付程序；擁有者 Windows 工作站 |
@@ -2927,4 +3194,5 @@ def test_baseline_mode_never_claims_non_regression(tmp_path):
 | §11.2 平台分類與資源標記 | P0 T14（標註與稽核）；13（資源報告、`core_portable` 平台 SKIP 閘門、Windows collection） |
 | §11.3 承接清單欄位、凍結、不以 SKIP 取得全綠 | 12、13 |
 | §14.2／§15.11.4 唯一門檻檔、`engine_result` 保留、`release_gate_result` | 15 |
+| §12.2 Stage 0 列「正式 Stage 0 出口須完成延後項目的凍結與證據充分性核對」、§14.2／OD-09「任何 Rust 候選長跑前凍結」 | 16（凍結工具、候選開跑登記；只依賴 12、15） |
 | 調和表 `TST-D-4`、`TST-D-6`、`TST-D-8`、`TST-D-9`、`TST-D-10`、`TST-D-12`、`TST-D-13`、`TST-D-14`、`GAP-G-12` | 13、12、10、10、14、14、14、14、14 |
