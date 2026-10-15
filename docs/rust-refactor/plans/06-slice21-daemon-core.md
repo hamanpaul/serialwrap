@@ -36,6 +36,7 @@
 3. **WAL 目錄在 daemon 啟動時唯讀或磁碟滿**：daemon 仍啟動、`health.status.wal.healthy=false`、`unhealthy_reason` 非 null、`write_failures` 遞增、**所有** session 的登入 probe 等自動 TX 停止（全域 `WalHealthFanout` 同步每個 fence 的 `wal_unhealthy`，新建 session 繼承目前值），agent 命令 TX 照常寫出且 WAL 回傳 `loss_flag:true`，不得在記憶體堆積待寫紀錄。磁碟滿以「已開啟 handle 上連續兩次 append（含一次重試）失敗」判定，下一次成功即恢復。測試加在 Task 7（`open_failure_at_startup_marks_unhealthy`、`enospc_on_open_handle_trips_all_fences`、`new_session_inherits_wal_unhealthy`）、Task 13（`disk_full_blocks_login_probe_but_not_agent_cmd`）與 Task 19（`wal_dir_readonly_at_start_blocks_login_probe`、`wal_fault_after_ready_splits_agent_and_auto_tx`）。
 4. **系統時間（wall clock）在執行中倒退或跳前一小時**：Quiet window、Ready Reconfirm deadline、Lease 到期、Drain 3000 ms、命令逾時、WAL identity 檢查節流全部只依 monotonic；只有 `wall_ts`／`*_at` 字串反映新 wall time，history 淘汰仍照 Python 以 `done_at` 字串排序（KEEP）。測試加在 Task 11（`wall_clock_jump_does_not_move_deadlines`；`wall_clock_jump_param` 參數化 wall ±1 h，分別斷言 quiet、reconfirm、lease、drain、command timeout 五個期限）與 Task 7（`identity_throttle_ignores_wall_jump`）。
 5. **同一 RPC 連線 pipelining `session.recover --force`（最長約 10 s）後緊接 `daemon.stop`，且 client 在中途斷線**：handler 不因斷線取消；回應依請求順序寫出；`daemon.stop` 觸發的關機要等前一個 handler 收斂後依 SC-11 drain，不得在 handler 持有 session 時關閉 WAL；閒置連線不得阻擋 `RpcServer::stop`。測試加在 Task 17（`pipelined_stop_after_long_call`、`idle_connection_does_not_block_stop`、`half_line_and_unread_response_do_not_block_stop`）與 Task 19（`daemon_stop_during_force_recover_with_client_gone`，以真 daemon 驗證 WAL 只在 handler 結束後關閉且 exit 0 於上限內）。
+6. **授權通過後、OS 提交前發生 Quiet／drain／lease 換手（R0-F1，規格 §5.2.2）**：授權重驗與 OS 提交必須在同一 Fence 臨界區（`FenceSubmitGate`，arch §4.2／§5.4 第 3 點），不得「鎖內驗證、放鎖、再 write」；鎖只跨非阻塞提交（POSIX 單次 `write(2)`、Windows `WriteFile` 發出），不跨 POLLOUT／`GetOverlappedResult` 等待。驗收：Task 9 `authorized_then_quiet_before_os_submit_is_zero_tx`、`authorized_then_drain_freeze_before_os_submit_is_zero_tx`、`authorized_then_lease_owner_gen_bump_before_os_submit_is_zero_tx`、`quiet_during_os_submit_waits_for_submit_and_counts_committed`、`quiet_between_partial_submits_stops_tail`、`os_submit_always_inside_fence_critical_section`。
 
 ---
 
@@ -62,7 +63,7 @@
 | `TRANSPORT_STALL` 精煉、`/dev/ttyMCU`、flash probe | 不偵測；`mcu.status` 回 `flashing:false`、`flashing_com:null`、`last_detect:null`、`candidates` 照 Python 規則 | 2.3／2.4 |
 | Human console（PTY attach、Telnet listener、Raw／Line、DeferredBuffer 回放、soft preempt） | POSIX 只建 internal 哨兵 primary PTY（keepalive＋RX fan-out），對外 `vtty`／`console_count` 與 Python 一致；Windows 不起 TCP listener，SessionPublic 輸出 `console_endpoint:null` | 2.2 |
 | `sw_core::state_migrate`、`bench_registry` | 依 arch §1.3（WAL-D18／WAL-D19）分屬 `sw-cli`（P4）與 `sw-proto`（P3）；sw-core 不得出現這兩個模組 | P3／P4 |
-| 自動 attach 前的普通外部 holder 拒絕 | Python 基線（P1 T10）只在非 force `device.attach` 做 holder 預檢；自動 attach／PROBE 只靠 `open`＋`flock`＋`TIOCEXCL`，外部程式以普通 `open`（不取 flock、不設 TIOCEXCL）先開埠時不會被拒。規格 §6.2「拒絕已識別的外部衝突」是否涵蓋此情境需裁決：本 Phase 照基線行為實作，並以 `s21-exclusive-conflict-plain-open` 情境記錄實際行為（不判 PASS／FAIL，標「待裁決」），於 PR 描述登記為 DF 候選（arch §0 第 2 點），擁有者裁決前不得改產品行為 | 待裁決 |
+| 普通外部 holder（未取 flock）的拒絕 | **已定案，不再待裁決**：規格 §6.2「拒絕已識別的外部衝突」與 OD-04 核准的 BC-04 涵蓋此情境；`TIOCEXCL` 不撤銷既有 handle，外部程式以普通 `open` 先開埠時 `open`→`flock`→`TIOCEXCL` 仍會成功（隔離 PTY 已重現），若放行即兩者同時讀寫 UART。P1 T10「非合作式外部 holder」凍結規則（02）已在 Python 基線 `_PosixSerialPort.open` 加鎖後 holder 重掃；本 Phase 的 `PosixSerialBackend::open_exclusive`（Task 2，arch §4.2）同樣在 TIOCEXCL 之後、termios 與任何 I/O 之前重掃，`pids` 非空 → `OpenError::Held`。適用初次自動 attach、熱插拔、PROBE、`device.attach`（**含 `force:true`**）。以 `s21-exclusive-conflict-plain-open` 判 PASS／FAIL（Task 21） | 2.1 |
 
 ### 0.3 前置交付（Consumes；Task 0 以編譯期與 pytest 檢查驗證）
 
@@ -183,7 +184,7 @@ impl CancelToken { pub fn new(waker: Arc<dyn IoWaker>) -> CancelToken; pub fn ca
 pub struct CloseToken { inner: Box<dyn CloseImpl> }
 pub trait CloseImpl: Send { fn close(self: Box<Self>) -> CloseReceipt; }
 impl CloseToken { pub fn new(inner: Box<dyn CloseImpl>) -> CloseToken; pub fn close(self, r: Box<dyn SerialReader>, w: Box<dyn SerialWriter>) -> CloseReceipt; }
-#[derive(Debug, Clone)] pub struct CloseReceipt { pub closed: bool, pub error: Option<PalError> }
+#[derive(Debug, Clone)] pub struct CloseReceipt { pub closed: bool, pub excl_cleared: bool, pub error: Option<PalError> }   // excl_cleared：POSIX 關 fd 前 TIOCNXCL 是否成功（arch §4.2，R0-F3）；Windows／fake 恆等於 closed
 pub trait IoWaker: Send + Sync { fn wake(&self); }
 pub trait SerialBackend: Send + Sync { fn open_exclusive(&self, dev: &DevicePath, cfg: &SerialConfig) -> Result<Box<dyn SerialHandle>, OpenError>; }
 pub trait SerialHandle: Send {
@@ -193,7 +194,17 @@ pub trait SerialHandle: Send {
     fn is_alive(&self) -> bool;
 }
 pub trait SerialReader: Send { fn read(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> PalResult<ReadOutcome>; }
-pub trait SerialWriter: Send { fn write(&mut self, data: &[u8], cancel: &CancelToken) -> TxResult; }
+// arch §4.2 SubmitGate（R0-F1）：每次 OS 提交（POSIX 一次非阻塞 write(2)、Windows 一次 overlapped WriteFile 發出）都必須經 gate；
+// gate 在 Fence 鎖內重驗後才呼叫 os_submit，被拒則不呼叫；完成等待在 gate 外。
+pub trait SubmitGate { fn submit(&self, os_submit: &mut dyn FnMut() -> SubmitStep) -> Result<SubmitStep, SubmitRevoked>; }
+#[derive(Debug)] pub enum SubmitStep { Accepted(usize), Pending, WouldBlock, Failed(PalError) }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub struct SubmitRevoked;
+pub struct AlwaysOpen;  impl SubmitGate for AlwaysOpen {}   // 直接呼叫 os_submit；PAL conformance／單元測試專用
+pub trait SerialWriter: Send {
+    fn write_gated(&mut self, data: &[u8], cancel: &CancelToken, gate: &dyn SubmitGate) -> TxResult;
+    fn write(&mut self, data: &[u8], cancel: &CancelToken) -> TxResult { self.write_gated(data, cancel, &AlwaysOpen) }  // sw-core 禁用
+}
+// gate 撤銷：未提交任何 bytes → NotSubmitted（error None）；已確認 k≥1 後撤銷 → Completed(k)＋PalError::cancelled()；撤銷後不得再交 OS。
 pub trait UartExclusive: Send + Sync { fn probe_holders(&self, real_path: &str) -> HolderReport; }
 // DeviceSource／DeviceWatcher／InstanceLock／WalFs／RpcListener 照 arch §4.3～§4.6 逐字，並加下列兩點（同步修訂 arch §4.5／§4.6）：
 //   WalFs 新增 fn read_all(&self, path: &Path) -> PalResult<Option<Vec<u8>>>;   // 讀取 API（Task 7）用；Task 6 conformance 一併涵蓋
@@ -569,9 +580,13 @@ pub enum FakeWriteStep {
     Accept(usize),                         // 接受前 n bytes 後回 Completed(累計)
     AcceptThenError(usize, PalError),      // 接受 n bytes 後回 Completed(n)+error
     Unknown(PalError),                     // 回 TxOutcome::Unknown + error
-    BlockUntilCancel { accept_before_cancel: usize }, // 阻塞直到 CancelToken::cancel，回 Completed(accept_before_cancel)
-    BlockForever,                          // 阻塞直到 FakeDevice::release_block（模擬 D-state）
+    BlockUntilCancel { accept_before_cancel: usize }, // 經 gate 提交後（已交 OS、in_flight 已設）於 gate 外阻塞直到 CancelToken::cancel，回 Completed(accept_before_cancel)
+    BlockForever,                          // 經 gate 提交後於 gate 外阻塞直到 FakeDevice::release_block（模擬 D-state；不持 Fence 鎖）
     Error(PalError),                       // 0 byte + error
+    // R0-F1 線性化測試用（arch §5.4 第 3 點）：
+    PauseBeforeSubmit,                     // write_gated 進入後、第一次 gate.submit 之前暫停（不持鎖），等 release_pause 後才提交全部 bytes
+    PauseInsideSubmit,                     // gate 已重驗通過、os_submit 閉包內（持 Fence 鎖）暫停，等 release_pause 後接受全部 bytes
+    AcceptThenWouldBlock(usize),           // 第一次 gate.submit 接受 n bytes，隨後回 WouldBlock 並於 gate 外暫停；release_pause 後經 gate 提交剩餘
 }
 pub struct FakeSerialBackend { /* Mutex<HashMap<String, Arc<FakeDeviceInner>>> */ }
 impl FakeSerialBackend {
@@ -591,7 +606,11 @@ impl FakeDevice {
     pub fn open_count(&self) -> usize;
     pub fn close_count(&self) -> usize;
     pub fn is_open(&self) -> bool;
-    pub fn write_calls(&self) -> usize;               // writer.write 被呼叫次數（零 TX 斷言用）
+    pub fn write_calls(&self) -> usize;               // writer.write／write_gated 被呼叫次數（TxWriter 出列快速拒絕的零 TX 斷言用）
+    pub fn os_submits(&self) -> usize;                // os_submit 閉包實際執行（bytes 交給假 OS）的次數；gate 撤銷不計。零 TX 以此值與 take_tx 為準
+    pub fn on_os_submit(&self, hook: Box<dyn Fn() + Send + Sync>);   // 每次 os_submit 閉包內（持 Fence 鎖時）呼叫；鎖持有斷言用
+    pub fn wait_paused(&self, timeout: Duration) -> bool;            // 等 writer 抵達 Pause*／AcceptThenWouldBlock 的暫停點
+    pub fn release_pause(&self);
     pub fn on_tx_reply(&self, trigger: &[u8], reply: &[u8]);                 // 已確認 TX 累積緩衝出現 trigger 時推一次 reply
     pub fn on_tx_match(&self, pattern: &str, reply: Box<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>); // pattern 以 sw_proto::pyre 編譯，對每個已確認 TX 行比對；reply 取得命中的行（random nonce probe 用：回顯 nonce＋prompt）
 }
@@ -688,7 +707,7 @@ fn close_requires_reader_and_writer_and_counts_once() {
     let h = be.open_exclusive(&DevicePath("/dev/ttyFAKE0".into()), &cfg()).unwrap();
     let (r, w, _waker, close) = h.split();
     let rc = close.close(r, w);
-    assert!(rc.closed && rc.error.is_none());
+    assert!(rc.closed && rc.excl_cleared && rc.error.is_none());   // fake 不模擬殘留獨占旗標；殘留情境由 Task 2 原生 PTY 測試驗證（R0-F3）
     assert_eq!((dev.open_count(), dev.close_count(), dev.is_open()), (1, 1, false));
 }
 
@@ -712,13 +731,15 @@ fn fake_clock_sleep_wakes_on_advance_and_wall_jump_keeps_mono() {
 | `deny_access_maps_to_access_denied` | `Err(OpenError::AccessDenied{holder})`，`holder == HolderReport{pids: vec![], holder_unknown: true, status: HolderScanStatus::Unsupported}` |
 | `removed_device_read_errors` | `remove_device` 後 `read` 回 `Err(e)` 且 `e.py_message == "[Errno 5] Input/output error"` |
 | `reader_woken_by_waker` | 另一 thread `waker.wake()` 後 `read(.., Some(1s))` 回 `Ok(ReadOutcome::Woken)` |
-| `fail_close_reports_error` | `fail_close(e)` 後 `CloseReceipt{closed:false, error:Some(_)}` |
+| `fail_close_reports_error` | `fail_close(e)` 後 `CloseReceipt{closed:false, excl_cleared:false, error:Some(_)}` |
 | `wal_fs_external_unlink_keeps_handle` | `open_append` → `external_unlink` → `file.unlinked() == Ok(true)`、`path_identity == Ok(None)` |
 | `wal_fs_pending_delete_with_external_reader` | `hold_external_reader` 後 `external_unlink`：`path_identity` 仍回 `Some(old)`、`open_append` 回 `Err(kind=AccessDenied)` 直到 handle drop |
 | `mem_stream_roundtrip` | 一端寫 `b"x\n"`，另一端讀到相同 bytes；`close_write` 後讀回 0 |
 | `on_tx_reply_pushes_rx_once` | `on_tx_reply(b"echo hi\n", b"hi\r\n# ")` → 寫 `b"echo hi\n"` 後 `read` 讀到 reply；再寫一次不再推 |
 | `on_tx_match_echoes_nonce` | `on_tx_match(r"^echo __READY__([0-9a-f]{8})$", |l| …)` → 寫 `b"echo __READY__ab12cd34\n"` 後讀到含 `__READY__ab12cd34` 的回覆 |
 | `fake_clock_subscribe_notified_on_advance` | `subscribe()` 後 `advance(1ms)` → `recv_timeout(100ms)` 成功 |
+| `fake_writer_revoking_gate_never_submits`（R0-F1） | 以永遠回 `Err(SubmitRevoked)` 的 gate 呼叫 `write_gated(b"abc", ..)` → `outcome == NotSubmitted`、`error.is_none()`、`os_submits()==0`、`take_tx()` 為空、`write_calls()==1` |
+| `fake_revoke_after_partial_stops_tail`（R0-F1） | `AcceptThenWouldBlock(2)`；gate 第一次放行、第二次回 `Err(SubmitRevoked)`；`wait_paused` 後 `release_pause` → `outcome == Completed(2)`、`error.kind == Cancelled`、`take_tx()==b"ab"`、`os_submits()==1` |
 
 - [ ] **Step 2：執行並確認 FAIL**
 
@@ -730,7 +751,7 @@ Expected：FAIL，`not implemented: slice21 T1 FakeSerialBackend::add_device`。
 - `FakeDeviceInner { rx: Mutex<VecDeque<u8>>, tx: Mutex<Vec<u8>>, steps: Mutex<VecDeque<FakeWriteStep>>, cond: Condvar, open: AtomicBool, opens: AtomicUsize, closes: AtomicUsize, writes: AtomicUsize, blocked_release: AtomicBool, close_err: Mutex<Option<PalError>>, removed: AtomicBool }`。
 - `open_exclusive`：`removed` → `NotFound(PalError::not_found("[Errno 2] No such file or directory"))`；`deny_access` 標記 → `AccessDenied`；外部 hold → `Held(HolderReport{pids, holder_unknown: pids.is_empty(), status: Ok})`；已 open → `Held(HolderReport{pids: vec![], holder_unknown: true, status: HolderScanStatus::Ok})`（與 POSIX flock 自身持有、排除自身 pid 後為空一致）；否則 `open=true`、`opens+=1`。
 - `split`：reader/writer 共用 inner；waker 以 `Condvar::notify_all` 加 `woken` 旗標實作。
-- writer.write：`writes+=1`；`cancel.is_cancelled()` 已為真 → `TxResult{outcome: NotSubmitted, error: Some(Cancelled)}`（**只有** fake 在呼叫前取消時才回 NotSubmitted；真實 PAL 由 TxWriter 在呼叫前決定）；依 steps 處理，`BlockUntilCancel` 以 `cond.wait_while(!cancelled)`；`BlockForever` 等 `blocked_release`。
+- writer.write_gated：`writes+=1`；`cancel.is_cancelled()` 已為真 → `TxResult{outcome: NotSubmitted, error: Some(Cancelled)}`（**只有** fake 在呼叫前取消時才回 NotSubmitted；真實 PAL 由 TxWriter 在呼叫前決定）；依 steps 處理。**所有**「接受 bytes」的動作都放在傳給 `gate.submit` 的 `os_submit` 閉包內（閉包內 `os_submits+=1`、呼叫 `on_os_submit` hook、把 bytes 推入 `tx`）；`gate.submit` 回 `Err(SubmitRevoked)` 時依 arch §4.2 回 `NotSubmitted` 或 `Completed(k)`＋`cancelled`，不再提交。`BlockUntilCancel`／`BlockForever` 先經 gate 提交 `accept_before_cancel`／全部 bytes，再於**閉包外**以 `cond.wait_while(!cancelled)`／等 `blocked_release`（不持 Fence 鎖）；`PauseBeforeSubmit` 在第一次 `gate.submit` 前、`PauseInsideSubmit` 在閉包內、`AcceptThenWouldBlock(n)` 在閉包回 `WouldBlock` 後於閉包外等待 `release_pause`。`write`（無 gate）＝`write_gated(.., &AlwaysOpen)`，供既有 PAL 自測沿用。
 - reader.read：有資料 → 複製最多 `buf.len()`；`woken` → 清旗標回 `Woken`；逾時回 `TimedOut`。
 - FakeWalFs identity 以遞增 `u128` 產生，`FileIdentity(1, id)`。
 - `sw_pal::fakes` 只在 `feature = "test-fakes"` 編譯（`#[cfg(feature = "test-fakes")] pub mod fakes;`）。
@@ -738,7 +759,7 @@ Expected：FAIL，`not implemented: slice21 T1 FakeSerialBackend::add_device`。
 - [ ] **Step 4：執行並確認 PASS**
 
 Run：`cargo test -p sw-pal --features test-fakes --test fakes_selftest`
-Expected：16 passed。
+Expected：18 passed。
 
 - [ ] **Step 5：Commit**
 
@@ -752,8 +773,8 @@ git commit -m "test(sw-pal): 實作 Slice 2.1 記憶體替身（序列埠、時�
 ## Task 2：PAL POSIX serial＋UartExclusive＋哨兵 PTY
 
 **Test author model:** haiku-xhigh　**Implementer model:** codex-gpt-6-luna-max
-**Changelog fragment:** `changelog.d/rust-s21-pal-serial.md`（front matter `type: feat`、`scope: rust-s21`；本文：「Rust PAL POSIX 序列埠：flock＋TIOCEXCL 獨占開啟、可喚醒讀取、可取消寫入與三態 TX 結果、/proc holder 診斷（BC-04、BC-03 前提）。」）
-**BLOCKED-OWNER：** (1) 實體 USB-UART（CH340／FTDI）上的 `TIOCEXCL`＋`flock` 行為與 RTS/CTS 卡住時的可取消寫入（`cap_physical_uart__*`，需擁有者 bench）；(2) 外部 minicom 先開埠後 daemon `open_exclusive` 得到 `Held` 的實機證據（L3 裝置衝突 P1）。
+**Changelog fragment:** `changelog.d/rust-s21-pal-serial.md`（front matter `type: feat`、`scope: rust-s21`；本文：「Rust PAL POSIX 序列埠：flock＋TIOCEXCL 獨占開啟（關閉與失敗路徑先 TIOCNXCL）、可喚醒讀取、可取消寫入與三態 TX 結果、/proc holder 診斷（BC-04、BC-03 前提）。」）
+**BLOCKED-OWNER：** (1) 實體 USB-UART（CH340／FTDI）上的 `TIOCEXCL`＋`flock` 行為（含 `CloseToken` 的 TIOCNXCL 後外部工具立即可開、daemon 被 SIGKILL 後 tty 旗標隨最後一個 handle 重置）與 RTS/CTS 卡住時的可取消寫入（`cap_physical_uart__*`，需擁有者 bench）；(2) 外部 minicom 先開埠後 daemon `open_exclusive` 得到 `Held` 的實機證據（L3 裝置衝突 P1）。
 
 **Files:**
 - Create: `crates/sw-pal/src/serial/posix.rs`、`crates/sw-pal/src/console_pty/posix.rs`、`crates/sw-pal/src/proc_holders/posix.rs`
@@ -794,6 +815,60 @@ fn cap_posix_pty__external_plain_open_after_tiocexcl_is_ebusy() {
     let _h = sw_pal::native().serial.open_exclusive(&dev, &cfg()).unwrap();
     let err = std::fs::OpenOptions::new().read(true).write(true).open(&dev.0).unwrap_err();
     assert_eq!(err.raw_os_error(), Some(libc::EBUSY));
+}
+
+/// 規格 §6.2「拒絕已識別的外部衝突」：外部程式先以普通 open（不 flock、不設 TIOCEXCL）持有，
+/// 本端 open→flock→TIOCEXCL 都會成功，必須靠鎖後 holder 重掃拒絕；被拒時不得改 termios、不得送任何 byte。
+#[test] #[ignore = "cap:posix_pty"]
+fn cap_posix_pty__external_plain_open_before_daemon_is_held() {
+    let (dev, mut peer) = posix_pty_pair();
+    let child = sw_pal::conformance::spawn_plain_holder(&dev);          // 子程序 open(O_RDWR|O_NOCTTY) 後 sleep；不 flock、不 TIOCEXCL
+    let before = sw_pal::conformance::tcgetattr_snapshot(&dev);
+    match sw_pal::native().serial.open_exclusive(&dev, &cfg()) {
+        Err(OpenError::Held(rep)) => {
+            assert_eq!(rep.pids, vec![child.id()]);
+            assert!(!rep.holder_unknown);
+        }
+        other => panic!("expected Held for plain external holder, got {other:?}"),
+    }
+    assert_eq!(sw_pal::conformance::tcgetattr_snapshot(&dev), before, "被拒時不得改寫外部工具的 termios");
+    assert_eq!(peer.read_available(Duration::from_millis(500)), Vec::<u8>::new(), "被拒時 UART 零 TX");
+    drop(child);                                                        // kill + wait
+    // peer（PTY master）仍開啟：被拒路徑若只 close(fd) 未 TIOCNXCL，旗標殘留，此處會得 Held(EBUSY)（R0-F3）
+    let _h = sw_pal::native().serial.open_exclusive(&dev, &cfg()).expect("holder 結束後可取得");
+}
+
+/// R0-F3：TIOCEXCL 是 tty 物件旗標，不隨 fd 關閉清除；PTY master 持續開啟時，CloseToken 必須先 TIOCNXCL 才關 fd，
+/// 否則 PROBE→close→正式 open 與 release→外部工具 open 都會 EBUSY。本測試在修正前必定 FAIL（第一次 reopen 即 EBUSY）。
+#[test] #[ignore = "cap:posix_pty"]
+fn cap_posix_pty__probe_close_reopen_with_master_open() {
+    if sw_pal::conformance::has_cap_sys_admin() { eprintln!("EVIDENCE_MISSING: TIOCEXCL bypassed under CAP_SYS_ADMIN"); return; }
+    let (dev, mut peer) = posix_pty_pair();                                 // peer 持有 master 直到測試結束
+    for round in 0..3 {                                                     // 模擬 PROBE bridge → 正式 bridge → 再一次 recover
+        let h = sw_pal::native().serial.open_exclusive(&dev, &cfg()).unwrap_or_else(|e| panic!("round {round}: reopen failed {e:?}"));
+        let (r, w, _waker, close) = h.split();
+        let rc = close.close(r, w);
+        assert!(rc.closed && rc.excl_cleared && rc.error.is_none(), "round {round}: {rc:?}");
+        // 外部一般 open（不經 serialwrap）也必須成功：證明旗標已解除，而不只是同 backend 的路徑碰巧可用
+        let ext = std::fs::OpenOptions::new().read(true).write(true).open(&dev.0)
+            .unwrap_or_else(|e| panic!("round {round}: plain open after close must not be EBUSY, got {:?}", e.raw_os_error()));
+        drop(ext);
+    }
+    assert_eq!(peer.read_available(Duration::from_millis(100)), Vec::<u8>::new(), "open／close 循環不得寫出任何 byte");
+}
+
+/// R0-F3：open_exclusive 在 TIOCEXCL 成功之後失敗（termios／eventfd），失敗返回前必須 TIOCNXCL。
+#[test] #[ignore = "cap:posix_pty"]
+fn cap_posix_pty__open_failure_after_tiocexcl_clears_excl() {
+    if sw_pal::conformance::has_cap_sys_admin() { eprintln!("EVIDENCE_MISSING: TIOCEXCL bypassed under CAP_SYS_ADMIN"); return; }
+    let (dev, _peer) = posix_pty_pair();
+    let be = sw_pal::serial::posix::PosixSerialBackend::with_post_excl_fault(PalError::io(5, "injected tcsetattr failure")); // test-fakes only
+    match be.open_exclusive(&dev, &cfg()) { Err(OpenError::Other(e)) => assert_eq!(e.kind, PalErrorKind::Io), other => panic!("{other:?}") }
+    match std::fs::OpenOptions::new().read(true).write(true).open(&dev.0) {
+        Ok(f) => drop(f),
+        Err(e) => panic!("失敗路徑殘留 TIOCEXCL：errno={:?}", e.raw_os_error()),
+    }
+    let _h = sw_pal::native().serial.open_exclusive(&dev, &cfg()).expect("失敗後可重新取得");
 }
 
 #[test] #[ignore = "cap:posix_pty"]
@@ -850,9 +925,11 @@ conformance `serial_suite` 內含下列斷言（每列一個子檢查，失敗�
 | `roundtrip_tx` | `write(b"hello\n")` → `Completed(6)`、`error None`；peer 讀到 `b"hello\n"` |
 | `roundtrip_rx` | peer 寫 `b"\x00\xff\r\n"` → `read` 回 `Data(4)` 且內容相同 |
 | `read_timeout` | 無資料 `read(Some(200ms))` 回 `TimedOut`，耗時 ∈ [180, 400] ms |
-| `close_once` | `CloseToken::close(r, w)` 回 `closed:true`；之後同一路徑可再次 `open_exclusive` 成功 |
+| `close_once` | `CloseToken::close(r, w)` 回 `closed:true`、`excl_cleared:true`、`error:None`；**peer 端（PTY master／COM pair 對端）全程保持開啟**下，之後同一路徑可再次 `open_exclusive` 成功（POSIX 若關閉前未 TIOCNXCL，此處得 `Held`，R0-F3） |
 | `eof_not_bridge_down` | peer 關閉後 `read` 回 `Ok(Eof)`（呼叫端不得當成 I/O error，UIO-12.10-d KEEP） |
 | `cancel_before_write` | 寫前已 cancel：`write` 回 `Completed(0)` 且 `error.kind == Cancelled`，peer 讀不到任何 byte |
+| `gate_revoked_never_reaches_os`（R0-F1） | 以永遠回 `Err(SubmitRevoked)` 的計數 gate 呼叫 `write_gated(b"zz\n", ..)` → `NotSubmitted`、`error None`、gate 被呼叫恰 1 次、peer 於 300 ms 內讀不到任何 byte |
+| `gate_wraps_every_os_submit`（R0-F1） | 計數 gate（放行並記錄閉包執行次數）寫 64 KiB → `Completed(65536)`；閉包執行次數 ≥ 1 且等於 PAL 實際 syscall／`WriteFile` 發出次數（PAL 內 debug 計數器）；peer 讀到完整 bytes |
 
 POSIX 單元測試（不需資源，`crates/sw-pal/src/serial/posix.rs` 內 `#[cfg(test)]`）：
 
@@ -868,6 +945,12 @@ POSIX 單元測試（不需資源，`crates/sw-pal/src/serial/posix.rs` 內 `#[c
 | `holder_scan_unreadable_proc_is_unknown` | `proc_root` 不存在 → `HolderReport{pids: [], holder_unknown: true, status: Unknown}` |
 | `holder_scan_permission`（root 下 skip，報告「證據不足」） | fd 目錄 `chmod 000` → `status == Permission`、`holder_unknown == true` |
 | `holder_unknown_only_when_no_pids` | `probe_holders` 回 `pids:[123]`、`status: Permission`（部分目錄不可讀）→ `holders_or_unknown` 的 `holder_unknown == false`（P1 T10：`pids` 非空 → false，空 → true，與 status 無關） |
+| `close_sequence_order_nxcl_before_close` | 以錄製替身 `TtyCloseOps`（`close_sequence(&mut ops)` 為 `CloseToken::close` 的純邏輯核心）：呼叫序恰為 `[Nxcl, FlockUnlock, CloseFd, CloseWakeR, CloseWakeW]`；回 `CloseReceipt{closed:true, excl_cleared:true, error:None}` |
+| `close_sequence_nxcl_hangup_errno_is_cleared` | 參數化 `Nxcl` 回 `EIO`／`ENXIO`／`ENODEV`（tty 已 hangup／裝置拔除）→ 呼叫序不變、`closed:true`、`excl_cleared:true`、`error:None`、無 WARNING |
+| `close_sequence_nxcl_other_errno_still_closes` | `Nxcl` 回 `ENOTTY` → 仍呼叫 `FlockUnlock, CloseFd, CloseWakeR, CloseWakeW`（不得保留 fd）；`closed:true`、`excl_cleared:false`、`error.py_message == "[Errno 25] Inappropriate ioctl for device"`；WARNING 恰一筆，前綴 `serialwrapd: TIOCNXCL failed on ` |
+| `close_sequence_close_fd_failure` | `CloseFd` 回 `EIO` → `closed:false`、`excl_cleared:true`、`error.kind == Io`；wake fd 仍關閉 |
+| `open_failure_after_excl_runs_nxcl_before_close` | 錄製替身注入 `apply_termios` 失敗（`open_sequence(&mut ops)` 純邏輯核心）→ 呼叫序尾段恰為 `[Excl, Termios(Err), Nxcl, CloseFd]`；鎖後重掃 `Reject` 時尾段恰為 `[Excl, ProbeHolders, Nxcl, CloseFd]`（不得出現 `Termios`）；`Excl` 之前（open／flock）失敗時序列中**不得**出現 `Nxcl` |
+| `post_lock_holder_verdict_matrix` | `{pids:[123], status:Ok}` → `Reject`；`{pids:[123], status:Permission}` → `Reject`（已識別即拒絕，不論 status）；`{pids:[], status:Ok}` → `Accept`；`{pids:[], status:Unknown}`、`{pids:[], status:Permission}` → `AcceptUnverified`（不得回 `Accept`） |
 
 跨程序與獨占必測情境（§6.2「兩個 daemon 競爭開埠、symlink 指向同一裝置、程序退出、handle 繼承」；`crates/sw-pal/tests/serial_posix_process.rs`，子程序以 `std::env::current_exe()` 加 `--exact <name>` 與 `S21_CHILD` env 重入本測試二進位）：
 
@@ -875,7 +958,8 @@ POSIX 單元測試（不需資源，`crates/sw-pal/src/serial/posix.rs` 內 `#[c
 |---|---|---|
 | `cap_posix_pty__second_process_open_is_held` | posix_pty | 子程序持有 `open_exclusive`（不同 lock／socket 路徑，模擬第二個 daemon）→ 父程序 `open_exclusive` 回 `Held`，`pids` 含子程序 pid、`holder_unknown:false` |
 | `cap_posix_pty__two_symlinks_same_tty_is_held` | posix_pty | 以兩個不同 symlink（`by-id/a`、`by-path/b`）指向同一 slave：經 a 開成功後經 b 開 → `Held`（`flock`／`TIOCEXCL` 作用在 inode） |
-| `cap_posix_pty__holder_exit_releases_lock_and_excl` | posix_pty | 子程序 `open_exclusive` 後被 `SIGKILL` → 父程序 100 ms 內 `open_exclusive` 成功 |
+| `cap_posix_pty__holder_exit_releases_flock_excl_persists_while_master_open` | posix_pty（非 root；`CAP_SYS_ADMIN` 下 skip 記「證據不足」） | （更正：舊名 `holder_exit_releases_lock_and_excl` 的「SIGKILL 後 100 ms 內 `open_exclusive` 成功」與 kernel 行為不符——TIOCEXCL 只在 tty 物件釋放時重置，父程序持有 PTY master 時旗標存活。）父程序先以一般 open 取得保活 fd `keep`（不 flock）→ 子程序以 `PosixSerialBackend::with_uart_exclusive(NoHolders)`（test-fakes only；鎖後重掃固定回 `{pids:[], status:Ok}`——否則父程序的 `keep` 會被鎖後重掃識別為外部 holder 而 `Held`，R0-F2）`open_exclusive` 成功（真 open／flock／TIOCEXCL）後被 `SIGKILL` → 100 ms 內 `flock(keep, LOCK_EX\|LOCK_NB) == 0`（flock 隨程序結束釋放）；一般 open 回 `EBUSY`；`open_exclusive` 回 `Held{pids:[], holder_unknown:true}`；`ioctl(keep, TIOCNXCL)` 後 `open_exclusive` 成功。實體 UART 程序退出時 tty 物件隨最後一個 handle 釋放、旗標重置，屬 BO-S21-04 實機證據 |
+| `cap_posix_pty__release_then_external_plain_open_succeeds` | posix_pty（非 root） | peer（PTY master）全程開啟；父程序 `open_exclusive` → `split` → `CloseToken::close` 回 `excl_cleared:true` → 子程序（模擬外部燒錄工具）以一般 `open(O_RDWR\|O_NOCTTY)` 開同一 slave：exit 0（子程序內 open 成功並寫 `b"X"`，peer 讀到 `b"X"`）；子程序結束後父程序 `open_exclusive` 再次成功（release→外部→attach 循環，R0-F3） |
 | `cap_posix_pty__fd_not_inherited_by_child` | posix_pty | `open_exclusive` 後 spawn `sh -c 'ls -l /proc/self/fd'` → 輸出不含 slave 路徑與 eventfd（`O_CLOEXEC`／`EFD_CLOEXEC`） |
 | `cap_posix_pty__concurrent_wake_reaches_reader_and_writer` | posix_pty | reader 阻塞於 `read(None)`、writer 阻塞於 `POLLOUT`（peer 停讀）時呼叫一次 `CancelToken::cancel()`＋`waker.wake()`：兩者都在 100 ms 內返回；重複 200 次無一遺失喚醒 |
 | `cap_sys_admin__tiocexcl_bypass_documented` | posix_pty＋root（非 root skip） | root 下外部普通 `open` 在 TIOCEXCL 後**成功**（記錄行為，報告標「§6.2 例外，需權限管控」） |
@@ -908,10 +992,21 @@ fn open_exclusive(&self, dev: &DevicePath, cfg: &SerialConfig) -> Result<Box<dyn
         return Err(if e == libc::EWOULDBLOCK { OpenError::Held(self.holders_or_unknown(&dev.0)) } else { OpenError::Other(PalError::from_errno(e)) });
     }
     if unsafe { libc::ioctl(fd, libc::TIOCEXCL) } != 0 { return Err(OpenError::Other(PalError::from_errno(errno()))); }
+    // R0-F3：TIOCEXCL 成功後改由 ExclGuard 持有；之後任何 `return Err`／`?` 在 drop 時先 ioctl(TIOCNXCL)（失敗依 close_sequence 的 errno 規則只記 WARNING）再 close(fd)。
+    // 旗標掛在 tty 物件上、不隨 fd 關閉清除；PTY master 仍開啟或外部 holder 仍持有時，漏清會讓之後所有一般 open 都 EBUSY。
+    let guard = ExclGuard::arm(guard);
+    #[cfg(feature = "test-fakes")] if let Some(e) = self.post_excl_fault.clone() { return Err(OpenError::Other(e)); } // with_post_excl_fault：只供 open_failure_after_tiocexcl_clears_excl
+    // 鎖後重掃（§6.2）：TIOCEXCL 不撤銷既有 handle，未取 flock 的外部程式（minicom）先開時前三步都成功
+    let rep = self.excl.probe_holders(&dev.0);                                       // 排除自身 pid
+    match post_lock_holder_verdict(&rep) {
+        PostLockVerdict::Reject => return Err(OpenError::Held(HolderReport { holder_unknown: false, ..rep })), // ExclGuard drop → TIOCNXCL → close(fd)；termios 未動、零 TX
+        PostLockVerdict::AcceptUnverified => log::warn!("serialwrap: 無法確認 {} 的外部 holder（status={:?}），BC-04 僅保證 serialwrap 實例互斥", dev.0, rep.status),
+        PostLockVerdict::Accept => {}
+    }
     apply_termios(fd, cfg).map_err(OpenError::Other)?;                               // tcgetattr → build_termios → tcsetattr(TCSANOW)
     let wake_r = EventFd::new().map_err(OpenError::Other)?;                          // reader 專用；Linux eventfd(EFD_NONBLOCK|EFD_CLOEXEC)，其他 unix self-pipe
     let wake_w = EventFd::new().map_err(OpenError::Other)?;                          // writer 專用（避免 reader 讀乾後 writer 漏醒）
-    Ok(Box::new(PosixSerialHandle::new(guard.into_inner(), wake_r, wake_w)))
+    Ok(Box::new(PosixSerialHandle::new(guard.disarm_into_fd(), wake_r, wake_w)))   // 成功：解除獨占的責任移交給 CloseToken
 }
 fn holders_or_unknown(&self, path: &str) -> HolderReport {
     let mut r = self.excl.probe_holders(path);
@@ -924,31 +1019,45 @@ fn holders_or_unknown(&self, path: &str) -> HolderReport {
 - writer：
 
 ```rust
-fn write(&mut self, data: &[u8], cancel: &CancelToken) -> TxResult {
+fn write_gated(&mut self, data: &[u8], cancel: &CancelToken, gate: &dyn SubmitGate) -> TxResult {
     let mut sent = 0usize;
     loop {
         if cancel.is_cancelled() { return TxResult { outcome: TxOutcome::Completed(sent), error: Some(PalError::cancelled()) }; }
         if sent == data.len() { return TxResult { outcome: TxOutcome::Completed(sent), error: None }; }
-        let n = unsafe { libc::write(self.fd, data[sent..].as_ptr().cast(), data.len() - sent) };
-        if n > 0 { sent += n as usize; continue; }
-        let e = errno();
-        if n < 0 && (e == libc::EAGAIN || e == libc::EWOULDBLOCK) {
-            // poll(POLLOUT, wake_fd)，無逾時；wake → 下一輪檢查 cancel（UIO-12.2-b：不再 sleep(0.01) 無限重試）
-            match poll_out_or_wake(self.fd, self.wake_fd) { Ok(_) => continue, Err(pe) => return TxResult { outcome: TxOutcome::Completed(sent), error: Some(pe) } }
+        // R0-F1：每一次 write(2) 都在 gate（Fence 鎖）內、重驗後才執行；fd 為 O_NONBLOCK，臨界區只含這一個不阻塞的 syscall
+        let fd = self.fd;
+        let step = gate.submit(&mut || {
+            let n = unsafe { libc::write(fd, data[sent..].as_ptr().cast(), data.len() - sent) };
+            if n > 0 { return SubmitStep::Accepted(n as usize); }
+            let e = errno();
+            if n < 0 && (e == libc::EAGAIN || e == libc::EWOULDBLOCK) { SubmitStep::WouldBlock }
+            else if n == 0 { SubmitStep::Failed(PalError::io(0, "write returned 0")) } else { SubmitStep::Failed(PalError::from_errno(e)) }
+        });
+        match step {
+            Err(SubmitRevoked) if sent == 0 => return TxResult { outcome: TxOutcome::NotSubmitted, error: None },
+            Err(SubmitRevoked) => return TxResult { outcome: TxOutcome::Completed(sent), error: Some(PalError::cancelled()) }, // 尾段不交 OS
+            Ok(SubmitStep::Accepted(n)) => { sent += n; continue; }
+            Ok(SubmitStep::WouldBlock) => {
+                // gate 外 poll(POLLOUT, wake_fd)，無逾時；wake → 下一輪檢查 cancel（UIO-12.2-b：不再 sleep(0.01) 無限重試）；
+                // 下一段一律再經 gate 重驗（失效發生在等待期間 → 尾段不送）
+                match poll_out_or_wake(self.fd, self.wake_fd) { Ok(_) => continue, Err(pe) => return TxResult { outcome: TxOutcome::Completed(sent), error: Some(pe) } }
+            }
+            Ok(SubmitStep::Failed(pe)) => return TxResult { outcome: TxOutcome::Completed(sent), error: Some(pe) },
+            Ok(SubmitStep::Pending) => unreachable!("POSIX 不產生 Pending"),
         }
-        if n == 0 { return TxResult { outcome: TxOutcome::Completed(sent), error: Some(PalError::io(0, "write returned 0")) }; }
-        return TxResult { outcome: TxOutcome::Completed(sent), error: Some(PalError::from_errno(e)) };
     }
 }
 ```
 
 POSIX writer 不產生 `TxOutcome::Unknown`（每次 syscall 回傳確切長度）；`Unknown` 只由 Windows 與 fake 產生。
 - `IoWaker::wake` 對 `wake_r` 與 `wake_w` 各寫一次；reader 只 poll／讀乾 `wake_r`，writer 只 poll／讀乾 `wake_w`（兩個等待者各自消耗自己的喚醒，不會互相吃掉）。`CancelToken::cancel` 設旗標後呼叫同一個 waker。
-- `CloseToken::close`：drop reader/writer 後 `flock(LOCK_UN)`、`close(fd)`、`close(wake_r)`、`close(wake_w)`；`close` 失敗 → `CloseReceipt{closed:false, error}`。
+- `CloseToken::close`（arch §4.2 關閉序，R0-F3）：drop reader/writer（I/O 已收斂）後經 `close_sequence(&mut LibcTtyCloseOps)`：`ioctl(fd, TIOCNXCL)` → `flock(LOCK_UN)` → `close(fd)` → `close(wake_r)` → `close(wake_w)`。`TIOCNXCL` 回 `EIO`／`ENXIO`／`ENODEV`（已 hangup／拔除）視為已解除；其他 errno → 照序繼續關閉、`excl_cleared:false`、`error:Some`、stderr WARNING `serialwrapd: TIOCNXCL failed on <dev>: <py_message>`；`close(fd)` 失敗 → `CloseReceipt{closed:false, error}`。`ExclGuard`（open 失敗路徑）的 drop 共用同一個 `close_sequence`（無 wake fd 時略過末兩步）。`PosixSerialBackend::with_post_excl_fault(PalError)` 只在 `feature = "test-fakes"` 編譯，於 TIOCEXCL 成功後立即回該錯誤（模擬 termios／eventfd 失敗）。
 - `apply_termios`：`tcgetattr` → `c_iflag=c_oflag=c_lflag=0`、`c_cflag = CREAD|CLOCAL|CSx[|PARENB[|PARODD]][|CSTOPB][|CRTSCTS]`（**覆寫**，不 OR 到既有值；速度以 `cfsetispeed`／`cfsetospeed` 設定）、`c_cc` 不動 → `tcsetattr(TCSANOW)`。
 - `probe_holders`：照 06 §9.5 `_probe_external_holder`（排除自身 pid；`readlink == realpath(path) || readlink == path` 或 `st_rdev` 相同且非 0；pid 升冪）；`/proc` 不可列 → `Unknown`；任一 fd 目錄 EACCES → `Permission`（保留已收集的 pids）。函式內部用 `probe_holders_in(proc_root: &Path, path: &str)` 供測試注入。
 - `console_pty/posix.rs` `create_pty`：`openpty` → master `O_NONBLOCK` → slave termios `iflag=oflag=lflag=0`、`cflag=CREAD|CLOCAL|CS8`、`VMIN=1`、`VTIME=0`、`TCSANOW` → `slave_path = ttyname(slave)`；daemon 同持 master 與 slave（KeepAlive）。
 - `conformance::posix_pty_pair()`：`openpty`，把 slave 路徑當 `DevicePath`、master 包成 `PeerEnd`（`stop_reading` 只是停止讀 master）。
+- `conformance::spawn_plain_holder(dev: &DevicePath) -> PlainHolder`：以 `current_exe()` 重入（`S21_CHILD=plain_holder`）的子程序 `open(O_RDWR|O_NOCTTY)` 該路徑後回報 ready 並 sleep，不 `flock`、不 `TIOCEXCL`（模擬 minicom）；`PlainHolder::id() -> u32`，`Drop` 時 `kill`＋`wait`。`conformance::tcgetattr_snapshot(dev) -> Vec<u8>`：另開 `O_RDONLY|O_NOCTTY|O_NONBLOCK` 取 `termios` 位元組後關閉（只讀，供「未被改寫」比對）。
+- 鎖後 holder 重掃（規格 §6.2，arch §4.2）：`TIOCEXCL` 成功後、`apply_termios` 之前呼叫 `self.excl.probe_holders(&dev.0)`（排除自身 pid）；`pids` 非空 → `ExclGuard` drop（`TIOCNXCL` → close fd，R0-F3）並回 `OpenError::Held(HolderReport{pids, holder_unknown:false, status})`；`pids` 為空且 `status ∈ {Unknown, Permission}` → 照常開啟並 `log::warn!("serialwrap: 無法確認 {} 的外部 holder（status={:?}），BC-04 僅保證 serialwrap 實例互斥")`（不得當安全證明）。純函式 `post_lock_holder_verdict(&HolderReport) -> PostLockVerdict::{Reject, Accept, AcceptUnverified}` 供單元測試。此檢查在 backend 內，呼叫端（含 `precheck_holders:false` 的 force 與自動 attach）無法略過。`PosixSerialBackend::with_uart_exclusive(Arc<dyn UartExclusive>)` 只在 `feature = "test-fakes"` 編譯，替換鎖後重掃所用的 holder 掃描（供 `cap_posix_pty__holder_exit_releases_flock_excl_persists_while_master_open` 這類測試本身須預持 fd 的情境），正式路徑不得使用。
 
 - [ ] **Step 4：執行並確認 PASS**
 
@@ -1064,8 +1173,8 @@ Expected：FAIL，`not implemented: slice21 T3 dcb_model`。
 - 開啟：`CreateFileW(win_device_name, GENERIC_READ|GENERIC_WRITE, 0, null, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, 0)`；失敗依 `map_open_error`：`AccessDenied` → `OpenError::AccessDenied{os, holder: HolderReport{pids: vec![], holder_unknown: true, status: Unsupported}}`；成功後 `GetCommState` → 套 `dcb_model` → `SetCommState`；`SetCommTimeouts(comm_timeouts_model())`；`SetupComm(4096, 4096)`；`PurgeComm` **不呼叫**（對齊 POSIX 不 tcflush）。
 - I/O 執行緒模型（arch §1.4）：reader 與 writer 各自持有專屬 `OVERLAPPED`＋manual-reset event 與 buffer，生命週期綁在物件上，`Drop` 前保證無在途 I/O。
 - reader：`ReadFile(h, buf, len, null, &ov)` → `ERROR_IO_PENDING` 時 `WaitForMultipleObjects([ov.hEvent, wake_event], FALSE, timeout)`；wake → `CancelIoEx(h, &ov)` → `GetOverlappedResult(h, &ov, &n, TRUE)` → n>0 回 `Data(n)`（已完成 bytes 不丟），否則 `Woken`；io event → `GetOverlappedResult(..., FALSE)`，`n==0` 回 `TimedOut`（COMMTIMEOUTS 200 ms 到期）。
-- writer：`WriteFile(..., &ov)` → 等 `[ov.hEvent, wake_event]`（無逾時，寫逾時由 COMMTIMEOUTS 5000 ms 處理）；wake 且已 cancel → `CancelIoEx` → `GetOverlappedResult(bWait=TRUE)` → `map_overlapped_completion`；完成後若 `transferred < len` 且無錯 → 迴圈續寫剩餘（累計 sent）。
-- `CloseToken::close`：確認 reader／writer 已 drop（無在途 OVERLAPPED）→ `CloseHandle`；失敗 → `closed:false`。
+- writer（`write_gated`）：`WriteFile(..., &ov)` 的**發出**放在 `gate.submit` 閉包內（同步完成 → `Accepted(n)`；`ERROR_IO_PENDING` → `Pending`；其他錯誤 → `Failed`），gate 撤銷時不呼叫 `WriteFile`（R0-F1）；閉包返回、放鎖後才在 gate 外等 `[ov.hEvent, wake_event]`（無逾時，寫逾時由 COMMTIMEOUTS 5000 ms 處理）；wake 且已 cancel → `CancelIoEx` → `GetOverlappedResult(bWait=TRUE)` → `map_overlapped_completion`；完成後若 `transferred < len` 且無錯 → 剩餘 bytes 以新的 `gate.submit` 重驗後再發出（撤銷則 `Completed(sent)`＋`cancelled`，累計 sent）。
+- `CloseToken::close`：確認 reader／writer 已 drop（無在途 OVERLAPPED）→ `CloseHandle`；成功 → `closed:true, excl_cleared:true`（`dwShareMode=0` 的限制隨 handle 關閉解除）；失敗 → `closed:false, excl_cleared:false`。
 - `probe_holders` 恆回 `{pids: [], holder_unknown: true, status: Unsupported}`。
 - `set_baud`：`GetCommState`／改 `BaudRate`／`SetCommState`。
 
@@ -1737,7 +1846,7 @@ git commit -m "feat(sw-core): 命令 admission、出列與 history 上限" -m "C
 ## Task 9：sw-core TxWriter＋Fence（送出前檢查、BC-03 三態、SC-07）
 
 **Test author model:** haiku-xhigh　**Implementer model:** codex-gpt-6-luna-max
-**Changelog fragment:** `changelog.d/rust-s21-txwriter.md`（front matter `type: feat`、`scope: rust-s21`；本文：「Rust 單一 TX 寫入者：OS 寫入前於 fence 鎖內檢查 epoch／凍結／Quiet／Reconfirm／WAL 健康／取消，TX WAL 只記 OS 確認的 bytes 且順序等於實際寫入順序。」）
+**Changelog fragment:** `changelog.d/rust-s21-txwriter.md`（front matter `type: feat`、`scope: rust-s21`；本文：「Rust 單一 TX 寫入者：每次 OS 提交都在 fence 鎖內重驗 epoch／凍結／Quiet／Reconfirm／WAL 健康／世代／取消後才交 OS（授權與提交同一臨界區，鎖不跨完成等待），TX WAL 只記 OS 確認的 bytes 且順序等於實際寫入順序。」）
 **BLOCKED-OWNER：** 無。
 
 **Files:**
@@ -1763,8 +1872,14 @@ git commit -m "feat(sw-core): 命令 admission、出列與 history 上限" -m "C
     pub reconfirm_pending: bool, pub flash_mode: FlashMode, pub wal_unhealthy: bool, pub cancelled: HashSet<OpId>, pub in_flight: Option<InFlight> }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)] pub enum FenceReject { StaleEpoch, Frozen, Quiet, ReconfirmPending, WalUnhealthy, Flash, OwnerMismatch, FsmMismatch, Cancelled }
 pub struct Fence(Mutex<FenceState>);
-impl Fence { pub fn new() -> Arc<Fence>; pub fn with<R>(&self, f: impl FnOnce(&mut FenceState) -> R) -> R; pub fn admit(st: &FenceState, p: &TxPermit) -> Result<(), FenceReject>; }
+impl Fence { pub fn new() -> Arc<Fence>; pub fn with<R>(&self, f: impl FnOnce(&mut FenceState) -> R) -> R; pub fn admit(st: &FenceState, p: &TxPermit) -> Result<(), FenceReject>;
+             pub fn try_with<R>(&self, f: impl FnOnce(&mut FenceState) -> R) -> Option<R>; /* try_lock；鎖被持有時回 None（鎖持有斷言用） */ }
 impl WalHealthSink for Fence {}                               // set_wal_unhealthy → state.wal_unhealthy
+/// arch §4.2／§5.4 第 3 點（R0-F1）：授權與 OS 提交的唯一序列化點。submit：取 Fence 鎖 → Fence::admit(permit) →
+/// Err(r) 時記 last_reject=Some(r) 並回 Err(SubmitRevoked)（不呼叫 os_submit）→ Ok 時仍持鎖呼叫 os_submit →
+/// Accepted(n>0)／Pending 時同一臨界區設 in_flight=Some(InFlight{op_id, len}) → 放鎖。鎖只跨非阻塞提交，不跨完成等待。
+pub struct FenceSubmitGate<'a> { pub fence: &'a Fence, pub permit: &'a TxPermit, pub last_reject: Cell<Option<FenceReject>> }
+impl SubmitGate for FenceSubmitGate<'_> {}
 pub struct TxJob { pub permit: TxPermit, pub payload: Vec<u8>, pub reply: crossbeam_channel::Sender<TxReport> }
 #[derive(Debug, Clone)] pub struct TxReport { pub op_id: OpId, pub epoch: u64, pub result: TxResult, pub wal: Option<WalAppend> /* TX WAL 寫入結果（seq／ok／loss_flag）*/, pub reject: Option<FenceReject> }
 /// epoch 範圍的 TX 帳本：TxWriter 對每個 op 累計，結束時整本交回，finisher 原樣放進 WorkerStoppedReceipt（BC-03 映射的唯一來源）。
@@ -1847,6 +1962,118 @@ fn freeze_during_in_flight_counts_as_committed_and_next_is_rejected() {
     let rep2 = send(&r, TxClass::Command, 2, 7, b"x");
     assert_eq!(rep2.result.outcome, TxOutcome::NotSubmitted);
 }
+
+// ---- R0-F1：授權與 OS 提交的序列化（arch §5.4 第 3 點、規格 §5.2.2）----
+fn send_async(r: &Rig, class: TxClass, op: u64, owner_gen: u64, payload: &[u8]) -> crossbeam_channel::Receiver<TxReport> {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    r.h.jobs.send(TxJob { permit: TxPermit { op_id: OpId(op), epoch: 7, owner_gen, fsm_gen: 0, class, source: "agent:x".into(), cmd_id: Some("c".into()), log: true },
+                          payload: payload.to_vec(), reply: tx }).unwrap();
+    rx
+}
+
+#[test]
+fn authorized_then_quiet_before_os_submit_is_zero_tx() {        // 舊設計（鎖內驗證→放鎖→write）會在此寫出 bytes
+    let r = rig();
+    r.dev.script_write(vec![FakeWriteStep::PauseBeforeSubmit]);
+    let rx = send_async(&r, TxClass::Command, 1, 0, b"reboot\n");
+    assert!(r.dev.wait_paused(Duration::from_secs(2)));           // 出列快速檢查已通過、尚未提交 OS
+    r.fence.with(|s| s.quiet_active = true);                      // 不得阻塞：writer 此時不持鎖
+    r.dev.release_pause();
+    let rep = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!((rep.result.outcome, rep.reject), (TxOutcome::NotSubmitted, Some(FenceReject::Quiet)));
+    assert!(rep.result.error.is_none());
+    assert_eq!(r.dev.os_submits(), 0);
+    assert!(r.dev.take_tx().is_empty());
+    assert!(tx_lens(&r).is_empty());
+    assert!(r.fence.with(|s| s.in_flight.is_none()));
+}
+
+#[test]
+fn authorized_then_drain_freeze_before_os_submit_is_zero_tx() {
+    let r = rig();
+    r.dev.script_write(vec![FakeWriteStep::PauseBeforeSubmit]);
+    let rx = send_async(&r, TxClass::Command, 1, 0, b"ls\n");
+    assert!(r.dev.wait_paused(Duration::from_secs(2)));
+    r.fence.with(|s| { s.frozen = true; s.active_epoch = None; });   // Phase 1（換手／release）
+    r.dev.release_pause();
+    let rep = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!((rep.result.outcome, rep.reject), (TxOutcome::NotSubmitted, Some(FenceReject::Frozen)));
+    assert_eq!(r.dev.os_submits(), 0);
+    assert!(r.dev.take_tx().is_empty() && tx_lens(&r).is_empty());
+}
+
+#[test]
+fn authorized_then_lease_owner_gen_bump_before_os_submit_is_zero_tx() {   // LeaseOwner 世代在提交臨界區重驗
+    let r = rig();
+    r.fence.with(|s| s.owner_gen = 3);
+    r.dev.script_write(vec![FakeWriteStep::PauseBeforeSubmit]);
+    let rx = send_async(&r, TxClass::LeaseOwner, 1, 3, b"\x03");
+    assert!(r.dev.wait_paused(Duration::from_secs(2)));
+    r.fence.with(|s| s.owner_gen = 4);                            // lease close／expiry／換手
+    r.dev.release_pause();
+    let rep = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!((rep.result.outcome, rep.reject), (TxOutcome::NotSubmitted, Some(FenceReject::OwnerMismatch)));
+    assert_eq!(r.dev.os_submits(), 0);
+    assert!(r.dev.take_tx().is_empty() && tx_lens(&r).is_empty());
+}
+
+#[test]
+fn quiet_during_os_submit_waits_for_submit_and_counts_committed() {
+    let r = rig();
+    r.dev.script_write(vec![FakeWriteStep::PauseInsideSubmit]);
+    let rx = send_async(&r, TxClass::Command, 1, 0, b"abc");
+    assert!(r.dev.wait_paused(Duration::from_secs(2)));           // 已重驗通過、持 Fence 鎖、os_submit 進行中
+    let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+    let f = r.fence.clone();
+    let inv = std::thread::spawn(move || { f.with(|s| s.quiet_active = true); done_tx.send(()).unwrap(); });
+    assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err(), "失效操作必須等到 OS 提交返回");
+    assert!(r.dev.take_tx().is_empty(), "暫停點在提交之前，bytes 尚未交 OS");
+    r.dev.release_pause();
+    inv.join().unwrap();
+    assert!(done_rx.recv_timeout(Duration::from_secs(1)).is_ok());
+    let rep = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!((rep.result.outcome, rep.reject), (TxOutcome::Completed(3), None));
+    assert_eq!(r.dev.take_tx(), b"abc".to_vec());
+    assert_eq!(tx_lens(&r).len(), 1);
+    let rep2 = send(&r, TxClass::Command, 2, 7, b"x");
+    assert_eq!((rep2.result.outcome, rep2.reject), (TxOutcome::NotSubmitted, Some(FenceReject::Quiet)));
+    assert_eq!(r.dev.os_submits(), 1);
+}
+
+#[test]
+fn quiet_between_partial_submits_stops_tail() {
+    let r = rig();
+    r.dev.script_write(vec![FakeWriteStep::AcceptThenWouldBlock(2)]);
+    let rx = send_async(&r, TxClass::Command, 1, 0, b"abcdef");
+    assert!(r.dev.wait_paused(Duration::from_secs(2)));           // 已提交 "ab"，於 gate 外等 POLLOUT
+    r.fence.with(|s| { assert!(s.in_flight.is_some()); s.quiet_active = true; });   // 不得阻塞
+    r.dev.release_pause();
+    let rep = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!((rep.result.outcome, rep.reject), (TxOutcome::Completed(2), Some(FenceReject::Quiet)));
+    assert_eq!(rep.result.error.as_ref().unwrap().kind, PalErrorKind::Cancelled);
+    assert_eq!(r.dev.take_tx(), b"ab".to_vec());                 // 尾段 "cdef" 永不交 OS
+    assert_eq!(r.dev.os_submits(), 1);
+    let lines = tx_lens(&r);
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].contains("\"len\":2,"));
+}
+
+#[test]
+fn os_submit_always_inside_fence_critical_section() {
+    let r = rig();
+    let f = r.fence.clone();
+    let unlocked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let u2 = unlocked.clone();
+    r.dev.on_os_submit(Box::new(move || { if f.try_with(|_| ()).is_some() { u2.fetch_add(1, std::sync::atomic::Ordering::SeqCst); } }));
+    r.dev.script_write(vec![FakeWriteStep::AcceptThenWouldBlock(1)]);
+    let rx = send_async(&r, TxClass::Command, 1, 0, b"xyz");
+    assert!(r.dev.wait_paused(Duration::from_secs(2)));
+    r.dev.release_pause();
+    assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap().result.outcome, TxOutcome::Completed(3));
+    for i in 0..20u64 { send(&r, TxClass::Command, 10 + i, 7, b"q"); }
+    assert!(r.dev.os_submits() >= 22);
+    assert_eq!(unlocked.load(std::sync::atomic::Ordering::SeqCst), 0, "每次 OS 提交時 Fence 鎖必為持有");
+}
 ```
 
 Gate 表（`gate_rules` 參數化測試；每列以 `Fence::admit(&state, &permit)` 斷言）：
@@ -1901,13 +2128,16 @@ fn run(mut self) -> (Box<dyn SerialWriter>, TxLedger) {
             recv(self.stop) -> _ => break,                                  // 與 Sender 數量無關（OpCtx 持有 clone 也能結束）
             recv(self.jobs) -> j => match j { Ok(j) => j, Err(_) => break },
         };
-        let gate = self.fence.with(|s| match Fence::admit(s, &job.permit) {
-            Ok(()) => { s.in_flight = Some(InFlight { op_id: job.permit.op_id, len: job.payload.len() }); Ok(()) }
-            Err(r) => Err(r),
-        });
-        let (result, reject) = match gate {
+        // 出列快速拒絕（不呼叫 PAL）；通過**不是**授權——授權只發生在 PAL 每次 OS 提交的 FenceSubmitGate 臨界區（R0-F1）
+        let pre = self.fence.with(|s| Fence::admit(s, &job.permit));
+        let (result, reject) = match pre {
             Err(r) => (TxResult { outcome: TxOutcome::NotSubmitted, error: None }, Some(r)),
-            Ok(()) => { let res = self.writer.write(&job.payload, &self.cancel); self.fence.with(|s| s.in_flight = None); (res, None) }
+            Ok(()) => {
+                let gate = FenceSubmitGate { fence: &self.fence, permit: &job.permit, last_reject: Cell::new(None) };
+                let res = self.writer.write_gated(&job.payload, &self.cancel, &gate);   // 鎖只在 gate.submit 內持有
+                self.fence.with(|s| if s.in_flight.as_ref().map(|f| f.op_id) == Some(job.permit.op_id) { s.in_flight = None });
+                (res, gate.last_reject.get())                                     // Completed(k)+cancelled 時亦帶撤銷原因
+            }
         };
         let wal = match (&result.outcome, job.permit.log) {
             (TxOutcome::Completed(n), true) if *n > 0 => Some(self.wal.append(WalAppendReq { com: &self.com, dir: "TX",
@@ -1927,7 +2157,7 @@ fn run(mut self) -> (Box<dyn SerialWriter>, TxLedger) {
 }
 ```
 
-`Fence::admit` 依 gate 表的檢查順序：`frozen` → `epoch` → `cancelled` → flash 規則 → class 規則（quiet → reconfirm → wal_unhealthy）→ 世代規則（`owner_gen`：`LeaseOwner`／`InteractiveOpenCmd`／`HumanRaw`／`HumanReplay`；`fsm_gen`：`LoginProbe`／`ReadyReconfirm`／`SelfTestProbe`）。drain 時 actor 在**同一把鎖**內設 `frozen=true`、`active_epoch=None`（Task 12），形成 arch §5.4 的線性化邊界。
+`Fence::admit` 依 gate 表的檢查順序：`frozen` → `epoch` → `cancelled` → flash 規則 → class 規則（quiet → reconfirm → wal_unhealthy）→ 世代規則（`owner_gen`：`LeaseOwner`／`InteractiveOpenCmd`／`HumanRaw`／`HumanReplay`；`fsm_gen`：`LoginProbe`／`ReadyReconfirm`／`SelfTestProbe`）。drain 時 actor 在**同一把鎖**內設 `frozen=true`、`active_epoch=None`（Task 12），形成 arch §5.4 的線性化邊界。`FenceSubmitGate::submit`：`let mut st = fence.0.lock(); if let Err(r) = Fence::admit(&st, permit) { self.last_reject.set(Some(r)); return Err(SubmitRevoked) } let step = os_submit(); if matches!(step, SubmitStep::Accepted(n) if n > 0) || matches!(step, SubmitStep::Pending) { st.in_flight = Some(InFlight { op_id: permit.op_id, len }) } drop(st); Ok(step)`——`os_submit` 必須是非阻塞提交（Task 2 POSIX 單次 `write(2)`、Task 3 Windows `WriteFile` 發出），任何完成等待都不得放進閉包；code review 以 `grep -n "poll_out_or_wake\|GetOverlappedResult\|WaitForMultipleObjects" crates/sw-pal/src/serial/` 確認這些呼叫都不在 `gate.submit(` 閉包內。
 
 - [ ] **Step 4：執行並確認 PASS**
 
@@ -2463,7 +2693,8 @@ fn drain_timeout_marks_stalled_and_late_receipt_completes() {
 | `hotplug_held_is_detached_attach_failed` | 非 RELEASED 的動態 session 收 `DeviceAttached` → `BridgeOpened(Err(Held{..}))` → `DETACHED`、`last_error:"ATTACH_FAILED:DeviceHeldError"` |
 | `attach_success_commits_then_attaching` | `BridgeOpened(Ok)` → `Persist(Unreleased)` → `StateCommitted(Ok)` 後才回 `{"ok":true,"session":{state:"ATTACHING"}}`；`last_released()` 已不含該 sid；`StartLogin` 在回覆之後 |
 | `attach_during_drain_is_session_recovering` | release 卡在 drain 時 `DeviceAttach` → `SESSION_RECOVERING`＋`drain_stalled`，無 `OpenBridge` |
-| `attach_force_skips_precheck_not_exclusivity` | `force:true` → `OpenBridge{precheck_holders:false}`；`BridgeOpened(Err(Held))` 仍回 `DEVICE_STILL_HELD` |
+| `attach_force_does_not_bypass_identified_external_holder`（取代原 `attach_force_skips_precheck_not_exclusivity`；規格 §6.2） | RELEASED＋`DeviceAttach{force:true}` → `Effect::OpenBridge{precheck_holders:false}`；注入 `BridgeOpened(Err(Held{pids:[4242], holder_unknown:false}))`（`open_exclusive` 鎖後重掃識別到未取 flock 的外部 holder）→ 回應**完全等於** `{"ok":false,"error_code":"DEVICE_STILL_HELD","pids":[4242],"holder_unknown":false,"selector":"COM0"}`；仍 `RELEASED`、`state_store.commits()` 不變；effects 不含 `StartLogin`、`StartOp`、`Persist{delta: StateDelta::Unreleased{..}}`（UART 零 TX）；`conn_epoch` 仍 `None` |
+| `auto_attach_plain_external_holder_no_io` | DETACHED 動態 session（初次啟動）＋`DeviceAttached` → `OpenBridge{precheck_holders:false}`；注入 `BridgeOpened(Err(Held{pids:[4242], holder_unknown:false}))` → `DETACHED`、`last_error:"ATTACH_FAILED:DeviceHeldError"`；effects 無 `StartLogin`／`StartOp`；`conn_epoch` 仍 `None` |
 | `already_attached` | 有 bridge 且非 RELEASED → `{"ok":true,"already_attached":true,"session":…}` |
 | `missing_device_tick_keeps_released` | RELEASED 時裝置離線 → 仍 `RELEASED`（DF-04；`_mark_missing_devices` 不降級） |
 | `io_error_drain_then_reattach_when_present` | READY＋`UartIoError` → RECOVERING → receipt → 裝置在 → `ATTACHING`＋`OpenBridge`；裝置不在 → `DETACHED` |
@@ -2523,7 +2754,7 @@ fn begin_stop(&mut self, kind: StopKind, waiter: Option<Reply>, now: Mono) -> Ef
 - 收到 receipt：`epoch`／`stop_id` 不符 → 只對帳本中仍未終態的舊 op 命令紀錄套 BC-03，不改狀態；相符且 `handle_closed` → 對 `aborted_op` 依帳本 `registry.complete(cmd, CmdOutcome::Aborted(class))`（`confirmed_bytes ≥ 1`→InFlight、`0` 且非 unknown→NotSubmitted、`unknown`→Unknown），InFlight 另產生 `Effect::WalMeta{cmd_id, meta:{"event":"command_aborted_in_flight","confirmed_tx_bytes":N,"tx_outcome":"complete"|"partial"}}`（`complete`＝確認 bytes 等於 payload 長度；P1 T08）→ `conn_epoch=None`、`queue_registered=false`、`Notify(SessionDetached)` → 依 kind（`post_kind` 只在 kind 非 Release 時覆寫裝置存在判斷）：Release → `Persist{delta: StateDelta::Released{sid, row: ReleasedRow{by_id, released_by, released_at, reason}}}`，等 `StateCommitted` 成功才 `RELEASED` 並回覆所有 waiters；失敗 → 狀態仍設 `RELEASED`、waiters 收 `Err(PyErr("state.json commit failed: …"))`；Recover／IoError → 裝置在 `ATTACHING`＋`OpenBridge`，否則 `DETACHED`；Removed → `DETACHED`、`last_error:"DEVICE_REMOVED"`；Rebound → `last_error:"DEVICE_REBOUND_REQUIRED"` 後 `OpenBridge`（Task 16）；Shutdown → 回覆 waiter。`handle_closed:false` → `stalled=true`、維持 RECOVERING、waiters 收 SC-04 形狀。收尾時 `drain_stalled=false`，`drain_timeout_epoch` 保留最後一次逾時值（P1 T08 凍結）。
 - `DrainTimeout` 且 StopOp 未完成：`stalled=true`、對外 `drain_stalled:true`、`drain_timeout_epoch=bridge_generation`；Release 的 waiters 收 `{"ok":false,"error_code":"SESSION_RECOVERING","drain_stalled":true,"drain_timeout_epoch":N,"session":…}`（waiters 清空，之後遲到回條照樣完成 release）。
 - Release 回應 `closed_consoles` = 進入 Phase 1 時的 console 數（Python `len(bridge.list_consoles())`；2.1 POSIX 哨兵 = 1、Windows 0）、`aborted_cmd` = 進入 Phase 1 時前景是否忙。收尾時 `last_error` 依 kind 設定（05 §3.1）：Release→`RELEASED`、Clear→`CLEARED`、Bind→`REBOUND`、Removed→`DEVICE_REMOVED`、Rebound→`DEVICE_REBOUND_REQUIRED`、IoError→裝置仍在時覆寫為 `null`（T20）。
-- SC-05 attach：`drain_in_progress` → `SESSION_RECOVERING`；`OpenBridge{precheck_holders: !force}` 由 attach worker thread 執行：預檢 `uart_excl.probe_holders(real_path)` 的 `pids` 非空 → `BridgeOpened(Err(Held{pids}))`（不呼叫 `open_exclusive`），否則同步 `open_exclusive`（RPC reply 延後到 `BridgeOpened`）；結果映射照 P1 T10 結果表（含「其他 OSError → `ok:true`＋`DETACHED`＋`ATTACH_FAILED:<ExcType>`」、熱插 `Held` → `ATTACH_FAILED:DeviceHeldError`）；成功 → `Persist(StateDelta::Unreleased{sid})` → commit 後 `ATTACHING` 並回 ok，`StartLogin` 非同步。
+- SC-05 attach：`drain_in_progress` → `SESSION_RECOVERING`；`OpenBridge{precheck_holders: !force}` 由 attach worker thread 執行：預檢 `uart_excl.probe_holders(real_path)` 的 `pids` 非空 → `BridgeOpened(Err(Held{pids}))`（不呼叫 `open_exclusive`），否則同步 `open_exclusive`（RPC reply 延後到 `BridgeOpened`）；`precheck_holders:false`（force、自動 attach）只省略開檔前快照，`open_exclusive` 內的鎖後重掃（Task 2）照常執行，識別到外部 holder 一律 `Err(Held)`——`force` 不得略過已識別的外部衝突（規格 §6.2）；結果映射照 P1 T10 結果表（含「其他 OSError → `ok:true`＋`DETACHED`＋`ATTACH_FAILED:<ExcType>`」、熱插 `Held` → `ATTACH_FAILED:DeviceHeldError`）；成功 → `Persist(StateDelta::Unreleased{sid})` → commit 後 `ATTACHING` 並回 ok，`StartLogin` 非同步。
 
 - [ ] **Step 4：執行並確認 PASS**
 
@@ -3253,7 +3484,7 @@ fn rebind_drains_before_reopen() {                                  // Review Fo
 | `dynamic_session_naming` | template `prpl-template` 第 3 個 session：`session_id == "prpl-template:COM2"`、`alias == "prpl-template+3"`、`act_no == 3` |
 | `resolution_order_pin_sticky_detect_fallback` | pin 存在 → 用 pin（`profile_source:"pin"`）；否則 sticky（`"sticky"`）；否則 detect：PROBE 開啟 → 送 `\n` → 3.0 s 後 tail 命中第一個 prompt_regex（`"detected"`）；都不中 → 非 command_capable passthrough（`"fallback"`） |
 | `detect_skips_passthrough_console_unlock_and_unsupported` | detect 不嘗試 passthrough、`console_unlock_env`、`post_login_cmd` 模板 |
-| `probe_bridge_closed_with_receipt_before_real_open` | 時序 `open(PROBE)`→`close(PROBE)`→`open(real)`，WAL 的 detect RX/TX `com == "PROBE"` |
+| `probe_bridge_closed_with_receipt_before_real_open` | PROBE 的 `CloseReceipt{closed:true, excl_cleared:true}` 收到後才 `open(real)`（`excl_cleared:false` 時仍嘗試 open，得 `Held` 依熱插規則 `DETACHED`＋`ATTACH_FAILED:DeviceHeldError`，不得靜默吞掉；原生 PTY 下的 reopen 由 Task 2 `cap_posix_pty__probe_close_reopen_with_master_open` 釘住）；時序 `open(PROBE)`→`close(PROBE)`→`open(real)`，WAL 的 detect RX/TX `com == "PROBE"` |
 | `sticky_persisted_only_when_ready_and_path_unchanged` | detected 且 READY → `state.json.profile_detected[by_id]` 寫入；READY 前 real_path 改變 → 不寫 |
 | `detached_rebind_fallback_smallest_act_no` | 新 by_id 無 session、有兩個 DETACHED 且其 by_id 離線的 session → 綁到 act_no 較小者並寫 binding override |
 | `max_sessions_warning` | 已 16 個 → 新裝置不建 session，WARNING `已達 max_sessions=16，忽略裝置 <by_id>` |
@@ -3638,7 +3869,7 @@ fn unreadable_state_json_exits_3_and_releases_lock() {
 | `real_sigterm_to_started_daemon_exits_0_after_flush` | 實際行程（watcher、actor、RPC、StateStore thread 都已啟動、session READY、有排隊命令）收 `SIGTERM` → exit 0；之後讀 WAL 最後一筆紀錄完整、`FLUSHED_BY_SHUTDOWN` 已寫入 command 紀錄（以停機前最後一次 `command.get` 輪詢驗證）、lock 可被新 daemon 取得 |
 | `shutdown_with_stalled_drain_exits_1_with_diagnostic` | in-process：一個 session writer `BlockForever` → stop → `SessionsDrained{stalled:["t:COM0"]}`，stderr 含 `serialwrapd: shutdown incomplete: drain stalled: t:COM0`，`run_with_hooks` 回 1（不宣告 graceful success）；WAL 仍 sync＋close、lock 仍釋放（行程結束時 kernel 關閉殘留 fd） |
 | `shutdown_wal_sync_failure_exits_1` | WAL `sync` 失敗 → stderr `serialwrapd: shutdown incomplete: WAL sync failed: <py_message>`、回 1 |
-| `shutdown_releases_tty_before_exit` | 停機後立即以 `open(O_RDWR)` 開同一 PTY slave 成功（handle 已關、TIOCEXCL 解除） |
+| `shutdown_releases_tty_before_exit` | PTY master 由測試全程持有；停機後立即以 `open(O_RDWR)` 開同一 PTY slave 成功（handle 已關、TIOCEXCL 由 `CloseToken` 的 TIOCNXCL 解除——行程結束本身不會清除 master 仍開啟的 PTY 旗標，故此斷言能抓到漏做 TIOCNXCL，R0-F3） |
 | `wal_dir_readonly_at_start_blocks_login_probe`（Review Focus 3，非 root；root 下 skip 為證據不足） | `SERIALWRAP_WAL_DIR` 指向唯讀目錄 → daemon 啟動、`health.status.wal.healthy==false`、`unhealthy_reason=="dir_unwritable"`；shell profile 的登入 probe 不送（FakeTarget 收到 0 bytes）、session 停 `ATTACHED`＋`last_error:"PROMPT_UNAVAILABLE"`；`command.submit` 回 `SESSION_NOT_READY` 且仍 0 bytes |
 | `wal_fault_after_ready_splits_agent_and_auto_tx`（Review Focus 3） | 先 READY，再把 WAL 目錄改唯讀並刪除 `raw.wal.ndjson`（重建失敗）→ `health.status.wal.healthy==false`；`command.submit echo x` → FakeTarget 收到 `echo x\n`、`command.get` 終態 `done`；之後 `session self-test`（`SelfTestProbe`，自動 TX）的 probe bytes 未送出 |
 | `daemon_stop_during_force_recover_with_client_gone`（Review Focus 5） | 真 daemon：同連線 pipelining `session.recover --force`（DUT 不回 prompt）與 `daemon.stop`，client 送出後立即斷線 → recover handler 跑完（WAL 有其救援 TX）、WAL `close` 發生在 handler 結束之後（以 trace 順序斷言）、行程 exit 0 於 15 s 內 |
@@ -3852,9 +4083,16 @@ def test_external_open_blocked_then_release_attach_handoff(shell_daemon):
     assert e.value.errno == errno.EBUSY                                     # BC-04 TIOCEXCL
     rel = shell_daemon.sw("device", "release", "--selector", "COM0", "--source", "agent:t", "--reason", "flash")
     assert rel["ok"] is True and rel["session"]["state"] == "RELEASED"
-    fd = os.open(slave, os.O_RDWR | os.O_NOCTTY)                             # 外部工具接手
+    fd = os.open(slave, os.O_RDWR | os.O_NOCTTY)                             # 外部工具接手；FakeTarget 持有 master，daemon 關閉前漏 TIOCNXCL 時此處 EBUSY（R0-F3）
     held = shell_daemon.sw("device", "attach", "--selector", "COM0")
     assert held["error_code"] == "DEVICE_STILL_HELD" and os.getpid() in held["pids"] and held["holder_unknown"] is False
+    before = len(shell_daemon.targets["COM0"].written())
+    forced = shell_daemon.sw("device", "attach", "--selector", "COM0", "--force")   # §6.2：force 不得略過已識別外部 holder
+    assert forced["_rc"] == 2 and forced["error_code"] == "DEVICE_STILL_HELD"
+    assert forced["pids"] == [os.getpid()] and forced["holder_unknown"] is False
+    shell_daemon.wait_state("COM0", "RELEASED", timeout=1.0)              # 被拒後 released 保護不得被清除
+    time.sleep(1.0)
+    assert shell_daemon.targets["COM0"].written()[before:] == b"", "被拒的 force attach 不得對 UART 送出任何 byte"
     os.close(fd)
     ok = shell_daemon.sw("device", "attach", "--selector", "COM0")
     assert ok["ok"] is True
@@ -3941,12 +4179,13 @@ git commit -m "test(contract): Slice 2.1 黑箱案例並修正 Rust daemon 差�
 - Consumes：P2 runner 動作表與 `DaemonHarness`。
 - Produces（新增動作，與 P2 既有 12 個並列）：
   - `external_open`：`target: session_slave|by_id_link`、`hold: flock_tiocexcl|plain`、`save_as`；在協調器行程外以子行程開埠並持有（`flock_tiocexcl` 模擬遵守鎖的外部工具；`plain` 模擬不取鎖的工具），結果寫 `control.ndjson`（含子行程 pid）。
-  - `external_close`：`from`（`save_as` 名）；結束子行程並確認 fd 已關。
+  - `external_close`：`from`（`save_as` 名）；`hold=flock_tiocexcl` 時子行程先 `ioctl(TIOCNXCL)` 再 close（收到 SIGTERM 的 handler 內執行；SIGKILL 不得用於此動作），再結束子行程並確認 fd 已關——否則測試替身自己留下的 TIOCEXCL 會在 bridge 持有 PTY master 時讓後續 `device attach` 永遠 EBUSY（R0-F3）。
+  - `external_open` 回報 `{"opened":bool,"errno":int|null}`；release 後的 `external_open` 得 `opened:false, errno:16`（EBUSY）時情境判 FAIL（daemon 關閉前未解除獨占），不得轉為 `DEVICE_STILL_HELD` 或 SKIP。
   - `measure_rpc_latency`：`method`、`samples`、`save_as`；以直接 NDJSON socket 往返計時（不經 CLI），樣本寫入 `comparison.json.latency_samples_ms[<save_as>]`。
   - `measure_event_latency`：`event ∈ {release_request, command_cancel, lease_expiry, stop_request}`、`samples`、`save_as`；以 `contracts/resource_limits.yaml event_latency` 的 `accept_point`／`complete_point` 定義計時（daemon 端點以 `daemon status` 的 test-fakes 計時欄位或 WAL META 時戳取得，量測方法隨 `method_revision` 凍結）。
   - `wait_cli_until`：`argv`、`json_path`、`equals`、`timeout_s`；輪詢 CLI 直到條件成立（取代固定 sleep 的決定性同步）。
 
-- [ ] **Step 1：寫失敗測試**：`test_s21_actions.py`：動作表含上述 5 個名稱；`external_open hold=flock_tiocexcl` 後同一路徑 `open_exclusive` 等價探測（`fcntl.flock(LOCK_EX|LOCK_NB)`）失敗；`external_close` 後成功；`measure_rpc_latency samples=10` 對 Python 基線 daemon 產生 10 個正數樣本；`wait_cli_until` 逾時 → `StepError`；P2 `test_runner_actions_exist` 與 `test_fault_actions_not_in_uart_stream` 仍綠。
+- [ ] **Step 1：寫失敗測試**：`test_s21_actions.py`：動作表含上述 5 個名稱；`external_open hold=flock_tiocexcl` 後同一路徑 `open_exclusive` 等價探測（`fcntl.flock(LOCK_EX|LOCK_NB)`）失敗；`external_close` 後成功；`test_external_close_clears_tiocexcl_with_master_open`：測試持有 PTY master，`external_open hold=flock_tiocexcl` → 一般 `os.open(slave)` 得 `EBUSY`（非 root）→ `external_close` → 一般 `os.open(slave)` 成功（非 EBUSY）；`measure_rpc_latency samples=10` 對 Python 基線 daemon 產生 10 個正數樣本；`wait_cli_until` 逾時 → `StepError`；P2 `test_runner_actions_exist` 與 `test_fault_actions_not_in_uart_stream` 仍綠。
 - [ ] **Step 2：執行並確認 FAIL**：`python3 -m pytest -q func-test/tests/test_s21_actions.py` → `KeyError: 'external_open'`。
 - [ ] **Step 3：實作**：照 Interfaces；控制只經協調器，不寫入 UART byte stream（§15.3）。
 - [ ] **Step 4：執行並確認 PASS**：`python3 -m pytest -q func-test/tests`。
@@ -3987,7 +4226,7 @@ P2_21 = ["l15-delayed-reply", "l15-half-prompt", "l15-slow-reader-backpressure",
          "l15-multi-source-contention-cli", "l15-stale-event-delay", "l15-wal-interference", "l15-reject-zero-tx"]
 S21 = sorted(p.stem for p in (ROOT / "func-test/scenarios").glob("s21-*.yaml"))
 GATE = os.environ.get("SERIALWRAP_GATE") == "1"
-RECORD_ONLY = {"s21-exclusive-conflict-plain-open"}            # 待裁決行為：只記錄，不判 PASS／FAIL
+RECORD_ONLY: set[str] = set()   # s21-exclusive-conflict-plain-open 已依規格 §6.2 定案為拒絕（§0.2），改為正式判定
 
 def test_case_list_matches_freeze():
     lock = json.loads((ROOT / "tests/acceptance/cases.lock.json").read_text(encoding="utf-8"))
@@ -4023,9 +4262,9 @@ s21 情境（每檔一列；斷言由 runner 依 §15.6.3 判定，不使用固�
 | `s21-wire-equals-wal` | READY 後 20 次 `cli cmd submit "echo L15_<i>"`，每次 `wait_cli_until` 終態；`op_end` | `assert_compare`：每埠、每 endpoint_generation 的 `wal_tx_bytes == wire.serial_read`、`wire.serial_write == wal_rx_bytes`（不比 chunk 邊界、seq、時間） |
 | `s21-quiet-zero-tx` | `op_begin quiet` → `dut_control emit` U-Boot banner → `wait_wire_marker "Hit any key"`（serial_write）→ `cli cmd submit "echo X"`（預期 `AUTOBOOT_QUIET`）→ `op_end quiet` | `assert_zero_tx quiet`；CLI 回應含 `retry_after_s` |
 | `s21-partial-tx-abort` | `bridge_control pause_pump`（停止讀 PTY master，kernel buffer 填滿後 writer 阻塞）→ `cli cmd submit` 16000 bytes 的 `echo`（`save_as big`）→ `wait_cli_until cmd status big command.status == running` → `cli device release` → `bridge_control resume_pump` → `wait_cli_until device release 已回` → `op_end` | `assert_command_resolved big`：終態且 payload 在 wire 出現 ≤1 次（不重送）；BC-03 映射與實際觀測一致：wire `serial_read` 中該命令 bytes > 0 ⇒ `COMMAND_ABORTED_IN_FLIGHT`，= 0 ⇒ `FLUSHED_BY_RECOVERY`；兩種情形都要求 wire bytes 總量 == WAL 該 cmd_id 的 TX `len` 總和 < 16001。部分寫出的決定性路徑由 L1（Task 12／12b）覆蓋 |
-| `s21-release-attach-handoff` | `cli device release` → `external_open target=session_slave hold=flock_tiocexcl save_as ext` → `cli device attach`（預期 `DEVICE_STILL_HELD`）→ `external_close ext` → `cli device attach` → `wait_state READY` | release 回 ok 時 handle 已關（`external_open` 立即成功）；`DEVICE_STILL_HELD.holder_unknown==false`、`pids` 含 ext pid；交接期間 `assert_zero_tx` |
+| `s21-release-attach-handoff` | `cli device release` → `external_open target=session_slave hold=flock_tiocexcl save_as ext` → `cli device attach`（預期 `DEVICE_STILL_HELD`）→ `external_close ext` → `cli device attach` → `wait_state READY` | release 回 ok 時 handle 已關且獨占已解除（`external_open` 立即回 `opened:true`；`errno:16` EBUSY 判 FAIL，R0-F3）；`external_close` 後的 `cli device attach` 成功（測試替身也已 TIOCNXCL）；`DEVICE_STILL_HELD.holder_unknown==false`、`pids` 含 ext pid；交接期間 `assert_zero_tx` |
 | `s21-exclusive-conflict` | daemon 啟動前 `external_open hold=flock_tiocexcl` → 啟 daemon → `wait_cli_until session list` 該 session `state ∈ {DETACHED, ATTACHED}` → `cli device attach` | session 不進 READY；`last_error` 以 `ATTACH_FAILED:DeviceHeldError` 開頭；attach 回 `DEVICE_STILL_HELD`；`wire.serial_read` 為 0 byte |
-| `s21-exclusive-conflict-plain-open`（只記錄） | 同上但 `hold=plain` | 記錄 daemon 是否進 READY 與 wire bytes（基線預期：Python 會成功開埠並送 probe）；結果附在 gate 報告「待裁決」欄，見 §0.2 |
+| `s21-exclusive-conflict-plain-open`（規格 §6.2；BC-04、SC-05） | daemon 啟動前 `external_open target=session_slave hold=plain save_as ext`（普通 `open`，不 flock、不 TIOCEXCL，模擬 minicom）→ 啟 daemon → `wait_cli_until session list` 該 session `state == DETACHED` → `op_begin attach-plain` → `cli device attach`（預期 `DEVICE_STILL_HELD`）→ `cli device attach --force`（預期 `DEVICE_STILL_HELD`）→ `op_end attach-plain` → `external_close ext` → `cli device attach` → `wait_state READY` | session 在 `external_close` 前從未進 `ATTACHING`／`READY`；`last_error == "ATTACH_FAILED:DeviceHeldError"`；兩次 attach（含 `--force`）回應皆為 `{"ok":false,"error_code":"DEVICE_STILL_HELD","pids":[<ext pid>],"holder_unknown":false,"selector":"COM0"}`；`external_close` 前 `wire.serial_read` 為 0 byte（`assert_zero_tx attach-plain` 且全段無 probe／登入 TX）；外部關閉後 attach ok 並 READY。Python（P1 T10 鎖後重掃）與 Rust 皆須 PASS |
 | `s21-credentials-unresolved` | DUT plan 只回 `login: `；profile 宣告 `user_env`／`pass_env` 但未提供 → `wait_state ATTACHED` | `last_error=="CREDENTIALS_UNRESOLVED"`；整段 `wire.serial_read` 為 0 byte |
 | `s21-wal-unlink-under-traffic` | 背景每 100 ms 一筆命令（`parallel`）→ `wal_control unlink_current` → 再 10 筆 | `assert_wal_meta contains_value WAL_RECREATED_AFTER_EXTERNAL_UNLINK, loss_flag true, has_keys [potentially_lost_seq_range, range_known]`；之後每筆命令 `assert_wal_marker TX`（CRC／len 正確，F12 修訂 oracle） |
 | `s21-reboot-minimal-guard`（§11.6 最小 reboot 防護） | READY → `cli cmd submit "reboot"` → `dut_control logical_reboot banner_delay_ms:500` → `op_begin quiet` → 期間 `cli cmd submit "echo DURING"`（預期 `AUTOBOOT_QUIET`／`READY_UNCONFIRMED`）→ `op_end quiet` → DUT 回 prompt → `wait_state READY`（重新登入）→ `cli cmd submit "echo AFTER"` | `assert_zero_tx quiet`；`echo DURING` 在 wire 出現 0 次；`reboot` 命令終態 `recovery_action:"EXPECT_REBOOT"` 或 `done`；`echo AFTER` done；wire `dut_generation` 2 |
@@ -4034,7 +4273,7 @@ s21 情境（每檔一列；斷言由 runner 依 §15.6.3 判定，不使用固�
 - [ ] **Step 2：執行並確認 FAIL**
 
 Run：`SERIALWRAP_L15_PY_DAEMON=$PWD/tests/contract_blackbox/bin/py-serialwrapd SERIALWRAP_L15_RUST_DAEMON=$PWD/target/x86_64-unknown-linux-gnu/release/serialwrapd SERIALWRAP_L15_SELFTEST_REPORT=$HOME/b-log/rust-refactor/p2/selftest-linux/selftest-report.json python3 -m pytest -q tests/acceptance/l15/test_slice21_l15.py`
-Expected：`python` 參數全部 PASS（`s21-exclusive-conflict-plain-open` 只記錄）；`rust` 參數若在 Task 19 前執行則 FAIL（daemon exit 101），Task 19 後才進入差異修正。
+Expected：`python` 參數全部 PASS（含 `s21-exclusive-conflict-plain-open`；若 Python 基線在此 FAIL，表示 P1 T10 鎖後重掃未落地，回報 P1 owner）；`rust` 參數若在 Task 19 前執行則 FAIL（daemon exit 101），Task 19 後才進入差異修正。
 
 - [ ] **Step 3：實作**
 
@@ -4045,7 +4284,7 @@ Expected：`python` 參數全部 PASS（`s21-exclusive-conflict-plain-open` 只�
 - [ ] **Step 4：執行並確認 PASS**
 
 Run：Step 2 命令，另以 `SERIALWRAP_GATE=1` 再跑一次
-Expected：37 項全部 PASS（`test_case` 36 個參數組合＝(8＋10) 情境 × 2 label，加 `test_case_list_matches_freeze`），`s21-exclusive-conflict-plain-open` 兩輪皆有完整證據；`SERIALWRAP_GATE=1` 下無 skip；`target/l15/slice21/<run_id>/` 兩輪證據齊全。
+Expected：37 項全部 PASS（`test_case` 36 個參數組合＝(8＋10) 情境 × 2 label，加 `test_case_list_matches_freeze`），`s21-exclusive-conflict-plain-open` 兩個 label 皆 PASS；`SERIALWRAP_GATE=1` 下無 skip；`target/l15/slice21/<run_id>/` 兩輪證據齊全。
 
 - [ ] **Step 5：Commit**
 
@@ -4082,7 +4321,7 @@ git commit -m "test(l15): Slice 2.1 bridge 回歸、安全情境與事件延遲�
                "status": "PASS|FAIL|EVIDENCE_MISSING", "command": "str", "exit": 0, "passed": 0, "failed": 0, "skipped": 0, "deselected": 0,
                "ignored": 0, "expected_min_passed": 0, "allowed_missing_bo": "BO-S21-NN|null", "log": "relpath"}],
  "case_uptake": {"denominator": 0, "valid_pass": 0, "rate": 0.0, "window_start": "YYYY-MM-DD", "pass_case_ids": ["str"]},
- "pending_decisions": [{"id": "str", "scenario": "s21-exclusive-conflict-plain-open", "evidence": "relpath"}],
+ "pending_decisions": [{"id": "str", "scenario": "str", "evidence": "relpath"}],
  "blocked_owner": [{"id": "BO-S21-NN", "item": "str", "case_ids": ["str"], "status": "BLOCKED-OWNER", "procedure": "docs/rust-refactor/slice21-owner-runbook.md#bo-s21-nn", "evidence": "relpath|null"}],
  "verdict": "READY_FOR_OWNER_EVIDENCE|INCOMPLETE|FAIL"}
 ```
@@ -4180,7 +4419,7 @@ Expected：FAIL，`FileNotFoundError: .../tests/acceptance/slice21_gate_report.s
 7. `python3 -m pytest -q tests/contract_blackbox/slice21 -m cap_posix_pty --junitxml=…`（Python）與 Rust 版（Task 20 Step 2 命令），從 junit 取 `passed/failed/skipped`
 8. Task 20 既有套件：兩條 pytest 命令＋三次單 case 的 `func-test/runner.py --case <id>`（逐一核對三個 case 報告）
 9. Task 21 L1.5 命令（`SERIALWRAP_GATE=1`），並把 `event_latency` 三輪結果寫成獨立 section
-9b. 計算 `case_uptake`（Task 0b `slice_breaker.acceptance_rate`），並把 `s21-exclusive-conflict-plain-open` 證據列入 `pending_decisions`
+9b. 計算 `case_uptake`（Task 0b `slice_breaker.acceptance_rate`）；`s21-exclusive-conflict-plain-open` 已定案（§0.2），計入 `l15_ab` section 判定，**不**列入 `pending_decisions`
 9c. 收集 `identity`（CLI／daemon 路徑與 sha256、`daemon status` 的 implementation／version、`contracts/` revision、`cases.lock.json` 與凍結檔 sha256、bridge `tree_sha256`、runner sha256、`uname`、device）
 10. `pwsh.exe -File scripts/rust/win-blackbox.ps1 -Suite slice21-nocom -Daemon <win serialwrapd.exe>`
 11. `python3 -m pytest -q tests/`
@@ -4227,7 +4466,7 @@ git commit -m "chore(rust): Slice 2.1 出口 gate 腳本、報告 schema 與擁�
 
 ## PR 與出口
 
-- PR：`wt/rust-refactor/slice21-daemon-core` → `feature/rust-refactor`；標題 `feat(rust): Slice 2.1 Rust daemon core`；body 依 `.github/pull_request_template.md` 填 Policy Checklist，並附 `report.json` 的 section 摘要、`identity`、`case_uptake`、`pending_decisions` 與 BLOCKED-OWNER 清單；不引用 issue 時上 `policy-exempt:issue-link`；Rust daemon 尚非部署 artifact，README／docs 不改對外操作說明，上 `policy-exempt:docs-sync`（附理由）。PR 描述另列：§10.4 測試資產變更清單（Task 15a、Task 20 Step 0、Task 21a）與各自的獨立審閱者；DF 候選（§0.2「自動 attach 前的普通外部 holder 拒絕」、Task 19 停機未收斂 exit 1）。
+- PR：`wt/rust-refactor/slice21-daemon-core` → `feature/rust-refactor`；標題 `feat(rust): Slice 2.1 Rust daemon core`；body 依 `.github/pull_request_template.md` 填 Policy Checklist，並附 `report.json` 的 section 摘要、`identity`、`case_uptake`、`pending_decisions` 與 BLOCKED-OWNER 清單；不引用 issue 時上 `policy-exempt:issue-link`；Rust daemon 尚非部署 artifact，README／docs 不改對外操作說明，上 `policy-exempt:docs-sync`（附理由）。PR 描述另列：§10.4 測試資產變更清單（Task 15a、Task 20 Step 0、Task 21a）與各自的獨立審閱者；DF 候選（Task 19 停機未收斂 exit 1）；§0.2「普通外部 holder（未取 flock）的拒絕」已依規格 §6.2 定案，不再列 DF 候選。
 - **合併阻擋（OD-08）**：本 PR 動到 PAL（serial、lock、device source、WalFs、RPC listener），依 OD-08「動到 PAL 的 PR 必須取得原生 Windows COM handle 證據；記憶體 fake 不得充數」，PR 保持 draft／不得合併，直到 BO-S21-01 證據回填並經審查，或擁有者在 PR 上留下明確書面豁免（比照 04 計畫 Task 9）。
 - 回歸 case 政策（#155）：本 Phase 非 bug 修復；實機案例由 BO-S21-07／08 以既有 TestPilot case 承接，PR 描述註明「未新增 regression case：F1／F2／F3／F4／F12 既有 18 個 case（17 個屬 `slice_2.1` 分母、`f4-interactive-line-cmd-defined` 為提前證據）由擁有者以 Rust daemon 執行」。
 - Slice 2.1 出口（§11.6）需同時具備：本環境 gate `READY_FOR_OWNER_EVIDENCE`（不得為 `INCOMPLETE`）＋BO-S21-01～16 證據回填並經審查＋`pending_decisions` 經擁有者裁決＋Task 23 校準報告。未回填前不得宣告 Slice 2.1 出口通過。

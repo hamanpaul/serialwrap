@@ -420,13 +420,22 @@ pub struct SerialConfig { pub baud: u32, pub data_bits: u8, pub parity: Parity, 
                           pub flow: FlowControl, pub xonxoff: bool /* POSIX backend 忽略（UIO-12.1-e） */ }
 pub trait SerialBackend: Send + Sync {
     /// 以獨占方式開啟並完成設定。
-    /// POSIX：open(O_RDWR|O_NOCTTY|O_NONBLOCK|O_CLOEXEC) → flock(LOCK_EX|LOCK_NB) → ioctl(TIOCEXCL) → termios（06 §10.2 的位元設定）
+    /// POSIX：open(O_RDWR|O_NOCTTY|O_NONBLOCK|O_CLOEXEC) → flock(LOCK_EX|LOCK_NB) → ioctl(TIOCEXCL)
+    ///        → **鎖後 holder 重掃**（規格 §6.2「拒絕已識別的外部衝突」；P1 T10「非合作式外部 holder」凍結規則）：
+    ///          TIOCEXCL 不撤銷既有 handle，外部程式（如 minicom）先以普通 open 開埠、不取 flock 時前三步都會成功，
+    ///          因此 `probe_holders(path)`（排除自身 pid）`pids` 非空 → ioctl(TIOCNXCL) → close(fd)、回 `Held{pids, holder_unknown:false}`；
+    ///          `pids` 為空且 status∈{Unknown, Permission} → 照常開啟並 WARNING（不得當安全證明，`foreign_holders` 標 holder_unknown）
+    ///        → termios（06 §10.2 的位元設定）。重掃在 termios 與任何 RX／TX 之前，故被拒時 UART 零 TX、外部工具的 termios 不被改寫。
+    ///        此檢查在 backend 內，所有呼叫者（初次／熱插自動 attach、PROBE、`device.attach`，含 `force:true`）都無法略過。
+    ///        **TIOCEXCL 成功後的任何失敗返回**（鎖後重掃拒絕、termios、eventfd 建立失敗）一律先 ioctl(TIOCNXCL) 再 close(fd)
+    ///        （`ExclGuard`）：TIOCEXCL 是 tty 物件旗標，不隨 fd 關閉清除，只在 tty 物件釋放（最後一個 handle 關閉且對端不存在）時重置；
+    ///        PTY master 仍開啟（測試 harness、bridge 受測端）或外部 holder 仍持有時，殘留旗標會讓之後的一般 open 一律 EBUSY（R0-F3 實測）。
     /// Windows：CreateFileW(\\.\COMn, GENERIC_READ|GENERIC_WRITE, dwShareMode=0, OPEN_EXISTING, FILE_FLAG_OVERLAPPED)
     ///          → SetCommState／SetCommTimeouts（ReadIntervalTimeout=MAXDWORD 等，write constant 5000ms）
     fn open_exclusive(&self, dev: &DevicePath, cfg: &SerialConfig) -> Result<Box<dyn SerialHandle>, OpenError>;
 }
 pub enum OpenError {
-    Held(HolderReport),                                   // POSIX EWOULDBLOCK(flock) 或 open EBUSY(TIOCEXCL)
+    Held(HolderReport),                                   // POSIX EWOULDBLOCK(flock)、open EBUSY(TIOCEXCL)，或鎖後重掃識別到外部 holder
     AccessDenied { os: PalError, holder: HolderReport },  // Windows ERROR_ACCESS_DENIED：不推斷 holder，holder_unknown=true
     NotFound(PalError),
     Other(PalError),
@@ -448,18 +457,37 @@ pub trait SerialReader: Send {
 }
 pub enum TxOutcome { NotSubmitted, Completed(usize), Unknown }
 pub struct TxResult { pub outcome: TxOutcome, pub error: Option<PalError> } // Completed(n<len)+error 表示部分完成後失敗
+/// OS 提交的序列化點（規格 §5.2.2，R0-F1）。PAL 每次要把 bytes 交給 OS 前都必須經過 gate：
+/// POSIX 一次非阻塞 `write(2)`（fd 為 O_NONBLOCK，立即返回 n 或 EAGAIN）；Windows 一次 overlapped `WriteFile` 發出（立即返回
+/// 完成或 ERROR_IO_PENDING）。`submit` 的實作（sw-core `FenceSubmitGate`）在 Fence 鎖內重驗 permit，通過才呼叫 `os_submit`，
+/// 並在同一臨界區登記 `in_flight` 後放鎖；被拒時**不呼叫** `os_submit`。`os_submit` 只做提交、不得等待完成；
+/// POLLOUT／GetOverlappedResult 等完成等待一律在 gate 之外進行，因此鎖只跨「非阻塞提交」，不跨完成等待。
+pub trait SubmitGate { fn submit(&self, os_submit: &mut dyn FnMut() -> SubmitStep) -> Result<SubmitStep, SubmitRevoked>; }
+pub enum SubmitStep { Accepted(usize) /* POSIX write(2)=n>0 或 Windows 同步完成 */, Pending /* Windows ERROR_IO_PENDING：已交 OS */,
+                      WouldBlock /* EAGAIN：未交 OS */, Failed(PalError) /* 0 byte 交 OS */ }
+pub struct SubmitRevoked;                       // 原因由 gate 實作自行保存（PAL 不依賴 sw-core 的 FenceReject）
+pub struct AlwaysOpen;                          // impl SubmitGate：直接呼叫 os_submit；只供 PAL conformance 與 PAL 單元測試
 pub trait SerialWriter: Send {
-    /// 寫一段 payload，直到完成、取消或失敗。POSIX：poll(POLLOUT, wake) 迴圈，EAGAIN 不再無限 sleep 重試；
-    /// Windows：overlapped WriteFile；cancel 時 CancelIoEx 後 GetOverlappedResult(bWait=TRUE)，n=已傳 bytes。
-    /// 回傳值必須能區分「從未呼叫 OS write」「OS 確認 n bytes」「結果不明」（BC-03、§5.1.4）。
-    fn write(&mut self, data: &[u8], cancel: &CancelToken) -> TxResult;
+    /// 寫一段 payload，直到完成、取消、失敗或被 gate 撤銷。POSIX：每次 write(2) 都經 `gate.submit`，EAGAIN 時於 gate 外
+    /// poll(POLLOUT, wake) 後再經 gate 提交下一段（每段重驗，不再無限 sleep 重試）；Windows：overlapped WriteFile 經 `gate.submit`
+    /// 發出，於 gate 外等 [ov.hEvent, wake]；cancel 時 CancelIoEx 後 GetOverlappedResult(bWait=TRUE)，n=已傳 bytes。
+    /// 回傳值必須能區分「從未提交 OS」「OS 確認 n bytes」「結果不明」（BC-03、§5.1.4）。gate 撤銷：尚未提交任何 bytes →
+    /// `NotSubmitted`；已確認 k≥1 bytes 後撤銷 → `Completed(k)`＋`PalError::cancelled()`，未提交的尾段不得再交 OS。
+    fn write_gated(&mut self, data: &[u8], cancel: &CancelToken, gate: &dyn SubmitGate) -> TxResult;
+    /// = `write_gated(data, cancel, &AlwaysOpen)`。sw-core 禁止呼叫（`tx_writer.rs` 以外亦不得持有 SerialWriter）。
+    fn write(&mut self, data: &[u8], cancel: &CancelToken) -> TxResult { self.write_gated(data, cancel, &AlwaysOpen) }
 }
 pub trait IoWaker: Send + Sync { fn wake(&self); }   // eventfd/self-pipe 寫入 ｜ SetEvent
 #[derive(Clone)] pub struct CancelToken { /* Arc<AtomicBool> + Arc<dyn IoWaker> */ }
 pub struct CloseToken;
 impl CloseToken { pub fn close(self, r: Box<dyn SerialReader>, w: Box<dyn SerialWriter>) -> CloseReceipt; }
 // close 只能在 reader 與 writer 都交回後呼叫；型別保證 handle 不會被雙重關閉，也不會在 I/O 未收斂時關閉
-pub struct CloseReceipt { pub closed: bool, pub error: Option<PalError> }
+// POSIX 關閉序（I/O 收斂後、關閉有效 tty fd 前解除獨占；R0-F3）：ioctl(TIOCNXCL) → flock(LOCK_UN) → close(fd) → close(wake_r／wake_w)。
+//   TIOCNXCL 失敗：errno ∈ {EIO, ENXIO, ENODEV}（tty 已 hangup／裝置已拔除，tty 物件隨最後一個 handle 釋放、旗標一併消失）→ excl_cleared=true、不記錯；
+//   其他 errno → 仍照序 close（不得因此保留 fd），excl_cleared=false、error=Some(該 errno)，daemon stderr WARNING
+//   `serialwrapd: TIOCNXCL failed on <dev>: <py_message>`；之後同一裝置的 open 可能得 `Held{pids:[], holder_unknown:true}`，不得被當成成功交接的證據。
+// Windows／fake：CloseHandle 即解除共用限制，excl_cleared 恆等於 closed。
+pub struct CloseReceipt { pub closed: bool, pub excl_cleared: bool, pub error: Option<PalError> }
 
 pub trait UartExclusive: Send + Sync {
     /// 只供診斷，不是鎖。POSIX 掃 /proc/*/fd（排除自身 pid；readlink 比對 realpath／原路徑，或比對 st_rdev）；
@@ -663,7 +691,7 @@ pub trait SignalWait: Send + Sync {
 - **`SessionActor`**（`actor.rs`）：執行 `SessionCore` 的 thread `serialwrap-session-<COM>`。以 `select_biased!` 從 mailbox 收事件，執行 `Effects`（送 TxJob、啟停 worker、排 timer、回覆 RPC、寫 WAL META、要求 StateStore 持久化）。`Effects` 的執行不得阻塞；需要等待的工作一律交給下列 thread。
 - **`IoWorker`**（`uart_bridge.rs`）：每個 `conn_epoch` 一組，包含：
   - **Reader thread**：read → `WalWriter::append(RX)` → 推送到 ConsoleHub → `UartRxChunk` 送進 data lane。
-  - **TxWriter thread**（`tx_writer.rs`）：唯一呼叫 `SerialWriter::write` 的地方。
+  - **TxWriter thread**（`tx_writer.rs`）：唯一呼叫 `SerialWriter::write_gated` 的地方（一律帶 `FenceSubmitGate`，§5.4）。
 - **`OpRunner`**：執行前景長操作的 thread，包括 command execute、file transfer、self-test probe、recover 送按鍵與等待、login FSM、force recover 輪詢。一個 session 同時只有一個前景槽（`ForegroundSlot`），對應 Python 的 `_ForegroundOperation`。OpRunner 送 TX 只能向 actor 取得 `TxPermit`，再交給 TxWriter；等待 RX 使用共享的 `RxWindow`（`Arc<Mutex<RxWindow>> + Condvar`，語意照 06 §4.2 的絕對偏移與 `_rx_trimmed`）。
 - **`ConsoleHub`**（`human_console.rs`、`telnet_console.rs`）：每 session 一個 thread，處理 PTY master／TCP socket 的入出向；每個 console 有自己的出向 ring（§5.10）。
 
@@ -712,9 +740,12 @@ pub struct Fence(Mutex<FenceState>);
 
 1. **Admission**：RPC handler 送 `CmdSubmit` 給 actor，`SessionCore` 依 §5.3 表與 SC-01／02／03 檢查狀態、gate、容量（`SC-06`），再加 `_resolve_session_id` 的 Python 順序。
 2. **出列**：actor 把命令交給 OpRunner 前重驗 epoch、owner、quiet／reconfirm、release／recovery、cancel。
-3. **OS 寫入前**：TxWriter 取 `Fence` 鎖，驗證 `permit.epoch == active_epoch`、`!frozen`、class 對應的 gate 規則、`permit.owner_gen` 規則、`op_id ∉ cancelled`。通過後設 `in_flight = Some(op_id, len)`、放鎖、呼叫 OS write。完成後取鎖清 `in_flight`，並把 `TxResult` 交給 WalWriter（只記錄確認的 bytes，`SC-07`），最後送出 `UartTxCompleted`。
+3. **OS 提交時（授權與提交同一臨界區，R0-F1）**：TxWriter 出列時先以 `Fence::admit` 做一次快速拒絕（被拒者不呼叫 PAL；通過**不算**授權）。真正的授權發生在 PAL 每次 OS 提交的 `SubmitGate::submit`（§4.2）內：`FenceSubmitGate { fence, permit }` 取 `Fence` 鎖 → 重跑 `Fence::admit`（`permit.epoch == active_epoch`、`!frozen`、class 對應的 gate 規則、世代規則（`owner_gen`／`fsm_gen`／`input_epoch`）、`op_id ∉ cancelled`）→ 通過才在**仍持鎖**時呼叫非阻塞的 `os_submit`（POSIX 一次 `write(2)`；Windows 發出 overlapped `WriteFile`）→ 提交有交出 bytes（`Accepted(n>0)`／`Pending`）時於同一臨界區設 `in_flight = Some(op_id, len)` → 放鎖。完成等待（POLLOUT、`GetOverlappedResult`）一律在鎖外。POSIX 部分寫入後的下一段再經 gate 重驗；撤銷後的尾段不交 OS（結果 `Completed(k)`＋`cancelled`，k=0 時 `NotSubmitted`，原因寫入 `TxReport.reject`）。寫入結束後取鎖清 `in_flight`，並把 `TxResult` 交給 WalWriter（只記錄確認的 bytes，`SC-07`），最後送出 `UartTxCompleted`。**禁止**「鎖內驗證、放鎖、再呼叫 OS write」的寫法：兩者之間的 Quiet／換手／drain 會讓失效世代的 bytes 被寫出（規格 §5.2.2「讀一次旗標，過一段時間再 write」）。
 
-   actor 的任何失效操作（drain、release、quiet arm、lease close、flash freeze）都在**同一把鎖**內修改 `FenceState`，形成可測試的線性化邊界：失效之前已標 in-flight 的寫入算「已提交」，結果照實記錄；失效之後的寫入一律 `NotSubmitted`。
+   actor 的任何失效操作（drain、release、quiet arm、lease close／expiry、soft preempt、flash freeze、`input_epoch++`）都在**同一把鎖**內修改 `FenceState`，因此與 OS 提交互斥，形成可測試的線性化邊界：
+   - 失效先取得鎖 → 之後每一次 `gate.submit` 都看到新狀態，尚未提交的 bytes 一律不交 OS（zero-TX 只對這類操作斷言，規格 §5.2.2 末段）。
+   - 提交先取得鎖 → 失效呼叫阻塞到該次**非阻塞**提交返回（微秒級；不等完成），該段 bytes 已交 OS，記為在途（`in_flight`）並照實記錄，不宣稱可撤回。
+   - 鎖不跨完成等待：寫入卡在完成等待（D-state、RTS/CTS 卡住）時，失效操作不被阻塞，Phase 1 仍可立即進行並以 `CancelToken` 收斂（§5.5）。
 
 TxClass 與 gate 規則（規格 §5.2.1）：
 
@@ -723,6 +754,7 @@ TxClass 與 gate 規則（規格 §5.2.1）：
 | `Command`／`FileTransfer` | `quiet_active`、`reconfirm_pending`；source 以 `human:` 開頭時另見 `DF-02` |
 | `LoginProbe`／`ReadyReconfirm`／`SystemRecoverKey`／`SelfTestProbe` | quiet、`wal_unhealthy`（停止自動 TX，規格 §5.4） |
 | `HumanRaw` | `owner_gen` 不符時改走 deferred |
+| `LeaseOwner`／`InteractiveOpenCmd` | 不受 quiet 阻擋；`permit.owner_gen != owner_gen`（lease close／expiry／soft preempt／換手後的舊 lease 世代）→ `OwnerMismatch`。此世代檢查在每次 `gate.submit` 臨界區內重跑（R0-F1） |
 | `Flash` | 只在 `FlashMode::Flashing` 時放行 |
 | `FlashProbe` | 只在對應的 `Probe(probe_id)` 時放行 |
 | 其他所有 class | `flash_mode != Off` |
@@ -750,7 +782,7 @@ TxWriter 的 job queue 容量 64；滿時 OpRunner 阻塞等待（只有 OpRunne
 1. reader 回傳 `Woken`；Windows 先 CancelIoEx，再 GetOverlappedResult，已讀到的 bytes 照常落 WAL。
 2. writer 完成在途寫入，取得 `TxResult`。
 3. WalWriter 記錄所有可確認的 TX；記錄失敗的部分收集到 `unrecorded`。
-4. `CloseToken::close` → `CloseReceipt`。
+4. `CloseToken::close` → `CloseReceipt`（POSIX 先 `TIOCNXCL` 解除獨占再關 fd，見 §4.2；否則 PTY master 仍開啟時 PROBE→正式 bridge 重開、release 後外部工具開啟都會 EBUSY）。
 5. 送出 `WorkerStoppedReceipt { epoch, stop_id, tx_outcomes: Vec<(OpId, TxResult)>, unrecorded: Vec<EvidenceGap>, wal_error: Option<PalError>, handle_closed: bool }`。
 
 規則：
@@ -823,9 +855,9 @@ TxWriter 的 job queue 容量 64；滿時 OpRunner 阻塞等待（只有 OpRunne
 - **重啟**：以最後有效的 `state.json` 為準。動態 session 的 released 項目在 init 時保留（`DF-04`）。`_mark_missing_devices` 不得把 RELEASED 降成 DETACHED（`DF-04`）。
 - **attach**（`SC-05`）：
   1. 確認沒有 drain 在進行。
-  2. 非 force 時做 holder 預檢：`pids` 非空 → `DEVICE_STILL_HELD{pids, holder_unknown:false}`。
+  2. 非 force 時做 holder 預檢：`pids` 非空 → `DEVICE_STILL_HELD{pids, holder_unknown:false}`。`force` 只略過這個**開檔前**快照，**不得**略過已識別的外部 holder（規格 §6.2、BC-04）：步驟 3 的 `open_exclusive` 鎖後重掃（§4.2）對 force 一樣執行。
   3. **同步** `open_exclusive`：
-     - `Held` 或 `AccessDenied` → `DEVICE_STILL_HELD{pids, holder_unknown}`；
+     - `Held`（含鎖後重掃識別到的外部 holder，例如未取 flock 的 minicom）或 `AccessDenied` → `DEVICE_STILL_HELD{pids, holder_unknown}`，session 維持 `RELEASED`、不啟動 I/O、UART 零 TX；
      - `NotFound` → `DEVICE_NOT_PRESENT`；
      - 其他錯誤 → 照 Python 非同步失敗的結果（session `DETACHED`、`last_error="ATTACH_FAILED:<kind>"`），RPC 回 ok。
   4. 成功時：清除 released、`StateStore::commit`、state `ATTACHING`、回 ok，login 流程非同步進行。
@@ -1109,7 +1141,7 @@ connect 與 benches 是否一併納入 Windows 支援，為 `SC-27`（owner 確�
 
 - 各 crate 的 `#[cfg(test)]` 單元測試與 `tests/` 整合測試。
   - `SessionCore` 以事件序列配合 FakeClock 覆蓋 §5.3 狀態表全部列、BC-02、BC-03、drain、quiet。
-  - TxWriter 以 FakeSerial（可注入部分寫入、Unknown、阻塞、取消失敗）覆蓋 fence 線性化。
+  - TxWriter 以 FakeSerial（可注入部分寫入、Unknown、阻塞、取消失敗，以及「授權後、OS 提交前暫停」`PauseBeforeSubmit`、「提交臨界區內暫停」`PauseInsideSubmit`、「部分提交後 EAGAIN 暫停」`AcceptThenWouldBlock`）覆蓋 fence 線性化：在授權通過後、OS 提交前觸發 Quiet／drain／lease 換手（`owner_gen++`）必須零 TX（`os_submits()==0`、`take_tx()` 為空、無 TX WAL）；提交臨界區內的失效呼叫必須阻塞到提交返回；每次 OS 提交時 Fence 鎖必為持有狀態（06 Task 9 `authorized_then_*_before_os_submit_is_zero_tx`、`os_submit_always_inside_fence_critical_section`）。
   - WalWriter 以 FakeWalFs（可注入 unlink、replace、寫入失敗、rename 失敗）覆蓋。
 - PAL conformance suite：`sw_pal::conformance::{serial_suite, wal_fs_suite, lock_suite, rpc_suite, console_suite}`。同一套斷言分別跑在 fakes、POSIX PTY、Windows COM pair 上。在 fakes 上通過**不得**計為原生 gate。
 - 資源標記：需要特定資源的測試命名為 `cap_<resource>__<name>` 並加 `#[ignore = "cap:<resource>"]`。resource 取值：`posix_pty`、`windows_com`、`physical_uart`、`supervisor_runtime`、`interactive_desktop`、`process_rpc`。執行時 runner 以 `-- --ignored cap_<resource>__` 選取，被略過的會顯示為 ignored，**不會**算成 pass。`memory_only` 測試不加 ignore。
@@ -1222,7 +1254,7 @@ A/B 程序照規格 §15.9：先停 A 並確認資源釋放，才啟動 B；兩�
 | Linux | `${XDG_DATA_HOME:-~/.local/share}/serialwrap/versions/<v>/` | `~/.local/bin/serialwrap`、`~/.local/bin/serialwrapd` 為 symlink，指向 `versions/<v>/bin/*` |
 | Windows | `%LOCALAPPDATA%\Programs\serialwrap\versions\<v>\` | `bin\serialwrap.exe`、`bin\serialwrapd.exe` 為**複本**，另有 `bin\current-release.json` 記錄 `{"bundle_version","dir"}`；不依賴 symlink 權限 |
 
-切換流程：先把新複本寫成 `*.new`，再把舊檔 rename 成 `*.old.<ts>`（執行中的 exe 允許 rename），最後把 `*.new` rename 成正式名稱。至少保留 Current 與 Previous。rollback 流程依規格 §12.1 七步驟（`SC-23`）。
+切換流程：先把新複本寫成 `*.new`，再把舊檔 rename 成 `*.old.<ts>`（執行中的 exe 允許 rename），最後把 `*.new` rename 成正式名稱。至少保留 Current 與 Previous。rollback 流程依規格 §12.1 七步驟（`SC-23`）。第 2 步的交接安全檢查（Flash、FileTransfer、活躍寫入與其他不可安全中止操作）沒有覆寫：update／rollback 帶 `--force` 時仍拒絕，且不停止監管、不送 `daemon.stop`，因為停止 daemon 會中止傳輸或 flash pump，而 DUT 上已發生的部分燒寫無法撤銷。
 
 ### 10.3 版本配對 gate
 

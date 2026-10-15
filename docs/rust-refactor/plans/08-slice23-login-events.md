@@ -1011,7 +1011,7 @@ use sw_core::tx_writer::*;
 fn job_queued_before_arm_is_not_submitted_after_arm() {
     let h = TxRig::new();                                      // FakeSerial writer 先阻塞在第 1 個 job
     let g = h.fence_bump_fsm_gen();                            // 模擬 StartLogin
-    let r1 = h.submit(TxClass::LoginProbe, Some(g), b"\n");    // 進 OS、卡住（in-flight）
+    let r1 = h.submit(TxClass::LoginProbe, Some(g), b"\n");    // 已經 FenceSubmitGate 提交 OS、於 gate 外卡住等完成（in-flight）
     let r2 = h.submit(TxClass::LoginProbe, Some(g), b"root\n");// 排在 queue
     h.wait_in_flight();
     h.fence_arm_quiet(/*blocks_probe*/ true);                  // 同鎖：quiet_active、auto_probe_blocked、fsm_gen+1
@@ -1021,6 +1021,21 @@ fn job_queued_before_arm_is_not_submitted_after_arm() {
     assert_eq!((rep2.result.outcome, rep2.reject), (TxOutcome::NotSubmitted, Some(FenceReject::StaleFsmGen)));
     assert_eq!(h.wal_tx_payloads(), vec![b"\n".to_vec()]);
     assert_eq!(h.dev.written(), b"\n");
+}
+
+#[test]
+fn login_probe_authorized_then_quiet_arm_before_os_submit_is_zero_tx() {   // R0-F1：出列檢查通過後、OS 提交前 arm
+    let h = TxRig::new(); let g = h.fence_bump_fsm_gen();
+    h.dev.script_write(vec![sw_pal::fakes::serial::FakeWriteStep::PauseBeforeSubmit]);
+    let r1 = h.submit(TxClass::LoginProbe, Some(g), b"root\n");
+    assert!(h.dev.wait_paused(std::time::Duration::from_secs(2)));       // 尚未進 FenceSubmitGate 臨界區
+    h.fence_arm_quiet(/*blocks_probe*/ true);                             // 不得阻塞（writer 不持鎖）
+    h.dev.release_pause();
+    let rep = r1.recv();
+    assert_eq!((rep.result.outcome, rep.reject), (TxOutcome::NotSubmitted, Some(FenceReject::StaleFsmGen)));
+    assert_eq!(h.dev.os_submits(), 0);
+    assert!(h.dev.written().is_empty(), "帳號不得在 quiet arm 後送出");
+    assert!(h.wal_tx_payloads().is_empty());
 }
 
 #[test]

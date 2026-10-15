@@ -38,7 +38,7 @@
 | SC-02 | `FLASHING` 狀態下的 CmdSubmit 與 InteractiveOpen 回 `FLASHING_BUSY`（現況為 `SESSION_NOT_READY`） | §5.3 | 雙邊 |
 | SC-03 | execute-time 與 file.* 經 manager gate 回 `AUTOBOOT_QUIET` 時也附 `retry_after_s` | §5.3 | 雙邊 |
 | SC-04 | Drain 可觀測面：斷線、I/O error、release、clear、bind 的 detach 期間轉為 `RECOVERING`。release 必須等 handle 關閉回條後才回成功；超過 3000 ms 時設 `drain_stalled:true` 與 `drain_timeout_epoch`（取 `bridge_generation`），release 回 `SESSION_RECOVERING`。SessionPublic 新增 `drain_stalled`、`drain_timeout_epoch` 兩欄，位置在 `capture` 之後 | §5.2、§5.3、§9.4 | 雙邊 |
-| SC-05 | `device.attach` 同步重新取得獨占：失敗回 `DEVICE_STILL_HELD{pids,holder_unknown}` 或 `DEVICE_NOT_PRESENT`；成功才回 `ATTACHING` | §5.3、§6.2 交接 | 雙邊 |
+| SC-05 | `device.attach` 同步重新取得獨占：失敗回 `DEVICE_STILL_HELD{pids,holder_unknown}` 或 `DEVICE_NOT_PRESENT`；成功才回 `ATTACHING`。`force` 只略過開檔前預檢，不得略過已識別的外部 holder：POSIX 開檔在 `TIOCEXCL` 後、任何 I/O 前做鎖後 holder 重掃（未取 flock 的外部程式先開埠時 open／flock／TIOCEXCL 仍會成功），`pids` 非空即 `DEVICE_STILL_HELD`、零 TX；初次／熱插自動 attach 同樣適用（`ATTACH_FAILED:DeviceHeldError`） | §5.3、§6.2 交接、§6.2 POSIX「拒絕已識別的外部衝突」 | 雙邊 |
 | SC-06 | `CMD_PENDING_MAX` 的計數納入「已 cancel 但 worker 仍在執行」的命令 | §5.4 | 雙邊 |
 | SC-07 | TX WAL 只記錄 OS 已確認寫出的 bytes，順序等於實際寫入順序 | §8.1 TX、ADR-05 | 雙邊 |
 | SC-08 | UDS 權限預設 `0600`，新建目錄為 `0700`；只有明確設定 `SERIALWRAP_SOCKET_GROUP` 時才用 `0660` 加 chgrp | ADR-04 | 雙邊（owner #3） |
@@ -56,7 +56,7 @@
 | SC-20 | 新子命令 `daemon restart`：systemd 與 windows 模式轉為 `service restart`；on-demand 模式執行 stop、等待結束、再 start（同一 endpoint） | §4.2 #14 | 雙邊 |
 | SC-21 | `remote stop <port\|all>` 作為 `remote close` 的別名，原名照常可用 | §4.2 #17 | 雙邊 |
 | SC-22 | `supervision-mode set <mode> [--force] [--with-sudo]`：輸出 JSON，走與 setup 相同的 reconcile；不帶參數時維持輸出純文字 | §4.2 #16 | Rust-only（1B） |
-| SC-23 | `setup --rollback`、版本目錄、Current／Previous、規格 §12.1 的七步更新流程 | §4.2 #19、§12.1 | Rust-only（1B） |
+| SC-23 | `setup --rollback`、版本目錄、Current／Previous、規格 §12.1 的七步更新流程；第 2 步交接安全檢查不受 `--force` 影響（Flash／FileTransfer 等不可安全中止操作進行中一律拒絕，不停止監管或 daemon） | §4.2 #19、§12.1 | Rust-only（1B） |
 | SC-24 | 監管模式 `windows-task`（`ExecutionTimeLimit=PT0S`）與 `windows-service` | §6.1、OD-03、OD-12 | Rust-only（1B） |
 | SC-25 | release manifest，以及 doctor 的 `version_pairing` 檢查 | §9.5、OD-13 | Rust-only |
 | SC-26 | Windows event handler：`exec` 走 CreateProcess 加 Job；`shell` 走 `cmd.exe /d /s /c`；timeout 時 TerminateJobObject；env 白名單另加 `SYSTEMROOT`、`COMSPEC`、`PATHEXT`、`TEMP`、`TMP`、`USERPROFILE` | §5.5 | Rust-only（owner #6） |
@@ -266,14 +266,14 @@
 
 | ID | 事實 | 規格 | 裁決 | 理由 | 階段 | 需擁有者 |
 |---|---|---|---|---|---|---|
-| UIO-12.1-a | 沒有 flock 與 TIOCEXCL | BC-04 | BC | — | P1/P5 | no |
+| UIO-12.1-a | 沒有 flock 與 TIOCEXCL | BC-04 | BC | 加 flock＋TIOCEXCL；因 TIOCEXCL 不撤銷既有 handle，另加鎖後 holder 重掃以拒絕未取 flock 的外部 holder（含 `--force`）；TIOCEXCL 是 tty 物件旗標、不隨 fd 關閉清除，故正常關閉（I/O 收斂後）與 TIOCEXCL 之後的所有失敗路徑都先 `TIOCNXCL` 再 `LOCK_UN`／close（R0-F3；arch §4.2 關閉序） | P1/P5 | no |
 | UIO-12.1-b | `/proc` 不可讀時無法與「無 holder」區分 | BC-04 | BC | `holder_unknown` | P1/P5 | no |
 | UIO-12.1-c | Windows 開檔失敗沒有對應錯誤碼 | BC-04 | BC | ACCESS_DENIED → `DEVICE_STILL_HELD` 加 `holder_unknown:true` | P1/P5 | no |
-| UIO-12.1-d | PROBE bridge 與正式 bridge 之間無鎖交接 | BC-04 | BC | 依序 open、close 並取得 receipt | P5 | no |
+| UIO-12.1-d | PROBE bridge 與正式 bridge 之間無鎖交接 | BC-04 | BC | 依序 open、close 並取得 receipt（receipt 須 `excl_cleared:true`，即 PROBE 關閉前已 TIOCNXCL；否則 PTY master 仍開啟時正式 open 得 EBUSY） | P5 | no |
 | UIO-12.1-e | POSIX 忽略 `xonxoff` | — | KEEP | 兩平台的差異收在 PAL 內 | P5 | no |
 | UIO-12.2-a | 沒有 drain | §5.2 | SPEC SC-04 | — | P1/P5 | no |
 | UIO-12.2-b | `_write_all` 遇 EAGAIN 無限重試、無法取消 | §5.2.3 | SPEC SC-04 | 改為可喚醒、可取消 | P1/P5 | no |
-| UIO-12.2-c | 送出前檢查只有兩項 | §5.2.2 | SPEC SC-04 | fence | P5 | no |
+| UIO-12.2-c | 送出前檢查只有兩項 | §5.2.2 | SPEC SC-04 | fence：授權重驗與 OS 實際提交在同一臨界區（Rust `FenceSubmitGate`、Python `_tx_fence_lock` 臨界區內單次非阻塞 `os.write`，`_state_lock` 只做 pre-check），鎖只跨非阻塞提交、不跨完成等待；禁止「驗證→放鎖→write」（R0-F1，arch §5.4 第 3 點；P1 T20、P5 Task 9 測試） | P5 | no |
 | UIO-12.2-d | 沒有 TX 三態 | BC-03 | BC | — | P1/P5 | no |
 | UIO-12.3-a | TX WAL 記整段或完全不記 | §8.1 | SPEC SC-07 | — | P1/P5 | no |
 | UIO-12.3-b | TX WAL 在 write 鎖之外才 append | §8.1 | SPEC SC-07 | — | P1/P5 | no |
@@ -318,7 +318,7 @@
 | PLT-D-10 | 使用 `msvcrt.locking`，路徑未正規化 | §6.2 | SPEC SC-10 | — | P1/P5 | no |
 | PLT-D-11 | 本區碼未列入 | §9.2 | KEEP | 收錄 | P0 | no |
 | PLT-D-12 | 版本 gate 只在測試 harness，CLI 只警告 | §9.4、§9.5 | KEEP＋NEW SC-25 | 警告保留；新增 manifest 與 doctor 配對檢查 | P3/P4 | no |
-| PLT-D-13 | 沒有 TIOCEXCL 與 tty flock | BC-04 | BC | — | P1/P5 | no |
+| PLT-D-13 | 沒有 TIOCEXCL 與 tty flock | BC-04 | BC | 同 UIO-12.1-a（含關閉前 TIOCNXCL） | P1/P5 | no |
 | PLT-O-01 | system scope 的 state 路徑不一致 | — | FIX DF-10 | — | P1/P4 | no |
 | PLT-O-02 | pipx 安裝下 spawn 失敗 | — | FIX DF-05 | — | P1/P4 | no |
 | PLT-O-03 | watcher 與 rank 之間有 race | #100 | FIX DF-14 | — | P1/P5 | no |

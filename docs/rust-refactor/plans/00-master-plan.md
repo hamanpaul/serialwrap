@@ -68,7 +68,7 @@
 | 審查 A | Claude Sonnet（effort max） | Workflow `agent(..., {model:'sonnet', effort:'max'})` | 規格符合度、正確性、安全不變量 |
 | 審查 B | Codex `gpt-6.1-sol`（reasoning medium） | `codex exec -m gpt-6.1-sol -c model_reasoning_effort="medium" -s read-only` | 獨立第二意見 |
 
-原則：同一 Task 的「測試作者」與「實作者」盡量不同模型（降低共同盲點）；審查者永不為該 Task 的實作者。
+原則：同一 Task 的「測試作者」與「實作者」盡量不同模型（降低共同盲點）；審查者永不為該 Task 的實作者。daemon 生命週期（啟動序、RAII／退出清理、監管停止、更新／回滾與跨 Stage 停止交接）與 Windows 行程管理（行程樹終止、WSLENV、staging、exit code）一律由實作 B（Codex `gpt-6-luna`）實作，不派實作 A／C（R0-F6）；這類 Task 的 Windows 執行步驟（寫 `/mnt/c`、呼叫 `cmd.exe`／`powershell.exe`）可能被 Codex `-s workspace-write` 沙箱擋下，一律由 orchestrator 代跑並把報告路徑交給實作者。
 
 ## 3. 本環境可產出與不可產出的證據
 
@@ -115,7 +115,7 @@
 
 | ID | Task | 測試作者 | 實作者 | 依賴（同 Phase Task） |
 |---|---|---|---|---|
-| P1-T1 | Stage 0 測試設施：替身、平台 skip、TX 結果純型別、Windows 原生 pytest runner | H | G | — |
+| P1-T1 | Stage 0 測試設施：替身、平台 skip、TX 結果純型別、Windows 原生 pytest runner | H | L | — |
 | P1-T2 | BC-01a WAL 常駐 handle、每筆 flush、唯一 close、DF-17 | H | L | P1-T1 |
 | P1-T3 | BC-01b Windows `CreateFileW` share-delete handle 與 `win32_files` | G | L | P1-T2 |
 | P1-T4 | BC-01c rotate／reset 於常駐 handle 下同步與 DF-03 歸檔後綴 | G | L | P1-T3 |
@@ -298,11 +298,11 @@
 | P8-T7 | PAL flash 端點能力 | G | L | P8-T0 |
 | P8-T8 | SessionCore FLASHING 仲裁 | H | L | P8-T0 |
 | P8-T9 | FlashEndpoint 執行緒與認線協調 | G | L | P8-T0、P8-T2、P8-T7、P8-T8 |
-| P8-T10 | `mcu.patterns`／`mcu.status` RPC 與 daemon 組裝 | G | H | P8-T9 |
+| P8-T10 | `mcu.patterns`／`mcu.status` RPC 與 daemon 組裝 | G | L | P8-T9 |
 | P8-T11 | 外部工具裝置交接的黑箱與整合驗證 | H | L | P8-T0、P8-T6、P8-T8 |
 | P8-T12 | systemd 監管整合與有序停止 | G | L | P8-T6、P8-T9、P8-T11 |
 | P8-T13 | `windows-task` 監管對 Rust daemon 的驗證 | H | L | P8-T12 |
-| P8-T14 | 更新／回滾守衛對 Rust daemon 的驗證與補強（SC-23） | G | H | P8-T6、P8-T9 |
+| P8-T14 | 更新／回滾守衛對 Rust daemon 的驗證與補強（SC-23） | G | L | P8-T6、P8-T9 |
 | P8-T15 | 全部凍結契約的最終覆蓋判定與切片出口腳本 | H | G | P8-T0～14 |
 
 ### P9（`10-stage3-canary.md`；Phase 前置：P0～P8（以前置 Phase 交付物為介面））
@@ -326,7 +326,7 @@
 | P9-T13 | 實機回滾演練（`tools/stage3/rollback_drill.py`） | G | L | P9-T12 |
 | P9-T14 | Stage 0～3 出口證據索引（`tools/stage3/evidence_index.py`） | L | G | P9-T7 |
 | P9-T14B | 證據 ingest（`tools/stage3/evidence_ingest.py`） | H | L | P9-T15 |
-| P9-T15 | OD-09 延後凍結程序與凍結後 gate 判定（`tools/stage3/od09_freeze.py`） | L | H | P9-T14 |
+| P9-T15 | OD-09 延後凍結程序與凍結輸出對正式 gate 的讀寫契約（`tools/stage3/od09_freeze.py`；寫入 P2 `thresholds.<key>.per_platform.<os>.<field>`，不改 gate） | L | H | P9-T14 |
 | P9-T16 | Python daemon 退役切換（packaging） | H | L | P9-T13 |
 | P9-T17 | `python3 -m tools.stage3` 入口與擁有者程序文件 | G | H | P9-T16 |
 
@@ -352,9 +352,9 @@
 
 ### 審查後仍未解決（需擁有者或後續 PR 處理）
 
-1. P8-T10（daemon 組裝、flash endpoint 啟動序）與 P8-T14（更新／回滾守衛）由 H 實作，與 P5 §0.4「daemon 生命週期一律 L」的分工說明不一致；P8 已以 Sonnet 逐項核對不變量補償，是否改派 L 待擁有者裁決（本次未改）。
+1. （已解決，R0-F6）P8-T10（daemon 組裝、flash endpoint 啟動序）與 P8-T14（更新／回滾守衛）已依 §2 原則與 P5 §0.4「daemon 生命週期一律 L」改派 L（09 §0.2、Task 總覽與兩 Task 標頭同步）；測試作者維持 G（≠ 實作者），Sonnet 逐項核對不變量的審查要求保留。
 2. P5-T1（PAL test-fakes，含可注入部分寫入／取消失敗的 `FakeSerial`）由 G 實作；依 P5 自述屬「獨立模組」，未視為違規，但 fakes 的 cancel 語意錯誤會讓 L1 誤綠，建議審查 A 專審。
-3. P1-T1 的 `win-pytest.sh`（Windows 行程樹終止、WSLENV）由 G 實作，P3-T17 同類工作則判為高風險平台改派 L；若改派需同步調整 P1 §0.1 的 Test reviewer 欄（現為 L）。
+3. （已解決，R0-F6）P1-T1 的 `win-pytest.sh`（Windows 行程樹終止、WSLENV）比照 P3-T17 改派 L；P1 §0.1 的 Test reviewer（A1.5）同步由 L 改為 G，使測試作者 H／審核者 G／實作者 L 三者不同；Windows 實跑由 orchestrator 代跑。另 01 計畫的本機絕對路徑已改為 `$SW_ROOT`／`$CONV_REPO`／`$CONV_WT` 變數。
 4. P7-T18A 的 `bb_faketarget` 擴充鍵（`noise` 等）與 P5-T15a（`noise_interval_s`）可能重複，P7 執行時需合併為單一參數。
 5. P8-T10 新建 `crates/sw-daemon/tests/support/service_rig.rs` 與 P5-T18 `support/mod.rs` 既有 `ServiceRig` 可能同名衝突，P8 執行時應改為擴充既有型別。
 6. arch 文件（`rust-architecture.md`）尚未同步本次定案（`HolderScanStatus` 共用、`FakeClock::at`、`pycompat_s21.tsv`、P8 SC 改號）；由各 owner Task 依其「修訂 arch」步驟寫回。

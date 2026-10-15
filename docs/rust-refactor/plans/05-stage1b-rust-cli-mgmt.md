@@ -35,7 +35,7 @@
 2. **委派殘留造成假綠**：每個群組改原生後必須從 `DELEGATED_GROUPS` 移除；黑箱 bundle 的 `python_cli_delegate.entry` 指向 sentinel（被呼叫即寫 marker 並 exit 97），任何漏網委派都會讓測試失敗（Task 1、14）。
 3. **Windows 程序語意**：存活判定絕不用等同 `os.kill(pid,0)` 的終止呼叫；`remote close` 先核對根 PID 的 CreationTime 等於 `TunnelProc.start_ticks`，再以 Toolhelp32 parent 鏈＋CreationTime 收集整棵樹終止；ProcScan 必須辨識 `serialwrapd.exe` 並把 launcher 與其 Python 子行程去重，否則每個 Stage 1 daemon 都被漏掃或誤判為多開（Task 4、5）。
 4. **SC-18 首次需求啟動只在「請求從未送出」時重送**：僅 connect 階段 PAL kind 為 `ConnectionRefused`／`NotFound`、endpoint 來源為預設本機 endpoint、且方法不是 `health.ping`／`health.status`／`daemon.stop` 時才在跨行程鎖內 auto-start 並重送一次；send／recv 階段失敗、`TIMEOUT`、`EMPTY_RESPONSE`、`PermissionDenied`、明確 `--endpoint/--socket/--bench` 一律不重送（Task 7）。
-5. **安裝切換的原子性與可回復**：整筆 update／rollback 持有安裝根目錄跨行程鎖；`*.new`→`*.old.<ts>`→正式名的每一步失敗都要能回到完整 Previous（CLI、launcher、Python runtime、設定、監管定義與其**已註冊狀態**一起），`current-release.json` 只在切換全部成功後改寫、`install-journal.json` 記錄進度供中斷復原；安全檢查無法確認時一律拒絕（fail-closed）；版本配對、health、WAL、狀態相容或 smoke 任一失敗即自動回退並保留失敗證據（Task 11、12）。
+5. **安裝切換的原子性與可回復**：整筆 update／rollback 持有安裝根目錄跨行程鎖；`*.new`→`*.old.<ts>`→正式名的每一步失敗都要能回到完整 Previous（CLI、launcher、Python runtime、設定、監管定義與其**已註冊狀態**一起），`current-release.json` 只在切換全部成功後改寫、`install-journal.json` 記錄進度供中斷復原；安全檢查無法確認時一律拒絕（fail-closed）；update／rollback 的交接安全檢查（Flash、FileTransfer、活躍寫入、lease、recovering、身分與探測）**不受 `--force` 影響**（§12.1 步驟 2，Task 12）；版本配對、health、WAL、狀態相容或 smoke 任一失敗即自動回退並保留失敗證據（Task 11、12）。
 
 ---
 
@@ -1888,8 +1888,10 @@ pub struct Journal { pub op: String, pub from: Option<String>, pub to: String, p
 pub fn write_journal(ctx: &Ctx, root: &InstallRoot, j: &Journal) -> Result<(), LayoutError>;   // <root>/install-journal.json，atomic_write
 pub fn recover_journal(ctx: &mut Ctx, root: &InstallRoot) -> Option<UpdateReport>;            // 殘留 journal → 依 step 完成回復後刪除
 pub fn run_install(ctx: &mut Ctx, bundle_dir: &Path, ns: &Namespace) -> UpdateReport;
-pub fn run_update(ctx: &mut Ctx, bundle_dir: &Path, target_mode: &SupervisionMode, with_sudo: bool, force: bool) -> UpdateReport;
-pub fn run_rollback(ctx: &mut Ctx, with_sudo: bool, force: bool) -> UpdateReport;
+// force_requested：使用者是否帶 `--force`。update／rollback 路徑**只用於回報**（safety_check 步驟 detail 記 `force_ignored:true`），
+// 不得傳入 safety_check、stop_supervisor 的重檢或任何交接判定（§12.1 步驟 2：不符合交接條件時拒絕更新，無覆寫）。
+pub fn run_update(ctx: &mut Ctx, bundle_dir: &Path, target_mode: &SupervisionMode, with_sudo: bool, force_requested: bool) -> UpdateReport;
+pub fn run_rollback(ctx: &mut Ctx, with_sudo: bool, force_requested: bool) -> UpdateReport;
 ```
 
 錯誤碼（**全部為 §9.2 既有碼**，以 `phase`／`reason` 區分，見 §0.3）：
@@ -1901,7 +1903,7 @@ pub fn run_rollback(ctx: &mut Ctx, with_sudo: bool, force: bool) -> UpdateReport
 | 檔案 sha256／tree 不符 | `CHECKSUM_VERIFY_FAILED` | `update_verify`／`rollback_verify` | `diffs:[{field,expected,actual}]` |
 | 新舊 `state_schema` 不同且無核准遷移 | `INVALID_ARGS` | `update_verify`／`rollback_verify` | `state_schema_incompatible`、`current`、`target` |
 | 沒有可回滾的 Previous | `INVALID_ARGS` | `rollback_verify` | `rollback_unavailable`；message `沒有可回滾的 Previous 版本（<原因>）` |
-| flash 進行中 | `FLASHING_BUSY` | `update_safety_check` | message `flash 進行中，拒絕更新／回滾（可用 --force 覆寫）` |
+| flash 進行中 | `FLASHING_BUSY` | `update_safety_check` | message `flash 進行中，拒絕更新／回滾（--force 不適用，請待 flash 完成後重試）` |
 | 前景／背景命令、lease、recovering | `SESSION_BUSY` | `update_safety_check` | `busy:[…]`（與 P8 SC-23-G 相同碼） |
 | 安全探測 RPC 失敗／逾時／格式異常 | 該 RPC 的碼（`TIMEOUT`、`SOCKET_ERROR`、`INVALID_RESPONSE`…） | `update_safety_check` | `probe:<method>` |
 | ping 不通但仍有 daemon 行程，或身分無法確認 | `DEVICE_STILL_HELD` | `update_safety_check` | `pids`、`holder_unknown` |
@@ -1913,11 +1915,11 @@ pub fn run_rollback(ctx: &mut Ctx, with_sudo: bool, force: bool) -> UpdateReport
 行為（update 與 rollback 共用；rollback 的「新版本」＝Previous；首次安裝見文末）：
 0. **lock＋journal**：`install_lock`（Task 11）取得後才 `read_current`；任何分支開始前若有 `install-journal.json` → `recover_journal`（`step` ∈ {`lock`,`verify`,`safety_check`,`stop_supervisor`,`confirm_released`} → 只恢復監管 enabled 狀態並刪 journal；∈ {`backup_and_switch`,`start_and_verify`,`revert_to_previous`} → 以 journal 的 `backup_dir` 執行步驟 7 後刪 journal），回報於輸出 `recovered_journal`。每一步開始前 `write_journal(step)`，成功或完整回退後刪除；中斷時 `doctor` 的 `version_pairing` 會顯示不一致，fix 指向 `serialwrap setup`。
 1. **verify**：update：`parse_manifest(<bundle>/release-manifest.json)`＋`verify_bundle`＋**state_schema 相容性**（Current 與新 manifest 的 `components.daemon.state_schema` 不同 → 拒絕；只有新 manifest 宣告 `components.daemon.state_migration:{from,to,id,approval_ref}` 且 `id` 列於 `contracts/behavior_changes.yaml` 已核准項時才允許——Stage 1 沒有任何核准遷移，故一律拒絕，§12.1「如确需不相容變更，必須先核准遷移／回復方案」）＋`stage_version`；rollback：`read_current` 有 `previous` 且 `versions/<prev>` 存在且 `verify_bundle` 通過且 state_schema 相同，否則依上表（原因字串：`current-release.json 不存在`／`未記錄 previous`／`版本目錄 <dir> 不存在`／`版本目錄驗證失敗`）。
-2. **safety_check**（fail-closed；`--force` 只略過本步的 busy 判定，不略過身分確認）：
+2. **safety_check**（fail-closed；**不受 `--force` 影響**——§12.1 步驟 2「檢查 Flash、FileTransfer、活躍寫入與其他不可安全中止操作；不符合交接條件時拒絕更新」沒有覆寫條款，且步驟 3 的 `daemon.stop` 會取消傳輸、停止 flash pump，行程安全退出無法撤銷 DUT 上已發生的部分燒寫／部分寫檔。故 busy 判定、身分確認與 RPC 探測在 update／rollback 一律執行；帶 `--force` 時只在本步 detail 記 `force_ignored:true`，結果與未帶時逐欄相同。一般 `setup`（Task 10，非 update 路徑）的 `--force` 覆寫 flashing 為 Python 對等行為，不適用於此）：
    - `health.ping`(0.5) 失敗 → `ProcScan::serialwrapd_instances()` 查 endpoint 對應實例：無 → `Ok(None)`（確認沒有 daemon）；有（daemon 失聯但行程仍在，可能仍持有 COM）或 ProcScan 失敗 → `DEVICE_STILL_HELD`。
    - ping 成功 → `mcu.status`(0.5) 與 `session.list`(1.0) **都必須**回 `ok:true` 且欄位型別正確，任一失敗／逾時／格式異常 → 拒絕（上表）；`capture_daemon_identity` 的 `known==false` → `DEVICE_STILL_HELD`（`holder_unknown:true`）。
    - busy 判定：`mcu.status.flashing` → `FLASHING_BUSY`；任一 session `state ∈ {FLASHING, RECOVERING}` 或 `recovering==true` 或 `foreground_busy==true` 或 `outstanding_commands>0` 或 `interactive_session_id!=null` → `SESSION_BUSY`，detail `busy:[{"com","state","foreground_busy","outstanding_commands","interactive_session_id","recovering"}]`。
-3. **stop_supervisor**：記下 `DaemonSnapshot`（identity、各 session `attached_real_path`、`com`／`state`）與 `SupervisorSnapshot`（`query` 的 running、enabled）；windows-task／windows-service 先 `set_enabled(false)`；**停用後立即重跑一次步驟 2 的 busy 判定**（縮小「檢查後新請求進入」窗口；busy → `set_enabled(true)`、拒絕、不停止）；之後 `graceful_stop(mode, keep_disabled=true, phase:"update_confirm_released")`——RPC `daemon.stop` 觸發 SC-11 有序關機，於檢查後才進入的請求由 daemon drain 完成而非中途截斷。
+3. **stop_supervisor**：記下 `DaemonSnapshot`（identity、各 session `attached_real_path`、`com`／`state`）與 `SupervisorSnapshot`（`query` 的 running、enabled）；windows-task／windows-service 先 `set_enabled(false)`；**停用後立即重跑一次步驟 2 的 busy 判定**（縮小「檢查後新請求進入」窗口；同樣不受 `--force` 影響；busy → `set_enabled(true)`、拒絕、不停止）；之後 `graceful_stop(mode, keep_disabled=true, phase:"update_confirm_released")`——RPC `daemon.stop` 觸發 SC-11 有序關機，於檢查後才進入的請求由 daemon drain 完成而非中途截斷。
 4. **confirm_released**：`wait_daemon_gone(endpoint, &snapshot.id, 10s)`（ping 不通**且** identity tree——Windows 含 launcher 與 Python 子行程——全數結束；行程結束即由 OS 關閉其 COM handle，Windows holders 依 SC-17 為 unknown，以完整行程樹消失為釋放證據），且 POSIX 上 `serialwrapd_tty_holders(attached_paths)` 為空（Windows 記 `holders_status:"unsupported"`）。失敗依上表，**不**切換；回復：`set_enabled(true)`（若步驟 3 有 disable）；舊 daemon 已結束而 holder 仍在時**不啟動任何版本**（§12.1「不能強行啟動上一版搶同一 UART」），由輸出的 `pids` 指示處理。
 5. **backup_and_switch**：`backup_state(from=current, to=new, SupervisorSnapshot)` → `switch_entries` → `materialize_assets(force=false)`（profiles 保留使用者修改、skill 與 wrappers 以新版內嵌資產刷新，同 Task 10）→ supervised 模式重新 `install` 監管定義（穩定入口路徑不變，Task XML 仍指 `bin\serialwrapd.exe`）→ `write_current{bundle_version:new, dir, previous:Some(old), backup_dir, switched_at}`。rollback 另做：以 `current.backup_dir`（當初從 Previous 切到 Current 時的備份）呼叫 `restore_backup(include_state=false)`——**先**還原 config（mode、endpoint）、**再**依 Previous 的已註冊狀態重新註冊或 reload 監管定義（跨 mode 時：解除 Current mode 的註冊、建立 Previous mode 的註冊）；state.json 保留 Current（schema 已確認相同，含更新後才發生的 released 保護，DF-04）；被覆蓋的 Current 設定與定義已在本步新備份中。
 6. **start_and_verify**：依**目標組合的 mode**（update：`target_mode`；rollback：Previous 備份的 mode）啟動——supervised → `set_enabled(true)`（還原為快照中的 enabled 值）＋`action(Start)`；on-demand 且步驟 3 前 daemon 健康 → 以新穩定入口執行內部 start 流程。驗收**全部**通過才算成功（最多等 daemon start 的輪詢時間）：
@@ -1969,6 +1971,64 @@ fn update_safety_probe_timeout_refuses() {
     assert_eq!((s(&j, "phase"), s(&j, "probe")), ("update_safety_check", "session.list"));
     assert!(t.service().actions().is_empty() && t.rpc().requests().iter().all(|r| r.1 != "daemon.stop"));
 }
+// R0-F4：§12.1 步驟 2 的交接安全檢查不得被 --force 覆寫（Flash／FileTransfer 中停 daemon 無法撤銷 DUT 已發生的部分燒寫／寫檔）
+fn assert_refused_untouched(t: &TestEnv, j: &serde_json::Value, key: &str, code: &str, cur_ver: &str) {
+    assert_eq!((s(j, "error_code"), s(j, "phase")), (code, "update_safety_check"));
+    let steps = j[key]["steps"].as_array().unwrap();
+    assert_eq!(steps.last().unwrap()["step"], "safety_check", "不得進入 stop_supervisor");
+    assert_eq!(steps.last().unwrap()["detail"]["force_ignored"], true);
+    assert!(steps.last().unwrap()["detail"].get("skipped").is_none(), "busy 判定不得被略過");
+    assert!(t.service().actions().is_empty(), "不得 disable／stop／End 監管");
+    assert!(t.rpc().requests().iter().all(|r| r.1 != "daemon.stop"), "不得要求 daemon 停止");
+    assert_eq!(sw_cli::install_layout::read_current(&t.root()).unwrap().unwrap().bundle_version, cur_ver);
+    assert_eq!(std::fs::read(t.root().bin.join("serialwrap.exe")).unwrap(), t.version_bytes(cur_ver, "bin/serialwrap.exe"));
+}
+#[test]
+fn update_force_does_not_override_flashing() {
+    let t = TestEnv::windows().with_install_root().with_installed("0.4.0").with_bundle("0.4.1")
+        .with_rpc_ok(TestEnv::win_endpoint(), "health.ping", "{\"ok\":true}")
+        .with_rpc_ok(TestEnv::win_endpoint(), "mcu.status", "{\"flashing\":true,\"ok\":true}")
+        .with_rpc_ok(TestEnv::win_endpoint(), "session.list", "{\"ok\":true,\"sessions\":[{\"com\":\"COM0\",\"state\":\"FLASHING\",\"foreground_busy\":false,\"outstanding_commands\":0,\"interactive_session_id\":null,\"recovering\":false}]}");
+    let (rc, out, err) = t.run_from_bundle(&["setup", "--force"]);
+    assert_eq!(rc, 2);
+    let j = json(&out);
+    assert_eq!(s(&j, "message"), "flash 進行中，拒絕更新／回滾（--force 不適用，請待 flash 完成後重試）");
+    assert!(err.starts_with("serialwrap: setup failed: FLASHING_BUSY: "));
+    assert_refused_untouched(&t, &j, "update", "FLASHING_BUSY", "0.4.0");
+}
+#[test]
+fn rollback_force_does_not_override_flashing() {
+    let t = TestEnv::windows().with_install_root().with_installed("0.4.0").with_installed("0.4.1").with_current("0.4.1", Some("0.4.0"))
+        .with_rpc_ok(TestEnv::win_endpoint(), "health.ping", "{\"ok\":true}")
+        .with_rpc_ok(TestEnv::win_endpoint(), "mcu.status", "{\"flashing\":true,\"ok\":true}")
+        .with_rpc_ok(TestEnv::win_endpoint(), "session.list", "{\"ok\":true,\"sessions\":[{\"com\":\"COM0\",\"state\":\"FLASHING\",\"foreground_busy\":false,\"outstanding_commands\":0,\"interactive_session_id\":null,\"recovering\":false}]}");
+    let (rc, out, _) = t.run(&["setup", "--rollback", "--force"]);
+    assert_eq!(rc, 2);
+    assert_refused_untouched(&t, &json(&out), "rollback", "FLASHING_BUSY", "0.4.1");
+}
+#[test]
+fn update_force_does_not_override_file_transfer() {
+    // file.push 進行中：session.list 顯示 foreground_busy:true 且 outstanding_commands>0
+    let t = TestEnv::windows().with_install_root().with_installed("0.4.0").with_bundle("0.4.1")
+        .with_rpc_ok(TestEnv::win_endpoint(), "health.ping", "{\"ok\":true}")
+        .with_rpc_ok(TestEnv::win_endpoint(), "mcu.status", "{\"flashing\":false,\"ok\":true}")
+        .with_rpc_ok(TestEnv::win_endpoint(), "session.list", "{\"ok\":true,\"sessions\":[{\"com\":\"COM0\",\"state\":\"READY\",\"foreground_busy\":true,\"outstanding_commands\":1,\"interactive_session_id\":null,\"recovering\":false}]}");
+    let (rc, out, _) = t.run_from_bundle(&["setup", "--force"]);
+    assert_eq!(rc, 2);
+    let j = json(&out);
+    assert_refused_untouched(&t, &j, "update", "SESSION_BUSY", "0.4.0");
+    assert_eq!(j["busy"][0]["com"], "COM0");
+}
+#[test]
+fn rollback_force_does_not_override_file_transfer() {
+    let t = TestEnv::windows().with_install_root().with_installed("0.4.0").with_installed("0.4.1").with_current("0.4.1", Some("0.4.0"))
+        .with_rpc_ok(TestEnv::win_endpoint(), "health.ping", "{\"ok\":true}")
+        .with_rpc_ok(TestEnv::win_endpoint(), "mcu.status", "{\"flashing\":false,\"ok\":true}")
+        .with_rpc_ok(TestEnv::win_endpoint(), "session.list", "{\"ok\":true,\"sessions\":[{\"com\":\"COM0\",\"state\":\"READY\",\"foreground_busy\":true,\"outstanding_commands\":1,\"interactive_session_id\":null,\"recovering\":false}]}");
+    let (rc, out, _) = t.run(&["setup", "--rollback", "--force"]);
+    assert_eq!(rc, 2);
+    assert_refused_untouched(&t, &json(&out), "rollback", "SESSION_BUSY", "0.4.1");
+}
 #[test]
 fn pairing_failure_after_switch_reverts_to_complete_previous() {
     let t = TestEnv::windows().with_install_root().with_installed("0.4.0").with_bundle("0.4.1")
@@ -1994,7 +2054,7 @@ fn pairing_failure_after_switch_reverts_to_complete_previous() {
 | `update_lock_contention_no_side_effects` | 另一行程持 `.install.lock` → `TIMEOUT`／`install_lock`、無任何 RPC、install root 不變 |
 | `update_verify_failed_no_side_effects` | bundle 內 exe 被竄改 → `CHECKSUM_VERIFY_FAILED`／`update_verify`、`diffs[0].field` 以 `sha256:` 開頭、無任何 RPC stop、`versions/<v>` 不存在 |
 | `update_refuses_incompatible_state_schema` | 新 manifest `state_schema:"python-state-v1"` → `INVALID_ARGS`／`state_schema_incompatible`、無 stop |
-| `update_flashing_busy` | `flashing:true` → `FLASHING_BUSY`、message `flash 進行中，拒絕更新／回滾（可用 --force 覆寫）` |
+| `update_flashing_busy` | `flashing:true` → `FLASHING_BUSY`、message `flash 進行中，拒絕更新／回滾（--force 不適用，請待 flash 完成後重試）` |
 | `update_busy_background_command` | `foreground_busy:false, outstanding_commands:2` → `SESSION_BUSY` |
 | `update_busy_interactive_lease` | `interactive_session_id:"L1"` → `SESSION_BUSY` |
 | `update_busy_recovering` | `recovering:true` 或 `state:"RECOVERING"` → `SESSION_BUSY` |
@@ -2002,7 +2062,12 @@ fn pairing_failure_after_switch_reverts_to_complete_previous() {
 | `update_busy_appears_after_disable_aborts` | 第一次 `session.list` 閒置、停用後第二次顯示 `foreground_busy:true` → `SESSION_BUSY`、`set_enabled(true)` 被呼叫、無 `daemon.stop` |
 | `update_rpc_down_child_holds_com_blocks` | ping refused 但 ProcScan 仍回 endpoint 對應實例 → `DEVICE_STILL_HELD`／`update_safety_check`、`pids` 含該 pid、無切換 |
 | `update_identity_unknown_blocks` | ping ok、`FakeProcScan::fail()` → `DEVICE_STILL_HELD`、`holder_unknown:true`、無 stop |
-| `update_force_skips_busy_only` | `--force` 時 busy 判定記 `detail:{"skipped":true}`；身分確認仍執行（ProcScan 失敗時仍拒絕） |
+| `update_force_does_not_override_flashing`／`rollback_force_does_not_override_flashing`（上方程式碼） | FLASHING＋`--force` → `FLASHING_BUSY`／`update_safety_check`、steps 止於 `safety_check` 且 detail `force_ignored:true`、無 `skipped`；`service().actions()` 為空、無 `daemon.stop` RPC、`current-release.json` 與 `bin` 未變 |
+| `update_force_does_not_override_file_transfer`／`rollback_force_does_not_override_file_transfer`（上方程式碼） | `file.push` 進行中（`foreground_busy:true`、`outstanding_commands:1`）＋`--force` → `SESSION_BUSY`，其餘斷言同上 |
+| `update_force_does_not_override_interactive_or_recovering` | `interactive_session_id:"L1"`、或 `state:"RECOVERING"`，各＋`--force` → `SESSION_BUSY`、無監管動作、無 `daemon.stop` |
+| `update_force_does_not_skip_identity_or_probe` | `--force`＋`FakeProcScan::fail()` → `DEVICE_STILL_HELD`（`holder_unknown:true`）；`--force`＋`session.list` recv timeout → `probe:"session.list"` 拒絕；兩者皆無 stop |
+| `update_force_recheck_after_disable_still_aborts` | `--force`＋第一次 `session.list` 閒置、停用後第二次 `foreground_busy:true` → `SESSION_BUSY`、`set_enabled(true)` 被呼叫、無 `daemon.stop`（步驟 3 重檢也不受 `--force` 影響） |
+| `update_force_idle_same_result_as_without` | 全閒置時帶與不帶 `--force` 的 `steps[*].step` 與最終 `ok` 相同；帶 `--force` 時 `safety_check.detail.force_ignored==true` |
 | `update_windows_task_graceful_before_switch` | `event_order`：`/DISABLE` < `rpc:daemon.stop` < `rpc:health.ping#gone` < 第一個 `bin` 改名；daemon 正常結束時無 `/End` |
 | `update_old_daemon_never_exits_aborts_without_switch` | ping 持續 ok → `TIMEOUT`／`update_confirm_released`、`bin` 未變、`set_enabled(true)` 被呼叫、無 Start |
 | `update_tty_still_held_posix_aborts` | `TestEnv::posix()`：identity 消失但 `serialwrapd_tty_holders` 仍回該 tty → `DEVICE_STILL_HELD`／`update_confirm_released`、不啟動任何版本 |
@@ -2033,14 +2098,14 @@ fn pairing_failure_after_switch_reverts_to_complete_previous() {
 - [ ] **步驟 3：實作**（主幹）
 
 ```rust
-pub fn run_update(ctx: &mut Ctx, bundle: &Path, mode: &SupervisionMode, with_sudo: bool, force: bool) -> UpdateReport {
+pub fn run_update(ctx: &mut Ctx, bundle: &Path, mode: &SupervisionMode, with_sudo: bool, force_requested: bool) -> UpdateReport {
     let root = resolve_install_root(ctx);
     let _lock = step!(r0, Lock, install_lock(ctx, &root));                                         // 持有到函式結束
     let mut r = UpdateReport::new("update", read_current_version(ctx, &root), manifest_version(bundle));
     let vdir = step!(r, Verify, verify_schema_and_stage(ctx, &root, bundle));
     let ep = local_endpoint(ctx);
-    let snap = step!(r, SafetyCheck, safety_check_or_skip(ctx, &ep, force));                     // busy 可 --force；身分不可
-    let sup = step!(r, StopSupervisor, stop_supervisor(ctx, mode, with_sudo, &ep, &snap, force));  // disable → 重檢 busy → graceful_stop
+    let snap = step!(r, SafetyCheck, safety_check(ctx, &ep).note_force_ignored(force_requested)); // 無覆寫：§12.1 步驟 2；force 只記 detail
+    let sup = step!(r, StopSupervisor, stop_supervisor(ctx, mode, with_sudo, &ep, &snap));          // disable → 重檢 busy（無 force）→ graceful_stop
     if let Err(e) = confirm_released(ctx, &ep, &snap) { reenable(ctx, &sup); return r.fail(ConfirmReleased, e); }
     let (backup, sw) = step_or_revert!(r, BackupAndSwitch, backup_and_switch(ctx, &root, &vdir, mode, &sup));
     if let Err(e) = start_and_verify(ctx, mode, &snap, &vdir) { return revert_to_previous(ctx, r, backup, sw, &sup, &snap, e); }

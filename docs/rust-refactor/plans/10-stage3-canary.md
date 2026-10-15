@@ -43,8 +43,8 @@
 |---|---|---|
 | P0 | `contracts/error_codes.yaml`；`contracts/behavior_changes.yaml`（BC／SC／DF，每項 `scope` ∈ P0 `CHANGE_SCOPES`（`both`、`rust_only`、`python_when_manifest_present`——SC-25 經 P1 T18 改為後者）、`applies_to.{python,rust}`、`case_ids`、`ab_participation`（P0 01 T1 必填，`scope == "both"` ⇔ `diff`）） | 原因碼不撞名檢查；A/B 差異歸屬：本計畫直接讀 P0 的 `ab_participation`（並核對與 `scope` 一致）——`diff`（必須在 A/B 差分中出現且已登記）、`rust_only`→`absolute_only`（不參與差分，只驗 B 側絕對契約，arch §0 第 2 點） |
 | P0／P2／P3 | `contracts/release_manifest.schema.json`、`release-manifest.json`（arch §10.1 欄位：`bundle_version`、`stage`、`target`、`git_revision`、`contract_revision`、`components.{cli,daemon,python_cli_delegate,assets,supervisor}`、`pairing`；Rust daemon 形狀為 `components.daemon{implementation:"rust",version,git_revision,launcher:{path,sha256}}`（同一個 `bin/serialwrapd` 依 implementation 走原生，P5 `main.rs`），**沒有** `daemon.path`；Python 部署碼以 `daemon.package.tree_sha256`、`python_cli_delegate.tree_sha256` 表示） | artifact 身分（`artifact_id = sha256(release-manifest.json bytes)`，每平台各一）、`runtime_digest`（Task 14）、A/B 側別檢查；Task 16 新增靜態 `retirement` 標記 |
-| P2 | `realhw/acceptance/longrun_acceptance.yaml`：頂層 `schema_version`、`revision`、`workload.{engine_case,engine_files,min_continuous_duration_s,allow_segment_stitching,snapshot_interval_s,observer_interval_s,max_observation_gap_factor}`、`counting`、`thresholds.{unexpected_cmd_error_rate,effective_throughput,stuck_attached}`（`status: frozen`）、`thresholds.{resources,min_effective_load,comparison_uncertainty}`（`status: deferred`，純量欄位 `rss_peak_kb`／`rss_steady_kb`／`rss_slope_kb_per_h`、`min_completed_per_board_source`／`max_idle_gap_s`、`tolerance`／`rerun_rule`，初值 null）、`safety`（含 `allowed_tx_source_regex`）、`liveness`、`evidence`；schema `longrun_acceptance.schema.json` | OD-09 freeze 只寫三個延後項並遞增 `revision`（Task 15 先擴充 schema 允許每平台形式）；A/B L3 前置檢查；時長與缺口係數只從 `workload.*` 讀，不在本計畫重複數值（§15.11.4、P2 `test_single_source_of_thresholds`） |
-| P2 | `realhw/acceptance/gate.py`：`GateInputs(report_dir, case_dir, acceptance_path, platform, mode, observer_path, wal_dir, baseline_gate_path)`、`evaluate(inputs) -> dict`、`load_acceptance(path) -> tuple[dict, dict]`（內容、`{"path","revision","sha256","git_blob_sha1"}`）、`RESULTS = ("PASS","FAIL","INSUFFICIENT_EVIDENCE","BLOCKED","NOT_APPLICABLE_BASELINE")`；CLI `python3 -m realhw.acceptance.gate --report-dir D --case-dir C --acceptance A --platform P --mode baseline\|candidate [--observer O] [--wal-dir W] [--baseline-gate B] --out release-gate.json`（exit：PASS／NOT_APPLICABLE_BASELINE 0、FAIL 1、INSUFFICIENT 4、BLOCKED 5）；輸出 `release-gate.v1`：`engine_result` 為 lr-mixed 結果 **dict** 原樣（`verdict` 等鍵）、`release_gate_result`、`baseline_result`（只在 baseline 模式）、`acceptance.revision`、`run.cli_identity`、`checks`；`baseline_compatible` 要求基線 gate 的 `acceptance.revision` 與候選相同；observer CLI `python3 -m realhw.acceptance.observer`；`walscan.scan_wal` | L3 A/B 判定（Task 5B、7）；L3 gate 報告 ingest（Task 14B） |
+| P2 | `realhw/acceptance/longrun_acceptance.yaml`：頂層 `schema_version`、`revision`、`workload.{engine_case,engine_files,min_continuous_duration_s,allow_segment_stitching,snapshot_interval_s,observer_interval_s,max_observation_gap_factor}`、`counting`、`thresholds.{unexpected_cmd_error_rate,effective_throughput,stuck_attached}`（`status: frozen`）、`thresholds.{resources,min_effective_load,comparison_uncertainty}`（key 層級 `status: deferred`；數值只在 `per_platform.{linux,windows}` 之下：`resources`→`rss_peak_kb`／`rss_steady_kb`／`rss_slope_kb_per_h`，`min_effective_load`→`min_completed_per_board_source`（`{"<com>\|<source>": int}`）／`max_idle_gap_s`，`comparison_uncertainty`→`error_rate_abs_tolerance`／`throughput_ratio_tolerance`／`stuck_s_tolerance`／`max_reruns`，初值 null；P2 Task 15「延後項讀寫契約」）、`safety`（含 `allowed_tx_source_regex`）、`liveness`、`evidence`；schema `longrun_acceptance.schema.json`；gate 已定義 `status: frozen` 時的判定（P2 Task 15 checks 表） | OD-09 freeze 只寫三個延後項的 `per_platform.<os>.<field>`（兩平台一次）與凍結紀錄欄位並遞增 `revision`，不改名、不另設子樹、不改 gate 判定；A/B L3 前置檢查；時長與缺口係數只從 `workload.*` 讀，不在本計畫重複數值（§15.11.4、P2 `test_single_source_of_thresholds`） |
+| P2 | `realhw/acceptance/gate.py`：`GateInputs(report_dir, case_dir, acceptance_path, platform, mode, observer_path, wal_dir, baseline_gate_path)`、`evaluate(inputs) -> dict`、`load_acceptance(path) -> tuple[dict, dict]`（內容、`{"path","revision","sha256","git_blob_sha1"}`）、`RESULTS = ("PASS","FAIL","INSUFFICIENT_EVIDENCE","BLOCKED","NOT_APPLICABLE_BASELINE")`；CLI `python3 -m realhw.acceptance.gate --report-dir D --case-dir C --acceptance A --platform P --mode baseline\|candidate [--observer O] [--wal-dir W] [--baseline-gate B] --out release-gate.json`（exit：PASS／NOT_APPLICABLE_BASELINE 0、FAIL 1、INSUFFICIENT 4、BLOCKED 5）；輸出 `release-gate.v1`：`engine_result` 為 lr-mixed 結果 **dict** 原樣（`verdict` 等鍵）、`release_gate_result`、`baseline_result`（只在 baseline 模式）、`acceptance.revision`、`run.cli_identity`、`checks`；`baseline_compatible` 比對基線 gate 的 `platform`、`run.engine_files_sha256`、`acceptance.workload_contract_sha256` 與基線 `baseline_result=="PASS"`，**不**要求 `acceptance.revision` 相同（P2 Task 15 checks 表；OD-09 於基線後以新 revision 凍結延後項屬正常流程）；observer CLI `python3 -m realhw.acceptance.observer`；`walscan.scan_wal` | L3 A/B 判定（Task 5B、7）；L3 gate 報告 ingest（Task 14B） |
 | P2 | `tests/acceptance/cases.yaml`（`invariant_ids` 六項、每案 `case_id`、`suite`、`layer`、`platforms`、`invariants`、`necessity`、`destructive`、`expected: PASS\|XFAIL`、`sentinel: null\|{issue,signature,expires}`、`stage0_required`、`cli_stage`、`daemon_slice`）、`tests/acceptance/cases.lock.json`（`sets.{stage0,cli_1A,cli_1B,slice_2.1,…,slice_2.4}`） | 必要案例集合、XFAIL 核准來源、六項不變量案例完整性（Task 3、7、7B、14B）；`f4-background-result-tail-consistent` 依 TST-D-6 目前為 `expected: PASS`，本計畫不另列手寫 XFAIL 清單 |
 | P2 | L1.5：`python3 func-test/runner.py --mode bridge --dut-mode local-process\|docker --report-dir DIR --selftest-report PATH [--scenarios]`，以 env `SERIALWRAP_CLI_EXE`／`SERIALWRAP_DAEMON_EXE`（arch §9.2）選 artifact；**runner 每個 case 自行啟停 daemon 與 bridge 拉起的 DUT**，證據目錄 `<report-dir>/<case_id>/<mode>/<run_index>/`：`manifest.json`（`l15-manifest.v1`：`transport.mode`、`artifacts.{cli.sha256,daemon.implementation,daemon.sha256,daemon.tree_sha256,release_manifest_sha256}`、`tool.tree_sha256`、`dut.{mode,image_id}`）、`comparison.json`（`comparison.v1`：`verdict`（含 `INSUFFICIENT_EVIDENCE`）、`streams[]`、`invariants[]`）、`bridge-manifest.json`（`closed_cleanly`、`failure`）、`wire.ndjson`（`dut_generation`）、`cli.ndjson`、`daemon.log`、`wal/` | L1.5 suite adapter（Task 5B）與 A/B 差分（Task 7B）；**P2 沒有獨立的模擬器 launch／stop／state-digest CLI，也沒有 A/B 比較器**——P2 的比較器是單次 run 的 WAL↔wire 工具（`comparison.v1`），A/B 編排與差分由本計畫的 `tools/stage3/ab_diff.py`（Task 7B）提供（P2 第 29 行） |
 | P2 | L2：`testpilot run serialwrap_regression`（testbed `serialwrap_exe`、`bench_lock_path`；報告目錄由引擎自選 `~/b-log/regression-reports/tp-<ts>/report.json`，不接受外部 report dir，盤點 08 §3.1）；L3：`python3 -m realhw --tier <t> --report-dir DIR`（`realhw/config.json` 的 `serialwrap_exe`、#154 版本 gate TST-D-10；`report.json.meta.cli_identity.{resolved,sha256,pinned}`、`meta.started_at_utc`；`lr-mixed` PID 取 `daemon status.pid`，TST-D-12） | L2／L3 suite adapter（Task 5B）指向各側 artifact 並核對實際受測身分 |
@@ -508,6 +508,11 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFERRED = ("resources", "min_effective_load", "comparison_uncertainty")
+P2_DEFERRED_FIELDS = {   # P2 Task 15「延後項讀寫契約」逐字；Task 15 od09_freeze.PER_PLATFORM_FIELDS 必須相等（test_per_platform_fields_match_p2）
+    "resources": ("rss_peak_kb", "rss_steady_kb", "rss_slope_kb_per_h"),
+    "min_effective_load": ("min_completed_per_board_source", "max_idle_gap_s"),
+    "comparison_uncertainty": ("error_rate_abs_tolerance", "throughput_ratio_tolerance", "stuck_s_tolerance", "max_reruns"),
+}
 
 pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
@@ -529,6 +534,13 @@ def test_p2_acceptance_deferred_and_workload_keys():
     assert {"min_continuous_duration_s", "snapshot_interval_s", "max_observation_gap_factor", "engine_files"} <= set(doc["workload"])
     for k in DEFERRED:
         assert doc["thresholds"][k]["status"] in ("deferred", "frozen")
+        # OD-09 延後項讀寫契約（P2 Task 15）：數值只在 per_platform.<os> 之下，欄位名即 Task 15 freeze 的寫入介面
+        assert set(doc["thresholds"][k]["per_platform"]) == {"linux", "windows"}
+        for os_name in ("linux", "windows"):
+            assert set(doc["thresholds"][k]["per_platform"][os_name]) == set(P2_DEFERRED_FIELDS[k])
+        assert not (set(doc["thresholds"][k]) & {f for fs in P2_DEFERRED_FIELDS.values() for f in fs})   # 無直接掛在 key 下的數值欄位
+        assert not ({"tolerance", "rerun_rule", "deferred"} & set(doc["thresholds"][k]))
+    assert "deferred" not in doc and "deferred" not in doc["thresholds"]
 
 
 def test_p2_cases_yaml_and_lock():
@@ -627,7 +639,7 @@ def write_fake_repo(root: Path, *, layer: str = "l1.5") -> Path
     # 建立假 repo：contracts/behavior_changes.yaml（BC-01 scope both、SC-15 scope rust_only 等）、tests/acceptance/cases.yaml（含六個 invariant_ids、
     # 每個 invariant 至少一個 case、一個 destructive case、一個 expected XFAIL＋sentinel 的 case）、tests/acceptance/cases.lock.json、
     # tools/stage3/、tools/uart_stdio_bridge/、func-test/runner.py、regression/、realhw/（各放一個 stub 檔，供 FrozenTree）、profiles/default.yaml、
-    # realhw/acceptance/longrun_acceptance.yaml（P2 形狀，三個延後項 status deferred）
+    # realhw/acceptance/longrun_acceptance.yaml 與 longrun_acceptance.schema.json：自本 repo 實際 P2 檔原樣複製（不自造 fixture；三個延後項 status deferred、per_platform 值為 null）
 def write_ab_manifest(root: Path, *, layer: str = "l1.5", platform: str = "linux", stage: str = "3", **overrides: Any) -> Path
     # 呼叫 write_fake_repo；A=baseline（daemon python）、B=candidate（daemon rust）兩個 bundle；依 Task 1 schema 寫 ab-manifest.json，
     # case_ids 預設＝該 layer／platform 的 required_case_set 案例；計算全部 FrozenFile／FrozenTree；overrides 以 dotted key 覆寫（如 "reverify.enabled"=True）
@@ -2789,20 +2801,20 @@ def ingest(index_path: Path, *, kind: str, item_id: str, platform: str, report: 
 
 ---
 
-## Task 15：OD-09 延後凍結程序與凍結後 gate 判定（`tools/stage3/od09_freeze.py`）
+## Task 15：OD-09 延後凍結程序與凍結輸出對正式 gate 的讀寫契約（`tools/stage3/od09_freeze.py`）
 
 **Test author model:** codex-gpt-6-luna-max
 **Implementer model:** haiku-xhigh
 **Changelog fragment:** `changelog.d/rust-p9-15-od09-freeze.md`
 **BLOCKED-OWNER:** BO-P9-12（兩平台修正後 Python 48h 基線證據；擁有者核准數值；時序必須早於任何 Rust 候選長跑，最早者為 Stage 1B 的 `S1B-L3-MIXED-48H-WINDOWS`，因此實務上於 Stage 0 出口完成）。
 
-P2 的 `longrun_acceptance.yaml` 把三個延後項放在 `thresholds.{resources,min_effective_load,comparison_uncertainty}`（`status: deferred`、純量欄位為 null），P2 gate 對 deferred 一律 `BLOCKED`，但**沒有定義凍結後如何判定**。本 Task 補上：凍結程序、P2 schema 的每平台形式，以及 gate 對已凍結延後項的判定。
+P2 的 `longrun_acceptance.yaml` 把三個延後項放在 `thresholds.{resources,min_effective_load,comparison_uncertainty}`，key 層級 `status: deferred`，數值只在 `per_platform.{linux,windows}.<field>` 之下（初值 null）；P2 gate 對 deferred 一律 `BLOCKED`，對 `status: frozen` 已有判定規則（P2 Task 15 checks 表的 `resources`／`min_effective_load`／`comparison_uncertainty`／`error_rate_relative`／`throughput_relative`／`stuck_relative` 列），且只讀 `per_platform[platform]`。讀寫契約（路徑、欄位名、型別）以 P2 Task 15「延後項讀寫契約」表為唯一來源。本 Task 只補上**寫入端**：凍結程序（stats → propose → freeze）、時序守門 `check_frozen_before`，以及「凍結輸出能被正式 gate 原樣讀取」的整合測試；**不改 gate 判定、不改名、不另設 `deferred`／`tolerance`／`rerun_rule` 等子樹**。
 
 **Files:**
 - Create: `tools/stage3/od09_freeze.py`
 - Create: `tests/fakes_od09.py`（`od09_env`）
-- Modify: `realhw/acceptance/longrun_acceptance.schema.json`（延後項的純量欄位允許 `null`、number，或每平台物件 `{"linux": …, "windows": …}`；`min_completed_per_board_source` 允許 `{"<com>|<source>": int}` 或其每平台物件；凍結時 `decision_id`、`approved_by`、`overrides`、`proposal_sha256`、`baseline_entry_ids` 為必填）
-- Modify: `realhw/acceptance/gate.py`（三個延後項 `status: frozen` 時的判定，見下；deferred 行為不變）
+- Modify: `realhw/acceptance/longrun_acceptance.schema.json`（只新增凍結紀錄欄位：`status: frozen` 時 `decision_id`、`approved_by`、`overrides`、`proposal_sha256`、`baseline_entry_ids` 為必填；`per_platform` 形狀與欄位型別沿用 P2，不放寬；同一 commit 讓 P2 `tests/test_longrun_gate.py` 的 `LongrunFixture`「填好延後項的 acceptance 副本」補上這五欄，P2 既有測試維持綠燈）
+- 不修改 `realhw/acceptance/gate.py`：若整合測試因 gate 未依 `per_platform[platform]` 讀值而紅，屬 P2 Task 15 缺陷，回 P2 修正並補 P2 測試；不得在 `od09_freeze` 內加相容層或寫第二份值
 - Marker（P0 T14 檔內 `pytestmark`，非 YAML 登錄）：（`test_stage3_od09.py: {class: core_portable, resources: [memory_only]}`、`test_longrun_gate_frozen.py: {class: core_portable, resources: [memory_only]}`）
 - Test: `tests/test_stage3_od09.py`、`tests/test_longrun_gate_frozen.py`
 
@@ -2811,6 +2823,12 @@ P2 的 `longrun_acceptance.yaml` 把三個延後項放在 `thresholds.{resources
 
 ```python
 DEFERRED_KEYS: tuple[str, ...] = ("resources", "min_effective_load", "comparison_uncertainty")
+PLATFORMS: tuple[str, ...] = ("linux", "windows")
+PER_PLATFORM_FIELDS: Mapping[str, tuple[str, ...]] = {   # 必須等於 P2 Task 15「延後項讀寫契約」與 tests/test_stage3_consumes.py 的 P2_DEFERRED_FIELDS
+    "resources": ("rss_peak_kb", "rss_steady_kb", "rss_slope_kb_per_h"),
+    "min_effective_load": ("min_completed_per_board_source", "max_idle_gap_s"),
+    "comparison_uncertainty": ("error_rate_abs_tolerance", "throughput_ratio_tolerance", "stuck_s_tolerance", "max_reruns"),
+}
 BASELINE_ITEMS: Mapping[str, str] = {"linux": "S0-L3-BASELINE-LINUX-48H", "windows": "S0-L3-BASELINE-WINDOWS-48H"}
 PROPOSAL_RULES: Mapping[str, str]   # 公式的人類可讀描述，原樣寫入 proposal
 @dataclass(frozen=True)
@@ -2825,6 +2843,7 @@ class BaselineStats:
     rss_steady_median_kb: int
     rss_steady_slope_kb_per_h: float
     hourly_done: Mapping[str, Mapping[str, int]]    # "<com>|<source>" -> {"min": n, "p10": n, "hours": h}
+    completed_total: Mapping[str, int]              # "<com>|<source>" -> 全程 completed（P2 counting.definitions.completed）
 def workload(acceptance_path: Path) -> Mapping[str, Any]          # 回 acceptance 的 workload 段（時長、間隔、缺口係數唯一來源）
 def baseline_stats(case_dir: Path, *, platform: str, release_manifest: Path) -> BaselineStats
 def validate_baseline(stats: BaselineStats, *, acceptance_path: Path) -> list[str]
@@ -2835,31 +2854,31 @@ def freeze(acceptance_path: Path, proposal: dict, *, decision_id: str, approved_
 def check_frozen_before(acceptance_path: Path, run_started_at: str) -> list[str]
 ```
 
-`baseline_stats`：`duration_s = last_t - first_t`；`max_snapshot_gap_s` 為相鄰快照最大間隔；`snapshot_interval_s` 為間隔中位數；RSS：`peak = max(rss_kb)`，穩態窗＝後半段快照，`median`、`slope`（最小平方法，kb/h）；`hourly_done`：依 `t // 3600` 分桶，每 (`com`, `source`) 只計 `kind=="done"`，只統計完整小時（排除最後不滿一小時的桶），取 `min` 與第 10 百分位（nearest-rank）。
+`baseline_stats`：`duration_s = last_t - first_t`；`max_snapshot_gap_s` 為相鄰快照最大間隔；`snapshot_interval_s` 為間隔中位數；RSS：`peak = max(rss_kb)`，穩態窗＝最後 24 h 快照（與 P2 gate `resources` 的 steady／slope 窗相同），`median`、`slope`（最小平方法，kb/h）；`hourly_done`：依 `t // 3600` 分桶，每 (`com`, `source`) 只計 `kind=="done"`，只統計完整小時（排除最後不滿一小時的桶），取 `min` 與第 10 百分位（nearest-rank）；`completed_total`：每 (`com`, `source`) 全程 completed 數，定義與 P2 `counting.definitions.completed` 相同（`kind=="done"`，或 `kind=="bg_result"` 且 `status=="done"`）。
 
 `validate_baseline` 違規（時長與係數一律讀 `workload(acceptance_path)`，本模組不重複數值，§15.11.4 唯一來源）：`daemon_implementation != "python"`（基線必須是 Python）；`duration_s < workload.min_continuous_duration_s`；`max_snapshot_gap_s > workload.max_observation_gap_factor × snapshot_interval_s`（不得拼接 segments）；任一 (`com`,`source`) 的 `min == 0`（負載中斷）。
 
-`propose` 固定公式（本計畫先於基線存在而定，**不得在看到基線後修改公式；擁有者只能在 freeze 時以 `overrides` 明示覆寫，覆寫會原樣記錄**）。`I = max(linux.snapshot_interval_s, windows.snapshot_interval_s)`；鍵直接對應 P2 的欄位名：
+`propose` 固定公式（本計畫先於基線存在而定，**不得在看到基線後修改公式；擁有者只能在 freeze 時以 `overrides` 明示覆寫，覆寫會原樣記錄**）。`I = max(linux.snapshot_interval_s, windows.snapshot_interval_s)`；路徑與欄位名逐字等於 P2 的 `thresholds.<key>.per_platform.<os>.<field>`（`<os>` 取 `PLATFORMS` 兩者，`s` 為該平台的 `BaselineStats`）：
 
-| 鍵（`thresholds.` 之下） | 值 |
+| 路徑（`thresholds.` 之下） | 值 |
 |---|---|
-| `resources.rss_peak_kb.<platform>` | `ceil(1.25 × rss_peak_kb)` |
-| `resources.rss_steady_kb.<platform>` | `ceil(1.25 × rss_steady_median_kb)` |
-| `resources.rss_slope_kb_per_h.<platform>` | `max(ceil(2 × rss_steady_slope_kb_per_h), 256)` |
-| `min_effective_load.min_completed_per_board_source.<platform>` | 每個 `"<com>\|<source>"`：`max(1, floor(0.5 × p10))`（每完整小時） |
-| `min_effective_load.max_idle_gap_s` | `3600`（每個完整小時都必須有完成的命令） |
-| `comparison_uncertainty.tolerance` | `{"error_rate_abs": 0.002, "stuck_total_s": 2×I, "stuck_longest_s": I, "boundary_band_insufficient": true, "observation_gap_insufficient_s": 2×I}`（結果落在門檻 ± 容許差內 → `INSUFFICIENT_EVIDENCE`） |
-| `comparison_uncertainty.rerun_rule` | `{"max_extra_rounds": 1, "order": ["B","A"], "rule": "all_rounds_pass"}` |
+| `resources.per_platform.<os>.rss_peak_kb` | `ceil(1.25 × s.rss_peak_kb)` |
+| `resources.per_platform.<os>.rss_steady_kb` | `ceil(1.25 × s.rss_steady_median_kb)` |
+| `resources.per_platform.<os>.rss_slope_kb_per_h` | `max(ceil(2 × s.rss_steady_slope_kb_per_h), 256)` |
+| `min_effective_load.per_platform.<os>.min_completed_per_board_source` | `{"<com>\|<source>": max(1, floor(0.5 × s.completed_total[key]))}`，鍵＝該平台基線出現的全部 (`com`,`source`)（全程 completed 下限，P2 gate 依此鍵逐一判定） |
+| `min_effective_load.per_platform.<os>.max_idle_gap_s` | `3600`（同一 `<com>\|<source>` 相鄰 completed 事件間隔上限） |
+| `comparison_uncertainty.per_platform.<os>.error_rate_abs_tolerance` | `0.002` |
+| `comparison_uncertainty.per_platform.<os>.throughput_ratio_tolerance` | `0.02` |
+| `comparison_uncertainty.per_platform.<os>.stuck_s_tolerance` | `I`（一個快照間隔的量化誤差） |
+| `comparison_uncertainty.per_platform.<os>.max_reruns` | `1` |
 
-proposal 另含 `baseline_artifacts`、`proposal_rules`（`PROPOSAL_RULES`）、`generated_at`、`acceptance_revision`（產生時的 `revision`）、`proposal_sha256`（不含自身欄位：`sha256(dumps_compact)`）。
+proposal 形狀與 acceptance 子樹同構：`{"thresholds": {<key>: {"per_platform": {"linux": {...}, "windows": {...}}}}, ...}`，`propose` 產出後以 `PER_PLATFORM_FIELDS` 自我檢查（每個 key、每個平台欄位集合恰等於 `PER_PLATFORM_FIELDS[key]`、值非 null）。proposal 另含 `baseline_artifacts`、`proposal_rules`（`PROPOSAL_RULES`）、`generated_at`、`acceptance_revision`（產生時的 `revision`）、`proposal_sha256`（不含自身欄位：`sha256(dumps_compact)`）。
 
-`freeze` 前置（任一不符 → `HarnessError`）：兩平台 `BASELINE_ITEMS` 在 Stage 0 對應平台 target 下 `item_status == "SATISFIED"`，否則 `HARNESS_OD09_BASELINE_INVALID`；證據索引中任何 `candidate_longrun:true` 項目的 entry（不論結果、不論平台）存在 → `HARNESS_OD09_TOO_LATE`（已有 Rust 候選長跑開始，不得事後凍結）；acceptance 檔任一 `thresholds.<DEFERRED_KEYS>.status` 已為 `frozen` → `HARNESS_OD09_TOO_LATE`；`proposal_sha256` 重算不符或 `proposal.acceptance_revision` 不等於現行 `revision` → `HARNESS_OD09_BASELINE_INVALID`。通過後對每個 `DEFERRED_KEYS` 改寫 `thresholds.<key>`：`status: frozen`、`frozen_at: now`、保留 `decision: OD-09` 與 `freeze_deadline`、新增 `decision_id`、`approved_by`、`overrides`、`proposal_sha256`、`baseline_entry_ids`，並把 proposal 值（套上 overrides）寫進 P2 的純量欄位（每平台物件形式）；頂層 `revision` 改為 `f"{now 日期}.{n}"`（同日第 n 次）；其他鍵逐值保留；以 PyYAML `safe_dump(sort_keys=False, allow_unicode=True)` 寫回並以 `gate.load_acceptance` 驗證。在 `addenda_path` 附加一列 `| <decision_id> | OD-09 延後項凍結 | <now 日期> | approved_by=<…>；revision=<新 revision>；proposal_sha256=<…>；overrides=<鍵清單或 無> |`。回傳 `{"thresholds":{三鍵寫入後內容},"revision","acceptance_sha256","requires_baseline_gate_rerun":true}`；CLI `od09 freeze --out` 把它寫成 ingest 用的報告。凍結改變 `revision`，P2 `baseline_compatible` 要求候選與基線 gate 的 revision 相同，因此凍結後**必須**以新 revision 對兩平台已保存的基線證據重跑 `python3 -m realhw.acceptance.gate --mode baseline`（離線、不重跑長跑），程序寫在 `od09-deferred-freeze.md`。
+`freeze` 前置（任一不符 → `HarnessError`）：兩平台 `BASELINE_ITEMS` 在 Stage 0 對應平台 target 下 `item_status == "SATISFIED"`，否則 `HARNESS_OD09_BASELINE_INVALID`；證據索引中任何 `candidate_longrun:true` 項目的 entry（不論結果、不論平台）存在 → `HARNESS_OD09_TOO_LATE`（已有 Rust 候選長跑開始，不得事後凍結）；acceptance 檔任一 `thresholds.<DEFERRED_KEYS>.status` 已為 `frozen` → `HARNESS_OD09_TOO_LATE`；`proposal_sha256` 重算不符或 `proposal.acceptance_revision` 不等於現行 `revision` → `HARNESS_OD09_BASELINE_INVALID`；**介面一致性**：acceptance 檔每個 `DEFERRED_KEYS` 必須有 `per_platform`，其平台集合恰為 `PLATFORMS`、每平台欄位集合恰為 `PER_PLATFORM_FIELDS[key]`，proposal 的 `thresholds.<key>.per_platform` 亦同，且 `overrides` 的每個鍵必須是 `"<key>.per_platform.<os>.<field>"` 且指向上述既有欄位——任一不符 → `HARNESS_OD09_BASELINE_INVALID`（`detail` 列出多出／缺少的路徑），檔案不得被改動。通過後對每個 `DEFERRED_KEYS` 改寫 `thresholds.<key>`：`status: frozen`、`frozen_at: now`、保留 `decision: OD-09` 與 `freeze_deadline`、新增 `decision_id`、`approved_by`、`overrides`、`proposal_sha256`、`baseline_entry_ids`，並把 proposal 值（套上 overrides）逐欄寫進**既有的** `thresholds.<key>.per_platform.<os>.<field>`（兩平台一次寫入；不新增其他數值欄位或子樹，不寫任何 `deferred` 子樹）；頂層 `revision` 改為 `f"{now 日期}.{n}"`（同日第 n 次）；其他鍵逐值保留；以 PyYAML `safe_dump(sort_keys=False, allow_unicode=True)` 寫回並以 `gate.load_acceptance` 驗證。在 `addenda_path` 附加一列 `| <decision_id> | OD-09 延後項凍結 | <now 日期> | approved_by=<…>；revision=<新 revision>；proposal_sha256=<…>；overrides=<鍵清單或 無> |`。回傳 `{"thresholds":{三鍵寫入後內容},"revision","acceptance_sha256","requires_baseline_gate_rerun":true}`；CLI `od09 freeze --out` 把它寫成 ingest 用的報告。凍結改變 `revision`，但 P2 `baseline_compatible` **不**要求候選與基線 gate 的 `acceptance.revision` 相同（只比對 `platform`、`run.engine_files_sha256`、`workload_contract_sha256` 與基線 PASS；凍結只改 `thresholds`，不影響 `workload`＋`counting` 的 sha）。凍結後仍以新 revision 對兩平台已保存的基線證據重跑 `python3 -m realhw.acceptance.gate --mode baseline`（離線、不重跑長跑），作為凍結值可被正式 gate 讀取的自檢並供候選引用（`requires_baseline_gate_rerun:true` 保留），程序寫在 `od09-deferred-freeze.md`。
 
-`check_frozen_before(path, ts)`：回傳違規清單——任一 `DEFERRED_KEYS` 的 `thresholds.<key>.status != "frozen"` → `"<key> not frozen"`；`frozen_at >= ts` → `"<key> frozen after run start"`。
+`check_frozen_before(path, ts)`：讀與正式 gate 相同的路徑，回傳違規清單——任一 `DEFERRED_KEYS` 的 `thresholds.<key>.status != "frozen"` → `"<key> not frozen"`；`frozen_at >= ts` → `"<key> frozen after run start"`；`status == "frozen"` 但任一 `thresholds.<key>.per_platform.<os>.<field>`（`PLATFORMS` × `PER_PLATFORM_FIELDS[key]`）缺少或為 null → `"<key>.per_platform.<os>.<field> missing"`（不得只看 `status` 就宣告已凍結）；`gate.load_acceptance(path)` 拋出 schema 錯誤 → `"acceptance schema invalid: <訊息>"`。
 
-**`gate.py` 凍結後判定**（只在 `thresholds.<key>.status == "frozen"` 時；值取 `values[platform]`）：
-- candidate 模式：`resources` → 候選 RSS 峰值、後半段中位數、斜率三項皆 ≤ 門檻 → PASS，任一超過 → FAIL；`min_effective_load` → 每個完整小時、每個列出的 `<com>|<source>` 的 completed ≥ 門檻、且無超過 `max_idle_gap_s` 的空檔 → PASS，否則 `INSUFFICIENT_EVIDENCE`（負載不足是證據不足，不是產品 PASS）；`comparison_uncertainty` → 以 `tolerance` 套用到 `error_rate_relative`、`stuck_relative`：結果落在門檻 ± 容許差內 → 該 relative check 改為 `INSUFFICIENT_EVIDENCE`，`observation_gap_insufficient_s` 取代 `observation_gaps` 的判定界線。
-- baseline 模式：三項回 `NOT_APPLICABLE_BASELINE`（`detail` 記錄實測值供校準），且不受 `pre_frozen` 檢查影響（延後項本來就在基線之後凍結，§11.6）。
+**凍結後 gate 判定**：沿用 P2 Task 15 gate 既有規則，本 Task 不另定義、不修改 `gate.py`。對照（皆讀 `thresholds.<key>.per_platform[platform]`）：`resources` → `rss_peak_kb`／`rss_steady_kb`／`rss_slope_kb_per_h`（峰值、最後 24 h 中位數、最後 24 h 斜率，任一超過 → FAIL）；`min_effective_load` → `min_completed_per_board_source` 的每個鍵與 `max_idle_gap_s`（不足 → INSUFFICIENT_EVIDENCE）；`comparison_uncertainty` → `error_rate_abs_tolerance` 用於 `error_rate_relative`、`throughput_ratio_tolerance` 用於 `throughput_relative`、`stuck_s_tolerance` 用於 `stuck_relative`、`max_reruns` 為重跑上限。baseline 模式三項回 `NOT_APPLICABLE_BASELINE`，且不受 `pre_frozen` 檢查影響（延後項本來就在基線之後凍結，§11.6）。
 
 **Steps:**
 
@@ -2867,7 +2886,7 @@ proposal 另含 `baseline_artifacts`、`proposal_rules`（`PROPOSAL_RULES`）、
 
 ```python
 def test_freeze_refused_after_candidate_longrun(tmp_path):
-    env = fakes_od09.od09_env(tmp_path)   # 建 P2 形狀 acceptance（三延後項 deferred）、兩平台基線 case_dir、Stage 0 兩平台 target 與 SATISFIED 基線 entries
+    env = fakes_od09.od09_env(tmp_path)   # 複製 repo 實際 P2 acceptance＋schema（三延後項 deferred）、兩平台基線 case_dir、Stage 0 兩平台 target 與 SATISFIED 基線 entries
     cat = evidence_index.load_exit_catalog()
     evidence_index.add_entry(env.index, fakes_evidence.entry(tmp_path, "S1B-L3-MIXED-48H-WINDOWS", "INFRA_ERROR", platform="windows"),
                              catalog=cat)
@@ -2881,13 +2900,60 @@ def test_freeze_refused_after_candidate_longrun(tmp_path):
 def test_proposal_formula_fixed(tmp_path):
     env = fakes_od09.od09_env(tmp_path, linux_rss_peak=40000, linux_slope=10.0, interval=300)
     prop = od09_freeze.propose(env.linux_stats, env.windows_stats)
-    assert prop["resources"]["rss_peak_kb"]["linux"] == 50000
-    assert prop["resources"]["rss_slope_kb_per_h"]["linux"] == 256
-    assert prop["comparison_uncertainty"]["tolerance"]["stuck_longest_s"] == 300
-    assert prop["comparison_uncertainty"]["tolerance"]["error_rate_abs"] == 0.002
+    lin = prop["thresholds"]["resources"]["per_platform"]["linux"]
+    assert lin["rss_peak_kb"] == 50000
+    assert lin["rss_slope_kb_per_h"] == 256
+    cu = prop["thresholds"]["comparison_uncertainty"]["per_platform"]["linux"]
+    assert cu == {"error_rate_abs_tolerance": 0.002, "throughput_ratio_tolerance": 0.02, "stuck_s_tolerance": 300, "max_reruns": 1}
+    load = prop["thresholds"]["min_effective_load"]["per_platform"]["windows"]
+    assert load["max_idle_gap_s"] == 3600
+    key = "COM0|agent:rhw0"
+    assert load["min_completed_per_board_source"][key] == max(1, env.windows_stats.completed_total[key] // 2)
+    for k in od09_freeze.DEFERRED_KEYS:
+        assert "tolerance" not in prop["thresholds"][k] and "rerun_rule" not in prop["thresholds"][k]
+
+
+def test_real_p2_acceptance_roundtrip_propose_freeze_check_gate(tmp_path):
+    # 介面一致性：以 repo 實際 P2 門檻檔（非自造 fixture）走 propose → freeze → check_frozen_before → gate.evaluate
+    real = ROOT / "realhw" / "acceptance" / "longrun_acceptance.yaml"
+    env = fakes_od09.od09_env(tmp_path)
+    assert env.acceptance.read_bytes() == real.read_bytes()            # 替身不得改寫或自造 acceptance
+    before = yaml.safe_load(real.read_text(encoding="utf-8"))
+    assert sorted(od09_freeze.check_frozen_before(env.acceptance, fakes.ts(21, 0))) == sorted(
+        f"{k} not frozen" for k in od09_freeze.DEFERRED_KEYS)
+    cat = evidence_index.load_exit_catalog()
+    prop = od09_freeze.propose(env.linux_stats, env.windows_stats)
+    od09_freeze.freeze(env.acceptance, prop, decision_id="OD-09-F1", approved_by="owner", overrides={}, index_path=env.index,
+                       catalog=cat, evidence_root=env.evidence_root, cases={}, addenda_path=env.addenda, now=fakes.ts(20, 9))
+    after = yaml.safe_load(env.acceptance.read_text(encoding="utf-8"))
+    assert "deferred" not in after and "deferred" not in after["thresholds"]
+    for k in od09_freeze.DEFERRED_KEYS:
+        t = after["thresholds"][k]
+        assert t["status"] == "frozen"
+        assert set(t["per_platform"]) == set(before["thresholds"][k]["per_platform"]) == {"linux", "windows"}
+        for os_name in ("linux", "windows"):
+            assert set(t["per_platform"][os_name]) == set(before["thresholds"][k]["per_platform"][os_name])   # 欄位名沿用 P2，無改名
+            assert all(v is not None for v in t["per_platform"][os_name].values())
+        assert set(t) - {"per_platform"} <= {"status", "decision", "freeze_deadline", "frozen_at", "decision_id", "approved_by",
+                                            "overrides", "proposal_sha256", "baseline_entry_ids"}
+    gate.load_acceptance(env.acceptance)                                 # 正式 schema 驗證通過
+    assert od09_freeze.check_frozen_before(env.acceptance, fakes.ts(21, 0)) == []
+    # 以凍結後新 revision 重跑基線 gate，再以正式 gate 評估健康候選：延後項不得仍為 BLOCKED，且數值確實被讀到
+    run = fakes_od09.longrun_case(tmp_path / "cand", platform="linux", started_at=fakes.ts(21, 0),
+                                  rss_peak_kb=after["thresholds"]["resources"]["per_platform"]["linux"]["rss_peak_kb"] - 1)
+    out = gate.evaluate(run.inputs(mode="candidate", acceptance_path=env.acceptance,
+                                   baseline=fakes_od09.rerun_baseline_gate(env, platform="linux")))
+    res = {c["id"]: c["result"] for c in out["checks"]}
+    assert res["resources"] == res["min_effective_load"] == res["comparison_uncertainty"] == "PASS"
+    assert out["release_gate_result"] == "PASS"
+    over = fakes_od09.longrun_case(tmp_path / "over", platform="linux", started_at=fakes.ts(21, 0),
+                                   rss_peak_kb=after["thresholds"]["resources"]["per_platform"]["linux"]["rss_peak_kb"] + 1)
+    out2 = gate.evaluate(over.inputs(mode="candidate", acceptance_path=env.acceptance,
+                                     baseline=fakes_od09.rerun_baseline_gate(env, platform="linux")))
+    assert {c["id"]: c["result"] for c in out2["checks"]}["resources"] == "FAIL"   # 證明 gate 讀的正是 freeze 寫入的欄位
 ```
 
-（`fakes_od09.od09_env(root, *, linux_rss_peak=40000, linux_slope=10.0, interval=300, duration_s=None, rust_baseline=False)`：`duration_s=None` 時取 acceptance 的 `workload.min_continuous_duration_s`；回傳 `SimpleNamespace(acceptance, index, evidence_root, addenda, contract, linux_stats, windows_stats, linux_case_dir, windows_case_dir)`。）
+（`fakes_od09.od09_env(root, *, linux_rss_peak=40000, linux_slope=10.0, interval=300, duration_s=None, rust_baseline=False)`：acceptance 與 schema 一律自 repo 實際 `realhw/acceptance/longrun_acceptance.yaml`、`longrun_acceptance.schema.json` **原樣複製**（測試需要變形時只能在複本上以 dotted-path 修改單一鍵，不得自建整份檔）；`duration_s=None` 時取 acceptance 的 `workload.min_continuous_duration_s`；回傳 `SimpleNamespace(acceptance, index, evidence_root, addenda, contract, linux_stats, windows_stats, linux_case_dir, windows_case_dir)`。`fakes_od09.longrun_case(dir, *, platform, started_at, rss_peak_kb, completed_scale=1.0)` 以 P2 Task 15 `LongrunFixture` 建健康候選 report／case_dir（completed 預設等於基線 `completed_total`），回傳物件的 `inputs(*, mode, acceptance_path, baseline)` 產生 `gate.GateInputs`；測試檔頭 `ROOT = Path(__file__).resolve().parents[1]`，並 `import yaml`、`from realhw.acceptance import gate`；`fakes_od09.rerun_baseline_gate(env, *, platform)` 以凍結後的 acceptance 對 `env.<platform>_case_dir` 執行 `gate.evaluate(mode="baseline")` 並寫出 `release-gate.json`，回傳其路徑。）
 
 | 測試名 | 斷言 |
 |---|---|
@@ -2898,29 +2964,33 @@ def test_proposal_formula_fixed(tmp_path):
 | `test_thresholds_read_from_workload` | 把替身 acceptance 的 `min_continuous_duration_s` 改為 3600 → 1.5h 基線不再因時長違規（證明沒有硬寫 172800） |
 | `test_rust_baseline_rejected` | `daemon_implementation == "rust"` → 違規 |
 | `test_load_stop_rejected` | 某來源某完整小時 done=0 → 違規 |
-| `test_freeze_writes_only_deferred_and_bumps_revision` | freeze 後 `thresholds` 中三個已凍結項與其他頂層鍵逐值不變；三延後項 `status == "frozen"`、`decision_id == "OD-09-F1"`、`rss_peak_kb == {"linux":…, "windows":…}`；`revision` 改變；`gate.load_acceptance` 驗證通過 |
-| `test_freeze_records_overrides` | `overrides={"resources.rss_peak_kb.linux": 60000}` → 值為 60000、`overrides` 原樣記錄、addenda 該列含 `resources.rss_peak_kb.linux` |
+| `test_per_platform_fields_match_p2` | `dict(od09_freeze.PER_PLATFORM_FIELDS)` 的每個 key 的欄位集合 == repo 實際 P2 `longrun_acceptance.yaml` 中 `thresholds.<key>.per_platform.linux` 與 `.windows` 的鍵集合，且 == `tests/test_stage3_consumes.py` 的 `P2_DEFERRED_FIELDS`（P2 改名時本測試先紅） |
+| `test_freeze_writes_only_deferred_and_bumps_revision` | freeze 後 `thresholds` 中三個已凍結項與其他頂層鍵逐值不變；三延後項 `status == "frozen"`、`decision_id == "OD-09-F1"`、`thresholds.resources.per_platform.linux.rss_peak_kb == prop["thresholds"]["resources"]["per_platform"]["linux"]["rss_peak_kb"]`（windows 同）；`"rss_peak_kb" not in thresholds.resources`、`"tolerance" not in thresholds.comparison_uncertainty`、頂層與 `thresholds` 無 `deferred` 鍵；`revision` 改變；`gate.load_acceptance` 驗證通過 |
+| `test_freeze_records_overrides` | `overrides={"resources.per_platform.linux.rss_peak_kb": 60000}` → `thresholds.resources.per_platform.linux.rss_peak_kb == 60000`、windows 值不變、`overrides` 原樣記錄、addenda 該列含 `resources.per_platform.linux.rss_peak_kb` |
+| `test_freeze_rejects_unknown_override_path` | `overrides={"resources.rss_budget.linux": 1}` 或 `{"comparison_uncertainty.per_platform.linux.tolerance": 1}` → `HARNESS_OD09_BASELINE_INVALID`、acceptance 檔 bytes 不變、addenda 無新列 |
+| `test_freeze_rejects_field_set_mismatch` | 在 acceptance 複本的 `thresholds.resources.per_platform.windows` 刪除 `rss_slope_kb_per_h`（模擬 P2 改名）→ `HARNESS_OD09_BASELINE_INVALID`、`detail` 含 `resources.per_platform.windows.rss_slope_kb_per_h`；proposal 刪除一欄並重算 sha → 同上；兩者 acceptance 檔 bytes 不變 |
 | `test_freeze_requires_satisfied_baselines` | windows 基線 entry 缺 → `HARNESS_OD09_BASELINE_INVALID` |
 | `test_refreeze_refused` | 已 frozen 再 freeze → `HARNESS_OD09_TOO_LATE` |
 | `test_tampered_proposal_rejected` | 修改 proposal 數值而不更新 sha → `HARNESS_OD09_BASELINE_INVALID`；proposal 的 `acceptance_revision` 與現行不同 → 同上 |
 | `test_check_frozen_before` | 未凍結 → 三條 `not frozen`；凍結於 t，run 於 t+1s → `[]`；run 於 t-1s → 三條 `frozen after run start` |
+| `test_check_frozen_before_rejects_null_values` | 先以 `freeze` 正常凍結（`frozen_at` 早於 run），再在複本上把三項的 `per_platform.windows` 各欄改回 null → 結果含 `"comparison_uncertainty.per_platform.windows.max_reruns missing"` 等每個 null 欄位、以及 `"acceptance schema invalid: …"`，不得回 `[]`（不得只看 `status` 宣告已凍結） |
 | `test_addenda_append_only` | 兩次（不同 acceptance 檔）freeze → addenda 檔前段原文不變、新增兩列 |
 
-`tests/test_longrun_gate_frozen.py`（`pytestmark = [core_portable, memory_only]`；以 P2 Task 15 的 gate 測試替身建 report／case_dir）：
+`tests/test_longrun_gate_frozen.py`（`pytestmark = [core_portable, memory_only]`；**acceptance 一律為 repo 實際 P2 檔的複本經本 Task `freeze` 寫出的結果**，不得手寫凍結後的 acceptance；report／case_dir 以 `fakes_od09.longrun_case`（P2 Task 15 gate 測試替身）建立；本檔驗證「freeze 寫出的欄位＝未修改的正式 gate 讀取的欄位」）：
 
 | 測試名 | 斷言 |
 |---|---|
-| `test_deferred_still_blocked` | 未凍結 → 三項 check 為 `BLOCKED`（P2 原行為不變） |
-| `test_frozen_resources_fail_over_budget` | candidate RSS 峰值超過 `rss_peak_kb[platform]` → `resources` FAIL、`release_gate_result == "FAIL"` |
-| `test_frozen_min_load_insufficient` | 某小時 completed 低於門檻 → `min_effective_load` `INSUFFICIENT_EVIDENCE` |
-| `test_frozen_tolerance_band_insufficient` | 錯誤率落在 baseline ± 0.002 內且高於 baseline → `error_rate_relative` `INSUFFICIENT_EVIDENCE` |
+| `test_deferred_still_blocked` | 未凍結（實際 P2 檔原樣）→ 三項 check 為 `BLOCKED`、`release_gate_result == "BLOCKED"`（P2 原行為不變） |
+| `test_frozen_resources_fail_over_budget` | freeze 後 linux candidate RSS 峰值 = `thresholds.resources.per_platform.linux.rss_peak_kb + 1` → `resources` FAIL、`release_gate_result == "FAIL"`；windows candidate 以 `per_platform.windows` 判定（以 override 讓兩平台值不同，同一峰值 linux PASS、windows FAIL） |
+| `test_frozen_min_load_insufficient` | freeze 後 candidate 的 `COM0\|agent:rhw0` 全程 completed = `per_platform.linux.min_completed_per_board_source["COM0\|agent:rhw0"] - 1` → `min_effective_load` `INSUFFICIENT_EVIDENCE`、`detail` 含該鍵；某鍵相鄰 completed 間隔 3601 s → 同上 |
+| `test_frozen_tolerance_band_insufficient` | freeze 後錯誤率 = baseline + 0.001（落在 `error_rate_abs_tolerance` 0.002 內）→ `error_rate_relative` `INSUFFICIENT_EVIDENCE`；baseline + 0.003 → FAIL；throughput 為基線 94%（落在 `[0.95 − throughput_ratio_tolerance, 0.95)`）→ `throughput_relative` `INSUFFICIENT_EVIDENCE` |
 | `test_baseline_mode_not_applicable` | baseline 模式、三項已凍結 → 三項 `NOT_APPLICABLE_BASELINE`、`baseline_result` 不受影響 |
-| `test_all_frozen_candidate_pass` | 全部符合 → `release_gate_result == "PASS"` |
+| `test_all_frozen_candidate_pass` | freeze 後、候選 `started_at` 晚於 `frozen_at`、基線 gate 以新 revision 重跑、全部符合 → 三延後項 check 皆 `PASS`（非 `BLOCKED`）、`release_gate_result == "PASS"` |
 
-- [ ] **Step 2：Run** `python3 -m pytest -q tests/test_stage3_od09.py tests/test_longrun_gate_frozen.py` → Expected: FAIL（`ImportError`；gate 測試因凍結判定未實作而斷言失敗）。
-- [ ] **Step 3：實作**（haiku）依規則與公式表；百分位與時間分桶只用 stdlib；YAML 以 PyYAML；`gate.py` 的修改不得改動 P2 既有 deferred／frozen 三項的判定與 `engine_result` 保留規則，並重跑 P2 的 `tests/test_longrun_gate.py`、`tests/test_longrun_acceptance_file.py`；登錄兩個測試檔。
-- [ ] **Step 4：Run** 同上＋P2 兩個 longrun 測試檔 → Expected: PASS。【BLOCKED-OWNER BO-P9-12】實際 `od09 stats → propose → freeze → 重跑基線 gate → check` 於兩平台基線完成後由擁有者執行（程序見 Task 17 的 `od09-deferred-freeze.md`）。
-- [ ] **Step 5：commit** `feat(stage3): 新增 OD-09 延後項凍結程序、時序守門與凍結後 gate 判定`（files 含 `tests/fakes_od09.py`、`realhw/acceptance/` 兩檔）。
+- [ ] **Step 2：Run** `python3 -m pytest -q tests/test_stage3_od09.py tests/test_longrun_gate_frozen.py` → Expected: FAIL（`ImportError: tools.stage3.od09_freeze`；`test_real_p2_acceptance_roundtrip_propose_freeze_check_gate` 與 `test_longrun_gate_frozen.py` 因 freeze 未實作而紅）。
+- [ ] **Step 3：實作**（haiku）依規則與公式表；百分位與時間分桶只用 stdlib；YAML 以 PyYAML；**不修改 `gate.py`**（只改 schema 的凍結紀錄必填欄位）；寫入路徑只用 `thresholds.<key>.per_platform.<os>.<field>`；並重跑 P2 的 `tests/test_longrun_gate.py`、`tests/test_longrun_acceptance_file.py`；登錄兩個測試檔。若整合測試紅在 gate 讀值（而非 freeze 寫值），停止並回報 P2 缺陷，不在本模組繞過。
+- [ ] **Step 4：Run** 同上＋P2 兩個 longrun 測試檔＋`tests/test_stage3_consumes.py` → Expected: PASS。【BLOCKED-OWNER BO-P9-12】實際 `od09 stats → propose → freeze → 重跑基線 gate → check` 於兩平台基線完成後由擁有者執行（程序見 Task 17 的 `od09-deferred-freeze.md`）。
+- [ ] **Step 5：commit** `feat(stage3): 新增 OD-09 延後項凍結程序、時序守門與凍結輸出對正式 gate 的整合驗證`（files 含 `tests/fakes_od09.py`、`realhw/acceptance/longrun_acceptance.schema.json`；不含 `gate.py`）。
 
 ---
 
@@ -3212,7 +3282,7 @@ fixtures 檔：`crates/sw-proto/tests/fixtures/stage3_retired_python_daemon.json
 | `evidence report` | `--index PATH --evidence-root DIR` | `render_report` |
 | `od09 stats` | `--case-dir DIR --platform P --release-manifest PATH` | `baseline_stats` |
 | `od09 propose` | `--linux-stats JSON --windows-stats JSON --out PATH` | `propose` |
-| `od09 freeze` | `--acceptance PATH --proposal PATH --decision-id ID --approved-by TEXT [--set KEY=VALUE ...] --index PATH --evidence-root DIR --addenda PATH --out PATH` | `freeze`（`--out` 寫 ingest 用 JSON） |
+| `od09 freeze` | `--acceptance PATH --proposal PATH --decision-id ID --approved-by TEXT [--set <key>.per_platform.<os>.<field>=VALUE ...] --index PATH --evidence-root DIR --addenda PATH --out PATH` | `freeze`（`--out` 寫 ingest 用 JSON） |
 | `od09 check` | `--acceptance PATH --run-started-at ISO` | `check_frozen_before` |
 | `retirement verify` | `[--mode {repo,release}] [--evidence-root DIR] [--bundle-manifest PLATFORM=PATH ...]` | `verify`（`release` 模式且 `retired:false` → exit 2、`HARNESS_RETIREMENT_NOT_APPROVED`） |
 | `retirement bundle-plan` | `--stage S [--dev]` | `bundle_plan` |
@@ -3345,7 +3415,7 @@ def test_od12_single_user_and_no_isolation_claim():
 | 13 | 實機回滾演練 | agy-gemini-3.8-flash-high | codex-gpt-6-luna-max |
 | 14 | Stage 0～3 出口證據索引 | codex-gpt-6-luna-max | agy-gemini-3.8-flash-high |
 | 14B | 證據 ingest | haiku-xhigh | codex-gpt-6-luna-max |
-| 15 | OD-09 延後凍結與凍結後 gate 判定 | codex-gpt-6-luna-max | haiku-xhigh |
+| 15 | OD-09 延後凍結與凍結輸出對正式 gate 的讀寫契約 | codex-gpt-6-luna-max | haiku-xhigh |
 | 16 | Python daemon 退役切換 | haiku-xhigh | codex-gpt-6-luna-max |
 | 17 | 工具入口與擁有者程序文件 | agy-gemini-3.8-flash-high | haiku-xhigh |
 

@@ -69,7 +69,7 @@
   - `cargo test --workspace` 的新增測試全部以 `not yet implemented: P8-Tn` 或斷言失敗收場，不得有編譯錯誤。
   - 對 Rust artifact 執行黑箱：新增案例全部 FAIL（不是 SKIP）。
 - **階段 B（實作）**：依 Task 1→15 順序執行步驟 4～6（實作、確認 PASS、commit），執行者為「Implementer model」。實作者不得修改階段 A 的斷言；認為斷言有誤時停下，交回測試作者與審查者裁決（§10.4）。
-- 每個 Task 完成後的審查：Claude Sonnet（effort max）＋Codex `gpt-6.1-sol`（medium），審查者不得為該 Task 的實作者（master plan §2）。Task 10（daemon 啟動序、start 失敗 exit 1）與 Task 14（更新／回滾守衛）由 haiku 實作，Sonnet 審查須逐項核對 §11.3 六項不變量與 Review Focus 5 並在審查紀錄列出結論。
+- 每個 Task 完成後的審查：Claude Sonnet（effort max）＋Codex `gpt-6.1-sol`（medium），審查者不得為該 Task 的實作者（master plan §2）。Task 10（daemon 啟動序、`FlashEndpoint` RAII 清理、start 失敗 exit 1）與 Task 14（更新／回滾守衛、跨 Stage 停止交接）屬 daemon 生命週期，依 master plan §2 與 06 §0.4「daemon 生命週期一律 `codex-gpt-6-luna-max`」由 Codex 實作（R0-F6；原派 haiku 已撤銷）；測試作者維持 `agy-gemini-3.8-flash-high`（≠ 實作者）。Sonnet 審查仍須逐項核對 §11.3 六項不變量與 Review Focus 5 並在審查紀錄列出結論。兩 Task 的 Windows 執行步驟（`scripts/rust/win-test.sh`）因 Codex `-s workspace-write` 沙箱可能擋 `/mnt/c`／`cmd.exe`，一律由 orchestrator 執行並把 `target/win-test-report/<run_id>.json` 路徑交給實作者（同 07 執行順序第 5 點）。
 
 ### 0.3 Artifact 與常用命令
 
@@ -118,11 +118,11 @@ scripts/rust/win-test.sh --package <crate> [--caps <res>]
 | 7 | PAL flash 端點能力（PTY symlink、raw、speed、master 寫入分身、line control） | agy-gemini-3.8-flash-high | codex-gpt-6-luna-max | P6 PTY |
 | 8 | SessionCore FLASHING 仲裁（probe 授權、Matched、HolderGone、flash-critical） | haiku-xhigh | codex-gpt-6-luna-max | P5、P6 |
 | 9 | FlashEndpoint 執行緒與認線協調（沉默、sync 回放、pump、holder-probe、baud 鏡射） | agy-gemini-3.8-flash-high | codex-gpt-6-luna-max | 0、2、7、8 |
-| 10 | `mcu.patterns`／`mcu.status` RPC 與 daemon 組裝 | agy-gemini-3.8-flash-high | haiku-xhigh | 9 |
+| 10 | `mcu.patterns`／`mcu.status` RPC 與 daemon 組裝 | agy-gemini-3.8-flash-high | codex-gpt-6-luna-max | 9 |
 | 11 | 外部工具裝置交接的黑箱與整合驗證 | haiku-xhigh | codex-gpt-6-luna-max | 0、6、8、P5 |
 | 12 | systemd 監管整合與有序停止 | agy-gemini-3.8-flash-high | codex-gpt-6-luna-max | 6、9、11、P4、P5 |
 | 13 | `windows-task` 監管對 Rust daemon 的驗證 | haiku-xhigh | codex-gpt-6-luna-max | 12、P4 |
-| 14 | 更新／回滾守衛對 Rust daemon 的驗證與補強（SC-23） | agy-gemini-3.8-flash-high | haiku-xhigh | 6、9、P4 |
+| 14 | 更新／回滾守衛對 Rust daemon 的驗證與補強（SC-23） | agy-gemini-3.8-flash-high | codex-gpt-6-luna-max | 6、9、P4 |
 | 15 | 全部凍結契約的最終覆蓋判定與切片出口腳本 | haiku-xhigh | agy-gemini-3.8-flash-high | 0～14 |
 
 ---
@@ -174,13 +174,13 @@ class ShellTarget:                            # fixture `shell_target`
 class FakeMcu:                                # fixture `fake_mcu`；fakemcu.py：TI SBL 子集（55 55 → 00 cc；之後每封包回 00 cc）
     def rx_log(self) -> bytes; def current_speed(self) -> int
 class FakeFlasher:                            # fakeflasher.py
-    def __init__(self, link: Path, *, baud: int | None): ...   # baud=None → 不 cfsetspeed
+    def __init__(self, link: Path, *, baud: int | None, excl: bool = False): ...   # baud=None → 不 cfsetspeed；excl=True → 開啟後 ioctl(TIOCEXCL)、close 時不清除（模擬自設獨占的 flasher）
     def write(self, b: bytes) -> None; def read_exact(self, n: int, timeout: float) -> bytes
     def set_baud(self, baud: int) -> None; def close(self) -> None
 class ExternalHolder:                         # extholder.py：子行程以單一行程持有 tty（flock=True 時 fcntl.flock(LOCK_EX)）
     pid: int
     def __init__(self, path: str, *, flock: bool): ...
-    def start(self) -> None; def stop(self) -> None
+    def start(self) -> None; def stop(self) -> None   # start：子行程 open 失敗（含 EBUSY＝daemon 關閉前未 TIOCNXCL，R0-F3）→ raise ExternalHolderOpenError(errno)，不得靜默視為持有中
 class HolderSampler:                          # holder_sampler.py：每 10 ms 掃 /proc，記錄 (t, pids) 序列
     def __init__(self, path: str, interval_s: float = 0.01): ...
     def __enter__(self) -> "HolderSampler"; def __exit__(self, *a) -> None
@@ -1528,6 +1528,7 @@ fn device_detached_during_flashing_is_deferred() {
 5. 起 holder watch thread（`slave_path`、poll 0.5 s、max 1800 s）：`pids` 非空 → armed；armed 後為空 → 結束；結束一律設 stop。
 6. `mgr.line_control_for(com).mirror_termios_from(slave_ref, Some(fallback_baud))`（Task 7：B0 視為未設）；`ack` 非空 → `master_writer.try_write(ack)` 一次（錯誤與部分寫入忽略）；`pump_endpoint_to_sink`（不重送 `first`）：每筆 `TxClass::Flash` 一筆 WAL TX `source:"flash"`；`NotSubmitted` → 結束。
 7. finally：`active_com=None`、`master_writer=None`、`rx_buffers.remove(com)`、送 `FlashHolderGone{probe_id}`；外層 finally：所有仍 held 者 Released、unmark 全部。
+   獨占不變式（R0-F3 延伸檢查）：實體 MCU UART 在整個 flash 期間由既有 bridge handle 持有，**不**因 flash 開始／結束而 close／reopen（不經 `CloseToken`）；`/dev/ttyMCU` 端點 slave 由 `create_pty` 建立、daemon 同持 master＋slave keepalive，daemon **絕不**對端點 slave 設 `TIOCEXCL`、也不以 `open_exclusive` 開它，故 flasher 每次關閉後可再開。外部 flasher 自行設 TIOCEXCL 後未清除而離開的情形（keepalive 使 tty 物件不釋放、下一次 flasher open 會 EBUSY）屬 Python 基線同樣存在的行為，本 Phase 不改產品行為，只以 `endpoint_reopen_after_flasher_set_excl_recorded` 記錄並於 PR 登記為 DF 候選。
 8. `rx_observer(com, data)`（reader thread）：持 shared 鎖：若 `rx_buffers` 有 com → extend 並保留最後 4096；`active = active_com == com`；鎖外 `active` 時 `master_writer.try_write(data)`（錯誤忽略、不重試、不阻塞）。
 
 - [ ] **Step 1：寫失敗測試**
@@ -1614,6 +1615,8 @@ fn endpoint_never_writes_when_unbridged() {
 | `rx_observer_non_blocking` | master writer `try_write` 回 `Ok(0)` | reader thread 不阻塞、不重試 |
 | `rx_observer_only_active_com` | COM1 RX | 不寫 master |
 | `second_open_while_active_ignored` | flash 中 flasher 再寫 | 不重入 `on_flash_open` |
+| `cap_posix_pty__endpoint_slave_never_exclusive`（`crates/sw-pal/tests/flash_pty.rs`，`posix_pty`；R0-F3 延伸） | `FlashEndpoint::start` 後、完成一次 matched→pump→`FlashHolderGone` 循環後，各以一般 open 開 `ttyMCU` 並 `ioctl(TIOCGEXCL)` | 兩次讀回皆為 `0`（daemon 從未對端點設 TIOCEXCL）；第二次 flasher open 成功、送 `55 55` 仍得 `00 cc` 回放 |
+| `endpoint_reopen_after_flasher_set_excl_recorded`（黑箱，只記錄、不判 PASS／FAIL） | `FakeFlasher(excl=True)` 開端點後設 `TIOCEXCL`、完成 flash、不清除即關閉 → 第二個 `FakeFlasher` 開 link | 記錄第二次 open 的 errno（預期 Python 與 Rust 皆為 `EBUSY`）與 `mcu.status`；結果寫入 gate 報告「待裁決」欄（DF 候選：端點於 `FlashHolderGone` 後以 keepalive fd `TIOCNXCL`） |
 | `endpoint_thread_survives_on_flash_open_panic` | coordinator panic | thread 繼續服務下一次 open（C1） |
 | `windows_caps_no_endpoint` | `caps.flash_endpoint=false` | `FlashEndpoint::start` 回 `Ok(None)`，無 thread |
 
@@ -1684,7 +1687,7 @@ def test_baud_mirrored_once_from_flasher(sw_env, fake_mcu):
 
 ## Task 10：`mcu.patterns`／`mcu.status` RPC 與 daemon 組裝
 
-**Test author model:** agy-gemini-3.8-flash-high　**Implementer model:** haiku-xhigh
+**Test author model:** agy-gemini-3.8-flash-high　**Implementer model:** codex-gpt-6-luna-max（daemon 啟動序與 `FlashEndpoint` RAII 清理屬 daemon 生命週期，R0-F6；Sonnet 審查須逐項核對不變量，§0.2）
 
 **Files:**
 - Modify: `crates/sw-daemon/src/service.rs`（`"mcu.patterns"`、`"mcu.status"` 分支；位置照 `service.py:711-724`，在 `health.status` 之後）
@@ -1751,7 +1754,7 @@ P5 已交付 release／attach 的完整安全路徑（`aborted_cmd`、`closed_co
 - Produces：無新公開型別；契約形狀如下（CLI 輸出 `sort_keys`，下表以 dict 表示、略 `version`）：
   - release 成功：`{"ok":true,"session":SessionPublic(state="RELEASED"),"closed_consoles":int,"aborted_cmd":bool}`；已 RELEASED：`{"ok":true,"already_released":true,"session":…}`。
   - attach 被外部持有（非 force，預檢）：`{"ok":false,"error_code":"DEVICE_STILL_HELD","pids":[int],"holder_unknown":false,"selector":…}`。
-  - attach force 但 `open_exclusive` 回 `Held`：同上（`pids` 取 holder 掃描）；Windows `AccessDenied`：`{"ok":false,"error_code":"DEVICE_STILL_HELD","pids":[],"holder_unknown":true,"selector":…}`。
+  - attach force 但 `open_exclusive` 回 `Held`：同上（`pids` 取 holder 掃描）。`force` 只略過開檔前預檢，**不得**略過已識別的外部 holder（規格 §6.2「拒絕已識別的外部衝突」）：外部程式未取 flock（minicom 類）先開埠時，`open`→`flock`→`TIOCEXCL` 雖都成功，`open_exclusive` 的鎖後 holder 重掃（arch §4.2、06 Task 2）仍回 `Held{pids:[tool], holder_unknown:false}`，session 維持 `RELEASED`、UART 零 TX。Windows `AccessDenied`：`{"ok":false,"error_code":"DEVICE_STILL_HELD","pids":[],"holder_unknown":true,"selector":…}`。
   - 裝置不在：`{"ok":false,"error_code":"DEVICE_NOT_PRESENT","selector":…,"device_by_id":str|null}`。
   - self-test RELEASED（P5 06 L2493 規則）：`classification:"RELEASED"`、`recommended_action`（`pids` 為空**且** `holder_unknown:false` → `device_attach`、`reclaimable:true`；`pids` 非空，或 `pids` 為空但 `holder_unknown:true`（Windows／`/proc` 不可讀）→ `wait_external_flash`、`reclaimable:false`；BC-04：不明不得當安全證明）、`released_by`、`released_at`、`reason`、`external_holder`（pids 或 `"none"`）、`reclaimable`。
 
@@ -1815,7 +1818,8 @@ def test_released_survives_two_restarts_and_replug(sw_env, shell_target):
 
 | 測試名 | 情境 | 期望 |
 |---|---|---|
-| `force_attach_minicom_like_tool_opens` | 外部 `flock=False` 持有中 `attach --force` | ok:true、`ATTACHING`（預檢略過、`open_exclusive` 成功；TIOCEXCL 由 daemon 設定後外部新開失敗） |
+| `force_attach_plain_open_tool_still_held`（取代原 `force_attach_minicom_like_tool_opens`；規格 §6.2，先寫、須先 FAIL） | RELEASED 後 `ExternalHolder(slave_path, flock=False)` 持有（minicom 類，不取 flock、不設 TIOCEXCL）→ 記 `n0 = len(shell_target.rx_log())` → `attach --force` | `exit==2`；`drop_version(r.json) == {"ok": False, "error_code": "DEVICE_STILL_HELD", "pids": [holder.pid], "holder_unknown": False, "selector": "COM0"}`；session 仍 `RELEASED`（`released_by`／`reason` 不變）；回覆後再等 1.0 s，`shell_target.rx_log()[n0:] == b""` 且 WAL 無新 TX 記錄（UART 零 TX）；回覆後 `sw_env.holders(slave_path, exclude_self=True) == [holder.pid]`（daemon 已關閉其試開的 fd，未與外部工具共持）；`holder.stop()` 後同一 `attach --force` 回 ok、`ATTACHING` |
+| `auto_attach_plain_open_tool_never_starts_io` | 外部 `flock=False` 先持有 slave，之後才 `sw_env.start` | 5 s 內 session `DETACHED`、`last_error=="ATTACH_FAILED:DeviceHeldError"`、從未 `ATTACHING`／`READY`；`shell_target.rx_log() == b""`（無 probe／登入 TX）；`holder.stop()` 後 `device attach` ok 並 READY |
 | `force_attach_flock_tool_still_held` | 外部 `flock=True` | `DEVICE_STILL_HELD`、`pids==[tool]`、`holder_unknown:false`、session 仍 RELEASED |
 | `attach_device_absent` | by-id symlink 移除 | `DEVICE_NOT_PRESENT`＋`device_by_id` |
 | `release_dedupe_concurrent` | 兩個 `device.release` 同時送 | 兩者皆 ok；只產生一次 StopOp；第二次若晚到則 `already_released:true` |
@@ -1826,6 +1830,7 @@ def test_released_survives_two_restarts_and_replug(sw_env, shell_target):
 | `selftest_released_none_holder` | RELEASED、無 holder（POSIX，`holder_unknown:false`） | `external_holder:"none"`、`reclaimable:true`、`recommended_action:"device_attach"` |
 | `release_flash_interaction_probe_window` | Probe(1) 窗口中 `device.release` | `FLASHING_BUSY`；probe 結束後 release 成功；外部零 TX |
 | `handoff_never_double_held` | release→外部工具開→關→attach，全程 `HolderSampler(slave_path)` | `max_concurrent()<=1`（含 daemon pid 與外部工具） |
+| `release_external_open_not_ebusy_repeated`（POSIX 黑箱，非 root；R0-F3） | `shell_target` 全程持有 PTY master；release → 外部一般 `os.open(slave)` → 關 → attach → READY，重複 3 輪 | 每輪外部 open 成功（`EBUSY` 判 FAIL）；每輪 attach `ok:true`、READY；全程無 `DEVICE_STILL_HELD` 回應 |
 | `released_blocks_auto_attach_on_hotplug` | RELEASED、裝置重新出現 | 不自動 attach、零 TX |
 | `released_cmd_submit_not_ready` | RELEASED | `command.submit` → `SESSION_NOT_READY` |
 | `handoff_wal_continuity` | release→外部工具→attach | WAL `seq` 嚴格遞增；外部工具期間無 TX 紀錄 |
@@ -1835,13 +1840,13 @@ def test_released_survives_two_restarts_and_replug(sw_env, shell_target):
 
 - [ ] **Step 2：執行並確認 FAIL**：`cargo test -p sw-core --features test-fakes --test handoff` → FAIL；POSIX 黑箱 Python PASS（P1 已實作 SC-05、DF-04、BC-04）、Rust FAIL；Windows 黑箱在無 `SW_TEST_COM_PAIR` 時為 SKIP（標「證據不足」，不計 PASS）。
 - [ ] **Step 3：commit 測試**：`test(handoff): 新增外部工具裝置交接黑箱測試`
-- [ ] **Step 4：實作**：只修 P8 新增交互的缺口（FileTransfer 占前景槽時 `aborted_cmd:true`、Probe 窗口 flash-critical 擋 release）；P5 既有語意（attach 前置序 `drain_in_progress` → 非 force `probe_holders` → 同步 `open_exclusive`、self-test RELEASED 規則）黑箱若失敗，記錄並回報 P5 owner，本 Task 不修改。
+- [ ] **Step 4：實作**：只修 P8 新增交互的缺口（FileTransfer 占前景槽時 `aborted_cmd:true`、Probe 窗口 flash-critical 擋 release）；P5 既有語意（attach 前置序 `drain_in_progress` → 非 force `probe_holders` → 同步 `open_exclusive`（含鎖後 holder 重掃，force 不略過）、self-test RELEASED 規則）黑箱若失敗（例如 `force_attach_plain_open_tool_still_held` 回 ok），記錄並回報 P5 owner，本 Task 不修改。
 - [ ] **Step 5：執行並確認 PASS**：Rust 測試與 POSIX 黑箱兩側全 PASS。
 - [ ] **Step 6：commit**：`test(handoff): 以黑箱驗證外部工具交接、強制收回與 released 診斷`（若 Step 4 有程式修正，另以 `fix(handoff): …` commit）
 
 **Changelog fragment：** `changelog.d/rust-p8-device-handoff.md`（`type: change`、`scope: rust-core`；Step 4 有修正時改 `type: fix`）。
 
-**BLOCKED-OWNER：** `windows_access_denied_holder_unknown`、`windows_external_flasher_cycle`（OD-08 原生 COM）；realhw `p1-ho-cycle`（外部 tmux `minicom -D <attached_real_path> -b 115200`、`DEVICE_STILL_HELD`、`--force`）、`p1-ho-persist`（RELEASED 跨 `sudo systemctl restart`）、L2 `f10-creds-fixed-then-ready`（ThrowawayDaemon 交接）於 live bench 以 Rust bundle 執行。
+**BLOCKED-OWNER：** `windows_access_denied_holder_unknown`、`windows_external_flasher_cycle`（OD-08 原生 COM）；realhw `p1-ho-cycle`（外部 tmux `minicom -D <attached_real_path> -b 115200`；`device attach` 與 `device attach --force` 都須回 `DEVICE_STILL_HELD`，kill minicom 後才收回 READY）、`p1-ho-persist`（RELEASED 跨 `sudo systemctl restart`）、L2 `f10-creds-fixed-then-ready`（ThrowawayDaemon 交接）於 live bench 以 Rust bundle 執行。
 
 ---
 
@@ -2042,9 +2047,9 @@ fn cap_supervisor_runtime__task_pt0s_restart_and_graceful_stop() {
 
 ## Task 14：更新／回滾守衛對 Rust daemon 的驗證與補強（SC-23）
 
-P4 已交付 §12.1 七步與 `safety_check`（05 L1617-1654：`mcu.status`(0.5 s).`flashing` → `FLASHING_BUSY`；`session.list`(1.0 s) 任一 `state=="FLASHING"` 或 `foreground_busy` → `UPDATE_BUSY`，detail `busy:[{com,state,foreground_busy}]`；`--force` 只略過此步）。本 Task **不**另建守衛、不改錯誤碼；只 (a) 對 Rust daemon 驗證 P4 契約；(b) 補 §12.1 第 2 步「活躍寫入與其他不可安全中止操作」中 P4 未涵蓋的 interactive lease；(c) 修正 P4 內部矛盾：Global Constraint「安全檢查無法確認時一律拒絕（fail-closed）」與第 2 步「不健康視為通過」衝突，依 fail-closed 收斂。
+P4 已交付 §12.1 七步與 `safety_check`（05 L1617-1654：`mcu.status`(0.5 s).`flashing` → `FLASHING_BUSY`；`session.list`(1.0 s) 任一 `state=="FLASHING"` 或 `foreground_busy` → `UPDATE_BUSY`，detail `busy:[{com,state,foreground_busy}]`；**`--force` 不影響此步**——§12.1 第 2 步不符合交接條件時一律拒絕更新，`--force` 只在 detail 記 `force_ignored:true`，見 05 Task 12 第 2 步）。本 Task **不**另建守衛、不改錯誤碼；只 (a) 對 Rust daemon 驗證 P4 契約；(b) 補 §12.1 第 2 步「活躍寫入與其他不可安全中止操作」中 P4 未涵蓋的 interactive lease；(c) 修正 P4 內部矛盾：Global Constraint「安全檢查無法確認時一律拒絕（fail-closed）」與第 2 步「不健康視為通過」衝突，依 fail-closed 收斂。
 
-**Test author model:** agy-gemini-3.8-flash-high　**Implementer model:** haiku-xhigh（Sonnet 審查須逐項核對不變量，§0.2）
+**Test author model:** agy-gemini-3.8-flash-high　**Implementer model:** codex-gpt-6-luna-max（daemon 生命週期／跨 Stage 停止交接，R0-F6；Sonnet 審查須逐項核對不變量，§0.2）
 
 **Files:**
 - Modify: P4 `safety_check` 所在模組（`crates/sw-cli/src/` 的 update 流程；以 P4 實際檔名為準）：busy 條件加 `interactive_session_id != null`；daemon 健康判定改為三態
@@ -2055,23 +2060,28 @@ P4 已交付 §12.1 七步與 `safety_check`（05 L1617-1654：`mcu.status`(0.5 
 - Consumes：P4 `safety_check(ctx, endpoint) -> Result<(), (&'static str, PyDict)>`、`run_update`、`run_rollback`、版本目錄與 Current／Previous、`mkbundle.sh --dev`、`ProcScan`；Task 6、9 的 daemon 行為。
 - 行為變更（寫入 P4 契約）：
   - busy 條件：`state=="FLASHING"` 或 `foreground_busy==true` 或 `interactive_session_id` 非 null → `UPDATE_BUSY`（detail 每筆加 `interactive_session_id`；message 不變）。背景 capture 為被動 RX、可安全中止，不列入（理由寫入 P4 文字）。
-  - daemon 健康三態：**確認不存在**（連線被拒或 socket／TCP 端點不存在，且 `ProcScan` 找不到 `serialwrapd`）→ 視為通過；**健康**→ 照常檢查；**未知**（RPC timeout、壞回應、連線成功但回應不可解析、行程存在但 RPC 不通）→ 拒絕，回 `UPDATE_BUSY`＋detail `{"health":"unknown","reason":…}`，`--force` 可略過。
+  - daemon 健康三態：**確認不存在**（連線被拒或 socket／TCP 端點不存在，且 `ProcScan` 找不到 `serialwrapd`）→ 視為通過；**健康**→ 照常檢查；**未知**（RPC timeout、壞回應、連線成功但回應不可解析、行程存在但 RPC 不通）→ 拒絕，回 `UPDATE_BUSY`＋detail `{"health":"unknown","reason":…}`；**`--force` 不可略過**（健康不明時可能正處 FLASHING／FileTransfer，停 daemon 無法撤銷 DUT 已發生的部分燒寫）。
+  - `--force` 對 update／rollback 的 busy、健康三態、身分確認與步驟 3 停用後重檢**全部無效**；帶 `--force` 的拒絕結果與未帶時逐欄相同，只多 detail `force_ignored:true`，且不得 disable／stop 監管、不得送 `daemon.stop`。一般 `setup`（非 update 路徑）的 Python 對等 `--force` 覆寫不變。
 
 - [ ] **Step 1：寫失敗測試**
 
 | 測試名 | 情境 | 期望 |
 |---|---|---|
-| `guard_flashing_blocks_rollback`（`update_guard.rs`，stubd） | `mcu.status.flashing:true` | P4 `FLASHING_BUSY` JSON（message `flash 進行中，拒絕更新／回滾（可用 --force 覆寫）`）、exit 2、未執行任何 stop／切換命令 |
+| `guard_flashing_blocks_rollback`（`update_guard.rs`，stubd） | `mcu.status.flashing:true` | P4 `FLASHING_BUSY` JSON（message `flash 進行中，拒絕更新／回滾（--force 不適用，請待 flash 完成後重試）`）、exit 2、未執行任何 stop／切換命令 |
 | `guard_foreground_blocks_rollback` | COM1 `foreground_busy:true` | `UPDATE_BUSY`、detail `busy` 含 `{"com":"COM1",…}`、exit 2 |
 | `guard_interactive_lease_blocks_rollback` | COM0 `interactive_session_id:"i-1"`、`foreground_busy:false` | `UPDATE_BUSY`、detail 含 `interactive_session_id:"i-1"` |
 | `guard_rpc_timeout_refuses` | stubd `session.list` 延遲 > 1.0 s | `UPDATE_BUSY`、`health:"unknown"`、未停止監管 |
 | `guard_malformed_response_refuses` | stubd 回 `reply_raw:"{not json"` | 同上 |
 | `guard_daemon_absent_passes` | socket 不存在且無 `serialwrapd` 行程 | 放行進第 3 步 |
 | `guard_process_alive_rpc_down_refuses` | socket 不通但 `ProcScan` 找到 `serialwrapd` | `UPDATE_BUSY`、`health:"unknown"` |
-| `guard_force_overrides` | 上述任一＋`--force` | 進入第 3 步（stop 監管） |
+| `guard_force_does_not_override`（參數化，取代原 `guard_force_overrides`） | 上述每一拒絕列（flashing、foreground、interactive lease、RPC timeout、壞回應、行程在但 RPC 不通）各＋`--force`，update 與 `setup --rollback --force` 各跑一次 | 錯誤碼／`phase`／`busy` 與未帶 `--force` 時逐欄相同；`safety_check.detail.force_ignored==true`、無 `skipped`；steps 止於 `safety_check`；監管呼叫序為空（無 `/Change /DISABLE`、`/End`、`systemctl stop`）；stubd 未收到 `daemon.stop`；`current-release.json` 未變 |
+| `guard_force_recheck_after_disable_still_refuses` | 第一次 `session.list` 閒置、停用後第二次 `state:"FLASHING"`，帶 `--force` | `FLASHING_BUSY` 或 `UPDATE_BUSY`、`set_enabled(true)` 已呼叫、stubd 未收到 `daemon.stop` |
+| `guard_daemon_absent_force_same_as_without` | daemon 確認不存在＋`--force` | 放行進第 3 步，steps 與未帶 `--force` 相同（`--force` 不改變通過路徑） |
 | `setup_guard_message_unchanged` | 一般 `setup` 且 flashing | Python 原文 `flash 進行中，拒絕 setup（可用 --force 覆寫）`、exit 2 |
 | `rollback_refuses_while_push`（黑箱，Rust daemon） | `file.push` 進行中 rollback | `UPDATE_BUSY`；push 正常完成且 DUT 端檔案 md5 正確 |
 | `rollback_refuses_while_flashing`（黑箱，fakemcu） | FLASHING 中 rollback | `FLASHING_BUSY`；flash 正常完成 |
+| `rollback_force_refuses_while_flashing`（黑箱，fakemcu，`posix_pty`；R0-F4） | FLASHING 中 `setup --rollback --force`；同樣以 `setup --force`（bundle 更新）再跑一次 | 兩者皆 `FLASHING_BUSY`、`phase:"update_safety_check"`、exit 2；拒絕前後 `daemon status.pid` 不變且 `health.ping` 全程 ok；監管仍 enabled（stub 監管呼叫序為空）；fakemcu 收到的燒錄位元組與單獨燒錄時完全相同、flasher `Return error code : 0x0`、燒後 session 回 `ATTACHED`；`current-release.json` 未變 |
+| `rollback_force_refuses_while_push`（黑箱，Rust daemon；R0-F4） | `file.push` 進行中 `setup --rollback --force`；同樣以 `setup --force` 再跑一次 | 兩者皆 `UPDATE_BUSY`、exit 2；`daemon status.pid` 不變、未收到 `daemon.stop`（WAL 無 shutdown 記錄）；push 正常完成且 DUT 端檔案 md5 正確 |
 | `rollback_refuses_while_interactive_send`（黑箱） | interactive lease 開啟、`interactive_send` 進行中 | `UPDATE_BUSY`；DUT 端收到完整 payload |
 | `rollback_cross_stage_state_compat_released`（黑箱，`posix_pty`，`rust_only`） | Current＝Stage 2（Rust daemon）、Previous＝Stage 1B（Python daemon）；Current 下 release COM0 後 `setup --rollback` | Previous daemon 讀同一 `state.json`：COM0 仍 RELEASED；`device attach` 成功並 READY |
 | `rollback_cross_stage_ready_never_double_held`（黑箱，`posix_pty`，`rust_only`） | 同上兩版；COM0 為 READY（Rust daemon 持有 tty）時 `setup --rollback`，全程 `HolderSampler(slave_path, 0.01)` | `max_concurrent()<=1`；Rust daemon pid 消失後 Python daemon pid 才出現；最終 READY |
@@ -2079,7 +2089,7 @@ P4 已交付 §12.1 七步與 `safety_check`（05 L1617-1654：`mcu.status`(0.5 
 
 - [ ] **Step 2：執行並確認 FAIL**：`cargo test -p sw-cli --test update_guard` → 新增三態與 lease 列 FAIL（P4 既有列 PASS）；黑箱對 Rust bundle FAIL（`rust_only` 兩列在 Python 側 SKIP 並已於 `cases.yaml` 登記）。
 - [ ] **Step 3：commit 測試**：`test(setup): 新增更新／回滾守衛對 Rust daemon 的驗證與 fail-closed 測試`
-- [ ] **Step 4：實作**：只改 P4 `safety_check` 的 busy 條件與健康三態判定；message 與錯誤碼不變；P4 計畫文字同步。
+- [ ] **Step 4：實作**：只改 P4 `safety_check` 的 busy 條件與健康三態判定，並確認 `--force` 未傳入 `safety_check`／步驟 3 重檢（若 P4 實作仍有 force 略過分支，於本 Task 同 PR 移除並更新 P4 測試）；錯誤碼不變、message 依 P4 現行文字（`--force 不適用`）；P4 計畫文字同步。
 - [ ] **Step 5：執行並確認 PASS**：Rust 測試、P4 既有 `cargo test -p sw-cli` 與黑箱 PASS。
 - [ ] **Step 6：commit**：`fix(setup): 更新／回滾守衛納入 interactive lease 並在健康不明時拒絕`
 

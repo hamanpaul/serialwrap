@@ -33,7 +33,7 @@
 ## Review Focus
 
 1. **BC-02 的 `input_epoch` 失效邊界**：banner／quiet 重新 arm／reboot 命令／drain Phase 1／release／FlashSyncMatched 之後，mailbox 內帶舊 `input_epoch` 的 `ConsoleInputBytes`、deferred entry、已排入 TxWriter 但尚未進 OS 的 human job（`FenceReject::InputStale`），都不可到達 UART。沒有失效的 suspend／resume 與 soft preempt 不得遺失或重排任何按鍵（Task 4、Task 6、Task 11 `test_bc02_*`）。
-2. **Human TX 的 OS 寫入前重驗與同源順序**：路由判定為 raw 之後、`SerialWriter::write` 之前，若 `owner_gen` 改變、human admission 關閉或 `input_epoch` 改變，必須 `NotSubmitted`。被拒 bytes 依 D-15 結算：仍有效就依序轉入 deferred，失效就丟棄並診斷。WAL 只記實際確認的 bytes；部分寫出或結果不明的 human TX 不得重送（Task 6 `fence_human_raw.rs`、`human_tx_lane` 系列）。
+2. **Human TX 的 OS 寫入前重驗與同源順序**：路由判定為 raw 之後、OS 實際提交之前（06 Task 9 `FenceSubmitGate` 臨界區，授權與提交同一把 Fence 鎖，R0-F1；不是「出列時驗一次後放鎖再 write」），若 `owner_gen` 改變、human admission 關閉或 `input_epoch` 改變，必須 `NotSubmitted`。被拒 bytes 依 D-15 結算：仍有效就依序轉入 deferred，失效就丟棄並診斷。WAL 只記實際確認的 bytes；部分寫出或結果不明的 human TX 不得重送（Task 6 `fence_human_raw.rs`、`human_tx_lane` 系列）。
 3. **Telnet parser 與出向 ring 的位元組完整性**：每 client 一個跨 chunk 狀態機；greeting 必須在該 client 加入 fan-out 之前送出；協商回覆與 greeting 為 `OutItem::Control`，永不被 drop-oldest 丟棄，但 Control 總量受 64 KiB 上限保護（超過就關閉該 console）；drop-oldest 不得切開 `IAC IAC`；Telnet 控制 bytes 永不成為 DUT TX（Task 2、Task 5、Task 9）。
 4. **Lease 到期 tick（SC-13）與 touch 的競態**：重用 06 的 `ControlEvent::Tick`／`TimerEvent::LeaseExpiry`。tick 以處理當下的 `last_activity` 重算 deadline。tombstone 依 P1 語意可重複讀：tick 到期後 send／status／close 都回 `INTERACTIVE_EXPIRED`，FIFO 16 擠出後才是 `INTERACTIVE_NOT_FOUND`。stash 還原與回放只在 stash 未過期且 peer 仍在時進行，否則丟棄該 client 的 deferred（D-16、SC-31，Task 7）。
 5. **Ownership 簿記的 #78／#136 分流與 DF-02**：`console_detach` 放棄整個 suspend 簿記，I/O 斷線只讓出 `suspended_owner`；`/proc` 掃描不得在 actor thread 內執行；只有 daemon 內部 human console 路徑（`SubmitOrigin::HumanConsole`）可被升格為 interactive lease，RPC 帶入的 `human:` source 一律當 agent（Task 6、Task 7、Task 10）。
@@ -1443,11 +1443,28 @@ fn admission_close_after_os_submission_counts_as_written() {                  //
     r.fence.with(|s| { s.owner_gen = 7; s.input_epoch = 3; });
     r.dev.script_write(vec![FakeWriteStep::BlockForever]);
     let raw = r.submit(r.permit(TxClass::HumanRaw, 7, Some(3), "human:c1"), b"k");
-    r.dev.wait_blocked();                                                      // job 已進 OS write
+    r.dev.wait_blocked();                                                      // job 已經 FenceSubmitGate 提交 OS，於 gate 外等完成（不持鎖）
     r.fence.with(|s| s.human_admission_blocked = true);
     r.dev.release_block();
     assert!(matches!(raw.recv().unwrap().result.outcome, TxOutcome::Completed(1)));
     assert_eq!(r.wal_tx().len(), 1);
+}
+
+#[test]
+fn human_raw_input_epoch_bump_after_authorize_before_os_submit_is_zero_tx() {  // R0-F1：出列檢查通過後、OS 提交前失效
+    let r = TxRig::new();
+    r.fence.with(|s| { s.owner_gen = 7; s.input_epoch = 3; });
+    r.dev.script_write(vec![FakeWriteStep::PauseBeforeSubmit]);
+    let raw = r.submit(r.permit(TxClass::HumanRaw, 7, Some(3), "human:c1"), b"k");
+    assert!(r.dev.wait_paused(std::time::Duration::from_secs(2)));
+    r.fence.with(|s| { s.input_epoch = 4; s.owner_gen = 8; });               // reboot／quiet re-arm／換手
+    r.dev.release_pause();
+    let rep = raw.recv().unwrap();
+    assert!(matches!(rep.result.outcome, TxOutcome::NotSubmitted));
+    assert_eq!(rep.reject, Some(FenceReject::InputStale));
+    assert_eq!(r.dev.os_submits(), 0);
+    assert!(r.dev.take_tx().is_empty(), "失效世代的 human byte 不得到達 UART");
+    assert!(r.wal_tx().is_empty());
 }
 ```
 

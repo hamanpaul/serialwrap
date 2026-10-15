@@ -10,7 +10,7 @@
 
 **Spec:** `docs/rust-refactor/serialwrap-rust-spec-final.md` §3.2、§4.2、§8.1、§9.1～§9.5、§10.1、§10.4、§11.2～§11.4、ADR-07、ADR-08；`docs/rust-refactor/owner-decisions-2026-10-15.md` OD-04、OD-06、OD-11、OD-13；`docs/rust-refactor/plans/00-master-plan.md`；`docs/rust-refactor/plans/rust-architecture.md` §1.3、§3.1、§3.2、§3.3、§3.5、§3.8、§7.4、§9；`docs/rust-refactor/plans/spec-reconciliation.md`（全表；本 Phase 承接標 P0 的列）；盤點 `docs/rust-refactor/inventory/01-cli.md`、`02-rpc.md`、`03-errors.md`、`04-wal-state.md`、`08-tests-assets.md`、`09-events-transfer.md`、`10-gaps.md`。
 
-**工作目錄：** serialwrap 一律在 `/home/paul_chen/prj_pri/serialwrap-worktrees/rust-refactor`（分支 `feature/rust-refactor`；子任務可另開 `wt/rust-refactor/<subtask>` worktree）。下文路徑皆相對此根目錄，T13 除外（paulsha-conventions 另一 repo）。
+**工作目錄：** serialwrap 一律在 `feature/rust-refactor` 分支的 worktree 根目錄（下文記為 `$SW_ROOT`，執行者以 `SW_ROOT=$(git rev-parse --show-toplevel)` 在該 worktree 內求得；子任務可另開 `wt/rust-refactor/<subtask>` worktree）。下文路徑皆相對此根目錄，T13 除外（paulsha-conventions 另一 repo：其本機 checkout 記為 `$CONV_REPO`、T13 隔離 worktree 記為 `$CONV_WT`，兩者由執行者依本機佈局設定，計畫不寫死任何本機絕對路徑）。
 
 ---
 
@@ -100,7 +100,7 @@
 | `docs/rust-refactor/spec-errata.md` | 新增（規格勘誤清單，不改定稿本文）；**唯一建立者 T7**（建骨架與「盤點勘誤」節），T15 只追加 | T7、T15 |
 | `README.md`、`docs/design-event-trigger.md`、`docs/serialwrap-spec.md`、`sw_core/file_transfer.py`（註解） | 勘誤 | T15 |
 | `changelog.d/rust-p0-*.md` | 每 Task 一個 | 各 Task |
-| `~/prj_pri/paulsha-conventions-worktrees/od06-diagnostic-codes/`（另一 repo） | R-27 | T13 |
+| `$CONV_WT/`（paulsha-conventions 另一 repo 的 `feature/od06-diagnostic-code-coverage` worktree） | R-27 | T13 |
 
 ## 共用介面（本 Phase 產出、後續 Phase 消費）
 
@@ -1325,8 +1325,10 @@ scope: contracts
 | BC-01 | WAL 常駐 handle、每筆 flush、Windows share-delete、自癒與缺口記錄 | `["§9.1","§8.2","ADR-05"]` | `[WAL-D5, WAL-D6, WAL-1.4b, UIO-12.4-a]` | `[P1, P5]` | `bc01-wal-resident-handle`、`bc01-wal-flush-per-record`、`bc01-wal-rotate-normal`、`bc01-wal-external-unlink-meta`、`bc01-wal-external-reader-handle`、`bc01-wal-recreate-failure-stops-tx`、`bc01-f12-oracle-progress` | `[OD-04, OD-05, OD-13]` |
 | BC-02 | DeferredBuffer 溢位或跨上下文時整段清空 | `["§9.1","§5.2.6"]` | `[SES-16.1, UIO-12.5, SES-16.4-05, UIO-12.9-c]` | `[P1, P6]` | `bc02-deferred-overflow-clear`、`bc02-deferred-context-switch-clear`、`bc02-mailbox-stale-input-not-replayed`、`bc02-normal-replay-53` | `[OD-04]` |
 | BC-03 | 新增 `COMMAND_ABORTED_IN_FLIGHT` | `["§9.1","§5.1.4"]` | `[SES-16.2, UIO-12.2-d, ERR-7.3-9]` | `[P1, P5]` | `bc03-aborted-in-flight-after-1byte`、`bc03-unknown-outcome-send-failed`、`bc03-no-auto-resend` | `[OD-04]` |
-| BC-04 | Per-UART 獨占、衝突阻斷與 holder 診斷 | `["§9.1","§6.2"]` | `[RPC-D-08, ERR-7.1-h, UIO-12.1-a, UIO-12.1-b, UIO-12.1-c, UIO-12.1-d, PLT-D-13]` | `[P1, P5]` | `bc04-posix-exclusive-tiocexcl-flock`、`bc04-device-still-held-pids`、`bc04-holder-unknown-proc-unreadable`、`bc04-windows-access-denied-holder-unknown`、`bc04-device-attach-sync-reacquire` | `[OD-04, OD-05, OD-08]` |
+| BC-04 | Per-UART 獨占、衝突阻斷與 holder 診斷 | `["§9.1","§6.2"]` | `[RPC-D-08, ERR-7.1-h, UIO-12.1-a, UIO-12.1-b, UIO-12.1-c, UIO-12.1-d, PLT-D-13]` | `[P1, P5]` | `bc04-posix-exclusive-tiocexcl-flock`、`bc04-posix-close-clears-tiocexcl`、`bc04-device-still-held-pids`、`bc04-holder-unknown-proc-unreadable`、`bc04-windows-access-denied-holder-unknown`、`bc04-device-attach-sync-reacquire` | `[OD-04, OD-05, OD-08]` |
 | BC-05 | Windows `remote -R/-L` | `["§9.1"]` | `[PLT-D-08]` | `[P1, P4]` | `bc05-windows-remote-reverse`、`bc05-windows-remote-local`、`bc05-process-lifecycle-stop-restart`、`bc05-three-topologies` | `[OD-04]` |
+
+`bc04-posix-close-clears-tiocexcl`（R0-F3）：PTY master 持續開啟下，daemon 關閉 tty（PROBE→正式 bridge、release、TIOCEXCL 後的失敗路徑）後同一 slave 的一般 open 不得 EBUSY。證據：P1 T10 `test_close_clears_tiocexcl_reopen_with_master_open`、`test_post_lock_reject_clears_excl`、`test_release_then_external_plain_open_succeeds`、`test_dynamic_probe_then_bridge_reopen_native`；P5 Task 2 `cap_posix_pty__probe_close_reopen_with_master_open`、`cap_posix_pty__open_failure_after_tiocexcl_clears_excl`、`cap_posix_pty__release_then_external_plain_open_succeeds`。
 
 **SC／DF 項：** 內容與 phases、scope 照調和表 §1.1、§1.2 與 §2 各列「階段」欄（「雙邊」→`both`，「Rust-only」→`rust_only`）。case_ids 逐字如下（每項一個）：
 
@@ -2359,16 +2361,17 @@ scope: policy
 
 **Test author model:** haiku-xhigh　**Implementer model:** agy-gemini-3.8-flash-high
 
-**工作目錄：** 以 worktree 隔離，不動 `~/prj_pri/paulsha-conventions` 目前 checkout 的 `main`：
+**工作目錄：** 以 worktree 隔離，不動 `$CONV_REPO`（paulsha-conventions 本機 checkout，執行者依本機佈局設定）目前 checkout 的 `main`：
 
 ```bash
-git -C ~/prj_pri/paulsha-conventions fetch --no-tags origin main   # 若網路不可用，直接使用本地已有的 origin/main（65d9e43）
-git -C ~/prj_pri/paulsha-conventions worktree add \
-  ~/prj_pri/paulsha-conventions-worktrees/od06-diagnostic-codes \
+: "${CONV_REPO:?請設定 paulsha-conventions 本機 checkout 路徑}"
+CONV_WT="${CONV_WT:-$(dirname "$CONV_REPO")/paulsha-conventions-worktrees/od06-diagnostic-codes}"
+git -C "$CONV_REPO" fetch --no-tags origin main   # 若網路不可用，直接使用本地已有的 origin/main（65d9e43）
+git -C "$CONV_REPO" worktree add "$CONV_WT" \
   -b feature/od06-diagnostic-code-coverage origin/main
 ```
 
-以下路徑相對 `~/prj_pri/paulsha-conventions-worktrees/od06-diagnostic-codes`。
+以下路徑相對 `$CONV_WT`。
 
 **Files:**
 - Create: `policy_check/rules/r27_diagnostic_code_coverage.py`、`tests/test_rule_r27_diagnostic_code_coverage.py`、`changelog.d/od06-diagnostic-code-coverage.md`
@@ -2561,8 +2564,8 @@ Run（conventions worktree）：`python3 -m policy_check --repo .`；Expected：
 Run（對 serialwrap 驗證 R-27 實際判定）：
 
 ```bash
-cd /home/paul_chen/prj_pri/serialwrap-worktrees/rust-refactor
-PYTHONPATH=~/prj_pri/paulsha-conventions-worktrees/od06-diagnostic-codes \
+cd "$SW_ROOT"
+PYTHONPATH="$CONV_WT" \
   python3 -c "from pathlib import Path; from policy_check import config as c; \
 from policy_check.rules import registry; from policy_check.rules.base import RuleContext; \
 r={x.rule_id:x for x in registry.load_all()}['R-27']; \

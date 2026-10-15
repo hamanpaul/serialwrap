@@ -44,7 +44,7 @@
 3. TX 三態：TX WAL 只記 OS 確認的 bytes 且在 `_write_lock` 內 append；BC-03 映射（≥1 byte→`COMMAND_ABORTED_IN_FLIGHT`、不明→`SEND_FAILED`、未提交→`FLUSHED_BY_RECOVERY`）且任何路徑都不自動重送。
 4. Drain 與交接：release 在 handle 關閉回條（`handle_closed`、`writer_converged`、`reader_stopped` 全為真）前不得回成功；3,000 ms 逾時回 `SESSION_RECOVERING`＋`drain_stalled`；重複 release 去重；drain 未完成不得重開同一端點（含 manager 層所有直接 `bridge.stop()` 呼叫點）；舊命令晚到的完成不得改新 session 狀態；BC-04 開檔獨占失敗不得清除保護後繼續收送。
 5. BC-02 上下文失效：失效後 console thread 已讀入但尚未處理的舊按鍵、以及舊 `owner_gen` 的 deferred 項目一律不得回放（含已排入、等待 `_write_lock` 的 raw／replay 資料）；未失效時 #53 Soft Preempt 回放逐字不變。
-6. OS write 前授權（T20）：命令出列後、實際 write 前觸發 quiet、release、cancel、lease 切換 → 零 TX。
+6. OS write 前授權（T20）：命令出列後、實際 write 前觸發 quiet、release、cancel、lease 切換 → 零 TX。授權重驗與每次非阻塞 `os.write` 必須在同一 `_tx_fence_lock` 臨界區內（不得「驗證→放鎖→write」）；失效端持同一把鎖；鎖不跨 EAGAIN backoff 或完成等待（R0-F1）。
 
 ---
 
@@ -63,7 +63,7 @@
 
 | Task | 標題 | 範圍 | Test author | Test reviewer（A1.5） | Implementer |
 |---|---|---|---|---|---|
-| T01 | Stage 0 測試設施：替身、平台 skip、TX 結果純型別、Windows 原生 pytest runner | 基礎 | haiku-xhigh | codex-gpt-6-luna-max | agy-gemini-3.8-flash-high |
+| T01 | Stage 0 測試設施：替身、平台 skip、TX 結果純型別、Windows 原生 pytest runner | 基礎 | haiku-xhigh | agy-gemini-3.8-flash-high | codex-gpt-6-luna-max（`win-pytest.sh` 的 Windows 行程樹終止、WSLENV、staging 與 exit code 屬平台高風險，與 P3 Task 17 同類，R0-F6） |
 | T02 | BC-01a WAL 常駐 handle、每筆 flush、唯一 close、DF-17 | BC-01、DF-17、SC-11（WAL 端） | haiku-xhigh | agy-gemini-3.8-flash-high | codex-gpt-6-luna-max |
 | T03 | BC-01b Windows `CreateFileW` share-delete handle 與 `win32_files` | BC-01、SC-10（API 層） | agy-gemini-3.8-flash-high | haiku-xhigh | codex-gpt-6-luna-max |
 | T04 | BC-01c rotate／reset 於常駐 handle 下同步與 DF-03 歸檔後綴 | BC-01、DF-03 | agy-gemini-3.8-flash-high | haiku-xhigh | codex-gpt-6-luna-max |
@@ -90,7 +90,7 @@
 ## Task T01：Stage 0 測試設施：替身、平台 skip、TX 結果純型別、Windows 原生 pytest runner
 
 - **範圍**：本 Phase 共用測試基礎；唯一的產品碼是**純型別**（`TxResult` dataclass 與 `TxIncompleteError` 例外家族，不改任何行為），因為替身 `FakePort.write` 的預設回傳值依賴它，必須在其他 Task 之前存在（不得以臨時替代型別讓測試虛假通過）。marker 的**註冊**屬 P0 T14，本 Task 只在既有 collection hook 內補平台／資源條件 skip。
-- **Test author model**：haiku-xhigh　**Implementer model**：agy-gemini-3.8-flash-high
+- **Test author model**：haiku-xhigh　**Test reviewer（A1.5）**：agy-gemini-3.8-flash-high　**Implementer model**：codex-gpt-6-luna-max（00-master-plan §2：平台行程管理歸 Codex；與 04 Task 17 `win-runner.sh`／`win-test.sh` 同類，R0-F6）。**Windows 執行步驟**（B2 的 `scripts/stage0/win-pytest.sh …` 實跑）需寫入 `/mnt/c` 並呼叫 `cmd.exe`／`powershell.exe`／`taskkill.exe`，Codex `-s workspace-write` 沙箱可能擋下，一律由 orchestrator 執行並把 `summary.json`／`junit.xml` 路徑交給實作者；Codex 實作者只改程式碼（同 07 執行順序第 5 點）。
 - **Changelog fragment**：`changelog.d/rust-p1-stage0-test-infra.md`（`type: change`，`scope: tests`）：新增 Stage 0 行為變更測試共用替身、TX 結果型別、平台條件 skip 與 Windows 原生 pytest runner。
 - **BLOCKED-OWNER**：Windows host 的 `py -3.12` 需已安裝 `pytest`、`PyYAML`、`pyserial`、`jsonschema`；缺少時 runner 以 exit 3 回報，安裝需擁有者同意（`py -3.12 -m pip install --user pytest pyyaml pyserial jsonschema==4.10.3`），在同意前所有 `windows_native` 結果記為「證據不足」。
 
@@ -939,7 +939,7 @@
   UARTBridge.tx_account(self, cmd_id: str) -> tuple[int, bool]    # (confirmed_bytes 累計, 曾有 unknown)；讀後移除；容量 512 FIFO
   SessionManager._on_bridge_rx(self, session_id: str, data: bytes, wal_seq: int | None = None) -> None
   ```
-- Rust 對應：arch §4.2 `TxOutcome { NotSubmitted, Completed(usize), Unknown }`／`TxResult { outcome, error }`、`SerialWriter::write(data, cancel)`；§5.4 OS 寫入前 fence 與「完成後把 TxResult 交給 WalWriter（只記錄確認的 bytes）」；§5.7 `confirmed_bytes`／`unknown` 累計。**arch §4.2 的 `Unknown` 必須帶已確認前綴**：本 Task 同步修訂 arch §4.2 為 `Unknown { confirmed: usize }`（`confirmed` 為結果不明前 OS 已確認的 bytes，未知尾段＝`len - confirmed`），§5.7 映射改為「`confirmed ≥ 1`（不論最後為 Completed 或 Unknown）→ `COMMAND_ABORTED_IN_FLIGHT`；`Unknown{confirmed:0}` → `SEND_FAILED`」。
+- Rust 對應：arch §4.2 `TxOutcome { NotSubmitted, Completed(usize), Unknown }`／`TxResult { outcome, error }`、`SerialWriter::write_gated(data, cancel, gate)`（每次 OS 提交經 `SubmitGate`，R0-F1）；§5.4 OS 提交時 fence 與「完成後把 TxResult 交給 WalWriter（只記錄確認的 bytes）」；§5.7 `confirmed_bytes`／`unknown` 累計。**arch §4.2 的 `Unknown` 必須帶已確認前綴**：本 Task 同步修訂 arch §4.2 為 `Unknown { confirmed: usize }`（`confirmed` 為結果不明前 OS 已確認的 bytes，未知尾段＝`len - confirmed`），§5.7 映射改為「`confirmed ≥ 1`（不論最後為 Completed 或 Unknown）→ `COMMAND_ABORTED_IN_FLIGHT`；`Unknown{confirmed:0}` → `SEND_FAILED`」。
 
 **TX 結果判定表（凍結）**
 
@@ -1153,7 +1153,7 @@
 
 **行為規格**
 1. `begin_drain`：持 `_state_lock`：`_tx_frozen=True`、`_drain_epoch=epoch`、`_drain_pending=True`、`_preserve_on_drain=preserve_consoles`；`_stop_event.set()`；`_tx_cancel.set()`（`_write_all` 在 EAGAIN backoff 檢查此事件）；BC-02 的 `invalidate_deferred("drain")`（T09 實作；T07 先呼叫一個 no-op 鉤子 `self._on_drain_invalidate()`，T09 換成實作）。重複呼叫為 no-op（去重）。
-2. fence：`send_bytes` 在 `_state_lock` 內 `if self._tx_frozen: result = TxResult("not_submitted", 0, len(payload), "draining")` 並 raise `TxIncompleteError`。凍結前已通過 fence、正在 OS write 的寫入視為已提交，結果照實記錄。
+2. fence：`send_bytes` 在 `_state_lock` 內 `if self._tx_frozen: result = TxResult("not_submitted", 0, len(payload), "draining")` 並 raise `TxIncompleteError`。此處只是 pre-check：**只有凍結前已實際提交 OS 的 bytes**（T20 起：在 `_tx_fence_lock` 臨界區內完成 `os.write` 提交者）才視為已提交、照實記錄；通過 pre-check 但尚未提交的寫入，於 T20 的提交點重驗 `_tx_frozen` 而零 TX（R0-F1，T20 `test_release_by_other_thread_after_authorize_before_submit_zero_tx`）。T07 至 T20 之間此窗口為已知缺口，不得以本 Task 測試宣稱已關閉。
 3. `finish_drain(timeout_s)`：`deadline = monotonic()+timeout_s`；join reader thread（剩餘時間）；join console thread（剩餘時間）——沿用現行 `stop()` 的守衛：呼叫者即該 thread 本身時不 join（該 thread 於回呼返回後自行結束，`reader_stopped` 以 `_stop_event` 已設且 `_loop` 不再取新資料判定）；`acquired = self._write_lock.acquire(timeout=max(0, remaining))`；三者都完成 → 在 `_state_lock` 內抽出 preserved 與待關 clients（同現行 `stop()` 第 2 步）、清欄位；鎖外 `port.close()` 恰一次、listener close、client fds close；`release _write_lock`；組回條（`handle_closed=True`；`port.close()` 擲例外時 `handle_closed=False`、`error=str(exc)`）。任一未在期限內完成 → 啟動 daemon thread `serialwrap-drain-<com>` 以無期限方式完成同樣步驟，完成後呼叫 `on_late_receipt(receipt)`，本呼叫回 `None`。
 4. 回條的 `unrecorded`：Phase 2 期間 WAL append 回傳 `loss_flag=True` 的 TX／RX 以字串列出；`tx_in_flight` 為凍結當下在途寫入的 `TxResult`（無則 None）。
 5. `_drain_pending` 只在**成功**回條（`handle_closed and writer_converged and reader_stopped`）產生後才清除；`port.close()` 失敗的回條不清除 `_drain_pending`（handle 狀態不明，不得重開）。`start()` 在 `_drain_pending` 時拒絕。`stop()` 被呼叫兩次：第二次回傳 `None`（與基線相同：第一次已清空 clients，避免同一批 consoles 被重複歸屬），`port.close()` 不重複。
@@ -1611,7 +1611,7 @@
 
 - **範圍**：BC-04：POSIX 對已開啟 tty fd 取非阻塞 `flock` 並設 `TIOCEXCL`（`O_CLOEXEC`）；失敗不啟動收送；holder 診斷（`pids`、`holder_unknown`，掃描失敗不得當作安全證明）；Windows pyserial `dwShareMode=0` 開檔失敗的 `ERROR_ACCESS_DENIED` → `DEVICE_STILL_HELD{pids:[], holder_unknown:true}`。SC-05：`device.attach` 同步重新取得獨占，失敗回 `DEVICE_STILL_HELD` 或 `DEVICE_NOT_PRESENT`，成功才 `ATTACHING`。DF-04：動態 session 的 RELEASED 跨任意次重啟保留；裝置離線 tick 不得把 RELEASED 降為 DETACHED。依據：規格 §6.2 POSIX／Windows／交接、§9.1 BC-04；OD-04 備註（daemon 持有時無法再直接開 tty，屬預期）；盤點 06 §10.2、§12.1，05 §12.4，04 §2.6；arch §4.2 `OpenError`／`HolderReport`、§5.9 attach。
 - **Test author model**：agy-gemini-3.8-flash-high　**Implementer model**：codex-gpt-6-luna-max
-- **Changelog fragment**：`changelog.d/rust-p1-bc04-uart-exclusive.md`（`type: security`，`scope: uart`）：POSIX 開啟 UART 時取得 flock 並設 TIOCEXCL，已被占用時拒絕收送並回報 holder；Windows 存取拒絕回 `DEVICE_STILL_HELD`（`holder_unknown:true`）；`device attach` 改為同步取得獨占；動態 session 的 released 狀態跨重啟保留（DF-04）。
+- **Changelog fragment**：`changelog.d/rust-p1-bc04-uart-exclusive.md`（`type: security`，`scope: uart`）：POSIX 開啟 UART 時取得 flock 並設 TIOCEXCL（關閉與失敗路徑先以 TIOCNXCL 解除），已被占用時拒絕收送並回報 holder；Windows 存取拒絕回 `DEVICE_STILL_HELD`（`holder_unknown:true`）；`device attach` 改為同步取得獨占；動態 session 的 released 狀態跨重啟保留（DF-04）。
 - **BLOCKED-OWNER**：(1) Windows 原生 COM 第二次開啟得 `ERROR_ACCESS_DENIED`（需 OD-08 com0com pair 或實體 USB-UART 直連，`windows_com` 測試）；(2) 受限 `/proc`（`hidepid=2` 重新掛載需 root）與 `CAP_SYS_ADMIN` 例外情境；(3) Spike 5 Stage 0 BC-04／交接實機驗證（外部 minicom 先開埠、實板 handle 繼承）。
 
 **Files**
@@ -1640,6 +1640,17 @@
       # os.open(O_RDWR|O_NOCTTY|O_NONBLOCK|O_CLOEXEC)；EBUSY → DeviceHeldError；
       # fcntl.flock(fd, LOCK_EX|LOCK_NB)：BlockingIOError → close(fd)、DeviceHeldError；
       # fcntl.ioctl(fd, termios.TIOCEXCL)：失敗 → close(fd)、raise OSError
+      # 鎖後重掃 probe_holders(realpath, exclude_pid=os.getpid())：pids 非空 → _release_exclusive(fd)、close(fd)、DeviceHeldError（termios／RX／TX 之前；force 不略過）
+      # TIOCEXCL 成功之後 open() 內的任何失敗返回（重掃拒絕或其他例外）一律 _release_exclusive(fd) 後才 close(fd)（R0-F3）；
+      # open() 成功後 configure() 失敗由呼叫端 close() 收尾，同樣經 _release_exclusive
+  _PosixSerialPort.close(self) -> None
+      # 冪等；fd 存在時：_release_exclusive(fd) → fcntl.flock(fd, LOCK_UN) → os.close(fd)。
+      # 呼叫端（UARTBridge.stop／finish_drain）保證 RX／TX 已收斂後才 close；owns_port=False 時不呼叫。
+  _PosixSerialPort._release_exclusive(fd: int) -> bool
+      # fcntl.ioctl(fd, termios.TIOCNXCL)；成功 → True；OSError errno ∈ {EIO, ENXIO, ENODEV}（已 hangup／拔除）→ True；
+      # 其他 OSError → log WARNING "serialwrap: TIOCNXCL failed on %s: %s"、回 False（呼叫端仍照常 close，不得保留 fd）
+      # 理由：TIOCEXCL 是 tty 物件旗標、不隨 fd 關閉清除；PTY master 仍開啟（FakeTarget／bridge 受測端）時殘留會讓
+      #       PROBE→正式 bridge 重開與 release 後外部工具開啟都 EBUSY（R0-F3 實測）
   # sw_core/uart_io.py
   UARTBridge.__init__(..., preopened_port: SerialPort | None = None, owns_port: bool = True)
       # start() 有 preopened_port 時跳過 open_serial_port()／port.open()，仍呼叫 configure；
@@ -1662,7 +1673,7 @@
 | 已 attached 且非 RELEASED | `{"ok":true,"already_attached":true,"session":…}` | 不變 |
 | 裝置不在 | `{"ok":false,"error_code":"DEVICE_NOT_PRESENT","selector":…,"device_by_id":…}` | 不變 |
 | 非 force 預檢 `pids` 非空 | `{"ok":false,"error_code":"DEVICE_STILL_HELD","pids":[…],"holder_unknown":false,"selector":…}` | 不變（RELEASED 保留） |
-| 同步開檔 `DeviceHeldError` | `{"ok":false,"error_code":"DEVICE_STILL_HELD","pids":[…],"holder_unknown":<bool>,"selector":…}` | 不變 |
+| 同步開檔 `DeviceHeldError`（含 force 時鎖後重掃識別到未取 flock 的外部 holder） | `{"ok":false,"error_code":"DEVICE_STILL_HELD","pids":[…],"holder_unknown":<bool>,"selector":…}` | 不變 |
 | 同步開檔 `DeviceNotPresentError`／`FileNotFoundError` | `DEVICE_NOT_PRESENT` | 不變 |
 | 同步開檔其他 `OSError` | `{"ok":true,"session":…}` | `DETACHED`、`last_error="ATTACH_FAILED:<ExcType>"`（arch §5.9 步驟 3） |
 | 成功 | `{"ok":true,"session":…}` | 清 released、`_save_state()`、`ATTACHING`、port 交給 `_attach_by_id` |
@@ -1670,8 +1681,9 @@
 `holder_unknown` 規則：`pids` 非空 → `false`；`pids` 為空（掃描失敗、權限不足、Windows、或鎖衝突但查不到 PID）→ `true`。熱插拔自動 attach 遇 `DeviceHeldError` → `DETACHED`、`last_error="ATTACH_FAILED:DeviceHeldError"`（沿用動態前綴）。
 
 **非合作式外部 holder（凍結；規格 §6.2「拒絕已識別的外部衝突」）**：`flock` 是 advisory、`TIOCEXCL` 不撤銷既有 handle，一般 minicom 先 open 不取 flock 時本 daemon 的 open／flock／TIOCEXCL 都會成功。因此 `_PosixSerialPort.open` 在三步成功後、**啟動任何 RX／TX 之前**再做一次 `probe_holders(realpath, exclude_pid=os.getpid())`：
-- `status == "ok"` 且 `pids` 非空（已識別的外部 holder）→ 關閉 fd、raise `DeviceHeldError(holder=report)`（`holder_unknown:false`）。
-- `status ∈ {"permission","unknown"}`（掃描本身失敗）→ **不**視為安全證明但也不拒絕（否則受限 `/proc` 環境無法開任何埠）：照常開啟，log WARNING `serialwrap: 無法確認 %s 的外部 holder（status=%s），BC-04 僅保證 serialwrap 實例互斥`，並把結果放進 `daemon status` 的 `foreign_holders`（`multi_open` 既有欄位）為 `{"device":…, "holder_unknown": true}`。
+- `pids` 非空（已識別的外部 holder；不論 `status`——`status="permission"` 時已收集到的 pid 仍是已識別）→ 在 termios 設定與任何 RX／TX 之前先 `TIOCNXCL`（本端剛設的旗標會殘留在外部 holder 仍持有的 tty 上）再關閉 fd、raise `DeviceHeldError(holder=report)`（`holder_unknown:false`）。
+- 此檢查位於 `_PosixSerialPort.open` 內，所有開埠路徑都經過：daemon 啟動時的初次自動 attach、熱插拔自動 attach、PROBE、`attach_device(force=False)` 與 **`attach_device(force=True)`**。`force` 只略過開檔前的預檢快照（結果表第 4 列），**不得**略過已識別的外部 holder（規格 §6.2）；`force=True` 遇此情形同樣回 `DEVICE_STILL_HELD`、session 維持 `RELEASED`、UART 零 TX。
+- `pids` 為空且 `status ∈ {"permission","unknown"}`（掃描本身失敗）→ **不**視為安全證明但也不拒絕（否則受限 `/proc` 環境無法開任何埠）：照常開啟，log WARNING `serialwrap: 無法確認 %s 的外部 holder（status=%s），BC-04 僅保證 serialwrap 實例互斥`，並把結果放進 `daemon status` 的 `foreign_holders`（`multi_open` 既有欄位）為 `{"device":…, "holder_unknown": true}`。
 - 本 daemon 自身其他 fd（同 pid）被排除，不構成衝突。
 `--force-spawn`、OD-11 allowlist、sandbox 皆不影響上述判定（規格 §6.2 末段、ADR-02）。
 
@@ -1735,6 +1747,38 @@
       p = sp._PosixSerialPort(pty_path, UartProfile()); p.open(); p.close()
       assert termios.TIOCEXCL in calls
 
+  def test_close_clears_tiocexcl_reopen_with_master_open(pty_path, monkeypatch):
+      # R0-F3：fixture 全程持有 PTY master；close 若只解 flock、關 fd 而未 TIOCNXCL，第一次 plain open 即 EBUSY
+      if os.geteuid() == 0:
+          pytest.skip("EVIDENCE_MISSING: TIOCEXCL bypassed for root (§6.2)")
+      import errno, fcntl, termios
+      events = []
+      real_ioctl, real_flock = fcntl.ioctl, fcntl.flock
+      monkeypatch.setattr(sp.fcntl, "ioctl", lambda fd, req, *a: (events.append(("ioctl", req)), real_ioctl(fd, req, *a))[1])
+      monkeypatch.setattr(sp.fcntl, "flock", lambda fd, op: (events.append(("flock", op)), real_flock(fd, op))[1])
+      for _ in range(3):                                   # PROBE → 正式 bridge → recover 的 open／close 循環
+          events.clear()
+          p = sp._PosixSerialPort(pty_path, UartProfile()); p.open(); p.close()
+          tail = [e for e in events if e in (("ioctl", termios.TIOCNXCL), ("flock", fcntl.LOCK_UN))]
+          assert tail == [("ioctl", termios.TIOCNXCL), ("flock", fcntl.LOCK_UN)]   # 先解除獨占，再解鎖、關 fd
+          try:
+              fd = os.open(pty_path, os.O_RDWR | os.O_NOCTTY)   # 外部工具角度：一般 open 必須成功
+          except OSError as e:
+              pytest.fail(f"plain open after close must not fail, errno={errno.errorcode.get(e.errno)}")
+          os.close(fd)
+
+  def test_post_lock_reject_clears_excl(pty_path, monkeypatch):
+      # R0-F3：TIOCEXCL 成功後被鎖後重掃拒絕，失敗路徑也必須 TIOCNXCL 才 close（成功路徑中 probe_holders 只在重掃呼叫）
+      if os.geteuid() == 0:
+          pytest.skip("EVIDENCE_MISSING: TIOCEXCL bypassed for root (§6.2)")
+      monkeypatch.setattr(sp, "probe_holders", lambda *a, **k: sp.HolderReport((4242,), False, "ok"))
+      with pytest.raises(sp.DeviceHeldError) as ei:
+          sp._PosixSerialPort(pty_path, UartProfile()).open()
+      assert ei.value.holder.pids == (4242,)
+      monkeypatch.undo()
+      fd = os.open(pty_path, os.O_RDWR | os.O_NOCTTY)          # 不得 EBUSY
+      os.close(fd)
+
   def test_symlink_to_same_device_conflicts(pty_path, tmp_path):
       link = tmp_path / "by-id-link"; link.symlink_to(pty_path)
       a = sp._PosixSerialPort(pty_path, UartProfile()); a.open()
@@ -1776,7 +1820,10 @@
   | `test_attach_device_success_is_sync_and_attaching` | RELEASED session；開檔成功 → 回 `{"ok": True, …}`、state `ATTACHING`、`_preopened_ports[by_id]` 存在、`_spawn_attach` 被呼叫 |
   | `test_attach_device_held_keeps_released` | 開檔擲 `DeviceHeldError(pids=(4321,))` → `{"ok": False, "error_code": "DEVICE_STILL_HELD", "pids": [4321], "holder_unknown": False, "selector": "COM0"}`；state 仍 `RELEASED`；`state.json` released 未變（檔案 bytes 與 mtime 不變）、替身 port 無任何 `writes`、WAL 無新 TX |
   | `test_external_open_without_flock_is_rejected` | （`posix_only`、`posix_pty`、`process_rpc`）子行程只 `os.open(pty, O_RDWR\|O_NOCTTY)`、不 flock → `_PosixSerialPort.open()` 擲 `DeviceHeldError`、`child.pid in holder.pids`、fd 已關閉 |
-  | `test_holder_scan_failure_opens_with_warning` | `probe_holders` 回 `status="permission"` → open 成功、log WARNING 含「無法確認」、`daemon status.foreign_holders` 含 `holder_unknown: true` |
+  | `test_attach_device_force_rejects_plain_external_holder` | （`posix_only`、`posix_pty`、`process_rpc`；先寫、須先 FAIL：現況 force 略過預檢後開檔成功）RELEASED session；子行程只 `os.open(pty, O_RDWR\|O_NOCTTY)`、不 flock、印 `ok` 後持有 → `attach_device("COM0", force=True)` 回應**完全等於** `{"ok": False, "error_code": "DEVICE_STILL_HELD", "pids": [child.pid], "holder_unknown": False, "selector": "COM0"}`；state 仍 `RELEASED`；`state.json` bytes 與 mtime 不變；`_preopened_ports` 不含該 by_id、`_spawn_attach` 未被呼叫；PTY master 端以 `select` 讀 1.0 s 為 0 byte（UART 零 TX）；WAL 無新 TX 記錄；子行程結束後同一呼叫回 `ok: True`、`ATTACHING` |
+  | `test_auto_attach_plain_external_holder_zero_tx` | （`posix_only`、`posix_pty`、`process_rpc`）子行程先普通 `open` 持有 PTY slave（不 flock）後才啟動 throwaway daemon（`SERIALWRAP_BY_ID_DIR` 只含該 symlink）→ 5 s 內 session 為 `DETACHED`、`last_error == "ATTACH_FAILED:DeviceHeldError"`、從未出現 `ATTACHING`／`READY`；PTY master 全程讀到 0 byte（無 prompt probe、無登入 TX）；`device attach --selector COM0 --force` 回 `DEVICE_STILL_HELD`、`pids == [child.pid]`、`holder_unknown: false` |
+  | `test_post_lock_scan_partial_permission_with_pids_rejects` | monkeypatch `probe_holders` 回 `HolderReport((123,), False, "permission")`（三步皆成功）→ `_PosixSerialPort.open()` 擲 `DeviceHeldError`、`holder.pids == (123,)`、fd 已關閉（`os.fstat` 擲 `EBADF`）、`apply_termios`／`tcsetattr` 未被呼叫 |
+  | `test_holder_scan_failure_opens_with_warning` | `probe_holders` 回 `status="permission"`、`pids=()` → open 成功、log WARNING 含「無法確認」、`daemon status.foreign_holders` 含 `holder_unknown: true` |
   | `test_two_daemons_compete_for_same_tty` | （`posix_only`、`posix_pty`、`process_rpc`）兩個 throwaway daemon（獨立 socket／state／run，`SERIALWRAP_BY_ID_DIR` 指向同一個只含該 PTY symlink 的 sandbox）先後啟動 → 恰一個 session 為 `ATTACHED`／`READY`，另一個 `DETACHED` 且 `last_error == "ATTACH_FAILED:DeviceHeldError"`；PTY 對端只看到一個 reader |
   | `test_force_spawn_does_not_bypass_uart_lock` | `daemon start --force-spawn` 起第二個 daemon 時同上結果（`--force-spawn` 只略過 CLI 跨 socket 預檢，ADR-02） |
   | `test_attach_op_invalidated_by_release_during_open` | 替身 `open()` 阻塞期間另一執行緒 `release_device`／`bind_session`／`update_devices([])` → 回應分別為 `SESSION_RECOVERING` 形狀／`SESSION_RECOVERING` 形狀／`DEVICE_NOT_PRESENT`；候選 port `close_calls == 1`；未寫入 `_preopened_ports` |
@@ -1790,6 +1837,8 @@
   | `test_dynamic_released_attachable_after_restart` | 動態 session release → 重建 `SessionManager` → `get_session("<COM>")` 存在且 state `RELEASED`（init 依 `_loaded_released` 實體化）→ `attach_device("<COM>")` 成功、`ATTACHING` |
   | `test_offline_tick_keeps_released` | RELEASED session 裝置離線後 `update_devices([])` → state 仍 `RELEASED` |
   | `test_unconsumed_preopened_port_closed_on_release` | attach 成功但 attach thread 尚未消費時 release → 該 port `close()` 恰一次 |
+  | `test_release_then_external_plain_open_succeeds` | （`posix_only`、`posix_pty`、`process_rpc`；非 root，root 下 skip 記「證據不足」；R0-F3，修正前必 FAIL）測試持有 PTY master 全程不關；throwaway daemon 對該 slave 到 `READY` → `device release` 回 ok → 子行程（模擬外部燒錄工具）一般 `os.open(slave, O_RDWR\|O_NOCTTY)` **成功**（exit 0；`EBUSY` 判 FAIL）、寫 `b"X"` 後關閉，master 端讀到 `b"X"` → `device attach` 回 `ok: True` → 20 s 內 `READY` |
+  | `test_dynamic_probe_then_bridge_reopen_native` | （`posix_only`、`posix_pty`、`process_rpc`；非 root；R0-F3）無 pin／sticky 的動態 session（非 `attach_device` 路徑，PROBE bridge 自行 open／close 後正式 bridge 再 open），測試持有 PTY master 並在收到 `\n` 時回 prompt → 20 s 內 `profile_source == "detected"` 且 state `READY`；`last_error` 從未為 `ATTACH_FAILED:DeviceHeldError`（PROBE 關閉時未 TIOCNXCL 會讓正式 open EBUSY） |
   | `test_native_second_open_access_denied`（`windows_native`＋`windows_com`；不得在模組層帶任何 POSIX marker，否則 Windows 上永遠被 skip） | `SW_TEST_COM_PAIR` 的 COMa 由 bridge 開啟後，第二個 `_PySerialPort(COMa).open()` 擲 `DeviceHeldError` 且 `holder_unknown is True`；正式 gate 以 runner `summary.json` 確認此 test 實際執行（非 skip） |
 - [ ] **A2 執行並確認 FAIL**：`python3 -m pytest -q tests/test_stage0_uart_exclusive.py` → 預期 `AttributeError: module 'sw_core.serial_port' has no attribute 'DeviceHeldError'`。commit：`test(uart): BC-04 獨占開檔、holder 診斷與 SC-05 同步收回失敗測試`
 - [ ] **B1 實作**：
@@ -1797,6 +1846,7 @@
   - `_PySerialPort.open`：`SerialException` → `classify_pyserial_open_error(str(exc))`：`held` → `DeviceHeldError(holder=HolderReport((), True, "unsupported"), os_error=str(exc))`；`not_found` → `DeviceNotPresentError`；其他維持 `OSError(errno or EIO, str)`。
   - `probe_holders`：由 `SessionManager._probe_external_holder` 搬移並改回傳 `HolderReport`；`_probe_external_holder` 保留為包裝，回 `{"pids": list, "holder": first|None, "holder_unknown": bool}`（self-test RELEASED 分支沿用 `pids`／`holder`，新鍵附加於尾端）。Windows（`os.name=="nt"`）直接回 `unsupported`。
   - `_PosixSerialPort.open` 三步成功後依「非合作式外部 holder」凍結規則再掃一次 holder。
+  - `_PosixSerialPort.close`／`_release_exclusive`：依 Interfaces；TIOCEXCL 成功之後的所有失敗返回與正常 `close()` 都走「`TIOCNXCL` → `LOCK_UN` → `os.close`」；`TIOCNXCL` 非 hangup 類失敗只 WARNING、仍關 fd。`UARTBridge.stop()`／`finish_drain` 在 RX thread join 與 TX 收斂之後才呼叫 `port.close()`（I/O 收斂後、關閉有效 tty fd 前解除獨占；arch §4.2 關閉序）。
   - `attach_device`：依凍結表與「同步 attach 的操作身分」；同步開檔使用 `open_serial_port(real_path, session.profile.uart)` 後 `port.open()`；重驗通過才 `self._preopened_ports[by_id] = op`，再清 released、`_save_state()`、`ATTACHING`、`_spawn_attach(by_id)`。`_attach_by_id` 取 `op = self._preopened_ports.pop(by_id, None)`，PROBE 與正式 bridge 依「預開 port 與 PROBE bridge」共用 `op.port`；正式 bridge `start()` 失敗時由正式 bridge 負責 close（`owns_port=True`），不得雙重 close。
   - DF-04：`__init__` 將 `_loaded_released` 中**不在** `self._sessions` 的列**直接實體化**為 `RELEASED` session（COM 取自 session_id `<profile>:<COM>`、profile 取自 pins／provenance 中的 template，套回 `released_by`／`released_at`／`released_reason`），並把 by_id 加入 `_released_by_ids`——否則 `_spawn_attach` 對 released by_id 早退（`session_manager.py` 約 2291 行），session 永遠不會被實體化，`device attach <COM>` 找不到 selector、只留下封鎖而沒有解除路徑；template 已不存在而無法實體化者保留於 `_loaded_released` 並持續阻擋，log WARNING。`_save_state` 的 `released` = 記憶體 RELEASED session 列 ∪ `_loaded_released` 中未實體化的列。`_mark_missing_devices_locked` 跳過 `state == "RELEASED"`。
 - [ ] **B2 執行並確認 PASS**：`python3 -m pytest -q tests/test_stage0_uart_exclusive.py tests/test_serial_port.py tests/test_device_handoff.py tests/test_holder_probe_portability.py tests/test_explicit_target_device_ownership.py tests/test_windows_claim.py tests/test_multi_open_detect.py tests/test_multiagent_e2e.py tests/test_human_agent_coexist.py tests/test_flash_endpoint.py tests/test_resource_markers.py tests/test_contracts_rpc_schema.py`；`python3 -m tools.contracts check`；全套依 §0 第 4 點，並檢查是否有既有測試在 bridge 開啟後以路徑再開同一 PTY slave（BC-04 預期行為；若有，**先**把該檔與測試名追加到本 Task「測試資產變更」並經獨立審閱，PR 註明，才可修改）。
@@ -2031,14 +2081,14 @@
 
 ## Task T20：OS write 前授權 permit（quiet／release／cancel／lease／owner_gen 零 TX）
 
-- **範圍**：規格 §5.2.2（實際開始 OS write 前必須完成授權檢查）、§11.3 零 TX 不變量、arch §5.4「OS 寫入前：TxWriter 取 Fence 鎖驗證 permit」。T06 的 fence 只涵蓋 flash、WAL、drain、raw admission；本 Task 補上命令出列後、OS write 前才發生的 quiet／reconfirm 啟動、release、cancel、interactive lease 切換，以及 BC-02 raw／replay 資料在等待 `_write_lock` 期間的上下文失效（T09 第 3 點）。授權與失效共用 bridge 的 `_state_lock` 作為序列化邊界。
+- **範圍**：規格 §5.2.2（實際開始 OS write 前必須完成授權檢查）、§11.3 零 TX 不變量、arch §5.4「OS 寫入前：TxWriter 取 Fence 鎖驗證 permit」。T06 的 fence 只涵蓋 flash、WAL、drain、raw admission；本 Task 補上命令出列後、OS write 前才發生的 quiet／reconfirm 啟動、release、cancel、interactive lease 切換，以及 BC-02 raw／replay 資料在等待 `_write_lock` 期間的上下文失效（T09 第 3 點）。**序列化邊界（R0-F1）**：授權重驗與每一次 OS 提交（單次非阻塞 `os.write`）在同一把新鎖 `_tx_fence_lock` 的臨界區內完成，所有失效操作也持同一把鎖修改 gate 欄位；禁止「在 `_state_lock` 內驗證、放鎖、再 `os.write`」——兩者之間的 quiet／release／lease 換手會讓失效世代的 bytes 寫出（規格 §5.2.2）。鎖只跨非阻塞提交，不跨 EAGAIN backoff 或完成等待。
 - **Test author model**：haiku-xhigh　**Implementer model**：codex-gpt-6-luna-max
 - **Changelog fragment**：`changelog.d/rust-p1-tx-permit.md`（`type: fix`，`scope: uart`）：每次 UART 寫入在實際送出前重新驗證命令仍有效（未被取消、未進 quiet、未被 release、lease 未切換、human 輸入上下文未失效），不再送出已失效的命令或按鍵。
 - **BLOCKED-OWNER**：無（實機交接情境併入 T21 的 F10 case）。
 
 **Files**
 - Create: `tests/test_stage0_tx_permit.py`
-- Modify: `sw_core/uart_io.py`、`sw_core/session_manager.py`（execute／interactive／console 路徑發 permit；quiet、release、cancel、lease 切換時撤銷）、`sw_core/arbiter.py`（`cancel()` 通知 manager 撤銷該 cmd_id）、`sw_core/service.py`（cancel 接線）、`docs/rust-refactor/plans/rust-architecture.md` §5.4（Python 對應說明一行）
+- Modify: `sw_core/uart_io.py`、`sw_core/serial_port.py`（`_posix_write_all`／`_PosixSerialPort.write`／`_PySerialPort.write` 接受 `submit_guard`）、`sw_core/session_manager.py`（execute／interactive／console 路徑發 permit；quiet、release、cancel、lease 切換時撤銷）、`sw_core/arbiter.py`（`cancel()` 通知 manager 撤銷該 cmd_id）、`sw_core/service.py`（cancel 接線）、`tests/stage0_fakes.py`（`FakePort.write` 新增可選 `submit_guard`）、`docs/rust-refactor/plans/rust-architecture.md` §5.4（Python 對應說明一行）
 
 **Interfaces**
 - Consumes：T06 `send_bytes`／`TxResult`；T07 fence；T09 `owner_gen`；T11 `trusted_human` 分類。
@@ -2052,24 +2102,45 @@
       tx_class: Literal["agent", "interactive", "human_line", "human_raw", "system"]
       owner_gen: int | None = None      # human_raw／replay：擷取時的 owner_gen（T09）
   UARTBridge.send_bytes(..., permit: TxPermit | None = None) -> TxResult
-  UARTBridge.set_tx_gate(self, *, generation: int, quiet: bool, lease_owner: str | None) -> None   # 持 _state_lock 更新
-  UARTBridge.revoke_ops(self, op_ids: Iterable[str]) -> None                                        # 持 _state_lock；FIFO 512
-  UARTBridge._before_os_write: Callable[[], None] | None   # 測試接縫：permit 驗證通過後、OS write 前呼叫（預設 None）
+  UARTBridge.set_tx_gate(self, *, generation: int, quiet: bool, lease_owner: str | None) -> None   # 持 _state_lock → _tx_fence_lock 更新
+  UARTBridge.revoke_ops(self, op_ids: Iterable[str]) -> None                                        # 持 _tx_fence_lock；FIFO 512
+  UARTBridge._tx_fence_lock: threading.Lock          # R0-F1：授權重驗＋單次 OS 提交的唯一臨界區；lock order `_state_lock` → `_tx_fence_lock`，
+                                                     # 持 `_tx_fence_lock` 時不得取 `_state_lock` 或呼叫 manager／WAL
+  UARTBridge._submit_guard(self, permit: TxPermit | None, payload_len: int) -> ContextManager[str | None]
+      # with 進入時取 _tx_fence_lock 並重跑第 1 點全部檢查，yield None（放行）或拒絕原因字串；with 內只允許一次非阻塞 os.write
+      # permit is None（第 2 點的內部呼叫者）時只跑 drain 凍結與 flash gate，但同樣經過 guard（不存在不經 guard 的 OS 寫入）
+  UARTBridge._after_tx_authorize: Callable[[], None] | None   # 測試接縫：pre-check 通過後、第一次進 _submit_guard 前（不持任何 TX 鎖，仍持 _write_lock）
+  UARTBridge._inside_tx_submit: Callable[[], None] | None     # 測試接縫：_submit_guard 內重驗通過後、os.write 前（持 _tx_fence_lock）
+  # sw_core/serial_port.py
+  def _posix_write_all(fd: int, payload: bytes, cancel: threading.Event | None = None, *,
+                       submit_guard: Callable[[], ContextManager[str | None]] | None = None) -> TxResult
+  # _PosixSerialPort.write／_PySerialPort.write 同樣接受 `submit_guard=`（以 inspect.signature 偵測，與 T06 `cancel` 相容規則同法）
   ```
-- Rust 對應：arch §5.4 `TxPermit { op_id, epoch, owner_gen, class }`、`FenceState`、「OS 寫入前：驗證 `permit.epoch == active_epoch`、`!frozen`、class 對應的 gate 規則、`permit.owner_gen` 規則、`op_id ∉ cancelled`」。
+- Rust 對應：arch §5.4 `TxPermit { op_id, epoch, owner_gen, class }`、`FenceState`、第 3 點「OS 提交時：`FenceSubmitGate` 在 Fence 鎖內重驗 `permit.epoch == active_epoch`、`!frozen`、class 對應的 gate 規則、世代規則、`op_id ∉ cancelled` 後才提交」；arch §4.2 `SubmitGate`。
 
 **行為規格（凍結）**
-1. 驗證點：`send_bytes` 持 `_write_lock` 後、OS write 前，在 `_state_lock` 內依序檢查（T06 既有 flash／WAL／drain／deferred 檢查之後）：`permit.bridge_generation != self._gate_generation` → 拒絕 `"stale_generation"`；`permit.op_id in self._revoked_ops` → `"cancelled"`；`tx_class ∈ {agent, interactive}` 且 `self._gate_quiet` → `"quiet"`；`tx_class == "interactive"` 且 `self._gate_lease_owner != permit.op_id` → `"lease"`；`tx_class == "human_raw"` 且 `permit.owner_gen != self._owner_gen` → **丟棄**（`"stale_owner_gen"`，log DEBUG，不送、不重新 defer、不 raise）。其他拒絕回 `TxResult("not_submitted", 0, n, <reason>)` 並 raise `TxIncompleteError`；沒有任何拒絕路徑會寫 OS 或 TX WAL。
+1. 檢查內容（依序）：drain 凍結（`_tx_frozen` → `"draining"`）、flash gate、`permit.bridge_generation != self._gate_generation` → `"stale_generation"`；`permit.op_id in self._revoked_ops` → `"cancelled"`；`tx_class ∈ {agent, interactive}` 且 `self._gate_quiet` → `"quiet"`；`tx_class == "interactive"` 且 `self._gate_lease_owner != permit.op_id` → `"lease"`；`tx_class == "human_raw"` 且 `permit.owner_gen != self._owner_gen` → **丟棄**（`"stale_owner_gen"`，log DEBUG，不送、不重新 defer、不 raise）。
+   - **pre-check**：`send_bytes` 持 `_write_lock` 後，在 `_state_lock` 內先跑 T06 既有 flash／WAL／drain／deferred 檢查與上列檢查，作為快速拒絕；通過**不算**授權。
+   - **提交點（授權，R0-F1）**：寫入迴圈的**每一次** `os.write`（含部分寫入後的續寫）都包在 `with self._submit_guard(permit, n) as reason:` 內：取 `_tx_fence_lock` → 重跑上列檢查 → `reason is None` 才在仍持鎖時呼叫 `_inside_tx_submit`（若有）與**一次** `os.write`（fd 為 `O_NONBLOCK`，立即返回 n 或 EAGAIN）→ 放鎖。EAGAIN backoff（`cancel.wait(EAGAIN_BACKOFF_S)`）與後續等待一律在鎖外。被拒：尚未寫出任何 byte → `TxResult("not_submitted", 0, n, <reason>)`；已確認 k≥1 bytes 後被拒 → `TxResult("completed", k, n, f"revoked:{reason}")`，尾段不得再交 OS（T08 依 confirmed≥1 映射 `COMMAND_ABORTED_IN_FLIGHT`）；`reason == "cancelled"` 且源自 `_tx_cancel`（drain）時維持 T06／T07 既有 `TxResult("completed", sent, n, "cancelled")`。拒絕一律 raise `TxIncompleteError`（`stale_owner_gen` 除外，見上）；沒有任何拒絕路徑會寫 OS 或為未提交 bytes 寫 TX WAL。
+   - **失效端**：`begin_drain`（`_tx_frozen`、`_tx_cancel`）、`set_tx_gate`、`revoke_ops`、`invalidate_deferred`／`_owner_gen` 變更、flash gate 進出，都必須在持 `_tx_fence_lock` 時修改上列欄位（既有持 `_state_lock` 的呼叫點依 lock order 巢狀取得）。因此失效與提交互斥：失效先取得鎖 → 之後所有提交被拒（零 TX）；提交先取得鎖 → 失效等到該次非阻塞 `os.write` 返回，該段 bytes 視為已提交、照實記 TX WAL。
+   - **port 物件路徑**：`_PosixSerialPort.write` 與 `_posix_write_all` 同演算法；`_PySerialPort`（Windows）無法分離提交與完成，改為每段 ≤ `PYSERIAL_SUBMIT_CHUNK = 64` bytes、`submit_guard` 包住該段 `serial.write`（受 `write_timeout` 上限），失效端最多等一段；不支援 `submit_guard` 的既有替身 port（相容規則）由 bridge 以 `_submit_guard` 包住整個 `port.write` 呼叫（安全優先，失效端等到該呼叫返回）。`tests/stage0_fakes.py` 的 `FakePort.write(payload, *, cancel=None, submit_guard=None)`：有 `submit_guard` 時在 guard 內記錄 `writes`（被拒則不記錄、回 `not_submitted`），`block` 改在 guard **之外**等待（模擬完成等待）；無 `submit_guard` 時行為不變。
 2. `permit is None`：只允許下列既有內部呼叫者（實作時以 `grep -n "send_bytes(" sw_core/*.py` 列表確認並寫入 PR）：flash pump bytes（flash gate 另行保護）、`send_secret`／login FSM（`system`，由 T05 WAL 檢查與 T07 drain fence 保護）。命令（`execute_command`）、interactive（`interactive_send`）、human console raw 與 replay 一律帶 permit。
 3. 發放與撤銷（lock order：manager `_lock` → bridge `_state_lock`，與現況 `enter_flashing` 一致；bridge 持 `_state_lock` 時不得呼叫 manager）：attach 成功設 `set_tx_gate(generation=session.bridge_generation, …)`；`arm_boot_quiet`／ready reconfirm 啟動與解除時更新 `quiet`；`interactive_open`／close／lease 到期／soft preempt 時更新 `lease_owner`；`release`／drain Phase 1 由 T07 `_tx_frozen` 擋下；`arbiter.cancel(cmd_id)` 經 manager 呼叫 `bridge.revoke_ops([cmd_id])`。
-4. human raw 直送與回放：`_handle_console_rx`／`resume_interactive`／`_set_interactive_admission(True)` 以擷取時的 `owner_gen` 建 permit（T09 第 3 點），因此失效發生在「已離開 `_state_lock`、等待 `_write_lock`」期間的資料於驗證點被丟棄。
+4. human raw 直送與回放：`_handle_console_rx`／`resume_interactive`／`_set_interactive_admission(True)` 以擷取時的 `owner_gen` 建 permit（T09 第 3 點），因此失效發生在「已離開 `_state_lock`、等待 `_write_lock`」或「pre-check 通過、尚未進 `_submit_guard`」期間的資料於提交點被丟棄。
 
 **Steps**
-- [ ] **A1 寫失敗測試**：`tests/test_stage0_tx_permit.py`（`core_portable`＋`memory_only`；以 `_before_os_write` 接縫製造「已通過 T06 檢查、尚未 OS write」的窗口）
+- [ ] **A1 寫失敗測試**：`tests/test_stage0_tx_permit.py`（`core_portable`＋`memory_only`；以 `_after_tx_authorize` 接縫製造「pre-check 已通過、尚未 OS 提交」的窗口，以 `_inside_tx_submit` 接縫停在提交臨界區內；跨 thread 情境一律以 `threading.Event` 同步、每個等待帶 2 s 上限）
 
   | 測試名 | 斷言 |
   |---|---|
-  | `test_quiet_armed_after_dequeue_before_write_zero_tx` | agent 命令 permit 通過後於 `_before_os_write` 內觸發 `session.arm_boot_quiet()` → 該次寫入不執行：`port.writes == []`、WAL 無 TX、命令結果 `AUTOBOOT_QUIET` 或 `FLUSHED_BY_RECOVERY`（依 T11／T08 映射，不得為 ok） |
+  | `test_quiet_armed_after_dequeue_before_write_zero_tx` | agent 命令 permit 通過後於 `_after_tx_authorize` 內觸發 `session.arm_boot_quiet()` → 該次寫入不執行：`port.writes == []`、WAL 無 TX、命令結果 `AUTOBOOT_QUIET` 或 `FLUSHED_BY_RECOVERY`（依 T11／T08 映射，不得為 ok） |
+  | `test_quiet_armed_by_other_thread_after_authorize_before_submit_zero_tx`（R0-F1，舊「驗證→放鎖→write」實作必紅） | `_after_tx_authorize` 設 `paused` 並等 `resume`；另一 thread 於 `paused` 後呼叫 `session.arm_boot_quiet()`，斷言它在 0.5 s 內返回（writer 未持 TX 鎖）；設 `resume` → `TxIncompleteError`、`result == TxResult("not_submitted", 0, n, "quiet")`、`port.writes == []`、`wal_records` 無 `dir == "TX"` |
+  | `test_release_by_other_thread_after_authorize_before_submit_zero_tx`（R0-F1） | 同上窗口，另一 thread 呼叫 `bridge.begin_drain(5, preserve_consoles=False)`（不等 finish）→ `result.outcome == "not_submitted"` 且 `result.error in ("draining", "cancelled")`、`result.confirmed == 0`、`port.writes == []`、無 TX WAL |
+  | `test_interactive_lease_handoff_after_authorize_before_submit_zero_tx`（R0-F1） | lease A 的 `interactive_send` 停在 `_after_tx_authorize`；另一 thread 關閉 A 並開 lease B（`set_tx_gate(lease_owner="interactive:B")`、`_owner_gen` 遞增）→ A 的寫入 `not_submitted, "lease"`、`port.writes == []`；之後 B 的 send 正常寫出且 `port.writes == [<B payload>]` |
+  | `test_invalidation_during_submit_waits_and_counts_committed`（R0-F1） | `_inside_tx_submit` 設 `in_submit` 並等 `resume`（此時持 `_tx_fence_lock`）；另一 thread 呼叫 `session.arm_boot_quiet()`，斷言 0.2 s 內**未**返回且 `bridge._gate_quiet is False`；設 `resume` → 該寫入 `TxResult("completed", n, n)`、`port.writes == [payload]`、TX WAL 恰 1 筆 `len == n`；quiet thread 於 1 s 內返回；下一筆 agent send → `not_submitted, "quiet"`、`port.writes` 不變 |
+  | `test_quiet_between_partial_chunks_stops_tail`（R0-F1） | fd 路徑：`ScriptedWrite([2, BlockingIOError(errno.EAGAIN, "again")])` 且 EAGAIN backoff 期間（以 monkeypatch 的 `cancel.wait` 設 `in_backoff` 並等 `resume`）另一 thread `arm_boot_quiet()` 並斷言 0.5 s 內返回；`resume` 後 → `TxResult("completed", 2, 6, "revoked:quiet")`、`ScriptedWrite.calls == [b"abcdef", b"cdef"]`（第二次為 EAGAIN、未交出 byte；quiet 後不再有第三次呼叫，尾段 `b"cdef"` 永不交 OS）、TX WAL 恰 1 筆 `len == 2`；經 `execute_command` 路徑時命令 `error_code == "COMMAND_ABORTED_IN_FLIGHT"` |
+  | `test_os_write_always_inside_tx_fence_lock`（R0-F1） | monkeypatch `uio.os.write`／`FakePort` 的記錄點：每次被呼叫時斷言 `bridge._tx_fence_lock.locked() is True`，且另一 thread `bridge._tx_fence_lock.acquire(blocking=False)` 回 `False`；跑 agent 命令、interactive send、human raw 直送、#53 回放、`send_secret` 各一次 → 違規計數 0 |
+  | `test_tx_fence_lock_not_held_during_backoff`（R0-F1） | fd 路徑 `os.write` 永遠 EAGAIN；writer 進 backoff 後另一 thread `bridge._tx_fence_lock.acquire(timeout=0.1)` 回 `True`（鎖不跨等待）；之後 `begin_drain` → writer 以 `"cancelled"` 結束（T07 `test_eagain_writer_is_cancelled_by_drain` 語意不變） |
   | `test_release_after_dequeue_before_write_zero_tx` | 同窗口內 `release_device` → 零 TX；release 完成後 `port.close_calls == 1` |
   | `test_cancel_after_dequeue_before_write_zero_tx` | 同窗口內 `arbiter.cancel(cmd_id)` → 零 TX、命令紀錄 `status == "canceled"` |
   | `test_lease_switch_before_write_zero_tx` | interactive lease A 的 send 在窗口內被 lease B 取代 → 零 TX、回 `INTERACTIVE_EXPIRED` 或 `SESSION_BUSY`（依現況映射） |
@@ -2078,10 +2149,10 @@
   | `test_permit_ok_path_unchanged` | 無失效事件時命令與 #53 回放的 `port.writes` 與 T06／T09 測試期望逐位元組相同 |
   | `test_permit_none_only_for_listed_internal_callers` | AST 掃描 `sw_core/*.py`：不帶 `permit=` 的 `send_bytes(` 呼叫點集合等於第 2 點清單 |
 - [ ] **A2 執行並確認 FAIL**：`python3 -m pytest -q tests/test_stage0_tx_permit.py` → 預期 `ImportError: cannot import name 'TxPermit'`。commit：`test(uart): OS write 前授權 permit 零 TX 失敗測試`
-- [ ] **B1 實作**：依行為規格；`_gate_generation`、`_gate_quiet`、`_gate_lease_owner`、`_revoked_ops` 以 class 層預設值提供（相容 bare bridge）；`_revoked_ops` 為 `collections.OrderedDict` 上限 512。
-- [ ] **B2 執行並確認 PASS**：`python3 -m pytest -q tests/test_stage0_tx_permit.py tests/test_stage0_tx_outcome.py tests/test_stage0_deferred.py tests/test_stage0_session_drain.py tests/test_stage0_gate_codes.py tests/test_interactive_raw.py tests/test_agent_defer_tx.py tests/test_human_agent_coexist.py tests/test_multiagent_e2e.py tests/test_issue26_interactive_guard.py`；全套依 §0 第 4 點。
-- **測試資產變更**：無。
-- [ ] **B3 commit**：`fix(uart): OS 寫入前重新驗證命令與輸入上下文，失效者零 TX`
+- [ ] **B1 實作**：依行為規格；`_gate_generation`、`_gate_quiet`、`_gate_lease_owner`、`_revoked_ops`、`_tx_fence_lock`（缺時以 `getattr(self, "_tx_fence_lock", None)` 惰性建立）以 class 層預設值提供（相容 bare bridge）；`_revoked_ops` 為 `collections.OrderedDict` 上限 512。T06 `send_bytes`「`_state_lock` 內檢查、鎖外寫入」改為「`_state_lock` 內 pre-check、每次 `os.write` 於 `_submit_guard` 內重驗後提交」；T07 `begin_drain` 改為持 `_tx_fence_lock` 設 `_tx_frozen`／`_tx_cancel`。
+- [ ] **B2 執行並確認 PASS**：`python3 -m pytest -q tests/test_stage0_tx_permit.py tests/test_stage0_tx_outcome.py tests/test_stage0_bridge_drain.py tests/test_stage0_fakes.py tests/test_stage0_deferred.py tests/test_stage0_session_drain.py tests/test_stage0_gate_codes.py tests/test_interactive_raw.py tests/test_agent_defer_tx.py tests/test_human_agent_coexist.py tests/test_multiagent_e2e.py tests/test_issue26_interactive_guard.py tests/test_serial_port.py tests/test_concurrency_races.py`；全套依 §0 第 4 點。
+- **測試資產變更**：無既有測試斷言改動；`tests/stage0_fakes.py` 的 `FakePort.write` 新增可選 `submit_guard` 參數（不帶時行為與 T01 完全相同，T01／T07 既有斷言不變）。
+- [ ] **B3 commit**：`fix(uart): OS 寫入前於同一臨界區重驗並提交，失效者零 TX`
 
 ---
 
