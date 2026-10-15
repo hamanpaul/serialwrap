@@ -19,7 +19,7 @@ codes:
     uart_tx: none
     agent_action: "以 session list 確認 alias 名稱後再重試"
     extra_fields: ["alias"]
-    contract_tests: []
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapMemory::test_alias_not_found_saves_state_first"]
     behavior_change: []
     sources: ["sw_core/session_manager.py:1735"]
   - code: AUTOBOOT_QUIET
@@ -46,7 +46,7 @@ codes:
     uart_tx: confirmed
     agent_action: "檢查目標端 base64 工具與擷取內容後再重試"
     extra_fields: []
-    contract_tests: []
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapMemory::test_base64_decode_failed_pull"]
     behavior_change: []
     sources: ["sw_core/file_transfer.py:324"]
   - code: BENCH_ENDPOINT_NOT_REMEMBERED
@@ -181,7 +181,7 @@ codes:
     uart_tx: possible
     agent_action: "視為失敗，先以 session self-test 確認狀態"
     extra_fields: []
-    contract_tests: []
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapMemory::test_command_failed_fallback"]
     behavior_change: []
     sources: ["sw_core/arbiter.py:318"]
   - code: CONSOLE_LINE_LIMIT_TOO_SMALL
@@ -207,7 +207,7 @@ codes:
     uart_tx: none
     agent_action: "以 console list 取得現存 client_id 後再操作"
     extra_fields: ["client_id"]
-    contract_tests: []
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapMemory::test_console_not_found_detach_unknown_client"]
     behavior_change: []
     sources: ["sw_core/session_manager.py:3996"]
   - code: DAEMON_ALREADY_RUNNING
@@ -262,7 +262,7 @@ codes:
     agent_action: "查看 daemon 的 stderr 並排除原因後再執行 daemon start"
     extra_fields: ["pid", "returncode"]
     exit_codes: {"daemon start": 2}
-    contract_tests: []
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapFramingTcp::test_daemon_exited_on_spawn"]
     behavior_change: ["DF-05"]
     sources: ["sw_core/cli.py:589"]
   - code: DAEMON_NOT_READY
@@ -302,7 +302,7 @@ codes:
     uart_tx: none
     agent_action: "先以 session.bind 綁定裝置後再 attach"
     extra_fields: ["session"]
-    contract_tests: []
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapMemory::test_device_not_bound_attach"]
     behavior_change: []
     sources: ["sw_core/session_manager.py:2161"]
   - code: DEVICE_NOT_FOUND
@@ -394,7 +394,7 @@ codes:
     uart_tx: possible
     agent_action: "視為結果不明：先以 command.get 或 session get_state 確認狀態，不可假設未執行而直接重送"
     extra_fields: ["message"]
-    contract_tests: []
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapFramingTcp::test_framing_exception_bytes"]
     behavior_change: []
     sources: ["sw_core/rpc_posix.py:59"]
   - code: FLASHING_BUSY
@@ -461,7 +461,7 @@ codes:
     uart_tx: possible
     agent_action: "以 session get_state 確認目前狀態後，再決定重試 recover 或處理裝置"
     extra_fields: ["action", "recovered", "session"]
-    contract_tests: []
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapMemory::test_force_recover_timeout"]
     behavior_change: []
     sources: ["sw_core/session_manager.py:4686"]
   - code: INTERACTIVE_EXPIRED
@@ -501,7 +501,7 @@ codes:
     agent_action: "回報例外訊息；勿假設操作已失敗而重送寫入型命令"
     extra_fields: ["message"]
     exit_codes: {"benches": 1, "connect": 1, "daemon stop": 1, "event": 1, "remote": 1}
-    contract_tests: []
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapPosixRemoteCli::test_internal_error_cli_catch_all"]
     behavior_change: ["DF-07"]
     sources: ["sw_core/cli.py:138", "sw_core/cli.py:1456", "sw_core/cli.py:1526", "sw_core/cli.py:1615"]
   - code: INVALID_ARGS
@@ -521,7 +521,7 @@ codes:
   - code: INVALID_BENCH_CONFIG
     status: EXISTING
     reachable: true
-    scope: {interfaces: [cli_local], methods: ["benches", "connect"], platforms: [posix, windows]}
+    scope: {interfaces: [cli_local], methods: ["benches", "connect"], platforms: [posix]}
     meaning: "benches.yaml 驗證失敗"
     side_effect: "無"
     retryable: "fix_args"
@@ -529,7 +529,7 @@ codes:
     agent_action: "修正 benches.yaml 的欄位後重試"
     extra_fields: ["message"]
     exit_codes: {"benches": 1, "connect": 1}
-    contract_tests: []
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapPosixRemoteCli::test_invalid_bench_config_connect"]
     behavior_change: []
     sources: ["sw_core/cli.py:1355", "sw_core/cli.py:1482"]
   - code: INVALID_BENCH_STATE
@@ -585,7 +585,7 @@ codes:
     uart_tx: none
     agent_action: "修正請求的 JSON 格式後重送"
     extra_fields: []
-    contract_tests: []
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapFramingTcp::test_framing_invalid_json_bytes"]
     behavior_change: []
     sources: ["sw_core/rpc_posix.py:31"]
   - code: INVALID_METHOD
@@ -598,7 +598,7 @@ codes:
     uart_tx: none
     agent_action: "以字串形式的 method 重送"
     extra_fields: []
-    contract_tests: []
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapFramingTcp::test_framing_invalid_method_bytes"]
     behavior_change: []
     sources: ["sw_core/rpc_posix.py:47"]
   - code: INVALID_REQUEST
@@ -611,7 +611,7 @@ codes:
     uart_tx: none
     agent_action: "以 JSON object 格式重送"
     extra_fields: []
-    contract_tests: []
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapFramingTcp::test_framing_invalid_request_bytes"]
     behavior_change: []
     sources: ["sw_core/rpc_posix.py:38"]
   - code: INVALID_RESPONSE
@@ -624,7 +624,7 @@ codes:
     uart_tx: possible
     agent_action: "勿直接重送寫入型命令；先以 health.ping 與 session get_state 確認 daemon 與 session 狀態"
     extra_fields: []
-    contract_tests: []
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapFramingTcp::test_invalid_response_non_object"]
     behavior_change: ["DF-06"]
     sources: ["sw_core/client.py:270"]
   - code: INVALID_RULE_SCHEMA
@@ -637,7 +637,7 @@ codes:
     uart_tx: none
     agent_action: "依 schema 修正 rule 欄位後重送 event.rule_set"
     extra_fields: ["error"]
-    contract_tests: []
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapMemory::test_invalid_rule_schema_uses_error_key"]
     behavior_change: []
     sources: ["sw_core/service.py:1138"]
   - code: INVALID_TARGET
@@ -716,7 +716,7 @@ codes:
     uart_tx: possible
     agent_action: "先確認目標檔與暫存檔狀態，再決定是否重試"
     extra_fields: []
-    contract_tests: []
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapMemory::test_move_timeout_push"]
     behavior_change: []
     sources: ["sw_core/file_transfer.py:250"]
   - code: NEEDS_SUDO
@@ -743,7 +743,7 @@ codes:
     uart_tx: none
     agent_action: "等待 session 進入 READY 後重試；必要時以 session self-test 取得分類"
     extra_fields: ["session"]
-    contract_tests: []
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapMemory::test_not_ready_attach_state_result"]
     behavior_change: []
     sources: ["sw_core/session_manager.py:2146"]
   - code: NO_ACTIVE_CAPTURE
@@ -770,7 +770,7 @@ codes:
     agent_action: "依 supervision_mode 改用正確的 daemon 管理方式（on-demand 使用 daemon start 與 daemon stop）"
     extra_fields: ["mode", "action", "hint"]
     exit_codes: {"daemon start": 2, "daemon stop": 2, "service <action>": 2}
-    contract_tests: []
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapMemory::test_no_systemd_service_action"]
     behavior_change: []
     sources: ["sw_core/service_ctl.py:55"]
   - code: PROFILE_IS_EXPLICIT
@@ -823,7 +823,7 @@ codes:
     ok_response: true
     agent_action: "命令已執行，勿重送；以 session get_state 確認當前狀態"
     extra_fields: ["partial", "recovery_action", "session"]
-    contract_tests: []
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapMemory::test_prompt_timeout_force_recovered"]
     behavior_change: []
     sources: ["sw_core/session_manager.py:3919"]
   - code: PROMPT_TIMEOUT_RECOVERED
@@ -905,7 +905,7 @@ codes:
     uart_tx: none
     agent_action: "以 event rule list 確認 rule_id 後重試"
     extra_fields: []
-    contract_tests: []
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapMemory::test_rule_not_found"]
     behavior_change: []
     sources: ["sw_core/service.py:1150"]
   - code: SAMPLE_READ_FAILED
@@ -1036,7 +1036,7 @@ codes:
     uart_tx: none
     agent_action: "檢查 socket 路徑的權限與殘留檔案後重試"
     extra_fields: []
-    contract_tests: []
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapPosixLock::test_socket_unavailable_lock"]
     behavior_change: []
     sources: ["sw_core/lock_posix.py:37"]
   - code: SSH_NOT_FOUND
@@ -1214,7 +1214,7 @@ codes:
   - code: TUNNEL_STATUS_ERROR
     status: EXISTING
     reachable: true
-    scope: {interfaces: [cli_local], methods: ["benches", "connect"], platforms: [posix, windows]}
+    scope: {interfaces: [cli_local], methods: ["benches", "connect"], platforms: [posix]}
     meaning: "connect 與 benches 讀取 tunnel 狀態時，回應格式異常或缺少 tunnels 清單（若回應帶 code 則透傳該 code）"
     side_effect: "無"
     retryable: "conditional"
@@ -1222,7 +1222,7 @@ codes:
     agent_action: "檢查 remote 狀態與 ssh 控制通道後重試"
     extra_fields: ["message"]
     exit_codes: {"benches": 1, "connect": 1}
-    contract_tests: []
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapPosixRemoteCli::test_tunnel_status_error_malformed"]
     behavior_change: []
     sources: ["sw_core/cli.py:1265", "sw_core/cli.py:1270", "sw_core/cli.py:1275", "sw_core/cli.py:1493"]
   - code: TUNNEL_STILL_ACTIVE
@@ -1242,7 +1242,7 @@ codes:
   - code: UNKNOWN_BENCH_CODE
     status: EXISTING
     reachable: true
-    scope: {interfaces: [cli_local], methods: ["connect"], platforms: [posix, windows]}
+    scope: {interfaces: [cli_local], methods: ["connect"], platforms: [posix]}
     meaning: "bench_registry 找不到指定的 bench code"
     side_effect: "無"
     retryable: "fix_args"
@@ -1250,7 +1250,7 @@ codes:
     agent_action: "以 benches.yaml 內存在的 bench code 重試"
     extra_fields: ["message"]
     exit_codes: {"connect": 1}
-    contract_tests: []
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapPosixRemoteCli::test_unknown_bench_code_connect"]
     behavior_change: []
     sources: ["sw_core/cli.py:1353"]
   - code: UNKNOWN_EVENT_CMD
@@ -1265,7 +1265,7 @@ codes:
     agent_action: "改用 event 支援的子命令重試"
     extra_fields: ["cmd"]
     exit_codes: {"event": 2}
-    contract_tests: []
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapMemory::test_unknown_event_cmd_unreachable"]
     behavior_change: []
     sources: ["sw_core/cli.py:1064"]
   - code: UNKNOWN_PROFILE

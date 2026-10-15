@@ -32,7 +32,7 @@ values:
     cleared_by: ["auto:裝置事件觸發之 attach 開頭清除@session_manager.py:2602", "operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:daemon restart"]
     promoted_via: []
     error_code_namespace: allowed_shared
-    contract_tests: []
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapLastError::test_last_error_attach_failed_prefix"]
   - value: "BCM_PROMPT_TIMEOUT"
     kind: named
     reason_forms: []
@@ -49,7 +49,7 @@ values:
     cleared_by: ["auto:自動重探 DETACHED→ATTACHING@session_manager.py:1463", "auto:自動重探 probe 成功→READY@session_manager.py:2536", "operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:command.submit", "operator:daemon restart"]
     promoted_via: ["session.attach", "session.recover"]
     error_code_namespace: allowed_shared
-    contract_tests: []
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapLastError::test_last_error_bcm_prompt_timeout"]
   - value: "BOOTLOADER_STUCK"
     kind: named
     reason_forms: []
@@ -134,7 +134,7 @@ values:
     cleared_by: ["operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:command.submit", "operator:daemon restart"]
     promoted_via: ["session.attach", "session.recover"]
     error_code_namespace: allowed_shared
-    contract_tests: ["tests/test_console_unlock.py::test_continuous_rx_timeout_never_transmits"]
+    contract_tests: ["tests/test_console_unlock.py::test_continuous_rx_timeout_never_transmits", "tests/test_contracts_gap_codes.py::TestGapLastError::test_last_error_console_unlock_idle_timeout_after_probe"]
   - value: "CONSOLE_UNLOCK_PROMPT_TIMEOUT"
     kind: named
     reason_forms: []
@@ -253,7 +253,7 @@ values:
     cleared_by: ["auto:自動重探 DETACHED→ATTACHING@session_manager.py:1463", "auto:自動重探 probe 成功→READY@session_manager.py:2536", "operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:command.submit", "operator:daemon restart"]
     promoted_via: ["session.attach", "session.recover"]
     error_code_namespace: allowed_shared
-    contract_tests: []
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapLastError::test_last_error_login_prompt_timeout"]
   - value: "LOGIN_REQUIRED"
     kind: named
     reason_forms: []
@@ -389,7 +389,7 @@ values:
     cleared_by: ["auto:自動重探 DETACHED→ATTACHING@session_manager.py:1463", "auto:自動重探 probe 成功→READY@session_manager.py:2536", "operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:command.submit", "operator:daemon restart"]
     promoted_via: ["session.attach", "session.recover"]
     error_code_namespace: allowed_shared
-    contract_tests: []
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapLastError::test_last_error_prpl_prompt_timeout"]
   - value: "READY_NONCE_TIMEOUT"
     kind: named
     reason_forms: []
@@ -423,7 +423,7 @@ values:
     cleared_by: ["auto:自動重探 DETACHED→ATTACHING@session_manager.py:1463", "auto:自動重探 probe 成功→READY@session_manager.py:2536", "operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:command.submit", "operator:daemon restart"]
     promoted_via: ["session.attach", "session.recover"]
     error_code_namespace: allowed_shared
-    contract_tests: []
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapLastError::test_last_error_ready_prompt_timeout"]
   - value: "REBOOTING"
     kind: named
     reason_forms: []
@@ -559,7 +559,7 @@ values:
     cleared_by: ["auto:自動重探 DETACHED→ATTACHING@session_manager.py:1463", "auto:自動重探 probe 成功→READY@session_manager.py:2536", "operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:command.submit", "operator:daemon restart"]
     promoted_via: ["session.attach", "session.recover"]
     error_code_namespace: allowed_shared
-    contract_tests: []
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapLastError::test_last_error_shell_prompt_timeout"]
   - value: "TRANSPORT_STALL"
     kind: named
     reason_forms: []

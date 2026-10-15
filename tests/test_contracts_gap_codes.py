@@ -7,8 +7,10 @@
 
 涵蓋範圍（每個測試名稱皆對應計畫表格的一列）：
 
-- ``TestGapMemory``：行程內即可驗證的 error_code（alias、file transfer、console、
-  service、event、arbiter、CLI bench／tunnel／systemd 替身）。
+- ``TestGapMemory``：行程內即可驗證的跨平台 error_code（alias、file transfer、console、
+  service、event、arbiter、systemd 替身）。
+- ``TestGapPosixRemoteCli``：依賴 POSIX（remote_tunnel／fcntl）之 CLI error_code（bench／
+  tunnel status／CLI remote internal error；``posix_only``、``memory_only``）。
 - ``TestGapFramingTcp``：RPC framing 位元組（``serve_connection``）、TCP 回應格式與
   daemon spawn 失敗；會開 loopback socket／asyncio server，故標 ``process_rpc``。
 - ``TestGapPosixLock``：POSIX singleton lock 的 ``SOCKET_UNAVAILABLE``（``posix_only``）。
@@ -42,13 +44,20 @@ from sw_core.arbiter import CommandArbiter
 from sw_core.client import _rpc_call_once
 from sw_core.config import SessionProfile, UartProfile
 from sw_core.device_watcher import DeviceInfo
+from sw_core.auth import SessionAuth
 from sw_core.file_transfer import pull_file, push_file
-from sw_core.login_fsm import LOGIN_FSM_DETAIL_ERRORS, ensure_ready
+from sw_core.login_fsm import (
+    LOGIN_FSM_DETAIL_ERRORS,
+    _ensure_console_unlocked,
+    _finalize_ready,
+    ensure_ready,
+)
 from sw_core.service import SerialwrapService
 from sw_core.service_ctl import service_action
 from sw_core.session_manager import (
     SessionManager,
     SessionRuntime,
+    UARTBridge,
     _login_fsm_rx_tail_detail,
 )
 from sw_core.wal import WalWriter
@@ -145,6 +154,12 @@ class _ScriptedBridge:
         self.vtty_path = None
         # 明確關閉 RX 洪水分類路徑（_maybe_reclassify_flood 對無 rx_stats 的 bridge 直通）。
         self.rx_stats = None
+
+    def start(self) -> None:
+        pass
+
+    def stop(self, preserve_consoles: bool = False):
+        return None
 
     def clear_rx_buffer(self) -> None:
         pass
@@ -250,10 +265,13 @@ def _roundtrip(payload: bytes, handler) -> list[bytes]:
 class TestGapMemory:
     def test_alias_not_found_saves_state_first(self, tmp_path: Path) -> None:
         mgr = _mgr(tmp_path, [_profile()])
+        state_file = tmp_path / "state.json"
+        assert state_file.exists()
+        state_file.unlink()
 
         assert mgr.unassign_alias("ghost") == {"ok": False, "error_code": "ALIAS_NOT_FOUND", "alias": "ghost"}
         # 即使失敗也先落 state.json（unassign_alias 於回傳前呼叫 _save_state）。
-        assert (tmp_path / "state.json").exists()
+        assert state_file.exists()
 
     def test_base64_decode_failed_pull(self, tmp_path: Path) -> None:
         bridge = _MiniFileBridge()
@@ -370,6 +388,7 @@ class TestGapMemory:
 
     def test_unknown_event_cmd_unreachable(self) -> None:
         # argparse 對不在 choices 內的子命令以 exit 2 結束，UNKNOWN_EVENT_CMD 因此不可達。
+        _unreachable_code = "UNKNOWN_EVENT_CMD"
         with pytest.raises(SystemExit) as exc_info:
             cli.build_parser().parse_args(["event", "bogus"])
         assert exc_info.value.code == 2
@@ -401,6 +420,38 @@ class TestGapMemory:
         finally:
             arb.unregister_session("fake")
 
+    def test_prompt_timeout_force_recovered(self, tmp_path: Path) -> None:
+        mgr = _mgr(tmp_path, [_profile()])
+        session = mgr.get_session("COM0")
+        assert session is not None
+        session.state = "READY"
+        bridge = mock.MagicMock()
+        bridge.wait_for_regex.return_value = False
+        bridge.wait_for_regex_from.return_value = False
+        bridge.rx_text_from.return_value = ""
+        bridge.rx_tail.return_value = ""
+        session.bridge = bridge
+
+        with mock.patch.object(mgr, "_force_recover", return_value={"ok": True, "recovered": True, "session": {}}):
+            r = mgr.execute_command(session.session_id, "stuck-cmd", "system:recover", "cmd-recover", timeout_s=0.01, mode="line")
+
+        assert r["ok"] is True
+        assert r["error_code"] == "PROMPT_TIMEOUT_FORCE_RECOVERED"
+        assert r["recovery_action"] == "FORCE_CLEAR_REATTACH"
+        assert r["partial"] is True
+        # 驗證 CTRL-C 與 CTRL-D 探測確實送出
+        bridge.send_bytes.assert_any_call(b"\x03", source="system:recover", cmd_id=None)
+        bridge.send_bytes.assert_any_call(b"\x04", source="system:recover", cmd_id=None)
+
+
+# ---------------------------------------------------------------------------
+# POSIX 專屬 CLI 錯誤碼（依賴 remote_tunnel／fcntl；Windows 基線回傳 REMOTE_NOT_SUPPORTED）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.posix_only
+@pytest.mark.memory_only
+class TestGapPosixRemoteCli:
     def test_invalid_bench_config_connect(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
                                           capsys: pytest.CaptureFixture[str]) -> None:
         benches = tmp_path / "benches.yaml"
@@ -441,13 +492,29 @@ class TestGapMemory:
 
         # rt.status 回 ok 但缺 tunnels 清單 → _status_tunnels 拋 TUNNEL_STATUS_ERROR。
         # 註：`serialwrap remote status` 直接透傳 rt.status（不經 _status_tunnels）；
-        # 可達路徑為 `serialwrap benches`（盤點勘誤，見計畫 T7 表格的說明）。
+        # 可達路徑為 `serialwrap benches` 與 `serialwrap connect --close`（見 spec-errata.md INV-ERR-01）。
         monkeypatch.setattr(remote_tunnel, "status", lambda run_dir: {"ok": True})
 
         rc = cli.main(["benches"])
 
         assert rc == 1
         assert _last_json_line(capsys.readouterr().out)["error_code"] == "TUNNEL_STATUS_ERROR"
+
+    def test_internal_error_cli_catch_all(self, monkeypatch: pytest.MonkeyPatch,
+                                          capsys: pytest.CaptureFixture[str]) -> None:
+        from sw_core import remote_tunnel
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(remote_tunnel, "status", _boom)
+
+        rc = cli.main(["remote", "status"])
+
+        assert rc == 1
+        out = _last_json_line(capsys.readouterr().out)
+        assert out["error_code"] == "INTERNAL_ERROR"
+        assert out["message"] == "boom"
 
 
 # ---------------------------------------------------------------------------
@@ -465,21 +532,25 @@ class TestGapFramingTcp:
         lines = _roundtrip(b'{"id":1,"method":"boom"}\n', handler)
 
         assert lines == [b'{"id":1,"ok":false,"error_code":"EXCEPTION","message":"kaboom"}\n']
+        assert json.loads(lines[0])["error_code"] == "EXCEPTION"
 
     def test_framing_invalid_json_bytes(self) -> None:
         lines = _roundtrip(b"{bad\n", lambda method, params: {"ok": True})
 
         assert lines == [b'{"ok": false, "error_code": "INVALID_JSON"}\n']
+        assert json.loads(lines[0])["error_code"] == "INVALID_JSON"
 
     def test_framing_invalid_request_bytes(self) -> None:
         lines = _roundtrip(b"[1]\n", lambda method, params: {"ok": True})
 
         assert lines == [b'{"ok": false, "error_code": "INVALID_REQUEST"}\n']
+        assert json.loads(lines[0])["error_code"] == "INVALID_REQUEST"
 
     def test_framing_invalid_method_bytes(self) -> None:
         lines = _roundtrip(b'{"id":7}\n', lambda method, params: {"ok": True})
 
         assert lines == [b'{"id":7,"ok":false,"error_code":"INVALID_METHOD"}\n']
+        assert json.loads(lines[0])["error_code"] == "INVALID_METHOD"
 
     def test_invalid_response_non_object(self) -> None:
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -775,3 +846,87 @@ class TestGapLastError:
 
         assert "BRIDGE_DOWN:SERIAL_READ:EIO" in writes
         assert session.last_error is None
+
+    def test_last_error_login_prompt_timeout(self, tmp_path: Path) -> None:
+        profile = _shell_login_profile(user_env="SW_GAP_USER", pass_env="SW_GAP_PASS")
+        bridge = _ScriptedBridge(waits=[False])
+        auth = SessionAuth(username="root", password="secret")
+        ok, err = ensure_ready(bridge, profile, auth)
+        assert ok is False
+        assert err == "LOGIN_PROMPT_TIMEOUT"
+
+        mgr = _mgr(tmp_path, [profile])
+        mgr._devices[_BY_ID] = DeviceInfo(by_id=_BY_ID, real_path="/dev/ttyUSB0")
+        session = mgr.get_session("COM0")
+        assert session is not None
+        with mock.patch.dict(os.environ, {"SW_GAP_USER": "root", "SW_GAP_PASS": "secret"}):
+            with mock.patch("sw_core.session_manager.UARTBridge", return_value=_ScriptedBridge(waits=[False])):
+                mgr._attach_by_id(_BY_ID)
+        assert session.last_error == "LOGIN_PROMPT_TIMEOUT"
+        assert session.state == "DETACHED"
+
+    def test_last_error_bcm_prompt_timeout(self) -> None:
+        profile = _profile(platform="bcm", prompt_regex=r">")
+        ok, err = ensure_ready(_ScriptedBridge([False]), profile)
+        assert ok is False
+        assert err == "BCM_PROMPT_TIMEOUT"
+
+    def test_last_error_shell_prompt_timeout(self) -> None:
+        profile = _profile(platform="shell", prompt_regex=r"#")
+        ok, err = ensure_ready(_ScriptedBridge([False]), profile)
+        assert ok is False
+        assert err == "SHELL_PROMPT_TIMEOUT"
+
+    def test_last_error_prpl_prompt_timeout(self) -> None:
+        profile = _profile(platform="prpl", prompt_regex=r"#")
+        ok, err = ensure_ready(_ScriptedBridge([False]), profile)
+        assert ok is False
+        assert err == "PRPL_PROMPT_TIMEOUT"
+
+    def test_last_error_ready_prompt_timeout(self) -> None:
+        profile = _profile(platform="shell", prompt_regex=r"#", ready_probe="echo __READY__${nonce}")
+        ok, err = _finalize_ready(_ScriptedBridge([True, False]), profile)
+        assert ok is False
+        assert err == "READY_PROMPT_TIMEOUT"
+
+    def test_last_error_attach_failed_prefix(self, tmp_path: Path) -> None:
+        mgr = _mgr(tmp_path, [_profile()])
+        mgr._devices[_BY_ID] = DeviceInfo(by_id=_BY_ID, real_path="/dev/ttyUSB0")
+        session = mgr.get_session("COM0")
+        assert session is not None
+
+        with mock.patch.object(UARTBridge, "start", side_effect=OSError("busy")):
+            mgr._attach_by_id(_BY_ID)
+
+        assert session.last_error == "ATTACH_FAILED:OSError"
+        assert session.state == "DETACHED"
+
+    def test_last_error_console_unlock_idle_timeout_after_probe(self) -> None:
+        profile = _shell_login_profile(console_unlock_env="SW_CONSOLE_UNLOCK", console_unlock_idle_s=0.08, timeout_s=10.0)
+        auth = SessionAuth(username=None, password=None, console_unlock="supersecret")
+
+        class _ContinuousRxBridge(_ScriptedBridge):
+            def rx_idle_s(self) -> float:
+                if not self.sent:
+                    # probe 送出前：RX 靜默時間超過門檻，使第一段 _wait_console_idle 成功
+                    return 1.0
+                # probe 送出後：RX 吵雜，rx_idle_s 恆為 0，第二段 _wait_console_idle 逾時
+                return 0.0
+
+        current_time = [1000.0]
+
+        def fake_monotonic() -> float:
+            return current_time[0]
+
+        def fake_sleep(dur: float) -> None:
+            current_time[0] += dur
+
+        bridge = _ContinuousRxBridge(waits=[False], tail="noisy output\n")
+        with mock.patch("sw_core.login_fsm.time.monotonic", side_effect=fake_monotonic), \
+                mock.patch("sw_core.login_fsm.time.sleep", side_effect=fake_sleep):
+            ok, err = _ensure_console_unlocked(bridge, profile, auth)
+
+        assert ok is False
+        assert err == "CONSOLE_UNLOCK_IDLE_TIMEOUT"
+        assert "" in bridge.sent
+        assert "<secret>" not in bridge.sent
