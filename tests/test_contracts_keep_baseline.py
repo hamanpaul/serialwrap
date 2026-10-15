@@ -205,6 +205,14 @@ def test_lastresort_format_and_level():
     stderr = proc.stderr.decode("utf-8", errors="replace").replace("\r\n", "\n")
     assert stderr == "w 1\n", f"stderr 應恰為 'w 1\\n'（INFO 丟棄、格式 %(message)s），實際 {stderr!r}"
 
+    # 核對 daemon_logging.yaml 的 sink 欄位宣告與實測一致
+    doc = _load_yaml(DAEMON_LOGGING)
+    sink = doc["sink"]
+    assert sink["stream"] == "stderr"
+    assert sink["min_level"] == "WARNING"
+    assert sink["format"] == "%(message)s"
+    assert sink["info_dropped"] is True
+
 
 @pytest.mark.memory_only
 def test_last_error_logging_templates_match():
@@ -301,6 +309,10 @@ def test_config_error_split(tmp_path):
     raise_cases = [
         ("max_console_line_chars=true", {"max_console_line_chars": True}, ValueError,
          "max_console_line_chars 必須是正整數或 null"),
+        ("max_console_line_chars='8'", {"max_console_line_chars": "8"}, ValueError,
+         "max_console_line_chars 必須是正整數或 null"),
+        ("max_console_line_chars=1.5", {"max_console_line_chars": 1.5}, ValueError,
+         "max_console_line_chars 必須是正整數或 null"),
         ("max_console_line_chars=0", {"max_console_line_chars": 0}, ValueError,
          "max_console_line_chars 必須是正整數或 null"),
         ("console_unlock_idle_s=true", {"console_unlock_idle_s": True}, ValueError,
@@ -308,6 +320,10 @@ def test_config_error_split(tmp_path):
         ("console_unlock_idle_s=abc", {"console_unlock_idle_s": "abc"}, ValueError,
          "console_unlock_idle_s 必須是有限正數"),
         ("console_unlock_idle_s=-1", {"console_unlock_idle_s": -1}, ValueError,
+         "console_unlock_idle_s 必須是有限正數"),
+        ("console_unlock_idle_s=inf", {"console_unlock_idle_s": float("inf")}, ValueError,
+         "console_unlock_idle_s 必須是有限正數"),
+        ("console_unlock_idle_s=nan", {"console_unlock_idle_s": float("nan")}, ValueError,
          "console_unlock_idle_s 必須是有限正數"),
     ]
     for idx, (case_id, template, exc_type, message) in enumerate(raise_cases):
@@ -368,6 +384,13 @@ def test_config_error_split(tmp_path):
         ("target_without_device_by_id→dropped",
          {"targets": [{"com": "COM0", "profile": "p"}]},
          lambda r: len(r.profiles), 0),
+        # target 引用未定義 profile → 靜默略過
+        ("unknown_profile_ref→dropped",
+         {"targets": [{"com": "COM0", "profile": "nope", "device_by_id": "/dev/serial/by-id/test-dut"}]},
+         lambda r: len(r.profiles), 0),
+        # targets 非 list → 靜默略過（全走動態偵測）
+        ("targets_non_list→dropped", {"targets": "abc"},
+         lambda r: len(r.profiles), 0),
     ]
     for idx, (case_id, kwargs, getter, expected) in enumerate(silent_cases):
         d = _write_yaml_dir(tmp_path / f"silent_{idx}", {"p.yaml": _profile_doc(**kwargs)})
@@ -378,6 +401,17 @@ def test_config_error_split(tmp_path):
             continue
         if got != expected:
             failures.append(f"silent[{case_id}] 得 {got!r}，預期 {expected!r}")
+
+    # 頂層非 dict 的 YAML 檔（sw_core/config.py:327）被靜默忽略
+    top_non_dict_dir = tmp_path / "top_non_dict"
+    top_non_dict_dir.mkdir()
+    (top_non_dict_dir / "p.yaml").write_text("- not\n- a\n- mapping\n", encoding="utf-8")
+    try:
+        res = load_profiles(str(top_non_dict_dir))
+        if len(res.profiles) != 0 or len(res.templates) != 0:
+            failures.append(f"silent[top_non_dict] 預期空結果，實際 {res}")
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"silent[top_non_dict] 不應拋出，實際 {type(exc).__name__}: {exc}")
 
     assert not failures, "EVT-D-S14 config 錯誤分流與表格不符：\n" + "\n".join(failures)
 
@@ -441,4 +475,28 @@ def test_string_false_is_truthy(tmp_path):
     assert result.profiles[0].uart.xonxoff is True, (
         'EVT-D-C3：字串 "false" 應被 bool() 當成 True（現況），實際 xonxoff='
         f"{result.profiles[0].uart.xonxoff!r}"
+    )
+
+    # 盤點 09 §8.3 D-C3 第二處：event_engine schema 的 auto_enable_com_on_load 與 debug
+    from sw_core.event_engine.schema import validate_rule_dict
+
+    rule_doc = {
+        "schema_version": 1,
+        "owner": "test",
+        "name": "truthiness-test",
+        "kind": "tool",
+        "selectors": ["COM0"],
+        "pattern": {"kind": "contains", "value": "test"},
+        "handler": {"shell": "true"},
+        "auto_enable_com_on_load": "false",
+        "debug": "false",
+    }
+    rule = validate_rule_dict(rule_doc)
+    assert rule.auto_enable_com_on_load is True, (
+        'EVT-D-C3：字串 "false" 經 bool() 應為 True，實際 auto_enable_com_on_load='
+        f"{rule.auto_enable_com_on_load!r}"
+    )
+    assert rule.debug is True, (
+        'EVT-D-C3：字串 "false" 經 bool() 應為 True，實際 debug='
+        f"{rule.debug!r}"
     )

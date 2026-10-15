@@ -3003,8 +3003,16 @@ sink:
   mechanism: "logging.lastResort（daemon 端未呼叫 basicConfig／addHandler／setLevel）"
   min_level: WARNING
   format: "%(message)s"
-  info_dropped: true
-  supervisor: "systemd 模式由 journald 承接 stderr；on-demand 模式寫到啟動者的 stderr"
+  destinations:
+    - launch: "systemd-user／systemd-system unit"
+      stderr: "journald（sw_core/systemd_units.py 的 unit 無 StandardOutput／StandardError 覆寫，沿用 systemd 預設）"
+      observed: false   # 推論；實機觀察為 BLOCKED-OWNER #8（supervisor_runtime）
+    - launch: "serialwrap daemon start（on-demand 背景 spawn；POSIX 與 Windows DETACHED_PROCESS）"
+      stderr: "DEVNULL（sw_core/cli.py:568-569）；全部 daemon log 遺失，僅 WAL META 留存"
+    - launch: "serialwrap daemon start --foreground／直接執行 serialwrapd"
+      stderr: "繼承啟動者終端（sw_core/cli.py:565）"
+    - launch: "regression ThrowawayDaemon"
+      stderr: "<workdir>/daemon.log（regression/serialwrap_regression/guards.py:170-176）"
 messages:
   - id: credentials_unresolved
     logger: serialwrap

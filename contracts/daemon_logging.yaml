@@ -1,0 +1,150 @@
+# contracts/daemon_logging.yaml — daemon logging 基線契約（GAP-G-01）
+# 凍結 daemon 端的 logging 去向、等級門檻、輸出格式與全部 logger 呼叫模板。
+schema_version: 1
+revision: 1
+sink:
+  stream: stderr
+  mechanism: "logging.lastResort（daemon 端未呼叫 basicConfig／addHandler／setLevel）"
+  min_level: WARNING
+  format: "%(message)s"
+  info_dropped: true
+  destinations:
+    - launch: "systemd-user／systemd-system unit"
+      stderr: "journald（sw_core/systemd_units.py 的 unit 無 StandardOutput／StandardError 覆寫，沿用 systemd 預設）"
+      observed: false   # 推論；實機觀察為 BLOCKED-OWNER #8（supervisor_runtime）
+    - launch: "serialwrap daemon start（on-demand 背景 spawn；POSIX 與 Windows DETACHED_PROCESS）"
+      stderr: "DEVNULL（sw_core/cli.py:568-569）；全部 daemon log 遺失，僅 WAL META 留存"
+    - launch: "serialwrap daemon start --foreground／直接執行 serialwrapd"
+      stderr: "繼承啟動者終端（sw_core/cli.py:565）"
+    - launch: "regression ThrowawayDaemon"
+      stderr: "<workdir>/daemon.log（regression/serialwrap_regression/guards.py:170-176）"
+excluded_sources:
+  - sw_core/cli_trace.py
+messages:
+  - id: auth_env_file_unparseable
+    logger: sw_core.auth
+    level: WARNING
+    template: "無法解析 env_file: %s（session %s）"
+    args: [expanded, sp.com]
+    source: "sw_core/auth.py:109"
+
+  - id: auth_env_file_missing
+    logger: sw_core.auth
+    level: WARNING
+    template: "env_file 不存在: %s（session %s）"
+    args: [expanded, sp.com]
+    source: "sw_core/auth.py:112"
+
+  - id: device_watcher_tick_failed
+    logger: serialwrap
+    level: WARNING
+    template: "device watcher tick 失敗，略過本輪"
+    args: []
+    exc_info: true
+    source: "sw_core/device_watcher.py:78"
+
+  - id: matcher_thread_exit_timeout
+    logger: sw_core.event_engine.matcher
+    level: WARNING
+    template: "event-matcher thread did not exit within 2s; context may receive late callbacks"
+    args: []
+    source: "sw_core/event_engine/matcher.py:154"
+
+  - id: matcher_eval_failed
+    logger: serialwrap
+    level: WARNING
+    template: "event matcher 求值失敗，丟棄此 item（selector=%s）"
+    args: [item.selector]
+    exc_info: true
+    source: "sw_core/event_engine/matcher.py:226"
+
+  - id: console_unlock_attempt
+    logger: serialwrap
+    level: INFO
+    dropped: true
+    template: "console unlock attempt com=%s rx_idle_s=%.3f required_idle_s=%.3f"
+    args: [sp.com, idle_s, sp.console_unlock_idle_s]
+    source: "sw_core/login_fsm.py:316"
+
+  - id: state_file_corrupt
+    logger: serialwrap
+    level: WARNING
+    template: "state.json 解析失敗（JSON 損毀），略過載入並備份至 %s：%s"
+    args: [backup, exc]
+    source: "sw_core/session_manager.py:763"
+
+  - id: credentials_unresolved
+    logger: serialwrap
+    level: WARNING
+    template: "session %s 帳密解析未完成（reason=%s, env_file=%s）：不對 login prompt 送空帳密，標記 CREDENTIALS_UNRESOLVED 終態，請補齊帳密後手動 attach/recover"
+    args: [com, reason, env_file_or_dash]
+    source: "sw_core/session_manager.py:1211"
+    dedup: credentials_warned
+
+  - id: transport_stall_suspected
+    logger: serialwrap
+    level: WARNING
+    template: "session %s 疑似 transport stall（零 RX %.1fs、probe 全程無 echo，real_path=%s）：%s"
+    args: [com, rx_age_s, real_path_or_dash, detail]
+    source: "sw_core/session_manager.py:1311"
+    dedup: transport_stall_warned
+
+  - id: max_sessions_reached
+    logger: serialwrap
+    level: WARNING
+    template: "已達 max_sessions=%d，忽略裝置 %s"
+    args: [max_sessions, by_id]
+    source: "sw_core/session_manager.py:2568"
+
+  - id: reboot_recovery_ensure_ready_exception
+    logger: serialwrap
+    level: WARNING
+    template: "reboot-recovery ensure_ready 例外（session=%s），續迴圈待逾時收尾"
+    args: [session_id]
+    exc_info: true
+    source: "sw_core/session_manager.py:3438"
+
+  - id: console_rx_handler_exception
+    logger: serialwrap
+    level: WARNING
+    template: "console RX handler 例外（com=%s），略過此塊、console 續行"
+    args: [com]
+    exc_info: true
+    source: "sw_core/uart_io.py:453"
+
+  - id: rx_handler_exception_pyserial
+    logger: serialwrap
+    level: WARNING
+    template: "RX handler 例外（com=%s），略過此塊、reader 續行"
+    args: [com]
+    exc_info: true
+    source: "sw_core/uart_io.py:885"
+
+  - id: rx_handler_exception_posix
+    logger: serialwrap
+    level: WARNING
+    template: "RX handler 例外（com=%s），略過此塊、reader 續行"
+    args: [com]
+    exc_info: true
+    source: "sw_core/uart_io.py:928"
+
+  - id: wal_rotate_failed
+    logger: serialwrap
+    level: WARNING
+    template: "WAL 輪替失敗（best-effort 續用既有檔案，不殺 reader）：%s：%s"
+    args: [path, exc]
+    source: "sw_core/wal.py:110"
+
+  - id: wal_append_failed
+    logger: serialwrap
+    level: WARNING
+    template: "WAL append 寫入失敗（best-effort 略過）：%s"
+    args: [retry_exc]
+    source: "sw_core/wal.py:165"
+
+  - id: wal_dir_recreated
+    logger: serialwrap
+    level: WARNING
+    template: "WAL 目錄 %s 消失，已重建並續寫（原因：%s）；消失期間的紀錄無法復原"
+    args: [wal_dir, exc]
+    source: "sw_core/wal.py:169"
