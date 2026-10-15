@@ -105,7 +105,7 @@ values:
     kind: named
     reason_forms: []
     reachable: true
-    meaning: "console_unlock 步驟遇到 CFE 或 bootloader 提示，不送 secret 並停止後續 TX；login_fsm.py:293 為空行 probe 之前判定（零 TX），login_fsm.py:308 為空行 probe 之後判定（該處之前已送過空行 probe）"
+    meaning: "console_unlock 步驟遇到 CFE 或 bootloader 提示，不送 secret 並停止後續 TX；空行 probe 之前判定者為零 TX，之後判定者該處之前已送出一次空行 probe"
     agent_action: "以 interactive-open --allow-attached 手動進入 bootloader 處理，完成後以 session attach 重試"
     manual_recovery: "人工脫困後，以 session attach 或 session recover 重新進入流程，或重啟 daemon"
     logging: "無"
@@ -122,7 +122,7 @@ values:
     kind: named
     reason_forms: []
     reachable: true
-    meaning: "console_unlock 等待 RX 閒置逾時（console 持續有輸出，未能靜默）；從未送出 secret。login_fsm.py:291 為零 TX；login_fsm.py:306、:315 之前已於 :300 送出一次空行 probe（已有 TX，仍未送 secret）"
+    meaning: "console_unlock 等待 RX 閒置逾時（console 持續有輸出，未能靜默）；從未送出 secret。空行 probe 之前判定者為零 TX，之後判定者該處之前已送出一次空行 probe（已有 TX，仍未送 secret）"
     agent_action: "等待 console 靜默後以 session attach 重試；若 console 持續輸出，先排查 RX 洪水（RX_FLOOD）"
     manual_recovery: "console 靜默後以 session attach 手動重試"
     logging: "無"
@@ -343,7 +343,7 @@ values:
     kind: named
     reason_forms: []
     reachable: true
-    meaning: "命令送出後等不到 prompt，且 CTRL_C／CTRL_D 皆未恢復（或 boot quiet 期間跳過強制按鍵）時，由 _transition_to_attached 轉為 ATTACHED（sw_core/session_manager.py:3913）"
+    meaning: "命令送出後等不到 prompt，且 CTRL_C／CTRL_D 皆未恢復（或 boot quiet 期間跳過強制按鍵）時，由 _transition_to_attached 轉為 ATTACHED"
     agent_action: "此值具自動重探資格；逾期未恢復時以 session recover 或 console attach 檢查 target 狀態"
     manual_recovery: "通常由 daemon 自動重探；逾期未恢復時以 session recover 手動重試"
     logging: "無"
@@ -582,7 +582,7 @@ values:
     reason_forms: []
     reachable: false
     unreachable_reason: "盤點 03 §7.5：login_fsm._maybe_login 以同名變數覆寫 err，回應不會帶出此值（調和表 ERR-7.5-a、GAP-X3）"
-    meaning: "user_env 指定的帳號環境變數缺漏（目前程式不可達，保留於目錄以凍結既有語意）"
+    meaning: "user_env 指定的帳號環境變數缺漏"
     agent_action: "目前不會由程式回出；若日後遇到，依 user_env 的設定補齊環境變數後以 session attach 重試"
     manual_recovery: "補齊 user_env 對應的環境變數後，以 session attach 或 session recover 手動重新進入流程"
     logging: "無"

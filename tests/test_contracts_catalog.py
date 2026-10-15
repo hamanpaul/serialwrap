@@ -588,6 +588,42 @@ STRUCTURAL_CASES = [
         id="ec_passthrough_duplicate_id",
     ),
     pytest.param(
+        "ec_passthrough_rule_pipe",
+        "error_code",
+        GOOD_EC.replace(
+            "passthrough: []",
+            textwrap.dedent("""\
+            passthrough:
+              - id: pt_test
+                namespace_ref: session_last_errors
+                scope: {interfaces: [rpc], methods: [x.y], platforms: [posix]}
+                rule: "規則 | 含管線符"
+                owner_confirmation: not_required
+                reconciliation_refs: [ref1]
+            """),
+        ),
+        "passthrough[0](pt_test).rule",
+        id="ec_passthrough_rule_pipe",
+    ),
+    pytest.param(
+        "ec_passthrough_rule_newline",
+        "error_code",
+        GOOD_EC.replace(
+            "passthrough: []",
+            textwrap.dedent("""\
+            passthrough:
+              - id: pt_test
+                namespace_ref: session_last_errors
+                scope: {interfaces: [rpc], methods: [x.y], platforms: [posix]}
+                rule: "規則\\n含換行"
+                owner_confirmation: not_required
+                reconciliation_refs: [ref1]
+            """),
+        ),
+        "passthrough[0](pt_test).rule",
+        id="ec_passthrough_rule_newline",
+    ),
+    pytest.param(
         "ec_exit_code_value_type",
         "error_code",
         GOOD_EC.replace("interfaces: [rpc]", "interfaces: [cli_local]").replace("behavior_change: []", 'behavior_change: []\n    exit_codes: {doctor: "two"}'),

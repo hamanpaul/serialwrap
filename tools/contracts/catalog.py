@@ -620,7 +620,7 @@ def _check_passthrough(p: _Problems, items: list[Any]) -> None:
         if "scope" in pt:
             _check_scope(p, f"{loc}.scope", pt["scope"], methods_nonempty=True)
         if "rule" in pt:
-            _check_str(p, f"{loc}.rule", pt["rule"])
+            _check_text(p, f"{loc}.rule", pt["rule"])
         if "owner_confirmation" in pt:
             _check_enum(p, f"{loc}.owner_confirmation", pt["owner_confirmation"], _OWNER_CONFIRMATIONS)
         if "reconciliation_refs" in pt:
