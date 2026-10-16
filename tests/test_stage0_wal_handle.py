@@ -8,7 +8,7 @@
   使本檔在實作前仍可 collection；Stage A 下各測試應因 `ModuleNotFoundError` 紅燈。
 - 依 P0 T14 規則：本檔混合 `core_portable` 與 `windows_native`，**模組層不放平台 marker**，
   平台 marker 逐函式標註；資源 marker 統一為 `memory_only`（只用暫存目錄與行程內物件）。
-- 替身 `CountingFs` 以 `PosixWalFs` 子類包裝 `WalFile`，記錄 open／close／write 並依劇本注入失敗。
+- 替身 `CountingFs` 以目前平台的預設 `WalFs` 實作包裝 `WalFile`，記錄 open／close／write 並依劇本注入失敗。
 """
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ def _load():
 
 
 def _counting_fs_cls():
-    """建立 `CountingFs` 類別：包裝 `PosixWalFs`，記錄 open／close／write 並可注入失敗劇本。
+    """建立 `CountingFs` 類別：包裝平台預設 WAL backend 並記錄 open／close／write。
 
     劇本 `script[path]` 為依序消費的動作，每次 `WalFile.write_all_flush` 消費一個（佇列空則為 `("ok",)`）：
       - `("ok",)`：委派完整寫出。
@@ -48,7 +48,7 @@ def _counting_fs_cls():
     """
     wal_fs = _load()
 
-    class CountingFs(wal_fs.PosixWalFs):
+    class CountingFs(type(wal_fs.default_wal_fs())):
         def __init__(self) -> None:
             super().__init__()
             self.opens: list[str] = []

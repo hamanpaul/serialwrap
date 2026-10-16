@@ -494,7 +494,7 @@
       # SetFileInformationByHandle(FileDispositionInfoEx(21), DELETE|POSIX_SEMANTICS)
 
   # sw_core/wal_fs.py
-  class WindowsWalFs:  # 實作 WalFs；open_append 用 open_shared_append；unlinked 用 delete_pending；identity 用 file_identity
+  class WindowsWalFs(api: WinApi | None = None):  # 實作 WalFs；所有 Windows API 可注入；unlinked 僅用 delete_pending
   ```
 - Rust 對應：arch §4.5 `WalFs::open_append` Windows 分支、`WalFile::identity`／`unlinked`；arch §4.4 Windows `LockFileEx(EXCLUSIVE|FAIL_IMMEDIATELY, offset 0, len 1)`。
 
@@ -602,14 +602,18 @@
   | 測試名 | 斷言 |
   |---|---|
   | `test_native_windows_walfs_unlinked_reports_delete_pending` | `WindowsWalFs().open_append(p)` 後 `w32.delete_classic(p)` → `.unlinked() is True` |
-  | `test_native_os_remove_semantics_recorded` | 記錄 `os.remove` 在本機是 classic 或 POSIX semantics（輸出至測試 stdout 供證據），兩種結果都不得使 `WindowsWalFs` 的偵測失準：之後 `.unlinked()` 為真或 `path_identity` 為 `None` |
+  | `test_native_os_remove_semantics_recorded` | 以 JUnit property `os_remove_semantics` 記錄 `os.remove` 在本機是 classic 或 POSIX semantics；兩種結果都不得使 `WindowsWalFs` 的偵測失準：之後 `.unlinked()` 為真或 `path_identity` 為 `None` |
   | `test_native_sync_on_append_handle` | `WindowsWalFs().open_append(p)` 寫入後 `.sync()` 不擲例外（`FlushFileBuffers` 在 `FILE_APPEND_DATA\|SYNCHRONIZE` handle 上可用） |
   | `test_native_sync_dir_is_documented_noop` | `WindowsWalFs().sync_dir(dir)` 不擲例外、不開啟任何 handle（spy `CreateFileW` 呼叫數 0） |
   | `test_native_path_identity_missing_returns_none` | 不存在路徑 → `None` |
   | `test_native_reader_without_share_delete_blocks_rename` | 以 Python `open(p, "rb")` 持有（無 share-delete）時 `os.replace(p, q)` 擲 `PermissionError`（此為 T04 外部 reader 阻擋案例的前提） |
 - [ ] **A2 執行並確認 FAIL**：`python3 -m pytest -q tests/test_stage0_wal_winfs.py` → 預期 `ImportError: cannot import name 'win32_files'`。commit：`test(wal): BC-01 Windows share-delete handle 失敗測試`
-- [ ] **B1 實作**：依 Interfaces 與行為規格；`WinApi` 欄位在 `load_api()` 以 `ctypes.WinDLL("kernel32", use_last_error=True)` 綁定並設定 `argtypes`／`restype`（`HANDLE=ctypes.c_void_p`），`GetLastError` 綁 `ctypes.get_last_error`；結構 `FILE_STANDARD_INFO{LARGE_INTEGER AllocationSize; LARGE_INTEGER EndOfFile; DWORD NumberOfLinks; BOOLEAN DeletePending; BOOLEAN Directory}`（class 1）、`FILE_ID_INFO{ULONGLONG VolumeSerialNumber; BYTE FileId[16]}`（class 18）。`WindowsWalFs.rename_noreplace_or_suffix` 共用 T04 演算法；`sync` 走 `os.fsync`（CPython 在 Windows 對應 `_commit`→`FlushFileBuffers`）。`default_wal_fs()` 在 `os.name == "nt"` 回 `WindowsWalFs()`。
+- [ ] **B1 實作**：依 Interfaces 與行為規格；`WinApi` 欄位在 `load_api()` 以 `ctypes.WinDLL("kernel32", use_last_error=True)` 綁定並設定 `argtypes`／`restype`（`HANDLE=ctypes.c_void_p`），`GetLastError` 綁 `ctypes.get_last_error`；結構 `FILE_STANDARD_INFO{LARGE_INTEGER AllocationSize; LARGE_INTEGER EndOfFile; DWORD NumberOfLinks; BOOLEAN DeletePending; BOOLEAN Directory}`（class 1）、`FILE_ID_INFO{ULONGLONG VolumeSerialNumber; BYTE FileId[16]}`（class 18）。`WindowsWalFs(api: WinApi | None = None)` 將替身或原生 API 傳給所有 `win32_files` 呼叫；`WindowsWalFile.unlinked()` 僅呼叫 `delete_pending`。`WindowsWalFs.rename_noreplace_or_suffix` 共用 T04 演算法；`sync` 走 `os.fsync`（CPython 在 Windows 對應 `_commit`→`FlushFileBuffers`）。`default_wal_fs()` 在 `os.name == "nt"` 回 `WindowsWalFs()`。
 - [ ] **B2 執行並確認 PASS**：`python3 -m pytest -q tests/test_stage0_wal_winfs.py tests/test_stage0_wal_handle.py`；`scripts/stage0/win-pytest.sh tests/test_stage0_wal_winfs.py tests/test_stage0_wal_handle.py tests/test_wal.py tests/test_wal_integrity.py`。
+- **測試資產變更**（獨立審閱：Reviewer A 確認 API 修正未放寬斷言）：
+  - `tests/test_stage0_wal_handle.py::test_dir_removed_still_self_heals`、`::test_file_unlinked_name_check_unthrottled`：`CountingFs` base 由 `PosixWalFs` 改為 `type(default_wal_fs())`，讓原生 Windows 使用 share-delete 後端；兩項自癒斷言不變。
+  - `tests/test_stage0_wal_winfs.py::test_native_os_remove_semantics_recorded`、`::test_native_sync_on_append_handle`：依 `WalFile` Protocol 將 `write()` 改為 `write_all_flush()`；前者另以 JUnit property 留存刪除語意。
+  - `tests/test_stage0_wal_winfs.py`：新增可攜替身案例，覆蓋 `WindowsWalFs` API 注入、DeletePending、FileId／路徑錯誤映射、查詢 handle 清理、LockFileEx 錯誤映射、檔案大小與歸檔後綴（含 `.999` 用盡）。
 - [ ] **B3 commit**：`fix(wal): BC-01 Windows WAL handle 改用 CreateFileW share-delete 並提供 LockFileEx 包裝`
 
 ---
@@ -788,6 +792,7 @@
    2. `ident = fs.path_identity(wal_path)`；`ident is None`（名稱不存在）或 `ident == (0, 0)`（Windows delete-pending 哨兵，T03 第 2 點）→ `external_unlink`；
    3. `ident != fp.identity()`（名稱存在且為真實但不同的 identity）→ `replaced`（POSIX `os.replace` 覆蓋後舊 inode 的 `st_nlink` 也會變 0，因此 identity 比對必須先於 `unlinked()`）；
    4. identity 相同但 `fp.unlinked()` 為真 → `external_unlink`。
+   5. `path_identity`、`identity` 或 `unlinked` 查詢若擲出 `OSError`（包含檔案系統不支援 `FileIdInfo` 的 50／87），該次 identity 視為未知：略過本次 identity-based 分類，使用目前 handle 繼續一般 append；不得因查詢錯誤觸發重建、寫 META、設 unhealthy，亦不得讓查詢例外離開 `append`。這只處理 identity 證據不可用，不覆蓋已由每筆名稱檢查確認的目錄／路徑消失；後續一般寫入若失敗，依 T02 寫入失敗規格處理。
 2. 命中後：記 `previous_identity = f"{dev}:{ino}"`（取不到為 `None`）、遺失範圍、關閉自身 handle、`ensure_dir`，做**一次** `open_append` 嘗試。WalWriter 任何路徑都**不得持 `_lock` 睡眠**：重試的退避以 `clock` 判定——第 i 次失敗（i=1,2,3）後，下一次嘗試只在距該次失敗 `>= WAL_RECREATE_BACKOFF_S[i-1]`（0.01、0.05、0.2 s）的下一筆 append 時進行；第 4 次失敗起間隔依 `WAL_RECREATE_RETRY_INTERVALS_S`（1 s、2 s、之後封頂 5 s）；未到嘗試時間的 append 不做任何開檔 syscall，直接回傳 `loss_flag=True`（seq 照常消耗）。
 3. 遺失範圍：`file_first_seq` 為目前 WAL 檔第一筆 seq（啟動掃描時取現行檔第一個非空行；該行能解析為 dict 且 `seq` 為 int 才算已知，否則為 `None`；rotate／reset／重建後設為下一筆寫入的 seq）。範圍＝`[file_first_seq, self._seq]`（`self._seq` 為 META 之前最後已消耗的 seq，含不健康期間消耗而未落盤的 seq）；`file_first_seq is None` 或 `self._seq < file_first_seq` → `potentially_lost_seq_range=None`、`range_known=False`。禁止填入猜測值。
 4. 重建成功：先寫 META（消耗一個 seq、外層 `loss_flag:true`），再寫原紀錄；`_recreated_count += 1`；`unhealthy=False`；`unhealthy_reason=None`。
@@ -796,6 +801,7 @@
 
 **Steps**
 - [ ] **A1 寫失敗測試**：`tests/test_stage0_wal_unlink.py`
+  - 補 `core_portable` 案例 `test_identity_query_oserror_is_unknown_and_append_continues`：替身分別令路徑 identity、handle identity、`unlinked` 查詢擲 `OSError`，確認 append 不外拋、不寫重建 META、不設 unhealthy，且記錄持續寫入當前 WAL。
   ```python
   from __future__ import annotations
   import json
