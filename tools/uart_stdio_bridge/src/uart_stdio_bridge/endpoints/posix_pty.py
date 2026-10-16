@@ -138,6 +138,11 @@ class PosixPtyEndpoint:
                 time.sleep(min(0.01, remaining))
             elif not poll_waited:
                 time.sleep(min(0.001, remaining))
+            else:
+                # poll 是在 self._lock 內等待；逾時後若立即重取鎖，threading.Lock 不保證公平，
+                # 同一端點的 write_some／peer_open 會被餓到 read() 的整個 timeout（50 ms）才拿到鎖，
+                # RX 寫回受測端被量化成 50 ms 一筆。於鎖外短暫讓出，讓等待中的執行緒取得鎖。
+                time.sleep(min(0.0005, remaining))
 
     def write_some(self, data: bytes, timeout_s: float) -> int:
         """寫入一段 bytes，回報本次由核心接受的長度。"""
