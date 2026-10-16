@@ -374,6 +374,208 @@ def test_control_ack_shapes():
     assert ack["error"] == "unknown_action"
 
 
+def test_feed_preserves_serial_order_with_prior_delayed_emit():
+    _src_on_path()
+    from uart_stdio_bridge.dut.model import CommandOverride, DutModel, TargetConfig
+
+    cfg = TargetConfig(
+        noise_enabled=False,
+        overrides={"slow": CommandOverride(response="SLOW\r\n# ", delay_ms=700)},
+    )
+    model = DutModel(cfg)
+    model.boot(0)
+
+    # t=0 feed "slow\n"，因 delay_ms=700 進入 heap，feed 回傳空
+    assert model.feed(b"slow\n", 0) == []
+
+    # t=700 feed "ls\n"，無中介 poll
+    # 預期返回的 emits 必須先是 SLOW，再是 ls 回應
+    emits = model.feed(b"ls\n", 700)
+    out = _data(emits)
+    slow_idx = out.find(b"SLOW")
+    ls_idx = out.find(b"EXEC:ls")
+    assert slow_idx != -1, "必須包含 slow 回應"
+    assert ls_idx != -1, "必須包含 ls 回應"
+    assert slow_idx < ls_idx, f"slow 必須先於 ls 輸出: {out!r}"
+
+
+def test_stop_stdin_does_not_consume_subsequent_commands_in_same_chunk():
+    _src_on_path()
+    from uart_stdio_bridge.dut.model import DutModel, TargetConfig
+    from uart_stdio_bridge.dut.plan import ScenarioPlan, Trigger
+
+    plan = ScenarioPlan(
+        seed=1,
+        triggers=(
+            Trigger(
+                id="stop",
+                line_contains="STOP",
+                action={"kind": "stop_stdin", "resume_after_ms": None},
+            ),
+        ),
+    )
+    cfg = TargetConfig(noise_enabled=False)
+    model = DutModel(cfg, plan=plan)
+    model.boot(0)
+
+    # 同一 chunk 包含 STOP 與後續命令 ls 與 pwd
+    emits = model.feed(b"STOP\nls\npwd\n", 0)
+    assert model.stdin_paused is True
+    # 只有 STOP 會被執行，ls 與 pwd 必須保留在 _buf 且不得被執行
+    out = _data(emits)
+    assert b"EXEC:STOP" in out or b"RESULT:STOP" in out
+    assert b"EXEC:ls" not in out
+    assert b"EXEC:pwd" not in out
+
+    # poll 期間亦不得輸出 ls 或 pwd
+    poll_emits = model.poll(100)
+    assert b"EXEC:ls" not in _data(poll_emits)
+
+    # 透過 apply_control resume 後，排隊的命令方才被執行
+    res_emits, ack = model.apply_control({"action": "stdin_resume"}, 200)
+    assert ack["ok"] is True
+    assert model.stdin_paused is False
+    res_out = _data(res_emits)
+    assert b"EXEC:ls" in res_out
+    assert b"EXEC:pwd" in res_out
+
+
+def test_pause_queued_commands_serialized():
+    _src_on_path()
+    from uart_stdio_bridge.dut.model import DutModel, TargetConfig
+
+    cfg = TargetConfig(noise_enabled=False)
+    model = DutModel(cfg)
+    model.boot(0)
+
+    # 暫停 60 秒（上限為 30 秒/命令）
+    model.pause_responding(0, 60000)
+
+    # 在 t=0 送入兩個命令
+    emits1 = model.feed(b"cmd1\n", 0)
+    emits2 = model.feed(b"cmd2\n", 0)
+    assert emits1 == []
+    assert emits2 == []
+
+    # t=30000 時 cmd1 到期，cmd2 應在 60000
+    p1 = model.poll(30000)
+    out1 = _data(p1)
+    assert b"EXEC:cmd1" in out1
+    assert b"EXEC:cmd2" not in out1
+
+    p2 = model.poll(60000)
+    out2 = _data(p2)
+    assert b"EXEC:cmd2" in out2
+
+
+def test_logical_reboot_clears_old_generation_state():
+    _src_on_path()
+    from uart_stdio_bridge.dut.model import CommandOverride, DutModel, TargetConfig
+
+    cfg = TargetConfig(
+        noise_enabled=False,
+        overrides={"slow": CommandOverride(response="STALE-RESP\r\n# ", delay_ms=700)},
+    )
+    model = DutModel(cfg)
+    model.boot(0)
+
+    model.feed(b"slow\n", 0)
+    # 在 50 ms 觸發 logical_reboot
+    reboot_emits = model.logical_reboot(50, banner_delay_ms=100, pre_text="REBOOT\r\n")
+    assert b"REBOOT\r\n" in _data(reboot_emits)
+    assert model.generation == 2
+
+    # 在 150 ms 收到 banner
+    banner_emits = model.poll(150)
+    assert cfg.boot_banner.encode("utf-8") in _data(banner_emits)
+
+    # 到達 700 ms 時，先前的 slow 回應不得出現
+    later_emits = model.poll(750)
+    assert b"STALE-RESP" not in _data(later_emits)
+
+
+def test_scenario_plan_validation():
+    _src_on_path()
+    from uart_stdio_bridge.dut.plan import ScenarioPlan
+
+    # 錯誤的 schema_version
+    with pytest.raises(ValueError, match="Unsupported schema_version"):
+        ScenarioPlan.from_json({"schema_version": "dut-plan.v2"})
+
+    # 重複的 trigger id
+    with pytest.raises(ValueError, match="重複的 trigger id"):
+        ScenarioPlan.from_json({
+            "schema_version": "dut-plan.v1",
+            "triggers": [
+                {"id": "t1", "line_contains": "a", "action": {"kind": "silent"}},
+                {"id": "t1", "line_contains": "b", "action": {"kind": "silent"}},
+            ],
+        })
+
+    # 不支援的 action kind
+    with pytest.raises(ValueError, match="不支援的 trigger action kind"):
+        ScenarioPlan.from_json({
+            "schema_version": "dut-plan.v1",
+            "triggers": [{"id": "t1", "line_contains": "a", "action": {"kind": "unknown_action"}}],
+        })
+
+    # 非法 base64
+    with pytest.raises(ValueError, match="合法 Base64"):
+        ScenarioPlan.from_json({
+            "schema_version": "dut-plan.v1",
+            "triggers": [
+                {
+                    "id": "t1",
+                    "line_contains": "a",
+                    "action": {"kind": "half_prompt", "split_at": 1, "gap_ms": 1, "inject_b64": "!!!"},
+                }
+            ],
+        })
+
+    # flood 負數 bytes
+    with pytest.raises(ValueError, match="flood bytes"):
+        ScenarioPlan.from_json({
+            "schema_version": "dut-plan.v1",
+            "triggers": [
+                {"id": "t1", "line_contains": "a", "action": {"kind": "flood", "bytes": 0, "line": "x"}},
+            ],
+        })
+
+
+def test_target_config_validation():
+    _src_on_path()
+    from uart_stdio_bridge.dut.model import TargetConfig
+
+    with pytest.raises(ValueError, match="noise_interval_ms"):
+        TargetConfig.from_json({"noise_interval_ms": 0})
+
+    with pytest.raises(ValueError, match="delay_ms"):
+        TargetConfig.from_json({"overrides": {"slow": {"delay_ms": -10}}})
+
+
+def test_apply_control_validation():
+    _src_on_path()
+    from uart_stdio_bridge.dut.model import DutModel, TargetConfig
+
+    model = DutModel(TargetConfig(noise_enabled=False))
+    model.boot(0)
+
+    # 未知 trigger id
+    emits, ack = model.apply_control({"id": "1", "action": "set_trigger", "trigger_id": "nonexistent"}, 0)
+    assert ack["ok"] is False
+    assert ack["error"] == "unknown_trigger"
+
+    # 非法 base64
+    emits, ack = model.apply_control({"id": "2", "action": "emit", "payload_b64": "!!!"}, 0)
+    assert ack["ok"] is False
+    assert ack["error"] == "bad_payload"
+
+    # 非法 duration_ms
+    emits, ack = model.apply_control({"id": "3", "action": "pause_responding", "duration_ms": "abc"}, 0)
+    assert ack["ok"] is False
+    assert ack["error"] == "bad_request"
+
+
 def test_model_has_no_io_imports():
     for name in ("model.py", "plan.py"):
         tree = ast.parse((DUT_DIR / name).read_text(encoding="utf-8"))

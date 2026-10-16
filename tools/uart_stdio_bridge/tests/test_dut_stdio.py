@@ -151,3 +151,105 @@ def test_stdin_eof_exit0(tmp_path):
     target_json = _target_json(tmp_path)
     proc = _cli(["--target-json", str(target_json)], stdin_data=b"")
     assert proc.returncode == 0, proc.stderr
+
+
+def test_cli_via_uart_stdio_bridge_dut_subcommand(tmp_path):
+    target_json = _target_json(tmp_path)
+    proc = subprocess.run(
+        [sys.executable, "-m", "uart_stdio_bridge", "dut", "--target-json", str(target_json)],
+        input=b"",
+        capture_output=True,
+        timeout=15,
+        env=_env(),
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.startswith(DEFAULT_BANNER)
+
+
+def test_cli_rejects_unknown_arguments(tmp_path):
+    target_json = _target_json(tmp_path)
+    proc = _cli(["--target-json", str(target_json), "--contorl-dir", "/tmp"], stdin_data=b"")
+    assert proc.returncode == 2
+    assert proc.stdout == b""
+    line = proc.stderr.splitlines()[0]
+    data = json.loads(line)
+    assert "error" in data
+
+
+def test_cli_rejects_incompatible_mode_arguments(tmp_path):
+    target_json = _target_json(tmp_path)
+    # dut 模式帶 echo 參數
+    proc = _cli(["--target-json", str(target_json), "--stderr-flood-bytes", "10"], stdin_data=b"")
+    assert proc.returncode == 2
+    # echo 模式帶 dut 參數
+    proc2 = _cli(["--mode", "echo", "--target-json", str(target_json)], stdin_data=b"")
+    assert proc2.returncode == 2
+
+
+def test_cli_stdin_pause_backpressure(tmp_path):
+    from uart_stdio_bridge.dut.plan import ScenarioPlan, Trigger
+
+    target_json = _target_json(tmp_path)
+    plan_path = tmp_path / "plan.json"
+    plan = ScenarioPlan(
+        seed=1,
+        triggers=(
+            Trigger(
+                id="stop",
+                line_contains="STOP",
+                action={"kind": "stop_stdin", "resume_after_ms": None},
+            ),
+        ),
+    )
+    plan_path.write_text(json.dumps(plan.to_json(), ensure_ascii=False), encoding="utf-8")
+
+    proc = subprocess.Popen(
+        _cli_args("--target-json", str(target_json), "--plan-json", str(plan_path)),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=_env(),
+    )
+    out_buf = bytearray()
+
+    def reader():
+        while True:
+            chunk = proc.stdout.read(1024)
+            if not chunk:
+                break
+            out_buf.extend(chunk)
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+
+    try:
+        # 等待開機 banner
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and DEFAULT_BANNER not in out_buf:
+            time.sleep(0.05)
+        assert DEFAULT_BANNER in out_buf
+
+        # 送出觸發 stop_stdin 的命令
+        proc.stdin.write(b"STOP\n")
+        proc.stdin.flush()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and b"EXEC:STOP" not in out_buf:
+            time.sleep(0.05)
+        assert b"EXEC:STOP" in out_buf
+
+        # 暫停期間送入後續命令 AFTER\n
+        proc.stdin.write(b"AFTER\n")
+        proc.stdin.flush()
+        time.sleep(0.5)
+
+        # AFTER 不得在暫停期間被回應
+        assert b"EXEC:AFTER" not in out_buf
+    finally:
+        try:
+            if proc.stdin and not proc.stdin.closed:
+                proc.stdin.close()
+            proc.wait(timeout=5)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()

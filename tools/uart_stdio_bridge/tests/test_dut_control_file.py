@@ -150,3 +150,30 @@ def test_poll_skips_partial_line(tmp_path):
     with open(control, "ab") as handle:
         handle.write(b"}\n")
     assert channel.poll() == [{"id": "x1", "action": "stdin_pause"}]
+
+
+def test_reused_control_dir_with_old_ack_and_no_dut_times_out(tmp_path):
+    from uart_stdio_bridge.dut.control_file import DutControlClient
+
+    # 模擬先前的執行留下的舊 ack.ndjson，包含 dc-1
+    ack_file = tmp_path / "ack.ndjson"
+    ack_file.write_text('{"id":"dc-1","ok":true,"generation":1,"t_ms":0}\n', encoding="utf-8")
+
+    client = DutControlClient(tmp_path)
+    with pytest.raises(TimeoutError):
+        client.send({"action": "logical_reboot"}, timeout_s=0.3)
+
+
+def test_reused_control_dir_channel_does_not_replay_old_commands(tmp_path):
+    from uart_stdio_bridge.dut.control_file import ControlFileChannel
+
+    # 模擬先前的執行留下的舊 control.ndjson
+    control = tmp_path / "control.ndjson"
+    control.write_bytes(b'{"id":"dc-old","action":"logical_reboot"}\n')
+
+    channel = ControlFileChannel(tmp_path)
+    assert channel.poll() == []
+
+    with open(control, "ab") as handle:
+        handle.write(b'{"id":"dc-new","action":"stdin_pause"}\n')
+    assert channel.poll() == [{"id": "dc-new", "action": "stdin_pause"}]
