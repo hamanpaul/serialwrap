@@ -6,11 +6,24 @@ use std::path::{Path, PathBuf};
 use sw_proto::error_codes::ErrorCode;
 use sw_proto::pyjson::PyDict;
 
-/// 剝除註解並提取所有字串常值（含一般字串 "..." 與 raw 字串 r"..." / r#"..."#）。
-fn strip_comments_and_extract_string_literals(source: &str) -> Vec<(usize, String)> {
-    let mut literals = Vec::new();
+/// 單次詞法掃描的結果（OD-06 常值掃描與 ErrorCode 抽取共用同一詞法，判斷註解、字串、lifetime 的規則不可分岔）。
+struct LexedSource {
+    /// 去除註解與字串內容後的程式碼；註解與字串各以單一空白代替，避免相鄰 token 黏連。
+    code: String,
+    /// 字串常值（起始行號, 內容）；一般字串與 raw 字串皆收錄。
+    literals: Vec<(usize, String)>,
+}
+
+/// 詞法掃描：辨識行註解、巢狀區塊註解、raw 字串、一般字串與字元常值。
+///
+/// 字元常值只認兩種形式：跳脫形（`'\n'`、`'\''`、`'\u{..}'`）與單字元形（`'x'`，含 `'"'`）。
+/// 其餘單引號視為 lifetime 或 label（`'a`、`'static`），只越過 `'` 本身，不吞掉後續內容；
+/// 否則 `&'static str` 之後的字串常值會被漏掃（false negative）。
+fn lex_rust_source(source: &str) -> LexedSource {
     let chars: Vec<char> = source.chars().collect();
     let n = chars.len();
+    let mut code = String::new();
+    let mut literals = Vec::new();
     let mut i = 0;
     let mut line_num = 1;
 
@@ -18,6 +31,7 @@ fn strip_comments_and_extract_string_literals(source: &str) -> Vec<(usize, Strin
         let c = chars[i];
         if c == '\n' {
             line_num += 1;
+            code.push('\n');
             i += 1;
             continue;
         }
@@ -28,6 +42,7 @@ fn strip_comments_and_extract_string_literals(source: &str) -> Vec<(usize, Strin
             while i < n && chars[i] != '\n' {
                 i += 1;
             }
+            code.push(' ');
             continue;
         }
 
@@ -51,6 +66,7 @@ fn strip_comments_and_extract_string_literals(source: &str) -> Vec<(usize, Strin
                 }
                 i += 1;
             }
+            code.push(' ');
             continue;
         }
 
@@ -87,6 +103,7 @@ fn strip_comments_and_extract_string_literals(source: &str) -> Vec<(usize, Strin
                 }
                 if closed {
                     literals.push((start_line, content));
+                    code.push(' ');
                     i = j;
                     continue;
                 }
@@ -118,35 +135,47 @@ fn strip_comments_and_extract_string_literals(source: &str) -> Vec<(usize, Strin
                 i += 1;
             }
             literals.push((start_line, content));
+            code.push(' ');
             continue;
         }
 
-        // 字元常值 '...'
+        // 字元常值 '...' 或 lifetime／label
         if c == '\'' {
-            i += 1;
-            let mut escaped = false;
-            while i < n {
-                let cc = chars[i];
-                if cc == '\n' {
-                    line_num += 1;
-                }
-                if escaped {
-                    escaped = false;
-                } else if cc == '\\' {
-                    escaped = true;
-                } else if cc == '\'' {
+            // 跳脫形：'\n'、'\''、'\u{..}'，越過 ' 與 \ 與被跳脫的字元後，找結尾 '
+            if i + 1 < n && chars[i + 1] == '\\' {
+                i += 3;
+                while i < n && chars[i] != '\'' {
+                    if chars[i] == '\n' {
+                        line_num += 1;
+                    }
                     i += 1;
-                    break;
                 }
                 i += 1;
+                code.push(' ');
+                continue;
             }
+            // 單字元形：'x'（含 '"'，使其內的雙引號不被誤認為字串起點）
+            if i + 2 < n && chars[i + 2] == '\'' {
+                i += 3;
+                code.push(' ');
+                continue;
+            }
+            // lifetime／label（'a、'static）：只越過 '，不吞掉後續內容
+            code.push('\'');
+            i += 1;
             continue;
         }
 
+        code.push(c);
         i += 1;
     }
 
-    literals
+    LexedSource { code, literals }
+}
+
+/// 剝除註解並提取所有字串常值（含一般字串 "..." 與 raw 字串 r"..." / r#"..."#）。
+fn strip_comments_and_extract_string_literals(source: &str) -> Vec<(usize, String)> {
+    lex_rust_source(source).literals
 }
 
 /// 判定字串常值是否符合 "[A-Z][A-Z0-9_]{3,}" 且不在允許清單內。
@@ -226,42 +255,9 @@ fn camel_to_upper_snake(s: &str) -> String {
     out
 }
 
-/// 剝除註解並提取 ErrorCode::([A-Za-z0-9]+) 的所有使用處。
+/// 剝除註解與字串內容後，提取 ErrorCode::([A-Za-z0-9]+) 的所有使用處（與常值掃描共用同一詞法）。
 fn extract_error_code_variants(source: &str) -> Vec<String> {
-    let mut clean_src = String::new();
-    let chars: Vec<char> = source.chars().collect();
-    let n = chars.len();
-    let mut i = 0;
-    while i < n {
-        let c = chars[i];
-        if c == '/' && i + 1 < n && chars[i + 1] == '/' {
-            i += 2;
-            while i < n && chars[i] != '\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if c == '/' && i + 1 < n && chars[i + 1] == '*' {
-            i += 2;
-            let mut depth = 1;
-            while i < n && depth > 0 {
-                if chars[i] == '/' && i + 1 < n && chars[i + 1] == '*' {
-                    depth += 1;
-                    i += 2;
-                    continue;
-                }
-                if chars[i] == '*' && i + 1 < n && chars[i + 1] == '/' {
-                    depth -= 1;
-                    i += 2;
-                    continue;
-                }
-                i += 1;
-            }
-            continue;
-        }
-        clean_src.push(c);
-        i += 1;
-    }
+    let clean_src = lex_rust_source(source).code;
 
     let mut variants = Vec::new();
     let pattern = "ErrorCode::";
@@ -402,4 +398,72 @@ fn negative_self_test_undocumented_error_code_fails() {
         !is_code_documented(&codes[0], "", ""),
         "無說明之文件應判定為 FAIL"
     );
+}
+
+#[test]
+fn negative_self_test_lifetime_does_not_hide_following_string_literal() {
+    // 4. 負向自測（OD-06）：&'static 之後的字串常值必須被掃到（舊詞法會整段吞掉）
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("dummy.rs");
+    fs::write(&file, r#"fn name() -> &'static str { "TIMEOUT" }"#).unwrap();
+    let violations = scan_forbidden_literals(dir.path());
+    assert_eq!(violations.len(), 1);
+    assert_eq!(violations[0].2, "TIMEOUT");
+}
+
+#[test]
+fn negative_self_test_char_literal_quote_does_not_open_string() {
+    // 4. 負向自測（OD-06）：'"' 與 '\'' 字元常值不得開啟字串，其後的常值仍須掃到
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("dummy.rs");
+    fs::write(
+        &file,
+        r#"fn f() { let _q = '"'; let _e = '\''; let _s = "SOCKET_ERROR"; }"#,
+    )
+    .unwrap();
+    let violations = scan_forbidden_literals(dir.path());
+    assert_eq!(violations.len(), 1);
+    assert_eq!(violations[0].2, "SOCKET_ERROR");
+}
+
+#[test]
+fn negative_self_test_line_comment_marker_inside_string_does_not_hide_code() {
+    // 4. 負向自測（OD-06）："unix://" 內的 // 不是行註解，其後的 ErrorCode 使用處仍須抽出
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("dummy.rs");
+    fs::write(
+        &file,
+        r#"fn f() { let _ = Err(E::new("unix://", ErrorCode::InvalidEndpoint)); }"#,
+    )
+    .unwrap();
+    let codes = extract_emitted_codes_from_dir(dir.path());
+    assert_eq!(codes, vec!["INVALID_ENDPOINT"]);
+}
+
+#[test]
+fn negative_self_test_block_comment_marker_inside_string_does_not_hide_code() {
+    // 4. 負向自測（OD-06）：字串 "/*" 不得開啟區塊註解，否則其後的程式碼會被整段吞掉
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("dummy.rs");
+    fs::write(
+        &file,
+        r#"fn f() { let _ = ("/*", ErrorCode::SocketError); }"#,
+    )
+    .unwrap();
+    let codes = extract_emitted_codes_from_dir(dir.path());
+    assert_eq!(codes, vec!["SOCKET_ERROR"]);
+}
+
+#[test]
+fn negative_self_test_lifetime_does_not_hide_error_code_use() {
+    // 4. 負向自測（OD-06）：lifetime 之後的 ErrorCode 使用處仍須抽出
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("dummy.rs");
+    fs::write(
+        &file,
+        r#"fn f() -> &'static str { let _ = ErrorCode::SocketError; "" }"#,
+    )
+    .unwrap();
+    let codes = extract_emitted_codes_from_dir(dir.path());
+    assert_eq!(codes, vec!["SOCKET_ERROR"]);
 }
