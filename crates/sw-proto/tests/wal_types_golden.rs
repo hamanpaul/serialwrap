@@ -27,21 +27,13 @@ fn parse_wal_record_input(s: &str) -> WalRecord {
     let payload_b64 = parts[9].to_string();
     let loss_flag = parts[10] == "true";
 
-    // 簡易解析 meta JSON（避免在 stub 階段觸發 pyjson::loads）
+    // meta 以 pyjson 解析（保留布林、整數、null 與 list 型別）。
+    // 舊版為 stub 階段的簡易切分，會把所有值誤判為字串，且無法處理 list／null。
     let meta_json = parts[11];
-    let mut map = indexmap::IndexMap::new();
-    if meta_json != "{}" && !meta_json.is_empty() {
-        // 基本提取 key-value 供 meta 結構驗證
-        let trimmed = meta_json.trim_matches(|c| c == '{' || c == '}');
-        for item in trimmed.split(',') {
-            if let Some((k, v)) = item.split_once(':') {
-                let k_clean = k.trim().trim_matches('"').to_string();
-                let v_clean = v.trim().trim_matches('"').to_string();
-                map.insert(k_clean, PyValue::Str(v_clean));
-            }
-        }
-    }
-    let meta = PyDict(map);
+    let meta = match sw_proto::pyjson::loads(meta_json).expect("meta 必須為合法 JSON") {
+        PyValue::Dict(d) => d,
+        other => panic!("meta 必須為 JSON 物件，實際為 {other:?}"),
+    };
 
     let rotation_failed = if parts[12].is_empty() {
         None
@@ -107,4 +99,26 @@ fn test_wal_recreated_meta() {
     assert_eq!(unknown.get("previous_identity"), Some(&PyValue::Null));
     assert_eq!(unknown.get("range_known"), Some(&PyValue::Bool(false)));
     assert_eq!(unknown.get("potentially_lost_seq_range"), Some(&PyValue::Null));
+
+    // 範圍邊界（審查 A-5）：Python `last_seq >= first_seq` 與 schema `first <= last`、`minimum: 1` 的交集。
+    // 反向區間與 0 起點不得視為已知；`first == last` 為已知。
+    for range in [(9, 3), (0, 5)] {
+        let bad = wal_recreated_meta("replaced", None, Some(range));
+        assert_eq!(
+            bad.get("range_known"),
+            Some(&PyValue::Bool(false)),
+            "range {range:?}"
+        );
+        assert_eq!(
+            bad.get("potentially_lost_seq_range"),
+            Some(&PyValue::Null),
+            "range {range:?}"
+        );
+    }
+    let single = wal_recreated_meta("replaced", None, Some((4, 4)));
+    assert_eq!(single.get("range_known"), Some(&PyValue::Bool(true)));
+    assert_eq!(
+        single.get("potentially_lost_seq_range"),
+        Some(&PyValue::List(vec![int(4), int(4)]))
+    );
 }

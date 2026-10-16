@@ -21,6 +21,11 @@ GENERATORS = [
     ("gen_pycompat.py", "pypath.windows.tsv"),
     ("gen_unicode_tables.py", "unicode_tables.txt"),
     ("gen_pyre.py", "pyre.tsv"),
+    ("gen_constants.py", "constants.json"),
+    ("gen_runtime_paths.py", "runtime_paths.posix.tsv"),
+    ("gen_runtime_paths.py", "runtime_paths.windows.tsv"),
+    ("gen_endpoint.py", "endpoint.tsv"),
+    ("gen_wal_line.py", "wal_line.tsv"),
 ]
 
 

@@ -15,10 +15,22 @@ impl sw_proto::pypath::HomeLookup for H {
     }
 }
 
+/// 還原 golden 生成子行程的環境（`scripts/rust/goldens/gen_runtime_paths.py::run_probe`）：
+/// 基礎環境恆含 `HOME` 與 `USERPROFILE`（皆為 `/golden/pw-home`）；TSV 的輸入欄位只記錄使用者覆寫的鍵。
+/// 快照缺這兩鍵時，Windows 的 `~` 不會展開，與 Python 的結果不同（P3-T7 審查 B2）。
+fn golden_env(input: &str) -> Vec<(String, String)> {
+    let mut pairs = vec![
+        ("HOME".to_string(), "/golden/pw-home".to_string()),
+        ("USERPROFILE".to_string(), "/golden/pw-home".to_string()),
+    ];
+    pairs.extend(common::env_pairs(input));
+    pairs
+}
+
 fn run(file: &str, native: NativeTraits) {
     let mut fails = Vec::new();
     for r in common::golden(file) {
-        let env = EnvSnapshot::from_pairs(common::env_pairs(&r.input));
+        let env = EnvSnapshot::from_pairs(golden_env(&r.input));
         let got = match RuntimePaths::resolve(&env, native, &H) {
             Ok(p) => common::paths_json(&p),
             Err(PathsError::InvalidTcpPort { .. }) => "ERR:ValueError".into(),

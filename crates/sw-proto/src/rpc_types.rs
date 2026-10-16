@@ -1,6 +1,11 @@
-//! RPC 方法表與型別（P3-T7 stub）。
-#![allow(unused_variables, dead_code)]
+//! RPC 方法表與型別（P3-T7）。
+//!
+//! 方法名稱以 `contracts/rpc_schema.json` 為權威來源（`x-methods` 54 項＋ `x-pending` 的 `daemon.handoff_stop`，SC-11）。
+//! 重試白名單與長逾時集合分別取自 [`crate::constants`]，測試 `tests/rpc_types.rs` 以集合比對。
 
+use crate::constants::{LONG_RPC_METHODS, RETRYABLE_READONLY_METHODS};
+
+/// RPC 方法；未知名稱落入 [`Method::Unknown`]（保留原字串，不拋錯）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Method {
     HealthPing,
@@ -61,24 +66,202 @@ pub enum Method {
     Unknown(String),
 }
 
+/// 方法名稱表（55 項），與 [`Method`] 的已知變體一一對應。
+static KNOWN: [&str; 55] = [
+    "health.ping",
+    "health.status",
+    "daemon.stop",
+    "daemon.handoff_stop",
+    "device.list",
+    "device.release",
+    "device.attach",
+    "session.list",
+    "session.get_state",
+    "session.clear",
+    "session.bind",
+    "session.pin",
+    "session.unpin",
+    "session.attach",
+    "session.self_test",
+    "session.activity",
+    "session.recover",
+    "session.console_attach",
+    "session.console_detach",
+    "session.console_list",
+    "session.interactive_open",
+    "session.interactive_send",
+    "session.interactive_status",
+    "session.interactive_close",
+    "session.log_start",
+    "session.log_stop",
+    "session.log_status",
+    "alias.list",
+    "alias.set",
+    "alias.assign",
+    "alias.unassign",
+    "command.submit",
+    "command.get",
+    "command.result_tail",
+    "command.cancel",
+    "result.tail",
+    "log.tail_raw",
+    "log.tail_text",
+    "file.push",
+    "file.pull",
+    "wal.range",
+    "wal.reset",
+    "wal.current_seq",
+    "mcu.patterns",
+    "mcu.status",
+    "event.rule_set",
+    "event.rule_delete",
+    "event.rule_list",
+    "event.rule_get",
+    "event.com_enable",
+    "event.com_disable",
+    "event.com_status",
+    "event.reset",
+    "event.reload",
+    "event.tail",
+];
+
 impl Method {
+    /// 線路上的方法字串。
     pub fn as_str(&self) -> &str {
-        todo!("P3-T7: Method::as_str")
+        match self {
+            Method::HealthPing => "health.ping",
+            Method::HealthStatus => "health.status",
+            Method::DaemonStop => "daemon.stop",
+            Method::DaemonHandoffStop => "daemon.handoff_stop",
+            Method::DeviceList => "device.list",
+            Method::DeviceRelease => "device.release",
+            Method::DeviceAttach => "device.attach",
+            Method::SessionList => "session.list",
+            Method::SessionGetState => "session.get_state",
+            Method::SessionClear => "session.clear",
+            Method::SessionBind => "session.bind",
+            Method::SessionPin => "session.pin",
+            Method::SessionUnpin => "session.unpin",
+            Method::SessionAttach => "session.attach",
+            Method::SessionSelfTest => "session.self_test",
+            Method::SessionActivity => "session.activity",
+            Method::SessionRecover => "session.recover",
+            Method::SessionConsoleAttach => "session.console_attach",
+            Method::SessionConsoleDetach => "session.console_detach",
+            Method::SessionConsoleList => "session.console_list",
+            Method::SessionInteractiveOpen => "session.interactive_open",
+            Method::SessionInteractiveSend => "session.interactive_send",
+            Method::SessionInteractiveStatus => "session.interactive_status",
+            Method::SessionInteractiveClose => "session.interactive_close",
+            Method::SessionLogStart => "session.log_start",
+            Method::SessionLogStop => "session.log_stop",
+            Method::SessionLogStatus => "session.log_status",
+            Method::AliasList => "alias.list",
+            Method::AliasSet => "alias.set",
+            Method::AliasAssign => "alias.assign",
+            Method::AliasUnassign => "alias.unassign",
+            Method::CommandSubmit => "command.submit",
+            Method::CommandGet => "command.get",
+            Method::CommandResultTail => "command.result_tail",
+            Method::CommandCancel => "command.cancel",
+            Method::ResultTail => "result.tail",
+            Method::LogTailRaw => "log.tail_raw",
+            Method::LogTailText => "log.tail_text",
+            Method::FilePush => "file.push",
+            Method::FilePull => "file.pull",
+            Method::WalRange => "wal.range",
+            Method::WalReset => "wal.reset",
+            Method::WalCurrentSeq => "wal.current_seq",
+            Method::McuPatterns => "mcu.patterns",
+            Method::McuStatus => "mcu.status",
+            Method::EventRuleSet => "event.rule_set",
+            Method::EventRuleDelete => "event.rule_delete",
+            Method::EventRuleList => "event.rule_list",
+            Method::EventRuleGet => "event.rule_get",
+            Method::EventComEnable => "event.com_enable",
+            Method::EventComDisable => "event.com_disable",
+            Method::EventComStatus => "event.com_status",
+            Method::EventReset => "event.reset",
+            Method::EventReload => "event.reload",
+            Method::EventTail => "event.tail",
+            Method::Unknown(s) => s.as_str(),
+        }
     }
 
+    /// 由線路字串解析；已知名稱精確比對，其餘為 `Unknown`。
     pub fn parse(s: &str) -> Method {
-        todo!("P3-T7: Method::parse")
+        match s {
+            "health.ping" => Method::HealthPing,
+            "health.status" => Method::HealthStatus,
+            "daemon.stop" => Method::DaemonStop,
+            "daemon.handoff_stop" => Method::DaemonHandoffStop,
+            "device.list" => Method::DeviceList,
+            "device.release" => Method::DeviceRelease,
+            "device.attach" => Method::DeviceAttach,
+            "session.list" => Method::SessionList,
+            "session.get_state" => Method::SessionGetState,
+            "session.clear" => Method::SessionClear,
+            "session.bind" => Method::SessionBind,
+            "session.pin" => Method::SessionPin,
+            "session.unpin" => Method::SessionUnpin,
+            "session.attach" => Method::SessionAttach,
+            "session.self_test" => Method::SessionSelfTest,
+            "session.activity" => Method::SessionActivity,
+            "session.recover" => Method::SessionRecover,
+            "session.console_attach" => Method::SessionConsoleAttach,
+            "session.console_detach" => Method::SessionConsoleDetach,
+            "session.console_list" => Method::SessionConsoleList,
+            "session.interactive_open" => Method::SessionInteractiveOpen,
+            "session.interactive_send" => Method::SessionInteractiveSend,
+            "session.interactive_status" => Method::SessionInteractiveStatus,
+            "session.interactive_close" => Method::SessionInteractiveClose,
+            "session.log_start" => Method::SessionLogStart,
+            "session.log_stop" => Method::SessionLogStop,
+            "session.log_status" => Method::SessionLogStatus,
+            "alias.list" => Method::AliasList,
+            "alias.set" => Method::AliasSet,
+            "alias.assign" => Method::AliasAssign,
+            "alias.unassign" => Method::AliasUnassign,
+            "command.submit" => Method::CommandSubmit,
+            "command.get" => Method::CommandGet,
+            "command.result_tail" => Method::CommandResultTail,
+            "command.cancel" => Method::CommandCancel,
+            "result.tail" => Method::ResultTail,
+            "log.tail_raw" => Method::LogTailRaw,
+            "log.tail_text" => Method::LogTailText,
+            "file.push" => Method::FilePush,
+            "file.pull" => Method::FilePull,
+            "wal.range" => Method::WalRange,
+            "wal.reset" => Method::WalReset,
+            "wal.current_seq" => Method::WalCurrentSeq,
+            "mcu.patterns" => Method::McuPatterns,
+            "mcu.status" => Method::McuStatus,
+            "event.rule_set" => Method::EventRuleSet,
+            "event.rule_delete" => Method::EventRuleDelete,
+            "event.rule_list" => Method::EventRuleList,
+            "event.rule_get" => Method::EventRuleGet,
+            "event.com_enable" => Method::EventComEnable,
+            "event.com_disable" => Method::EventComDisable,
+            "event.com_status" => Method::EventComStatus,
+            "event.reset" => Method::EventReset,
+            "event.reload" => Method::EventReload,
+            "event.tail" => Method::EventTail,
+            _ => Method::Unknown(s.to_string()),
+        }
     }
 
+    /// 已知方法名稱（55 項，無重複）。
     pub fn known() -> &'static [&'static str] {
-        todo!("P3-T7: Method::known")
+        &KNOWN
     }
 
+    /// 是否在 client 端可安全重送的唯讀白名單內（`RETRYABLE_READONLY_METHODS`）。
     pub fn is_retryable_readonly(&self) -> bool {
-        todo!("P3-T7: Method::is_retryable_readonly")
+        RETRYABLE_READONLY_METHODS.contains(&self.as_str())
     }
 
+    /// 是否使用長 RPC 逾時（`LONG_RPC_METHODS`）。
     pub fn uses_long_timeout(&self) -> bool {
-        todo!("P3-T7: Method::uses_long_timeout")
+        LONG_RPC_METHODS.contains(&self.as_str())
     }
 }

@@ -1,29 +1,84 @@
-//! 常數定義（P3-T7 stub）。
-#![allow(dead_code)]
+//! 常數定義（P3-T7）。
+//!
+//! 數值照 `rust-architecture.md` §3.1，並以 `contracts/golden/constants.json`（由
+//! `scripts/rust/goldens/gen_constants.py` 以 AST 自 Python 來源抽出）逐項比對（`tests/constants_sync.rs`）。
 
-pub const DEFAULT_TCP_PORT_RAW_DEFAULT: &str = "";
-pub const LOOPBACK_TCP_HOSTS: [&str; 3] = ["", "", ""];
+/// `DEFAULT_TCP_PORT` 的預設原始字串（`SERIALWRAP_TCP_PORT` 未設時）。
+pub const DEFAULT_TCP_PORT_RAW_DEFAULT: &str = "48700";
+
+/// RPC TCP 僅允許的 loopback 主機（`sw_core/constants.py::LOOPBACK_TCP_HOSTS`）。
+pub const LOOPBACK_TCP_HOSTS: [&str; 3] = ["127.0.0.1", "localhost", "::1"];
+
+/// client 端可安全重送的唯讀方法白名單（`sw_core/client.py::RETRYABLE_READONLY_METHODS`）。
 pub const RETRYABLE_READONLY_METHODS: [&str; 11] = [
-    "", "", "", "", "", "", "", "", "", "", "",
+    "health.ping",
+    "health.status",
+    "session.list",
+    "session.get_state",
+    "session.activity",
+    "session.console_list",
+    "session.log_status",
+    "device.list",
+    "alias.list",
+    "mcu.patterns",
+    "mcu.status",
 ];
-pub const RETRY_BACKOFF_BASE_S: f64 = 0.0;
-pub const RETRY_BACKOFF_MAX_S: f64 = 0.0;
-pub const TRANSIENT_ERROR_CODES: [&str; 3] = ["", "", ""];
-pub const PROBE_TIMEOUT_S: f64 = 0.0;
-pub const PROBE_DEADLINE_S: f64 = 0.0;
-pub const PROBE_METHODS: [&str; 2] = ["", ""];
-pub const RECV_CHUNK: usize = 0;
-pub const CLIENT_RESPONSE_MAX_BYTES: usize = 0;
-pub const DEFAULT_RPC_TIMEOUT_S: f64 = 0.0;
-pub const LONG_RPC_TIMEOUT_FLOOR_S: f64 = 0.0;
-pub const LONG_RPC_METHODS: [&str; 4] = ["", "", "", ""];
-pub const ENDPOINT_PROBE_TIMEOUT_S: f64 = 0.0;
-pub const SYSTEM_SOCKET: &str = "";
-pub const COMPLETION_REGEX_MAX_BYTES: usize = 0;
-pub const CMD_WARN_BYTES: i64 = 0;
-pub const CMD_REJECT_BYTES: i64 = 0;
-pub const FILE_DEFAULT_CHUNK_SIZE: i64 = 0;
-pub const FILE_ACK_MODES: [&str; 3] = ["", "", ""];
-pub const DELEGATE_DEPTH_ENV: &str = "";
-pub const DELEGATE_ARGV_SHA_ENV: &str = "";
-pub const MAX_NUMERIC_LOG_LEVEL_DIGITS: usize = 0;
+
+/// 重試退避基底秒數（`RETRY_BACKOFF_BASE_S`）。
+pub const RETRY_BACKOFF_BASE_S: f64 = 0.5;
+/// 重試退避上限秒數（`RETRY_BACKOFF_MAX_S`）。
+pub const RETRY_BACKOFF_MAX_S: f64 = 5.0;
+
+/// 可重試的暫態錯誤碼（`TRANSIENT_ERROR_CODES`）。
+pub const TRANSIENT_ERROR_CODES: [&str; 3] = ["TIMEOUT", "SOCKET_ERROR", "EMPTY_RESPONSE"];
+
+/// TIMEOUT 探測單次逾時秒數（`PROBE_TIMEOUT_S`）。
+pub const PROBE_TIMEOUT_S: f64 = 1.0;
+/// TIMEOUT 探測總期限秒數（`PROBE_DEADLINE_S`）。
+pub const PROBE_DEADLINE_S: f64 = 2.5;
+/// 探測使用的方法（`_PROBE_METHODS`）。
+pub const PROBE_METHODS: [&str; 2] = ["health.ping", "health.status"];
+
+/// 單次 `recv` 區塊大小（`RECV_CHUNK`）。
+pub const RECV_CHUNK: usize = 65536;
+
+/// client 回應累積上限（arch §5.10 由 16 MiB 修訂為 256 MiB；Rust-only 上限，Python 無上限，見 plan §0.7）。
+pub const CLIENT_RESPONSE_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// 一般 RPC 逾時秒數（`cli.DEFAULT_RPC_TIMEOUT_S`）。
+pub const DEFAULT_RPC_TIMEOUT_S: f64 = 5.0;
+/// 長 RPC 逾時下限秒數（`cli.LONG_RPC_TIMEOUT_FLOOR_S`）。
+pub const LONG_RPC_TIMEOUT_FLOOR_S: f64 = 45.0;
+/// 使用長逾時的方法（`cli.LONG_RPC_METHODS`）。
+pub const LONG_RPC_METHODS: [&str; 4] = [
+    "session.recover",
+    "session.attach",
+    "session.self_test",
+    "session.console_attach",
+];
+
+/// endpoint 存活探測逾時秒數（`cli.ENDPOINT_PROBE_TIMEOUT_S`）。
+pub const ENDPOINT_PROBE_TIMEOUT_S: f64 = 0.2;
+
+/// 系統級 socket 路徑（`constants.SYSTEM_SOCKET`）。
+pub const SYSTEM_SOCKET: &str = "/run/serialwrap/serialwrapd.sock";
+
+/// completion regex 最大位元組數（`command_completion.COMPLETION_REGEX_MAX_BYTES`）。
+pub const COMPLETION_REGEX_MAX_BYTES: usize = 1024;
+/// 命令警告位元組門檻（`arbiter.CMD_WARN_BYTES`）。
+pub const CMD_WARN_BYTES: i64 = 4096;
+/// 命令拒絕位元組門檻（`arbiter.CMD_REJECT_BYTES`）。
+pub const CMD_REJECT_BYTES: i64 = 16384;
+
+/// 檔案傳輸預設分塊大小（`file_transfer.FILE_DEFAULT_CHUNK_SIZE`）。
+pub const FILE_DEFAULT_CHUNK_SIZE: i64 = 512;
+/// 檔案傳輸 ACK 模式（`file_transfer.FILE_ACK_MODES`）。
+pub const FILE_ACK_MODES: [&str; 3] = ["auto", "echo", "none"];
+
+/// 委派深度環境變數名（arch §7.4；防止 Rust→Python→Rust 無限委派）。
+pub const DELEGATE_DEPTH_ENV: &str = "SERIALWRAP_DELEGATE_DEPTH";
+/// 委派 argv 雜湊環境變數名（arch §7.4）。
+pub const DELEGATE_ARGV_SHA_ENV: &str = "SERIALWRAP_DELEGATE_ARGV_SHA";
+
+/// 數值型 log level 的最大位數（`cli_trace._MAX_NUMERIC_LOG_LEVEL_DIGITS`）。
+pub const MAX_NUMERIC_LOG_LEVEL_DIGITS: usize = 4300;
