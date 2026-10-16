@@ -1,11 +1,14 @@
-"""黑箱契約 harness 公開介面（P3-T2 紅燈階段 stub）。
+"""黑箱契約 harness 公開介面。
 
-只提供 plan 規定的公開名稱與簽章；函式本體一律 raise NotImplementedError("P3-T2")，
-實作於 Step 4 完成。stdlib-only，不得 import sw_core／serialwrap／serialwrapd。
+提供黑箱測試所需的 CLI 執行、環境隔離、A/B 選擇器解析與跨平台輸出處理。
+stdlib-only，不得 import sw_core／serialwrap／serialwrapd。
 """
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -21,45 +24,160 @@ class CliResult:
 
 
 def repo_root() -> Path:
-    raise NotImplementedError("P3-T2")
+    return Path(__file__).resolve().parents[2]
 
 
 def ab_env() -> dict[str, str]:
-    raise NotImplementedError("P3-T2")
+    try:
+        from ab_env import AB_ENV
+        return dict(AB_ENV)
+    except ImportError:
+        tests_dir = str(repo_root() / "tests")
+        if tests_dir not in sys.path:
+            sys.path.insert(0, tests_dir)
+        try:
+            from ab_env import AB_ENV
+            return dict(AB_ENV)
+        except ImportError:
+            keys = ("SERIALWRAP_CLI_EXE", "SERIALWRAP_DAEMON_EXE", "SERIALWRAP_AB_LABEL")
+            return {k: os.environ[k] for k in keys if k in os.environ}
 
 
 def ab_label() -> str:
-    raise NotImplementedError("P3-T2")
+    return ab_env().get("SERIALWRAP_AB_LABEL", "python-baseline")
 
 
 def is_rust() -> bool:
-    raise NotImplementedError("P3-T2")
-
-
-def cli_prefix() -> list[str]:
-    raise NotImplementedError("P3-T2")
+    return ab_label().startswith("rust")
 
 
 def python_baseline_prefix() -> list[str]:
-    raise NotImplementedError("P3-T2")
+    root = repo_root()
+    if os.name == "nt":
+        return [sys.executable, str(root / "serialwrap.py")]
+    return [str(root / "serialwrap")]
 
 
 def python_baseline_interpreter() -> list[str]:
-    raise NotImplementedError("P3-T2")
+    if os.name == "nt":
+        return [sys.executable]
+    py = shutil.which("python3")
+    return [py if py else sys.executable]
+
+
+def cli_prefix() -> list[str]:
+    cli = ab_env().get("SERIALWRAP_CLI_EXE")
+    if not cli:
+        return python_baseline_prefix()
+    if cli.endswith(".py"):
+        return [sys.executable, cli]
+    return [cli]
 
 
 def daemon_prefix() -> list[str]:
-    raise NotImplementedError("P3-T2")
+    d = ab_env().get("SERIALWRAP_DAEMON_EXE")
+    if d:
+        if d.endswith(".py"):
+            return [sys.executable, d]
+        return [d]
+    if os.name == "nt":
+        return [sys.executable, str(repo_root() / "serialwrapd.py")]
+    return [str(repo_root() / "tests" / "contract_blackbox" / "bin" / "py-serialwrapd")]
 
 
 def isolated_env(tmp: Path, **overrides: str | None) -> dict[str, str]:
-    raise NotImplementedError("P3-T2")
+    e = dict(os.environ)
+    # 先刪除外層 env 中所有 SERIALWRAP_ 開頭的變數
+    for k in list(e.keys()):
+        if k.startswith("SERIALWRAP_"):
+            del e[k]
+
+    # 設置 9 個目錄變數
+    dirs = {
+        "SERIALWRAP_STATE_DIR": tmp / "state",
+        "SERIALWRAP_RUN_DIR": tmp / "run",
+        "SERIALWRAP_WAL_DIR": tmp / "wal",
+        "SERIALWRAP_CONFIG_DIR": tmp / "config",
+        "SERIALWRAP_LOG_DIR": tmp / "blog",
+        "SERIALWRAP_EVENTS_DIR": tmp / "events.d",
+        "SERIALWRAP_EVENTS_RUNTIME_DIR": tmp / "events-rt",
+        "SERIALWRAP_BY_ID_DIR": tmp / "by-id",
+        "SERIALWRAP_BY_PATH_DIR": tmp / "by-path",
+    }
+    for var, p in dirs.items():
+        p.mkdir(parents=True, exist_ok=True)
+        e[var] = str(p)
+
+    # 設置 HOME、XDG 目錄與環境變數
+    (tmp / "home").mkdir(parents=True, exist_ok=True)
+    (tmp / "xdg-config").mkdir(parents=True, exist_ok=True)
+    (tmp / "xdg-state").mkdir(parents=True, exist_ok=True)
+    e["HOME"] = str(tmp / "home")
+    if os.name == "nt":
+        e["USERPROFILE"] = str(tmp / "home")
+    e["XDG_CONFIG_HOME"] = str(tmp / "xdg-config")
+    e["XDG_STATE_HOME"] = str(tmp / "xdg-state")
+    for k in (
+        "XDG_RUNTIME_DIR",
+        "XDG_DATA_HOME",
+        "PYTHONUNBUFFERED",
+        "PYTHONIOENCODING",
+        "PYTHONUTF8",
+        "PYTHONLEGACYWINDOWSSTDIO",
+        "PYTHONWARNINGS",
+        "PYTHONDEVMODE",
+        "PYTHONFAULTHANDLER",
+        "HOMEDRIVE",
+        "HOMEPATH",
+    ):
+        e.pop(k, None)
+    e["COLUMNS"] = "80"
+    e["LANG"] = "C.UTF-8"
+    e["LC_ALL"] = "C.UTF-8"
+    e["PYTHONDONTWRITEBYTECODE"] = "1"
+
+    # overrides 處理：值為 None 則刪除該 key，否則覆寫
+    for k, v in overrides.items():
+        if v is None:
+            e.pop(k, None)
+        else:
+            e[k] = str(v)
+    return e
 
 
-def run_cli(args: Sequence[str], *, env: Mapping[str, str], stdin: bytes | None = None,
-            timeout_s: float = 60.0, merge_stderr: bool = False, cwd: Path | None = None) -> CliResult:
-    raise NotImplementedError("P3-T2")
+def run_cli(
+    args: Sequence[str],
+    *,
+    env: Mapping[str, str],
+    stdin: bytes | None = None,
+    timeout_s: float = 60.0,
+    merge_stderr: bool = False,
+    cwd: Path | None = None,
+) -> CliResult:
+    cmd = cli_prefix() + list(args)
+    stderr_target = subprocess.STDOUT if merge_stderr else subprocess.PIPE
+    proc = subprocess.run(
+        cmd,
+        stdin=subprocess.DEVNULL if stdin is None else None,
+        input=stdin,
+        env=dict(env),
+        stdout=subprocess.PIPE,
+        stderr=stderr_target,
+        timeout=timeout_s,
+        cwd=str(cwd) if cwd else None,
+    )
+    return CliResult(
+        rc=proc.returncode,
+        stdout=proc.stdout or b"",
+        stderr=b"" if merge_stderr else (proc.stderr or b""),
+    )
 
 
 def stdout_lines(r: CliResult) -> list[str]:
-    raise NotImplementedError("P3-T2")
+    text = r.stdout.decode("utf-8", errors="replace")
+    nl = "\r\n" if os.name == "nt" else "\n"
+    if not text:
+        return []
+    if text.endswith(nl):
+        text = text[:-len(nl)]
+    return text.split(nl)

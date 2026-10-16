@@ -70,7 +70,7 @@
   各 Task 標頭的「Changelog fragment」只寫檔名與正文；`type` 一律 `feat`（Task 2、17、18、19 的測試／工具類為 `change`），`scope` 為 `rust-cli`。不得使用 `### Added` 之類的 Keep a Changelog 標題。
 - 每個 commit 前：`cargo test --workspace`（已實作部分）、`python3 -m pytest -q tests/`、`python3 -m policy_check --repo .`。紅燈 commit 允許 Rust 測試失敗，但 `python3 -m pytest -q tests/` 中**非本 phase 新增**的測試不得出現新失敗；本 phase 新增、預期紅燈的 pytest 以 `pytest.mark.xfail(strict=True, reason="P3-T<n> 紅燈")` 標示（本文件的測試範例未逐一寫出此 decorator，紅燈 commit 時一律補上），實作完成的同一 commit 移除標記。
 - **紅燈不得是 collection error**：`xfail` 攔不住 import 失敗或語法錯誤。Step 1 必須同時提交可 import 的 stub 模組（Python：函式本體 `raise NotImplementedError("P3-T<n>")`；腳本：存在但 `sys.exit(2)`），讓紅燈發生在執行期 assertion，並以 `xfail(strict=True, raises=(NotImplementedError, AssertionError))` 標示。
-- **marker（P0 T14）**：本 phase 新增的每個 pytest 檔都帶 `pytestmark`，平台 marker 恰一個（`core_portable`／`posix_only`／`windows_native`）、資源 marker 至少一個（`memory_only`／`process_rpc`／`posix_pty`…），只用 P0 註冊的詞彙。對照：`tests/test_rust_cfg_boundary.py`、`test_rust_goldens_fresh.py`、`test_rust_error_codes_gen.py`、`test_rust_ab_compare.py`、`test_rust_stage1a_gate.py`、`test_rust_check_win_imports.py` → `core_portable`＋`process_rpc`（皆以 subprocess 執行腳本）；`test_rust_ci_workflow.py`、`test_ab_env_bbproc.py`、`test_rust_readme_trust_scope.py` → `core_portable`＋`memory_only`；`test_rust_workspace_layout.py` → `core_portable`＋`process_rpc`；`test_rust_mkbundle.py`、`test_rust_win_scripts.py` → `posix_only`＋`process_rpc`；`tests/contract_blackbox/**` → 依案例：stub／subprocess 類 `core_portable`＋`process_rpc`，PTY／daemon 類 `posix_only`＋`posix_pty`＋`process_rpc`，Windows 專屬 `windows_native`＋`process_rpc`。黑箱另註冊的非平台 marker 只有 `rust_only`、`needs_py_daemon`、`needs_delegation`。
+- **marker（P0 T14）**：本 phase 新增的每個 pytest 檔都帶 `pytestmark`，平台 marker 恰一個（`core_portable`／`posix_only`／`windows_native`）、資源 marker 至少一個（`memory_only`／`process_rpc`／`posix_pty`…），只用 P0 註冊的詞彙。對照：`tests/test_rust_cfg_boundary.py`、`test_rust_goldens_fresh.py`、`test_rust_error_codes_gen.py`、`test_rust_ab_compare.py`、`test_rust_stage1a_gate.py`、`test_rust_check_win_imports.py` → `core_portable`＋`process_rpc`（皆以 subprocess 執行腳本）；`test_rust_ci_workflow.py`、`test_rust_readme_trust_scope.py` → `core_portable`＋`memory_only`；`test_ab_env_bbproc.py` → `posix_only`＋`memory_only`；`test_rust_workspace_layout.py` → `core_portable`＋`process_rpc`；`test_rust_mkbundle.py`、`test_rust_win_scripts.py` → `posix_only`＋`process_rpc`；`tests/contract_blackbox/**` → 依案例：stub／subprocess 類 `core_portable`＋`process_rpc`，PTY／daemon 類 `posix_only`＋`posix_pty`＋`process_rpc`，Windows 專屬 `windows_native`＋`process_rpc`。黑箱另註冊的非平台 marker 只有 `rust_only`、`needs_py_daemon`、`needs_delegation`。
 
 ### 0.6 模型分工總表（master plan §2；測試作者 ≠ 實作者）
 
@@ -614,7 +614,7 @@ def test_isolated_env_strips_all_serialwrap_vars(env, monkeypatch, tmp_path):
 
 （`test_bb_harness_selftest.py` 模組層 `pytestmark = [pytest.mark.core_portable, pytest.mark.process_rpc]`，`test_faketarget_login_flow` 以函式層 `posix_only`＋`posix_pty` 覆寫平台——因同檔混合平台，模組層改只放資源 marker、各函式自帶平台 marker，遵守 P0 T14 規則 2。）
 
-`tests/test_ab_env_bbproc.py`（`core_portable`、`memory_only`）：
+`tests/test_ab_env_bbproc.py`（`posix_only`、`memory_only`）：
 
 ```python
 import importlib.util, sys

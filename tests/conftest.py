@@ -15,6 +15,7 @@ import tempfile
 
 import pytest
 
+import ab_env  # noqa: F401  黑箱 A/B 選擇器須在 pop 前擷取
 import liveguard
 
 # ---- 第 0 步：live 快照（必須在覆寫任何 env 之前）----
@@ -58,6 +59,11 @@ for _k in (
     "SERIALWRAP_TTYMCU_PATH",
     "SERIALWRAP_EVENTS_LOG_PATH",
     "SERIALWRAP_DATA_DIR",
+    "SERIALWRAP_CLI_EXE",
+    "SERIALWRAP_DAEMON_EXE",
+    "SERIALWRAP_AB_LABEL",
+    "SERIALWRAP_DELEGATE_DEPTH",
+    "SERIALWRAP_DELEGATE_ARGV_SHA",
 ):
     os.environ.pop(_k, None)
 

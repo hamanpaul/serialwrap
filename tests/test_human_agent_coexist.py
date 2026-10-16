@@ -26,6 +26,7 @@ import tempfile
 import termios
 import threading
 import time
+import sys
 import unittest
 from typing import Any
 import pytest
@@ -33,8 +34,9 @@ import pytest
 pytestmark = [pytest.mark.posix_only, pytest.mark.interactive_desktop, pytest.mark.posix_pty, pytest.mark.process_rpc]
 
 ROOT_DIR = pathlib.Path(__file__).resolve().parents[1]
-SERIALWRAP = str(ROOT_DIR / "serialwrap")
-SERIALWRAPD = str(ROOT_DIR / "serialwrapd.py")
+from ab_env import AB_ENV
+SERIALWRAP = AB_ENV.get("SERIALWRAP_CLI_EXE") or str(ROOT_DIR / "serialwrap")
+SERIALWRAPD_ARGV = [AB_ENV["SERIALWRAP_DAEMON_EXE"]] if AB_ENV.get("SERIALWRAP_DAEMON_EXE") else [sys.executable, str(ROOT_DIR / "serialwrapd.py")]
 
 
 class FakeTarget:
@@ -182,9 +184,8 @@ targets:
         self._lock = str(self._root / "run" / "serialwrapd.lock")
 
         self._daemon = subprocess.Popen(
-            [
-                os.environ.get("PYTHON", "python3"),
-                SERIALWRAPD,
+            SERIALWRAPD_ARGV
+            + [
                 "--profile-dir", str(self._profile_dir),
                 "--socket", self._socket,
                 "--lock", self._lock,
