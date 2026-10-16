@@ -483,7 +483,7 @@ def check_generated_facts(repo_root: Path, policy: Mapping[str, Any]) -> list[Fi
 
         env = {**os.environ, "LC_ALL": "C"}
         if str(repo_root) not in sys.path:
-            env["PYTHONPATH"] = f"{repo_root}:{env.get('PYTHONPATH', '')}".rstrip(":")
+            env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{env.get('PYTHONPATH', '')}".rstrip(os.pathsep)
 
         try:
             proc = subprocess.run(
@@ -745,7 +745,7 @@ def _run_extract_command(extract_cmd: str, repo_root: Path) -> list[str]:
     """執行 policy 宣告之 diagnostic_codes 抽取命令並回傳輸出之碼清單。"""
     env = {**os.environ, "LC_ALL": "C"}
     if str(repo_root) not in sys.path:
-        env["PYTHONPATH"] = f"{repo_root}:{env.get('PYTHONPATH', '')}".rstrip(":")
+        env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{env.get('PYTHONPATH', '')}".rstrip(os.pathsep)
 
     proc = subprocess.run(
         shlex.split(extract_cmd),

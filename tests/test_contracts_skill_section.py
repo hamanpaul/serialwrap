@@ -564,6 +564,24 @@ def test_render_deterministic_bytes() -> None:
     assert proc1.stdout.decode("utf-8") == in_proc_expected
 
 
+@pytest.mark.process_rpc
+def test_cli_stdout_is_utf8_lf_regardless_of_locale_encoding() -> None:
+    """CLI 輸出固定為 UTF-8＋LF，不隨行程 locale 編碼變動。
+
+    原生 Windows 的管線 stdout 預設為 locale 編碼（如 cp950）且換行轉為 CRLF，
+    讀取端以 UTF-8 解碼會失敗；此處以 PYTHONIOENCODING 模擬非 UTF-8 locale 重現。
+    """
+    import os
+
+    env = {**os.environ, "PYTHONIOENCODING": "latin-1"}
+    cmd = [sys.executable, "-m", "tools.contracts", "skill-section", "--namespace", "error_code"]
+    proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, env=env, timeout=300)
+
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+    expected = _load_skill_section().render(_load_catalog().load_catalogs(REPO_ROOT), "error_code") + "\n"
+    assert proc.stdout == expected.encode("utf-8")
+
+
 @pytest.mark.memory_only
 def test_skill_rows_match_entry_pattern() -> None:
     """T12 的 entry_pattern 能匹配每個資料列、不匹配表頭。"""
