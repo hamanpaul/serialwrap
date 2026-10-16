@@ -199,7 +199,13 @@ def test_session_public_order_matches_runtime():
         adds = p.get("adds", {})
         if "SessionPublic" in adds:
             pending_fields.update(adds["SessionPublic"])
-    filtered_order = [k for k in order if k != "console_endpoint" and k not in pending_fields]
+    # console_endpoint 為條件欄（x-conditional）：有 PTY 平台（POSIX）不出現；無 PTY 平台
+    # （Windows TCP console，session_manager.py to_public_dict）bridge 未起時仍恆輸出 null。
+    # 依平台決定期望集合，而非一律剔除，否則 Windows 原生執行會誤判。
+    from sw_core.uart_io import _pty_available
+
+    conditional_absent = {"console_endpoint"} if _pty_available() else set()
+    filtered_order = [k for k in order if k not in conditional_absent and k not in pending_fields]
     assert runtime_keys == filtered_order
 
 

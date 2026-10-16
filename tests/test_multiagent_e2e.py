@@ -2,6 +2,12 @@ import base64
 import json
 import os
 import pathlib
+import pytest
+
+# POSIX-only：本檔頂層 import pty（→ tty → termios），原生 Windows 無 termios；非 POSIX 整檔略過、不 import。
+if os.name != "posix":
+    pytest.skip("multi-agent E2E 測試依賴 POSIX pty／termios", allow_module_level=True)
+
 import pty
 import select
 import shutil

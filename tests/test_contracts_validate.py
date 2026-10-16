@@ -1217,8 +1217,10 @@ def test_cli_effective_subcommand(tmp_path):
 # Phase 出口測試（P0-T12 Step 1 追加）：真實 repo 的契約檢查必須全綠。
 @pytest.mark.process_rpc
 def test_real_repo_contract_check_passes():
+    # CLI 輸出固定 UTF-8（tools/contracts/cli.py）；明示 encoding，避免 Windows locale（如 cp950）
+    # 解碼失敗使 stdout 為 None
     proc = subprocess.run([sys.executable, "-m", "tools.contracts", "check"],
-                          cwd=ROOT, capture_output=True, text=True, timeout=300)
+                          cwd=ROOT, capture_output=True, text=True, encoding="utf-8", timeout=300)
     out = json.loads(proc.stdout)
     assert proc.returncode == 0, json.dumps(out["findings"], ensure_ascii=False, indent=1)
     assert out["ok"] is True
