@@ -314,6 +314,10 @@ def rx_writer(bridge: Bridge) -> None:
                                 break
                         bridge._stop_event.wait(0.01)
                         continue
+                    if getattr(bridge.endpoint, "peer_gate", False):
+                        # peer gate 下 write_some 只在 peer 開啟時寫入；寫入前取樣可能剛好落在開啟之前，
+                        # 以成功寫入本身證明 peer 已開啟，確保 peer_state{open:true} 先於該筆 serial_write。
+                        bridge._note_peer_state(True)
                     payload = data[offset : offset + accepted]
                     bridge._note_activity("serial_write")
                     if not bridge._record_data("serial_write", payload):
