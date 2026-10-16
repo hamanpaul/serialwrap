@@ -87,8 +87,11 @@ def test_partial_write_to_dut_records_accepted_only(tmp_path: Path):
     writer = EvidenceWriter(
         evidence_dir / "wire.ndjson", run_id="r1", case_id="c1", clock_id="clk1"
     )
+    # 4107 B payload 須以單一 serial_read chunk 交給 tx-writer，腳本長度序列才與 wire 一一對應；
+    # 預設 read_chunk=4096 會切成 4096＋11 兩塊，使第二筆接受長度被 chunk 邊界截成 4093。
     cfg = BridgeConfig(
-        run_id="r1", case_id="c1", port_id="COM0", evidence_dir=evidence_dir
+        run_id="r1", case_id="c1", port_id="COM0", evidence_dir=evidence_dir,
+        read_chunk=8192,
     )
     bridge = Bridge(cfg, endpoint, dut, writer, dut_control=None)
     bridge.start()
@@ -427,13 +430,17 @@ def test_allowed_dut_exit_no_fail(bridge_proc):
     fd = os.open(b.link, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
     try:
         write_all(fd, b"12345")
+        # 第 1 世代在結束前已回顯這 5 B，須先讀走，否則會混進第 2 世代的回顯。
+        assert read_exact(fd, 5, timeout_s=5.0) == b"12345"
         time.sleep(0.3)
         res = b.control.call("dut_spawn")
         assert res["dut_generation"] == 2
 
-        write_all(fd, b"hello again\n")
-        recvd = read_exact(fd, len(b"hello again\n"), timeout_s=5.0)
-        assert recvd == b"hello again\n"
+        # 第 2 世代沿用同一 argv（--exit-after-bytes 5），只能回顯 5 B 後結束；
+        # 送恰好 5 B 驗證往返恢復，避免超量 bytes 寫進已結束的 DUT。
+        write_all(fd, b"hello")
+        recvd = read_exact(fd, len(b"hello"), timeout_s=5.0)
+        assert recvd == b"hello"
     finally:
         os.close(fd)
 
