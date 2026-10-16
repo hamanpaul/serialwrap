@@ -9,6 +9,7 @@ import os
 import select
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -190,10 +191,13 @@ class StubDutProcess:
         self.stderr_buf = bytearray()
         self._poll_rc: int | None = None
         self.stdin_closed = False
+        self._stdout_condition = threading.Condition()
 
     def spawn(self) -> None:
         self.is_spawned = True
         self._poll_rc = None
+        with self._stdout_condition:
+            self._stdout_condition.notify_all()
 
     def stdin_write_some(self, data: bytes) -> int:
         if self._poll_rc is not None or self.stdin_closed:
@@ -212,11 +216,15 @@ class StubDutProcess:
         return accepted
 
     def stdout_read(self, max_bytes: int) -> bytes:
-        if not self.stdout_buf:
-            return b""
-        chunk = bytes(self.stdout_buf[:max_bytes])
-        del self.stdout_buf[:max_bytes]
-        return chunk
+        # 對齊 DutProcess.stdout_read 的阻塞 pipe 語意：空 buffer 不代表 EOF。
+        with self._stdout_condition:
+            while not self.stdout_buf and self._poll_rc is None:
+                self._stdout_condition.wait(0.05)
+            if not self.stdout_buf:
+                return b""
+            chunk = bytes(self.stdout_buf[:max_bytes])
+            del self.stdout_buf[:max_bytes]
+            return chunk
 
     def stderr_read(self, max_bytes: int) -> bytes:
         if not self.stderr_buf:
@@ -230,10 +238,14 @@ class StubDutProcess:
 
     def terminate(self, grace_s: float = 2.0) -> int | None:
         self._poll_rc = 0
+        with self._stdout_condition:
+            self._stdout_condition.notify_all()
         return 0
 
     def kill(self) -> int | None:
         self._poll_rc = -9
+        with self._stdout_condition:
+            self._stdout_condition.notify_all()
         return -9
 
     def poll(self) -> int | None:
@@ -244,6 +256,8 @@ class StubDutProcess:
         self.is_spawned = True
         self._poll_rc = None
         self.stdin_closed = False
+        with self._stdout_condition:
+            self._stdout_condition.notify_all()
         return self.generation
 
     def describe(self) -> dict[str, Any]:
