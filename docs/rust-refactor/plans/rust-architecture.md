@@ -299,13 +299,15 @@ macro_rules! pydict { ($($k:expr => $v:expr),* $(,)?) => { ... } }  // 回應依
   - `\Z` → `\z`。
   - `\s` 擴成 Python 集合 `[\t\n\x0b\x0c\r\x1c-\x1f \x85\p{White_Space}]`。
   - `(?x)` 展開處理；字元類交集等語法另行轉寫。
-  - 無法轉譯的構造回傳 `Untranslatable`，呼叫端視同不合法，例如 `INVALID_COMPLETION_REGEX`。殘餘差異清單由契約測試列舉並登記。
+  - 無法轉譯的構造回傳 `Untranslatable`。CLI 相容入口 `completion_regex_check` 依 Task 5 契約將其視為可交由 Python daemon 檢查；daemon 入口必須呼叫 `completion_regex_check_strict`，將 `Untranslatable` 視為不合法，避免證據不足時放行。其他 daemon 驗證路徑亦須採 fail-closed。殘餘差異清單由契約測試列舉並登記。
 - API：
 
   ```rust
-  pub fn compile(pat:&str, flags:PyFlags) -> Result<PyRegex, PyReError>;
+  pub fn compile(pat:&str, flags:PyFlags) -> Result<PyRegex, CompileError>;
   impl PyRegex { fn search(&self, hay:&str) -> Option<PyMatch>; fn search_from(&self, hay:&str, pos:usize) -> Option<PyMatch>; }
   ```
+
+  completion 驗證分為 `completion_regex_check`（保留 CLI 對 `Untranslatable` 的相容行為）與 `completion_regex_check_strict`（供 daemon 使用，遇到 `Untranslatable` 一律回 `Invalid`）；`valid_completion_regex_strict` 是後者的布林包裝。呼叫端不得以寬鬆入口代替 daemon 的嚴格驗證。
 
   執行時 `backtrack_limit=1_000_000`。超過上限時當作「未匹配」並遞增 `regex_backtrack_exhausted` 診斷計數，只寫 log。
 - 用途：`valid_completion_regex`（CLI 本地預檢與 daemon）、profile regex（prompt／login／password／bootloader）、event rule regex、`profile test`。

@@ -1124,9 +1124,9 @@ Expected：PASS。
 ```rust
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PyFlags(pub u32);
-impl PyFlags { pub const I: u32 = 2; pub const L: u32 = 4; pub const M: u32 = 8; pub const S: u32 = 16; pub const U: u32 = 32; pub const X: u32 = 64; pub const A: u32 = 256; }
+impl PyFlags { pub const T: u32 = 1; pub const I: u32 = 2; pub const L: u32 = 4; pub const M: u32 = 8; pub const S: u32 = 16; pub const U: u32 = 32; pub const X: u32 = 64; pub const A: u32 = 256; }
 #[derive(Debug, Clone, PartialEq)]
-pub struct PyReError { pub msg: String, pub pos: Option<usize>, pub line_col: Option<(usize, usize)> }
+pub struct PyReError { pub msg: String, pub pos: Option<usize>, pub line_col: Option<(usize, usize)>, pub value_error: bool }
 impl std::fmt::Display for PyReError {}   // pattern 含 "\n"：msg + " (line L, column C)"；否則 msg + " at position N"；pos 為 None：msg
 #[derive(Debug, Clone, PartialEq)]
 pub enum CompileError { Re(PyReError), Recursion, Overflow(String) /* Python OverflowError，例如 a{99999999999} */, Untranslatable(String) }
@@ -1143,12 +1143,16 @@ pub const PARSE_DEPTH_LIMIT: usize;     // gen_pyre.py 以二分搜尋量得 Pyt
 pub enum CompletionCheck { Valid, Invalid, Crash(String) /* Python 未攔的例外（OverflowError）→ 呼叫端 exit 1、stdout 空 */ }
 pub fn completion_regex_check(v: Option<&crate::pyjson::PyValue>) -> CompletionCheck;
 pub fn valid_completion_regex(v: Option<&crate::pyjson::PyValue>) -> bool;   // = matches!(completion_regex_check(v), Valid)
+pub fn completion_regex_check_strict(v: Option<&crate::pyjson::PyValue>) -> CompletionCheck; // daemon 使用；Untranslatable → Invalid
+pub fn valid_completion_regex_strict(v: Option<&crate::pyjson::PyValue>) -> bool; // 嚴格入口的布林包裝
 // command_completion.py:11-23：None → Valid；非 Str 或空 → Invalid；UTF-8 長度 > COMPLETION_REGEX_MAX_BYTES(1024) → Invalid；
 // compile 的 Re／Recursion → Invalid（Python 攔 re.error／RecursionError）；Overflow → Crash（Python 只攔 re.error、UnicodeEncodeError、
 // RecursionError，OverflowError 會變 traceback；KEEP：exit 1、stdout 空）；
 // Untranslatable → Valid（Python 端可接受、Rust 轉譯不出時**不在 CLI 本地拒絕**，交由 daemon 自行驗證；不 fail-closed，避免拒絕 Python 接受的輸入）；
 // 可轉譯且 search("") 有結果 → Invalid
 ```
+
+`Untranslatable → Valid` 僅適用 CLI 的相容入口；Rust daemon 與其他做授權／排隊前檢查的路徑必須使用 strict 入口並 fail-closed。此雙 API 裁決消除 arch §3.6 原先未區分 CLI 與 daemon 呼叫端的衝突。
 
 超過 `BACKTRACK_LIMIT` 視為未匹配（arch §3.6）；`Untranslatable` 的構造清單寫入 `contracts/golden/pyre.residuals.txt`（殘餘差異，EVT-D-S15）。殘餘檔格式（每行一筆，`\t` 分隔）：`<pattern 的 hex>\t<構造名>\t<核可者>\t<核可紀錄（PR 留言連結或日期＋審查者）>`；**不以 case id 豁免**。比對規則：只有在 Rust `compile(pattern)` 實際回 `Untranslatable(<同一構造名>)` 時，該 pattern 的 `compile` 列（Python `ok`）與連帶的 `search`／`completion_valid` 列才可視為已登記差異；Rust 結果是其他任何值（含 `ok` 但 search 位置不同、`err:` 文字不同）一律 FAIL。另有測試檢查殘餘檔：無重複列、每列都被至少一個 golden pattern 用到（未使用即過期 → FAIL）、核可欄非空、總筆數 ≤ 20、不含 `sw_core/assets/profiles/*.yaml` 與 `UBOOT_FALLBACK_PROMPTS` 的任何 regex。殘餘檔由**審查者**（非實作者）於 Step 5 後寫入核可欄；實作者只能提出候選。
 
