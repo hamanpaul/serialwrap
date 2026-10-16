@@ -99,6 +99,8 @@ class Bridge:
         self._intentional_dut_exits: set[int] = set()
         self._tx_restart_discard_generation: int | None = None
         self._transport_disconnected = False
+        self._peer_state_lock = threading.Lock()
+        self._last_peer_state: bool | None = None
         self._quiesce_action_id: str | None = None
         self._stderr_total = 0
         self._stderr_written = 0
@@ -354,6 +356,14 @@ class Bridge:
                 return
             self._stdout_eof_generations.add(generation)
         self._record_meta({"event": "dut_stdout_eof"})
+
+    def _note_peer_state(self, current: bool) -> None:
+        """peer 狀態與上次記錄不同時寫 META peer_state（peer-watch 與 rx-writer 共用，避免重複）。"""
+        with self._peer_state_lock:
+            if current == self._last_peer_state:
+                return
+            self._last_peer_state = current
+            self._record_meta({"event": "peer_state", "open": current})
 
     def _note_activity(self, observation: str) -> None:
         with self._state_changed:
@@ -1030,12 +1040,9 @@ class Bridge:
                 },
                 loss_flag=True,
             )
-            self._fail(
-                "HARNESS_WINDOW_UNSETTLED",
-                f"shutdown 排空逾時：tx={pending['tx']} rx={pending['rx']}",
-                force=True,
-                signal_done=False,
-            )
+            # shutdown 是呼叫端明確要求的結束，不屬 fail-stop（計畫 Task 5：shutdown → wait() 回 0）；
+            # 排空逾時未送達的 bytes 已以 loss_flag:true 的 fault META 與 manifest pending_at_close 誠實記錄，
+            # 比較器據此判證據不足。HARNESS_WINDOW_UNSETTLED 屬比較器 correlation 原因碼，不作 bridge 失敗碼。
         self._flush_writer()
         self._record_meta({"event": "bridge_stop"})
         self._flush_writer()

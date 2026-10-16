@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 import uuid
 from typing import TYPE_CHECKING
@@ -142,21 +143,33 @@ def tx_writer(bridge: Bridge) -> None:
         bridge._pump_stopped("tx_writer")
 
 
+def _accepts_timeout(read_fn: object) -> bool:
+    """判斷 stdout_read 是否支援 timeout_s（介面契約本身為阻塞讀，timeout_s 為選配擴充）。"""
+    try:
+        return "timeout_s" in inspect.signature(read_fn).parameters  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+
+
 def rx_reader(bridge: Bridge) -> None:
     """讀取 DUT stdout；EOF 留 META，並等候下一個 DUT 世代。"""
     try:
+        timed_read = _accepts_timeout(bridge.dut.stdout_read)
         while not bridge._stop_event.is_set():
             if bridge._pump_checkpoint("rx_reader", "RX", "reader"):
                 return
             if bridge._closing:
                 return
             generation = bridge._dut_generation()
-            bridge._reader_io_now("RX", True)
             try:
-                try:
+                if timed_read:
+                    bridge._reader_io_now("RX", True)
                     data = bridge.dut.stdout_read(bridge.cfg.read_chunk, timeout_s=0.05)
-                except TypeError:
+                else:
+                    # 阻塞讀（介面契約）期間尚未持有任何 bytes，不標 busy；
+                    # 否則 DUT 閒置時 shutdown 排空永遠等不到 RX 讀取側安定。
                     data = bridge.dut.stdout_read(bridge.cfg.read_chunk)
+                    bridge._reader_io_now("RX", True)
             except OSError as exc:
                 bridge._reader_io_now("RX", False)
                 if bridge._stop_event.is_set():
@@ -237,10 +250,22 @@ def rx_writer(bridge: Bridge) -> None:
                     if bridge._pump_checkpoint("rx_writer", "RX", "writer"):
                         return
                     bridge._pump_inflight_now("rx_writer", len(data) - offset)
+                    write_timeout_s = bridge.cfg.write_timeout_s
                     try:
-                        accepted = bridge.endpoint.write_some(
-                            data[offset:], bridge.cfg.write_timeout_s
-                        )
+                        peer_state = bridge.endpoint.peer_open()
+                    except OSError:
+                        peer_state = None
+                    if peer_state is not None:
+                        # 寫入前即時取樣並記錄 peer 轉換；peer-watch 50 ms 取樣可能漏掉短暫開啟，
+                        # 而 peer gate 下 serial_write 必在 peer 開啟時發生，META 須先於該筆資料。
+                        bridge._note_peer_state(bool(peer_state))
+                    peer_known_closed = peer_state is False
+                    if peer_known_closed:
+                        # peer 已關閉時 POSIX peer gate 只會等到逾時再回 0（不寫、不丟）；
+                        # 縮短單次等待片段，讓迴圈及時察覺 shutdown／peer 重新開啟，回 0 照常重試。
+                        write_timeout_s = min(write_timeout_s, 0.05)
+                    try:
+                        accepted = bridge.endpoint.write_some(data[offset:], write_timeout_s)
                     except EndpointWriteUncertain as exc:
                         requested = int(getattr(exc, "requested_len", len(data) - offset))
                         bridge._record_meta(
@@ -355,17 +380,15 @@ def dut_watch(bridge: Bridge) -> None:
 
 def peer_watch(bridge: Bridge) -> None:
     """每 50 ms 取樣 peer；狀態轉換以 META 保存。"""
-    previous: bool | None = None
     try:
         while not bridge._closing and not bridge._stop_event.wait(0.05):
             try:
                 current = bridge.endpoint.peer_open()
             except OSError:
                 current = None
-            if current is None or current == previous:
+            if current is None:
                 continue
-            previous = current
-            bridge._record_meta({"event": "peer_state", "open": bool(current)})
+            bridge._note_peer_state(bool(current))
     finally:
         bridge._pump_stopped("peer_watch")
 
