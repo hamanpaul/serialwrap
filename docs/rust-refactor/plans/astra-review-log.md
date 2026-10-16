@@ -228,3 +228,12 @@
 | `spec-reconciliation.md` | §1.1 新增 SC-36 列與登記數說明 |
 
 待後續處理（OD-15）：(1) Console-side com0com 需第二組 pair（COM20／COM21 已作 DUT-side），建立需管理員一次；(2) `setup --with-com0com` 遇既有 pair 視為已安裝、不重裝，請擁有者確認此行為；(3) `win-task-logon-trigger` 需人工登出登入，仍列 BLOCKED-OWNER；(4) P9 證據索引 ID 與 P2 新增的 `S0-L15-DOCKER-*`／`S0-SPIKE1-REMAINING`／`S0-WIN-TASK-THROWAWAY-72H` 需於實作時對齊；(5) P9 ingest 對缺 `evidence_layer` 的既有報告仍接受（相容舊產生端），docker／throwaway runner 產出者則必填。
+
+## OD-14／OD-15 同步後待決事項的執行者判斷（2026-10-16）
+
+| 事項 | 判斷 |
+|---|---|
+| 06 黑箱測試約 40 s 實時等待 | 加 `slow` marker 但仍屬必跑集合，不得因 slow 而 SKIP |
+| `setup --with-com0com` 遇既有 pair | 視為已安裝並沿用（冪等），不重複建立；報告既有 pair 的 PortName |
+| Console-side 需第二組 pair | 已於擁有者 Windows host 建立：CNCA1=COM22（daemon Console backend）／CNCB1=COM23（Tera Term）；與 DUT-side COM20／COM21 分開，不得混用（§15.8.1） |
+| `win-task-logon-trigger` 需人工登出登入 | 維持 BLOCKED-OWNER |
