@@ -84,10 +84,15 @@ class TestWalHealth(_WalBase):
         shutil.rmtree(self.wal_dir)
         self._append(b"after-rmtree")
 
+        # BC-01：重建後先寫 META 再寫原紀錄，讀取端需過濾 META 列後比對資料列
         rows = self.wal.tail_raw()
-        self.assertEqual(len(rows), 1)
+        data_rows = [row for row in rows if row.get("dir") != "META"]
+        self.assertEqual(len(data_rows), 1)
         import base64
-        self.assertEqual(base64.b64decode(rows[0]["payload_b64"]), b"after-rmtree")
+        self.assertEqual(base64.b64decode(data_rows[0]["payload_b64"]), b"after-rmtree")
+        meta_rows = [row for row in rows if row.get("dir") == "META"]
+        self.assertEqual(len(meta_rows), 1)
+        self.assertEqual(meta_rows[0]["meta"]["event"], "WAL_RECREATED_AFTER_EXTERNAL_UNLINK")
 
     @pytest.mark.core_portable
     @pytest.mark.memory_only

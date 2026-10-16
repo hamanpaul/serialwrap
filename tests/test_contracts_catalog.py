@@ -1071,7 +1071,7 @@ def test_ec_shape_quirks_frozen() -> None:
 def test_ec_exit_codes_frozen() -> None:
     """CLI local 錯誤碼之 exit_codes 映射凍結。"""
     by = _ec_by_code()
-    assert by["REMOTE_NOT_SUPPORTED"].exit_codes == {"daemon start": 2, "connect": 1, "benches": 1, "remote": 1}
+    assert by["REMOTE_NOT_SUPPORTED"].exit_codes == {"daemon start": 2}  # BC-05／SC-27：connect／benches／remote 不再回此碼
     assert by["INVALID_COMPLETION_REGEX"].exit_codes["cmd submit"] == 1
     assert by["SAMPLE_READ_FAILED"].exit_codes == {"profile test": 0}
     assert {"event", "daemon stop", "connect", "benches", "remote"} <= set(by["INTERNAL_ERROR"].exit_codes)

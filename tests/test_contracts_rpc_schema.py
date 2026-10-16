@@ -111,8 +111,8 @@ def _load_behavior_changes():
 @pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_methods_equal_dispatch_plus_daemon_stop():
-    """驗證 RPC 契約中的 x-methods 集合恰為 service._dispatch 處理的 method 加上 daemon.stop。"""
-    assert set(_schema()["x-methods"]) == _dispatch_methods() | {"daemon.stop"}
+    """驗證 RPC 契約中的 x-methods 集合恰為 service._dispatch 處理的 method 加上 daemon.stop 與 daemon.handoff_stop。"""
+    assert set(_schema()["x-methods"]) == _dispatch_methods() | {"daemon.stop", "daemon.handoff_stop"}
 
 
 @pytest.mark.core_portable

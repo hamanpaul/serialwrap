@@ -217,7 +217,9 @@ def _synthetic_rule_findings(paths: list[Path]) -> dict[str, list[tuple[str, str
                 findings["unregistered"].append((item.file, item.name))
             if "core_portable" in item.marks and item.platform_skip:
                 findings["core_portable_skip"].append((item.file, item.name))
-            if item.marks & {"windows_com", "physical_uart"}:
+            if "physical_uart" in item.marks:
+                findings["unsupported_claim"].append((item.file, item.name))
+            elif "windows_com" in item.marks and "windows_native" not in item.marks:
                 findings["unsupported_claim"].append((item.file, item.name))
             child = item.marks - module_marks
             if ((module_marks & RESOURCE and child & RESOURCE)
@@ -272,7 +274,37 @@ def test_core_portable_items_have_no_platform_skip():
 
 @pytest.mark.memory_only
 def test_no_windows_com_or_physical_uart_claims_in_p0():
-    bad = [(i.file, i.name) for i in _all_items() if i.marks & {"windows_com", "physical_uart"}]
+    # physical_uart 永遠禁止宣稱（使用數必須為 0）
+    bad: list[tuple[str, str, str]] = [
+        (i.file, i.name, "physical_uart_claimed") for i in _all_items() if "physical_uart" in i.marks
+    ]
+
+    # windows_com 只允許出現在模組層或 class 層 pytestmark 含 windows_native 的項目，且每個使用者同時帶 windows_native
+    for i in _all_items():
+        if "windows_com" in i.marks and "windows_native" not in i.marks:
+            bad.append((i.file, i.name, "windows_com_missing_windows_native"))
+
+    for path in sorted(TESTS.glob("test_*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        mod_pm = _pytestmark(tree.body)
+        if "windows_com" in mod_pm and "windows_native" not in mod_pm:
+            bad.append((path.name, "<module>", "windows_com_in_module_pytestmark_without_windows_native"))
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if "windows_com" in _decor_marks(node.decorator_list):
+                    bad.append((path.name, node.name, "windows_com_in_function_decorator"))
+            elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+                cls_pm = _pytestmark(node.body)
+                cls_dec = _decor_marks(node.decorator_list)
+                if "windows_com" in cls_dec:
+                    bad.append((path.name, node.name, "windows_com_in_class_decorator"))
+                if "windows_com" in cls_pm and "windows_native" not in cls_pm:
+                    bad.append((path.name, node.name, "windows_com_in_class_pytestmark_without_windows_native"))
+                for fn in node.body:
+                    if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        if "windows_com" in _decor_marks(fn.decorator_list):
+                            bad.append((path.name, f"{node.name}.{fn.name}", "windows_com_in_method_decorator"))
+
     assert bad == []
 
 

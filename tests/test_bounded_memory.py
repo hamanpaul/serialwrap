@@ -235,8 +235,10 @@ def test_deferred_buffer_capped(monkeypatch):
     b._agent_active = True
     b._suspended_owner = "human:cid1"
     b._deferred_buffers = {}
+    b._owner_gen = 0
     client = uio.ConsoleClient(client_id="cid1", label="x", master_fd=-1, slave_fd=-1,
                                slave_path="", attached_at=0.0)
     b._handle_console_rx(client, b"A" * 500)
-    assert len(b._deferred_buffers["cid1"]) == 100   # 受上限
-    assert bytes(b._deferred_buffers["cid1"]) == b"A" * 100  # 保留最近輸入
+    assert "cid1" not in b._deferred_buffers          # BC-02：超過上限整段清空
+    b._handle_console_rx(client, b"B" * 10)
+    assert bytes(b._deferred_buffers["cid1"]) == b"B" * 10   # _DeferredEntry 為 bytearray 子類

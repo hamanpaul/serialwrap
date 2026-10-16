@@ -113,3 +113,69 @@ def test_health_ping_not_blocked_by_slow_command_result_tail():
         th.join(timeout=5.0)
         loop.close()
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+@pytest.mark.skipif(
+    sys.platform.startswith("win"),
+    reason="POSIX-only: Unix domain socket 在 Windows 不適用（#84 PORT-4）",
+)
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
+def test_release_rpc_offloaded_from_event_loop():
+    """以真實 BLOCKING_RPC_METHODS 驅動：device.release 阻塞於 drain 期間，health.ping 在 0.5 s 內回應。
+
+    若 device.release 不在 offload 清單（修正前），慢 handler 會在單執行緒 event loop 上
+    同步執行，並發 health.ping 被卡 → 此測試失敗；納入清單後 health.ping 即時回應。
+    """
+    tmp = tempfile.mkdtemp(prefix="sw80rel-")
+    sock = os.path.join(tmp, "t.sock")
+    slow_s = 2.0
+
+    def _handler(method: str, params: dict) -> dict:
+        if method == "device.release":
+            time.sleep(slow_s)  # 模擬 release drain 阻塞
+            return {"ok": True}
+        return {"ok": True, "pong": True}
+
+    loop = asyncio.new_event_loop()
+    # 關鍵：用 daemon 的真實 BLOCKING_RPC_METHODS，確保 device.release 確實被宣告為 offload
+    server = JsonRpcUnixServer(sock, _handler, blocking_methods=BLOCKING_RPC_METHODS)
+    ready = threading.Event()
+
+    def _run() -> None:
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(server.start())
+        ready.set()
+        loop.run_forever()
+
+    th = threading.Thread(target=_run, daemon=True)
+    th.start()
+    assert ready.wait(5.0), "server failed to start"
+    try:
+        slow_done: dict = {}
+
+        def _fire_slow() -> None:
+            slow_done["resp"] = rpc_call(sock, "device.release", {"selector": "COM0"}, timeout_s=10.0)
+
+        slow_thread = threading.Thread(target=_fire_slow)
+        slow_thread.start()
+        time.sleep(0.3)  # 確保慢 handler 已進入
+
+        t0 = time.monotonic()
+        resp = rpc_call(sock, "health.ping", {}, timeout_s=5.0)
+        elapsed = time.monotonic() - t0
+
+        assert resp.get("ok") and resp.get("pong")
+        assert elapsed < 0.5, f"health.ping 在 device.release 進行中被阻塞 {elapsed:.2f}s"
+        slow_thread.join(timeout=10.0)
+        assert slow_done.get("resp", {}).get("ok")
+    finally:
+        fut = asyncio.run_coroutine_threadsafe(server.stop(), loop)
+        try:
+            fut.result(timeout=5.0)
+        except Exception:
+            pass
+        loop.call_soon_threadsafe(loop.stop)
+        th.join(timeout=5.0)
+        loop.close()
+        shutil.rmtree(tmp, ignore_errors=True)

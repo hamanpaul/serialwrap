@@ -120,22 +120,29 @@ def test_remote_malformed_endpoint_returns_json_error(tmp_path, monkeypatch, cap
 
 
 @pytest.mark.core_portable
-def test_remote_windows_returns_not_supported(tmp_path, monkeypatch, capsys):
-    """native Windows：guard 需在 `import remote_tunnel`（頂層 import fcntl）之前
-    就攔截，status／open 兩條路徑皆須回 JSON REMOTE_NOT_SUPPORTED，不得拋例外。
+def test_remote_windows_supported(tmp_path, monkeypatch, capsys):
+    """BC-05：native Windows 不再回 REMOTE_NOT_SUPPORTED。status 與 open 兩條路徑皆進入
+    正常分派（以替身 status／open_tunnel 回 ok:true），不得回 REMOTE_NOT_SUPPORTED。
     """
     monkeypatch.setenv("SERIALWRAP_RUN_DIR", str(tmp_path))
     monkeypatch.setattr(cli.os, "name", "nt")
+    monkeypatch.setattr(rt, "status", lambda run_dir: {"ok": True, "tunnels": []})
+    monkeypatch.setattr(rt, "resolve_ssh_bin", lambda via: "ssh")
+    monkeypatch.setattr(
+        rt,
+        "open_tunnel",
+        lambda spec, run_dir, **kw: {"ok": True, "status": "active", "role": spec.role, "listen_port": spec.port},
+    )
 
     rc, obj = _run(["remote"], capsys)
-    assert rc == 1 and obj is not None
-    assert obj["ok"] is False
-    assert obj["error_code"] == "REMOTE_NOT_SUPPORTED"
+    assert rc == 0 and obj is not None
+    assert obj["ok"] is True
+    assert obj.get("error_code") != "REMOTE_NOT_SUPPORTED"
 
     rc, obj = _run(["remote", "u@h:7777"], capsys)
-    assert rc == 1 and obj is not None
-    assert obj["ok"] is False
-    assert obj["error_code"] == "REMOTE_NOT_SUPPORTED"
+    assert rc == 0 and obj is not None
+    assert obj["ok"] is True
+    assert obj.get("error_code") != "REMOTE_NOT_SUPPORTED"
 
 
 @pytest.mark.posix_only

@@ -482,11 +482,10 @@ def test_resolve_ssh_bin_missing(monkeypatch):
 
 
 @pytest.mark.memory_only
-def test_guard_platform_rejects_windows(monkeypatch):
+def test_guard_platform_noop_on_windows(monkeypatch):
+    """BC-05：guard_platform 保留函式（避免外部呼叫者匯入失敗），但在 Windows 為 no-op。"""
     monkeypatch.setattr(rt.os, "name", "nt")
-    with pytest.raises(rt.TunnelError) as ei:
-        rt.guard_platform()
-    assert ei.value.code == "REMOTE_NOT_SUPPORTED"
+    assert rt.guard_platform() is None  # 不擲 TunnelError
 
 
 @pytest.mark.memory_only
