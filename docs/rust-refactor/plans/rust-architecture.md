@@ -209,7 +209,7 @@ sw-pal ────────┘ ←  sw-cli（只依賴 sw-proto + sw-pal；�
   - `Status` 取值：`Existing`、`Approved`、`Implemented`、`Verified`。
   - 本檔由 `scripts/rust/gen_error_codes.py` 依 `contracts/error_codes.yaml` 產生並 check-in；不使用 build.rs（§2）。
 - 一致性測試 `crates/sw-proto/tests/error_codes_sync.rs`：用 `yaml11` 讀 YAML，逐筆比對 enum 與 META。另有 Python 測試以 AST 加常數傳遞路徑掃描 `sw_core`（03 的方法），確認 Python 可輸出的每個碼都在 YAML。計數由資料產生（OD-06），沒有寫死的 78。
-- `session_last_errors.rs`：`pub enum SessionLastError`，包含 31 個具名值（03 §5.2），加上動態前綴 `ReprobeFailed(String)`、`AttachFailed(String)`、`BridgeDown(String)`。`USER_ENV_MISSING` 標記 `reachable:false`。此 enum 與 `ErrorCode` 互不轉換。`session.attach`／`session.recover` 把 last_error 值當 `error_code` 輸出時（`RPC-D-02`，owner 待確認），以 `RpcErrorCode::LastErrorPassthrough(SessionLastError)` 表示，不併入 RPC 碼計數。
+- `session_last_errors.rs`：`pub enum SessionLastError`，包含 31 個具名值（03 §5.2），加上動態前綴 `ReprobeFailed(String)`、`AttachFailed(String)`、`BridgeDown(String)`。`USER_ENV_MISSING` 標記 `reachable:false`。此 enum 與 `ErrorCode` 互不轉換。`session.attach`／`session.recover` 不再把 last_error 值當 `error_code` 輸出（`SC-34`，OD-14 #1；原 `RpcErrorCode::LastErrorPassthrough` 刪除）：未達 READY 時固定回 `ErrorCode::SessionNotReady`，另以回應欄位 `last_error: Option<SessionLastError>`（序列化為字串或 null）與 `last_error_detail: Option<String>` 回報，鍵序為 `ok, error_code, last_error, last_error_detail, session`（recover REPROBE 分支附在 `error_code` 之後）。`NOT_READY` 隨之 `reachable:false`。
 - 非錯誤碼也有各自的目錄，同樣由 YAML 生成：`WarningCode`（`CMD_LENGTH_WARNING`）、`ErrorDetail`（`NOT_BOOTLOADER`）、`Classification`（self-test）、`RecommendedAction`、`RecoveryAction`。
 
 ### 3.3 `pyjson.rs`：JSON 的值、解析與序列化
@@ -576,7 +576,8 @@ pub trait RpcStream: std::io::Read + std::io::Write + Send {
     fn last_errno(&self) -> Option<i32>;       // cli_trace 的 errno/errno_name
 }
 pub struct ListenOptions { pub mode: u32, pub group: Option<String>, pub ensure_dir_mode: Option<u32> }
-// SC-08：預設 mode 0o600、dir 0o700（只在新建時套用）；group 有值時 mode 0o660 並 chgrp，失敗時忽略（與 Python 相同）
+// SC-08 已撤回（OD-14 #3）：維持 Python 基線——bind 後 mode 0o660；ensure_dir_mode 為 None（目錄依基線預設建立，不設 0o700）；
+// group（SERIALWRAP_SOCKET_GROUP strip 後非空）有值時另 chgrp，失敗時忽略（與 Python 相同）
 pub trait RpcListenerFactory: Send + Sync {
     /// Unix：既有 socket 檔一律 unlink 後再 bind（前置 lock 已探測過存活）
     /// TCP：只允許 LOOPBACK_TCP_HOSTS，否則回錯，訊息逐字照 rpc_win.py
@@ -766,7 +767,7 @@ TxClass 與 gate 規則（規格 §5.2.1）：
 
 | class | 擋下條件 |
 |---|---|
-| `Command`／`FileTransfer` | `quiet_active`、`reconfirm_pending`；source 以 `human:` 開頭時另見 `DF-02` |
+| `Command`／`FileTransfer` | `quiet_active`、`reconfirm_pending`；source 以 `human:` 開頭時另見 `DF-02`（OD-14 #5 確認）；passthrough 不 arm quiet／reconfirm，兩旗標恆 false（§5.12，SC-35） |
 | `LoginProbe`／`ReadyReconfirm`／`SystemRecoverKey`／`SelfTestProbe` | quiet、`wal_unhealthy`（停止自動 TX，規格 §5.4）；`LoginProbe`／`ReadyReconfirm` 另比對 `fsm_gen`（08 Task 7 `fsm_gen_floor`），與 quiet 一樣在每次 `gate.submit` 臨界區內重跑——出列或呼叫端的 quiet 檢查只算 pre-check（R2-F1；Python Stage 0 對應 02 T20 `tx_class="system_probe"`＋`login_gen`、`set_probe_gate`、`system_permit()`）。quiet 的判定：`LoginProbe`／`ReadyReconfirm` 看 `auto_probe_blocked`（console unlock 不擋）；`SystemRecoverKey`／`SelfTestProbe` 看 `quiet_active`。`SelfTestProbe`（R5-F2，DF-19）`fsm_gen: None`、不比對 fsm_gen，只以 `epoch`＋`quiet_active` 在提交點重驗，與 actor 內 self-test pre-check（AUTOBOOT_QUIET 分支）同義；被 `Quiet` 擋下時回 pre-check 同形的 `AUTOBOOT_QUIET`、零 TX（06 Task 14 `OpOutcome::SelfTestRefused`）；Python 對應 02 T20 `tx_class="self_test_probe"`、`_gate_self_test_quiet_until`（含 console unlock profile） |
 | `HumanRaw` | `owner_gen` 不符時改走 deferred |
 | `LeaseOwner`／`InteractiveOpenCmd` | 不受 quiet 阻擋；`permit.owner_gen != owner_gen`（lease close／expiry／soft preempt／換手後的舊 lease 世代）→ `OwnerMismatch`。此世代檢查在每次 `gate.submit` 臨界區內重跑（R0-F1） |
@@ -817,8 +818,9 @@ TxWriter 的 job queue 容量 64；滿時 OpRunner 阻塞等待（只有 OpRunne
 **逾時**（收到 `WorkerDrainTimeout` 時 StopOp 仍未完成）：
 
 - 維持 `RECOVERING`，設 `drain_stalled=true`、`drain_timeout_epoch=<bridge_generation>`。
-- release 的 waiters 收到 `{"ok":false,"error_code":"SESSION_RECOVERING","drain_stalled":true,"drain_timeout_epoch":N,"session":…}`（`SC-04`，owner 確認項 4）。
-- 回條遲到時仍完成同一個 StopOp。之後再次呼叫 `device release`，依實際結果回 `already_released`；若仍在 drain，同樣回 `SESSION_RECOVERING`。
+- release 的 waiters 收到 `{"ok":false,"error_code":"DRAIN_STALLED","drain_stalled":true,"drain_timeout_epoch":N,"session":…}`（`SC-04`，OD-14 #4 新碼 `DRAIN_STALLED` 取代原 `SESSION_RECOVERING`；`retryable:"no"`、`uart_tx:possible`）。回條 `handle_closed:false` 時同樣維持 `RECOVERING`、`drain_stalled=true`，release waiter 收 `DRAIN_STALLED`。
+- 回條遲到時仍完成同一個 StopOp（RELEASED＋持久化）。之後再次呼叫 `device release`，依實際結果回 `already_released`；若仍 stalled，回同形 `DRAIN_STALLED`；drain 進行中但尚未逾時的重複 release 加入同一 StopOp、共用同一期限。
+- drain 中的 `device.attach`、`clear`、`bind`、`recover` **維持** `SESSION_RECOVERING`＋drain 欄位（不改用 `DRAIN_STALLED`）。
 - 回條到達前，**不得**對同一端點再次呼叫 `open_exclusive`；manager 的 attach 路徑會檢查 `drain_in_progress(by_id)`。
 
 ### 5.6 過期事件
@@ -936,6 +938,20 @@ TxWriter 的 job queue 容量 64；滿時 OpRunner 阻塞等待（只有 OpRunne
   - 沒有發生上下文失效時，照 #53 的正常回放流程。
   - **回放保留（07 D-22，R2-F4）**：Python 的 resume flush 在 `_foreground_operation` token 釋放前同步寫完（`session_manager.py:3699-3703`、`:1104-1120`）。Rust 回放走非同步 human lane，因此每個回放點建立 `ReplayHold`，在同一次 `Fence::with` 內設 `FenceState.replay_auth = Some(hold_id)`，HumanReplay permit 帶 `replay_hold: Some(hold_id)`。hold 存在期間 `foreground_busy()` 為 true（佇列不出列、`interactive_open`／`send` 回 `SESSION_BUSY`），最後一筆回放結算才釋放並出列。任何不經佇列的新操作取得 ownership 時，先撤銷 `replay_auth`；之後才到 OS 提交點的回放回 `ReplayRevoked`、零 TX，bytes 放回 deferred 前端，等下一個回放點再送。HumanReplay 不比對 `owner_gen`／admission，只比對 `input_epoch` 與 `replay_auth`。
 
+### 5.12 Passthrough 安靜升 READY（SC-35）
+
+OD-14 #2：`platform == "passthrough"` 的 session（含 others-template fallback、uboot-template 等帶 ready_probe 者、§6.1 注入的 `windows-default-passthrough`）由 serialwrap 只做「安靜偵測」，不做登入或 prompt 介入；UART 由 agent 自行維護。
+
+- **常數**：`sw_proto::constants::PASSTHROUGH_READY_QUIET_S: f64 = 30.0`（Python `sw_core.constants.PASSTHROUGH_READY_QUIET_S`）；L1 以 `FakeClock` 推進。
+- **attach**：`choose_login_plan` 對 passthrough 一律 `LoginPlan::None`：不跑 Login FSM、不送 ready_probe（即使 profile 有 ready_probe）、不做 boot quiet gate。bridge 起來即 `ATTACHED`、`last_error:null`、零 TX。
+- **安靜視窗**：`SessionCore` 保存 `quiet_since: MonoInstant = max(進入 ATTACHED 的 mono 時刻, 最後一次 UartRxChunk 的 mono 時刻)`。任何 RX chunk（含人類鍵入的回顯）重新起算；TX 不重算。判定只在既有 1 s `ControlEvent::Tick`：state==ATTACHED、bridge 存在、無 drain／`pending_stop`、非 RELEASED、非 flash 臨界（Probe／FLASHING）且 `now - quiet_since >= PASSTHROUGH_READY_QUIET_S` → 轉 `READY`（零 TX、`last_error:null`）。tick 粒度造成 30～31 s 的轉移點，屬預期。
+- **READY 之後**：依一般 READY 流程進 Arbiter（DF-02 照樣適用；human console raw ownership 與 agent 命令的 suspend／resume 同一般 READY）。RX 不會使其降級；`quiet_gate` 對 passthrough 不 arm boot-banner quiet、不跑 READY reconfirm，`AUTOBOOT_QUIET`／`READY_UNCONFIRMED` gate 永不觸發。只經 §5.5 drain 路徑（`UartIoError`、`DeviceDetached`、release、clear、bind、recover force）離開 READY，恢復後 ATTACHING → ATTACHED（不 probe）→ 重新累計 30 s。
+- **Admission**：ATTACHED 的 passthrough 收到 `CmdSubmit` → `{"ok":false,"error_code":"SESSION_NOT_READY","passthrough_ready_in_s":<f64，round 1 位，≥0>,"session":…}`（鍵序 `ok, error_code, passthrough_ready_in_s, session`），不再回 `PROFILE_NOT_COMMAND_CAPABLE`。`PROFILE_NOT_COMMAND_CAPABLE` 只保留給非 passthrough 且 ready_probe 為空的 profile 在 ATTACHED，以及 `file.push`／`file.pull` 對 passthrough（任何 state）。`command_capable` 定義不變（仍由 ready_probe 推導，flash 偵測候選依賴它）。
+- **line／background 完成條件**（只用既有機制）：(1) 有 `completion_regex` → #230 producer 完成；(2) 否則 profile `prompt_regex` 符合 `valid_completion_regex` 規則（可編譯、非空、`search("")` 不命中）→ 既有 prompt 完成；(3) 否則（如 others-template 的 `.*`）→ 沿用既有等待迴圈（有 RX 續等、連續 `min(timeout_s, 30)` 秒無新 RX 或 effective timeout 到即停），回既有 `{"ok":false,"error_code":"PROMPT_TIMEOUT","partial":true,"recovery_action":"NONE"}`，capture chunks＝清理後 RX。passthrough 未命中時 OpRunner **不送** `SystemRecoverKey`（CTRL_C／CTRL_D）、**不**轉 ATTACHED、**不** force recover，session 維持 READY。completion_regex 命中且 prompt_regex 不可用時，stdout＝`clean_text(pre_offset 起至完成標記結尾的 RX)`。reboot 命令特例不套用（當一般 line 命令）；interactive 模式不變。
+- **self-test**：passthrough 永不 TX。READY → `classification:"PASSTHROUGH"`、`recommended_action:"none"`；ATTACHED → 既有 PASSTHROUGH 分支（console_attach／fallback suggest）並加 `passthrough_ready_in_s`。
+- **recover**：REPROBE 不 probe；未 READY 時依 SC-34 形狀（`error_code:"SESSION_NOT_READY"`、`last_error:null`）；force 走既有 clear＋reattach（10 s 內通常未滿 30 s → 既有 `FORCE_RECOVER_TIMEOUT`）。`session.attach` 對 passthrough ATTACHED 不 probe，回 `{"ok":true,"session":…}`。
+- 不新增錯誤碼、不新增 WAL META 事件。
+
 ---
 
 ## 6. `sw-daemon`：組裝、framing、分派
@@ -946,7 +962,7 @@ TxWriter 的 job queue 容量 64；滿時 OpRunner 阻塞等待（只有 OpRunne
 
 1. `ensure_runtime_dirs`。
 2. `load_profiles`；結果為空時 stderr 印 `serialwrapd: no profiles loaded`。
-3. Windows device backend 時注入 `windows-default-passthrough` template（依 capability 判斷）。
+3. Windows device backend 時注入 `windows-default-passthrough` template（依 capability 判斷）。此 template 為 `platform=passthrough`，同樣適用 §5.12 的安靜升 READY（`SC-35`）。
 4. `instance_lock.acquire`；失敗時 stderr `serialwrapd: DAEMON_ALREADY_RUNNING`，exit 2。
 5. 建 Service；`StateLoadError` 時 exit 3。
 6. 取得 OD-11 allowlist 判定（`SC-19`）；違規時 stderr `serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED: <reason>`，exit 2。
@@ -1155,7 +1171,7 @@ Windows（`ProcessTunnel::supports_control_master()==false`）的差異：
 - **停止**：terminate tree。
 - argv 不帶 ControlMaster 相關的 3 個 `-o` 選項；identity 計算仍包含使用者的 `ssh_opts`。
 
-connect 與 benches 是否一併納入 Windows 支援，為 `SC-27`（owner 確認項）。
+connect 與 benches 一併納入 Windows 支援（`SC-27`，OD-14 #7 確認），移除這兩者在 Windows 上的 `REMOTE_NOT_SUPPORTED`。
 
 ---
 

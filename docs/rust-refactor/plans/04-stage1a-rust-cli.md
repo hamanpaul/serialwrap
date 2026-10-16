@@ -30,6 +30,7 @@
 | 來源 | 交付物 | 本計畫用途 | 缺少時 |
 |---|---|---|---|
 | P0 | `contracts/error_codes.yaml`、`contracts/session_last_errors.yaml`（arch §3.2 欄位：`code`、`interfaces`、`retryable`、`reachable`、`status`） | Task 8 生成 `error_codes.rs`／`session_last_errors.rs` | Task 8 停在紅燈，不得自寫 YAML 代替 |
+| P1-OC | `02b-stage0-owner-confirmations.md`（OD-14）已合併：`contracts/error_codes.yaml` 新增 `DRAIN_STALLED`、移除頂層 `passthrough:`（`last_error_passthrough` meta 項）、`NOT_READY` 改 `reachable:false`；`session_last_errors.yaml` 的 `promoted_via` 語意改為「出現在回應頂層 `last_error` 欄位」；`behavior_changes.yaml` 新增 SC-34／SC-35、移除 SC-08 | Task 8 的生成器與 `error_codes_sync.rs` 以 P1-OC 後的 YAML 為輸入；生成器**不得**產生任何 passthrough／`LastErrorPassthrough` 變體（SC-34），`promoted_via` 只作資料欄、不影響 `ErrorCode` | P1-OC 未合併前不得開始 Task 8（否則生成物與合併後 YAML 不一致，`--check` 必紅）；停止回報 |
 | P0 | `contracts/cli_schema.json` | Task 10 的 `cli_spec.rs` 與 schema 一致性測試 | 一致性測試 `panic!("P0 contracts 缺少")`（不得早退或 SKIP），Task 10 停在紅燈 |
 | P0 | T14 的 marker 稽核（`tests/test_resource_markers.py`，10 個 marker 詞彙） | 本 phase 新增的每個 pytest 檔都帶合規 `pytestmark`（§0.5） | 稽核 FAIL 視為本 phase 新增失敗 |
 | P1 | DF-06（client 非 JSON 回應 → `INVALID_RESPONSE`）與 SC-09（`resolve_config_path()`：`SERIALWRAP_CONFIG` 原樣勝出（即使不存在）→ `CONFIG_DIR/config.yaml`（存在）→ 系統檔（存在）→ `CONFIG_DIR/config.yaml`，02 T15）的 Python 實作已合併 | 黑箱測試以修正後 Python 為基線 | 兩個黑箱案例對 Python 紅燈；不得改寫 oracle 遷就舊行為 |

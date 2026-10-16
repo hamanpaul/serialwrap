@@ -1534,6 +1534,8 @@ bash tools/docker/remote_tunnel_test.sh all                                     
 
 ## Task 9：`connect`／`benches` 原生（SC-27）
 
+> SC-27 的範圍（Windows remote 涵蓋 `connect`／`benches`、移除兩者在 Windows 上的 `REMOTE_NOT_SUPPORTED`）已由 OD-14 #7 確認原預設，`behavior_changes.yaml` 該項 `owner_confirmation: confirmed`（P1-OC 簿記），本 Task 不再視為待確認項。
+
 **Test author model:** agy-gemini-3.8-flash-high
 **Implementer model:** haiku-xhigh
 **Changelog fragment:** `changelog.d/<issue>-rust-p4-connect-benches.md`（`type: feat`，`scope: rust-cli`）

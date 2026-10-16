@@ -2144,6 +2144,8 @@ class Cycle:
 def steady(sess: Mapping[str, Any]) -> bool
     # state=="READY" 且 boot_quiet_remaining_s 為 None 或 ≤0 且 ready_reconfirm_pending 不為 True 且 ready_reconfirm_failed 不為 True；
     # 或 state=="ATTACHED" 且（command_capable is False 或 platform=="passthrough"）——不依 profile 名稱
+    # SC-35（OD-14 #2）：passthrough 連續 30 s 無 RX 後自動轉 READY（passthrough 不 arm quiet／reconfirm，READY 分支自然成立）；
+    # 仍持續有 RX 的 passthrough 停在 ATTACHED，照上式視為穩態。ATTACHED→READY 為穩態→穩態，不構成 episode
 def episodes(snapshots: Sequence[dict], policy: CanaryPolicy) -> list[Episode]
 def classify_episode(ep: Episode, platform: str, recover_tx_seen: bool) -> str | None
 class Attribution(NamedTuple):       # 受測內容歸屬鍵（R4-F1）：三者皆相同才是「同一受測物」
@@ -2249,6 +2251,7 @@ def test_ambiguous_artifact_is_none():
 | `test_unfinished_episode_dropped` | 序列末端停在 `RELEASED` → 無 cycle |
 | `test_pid_change_splits_episode` | episode 中途 daemon pid 改變 → 無 cycle |
 | `test_passthrough_attached_is_steady` | `command_capable=False` 的 COM 恆 ATTACHED → 無 episode；`platform="passthrough"` 同；使用者自訂名稱的 passthrough profile 亦同（不依 profile 名稱） |
+| `test_passthrough_ready_is_steady` | SC-35：`platform="passthrough"`（`command_capable=False` 與 `True` 各一）的 COM 序列 ATTACHED（持續 RX）→ READY（30 s 安靜後，`boot_quiet_remaining_s` 為 None、`ready_reconfirm_pending` 為 False）→ 無 episode、無 cycle，且不觸發 `stuck_attached` |
 | `test_coexist_bucket_and_cap` | 同 com 同日 7 個桶都有 human＋agent → 恰 5 個 `human_agent_coexist`（cap） |
 | `test_planned_restart_cycle` | pid 100→101 且 note 覆蓋 → `["planned_restart"]`；中間夾一個 `daemon_ok=False` 快照仍成立；無 note → 無 cycle（由 Task 11 開事故） |
 | `test_unverified_artifact_not_attributed` | 兩側快照 `artifact_check="version_mismatch"` → `attribute_artifact` 為 None；兩側 `artifact_check="verified"` 但 `bundle_tree=None` → 同為 None（R4-F1：無內容指紋不歸屬） |
@@ -2325,7 +2328,7 @@ def current_incidents(records: Sequence[dict], detected: Sequence[Incident]) -> 
 | `unexplained_pid_change` | 同上但 `t_c - t_p > 3I`；或 p、c 的 `daemon_pid` 相同但兩者之間有 `error` 為 `not_running`／`connect_refused` 的快照（daemon 確定曾不存在，不能排除 PID 重用），未被 note 覆蓋 | c `t_wall` |
 | `supervisor_failed_to_start` | 已佐證的主機重開後，該 boot 第一個快照起 `post_boot_grace_s` 內沒有任何 `daemon_ok` 快照，且該期間至少有一個快照 | 新 boot_id |
 | `daemon_unreachable` | 同 boot 連續 ≥`unreachable_incident_polls` 個 `daemon_ok` 為 false 的快照、跨度 ≥2I，不在 post-boot grace 內，且未被 `planned_downtime` note 覆蓋 | 該段第一個 `t_wall` |
-| `stuck_attached` | 同 com、同 daemon pid，連續 `canary_classify.steady(sess)` 為 false 的快照（排除 state `RELEASED`、`FLASHING`、`DETACHED`；passthrough／`command_capable=false` 的 ATTACHED 已由 `steady` 視為穩態）的 `last_t - first_t ≥ stuck_incident_s` | com＋段起點 |
+| `stuck_attached` | 同 com、同 daemon pid，連續 `canary_classify.steady(sess)` 為 false 的快照（排除 state `RELEASED`、`FLASHING`、`DETACHED`；passthrough／`command_capable=false` 的 ATTACHED 已由 `steady` 視為穩態；passthrough 30 s 安靜後轉 READY（SC-35）同為穩態）的 `last_t - first_t ≥ stuck_incident_s` | com＋段起點 |
 | `wal_unhealthy` | `wal_healthy is False` 段的第一個快照 | 段起點 |
 | `wal_loss` | `wal_loss` 或 `wal_recreated` 訊號（Task 8 已保證同一筆 META 只出一個訊號） | `f"{kind}:{seq}:{wall_ts}"` |
 | `harvest_integrity` | `harvest_anomaly` 紀錄中 `malformed_line`、`crc_mismatch`、`seq_regress`、`truncated`、`replaced`、`vanished` 任一（擷取異常是證據完整性問題，不可只記錄後忽略） | anomaly `detail` |

@@ -17,7 +17,7 @@
 （摘自 `00-master-plan.md` Global Constraints，僅列本 Phase 相關者；全文以 master plan 為準）
 
 - 平台相依 production code 只在 `sw-pal`；其他 crate 禁止 `#[cfg(unix)]`／`#[cfg(windows)]`／`target_os`／`cfg!`／`cfg_attr` 平台分支與 build script 間接分支（§3.1）；允許 `#[cfg(test)]` 與 `#[cfg(feature = "test-fakes")]`。`scripts/rust/check_cfg_boundary.py` 必須維持 0 命中。
-- RPC／CLI `error_code` 與 session `last_error` 為兩個獨立命名空間（ADR-07、§9.3）；`CREDENTIALS_UNRESOLVED` 只屬後者。`session.attach`／`session.recover` 把 `last_error` 透傳成 `error_code` 的既有行為以 `RpcErrorCode::LastErrorPassthrough(SessionLastError)` 表示（06 內部以 last_error 字串承載，於 RPC 邊界以 `SessionLastError::parse` 轉換）（調和表擁有者確認項 #1 預設），不得新增 RPC 碼。
+- RPC／CLI `error_code` 與 session `last_error` 為兩個獨立命名空間（ADR-07、§9.3）；`CREDENTIALS_UNRESOLVED` 只屬後者。`session.attach`／`session.recover` 依 SC-34（OD-14 #1，RPC-D-02 已裁決分離）不再把 `last_error` 透傳成 `error_code`：未達 READY 一律回固定碼 `SESSION_NOT_READY`，另以回應頂層 `last_error`（`Option<SessionLastError>`，序列化為字串或 null；06 內部以 last_error 字串承載，於 RPC 邊界以 `SessionLastError::parse` 轉換）與 `last_error_detail`（`Option<String>`）回報；`RpcErrorCode::LastErrorPassthrough` 已刪除，不得新增 RPC 碼。
 - 錯誤碼計數由 `contracts/error_codes.yaml` 資料產生，不得硬編碼 78（§9.2、OD-06）；本 Phase 不新增任何 `error_code` 或 `last_error` 值。
 - `--retries` 只對 11 個唯讀方法重試；`session.interactive_status` 與所有 `event.*`、`file.*`、`log.*` 方法永不重試（§4.2、arch §7.5）。
 - JSON：CLI／RPC 為 compact、`ensure_ascii=False`；`state.json`／WAL 以 `sort_keys=True`；events.ndjson 與 handler stdin 為 Python 預設分隔符（`", "`、`": "`）、不排序、`ensure_ascii=False`；規則檔 `indent=2, sort_keys=True`、無尾端換行；counter 檔預設分隔符、`ensure_ascii=True`（arch §3.3）。
@@ -49,7 +49,7 @@
 | 項目 | 對應 Python 基線 | Rust 承接檔（「06 Tn」＝P5 已建立，本 Phase 只擴充） |
 |---|---|---|
 | 帳密解析 | `auth.py`（05 §9） | `crates/sw-core/src/session_auth.rs`（06 T13） |
-| Login FSM 全平台 | `login_fsm.py`（05 §8） | `crates/sw-core/src/login_fsm.rs`（06 T13；補 bcm、`post_login_cmd`、console unlock、flood 反分類、detect） |
+| Login FSM 全平台 | `login_fsm.py`（05 §8） | `crates/sw-core/src/login_fsm.rs`（06 T13；補 bcm、`post_login_cmd`、console unlock、flood 反分類、detect）。SC-35（OD-14 #2）：`platform=passthrough` 的 session 一律 `LoginPlan::None`（不登入、不送 ready_probe，含 uboot-template 等有 ready_probe 者），READY 只經 P5 的 30 s 安靜 tick；`ensure_ready` 的 passthrough 分支只作純函式回歸 |
 | Login run 協調與收斂 | `session_manager._probe_existing_bridge`、`_attach_by_id` probe 段、`_attach_by_id_dynamic` detect 層、`_spawn_reboot_recovery`、`_refine_probe_failure`、`_emit_credentials_unresolved_warning` | `crates/sw-core/src/login_run.rs`（新檔，只放收斂函式）＋06 的 `session_core.rs`／`op_runner.rs` |
 | Quiet Gate＋Reconfirm | `SessionRuntime` quiet／reconfirm 方法、`_update_boot_quiet_locked`、`_boot_quiet_blocks_probe`、`_agent_gate_reject_locked`、`service._resolve_session_id` gate 段（05 §1.6、§7） | `crates/sw-core/src/quiet_gate.rs`（06 T13） |
 | Readiness reprobe | `reconcile_readiness`、`_prepare_reprobe_locked`、`_finish_probe_reprobe`、`_reprobe_target_still_valid_locked`、`_bootloader_evidence`（05 §6） | `crates/sw-core/src/reprobe.rs`（新檔） |
@@ -104,7 +104,9 @@
 |---|---|---|
 | SC-03 | execute-time／file gate 回 `AUTOBOOT_QUIET` 時附 `retry_after_s`（quiet：剩餘秒數 1 位小數；pending-only：5.0）；鍵位置照 P1 凍結的 Python 輸出 | 4 |
 | SC-13 | lease 到期 1 s tick 主動處理（P6 實作；本 Phase 的 reprobe tick 與其共用同一 1 s tick 事件） | 5 |
-| SC-26 | Windows event handler：`exec` 走 CreateProcessW＋Job；`shell` 走 `cmd.exe /d /s /c`；逾時 TerminateJobObject；env 白名單另加 `SYSTEMROOT`、`COMSPEC`、`PATHEXT`、`TEMP`、`TMP`、`USERPROFILE` | 14 |
+| SC-26 | Windows event handler：`exec` 走 CreateProcessW＋Job；`shell` 走 `cmd.exe /d /s /c`；逾時 TerminateJobObject；env 白名單另加 `SYSTEMROOT`、`COMSPEC`、`PATHEXT`、`TEMP`、`TMP`、`USERPROFILE`（OD-14 #6 確認原預設） | 14 |
+| SC-34 | `session.attach`／`session.recover` 的 `error_code` 與 `last_error` 分離：未達 READY 回 `SESSION_NOT_READY`＋頂層 `last_error`／`last_error_detail`（OD-14 #1；P5 已實作核心，本 Phase 承接完整 login／reprobe 情境的回應） | 9、17 |
+| SC-35 | `platform=passthrough` 不跑 Login FSM、不送 ready_probe、不 arm boot quiet、不跑 READY reconfirm；ATTACHED 連續 30 s 無 RX 自動轉 READY（OD-14 #2；P5 已實作 tick 與命令路徑核心，本 Phase 負責完整 Login FSM 繞過、quiet gate 排除、self-test／recover 的 Slice 2.3 深度） | 3、4、7、8、9、17 |
 | DF-01 | `event.rule_delete`／`event.reset` 的 `rule_id` 必須符合 `^[a-z0-9][a-z0-9-]{0,63}\.[a-z0-9][a-z0-9-]{0,63}\Z`，否則不碰檔案（delete 回 `deleted:false`、reset 不計數） | 13、16 |
 | DF-08 | `contains` 規則的 `flags` 也驗證（`unsupported regex flag: X`） | 11 |
 | DF-09 | `RuleRegistry.load_all` 把 `ValueError`／`TypeError` 當 `FailedLoad` | 13 |
@@ -133,7 +135,7 @@ ID 選擇：SC-28／SC-29 已由 P6（07 T0 D-11／D-12）占用，本 Phase 取
 |---|---|---|---|
 | `session_auth.rs`（06 T13） | `SessionAuth`、`AuthResolution{reason: &'static str, env_file_path}`、`parse_env_file(&str)`、`resolve_session_auth(p, env, read)`、`credentials_declared_but_unresolved` | 只補 golden 回歸（env_file 解碼失敗、BOM、universal newline、Unicode 空白、警告模板逐字）；`SessionAuth` 的 `Debug` 改為遮蔽 password／console_unlock（新增行為，RED）。不新增 `Secret`／`AuthReason` 型別 | 2 |
 | `login_fsm.rs`（06 T13） | `LoginIo`、`LoginOutcome{Ready, NotReady, Failed}`、`LoginPlan`、`choose_login_plan`（含 `quiet_blocks` → 合成 `PROMPT_UNAVAILABLE`）、`probe_ready`、`ensure_ready`（shell／prpl／passthrough）、`prompt_timeout_error` | `LoginIo` 加 `cancel: &RunCancel`、`class: TxClass`，`tx` 閉包改回 06 T9 `TxReport`（console unlock 的 INFO log 依 GAP-G-01 丟棄，不需 log 介面）；`LoginOutcome` 加 `Aborted(LoginAbort)`、`Raised(String)`；`ensure_ready` 補 bcm、`post_login_cmd`、console unlock、`maybe_reclassify_flood`；新增 `detect_template`、`matches_any_bootloader_prompt`、`console_at_bootloader`、`is_prompt_timeout_error`；移除 `slice21_unsupported_feature` 的呼叫點 | 3 |
-| `quiet_gate.rs`（06 T13） | `QuietState`（arm／clear_quiet／confirm_ready／expire／remaining_s／reconfirm_remaining_s／on_rx_text）、`QuietTransition`、`detect_boot_banner`、`is_reboot_command`、SC-03 `retry_after_s`、DF-02 | 新增 `boot_quiet_blocks_probe`、`agent_gate_active`、`submit_gate_reject`／`execute_gate_reject` 的 golden 位元組相等、`READY_UNCONFIRMED_HINT` 常數；`quiet_rx` golden 回歸。arm 時改呼叫 07 `invalidate_human_input`（不再 `owner_gen++` 作 deferred 失效） | 4 |
+| `quiet_gate.rs`（06 T13） | `QuietState`（arm／clear_quiet／confirm_ready／expire／remaining_s／reconfirm_remaining_s／on_rx_text）、`QuietTransition`、`detect_boot_banner`、`is_reboot_command`、SC-03 `retry_after_s`、DF-02 | 新增 `boot_quiet_blocks_probe`、`agent_gate_active`、`submit_gate_reject`／`execute_gate_reject` 的 golden 位元組相等、`READY_UNCONFIRMED_HINT` 常數；`quiet_rx` golden 回歸。arm 時改呼叫 07 `invalidate_human_input`（不再 `owner_gen++` 作 deferred 失效）。SC-35：`platform == "passthrough"` 的 session 一律不 arm boot-banner quiet、不設 READY reconfirm，`submit_gate_reject`／`execute_gate_reject`／`boot_quiet_blocks_probe` 對 passthrough 恆回不阻擋 | 4 |
 | `tx_writer.rs`（06 T9）／arch §5.4 | `TxPermit`、`FenceState`、`FenceReject`（8 值）、`TxJob`、`TxReport` | `TxPermit.fsm_gen: Option<u64>`（只有 `LoginProbe`／`ReadyReconfirm` 帶值；`SelfTestProbe` 為 `None`、改以 `quiet_active` 擋，R5-F2）、`FenceState.fsm_gen_floor`、`FenceState.auto_probe_blocked`、`FenceReject::StaleFsmGen`；admit 規則見 Task 7 | 7 |
 | `uart_bridge.rs`（06 T10） | `RxShared`、`ReaderCtx`、`spawn_reader` | `RxShared::wait_for_regex_cancellable`＋`RunCancel`；`ReaderCtx.observers: Vec<Arc<dyn RxObserver>>`（WAL append 後依序呼叫，DF-15） | 7、10、16 |
 | `session_core.rs`（06 T11） | `ControlEvent::LoginFinished`、`Effect::{StartLogin, WalMeta, Warn, Notify}`、`begin_stop` | `Effect::CancelLogin`、`StartLogin.kind`、`LoginFinished.report`、`active_login`；reprobe tick；`transport_stall_warned`（`clean_text` 後非空 RX 清除）；login 收斂表；`Effect::CaptureOpen／CaptureClose` 與 `ControlEvent::CaptureOpened／CaptureClosed`；`ForceRecoverPoll` timer | 5、6、7、9、10 |
@@ -208,7 +210,7 @@ ID 選擇：SC-28／SC-29 已由 P6（07 T0 D-11／D-12）占用，本 Phase 取
 - Modify: `docs/rust-refactor/plans/spec-reconciliation.md`（§1.1 增 SC-30、§1.2 增 DF-18、SC-11 列補 Event Engine 細化、§5 統計）
 - Modify: `contracts/behavior_changes.yaml`（`changes` 增 SC-30、DF-18 兩筆，依 §0.5 欄位；遞增 `revision`）
 - Create: `tests/acceptance/breaker/slice_2.3.json`（凍結快照）、`tests/acceptance/breaker/slice_2.3.snapshots.ndjson`（空檔）：以 06 Task 0b `scripts/rust/slice_breaker.py`（不重建）在 `slice_2.3` 集合凍結的同一 commit 凍結斷路器分母與觀測窗口起訖（規格 §12.2、OD-02／OD-13）；Task 19 Phase gate 以 `slice_breaker.py --freeze tests/acceptance/breaker/slice_2.3.json --snapshots …` 判定，觸發即停止擴大部署並退守 Stage 1
-- Modify: `tests/test_contracts_catalog.py`（`test_bc_real_sc_df_ranges`：SC 期望改 `range(1, 32)`（P6 已登記 SC-28／29／31，07 Task 0 下游通知）、DF 改 `range(1, 20)`（DF-19 已由 P0 登記、P1 T20 實作，R5-F2；本 Task 補上 DF-18 後區間連續）；若 P6 尚未合併，本 Task 只在 P6 合併後執行此項）
+- Modify: `tests/test_contracts_catalog.py`（`test_bc_real_sc_df_ranges`：SC 期望改 `({f"SC-{i:02d}" for i in range(1, 32)} | {"SC-34", "SC-35"}) - {"SC-08"}`（P6 已登記 SC-28／29／31，07 Task 0 下游通知；SC-34／SC-35 由 P1-OC 登記、SC-08 依 OD-14 #3 撤回）、DF 改 `range(1, 20)`（DF-19 已由 P0 登記、P1 T20 實作，R5-F2；本 Task 補上 DF-18 後區間連續）；若 P6 尚未合併，本 Task 只在 P6 合併後執行此項）
 - Modify: `tests/acceptance/cases.yaml`、`tests/acceptance/cases.lock.json`（以 `regen_lock.py --add-only` 產生；不得手改鎖檔）
 - Modify: `crates/sw-core/src/{login_fsm,quiet_gate,self_test,capture,session_core,tx_writer,uart_bridge,op_runner}.rs`（只追加新公開項，既有函式本體不動）
 - Create: `crates/sw-core/src/{login_run,reprobe,transport_stall,recover,mono}.rs`
@@ -320,7 +322,7 @@ def test_slice23_cases_frozen_before_implementation():
 **Test author model:** agy-gemini-3.8-flash-high　**Implementer model:** haiku-xhigh
 **Changelog fragment:** `changelog.d/rust-p7-goldens.md`（`### Added`：Slice 2.3 golden 產生器與 `contracts/golden/p7/`）
 **BLOCKED-OWNER:** 無（golden 以 Python 純函式與記憶體 fake 產生，不需實機）。
-**前置條件：** P1 已完成 DF-01、DF-08、DF-09、DF-15、SC-03 的 Python 修正（golden 必須取自修正後基線）。
+**前置條件：** P1 已完成 DF-01、DF-08、DF-09、DF-15、SC-03 的 Python 修正，且 P1-OC（`02b-stage0-owner-confirmations.md`）已完成 SC-34、SC-35 的 Python 修正（golden 必須取自修正後基線；`self_test_responses`、`recover_responses`、`gate_responses`、`login_fsm_scenarios` 含 SC-34 的 `last_error`／`last_error_detail` 欄位與 SC-35 的 passthrough 列）。
 
 **Files:**
 - Create: `scripts/rust/capture_p7_goldens.py`（可 import `sw_core`；這是基線擷取工具，不是黑箱測試）
@@ -405,8 +407,8 @@ def test_event_engine_order_golden_distinguishes_start_and_rule_set():
 | `event_log_tail` | 寫入事件序列後 `tail(rule_id, selector, since_ts, n)`：`n=None/0/3/-2/True`、`since_ts` 邊界、壞 JSON 行略過 |
 | `registry_load` | 目錄內容（檔名→bytes）→ `load_all()` 的 `rules`（rule_id 清單）與 `failed`（`[basename, reason]`），含 JSONDecodeError 各訊息、`schema_version` 錯、DF-09 後 `ValueError`／`TypeError`、非法 UTF-8 |
 | `counter_file` | `CounterStore.save` 後檔案位元組（b64）與 `load` 對壞檔／缺檔回 `Counter()` |
-| `self_test_responses` | 以 `SessionManager`＋stub bridge／devices 驅動 `self_test` 每個分類分支（含 `HUMAN_INTERACTIVE_ACTIVE`、RELEASED 有／無 holder、passthrough fallback suggest、nonce probe 三結果）→ `{"response": json.dumps(不排序)}`，保留完整 key 順序 |
-| `recover_responses` | 同法驅動 `recover_session`：RELEASED、FLASHING_BUSY、REATTACH、SESSION_NOT_READY、ATTACHED REPROBE 成功／失敗（含 bootloader 分類）、ATTACHED＋force 逾時（`FORCE_RECOVER_TIMEOUT`）、READY CTRL_C 成功、READY 兩鍵失敗＋自動 force 成功／失敗（`PROMPT_TIMEOUT`、`recovery_action:"NONE"`）→ `{"response","virtual_elapsed_s"}`（patch `time.sleep`） |
+| `self_test_responses` | 以 `SessionManager`＋stub bridge／devices 驅動 `self_test` 每個分類分支（含 `HUMAN_INTERACTIVE_ACTIVE`、RELEASED 有／無 holder、passthrough fallback suggest、SC-35 passthrough ATTACHED（含 `passthrough_ready_in_s`）與 passthrough READY（`PASSTHROUGH`／`none`、零 TX）、nonce probe 三結果）→ `{"response": json.dumps(不排序)}`，保留完整 key 順序 |
+| `recover_responses` | 同法驅動 `recover_session`：RELEASED、FLASHING_BUSY、REATTACH、SESSION_NOT_READY、ATTACHED REPROBE 成功／失敗（含 bootloader 分類；SC-34 `error_code:"SESSION_NOT_READY"`＋`last_error`／`last_error_detail`）、SC-35 passthrough ATTACHED REPROBE（零 TX）、ATTACHED＋force 逾時（`FORCE_RECOVER_TIMEOUT`）、READY CTRL_C 成功、READY 兩鍵失敗＋自動 force 成功／失敗（`PROMPT_TIMEOUT`、`recovery_action:"NONE"`）→ `{"response","virtual_elapsed_s"}`（patch `time.sleep`） |
 | `log_responses` | `log_start`（新建／already_active／LOG_OPEN_FAILED）、`log_stop`（有／無 capture）、`log_status`（有／無）→ `{"response"}`，`capture_id`／時間欄位以固定 patch 值 |
 | `event_engine_order` | 以 stub BridgeQueries 驅動 `EventEngine.start()`、`rule_set()`、`reload()` 後讀 events.ndjson 的 `type` 序列（`rule_set` 路徑為 `com_enabled` 在 `rule_loaded` 之前；`start` 為 `rule_loaded` 在前） → `{"id","types","triggered_by"}` |
 
@@ -618,7 +620,8 @@ fn console_unlock_is_not_blocked_by_cfe_banner_history() {
 
 | 測試名 | 精確斷言 |
 |---|---|
-| `prompt_timeout_error_by_platform`（回歸） | `"bcm"`→`BCM_PROMPT_TIMEOUT`、`"shell"`→`SHELL_PROMPT_TIMEOUT`、`"prpl"`／`"passthrough"`／`""` 皆 `PRPL_PROMPT_TIMEOUT` |
+| `prompt_timeout_error_by_platform`（回歸） | `"bcm"`→`BCM_PROMPT_TIMEOUT`、`"shell"`→`SHELL_PROMPT_TIMEOUT`、`"prpl"`／`"passthrough"`／`""` 皆 `PRPL_PROMPT_TIMEOUT`（純函式回歸；SC-35 起 passthrough session 不進 Login FSM，`"passthrough"` 列只鎖函式映射，不代表 passthrough 會產生此 last_error） |
+| `choose_login_plan_passthrough_is_none`（新增，SC-35） | 以 `platform="passthrough"` 搭配四種 profile 組合（`ready_probe` 為 `""`／`"echo __READY__${nonce}"`、`login_regex` 為 `"$^"`／`"(?mi)^login:\\s*$"`、有／無 `user_env`＋`pass_env`、有／無 `console_unlock_env`）呼叫 `choose_login_plan` → 一律 `LoginPlan::None`；`quiet_blocks=true` 時同樣 `LoginPlan::None`（**不**合成 `PROMPT_UNAVAILABLE`）；`rig.io()` 的 `write_calls()==0` |
 | `is_prompt_timeout_error_suffix` | `err.endswith("_PROMPT_TIMEOUT")` 語意（`login_fsm.py:57`）：`BCM_PROMPT_TIMEOUT`、`SHELL_PROMPT_TIMEOUT`、`LOGIN_PROMPT_TIMEOUT`→true；`PROMPT_TIMEOUT`、`PROMPT_UNAVAILABLE`→false；`maybe_reclassify_flood` 可反分類集合＝`_FLOOD_MASKABLE_ERRORS` ∪ 後綴命中者 |
 | `detect_boot_banner_cases`（回歸） | `"U-Boot 2024.04"`→true；`"u-boot"`→false；`"CFE version 1.0"`→true；`"CFE version"`→false；`"Hit any key to stop autoboot:  3"`→true；`""`→false |
 | `matches_login_or_password_uses_cleaned_and_raw` | `"\x1b[1m(none) login:\x1b[0m"` 對 `(?mi)^.*login:\s*$` → true；無效 regex `"("` 略過、回 false（`matches_*` 有 try／except） |
@@ -747,6 +750,9 @@ fn console_unlock_profile_is_not_probe_blocked() {
 | `stale_login_finished_is_ignored` | `fsm_gen` 不符的 `LoginFinished{Ready}` → 狀態不變、不清 pending（§5.3「過期 timer／ownership 事件」） |
 | `execute_time_quiet_has_retry_after_s`（回歸） | quiet 剩 37.26 s → `retry_after_s==37.3`；pending-only → `5.0`；failed → `READY_UNCONFIRMED`、無 `retry_after_s`、`recommended_action=="self_test"`（SC-03） |
 | `rpc_human_source_is_treated_as_agent`（回歸） | `source="human:x"` 經 RPC 仍被 gate（DF-02） |
+| `passthrough_banner_never_arms_quiet`（新增，SC-35） | `platform="passthrough"`（uboot-template 與 others-template 各一）在 ATTACHED 與 READY 下各收一個含 `U-Boot 2024.04`、`Hit any key to stop autoboot:  3` 的 chunk → `fsm_gen`、`input_epoch` 不變；`public()["boot_quiet_remaining_s"]` 為 null、`ready_reconfirm_pending==false`；fence `quiet_active==false`、`auto_probe_blocked==false`；Effects 無 `reason=boot_banner` 的 `Log` 行 |
+| `passthrough_ready_never_gated`（新增，SC-35） | passthrough READY（經 30 s 安靜轉入）收到上列 banner 後立即 `Submit("ls")` → 進 Arbiter（回 `cmd_id`），**不**回 `AUTOBOOT_QUIET`／`READY_UNCONFIRMED`；`session_list` 輸出 `ready_reconfirm_failed:false`、`ready_reconfirm_remaining_s:null` |
+| `passthrough_banner_restarts_quiet_window`（新增，SC-35） | passthrough ATTACHED 第 29 s 收到 banner chunk → 不 arm quiet（同上），但安靜視窗自該 chunk 起重算：之後第 29 s 的 `Tick` 仍 ATTACHED、第 30 s 的 `Tick` 轉 READY |
 
 - [ ] **Step 2：執行**：`cargo test -p sw-core --features test-fakes --test quiet_gate_p7 --test session_core_quiet_p7` → 新增列 RED；標「回歸」者 PASS（FAIL 記 P5 缺陷）。
 - [ ] **Step 3：實作**：照 05 §1.6 與 `_update_boot_quiet_locked`（`session_manager.py:2327-2368`）核對 06 本體；`QuietTransition::Armed` → 在同一次 `Fence::with` 內設 `quiet_active=true`、`auto_probe_blocked=boot_quiet_blocks_probe(..)`、`fsm_gen+=1`，且 `boot_quiet_blocks_probe` 為真時 `fence.fsm_gen_floor = fsm_gen`、清 `active_login`（線性化點，Review Focus 1；console unlock 只遞增 `fsm_gen`、不推 floor），鎖外再 `invalidate_human_input(BootBanner|QuietRearm, fx)`、對進行中且被擋的 login run 發 `Effect::CancelLogin{epoch, fsm_gen: 舊值}`（Task 7）；`Cleared` → 同鎖清 `quiet_active`、`auto_probe_blocked`，**不**動 `fsm_gen`。`submit_gate_reject`／`execute_gate_reject` 依 `gate_responses` golden 的 key 順序以 `pydict!` 建構。
@@ -836,6 +842,7 @@ fn backoff_schedule_2_4_8_15_15_until_exhausted_at_10() {
 | `reprobe_eligibility_attached` | ATTACHED：`PROMPT_UNAVAILABLE`、`PROMPT_TIMEOUT`、`SHELL_PROMPT_TIMEOUT`、`READY_PROMPT_TIMEOUT`、`RX_FLOOD`、`TRANSPORT_STALL` → true；`LOGIN_REQUIRED`、`READY_NONCE_TIMEOUT`、`BOOTLOADER_STUCK`、`CREDENTIALS_UNRESOLVED`、None → false |
 | `reprobe_eligibility_detached` | DETACHED 同上但 `PROMPT_UNAVAILABLE` → false；READY／ATTACHING → 一律 false |
 | `credentials_unresolved_never_reprobes` | `last_error=CREDENTIALS_UNRESOLVED`、其他條件皆滿足 → `None` 且 attempts 不變 |
+| `passthrough_never_reprobes`（新增，SC-35） | `platform="passthrough"`（uboot-template，有 `ready_probe`）ATTACHED、`last_error=PROMPT_UNAVAILABLE`、RX 已安靜 ≥3 s、其他條件皆滿足 → `prepare` 回 `None`、attempts 不變；READY＋（理論上的）pending → 同樣 `None`；passthrough 的 READY 只由 P5 安靜 tick 決定 |
 | `quiet_blocks_without_counting_attempt` | quiet active（無 console_unlock）→ `None`、attempts 不變；有 `console_unlock_env` → 不被 quiet 擋（`boot_quiet_blocks_probe` 為假） |
 | `human_active_blocks_reprobe` | P6 lease 顯示 human active → `prepare` 回 `None`；`target_still_valid` 回 false |
 | `rx_not_idle_for_3s` | `now-last_rx_mono=2.99` → None；`3.0` → Probe |
@@ -1228,7 +1235,9 @@ fn banner_during_self_test_suspend_does_not_replay_stale_human_input() {
 | `st_released_holder_unknown`（新增） | RELEASED、`[]`、`holder_unknown=true` | `external_holder:"none"`、`reclaimable:false`、`wait_external_flash`（BC-04） |
 | `st_released_with_pid`（回歸） | `[123]` | `[123]`、`wait_external_flash` |
 | `st_human_strict_key_order`（新增） | strict＋human lease | `HUMAN_INTERACTIVE_ACTIVE`／`wait_or_detach_console`；`interactive_id` 位於 `session` 之前（`session_manager.py:4349-4356`） |
-| `st_passthrough_fallback_suggest`（新增） | profile_source fallback、suggested `prpl-template` | `pin_profile`＋`suggested_profile`＋`hint` 逐字（02 §7.5） |
+| `st_passthrough_fallback_suggest`（新增） | profile_source fallback、suggested `prpl-template` | `pin_profile`＋`suggested_profile`＋`hint` 逐字（02 §7.5）；另含 `passthrough_ready_in_s`（SC-35，數值為剩餘安靜秒數 1 位小數、≥0） |
+| `st_passthrough_attached_ready_in`（新增，SC-35） | others-template ATTACHED、自進入 ATTACHED 起已安靜 12.34 s | `classification:"PASSTHROUGH"`、`recommended_action:"console_attach"`、`passthrough_ready_in_s:17.7`；`write_calls()==0` |
+| `st_passthrough_ready_zero_tx`（新增，SC-35） | passthrough READY（uboot-template 與 others-template 各一；uboot-template 有 `ready_probe`） | `classification:"PASSTHROUGH"`、`recommended_action:"none"`；不送 nonce probe：`write_calls()==0`、無 `system:self_test` TX WAL；不呼叫 `confirm_ready`；state 維持 READY |
 | `st_rx_flood_attached`（新增） | ATTACHED、rx 20000 | `RX_FLOOD`／`wait`＋`rx_bytes_last_10s:20000` |
 | `st_attached_family_extra_keys`（新增） | ATTACHED 族 | `attached_real_path`,`current_real_path`,`attached_vtty`,`bridge_generation` 位置照 golden |
 | `st_autoboot_quiet_zero_tx`（回歸） | READY＋quiet_active | `AUTOBOOT_QUIET`／`wait`；`write_calls()==0` |
@@ -1281,12 +1290,12 @@ pub enum RecoverPlan {
 /// → ATTACHED（force→Force／否則 Reprobe）→ 非 READY（force→Force／否則 SESSION_NOT_READY）→ READY → ReadyKeys
 pub fn plan_recover(state: &str, has_bridge: bool, draining: bool, device_present: bool, released: bool, flash_busy: bool, req: &RecoverRequest) -> RecoverPlan;
 pub fn plan_resets_progress(plan: &RecoverPlan) -> bool;   // RELEASED／FLASHING_BUSY 的 Reply 為 false，其餘 true
-pub fn reprobe_reply(recovered: bool, last_error: Option<&str>, bootloader_match: Option<&str>, session: PyDict) -> PyDict;
+pub fn reprobe_reply(recovered: bool, last_error: Option<&str>, last_error_detail: Option<&str>, bootloader_match: Option<&str>, session: PyDict) -> PyDict;   // SC-34：last_error／detail 取自同一 session 快照
 pub fn force_reply(recovered: bool, session: Option<PyDict>) -> PyDict;
 // 常數取自 sw_proto::constants::{FORCE_RECOVER_POLLS, FORCE_RECOVER_POLL_S}（Task 0 新增），不在業務碼定義
 ```
 
-規則：`reprobe_reply` 未恢復時 `ok:true`＋`error_code = last_error or "SESSION_NOT_READY"`（`LastErrorPassthrough`），bootloader 證據或 `BOOTLOADER_STUCK` 再附 `classification:"BOOTLOADER"`、`recommended_action:"recover_interactive"`、命中時 `matched_prompt`；reprobe 失敗且 force → 轉 Force。Force 失敗 `{"ok":false,"error_code":"FORCE_RECOVER_TIMEOUT","action":"FORCE_CLEAR_REATTACH","recovered":false,"session":<dict 或 {}>}`（約 10 s 虛擬時間）。READY 路徑（不看 `force`）：CTRL_C／CTRL_D 各 `min(timeout_s, 2.0)`；成功 `PROMPT_TIMEOUT_RECOVERED`；兩鍵失敗 → `ATTACHED` → 自動 Force：成功 `{"ok":true,"error_code":"PROMPT_TIMEOUT_FORCE_RECOVERED","partial":true,"recovery_action":"FORCE_CLEAR_REATTACH","session":…}`，失敗 `{"ok":false,"error_code":"PROMPT_TIMEOUT","partial":true,"recovery_action":"NONE"}`（約 2×2 s＋10 s＝14 s 虛擬時間，`session_manager.py:3905-3929`）。force 的 clear 走 06 Two-Phase Drain；drain 逾時時仍以輪詢結果回覆，不冒用 `FORCE_RECOVER_TIMEOUT` 作內部事件名（§5.2.5）。重複 recover 加入同一 StopOp waiters（06 去重）。
+規則：`reprobe_reply` 未恢復時依 SC-34（OD-14 #1）回 `{"ok":true,"recovering":false,"action":"REPROBE","recovered":false,"session":…,"error_code":"SESSION_NOT_READY","last_error":<str|null>,"last_error_detail":<str|null>}`（`error_code` 固定，不再透傳 last_error；`LastErrorPassthrough` 已刪除），bootloader 證據或 `last_error == "BOOTLOADER_STUCK"` 再附 `classification:"BOOTLOADER"`、`recommended_action:"recover_interactive"`、命中時 `matched_prompt`；reprobe 失敗且 force → 轉 Force。Force 失敗 `{"ok":false,"error_code":"FORCE_RECOVER_TIMEOUT","action":"FORCE_CLEAR_REATTACH","recovered":false,"session":<dict 或 {}>}`（約 10 s 虛擬時間）。READY 路徑（不看 `force`）：CTRL_C／CTRL_D 各 `min(timeout_s, 2.0)`；成功 `PROMPT_TIMEOUT_RECOVERED`；兩鍵失敗 → `ATTACHED` → 自動 Force：成功 `{"ok":true,"error_code":"PROMPT_TIMEOUT_FORCE_RECOVERED","partial":true,"recovery_action":"FORCE_CLEAR_REATTACH","session":…}`，失敗 `{"ok":false,"error_code":"PROMPT_TIMEOUT","partial":true,"recovery_action":"NONE"}`（約 2×2 s＋10 s＝14 s 虛擬時間，`session_manager.py:3905-3929`）。force 的 clear 走 06 Two-Phase Drain；drain 逾時時仍以輪詢結果回覆，不冒用 `FORCE_RECOVER_TIMEOUT` 作內部事件名（§5.2.5）。重複 recover 加入同一 StopOp waiters（06 去重）。
 
 - [ ] **Step 1：寫失敗測試**
 
@@ -1338,12 +1347,15 @@ fn recover_during_drain_does_not_open_before_receipt() {
 }
 
 #[test]
-fn reprobe_unrecovered_passes_last_error_through_with_ok_true() {
+fn reprobe_unrecovered_reports_last_error_field_with_ok_true() {   // SC-34（OD-14 #1）
     let mut h = core_attached_with_error("TRANSPORT_STALL");
     let reply = h.rpc_recover(RecoverRequest { timeout_s: 2.0, force: false });
     h.complete_login(sw_core::login_fsm::LoginOutcome::NotReady("TRANSPORT_STALL".into()));
     let r = reply.take().unwrap();
-    assert_eq!((r.bool("ok"), r.str("action"), r.bool("recovered"), r.str("error_code")), (true, "REPROBE", false, "TRANSPORT_STALL"));
+    assert_eq!((r.bool("ok"), r.str("action"), r.bool("recovered"), r.str("error_code")), (true, "REPROBE", false, "SESSION_NOT_READY"));
+    assert_eq!(r.keys(), ["ok", "recovering", "action", "recovered", "session", "error_code", "last_error", "last_error_detail"]);
+    assert_eq!(r.str("last_error"), "TRANSPORT_STALL");
+    assert_eq!(r["last_error_detail"], r["session"]["last_error_detail"]);   // transport_stall_hint 文字，與 session 快照同值
 }
 ```
 
@@ -1354,7 +1366,11 @@ fn reprobe_unrecovered_passes_last_error_through_with_ok_true() {
 | `released_recover_does_not_reset_credentials_warned` | RELEASED、`credentials_warned=true` → 回 `{"ok":true,"released":true,…}` 且 `credentials_warned` 仍 true、reprobe 進度不變 |
 | `flashing_busy_does_not_reset_progress` | FLASHING → `FLASHING_BUSY`＋`selector`＋`session`；`reprobe_attempts` 不變 |
 | `recover_no_bridge_device_absent` | `{"ok":false,"error_code":"SESSION_NOT_READY","session":…}` |
-| `recover_reprobe_bootloader_adds_classification` | tail `=> ` → `classification:"BOOTLOADER"`、`matched_prompt:"^=> $"` |
+| `recover_reprobe_bootloader_adds_classification` | tail `=> ` → `error_code:"SESSION_NOT_READY"`、`last_error:"BOOTLOADER_STUCK"`、`classification:"BOOTLOADER"`、`matched_prompt:"^=> $"`（SC-34：BOOTLOADER 判定看 `last_error`，不看 `error_code`） |
+| `recover_reprobe_unrecovered_null_last_error`（新增，SC-34） | ATTACHED、`last_error=None`、reprobe 未達 READY → `error_code:"SESSION_NOT_READY"`、`last_error:null`、`last_error_detail:null` |
+| `recover_passthrough_attached_never_probes`（新增，SC-35） | passthrough（uboot-template，有 `ready_probe`）ATTACHED、非 force → `{"ok":true,"recovering":false,"action":"REPROBE","recovered":false,"session":…,"error_code":"SESSION_NOT_READY","last_error":null,"last_error_detail":null}`；`write_calls()==0`；不建立 `ExistingBridgeProbe` op |
+| `recover_passthrough_ready_never_sends_keys`（新增，SC-35） | passthrough READY、非 force → `recovered:true`（state 維持 READY）、不送 `\x03`／`\x04`、`write_calls()==0` |
+| `recover_passthrough_force_times_out`（新增，SC-35） | passthrough ATTACHED＋force → 走 Force（clear＋reattach）；10 次輪詢內未滿 30 s 安靜 → `FORCE_RECOVER_TIMEOUT`（形狀同 `attached_force_times_out_after_ten_polls_with_exact_shape`）；reattach 後 ATTACHED、零 TX |
 | `recover_reprobe_failure_with_force_goes_to_force` | ATTACHED reprobe 失敗＋force → Force 回覆形狀 |
 | `recover_resets_credentials_warned` | 先 CREDENTIALS_UNRESOLVED 已告警 → recover 後再遇終態會再告警一次 |
 | `recover_non_ready_non_force` | ATTACHING → `SESSION_NOT_READY`＋session |
@@ -2166,9 +2182,11 @@ impl sw_core::event_engine::BridgeQueries for SessionManager { /* known_coms, pr
 | `self_test_bad_timeout_before_selector_is_exception`（回歸） | `{"timeout_s":"x"}` → `Err(PyErr)` |
 | `self_test_not_found_has_lease_ctx_and_command_capable_false`（回歸） | `SESSION_NOT_FOUND`＋`selector`＋4 個 lease 鍵＋`command_capable:false` |
 | `recover_force_string_false_is_true` | `force:"false"` → 走 force 路徑（`bool("false")` 為真） |
-| `attach_credentials_passthrough` | ATTACHED＋CREDENTIALS_UNRESOLVED、probe 再失敗 → `{"ok":false,"error_code":"CREDENTIALS_UNRESOLVED","session":…}`（LastErrorPassthrough） |
+| `attach_credentials_unresolved_last_error_field`（SC-34，OD-14 #1） | ATTACHED＋CREDENTIALS_UNRESOLVED、probe 再失敗 → wire 去掉 `version` 後等於 `{"ok":false,"error_code":"SESSION_NOT_READY","last_error":"CREDENTIALS_UNRESOLVED","last_error_detail":null,"session":…}`，鍵序 `ok, error_code, last_error, last_error_detail, session`；`error_code` 不得為 `CREDENTIALS_UNRESOLVED` |
 | `attach_resets_credentials_warned` | attach 後終態再告警一次（WAL META 計數 +1） |
-| `attach_state_result_mapping` | FLASHING → `FLASHING_BUSY`；RECOVERING → `SESSION_RECOVERING`；last_error None → `NOT_READY` |
+| `attach_state_result_mapping` | FLASHING → `FLASHING_BUSY`；RECOVERING → `SESSION_RECOVERING`；last_error `"READY_NONCE_TIMEOUT"`（detail 為 rx tail）→ `SESSION_NOT_READY`＋`last_error:"READY_NONCE_TIMEOUT"`＋`last_error_detail` 等於 `session.last_error_detail`；last_error None → `SESSION_NOT_READY`＋`last_error:null`＋`last_error_detail:null`（不再回 `NOT_READY`，SC-34） |
+| `attach_human_lease_branch_last_error_field`（新增，SC-34） | ATTACHED＋human lease＋`last_error:"PROMPT_UNAVAILABLE"` → 不 probe（`write_calls()==0`）、`{"ok":false,"error_code":"SESSION_NOT_READY","last_error":"PROMPT_UNAVAILABLE","last_error_detail":null,"session":…}` |
+| `attach_passthrough_attached_ok_no_probe`（新增，SC-35） | passthrough（uboot-template，有 `ready_probe`）ATTACHED → `{"ok":true,"session":…}`，`write_calls()==0`，state 仍 ATTACHED |
 | `log_rpcs_shapes` | 與 `log_responses` golden 一致，且 `log_status` 在 `RETRYABLE_READONLY_METHODS` 內 |
 | `session_public_fields_p7` | `session.get_state` 含 `boot_quiet_remaining_s`、`ready_reconfirm_pending`、`ready_reconfirm_failed`、`ready_reconfirm_remaining_s`、`last_error_detail`、`rx_bytes_last_10s`、`last_rx_age_s`、`last_tx_age_s`（§9.4）、`reprobe_attempts`、`next_reprobe_at`（monotonic 秒原值，2.3 起為實值）、`reprobe_exhausted`，位置照 02 §6.1 |
 
@@ -2284,8 +2302,10 @@ def test_creds_file_fixed_does_not_auto_probe_until_attach(p7, tmp_path):
 
 | 檔案／測試名 | 情境 | 精確斷言（Python 基線與 Rust 皆須通過；SC-30 案例只對 Rust） |
 |---|---|---|
-| `test_p7_login.py::test_platform_matrix[shell|prpl|passthrough_uboot|bcm]` | 各平台標準登入（bcm：`login_steps` Login→Password→`CM> `、`commands.overrides.sh`） | 進 READY；`last_error` null；WAL TX 不含密碼 bytes；bcm 之後 `cmd submit` 成功 |
-| `test_p7_login.py::test_passthrough_others_stays_attached` | others-template | 30 s 內維持 ATTACHED、`last_error` null、零 TX |
+| `test_p7_login.py::test_platform_matrix[shell|prpl|bcm]` | 各平台標準登入（bcm：`login_steps` Login→Password→`CM> `、`commands.overrides.sh`） | 進 READY；`last_error` null；WAL TX 不含密碼 bytes；bcm 之後 `cmd submit` 成功 |
+| `test_p7_login.py::test_passthrough_uboot_quiet_ready_no_login`（SC-35） | passthrough_uboot（有 `ready_probe`、FakeTarget 停在 `=> ` 後不再輸出） | 不跑登入、不送 ready_probe：首個 `cmd submit` 之前 target 收到 0 byte；進入 ATTACHED 後 30～32 s 內轉 READY、`last_error` null；之後 `cmd submit --cmd version` 依 prompt `=> ` 完成（`ok:true`、`partial:false`） |
+| `test_p7_login.py::test_passthrough_others_quiet_ready`（SC-35） | others-template；FakeTarget 先於第 10 s 輸出一行雜訊再靜默 | 第 10 s 前後仍 ATTACHED（RX 重新起算安靜視窗）；自該行起 30～32 s 內轉 READY；全程 `last_error` null、target 收到 0 byte |
+| `test_p7_login.py::test_passthrough_banner_no_quiet_gate`（SC-35） | passthrough READY 後 FakeTarget 輸出 `U-Boot 2024.04`／`Hit any key to stop autoboot:  3` | `session list` 的 `boot_quiet_remaining_s` 為 null、`ready_reconfirm_pending:false`；state 維持 READY；立即 `cmd submit` 不回 `AUTOBOOT_QUIET`（進 Arbiter 並送出 bytes） |
 | `test_p7_login.py::test_creds_fixed_then_attach_ready` | 補 env_file 後 `session attach` | READY；WAL META `credentials_unresolved` 共 1 筆（修正前那筆） |
 | `test_p7_login.py::test_console_unlock_smart4r_like` | `console_lock` secret、開機先輸出 `CFE version ` banner | READY（banner 不中止 unlock，SC-30 例外）；secret 不在 WAL；INFO log 不出現在 stderr |
 | `test_p7_quiet_reconfirm.py::test_spontaneous_reboot_gates_agent` | READY 後 `boot()` 輸出 U-Boot 倒數 | `cmd submit` → `AUTOBOOT_QUIET`＋`retry_after_s` 浮點；倒數期間 target 收到 0 byte |
@@ -2293,7 +2313,8 @@ def test_creds_file_fixed_does_not_auto_probe_until_attach(p7, tmp_path):
 | `test_p7_quiet_reconfirm.py::test_ready_bootloader_tail_terminal_d1` | READY 後 `boot()` 輸出 banner 並停在 `=> `（常數不可由 env 調整，quiet 180 s 後才評估） | 等待 ≤ 180 s＋2 s：`session list` 顯示 `ready_reconfirm_failed:true`、state 仍 `READY`、`last_error` 為 null；`cmd submit` → `READY_UNCONFIRMED`、`recommended_action:"self_test"`、無 `retry_after_s`；banner 之後 target 收到 0 byte（D1 不對 U-Boot 送 probe）。標 `slow`（> 180 s），屬必要案例、不得 SKIP；快速時間邊界由 Task 5 `ready_bootloader_tail_d1_keeps_last_error_null`（FakeClock）覆蓋 |
 | `test_p7_quiet_reconfirm.py::test_attached_bootloader_probe_sets_stuck` | ATTACHED（無 READY 歷史）、tail 停在 `=> `、quiet 已過期或從未 arm、手動 `session recover` | 回 `classification:"BOOTLOADER"`、`matched_prompt:"^=> $"`；之後自動 reprobe 失敗一次 → `last_error:"BOOTLOADER_STUCK"`、`reprobe_exhausted:true` |
 | `test_p7_quiet_reconfirm.py::test_rust_quiet_mid_login_aborts_sc30`（case_id `sc30-quiet-mid-login-aborts`） | attach 登入途中輸出 banner | Rust：banner 之後 target 收到 0 byte、`ATTACHED`＋`PROMPT_UNAVAILABLE`（`is_rust()` 為假時 `pytest.skip("SC-30 Rust-only")`，屬 cases.yaml 標註的平台限定、非執行時 SKIP 取綠） |
-| `test_p7_selftest_recover.py::test_selftest_classifications` | READY、ATTACHED bootloader、flood、passthrough、released | `classification` 分別 `OK`、`BOOTLOADER`、`RX_FLOOD`、`PASSTHROUGH`、`RELEASED` 與對應 `recommended_action` |
+| `test_p7_selftest_recover.py::test_selftest_classifications` | READY、ATTACHED bootloader、flood、passthrough ATTACHED、passthrough READY、released | `classification` 分別 `OK`、`BOOTLOADER`、`RX_FLOOD`、`PASSTHROUGH`、`PASSTHROUGH`、`RELEASED` 與對應 `recommended_action`（passthrough ATTACHED 為 `console_attach` 且帶 `passthrough_ready_in_s`；passthrough READY 為 `none`，self-test 期間 target 收到 0 byte，SC-35） |
+| `test_p7_selftest_recover.py::test_attach_recover_last_error_field`（SC-34，case_id `sc34-attach-recover-last-error-field`） | ATTACHED＋`CREDENTIALS_UNRESOLVED`；再以 `READY_NONCE_TIMEOUT` 情境各呼叫 `session attach`、`session recover` | attach：`ok:false`、`error_code:"SESSION_NOT_READY"`、`last_error` 等於 `session.last_error`；recover：`ok:true`、`action:"REPROBE"`、`recovered:false`、`error_code:"SESSION_NOT_READY"`、`last_error` 同值；兩者皆有 `last_error_detail` 鍵且等於 `session.last_error_detail`；CLI exit code 與 Python 基線相同 |
 | `test_p7_selftest_recover.py::test_recover_force_timeout_attached` | 前置：ATTACHED、target 靜默；`session recover --force` | `FORCE_RECOVER_TIMEOUT`、`action:"FORCE_CLEAR_REATTACH"`，耗時 10～13 s |
 | `test_p7_selftest_recover.py::test_recover_force_on_ready_runs_keys_first` | 前置：READY、target 靜默；`session recover --force` | `{"ok":false,"error_code":"PROMPT_TIMEOUT","partial":true,"recovery_action":"NONE"}`，耗時 14～17 s；target 依序收到 `\x03`、`\x04` |
 | `test_p7_selftest_recover.py::test_recover_ready_ctrl_c` | 命令 hang、CTRL_C 後 prompt | `PROMPT_TIMEOUT_RECOVERED`、`recovery_action:"CTRL_C"` |

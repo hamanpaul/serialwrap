@@ -189,3 +189,24 @@
 4. `live_daemon` 的 Windows `QueryFullProcessImageNameW` 路徑、`entry_dir_check` 對真實 Windows 安裝的行為，以及 systemd drop-in 在 `systemd-system` 的實機驗證，仍需擁有者 bench（OD-05／OD-08、`cap_supervisor_runtime`）。
 5. `contracts/golden/selftest_refused.json` 的四個拒絕碼由 P1 T20 以 Python 實跑產生；若 T05／T06／T07 對映日後調整，P5 golden 須同步重產。
 6. `update` 與 `supervision-mode set` 同時執行時兩者都會 hold／release 同一監管項，`supervision-mode set` 未持 `install_lock`；本輪未處理，建議後續評估是否改為共用 `install_lock`。
+
+## OD-14 擁有者裁決同步（2026-10-16）
+
+依 `owner-decisions-2026-10-15.md` OD-14（調和表 §3 擁有者確認清單 #1～#7）同步計畫。擁有者相容原則：外部指令格式（CLI 子命令、參數、RPC method 名稱）只能新增不能修改；狀態與回應欄位內容可調整。新登記 **SC-34**（#1）、**SC-35**（#2）；**SC-08 撤回**（#3，編號不重用）；#4 修訂 SC-04（新錯誤碼 `DRAIN_STALLED`，不另開 SC）；#5～#7（DF-02、SC-26、SC-27）確認原預設。`02-stage0-python-bc.md`、`contracts/`、`sw_core/`、`tests/` 本次未修改（P1 工作流進行中）；Python 與契約的實際修改由新計畫 P1-OC 承接。`01-stage0-contracts.md`（P0，已完成）內的 `last_error_passthrough`／`pending_default`／`owner_item ∈ 1..7` 敘述保留為歷史紀錄，由 P1-OC T1／T2 取代。
+
+| 檔案 | 變更 |
+|---|---|
+| `spec-reconciliation.md` | 檔頭與 needs-owner 說明加 OD-14；§1.1 SC-04 改 `DRAIN_STALLED`、SC-08 標撤回、SC-26／27 標 OD-14 確認、新增 SC-34／SC-35 列；§1.2 DF-02 標確認；§2 RPC-D-02／ERR-7.2-b／ERR-7.3-1／SES-16.5-02 改 SPEC SC-34，SES-16.4-03 改 SPEC SC-35，RPC-D-05 改 KEEP，SES-16.3a 註 `DRAIN_STALLED`，SES-16.6-01 註 SC-35，#5～#7 列標確認；§3 改為「已裁決 OD-14」表（原預設、裁決、登記與承接）；§5 統計重算（KEEP 148、SPEC 35，合計 299）與登記數說明 |
+| `02b-stage0-owner-confirmations.md`（新） | P1-OC 計畫：T1 契約簿記、T2 SC-34、T3 SC-08 撤回（0660）、T4 `DRAIN_STALLED`、T5 SC-35 狀態機、T6 SC-35 命令路徑、T7 文件／SKILL／#155／docker 與 Windows 原生驗證；於 P1 完成後執行，先讀 P1 的 SC-04／SC-08／DF-02 commit 定位程式 |
+| `00-master-plan.md` | Goal 改 OD-01～OD-15；Global Constraints 加 `DRAIN_STALLED`、SC-34／35、0660 與相容原則；§1 Phase 表加 P1-OC；P1-T15 註 SC-08 撤回；P3 前置加 P1-OC（Task 8 前）、P5 前置加 P1-OC；Cross-plan index 新增 P1-OC 段；SC 編號交接列改為新範圍鏈與 owner_item 放寬 |
+| `rust-architecture.md` | §3.2 移除 `RpcErrorCode::LastErrorPassthrough`（SC-34 欄位）；§4.6 `ListenOptions` 改 0o660／無目錄模式；§5.4 TxClass 註 passthrough；§5.5 release 逾時回 `DRAIN_STALLED`、attach 等維持 `SESSION_RECOVERING`；新增 §5.12 Passthrough 安靜升 READY；§6.1 Windows 預設 passthrough 適用 SC-35；§7.7 SC-27 確認 |
+| `03-stage0-test-infra.md` | drain 逾時 L1 連結改為 `DRAIN_STALLED`；`no_reopen_before_handoff` 涵蓋此碼 |
+| `04-stage1a-rust-cli.md` | 前置表加 P1-OC（`gen_error_codes` 前合併；不生成 passthrough variant） |
+| `05-stage1b-rust-cli-mgmt.md` | Task 9 註 SC-27 由 OD-14 確認 |
+| `06-slice21-daemon-core.md` | P5 承接四項核心：SC-34 回應形狀與測試、SC-35（attach 不登入、Tick 安靜升 READY、Admission、三層完成條件、無救援按鍵、self-test／recover）、UDS `uds_mode_0660_baseline`／`test_socket_mode_0660`、release `DRAIN_STALLED`；前置表 P1 改 SC-01～07 並加 P1-OC 列 |
+| `07-slice22-console.md` | SC 範圍期望改 `(range(1,30)∪{31,34,35})−{8}`／P7 下游 `(range(1,32)∪{34,35})−{8}`；DF-02 確認；release `DRAIN_STALLED`；passthrough READY 的 console 行為同一般 READY |
+| `08-slice23-login-events.md` | SC-34 取代 `LastErrorPassthrough`（recover／attach 測試改名與鍵序）；SC-35 的 Login FSM 繞過、Quiet 排除、self-test／recover 測試與黑箱；SC-26 確認；SC 範圍改 `(range(1,32)∪{34,35})−{8}` |
+| `09-slice24-transfer-flash.md` | release `DRAIN_STALLED`（新 L1 `release_drain_stalled_then_completes`）；前置加 P1-OC；SC-33 改 `owner_item: 8`／pending item 8，取消驗證器改動；SC 範圍改 `range(1,36)−{8}`；file.* 對 passthrough 回 `PROFILE_NOT_COMMAND_CAPABLE`；flash 候選含安靜升 READY 的 passthrough |
+| `10-stage3-canary.md` | canary `steady()` 說明 passthrough ATTACHED→READY 為穩態轉換；新增 `test_passthrough_ready_is_steady` |
+
+待後續處理：(1) `06` 的黑箱 `test_passthrough_quiet_ready_and_cmd` 以真實時間等約 40 s，是否加 slow marker 或時間覆寫由 P5 執行時決定（不新增 env 覆寫）；(2) SC-34／SC-35 的黑箱 case id 尚未登記到 P2 `cases.yaml`，由 P2／P5 Task 0b 依 `behavior_changes.yaml` 的 `case_ids` 補登。

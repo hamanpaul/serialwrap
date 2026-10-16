@@ -1771,7 +1771,7 @@ bridge: {applicable: true, only: true, compare: full}
 | `no_auto_resend` | `assert_command_resolved` 或 `assert_wire_contiguous`（payload 恰一次） |
 | `insufficient_evidence_not_pass` | `assert_compare`、`assert_wal_meta{loss_flag:true}` 或 `assert_zero_tx`（三者的 INSUFFICIENT 不得轉 PASS） |
 
-無法由外部決定性製造的部分（delayed-close、drain 3,000 ms 逾時下 release 回 `SESSION_RECOVERING`＋`drain_stalled`、舊 worker 晚到 completion 不改新 session 狀態）不在 L1.5 假造，明確連到 P1 的 L1 測試入口：`02-stage0-python-bc.md` T07（`DrainReceipt`）、T08（release／attach 交接回應、drain 診斷）、T20（OS write 前授權 permit）；`cases.yaml` 的對應 case 以 `implemented_by: 02-stage0-python-bc.md` 登記。
+無法由外部決定性製造的部分（delayed-close、drain 3,000 ms 逾時下 release 回 `DRAIN_STALLED`＋`drain_stalled`（OD-14 #4 新碼，取代原 `SESSION_RECOVERING`；drain 中的 attach／clear／bind／recover 仍回 `SESSION_RECOVERING`）、舊 worker 晚到 completion 不改新 session 狀態）不在 L1.5 假造，明確連到 P1 的 L1 測試入口：`02-stage0-python-bc.md` T07（`DrainReceipt`）、T08（release／attach 交接回應、drain 診斷）、T20（OS write 前授權 permit），以及 `02b-stage0-owner-confirmations.md`（P1-OC，`DRAIN_STALLED` 回應形狀）；`no_reopen_before_handoff` 的 oracle 對 `DRAIN_STALLED` 同樣以「回覆後不得重開、回條前外部無法取得獨占」判定；P2 的 zero-TX oracle 不變（`DRAIN_STALLED` 為 `uart_tx: possible`，不列入 `zero_tx_on_reject`）；`cases.yaml` 的對應 case 以 `implemented_by: 02-stage0-python-bc.md` 登記。
 
 **情境清單（15 個 L1.5＋3 個 Windows-native；`daemon_slice` 與 `cases.yaml` 一致）**
 

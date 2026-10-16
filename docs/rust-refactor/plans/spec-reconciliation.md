@@ -1,6 +1,6 @@
 # 規格 ↔ 程式碼調和表（Spec Reconciliation）
 
-> 本表逐項裁決 `docs/rust-refactor/inventory/01～10` 所列的差異、quirk、缺口與矛盾，作為各 Phase 實作依據。除文末「擁有者確認清單」外，不需再向擁有者確認。
+> 本表逐項裁決 `docs/rust-refactor/inventory/01～10` 所列的差異、quirk、缺口與矛盾，作為各 Phase 實作依據。除文末「擁有者確認清單」外，不需再向擁有者確認；該清單 #1～#7 已由 `owner-decisions-2026-10-15.md` OD-14（2026-10-16）全數裁決，Python 基線與契約的對應修改見 `02b-stage0-owner-confirmations.md`（P1-OC）。
 > 共用架構見 `rust-architecture.md`。Phase 代號沿用 `00-master-plan.md`：P0 契約、P1 Python BC、P2 測試基礎、P3 Stage 1A、P4 Stage 1B、P5 Slice 2.1、P6 2.2、P7 2.3、P8 2.4、P9 Stage 3。
 
 ## 0. 裁決規則與代號
@@ -16,7 +16,7 @@
 | **TEST** | 修測試資產；依規格 §10.4 需獨立審閱 | 否 | — |
 | **IMPL** | 內部實作差異，不構成對外契約 | 否 | Rust 自由實作 |
 
-**needs-owner 標 yes 的條件**：變更會改到對外可觀測的契約，而且定稿規格沒有明文要求。標 yes 的項目一律先套用文末列出的預設值往下做，不因等待確認而停工。
+**needs-owner 標 yes 的條件**：變更會改到對外可觀測的契約，而且定稿規格沒有明文要求。標 yes 的項目一律先套用文末列出的預設值往下做，不因等待確認而停工。本表現有的 7 項已由 OD-14 裁決（§3），「需擁有者」欄保留原編號供追溯，裁決結果以 §3 與各列「裁決」欄為準。
 
 **通則**（適用全表，不逐列重複）：
 
@@ -37,11 +37,11 @@
 | SC-01 | `RECOVERING` 狀態下的 CmdSubmit 與 InteractiveOpen 回 `SESSION_RECOVERING`（現況為 `SESSION_NOT_READY`） | §5.3 | 雙邊 |
 | SC-02 | `FLASHING` 狀態下的 CmdSubmit 與 InteractiveOpen 回 `FLASHING_BUSY`（現況為 `SESSION_NOT_READY`） | §5.3 | 雙邊 |
 | SC-03 | execute-time 與 file.* 經 manager gate 回 `AUTOBOOT_QUIET` 時也附 `retry_after_s` | §5.3 | 雙邊 |
-| SC-04 | Drain 可觀測面：斷線、I/O error、release、clear、bind 的 detach 期間轉為 `RECOVERING`。release 必須等 handle 關閉回條後才回成功；自停止請求起算（含 Phase 1 等鎖，R3-F3）超過 3000 ms 時設 `drain_stalled:true` 與 `drain_timeout_epoch`（取 `bridge_generation`），release 回 `SESSION_RECOVERING`。SessionPublic 新增 `drain_stalled`、`drain_timeout_epoch` 兩欄，位置在 `capture` 之後 | §5.2、§5.3、§9.4 | 雙邊 |
+| SC-04 | Drain 可觀測面：斷線、I/O error、release、clear、bind 的 detach 期間轉為 `RECOVERING`。release 必須等 handle 關閉回條後才回成功；自停止請求起算（含 Phase 1 等鎖，R3-F3）超過 3000 ms 時設 `drain_stalled:true` 與 `drain_timeout_epoch`（取 `bridge_generation`），release 回新錯誤碼 `DRAIN_STALLED`（OD-14 #4，取代原預設 `SESSION_RECOVERING`；仍 stalled 時重複 release 同形回應，回條遲到時 daemon 自行完成 release，之後回 `already_released`；drain 中的 attach／clear／bind／recover 維持 `SESSION_RECOVERING`＋drain 欄位）。SessionPublic 新增 `drain_stalled`、`drain_timeout_epoch` 兩欄，位置在 `capture` 之後 | §5.2、§5.3、§9.4 | 雙邊 |
 | SC-05 | `device.attach` 同步重新取得獨占：失敗回 `DEVICE_STILL_HELD{pids,holder_unknown}` 或 `DEVICE_NOT_PRESENT`；成功才回 `ATTACHING`。`force` 只略過開檔前預檢，不得略過已識別的外部 holder：POSIX 開檔在 `TIOCEXCL` 後、任何 I/O 前做鎖後 holder 重掃（未取 flock 的外部程式先開埠時 open／flock／TIOCEXCL 仍會成功），`pids` 非空即 `DEVICE_STILL_HELD`、零 TX；初次／熱插自動 attach 同樣適用（`ATTACH_FAILED:DeviceHeldError`） | §5.3、§6.2 交接、§6.2 POSIX「拒絕已識別的外部衝突」 | 雙邊 |
 | SC-06 | `CMD_PENDING_MAX` 的計數納入「已 cancel 但 worker 仍在執行」的命令 | §5.4 | 雙邊 |
 | SC-07 | TX WAL 只記錄 OS 已確認寫出的 bytes，順序等於實際寫入順序 | §8.1 TX、ADR-05 | 雙邊 |
-| SC-08 | UDS 權限預設 `0600`，新建目錄為 `0700`；只有明確設定 `SERIALWRAP_SOCKET_GROUP` 時才用 `0660` 加 chgrp | ADR-04 | 雙邊（owner #3） |
+| SC-08 | **已撤回（OD-14 #3）**：UDS 權限維持基線 `0660`（bind 後 chmod），`SERIALWRAP_SOCKET_GROUP` strip 後非空時 chgrp（失敗忽略），目錄不另設 `0700`。不登記於 `behavior_changes.yaml`（編號保留、不重用）；Python 與 Rust 一律承接基線，原 `0600`／`0700` 變更自所有計畫移除 | ADR-04（擁有者裁決不採） | —（撤回） |
 | SC-09 | 設定探索順序：`SERIALWRAP_CONFIG`（指定 config.yaml）→ `CONFIG_DIR/config.yaml` → 系統目錄（`/etc/serialwrap/config.yaml` 或 `%ProgramData%\serialwrap\config.yaml`，唯讀 fallback） | §6.1 | 雙邊 |
 | SC-10 | lock 與 socket 路徑在比較時先正規化（abspath、normpath，並去掉 `unix://` 前綴）；Windows Tier 1 改用 `LockFileEx`（與 `msvcrt.locking` 互斥相容） | §6.2 | 雙邊 |
 | SC-11 | 有序關機：drain 所有 worker、關閉 handle、WAL sync，之後才 exit。Rust 細化（P5 Task 19、P8 Task 12；DF 候選）：各步驟有界等待、失敗不阻擋後續步驟，但 flash endpoint 未 join、RPC handler 逾時、drain stalled、WAL sync 失敗任一發生即以 `serialwrapd: shutdown incomplete: …` 診斷與 exit 1 結束，不宣稱優雅停止；只有全部收斂才 exit 0。Python 基線此情境 exit code 不改（以 log 與 `shutdown_drain().graceful` 揭露），不屬 A/B 比較範圍。停止起點（雙邊，R1-F2）：drain 前先設 manager stopping gate（之後熱插／bootstrap／recover 不開 UART、不建 worker，已越過 gate 的在途 attach 納入 drain 集合）、停 watcher、關事件派工 intake；Event handler 行程樹須在 WAL close 前收斂（Python `engine.stop` 無上限等待；Rust 以 drain 共用期限＋process group／Job 終止，未回收記入 `shutdown incomplete`）（P1 T08、P5 Task 16／19、P7 Task 15／16-wire、P8 Task 12）。交接停止（雙邊，R1-F1）：新增 RPC `daemon.handoff_stop`，daemon 在共同 admission 邊界（`AdmissionGate`）同一臨界區內做 busy 判定（flash／sync-probe、已 admit 的命令／file 傳輸／self-test／recover／release、lease、recovering）→ 閒置才凍結所有新的有副作用操作（之後回 `FLUSHED_BY_SHUTDOWN`＋`reason:"handoff_frozen"`、零 TX；ttyMCU 端點沉默）→ 回 `{"ok":true,"stopping":true,"handoff_token"}` 後才走本列停止；忙碌回 `FLASHING_BUSY`／`SESSION_BUSY`＋`busy`，不凍結、不停止。本列 shutdown drain 的 Phase 1 是中止（`TransferAbort`、撤銷前景命令、停 flash pump）而非等待完成，故 §12.1 更新／回滾只能經交接停止。不新增錯誤碼（`FLUSHED_BY_SHUTDOWN` 介面加 `rpc`）；`x-methods` 54→55（Python P1 T08；Rust P8 Task 14；消費者 P4 Task 12） | §6.1 更新流程、§8.1、§12.1 步驟 2～3、BC-01 | 雙邊 |
@@ -59,15 +59,17 @@
 | SC-23 | `setup --rollback`、版本目錄、Current／Previous、規格 §12.1 的七步更新流程；第 2 步交接安全檢查不受 `--force` 影響（Flash／FileTransfer 等不可安全中止操作進行中一律拒絕，不停止監管或 daemon）；第 3 步停止只經 SC-11 `daemon.handoff_stop` 原子交接（CLI 預檢後才開始的 `file.push`／flash 由 daemon 判定忙碌而拒絕；daemon 不支援或結果不明時 fail-closed，不送一般 `daemon.stop`、不硬停，R1-F1）；第 7 步回退與 journal 中斷復原停止目前在跑的 daemon（第 6 步起已對外服務的新版）同樣只經 `daemon.handoff_stop`（`reason:"revert"`），忙碌、不支援或結果不明時保留 journal、不硬停、不切換回 Previous，待 daemon 閒置後由下一次 `setup` 完成回退（R2-F6）；中斷復原的 `install-journal.json` 在停用前即持久保存原始入口／current／config／監管 enabled・running／daemon 快照，備份完整提交（`backup_complete`）前不切換，復原失敗保留 journal（R1-F5，P4 Task 12）；第 3 步「停止該實例的監管拉起能力」適用每一種 mode：送 `daemon.handoff_stop` 前先抑制監管拉起並記入 journal——systemd 寫持久 drop-in（`Restart=no`、`RefuseManualStart=yes`）＋`disable` 並以 `systemctl show` 驗證（既有 unit `Restart=on-failure`，交接後停機未收斂 exit 1 時不得在備份／切換期間被拉起），windows-task／windows-service disable 且 hold 期間重新註冊以停用狀態送出，on-demand 持 `autostart.lock` 並以 `install-journal.json` 存在擋 SC-18；hold 只在啟動目標版本前、拒絕還原或中斷復原時撤銷；更新期間外部 `systemctl start`／`service start`／`daemon start`（systemd 路由）會被 systemd 拒絕。交接 token 只授權發出它的實例：等待中、切換前與啟動前偵測到其他實例一律重新交接（被拒 → 不硬停、不切換），`hard_stop` 只對取得 grant 的 identity；同規則適用 SC-22 `supervision-mode set`（R5-F1，P4 Task 3／7／12、P8 Task 14） | §4.2 #19、§6.1、§12.1 | Rust-only（1B） |
 | SC-24 | 監管模式 `windows-task`（`ExecutionTimeLimit=PT0S`）與 `windows-service` | §6.1、OD-03、OD-12 | Rust-only（1B） |
 | SC-25 | release manifest，以及 doctor 的 `version_pairing` 檢查 | §9.5、OD-13 | Rust-only |
-| SC-26 | Windows event handler：`exec` 走 CreateProcess 加 Job；`shell` 走 `cmd.exe /d /s /c`；timeout 時 TerminateJobObject；env 白名單另加 `SYSTEMROOT`、`COMSPEC`、`PATHEXT`、`TEMP`、`TMP`、`USERPROFILE` | §5.5 | Rust-only（owner #6） |
-| SC-27 | BC-05 的 Windows remote 範圍延伸到 `connect` 與 `benches`，移除這兩者的 `REMOTE_NOT_SUPPORTED` | BC-05 | 雙邊（owner #7） |
+| SC-26 | Windows event handler：`exec` 走 CreateProcess 加 Job；`shell` 走 `cmd.exe /d /s /c`；timeout 時 TerminateJobObject；env 白名單另加 `SYSTEMROOT`、`COMSPEC`、`PATHEXT`、`TEMP`、`TMP`、`USERPROFILE` | §5.5 | Rust-only（OD-14 #6 確認） |
+| SC-27 | BC-05 的 Windows remote 範圍延伸到 `connect` 與 `benches`，移除這兩者的 `REMOTE_NOT_SUPPORTED` | BC-05 | 雙邊（OD-14 #7 確認） |
+| SC-34 | `session.attach`／`session.recover` 的 `error_code` 不再放 `last_error` 值（含 `CREDENTIALS_UNRESOLVED`）：attach 於 command-capable 且 state ∉ {READY, ATTACHING, FLASHING, RECOVERING} 時（含 human lease 分支、bridge 存在的其他分支與同步 probe 之後）回 `{"ok":false,"error_code":"SESSION_NOT_READY","last_error":<str\|null>,"last_error_detail":<str\|null>,"session":…}`（原 `last_error or "NOT_READY"` 一併取代，`NOT_READY` 改 `reachable:false`）；recover 的 REPROBE 未恢復時回 `{"ok":true,"recovering":false,"action":"REPROBE","recovered":false,"session":…,"error_code":"SESSION_NOT_READY","last_error":…,"last_error_detail":…}`，其後照舊可附 `classification`／`recommended_action`／`matched_prompt`（BOOTLOADER 判定改看 `last_error == "BOOTLOADER_STUCK"`）。`error_codes.yaml` 的 `last_error_passthrough` meta 項與 `code_extraction.yaml` 的對應抽取規則移除；`session_last_errors.yaml` 的 `promoted_via` 改指「出現在該方法回應頂層 `last_error` 欄位」 | §9.3、§15.2「不新增為 RPC error_code」、OD-14 #1 | 雙邊（P1-OC T2；Rust P5、P7） |
+| SC-35 | `platform=passthrough` 啟用送命令：attach 不跑 Login FSM、不送 ready_probe、不做 boot quiet gate，bridge 起來即 `ATTACHED`、零 TX；`ATTACHED` 連續 `PASSTHROUGH_READY_QUIET_S = 30` 秒無 RX（`quiet_since = max(進入 ATTACHED, 最後 RX)`，任何 RX 重新起算，TX 不算；1 s tick 判定；drain／flash 臨界／RELEASED 時不升）即自動轉 `READY`，之後依一般 `READY` 流程進 Arbiter（DF-02 照樣適用）；passthrough 不 arm boot-banner quiet、不跑 READY reconfirm。`ATTACHED` 時 `command.submit` 回 `SESSION_NOT_READY`＋`passthrough_ready_in_s`（不再回 `PROFILE_NOT_COMMAND_CAPABLE`）；`file.push`／`file.pull` 對 passthrough 任何狀態回 `PROFILE_NOT_COMMAND_CAPABLE`。line／background 完成條件：有 `completion_regex` → #230 producer 完成；否則 profile `prompt_regex` 符合 `valid_completion_regex`（可編譯、非空、不匹配空串）→ 既有 prompt 完成；否則（如 others-template 的 `.*`）沿用既有等待迴圈後回 `{"ok":false,"error_code":"PROMPT_TIMEOUT","partial":true,"recovery_action":"NONE"}`。passthrough 未命中時不送 CTRL_C／CTRL_D、不轉 `ATTACHED`、不 force recover；reboot 命令不套特例。self-test 永不 TX（READY → `PASSTHROUGH`＋`recommended_action:"none"`；ATTACHED 加 `passthrough_ready_in_s`）；recover 的 REPROBE 不 probe。斷線等 drain 路徑走一般恢復（ATTACHING → ATTACHED → 重新累計 30 s）。`command_capable` 定義不變（flash 偵測候選依賴它）。不新增錯誤碼與 WAL META | §5.3、§5.2.1「核准的例外」、OD-14 #2 | 雙邊（P1-OC T5／T6；Rust P5 核心、P7 登入／Quiet 排除、P8 file.* 與 flash 交互） |
 
 ### 1.2 DF：缺陷與安全修正（兩邊都修）
 
 | ID | 內容 |
 |---|---|
 | DF-01 | `event.rule_delete` 與 `event.reset` 的 `rule_id` 必須符合 `^[a-z0-9][a-z0-9-]{0,63}\.[a-z0-9][a-z0-9-]{0,63}\Z`，否則不碰檔案。rule_delete 回 `{"ok":true,"deleted":false}`，reset 不計數。修正路徑穿越 |
-| DF-02 | RPC 帶入的 `source` 以 `human:` 開頭時，gate 一律以 agent 對待，也不升格成 interactive（owner #5）。真正的 human console 行走 daemon 內部路徑，不受影響 |
+| DF-02 | RPC 帶入的 `source` 以 `human:` 開頭時，gate 一律以 agent 對待，也不升格成 interactive（OD-14 #5 確認）。真正的 human console 行走 daemon 內部路徑，不受影響 |
 | DF-03 | WAL 或 mirror 歸檔同名時加 `.1`、`.2`… 後綴，不覆蓋既有歸檔（rotate 與 reset 都適用） |
 | DF-04 | 動態 session 的 RELEASED 要能跨任意次數重啟保留；裝置離線的 tick 不得把 RELEASED 降為 DETACHED |
 | DF-05 | `daemon start` 的 daemon 定位順序：manifest launcher → 與 CLI 同目錄的 `serialwrapd` → Python `-m sw_core.daemon` fallback（POSIX 也加）；不再依賴套件內不存在的 `serialwrapd.py` |
@@ -133,10 +135,10 @@
 | ID | 事實 | 規格 | 裁決 | 理由 | 階段 | 需擁有者 |
 |---|---|---|---|---|---|---|
 | RPC-D-01 | 有多個經非字面路徑輸出的碼不在 78 碼清單 | §9.2 | KEEP | 全部收錄；`reachable` 與 `interface` 依實況標註 | P0 | no |
-| RPC-D-02 | `session.attach` 與 `session.recover`（REPROBE 分支）把 `last_error` 原樣放進 `error_code`，包含 `CREDENTIALS_UNRESOLVED` | §9.3、§15.2「不新增為 RPC error_code」 | KEEP（預設） | 這是既有行為，不是新增；改掉會打斷 agent 與測試。`error_codes.yaml` 只放一筆 `last_error_passthrough` meta 項（`namespace_ref: session_last_errors`），不併入 RPC 計數 | P0 | **yes #1** |
+| RPC-D-02 | `session.attach` 與 `session.recover`（REPROBE 分支）把 `last_error` 原樣放進 `error_code`，包含 `CREDENTIALS_UNRESOLVED` | §9.3、§15.2「不新增為 RPC error_code」 | SPEC SC-34（OD-14 #1 分離） | 擁有者裁決分離：`error_code` 改回固定 `SESSION_NOT_READY`，另以 `last_error`、`last_error_detail` 欄位回報；`error_codes.yaml` 的 `last_error_passthrough` meta 項於 P1-OC 移除（原預設「保留」作廢） | P1-OC/P5/P7 | **yes #1（已裁決 OD-14）** |
 | RPC-D-03 | `stream` 不是真串流，只發一次請求 | 寫「串流讀取」 | DOC | 勘誤 | P0 | no |
 | RPC-D-04 | RPC 方法名有誤，規格漏列方法 | §4.2 | DOC | 以 02 §7 的 54 個方法為準 | P0 | no |
-| RPC-D-05 | socket 權限為 `0660`，另可經 `SOCKET_GROUP` chgrp | ADR-04 要求 `0600` | SPEC SC-08 | 預設改 `0600`；system 模式明確指定 group 時保留 `0660` | P1/P5 | **yes #3** |
+| RPC-D-05 | socket 權限為 `0660`，另可經 `SOCKET_GROUP` chgrp | ADR-04 要求 `0600` | KEEP（OD-14 #3；SC-08 撤回） | 擁有者裁決維持 `0660`＋選用 `SERIALWRAP_SOCKET_GROUP`；Python 還原 P1 T15 的 0600／0700 變更（P1-OC T3），Rust 依基線實作 | P1-OC/P5 | **yes #3（已裁決 OD-14）** |
 | RPC-D-06 | Windows 用 `msvcrt.locking`；探測與取鎖順序與 POSIX 相反 | §6.2 要求 `LockFileEx` | SPEC SC-10 | 改用 LockFileEx（與原鎖互斥相容）；兩平台各自的順序保留 | P1/P5 | no |
 | RPC-D-07 | 路徑未正規化 | §6.2 要求正規化 | SPEC SC-10 | 只在比較時正規化；`config.yaml` 仍寫入原字串 | P1/P4 | no |
 | RPC-D-08 | 沒有 `holder_unknown`；`/proc` 不可讀時視為可收回 | BC-04 | BC | BC-04 加上 SC-05 | P1/P5 | no |
@@ -151,7 +153,7 @@
 | RPC-H-02 | 請求行超過 65536 bytes 時斷線、不回應 | — | KEEP | 精確邊界由 Stage 0 測 65535／65536／65537 擷取 | P0/P5 | no |
 | RPC-H-03 | 接受 NaN 並原樣回送；lone surrogate | — | KEEP | pyjson 支援 NaN；lone surrogate 轉 U+FFFD，屬非契約差異 | P5 | no |
 | RPC-H-04 | `INVALID_JSON`／`INVALID_REQUEST` 用含空格分隔、無 id | — | KEEP | 位元組級保留 | P5 | no |
-| RPC-H-05 | client 傳 `source:"human:…"` 就能繞過 gate | §5.2.1 Quiet 屬安全骨架 | FIX DF-02 | 安全 gate 可被偽造繞過 | P1/P5 | **yes #5** |
+| RPC-H-05 | client 傳 `source:"human:…"` 就能繞過 gate | §5.2.1 Quiet 屬安全骨架 | FIX DF-02 | 安全 gate 可被偽造繞過 | P1/P5 | **yes #5（OD-14 確認預設）** |
 | RPC-H-06 | falsy 值會換成預設；`bool("false")` 為 True | — | KEEP | Python 轉型語意（arch §3.4） | P5 | no |
 | RPC-H-07 | self-test 對 FLASHING session 送 nonce probe | — | KEEP | flash gate／fence 已擋下實際 TX，結果同為 `TARGET_UNRESPONSIVE`；不得 `confirm_ready` | P5 | no |
 | RPC-H-08 | 負數參數得到 `EXCEPTION` 或怪異結果 | — | KEEP | code 保留，message 非契約（G1） | P5 | no |
@@ -181,10 +183,10 @@
 | ERR-7.1-g | framing 碼沒有 version，early 回應沒有 id | — | KEEP | arch §6.2 | P0 | no |
 | ERR-7.1-h | `DEVICE_STILL_HELD` 沒有 `holder_unknown` | BC-04 | BC | 欄位一律附上 | P1/P5 | no |
 | ERR-7.2-a | 16 個直接輸出的碼未列入 | §9.2 | KEEP | 收錄 | P0 | no |
-| ERR-7.2-b | 23 個經 last_error 提升的碼 | §9.3 | KEEP | 見 RPC-D-02 | P0 | 同 #1 |
+| ERR-7.2-b | 23 個經 last_error 提升的碼 | §9.3 | SPEC SC-34 | 見 RPC-D-02；SC-34 起這些值只出現在回應頂層 `last_error` 欄位，不再是 `error_code` | P1-OC | 同 #1（已裁決 OD-14） |
 | ERR-7.2-c | `SOCKET_UNAVAILABLE`（PROC） | — | KEEP | `interface: proc` | P0 | no |
 | ERR-7.2-d | `CMD_LENGTH_WARNING`／`NOT_BOOTLOADER`／`INVALID_INTERACTIVE_ENCODING` 不是 error_code | — | KEEP | 另立 warning、detail 目錄；最後一項經 `EXCEPTION` 包裝 | P0 | no |
-| ERR-7.3-1 | `CREDENTIALS_UNRESOLVED` 外洩成 error_code | §9.3 | KEEP | 見 RPC-D-02 | P0 | 同 #1 |
+| ERR-7.3-1 | `CREDENTIALS_UNRESOLVED` 外洩成 error_code | §9.3 | SPEC SC-34 | 見 RPC-D-02；改由 `last_error` 欄位回報 | P1-OC | 同 #1（已裁決 OD-14） |
 | ERR-7.3-2 | `RECOVERING` 下 submit 回 `SESSION_NOT_READY` | §5.3 | SPEC SC-01 | 規格明文 | P1/P5 | no |
 | ERR-7.3-3 | `FLUSHED_BY_RECOVERY` 的觸發面比規格寬（任何 detach） | — | KEEP＋DOC | 基線 | P0 | no |
 | ERR-7.3-4 | `FORCE_RECOVER_TIMEOUT` 只在 force 路徑回出 | §5.2.5 | KEEP | 與規格一致 | P0 | no |
@@ -235,11 +237,11 @@
 |---|---|---|---|---|---|---|
 | SES-16.1 | DeferredBuffer 截頭留尾；跨上下文時不清 | BC-02 | BC | 加上下文標記（owner_gen） | P1/P6 | no |
 | SES-16.2 | 沒有三態 TX 結果；`n<=0` 時記整段 payload | BC-03、§8.1 | BC＋SPEC SC-07 | — | P1/P5 | no |
-| SES-16.3a | 沒有 drain barrier、receipt、3000 ms timeout | §5.2 | SPEC SC-04 | ADR-06 安全骨架；只有「release 遇 drain 逾時」的回應形狀需確認 | P1/P5 | **yes #4** |
+| SES-16.3a | 沒有 drain barrier、receipt、3000 ms timeout | §5.2 | SPEC SC-04 | ADR-06 安全骨架；「release 遇 drain 逾時」的回應依 OD-14 #4 改為新碼 `DRAIN_STALLED`（P1-OC T4） | P1/P1-OC/P5 | **yes #4（已裁決 OD-14）** |
 | SES-16.3b | self-test、recover、reprobe、interactive_open 送 TX 不取前景 token | ADR-06 | KEEP | 單一 writer 保證每次寫入不被切開；命令層級的並行維持基線 | P5 | no |
 | SES-16.4-01 | `RECOVERING` 下 submit 與 open 回 `SESSION_NOT_READY` | §5.3 | SPEC SC-01 | 規格明文 | P1/P5 | no |
 | SES-16.4-02 | `FLASHING` 下 submit 與 open 回 `SESSION_NOT_READY` | §5.3 | SPEC SC-02 | 規格明文 | P1/P5 | no |
-| SES-16.4-03 | passthrough 在 ATTACHED 時 submit 回 `PROFILE_NOT_COMMAND_CAPABLE` | §5.3、§5.2.1「核准的例外」 | KEEP（預設） | 例外未經核准，不啟用 | — | **yes #2** |
+| SES-16.4-03 | passthrough 在 ATTACHED 時 submit 回 `PROFILE_NOT_COMMAND_CAPABLE` | §5.3、§5.2.1「核准的例外」 | SPEC SC-35（OD-14 #2 啟用） | 擁有者核准例外：30 s 無 RX 自動 READY 後進 Arbiter；ATTACHED 期間 submit 改回 `SESSION_NOT_READY`＋`passthrough_ready_in_s` | P1-OC/P5/P7/P8 | **yes #2（已裁決 OD-14）** |
 | SES-16.4-04 | 斷線與 I/O error 走 DETACHED→ATTACHING | §5.3 | SPEC SC-04 | 規格明文 | P1/P5 | no |
 | SES-16.4-05 | FlashSyncMatched 時不清 DeferredBuffer | BC-02 | BC | — | P1/P8 | no |
 | SES-16.4-06 | `enter_flashing` 沒有 guard | §5.3 | SPEC SC-14 | 規格明文 | P1/P8 | no |
@@ -252,12 +254,12 @@
 | SES-16.4-13 | `device.attach` 非同步，另有額外錯誤碼 | §5.3 | SPEC SC-05＋KEEP 碼 | 失敗不得宣稱已收回 | P1/P5 | no |
 | SES-16.4-14 | `FORCE_RECOVER_TIMEOUT` 約 10 s；沒有 drain timeout | §5.2.5 | KEEP＋SPEC SC-04 | — | P5 | no |
 | SES-16.5-01 | 本區有多個碼未列入 | §9.2 | KEEP | 收錄 | P0 | no |
-| SES-16.5-02 | last_error 外洩成 error_code | §9.3 | KEEP | 見 RPC-D-02 | P0 | 同 #1 |
+| SES-16.5-02 | last_error 外洩成 error_code | §9.3 | SPEC SC-34 | 見 RPC-D-02 | P1-OC | 同 #1（已裁決 OD-14） |
 | SES-16.5-03 | `CREDENTIALS_UNRESOLVED` 由 manager 的 gate 合成，狀態為 ATTACHED | §9.3 | KEEP | 依基線凍結 | P0 | no |
 | SES-16.5-04 | last_error 完整值集合 | §9.3 | KEEP | 收入 `session_last_errors.yaml` | P0 | no |
-| SES-16.6-01 | passthrough 是否 probe 由 `ready_probe` 決定 | — | KEEP＋DOC | 修正 CLAUDE.md | P0 | no |
+| SES-16.6-01 | passthrough 是否 probe 由 `ready_probe` 決定 | — | KEEP＋DOC | 修正 CLAUDE.md。SC-35（OD-14 #2）起 passthrough 一律不 probe（含有 ready_probe 的 uboot-template），進 READY 改由 30 s 安靜判定；`command_capable` 仍由 ready_probe 推導 | P0/P1-OC | no |
 | SES-16.6-02 | pending 不計 `interactive`；`limits` 未揭露 pending 上限 | — | KEEP | 只做 SC-06 | P5 | no |
-| SES-16.6-03 | `priority 0` 變成 10；`human:` 可偽造 | — | KEEP／FIX DF-02 | — | P5 | 同 #5 |
+| SES-16.6-03 | `priority 0` 變成 10；`human:` 可偽造 | — | KEEP／FIX DF-02 | — | P5 | 同 #5（OD-14 確認） |
 | SES-16.6-04 | `login_regex` 預設值是雙反斜線 | — | KEEP | 已知缺陷，逐字承接 | P0 | no |
 | SES-16.6-05 | nonce 會被命令回顯滿足 | — | KEEP | 登入 FSM 基線 | P7 | no |
 | SES-16.6-06 | 裝置離線的 tick 把 RELEASED 改成 DETACHED | §6.2 | FIX DF-04 | 交接安全 | P1/P5 | no |
@@ -316,7 +318,7 @@
 | PLT-D-05 | 沒有 `remote stop` | §4.2 | NEW SC-21 | — | P1/P4 | no |
 | PLT-D-06 | 沒有 `--rollback` | §12.1 | NEW SC-23 | — | P4 | no |
 | PLT-D-07 | `benches`／`profile` 分類錯誤 | §4.2 | IMPL | 只改排程 | P3 | no |
-| PLT-D-08 | 程式碼沒有 pipe；真正的 POSIX 依賴是 07 §8.6 清單 | BC-05 | BC＋DOC | 以 §8.6 清單作為 BC-05 範圍；延伸到 `connect`／`benches`（SC-27） | P1/P4 | **yes #7** |
+| PLT-D-08 | 程式碼沒有 pipe；真正的 POSIX 依賴是 07 §8.6 清單 | BC-05 | BC＋DOC | 以 §8.6 清單作為 BC-05 範圍；延伸到 `connect`／`benches`（SC-27） | P1/P4 | **yes #7（OD-14 確認預設）** |
 | PLT-D-09 | windows 監管模式不存在 | §6.1 | NEW SC-24 | — | P4 | no |
 | PLT-D-10 | 使用 `msvcrt.locking`，路徑未正規化 | §6.2 | SPEC SC-10 | — | P1/P5 | no |
 | PLT-D-11 | 本區碼未列入 | §9.2 | KEEP | 收錄 | P0 | no |
@@ -372,7 +374,7 @@
 | EVT-D-S3 | SKILL 未記載許多碼 | OD-06 | DOC | P0 | P0 | no |
 | EVT-D-S4 | `wal_seq` 是全域快照 | §5.5 | FIX DF-15 | — | P1/P7 | no |
 | EVT-D-S5 | 單一 matcher queue；LineBuffer 永不重設 | §5.5 | KEEP | 基線 | P7 | no |
-| EVT-D-S6 | handler 只能在 POSIX 執行 | §5.5 | NEW SC-26（Rust-only） | Windows 語意必須定義 | P7 | **yes #6** |
+| EVT-D-S6 | handler 只能在 POSIX 執行 | §5.5 | NEW SC-26（Rust-only） | Windows 語意必須定義 | P7 | **yes #6（OD-14 確認預設）** |
 | EVT-D-S7 | 本地檔由 daemon 讀寫 | §4.2 #5 | KEEP | 改成 CLI 讀寫會是 BC | P3/P8 | no |
 | EVT-D-S8 | stream 是一次性請求 | §4.2 #8 | KEEP＋DOC | — | P0 | no |
 | EVT-D-S9 | `log` 群組只有 tail | §4.2 #7 | KEEP＋DOC | — | P0 | no |
@@ -455,17 +457,19 @@
 
 ---
 
-## 3. 擁有者確認清單（needs-owner=yes；不等確認，先依預設實作）
+## 3. 擁有者確認清單（needs-owner=yes；**已裁決 OD-14，2026-10-16**）
 
-| # | ID | 議題 | 預設 |
-|---|---|---|---|
-| 1 | RPC-D-02（另含 ERR-7.2-b、ERR-7.3-1、SES-16.5-02） | `session.attach` 與 `session.recover` 把 `last_error`（含 `CREDENTIALS_UNRESOLVED`）放進 `error_code` | **保留**現況；`error_codes.yaml` 只放一筆 passthrough meta 項，不計入 RPC 碼，並交叉引用 `session_last_errors` |
-| 2 | SES-16.4-03 | 規格中「passthrough ATTACHED 可進 Arbiter」的例外 | **不啟用**，維持 `PROFILE_NOT_COMMAND_CAPABLE` |
-| 3 | RPC-D-05／SC-08 | UDS 權限 | 預設 `0600`，新建目錄 `0700`；system 模式明確指定 `SERIALWRAP_SOCKET_GROUP` 時用 `0660` 加 chgrp |
-| 4 | SC-04 | release 遇 drain 逾時時的回應 | `{"ok":false,"error_code":"SESSION_RECOVERING","drain_stalled":true,"drain_timeout_epoch":N,"session":…}`。回條遲到時仍完成 release，下次再呼叫回 `already_released` |
-| 5 | RPC-H-05／DF-02 | RPC 帶入的 `human:` source | 一律以 agent 對待（gate 與升格都比照 agent）；daemon 內部的 human console 路徑不受影響 |
-| 6 | EVT-D-S6／SC-26 | Windows event handler | `shell` 走 `cmd.exe /d /s /c`；用 Job Object 處理 timeout；env 白名單加 `SYSTEMROOT`、`COMSPEC`、`PATHEXT`、`TEMP`、`TMP`、`USERPROFILE` |
-| 7 | SC-27 | BC-05 的 Windows remote 是否涵蓋 `connect`／`benches` | **涵蓋**，移除這兩者在 Windows 上的 `REMOTE_NOT_SUPPORTED` |
+原「不等確認，先依預設實作」的 7 項已由 `owner-decisions-2026-10-15.md` OD-14 全數裁決：#1～#4 偏離原預設，#5～#7 確認原預設。擁有者相容原則：外部**指令格式**（CLI 子命令、參數、RPC method 名稱）只能新增不能修改；狀態與回應欄位內容可調整。Python Stage 0 基線與 P0 契約的修改由 `02b-stage0-owner-confirmations.md`（P1-OC，於 P1 完成後執行）承接；Rust 由 P5～P8 各計畫承接。`contracts/behavior_changes.yaml` 的 `pending_owner_confirmations` 於 P1-OC 清空，相關變更項改 `owner_confirmation: confirmed`。
+
+| # | ID | 議題 | 原預設 | 裁決（OD-14） | 登記與承接 |
+|---|---|---|---|---|---|
+| 1 | RPC-D-02（另含 ERR-7.2-b、ERR-7.3-1、SES-16.5-02） | `session.attach` 與 `session.recover` 把 `last_error`（含 `CREDENTIALS_UNRESOLVED`）放進 `error_code` | 保留現況；`error_codes.yaml` 只放一筆 passthrough meta 項 | **已裁決：分離**。`error_code` 改回固定 `SESSION_NOT_READY`，回應另加 `last_error`（字串或 null）與 `last_error_detail`（既有語意）；attach 的 `NOT_READY` fallback 一併取代（`NOT_READY` 改 `reachable:false`）；`last_error_passthrough` meta 項與抽取規則移除 | 新 SC-34（雙邊、A/B diff）；P1-OC T1／T2；Rust P5、P7 |
+| 2 | SES-16.4-03 | 規格中「passthrough ATTACHED 可進 Arbiter」的例外 | 不啟用，維持 `PROFILE_NOT_COMMAND_CAPABLE` | **已裁決：啟用**。`platform=passthrough` 在 `ATTACHED` 連續 `PASSTHROUGH_READY_QUIET_S = 30` 秒無 RX 即自動轉 `READY`（任何 RX 重新起算），之後依一般 `READY` 流程進 Arbiter；不登入、不 probe、不套 boot quiet gate（serialwrap 不介入，UART 由 agent 維護）。完成條件只用既有機制：`completion_regex`（producer）→ 可用的 profile `prompt_regex` → 否則既有等待迴圈後 `PROMPT_TIMEOUT`（`recovery_action:"NONE"`，不送 CTRL_C／CTRL_D、不降級）；斷線走一般恢復。細節見 §1.1 SC-35 | 新 SC-35（雙邊、A/B diff）；P1-OC T1／T5／T6；Rust P5 核心、P7、P8 |
+| 3 | RPC-D-05／SC-08 | UDS 權限 | `0600`、新建目錄 `0700`；指定 `SERIALWRAP_SOCKET_GROUP` 時 `0660`＋chgrp | **已裁決：維持 `0660`**（＋選用 `SERIALWRAP_SOCKET_GROUP` chgrp）。SC-08 撤回，自 `behavior_changes.yaml` 移除；斷言 0600／0700 的測試改斷言 0660 基線 | SC-08 撤回；P1-OC T1／T3；Rust P5 |
+| 4 | SC-04 | release 遇 drain 逾時時的回應 | `{"ok":false,"error_code":"SESSION_RECOVERING","drain_stalled":true,"drain_timeout_epoch":N,"session":…}` | **已裁決：新增錯誤碼 `DRAIN_STALLED`**（取代該回應中的 `SESSION_RECOVERING`），附 `drain_stalled:true`、`drain_timeout_epoch`。`retryable: "no"`（release 會自行完成，重送不會加速）、`uart_tx: possible`；agent 處置：等待並以 `session get_state` 查到 `RELEASED` 後再交接，不得重開裝置。回條遲到時仍完成 release，之後回 `already_released`；drain 中的 attach／clear／bind／recover 維持 `SESSION_RECOVERING` | 修訂 SC-04（不另開 SC）；P1-OC T4；Rust P5、P8 |
+| 5 | RPC-H-05／DF-02 | RPC 帶入的 `human:` source | 一律以 agent 對待（gate 與升格都比照 agent）；daemon 內部的 human console 路徑不受影響 | **已裁決：確認原預設** | DF-02（P1 T11 已實作；P1-OC T1 改 `confirmed`）；Rust P5、P6 |
+| 6 | EVT-D-S6／SC-26 | Windows event handler | `shell` 走 `cmd.exe /d /s /c`；Job Object 處理 timeout；env 白名單加 `SYSTEMROOT`、`COMSPEC`、`PATHEXT`、`TEMP`、`TMP`、`USERPROFILE` | **已裁決：確認原預設** | SC-26（Rust-only；P1-OC T1 改 `confirmed`）；P7 Task 14 |
+| 7 | SC-27 | BC-05 的 Windows remote 是否涵蓋 `connect`／`benches` | 涵蓋，移除兩者在 Windows 上的 `REMOTE_NOT_SUPPORTED` | **已裁決：確認原預設（涵蓋）** | SC-27（P1 T14 已實作；P1-OC T1 改 `confirmed`）；P4 Task 9 |
 
 ## 4. 保留的已知缺陷（KEEP；建議另開 issue，不在本次重構範圍）
 
@@ -488,8 +492,8 @@ Rust 依基線逐字承接以上行為。要修正時另開 issue，並登記新
 
 | 裁決 | 列數 |
 |---|---|
-| KEEP（保留基線並凍結；含 KEEP＋DOC 等以保留為主者） | 152 |
-| SPEC（依定稿規格變更，SC） | 31 |
+| KEEP（保留基線並凍結；含 KEEP＋DOC 等以保留為主者） | 148 |
+| SPEC（依定稿規格變更，SC） | 35 |
 | NEW（規格要求的新功能，SC） | 14 |
 | FIX（缺陷／安全修正，DF） | 26 |
 | BC（既有核准的 BC-01～05） | 19 |
@@ -498,4 +502,6 @@ Rust 依基線逐字承接以上行為。要修正時另開 issue，並登記新
 | IMPL（內部實作差異） | 19 |
 | **合計** | **299** |
 
-登記項目：SC-01～SC-27（27 項）、DF-01～DF-17 與 DF-19（18 項；DF-18 保留給 P7 `08` §0.5），另有既有核准的 BC-01～05。7 列標為需擁有者確認，對應第 3 節的 7 項（第 1 項含 3 列交叉引用），均已附預設值。
+登記項目：SC-01～SC-27 扣除已撤回的 SC-08，加上 OD-14 新增的 SC-34、SC-35（共 28 項；SC-28～SC-33 由 P6～P8 另行登記）、DF-01～DF-17 與 DF-19（18 項；DF-18 保留給 P7 `08` §0.5），另有既有核准的 BC-01～05。7 列標為需擁有者確認，對應第 3 節的 7 項（第 1 項含 3 列交叉引用），已全數由 OD-14 裁決。
+
+OD-14 對上表的影響（2026-10-16）：RPC-D-02、ERR-7.2-b、ERR-7.3-1、SES-16.5-02 由 KEEP 改 SPEC（SC-34）；SES-16.4-03 由 KEEP 改 SPEC（SC-35）；RPC-D-05 由 SPEC（SC-08）改 KEEP。上表已依此重算：KEEP 由 152 列減為 148 列、SPEC 由 31 列增為 35 列，合計仍 299 列。

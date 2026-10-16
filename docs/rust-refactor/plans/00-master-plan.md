@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 依 `docs/rust-refactor/serialwrap-rust-spec-final.md`（定稿）與 `docs/rust-refactor/owner-decisions-2026-10-15.md`（OD-01～OD-13）1:1 完成 serialwrap 的 Stage 0～3 重構交付：Python 基線修正（BC-01～05）、契約凍結、外部 bridge 證據工具、Rust CLI（Stage 1A／1B）、Rust daemon 四切片（Slice 2.1～2.4）與 Stage 3 退役前置工具。
+**Goal:** 依 `docs/rust-refactor/serialwrap-rust-spec-final.md`（定稿）與 `docs/rust-refactor/owner-decisions-2026-10-15.md`（OD-01～OD-15）1:1 完成 serialwrap 的 Stage 0～3 重構交付：Python 基線修正（BC-01～05）、契約凍結、外部 bridge 證據工具、Rust CLI（Stage 1A／1B）、Rust daemon 四切片（Slice 2.1～2.4）與 Stage 3 退役前置工具。
 
 **Architecture:** Cargo workspace（`sw-proto`／`sw-pal`／`sw-core`／`sw-daemon`／`sw-cli`），平台相依只在 `sw-pal`；契約先行（`contracts/*.yaml|json` 為權威，Python 與 Rust 都對契約測）；黑箱測試只經部署 artifact（CLI subprocess＋JSON），同一批黑箱案例可指向 Python 或 Rust artifact 做 Sequential A/B。
 
@@ -18,7 +18,8 @@
 - `--retries` 只對 11 個唯讀方法重試：`health.ping`、`health.status`、`session.list`、`session.get_state`、`session.activity`、`session.console_list`、`session.log_status`、`device.list`、`alias.list`、`mcu.patterns`、`mcu.status`（§4.2）；`session.interactive_status` 絕不重試。
 - CLI JSON：`json.dumps(..., ensure_ascii=False, separators=(",", ":"))` 等價輸出；`state.json`／WAL 以 `sort_keys=True`。
 - 背壓上限：`CMD_PENDING_MAX=256`、`CMD_HISTORY_MAX=512`、`BG_CAPTURE_MAX_COUNT=64`、`DEFERRED_INPUT_MAX_BYTES=262144`、EventEngine LineBuffer `16384`、每 Console 出向 Ring `1 MiB`（§5.4）；Actor mailbox／RX／TX／WAL 待處理一律有界。
-- Drain timeout 3,000 ms → `RECOVERING`＋`drain_stalled:true`＋`drain_timeout_epoch`（§5.2.5）。
+- Drain timeout 3,000 ms → `RECOVERING`＋`drain_stalled:true`＋`drain_timeout_epoch`（§5.2.5）；`device.release` 逾時回 `DRAIN_STALLED`（OD-14 #4），drain 中的 attach／clear／bind／recover 維持 `SESSION_RECOVERING`。
+- OD-14：`session.attach`／`session.recover` 的 `error_code` 不放 `last_error` 值，改回 `SESSION_NOT_READY`＋`last_error`／`last_error_detail` 欄位（SC-34）；`platform=passthrough` 連續 30 s 無 RX 自動 `READY` 並可送命令（SC-35）；UDS 維持 `0660`（SC-08 撤回）。外部指令格式（CLI 子命令、參數、RPC method）只能新增不能修改。
 - Ready Reconfirm 耗盡：300 秒或 5 次失敗（§5.3）。
 - WAL rotate 門檻 `R` 以 Stage 0 擷取的 Python 常數為準，不自行換算 64 MB（§1.1.3）。
 - Windows 序列埠：`CreateFileW(OPEN_EXISTING, dwShareMode=0)`；WAL handle：`FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE`（§6.2、§8.2）。
@@ -47,6 +48,7 @@
 |---|---|---|---|
 | P0 | Stage 0 契約治理 | `01-stage0-contracts.md` | `contracts/*`、契約驗證器、SKILL 受管區段、OD-06 通用規則設定 |
 | P1 | Stage 0 Python BC | `02-stage0-python-bc.md` | BC-01～BC-05、OD-11 allowlist、F12 oracle 修訂、Stage 0 擷取凍結值 |
+| P1-OC | Stage 0 擁有者裁決套用（OD-14） | `02b-stage0-owner-confirmations.md` | SC-34、SC-35、`DRAIN_STALLED`、SC-08 撤回（0660）、擁有者確認簿記；P1 完成後執行 |
 | P2 | Stage 0 測試基礎 | `03-stage0-test-infra.md` | `tools/uart_stdio_bridge/`、DUT 模擬器、比較器、func-test 外部模式、`tests/acceptance/`、資源標記、`longrun_acceptance.yaml`＋gate 判定器、OD-09 延後項凍結工具與候選長跑開跑登記（T16，R4-F2）、release manifest |
 | P3 | Stage 1A | `04-stage1a-rust-cli.md` | Cargo workspace、`sw-proto`、`sw-pal`（client 側）、`sw-cli` 資料面＋固定路徑委派 |
 | P4 | Stage 1B | `05-stage1b-rust-cli-mgmt.md` | daemon／service／supervision-mode／remote／connect／setup／doctor／console-attach、`windows-task`、版本配對、更新／回滾 |
@@ -130,7 +132,7 @@
 | P1-T20 | OS write 前授權 permit（quiet／release／cancel／lease／owner_gen 零 TX；自動登入／密碼／ready probe 帶 `system_probe` permit＋`login_gen`（R2-F1）；Quiet 不擋有效 interactive lease 救援（R2-F2）；Windows 持鎖寫入下 drain 取 fence 鎖有上限、3,000 ms 期限自請求起算（R3-F3）；self-test nonce probe 帶 `self_test_probe` permit、提交點重驗 boot quiet 與 bridge 世代，被擋回 `AUTOBOOT_QUIET`（R5-F2，DF-19）） | H | L | P1-T12 |
 | P1-T13 | OD-11／SC-19 隔離實例測試裝置 allowlist | G | H | P1-T20 |
 | P1-T14 | BC-05 Windows `remote -R/-L`、SC-27 `connect`／`benches`、SC-21 `remote stop`、跨行程檔案鎖 | H | L | P1-T13 |
-| P1-T15 | 平台管理：SC-08、SC-09、SC-10、SC-12、SC-20、DF-14 | G | L | P1-T18 |
+| P1-T15 | 平台管理：SC-08、SC-09、SC-10、SC-12、SC-20、DF-14（SC-08 已由 OD-14 撤回，P1-OC-T3 還原為 0660） | G | L | P1-T18 |
 | P1-T16 | 缺陷修正群組：DF-01、DF-06、DF-07、DF-08、DF-09、DF-10、DF-11、DF-12、DF-13、DF-16 | H | G（DF-01／06／07／08／09）＋L（DF-10～13／16） | P1-T15 |
 | P1-T17 | F12 `f12-wal-path-live` 與 L3 `p0-wal-live` 改為 seq／marker／CRC oracle | H | G | P1-T16 |
 | P1-T18 | Python 側 release manifest、`tree_sha256`、`version_pairing`、DF-05 daemon 定位 | G | H | P1-T14 |
@@ -158,7 +160,7 @@
 | P2-T15 | `longrun_acceptance.yaml`、外層 `release_gate_result` 判定器、長跑觀測器、Windows 原生 COM 獨占證據 `winexcl`（R1-F7）；`release-gate.json` 帶 `run.deployed_content`（R5-F4） | L | H | P2-T14 |
 | P2-T16 | OD-09 延後項凍結工具與候選長跑開跑登記（`realhw/acceptance/od09_freeze.py`；延後項唯一寫入者；只讀 Stage 0 索引，不依賴 P3～P9，R4-F2） | L | H | P2-T12、P2-T15 |
 
-### P3（`04-stage1a-rust-cli.md`；Phase 前置：P0、P1（T15 SC-09、T16 DF-06、T18 manifest）、P2（T10、T12））
+### P3（`04-stage1a-rust-cli.md`；Phase 前置：P0、P1（T15 SC-09、T16 DF-06、T18 manifest）、P1-OC（Task 8 `gen_error_codes` 前）、P2（T10、T12））
 
 | ID | Task | 測試作者 | 實作者 | 依賴（同 Phase Task） |
 |---|---|---|---|---|
@@ -205,7 +207,7 @@
 | P4-T17 | `sw-daemon` launcher、`yaml11::emit`、`bench_registry` 與自含式 dev bundle（P3 明列為 P4 範圍者） | H | L | P4-T1 |
 | P4-T18 | `windows-task` Spike 2 程序、腳本與證據 schema（P2 指派 `win-task-*` 案例） | H | G | P4-T3、P4-T10、P4-T12 |
 
-### P5（`06-slice21-daemon-core.md`；Phase 前置：P0～P4）
+### P5（`06-slice21-daemon-core.md`；Phase 前置：P0～P4、P1-OC）
 
 | ID | Task | 測試作者 | 實作者 | 依賴（同 Phase Task） |
 |---|---|---|---|---|
@@ -331,6 +333,20 @@
 | P9-T16 | Python daemon 退役切換（packaging；發佈前逐檔重驗 bundle 內容與 tree、`retirement pack`＋`verify-archive` 後只上傳已驗 archive，R2-F7；旁載檔後重設 target 或新事故報告後拒絕發佈，R3-F1／R3-F2） | H | L | P9-T13 |
 | P9-T17 | `python3 -m tools.stage3` 入口與擁有者程序文件 | G | H | P9-T16 |
 
+### P1-OC（`02b-stage0-owner-confirmations.md`；Phase 前置：P1（全部 Task 合併後）；須在 P3 Task 8 與 P5 開始前合併）
+
+OD-14（2026-10-16）裁決套用到 Python Stage 0 基線與 P0 契約。新 SC：SC-34（#1）、SC-35（#2）；SC-08 撤回（#3）；SC-04 改以 `DRAIN_STALLED` 回報 release drain 逾時（#4）；DF-02、SC-26、SC-27 確認原預設（#5～#7）。
+
+| ID | Task | 測試作者 | 實作者 | 依賴（同 Phase Task） |
+|---|---|---|---|---|
+| P1-OC-T1 | 契約簿記：SC-34／SC-35 登記、SC-08 撤回、#5～#7 確認、pending 清空、`owner_item` 驗證放寬 | H | G | — |
+| P1-OC-T2 | SC-34 attach／recover 回應分離 `last_error`，移除 `last_error_passthrough` meta 項 | G | L | P1-OC-T1 |
+| P1-OC-T3 | SC-08 撤回：socket 權限還原 0660 基線 | H | L | P1-OC-T1 |
+| P1-OC-T4 | `DRAIN_STALLED`：release drain 逾時新錯誤碼 | G | L | P1-OC-T1 |
+| P1-OC-T5 | SC-35a passthrough 狀態機（不登入／不 probe、30 s 安靜升 READY、gate、self-test／recover／attach） | H | L | P1-OC-T2 |
+| P1-OC-T6 | SC-35b passthrough 命令路徑（完成條件、無救援按鍵、file.* 拒絕；SC-35 → IMPLEMENTED） | G | L | P1-OC-T5 |
+| P1-OC-T7 | 文件、SKILL 受管區段、#155 回歸 case、docker／Windows 原生驗證收尾 | G | H | P1-OC-T2～T6 |
+
 ### 跨 Phase 關鍵交接（本次審查定案的唯一 owner）
 
 | 介面／檔案 | 唯一建立者 | 後續 Phase 的處置 |
@@ -351,7 +367,7 @@
 | L1 完整性：`tests/acceptance/l1_required.lock.json`（每平台必要 nodeid 凍結）、`l1_results.schema.json`（`l1-results.v1`＝`SW_RESOURCE_REPORT` v2）、`l1_judge.py`（唯一判定實作）、`regen_lock.py --l1-add-only`；cargo 端 `scripts/rust/cargo_l1_results.py` | P2-T13；cargo 轉換器 P3-T17（R5-F3） | P3-T18、P4-T16、P5-T22、P6-T13、P7-T19、P9-T1 只以 `--l1-add-only` 新增 set，set 內 nodeid 由各 Phase 每個 Task 的紅燈 commit 逐 Task 登記、PR 以 `regen_lock.py --check --base` 防縮減（R5 審查後續）；P3～P9 的 L1 出口與 gate 一律依路徑載入 `l1_judge.py` 判定，不得以 `tests>0`、`passed>0`、`passed≥N` 或函式存在判定；P8-T15 結果檔同帶 `collected`／`exit_code`／`finished` |
 | `tests/contract_blackbox/bb_faketarget.py` | P3-T2 | P5-T15a、P6-T11、P7-T18A 以 keyword-only 擴充（不存在 `contract_blackbox/faketarget.py`） |
 | `behavior_changes.yaml` 新條目欄位 | P0-T1／T5 schema | 一律 `approved_at_revision`＋`ab_participation`，`contracts/` 內不得出現 `contract_revision` 鍵 |
-| SC 編號 | 調和表 SC-01～27 | P6：SC-28、29、31；P7：SC-30；P8：SC-32、33（原稿 SC-31／32 撞號，已改）；`test_bc_real_sc_df_ranges` 依序改為 `range(1,30)∪{31}` → `range(1,32)` → `range(1,34)`；DF-18 屬 P7；DF-19（self-test nonce probe 提交點 quiet 重驗，R5-F2）由 P0-T5 登記、P1-T20 實作，DF 期望 P0 為 `range(1,18)∪{19}`、P7 Task 0 起為 `range(1,20)` |
+| SC 編號 | 調和表 SC-01～27（SC-08 已由 OD-14 撤回，編號不重用）；P1-OC：SC-34、35（OD-14） | P6：SC-28、29、31；P7：SC-30；P8：SC-32、33（原稿 SC-31／32 撞號，已改）；`test_bc_real_sc_df_ranges` 依序改為 P1-OC `range(1,28)−{8}∪{34,35}` → P6 `(range(1,30)∪{31,34,35})−{8}` → P7 `(range(1,32)∪{34,35})−{8}` → P8 `range(1,36)−{8}`；P1-OC 清空 `pending_owner_confirmations` 並把 `owner_item` 驗證放寬為 ≥1，P8 的 SC-33 以 item 8 登記；DF-18 屬 P7；DF-19（self-test nonce probe 提交點 quiet 重驗，R5-F2）由 P0-T5 登記、P1-T20 實作，DF 期望 P0 為 `range(1,18)∪{19}`、P7 Task 0 起為 `range(1,20)` |
 
 ### 審查後仍未解決（需擁有者或後續 PR 處理）
 
