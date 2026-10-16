@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import errno
 import json
 import logging
 import os
@@ -8,42 +9,43 @@ import threading
 import time
 import zlib
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 from .constants import DEFAULT_WAL_ROTATE_BYTES, WAL_DIR
 from .util import dumps_stable, monotonic_ns, now_iso, to_printable
+from .wal_fs import PartialWriteError, WalFile, WalFs, default_wal_fs
 
 # 模組層 logger：append 的頻率等同 UART RX，而 logging.getLogger() 每次呼叫都會
 # 進 logging.Manager 取全域鎖——不可放在這條熱路徑上（#189）。
 _LOG = logging.getLogger("serialwrap")
 
 
-def _fsync_dir(path: str) -> None:
-    """rename 後 fsync 目錄，確保目錄 entry 持久化（POSIX 語意）。
-
-    Windows（nt）：``os.open`` 不可開目錄，會拋 Permission denied；NTFS 自行管理目錄
-    一致性，直接跳過（比照 session_manager._save_state 的 #84 PORT-4 守衛；#218）。
-    """
-    if os.name == "nt":
-        return
-    dir_fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
-
-
 class WalWriter:
-    def __init__(self, wal_dir: str | None = None, rotate_bytes: int = DEFAULT_WAL_ROTATE_BYTES) -> None:
+    def __init__(
+        self,
+        wal_dir: str | None = None,
+        rotate_bytes: int = DEFAULT_WAL_ROTATE_BYTES,
+        *,
+        fs: WalFs | None = None,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
         # None-sentinel：於建構時解析模組層 WAL_DIR（#120）——def-time default 會在類別定義時
         # 凍結 import 當下的值，使 conftest env 隔離與 setattr(wal, "WAL_DIR", ...) 全部失效。
         self._wal_dir = WAL_DIR if wal_dir is None else wal_dir
         self._rotate_bytes = rotate_bytes
         self._wal_path = os.path.join(self._wal_dir, "raw.wal.ndjson")
         self._mirror_path = os.path.join(self._wal_dir, "raw.mirror.log")
+        self._fs = fs if fs is not None else default_wal_fs()
+        self._clock = clock if clock is not None else time.monotonic
         self._lock = threading.Lock()
         self._seq = 0
+        self._wal_fp: WalFile | None = None
+        self._mirror_fp: WalFile | None = None
+        self._closed = False
+        self._dirty_tail = {"wal": False, "mirror": False}
+        self._unhealthy = False
+        self._unhealthy_reason: str | None = None
         # 稽核健康計數（#189）：WAL 目錄可能被外部工具整個刪掉，而服務先前對此毫無所覺。
         self._write_failures = 0
         self._last_write_error: str | None = None
@@ -64,14 +66,23 @@ class WalWriter:
         with self._lock:
             return self._seq
 
+    @property
+    def closed(self) -> bool:
+        with self._lock:
+            return self._closed
+
+    @property
+    def unhealthy(self) -> bool:
+        return self._unhealthy
+
     def _load_last_seq(self) -> None:
         if not os.path.exists(self._wal_path):
             self._seq = 0
             return
         last = 0
-        with open(self._wal_path, "r", encoding="utf-8", errors="replace") as fp:
-            for line in fp:
-                line = line.strip()
+        with open(self._wal_path, "rb") as fp:
+            for raw_line in fp:
+                line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line:
                     continue
                 try:
@@ -82,9 +93,13 @@ class WalWriter:
                     seq = obj.get("seq")
                     if isinstance(seq, int) and seq > last:
                         last = seq
+            fp.seek(0, os.SEEK_END)
+            if fp.tell() > 0:
+                fp.seek(-1, os.SEEK_END)
+                self._dirty_tail["wal"] = fp.read(1) != b"\n"
         self._seq = last
 
-    def _rotate_if_needed(self) -> bool:
+    def _rotate_if_needed(self, sizes: dict[str, int | None] | None = None) -> bool:
         """檔案超過上限時輪替。回傳 True 表示輪替過程發生 OSError 已被 best-effort 含住（degrade）。
 
         輪替只是「限制檔案大小」的最佳化，不是資料平面必要步驟。原本此方法在 ``append`` 的 try
@@ -94,23 +109,210 @@ class WalWriter:
         檔案，遠優於殺 reader（#79 Codex 必修）。
         """
         rotation_failed = False
+        observed_sizes = sizes if sizes is not None else {}
         for path in (self._wal_path, self._mirror_path):
             try:
-                if not os.path.exists(path):
+                size = self._fs.size(path)
+                observed_sizes[path] = size
+                if size is None:
                     continue
-                if os.path.getsize(path) < self._rotate_bytes:
+                if size < self._rotate_bytes:
                     continue
+                which = "wal" if path == self._wal_path else "mirror"
+                close_error = self._close_handle_locked(which, sync=True)
+                if close_error is not None:
+                    raise close_error
                 ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
                 dst = f"{path}.{ts}"
                 os.replace(path, dst)
-                _fsync_dir(os.path.dirname(path))
+                self._dirty_tail[which] = False
+                self._fs.sync_dir(os.path.dirname(path))
             except OSError as exc:
                 rotation_failed = True
-                import logging
-                logging.getLogger("serialwrap").warning(
-                    "WAL 輪替失敗（best-effort 續用既有檔案，不殺 reader）：%s：%s", path, exc
-                )
+                _LOG.warning("WAL 輪替失敗（best-effort 續用既有檔案，不殺 reader）：%s：%s", path, exc)
         return rotation_failed
+
+    def _handle_for(self, which: str) -> WalFile | None:
+        return self._wal_fp if which == "wal" else self._mirror_fp
+
+    def _set_handle(self, which: str, handle: WalFile | None) -> None:
+        if which == "wal":
+            self._wal_fp = handle
+        else:
+            self._mirror_fp = handle
+
+    def _path_for(self, which: str) -> str:
+        return self._wal_path if which == "wal" else self._mirror_path
+
+    def _close_handle_locked(self, which: str, *, sync: bool = False) -> Exception | None:
+        handle = self._handle_for(which)
+        if handle is None:
+            return None
+        # 先解除所有權，再執行可能失敗的 close；任何例外路徑都不會再關閉同一 handle。
+        self._set_handle(which, None)
+        first_error: Exception | None = None
+        if sync:
+            try:
+                handle.sync()
+            except Exception as exc:
+                first_error = exc
+        try:
+            handle.close()
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+        return first_error
+
+    def _open_handle_locked(self, which: str) -> WalFile:
+        handle = self._handle_for(which)
+        if handle is None:
+            handle = self._fs.open_append(self._path_for(which))
+            self._set_handle(which, handle)
+        return handle
+
+    def _write_once_locked(self, which: str, data: bytes) -> None:
+        self._open_handle_locked(which).write_all_flush(data)
+
+    @staticmethod
+    def _sent(exc: OSError, attempted_length: int) -> int:
+        if not isinstance(exc, PartialWriteError):
+            return 0
+        try:
+            sent = int(exc.sent)
+        except (AttributeError, TypeError, ValueError):
+            return 0
+        return min(max(sent, 0), attempted_length)
+
+    @staticmethod
+    def _tail_is_dirty(sent: int, data_length: int, prefix_length: int) -> bool:
+        if sent >= data_length:
+            return False
+        if prefix_length:
+            # sent=0 時舊殘行仍未終結；只寫出換行時則尚未開始新紀錄。
+            return sent == 0 or sent > prefix_length
+        return sent > 0
+
+    @staticmethod
+    def _write_error_text(exc: OSError) -> str:
+        reported = exc.__cause__
+        if isinstance(reported, OSError):
+            exc = reported
+        return f"{type(exc).__name__}: {exc}"
+
+    def _note_retry_succeeded(self, exc: OSError) -> None:
+        self._last_write_error = self._write_error_text(exc)
+        if isinstance(exc, FileNotFoundError) or exc.errno == errno.ENOENT:
+            self._record_recreated(exc)
+
+    def _record_recreated(self, exc: OSError) -> None:
+        self._recreated_count += 1
+        self._last_write_error = self._write_error_text(exc)
+        _LOG.warning(
+            "WAL 目錄 %s 消失，已重建並續寫（原因：%s）；消失期間的紀錄無法復原",
+            self._wal_dir,
+            exc,
+        )
+
+    def _check_missing_names_locked(self, sizes: dict[str, int | None]) -> None:
+        directory_missing = not os.path.isdir(self._wal_dir)
+        stale: list[str] = []
+        for which in ("wal", "mirror"):
+            if self._handle_for(which) is None:
+                continue
+            if directory_missing:
+                stale.append(which)
+                continue
+            path = self._path_for(which)
+            if path not in sizes:
+                # rotate 的 size 探測失敗時保留 handle；實際寫入路徑會回報可操作的錯誤。
+                continue
+            if sizes[path] is None:
+                stale.append(which)
+        if not stale:
+            return
+
+        for which in stale:
+            self._close_handle_locked(which)
+            # 遺失名稱代表原 inode 上的殘行已不再是目前檔案的一部分。
+            self._dirty_tail[which] = False
+        try:
+            self._fs.ensure_dir(self._wal_dir)
+        except OSError:
+            return
+        self._record_recreated(
+            FileNotFoundError(errno.ENOENT, "WAL 檔案路徑消失", self._wal_dir)
+        )
+
+    def _retry_write_locked(
+        self,
+        which: str,
+        data: bytes,
+        first_exc: OSError,
+        *,
+        first_attempt: bytes,
+        prefix_length: int = 0,
+    ) -> OSError | None:
+        sent = self._sent(first_exc, len(first_attempt))
+        if sent > 0:
+            if sent >= len(first_attempt):
+                self._dirty_tail[which] = False
+                self._note_retry_succeeded(first_exc)
+                return None
+            try:
+                self._write_once_locked(which, first_attempt[sent:])
+            except OSError as retry_exc:
+                total_sent = sent + self._sent(retry_exc, len(first_attempt) - sent)
+                self._dirty_tail[which] = self._tail_is_dirty(
+                    total_sent, len(first_attempt), prefix_length
+                )
+                return retry_exc
+            self._dirty_tail[which] = False
+            self._note_retry_succeeded(first_exc)
+            return None
+
+        close_error = self._close_handle_locked(which)
+        if close_error is not None:
+            self._dirty_tail[which] = bool(prefix_length)
+            return close_error if isinstance(close_error, OSError) else OSError(str(close_error))
+        try:
+            self._fs.ensure_dir(self._wal_dir)
+            self._write_once_locked(which, data)
+        except OSError as retry_exc:
+            retry_sent = self._sent(retry_exc, len(data))
+            self._dirty_tail[which] = self._tail_is_dirty(
+                retry_sent, len(data), prefix_length
+            )
+            return retry_exc
+        self._dirty_tail[which] = False
+        self._note_retry_succeeded(first_exc)
+        return None
+
+    def _write_one_locked(self, which: str, data: bytes) -> OSError | None:
+        if self._dirty_tail[which]:
+            try:
+                self._write_once_locked(which, b"\n")
+            except OSError as exc:
+                # 換行也寫不進去時重開 handle，將終結符與本筆資料合併重試。
+                return self._retry_write_locked(
+                    which,
+                    b"\n" + data,
+                    exc,
+                    first_attempt=b"\n",
+                    prefix_length=1,
+                )
+            self._dirty_tail[which] = False
+
+        try:
+            self._write_once_locked(which, data)
+        except OSError as exc:
+            return self._retry_write_locked(
+                which,
+                data,
+                exc,
+                first_attempt=data,
+            )
+        self._dirty_tail[which] = False
+        return None
 
     def append(
         self,
@@ -126,7 +328,11 @@ class WalWriter:
         payload_b64 = base64.b64encode(payload).decode("ascii")
         crc32 = zlib.crc32(payload) & 0xFFFFFFFF
         with self._lock:
-            rotation_failed = self._rotate_if_needed()
+            rotation_failed = False
+            if not self._closed:
+                sizes: dict[str, int | None] = {}
+                rotation_failed = self._rotate_if_needed(sizes)
+                self._check_missing_names_locked(sizes)
             self._seq += 1
             record = {
                 "seq": self._seq,
@@ -145,40 +351,60 @@ class WalWriter:
             if rotation_failed:
                 # 輪替失敗不丟資料（仍寫入既有檔），但標記供觀測；conditional key 維持常態 record 向後相容。
                 record["rotation_failed"] = True
-            try:
-                self._write_record_locked(record, payload)
-            except OSError as exc:
-                # #189：稽核目錄可能在 daemon 運行期間被外部工具整個刪掉（實地事故：
-                # testpilot 的 clean_wal() rmtree 硬編路徑 /tmp/serialwrap/wal）。append
-                # 每次都重開檔，故下一筆寫入立刻撞到 ENOENT——在這裡自癒重建目錄並重試
-                # 一次，而不是連續六天安靜地把稽核紀錄寫進虛空、seq 一路累加到 126 萬。
-                try:
-                    os.makedirs(self._wal_dir, exist_ok=True)
-                    self._write_record_locked(record, payload)
-                except OSError as retry_exc:
-                    # 重建也失敗（ENOSPC/EROFS/權限/fd 耗盡）不得讓資料平面（RX reader
-                    # thread）崩潰（#79 STA-1）。best-effort：標記 loss、告警，仍回傳
-                    # record 讓上游照常 fan-out 給 console、續處理後續 RX。
-                    record["loss_flag"] = True
-                    self._write_failures += 1
-                    self._last_write_error = f"{type(retry_exc).__name__}: {retry_exc}"
-                    _LOG.warning("WAL append 寫入失敗（best-effort 略過）：%s", retry_exc)
-                else:
-                    self._recreated_count += 1
-                    self._last_write_error = f"{type(exc).__name__}: {exc}"
-                    _LOG.warning(
-                        "WAL 目錄 %s 消失，已重建並續寫（原因：%s）；消失期間的紀錄無法復原",
-                        self._wal_dir, exc,
-                    )
+            if self._closed:
+                record["loss_flag"] = True
+                self._write_failures += 1
+                self._last_write_error = "WalClosed: writer closed"
+                return record
+
+            wal_error, mirror_error = self._write_record_locked(record, payload)
+            if wal_error is None:
+                self._unhealthy = False
+                self._unhealthy_reason = None
+            else:
+                record["loss_flag"] = True
+                self._write_failures += 1
+                self._last_write_error = self._write_error_text(wal_error)
+                self._unhealthy = True
+                self._unhealthy_reason = "write_failed"
+                _LOG.warning("WAL append 寫入失敗（best-effort 略過）：%s", wal_error)
+            if mirror_error is not None:
+                self._write_failures += 1
+                self._last_write_error = self._write_error_text(mirror_error)
+                _LOG.warning("WAL append 寫入失敗（best-effort 略過）：%s", mirror_error)
         return record
 
-    def _write_record_locked(self, record: dict[str, Any], payload: bytes) -> None:
+    def _write_record_locked(
+        self, record: dict[str, Any], payload: bytes
+    ) -> tuple[OSError | None, OSError | None]:
         """雙軌 append：權威 ndjson ＋ 人類可讀鏡像。須在 ``self._lock`` 內呼叫。"""
-        with open(self._wal_path, "a", encoding="utf-8") as wal_fp:
-            wal_fp.write(dumps_stable(record))
-            wal_fp.write("\n")
-        with open(self._mirror_path, "a", encoding="utf-8") as mirror_fp:
-            mirror_fp.write(to_printable(payload))
+        line = (dumps_stable(record) + "\n").encode("utf-8")
+        printable = to_printable(payload).encode("utf-8")
+        wal_error = self._write_one_locked("wal", line)
+        if printable:
+            mirror_error = self._write_one_locked("mirror", printable)
+        else:
+            try:
+                self._open_handle_locked("mirror")
+            except OSError:
+                # 空 META 不寫 mirror，也不因其 best-effort 開檔失敗影響權威 WAL。
+                pass
+            mirror_error = None
+        return wal_error, mirror_error
+
+    def close(self) -> None:
+        """同步並關閉目前持有的 WAL 與 mirror handle；重複呼叫不重複關閉。"""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            first_error: Exception | None = None
+            for which in ("wal", "mirror"):
+                error = self._close_handle_locked(which, sync=True)
+                if first_error is None and error is not None:
+                    first_error = error
+            if first_error is not None:
+                raise first_error
 
     def health(self) -> dict[str, Any]:
         """稽核紀錄的活體健康（#189）。
@@ -207,6 +433,8 @@ class WalWriter:
         failures = self._write_failures
         last_error = self._last_write_error
         recreated = self._recreated_count
+        unhealthy = self._unhealthy
+        unhealthy_reason = self._unhealthy_reason
         return {
             "wal_dir": self._wal_dir,
             "wal_path": self._wal_path,
@@ -221,7 +449,9 @@ class WalWriter:
                 wal_dir_exists
                 and wal_dir_writable
                 and not (seq > 0 and not wal_file_exists)
+                and not unhealthy
             ),
+            "unhealthy_reason": unhealthy_reason,
         }
 
     def available_from_seq(self) -> int | None:
@@ -244,11 +474,16 @@ class WalWriter:
         with self._lock:
             prev_seq = self._seq
             ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
-            for path in (self._wal_path, self._mirror_path):
-                if os.path.exists(path) and os.path.getsize(path) > 0:
+            for which, path in (("wal", self._wal_path), ("mirror", self._mirror_path)):
+                size = self._fs.size(path)
+                if size is not None and size > 0:
+                    close_error = self._close_handle_locked(which, sync=True)
+                    if close_error is not None:
+                        raise close_error
                     dst = f"{path}.{ts}"
                     os.replace(path, dst)
-            _fsync_dir(self._wal_dir)
+                    self._dirty_tail[which] = False
+            self._fs.sync_dir(self._wal_dir)
             self._seq = 0
             return {"ok": True, "previous_seq": prev_seq, "rotated_suffix": ts}
 
@@ -259,7 +494,7 @@ class WalWriter:
         """
         with open(self._wal_path, "r", encoding="utf-8", errors="replace") as fp:
             for line in fp:
-                line = line.strip()
+                line = line.rstrip("\r\n")
                 if not line:
                     continue
                 try:

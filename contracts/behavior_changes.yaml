@@ -30,7 +30,7 @@ changes:
     ab_participation: "diff"
     phases: ["P1", "P5"]
     case_ids: ["bc01-wal-resident-handle", "bc01-wal-flush-per-record", "bc01-wal-rotate-normal", "bc01-wal-external-unlink-meta", "bc01-wal-external-reader-handle", "bc01-wal-recreate-failure-stops-tx", "bc01-f12-oracle-progress"]
-    compatibility_impact: "WAL 改為常駐 handle 並每筆 flush，寫入路徑不再每筆開關檔。外部 unlink／替換（含只刪檔、目錄消失）經有界重試重建成功後，先寫首筆 META WAL_RECREATED_AFTER_EXTERNAL_UNLINK（loss_flag:true、potentially_lost_seq_range，不再靜默）；正常 rotate 不寫缺口 META。WAL 重建失敗時有界處置並停止新增自動 UART TX（已完成的 UART 寫入不因 WAL append 失敗而自動重送）。正常 rotate 門檻 67108864 與 WAL 記錄格式不變。Windows 上外部讀取者的 share-delete 相容性改變。對讀取 WAL 的 L2／L3：可能出現 META 缺口事件。"
+    compatibility_impact: "WAL 改為常駐 handle 並每筆 flush，寫入路徑不再每筆開關檔。Windows 新寫入 WAL 行尾與 mirror 內的換行由文字模式 CRLF 改為 binary 模式 LF；讀取端仍接受既有 WAL CRLF 檔案。health.status.wal 新增 unhealthy_reason 欄位。外部 unlink／替換（含只刪檔、目錄消失）經有界重試重建成功後，先寫首筆 META WAL_RECREATED_AFTER_EXTERNAL_UNLINK（loss_flag:true、potentially_lost_seq_range，不再靜默）；正常 rotate 不寫缺口 META。WAL 重建失敗時有界處置並停止新增自動 UART TX（已完成的 UART 寫入不因 WAL append 失敗而自動重送）。正常 rotate 門檻 67108864 與 WAL 記錄格式不變。Windows 上外部讀取者的 share-delete 相容性改變。對讀取 WAL 的 L2／L3：可能出現 META 缺口事件。"
     approval_conditions: "同時核准正常 rotate、外部 handle 阻擋、有界失敗處置及 META 語意；F12 oracle 由 OD-13 配套核准"
     related_decisions: ["OD-04", "OD-05", "OD-13"]
   - id: "BC-02"
@@ -1297,7 +1297,7 @@ changes:
   - id: "DF-17"
     kind: "DF"
     title: "WAL／mirror 寫入失敗重試不重複 seq"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-15"

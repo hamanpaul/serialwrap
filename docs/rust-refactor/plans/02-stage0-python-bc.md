@@ -245,7 +245,9 @@
 
 **Files**
 - Create: `sw_core/wal_fs.py`、`tests/test_stage0_wal_handle.py`
-- Modify: `sw_core/wal.py`、`sw_core/constants.py`（新增 `WAL_IDENTITY_CHECK_INTERVAL_S = 0.05`、`WAL_RECREATE_BACKOFF_S = (0.01, 0.05, 0.2)`、`WAL_RECREATE_RETRY_INTERVALS_S = (1.0, 2.0, 5.0)`（之後封頂 5.0）、`DRAIN_TIMEOUT_MS = 3000`；同步回填 `docs/rust-refactor/plans/rust-architecture.md` §3.1 常數表）、`contracts/rpc_schema.json`（`health.status` 的 `wal` 子物件新增 `unhealthy_reason`，見規格第 7 點）
+- Modify: `sw_core/wal.py`、`sw_core/constants.py`（新增 `WAL_IDENTITY_CHECK_INTERVAL_S = 0.05`、`WAL_RECREATE_BACKOFF_S = (0.01, 0.05, 0.2)`、`WAL_RECREATE_RETRY_INTERVALS_S = (1.0, 2.0, 5.0)`（之後封頂 5.0）、`DRAIN_TIMEOUT_MS = 3000`）、`contracts/rpc_schema.json`（`health.status` 的 `wal` 子物件新增 `unhealthy_reason`，見規格第 7 點）、`contracts/behavior_changes.yaml`（DF-17 狀態推進）、`contracts/daemon_logging.yaml`（同步 WAL logger 呼叫點）、`docs/rust-refactor/plans/rust-architecture.md`（回填 §3.1 常數表及 §5.8 尾行語意）
+
+> `contracts/daemon_logging.yaml` 的 WAL `source` 行號須對齊 AST logger 呼叫位置；T04／T05 後續修改 `sw_core/wal.py` 時同步重校。
 
 **Interfaces**
 - Consumes：`sw_core.util.dumps_stable`、`to_printable`、`now_iso`、`monotonic_ns`（既有）。
@@ -288,13 +290,13 @@
 
 **行為規格（實作者必須逐條滿足）**
 1. handle **延遲開啟**：第一次 append 才開 WAL 與 mirror（維持現況「無流量時不產生檔案」的可觀測行為，`health.wal_file_exists` 不變）。
-2. 每筆 append：鎖外算 b64／crc；鎖內 `rotate_if_needed`（T04）→ 名稱消失檢查（第 4 點）→ `identity_check`（T05）→ `seq += 1` → 序列化 → `wal.write_all_flush(line_bytes)` → `mirror.write_all_flush(to_printable(payload).encode("utf-8"))`。檔案以 binary unbuffered 開啟；`line_bytes = (dumps_stable(record) + "\n").encode("utf-8")`。POSIX 上與現況逐位元組相同；**Windows 上現況為文字模式 `open(path, "a", encoding="utf-8")`，換行實際寫成 `\r\n`，新格式只寫 `\n`——此為 BC-01 附帶的位元組差異**，於 `contracts/behavior_changes.yaml` BC-01 的說明欄註明，並以 `windows_native` 測試釘死新格式；讀取端（`_iter_matching`／`tail_*`、T17 oracle、Rust reader）必須同時接受舊檔的 `\r\n` 行尾（`json.loads` 前 `rstrip("\r\n")`）。
+2. 每筆 append：鎖外算 b64／crc；鎖內 `rotate_if_needed`（T04）→ 名稱消失檢查（第 4 點）→ `identity_check`（T05）→ `seq += 1` → 序列化 → `wal.write_all_flush(line_bytes)` → `mirror.write_all_flush(to_printable(payload).encode("utf-8"))`。檔案以 binary unbuffered 開啟；`line_bytes = (dumps_stable(record) + "\n").encode("utf-8")`。POSIX 上與現況逐位元組相同；**Windows 上現況為文字模式 `open(path, "a", encoding="utf-8")`，WAL 行尾與 mirror 中的換行實際寫成 `\r\n`，新格式只寫 `\n`——此為 BC-01 附帶的位元組差異**，於 `contracts/behavior_changes.yaml` BC-01 的說明欄註明，並以 `windows_native` 測試釘死 WAL 新格式；讀取端（`_iter_matching`／`tail_*`、T17 oracle、Rust reader）必須同時接受舊 WAL 的 `\r\n` 行尾（`json.loads` 前 `rstrip("\r\n")`）。
 3. DF-17 與部分寫入：WAL、mirror 各自獨立重試，WAL 行任何情況下同一 seq 最多出現一次，且不得產生被串接的 NDJSON 行。以 `PartialWriteError.sent` 判定進度：
    - `sent == 0`（含 `write_all_flush` 前開檔失敗；非 `PartialWriteError` 的一般 `OSError` 一律視為 `sent == 0`，測試替身直接擲 `OSError` 即走此路）：關閉該 handle、`ensure_dir`、重開、重寫**整行**一次。
    - `0 < sent < len(data)`：**不得重寫整行**；在同一 handle 上只補寫剩餘的 `data[sent:]` 一次（POSIX `O_APPEND`／Windows `FILE_APPEND_DATA` 且唯一 writer 持鎖，故補寫緊接前綴）；補寫仍失敗 → 設 `_dirty_tail[which]=True`（下一次對該檔寫入前先寫一個 `b"\n"` 終結殘行，殘行成為一筆會被讀取端判為無效的行，不得與下一筆串接），本筆視為寫入失敗。
    - `write_all_flush` 已回傳（全部寫出）後任何後續步驟的例外都不得觸發重寫。
-   - WAL 重試仍失敗：回傳 record `loss_flag=True`、`write_failures += 1`、`last_write_error` 記重試例外（`f"{type(exc).__name__}: {exc}"`）；mirror 重試仍失敗：`write_failures += 1`、`last_write_error` 更新，回傳 record 的 `loss_flag` **維持** `False`（權威紀錄 WAL 已寫入）。既有 warning log 文字保留（盤點 04 §1.4 第 2、3 點）。
-4. 名稱消失（**不受** T05 的 50 ms 節流）：每筆 append 在寫入前檢查 `not os.path.isdir(wal_dir)` 或 `fs.size(path) is None`（rotate 本來每筆都呼叫 `size`，不增加 syscall 次數）；命中時關閉該 handle、`ensure_dir`、重開（`_recreated_count += 1`，既有 warning 保留）——常駐 fd 對已刪 inode 寫入不會報錯，若不先檢查名稱，`rmtree` 後的紀錄會寫進虛空（`tests/test_wal_missing_detection.py` 既有三個自癒測試依賴此行為）。META 補寫與 identity／DeletePending 比對由 T05 負責；T05 的節流只套用在後兩者。
+   - WAL 重試仍失敗：回傳 record `loss_flag=True`、`write_failures += 1`、`last_write_error` 記重試例外；若例外由 `PartialWriteError` 包裝，使用其底層 `OSError` 格式化（`f"{type(os_error).__name__}: {os_error}"`），保留既有健康欄位文字；mirror 重試仍失敗：`write_failures += 1`、`last_write_error` 更新，回傳 record 的 `loss_flag` **維持** `False`（權威紀錄 WAL 已寫入）。既有 warning log 文字保留（盤點 04 §1.4 第 2、3 點）。
+4. 名稱消失（**不受** T05 的 50 ms 節流）：每筆 append 在寫入前檢查 `not os.path.isdir(wal_dir)` 或 rotate 已取得的 `fs.size(path) is None`（名稱檢查重用 rotate 的 size 結果，不增加 `size` syscall 次數）；命中時關閉該 handle、`ensure_dir`、重開（`_recreated_count += 1`，既有 warning 保留）——常駐 fd 對已刪 inode 寫入不會報錯，若不先檢查名稱，`rmtree` 後的紀錄會寫進虛空（`tests/test_wal_missing_detection.py` 既有三個自癒測試依賴此行為）。META 補寫與 identity／DeletePending 比對由 T05 負責；T05 的節流只套用在後兩者。
 5. `close()`：持鎖；WAL、mirror 各自 `sync()` 後 `close()`；設 `closed=True`。之後的 append 不重開檔：回傳 record `loss_flag=True`、`write_failures += 1`、`last_write_error="WalClosed: writer closed"`，seq 照常遞增。
 6. 任一 handle 開啟成功、另一個失敗時，已開啟者保留供下次使用，不得洩漏或重複開啟；例外路徑中只有持有者負責 close。
 7. 權威 WAL 不可寫即不健康（規格 §8.2「記錄不可用時」、§1.3）：WAL（非 mirror）在第 3 點重試後仍失敗，或首次開檔失敗（含 ENOSPC、EIO、EACCES、`WalClosed` 以外）→ `unhealthy=True`、`unhealthy_reason="write_failed"`；下一筆 WAL 成功寫入即清除（`unhealthy=False`、`unhealthy_reason=None`）。mirror-only 失敗不影響 `unhealthy`。`health()` 在既有 10 鍵之後新增 `"unhealthy_reason"`（`None`｜`"write_failed"`｜`"recreate_failed"`（T05）），`healthy = 既有公式 and not self.unhealthy`；`unhealthy` property 在本 Task 建立，T05 擴充 `recreate_failed`。T05 的「停止自動 TX」對兩種 reason 一視同仁。
@@ -410,30 +412,43 @@
   | `test_wal_permanent_failure_sets_loss_flag` | WAL 兩次都失敗 → 回傳 `loss_flag is True`、`write_failures == 1`、seq 仍被消耗（下一筆 seq 為 3） |
   | `test_dir_removed_still_self_heals` | `shutil.rmtree(tmp_path)` 後**立即**（不推進 clock）append → 檔案重建、紀錄落在新檔、`health()["recreated_count"] == 1`（第 4 點不受節流） |
   | `test_file_unlinked_name_check_unthrottled` | 只 `os.unlink(wal_path)` 後立即 append → 新檔存在且含該筆（META 由 T05 補，本 Task 不斷言 META） |
+  | `test_empty_meta_first_append_creates_empty_mirror` | 首筆空 payload META 仍延遲建立空 mirror 檔並持有 handle；不寫 mirror bytes，也不計為失敗 |
   | `test_restart_resumes_max_seq` | 寫 5 筆後新建 `WalWriter(wal_dir=…)` 的下一筆 seq 為 6（盤點 04 §1.7） |
+  | `test_restart_terminates_unterminated_wal_tail_before_new_record` | 重啟時若 WAL 最後 byte 不是 LF，下一筆前先終結舊殘行；新紀錄仍為完整且可解析的獨立行 |
+  | `test_append_reuses_rotation_size_checks_for_name_detection` | 每次 append 的 WAL／mirror `fs.size` 各呼叫一次；名稱檢查重用 rotate 探測結果 |
   | `test_partial_write_then_eio_completes_suffix_only` | WAL 第一次 `os.write` 只寫前 10 bytes 後擲 `OSError(EIO)`、補寫成功 → 檔案中該筆為完整單行、JSON 可解析、全檔 seq 唯一 |
   | `test_partial_write_suffix_failure_terminates_tail` | 前綴寫出後補寫也失敗 → 回傳 `loss_flag is True`；下一筆 append 前先寫 `\n`：檔案中殘行獨立成一行（`json.loads` 失敗）、下一筆為完整獨立行、seq 不重複 |
   | `test_full_write_then_exception_not_rewritten` | 包裝 `write_all_flush` 在委派完整寫出後才擲例外 → 該 seq 只出現一次 |
+  | `test_partial_write_error_preserves_underlying_os_message` | POSIX 包裝的 `PartialWriteError` 保留底層 `OSError` 的 errno／訊息與 cause |
+  | `test_health_last_write_error_uses_underlying_oserror` | `health.last_write_error` 對部分寫入錯誤仍使用基線 `OSError: [Errno …] …` 格式 |
   | `test_wal_persistent_failure_marks_unhealthy_write_failed` | WAL 兩次寫入都 `OSError(ENOSPC)` → `health()["healthy"] is False`、`unhealthy_reason == "write_failed"`、`w.unhealthy is True`；下一筆成功 → 恢復 `None`／`True` |
   | `test_first_open_failure_marks_unhealthy` | `open_append` 擲 `PermissionError` → `unhealthy_reason == "write_failed"` |
   | `test_mirror_only_failure_keeps_healthy` | 只有 mirror 永久失敗 → `unhealthy is False` |
   | `test_native_line_ending_is_lf_only`（`windows_native`） | Windows 上寫一筆後原始 bytes 以 `b"}\n"` 結尾且不含 `b"\r\n"`；預先放入 `\r\n` 行尾的舊檔可被 `tail_raw` 正常讀出 |
 - [ ] **A2 執行並確認 FAIL**：`python3 -m pytest -q tests/test_stage0_wal_handle.py` → 預期 `ModuleNotFoundError: No module named 'sw_core.wal_fs'`。commit：`test(wal): BC-01 常駐 handle 與 DF-17 失敗測試`
 - [ ] **B1 實作**：
-  - `PosixWalFs.open_append`：`fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o666)`；`fp = os.fdopen(fd, "ab", buffering=0)`；`fdopen` 失敗時 `os.close(fd)` 再 raise。`write_all_flush`：`view = memoryview(data)`；迴圈 `n = fp.write(view[sent:])`，`n is None or n <= 0` → `PartialWriteError(errno.EIO, "short write", sent=sent)`；`OSError` → 轉成 `PartialWriteError(e.errno, str(e), sent=sent)`（`from e`）。`identity`：`st = os.fstat(fp.fileno()); return (st.st_dev, st.st_ino)`。`unlinked`：`os.fstat(...).st_nlink == 0`。`close`：`if not self._closed: self._closed = True; fp.close()`。`path_identity`：`os.stat` → `(st_dev, st_ino)`，`FileNotFoundError` → `None`。`sync_dir`：沿用 `_fsync_dir`（nt 直接 return）。
+  - `PosixWalFs.open_append`：`fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o666)`；`fp = os.fdopen(fd, "ab", buffering=0)`；`fdopen` 失敗時 `os.close(fd)` 再 raise。`write_all_flush`：`view = memoryview(data)`；迴圈 `n = fp.write(view[sent:])`，`n is None or n <= 0` → `PartialWriteError(errno.EIO, "short write", sent=sent)`；`OSError` → 以 `e.strerror or str(e)` 建立 `PartialWriteError(e.errno, ..., sent=sent)`（`from e`）。`identity`：`st = os.fstat(fp.fileno()); return (st.st_dev, st.st_ino)`。`unlinked`：`os.fstat(...).st_nlink == 0`。`close`：`if not self._closed: self._closed = True; fp.close()`。`path_identity`：`os.stat` → `(st_dev, st_ino)`，`FileNotFoundError` → `None`。`sync_dir` 的 POSIX／Windows 分支只留在 `PosixWalFs` seam 內；T02 的 `rename_noreplace_or_suffix` 不實作，交由 T04 定義並驗證。
   - `WalWriter`：新增 `_fs`、`_wal_fp: WalFile | None`、`_mirror_fp: WalFile | None`、`_closed`、`_dirty_tail: dict[str, bool]`、`_unhealthy`、`_unhealthy_reason`、`_clock = clock or time.monotonic`；`_write_record_locked(record, payload)` 改為：
     ```python
     line = (dumps_stable(record) + "\n").encode("utf-8")
     mirror = to_printable(payload).encode("utf-8")
     wal_err = self._write_one_locked("wal", line)      # 依 PartialWriteError.sent 分流：sent==0→close→ensure_dir→reopen→整行重寫一次；sent>0→只補寫 data[sent:]，再失敗設 _dirty_tail
-    mirror_err = self._write_one_locked("mirror", mirror) if mirror else None
+    if mirror:
+        mirror_err = self._write_one_locked("mirror", mirror)
+    else:
+        try:
+            self._open_handle_locked("mirror")  # 首筆空 META 仍建立空 mirror 檔，不寫入 bytes
+        except OSError:
+            pass
+        mirror_err = None
     ```
-    `_write_one_locked(which, data) -> BaseException | None`：`_dirty_tail[which]` 為真時先寫 `b"\n"`（成功才清旗標；`\n` 寫入失敗視同本筆 `sent==0`，依第 3 點重開後重寫 `\n`＋整行一次，**不得**在殘行未終結時直接寫入該行——與 Rust arch §5.8 第 5 點「`b"\n" ++ data` 合併計算 sent」位元組結果相同，R2-F3）；handle 為 None 時先 `open_append`；依規格第 3 點以 `PartialWriteError.sent` 分流（`sent==0`→關閉、`ensure_dir`、重開、重寫整行一次；`sent>0`→同 handle 補寫 `data[sent:]` 一次，失敗設 `_dirty_tail`）；成功且第一次例外為 `FileNotFoundError`（目錄消失）時沿用既有 `_recreated_count += 1` 與 warning；仍失敗回傳例外。`append` 依規格第 3、7 點設定 `loss_flag`、`write_failures`、`last_write_error`、`unhealthy`。空 payload 的 mirror 不寫（與現況相同，META 不寫 mirror）。第 4 點名稱檢查置於 `_rotate_if_needed` 之後、寫入之前。
+    `_rotate_if_needed(sizes: dict[str, int | None] | None = None) -> bool` 保留既有 bool 回傳；`append` 傳入 size snapshot dict，供名稱消失檢查重用 rotate 已取得的結果。
+    `_write_one_locked(which, data) -> BaseException | None`：`_dirty_tail[which]` 為真時先寫 `b"\n"`（成功才清旗標；`\n` 寫入失敗視同本筆 `sent==0`，依第 3 點重開後重寫 `\n`＋整行一次，**不得**在殘行未終結時直接寫入該行——與 Rust arch §5.8 第 5 點「`b"\n" ++ data` 合併計算 sent」位元組結果相同，R2-F3）；handle 為 None 時先 `open_append`；依規格第 3 點以 `PartialWriteError.sent` 分流（`sent==0`→關閉、`ensure_dir`、重開、重寫整行一次；`sent>0`→同 handle 補寫 `data[sent:]` 一次，失敗設 `_dirty_tail`）；成功且第一次例外為 `FileNotFoundError`（目錄消失）時沿用既有 `_recreated_count += 1` 與 warning；仍失敗回傳例外。`append` 依規格第 3、7 點設定 `loss_flag`、`write_failures`、`last_write_error`、`unhealthy`。空 payload 的 mirror 不寫 bytes；首次 append 仍 best-effort 開啟 mirror，以保留基線建立空 mirror 檔的行為，開啟失敗不計失敗且不影響 WAL。第 4 點名稱檢查置於 `_rotate_if_needed` 之後、寫入之前。
   - `_iter_matching`／`tail_*` 讀取時對每行先 `rstrip("\r\n")`（接受 Windows 舊檔 `\r\n`）；無法解析的行沿用現況處理（略過）。
   - `contracts/rpc_schema.json` 的 `health.status` 結果 schema：`wal` 子物件新增 `unhealthy_reason`（`null`｜`"write_failed"`｜`"recreate_failed"`），遞增 `x-catalog-revision`；P0 的 rpc schema 漂移測試須通過。
   - `close()`、`closed` 依規格第 5 點。
-  - `_load_last_seq` 不變（啟動時以 `open(..., "r")` 掃描，掃描完即關，不持有 handle）。
-- [ ] **B2 執行並確認 PASS**：`python3 -m pytest -q tests/test_stage0_wal_handle.py tests/test_wal.py tests/test_wal_integrity.py tests/test_wal_missing_detection.py tests/test_log_tail_latest.py tests/test_contracts_rpc_schema.py`（`test_wal_missing_detection.py` 三個自癒測試必須不改即通過）；`scripts/stage0/win-pytest.sh tests/test_stage0_wal_handle.py`；全套依 §0 第 4 點。
+  - `_load_last_seq` 啟動時掃描有效 seq，掃描完即關、不持有 handle；另檢查非空 WAL 最後 byte，若不是 LF 則設定 WAL `dirty_tail`，避免重啟後把新紀錄串接到殘行。
+- [ ] **B2 執行與證據狀態**：Linux 執行 `python3 -m pytest -q tests/test_stage0_wal_handle.py tests/test_wal.py tests/test_wal_integrity.py tests/test_wal_missing_detection.py tests/test_log_tail_latest.py tests/test_contracts_rpc_schema.py`（`test_wal_missing_detection.py` 三個自癒測試必須不改即通過）及全套依 §0 第 4 點。原生 Windows `scripts/stage0/win-pytest.sh tests/test_stage0_wal_handle.py` 在 T03 的 `WindowsWalFs`／share-delete handle 落地前預期有 delete-sharing 失敗，記為「待 T03 重跑／證據不足」，不得列 PASS；T03 後須原生重跑該檔與其計畫指定的 WAL 核心測試。
 - **測試資產變更**：無。
 - [ ] **B3 commit**：`perf(wal): BC-01 改為常駐 handle 與每筆 flush，mirror 失敗不重複 WAL seq`
 

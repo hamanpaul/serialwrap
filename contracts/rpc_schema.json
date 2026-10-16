@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/hamanpaul/serialwrap/contracts/rpc_schema.json",
   "title": "serialwrap RPC contract",
-  "x-catalog-revision": 1,
+  "x-catalog-revision": 2,
   "x-wire": {
     "framing": "ndjson",
     "line_strip": true,
@@ -2795,7 +2795,8 @@
               "write_failures",
               "last_write_error",
               "recreated_count",
-              "healthy"
+              "healthy",
+              "unhealthy_reason"
             ],
             "properties": {
               "wal_dir": {
@@ -2830,6 +2831,17 @@
               },
               "healthy": {
                 "type": "boolean"
+              },
+              "unhealthy_reason": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "enum": [
+                  null,
+                  "write_failed",
+                  "recreate_failed"
+                ]
               }
             },
             "required": [
@@ -2842,9 +2854,10 @@
               "write_failures",
               "last_write_error",
               "recreated_count",
-              "healthy"
+              "healthy",
+              "unhealthy_reason"
             ],
-            "x-note": "healthy = dir_exists and dir_writable and not (seq>0 and not file_exists)；不取 WAL 鎖"
+            "x-note": "healthy = dir_exists and dir_writable and not (seq>0 and not file_exists) and not unhealthy；unhealthy_reason 為 null、write_failed 或 recreate_failed；不取 WAL 鎖"
           },
           "limits": {
             "type": "object",

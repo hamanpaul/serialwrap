@@ -63,6 +63,10 @@ DEVICE_BY_ID_DIR = _env_path("SERIALWRAP_BY_ID_DIR", "/dev/serial/by-id")
 DEVICE_BY_PATH_DIR = _env_path("SERIALWRAP_BY_PATH_DIR", "/dev/serial/by-path")
 LOG_DIR = _env_path("SERIALWRAP_LOG_DIR", os.path.join(os.path.expanduser("~"), "b-log"))
 DEFAULT_WAL_ROTATE_BYTES = 64 * 1024 * 1024
+WAL_IDENTITY_CHECK_INTERVAL_S: float = 0.05
+WAL_RECREATE_BACKOFF_S: tuple[float, ...] = (0.01, 0.05, 0.2)
+WAL_RECREATE_RETRY_INTERVALS_S: tuple[float, ...] = (1.0, 2.0, 5.0)
+DRAIN_TIMEOUT_MS: int = 3000
 EVENTS_DIR = _env_path(
     "SERIALWRAP_EVENTS_DIR",
     os.path.join(os.path.expanduser("~"), ".serialwrap", "events.d"),

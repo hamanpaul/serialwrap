@@ -133,18 +133,25 @@ messages:
     level: WARNING
     template: "WAL 輪替失敗（best-effort 續用既有檔案，不殺 reader）：%s：%s"
     args: [path, exc]
-    source: "sw_core/wal.py:110"
+    source: "sw_core/wal.py:132"
 
   - id: wal_append_failed
     logger: serialwrap
     level: WARNING
     template: "WAL append 寫入失敗（best-effort 略過）：%s"
-    args: [retry_exc]
-    source: "sw_core/wal.py:165"
+    args: [wal_error]
+    source: "sw_core/wal.py:370"
+
+  - id: mirror_append_failed
+    logger: serialwrap
+    level: WARNING
+    template: "WAL append 寫入失敗（best-effort 略過）：%s"
+    args: [mirror_error]
+    source: "sw_core/wal.py:374"
 
   - id: wal_dir_recreated
     logger: serialwrap
     level: WARNING
     template: "WAL 目錄 %s 消失，已重建並續寫（原因：%s）；消失期間的紀錄無法復原"
     args: [wal_dir, exc]
-    source: "sw_core/wal.py:169"
+    source: "sw_core/wal.py:210"

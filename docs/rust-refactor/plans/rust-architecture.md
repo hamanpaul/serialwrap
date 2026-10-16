@@ -158,6 +158,9 @@ sw-pal ────────┘ ←  sw-cli（只依賴 sw-proto + sw-pal；�
 | `DEFAULT_TCP_PORT` | `48700`（env `SERIALWRAP_TCP_PORT` 以 Python `int()` 規則解析；空字串或非整數：CLI 與 daemon 皆 exit 1，stderr 一行 `serialwrap: invalid SERIALWRAP_TCP_PORT: ...`，見 `GAP-X1`） | constants.py:47 |
 | `LOOPBACK_TCP_HOSTS` | `["127.0.0.1","localhost","::1"]` | :49 |
 | `DEFAULT_WAL_ROTATE_BYTES` | `67108864`（條件 `size >= R`，寫入前檢查；WAL 與 mirror 各自判斷） | :65 |
+| `WAL_IDENTITY_CHECK_INTERVAL_S` | `0.05`（外部 unlink／替換身分檢查節流，§8.2） | BC-01 |
+| `WAL_RECREATE_BACKOFF_S` | `[0.01,0.05,0.2]`（外部 unlink 後重開檔案的有界退避，§8.2） | BC-01 |
+| `WAL_RECREATE_RETRY_INTERVALS_S` | `[1.0,2.0,5.0]`（重建失敗後再次嘗試的間隔，最高 5.0 秒） | BC-01 |
 | `EVENTS_LOG_ROTATE_BYTES`／`EVENTS_LOG_BACKUP_COUNT` | `10485760`／`3` | event_log.py |
 | `RX_RATE_WINDOW_S`／`RX_FLOOD_BYTES_PER_10S` | `10.0`／`20000` | :91,93 |
 | `TRANSPORT_STALL_MIN_RX_AGE_S` | `30.0` | :102 |
@@ -190,7 +193,7 @@ sw-pal ────────┘ ←  sw-cli（只依賴 sw-proto + sw-pal；�
 | 裝置 | watcher poll `1.0`；Windows BT TTL `5.0`；`max_sessions` 預設 `16` | device_*.py、config.py |
 | self-test／recover | probe timeout 預設 `2.0`；force recover `10×1.0s`；CTRL_C／CTRL_D 各等 `min(timeout_s,2.0)` | session_manager.py |
 | human console | `timeout_s=30.0`、`priority=100`、`source="human:<client_id>"`、`HUMAN_INTERACTIVE_COMMANDS`（18 個，02 §9） | service.py |
-| Drain（新） | `DRAIN_TIMEOUT_MS=3000`（§5.2.5） | 規格 |
+| Drain（新） | `DRAIN_TIMEOUT_MS=3000`（§5.2.5） | constants.py |
 
 `runtime_paths.rs`：`RuntimePaths::resolve(env: &EnvSnapshot, native: NativeTraits) -> RuntimePaths`。逐字重現 constants.py 的 import-time 規則，包含：
 
@@ -856,7 +859,7 @@ TxWriter 的 job queue 容量 64；滿時 OpRunner 阻塞等待（只有 OpRunne
      - 該檔 `dirty_tail` 為真時，本次實際寫出的資料為 `b"\n" ++ data`（先終結上一筆殘行；位元組結果與 P1「先寫 `\n` 再寫該行」相同），以下 `sent` 以合併後長度計。
      - `sent == 0`（含開檔失敗）：關閉該 handle、`ensure_dir`、重開，**整段**重寫一次。
      - `0 < sent < len`：**不得重寫整段**；在同一 handle 上只補寫 `data[sent..]` 一次（O_APPEND／FILE_APPEND_DATA＋唯一 writer 持鎖，補寫緊接前綴）。
-     - 重試（整段重寫或補寫）仍失敗：若最終已確認長度落在殘行內（大於終結 `\n` 的長度且小於總長），設 `dirty_tail=true`，下一次對該檔寫入前先終結殘行，殘行成為一筆讀取端判為無效、被略過的獨立行；否則 `dirty_tail=false`。本筆視為該檔寫入失敗。
+     - 重試（整段重寫或補寫）仍失敗：若最終已確認長度落在新紀錄殘行內（大於終結 `\n` 的長度且小於總長），設 `dirty_tail=true`；若原 `dirty_tail` 為真且合併寫入的最終確認長度為 0，舊殘行仍未終結，也設 `dirty_tail=true`。兩種情況都須在下一次對該檔寫入前先終結殘行，使其成為讀取端判為無效、被略過的獨立行；其餘情況（例如只確認寫出終結 `\n`）設 `dirty_tail=false`。本筆視為該檔寫入失敗。
      - 全部寫出（含補寫成功）→ 清 `dirty_tail`、本筆該檔成功；`write_all_flush` 已回 `Ok` 後的任何後續錯誤都不得觸發重寫。
   6. 失敗時設 `loss_flag`、遞增 `write_failures`、記錄 `last_write_error`；WAL 的「首次嘗試＋重試」皆失敗（含部分寫入後補寫失敗）即本筆寫入失敗：`write_failures` 只 +1（每筆每檔最多計一次，與 P1 T02 相同），`unhealthy_reason="write_failed"`，下一筆完整寫出才恢復。
 - **unlink 偵測**：每次 append 時，若距上次檢查 ≥ 50 ms，比對 `path_identity(wal_path) != wal.identity()` 或 `wal.unlinked()`。命中則：
