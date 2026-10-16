@@ -1,0 +1,78 @@
+{
+  "config": {
+    "boot_banner": "boot done\r\nroot@prplOS:/# ",
+    "commands": {
+      "default": "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+    },
+    "noise": {
+      "enabled": true,
+      "interval_ms": 100
+    },
+    "platform": "prpl"
+  },
+  "noise": [
+    {
+      "t_ms": 1,
+      "tick": 1
+    },
+    {
+      "t_ms": 362,
+      "tick": 2
+    },
+    {
+      "t_ms": 462,
+      "tick": 3
+    },
+    {
+      "t_ms": 562,
+      "tick": 4
+    },
+    {
+      "t_ms": 662,
+      "tick": 5
+    },
+    {
+      "t_ms": 763,
+      "tick": 6
+    },
+    {
+      "t_ms": 863,
+      "tick": 7
+    },
+    {
+      "t_ms": 963,
+      "tick": 8
+    },
+    {
+      "t_ms": 1063,
+      "tick": 9
+    },
+    {
+      "t_ms": 1164,
+      "tick": 10
+    },
+    {
+      "t_ms": 1264,
+      "tick": 11
+    },
+    {
+      "t_ms": 1364,
+      "tick": 12
+    },
+    {
+      "t_ms": 1467,
+      "tick": 13
+    }
+  ],
+  "source_blob": "93553e6:func-test/lib/fake_target.py",
+  "steps": [
+    {
+      "input_b64": "bHMK",
+      "output_b64": "RVhFQzpscw0KUkVTVUxUOmxzOk9LDQpyb290QHBycGxPUzovIyA=",
+      "pre_pause_s": 0.35,
+      "pre_wait_ms": 1000,
+      "wait_ms": 500
+    }
+  ],
+  "total_ms": 1511
+}
