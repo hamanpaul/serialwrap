@@ -29,8 +29,13 @@ def run_echo(
     close_stdout_after_bytes: int | None = None,
     read_delay_ms: int = 0,
     write_chunk: int = 4096,
+    banner: bytes = b"",
 ) -> int:
-    """純二進位回顯模式（自測與效能測試專用）。"""
+    """純二進位回顯模式（自測與效能測試專用）。
+
+    banner 非空時於讀取 stdin 前完整寫到 stdout（模擬開機即輸出），不計入
+    exit_after_bytes／close_stdout_after_bytes 的回顯計數。
+    """
 
     def _flood_stderr() -> None:
         remaining = stderr_flood_bytes
@@ -52,6 +57,18 @@ def run_echo(
 
     total_written = 0
     stdout_closed = False
+
+    banner_offset = 0
+    while banner_offset < len(banner):
+        try:
+            n = os.write(stdout_fd, banner[banner_offset:])
+        except OSError:
+            stdout_closed = True
+            break
+        if n <= 0:
+            stdout_closed = True
+            break
+        banner_offset += n
 
     while True:
         if read_delay_ms > 0:

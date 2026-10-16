@@ -78,7 +78,8 @@
 uart-stdio-bridge version
 
 # 執行 DUT 模擬器（Task 4 實作，轉呼叫 uart_stdio_bridge.dut）
-uart-stdio-bridge dut --mode echo
+uart-stdio-bridge dut --mode echo [--banner TEXT]          # --banner：啟動即輸出（測 peer gate）
+uart-stdio-bridge dut --mode model [--noise-interval-ms N] # 省略 --target-json 時用預設 TargetConfig
 
 # 執行 bridge 轉接與錄證
 uart-stdio-bridge run --run-id <run-id> --case-id <case-id> --port-id COM0 \
