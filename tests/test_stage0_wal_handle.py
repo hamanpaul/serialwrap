@@ -277,9 +277,11 @@ def test_dir_removed_still_self_heals(tmp_path):
     shutil.rmtree(wal_dir)
     # 不推進任何 clock：名稱消失檢查不受 50 ms 節流影響
     rec = w.append(com="COM0", direction="RX", source="device", payload=b"b")
-    assert rec["seq"] == 2
+    assert rec["seq"] == 3
     assert os.path.exists(w.wal_path)
-    assert any(r["seq"] == 2 for r in _lines(w.wal_path))  # 紀錄落在新檔
+    rows = _lines(w.wal_path)
+    assert rows[0]["seq"] == 2 and rows[0]["dir"] == "META"
+    assert any(r["seq"] == 3 and r["payload_b64"] for r in rows)  # 紀錄落在新檔
     assert w.health()["recreated_count"] == 1
 
 
@@ -289,9 +291,10 @@ def test_file_unlinked_name_check_unthrottled(tmp_path):
     w = WalWriter(wal_dir=str(tmp_path), fs=fs)
     w.append(com="COM0", direction="RX", source="device", payload=b"a")
     os.unlink(w.wal_path)
-    w.append(com="COM0", direction="RX", source="device", payload=b"b")
+    rec = w.append(com="COM0", direction="RX", source="device", payload=b"b")
     assert os.path.exists(w.wal_path)
-    assert any(r["seq"] == 2 for r in _lines(w.wal_path))  # META 補寫由 T05 負責，本測試不斷言
+    assert rec["seq"] == 3
+    assert any(r["seq"] == 3 and r["payload_b64"] for r in _lines(w.wal_path))
 
 
 @pytest.mark.core_portable

@@ -28,6 +28,7 @@ _STALE_CONSOLE_GRACE_S = 2.0
 # RX 速率視窗筆數硬上限（#153 防呆）：異常高頻小 chunk 下 deque 也不無界成長；
 # 時間剪枝為主，此上限僅兜底（deque maxlen 自動丟最舊）。
 _RX_WINDOW_MAX_ENTRIES = 4096
+AUTO_TX_SOURCES: frozenset[str] = frozenset({"system"})
 
 
 def _pty_available() -> bool:
@@ -955,6 +956,13 @@ class UARTBridge:
                     # 否則 source="flash-..." 的命令會繞過此 gate（#69 Finding round3）。
                     return
                 if (
+                    getattr(self.wal, "unhealthy", False)
+                    and (source in AUTO_TX_SOURCES or source.startswith("system:"))
+                ):
+                    raise WalUnavailableError(
+                        TxResult("not_submitted", 0, len(payload), "WAL_UNHEALTHY")
+                    )
+                if (
                     raw_token is not None
                     and raw_token is getattr(self, "_console_raw_token", None)
                     and getattr(self, "_interactive_admission_blocked", False)
@@ -1518,6 +1526,10 @@ class TxUnknownError(TxIncompleteError):
 
     def __reduce__(self) -> tuple[type, tuple[Any, ...]]:
         return type(self), (self.result, self.errno)
+
+
+class WalUnavailableError(TxIncompleteError):
+    """WAL 不健康時拒絕新增的系統自動傳輸。"""
 
 
 class SerialNotReady(TxIncompleteError, RuntimeError):

@@ -126,6 +126,8 @@ class WalFs(Protocol):
 
     def size(self, path: str) -> int | None: ...
 
+    def tail_needs_termination(self, path: str) -> bool: ...
+
     def rename_noreplace_or_suffix(self, src: str, base_dst: str) -> str: ...
 
     def sync_dir(self, path: str) -> None: ...
@@ -201,6 +203,15 @@ class PosixWalFs:
             return os.stat(path).st_size
         except FileNotFoundError:
             return None
+
+    def tail_needs_termination(self, path: str) -> bool:
+        """確認現行 WAL 尾端是否缺少換行，避免下一筆紀錄串接在殘行上。"""
+        with open(path, "rb") as fp:
+            fp.seek(0, os.SEEK_END)
+            if fp.tell() == 0:
+                return False
+            fp.seek(-1, os.SEEK_END)
+            return fp.read(1) != b"\n"
 
     def rename_noreplace_or_suffix(self, src: str, base_dst: str) -> str:
         """以不覆蓋既有歸檔的方式改名，碰撞時依序附加數字後綴。"""

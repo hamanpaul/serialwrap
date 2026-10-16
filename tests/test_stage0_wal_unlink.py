@@ -38,9 +38,10 @@ _NATIVE_SKIP = pytest.mark.skipif(
 
 
 def _load_posix_fs() -> Any:
-    from sw_core.wal_fs import PosixWalFs
+    from sw_core.wal_fs import default_wal_fs
 
-    return PosixWalFs
+    # core_portable 測試使用當前平台的 WAL 後端，Windows 才能驗證 share-delete 語意。
+    return type(default_wal_fs())
 
 
 def _load_windows_fs() -> Any:
@@ -84,8 +85,19 @@ def _rx(w: WalWriter, payload: bytes) -> dict[str, Any]:
     return w.append(com="COM0", direction="RX", source="device", payload=payload)
 
 
+def _replace_open_wal(w: WalWriter, content: bytes) -> None:
+    wal_path = Path(w.wal_path)
+    if os.name == "nt":
+        os.rename(w.wal_path, f"{w.wal_path}.old")
+        wal_path.write_bytes(content)
+        return
+    replacement = wal_path.with_name("replacement")
+    replacement.write_bytes(content)
+    os.replace(replacement, wal_path)
+
+
 @pytest.mark.core_portable
-def test_external_unlink_recreates_and_writes_meta_first(tmp_path):
+def test_external_unlink_recreates_and_writes_meta_first(tmp_path, caplog):
     clk = Clock()
     w = _w(tmp_path, clk)
     for _ in range(3):
@@ -105,6 +117,31 @@ def test_external_unlink_recreates_and_writes_meta_first(tmp_path):
     }
     assert lines[1]["seq"] == rec["seq"] == 5
     assert w.health()["recreated_count"] == 1 and w.health()["healthy"] is True
+    assert w.health()["last_write_error"].startswith("FileNotFoundError: [Errno 2] WAL 檔案路徑消失:")
+    assert any(
+        "WAL 目錄 " + str(tmp_path) + " 消失，已重建並續寫" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.core_portable
+def test_second_unlink_range_starts_at_first_meta_seq(tmp_path):
+    clk = Clock()
+    w = _w(tmp_path, clk)
+    _rx(w, b"before first unlink")
+    os.unlink(w.wal_path)
+    clk.advance(0.06)
+    _rx(w, b"after first unlink")
+    first_meta = next(row for row in w.tail_raw() if row["dir"] == "META")
+
+    os.unlink(w.wal_path)
+    clk.advance(0.06)
+    _rx(w, b"after second unlink")
+
+    second_meta = next(row for row in w.tail_raw() if row["dir"] == "META")
+    assert second_meta["meta"]["potentially_lost_seq_range"] == [
+        first_meta["seq"], first_meta["seq"] + 1
+    ]
 
 
 @pytest.mark.core_portable
@@ -112,13 +149,84 @@ def test_replaced_file_detected(tmp_path):
     clk = Clock()
     w = _w(tmp_path, clk)
     _rx(w, b"a")
-    tmp = tmp_path / "other"
-    tmp.write_text("", encoding="utf-8")
-    os.replace(tmp, w.wal_path)
+    _replace_open_wal(w, b"")
     clk.advance(0.06)
     _rx(w, b"b")
     metas = [line for line in _lines(w.wal_path) if line["dir"] == "META"]
     assert metas[0]["meta"]["reason"] == "replaced"
+
+
+@pytest.mark.parametrize("replacement_size", [600, 601])
+@pytest.mark.core_portable
+def test_replaced_file_at_rotate_threshold_is_detected_before_rotation(
+    tmp_path, replacement_size
+):
+    clk = Clock()
+    w = _w(tmp_path, clk, rotate_bytes=600)
+    _rx(w, b"before replacement")
+    _replace_open_wal(w, b"x" * replacement_size)
+
+    record = _rx(w, b"after replacement")
+
+    rows = w.tail_raw()
+    metas = [row for row in rows if row["dir"] == "META"]
+    assert len(metas) == 1
+    assert metas[0]["meta"]["reason"] == "replaced"
+    assert metas[0]["meta"]["potentially_lost_seq_range"] == [1, 1]
+    assert record["seq"] == metas[0]["seq"] + 1
+
+
+@pytest.mark.core_portable
+def test_replaced_unterminated_file_keeps_meta_on_a_parseable_line(tmp_path):
+    clk = Clock()
+    w = _w(tmp_path, clk)
+    _rx(w, b"before replacement")
+    _replace_open_wal(w, b"partial")
+    clk.advance(0.06)
+
+    record = _rx(w, b"after replacement")
+
+    physical_lines = Path(w.wal_path).read_bytes().splitlines()
+    meta_line = next(line for line in physical_lines if b'"dir":"META"' in line)
+    meta = json.loads(meta_line)
+    assert meta["meta"]["event"] == "WAL_RECREATED_AFTER_EXTERNAL_UNLINK"
+    assert [row["dir"] for row in w.tail_raw()] == ["META", "RX"]
+    assert w.tail_raw()[-1]["seq"] == record["seq"]
+
+
+@pytest.mark.core_portable
+def test_replacement_tail_inspection_failure_stays_unhealthy_until_retry(tmp_path):
+    WalFs = _load_posix_fs()
+
+    class F(WalFs):
+        fail_tail_inspection = True
+
+        def tail_needs_termination(self, path):
+            if self.fail_tail_inspection:
+                self.fail_tail_inspection = False
+                raise OSError(5, "tail inspection unavailable")
+            return super().tail_needs_termination(path)
+
+    clk = Clock()
+    fs = F()
+    w = _w(tmp_path, clk, fs=fs)
+    _rx(w, b"before replacement")
+    _replace_open_wal(w, b"partial")
+    clk.advance(0.06)
+
+    failed = _rx(w, b"first recreate attempt")
+    assert failed["loss_flag"] is True
+    assert w.unhealthy is True
+    assert w.health()["unhealthy_reason"] == "recreate_failed"
+    assert w.tail_raw() == []
+
+    clk.advance(0.011)
+    _rx(w, b"retry succeeds")
+    rows = w.tail_raw()
+    meta = next(row for row in rows if row["dir"] == "META")
+    assert meta["meta"]["potentially_lost_seq_range"] == [1, failed["seq"]]
+    assert rows[-1]["dir"] == "RX"
+    assert w.unhealthy is False
 
 
 @pytest.mark.core_portable
@@ -152,6 +260,169 @@ def test_check_is_throttled_to_interval(tmp_path):
     clk.advance(0.06)   # 不用 0.05：1000.0+0.05-1000.0 在浮點下 < 0.05
     _rx(w, b"a")
     assert len([c for c in calls if c == w.wal_path]) == len(wal_calls) + 1
+
+
+@pytest.mark.parametrize("identity_mode", ["zero_sentinel", "same_identity_unlinked"])
+@pytest.mark.core_portable
+def test_zero_identity_sentinel_and_unlinked_handle_trigger_recreation(
+    tmp_path, identity_mode
+):
+    WalFs = _load_posix_fs()
+    wal_path = str(tmp_path / "raw.wal.ndjson")
+
+    class F(WalFs):
+        def path_identity(self, path):
+            if identity_mode == "zero_sentinel" and path == wal_path:
+                return (0, 0)
+            return super().path_identity(path)
+
+        def open_append(self, path):
+            inner = super().open_append(path)
+            if identity_mode != "same_identity_unlinked" or path != wal_path:
+                return inner
+            fs = self
+
+            class Wrapped:
+                def write_all_flush(self, data):
+                    inner.write_all_flush(data)
+
+                def sync(self):
+                    inner.sync()
+
+                def identity(self):
+                    return inner.identity()
+
+                def unlinked(self):
+                    return True
+
+                def close(self):
+                    inner.close()
+
+            return Wrapped()
+
+    clk = Clock()
+    w = _w(tmp_path, clk, fs=F())
+    _rx(w, b"before")
+    clk.advance(0.06)
+    _rx(w, b"after")
+
+    metas = [row for row in w.tail_raw() if row["dir"] == "META"]
+    assert len(metas) == 1
+    assert metas[0]["meta"]["reason"] == "external_unlink"
+
+
+@pytest.mark.parametrize("failing_query", ["path_identity", "identity", "unlinked"])
+@pytest.mark.core_portable
+def test_identity_query_oserror_is_unknown_and_append_continues(tmp_path, failing_query):
+    PosixWalFs = _load_posix_fs()
+    wal_path = str(tmp_path / "raw.wal.ndjson")
+
+    class F(PosixWalFs):
+        def path_identity(self, path):
+            if failing_query == "path_identity" and path == wal_path:
+                raise OSError(5, "identity unavailable")
+            return super().path_identity(path)
+
+        def open_append(self, path):
+            handle = super().open_append(path)
+            if path != wal_path:
+                return handle
+            fs = self
+
+            class Wrapped:
+                def write_all_flush(self, data):
+                    handle.write_all_flush(data)
+
+                def sync(self):
+                    handle.sync()
+
+                def identity(self):
+                    if failing_query == "identity":
+                        raise OSError(5, "identity unavailable")
+                    return handle.identity()
+
+                def unlinked(self):
+                    if failing_query == "unlinked":
+                        raise OSError(5, "identity unavailable")
+                    return handle.unlinked()
+
+                def close(self):
+                    handle.close()
+
+            return Wrapped()
+
+    clk = Clock()
+    w = _w(tmp_path, clk, fs=F())
+    _rx(w, b"before")
+    clk.advance(0.06)
+    record = _rx(w, b"after")
+
+    rows = _lines(w.wal_path)
+    assert record["loss_flag"] is False
+    assert [row["seq"] for row in rows] == [1, 2]
+    assert all(row["dir"] != "META" for row in rows)
+    assert w.unhealthy is False
+
+
+@pytest.mark.parametrize("failing_query", ["path_identity", "identity", "unlinked"])
+@pytest.mark.core_portable
+def test_identity_query_oserror_at_rotate_threshold_keeps_current_file(
+    tmp_path, failing_query
+):
+    PosixWalFs = _load_posix_fs()
+    wal_path = str(tmp_path / "raw.wal.ndjson")
+
+    class F(PosixWalFs):
+        fail_identity_query = False
+
+        def path_identity(self, path):
+            if self.fail_identity_query and failing_query == "path_identity" and path == wal_path:
+                raise OSError(5, "identity unavailable")
+            return super().path_identity(path)
+
+        def open_append(self, path):
+            handle = super().open_append(path)
+            if path != wal_path:
+                return handle
+            fs = self
+
+            class Wrapped:
+                def write_all_flush(self, data):
+                    handle.write_all_flush(data)
+
+                def sync(self):
+                    handle.sync()
+
+                def identity(self):
+                    if fs.fail_identity_query and failing_query == "identity":
+                        raise OSError(5, "identity unavailable")
+                    return handle.identity()
+
+                def unlinked(self):
+                    if fs.fail_identity_query and failing_query == "unlinked":
+                        raise OSError(5, "identity unavailable")
+                    return handle.unlinked()
+
+                def close(self):
+                    handle.close()
+
+            return Wrapped()
+
+    clk = Clock()
+    fs = F()
+    w = _w(tmp_path, clk, rotate_bytes=1, fs=fs)
+    _rx(w, b"before")
+    current_handle = w._wal_fp
+    fs.fail_identity_query = True
+
+    record = _rx(w, b"after")
+
+    rows = _lines(w.wal_path)
+    assert w._wal_fp is current_handle
+    assert [row["seq"] for row in rows] == [1, 2]
+    assert all(row["dir"] != "META" for row in rows)
+    assert not list(Path(w.wal_path).parent.glob("raw.wal.ndjson.*"))
+    assert record["loss_flag"] is False and w.unhealthy is False
 
 
 @pytest.mark.core_portable
@@ -218,6 +489,48 @@ def test_bounded_retry_then_unhealthy_and_auto_tx_stops(tmp_path, monkeypatch):
     meta = [line for line in _lines(w.wal_path) if line["dir"] == "META"][0]["meta"]
     assert meta["potentially_lost_seq_range"][0] == 1
     assert w.unhealthy is False
+
+
+@pytest.mark.core_portable
+def test_recreate_retry_schedule_checks_each_gap_and_caps_at_five_seconds(tmp_path):
+    from sw_core.constants import WAL_RECREATE_BACKOFF_S, WAL_RECREATE_RETRY_INTERVALS_S
+
+    WalFs = _load_posix_fs()
+
+    class Broken(WalFs):
+        broken = False
+        attempts = 0
+
+        def open_append(self, path):
+            if self.broken and path.endswith("raw.wal.ndjson"):
+                self.attempts += 1
+                raise PermissionError(13, "Access is denied")
+            return super().open_append(path)
+
+    retry_gaps = [
+        *WAL_RECREATE_BACKOFF_S,
+        *WAL_RECREATE_RETRY_INTERVALS_S,
+        WAL_RECREATE_RETRY_INTERVALS_S[-1],
+    ]
+    assert retry_gaps == [0.01, 0.05, 0.2, 1.0, 2.0, 5.0, 5.0]
+
+    fs = Broken()
+    clk = Clock()
+    w = _w(tmp_path, clk, fs=fs)
+    _rx(w, b"before unlink")
+    os.unlink(w.wal_path)
+    fs.broken = True
+    clk.advance(0.06)
+    _rx(w, b"first failed recreate")
+    assert fs.attempts == 1
+
+    for attempt, gap in enumerate(retry_gaps, start=2):
+        clk.advance(gap - 0.001)
+        _rx(w, b"before retry deadline")
+        assert fs.attempts == attempt - 1
+        clk.advance(0.0011)
+        _rx(w, b"at retry deadline")
+        assert fs.attempts == attempt
 
 
 @pytest.mark.core_portable
@@ -355,6 +668,24 @@ def test_bridge_with_stub_wal_without_unhealthy_attr(tmp_path):
     bridge, _ = make_bridge(tmp_path, port=port, wal=StubWal())
     bridge.send_bytes(b"x", source="system:x")
     assert port.writes == [b"x"]
+
+
+@pytest.mark.core_portable
+def test_flash_gate_precedes_wal_unhealthy_rejection(tmp_path):
+    from stage0_fakes import FakePort, make_bridge
+
+    class UnhealthyWal:
+        unhealthy = True
+
+        def append(self, **kwargs):
+            raise AssertionError("flash gate 已丟棄的資料不得寫入 WAL")
+
+    port = FakePort()
+    bridge, _ = make_bridge(tmp_path, port=port, wal=UnhealthyWal())
+    bridge.set_flash_mode(True)
+
+    assert bridge.send_bytes(b"probe\n", source="system:self_test") is None
+    assert port.writes == []
 
 
 @pytest.mark.windows_native

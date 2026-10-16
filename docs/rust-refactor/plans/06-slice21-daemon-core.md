@@ -212,8 +212,9 @@ pub trait SerialWriter: Send {
 }
 // gate 撤銷：未提交任何 bytes → NotSubmitted（error None）；已確認 k≥1 後撤銷 → Completed(k)＋PalError::cancelled()；撤銷後不得再交 OS。
 pub trait UartExclusive: Send + Sync { fn probe_holders(&self, real_path: &str) -> HolderReport; }
-// DeviceSource／DeviceWatcher／InstanceLock／WalFs／RpcListener 照 arch §4.3～§4.6 逐字，並加下列兩點（同步修訂 arch §4.5／§4.6）：
+// DeviceSource／DeviceWatcher／InstanceLock／WalFs／RpcListener 照 arch §4.3～§4.6 逐字，並加下列三點（同步修訂 arch §4.5／§4.6）：
 //   WalFs 新增 fn read_all(&self, path: &Path) -> PalResult<Option<Vec<u8>>>;   // 讀取 API（Task 7）用；Task 6 conformance 一併涵蓋
+//   WalFs 新增 fn tail_needs_termination(&self, path: &Path) -> PalResult<bool>; // 自癒後確認 META 不會接在替換檔殘行上
 //   RpcListener::accept 回 Box<dyn RpcServerStream>（Task 0c 定義；P3 RpcStream 維持 client 專用）
 pub trait SignalWait: Send + Sync {
     /// 必須在 main 的第一個動作、建立任何 thread 之前呼叫：POSIX 以 pthread_sigmask(SIG_BLOCK, {SIGINT,SIGTERM}) 後啟動專屬 sigwait thread
@@ -635,6 +636,7 @@ pub struct FakeWalFs { /* 記憶體檔案系統，path → (identity u128, bytes
 impl FakeWalFs {
     pub fn new() -> Arc<FakeWalFs>;
     pub fn contents(&self, path: &Path) -> Option<Vec<u8>>;
+    pub fn tail_needs_termination(&self, path: &Path) -> bool;       // 空檔／換行結尾回 false；否則 true
     pub fn list_dir(&self, dir: &Path) -> Vec<PathBuf>;            // 排序後
     pub fn external_unlink(&self, path: &Path);                    // POSIX 語意：路徑消失、handle 存活、unlinked()=true
     pub fn external_replace(&self, path: &Path, bytes: &[u8]);     // 新 identity 佔用路徑
@@ -1468,6 +1470,7 @@ fn fake_conformance() {
 | `identity_stable_and_matches_path` | `file.identity() == fs.path_identity(path).unwrap().unwrap()` |
 | `external_unlink_detected` | `external.unlink(path)` → `file.unlinked() == Ok(true)` 或 `fs.path_identity(path) == Ok(None)`（兩者至少其一；POSIX 兩者皆真） |
 | `external_replace_detected` | `external.replace_with(path, b"x")` → `fs.path_identity(path)` 為 `Some(id2)` 且 `id2 != file.identity()` |
+| `tail_needs_termination_reports_partial_line` | `contents(path)=b"partial"` → true；改成 `b"partial\n"` 或空檔 → false |
 | `rename_while_open_keeps_writing_to_renamed` | `rename_noreplace_or_suffix(path, path.with_extension("ndjson.20261015-000000"))` 回該路徑；原 handle 再寫 → 內容出現在歸檔，不在新 path |
 | `rename_noreplace_suffix` | 目標已存在 → 回 `<base>.1`；再一次 → `<base>.2`；既有歸檔內容不變（DF-03） |
 | `size_and_missing` | `fs.size(missing) == Ok(None)`；寫 3 bytes 後 `== Ok(Some(3))` |
@@ -1496,8 +1499,8 @@ Expected：`fake_conformance` PASS，`native_conformance` FAIL：`not implemente
 
 - [ ] **Step 3：實作**
 
-- POSIX：`open(O_WRONLY|O_APPEND|O_CREAT|O_CLOEXEC, 0o666)`（umask 生效）；`write_all_flush` 迴圈 `write(bytes[sent..])` 直到全寫（EINTR 重試），無 user-space buffer；每次成功 `write` 累加 `sent`，`write` 回 0 → `WalWriteError{sent, error: PalError::io(EIO, "[Errno 5] Input/output error")}`、回 -1（非 EINTR）→ `WalWriteError{sent, error: <errno 對應 PalError>}`，**不得**丟棄已累加的 `sent`（arch §4.5，R2-F3）；`sync` = `fsync`；`identity` = `fstat (st_dev, st_ino)` → `FileIdentity(dev as u128, ino as u128)`；`unlinked` = `st_nlink == 0`；`path_identity` = `stat`（ENOENT → `None`）；`rename_noreplace_or_suffix`：Linux `renameat2(RENAME_NOREPLACE)`，`EEXIST` → 依序試 `.1`、`.2`…；`EINVAL`／`ENOSYS` → `link(from,to)` + `unlink(from)`；`sync_dir` = `open(dir, O_RDONLY)` + `fsync`；`dir_writable` = `access(W_OK|X_OK)`。
-- Windows：`CreateFileW(FILE_APPEND_DATA|SYNCHRONIZE, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL)`；`write_all_flush` 迴圈 `WriteFile`，以每次 `lpNumberOfBytesWritten` 累加 `sent`，失敗時同樣回 `WalWriteError{sent, error}`；`sync` = `FlushFileBuffers`；`identity` = `FileIdInfo`；`unlinked` = `FileStandardInfo.DeletePending`；`path_identity`：`CreateFileW(0 access, share RWD, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS)`，`ERROR_FILE_NOT_FOUND|ERROR_PATH_NOT_FOUND` → `None`，`ERROR_ACCESS_DENIED`（delete pending）→ `Err(kind=AccessDenied)`；`rename_noreplace_or_suffix` 用 `MoveFileExW(flags=0)`，`ERROR_ALREADY_EXISTS` → 下一個後綴；`sync_dir` 回 `Ok(())`；`dir_writable` = 目錄存在且無 `FILE_ATTRIBUTE_READONLY`。
+- POSIX：`open(O_WRONLY|O_APPEND|O_CREAT|O_CLOEXEC, 0o666)`（umask 生效）；`write_all_flush` 迴圈 `write(bytes[sent..])` 直到全寫（EINTR 重試），無 user-space buffer；每次成功 `write` 累加 `sent`，`write` 回 0 → `WalWriteError{sent, error: PalError::io(EIO, "[Errno 5] Input/output error")}`、回 -1（非 EINTR）→ `WalWriteError{sent, error: <errno 對應 PalError>}`，**不得**丟棄已累加的 `sent`（arch §4.5，R2-F3）；`sync` = `fsync`；`identity` = `fstat (st_dev, st_ino)` → `FileIdentity(dev as u128, ino as u128)`；`unlinked` = `st_nlink == 0`；`path_identity` = `stat`（ENOENT → `None`）；`tail_needs_termination` 以唯讀 handle 檢查最後一個 byte，非空且不是 `\\n` 時回 true；`rename_noreplace_or_suffix`：Linux `renameat2(RENAME_NOREPLACE)`，`EEXIST` → 依序試 `.1`、`.2`…；`EINVAL`／`ENOSYS` → `link(from,to)` + `unlink(from)`；`sync_dir` = `open(dir, O_RDONLY)` + `fsync`；`dir_writable` = `access(W_OK|X_OK)`。
+- Windows：`CreateFileW(FILE_APPEND_DATA|SYNCHRONIZE, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL)`；`write_all_flush` 迴圈 `WriteFile`，以每次 `lpNumberOfBytesWritten` 累加 `sent`，失敗時同樣回 `WalWriteError{sent, error}`；`sync` = `FlushFileBuffers`；`identity` = `FileIdInfo`；`unlinked` = `FileStandardInfo.DeletePending`；`path_identity`：`CreateFileW(0 access, share RWD, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS)`，`ERROR_FILE_NOT_FOUND|ERROR_PATH_NOT_FOUND` → `None`，其他查詢錯誤（含 `ERROR_ACCESS_DENIED`）維持未知；`tail_needs_termination` 以可共享讀取的 handle 檢查最後一個 byte；`rename_noreplace_or_suffix` 用 `MoveFileExW(flags=0)`，`ERROR_ALREADY_EXISTS` → 下一個後綴；`sync_dir` 回 `Ok(())`；`dir_writable` = 目錄存在且無 `FILE_ATTRIBUTE_READONLY`。
 - 每個 `WalFile` 的 `close` 只能呼叫一次（`self: Box<Self>`），`Drop` 未 close 時也關 handle（唯一關閉點，規格 §8.2）。
 
 - [ ] **Step 4：執行並確認 PASS**
@@ -1704,7 +1707,13 @@ fn wal_partial_write_suffix_failure_terminates_tail_next_record_parses() {   // 
 | `mirror_failure_retries_only_mirror` | `fail_next_writes(mirror, 1, EACCES)` → WAL 檔只有一行 seq=1（不重複，DF-17）；mirror 經一次重試後有內容 |
 | `mirror_retry_failure_counts_write_failure` | `fail_next_writes(mirror, 2, EACCES)` → WAL 仍寫入、`write_failures == 1`、`last_write_error == "PermissionError: [Errno 13] Permission denied"`（P1：mirror 重試失敗也計入） |
 | `mirror_identity_reopened_without_meta` | `external_unlink(mirror)`、advance 60 ms、append → mirror 重建並含新內容；WAL 無 META、`recreated_count` 不變（P1 T05 第 1 點） |
-| `rotate_runs_before_identity_check` | 同一筆 append 同時滿足 rotate 門檻與 identity 變更 → 先 rotate（歸檔舊 handle）再做 identity 檢查（P1 順序）；以 `FakeWalFs` 操作紀錄斷言順序 |
+| `identity_check_precedes_rotation_when_rotation_is_due` | 同一筆 append 同時滿足 rotate 門檻與 identity 變更 → 先做失效分類並保存原遺失範圍，再依 `>= R` 輪替替換檔、於現行檔寫 META；以 `FakeWalFs` 操作紀錄斷言順序 |
+| `identity_query_error_at_rotate_threshold_keeps_current_file` | path／handle identity 或 `unlinked` 查詢失敗且檔案達門檻 → 該路徑保留現行 handle、略過本次輪替並正常 append，不寫 META、不設 unhealthy |
+| `replacement_at_rotate_threshold_keeps_meta_current` | 替換檔大小恰為／高於 `R` → 替換證據在輪替前確認；META 與原紀錄寫入新現行檔，遺失範圍仍從前檔 `file_first_seq` 開始 |
+| `replacement_unterminated_tail_keeps_meta_parseable` | 替換檔尾端為未換行殘行 → 先終結殘行；`tail_raw` 略過殘行且仍讀得到獨立 META 與後續紀錄 |
+| `second_unlink_range_starts_at_first_meta_seq` | 連續兩次 unlink → 第二筆 META 範圍從第一筆 META seq 起算 |
+| `zero_identity_and_unlinked_handle_classify_external_unlink` | path identity `(0,0)` sentinel 或 identity 相同但 `unlinked()==true` → `reason:"external_unlink"` |
+| `recreate_retry_schedule_uses_monotonic_gaps` | 依序驗證 10／50／200 ms、1／2／5／5 s 間隔；未到期限不開檔，到期 append 最多嘗試一次 |
 | `lazy_open_idle_file_absent` | `WalWriter::open` 後尚未 append → `fs.contents(wal) == None`、`health().wal_file_exists == false`、`healthy == true`（P1 開檔為 lazy） |
 | `enospc_on_open_handle_trips_all_fences`（Review Focus 3） | fanout 註冊三個 fence；已開 handle 上 `fail_next_writes(wal, 2, ENOSPC)`（含重試共兩次）→ 三個 fence `wal_unhealthy == true`、`unhealthy_reason == "write_failed"`；下一筆成功 → 三者恢復 false、`unhealthy_reason == None` |
 | `new_session_inherits_wal_unhealthy` | unhealthy 期間 `fan.register(new_fence)` → 新 fence 立即 `wal_unhealthy == true` |
@@ -1741,8 +1750,10 @@ pub fn append(&self, r: WalAppendReq<'_>) -> WalAppend {
     let printable = sw_proto::pycompat::to_printable(r.payload);
     let mut g = self.inner.lock().unwrap();
     let now = self.clock.mono_ns();
-    let rotation_failed = self.rotate_if_needed_locked(&mut g);   // P1 順序：先 rotate
-    self.check_identity_locked(&mut g, now);              // 再做 identity（≥50 ms mono 節流）；WAL 命中 → 關舊 handle → 重開（10/50/200 ms）→ 先寫 META（com:"WAL"）；mirror 命中只重開
+    let rotation_due = self.rotation_candidate_locked(&g); // 用目前 size 判斷是否可能輪替
+    let identity_check = self.check_identity_locked(&mut g, now, rotation_due); // 平時 ≥50 ms mono 節流；輪替前分類並保存範圍；查詢未知時回傳該路徑 skip
+    let rotation_failed = self.rotate_if_needed_locked(&mut g, &identity_check.rotation_skip_paths);
+    self.finish_recreate_if_pending_locked(&mut g);        // WAL 命中 → 先輪替達門檻的替換檔，再重開、終結殘行並寫 META（com:"WAL"）；mirror 命中只重開
     self.ensure_open_locked(&mut g);                      // lazy open：第一次 append 才開檔
     g.seq += 1;
     let rec = WalRecord { seq: g.seq, mono_ts_ns: now, wall_ts: sw_proto::pycompat::iso_utc_now(self.clock.wall_unix_us()), com: r.com.into(),
@@ -1768,7 +1779,7 @@ pub fn append(&self, r: WalAppendReq<'_>) -> WalAppend {
   5. 重試結果：成功 → 清 `dirty_tail[t]`、回 true。失敗 → 以「本次已確認總長 `c`」（步驟 3 為重寫那次的 `sent`；步驟 4 為 `k + 補寫的 sent`）判定：`term < c < buf.len()` → `dirty_tail[t] = true`（殘行留待下一筆先以 `\n` 終結）；`c <= term` → 未產生新殘行，`dirty_tail[t] = (c < term)`（終結 `\n` 尚未寫出才保留旗標）；回 false。不做第三次嘗試。
   6. 旗標以 WAL／mirror 為單位（與 P1 `_dirty_tail[which]` 相同）；rotate／自癒重建後的新檔若旗標仍為真，首次寫入同樣先寫 `\n`（空行由讀取端略過，與 P1 位元組一致）。
   `last_write_error = format!("{}: {}", e.error.py_exc_name(), e.error.py_message)`（取最後一次錯誤；`PalError::py_exc_name`，Task 0）。WAL 回 false（含部分寫入後補寫失敗）即「首次＋重試皆失敗」，由 `update_health_locked` 設 `unhealthy_reason="write_failed"`；下一筆完整寫出才清除。
-- 自癒：`check_identity_locked` 比對 `fs.path_identity(wal_path)` 與 `file.identity()`、`file.unlinked()`；`None`／`unlinked` → `reason:"external_unlink"`，不同 identity → `"replaced"`，路徑 `AccessDenied`（Windows pending delete）→ `"external_unlink"`；保存 `previous_identity = format!("{}:{}", id.0, id.1)`、範圍 `[file_first_seq, seq]`（`file_first_seq` 未知時 `null`、`range_known:false`）；關舊 handle；重開最多 3 次（間隔 `clock.sleep(10/50/200 ms)`）；成功 → `recreated_count += 1`、寫 META（外層 `dir:"META"`、`source:"system"`、`cmd_id:null`、`com:"WAL"`（P1 T05 凍結，不用觸發的 com）、`loss_flag:true`，`seq` 消耗一號）、`file_first_seq = META seq`；失敗 → `unhealthy_reason="recreate_failed"`、fanout `set_wal_unhealthy(true)`，之後每筆 append 仍受同一個 50 ms mono 節流，到期時再做一輪有界（3 次）重試（P1 T05 第 5 點），成功後清除並 fanout `false`。mirror 的 identity 檢查同節流、只重開不寫 META。
+- 自癒：每筆 append 檢查目錄與 WAL 名稱；identity／DeletePending 平時以 50 ms mono 節流，輪替將清除 handle／identity 時先分類。分類順序為目錄不存在、path identity 為 `None` 或 `(0,0)`、path identity 與 `file.identity()` 不同、identity 相同但 `file.unlinked()` 為真；identity 查詢的 `OSError` 視為未知，不因查詢失敗自癒，且該路徑若達輪替門檻則保留 handle 並略過本次輪替。WAL 命中後保存舊 identity 與範圍 `[file_first_seq, seq]`（範圍起點未知時 `null`、`range_known:false`，重試期間新消耗的 seq 納入終點），關閉自身 handle；若替換檔達 `>= R`，先輪替替換檔，再重建現行檔。到期 append 每次最多嘗試一次開檔；前三次失敗後間隔 10／50／200 ms，之後 1／2／5／5… 秒（上限 5 秒），不睡眠。重開後呼叫 `WalFs::tail_needs_termination`；若既存檔非空且尾端未換行，先補換行，然後寫 META（外層 `dir:"META"`、`source:"system"`、`cmd_id:null`、`com:"WAL"`、`loss_flag:true`，`seq` 消耗一號），再寫原紀錄；尾端檢查、終結或 META 寫入失敗皆保持不健康並依退避重試，成功後 `file_first_seq = META seq`。重建成功沿用既有 WAL recreated 診斷與日誌。失敗 → `unhealthy_reason="recreate_failed"`、fanout `set_wal_unhealthy(true)`；成功後清除並 fanout `false`。mirror 的 identity 檢查同節流、只重開不寫 META。
 - rotate／reset 照 arch §5.8（同一鎖內 flush、`sync()`、關閉自身 handle 後執行 `rename_noreplace_or_suffix`；失敗時重開原路徑，成功後 `sync_dir`，下次寫入才開新檔；size 以「開檔時 `fs.size()` ＋ 已寫 bytes」追蹤）。
 - `health`：不取主鎖，以 `AtomicU64`／`ArcSwap` 等價快照；`healthy = dir_exists && dir_writable && !(seq>0 && !file_exists) && unhealthy_reason.is_none()`。`WalWriter::open` 不開檔（lazy，P1）但評估 `fs.dir_writable(dir)`：不可寫 → `unhealthy_reason="dir_unwritable"` 並在 `set_health_sink` 時立即 fanout `true`。
 - 讀取 API 用 `WalFs::read_all`（Task 0 已納入 trait、Task 6 實作與 conformance）。逐行 `decode_utf8_replace` → strip → 空行／非 JSON／非 dict／`seq` 非 int 略過。

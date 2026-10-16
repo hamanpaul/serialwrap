@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "serialwrap WAL META events contract",
-  "x-catalog-revision": 1,
+  "x-catalog-revision": 2,
   "type": "object",
   "oneOf": [
     {
@@ -87,11 +87,12 @@
     {
       "title": "WAL_RECREATED_AFTER_EXTERNAL_UNLINK",
       "description": "外部 unlink／刪除後 WAL 重建事件",
-      "x-status": "APPROVED",
+      "x-status": "IMPLEMENTED",
       "x-behavior-change": "BC-01",
       "x-outer-record": {
         "dir": "META",
         "source": "system",
+        "com": "WAL",
         "loss_flag": true
       },
       "type": "object",
@@ -121,7 +122,8 @@
             "string",
             "null"
           ],
-          "description": "舊檔案識別資訊（dev:ino；P1 補 pattern ^[0-9]+:[0-9]+$）"
+          "pattern": "^[0-9]+:[0-9]+$",
+          "description": "舊檔案識別資訊，十進位 <dev>:<ino> 或 Windows <VolumeSerialNumber>:<FileId128>"
         },
         "range_known": {
           "type": "boolean",

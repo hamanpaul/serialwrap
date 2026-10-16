@@ -12,7 +12,13 @@ from collections import deque
 from collections.abc import Callable, Iterator
 from typing import Any
 
-from .constants import DEFAULT_WAL_ROTATE_BYTES, WAL_DIR
+from .constants import (
+    DEFAULT_WAL_ROTATE_BYTES,
+    WAL_DIR,
+    WAL_IDENTITY_CHECK_INTERVAL_S,
+    WAL_RECREATE_BACKOFF_S,
+    WAL_RECREATE_RETRY_INTERVALS_S,
+)
 from .util import dumps_stable, monotonic_ns, now_iso, to_printable
 from .wal_fs import PartialWriteError, WalFile, WalFs, default_wal_fs
 
@@ -50,6 +56,16 @@ class WalWriter:
         self._write_failures = 0
         self._last_write_error: str | None = None
         self._recreated_count = 0
+        self._file_first_seq: int | None = None
+        self._file_first_seq_pending = True
+        self._last_identity_check: float | None = None
+        self._recreate_failures = 0
+        self._next_recreate_at: float | None = None
+        self._wal_identity: tuple[int, int] | None = None
+        self._pending_recreate_reason: str | None = None
+        self._pending_previous_identity: str | None = None
+        self._pending_file_first_seq: int | None = None
+        self._wal_path_expected = False
         os.makedirs(self._wal_dir, exist_ok=True)
         self._load_last_seq()
 
@@ -78,13 +94,29 @@ class WalWriter:
     def _load_last_seq(self) -> None:
         if not os.path.exists(self._wal_path):
             self._seq = 0
+            self._file_first_seq = None
+            self._file_first_seq_pending = True
+            self._wal_path_expected = False
             return
+        self._wal_path_expected = True
         last = 0
+        first: int | None = None
+        first_nonempty_seen = False
         with open(self._wal_path, "rb") as fp:
             for raw_line in fp:
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line:
                     continue
+                if not first_nonempty_seen:
+                    first_nonempty_seen = True
+                    try:
+                        first_obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        first_obj = None
+                    if isinstance(first_obj, dict):
+                        first_seq = first_obj.get("seq")
+                        if isinstance(first_seq, int) and not isinstance(first_seq, bool):
+                            first = first_seq
                 try:
                     obj = json.loads(line)
                 except json.JSONDecodeError:
@@ -98,8 +130,15 @@ class WalWriter:
                 fp.seek(-1, os.SEEK_END)
                 self._dirty_tail["wal"] = fp.read(1) != b"\n"
         self._seq = last
+        self._file_first_seq = first
+        self._file_first_seq_pending = not first_nonempty_seen
 
-    def _rotate_if_needed(self, sizes: dict[str, int | None] | None = None) -> bool:
+    def _rotate_if_needed(
+        self,
+        sizes: dict[str, int | None] | None = None,
+        *,
+        skip_paths: set[str] | None = None,
+    ) -> bool:
         """檔案超過上限時輪替。回傳 True 表示輪替過程發生 OSError 已被 best-effort 含住（degrade）。
 
         輪替只是「限制檔案大小」的最佳化，不是資料平面必要步驟。原本此方法在 ``append`` 的 try
@@ -110,10 +149,16 @@ class WalWriter:
         """
         rotation_failed = False
         observed_sizes = sizes if sizes is not None else {}
+        paths_to_skip = skip_paths if skip_paths is not None else set()
         for path in (self._wal_path, self._mirror_path):
+            if path in paths_to_skip:
+                continue
             try:
-                size = self._fs.size(path)
-                observed_sizes[path] = size
+                if path in observed_sizes:
+                    size = observed_sizes[path]
+                else:
+                    size = self._fs.size(path)
+                    observed_sizes[path] = size
                 if size is None:
                     continue
                 if size < self._rotate_bytes:
@@ -125,6 +170,11 @@ class WalWriter:
                 ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
                 self._fs.rename_noreplace_or_suffix(path, f"{path}.{ts}")
                 self._dirty_tail[which] = False
+                if which == "wal":
+                    self._wal_path_expected = False
+                    self._wal_identity = None
+                    self._file_first_seq = self._seq + 1
+                    self._file_first_seq_pending = False
                 self._fs.sync_dir(os.path.dirname(path))
             except OSError as exc:
                 rotation_failed = True
@@ -167,6 +217,14 @@ class WalWriter:
         if handle is None:
             handle = self._fs.open_append(self._path_for(which))
             self._set_handle(which, handle)
+            if which == "wal":
+                self._wal_path_expected = True
+                try:
+                    self._wal_identity = handle.identity()
+                except OSError:
+                    # FileIdInfo 等 identity 查詢不支援時，保留 handle 並略過該次證據。
+                    self._wal_identity = None
+                self._last_identity_check = self._clock()
         return handle
 
     def _write_once_locked(self, which: str, data: bytes) -> None:
@@ -212,35 +270,240 @@ class WalWriter:
             exc,
         )
 
-    def _check_missing_names_locked(self, sizes: dict[str, int | None]) -> None:
-        directory_missing = not os.path.isdir(self._wal_dir)
-        stale: list[str] = []
-        for which in ("wal", "mirror"):
-            if self._handle_for(which) is None:
-                continue
-            if directory_missing:
-                stale.append(which)
+    @staticmethod
+    def _identity_text(identity: tuple[int, int] | None) -> str | None:
+        if identity is None:
+            return None
+        return f"{identity[0]}:{identity[1]}"
+
+    def _identity_change_locked(self, which: str) -> tuple[str | None, bool]:
+        handle = self._handle_for(which)
+        if handle is None:
+            return None, False
+        path = self._path_for(which)
+        try:
+            path_identity = self._fs.path_identity(path)
+        except OSError:
+            return None, True
+        if path_identity is None or path_identity == (0, 0):
+            return "external_unlink", False
+        try:
+            handle_identity = handle.identity()
+        except OSError:
+            return None, True
+        if which == "wal":
+            self._wal_identity = handle_identity
+        if path_identity != handle_identity:
+            return "replaced", False
+        try:
+            if handle.unlinked():
+                return "external_unlink", False
+        except OSError:
+            return None, True
+        return None, False
+
+    def _check_missing_names_locked(
+        self,
+        sizes: dict[str, int | None],
+        *,
+        force_identity: bool = False,
+    ) -> tuple[str | None, set[str]]:
+        """每筆確認名稱存在；檔案身分與 DeletePending 則依節流間隔查詢。"""
+        wal_handle = self._wal_fp
+        mirror_handle = self._mirror_fp
+        wal_expected = self._wal_path_expected or wal_handle is not None
+        wal_history_exists = wal_expected or mirror_handle is not None or self._seq > 0
+        directory_missing = wal_history_exists and not os.path.isdir(self._wal_dir)
+        wal_reason: str | None = "dir_missing" if directory_missing and wal_expected else None
+        identity_unknown_paths: set[str] = set()
+
+        if (
+            wal_reason is None
+            and wal_expected
+            and not directory_missing
+            and self._wal_path in sizes
+            and sizes[self._wal_path] is None
+        ):
+            wal_reason = "external_unlink"
+
+        for which, handle in (("wal", wal_handle), ("mirror", mirror_handle)):
+            if handle is None:
                 continue
             path = self._path_for(which)
-            if path not in sizes:
-                # rotate 的 size 探測失敗時保留 handle；實際寫入路徑會回報可操作的錯誤。
-                continue
-            if sizes[path] is None:
-                stale.append(which)
-        if not stale:
-            return
+            reason: str | None = None
+            if directory_missing:
+                reason = "dir_missing"
+            elif path in sizes and sizes[path] is None:
+                reason = "external_unlink"
+            if reason is not None:
+                if which == "wal":
+                    wal_reason = reason
+                else:
+                    self._close_handle_locked("mirror")
+                    self._dirty_tail["mirror"] = False
 
-        for which in stale:
-            self._close_handle_locked(which)
-            # 遺失名稱代表原 inode 上的殘行已不再是目前檔案的一部分。
-            self._dirty_tail[which] = False
+        now = self._clock()
+        due = (
+            force_identity
+            or
+            self._last_identity_check is None
+            or now - self._last_identity_check >= WAL_IDENTITY_CHECK_INTERVAL_S
+        )
+        if due:
+            self._last_identity_check = now
+            for which, handle in (("wal", self._wal_fp), ("mirror", self._mirror_fp)):
+                if handle is None or (which == "wal" and wal_reason is not None):
+                    continue
+                reason, identity_unknown = self._identity_change_locked(which)
+                if identity_unknown:
+                    identity_unknown_paths.add(self._path_for(which))
+                if reason is None:
+                    continue
+                if which == "wal":
+                    wal_reason = reason
+                else:
+                    self._close_handle_locked("mirror")
+                    self._dirty_tail["mirror"] = False
+        return wal_reason, identity_unknown_paths
+
+    def _previous_wal_identity_locked(self) -> str | None:
+        handle = self._wal_fp
+        if handle is not None:
+            try:
+                identity = handle.identity()
+            except OSError:
+                identity = self._wal_identity
+            else:
+                self._wal_identity = identity
+            return self._identity_text(identity)
+        return self._identity_text(self._wal_identity)
+
+    def _schedule_recreate_retry_locked(self, exc: OSError) -> None:
+        self._recreate_failures += 1
+        failure_number = self._recreate_failures
+        if failure_number <= len(WAL_RECREATE_BACKOFF_S):
+            delay = WAL_RECREATE_BACKOFF_S[failure_number - 1]
+        else:
+            retry_index = min(
+                failure_number - len(WAL_RECREATE_BACKOFF_S) - 1,
+                len(WAL_RECREATE_RETRY_INTERVALS_S) - 1,
+            )
+            delay = WAL_RECREATE_RETRY_INTERVALS_S[retry_index]
+        self._next_recreate_at = self._clock() + delay
+        self._unhealthy = True
+        self._unhealthy_reason = "recreate_failed"
+        self._last_write_error = self._write_error_text(exc)
+        _LOG.warning("WAL 重建失敗（best-effort 延後重試）：%s", exc)
+
+    def _attempt_recreate_locked(self) -> bool:
+        if self._pending_recreate_reason is None:
+            return False
+        now = self._clock()
+        if self._next_recreate_at is not None and now < self._next_recreate_at:
+            return False
         try:
             self._fs.ensure_dir(self._wal_dir)
+            handle = self._fs.open_append(self._wal_path)
+        except OSError as exc:
+            self._schedule_recreate_retry_locked(exc)
+            return False
+
+        self._set_handle("wal", handle)
+        self._wal_path_expected = True
+        try:
+            self._wal_identity = handle.identity()
         except OSError:
-            return
+            self._wal_identity = None
+        self._last_identity_check = now
+
+        try:
+            self._dirty_tail["wal"] = self._fs.tail_needs_termination(self._wal_path)
+            if self._dirty_tail["wal"]:
+                handle.write_all_flush(b"\n")
+                self._dirty_tail["wal"] = False
+        except OSError as exc:
+            self._close_handle_locked("wal")
+            self._schedule_recreate_retry_locked(exc)
+            return False
+
+        first_seq = self._pending_file_first_seq
+        last_seq = self._seq
+        range_known = first_seq is not None and last_seq >= first_seq
+        lost_range = [first_seq, last_seq] if range_known else None
+        meta_record = self._new_record_locked(
+            com="WAL",
+            direction="META",
+            source="system",
+            payload=b"",
+            cmd_id=None,
+            loss_flag=True,
+            meta={
+                "event": "WAL_RECREATED_AFTER_EXTERNAL_UNLINK",
+                "reason": self._pending_recreate_reason,
+                "previous_identity": self._pending_previous_identity,
+                "potentially_lost_seq_range": lost_range,
+                "range_known": range_known,
+            },
+        )
+        wal_error, _ = self._write_record_locked(meta_record, b"")
+        if wal_error is not None:
+            self._close_handle_locked("wal")
+            self._schedule_recreate_retry_locked(wal_error)
+            return False
+
+        self._file_first_seq = meta_record["seq"]
+        self._file_first_seq_pending = False
         self._record_recreated(
             FileNotFoundError(errno.ENOENT, "WAL 檔案路徑消失", self._wal_dir)
         )
+        self._pending_recreate_reason = None
+        self._pending_previous_identity = None
+        self._pending_file_first_seq = None
+        self._recreate_failures = 0
+        self._next_recreate_at = None
+        self._unhealthy = False
+        self._unhealthy_reason = None
+        return True
+
+    def _begin_recreate_locked(self, reason: str, *, attempt: bool = True) -> bool:
+        if self._pending_recreate_reason is None:
+            self._pending_recreate_reason = reason
+            self._pending_previous_identity = self._previous_wal_identity_locked()
+            self._pending_file_first_seq = self._file_first_seq
+            self._recreate_failures = 0
+            self._next_recreate_at = None
+            self._close_handle_locked("wal")
+            self._dirty_tail["wal"] = False
+        return self._attempt_recreate_locked() if attempt else True
+
+    def _new_record_locked(
+        self,
+        *,
+        com: str,
+        direction: str,
+        source: str,
+        payload: bytes,
+        payload_b64: str = "",
+        crc32: str = "00000000",
+        cmd_id: str | None = None,
+        loss_flag: bool = False,
+        meta: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self._seq += 1
+        return {
+            "seq": self._seq,
+            "mono_ts_ns": monotonic_ns(),
+            "wall_ts": now_iso(),
+            "com": com,
+            "dir": direction,
+            "source": source,
+            "cmd_id": cmd_id,
+            "len": len(payload),
+            "crc32": crc32,
+            "payload_b64": payload_b64,
+            "loss_flag": bool(loss_flag),
+            "meta": meta or {},
+        }
 
     def _retry_write_locked(
         self,
@@ -325,28 +588,62 @@ class WalWriter:
         meta: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload_b64 = base64.b64encode(payload).decode("ascii")
-        crc32 = zlib.crc32(payload) & 0xFFFFFFFF
+        payload_crc32 = f"{zlib.crc32(payload) & 0xFFFFFFFF:08x}"
         with self._lock:
             rotation_failed = False
             if not self._closed:
-                sizes: dict[str, int | None] = {}
-                rotation_failed = self._rotate_if_needed(sizes)
-                self._check_missing_names_locked(sizes)
-            self._seq += 1
-            record = {
-                "seq": self._seq,
-                "mono_ts_ns": monotonic_ns(),
-                "wall_ts": now_iso(),
-                "com": com,
-                "dir": direction,
-                "source": source,
-                "cmd_id": cmd_id,
-                "len": len(payload),
-                "crc32": f"{crc32:08x}",
-                "payload_b64": payload_b64,
-                "loss_flag": bool(loss_flag),
-                "meta": meta or {},
-            }
+                if self._pending_recreate_reason is None:
+                    sizes: dict[str, int | None] = {}
+                    for path in (self._wal_path, self._mirror_path):
+                        try:
+                            sizes[path] = self._fs.size(path)
+                        except OSError:
+                            pass
+                    force_identity = any(
+                        size is not None and size >= self._rotate_bytes
+                        for size in sizes.values()
+                    )
+                    reason, identity_unknown_paths = self._check_missing_names_locked(
+                        sizes, force_identity=force_identity
+                    )
+                    if reason is not None:
+                        self._begin_recreate_locked(reason, attempt=False)
+                        rotation_failed = self._rotate_if_needed(sizes)
+                        self._attempt_recreate_locked()
+                    else:
+                        rotation_failed = self._rotate_if_needed(
+                            sizes, skip_paths=identity_unknown_paths
+                        )
+                if self._pending_recreate_reason is not None:
+                    if not self._attempt_recreate_locked():
+                        record = self._new_record_locked(
+                            com=com,
+                            direction=direction,
+                            source=source,
+                            payload=payload,
+                            payload_b64=payload_b64,
+                            crc32=payload_crc32,
+                            cmd_id=cmd_id,
+                            loss_flag=True,
+                            meta=meta,
+                        )
+                        if rotation_failed:
+                            record["rotation_failed"] = True
+                        self._write_failures += 1
+                        if self._last_write_error is None:
+                            self._last_write_error = "WAL recreation is pending"
+                        return record
+            record = self._new_record_locked(
+                com=com,
+                direction=direction,
+                source=source,
+                payload=payload,
+                payload_b64=payload_b64,
+                crc32=payload_crc32,
+                cmd_id=cmd_id,
+                loss_flag=loss_flag,
+                meta=meta,
+            )
             if rotation_failed:
                 # 輪替失敗不丟資料（仍寫入既有檔），但標記供觀測；conditional key 維持常態 record 向後相容。
                 record["rotation_failed"] = True
@@ -358,6 +655,9 @@ class WalWriter:
 
             wal_error, mirror_error = self._write_record_locked(record, payload)
             if wal_error is None:
+                if self._file_first_seq_pending:
+                    self._file_first_seq = record["seq"]
+                    self._file_first_seq_pending = False
                 self._unhealthy = False
                 self._unhealthy_reason = None
             else:
@@ -484,9 +784,17 @@ class WalWriter:
                     if which == "wal":
                         archive_prefix = f"{os.path.basename(self._wal_path)}."
                         rotated_suffix = os.path.basename(dst)[len(archive_prefix):]
+                        self._wal_path_expected = False
+                        self._wal_identity = None
+                        self._file_first_seq = self._seq + 1
+                        self._file_first_seq_pending = False
                     self._dirty_tail[which] = False
             self._fs.sync_dir(self._wal_dir)
             self._seq = 0
+            self._wal_path_expected = False
+            self._wal_identity = None
+            self._file_first_seq = 1
+            self._file_first_seq_pending = False
             return {"ok": True, "previous_seq": prev_seq, "rotated_suffix": rotated_suffix}
 
     def _iter_matching(self, com: str | None) -> Iterator[dict[str, Any]]:

@@ -9,7 +9,7 @@ changes:
   - id: "BC-01"
     kind: "BC"
     title: "WAL 常駐 handle、每筆 flush、Windows share-delete、自癒與缺口記錄"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "hamanpaul"
       date: "2026-10-15"

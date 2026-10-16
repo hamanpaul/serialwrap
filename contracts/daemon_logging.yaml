@@ -110,7 +110,7 @@ messages:
     template: "console RX handler 例外（com=%s），略過此塊、console 續行"
     args: [com]
     exc_info: true
-    source: "sw_core/uart_io.py:453"
+    source: "sw_core/uart_io.py:454"
 
   - id: rx_handler_exception_pyserial
     logger: serialwrap
@@ -118,7 +118,7 @@ messages:
     template: "RX handler 例外（com=%s），略過此塊、reader 續行"
     args: [com]
     exc_info: true
-    source: "sw_core/uart_io.py:885"
+    source: "sw_core/uart_io.py:886"
 
   - id: rx_handler_exception_posix
     logger: serialwrap
@@ -126,32 +126,39 @@ messages:
     template: "RX handler 例外（com=%s），略過此塊、reader 續行"
     args: [com]
     exc_info: true
-    source: "sw_core/uart_io.py:928"
+    source: "sw_core/uart_io.py:929"
 
   - id: wal_rotate_failed
     logger: serialwrap
     level: WARNING
     template: "WAL 輪替失敗（best-effort 續用既有檔案，不殺 reader）：%s：%s"
     args: [path, exc]
-    source: "sw_core/wal.py:131"
+    source: "sw_core/wal.py:181"
 
   - id: wal_append_failed
     logger: serialwrap
     level: WARNING
     template: "WAL append 寫入失敗（best-effort 略過）：%s"
     args: [wal_error]
-    source: "sw_core/wal.py:369"
+    source: "sw_core/wal.py:669"
 
   - id: mirror_append_failed
     logger: serialwrap
     level: WARNING
     template: "WAL append 寫入失敗（best-effort 略過）：%s"
     args: [mirror_error]
-    source: "sw_core/wal.py:373"
+    source: "sw_core/wal.py:673"
 
   - id: wal_dir_recreated
     logger: serialwrap
     level: WARNING
     template: "WAL 目錄 %s 消失，已重建並續寫（原因：%s）；消失期間的紀錄無法復原"
     args: [wal_dir, exc]
-    source: "sw_core/wal.py:209"
+    source: "sw_core/wal.py:267"
+
+  - id: wal_recreate_failed
+    logger: serialwrap
+    level: WARNING
+    template: "WAL 重建失敗（best-effort 延後重試）：%s"
+    args: [exc]
+    source: "sw_core/wal.py:396"

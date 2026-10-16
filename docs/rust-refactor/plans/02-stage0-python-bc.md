@@ -767,9 +767,13 @@
 
 **Files**
 - Create: `tests/test_stage0_wal_unlink.py`
-- Modify: `sw_core/wal.py`、`sw_core/uart_io.py`（自動 TX 阻擋）、`sw_core/service.py`（`health.status.wal` 帶出新欄位，無需改碼若直接回傳 `WalWriter.health()`）、`docs/rust-refactor/plans/rust-architecture.md` §3.8（補 `com:"WAL"` 與 `previous_identity` 字串格式）、`contracts/behavior_changes.yaml`（BC-01 → `IMPLEMENTED`；不得寫 `contract_revision`）、`contracts/wal_meta_events.schema.json`（**P0 T10 已建立的唯一 META schema，只修改、不另建**：`WAL_RECREATED_AFTER_EXTERNAL_UNLINK` 補外層 `com:"WAL"`、`previous_identity` pattern、`x-status` 改 `IMPLEMENTED`，遞增 `x-catalog-revision`）、`tests/test_wal_missing_detection.py`（測試資產變更，見下）
+- Modify: `sw_core/wal.py`、`sw_core/wal_fs.py`（新增尾端換行查詢，供替換檔重建前隔離 META 行）、`sw_core/uart_io.py`（自動 TX 阻擋）、`sw_core/service.py`（`health.status.wal` 帶出新欄位，無需改碼若直接回傳 `WalWriter.health()`）、`docs/rust-refactor/plans/rust-architecture.md` §3.8／§4.5／§5.8（補 `com:"WAL"`、`previous_identity` 字串格式、尾端換行檢查與重試時序）、`contracts/behavior_changes.yaml`（BC-01 → `IMPLEMENTED`；不得寫 `contract_revision`）、`contracts/wal_meta_events.schema.json`（**P0 T10 已建立的唯一 META schema，只修改、不另建**：`WAL_RECREATED_AFTER_EXTERNAL_UNLINK` 補外層 `com:"WAL"`、`previous_identity` pattern、`x-status` 改 `IMPLEMENTED`，遞增 `x-catalog-revision`）、`contracts/daemon_logging.yaml`（同步新增／移動後的 WAL logger 呼叫來源行）、`tests/test_wal_missing_detection.py`（測試資產變更，見下）
 
-**測試資產變更**（需獨立審閱，PR 註明）：`tests/test_wal_missing_detection.py::TestWalHealth::test_recreated_wal_is_readable_again` 原斷言 `len(rows) == 1`；BC-01 重建後先寫 META，改為先過濾 `row["dir"] != "META"` 後斷言 1 列，並另斷言恰有 1 筆 `meta.event == "WAL_RECREATED_AFTER_EXTERNAL_UNLINK"`。`test_append_recreates_deleted_wal_dir`、`test_append_records_failure_when_recreate_fails` 不改（依 T02 第 4 點不節流的名稱檢查即可通過；後者的失敗路徑對應本 Task 第 5 點）。
+**測試資產變更**（需獨立審閱，PR 註明）：
+- `tests/test_wal_missing_detection.py::TestWalHealth::test_recreated_wal_is_readable_again` 原斷言 `len(rows) == 1`；BC-01 重建後先寫 META，改為先過濾 `row["dir"] != "META"` 後斷言 1 列，並另斷言恰有 1 筆 `meta.event == "WAL_RECREATED_AFTER_EXTERNAL_UNLINK"`。`test_append_recreates_deleted_wal_dir`、`test_append_records_failure_when_recreate_fails` 不改（依 T02 第 4 點不節流的名稱檢查即可通過；後者的失敗路徑對應本 Task 第 5 點）。
+- `tests/test_stage0_wal_handle.py::test_dir_removed_still_self_heals` 與 `::test_file_unlinked_name_check_unthrottled`：更新 WAL 行 seq／META 順序預期；META 會先消耗一個 seq，名稱檢查不節流的原斷言仍保留。
+- `tests/test_stage0_wal_unlink.py::test_identity_query_oserror_is_unknown_and_append_continues`：加入三種 identity 查詢 `OSError` 注入，確認查詢失敗只略過該次分類，append 仍寫入原檔且不新增 META 或 unhealthy 狀態。
+- `tests/test_stage0_wal_unlink.py::test_identity_query_oserror_at_rotate_threshold_keeps_current_file`：identity 查詢遇 `OSError` 且大小達輪替門檻時，確認該路徑保留現行 handle、略過該次輪替並繼續 append；包含 path／handle identity 與 `unlinked` 三種查詢。
 
 **Interfaces**
 - Consumes：T02／T03 `WalFs.path_identity`、`WalFile.identity`、`WalFile.unlinked`；T02 的 `unhealthy`／`unhealthy_reason`；T01 的 `TxResult`、`TxIncompleteError`；`sw_core.constants.WAL_IDENTITY_CHECK_INTERVAL_S`、`WAL_RECREATE_BACKOFF_S`、`WAL_RECREATE_RETRY_INTERVALS_S`。
@@ -794,17 +798,17 @@
 - Rust 對應：arch §3.8 META schema（本 Task 補 `com:"WAL"`）、§5.8 unlink 偵測步驟 1～6、§5.4 fence `wal_unhealthy`（`LoginProbe`／`ReadyReconfirm`／`SystemRecoverKey`／`SelfTestProbe` 被擋）。
 
 **行為規格**
-1. 偵測分兩層：(a) **名稱消失**（`not isdir(wal_dir)` 或 `fs.size(wal_path) is None`）**每筆都檢查、不節流**（T02 第 4 點的同一檢查，本 Task 在其命中時補 META）；(b) **identity／DeletePending 比對**只在距上次比對 `>= WAL_IDENTITY_CHECK_INTERVAL_S` 時做（50 ms 只是節流間隔，不代表遺失窗口上限）。mirror 同樣檢查但只重開、不寫 META。分類依下列順序，取第一個命中者：
+1. 偵測分兩層：(a) **名稱消失**（`not isdir(wal_dir)` 或 `fs.size(wal_path) is None`）**每筆都檢查、不節流**（T02 第 4 點的同一檢查，本 Task 在其命中時補 META）；(b) **identity／DeletePending 比對**平時只在距上次比對 `>= WAL_IDENTITY_CHECK_INTERVAL_S` 時做（50 ms 只是節流間隔，不代表遺失窗口上限）；若本筆因 `size >= R` 即將輪替並清除現有 handle／identity，須先完成該 handle 的失效分類，以免輪替抹除替換證據。mirror 同樣檢查但只重開、不寫 META。分類依下列順序，取第一個命中者：
    1. `not os.path.isdir(wal_dir)` → `dir_missing`；
    2. `ident = fs.path_identity(wal_path)`；`ident is None`（名稱不存在）或 `ident == (0, 0)`（Windows delete-pending 哨兵，T03 第 2 點）→ `external_unlink`；
    3. `ident != fp.identity()`（名稱存在且為真實但不同的 identity）→ `replaced`（POSIX `os.replace` 覆蓋後舊 inode 的 `st_nlink` 也會變 0，因此 identity 比對必須先於 `unlinked()`）；
    4. identity 相同但 `fp.unlinked()` 為真 → `external_unlink`。
-   5. `path_identity`、`identity` 或 `unlinked` 查詢若擲出 `OSError`（包含檔案系統不支援 `FileIdInfo` 的 50／87），該次 identity 視為未知：略過本次 identity-based 分類，使用目前 handle 繼續一般 append；不得因查詢錯誤觸發重建、寫 META、設 unhealthy，亦不得讓查詢例外離開 `append`。這只處理 identity 證據不可用，不覆蓋已由每筆名稱檢查確認的目錄／路徑消失；後續一般寫入若失敗，依 T02 寫入失敗規格處理。
+   5. `path_identity`、`identity` 或 `unlinked` 查詢若擲出 `OSError`（包含檔案系統不支援 `FileIdInfo` 的 50／87），該次 identity 視為未知：略過本次 identity-based 分類，使用目前 handle 繼續一般 append；若該路徑同時達輪替門檻，保留其 handle 並略過該路徑本次輪替，以免清除尚未能判讀的替換證據。不得因查詢錯誤觸發重建、寫 META、設 unhealthy，亦不得讓查詢例外離開 `append`。這只處理 identity 證據不可用，不覆蓋已由每筆名稱檢查確認的目錄／路徑消失；後續一般寫入若失敗，依 T02 寫入失敗規格處理。
 2. 命中後：記 `previous_identity = f"{dev}:{ino}"`（取不到為 `None`）、遺失範圍、關閉自身 handle、`ensure_dir`，做**一次** `open_append` 嘗試。WalWriter 任何路徑都**不得持 `_lock` 睡眠**：重試的退避以 `clock` 判定——第 i 次失敗（i=1,2,3）後，下一次嘗試只在距該次失敗 `>= WAL_RECREATE_BACKOFF_S[i-1]`（0.01、0.05、0.2 s）的下一筆 append 時進行；第 4 次失敗起間隔依 `WAL_RECREATE_RETRY_INTERVALS_S`（1 s、2 s、之後封頂 5 s）；未到嘗試時間的 append 不做任何開檔 syscall，直接回傳 `loss_flag=True`（seq 照常消耗）。
 3. 遺失範圍：`file_first_seq` 為目前 WAL 檔第一筆 seq（啟動掃描時取現行檔第一個非空行；該行能解析為 dict 且 `seq` 為 int 才算已知，否則為 `None`；rotate／reset／重建後設為下一筆寫入的 seq）。範圍＝`[file_first_seq, self._seq]`（`self._seq` 為 META 之前最後已消耗的 seq，含不健康期間消耗而未落盤的 seq）；`file_first_seq is None` 或 `self._seq < file_first_seq` → `potentially_lost_seq_range=None`、`range_known=False`。禁止填入猜測值。
 4. 重建成功：先寫 META（消耗一個 seq、外層 `loss_flag:true`），再寫原紀錄；`_recreated_count += 1`；`unhealthy=False`；`unhealthy_reason=None`。
 5. 重建失敗：**第一次失敗即**設 `unhealthy=True`、`unhealthy_reason="recreate_failed"`（重建失敗不得宣稱 healthy），本筆回傳 `loss_flag=True`、`write_failures += 1`；之後依第 2 點的時間表做有界重試（不得無限迴圈、不得持鎖睡眠、不得強制關閉他人 handle）。不健康期間的範圍在成功重建時一併涵蓋（第 3 點）。
-6. 停止自動 TX：`UARTBridge.send_bytes` 在 `_state_lock` 內檢查 `getattr(self.wal, "unhealthy", False)`（既有測試以無此屬性的 stub WAL 建 bridge）——`unhealthy_reason` 為 `write_failed`（T02）或 `recreate_failed` 皆然——且 `source == "system" or source.startswith("system:")` → 不寫 OS、回 `TxResult("not_submitted", 0, len(payload), "WAL_UNHEALTHY")` 並 raise `WalUnavailableError(result)`；agent／human 來源不受此限（規格只要求停止新增自動 TX）。來源分類必須涵蓋實際的自動 TX 呼叫者：實作前以 `grep -n 'source="system' sw_core/*.py` 列出 login probe、ready reconfirm、recover 鍵、self-test probe 等全部呼叫點並逐一確認以 `system`／`system:` 開頭，未符合者在本 Task 內改正並列入 PR 說明。
+6. 停止自動 TX：`UARTBridge.send_bytes` 在 `_state_lock` 內、flash gate 靜默丟棄之後檢查 `getattr(self.wal, "unhealthy", False)`（既有測試以無此屬性的 stub WAL 建 bridge；順序保留 RPC-H-07）——`unhealthy_reason` 為 `write_failed`（T02）或 `recreate_failed` 皆然——且 `source == "system" or source.startswith("system:")` → 不寫 OS、回 `TxResult("not_submitted", 0, len(payload), "WAL_UNHEALTHY")` 並 raise `WalUnavailableError(result)`；agent／human 來源不受此限（規格只要求停止新增自動 TX）。來源分類必須涵蓋實際的自動 TX 呼叫者：實作前以 `grep -n 'source="system' sw_core/*.py` 列出 login probe、ready reconfirm、recover 鍵、self-test probe 等全部呼叫點並逐一確認以 `system`／`system:` 開頭，未符合者在本 Task 內改正並列入 PR 說明。
 
 **Steps**
 - [ ] **A1 寫失敗測試**：`tests/test_stage0_wal_unlink.py`
@@ -933,6 +937,14 @@
   | `test_health_unhealthy_reason_null_when_healthy` | 正常時 `health()["unhealthy_reason"] is None` |
   | `test_unthrottled_name_check_writes_meta_immediately` | `os.unlink(wal_path)` 後**不推進 clock** 立即 append → 新檔第一行即 META `reason == "external_unlink"` |
   | `test_write_failed_also_blocks_auto_tx` | T02 的 `unhealthy_reason == "write_failed"` 時 `send_bytes(source="system:login")` 擲 `WalUnavailableError`、`port.writes == []` |
+  | `test_replaced_file_at_rotate_threshold_is_detected_before_rotation` | 替換檔大小恰為／高於 `rotate_bytes` 時，先保留替換證據與原遺失 seq 範圍，再依 `>= R` 輪替並在現行檔寫 META |
+  | `test_replaced_unterminated_file_keeps_meta_on_a_parseable_line` | 替換檔尾端沒有換行時，先終結殘行；`tail_raw()` 仍能讀到獨立 META 與後續紀錄 |
+  | `test_second_unlink_range_starts_at_first_meta_seq` | 同一 writer 連續兩次 unlink；第二筆 META 範圍由第一筆 META 的 seq 開始 |
+  | `test_zero_identity_sentinel_and_unlinked_handle_trigger_recreation` | 行為替身分別提供 `(0, 0)` sentinel、identity 相同但 `unlinked() is True`，兩案皆分類為 `external_unlink` |
+  | `test_recreate_retry_schedule_checks_each_gap_and_caps_at_five_seconds` | fake clock 在每一重試間隔前 1 ms 不觸發，達間隔後觸發；涵蓋 10／50／200 ms、1／2／5／5 s |
+  | `test_replacement_tail_inspection_failure_stays_unhealthy_until_retry` | 尾端查詢擲 `OSError` 時不寫 META、保持 `recreate_failed`；退避到期後確認／終結尾端、寫出可讀 META 並恢復健康 |
+  | `test_identity_query_oserror_at_rotate_threshold_keeps_current_file` | path／handle identity 或 `unlinked` 查詢擲 `OSError` 且檔案達輪替門檻時，保留現行 handle 並略過該路徑輪替；正常 append、不寫 META、不設 unhealthy |
+  | `test_flash_gate_precedes_wal_unhealthy_rejection` | WAL 不健康且 flash gate 開啟時，自動 TX 仍照基線靜默丟棄，不先擲 `WalUnavailableError` |
   | `test_bridge_with_stub_wal_without_unhealthy_attr` | 以無 `unhealthy` 屬性的 stub WAL 建 bridge → `send_bytes(source="system:x")` 照常寫出 |
   | `test_native_classic_delete_pending_with_external_reader`（`windows_native`） | 外部以 share-all handle 持有，`w32.delete_classic(p)` 後（先斷言 `path_identity == (0, 0)` 確認 classic 生效）`unlinked()` 為真；重建因 access denied 失敗 → `unhealthy`；外部 handle 關閉並依退避時間表後重建成功、META `reason == "external_unlink"` |
   | `test_native_posix_semantics_delete`（`windows_native`） | 以 `w32.delete_posix_semantics(p)`（`SetFileInformationByHandle(FileDispositionInfoEx, FILE_DISPOSITION_FLAG_DELETE\|FILE_DISPOSITION_FLAG_POSIX_SEMANTICS)`）刪除 → 名稱立即消失、重建成功、META `reason == "external_unlink"` |

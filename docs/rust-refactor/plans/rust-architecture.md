@@ -336,12 +336,14 @@ macro_rules! pydict { ($($k:expr => $v:expr),* $(,)?) => { ... } }  // 回應依
   ```json
   {"event":"WAL_RECREATED_AFTER_EXTERNAL_UNLINK",
    "reason":"external_unlink"|"replaced"|"dir_missing",
-   "previous_identity":str|null,
+   "previous_identity":"<dev>:<ino>"|null,
    "potentially_lost_seq_range":[first,last]|null,
    "range_known":bool}
   ```
 
-  外層紀錄：`dir:"META"`、`source:"system"`、`loss_flag:true`。
+  `previous_identity` 是十進位整數組成的 `<dev>:<ino>`；Windows 為 `<VolumeSerialNumber>:<FileId128>`。
+
+  外層紀錄：`dir:"META"`、`source:"system"`、`com:"WAL"`、`loss_flag:true`。
 
 ---
 
@@ -545,6 +547,7 @@ pub trait WalFs: Send + Sync {
     fn open_append(&self, path: &Path) -> PalResult<Box<dyn WalFile>>;
     fn path_identity(&self, path: &Path) -> PalResult<Option<FileIdentity>>;  // None = 不存在
     fn size(&self, path: &Path) -> PalResult<Option<u64>>;
+    fn tail_needs_termination(&self, path: &Path) -> PalResult<bool>;
     fn rename_noreplace_or_suffix(&self, from: &Path, base_to: &Path) -> PalResult<PathBuf>; // DF-03：優先原子 no-replace；不支援時降級；同名加 .1 .2 …
     fn sync_dir(&self, dir: &Path) -> PalResult<()>;
     fn ensure_dir(&self, dir: &Path) -> PalResult<()>;
@@ -778,6 +781,8 @@ TxClass 與 gate 規則（規格 §5.2.1）：
 | `FlashProbe` | 只在對應的 `Probe(probe_id)` 時放行 |
 | 其他所有 class | `flash_mode != Off` |
 
+Python 基線的 gate 順序也須保留：`UARTBridge.send_bytes` 先套用 flash gate；flash 模式不允許該來源時靜默丟棄，之後才檢查 WAL unhealthy 並拒絕自動 TX。這保留 RPC-H-07 的 flash probe timeout 語意。
+
 TxWriter 的 job queue 容量 64；滿時 OpRunner 阻塞等待（只有 OpRunner 會送 job）。
 
 ### 5.5 Two-Phase Drain Barrier（`drain.rs`）
@@ -862,13 +867,14 @@ TxWriter 的 job queue 容量 64；滿時 OpRunner 阻塞等待（只有 OpRunne
      - 重試（整段重寫或補寫）仍失敗：若最終已確認長度落在新紀錄殘行內（大於終結 `\n` 的長度且小於總長），設 `dirty_tail=true`；若原 `dirty_tail` 為真且合併寫入的最終確認長度為 0，舊殘行仍未終結，也設 `dirty_tail=true`。兩種情況都須在下一次對該檔寫入前先終結殘行，使其成為讀取端判為無效、被略過的獨立行；其餘情況（例如只確認寫出終結 `\n`）設 `dirty_tail=false`。本筆視為該檔寫入失敗。
      - 全部寫出（含補寫成功）→ 清 `dirty_tail`、本筆該檔成功；`write_all_flush` 已回 `Ok` 後的任何後續錯誤都不得觸發重寫。
   6. 失敗時設 `loss_flag`、遞增 `write_failures`、記錄 `last_write_error`；WAL 的「首次嘗試＋重試」皆失敗（含部分寫入後補寫失敗）即本筆寫入失敗：`write_failures` 只 +1（每筆每檔最多計一次，與 P1 T02 相同），`unhealthy_reason="write_failed"`，下一筆完整寫出才恢復。
-- **unlink 偵測**：每次 append 時，若距上次檢查 ≥ 50 ms，比對 `path_identity(wal_path) != wal.identity()` 或 `wal.unlinked()`。命中則：
-  1. 標記失效。
-  2. 保存舊 identity 與 seq 範圍 `[file_first_seq, seq]`。
-  3. 關閉自身 handle。
-  4. 有界重試重開，最多 3 次，間隔 10／50／200 ms。
-  5. 成功後先寫 META `WAL_RECREATED_AFTER_EXTERNAL_UNLINK`（§3.8），再寫原紀錄。
-  6. 重開失敗時 `health.healthy=false`，fence 設 `wal_unhealthy=true`（停止自動 TX），記錄仍以 `loss_flag` 回傳。
+- **unlink 偵測**：每筆 append 都檢查 WAL 目錄與檔案名稱；identity／DeletePending 比對平時以 50 ms 節流。若本筆大小檢查將輪替 WAL 或 mirror，先完成該 handle 的 identity 分類，再關閉或清除其身分。分類順序為：目錄不存在 → `dir_missing`；路徑 identity 為 `None` 或 `(0,0)` → `external_unlink`；路徑與 handle identity 不同 → `replaced`；兩者相同但 `unlinked()` 為真 → `external_unlink`。identity 查詢擲 `OSError` 時該次證據視為未知，保留現行 handle 繼續 append，不觸發重建；若該路徑也達輪替門檻，該路徑本次略過輪替，避免清除未能判讀的替換證據。
+  命中 WAL 失效時：
+  1. 保存舊 identity 與 seq 範圍 `[file_first_seq, seq]`；範圍起點未知時寫 `null` 與 `range_known:false`，重試期間新消耗的 seq 併入終點。
+  2. 關閉自身 handle；若外部替換檔已達 rotate 門檻，先依 `>= R` 輪替該檔，再在新現行檔重建紀錄。
+  3. 每次到期 append 最多嘗試一次開檔；前三次失敗後的間隔為 10／50／200 ms，第四次起為 1／2／5／5…秒，封頂 5 秒。任何路徑都不持鎖睡眠。
+  4. 重開後以 `tail_needs_termination` 檢查既存檔尾端；非空且未以換行結尾時先補一個換行，讓殘行與 META 分開。檢查、終結或 META 寫入失敗都維持不健康並依退避重試。
+  5. 成功後先寫 META `WAL_RECREATED_AFTER_EXTERNAL_UNLINK`（§3.8），再寫原紀錄；重建成功沿用既有 `_record_recreated` 診斷欄位與日誌。
+  6. 重建失敗時 `health.healthy=false`、`unhealthy_reason="recreate_failed"`，fence 設 `wal_unhealthy=true`（停止自動 TX），記錄仍以 `loss_flag` 回傳。
 - **rotate／reset**：同一把鎖內依序 flush、`sync()`、關閉自身 handle、rename；成功後 `sync_dir`，下次寫入時再開啟現行路徑。reset 只輪替大小大於 0 的檔案，兩檔共用同一 UTC 時戳，目錄同步成功後才將 seq 歸零。
   - rotate rename 失敗時，下一筆寫入會重開原路徑並繼續附加，該筆紀錄帶 `rotation_failed:true`。
   - 同名歸檔加 `.N` 後綴（`DF-03`）；POSIX 優先使用原子 no-replace 改名，不支援時改以 hard link 後 unlink，若 hard link 也不支援則檢查目的地後降級為一般 rename；Windows 使用不覆蓋既有目的地的改名。
