@@ -1,0 +1,16 @@
+[package]
+name = "sw-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# bin `serialwrapd`（P3 只放空殼；P4 之後承接 daemon 本體）。
+[[bin]]
+name = "serialwrapd"
+path = "src/main.rs"
+
+[dependencies]
+sw-core = { path = "../sw-core" }
+sw-proto = { path = "../sw-proto" }
+sw-pal = { path = "../sw-pal" }

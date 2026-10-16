@@ -32,7 +32,6 @@ def _crate(tmp: Path, name: str, rel: str, body: str) -> None:
 
 
 @pytest.mark.skipif(not (ROOT / "crates").is_dir(), reason="crates/ 尚未建立")
-@pytest.mark.xfail(strict=True, reason="P3-T1 紅燈")
 def test_repo_clean():
     r = _run(ROOT)
     assert r.returncode == 0, r.stdout + r.stderr
@@ -56,7 +55,6 @@ def test_repo_clean():
     ],
 )
 @pytest.mark.parametrize("subdir", ["src", "tests"])
-@pytest.mark.xfail(strict=True, reason="P3-T1 紅燈")
 def test_detects_forbidden(tmp_path, snippet, rule, subdir):
     _crate(tmp_path, "sw-cli", f"{subdir}/bad.rs", snippet)
     r = _run(tmp_path)
@@ -74,13 +72,11 @@ def test_detects_forbidden(tmp_path, snippet, rule, subdir):
         "#[cfg(not(test))]\nfn a() {}\n",
     ],
 )
-@pytest.mark.xfail(strict=True, reason="P3-T1 紅燈")
 def test_allows_test_and_fakes(tmp_path, snippet):
     _crate(tmp_path, "sw-cli", "src/ok.rs", snippet)
     assert _run(tmp_path).returncode == 0
 
 
-@pytest.mark.xfail(strict=True, reason="P3-T1 紅燈")
 def test_pal_exempt(tmp_path):
     _crate(
         tmp_path,
@@ -91,7 +87,6 @@ def test_pal_exempt(tmp_path):
     assert _run(tmp_path).returncode == 0
 
 
-@pytest.mark.xfail(strict=True, reason="P3-T1 紅燈")
 def test_build_script_and_target_section(tmp_path):
     _crate(tmp_path, "sw-proto", "build.rs", "fn main() {}\n")
     (tmp_path / "crates" / "sw-proto" / "Cargo.toml").write_text(

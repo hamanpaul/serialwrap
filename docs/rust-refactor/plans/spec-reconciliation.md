@@ -506,3 +506,14 @@ Rust 依基線逐字承接以上行為。要修正時另開 issue，並登記新
 登記項目：SC-01～SC-27 扣除已撤回的 SC-08，加上 OD-14 新增的 SC-34、SC-35（共 28 項；SC-28～SC-33 由 P6～P8 另行登記，OD-15 的 SC-36 由 P4 Task 19 登記）、DF-01～DF-17 與 DF-19（18 項；DF-18 保留給 P7 `08` §0.5），另有既有核准的 BC-01～05。7 列標為需擁有者確認，對應第 3 節的 7 項（第 1 項含 3 列交叉引用），已全數由 OD-14 裁決。
 
 OD-14 對上表的影響（2026-10-16）：RPC-D-02、ERR-7.2-b、ERR-7.3-1、SES-16.5-02 由 KEEP 改 SPEC（SC-34）；SES-16.4-03 由 KEEP 改 SPEC（SC-35）；RPC-D-05 由 SPEC（SC-08）改 KEEP。上表已依此重算：KEEP 由 152 列減為 148 列、SPEC 由 31 列增為 35 列，合計仍 299 列。
+
+## 6. P3 登記：Rust-only 非契約差異（arch §0.7）
+
+由 `04-stage1a-rust-cli.md` §0.7 寫回 `rust-architecture.md` 時登記。以下為 **Rust-only 非契約差異**：不登記 `contracts/behavior_changes.yaml`、不參與 A/B 差分，只驗絕對契約。ID 為 P3-T1 暫定配發（`NC-` 前綴），待調和表維護者確認。
+
+| ID | 事實（現況） | 規格 | 裁決 | 理由 | 階段 | 需擁有者 |
+|---|---|---|---|---|---|---|
+| NC-01 | client 回應累積上限：Python 無上限（`recv(65536)` 累積到換行）；Rust 設上限，超過視同 `INVALID_RESPONSE` | — | IMPL（Rust-only 非契約差異；上限 256 MiB，原 arch §5.10 草案 16 MiB） | `wal export --limit 50000` 回應可超過 16 MiB；上限不影響正常回應 | P3 | no |
+| NC-02 | JSON 巢狀深度上限：Python 上限隨平台與 C 堆疊而變（Linux 3.12.3 約 9998、Windows 3.12.10 約 2998） | — | IMPL（Rust-only；自訂常數 `JSON_MAX_DEPTH`，超過回 `JsonError::Recursion`） | 同一 Rust 引擎需固定單一值；不以 Stage 0 單一數值凍結（arch §3.3） | P3 | no |
+| NC-03 | 委派至 Python 子行程時多三個 env：`SERIALWRAP_DELEGATE_DEPTH`、`SERIALWRAP_DELEGATE_ARGV_SHA`、`SERIALWRAP_RELEASE_MANIFEST` | — | IMPL（Rust-only；對 Python 子行程可見） | `python -m sw_core.cli` 下 `find_release_manifest(argv0)` 找不到 bundle manifest；遞迴防護需要（arch §7.4） | P3 | no |
+| Q-19(c) | 非 UTF-8 argv 中要寫到 stdout 的值（例如 `--bench` 名稱出現在錯誤訊息）：Python 依 locale 決定（`C`／`POSIX`／`C.UTF-8` 原樣寫 raw byte；其他 UTF-8 locale 為 strict、stdout 空、exit 1） | — | IMPL（Rust-only：不讀 locale，一律採 strict 語意，exit 1、stdout 空、stderr 一行 `serialwrap: internal error: argument is not valid UTF-8`） | Rust 不讀 locale；黑箱 `test_non_utf8_bench_echo`（`posix_only`、`rust_only`）驗證（計畫 Task 14／Q-19） | P3 | no |

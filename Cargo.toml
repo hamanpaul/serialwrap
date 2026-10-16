@@ -1,3 +1,31 @@
+# serialwrap Rust workspace（P3-T1；依 docs/rust-refactor/plans/rust-architecture.md §1.1、§1.2）。
+# VERSION 檔為單一版本來源；`tests/test_rust_workspace_layout.py` 會核對此處版本與 VERSION 一致。
 [workspace]
 resolver = "2"
-members = ["crates/sw-proto"]
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.3.2"
+edition = "2021"
+rust-version = "1.96"
+publish = false
+
+# 全部依賴以 `=` 釘版（arch §1.2）。crate 內以 `{ workspace = true }` 引用。
+[workspace.dependencies]
+indexmap = { version = "=2.11.4" }
+fancy-regex = { version = "=0.16.2", default-features = false, features = ["std", "unicode", "perf"] }
+yaml-rust2 = { version = "=0.10.4", default-features = false }
+crc32fast = { version = "=1.5.0" }
+sha2 = { version = "=0.10.9" }
+crossbeam-channel = { version = "=0.5.15" }
+libc = { version = "=0.2.186" }
+windows-sys = { version = "=0.61.2" }
+tempfile = { version = "=3.23.0" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+debug = 1
+strip = "none"

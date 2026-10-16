@@ -117,6 +117,13 @@ arch 前言規定分計畫不得牴觸 arch，要牴觸時先改 arch。下列�
 | §7.2 | 未指定 patch 版本 | argparse 方言釘 **CPython 3.12.3**（`invalid choice` 引號與 `--help` 子命令欄寬在 3.12.x 間不同） | 同一 Rust 引擎只能對齊一個方言 |
 | §7.4 | 委派 env「僅加兩個變數」 | 加三個：`SERIALWRAP_DELEGATE_DEPTH`、`SERIALWRAP_DELEGATE_ARGV_SHA`、`SERIALWRAP_RELEASE_MANIFEST=<manifest 絕對路徑>` | Python `python -m sw_core.cli` 下 `find_release_manifest(argv0)` 找不到 bundle manifest |
 | §3.3（新增） | — | JSON 巢狀深度上限為 Rust 自訂常數，登記為非契約差異 | Python 上限隨平台與 C 堆疊而變（Linux 3.12.3 約 9998、Windows 3.12.10 約 2998） |
+| §4 `PalError` | `PalError{kind,os_code,py_message}` | `PalError{kind,os_code,winerror,strerror,py_message}` | Python `OSError` 的 `winerror`、`strerror` 屬性分開保存（`traits.rs`） |
+| §4 `ClientCaps` | arch §4 只有完整的 `Capabilities`，無 client 子集 | `ClientCaps{path_flavor,af_unix,native_backend,default_skill,text_newline,exec_replace}`，值型別為 `PalPathFlavor`、`BackendKind`、`SkillPlatform` | 業務碼只看 capability 值（§2.1）；P4 併入 `Capabilities` |
+| §4.4 `EndpointSpec::Unix` | `Unix(PathBuf)` | `Unix(OsString)` | 非 UTF-8 socket 路徑須以原始 bytes 運作（Q-19(a)） |
+| §4.6 `RpcConnector` | 無 `resolve_tcp` | 新增 `resolve_tcp(host, port) -> PalResult<()>` | Q-10：TCP `getaddrinfo` 早於 timeout 驗證，需獨立呼叫 |
+| §1.3 檔案樹 | sw-cli 無 `lib.rs`、`ctx.rs`；sw-pal 無 `select.rs`、`fakes/{env,rpc,process}.rs` | 補列上述檔案（P3 實際落地 stub） | P3-T1 Files 清單 |
+| §2.1 禁止清單 | 未列群組 `use`、OS 名稱比較；`[target.'cfg(` 區段 | 補列 `std::env::consts::OS`／`FAMILY`、群組 `use`、`[package] build`、引號 key 與表形式 build 鍵，`[target.…]` 任何 triple 表 | 審查修正：閘門以語意檢查，文件與閘門須一致 |
+| §1.2、Task 1 Interfaces | sw-cli 依賴列為 proto＋pal | sw-cli 另依賴 `indexmap =2.11.4` | argparse `Namespace` 插入序（P3-T10 Produces 直接引用 `IndexMap`）；arch §1.2 已列 sw-cli 為 indexmap 使用者 |
 
 ---
 
@@ -210,7 +217,7 @@ arch 前言規定分計畫不得牴觸 arch，要牴觸時先改 arch。下列�
   - `Cargo.toml`：`[workspace] members = ["crates/*"]`、`resolver = "2"`；`[workspace.package] version = "<VERSION 檔內容>"`、`edition = "2021"`、`rust-version = "1.96"`；`[workspace.dependencies]` 照 arch §1.2 全部 `=` 釘版；`[profile.release]` 照 arch §1.1。
   - `rust-toolchain.toml`：`channel = "1.96.1"`、`targets = ["x86_64-unknown-linux-gnu","x86_64-pc-windows-gnu"]`。
   - `.cargo/config.toml`：**不設** `runner` 與 `linker`（§0.7；原生 Windows runner 的 host triple 就是 `x86_64-pc-windows-gnu`，`[target.<triple>].runner` 會套用到不帶 `--target` 的原生 `cargo test`）。只放與平台無關的設定（例如 `[term]`）；若無設定可省略此檔。WSL 交叉執行改由 `scripts/rust/win-test.sh`／`win-runner.sh` 偵測 WSL（`WSL_DISTRO_NAME` 或 `/proc/sys/fs/binfmt_misc/WSLInterop`）後以 `CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=scripts/rust/win-runner.sh`、`CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc` 環境變數注入（兩支腳本由 Task 17 交付）。
-  - crate 依賴：`sw-proto`（indexmap、fancy-regex、yaml-rust2、sha2；dev：`tempfile`）；`sw-pal`（`[target.'cfg(unix)'.dependencies] libc`、`[target.'cfg(windows)'.dependencies] windows-sys`，`[features] test-fakes = []`；dev：`tempfile`）；`sw-cli`（`sw-proto`、`sw-pal`；dev：`sw-pal` 加 `features=["test-fakes"]`、`tempfile`；`[lib] name="sw_cli"`、`[[bin]] name="serialwrap" path="src/main.rs"`）；`sw-core`（`sw-proto`、`sw-pal`）；`sw-daemon`（`[[bin]] name="serialwrapd"`，依賴 `sw-core`、`sw-proto`、`sw-pal`）。
+  - crate 依賴：`sw-proto`（indexmap、fancy-regex、yaml-rust2、sha2；dev：`tempfile`）；`sw-pal`（`[target.'cfg(unix)'.dependencies] libc`、`[target.'cfg(windows)'.dependencies] windows-sys`，`[features] test-fakes = []`；dev：`tempfile`）；`sw-cli`（`sw-proto`、`sw-pal`、`indexmap`（P3-T10 的 `Namespace` 直接引用 `indexmap::IndexMap`，§0.7）；dev：`sw-pal` 加 `features=["test-fakes"]`、`tempfile`；`[lib] name="sw_cli"`、`[[bin]] name="serialwrap" path="src/main.rs"`）；`sw-core`（`sw-proto`、`sw-pal`）；`sw-daemon`（`[[bin]] name="serialwrapd"`，依賴 `sw-core`、`sw-proto`、`sw-pal`）。
   - `scripts/rust/check_cfg_boundary.py [--root DIR]`：stdout 每行 `<relpath>:<line>: <rule>: <text>`；exit 0（乾淨）／1（違規）。
   - `scripts/rust/check_dep_direction.py [--root DIR]`：執行 `cargo metadata --format-version 1 --filter-platform <triple>`（兩個 triple 各一次），違規列出 `<crate> -> <dep>: <rule>`，exit 0／1。
 
@@ -219,10 +226,11 @@ arch 前言規定分計畫不得牴觸 arch，要牴觸時先改 arch。下列�
 | 規則 ID | 掃描範圍（排除 `crates/sw-pal/`） | 命中條件 |
 |---|---|---|
 | `cfg-predicate` | `crates/*/{src,tests,benches,examples}/**/*.rs` | `#[cfg(`、`#![cfg(`、`#[cfg_attr(`、`cfg!(` 的謂詞不是由 `test`、`feature = "test-fakes"` 與 `all`／`any`／`not` 組成 |
-| `os-module` | 同上 | `std::os::unix`、`std::os::windows` |
+| `os-module` | 同上 | `std::os::unix`、`std::os::windows`（含群組 `use` 寫法） |
+| `os-name` | 同上 | `std::env::consts::OS`、`FAMILY`（執行期 OS 名稱比較，arch §2.1；審查修正新增） |
 | `ffi-crate` | 同上 | `libc::`、`windows_sys::` |
-| `build-script` | `crates/*/build.rs` 存在；`crates/*/Cargo.toml` 含 `build =` 或 `[build-dependencies]` | 任一 |
-| `target-section` | `crates/*/Cargo.toml`（排除 sw-pal） | `[target.'cfg(` |
+| `build-script` | `crates/*/build.rs` 存在；`crates/*/Cargo.toml`（tomllib 解析）含 `[package] build`、任何 `build-dependencies`（頂層或 target 表內） | 任一 |
+| `target-section` | `crates/*/Cargo.toml`（排除 sw-pal） | 任何 `[target.…]` 區段（含 triple 表；審查修正加嚴） |
 | `dep-direction` | `cargo metadata` | `sw-cli` 依賴 `sw-core`；`sw-pal` 依賴 `sw-proto`；`sw-proto` 依賴任何 workspace crate；`sw-pal` 以外直接依賴 `libc`／`windows-sys` |
 | `test-data-path` | `crates/*/tests/**/*.rs`（含 sw-pal） | `CARGO_MANIFEST_DIR` 出現在 `tests/common/mod.rs` 以外（測試資料一律經 `data_root()`，Step 4 第 7 點） |
 

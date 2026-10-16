@@ -24,13 +24,11 @@ def _cargo_available():
         pytest.skip("cargo 不存在（證據不足，非 PASS）")
 
 
-@pytest.mark.xfail(strict=True, reason="P3-T1 紅燈")
 def test_members_exist():
     for c in CRATES:
         assert (ROOT / "crates" / c / "Cargo.toml").is_file(), c
 
 
-@pytest.mark.xfail(strict=True, reason="P3-T1 紅燈")
 def test_dep_direction():
     r = subprocess.run(
         [
@@ -46,14 +44,12 @@ def test_dep_direction():
     assert r.returncode == 0, r.stdout + r.stderr
 
 
-@pytest.mark.xfail(strict=True, reason="P3-T1 紅燈")
 def test_workspace_version_matches_VERSION():
     version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
     text = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
     assert f'version = "{version}"' in text
 
 
-@pytest.mark.xfail(strict=True, reason="P3-T1 紅燈")
 def test_toolchain_pinned():
     t = (ROOT / "rust-toolchain.toml").read_text(encoding="utf-8")
     assert 'channel = "1.96.1"' in t and "x86_64-pc-windows-gnu" in t
