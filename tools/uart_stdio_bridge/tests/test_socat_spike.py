@@ -138,3 +138,38 @@ def test_echo_child_binary():
     )
     assert proc.returncode == 0, f"echo_child 應 exit 0，實得 {proc.returncode}；stderr={proc.stderr!r}"
     assert proc.stdout == expected
+
+
+def test_echo_child_non_sentinel_continuation():
+    """__EXIT__ 後接一般非換行字元時不觸發結束，原樣回寫直至 EOF。"""
+    assert ECHO_CHILD.is_file(), f"echo 子程序不存在：{ECHO_CHILD}"
+    payload = b"__EXIT__abc\n"
+    proc = subprocess.run(
+        [sys.executable, str(ECHO_CHILD)],
+        input=payload,
+        capture_output=True,
+        timeout=ECHO_TIMEOUT_S,
+        check=False,
+    )
+    assert proc.returncode == 0, f"echo_child 應 exit 0，實得 {proc.returncode}；stderr={proc.stderr!r}"
+    assert proc.stdout == payload
+
+
+def test_echo_child_chunked_sentinel():
+    """跨 chunk 傳送資料與結束標記時，前段資料原樣回寫且正確退出。"""
+    assert ECHO_CHILD.is_file(), f"echo 子程序不存在：{ECHO_CHILD}"
+    proc = subprocess.Popen(
+        [sys.executable, str(ECHO_CHILD)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert proc.stdin is not None
+    assert proc.stdout is not None
+    proc.stdin.write(b"abc")
+    proc.stdin.flush()
+    proc.stdin.write(b"__EXIT__\n")
+    proc.stdin.flush()
+    stdout, stderr = proc.communicate(timeout=ECHO_TIMEOUT_S)
+    assert proc.returncode == 0, f"echo_child 應 exit 0，實得 {proc.returncode}；stderr={stderr!r}"
+    assert stdout == b"abc"
