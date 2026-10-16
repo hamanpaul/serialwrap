@@ -27,15 +27,21 @@ _EXPECTED = {
 }
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_blocking_methods_include_known_blocking_handlers():
     assert _EXPECTED <= BLOCKING_RPC_METHODS
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_cli_result_tail_method_is_offloaded():
     """CLI `cmd result-tail` 實際送 command.result_tail（非 legacy result.tail），須在 offload 清單。"""
     assert "command.result_tail" in BLOCKING_RPC_METHODS
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_blocking_methods_are_real_dispatch_strings():
     """防打錯方法名：每個 offload 的方法都應是 service.rpc 實際分派的字串。"""
     src = (pathlib.Path(sw_core.__file__).parent / "service.py").read_text(encoding="utf-8")
@@ -47,6 +53,8 @@ def test_blocking_methods_are_real_dispatch_strings():
     sys.platform.startswith("win"),
     reason="POSIX-only: Unix domain socket 在 Windows 不適用（#84 PORT-4）",
 )
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
 def test_health_ping_not_blocked_by_slow_command_result_tail():
     """以真實 BLOCKING_RPC_METHODS 驅動：大 command.result_tail 進行中，health.ping 不得被卡。
 

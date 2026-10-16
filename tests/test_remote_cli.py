@@ -6,7 +6,13 @@ import os
 import pytest
 
 from sw_core import cli
-from sw_core import remote_tunnel as rt
+try:  # remote_tunnel.py:10 頂層 import fcntl；原生 Windows 無此模組，rt 僅供 POSIX 測試使用
+    from sw_core import remote_tunnel as rt
+except ImportError:  # pragma: no cover -- 原生 Windows
+    rt = None
+
+# 模組層只放資源 marker；平台 marker 逐函式標註（Windows 行為測試為 core_portable，其餘依賴 POSIX fcntl 的為 posix_only）
+pytestmark = [pytest.mark.memory_only]
 
 
 def _run(argv, capsys):
@@ -15,24 +21,28 @@ def _run(argv, capsys):
     return rc, json.loads(out) if out.strip() else None
 
 
+@pytest.mark.posix_only
 def test_remote_bare_is_status(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("SERIALWRAP_RUN_DIR", str(tmp_path))
     rc, obj = _run(["remote"], capsys)
     assert rc == 0 and obj["ok"] and obj["tunnels"] == []
 
 
+@pytest.mark.posix_only
 def test_remote_mutually_exclusive_R_L(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("SERIALWRAP_RUN_DIR", str(tmp_path))
     rc, obj = _run(["remote", "-R", "-L", "u@h:7777"], capsys)
     assert rc == 1 and obj["error_code"] == "INVALID_ARGS"
 
 
+@pytest.mark.posix_only
 def test_remote_invalid_target(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("SERIALWRAP_RUN_DIR", str(tmp_path))
     rc, obj = _run(["remote", "nohost"], capsys)
     assert rc == 1 and obj["error_code"] == "INVALID_TARGET"
 
 
+@pytest.mark.posix_only
 def test_remote_open_dispatches_to_open_tunnel(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("SERIALWRAP_RUN_DIR", str(tmp_path))
     captured = {}
@@ -47,6 +57,7 @@ def test_remote_open_dispatches_to_open_tunnel(tmp_path, monkeypatch, capsys):
     assert captured["spec"].ssh_target == "tester@relay"
 
 
+@pytest.mark.posix_only
 def test_remote_local_with_default_role_is_invalid_args(tmp_path, monkeypatch, capsys):
     """--local 僅用於 -L（connect）；預設（-R/expose）帶入須擋在 CLI 層，不靜默略過。"""
     monkeypatch.setenv("SERIALWRAP_RUN_DIR", str(tmp_path))
@@ -55,6 +66,7 @@ def test_remote_local_with_default_role_is_invalid_args(tmp_path, monkeypatch, c
     assert rc == 1 and obj["error_code"] == "INVALID_ARGS"
 
 
+@pytest.mark.posix_only
 def test_remote_local_with_R_is_invalid_args(tmp_path, monkeypatch, capsys):
     """--local 僅用於 -L（connect）；明確帶 -R 仍須擋。"""
     monkeypatch.setenv("SERIALWRAP_RUN_DIR", str(tmp_path))
@@ -63,6 +75,7 @@ def test_remote_local_with_R_is_invalid_args(tmp_path, monkeypatch, capsys):
     assert rc == 1 and obj["error_code"] == "INVALID_ARGS"
 
 
+@pytest.mark.posix_only
 def test_remote_local_zero_is_invalid_args(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("SERIALWRAP_RUN_DIR", str(tmp_path))
     monkeypatch.setattr(rt, "resolve_ssh_bin", lambda via: "/usr/bin/ssh")
@@ -70,6 +83,7 @@ def test_remote_local_zero_is_invalid_args(tmp_path, monkeypatch, capsys):
     assert rc == 1 and obj["error_code"] == "INVALID_ARGS"
 
 
+@pytest.mark.posix_only
 def test_remote_local_too_large_is_invalid_args(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("SERIALWRAP_RUN_DIR", str(tmp_path))
     monkeypatch.setattr(rt, "resolve_ssh_bin", lambda via: "/usr/bin/ssh")
@@ -77,6 +91,7 @@ def test_remote_local_too_large_is_invalid_args(tmp_path, monkeypatch, capsys):
     assert rc == 1 and obj["error_code"] == "INVALID_ARGS"
 
 
+@pytest.mark.posix_only
 def test_remote_local_valid_with_L_dispatches(tmp_path, monkeypatch, capsys):
     """有效範圍內的 --local 搭 -L 仍照常派送到 open_tunnel。"""
     monkeypatch.setenv("SERIALWRAP_RUN_DIR", str(tmp_path))
@@ -94,6 +109,7 @@ def test_remote_local_valid_with_L_dispatches(tmp_path, monkeypatch, capsys):
     assert captured["spec"].local == 7000
 
 
+@pytest.mark.posix_only
 def test_remote_malformed_endpoint_returns_json_error(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("SERIALWRAP_RUN_DIR", str(tmp_path))
     monkeypatch.setattr(rt, "resolve_ssh_bin", lambda via: "/usr/bin/ssh")
@@ -103,6 +119,7 @@ def test_remote_malformed_endpoint_returns_json_error(tmp_path, monkeypatch, cap
     assert obj["error_code"] == "INVALID_ENDPOINT"
 
 
+@pytest.mark.core_portable
 def test_remote_windows_returns_not_supported(tmp_path, monkeypatch, capsys):
     """native Windows：guard 需在 `import remote_tunnel`（頂層 import fcntl）之前
     就攔截，status／open 兩條路徑皆須回 JSON REMOTE_NOT_SUPPORTED，不得拋例外。
@@ -121,6 +138,7 @@ def test_remote_windows_returns_not_supported(tmp_path, monkeypatch, capsys):
     assert obj["error_code"] == "REMOTE_NOT_SUPPORTED"
 
 
+@pytest.mark.posix_only
 def test_remote_internal_error_is_json_not_traceback(tmp_path, monkeypatch, capsys):
     """非 TunnelError 例外（如壞掉的 SERIALWRAP_RUN_DIR）不得穿越 CLI 邊界，
     須經 catch-all 轉為 JSON INTERNAL_ERROR。"""

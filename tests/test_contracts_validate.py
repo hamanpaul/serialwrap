@@ -21,6 +21,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+pytestmark = [pytest.mark.core_portable]
+
 ROOT = Path(__file__).resolve().parents[1]
 
 # 與 `.project-policy.yml` 的 diagnostic_codes.entry_pattern 逐字相同（T12）。
@@ -58,6 +60,7 @@ def _find(findings, check: str):
     return [f for f in findings if f.check == check]
 
 
+@pytest.mark.memory_only
 def test_summary_counts_are_data_derived():
     cat_mod, ex_mod, val = _load("catalog"), _load("extract"), _load("validate")
     cat = cat_mod.load_catalogs(ROOT)
@@ -68,6 +71,7 @@ def test_summary_counts_are_data_derived():
     assert s["error_code"]["passthrough"] == len(cat.passthrough)
 
 
+@pytest.mark.memory_only
 def test_no_hardcoded_78_anywhere_in_validator():
     files = sorted((ROOT / "tools" / "contracts").glob("*.py"))
     # 紅燈階段目錄尚不存在；空清單不得被視為通過。
@@ -369,6 +373,7 @@ def _run_cli(*args: str) -> subprocess.CompletedProcess:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.memory_only
 def test_c02_emitted_not_in_catalog(tmp_path):
     _make_repo(
         tmp_path,
@@ -384,6 +389,7 @@ def test_c02_emitted_not_in_catalog(tmp_path):
     assert [f.subject for f in hits] == ["GHOST_CODE"]
 
 
+@pytest.mark.memory_only
 def test_c03_approved_but_emitted(tmp_path):
     _make_repo(
         tmp_path,
@@ -401,6 +407,7 @@ def test_c03_approved_but_emitted(tmp_path):
     assert [f.subject for f in hits] == ["NEW_CODE"]
 
 
+@pytest.mark.memory_only
 def test_c04_effective_but_not_emitted(tmp_path):
     _make_repo(tmp_path, codes=[_code("OLD_CODE")])
     cat, res = _context(tmp_path)
@@ -408,12 +415,14 @@ def test_c04_effective_but_not_emitted(tmp_path):
     assert [f.subject for f in hits] == ["OLD_CODE"]
 
 
+@pytest.mark.memory_only
 def test_c04_unreachable_not_flagged(tmp_path):
     _make_repo(tmp_path, codes=[_code("OLD_CODE", reachable=False)])
     cat, res = _context(tmp_path)
     assert _find(_load("validate").check_catalog_against_emissions(cat, res), "C04") == []
 
 
+@pytest.mark.memory_only
 def test_c06_proc_interface_missing(tmp_path):
     _make_repo(
         tmp_path,
@@ -430,6 +439,7 @@ def test_c06_proc_interface_missing(tmp_path):
     assert [f.subject for f in hits] == ["DAEMON_X"]
 
 
+@pytest.mark.memory_only
 def test_c07_unresolved_reported(tmp_path):
     _make_repo(
         tmp_path,
@@ -445,6 +455,7 @@ def test_c07_unresolved_reported(tmp_path):
     assert len(hits) == 1
 
 
+@pytest.mark.memory_only
 def test_c08_stale_exclude(tmp_path):
     cfg = _extraction_config()
     cfg["exclude_values"] = [
@@ -456,6 +467,7 @@ def test_c08_stale_exclude(tmp_path):
     assert len(hits) == 1
 
 
+@pytest.mark.process_rpc
 def test_c19_exclusion_warned(tmp_path):
     cfg = _extraction_config()
     cfg["exclude_values"] = [
@@ -488,6 +500,7 @@ def test_c19_exclusion_warned(tmp_path):
     assert out["ok"] is True
 
 
+@pytest.mark.memory_only
 def test_c19_exclusion_hides_catalog_value(tmp_path):
     cfg = _extraction_config()
     cfg["exclude_values"] = [
@@ -515,6 +528,7 @@ def test_c19_exclusion_hides_catalog_value(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.memory_only
 def test_c09_missing_contract_test(tmp_path):
     _make_repo(tmp_path, codes=[_code("NEW_OK", contract_tests=[])])
     cat = _catalog(tmp_path)
@@ -522,6 +536,7 @@ def test_c09_missing_contract_test(tmp_path):
     assert [f.subject for f in hits] == ["NEW_OK"]
 
 
+@pytest.mark.memory_only
 def test_c09_test_file_lacks_code(tmp_path):
     _make_repo(tmp_path, codes=[_code("NEW_OK", contract_tests=[_DUMMY_TEST])])  # 檔內無 NEW_OK
     cat = _catalog(tmp_path)
@@ -529,6 +544,7 @@ def test_c09_test_file_lacks_code(tmp_path):
     assert [f.subject for f in hits] == ["NEW_OK"]
 
 
+@pytest.mark.memory_only
 def test_c09_node_does_not_exist(tmp_path):
     _make_repo(
         tmp_path,
@@ -545,6 +561,7 @@ def test_c09_node_does_not_exist(tmp_path):
     assert [f.subject for f in hits] == ["NEW_OK"]
 
 
+@pytest.mark.memory_only
 def test_c09_code_only_in_comment(tmp_path):
     _make_repo(
         tmp_path,
@@ -563,6 +580,7 @@ def test_c09_code_only_in_comment(tmp_path):
     assert [f.subject for f in hits] == ["NEW_OK"]
 
 
+@pytest.mark.memory_only
 def test_c09_code_in_other_test_only(tmp_path):
     _make_repo(
         tmp_path,
@@ -582,6 +600,7 @@ def test_c09_code_in_other_test_only(tmp_path):
     assert [f.subject for f in hits] == ["NEW_OK"]
 
 
+@pytest.mark.memory_only
 def test_c09_class_node_and_param_id(tmp_path):
     _make_repo(
         tmp_path,
@@ -603,6 +622,7 @@ def test_c09_class_node_and_param_id(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.memory_only
 def test_c10_unknown_behavior_change(tmp_path):
     _make_repo(tmp_path, codes=[_code("NEW_OK", behavior_change=["SC-99"])])  # SC-99 不存在
     cat = _catalog(tmp_path)
@@ -610,6 +630,7 @@ def test_c10_unknown_behavior_change(tmp_path):
     assert len(hits) == 1
 
 
+@pytest.mark.memory_only
 def test_c11_forbidden_shared_name(tmp_path):
     _make_repo(
         tmp_path,
@@ -621,6 +642,7 @@ def test_c11_forbidden_shared_name(tmp_path):
     assert [f.subject for f in hits] == ["X_ONLY"]
 
 
+@pytest.mark.memory_only
 def test_c12_harness_prefix(tmp_path):
     _make_repo(tmp_path, codes=[_code("PLAIN_OK")])
     base = _catalog(tmp_path)
@@ -631,6 +653,7 @@ def test_c12_harness_prefix(tmp_path):
     assert [f.subject for f in hits] == ["HARNESS_X"]
 
 
+@pytest.mark.memory_only
 def test_c16_approved_code_with_implemented_change(tmp_path):
     _make_repo(
         tmp_path,
@@ -642,6 +665,7 @@ def test_c16_approved_code_with_implemented_change(tmp_path):
     assert len(hits) == 1
 
 
+@pytest.mark.memory_only
 def test_c16_implemented_code_with_approved_change(tmp_path):
     _make_repo(
         tmp_path,
@@ -677,6 +701,7 @@ def test_c16_implemented_code_with_approved_change(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.memory_only
 def test_c17_pending_not_folded(tmp_path):
     _make_repo(
         tmp_path,
@@ -692,6 +717,7 @@ def test_c17_pending_not_folded(tmp_path):
     assert len(hits) == 1
 
 
+@pytest.mark.memory_only
 def test_c17_pending_missing_change(tmp_path):
     _make_repo(
         tmp_path,
@@ -702,6 +728,7 @@ def test_c17_pending_missing_change(tmp_path):
     assert len(hits) == 1
 
 
+@pytest.mark.memory_only
 def test_c18_empty_result_placeholder(tmp_path):
     _make_repo(
         tmp_path,
@@ -729,6 +756,7 @@ def test_c18_empty_result_placeholder(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.memory_only
 def test_c13_doc_coverage_missing(tmp_path):
     doc = tmp_path / "SKILL.md"
     doc.write_text("| `A_CODE` | 來源 | 行號 | 意義 A | 處置 A |\n", encoding="utf-8")
@@ -737,6 +765,7 @@ def test_c13_doc_coverage_missing(tmp_path):
     assert [f.subject for f in hits] == ["B_CODE"]
 
 
+@pytest.mark.memory_only
 def test_c13_empty_action_not_counted(tmp_path):
     doc = tmp_path / "SKILL.md"
     doc.write_text(
@@ -749,6 +778,7 @@ def test_c13_empty_action_not_counted(tmp_path):
     assert [f.subject for f in hits] == ["B_CODE"]
 
 
+@pytest.mark.memory_only
 def test_c13_require_in_any(tmp_path):
     d1 = tmp_path / "SKILL.md"
     d2 = tmp_path / "SKILL_WINDOWS.md"
@@ -786,8 +816,8 @@ def test_parity_fixtures_present():
     assert expected_stems.issubset({p.stem for p in _R27_PARITY_FIXTURES})
 
 
-@pytest.mark.memory_only
 @pytest.mark.parametrize("fixture_path", _R27_PARITY_FIXTURES, ids=lambda p: p.stem)
+@pytest.mark.memory_only
 def test_c13_parity_fixtures(tmp_path, fixture_path):
     spec = yaml.safe_load(fixture_path.read_text(encoding="utf-8"))
     docs: list[Path] = []
@@ -822,6 +852,7 @@ def test_c13_code_with_whitespace_fails(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.process_rpc
 def test_c14_generated_fact_drift(tmp_path):
     (tmp_path / "SKILL.md").write_text(
         '<!-- BEGIN: generated-fact marker="error-codes" -->\n'
@@ -844,6 +875,7 @@ def test_c14_generated_fact_drift(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.memory_only
 def test_run_all_without_policy_file(tmp_path):
     _make_repo(tmp_path, codes=[_code("PLAIN_OK")])  # 不寫 .project-policy.yml
     findings, summary = _load("validate").run_all(tmp_path)
@@ -857,6 +889,7 @@ def test_run_all_without_policy_file(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.process_rpc
 def test_cli_extract_lines_sorted(tmp_path):
     _make_repo(
         tmp_path,
@@ -880,6 +913,7 @@ def test_cli_extract_lines_sorted(tmp_path):
     assert lines == ["ALPHA_OK", "ZETA_OK"]
 
 
+@pytest.mark.process_rpc
 def test_cli_check_exit_1_on_fail(tmp_path):
     _make_repo(
         tmp_path,
@@ -897,6 +931,7 @@ def test_cli_check_exit_1_on_fail(tmp_path):
     assert any(f["check"] == "C02" for f in out["findings"])
 
 
+@pytest.mark.process_rpc
 def test_cli_bad_config_exit_1(tmp_path):
     cfg = _extraction_config()
     cfg["namespaces"]["error_code"]["sinks"].append({"kind": "no_such_kind"})
@@ -911,6 +946,7 @@ def test_cli_bad_config_exit_1(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.memory_only
 def test_c01_corrupt_catalog_reported(tmp_path):
     _make_repo(tmp_path, codes=[_code("PLAIN_OK")])
     (tmp_path / "contracts" / "error_codes.yaml").write_text("corrupted: [yaml", encoding="utf-8")
@@ -920,6 +956,7 @@ def test_c01_corrupt_catalog_reported(tmp_path):
     assert all(f.subject == "contracts" and f.severity == "FAIL" for f in hits)
 
 
+@pytest.mark.process_rpc
 def test_cli_check_only_unknown_code(tmp_path):
     _make_repo(tmp_path, codes=[_code("PLAIN_OK")])
     proc = _run_cli("check", "--only", "C99", "--repo", str(tmp_path))
@@ -927,6 +964,7 @@ def test_cli_check_only_unknown_code(tmp_path):
     assert "contracts: unknown check code(s): C99" in proc.stderr
 
 
+@pytest.mark.process_rpc
 def test_cli_check_only_broken_catalog_retains_c01(tmp_path):
     _make_repo(tmp_path, codes=[_code("PLAIN_OK")])
     (tmp_path / "contracts" / "error_codes.yaml").write_text("corrupted: [yaml", encoding="utf-8")
@@ -937,6 +975,7 @@ def test_cli_check_only_broken_catalog_retains_c01(tmp_path):
     assert any(f["check"] == "C01" for f in out["findings"])
 
 
+@pytest.mark.process_rpc
 def test_c14_command_failure_exit_code(tmp_path):
     (tmp_path / "SKILL.md").write_text(
         '<!-- BEGIN: generated-fact marker="error-codes" -->\n'
@@ -955,6 +994,7 @@ def test_c14_command_failure_exit_code(tmp_path):
     assert "exit=7" in hits[0].message
 
 
+@pytest.mark.memory_only
 def test_c09_dynamic_prefix_requires_colon(tmp_path):
     _make_repo(
         tmp_path,
@@ -991,6 +1031,7 @@ def test_c09_dynamic_prefix_requires_colon(tmp_path):
     assert len(hits_ok) == 0
 
 
+@pytest.mark.memory_only
 def test_c09_decorator_does_not_count(tmp_path):
     _make_repo(
         tmp_path,
@@ -1010,6 +1051,7 @@ def test_c09_decorator_does_not_count(tmp_path):
     assert "node 本體內找不到該碼" in hits[0].message
 
 
+@pytest.mark.memory_only
 def test_c15_duplicate_context_and_unregistered_code(tmp_path):
     _make_repo(
         tmp_path,
@@ -1028,6 +1070,7 @@ def test_c15_duplicate_context_and_unregistered_code(tmp_path):
     assert any("GHOST_CODE" in f.message for f in hits)
 
 
+@pytest.mark.memory_only
 def test_c15_exit_code_mismatch_both_directions(tmp_path):
     _make_repo(
         tmp_path,
@@ -1045,6 +1088,7 @@ def test_c15_exit_code_mismatch_both_directions(tmp_path):
     assert any("EXTRA_CODE" in f.subject for f in hits)
 
 
+@pytest.mark.memory_only
 def test_c15_context_outside_cli_contexts(tmp_path):
     _make_repo(
         tmp_path,
@@ -1060,6 +1104,7 @@ def test_c15_context_outside_cli_contexts(tmp_path):
     assert any("not_a_valid_context" in f.subject for f in hits)
 
 
+@pytest.mark.memory_only
 def test_c15_missing_schema_files(tmp_path):
     _make_repo(tmp_path, codes=[_code("PLAIN_OK")])
     (tmp_path / "contracts" / "rpc_schema.json").unlink()
@@ -1070,6 +1115,7 @@ def test_c15_missing_schema_files(tmp_path):
     assert {f.subject for f in hits} == {"contracts/rpc_schema.json", "contracts/cli_schema.json"}
 
 
+@pytest.mark.memory_only
 def test_c18_hollow_schema_missing_x_methods(tmp_path):
     _make_repo(tmp_path, rpc={})
     cat = _catalog(tmp_path)
@@ -1077,6 +1123,7 @@ def test_c18_hollow_schema_missing_x_methods(tmp_path):
     assert any("x-methods" in f.message for f in hits)
 
 
+@pytest.mark.memory_only
 def test_c18_empty_properties_object_fails(tmp_path):
     _make_repo(
         tmp_path,
@@ -1098,6 +1145,7 @@ def test_c18_empty_properties_object_fails(tmp_path):
     assert any("空 properties 佔位符" in f.message for f in hits)
 
 
+@pytest.mark.memory_only
 def test_c13_missing_doc_fails_even_with_require_in_any(tmp_path):
     good_doc = tmp_path / "doc_good.md"
     good_doc.write_text("### `A_CODE`\n- **意義**：說明\n- **處置**：處置\n", encoding="utf-8")
@@ -1107,6 +1155,7 @@ def test_c13_missing_doc_fails_even_with_require_in_any(tmp_path):
     assert any(f.subject == str(missing_doc) and "文件不存在" in f.message for f in hits)
 
 
+@pytest.mark.memory_only
 def test_c13_invalid_require_in(tmp_path):
     doc = tmp_path / "doc.md"
     doc.write_text("### `A_CODE`\n- **意義**：說明\n- **處置**：處置\n", encoding="utf-8")
@@ -1115,6 +1164,7 @@ def test_c13_invalid_require_in(tmp_path):
     assert any("未知的 require_in" in f.message for f in hits)
 
 
+@pytest.mark.memory_only
 def test_c02_seen_dedupes_per_namespace(tmp_path):
     _make_repo(
         tmp_path,
@@ -1134,6 +1184,7 @@ def test_c02_seen_dedupes_per_namespace(tmp_path):
     assert [f.subject for f in hits] == ["SHARED_GHOST", "SHARED_GHOST"]
 
 
+@pytest.mark.process_rpc
 def test_cli_summary_subcommand(tmp_path):
     _make_repo(tmp_path, codes=[_code("PLAIN_OK")])
     proc = _run_cli("summary", "--repo", str(tmp_path))
@@ -1145,6 +1196,7 @@ def test_cli_summary_subcommand(tmp_path):
     assert "safety_invariants" in data
 
 
+@pytest.mark.process_rpc
 def test_cli_effective_subcommand(tmp_path):
     _make_repo(
         tmp_path,

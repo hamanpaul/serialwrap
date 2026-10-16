@@ -1,3 +1,7 @@
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+
 def test_config_roundtrip(tmp_path):
     from sw_core.runtime_config import RuntimeConfig
     rc = RuntimeConfig(tmp_path / "config.yaml")

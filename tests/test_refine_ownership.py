@@ -18,6 +18,7 @@ from sw_core.session_manager import SessionManager
 from sw_core.uart_io import UARTBridge
 import sw_core.session_manager as sm_mod
 from sw_core.wal import WalWriter
+import pytest
 
 
 class RecordingBridge:
@@ -142,6 +143,8 @@ class TestRefineOwnership(unittest.TestCase):
         thread.join(5.0)
         self.assertFalse(thread.is_alive(), "操作執行緒未在 barrier 釋放後結束")
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_blocking_push_rejects_competing_push_without_tx(self) -> None:
         started = threading.Event()
         release = threading.Event()
@@ -185,6 +188,8 @@ class TestRefineOwnership(unittest.TestCase):
         self.assertEqual(first_result, [{"ok": True}])
         self.assertFalse(self.session.foreground_busy)
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_blocking_command_rejects_competing_pull_without_tx(self) -> None:
         self.bridge.block_tx = True
         first_result: list[dict[str, Any]] = []
@@ -215,6 +220,8 @@ class TestRefineOwnership(unittest.TestCase):
         self.assertTrue(first_result[0]["ok"])
         self.assertFalse(self.session.foreground_busy)
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_command_admission_covers_gap_before_inner_execution(self) -> None:
         entered_inner = threading.Event()
         release_inner = threading.Event()
@@ -354,6 +361,8 @@ class TestRefineOwnership(unittest.TestCase):
         except BaseException as error:  # noqa: BLE001 — 測試需保留 operation 例外供主執行緒斷言
             errors.append(error)
 
+    @pytest.mark.posix_only
+    @pytest.mark.posix_pty
     def test_new_console_during_transfer_does_not_send_raw(self) -> None:
         """root review regression：file push 期間新 console 不得 raw TX。"""
         self._assert_new_console_is_line_buffered_during_operation(
@@ -363,6 +372,8 @@ class TestRefineOwnership(unittest.TestCase):
             ),
         )
 
+    @pytest.mark.posix_only
+    @pytest.mark.posix_pty
     def test_new_console_during_file_pull_is_line_buffered_and_restored(self) -> None:
         self._assert_new_console_is_line_buffered_during_operation(
             "pull",
@@ -371,6 +382,8 @@ class TestRefineOwnership(unittest.TestCase):
             ),
         )
 
+    @pytest.mark.posix_only
+    @pytest.mark.posix_pty
     def test_new_console_during_command_is_line_buffered_and_restored(self) -> None:
         self._assert_new_console_is_line_buffered_during_operation(
             "command",
@@ -379,6 +392,8 @@ class TestRefineOwnership(unittest.TestCase):
             ),
         )
 
+    @pytest.mark.posix_only
+    @pytest.mark.posix_pty
     def test_new_console_gate_reopens_after_operation_exception(self) -> None:
         self._assert_new_console_is_line_buffered_during_operation(
             "push",
@@ -388,6 +403,8 @@ class TestRefineOwnership(unittest.TestCase):
             fail_after_release=True,
         )
 
+    @pytest.mark.posix_only
+    @pytest.mark.posix_pty
     def test_existing_human_owner_window_is_deferred_before_suspend(self) -> None:
         """admission 到實際 suspend 間既有 human owner 也不得 raw TX。"""
         bridge = UARTBridge(
@@ -431,6 +448,8 @@ class TestRefineOwnership(unittest.TestCase):
         self.assertEqual(transmitted, [b"window-input"], "resume 後才可 flush deferred human input")
         self.assertFalse(self.session.foreground_busy)
 
+    @pytest.mark.core_portable
+    @pytest.mark.process_rpc
     def test_tcp_accept_during_operation_gate_does_not_get_raw_owner(self) -> None:
         """TCP accept 路徑也必須服從同一 interactive admission gate。"""
         lines: list[tuple[str, str]] = []
@@ -485,6 +504,8 @@ class TestRefineOwnership(unittest.TestCase):
         finally:
             bridge._serial_fd = None
 
+    @pytest.mark.posix_only
+    @pytest.mark.posix_pty
     def test_raw_write_rechecks_admission_at_actual_write(self) -> None:
         """raw RX 已進 send_bytes 後，admission 關閉仍不得落到實際 UART write。"""
         bridge = UARTBridge(
@@ -548,6 +569,8 @@ class TestRefineOwnership(unittest.TestCase):
         finally:
             bridge._serial_fd = None
 
+    @pytest.mark.posix_only
+    @pytest.mark.posix_pty
     def test_operation_finish_replays_raw_bytes_without_manager_lease(self) -> None:
         """bridge 已有 human owner 但 manager 無 lease 時，操作收尾只回放一次 deferred。"""
         bridge = UARTBridge(
@@ -606,6 +629,8 @@ class TestRefineOwnership(unittest.TestCase):
         self.assertTrue(replay_lock_free.is_set(), "deferred replay 不得持有 manager lock")
         self.assertFalse(self.session.foreground_busy)
 
+    @pytest.mark.posix_only
+    @pytest.mark.posix_pty
     def test_secondary_console_raw_bytes_use_line_broker_without_uart_tx(self) -> None:
         """secondary console 的 raw bytes 不直送，newline 才交給 line broker。"""
         lines: list[tuple[str, str]] = []
@@ -649,6 +674,8 @@ class TestRefineOwnership(unittest.TestCase):
         self.assertEqual(tx, [], "secondary newline 也不應由 console raw 路徑 TX")
         self.assertEqual(lines, [(secondary_id, "raw-secondary")])
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_human_peer_grace_rejects_old_id_and_allows_new_client(self) -> None:
         """human peer grace 內保留，逾時後舊 ID 失效且新 client 可取得 lease。"""
         from sw_core.constants import _HUMAN_PEER_GRACE_S
@@ -681,6 +708,8 @@ class TestRefineOwnership(unittest.TestCase):
         self.assertNotEqual(replacement["interactive_id"], old_id)
         self.assertTrue(self.manager.interactive_close(replacement["interactive_id"])["ok"])
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_blocking_pull_rejects_competing_foreground_command_without_tx(self) -> None:
         started = threading.Event()
         release = threading.Event()
@@ -719,6 +748,8 @@ class TestRefineOwnership(unittest.TestCase):
         self.assertEqual(first_result, [{"ok": True}])
         self.assertFalse(self.session.foreground_busy)
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_foreground_busy_rejects_interactive_open_and_send(self) -> None:
         lease_result = self.manager.interactive_open("COM0", owner="human:primary")
         self.assertTrue(lease_result["ok"])
@@ -763,6 +794,8 @@ class TestRefineOwnership(unittest.TestCase):
         self.assertFalse(self.session.foreground_busy)
         self.assertTrue(self.manager.interactive_close(interactive_id)["ok"])
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_interactive_command_keeps_agent_owner_after_operation(self) -> None:
         source = "agent:interactive"
         result = self.manager.execute_command(
@@ -775,6 +808,8 @@ class TestRefineOwnership(unittest.TestCase):
         self.assertEqual(result["interactive_session_id"], self.session.interactive_session_id)
         self.assertTrue(self.manager.interactive_close(result["interactive_session_id"])["ok"])
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_interactive_command_replaces_existing_human_bridge_owner(self) -> None:
         bridge = UARTBridge(
             "COM0",
@@ -805,6 +840,8 @@ class TestRefineOwnership(unittest.TestCase):
             # 不得因 foreground admission gate 把 agent owner 排入 pending 而遺失。
             self.assertTrue(self.manager.interactive_close(human_id)["ok"])
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_resume_exception_still_releases_operation_token(self) -> None:
         lease_result = self.manager.interactive_open("COM0", owner="human:primary")
         self.assertTrue(lease_result["ok"])
@@ -817,6 +854,8 @@ class TestRefineOwnership(unittest.TestCase):
         self.assertFalse(self.session.foreground_busy)
         self.assertIsNone(self.session._foreground_operation)
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_post_close_exception_still_releases_operation_token(self) -> None:
         with mock.patch.object(
             sm_mod._PostCloseAction,
@@ -830,6 +869,8 @@ class TestRefineOwnership(unittest.TestCase):
         self.assertFalse(self.session.foreground_busy)
         self.assertIsNone(self.session._foreground_operation)
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_old_operation_cannot_clear_new_epoch_busy(self) -> None:
         old_started = threading.Event()
         old_release = threading.Event()
@@ -895,6 +936,8 @@ class TestRefineOwnership(unittest.TestCase):
         self.assertFalse(self.session.foreground_busy)
         self.assertEqual(new_bridge.tx, [b"new-start\n", b"new-end\n"])
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_unknown_closed_expired_and_replaced_interactive_ids_do_not_tx(self) -> None:
         unknown = self.manager.interactive_send("unknown", data="x")
         self.assertEqual(unknown["error_code"], "INTERACTIVE_NOT_FOUND")

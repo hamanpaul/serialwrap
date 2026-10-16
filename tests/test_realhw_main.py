@@ -6,6 +6,9 @@ from types import SimpleNamespace
 
 from realhw import __main__ as realhw_main
 from realhw import preflight
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def test_main_closes_benchlock_fd_on_success(monkeypatch, tmp_path):

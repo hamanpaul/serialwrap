@@ -12,6 +12,9 @@ import time
 import tty
 
 from sw_core.flash_endpoint import pump_endpoint_to_sink, make_rx_to_endpoint_writer
+import pytest
+
+pytestmark = [pytest.mark.posix_only, pytest.mark.posix_pty]
 
 
 class _Sink:

@@ -12,6 +12,9 @@ import pytest
 # 本檔混合 memory_only（AST 稽核）與 process_rpc（subprocess），依規則 2 模組層只放平台 marker
 pytestmark = [pytest.mark.core_portable]
 
+# 稽核函式本身含 "tmux" 字串常數（比對字串、從不啟動 tmux），豁免 interactive_desktop 的偵測要求
+RESOURCE_AUDIT_WAIVERS = {"interactive_desktop": "只比對含 tmux 字樣的設定字串、從不啟動 tmux（稽核函式自身的字串常數）"}
+
 TESTS = Path(__file__).resolve().parent
 PLATFORM = {"core_portable", "posix_only", "windows_native"}
 RESOURCE = {"memory_only", "process_rpc", "posix_pty", "windows_com", "physical_uart",

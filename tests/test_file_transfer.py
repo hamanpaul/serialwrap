@@ -18,6 +18,9 @@ from sw_core.file_transfer import (
     pull_file,
     push_file,
 )
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 _PROMPT = r"root@host:~# "
 _PROMPT_REGEX = r"root@host:~#\s"

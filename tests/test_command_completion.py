@@ -5,11 +5,17 @@ from __future__ import annotations
 import io
 import json
 import os
-import pty
+try:  # POSIX-only：原生 Windows 無 pty 模組；僅 POSIX PTY 測試（posix_only + posix_pty）使用
+    import pty
+except ImportError:  # pragma: no cover -- 原生 Windows
+    pty = None
 import select
 import threading
 import time
-import tty
+try:  # POSIX-only：原生 Windows 無 tty 模組；僅 POSIX PTY 測試（posix_only + posix_pty）使用
+    import tty
+except ImportError:  # pragma: no cover -- 原生 Windows
+    tty = None
 from contextlib import redirect_stdout
 from unittest import mock
 
@@ -100,6 +106,8 @@ def device(tmp_path):
 
 
 @pytest.mark.parametrize("mode", ["line", "background"])
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 def test_producer_completion_finishes_without_prompt_and_preserves_stdout(device, mode):
     producer, bridge, manager, session, wal = device
     started = time.monotonic()
@@ -114,6 +122,8 @@ def test_producer_completion_finishes_without_prompt_and_preserves_stdout(device
     assert any(entry.get("meta", {}).get("completion_regex") == COMPLETION for entry in wal.entries)
 
 
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 def test_echo_only_cannot_satisfy_numeric_rc_end_producer_regex(device):
     producer, bridge, manager, session, wal = device
     producer.produce = False
@@ -122,6 +132,8 @@ def test_echo_only_cannot_satisfy_numeric_rc_end_producer_regex(device):
     assert not result["ok"] and result["partial"]
 
 
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 def test_historical_marker_cannot_complete_new_command(device):
     producer, bridge, manager, session, wal = device
     producer.produce = False
@@ -131,6 +143,8 @@ def test_historical_marker_cannot_complete_new_command(device):
     assert not result["ok"] and result["partial"]
 
 
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 def test_prompt_fallback_without_completion_is_unchanged(device):
     producer, bridge, manager, session, wal = device
     producer.give_prompt = True
@@ -141,6 +155,8 @@ def test_prompt_fallback_without_completion_is_unchanged(device):
 
 
 @pytest.mark.parametrize("trailing_prompt", [False, True])
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 def test_prompt_before_producer_cannot_truncate_completed_stdout(device, trailing_prompt):
     producer, bridge, manager, session, wal = device
     producer.prefix_prompt = True
@@ -153,6 +169,8 @@ def test_prompt_before_producer_cannot_truncate_completed_stdout(device, trailin
 
 @pytest.mark.parametrize("invalid", ["(", "", "a" * 1025, "x" * 512 + "界" * 200, 12, ".*", "\ud800", "(" * 1000],
                          ids=["syntax", "empty", "bytes", "unicode-bytes", "type", "matches-empty", "invalid-unicode", "parser-recursion"])
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 def test_invalid_regex_direct_execute_rejects_before_any_tx(device, invalid):
     producer, bridge, manager, session, wal = device
     result = manager.execute_command(session.session_id, COMMAND, "agent:test", "invalid-case", completion_regex=invalid)
@@ -161,6 +179,8 @@ def test_invalid_regex_direct_execute_rejects_before_any_tx(device, invalid):
 
 
 @pytest.mark.parametrize("invalid", ["(", "", "a" * 1025, 12, ".*"])
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_invalid_regex_rpc_and_arbiter_reject_without_enqueue(invalid):
     service = SerialwrapService([])
     with mock.patch.object(service, "_resolve_session_id") as resolve:
@@ -176,6 +196,8 @@ def test_invalid_regex_rpc_and_arbiter_reject_without_enqueue(invalid):
     assert arbiter.snapshot() == []
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_cli_transmits_completion_regex():
     with mock.patch("sw_core.cli.rpc_call", return_value={"ok": True}) as rpc, redirect_stdout(io.StringIO()):
         assert main(["--socket", "/tmp/nonexistent-completion.sock", "cmd", "submit", "--selector", "COM0", "--cmd", COMMAND,
@@ -184,6 +206,8 @@ def test_cli_transmits_completion_regex():
     assert rpc.call_args.args[2]["completion_regex"] == COMPLETION
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_cli_rejects_invalid_regex_before_rpc():
     output = io.StringIO()
     with mock.patch("sw_core.cli.rpc_call") as rpc, redirect_stdout(output):
@@ -192,6 +216,8 @@ def test_cli_rejects_invalid_regex_before_rpc():
     rpc.assert_not_called()
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_rpc_queue_worker_execute_and_command_record_propagate_regex():
     service = SerialwrapService([])
     session_id = "fake:COM0"
@@ -214,6 +240,8 @@ def test_rpc_queue_worker_execute_and_command_record_propagate_regex():
         service._arbiter.unregister_session(session_id)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_legacy_seven_argument_arbiter_callback_is_unchanged():
     callback = mock.Mock(return_value={"ok": True})
     arbiter = CommandArbiter(callback)
@@ -229,6 +257,8 @@ def test_legacy_seven_argument_arbiter_callback_is_unchanged():
         arbiter.unregister_session("fake")
 
 
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 def test_completion_override_does_not_replace_reboot_recovery(device):
     producer, bridge, manager, session, wal = device
     with mock.patch.object(manager, "_handle_reboot_command", return_value={"ok": True, "recovery_action": "EXPECT_REBOOT"}) as reboot:

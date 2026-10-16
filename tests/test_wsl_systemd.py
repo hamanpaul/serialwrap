@@ -3,6 +3,9 @@ import configparser
 
 from sw_core.setup_cmd import _merge_wsl_conf_systemd, ensure_wsl_systemd
 from sw_core.sysenv import FakeEffects
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def _parse(text: str) -> configparser.ConfigParser:

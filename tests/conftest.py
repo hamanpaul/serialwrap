@@ -116,3 +116,23 @@ def pytest_sessionfinish(session, exitstatus):
         if session.exitstatus == 0:
             session.exitstatus = 1
     shutil.rmtree(_ISO_ROOT, ignore_errors=True)
+
+
+# ---- marker 註冊（平台／資源分類；逐檔標註與稽核見 tests/test_resource_markers.py）----
+_MARKERS = {
+    "core_portable": "Linux 與 Windows 都必跑；禁止以平台原因 SKIP；不得宣稱測到原生 UART",
+    "posix_only": "只在 POSIX 執行（PTY、POSIX 鎖、/proc、/dev/ttyMCU、AF_UNIX）",
+    "windows_native": "只在原生 Windows 執行（檔案分享旗標、鎖、行程、排程器、原生裝置介面）",
+    "memory_only": "只用行程內物件與暫存檔；不開 socket、子行程、PTY 或裝置",
+    "process_rpc": "會啟動子行程或開真實 socket／RPC server",
+    "posix_pty": "會開 POSIX PTY pair",
+    "windows_com": "以原生 Windows serial backend 真正開啟 COM 裝置（socket 或記憶體 stream 不算）",
+    "physical_uart": "需要實體 USB-UART 與 DUT",
+    "supervisor_runtime": "需要真正運作中的 systemd／Task Scheduler／Windows service",
+    "interactive_desktop": "需要登入中的桌面或終端多工器（tmux 等）",
+}
+
+
+def pytest_configure(config):
+    for name, desc in _MARKERS.items():
+        config.addinivalue_line("markers", f"{name}: {desc}")

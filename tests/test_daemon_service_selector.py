@@ -31,6 +31,8 @@ def _iso_state():
 # ─────────────────────────── build_parser ──────────────────────────────────
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_daemon_parser_default_socket_equals_default_endpoint():
     """--socket 預設應為 DEFAULT_ENDPOINT（POSIX 等同 SOCKET_PATH，Windows 為 TCP URL）（#84 PORT-4）。"""
     from sw_core.constants import DEFAULT_ENDPOINT
@@ -43,6 +45,8 @@ def test_daemon_parser_default_socket_equals_default_endpoint():
 # ─────────────────────────── _build_lock ───────────────────────────────────
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_build_lock_win_returns_windows_singleton_lock(monkeypatch, tmp_path):
     """win 後端：_build_lock 應回 WindowsSingletonLock。"""
     import sw_core.platform_backends as pb
@@ -64,6 +68,8 @@ def test_build_lock_win_returns_windows_singleton_lock(monkeypatch, tmp_path):
     sys.platform.startswith("win"),
     reason="POSIX-only: lock_posix 使用 fcntl，不適用於 Windows（#84 PORT-4）",
 )
+@pytest.mark.posix_only
+@pytest.mark.memory_only
 def test_build_lock_posix_returns_singleton_lock(monkeypatch, tmp_path):
     """posix 後端：_build_lock 應回 SingletonLock（POSIX 限定）。"""
     import sw_core.platform_backends as pb
@@ -82,6 +88,8 @@ def test_build_lock_posix_returns_singleton_lock(monkeypatch, tmp_path):
 # ─────────────────────────── _build_server ─────────────────────────────────
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_build_server_win_returns_tcp_rpc_server(monkeypatch):
     """win 後端：_build_server 應回 TcpRpcServer。"""
     import sw_core.platform_backends as pb
@@ -99,6 +107,8 @@ def test_build_server_win_returns_tcp_rpc_server(monkeypatch):
     sys.platform.startswith("win"),
     reason="POSIX-only: JsonRpcUnixServer 使用 AF_UNIX，不適用於 Windows（#84 PORT-4）",
 )
+@pytest.mark.posix_only
+@pytest.mark.memory_only
 def test_build_server_posix_returns_unix_server(monkeypatch, tmp_path):
     """posix 後端：_build_server 應回 JsonRpcUnixServer（POSIX 限定）。"""
     import sw_core.platform_backends as pb
@@ -115,6 +125,8 @@ def test_build_server_posix_returns_unix_server(monkeypatch, tmp_path):
 # ──────────────────────── _write_config_endpoint ───────────────────────────
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_write_config_endpoint_writes_socket_path(tmp_path, monkeypatch):
     """_write_config_endpoint 應寫入 socket_path 到 config.yaml，並保留 supervision_mode。"""
     from sw_core.runtime_config import RuntimeConfig
@@ -136,6 +148,8 @@ def test_write_config_endpoint_writes_socket_path(tmp_path, monkeypatch):
 # #173：POSIX 也要無條件寫入 config.yaml socket_path（先前只有 win backend 會寫）。
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_write_effective_endpoint_called_unconditionally_on_posix(monkeypatch, tmp_path):
     """posix 後端：_write_effective_endpoint 仍須呼叫 _write_config_endpoint（#173 回歸 pin）。
 
@@ -156,6 +170,8 @@ def test_write_effective_endpoint_called_unconditionally_on_posix(monkeypatch, t
     assert calls == [str(tmp_path / "custom.sock")]
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_write_effective_endpoint_called_unconditionally_on_win(monkeypatch, tmp_path):
     """win 後端：既有行為（#84 PORT-4）不應被本次重構破壞，仍要呼叫一次。"""
     import sw_core.platform_backends as pb
@@ -174,6 +190,8 @@ def test_write_effective_endpoint_called_unconditionally_on_win(monkeypatch, tmp
 # ─────────────────────── RuntimeConfig.set_socket ──────────────────────────
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_set_socket_only_updates_socket_path(tmp_path):
     """set_socket 只改 socket_path，不動 supervision_mode。"""
     from sw_core.runtime_config import RuntimeConfig
@@ -189,6 +207,8 @@ def test_set_socket_only_updates_socket_path(tmp_path):
     assert rc3.mode() == "systemd-user"  # supervision_mode 維持不變
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_set_socket_creates_config_if_absent(tmp_path):
     """config.yaml 不存在時，set_socket 仍可建立並寫入。"""
     from sw_core.runtime_config import RuntimeConfig
@@ -205,6 +225,8 @@ def test_set_socket_creates_config_if_absent(tmp_path):
 # ──────────────────────── _load_exclude_coms ───────────────────────────────
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_load_exclude_coms_reads_windows_config(tmp_path, monkeypatch):
     """_load_exclude_coms 應從 config.yaml 的 windows.exclude_coms 讀取排除清單。
 
@@ -226,6 +248,8 @@ def test_load_exclude_coms_reads_windows_config(tmp_path, monkeypatch):
     assert result == {"COM1", "COM3"}
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_load_exclude_coms_returns_empty_when_absent(tmp_path, monkeypatch):
     """config.yaml 不存在或無 windows.exclude_coms 時，回傳空集合。"""
     import sw_core.device_source as ds_mod
@@ -237,6 +261,8 @@ def test_load_exclude_coms_returns_empty_when_absent(tmp_path, monkeypatch):
     assert result == set()
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_load_exclude_coms_empty_when_no_windows_section(tmp_path, monkeypatch):
     """config.yaml 有 supervision_mode 但無 windows 段時，回傳空集合。"""
     import sw_core.device_source as ds_mod
@@ -257,6 +283,8 @@ def test_load_exclude_coms_empty_when_no_windows_section(tmp_path, monkeypatch):
 # ──────────────────── DeviceWatcher source 選擇（service.py） ──────────────
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_service_uses_windows_device_source_when_win_backend(monkeypatch, tmp_path):
     """Windows 後端：SerialwrapService 的 DeviceWatcher 應接到 WindowsDeviceSource。"""
     import sw_core.platform_backends as pb
@@ -271,6 +299,8 @@ def test_service_uses_windows_device_source_when_win_backend(monkeypatch, tmp_pa
     assert isinstance(svc._watcher._source, WindowsDeviceSource)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_service_uses_posix_device_source_when_posix_backend(monkeypatch, tmp_path):
     """POSIX 後端：SerialwrapService 的 DeviceWatcher 應接到 PosixDeviceSource（預設）。"""
     import sw_core.platform_backends as pb

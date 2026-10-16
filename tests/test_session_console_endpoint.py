@@ -19,6 +19,8 @@ import pytest
 import sw_core.session_manager as sm
 from sw_core.session_manager import SessionRuntime
 
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+
 
 def _session(bridge) -> SessionRuntime:
     profile = mock.Mock()

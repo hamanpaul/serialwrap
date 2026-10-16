@@ -13,6 +13,9 @@ from sw_core.event_engine.matcher import (
 )
 from sw_core.event_engine.counter import Counter
 from sw_core.event_engine.schema import validate_rule_dict
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def _rule(**overrides) -> object:

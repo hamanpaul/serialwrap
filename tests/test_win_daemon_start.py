@@ -64,6 +64,8 @@ def _run_with_mocks(args, monkeypatch, backend: str, rpc_side_effect=None):
     return rc, popen, printer, sleeper
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestWinSpawnSocketDefault:
     def test_default_spawn_socket_is_tcp_on_win_backend(
         self, monkeypatch: pytest.MonkeyPatch
@@ -85,6 +87,8 @@ class TestWinSpawnSocketDefault:
         assert cmd[cmd.index("--socket") + 1] == "tcp://127.0.0.1:49123"
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestEndpointCarveOut:
     def test_loopback_endpoint_accepted_as_bind_on_win(
         self, monkeypatch: pytest.MonkeyPatch
@@ -127,6 +131,8 @@ class TestEndpointCarveOut:
         assert payload["message"] == "--endpoint 不支援 daemon start（daemon 只能在本機啟動）"
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestIsLoopbackTcp:
     @pytest.mark.parametrize(
         "ep",
@@ -143,6 +149,8 @@ class TestIsLoopbackTcp:
         assert cli._is_loopback_tcp(ep) is False
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestDaemonSpawnArgv:
     def test_frozen_prefers_sibling_exe(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path
@@ -201,6 +209,8 @@ class TestDaemonSpawnArgv:
         assert printer.call_args.args[0]["error_code"] == "DAEMON_BINARY_NOT_FOUND"
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestReadinessWindow:
     def test_win_backend_waits_50_attempts(self, monkeypatch: pytest.MonkeyPatch) -> None:
         rc, popen, printer, sleeper = _run_with_mocks(
@@ -219,6 +229,8 @@ class TestReadinessWindow:
         assert sleeper.call_count == 15
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestEnvFileOnWindows:
     """#131 review：Windows env 檔不經 bash——Git Bash 的 env -0 會把整個環境 MSYS 化
     （PATH 變 /c/... 冒號分隔），spawn 出的 serialwrapd 拿到不可用環境。改用內建最小解析。"""
@@ -266,6 +278,8 @@ class TestEnvFileOnWindows:
             cli._load_daemon_start_env_files([str(env_file)])
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestEndpointSocketConflict:
     def test_both_flags_divergent_rejected_on_win(
         self, monkeypatch: pytest.MonkeyPatch
@@ -296,6 +310,8 @@ class TestEndpointSocketConflict:
         assert cmd[cmd.index("--socket") + 1] == "tcp://127.0.0.1:5000"
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestInvalidBackendEnv:
     def test_unknown_backend_value_does_not_crash_cli(
         self, monkeypatch: pytest.MonkeyPatch
@@ -309,6 +325,8 @@ class TestInvalidBackendEnv:
 
 
 @pytest.mark.skipif(not sys.platform.startswith("win"), reason="原生 Windows detach 旗標對測")
+@pytest.mark.windows_native
+@pytest.mark.memory_only
 class TestWindowsDetachFlags:
     def test_popen_uses_detached_creationflags(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import subprocess

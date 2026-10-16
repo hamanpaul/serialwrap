@@ -12,7 +12,10 @@ passthrough / others-template 等「僅 console」profile 過去永遠停在 ATT
 from __future__ import annotations
 
 import os
-import pty
+try:  # POSIX-only：原生 Windows 無 pty 模組；僅 POSIX PTY 測試（posix_only + posix_pty）使用
+    import pty
+except ImportError:  # pragma: no cover -- 原生 Windows
+    pty = None
 import tempfile
 import time
 import unittest
@@ -25,6 +28,7 @@ from sw_core.session_manager import InteractiveLease, SessionManager
 import sw_core.session_manager as sm_mod
 from sw_core.uart_io import UARTBridge
 from sw_core.wal import WalWriter
+import pytest
 
 
 def _make_profile(
@@ -50,6 +54,8 @@ def _make_profile(
     )
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestCommandCapableGate(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -136,6 +142,8 @@ class TestCommandCapableGate(unittest.TestCase):
         self.assertFalse(session.to_public_dict()["command_capable"])
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestSelfTestTopLevelCommandCapable(unittest.TestCase):
     """#51 sub-task A：self_test 須在最外層 result dict 暴露 command_capable。
 
@@ -207,6 +215,8 @@ class TestSelfTestTopLevelCommandCapable(unittest.TestCase):
         self.assertIs(result["command_capable"], False)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestUbootTemplateProfile(unittest.TestCase):
     """#51 sub-task B：uboot-template profile 應為 command-capable。"""
 
@@ -245,6 +255,8 @@ class _FakeTarget:
                 pass
 
 
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 class TestLastHumanInputAt(unittest.TestCase):
     """#53 sub-task 4：UARTBridge 須追蹤最後一次「真實 human owner 鍵入」時間。
 
@@ -309,6 +321,8 @@ class TestLastHumanInputAt(unittest.TestCase):
             self.assertIsNone(bridge.snapshot()["last_human_input_at"])
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestHumanActiveSemantics(unittest.TestCase):
     """#53 sub-task 5：self_test 須暴露 human_active（最近鍵入時間窗）。
 
@@ -416,6 +430,8 @@ class TestHumanActiveSemantics(unittest.TestCase):
         self.assertFalse(result["human_active"])
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestSoftPreemptAndLiveness(unittest.TestCase):
     """#53 sub-task 6：閒置 human lease 可被 agent soft preempt（降級而非踢除）；
     死孤兒 console 由既有 liveness（peer-gone）在 self_test 時 detach。
@@ -557,6 +573,8 @@ class TestSoftPreemptAndLiveness(unittest.TestCase):
         self.assertIsNone(session.interactive_session_id)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestPassthroughFallback(unittest.TestCase):
     """#51 後續：新增第二個 passthrough template（uboot-template，command-capable）後，
     dynamic auto-detect 的「通用 passthrough fallback」必須仍是非 command-capable 的

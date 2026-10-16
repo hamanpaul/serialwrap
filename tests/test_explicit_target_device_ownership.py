@@ -42,6 +42,9 @@ from sw_core.device_watcher import DeviceInfo
 from sw_core.session_manager import SessionManager
 import sw_core.session_manager as sm_mod
 from sw_core.wal import WalWriter
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 # 對應 bench 實測的兩個 by-id（CH340 未插 / XDS110 -if00 已插）。
 ABSENT_BY_ID = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"

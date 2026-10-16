@@ -35,6 +35,12 @@ policy_version: 1.0.18
 - **目前無已知恆定失敗**（2026-08-11 校正）：本機全套 `python3 -m pytest -q tests/` 為 `1636 passed, 16 skipped`（0 failed）。舊版本檔曾把 `tests/test_multiagent_e2e.py::TestMultiAgentE2E::test_five_agents_three_rounds_no_conflict`（agent TX count mismatch）列為 pre-existing 失敗，該 case 單獨連跑 5/5 通過、全套亦通過，**該註記已過期並移除**；看到它紅燈請當成真實回歸處理，不要當成既有基線。
 - **「已知 flaky」不得當作放行理由**：口耳相傳曾把 PTY-heavy 測試（`tests/test_human_agent_coexist.py`、`tests/test_multiagent_e2e.py`、`tests/test_multiagent_stress.py`、`tests/test_flash_pump.py`、`tests/test_flash_service_wiring.py`、`tests/test_agent_defer_tx.py`）在多 suite 併發下的失敗歸因為 `/dev/pts` 競態。2026-08-11 以 host＋worktree 併發度 2／6／12 共 25 次重跑**無法重現**（每次皆 `33 passed`；pty 峰值 63／上限 4096、load 峰值 7.5／20 cores），故此說法**目前無證據支持**。看到這幾支紅燈請**預設當成真實回歸**處理；要主張是環境問題，須提出「同範圍連跑兩次、失敗集合不同」的實測，並先排除洩漏的 throwaway daemon 與系統飽和。
 - 不得引入**新的**測試失敗。
+- **pytest 平台／資源 marker（Rust 重構 P0 T14）**：每個測試 item 必須恰有一個平台 marker（`core_portable`／`posix_only`／`windows_native`）與至少一個資源 marker（`memory_only`／`process_rpc`／`posix_pty`／`windows_com`／`physical_uart`／`supervisor_runtime`／`interactive_desktop`）；`memory_only` 不得與其他資源 marker 並存。marker 定義唯一位於 `tests/conftest.py` 的 `_MARKERS`；逐檔標註與稽核由 `tests/test_resource_markers.py` 強制（漏標、誤標、`core_portable` 平台 SKIP、模組層與子層混用皆 FAIL）。
+  - 選取範例：`python3 -m pytest -q -m "core_portable and memory_only" tests/`、`python3 -m pytest -q -m posix_pty tests/`。
+  - `core_portable` 不得有平台條件 SKIP；平台受限的測試須標 `posix_only` 或 `windows_native`，且不得以改標 `posix_only` 縮小 `core_portable` 分母。
+  - `core_portable` 的正確性不由稽核單獨保證：`core_portable` 集合須以原生 Windows 實跑（`py -3.12 -m pytest -m core_portable`）確認；稽核只能判定標註是否自洽，無法判定測試是否真的可攜。
+  - `windows_com` 只能標在真正以原生 Windows serial backend 開啟 COM 裝置的測試（socket 或記憶體 stream 不算）；`physical_uart` 需實體 USB-UART 與 DUT。本環境不得宣稱任何 `windows_com`／`physical_uart` 證據，P0 稽核斷言兩者使用數為 0。
+  - 新增測試檔須依上述規則帶 `pytestmark`、class 或函式 marker；同檔混合平台時平台 marker 放在 class／函式層，不放模組層。
 
 ## 回歸 case 政策（#155）
 

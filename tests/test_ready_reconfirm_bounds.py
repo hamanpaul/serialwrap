@@ -39,6 +39,9 @@ from sw_core.service import SerialwrapService
 from sw_core.session_manager import SessionManager
 import sw_core.session_manager as sm_mod
 from sw_core.wal import WalWriter
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 try:
     import state_iso  # pytest／unittest discover：tests/ 在 sys.path

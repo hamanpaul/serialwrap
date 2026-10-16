@@ -16,6 +16,9 @@ from sw_core.session_manager import (
     SessionRuntime,
 )
 from sw_core.wal import WalWriter
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 try:
     import state_iso  # pytest／unittest discover：tests/ 在 sys.path

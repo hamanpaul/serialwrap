@@ -12,6 +12,9 @@ import time
 import termios
 import unittest
 from typing import Any
+import pytest
+
+pytestmark = [pytest.mark.posix_only, pytest.mark.posix_pty, pytest.mark.process_rpc]
 
 ROOT_DIR = pathlib.Path(__file__).resolve().parents[1]
 SERIALWRAP = str(ROOT_DIR / "serialwrap")

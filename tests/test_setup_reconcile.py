@@ -7,6 +7,9 @@
 - system 模式無 with_sudo 時不可實際跑 sudo，改記 pending_sudo。
 - force 跳過 flash 護欄。
 """
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def _cmds(fx):

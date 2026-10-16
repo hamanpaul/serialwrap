@@ -7,6 +7,8 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+
 
 @pytest.fixture
 def setup_env(tmp_path, monkeypatch):

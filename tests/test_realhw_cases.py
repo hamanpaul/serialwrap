@@ -6,6 +6,9 @@ from types import SimpleNamespace
 
 from realhw import harness
 from realhw.cases import p1_hotplug
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 class _Ctx:

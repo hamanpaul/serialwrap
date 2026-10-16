@@ -24,6 +24,7 @@ from unittest import mock
 
 import sw_core.client as client
 from sw_core import cli, cli_trace
+import pytest
 
 
 TRACE_KEYS = {
@@ -98,6 +99,8 @@ class CliDiagnosticsMixin:
         self.assertRegex(value, r"^[0-9a-f]{64}$")
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestCliTraceOutput(CliDiagnosticsMixin, unittest.TestCase):
     def test_default_stdout_stderr_bytes_remain_unchanged(self) -> None:
         with mock.patch(
@@ -357,6 +360,8 @@ class TestCliTraceOutput(CliDiagnosticsMixin, unittest.TestCase):
 
 
 @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "需 AF_UNIX（原生 Windows 無此屬性）")
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
 class TestCliTraceErrno(CliDiagnosticsMixin, unittest.TestCase):
     def test_missing_unix_socket_records_enoent(self) -> None:
         missing = "/tmp/sw171-cli-trace-missing.sock"
@@ -422,6 +427,8 @@ class TestCliTraceErrno(CliDiagnosticsMixin, unittest.TestCase):
         self.assertIsNone(trace["errno_name"])
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestCliTraceTcpAndRetry(CliDiagnosticsMixin, unittest.TestCase):
     def test_loopback_tcp_connection_refused_keeps_visible_host_port(self) -> None:
         with mock.patch(
@@ -479,6 +486,8 @@ class TestCliTraceTcpAndRetry(CliDiagnosticsMixin, unittest.TestCase):
         self.assertIsNone(trace["errno_name"])
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestCliTraceDaemonStart(CliDiagnosticsMixin, unittest.TestCase):
     def test_daemon_start_already_running_success_emits_single_probe_trace(self) -> None:
         with (
@@ -536,6 +545,8 @@ class TestCliTraceDaemonStart(CliDiagnosticsMixin, unittest.TestCase):
         self.assertIsNone(first["errno"])
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestCliTraceSetup(CliDiagnosticsMixin, unittest.TestCase):
     def _run_isolated_setup(
         self,
@@ -653,6 +664,8 @@ class TestCliTraceSetup(CliDiagnosticsMixin, unittest.TestCase):
         )
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestCliTraceNoExtraRpcOnTraceSinkFailure(CliDiagnosticsMixin, unittest.TestCase):
     def test_mutating_rpc_typeerror_after_send_is_not_retried(self) -> None:
         cases = [
@@ -692,6 +705,8 @@ class TestCliTraceNoExtraRpcOnTraceSinkFailure(CliDiagnosticsMixin, unittest.Tes
                 self.assertIsNotNone(calls[0][2]["trace_sink"])
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestRpcCallTraceSink(unittest.TestCase):
     def test_sink_exception_preserves_success_and_failure_rpc_responses(self) -> None:
         endpoint = "/tmp/sw201-trace-sink.sock"
@@ -768,6 +783,8 @@ class TestRpcCallTraceSink(unittest.TestCase):
                 rpc_call_once.assert_called_once()
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestCliTraceLoggerIsolation(CliDiagnosticsMixin, unittest.TestCase):
     def test_trace_logger_does_not_propagate_to_root_or_serialwrap_logger(self) -> None:
         root_stream = io.StringIO()

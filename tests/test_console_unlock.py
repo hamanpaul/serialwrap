@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import dataclasses
 import os
-import pty
+try:  # POSIX-only：原生 Windows 無 pty 模組；僅 POSIX PTY 測試（posix_only + posix_pty）使用
+    import pty
+except ImportError:  # pragma: no cover -- 原生 Windows
+    pty = None
 import re
 import select
 import threading
 import time
-import tty
+try:  # POSIX-only：原生 Windows 無 tty 模組；僅 POSIX PTY 測試（posix_only + posix_pty）使用
+    import tty
+except ImportError:  # pragma: no cover -- 原生 Windows
+    tty = None
 from pathlib import Path
 
 import pytest
@@ -137,6 +143,8 @@ def hardware():
         target.close()
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_config_inherits_and_overrides_unlock_fields(tmp_path):
     (tmp_path / "smart4.yaml").write_text("""profiles:
   smart4R-profile:
@@ -160,6 +168,8 @@ targets:
 
 
 @pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf"), True])
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_invalid_idle_is_rejected(tmp_path, value):
     import yaml
     (tmp_path / "invalid.yaml").write_text(yaml.safe_dump({"console_unlock_idle_s": value}))
@@ -167,6 +177,8 @@ def test_invalid_idle_is_rejected(tmp_path, value):
         load_profiles(str(tmp_path))
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_unlock_auth_only_resolves_and_repr_hides_secrets(monkeypatch):
     monkeypatch.setenv("SMART4R_CONSOLE_UNLOCK", "dummy-unlock")
     auth, resolution = resolve_session_auth(profile())
@@ -176,6 +188,8 @@ def test_unlock_auth_only_resolves_and_repr_hides_secrets(monkeypatch):
     assert "dummy-password" not in repr(SessionAuth(password="dummy-password"))
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_missing_unlock_is_declared_terminal(monkeypatch):
     monkeypatch.delenv("SMART4R_CONSOLE_UNLOCK", raising=False)
     auth, resolution = resolve_session_auth(profile())
@@ -184,6 +198,8 @@ def test_missing_unlock_is_declared_terminal(monkeypatch):
     assert SessionManager._credentials_declared_but_unresolved(profile(), resolution)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_unlock_env_file_precedes_environment(tmp_path, monkeypatch):
     env_file = tmp_path / "private.env"
     env_file.write_text("SMART4R_CONSOLE_UNLOCK=file-dummy\n")
@@ -193,6 +209,8 @@ def test_unlock_env_file_precedes_environment(tmp_path, monkeypatch):
     assert resolution.reason == "ok"
 
 
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 def test_boot_rx_resets_idle_before_any_tx_and_unlock_is_not_logged(hardware):
     target, bridge, wal = hardware
     threading.Thread(target=target.boot, daemon=True).start()
@@ -204,6 +222,8 @@ def test_boot_rx_resets_idle_before_any_tx_and_unlock_is_not_logged(hardware):
     assert any(line.startswith(b"echo __READY__") for line in target.lines)
 
 
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 def test_existing_shell_prompt_skips_unlock(hardware):
     target, bridge, _ = hardware
     target.locked = False
@@ -213,6 +233,8 @@ def test_existing_shell_prompt_skips_unlock(hardware):
     assert b"dummy-unlock" not in target.lines
 
 
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 def test_fresh_unlocked_attach_never_sends_secret_as_shell_command(hardware):
     target, bridge, _ = hardware
     target.locked = False
@@ -221,6 +243,8 @@ def test_fresh_unlocked_attach_never_sends_secret_as_shell_command(hardware):
 
 
 @pytest.mark.parametrize("async_after_prompt", [False, True])
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 def test_prompt_arriving_during_second_idle_wait_skips_unlock(hardware, monkeypatch, async_after_prompt):
     """空行回應超過一秒，但在第二次靜默等待內到達，不可注入 secret。"""
     target, bridge, _ = hardware
@@ -243,6 +267,8 @@ def test_prompt_arriving_during_second_idle_wait_skips_unlock(hardware, monkeypa
     assert any(line.startswith(b"echo __READY__") for line in target.lines)
 
 
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 def test_history_prompt_before_boot_cannot_skip_unlock(hardware):
     target, bridge, _ = hardware
     target.prompt()
@@ -253,6 +279,8 @@ def test_history_prompt_before_boot_cannot_skip_unlock(hardware):
     assert target.lines.count(b"dummy-unlock") == 1
 
 
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 def test_echoed_nonce_command_is_not_ready_evidence(hardware):
     target, bridge, _ = hardware
     target.locked = False
@@ -260,6 +288,8 @@ def test_echoed_nonce_command_is_not_ready_evidence(hardware):
     assert ensure_ready(bridge, profile(), SessionAuth(console_unlock="dummy-unlock")) == (False, "READY_NONCE_TIMEOUT")
 
 
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 def test_packaged_nonce_accepts_prompt_and_async_log_in_same_write(hardware):
     target, bridge, _ = hardware
     target.locked = False
@@ -268,6 +298,8 @@ def test_packaged_nonce_accepts_prompt_and_async_log_in_same_write(hardware):
     assert b"dummy-unlock" not in target.lines
 
 
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 def test_packaged_marker_command_finishes_without_recovery_keys_on_async_log(hardware, tmp_path):
     target, bridge, wal = hardware
     target.locked = False
@@ -288,10 +320,14 @@ def test_packaged_marker_command_finishes_without_recovery_keys_on_async_log(har
     "root@unrelated-host:~# ",
     "CFE> ",
 ])
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_packaged_prompt_keeps_hostname_line_start_boundary(text):
     assert re.search(packaged_profile().prompt_regex, text) is None
 
 
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 def test_cfe_prompt_blocks_all_tx(hardware):
     target, bridge, _ = hardware
     target.bootloader = True
@@ -302,12 +338,16 @@ def test_cfe_prompt_blocks_all_tx(hardware):
     assert target.received == []
 
 
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 def test_missing_unlock_never_probes_or_sends(hardware):
     target, bridge, _ = hardware
     assert ensure_ready(bridge, profile(), SessionAuth()) == (False, "CREDENTIALS_UNRESOLVED")
     assert target.received == []
 
 
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 def test_continuous_rx_timeout_never_transmits(hardware):
     target, bridge, _ = hardware
     done = threading.Event()
@@ -326,6 +366,8 @@ def test_continuous_rx_timeout_never_transmits(hardware):
         thread.join(1)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_smart4_unlock_can_pass_boot_quiet_but_other_profiles_cannot():
     smart4 = SessionRuntime("smart4R-profile:COM0", profile())
     smart4.arm_boot_quiet()
@@ -347,6 +389,8 @@ def make_manager(tmp_path, sp, target, wal):
 
 
 @pytest.mark.parametrize("operation", ["attach", "recover"])
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 def test_existing_bridge_attach_and_recover_unlock_inside_boot_quiet(hardware, tmp_path, monkeypatch, operation):
     target, bridge, wal = hardware
     monkeypatch.setenv("SMART4R_CONSOLE_UNLOCK", "dummy-unlock")
@@ -362,6 +406,8 @@ def test_existing_bridge_attach_and_recover_unlock_inside_boot_quiet(hardware, t
     assert target.lines.count(b"dummy-unlock") == 1
 
 
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 def test_initial_attach_unlocks_after_cfe_boot_without_generic_cr(tmp_path, monkeypatch):
     target = Target()
     wal = Wal()
@@ -382,6 +428,8 @@ def test_initial_attach_unlocks_after_cfe_boot_without_generic_cr(tmp_path, monk
         target.close()
 
 
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 def test_reboot_recovery_uses_unlock_inside_boot_quiet(hardware, tmp_path, monkeypatch):
     target, bridge, wal = hardware
     monkeypatch.setenv("SMART4R_CONSOLE_UNLOCK", "dummy-unlock")
@@ -403,6 +451,8 @@ def test_reboot_recovery_uses_unlock_inside_boot_quiet(hardware, tmp_path, monke
     assert all(at >= target.last_boot + 0.075 for at, _ in target.received)
 
 
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 def test_reprobe_can_schedule_passive_unlock_inside_boot_quiet(hardware, tmp_path):
     target, bridge, wal = hardware
     manager, session = make_manager(tmp_path, profile(), target, wal)
@@ -416,6 +466,8 @@ def test_reprobe_can_schedule_passive_unlock_inside_boot_quiet(hardware, tmp_pat
         assert manager._reprobe_target_still_valid_locked(session, bridge, time.monotonic())
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_template_materialization_preserves_unlock_settings(tmp_path):
     template = ProfileTemplate("smart4R-profile", console_unlock_env="SMART4R_CONSOLE_UNLOCK", console_unlock_idle_s=7)
     manager = SessionManager([], Wal(), templates=[template], on_ready=lambda _: None, on_detached=lambda _: None,
@@ -429,6 +481,8 @@ def test_template_materialization_preserves_unlock_settings(tmp_path):
         assert session.profile.console_unlock_idle_s == 9
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_dynamic_detection_skips_unlock_template():
     from unittest import mock
     from sw_core.login_fsm import detect_template
@@ -438,6 +492,8 @@ def test_dynamic_detection_skips_unlock_template():
     assert detect_template(bridge, [template], probe_timeout_s=0.001) is None
 
 
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 def test_cfe_split_chunks_arm_boot_quiet(hardware, tmp_path):
     target, bridge, wal = hardware
     manager, session = make_manager(tmp_path, profile(), target, wal)
@@ -449,6 +505,8 @@ def test_cfe_split_chunks_arm_boot_quiet(hardware, tmp_path):
     assert session.boot_quiet_active()
 
 
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 def test_unlock_timing_log_contains_only_safe_metadata(hardware, caplog):
     target, bridge, _ = hardware
     with caplog.at_level("INFO", logger="serialwrap"):
@@ -460,19 +518,27 @@ def test_unlock_timing_log_contains_only_safe_metadata(hardware, caplog):
 
 
 @pytest.mark.parametrize("command", ["echo b > /proc/sysrq-trigger", "echo 'b' >/proc/sysrq-trigger"])
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_exact_sysrq_reboot_is_recovery_command(command):
     assert _is_reboot_command(command)
 
 
 @pytest.mark.parametrize("command", ["echo b > /tmp/sysrq-trigger", "echo c > /proc/sysrq-trigger", "sync; echo b > /proc/sysrq-trigger", "sync; reboot"])
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_other_commands_do_not_broaden_reboot_detection(command):
     assert not _is_reboot_command(command)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_cfe_boot_banner_is_detected():
     assert detect_boot_banner("CFE version 1.0.38-164.255.3")
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_packaged_smart4_profile_declares_no_literal_secret():
     asset = Path(__file__).parents[1] / "sw_core/assets/profiles/default.yaml"
     loaded = load_profiles(str(asset.parent))

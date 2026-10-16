@@ -12,6 +12,9 @@ import tempfile
 import unittest
 import unittest.mock as mock
 from pathlib import Path
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def _make_fake_proc(proc_root: Path, spec: dict) -> None:

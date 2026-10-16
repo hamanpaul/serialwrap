@@ -13,6 +13,9 @@ from pathlib import Path
 from unittest import mock
 
 from sw_core.cli import main as cli_main
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 _REPO_VERSION = (Path(__file__).parent.parent / "VERSION").read_text(encoding="utf-8").strip()
 _MISMATCH_MARKER = "版本"  # `_warn_version_mismatch` 訊息固定含這個詞

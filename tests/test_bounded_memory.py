@@ -14,6 +14,9 @@ from sw_core.arbiter import CommandArbiter
 from sw_core.config import SessionProfile
 from sw_core.session_manager import BackgroundCapture, SessionManager, SessionRuntime
 from sw_core.wal import WalWriter
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def _profile(**overrides):

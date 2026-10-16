@@ -26,6 +26,7 @@ from sw_core.wal import WalWriter
 from regression.serialwrap_regression.cases.f07_file_transfer import (
     _target_tools_probe_command,
 )
+import pytest
 
 
 _PROMPT = "root@target:~# "
@@ -145,15 +146,10 @@ class _PortabilityBridge:
                 return
             payload = self.remote.get(path, b"")
             self._rx_text += _SENTINEL_BEGIN
-            if "openssl enc" in cmd:
-                encoded = subprocess.run(
-                    ["openssl", "enc", "-base64", "-A"],
-                    input=payload,
-                    stdout=subprocess.PIPE,
-                    check=True,
-                ).stdout.decode("ascii")
-            else:
-                encoded = base64.b64encode(payload).decode("ascii")
+            # fake 不啟動子行程：`openssl enc -base64 -A` 與 base64.b64encode 輸出位元組等價，
+            # 且本檔所有 pure 測試的 tools 都不含 "openssl"，此分支從未被 pure 測試走到。
+            # 真實 openssl 往返由 TestTransferOpenSSLRoundtrip（posix_only + process_rpc）驗證。
+            encoded = base64.b64encode(payload).decode("ascii")
             self._rx_text += encoded + _SENTINEL_END
 
 
@@ -202,7 +198,7 @@ class _LocalShellBridge:
         self._rx_text += cmd + "\r\n" + completed.stdout + _PROMPT
 
 
-class TestTransferPortability(unittest.TestCase):
+class _LocalFileMixin:
     def _local(self, data: bytes) -> str:
         handle = tempfile.NamedTemporaryFile(delete=False)
         handle.write(data)
@@ -210,6 +206,11 @@ class TestTransferPortability(unittest.TestCase):
         self.addCleanup(lambda: Path(handle.name).unlink(missing_ok=True))
         return handle.name
 
+
+class TestTransferPortability(_LocalFileMixin, unittest.TestCase):
+
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_all_tools_missing_rejects_before_data_or_move(self) -> None:
         bridge = _PortabilityBridge()
         local = self._local(b"payload")
@@ -222,6 +223,8 @@ class TestTransferPortability(unittest.TestCase):
         self.assertNotIn(" mv ", "".join(bridge.commands))
         self.assertEqual(bridge.remote, {})
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_echoing_probe_text_does_not_count_as_probe_success(self) -> None:
         bridge = _PortabilityBridge()
         bridge.send_command = lambda cmd, **kwargs: (
@@ -235,6 +238,8 @@ class TestTransferPortability(unittest.TestCase):
         self.assertEqual(result["error_code"], "TARGET_DECODER_MISSING")
         self.assertEqual(len(bridge.commands), 1)
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_all_encoder_tools_missing_rejects_without_creating_local_file(self) -> None:
         bridge = _PortabilityBridge()
         out = self._local(b"keep")
@@ -245,6 +250,8 @@ class TestTransferPortability(unittest.TestCase):
         self.assertEqual(Path(out).read_bytes(), b"keep")
         self.assertEqual(len(bridge.commands), 1)
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_echoing_encoder_probe_text_does_not_count_as_probe_success(self) -> None:
         bridge = _PortabilityBridge()
 
@@ -261,6 +268,8 @@ class TestTransferPortability(unittest.TestCase):
         self.assertEqual(result["error_code"], "TARGET_ENCODER_MISSING")
         self.assertEqual(Path(out).read_bytes(), b"keep")
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_encoder_failure_after_probe_is_explicit_and_preserves_local_file(self) -> None:
         bridge = _PortabilityBridge({"base64", "md5sum"}, fail_encoder=True)
         out = self._local(b"keep")
@@ -270,6 +279,8 @@ class TestTransferPortability(unittest.TestCase):
         self.assertEqual(result["error_code"], "TARGET_ENCODER_FAILED")
         self.assertEqual(Path(out).read_bytes(), b"keep")
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_encoder_partial_output_then_failure_marker_is_explicit(self) -> None:
         bridge = _PortabilityBridge(
             {"base64", "md5sum"}, fail_encoder=True, fail_encoder_partial=True,
@@ -281,6 +292,8 @@ class TestTransferPortability(unittest.TestCase):
         self.assertEqual(result["error_code"], "TARGET_ENCODER_FAILED")
         self.assertEqual(Path(out).read_bytes(), b"keep")
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_missing_encoder_failure_marker_remains_parse_failure(self) -> None:
         bridge = _PortabilityBridge(
             {"base64", "md5sum"}, fail_encoder=True, fail_encoder_no_marker=True,
@@ -292,6 +305,8 @@ class TestTransferPortability(unittest.TestCase):
         self.assertEqual(result["error_code"], "PULL_PARSE_FAILED")
         self.assertEqual(Path(out).read_bytes(), b"keep")
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_line_budget_probe_payload_is_bounded_by_source_size(self) -> None:
         bridge = _PortabilityBridge({"base64", "md5sum"})
         local = self._local(b"x")
@@ -309,6 +324,8 @@ class TestTransferPortability(unittest.TestCase):
         self.assertEqual(sizes[0], 1)
         self.assertLessEqual(max(sizes), 1)
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_probe_timeout_is_not_reported_as_missing_tool(self) -> None:
         bridge = _PortabilityBridge()
         bridge.wait_for_regex_from = lambda pattern, offset, timeout: False
@@ -318,6 +335,8 @@ class TestTransferPortability(unittest.TestCase):
 
         self.assertEqual(result["error_code"], "TRANSFER_TIMEOUT")
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_probe_shell_error_is_not_reported_as_missing_tool(self) -> None:
         bridge = _PortabilityBridge()
 
@@ -332,6 +351,140 @@ class TestTransferPortability(unittest.TestCase):
         result = push_file(bridge, local, "/tmp/dest", prompt_regex=_PROMPT_RE)
 
         self.assertEqual(result["error_code"], "TRANSFER_PROBE_FAILED")
+
+
+
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
+    def test_505_budget_bounds_every_push_and_pull_command(self) -> None:
+        bridge = _PortabilityBridge({"base64", "md5sum"})
+        local = self._local(os.urandom(1024))
+        pushed = push_file(
+            bridge, local, "/tmp/remote path with spaces", chunk_size=4096,
+            max_console_line_chars=505, prompt_regex=_PROMPT_RE,
+        )
+        self.assertTrue(pushed["ok"], pushed)
+        self.assertTrue(all(len(cmd.encode()) <= 505 for cmd in bridge.commands))
+
+        out = self._local(b"")
+        pulled = pull_file(
+            bridge, "/tmp/remote path with spaces", out,
+            max_console_line_chars=505, prompt_regex=_PROMPT_RE,
+        )
+        self.assertTrue(pulled["ok"], pulled)
+        self.assertEqual(Path(out).read_bytes(), Path(local).read_bytes())
+        self.assertTrue(all(len(cmd.encode()) <= 505 for cmd in bridge.commands))
+
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
+    def test_zero_budget_rejects_without_transmit(self) -> None:
+        bridge = _PortabilityBridge({"base64", "md5sum"})
+        local = self._local(b"payload")
+
+        result = push_file(
+            bridge, local, "/tmp/dest", max_console_line_chars=0,
+            prompt_regex=_PROMPT_RE,
+        )
+
+        self.assertEqual(result["error_code"], "CONSOLE_LINE_LIMIT_TOO_SMALL")
+        self.assertEqual(bridge.commands, [])
+
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
+    def test_positive_too_small_budget_rejects_without_transmit(self) -> None:
+        bridge = _PortabilityBridge({"base64", "md5sum"})
+        local = self._local(b"payload")
+
+        result = push_file(
+            bridge, local, "/tmp/dest", max_console_line_chars=1,
+            prompt_regex=_PROMPT_RE,
+        )
+
+        self.assertEqual(result["error_code"], "CONSOLE_LINE_LIMIT_TOO_SMALL")
+        self.assertEqual(bridge.commands, [])
+
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
+    def test_later_decoder_failure_is_not_prompt_success(self) -> None:
+        bridge = _PortabilityBridge({"base64", "md5sum"}, fail_chunk=True)
+        local = self._local(b"payload")
+
+        result = push_file(bridge, local, "/tmp/dest", prompt_regex=_PROMPT_RE)
+
+        self.assertEqual(result["error_code"], "TARGET_DECODER_FAILED")
+        self.assertFalse(any(" SW_XFER_MV_" in cmd for cmd in bridge.commands))
+
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
+    def test_failed_md5_does_not_write_unverified_pull(self) -> None:
+        bridge = _PortabilityBridge({"base64", "md5sum"}, fail_md5=True)
+        bridge.remote["/tmp/remote"] = b"payload"
+        out = self._local(b"sentinel")
+        Path(out).unlink()
+
+        result = pull_file(bridge, "/tmp/remote", out, prompt_regex=_PROMPT_RE)
+
+        self.assertEqual(result["error_code"], "CHECKSUM_VERIFY_FAILED")
+        self.assertFalse(Path(out).exists())
+
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
+    def test_md5_filename_collision_does_not_count_as_success(self) -> None:
+        bridge = _PortabilityBridge({"base64", "md5sum"}, fail_md5=True)
+        remote = "/tmp/SW_XFER_MD5_42_0123456789abcdef0123456789abcdef"
+        bridge.remote[remote] = b"payload"
+        out = self._local(b"sentinel")
+        Path(out).unlink()
+
+        result = pull_file(bridge, remote, out, prompt_regex=_PROMPT_RE)
+
+        self.assertEqual(result["error_code"], "CHECKSUM_VERIFY_FAILED")
+        self.assertFalse(Path(out).exists())
+
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
+    def test_md5_uses_checksum_field_when_filename_is_32_hex(self) -> None:
+        bridge = _PortabilityBridge({"base64", "md5sum"})
+        remote = "/tmp/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        payload = b"md5 field payload"
+        bridge.remote[remote] = payload
+        out = self._local(b"")
+
+        result = pull_file(bridge, remote, out, prompt_regex=_PROMPT_RE)
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(Path(out).read_bytes(), payload)
+        self.assertEqual(result["md5"], hashlib.md5(payload).hexdigest())
+
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
+    def test_mv_filename_collision_does_not_count_as_success(self) -> None:
+        bridge = _PortabilityBridge({"base64", "md5sum"}, fail_mv=True)
+        local = self._local(b"payload")
+        remote = "/tmp/SW_XFER_MV_42"
+
+        result = push_file(bridge, local, remote, prompt_regex=_PROMPT_RE)
+
+        self.assertEqual(result["error_code"], "MOVE_FAILED")
+
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
+    def test_pull_ignores_literal_marker_in_command_echo(self) -> None:
+        bridge = _PortabilityBridge({"base64", "md5sum"}, echo_old_markers=True)
+        payload = b"marker echo payload"
+        bridge.remote["/tmp/remote"] = payload
+        out = self._local(b"")
+
+        result = pull_file(bridge, "/tmp/remote", out, prompt_regex=_PROMPT_RE)
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(Path(out).read_bytes(), payload)
+
+
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
+class TestTransferOpenSSLRoundtrip(_LocalFileMixin, unittest.TestCase):
+    """真實 openssl 往返（經 _LocalShellBridge 以 /bin/sh 執行），僅 POSIX 子行程可跑。"""
 
     def test_only_openssl_roundtrip_binary_and_empty(self) -> None:
         for payload in (bytes(range(256)) + b"\x00binary", b""):
@@ -374,115 +527,9 @@ class TestTransferPortability(unittest.TestCase):
         finally:
             Path(remote).unlink(missing_ok=True)
 
-    def test_505_budget_bounds_every_push_and_pull_command(self) -> None:
-        bridge = _PortabilityBridge({"base64", "md5sum"})
-        local = self._local(os.urandom(1024))
-        pushed = push_file(
-            bridge, local, "/tmp/remote path with spaces", chunk_size=4096,
-            max_console_line_chars=505, prompt_regex=_PROMPT_RE,
-        )
-        self.assertTrue(pushed["ok"], pushed)
-        self.assertTrue(all(len(cmd.encode()) <= 505 for cmd in bridge.commands))
 
-        out = self._local(b"")
-        pulled = pull_file(
-            bridge, "/tmp/remote path with spaces", out,
-            max_console_line_chars=505, prompt_regex=_PROMPT_RE,
-        )
-        self.assertTrue(pulled["ok"], pulled)
-        self.assertEqual(Path(out).read_bytes(), Path(local).read_bytes())
-        self.assertTrue(all(len(cmd.encode()) <= 505 for cmd in bridge.commands))
-
-    def test_zero_budget_rejects_without_transmit(self) -> None:
-        bridge = _PortabilityBridge({"base64", "md5sum"})
-        local = self._local(b"payload")
-
-        result = push_file(
-            bridge, local, "/tmp/dest", max_console_line_chars=0,
-            prompt_regex=_PROMPT_RE,
-        )
-
-        self.assertEqual(result["error_code"], "CONSOLE_LINE_LIMIT_TOO_SMALL")
-        self.assertEqual(bridge.commands, [])
-
-    def test_positive_too_small_budget_rejects_without_transmit(self) -> None:
-        bridge = _PortabilityBridge({"base64", "md5sum"})
-        local = self._local(b"payload")
-
-        result = push_file(
-            bridge, local, "/tmp/dest", max_console_line_chars=1,
-            prompt_regex=_PROMPT_RE,
-        )
-
-        self.assertEqual(result["error_code"], "CONSOLE_LINE_LIMIT_TOO_SMALL")
-        self.assertEqual(bridge.commands, [])
-
-    def test_later_decoder_failure_is_not_prompt_success(self) -> None:
-        bridge = _PortabilityBridge({"base64", "md5sum"}, fail_chunk=True)
-        local = self._local(b"payload")
-
-        result = push_file(bridge, local, "/tmp/dest", prompt_regex=_PROMPT_RE)
-
-        self.assertEqual(result["error_code"], "TARGET_DECODER_FAILED")
-        self.assertFalse(any(" SW_XFER_MV_" in cmd for cmd in bridge.commands))
-
-    def test_failed_md5_does_not_write_unverified_pull(self) -> None:
-        bridge = _PortabilityBridge({"base64", "md5sum"}, fail_md5=True)
-        bridge.remote["/tmp/remote"] = b"payload"
-        out = self._local(b"sentinel")
-        Path(out).unlink()
-
-        result = pull_file(bridge, "/tmp/remote", out, prompt_regex=_PROMPT_RE)
-
-        self.assertEqual(result["error_code"], "CHECKSUM_VERIFY_FAILED")
-        self.assertFalse(Path(out).exists())
-
-    def test_md5_filename_collision_does_not_count_as_success(self) -> None:
-        bridge = _PortabilityBridge({"base64", "md5sum"}, fail_md5=True)
-        remote = "/tmp/SW_XFER_MD5_42_0123456789abcdef0123456789abcdef"
-        bridge.remote[remote] = b"payload"
-        out = self._local(b"sentinel")
-        Path(out).unlink()
-
-        result = pull_file(bridge, remote, out, prompt_regex=_PROMPT_RE)
-
-        self.assertEqual(result["error_code"], "CHECKSUM_VERIFY_FAILED")
-        self.assertFalse(Path(out).exists())
-
-    def test_md5_uses_checksum_field_when_filename_is_32_hex(self) -> None:
-        bridge = _PortabilityBridge({"base64", "md5sum"})
-        remote = "/tmp/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        payload = b"md5 field payload"
-        bridge.remote[remote] = payload
-        out = self._local(b"")
-
-        result = pull_file(bridge, remote, out, prompt_regex=_PROMPT_RE)
-
-        self.assertTrue(result["ok"], result)
-        self.assertEqual(Path(out).read_bytes(), payload)
-        self.assertEqual(result["md5"], hashlib.md5(payload).hexdigest())
-
-    def test_mv_filename_collision_does_not_count_as_success(self) -> None:
-        bridge = _PortabilityBridge({"base64", "md5sum"}, fail_mv=True)
-        local = self._local(b"payload")
-        remote = "/tmp/SW_XFER_MV_42"
-
-        result = push_file(bridge, local, remote, prompt_regex=_PROMPT_RE)
-
-        self.assertEqual(result["error_code"], "MOVE_FAILED")
-
-    def test_pull_ignores_literal_marker_in_command_echo(self) -> None:
-        bridge = _PortabilityBridge({"base64", "md5sum"}, echo_old_markers=True)
-        payload = b"marker echo payload"
-        bridge.remote["/tmp/remote"] = payload
-        out = self._local(b"")
-
-        result = pull_file(bridge, "/tmp/remote", out, prompt_regex=_PROMPT_RE)
-
-        self.assertTrue(result["ok"], result)
-        self.assertEqual(Path(out).read_bytes(), payload)
-
-
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestTransferProfileBudget(unittest.TestCase):
     def test_valid_profile_budget_is_loaded(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -586,6 +633,8 @@ class TestTransferProfileBudget(unittest.TestCase):
             self.assertEqual(pull.call_args.kwargs["max_console_line_chars"], 505)
 
 
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
 class TestOpenSSLProbeContract(unittest.TestCase):
     def test_f07_probe_executes_real_openssl_and_emits_lf_before_505_bytes(self) -> None:
         bridge = _LocalShellBridge()

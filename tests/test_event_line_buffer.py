@@ -2,6 +2,9 @@ from __future__ import annotations
 import unittest
 
 from sw_core.event_engine.line_buffer import LineBuffer, strip_ansi
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 class TestLineBuffer(unittest.TestCase):

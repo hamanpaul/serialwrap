@@ -5,6 +5,9 @@ import json
 import types
 
 import liveguard
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def _snap(content: bytes | None):

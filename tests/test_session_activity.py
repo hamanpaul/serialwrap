@@ -12,6 +12,9 @@ from unittest import mock
 
 from sw_core.config import SessionProfile
 from sw_core.session_manager import SessionManager, SessionRuntime
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 try:
     import state_iso  # pytest／unittest discover：tests/ 在 sys.path

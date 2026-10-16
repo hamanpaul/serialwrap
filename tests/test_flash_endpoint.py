@@ -11,10 +11,14 @@ import pytest
 from sw_core.flash_endpoint import FlashEndpoint
 
 # FlashEndpoint PTY 功能為 POSIX-only（#84 PORT-4）；Windows 上 start() 為 no-op，測試直接跳過。
-pytestmark = pytest.mark.skipif(
-    sys.platform.startswith("win"),
-    reason="POSIX-only: PTY/symlink 功能在 Windows 不適用（#84 PORT-4）",
-)
+pytestmark = [
+    pytest.mark.posix_only,
+    pytest.mark.posix_pty,
+    pytest.mark.skipif(
+        sys.platform.startswith("win"),
+        reason="POSIX-only: PTY/symlink 功能在 Windows 不適用（#84 PORT-4）",
+    ),
+]
 
 
 def _open_noctty(path: str, flags: int) -> int:

@@ -6,6 +6,9 @@
 from __future__ import annotations
 
 import os
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 _ISO_DIR_KEYS = (
     "SERIALWRAP_STATE_DIR",

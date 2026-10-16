@@ -8,9 +8,13 @@ from pathlib import Path
 from unittest import mock
 
 from sw_core import cli
+import pytest
+
+pytestmark = [pytest.mark.core_portable]
 
 
 class TestCliDaemonStart(unittest.TestCase):
+    @pytest.mark.process_rpc
     def test_load_daemon_start_env_sources_env_file(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             env_file = os.path.join(td, "OPI.env")
@@ -24,6 +28,7 @@ class TestCliDaemonStart(unittest.TestCase):
         self.assertEqual(env["SW_OPI_U"], "haman")
         self.assertEqual(env["SW_OPI_P"], "secret value")
 
+    @pytest.mark.memory_only
     def test_load_daemon_start_env_keeps_current_env_when_missing(self) -> None:
         with mock.patch.dict(os.environ, {"SERIALWRAP_TEST_FLAG": "1"}, clear=False):
             env, loaded = cli._load_daemon_start_env("/tmp/serialwrap-missing-opi-env")
@@ -31,6 +36,7 @@ class TestCliDaemonStart(unittest.TestCase):
         self.assertIsNone(loaded)
         self.assertEqual(env["SERIALWRAP_TEST_FLAG"], "1")
 
+    @pytest.mark.memory_only
     def test_resolve_daemon_start_env_files_uses_legacy_and_profile_env(self) -> None:
         """不設 SERIALWRAP_DAEMON_ENV_FILE 時，先載入 legacy，再載入 profile_dir/OPI.env。"""
         with mock.patch.dict(os.environ, {}, clear=True):
@@ -38,6 +44,7 @@ class TestCliDaemonStart(unittest.TestCase):
 
         self.assertEqual(env_files, ["~/OPI.env", "/tmp/any-profile-dir/OPI.env"])
 
+    @pytest.mark.memory_only
     def test_resolve_daemon_start_env_files_explicit_override_wins(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             profile = os.path.join(td, "default.yaml")
@@ -61,6 +68,7 @@ targets:
 
         self.assertEqual(env_files, ["/tmp/global.env"])
 
+    @pytest.mark.memory_only
     def test_run_daemon_start_passes_loaded_env_to_daemon(self) -> None:
         args = argparse.Namespace(
             profile_dir="/tmp/profiles",
@@ -93,6 +101,7 @@ targets:
         self.assertEqual(payload["env_files"], ["/tmp/OPI.env"])
         self.assertEqual(payload["warnings"], ["no_profiles_loaded"])
 
+    @pytest.mark.memory_only
     def test_run_daemon_start_reports_env_source_failure(self) -> None:
         args = argparse.Namespace(
             profile_dir="/tmp/profiles",
@@ -119,6 +128,7 @@ targets:
         self.assertEqual(payload["env_file"], "/tmp/OPI.env")
         self.assertEqual(payload["env_files"], ["/tmp/OPI.env"])
 
+    @pytest.mark.memory_only
     def test_run_daemon_start_empty_socket_stays_explicit(self) -> None:
         args = argparse.Namespace(
             profile_dir="/tmp/profiles",
@@ -151,6 +161,7 @@ targets:
         self.assertEqual(printer.call_args.args[0]["socket"], "")
 
 
+@pytest.mark.memory_only
 class TestDaemonStartSupervision(unittest.TestCase):
     """#108 #1：daemon start 監管模式 gate（systemd 重導 service start）+ on-demand 冪等。"""
 
@@ -337,6 +348,7 @@ def _make_fake_proc(proc_root, spec: dict) -> None:
         (pdir / "fd").mkdir()
 
 
+@pytest.mark.memory_only
 class TestFindConflictingDaemon(unittest.TestCase):
     """`cli._find_conflicting_daemon`（#173 spawn 防線的純函式部分，掃 fake /proc）。"""
 
@@ -375,6 +387,7 @@ class TestFindConflictingDaemon(unittest.TestCase):
         self.assertIsNone(conflict["socket"])
 
 
+@pytest.mark.memory_only
 class TestDaemonStartSpawnGuard(unittest.TestCase):
     """`daemon start` on-demand spawn 前的『同機已有其他 socket 的 daemon』防線（#173）。"""
 

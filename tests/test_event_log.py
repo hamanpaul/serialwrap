@@ -5,6 +5,9 @@ import tempfile
 import unittest
 
 from sw_core.event_engine.event_log import EventLogger
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 class TestEventLogger(unittest.TestCase):

@@ -1,3 +1,7 @@
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+
 def test_user_unit_has_restart_and_no_device_sandbox():
     from sw_core.systemd_units import render_user_unit
     text = render_user_unit(exec_start="%h/.local/bin/serialwrapd")

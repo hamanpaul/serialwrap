@@ -17,6 +17,9 @@ from sw_core.config import ProfileTemplate, SessionProfile, UartProfile
 from sw_core.session_manager import DeviceInfo, SessionManager
 import sw_core.session_manager as sm_mod
 from sw_core.wal import WalWriter
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 BY_ID = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
 

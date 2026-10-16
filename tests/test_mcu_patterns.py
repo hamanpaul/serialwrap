@@ -1,6 +1,8 @@
 import pytest
 from sw_core.mcu_patterns import McuPattern, McuPatternRegistry
 
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+
 
 def test_default_registry_has_ti_cc26xx():
     reg = McuPatternRegistry.default()

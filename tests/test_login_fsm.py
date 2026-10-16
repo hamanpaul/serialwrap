@@ -10,6 +10,9 @@ from sw_core.login_fsm import (
     matches_login_or_password,
     probe_ready,
 )
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 class TestLoginFsm(unittest.TestCase):

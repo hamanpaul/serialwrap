@@ -4,7 +4,10 @@
 - STA-4：規則 regex 加 ReDoS 靜態防護（長度上限 + 巢狀量詞拒絕）。
 """
 import collections
-import fcntl
+try:  # POSIX-only：原生 Windows 無 fcntl 模組；僅 POSIX PTY 測試（posix_only + posix_pty）使用
+    import fcntl
+except ImportError:  # pragma: no cover -- 原生 Windows
+    fcntl = None
 import os
 import threading
 
@@ -47,6 +50,8 @@ def _rule(**overrides):
 
 
 # ── RACE-1 ───────────────────────────────────────────────────────────────
+@pytest.mark.posix_only
+@pytest.mark.memory_only
 def test_fanout_delivers_to_live_console(tmp_path):
     # 用 os.pipe 當 console（fan-out 只是 os.write 到 master_fd，不依賴 PTY termios），
     # 避免 PTY slave canonical 模式對無換行資料的讀取阻塞。
@@ -63,6 +68,8 @@ def test_fanout_delivers_to_live_console(tmp_path):
         os.close(w)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_fanout_skips_bad_fd_without_crash(tmp_path):
     """壞/已關 console fd（EBADF）不得讓 RX loop 崩潰。"""
     b = _bridge(tmp_path)
@@ -76,11 +83,15 @@ def test_fanout_skips_bad_fd_without_crash(tmp_path):
 import sw_core.event_engine.schema as _schema_mod  # noqa: E402
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_overlong_regex_rejected():
     with pytest.raises(RuleSchemaError):
         _rule(pattern={"kind": "regex", "value": "a" * 1000})
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_contains_pattern_not_redos_checked():
     _rule(pattern={"kind": "contains", "value": "(a+)+"})  # contains 非 regex，不做 ReDoS 檢查
 
@@ -98,6 +109,8 @@ def test_contains_pattern_not_redos_checked():
     r"(a?){5}a{5}",                                        # final：固定 {N} 重複可變 body → 序列化指數
     "^" + "(a|aa)" * 8 + "b$", r"(a|aa)(a|aa)b",           # final2：unrolled 重疊 alternation 序列（無量詞）
 ])
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_redos_suspicious_rejected_without_re2(bad):
     if _schema_mod._re2 is None:
         with pytest.raises(RuleSchemaError):
@@ -113,6 +126,8 @@ def test_redos_suspicious_rejected_without_re2(bad):
     ("(?i)^[^\x00-\x60]*[^\x00-\x60]*Y$", ""),            # global inline (?i)
     (r"^([^\x02]+)+$", ""), (r"^([^,]+)+$", ""),          # round8：負類 anchored 巢狀量詞
 ])
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_redos_negated_suspicious_rejected_without_re2(pat, flags):
     if _schema_mod._re2 is None:
         with pytest.raises(RuleSchemaError):
@@ -126,6 +141,8 @@ def test_redos_negated_suspicious_rejected_without_re2(pat, flags):
     r"(a*)\1X", r"a{0,4096}a{0,4096}X",
     r"^(a)?(?(1)(a+)+b|c)$", r"^(a)?(?(1)(a|aa)+b|c)$",   # final3：GROUPREF_EXISTS 條件（re2 不支援）→ 落 re
 ])
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_redos_re2_incompatible_always_rejected(bad):
     with pytest.raises(RuleSchemaError):
         _rule(pattern={"kind": "regex", "value": bad})
@@ -137,11 +154,15 @@ def test_redos_re2_incompatible_always_rejected(bad):
     r"error|warn|fail", r"\d{3,5}", r"(abc)+", r"Kernel panic", r"a+$", r".*X",
     r"(abc){5}", r"x{3}y{3}",        # final：固定 {N} 重複但 body 非模糊（無可變量詞/alternation）→ 線性安全
 ])
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_redos_safe_single_quantifier_accepted_both_engines(ok):
     _rule(pattern={"kind": "regex", "value": ok})
 
 
 # ── ReDoS runtime 防護：re2 線性引擎（#91）/ re 回退路徑輸入封頂 ─────────────────────────
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_matcher_regex_input_handling_by_engine():
     """re2 線性 → 全文求值（不截斷）；re 回退 → 對 regex 輸入封頂截掉尾端。"""
     pm = PatternMatcher(Pattern(kind="regex", value="needle", flags=""))
@@ -153,6 +174,8 @@ def test_matcher_regex_input_handling_by_engine():
     assert pm.eval("a needle here") is not None         # 封頂之內/全文皆命中
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_matcher_contains_not_capped():
     """contains（已 escape 的字面量、無回溯風險）不截斷，長行尾端仍可命中（兩引擎皆然）。"""
     pm = PatternMatcher(Pattern(kind="contains", value="needle", flags=""))
@@ -160,6 +183,8 @@ def test_matcher_contains_not_capped():
     assert pm.eval(tail_only) is not None
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_matcher_re2_immune_to_polynomial_redos():
     """#91：re2 線性引擎對多項式 pattern（`a.*a.*a.*X`，AST 偵測器放行）長輸入不凍結。"""
     pytest.importorskip("re2")
@@ -171,6 +196,8 @@ def test_matcher_re2_immune_to_polynomial_redos():
     assert (time.monotonic() - t0) < 1.0, "re2 路徑對多項式 pattern 不應有 catastrophic backtracking"
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_matcher_re2_flags_and_groups():
     """re2 路徑：inline flag（i/s/m）與群組擷取語意與 re 一致。"""
     pytest.importorskip("re2")
@@ -180,6 +207,8 @@ def test_matcher_re2_flags_and_groups():
     assert r is not None and r.matched_text == "TEMP=42C" and r.groups == ["42"]
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_matcher_re2_falls_back_for_backreference():
     """re2 不支援 backreference → 自動退回標準 re（不致無法載入規則）。"""
     pytest.importorskip("re2")

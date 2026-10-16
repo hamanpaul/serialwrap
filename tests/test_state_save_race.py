@@ -23,6 +23,9 @@ import sw_core.session_manager as sm_mod
 from sw_core.config import SessionProfile, UartProfile
 from sw_core.session_manager import SessionManager
 from sw_core.wal import WalWriter
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def _make_profile(com: str = "COM0", by_id: str = "/dev/serial/by-id/dev0") -> SessionProfile:

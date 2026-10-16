@@ -3,6 +3,11 @@ from sw_core.mcu_patterns import McuPatternRegistry
 from sw_core.flash_endpoint import detect_mcu_line
 
 
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+
+
 class FakeTransport:
     """以 by_id -> 回應 bytes 模擬各候選對 probe 的反應。"""
     def __init__(self, replies):

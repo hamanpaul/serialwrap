@@ -11,6 +11,8 @@ sys.path.insert(0, str(REPO_ROOT / "regression"))
 
 from serialwrap_regression import core, harness  # noqa: E402
 
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+
 CFG = {
     "boards": [
         {"com": "COM0", "alias": "dut-prpl", "serial": "S0", "platform": "prpl"},

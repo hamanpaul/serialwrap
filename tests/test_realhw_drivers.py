@@ -4,6 +4,9 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from realhw import drivers
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 USBIPD_LIST = """Connected:
 BUSID  VID:PID    DEVICE                        STATE

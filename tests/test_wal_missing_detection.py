@@ -19,6 +19,7 @@ from pathlib import Path
 from unittest import mock
 
 from sw_core.wal import WalWriter
+import pytest
 
 
 class _WalBase(unittest.TestCase):
@@ -33,6 +34,8 @@ class _WalBase(unittest.TestCase):
 
 
 class TestWalHealth(_WalBase):
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_fresh_wal_is_healthy_with_no_file_yet(self):
         """全新 daemon 還沒有任何 UART 流量：檔案尚未建立不是故障。"""
         health = self.wal.health()
@@ -43,6 +46,8 @@ class TestWalHealth(_WalBase):
         self.assertEqual(health["current_seq"], 0)
         self.assertTrue(health["healthy"])
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_health_flags_vanished_wal_after_writes(self):
         """寫過紀錄之後檔案消失＝真故障，必須看得出來。"""
         self._append()
@@ -55,6 +60,8 @@ class TestWalHealth(_WalBase):
         self.assertGreater(health["current_seq"], 0)
         self.assertFalse(health["healthy"])
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_append_recreates_deleted_wal_dir(self):
         """#189 驗收：daemon 偵測到 WAL 被刪除後重建並告警，而不是安靜地寫進虛空。"""
         self._append()
@@ -70,6 +77,8 @@ class TestWalHealth(_WalBase):
         self.assertTrue(self.wal.health()["healthy"])
         self.assertTrue(any("WAL" in line for line in captured.output))
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_recreated_wal_is_readable_again(self):
         self._append()
         shutil.rmtree(self.wal_dir)
@@ -80,6 +89,8 @@ class TestWalHealth(_WalBase):
         import base64
         self.assertEqual(base64.b64decode(rows[0]["payload_b64"]), b"after-rmtree")
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_append_records_failure_when_recreate_fails(self):
         """重建也失敗（ENOSPC/EROFS/權限）時：標 loss、記錄錯誤，但不得讓 RX thread 崩潰。"""
         self._append()
@@ -94,7 +105,10 @@ class TestWalHealth(_WalBase):
         self.assertIsNotNone(health["last_write_error"])
         self.assertFalse(health["healthy"])
 
-    @unittest.skipIf(os.geteuid() == 0, "root 繞過權限檢查，此案在 root 下無意義")
+    # getattr：原生 Windows 無 os.geteuid，class 定義時不得拋 AttributeError（本案 posix_only，Windows 不選取）
+    @unittest.skipIf(getattr(os, "geteuid", lambda: 1)() == 0, "root 繞過權限檢查，此案在 root 下無意義")
+    @pytest.mark.posix_only
+    @pytest.mark.memory_only
     def test_non_traversable_dir_is_not_writable(self):
         """目錄只有 W_OK 沒有 X_OK 時進不去、建不了檔，不得判為可寫。"""
         self._append()
@@ -105,6 +119,8 @@ class TestWalHealth(_WalBase):
         self.assertFalse(health["wal_dir_writable"])
         self.assertFalse(health["healthy"])
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_available_from_seq_tracks_current_file(self):
         for _ in range(3):
             self._append()
@@ -128,6 +144,8 @@ class _ServiceBase(_WalBase):
         return svc
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestReadPathsReportMissing(_ServiceBase):
     def test_tail_raw_reports_wal_missing(self):
         self._append()
@@ -220,6 +238,8 @@ class TestReadPathsReportMissing(_ServiceBase):
         self.assertTrue(resp["rotated_out"])
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestHealthStatusExposesWal(_ServiceBase):
     def test_health_status_carries_wal_health(self):
         self._append()
@@ -230,6 +250,8 @@ class TestHealthStatusExposesWal(_ServiceBase):
         self.assertFalse(resp["wal"]["wal_dir_exists"])
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestDoctorWalWritable(unittest.TestCase):
     """doctor 的 wal_dir 檢查在事故當下回的是 ok:true——它只印路徑、從不檢查存在性。
     新增非 advisory 的 wal_writable 檢查把這一項補上。"""

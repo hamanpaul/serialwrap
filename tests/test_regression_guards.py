@@ -11,6 +11,8 @@ sys.path.insert(0, str(REPO_ROOT / "regression"))
 
 from serialwrap_regression import guards  # noqa: E402
 
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+
 
 @pytest.mark.parametrize("cmd", [
     "saveenv",

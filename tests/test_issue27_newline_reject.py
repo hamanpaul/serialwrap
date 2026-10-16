@@ -19,6 +19,9 @@ from sw_core.arbiter import (
     WARNING_CMD_LENGTH,
     CommandArbiter,
 )
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 try:
     import state_iso  # pytest／unittest discover：tests/ 在 sys.path

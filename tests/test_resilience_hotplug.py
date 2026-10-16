@@ -16,6 +16,9 @@ from sw_core.device_watcher import DeviceInfo
 from sw_core.session_manager import SessionManager, SessionRuntime
 import sw_core.session_manager as sm_mod
 from sw_core.wal import WalWriter
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def _make_profile(name: str = "p", com: str = "COM0",

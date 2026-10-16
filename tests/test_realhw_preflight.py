@@ -5,6 +5,11 @@ import os
 from types import SimpleNamespace
 
 from realhw import preflight
+import pytest
+
+pytestmark = []
+
+RESOURCE_AUDIT_WAIVERS = {"interactive_desktop": "只檢查命令字串組裝（tools_missing 清單中的 tmux 字串），不啟動 tmux"}
 
 
 def _checks(**over):
@@ -17,31 +22,43 @@ def _checks(**over):
     return preflight.Checks(**base)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_all_green_passes():
     ok, problems = preflight.evaluate(_checks())
     assert ok and problems == []
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_missing_tool_fails():
     ok, problems = preflight.evaluate(_checks(tools_missing=["tmux"]))
     assert not ok and any("tmux" in p for p in problems)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_other_pytest_fails_with_mutex_reason():
     ok, problems = preflight.evaluate(_checks(other_pytest=True))
     assert not ok and any("live guard" in p for p in problems)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_boards_not_ready_fails():
     ok, problems = preflight.evaluate(_checks(boards_ready=["COM0"]))
     assert not ok and any("COM1" in p for p in problems)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_git_behind_warns_but_passes():
     ok, problems = preflight.evaluate(_checks(git_behind=3))
     assert ok and any("落後" in p for p in problems)  # 警告仍列出但不擋
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_parse_version():
     assert preflight.parse_version("serialwrap 0.2.3") == (0, 2, 3)
     assert preflight.parse_version("0.10.1") == (0, 10, 1)
@@ -49,12 +66,16 @@ def test_parse_version():
     assert preflight.parse_version("usage: serialwrap ...") is None
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_missing_capabilities_all_present():
     caps = preflight.Capabilities(remote_capability=True,
                                   deployed_version="serialwrap 0.2.3", docker=True)
     assert preflight.missing_capabilities(caps) == {}
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_missing_capabilities_maps_reason_codes():
     caps = preflight.Capabilities(remote_capability=False,
                                   deployed_version="serialwrap 0.2.2", docker=False)
@@ -65,11 +86,15 @@ def test_missing_capabilities_maps_reason_codes():
     }
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_missing_capabilities_unparseable_version_is_stale():
     caps = preflight.Capabilities(remote_capability=True, deployed_version="", docker=True)
     assert preflight.missing_capabilities(caps) == {"deployed_recent": "deployed_daemon_stale"}
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_collect_capabilities_reads_remote_version_and_docker(monkeypatch):
     class _Sw:
         def run(self, *args):
@@ -87,6 +112,8 @@ def test_collect_capabilities_reads_remote_version_and_docker(monkeypatch):
     assert caps == preflight.Capabilities(True, "serialwrap 0.2.3", True)
 
 
+@pytest.mark.posix_only
+@pytest.mark.memory_only
 def test_benchlock_mutual_exclusion(tmp_path):
     lock = tmp_path / "bench.lock"
     fd1 = preflight.acquire_benchlock(lock)
@@ -98,16 +125,22 @@ def test_benchlock_mutual_exclusion(tmp_path):
     os.close(fd2)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_benchlock_failure_refuses_suite():
     ok, problems = preflight.evaluate(_checks(benchlock_ok=False))
     assert not ok and any("bench.lock" in p for p in problems)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_external_testpilot_refuses_suite():
     ok, problems = preflight.evaluate(_checks(external_testpilot=("1234 testpilot run wifi_llapi",)))
     assert not ok and any("testpilot" in p for p in problems)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_external_testpilot_ignores_own_pid(monkeypatch):
     me = os.getpid()
     monkeypatch.setattr(
@@ -125,6 +158,8 @@ def test_external_testpilot_ignores_own_pid(monkeypatch):
     assert preflight._external_testpilot() == ["4321 testpilot run wifi_llapi --case smoke"]
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_boards_missing_attributed_to_windows_daemon():
     ok, problems = preflight.evaluate(_checks(
         boards_ready=["COM0"], win_daemon_present=True, win_daemon_holds=("COM1",)))
@@ -134,6 +169,8 @@ def test_boards_missing_attributed_to_windows_daemon():
     assert "COM1" in joined
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_boards_missing_without_windows_attribution_unchanged():
     ok, problems = preflight.evaluate(_checks(boards_ready=["COM0"]))
     assert not ok and any("COM1" in p and "windows_daemon" not in p for p in problems)
@@ -150,6 +187,8 @@ class _FakeSwDoctor:
         return {"ok": True, "checks": self._checks}
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_doctor_ok_tolerates_advisory_red():
     """advisory 項（如 #148 wal_dir WARN）ok=False 不得觸發 suite-refuse。"""
     checks = [
@@ -159,6 +198,8 @@ def test_doctor_ok_tolerates_advisory_red():
     assert preflight._doctor_ok(_FakeSwDoctor(checks)) is True
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_doctor_ok_refuses_on_real_red():
     checks = [
         {"check": "python", "ok": True, "advisory": False},

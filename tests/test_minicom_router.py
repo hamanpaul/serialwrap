@@ -8,6 +8,9 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+import pytest
+
+pytestmark = []
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -84,6 +87,9 @@ class TestMinicomRouter(unittest.TestCase):
         return bin_dir
 
     @unittest.skipUnless(shutil.which("script"), "script command is required")
+    @pytest.mark.posix_only
+    @pytest.mark.posix_pty
+    @pytest.mark.process_rpc
     def test_wrapper_generates_transcript_log(self) -> None:
         with self._temporary_directory() as td:
             root = Path(td)
@@ -115,6 +121,9 @@ class TestMinicomRouter(unittest.TestCase):
             self.assertIn("fake minicom output", content)
 
     @unittest.skipUnless(shutil.which("script"), "script command is required")
+    @pytest.mark.posix_only
+    @pytest.mark.posix_pty
+    @pytest.mark.process_rpc
     def test_wrapper_prefers_home_b_log_over_build_log_path(self) -> None:
         with self._temporary_directory() as td:
             root = Path(td)
@@ -149,6 +158,9 @@ class TestMinicomRouter(unittest.TestCase):
             self.assertEqual(len(logs), 1)
             self.assertFalse(legacy_dir.exists())
 
+    @pytest.mark.posix_only
+    @pytest.mark.posix_pty
+    @pytest.mark.process_rpc
     def test_default_capture_uses_native_minicom_capturefile(self) -> None:
         with self._temporary_directory() as td:
             root = Path(td)
@@ -179,6 +191,9 @@ class TestMinicomRouter(unittest.TestCase):
             self.assertIn("fake minicom output", content)
             self.assertNotIn("Script started", content)
 
+    @pytest.mark.posix_only
+    @pytest.mark.posix_pty
+    @pytest.mark.process_rpc
     def test_user_capture_args_disable_auto_transcript(self) -> None:
         cases = (
             ("short", ["-C", "user-short.log"], ["-C", "user-short.log"], 1),
@@ -228,6 +243,9 @@ class TestMinicomRouter(unittest.TestCase):
                 self.assertFalse(list(blog_dir.glob("mini_*.log")))
                 self.assertFalse(script_marker.exists())
 
+    @pytest.mark.posix_only
+    @pytest.mark.posix_pty
+    @pytest.mark.process_rpc
     def test_script_unavailable_warns_and_runs_without_native_capture(self) -> None:
         with self._temporary_directory() as td:
             root = Path(td)
@@ -268,6 +286,9 @@ class TestMinicomRouter(unittest.TestCase):
             self.assertNotIn("-C", args)
             self.assertFalse(list(blog_dir.glob("mini_*.log")))
 
+    @pytest.mark.posix_only
+    @pytest.mark.posix_pty
+    @pytest.mark.process_rpc
     def test_capture_mode_minicom_uses_native_capturefile(self) -> None:
         with self._temporary_directory() as td:
             root = Path(td)
@@ -299,6 +320,9 @@ class TestMinicomRouter(unittest.TestCase):
             self.assertIn("fake minicom output", content)
             self.assertNotIn("Script started", content)
 
+    @pytest.mark.posix_only
+    @pytest.mark.posix_pty
+    @pytest.mark.process_rpc
     def test_capture_mode_off_disables_auto_transcript(self) -> None:
         with self._temporary_directory() as td:
             root = Path(td)
@@ -331,6 +355,9 @@ class TestMinicomRouter(unittest.TestCase):
             self.assertNotIn("-C", args)
             self.assertFalse(list(blog_dir.glob("mini_*.log")))
 
+    @pytest.mark.posix_only
+    @pytest.mark.posix_pty
+    @pytest.mark.process_rpc
     def test_legacy_explicit_capture_wrapper_zero_uses_native_capturefile(self) -> None:
         with self._temporary_directory() as td:
             root = Path(td)
@@ -376,6 +403,9 @@ class TestMinicomRouter(unittest.TestCase):
             self.assertEqual(len(logs), 1)
             self.assertIn("legacy capture", logs[0].read_text(encoding="utf-8"))
 
+    @pytest.mark.posix_only
+    @pytest.mark.posix_pty
+    @pytest.mark.process_rpc
     def test_invalid_capture_mode_exits_with_clear_error(self) -> None:
         with self._temporary_directory() as td:
             root = Path(td)
@@ -402,6 +432,9 @@ class TestMinicomRouter(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("invalid MINICOM_CAPTURE_MODE", result.stdout)
 
+    @pytest.mark.posix_only
+    @pytest.mark.posix_pty
+    @pytest.mark.process_rpc
     def test_broker_console_detaches_after_minicom_nonzero_exit(self) -> None:
         with self._temporary_directory() as td:
             root = Path(td)

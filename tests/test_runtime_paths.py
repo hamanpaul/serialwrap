@@ -7,6 +7,9 @@ import unittest
 from unittest import mock
 
 import sw_core.constants as constants
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 class TestRuntimePaths(unittest.TestCase):

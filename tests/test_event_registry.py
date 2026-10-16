@@ -5,6 +5,9 @@ import tempfile
 import unittest
 
 from sw_core.event_engine.registry import RuleRegistry, RuleLoadError
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def _rule_dict(owner: str, name: str, **overrides) -> dict:

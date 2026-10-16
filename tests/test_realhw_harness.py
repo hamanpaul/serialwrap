@@ -7,6 +7,8 @@ import pytest
 
 from realhw import harness
 
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+
 
 def _mk(id, tier="p0", destructive=False):
     return harness.Case(id=id, tier=tier, title=id, run=lambda ctx: harness.CaseResult("PASS"),

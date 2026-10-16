@@ -29,6 +29,8 @@ from sw_core import device_source as ds
 from sw_core.session_manager import SessionManager
 from sw_core.wal import WalWriter
 
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 藍牙排除測試（scan 層）

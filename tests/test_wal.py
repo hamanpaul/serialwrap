@@ -4,8 +4,13 @@ import unittest
 from pathlib import Path
 
 from sw_core.wal import WalWriter
+import pytest
+
+pytestmark = []
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestWal(unittest.TestCase):
     def test_append_and_tail(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -23,6 +28,8 @@ class TestWal(unittest.TestCase):
             self.assertTrue(Path(td, "raw.mirror.log").exists())
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestWalTailLatest(unittest.TestCase):
     """#124：tail_raw/tail_text 預設（from_seq 省略）改為 latest 模式回傳最新 N 筆。"""
 
@@ -163,6 +170,8 @@ class TestWalWindowsDirFsync(unittest.TestCase):
 
         return _open
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_reset_on_windows_rotates_and_zeroes_seq_without_dir_fsync(self) -> None:
         import os
         from unittest import mock
@@ -181,6 +190,8 @@ class TestWalWindowsDirFsync(unittest.TestCase):
         self.assertEqual(wal.current_seq, 0)
         self.assertEqual(len(archives), 1, archives)
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_rotate_if_needed_on_windows_is_not_degraded(self) -> None:
         import os
         from unittest import mock
@@ -196,6 +207,8 @@ class TestWalWindowsDirFsync(unittest.TestCase):
             archives = list(Path(td).glob("raw.wal.ndjson.*"))
             self.assertEqual(len(archives), 1, archives)
 
+    @pytest.mark.posix_only
+    @pytest.mark.memory_only
     def test_reset_on_posix_still_fsyncs_directory(self) -> None:
         import os
         from unittest import mock

@@ -1,6 +1,13 @@
 """sw_core.sysenv 的單元測試。"""
 
+import sys
 
+import pytest
+
+pytestmark = [pytest.mark.core_portable]
+
+
+@pytest.mark.memory_only
 def test_fake_effects_run_snapshots_cmd():
     """run() 須以 list(cmd) 快照記錄，呼叫端事後 mutate 原 list 不可污染 calls。"""
     from sw_core.sysenv import FakeEffects
@@ -11,6 +18,7 @@ def test_fake_effects_run_snapshots_cmd():
     assert fx.calls[0] == ["x"]
 
 
+@pytest.mark.memory_only
 def test_fake_effects_records_calls_and_answers_probes():
     from sw_core.sysenv import FakeEffects
 
@@ -36,15 +44,17 @@ def test_fake_effects_records_calls_and_answers_probes():
     assert ["echo", "hi"] in fx.calls
 
 
+@pytest.mark.process_rpc
 def test_system_effects_run_captures_returncode():
     from sw_core.sysenv import SystemEffects
 
     fx = SystemEffects()
-    rc, out, err = fx.run(["python3", "-c", "import sys;print('x');sys.exit(3)"])
+    rc, out, err = fx.run([sys.executable, "-c", "import sys;print('x');sys.exit(3)"])
     assert rc == 3
     assert "x" in out
 
 
+@pytest.mark.memory_only
 def test_system_effects_which_and_groups_do_not_raise():
     from sw_core.sysenv import SystemEffects
 
@@ -71,6 +81,7 @@ def _make_executable(path):
     os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
+@pytest.mark.memory_only
 def test_system_effects_which_all_finds_all_matches_in_path_order(monkeypatch):
     from sw_core.sysenv import SystemEffects
 
@@ -90,6 +101,7 @@ def test_system_effects_which_all_finds_all_matches_in_path_order(monkeypatch):
         assert got == [path_a, path_b]
 
 
+@pytest.mark.memory_only
 def test_system_effects_which_all_excludes_non_executable(monkeypatch):
     from sw_core.sysenv import SystemEffects
 
@@ -103,6 +115,7 @@ def test_system_effects_which_all_excludes_non_executable(monkeypatch):
         assert fx.which_all("myserialwrap") == []
 
 
+@pytest.mark.memory_only
 def test_system_effects_which_all_empty_when_no_match(monkeypatch):
     from sw_core.sysenv import SystemEffects
 
@@ -112,24 +125,27 @@ def test_system_effects_which_all_empty_when_no_match(monkeypatch):
         assert fx.which_all("definitely-not-a-binary-xyz") == []
 
 
+@pytest.mark.process_rpc
 def test_system_effects_run_default_timeout_none_unchanged_behavior():
     """不帶 timeout_s（既有呼叫）行為與修改前逐位元組相同：正常完成、不逾時。"""
     from sw_core.sysenv import SystemEffects
 
     fx = SystemEffects()
-    rc, out, err = fx.run(["python3", "-c", "print('ok')"])
+    rc, out, err = fx.run([sys.executable, "-c", "print('ok')"])
     assert rc == 0
     assert "ok" in out
 
 
+@pytest.mark.process_rpc
 def test_system_effects_run_timeout_returns_sentinel_not_raises():
     from sw_core.sysenv import SystemEffects
 
     fx = SystemEffects()
-    rc, out, err = fx.run(["sleep", "5"], timeout_s=0.1)
+    rc, out, err = fx.run([sys.executable, "-c", "import time; time.sleep(5)"], timeout_s=0.1)
     assert (rc, out, err) == (-1, "", "TIMEOUT")
 
 
+@pytest.mark.memory_only
 def test_fake_effects_which_all_default_empty():
     from sw_core.sysenv import FakeEffects
 
@@ -137,6 +153,7 @@ def test_fake_effects_which_all_default_empty():
     assert fx.which_all("serialwrap") == []
 
 
+@pytest.mark.memory_only
 def test_fake_effects_which_all_returns_configured_list():
     from sw_core.sysenv import FakeEffects
 
@@ -145,6 +162,7 @@ def test_fake_effects_which_all_returns_configured_list():
     assert fx.which_all("absent") == []
 
 
+@pytest.mark.memory_only
 def test_fake_effects_run_accepts_and_records_timeout_s():
     from sw_core.sysenv import FakeEffects
 
@@ -177,6 +195,7 @@ class _FakeStream:
             raise self._raises
 
 
+@pytest.mark.memory_only
 def test_force_utf8_stdio_reconfigures_stdout_stderr_on_win32(monkeypatch):
     from sw_core.sysenv import force_utf8_stdio
 
@@ -191,6 +210,7 @@ def test_force_utf8_stdio_reconfigures_stdout_stderr_on_win32(monkeypatch):
     assert err.calls == [{"encoding": "utf-8"}]
 
 
+@pytest.mark.memory_only
 def test_force_utf8_stdio_is_noop_off_win32(monkeypatch):
     from sw_core.sysenv import force_utf8_stdio
 
@@ -205,6 +225,7 @@ def test_force_utf8_stdio_is_noop_off_win32(monkeypatch):
     assert err.calls == []
 
 
+@pytest.mark.memory_only
 def test_force_utf8_stdio_tolerates_stream_without_reconfigure(monkeypatch):
     from sw_core.sysenv import force_utf8_stdio
 
@@ -218,6 +239,7 @@ def test_force_utf8_stdio_tolerates_stream_without_reconfigure(monkeypatch):
     force_utf8_stdio()  # 不得拋錯
 
 
+@pytest.mark.memory_only
 def test_force_utf8_stdio_tolerates_reconfigure_error(monkeypatch):
     from sw_core.sysenv import force_utf8_stdio
 
@@ -228,6 +250,7 @@ def test_force_utf8_stdio_tolerates_reconfigure_error(monkeypatch):
     force_utf8_stdio()  # 不得拋錯（吞 ValueError/OSError）
 
 
+@pytest.mark.memory_only
 def test_force_utf8_stdio_tolerates_incompatible_reconfigure_signature(monkeypatch):
     """reconfigure 存在但不吃 encoding=（拋 TypeError）時仍不得崩（#118 review）。"""
     from sw_core.sysenv import force_utf8_stdio
@@ -250,6 +273,7 @@ def test_force_utf8_stdio_tolerates_incompatible_reconfigure_signature(monkeypat
     assert out.called and err.called
 
 
+@pytest.mark.memory_only
 def test_force_utf8_stdio_skips_non_callable_reconfigure(monkeypatch):
     """reconfigure 屬性存在但不可呼叫時安全略過。"""
     from sw_core.sysenv import force_utf8_stdio

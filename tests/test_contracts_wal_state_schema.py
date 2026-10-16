@@ -21,6 +21,8 @@ from typing import Any
 
 import pytest
 
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONTRACTS_DIR = REPO_ROOT / "contracts"
 WAL_SCHEMA = "wal_record.schema.json"

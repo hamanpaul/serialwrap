@@ -25,6 +25,8 @@ import pytest
 from sw_core.doctor_cmd import run_doctor
 from sw_core.sysenv import FakeEffects
 
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+
 
 LINUX_CHECKS = [
     "python",

@@ -1,4 +1,7 @@
 from sw_core.flash_endpoint import resolve_flash_target
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def _sess(com, command_capable):

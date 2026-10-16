@@ -16,6 +16,9 @@ import time
 
 import sw_core.arbiter as arbiter_mod
 from sw_core.arbiter import CommandArbiter
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def _wait_until(pred, timeout_s: float = 5.0, interval_s: float = 0.005) -> bool:

@@ -13,6 +13,9 @@ import unittest
 from unittest.mock import patch
 
 from sw_core.wal import WalWriter
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 META_KEYS = {"from_seq", "last_seq", "current_seq", "returned", "truncated"}
 

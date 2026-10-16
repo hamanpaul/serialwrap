@@ -4,6 +4,9 @@ from __future__ import annotations
 import argparse
 
 import sw_core.cli as cli
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def _ns(endpoint=None, socket=None):

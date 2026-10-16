@@ -16,6 +16,8 @@ import pytest
 
 from sw_core.telnet_console import TELNET_GREETING, TelnetFilter, escape_iac
 
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+
 IAC = b"\xff"
 WILL, WONT, DO, DONT, SB, SE = b"\xfb", b"\xfc", b"\xfd", b"\xfe", b"\xfa", b"\xf0"
 OPT_BINARY, OPT_ECHO, OPT_SGA, OPT_TTYPE, OPT_NAWS = (

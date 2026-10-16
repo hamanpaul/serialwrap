@@ -18,7 +18,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 
-pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+pytestmark = [pytest.mark.core_portable]
 
 # `python3 -m tools.contracts` 的五個子命令（與 cli.py 的子命令表逐字相同）。
 _SUBCOMMANDS = ("extract", "check", "summary", "skill-section", "effective")
@@ -54,6 +54,7 @@ def _catalog_code_values() -> set[str]:
     return values
 
 
+@pytest.mark.memory_only
 def test_diagnostic_codes_declared_for_both_namespaces():
     decl = {d["namespace"]: d for d in _policy()["diagnostic_codes"]}
     assert set(decl) == {"error_code", "session_last_error"}
@@ -63,6 +64,7 @@ def test_diagnostic_codes_declared_for_both_namespaces():
         assert {"code", "meaning", "action"} <= set(re.compile(d["entry_pattern"]).groupindex)
 
 
+@pytest.mark.process_rpc
 def test_doc_coverage_local_mirror_of_r27_passes():
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
@@ -71,6 +73,7 @@ def test_doc_coverage_local_mirror_of_r27_passes():
     assert [f for f in findings if f.check in ("C13", "C14")] == []
 
 
+@pytest.mark.memory_only
 def test_generated_facts_cover_both_skills():
     facts = _policy()["generated_facts"]
     pairs = {(f["reflected_in"], f["marker"]) for f in facts}
@@ -82,10 +85,12 @@ def test_generated_facts_cover_both_skills():
     assert pairs == expected
 
 
+@pytest.mark.memory_only
 def test_contracts_in_code_paths():
     assert "contracts/**" in _policy()["code_paths"]
 
 
+@pytest.mark.memory_only
 def test_preflight_has_contracts_step_before_tests():
     steps = _policy()["preflight"]["steps"]
     names = [s["name"] for s in steps]
@@ -96,6 +101,7 @@ def test_preflight_has_contracts_step_before_tests():
     assert contracts_step["argv"] == ["python3", "-m", "tools.contracts", "check"]
 
 
+@pytest.mark.memory_only
 def test_policy_rule_declaration_has_no_code_list():
     # 先取宣告區塊：尚未宣告時於此以 KeyError 紅燈。
     block = _policy()["diagnostic_codes"]
@@ -105,12 +111,14 @@ def test_policy_rule_declaration_has_no_code_list():
     assert leaked == [], f"diagnostic_codes 宣告不得內含目錄碼值（OD-06，只放抽取方式與文件位置）：{leaked}"
 
 
+@pytest.mark.memory_only
 def test_claude_md_has_contract_governance_section():
     text = (ROOT / "CLAUDE.md").read_text(encoding="utf-8")
     assert "## 契約治理政策" in text
     assert "python3 -m tools.contracts check" in text
 
 
+@pytest.mark.memory_only
 def test_governance_doc_lists_all_checks():
     doc = ROOT / "docs" / "contracts-governance.md"
     assert doc.is_file(), "docs/contracts-governance.md 尚未建立（T12 Step 4）"

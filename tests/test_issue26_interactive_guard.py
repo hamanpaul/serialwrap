@@ -6,6 +6,9 @@ import unittest
 from unittest.mock import MagicMock
 
 from sw_core.session_manager import SessionManager
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 class TestRecoverOkTrue(unittest.TestCase):

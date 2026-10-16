@@ -30,6 +30,8 @@ def _args(socket_arg: str | None = None, endpoint: str | None = None) -> argpars
     return argparse.Namespace(socket=socket_arg, endpoint=endpoint)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestAfUnixAvailable:
     def test_reports_true_when_attr_present(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(socket, "AF_UNIX", 1, raising=False)
@@ -40,6 +42,8 @@ class TestAfUnixAvailable:
         assert client._af_unix_available() is False
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestEndpointAliveWithoutAfUnix:
     """無 AF_UNIX 平台上 unix endpoint 一律視為不可連（觸發 #108 fallback）。"""
 
@@ -75,6 +79,8 @@ class TestEndpointAliveWithoutAfUnix:
         assert cli._endpoint_alive("tcp://") is True
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestRpcCallWithoutAfUnix:
     def test_unix_endpoint_returns_socket_error_not_crash(
         self, monkeypatch: pytest.MonkeyPatch
@@ -93,11 +99,15 @@ class TestRpcCallWithoutAfUnix:
 
 
 class TestLocalDefaultEndpoint:
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_win_backend_uses_platform_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SERIALWRAP_RPC_BACKEND", "win")
         monkeypatch.setattr(cli, "DEFAULT_ENDPOINT", "tcp://127.0.0.1:48700", raising=False)
         assert cli._local_default_endpoint() == "tcp://127.0.0.1:48700"
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_win_backend_always_yields_tcp_even_on_posix(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -107,6 +117,8 @@ class TestLocalDefaultEndpoint:
         monkeypatch.setattr(cli, "DEFAULT_ENDPOINT", "/run/user/1000/serialwrapd.sock", raising=False)
         assert cli._local_default_endpoint() == f"tcp://127.0.0.1:{cli.DEFAULT_TCP_PORT}"
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_invalid_backend_env_falls_back_to_real_platform(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -114,16 +126,22 @@ class TestLocalDefaultEndpoint:
         expected = cli.DEFAULT_ENDPOINT if sys.platform.startswith("win") else cli.SOCKET_PATH
         assert cli._local_default_endpoint() == expected
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_posix_backend_keeps_socket_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SERIALWRAP_RPC_BACKEND", "posix")
         assert cli._local_default_endpoint() == cli.SOCKET_PATH
 
     @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX 預設行為")
+    @pytest.mark.posix_only
+    @pytest.mark.memory_only
     def test_auto_on_posix_keeps_socket_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("SERIALWRAP_RPC_BACKEND", raising=False)
         assert cli._local_default_endpoint() == cli.SOCKET_PATH
 
     @pytest.mark.skipif(not sys.platform.startswith("win"), reason="原生 Windows 對測")
+    @pytest.mark.windows_native
+    @pytest.mark.memory_only
     def test_auto_on_windows_uses_default_endpoint(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -132,6 +150,8 @@ class TestLocalDefaultEndpoint:
         assert cli._local_default_endpoint().startswith("tcp://127.0.0.1:")
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestResolveEndpointWinBackend:
     def test_no_config_falls_back_to_tcp_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SERIALWRAP_RPC_BACKEND", "win")

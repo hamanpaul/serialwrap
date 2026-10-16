@@ -13,6 +13,8 @@ import sw_core.session_manager as sm_mod
 from sw_core.session_manager import SessionManager, StateLoadError
 from sw_core.wal import WalWriter
 
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+
 
 def _mgr(tmp_path, monkeypatch):
     monkeypatch.setattr(sm_mod, "STATE_PATH", str(tmp_path / "state.json"))

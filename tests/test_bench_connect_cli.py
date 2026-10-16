@@ -10,7 +10,14 @@ import textwrap
 import pytest
 
 from sw_core import cli
-from sw_core import remote_tunnel as rt
+
+# POSIX-only：sw_core/remote_tunnel.py:10 頂層 import fcntl，原生 Windows 無此模組；非 POSIX 整檔略過、不 import。
+if os.name != "posix":
+    pytest.skip("bench connect 依賴 POSIX fcntl（remote_tunnel.py:10）", allow_module_level=True)
+
+from sw_core import remote_tunnel as rt  # noqa: E402
+
+pytestmark = [pytest.mark.posix_only, pytest.mark.memory_only]
 
 
 def _write_yaml(path: Path, content: str) -> None:

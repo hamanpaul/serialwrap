@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import unittest
 from unittest.mock import MagicMock, patch
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def _make_service() -> "SerialwrapService":

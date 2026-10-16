@@ -9,6 +9,8 @@ from typing import Any
 import pytest
 import yaml
 
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+
 ROOT = Path(__file__).resolve().parents[1]
 
 

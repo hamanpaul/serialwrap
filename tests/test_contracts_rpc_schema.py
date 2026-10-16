@@ -108,11 +108,15 @@ def _load_behavior_changes():
         return doc.get("changes", [])
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_methods_equal_dispatch_plus_daemon_stop():
     """驗證 RPC 契約中的 x-methods 集合恰為 service._dispatch 處理的 method 加上 daemon.stop。"""
     assert set(_schema()["x-methods"]) == _dispatch_methods() | {"daemon.stop"}
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_retryable_flags_match_client_whitelist():
     """驗證 x-methods 中標註 retryable_readonly 的方法與 client 端白名單完全一致，且 interactive_status 為 False。"""
     flagged = {m for m, v in _schema()["x-methods"].items() if v["retryable_readonly"]}
@@ -120,6 +124,8 @@ def test_retryable_flags_match_client_whitelist():
     assert _schema()["x-methods"]["session.interactive_status"]["retryable_readonly"] is False
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_rpc_schema_is_valid_draft2020():
     """驗證 rpc_schema.json 符合 JSON Schema Draft 2020-12 規範。"""
     import jsonschema
@@ -127,18 +133,24 @@ def test_rpc_schema_is_valid_draft2020():
     jsonschema.Draft202012Validator.check_schema(schema)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_blocking_flags_match_daemon():
     """驗證 x-methods 中標註 blocking 的方法與 daemon 端 BLOCKING_RPC_METHODS 完全一致。"""
     flagged = {m for m, v in _schema()["x-methods"].items() if v["blocking"]}
     assert flagged == _literal_set("sw_core/daemon.py", "BLOCKING_RPC_METHODS")
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_long_timeout_flags_match_cli():
     """驗證 x-methods 中標註 long_timeout 的方法與 CLI 端 _LONG_RPC_METHODS 完全一致。"""
     flagged = {m for m, v in _schema()["x-methods"].items() if v["long_timeout"]}
     assert flagged == _literal_set("sw_core/cli.py", "_LONG_RPC_METHODS")
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_method_errors_in_catalog():
     """驗證 x-methods 宣告的每個錯誤碼皆屬於 error_codes 目錄碼或 passthrough meta 項。"""
     schema = _schema()
@@ -151,6 +163,8 @@ def test_method_errors_in_catalog():
             assert err in valid_codes, f"Method {method} has undeclared error_code {err}"
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_every_rpc_code_referenced():
     """驗證 error_codes 目錄中 scope 包含 'rpc' 的所有錯誤碼，皆出現在某 method 的 errors 或 x-generic-errors 中。"""
     schema = _schema()
@@ -165,6 +179,8 @@ def test_every_rpc_code_referenced():
     assert rpc_codes <= referenced, f"Unreferenced rpc error codes: {rpc_codes - referenced}"
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_session_public_order_matches_runtime():
     """驗證 SessionRuntime.to_public_dict() 的鍵順序與 $defs.SessionPublic.x-order 扣除條件欄後完全一致。"""
     from sw_core.session_manager import SessionRuntime
@@ -187,6 +203,8 @@ def test_session_public_order_matches_runtime():
     assert runtime_keys == filtered_order
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_session_public_instance_validates():
     """驗證真實 SessionRuntime.to_public_dict() 實例符合 $defs.SessionPublic 的 JSON Schema 定義。"""
     import jsonschema
@@ -206,6 +224,8 @@ def test_session_public_instance_validates():
     jsonschema.validate(instance=rt.to_public_dict(), schema=validator_schema)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_command_record_order_matches_arbiter():
     """驗證 CommandArbiter 命令記錄的鍵順序與 $defs.CommandRecord.x-order 完全一致。"""
     from sw_core.arbiter import CommandArbiter
@@ -221,6 +241,8 @@ def test_command_record_order_matches_arbiter():
     assert list(rec.keys()) == expected_order
 
 
+@pytest.mark.core_portable
+@pytest.mark.process_rpc
 def test_early_response_bytes_match_framing():
     """驗證 INVALID_JSON 與 INVALID_REQUEST 在真實 framing 層的回應位元組完全等於 x-wire.early_responses。"""
     schema = _schema()
@@ -235,6 +257,8 @@ def test_early_response_bytes_match_framing():
     assert lines_req[0].decode("utf-8") == early["INVALID_REQUEST"]
 
 
+@pytest.mark.core_portable
+@pytest.mark.process_rpc
 def test_version_absent_for_matches_runtime():
     """驗證 version_absent_for 表列的情境回應皆不含 version，且 health.ping 回應末尾含 version。"""
     schema = _schema()
@@ -275,6 +299,8 @@ def test_version_absent_for_matches_runtime():
     assert list(ping_resp.keys())[-1] == "version"
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_line_limit_matches_golden():
     """驗證 x-wire.max_request_line_bytes 與 contracts/golden/rpc/line_limit.json 完全對齊。"""
     schema = _schema()
@@ -468,6 +494,8 @@ def _dispatch_param_names() -> dict[str, set[str]]:
     return out
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_coercion_expression_matches_default_for_missing_and_none():
     """機械檢查（不執行產品碼）：x-coercion 對省略與 None 求值必須等於 default（且型別相同）。"""
     for m, spec in _schema()["x-methods"].items():
@@ -479,6 +507,8 @@ def test_coercion_expression_matches_default_for_missing_and_none():
                 assert _same(out, p["default"]), (m, k, value, out, p["default"])
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_params_names_match_dispatch_reads():
     """機械檢查：每個 _dispatch 分支讀取的 params 名稱集合 == schema params 鍵 ∪ x-aliases。"""
     schema = _schema()
@@ -497,6 +527,8 @@ CASES: tuple[tuple[str, Any], ...] = (
 )
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_params_coercion_match_runtime():
     """執行期：每個 method × 每個 param × {省略, None, "10", "", 0}，recording fake 收到的值必須等於
     x-coercion 求值結果；求值例外時產品須回 INVALID_ARGS／EXCEPTION 且不得呼叫 manager。"""
@@ -546,6 +578,8 @@ def test_params_coercion_match_runtime():
     assert not failures, "\n".join(failures[:40])
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_selector_chain_match_runtime():
     """執行期：selector_chain 非 null 的 30 個 method（24 鏈＋6 raw）。鏈上每一鍵單獨給值時，該值必須
     出現在某個 manager 呼叫的參數中；同時給鏈上前兩鍵時取較前者（後者不得出現）。raw 方法原樣傳遞。"""
@@ -577,6 +611,8 @@ def test_selector_chain_match_runtime():
     assert checked == 30
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_wal_range_to_seq_filters_locally():
     """wal.range.to_seq 不轉傳 WAL：服務層保留 seq ≤ to_seq；0 或省略不過濾（schema x-forwarded: false）。"""
     svc = _svc()
@@ -602,6 +638,8 @@ def test_wal_range_to_seq_filters_locally():
         assert [r["seq"] for r in resp.get("records", [])] == expect, (params, resp)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_event_com_status_selector_scalar_types_validate():
     """event.com_status 的 selector 原樣傳入引擎：字串、數字、布林的成功回應須符合 result schema；None 走 coms 分支。"""
     import jsonschema
@@ -629,6 +667,8 @@ def test_event_com_status_selector_scalar_types_validate():
     jsonschema.validate(instance=resp, schema={"$defs": schema["$defs"], **result})
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_error_order_precedence():
     """執行期：error_order[0] 與 error_order[1] 同時成立時回應 error_order[0]。
     對 error_order[0] 為 INVALID_ARGS 的方法：無必填參數＋所有 manager 回 error_order[1] → INVALID_ARGS。
@@ -665,6 +705,8 @@ _NOT_SERVICE_TESTABLE: dict[str, str] = {
 }
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_result_schemas_not_placeholders():
     """每個 x-methods.*.result 與 $defs.* 皆非空物件，且具 type、$ref 或 oneOf（C18 的本地鏡像）。"""
     schema = _schema()
@@ -677,6 +719,8 @@ def test_result_schemas_not_placeholders():
         assert "type" in d_spec or "$ref" in d_spec, f"$defs.{d} missing type/$ref"
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_side_effects_declared_for_readonly_whitelist():
     """retryable_readonly 方法皆宣告 side_effects；session.list 的效果皆 idempotent。
     device.list 為純讀（見 spec-errata.md T8-ERR-01），side_effects 必須為空列表。"""
@@ -692,6 +736,8 @@ def test_side_effects_declared_for_readonly_whitelist():
         assert eff.get("idempotent") is True, f"session.list effect {eff} not marked idempotent"
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_uart_tx_effects_are_conditional_and_gated():
     """含 UART TX 的副作用不得宣稱 when=always（拒絕路徑零 TX，§11.3 第 1 項），且必須寫明 x-condition。"""
     for m, v in _schema()["x-methods"].items():
@@ -701,6 +747,8 @@ def test_uart_tx_effects_are_conditional_and_gated():
                 assert eff.get("x-condition"), (m, eff["what"])
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_section_94_fields_carry_unit_and_updated_by():
     """§9.4 凍結欄位須標 x-updated-by；數值型欄位另須標 x-unit。"""
     need_updated = {"multi_open", "multi_open_detail", "rx_bytes_last_10s", "rx_rate_bps",
@@ -728,6 +776,8 @@ def test_section_94_fields_carry_unit_and_updated_by():
     assert {"multi_open", "human_active", "rx_bytes_last_10s", "last_rx_age_s"} <= set(seen), seen
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_record_error_codes_match_catalog():
     """CommandRecord／CommandResultTail.error_code 的 x-record-error-codes 與目錄 rec 範圍（非 APPROVED）雙向一致，
     且目錄 scope.methods 所列的讀取 method 其 errors 或紀錄層清單皆涵蓋該碼。"""
@@ -747,6 +797,8 @@ def test_record_error_codes_match_catalog():
             assert c.code in set(spec.get("errors", [])) | record, (m, c.code)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_session_list_ready_reconfirm_not_evaluated():
     """session.list 不主動評估 ready_reconfirm 到期（GAP-G-13）：list_sessions 與 to_public_dict 不得呼叫
     expire_ready_reconfirm；到期翻轉只由 1 s tick 發生。"""
@@ -825,6 +877,8 @@ def _branches(method: str) -> list[dict[str, Any]]:
     return _schema()["x-methods"][method]["result"]["oneOf"]
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_self_test_recover_branch_orders_match_source_literals():
     """session.self_test／session.recover 的每個字面回應鍵序（session_manager.py）必須被某一 oneOf 分支
     以相同相對順序接受；wrapper self_test() 於最後追加 command_capable。"""
@@ -843,6 +897,8 @@ def test_self_test_recover_branch_orders_match_source_literals():
         assert any(_admits(b, keys) for b in rc_branches), keys
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_session_not_found_runtime_response_validates_branch():
     """執行期（真實 SessionManager，查無 session）：回應鍵序與值須符合 SESSION_NOT_FOUND 分支。"""
     import jsonschema
@@ -858,6 +914,8 @@ def test_session_not_found_runtime_response_validates_branch():
         jsonschema.validate(instance=resp, schema={"$defs": schema["$defs"], **branch})
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_foreign_holders_includes_self_pid(tmp_path: Path):
     """驗證 health.status 之 foreign_holders 包含自身 pid，且 multi_open 偵測結果正確映射。"""
     schema = _schema()
@@ -880,6 +938,8 @@ def test_foreign_holders_includes_self_pid(tmp_path: Path):
     assert result["holders"].get(fake_tty) == my_pid
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_pending_ids_exist():
     """驗證 x-pending 中每一筆的 change 識別碼皆存在於 behavior_changes.yaml 中。"""
     schema = _schema()
@@ -890,6 +950,8 @@ def test_pending_ids_exist():
         assert change_id in change_ids, f"x-pending change {change_id} not found in behavior_changes"
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_pending_fields_absent_while_approved():
     """驗證處於 APPROVED 狀態的變更項目其擴充欄位尚未出現在執行期回應中。"""
     schema = _schema()

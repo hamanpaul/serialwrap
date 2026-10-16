@@ -21,6 +21,9 @@ from sw_core.session_manager import SessionManager, SessionRuntime
 import sw_core.session_manager as sm_mod
 from sw_core.uart_io import UARTBridge
 from sw_core.wal import WalWriter
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 AGE_OVER = constants.TRANSPORT_STALL_MIN_RX_AGE_S + 10.0
 AGE_UNDER = constants.TRANSPORT_STALL_MIN_RX_AGE_S / 3

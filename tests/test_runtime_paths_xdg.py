@@ -1,4 +1,7 @@
 import importlib, os
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def _reload(env, monkeypatch):

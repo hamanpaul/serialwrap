@@ -11,6 +11,9 @@ sys.path.insert(0, str(REPO_ROOT / "reliability"))
 
 from serialwrap_reliability import core  # noqa: E402
 from serialwrap_reliability.reporter import ReliabilityReporter  # noqa: E402
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def _mk_run(tmp_path: Path):

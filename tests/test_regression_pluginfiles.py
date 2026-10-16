@@ -15,6 +15,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "regression"))
 
 from serialwrap_regression import core  # noqa: E402
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 PLUGIN_ROOT = REPO_ROOT / "regression" / "serialwrap_regression"
 

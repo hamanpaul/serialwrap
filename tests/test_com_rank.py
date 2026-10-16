@@ -21,6 +21,9 @@ from sw_core.device_watcher import DeviceInfo
 from sw_core.session_manager import SessionManager, SessionRuntime, device_sort_key
 import sw_core.session_manager as sm_mod
 from sw_core.wal import WalWriter
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 # 現行實機基準（測試期望錨點）：by-id 字典序 AC01… < AQ00…

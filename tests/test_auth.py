@@ -11,6 +11,9 @@ from unittest import mock
 
 from sw_core.auth import AuthResolution, SessionAuth, parse_env_file, resolve_session_auth
 from sw_core.config import SessionProfile, UartProfile
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def _make_shell_profile(

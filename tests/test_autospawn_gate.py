@@ -3,6 +3,9 @@
 驗證 should_auto_spawn() 邏輯與 supervision-mode CLI 指令。
 """
 from __future__ import annotations
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def test_should_auto_spawn_false_in_systemd_mode(tmp_path):

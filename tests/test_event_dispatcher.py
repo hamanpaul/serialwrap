@@ -16,6 +16,7 @@ from sw_core.event_engine.dispatcher import (
 from sw_core.event_engine.counter import Counter, CounterStore
 from sw_core.event_engine.schema import validate_rule_dict
 from sw_core.event_engine.matcher import MatcherFire, MatchResult
+import pytest
 
 
 def _rule_exec(exec_argv: list[str], **overrides) -> object:
@@ -46,6 +47,8 @@ class _Ctx:
         return self.counters
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestPayload(unittest.TestCase):
     def test_payload_shape(self) -> None:
         rule = _rule_exec(["/bin/true"])
@@ -102,6 +105,8 @@ class TestDispatcher(unittest.TestCase):
             wal_seq=1, matched_at=1, active_cmd_id=None,
         )
 
+    @pytest.mark.posix_only
+    @pytest.mark.process_rpc
     def test_exec_handler_writes_completed(self) -> None:
         marker = os.path.join(self.tmp, "fired")
         rule = {
@@ -118,6 +123,8 @@ class TestDispatcher(unittest.TestCase):
         types = [e["type"] for e in self.ctx.events]
         self.assertIn("fire_completed", types)
 
+    @pytest.mark.posix_only
+    @pytest.mark.process_rpc
     def test_timeout_kills_handler(self) -> None:
         rule = {
             "schema_version": 1,
@@ -132,6 +139,8 @@ class TestDispatcher(unittest.TestCase):
         types = [e["type"] for e in self.ctx.events]
         self.assertIn("fire_timeout", types)
 
+    @pytest.mark.posix_only
+    @pytest.mark.process_rpc
     def test_per_rule_concurrency_drops_oldest(self) -> None:
         rule = {
             "schema_version": 1,

@@ -10,6 +10,9 @@ import unittest
 from unittest import mock
 
 from sw_core.arbiter import CommandArbiter
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 class TestCommandCancel(unittest.TestCase):

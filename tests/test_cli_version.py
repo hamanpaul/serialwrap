@@ -21,6 +21,8 @@ import pytest
 from sw_core import cli
 from sw_core import version as version_module
 
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+
 _REPO_VERSION = (Path(__file__).parent.parent / "VERSION").read_text(encoding="utf-8").strip()
 
 

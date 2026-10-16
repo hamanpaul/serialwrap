@@ -8,8 +8,11 @@ import unittest
 from unittest.mock import MagicMock, call, patch
 
 from sw_core.client import _parse_endpoint, rpc_call
+import pytest
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestParseEndpoint(unittest.TestCase):
     def test_tcp_valid(self) -> None:
         transport, addr = _parse_endpoint("tcp://192.168.1.10:7777")
@@ -56,16 +59,76 @@ class TestParseEndpoint(unittest.TestCase):
             _parse_endpoint("tcp://127.0.0.1:7777/rpc")
 
 
-class TestRpcCallEndpointBranch(unittest.TestCase):
-    """確認 rpc_call 依 endpoint scheme 選擇正確 transport。"""
+class _OkResponseMixin:
+    """提供 rpc_call 假回應位元組（純記憶體，不開任何 socket）。"""
 
     def _make_ok_response(self) -> bytes:
         return json.dumps({"ok": True, "result": "pong"}).encode() + b"\n"
 
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+class TestRpcCallEndpointBranch(_OkResponseMixin, unittest.TestCase):
+    """確認 rpc_call 依 endpoint scheme 選擇正確 transport。"""
+
+
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_invalid_endpoint_returns_structured_error(self) -> None:
         resp = rpc_call("tcp://nohost", "health.ping", {})
         self.assertFalse(resp.get("ok"))
         self.assertEqual(resp.get("error_code"), "INVALID_ENDPOINT")
+
+
+
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
+    def test_tcp_endpoint_uses_create_connection(self) -> None:
+        mock_sock = MagicMock()
+        mock_sock.recv.return_value = self._make_ok_response()
+
+        with patch("socket.create_connection", return_value=mock_sock) as mock_cc:
+            rpc_call("tcp://127.0.0.1:7777", "health.ping", {})
+        mock_cc.assert_called_once_with(("127.0.0.1", 7777), timeout=5.0)
+        mock_sock.settimeout.assert_called_once_with(5.0)
+
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
+    def test_socket_error_returns_structured_error(self) -> None:
+        with patch("socket.socket") as mock_socket_cls:
+            mock_socket_cls.return_value.connect.side_effect = OSError("connection refused")
+            resp = rpc_call("/tmp/nonexistent.sock", "health.ping", {})
+        self.assertFalse(resp.get("ok"))
+        self.assertEqual(resp.get("error_code"), "SOCKET_ERROR")
+
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
+    def test_tcp_socket_error_returns_structured_error(self) -> None:
+        with patch("socket.create_connection", side_effect=OSError("connection refused")):
+            resp = rpc_call("tcp://127.0.0.1:7777", "health.ping", {})
+        self.assertFalse(resp.get("ok"))
+        self.assertEqual(resp.get("error_code"), "SOCKET_ERROR")
+
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
+    def test_tcp_connect_timeout_returns_timeout(self) -> None:
+        with patch("socket.create_connection", side_effect=socket.timeout("timed out")):
+            resp = rpc_call("tcp://127.0.0.1:7777", "health.ping", {})
+        self.assertFalse(resp.get("ok"))
+        self.assertEqual(resp.get("error_code"), "TIMEOUT")
+
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
+    def test_unsupported_scheme_returns_invalid_endpoint(self) -> None:
+        resp = rpc_call("http://127.0.0.1:7777", "health.ping", {})
+        self.assertFalse(resp.get("ok"))
+        self.assertEqual(resp.get("error_code"), "INVALID_ENDPOINT")
+
+@unittest.skipUnless(hasattr(socket, "AF_UNIX"), "需 AF_UNIX（原生 Windows 無此屬性，#131）")
+@pytest.mark.posix_only
+@pytest.mark.memory_only
+class TestRpcCallEndpointUnixBranch(_OkResponseMixin, unittest.TestCase):
+    """確認 unix endpoint 走 AF_UNIX transport（以 patch 取代 socket.socket，不開真實 socket）。"""
 
     @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "需 AF_UNIX（原生 Windows 無此屬性，#131）")
     def test_unix_path_uses_af_unix(self) -> None:
@@ -89,40 +152,10 @@ class TestRpcCallEndpointBranch(unittest.TestCase):
         mock_socket_cls.assert_called_once_with(socket.AF_UNIX, socket.SOCK_STREAM)
         mock_sock.connect.assert_called_once_with("/tmp/fake.sock")
 
-    def test_tcp_endpoint_uses_create_connection(self) -> None:
-        mock_sock = MagicMock()
-        mock_sock.recv.return_value = self._make_ok_response()
-
-        with patch("socket.create_connection", return_value=mock_sock) as mock_cc:
-            rpc_call("tcp://127.0.0.1:7777", "health.ping", {})
-        mock_cc.assert_called_once_with(("127.0.0.1", 7777), timeout=5.0)
-        mock_sock.settimeout.assert_called_once_with(5.0)
-
-    def test_socket_error_returns_structured_error(self) -> None:
-        with patch("socket.socket") as mock_socket_cls:
-            mock_socket_cls.return_value.connect.side_effect = OSError("connection refused")
-            resp = rpc_call("/tmp/nonexistent.sock", "health.ping", {})
-        self.assertFalse(resp.get("ok"))
-        self.assertEqual(resp.get("error_code"), "SOCKET_ERROR")
-
-    def test_tcp_socket_error_returns_structured_error(self) -> None:
-        with patch("socket.create_connection", side_effect=OSError("connection refused")):
-            resp = rpc_call("tcp://127.0.0.1:7777", "health.ping", {})
-        self.assertFalse(resp.get("ok"))
-        self.assertEqual(resp.get("error_code"), "SOCKET_ERROR")
-
-    def test_tcp_connect_timeout_returns_timeout(self) -> None:
-        with patch("socket.create_connection", side_effect=socket.timeout("timed out")):
-            resp = rpc_call("tcp://127.0.0.1:7777", "health.ping", {})
-        self.assertFalse(resp.get("ok"))
-        self.assertEqual(resp.get("error_code"), "TIMEOUT")
-
-    def test_unsupported_scheme_returns_invalid_endpoint(self) -> None:
-        resp = rpc_call("http://127.0.0.1:7777", "health.ping", {})
-        self.assertFalse(resp.get("ok"))
-        self.assertEqual(resp.get("error_code"), "INVALID_ENDPOINT")
 
 
+@pytest.mark.core_portable
+@pytest.mark.process_rpc
 class TestRpcCallOverRealTcpSocket(unittest.TestCase):
     """以 real loopback TCP server 驗證完整 rpc_call TCP path。"""
 
@@ -154,6 +187,8 @@ class TestRpcCallOverRealTcpSocket(unittest.TestCase):
         self.assertTrue(resp.get("ok"))
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestCliEndpoint(unittest.TestCase):
     """CLI --endpoint / _resolve_endpoint 行為測試。"""
 
@@ -191,6 +226,8 @@ class TestCliEndpoint(unittest.TestCase):
         self.assertEqual(args.endpoint, "tcp://127.0.0.1:7777")
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestCliEndpointPassthrough(unittest.TestCase):
     """CLI --endpoint 透傳測試。
 

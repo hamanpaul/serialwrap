@@ -1,5 +1,8 @@
 """tests/test_service_ctl.py — service_ctl.service_action 單元測試（Task 9）。"""
 from __future__ import annotations
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def test_user_mode_restart_calls_systemctl_user():

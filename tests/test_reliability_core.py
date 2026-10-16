@@ -14,6 +14,10 @@ sys.path.insert(0, str(REPO_ROOT / "reliability"))
 
 from serialwrap_reliability import core  # noqa: E402
 
+pytestmark = []
+
+RESOURCE_AUDIT_WAIVERS = {"interactive_desktop": "只以 fake_run 攔截 tmux 命令字串，不啟動 tmux"}
+
 
 CFG = {
     "boards": [
@@ -44,11 +48,15 @@ def _mk_case(id: str, tier: str = "p0", destructive: bool = False,
     )
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_repo_root_locates_worktree():
     assert core.REPO_ROOT == REPO_ROOT
     assert (core.REPO_ROOT / "realhw" / "harness.py").is_file()
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_resolve_repo_root_rejects_non_editable_layout(tmp_path):
     fake = tmp_path / "venv" / "lib" / "python3.12" / "site-packages" / "serialwrap_reliability" / "core.py"
     fake.parent.mkdir(parents=True)
@@ -57,6 +65,8 @@ def test_resolve_repo_root_rejects_non_editable_layout(tmp_path):
         core.resolve_repo_root(fake)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_ensure_realhw_importable_idempotent():
     got = core.ensure_realhw_importable()
     assert got == REPO_ROOT
@@ -67,6 +77,8 @@ def test_ensure_realhw_importable_idempotent():
     assert sys.path.count(str(REPO_ROOT)) == before.count(str(REPO_ROOT))
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_load_registry_populated_unique():
     registry = core.load_registry()
     ids = [case.id for case in registry]
@@ -75,6 +87,8 @@ def test_load_registry_populated_unique():
     assert any(case.id == "p0-doctor" for case in registry)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_core_modules_do_not_import_testpilot():
     pkg = REPO_ROOT / "reliability" / "serialwrap_reliability"
     for name in sorted(path.name for path in pkg.glob("*.py") if path.name != "plugin.py"):
@@ -84,6 +98,8 @@ def test_core_modules_do_not_import_testpilot():
 
 
 @pytest.mark.parametrize("duration_s,interval_s,n", [(900, 300, 3), (60, 300, 1), (0, 300, 1)])
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_synth_longrun_steps_count(duration_s, interval_s, n):
     steps = core.synth_longrun_steps(duration_s, interval_s)
     assert len(steps) == n
@@ -94,6 +110,8 @@ def test_synth_longrun_steps_count(duration_s, interval_s, n):
         assert step["target"] == "bench"
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_case_to_dict_single_step_schema():
     got = core.case_to_dict(_mk_case("p0-x", requires=("two_boards",), hints=("h1",)), CFG)
     assert {"id", "name", "topology", "steps", "pass_criteria", "metadata"} <= set(got)
@@ -108,6 +126,8 @@ def test_case_to_dict_single_step_schema():
     }
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_case_to_dict_longrun_synthesizes_checkpoints():
     got = core.case_to_dict(_mk_case("lr-mixed", tier="longrun"), CFG)
     assert [step["id"] for step in got["steps"]] == [
@@ -117,6 +137,8 @@ def test_case_to_dict_longrun_synthesizes_checkpoints():
     ]
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_case_to_dict_missing_com_fails_loud():
     bad_cfg = dict(CFG)
     bad_cfg["boards"] = [{"alias": "dut-only"}]
@@ -124,6 +146,8 @@ def test_case_to_dict_missing_com_fails_loud():
         core.case_to_dict(_mk_case("bad"), bad_cfg)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_case_to_dict_duplicate_com_fails_loud():
     bad_cfg = dict(CFG)
     bad_cfg["boards"] = [
@@ -134,11 +158,15 @@ def test_case_to_dict_duplicate_com_fails_loud():
         core.case_to_dict(_mk_case("dup"), bad_cfg)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_build_case_dicts_preserves_registry_order():
     got = core.build_case_dicts([_mk_case("a"), _mk_case("b"), _mk_case("c")], CFG)
     assert [case["id"] for case in got] == ["a", "b", "c"]
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_filter_for_run_default_excludes_destructive():
     cases = core.build_case_dicts(
         [_mk_case("a"), _mk_case("b", destructive=True), _mk_case("c")], CFG
@@ -147,6 +175,8 @@ def test_filter_for_run_default_excludes_destructive():
     assert [case["id"] for case in got] == ["a", "c"]
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_filter_for_run_explicit_id_includes_destructive():
     cases = core.build_case_dicts([_mk_case("a"), _mk_case("b", destructive=True)], CFG)
     got = core.filter_for_run(cases, {"b"})
@@ -154,6 +184,8 @@ def test_filter_for_run_explicit_id_includes_destructive():
 
 
 # ---------------------------------------------------------------- Task 4：判決抄寫與執行編排
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_result_to_dict_copies_case_result_shape():
     core.ensure_realhw_importable()
     from realhw import harness
@@ -176,10 +208,14 @@ def test_result_to_dict_copies_case_result_shape():
     }
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_failure_payload_pass_is_none():
     assert core.failure_payload({"verdict": "PASS"}) is None
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_failure_payload_fail_copies_classification():
     payload = core.failure_payload({
         "verdict": "FAIL", "reason": "fan-out 斷線", "category": "test",
@@ -195,18 +231,24 @@ def test_failure_payload_fail_copies_classification():
     }
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_failure_payload_runtime_skip_defaults_environment():
     payload = core.failure_payload({"verdict": "SKIP", "reason": "base64 缺", "category": "",
                                     "reason_code": "base64_missing", "evidence": {}})
     assert payload["category"] == "environment"
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_failure_payload_fail_without_category_stays_empty():
     payload = core.failure_payload({"verdict": "FAIL", "reason": "boom", "category": "",
                                     "reason_code": "uncaught_exception", "evidence": {}})
     assert payload["category"] == ""
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_runtime_skip_broken_by_and_missing_caps():
     meta_dep = {"requires": ["two_boards"], "destructive": False}
     assert core.runtime_skip(meta_dep, {}, "p1-hp-cycle") == (
@@ -218,6 +260,8 @@ def test_runtime_skip_broken_by_and_missing_caps():
     assert core.runtime_skip({"requires": [], "destructive": False}, {}, "x") is None
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_runtime_skip_consumes_missing_capabilities_output():
     """整合斷言（防靜默失效）：Phase 1 missing_capabilities 的實際輸出必須能直接餵 runtime_skip。"""
     core.ensure_realhw_importable()
@@ -233,11 +277,15 @@ def test_runtime_skip_consumes_missing_capabilities_output():
         "docker_unavailable", "能力缺項：docker")
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_make_skip_result_shape():
     r = core.make_skip_result("docker_unavailable", "能力缺項：docker")
     assert (r.verdict, r.category, r.reason_code) == ("SKIP", "environment", "docker_unavailable")
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_build_ctx_injects_win_cli(monkeypatch, tmp_path):
     core.ensure_realhw_importable()
     from realhw import drivers
@@ -278,6 +326,8 @@ def test_build_ctx_injects_win_cli(monkeypatch, tmp_path):
     assert ctx.report_dir == tmp_path and ctx.case_dir == tmp_path
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_run_case_blackbox_pass_and_uncaught(monkeypatch, tmp_path):
     core.ensure_realhw_importable()
     from realhw import harness
@@ -323,6 +373,8 @@ class _FakeSw:
         return self.state == want
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_recover_boards_dispatches_state_aware_verb(monkeypatch):
     monkeypatch.setattr(core.time, "sleep", lambda s: None)
     sw = _FakeSw("ATTACHED")
@@ -332,12 +384,16 @@ def test_recover_boards_dispatches_state_aware_verb(monkeypatch):
     assert sw.calls == [("session", "recover", "--selector", "COM0")]
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_recover_boards_ready_is_noop():
     sw = _FakeSw("READY")
     assert core.recover_boards(SimpleNamespace(sw=sw), ["COM0", "COM1"]) == []
     assert sw.calls == []
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_sweep_tmux_kills_only_prefix(monkeypatch):
     ran: list[list[str]] = []
 
@@ -354,11 +410,15 @@ def test_sweep_tmux_kills_only_prefix(monkeypatch):
     assert ["tmux", "kill-session", "-t", "other-sess"] not in ran
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_checkpoint_index():
     assert core.checkpoint_index("checkpoint-007", fallback=9) == 7
     assert core.checkpoint_index("weird", fallback=9) == 9
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_longrun_runner_join_and_snapshots(tmp_path):
     snaps = tmp_path / "snapshots.ndjson"
     snaps.write_text('{"t":0}\n{"t":300}\n', encoding="utf-8")
@@ -370,6 +430,8 @@ def test_longrun_runner_join_and_snapshots(tmp_path):
     assert runner.result() is sentinel
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_longrun_runner_skipped_mode():
     r = core.make_skip_result("docker_unavailable", "能力缺項：docker")
     runner = core.LongrunRunner.skipped(r)
@@ -378,6 +440,8 @@ def test_longrun_runner_skipped_mode():
     assert runner.result() is r
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_longrun_runner_result_joins_even_if_thread_already_finished():
     class FakeThread:
         def __init__(self) -> None:
@@ -395,6 +459,8 @@ def test_longrun_runner_result_joins_even_if_thread_already_finished():
     assert runner._thread.joined is True
 
 
+@pytest.mark.posix_only
+@pytest.mark.memory_only
 def test_run_preflight_acquires_benchlock_and_collects_missing(monkeypatch, tmp_path):
     """防靜默失效雙斷言：benchlock 有被嘗試取鎖並注入 collect；missing_caps 有被收集。"""
     core.ensure_realhw_importable()
@@ -432,6 +498,8 @@ def test_run_preflight_acquires_benchlock_and_collects_missing(monkeypatch, tmp_
     assert out["benchlock_fd"] is not None
 
 
+@pytest.mark.posix_only
+@pytest.mark.memory_only
 def test_run_preflight_closes_benchlock_on_collect_error(monkeypatch, tmp_path):
     core.ensure_realhw_importable()
     from realhw import preflight
@@ -450,6 +518,8 @@ def test_run_preflight_closes_benchlock_on_collect_error(monkeypatch, tmp_path):
     os.close(fd)
 
 
+@pytest.mark.posix_only
+@pytest.mark.memory_only
 def test_run_preflight_refuses_when_benchlock_held(monkeypatch, tmp_path):
     core.ensure_realhw_importable()
     from realhw import preflight

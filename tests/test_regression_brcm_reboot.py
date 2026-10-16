@@ -10,6 +10,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "regression"))
 
 from serialwrap_regression.cases import f09_brcm_reboot_login as case  # noqa: E402
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def _record(seq: int, direction: str, payload: bytes) -> dict:

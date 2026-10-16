@@ -8,6 +8,8 @@ import pytest
 from sw_core.rpc_win import TcpRpcServer, _parse_tcp
 from sw_core.client import rpc_call
 
+pytestmark = [pytest.mark.core_portable]
+
 
 @pytest.mark.parametrize("endpoint", [
     "tcp://0.0.0.0:48700",
@@ -15,6 +17,7 @@ from sw_core.client import rpc_call
     "tcp://10.0.0.1:48700",
     "tcp://[::]:48700",  # all-interfaces IPv6（正確方括號格式，非 loopback）
 ])
+@pytest.mark.memory_only
 def test_non_loopback_host_rejected(endpoint):
     """非 loopback host 應被 _parse_tcp 拒絕，避免 RPC server 對外暴露（Copilot review fix）。"""
     with pytest.raises(ValueError, match="loopback"):
@@ -26,6 +29,7 @@ def test_non_loopback_host_rejected(endpoint):
     ("tcp://localhost:48700", "localhost"),
     ("tcp://[::1]:48700", "::1"),  # IPv6 loopback 需方括號格式
 ])
+@pytest.mark.memory_only
 def test_loopback_host_accepted(endpoint, expected_host):
     """loopback host 應被 _parse_tcp 接受。"""
     host, port = _parse_tcp(endpoint)
@@ -33,6 +37,7 @@ def test_loopback_host_accepted(endpoint, expected_host):
     assert port == 48700
 
 
+@pytest.mark.process_rpc
 def test_tcp_rpc_round_trip():
     """TCP loopback JSON-RPC 來回測試：client 送 echo，server 回 {ok, got}。"""
     endpoint = "tcp://127.0.0.1:48721"

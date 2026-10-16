@@ -11,6 +11,9 @@ import time
 
 from sw_core.device_watcher import DeviceWatcher
 from sw_core.wal import WalWriter
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def test_wal_append_best_effort_on_write_error(tmp_path):

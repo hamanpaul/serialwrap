@@ -8,9 +8,12 @@ import stat
 import threading
 import time
 from pathlib import Path
+import pytest
 
 
 # ── #1a：CLI endpoint 解析會讀 config.yaml 的有效 socket ──────────────────────
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_resolve_endpoint_uses_config_socket_when_socket_not_overridden(tmp_path, monkeypatch):
     monkeypatch.setenv("SERIALWRAP_CONFIG_DIR", str(tmp_path))
     import importlib
@@ -31,6 +34,8 @@ def test_resolve_endpoint_uses_config_socket_when_socket_not_overridden(tmp_path
 
 
 # ── #1b：system unit ExecStart 帶 --profile-dir，且 install 會把 profiles 放到 /etc ──
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_system_exec_start_and_install_cover_profiles(tmp_path):
     from sw_core import setup_cmd as sc
     # #76：ExecStart 改由 _system_exec_start(home) 動態組（run-as-user pipx 路徑），
@@ -44,6 +49,8 @@ def test_system_exec_start_and_install_cover_profiles(tmp_path):
 
 
 # ── #2：system unit 設 UMask + socket group；rpc socket chmod 660 ─────────────
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_system_unit_has_umask_and_socket_group():
     from sw_core.systemd_units import render_system_unit
     text = render_system_unit(exec_start="/usr/local/bin/serialwrapd")
@@ -51,6 +58,8 @@ def test_system_unit_has_umask_and_socket_group():
     assert "Environment=SERIALWRAP_SOCKET_GROUP=dialout" in text
 
 
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
 def test_rpc_socket_is_chmod_660(tmp_path):
     from sw_core.rpc import JsonRpcUnixServer
     sock = str(tmp_path / "t.sock")
@@ -81,6 +90,8 @@ def test_rpc_socket_is_chmod_660(tmp_path):
 
 
 # ── #3/#5：minicom wrapper 不再硬編 /tmp socket，改走 CLI 解析（throwaway 隔離） ──
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_minicom_wrapper_no_hardcoded_tmp_socket():
     from importlib import resources
     text = (resources.files("sw_core.assets") / "tools" / "minicom_router.sh").read_text(encoding="utf-8")
@@ -90,6 +101,8 @@ def test_minicom_wrapper_no_hardcoded_tmp_socket():
 
 
 # ── #1c：setup 在 flash 進行中（未 force）須在「物化之前」中止 ───────────────────
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_setup_aborts_before_materialize_when_flashing(tmp_path, monkeypatch):
     monkeypatch.setenv("SERIALWRAP_CONFIG_DIR", str(tmp_path / "cfg"))
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
@@ -116,6 +129,8 @@ def test_setup_aborts_before_materialize_when_flashing(tmp_path, monkeypatch):
 
 
 # ── Copilot PR review：loginctl enable-linger 須帶使用者名稱（否則 linger 不生效） ──
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_enable_linger_includes_user(tmp_path, monkeypatch):
     monkeypatch.setenv("USER", "alice")
     monkeypatch.delenv("LOGNAME", raising=False)
@@ -129,6 +144,8 @@ def test_enable_linger_includes_user(tmp_path, monkeypatch):
     assert ["loginctl", "enable-linger"] not in fx.calls
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_enable_linger_skipped_when_no_user(tmp_path, monkeypatch):
     monkeypatch.delenv("USER", raising=False)
     monkeypatch.delenv("LOGNAME", raising=False)

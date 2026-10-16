@@ -8,8 +8,11 @@ from unittest import mock
 from sw_core.config import UartProfile
 from sw_core.uart_io import UARTBridge
 from sw_core.wal import WalWriter
+import pytest
 
 
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 def test_flashing_after_raw_snapshot_drops_input_instead_of_deferring(tmp_path: Path) -> None:
     bridge = UARTBridge(
         "COM0", "/dev/serial/by-id/fake", UartProfile(), WalWriter(wal_dir=str(tmp_path))

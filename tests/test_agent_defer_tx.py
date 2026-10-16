@@ -12,6 +12,9 @@ import unittest
 from sw_core.config import UartProfile
 from sw_core.uart_io import UARTBridge
 from sw_core.wal import WalWriter
+import pytest
+
+pytestmark = [pytest.mark.posix_only, pytest.mark.posix_pty, pytest.mark.process_rpc]
 
 
 class FakeTarget:

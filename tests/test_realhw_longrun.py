@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 from realhw.cases import longrun
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def test_analyze_counts_and_stuck_attached():

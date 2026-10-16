@@ -6,6 +6,8 @@ import pytest
 
 from sw_core import lock_win
 
+pytestmark = [pytest.mark.windows_native, pytest.mark.memory_only]
+
 
 def test_endpoint_alive_refuses(tmp_path, monkeypatch):
     """endpoint 可連時，acquire() 必須 raise DAEMON_ALREADY_RUNNING。"""
