@@ -627,14 +627,14 @@
 
 **Files**
 - Create: `tests/test_stage0_wal_rotate.py`
-- Modify: `sw_core/wal.py`、`sw_core/wal_fs.py`、`docs/rust-refactor/plans/rust-architecture.md` §5.8（rotate／reset 順序改為 flush→`sync()`→關閉舊 handle→rename→開新檔→`sync_dir`；rename 失敗時重開原路徑）
+- Modify: `sw_core/wal.py`、`sw_core/wal_fs.py`、`contracts/daemon_logging.yaml`、`docs/rust-refactor/plans/rust-architecture.md` §4.5／§5.8、`docs/rust-refactor/plans/06-slice21-daemon-core.md`（rotate／reset 順序改為 flush→`sync()`→關閉舊 handle→rename→下次寫入時開新檔→`sync_dir`；rename 失敗時重開原路徑）
 
 **Interfaces**
 - Consumes：T02 `WalFs`；T03 `WindowsWalFs`。
 - Produces（Python）：
   ```python
   def rename_noreplace_or_suffix(self, src: str, base_dst: str) -> str
-      # 依序嘗試 base_dst、base_dst+".1"、…、base_dst+".999"；第一個不存在者 os.rename(src, dst) 並回傳 dst；全部存在 → FileExistsError
+      # 依序嘗試 base_dst、base_dst+".1"、…、base_dst+".999"；優先用平台原子 no-replace；不支援時先 hard link 後 unlink，若 hard link 也不支援則確認目的地不存在後用 os.rename；全部名稱均占用 → FileExistsError
   WalWriter.reset(self) -> dict[str, Any]
       # {"ok": True, "previous_seq": int, "rotated_suffix": str}；rotated_suffix＝WAL 歸檔實際後綴（含 ".N"）；
       # 沒有 WAL 可歸檔時為 ts（與現況相同）
@@ -740,13 +740,20 @@
   | `test_rotate_threshold_is_ge_and_checked_before_write` | `rotate_bytes=R`，檔案大小恰為 `R` 時下一筆先 rotate；大小 `R-1` 時不 rotate（`WAL-D7`） |
   | `test_wal_and_mirror_rotate_independently` | mirror 小於門檻時只產生 WAL 歸檔 |
   | `test_reset_without_files_returns_ts_suffix` | 無檔案時 `rotated_suffix == "20261015-030617"` 且 `ok is True` |
-  | `test_reset_directory_missing_raises_and_keeps_seq` | `rmtree` 後 `reset()` 擲 `OSError`、`current_seq` 不變（盤點 04 §1.9） |
+| `test_reset_directory_missing_raises_and_keeps_seq`（`posix_only`） | `rmtree` 後 `reset()` 擲 `OSError`、`current_seq` 不變（盤點 04 §1.9；POSIX 目錄同步語意） |
   | `test_native_rotate_with_open_handle_succeeds`（`windows_native`） | Windows 上常駐 handle 存在時 rotate 產生歸檔、新檔 seq 連續 |
-  | `test_native_rotate_blocked_by_reader_degrades`（`windows_native`） | 另一 handle 以 `open(p,"rb")` 持有時 record 帶 `rotation_failed: true`、重開原路徑後寫入持續、無遺失 seq；reader 關閉後下一筆 rotate 成功 |
+| `test_native_rotate_blocked_by_reader_degrades`（`windows_native`） | 另一 handle 以 `open(p,"rb")` 持有時 record 帶 `rotation_failed: true`、重開原路徑後寫入持續、無遺失 seq；reader 關閉後下一筆新增恰一個 WAL 歸檔 |
+| `test_rotate_falls_back_when_atomic_rename_is_unsupported`（`posix_only`） | 原子 no-replace 回 `EINVAL` 時 rotate 仍建立歸檔及 `.1` 後綴，紀錄不帶 `rotation_failed` |
+| `test_reset_reports_suffix_when_atomic_rename_is_unsupported`（`posix_only`） | 原子 no-replace 回 `EINVAL` 且時間戳歸檔已存在時，reset 保留既有內容並回傳實際 `.1` 後綴 |
+| `test_rename_falls_back_when_hardlinks_are_unsupported`（`posix_only`） | hard link 不支援且目的地在檢查後出現時，不覆蓋既有歸檔，改用下一個後綴 |
 - [ ] **A2 執行並確認 FAIL**：`python3 -m pytest -q tests/test_stage0_wal_rotate.py` → 預期 `AttributeError: 'PosixWalFs' object has no attribute 'rename_noreplace_or_suffix'` 與 suffix 斷言失敗。commit：`test(wal): BC-01 rotate／reset 同步與 DF-03 後綴失敗測試`
-- [ ] **B1 實作**：依行為規格改 `_rotate_if_needed` 與 `reset`；`rename_noreplace_or_suffix` 放在 `PosixWalFs`（`WindowsWalFs` 繼承同一實作，Windows `os.rename` 本身不覆蓋，迴圈仍以 `os.path.exists` 預判並在 `FileExistsError` 時嘗試下一個）。
+- [ ] **B1 實作**：依行為規格改 `_rotate_if_needed` 與 `reset`；`rename_noreplace_or_suffix` 放在 `PosixWalFs`（`WindowsWalFs` 繼承同一實作，Windows `os.rename` 本身不覆蓋）。POSIX 優先使用原子 no-replace；syscall 回 `EINVAL`、`ENOSYS`、`EOPNOTSUPP` 或 `ENOTSUP` 時降級為 `os.link` 後 `os.unlink`；若 hard link 也失敗，目的地仍不存在才用 `os.rename`，若已存在則轉成 `FileExistsError` 讓迴圈嘗試下一個後綴。
 - [ ] **B2 執行並確認 PASS**：`python3 -m pytest -q tests/test_stage0_wal_rotate.py tests/test_wal_integrity.py tests/test_wal.py`；`scripts/stage0/win-pytest.sh tests/test_stage0_wal_rotate.py`。
-- **測試資產變更**：無。
+- **測試資產變更**（本次獨立審閱確認必要）：
+  - `tests/test_thread_survival.py::test_wal_rotation_failure_best_effort_does_not_kill_reader`：故障注入由 monkeypatch `os.replace` 改為注入 `WalFs.rename_noreplace_or_suffix`，因輪替改走檔案系統介面；保留原有存活與 `rotation_failed` 斷言。
+  - `tests/test_stage0_wal_rotate.py::test_reset_directory_missing_raises_and_keeps_seq` 改標 `posix_only`，保留原斷言；案例使用 `PosixWalFs`，且缺目錄錯誤依賴 POSIX 目錄同步語意。
+  - `tests/test_stage0_wal_rotate.py::test_native_rotate_blocked_by_reader_degrades` 比較阻擋前後的 WAL 歸檔集合，確認 reader 關閉後確實新增一個歸檔。
+  - 新增原子改名 syscall 不支援及 hard link 不支援時的 rotate／reset 降級測試，確認 DF-03 不覆蓋且 reset 回傳實際後綴。
 - [ ] **B3 commit**：`fix(wal): BC-01 rotate／reset 依規格先 sync 並關閉 handle 再改名重開，同名歸檔加數字後綴（DF-03）`
 
 ---

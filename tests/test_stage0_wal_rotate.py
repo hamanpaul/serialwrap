@@ -10,6 +10,7 @@ marker 規則（P0 T14）：
 """
 from __future__ import annotations
 
+import errno
 import importlib
 import json
 import os
@@ -79,6 +80,25 @@ def _make_ops_fs_cls():
     return OpsFs
 
 
+def _force_unsupported_atomic_rename(monkeypatch: pytest.MonkeyPatch, err_no: int) -> None:
+    """讓 POSIX 改名 syscall 回報指定錯誤，實際驗證相容降級路徑。"""
+    wal_fs_mod = importlib.import_module("sw_core.wal_fs")
+
+    class FailedRename:
+        argtypes: Any = None
+        restype: Any = None
+
+        def __call__(self, *_args: Any) -> int:
+            return -1
+
+    class FakeLibc:
+        renameat2 = FailedRename()
+        renamex_np = FailedRename()
+
+    monkeypatch.setattr(wal_fs_mod.ctypes, "CDLL", lambda *_args, **_kwargs: FakeLibc())
+    monkeypatch.setattr(wal_fs_mod.ctypes, "get_errno", lambda: err_no)
+
+
 @pytest.fixture
 def fixed_ts(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(wal_mod.time, "strftime", lambda fmt, t=None: "20261015-030617")
@@ -115,6 +135,94 @@ def test_same_second_rotations_get_numeric_suffix(tmp_path, fixed_ts):
     for n in names + ["raw.wal.ndjson"]:
         seqs += [json.loads(l)["seq"] for l in open(tmp_path / n, encoding="utf-8") if l.strip()]
     assert sorted(seqs) == list(range(1, 41))  # 無覆蓋、無遺失
+
+
+@pytest.mark.posix_only
+def test_rotate_falls_back_when_atomic_rename_is_unsupported(tmp_path, fixed_ts, monkeypatch):
+    _force_unsupported_atomic_rename(monkeypatch, errno.EINVAL)
+    OpsFs = _make_ops_fs_cls()
+    w = WalWriter(wal_dir=str(tmp_path), rotate_bytes=200, fs=OpsFs())
+    records = [
+        w.append(com="COM0", direction="RX", source="device", payload=b"y" * 40)
+        for _ in range(12)
+    ]
+
+    names = sorted(n for n in os.listdir(tmp_path) if n.startswith("raw.wal.ndjson."))
+    assert "raw.wal.ndjson.20261015-030617" in names
+    assert "raw.wal.ndjson.20261015-030617.1" in names
+    assert all("rotation_failed" not in rec for rec in records)
+
+
+@pytest.mark.posix_only
+def test_reset_reports_suffix_when_atomic_rename_is_unsupported(tmp_path, fixed_ts, monkeypatch):
+    _force_unsupported_atomic_rename(monkeypatch, errno.EINVAL)
+    OpsFs = _make_ops_fs_cls()
+    w = WalWriter(wal_dir=str(tmp_path), fs=OpsFs())
+    _fill(w, 2)
+    archive = tmp_path / "raw.wal.ndjson.20261015-030617"
+    archive.write_text("old\n", encoding="utf-8")
+
+    result = w.reset()
+
+    assert result == {"ok": True, "previous_seq": 2, "rotated_suffix": "20261015-030617.1"}
+    assert archive.read_text(encoding="utf-8") == "old\n"
+    assert (tmp_path / "raw.wal.ndjson.20261015-030617.1").exists()
+
+
+@pytest.mark.posix_only
+def test_rename_falls_back_when_hardlinks_are_unsupported(tmp_path, monkeypatch):
+    _force_unsupported_atomic_rename(monkeypatch, errno.ENOSYS)
+    (PosixWalFs,) = _load("sw_core.wal_fs", "PosixWalFs")
+    source = tmp_path / "raw.wal.ndjson"
+    base = tmp_path / "raw.wal.ndjson.20261015-030617"
+    source.write_text("new archive\n", encoding="utf-8")
+    original_exists = os.path.exists
+    created = False
+
+    def create_collision_after_probe(path):
+        nonlocal created
+        if os.fspath(path) == str(base) and not created:
+            created = True
+            base.write_text("external archive\n", encoding="utf-8")
+            return False
+        return original_exists(path)
+
+    def unsupported_link(src, dst):
+        raise OSError(errno.EOPNOTSUPP, "hardlinks unsupported", dst)
+
+    monkeypatch.setattr(os.path, "exists", create_collision_after_probe)
+    monkeypatch.setattr(os, "link", unsupported_link)
+
+    archived = PosixWalFs().rename_noreplace_or_suffix(str(source), str(base))
+
+    assert archived == f"{base}.1"
+    assert base.read_text(encoding="utf-8") == "external archive\n"
+    assert (tmp_path / "raw.wal.ndjson.20261015-030617.1").read_text(encoding="utf-8") == "new archive\n"
+
+
+@pytest.mark.core_portable
+def test_archive_created_after_existence_check_is_not_overwritten(tmp_path, monkeypatch):
+    (PosixWalFs,) = _load("sw_core.wal_fs", "PosixWalFs")
+    source = tmp_path / "raw.wal.ndjson"
+    base = tmp_path / "raw.wal.ndjson.20261015-030617"
+    source.write_text("new archive\n", encoding="utf-8")
+    real_exists = os.path.exists
+    injected = False
+
+    def create_collision_after_probe(path):
+        nonlocal injected
+        if os.fspath(path) == str(base) and not injected:
+            injected = True
+            base.write_text("external archive\n", encoding="utf-8")
+            return False
+        return real_exists(path)
+
+    monkeypatch.setattr(os.path, "exists", create_collision_after_probe)
+    archived = PosixWalFs().rename_noreplace_or_suffix(str(source), str(base))
+
+    assert archived == f"{base}.1"
+    assert base.read_text(encoding="utf-8") == "external archive\n"
+    assert (tmp_path / "raw.wal.ndjson.20261015-030617.1").read_text(encoding="utf-8") == "new archive\n"
 
 
 @pytest.mark.core_portable
@@ -210,7 +318,7 @@ def test_reset_without_files_returns_ts_suffix(tmp_path, fixed_ts):
     assert r == {"ok": True, "previous_seq": 0, "rotated_suffix": "20261015-030617"}
 
 
-@pytest.mark.core_portable
+@pytest.mark.posix_only
 def test_reset_directory_missing_raises_and_keeps_seq(tmp_path, fixed_ts):
     # rmtree 後 reset() 擲 OSError、current_seq 不變（盤點 04 §1.9）
     OpsFs = _make_ops_fs_cls()
@@ -242,6 +350,9 @@ def test_native_rotate_blocked_by_reader_degrades(tmp_path, fixed_ts):
     w = WalWriter(wal_dir=str(tmp_path), rotate_bytes=200, fs=WindowsWalFs())
     _fill(w, 5)
     wal_file = tmp_path / "raw.wal.ndjson"
+    before_archives = {
+        n for n in os.listdir(tmp_path) if n.startswith("raw.wal.ndjson.")
+    }
     with open(wal_file, "rb") as reader:
         rec = w.append(com="COM0", direction="RX", source="device", payload=b"block")
         assert rec.get("rotation_failed") is True
@@ -249,5 +360,8 @@ def test_native_rotate_blocked_by_reader_degrades(tmp_path, fixed_ts):
     rec2 = w.append(com="COM0", direction="RX", source="device", payload=b"unblock")
     assert "rotation_failed" not in rec2
     assert rec2["seq"] == 7
-    names = sorted(n for n in os.listdir(tmp_path) if n.startswith("raw.wal.ndjson."))
-    assert len(names) >= 1
+    after_archives = {
+        n for n in os.listdir(tmp_path) if n.startswith("raw.wal.ndjson.")
+    }
+    assert len(after_archives) == len(before_archives) + 1
+    assert len(after_archives - before_archives) == 1

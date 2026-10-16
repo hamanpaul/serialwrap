@@ -2,13 +2,101 @@
 
 from __future__ import annotations
 
+import ctypes
 import errno
 import io
 import os
+import sys
 from typing import TYPE_CHECKING, BinaryIO, Protocol
 
 if TYPE_CHECKING:
     from .win32_files import WinApi
+
+
+_UNSUPPORTED_RENAME_NOREPLACE_ERRNOS = {
+    errno.EINVAL,
+    errno.ENOSYS,
+    getattr(errno, "EOPNOTSUPP", -1),
+    getattr(errno, "ENOTSUP", -1),
+}
+
+
+def _rename_noreplace(src: str, dst: str) -> None:
+    """優先以原子 no-replace 改名；平台不支援時降級且保留既有目的檔。"""
+    if os.name == "nt":
+        os.rename(src, dst)
+        return
+
+    try:
+        _rename_noreplace_atomic(src, dst)
+        return
+    except OSError as exc:
+        if exc.errno not in _UNSUPPORTED_RENAME_NOREPLACE_ERRNOS:
+            raise
+
+    try:
+        os.link(src, dst)
+    except FileExistsError:
+        raise
+    except OSError:
+        if os.path.lexists(dst):
+            raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), dst)
+        os.rename(src, dst)
+        return
+
+    try:
+        os.unlink(src)
+    except OSError:
+        try:
+            os.unlink(dst)
+        except OSError:
+            pass
+        raise
+
+
+def _rename_noreplace_atomic(src: str, dst: str) -> None:
+    """呼叫作業系統提供的原子 no-replace 改名。"""
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform.startswith("linux"):
+        try:
+            rename = libc.renameat2
+        except AttributeError as exc:
+            raise OSError(
+                getattr(errno, "ENOTSUP", errno.EOPNOTSUPP),
+                "此 Linux libc 不支援原子 no-replace WAL 改名",
+                dst,
+            ) from exc
+        rename.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        rename.restype = ctypes.c_int
+        result = rename(-100, os.fsencode(src), -100, os.fsencode(dst), 1)
+    elif sys.platform == "darwin":
+        try:
+            rename = libc.renamex_np
+        except AttributeError as exc:
+            raise OSError(
+                getattr(errno, "ENOTSUP", errno.EOPNOTSUPP),
+                "此 macOS libc 不支援原子 no-replace WAL 改名",
+                dst,
+            ) from exc
+        rename.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
+        rename.restype = ctypes.c_int
+        result = rename(os.fsencode(src), os.fsencode(dst), 4)
+    else:
+        raise OSError(
+            getattr(errno, "ENOTSUP", errno.EOPNOTSUPP),
+            "此平台不支援原子 no-replace WAL 改名",
+            dst,
+        )
+
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), dst)
 
 
 class PartialWriteError(OSError):
@@ -115,7 +203,17 @@ class PosixWalFs:
             return None
 
     def rename_noreplace_or_suffix(self, src: str, base_dst: str) -> str:
-        raise NotImplementedError("WAL 歸檔命名由 T04 實作")
+        """以不覆蓋既有歸檔的方式改名，碰撞時依序附加數字後綴。"""
+        for suffix in range(1000):
+            dst = base_dst if suffix == 0 else f"{base_dst}.{suffix}"
+            if os.path.exists(dst):
+                continue
+            try:
+                _rename_noreplace(src, dst)
+            except FileExistsError:
+                continue
+            return dst
+        raise FileExistsError(errno.EEXIST, "無可用的 WAL 歸檔名稱", base_dst)
 
     def sync_dir(self, path: str) -> None:
         if os.name == "nt":
@@ -178,7 +276,7 @@ class WindowsWalFile:
         self._fp.close()
 
 
-class WindowsWalFs:
+class WindowsWalFs(PosixWalFs):
     """以 CreateFileW share-delete handle 實作 Windows WAL 檔案操作。"""
 
     def __init__(self, api: WinApi | None = None) -> None:
@@ -195,25 +293,6 @@ class WindowsWalFs:
         from . import win32_files
 
         return win32_files.path_identity(path, api=self._api)
-
-    def size(self, path: str) -> int | None:
-        try:
-            return os.stat(path).st_size
-        except FileNotFoundError:
-            return None
-
-    def rename_noreplace_or_suffix(self, src: str, base_dst: str) -> str:
-        for suffix in range(1000):
-            dst = base_dst if suffix == 0 else f"{base_dst}.{suffix}"
-            if os.path.exists(dst):
-                continue
-            try:
-                # Windows os.rename 不會覆蓋既有目標；競態下由 FileExistsError 重試。
-                os.rename(src, dst)
-            except FileExistsError:
-                continue
-            return dst
-        raise FileExistsError(errno.EEXIST, "無可用的 WAL 歸檔名稱", base_dst)
 
     def sync_dir(self, path: str) -> None:
         """Windows 沒有目錄 fsync 對應操作；rename 持久性依 NTFS journal。"""

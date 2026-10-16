@@ -919,7 +919,7 @@ changes:
   - id: "DF-03"
     kind: "DF"
     title: "WAL／mirror 歸檔同名不覆蓋"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-15"

@@ -103,7 +103,7 @@ class WalWriter:
         """檔案超過上限時輪替。回傳 True 表示輪替過程發生 OSError 已被 best-effort 含住（degrade）。
 
         輪替只是「限制檔案大小」的最佳化，不是資料平面必要步驟。原本此方法在 ``append`` 的 try
-        之外執行，rotation path 的 ``getsize``/``replace``/``open(dir)``/``fsync(dir)`` 因 EIO/權限/
+        之外執行，rotation path 的 ``fs.size``/``rename_noreplace_or_suffix``/``open(dir)``/``fsync(dir)`` 因 EIO/權限/
         fd 耗盡拋 OSError 會逃出 ``append`` → 殺死 RX reader thread（正是 #79 想避免的長壽 thread
         死亡，含 console fan-out 一併中止）。改為自身含住例外：失敗則告警並續用既有（可能超大的）
         檔案，遠優於殺 reader（#79 Codex 必修）。
@@ -123,8 +123,7 @@ class WalWriter:
                 if close_error is not None:
                     raise close_error
                 ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
-                dst = f"{path}.{ts}"
-                os.replace(path, dst)
+                self._fs.rename_noreplace_or_suffix(path, f"{path}.{ts}")
                 self._dirty_tail[which] = False
                 self._fs.sync_dir(os.path.dirname(path))
             except OSError as exc:
@@ -474,18 +473,21 @@ class WalWriter:
         with self._lock:
             prev_seq = self._seq
             ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+            rotated_suffix = ts
             for which, path in (("wal", self._wal_path), ("mirror", self._mirror_path)):
                 size = self._fs.size(path)
                 if size is not None and size > 0:
                     close_error = self._close_handle_locked(which, sync=True)
                     if close_error is not None:
                         raise close_error
-                    dst = f"{path}.{ts}"
-                    os.replace(path, dst)
+                    dst = self._fs.rename_noreplace_or_suffix(path, f"{path}.{ts}")
+                    if which == "wal":
+                        archive_prefix = f"{os.path.basename(self._wal_path)}."
+                        rotated_suffix = os.path.basename(dst)[len(archive_prefix):]
                     self._dirty_tail[which] = False
             self._fs.sync_dir(self._wal_dir)
             self._seq = 0
-            return {"ok": True, "previous_seq": prev_seq, "rotated_suffix": ts}
+            return {"ok": True, "previous_seq": prev_seq, "rotated_suffix": rotated_suffix}
 
     def _iter_matching(self, com: str | None) -> Iterator[dict[str, Any]]:
         """逐行掃**現行** WAL 檔（``raw.wal.ndjson``），產出通過解析與 com 過濾的紀錄（seq 為 int 才算有效）。

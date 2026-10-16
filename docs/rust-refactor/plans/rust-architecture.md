@@ -545,7 +545,7 @@ pub trait WalFs: Send + Sync {
     fn open_append(&self, path: &Path) -> PalResult<Box<dyn WalFile>>;
     fn path_identity(&self, path: &Path) -> PalResult<Option<FileIdentity>>;  // None = 不存在
     fn size(&self, path: &Path) -> PalResult<Option<u64>>;
-    fn rename_noreplace_or_suffix(&self, from: &Path, base_to: &Path) -> PalResult<PathBuf>; // DF-03：同名時加 .1 .2 …
+    fn rename_noreplace_or_suffix(&self, from: &Path, base_to: &Path) -> PalResult<PathBuf>; // DF-03：優先原子 no-replace；不支援時降級；同名加 .1 .2 …
     fn sync_dir(&self, dir: &Path) -> PalResult<()>;
     fn ensure_dir(&self, dir: &Path) -> PalResult<()>;
     fn dir_writable(&self, dir: &Path) -> bool;                               // os.access(W_OK|X_OK) 等價
@@ -869,9 +869,9 @@ TxWriter 的 job queue 容量 64；滿時 OpRunner 阻塞等待（只有 OpRunne
   4. 有界重試重開，最多 3 次，間隔 10／50／200 ms。
   5. 成功後先寫 META `WAL_RECREATED_AFTER_EXTERNAL_UNLINK`（§3.8），再寫原紀錄。
   6. 重開失敗時 `health.healthy=false`，fence 設 `wal_unhealthy=true`（停止自動 TX），記錄仍以 `loss_flag` 回傳。
-- **rotate／reset**：同一把鎖內依序 flush、`sync()`、rename（handle 仍開著，兩平台都可以，因為 handle 帶 share-delete），成功才關閉舊 handle 並開新檔，最後 `sync_dir`。
-  - rename 失敗時沿用舊 handle，該筆紀錄帶 `rotation_failed:true`。
-  - 同名歸檔加 `.N` 後綴（`DF-03`）。
+- **rotate／reset**：同一把鎖內依序 flush、`sync()`、關閉自身 handle、rename；成功後 `sync_dir`，下次寫入時再開啟現行路徑。reset 只輪替大小大於 0 的檔案，兩檔共用同一 UTC 時戳，目錄同步成功後才將 seq 歸零。
+  - rotate rename 失敗時，下一筆寫入會重開原路徑並繼續附加，該筆紀錄帶 `rotation_failed:true`。
+  - 同名歸檔加 `.N` 後綴（`DF-03`）；POSIX 優先使用原子 no-replace 改名，不支援時改以 hard link 後 unlink，若 hard link 也不支援則檢查目的地後降級為一般 rename；Windows 使用不覆蓋既有目的地的改名。
   - reset 用相同機制，條件 `> 0`，seq 歸 0。
 - **shutdown**：flush 加 sync 後關閉（`SC-11`）。
 - **啟動**：掃描現行檔，取最大合法 `seq`（與 Python 相同），並記下第一筆的 seq 作為 `file_first_seq`。
