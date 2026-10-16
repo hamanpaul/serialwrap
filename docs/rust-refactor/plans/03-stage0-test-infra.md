@@ -2,13 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 建立 Stage 0 的 L1.5／L2／L3 測試基礎，使 Python 基線與後續 Rust artifact 都能用同一批外部證據驗收：`tools/uart_stdio_bridge/`（獨立 Python bridge、POSIX PTY／Windows pySerial 端點、`bridge.v1` byte 證據、故障控制通道）、stdin/stdout DUT 模擬器（行為模型自 `FakeTarget` 抽離，Docker `-i` 與 `local-process` 兩種模式）、WAL↔wire 比較器與竄改拒絕、bridge 自測（Spike 4）、socat 接線 spike、`func-test` 外部 bridge 模式（保留 13 個 case）、§15.7.1 情境腳本、`tests/acceptance/cases.yaml` 承接清單（F1～F12 展開成 case ID 與切片歸屬）、pytest 資源報告與平台 SKIP 閘門（marker 標註屬 P0 T14）、L2／L3 Windows adapter（Telnet human frontend、版本 gate、bench lock、能力式 SKIP），以及 `realhw/acceptance/longrun_acceptance.yaml` 與外層 `release_gate_result` 判定器（保留 `engine_result`）。
+**Goal:** 建立 Stage 0 的 L1.5／L2／L3 測試基礎，使 Python 基線與後續 Rust artifact 都能用同一批外部證據驗收：`tools/uart_stdio_bridge/`（獨立 Python bridge、POSIX PTY／Windows pySerial 端點、`bridge.v1` byte 證據、故障控制通道）、stdin/stdout DUT 模擬器（行為模型自 `FakeTarget` 抽離，Docker `-i` 與 `local-process` 兩種模式）、WAL↔wire 比較器與竄改拒絕、bridge 自測（Spike 4）、socat 接線 spike、`func-test` 外部 bridge 模式（保留 13 個 case）、§15.7.1 情境腳本、`tests/acceptance/cases.yaml` 承接清單（F1～F12 展開成 case ID 與切片歸屬）、pytest 資源報告與平台 SKIP 閘門（marker 標註屬 P0 T14）、L2／L3 Windows adapter（Telnet human frontend、版本 gate、bench lock、能力式 SKIP），以及 `realhw/acceptance/longrun_acceptance.yaml` 與外層 `release_gate_result` 判定器（保留 `engine_result`）。OD-15（2026-10-16）另加：docker 優先驗證環境與兩容器拓樸（Task 17：假 COM PTY pair、systemd container、48 h docker 長跑與 >72 h Linux 監管 runner、`L1.5-docker` 證據標記），以及擁有者 Windows host 的 `windows-task` >72 h throwaway 排程與 Spike 1 剩餘項收尾（Task 18）；原生 Windows COM 證據改在擁有者 host 以 com0com pair `COM20`／`COM21` 實跑。
 
 **Architecture:** bridge、DUT 模擬器、比較器同屬 `tools/uart_stdio_bridge/` 的一個獨立 Python 發行單元（自有 `pyproject.toml`、自測、CI job），只用 stdlib＋Windows 端 `pyserial`，禁止 import `sw_core`、禁止共用產品判定邏輯（OD-07、§15.4.2）。bridge 只持有虛擬埠對端 B（POSIX：PTY master；Windows：COM-B 或實體 USB-UART 對端），以四個觀測位置（`serial_read`／`dut_stdin_write`／`dut_stdout_read`／`serial_write`）寫 `wire.ndjson`，故障控制走獨立 TCP loopback 控制通道與 DUT 控制檔目錄，絕不混入 UART byte stream（§15.3）。測試協調器仍是既有 `func-test/runner.py`（新增 `--mode bridge`），L2／L3 仍是既有 `regression/`、`realhw/` 引擎；`tests/acceptance/` 只放清單與 schema，不建新框架（§3.2）。長跑發版判定為引擎之外的獨立判定器，原樣保留引擎結果為 `engine_result`（OD-09、§15.11.4）。
 
 **Tech Stack:** Python 3.10+（bridge／DUT／比較器 runtime 只用 stdlib；開發測試需 3.11+ 以使用 `tomllib`，CI 用 3.12）、`pyserial==3.5`（僅 `sys_platform == "win32"`）、`pytest==9.0.3`、`PyYAML==6.0.3`、`jsonschema==4.10.3`（測試側）、socat 1.8（spike）、Docker 28（DUT image 以 `python:3.12-slim@sha256:7a8b4750…7a17` 固定，見 Task 6）、tmux＋minicom（Linux human frontend）、Windows Python 3.12（Windows adapter 的 L1，經 WSL interop 執行）。
 
-**Spec:** `docs/rust-refactor/serialwrap-rust-spec-final.md` §3.2、§8.3、§9.5、§11.1～§11.6、§13（Spike 4、7、8）、§14.2、§15.1～§15.12；`docs/rust-refactor/owner-decisions-2026-10-15.md` OD-01、OD-07、OD-08、OD-09、OD-10、OD-11、OD-13；`docs/rust-refactor/plans/00-master-plan.md`；`docs/rust-refactor/plans/rust-architecture.md` §9、§10；`docs/rust-refactor/plans/spec-reconciliation.md` §2.8（`TST-D-*`）、§2.10（`GAP-G-12`）；盤點 `docs/rust-refactor/inventory/08-tests-assets.md`（主要）、`04-wal-state.md` §1.3～§1.12、`06-uartio-console.md` §5、§8、`10-gaps.md` G-12。
+**Spec:** `docs/rust-refactor/serialwrap-rust-spec-final.md` §3.2、§8.3、§9.5、§11.1～§11.6、§13（Spike 4、7、8）、§14.2、§15.1～§15.12；`docs/rust-refactor/owner-decisions-2026-10-15.md` OD-01、OD-07、OD-08、OD-09、OD-10、OD-11、OD-13、OD-15；`docs/rust-refactor/plans/00-master-plan.md`；`docs/rust-refactor/plans/rust-architecture.md` §9、§10；`docs/rust-refactor/plans/spec-reconciliation.md` §2.8（`TST-D-*`）、§2.10（`GAP-G-12`）；盤點 `docs/rust-refactor/inventory/08-tests-assets.md`（主要）、`04-wal-state.md` §1.3～§1.12、`06-uartio-console.md` §5、§8、`10-gaps.md` G-12。
 
 ---
 
@@ -23,6 +23,8 @@
 | `contracts/release_manifest.schema.json`、`contracts/golden/tree_sha256.ndjson`、`sw_core/release_manifest.package_tree_sha256()` 語意 | P1 T18 | `identity.tree_sha256` 以 golden 對拍；manifest `artifacts.daemon.package_tree_sha256` 與 P1 同範圍 | Task 2、Task 10 的對應測試保持紅燈 |
 | BC-01～BC-05、SC-04、SC-07 的 Python 實作已合併 | P1（`02-stage0-python-bc.md`） | §15.7.1 情境的「預期 PASS」以修正後 Python 為準 | Task 11 的情境照常交付；對 Python 執行時若因 BC 未合併而失敗，報告標 `dependency_blocked:<BC-ID>`，不得標 PASS 或 SKIP |
 | F12／`p0-wal-live` oracle 修訂（`TST-D-7`） | P1 | 本計畫**不**修改 `f12_diagnostics.py`、`realhw/cases/p0.py` 的 WAL oracle；只在 `cases.yaml` 登記其新 oracle 與證據檔 | — |
+| P1 全部＋P1-OC（`02b-stage0-owner-confirmations.md`）已合併（修正後 Python 基線） | P1、P1-OC | Task 17 的 48 h docker 長跑與 >72 h Linux 監管 runner 只對修正後 Python 基線啟動 | `run-longrun.sh`／`run-supervision.sh` 拒絕啟動（Task 17 測試），其餘 Task 照常 |
+| OD-15 Spike 1 基本資格（擁有者 host：com0com 3.0.0.0 簽章 zip md5 `a07aa80024cca837dacc75d3573285ff` 與 SourceForge 一致、Authenticode Valid（CyberCircuits，COMODO timestamp）、Windows 10.0.26200、HVCI 執行中、Secure Boot 關閉；pair `CNCA0=COM20`（serialwrap／受測端）／`CNCB0=COM21`（bridge 端）；256-byte 全值域 A→B 相等、B→A 正常、COM20 第二次開啟被拒（`ERROR_ACCESS_DENIED`）、關閉後可重開；證據在擁有者 host 的 `b-log` 下 `rust-refactor/spike1/`） | OD-15 | 原生 Windows COM 測試與 gate（Task 3、5、6、8、10、11、13、18）在擁有者 host 以 `SW_TEST_COM_PAIR=COM20:COM21` 實跑 | 擁有者 host 不可用時記「證據不足」；Spike 1 剩餘三項（控制線隔離、Console-side pair、peer-close）未實測前不得預標 PASS |
 
 **分支**：`wt/rust-refactor/p2-test-infra`，PR base 為 `feature/rust-refactor`（repo CLAUDE.md：base 為 `feature/*` 時來源須為同 slug 的 `wt/<slug>/<subtask>`）。不得 commit 到 `main`。
 
@@ -30,7 +32,7 @@
 
 - Sequential A/B 執行器（§15.9.1 五步驟）屬 P9（`10-stage3-canary.md`）；本計畫只提供它所需的證據、比較器與 manifest 欄位。
 - `release-manifest.json` 的建置（`scripts/rust/mkbundle.sh`）屬 P3；本計畫只在 L1.5 `manifest.json` 收集受測 artifact 身分，並對 Python 基線以 arch §10.1 的 `tree_sha256` 演算法計算部署程式碼摘要。
-- Windows WAL／端點防毒（Spike 3）、`windows-task`（Spike 2）的可執行驗證屬 P1／P4；本計畫只在 `cases.yaml` 登記其 case ID 與證據需求。
+- Windows WAL／端點防毒（Spike 3）、`windows-task`（Spike 2）的可執行驗證屬 P1／P4；本計畫只在 `cases.yaml` 登記其 case ID 與證據需求。例外（OD-15）：`windows-task` >72 h 監管的 throwaway 排程程序與腳本由本計畫 Task 18 交付（P4 Task 18 消費），因 Linux docker 無法承載 Task Scheduler。
 - 不修改產品程式碼（`sw_core/**`、`serialwrapd.py`、`serialwrap`）。若測試揭露產品缺陷，依 §15.10 先判定最低足夠層級，另開 issue，不在本 Phase 修。
 
 ---
@@ -45,6 +47,9 @@
 - RPC／CLI `error_code` 與 session `last_error` 為兩個獨立命名空間（ADR-07、§9.3）；`CREDENTIALS_UNRESOLVED` 只屬後者。測試工具新增的 `HARNESS_*` 原因碼屬測試工具契約，不得混入產品錯誤碼目錄（§11.4）。
 - CLI JSON 以 `json.dumps(..., ensure_ascii=False, separators=(",", ":"))` 等價輸出；`state.json`／WAL 以 `sort_keys=True`。本計畫的證據檔（`wire.ndjson`、`control.ndjson`、`correlation.ndjson`）比照 WAL：`sort_keys=True`、緊湊分隔、行尾 `\n`。
 - Windows RPC 預設 `tcp://127.0.0.1:48700`；信任範圍＝整機本機使用者（OD-12）。bridge 控制通道同樣綁 `127.0.0.1`，並以隨機 token 檔（權限 0600）限制誤用，文件不得宣稱「同使用者隔離」。
+- **OD-15 docker 優先**：新版 serialwrap（修正後 Python 基線與每個 Rust 候選）一律先在 docker 驗證（Task 17）。docker 拓樸證據屬 L1.5（§11.1／§15.3），報告必帶 `evidence_layer: "L1.5-docker"`，**不得**計為真板 L2、實機 L3 或 OD-10 bench 長跑；Stage 0 證據索引對掛在 L2／L3／bench 項目上的 docker 報告判 FAIL（Task 17）。`physical_uart` 類測試在 docker 內以假 COM（socat PTY pair）執行時，pytest marker 不改，資源報告另記 `uart_kind: "pty-fake"`，不滿足真實 `physical_uart` 證據。
+- **OD-15 原生 Windows COM**：擁有者 host 已通過 Spike 1 基本資格（§0 前置表）。原生 COM 測試與 gate 一律在該 host 以 `SW_TEST_COM_PAIR=COM20:COM21`（COM20＝serialwrap／受測端、COM21＝bridge／測試端）執行；受測 daemon 一律為 OD-11 隔離實例（`SERIALWRAP_STATE_DIR`／`_RUN_DIR`／`_CONFIG_DIR` 三者明確設定且非預設）＋`SERIALWRAP_TEST_DEVICE_ALLOWLIST=COM20`。由 orchestrator 經 WSL interop 代跑（Codex 沙箱可能擋 `/mnt/c`），報告附 Windows build、HVCI 狀態與 pair 對應，並寫 `evidence_layer: "native-windows"`；只有擁有者 host 不可用時才記「證據不足」。Spike 1 剩餘三項（控制線隔離、Console-side pair、peer-close 語意）由 Task 18 實測，結果未知前不得預標 PASS。
+- **OD-15 唯讀 RPC**：需比對 §9.4 欄位時，可對擁有者 host 的正式 daemon 只送唯讀方法（白名單同 `--retries` 的 11 個：`health.ping`、`health.status`、`session.list`、`session.get_state`、`session.activity`、`session.console_list`、`session.log_status`、`device.list`、`alias.list`、`mcu.patterns`、`mcu.status`）；任何有副作用方法一律只對隔離實例或 docker。
 - repo 政策：不得 commit 到 `main`；每個 code PR 附 `changelog.d/<slug>.md` fragment（無對應 issue 時檔名不帶 issue 號，比照 `changelog.d/setup-preserve-remote-socket-path.md`）；commit 用 Conventional Commits 繁中 subject，含 `Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>` trailer；完成前跑 `python3 -m pytest -q tests/` 與 `python3 -m policy_check --repo .`。
 
 ## Review Focus
@@ -54,6 +59,7 @@
 3. **Binary 保真與背壓**：不 decode、不換行轉換、不 echo；短讀與部分寫入記錄實際接受長度；有界佇列只背壓、不靜默丟資料；結果不明的寫入記不確定區間並讓本次驗證失效（§15.4.3、§15.6.2）。
 4. **分母保護**：`tests/acceptance/cases.lock.json` 凍結切片必要集合、13 個 func-test case 的 ID／目的／oracle 保留、未結案命令留在分母、門檻 `frozen_at` 必須早於 run 起點（§11.3、§14.2、§15.11.4）。
 5. **平台誠實**：Windows 能力不足者以登記的 capability SKIP（`reason_code=cap_missing:<cap>`），不得以 Linux 結果、記憶體 fake 或 socket 冒充 `windows_com`；com0com peer close 不得記為 `transport_disconnect`（§11.2、§15.8.3）。
+6. **證據層級不混用（OD-15）**：`L1.5-docker` 與 `host-throwaway` 報告不得滿足 L2／L3／bench 項目；throwaway 排程工作不得觸碰正式 `serialwrap` 工作與預設目錄（Task 17、18）。
 
 ---
 
@@ -61,12 +67,12 @@
 
 比照 P0（`01-stage0-contracts.md`「執行順序」）與 P3（`04-stage1a-rust-cli.md` §1），本 Phase **逐 Task** 執行 red→green，不採「先批次寫完全部紅燈」：批次紅燈會讓後段 Task 的失敗原因變成前段尚未實作的 `ModuleNotFoundError`，紅燈沒有鑑別力，且 `tests/` 下頂層 import 不存在模組會使整個 `pytest -q tests/` collection error、遮蔽既有測試。
 
-1. **執行順序**：Task 1 → **Task 9** → Task 2 → 3 → 4 → 5 → 6 → 7 → 8 → 10 → 11 → 12 → 13 → 14 → 15 → 16。Task 16（OD-09 凍結工具）只依賴 Task 12、15，屬 Stage 0 交付，不得延到後續 Phase（R4-F2）。Task 9（socat 接線 spike）只依賴 Task 1 的套件骨架，依 §15.4.1「先做 socat 接線 spike，再建 Python 正式 bridge」排在 bridge 實作（Task 2～5）之前；spike 結果（`raw_roundtrip`、`no_echo`、`eof_on_child_exit`）任一為 False 時停止並回報，不得開始 Task 3／5。編號保留以利引用。
+1. **執行順序**：Task 1 → **Task 9** → Task 2 → 3 → 4 → 5 → 6 → 7 → 8 → 10 → 11 → 12 → 13 → 14 → 15 → 16 → 17 → 18。Task 17（docker 驗證環境，OD-15）依賴 Task 4、6、10、12、15；Task 18（Windows host throwaway 監管與 Spike 1 收尾，OD-15）依賴 Task 3、8、12、15。Task 16（OD-09 凍結工具）只依賴 Task 12、15，屬 Stage 0 交付，不得延到後續 Phase（R4-F2）。Task 9（socat 接線 spike）只依賴 Task 1 的套件骨架，依 §15.4.1「先做 socat 接線 spike，再建 Python 正式 bridge」排在 bridge 實作（Task 2～5）之前；spike 結果（`raw_roundtrip`、`no_echo`、`eof_on_child_exit`）任一為 False 時停止並回報，不得開始 Task 3／5。編號保留以利引用。
 2. **每個 Task**：測試作者完成 T 步驟（撰寫失敗測試、執行並確認 FAIL、commit 測試）→ 實作者完成 I 步驟（實作、確認 PASS、commit 實作）→ 才開始下一個 Task。T 步驟的紅燈必須是本 Task 契約的語意失敗（前段 Task 已實作），不是任意的 `ModuleNotFoundError`。每個 Task 的 Interfaces 段落是測試與實作之間的固定契約，測試作者只依 Interfaces 撰寫，不得窺探或預寫實作。
 3. **`tests/` 下的新測試檔**：建立時即依 P0 T14 規則帶 `pytestmark`；對本 Task 尚未實作的模組一律在**函式內** import（P0 慣例），不得在模組頂層 import，確保 T 步驟期間 `python3 -m pytest -q tests/` 仍可完整收集。T 步驟 commit 只在 phase 分支上，不開 PR。
 4. **I 步驟的綠燈範圍**：只要求「本 Task 測試＋已完成 Task 的測試＋既有測試」全綠；`tools/uart_stdio_bridge/tests` 與 `tests/` 的整套全綠在 §3 收尾驗收。I 步驟**不得新增測試**；驗收所需測試一律屬於該 Task 的 T 步驟。
 5. 實作者不得修改該 Task 的測試檔來遷就實作；發現測試本身錯誤時，停下並交回測試作者修正（§10.4「測試工具變更需獨立審閱」），修正以獨立 commit `test(...)` 記錄。func-test case YAML 的 oracle 修復（Task 10）屬測試資產變更：修復前先保存 pre-repair 基線輸出，修復以獨立 commit 提交並由非實作者審閱。
-6. **雙審**：高風險 Task（3、5、7、8、10、14、15、16）在該 Task I 步驟完成後立即雙審（sonnet max＋codex gpt-6.1-sol medium；審查者不得為該 Task 實作者），修正後才進下一個 Task；其餘 Task 於 Phase 收尾一併雙審。全部 Task 綠燈後跑整體驗收（§3）、修正、開 PR。
+6. **雙審**：高風險 Task（3、5、7、8、10、14、15、16、17、18）在該 Task I 步驟完成後立即雙審（sonnet max＋codex gpt-6.1-sol medium；審查者不得為該 Task 實作者），修正後才進下一個 Task；其餘 Task 於 Phase 收尾一併雙審。全部 Task 綠燈後跑整體驗收（§3）、修正、開 PR。
 
 **模型分工**（`00-master-plan.md` §2；測試作者 ≠ 實作者；並行／平台／I/O 狀態機與 Telnet parser 由 `codex-gpt-6-luna-max` 實作；DUT 模擬器與 bridge 周邊工具依 master §2 由 agy 實作）：
 
@@ -88,6 +94,8 @@
 | 14 | L2／L3 平台 adapter（pin＋版本 gate、PID／RSS、bench lock、能力式 SKIP、Telnet frontend、worker 存活事件） | haiku-xhigh | codex-gpt-6-luna-max |
 | 15 | `longrun_acceptance.yaml`、外層 `release_gate_result` 判定器、觀測器 | codex-gpt-6-luna-max | haiku-xhigh |
 | 16 | OD-09 延後項凍結工具與候選長跑開跑登記（延後項唯一寫入者） | codex-gpt-6-luna-max | haiku-xhigh |
+| 17 | docker 驗證環境與兩容器拓樸（OD-15；測試審核 agy-gemini-3.8-flash-high） | haiku-xhigh | codex-gpt-6-luna-max |
+| 18 | Windows host 監管 >72 h throwaway 排程與 Spike 1 收尾（OD-15；測試審核 haiku-xhigh） | agy-gemini-3.8-flash-high | codex-gpt-6-luna-max |
 
 **測試指令（全 Phase 共用）**
 
@@ -142,6 +150,9 @@ reliability/serialwrap_reliability/{core,testbed_loader}.py                # Tas
 realhw/acceptance/{__init__,longrun_acceptance.yaml,longrun_acceptance.schema.json,gate.py,observer.py,walscan.py,winexcl.py}  # Task 15
 realhw/acceptance/{od09_freeze.py,candidate_longrun_starts.ndjson}  tests/{test_od09_freeze,test_longrun_gate_frozen,fakes_od09}.py  # Task 16
 docs/rust-refactor/owner-decisions-addenda.md  docs/rust-refactor/procedures/od09-deferred-freeze.md  # Task 16
+tools/docker/{serialwrap,dut-sim,systemd}.Dockerfile  tools/docker/compose.l15.yaml  tools/docker/fake_uart.sh  # Task 17（OD-15）
+scripts/docker/{run-l15,run-systemd,run-longrun,run-supervision}.sh  tests/acceptance/evidence_labels.py  tests/test_docker_l15.py  tests/test_evidence_labels.py  # Task 17
+scripts/stage0/win-task-throwaway.ps1  realhw/acceptance/spike1_remaining.py  realhw/acceptance/spike1_report.schema.json  tests/test_win_task_throwaway.py  tests/test_spike1_remaining.py  # Task 18（OD-15）
 realhw/procedures/p2-1-mcu-flash.md                                      # Task 12
 .github/workflows/tests.yml                                              # Task 1（bridge job）、Task 13（`pytest-windows` job、自架 Windows COM job）
 docs/regression-plugin.md  func-test/README.md                           # Task 10、12、14（R-18 文件同步）
@@ -524,9 +535,10 @@ def test_data_record_exact_bytes():
 
 **Test author model:** haiku-xhigh　**Implementer model:** codex-gpt-6-luna-max
 **Changelog fragment:** `changelog.d/rust-p2-bridge-endpoints.md`（`type: feat`、`scope: test-infra`）
-**BLOCKED-OWNER evidence:**
-- `WinSerialEndpoint` 對真實 COM 的 `test_cap_windows_com__*` 測試（需 OD-08 自架 runner：Spike 1 通過時的 com0com DUT-side pair，或實體 USB-UART 直連 Windows；以 `SW_TEST_COM_PAIR=COMa:COMb` 提供）。本環境只能以注入的 fake `serial` 模組驗 adapter 邏輯，**不得**計為 `windows_com`。
-- com0com 關閉 COM-B 時 COM-A 的實際行為（決定 `transport_disconnect` 能力是否成立，§15.8.3）。
+**BLOCKED-OWNER evidence:** 無（OD-15 起改為可執行 gate）。
+**擁有者 host 可執行 gate（OD-15，G1）：**
+- `WinSerialEndpoint` 對真實 COM 的 `test_cap_windows_com__*` 測試：在擁有者 host 以 `SW_TEST_COM_PAIR=COM20:COM21` 經 WSL interop 原生執行（`scripts/stage0/win-pytest.sh -m windows_com tools/uart_stdio_bridge/tests`）；Linux 與 hosted CI 只以注入的 fake `serial` 模組驗 adapter 邏輯，**不得**計為 `windows_com`。擁有者 host 不可用時記「證據不足」。
+- com0com 關閉 COM-B 時 COM-A 的實際行為（決定 `transport_disconnect` 能力是否成立，§15.8.3）：屬 Spike 1 剩餘項「peer-close 語意」，由 Task 18 `spike1_remaining.py peer-close` 實測；結果寫回本 Task 的能力表前，`transport_disconnect` 在 Windows 維持未宣告。
 
 **Files:**
 - Create: `tools/uart_stdio_bridge/src/uart_stdio_bridge/endpoints/{__init__.py,base.py,posix_pty.py,win_serial.py}`
@@ -849,8 +861,8 @@ def test_model_matches_faketarget_golden(name):
 
 **Test author model:** agy-gemini-3.8-flash-high　**Implementer model:** codex-gpt-6-luna-max
 **Changelog fragment:** `changelog.d/rust-p2-bridge-core.md`（`type: feat`、`scope: test-infra`）
-**BLOCKED-OWNER evidence:**
-- Windows 上 `run --endpoint win-serial` 對真實 COM pair 的端到端證據（OD-08）。本環境可在 Windows host 經 interop 跑 `local-process` DUT＋fake endpoint 的單元測試，但不得計為原生 serial gate。
+**BLOCKED-OWNER evidence:** 無（OD-15 起改為可執行 gate）。
+**擁有者 host 可執行 gate（OD-15，G2）：** Windows 上 `run --endpoint win-serial --com COM21` 對 com0com pair 的端到端證據（OD-08）：bridge 開 COM21、受測端（pySerial 測試程式或 OD-11 隔離實例 daemon＋allowlist `COM20`）開 COM20，經 interop 原生執行，報告附 Windows build／HVCI／pair 對應。`local-process` DUT＋fake endpoint 的單元測試仍不得計為原生 serial gate。
 
 **Files:**
 - Create: `tools/uart_stdio_bridge/src/uart_stdio_bridge/bridge/{__init__.py,bytequeue.py,dut_process.py,pumps.py,control.py,core.py}`
@@ -1055,8 +1067,8 @@ def test_roundtrip_full_byte_range_all_four_observations(bridge_proc):
 
 **Test author model:** haiku-xhigh　**Implementer model:** agy-gemini-3.8-flash-high
 **Changelog fragment:** `changelog.d/rust-p2-dut-docker.md`（`type: feat`、`scope: test-infra`）
-**BLOCKED-OWNER evidence:**
-- Windows runner 上 `local-process` 模式的端到端執行（需 OD-08 COM pair）。`local-process` 只證明功能案例共用，不得宣告 Docker 拓樸通過（§15.7.2）。
+**BLOCKED-OWNER evidence:** 無（OD-15 起改為可執行 gate）。
+**擁有者 host 可執行 gate（OD-15，G3）：** Windows 上 `local-process` 模式的端到端執行，以 `SW_TEST_COM_PAIR=COM20:COM21` 在擁有者 host 原生執行。`local-process` 只證明功能案例共用，不得宣告 Docker 拓樸通過（§15.7.2）；docker 兩容器拓樸另由 Task 17 交付。
 
 **Files:**
 - Create: `tools/uart_stdio_bridge/docker/Dockerfile.dut`、`tools/uart_stdio_bridge/scripts/build_dut_image.sh`、`tools/uart_stdio_bridge/src/uart_stdio_bridge/bridge/dut_modes.py`
@@ -1288,8 +1300,8 @@ def test_content_difference_is_fail_with_first_diff(tmp_path):
 
 **Test author model:** codex-gpt-6-luna-max　**Implementer model:** agy-gemini-3.8-flash-high
 **Changelog fragment:** `changelog.d/rust-p2-bridge-selftest.md`（`type: feat`、`scope: test-infra`）
-**BLOCKED-OWNER evidence:**
-- `selftest --endpoint win-serial --com-pair COMa:COMb` 在擁有者 Windows 自架 runner 的 PASS 報告（OD-08；Spike 1 通過用 com0com DUT-side pair，否則實體 USB-UART）。沒有此報告前，Windows bridge 只能當接線工具，不得作 gate 證據（§13 Spike 4）。
+**BLOCKED-OWNER evidence:** 無（OD-15 起改為可執行 gate）。
+**擁有者 host 可執行 gate（OD-15，G4）：** `selftest --endpoint win-serial --com-pair COM20:COM21` 在擁有者 host（Spike 1 基本資格已通過的 com0com DUT-side pair）經 interop 原生執行，`verdict=="PASS"` 的報告登錄於 `stage0_evidence_index.yaml`（`S0-BRIDGE-SELFTEST-WIN`）。沒有此報告前，Windows bridge 只能當接線工具，不得作 gate 證據（§13 Spike 4）；報告若含 FAIL 項，依 §15.4.3 停止，不得以 Linux 自測替代。
 
 **Files:**
 - Create: `tools/uart_stdio_bridge/src/uart_stdio_bridge/selftest/{__init__.py,checks.py,runner.py}`、`tools/uart_stdio_bridge/APPROVED_REVISION.json`
@@ -1421,8 +1433,9 @@ def is_qualified(report: dict[str, Any], *, endpoint: str, tool_tree_sha256: str
 **Test author model:** agy-gemini-3.8-flash-high　**Implementer model:** 10A haiku-xhigh（case YAML／oracle 修復、`HarnessConfig`／env 隔離、`artifact_identity`、README、`tools/docker/*`）；10B codex-gpt-6-luna-max（`bridge_session`、`correlation`、settle／quiesce／checkpoint 迴圈、`TelnetClientCodec`／`TelnetConsole`、runner bridge 模式與 Windows endpoint 接線）。10A 先做，10B 依賴 10A 的 `HarnessConfig`。
 **Changelog fragment:** `changelog.d/rust-p2-functest-bridge-mode.md`（`type: feat`、`scope: func-test`）
 **BLOCKED-OWNER evidence:**
-- Windows 原生：Python daemon（Windows）＋`WinSerialEndpoint`（com0com DUT-side pair 或實體 USB-UART，OD-08）上依下方「Windows 接線契約」執行 13 個 case 的 bridge 模式與 `win-com-*` 三個情境（Task 11、Task 12 登記）。本環境只能以 fake-os 單元測試驗接線邏輯、以 fake Telnet server 驗 client codec。
-- 實體傳輸替代模式（OD-08 C）的 manifest 與逐案例承接紀錄。
+- 實體傳輸替代模式（OD-08 C）的 manifest 與逐案例承接紀錄（只在 com0com 路徑失效時才需要；OD-15 Spike 1 基本資格已通過，預設不執行）。
+
+**擁有者 host 可執行 gate（OD-15，G5）：** Windows 原生：Python daemon（Windows，OD-11 隔離實例＋`SERIALWRAP_TEST_DEVICE_ALLOWLIST=COM20`）＋`WinSerialEndpoint`（bridge 開 COM21）依下方「Windows 接線契約」執行 13 個 case 的 bridge 模式與 `win-com-*` 三個情境（Task 11、Task 12 登記），經 interop 在擁有者 host 原生執行。Linux 上只以 fake-os 單元測試驗接線邏輯、以 fake Telnet server 驗 client codec，不得計為 Windows 原生結果。
 
 **Files:**
 - Modify: `func-test/runner.py`、`func-test/lib/daemon_harness.py`、`func-test/lib/cli_client.py`、`func-test/lib/console_client.py`、`func-test/lib/yaml_loader.py`、`func-test/README.md`
@@ -1708,9 +1721,10 @@ def test_harness_isolates_nine_dirs_and_strips_all_serialwrap(monkeypatch, tmp_p
 
 **Test author model:** haiku-xhigh　**Implementer model:** agy-gemini-3.8-flash-high
 **Changelog fragment:** `changelog.d/rust-p2-l15-scenarios.md`（`type: feat`、`scope: func-test`）
-**BLOCKED-OWNER evidence:**
-- 同一組情境在 Windows（COM pair，Task 10「Windows 接線契約」）上的執行結果；`l15-transport-disconnect` 在 com0com 上只有 peer close 能力時須登記 SKIP（`cap_missing:transport_disconnect`），不得 PASS；`assert_peer_closed` 在 Windows 為 `cap_missing:peer_state`。
-- 三個 `win-com-*` 情境在擁有者 Windows 自架 runner（OD-08）的實跑結果。
+**BLOCKED-OWNER evidence:** 無（OD-15 起改為可執行 gate）。
+**擁有者 host 可執行 gate（OD-15，G6）：**
+- 同一組情境在 Windows（`SW_TEST_COM_PAIR=COM20:COM21`，Task 10「Windows 接線契約」）上的執行結果；`l15-transport-disconnect` 在 com0com 上只有 peer close 能力時須登記 SKIP（`cap_missing:transport_disconnect`），不得 PASS；`assert_peer_closed` 在 Windows 為 `cap_missing:peer_state`，直到 Task 18 peer-close 實測結果寫回能力表。
+- 三個 `win-com-*` 情境在擁有者 host 的實跑結果（orchestrator 經 interop 代跑；自架 GitHub runner 註冊與否不影響本 gate）。
 
 **Files:**
 - Create（15 個 L1.5 情境）：`func-test/scenarios/l15-delayed-reply.yaml`、`l15-half-prompt.yaml`、`l15-dut-silent.yaml`、`l15-slow-reader-backpressure.yaml`、`l15-dut-reboot-port-alive.yaml`、`l15-transport-disconnect.yaml`、`l15-multi-source-contention-cli.yaml`、`l15-multi-source-contention-console.yaml`、`l15-stale-event-delay.yaml`、`l15-wal-interference.yaml`、`l15-reject-zero-tx.yaml`、`l15-release-inflight.yaml`、`l15-exclusive-open.yaml`、`l15-reboot-min-guard.yaml`、`l15-context-switch-deferred-input.yaml`
@@ -1986,7 +2000,7 @@ cases:
 
 `cases.schema.json` 是承接清單欄位的**單一權威**：下游切片（P5～P8）新增案例一律以本 schema 欄位登記進 `cases.yaml`（P8 依 09 Task 1 以「只增不改」擴充 `suite`／`family` 列舉）；切片自有的清單檔（如 P6 `slice22.yaml`）不得另定欄位名，需改用本 schema 欄位或只作為 `cases.yaml` 的引用索引（下游同步項，見交付回報）。
 
-**Stage 0 證據索引（§15.12）**：`stage0_evidence_index.yaml`（`schema_version: 1`、`stage: "0"`、`items:[{id, requirement, spec_ref, case_ids, artifact_path, sha256|null, status: present|missing|blocked_owner, owner}]`）逐項列出 Stage 0 出口所需證據（每個 `stage0_required` case 的 evidence、bridge 自測報告與 `APPROVED_REVISION.json`、兩平台 48 h 基線 `release-gate.json`、OD-09 凍結 revision、§4 BLOCKED-OWNER 各項）。`check_evidence_index.py --stage 0 [--root DIR]`：驗 schema、每個 `present` 項的檔案存在且 sha256 相符、每個 `stage0_required` case 至少被一項引用；任何 `missing`／`blocked_owner` → exit 5（BLOCKED），不得 exit 0。Stage 1～3 的索引由 P3／P4／P9 以同一 schema 新增 `stage1a_evidence_index.yaml` 等檔，checker 以 `--stage` 選擇。
+**Stage 0 證據索引（§15.12）**：`stage0_evidence_index.yaml`（`schema_version: 1`、`stage: "0"`、`items:[{id, requirement, spec_ref, case_ids, artifact_path, sha256|null, status: present|missing|blocked_owner, owner}]`）逐項列出 Stage 0 出口所需證據（每個 `stage0_required` case 的 evidence、bridge 自測報告與 `APPROVED_REVISION.json`、兩平台 48 h 基線 `release-gate.json`、OD-09 凍結 revision、§4 BLOCKED-OWNER 各項）。`check_evidence_index.py --stage 0 [--root DIR]`：驗 schema、每個 `present` 項的檔案存在且 sha256 相符、每個 `stage0_required` case 至少被一項引用；任何 `missing`／`blocked_owner` → exit 5（BLOCKED），不得 exit 0。Stage 1～3 的索引由 P3／P4／P9 以同一 schema 新增 `stage1a_evidence_index.yaml` 等檔，checker 以 `--stage` 選擇。OD-15 證據層級：Task 17 為每個 item 加 `required_layer`（`L1` 或 `evidence_layer` 封閉集合 `L1.5-local`／`L1.5-docker`／`host-throwaway`／`native-windows`／`L2-bench`／`L3-bench`／`hw-bench` 之一）並讓 checker 讀被引用報告的 `evidence_layer`：`L1.5-docker` 或 `host-throwaway` 報告掛在 `required_layer ∈ {L2-bench, L3-bench, hw-bench}` 的項目 → 該項違規（exit 5，訊息 `evidence_layer_mismatch`）；docker／throwaway runner 產出的報告缺 `evidence_layer` → `evidence_layer_missing`（fail-closed）；docker 長跑與監管結果以獨立 item（`S0-L15-DOCKER-48H-LINUX`、`S0-L15-DOCKER-SUPERVISION-72H`）登錄，不併入 `S0-L3-BASELINE-*`。
 
 **承接清單內容（全部 117 筆；`daemon_slice` 依 §11.6，跨切片者事先明列）**
 
@@ -2208,7 +2222,8 @@ def test_lock_never_shrinks():
 **Test author model:** agy-gemini-3.8-flash-high　**Implementer model:** haiku-xhigh
 **Changelog fragment:** `changelog.d/rust-p2-pytest-resource-report.md`（`type: feat`、`scope: tests`）
 **BLOCKED-OWNER evidence:**
-- 自架 Windows COM runner（OD-08）註冊與 `windows-com-selfhosted` job 的實跑結果（需擁有者在 runner 上安裝 GitHub Actions runner 並加 label `serialwrap-com`）。hosted `windows-latest` 的 `pytest-windows` job 在 PR CI 可取得，不屬 BLOCKED。
+- 自架 Windows COM runner（OD-08）註冊與 `windows-com-selfhosted` job 的 CI 實跑結果（需擁有者在 runner 上安裝 GitHub Actions runner 並加 label `serialwrap-com`）。hosted `windows-latest` 的 `pytest-windows` job 在 PR CI 可取得，不屬 BLOCKED。
+- OD-15：同一組 `windows_com` 步驟（`selftest --endpoint win-serial`、`-m windows_com`、`win-com-*`）不必等 runner 註冊，可由 orchestrator 在擁有者 host 以 `SW_TEST_COM_PAIR=COM20:COM21` 經 interop 直接執行（gate G4～G6）；runner 只影響 CI 自動化，不影響證據可得性。
 
 **範圍（依 P0 T14「本 Task 是 marker 註冊、檔內標註與稽核的唯一 owner；P2 只保留報告」）**：本 Task **不**建立 `tests/platform_resources.yaml`、**不**在 `pytest_collection_modifyitems` 依檔名套 marker、**不**註冊 marker、**不**另訂分類規則；marker 一律讀檔內 `pytestmark`（P0 T14 規則），P1 T01 的平台自動 skip hook 保持原樣。本 Task 與 P0／P1 的 hook 合併在 `tests/conftest.py` 的**同一個** `pytest_collection_modifyitems`／`pytest_sessionfinish` 定義內（不得出現第二個同名 hook 定義）。
 
@@ -2341,6 +2356,7 @@ def judge(report: Mapping, required: Sequence[str], *, platform: str, junit: Map
 - Linux live bench：以 pinned `serialwrap_exe` 執行 `testpilot run serialwrap_regression`（非破壞集合）、`python3 -m realhw --tier p0,p1`、`testpilot run serialwrap_reliability` 的報告（bench 互斥、真板）。
 - Windows bench（Spike 7）：Telnet frontend 下的 F5、`p0-console-raw`、`p1-con-*`、`lr-mixed` 實跑；Windows 共用 bench lock 與其他 TestPilot 套件實際共鎖的證據；Windows RSS 觀測值。
 - 破壞性案例（F9、F10、`p1-rst-*`、`p1-ho-*`、`p1-hp-*`）的授權執行。
+- OD-15：上列 bench 執行前，同一組 regression／realhw 非破壞集合先以 Task 17 `scripts/docker/run-l15.sh realhw-p0p1`、`run-l15.sh regression-nondestructive` 在 docker 兩容器拓樸跑過（報告 `evidence_layer: "L1.5-docker"`）；docker 結果只作前置篩檢，不計為真板 L2／實機 L3。
 
 **Files:**
 - Create: `realhw/frontends.py`、`realhw/procobs.py`
@@ -2557,6 +2573,7 @@ def test_telnet_frontend_send_line_and_capture(fake_telnet_server, stub_sw):
 - Linux 與 Windows 各一次修正後 Python 48 h `lr-mixed` 基線（OD-10：擁有者 bench、依序、同機同板經 usbipd、不可並行），含 `observer.ndjson`、WAL 目錄複本、`release-gate.json`（`mode=baseline`）；Windows 另含 `excl/probes.ndjson`＋`excl/handoff.ndjson`（winexcl 原生 COM 獨占證據，R1-F7；真 `CreateFileW` 行為只能在擁有者 Windows bench 取得）。
 - OD-09 延後凍結項（`resources`、`min_effective_load`、`comparison_uncertainty`）的數值：須在上述基線完成後、任何 Rust 候選長跑前由擁有者裁決，並以本 Phase Task 16 `python3 -m realhw.acceptance.od09_freeze freeze` 寫入 `longrun_acceptance.yaml`（新 revision，`frozen_at` 早於候選 run；不得手改）——屬正式 Stage 0 出口條件（§12.2 Stage 0 列），不依賴後續 Phase。在此之前所有 candidate 判定必為 `BLOCKED`。
 - `lr-mixed` 故障保留：長跑實例的外部監管自動重啟須關閉或以等價措施稽核（§15.11.2，Spike 8）——由擁有者在 bench 上設定並記錄。
+- OD-15：P1（含 P1-OC）合併、修正後 Python 基線就緒後，另以 Task 17 `scripts/docker/run-longrun.sh --hours 48` 在 docker 兩容器拓樸執行 48 h `lr-mixed`（假 COM），本 Task 的 `gate.py` 照常判定，但報告為 `evidence_layer: "L1.5-docker"`：可提早揭露缺陷，**不得**取代上列 bench 基線（B8）或作為 OD-09 凍結依據（B9 只吃 bench 基線）。
 
 **Files:**
 - Create: `realhw/acceptance/__init__.py`、`realhw/acceptance/longrun_acceptance.yaml`、`realhw/acceptance/longrun_acceptance.schema.json`、`realhw/acceptance/gate.py`、`realhw/acceptance/observer.py`、`realhw/acceptance/walscan.py`、`realhw/acceptance/winexcl.py`（Windows 原生 COM 獨占開啟證據，R1-F7）、`realhw/acceptance/README.md`（含 48 h 基線執行程序：啟 observer →（Windows）`winexcl handoff --phase pre` → 啟 realhw longrun →（Windows）`winexcl handoff --phase post` → 結束後複製 WAL → 執行 gate）
@@ -3244,6 +3261,199 @@ def test_register_candidate_refused_before_freeze(tmp_path):
 
 ---
 
+## Task 17：docker 驗證環境與兩容器拓樸（OD-15）
+
+**Test author model:** haiku-xhigh　**Test reviewer:** agy-gemini-3.8-flash-high　**Implementer model:** codex-gpt-6-luna-max（容器內 PTY pair、systemd PID 1、長跑 runner 的行程與資源隔離）
+**Changelog fragment:** `changelog.d/rust-p2-docker-verification.md`（`type: feat`、`scope: test-infra`）：新增 docker 優先驗證環境：假 COM（PTY pair）兩容器拓樸、systemd container、48 h 長跑與 >72 h 監管 runner，報告一律標示 L1.5-docker。
+**BLOCKED-OWNER evidence:** 無（docker 在本環境可用）。真板 L2／實機 L3／OD-10 bench 長跑（B4、B5、B8）**不因本 Task 解除**。
+
+**範圍（OD-15 (3)(4)(5)(6)(7)）：**
+1. 兩容器拓樸：`serialwrap` 容器（Python 基線或掛入的 Rust bundle）⇄ `bridge`（`tools/uart_stdio_bridge` 於 `serialwrap` 容器內作為獨立行程，持 PTY 對端）⇄ `dut-sim` 容器（Task 4／6 的 DUT 模擬器 image，以 `-i` 無 `-t` stdin/stdout 接 bridge）。假 COM 以 `socat -d -d pty,raw,echo=0,link=/run/sw-fake/by-id/usb-fake-<n> pty,raw,echo=0,link=/run/sw-fake/peer-<n>` 建 PTY pair，`SERIALWRAP_BY_ID_DIR=/run/sw-fake/by-id`（只含假 by-id）。
+2. `physical_uart` 類測試在容器內以假 COM 執行：pytest marker 不改（P0 T14 擁有），Task 13 資源報告另記 `uart_kind: "pty-fake"`；`l1_judge`／證據索引不得把 `pty-fake` 視為真實 `physical_uart` 證據。
+3. systemd container：systemd 為 PID 1，啟用 user lingering 跑 `systemd-user` 模式（另一個 compose profile 跑 `systemd-system`）；驗 journald 收到 daemon stderr、SC-23 autostart hold drop-in（`Restart=no`、`RefuseManualStart=yes`）以 `systemctl show` 驗證、SC-12 reconcile 先停舊再起新。新版 serialwrap 一律先在此驗證（OD-15 (4)）。
+4. 長跑：`run-longrun.sh --hours 48`（P1＋P1-OC 合併後才可啟動）；`run-supervision.sh --hours 72`（Linux 監管 >72 h，與 48 h 長跑並行，不同 compose project、volume、網路；監管模式 `systemd-user` 與 `systemd-system` 各一）。
+5. 證據標記：`evidence_layer` 取自封閉集合 `{"L1.5-local", "L1.5-docker", "host-throwaway", "native-windows", "L2-bench", "L3-bench", "hw-bench"}`（與 P9 共用，只增不改）；docker／throwaway runner 產出的報告**必須**寫 `evidence_layer` 與 `producer`（fail-closed：缺鍵即拒收）。每份 docker 報告寫 `evidence_layer: "L1.5-docker"`、`producer`、`topology: "docker-2c"`、`uart_kind`、`image_digests`（三個 image 的 `sha256:` digest）、`bundle_tree_sha256`（Rust 候選；Python 基線為 `package_tree_sha256`）；`check_evidence_index.py` 依 `required_layer` 拒收（Task 12 段落）。
+
+**Files:**
+- Create: `tools/docker/serialwrap.Dockerfile`（`python:3.12-slim@sha256:<與 Task 6 同 digest>`＋socat、`pip install` repo；Rust bundle 以唯讀 bind mount `/opt/sw-bundle`）、`tools/docker/dut-sim.Dockerfile`（若 Task 6 `tools/uart_stdio_bridge/docker/Dockerfile.dut` 已滿足則為指向它的薄包裝，不重複定義）、`tools/docker/systemd.Dockerfile`（`debian:12-slim@sha256:<固定>`＋`systemd`、`dbus-user-session`，`STOPSIGNAL SIGRTMIN+3`）、`tools/docker/compose.l15.yaml`（services：`serialwrap`、`dut-sim`；profiles：`systemd-user`、`systemd-system`）、`tools/docker/fake_uart.sh`（建立／清除 PTY pair 與 sandbox by-id）
+- Create: `scripts/docker/run-l15.sh <suite> [--dry-run] [--bundle DIR]`（suite：`pytest-physical-uart`、`func-test-bridge`、`realhw-p0p1`、`regression-nondestructive`）、`scripts/docker/run-systemd.sh [--mode systemd-user|systemd-system] [--dry-run]`、`scripts/docker/run-longrun.sh --hours N [--dry-run]`、`scripts/docker/run-supervision.sh --hours N --mode … [--dry-run]`
+- Create: `tests/acceptance/evidence_labels.py`（`LAYERS`、`label_report(report: dict, **fields) -> dict`、`assert_not_real_board(report: dict) -> None`、`layer_satisfies(report_layer: str, required_layer: str) -> bool`）
+- Modify: `tests/acceptance/evidence_index.schema.json`（item 新增必填 `required_layer`，列舉＝`LAYERS ∪ {"L1"}`；既有 item 依性質補值）、`tests/acceptance/check_evidence_index.py`（讀 `present` 項報告 JSON：先 `validate_report_layer`（缺鍵 → `evidence_layer_missing`、未知值 → `evidence_layer_unknown`），再 `layer_satisfies` 與 `assert_not_real_board`，不符 → 違規 `evidence_layer_mismatch`；`required_layer: L1` 的項目改由 Task 13 `l1_judge` 判定）、`tests/acceptance/stage0_evidence_index.yaml`（新增 `S0-L15-DOCKER-48H-LINUX`（`required_layer: L1.5-docker`）、`S0-L15-DOCKER-SUPERVISION-72H`、`S0-L15-DOCKER-SYSTEMD`，初始 `missing`）、`tests/resource_report_plugin.py`（Task 13；報告加 `uart_kind`，未設 `SW_UART_KIND` 時為 `"native"`）
+- Create: `tests/test_docker_l15.py`（`core_portable`＋`memory_only`；呼叫 `--dry-run` 子程序者改標 `process_rpc`；真跑 docker 者另標 `docker` 資源 marker 並以 `cap:docker` 能力式 SKIP）、`tests/test_evidence_labels.py`（`core_portable`＋`memory_only`）
+
+**Interfaces — Produces：**
+
+```python
+# tests/acceptance/evidence_labels.py（只 import stdlib；不得 import sw_core）
+LAYERS: frozenset[str] = frozenset({"L1.5-local", "L1.5-docker", "host-throwaway", "native-windows",
+                                    "L2-bench", "L3-bench", "hw-bench"})   # evidence_layer 封閉集合（與 P9 共用，只增不改）
+REAL_LAYERS: frozenset[str] = frozenset({"L2-bench", "L3-bench", "hw-bench"})
+FAIL_CLOSED_PRODUCERS: frozenset[str] = frozenset({"run-l15.sh", "run-systemd.sh", "run-longrun.sh",
+                                                   "run-supervision.sh", "win-task-throwaway.ps1"})
+def label_report(report: dict, *, evidence_layer: str, producer: str, topology: str, uart_kind: str,
+                 image_digests: dict[str, str] | None = None, tree_sha256: str | None = None) -> dict
+    # 回傳新 dict（含 evidence_layer、producer）；evidence_layer 不在 LAYERS → ValueError；不覆寫既有 evidence_layer（不同值 → ValueError）
+def validate_report_layer(report: dict) -> str
+    # fail-closed：report["producer"] ∈ FAIL_CLOSED_PRODUCERS 而缺 evidence_layer → ValueError("evidence_layer_missing")；
+    # evidence_layer 存在但不在 LAYERS → ValueError("evidence_layer_unknown")；回傳 evidence_layer
+def layer_satisfies(report_layer: str, required_layer: str) -> bool
+    # 相等 → True；required ∈ REAL_LAYERS 時只有相等才 True；required == "L1.5-local" 時 "L1.5-docker" 亦 True；其餘 False
+def assert_not_real_board(report: dict, required_layer: str) -> None
+    # report["evidence_layer"] ∈ {"L1.5-docker","host-throwaway"} 且 required_layer ∈ REAL_LAYERS → AssertionError；
+    # 另 report 含 counts_as 且與 REAL_LAYERS 相交時同樣 AssertionError
+```
+
+`evidence_index.schema.json` 的 `required_layer` 列舉＝`LAYERS ∪ {"L1"}`（`L1` 項目由 Task 13 `l1_judge` 判定，不讀 `evidence_layer`）。
+
+`scripts/docker/*.sh --dry-run`：只印出將執行的 `docker compose …`／`docker run …`／容器內 pytest 指令（一行一個，`+ ` 前綴），exit 0，不呼叫 docker。
+
+### T 步驟
+
+- [ ] **T17-1：撰寫失敗測試**。`tests/test_evidence_labels.py`：
+
+```python
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+
+
+def _el():
+    from tests.acceptance import evidence_labels   # 函式內 import（§1 第 3 條）
+    return evidence_labels
+
+
+def test_layers_exact_closed_set():
+    el = _el()
+    assert el.LAYERS == frozenset({"L1.5-local", "L1.5-docker", "host-throwaway", "native-windows",
+                                   "L2-bench", "L3-bench", "hw-bench"})
+    assert el.REAL_LAYERS == frozenset({"L2-bench", "L3-bench", "hw-bench"})
+
+
+def test_docker_layer_never_satisfies_real_board():
+    el = _el()
+    for real in ("L2-bench", "L3-bench", "hw-bench"):
+        assert el.layer_satisfies("L1.5-docker", real) is False
+        assert el.layer_satisfies("host-throwaway", real) is False
+    assert el.layer_satisfies("L1.5-docker", "L1.5-local") is True
+    assert el.layer_satisfies("L2-bench", "L2-bench") is True
+
+
+def test_label_report_rejects_unknown_and_conflicting_layer():
+    el = _el()
+    with pytest.raises(ValueError):
+        el.label_report({}, evidence_layer="L1.5", producer="run-l15.sh", topology="docker-2c", uart_kind="pty-fake")
+    with pytest.raises(ValueError):
+        el.label_report({"evidence_layer": "L2-bench"}, evidence_layer="L1.5-docker", producer="run-l15.sh",
+                        topology="docker-2c", uart_kind="pty-fake")
+    r = el.label_report({"x": 1}, evidence_layer="L1.5-docker", producer="run-l15.sh", topology="docker-2c",
+                        uart_kind="pty-fake", image_digests={"serialwrap": "sha256:" + "a" * 64})
+    assert r["evidence_layer"] == "L1.5-docker" and r["producer"] == "run-l15.sh"
+    assert r["topology"] == "docker-2c" and r["uart_kind"] == "pty-fake"
+
+
+def test_fail_closed_missing_layer_for_docker_and_throwaway_producers():
+    el = _el()
+    for producer in ("run-l15.sh", "run-systemd.sh", "run-longrun.sh", "run-supervision.sh", "win-task-throwaway.ps1"):
+        with pytest.raises(ValueError, match="evidence_layer_missing"):
+            el.validate_report_layer({"producer": producer})
+    with pytest.raises(ValueError, match="evidence_layer_unknown"):
+        el.validate_report_layer({"producer": "run-l15.sh", "evidence_layer": "L2"})
+    assert el.validate_report_layer({"producer": "run-l15.sh", "evidence_layer": "L1.5-docker"}) == "L1.5-docker"
+
+
+def test_assert_not_real_board():
+    el = _el()
+    for real in ("L2-bench", "L3-bench", "hw-bench"):
+        for layer in ("L1.5-docker", "host-throwaway"):
+            with pytest.raises(AssertionError):
+                el.assert_not_real_board({"evidence_layer": layer}, real)
+    with pytest.raises(AssertionError):
+        el.assert_not_real_board({"evidence_layer": "L1.5-docker", "counts_as": ["L2-bench"]}, "L1.5-docker")
+    el.assert_not_real_board({"evidence_layer": "L1.5-docker", "counts_as": ["L1.5-local"]}, "L1.5-docker")
+```
+
+`tests/test_docker_l15.py` 關鍵案例（表列者皆須實作，斷言逐字）：
+
+| 測試 | 斷言 |
+|---|---|
+| `test_compose_two_app_containers` | `yaml.safe_load(compose.l15.yaml)["services"]` 的預設（無 profile）服務集合恰為 `{"serialwrap", "dut-sim"}`；`dut-sim` 的 `stdin_open is True` 且 `tty` 不存在或為 `False`（§15.7.2 `-i` 無 `-t`）；`dut-sim.network_mode == "none"` |
+| `test_compose_no_real_serial_devices` | 所有服務的 `devices`、`volumes` 字串都不含 `/dev/ttyUSB`、`/dev/ttyACM`、`/dev/serial`；`privileged` 不存在或為 `False`（systemd profile 例外只允許 `cgroup: host` 與 `/sys/fs/cgroup` 掛載） |
+| `test_run_l15_dry_run_uses_sandbox_by_id` | `bash scripts/docker/run-l15.sh pytest-physical-uart --dry-run` 的 stdout 含 `SERIALWRAP_BY_ID_DIR=/run/sw-fake/by-id` 與 `SW_UART_KIND=pty-fake`，且不含 `/dev/serial/by-id` |
+| `test_run_l15_dry_run_labels_report` | 同上 stdout 含 `--evidence-layer L1.5-docker`（runner 收尾以 `label_report` 寫報告） |
+| `test_run_systemd_dry_run_asserts_dropin` | `run-systemd.sh --mode systemd-user --dry-run` stdout 含 `systemctl --user show serialwrap -p Restart -p RefuseManualStart` 與期望字串 `Restart=no`、`RefuseManualStart=yes`，以及 `journalctl --user -u serialwrap -o cat` |
+| `test_longrun_and_supervision_isolated` | `run-longrun.sh --hours 48 --dry-run` 與 `run-supervision.sh --hours 72 --mode systemd-user --dry-run` 的 `-p <project>` 不同、所有 `-v <volume>:` 名稱集合交集為空 |
+| `test_longrun_refuses_before_p1` | 以 `SW_BC_PATH` 指向 tmp 的 `behavior_changes.yaml` 副本（BC-01 `status: APPROVED`）執行 `run-longrun.sh --hours 48 --dry-run` → exit 3，stderr 含 `P1 未合併：BC-01 非 IMPLEMENTED` |
+| `test_evidence_index_rejects_docker_for_l2` | 合成 index：item `required_layer: L2-bench`、`status: present`、引用報告 `{"producer": "run-l15.sh", "evidence_layer": "L1.5-docker"}`（sha256 相符）→ `check_evidence_index.py --stage 0 --root <tmp>` exit 5，stdout 含 `evidence_layer_mismatch`；同法對 `L3-bench`、`hw-bench` 與 `host-throwaway` 報告逐一 exit 5 |
+| `test_evidence_index_fail_closed_missing_layer` | 合成 index：item `required_layer: L1.5-docker`、引用報告 `{"producer": "run-longrun.sh"}`（無 `evidence_layer`）→ exit 5，stdout 含 `evidence_layer_missing` |
+| `test_evidence_index_requires_required_layer` | 合成 index 缺 `required_layer` → schema 驗證失敗（exit 2） |
+| `test_resource_report_uart_kind` | `SW_UART_KIND=pty-fake` 下 `resource_report_plugin` 產出的報告 `uart_kind == "pty-fake"`；未設時 `"native"` |
+| `test_docker_smoke_two_container`（`docker` marker；`cap:docker` 缺時能力式 SKIP，`reason_code=cap_missing:docker`） | `run-l15.sh func-test-bridge --case sm-01-attach-to-ready` 真跑：報告 `evidence_layer == "L1.5-docker"`、`topology == "docker-2c"`、`len(image_digests) == 3`、案例 PASS |
+
+- [ ] **T17-2：執行並確認 FAIL**：`python3 -m pytest -q tests/test_evidence_labels.py tests/test_docker_l15.py` → `ModuleNotFoundError: tests.acceptance.evidence_labels`（函式內）、compose／runner 檔不存在。
+- [ ] **T17-3：commit 測試**：`git commit -m "test(test-infra): 新增 OD-15 docker 驗證環境與證據層級標記的失敗測試"`。
+
+### I 步驟
+
+- [ ] **I17-1：實作** 依 Files／Interfaces；`fake_uart.sh` 在容器 entrypoint 建立 PTY pair 並等待 `link` 出現（上限 5 s）；`run-l15.sh` 收尾以 `python3 -c 'from tests.acceptance.evidence_labels import label_report …'` 寫 `l15-docker-report.json`；`run-longrun.sh` 啟動前讀 `behavior_changes.yaml`（或 `SW_BC_PATH`）確認 BC-01～BC-05 皆 `IMPLEMENTED`；長跑與監管 runner 只輸出到 `--out` 指定目錄（預設 `b-log/rust-refactor/p2/docker-<run_id>`，相對 HOME）。
+- [ ] **I17-2：執行並確認 PASS**：上列兩檔＋Task 12、13 測試全綠；本環境有 docker 時 `test_docker_smoke_two_container` 必須真跑 PASS（不得 SKIP 交差）；`python3 -m pytest -q tests/` 無新失敗。
+- [ ] **I17-3：commit**：`git commit -m "feat(test-infra): 新增 docker 兩容器 L1.5 拓樸、systemd container 與長跑／監管 runner（OD-15）"`＋fragment。
+
+---
+
+## Task 18：Windows host 監管 >72h throwaway 排程與 Spike 1 收尾（OD-15）
+
+**Test author model:** agy-gemini-3.8-flash-high　**Test reviewer:** haiku-xhigh　**Implementer model:** codex-gpt-6-luna-max（Windows 排程工作、行程與 COM 控制線）
+**Changelog fragment:** `changelog.d/rust-p2-win-throwaway-spike1.md`（`type: feat`、`scope: test-infra`）：新增 Windows host 的隔離 throwaway 排程工作程序（windows-task >72 h 監管驗證）與 Spike 1 剩餘項（控制線隔離、Console-side pair、peer-close）實測工具。
+**BLOCKED-OWNER evidence:** Console-side pair 需擁有者在 host 另建第二組 com0com pair（OD-01 選配）；未建立時該項報告 `NOT_RUN`（不得 PASS）。其餘項目可在擁有者 host 由 orchestrator 經 interop 執行（G7、G8）。
+
+**範圍（OD-15 (1)(7)）：**
+1. `windows-task` >72 h 監管驗證不能在 Linux docker 執行，改在擁有者 Windows host 以**隔離名稱與目錄的 throwaway 排程工作**執行：工作名 `serialwrap-throwaway-<run_id>`（`run_id` 符合 `^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$`）；`SERIALWRAP_STATE_DIR`／`_RUN_DIR`／`_CONFIG_DIR`／`_WAL_DIR`／`_LOG_DIR` 全指向 `%LOCALAPPDATA%\sw-throwaway\<run_id>\…`；daemon 為 OD-11 隔離實例＋`SERIALWRAP_TEST_DEVICE_ALLOWLIST=COM20`；RPC endpoint 用該 run 專屬 TCP port（不得為 48700）；不得建立、修改或停用正式 `serialwrap` 工作；`ExecutionTimeLimit=PT0S`、登入自啟、失敗自動重啟同 OD-03。報告 `evidence_layer: "host-throwaway"`（不計為正式工作站 `windows-task` 證據；P4 Task 18 Spike 2 消費本程序）。
+2. Spike 1 剩餘三項（P1 T21 `realhw/procedures/stage0-spike1-win-vcom.md` 的未完成段落）：(a) 控制線隔離：COM20 設 RTS／DTR 時 COM21 依 com0com 預設接線只看到對應 CTS／DSR／DCD 變化，不外洩到其他 pair；(b) Console-side pair（OD-01 選配）：第二組 pair 開啟／獨占／關閉語意與 DUT-side 相同；(c) peer-close 語意：COM21 關閉時 COM20 的讀（回 0 byte／逾時）與寫（成功或錯誤碼）實際行為，寫回 Task 3 能力表（`transport_disconnect` 是否成立）。結果只記實測值，三項各 `PASS|FAIL|NOT_RUN`。
+
+**Files:**
+- Create: `scripts/stage0/win-task-throwaway.ps1`（`-RunId <id> -Hours <n> -Bundle <win path> [-Cleanup] [-WhatIf]`；`-WhatIf` 只輸出將註冊的 Task XML 與 env 到 stdout，不呼叫 `schtasks`）、`realhw/acceptance/spike1_remaining.py`（`python -m realhw.acceptance.spike1_remaining <control-lines|console-pair|peer-close> --pair COM20:COM21 [--console-pair COMx:COMy] --out DIR`；只在 Windows 原生 Python 執行，Linux 只跑純函式）、`realhw/acceptance/spike1_report.schema.json`、`realhw/procedures/stage0-win-task-throwaway.md`（執行與清除程序）
+- Modify: `realhw/procedures/stage0-spike1-win-vcom.md`（P1 T21 產出；只追加「剩餘項執行」段落與 OD-15 基本資格結果引用，不改既有步驟）、`tests/acceptance/stage0_evidence_index.yaml`（新增 `S0-SPIKE1-REMAINING`、`S0-WIN-TASK-THROWAWAY-72H`（`required_layer: host-throwaway`），初始 `missing`）
+- Create: `tests/test_win_task_throwaway.py`、`tests/test_spike1_remaining.py`（模組層 `core_portable`＋`memory_only`；原生實測函式另標 `windows_native`＋`windows_com`，`SW_TEST_COM_PAIR` 未設時能力式 SKIP）
+
+**Interfaces — Produces：**
+
+```python
+# realhw/acceptance/spike1_remaining.py（只 import stdlib；Windows 原生路徑才 import serial）
+ITEMS: tuple[str, ...] = ("control_lines", "console_pair", "peer_close")
+VERDICTS: tuple[str, ...] = ("PASS", "FAIL", "NOT_RUN")
+def build_report(results: dict[str, dict], *, host: dict, pair: str, console_pair: str | None) -> dict
+    # host 必含 windows_build、hvci_running、secure_boot、com0com_version；ITEMS 缺項自動補 {"verdict":"NOT_RUN"}
+def throwaway_task_name(run_id: str) -> str        # "serialwrap-throwaway-" + run_id；run_id 格式不符 → ValueError
+def throwaway_env(run_id: str, localappdata: str) -> dict[str, str]
+    # 五個 SERIALWRAP_*_DIR 皆在 <localappdata>\sw-throwaway\<run_id>\ 之下、SERIALWRAP_TEST_DEVICE_ALLOWLIST="COM20"、SERIALWRAP_SOCKET 為 tcp://127.0.0.1:<port≠48700>
+```
+
+### T 步驟
+
+- [ ] **T18-1：撰寫失敗測試**。`tests/test_win_task_throwaway.py`、`tests/test_spike1_remaining.py`：
+
+| 測試 | 斷言 |
+|---|---|
+| `test_throwaway_name_prefix_and_not_production` | `throwaway_task_name("20261016T120000Z-a1b2c3") == "serialwrap-throwaway-20261016T120000Z-a1b2c3"`；結果 `!= "serialwrap"`；`run_id="x"` → `ValueError` |
+| `test_throwaway_env_all_under_isolated_root` | `throwaway_env(rid, r"C:\Users\u\AppData\Local")` 的五個 `SERIALWRAP_*_DIR` 值皆以 `C:\Users\u\AppData\Local\sw-throwaway\<rid>\` 開頭；`SERIALWRAP_TEST_DEVICE_ALLOWLIST == "COM20"`；`SERIALWRAP_SOCKET` 以 `tcp://127.0.0.1:` 開頭且 port ≠ 48700 |
+| `test_task_xml_whatif`（`windows_native`；或在 Linux 以 `pwsh` 存在時執行，否則能力式 SKIP） | `win-task-throwaway.ps1 -RunId <rid> -Hours 72 -Bundle C:\b -WhatIf` 輸出的 Task XML：`<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>`、`<URI>\serialwrap-throwaway-<rid></URI>`、所有 env 路徑在隔離根下、不含字串 `\serialwrap</URI>` |
+| `test_cleanup_removes_only_throwaway`（`windows_native`） | 註冊後 `-Cleanup`：`schtasks /Query /TN serialwrap-throwaway-<rid>` 失敗（不存在）；`schtasks /Query /TN serialwrap` 的結果（存在與否）與執行前相同 |
+| `test_spike1_report_schema_and_not_run_default` | `build_report({"control_lines": {"verdict": "PASS", …}}, host=<完整>, pair="COM20:COM21", console_pair=None)` 通過 `spike1_report.schema.json`；`console_pair.verdict == "NOT_RUN"`、`peer_close.verdict == "NOT_RUN"` |
+| `test_spike1_report_requires_host_fields` | `host` 缺 `hvci_running` → `ValueError` |
+| `test_spike1_control_lines_native`（`windows_native`＋`windows_com`） | 在擁有者 host 以 `SW_TEST_COM_PAIR=COM20:COM21` 實測：COM20 `rts=True` 後 COM21 `cts` 讀值與 com0com 預設接線一致，結果寫入報告（verdict 依實測，不預設 PASS） |
+| `test_spike1_peer_close_native`（`windows_native`＋`windows_com`） | COM21 關閉後 COM20 `read(1)` 於 timeout 內回 `b""` 或擲例外（記錄實際型別與 Windows error code）；結果寫入報告與 Task 3 能力表候選值 |
+
+- [ ] **T18-2：執行並確認 FAIL**：`python3 -m pytest -q tests/test_win_task_throwaway.py tests/test_spike1_remaining.py` → `ModuleNotFoundError: realhw.acceptance.spike1_remaining`（函式內）。
+- [ ] **T18-3：commit 測試**：`git commit -m "test(test-infra): 新增 Windows throwaway 排程與 Spike 1 剩餘項的失敗測試"`。
+
+### I 步驟
+
+- [ ] **I18-1：實作** 依 Files／Interfaces；`stage0-win-task-throwaway.md` 寫：(1) `mkbundle.sh` 產生 Windows bundle（P3 交付前用 Python 基線入口）；(2) `-WhatIf` 審閱 XML；(3) 註冊並開跑 72 h（與 Task 17 Linux 監管 runner 並行）；(4) 期間以唯讀 RPC 每 5 分鐘輪詢 `health.status`；(5) 結束 `-Cleanup`；(6) 報告登錄 `S0-WIN-TASK-THROWAWAY-72H`。
+- [ ] **I18-2：執行並確認 PASS**：Linux 上純函式測試全綠；orchestrator 在擁有者 host 經 `scripts/stage0/win-pytest.sh -m "windows_native" tests/test_win_task_throwaway.py tests/test_spike1_remaining.py` 原生執行（G7），報告附 Windows build／HVCI／pair；`python3 -m pytest -q tests/` 無新失敗。
+- [ ] **I18-3：commit**：`git commit -m "feat(test-infra): 新增 Windows host throwaway 排程監管程序與 Spike 1 剩餘項實測工具（OD-15）"`＋fragment。
+
+---
+
 ## 3. Phase 整體驗收（全部 Task 綠燈後）
 
 - [ ] `python3 -m pytest -q tools/uart_stdio_bridge/tests` 全綠，連跑 3 次結果一致。
@@ -3254,22 +3464,26 @@ def test_register_candidate_refused_before_freeze(tmp_path):
 - [ ] `python3 -m uart_stdio_bridge selftest --endpoint posix-pty --out ~/b-log/rust-refactor/p2/selftest-linux`：`verdict=="PASS"`（`PYTHONPATH=tools/uart_stdio_bridge/src`）。
 - [ ] `python3 func-test/runner.py --mode both --selftest-report <上行報告>`：13 個 case 的 pty 與 bridge 兩種模式結果、`func-test-report.json` 的 `independent_cases==13`；非 PASS 者已分診並記錄（不得改 oracle）。
 - [ ] `python3 func-test/runner.py --mode bridge --dut-mode docker --case sm-01-attach-to-ready --selftest-report <報告>` 一次，確認「DUT 在容器內、daemon 在主機原生 OS」拓樸在 `manifest.json.topology` 正確標示（§15.5 與既有 remote 拓樸分開）。
-- [ ] `python3 func-test/runner.py --mode bridge --scenarios ...`：15 個 L1.5 情境結果已保存（`win-com-*` 3 個在 Linux 以 `cap_missing:windows_com` SKIP，屬 B3）；`dependency_blocked` 項列出對應 BC。
+- [ ] `python3 func-test/runner.py --mode bridge --scenarios ...`：15 個 L1.5 情境結果已保存（`win-com-*` 3 個在 Linux 以 `cap_missing:windows_com` SKIP，Windows 結果屬 §4.1 G6）；`dependency_blocked` 項列出對應 BC。
 - [ ] 對外分享的證據以 `uart-stdio-bridge redact` 產生遮罩衍生檔，`redaction-manifest.json` 同時記原始與遮罩 sha256（§15.6.4）。
 - [ ] `python3 tests/acceptance/regen_lock.py --check` exit 0；`python3 tests/acceptance/check_evidence_index.py --stage 0` 的結果（預期 exit 5：B 項未取得）與缺項清單附於 PR 描述，不得宣稱 Stage 0 出口已滿足。
 - [ ] `python3 -m policy_check --repo .` 通過。
 - [ ] `tests/test_od09_freeze.py::test_stage0_chain_without_later_phases` 綠燈：基線 gate → `od09_freeze.freeze` → `register_candidate_start` → candidate gate 三延後項 PASS，過程未 import 任何 `tools.stage3`／`sw_core` 模組（證明正式 Stage 0 出口的 OD-09 凍結不依賴 P3～P9，R4-F2）。
-- [ ] 每個 Task 的 `changelog.d/rust-p2-*.md` fragment 已加入（16 個，frontmatter 的 `type`／`scope` 照各 Task 標頭）；PR 描述依 repo 回歸 case 政策（#155）記錄：本 Phase 為測試基礎，不修 bug，故無新增 `regression/` case；L2 案例調整為平台 adapter 與 `requires` 變更，oracle 未改。
+- [ ] OD-15 docker 優先（Task 17）：`run-l15.sh func-test-bridge`、`run-l15.sh pytest-physical-uart` 與 `run-systemd.sh --mode systemd-user`／`systemd-system` 結果已保存，報告 `evidence_layer == "L1.5-docker"`；P1（含 P1-OC）合併後 `run-longrun.sh --hours 48` 與 `run-supervision.sh --hours 72` 已並行啟動並登錄 `S0-L15-DOCKER-48H-LINUX`、`S0-L15-DOCKER-SUPERVISION-72H`（docker 結果不得標為 B4／B5／B8 已取得）。
+- [ ] OD-15 擁有者 host 可執行 gate（§4.1 G1～G8）：已執行者附 `evidence_layer: "native-windows"`／`"host-throwaway"` 報告；Spike 1 剩餘三項以實測 verdict 登錄 `S0-SPIKE1-REMAINING`（`NOT_RUN` 照實列出）；未執行者在 PR 描述列為「待執行」，不得標 PASS。
+- [ ] 每個 Task 的 `changelog.d/rust-p2-*.md` fragment 已加入（18 個，frontmatter 的 `type`／`scope` 照各 Task 標頭）；PR 描述依 repo 回歸 case 政策（#155）記錄：本 Phase 為測試基礎，不修 bug，故無新增 `regression/` case；L2 案例調整為平台 adapter 與 `requires` 變更，oracle 未改。
 - [ ] PR 描述列出本文件 §4 的 BLOCKED-OWNER 清單，狀態一律「未取得」，不得標 PASS。
 
 ## 4. BLOCKED-OWNER 證據總表（本環境無法產出；交付為程序、腳本、判定器與 schema）
 
+OD-15（2026-10-16）後，原 B1、B2、B3（com0com 路徑部分）、B12 與 B13（`platform_info()` 實測部分）改為 §4.1 的擁有者 host 可執行 gate；本表保留其列以供追溯，狀態欄以 §4.1 為準。
+
 | # | 項目 | 依據 | 相關 Task | 需要的資源／動作 |
 |---|---|---|---|---|
-| B1 | Windows 原生 COM 端點：`test_cap_windows_com__*` 測試、`selftest --endpoint win-serial` PASS 報告 | OD-08、§13 Spike 1／4、§11.2 | 3、5、8 | 擁有者 Windows 自架 runner；Spike 1 通過用 com0com DUT-side pair，否則實體 USB-UART 直連 Windows（不經 usbipd）；提供 `SW_TEST_COM_PAIR` |
-| B2 | com0com 關閉 COM-B 對 COM-A 的實際行為（`transport_disconnect` 能力是否成立） | §15.8.3 | 3、11 | 同 B1；未實測前 `l15-transport-disconnect` 在 Windows 登記 SKIP |
-| B3 | Windows 上 13 個 func-test case（bridge 模式，依 Task 10「Windows 接線契約」）、3 個 `win-com-*` 情境、L1.5 情境的 Windows 執行結果；實體傳輸替代模式的逐案例承接紀錄 | §11.6 Stage 0 L1.5、§15.8.4、OD-08 C | 10、11、12 | 同 B1＋Windows Python daemon＋OD-11 allowlist 隔離實例 |
-| B13 | 自架 Windows COM runner 註冊（label `serialwrap-com`）與 `windows-com-selfhosted` job 實跑；Windows `platform_info()` 的 Secure Boot／HVCI／COM driver／端點防毒實測值 | §11.5、§1.1.1、§15.8.3、OD-05、OD-08 | 2、13 | 擁有者 Windows 工作站；查詢權限不足時記「證據不足」 |
+| B1 | （OD-15 → G1、G4）Windows 原生 COM 端點：`test_cap_windows_com__*` 測試、`selftest --endpoint win-serial` PASS 報告 | OD-08、§13 Spike 1／4、§11.2 | 3、5、8 | 擁有者 host com0com pair `COM20:COM21`（Spike 1 基本資格已通過）；orchestrator 經 interop 執行 |
+| B2 | （OD-15 → G8）com0com 關閉 COM-B 對 COM-A 的實際行為（`transport_disconnect` 能力是否成立） | §15.8.3 | 3、11、18 | Task 18 `spike1_remaining.py peer-close`；未實測前 `l15-transport-disconnect` 在 Windows 登記 SKIP |
+| B3 | （OD-15 → G5、G6；實體傳輸替代模式仍 BLOCKED）Windows 上 13 個 func-test case（bridge 模式，依 Task 10「Windows 接線契約」）、3 個 `win-com-*` 情境、L1.5 情境的 Windows 執行結果；實體傳輸替代模式的逐案例承接紀錄 | §11.6 Stage 0 L1.5、§15.8.4、OD-08 C | 10、11、12 | `COM20:COM21`＋Windows Python daemon（OD-11 allowlist `COM20` 隔離實例）；實體傳輸替代模式只在 com0com 路徑失效時需要 |
+| B13 | 自架 Windows COM runner 註冊（label `serialwrap-com`）與 `windows-com-selfhosted` job 的 CI 實跑（仍 BLOCKED）；Windows `platform_info()` 的 Secure Boot／HVCI／COM driver／端點防毒實測值（OD-15 → G7 一併記錄） | §11.5、§1.1.1、§15.8.3、OD-05、OD-08 | 2、13 | runner 註冊需擁有者；`platform_info()` 在擁有者 host 以 interop 取得，查詢權限不足時記「證據不足」 |
 | B14 | 跨 OS bench 互斥：`cross_os_probe_argv` 在 WSL 與 Windows 兩側的實際設定與探測結果 | §15.2、OD-10 | 14 | 擁有者 bench 設定 |
 | B4 | Linux live bench：pinned `serialwrap_exe` 下 regression 非破壞集合、realhw P0＋P1、reliability 報告 | §11.6 Stage 0 L2／L3 | 14 | 擁有者 bench（共用 bench lock、真板、無並行 pytest） |
 | B5 | Windows bench（Spike 7）：Telnet frontend 下 F5／`p0-console-raw`／`p1-con-*`／`lr-mixed` 實跑、共用 bench lock 實際共鎖、Windows RSS | §13 Spike 7、§15.8.4 | 14 | 擁有者 Windows bench |
@@ -3279,7 +3493,23 @@ def test_register_candidate_refused_before_freeze(tmp_path):
 | B9 | OD-09 延後凍結項數值（RSS／資源、最低有效負載與樣本、比較不確定性）於基線後、正式 Stage 0 出口、任何 Rust 候選長跑（最早 `S1B-L3-MIXED-48H-WINDOWS`）前以 Task 16 `od09_freeze freeze` 寫入新 revision | OD-09、§12.2 Stage 0 列、§14.2 | 15、16 | 擁有者裁決（執行 Task 16 程序 `od09-deferred-freeze.md`） |
 | B10 | 長跑實例關閉監管自動重啟或等價故障保留措施的設定紀錄 | §15.11.2、Spike 8 | 15 | 擁有者 bench 設定 |
 | B11 | `p2-1-mcu-flash-manual` 程序的實機執行與證據 | §11.6 Slice 2.4 | 12 | 擁有者實機（DUT console＋FTDI MCU 線） |
-| B12 | >72 h `windows-task` 監管驗證（Spike 2）—本計畫只登記 `win-task-*` case | §13 Spike 2、OD-03 | 12 | 由 P4 交付程序；擁有者 Windows 工作站 |
+| B12 | （OD-15 → G7）>72 h `windows-task` 監管驗證（Spike 2）：本計畫 Task 18 交付 throwaway 排程程序（`evidence_layer: "host-throwaway"`）；測試團隊工作站上的正式工作驗證仍由 P4 Task 18 承接 | §13 Spike 2、OD-03、OD-15 | 12、18 | 擁有者 Windows host（隔離名稱與目錄的 throwaway 工作）；測試團隊工作站部分仍 BLOCKED |
+| B15 | OD-15：docker 結果不得取代的真板 L2／實機 L3／OD-10 bench 長跑（B4、B5、B8 照舊）；docker 48 h 與 >72 h 監管只作 L1.5 前置 | §11.1、§15.3、OD-10、OD-15 | 14、15、17 | 擁有者 bench |
+
+### 4.1 OD-15 擁有者 host 可執行 gate（不再列 BLOCKED-OWNER）
+
+前提：擁有者 host（Windows 10.0.26200、HVCI 執行中、Secure Boot 關閉）已安裝 com0com 3.0.0.0（簽章 zip md5 `a07aa80024cca837dacc75d3573285ff`）並建立 pair `CNCA0=COM20`／`CNCB0=COM21`；受測 daemon 一律 OD-11 隔離實例＋`SERIALWRAP_TEST_DEVICE_ALLOWLIST=COM20`；orchestrator 經 WSL interop 執行；報告 `evidence_layer: "native-windows"`（G7 throwaway 為 `"host-throwaway"`）。擁有者 host 不可用時該 gate 記「證據不足」，不得標 PASS。
+
+| Gate | 內容 | Task | 指令 |
+|---|---|---|---|
+| G1 | `test_cap_windows_com__*`（`WinSerialEndpoint` 真實 COM） | 3 | `SW_TEST_COM_PAIR=COM20:COM21 scripts/stage0/win-pytest.sh -m windows_com tools/uart_stdio_bridge/tests` |
+| G2 | `run --endpoint win-serial` 端到端 | 5 | bridge 開 COM21、受測端開 COM20 |
+| G3 | `local-process` 模式端到端 | 6 | 同 G2，`--dut-mode local-process` |
+| G4 | `selftest --endpoint win-serial --com-pair COM20:COM21` `verdict=="PASS"` | 8 | 登錄 `S0-BRIDGE-SELFTEST-WIN` |
+| G5 | 13 個 func-test case bridge 模式（Windows Python daemon） | 10 | `python func-test/runner.py --mode bridge --endpoint win-serial --com COM21` |
+| G6 | L1.5 情境與 3 個 `win-com-*` 情境 | 11 | `--scenarios`；`l15-transport-disconnect` 依 G8 結果決定 SKIP 與否 |
+| G7 | `windows-task` >72 h throwaway 監管；`platform_info()` 實測值 | 13、18 | `scripts/stage0/win-task-throwaway.ps1 -RunId <id> -Hours 72 -Bundle <dir>` |
+| G8 | Spike 1 剩餘三項：控制線隔離、Console-side pair（需第二組 pair，否則 `NOT_RUN`）、peer-close 語意 | 18 | `python -m realhw.acceptance.spike1_remaining <item> --pair COM20:COM21` |
 
 ## 5. 規格覆蓋自檢（§15.12 最小交付物 → Task）
 
@@ -3303,4 +3533,7 @@ def test_register_candidate_refused_before_freeze(tmp_path):
 | §11.3 承接清單欄位、凍結、不以 SKIP 取得全綠 | 12、13 |
 | §14.2／§15.11.4 唯一門檻檔、`engine_result` 保留、`release_gate_result` | 15 |
 | §12.2 Stage 0 列「正式 Stage 0 出口須完成延後項目的凍結與證據充分性核對」、§14.2／OD-09「任何 Rust 候選長跑前凍結」 | 16（凍結工具、候選開跑登記；只依賴 12、15） |
+| OD-15 (3)(4)(5)(6)(7)：docker 假 COM、systemd container、兩容器 L1.5、48 h docker 長跑、>72 h Linux 監管、證據層級標記 | 17（標記規則亦由 12 的證據索引執行） |
+| OD-15 (1)(7)：Spike 1 剩餘項、`windows-task` >72 h throwaway 排程（Windows host） | 18 |
+| OD-15 原生 Windows COM 證據改為擁有者 host 可執行 gate | §4.1 G1～G8（Task 3、5、6、8、10、11、13、18） |
 | 調和表 `TST-D-4`、`TST-D-6`、`TST-D-8`、`TST-D-9`、`TST-D-10`、`TST-D-12`、`TST-D-13`、`TST-D-14`、`GAP-G-12` | 13、12、10、10、14、14、14、14、14 |

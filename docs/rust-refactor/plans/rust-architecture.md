@@ -1226,6 +1226,7 @@ connect 與 benches 一併納入 Windows 支援（`SC-27`，OD-14 #7 確認）�
 | WB-cli 的 36 檔（01 §1.5 C） | 不改原檔，把其中的 I/O 契約（stdout／stderr／exit／spawn argv）**移植**成 `contract_blackbox/test_cli_*.py`，配 stubd | CLI A/B |
 | `func-test/`（DaemonHarness、cli_client） | 讀同兩個 env；補齊 WAL／CONFIG／EVENTS／LOG 隔離（`TST-D-8`） | L1.5 |
 | `tools/docker/uart_harness.py`、`remote_lab.py` | 容器內讀同兩個 env（Linux artifact 掛入容器） | remote 拓樸 |
+| P2 Task 17 docker 兩容器拓樸（`tools/docker/compose.l15.yaml`：`serialwrap` ⇄ `bridge` ⇄ `dut-sim`，假 COM 為 socat PTY pair）、`scripts/docker/run-l15.sh`、`run-systemd.sh`、`run-longrun.sh`、`run-supervision.sh` | serialwrap 容器以唯讀 bind mount 掛入 bundle，讀同兩個 env；`SERIALWRAP_BY_ID_DIR` 指向只放假 by-id 的 sandbox | **L1.5**（OD-15 docker 優先：新版一律先在 docker 驗證；報告標 `evidence_layer: "L1.5-docker"`，不得計為真板 L2、實機 L3 或 OD-10 bench 長跑） |
 | `regression/`（TestPilot） | testbed `serialwrap_exe` 指向 bundle 的 `bin/serialwrap`；sibling `bin/serialwrapd` 為 launcher | L2 |
 | `realhw/`、`reliability/` | 新增 `serialwrap_exe` 設定與 #154 版本 gate（`TST-D-10`） | L3 |
 
@@ -1251,7 +1252,7 @@ A/B 程序照規格 §15.9：先停 A 並確認資源釋放，才啟動 B；兩�
 4. 彙總為 `target/win-test-report/<run_id>.json`，欄位為 `exe`、`caps`、`passed`、`failed`、`ignored`、`exit`，另以 `scripts/rust/cargo_l1_results.py`（P3 Task 17）寫出逐案的 `l1-results.v1`（`collected` 取自 `<exe> --list`、`results` 取自 libtest 每行結果、`exit_code`、`finished`），報告以 `l1_results` 指向它。計數只作摘要；任何 L1 出口都以 `l1-results.v1` 對 `tests/acceptance/l1_required.lock.json` 事先凍結的 nodeid 清單、經 P2 `tests/acceptance/l1_judge.py` 判定（缺案、重複、必要案例 ignored／skip、未執行、exit 非 0 或未完成一律不是 PASS；不得以 `passed>0` 或 `passed≥N` 判定，R5-F3）。Linux 原生 `cargo test` 與 pytest（`SW_RESOURCE_REPORT` v2）產生同一格式。
 5. 任何一個 exe 失敗即 exit 1。
 
-**COM pair**：`SW_TEST_COM_PAIR=COMa:COMb` 由擁有者在 Spike 1／OD-08 後提供。沒有提供時，`windows_com` 測試保持 ignored，並在報告中標為「證據不足」，不是 PASS。
+**COM pair**：`SW_TEST_COM_PAIR=COMa:COMb`。OD-15：擁有者 host 已通過 Spike 1 基本資格（com0com 3.0.0.0 簽章套件、HVCI 執行中、Secure Boot 關閉；pair `CNCA0=COM20`（DUT-side A，serialwrap 開）／`CNCB0=COM21`（DUT-side B，bridge／測試端開）；全值域 A→B、B→A、COM20 第二次開啟 `ERROR_ACCESS_DENIED`、關閉後重開皆已驗證；證據在擁有者 host 的 `b-log` 下 `rust-refactor/spike1/`），因此在該 host 一律以 `SW_TEST_COM_PAIR=COM20:COM21` 執行 `windows_com` 測試，原「待 Spike 1」的原生 Windows COM handle 證據（OD-08）改為可執行 gate。daemon 必須以 OD-11 隔離實例啟動（`SERIALWRAP_STATE_DIR`／`_RUN_DIR`／`_CONFIG_DIR` 三者明確設定且非預設）並設 `SERIALWRAP_TEST_DEVICE_ALLOWLIST=COM20`；由 orchestrator 經 WSL interop 代跑，報告附 Windows build、HVCI 狀態與 pair 對應。Spike 1 剩餘三項（控制線隔離、Console-side pair、peer-close 語意）仍待測，相關案例結果未知前不得預標 PASS。只有擁有者 host 不可用（未提供 `SW_TEST_COM_PAIR`）時，`windows_com` 測試保持 ignored，並在報告中標為「證據不足」，不是 PASS。
 
 **Windows 黑箱**：Windows Python 3.12 以 `py -3.12 -m pytest tests/contract_blackbox`，搭配 `SERIALWRAP_CLI_EXE=…\serialwrap.exe`、`SERIALWRAP_DAEMON_EXE=…\serialwrapd.exe`，同樣在 Windows 本機目錄執行。入口腳本為 `scripts/rust/win-blackbox.ps1`，由 P3 建立。
 
@@ -1286,7 +1287,12 @@ A/B 程序照規格 §15.9：先停 A 並確認資源釋放，才啟動 B；兩�
                "package": {"name": "serialwrap", "version": "0.4.0", "wheel_sha256": "…", "tree_sha256": "…"}},
     "python_cli_delegate": {"entry": ["py/python.exe", "-I", "-B", "-m", "sw_core.cli"], "tree_sha256": "…"},
     "assets": {"skill_sha256": "…", "skill_windows_sha256": "…", "profiles_sha256": "…"},
-    "supervisor": {"default_mode": "windows-task", "definition_sha256": "…"}
+    "supervisor": {"default_mode": "windows-task", "definition_sha256": "…"},
+    "com0com": {"optional": true, "default_selected": false, "requires_elevation": true, "experimental": true,
+                "version": "3.0.0.0", "path": "optional/com0com/", "sha256": "…", "tree_sha256": "…",
+                "helper": {"path": "bin/sw-com0com-helper.exe", "sha256": "…"},
+                "license": "GPL-2.0", "license_file": "optional/com0com/LICENSE-GPLv2.txt",
+                "source_offer_file": "optional/com0com/SOURCE.md", "provenance_file": "optional/com0com/PROVENANCE.json"}
   },
   "pairing": {"rule": "exact", "cli_version": "0.4.0", "daemon_version": "0.4.0"}
 }
@@ -1296,6 +1302,7 @@ A/B 程序照規格 §15.9：先停 A 並確認資源釋放，才啟動 B；兩�
 - `tree_sha256` 是 sha256 of sorted `"<relpath>\0<sha256>\n"`，涵蓋所有部署的 Python 檔，以補足單看 `python.exe` hash 的不足（規格 §9.5）。
 - Stage 2 起 `daemon.implementation` 改為 `"rust"`，`entry` 移除。
 - 同目錄另有 `SHA256SUMS`。
+- **選用元件 `components.com0com`**（OD-15、`SC-36`，Rust-only，P4 Task 19；只在 Windows target 的 bundle 出現）：`optional/com0com/` 內含 com0com 3.0.0.0 簽章 driver 套件與 `setupc.exe`、`LICENSE-GPLv2.txt`、`SOURCE.md`（原始碼取得方式與書面提供承諾）、`PROVENANCE.json`（上游檔名、md5 `a07aa80024cca837dacc75d3573285ff`、sha256、Authenticode 簽署者 CyberCircuits／COMODO timestamp）。`verify_bundle` 對元件存在時一律驗 `sha256`／`tree_sha256` 與 helper sha256；元件缺席（Linux bundle 或未打包的 Windows bundle）時 bundle 仍有效，不視為缺件。§10.3 `version_pairing` 的 `components.*.sha256` 比對同樣只對實際存在的選用元件執行。`experimental` 維持 `true`，直到 Spike 1 剩餘項（控制線隔離、Console-side pair、peer-close 語意）在 HVCI 開啟機台全部通過才改 `false`。
 - **manifest 是宣告，不是內容證明**（R2-F7）：保留原 manifest、替換 `bin/serialwrapd` 時 `sha256(release-manifest.json)` 不變；`components.assets` 只帶 hash、沒有 path。凡需判定「實際檔案＝受測物」之處（P9 A/B 執行前 `verify_frozen`、Stage 3 `evidence target`、發佈時 `retirement verify --mode release` 與 `retirement verify-archive`），必須以 P9 Task 3 `verify_bundle` 逐一重算帶 `path`＋`sha256`／`tree_sha256` 的 component，並以 `bundle_tree_sha256`（sorted `"<posix relpath>\0<sha256>\n"` 的 sha256，涵蓋 bundle 目錄**全部**一般檔、不排除任何檔、遇 symlink 或非一般檔即拒絕）比對 Stage 3 target 記錄值；發佈只上傳通過 `verify-archive` 的 archive 位元組（P9 Task 14、Task 16）。
 - **證據綁定受測內容，不只綁 manifest**（R3-F2）：新增未宣告的旁載檔（例如 `bin/version.dll`）時 manifest 與 `artifact_id` 都不變、`verify_bundle` 照樣通過，若只在 target 記 tree，對同一 manifest 重設 target 就能讓舊 PASS 隨未受測內容發佈。因此：(1) 同一 `artifact_id` 不得以不同 `bundle_tree_sha256` 重設 target（P9 Task 14 `set_target` 回 `HARNESS_ARTIFACT_MISMATCH`），換內容必須重建 bundle；(2) A/B 報告每側記錄實際受測的 `bundle_tree_sha256` 與 `runtime_tree_sha256`（同演算法、只排除 bundle 根的 `release-manifest.json`／`SHA256SUMS`），每筆證據 entry 保存兩者並納入有效性判定，與 target 不符即過期；(3) 跨 Stage 沿用（`reuse_of`）除 `runtime_digest`（只雜湊宣告值）外必須 `runtime_tree_sha256` 相等；(4) 在 target bundle 目錄以外的安裝上產生的證據——Canary 工作站（collector 每次快照對 `versions/<v>/` 部署目錄重算兩個指紋，stdlib 實作、同演算法）與回滾演練（D1 量測 current 部署目錄）——由產生端記錄實際部署內容的指紋，Canary gate 只計指紋與 target 相同的紀錄、不同內容的執行量不合併；ingest 缺指紋即拒收，不得以 target 值回填（R4-F1，規格 §12.2 Stage 3「使用正式 release artifact」「不得直接合併不同版本的執行量」）；(5) 同一規則涵蓋所有執行受測 artifact 的報告（junit、func-test、TestPilot、realhw、`release-gate.json`、手動程序紀錄）：產生端以 P2 Task 10 `realhw/deployed_content.py`（同演算法，依 §10.2 安裝佈局由實際使用的 CLI 定位安裝目錄）在執行前後量測並寫入報告，A/B suite 的量測另須等於該側凍結 tree；target 記有 tree 時缺值、前後不一或不符一律拒收，報告開始時刻不能代替量測（R5-F4，§9.5、§11.4「報告須可追溯至實際受測組合」）。只有不執行 serialwrap artifact 的 OD-09 凍結報告與 bridge 自測不量測。
 - 建置由 `scripts/rust/mkbundle.sh --target <triple> --stage <s> [--dev]` 負責：組出 Python runtime（Linux 用 venv；Windows 用 embeddable 3.12 加 `pip install --target`），安裝本 repo wheel，產生 manifest。
@@ -1306,6 +1313,8 @@ A/B 程序照規格 §15.9：先停 A 並確認資源釋放，才啟動 B；兩�
 |---|---|---|
 | Linux | `${XDG_DATA_HOME:-~/.local/share}/serialwrap/versions/<v>/` | `~/.local/bin/serialwrap`、`~/.local/bin/serialwrapd` 為 symlink，指向 `versions/<v>/bin/*` |
 | Windows | `%LOCALAPPDATA%\Programs\serialwrap\versions\<v>\` | `bin\serialwrap.exe`、`bin\serialwrapd.exe` 為**複本**，另有 `bin\current-release.json` 記錄 `{"bundle_version","dir"}`；不依賴 symlink 權限 |
+
+**權限邊界（OD-15、`SC-36`）**：基本安裝、更新、回滾與 `windows-task` 註冊全部以使用者身分在 `%LOCALAPPDATA%` 完成，**不得**要求管理員。只有使用者明確選擇選用元件時（新增的 `serialwrap setup --with-com0com`／`--remove-com0com`，只新增不改既有參數），才以 `ShellExecuteExW(lpVerb="runas")` 啟動 bundle 內 `bin\sw-com0com-helper.exe install|remove --pair CNCA0=COMx,CNCB0=COMy`，由 helper 呼叫 `setupc.exe`；`sw-cli` 主行程永不提權。UAC 被拒或 helper 失敗不影響基本安裝結果：`setup` 回 `ok:true` 並在 `optional_components.com0com` 記 `installed:false` 與 `reason`（`elevation_declined`／`helper_failed`＋`helper_rc`），exit 0，不新增錯誤碼。移除或回滾 serialwrap 本體不呼叫 helper、不移除 driver（輸出 `left_installed:true` 提示）。
 
 切換流程：先把新複本寫成 `*.new`，再把舊檔 rename 成 `*.old.<ts>`（執行中的 exe 允許 rename），最後把 `*.new` rename 成正式名稱。至少保留 Current 與 Previous。rollback 流程依規格 §12.1 七步驟（`SC-23`）。第 2 步的交接安全檢查（Flash、FileTransfer、活躍寫入與其他不可安全中止操作）沒有覆寫：update／rollback 帶 `--force` 時仍拒絕，且不停止監管、不送 `daemon.stop`，因為停止 daemon 會中止傳輸或 flash pump，而 DUT 上已發生的部分燒寫無法撤銷。CLI 端預檢只做提早拒絕；第 3 步停止一律經 daemon 原子交接 `daemon.handoff_stop`（§6.2 第 7 步：busy 判定＋凍結新操作＋token 同一臨界區），update／rollback 路徑不送一般 `daemon.stop`；交接被拒或結果不明時不硬停、不切換（R1-F1，P4 Task 12、P1 T08、P8 Task 14）。第 7 步回退與 `install-journal.json` 中斷復原同樣只經交接（`reason:"revert"`）停止目前在跑的 daemon：第 6 步的新版一啟動就對外服務，驗收期間可能已受理傳輸或燒錄；交接被拒、不支援或結果不明時保留 journal、不硬停、不切換回 Previous，由下一次 `setup` 在 daemon 閒置後完成回退（R2-F6）。第 3 步的「停止該實例的監管拉起能力」適用於**每一種** mode（R5-F1）：既有 systemd unit 為 `Restart=on-failure`，停機未收斂時 daemon exit 1（§6.1 停止順序第 6 步），若只交接不抑制，舊實例結束後會在備份／切換期間被重新拉起（Linux 穩定入口為 symlink，可能指向新版或半切換），開 UART 並受理傳輸，而舊實例的 `handoff_token` 不能授權停止它。故所有交接停止前先 `ServiceCtl::hold_autostart`（§4.8；systemd 持久 drop-in＋disable，windows disable 且 hold 期間重新註冊以停用狀態送出，on-demand 持 `autostart.lock`＋journal 擋 SC-18），原值記入 journal，只在啟動目標版本前、拒絕還原或中斷復原時撤銷；交接只授權發出 token 的實例，等待中、切換前與啟動前偵測到任何其他實例一律重新交接（鏈長上限 3），`hard_stop` 只對取得 grant 的 identity 執行（P4 Task 3／7／12、P8 Task 14）。`supervision-mode set`（`SC-22`，Python 沒有的新命令）同樣停止正在服務的 daemon，故沿用同一組交接護欄而非 `setup` 的 Python 對等行為：同一 fail-closed 安全檢查（探測失敗、逾時、格式異常或身分不明一律拒絕，不視為「未 flashing」）、停止只經 `daemon.handoff_stop{reason:"supervision_set"}`、`--force` 不覆寫；同模式刷新或只列 `pending_sudo` 時不交接，避免只凍結不切換（R1-F3，P4 Task 10 `OldStop::HandedOff`、Task 12 `run_supervision_switch`）。
 

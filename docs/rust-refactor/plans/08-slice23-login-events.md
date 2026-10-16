@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 1.96.1（edition 2021；`crossbeam-channel =0.5.15`、`indexmap =2.11.4`、`fancy-regex =0.16.2` 經 `sw_proto::pyre`、`libc =0.2.186`／`windows-sys =0.61.2` 僅 sw-pal、dev `tempfile =3.23.0`）；Python 3.12（golden 產生器、`tests/contract_blackbox/` 黑箱，stdlib＋pytest＋PyYAML）。
 
-**Spec:** `docs/rust-refactor/serialwrap-rust-spec-final.md` §5.1.2、§5.1.3、§5.2.1、§5.2.2、§5.3、§5.4、§5.5、§9.3、§9.4、§11.6（Slice 2.3 列）、§12.2 Stage 2 表；`docs/rust-refactor/owner-decisions-2026-10-15.md`（OD-04、OD-06、OD-08、OD-10）；`docs/rust-refactor/plans/rust-architecture.md`（下稱 arch）§1.3、§3.1、§3.2、§3.4、§3.6、§4、§5、§6.3、§8、§9；`docs/rust-refactor/plans/spec-reconciliation.md`（下稱調和表）；盤點 `inventory/05-session.md`（§1.6、§6、§7、§8、§9、§11、§12、§13）、`inventory/09-events-transfer.md`（§3、§8、§9）、`inventory/02-rpc.md`（§5.2、§5.4、§7.4、§7.5、§7.7、§7.12）、`inventory/03-errors.md`（§5、§6）、`inventory/10-gaps.md`（G-01、G-09、G-13）。
+**Spec:** `docs/rust-refactor/serialwrap-rust-spec-final.md` §5.1.2、§5.1.3、§5.2.1、§5.2.2、§5.3、§5.4、§5.5、§9.3、§9.4、§11.6（Slice 2.3 列）、§12.2 Stage 2 表；`docs/rust-refactor/owner-decisions-2026-10-15.md`（OD-04、OD-06、OD-08、OD-10、OD-14、OD-15）；`docs/rust-refactor/plans/rust-architecture.md`（下稱 arch）§1.3、§3.1、§3.2、§3.4、§3.6、§4、§5、§6.3、§8、§9；`docs/rust-refactor/plans/spec-reconciliation.md`（下稱調和表）；盤點 `inventory/05-session.md`（§1.6、§6、§7、§8、§9、§11、§12、§13）、`inventory/09-events-transfer.md`（§3、§8、§9）、`inventory/02-rpc.md`（§5.2、§5.4、§7.4、§7.5、§7.7、§7.12）、`inventory/03-errors.md`（§5、§6）、`inventory/10-gaps.md`（G-01、G-09、G-13）。
 
 ---
 
@@ -210,7 +210,7 @@ ID 選擇：SC-28／SC-29 已由 P6（07 T0 D-11／D-12）占用，本 Phase 取
 - Modify: `docs/rust-refactor/plans/spec-reconciliation.md`（§1.1 增 SC-30、§1.2 增 DF-18、SC-11 列補 Event Engine 細化、§5 統計）
 - Modify: `contracts/behavior_changes.yaml`（`changes` 增 SC-30、DF-18 兩筆，依 §0.5 欄位；遞增 `revision`）
 - Create: `tests/acceptance/breaker/slice_2.3.json`（凍結快照）、`tests/acceptance/breaker/slice_2.3.snapshots.ndjson`（空檔）：以 06 Task 0b `scripts/rust/slice_breaker.py`（不重建）在 `slice_2.3` 集合凍結的同一 commit 凍結斷路器分母與觀測窗口起訖（規格 §12.2、OD-02／OD-13）；Task 19 Phase gate 以 `slice_breaker.py --freeze tests/acceptance/breaker/slice_2.3.json --snapshots …` 判定，觸發即停止擴大部署並退守 Stage 1
-- Modify: `tests/test_contracts_catalog.py`（`test_bc_real_sc_df_ranges`：SC 期望改 `({f"SC-{i:02d}" for i in range(1, 32)} | {"SC-34", "SC-35"}) - {"SC-08"}`（P6 已登記 SC-28／29／31，07 Task 0 下游通知；SC-34／SC-35 由 P1-OC 登記、SC-08 依 OD-14 #3 撤回）、DF 改 `range(1, 20)`（DF-19 已由 P0 登記、P1 T20 實作，R5-F2；本 Task 補上 DF-18 後區間連續）；若 P6 尚未合併，本 Task 只在 P6 合併後執行此項）
+- Modify: `tests/test_contracts_catalog.py`（`test_bc_real_sc_df_ranges`：SC 期望改 `({f"SC-{i:02d}" for i in range(1, 32)} | {"SC-34", "SC-35", "SC-36"}) - {"SC-08"}`（P6 已登記 SC-28／29／31，07 Task 0 下游通知；SC-34／SC-35 由 P1-OC 登記；SC-36（OD-15 Windows 安裝選用 com0com 元件，Rust-only）由 P4 Task 19 登記、已在 rust_only 名單；SC-08 依 OD-14 #3 撤回）、DF 改 `range(1, 20)`（DF-19 已由 P0 登記、P1 T20 實作，R5-F2；本 Task 補上 DF-18 後區間連續）；若 P6 尚未合併，本 Task 只在 P6 合併後執行此項）
 - Modify: `tests/acceptance/cases.yaml`、`tests/acceptance/cases.lock.json`（以 `regen_lock.py --add-only` 產生；不得手改鎖檔）
 - Modify: `crates/sw-core/src/{login_fsm,quiet_gate,self_test,capture,session_core,tx_writer,uart_bridge,op_runner}.rs`（只追加新公開項，既有函式本體不動）
 - Create: `crates/sw-core/src/{login_run,reprobe,transport_stall,recover,mono}.rs`
@@ -942,7 +942,7 @@ fn refine_flips_only_when_zero_rx_and_frozen_30s_and_warns_once() {
 
 **Test author model:** haiku-xhigh　**Implementer model:** codex-gpt-6-luna-max
 **Changelog fragment:** `changelog.d/rust-p7-login-run.md`（`### Added`：Login run 協調、quiet 中止 login run（SC-30）、fence 以 fsm_gen 擋過期 run、attach／reprobe 收斂與 transport stall 告警）
-**BLOCKED-OWNER:** 實機 F10 兩案（帳密修正後 READY、未解析終態零空帳密 TX；B-04）；原生 Windows COM 上的登入（OD-08，B-06）。
+**BLOCKED-OWNER:** 實機 F10 兩案（帳密修正後 READY、未解析終態零空帳密 TX；B-04；交 bench 前先以 `scripts/docker/run-l15.sh` 跑 `L1.5-docker`，不計 L2）。原生 Windows COM 上的登入（OD-08，B-06）OD-15 起為擁有者 host 可執行 gate（`COM20:COM21`）。
 
 **Files:**
 - Create: `crates/sw-core/src/login_run.rs`（收斂純函式）
@@ -2355,7 +2355,8 @@ def test_creds_file_fixed_does_not_auto_probe_until_attach(p7, tmp_path):
 
 **Test author model:** agy-gemini-3.8-flash-high　**Implementer model:** haiku-xhigh
 **Changelog fragment:** `changelog.d/rust-p7-phase-gate.md`（`### Added`：Slice 2.3 Windows 原生 COM 案例、出口證據產生器與驗證器）
-**BLOCKED-OWNER:** B-06（原生 Windows COM handle 下的登入、quiet 與事件，OD-08；程序本 Task 交付且可執行，缺 `SW_TEST_COM_PAIR` 時結果為 BLOCKED-OWNER）、B-08（測試團隊工作站）。
+**擁有者 host 可執行 gate（OD-15）：** B-06（原生 Windows COM handle 下的登入、quiet 與事件，OD-08）：由 orchestrator 經 WSL interop 在擁有者 host 以 `SW_TEST_COM_PAIR=COM20:COM21`（Spike 1 已通過的 com0com DUT-side pair）執行，結果依實跑判 PASS／FAIL；只有該 host 不可用（`caps_missing` 含 `windows_com`）時才為 BLOCKED-OWNER。
+**BLOCKED-OWNER:** B-08（測試團隊工作站）。
 
 **Files:**
 - Create: `crates/sw-daemon/tests/cap_windows_com_p7.rs`（`#[ignore = "cap:windows_com"]`；三案 `cap_windows_com__p7_login_ready`、`cap_windows_com__p7_quiet_banner_zero_tx`、`cap_windows_com__p7_event_fire`）
@@ -2364,7 +2365,7 @@ def test_creds_file_fixed_does_not_auto_probe_until_attach(p7, tmp_path):
 - Modify: `tests/acceptance/l1_required.lock.json`（只以 P2 `regen_lock.py --l1-add-only` 登記 `p7_gate:*` 各測試列的平台集合；R5-F3）
 - Create: `docs/rust-refactor/evidence/p7-gate-<YYMMDD>.md`（由 `p7_gate_report.py` 產生）、`docs/rust-refactor/evidence/p7-b01-procedure.md`（B-01 擁有者程序）
 
-**Windows COM 案例規格（OD-08、OD-11）：** daemon 以 throwaway 隔離實例啟動（獨立 state／run／wal 目錄），`windows.test_device_allowlist` 只列 COMa（OD-11：僅隔離實例、明確列名）；peer 端 COMb 由測試開啟並扮演 DUT。byte 證據＝peer 收到的全部 bytes 與 daemon WAL 的 TX 記錄逐筆比對（相同順序、相同內容，secret 只出現在 peer 端、不在 WAL）。三案驗收：(1) prpl 腳本登入到 READY、`cmd submit` 成功；(2) READY 後 peer 輸出 U-Boot banner → submit 回 `AUTOBOOT_QUIET`，banner 之後 peer 收到 0 byte；(3) contains 規則命中 → handler（`cmd.exe` shell 路徑）執行、`fire_completed`、Job 結束後無殘留行程。缺 `SW_TEST_COM_PAIR` 時三案保持 ignored，報告標「證據不足」（arch §9.4），gate 對應列為 BLOCKED-OWNER。
+**Windows COM 案例規格（OD-08、OD-11、OD-15）：** daemon 以 throwaway 隔離實例啟動（獨立 state／run／wal 目錄），`windows.test_device_allowlist`（或 `SERIALWRAP_TEST_DEVICE_ALLOWLIST`）只列 COMa（OD-11：僅隔離實例、明確列名）；peer 端 COMb 由測試開啟並扮演 DUT。擁有者 host 上 COMa＝`COM20`（`CNCA0`）、COMb＝`COM21`（`CNCB0`）。byte 證據＝peer 收到的全部 bytes 與 daemon WAL 的 TX 記錄逐筆比對（相同順序、相同內容，secret 只出現在 peer 端、不在 WAL）。三案驗收：(1) prpl 腳本登入到 READY、`cmd submit` 成功；(2) READY 後 peer 輸出 U-Boot banner → submit 回 `AUTOBOOT_QUIET`，banner 之後 peer 收到 0 byte；(3) contains 規則命中 → handler（`cmd.exe` shell 路徑）執行、`fire_completed`、Job 結束後無殘留行程。缺 `SW_TEST_COM_PAIR` 時三案保持 ignored，報告標「證據不足」（arch §9.4），gate 對應列為 BLOCKED-OWNER。
 
 **Interfaces：**
 
@@ -2408,6 +2409,11 @@ def test_zero_tests_is_not_pass(tmp_path):
 def test_missing_com_pair_makes_com_row_blocked_not_pass(tmp_path):
     md = g.build_report(_results(tmp_path, [_row("win-test.sh --caps windows_com", passed=0)], caps_missing=["windows_com"]))
     assert "| win-test.sh --caps windows_com | BLOCKED-OWNER | B-06 |" in md
+
+def test_com_row_with_pair_judged_by_run_not_blocked(tmp_path):
+    # OD-15：擁有者 host 提供 COM20:COM21 時，COM 列依實跑結果判定，不得為 BLOCKED-OWNER
+    md = g.build_report(_results(tmp_path, [_row("win-test.sh --caps windows_com", rc=1, passed=2, failed=1)]))
+    assert "| win-test.sh --caps windows_com | FAIL |" in md
 
 def test_owner_items_blocked_without_evidence_and_pass_with_verified_evidence(tmp_path):
     md = g.build_report(_results(tmp_path, []))
@@ -2490,7 +2496,7 @@ def test_full_required_set_passes(tmp_path):
 | B-03 | 真實 USB／usbip read-endpoint stall 重現與 busid 解析 | 實體 USB-UART 經 usbipd、可製造 stall 的手段 | `test_p7_stall.py` 的實機版本程序（以 `usbipd` detach 模擬）與判定欄位 | 6 |
 | B-04 | L2 F10 兩案（`f10-creds-fixed-then-ready`、`f10-unresolved-creds-terminal`），destructive | bench、ThrowawayDaemon 授權 | `testpilot run serialwrap_regression --case f10-creds-fixed-then-ready`、`--case f10-unresolved-creds-terminal`（Rust bundle） | 7、18 |
 | B-05 | L2 F11 兩案（`f11-flood-probe-classified` destructive、`f11-last-rx-age-sane`） | bench | `testpilot run serialwrap_regression --case f11-flood-probe-classified`、`--case f11-last-rx-age-sane`（Rust bundle） | 8、18 |
-| B-06 | 原生 Windows COM handle 證據（OD-08：動到 PAL 的 PR 與切片出口必備）：登入 FSM、quiet、事件端到端，及 Task 6／13／14 的 PAL 變更在 COM handle 環境下的回歸 | 擁有者 Windows 自架 runner；Spike 1 結果（com0com DUT-side pair）或實體 USB-UART 直連 Windows；`SW_TEST_COM_PAIR` | `SW_TEST_COM_PAIR=COMa:COMb scripts/rust/win-test.sh --caps windows_com --package sw-daemon --test cap_windows_com_p7`（Task 19 三案）；`scripts/rust/win-test.sh --package sw-pal --package sw-core`（PAL 回歸）；Windows 黑箱 `scripts/rust/win-blackbox.ps1 -Tests tests\contract_blackbox\test_p7_events.py,…`（`-Tests` 於 Task 18A 新增，預設值維持 P3 行為） | 6、7、13、14、16-wire、19 |
+| B-06 | 原生 Windows COM handle 證據（OD-08：動到 PAL 的 PR 與切片出口必備）：登入 FSM、quiet、事件端到端，及 Task 6／13／14 的 PAL 變更在 COM handle 環境下的回歸 | OD-15 起為擁有者 host 可執行 gate：Spike 1 已通過的 com0com DUT-side pair `COM20:COM21`（實體 USB-UART 直連 Windows 為備援）；orchestrator 經 WSL interop 代跑 | `SW_TEST_COM_PAIR=COM20:COM21 scripts/rust/win-test.sh --caps windows_com --package sw-daemon --test cap_windows_com_p7`（Task 19 三案）；`scripts/rust/win-test.sh --package sw-pal --package sw-core`（PAL 回歸）；Windows 黑箱 `scripts/rust/win-blackbox.ps1 -Tests tests\contract_blackbox\test_p7_events.py,…`（`-Tests` 於 Task 18A 新增，預設值維持 P3 行為） | 6、7、13、14、16-wire、19 |
 | B-07 | L3 realhw P0＋登入／Recovery／事件相關 P1 與 remote 案例 | bench、`two_boards`、`deployed_recent`、remote 容器環境 | `realhw` 以 Rust bundle 為 `serialwrap_exe`，分開執行並各自留報告：(1) `python3 -m realhw --tier p0`（P0 全部 8 案）；(2) `python3 -m realhw --only p1-rst-reboot`、`--only p1-rst-bootwindow`、`--only p1-rst-recover`（`--only` 一次一個精確 ID，`realhw/__main__.py:19`、`harness.select_cases`）；(3) `python3 -m realhw --tier remote`（8 案：`rm-topo-*`、`rm-live-*`）；(4) 先前切片必要回歸：06 Task 20／22 與 07 出口表列出的 realhw ID，逐一 `--only`。執行後以 `realhw --list` 對照 `cases.lock.json` 的 `slice_2.3` 集合確認無漏案 | 9、18 |
 | B-08 | 測試團隊 Windows 工作站（`windows-task`、第三方 EDR）上 event handler 實際觸發、Job 終止與逾時延遲 | 測試團隊工作站 | `scripts/rust/win-blackbox.ps1 -Tests tests\contract_blackbox\test_p7_events.py` 程序與判定欄位 | 14 |
 
@@ -2506,5 +2512,7 @@ def test_full_required_set_passes(tmp_path):
 | 延遲與背景雜訊案例 | Task 18 `test_p7_latency_noise.py` | 本環境可產出 |
 | 先前切片必要回歸（L1.5） | Task 18 slice21／slice22／l15 slice21 於 Rust artifact；func-test `brcm-01-login-flow`、`ev-01-spawn-handler` | 本環境可產出 |
 | 必要案例集合完整 | Task 0 凍結；Task 19 `cases.lock slice_2.3 coverage` 列 | 本環境可產出 |
+| L2／L3 前置：同一批情境於 docker 兩容器拓樸（P2 Task 17 `scripts/docker/run-l15.sh`） | `L1.5-docker` 報告 | 本環境可產出（OD-15；不計為 L2／L3） |
 | L2：F9、F10、F11 切片清單＋先前必要回歸 | B-02、B-04、B-05 | BLOCKED-OWNER |
-| L3／平台：P0＋登入／Recovery／事件 P1、適用 remote | B-07；Windows 原生 COM B-06 | BLOCKED-OWNER |
+| Windows 原生 COM | B-06（擁有者 host `COM20:COM21`） | 擁有者 host 可執行（OD-15） |
+| L3／平台：P0＋登入／Recovery／事件 P1、適用 remote | B-07 | BLOCKED-OWNER |

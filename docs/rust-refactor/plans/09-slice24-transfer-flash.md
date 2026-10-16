@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 1.96.1（edition 2021；`x86_64-unknown-linux-gnu`、`x86_64-pc-windows-gnu`）、crossbeam-channel `=0.5.15`、libc `=0.2.186`（僅 sw-pal）、windows-sys `=0.61.2`（僅 sw-pal）、新增 `md-5 = "=0.10.6"`（sw-core，對應 Python `hashlib.md5`）；Python 3.12 pytest（黑箱、golden 擷取、覆蓋判定）、`systemd-run --user`、Windows `schtasks.exe`（經 WSL interop，需擁有者授權旗標）。
 
-**Spec:** `docs/rust-refactor/serialwrap-rust-spec-final.md` §4.1（承接表 2.4 列）、§5.1.2、§5.1.3、§5.2.1、§5.2.2、§5.2.4、§5.2.6、§5.3（Flash／Release 列）、§6.1、§6.2「交接」、§7.1、§9.4、§11.3、§11.4、§11.5、§11.6（Slice 2.4 列）、§12.1、§12.2（Stage 2 表 2.4 列）、§13（Spike 2）、§15.10、§15.11；`owner-decisions-2026-10-15.md` OD-03、OD-08、OD-09、OD-10、OD-11、OD-12；`plans/rust-architecture.md` §4.2、§4.7、§4.8、§5.4～§5.10、§6.1、§6.3、§9；`plans/spec-reconciliation.md` SC-02、SC-03、SC-04、SC-05、SC-11、SC-12、SC-14、SC-23、SC-24、DF-02、DF-04、UIO-12.9-a～f、UIO-12.10-f、EVT-D-S7、EVT-D-F1～F6；盤點 `inventory/09` §4、`inventory/06` §5.3、§9、`inventory/05` §3、§12、`inventory/07` §5、§6、`inventory/02` §7.2、§7.3、§7.11、`inventory/10` G-03。
+**Spec:** `docs/rust-refactor/serialwrap-rust-spec-final.md` §4.1（承接表 2.4 列）、§5.1.2、§5.1.3、§5.2.1、§5.2.2、§5.2.4、§5.2.6、§5.3（Flash／Release 列）、§6.1、§6.2「交接」、§7.1、§9.4、§11.3、§11.4、§11.5、§11.6（Slice 2.4 列）、§12.1、§12.2（Stage 2 表 2.4 列）、§13（Spike 2）、§15.10、§15.11；`owner-decisions-2026-10-15.md` OD-03、OD-08、OD-09、OD-10、OD-11、OD-12、OD-15；`plans/rust-architecture.md` §4.2、§4.7、§4.8、§5.4～§5.10、§6.1、§6.3、§9；`plans/spec-reconciliation.md` SC-02、SC-03、SC-04、SC-05、SC-11、SC-12、SC-14、SC-23、SC-24、DF-02、DF-04、UIO-12.9-a～f、UIO-12.10-f、EVT-D-S7、EVT-D-F1～F6；盤點 `inventory/09` §4、`inventory/06` §5.3、§9、`inventory/05` §3、§12、`inventory/07` §5、§6、`inventory/02` §7.2、§7.3、§7.11、`inventory/10` G-03。
 
 ---
 
@@ -25,6 +25,7 @@
 - Windows 序列埠：`CreateFileW(OPEN_EXISTING, dwShareMode=0)`；WAL handle：`FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE`（§6.2、§8.2）。
 - Windows RPC 預設 `tcp://127.0.0.1:48700`；信任範圍＝整機本機使用者（OD-12），文件不得宣稱「同使用者隔離」。
 - Windows 監管預設 `windows-task`，`ExecutionTimeLimit=PT0S`（OD-03、§6.1）；`windows-service` 本切片不採用（OD-12 條件未成立）。
+- OD-15 驗證環境：(1) 擁有者 host 已通過 Spike 1 基本資格（DUT-side pair `CNCA0=COM20`／`CNCB0=COM21`、HVCI 執行中），需原生 Windows COM 的案例（OD-08）改為可執行 gate：orchestrator 經 WSL interop 在該 host 以 `SW_TEST_COM_PAIR=COM20:COM21`、OD-11 隔離實例＋`SERIALWRAP_TEST_DEVICE_ALLOWLIST=COM20` 執行；P4 Task 19 的 SC-36 選用 com0com 元件（`setup --with-com0com`）安裝的 pair 亦可作為 Windows 原生 flash 前置／交接測試的 COM pair（報告記錄 pair 來源：`owner-preinstalled` 或 `sc36-component`）。Spike 1 剩餘項（控制線隔離、peer-close 語意）結果未知，不得預標 PASS。(2) systemd 行為（journald stderr、autostart hold drop-in、有序停止）先以 P2 Task 17 `scripts/docker/run-systemd.sh` 在 systemd container 驗證；L2／L3 交 bench 前先跑 `scripts/docker/run-l15.sh` 兩容器拓樸，報告標 `L1.5-docker`，**不得**計為真板 L2、實機 L3 或 OD-10 bench 長跑。(3) Linux 監管 >72h 以 `scripts/docker/run-supervision.sh --hours 72` 在 docker 與 48h docker 長跑並行（不同 compose project／volume）；`windows-task` >72h 以 P2 Task 18 throwaway 排程工作（`serialwrap-throwaway-<run_id>`、隔離目錄）在擁有者 host 執行（Linux docker 無法承載 Task Scheduler）。
 - 長跑門檻唯一來源 `realhw/acceptance/longrun_acceptance.yaml`；OD-09 三項已凍結，其餘延後凍結（§14.2、§15.11.4）。
 - 本切片固定常數（逐字取自盤點，改值等同改契約）：`DEFAULT_CHUNK_SIZE=512`、`DEFAULT_ECHO_SLICE_SIZE=64`（字元）、`DEFAULT_ECHO_TIMEOUT_S=5.0`、`MIN_FILE_CHUNK_TIMEOUT_S=5.0`、`MIN_FILE_PULL_TIMEOUT_S=30.0`、`MIN_FILE_ECHO_TIMEOUT_S=5.0`、`ACK_MODES=["auto","echo","none"]`、`RX_MAX_CHARS=131072`（字元）、FlashEndpoint `grace=0.3`、pump select `0.2`、probe poll `0.02`、holder watch `poll=0.5,max=1800.0`、McuPattern 預設 `baud=115200,timeout_ms=500`、預設 pattern `ti-cc26xx`／`5555`／`00cc`／`115200`、`TTYMCU_PATH=$SERIALWRAP_TTYMCU_PATH 或 RUN_DIR/dev/ttyMCU`。
 - repo 政策：不得 commit 到 `main`；本 Phase 於 `wt/rust-refactor/p8-slice24`（base `feature/rust-refactor`，符合 R-12 的 `wt/<slug>/<subtask>`）進行；每個 code PR 附 `changelog.d/<slug>.md` fragment（本 repo 無對應 issue 時以 slug 命名，frontmatter 省略 `issue`；`type` 只能取 policy engine `TYPE_TO_SECTION` 的 `feat／fix／refactor／perf／change／docs／remove／deprecate／security`，一個 fragment 只有一個 `type`）；commit 用 Conventional Commits 繁中 subject，含 `Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>` trailer；完成前跑 `python3 -m pytest -q tests/` 與 `python3 -m policy_check --repo .`。
@@ -214,7 +215,7 @@ def throwaway_daemon(...) -> SwEnv            # fixture factory：獨立 RUN/STA
 - Modify: `tests/acceptance/cases.yaml`（追加下表 `s24-*`）、`tests/acceptance/cases.schema.json`（`suite` 列舉加 `contract-blackbox`、`rust-l1`；`family` 列舉加 `S24`；只增不改）、`tests/acceptance/cases.lock.json`（只經 `regen_lock.py --add-only`）
 - Modify: `contracts/behavior_changes.yaml`（新增 SC-32、SC-33；SC-33 `owner_item: 8`，`pending_owner_confirmations` 新增 item 8；**不改** P0 驗證器——P1-OC 已把 `owner_item` 放寬為 null 或 ≥1 的整數、pending item 為 ≥1 且不重複，原「`1..len(pending_owner_confirmations)`」改動作廢）、`docs/rust-refactor/plans/spec-reconciliation.md`（§1 SC 表加 SC-32、SC-33；KEEP 列 XFER-ABORT-01、MCU-STATUS-01；EVT-D-F4 列補 needs-owner；文末 needs-owner 清單加 SC-33、XFER-ABORT-01／BC-03、EVT-D-F4／F7）
 - Create: `tests/acceptance/breaker/slice_2.4.json`（凍結快照）、`tests/acceptance/breaker/slice_2.4.snapshots.ndjson`（空檔）
-- Modify: `scripts/rust/slice_breaker.py`（P5 06 Task 0b 已建立，介面相同；本 Task 只在缺少下列行為時補上並保留 06 的測試，不重建檔案）、`tests/test_contracts_catalog.py`（`test_bc_real_sc_df_ranges` 的 SC 期望改為 `{f"SC-{i:02d}" for i in range(1, 36)} - {"SC-08"}`（SC-34／SC-35 由 P1-OC 登記、SC-08 依 OD-14 #3 撤回、編號不重用）；`test_bc_real_rust_only_python_null` 名單加 SC-32、SC-33）
+- Modify: `scripts/rust/slice_breaker.py`（P5 06 Task 0b 已建立，介面相同；本 Task 只在缺少下列行為時補上並保留 06 的測試，不重建檔案）、`tests/test_contracts_catalog.py`（`test_bc_real_sc_df_ranges` 的 SC 期望改為 `{f"SC-{i:02d}" for i in range(1, 37)} - {"SC-08"}`（SC-34／SC-35 由 P1-OC 登記；SC-36（OD-15 Windows 安裝選用 com0com 元件，Rust-only）由 P4 Task 19 登記、已在 rust_only 名單；SC-08 依 OD-14 #3 撤回、編號不重用）；`test_bc_real_rust_only_python_null` 名單加 SC-32、SC-33）
 - Test: `tests/test_slice24_cases.py`
 
 **本 Phase 追加到 `cases.yaml` 的案例**（共同欄位：`family: S24`、`daemon_slice: "2.4"`、`necessity: required`、`stage0_required: false`、`destructive: false`、`expected: PASS`、`sentinel: null`、`issues: []`、`implemented_by: "09-slice24-transfer-flash.md"`、`cross_slice_reason: null`；`windows_status`：platforms 含 windows 者 `native`，否則 `gap` 並填 `windows_gap_reason`；`cli_stage`：prerequisites 含 `supervision` 或 capabilities 含 `supervisor_runtime` 者 `"1B"`，其餘 `"1A"`；`evidence`：pytest／cargo nodeid 清單；`source_ref`、`title`、`contract` 不得留空）：
@@ -975,7 +976,7 @@ fn drain_during_echo_paced_records_confirmed_slices_before_receipt() {
 
 **Changelog fragment：** `changelog.d/rust-p8-echo-paced.md`（`type: feat`、`scope: rust-core`）。
 
-**BLOCKED-OWNER：** Windows 原生 COM 上的 echo-paced 部分寫入／取消（`windows_com`，OD-08）。
+**擁有者 host 可執行 gate（OD-15，原 BLOCKED-OWNER）：** Windows 原生 COM 上的 echo-paced 部分寫入／取消（`windows_com`，OD-08）：`SW_TEST_COM_PAIR=COM20:COM21`，orchestrator 經 WSL interop 代跑。
 
 ---
 
@@ -1121,7 +1122,7 @@ Session gate 族（`s24-xfer-session-gates`，`file_transfer_session.rs` 以 `su
 
 **Changelog fragment：** `changelog.d/rust-p8-file-transfer-rpc.md`（`type: feat`、`scope: rust-daemon`）：含 XFER-ABORT-01 與 SC-33 的說明。
 
-**BLOCKED-OWNER：** L2 F7（`f7-binary-roundtrip-md5`、`f7-larger-file-not-truncated` 1 MB；後者 pull 端受 EVT-D-F4 影響必為 SKIP，待擁有者就 §0.4 EVT-D-F4 裁決）與 realhw `p1-cmd-file` 對 Rust bundle 實機執行；Windows 原生 COM 上的 push/pull（`windows_com`）。
+**BLOCKED-OWNER：** L2 F7（`f7-binary-roundtrip-md5`、`f7-larger-file-not-truncated` 1 MB；後者 pull 端受 EVT-D-F4 影響必為 SKIP，待擁有者就 §0.4 EVT-D-F4 裁決）與 realhw `p1-cmd-file` 對 Rust bundle 實機執行（交 bench 前先以 `scripts/docker/run-l15.sh` 跑 `L1.5-docker`，不計 L2／L3）。Windows 原生 COM 上的 push/pull（`windows_com`）OD-15 起為擁有者 host 可執行 gate（`COM20:COM21`）。
 
 ---
 
@@ -1953,7 +1954,7 @@ def test_released_survives_two_restarts_and_replug(sw_env, shell_target):
 | `windows_selftest_released_holder_unknown`（`windows_com`） | RELEASED、外部未持有 | `holder_unknown:true` → `external_holder:"none"`、`reclaimable:false`、`recommended_action:"wait_external_flash"` |
 | `windows_external_flasher_cycle`（`windows_com`） | release → 外部工具寫入 COMa → 結束 → attach | session 回 READY／ATTACHED；外部期間 WAL 無 daemon TX |
 
-- [ ] **Step 2：執行並確認 FAIL**：`cargo test -p sw-core --features test-fakes --test handoff` → FAIL；POSIX 黑箱 Python PASS（P1 已實作 SC-05、DF-04、BC-04）、Rust FAIL；Windows 黑箱在無 `SW_TEST_COM_PAIR` 時為 SKIP（標「證據不足」，不計 PASS）。
+- [ ] **Step 2：執行並確認 FAIL**：`cargo test -p sw-core --features test-fakes --test handoff` → FAIL；POSIX 黑箱 Python PASS（P1 已實作 SC-05、DF-04、BC-04）、Rust FAIL；Windows 黑箱在無 `SW_TEST_COM_PAIR` 時為 SKIP（標「證據不足」，不計 PASS）；OD-15 起擁有者 host 以 `SW_TEST_COM_PAIR=COM20:COM21` 由 orchestrator 實跑，紅燈須為 Rust FAIL（非 SKIP）。
 - [ ] **Step 3：commit 測試**：`test(handoff): 新增外部工具裝置交接黑箱測試`
 - [ ] **Step 4：實作**：只修 P8 新增交互的缺口（FileTransfer 占前景槽時 `aborted_cmd:true`、Probe 窗口 flash-critical 擋 release）；P5 既有語意（attach 前置序 `drain_in_progress` → 非 force `probe_holders` → 同步 `open_exclusive`（含鎖後 holder 重掃，force 不略過）、self-test RELEASED 規則）黑箱若失敗（例如 `force_attach_plain_open_tool_still_held` 回 ok），記錄並回報 P5 owner，本 Task 不修改。
 - [ ] **Step 5：執行並確認 PASS**：Rust 測試與 POSIX 黑箱兩側全 PASS。
@@ -1961,7 +1962,8 @@ def test_released_survives_two_restarts_and_replug(sw_env, shell_target):
 
 **Changelog fragment：** `changelog.d/rust-p8-device-handoff.md`（`type: change`、`scope: rust-core`；Step 4 有修正時改 `type: fix`）。
 
-**BLOCKED-OWNER：** `windows_access_denied_holder_unknown`、`windows_external_flasher_cycle`（OD-08 原生 COM）；realhw `p1-ho-cycle`（外部 tmux `minicom -D <attached_real_path> -b 115200`；`device attach` 與 `device attach --force` 都須回 `DEVICE_STILL_HELD`，kill minicom 後才收回 READY）、`p1-ho-persist`（RELEASED 跨 `sudo systemctl restart`）、L2 `f10-creds-fixed-then-ready`（ThrowawayDaemon 交接）於 live bench 以 Rust bundle 執行。
+**擁有者 host 可執行 gate（OD-15）：** `windows_access_denied_holder_unknown`、`windows_external_flasher_cycle`（OD-08 原生 COM）以 `SW_TEST_COM_PAIR=COM20:COM21`（或 SC-36 元件安裝的 pair）由 orchestrator 經 WSL interop 執行；Spike 1 已證實 COM20 第二次開啟得 `ERROR_ACCESS_DENIED`，本 Task 以 Rust daemon 重驗。
+**BLOCKED-OWNER：** realhw `p1-ho-cycle`（外部 tmux `minicom -D <attached_real_path> -b 115200`；`device attach` 與 `device attach --force` 都須回 `DEVICE_STILL_HELD`，kill minicom 後才收回 READY）、`p1-ho-persist`（RELEASED 跨 `sudo systemctl restart`）、L2 `f10-creds-fixed-then-ready`（ThrowawayDaemon 交接）於 live bench 以 Rust bundle 執行。
 
 ---
 
@@ -2093,6 +2095,7 @@ def test_restart_on_failure_keeps_released_and_wal_seq(sw_env, shell_target, tra
 
 **Changelog fragment：** `changelog.d/rust-p8-systemd-supervision.md`（`type: feat`、`scope: rust-daemon`）。
 
+**docker 先行（OD-15）：** 本 Task 的 journald 收到 daemon stderr、`shutdown incomplete` 診斷、SC-23 autostart hold drop-in（`systemctl show -p Restart,RefuseManualStart` 為 `Restart=no`、`RefuseManualStart=yes`）與 `setup --user`／`--system` 實裝，先以 P2 Task 17 `scripts/docker/run-systemd.sh`（systemd 為 PID 1 的 container，Rust bundle 唯讀掛入）跑過並附 `L1.5-docker` 報告；docker 結果不取代下列實機項。
 **BLOCKED-OWNER：** 正式 `serialwrap.service`（`setup --user`／`setup --system --with-sudo`，以 Rust bundle 為 ExecStart 目標）在擁有者 bench 實裝與 realhw `p1-rst-daemon`（`sudo systemctl restart` 後 `bridge_generation`、`profile`、`device_by_id` 不變）；本 Task 的 transient unit 只驗 daemon 行為，不改動擁有者既有 `serialwrap` unit。
 
 ---
@@ -2178,7 +2181,8 @@ fn cap_supervisor_runtime__task_pt0s_restart_and_graceful_stop() {
 
 **Changelog fragment：** `changelog.d/rust-p8-windows-task-supervision.md`（`type: fix`、`scope: rust-cli`）。
 
-**BLOCKED-OWNER：** (1) 建立測試排程工作的授權（`SW_TEST_ALLOW_SCHTASKS=1`，擁有者本機 Windows 11 Pro 24H2，OD-05）；(2) P2 已登記的 `win-task-logon-trigger`、`win-task-single-instance`、`win-task-restart-on-failure`、`win-task-72h`（Spike 2：>72 小時 `PT0S` 實證、登入觸發需登出／登入 `interactive_desktop`、測試團隊工作站以 `setup` 安裝正式 `serialwrap` 工作）以 Rust bundle 執行；(3) Task Scheduler 對 `TerminateProcess` 是否觸發 `RestartOnFailure` 的實測結論（若 150 s 內未重啟即為 FAIL，回報擁有者調整監管策略，不得改寬斷言）；(4) `schtasks /End` 在無執行中實例時的 rc 需於 Windows 實機確認（本計畫依規則避免該情境，不依賴其 rc）。
+**擁有者 host 可執行（OD-15）：** `win-task-restart-on-failure`、`win-task-single-instance` 與 `win-task-72h` 的 >72 小時 `PT0S` 實證改以 P2 Task 18 `scripts/stage0/win-task-throwaway.ps1 -RunId <id> -Hours 72 -Bundle <Rust bundle>` 在擁有者 host 執行（工作名 `serialwrap-throwaway-<run_id>`、`SERIALWRAP_STATE_DIR`／`_RUN_DIR`／`_CONFIG_DIR` 在隔離根下、allowlist `COM20`，不動正式 `serialwrap` 工作；結束 `-Cleanup`），報告 `evidence_layer: "host-throwaway"`；同時段 Linux 監管 >72h 在 docker（`run-supervision.sh`）並行。
+**BLOCKED-OWNER：** (1) 建立測試排程工作的授權（`SW_TEST_ALLOW_SCHTASKS=1`，擁有者本機 Windows 11 Pro 24H2，OD-05；throwaway 工作亦需此授權）；(2) P2 已登記的 `win-task-logon-trigger`、`win-task-single-instance`、`win-task-restart-on-failure`、`win-task-72h`（Spike 2：>72 小時 `PT0S` 實證、登入觸發需登出／登入 `interactive_desktop`、測試團隊工作站以 `setup` 安裝正式 `serialwrap` 工作）以 Rust bundle 執行；(3) Task Scheduler 對 `TerminateProcess` 是否觸發 `RestartOnFailure` 的實測結論（若 150 s 內未重啟即為 FAIL，回報擁有者調整監管策略，不得改寬斷言）；(4) `schtasks /End` 在無執行中實例時的 rc 需於 Windows 實機確認（本計畫依規則避免該情境，不依賴其 rc）。
 
 ---
 
@@ -2249,7 +2253,7 @@ P4 已交付 §12.1 七步與 `safety_check`（05 L1617-1654：`mcu.status`(0.5 
 
 **Changelog fragment：** `changelog.d/rust-p8-update-guard.md`（`type: fix`、`scope: rust-cli`）。
 
-**BLOCKED-OWNER：** Windows 版本目錄的實機回滾（真實 COM 釋放與重新取得，規格 §12.1 末段「回滾驗收須包括真實串口釋放與重新取得」）於擁有者 Windows 主機以原生 COM 執行。
+**擁有者 host 可執行（OD-15，原 BLOCKED-OWNER）：** Windows 版本目錄的實機回滾（真實 COM 釋放與重新取得，規格 §12.1 末段「回滾驗收須包括真實串口釋放與重新取得」）於擁有者 Windows 主機以原生 COM `COM20`（peer `COM21` 驗證外部可開／daemon 收回）由 orchestrator 執行；daemon 一律為 OD-11 隔離實例。實體 USB-UART 上的同一流程仍屬 Spike 6（P4 B-05）。
 
 ---
 
@@ -2477,15 +2481,17 @@ def test_cargo_results_import_roundtrip(tmp_path):
 | 1 | L2 TestPilot `serialwrap_regression` 全部適用 38 case（含 `f7-binary-roundtrip-md5`、`f7-larger-file-not-truncated`、`f10-creds-fixed-then-ready`、`f10-unresolved-creds-terminal`）以 Rust bundle 為 pinned `serialwrap_exe` | 各 L2 case_id；Task 6、11 | live bench、bench 互斥鎖、破壞集授權（testbed `allow_destructive: true`） | `testpilot run serialwrap_regression`（單案：`--case <id>`）；`report.json`／`report.md`。`f7-larger-file-not-truncated` 的 pull 端在 EVT-D-F4 KEEP 下必為 SKIP，需擁有者就 §0.4 裁決（預設 XFAIL＋sentinel）才可判定 |
 | 2 | realhw L3 P0＋P1＋remote（含 `p1-ho-cycle`、`p1-ho-persist`、`p1-cmd-file`、`p1-rst-daemon`） | 各 L3 case_id；Task 6、11、12 | 兩板 bench、systemd system 模式、sudo | `python3 -m realhw --tier p0,p1` 與 `python3 -m realhw --tier remote`；`--report-dir` 下 `report.json`／`report.md` |
 | 3 | P2-1 MCU flash 真機手動程序（`ocp-mcu-upgrade … /dev/ttyMCU` → `Return error code : 0x0`） | `p2-1-mcu-flash-manual`；Task 9 | 實體 MCU 線（FTDI）、DUT console、韌體檔 | `realhw/procedures/p2-1-mcu-flash.md`（P2）；其列出的證據檔 |
-| 4 | Windows 原生 COM：交接 `holder_unknown:true`、self-test RELEASED、外部 flasher 循環、push/pull、echo-paced 部分寫入 | `s24-ho-windows-com`；Task 5、6、11 | OD-08（com0com DUT-side pair 或實體 USB-UART 直連 Windows，不經 usbipd）、`SW_TEST_COM_PAIR` | Windows 自架 runner 執行 `pytest -m windows_com tests/contract_blackbox`；`results-rust-windows.json` |
+| 4 | Windows 原生 COM：交接 `holder_unknown:true`、self-test RELEASED、外部 flasher 循環、push/pull、echo-paced 部分寫入（**OD-15 起為擁有者 host 可執行 gate**，非等待擁有者） | `s24-ho-windows-com`；Task 5、6、11 | OD-08：擁有者 host 的 com0com DUT-side pair `SW_TEST_COM_PAIR=COM20:COM21`（Spike 1 已通過；或 SC-36 元件安裝的 pair；實體 USB-UART 直連 Windows 為備援，不經 usbipd）、OD-11 隔離實例＋allowlist `COM20`，orchestrator 經 WSL interop 代跑 | Windows 自架 runner 執行 `pytest -m windows_com tests/contract_blackbox`；`results-rust-windows.json` |
 | 5 | Windows 正式 gate：自架 runner 原生 build/link 的 artifact 與其 L1／L1.5 結果（WSL cross build 不取代） | 全部 platforms 含 windows 的 ID | 擁有者 Windows 自架 runner（arch §1.1、OD-08） | `slice24_exit.sh --windows-run <dir>`（含 `SHA256SUMS`） |
-| 6 | `windows-task` runtime：測試排程工作建立授權、失敗重啟實測、>72 小時 `PT0S`、登入觸發、測試團隊工作站正式安裝 | `s24-sup-wintask-runtime`、`win-task-logon-trigger`、`win-task-single-instance`、`win-task-restart-on-failure`、`win-task-72h`；Task 13 | `SW_TEST_ALLOW_SCHTASKS=1`、Spike 2、互動桌面 | `SW_TEST_ALLOW_SCHTASKS=1 scripts/rust/win-test.sh --package sw-pal --caps supervisor_runtime`；Spike 2 程序 |
+| 6 | `windows-task` runtime：測試排程工作建立授權、失敗重啟實測、>72 小時 `PT0S`（OD-15：以 P2 Task 18 throwaway 排程工作在擁有者 host 執行，與 Linux docker >72h 監管並行）、登入觸發、測試團隊工作站正式安裝 | `s24-sup-wintask-runtime`、`win-task-logon-trigger`、`win-task-single-instance`、`win-task-restart-on-failure`、`win-task-72h`；Task 13 | `SW_TEST_ALLOW_SCHTASKS=1`、Spike 2、互動桌面 | `SW_TEST_ALLOW_SCHTASKS=1 scripts/rust/win-test.sh --package sw-pal --caps supervisor_runtime`；Spike 2 程序 |
 | 7 | 正式 `serialwrap.service`（user／system）以 Rust bundle 實裝與重啟 | `p1-rst-daemon`、`p1-ho-persist`；Task 12 | 擁有者機器或 bench、sudo | `setup --user`／`setup --system --with-sudo` 後執行 #2 |
-| 8 | 雙平台 Rust daemon 各 48 小時 `lr-mixed`（Linux、Windows 依序，同機同板經 usbipd），滿足 OD-09 絕對與相對閘門 | `lr-mixed` | OD-10 bench 排程；pinned bundle、對應 Python 48h baseline、停用自動重啟、bench lock；OD-09 延後凍結項（RSS／資源預算、最低負載、比較容許誤差）已於正式 Stage 0 出口以 P2 Task 16 凍結（R4-F2） | 開跑前 `python3 -m realhw.acceptance.od09_freeze register-candidate --item S24-L3-LRMIXED-48H-<LINUX\|WINDOWS> --platform <p> --run-id <id> --started-at <now>`（非 0 不得開跑）→ `python3 -m realhw --tier longrun --duration 48h`＋P2 `realhw/acceptance/gate.py` → `release-gate.json`（Windows 依 P2 Task 15 README 前後加 `winexcl handoff --phase pre／post`、observer `--excl-dir`、gate `--excl-evidence`）；以 `slice24_exit.sh --longrun <dir>` 匯入 |
+| 8 | 雙平台 Rust daemon 各 48 小時 `lr-mixed`（Linux、Windows 依序，同機同板經 usbipd），滿足 OD-09 絕對與相對閘門。OD-15：開 bench 前先以 P2 Task 17 `scripts/docker/run-longrun.sh --hours 48` 在 docker 跑 Rust 候選（`L1.5-docker`，不計為本項證據） | `lr-mixed` | OD-10 bench 排程；pinned bundle、對應 Python 48h baseline、停用自動重啟、bench lock；OD-09 延後凍結項（RSS／資源預算、最低負載、比較容許誤差）已於正式 Stage 0 出口以 P2 Task 16 凍結（R4-F2） | 開跑前 `python3 -m realhw.acceptance.od09_freeze register-candidate --item S24-L3-LRMIXED-48H-<LINUX\|WINDOWS> --platform <p> --run-id <id> --started-at <now>`（非 0 不得開跑）→ `python3 -m realhw --tier longrun --duration 48h`＋P2 `realhw/acceptance/gate.py` → `release-gate.json`（Windows 依 P2 Task 15 README 前後加 `winexcl handoff --phase pre／post`、observer `--excl-dir`、gate `--excl-evidence`）；以 `slice24_exit.sh --longrun <dir>` 匯入 |
 | 9 | Windows 實機回滾（真實串口釋放與重新取得） | Task 14 | 擁有者 Windows 主機＋原生 COM | P4 `setup --rollback` 於 Windows；`failure.json`／步驟紀錄 |
 | 10 | needs-owner 裁決：SC-33（Python 側）、XFER-ABORT-01 是否納入 BC-03、EVT-D-F4／F7 | Task 1 | 擁有者 | `spec-reconciliation.md` needs-owner 清單；未裁決依預設往下做，EVT-D-F4 未裁決則阻擋出口 |
 
 `windows-service` 本切片不適用（OD-12：未完成多使用者認證／授權前不得部署），不列入出口。
+
+OD-15 補充：#1、#2、#7 交 bench 前須附 docker 兩容器拓樸（`run-l15.sh`）與 systemd container（`run-systemd.sh`）的 `L1.5-docker` 報告；`slice24_exit.sh` 匯入證據時，`evidence_layer` 為 `L1.5-docker` 的報告只能填 L1.5 列，掛到 #1、#2、#7、#8 一律拒收（P2 `assert_not_real_board`）。#4、#9 與 #6 的 throwaway 部分可在擁有者 host 執行，仍須回填實跑報告才算取得證據。
 
 ## 切片出口判定（規格 §11.6 Slice 2.4 列）
 

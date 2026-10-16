@@ -78,10 +78,16 @@
 - Linux L1（pytest、cargo test）、Linux L1.5（PTY pair＋bridge＋DUT 模擬器，含 Docker 模式）。
 - Windows 原生 L1：交叉編譯 `x86_64-pc-windows-gnu`，經 WSL interop 在 Windows host 原生執行 Rust 測試（檔案分享旗標、`LockFileEx`、TCP RPC、Task Scheduler XML 產生）；Windows Python（3.10～3.12）可跑 Python 側 Windows 測試。
 
+OD-15（2026-10-16）後新增可取得的證據：
+- **原生 Windows COM handle 證據**：Spike 1 基本資格已在擁有者 host 通過（證據在擁有者 host 的 `b-log` 下 `rust-refactor/spike1/`：com0com 3.0.0.0 signed zip md5 `a07aa80024cca837dacc75d3573285ff` 與 SourceForge 一致、Authenticode Valid、Windows 10.0.26200、HVCI 執行中、Secure Boot 關閉；pair `CNCA0=COM20`（serialwrap 端）／`CNCB0=COM21`（bridge 端）；256-byte 全值域雙向正常、COM20 第二次開啟 `ERROR_ACCESS_DENIED`、關閉後可重開）。各 Phase 原列 BLOCKED-OWNER 的 OD-08 原生 COM gate 改為可執行步驟：`SW_TEST_COM_PAIR=COM20:COM21`、daemon 以 OD-11 隔離實例＋`SERIALWRAP_TEST_DEVICE_ALLOWLIST=COM20` 啟動，由 orchestrator 經 WSL interop 代跑。Spike 1 剩餘項（控制線隔離、Console-side pair、peer-close 語意）仍為待測，不得預標 PASS。
+- **docker 優先驗證**：新版 serialwrap 一律先在 docker 驗證（P2-T17）：`physical_uart` 類測試以假 COM（socat PTY pair）在容器內跑、systemd 行為（journald stderr、autostart hold drop-in）在 systemd container 驗、L2／L3 情境先以兩容器拓樸（serialwrap ⇄ bridge ⇄ DUT 模擬器）跑；48h 長跑於 P1 與修正後 Python 基線就緒後在 docker 執行，Linux 監管 >72h 在 docker 並行。docker 證據一律標 `evidence_layer: "L1.5-docker"`，**不計為**真板 L2、實機 L3 或 OD-10 bench 長跑。
+- **`windows-task` >72h**：Linux docker 無法承載 Task Scheduler，改在擁有者 Windows host 以隔離名稱／目錄的 throwaway 排程工作執行（P2-T18，`evidence_layer: "host-throwaway"`）。
+- **production daemon 唯讀比對**：授權對正式 daemon 執行唯讀 RPC（`--retries` 白名單的 11 個唯讀方法，如 `daemon status`、`session list`）比對 §9.4 欄位；不得送有副作用方法。
+
 本環境**無法**產出、須由擁有者排程或授權的項目（各 Phase 交付時以「BLOCKED-OWNER」明列，不得標 PASS）：
-- Spike 1（com0com 驅動安裝，需管理員且屬侵入性變更）、原生 Windows COM handle gate（OD-08：com0com 或實體 USB-UART 直連 Windows）。
-- L2 實機回歸（TestPilot `serialwrap_regression` on live bench）、L3 `realhw` P0／P1／remote、48 小時長跑（OD-10，bench 依序）、>72 小時 `windows-task` 監管驗證（Spike 2）。
-- Canary（每平台 14 活躍日、≥5,000 次 `cmd submit`、≥50 次干擾／交接）、實機回滾演練、Stage 3 退役判定。
+- 擁有者 host 以外的原生 Windows COM 證據（例如測試團隊工作站、開啟 Secure Boot 的機台）；需管理員的 com0com 選用元件實機安裝／移除（P4-T19，擁有者 host 可執行）。
+- L2 實機回歸（TestPilot `serialwrap_regression` on live bench）、L3 `realhw` P0／P1／remote、OD-10 bench 依序 48 小時長跑（docker 48h 不取代）。
+- Canary（每平台 14 活躍日、≥5,000 次 `cmd submit`、≥50 次干擾／交接；OD-15 (8) 由執行者決定延到 Stage 3（P9）執行，P9 帳本工具保留，早期 Phase 不以 canary 為出口條件）、實機回滾演練、Stage 3 退役判定。
 - OD-09 延後凍結項（RSS 預算、最低負載、容許誤差）——需 Python 48h 基線後、於正式 Stage 0 出口以 P2-T16 凍結工具凍結（早於 Stage 1B 混合 48 h 長跑；工具不依賴後續 Phase，R4-F2）。
 
 以上項目本計畫交付「可執行的程序、腳本、gate 判定器與證據 schema」，證據本身待擁有者執行。
@@ -159,6 +165,8 @@
 | P2-T14 | L2／L3 平台 adapter（pin＋版本 gate、PID／RSS、bench lock、能力式 SKIP、Telnet human frontend、worker 存活事件、background 結果執行期收斂 `BgResultTracker`（R1-F6）；realhw／TestPilot `report.json` 帶 `meta.deployed_content`（R5-F4）） | H | L | P2-T13 |
 | P2-T15 | `longrun_acceptance.yaml`、外層 `release_gate_result` 判定器、長跑觀測器、Windows 原生 COM 獨占證據 `winexcl`（R1-F7）；`release-gate.json` 帶 `run.deployed_content`（R5-F4） | L | H | P2-T14 |
 | P2-T16 | OD-09 延後項凍結工具與候選長跑開跑登記（`realhw/acceptance/od09_freeze.py`；延後項唯一寫入者；只讀 Stage 0 索引，不依賴 P3～P9，R4-F2） | L | H | P2-T12、P2-T15 |
+| P2-T17 | docker 驗證環境與兩容器拓樸（OD-15：假 COM PTY pair、systemd container、`run-l15.sh`／`run-systemd.sh`／`run-longrun.sh`／`run-supervision.sh`、`evidence_layer` 標記，docker 證據不計 L2／L3／bench） | H | L | P2-T4、P2-T6、P2-T10、P2-T12、P2-T15 |
+| P2-T18 | Windows host 監管 >72h throwaway 排程工作與 Spike 1 剩餘項收尾（OD-15；COM20／COM21） | G | L | P2-T3、P2-T8、P2-T12、P2-T15 |
 
 ### P3（`04-stage1a-rust-cli.md`；Phase 前置：P0、P1（T15 SC-09、T16 DF-06、T18 manifest）、P1-OC（Task 8 `gen_error_codes` 前）、P2（T10、T12））
 
@@ -205,7 +213,8 @@
 | P4-T15 | Agent 權限模型文件與驗證工具（§10.3）、對外文件同步 | H | G | P4-T6、P4-T7、P4-T8、P4-T9、P4-T10、P4-T11、P4-T12、P4-T13、P4-T14 |
 | P4-T16 | Stage 1B 整合：全群組黑箱 A/B、L1.5、效能 gate、Windows 原生 L1、契約與案例完成度核對 | G | H | 全部 |
 | P4-T17 | `sw-daemon` launcher、`yaml11::emit`、`bench_registry` 與自含式 dev bundle（P3 明列為 P4 範圍者） | H | L | P4-T1 |
-| P4-T18 | `windows-task` Spike 2 程序、腳本與證據 schema（P2 指派 `win-task-*` 案例） | H | G | P4-T3、P4-T10、P4-T12 |
+| P4-T18 | `windows-task` Spike 2 程序、腳本與證據 schema（P2 指派 `win-task-*` 案例；OD-15：擁有者 host 以 P2-T18 throwaway 排程工作實跑 >72h） | H | G | P4-T3、P4-T10、P4-T12 |
+| P4-T19 | Windows 安裝的 com0com 選用元件（SC-36，OD-15：預設不勾選、只有該元件提權、附 GPLv2 與原始碼取得方式、Spike 1 剩餘項通過前標實驗性；`setup --with-com0com`／`--remove-com0com` 只新增） | H | L | P4-T4、P4-T11、P4-T12、P4-T17 |
 
 ### P5（`06-slice21-daemon-core.md`；Phase 前置：P0～P4、P1-OC）
 
@@ -367,7 +376,7 @@ OD-14（2026-10-16）裁決套用到 Python Stage 0 基線與 P0 契約。新 SC
 | L1 完整性：`tests/acceptance/l1_required.lock.json`（每平台必要 nodeid 凍結）、`l1_results.schema.json`（`l1-results.v1`＝`SW_RESOURCE_REPORT` v2）、`l1_judge.py`（唯一判定實作）、`regen_lock.py --l1-add-only`；cargo 端 `scripts/rust/cargo_l1_results.py` | P2-T13；cargo 轉換器 P3-T17（R5-F3） | P3-T18、P4-T16、P5-T22、P6-T13、P7-T19、P9-T1 只以 `--l1-add-only` 新增 set，set 內 nodeid 由各 Phase 每個 Task 的紅燈 commit 逐 Task 登記、PR 以 `regen_lock.py --check --base` 防縮減（R5 審查後續）；P3～P9 的 L1 出口與 gate 一律依路徑載入 `l1_judge.py` 判定，不得以 `tests>0`、`passed>0`、`passed≥N` 或函式存在判定；P8-T15 結果檔同帶 `collected`／`exit_code`／`finished` |
 | `tests/contract_blackbox/bb_faketarget.py` | P3-T2 | P5-T15a、P6-T11、P7-T18A 以 keyword-only 擴充（不存在 `contract_blackbox/faketarget.py`） |
 | `behavior_changes.yaml` 新條目欄位 | P0-T1／T5 schema | 一律 `approved_at_revision`＋`ab_participation`，`contracts/` 內不得出現 `contract_revision` 鍵 |
-| SC 編號 | 調和表 SC-01～27（SC-08 已由 OD-14 撤回，編號不重用）；P1-OC：SC-34、35（OD-14） | P6：SC-28、29、31；P7：SC-30；P8：SC-32、33（原稿 SC-31／32 撞號，已改）；`test_bc_real_sc_df_ranges` 依序改為 P1-OC `range(1,28)−{8}∪{34,35}` → P6 `(range(1,30)∪{31,34,35})−{8}` → P7 `(range(1,32)∪{34,35})−{8}` → P8 `range(1,36)−{8}`；P1-OC 清空 `pending_owner_confirmations` 並把 `owner_item` 驗證放寬為 ≥1，P8 的 SC-33 以 item 8 登記；DF-18 屬 P7；DF-19（self-test nonce probe 提交點 quiet 重驗，R5-F2）由 P0-T5 登記、P1-T20 實作，DF 期望 P0 為 `range(1,18)∪{19}`、P7 Task 0 起為 `range(1,20)` |
+| SC 編號 | 調和表 SC-01～27（SC-08 已由 OD-14 撤回，編號不重用）；P1-OC：SC-34、35（OD-14） | P6：SC-28、29、31；P7：SC-30；P8：SC-32、33（原稿 SC-31／32 撞號，已改）；P4-T19：SC-36（OD-15 com0com 選用元件，Rust-only）；`test_bc_real_sc_df_ranges` 依序改為 P1-OC `range(1,28)−{8}∪{34,35}` → P4 `range(1,28)−{8}∪{34,35,36}` → P6 `(range(1,30)∪{31,34,35,36})−{8}` → P7 `(range(1,32)∪{34,35,36})−{8}` → P8 `range(1,37)−{8}`；P1-OC 清空 `pending_owner_confirmations` 並把 `owner_item` 驗證放寬為 ≥1，P8 的 SC-33 以 item 8 登記；DF-18 屬 P7；DF-19（self-test nonce probe 提交點 quiet 重驗，R5-F2）由 P0-T5 登記、P1-T20 實作，DF 期望 P0 為 `range(1,18)∪{19}`、P7 Task 0 起為 `range(1,20)` |
 
 ### 審查後仍未解決（需擁有者或後續 PR 處理）
 

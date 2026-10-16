@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 1.96.1（edition 2021，`x86_64-unknown-linux-gnu`、`x86_64-pc-windows-gnu`）、`windows-sys =0.61.2`（arch §1.2 已列 feature 之外，只新增 `Win32_Globalization`（`MultiByteToWideChar`）與 `Win32_System_Diagnostics_Debug`（`FormatMessageW`），兩者皆在 KERNEL32，由 Task 1 一併修訂 arch §1.2 清單；匯入 DLL 限 arch §1.1 白名單，不得引入 SHELL32／SECUR32；`windows-sys` 只在 sw-pal，sw-daemon／sw-cli 不得直接依賴，arch L148）、`libc =0.2.186`、`sha2 =0.10.9`（arch §1.2 列為 sw-proto 依賴；sw-cli 一律經 `sw_proto::digest` 包裝取用，不直接依賴）、`tempfile =3.23.0`（dev）；Python 3.12＋pytest（黑箱、golden 擷取）；WSL interop（`scripts/rust/win-runner.sh`、`win-test.sh`）。
 
-**Spec:** `docs/rust-refactor/serialwrap-rust-spec-final.md` §4.2、§4.3、§6.1、§6.2、§9.4、§9.5、§10.3、§11.6（Stage 1B 列）、§12.1、§13（Spike 2、Spike 6）；`docs/rust-refactor/owner-decisions-2026-10-15.md` OD-03、OD-05、OD-08、OD-10、OD-12、OD-13；`docs/rust-refactor/plans/rust-architecture.md` §4.1、§4.8、§4.9、§7.3～§7.7、§10；`docs/rust-refactor/plans/spec-reconciliation.md` SC-10、SC-12、SC-17、SC-18、SC-20～SC-25、SC-27、DF-05、DF-07、DF-10～DF-13、DF-16、PLT-O-10～PLT-O-15、CLI-12.10、GAP-G-05、GAP-G-06；盤點 `inventory/07-platform-mgmt.md`（§0、§3～§12）、`inventory/01-cli.md`（§2、§4、§6.1、§6.11～§6.19、§7）、`inventory/04-wal-state.md`（§2.9、§3、§4）、`inventory/10-gaps.md`（G-04～G-06）。
+**Spec:** `docs/rust-refactor/serialwrap-rust-spec-final.md` §4.2、§4.3、§6.1、§6.2、§9.4、§9.5、§10.3、§11.6（Stage 1B 列）、§12.1、§13（Spike 2、Spike 6）；`docs/rust-refactor/owner-decisions-2026-10-15.md` OD-03、OD-05、OD-08、OD-10、OD-12、OD-13、OD-14（相容原則）、OD-15；`docs/rust-refactor/plans/rust-architecture.md` §4.1、§4.8、§4.9、§7.3～§7.7、§10；`docs/rust-refactor/plans/spec-reconciliation.md` SC-10、SC-12、SC-17、SC-18、SC-20～SC-25、SC-27、DF-05、DF-07、DF-10～DF-13、DF-16、PLT-O-10～PLT-O-15、CLI-12.10、GAP-G-05、GAP-G-06；盤點 `inventory/07-platform-mgmt.md`（§0、§3～§12）、`inventory/01-cli.md`（§2、§4、§6.1、§6.11～§6.19、§7）、`inventory/04-wal-state.md`（§2.9、§3、§4）、`inventory/10-gaps.md`（G-04～G-06）。
 
 ---
 
@@ -29,6 +29,11 @@
 - 本環境不得對真實主機做破壞性變更：測試一律以 `HOME`、`XDG_*`、`SERIALWRAP_*` 隔離目錄與 PATH stub（`systemctl`、`sudo`、`loginctl`、`ssh`、`autossh`、`schtasks`、`sc.exe`、`powershell.exe`）執行；真實 `systemctl --user serialwrap`、`/etc/systemd`、`/etc/wsl.conf`、Windows Task Scheduler 的註冊只在 owner 授權的 `cap_supervisor_runtime__*` 測試執行（預設 ignored）。
 - repo 政策：不得 commit 到 `main`；本 Phase 分支 `wt/rust-refactor/p4-<task-slug>`，PR base `feature/rust-refactor`；每個 code PR 附 `changelog.d/<issue>-rust-p4-<slug>.md`（direct child；`<issue>` 為 Rust 重構追蹤 issue 編號，查無 issue 時省略前綴；frontmatter 含 `type`／`scope`／`issue`，`type` 只能是 `policy_check.changelog.TYPE_TO_SECTION` 的鍵：`feat`／`fix`／`refactor`／`perf`／`change`／`docs`／`remove`／`deprecate`／`security`）；commit 用 Conventional Commits 繁中 subject，含 `Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>` trailer；完成前跑 `python3 -m pytest -q tests/` 與 `python3 -m policy_check --repo .`。
 - `.project-policy.yml` 的 `code_paths` 必須含 `crates/**`、`scripts/rust/**`、`contracts/**`（P3 加入；Task 1 驗證，缺則補上），否則 R-09 不觸發 fragment 檢查。
+- **OD-15（2026-10-16）**：
+  - **原生 Windows COM 證據可在擁有者 host 取得**：Spike 1 基本資格已通過（擁有者 host 的 `b-log` 下 `rust-refactor/spike1/`：com0com 3.0.0.0、HVCI 執行中、Secure Boot 關閉；pair `CNCA0=COM20`（serialwrap 端）／`CNCB0=COM21`（bridge／測試端），第二次開啟 COM20 回 `ERROR_ACCESS_DENIED`）。OD-08 要求的原生 Windows COM handle 證據改為各 Task 的**可執行 gate**：在擁有者 host 以 `SW_TEST_COM_PAIR=COM20:COM21` 執行，daemon 一律以 OD-11 隔離實例（`SERIALWRAP_STATE_DIR`／`_RUN_DIR`／`_CONFIG_DIR` 三者明確設定且非預設）＋`SERIALWRAP_TEST_DEVICE_ALLOWLIST=COM20` 啟動，由 orchestrator 經 WSL interop 代跑（Codex 沙箱可能擋 `/mnt/c`），報告附 Windows build、HVCI 狀態與 pair 對應。只有擁有者 host 不可用時才記「證據不足」。Spike 1 剩餘三項（控制線隔離、Console-side pair、peer-close 語意）仍屬待測，不得預標 PASS。
+  - **docker 優先**：L1.5 與 Linux 監管行為一律先以 P2 Task 17 的 docker runner（`scripts/docker/run-l15.sh`、`scripts/docker/run-systemd.sh`）驗證，報告 `evidence_layer: "L1.5-docker"`；docker 證據**不得**計為真板 L2、實機 L3 或 OD-10 bench 長跑。
+  - **`windows-task` >72 h** 改用 P2 Task 18 的 throwaway 排程工作程序（`scripts/stage0/win-task-throwaway.ps1`，工作名 `serialwrap-throwaway-<run_id>`、隔離目錄）在擁有者 host 執行，不動正式 `serialwrap` 工作。
+  - **com0com 選用元件**（Task 19，SC-36）：Windows 安裝新增選用、需提權、預設不勾選的 com0com 元件；基本安裝維持使用者身分、不得要求管理員。新增旗標 `setup --with-com0com`／`--remove-com0com` 只新增不修改（OD-14 相容原則），須登記於 `contracts/cli_schema.json` 並同步 `README.md` 英文與繁中兩段。**仍不新增錯誤碼**（選用元件失敗以 `optional_components` 欄位回報）。
 
 ## Review Focus
 
@@ -44,7 +49,7 @@
 
 ### 0.1 兩段式執行
 
-1. **TDD 階段（紅燈）**：依序完成 Task 1 全部步驟（骨架讓測試可編譯；骨架自身的 parser／help 擴充也先寫失敗測試），再依 Task 17、2→16、18 的順序只做每個 Task 的「步驟 1（寫失敗測試）」與「步驟 2（執行並確認 FAIL）」。全部紅燈原因符合各 Task 的預期（`not implemented: P4-Tn` panic、斷言不符或 sentinel exit 97，**不得**是編譯錯誤或 fixture 錯誤）後，一次 commit：
+1. **TDD 階段（紅燈）**：依序完成 Task 1 全部步驟（骨架讓測試可編譯；骨架自身的 parser／help 擴充也先寫失敗測試），再依 Task 17、2→16、18、19 的順序只做每個 Task 的「步驟 1（寫失敗測試）」與「步驟 2（執行並確認 FAIL）」。全部紅燈原因符合各 Task 的預期（`not implemented: P4-Tn` panic、斷言不符或 sentinel exit 97，**不得**是編譯錯誤或 fixture 錯誤）後，一次 commit：
    `test(rust-cli): 新增 Stage 1B 管理面失敗測試`（trailer 照 Global Constraints）。
    - 紅燈階段新增的 **pytest** 一律加 `@pytest.mark.xfail(strict=True, reason="P4-T<n> 紅燈")`（與 P3 §0.5 相同），使 `python3 -m pytest -q tests/` 在紅燈 commit 與後續各 Task commit 都不出現新失敗；該 Task 實作完成的同一 commit 移除 marker（`strict=True` 保證漏移除會變 XPASS→FAIL）。Rust 紅燈測試只在 `cargo test -p <crate> --test <file>` 層級預期失敗，不進 `pytest tests/`。
    - 預期「對既有實作直接 PASS」的測試（例如 Task 2 若 P3 已有部分 `SysEnv` 方法、Task 15 對 P1 已改過的文件）不得當紅燈證據：必須附一次**突變檢查**（暫時改壞受測實作或文件的一行 → 確認該測試轉紅 → 還原），在 PR 描述記錄突變內容與結果。
@@ -63,8 +68,9 @@
 | 8 | Task 12 | Task 4、7、10、11 |
 | 9 | Task 13 | Task 2、4、10、11 |
 | 10 | Task 14 | Task 7、10 |
-| 11 | Task 18（windows-task Spike 2 程序與證據 schema） | Task 3、10、12 |
-| 12 | Task 15 | Task 6～14 |
+| 11 | Task 18（windows-task Spike 2 程序與證據 schema；>72 h 實跑沿用 P2 Task 18 throwaway 排程工作） | Task 3、10、12 |
+| 11b | Task 19（Windows 安裝的 com0com 選用元件，SC-36，OD-15） | Task 4、11、12、17 |
+| 12 | Task 15 | Task 6～14、19 |
 | 13 | Task 16 | 全部 |
 
 ### 0.2 本 Phase 消費的 P0～P3 產出（Consumes，全 Phase 共用）
@@ -127,9 +133,9 @@ P3 **沒有**交付、但本 Phase 需要者（全部由本 Phase 建立，誰�
 | 項目 | 檔案 | 內容 |
 |---|---|---|
 | 錯誤碼 | `contracts/error_codes.yaml` | **不新增碼**。本 Phase 用到的既有碼若 `scope.interfaces` 未含 `cli_local`（例如 `TIMEOUT`、`SESSION_BUSY`、`DEVICE_STILL_HELD`、`CHECKSUM_VERIFY_FAILED`），只補 interface 與對應 SKILL 說明（OD-06 受管區段重生）；`phase` 值集合（`restart_wait_old_exit`、`reconcile_wait_old_exit`、`service_restart_wait_stop`、`install_lock`、`update_verify`、`rollback_verify`、`update_safety_check`、`update_confirm_released`、`update_start_and_verify`、`update_autostart_hold`／`update_autostart_release`（R5-F1：交接前抑制監管拉起失敗、還原時撤銷失敗；碼為 `INTERNAL_ERROR`／`NEEDS_SUDO`／`TIMEOUT`）、`supervision_set_safety_check`（R1-F3：`supervision-mode set` 的預檢與交接拒絕，碼為 `FLASHING_BUSY`／`SESSION_BUSY`／`DEVICE_STILL_HELD`／探測 RPC 原碼））寫入各碼的 `meaning` 附註 |
-| 行為變更狀態 | `contracts/behavior_changes.yaml` | SC-18、SC-20～SC-25、SC-27、DF-05、DF-07、DF-10～DF-13、DF-16、BC-05 在對應 Task 完成時 `status: IMPLEMENTED`（P0 `CHANGE_STATUS` 大寫值）；`case_ids` **不改**（P0 已凍結，例如 `sc18-windows-ondemand-autostart`、`sc23-setup-rollback`、`bc05-three-topologies`）；`VERIFIED` 只在 BLOCKED-OWNER 證據補齊後由擁有者改 |
+| 行為變更狀態 | `contracts/behavior_changes.yaml` | **新登記 SC-36**（Task 19，OD-15：Windows 安裝的 com0com 選用元件；Rust-only、`ab_participation: absolute_only`、`phases: [P4, P8]`、`case_ids: ["sc36-win-installer-com0com-optional"]`；登記即 `APPROVED`，Task 19 完成時 `IMPLEMENTED`）。SC-18、SC-20～SC-25、SC-27、DF-05、DF-07、DF-10～DF-13、DF-16、BC-05 在對應 Task 完成時 `status: IMPLEMENTED`（P0 `CHANGE_STATUS` 大寫值）；`case_ids` **不改**（P0 已凍結，例如 `sc18-windows-ondemand-autostart`、`sc23-setup-rollback`、`bc05-three-topologies`）；`VERIFIED` 只在 BLOCKED-OWNER 證據補齊後由擁有者改 |
 | 測試↔case 綁定 | `tests/acceptance/p4_case_map.yaml`（新增，Task 1） | 每個 P0 case_id 與 P2 `cases.lock.json` `sets.cli_1B` 中 `implemented_by: 05-stage1b-rust-cli-mgmt.md` 的 case_id → 承接測試節點清單（Rust：`<crate>::<test file>::<fn>`；pytest：node id 並加 `@pytest.mark.case("<case_id>")`）、平台、能力、artifact、證據檔；schema 見 §0.4 |
-| CLI schema | `contracts/cli_schema.json` | Rust-only：`supervision-mode [set MODE] [--force] [--with-sudo]`（R1-F3：`--force` 保留為相容旗標，不覆寫交接護欄，只在輸出記 `force_ignored:true`）、`setup --windows-task/--windows-service/--rollback`、env `SERIALWRAP_INSTALL_ROOT`；雙邊：`daemon restart`、`remote stop`（以 P1 Python parser 擷取） |
+| CLI schema | `contracts/cli_schema.json` | Rust-only：`setup --with-com0com`／`setup --remove-com0com`（Task 19，SC-36，只新增）、`supervision-mode [set MODE] [--force] [--with-sudo]`（R1-F3：`--force` 保留為相容旗標，不覆寫交接護欄，只在輸出記 `force_ignored:true`）、`setup --windows-task/--windows-service/--rollback`、env `SERIALWRAP_INSTALL_ROOT`；雙邊：`daemon restart`、`remote stop`（以 P1 Python parser 擷取） |
 | CLI help golden | `contracts/cli_help/rust_only/*.txt` | 由 `scripts/rust/capture_cli_help.py --rust-only` 以 Python 3.12 argparse（`sw_core.cli.build_parser()`＋本計畫的擴充 `add_argument`）產生，COLUMNS=80 與 120 |
 | manifest schema | `contracts/release_manifest.schema.json` | 與 P1 T18 欄位一致（`components.daemon.{launcher,runtime,package}`）；新增 optional `components.daemon.state_schema`（string）、`components.supervisor.task_xml_template_sha256`（string）；不改既有必填欄位 |
 
@@ -539,7 +545,7 @@ python3 scripts/rust/check_cfg_boundary.py
 
 **BLOCKED-OWNER：**
 - Windows 實機 SERIALCOMM 含藍牙與 USB-UART 混合列舉的實測（需 OD-05 機台接上實體 USB-UART 與藍牙 COM；本環境 interop 只能驗證空／既有登錄內容）。
-- OD-08：本 Task 動到 PAL，PR 必附原生 Windows COM handle 證據（com0com DUT-side pair 或實體 USB-UART 直連 Windows）；本環境無法產出，PR 標示證據待補。
+- OD-08：本 Task 動到 PAL，PR 必附原生 Windows COM handle 證據。**OD-15 起改為可執行 gate**（非 BLOCKED）：擁有者 host 以 `SW_TEST_COM_PAIR=COM20:COM21`＋OD-11 隔離實例（`SERIALWRAP_TEST_DEVICE_ALLOWLIST=COM20`）由 orchestrator 代跑，報告附 Windows build／HVCI／pair 對應；擁有者 host 不可用時才記「證據不足」。
 
 ---
 
@@ -794,7 +800,7 @@ python3 scripts/rust/check_cfg_boundary.py
 
 **BLOCKED-OWNER：**
 - Spike 2：在 OD-05 代表機台以正式 artifact 註冊 `windows-task`，驗證登入觸發、唯一實例（`IgnoreNew`）、失敗自動重啟、`PT0S` 與實際連續運行 >72 小時（需互動登入／登出與重開機）；可執行程序、腳本與證據 schema 由 Task 18 交付。
-- OD-08：本 Task 動到 PAL，PR 必附原生 Windows COM handle 證據（本環境無法產出，PR 標示證據待補）。
+- OD-08：本 Task 動到 PAL，PR 必附原生 Windows COM handle 證據；OD-15 起為可執行 gate（擁有者 host `SW_TEST_COM_PAIR=COM20:COM21`＋OD-11 隔離實例、allowlist `COM20`，orchestrator 代跑；host 不可用才記「證據不足」）。
 - `cap_supervisor_runtime__windows_task_roundtrip` 在擁有者 Windows 主機執行（會建立並刪除排程工作，需擁有者同意）。
 - `cap_supervisor_runtime__systemd_hold_blocks_restart_on_failure`（R5-F1）在擁有者 Linux 主機的 `systemd --user` 執行（建立並刪除測試 unit，需擁有者同意）；`systemd-system` 版的 hold（`/etc/systemd/system/…` drop-in＋`RefuseManualStart` 對 running unit 生效）另於擁有者授權的 throwaway VM 驗證，結論不符時回報擁有者調整抑制機制，不得改寬斷言。
 - `windows-service` 的帳號、Session 0、ACL 資格（OD-12；僅在擁有者核准採用時）。
@@ -900,7 +906,7 @@ scripts/rust/win-test.sh --package sw-pal -- proc_scan process_ctl
 
 **BLOCKED-OWNER：**
 - 以正式 Windows artifact（原生 build 的 launcher＋bundled Python）在 OD-05 機台實測 Stage 1 daemon 只被計為 1 個實例；受 EDR 限制時 `NtQueryInformationProcess` 是否可讀命令列需實機確認。
-- OD-08：本 Task 動到 PAL，PR 必附原生 Windows COM handle 證據（本環境無法產出，PR 標示證據待補）。
+- OD-08：本 Task 動到 PAL，PR 必附原生 Windows COM handle 證據；OD-15 起為可執行 gate（擁有者 host `SW_TEST_COM_PAIR=COM20:COM21`＋OD-11 隔離實例、allowlist `COM20`，orchestrator 代跑；host 不可用才記「證據不足」）。
 
 ---
 
@@ -988,7 +994,7 @@ scripts/rust/win-test.sh --package sw-pal -- process_tunnel fs_lock
 
 **BLOCKED-OWNER：**
 - Win32-OpenSSH `ssh.exe` 在擁有者 Windows 主機被 `TerminateProcess` 後 relay 端 `-R`／`-L` forward 的實際釋放時間（需真實 relay）。
-- OD-08：本 Task 動到 PAL，PR 必附原生 Windows COM handle 證據（本環境無法產出，PR 標示證據待補）。
+- OD-08：本 Task 動到 PAL，PR 必附原生 Windows COM handle 證據；OD-15 起為可執行 gate（擁有者 host `SW_TEST_COM_PAIR=COM20:COM21`＋OD-11 隔離實例、allowlist `COM20`，orchestrator 代跑；host 不可用才記「證據不足」）。
 
 ---
 
@@ -2968,7 +2974,7 @@ python3 -m pytest -q tests/ && python3 -m policy_check --repo .
 - [ ] **步驟 5：commit**：`feat(rust-cli): 實作完整組合首次安裝、更新與 setup --rollback`
 
 **BLOCKED-OWNER：**
-- Spike 6 實機回滾：在 L2 bench 與 OD-05 Windows 機台（OD-08：com0com DUT-side pair 或實體 USB-UART 直連 Windows）完成「更新→回滾」並證明真實串口被舊版 daemon 釋放、Previous daemon 重新取得（§12.1 末段），不只比對版本字串。
+- Spike 6 實機回滾：在 L2 bench 與 OD-05 Windows 機台（OD-08：com0com DUT-side pair 或實體 USB-UART 直連 Windows；OD-15 起 Windows 側串口釋放／重新取得可先在擁有者 host 以 COM20／COM21＋OD-11 隔離實例實跑，屬可執行 gate，L2 bench 部分仍 BLOCKED-OWNER）完成「更新→回滾」並證明真實串口被舊版 daemon 釋放、Previous daemon 重新取得（§12.1 末段），不只比對版本字串。
 - §10.3 實際權限下（一般任務 Agent 身分）無法觸發 update／rollback 或替換版本檔的證據（見 Task 15；須為 `verify_agent_perms.py` `verdict:"blocked"`，含 ownership／chmod／DACL 與祖先目錄替換檢查，當下操作被拒不足以成立）。
 
 ---
@@ -3554,6 +3560,8 @@ python3 scripts/rust/check_p4_cases.py --check
 python3 scripts/rust/check_cfg_boundary.py && python3 -m pytest -q tests/ && python3 -m policy_check --repo .
 ```
 
+**OD-15 docker 優先**：上列 Linux L1.5（`func-test/runner.py --mode bridge`、`test_multiagent_e2e.py`／`test_human_agent_coexist.py` 以 Rust CLI 執行）與監管相關黑箱，先以 P2 Task 17 的 `scripts/docker/run-l15.sh rust-1b`（兩容器拓樸 serialwrap ⇄ bridge ⇄ DUT 模擬器、假 COM 為 socat PTY pair）與 `scripts/docker/run-systemd.sh`（systemd container：journald 收 daemon stderr、`setup` reconcile 與 SC-23 autostart hold drop-in 以 `systemctl show -p Restart,RefuseManualStart` 驗 `Restart=no`／`RefuseManualStart=yes`）執行；報告帶 `evidence_layer: "L1.5-docker"`、`topology: "docker-2c"`、`uart_kind: "pty-fake"`、`image_digests`、`bundle_tree_sha256`，`check_p4_cases.py --check` 只把它們計入 L1.5，掛到 `layer ∈ {L2, L3}` 或 bench 長跑案例時判 FAIL（P2 `evidence_labels.assert_not_real_board`）。步驟 1 另加測試 `test_check_p4_cases_rejects_docker_for_l2`：合成一份 `evidence_layer: "L1.5-docker"` 報告綁到 L2 案例 → `check_p4_cases.py --check` exit 1 且訊息含 `not_real_board`。
+
 本環境量得的 WSL2 數值只記為「Linux／WSL2 開發參考」（`gate:"NOT_STANDARD_ENV"`），報告中明確標示環境，不填入 §1.2 正式欄位。P3 沿用的 Stage 1A 證據（資料面 A/B、L1.5）只在其 artifact sha256 與本次 bundle 的 `components.cli.sha256` 相同時才可沿用，否則以本次 bundle 重跑。
 
 - [ ] **步驟 5：commit**：`test(rust-cli): 完成 Stage 1B 黑箱 A/B、L1.5 與量測工具`
@@ -3563,7 +3571,7 @@ python3 scripts/rust/check_cfg_boundary.py && python3 -m pytest -q tests/ && pyt
 - §11.6 Stage 1B L2：以 Rust CLI 作為 pinned `serialwrap_exe` 在 live bench 跑全部適用 TestPilot `serialwrap_regression` 案例，含已授權破壞集。
 - §11.6 Stage 1B L3：`realhw` P0＋P1＋remote 以 Rust CLI 執行。
 - §11.6／OD-10：Rust CLI＋Python daemon 混合組合 48 小時長跑（至少 Windows 生產目標環境；bench 依序排程，約佔 3 天）——程序與 gate 判定沿用 P2 `longrun_acceptance.yaml`，本 Phase 只把 Rust CLI artifact 填入 manifest。這是最早的 Rust 候選長跑（`S1B-L3-MIXED-48H-WINDOWS`）：前置為 OD-09 延後項已於正式 Stage 0 出口以 P2 Task 16 凍結（工具屬 P2，不需等待 P9，R4-F2）；啟動 `python3 -m realhw --tier longrun` 前必須先執行 `py -3.12 -m realhw.acceptance.od09_freeze register-candidate --acceptance realhw/acceptance/longrun_acceptance.yaml --item S1B-L3-MIXED-48H-WINDOWS --platform windows --run-id <run_id> --started-at <now>`，exit 非 0（未凍結 → 5，`HARNESS_OD09_NOT_FROZEN`）即不得開跑；gate 的 `pre_frozen` 仍為最後防線。
-- Spike 2（>72 h `windows-task` 監管，程序見 Task 18）、Spike 6（混合版本與實機回滾）與 OD-08 原生 Windows COM handle 證據（動到 PAL 的 PR 必附）。
+- Spike 6（混合版本與實機回滾）的 L2 bench 部分。Spike 2（>72 h `windows-task` 監管）與 OD-08 原生 Windows COM handle 證據自 OD-15 起改為擁有者 host 上的可執行 gate（Task 18 沿用 P2 Task 18 throwaway 排程工作；COM20／COM21＋OD-11 隔離實例），不再列 BLOCKED-OWNER；擁有者 host 不可用時記「證據不足」。
 - 正式 release artifact 於 Windows 自架 runner 原生 build/link 與簽署前檢查（`objdump -p` 匯入 DLL 白名單、launcher Subsystem 為 Windows GUI）。
 
 ---
@@ -3655,7 +3663,7 @@ python3 scripts/rust/check_cfg_boundary.py
 
 **BLOCKED-OWNER：**
 - 正式 Windows bundle 的 bundled Python runtime（非 venv）由擁有者 Windows 自架 runner 產生並原生 build launcher；本環境只驗 dev bundle。
-- OD-08：本 Task 動到 PAL（`exec_or_wait_opts`），PR 必附原生 Windows COM handle 證據（本環境無法產出，PR 標示證據待補）。
+- OD-08：本 Task 動到 PAL（`exec_or_wait_opts`），PR 必附原生 Windows COM handle 證據；OD-15 起為可執行 gate（擁有者 host `SW_TEST_COM_PAIR=COM20:COM21`＋OD-11 隔離實例、allowlist `COM20`，orchestrator 代跑；host 不可用才記「證據不足」）。
 
 ---
 
@@ -3682,19 +3690,101 @@ scripts/rust/win/spike2_windows_task.ps1 -Phase <install|logon|single|restart|lo
   restart：`Stop-Process -Force` launcher（模擬崩潰）→ 記錄重新拉起時間（期望 ≤ 90 s：PT1M＋啟動時間）
   longrun-start／longrun-check：寫入起始時間戳；check 時要求 now-start ≥ 72 h、期間 `health.ping` 每 5 分鐘取樣皆 ok（由同一 task 內的取樣器寫入 evidence）、`ExecutionTimeLimit` 未觸發
   teardown：只在擁有者同意下 `schtasks /Delete`
+  OD-15：-TaskName 參數（預設 serialwrap）；install／single／restart／longrun-* 在擁有者 host 實跑時一律以 P2 Task 18 throwaway 程序
+    （scripts/stage0/win-task-throwaway.ps1 -RunId <id> -Hours 72 -Bundle <dir>）註冊工作名 serialwrap-throwaway-<run_id>、
+    STATE／RUN／CONFIG 隔離根 %LOCALAPPDATA%\sw-throwaway\<run_id>\、OD-11 allowlist COM20，不碰正式 serialwrap 工作；teardown 對應 -Cleanup
   每個 phase 輸出 <OutDir>/<case_id>.json，符合 contracts/evidence/spike2_windows_task.schema.json
 scripts/rust/judge_spike2.py --evidence-dir <dir>   # 依 schema 與上列門檻判 PASS／FAIL／INSUFFICIENT_EVIDENCE（§11.4；缺檔或時間戳不連續 → INSUFFICIENT_EVIDENCE，不得判 PASS）
 ```
 
 evidence schema 必填：`case_id`、`artifact_sha256`（CLI、launcher、runtime）、`machine_id`、`os_build`、`user`、`started_at`／`ended_at`（UTC ISO-8601）、`observations[]`（`ts`、`kind`、`value`）、`task_xml_sha256`、`verdict_inputs`。
 
-- [ ] **步驟 1：寫失敗測試**（`tests/test_rust_spike2_tools.py`）：`judge_spike2.py` 對合成證據的判定——72 h 足夠且取樣連續 → PASS；71.9 h → FAIL；取樣缺 2 小時 → INSUFFICIENT_EVIDENCE；重啟 120 s → FAIL；single 實例數出現 2 → FAIL；schema 缺欄位 → INSUFFICIENT_EVIDENCE。另驗兩份 deploy 文件含「前置條件」「步驟」「預期證據」「判定」「清理」五節，且 `.ps1` 不含 `schtasks /Delete` 以外的破壞性指令（掃描 `Remove-Item -Recurse` 指向 install root 以外路徑者即 FAIL）。測試以 `xfail(strict=True, reason="P4-T18 紅燈")` 標示。
+- [ ] **步驟 1：寫失敗測試**（`tests/test_rust_spike2_tools.py`）：`judge_spike2.py` 對合成證據的判定——72 h 足夠且取樣連續 → PASS；71.9 h → FAIL；取樣缺 2 小時 → INSUFFICIENT_EVIDENCE；重啟 120 s → FAIL；single 實例數出現 2 → FAIL；schema 缺欄位 → INSUFFICIENT_EVIDENCE。OD-15 補充：`-TaskName serialwrap-throwaway-r1` 時 `.ps1` 產生的所有 `schtasks` 呼叫（以 `-WhatIf` 模式輸出的命令清單斷言）只帶 `/TN serialwrap-throwaway-r1`、絕不出現 `/TN serialwrap`（正式工作名）；evidence 的 `evidence_layer == "host-throwaway"`；`judge_spike2.py` 對 `task_name` 不以 `serialwrap-throwaway-` 開頭且 `user` 為正式工作身分的證據不判定（INSUFFICIENT_EVIDENCE），避免誤動正式工作。另驗兩份 deploy 文件含「前置條件」「步驟」「預期證據」「判定」「清理」五節，且 `.ps1` 不含 `schtasks /Delete` 以外的破壞性指令（掃描 `Remove-Item -Recurse` 指向 install root 以外路徑者即 FAIL）。測試以 `xfail(strict=True, reason="P4-T18 紅燈")` 標示。
 - [ ] **步驟 2：執行並確認 FAIL**：`python3 -m pytest -q tests/test_rust_spike2_tools.py --runxfail` → 腳本不存在。
 - [ ] **步驟 3：實作**：依 Produces；`.ps1` 只讀寫 `-OutDir` 與 `-InstallRoot`，不改系統設定以外的任何東西（登出／登入由擁有者手動，腳本只記錄）。
 - [ ] **步驟 4：執行並確認 PASS**：`python3 -m pytest -q tests/test_rust_spike2_tools.py`；`pwsh -NoProfile -Command "Invoke-ScriptAnalyzer scripts/rust/win/*.ps1"`（可用時）；`python3 -m policy_check --repo .`。
 - [ ] **步驟 5：commit**：`docs(rust-refactor): 新增 windows-task Spike 2 程序、證據 schema 與判定器`
 
-**BLOCKED-OWNER：** 全部 `win-task-*` 實跑（需擁有者 Windows 工作站、互動登入／登出、>72 h 連續運行）；windows-task 版 `p1-rst-daemon` 與 Windows 版 `rm-live-e2e`（需實體板與真實 relay）。本 Task 只交付可執行程序與判定器，證據待擁有者執行（master plan §3）。
+**OD-15 可執行 gate（非 BLOCKED）：** `win-task-single-instance`、`win-task-restart-on-failure`、`win-task-72h`（>72 h 連續運行）在擁有者 Windows host 以 throwaway 排程工作實跑（與 docker 內 Linux 監管 >72 h、48 h 長跑並行；Linux docker 無法承載 Task Scheduler），證據 `evidence_layer: "host-throwaway"`；擁有者 host 不可用時記「證據不足」。
+
+**BLOCKED-OWNER：** `win-task-logon-trigger`（需互動登出／登入）與測試團隊工作站上的正式 `serialwrap` 工作實跑；windows-task 版 `p1-rst-daemon` 與 Windows 版 `rm-live-e2e`（需實體板與真實 relay）。本 Task 只交付可執行程序與判定器，證據待擁有者執行（master plan §3）。
+
+---
+
+## Task 19：Windows 安裝的 com0com 選用元件（SC-36，OD-15）
+
+OD-15 (1)：com0com 主要 driver 打包進 serialwrap Windows 安裝，作為**選用、需提權、預設不勾選**的元件；不得使整體安裝需要管理員；附 GPLv2 授權與原始碼取得方式；Spike 1 剩餘項（控制線隔離、Console-side pair、peer-close 語意）於 HVCI 開啟機台全部通過前標示為實驗性。規格原文只把 com0com 定為選配／測試手段（OD-01／OD-08），打包屬 OD-15 新增範圍，登記為 **SC-36**（Rust-only）。
+
+**Test author model:** haiku-xhigh
+**Test reviewer model:** agy-gemini-3.8-flash-high
+**Implementer model:** codex-gpt-6-luna-max（提權 spawn、Windows 行程與安裝流程；依 00-master-plan §2 屬實作 B）
+**Changelog fragment:** `changelog.d/<issue>-rust-p4-com0com-optional.md`（`type: feat`，`scope: rust-cli`）：Windows 安裝新增選用、需提權的 com0com 元件（`setup --with-com0com`／`--remove-com0com`），基本安裝仍不需管理員；附 GPLv2 授權與原始碼取得方式，目前標示為實驗性。
+
+**Files:**
+- Create: `crates/sw-com0com-helper/`（`Cargo.toml`、`src/main.rs`；bin `sw-com0com-helper`，Windows 產物 `bin\sw-com0com-helper.exe`；只解析 `install|remove --pair CNCA0=COMx,CNCB0=COMy` 並呼叫 `sw_pal::com0com`，不含平台 `cfg`）、`crates/sw-pal/src/com0com.rs`（`setupc.exe` 呼叫與輸出解析；Windows 實作與 POSIX `Unsupported` 皆在 sw-pal）、`crates/sw-cli/tests/mgmt_com0com.rs`、`tests/contract_blackbox/test_cli_mgmt_com0com.py`、`packaging/com0com/{LICENSE-GPLv2.txt,SOURCE.md,PROVENANCE.json}`
+- Modify: `scripts/rust/mkbundle.sh`（Windows target 新增 `--with-com0com <signed zip>`：解出簽章 driver 套件與 `setupc.exe` 到 bundle `optional/com0com/`，複製 `packaging/com0com/*`，計算 sha256 寫入 manifest；未給參數時 bundle 不含此元件）、`crates/sw-proto/src/release_manifest.rs`（`components.com0com` optional 結構）、`contracts/release_manifest.schema.json`（新增 optional `components.com0com`，不改既有必填欄位）、`crates/sw-cli/src/install_layout.rs`（`verify_bundle` 驗該元件 sha256；元件缺席仍有效）、`crates/sw-cli/src/setup_cmd.rs`（`--with-com0com`／`--remove-com0com` 獨立步驟與 `optional_components` 輸出）、`crates/sw-pal/src/process.rs`（`ProcessCtl::spawn_elevated`）、`crates/sw-pal/src/fakes.rs`（`FakeProcessCtl::elevated_spawns`、`elevation_result`）、`contracts/cli_schema.json`（兩個旗標，Rust-only）、`contracts/cli_help/rust_only/*.txt`（`capture_cli_help.py --rust-only` 重產）、`contracts/behavior_changes.yaml`（登記 SC-36）、`tests/test_contracts_catalog.py`（`test_bc_real_sc_df_ranges` 的 SC 期望改為 `{f"SC-{i:02d}" for i in range(1, 28)} - {"SC-08"} | {"SC-34", "SC-35", "SC-36"}`；`test_bc_real_rust_only_python_null` 名單加 SC-36）、`tests/acceptance/p4_case_map.yaml`（`sc36-win-installer-com0com-optional` 綁定本 Task 測試）、`README.md`（英文與繁中兩段：選用元件、提權範圍、GPLv2 與原始碼取得、實驗性、移除方式）、SKILL（安裝段落提及選用元件；非受管區段）
+
+**Interfaces:**
+- Consumes：Task 4 `ProcessCtl`、Task 11 `ReleaseManifest`／`verify_bundle`／`stage_version`／`install_lock`、Task 12 `run_setup`（首次安裝／update 步驟序列與 `UpdateReport`）、Task 17 `mkbundle.sh` Windows bundle。
+- Produces：
+
+```rust
+// sw-pal/src/process.rs
+pub enum ElevatedOutcome { Exited(i32), Declined /* ERROR_CANCELLED：使用者拒絕 UAC */ }
+pub trait ProcessCtl: Send + Sync {
+    // 既有方法不變，新增：
+    /// Windows：ShellExecuteExW(lpVerb="runas", SEE_MASK_NOCLOSEPROCESS) 啟動 exe 並等待結束；POSIX：Err(kind=Unsupported)
+    fn spawn_elevated(&self, exe: &Path, args: &[String]) -> PalResult<ElevatedOutcome>;
+}
+// sw-pal/src/com0com.rs（install_pair／remove_pair 只在提權 helper 內呼叫；list_pairs 為唯讀、主行程可不提權呼叫）
+pub fn install_pair(setupc: &Path, a: &str, b: &str) -> PalResult<PairInfo>;   // setupc.exe install PortName=COMx PortName=COMy
+pub fn remove_pair(setupc: &Path, pair_index: u32) -> PalResult<()>;
+pub fn list_pairs(setupc: &Path) -> PalResult<Vec<PairInfo>>;                   // 解析 setupc list
+pub struct PairInfo { pub index: u32, pub a_name: String, pub b_name: String }
+
+// sw-proto/src/release_manifest.rs
+pub struct Com0comComponent { pub optional: bool, pub default_selected: bool, pub requires_elevation: bool, pub experimental: bool,
+                              pub version: String, pub sha256: String, pub license: String /* "GPL-2.0" */,
+                              pub license_file: String, pub source_offer_file: String, pub provenance_file: String, pub helper: String,
+                              pub default_pair: (String, String) /* ("COM20","COM21") */ }
+impl ReleaseManifest { pub fn com0com(&self) -> Option<Com0comComponent>; }   // 缺席 → None
+
+// sw-cli/src/setup_cmd.rs
+pub enum OptionalStep { InstallCom0com { pair: (String, String) }, RemoveCom0com }
+pub fn run_optional_step(ctx: &Ctx, bundle: &Path, step: OptionalStep) -> PyDict;
+  // 回 {"installed":bool|"removed":bool, "reason":Option<"elevation_declined"|"helper_failed"|"component_absent">, "helper_rc":Option<i32>, "experimental":bool}
+```
+
+`setup` 輸出：基本安裝結果不變，另加 `"optional_components":{"com0com":{…}}`（只在帶旗標或元件已安裝時輸出）。基本安裝成功時，選用元件失敗或 UAC 被拒一律 `ok:true`、exit 0（只在 `optional_components.com0com` 回報）。`--remove-com0com` 只執行移除步驟；serialwrap 本體 rollback／移除**不**呼叫 helper，若偵測到 pair 仍存在，輸出 `optional_components.com0com.left_installed: true`。`experimental` 為 true 時 stderr 印一行 `serialwrap: com0com 選用元件為實驗性（Spike 1 未全數通過）`。預設 pair 為 `CNCA0=COM20`、`CNCB0=COM21`：`setup` 不另加 pair 參數（不新增 `--com0com-pair`），一律以 manifest 的 `components.com0com.default_pair` 傳給 helper；指定其他 pair 只能直接呼叫 helper（測試用）。
+
+- [ ] **步驟 1：寫失敗測試**（`crates/sw-cli/tests/mgmt_com0com.rs`，`FakeProcessCtl`＋`MemFs` bundle；`tests/contract_blackbox/test_cli_mgmt_com0com.py` 以 `mkbundle.sh --dev --with-com0com <fixture zip>` 的 bundle 執行）：
+
+| 測試 | 斷言 |
+|---|---|
+| `manifest_com0com_component_optional` | `m.com0com().unwrap()`：`optional == true`、`default_selected == false`、`requires_elevation == true`、`license == "GPL-2.0"`、`version == "3.0.0.0"` |
+| `bundle_without_component_verifies` | 不帶 `--with-com0com` 產生的 bundle：`m.com0com().is_none()` 且 `verify_bundle(..) == Ok(())` |
+| `bundle_component_sha_mismatch_rejected` | 竄改 `optional/com0com/` 任一檔 → `verify_bundle` 回含 `components.com0com.sha256` 的 `PairingDiff` |
+| `base_install_never_elevates` | `setup`（首次安裝與 update 兩路徑，不帶旗標）後 `fake.elevated_spawns().is_empty()`；`fake.spawns()` 無任何 argv 含 `runas` |
+| `with_com0com_elevates_exactly_helper` | `setup --with-com0com` → `elevated_spawns().len() == 1`，exe 為 `<bundle>\bin\sw-com0com-helper.exe`、args `== ["install","--pair","CNCA0=COM20,CNCB0=COM21"]`；基本安裝步驟仍無提權 |
+| `uac_declined_keeps_base_ok` | `elevation_result(Declined)` → stdout JSON `ok == true`、`optional_components.com0com == {"installed":false,"reason":"elevation_declined","helper_rc":null,"experimental":true}`、exit 0 |
+| `helper_failure_reported` | `elevation_result(Exited(3))` → `installed == false`、`reason == "helper_failed"`、`helper_rc == 3`、exit 0 |
+| `component_absent_with_flag` | bundle 無元件＋`--with-com0com` → `reason == "component_absent"`、無提權 |
+| `existing_pair_not_reinstalled` | fake `list_pairs` 已含 `COM20`／`COM21` → `--with-com0com` 不提權、`installed == true`、`reason` 為 null |
+| `remove_com0com_plan` | `setup --remove-com0com` → 恰一次提權，args `== ["remove","--pair","CNCA0=COM20,CNCB0=COM21"]` |
+| `rollback_does_not_touch_driver` | `setup --rollback` 後 `elevated_spawns().is_empty()`；fake `list_pairs` 回一組 → 輸出含 `left_installed: true` |
+| `experimental_stderr_line` | `experimental == true` 時 stderr 恰含一行 `serialwrap: com0com 選用元件為實驗性（Spike 1 未全數通過）` |
+| `spawn_elevated_unsupported_on_posix`（POSIX） | `native` `ProcessCtl::spawn_elevated` 回 `Err(kind == Unsupported)` |
+| `test_bundle_license_files_present`（pytest） | bundle `optional/com0com/` 含 `LICENSE-GPLv2.txt`（首行含 `GNU GENERAL PUBLIC LICENSE` 與 `Version 2`）、`SOURCE.md`（含 SourceForge 專案 URL 與 3.0.0.0 原始碼 tarball 連結、書面提供承諾一節）、`PROVENANCE.json`（`md5 == "a07aa80024cca837dacc75d3573285ff"`、`authenticode_signer` 含 `CyberCircuits`） |
+| `test_cli_schema_flags_rust_only`（pytest） | `contracts/cli_schema.json` 的 `setup` 含 `--with-com0com`、`--remove-com0com`，標 Rust-only；既有 `setup` 旗標集合為其子集（只新增，不改） |
+| `test_readme_com0com_both_languages`（pytest） | `README.md` 的 `English` 與 `繁體中文` 章各含 `com0com`、`GPL`、`--with-com0com` |
+| `test_sc36_registered`（pytest） | `behavior_changes.yaml` 的 SC-36：`scope == "rust_only"`、`ab_participation == "absolute_only"`、`phases == ["P4","P8"]`、`approval.decision_ref == "OD-15"`、`case_ids == ["sc36-win-installer-com0com-optional"]` |
+
+- [ ] **步驟 2：執行並確認 FAIL**：`cargo test -p sw-cli --test mgmt_com0com`（`not implemented: P4-T19` panic／未定義符號）；`python3 -m pytest -q tests/contract_blackbox/test_cli_mgmt_com0com.py tests/test_contracts_catalog.py --runxfail`（紅燈期 `xfail(strict=True, reason="P4-T19 紅燈")`）。
+- [ ] **步驟 3：實作**：依 Produces；登記 SC-36（`status: "APPROVED"` → 本步驟末改 `IMPLEMENTED`，`approval: {basis: owner_decision, owner: hamanpaul, decision_ref: OD-15, date: "2026-10-16"}`、`owner_confirmation: not_required`、`applies_to.python: null`、`rust.stage: "stage-1b"`）；`PROVENANCE.json` 欄位：`upstream_file`、`md5`、`sha256`、`authenticode_signer`、`timestamp_authority`（COMODO）、`spike1_evidence`（「擁有者 host 的 `b-log` 下 `rust-refactor/spike1/`」，不寫本機絕對路徑）；`experimental` 預設 true，只在 P2 Task 18 的 Spike 1 剩餘三項報告皆 PASS（HVCI 開啟）後由擁有者 PR 改 false。
+- [ ] **步驟 4：執行並確認 PASS**：`cargo test -p sw-cli --test mgmt_com0com && cargo test -p sw-pal`；`python3 -m pytest -q tests/contract_blackbox/test_cli_mgmt_com0com.py tests/test_contracts_catalog.py`；`python3 scripts/rust/check_cfg_boundary.py`；`python3 -m tools.contracts check`；`python3 -m policy_check --repo .`。原生 Windows（擁有者 host，需管理員，由 orchestrator 代跑）：以 Windows bundle 執行 `serialwrap setup --with-com0com` → 同意 UAC 後 `setupc list` 出現新 pair、`setup --remove-com0com` 後消失；拒絕 UAC 時基本安裝目錄與 `windows-task` 註冊照常完成。擁有者 host 已有 Spike 1 的 `COM20`／`COM21` pair：原生實跑先以 helper 直接指定不衝突的測試 pair（例如 `sw-com0com-helper.exe install --pair CNCA1=COM30,CNCB1=COM31`）驗證安裝／`list`／移除，結束後只移除該測試 pair，不動既有 pair；`setup --with-com0com` 的端到端在既有 pair 存在時應偵測到同名 pair 而回 `installed:true` 且不重複建立（`test`：fake `list_pairs` 已含 COM20／COM21 → 不提權、`reason` 為 null、`installed == true`）。
+- [ ] **步驟 5：commit**：`feat(rust-cli): Windows 安裝新增選用、需提權的 com0com 元件（SC-36）`
+
+**BLOCKED-OWNER：** 只有擁有者 host 不可用時，原生 Windows 提權安裝／移除實跑記「證據不足」（需管理員與 UAC 互動）；其餘皆為可執行步驟。
 
 ---
 
@@ -3719,7 +3809,8 @@ evidence schema 必填：`case_id`、`artifact_sha256`（CLI、launcher、runtim
 | 15 | Agent 權限模型文件與驗證工具、文件同步 | haiku-xhigh | agy-gemini-3.8-flash-high（審查 A 專審驗證腳本副作用） | §10.3、OD-06、OD-12 |
 | 16 | Stage 1B 整合：A/B、L1.5、效能 gate、Windows 原生 L1、案例完成度 | agy-gemini-3.8-flash-high | haiku-xhigh | §11.3、§11.6、§1.2 |
 | 17 | `sw-daemon` launcher、`yaml11::emit`、`bench_registry`、自含式 dev bundle | haiku-xhigh | codex-gpt-6-luna-max | arch §6.1、§10.1、§9.5、OD-13 |
-| 18 | `windows-task` Spike 2 程序、腳本與證據 schema | haiku-xhigh | agy-gemini-3.8-flash-high | §13 Spike 2、OD-03、P2 `win-task-*` |
+| 18 | `windows-task` Spike 2 程序、腳本與證據 schema（>72 h 以 P2 Task 18 throwaway 排程工作實跑，OD-15） | haiku-xhigh | agy-gemini-3.8-flash-high | §13 Spike 2、OD-03、OD-15、P2 `win-task-*` |
+| 19 | Windows 安裝的 com0com 選用元件（審核 agy-gemini-3.8-flash-high） | haiku-xhigh | codex-gpt-6-luna-max | SC-36、OD-15、OD-01、OD-08 |
 
 審查者固定：審查 A Claude Sonnet（effort max）、審查 B Codex `gpt-6.1-sol`（reasoning medium）；兩者皆不得為該 Task 實作者。
 
@@ -3727,11 +3818,11 @@ evidence schema 必填：`case_id`、`artifact_sha256`（CLI、launcher、runtim
 
 | # | 項目 | 來源 | 對應 Task |
 |---|---|---|---|
-| B-01 | Spike 2：`windows-task` 登入觸發、唯一實例、失敗重啟、`PT0S`、實際 >72 h 運行（OD-05 機台、正式 artifact） | §6.1、§13、OD-03 | 3、10、16、18 |
+| B-01 | Spike 2：`windows-task` 登入觸發（互動登出／登入）與測試團隊工作站正式工作實跑。唯一實例、失敗重啟、`PT0S`、>72 h 運行自 OD-15 起改在擁有者 host 以 throwaway 排程工作執行（可執行 gate，見 Task 18） | §6.1、§13、OD-03、OD-15 | 3、10、16、18 |
 | B-02 | `cap_supervisor_runtime__*` 在擁有者 Windows 主機註冊／刪除測試排程工作 | Global Constraints | 3 |
 | B-03 | `windows-service` 帳號／Session 0／ACL 資格（僅在 OD-12 條件成立且核准採用時） | OD-12、§13 Spike 2 | 3、10 |
 | B-04 | 真實 `systemd-user`／`systemd-system` reconcile 與 WSL `/etc/wsl.conf`＋`wsl --shutdown`（會替換本機正式服務或修改主機設定） | §6.1 | 10 |
-| B-05 | Spike 6：混合版本實機更新／回滾，真實串口釋放與重新取得（OD-08 原生 Windows COM：com0com DUT-side pair 或實體 USB-UART） | §12.1、§13、OD-08 | 7、12 |
+| B-05 | Spike 6：混合版本實機更新／回滾的 L2 bench 部分。Windows 側真實串口釋放與重新取得自 OD-15 起在擁有者 host 以 `COM20`／`COM21`＋OD-11 隔離實例（allowlist `COM20`）執行，為可執行 gate | §12.1、§13、OD-08、OD-15 | 7、12 |
 | B-06 | BC-05 Windows：Win32-OpenSSH 對真實 relay 的三拓樸、生命週期、停止／重啟；L3 remote | §9.1 BC-05、§11.6 | 5、8、9 |
 | B-07 | 正式 Windows release artifact 原生 build/link（自架 runner）與 DLL 匯入檢查 | arch §1.1、ADR-01 | 11、16 |
 | B-08 | EDR 開啟下 spawn、改名切換、首次執行不被攔截；100 次 CLI 執行期間無任何暫存檔／目錄建立（含建立後刪除） | §1.2、OD-05 | 7、11、16 |
@@ -3742,6 +3833,9 @@ evidence schema 必填：`case_id`、`artifact_sha256`（CLI、launcher、runtim
 | B-13 | §10.3 身分清單由部署負責人提供，並以一般任務 Agent 實際身分取得 `verify_agent_perms.py` `verdict:"blocked"`（exit 0；restore_checks 全 `possible:false`）證據；`not_blocked`／`unknown` 不計，同帳號部署只能登錄流程約束 | §10.3 | 12、15 |
 | B-14 | 測試團隊工作站 `doctor` 全項、`connect`／`--bench` 經真實 relay、TeraTerm／PuTTY 連 `console_endpoint` 實機操作 | §11.6 | 9、13、14 |
 | B-15 | Windows 實機 SERIALCOMM（藍牙＋USB-UART 混合）與 `NtQueryInformationProcess` 在 EDR 下可讀性 | SC-17、07 §1.6 | 2、4 |
-| B-16 | OD-08：所有動到 PAL 的 PR（Task 2、3、4、5、17）必附原生 Windows COM handle 證據（com0com DUT-side pair 或實體 USB-UART） | OD-08 | 2、3、4、5、17 |
+| B-16 | ~~OD-08 原生 Windows COM handle 證據~~ **OD-15 起不再 BLOCKED**：動到 PAL 的 PR（Task 2、3、4、5、17、19）在擁有者 host 以 `SW_TEST_COM_PAIR=COM20:COM21`＋OD-11 隔離實例（allowlist `COM20`）由 orchestrator 代跑取得；擁有者 host 不可用時記「證據不足」 | OD-08、OD-15 | 2、3、4、5、17、19 |
 | B-17 | P2 指派本 Phase 的 `win-task-logon-trigger`、`win-task-single-instance`、`win-task-restart-on-failure`、`win-task-72h`、windows-task 版 `p1-rst-daemon`、Windows 版 `rm-live-e2e` 實跑（程序與判定器由 Task 18 交付） | P2 L1855、L1869、L1906-1909、L2493 | 18 |
 | B-18 | 正式 Windows bundle 的 bundled Python runtime 與 launcher（GUI subsystem）於自架 runner 原生產生 | arch §1.1、§6.1 | 17 |
+| B-19 | com0com 選用元件於擁有者 host 的提權安裝／移除實跑（需管理員、UAC 互動；僅在擁有者 host 不可用時記證據不足）；`experimental` 改 false 需 Spike 1 剩餘三項（控制線隔離、Console-side pair、peer-close）於 HVCI 開啟機台全數 PASS | OD-15、§13 Spike 1 | 19 |
+
+docker 驗證（OD-15）：Linux L1.5、監管行為（journald、autostart hold drop-in、reconcile）與 Linux 監管 >72 h 以 P2 Task 17 docker runner 先行，屬 L1.5，**不**解除上表任何 L2／L3／bench 項（B-10、B-11、B-12 維持 BLOCKED-OWNER）。

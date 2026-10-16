@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 1.96.1（edition 2021，`x86_64-unknown-linux-gnu`、`x86_64-pc-windows-gnu`）；依賴照 arch §1.2 以 `=` 釘版（本 phase 用到 `indexmap =2.11.4`、`fancy-regex =0.16.2`、`yaml-rust2 =0.10.4`、`sha2 =0.10.9`、`libc =0.2.186`、`windows-sys =0.61.2`、dev `tempfile =3.23.0`）；Python 3.12.3（Linux golden 基準）、Windows Python 3.12.10（`py -3.12`，已確認含 PyYAML 與 pytest 9.0.3）；pytest；WSL interop。
 
-**Spec:** `docs/rust-refactor/serialwrap-rust-spec-final.md` §3.1、§3.2、§4.1～§4.3、§9.2、§9.5、§11.3、§11.6（Stage 1A 列）、§12.2（Stage 1A）、§15.9；`owner-decisions-2026-10-15.md`（OD-06、OD-08、OD-12）；`plans/00-master-plan.md`；`plans/rust-architecture.md`；`plans/spec-reconciliation.md`（CLI-11.xx、CLI-12.xx、DF-06、SC-09、GAP-X1、GAP-G-08、GAP-G-11、RPC-H-03、EVT-D-S15）；盤點 `inventory/01-cli.md`、`03-errors.md`、`07-platform-mgmt.md` §0／§1.8／§4、`09-events-transfer.md` §2／§5／§6、`10-gaps.md` G-04／G-08／G-11／X1。
+**Spec:** `docs/rust-refactor/serialwrap-rust-spec-final.md` §3.1、§3.2、§4.1～§4.3、§9.2、§9.5、§11.3、§11.6（Stage 1A 列）、§12.2（Stage 1A）、§15.9；`owner-decisions-2026-10-15.md`（OD-06、OD-08、OD-12、OD-15）；`plans/00-master-plan.md`；`plans/rust-architecture.md`；`plans/spec-reconciliation.md`（CLI-11.xx、CLI-12.xx、DF-06、SC-09、GAP-X1、GAP-G-08、GAP-G-11、RPC-H-03、EVT-D-S15）；盤點 `inventory/01-cli.md`、`03-errors.md`、`07-platform-mgmt.md` §0／§1.8／§4、`09-events-transfer.md` §2／§5／§6、`10-gaps.md` G-04／G-08／G-11／X1。
 
 ---
 
@@ -1714,7 +1714,7 @@ Expected：PASS。
 **Test author model:** haiku-xhigh　**Implementer model:** codex-gpt-6-luna-max
 **Changelog fragment:** `changelog.d/rust-p3-09-pal-client.md`
 **BLOCKED-OWNER:**
-- OD-08（已裁決，不再提供替代選項）：動到 PAL 的 PR 必須取得原生 Windows COM handle 證據；WSL interop 報告與記憶體 fake 都不得充數。本 phase 的證據案例固定為 Task 17 的 `win-blackbox.ps1 -ComPair COMa:COMb`（見該 Task「Windows COM 證據」）：在擁有者 Windows 自架 runner 上，以 Spike 1 結果決定的 com0com DUT-side pair 或實體 USB-UART 直連 Windows（不經 usbipd），Python daemon 以原生 serial backend 開 COMa、P2 `uart-stdio-bridge run --endpoint win-serial --com COMb` 接 DUT 模擬器，Rust CLI 執行 attach→READY、`cmd submit`、`device release`／`device attach` 並驗 `windows_com` 案例；另附同機 `uart-stdio-bridge selftest --endpoint win-serial --com-pair COMa:COMb` 的 PASS 報告（P2 Task 8）。證據放 `target/stage1a-evidence/<run_id>/windows-com/`。資源未備妥時本項維持 BLOCKED-OWNER、PR 不得合併；若要改以其他證據替代，須另行變更 OD-08 裁決。
+- OD-08（已裁決，不再提供替代選項）：動到 PAL 的 PR 必須取得原生 Windows COM handle 證據；WSL interop 報告與記憶體 fake 都不得充數。本 phase 的證據案例固定為 Task 17 的 `win-blackbox.ps1 -ComPair COMa:COMb`（見該 Task「Windows COM 證據」）：在擁有者 Windows 自架 runner 上，以 Spike 1 結果決定的 com0com DUT-side pair 或實體 USB-UART 直連 Windows（不經 usbipd），Python daemon 以原生 serial backend 開 COMa、P2 `uart-stdio-bridge run --endpoint win-serial --com COMb` 接 DUT 模擬器，Rust CLI 執行 attach→READY、`cmd submit`、`device release`／`device attach` 並驗 `windows_com` 案例；另附同機 `uart-stdio-bridge selftest --endpoint win-serial --com-pair COMa:COMb` 的 PASS 報告（P2 Task 8）。證據放 `target/stage1a-evidence/<run_id>/windows-com/`。**OD-15 起資源已備妥**：Spike 1 基本資格已於擁有者 host 通過（pair `CNCA0=COM20`（serialwrap／Python daemon 端，即 COMa）／`CNCB0=COM21`（bridge 端，即 COMb）），本項改為可執行 gate：以 `SW_TEST_COM_PAIR=COM20:COM21`、`win-blackbox.ps1 -ComPair COM20:COM21` 執行，Python daemon 一律為 OD-11 隔離實例（三個隔離目錄明確設定）＋`SERIALWRAP_TEST_DEVICE_ALLOWLIST=COM20`，由 orchestrator 經 WSL interop 代跑，報告附 Windows build、HVCI 狀態與 pair 對應。擁有者 host 不可用時才記「證據不足」、PR 不得合併；若要改以其他證據替代，須另行變更 OD-08 裁決。
 - 擁有者 Windows 自架 runner 上的原生 build／link（arch §1.1：cross check 不取代原生 build）。
 - `cap_interactive_desktop__exec_or_wait_ctrl_c`：Windows 互動 console 的 Ctrl-C 轉送與 exit code `0xC000013A` 驗證，需要互動桌面。
 
@@ -3209,7 +3209,7 @@ Expected：全部 PASS（`-m needs_delegation` 涵蓋 `test_bb_delegation.py` �
 **BLOCKED-OWNER:**
 - 正式 gate 的 Windows 原生 build／link 必須在擁有者 Windows 自架 runner（`stable-x86_64-pc-windows-gnu` host toolchain）執行；本 Task 的 interop 報告只算開發迴圈證據。
 - 匯入 DLL 檢查：本 Task 交付 `check_win_imports.py` 並對 interop 產物執行（開發證據）；正式結果以自架 runner 原生產物為準。
-- Windows COM 證據（OD-08，見下方「Windows COM 證據」）：需要 com0com pair 或實體 USB-UART 直連 Windows。
+- Windows COM 證據（OD-08，見下方「Windows COM 證據」）：OD-15 起使用擁有者 host 已通過 Spike 1 基本資格的 com0com pair `COM20:COM21`（可執行 gate）。
 - 端點防毒（第三方企業 EDR）在 100 次連續 CLI 執行期間無新增攔截的查證，需擁有者提供 EDR 紀錄；與「不新增解壓執行檔或目錄」（規格 §1.2，本 Task 以快照差分自行驗證）分開記錄、各自判定。
 - Windows CPython 3.12.3 embeddable（§3 B8）：需可下載 python.org 檔案或由擁有者放到 `%LOCALAPPDATA%\sw-rust-test\py-3.12.3\`；缺少時 Windows cli_help 與委派 A/B 判「證據不足」。
 
@@ -3384,7 +3384,7 @@ Expected：pytest PASS；`win-test` 報告 `overall: pass`，`evidence_insuffici
 - L2：以 Rust CLI（bundle `bin/serialwrap` 作為 TestPilot `serialwrap_exe`）執行資料面相關的 `regression/` 案例（live bench、bench 互斥協定）。
 - L3：以 Rust CLI 執行 `realhw` P0 與相關 P1。
 - 擁有者 Windows 自架 runner 的原生 build＋`win-blackbox` 重跑（取代 Task 17 interop 報告作為正式 gate）。
-- OD-08 Windows COM 證據（Task 9、Task 17「Windows COM 證據」；不得替代）。
+- （OD-15 起移出 BLOCKED-OWNER）OD-08 Windows COM 證據改為擁有者 host `COM20:COM21` 的可執行 gate（Task 9、Task 17「Windows COM 證據」；不得替代）；擁有者 host 不可用時記「證據不足」。
 - 以上未取得前，Stage 1A 出口狀態只能記為 `IMPLEMENTED`，不得記為 `VERIFIED`（規格 §0.3）。
 
 **Files:**
@@ -3421,7 +3421,7 @@ Expected：pytest PASS；`win-test` 報告 `overall: pass`，`evidence_insuffici
   - `scripts/rust/ab_blackbox.sh [--profile debug|release]`：`mkbundle.sh --dev` → 以 `SW_AB_PIDLOG=<run>/a.pids` 執行 A（Python 基線）→ **釋放確認**（規格 §15.9.1 第 3 步；任一項不明即停止、不啟動 B）：`a.pids` 中每個 pid 與其子行程都已結束（`/proc/<pid>` 不存在或為 zombie 已回收，等待上限 10 s）；每個 socket 路徑不存在；每個 lock 檔可被 `flock -n` 取得；掃 `/proc/*/fd` 無任何行程持有 A 的 run／state 目錄內的檔案或 PTY；結果寫 `<run>/release-check.json` → B（`SERIALWRAP_CLI_EXE=<bundle>/bin/serialwrap`、`SERIALWRAP_AB_LABEL=rust-1a`，同樣記 `b.pids`）→ 產生兩邊 identity JSON → `ab_compare.py --required <stage1a_gate.py 輸出的必要清單>` → `target/ab-report/<run_id>.json`。`--l1-out <dir>`（R5 審查後續）：B 輪的 pytest 命令固定為 `s1a_blackbox` linux selector（`tests/contract_blackbox -m "core_portable or posix_only"`），帶 `SW_RESOURCE_REPORT=<dir>/linux/blackbox/resource-report.json` 與 `--junitxml=<dir>/linux/blackbox/junit.xml`；同一份報告也是 `s1a_delegation`（`test_bb_delegation.py` 子集，selector.argv 相同）的判定輸入，不另跑。
   - `scripts/rust/stage1a_gate.py --ab-report <json> [--win-report <json>] [--l15-report <func-test-report.json>] [--windows-com <dir>] --out <json>`：
     1. 分母：讀 `tests/acceptance/cases.lock.json` 的 `sets.cli_1A` 與 `tests/contract_blackbox/data/coverage_1a.json`（`p3_extra` 必要案例，含 console RPC 案例，§0.3）；兩者聯集即 Stage 1A 必要集合。lock 檔缺失或 `sets.cli_1A` 不存在 → `evidence-insufficient`（不得以空集合通過）。
-    2. 逐 case 對帳：L1／黑箱層必須在 ab-report 中為 `ok` 或 `rust-only-ok`；L1.5 層必須在 func-test 報告（以 Rust CLI 執行）為 PASS 且 `gate_eligible`；L2／L3 層記 `BLOCKED-OWNER`；缺漏任一必要證據 → `evidence-insufficient`。
+    2. 逐 case 對帳：L1／黑箱層必須在 ab-report 中為 `ok` 或 `rust-only-ok`；L1.5 層必須在 func-test 報告（以 Rust CLI 執行）為 PASS 且 `gate_eligible`；L2／L3 層記 `BLOCKED-OWNER`（OD-15：`evidence_layer == "L1.5-docker"` 的報告只計 L1.5，掛到 L2／L3 case 時判 `evidence-insufficient`）；缺漏任一必要證據 → `evidence-insufficient`。
     3. `coverage_1a.json` 另列「原生命令 → 證據」：Task 14 的 55 列、`event` 10 子命令、`profile test`、`skill` 每一列至少對應一個 stub 黑箱 case，且資料面命令（下表 E2E 欄）至少一個 Rust CLI→Python daemon case 或一個 P2 L1.5 case；某列找不到真實 daemon 路徑證據（例如 `file push`／`file pull`：FakeTarget 不執行 shell，若 P2 也無對應 L1.5 case）→ 該列 `evidence-insufficient`，阻擋出口，不得以 stub 結果代替。
     4. 安全不變量（規格 §11.3）對照表，每列必須有指定 case 且 PASS：
 
@@ -3649,6 +3649,8 @@ SERIALWRAP_CLI_EXE=$PWD/target/dev-bundle/bin/serialwrap python3 func-test/runne
 SERIALWRAP_CLI_EXE=$PWD/target/dev-bundle/bin/serialwrap python3 func-test/runner.py --mode bridge --scenarios \
   --selftest-report ~/b-log/rust-refactor/p2/selftest-linux/selftest-report.json \
   --report-dir target/stage1a-evidence/<run_id>/func-test-scenarios                                # L1.5 安全情境
+SW_CLI_BUNDLE=$PWD/target/dev-bundle scripts/docker/run-l15.sh rust-1a \
+  --report-dir target/stage1a-evidence/<run_id>/l15-docker                                        # OD-15 docker 優先：P2 Task 17 兩容器拓樸，evidence_layer "L1.5-docker"，不計 L2／L3
 scripts/rust/win-test.sh --package sw-proto --package sw-pal --package sw-cli
 mkdir -p target/stage1a-evidence/<run_id>/l1/windows/cargo && cp "target/win-test-report/$(jq -r .l1_results target/win-test-report/<run_id>.json)" target/stage1a-evidence/<run_id>/l1/windows/cargo/resource-report.json   # windows cargo l1-results
 scripts/rust/win-blackbox.sh                                        # 含 ab_compare、check_win_imports、startup-100；B 輪 l1-results → target/win-blackbox/<run_id>/l1/windows/blackbox/
@@ -3675,7 +3677,7 @@ PR 描述需列：§11.6 Stage 1A 列的每項證據與狀態（本環境 PASS�
 
 | # | 項目 | 所屬 Task | 本計畫交付 | 需要的擁有者動作 |
 |---|---|---|---|---|
-| B1 | OD-08（已裁決）：動到 PAL 的 PR 與 Stage 1A 出口需原生 Windows COM handle 證據，不得以 interop 報告或 fake 替代 | 9、17、18、19 | `win-blackbox.ps1 -ComPair COMa:COMb` 的固定案例（bridge selftest＋Rust CLI→Python daemon 於 COMa 的 attach／cmd／release／attach＋P1 `windows_com` 案例）、`rust-windows-com` CI job | 依 Spike 1 結果提供 com0com pair 或實體 USB-UART 直連 Windows，註冊自架 runner 並執行；未完成前 PR 不得合併 |
+| B1 | OD-08（已裁決）：動到 PAL 的 PR 與 Stage 1A 出口需原生 Windows COM handle 證據，不得以 interop 報告或 fake 替代 | 9、17、18、19 | `win-blackbox.ps1 -ComPair COMa:COMb` 的固定案例（bridge selftest＋Rust CLI→Python daemon 於 COMa 的 attach／cmd／release／attach＋P1 `windows_com` 案例）、`rust-windows-com` CI job | OD-15：Spike 1 基本資格已通過，pair 為 `COM20:COM21`（擁有者 host）；註冊自架 runner（`SW_TEST_COM_PAIR=COM20:COM21`，OD-11 隔離實例＋allowlist `COM20`）並執行，屬可執行 gate；擁有者 host 不可用時記證據不足，未完成前 PR 不得合併 |
 | B2 | Windows 自架 runner 原生 build／link 與匯入 DLL 檢查 | 9、17、18、19 | `win-test.sh`、`win-blackbox.ps1`、`check_win_imports.py` 可直接在 runner 上執行 | 於自架 runner 執行並回傳報告 |
 | B3 | Windows 互動 console 的 Ctrl-C／Ctrl-Break 委派行為（`cap_interactive_desktop__exec_or_wait_ctrl_c`，非互動環境執行時明確失敗） | 9、16 | ignored 測試（含實際斷言） | 於桌面 session 執行 `cargo test -p sw-pal -- --ignored cap_interactive_desktop__` |
 | B4 | 端點防毒（第三方企業 EDR）在 100 次連續 CLI 執行無新增攔截 | 17 | `startup-100.json`（時間戳、exit code、exe sha256；「不新增解壓執行檔或目錄」由快照差分自行判定，與 EDR 分開） | 提供同時段 EDR 紀錄比對；權限不足時記「證據不足」 |
@@ -3697,6 +3699,6 @@ PR 描述需列：§11.6 Stage 1A 列的每項證據與狀態（本環境 PASS�
 | L2 以 Rust CLI 執行資料面相關案例 | B5 | BLOCKED-OWNER |
 | L3 以 Rust CLI 執行 P0 與相關 P1 | B6 | BLOCKED-OWNER |
 | 雙平台 L1 | `cargo test --workspace`（Linux）、`win-test.sh`（Windows interop）、CI `rust-windows-hosted`；正式以 B2 | Linux PASS；Windows 開發證據＋hosted L1 |
-| 每 PR CI（規格 §11.5） | Task 19 `rust.yml`（`rust-linux`、`rust-windows-hosted`；`rust-windows-com` 依 B1） | 兩個 hosted job PASS；COM job BLOCKED-OWNER |
-| Windows 原生 COM 證據（OD-08） | B1 | BLOCKED-OWNER |
+| 每 PR CI（規格 §11.5） | Task 19 `rust.yml`（`rust-linux`、`rust-windows-hosted`；`rust-windows-com` 依 B1） | 兩個 hosted job PASS；COM job 於擁有者 host 自架 runner 執行（OD-15 可執行 gate） |
+| Windows 原生 COM 證據（OD-08） | B1 | 擁有者 host `COM20:COM21` 可執行 gate（OD-15）；host 不可用時證據不足 |
 | 必要案例集合對帳（規格 §11.3） | Task 18 `stage1a_gate.py`（`cases.lock.json` `sets.cli_1A` ∪ `coverage_1a.json` `p3_extra`；安全不變量對照表） | `IMPLEMENTED`；任何 `evidence-insufficient` 即 FAIL |

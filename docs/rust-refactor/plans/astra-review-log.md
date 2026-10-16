@@ -209,4 +209,22 @@
 | `09-slice24-transfer-flash.md` | release `DRAIN_STALLED`（新 L1 `release_drain_stalled_then_completes`）；前置加 P1-OC；SC-33 改 `owner_item: 8`／pending item 8，取消驗證器改動；SC 範圍改 `range(1,36)−{8}`；file.* 對 passthrough 回 `PROFILE_NOT_COMMAND_CAPABLE`；flash 候選含安靜升 READY 的 passthrough |
 | `10-stage3-canary.md` | canary `steady()` 說明 passthrough ATTACHED→READY 為穩態轉換；新增 `test_passthrough_ready_is_steady` |
 
-待後續處理：(1) `06` 的黑箱 `test_passthrough_quiet_ready_and_cmd` 以真實時間等約 40 s，是否加 slow marker 或時間覆寫由 P5 執行時決定（不新增 env 覆寫）；(2) SC-34／SC-35 的黑箱 case id 尚未登記到 P2 `cases.yaml`，由 P2／P5 Task 0b 依 `behavior_changes.yaml` 的 `case_ids` 補登。
+待後續處理（OD-14）：(1) `06` 的黑箱 `test_passthrough_quiet_ready_and_cmd` 以真實時間等約 40 s，是否加 slow marker 或時間覆寫由 P5 執行時決定（不新增 env 覆寫）；(2) SC-34／SC-35 的黑箱 case id 尚未登記到 P2 `cases.yaml`，由 P2／P5 Task 0b 依 `behavior_changes.yaml` 的 `case_ids` 補登。
+
+## OD-15 擁有者裁決同步（2026-10-16）
+
+依 OD-15（Windows 驅動打包與 docker 優先驗證）同步計畫。新登記 **SC-36**（com0com 選用元件，Rust-only，P4 Task 19）；SC 範圍鏈改為 P1-OC `range(1,28)−{8}∪{34,35}` → P4 `∪{36}` → P6 `(range(1,30)∪{31,34,35,36})−{8}` → P7 `(range(1,32)∪{34,35,36})−{8}` → P8 `range(1,37)−{8}`。Spike 1 基本資格已在擁有者 host 通過（pair `CNCA0=COM20`／`CNCB0=COM21`，證據在擁有者 host 的 `b-log` 下 `rust-refactor/spike1/`），原 OD-08 原生 COM 的 BLOCKED-OWNER 項改為以 `SW_TEST_COM_PAIR=COM20:COM21`＋OD-11 隔離實例（allowlist `COM20`）實跑的 gate；Spike 1 剩餘三項（控制線隔離、Console-side pair、peer-close）仍待測。docker 證據一律標 `evidence_layer: "L1.5-docker"`，不計為真板 L2／實機 L3／OD-10 bench。Canary 延到 Stage 3（P9），帳本工具保留。
+
+| 檔案 | 變更 |
+|---|---|
+| `00-master-plan.md` | §3 證據段新增 OD-15 可取得證據（原生 COM、docker 優先、`windows-task` throwaway、production 唯讀 RPC）並縮減 BLOCKED-OWNER 清單、Canary 延到 P9；P2 索引加 P2-T17／T18、P4 索引加 P4-T19、P4-T18 註 throwaway；SC 編號交接列加 SC-36 範圍鏈 |
+| `02b-stage0-owner-confirmations.md` | docker 驗證改指 P2 Task 17 runner（`run-l15.sh`、`run-systemd.sh` 驗 socket 群組權限）；T7 加 docker 48h 啟動時點；Windows 原生以 COM20／COM21 實跑 |
+| `03-stage0-test-infra.md` | 新增 Task 17（docker 驗證環境與兩容器拓樸、`evidence_labels.py` 封閉 `evidence_layer` 集合、48h／72h runner）、Task 18（`win-task-throwaway.ps1`、`spike1_remaining.py`）；Windows COM 的 BLOCKED 項改 G1～G8 gate（§4.1）；Task 12 證據索引拒收 docker／throwaway 報告於 L2／L3／bench；Task 14、15 docker 前置 |
+| `04-stage1a-rust-cli.md` | OD-08 原生 COM 項改 COM20:COM21 gate；出口加 `run-l15.sh rust-1a`；`stage1a_gate` 拒收 docker 報告於 L2／L3 |
+| `05-stage1b-rust-cli-mgmt.md` | 新增 Task 19（com0com 選用元件：manifest、`setup --with-com0com`／`--remove-com0com`、`runas` helper、GPLv2／SOURCE／PROVENANCE、UAC 拒絕不影響基本安裝、移除／回滾不動 driver、experimental）並登記 SC-36；OD-08 項改 gate；Task 16 docker 前置；Task 18 改 throwaway 程序；附錄 B 縮減 |
+| `06`～`09` | OD-08／Spike 1 BLOCKED 項改 COM20／COM21 gate；L2／L3 前先跑 docker L1.5；09 systemd 行為先在 systemd container、Task 13 win-task 用 throwaway、SC-36 元件 pair 可供 Windows 原生測試；07／08／09 SC 範圍加 SC-36；07 Console-side 範例埠改 COM40／COM41（避開已用的 COM20／COM21） |
+| `10-stage3-canary.md` | Canary 延到 Stage 3、早期 Phase 不得以 canary 為出口；`S0-SPIKE1-WIN-VCOM` 註基本資格通過；Task 14B evidence ingest 拒收 `L1.5-docker`／`host-throwaway` 於真板項目（新增三個測試列）；Task 5B 可用 docker 兩容器拓樸 |
+| `rust-architecture.md` | §9.3 加 docker 拓樸列；§9.4 COM pair 改 COM20:COM21；§10.1 manifest 加選用 `components.com0com`；§10.2 權限邊界（只有 helper 提權） |
+| `spec-reconciliation.md` | §1.1 新增 SC-36 列與登記數說明 |
+
+待後續處理（OD-15）：(1) Console-side com0com 需第二組 pair（COM20／COM21 已作 DUT-side），建立需管理員一次；(2) `setup --with-com0com` 遇既有 pair 視為已安裝、不重裝，請擁有者確認此行為；(3) `win-task-logon-trigger` 需人工登出登入，仍列 BLOCKED-OWNER；(4) P9 證據索引 ID 與 P2 新增的 `S0-L15-DOCKER-*`／`S0-SPIKE1-REMAINING`／`S0-WIN-TASK-THROWAWAY-72H` 需於實作時對齊；(5) P9 ingest 對缺 `evidence_layer` 的既有報告仍接受（相容舊產生端），docker／throwaway runner 產出者則必填。

@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 1.96.1（edition 2021；`x86_64-unknown-linux-gnu`、`x86_64-pc-windows-gnu`）；`crossbeam-channel =0.5.15`、`libc =0.2.186`（sw-pal unix）、`windows-sys =0.61.2`（sw-pal windows）、`crc32fast =1.5.0`、`indexmap =2.11.4`、`fancy-regex =0.16.2`（經 `sw_proto::pyre`）、dev `tempfile =3.23.0`；Python 3.10+／pytest（黑箱與既有套件）；P2 的 `tools/uart_stdio_bridge/` 與 Docker DUT 模擬器（L1.5）。
 
-**Spec:** `docs/rust-refactor/serialwrap-rust-spec-final.md`（§5.1～§5.4、§6.2、§8.1～§8.3、§9.1、§11.6 Slice 2.1、§12.2 Stage 2、§15.6、§15.9）；`docs/rust-refactor/owner-decisions-2026-10-15.md`（OD-04、OD-08、OD-11、OD-12、OD-13、OD-14）；`docs/rust-refactor/plans/00-master-plan.md`；`docs/rust-refactor/plans/rust-architecture.md`（§1～§6、§9）；`docs/rust-refactor/plans/spec-reconciliation.md`（SC／DF／KEEP 裁決）；Python 行為來源 `docs/rust-refactor/inventory/02-rpc.md`、`03-errors.md`、`04-wal-state.md`、`05-session.md`、`06-uartio-console.md`、`07-platform-mgmt.md`、`10-gaps.md`。
+**Spec:** `docs/rust-refactor/serialwrap-rust-spec-final.md`（§5.1～§5.4、§6.2、§8.1～§8.3、§9.1、§11.6 Slice 2.1、§12.2 Stage 2、§15.6、§15.9）；`docs/rust-refactor/owner-decisions-2026-10-15.md`（OD-04、OD-08、OD-11、OD-12、OD-13、OD-14、OD-15）；`docs/rust-refactor/plans/00-master-plan.md`；`docs/rust-refactor/plans/rust-architecture.md`（§1～§6、§9）；`docs/rust-refactor/plans/spec-reconciliation.md`（SC／DF／KEEP 裁決）；Python 行為來源 `docs/rust-refactor/inventory/02-rpc.md`、`03-errors.md`、`04-wal-state.md`、`05-session.md`、`06-uartio-console.md`、`07-platform-mgmt.md`、`10-gaps.md`。
 
 ## Global Constraints
 
@@ -26,6 +26,8 @@
 - Windows RPC 預設 `tcp://127.0.0.1:48700`；信任範圍＝整機本機使用者（OD-12），規格與文件不得宣稱「同使用者隔離」。
 - bridge 位置 `tools/uart_stdio_bridge/`，不得 import `sw_core`／連結 `sw-pal`（OD-07、§15.4.2）；本 Phase 只新增 `func-test/scenarios/s21-*.yaml` 情境檔，不改 bridge 工具。P2 runner（`func-test/runner.py`）缺少的動作（`external_open`／`external_close`、`measure_rpc_latency`）不在本 Phase 內順手加：以 Task 21a 的獨立測試資產 PR（§10.4，獨立審閱＋runner 自測）先行合併，Task 21 只消費。
 - 記憶體 fake 通過不得計為原生 gate（OD-08、arch §9.1）；需要 COM pair 的 `cap_windows_com__*` 在未提供 `SW_TEST_COM_PAIR` 時保持 ignored 並標「證據不足」。
+- OD-15：Spike 1 基本資格已在擁有者 host 通過（com0com 3.0.0.0、HVCI 執行中；pair `CNCA0=COM20`（serialwrap 端）／`CNCB0=COM21`（測試／bridge 端）；COM20 第二次開啟得 `ERROR_ACCESS_DENIED`；證據在擁有者 host 的 `b-log` 下 `rust-refactor/spike1/`）。因此原生 Windows COM handle gate（OD-08）改為**可執行 gate**：由 orchestrator 經 WSL interop 在擁有者 host 以 `SW_TEST_COM_PAIR=COM20:COM21` 執行，daemon 一律以 OD-11 隔離實例（`SERIALWRAP_STATE_DIR`／`_RUN_DIR`／`_CONFIG_DIR` 明確設定且非預設）＋`SERIALWRAP_TEST_DEVICE_ALLOWLIST=COM20` 啟動，報告附 Windows build、HVCI 狀態與 pair 對應；只有擁有者 host 不可用時才記「證據不足」。Spike 1 剩餘項（控制線隔離、peer-close 語意）仍是結果未知的測試，不得預標 PASS。
+- OD-15 docker 優先：L2／L3 案例在交擁有者 bench 前，先以 P2 Task 17 的 `scripts/docker/run-l15.sh`（serialwrap 容器 ⇄ bridge ⇄ DUT 模擬器容器、假 COM PTY pair）跑同一批情境，報告標 `evidence_layer: "L1.5-docker"`；docker 結果**不得**計為真板 L2、實機 L3 或 OD-10 bench 長跑，後三者仍為 BLOCKED-OWNER。systemd 監管行為先在 `scripts/docker/run-systemd.sh` 的 systemd container 驗證。
 - repo 政策：不得 commit 到 `main`；本 Phase 在 `wt/rust-refactor/slice21-daemon-core` 分支工作，PR base 為 `feature/rust-refactor`（R-12）；每個 code PR 附 `changelog.d/<issue>-<slug>.md`，本 Phase 以追蹤鍵 `rust-s21` 命名（比照既有 `st06-*` 非數字鍵）；commit 用 Conventional Commits 繁中 subject，含 `Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>` trailer；完成前跑 `python3 -m pytest -q tests/` 與 `python3 -m policy_check --repo .`。
 - changelog fragment 格式：`policy_check.changelog.parse_fragment` 要求 YAML front matter，每個 fragment 一律寫成 `---\ntype: feat\nscope: <crate 或 tests>\n---\n<繁中本文>`（比照既有 `changelog.d/224-brcm-leading-whitespace.md`）；各 Task 標頭「Changelog fragment」只列檔名、`scope` 與本文。不得使用 `### Added` 標題格式（`collate` 會 raise `FragmentError`）。
 - 測試資產修改（既有 `tests/*.py`、`func-test/` runner／scenario、`tests/contract_blackbox/bb_*.py`、P2 bridge 工具）依規格 §10.4 必須由非實作者獨立審閱並在 PR 描述列出；本計畫凡標「測試資產變更（§10.4）」的步驟皆適用。
@@ -1092,7 +1094,9 @@ git commit -m "feat(sw-pal): POSIX 序列埠獨占開啟、可取消寫入與 ho
 
 **Test author model:** agy-gemini-3.8-flash-high　**Implementer model:** codex-gpt-6-luna-max
 **Changelog fragment:** `changelog.d/rust-s21-pal-serial-windows.md`（front matter `type: feat`、`scope: rust-s21`；本文：「Rust PAL Windows 序列埠：CreateFileW 獨占（dwShareMode=0）、overlapped 讀寫、CancelIoEx 後 GetOverlappedResult 收斂、ACCESS_DENIED 以 holder_unknown 表示。」）
-**BLOCKED-OWNER：** (1) 原生 Windows COM handle gate（OD-08）：`SW_TEST_COM_PAIR=COMa:COMb`（com0com DUT-side pair，或 Spike 1 失敗時實體 USB-UART 直連 Windows）下的 `cap_windows_com__*` 全部項目；(2) 外部 TeraTerm／PuTTY 先開 COM 時 daemon 得到 `AccessDenied → DEVICE_STILL_HELD{pids:[],holder_unknown:true}` 的實機證據；(3) USB 拔除時 overlapped 在途 I/O 的完成碼（`ERROR_DEVICE_REMOVED`／`ERROR_OPERATION_ABORTED`）實測。
+**擁有者 host 可執行 gate（OD-15，原 BLOCKED-OWNER）：** 原生 Windows COM handle gate（OD-08）：`SW_TEST_COM_PAIR=COM20:COM21`（Spike 1 已通過的 com0com DUT-side pair）下的 `cap_windows_com__*` 全部項目，由 orchestrator 經 WSL interop 在擁有者 host 執行（Step 5 第二段），結果寫入 `target/win-test-report/<run_id>.json`。
+
+**BLOCKED-OWNER：** (1) 實體 USB-UART 直連 Windows 的同一批項目（僅在 com0com 結果不足以判定時補做）；(2) 外部 TeraTerm／PuTTY 先開 COM 時 daemon 得到 `AccessDenied → DEVICE_STILL_HELD{pids:[],holder_unknown:true}` 的實機證據；(3) USB 拔除時 overlapped 在途 I/O 的完成碼（`ERROR_DEVICE_REMOVED`／`ERROR_OPERATION_ABORTED`）實測。
 
 **Files:**
 - Create: `crates/sw-pal/src/serial/windows.rs`
@@ -1197,6 +1201,8 @@ Expected：FAIL，`not implemented: slice21 T3 dcb_model`。
 
 Run：`cargo test -p sw-pal --features test-fakes --test serial_windows && scripts/rust/win-test.sh --package sw-pal`
 Expected：PASS；`target/win-test-report/<run_id>.json` 中 `cap_windows_com__*` 為 `ignored`（未提供 `SW_TEST_COM_PAIR`），報告欄 `caps` 標「證據不足」。
+
+擁有者 host 第二段（OD-15，orchestrator 代跑）：同一指令加 `SW_TEST_COM_PAIR=COM20:COM21` 重跑，Expected：`cap_windows_com__*` 全部實際執行（非 `ignored`），`cap_windows_com__open_exclusive_*` 斷言第二次開啟 `ERROR_ACCESS_DENIED`；報告 `caps.windows_com` 記 `pair:"COM20:COM21"`、Windows build、HVCI 狀態。結果為 FAIL 時屬真實缺陷，不得改標「證據不足」。
 
 - [ ] **Step 5：Commit**
 
@@ -4062,7 +4068,9 @@ git commit -m "feat(sw-daemon): RPC 平面分派、參數轉型與 health.status
 
 **Test author model:** haiku-xhigh　**Implementer model:** codex-gpt-6-luna-max
 **Changelog fragment:** `changelog.d/rust-s21-daemon-main.md`（front matter `type: feat`、`scope: rust-s21`；本文：「Rust serialwrapd：Python 相同的參數、路徑 env 與 exit code（0/1/2/3）；啟動時先掃描、排定 COM、bootstrap attach 再啟 watcher（DF-14）；RPC 綁定後寫 config.yaml 的 socket_path（SC-09 寫入路徑）；關機先停 server、設 manager stopping gate、停 watcher、drain 全部 session（含在途 attach）、WAL sync 再釋放鎖（SC-11），未收斂時以 exit 1 與診斷回報；OD-11 allowlist 僅允許隔離實例。」）
-**BLOCKED-OWNER：** (1) systemd-user／systemd-system 監管下以 Rust `serialwrapd` 啟停的實機驗證（L3 P0）；(2) Windows `windows-task` 監管下啟動 Rust daemon（Spike 2）。
+**docker 先行（OD-15）：** systemd-user／systemd-system 監管下的 Rust `serialwrapd` 啟停先以 P2 Task 17 `scripts/docker/run-systemd.sh` 在 systemd container 驗證（journald 收到 daemon stderr、`systemctl show` 狀態），報告標 `L1.5-docker`；`windows-task` 啟動 Rust daemon 以 P2 Task 18 的 throwaway 排程工作（`serialwrap-throwaway-<run_id>`、隔離目錄、allowlist `COM20`）在擁有者 host 執行。
+
+**BLOCKED-OWNER：** (1) systemd-user／systemd-system 監管下以 Rust `serialwrapd` 啟停的實機驗證（L3 P0；docker 結果不取代）；(2) Windows `windows-task` 正式（非 throwaway）監管下啟動 Rust daemon 的 Spike 2 完整證據。
 
 **Files:**
 - Modify: `crates/sw-daemon/src/daemon_main.rs`、`crates/sw-daemon/src/main.rs`、`crates/sw-daemon/src/launcher.rs`（`implementation == "rust"` 時改走 `daemon_main::run`）、`docs/rust-refactor/plans/rust-architecture.md` §6.1（啟動順序改為 P1 DF-14 的 `scan → rank → update → bootstrap_attach → watcher.start`；panic 政策）
@@ -4278,7 +4286,7 @@ git commit -m "feat(sw-daemon): serialwrapd 啟動順序、有序關機與 exit 
 
 **Test author model:** haiku-xhigh　**Implementer model:** codex-gpt-6-luna-max
 **Changelog fragment:** `changelog.d/rust-s21-blackbox.md`（front matter `type: feat`、`scope: rust-s21`；本文：「新增 Slice 2.1 黑箱契約案例（F1／F2／F3／F4／F12 L1 承接、零 TX、獨占、release／attach、帳密未解析、WAL 自癒），同一批案例可指向 Python 或 Rust daemon；修正 Rust daemon 與基線不一致處。」）
-**BLOCKED-OWNER：** (1) L2：以 Rust daemon 執行 TestPilot `serialwrap_regression` F1、F2、F3、F4、F12 的 18 個 case（其中 17 個屬 `cases.lock.json` 的 `slice_2.1` 分母；`f4-interactive-line-cmd-defined` 屬 2.2、作提前證據；含 F12 已依 OD-13／TST-D-7 修訂的 oracle），需擁有者 live bench；(2) L3：`realhw` P0 適用核心集合＋WAL／裝置衝突／Recovery 相關 P1，雙平台，需 bench；(3) Windows 端以 Rust daemon 跑同一批黑箱需 COM pair（見 Task 22）。
+**BLOCKED-OWNER：** (1) L2：以 Rust daemon 執行 TestPilot `serialwrap_regression` F1、F2、F3、F4、F12 的 18 個 case（其中 17 個屬 `cases.lock.json` 的 `slice_2.1` 分母；`f4-interactive-line-cmd-defined` 屬 2.2、作提前證據；含 F12 已依 OD-13／TST-D-7 修訂的 oracle），需擁有者 live bench；(2) L3：`realhw` P0 適用核心集合＋WAL／裝置衝突／Recovery 相關 P1，雙平台，需 bench；(3) Windows 端以 Rust daemon 跑同一批黑箱：OD-15 起改為擁有者 host 可執行（`SW_TEST_COM_PAIR=COM20:COM21`，見 Task 22），不再列 BLOCKED-OWNER。交 bench 前，(1)(2) 的情境先以 `scripts/docker/run-l15.sh` 兩容器拓樸跑過並附 `L1.5-docker` 報告（OD-15；不計為 L2／L3）。
 
 **Files:**
 - Create: `tests/contract_blackbox/slice21/test_f1_cmd_contract.py`、`test_f2_backpressure.py`、`test_f3_observability.py`、`test_f4_session_semantics.py`、`test_f12_diagnostics.py`、`test_safety_core.py`、`test_slice_scope.py`
@@ -4469,7 +4477,9 @@ git commit -m "test(contract): Slice 2.1 黑箱案例並修正 Rust daemon 差�
 
 **Test author model:** agy-gemini-3.8-flash-high　**Implementer model:** codex-gpt-6-luna-max
 **Changelog fragment:** `changelog.d/rust-s21-l15.md`（front matter `type: feat`、`scope: tests`；本文：「Slice 2.1 L1.5：以 Rust daemon 重跑 P2 凍結的 8 個 2.1 情境，新增 Quiet 零 TX、部分寫出中止不重送、release／attach 交接、外部占用、帳密未解析、WAL 外部刪除、reboot 最小防護與事件延遲情境。」）
-**BLOCKED-OWNER：** (1) Windows L1.5：同一批情境在原生 Windows daemon＋com0com DUT-side pair（或實體 USB-UART）上的 A/B 證據（OD-08；含 `win-com-*` 三個凍結案例，BO-S21-13）；(2) 實機 A/B（§15.9.2）。
+**擁有者 host 可執行（OD-15）：** Windows L1.5：同一批情境在原生 Windows daemon（OD-11 隔離實例＋`SERIALWRAP_TEST_DEVICE_ALLOWLIST=COM20`）＋com0com DUT-side pair `COM20`／`COM21` 上的 A/B 證據（OD-08；含 `win-com-*` 三個凍結案例，BO-S21-13），orchestrator 經 WSL interop 代跑。
+
+**BLOCKED-OWNER：** 實機 A/B（§15.9.2）。
 
 **Files:**
 - Create: `func-test/scenarios/{s21-wire-equals-wal,s21-quiet-zero-tx,s21-partial-tx-abort,s21-release-attach-handoff,s21-exclusive-conflict,s21-exclusive-conflict-plain-open,s21-credentials-unresolved,s21-wal-unlink-under-traffic,s21-reboot-minimal-guard,s21-event-latency}.yaml`（P2 scenario YAML 格式，`meta.scenario.revision`、`invariants`、`behavior_changes` 必填）
@@ -4571,7 +4581,7 @@ git commit -m "test(l15): Slice 2.1 bridge 回歸、安全情境與事件延遲�
 
 **Test author model:** haiku-xhigh　**Implementer model:** agy-gemini-3.8-flash-high
 **Changelog fragment:** `changelog.d/rust-s21-gate.md`（front matter `type: feat`、`scope: rust-s21`；本文：「新增 Slice 2.1 出口 gate 腳本與報告 schema：彙整 Linux／Windows 原生 L1、黑箱 A/B、L1.5 與 policy 結果，並把需擁有者執行的證據明列為 BLOCKED-OWNER、不得標 PASS。」）
-**BLOCKED-OWNER：** 本 Task 彙整全 Phase 的 BLOCKED-OWNER（見 §結尾總表），自身新增：(1) `scripts/rust/slice21_gate.sh --with-com-pair` 在擁有者提供 `SW_TEST_COM_PAIR` 後的完整執行；(2) Spike 3（第三方 EDR 開啟時的 WAL 寫入／rotate／unlink／外部 reader）以 Rust `WalFs` 重跑並與 Stage 0 Python 結果並列。
+**BLOCKED-OWNER：** 本 Task 彙整全 Phase 的 BLOCKED-OWNER（見 §結尾總表），自身新增：(1) `scripts/rust/slice21_gate.sh --with-com-pair` 的完整執行——OD-15 起在擁有者 host 以 `SW_TEST_COM_PAIR=COM20:COM21` 由 orchestrator 代跑（可執行 gate，非 BLOCKED-OWNER；`com.status` 須為實際 PASS／FAIL，`EVIDENCE_MISSING` 只在 host 不可用時允許）；(2) Spike 3（第三方 EDR 開啟時的 WAL 寫入／rotate／unlink／外部 reader）以 Rust `WalFs` 重跑並與 Stage 0 Python 結果並列。
 
 **Files:**
 - Create: `scripts/rust/slice21_gate.sh`、`scripts/rust/slice21_gate_judge.py`、`tests/acceptance/slice21_gate_report.schema.json`、`tests/acceptance/slice21_gate_expect.yaml`、`tests/acceptance/slice21_bo.yaml`（BO 清單＋`case_ids`，與本計畫結尾總表同序）、`tests/test_slice21_gate_report.py`、`tests/test_slice21_gate_judge.py`、`tests/contract_blackbox/slice21/test_windows_nocom.py`、`docs/rust-refactor/slice21-owner-runbook.md`、`crates/sw-core/examples/wal_s1w.rs`（規格 §1.2 WAL 指標的 Rust 量測器：以 P1 T19 `scripts/stage0/wal_microbench.py` 凍結的 S1-W 資料混合與取樣口徑驅動 Task 7 `WalWriter`＋Task 6 原生 `WalFs`，輸出單筆寫入 p50／p95／p99 與每次 rotate 停頓；只量測、不改 WAL 行為）
@@ -4748,7 +4758,7 @@ git commit -m "chore(rust): Slice 2.1 出口 gate 腳本、報告 schema 與擁�
 ## PR 與出口
 
 - PR：`wt/rust-refactor/slice21-daemon-core` → `feature/rust-refactor`；標題 `feat(rust): Slice 2.1 Rust daemon core`；body 依 `.github/pull_request_template.md` 填 Policy Checklist，並附 `report.json` 的 section 摘要、`identity`、`case_uptake`、`pending_decisions` 與 BLOCKED-OWNER 清單；不引用 issue 時上 `policy-exempt:issue-link`；Rust daemon 尚非部署 artifact，README／docs 不改對外操作說明，上 `policy-exempt:docs-sync`（附理由）。PR 描述另列：§10.4 測試資產變更清單（Task 15a、Task 20 Step 0、Task 21a）與各自的獨立審閱者；DF 候選（Task 19 停機未收斂 exit 1）；§0.2「普通外部 holder（未取 flock）的拒絕」已依規格 §6.2 定案，不再列 DF 候選。
-- **合併阻擋（OD-08）**：本 PR 動到 PAL（serial、lock、device source、WalFs、RPC listener），依 OD-08「動到 PAL 的 PR 必須取得原生 Windows COM handle 證據；記憶體 fake 不得充數」，PR 保持 draft／不得合併，直到 BO-S21-01 證據回填並經審查，或擁有者在 PR 上留下明確書面豁免（比照 04 計畫 Task 9）。
+- **合併阻擋（OD-08）**：本 PR 動到 PAL（serial、lock、device source、WalFs、RPC listener），依 OD-08「動到 PAL 的 PR 必須取得原生 Windows COM handle 證據；記憶體 fake 不得充數」，PR 保持 draft／不得合併，直到 BO-S21-01 證據回填並經審查，或擁有者在 PR 上留下明確書面豁免（比照 04 計畫 Task 9）。OD-15 起 BO-S21-01 可在擁有者 host（`COM20`／`COM21`）取得，預期以實跑證據解除阻擋，不以豁免代替。
 - 回歸 case 政策（#155）：本 Phase 非 bug 修復；實機案例由 BO-S21-07／08 以既有 TestPilot case 承接，PR 描述註明「未新增 regression case：F1／F2／F3／F4／F12 既有 18 個 case（17 個屬 `slice_2.1` 分母、`f4-interactive-line-cmd-defined` 為提前證據）由擁有者以 Rust daemon 執行」。
 - Slice 2.1 出口（§11.6）需同時具備：本環境 gate `READY_FOR_OWNER_EVIDENCE`（不得為 `INCOMPLETE`）＋BO-S21-01～16 證據回填並經審查＋`pending_decisions` 經擁有者裁決＋Task 23 校準報告。未回填前不得宣告 Slice 2.1 出口通過。
 
@@ -4756,19 +4766,19 @@ git commit -m "chore(rust): Slice 2.1 出口 gate 腳本、報告 schema 與擁�
 
 | ID | 項目 | case_ids（cases.lock） | 來源 Task |
 |---|---|---|---|
-| BO-S21-01 | 原生 Windows COM handle gate（OD-08）：`SW_TEST_COM_PAIR` 下 `cap_windows_com__*` 全部（獨占 ACCESS_DENIED、CancelIoEx 收斂、部分寫出、conformance）；PR 合併前置 | — | 3、22 |
+| BO-S21-01 | 原生 Windows COM handle gate（OD-08）：`SW_TEST_COM_PAIR` 下 `cap_windows_com__*` 全部（獨占 ACCESS_DENIED、CancelIoEx 收斂、部分寫出、conformance）；PR 合併前置。**OD-15 起轉為擁有者 host 可執行 gate**（`COM20:COM21`，orchestrator 經 WSL interop 代跑），不再等待擁有者提供 pair | — | 3、22 |
 | BO-S21-02 | Windows 外部 TeraTerm／PuTTY 先開 COM 時 `DEVICE_STILL_HELD{pids:[],holder_unknown:true}` 實機證據 | — | 3 |
 | BO-S21-03 | Windows USB 拔除時 overlapped 在途 I/O 完成碼實測與 drain 3000 ms 收斂 | — | 3、12 |
 | BO-S21-04 | 實體 USB-UART（CH340／FTDI）上的 TIOCEXCL＋flock 與 RTS/CTS 卡住時可取消寫入（`cap_physical_uart__*`） | — | 2 |
 | BO-S21-05 | 外部 minicom 先開埠時 daemon 得 `Held` 的 Linux 實機證據 | — | 2 |
-| BO-S21-06 | Windows `CTRL_BREAK`／`CTRL_CLOSE` 停止 daemon（互動 console），以及 `windows-task` 監管下的啟停（Spike 2） | — | 4、19 |
-| BO-S21-07 | L2：Rust daemon 執行 `serialwrap_regression` F1／F2／F3／F4／F12 的 18 個 case（F12 用 OD-13 修訂 oracle） | `f1-*`（5）、`f2-*`（4）、`f3-*`（4）、`f4-activity-classification`、`f4-background-result-tail-consistent`、`f12-*`（2）；提前證據 `f4-interactive-line-cmd-defined` | 20 |
-| BO-S21-08 | L3：`realhw` P0 適用核心集合＋WAL／裝置衝突／Recovery 相關 P1，Linux 與 Windows 各一輪 | `p0-doctor`、`p0-cmd-async`、`p0-clear-reattach`、`p0-selftest`、`p0-wal-live`、`p0-multiopen`、`p1-cmd-serial`、`p1-rst-daemon`、`p1-rst-recover`、`p1-hp-cycle`、`p1-hp-reorder` | 20 |
+| BO-S21-06 | Windows `CTRL_BREAK`／`CTRL_CLOSE` 停止 daemon（互動 console），以及 `windows-task` 監管下的啟停（Spike 2）；OD-15：先以 P2 Task 18 throwaway 排程工作在擁有者 host 跑（可執行），正式工作的 Spike 2 證據仍待擁有者 | — | 4、19 |
+| BO-S21-07 | L2（交 bench 前先以 `scripts/docker/run-l15.sh` 跑 `L1.5-docker`，不計 L2）：Rust daemon 執行 `serialwrap_regression` F1／F2／F3／F4／F12 的 18 個 case（F12 用 OD-13 修訂 oracle） | `f1-*`（5）、`f2-*`（4）、`f3-*`（4）、`f4-activity-classification`、`f4-background-result-tail-consistent`、`f12-*`（2）；提前證據 `f4-interactive-line-cmd-defined` | 20 |
+| BO-S21-08 | L3（先以 docker 兩容器拓樸跑 `L1.5-docker`，不計 L3）：`realhw` P0 適用核心集合＋WAL／裝置衝突／Recovery 相關 P1，Linux 與 Windows 各一輪 | `p0-doctor`、`p0-cmd-async`、`p0-clear-reattach`、`p0-selftest`、`p0-wal-live`、`p0-multiopen`、`p1-cmd-serial`、`p1-rst-daemon`、`p1-rst-recover`、`p1-hp-cycle`、`p1-hp-reorder` | 20 |
 | BO-S21-09 | 雙平台實機「外部燒錄工具接手→`device attach` 收回」交接證據 | — | 12 |
 | BO-S21-10 | 實機 shell／prplOS 板的登入→READY 與 reboot quiet 最小防護（L3 P0 reboot 相關核心） | — | 13、21 |
 | BO-S21-11 | 同款 CH340（by-id 相同）以 by-path 區分的 COM 指派實機證據 | — | 16 |
-| BO-S21-12 | systemd-user／systemd-system 監管下 Rust `serialwrapd` 啟停（L3 P0） | — | 19 |
-| BO-S21-13 | Windows L1.5（原生 daemon＋com0com DUT-side pair 或實體 USB-UART）與實機 A/B（§15.9.2），含 Windows 端以 Rust daemon 跑 `tests/contract_blackbox/slice21` 全套 | `win-com-open-exclusive`、`win-com-txrx-bridge`、`win-com-cancel-close` | 20、21 |
+| BO-S21-12 | systemd-user／systemd-system 監管下 Rust `serialwrapd` 啟停（L3 P0）；OD-15：先在 systemd container（`scripts/docker/run-systemd.sh`）驗證並附 `L1.5-docker` 報告，實機 L3 仍待擁有者 | — | 19 |
+| BO-S21-13 | Windows L1.5（原生 daemon＋com0com DUT-side pair 或實體 USB-UART；OD-15 起 com0com 部分在擁有者 host 以 `COM20`／`COM21` 可執行）與實機 A/B（§15.9.2，仍 BLOCKED-OWNER），含 Windows 端以 Rust daemon 跑 `tests/contract_blackbox/slice21` 全套 | `win-com-open-exclusive`、`win-com-txrx-bridge`、`win-com-cancel-close` | 20、21 |
 | BO-S21-14 | Spike 3：第三方 EDR 開啟下 Rust `WalFs` 的寫入／rotate／unlink／外部 reader 結果，與 Stage 0 Python 結果並列 | `win-wal-av-rotate`、`win-wal-av-unlink`、`win-wal-av-reader-handle` | 6、22 |
 | BO-S21-15 | 藍牙 SPP 虛擬 COM 實際存在時的 SERIALCOMM 排除證據（需配對藍牙裝置的 Windows 機台） | — | 5 |
 | BO-S21-16 | Windows L2：EDR 開啟下以實體 UART 驗證 F12 WAL 進展 oracle | `win-wal-f12-progress` | 20、22 |
