@@ -1,0 +1,14 @@
+{
+  "argv": [
+    "stream",
+    "tail",
+    "--from-seq",
+    "-1"
+  ],
+  "columns": 80,
+  "rc": 2,
+  "stdout": "{\"error_code\":\"SOCKET_ERROR\",\"message\":\"[Errno 2] No such file or directory\",\"ok\":false}\n",
+  "stderr": "serialwrap: result.tail failed: SOCKET_ERROR: [Errno 2] No such file or directory\n",
+  "native": true,
+  "post_parse_effects": true
+}

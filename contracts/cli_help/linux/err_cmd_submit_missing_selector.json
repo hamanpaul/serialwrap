@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "cmd",
+    "submit"
+  ],
+  "columns": 80,
+  "rc": 2,
+  "stdout": "",
+  "stderr": "usage: serialwrap cmd submit [-h] --selector SELECTOR [--cmd COMMAND_TEXT]\n                             [--source SOURCE] [--mode MODE]\n                             [--priority PRIORITY]\n                             [--cmd-timeout CMD_TIMEOUT_S]\n                             [--expected-duration EXPECTED_DURATION_S]\n                             [--completion-regex COMPLETION_REGEX]\nserialwrap cmd submit: error: the following arguments are required: --selector\n",
+  "native": true,
+  "post_parse_effects": false
+}

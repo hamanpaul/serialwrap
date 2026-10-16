@@ -2,7 +2,14 @@
 #![allow(unused_variables)]
 
 use crate::ctx::TextIo;
+use sw_proto::error_codes::ErrorCode;
 use sw_proto::pyjson::PyDict;
+
+/// 組裝錯誤回應（P3-T8 stub；P3-T11 完整實作）。
+pub fn error_resp(code: ErrorCode, message: Option<&str>) -> PyDict {
+    todo!("P3-T8: error_resp")
+}
+
 
 /// Q-01：`json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",",":"))` 後接 `\n`。
 pub fn print_json(io: &mut TextIo, v: &PyDict) -> std::io::Result<()> {

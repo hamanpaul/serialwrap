@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "session",
+    "interactive-send",
+    "--help"
+  ],
+  "columns": 120,
+  "rc": 0,
+  "stdout": "usage: serialwrap session interactive-send [-h] --interactive-id INTERACTIVE_ID --data DATA [--encoding ENCODING]\n\noptions:\n  -h, --help            show this help message and exit\n  --interactive-id INTERACTIVE_ID\n  --data DATA\n  --encoding ENCODING\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

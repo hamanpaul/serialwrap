@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "session",
+    "interactive-open",
+    "--help"
+  ],
+  "columns": 80,
+  "rc": 0,
+  "stdout": "usage: serialwrap session interactive-open [-h] --selector SELECTOR\n                                           [--owner OWNER]\n                                           [--timeout INTERACTIVE_TIMEOUT_S]\n                                           [--command COMMAND]\n                                           [--allow-attached]\n\noptions:\n  -h, --help            show this help message and exit\n  --selector SELECTOR   session_id | COMx | alias\n  --owner OWNER\n  --timeout INTERACTIVE_TIMEOUT_S\n  --command COMMAND\n  --allow-attached      允許在 ATTACHED 狀態下開啟 bootloader recovery lease（需通過\n                        bootloader prompt 比對）。 若 session 已有 human interactive\n                        lease 則暫停並在 close 時恢復。\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

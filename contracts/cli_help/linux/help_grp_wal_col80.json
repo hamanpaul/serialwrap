@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "wal",
+    "--help"
+  ],
+  "columns": 80,
+  "rc": 0,
+  "stdout": "usage: serialwrap wal [-h] <command> ...\n\n操作 write-ahead log（WAL）：匯出區段、重設與查詢目前 seq。\n\npositional arguments:\n  <command>\n    export     匯出 WAL 區段（--from-seq／--to-seq／--limit）\n    reset      重設 WAL\n    current-seq\n               顯示目前 WAL seq\n\noptions:\n  -h, --help   show this help message and exit\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

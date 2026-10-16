@@ -1,0 +1,14 @@
+{
+  "argv": [
+    "alias",
+    "assign",
+    "--by-id",
+    "b"
+  ],
+  "columns": 80,
+  "rc": 2,
+  "stdout": "",
+  "stderr": "usage: serialwrap alias assign [-h] --by-id BY_ID --alias ALIAS\n                               [--profile PROFILE]\nserialwrap alias assign: error: the following arguments are required: --alias\n",
+  "native": true,
+  "post_parse_effects": false
+}

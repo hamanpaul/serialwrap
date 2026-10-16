@@ -1,0 +1,14 @@
+{
+  "argv": [
+    "log",
+    "tail-raw",
+    "--from-seq",
+    "1e3"
+  ],
+  "columns": 80,
+  "rc": 2,
+  "stdout": "",
+  "stderr": "usage: serialwrap log tail-raw [-h] [--selector SELECTOR] [--com COM]\n                               [--from-seq FROM_SEQ] [--limit LIMIT]\nserialwrap log tail-raw: error: argument --from-seq: invalid int value: '1e3'\n",
+  "native": true,
+  "post_parse_effects": false
+}
