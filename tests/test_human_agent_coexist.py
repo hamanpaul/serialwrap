@@ -84,6 +84,14 @@ class FakeTarget:
                 line, buf = buf.split(b"\n", 1)
                 cmd = line.strip()
                 if not cmd:
+                    # 比照真實 shell：空行（daemon 的 prompt probe）要重印 prompt。
+                    # 否則 probe 只能靠開機殘留的 prompt；RX 執行緒若先收進 buffer、
+                    # 再被 `_probe_prompt` 的 `clear_rx_buffer()` 清掉，session 會卡在
+                    # PRPL_PROMPT_TIMEOUT、20s 內到不了 READY（失敗的 case 隨執行而變）。
+                    try:
+                        os.write(self.master_fd, b"root@prplOS:/# ")
+                    except OSError:
+                        return
                     continue
                 if cmd.startswith(b"echo __READY__"):
                     reply = cmd[5:] + b"\r\n"
