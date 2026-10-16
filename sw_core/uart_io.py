@@ -14,7 +14,7 @@ from typing import Any, Callable
 
 from .config import UartProfile
 from .constants import DEFERRED_INPUT_MAX_BYTES, RX_RATE_WINDOW_S
-from .serial_port import SerialPort, open_serial_port
+from .serial_port import SerialPort, TxResult, open_serial_port
 from .telnet_console import TELNET_GREETING, TelnetFilter, escape_iac
 from .util import strip_ansi
 from .wal import WalWriter
@@ -1479,3 +1479,49 @@ class UARTBridge:
                 self._interactive_owner = owner
                 return True
             return False
+
+
+class TxIncompleteError(OSError):
+    """UART 寫入未完整完成時攜帶可確認的提交結果。"""
+
+    def __init__(self, result: TxResult) -> None:
+        self.result = result
+        message = (
+            f"tx incomplete: {result.outcome} "
+            f"{result.confirmed}/{result.requested} {result.error}"
+        )
+        super().__init__(message)
+        reason = (result.error or "").removeprefix("revoked:")
+        if reason == "cancelled":
+            errno_value = errno.ECANCELED
+        elif reason == "draining":
+            errno_value = errno.EAGAIN
+        else:
+            errno_value = errno.EIO
+        self.errno = errno_value
+        self.strerror = message
+        self._message = message
+
+    def __str__(self) -> str:
+        return self._message
+
+    def __reduce__(self) -> tuple[type, tuple[Any, ...]]:
+        return type(self), (self.result,)
+
+
+class TxUnknownError(TxIncompleteError):
+    """OS 寫入結果不明，errno 沿用原始傳輸錯誤。"""
+
+    def __init__(self, result: TxResult, errno_value: int = errno.EIO) -> None:
+        super().__init__(result)
+        self.errno = errno_value
+
+    def __reduce__(self) -> tuple[type, tuple[Any, ...]]:
+        return type(self), (self.result, self.errno)
+
+
+class SerialNotReady(TxIncompleteError, RuntimeError):
+    """序列埠尚未就緒；保留既有例外型別與訊息相容性。"""
+
+    def __str__(self) -> str:
+        return "serial not ready"

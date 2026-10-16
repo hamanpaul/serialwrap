@@ -58,6 +58,9 @@ for _k in (
     "SERIALWRAP_TTYMCU_PATH",
     "SERIALWRAP_EVENTS_LOG_PATH",
     "SERIALWRAP_DATA_DIR",
+    "SERIALWRAP_CONFIG",
+    "SERIALWRAP_TEST_DEVICE_ALLOWLIST",
+    "SERIALWRAP_RELEASE_MANIFEST",
 ):
     os.environ.pop(_k, None)
 
@@ -136,3 +139,22 @@ _MARKERS = {
 def pytest_configure(config):
     for name, desc in _MARKERS.items():
         config.addinivalue_line("markers", f"{name}: {desc}")
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """依平台與擁有者提供的 COM pair 條件標記測試 skip。"""
+    for item in items:
+        if "windows_native" in item.keywords and os.name != "nt":
+            item.add_marker(
+                pytest.mark.skip(
+                    reason="windows_native：請以 scripts/stage0/win-pytest.sh 執行（證據不足，非 PASS）"
+                )
+            )
+        if "posix_only" in item.keywords and os.name == "nt":
+            item.add_marker(pytest.mark.skip(reason="posix_only：Windows 不適用"))
+        if "windows_com" in item.keywords and not os.environ.get("SW_TEST_COM_PAIR"):
+            item.add_marker(
+                pytest.mark.skip(
+                    reason="BLOCKED-OWNER：需 OD-08 COM pair（SW_TEST_COM_PAIR；證據不足，非 PASS）"
+                )
+            )

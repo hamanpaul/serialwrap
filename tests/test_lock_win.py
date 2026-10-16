@@ -6,9 +6,10 @@ import pytest
 
 from sw_core import lock_win
 
-pytestmark = [pytest.mark.windows_native, pytest.mark.memory_only]
+pytestmark = [pytest.mark.memory_only]
 
 
+@pytest.mark.core_portable
 def test_endpoint_alive_refuses(tmp_path, monkeypatch):
     """endpoint 可連時，acquire() 必須 raise DAEMON_ALREADY_RUNNING。"""
     monkeypatch.setattr(lock_win, "_endpoint_alive", lambda ep: True)
@@ -17,6 +18,7 @@ def test_endpoint_alive_refuses(tmp_path, monkeypatch):
         lk.acquire()
 
 
+@pytest.mark.windows_native
 @pytest.mark.skipif(not sys.platform.startswith("win"), reason="msvcrt 檔鎖僅 Windows")
 def test_stale_endpoint_acquires(tmp_path, monkeypatch):
     """endpoint 不可連（stale）時，acquire() 取得 msvcrt 檔鎖，release() 釋放。"""
@@ -29,6 +31,7 @@ def test_stale_endpoint_acquires(tmp_path, monkeypatch):
         lk.release()
 
 
+@pytest.mark.windows_native
 @pytest.mark.skipif(not sys.platform.startswith("win"), reason="msvcrt 檔鎖互斥僅 Windows")
 def test_two_locks_same_path_second_raises(tmp_path, monkeypatch):
     """同一 lock_path 的兩個 WindowsSingletonLock，第一個 acquire 成功後，

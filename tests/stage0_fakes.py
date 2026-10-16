@@ -29,7 +29,7 @@ class ScriptedWrite:
     每次呼叫都記入 `calls`；actions 耗盡後再被呼叫即 raise AssertionError（多出的 OS 寫入本身即失敗）。
     """
 
-    def __init__(self, actions: list[Any]) -> None:
+    def __init__(self, actions: list[int | BaseException | Callable[[bytes], int]]) -> None:
         self._actions = list(actions)
         self.calls: list[bytes] = []
 

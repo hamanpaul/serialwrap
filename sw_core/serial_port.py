@@ -23,6 +23,8 @@ import re
 import sys
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Literal
 
 from .config import UartProfile
 
@@ -45,6 +47,21 @@ if os.name == "posix":  # pragma: no cover - 平台相依
     }
 
 _COM_RE = re.compile(r"^COM\d+$", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class TxResult:
+    """記錄一次 UART 寫入的可確認結果。"""
+
+    outcome: Literal["not_submitted", "completed", "unknown"]
+    confirmed: int
+    requested: int
+    error: str | None = None
+
+    @property
+    def complete(self) -> bool:
+        """只有完整完成且確認長度吻合時才為真。"""
+        return self.outcome == "completed" and self.confirmed == self.requested
 
 
 def _win_device_name(device_path: str) -> str:
