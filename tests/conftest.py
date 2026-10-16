@@ -4,7 +4,7 @@
 時序關鍵：本檔 module top-level 於 pytest collection 之前執行、早於任何測試模組 import——
 sw_core/constants.py 的路徑常數是 import-time 凍結，fixture 階段才 setenv 一律太遲。
 限制（載明於 CLAUDE.md）：python3 -m unittest discover 不載入本檔，該跑法的 state 維度
-由 8 檔 per-file 隔離（tests/state_iso.py）補上。
+由 13 檔 per-file 隔離（tests/state_iso.py）補上。
 """
 from __future__ import annotations
 

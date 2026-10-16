@@ -500,3 +500,22 @@ def test_string_false_is_truthy(tmp_path):
         'EVT-D-C3：字串 "false" 經 bool() 應為 True，實際 debug='
         f"{rule.debug!r}"
     )
+
+
+@pytest.mark.process_rpc
+def test_tcp_port_empty_env_import_fails():
+    """GAP-X1：SERIALWRAP_TCP_PORT 為空字串時 import sw_core.constants 直接 ValueError（exit 1），不退回 48700。"""
+    env = dict(os.environ)
+    env["SERIALWRAP_TCP_PORT"] = ""
+    env["PYTHONPATH"] = str(REPO)
+    proc = subprocess.run(
+        [sys.executable, "-c", "import sw_core.constants"],
+        cwd=str(REPO),
+        env=env,
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    stderr = proc.stderr.decode("utf-8", errors="replace")
+    assert proc.returncode == 1, f"空字串 SERIALWRAP_TCP_PORT 應 exit 1，實際 {proc.returncode}：{stderr}"
+    assert "ValueError" in stderr, f"應為 ValueError traceback，實際 {stderr!r}"

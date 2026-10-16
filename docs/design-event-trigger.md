@@ -29,8 +29,8 @@
 - 對 device → host 方向的 RX line 做 per-line pattern match（plain substring 或 regex）。
 - 可選 scope filter：spontaneous / command_output / any。
 - 可選 profile filter：rule 只在 binding 該 profile 的 COM 上生效。
-- handler spawn 完整契約：stdin JSON payload + env 子集 + timeout + 並行上限 + overflow drop_oldest。
-- counter（fire_count / last_fire_ts / exhausted）persist 在 tmpfs，daemon failover 後沿用，host reboot 清除。
+- handler spawn 完整契約：stdin JSON payload + env 子集 + timeout + 並行上限 + 飽和時丟棄新 fire。
+- counter（fire_count / last_fire_ts / exhausted）persist 在 `STATE_DIR/events`（非 tmpfs；daemon failover 後沿用，host reboot 後保留）。
 - 事件 / 失敗 / drop 全部寫入 `events.ndjson` 供 forensic。
 - daemon 重啟時根據 rule 的 `auto_enable_com_on_load` 自動恢復 monitoring 能力。
 
@@ -40,7 +40,6 @@
 - 不做 inbox / pull 模式（永久 out of scope，會違反原則 2）。
 - 不做 rule 鏈接（trigger-by-another-event，v2 候選）。
 - 不做 daemon 端 level / threshold gating（handler 自己分流）。
-- 不做跨 host reboot 的 counter 持久化（host reboot 等於重新 sensing）。
 - 不做 RPC caller authentication；`owner` 為 self-declared metadata，daemon 不驗。
 
 ## 4. 架構
@@ -75,8 +74,8 @@ Bridge._handle_serial_rx ──► WAL.append(RX)               (現有，零改
 
 **隔離與背壓策略**：
 - per-COM matcher queue 滿（default 1024 lines）→ drop_oldest，記 `event_dropped(reason=matcher_queue_overflow)`。
-- per-rule concurrency = 1：rule 還在跑時新事件來 → drop_oldest，記 `event_dropped(reason=per_rule_busy)`。
-- per-daemon concurrency = 8：超出 → drop_oldest，記 `event_dropped(reason=per_daemon_saturated)`。
+- per-rule concurrency = 1：rule 還在跑時新事件來 → **丟棄新 fire**，記 `event_dropped(reason=per_rule_busy)`。
+- per-daemon concurrency = 8：超出 → **丟棄新 fire**，記 `event_dropped(reason=per_daemon_saturated)`。
 - 任何階段都**不允許 block bridge IO loop** 或回壓 RX。
 
 ## 5. Rule Schema
@@ -141,7 +140,7 @@ Bridge._handle_serial_rx ──► WAL.append(RX)               (現有，零改
 ### Schema 驗證
 
 - `pattern.kind == "regex"` → `pattern.value` 必須能被 `re.compile(value, flags)` 通過，否則 reject。
-- `selectors` 元素必須是現有 alias / 已知 COM 名 / `"ALL"`。未來新增的 alias 不會 retroactive，要 reload。
+- `selectors` 元素必須是現有 alias / 已知 COM 名 / `"ALL"`。未來新增的 alias／COM 不會 retroactive 啟用，須 `event enable --selector <COM>`。
 - `handler.exec` 與 `handler.shell` 互斥，且必須二擇一。
 - `cooldown_ms`, `timeout_ms`, `max_fires` 須非負（`max_fires` 也可為 null）。
 
@@ -156,8 +155,8 @@ Bridge._handle_serial_rx ──► WAL.append(RX)               (現有，零改
 | 物件 | 路徑 | 持久層級 |
 |---|---|---|
 | rule definition | `events.d/<rule_id>.json` | 跨 daemon restart, 跨 host reboot |
-| counter（fire_count / last_fire_ts / exhausted） | `/tmp/serialwrap/events/<rule_id>.counter.json` | tmpfs（跨 daemon failover 保留，host reboot 清） |
-| event log | `/tmp/serialwrap/events/events.ndjson` | tmpfs（rotation 規則同 daemon log，預設 10MB×3） |
+| counter（fire_count / last_fire_ts / exhausted） | `STATE_DIR/events/<rule_id>.counter.json`（預設 `~/.local/state/serialwrap/events/`） | 持久（非 tmpfs；跨 daemon failover 與 host reboot 保留） |
+| event log | `STATE_DIR/events/events.ndjson`（預設 `~/.local/state/serialwrap/events/events.ndjson`） | 持久（非 tmpfs；rotation 規則同 daemon log，預設 10MB×3） |
 | COM enable 狀態 | runtime in-memory | 無獨立 state file；由 `auto_enable_com_on_load` 在 daemon load 計算 |
 
 `events.d/` 預設位置：`~/.serialwrap/events.d/`（user-writable、跨 reboot 持久），可由 env `SERIALWRAP_EVENTS_DIR` 覆寫；正式部署可指向 `/etc/serialwrap/events.d/` 或 `/var/lib/serialwrap/events.d/`。
@@ -215,7 +214,7 @@ manual `event enable` / `event disable` 之後**不**寫回 rule 檔；下次 da
 
 ### Selector 展開
 
-- `selectors=["ALL"]` → daemon 解讀為「所有目前已知 COM」；新增 alias 後須 reload 才生效。
+- `selectors=["ALL"]` → daemon 解讀為「所有目前已知 COM」；`auto_enable_com_on_load` 只在規則載入／設定時展開到當下已知 COM，之後新增的 COM 須 `event enable --selector` 才會啟用（daemon 啟動時 engine 早於 device watcher，故只含 YAML explicit target）。
 - 多 selector rule fire 時，payload 的 `selector` 欄位是**實際命中的那個** COM。
 
 ### Line 上限
@@ -246,18 +245,20 @@ per-line 長度上限 16 KB；超出視為「split 後比對」（簡化：直�
   "kind": "tool",
   "selector": "COM0",
   "matched_at": 1714200000123,
-  "matched_line": "[ 1234.567] sensor: Temperature overhold 105C, throttling",
+  "matched_line": "Temperature overhold 105C",
   "matched_text": "Temperature overhold 105C",
   "match_groups": [],
   "scope": "spontaneous",
   "active_cmd_id": null,
   "wal_seq": 12345678,
-  "bridge_generation": 7,
+  "bridge_generation": 0,
   "fire_count": 3,
   "level": "WARN",
   "profile": "ALL"
 }
 ```
+
+（註：`matched_line` 目前等於 `matched_text`；`bridge_generation` 目前恆為 `0`，欄位保留供日後使用。）
 
 ### Env subset（SERIALWRAP_EVENT_*）
 
@@ -279,7 +280,7 @@ per-line 長度上限 16 KB；超出視為「split 後比對」（簡化：直�
 
 - per-rule = 1（**doc 必寫**：handler 必須輕量；超出 → `event_dropped(per_rule_busy)`）
 - per-daemon = 8（→ `event_dropped(per_daemon_saturated)`）
-- 兩個都是 drop_oldest 語義；不 block，不延遲，不影響 bridge。
+- 兩者皆為**丟棄新 fire**語義（不 block，不延遲，不影響 bridge）。
 
 ### Handler 失敗處理
 
@@ -371,12 +372,12 @@ serialwrap event tail [--rule-id X] [--selector COM0] [-n 50] [--since <ts>]
 | type | 何時寫 | 額外欄位 |
 |---|---|---|
 | `match_recorded` | matcher 通過所有 gate、enqueue dispatcher | `wal_seq`, `matched_text`, `fire_count` |
-| `match_skipped` | **rule.debug=true 才寫**：pattern match 但被某 gate 擋下 | `reason` ∈ `cooldown / exhausted / scope_mismatch / profile_mismatch / per_rule_busy / per_daemon_saturated` |
+| `match_skipped` | **rule.debug=true 才寫**：pattern match 但被某 gate 擋下 | `reason` ∈ `cooldown / exhausted / scope_mismatch / profile_mismatch`（4 種；`per_rule_busy`／`per_daemon_saturated` 只走 `event_dropped`） |
 | `fire_attempted` | dispatcher 即將 fork | `pid`（先不知 → 簡寫 `-1` 後續補也可，v1 簡化為合併進 `fire_completed`） |
 | `fire_completed` | handler 正常 / 異常退出 | `exit_code`, `duration_ms`, `stdout_tail`, `stderr_tail`（各 ≤4KB） |
 | `fire_timeout` | handler 超時被 kill | `duration_ms` |
 | `fire_failed` | spawn 失敗（exec 錯、permission） | `reason` |
-| `event_dropped` | drop_oldest 觸發（**永遠寫，不需 debug**） | `reason` ∈ `matcher_queue_overflow / per_rule_busy / per_daemon_saturated`, `dropped_count` |
+| `event_dropped` | `matcher_queue_overflow` 為 drop_oldest（丟最舊待比對行）；`per_rule_busy`／`per_daemon_saturated` 為丟棄新 fire（**永遠寫，不需 debug**） | `reason` ∈ `matcher_queue_overflow / per_rule_busy / per_daemon_saturated`；overflow 附 `selector`、`wal_seq`，其餘附 `rule_id`、`selector`（無 `dropped_count`） |
 | `rule_loaded` / `rule_unloaded` | `event.reload` / `rule_set` / `rule_delete` 後 | `rule_id` |
 | `rule_load_failed` | schema 驗證失敗 | `path`, `reason` |
 | `com_enabled` / `com_disabled` | enable/disable / auto-enable on load | `selector`, `triggered_by` ∈ `manual / auto / reload` |
@@ -396,9 +397,9 @@ serialwrap event tail [--rule-id X] [--selector COM0] [-n 50] [--since <ts>]
 | handler 一直 timeout | 每次 timeout +1，直到 max_fires 把 rule 變 exhausted（如未設 max_fires，會持續 fire） |
 | matcher queue 滿 | drop_oldest，記 `event_dropped(matcher_queue_overflow)`，bridge 不受影響 |
 | daemon crash 在 counter 寫入中 | atomic rename 保證要嘛舊值要嘛新值，不會半寫 |
-| host reboot | tmpfs 全清；rule 檔保留；下次 daemon 啟動依 `auto_enable_com_on_load` 重啟 monitor，counter 從 0 開始 |
+| host reboot | counter 與 `events.ndjson` 位於 `STATE_DIR/events`（非 tmpfs）而保留；rule 檔保留；下次 daemon 啟動依 `auto_enable_com_on_load` 重啟 monitor |
 | COM 未 bind / session 未 attached | 該 COM 上的 rule 不 fire（沒有 RX 流入）；不影響 rule 列表 |
-| `selectors=["ALL"]` rule | 套用到所有當前 COM；新增 COM 後須 `event reload` 才會被涵蓋 |
+| `selectors=["ALL"]` rule | `auto_enable_com_on_load` 只在載入時展開到當下已知 COM；新增 COM 後須 `event enable --selector` 才會啟用（daemon 啟動時 engine 早於 device watcher，故只含 YAML explicit target）|
 | `profile` filter 但 COM 未 bind | 視為 `actual=null`，不 match；fire skip（rule.debug=true 才寫 `match_skipped(profile_mismatch)`）|
 
 ## 12. Out of Scope（v2+ 候選）
@@ -406,7 +407,7 @@ serialwrap event tail [--rule-id X] [--selector COM0] [-n 50] [--since <ts>]
 - **Webhook / HTTP dispatcher**：以 `handler.kind: "webhook"` 形式擴充，不影響現有 spawn channel。
 - **Rule 鏈接（trigger-by-another-event）**：需要 daemon 內部 event bus，v1 故意不做。
 - **Daemon 端 level / threshold gating**：使用者抱怨 handler-side filter 不夠用時再加。
-- **Cross-host-reboot counter persistence**：搬到 `/var/lib/serialwrap/events/` + atomic write；目前用例不需要。
+- **counter／event log 位置遷移**：可移到 `/var/lib/serialwrap/events/`（目前在 `STATE_DIR/events`，已跨 host reboot 保留）。
 - **RPC caller authentication**：與整個 serialwrap 的 caller auth 一起處理，本 issue 不涵蓋。
 - **Rolling-window pattern（跨行 match）**：v1 故意只做 line-based。
 - **Glob pattern type**：未來在 `pattern.kind` 加 `"glob"` 即可，不需動 outer schema（α-X 設計目的）。

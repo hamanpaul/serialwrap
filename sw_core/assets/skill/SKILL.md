@@ -194,16 +194,16 @@ serialwrap event enable --selector COM0
 # 5. 查看 fire 記錄
 serialwrap event tail --rule-id owner.name -n 20
 ```
-- `auto_enable_com_on_load: true` 的規則在 daemon 重啟後自動啟用。
-- Counter 由 disable/delete/reset 清除；daemon 重啟後 counter 保留（tmpfs 除外）。
+- `auto_enable_com_on_load: true` 的規則在 daemon 重啟後，對具體 COM selector 自動啟用；`selectors: ["ALL"]` 只在 daemon 啟動時展開到當下已知 COM（event engine 啟動早於 device watcher／bootstrap_attach，實務上只含 YAML explicit target），之後熱插或動態偵測的 COM 須手動 `serialwrap event enable --selector COMx`。
+- Counter 與 event log 位於 `STATE_DIR/events`（非 tmpfs，主機重開機後保留）；counter 由 disable/delete/reset 清除，daemon 重啟後 counter 保留。
 
 ## 透過 UART 推送／拉取檔案
 ```bash
 serialwrap file push --selector COM0 --local ./probe.sh --remote /tmp/probe.sh --source agent:diag
 serialwrap file pull --selector COM0 --remote /etc/config/wireless --local ./wireless.bak --source agent:diag
 ```
-- `--remote`／`--local` 必填於 push；pull 省略 `--local` 時回傳檔案內容。
-- `--chunk-size` 預設 2048（push）。
+- `--remote`／`--local` 必填於 push；pull 省略 `--local` 時寫到 daemon 工作目錄的 `basename(remote)`，回應附 `local_path`。
+- `--chunk-size` 預設 512（push）。
 - remote 模式下 `--local` 指 daemon 所在 host 的路徑。
 - **適用範圍＝小檔（設定檔、腳本、探針等，數十 KB 內）**。UART 115200 baud 的原始上限約 11 KB/s，echo-ACK 節流後更低（1 MB 約 10–17 分鐘）——`file push` 的設計目標本來就不是大檔。
 - **大檔走網路通道，不走 UART**：firmware image 這類檔案，只要 DUT 有 SSH／TFTP／HTTP 可達，一律用 SCP／TFTP 傳輸，serialwrap 只負責控制面（以 `cmd submit` 觸發板端的 `scp`／`tftp`／`wget` 並觀察結果）。實測一顆 81 MB image 走 SCP 經 LAN 數秒完成；同一顆走 UART 即使通道完全穩定也需兩小時以上。

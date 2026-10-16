@@ -112,6 +112,8 @@ def test_file_transfer_comment_updated():
     """驗證 sw_core/file_transfer.py 註解中已移除舊的 ≈ 741 開銷估計。"""
     file_transfer_text = (ROOT / "sw_core" / "file_transfer.py").read_text(encoding="utf-8")
     assert "≈ 741" not in file_transfer_text
+    assert "781～798" in file_transfer_text
+    assert "97～114" in file_transfer_text
 
 
 @pytest.mark.memory_only
@@ -168,6 +170,8 @@ def test_p0_rows_all_covered():
             if "P0" in stage:
                 p0_row_ids.add(row_id)
 
+    assert p0_row_ids, "parse found no P0 rows（調和表表格格式可能已變動；空集合不得視為通過）"
+
     coverage_path = ROOT / "contracts" / "p0_row_coverage.yaml"
     assert coverage_path.is_file(), f"{coverage_path} 不存在（請建立該檔案）"
 
@@ -199,8 +203,12 @@ def test_p0_rows_all_covered():
                 path_str, anchor = target.split("#", 1)
                 p = ROOT / path_str
                 assert p.is_file(), f"列 {row_id} 的 frozen_in 目標檔案不存在：{p}"
+                if path_str == "docs/rust-refactor/spec-errata.md":
+                    assert anchor == row_id, f"列 {row_id} 的 spec-errata 錨點必須為本列 ID，實際 {anchor}"
                 target_content = p.read_text(encoding="utf-8")
-                assert re.search(r"^#+\s+.*" + re.escape(anchor), target_content, re.MULTILINE), (
+                assert re.search(
+                    r"^#+\s+.*" + re.escape(anchor) + r"(?![0-9A-Za-z.\-])", target_content, re.MULTILINE
+                ), (
                     f"列 {row_id} 的 frozen_in 目標 {target} 在 {path_str} 中未找到含 {anchor} 的標題"
                 )
             elif "::" in target:
@@ -214,3 +222,46 @@ def test_p0_rows_all_covered():
             else:
                 p = ROOT / target
                 assert p.exists(), f"列 {row_id} 的 frozen_in 目標檔案或路徑不存在：{p}"
+
+
+@pytest.mark.memory_only
+def test_skill_all_selector_caveat():
+    """EVT-D-D11：SKILL 不得宣稱 ALL 規則重啟後涵蓋動態／熱插 COM，須載明 ALL 只在啟動時展開。"""
+    skill_text = (ROOT / "sw_core" / "assets" / "skill" / "SKILL.md").read_text(encoding="utf-8")
+    assert "的規則在 daemon 重啟後自動啟用。" not in skill_text
+    assert "只在 daemon 啟動時展開到當下已知 COM" in skill_text
+
+
+@pytest.mark.memory_only
+def test_design_event_drop_and_counter_statements():
+    """EVT-D-D6～D8、D5 與設計文件 L32／L43／L144／L218／L381／L403／L411 勘誤的回歸。"""
+    text = (ROOT / "docs" / "design-event-trigger.md").read_text(encoding="utf-8")
+    # dropped_count 只允許出現在「（無 `dropped_count`）」的否定敘述中一次
+    assert "（無 `dropped_count`）" in text
+    assert text.count("dropped_count") == 1
+    assert "drop_oldest 觸發" not in text
+    assert "`per_rule_busy`／`per_daemon_saturated` 為丟棄新 fire" in text
+    assert "並行上限 + 飽和時丟棄新 fire" in text
+    assert "不做跨 host reboot 的 counter 持久化" not in text
+    assert "/tmp/serialwrap/events" not in text
+    assert "新增 alias 後須 reload 才生效" not in text
+    assert "新增 COM 後須 `event reload` 才會被涵蓋" not in text
+
+
+@pytest.mark.memory_only
+def test_spec_transport_windows_loopback_tcp():
+    """RPC-D-14：serialwrap-spec §4.3 須區分 POSIX（僅 Unix socket）與 Windows（loopback TCP bind）。"""
+    text = (ROOT / "docs" / "serialwrap-spec.md").read_text(encoding="utf-8")
+    assert "POSIX 上，`tcp://...`" in text
+    assert "Windows daemon 本體直接 listen loopback TCP（預設 48700，`SERIALWRAP_TCP_PORT` 可改）" in text
+    assert "Windows 僅接受 loopback `tcp://`" in text
+    assert "`daemon start` 只支援本機 socket，不支援 `--endpoint`" not in text
+
+
+@pytest.mark.memory_only
+def test_claude_md_errata_statements():
+    """EVT-D-D9／WAL-D16、SES-16.6-01、PLT-D-02 的 CLAUDE.md 勘誤回歸。"""
+    text = (ROOT / "CLAUDE.md").read_text(encoding="utf-8")
+    assert "動態偵測 session 只用 template `log_dir`，不套用 `defaults.log_dir`" in text
+    assert "是否 probe 由 `ready_probe` 決定" in text
+    assert "隔離實例必須**同時**設 `SERIALWRAP_BY_ID_DIR` 與 `SERIALWRAP_BY_PATH_DIR`" in text

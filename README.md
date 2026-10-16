@@ -2954,7 +2954,7 @@ Event Trigger Engine 讓 daemon 持續監聽每個 COM 的 UART RX 行，當輸�
 
 ### 規則格式
 
-規則為 JSON/YAML 檔，儲存在 `~/.serialwrap/events.d/`：
+規則為 JSON 檔（只讀取 `*.json`），儲存在 `~/.serialwrap/events.d/`：
 
 ```json
 {
@@ -2996,7 +2996,7 @@ serialwrap event tail --rule-id ops.kernel-panic -n 20  # 查看最近 fire 記�
 由 event engine 觸發的 handler script **必須**：
 - 在 `timeout_ms`（預設 10s）內結束；超時會依序收到 SIGTERM（pgid）→ SIGKILL（pgid）
 - **不可呼叫 `setsid()`** 或主動 daemonize，否則子進程會脫離 process group，timeout 無法強制終止
-- 從 stdin 讀取 JSON payload（含 `com`、`rule_id`、`matched_text`、`trigger_ts` 等欄位）
+- 從 stdin 讀取 JSON payload（含 `selector`、`rule_id`、`matched_text`、`matched_at` 等欄位）
 - 以 exit code 0 代表成功，非 0 代表失敗（均記入 events.ndjson）
 
 Handler **建議**：

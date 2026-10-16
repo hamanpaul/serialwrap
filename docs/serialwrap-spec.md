@@ -134,13 +134,13 @@ sequenceDiagram
 
 ### 4.3 Client ↔ Daemon transport
 
-- daemon 本體仍只 listen **Unix socket**
+- daemon 本體：POSIX 只 listen **Unix socket**；Windows 改 listen `tcp://127.0.0.1:48700`（TCP loopback，`sw_core/rpc_win.py`）
 - CLI client 端可接受：
   - `--socket /tmp/serialwrap/serialwrapd.sock`
   - `--endpoint unix:///tmp/serialwrap/serialwrapd.sock`
   - `--endpoint tcp://host:port`
-- `tcp://...` 的用途是讓 client 經由 **ssh-tunnel / socat / 隔離測試網路** 連到遠端 daemon；**不是**讓 daemon 直接 listen TCP
-- `daemon start` 只支援本機 socket，不支援 `--endpoint`
+- POSIX 上，`tcp://...` 的用途是讓 client 經由 **ssh-tunnel / socat / 隔離測試網路** 連到遠端 daemon；**不是**讓 daemon 直接 listen TCP。Windows daemon 本體直接 listen loopback TCP（預設 48700，`SERIALWRAP_TCP_PORT` 可改）。
+- `daemon start` 只支援本機：POSIX 不支援 `--endpoint`；Windows 僅接受 loopback `tcp://`（127.0.0.1／localhost／::1）作為 bind 位址。
 
 ## 5. Session / Console / Command 狀態
 

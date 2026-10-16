@@ -36,10 +36,10 @@ _DECODERS = ("base64", "openssl")
 _ENCODERS = ("base64", "openssl")
 
 # 預設 chunk 大小（#157）：512B 的 base64 為 ceil(512/3)*4=684 字元，加上
-# `printf '%s' '' | base64 -d >> /tmp/.sw_upload_<12hex>` 樣板約 57 字元固定
-# 開銷 ≈ 741 字元——相對 issue 實證會截斷的 ~2789 字元（chunk=2048）約 3.8x
-# 安全餘裕。注意：此值是依 #157 附的截斷長度反推的保守估計、非真機量測值；
-# 呼叫端可經 CLI `--chunk-size`／RPC `chunk_size` 覆寫。
+# 樣板（含 runtime sentinel 與 base64／openssl decoder 變體）約 97～114 字元固定開銷，
+# 整行以 `_chunk_command` 計算約 781～798 字元（送出時另加一個換行，共 782～799 bytes），
+# 相對 issue 實證會截斷的 ~2789 字元（chunk=2048）約 3.5x 安全餘裕。注意：此值是依 #157 附的
+# 截斷長度反推的保守估計；行長為計算值、非真機量測值。呼叫端可經 CLI `--chunk-size`／RPC `chunk_size` 覆寫。
 DEFAULT_CHUNK_SIZE = 512
 
 # echo-ACK 節流預設（#161）：slice 64 字元、每段 echo 等待 `DEFAULT_ECHO_TIMEOUT_S`。
