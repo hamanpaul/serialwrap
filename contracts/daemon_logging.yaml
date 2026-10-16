@@ -94,7 +94,7 @@ messages:
     level: WARNING
     template: "已達 max_sessions=%d，忽略裝置 %s"
     args: [max_sessions, by_id]
-    source: "sw_core/session_manager.py:2568"
+    source: "sw_core/session_manager.py:2573"
 
   - id: reboot_recovery_ensure_ready_exception
     logger: serialwrap
@@ -102,7 +102,7 @@ messages:
     template: "reboot-recovery ensure_ready 例外（session=%s），續迴圈待逾時收尾"
     args: [session_id]
     exc_info: true
-    source: "sw_core/session_manager.py:3438"
+    source: "sw_core/session_manager.py:3447"
 
   - id: console_rx_handler_exception
     logger: serialwrap
@@ -110,7 +110,7 @@ messages:
     template: "console RX handler 例外（com=%s），略過此塊、console 續行"
     args: [com]
     exc_info: true
-    source: "sw_core/uart_io.py:454"
+    source: "sw_core/uart_io.py:506"
 
   - id: rx_handler_exception_pyserial
     logger: serialwrap
@@ -118,7 +118,7 @@ messages:
     template: "RX handler 例外（com=%s），略過此塊、reader 續行"
     args: [com]
     exc_info: true
-    source: "sw_core/uart_io.py:886"
+    source: "sw_core/uart_io.py:949"
 
   - id: rx_handler_exception_posix
     logger: serialwrap
@@ -126,7 +126,14 @@ messages:
     template: "RX handler 例外（com=%s），略過此塊、reader 續行"
     args: [com]
     exc_info: true
-    source: "sw_core/uart_io.py:929"
+    source: "sw_core/uart_io.py:992"
+
+  - id: tx_account_evicted
+    logger: serialwrap
+    level: WARNING
+    template: "tx account evicted (cmd_id=%s)"
+    args: [oldest_cmd]
+    source: "sw_core/uart_io.py:1196"
 
   - id: wal_rotate_failed
     logger: serialwrap

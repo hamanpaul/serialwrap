@@ -306,7 +306,7 @@ changes:
   - id: "SC-07"
     kind: "SC"
     title: "TX WAL 只記錄 OS 已確認寫出的 bytes"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -1243,7 +1243,7 @@ changes:
   - id: "DF-15"
     kind: "DF"
     title: "RX 精確 WAL seq"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-15"

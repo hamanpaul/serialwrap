@@ -673,6 +673,7 @@ def test_bridge_with_stub_wal_without_unhealthy_attr(tmp_path):
 @pytest.mark.core_portable
 def test_flash_gate_precedes_wal_unhealthy_rejection(tmp_path):
     from stage0_fakes import FakePort, make_bridge
+    from sw_core.serial_port import TxResult
 
     class UnhealthyWal:
         unhealthy = True
@@ -684,7 +685,9 @@ def test_flash_gate_precedes_wal_unhealthy_rejection(tmp_path):
     bridge, _ = make_bridge(tmp_path, port=port, wal=UnhealthyWal())
     bridge.set_flash_mode(True)
 
-    assert bridge.send_bytes(b"probe\n", source="system:self_test") is None
+    assert bridge.send_bytes(b"probe\n", source="system:self_test") == TxResult(
+        "not_submitted", 0, len(b"probe\n")
+    )
     assert port.writes == []
 
 

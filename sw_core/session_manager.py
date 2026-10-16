@@ -2382,19 +2382,24 @@ class SessionManager:
         if self._on_console_line is not None:
             self._on_console_line(session_id, client_id, line)
 
-    def _on_bridge_rx(self, session_id: str, data: bytes) -> None:
+    def _on_bridge_rx(
+        self,
+        session_id: str,
+        data: bytes,
+        wal_seq: int | None = None,
+    ) -> None:
         # Notify RX observers before foreground_busy gate (observers receive ALL rx).
         # IMPORTANT: Observer MUST NOT block on I/O or cross-thread wait, and MUST NOT
         # call SessionManager methods under _lock (deadlock risk). Exceptions are silently swallowed.
-        if self._rx_observers:
-            with self._lock:
-                session = self._sessions.get(session_id)
-                com = session.profile.com if session is not None else session_id
-                wal_seq = self._wal.current_seq
-                observers = list(self._rx_observers)
+        with self._lock:
+            session = self._sessions.get(session_id)
+            com = session.profile.com if session is not None else session_id
+            chunk_wal_seq = wal_seq if wal_seq is not None else self._wal.current_seq
+            observers = list(self._rx_observers)
+        if observers:
             for obs in observers:
                 try:
-                    obs(com, data, wal_seq)
+                    obs(com, data, chunk_wal_seq)
                 except Exception:
                     pass
         chunk = clean_text(data.decode("utf-8", errors="replace"))
@@ -2422,7 +2427,7 @@ class SessionManager:
                     continue
                 capture.add_chunk(chunk, BG_CAPTURE_MAX_BYTES)
                 capture.last_activity_mono = time.monotonic()
-                capture.last_seq = self._wal.current_seq
+                capture.last_seq = chunk_wal_seq
             if session.foreground_busy:
                 return
             # agent log capture（維持原行為：foreground 期間不寫 agent log）
@@ -2617,7 +2622,9 @@ class SessionManager:
             profile.uart,
             self._wal,
             on_console_line=lambda client_id, line, sid=session_id: self._on_bridge_console_line(sid, client_id, line),
-            on_rx_data=lambda data, sid=session_id: self._on_bridge_rx(sid, data),
+            on_rx_data=lambda data, wal_seq=None, sid=session_id: self._on_bridge_rx(
+                sid, data, wal_seq
+            ),
             on_bridge_down=lambda reason, sid=session_id: self._handle_bridge_down(sid, bridge, reason),
             preserved_consoles=preserved_consoles,
         )
@@ -3063,7 +3070,9 @@ class SessionManager:
             profile.uart,
             self._wal,
             on_console_line=lambda client_id, line, sid=session_id: self._on_bridge_console_line(sid, client_id, line),
-            on_rx_data=lambda data, sid=session_id: self._on_bridge_rx(sid, data),
+            on_rx_data=lambda data, wal_seq=None, sid=session_id: self._on_bridge_rx(
+                sid, data, wal_seq
+            ),
             on_bridge_down=lambda reason, sid=session_id: self._handle_bridge_down(sid, bridge, reason),
         )
 

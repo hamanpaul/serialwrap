@@ -296,6 +296,7 @@ class SerialwrapService:
         self._arbiter.flush_session(session_id, error_code)
 
     def _engine_rx_observer(self, com: str, data: bytes, wal_seq: int) -> None:
+        """以該 RX chunk 的精確 WAL seq 將完整行送入 EventEngine。"""
         with self._engine_buffers_lock:
             buf = self._engine_line_buffers.get(com)
             if buf is None:

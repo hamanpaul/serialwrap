@@ -3,6 +3,8 @@ from __future__ import annotations
 import collections
 import dataclasses
 import errno
+import inspect
+import logging
 import os
 import re
 import select
@@ -14,7 +16,7 @@ from typing import Any, Callable
 
 from .config import UartProfile
 from .constants import DEFERRED_INPUT_MAX_BYTES, RX_RATE_WINDOW_S
-from .serial_port import SerialPort, TxResult, open_serial_port
+from .serial_port import SerialPort, TxResult, _posix_write_all, open_serial_port
 from .telnet_console import TELNET_GREETING, TelnetFilter, escape_iac
 from .util import strip_ansi
 from .wal import WalWriter
@@ -29,6 +31,51 @@ _STALE_CONSOLE_GRACE_S = 2.0
 # 時間剪枝為主，此上限僅兜底（deque maxlen 自動丟最舊）。
 _RX_WINDOW_MAX_ENTRIES = 4096
 AUTO_TX_SOURCES: frozenset[str] = frozenset({"system"})
+_TX_ACCOUNT_MAX = 512
+_PORT_WRITE_CANCEL_CACHE: dict[type, bool] = {}
+_PORT_WRITE_CANCEL_CACHE_LOCK = threading.Lock()
+
+
+def _port_write_accepts_cancel(port: SerialPort) -> bool:
+    """依 port 型別快取 write 是否接受 cancel 關鍵字。"""
+    port_type = type(port)
+    with _PORT_WRITE_CANCEL_CACHE_LOCK:
+        cached = _PORT_WRITE_CANCEL_CACHE.get(port_type)
+        if cached is not None:
+            return cached
+        try:
+            signature = inspect.signature(port.write)
+        except (TypeError, ValueError):
+            accepts_cancel = False
+        else:
+            accepts_cancel = any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in signature.parameters.values()
+            ) or (
+                (parameter := signature.parameters.get("cancel")) is not None
+                and parameter.kind
+                in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+            )
+        _PORT_WRITE_CANCEL_CACHE[port_type] = accepts_cancel
+        return accepts_cancel
+
+
+def _callback_accepts_keyword(callback: Callable[..., Any], keyword: str) -> bool:
+    """檢查 callback 是否能接收指定關鍵字。"""
+    try:
+        signature = inspect.signature(callback)
+    except (TypeError, ValueError):
+        return False
+    if any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    ):
+        return True
+    parameter = signature.parameters.get(keyword)
+    return parameter is not None and parameter.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
 
 
 def _pty_available() -> bool:
@@ -99,10 +146,11 @@ class UARTBridge:
 
     並發/鎖序不變式（修改 console 或寫入路徑前必讀）：
     - 鎖序固定 `_write_lock ⊃ _state_lock`：**永遠先取 _write_lock 再取 _state_lock，
-      絕不反向**（全檔僅 send_bytes / set_flash_mode 兩處巢狀，皆 write 在外）。任何「持
-      _state_lock 後再取 _write_lock」都會與之形成 AB-BA 死鎖——維持單向是 #69 gate 原子性
-      與雙執行緒安全的前提。需要在持鎖後送資料者（如 resume_interactive flush）一律先**釋放**
-      _state_lock 再呼 send_bytes。
+      絕不反向**。`send_bytes` 與 `set_flash_mode` 皆先取 `_write_lock` 再取
+      `_state_lock`；`send_command_echo_paced` 則持 `_write_lock` 跨完整送出、echo 等待
+      與 WAL append，並重入 `send_bytes`。任何「持 `_state_lock` 後再取 `_write_lock`」
+      都會形成 AB-BA 死鎖——維持單向是 #69 gate 原子性與雙執行緒安全的前提。需要在持鎖後送
+      資料者（如 resume_interactive flush）一律先**釋放** `_state_lock` 再呼 `send_bytes`。
     - reader 執行緒模型：POSIX 為**單一** `_loop`，以 select() 同時多工序列埠 fd 與 human
       console PTY master fd。Windows（`_pty_available()` 為 False）為**兩條**執行緒——`_loop`
       做序列埠阻塞讀、`_console_loop` 以 socket select() 收 TCP console；兩者並發存取 `_clients`
@@ -142,8 +190,12 @@ class UARTBridge:
         self._primary_client_id: str | None = None
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
-        self._write_lock = threading.Lock()
+        self._write_lock = threading.RLock()
         self._state_lock = threading.RLock()
+        self._tx_cancel = threading.Event()
+        self._tx_accounts: dict[str, tuple[int, bool]] = {}
+        self._tx_active_cmd: str | None = None
+        self._rx_callback_signature_cache: tuple[int, Callable[..., Any], bool] | None = None
         # 僅由 _handle_console_rx 傳入的 identity token；raw console gate 不以可偽造
         # 的 source 字串判斷授權，且 send_bytes 會在實際 write 前重新驗證 admission。
         self._console_raw_token = object()
@@ -680,10 +732,21 @@ class UARTBridge:
             window.popleft()
 
     def _handle_serial_rx(self, data: bytes) -> None:
-        self.wal.append(com=self.com, direction="RX", source="device", payload=data)
+        record = self.wal.append(com=self.com, direction="RX", source="device", payload=data)
+        wal_seq = record.get("seq") if isinstance(record, dict) else None
         self._append_rx_text(data)
-        if self._on_rx_data is not None:
-            self._on_rx_data(data)
+        callback = self._on_rx_data
+        if callback is not None:
+            cache = getattr(self, "_rx_callback_signature_cache", None)
+            if cache is None or cache[0] != id(callback) or cache[1] is not callback:
+                accepts_wal_seq = _callback_accepts_keyword(callback, "wal_seq")
+                self._rx_callback_signature_cache = (id(callback), callback, accepts_wal_seq)
+            else:
+                accepts_wal_seq = cache[2]
+            if accepts_wal_seq:
+                callback(data, wal_seq=wal_seq)
+            else:
+                callback(data)
         # 在持 _state_lock 下逐一寫入（#83 RACE-1）：消除「鎖外快照 fd → 釋鎖 → 另一執行緒
         # 在 _clients pop 後 os.close(master_fd) → 此處 os.write 寫到已關閉/被重用的 fd」之
         # use-after-close（資料誤送）窗口。所有關閉路徑都「先在鎖內把 client 移出 _clients、
@@ -941,75 +1004,229 @@ class UARTBridge:
         cmd_id: str | None = None,
         log: bool = True,
         _allow_during_flash: bool = False,
-    ) -> None:
-        # 全程持有 _write_lock，使「檢查 flash_mode → 實際寫入」對 set_flash_mode 切換原子化
-        # （#69 Finding 2 round2）：否則檢查與寫入之間若 flash 開啟，非 flash byte 仍會寫出汙染 SBL。
+    ) -> TxResult:
+        """在單一寫入鎖內送出並記錄 OS 已確認的 bytes。"""
         with self._write_lock:
-            with self._state_lock:
-                raw_context = getattr(self, "_console_raw_context", None)
-                raw_token = getattr(raw_context, "token", None)
-                if self._flash_mode and not _allow_during_flash:
-                    # FLASHING 期間僅允許 flasher 自身寫入（內部能力 _allow_during_flash，僅 flash_tx 帶）；
-                    # 丟棄其他所有來源（system probe / reconcile 自動重探 / self_test / agent / command 注入等），
-                    # 防止競態下把 bytes 寫進燒錄中的 device、汙染 SBL binary 串流（C2，#69 Finding 1）。
-                    # 注意：授權不綁使用者可控的 `source` 稽核字串（cmd submit 可帶任意 source），
-                    # 否則 source="flash-..." 的命令會繞過此 gate（#69 Finding round3）。
-                    return
-                if (
-                    getattr(self.wal, "unhealthy", False)
-                    and (source in AUTO_TX_SOURCES or source.startswith("system:"))
-                ):
-                    raise WalUnavailableError(
-                        TxResult("not_submitted", 0, len(payload), "WAL_UNHEALTHY")
-                    )
-                if (
-                    raw_token is not None
-                    and raw_token is getattr(self, "_console_raw_token", None)
-                    and getattr(self, "_interactive_admission_blocked", False)
-                ):
-                    # raw console send 的線性化點在 write lock 內、實際寫入前；
-                    # admission 若已關閉，改排入既有 deferred buffer，待 gate 開放後回放。
-                    client_id = getattr(raw_context, "client_id", None)
-                    if client_id:
-                        buf = self._deferred_buffers.get(client_id)
-                        if buf is None:
-                            buf = bytearray()
-                            self._deferred_buffers[client_id] = buf
-                        buf.extend(payload)
-                        if len(buf) > DEFERRED_INPUT_MAX_BYTES:
-                            del buf[: len(buf) - DEFERRED_INPUT_MAX_BYTES]
-                    return
-                port = self._serial
-                serial_fd = self._serial_fd
-            if serial_fd is not None:
-                # POSIX：維持原寫入路徑（self._write_all），與既有測試（戳 _serial_fd / monkeypatch
-                # _write_all）逐字相容；flash gate 與 _write_lock 原子性（#69）皆不變。
-                self._write_all(serial_fd, payload)
-            elif port is not None:
-                # Windows/pyserial：序列埠無整數 fd，改由 port 寫入（#84 PORT-1）。
-                port.write(payload)
-            else:
-                raise RuntimeError("serial not ready")
-        if log:
-            self.wal.append(com=self.com, direction="TX", source=source, payload=payload, cmd_id=cmd_id)
+            return self._send_bytes_locked(
+                payload,
+                source=source,
+                cmd_id=cmd_id,
+                log=log,
+                _allow_during_flash=_allow_during_flash,
+            )
 
-    def _write_all(self, fd: int, payload: bytes) -> None:
-        view = memoryview(payload)
-        sent = 0
-        while sent < len(payload):
+    def _send_bytes_locked(
+        self,
+        payload: bytes,
+        *,
+        source: str,
+        cmd_id: str | None = None,
+        log: bool = True,
+        _allow_during_flash: bool = False,
+    ) -> TxResult:
+        """呼叫端持有 `_write_lock` 時送出一筆資料。"""
+        requested = len(payload)
+        with self._state_lock:
+            raw_context = getattr(self, "_console_raw_context", None)
+            raw_token = getattr(raw_context, "token", None)
+            if getattr(self, "_flash_mode", False) and not _allow_during_flash:
+                # FLASHING 期間僅允許 flasher 自身寫入；保留原有靜默丟棄語意。
+                return TxResult("not_submitted", 0, requested)
+            if (
+                getattr(self.wal, "unhealthy", False)
+                and (source in AUTO_TX_SOURCES or source.startswith("system:"))
+            ):
+                raise WalUnavailableError(TxResult("not_submitted", 0, requested, "WAL_UNHEALTHY"))
+            if (
+                raw_token is not None
+                and raw_token is getattr(self, "_console_raw_token", None)
+                and getattr(self, "_interactive_admission_blocked", False)
+            ):
+                client_id = getattr(raw_context, "client_id", None)
+                if client_id:
+                    buffers = getattr(self, "_deferred_buffers", None)
+                    if buffers is None:
+                        buffers = {}
+                        self._deferred_buffers = buffers
+                    buf = buffers.get(client_id)
+                    if buf is None:
+                        buf = bytearray()
+                        buffers[client_id] = buf
+                    buf.extend(payload)
+                    if len(buf) > DEFERRED_INPUT_MAX_BYTES:
+                        del buf[: len(buf) - DEFERRED_INPUT_MAX_BYTES]
+                return TxResult("not_submitted", 0, requested, "deferred")
+            port = self._serial
+            serial_fd = self._serial_fd
+
+        write_error: TxIncompleteError | None = None
+        if serial_fd is not None:
             try:
-                n = os.write(fd, view[sent:])
-            except BlockingIOError:
-                time.sleep(0.01)
-                continue
+                raw_result = self._write_all(serial_fd, payload)
+            except TxIncompleteError as exc:
+                raw_result = exc.result
+                write_error = exc
             except OSError as exc:
-                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
-                    time.sleep(0.01)
-                    continue
-                raise
-            if n <= 0:
-                break
-            sent += n
+                raw_result = TxResult(
+                    "completed",
+                    0,
+                    requested,
+                    f"{type(exc).__name__}: {exc}",
+                )
+                write_error = TxIncompleteError(raw_result)
+            result = (
+                raw_result
+                if isinstance(raw_result, TxResult)
+                else TxResult("completed", requested, requested)
+            )
+        elif port is not None:
+            try:
+                write = port.write
+                cancel = getattr(self, "_tx_cancel", None)
+                if _port_write_accepts_cancel(port):
+                    raw_result = write(payload, cancel=cancel)
+                else:
+                    raw_result = write(payload)
+            except TxUnknownError as exc:
+                raw_result = exc.result
+                write_error = exc
+            except TxIncompleteError as exc:
+                raw_result = exc.result
+                write_error = exc
+            except OSError as exc:
+                raw_result = TxResult(
+                    "unknown",
+                    0,
+                    requested,
+                    f"{type(exc).__name__}: {exc}",
+                )
+                write_error = TxUnknownError(
+                    raw_result,
+                    getattr(exc, "errno", None) or errno.EIO,
+                )
+            result = (
+                raw_result
+                if isinstance(raw_result, TxResult)
+                else TxResult("completed", requested, requested)
+            )
+        else:
+            raise SerialNotReady(TxResult("not_submitted", 0, requested, "serial not ready"))
+
+        if result.outcome == "unknown" and not isinstance(write_error, TxUnknownError):
+            error_text = result.error or "unknown"
+            errno_value = errno.ETIMEDOUT if error_text.startswith("SerialTimeoutException:") else errno.EIO
+            write_error = TxUnknownError(result, errno_value)
+        elif result.outcome == "completed" and result.confirmed < requested and write_error is None:
+            write_error = TxIncompleteError(result)
+        elif (
+            result.outcome == "not_submitted"
+            and result.error not in (None, "deferred")
+            and write_error is None
+        ):
+            write_error = TxIncompleteError(result)
+
+        self._tx_account_result_locked(cmd_id, result)
+        if log and result.confirmed > 0:
+            self._append_tx_record_locked(
+                payload[: result.confirmed],
+                source=source,
+                cmd_id=cmd_id,
+            )
+        if log and result.outcome == "unknown":
+            self._append_unknown_tx_meta_locked(result, source=source, cmd_id=cmd_id)
+
+        if write_error is not None:
+            raise write_error
+        return result
+
+    def _append_tx_record_locked(
+        self,
+        payload: bytes,
+        *,
+        source: str,
+        cmd_id: str | None,
+    ) -> None:
+        self.wal.append(
+            com=self.com,
+            direction="TX",
+            source=source,
+            payload=payload,
+            cmd_id=cmd_id,
+        )
+
+    def _append_unknown_tx_meta_locked(
+        self,
+        result: TxResult,
+        *,
+        source: str,
+        cmd_id: str | None,
+    ) -> None:
+        self.wal.append(
+            com=self.com,
+            direction="META",
+            source=source,
+            payload=b"",
+            cmd_id=cmd_id,
+            meta={
+                "event": "tx_outcome_unknown",
+                "requested_bytes": result.requested,
+                "confirmed_bytes": result.confirmed,
+                "unknown_range": [result.confirmed, result.requested],
+                "error": result.error or "unknown",
+            },
+        )
+
+    def _tx_account_result_locked(self, cmd_id: str | None, result: TxResult) -> None:
+        if cmd_id is None or result.outcome == "not_submitted":
+            return
+        accounts = getattr(self, "_tx_accounts", None)
+        if accounts is None:
+            accounts = {}
+            self._tx_accounts = accounts
+        previous = accounts.get(cmd_id, (0, False))
+        accounts[cmd_id] = (
+            previous[0] + result.confirmed,
+            previous[1] or result.outcome == "unknown",
+        )
+        if len(accounts) > _TX_ACCOUNT_MAX:
+            active_cmd = getattr(self, "_tx_active_cmd", None)
+            for oldest_cmd in accounts:
+                if oldest_cmd != active_cmd:
+                    del accounts[oldest_cmd]
+                    logging.getLogger("serialwrap").warning(
+                        "tx account evicted (cmd_id=%s)", oldest_cmd
+                    )
+                    break
+
+    def tx_account(self, cmd_id: str) -> tuple[int, bool]:
+        """讀取並移除一個命令的累計確認 bytes 與 unknown 標記。"""
+        with self._write_lock:
+            accounts = getattr(self, "_tx_accounts", None)
+            if accounts is None:
+                return (0, False)
+            return accounts.pop(cmd_id, (0, False))
+
+    def tx_settle(self, cmd_id: str) -> None:
+        """命令抵達終態時移除 TX 帳本項目。"""
+        with self._write_lock:
+            accounts = getattr(self, "_tx_accounts", None)
+            if accounts is not None:
+                accounts.pop(cmd_id, None)
+
+    def tx_set_active(self, cmd_id: str | None) -> None:
+        """標記目前前景命令，避免容量回收淘汰其在途證據。"""
+        with self._write_lock:
+            self._tx_active_cmd = cmd_id
+
+    def _write_all(
+        self,
+        fd: int,
+        payload: bytes,
+        *,
+        cancel: threading.Event | None = None,
+    ) -> TxResult:
+        tx_cancel = cancel if cancel is not None else getattr(self, "_tx_cancel", None)
+        return _posix_write_all(fd, payload, tx_cancel)
 
     def flash_tx(self, payload: bytes) -> None:
         """flash 模式：endpoint→device 原樣送出，跳過行處理（_consume_console_input）。
@@ -1090,27 +1307,82 @@ class UARTBridge:
         pre = self.rx_snapshot_len()
         sent_chars = 0
         acked_chars = 0
-        sent_payload = b""
-        for idx, piece in enumerate(slices):
-            data = piece.encode("utf-8", errors="replace")
-            self.send_bytes(data, source=source, cmd_id=cmd_id, log=False)
-            sent_payload += data
-            sent_chars += len(piece)
-            acked_chars = self._await_echo_progress(slices[: idx + 1], pre, echo_timeout_s)
-            if acked_chars < sent_chars:
-                # echo 停滯：換行未送出、命令未執行；只記實際送出的 bytes（單筆稽核）。
-                if sent_payload:
-                    self.wal.append(
-                        com=self.com, direction="TX", source=source,
-                        payload=sent_payload, cmd_id=cmd_id,
+        sent_payload = bytearray()
+        with self._write_lock:
+            try:
+                for idx, piece in enumerate(slices):
+                    data = piece.encode("utf-8", errors="replace")
+                    try:
+                        raw_result = self.send_bytes(
+                            data, source=source, cmd_id=cmd_id, log=False
+                        )
+                    except TxIncompleteError as exc:
+                        if exc.result.confirmed:
+                            sent_payload.extend(data[: exc.result.confirmed])
+                        if exc.result.outcome == "unknown":
+                            self._append_unknown_tx_meta_locked(
+                                exc.result, source=source, cmd_id=cmd_id
+                            )
+                        raise
+                    result = (
+                        raw_result
+                        if isinstance(raw_result, TxResult)
+                        else TxResult("completed", len(data), len(data))
                     )
-                return {"ok": False, "acked_chars": acked_chars, "sent_chars": sent_chars}
-        self.send_bytes(b"\n", source=source, cmd_id=cmd_id, log=False)
-        self.wal.append(
-            com=self.com, direction="TX", source=source,
-            payload=sent_payload + b"\n", cmd_id=cmd_id,
-        )
-        return {"ok": True, "acked_chars": acked_chars, "sent_chars": sent_chars}
+                    if result.confirmed:
+                        sent_payload.extend(data[: result.confirmed])
+                    if result.outcome == "not_submitted" or not result.complete:
+                        return {
+                            "ok": False,
+                            "acked_chars": acked_chars,
+                            "sent_chars": sent_chars,
+                        }
+                    sent_chars += len(piece)
+                    acked_chars = self._await_echo_progress(
+                        slices[: idx + 1], pre, echo_timeout_s
+                    )
+                    if acked_chars < sent_chars:
+                        # echo 停滯：換行未送出、命令未執行；只記實際確認的 bytes。
+                        return {
+                            "ok": False,
+                            "acked_chars": acked_chars,
+                            "sent_chars": sent_chars,
+                        }
+
+                try:
+                    raw_newline_result = self.send_bytes(
+                        b"\n", source=source, cmd_id=cmd_id, log=False
+                    )
+                except TxIncompleteError as exc:
+                    if exc.result.confirmed:
+                        sent_payload.extend(b"\n"[: exc.result.confirmed])
+                    if exc.result.outcome == "unknown":
+                        self._append_unknown_tx_meta_locked(
+                            exc.result, source=source, cmd_id=cmd_id
+                        )
+                    raise
+                newline_result = (
+                    raw_newline_result
+                    if isinstance(raw_newline_result, TxResult)
+                    else TxResult("completed", 1, 1)
+                )
+                if newline_result.confirmed:
+                    sent_payload.extend(b"\n"[: newline_result.confirmed])
+                if (
+                    newline_result.outcome == "not_submitted"
+                    or not newline_result.complete
+                ):
+                    return {
+                        "ok": False,
+                        "acked_chars": acked_chars,
+                        "sent_chars": sent_chars,
+                    }
+                return {"ok": True, "acked_chars": acked_chars, "sent_chars": sent_chars}
+            finally:
+                if sent_payload:
+                    self._append_tx_record_locked(
+                        bytes(sent_payload), source=source, cmd_id=cmd_id
+                    )
 
     def _await_echo_progress(
         self, expected_cumulative: list[str], from_offset: int, timeout_s: float
@@ -1135,6 +1407,9 @@ class UARTBridge:
                     break
                 pos = found + len(piece)
                 acked += len(piece)
+            tx_cancel = getattr(self, "_tx_cancel", None)
+            if tx_cancel is not None and tx_cancel.is_set():
+                return acked
             if complete:
                 return acked
             if time.monotonic() >= deadline:

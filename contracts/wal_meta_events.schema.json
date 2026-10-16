@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "serialwrap WAL META events contract",
-  "x-catalog-revision": 2,
+  "x-catalog-revision": 3,
   "type": "object",
   "oneOf": [
     {
@@ -184,6 +184,53 @@
           }
         }
       ]
+    },
+    {
+      "title": "tx_outcome_unknown",
+      "description": "UART 寫入結果不明事件",
+      "x-behavior-change": "BC-03",
+      "x-outer-record": {
+        "dir": "META",
+        "source": "與原 TX 相同",
+        "com": "與原 TX 相同",
+        "cmd_id": "與原請求相同"
+      },
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event",
+        "requested_bytes",
+        "confirmed_bytes",
+        "unknown_range",
+        "error"
+      ],
+      "properties": {
+        "event": {
+          "const": "tx_outcome_unknown"
+        },
+        "requested_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "confirmed_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unknown_range": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "minItems": 2,
+          "maxItems": 2,
+          "x-constraint": "[confirmed_bytes, requested_bytes]"
+        },
+        "error": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
     }
   ]
 }

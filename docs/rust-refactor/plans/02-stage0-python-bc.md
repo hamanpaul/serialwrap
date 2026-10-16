@@ -968,14 +968,14 @@
 
 **Files**
 - Create: `tests/test_stage0_tx_outcome.py`
-- Modify: `sw_core/serial_port.py`、`sw_core/uart_io.py`、`sw_core/session_manager.py`（`_on_bridge_rx` 收 `wal_seq`、兩處 bridge 建構 lambda）、`sw_core/service.py`（RX observer 參數不變，值改精確）、`contracts/wal_meta_events.schema.json`（新增 `tx_outcome_unknown` 事件分支，遞增 `x-catalog-revision`）、`docs/rust-refactor/plans/rust-architecture.md` §4.2、§5.7（`Unknown { confirmed }`，見 Rust 對應）
+- Modify: `sw_core/serial_port.py`、`sw_core/uart_io.py`、`sw_core/session_manager.py`（`_on_bridge_rx` 收 `wal_seq`、兩處 bridge 建構 lambda）、`sw_core/service.py`（RX observer 參數不變，值改精確）、`contracts/wal_meta_events.schema.json`（新增 `tx_outcome_unknown` 事件分支，遞增 `x-catalog-revision`）、`contracts/daemon_logging.yaml`（新增 TX 帳本淘汰 WARNING 並同步來源行）、`tests/test_stage0_wal_unlink.py`（flash gate 預期結果改為 TxResult）、`docs/rust-refactor/plans/rust-architecture.md` §3.8／§4.2／§5.7、`docs/rust-refactor/plans/06-slice21-daemon-core.md`（Unknown 變體攜帶 confirmed）
 
-**相容規則（凍結；保護既有測試替身，皆不屬測試資產變更）**
+**相容規則（凍結；保護既有測試替身）**
 1. `send_bytes` 一律以兩個位置參數呼叫 `self._write_all(fd, payload)`（取消事件由 `_write_all` 內部讀 `self._tx_cancel`，T07），以相容 `tests/test_uart_flash_bridge.py:65,91`、`tests/test_refine_ownership.py:477,523,596` 以兩參數 lambda 取代 `_write_all` 的寫法；`_write_all` 回傳 `None` 視為 `TxResult("completed", n, n)`。
 2. port 路徑：僅在 `port.write` 簽名接受 `cancel` 關鍵字時才傳（`inspect.signature` 結果以 port 型別快取），以相容 `tests/test_serial_port.py:363` 的 `_FakeSerialPort.write(self, payload) -> None`；回傳 `None` 視為 `completed, n`。
 3. WAL：`rec = self.wal.append(...)`；`seq = rec.get("seq") if isinstance(rec, dict) else None`，以相容回傳 `None` 的 stub WAL（`tests/test_uart_flash_bridge.py::_RecordingWal`、`tests/test_command_completion.py::Wal`、`tests/test_console_unlock.py::Wal`）；`getattr(self.wal, "unhealthy", False)` 同 T05。
 4. 以 `object.__new__(UARTBridge)` 建立、缺新欄位的 bare bridge（`tests/test_concurrency_races.py:25`、`tests/test_suspend_resume_reentrant.py`）：新欄位（`_tx_accounts`、`_tx_frozen`、`_tx_cancel` 等）一律以 `getattr(self, "<name>", <預設>)` 讀取或以 class 層預設值提供，不得要求這些測試補欄位。
-5. `_PySerialPort.write` 對 `SerialTimeoutException`／`SerialException` 維持**擲出 `OSError` 子類**（`TxUnknownError`，errno 沿用現況映射：timeout→`ETIMEDOUT`、其他→例外 errno 或 `EIO`），以相容 `tests/test_serial_port.py::test_write_timeout_maps_to_oserror_etimedout`、`test_write_serialexception_maps_to_oserror`；結果資訊放在例外的 `.result`。
+5. `_PySerialPort.write` 對 `SerialTimeoutException`／`SerialException`／普通 `OSError` 維持**擲出 `OSError` 子類**（`TxUnknownError`，errno 沿用現況映射：timeout→`ETIMEDOUT`、其他→例外 errno 或 `EIO`）；普通 `OSError` 時 `.result.confirmed` 保留此呼叫已確認的前綴。此規則相容 `tests/test_serial_port.py::test_write_timeout_maps_to_oserror_etimedout`、`test_write_serialexception_maps_to_oserror`；結果資訊放在例外的 `.result`。
 
 **Interfaces**
 - Consumes：T02 `WalWriter.append`（回傳 record 含 `seq`）；T01 的 `TxResult`、`TxIncompleteError`、`TxUnknownError`、`SerialNotReady`（本 Task 不重複定義）。
@@ -995,7 +995,7 @@
   UARTBridge.tx_set_active(self, cmd_id: str | None) -> None      # R1-F8：目前前景命令；FIFO 溢位淘汰時跳過它（不淘汰在途證據）
   SessionManager._on_bridge_rx(self, session_id: str, data: bytes, wal_seq: int | None = None) -> None
   ```
-- Rust 對應：arch §4.2 `TxOutcome { NotSubmitted, Completed(usize), Unknown }`／`TxResult { outcome, error }`、`SerialWriter::write_gated(data, cancel, gate)`（每次 OS 提交經 `SubmitGate`，R0-F1）；§5.4 OS 提交時 fence 與「完成後把 TxResult 交給 WalWriter（只記錄確認的 bytes）」；§5.7 `confirmed_bytes`／`unknown` 累計。**arch §4.2 的 `Unknown` 必須帶已確認前綴**：本 Task 同步修訂 arch §4.2 為 `Unknown { confirmed: usize }`（`confirmed` 為結果不明前 OS 已確認的 bytes，未知尾段＝`len - confirmed`），§5.7 映射改為「`confirmed ≥ 1`（不論最後為 Completed 或 Unknown）→ `COMMAND_ABORTED_IN_FLIGHT`；`Unknown{confirmed:0}` → `SEND_FAILED`」。
+- Rust 對應：arch §4.2 `TxOutcome { NotSubmitted, Completed(usize), Unknown { confirmed: usize } }`／`TxResult { outcome, error }`、`SerialWriter::write_gated(data, cancel, gate)`（每次 OS 提交經 `SubmitGate`，R0-F1）；§5.4 OS 提交時 fence 與「完成後把 TxResult 交給 WalWriter（只記錄確認的 bytes）」；§5.7 `confirmed_bytes`／`unknown` 累計。**arch §4.2 的 `Unknown` 必須帶已確認前綴**：本 Task 同步修訂 arch §4.2 為 `Unknown { confirmed: usize }`（`confirmed` 為結果不明前 OS 已確認的 bytes，未知尾段＝`len - confirmed`），§5.7 映射改為「`confirmed ≥ 1`（不論最後為 Completed 或 Unknown）→ `COMMAND_ABORTED_IN_FLIGHT`；`Unknown{confirmed:0}` → `SEND_FAILED`」。
 
 **TX 結果判定表（凍結）**
 
@@ -1007,6 +1007,7 @@
 | EAGAIN 期間 `cancel` 被設 | `completed, sent, err="cancelled"` | sent>0 時一筆 | raise |
 | pyserial 迴圈已確認寫出 k bytes 後遇 `SerialTimeoutException` 或其他 `SerialException`（k 可為 0） | `unknown, k, err=…`（未知尾段 `requested-k`） | k>0 時一筆 TX `payload[:k]`；另寫一筆 META `{"event":"tx_outcome_unknown","requested_bytes":M,"confirmed_bytes":k,"unknown_range":[k,M],"error":…}`（`source`、`cmd_id` 同原請求） | raise `TxUnknownError`（`OSError` 子類） |
 | pyserial `n` 為 0 或 None | `completed, sent, err="short_write"` | sent>0 時一筆 | raise |
+| port 寫入擲出沒有結構化進度的普通 `OSError` | `unknown, 0, len`；若後端已掌握確認前綴則以該值回報 | 已確認前綴記 TX，另記 `tx_outcome_unknown` META | raise `TxUnknownError` |
 | flash gate 擋下（`UIO-12.3-d`） | `not_submitted, 0` | 無 | 回傳、不 raise（保留靜默語意） |
 | raw console deferred（admission 關） | `not_submitted, 0, err="deferred"` | 無 | 回傳、不 raise |
 | serial 未就緒 | `not_submitted, 0, err="serial not ready"` | 無 | raise `SerialNotReady`（`TxIncompleteError`＋`RuntimeError` 雙重子類，與現況 `RuntimeError("serial not ready")` 相容） |
@@ -1171,17 +1172,24 @@
   | `test_stub_wal_returning_none_does_not_break_rx` | `append()` 回 `None` 的 stub WAL → `_handle_serial_rx` 仍送達 observer（`wal_seq is None`） |
   | `test_no_auto_resend_after_partial_in_file_transfer` | `file_transfer` 的分段寫入第 2 段得 `completed, k<n` 或 `unknown` → 該段 bytes 在 `port.writes` 中只出現一次（不重送），結果為錯誤 |
   | `test_no_auto_resend_after_partial_in_login_fsm` | login FSM 送帳號時得部分寫入 → 不重送該行，FSM 進入既有失敗分支 |
+  | `test_echo_paced_oserror_keeps_confirmed_bytes_and_unknown_meta` | 第一個 slice 已確認，下一個 slice 擲普通 `OSError` → 一筆 TX 僅含前綴、一筆 unknown META，TX 帳本保留確認 bytes 與 unknown |
+  | `test_echo_paced_logs_confirmed_bytes_on_unexpected_exception` | echo 等待在 slice 已確認後擲未預期例外 → finally 仍於鎖內寫出唯一一筆 TX 前綴並重拋原例外 |
+  | `test_tx_account_updates_before_wal_append_failure` | TX WAL append 失敗 → 命令帳本仍保留 OS 已確認的 bytes |
+  | `test_pyserial_plain_oserror_keeps_confirmed_prefix` | pyserial 已確認前綴後擲普通 `OSError` → `TxUnknownError.result.confirmed` 保留前綴 |
+  | `test_echo_wait_returns_current_progress_when_tx_cancelled` | echo 尚未到達時設定 TX cancel → 等待立即回傳目前 acked 數 |
   | `test_legacy_on_rx_data_single_arg_still_supported` | `on_rx_data=lambda d: …`（舊簽章）仍可運作，不傳 `wal_seq` |
   | `test_background_capture_from_seq_uses_exact_seq` | background capture 的 `last_seq` 等於該 chunk 的 RX seq（多 COM 交錯下） |
 - [ ] **A2 執行並確認 FAIL**：`python3 -m pytest -q tests/test_stage0_tx_outcome.py` → 預期 `ImportError: cannot import name 'TxResult'`（或斷言 `send_bytes` 回傳 `None`）。commit：`test(uart): BC-03／SC-07 TX 三態與確認 bytes 記錄失敗測試`
 - [ ] **B1 實作**：
   - `_write_all`：`sent=0`；迴圈 `os.write`；`BlockingIOError`／EAGAIN → `if cancel and cancel.wait(EAGAIN_BACKOFF_S): return TxResult("completed", sent, n_req, "cancelled")`（`EAGAIN_BACKOFF_S=0.01`，`cancel` 為 None 時 `time.sleep(0.01)` 並同時檢查 `self._tx_cancel`，見 T07）；其他 `OSError` → `TxResult("completed", sent, n_req, f"{type(e).__name__}: {e}")`；`n<=0` → `"short_write"`；完成 → `TxResult("completed", n_req, n_req)`。
   - `_PosixSerialPort.write` 委派相同演算法（抽成模組函式 `_posix_write_all(fd, payload, cancel) -> TxResult`，`UARTBridge._write_all` 也呼叫它，消除重複實作）；`_PySerialPort.write`：迴圈中 `SerialTimeoutException`／`SerialException` → `raise TxUnknownError(TxResult("unknown", sent, n, f"{type(exc).__name__}: {exc}"), <現況 errno>) from exc`（`sent` 為已確認前綴）；`not n` → 回 `TxResult("completed", sent, n, "short_write")`；完成回 `completed, n`。
-  - `send_bytes`：持 `_write_lock` 全程；`_state_lock` 內做 flash gate、T05 WAL 不健康檢查、T07 fence、raw deferred（T20 再加 permit 驗證）；鎖外（仍持 `_write_lock`）依相容規則 1／2 寫入取得 `result`（`TxUnknownError` 被捕捉後取其 `.result`，記錄完再重拋同一例外）；**仍持 `_write_lock`** 時：`log and result.confirmed > 0` → `wal.append(TX, payload[:confirmed])`；`log and result.outcome == "unknown"` → META `tx_outcome_unknown`；更新 `_tx_accounts[cmd_id]`（`cmd_id` 非 None 時；R1-F8：新 key 使表超過 512 時淘汰最舊且 `!= self._tx_active_cmd` 的項目並 log WARNING `serialwrap: tx account evicted (cmd_id=%s)`，在途前景命令的累計永不被淘汰）；釋放鎖後 `if not result.complete and result.error not in (None, "deferred"): raise TxIncompleteError(result)`（unknown 重拋 `TxUnknownError`；serial 未就緒 raise `SerialNotReady`）；回傳 `result`。
+  - `send_bytes`：持 `_write_lock` 全程；`_state_lock` 內做 flash gate、T05 WAL 不健康檢查、T07 fence、raw deferred（T20 再加 permit 驗證）；鎖外（仍持 `_write_lock`）依相容規則 1／2 寫入取得 `result`（`TxUnknownError` 被捕捉後取其 `.result`，記錄完再重拋同一例外）；**仍持 `_write_lock`** 時先更新 `_tx_accounts[cmd_id]`（`cmd_id` 非 None 時；R1-F8：新 key 使表超過 512 時淘汰最舊且 `!= self._tx_active_cmd` 的項目並以 logger `serialwrap`、訊息模板 `tx account evicted (cmd_id=%s)` 記 WARNING，在途前景命令的累計永不被淘汰），再依序 append 已確認 TX bytes 與 unknown META；WAL append 失敗不得略過帳本更新。釋放鎖後 `if not result.complete and result.error not in (None, "deferred"): raise TxIncompleteError(result)`（unknown 重拋 `TxUnknownError`；serial 未就緒 raise `SerialNotReady`）；回傳 `result`。
   - `contracts/wal_meta_events.schema.json` 新增 `tx_outcome_unknown` 分支：`required: [event, requested_bytes, confirmed_bytes, unknown_range, error]`，整數非負、`unknown_range` 兩元素、`x-behavior-change: "BC-03"`。
   - `_handle_serial_rx`：`rec = self.wal.append(...)`；`seq = rec.get("seq")`；呼叫 `self._on_rx_data` 前以 `inspect.signature` 判定是否接受 `wal_seq` 關鍵字（結果以 callback 物件的 `id()` 快取，callback 被替換時重新判定；測試會在建構後直接指派 `_on_rx_data`），接受時 `self._on_rx_data(data, wal_seq=seq)`，否則 `self._on_rx_data(data)`。`SessionManager` 兩處 lambda 改為 `lambda data, wal_seq=None, sid=session_id: self._on_bridge_rx(sid, data, wal_seq)`；`_on_bridge_rx` 以 `wal_seq if wal_seq is not None else self._wal.current_seq` 傳給 observers 與 background capture。
 - [ ] **B2 執行並確認 PASS**：`python3 -m pytest -q tests/test_stage0_tx_outcome.py tests/test_uart_io.py tests/test_serial_port.py tests/test_interactive_raw.py tests/test_file_transfer.py tests/test_event_engine.py tests/test_issue159_bg_fast_capture.py tests/test_agent_defer_tx.py tests/test_human_agent_coexist.py tests/test_multiagent_e2e.py tests/test_uart_flash_bridge.py tests/test_refine_ownership.py tests/test_command_completion.py tests/test_console_unlock.py tests/test_concurrency_races.py tests/test_login_fsm.py`；`python3 -m tools.contracts check`；全套依 §0 第 4 點。
-- **測試資產變更**：無（相容規則 1～5 保證既有替身不需改動；若仍有既有測試變紅，視為實作缺陷）。
+- **測試資產變更**（需獨立審閱，PR 註明）：
+  - `tests/test_stage0_tx_outcome.py::test_no_auto_resend_after_partial_in_login_fsm`：修正新建測試的 `SessionProfile`／`SessionAuth` 欄位名稱，並在收到空 probe 時注入 login prompt，確保測試確實抵達帳號部分寫入分支；斷言不變，對應 BC-03。Reviewer A（Claude Sonnet, max）獨立確認原 fixture 會在驗證行為前以 TypeError 失敗、prompt 注入必要且斷言未放寬。
+  - `tests/test_stage0_wal_unlink.py::test_flash_gate_precedes_wal_unhealthy_rejection`：依 BC-03 新介面將舊的 `None` 預期改為精確的 `TxResult("not_submitted", 0, requested)`，並延遲 import；Reviewer A（Claude Sonnet, max）確認該斷言符合凍結結果表且更嚴格。Reviewer B（Codex gpt-6.1-sol）對本 Task 無發現。
 - [ ] **B3 commit**：`fix(uart): BC-03 TX 區分三態並只記確認寫出的 bytes，RX 觀察者改用精確 seq`
 
 ---

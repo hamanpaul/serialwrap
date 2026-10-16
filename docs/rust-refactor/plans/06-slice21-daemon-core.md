@@ -183,7 +183,7 @@ impl SerialConfig { pub fn from_uart_profile(baud: u32, data_bits: u8, parity: &
 #[derive(Clone, Debug, PartialEq, Eq)] pub struct HolderReport { pub pids: Vec<u32>, pub holder_unknown: bool, pub status: HolderScanStatus }
 #[derive(Debug)] pub enum OpenError { Held(HolderReport), AccessDenied { os: PalError, holder: HolderReport }, NotFound(PalError), Other(PalError) }
 #[derive(Debug, PartialEq, Eq)] pub enum ReadOutcome { Data(usize), Eof, Woken, TimedOut }
-#[derive(Debug, Clone, PartialEq, Eq)] pub enum TxOutcome { NotSubmitted, Completed(usize), Unknown }
+#[derive(Debug, Clone, PartialEq, Eq)] pub enum TxOutcome { NotSubmitted, Completed(usize), Unknown { confirmed: usize } }
 #[derive(Debug, Clone)] pub struct TxResult { pub outcome: TxOutcome, pub error: Option<PalError> }
 #[derive(Clone)] pub struct CancelToken { flag: Arc<AtomicBool>, waker: Arc<dyn IoWaker> }
 impl CancelToken { pub fn new(waker: Arc<dyn IoWaker>) -> CancelToken; pub fn cancel(&self); pub fn is_cancelled(&self) -> bool; }
@@ -592,7 +592,7 @@ impl Clock for FakeClock { /* threaded：sleep(d) 阻塞到另一 thread advance
 pub enum FakeWriteStep {
     Accept(usize),                         // 接受前 n bytes 後回 Completed(累計)
     AcceptThenError(usize, PalError),      // 接受 n bytes 後回 Completed(n)+error
-    Unknown(PalError),                     // 回 TxOutcome::Unknown + error
+    Unknown { confirmed: usize, error: PalError }, // 回 TxOutcome::Unknown { confirmed } + error
     BlockUntilCancel { accept_before_cancel: usize }, // 經 gate 提交後（已交 OS、in_flight 已設）於 gate 外阻塞直到 CancelToken::cancel，回 Completed(accept_before_cancel)
     BlockForever,                          // 經 gate 提交後於 gate 外阻塞直到 FakeDevice::release_block（模擬 D-state；不持 Fence 鎖）
     Error(PalError),                       // 0 byte + error
@@ -744,7 +744,7 @@ fn fake_clock_sleep_wakes_on_advance_and_wall_jump_keeps_mono() {
 
 | 測試名 | 精確斷言 |
 |---|---|
-| `unknown_step_reports_unknown` | `Unknown(e)` → `outcome == TxOutcome::Unknown`、`take_tx()` 為空 |
+| `unknown_step_reports_unknown` | `Unknown { confirmed: 0, error: e }` → `outcome == TxOutcome::Unknown { confirmed: 0 }`、`take_tx()` 為空 |
 | `deny_access_maps_to_access_denied` | `Err(OpenError::AccessDenied{holder})`，`holder == HolderReport{pids: vec![], holder_unknown: true, status: HolderScanStatus::Unsupported}` |
 | `removed_device_read_errors` | `remove_device` 後 `read` 回 `Err(e)` 且 `e.py_message == "[Errno 5] Input/output error"` |
 | `reader_woken_by_waker` | 另一 thread `waker.wake()` 後 `read(.., Some(1s))` 回 `Ok(ReadOutcome::Woken)` |
@@ -1068,7 +1068,7 @@ fn write_gated(&mut self, data: &[u8], cancel: &CancelToken, gate: &dyn SubmitGa
 }
 ```
 
-POSIX writer 不產生 `TxOutcome::Unknown`（每次 syscall 回傳確切長度）；`Unknown` 只由 Windows 與 fake 產生。
+POSIX writer 不產生 `TxOutcome::Unknown { confirmed }`（每次 syscall 回傳確切長度）；`Unknown` 只由 Windows 與 fake 產生。
 - `IoWaker::wake` 對 `wake_r` 與 `wake_w` 各寫一次；reader 只 poll／讀乾 `wake_r`，writer 只 poll／讀乾 `wake_w`（兩個等待者各自消耗自己的喚醒，不會互相吃掉）。`CancelToken::cancel` 設旗標後呼叫同一個 waker。
 - `CloseToken::close`（arch §4.2 關閉序，R0-F3）：drop reader/writer（I/O 已收斂）後經 `close_sequence(&mut LibcTtyCloseOps)`：`ioctl(fd, TIOCNXCL)` → `flock(LOCK_UN)` → `close(fd)` → `close(wake_r)` → `close(wake_w)`。`TIOCNXCL` 回 `EIO`／`ENXIO`／`ENODEV`（已 hangup／拔除）視為已解除；其他 errno → 照序繼續關閉、`excl_cleared:false`、`error:Some`、stderr WARNING `serialwrapd: TIOCNXCL failed on <dev>: <py_message>`；`close(fd)` 失敗 → `CloseReceipt{closed:false, error}`。`ExclGuard`（open 失敗路徑）的 drop 共用同一個 `close_sequence`（無 wake fd 時略過末兩步）。`PosixSerialBackend::with_post_excl_fault(PalError)` 只在 `feature = "test-fakes"` 編譯，於 TIOCEXCL 成功後立即回該錯誤（模擬 termios／eventfd 失敗）。
 - `apply_termios`：`tcgetattr` → `c_iflag=c_oflag=c_lflag=0`、`c_cflag = CREAD|CLOCAL|CSx[|PARENB[|PARODD]][|CSTOPB][|CRTSCTS]`（**覆寫**，不 OR 到既有值；速度以 `cfsetispeed`／`cfsetospeed` 設定）、`c_cc` 不動 → `tcsetattr(TCSANOW)`。
@@ -1168,8 +1168,8 @@ fn overlapped_completion_mapping() {
     assert_eq!(map_overlapped_completion(true, 10, 0), (TxOutcome::Completed(10), None));
     assert_eq!(map_overlapped_completion(false, 4, 995), (TxOutcome::Completed(4), Some(PalErrorKind::Cancelled))); // ERROR_OPERATION_ABORTED
     assert_eq!(map_overlapped_completion(true, 3, 1460), (TxOutcome::Completed(3), Some(PalErrorKind::TimedOut))); // 寫逾時：部分完成
-    assert_eq!(map_overlapped_completion(false, 0, 1617), (TxOutcome::Unknown, Some(PalErrorKind::Io)));         // ERROR_DEVICE_REMOVED：長度不可信
-    assert_eq!(map_overlapped_completion(false, 0, 22), (TxOutcome::Unknown, Some(PalErrorKind::Io)));           // ERROR_BAD_COMMAND
+    assert_eq!(map_overlapped_completion(false, 0, 1617), (TxOutcome::Unknown { confirmed: 0 }, Some(PalErrorKind::Io))); // ERROR_DEVICE_REMOVED：長度不可信
+    assert_eq!(map_overlapped_completion(false, 0, 22), (TxOutcome::Unknown { confirmed: 0 }, Some(PalErrorKind::Io)));   // ERROR_BAD_COMMAND
 }
 ```
 
@@ -2288,7 +2288,7 @@ Gate 表（`gate_rules` 參數化測試；每列以 `Fence::admit(&state, &permi
 
 | 測試名 | 精確斷言 |
 |---|---|
-| `unknown_outcome_records_no_tx_and_reports_unknown` | `Unknown(e)` → `TxReport.result.outcome == Unknown`、`wal_seq == None`、無 TX 行 |
+| `unknown_outcome_records_no_tx_and_reports_unknown` | `Unknown { confirmed: 0, error: e }` → `TxReport.result.outcome == Unknown { confirmed: 0 }`、`wal_seq == None`、無 TX 行 |
 | `log_false_secret_not_in_wal` | `permit.log=false` → OS 收到 bytes、WAL 無 TX 行（UIO-12.3-c） |
 | `wal_order_equals_write_order` | 連續 50 個 job（payload `i`）→ WAL TX 行的 payload 序 == `dev.take_tx()` 序 |
 | `fence_sink_sets_wal_unhealthy` | `WalHealthSink::set_wal_unhealthy(&*fence, true)` → `fence.with(|s| s.wal_unhealthy) == true` |

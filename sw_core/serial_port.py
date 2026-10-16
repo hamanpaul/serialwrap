@@ -21,6 +21,7 @@ import errno
 import os
 import re
 import sys
+import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -47,6 +48,46 @@ if os.name == "posix":  # pragma: no cover - 平台相依
     }
 
 _COM_RE = re.compile(r"^COM\d+$", re.IGNORECASE)
+_EAGAIN_BACKOFF_S = 0.01
+
+
+def _posix_write_all(
+    fd: int,
+    payload: bytes,
+    cancel: threading.Event | None = None,
+) -> TxResult:
+    """寫出 payload 並回報 OS 確認的前綴長度。"""
+    view = memoryview(payload)
+    sent = 0
+    requested = len(payload)
+    while sent < requested:
+        if cancel is not None and cancel.is_set():
+            return TxResult("completed", sent, requested, "cancelled")
+        try:
+            n = os.write(fd, view[sent:])
+        except BlockingIOError:
+            if cancel is None:
+                time.sleep(_EAGAIN_BACKOFF_S)
+            elif cancel.wait(_EAGAIN_BACKOFF_S):
+                return TxResult("completed", sent, requested, "cancelled")
+            continue
+        except OSError as exc:
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                if cancel is None:
+                    time.sleep(_EAGAIN_BACKOFF_S)
+                elif cancel.wait(_EAGAIN_BACKOFF_S):
+                    return TxResult("completed", sent, requested, "cancelled")
+                continue
+            return TxResult(
+                "completed",
+                sent,
+                requested,
+                f"{type(exc).__name__}: {exc}",
+            )
+        if n <= 0:
+            return TxResult("completed", sent, requested, "short_write")
+        sent += n
+    return TxResult("completed", sent, requested)
 
 
 @dataclass(frozen=True)
@@ -100,8 +141,13 @@ class SerialPort(ABC):
         """
 
     @abstractmethod
-    def write(self, payload: bytes) -> None:
-        """寫出整段 ``payload``。"""
+    def write(
+        self,
+        payload: bytes,
+        *,
+        cancel: threading.Event | None = None,
+    ) -> TxResult | None:
+        """寫出 payload 並回傳可確認的結果。"""
 
     @abstractmethod
     def close(self) -> None:
@@ -177,26 +223,16 @@ class _PosixSerialPort(SerialPort):
             raise OSError("serial not open")
         return os.read(fd, max_bytes)
 
-    def write(self, payload: bytes) -> None:
+    def write(
+        self,
+        payload: bytes,
+        *,
+        cancel: threading.Event | None = None,
+    ) -> TxResult:
         fd = self._fd
         if fd is None:
             raise OSError("serial not open")
-        view = memoryview(payload)
-        sent = 0
-        while sent < len(payload):
-            try:
-                n = os.write(fd, view[sent:])
-            except BlockingIOError:
-                time.sleep(0.01)
-                continue
-            except OSError as exc:
-                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
-                    time.sleep(0.01)
-                    continue
-                raise
-            if n <= 0:
-                break
-            sent += n
+        return _posix_write_all(fd, payload, cancel)
 
     def close(self) -> None:
         fd = self._fd
@@ -325,7 +361,12 @@ class _PySerialPort(SerialPort):
         except serial.SerialException as exc:  # 拔線：ClearCommError/ReadFile 失敗
             raise OSError(getattr(exc, "errno", None) or errno.EIO, str(exc)) from exc
 
-    def write(self, payload: bytes) -> None:
+    def write(
+        self,
+        payload: bytes,
+        *,
+        cancel: threading.Event | None = None,
+    ) -> TxResult:
         import serial
 
         ser = self._ser
@@ -335,15 +376,50 @@ class _PySerialPort(SerialPort):
         view = memoryview(payload)
         sent = 0
         while sent < len(payload):
+            if cancel is not None and cancel.is_set():
+                return TxResult("completed", sent, len(payload), "cancelled")
             try:
                 n = ser.write(view[sent:])
             except serial.SerialTimeoutException as exc:
-                raise OSError(errno.ETIMEDOUT, str(exc)) from exc
+                from .uart_io import TxUnknownError
+
+                result = TxResult(
+                    "unknown",
+                    sent,
+                    len(payload),
+                    f"{type(exc).__name__}: {exc}",
+                )
+                raise TxUnknownError(result, errno.ETIMEDOUT) from exc
             except serial.SerialException as exc:
-                raise OSError(getattr(exc, "errno", None) or errno.EIO, str(exc)) from exc
+                from .uart_io import TxUnknownError
+
+                result = TxResult(
+                    "unknown",
+                    sent,
+                    len(payload),
+                    f"{type(exc).__name__}: {exc}",
+                )
+                raise TxUnknownError(
+                    result,
+                    getattr(exc, "errno", None) or errno.EIO,
+                ) from exc
+            except OSError as exc:
+                from .uart_io import TxUnknownError
+
+                result = TxResult(
+                    "unknown",
+                    sent,
+                    len(payload),
+                    f"{type(exc).__name__}: {exc}",
+                )
+                raise TxUnknownError(
+                    result,
+                    getattr(exc, "errno", None) or errno.EIO,
+                ) from exc
             if not n:
-                break
+                return TxResult("completed", sent, len(payload), "short_write")
             sent += n
+        return TxResult("completed", sent, len(payload))
 
     def close(self) -> None:
         ser = self._ser

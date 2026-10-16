@@ -345,6 +345,8 @@ macro_rules! pydict { ($($k:expr => $v:expr),* $(,)?) => { ... } }  // 回應依
 
   外層紀錄：`dir:"META"`、`source:"system"`、`com:"WAL"`、`loss_flag:true`。
 
+- BC-03 的 `tx_outcome_unknown` META 事件與欄位定義以 `contracts/wal_meta_events.schema.json` 為準。
+
 ---
 
 ## 4. `sw-pal`：平台抽象層（完整 trait）
@@ -460,7 +462,8 @@ pub trait SerialReader: Send {
     /// 被喚醒時 Windows 先 CancelIoEx(h,&ov) 再 GetOverlappedResult(bWait=TRUE)，已完成的 bytes 照實回報，不丟棄。
     fn read(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> PalResult<ReadOutcome>;
 }
-pub enum TxOutcome { NotSubmitted, Completed(usize), Unknown }
+pub enum TxOutcome { NotSubmitted, Completed(usize), Unknown { confirmed: usize } }
+// Unknown.confirmed 是結果不明前 OS 已確認的前綴；未知尾段長度為 requested - confirmed。
 pub struct TxResult { pub outcome: TxOutcome, pub error: Option<PalError> } // Completed(n<len)+error 表示部分完成後失敗
 /// OS 提交的序列化點（規格 §5.2.2，R0-F1）。PAL 每次要把 bytes 交給 OS 前都必須經過 gate：
 /// POSIX 一次非阻塞 `write(2)`（fd 為 O_NONBLOCK，立即返回 n 或 EAGAIN）；Windows 一次 overlapped `WriteFile` 發出（立即返回
@@ -846,7 +849,7 @@ TxWriter 的 job queue 容量 64；滿時 OpRunner 阻塞等待（只有 OpRunne
   - 結算時該 op 的 WAL 證據缺口移入有界的未解決集合（256，溢位合併最舊者為 `{gaps, bytes, first_op, last_op}` 計數）；單一 op 的缺口上限 16，溢位同樣合併。
   - 未結算 op 達 256：**不淘汰任何在途項目**；新 op 的 job 不交 OS（`NotSubmitted`＋`Frozen`、不建項目），並以 `UartIoError{reason:"TX_LEDGER_SATURATED"}` 走既有 IoError drain 收斂（新 epoch 帳本歸零）。
 - recovery、release、drain 中止在途命令時，命令紀錄依下列規則處置：
-  - `confirmed_bytes ≥ 1` → `status:"error"`、`error_code:"COMMAND_ABORTED_IN_FLIGHT"`（`retryable:false`）。
+  - `confirmed_bytes ≥ 1`（不論最後結果為 `Completed` 或 `Unknown`）→ `status:"error"`、`error_code:"COMMAND_ABORTED_IN_FLIGHT"`（`retryable:false`）。
   - 所有寫入都是 `NotSubmitted` 或 `Completed(0)` → `FLUSHED_BY_RECOVERY`。
   - 有 `Unknown` 且 `confirmed_bytes=0` → `SEND_FAILED`（沿用既有映射，見 `ERR-7.3-9`）。
 - 任何情況都不自動重送。
