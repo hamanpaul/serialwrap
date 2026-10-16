@@ -30,11 +30,18 @@ def b64(payload: bytes) -> str:
 
 
 def wall_ts_now() -> str:
-    """取得當前 UTC 牆上時間 ISO8601 字串（微秒為 0 時省略小數）。"""
-    dt = datetime.now(timezone.utc)
-    if dt.microsecond == 0:
-        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    return dt.isoformat()
+    """取得當前 UTC 牆上時間 ISO8601 字串（微秒為 0 時省略小數；時區一律 `+00:00`，與 WAL 相同）。"""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _check_common(*, seq: int, endpoint_generation: int, dut_generation: int) -> None:
+    """驗證 seq 與兩個 generation 皆 ≥1（§15.6.2）。"""
+    if seq < 1:
+        raise ValueError(f"seq 必須 ≥1：{seq}")
+    if endpoint_generation < 1 or dut_generation < 1:
+        raise ValueError(
+            f"generation 必須 ≥1：endpoint={endpoint_generation} dut={dut_generation}"
+        )
 
 
 def dumps_record(rec: dict[str, Any]) -> bytes:
@@ -65,8 +72,11 @@ def make_data_record(
     stream_offset: int,
     payload: bytes,
 ) -> dict[str, Any]:
-    """建立資料傳輸紀錄（DIR 為 TX 或 RX）。"""
-    direction = OBSERVATIONS.get(observation, "TX")
+    """建立資料傳輸紀錄（DIR 為 TX 或 RX）；未知 observation 一律 ValueError，不猜方向。"""
+    if observation not in OBSERVATIONS:
+        raise ValueError(f"未知 observation：{observation!r}")
+    _check_common(seq=seq, endpoint_generation=endpoint_generation, dut_generation=dut_generation)
+    direction = OBSERVATIONS[observation]
     return {
         "schema_version": "bridge.v1",
         "run_id": run_id,
@@ -105,7 +115,11 @@ def make_meta_record(
     meta: dict[str, Any],
     loss_flag: bool = False,
 ) -> dict[str, Any]:
-    """建立中繼事件紀錄（DIR 為 META）。"""
+    """建立中繼事件紀錄（DIR 為 META）；`meta["event"]` 必須為非空字串。"""
+    event = meta.get("event") if isinstance(meta, dict) else None
+    if not isinstance(event, str) or not event:
+        raise ValueError(f"META 紀錄缺少 meta.event：{meta!r}")
+    _check_common(seq=seq, endpoint_generation=endpoint_generation, dut_generation=dut_generation)
     return {
         "schema_version": "bridge.v1",
         "run_id": run_id,

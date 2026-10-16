@@ -1,5 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serialwrap.local/schemas/comparison.schema.json",
   "title": "serialwrap comparison.v1 contract",
   "type": "object",
   "additionalProperties": false,

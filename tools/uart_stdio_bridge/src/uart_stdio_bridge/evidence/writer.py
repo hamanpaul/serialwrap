@@ -78,7 +78,14 @@ class EvidenceWriter:
             if hasattr(os, "O_BINARY"):
                 flags |= os.O_BINARY
             mode = 0o600
-            self._fd = os.open(str(self.path), flags, mode)
+            try:
+                self._fd = os.open(str(self.path), flags, mode)
+            except OSError as exc:
+                # 既有證據檔不得覆寫或續寫（O_EXCL）；任何開檔失敗一律以 harness 碼回報
+                self._failure = "HARNESS_EVIDENCE_WRITE_FAILED"
+                raise EvidenceFailure(
+                    f"無法建立證據檔 {self.path}: {exc}", code="HARNESS_EVIDENCE_WRITE_FAILED"
+                ) from exc
             self._thread = threading.Thread(
                 target=self._worker, name="evidence-writer", daemon=True
             )

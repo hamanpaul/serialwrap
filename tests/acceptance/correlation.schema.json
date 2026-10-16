@@ -1,0 +1,186 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serialwrap.local/schemas/correlation.schema.json",
+  "title": "serialwrap correlation.v1 協調器關聯紀錄（correlation.ndjson 單行）",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "case_id",
+    "seq",
+    "mono_ts_ns",
+    "wall_ts",
+    "clock_id",
+    "op_id",
+    "step_index",
+    "kind",
+    "action",
+    "argv",
+    "rc",
+    "response_sha256",
+    "cmd_id",
+    "wal_seq",
+    "settled",
+    "wire",
+    "marker",
+    "marker_dir"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "correlation.v1"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "case_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "mono_ts_ns": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "wall_ts": {
+      "type": "string",
+      "minLength": 1
+    },
+    "clock_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "op_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "step_index": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "kind": {
+      "enum": [
+        "op_start",
+        "op_end",
+        "marker"
+      ]
+    },
+    "action": {
+      "type": "string"
+    },
+    "argv": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
+    },
+    "rc": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "response_sha256": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "cmd_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "wal_seq": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "settled": {
+      "type": "boolean"
+    },
+    "wire": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "endpoint_generation",
+            "dut_generation",
+            "wire_seq",
+            "offsets"
+          ],
+          "properties": {
+            "endpoint_generation": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "dut_generation": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "wire_seq": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "offsets": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "serial_read",
+                "dut_stdin_write",
+                "dut_stdout_read",
+                "serial_write"
+              ],
+              "properties": {
+                "serial_read": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "dut_stdin_write": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "dut_stdout_read": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "serial_write": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "marker": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "marker_dir": {
+      "enum": [
+        "TX",
+        "RX",
+        null
+      ]
+    }
+  }
+}

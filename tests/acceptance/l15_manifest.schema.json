@@ -1,0 +1,438 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serialwrap.local/schemas/l15_manifest.schema.json",
+  "title": "serialwrap l15-manifest.v1 L1.5 執行 manifest（manifest.json，協調器寫）",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "case_id",
+    "created_at",
+    "mode",
+    "topology",
+    "transport",
+    "artifacts",
+    "tool",
+    "dut",
+    "repo_git_revision",
+    "repo_dirty",
+    "contract_revision",
+    "contract_dirty",
+    "cases_yaml_sha256",
+    "case",
+    "platform",
+    "bridge_manifest_sha256",
+    "evidence"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "l15-manifest.v1"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "case_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "created_at": {
+      "type": "string",
+      "minLength": 1
+    },
+    "mode": {
+      "enum": [
+        "pty",
+        "bridge"
+      ]
+    },
+    "topology": {
+      "enum": [
+        "dut_in_container_daemon_native",
+        "dut_local_process_daemon_native",
+        "faketarget_pty"
+      ]
+    },
+    "transport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "port_id",
+        "daemon_side",
+        "bridge_side"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "virtual_pty",
+            "virtual_com0com",
+            "physical_usb_uart",
+            "faketarget_pty"
+          ]
+        },
+        "port_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "daemon_side": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "bridge_side": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cli",
+        "daemon",
+        "release_manifest_sha256"
+      ],
+      "properties": {
+        "cli": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256",
+            "version_stdout"
+          ],
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "version_stdout": {
+              "type": "string"
+            }
+          }
+        },
+        "daemon": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "argv",
+            "sha256",
+            "implementation",
+            "package_tree_sha256",
+            "repo_tree_sha256"
+          ],
+          "properties": {
+            "argv": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "sha256": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "implementation": {
+              "enum": [
+                "python",
+                "rust"
+              ]
+            },
+            "package_tree_sha256": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "repo_tree_sha256": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          }
+        },
+        "release_manifest_sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version",
+        "tree_sha256",
+        "approved"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tree_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "approved": {
+          "type": "boolean"
+        }
+      }
+    },
+    "dut": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "image",
+        "image_id",
+        "target_sha256",
+        "scenario_sha256",
+        "seed"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "docker",
+            "local-process",
+            "faketarget"
+          ]
+        },
+        "image": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "image_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "target_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "scenario_sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "seed": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      }
+    },
+    "repo_git_revision": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "repo_dirty": {
+      "type": "boolean"
+    },
+    "contract_revision": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "contract_dirty": {
+      "type": "boolean"
+    },
+    "cases_yaml_sha256": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_path",
+        "sha256",
+        "revision"
+      ],
+      "properties": {
+        "source_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "platform": {
+      "type": "object",
+      "required": [
+        "os",
+        "release",
+        "version",
+        "machine",
+        "python",
+        "evidence_insufficient"
+      ],
+      "properties": {
+        "evidence_insufficient": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "bridge_manifest_sha256": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "wire",
+        "control",
+        "correlation",
+        "dut_stderr",
+        "wal_dir",
+        "cli_log"
+      ],
+      "properties": {
+        "wire": {
+          "type": "object",
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          }
+        },
+        "control": {
+          "type": "object",
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          }
+        },
+        "correlation": {
+          "type": "object",
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          }
+        },
+        "dut_stderr": {
+          "type": "object",
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          }
+        },
+        "wal_dir": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cli_log": {
+          "type": "object",
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          }
+        }
+      }
+    }
+  }
+}
