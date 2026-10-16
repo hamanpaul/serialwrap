@@ -250,11 +250,23 @@ def _run_command(argv: list[str]) -> int:
         test_cap = os.environ.get("UART_STDIO_BRIDGE_TEST_STDERR_CAP")
         if test_cap is not None:
             stderr_cap = int(test_cap)
+        os_write_fn = os.write
+        if os.environ.get("UART_STDIO_BRIDGE_TEST_FAULT") == "enospc_after_1mib":
+            import errno
+            fault_bytes_written = [0]
+            def _fault_os_write(fd: int, data: bytes) -> int:
+                if fault_bytes_written[0] + len(data) > 1024 * 1024:
+                    raise OSError(errno.ENOSPC, "No space left on device")
+                n = os.write(fd, data)
+                fault_bytes_written[0] += n
+                return n
+            os_write_fn = _fault_os_write
         writer = EvidenceWriter(
             evidence_dir / "wire.ndjson",
             run_id=args.run_id,
             case_id=args.case_id,
             clock_id=clock_id(),
+            os_write=os_write_fn,
         )
         config = BridgeConfig(
             run_id=args.run_id,
@@ -383,7 +395,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("compare", add_help=False, help="WAL 與 wire byte stream 比對、窗口判定與竄改拒絕")
     subparsers.add_parser("redact", add_help=False, help="產生遮罩衍生證據目錄與 redaction-manifest.json")
     subparsers.add_parser("dut", add_help=False, help="執行 DUT 模擬器")
-    subparsers.add_parser("selftest", add_help=False, help="selftest 子命令（待實作）")
+    subparsers.add_parser("selftest", add_help=False, help="執行 bridge 自測與資格報告")
 
     return parser
 

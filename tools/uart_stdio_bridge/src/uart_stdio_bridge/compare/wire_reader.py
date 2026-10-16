@@ -256,6 +256,14 @@ def load_wire(
                         "detail": "bridge-manifest 表示 bridge 未正常關閉或記錄 failure",
                     })
 
+                if manifest.get("test_overrides"):
+                    problems.append({
+                        "code": "HARNESS_INSUFFICIENT_EVIDENCE",
+                        "file": str(manifest_path),
+                        "line_no": 0,
+                        "detail": "bridge-manifest 含有 test_overrides，證據無效（§15.4.3／I8-1）",
+                    })
+
     lines = bytes_to_verify.splitlines()
     expected_seq = 1
     expected_stream_offsets: dict[tuple[str, int, str], int] = {}
