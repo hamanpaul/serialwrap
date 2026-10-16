@@ -1,0 +1,8 @@
+[package]
+name = "sw-proto"
+version = "0.3.2"
+edition = "2021"
+publish = false
+
+[dependencies]
+indexmap = "=2.11.4"

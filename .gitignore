@@ -32,3 +32,6 @@ regression/serialwrap_regression/testbed.yaml
 
 # session-local dispatch/runtime artifacts（勿入版控；R-21 教訓 2026-08-11）
 runtime/
+
+# Rust cargo 建置產物（P3-T1）
+/target/

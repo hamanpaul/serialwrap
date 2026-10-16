@@ -1,0 +1,5 @@
+profiles:
+  alpha:
+    platform: prpl
+targets:
+  - {profile: alpha, device_by_id: da}

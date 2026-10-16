@@ -1,0 +1,9 @@
+profiles:
+  real:
+    platform: shell
+
+targets:
+  - {profile: missing, device_by_id: d1}
+  - {profile_name: real, device_by_id: d2}
+  - {profile: "  real  ", device_by_id: d3, com: "  COM7 ", alias: "  custom  "}
+  - {profile: "", device_by_id: d4}

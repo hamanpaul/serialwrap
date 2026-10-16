@@ -1,0 +1,42 @@
+profiles:
+  tpl:
+    platform: prpl
+    prompt_regex: "TPL-P"
+    login_regex: "TPL-L"
+    password_regex: "TPL-PW"
+    post_login_cmd: "tpl-cmd"
+    ready_probe: "tpl-ready"
+    username: tuser
+    user_env: TPL_U
+    pass_env: TPL_P
+    env_file: tpl.env
+    console_unlock_env: TPL_UNLOCK
+    console_unlock_idle_s: 3
+    timeout_s: 11
+    quiet_window_s: 1.5
+    hard_timeout_s: 90
+    log_dir: tlog
+    max_console_line_chars: 77
+    uart: {baud: 9600, data_bits: 7, parity: o, stop_bits: 2, flow_control: xon, xonxoff: true}
+
+targets:
+  - profile: tpl
+    device_by_id: full-dev
+    platform: " SHELL "
+    prompt_regex: "T-P"
+    login_regex: " T-L "
+    password_regex: "T-PW"
+    post_login_cmd: " t-cmd "
+    ready_probe: ""
+    username: "t-user"
+    user_env: T_U
+    pass_env: T_P
+    env_file: sub/../t.env
+    console_unlock_env: T_UNLOCK
+    console_unlock_idle_s: 2.5
+    timeout_s: 12
+    quiet_window_s: 0.5
+    hard_timeout_s: 45
+    log_dir: "tl/./x/.."
+    max_console_line_chars: 256
+    uart: {baud: 230400, parity: e}

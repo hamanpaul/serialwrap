@@ -1,0 +1,4 @@
+profiles:
+  only-tpl:
+    platform: prpl
+targets:

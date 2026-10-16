@@ -1,0 +1,1 @@
+profiles: !!python/object/apply:os.system ["echo x"]

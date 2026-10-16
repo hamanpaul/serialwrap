@@ -1,0 +1,12 @@
+profiles:
+  p:
+    platform: shell
+    username: 2001-12-14
+    prompt_regex: 2001-12-14t21:59:43.10-05:00
+    post_login_cmd: [a, 1, null]
+    login_regex: 1.50
+    password_regex: 0x1A
+    timeout_s: 2001-12-14
+
+targets:
+  - {profile: p, device_by_id: d1, username: 2001-12-14 21:59:43+09:00, login_regex: .inf}

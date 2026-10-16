@@ -1,0 +1,57 @@
+"""P3 golden 新鮮度：產生器重跑的輸出必須與 contracts/golden 逐位元組相同。
+
+之後每個 golden Task 在 ``GENERATORS`` 追加一列。
+"""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+pytestmark = [pytest.mark.core_portable, pytest.mark.process_rpc]
+
+GENERATORS = [
+    ("gen_pyjson.py", "pyjson.tsv"),
+    ("gen_pycompat.py", "pycompat.tsv"),
+    ("gen_pycompat.py", "pypath.posix.tsv"),
+    ("gen_pycompat.py", "pypath.windows.tsv"),
+    ("gen_pyre.py", "pyre.tsv"),
+]
+
+
+@pytest.mark.skipif(
+    sys.version_info[:3] != (3, 12, 3),
+    reason="golden 以 CPython 3.12.3 為基準（CI 釘 3.12.3；其他版本為證據不足，非 PASS）",
+)
+@pytest.mark.parametrize("script, out", GENERATORS)
+def test_golden_is_fresh(tmp_path, script, out):
+    target = tmp_path / out
+    subprocess.run(
+        [sys.executable, str(ROOT / "scripts/rust/goldens" / script), "--out", str(target)],
+        check=True,
+    )
+    assert target.read_bytes() == (ROOT / "contracts/golden" / out).read_bytes()
+
+
+@pytest.mark.skipif(
+    sys.version_info[:3] != (3, 12, 3),
+    reason="golden 以 CPython 3.12.3 為基準（CI 釘 3.12.3；其他版本為證據不足，非 PASS）",
+)
+def test_pyre_limits_is_fresh(tmp_path):
+    """``pyre.limits.json`` 記錄 PARSE_DEPTH_LIMIT（Python 首次 RecursionError 的深度 T），須與重跑結果逐位元組相同。"""
+    subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/rust/goldens/gen_pyre.py"),
+            "--out",
+            str(tmp_path / "pyre.tsv"),
+            "--limits-out",
+            str(tmp_path / "pyre.limits.json"),
+        ],
+        check=True,
+    )
+    assert (tmp_path / "pyre.limits.json").read_bytes() == (ROOT / "contracts/golden/pyre.limits.json").read_bytes()

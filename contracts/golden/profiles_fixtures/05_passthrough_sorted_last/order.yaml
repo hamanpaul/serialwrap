@@ -1,0 +1,14 @@
+profiles:
+  uboot-pt:
+    platform: passthrough
+    ready_probe: ""
+  zz-prpl:
+    platform: prpl
+  aa-shell:
+    platform: shell
+
+targets:
+  - profile: uboot-pt
+    device_by_id: dev-pt
+  - profile: zz-prpl
+    device_by_id: dev-z

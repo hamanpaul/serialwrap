@@ -1,0 +1,130 @@
+# pyre golden 語料（P3-T5）。由 scripts/rust/goldens/gen_pyre.py 讀取，oracle 為 CPython 3.12.3 re 與 valid_completion_regex。
+# 每行一個 pattern；行首 # 為註解。TAB 之後為 haystack 清單，以 <SEP> 分隔（無 TAB 者只產生 compile／completion_valid 列）。
+# 欄位原文即 UTF-8 文字，反斜線照字面（regex 語法不跳脫）；控制字元以 <U+XXXX> 表示；空字串以 <EMPTY> 表示。
+# 深度（巢狀 parens）與 1024／1025 bytes 長度邊界由產生器產生，不在本檔。
+#
+# 第一區：出貨 profile regex（sw_core/assets/profiles/default.yaml 經 PyYAML 解碼後的值）與 sw_core/constants.py 的 UBOOT_FALLBACK_PROMPTS。
+(?m)^root@prplOS:.*# 	root@prplOS:~# <SEP>x<U+000A>root@prplOS:admin# <SEP>root@prplOS:x
+(?mi)^login:\s*$	login:<SEP>Login:  <U+000A>abc<SEP>xlogin:<SEP>user login:
+# SES-16.6-04：YAML 原文的雙反斜線形式（字面 \\），與上一行解碼後的 regex 不同，兩者皆須比對。
+(?mi)^login:\\s*$	login:\<SEP>login:<SEP>login:\\
+(?mi)^password:\s*$	Password:<SEP>password:  <U+000A>x
+^=> $	=> <SEP>x<U+000A>=>
+^U-Boot> $	U-Boot> <SEP>u-boot>
+^CFE> $	CFE>
+^BCM\d+>> $	BCM4908>> <SEP>BCMx>>
+.*[$#] $	root# <SEP>x
+(?mi)^.*login:\s*$	user login:
+(?m)^(?:[ \t]*|.*[^>#\s])[>#][ \t]*$	user#<SEP>x><SEP>  >
+(?mi)login:\s*$	Login:
+(?m)^root@Speedport Smart 4 Typ [AB]:[^\r\n#]*#[ \t]*	root@Speedport Smart 4 Typ A:admin# <SEP>root@Speedport Smart 4 Typ C:x#
+(?m)^CFE>\s*$	CFE>  <SEP>CFE>
+(?mi)^(=>|u-boot>|cfe>) $	U-BOOT> <SEP>=>
+$^	<EMPTY><SEP>x
+.*	abc<SEP><EMPTY>
+#
+# 第二區：語法與語意（accept 集合與匹配位置）。
+a	a<SEP>b<SEP><EMPTY>
+abc	xxabcxx
+é+x	aééx
+x	😀x
+(?P<n>a)(?P=n)	aa<SEP>ab
+(a)?(?(1)b|c)	ab<SEP>c<SEP>ac
+a*+	aaa
+(?>a+)b	aaab<SEP>aaa
+(?x) a b # comment	ab
+(?x)a # c<U+000A>b	ab
+a\Z	a<SEP>a<U+000A>
+a$	a<U+000A><SEP>ab
+(?m)a$	a<U+000A>b
+(?s)a.b	a<U+000A>b
+a.b	a<U+000A>b<SEP>axb
+\s	<U+001C><SEP><U+0085><SEP><U+00A0>
+\s+	a <U+000B><U+000C>b
+\bé\b	é<SEP>ée
+\bx\b	éx x
+\w+	日本語 x
+\d+	x٤٢
+[\w-]+	a-b c
+(?i)É	é
+(?i)ß	ẞ
+\N{LATIN SMALL LETTER E WITH ACUTE}	é
+a(?#x)b	ab
+(?a)\w+	éab
+(?u)a	a
+\x41	A
+A	A
+\U00000041	A
+\0	<U+0000>
+\101	A
+\A	ab
+\B	ab
+a{2}	aaa
+a{,3}	aaaa
+a{2,}	aaaaa
+a+?	aaa
+(?=x)?	x<SEP><EMPTY>
+^	abc<SEP><EMPTY>
+a*	b
+(?<=a)b	ab
+(?<!a)b	ab cb
+(?=a)a	a
+[]a]	]
+[a-]	-
+[\]]	]
+\\	\
+a<U+000A>b	a<U+000A>b
+(?m)^$	a<U+000A><U+000A>
+(?#x)
+(?i)
+<EMPTY>	abc
+#
+# 第三區：非法語法（re.error 訊息與位置必須逐字一致）。
+(
+)
+[
+[a
+a**
+*
++a
+?
+a{1
+a{2,1}
+(?<=a+)
+(?<=ab|c)d
+(?P<1>x)
+(?P<n>a)(?P<n>b)
+(?P=m)
+(?P<n>a)(?P=m)
+\8
+(?z)
+(?<n>a)
+(?i
+a(?i)b
+(?L)a
+[z-a]
+\p{L}
+\c
+\
+(?#unterminated
+a<U+000A>(
+a<U+000A>)
+(?x)a<U+000A>(
+(?(1)a|b)
+(?s
+\N{NO SUCH NAME}
+#
+# 第四區：OverflowError 與接受邊界（Python 不以 re.error 拒絕者）。
+a{99999999999}
+a{4294967295}
+a{1,99999999999}
+a{4294967294}
+#
+# 第五區：completion 專用邊界（可匹配空字串者 completion_valid 必為 0）。
+x	x<SEP>y
+x*
+\Z
+(?!a)
+$
+a<U+000A>
+(?i)
