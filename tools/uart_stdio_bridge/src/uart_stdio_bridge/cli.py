@@ -15,7 +15,7 @@ _SUBCOMMAND_TARGETS = {
     "dut": "uart_stdio_bridge.dut.__main__",
     "run": "uart_stdio_bridge.bridge.core",
     "compare": "uart_stdio_bridge.compare.comparator",
-    "redact": "uart_stdio_bridge.compare.comparator",
+    "redact": "uart_stdio_bridge.compare.redact",
     "selftest": "uart_stdio_bridge.selftest.runner",
 }
 
@@ -379,9 +379,11 @@ def build_parser() -> argparse.ArgumentParser:
     # version 子命令
     subparsers.add_parser("version", help="顯示工具身分與 schema 版本（JSON 格式）")
 
-    # 未實作之子命令佔位（add_help=False，不吸收或限制參數，參數完整轉交）
-    for name in ("run", "compare", "redact", "selftest", "dut"):
-        subparsers.add_parser(name, add_help=False, help=f"{name} 子命令（待實作）")
+    subparsers.add_parser("run", add_help=False, help="執行 bridge 轉接與錄證")
+    subparsers.add_parser("compare", add_help=False, help="WAL 與 wire byte stream 比對、窗口判定與竄改拒絕")
+    subparsers.add_parser("redact", add_help=False, help="產生遮罩衍生證據目錄與 redaction-manifest.json")
+    subparsers.add_parser("dut", add_help=False, help="執行 DUT 模擬器")
+    subparsers.add_parser("selftest", add_help=False, help="selftest 子命令（待實作）")
 
     return parser
 

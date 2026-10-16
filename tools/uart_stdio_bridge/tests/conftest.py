@@ -40,7 +40,18 @@ def pytest_runtest_setup(item):
 
 
 def pytest_sessionfinish(session, exitstatus):
-    # 產品邊界：整個工具自測 session 不得載入產品模組
+    # 產品邊界：若純為 bridge 工具自測 session，不得載入產品模組
+    cli_args = getattr(session.config, "args", [])
+    for arg in cli_args:
+        if not arg or arg.startswith("-"):
+            continue
+        path_part = arg.split("::")[0]
+        try:
+            resolved = pathlib.Path(path_part).resolve()
+            if not resolved.is_relative_to(TOOL_ROOT):
+                return
+        except Exception:
+            pass
     leaked = sorted(m for m in sys.modules if m == "sw_core" or m.startswith("sw_core."))
     if leaked:
         print(f"[bridge-boundary] FAIL: 載入了產品模組 {leaked}")

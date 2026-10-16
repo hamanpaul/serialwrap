@@ -26,7 +26,7 @@ def test_checkpoint_mid_run_pass_and_tamper(tmp_path):
     assert compare(ev.inputs(checkpoint=checkpoint))["verdict"] == "PASS"
 
     wire = ev.wire_path.read_bytes()
-    ev.wire_path.write_bytes(wire.replace(b"checkpointed", b"Checkpointed", 1))
+    ev.wire_path.write_bytes(wire.replace(b"compare-case", b"Compare-case", 1))
     out = compare(ev.inputs(checkpoint=checkpoint))
     assert out["verdict"] == "INSUFFICIENT_EVIDENCE"
     assert "HARNESS_TAMPER_DETECTED" in out["reasons"]

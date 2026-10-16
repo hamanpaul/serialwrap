@@ -1,0 +1,168 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "serialwrap comparison.v1 contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "case_id",
+    "verdict",
+    "reasons",
+    "tool",
+    "integrity",
+    "window",
+    "streams",
+    "invariants"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "comparison.v1"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "case_id": {
+      "type": "string"
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["PASS", "FAIL", "INSUFFICIENT_EVIDENCE"]
+    },
+    "reasons": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "tree_sha256"],
+      "properties": {
+        "name": { "type": "string" },
+        "version": { "type": "string" },
+        "tree_sha256": { "type": "string" }
+      }
+    },
+    "integrity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "wire_records",
+        "wire_sha256",
+        "wire_sha256_expected",
+        "wal_files",
+        "wal_records",
+        "problems"
+      ],
+      "properties": {
+        "wire_records": { "type": "integer", "minimum": 0 },
+        "wire_sha256": { "type": "string" },
+        "wire_sha256_expected": { "type": ["string", "null"] },
+        "wal_files": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "wal_records": { "type": "integer", "minimum": 0 },
+        "problems": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["code", "file", "line_no", "detail"],
+            "properties": {
+              "code": { "type": "string" },
+              "file": { "type": "string" },
+              "line_no": { "type": "integer" },
+              "detail": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "window": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "until_op",
+        "wal_seq",
+        "wire_offsets",
+        "endpoint_generation"
+      ],
+      "properties": {
+        "until_op": { "type": ["string", "null"] },
+        "wal_seq": { "type": "integer", "minimum": 0 },
+        "wire_offsets": {
+          "type": "object",
+          "additionalProperties": { "type": "integer", "minimum": 0 }
+        },
+        "endpoint_generation": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "streams": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "port_id",
+          "com",
+          "endpoint_generation",
+          "dir",
+          "wal_bytes",
+          "wire_bytes",
+          "equal",
+          "first_diff_offset",
+          "wal_context_hex",
+          "wire_context_hex",
+          "rules_applied"
+        ],
+        "properties": {
+          "port_id": { "type": "string" },
+          "com": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "endpoint_generation": { "type": "integer", "minimum": 1 },
+          "dir": { "type": "string", "enum": ["TX", "RX"] },
+          "wal_bytes": { "type": "integer", "minimum": 0 },
+          "wire_bytes": { "type": "integer", "minimum": 0 },
+          "equal": { "type": "boolean" },
+          "first_diff_offset": { "type": ["integer", "null"], "minimum": 0 },
+          "wal_context_hex": { "type": ["string", "null"] },
+          "wire_context_hex": { "type": ["string", "null"] },
+          "rules_applied": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["rule", "dir", "wire_offset", "len"],
+              "properties": {
+                "rule": { "type": "string" },
+                "dir": { "type": "string", "enum": ["TX", "RX"] },
+                "wire_offset": { "type": "integer", "minimum": 0 },
+                "len": { "type": "integer", "minimum": 0 }
+              }
+            }
+          }
+        }
+      }
+    },
+    "invariants": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "verdict", "detail"],
+        "properties": {
+          "id": { "type": "string" },
+          "op_id": { "type": ["string", "null"] },
+          "verdict": { "type": "string", "enum": ["PASS", "FAIL", "INSUFFICIENT_EVIDENCE"] },
+          "detail": { "type": "string" }
+        }
+      }
+    }
+  }
+}
