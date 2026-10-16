@@ -19,6 +19,7 @@ GENERATORS = [
     ("gen_pycompat.py", "pycompat.tsv"),
     ("gen_pycompat.py", "pypath.posix.tsv"),
     ("gen_pycompat.py", "pypath.windows.tsv"),
+    ("gen_unicode_tables.py", "unicode_tables.txt"),
     ("gen_pyre.py", "pyre.tsv"),
 ]
 

@@ -77,10 +77,11 @@ fn pypath_posix_golden() {
 
 #[test]
 fn pypath_windows_golden() {
-    let env = sw_proto::runtime_paths::EnvSnapshot::from_pairs([(
-        "USERPROFILE".to_string(),
-        r"C:\Users\golden".to_string(),
-    )]);
+    // 與 gen_pycompat.py 的前提一致：USERPROFILE=C:\Users\golden、USERNAME=golden。
+    let env = sw_proto::runtime_paths::EnvSnapshot::from_pairs([
+        ("USERPROFILE".to_string(), r"C:\Users\golden".to_string()),
+        ("USERNAME".to_string(), "golden".to_string()),
+    ]);
     check("pypath.windows.tsv", |op, s| {
         common::pypath_dispatch(PathFlavor::Windows, op, s, &env, &FakeHome)
     });

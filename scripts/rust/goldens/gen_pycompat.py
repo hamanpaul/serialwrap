@@ -17,12 +17,14 @@ Windows 檔原生產生方式（亦可透過 WSL 執行）：:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import ntpath
 import os
 import posixpath
 import random
 import sys
+import types
 from pathlib import Path
 
 # 將 scripts/rust/goldens 目錄加入 sys.path 以載入 _tsv.py
@@ -34,6 +36,47 @@ from _tsv import Row, write_tsv
 
 BASELINE = (3, 12, 3)
 FUZZ_SEED = 20261016
+
+# expanduser 的固定前提（與 Rust 測試一致）：
+#   POSIX：HOME=/golden/home；pwd 表 current → /golden/pw-home、bob → /golden/bob-home
+#   Windows：USERPROFILE=C:\Users\golden、USERNAME=golden；其餘環境變數不設定
+POSIX_ENV = {"HOME": "/golden/home"}
+WIN_ENV = {"USERPROFILE": r"C:\Users\golden", "USERNAME": "golden"}
+
+
+@contextlib.contextmanager
+def patched_environ(values: dict[str, str]):
+    """暫時以 ``values`` 取代 ``os.environ``（ntpath／posixpath 的 expanduser 於呼叫時讀取它）。"""
+    saved = dict(os.environ)
+    os.environ.clear()
+    os.environ.update(values)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+
+@contextlib.contextmanager
+def fake_pwd_table():
+    """以假的 pwd 表取代 ``pwd.getpwnam``／``getpwuid``，使 posixpath.expanduser 的 ``~user`` 結果固定。"""
+    import pwd
+
+    saved = (pwd.getpwnam, pwd.getpwuid)
+
+    def getpwnam(name: str):
+        if name == "bob":
+            return types.SimpleNamespace(pw_dir="/golden/bob-home")
+        raise KeyError(name)
+
+    def getpwuid(uid: int):
+        return types.SimpleNamespace(pw_dir="/golden/pw-home")
+
+    pwd.getpwnam, pwd.getpwuid = getpwnam, getpwuid
+    try:
+        yield
+    finally:
+        pwd.getpwnam, pwd.getpwuid = saved
 
 # ---------------------------------------------------------------------------
 # 1. pycompat.tsv 產生器
@@ -264,6 +307,25 @@ def gen_decode_rows(rng: random.Random) -> list[Row]:
     return rows
 
 
+def oserror_expected(errno, winerror, strerror, filename, plain) -> str:
+    """``str(OSError(...))`` 的期望值。
+
+    - ``plain``／errno 列：直接呼叫 CPython ``OSError``（本機 Linux 即為真實行為）。
+    - ``winerror`` 列：Linux 的 ``OSError.__str__`` 不輸出 ``[WinError n]``，無法在本機取得真值；
+      此分支以 Windows 格式公式輸出，並已於 Windows CPython 3.12.10 以
+      ``str(OSError(errno, strerror, filename, winerror))`` 逐列核對（101 列，含 errno／plain 列，全數一致）。
+    """
+    if plain is not None:
+        return str(OSError(plain))
+    if winerror is not None:
+        exp = f"[WinError {winerror}] {strerror}"
+        if filename is not None:
+            exp += f": {filename!r}"
+        return exp
+    args = [errno, strerror] + ([filename] if filename is not None else [])
+    return str(OSError(*args))
+
+
 def gen_oserror_rows(rng: random.Random) -> list[Row]:
     rows: list[Row] = []
     cases: list[tuple[int | None, int | None, str | None, str | None, str | None]] = [
@@ -324,19 +386,7 @@ def gen_oserror_rows(rng: random.Random) -> list[Row]:
             filename if filename is not None else "",
             plain if plain is not None else "",
         ])
-        if plain is not None:
-            exp = plain
-        elif winerror is not None:
-            exp = f"[WinError {winerror}] {strerror}"
-            if filename is not None:
-                exp += f": {repr(filename)}"
-        elif errno is not None:
-            exp = f"[Errno {errno}] {strerror}"
-            if filename is not None:
-                exp += f": {repr(filename)}"
-        else:
-            exp = ""
-        rows.append((f"oserr_{i:04d}", "oserror", case_input, exp))
+        rows.append((f"oserr_{i:04d}", "oserror", case_input, oserror_expected(errno, winerror, strerror, filename, plain)))
     return rows
 
 
@@ -577,28 +627,6 @@ def build_pypath_posix_tsv(rng: random.Random) -> list[Row]:
     rows: list[Row] = []
     corpus = gen_pypath_corpus("posix", rng)
 
-    # FakeHome 對照：current_user -> /golden/pw-home, bob -> /golden/bob-home
-    def posix_expanduser_golden(p: str) -> str:
-        if not p.startswith("~"):
-            return p
-        sep_idx = p.find("/")
-        if sep_idx < 0:
-            user = p[1:]
-            rest = ""
-        else:
-            user = p[1:sep_idx]
-            rest = p[sep_idx:]
-        if not user:
-            # "~" or "~/" -> 使用 HOME=/golden/home
-            home = "/golden/home"
-        elif user == "bob":
-            home = "/golden/bob-home"
-        else:
-            # 查無此 user，原樣回傳
-            return p
-        home = home.rstrip("/")
-        return (home + rest) or "/"
-
     for op, cases in corpus.items():
         for i, c in enumerate(cases):
             case_id = f"{op}_{i:04d}"
@@ -623,7 +651,8 @@ def build_pypath_posix_tsv(rng: random.Random) -> list[Row]:
                 exp = f"{r}\x1f{ext}"
             elif op == "expanduser":
                 s = c
-                exp = posix_expanduser_golden(c)
+                with patched_environ(POSIX_ENV), fake_pwd_table():
+                    exp = posixpath.expanduser(c)
             else:
                 raise ValueError(f"unknown op {op}")
             rows.append((case_id, op, s, exp))
@@ -633,24 +662,6 @@ def build_pypath_posix_tsv(rng: random.Random) -> list[Row]:
 def build_pypath_windows_tsv(rng: random.Random) -> list[Row]:
     rows: list[Row] = []
     corpus = gen_pypath_corpus("windows", rng)
-
-    # Windows expanduser：USERPROFILE=C:\Users\golden, USERNAME=golden
-    def win_expanduser_golden(p: str) -> str:
-        if not p.startswith("~"):
-            return p
-        i = 1
-        n = len(p)
-        while i < n and p[i] not in ("\\", "/"):
-            i += 1
-        userhome = r"C:\Users\golden"
-        if i != 1:  # ~user
-            target_user = p[1:i]
-            current_user = "golden"
-            if target_user != current_user:
-                if current_user != ntpath.basename(userhome):
-                    return p
-                userhome = ntpath.join(ntpath.dirname(userhome), target_user)
-        return userhome + p[i:]
 
     for op, cases in corpus.items():
         for i, c in enumerate(cases):
@@ -676,7 +687,8 @@ def build_pypath_windows_tsv(rng: random.Random) -> list[Row]:
                 exp = f"{r}\x1f{ext}"
             elif op == "expanduser":
                 s = c
-                exp = win_expanduser_golden(c)
+                with patched_environ(WIN_ENV):
+                    exp = ntpath.expanduser(c)
             else:
                 raise ValueError(f"unknown op {op}")
             rows.append((case_id, op, s, exp))
