@@ -110,7 +110,7 @@ messages:
     template: "console RX handler 例外（com=%s），略過此塊、console 續行"
     args: [com]
     exc_info: true
-    source: "sw_core/uart_io.py:506"
+    source: "sw_core/uart_io.py:872"
 
   - id: rx_handler_exception_pyserial
     logger: serialwrap
@@ -118,7 +118,7 @@ messages:
     template: "RX handler 例外（com=%s），略過此塊、reader 續行"
     args: [com]
     exc_info: true
-    source: "sw_core/uart_io.py:949"
+    source: "sw_core/uart_io.py:1316"
 
   - id: rx_handler_exception_posix
     logger: serialwrap
@@ -126,14 +126,67 @@ messages:
     template: "RX handler 例外（com=%s），略過此塊、reader 續行"
     args: [com]
     exc_info: true
-    source: "sw_core/uart_io.py:992"
+    source: "sw_core/uart_io.py:1361"
 
   - id: tx_account_evicted
     logger: serialwrap
     level: WARNING
     template: "tx account evicted (cmd_id=%s)"
     args: [oldest_cmd]
-    source: "sw_core/uart_io.py:1196"
+    source: "sw_core/uart_io.py:1603"
+
+  - id: drain_pending_write_cancel_failed
+    logger: serialwrap
+    level: WARNING
+    template: "UART pending write 取消失敗（com=%s）"
+    args: [com]
+    exc_info: true
+    source: "sw_core/uart_io.py:483"
+
+  - id: drain_late_receipt_callback_failed_during_finish
+    logger: serialwrap
+    level: WARNING
+    template: "UART drain 遲到回條回呼失敗（com=%s）"
+    args: [com]
+    exc_info: true
+    source: "sw_core/uart_io.py:516"
+
+  - id: drain_late_receipt_callback_failed_after_schedule
+    logger: serialwrap
+    level: WARNING
+    template: "UART drain 遲到回條回呼失敗（com=%s）"
+    args: [com]
+    exc_info: true
+    source: "sw_core/uart_io.py:670"
+
+  - id: drain_background_receipt_missing
+    logger: serialwrap
+    level: ERROR
+    template: "背景 UART drain 未能產生回條（com=%s）"
+    args: [com]
+    source: "sw_core/uart_io.py:682"
+
+  - id: drain_late_receipt_callback_failed_in_worker
+    logger: serialwrap
+    level: WARNING
+    template: "UART drain 遲到回條回呼失敗（com=%s）"
+    args: [com]
+    exc_info: true
+    source: "sw_core/uart_io.py:690"
+
+  - id: bridge_drain_timeout
+    logger: serialwrap
+    level: WARNING
+    template: "serialwrap: bridge %s drain 逾時，handle 於背景關閉"
+    args: [com]
+    source: "sw_core/uart_io.py:738"
+
+  - id: bridge_drain_unsafe_receipt
+    logger: serialwrap
+    level: WARNING
+    template: "UART drain 未能安全收斂（com=%s epoch=%s error=%s）"
+    args: [com, epoch, error]
+    source: "sw_core/uart_io.py:744"
 
   - id: wal_rotate_failed
     logger: serialwrap
