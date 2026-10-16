@@ -30,13 +30,33 @@ class FakeSerial:
 
     def __init__(self, **kwargs: Any) -> None:
         self.kwargs = dict(kwargs)
-        self.timeout = kwargs.get("timeout")
-        self.write_timeout = kwargs.get("write_timeout")
+        self._timeout = kwargs.get("timeout")
+        self._write_timeout = kwargs.get("write_timeout")
+        self.timeout_assignments = 0
+        self.write_timeout_assignments = 0
         self.write_return: int | None = None  # None → 回傳 len(data)
         self.write_exc: BaseException | None = None
         self.writes: list[bytes] = []
         self.read_data = bytearray()
         self.closed = False
+
+    @property
+    def timeout(self) -> float | None:
+        return self._timeout
+
+    @timeout.setter
+    def timeout(self, value: float | None) -> None:
+        self.timeout_assignments += 1
+        self._timeout = value
+
+    @property
+    def write_timeout(self) -> float | None:
+        return self._write_timeout
+
+    @write_timeout.setter
+    def write_timeout(self, value: float | None) -> None:
+        self.write_timeout_assignments += 1
+        self._write_timeout = value
 
     def write(self, data: bytes) -> int:
         self.writes.append(bytes(data))
@@ -133,6 +153,46 @@ def test_write_some_returns_accepted(fake_serial_module):
         ep.close()
 
 
+@pytest.mark.parametrize("accepted", [-1, 6])
+def test_write_some_rejects_impossible_accepted_lengths(fake_serial_module, accepted: int):
+    from uart_stdio_bridge.endpoints.base import EndpointWriteUncertain
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    fake = FakeSerial()
+    fake.write_return = accepted
+    ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(fake))
+    ep.open()
+    try:
+        with pytest.raises(EndpointWriteUncertain) as exc_info:
+            ep.write_some(b"abcde", 0.1)
+        assert exc_info.value.requested_len == 5
+    finally:
+        ep.close()
+
+
+def test_io_does_not_reconfigure_unchanged_timeouts(fake_serial_module):
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    fake = FakeSerial()
+    ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(fake))
+    ep.open()
+    try:
+        ep.read(8, 0.01)
+        first_read_set_count = fake.timeout_assignments
+        ep.read(8, 0.01)
+        assert fake.timeout_assignments == first_read_set_count
+
+        ep.write_some(b"x", 0.01)
+        first_write_set_count = fake.write_timeout_assignments
+        ep.write_some(b"x", 0.01)
+        assert fake.write_timeout_assignments == first_write_set_count
+
+        ep.write_some(b"x", 0)
+        assert fake.write_timeout == pytest.approx(0.001)
+    finally:
+        ep.close()
+
+
 def test_write_timeout_is_uncertain(fake_serial_module):
     from uart_stdio_bridge.endpoints.base import EndpointWriteUncertain
     from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
@@ -191,6 +251,147 @@ def test_peer_close_labelled_not_transport_disconnect(fake_serial_module):
         assert ep.describe()["last_fault"] == "peer_close"
     finally:
         ep.close()
+
+
+def test_reconnect_requires_peer_close_permission_for_open_handle(fake_serial_module):
+    from uart_stdio_bridge.endpoints.base import EndpointError
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    fake = FakeSerial()
+    ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(fake))
+    ep.open()
+    try:
+        with pytest.raises(EndpointError) as exc_info:
+            ep.reconnect()
+        assert "HARNESS_CAPABILITY_UNAVAILABLE" in str(exc_info.value)
+        assert not fake.closed
+        assert ep.generation == 1
+    finally:
+        ep.close()
+
+
+def test_disconnected_endpoint_waits_then_reconnects(fake_serial_module):
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    serials: list[FakeSerial] = []
+
+    def factory(**kwargs: Any) -> FakeSerial:
+        fake = FakeSerial(**kwargs)
+        serials.append(fake)
+        return fake
+
+    ep = WinSerialEndpoint("COMb", allow_peer_close=True, serial_factory=factory)
+    ep.open()
+    try:
+        ep.disconnect(remove_link=False)
+
+        start = time.monotonic()
+        assert ep.read(16, 0.05) == b""
+        assert time.monotonic() - start >= 0.05
+
+        start = time.monotonic()
+        assert ep.write_some(b"x", 0.05) == 0
+        assert time.monotonic() - start >= 0.05
+
+        assert ep.reconnect() == 2
+        assert len(serials) == 2
+        assert not serials[-1].closed
+        assert ep.write_some(b"new", 0.1) == 3
+    finally:
+        ep.close()
+
+
+def test_io_and_reconnect_are_serialized(fake_serial_module):
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    read_started = threading.Event()
+    read_release = threading.Event()
+    failures: list[BaseException] = []
+
+    class BlockingSerial(FakeSerial):
+        def read(self, size: int = 1) -> bytes:
+            read_started.set()
+            if not read_release.wait(2):
+                raise TimeoutError("test read was not released")
+            if self.closed:
+                raise OSError("serial object closed during read")
+            return b""
+
+    serials: list[BlockingSerial] = []
+
+    def factory(**kwargs: Any) -> BlockingSerial:
+        fake = BlockingSerial(**kwargs)
+        serials.append(fake)
+        return fake
+
+    ep = WinSerialEndpoint("COMb", allow_peer_close=True, serial_factory=factory)
+    ep.open()
+
+    def read_one() -> None:
+        try:
+            ep.read(1, 0.01)
+        except BaseException as exc:
+            failures.append(exc)
+
+    def reconnect() -> None:
+        try:
+            ep.reconnect()
+        except BaseException as exc:
+            failures.append(exc)
+
+    reader = threading.Thread(target=read_one)
+    reconnector = threading.Thread(target=reconnect)
+    reader.start()
+    second_handle_open = False
+    try:
+        assert read_started.wait(1)
+        reconnector.start()
+        time.sleep(0.02)
+        assert reconnector.is_alive()
+    finally:
+        read_release.set()
+        reader.join(2)
+        if reconnector.ident is not None:
+            reconnector.join(2)
+        second_handle_open = len(serials) > 1 and not serials[1].closed
+        ep.close()
+
+    assert not reader.is_alive()
+    assert not reconnector.is_alive()
+    assert failures == []
+    assert ep.generation == 2
+    assert serials[0].closed
+    assert second_handle_open
+
+
+def test_open_endpoint_dispatches_and_opens_win_serial(fake_serial_module):
+    from uart_stdio_bridge.endpoints import open_endpoint
+
+    fake = FakeSerial()
+    factory = RecordingFactory(fake)
+    fake_serial_module.Serial = factory
+    ep = open_endpoint(
+        {
+            "kind": "win-serial",
+            "com": "COMb",
+            "baud": 57600,
+            "transport_mode": "virtual_com0com",
+            "allow_peer_close": True,
+        }
+    )
+    try:
+        assert ep.generation == 1
+        assert ep.com == "COMb"
+        assert ep.baud == 57600
+        assert ep.allow_peer_close is True
+        assert factory.calls[0]["port"] == "COMb"
+        assert factory.calls[0]["baudrate"] == 57600
+    finally:
+        ep.close()
+
+    for invalid in (None, {}, {"kind": "win-serial"}, {"kind": "unknown"}):
+        with pytest.raises(ValueError):
+            open_endpoint(invalid)
 
 
 def test_link_ops_unavailable(fake_serial_module):

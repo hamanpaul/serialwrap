@@ -213,6 +213,30 @@ def test_peer_gate_disabled_writes_queue(link: Path):
         ep.close()
 
 
+def test_write_without_peer_at_backpressure_does_not_spin(link: Path):
+    from uart_stdio_bridge.endpoints.posix_pty import PosixPtyEndpoint
+
+    ep = PosixPtyEndpoint(link, peer_gate=False)
+    ep.open()
+    payload = b"x" * 65536
+    try:
+        for _ in range(20):
+            if ep.write_some(payload, 0.02) == 0:
+                break
+        else:
+            pytest.fail("無 peer 時未能填滿 PTY buffer")
+
+        wall_start = time.monotonic()
+        cpu_start = time.process_time()
+        assert ep.write_some(payload, 0.1) == 0
+        wall_elapsed = time.monotonic() - wall_start
+        cpu_elapsed = time.process_time() - cpu_start
+        assert wall_elapsed >= 0.1
+        assert cpu_elapsed < 0.05
+    finally:
+        ep.close()
+
+
 def test_partial_write_reports_accepted_len(link: Path):
     from uart_stdio_bridge.endpoints.posix_pty import PosixPtyEndpoint
 
@@ -250,6 +274,179 @@ def test_read_timeout_returns_empty(link: Path):
     finally:
         os.close(fd)
         ep.close()
+
+
+def test_read_drains_pending_after_peer_close(link: Path):
+    from uart_stdio_bridge.endpoints.posix_pty import PosixPtyEndpoint
+
+    ep = PosixPtyEndpoint(link)
+    ep.open()
+    fd = _open_peer(link)
+    try:
+        _write_all_fd(fd, b"LAST")
+        os.close(fd)
+        fd = -1
+
+        assert ep.read(16, 0.2) == b"LAST"
+        assert ep.peer_open() is False
+
+        next_fd = _open_peer(link)
+        try:
+            poller = select.poll()
+            poller.register(next_fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+            assert not poller.poll(50)
+        finally:
+            os.close(next_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        ep.close()
+
+
+def test_idle_read_without_peer_waits_without_spinning(link: Path):
+    from uart_stdio_bridge.endpoints.posix_pty import PosixPtyEndpoint
+
+    ep = PosixPtyEndpoint(link)
+    ep.open()
+    try:
+        wall_start = time.monotonic()
+        cpu_start = time.process_time()
+        assert ep.read(4096, 0.1) == b""
+        wall_elapsed = time.monotonic() - wall_start
+        cpu_elapsed = time.process_time() - cpu_start
+        assert wall_elapsed >= 0.1
+        assert cpu_elapsed < 0.05
+    finally:
+        ep.close()
+
+
+def test_peer_gate_rechecks_after_backpressure(link: Path, monkeypatch: pytest.MonkeyPatch):
+    from uart_stdio_bridge.endpoints.posix_pty import PosixPtyEndpoint
+
+    ep = PosixPtyEndpoint(link, peer_gate=True)
+    ep.open()
+    fd = _open_peer(link)
+    peer_fd = [fd]
+    write_calls = 0
+    original_write = os.write
+
+    def write_with_peer_close(target_fd: int, data: bytes | memoryview) -> int:
+        nonlocal write_calls
+        if target_fd == ep._master_fd:
+            write_calls += 1
+            if write_calls == 1:
+                os.close(peer_fd[0])
+                peer_fd[0] = -1
+                raise BlockingIOError(11, "injected EAGAIN")
+        return original_write(target_fd, data)
+
+    try:
+        assert ep.peer_open() is True
+        monkeypatch.setattr(os, "write", write_with_peer_close)
+        assert ep.write_some(b"STALE", 0.05) == 0
+        assert write_calls == 1
+        monkeypatch.undo()
+
+        next_fd = _open_peer(link)
+        try:
+            poller = select.poll()
+            poller.register(next_fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+            assert not poller.poll(50)
+        finally:
+            os.close(next_fd)
+    finally:
+        if peer_fd[0] >= 0:
+            os.close(peer_fd[0])
+        ep.close()
+
+
+def test_disconnected_endpoint_waits_then_reconnects(link: Path):
+    from uart_stdio_bridge.endpoints.posix_pty import PosixPtyEndpoint
+
+    ep = PosixPtyEndpoint(link)
+    ep.open()
+    try:
+        ep.disconnect(remove_link=True)
+        assert ep.peer_open() is False
+
+        start = time.monotonic()
+        assert ep.read(16, 0.05) == b""
+        assert time.monotonic() - start >= 0.05
+
+        start = time.monotonic()
+        assert ep.write_some(b"x", 0.05) == 0
+        assert time.monotonic() - start >= 0.05
+
+        assert ep.reconnect() == 2
+        fd = _open_peer(link)
+        try:
+            _write_all_fd(fd, b"new")
+            assert _ep_read_n(ep, 3, 1.0) == b"new"
+            assert ep.write_some(b"epoch2", 1.0) == 6
+            assert _read_fd_n(fd, 6, 1.0) == b"epoch2"
+        finally:
+            os.close(fd)
+    finally:
+        ep.close()
+
+
+def test_reconnect_during_pumps_does_not_raise(link: Path):
+    from uart_stdio_bridge.endpoints.posix_pty import PosixPtyEndpoint
+
+    ep = PosixPtyEndpoint(link)
+    ep.open()
+    stop = threading.Event()
+    errors: list[BaseException] = []
+
+    def pump_read() -> None:
+        while not stop.is_set():
+            try:
+                ep.read(64, 0.005)
+            except BaseException as exc:
+                errors.append(exc)
+                stop.set()
+
+    def pump_write() -> None:
+        while not stop.is_set():
+            try:
+                ep.write_some(b"x", 0.005)
+            except BaseException as exc:
+                errors.append(exc)
+                stop.set()
+
+    workers = [threading.Thread(target=pump_read), threading.Thread(target=pump_write)]
+    for worker in workers:
+        worker.start()
+    try:
+        for _ in range(75):
+            ep.reconnect()
+        stop.set()
+        for worker in workers:
+            worker.join(2)
+        assert all(not worker.is_alive() for worker in workers)
+        assert errors == []
+    finally:
+        stop.set()
+        for worker in workers:
+            worker.join(2)
+        ep.close()
+
+
+def test_open_endpoint_returns_open_adapter_and_validates_spec(link: Path):
+    from uart_stdio_bridge.endpoints import open_endpoint
+
+    ep = open_endpoint({"kind": "posix-pty", "by_id_link": str(link), "peer_gate": False})
+    try:
+        assert ep.generation == 1
+        assert ep.slave_path is not None
+        assert link.is_symlink()
+        assert ep.peer_gate is False
+    finally:
+        ep.close()
+
+    for invalid in (None, {}, {"kind": "posix-pty"}, {"kind": "unknown"}):
+        with pytest.raises(ValueError):
+            open_endpoint(invalid)
 
 
 def test_disconnect_removes_link_and_peer_sees_hangup(link: Path):
