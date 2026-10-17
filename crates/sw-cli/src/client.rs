@@ -24,6 +24,18 @@ pub struct RpcOutcome {
     pub meta: TraceMeta,
 }
 
+/// RPC 參數的來源（Q-19 (b)）。
+///
+/// argv 衍生的值只可能含非 UTF-8 跳脫（`sw_proto::pyfmt::ESCAPE_MARK` 之後接偏移字元），送出前須攔截；
+/// 由檔案內容解析而來的值（`event add --file` 的 JSON）是合法資料，其中的 NUL 等碼位屬於正常內容，不得檢查。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParamOrigin {
+    /// 參數全部來自 argv（既有所有呼叫點）。
+    Argv,
+    /// 參數來自檔案內容（`event add --file`）。
+    Document,
+}
+
 /// NaN／<0／奈秒向上取整後達到 2**63 → InvalidTimeout；0 → NonBlocking；其他 → Blocking。
 pub fn sock_timeout(timeout_s: f64) -> Result<SockTimeout, ClientCrash> {
     const PYTIME_NS_LIMIT: f64 = 9_223_372_036_854_775_808.0; // 2**63
@@ -66,7 +78,27 @@ pub fn rpc_call_once(
     req_id: i64,
     timeout_s: f64,
 ) -> Result<(PyDict, Option<i64> /* errno */), ClientCrash> {
-    rpc_call_once_capped(
+    rpc_call_once_origin(
+        p,
+        endpoint,
+        method,
+        params,
+        req_id,
+        timeout_s,
+        ParamOrigin::Argv,
+    )
+}
+
+fn rpc_call_once_origin(
+    p: &sw_pal::ClientPlatform,
+    endpoint: &str,
+    method: &str,
+    params: &PyValue,
+    req_id: i64,
+    timeout_s: f64,
+    origin: ParamOrigin,
+) -> Result<(PyDict, Option<i64> /* errno */), ClientCrash> {
+    rpc_call_once_capped_origin(
         p,
         endpoint,
         method,
@@ -74,6 +106,7 @@ pub fn rpc_call_once(
         req_id,
         timeout_s,
         CLIENT_RESPONSE_MAX_BYTES,
+        origin,
     )
 }
 
@@ -126,6 +159,30 @@ pub fn rpc_call(
     timeout_s: f64,
     retries: &PyInt,
 ) -> Result<RpcOutcome, ClientCrash> {
+    rpc_call_origin(
+        p,
+        endpoint,
+        method,
+        params,
+        req_id,
+        timeout_s,
+        retries,
+        ParamOrigin::Argv,
+    )
+}
+
+/// [`rpc_call`] 的參數來源版本；`origin` 只決定送出前的非 UTF-8 攔截是否套用（見 [`ParamOrigin`]）。
+#[allow(clippy::too_many_arguments)]
+pub fn rpc_call_origin(
+    p: &sw_pal::ClientPlatform,
+    endpoint: &str,
+    method: &str,
+    params: &PyValue,
+    req_id: i64,
+    timeout_s: f64,
+    retries: &PyInt,
+    origin: ParamOrigin,
+) -> Result<RpcOutcome, ClientCrash> {
     let started_ns = p.clock.mono_ns();
     let attempts = attempt_limit(retries, RETRYABLE_READONLY_METHODS.contains(&method));
     let mut delay_s = RETRY_BACKOFF_BASE_S;
@@ -134,7 +191,8 @@ pub fn rpc_call(
     let mut response = PyDict::new();
 
     for attempt in 0..attempts {
-        let (current, errno) = rpc_call_once(p, endpoint, method, params, req_id, timeout_s)?;
+        let (current, errno) =
+            rpc_call_once_origin(p, endpoint, method, params, req_id, timeout_s, origin)?;
         response = current;
         last_errno = errno;
 
@@ -187,6 +245,29 @@ pub fn rpc_call_once_capped(
     timeout_s: f64,
     max_bytes: usize,
 ) -> Result<(PyDict, Option<i64>), ClientCrash> {
+    rpc_call_once_capped_origin(
+        p,
+        endpoint,
+        method,
+        params,
+        req_id,
+        timeout_s,
+        max_bytes,
+        ParamOrigin::Argv,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rpc_call_once_capped_origin(
+    p: &sw_pal::ClientPlatform,
+    endpoint: &str,
+    method: &str,
+    params: &PyValue,
+    req_id: i64,
+    timeout_s: f64,
+    max_bytes: usize,
+    origin: ParamOrigin,
+) -> Result<(PyDict, Option<i64>), ClientCrash> {
     let parsed = match parse_endpoint(endpoint) {
         Ok(parsed) => parsed,
         Err(error) => return Ok((failure(ErrorCode::InvalidEndpoint, Some(error.0)), None)),
@@ -236,8 +317,9 @@ pub fn rpc_call_once_capped(
         }
     };
 
-    // Q-19 (b)：參數含非 UTF-8 原文時，連線成功後、送出前以編碼錯誤結束（daemon 收到 0 筆請求行）。
-    if crate::argv::value_is_tainted(params) {
+    // Q-19 (b)：argv 衍生參數含非 UTF-8 原文時，連線成功後、送出前以編碼錯誤結束（daemon 收到 0 筆請求行）。
+    // 檔案內容來源（`ParamOrigin::Document`）不檢查：JSON 的 NUL 等碼位是合法內容。
+    if origin == ParamOrigin::Argv && crate::argv::value_is_tainted(params) {
         return Err(ClientCrash::EncodeError(
             crate::argv::NOT_UTF8_MESSAGE.to_string(),
         ));

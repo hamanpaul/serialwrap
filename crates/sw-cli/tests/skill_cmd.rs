@@ -103,5 +103,9 @@ fn skill_default_windows_outputs_skill_windows() {
     let ns = sw_cli::argparse::Namespace::default();
     let rc = run_skill(&mut ctx, &ns);
     assert_eq!(rc, 0);
-    assert_eq!(String::from_utf8(out).unwrap(), assets::SKILL_WINDOWS_MD);
+    // Q-05／Q-27：Windows 的 stdout 為 universal newline 模式，`\n` 寫成 `\r\n`，且不加額外換行。
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        assets::SKILL_WINDOWS_MD.replace('\n', "\r\n")
+    );
 }
