@@ -1,0 +1,22 @@
+{
+  "cancelled": {
+    "error_code": "EXCEPTION",
+    "message": "tx incomplete: not_submitted 0/23 cancelled",
+    "ok": false
+  },
+  "drain": {
+    "error_code": "EXCEPTION",
+    "message": "tx incomplete: not_submitted 0/23 draining",
+    "ok": false
+  },
+  "stale_generation": {
+    "error_code": "EXCEPTION",
+    "message": "tx incomplete: not_submitted 0/23 stale_generation",
+    "ok": false
+  },
+  "wal_unhealthy": {
+    "error_code": "EXCEPTION",
+    "message": "tx incomplete: not_submitted 0/23 wal_unhealthy",
+    "ok": false
+  }
+}

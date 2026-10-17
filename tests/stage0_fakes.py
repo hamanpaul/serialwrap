@@ -268,6 +268,7 @@ def make_service(
         session.bridge = bridge
         session.state = "READY"
         session.bridge_generation = 1
+        session._push_tx_gate(bridge)
         svc._arbiter.register_session(session.session_id)
 
     def wait_until_admitted(method: str, com: str, timeout: float = 1.0) -> None:

@@ -253,7 +253,11 @@ class SerialwrapService:
         # #154：daemon 啟動時算一次、常駐於 instance，避免每次 RPC 都重開 VERSION 檔案。
         self._version = resolve_version()
 
-        self._arbiter = CommandArbiter(self._send_cb, admission=self.admission)
+        self._arbiter = CommandArbiter(
+            self._send_cb,
+            admission=self.admission,
+            on_cancel=lambda cmd_id: self._sessions.revoke_tx_op(cmd_id),
+        )
         self._sessions = SessionManager(
             profiles,
             self._wal,

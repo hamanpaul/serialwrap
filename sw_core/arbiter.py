@@ -37,9 +37,18 @@ class _QueuedCommand:
 
 
 class CommandArbiter:
-    def __init__(self, send_cb: Callable[..., dict[str, Any]], *, admission: Any | None = None) -> None:
+    _worker_context = threading.local()
+
+    def __init__(
+        self,
+        send_cb: Callable[..., dict[str, Any]],
+        *,
+        admission: Any | None = None,
+        on_cancel: Callable[[str], None] | None = None,
+    ) -> None:
         self._send_cb = send_cb
         self._admission = admission
+        self._on_cancel = on_cancel
         self._lock = threading.Lock()
         self._queues: dict[str, queue.PriorityQueue[_QueuedCommand]] = {}
         self._threads: dict[str, threading.Thread] = {}
@@ -47,7 +56,39 @@ class CommandArbiter:
         self._commands: dict[str, dict[str, Any]] = {}
         self._admission_tickets: dict[str, Any] = {}
         self._running: dict[str, str] = {}
+        self._cancel_callbacks: dict[str, Callable[[str], None]] = {}
         self._counter = 0
+
+    @classmethod
+    def register_current_cancel_callback(
+        cls, cmd_id: str, callback: Callable[[str], None]
+    ) -> bool:
+        """讓 send callback 內的 manager 為目前 worker 命令登記取消撤銷器。"""
+        arbiter = getattr(cls._worker_context, "arbiter", None)
+        active_cmd_id = getattr(cls._worker_context, "cmd_id", None)
+        if arbiter is None or active_cmd_id != cmd_id:
+            return False
+        cancel_now = False
+        with arbiter._lock:
+            rec = arbiter._commands.get(cmd_id)
+            if rec is None:
+                return False
+            if rec.get("status") == "canceled" or rec.get("done_at"):
+                cancel_now = rec.get("status") == "canceled"
+            else:
+                arbiter._cancel_callbacks[cmd_id] = callback
+        if cancel_now:
+            callback(cmd_id)
+        return True
+
+    @classmethod
+    def unregister_current_cancel_callback(cls, cmd_id: str) -> None:
+        arbiter = getattr(cls._worker_context, "arbiter", None)
+        active_cmd_id = getattr(cls._worker_context, "cmd_id", None)
+        if arbiter is None or active_cmd_id != cmd_id:
+            return
+        with arbiter._lock:
+            arbiter._cancel_callbacks.pop(cmd_id, None)
 
     def register_session(self, session_id: str) -> None:
         with self._lock:
@@ -320,7 +361,10 @@ class CommandArbiter:
             if was_accepted:
                 self._finish_admission_locked(cmd_id)
             self._evict_commands_locked()  # 命令終結即收斂 history，不必等下一次 submit（Copilot 審查）
-            return {"ok": True, "cmd_id": cmd_id, "status": "canceled"}
+            callback = self._on_cancel or self._cancel_callbacks.get(cmd_id)
+        if callback is not None:
+            callback(cmd_id)
+        return {"ok": True, "cmd_id": cmd_id, "status": "canceled"}
 
     def _worker(self, session_id: str, pq: queue.PriorityQueue[_QueuedCommand], stop_event: threading.Event) -> None:
         while not stop_event.is_set():
@@ -355,7 +399,27 @@ class CommandArbiter:
                     options["completion_regex"] = item.completion_regex
                 if item.trusted_human:
                     options["trusted_human"] = True
-                result = self._send_cb(*args, **options)
+                previous_arbiter = getattr(self._worker_context, "arbiter", None)
+                previous_cmd_id = getattr(self._worker_context, "cmd_id", None)
+                self._worker_context.arbiter = self
+                self._worker_context.cmd_id = item.cmd_id
+                try:
+                    result = self._send_cb(*args, **options)
+                finally:
+                    if previous_arbiter is None:
+                        try:
+                            del self._worker_context.arbiter
+                        except AttributeError:
+                            pass
+                    else:
+                        self._worker_context.arbiter = previous_arbiter
+                    if previous_cmd_id is None:
+                        try:
+                            del self._worker_context.cmd_id
+                        except AttributeError:
+                            pass
+                    else:
+                        self._worker_context.cmd_id = previous_cmd_id
             except Exception:
                 with self._lock:
                     rec = self._commands.get(item.cmd_id)

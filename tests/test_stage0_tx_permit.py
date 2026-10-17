@@ -156,13 +156,37 @@ def _ready(
     mgr = make_manager(tmp_path, [profile or make_profile(by_id=BY_ID)])
     s = mgr.get_session("COM0")
     assert s is not None
+    from sw_core.device_watcher import DeviceInfo
+
     b, _wal = make_bridge(
         tmp_path,
         port=port,
         fd=fd,
         wal=mgr._wal,
-        on_rx_data=lambda data, sid=s.session_id: mgr._on_bridge_rx(sid, data),
+        on_rx_data=lambda data, wal_seq=None, sid=s.session_id: mgr._on_bridge_rx(
+            sid, data, wal_seq
+        ),
     )
+    # 這個 helper 代表已成功 attach 的 session。原替身未啟動 bridge、未登記
+    # discovery device，且直接呼叫 manager RX observer，會讓互動／self-test
+    # 在抵達 T20 提交點前就被錯誤拒絕或等不到 RX。以記憶體狀態補足 attach 成功條件。
+    mgr._devices[BY_ID] = DeviceInfo(by_id=BY_ID, real_path="fake-uart")
+    manager_rx = b._on_rx_data
+
+    def inject_rx(data: bytes, wal_seq: int | None = None) -> None:
+        b._append_rx_text(data)
+        if manager_rx is not None:
+            manager_rx(data, wal_seq=wal_seq)
+
+    b._on_rx_data = inject_rx
+    real_snapshot = b.snapshot
+
+    def snapshot_as_attached() -> dict[str, Any]:
+        snapshot = real_snapshot()
+        snapshot.update(running=True, serial_alive=True, vtty_alive=True, vtty="fake-vtty")
+        return snapshot
+
+    b.snapshot = snapshot_as_attached
     with mgr._lock:
         s.bridge = b
         s.state = state
@@ -212,9 +236,18 @@ def _spy_bridge(bridge: Any, monkeypatch: pytest.MonkeyPatch) -> _BridgeSpy:
         finally:
             spy.depth -= 1
 
-    def send(payload: bytes, *args: Any, **kwargs: Any) -> Any:
-        spy.sends.append((kwargs.get("source"), kwargs.get("permit"), spy.depth))
-        return orig_send(payload, *args, **kwargs)
+    def send(
+        payload: bytes,
+        *,
+        source: str,
+        cmd_id: str | None = None,
+        permit: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        spy.sends.append((source, permit, spy.depth))
+        return orig_send(
+            payload, source=source, cmd_id=cmd_id, permit=permit, **kwargs
+        )
 
     monkeypatch.setattr(bridge, "system_permit", sp)
     monkeypatch.setattr(bridge, "send_bytes", send)
@@ -240,7 +273,15 @@ def _always_eagain(fd: int, data: Any) -> int:
 
 
 def _login_profile(**extra: Any) -> Any:
-    return make_profile(by_id=BY_ID, user_env="SW_T20_USER", pass_env="SW_T20_PASS", **extra)
+    return make_profile(
+        by_id=BY_ID,
+        user_env="SW_T20_USER",
+        pass_env="SW_T20_PASS",
+        login_regex=r"(?mi)^login:\s*$",
+        password_regex=r"(?mi)^password:\s*$",
+        timeout_s=0.1,
+        **extra,
+    )
 
 
 def _login_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -284,6 +325,29 @@ def test_quiet_armed_after_dequeue_before_write_zero_tx(tmp_path: Path) -> None:
     assert _tx_records(mgr._wal) == []
     assert res.get("ok") is False
     assert res.get("error_code") in {"AUTOBOOT_QUIET", "FLUSHED_BY_RECOVERY"}
+
+
+@pytest.mark.parametrize("outcome,confirmed", [("completed", 2), ("unknown", 0)])
+def test_reboot_write_uncertain_arms_quiet_before_return(
+    tmp_path: Path, outcome: str, confirmed: int
+) -> None:
+    requested = len(b"reboot\n")
+    port = FakePort(write_results=[_tx_result(outcome, confirmed, requested, "driver_error")])
+    mgr, session, bridge = _ready(tmp_path, port)
+
+    with pytest.raises(_incomplete_error()):
+        mgr._handle_reboot_command(
+            session,
+            bridge,
+            command="reboot",
+            source="agent:test",
+            cmd_id="reboot-uncertain",
+            timeout_s=0.1,
+            execution_mode="line",
+        )
+
+    assert session.boot_quiet_active()
+    assert bridge._gate_quiet is True
 
 
 def test_quiet_armed_by_other_thread_after_authorize_before_submit_zero_tx(tmp_path: Path) -> None:
@@ -514,6 +578,7 @@ def test_begin_drain_fence_acquire_bounded_and_freezes_tail(tmp_path: Path) -> N
     port = FakePort(block=gate, block_in_guard=True)
     b, wal = make_bridge(tmp_path, port=port)
     b.set_tx_gate(generation=4, quiet=False, lease_owner=None)
+    owner_gen = b.owner_gen
     ta, abox = _spawn(b.send_bytes, b"abc", source="agent:a", cmd_id="a", permit=_permit("a", 4, "agent"))
     _wait_until(lambda: port.writes == [b"abc"])
     tb, bbox = _spawn(b.send_bytes, b"def", source="agent:b", cmd_id="b", permit=_permit("b", 4, "agent"))
@@ -532,6 +597,7 @@ def test_begin_drain_fence_acquire_bounded_and_freezes_tail(tmp_path: Path) -> N
     bres = _outcome(bbox)
     assert bres.outcome == "not_submitted"
     assert bres.error in ("draining", "cancelled")
+    _wait_until(lambda: b.owner_gen == owner_gen + 1)
     assert port.writes == [b"abc"]
     assert len(_tx_records(wal)) == 1
     rec = b.finish_drain(1.0)
@@ -549,6 +615,7 @@ def test_pyserial_chunked_write_drain_stops_after_inflight_chunk(tmp_path: Path)
     class _FakeSer:
         def __init__(self) -> None:
             self.cancel_calls = 0
+            self.is_open = True
 
         def write(self, data: bytes) -> int:
             calls.append(bytes(data))
@@ -577,7 +644,44 @@ def test_pyserial_chunked_write_drain_stops_after_inflight_chunk(tmp_path: Path)
     assert res.outcome == "completed"
     assert res.confirmed == 64 and res.requested == 130
     assert res.error in ("revoked:draining", "cancelled")
+    assert _load("sw_core.serial_port", "PYSERIAL_SUBMIT_CHUNK") == 64
     assert len(calls) == 1  # 後兩段永不交 OS
+
+
+def test_pyserial_partial_cancel_keeps_cancelled_reason() -> None:
+    sp_cls = _load("sw_core.serial_port", "_PySerialPort")
+    cancel = threading.Event()
+    calls: list[bytes] = []
+
+    class _FakeSer:
+        is_open = True
+
+        def write(self, data: bytes) -> int:
+            calls.append(bytes(data))
+            cancel.set()
+            return len(data)
+
+    port = sp_cls("COM0", _load("sw_core.config", "UartProfile")())
+    port._ser = _FakeSer()
+    result = port.write(b"x" * 100, cancel=cancel)
+    chunk = _load("sw_core.serial_port", "PYSERIAL_SUBMIT_CHUNK")
+    assert result == _tx_result("completed", chunk, 100, "cancelled")
+    assert calls == [b"x" * chunk]
+
+
+def test_posix_partial_cancel_keeps_cancelled_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    cancel = threading.Event()
+    calls: list[bytes] = []
+
+    def write(_fd: int, payload: Any) -> int:
+        calls.append(bytes(payload))
+        cancel.set()
+        return 2
+
+    monkeypatch.setattr(uio.os, "write", write)
+    result = _load("sw_core.serial_port", "_posix_write_all")(7, b"abcdef", cancel)
+    assert result == _tx_result("completed", 2, 6, "cancelled")
+    assert calls == [b"abcdef"]
 
 
 def test_release_after_dequeue_before_write_zero_tx(tmp_path: Path) -> None:
@@ -640,6 +744,57 @@ def test_cancel_after_dequeue_before_write_zero_tx(tmp_path: Path) -> None:
     assert arb._commands[cmd_id]["status"] == "canceled"
 
 
+@pytest.mark.parametrize("mode", ["line", "interactive"])
+def test_cancel_between_dequeue_and_manager_registration_zero_tx(
+    tmp_path: Path, mode: str
+) -> None:
+    port = FakePort()
+    mgr, s, _bridge = _ready(tmp_path, port)
+    arb_cls = _load("sw_core.arbiter", "CommandArbiter")
+    dequeued = threading.Event()
+    continue_worker = threading.Event()
+
+    def send_cb(
+        session_id: str,
+        command: str,
+        source: str,
+        cmd_id: str,
+        timeout_s: float,
+        run_mode: str,
+        expected_duration_s: float | None = None,
+        completion_regex: str | None = None,
+    ) -> dict[str, Any]:
+        dequeued.set()
+        assert continue_worker.wait(2.0)
+        return mgr.execute_command(
+            session_id,
+            command,
+            source,
+            cmd_id,
+            timeout_s=timeout_s,
+            mode=run_mode,
+            expected_duration_s=expected_duration_s,
+            completion_regex=completion_regex,
+        )
+
+    arb = arb_cls(send_cb)
+    arb.register_session(s.session_id)
+    cmd_id = arb.submit(
+        session_id=s.session_id,
+        command="echo hi",
+        source="agent:x",
+        mode=mode,
+        timeout_s=0.1,
+    )["cmd_id"]
+    assert dequeued.wait(1.0)
+    assert arb.cancel(cmd_id)["status"] == "canceled"
+    continue_worker.set()
+    _wait_until(lambda: arb._running.get(s.session_id) is None)
+    assert port.writes == []
+    assert _tx_records(mgr._wal) == []
+    assert arb._commands[cmd_id]["status"] == "canceled"
+
+
 def test_lease_switch_before_write_zero_tx(tmp_path: Path) -> None:
     port = FakePort()
     mgr, s, b = _ready(tmp_path, port)
@@ -653,6 +808,23 @@ def test_lease_switch_before_write_zero_tx(tmp_path: Path) -> None:
     ret = box["ret"]
     assert ret["ok"] is False
     assert ret["error_code"] in {"INTERACTIVE_EXPIRED", "SESSION_BUSY"}
+    assert port.writes == []
+    assert _tx_records(mgr._wal) == []
+
+
+def test_interactive_open_command_expired_before_submit_zero_tx(tmp_path: Path) -> None:
+    port = FakePort()
+    mgr, s, b = _ready(tmp_path, port)
+    b._after_tx_authorize = lambda: mgr._expire_interactive_leases_tick(
+        now=time.monotonic() + 1.0
+    )
+
+    result = mgr.interactive_open(
+        "COM0", owner="agent:x", timeout_s=0.1, command="echo hi"
+    )
+
+    assert result == {"ok": False, "error_code": "INTERACTIVE_EXPIRED"}
+    assert s.interactive_session_id is None
     assert port.writes == []
     assert _tx_records(mgr._wal) == []
 
@@ -799,6 +971,14 @@ def test_stale_generation_permit_rejected(tmp_path: Path) -> None:
     assert _tx_records(mgr._wal) == []
 
 
+def test_bare_bridges_do_not_share_revoked_operation_history() -> None:
+    first = uio.UARTBridge.__new__(uio.UARTBridge)
+    second = uio.UARTBridge.__new__(uio.UARTBridge)
+    first._revoke_ops_locked(["cmd-one"])
+    assert "cmd-one" in first._revoked_ops
+    assert "cmd-one" not in (getattr(second, "_revoked_ops", None) or {})
+
+
 # ---------------------------------------------------------------------------
 # B. raw／replay、ok 路徑不變、permit=None 白名單
 # ---------------------------------------------------------------------------
@@ -837,39 +1017,94 @@ def test_permit_ok_path_unchanged(tmp_path: Path) -> None:
     assert port.writes == [ECHO, b"replay"]
 
 
-def test_permit_none_only_for_listed_internal_callers() -> None:
-    root = REPO / "sw_core"
-    allowed = {("uart_io.py", "flash_tx"), ("uart_io.py", "send_secret")}
+def _unpermitted_send_bytes_calls(tree: ast.AST) -> tuple[dict[str, int], dict[str, int]]:
+    """列出未傳 permit 或明確傳入 None 的 send_bytes 呼叫。"""
+    missing: dict[str, int] = {}
+    explicit_none: dict[str, int] = {}
 
     class _Visitor(ast.NodeVisitor):
-        def __init__(self, fname: str) -> None:
-            self.fname = fname
-            self.stack: list[str] = []
-            self.found: set[tuple[str, str]] = set()
+        def __init__(self) -> None:
+            self.functions: list[str] = []
+            self.aliases: list[set[str]] = []
 
         def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-            self.stack.append(node.name)
+            self.functions.append(node.name)
+            self.aliases.append(set())
             self.generic_visit(node)
-            self.stack.pop()
+            self.aliases.pop()
+            self.functions.pop()
 
         visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
 
-        def visit_Call(self, node: ast.Call) -> None:
-            if (
-                isinstance(node.func, ast.Attribute)
-                and node.func.attr == "send_bytes"
-                and not any(kw.arg == "permit" for kw in node.keywords)
+        def _record_alias(self, targets: list[ast.expr], value: ast.expr) -> None:
+            if not self.aliases or not (
+                isinstance(value, ast.Attribute) and value.attr == "send_bytes"
             ):
-                self.found.add((self.fname, self.stack[-1] if self.stack else "<module>"))
+                return
+            self.aliases[-1].update(
+                target.id for target in targets if isinstance(target, ast.Name)
+            )
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            self._record_alias(node.targets, node.value)
             self.generic_visit(node)
 
-    found: set[tuple[str, str]] = set()
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+            if node.value is not None:
+                self._record_alias([node.target], node.value)
+            self.generic_visit(node)
+
+        def visit_Call(self, node: ast.Call) -> None:
+            direct = isinstance(node.func, ast.Attribute) and node.func.attr == "send_bytes"
+            alias = isinstance(node.func, ast.Name) and any(
+                node.func.id in names for names in self.aliases
+            )
+            if direct or alias:
+                function = self.functions[-1] if self.functions else "<module>"
+                permit = next((kw.value for kw in node.keywords if kw.arg == "permit"), None)
+                if permit is None:
+                    missing[function] = missing.get(function, 0) + 1
+                elif isinstance(permit, ast.Constant) and permit.value is None:
+                    explicit_none[function] = explicit_none.get(function, 0) + 1
+            self.generic_visit(node)
+
+    _Visitor().visit(tree)
+    return missing, explicit_none
+
+
+def test_permit_none_only_for_listed_internal_callers() -> None:
+    root = REPO / "sw_core"
+    # 僅相容 adapter 可在舊版測試替身不接受 permit 關鍵字時省略它；
+    # 實際 UARTBridge 路徑一律傳 permit。flash pump 與 send_secret 是規格明列例外。
+    allowed_missing = {
+        ("uart_io.py", "_send_bytes_with_permit"): 3,
+        ("uart_io.py", "flash_tx"): 1,
+        ("uart_io.py", "send_secret"): 1,
+        ("session_manager.py", "_send_bytes_with_permit"): 2,
+    }
+    found: dict[tuple[str, str], int] = {}
+    explicit_none: dict[tuple[str, str], int] = {}
     for path in sorted(root.glob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        visitor = _Visitor(path.name)
-        visitor.visit(tree)
-        found |= visitor.found
-    assert found == allowed, f"permit=None 的 send_bytes 呼叫點應只剩 {sorted(allowed)}，實際 {sorted(found)}"
+        missing, none_calls = _unpermitted_send_bytes_calls(tree)
+        found.update({(path.name, name): count for name, count in missing.items()})
+        explicit_none.update({(path.name, name): count for name, count in none_calls.items()})
+    assert found == allowed_missing, f"未傳 permit 的 send_bytes 呼叫點超出相容白名單：{found}"
+    assert explicit_none == {}, f"不得明確使用 permit=None：{explicit_none}"
+
+
+def test_permit_none_guard_detects_aliases_and_explicit_none() -> None:
+    tree = ast.parse(
+        """\
+def send_via_alias(bridge):
+    write = bridge.send_bytes
+    write(b'alias')
+    bridge.send_bytes(b'none', permit=None)
+"""
+    )
+    missing, explicit_none = _unpermitted_send_bytes_calls(tree)
+    assert missing == {"send_via_alias": 1}
+    assert explicit_none == {"send_via_alias": 1}
 
 
 # ---------------------------------------------------------------------------
@@ -921,9 +1156,143 @@ def test_attach_probe_banner_after_precheck_sends_no_login_bytes(tmp_path: Path,
     assert s.ready_reconfirm_pending is True
 
 
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_attach_bridge_quiet_updates_first_attach_permit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dynamic: bool
+) -> None:
+    from sw_core.config import ProfileTemplate
+    from sw_core.device_watcher import DeviceInfo
+    from sw_core.session_manager import SessionManager
+    from sw_core.wal import WalWriter
+
+    monkeypatch.setenv("SW_ATTACH_USER", "root")
+    monkeypatch.setenv("SW_ATTACH_PASS", "secret")
+    port = FakePort()
+    monkeypatch.setattr(uio, "open_serial_port", lambda *_args, **_kwargs: port)
+
+    def start_without_reader(bridge: Any) -> None:
+        bridge._serial = bridge._preopened_port
+        bridge._serial_fd = None
+
+    monkeypatch.setattr(uio.UARTBridge, "start", start_without_reader)
+
+    def banner_then_probe(bridge: Any, _profile: Any, *, auth: Any = None) -> tuple[bool, str | None]:
+        bridge._on_rx_data(BANNER)
+        bridge.send_command("", source="system")
+        return True, None
+
+    monkeypatch.setattr("sw_core.session_manager.ensure_ready", banner_then_probe)
+
+    if dynamic:
+        template = ProfileTemplate(
+            profile_name="attach-template",
+            username="root",
+            user_env="SW_ATTACH_USER",
+            pass_env="SW_ATTACH_PASS",
+        )
+        mgr = SessionManager(
+            [],
+            WalWriter(wal_dir=str(tmp_path / "wal")),
+            templates=[template],
+            on_ready=lambda _sid: None,
+            on_detached=lambda _sid: None,
+            state_path=str(tmp_path / "state.json"),
+        )
+        mgr._profile_pins[BY_ID] = template.profile_name
+    else:
+        profile = make_profile(by_id=BY_ID, user_env="SW_ATTACH_USER", pass_env="SW_ATTACH_PASS")
+        mgr = make_manager(tmp_path, [profile])
+
+    mgr._devices[BY_ID] = DeviceInfo(by_id=BY_ID, real_path="fake-uart")
+    mgr._attach_by_id(BY_ID)
+
+    session = next(iter(mgr._sessions.values()))
+    assert port.writes == []
+    assert _tx_records(mgr._wal) == []
+    assert session.bridge is not None
+    assert session.bridge._gate_probe_quiet_until == session.boot_quiet_until
+    assert session.state == "ATTACHED"
+    session.bridge.stop()
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("credentials", ["none", "unresolved"])
+def test_attach_probe_failure_keeps_manual_login_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dynamic: bool,
+    credentials: str,
+) -> None:
+    from sw_core.config import ProfileTemplate
+    from sw_core.device_watcher import DeviceInfo
+    from sw_core.session_manager import SessionManager
+    from sw_core.wal import WalWriter
+
+    port = FakePort()
+    monkeypatch.setattr(uio, "open_serial_port", lambda *_args, **_kwargs: port)
+
+    def start_without_reader(bridge: Any) -> None:
+        bridge._serial = bridge._preopened_port
+        bridge._serial_fd = None
+
+    monkeypatch.setattr(uio.UARTBridge, "start", start_without_reader)
+    probes: list[str] = []
+
+    def failed_probe(_bridge: Any, _profile: Any) -> tuple[bool, str]:
+        probes.append("probe")
+        return False, "PROMPT_UNAVAILABLE"
+
+    def unexpected_login(*_args: Any, **_kwargs: Any) -> tuple[bool, str]:
+        raise AssertionError("沒有可用帳密時不應呼叫 ensure_ready")
+
+    monkeypatch.setattr("sw_core.session_manager.probe_ready", failed_probe)
+    monkeypatch.setattr("sw_core.session_manager.ensure_ready", unexpected_login)
+
+    env_file = str(tmp_path / "missing.env") if credentials == "unresolved" else None
+    if dynamic:
+        template = ProfileTemplate(
+            profile_name="attach-template",
+            user_env="SW_ATTACH_USER" if env_file else None,
+            pass_env="SW_ATTACH_PASS" if env_file else None,
+            env_file=env_file,
+        )
+        mgr = SessionManager(
+            [],
+            WalWriter(wal_dir=str(tmp_path / "wal")),
+            templates=[template],
+            on_ready=lambda _sid: None,
+            on_detached=lambda _sid: None,
+            state_path=str(tmp_path / "state.json"),
+        )
+        mgr._profile_pins[BY_ID] = template.profile_name
+    else:
+        profile = make_profile(
+            by_id=BY_ID,
+            user_env="SW_ATTACH_USER" if env_file else None,
+            pass_env="SW_ATTACH_PASS" if env_file else None,
+            env_file=env_file,
+        )
+        mgr = make_manager(tmp_path, [profile])
+
+    mgr._devices[BY_ID] = DeviceInfo(by_id=BY_ID, real_path="fake-uart")
+    mgr._attach_by_id(BY_ID)
+
+    session = next(iter(mgr._sessions.values()))
+    assert session.state == "ATTACHED"
+    assert session.bridge is not None
+    if credentials == "unresolved":
+        assert session.last_error == "CREDENTIALS_UNRESOLVED"
+        assert probes == []
+    else:
+        assert session.last_error == "PROMPT_UNAVAILABLE"
+        assert probes == ["probe"]
+    assert port.writes == []
+    session.bridge.stop()
+
+
 def test_password_not_sent_when_quiet_arms_before_secret_submit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _login_env(monkeypatch)
-    scripts = {b"\n": b"login: ", b"root\n": b"Password: "}
+    scripts = {b"\n": b"login: ", b"root\n": b"\r\nPassword: "}
     holder: dict[str, Any] = {}
 
     def on_write(data: bytes) -> None:
@@ -1113,9 +1482,16 @@ def test_implicit_system_source_without_permit_still_quiet_gated(tmp_path: Path)
     assert port.writes == [b"f"]
 
 
-def test_recover_key_quiet_armed_after_precheck_zero_tx(tmp_path: Path) -> None:
+@pytest.mark.parametrize("console_unlock", [False, True])
+def test_recover_key_quiet_armed_after_precheck_zero_tx(
+    tmp_path: Path, console_unlock: bool
+) -> None:
     port = FakePort()
-    mgr, s, b = _ready(tmp_path, port, state="READY")
+    profile = make_profile(
+        by_id=BY_ID,
+        console_unlock_env="SW_RECOVER_UNLOCK" if console_unlock else None,
+    )
+    mgr, s, b = _ready(tmp_path, port, profile=profile, state="READY")
     pause = _Pause(b)
     t, box = _spawn(
         mgr._recover_after_failure,
@@ -1147,9 +1523,9 @@ def test_login_fsm_sends_all_carry_system_probe_permit(tmp_path: Path, monkeypat
         if data == b"\n":
             bb._on_rx_data(b"login: ")
         elif data == b"root\n":
-            bb._on_rx_data(b"Password: ")
+            bb._on_rx_data(b"\r\nPassword: ")
         elif data == b"s3cret\n":
-            bb._on_rx_data(b"root@prplOS:/# ")
+            bb._on_rx_data(b"\r\nroot@prplOS:/# ")
         elif data.startswith(b"echo __READY__"):
             nonce = data[len(b"echo __READY__") :].strip()
             bb._on_rx_data(b"__READY__" + nonce + b"\r\nroot@prplOS:/# ")
@@ -1158,12 +1534,17 @@ def test_login_fsm_sends_all_carry_system_probe_permit(tmp_path: Path, monkeypat
     mgr, s, b = _ready(tmp_path, port, profile=_login_profile(), state="ATTACHED")
     holder["b"] = b
     spy = _spy_bridge(b, monkeypatch)
-    # 範圍：attach ensure_ready（login＋password＋nonce）與 probe_ready（READY 再確認）、recover 按鍵。
-    # console unlock、reprobe 引擎、reboot recovery 三條腿尚未腳本化（見報告）。
     mgr._probe_existing_bridge(s, b)
     assert s.state == "READY"
+    attach_permits = list(spy.permits)
+    assert attach_permits
+    assert {p.login_gen for p in attach_permits} == {1}
     s.ready_reconfirm_pending = True
     mgr._probe_existing_bridge(s, b)
+    reconfirm_permits = spy.permits[len(attach_permits):]
+    assert reconfirm_permits
+    assert len({p.login_gen for p in reconfirm_permits}) == 1
+    assert min(p.login_gen for p in reconfirm_permits) > max(p.login_gen for p in attach_permits)
     mgr._recover_after_failure(
         s,
         b,
@@ -1176,7 +1557,7 @@ def test_login_fsm_sends_all_carry_system_probe_permit(tmp_path: Path, monkeypat
     )
     assert spy.permits, "system_permit 未被使用"
     assert all(p.tx_class == "system_probe" for p in spy.permits)
-    assert len({p.login_gen for p in spy.permits}) >= 2  # attach run 與 probe_ready run 各自一個世代
+    assert len(attach_permits) + len(reconfirm_permits) == len(spy.permits)
     for source, permit_kw, depth in spy.sends:
         if source in ("system", "system:secret"):
             assert depth > 0, f"{source} 送出時未處於 system_permit 內"
@@ -1187,20 +1568,145 @@ def test_login_fsm_sends_all_carry_system_probe_permit(tmp_path: Path, monkeypat
             assert permit_kw.login_gen is None
 
 
+def test_console_unlock_login_uses_system_probe_permit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SW_T20_UNLOCK", "unlock-secret")
+    holder: dict[str, Any] = {}
+
+    def script(data: bytes) -> None:
+        bridge = holder["b"]
+        if data == b"\n":
+            bridge._on_rx_data(b"root@prplOS:/# ")
+        elif data.startswith(b"echo __READY__"):
+            nonce = data[len(b"echo __READY__"):].strip()
+            bridge._on_rx_data(b"__READY__" + nonce + b"\r\nroot@prplOS:/# ")
+
+    profile = make_profile(
+        by_id=BY_ID,
+        console_unlock_env="SW_T20_UNLOCK",
+        console_unlock_idle_s=0.0,
+    )
+    port = FakePort(on_write=script)
+    mgr, session, bridge = _ready(tmp_path, port, profile=profile, state="ATTACHED")
+    holder["b"] = bridge
+    spy = _spy_bridge(bridge, monkeypatch)
+
+    mgr._probe_existing_bridge(session, bridge)
+
+    assert session.state == "READY"
+    assert spy.permits
+    assert len({permit.login_gen for permit in spy.permits}) == 1
+    assert all(permit.tx_class == "system_probe" for permit in spy.permits)
+    assert [call[0] for call in spy.sends].count("system") >= 2
+
+
+def test_reprobe_worker_login_uses_system_probe_permit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _login_env(monkeypatch)
+    holder: dict[str, Any] = {}
+
+    def script(data: bytes) -> None:
+        bridge = holder["b"]
+        if data == b"\n":
+            bridge._on_rx_data(b"login: ")
+        elif data == b"root\n":
+            bridge._on_rx_data(b"\r\nPassword: ")
+        elif data == b"s3cret\n":
+            bridge._on_rx_data(b"\r\nroot@prplOS:/# ")
+        elif data.startswith(b"echo __READY__"):
+            nonce = data[len(b"echo __READY__"):].strip()
+            bridge._on_rx_data(b"__READY__" + nonce + b"\r\nroot@prplOS:/# ")
+
+    port = FakePort(on_write=script)
+    mgr, session, bridge = _ready(
+        tmp_path, port, profile=_login_profile(), state="ATTACHED"
+    )
+    holder["b"] = bridge
+    session.last_error = "PROMPT_UNAVAILABLE"
+    spy = _spy_bridge(bridge, monkeypatch)
+
+    mgr._spawn_reprobe_probe(session.session_id, bridge)
+    mgr.join_reprobe_workers(timeout=2.0)
+
+    assert session.state == "READY"
+    assert spy.permits
+    assert len({permit.login_gen for permit in spy.permits}) == 1
+    assert all(permit.tx_class == "system_probe" for permit in spy.permits)
+
+
+def test_reboot_recovery_login_uses_system_probe_permit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _login_env(monkeypatch)
+    holder: dict[str, Any] = {}
+
+    def script(data: bytes) -> None:
+        bridge = holder["b"]
+        if data == b"\n":
+            bridge._on_rx_data(b"login: ")
+        elif data == b"root\n":
+            bridge._on_rx_data(b"\r\nPassword: ")
+        elif data == b"s3cret\n":
+            bridge._on_rx_data(b"\r\nroot@prplOS:/# ")
+        elif data.startswith(b"echo __READY__"):
+            nonce = data[len(b"echo __READY__"):].strip()
+            bridge._on_rx_data(b"__READY__" + nonce + b"\r\nroot@prplOS:/# ")
+
+    port = FakePort(on_write=script)
+    mgr, session, bridge = _ready(
+        tmp_path, port, profile=_login_profile(), state="RECOVERING"
+    )
+    holder["b"] = bridge
+    session.recovering = True
+    spy = _spy_bridge(bridge, monkeypatch)
+
+    mgr._spawn_reboot_recovery(session.session_id, timeout_s=2.0)
+    _wait_until(lambda: session.state == "READY" and not session.recovering, timeout=2.0)
+
+    assert spy.permits
+    assert len({permit.login_gen for permit in spy.permits}) == 1
+    assert all(permit.tx_class == "system_probe" for permit in spy.permits)
+
+
 # ---------------------------------------------------------------------------
 # D. session.self_test 的 nonce probe（R5-F2，DF-19）
 # ---------------------------------------------------------------------------
 
 
 def test_self_test_probe_other_reject_golden(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio
+
+    from sw_core.daemon import make_rpc_handler
+    from sw_core.device_watcher import DeviceInfo
+    from sw_core.rpc_posix import serve_connection
+    from stage0_fakes import make_service
+
     observed: dict[str, Any] = {}
     for case in ("drain", "stale_generation", "cancelled", "wal_unhealthy"):
         sub = tmp_path / case
         sub.mkdir()
         holder: dict[str, Any] = {}
         port = FakePort(on_write=_nonce_responder(holder))
-        mgr, s, b = _ready(sub, port, state="READY")
+        service = make_service(sub, ready=["COM0"], port=port)
+        mgr = service._sessions
+        s = mgr.get_session("COM0")
+        assert s is not None
+        b = s.bridge
+        assert b is not None
+        by_id = s.profile.device_by_id
+        mgr._devices[by_id] = DeviceInfo(by_id=by_id, real_path="fake-uart")
+        s.attached_real_path = "fake-uart"
         holder["b"] = b
+        real_snapshot = b.snapshot
+
+        def snapshot_as_attached(_snapshot: Any = real_snapshot) -> dict[str, Any]:
+            snapshot = _snapshot()
+            snapshot.update(running=True, serial_alive=True, vtty_alive=True, vtty="fake-vtty")
+            return snapshot
+
+        b.snapshot = snapshot_as_attached
         probes: list[Any] = []
         waits: list[int] = []
         orig_permit = mgr._self_test_permit_locked
@@ -1227,19 +1733,46 @@ def test_self_test_probe_other_reject_golden(tmp_path: Path, monkeypatch: pytest
             elif _case == "cancelled":
                 _b.revoke_ops([_probes[-1].op_id])
             else:
-                _mgr._wal.unhealthy = True
+                _mgr._wal._unhealthy = True
 
         b._after_tx_authorize = hook
-        try:
-            r = mgr.self_test("COM0", timeout_s=0.3)
-            code = r.get("error_code")
-            ok = bool(r.get("ok"))
-        except Exception as exc:  # noqa: BLE001 — WAL unhealthy 等例外穿出 manager 時記錄其型別
-            code = type(exc).__name__
-            ok = False
+
+        class MemoryWriter:
+            def __init__(self) -> None:
+                self.data = bytearray()
+
+            def write(self, data: bytes) -> None:
+                self.data.extend(data)
+
+            async def drain(self) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
+            async def wait_closed(self) -> None:
+                return None
+
+        writer = MemoryWriter()
+        request = {"id": 1, "method": "session.self_test", "params": {"selector": "COM0", "timeout_s": 0.3}}
+        handler = make_rpc_handler(service, lambda: None)
+
+        async def serve() -> None:
+            reader = asyncio.StreamReader()
+            reader.feed_data(json.dumps(request).encode("utf-8") + b"\n")
+            reader.feed_eof()
+            await serve_connection(reader, writer, handler, set())
+
+        asyncio.run(serve())
+        response = json.loads(writer.data.decode("utf-8").splitlines()[0])
         assert waits == [], f"{case}：零 TX 時不得等待 nonce"
         assert port.writes == [], f"{case}：不得有 TX"
-        observed[case] = {"error_code": code, "ok": ok}
+        assert response["id"] == 1
+        observed[case] = {
+            "error_code": response.get("error_code"),
+            "message": response.get("message"),
+            "ok": bool(response.get("ok")),
+        }
 
     if os.environ.get("SW_REGEN_GOLDEN") == "1":
         GOLDEN.parent.mkdir(parents=True, exist_ok=True)

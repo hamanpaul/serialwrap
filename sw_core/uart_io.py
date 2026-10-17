@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+import contextlib
 import dataclasses
 import errno
 import inspect
@@ -12,7 +13,7 @@ import socket
 import threading
 import time
 import uuid
-from typing import Any, Callable
+from typing import Any, Callable, Iterator, Literal
 
 from .config import UartProfile
 from . import constants as _constants
@@ -35,6 +36,19 @@ _RX_WINDOW_MAX_ENTRIES = 4096
 AUTO_TX_SOURCES: frozenset[str] = frozenset({"system"})
 
 
+@dataclasses.dataclass(frozen=True)
+class TxPermit:
+    """單次 TX 的不可變提交授權；欄位由建立操作時的 session 快照提供。"""
+
+    op_id: str
+    bridge_generation: int
+    tx_class: Literal[
+        "agent", "interactive", "human_line", "human_raw", "system_probe", "self_test_probe"
+    ]
+    owner_gen: int | None = None
+    login_gen: int | None = None
+
+
 def open_serial_port(
     device_path: str,
     profile: UartProfile,
@@ -46,6 +60,7 @@ def open_serial_port(
 _TX_ACCOUNT_MAX = 512
 _PORT_WRITE_CANCEL_CACHE: dict[type, bool] = {}
 _PORT_WRITE_CANCEL_CACHE_LOCK = threading.Lock()
+_PORT_WRITE_GUARD_CACHE: dict[type, bool] = {}
 
 
 def _port_write_accepts_cancel(port: SerialPort) -> bool:
@@ -72,6 +87,40 @@ def _port_write_accepts_cancel(port: SerialPort) -> bool:
         return accepts_cancel
 
 
+def _port_write_accepts_submit_guard(port: SerialPort) -> bool:
+    """依 port 型別快取 write 是否接受每段提交 guard。"""
+    instance_write = getattr(port, "__dict__", {}).get("write")
+    if instance_write is not None:
+        try:
+            signature = inspect.signature(instance_write)
+        except (TypeError, ValueError):
+            return False
+        return "submit_guard" in signature.parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+    port_type = type(port)
+    with _PORT_WRITE_CANCEL_CACHE_LOCK:
+        cached = _PORT_WRITE_GUARD_CACHE.get(port_type)
+        if cached is not None:
+            return cached
+        try:
+            signature = inspect.signature(port.write)
+        except (TypeError, ValueError):
+            accepts_guard = False
+        else:
+            accepts_guard = any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in signature.parameters.values()
+            ) or (
+                (parameter := signature.parameters.get("submit_guard")) is not None
+                and parameter.kind
+                in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+            )
+        _PORT_WRITE_GUARD_CACHE[port_type] = accepts_guard
+        return accepts_guard
+
+
 def _callback_accepts_keyword(callback: Callable[..., Any], keyword: str) -> bool:
     """檢查 callback 是否能接收指定關鍵字。"""
     try:
@@ -83,6 +132,19 @@ def _callback_accepts_keyword(callback: Callable[..., Any], keyword: str) -> boo
         for parameter in signature.parameters.values()
     ):
         return True
+    parameter = signature.parameters.get(keyword)
+    return parameter is not None and parameter.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
+
+
+def _callback_declares_keyword(callback: Callable[..., Any], keyword: str) -> bool:
+    """確認 callback 的明確簽章有宣告關鍵字參數。"""
+    try:
+        signature = inspect.signature(callback)
+    except (TypeError, ValueError):
+        return False
     parameter = signature.parameters.get(keyword)
     return parameter is not None and parameter.kind in (
         inspect.Parameter.POSITIONAL_OR_KEYWORD,
@@ -194,6 +256,9 @@ class UARTBridge:
       與 WAL append，並重入 `send_bytes`。任何「持 `_state_lock` 後再取 `_write_lock`」
       都會形成 AB-BA 死鎖——維持單向是 #69 gate 原子性與雙執行緒安全的前提。需要在持鎖後送
       資料者（如 resume_interactive flush）一律先**釋放** `_state_lock` 再呼 `send_bytes`。
+    - 授權提交鎖序為 `_state_lock → _tx_fence_lock`；失效 gate 更新與每次 OS write 在
+      `_tx_fence_lock` 內線性化。持有 `_tx_fence_lock` 時不得取得 `_state_lock`，也不得
+      呼叫 manager 或執行 WAL 寫入；鎖只跨單次 OS 提交，不跨 EAGAIN／完成等待。
     - reader 執行緒模型：POSIX 為**單一** `_loop`，以 select() 同時多工序列埠 fd 與 human
       console PTY master fd。Windows（`_pty_available()` 為 False）為**兩條**執行緒——`_loop`
       做序列埠阻塞讀、`_console_loop` 以 socket select() 收 TCP console；兩者並發存取 `_clients`
@@ -207,6 +272,13 @@ class UARTBridge:
 
     # class 預設供既有以 __new__ 建立的測試替身讀取；正式 bridge 會在 __init__ 覆寫。
     _drain_deadline = float("inf")
+    _gate_generation = 0
+    _gate_quiet = False
+    _gate_lease_owner: str | None = None
+    _gate_probe_quiet_until = 0.0
+    _gate_self_test_quiet_until = 0.0
+    _gate_login_gen_floor = 0
+    _revoked_ops: collections.OrderedDict[str, None] | None = None
 
     def __init__(
         self,
@@ -242,10 +314,19 @@ class UARTBridge:
         self._thread: threading.Thread | None = None
         self._write_lock = threading.RLock()
         self._state_lock = threading.RLock()
+        self._tx_fence_lock = threading.Lock()
         self._lifecycle_lock = threading.Lock()
         self._start_lock = threading.Lock()
         self._tx_cancel = threading.Event()
         self._tx_frozen = False
+        self._gate_generation = 0
+        self._gate_quiet = False
+        self._gate_lease_owner = None
+        self._gate_probe_quiet_until = 0.0
+        self._gate_self_test_quiet_until = 0.0
+        self._gate_login_gen_floor = 0
+        self._revoked_ops = collections.OrderedDict()
+        self._tx_permit_context = threading.local()
         self._tx_in_flight_token: object | None = None
         self._tx_in_flight_result: TxResult | None = None
         self._drain_started = False
@@ -312,6 +393,299 @@ class UARTBridge:
         self._console_thread: threading.Thread | None = None
         self._console_endpoint: str | None = None
 
+    def set_tx_gate(
+        self,
+        *,
+        generation: int,
+        quiet: bool,
+        lease_owner: str | None,
+    ) -> None:
+        """以 TX fence 原子發布 bridge 世代、agent quiet 與 interactive owner。"""
+        fence = getattr(self, "_tx_fence_lock", None)
+        if fence is None:
+            with self._state_lock:
+                self._gate_generation = generation
+                self._gate_quiet = quiet
+                self._gate_lease_owner = lease_owner
+            return
+        with self._state_lock:
+            with fence:
+                self._gate_generation = generation
+                self._gate_quiet = quiet
+                self._gate_lease_owner = lease_owner
+
+    def set_probe_gate(
+        self,
+        *,
+        quiet_until: float,
+        login_gen_floor: int,
+        self_test_quiet_until: float | None = None,
+    ) -> None:
+        """更新 login probe quiet deadline 與單調遞增的 login 世代下限。"""
+        fence = getattr(self, "_tx_fence_lock", None)
+        if fence is None:
+            with self._state_lock:
+                self._set_probe_gate_locked(
+                    quiet_until, login_gen_floor, self_test_quiet_until
+                )
+            return
+        with self._state_lock:
+            with fence:
+                self._set_probe_gate_locked(
+                    quiet_until, login_gen_floor, self_test_quiet_until
+                )
+
+    def _set_probe_gate_locked(
+        self,
+        quiet_until: float,
+        login_gen_floor: int,
+        self_test_quiet_until: float | None,
+    ) -> None:
+        self._gate_probe_quiet_until = quiet_until
+        self._gate_self_test_quiet_until = (
+            quiet_until if self_test_quiet_until is None else self_test_quiet_until
+        )
+        self._gate_login_gen_floor = max(
+            getattr(self, "_gate_login_gen_floor", 0), login_gen_floor
+        )
+
+    @contextlib.contextmanager
+    def system_permit(self, permit: TxPermit) -> Iterator[None]:
+        """將 system probe permit 傳遞給 login FSM 的 send_command/send_secret。"""
+        context = getattr(self, "_tx_permit_context", None)
+        if context is None:
+            context = threading.local()
+            self._tx_permit_context = context
+        previous = getattr(context, "system_permit", None)
+        context.system_permit = permit
+        try:
+            yield
+        finally:
+            if previous is None:
+                try:
+                    del context.system_permit
+                except AttributeError:
+                    pass
+            else:
+                context.system_permit = previous
+
+    @contextlib.contextmanager
+    def operation_permit(self, permit: TxPermit) -> Iterator[None]:
+        """讓 file-transfer 等多筆子命令共用發放時的外層操作 permit。"""
+        context = getattr(self, "_tx_permit_context", None)
+        if context is None:
+            context = threading.local()
+            self._tx_permit_context = context
+        previous = getattr(context, "operation_permit", None)
+        context.operation_permit = permit
+        try:
+            yield
+        finally:
+            if previous is None:
+                try:
+                    del context.operation_permit
+                except AttributeError:
+                    pass
+            else:
+                context.operation_permit = previous
+
+    def _resolve_tx_permit(
+        self,
+        source: str,
+        cmd_id: str | None,
+        permit: TxPermit | None,
+    ) -> TxPermit:
+        if permit is not None:
+            return permit
+        context = getattr(self, "_tx_permit_context", None)
+        active = getattr(context, "operation_permit", None) if context is not None else None
+        if active is not None:
+            return active
+        system = getattr(context, "system_permit", None) if context is not None else None
+        if system is not None and (source == "system" or source.startswith("system:")):
+            return system
+        generation = getattr(self, "_gate_generation", 0)
+        raw_context = getattr(self, "_console_raw_context", None)
+        raw_token = getattr(raw_context, "token", None)
+        if (
+            raw_token is not None
+            and raw_token is getattr(self, "_console_raw_token", None)
+            and source.startswith("human:")
+        ):
+            client_id = getattr(raw_context, "client_id", None) or source.partition(":")[2]
+            owner_gen = getattr(raw_context, "captured_owner_gen", None)
+            if owner_gen is None:
+                owner_gen = getattr(self, "_owner_gen", 0)
+            return TxPermit(f"console:{client_id}", generation, "human_raw", owner_gen=owner_gen)
+        if source == "system:self_test":
+            return TxPermit("system:self_test", generation, "self_test_probe")
+        if source == "system" or source.startswith("system:"):
+            return TxPermit(
+                source if source.startswith("system:") else "system:implicit",
+                generation,
+                "system_probe",
+            )
+        if source.startswith("human:"):
+            return TxPermit(
+                f"console:{source.partition(':')[2]}",
+                generation,
+                "human_line",
+                owner_gen=getattr(self, "_owner_gen", 0),
+            )
+        return TxPermit(cmd_id or f"legacy:{uuid.uuid4().hex}", generation, "agent")
+
+    def _send_bytes_with_permit(
+        self,
+        payload: bytes,
+        *,
+        source: str,
+        cmd_id: str | None,
+        permit: TxPermit | None,
+        **kwargs: Any,
+    ) -> TxResult:
+        """呼叫新 bridge 介面，並保留舊固定簽章替身的相容性。"""
+        send_bytes = self.send_bytes
+        try:
+            parameters = inspect.signature(send_bytes).parameters
+        except (TypeError, ValueError):
+            accepts_permit = False
+        else:
+            accepts_permit = "permit" in parameters
+        if accepts_permit:
+            return send_bytes(
+                payload,
+                source=source,
+                cmd_id=cmd_id,
+                permit=permit,
+                **kwargs,
+            )
+        if permit is None:
+            return send_bytes(payload, source=source, cmd_id=cmd_id, **kwargs)
+        context = getattr(self, "operation_permit", None)
+        if callable(context):
+            with context(permit):
+                return send_bytes(payload, source=source, cmd_id=cmd_id, **kwargs)
+        return send_bytes(payload, source=source, cmd_id=cmd_id, **kwargs)
+
+    @contextlib.contextmanager
+    def _submit_guard(
+        self, permit: TxPermit | None, payload_len: int
+    ) -> Iterator[str | None]:
+        """每次 OS write 前在 fence 內重新驗證，並把單一提交與失效操作線性化。"""
+        del payload_len  # 長度供測試 seam／未來診斷保留；授權依操作身分判定。
+        fence = getattr(self, "_tx_fence_lock", None)
+        if fence is None:
+            reason = self._submit_reject_reason(permit)
+            yield reason
+            return
+        with fence:
+            reason = self._submit_reject_reason(permit)
+            if reason is None:
+                hook = getattr(self, "_inside_tx_submit", None)
+                if callable(hook):
+                    hook()
+            yield reason
+
+    def _submit_reject_reason(self, permit: TxPermit | None) -> str | None:
+        """回傳 fence 內可直接檢查的提交拒絕原因。"""
+        if permit is None:
+            if getattr(self, "_tx_frozen", False):
+                return "draining"
+            if not getattr(self, "_flash_mode", False):
+                return "not_flashing"
+            return None
+        reason = self._tx_reject_reason(permit)
+        if reason is not None:
+            return reason
+        if permit.tx_class in {"system_probe", "self_test_probe"} and getattr(
+            self.wal, "unhealthy", False
+        ):
+            return "wal_unhealthy"
+        return None
+
+    def _tx_reject_reason(self, permit: TxPermit) -> str | None:
+        # 呼叫端在 pre-check 時已持 state lock；提交點只持 fence lock。gate 更新採
+        # state → fence 順序，故此處直接讀快照，不在 fence 內反向取得 state。
+        if getattr(self, "_tx_frozen", False):
+            return "draining"
+        if getattr(self, "_flash_mode", False):
+            return "flashing"
+        if (
+            permit.tx_class != "system_probe"
+            and permit.bridge_generation != getattr(self, "_gate_generation", 0)
+        ):
+            return "stale_generation"
+        if permit.op_id in (getattr(self, "_revoked_ops", None) or {}):
+            return "cancelled"
+        if permit.tx_class == "agent" and getattr(self, "_gate_quiet", False):
+            return "quiet"
+        if permit.tx_class == "interactive":
+            if getattr(self, "_gate_lease_owner", None) != permit.op_id:
+                return "lease"
+            if (
+                permit.owner_gen is not None
+                and permit.owner_gen != getattr(self, "_owner_gen", 0)
+            ):
+                return "lease"
+        if permit.tx_class == "human_raw" and (
+            permit.owner_gen is not None
+            and permit.owner_gen != getattr(self, "_owner_gen", 0)
+        ):
+            return "stale_owner_gen"
+        if permit.tx_class == "system_probe":
+            quiet_until = (
+                getattr(self, "_gate_self_test_quiet_until", 0.0)
+                if permit.op_id == "system:recover"
+                else getattr(self, "_gate_probe_quiet_until", 0.0)
+            )
+            if time.monotonic() < quiet_until:
+                return "quiet"
+            floor = getattr(self, "_gate_login_gen_floor", 0)
+            if permit.login_gen is not None and permit.login_gen < floor:
+                return "stale_login_gen"
+        if permit.tx_class == "self_test_probe" and (
+            time.monotonic() < getattr(self, "_gate_self_test_quiet_until", 0.0)
+        ):
+            return "quiet"
+        return None
+
+    def revoke_ops(self, op_ids: list[str] | tuple[str, ...] | set[str]) -> None:
+        """使尚未提交的命令 permit 失效，帳本容量固定為 512 筆。"""
+        fence = getattr(self, "_tx_fence_lock", None)
+        if fence is None:
+            self._revoke_ops_locked(op_ids)
+            return
+        with fence:
+            self._revoke_ops_locked(op_ids)
+
+    def _revoke_ops_locked(self, op_ids: list[str] | tuple[str, ...] | set[str]) -> None:
+        revoked = getattr(self, "_revoked_ops", None)
+        if revoked is None:
+            revoked = collections.OrderedDict()
+            self._revoked_ops = revoked
+        for op_id in op_ids:
+            revoked.pop(op_id, None)
+            revoked[op_id] = None
+        while len(revoked) > _TX_ACCOUNT_MAX:
+            revoked.popitem(last=False)
+
+    def _invalidate_deferred_locked(self, reason: str) -> int:
+        self._owner_gen = getattr(self, "_owner_gen", 0) + 1
+        buffers = getattr(self, "_deferred_buffers", None)
+        dropped = sum(len(entry) for entry in buffers.values()) if buffers is not None else 0
+        if buffers is not None:
+            buffers.clear()
+        return dropped
+
+    @staticmethod
+    def _log_deferred_invalidation(reason: str, dropped: int) -> None:
+        if dropped:
+            logging.getLogger("serialwrap").warning(
+                "serialwrap: deferred 輸入因 %s 失效，丟棄 %d bytes（BC-02）",
+                reason,
+                dropped,
+            )
+
     def set_flash_mode(self, enabled: bool) -> None:
         """進出 flash 模式；FLASHING 期間擋下 console 注入（C2）。
 
@@ -322,7 +696,8 @@ class UARTBridge:
         """
         with self._write_lock:
             with self._state_lock:
-                self._flash_mode = enabled
+                with self._tx_fence_lock:
+                    self._flash_mode = enabled
 
     @property
     def vtty_path(self) -> str | None:
@@ -489,30 +864,56 @@ class UARTBridge:
             else time.monotonic() + _constants.DRAIN_TIMEOUT_MS / 1000
         )
         port: SerialPort | None
+        fence = getattr(self, "_tx_fence_lock", None)
+        acquired = False
+        deferred_invalidation_pending = False
+        dropped_deferred = 0
         with self._lifecycle_lock:
             with self._state_lock:
-                if self._drain_started:
-                    return
-                self._drain_started = True
-                self._drain_generation += 1
-                self._drain_pending = True
-                self._drain_deadline = drain_deadline
-                self._drain_epoch = epoch
-                self._preserve_on_drain = preserve_consoles
-                self._tx_frozen = True
-                self._drain_tx_token = self._tx_in_flight_token
-                self._drain_tx_in_flight = (
-                    self._tx_in_flight_result if self._tx_in_flight_token is not None else None
-                )
-                self._drain_unrecorded.clear()
-                self._drain_receipt = None
-                self._drain_worker_started = False
-                self._drain_callbacks.clear()
-                self._stop_event.set()
-                self._tx_cancel.set()
-                port = self._serial
-
-                self._on_drain_invalidate()
+                if fence is not None:
+                    wait_s = min(
+                        _constants.DRAIN_FENCE_ACQUIRE_S,
+                        max(0.0, drain_deadline - time.monotonic()),
+                    )
+                    acquired = fence.acquire(timeout=wait_s)
+                try:
+                    if self._drain_started:
+                        return
+                    self._drain_started = True
+                    self._drain_generation += 1
+                    self._drain_pending = True
+                    self._drain_deadline = drain_deadline
+                    self._drain_epoch = epoch
+                    self._preserve_on_drain = preserve_consoles
+                    self._tx_frozen = True
+                    self._drain_tx_token = self._tx_in_flight_token
+                    self._drain_tx_in_flight = (
+                        self._tx_in_flight_result if self._tx_in_flight_token is not None else None
+                    )
+                    self._drain_unrecorded.clear()
+                    self._drain_receipt = None
+                    self._drain_worker_started = False
+                    self._drain_callbacks.clear()
+                    self._stop_event.set()
+                    self._tx_cancel.set()
+                    port = self._serial
+                    # fence 取得逾時時先發布 frozen/cancel，讓已授權段完成後不再開始
+                    # 下一段；owner generation 與 deferred 清除改由鎖外收尾等 fence。
+                    if fence is None or acquired:
+                        dropped_deferred = self._invalidate_deferred_locked("drain")
+                    else:
+                        deferred_invalidation_pending = True
+                finally:
+                    if acquired and fence is not None:
+                        fence.release()
+        if deferred_invalidation_pending:
+            threading.Thread(
+                target=self._invalidate_deferred_after_drain_fence,
+                name=f"serialwrap-drain-invalidate-{self.com}",
+                daemon=True,
+            ).start()
+        else:
+            self._log_deferred_invalidation("drain", dropped_deferred)
         cancel_pending_write = getattr(port, "cancel_pending_write", None)
         if callable(cancel_pending_write):
             try:
@@ -526,6 +927,14 @@ class UARTBridge:
         """Drain 開始時使所有已擷取的 deferred 輸入失效。"""
         self.invalidate_deferred("drain")
 
+    def _invalidate_deferred_after_drain_fence(self) -> None:
+        """先等在途提交放鎖，再以 state→fence 順序使 deferred 世代失效。"""
+        fence = getattr(self, "_tx_fence_lock", None)
+        if fence is not None:
+            with fence:
+                pass
+        self.invalidate_deferred("drain")
+
     @property
     def owner_gen(self) -> int:
         """回傳 deferred 輸入世代；只在上下文失效時遞增。"""
@@ -533,18 +942,15 @@ class UARTBridge:
 
     def invalidate_deferred(self, reason: str) -> int:
         """遞增 deferred 世代並清空所有舊輸入，回傳丟棄的位元組數。"""
-        with self._state_lock:
-            self._owner_gen = getattr(self, "_owner_gen", 0) + 1
-            buffers = getattr(self, "_deferred_buffers", None)
-            dropped = sum(len(entry) for entry in buffers.values()) if buffers is not None else 0
-            if buffers is not None:
-                buffers.clear()
-        if dropped:
-            logging.getLogger("serialwrap").warning(
-                "serialwrap: deferred 輸入因 %s 失效，丟棄 %d bytes（BC-02）",
-                reason,
-                dropped,
-            )
+        fence = getattr(self, "_tx_fence_lock", None)
+        if fence is None:
+            with self._state_lock:
+                dropped = self._invalidate_deferred_locked(reason)
+        else:
+            with self._state_lock:
+                with fence:
+                    dropped = self._invalidate_deferred_locked(reason)
+        self._log_deferred_invalidation(reason, dropped)
         return dropped
 
     def _append_deferred_locked(self, client_id: str, payload: bytes, owner_gen: int) -> None:
@@ -1388,7 +1794,18 @@ class UARTBridge:
                     raw_context.client_id = client.client_id
                     raw_context.captured_owner_gen = raw_owner_gen
                 try:
-                    self.send_bytes(data, source=expected_owner, cmd_id=None)
+                    permit = TxPermit(
+                        f"console:{client.client_id}",
+                        getattr(self, "_gate_generation", 0),
+                        "human_raw",
+                        owner_gen=raw_owner_gen,
+                    )
+                    self._send_bytes_with_permit(
+                        data,
+                        source=expected_owner,
+                        cmd_id=None,
+                        permit=permit,
+                    )
                 finally:
                     if raw_context is not None:
                         if previous_token is None:
@@ -1531,6 +1948,7 @@ class UARTBridge:
         cmd_id: str | None = None,
         log: bool = True,
         _allow_during_flash: bool = False,
+        permit: TxPermit | None = None,
     ) -> TxResult:
         """在單一寫入鎖內送出並記錄 OS 已確認的 bytes。"""
         with self._write_lock:
@@ -1540,6 +1958,7 @@ class UARTBridge:
                 cmd_id=cmd_id,
                 log=log,
                 _allow_during_flash=_allow_during_flash,
+                permit=permit,
             )
 
     def _send_bytes_locked(
@@ -1550,9 +1969,15 @@ class UARTBridge:
         cmd_id: str | None = None,
         log: bool = True,
         _allow_during_flash: bool = False,
+        permit: TxPermit | None = None,
     ) -> TxResult:
         """呼叫端持有 `_write_lock` 時送出一筆資料。"""
         requested = len(payload)
+        active_permit = (
+            None
+            if _allow_during_flash
+            else self._resolve_tx_permit(source, cmd_id, permit)
+        )
         with self._state_lock:
             raw_context = getattr(self, "_console_raw_context", None)
             raw_token = getattr(raw_context, "token", None)
@@ -1586,6 +2011,12 @@ class UARTBridge:
                         client_id, payload, owner_gen=deferred_owner_gen
                     )
                 return TxResult("not_submitted", 0, requested, "deferred")
+            if active_permit is not None:
+                reject = self._tx_reject_reason(active_permit)
+                if reject == "stale_owner_gen":
+                    return TxResult("not_submitted", 0, requested, reject)
+                if reject is not None:
+                    raise TxIncompleteError(TxResult("not_submitted", 0, requested, reject))
             port = self._serial
             serial_fd = self._serial_fd
             tx_token: object | None = None
@@ -1599,9 +2030,27 @@ class UARTBridge:
         write_error: TxIncompleteError | None = None
         result: TxResult | None = None
         try:
+            after_authorize = getattr(self, "_after_tx_authorize", None)
+            if callable(after_authorize):
+                after_authorize()
+            submit_guard = lambda: self._submit_guard(active_permit, requested)
             if serial_fd is not None:
                 try:
-                    raw_result = self._write_all(serial_fd, payload)
+                    write_all = self._write_all
+                    if _callback_declares_keyword(write_all, "submit_guard"):
+                        raw_result = write_all(
+                            serial_fd, payload, submit_guard=submit_guard
+                        )
+                    else:
+                        # 舊測試替身的 monkeypatch 保留原兩參數介面；仍以整次替身
+                        # 呼叫作為單一提交區段，正式 POSIX 後端則逐次 os.write guard。
+                        with submit_guard() as reject:
+                            if reject is not None:
+                                raw_result = TxResult(
+                                    "not_submitted", 0, requested, reject
+                                )
+                            else:
+                                raw_result = write_all(serial_fd, payload)
                 except TxIncompleteError as exc:
                     raw_result = exc.result
                     write_error = exc
@@ -1622,10 +2071,20 @@ class UARTBridge:
                 try:
                     write = port.write
                     cancel = getattr(self, "_tx_cancel", None)
+                    write_kwargs: dict[str, Any] = {}
                     if _port_write_accepts_cancel(port):
-                        raw_result = write(payload, cancel=cancel)
+                        write_kwargs["cancel"] = cancel
+                    if _port_write_accepts_submit_guard(port):
+                        write_kwargs["submit_guard"] = submit_guard
+                        raw_result = write(payload, **write_kwargs)
                     else:
-                        raw_result = write(payload)
+                        with submit_guard() as reject:
+                            if reject is not None:
+                                raw_result = TxResult(
+                                    "not_submitted", 0, requested, reject
+                                )
+                            else:
+                                raw_result = write(payload, **write_kwargs)
                 except TxUnknownError as exc:
                     raw_result = exc.result
                     write_error = exc
@@ -1669,10 +2128,14 @@ class UARTBridge:
                 write_error = TxIncompleteError(result)
             elif (
                 result.outcome == "not_submitted"
-                and result.error not in (None, "deferred")
+                and result.error not in (None, "deferred", "stale_owner_gen")
                 and write_error is None
             ):
-                write_error = TxIncompleteError(result)
+                write_error = (
+                    WalUnavailableError(result)
+                    if result.error == "wal_unhealthy"
+                    else TxIncompleteError(result)
+                )
 
             self._tx_account_result_locked(cmd_id, result)
             if log and result.confirmed > 0:
@@ -1788,9 +2251,12 @@ class UARTBridge:
         payload: bytes,
         *,
         cancel: threading.Event | None = None,
+        submit_guard: Callable[[], Any] | None = None,
     ) -> TxResult:
         tx_cancel = cancel if cancel is not None else getattr(self, "_tx_cancel", None)
-        return _posix_write_all(fd, payload, tx_cancel)
+        return _posix_write_all(
+            fd, payload, tx_cancel, submit_guard=submit_guard
+        )
 
     def flash_tx(self, payload: bytes) -> None:
         """flash 模式：endpoint→device 原樣送出，跳過行處理（_consume_console_input）。
@@ -1835,11 +2301,20 @@ class UARTBridge:
                 except OSError:
                     pass  # 連 fallback 都失敗 → 維持 profile baud
 
-    def send_command(self, cmd: str, *, source: str, cmd_id: str | None = None) -> None:
+    def send_command(
+        self,
+        cmd: str,
+        *,
+        source: str,
+        cmd_id: str | None = None,
+        permit: TxPermit | None = None,
+    ) -> None:
         payload = cmd.encode("utf-8", errors="replace")
         if not payload.endswith(b"\n"):
             payload += b"\n"
-        self.send_bytes(payload, source=source, cmd_id=cmd_id)
+        self._send_bytes_with_permit(
+            payload, source=source, cmd_id=cmd_id, permit=permit
+        )
 
     def send_command_echo_paced(
         self,
@@ -1849,6 +2324,7 @@ class UARTBridge:
         cmd_id: str | None = None,
         slice_size: int = 64,
         echo_timeout_s: float = 2.0,
+        permit: TxPermit | None = None,
     ) -> dict[str, Any]:
         """以 echo 回讀節流送出單行命令（#161）：逐 slice 送、板端 echo 確認才送下一段。
 
@@ -1877,8 +2353,12 @@ class UARTBridge:
                 for idx, piece in enumerate(slices):
                     data = piece.encode("utf-8", errors="replace")
                     try:
-                        raw_result = self.send_bytes(
-                            data, source=source, cmd_id=cmd_id, log=False
+                        raw_result = self._send_bytes_with_permit(
+                            data,
+                            source=source,
+                            cmd_id=cmd_id,
+                            permit=permit,
+                            log=False,
                         )
                     except TxIncompleteError as exc:
                         if exc.result.confirmed:
@@ -1914,8 +2394,12 @@ class UARTBridge:
                         }
 
                 try:
-                    raw_newline_result = self.send_bytes(
-                        b"\n", source=source, cmd_id=cmd_id, log=False
+                    raw_newline_result = self._send_bytes_with_permit(
+                        b"\n",
+                        source=source,
+                        cmd_id=cmd_id,
+                        permit=permit,
+                        log=False,
                     )
                 except TxIncompleteError as exc:
                     if exc.result.confirmed:
@@ -1980,20 +2464,34 @@ class UARTBridge:
                 return acked
             time.sleep(0.01)
 
-    def cancel_input_line(self, *, source: str) -> None:
+    def cancel_input_line(
+        self, *, source: str, permit: TxPermit | None = None
+    ) -> None:
         """取消板端輸入緩衝中的半行（#161）：送 Ctrl-U（\\x15）清行＋換行重取 prompt。
 
         供 echo 停滯後復原用——換行尚未送出、命令未執行，Ctrl-U 清掉已累積的半行輸入，
         換行讓 shell 重新給 prompt。不做 per-platform 分歧：不吃 Ctrl-U 的 CLI（如 bcm
         原生 CLI）後果僅是多一個無效字元＋一次換行（既有 prompt 重取），無破壞性。
         """
-        self.send_bytes(b"\x15\n", source=source, cmd_id=None)
+        self._send_bytes_with_permit(
+            b"\x15\n", source=source, cmd_id=None, permit=permit
+        )
 
-    def send_secret(self, secret: str) -> None:
+    def send_secret(self, secret: str, *, permit: TxPermit | None = None) -> None:
         payload = secret.encode("utf-8", errors="replace")
         if not payload.endswith(b"\n"):
             payload += b"\n"
-        self.send_bytes(payload, source="system:secret", cmd_id=None, log=False)
+        if permit is not None:
+            # 明確 permit 僅供非 FSM 的既有呼叫者；login FSM 由 system_permit 傳遞。
+            self._send_bytes_with_permit(
+                payload,
+                source="system:secret",
+                cmd_id=None,
+                permit=permit,
+                log=False,
+            )
+        else:
+            self.send_bytes(payload, source="system:secret", cmd_id=None, log=False)
 
     def clear_rx_buffer(self) -> None:
         with self._rx_lock:
@@ -2254,7 +2752,18 @@ class UARTBridge:
                     flush_data.append((f"human:{client_id}", buf))
             self._deferred_buffers.clear()
         for source, data in flush_data:
-            self.send_bytes(data, source=source, cmd_id=None)
+            client_id = source.partition(":")[2]
+            self._send_bytes_with_permit(
+                data,
+                source=source,
+                cmd_id=None,
+                permit=TxPermit(
+                    f"console:{client_id}",
+                    getattr(self, "_gate_generation", 0),
+                    "human_raw",
+                    owner_gen=getattr(data, "owner_gen", getattr(self, "_owner_gen", 0)),
+                ),
+            )
 
     def snapshot(self) -> dict[str, Any]:
         consoles = self.list_consoles()

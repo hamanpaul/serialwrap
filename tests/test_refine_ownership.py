@@ -581,6 +581,7 @@ class TestRefineOwnership(unittest.TestCase):
         )
         self.addCleanup(bridge.stop)
         self.session.bridge = bridge  # type: ignore[assignment]
+        self.session._push_tx_gate(bridge)
         attached = bridge.attach_console(label="tcp-like-human")
         client_id = attached["client_id"]
         assert client_id is not None

@@ -467,14 +467,14 @@ codes:
   - code: INTERACTIVE_EXPIRED
     status: IMPLEMENTED
     reachable: true
-    scope: {interfaces: [rpc], methods: ["session.interactive_send", "session.interactive_status", "session.interactive_close"], platforms: [posix, windows]}
+    scope: {interfaces: [rpc], methods: ["session.interactive_open", "session.interactive_send", "session.interactive_status", "session.interactive_close"], platforms: [posix, windows]}
     meaning: "互動 lease 已逾時失效"
-    side_effect: "存取或 1 s tick 將 lease 標記為 expired 並關閉，最多保留每個 session 16 個 tombstone；send/status/close 回 INTERACTIVE_EXPIRED，close 不移除 tombstone；可能還原 human lease 並 resume，deferred 位元組可能被 flush 到 UART"
+    side_effect: "存取或 1 s tick 將 lease 標記為 expired 並關閉，最多保留每個 session 16 個 tombstone；open 的初始 command、send/status/close 遇 lease 過期時回 INTERACTIVE_EXPIRED，close 不移除 tombstone；可能還原 human lease 並 resume，deferred 位元組可能被 flush 到 UART"
     retryable: "no"
     uart_tx: possible
     agent_action: "重新 interactive open 取得新的 lease 後再送出"
     extra_fields: ["interactive_id"]
-    contract_tests: ["tests/test_bootloader_recovery.py::TestInteractiveOpenAllowAttached::test_interactive_send_expired_recovery_restores_and_returns_expired", "tests/test_bootloader_recovery.py::TestInteractiveOpenAllowAttached::test_interactive_status_expired_recovery_closes_restores", "tests/test_stage0_lease_flash_console.py::test_tick_expires_agent_lease_and_keeps_tombstone", "tests/test_stage0_lease_flash_console.py::test_tombstone_fifo_bound_16"]
+    contract_tests: ["tests/test_bootloader_recovery.py::TestInteractiveOpenAllowAttached::test_interactive_send_expired_recovery_restores_and_returns_expired", "tests/test_bootloader_recovery.py::TestInteractiveOpenAllowAttached::test_interactive_status_expired_recovery_closes_restores", "tests/test_stage0_lease_flash_console.py::test_tick_expires_agent_lease_and_keeps_tombstone", "tests/test_stage0_lease_flash_console.py::test_tombstone_fifo_bound_16", "tests/test_stage0_tx_permit.py::test_interactive_open_command_expired_before_submit_zero_tx"]
     behavior_change: ["SC-13"]
     sources: ["sw_core/session_manager.py:6425", "sw_core/session_manager.py:6441", "sw_core/session_manager.py:6468", "sw_core/session_manager.py:6481", "sw_core/session_manager.py:6504"]
   - code: INTERACTIVE_NOT_FOUND

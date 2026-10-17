@@ -787,6 +787,8 @@ TxClass 與 gate 規則（規格 §5.2.1）：
 
 Python 基線的 gate 順序也須保留：`UARTBridge.send_bytes` 先套用 flash gate；flash 模式不允許該來源時靜默丟棄，之後才檢查 WAL unhealthy 並拒絕自動 TX。這保留 RPC-H-07 的 flash probe timeout 語意。
 
+Python Stage 0 對應：`UARTBridge._submit_guard` 持 `_tx_fence_lock`，在每次 POSIX `os.write`／每段不超過 64 bytes 的 pyserial write 前重驗 `TxPermit`；manager 推送 quiet／lease／probe gate，arbiter cancel 撤銷命令 permit。
+
 TxWriter 的 job queue 容量 64；滿時 OpRunner 阻塞等待（只有 OpRunner 會送 job）。
 
 ### 5.5 Two-Phase Drain Barrier（`drain.rs`）

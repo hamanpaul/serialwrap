@@ -451,11 +451,15 @@ def test_begin_drain_invalidation_runs_inside_state_lock(tmp_path):
     release = threading.Event()
     acquired: list[bool] = []
 
-    def _invalidate() -> None:
+    invalidate_locked = bridge._invalidate_deferred_locked
+
+    def _invalidate(reason: str) -> int:
         entered.set()
         release.wait(1.0)
+        assert bridge._tx_fence_lock.locked()
+        return invalidate_locked(reason)
 
-    bridge._on_drain_invalidate = _invalidate
+    bridge._invalidate_deferred_locked = _invalidate
     drain_thread = threading.Thread(
         target=lambda: bridge.begin_drain(9, preserve_consoles=False), daemon=True
     )

@@ -4,7 +4,7 @@
 # applies_to.python.min_version 為目標 release 版號（不代表 VERSION 已是該版）；rust_only 項目為 null。
 # 檔內不寫 contract_revision（tree SHA 只在 build／capture 時計算）。字串一律以雙引號呈現，避免 YAML 1.1 bool／日期陷阱。
 schema_version: 1
-revision: 1
+revision: 2
 changes:
   - id: "BC-01"
     kind: "BC"
@@ -1324,7 +1324,7 @@ changes:
   - id: "DF-19"
     kind: "DF"
     title: "self-test nonce probe 提交點 quiet 重驗"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-15"

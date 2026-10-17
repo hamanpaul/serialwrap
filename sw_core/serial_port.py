@@ -27,9 +27,13 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Literal
+from contextlib import AbstractContextManager
+from typing import Callable, Literal
 
 from .config import UartProfile
+
+# pyserial 後端每次持有 TX fence 的提交區段上限（plan T20）。
+PYSERIAL_SUBMIT_CHUNK = 64
 
 # termios/fcntl 僅 POSIX 有；在 Windows 上絕不於 import 期求值，否則整個 daemon 載入即失敗。
 # _BAUD_MAP 也用 termios.Bxxxx 常數，故一併放進 POSIX 守衛內。
@@ -196,16 +200,32 @@ def _posix_write_all(
     fd: int,
     payload: bytes,
     cancel: threading.Event | None = None,
+    *,
+    submit_guard: Callable[[], AbstractContextManager[str | None]] | None = None,
 ) -> TxResult:
-    """寫出 payload 並回報 OS 確認的前綴長度。"""
+    """逐次授權 OS 寫入，並回報 OS 確認的前綴長度。"""
     view = memoryview(payload)
     sent = 0
     requested = len(payload)
     while sent < requested:
         if cancel is not None and cancel.is_set():
-            return TxResult("completed", sent, requested, "cancelled")
+            return TxResult(
+                "completed", sent, requested,
+                "cancelled",
+            )
         try:
-            n = os.write(fd, view[sent:])
+            if submit_guard is None:
+                n = os.write(fd, view[sent:])
+            else:
+                with submit_guard() as reject:
+                    if reject is not None:
+                        return TxResult(
+                            "not_submitted" if sent == 0 else "completed",
+                            sent,
+                            requested,
+                            reject if sent == 0 else f"revoked:{reject}",
+                        )
+                    n = os.write(fd, view[sent:])
         except BlockingIOError:
             if cancel is None:
                 time.sleep(_EAGAIN_BACKOFF_S)
@@ -287,6 +307,7 @@ class SerialPort(ABC):
         payload: bytes,
         *,
         cancel: threading.Event | None = None,
+        submit_guard: Callable[[], AbstractContextManager[str | None]] | None = None,
     ) -> TxResult | None:
         """寫出 payload 並回傳可確認的結果。"""
 
@@ -449,11 +470,12 @@ class _PosixSerialPort(SerialPort):
         payload: bytes,
         *,
         cancel: threading.Event | None = None,
+        submit_guard: Callable[[], AbstractContextManager[str | None]] | None = None,
     ) -> TxResult:
         fd = self._fd
         if fd is None:
             raise OSError("serial not open")
-        return _posix_write_all(fd, payload, cancel)
+        return _posix_write_all(fd, payload, cancel, submit_guard=submit_guard)
 
     def close(self) -> None:
         fd = self._fd
@@ -612,6 +634,7 @@ class _PySerialPort(SerialPort):
         payload: bytes,
         *,
         cancel: threading.Event | None = None,
+        submit_guard: Callable[[], AbstractContextManager[str | None]] | None = None,
     ) -> TxResult:
         import serial
 
@@ -623,9 +646,24 @@ class _PySerialPort(SerialPort):
         sent = 0
         while sent < len(payload):
             if cancel is not None and cancel.is_set():
-                return TxResult("completed", sent, len(payload), "cancelled")
+                return TxResult(
+                    "completed", sent, len(payload),
+                    "cancelled",
+                )
+            end = min(sent + PYSERIAL_SUBMIT_CHUNK, len(payload))
             try:
-                n = ser.write(view[sent:])
+                if submit_guard is None:
+                    n = ser.write(view[sent:end])
+                else:
+                    with submit_guard() as reject:
+                        if reject is not None:
+                            return TxResult(
+                                "not_submitted" if sent == 0 else "completed",
+                                sent,
+                                len(payload),
+                                reject if sent == 0 else f"revoked:{reject}",
+                            )
+                        n = ser.write(view[sent:end])
             except serial.SerialTimeoutException as exc:
                 from .uart_io import TxUnknownError
 
@@ -674,6 +712,16 @@ class _PySerialPort(SerialPort):
             try:
                 ser.close()
             except Exception:  # noqa: BLE001 - close best-effort
+                pass
+
+    def cancel_pending_write(self) -> None:
+        """盡力取消目前 pyserial write，不等待完成。"""
+        ser = self._ser
+        cancel_write = getattr(ser, "cancel_write", None) if ser is not None else None
+        if callable(cancel_write):
+            try:
+                cancel_write()
+            except Exception:  # noqa: BLE001 — drain deadline 不依賴取消成功
                 pass
 
     def set_baud(self, baud: int) -> None:
