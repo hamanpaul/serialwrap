@@ -204,7 +204,7 @@ CMD_PENDING_MAX: int = 256
 無法回收尚未執行者；少了 admission control，client 比 UART worker 快時 _commands 與 PriorityQueue 會
 持續累積 accepted/running records 而 OOM（#81 Codex 必修）。"""
 DEFERRED_INPUT_MAX_BYTES: int = 256 * 1024
-"""agent 命令期間單一 human console 的 deferred 輸入緩衝上限；超過則丟最舊位元組。"""
+"""agent 命令期間單一 human console 的 deferred 輸入緩衝上限；超過即整段清空。"""
 
 
 def ensure_runtime_dirs() -> None:

@@ -732,7 +732,7 @@ pub trait SignalWait: Send + Sync {
 | lane | 容量 | 內容 | 滿載策略 |
 |---|---|---|---|
 | `control` | 256 | RPC 請求、`DeviceAttached/Detached`、`DeviceRelease/Attach`、`SessionRecover*`、`CmdSubmit/Cancel`、`Interactive*`、`Console*`、`WorkerStoppedReceipt`、`WorkerDrainTimeout`、`UartIoError`、`UartTxCompleted`、timer、`Flash*`、`LogCaptureControl`、`FileTransfer`、`TransportStallDetected` | 送端最多等 `rpc_timeout`；逾時的 RPC 請求回 `TIMEOUT` 由 client 處理（daemon 不新增碼）。內部事件送端（worker、timer）一律阻塞等待，不得丟棄 |
-| `data` | 1024 個 chunk（每個 ≤8192 B） | `UartRxChunk{epoch, wal_seq, bytes}`、`ConsoleInputBytes{client_lifetime, owner_gen_at_capture, bytes}` | Reader 阻塞等待（背壓傳到 OS buffer）。WAL 在進 lane **之前**就已落盤，背壓不會丟失 RX 證據 |
+| `data` | 1024 個 chunk（每個 ≤8192 B） | `UartRxChunk{epoch, wal_seq, bytes}`、`ConsoleInputBytes{client_lifetime, deferred_epoch_at_capture, bytes}` | Reader 阻塞等待（背壓傳到 OS buffer）。WAL 在進 lane **之前**就已落盤，背壓不會丟失 RX 證據 |
 
 - 優先序：`select_biased!` 先取 control。但只要 control 內含有依 RX 順序判定的事件，就必須先把同一 `epoch` 中、序號在它之前的 data 處理完。實作方式：每個 RX chunk 帶 `rx_seq`；控制事件若依賴 RX，帶 `after_rx_seq`，actor 處理到該序號前把它暫存。這保證規格 §5.3「不得先處理後段 prompt」。
 - 有界處理延遲的目標值（規格 §5.3 要求在 Slice 2.1 前凍結，量測方法由 P5 計畫定義）：control 事件從進 lane 到處理完成 p99 ≤ 20 ms；RX flood（20000 B/10s 的 10 倍）期間仍 ≤ 50 ms。
@@ -743,7 +743,8 @@ pub trait SignalWait: Send + Sync {
 |---|---|---|
 | `conn_epoch: u64` | `SerialBackend::open_exclusive` 成功、建立 IoWorker 的那一刻（全域單調）。對外的 `bridge_generation` 另依 Python 規則維護（attach 成功才 +1） | 舊 worker 的 completion、receipt、RX；TxPermit |
 | `fsm_gen: u64` | (a) boot banner arm quiet；(b) 啟動一次 login／probe／ready-reconfirm run；(c) quiet 被清除 | login step timer、quiet timer、`ReadyProbeVerified` |
-| `owner_gen: u64` | owner 變更：lease 開或關、human raw 授予或撤銷、suspend depth 0→1 或 1→0、soft preempt、self-heal grant | DeferredBuffer 回放、console 輸入、lease 到期 |
+| `owner_gen: u64` | owner 變更：lease 開或關、human raw 授予或撤銷、suspend depth 0→1 或 1→0、soft preempt、self-heal grant | TxPermit 的 owner 權限與 lease 到期事件 |
+| `deferred_epoch: u64` | BC-02 上下文失效：drain、boot quiet、reboot、recovery、release 或 FlashSyncMatched | DeferredBuffer 回放與 `ConsoleInputBytes` mailbox 輸入 |
 
 - 事件攜帶建立時的世代；actor 比對不符就丟棄狀態轉移，但 I/O 證據仍保存（§5.6）。
 - 對外的 `drain_timeout_epoch` 取值為 `bridge_generation`，以便與 Python 對照（`SC-04`）。
@@ -765,9 +766,9 @@ pub struct Fence(Mutex<FenceState>);
 
 1. **Admission**：RPC handler 送 `CmdSubmit` 給 actor，`SessionCore` 依 §5.3 表與 SC-01／02／03 檢查狀態、gate、容量（`SC-06`），再加 `_resolve_session_id` 的 Python 順序。
 2. **出列**：actor 把命令交給 OpRunner 前重驗 epoch、owner、quiet／reconfirm、release／recovery、cancel。
-3. **OS 提交時（授權與提交同一臨界區，R0-F1）**：TxWriter 出列時先以 `Fence::admit` 做一次快速拒絕（被拒者不呼叫 PAL；通過**不算**授權）。真正的授權發生在 PAL 每次 OS 提交的 `SubmitGate::submit`（§4.2）內：`FenceSubmitGate { fence, permit }` 取 `Fence` 鎖 → 重跑 `Fence::admit`（`permit.epoch == active_epoch`、`!frozen`、class 對應的 gate 規則、世代規則（`owner_gen`／`fsm_gen`／`input_epoch`）、`op_id ∉ cancelled`）→ 通過才在**仍持鎖**時呼叫非阻塞的 `os_submit`（POSIX 一次 `write(2)`；Windows 發出 overlapped `WriteFile`）→ 提交有交出 bytes（`Accepted(n>0)`／`Pending`）時於同一臨界區設 `in_flight = Some(op_id, len)` → 放鎖。完成等待（POLLOUT、`GetOverlappedResult`）一律在鎖外。POSIX 部分寫入後的下一段再經 gate 重驗；撤銷後的尾段不交 OS（結果 `Completed(k)`＋`cancelled`，k=0 時 `NotSubmitted`，原因寫入 `TxReport.reject`）。寫入結束後取鎖清 `in_flight`，並把 `TxResult` 交給 WalWriter（只記錄確認的 bytes，`SC-07`），最後送出 `UartTxCompleted`。**禁止**「鎖內驗證、放鎖、再呼叫 OS write」的寫法：兩者之間的 Quiet／換手／drain 會讓失效世代的 bytes 被寫出（規格 §5.2.2「讀一次旗標，過一段時間再 write」）。
+3. **OS 提交時（授權與提交同一臨界區，R0-F1）**：TxWriter 出列時先以 `Fence::admit` 做一次快速拒絕（被拒者不呼叫 PAL；通過**不算**授權）。真正的授權發生在 PAL 每次 OS 提交的 `SubmitGate::submit`（§4.2）內：`FenceSubmitGate { fence, permit }` 取 `Fence` 鎖 → 重跑 `Fence::admit`（`permit.epoch == active_epoch`、`!frozen`、class 對應的 gate 規則、世代規則（`owner_gen`／`fsm_gen`／`deferred_epoch`）、`op_id ∉ cancelled`）→ 通過才在**仍持鎖**時呼叫非阻塞的 `os_submit`（POSIX 一次 `write(2)`；Windows 發出 overlapped `WriteFile`）→ 提交有交出 bytes（`Accepted(n>0)`／`Pending`）時於同一臨界區設 `in_flight = Some(op_id, len)` → 放鎖。完成等待（POLLOUT、`GetOverlappedResult`）一律在鎖外。POSIX 部分寫入後的下一段再經 gate 重驗；撤銷後的尾段不交 OS（結果 `Completed(k)`＋`cancelled`，k=0 時 `NotSubmitted`，原因寫入 `TxReport.reject`）。寫入結束後取鎖清 `in_flight`，並把 `TxResult` 交給 WalWriter（只記錄確認的 bytes，`SC-07`），最後送出 `UartTxCompleted`。**禁止**「鎖內驗證、放鎖、再呼叫 OS write」的寫法：兩者之間的 Quiet／換手／drain 會讓失效世代的 bytes 被寫出（規格 §5.2.2「讀一次旗標，過一段時間再 write」）。
 
-   actor 的任何失效操作（drain、release、quiet arm、lease close／expiry、soft preempt、flash freeze、`input_epoch++`）都在**同一把鎖**內修改 `FenceState`，因此與 OS 提交互斥，形成可測試的線性化邊界：
+   actor 的任何失效操作（drain、release、quiet arm、lease close／expiry、soft preempt、flash freeze、`deferred_epoch++`）都在**同一把鎖**內修改 `FenceState`，因此與 OS 提交互斥，形成可測試的線性化邊界：
    - 失效先取得鎖 → 之後每一次 `gate.submit` 都看到新狀態，尚未提交的 bytes 一律不交 OS（zero-TX 只對這類操作斷言，規格 §5.2.2 末段）。
    - 提交先取得鎖 → 失效呼叫阻塞到該次**非阻塞**提交返回（微秒級；不等完成），該段 bytes 已交 OS，記為在途（`in_flight`）並照實記錄，不宣稱可撤回。
    - 鎖不跨完成等待：寫入卡在完成等待（D-state、RTS/CTS 卡住）時，失效操作不被阻塞，Phase 1 仍可立即進行並以 `CancelToken` 收斂（§5.5）。
@@ -799,7 +800,7 @@ TxWriter 的 job queue 容量 64；滿時 OpRunner 阻塞等待（只有 OpRunne
 2. state 設為 `RECOVERING`（release 也一樣）。Python 現況是 DETACHED→ATTACHING；改為 RECOVERING 屬 `SC-04`。
 3. 尚未提交的 TX job 標 `NotSubmitted`。
 4. arbiter 中 `accepted` 的命令 → `FLUSHED_BY_RECOVERY`（shutdown 用 `FLUSHED_BY_SHUTDOWN`）。
-5. DeferredBuffer 整段清空，`owner_gen++`（BC-02）。
+5. DeferredBuffer 整段清空，`deferred_epoch++`（BC-02）。
 6. 依 Python `_detach_session_locked` 契約關閉 lease 與 capture。
 7. 對 reader 呼叫 `IoWaker::wake()`，對 writer 呼叫 `CancelToken::cancel()`。
 8. 排定 `WorkerDrainTimeout{epoch, stop_id}`，3000 ms 後觸發。期限以 actor 處理該停止請求的 `now` 起算；Phase 1 取 Fence 鎖最多只等一次非阻塞提交（§5.4 第 3 點：POSIX 一次 `write(2)`、Windows 一次 overlapped `WriteFile` 發出），不等完成，所以不會把完成等待算到期限之外。Python 參考實作的 Windows `_PySerialPort` 會在鎖內阻塞寫入，對應的有上限取鎖與共同期限見 P1 T07／T20（R3-F3）。
@@ -940,15 +941,16 @@ TxWriter 的 job queue 容量 64；滿時 OpRunner 阻塞等待（只有 OpRunne
   struct Entry {
       client_id: String,
       client_lifetime: u64,
-      owner_gen: u64,
+      deferred_epoch_at_capture: u64,
       bytes: Vec<u8>,
   }
   ```
 
-  - 回放時只送 `owner_gen` 等於目前上下文、且 client 仍存活的項目。
-  - mailbox 中尚未處理、但帶舊 `owner_gen` 的 `ConsoleInputBytes` 一律丟棄（BC-02 測項）。
+  - 回放時只送 `deferred_epoch_at_capture` 等於目前 `deferred_epoch`、且 client 仍存活的項目。
+  - mailbox 中尚未處理、但帶舊 `deferred_epoch_at_capture` 的 `ConsoleInputBytes` 一律丟棄（BC-02 測項）。
   - 沒有發生上下文失效時，照 #53 的正常回放流程。
-  - **回放保留（07 D-22，R2-F4）**：Python 的 resume flush 在 `_foreground_operation` token 釋放前同步寫完（`session_manager.py:3699-3703`、`:1104-1120`）。Rust 回放走非同步 human lane，因此每個回放點建立 `ReplayHold`，在同一次 `Fence::with` 內設 `FenceState.replay_auth = Some(hold_id)`，HumanReplay permit 帶 `replay_hold: Some(hold_id)`。hold 存在期間 `foreground_busy()` 為 true（佇列不出列、`interactive_open`／`send` 回 `SESSION_BUSY`），最後一筆回放結算才釋放並出列。任何不經佇列的新操作取得 ownership 時，先撤銷 `replay_auth`；之後才到 OS 提交點的回放回 `ReplayRevoked`、零 TX，bytes 放回 deferred 前端，等下一個回放點再送。HumanReplay 不比對 `owner_gen`／admission，只比對 `input_epoch` 與 `replay_auth`。
+  - `deferred_epoch` 只在 BC-02 失效事件時遞增；不可用 `owner_gen` 判定 DeferredBuffer，否則 Soft Preempt 的 suspend／resume 會丟棄應正常回放的輸入。
+  - **回放保留（07 D-22，R2-F4）**：Python 的 resume flush 在 `_foreground_operation` token 釋放前同步寫完（`session_manager.py:3699-3703`、`:1104-1120`）。Rust 回放走非同步 human lane，因此每個回放點建立 `ReplayHold`，在同一次 `Fence::with` 內設 `FenceState.replay_auth = Some(hold_id)`，HumanReplay permit 帶 `replay_hold: Some(hold_id)`。hold 存在期間 `foreground_busy()` 為 true（佇列不出列、`interactive_open`／`send` 回 `SESSION_BUSY`），最後一筆回放結算才釋放並出列。任何不經佇列的新操作取得 ownership 時，先撤銷 `replay_auth`；之後才到 OS 提交點的回放回 `ReplayRevoked`、零 TX，bytes 放回 deferred 前端，等下一個回放點再送。`deferred_epoch_at_capture` 在入列前核對；HumanReplay permit 不比對 `owner_gen`／admission，只比對 `deferred_epoch` 與 `replay_auth`。
 
 ### 5.12 Passthrough 安靜升 READY（SC-35）
 

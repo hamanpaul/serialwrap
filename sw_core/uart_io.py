@@ -112,6 +112,19 @@ class ConsoleClient:
     sock_send_lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
 
 
+class _DeferredEntry(bytearray):
+    """保留延遲輸入內容與擷取時的 deferred 世代。"""
+
+    owner_gen: int
+
+    def __new__(cls, data: bytes = b"", owner_gen: int = 0) -> _DeferredEntry:
+        return super().__new__(cls, data)
+
+    def __init__(self, data: bytes = b"", owner_gen: int = 0) -> None:
+        super().__init__(data)
+        self.owner_gen = owner_gen
+
+
 @dataclasses.dataclass
 class PreservedConsoles:
     clients: dict[str, ConsoleClient]
@@ -269,6 +282,7 @@ class UARTBridge:
         self._suspended_owner: str | None = None
         self._suspend_depth: int = 0  # suspend/resume 巢狀深度（#78 可重入）
         self._deferred_buffers: dict[str, bytearray] = {}
+        self._owner_gen = 0
         # 最後一次「真實 human owner 鍵入」的 monotonic 時間（#53）。僅 human-OWNER
         # 直接 raw 送出分支會更新；deferred buffer、serial RX loop、agent 注入都不更新。
         self._last_human_input_at: float | None = None
@@ -485,7 +499,67 @@ class UARTBridge:
                 )
 
     def _on_drain_invalidate(self) -> None:
-        """BC-02 的延遲鉤子；T09 會在此接上 deferred buffer 世代失效。"""
+        """Drain 開始時使所有已擷取的 deferred 輸入失效。"""
+        self.invalidate_deferred("drain")
+
+    @property
+    def owner_gen(self) -> int:
+        """回傳 deferred 輸入世代；只在上下文失效時遞增。"""
+        return getattr(self, "_owner_gen", 0)
+
+    def invalidate_deferred(self, reason: str) -> int:
+        """遞增 deferred 世代並清空所有舊輸入，回傳丟棄的位元組數。"""
+        with self._state_lock:
+            self._owner_gen = getattr(self, "_owner_gen", 0) + 1
+            buffers = getattr(self, "_deferred_buffers", None)
+            dropped = sum(len(entry) for entry in buffers.values()) if buffers is not None else 0
+            if buffers is not None:
+                buffers.clear()
+        if dropped:
+            logging.getLogger("serialwrap").warning(
+                "serialwrap: deferred 輸入因 %s 失效，丟棄 %d bytes（BC-02）",
+                reason,
+                dropped,
+            )
+        return dropped
+
+    def _append_deferred_locked(self, client_id: str, payload: bytes, owner_gen: int) -> None:
+        """在持有 `_state_lock` 時，依世代與容量規則加入 deferred 輸入。"""
+        buffers = getattr(self, "_deferred_buffers", None)
+        if buffers is None:
+            buffers = {}
+            self._deferred_buffers = buffers
+        entry = buffers.get(client_id)
+        entry_gen = getattr(entry, "owner_gen", getattr(self, "_owner_gen", 0))
+        if entry is None or entry_gen != owner_gen:
+            entry = _DeferredEntry(b"", owner_gen=owner_gen)
+            buffers[client_id] = entry
+        total = len(entry) + len(payload)
+        if total > DEFERRED_INPUT_MAX_BYTES:
+            buffers.pop(client_id, None)
+            logging.getLogger("serialwrap").warning(
+                "serialwrap: deferred 輸入溢位，client=%s 丟棄 %d bytes（BC-02）",
+                client_id,
+                total,
+            )
+            return
+        entry.extend(payload)
+
+    def _captured_owner_gen_is_stale_locked(
+        self, client: ConsoleClient, captured_owner_gen: int | None
+    ) -> bool:
+        """呼叫端持有 `_state_lock` 時，檢查 console 輸入擷取世代是否過期。"""
+        current_owner_gen = getattr(self, "_owner_gen", 0)
+        if captured_owner_gen is None or captured_owner_gen == current_owner_gen:
+            return False
+        logging.getLogger("serialwrap").debug(
+            "serialwrap: 丟棄過期 console 輸入，com=%s client=%s captured_owner_gen=%s current_owner_gen=%s",
+            getattr(self, "com", ""),
+            client.client_id,
+            captured_owner_gen,
+            current_owner_gen,
+        )
+        return True
 
     def finish_drain(
         self,
@@ -834,6 +908,7 @@ class UARTBridge:
             return
         while not self._stop_event.is_set():
             with self._state_lock:
+                captured_owner_gen = getattr(self, "_owner_gen", 0)
                 socks = [c.sock for c in self._clients.values() if c.sock is not None]
             try:
                 rlist, _, _ = select.select([listener, *socks], [], [], 0.2)
@@ -865,7 +940,9 @@ class UARTBridge:
                     self._drop_console_client(client.client_id)
                     continue
                 try:
-                    self._handle_console_rx(client, data)
+                    self._handle_console_rx(
+                        client, data, captured_owner_gen=captured_owner_gen
+                    )
                 except Exception:  # noqa: BLE001 — 單一 console handler 例外不得殺死 console thread（比照 #79）
                     import logging
 
@@ -1020,6 +1097,7 @@ class UARTBridge:
                 continue
             if self._interactive_owner == f"human:{client_id}":
                 self._interactive_owner = None
+            self._deferred_buffers.pop(client_id, None)
             stale.append(removed)
         return stale
 
@@ -1180,7 +1258,13 @@ class UARTBridge:
 
         return lines, bytes(echo)
 
-    def _handle_console_rx(self, client: ConsoleClient, data: bytes) -> None:
+    def _handle_console_rx(
+        self,
+        client: ConsoleClient,
+        data: bytes,
+        *,
+        captured_owner_gen: int | None = None,
+    ) -> None:
         if client.telnet is not None:
             # telnet 入向過濾（#131）：先於 flash gate 推進 parser 狀態——協商回覆屬
             # client 向、不經 UART，flash 期間照送；資料位元組仍受下方 gate／owner／
@@ -1194,6 +1278,8 @@ class UARTBridge:
             if not data:
                 return
         with self._state_lock:
+            if self._captured_owner_gen_is_stale_locked(client, captured_owner_gen):
+                return
             if self._flash_mode:
                 # FLASHING 期間：console 為唯讀快照，丟棄所有 console→device 輸入，
                 # 避免人類鍵入 / agent 注入汙染 flasher 的 SBL binary 串流（C2）。
@@ -1206,10 +1292,18 @@ class UARTBridge:
         if owner == f"human:{client.client_id}":
             expected_owner = owner
             send_raw = False
+            raw_owner_gen = getattr(self, "_owner_gen", 0)
             with self._state_lock:
+                if self._captured_owner_gen_is_stale_locked(client, captured_owner_gen):
+                    return
                 # 重新核對 gate，堵住 RX 已快照 owner、manager 隨後 admission 的窗口。
                 owner_now = self._interactive_owner
                 blocked_now = getattr(self, "_interactive_admission_blocked", False)
+                raw_owner_gen = (
+                    captured_owner_gen
+                    if captured_owner_gen is not None
+                    else getattr(self, "_owner_gen", 0)
+                )
                 if owner_now == expected_owner and not blocked_now:
                     # 僅在真實 human owner 鍵入時記錄時間（#53），供 human_active 時間窗判定。
                     self._last_human_input_at = time.monotonic()
@@ -1217,13 +1311,9 @@ class UARTBridge:
                 elif owner_now == expected_owner and blocked_now:
                     # operation admission 到 suspend_interactive() 之間也必須先 defer；
                     # 否則既有 human owner 會在 lock 外 suspend 前繞過 foreground gate 直 TX。
-                    buf = self._deferred_buffers.get(client.client_id)
-                    if buf is None:
-                        buf = bytearray()
-                        self._deferred_buffers[client.client_id] = buf
-                    buf.extend(data)
-                    if len(buf) > DEFERRED_INPUT_MAX_BYTES:
-                        del buf[: len(buf) - DEFERRED_INPUT_MAX_BYTES]
+                    self._append_deferred_locked(
+                        client.client_id, data, owner_gen=raw_owner_gen
+                    )
                     return
                 else:
                     # owner 在 snapshot 後已改變（例如 suspend/close），以下重新走
@@ -1240,9 +1330,15 @@ class UARTBridge:
                 previous_client_id = (
                     getattr(raw_context, "client_id", None) if raw_context is not None else None
                 )
+                previous_captured_owner_gen = (
+                    getattr(raw_context, "captured_owner_gen", None)
+                    if raw_context is not None
+                    else None
+                )
                 if raw_context is not None:
                     raw_context.token = getattr(self, "_console_raw_token", None)
                     raw_context.client_id = client.client_id
+                    raw_context.captured_owner_gen = raw_owner_gen
                 try:
                     self.send_bytes(data, source=expected_owner, cmd_id=None)
                 finally:
@@ -1261,22 +1357,33 @@ class UARTBridge:
                                 pass
                         else:
                             raw_context.client_id = previous_client_id
+                        if previous_captured_owner_gen is None:
+                            try:
+                                del raw_context.captured_owner_gen
+                            except AttributeError:
+                                pass
+                        else:
+                            raw_context.captured_owner_gen = previous_captured_owner_gen
                 return
 
         if agent_active and suspended == f"human:{client.client_id}":
             with self._state_lock:
-                buf = self._deferred_buffers.get(client.client_id)
-                if buf is None:
-                    buf = bytearray()
-                    self._deferred_buffers[client.client_id] = buf
-                buf.extend(data)
-                # 上限保護（#81）：agent 命令期間 human 持續輸入不致無界成長 → OOM；
-                # 超過上限丟最舊位元組（保留最近輸入），resume 時 flush 較新的內容。
-                if len(buf) > DEFERRED_INPUT_MAX_BYTES:
-                    del buf[: len(buf) - DEFERRED_INPUT_MAX_BYTES]
+                if self._captured_owner_gen_is_stale_locked(client, captured_owner_gen):
+                    return
+                deferred_owner_gen = (
+                    captured_owner_gen
+                    if captured_owner_gen is not None
+                    else getattr(self, "_owner_gen", 0)
+                )
+                self._append_deferred_locked(
+                    client.client_id, data, owner_gen=deferred_owner_gen
+                )
             return
 
-        lines, echo = self._consume_console_input(client, data)
+        with self._state_lock:
+            if self._captured_owner_gen_is_stale_locked(client, captured_owner_gen):
+                return
+            lines, echo = self._consume_console_input(client, data)
         if echo:
             try:
                 self._console_send(client, echo)
@@ -1291,6 +1398,7 @@ class UARTBridge:
         failure_reason: str | None = None
         while not self._stop_event.is_set():
             with self._state_lock:
+                captured_owner_gen = getattr(self, "_owner_gen", 0)
                 port = self._serial
                 serial_fd = self._serial_fd
                 clients_by_fd = {client.master_fd: client for client in self._clients.values()}
@@ -1355,7 +1463,9 @@ class UARTBridge:
                     client = clients_by_fd.get(fd)
                     if client is None:
                         continue
-                    self._handle_console_rx(client, data)
+                    self._handle_console_rx(
+                        client, data, captured_owner_gen=captured_owner_gen
+                    )
                 except Exception:  # noqa: BLE001 — 單一 RX handler 例外不得殺死 reader thread（致該 UART RX 永久停擺、session 卻仍顯示 READY）（#79 STA-1）
                     import logging
                     logging.getLogger("serialwrap").warning(
@@ -1417,17 +1527,16 @@ class UARTBridge:
             ):
                 client_id = getattr(raw_context, "client_id", None)
                 if client_id:
-                    buffers = getattr(self, "_deferred_buffers", None)
-                    if buffers is None:
-                        buffers = {}
-                        self._deferred_buffers = buffers
-                    buf = buffers.get(client_id)
-                    if buf is None:
-                        buf = bytearray()
-                        buffers[client_id] = buf
-                    buf.extend(payload)
-                    if len(buf) > DEFERRED_INPUT_MAX_BYTES:
-                        del buf[: len(buf) - DEFERRED_INPUT_MAX_BYTES]
+                    deferred_owner_gen = getattr(
+                        raw_context, "captured_owner_gen", None
+                    )
+                    if deferred_owner_gen is None:
+                        deferred_owner_gen = getattr(
+                            payload, "owner_gen", getattr(self, "_owner_gen", 0)
+                        )
+                    self._append_deferred_locked(
+                        client_id, payload, owner_gen=deferred_owner_gen
+                    )
                 return TxResult("not_submitted", 0, requested, "deferred")
             port = self._serial
             serial_fd = self._serial_fd
@@ -2020,17 +2129,21 @@ class UARTBridge:
             self._interactive_owner = pending
         self._pending_interactive_owner = None
 
-    def _set_interactive_admission(self, allowed: bool) -> list[tuple[str, bytes]]:
+    def _set_interactive_admission(self, allowed: bool) -> list[tuple[str, bytearray]]:
         """切換 foreground raw admission，回傳待在鎖外回放的 deferred payload。"""
-        flush_data: list[tuple[str, bytes]] = []
+        flush_data: list[tuple[str, bytearray]] = []
         with self._state_lock:
             self._interactive_admission_blocked = not allowed
             if allowed:
                 self._promote_pending_interactive_owner_locked()
                 if self._suspend_depth == 0 and self._suspended_owner is None:
+                    current_owner_gen = getattr(self, "_owner_gen", 0)
+                    clients = getattr(self, "_clients", None)
                     for client_id, buf in self._deferred_buffers.items():
-                        if buf:
-                            flush_data.append((f"human:{client_id}", bytes(buf)))
+                        entry_owner_gen = getattr(buf, "owner_gen", current_owner_gen)
+                        client_is_live = clients is None or client_id in clients
+                        if buf and client_is_live and entry_owner_gen == current_owner_gen:
+                            flush_data.append((f"human:{client_id}", buf))
                     self._deferred_buffers.clear()
         return flush_data
 
@@ -2073,7 +2186,7 @@ class UARTBridge:
         Agent 命令完成後呼叫；僅在巢狀深度歸 0（最外層）時還原 owner 並 flush
         deferred 期間累積的 human 輸入（#78）。不平衡的 resume（depth 已 0）為 no-op。
         """
-        flush_data: list[tuple[str, bytes]] = []
+        flush_data: list[tuple[str, bytearray]] = []
         with self._state_lock:
             if self._suspend_depth == 0:
                 return
@@ -2084,9 +2197,13 @@ class UARTBridge:
             self._agent_active = False
             self._suspended_owner = None
             self._promote_pending_interactive_owner_locked()
+            current_owner_gen = getattr(self, "_owner_gen", 0)
+            clients = getattr(self, "_clients", None)
             for client_id, buf in self._deferred_buffers.items():
-                if buf:
-                    flush_data.append((f"human:{client_id}", bytes(buf)))
+                entry_owner_gen = getattr(buf, "owner_gen", current_owner_gen)
+                client_is_live = clients is None or client_id in clients
+                if buf and client_is_live and entry_owner_gen == current_owner_gen:
+                    flush_data.append((f"human:{client_id}", buf))
             self._deferred_buffers.clear()
         for source, data in flush_data:
             self.send_bytes(data, source=source, cmd_id=None)

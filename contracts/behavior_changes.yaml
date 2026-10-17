@@ -36,7 +36,7 @@ changes:
   - id: "BC-02"
     kind: "BC"
     title: "DeferredBuffer 溢位或跨上下文時整段清空"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "hamanpaul"
       date: "2026-10-15"
@@ -57,7 +57,7 @@ changes:
     ab_participation: "diff"
     phases: ["P1", "P6", "P8"]
     case_ids: ["bc02-deferred-overflow-clear", "bc02-deferred-context-switch-clear", "bc02-mailbox-stale-input-not-replayed", "bc02-normal-replay-53"]
-    compatibility_impact: "DeferredBuffer 溢位（原為截頭留尾）或發生跨上下文切換（recovery、release、reboot、lease 切換，以及 flash 認線成功（FlashSyncMatched））時，延後輸入整段清空、不回放。未發生失效時的 #53 正常回放不變。對依賴延後輸入保留尾端的 agent：溢位後不再保留尾段。"
+    compatibility_impact: "DeferredBuffer 溢位（原為截頭留尾）或 recovery、release、reboot、Quiet 重新啟動及 flash 認線成功（FlashSyncMatched）時，延後輸入整段清空、不回放。Lease hand-off 的寫入授權由 T20 permit 依 owner_gen 檢查，不觸發 BC-02 清空。未發生失效時的 #53 正常回放不變。對依賴延後輸入保留尾端的 agent：溢位後不再保留尾段。"
     approval_conditions: "保留未發生失效時的 #53 正常回放；測 mailbox 中尚未處理的舊輸入，避免清空後重新灌回"
     related_decisions: ["OD-04"]
   - id: "BC-03"

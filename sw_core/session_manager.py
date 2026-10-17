@@ -482,6 +482,9 @@ class SessionRuntime:
         prompt，若不清掉，下一個 RX chunk 的解除檢查會被舊 prompt 誤觸發、
         quiet window 立即失效。
         """
+        invalidate_deferred = getattr(self.bridge, "invalidate_deferred", None)
+        if callable(invalidate_deferred):
+            invalidate_deferred("boot_quiet")
         base = time.monotonic() if now is None else now
         self.boot_quiet_until = base + BOOT_QUIET_WINDOW_S
         self.boot_banner_tail = ""
@@ -2561,6 +2564,9 @@ class SessionManager:
                 self._admission.set_flag(session.profile.com, "flashing", True)
             if session.bridge is not None:
                 session.bridge.set_flash_mode(True)   # 擋 console 注入（C2）
+                invalidate_deferred = getattr(session.bridge, "invalidate_deferred", None)
+                if callable(invalidate_deferred):
+                    invalidate_deferred("flash")
             public = session.to_public_dict()
         return {"ok": True, "session": public}
 
@@ -4483,6 +4489,9 @@ class SessionManager:
         with self._lock:
             if not self._foreground_operation_current_locked(session, bridge, operation):
                 return {"ok": False, "error_code": "FLUSHED_BY_RECOVERY"}
+            invalidate_deferred = getattr(bridge, "invalidate_deferred", None)
+            if callable(invalidate_deferred):
+                invalidate_deferred("reboot")
             session.arm_boot_quiet()
         if session.profile.console_unlock_env:
             # 已重開的舊 root prompt 不可在 recovery 中被當成解鎖證據。
@@ -4914,6 +4923,9 @@ class SessionManager:
         # 除後由既有 reprobe / reboot recovery 接手升 READY。
         # 迴圈外快速早退（省掉整段設置）；真正的授權判定在迴圈**內**逐 byte 重驗。
         if not session.boot_quiet_active():
+            invalidate_deferred = getattr(bridge, "invalidate_deferred", None)
+            if callable(invalidate_deferred):
+                invalidate_deferred("recover")
             for action_name, payload in (("CTRL_C", b"\x03"), ("CTRL_D", b"\x04")):
                 # #162 回歸修（實機事故 2026-07-31）：gate 必須逐 byte 重驗。第二個 byte
                 # （CTRL-D）在第一個之後最多 min(timeout_s, 2.0) 秒才寫出，而 U-Boot
@@ -5691,6 +5703,9 @@ class SessionManager:
                 return {"ok": False, "error_code": "SESSION_NOT_READY", "session": session.to_public_dict()}
             else:
                 bridge = session.bridge
+                invalidate_deferred = getattr(bridge, "invalidate_deferred", None)
+                if callable(invalidate_deferred):
+                    invalidate_deferred("recover")
         if reprobe:
             # 與 auto 自動重探共用 per-session probe 互斥（Finding 2）。
             with self._lock:
