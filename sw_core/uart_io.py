@@ -17,7 +17,7 @@ from typing import Any, Callable
 from .config import UartProfile
 from . import constants as _constants
 from . import serial_port as serial_port_mod
-from .constants import DEFERRED_INPUT_MAX_BYTES, RX_RATE_WINDOW_S
+from .constants import CONSOLE_LINE_MAX_BYTES, DEFERRED_INPUT_MAX_BYTES, RX_RATE_WINDOW_S
 from .serial_port import SerialPort, TxResult, _posix_write_all
 from .telnet_console import TELNET_GREETING, TelnetFilter, escape_iac
 from .util import strip_ansi
@@ -121,6 +121,8 @@ class ConsoleClient:
     # socket 送出序列化（#131 review）：RX fan-out（reader thread）與協商回覆/echo
     # （console thread）對同一 socket 併發 send 會撕裂 IAC 逸出/協商序列；PTY 路徑不用。
     sock_send_lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+    # 本地 line buffer 超限後，丟棄至下一個 CR/LF 才重新接受輸入。
+    line_overflow: bool = False
 
 
 class _DeferredEntry(bytearray):
@@ -1261,6 +1263,10 @@ class UARTBridge:
         last_terminator: int | None = None
 
         for b in data:
+            if client.line_overflow and b not in (0x0A, 0x0D):
+                last_terminator = None
+                continue
+
             if b in (0x08, 0x7F):
                 last_terminator = None
                 if self._pop_last_console_char(client.tx_buffer):
@@ -1271,6 +1277,11 @@ class UARTBridge:
                 if last_terminator is not None and last_terminator != b and not client.tx_buffer:
                     last_terminator = None
                     continue
+                if client.line_overflow:
+                    client.tx_buffer.clear()
+                    client.line_overflow = False
+                    last_terminator = b
+                    continue
                 lines.append(client.tx_buffer.decode("utf-8", errors="replace"))
                 client.tx_buffer.clear()
                 # Commit the local line visually without adding an extra blank
@@ -1280,6 +1291,15 @@ class UARTBridge:
                 continue
 
             last_terminator = None
+            if len(client.tx_buffer) >= CONSOLE_LINE_MAX_BYTES:
+                client.tx_buffer.clear()
+                client.line_overflow = True
+                logging.getLogger("serialwrap").warning(
+                    "serialwrap: console 行超過 %d bytes 已丟棄（client=%s）",
+                    CONSOLE_LINE_MAX_BYTES,
+                    client.client_id,
+                )
+                continue
             client.tx_buffer.append(b)
             if b == 0x09 or 0x20 <= b <= 0x7E or b >= 0x80:
                 echo.append(b)

@@ -468,7 +468,7 @@ changes:
   - id: "SC-13"
     kind: "SC"
     title: "lease 到期由 1 s tick 主動處理"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -495,7 +495,7 @@ changes:
   - id: "SC-14"
     kind: "SC"
     title: "flash probe 資格加註 RELEASED／RECOVERING／drain／前景操作"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -548,7 +548,7 @@ changes:
   - id: "SC-16"
     kind: "SC"
     title: "console line buffer 上限與被拒整行 WARNING log"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"

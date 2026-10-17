@@ -259,7 +259,7 @@ serialwrap device attach --selector COM0
 | `SAMPLE_READ_FAILED` | cli_local／posix、windows | 修正參數後 | profile test 讀取樣本檔失敗 | 確認樣本檔路徑與讀取權限後重試 |
 | `SEND_FAILED` | rec／posix、windows | 否 | send 回呼拋出例外，無法確定命令是否已送出（結果不明） | 勿自動重送；先以 session self-test 與 command.get 確認狀態，再由操作者決定 |
 | `SESSION_BUSY` | rpc、rec／posix、windows | 是 | 同一 session 的前景操作仍在進行中 | 等待前景操作完成後重試 |
-| `SESSION_INTERACTIVE_BUSY` | rpc、rec／posix、windows | 是 | 已有不可搶占的 interactive lease，命令或檔案操作被拒 | 等待 interactive lease 結束（interactive close 或逾時）後重試 |
+| `SESSION_INTERACTIVE_BUSY` | rpc、rec／posix、windows | 是 | 已有不可搶占的 interactive lease，或 SC-13 到期收尾的 ownership restore 尚未完成；相關操作被拒 | 等待 interactive lease 結束或到期收尾完成後重試 |
 | `SESSION_NOT_FOUND` | rpc／posix、windows | 修正參數後 | selector 未對應任何 session | 以 session list 確認 selector 正確後重送 |
 | `SESSION_NOT_READY` | rpc、rec／posix、windows | 視情況 | session 狀態不符（非 READY，或 bridge 不存在） | 等待 session 進入 READY 後重試；必要時以 session self-test 檢查狀態 |
 | `SESSION_QUEUE_FULL` | rpc／posix、windows | 是 | session 已接受或執行中的命令（含已 cancel 但 worker 仍執行）達 256 筆上限 | 等待排隊命令完成後重試 |

@@ -963,7 +963,8 @@ class TestRefineOwnership(unittest.TestCase):
         replacement_id = replacement["interactive_id"]
         self.assertNotEqual(replacement_id, expired_id)
         replaced = self.manager.interactive_send(expired_id, data="replaced")
-        self.assertEqual(replaced["error_code"], "INTERACTIVE_NOT_FOUND")
+        # SC-13：新 lease 不會提前淘汰 FIFO 中仍保留的 expired tombstone。
+        self.assertEqual(replaced["error_code"], "INTERACTIVE_EXPIRED")
         self.assertEqual(self.bridge.tx, [])
         self.assertTrue(self.manager.interactive_close(replacement_id)["ok"])
 

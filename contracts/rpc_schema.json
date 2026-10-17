@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/hamanpaul/serialwrap/contracts/rpc_schema.json",
   "title": "serialwrap RPC contract",
-  "x-catalog-revision": 6,
+  "x-catalog-revision": 7,
   "x-wire": {
     "framing": "ndjson",
     "line_strip": true,
@@ -4451,17 +4451,24 @@
       },
       "errors": [
         "INVALID_ARGS",
-        "SESSION_NOT_READY"
+        "SESSION_NOT_READY",
+        "SESSION_INTERACTIVE_BUSY"
       ],
       "error_order": [
         "INVALID_ARGS",
-        "SESSION_NOT_READY"
+        "SESSION_NOT_READY",
+        "SESSION_INTERACTIVE_BUSY"
       ],
       "side_effects": [
         {
           "what": "新增 console client；本次新開 human lease（owner human:<client_id>，timeout max(hard_timeout_s, 86400)）",
           "when": "on_success",
           "idempotent": false
+        },
+        {
+          "what": "SC-13 到期收尾尚在還原 ownership 時回 SESSION_INTERACTIVE_BUSY，不新增 console client 或 human lease",
+          "when": "on_failure",
+          "idempotent": true
         }
       ],
       "retryable_readonly": false,
@@ -4706,17 +4713,24 @@
       },
       "errors": [
         "INVALID_ARGS",
-        "INTERACTIVE_NOT_FOUND"
+        "INTERACTIVE_NOT_FOUND",
+        "INTERACTIVE_EXPIRED"
       ],
       "error_order": [
         "INVALID_ARGS",
-        "INTERACTIVE_NOT_FOUND"
+        "INTERACTIVE_NOT_FOUND",
+        "INTERACTIVE_EXPIRED"
       ],
       "side_effects": [
         {
-          "what": "關閉 lease、還原 stashed human lease、resume interactive；session 不在時直接移除",
+          "what": "active lease 關閉、可能還原 stashed human lease 並 resume interactive；session 不在時移除 lease",
           "when": "on_success",
           "idempotent": false
+        },
+        {
+          "what": "expired tombstone 回 INTERACTIVE_EXPIRED 並保留，不移除 tombstone",
+          "when": "on_failure",
+          "idempotent": true
         }
       ],
       "retryable_readonly": false,
@@ -4841,6 +4855,11 @@
           "what": "command 非空時 bridge.send_command(command, source=owner)，TX 非冪等",
           "when": "on_success",
           "idempotent": false
+        },
+        {
+          "what": "SC-13 到期收尾尚在還原 ownership 時回 SESSION_INTERACTIVE_BUSY，不建立新 lease",
+          "when": "on_failure",
+          "idempotent": true
         }
       ],
       "retryable_readonly": false,
@@ -4931,7 +4950,7 @@
           "idempotent": false
         },
         {
-          "what": "lease 已逾時：標記 status=expired 並關閉 lease（_close_interactive_locked）",
+          "what": "lease 已逾時或已由 1 s tick 收回：保留每個 session 最多 16 個 tombstone；可能還原 human lease、resume 並 flush deferred bytes",
           "when": "on_failure",
           "idempotent": false
         }
@@ -5021,7 +5040,7 @@
           "idempotent": false
         },
         {
-          "what": "lease 已逾時：標記 status=expired 並關閉 lease（_close_interactive_locked）",
+          "what": "active lease 已逾時：關閉並保留 tombstone；session/bridge 不存在時依錯誤順序先回 SESSION_NOT_READY；1 s tick 也可提前收回並 resume/flush deferred bytes",
           "when": "on_failure",
           "idempotent": false
         }

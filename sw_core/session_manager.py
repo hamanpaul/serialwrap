@@ -4,6 +4,7 @@ import base64
 import dataclasses
 import itertools
 import json
+import logging
 import os
 import re
 import shlex
@@ -13,7 +14,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from . import serial_port as serial_port_mod
 from . import uart_io as uart_io_mod
@@ -36,6 +37,7 @@ from .constants import (
     ERROR_RX_FLOOD,
     ERROR_TRANSPORT_STALL,
     HUMAN_ACTIVE_WINDOW_S,
+    INTERACTIVE_TOMBSTONE_MAX,
     LOG_DIR,
     MAX_RECOVERY_LEASE_S,
     READY_RECONFIRM_MAX_ATTEMPTS,
@@ -333,13 +335,25 @@ class _PostCloseAction:
     bridge: "UARTBridge | None" = None
     needs_resume: bool = False
     clear_owner_after_resume: bool = False
+    should_execute: Callable[[], bool] | None = None
+    on_complete: Callable[[], None] | None = None
 
     def execute(self) -> None:
-        if self.bridge is None or not self.needs_resume:
-            return
-        self.bridge.resume_interactive()
-        if self.clear_owner_after_resume:
-            self.bridge.set_interactive_owner(None)
+        try:
+            if self.bridge is None or not self.needs_resume:
+                return
+            if self.should_execute is not None and not self.should_execute():
+                return
+            try:
+                self.bridge.resume_interactive()
+            finally:
+                if self.clear_owner_after_resume and (
+                    self.should_execute is None or self.should_execute()
+                ):
+                    self.bridge.set_interactive_owner(None)
+        finally:
+            if self.on_complete is not None:
+                self.on_complete()
 
 
 @dataclasses.dataclass
@@ -759,6 +773,8 @@ class SessionManager:
         self._release_persist_events: dict[str, threading.Event] = {}
         self._background: dict[str, BackgroundCapture] = {}
         self._interactive: dict[str, InteractiveLease] = {}
+        self._tombstones: dict[str, deque[str]] = {}
+        self._interactive_post_close: dict[str, object] = {}
         self._capture_fps: dict[str, Any] = {}  # capture_id → open file object
         self._templates: list[ProfileTemplate] = list(templates) if templates else []
         self._max_sessions = max_sessions
@@ -1981,12 +1997,86 @@ class SessionManager:
         with self._lock:
             self._reprobe_workers = [t for t in self._reprobe_workers if t.is_alive()]
 
+    def _expire_interactive_leases_tick(self, now: float | None = None) -> int:
+        """由週期 tick 收回到期的非 human lease，並在鎖外執行還原與回放。"""
+        tick_now = time.monotonic() if now is None else now
+        post_actions: list[tuple[str, _PostCloseAction]] = []
+        expired_count = 0
+        with self._lock:
+            for interactive_id, lease in list(self._interactive.items()):
+                if lease.status != "active" or lease.owner.startswith("human:"):
+                    continue
+                if tick_now - lease.last_activity_at <= lease.timeout_s:
+                    continue
+                session = self._sessions.get(lease.session_id)
+                if session is None:
+                    self._record_interactive_terminal_locked(
+                        lease, terminal_status="expired", keep_tombstone=True,
+                    )
+                    expired_count += 1
+                    continue
+                closed, post = self._close_interactive_locked(
+                    session,
+                    interactive_id=interactive_id,
+                    terminal_status="expired",
+                    keep_tombstone=True,
+                )
+                if closed is not None:
+                    if post.needs_resume and post.bridge is not None:
+                        token = object()
+                        self._interactive_post_close[session.session_id] = token
+                        bridge_generation = session.bridge_generation
+                        expected_interactive_id = session.interactive_session_id
+                        post.should_execute = lambda s=session, b=post.bridge, g=bridge_generation, i=expected_interactive_id, t=token: self._interactive_tick_action_is_current(
+                            s, b, g, i, t,
+                        )
+                        post.on_complete = lambda s=session, t=token: self._finish_interactive_tick_action(
+                            s, t,
+                        )
+                    post_actions.append((interactive_id, post))
+                    expired_count += 1
+        for interactive_id, post in post_actions:
+            try:
+                post.execute()
+            except Exception as exc:
+                logging.getLogger("serialwrap").warning(
+                    "serialwrap: interactive lease 到期後還原失敗（interactive_id=%s error=%s）",
+                    interactive_id,
+                    type(exc).__name__,
+                )
+        return expired_count
+
+    def _interactive_tick_action_is_current(
+        self,
+        session: SessionRuntime,
+        bridge: UARTBridge,
+        bridge_generation: int,
+        interactive_id: str | None,
+        token: object,
+    ) -> bool:
+        """確認鎖外到期收尾仍屬於原 session、bridge 與 lease ownership。"""
+        with self._lock:
+            return (
+                self._interactive_post_close.get(session.session_id) is token
+                and self._sessions.get(session.session_id) is session
+                and session.bridge is bridge
+                and session.bridge_generation == bridge_generation
+                and session.interactive_session_id == interactive_id
+            )
+
+    def _finish_interactive_tick_action(self, session: SessionRuntime, token: object) -> None:
+        """鎖外到期收尾完成後解除該 session 的 lease admission gate。"""
+        with self._lock:
+            if self._interactive_post_close.get(session.session_id) is token:
+                self._interactive_post_close.pop(session.session_id, None)
+
     def reconcile_readiness(self) -> None:
         """週期性重探可復原的非 READY session。
 
         本方法由 DeviceWatcher tick 同步呼叫，因此只在 lock 內收集候選、不在此同步等待 probe；
         ATTACHED 的 readiness probe 改交背景 worker（Finding 3），DETACHED 走既有 threaded _spawn_attach。
         """
+        self._expire_interactive_leases_tick()
         now = time.monotonic()
         jobs: list[tuple[str, str, UARTBridge | None, str]] = []
         with self._lock:
@@ -2136,6 +2226,8 @@ class SessionManager:
             session.retained_human_timeout_s = human_timeout_s
 
     def _restore_retained_human_console_locked(self, session: SessionRuntime) -> None:
+        if session.session_id in self._interactive_post_close:
+            return
         owner = session.retained_human_owner
         timeout_s = session.retained_human_timeout_s
         session.retained_human_owner = None
@@ -2742,8 +2834,15 @@ class SessionManager:
                 if session.state not in ("READY", "ATTACHED"):
                     continue
                 by_id = session.profile.device_by_id
-                dev = self._devices.get(by_id) if by_id else None
                 com = session.profile.com
+                if (
+                    session._pending_drain is not None
+                    or (by_id is not None and by_id in self._draining_by_ids)
+                    or session.foreground_busy
+                    or session._foreground_operation is not None
+                ):
+                    continue
+                dev = self._devices.get(by_id) if by_id else None
                 out.append({
                     "com": com,
                     "by_id": by_id,
@@ -2764,6 +2863,23 @@ class SessionManager:
                 return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
             if session.state == "FLASHING":
                 return {"ok": True, "already_flashing": True, "session": session.to_public_dict()}
+            if session.state == "RELEASED":
+                return {
+                    "ok": False,
+                    "error_code": "SESSION_NOT_READY",
+                    "session": session.to_public_dict(),
+                }
+            by_id = session.profile.device_by_id
+            if (
+                session.state == "RECOVERING"
+                or session._pending_drain is not None
+                or (by_id is not None and by_id in self._draining_by_ids)
+            ):
+                return {
+                    "ok": False,
+                    "error_code": "SESSION_RECOVERING",
+                    "session": session.to_public_dict(),
+                }
             session.flash_prev_state = session.state   # 記住以便結束後恢復
             session.state = "FLASHING"
             if self._admission is not None:
@@ -5070,12 +5186,38 @@ class SessionManager:
         session.bridge.set_interactive_owner(owner)
         return lease
 
+    def _record_interactive_terminal_locked(
+        self,
+        lease: InteractiveLease,
+        *,
+        terminal_status: Literal["closed", "expired"],
+        keep_tombstone: bool,
+    ) -> None:
+        """設定 lease 終態並維護每個 session 的有界 expired FIFO。"""
+        lease.status = terminal_status
+        if not keep_tombstone:
+            self._interactive.pop(lease.interactive_id, None)
+            return
+
+        tombstones = self._tombstones.setdefault(lease.session_id, deque())
+        if lease.interactive_id not in tombstones:
+            tombstones.append(lease.interactive_id)
+        while len(tombstones) > INTERACTIVE_TOMBSTONE_MAX:
+            expired_id = tombstones.popleft()
+            expired_lease = self._interactive.get(expired_id)
+            if expired_lease is not None and expired_lease.status == "expired":
+                self._interactive.pop(expired_id, None)
+        if not tombstones:
+            self._tombstones.pop(lease.session_id, None)
+
     def _close_interactive_locked(
         self,
         session: SessionRuntime,
         *,
         interactive_id: str | None = None,
         expected_owner: str | None = None,
+        terminal_status: Literal["closed", "expired"] = "closed",
+        keep_tombstone: bool = False,
     ) -> tuple[InteractiveLease | None, _PostCloseAction]:
         """Close interactive lease。回傳 (closed_lease, post_close_action)。
 
@@ -5088,9 +5230,6 @@ class SessionManager:
         lease = self._interactive.get(lease_id)
         if lease is not None and expected_owner is not None and lease.owner != expected_owner:
             return None, post
-        if lease is not None:
-            lease.status = "closed"
-            self._interactive.pop(lease_id, None)
 
         # 帶 suspended_human 的 lease（bootloader recovery 或 #53 soft preempt）關閉時 →
         # 還原 stash 的 human lease 或丟棄；不限 recovery_mode，soft preempt（recovery_mode=False）亦適用。
@@ -5125,6 +5264,12 @@ class SessionManager:
                     session.interactive_session_id is not None,
                 )
 
+            if lease is not None:
+                self._record_interactive_terminal_locked(
+                    lease,
+                    terminal_status=terminal_status,
+                    keep_tombstone=keep_tombstone,
+                )
             return lease, post
 
         # 一般 close
@@ -5133,6 +5278,12 @@ class SessionManager:
             session.bridge.set_interactive_owner(None)
         if self._admission is not None:
             self._admission.set_flag(session.profile.com, "lease", False)
+        if lease is not None:
+            self._record_interactive_terminal_locked(
+                lease,
+                terminal_status=terminal_status,
+                keep_tombstone=keep_tombstone,
+            )
         return lease, post
 
     def _refresh_interactive_locked(
@@ -5146,6 +5297,16 @@ class SessionManager:
         if lease is None:
             _, post = self._close_interactive_locked(session, interactive_id=lease_id)
             return None, post
+        if not lease.owner.startswith("human:") and lease.expired():
+            _, post = self._close_interactive_locked(
+                session,
+                interactive_id=lease_id,
+                terminal_status="expired",
+                keep_tombstone=True,
+            )
+            restored_id = session.interactive_session_id
+            restored = self._interactive.get(restored_id) if restored_id is not None else None
+            return restored, post
         if session.bridge is None:
             _, post = self._close_interactive_locked(session, interactive_id=lease_id)
             return None, post
@@ -5168,12 +5329,6 @@ class SessionManager:
             if snapshot.get("interactive_owner") != lease.owner:
                 _, post = self._close_interactive_locked(session, interactive_id=lease_id)
                 return None, post
-        else:
-            if lease.expired():
-                _, post = self._close_interactive_locked(session, interactive_id=lease_id)
-                restored_id = session.interactive_session_id
-                restored = self._interactive.get(restored_id) if restored_id is not None else None
-                return restored, post
         return lease, post
 
     def _lease_context(
@@ -5464,6 +5619,8 @@ class SessionManager:
             with self._lock:
                 if not self._foreground_operation_current_locked(session, bridge, operation):
                     return {"ok": False, "error_code": "FLUSHED_BY_RECOVERY"}
+                if session.session_id in self._interactive_post_close:
+                    return {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY"}
                 lease, post = self._refresh_interactive_locked(session)
                 if lease is None:
                     lease = self._open_interactive_locked(
@@ -5705,6 +5862,8 @@ class SessionManager:
             with self._lock:
                 if not self._foreground_operation_current_locked(session, bridge, operation):
                     return {"ok": False, "error_code": "FLUSHED_BY_RECOVERY"}
+                if session.session_id in self._interactive_post_close:
+                    return {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY"}
                 for bg_cmd_id in list(session.background_cmd_ids):
                     capture = self._background.get(bg_cmd_id)
                     if capture is not None:
@@ -5842,6 +6001,8 @@ class SessionManager:
         if human:
             post = _PostCloseAction()
             with self._lock:
+                if session.session_id in self._interactive_post_close:
+                    return {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY"}
                 lease, post = self._refresh_interactive_locked(session)
                 if lease is None:
                     lease = self._open_interactive_locked(
@@ -5964,6 +6125,8 @@ class SessionManager:
             session = self.get_session(selector)
             if session is None or session.bridge is None or session.state not in {"READY", "ATTACHED"}:
                 return {"ok": False, "error_code": "SESSION_NOT_READY", "selector": selector}
+            if session.session_id in self._interactive_post_close:
+                return {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY", "selector": session.profile.com}
             payload = session.bridge.attach_console(label=label)
             if payload.get("client_id") is None:
                 # 無 PTY 平台（Windows TCP console，#84 PORT-2）：human 直接連 TCP 端點，console
@@ -6056,6 +6219,12 @@ class SessionManager:
                 if session.state == "READY":
                     if session.foreground_busy or session._foreground_operation is not None:
                         return {"ok": False, "error_code": "SESSION_BUSY", "selector": session.profile.com}
+                    if session.session_id in self._interactive_post_close:
+                        return {
+                            "ok": False,
+                            "error_code": "SESSION_INTERACTIVE_BUSY",
+                            "interactive_session_id": session.interactive_session_id,
+                        }
                     # READY 一律走既有路徑；allow_attached 在 READY 下不改變語意。
                     existing, post = self._refresh_interactive_locked(session)
                     if post.needs_resume:
@@ -6146,6 +6315,12 @@ class SessionManager:
                                 "error_detail": "NOT_BOOTLOADER",
                             }
 
+                    if session.session_id in self._interactive_post_close:
+                        return {
+                            "ok": False,
+                            "error_code": "SESSION_INTERACTIVE_BUSY",
+                            "interactive_session_id": session.interactive_session_id,
+                        }
                     # 清除 expired lease（避免 BUSY 誤判）；若 close 需要 resume，
                     # 先在 lock 外完成 post-close，再重新評估是否要 stash human。
                     existing, post = self._refresh_interactive_locked(session)
@@ -6244,13 +6419,25 @@ class SessionManager:
         result: dict[str, Any]
         with self._lock:
             lease = self._interactive.get(interactive_id)
-            if lease is None or lease.status != "active":
+            if lease is None:
+                return {"ok": False, "error_code": "INTERACTIVE_NOT_FOUND", "interactive_id": interactive_id}
+            if lease.status == "expired":
+                return {"ok": False, "error_code": "INTERACTIVE_EXPIRED", "interactive_id": interactive_id}
+            if lease.status != "active":
                 return {"ok": False, "error_code": "INTERACTIVE_NOT_FOUND", "interactive_id": interactive_id}
             if lease.expired():
-                lease.status = "expired"
                 session = self._sessions.get(lease.session_id)
                 if session is not None:
-                    _, post = self._close_interactive_locked(session, interactive_id=interactive_id)
+                    _, post = self._close_interactive_locked(
+                        session,
+                        interactive_id=interactive_id,
+                        terminal_status="expired",
+                        keep_tombstone=True,
+                    )
+                else:
+                    self._record_interactive_terminal_locked(
+                        lease, terminal_status="expired", keep_tombstone=True,
+                    )
                 result = {"ok": False, "error_code": "INTERACTIVE_EXPIRED", "interactive_id": interactive_id}
             else:
                 session = self._sessions.get(lease.session_id)
@@ -6277,15 +6464,23 @@ class SessionManager:
             lease = self._interactive.get(interactive_id)
             if lease is None:
                 return {"ok": False, "error_code": "INTERACTIVE_NOT_FOUND", "interactive_id": interactive_id}
+            if lease.status == "expired":
+                return {"ok": False, "error_code": "INTERACTIVE_EXPIRED", "interactive_id": interactive_id}
+            if lease.status != "active":
+                return {"ok": False, "error_code": "INTERACTIVE_NOT_FOUND", "interactive_id": interactive_id}
             session = self._sessions.get(lease.session_id)
             if session is None or session.bridge is None:
-                return {"ok": False, "error_code": "SESSION_NOT_READY", "interactive_id": interactive_id}
-            # 先檢查 expired 再 touch
-            if lease.expired():
-                lease.status = "expired"
-                _, post = self._close_interactive_locked(session, interactive_id=interactive_id)
+                result = {"ok": False, "error_code": "SESSION_NOT_READY", "interactive_id": interactive_id}
+            elif lease.expired():
+                _, post = self._close_interactive_locked(
+                    session,
+                    interactive_id=interactive_id,
+                    terminal_status="expired",
+                    keep_tombstone=True,
+                )
                 result = {"ok": False, "error_code": "INTERACTIVE_EXPIRED", "interactive_id": interactive_id}
             else:
+                # 先確認 session/bridge，再判斷期限；成功路徑仍以 touch 延長租約。
                 lease.touch()
                 result = {
                     "ok": True,
@@ -6305,6 +6500,8 @@ class SessionManager:
             lease = self._interactive.get(interactive_id)
             if lease is None:
                 return {"ok": False, "error_code": "INTERACTIVE_NOT_FOUND", "interactive_id": interactive_id}
+            if lease.status == "expired":
+                return {"ok": False, "error_code": "INTERACTIVE_EXPIRED", "interactive_id": interactive_id}
             session = self._sessions.get(lease.session_id)
             if session is not None:
                 _, post = self._close_interactive_locked(session, interactive_id=interactive_id)

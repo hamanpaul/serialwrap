@@ -205,6 +205,10 @@ CMD_PENDING_MAX: int = 256
 持續累積 accepted/running records 而 OOM（#81 Codex 必修）。"""
 DEFERRED_INPUT_MAX_BYTES: int = 256 * 1024
 """agent 命令期間單一 human console 的 deferred 輸入緩衝上限；超過即整段清空。"""
+CONSOLE_LINE_MAX_BYTES: int = 16385
+"""human console 單行輸入緩衝上限；超過即丟棄整行。"""
+INTERACTIVE_TOMBSTONE_MAX: int = 16
+"""每個 session 保留的 expired interactive lease tombstone FIFO 上限。"""
 
 
 def ensure_runtime_dirs() -> None:

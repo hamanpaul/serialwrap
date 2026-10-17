@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shlex
@@ -348,7 +349,7 @@ class SerialwrapService:
 
     def _on_console_line(self, session_id: str, client_id: str, line: str) -> None:
         mode = _human_console_mode(line)
-        self._arbiter.submit(
+        result = self._arbiter.submit(
             session_id=session_id,
             command=line,
             source=f"human:{client_id}",
@@ -358,6 +359,19 @@ class SerialwrapService:
             admission_exempt=True,
             trusted_human=True,
         )
+        error_code = result.get("error_code")
+        if not result.get("ok") and error_code in {
+            "CMD_TOO_LONG",
+            "SESSION_QUEUE_FULL",
+            "SESSION_NOT_READY",
+        }:
+            logging.getLogger("serialwrap").warning(
+                "serialwrap: console 行被拒（session=%s client=%s error_code=%s bytes=%d）",
+                session_id,
+                client_id,
+                error_code,
+                len(line.encode("utf-8")),
+            )
 
     def _bg_fallback_from_arbiter(
         self, cmd_id: str, from_chunk: int = 0,
@@ -463,7 +477,9 @@ class SerialwrapService:
             except (KeyError, AttributeError):
                 fallback_baud = None
             ack = transport.acks.get(result.by_id, b"")   # 偵測時 MCU 回的 ACK，回放給 flasher
-            self._sessions.enter_flashing(com)
+            entered = self._sessions.enter_flashing(com)
+            if not entered.get("ok"):
+                return
             transport.release_held(adopt=com)   # 命中線 gate 交接 flash 生命週期；其餘 held 一併釋放
             # 命中線已進 FLASHING（由 state 守護），偵測也已結束——立即解除**全部**候選的 flash-critical
             # 標記，避免在後續（可能數分鐘的）pump 期間誤擋無關候選 COM 的 destructive op。

@@ -2198,7 +2198,9 @@
 
 **Files**
 - Create: `tests/test_stage0_lease_flash_console.py`
-- Modify: `sw_core/session_manager.py`（`reconcile_readiness` 呼叫 `_expire_interactive_leases_tick`、`interactive_send`／`interactive_status`／`interactive_close` 的 tombstone 判定、`collect_flash_candidates_and_mark`、`enter_flashing`）、`sw_core/uart_io.py`（`_consume_console_input`、`ConsoleClient.line_overflow`）、`sw_core/service.py`（`_on_console_line` 檢查 submit 結果並 log）、`sw_core/constants.py`（`CONSOLE_LINE_MAX_BYTES = 16385`、`INTERACTIVE_TOMBSTONE_MAX = 16`）
+- Modify: `sw_core/session_manager.py`（`reconcile_readiness` 呼叫 `_expire_interactive_leases_tick`、`_refresh_interactive_locked`、`attach_console`／`interactive_open` 的到期收尾 admission gate、`interactive_send`／`interactive_status`／`interactive_close` 的 tombstone 判定、`collect_flash_candidates_and_mark`、`enter_flashing`）、`sw_core/uart_io.py`（`_consume_console_input`、`ConsoleClient.line_overflow`）、`sw_core/service.py`（`_on_console_line` 檢查 submit 結果並 log、`_on_flash_open` 拒絕入場時釋放 probe 狀態）、`sw_core/constants.py`（`CONSOLE_LINE_MAX_BYTES = 16385`、`INTERACTIVE_TOMBSTONE_MAX = 16`）
+- Modify: `contracts/behavior_changes.yaml`（SC-13／14／16 狀態）、`contracts/error_codes.yaml`（`INTERACTIVE_EXPIRED` 的 SC-13 狀態、scope、contract tests；`SESSION_INTERACTIVE_BUSY` 收錄 ownership restore gate）、`contracts/rpc_schema.json`（interactive open/close 錯誤 side effects 與 close 錯誤順序，遞增 `x-catalog-revision`）、`contracts/daemon_logging.yaml`（新增 WARNING 模板並同步 source 行）、`sw_core/assets/skill/SKILL.md`、`sw_core/assets/skill/SKILL_WINDOWS.md`（重新產生受管 error code 區段）
+- Modify（測試資產）：`tests/test_refine_ownership.py`、`tests/test_contracts_keep_baseline.py`（變更理由見「測試資產變更」）
 
 **Interfaces**
 - Produces（Python）：
@@ -2251,12 +2253,23 @@
       assert mgr.interactive_close(lid)["error_code"] == "INTERACTIVE_EXPIRED"
       assert mgr.interactive_send(lid, data="ls")["error_code"] == "INTERACTIVE_EXPIRED"   # close 不刪 tombstone
 
+  def test_reconcile_readiness_expires_agent_lease(tmp_path):
+      mgr, s = _ready_mgr(tmp_path)
+      lid = mgr.interactive_open("COM0", owner="agent:x", timeout_s=0.05)["interactive_id"]
+      time.sleep(0.1)
+      mgr.reconcile_readiness()                     # 單獨驗證 DeviceWatcher 的週期入口
+      assert s.interactive_session_id is None
+      assert mgr._interactive[lid].status == "expired"
+      assert mgr.interactive_send(lid, data="ls")["error_code"] == "INTERACTIVE_EXPIRED"
+
   def test_status_touch_still_extends(tmp_path):
       mgr, s = _ready_mgr(tmp_path)
-      lid = mgr.interactive_open("COM0", owner="agent:x", timeout_s=0.3)["interactive_id"]
+      lid = mgr.interactive_open("COM0", owner="agent:x", timeout_s=1.0)["interactive_id"]
       for _ in range(4):
-          time.sleep(0.1); mgr.interactive_status(lid)
+          time.sleep(0.3)
+          assert mgr.interactive_status(lid)["ok"] is True
       assert mgr._expire_interactive_leases_tick() == 0
+      assert mgr._interactive[lid].status == "active"
 
   def test_flash_candidates_exclude_busy_and_draining(tmp_path):
       mgr = make_manager(tmp_path, [make_profile(platform="passthrough")])
@@ -2289,12 +2302,22 @@
   | `test_console_line_rejected_not_ready_logged` | ATTACHED（無 queue）時 line 被 `SESSION_NOT_READY` 拒絕 → WARNING 含 `error_code=SESSION_NOT_READY` |
   | `test_tombstone_fifo_bound_16` | 同 session 連續 17 個 lease 到期 → `_interactive` 中該 session 的 expired 數為 16，最舊者回 `INTERACTIVE_NOT_FOUND` |
   | `test_tick_restores_human_owner_after_soft_preempt_expiry` | soft preempt lease 到期 → bridge `interactive_owner` 還原為 human、上下文未失效的 deferred 被回放 |
+  | `test_tick_blocks_new_lease_until_owner_restore_finishes` | 用事件控制鎖外收尾交錯；收尾完成前新 open 回 `SESSION_INTERACTIVE_BUSY`，完成後 bridge 與 manager owner 一致 |
+  | `test_tick_continues_after_one_session_replay_failure` | 第一個 session replay 回報 TX unknown 時只嘗試一次，第二個 session 仍完成 resume，失敗 session suspend depth 歸零且 owner 清理 |
+  | `test_interactive_status_keeps_session_not_ready_precedence` | active lease 到期但 bridge 不存在時仍依凍結順序回 `SESSION_NOT_READY`；既有 expired tombstone 仍回 `INTERACTIVE_EXPIRED` |
   | `test_human_lease_not_expired_by_tick` | human lease 不受 timeout tick 影響（現況只看 peer） |
   | `test_flash_candidates_exclude_pending_drain` | `_pending_drain` 非 None 的 session 不在候選中 |
+  | `test_flash_candidates_exclude_draining_by_id_and_foreground_operation` | `_draining_by_ids` 與 `_foreground_operation` 各自存在時都排除候選 |
+  | `test_enter_flashing_rejects_active_drain` | `_pending_drain` 或 `_draining_by_ids` 命中時維持 READY 並回 `SESSION_RECOVERING` |
+  | `test_on_flash_open_failed_enter_releases_probe_resources` | `enter_flashing` 拒絕命中結果時不鏡射 termios／啟 pump，且釋放 held gates 與 flash-critical 標記 |
 - [ ] **A2 執行並確認 FAIL**：`python3 -m pytest -q tests/test_stage0_lease_flash_console.py` → 預期 `AttributeError: … '_expire_interactive_leases_tick'`。commit：`test(session): SC-13/14/16 lease tick、flash 資格與 console 行上限失敗測試`
 - [ ] **B1 實作**：依行為規格。
 - [ ] **B2 執行並確認 PASS**：`python3 -m pytest -q tests/test_stage0_lease_flash_console.py tests/test_login_recovery_lease.py tests/test_issue26_interactive_guard.py tests/test_flash_probe.py tests/test_flash_service_wiring.py tests/test_flashing_state.py tests/test_service_human_console.py tests/test_uart_io.py`；`python3 -m tools.contracts check`；全套依 §0 第 4 點。
-- **測試資產變更**：無（`_close_interactive_locked` 新參數有預設值，既有呼叫點與測試行為不變）。
+- **測試資產變更**（A1.5 re-lock 待獨立審閱；既有斷言維持或依 SC-13 契約精煉，PR 須列明並由獨立審閱者確認）：
+  - `tests/test_refine_ownership.py::TestRefineOwnership::test_unknown_closed_expired_and_replaced_interactive_ids_do_not_tx`：被 tombstone 保留的 replaced id 改預期 `INTERACTIVE_EXPIRED`；零 TX 斷言不變（SC-13）。
+  - `tests/test_stage0_lease_flash_console.py::test_tick_restores_human_owner_after_soft_preempt_expiry`：加入仍存活的 `ConsoleClient`（`attached_at` 設為目前時間），使替身符合 T09 resume 只回放 live client 的契約；owner／回放斷言不變（SC-13）。
+  - `tests/test_stage0_lease_flash_console.py`：補週期 reconcile 收回、touch 非 vacuous、post-close admission 交錯、雙 session replay 失敗隔離、status 錯誤順序與 flash guard 失敗回歸案例（SC-13／14）。
+  - `tests/test_contracts_keep_baseline.py::test_last_error_logging_templates_match`：將兩個既有 WARNING source 行更新為目前程式位置；原 HEAD 已因舊行號失敗，不改日誌模板斷言。
 - [ ] **B3 commit**：`fix(session): SC-13 lease 到期主動收回、SC-14 flash 認線資格、SC-16 console 行上限與拒絕診斷`
 
 ---
