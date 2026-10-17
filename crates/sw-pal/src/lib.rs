@@ -1,9 +1,6 @@
-//! `sw-pal`：client 側平台抽象層（P3-T1 骨架；P3-T9 承接實作）。
+//! `sw-pal`：client 側平台抽象層。
 //!
 //! 平台相依 cfg 只允許出現在本 crate（arch §2.1）。業務 crate 只看 `ClientCaps` 的值，不比較 OS 名稱。
-//! 行為尚未實作的函式本體一律 `todo!("P3-T9: <name>")`。
-#![allow(unused_variables)]
-
 use std::sync::Arc;
 
 pub mod clock;
@@ -61,5 +58,53 @@ pub struct ClientCaps {
 
 /// 組裝點呼叫：依目前平台建立 client 側能力包。
 pub fn native_client() -> ClientPlatform {
-    todo!("P3-T9: native_client")
+    #[cfg(unix)]
+    {
+        use crate::clock::posix::NativeClock;
+        use crate::fs_ops::posix::NativeFsRead;
+        use crate::process::posix::NativeProcessCtl;
+        use crate::rpc_transport::posix::NativeRpcConnector;
+        use crate::sysenv::posix::NativeSysEnv;
+
+        ClientPlatform {
+            env: Arc::new(NativeSysEnv),
+            fs: Arc::new(NativeFsRead),
+            clock: Arc::new(NativeClock),
+            rpc: Arc::new(NativeRpcConnector),
+            process: Arc::new(NativeProcessCtl),
+            caps: ClientCaps {
+                path_flavor: PalPathFlavor::Posix,
+                af_unix: true,
+                native_backend: BackendKind::Posix,
+                default_skill: SkillPlatform::Linux,
+                text_newline: "\n",
+                exec_replace: true,
+            },
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use crate::clock::windows::NativeClock;
+        use crate::fs_ops::windows::NativeFsRead;
+        use crate::process::windows::NativeProcessCtl;
+        use crate::rpc_transport::windows::NativeRpcConnector;
+        use crate::sysenv::windows::NativeSysEnv;
+
+        ClientPlatform {
+            env: Arc::new(NativeSysEnv),
+            fs: Arc::new(NativeFsRead),
+            clock: Arc::new(NativeClock),
+            rpc: Arc::new(NativeRpcConnector),
+            process: Arc::new(NativeProcessCtl),
+            caps: ClientCaps {
+                path_flavor: PalPathFlavor::Windows,
+                af_unix: false,
+                native_backend: BackendKind::Win,
+                default_skill: SkillPlatform::Windows,
+                text_newline: "\r\n",
+                exec_replace: false,
+            },
+        }
+    }
 }
