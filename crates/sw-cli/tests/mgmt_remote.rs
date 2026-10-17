@@ -72,6 +72,11 @@ fn expose_identity(forward_src: &str) -> String {
     })
 }
 
+/// 把路徑字串嵌入 JSON 字串常值時所需的跳脫（`\\` 與 `"`）；Windows 主機的 tmp 路徑含反斜線。
+fn json_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 /// `build_argv` 輸出中緊接在 `flag` 之後的參數值（`-L`／`-R` 的方向參數）。
 fn arg_after<'a>(argv: &'a [String], flag: &str) -> &'a str {
     let index = argv
@@ -495,6 +500,7 @@ fn status_prunes_dead_and_lists_orphan() {
         .join("cm-49000")
         .display()
         .to_string();
+    let cm = json_escape(&cm);
     assert_eq!(
         out,
         format!(
@@ -557,7 +563,7 @@ fn registry_reads_python_written_pgid_null() {
     let t = TestEnv::posix().with_tunnel_ready();
     let dir = t.run_dir().join("remote");
     std::fs::create_dir_all(&dir).unwrap();
-    let cp = dir.join("cm-48800").display().to_string();
+    let cp = json_escape(&dir.join("cm-48800").display().to_string());
     let doc = format!(
         "{{\"control_path\":\"{cp}\",\"endpoint\":\"tcp://127.0.0.1:48800\",\"forward_target\":\"/run/sw.sock\",\"identity\":\"x\",\"listen_port\":48800,\"pgid\":null,\"pid\":999,\"pid_start_ticks\":null,\"remote_bind\":\"127.0.0.1:48800\",\"role\":\"expose\",\"status\":\"active\",\"target\":\"u@relay\",\"via\":\"ssh\"}}"
     );

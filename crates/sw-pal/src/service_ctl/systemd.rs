@@ -71,11 +71,11 @@ impl SystemdCtl {
                         .join(HOLD_DROPIN_NAME),
                 )
             }
-            SupervisionMode::SystemdSystem => Some(
-                PathBuf::from("/etc/systemd/system")
-                    .join(format!("{name}.service.d"))
-                    .join(HOLD_DROPIN_NAME),
-            ),
+            // 系統層 drop-in 路徑會原樣進入 `sudo install`／`sudo rm` 的 argv，必為 POSIX 路徑；
+            // 以 `/` 組字串而非 `Path::join`，避免共用程式在 Windows 測試時混入 `\\`。
+            SupervisionMode::SystemdSystem => Some(PathBuf::from(format!(
+                "/etc/systemd/system/{name}.service.d/{HOLD_DROPIN_NAME}"
+            ))),
             _ => None,
         }
     }

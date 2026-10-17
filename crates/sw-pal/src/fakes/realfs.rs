@@ -1,7 +1,7 @@
 //! 真實檔案系統替身（feature `test-fakes`；只供 tempdir 內的測試使用，不是產品路徑）。
 //!
 //! 所有 `FsRead`／`FsOps` 方法皆以 `std::fs` 實作（測試用，非原子保證、非產品鎖語意）；跨行程鎖以 `flock`（Unix）
-//! 取得，Windows 測試替身回 `Unsupported`（原生 `LockFileEx` 由 P4-T5 原生實作承接）。產品路徑請勿引用本模組。
+//! 取得，Windows 測試替身沿用 P4-T5 原生 `LockFileEx`。產品路徑請勿引用本模組。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,7 +13,13 @@ use crate::traits::{FsRead, PalError, PalErrorKind, PalResult};
 pub struct RealFs;
 
 fn io_error(e: std::io::Error) -> PalError {
-    PalError::plain(PalErrorKind::Io, e.to_string())
+    // 保留「不存在」分類：Windows 的 ERROR_PATH_NOT_FOUND（os error 3）訊息不含 POSIX 字樣，只靠字串判斷會誤判。
+    let kind = if e.kind() == std::io::ErrorKind::NotFound {
+        PalErrorKind::NotFound
+    } else {
+        PalErrorKind::Io
+    };
+    PalError::plain(kind, e.to_string())
 }
 
 fn is_real_dir(p: &Path) -> bool {
@@ -200,13 +206,15 @@ impl FsOps for RealFs {
             }
             Ok(FileLockGuard::from_file(file))
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            // Windows 測試替身直接沿用 P4-T5 原生 `LockFileEx`，使跨行程鎖語意與產品一致。
+            crate::fs_ops::windows::NativeFsOps.file_lock_exclusive(p, blocking)
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (p, blocking);
-            Err(PalError::plain(
-                PalErrorKind::Unsupported,
-                "test fake file lock is POSIX-only; native LockFileEx is P4-T5",
-            ))
+            Err(PalError::plain(PalErrorKind::Unsupported, "test fake file lock is unsupported on this platform"))
         }
     }
 }

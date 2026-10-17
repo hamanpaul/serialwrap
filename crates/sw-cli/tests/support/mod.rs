@@ -200,11 +200,9 @@ impl TestEnv {
 
     /// 本 TestEnv 的預設 POSIX socket（`<run_dir>/serialwrapd.sock`，與 CLI 由 `SERIALWRAP_RUN_DIR` 推導的預設相同）。
     /// 以 `with_rpc_ok(&t.default_socket(), …)` 註冊即可讓不帶 `--socket` 的 CLI 呼叫落在替身上。
+    /// 以 `/` 串接（POSIX `os.path.join` 語意），使 Windows 主機上跑 POSIX 形狀測試時也與 CLI 推導值一致。
     pub fn default_socket(&self) -> String {
-        self.run_dir()
-            .join("serialwrapd.sock")
-            .display()
-            .to_string()
+        format!("{}/serialwrapd.sock", self.run_dir().display())
     }
 
     pub fn win_endpoint() -> &'static str {
