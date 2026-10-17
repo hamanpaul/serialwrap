@@ -1,9 +1,11 @@
 //! 假 `SysEnv`。
 
-use crate::traits::{PalError, PalErrorKind, SysEnv};
+use crate::traits::{CmdOutput, CmdOutputRaw, PalError, PalErrorKind, PalResult, SysEnv};
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 
 #[derive(Debug)]
 pub struct FakeEnv {
@@ -100,5 +102,54 @@ impl SysEnv for FakeEnv {
 
     fn pid(&self) -> u32 {
         std::process::id()
+    }
+
+    fn run(&self, _argv: &[String], _timeout: Option<Duration>) -> PalResult<CmdOutput> {
+        Ok(CmdOutput {
+            rc: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    }
+
+    fn run_raw(
+        &self,
+        _argv: &[String],
+        _env: Option<&[(OsString, OsString)]>,
+        _timeout: Option<Duration>,
+    ) -> PalResult<CmdOutputRaw> {
+        Ok(CmdOutputRaw {
+            rc: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        })
+    }
+
+    fn which(&self, _name: &str) -> Option<PathBuf> {
+        None
+    }
+
+    fn which_all(&self, _name: &str) -> Vec<PathBuf> {
+        Vec::new()
+    }
+
+    fn has_systemd(&self) -> bool {
+        false
+    }
+
+    fn is_wsl(&self) -> bool {
+        false
+    }
+
+    fn user_in_group(&self, _group: &str) -> bool {
+        false
+    }
+
+    fn user_identity(&self) -> String {
+        String::new()
+    }
+
+    fn local_appdata(&self) -> Option<PathBuf> {
+        None
     }
 }

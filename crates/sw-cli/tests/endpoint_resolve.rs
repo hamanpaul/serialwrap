@@ -77,6 +77,19 @@ impl SysEnv for TestEnv {
     fn pid(&self) -> u32 {
         4242
     }
+    fn run(&self, _argv: &[String], _timeout: Option<std::time::Duration>) -> PalResult<sw_pal::CmdOutput> {
+        Ok(sw_pal::CmdOutput { rc: 0, stdout: String::new(), stderr: String::new() })
+    }
+    fn run_raw(&self, _argv: &[String], _env: Option<&[(std::ffi::OsString, std::ffi::OsString)]>, _timeout: Option<std::time::Duration>) -> PalResult<sw_pal::CmdOutputRaw> {
+        Ok(sw_pal::CmdOutputRaw { rc: 0, stdout: Vec::new(), stderr: Vec::new() })
+    }
+    fn which(&self, _name: &str) -> Option<PathBuf> { None }
+    fn which_all(&self, _name: &str) -> Vec<PathBuf> { Vec::new() }
+    fn has_systemd(&self) -> bool { false }
+    fn is_wsl(&self) -> bool { false }
+    fn user_in_group(&self, _group: &str) -> bool { false }
+    fn user_identity(&self) -> String { String::new() }
+    fn local_appdata(&self) -> Option<PathBuf> { None }
 }
 
 struct TestFs {

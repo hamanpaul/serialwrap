@@ -1,4 +1,4 @@
-//! P4-T2：PAL `SysEnv` 管理面方法的紅燈測試（實作前應全數以 `not implemented: P4-T2` 失敗）。
+//! P4-T2：PAL `SysEnv` 管理面方法的契約與回歸測試。
 //!
 //! 執行：`cargo test -p sw-pal --features test-fakes --test sysenv_mgmt`。
 //! 會改動行程環境（PATH／USER／PATHEXT）或會以 PATH 解析子行程的案例，全部持有 `ENV_LOCK`，
@@ -6,6 +6,8 @@
 use std::ffi::OsString;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use sw_pal::native_client;
 use sw_pal::traits::PalErrorKind;
@@ -97,6 +99,32 @@ fn write_exe(dir: &std::path::Path, name: &str, mode: u32) {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
+#[cfg(unix)]
+fn run_with_pipe_held_by_grandchild(script: &str) -> (sw_pal::CmdOutput, Duration) {
+    let root = tempfile::tempdir().unwrap();
+    let pid_file = root.path().join("grandchild.pid");
+    let command = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        script.to_string(),
+        "sh".to_string(),
+        pid_file.to_string_lossy().into_owned(),
+    ];
+    let start = Instant::now();
+    let out = native_client()
+        .env
+        .run(&command, Some(Duration::from_millis(200)))
+        .unwrap();
+    let elapsed = start.elapsed();
+    if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+        if let Ok(pid) = pid.trim().parse::<libc::pid_t>() {
+            // SAFETY: 測試只終止本案例啟動並記錄 PID 的 sleep 子行程。
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+    (out, elapsed)
+}
+
 // ── which／which_all ──────────────────────────────────────────────
 
 #[cfg(unix)]
@@ -116,6 +144,56 @@ fn which_all_dedups_in_path_order() {
 
     let got = native_client().env.which_all("serialwrap");
     assert_eq!(got, vec![a.join("serialwrap"), b.join("serialwrap")]);
+}
+
+#[cfg(unix)]
+#[test]
+fn which_all_keeps_distinct_candidate_strings() {
+    let _g = env_guard();
+    let _restore = EnvRestore::capture(&["PATH"]);
+    let root = tempfile::tempdir().unwrap();
+    let bin = root.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    write_exe(&bin, "serialwrap", 0o755);
+    let path = format!("{}//:{}", bin.display(), bin.display());
+    std::env::set_var("PATH", path);
+
+    let got = native_client().env.which_all("serialwrap");
+    assert_eq!(got.len(), 2);
+    assert_ne!(got[0].as_os_str(), got[1].as_os_str());
+}
+
+#[cfg(unix)]
+#[test]
+fn which_uses_default_path_when_path_is_unset() {
+    let _g = env_guard();
+    let _restore = EnvRestore::capture(&["PATH"]);
+    std::env::remove_var("PATH");
+
+    let got = native_client().env.which("sh");
+    assert!(got.as_ref().is_some_and(|path| path.is_file()), "{got:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn which_treats_empty_path_entries_as_current_directory() {
+    struct CurrentDirRestore(std::path::PathBuf);
+    impl Drop for CurrentDirRestore {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).unwrap();
+        }
+    }
+
+    let _g = env_guard();
+    let _restore = EnvRestore::capture(&["PATH"]);
+    let previous = std::env::current_dir().unwrap();
+    let _cwd_restore = CurrentDirRestore(previous);
+    let root = tempfile::tempdir().unwrap();
+    write_exe(root.path(), "serialwrap", 0o755);
+    std::env::set_current_dir(root.path()).unwrap();
+    std::env::set_var("PATH", ":");
+
+    assert_eq!(native_client().env.which("serialwrap"), Some("serialwrap".into()));
 }
 
 #[cfg(unix)]
@@ -154,12 +232,18 @@ fn which_all_pathext_windows() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("serialwrap.exe"), b"MZ").unwrap();
     std::env::set_var("PATH", dir.path());
-    std::env::set_var("PATHEXT", ".EXE;.CMD");
+    std::env::set_var("PATHEXT", ".EXE;.exe");
 
-    let expected = vec![dir.path().join("serialwrap.exe")];
+    let expected = vec![
+        dir.path().join("serialwrap.EXE"),
+        dir.path().join("serialwrap.exe"),
+    ];
     assert_eq!(native_client().env.which_all("serialwrap"), expected);
     // name 已含副檔名時不得再加副檔名（不得產生 serialwrap.exe.EXE）。
-    assert_eq!(native_client().env.which_all("serialwrap.exe"), expected);
+    assert_eq!(
+        native_client().env.which_all("serialwrap.exe"),
+        vec![dir.path().join("serialwrap.exe")]
+    );
 }
 
 // ── run／run_raw ──────────────────────────────────────────────────
@@ -176,6 +260,32 @@ fn run_timeout_returns_minus1_timeout() {
         .env
         .run(&cmd, Some(Duration::from_millis(200)))
         .unwrap();
+    assert_eq!(out.rc, -1);
+    assert_eq!(out.stdout, "");
+    assert_eq!(out.stderr, "TIMEOUT");
+}
+
+#[cfg(unix)]
+#[test]
+fn run_timeout_covers_pipe_drain_after_parent_exit() {
+    let _g = env_guard();
+    let (out, elapsed) = run_with_pipe_held_by_grandchild(
+        "sleep 2 & echo $! > \"$1\"; exit 0",
+    );
+
+    assert!(elapsed < Duration::from_secs(1), "elapsed: {elapsed:?}");
+    assert_eq!(out.rc, -1);
+    assert_eq!(out.stdout, "");
+    assert_eq!(out.stderr, "TIMEOUT");
+}
+
+#[cfg(unix)]
+#[test]
+fn run_timeout_covers_pipe_drain_after_parent_is_killed() {
+    let _g = env_guard();
+    let (out, elapsed) = run_with_pipe_held_by_grandchild("sleep 2 & echo $! > \"$1\"; wait");
+
+    assert!(elapsed < Duration::from_secs(1), "elapsed: {elapsed:?}");
     assert_eq!(out.rc, -1);
     assert_eq!(out.stdout, "");
     assert_eq!(out.stderr, "TIMEOUT");
@@ -230,6 +340,29 @@ fn run_invalid_utf8_is_decode_error_like_python() {
         .expect_err("非法 UTF-8 應為解碼錯誤");
     assert_eq!(err.kind, PalErrorKind::Io);
     assert_eq!(err.py_message, want);
+}
+
+#[cfg(unix)]
+#[test]
+fn run_invalid_utf8_error_spans_match_python_goldens() {
+    let _g = env_guard();
+    let cases = [
+        ("invalid_utf8_truncated_lead", r"\xc2"),
+        ("invalid_utf8_bad_continuation", r"\xe2\x82A"),
+        ("invalid_utf8_overlong", r"\xe0\x80\x80"),
+        ("invalid_utf8_surrogate", r"\xed\xa0\x80"),
+        ("invalid_utf8_out_of_range", r"\xf4\x90\x80\x80"),
+    ];
+    for (case, bytes) in cases {
+        let line = golden_line(case);
+        let want = golden_str(&line, "decode_error").expect("golden decode_error");
+        let err = native_client()
+            .env
+            .run(&argv(&["printf", bytes]), None)
+            .unwrap_err();
+        assert_eq!(err.kind, PalErrorKind::Io, "{case}");
+        assert_eq!(err.py_message, want, "{case}");
+    }
 }
 
 #[cfg(windows)]

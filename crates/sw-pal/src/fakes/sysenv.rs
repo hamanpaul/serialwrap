@@ -25,6 +25,7 @@ pub struct FakeSysEnv {
     inner: FakeEnv,
     script: Mutex<Script>,
     user: String,
+    passwd_home: Option<String>,
     systemd: bool,
     wsl: bool,
     groups: Vec<String>,
@@ -40,6 +41,7 @@ pub struct FakeSysEnvBuilder {
     inner: FakeEnv,
     script: Script,
     user: String,
+    passwd_home: Option<String>,
     systemd: bool,
     wsl: bool,
     groups: Vec<String>,
@@ -125,9 +127,15 @@ impl FakeSysEnvBuilder {
         self
     }
 
-    /// 設定 `HOME`（`current_user_home` 以此為準）。
+    /// 設定 `HOME`（未指定 `passwd_home` 時也作為 `current_user_home`）。
     pub fn home(self, p: &Path) -> Self {
         self.var("HOME", &p.display().to_string())
+    }
+
+    /// 設定與 `HOME` 不同的 passwd 家目錄，用於驗證路徑優先序。
+    pub fn passwd_home(mut self, p: &Path) -> Self {
+        self.passwd_home = Some(p.display().to_string());
+        self
     }
 
     pub fn systemd(mut self, b: bool) -> Self {
@@ -229,6 +237,7 @@ impl FakeSysEnvBuilder {
             inner: self.inner,
             script: Mutex::new(self.script.into_iter().map(|(k, v)| (k, v.into())).collect()),
             user: self.user,
+            passwd_home: self.passwd_home,
             systemd: self.systemd,
             wsl: self.wsl,
             groups: self.groups,
@@ -252,7 +261,9 @@ impl SysEnv for FakeSysEnv {
         self.inner.system_config_dir()
     }
     fn current_user_home(&self) -> Option<String> {
-        self.inner.current_user_home()
+        self.passwd_home
+            .clone()
+            .or_else(|| self.inner.current_user_home())
     }
     fn user_home(&self, user: &str) -> Option<String> {
         self.inner.user_home(user)

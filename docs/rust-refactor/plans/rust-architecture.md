@@ -380,7 +380,7 @@ pub struct ClientCaps { pub path_flavor: PalPathFlavor, pub af_unix: bool, pub n
 
 ### 4.1 `SysEnv`、`Clock`、`FsOps`
 
-**P4-T1 修訂（計畫 Task 1）**：`SysEnv` 增加 `run(argv, timeout) -> PalResult<CmdOutput>`、`run_raw(argv, env, timeout) -> PalResult<CmdOutputRaw>`、`which`、`which_all`、`has_systemd`、`is_wsl`、`user_in_group`、`user_identity`、`local_appdata`（P4-T2 實作；預設主體 `unimplemented!`）。`FsOps: FsRead` 增加 `write_file`、`replace`、`copy_preserving`、`read_link`、`set_mode`、`sync_dir`、`symlink_file`（P4-T5 實作）；既有 `atomic_write`、`mkdirs`、`remove_file`、`copy_tree`、`remove_tree`、`symlink_or_copy_dir`、`file_lock_exclusive` 維持 P4-T5 簽章。P3 呼叫端僅使用 `FsRead` 方法，不需修改。
+**P4-T1 修訂（計畫 Task 1）**：`SysEnv` 增加 `run(argv, timeout) -> PalResult<CmdOutput>`、`run_raw(argv, env, timeout) -> PalResult<CmdOutputRaw>`、`which`、`which_all`、`has_systemd`、`is_wsl`、`user_in_group`、`user_identity`、`local_appdata`（P4-T2 實作）。`FsOps: FsRead` 增加 `write_file`、`replace`、`copy_preserving`、`read_link`、`set_mode`、`sync_dir`、`symlink_file`（P4-T5 實作）；既有 `atomic_write`、`mkdirs`、`remove_file`、`copy_tree`、`remove_tree`、`symlink_or_copy_dir`、`file_lock_exclusive` 維持 P4-T5 簽章。P3 呼叫端僅使用 `FsRead` 方法，不需修改。
 
 **P3 修訂（§0.7）**：P3 的 `SysEnv` 只交付 `var`、`vars`、`system_config_dir`、`current_user_home`、`user_home`、`current_exe`、`realpath`、`terminal_columns`、`stdout_is_terminal`、`errno_name`、`pid`；其餘（`home_dir`、`expanduser`、`is_wsl` 等）由 P4 補。`expanduser` 在 `sw-proto::pypath` 以 `HomeLookup` 實作（golden 可測）；`system_config_dir` 為 SC-09 必需。`FsOps` 在 P3 以唯讀 `FsRead`（`read`、`exists`、`is_dir`、`list_dir`）承接，P4 擴為 `FsOps: FsRead`。`Clock` 在 P3 為 `mono_ns`＋`sleep`。
 

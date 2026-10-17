@@ -8,9 +8,9 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::ffi::OsString;
 
-use sw_pal::traits::{EndpointSpec, PalErrorKind, SockTimeout};
 #[cfg(unix)]
 use sw_pal::traits::PalError;
+use sw_pal::traits::{EndpointSpec, PalErrorKind, SockTimeout};
 
 fn pal() -> sw_pal::ClientPlatform {
     sw_pal::native_client()
@@ -67,7 +67,10 @@ fn unix_enoent_matches_python_message() {
         .err()
         .unwrap();
     let g = golden_case("unix_enoent");
-    assert_eq!((e.py_message.as_str(), e.os_code), (g.message.as_str(), g.errno));
+    assert_eq!(
+        (e.py_message.as_str(), e.os_code),
+        (g.message.as_str(), g.errno)
+    );
 }
 
 #[cfg(unix)]
@@ -76,7 +79,10 @@ fn unix_path_too_long_has_no_errno() {
     let p = OsString::from(format!("/tmp/{}", "x".repeat(200)));
     let e = pal()
         .rpc
-        .connect(&EndpointSpec::Unix(p), SockTimeout::Blocking(Duration::from_secs(1)))
+        .connect(
+            &EndpointSpec::Unix(p),
+            SockTimeout::Blocking(Duration::from_secs(1)),
+        )
         .err()
         .unwrap();
     assert_eq!(e.py_message, "AF_UNIX path too long");
@@ -99,14 +105,23 @@ fn recv_times_out_per_call() {
 
 #[test]
 fn tcp_refused_and_gai_and_timeout0_match_python() {
-    for id in ["tcp_refused", "tcp_localhost_refused", "tcp_gai", "tcp_timeout0"] {
+    for id in [
+        "tcp_refused",
+        "tcp_localhost_refused",
+        "tcp_gai",
+        "tcp_timeout0",
+    ] {
         let g = golden_case(id);
         let e = pal()
             .rpc
             .connect(&g.endpoint(), g.timeout())
             .err()
             .unwrap_or_else(|| panic!("{id} 應失敗"));
-        assert_eq!((e.py_message.as_str(), e.os_code), (g.message.as_str(), g.errno), "{id}");
+        assert_eq!(
+            (e.py_message.as_str(), e.os_code),
+            (g.message.as_str(), g.errno),
+            "{id}"
+        );
     }
 }
 
@@ -125,7 +140,11 @@ fn unix_len_107_vs_108() {
             .connect(&ep, g.timeout())
             .err()
             .expect("unix 長度案例應失敗");
-        assert_eq!((e.py_message.as_str(), e.os_code), (g.message.as_str(), g.errno), "{id}");
+        assert_eq!(
+            (e.py_message.as_str(), e.os_code),
+            (g.message.as_str(), g.errno),
+            "{id}"
+        );
     }
 }
 
@@ -137,7 +156,10 @@ fn resolve_tcp_gai_matches_python() {
         .resolve_tcp("no-such-host.invalid", 1)
         .err()
         .expect("resolve_tcp 應失敗");
-    assert_eq!((e.py_message.as_str(), e.os_code), (g.message.as_str(), g.errno));
+    assert_eq!(
+        (e.py_message.as_str(), e.os_code),
+        (g.message.as_str(), g.errno)
+    );
 }
 
 /// 需要檔案系統 fixture 的 unix 案例（golden 列 `tmp:` 標籤）；回傳實作的結果。
@@ -183,10 +205,11 @@ fn unix_case_result(id: &str, dir: &std::path::Path) -> Result<(), PalError> {
         "unix_recv_nonblock" => {
             let path = dir.join("silent.sock");
             let _listener = UnixListener::bind(&path).unwrap(); // 不 accept
-            // Python 基線為「blocking connect → settimeout(0) → recv」；此處以 NonBlocking connect 取得同一非阻塞 recv 語意。
-            let mut s = p
-                .rpc
-                .connect(&EndpointSpec::Unix(path.into_os_string()), SockTimeout::NonBlocking)?;
+                                                                // Python 基線為「blocking connect → settimeout(0) → recv」；此處以 NonBlocking connect 取得同一非阻塞 recv 語意。
+            let mut s = p.rpc.connect(
+                &EndpointSpec::Unix(path.into_os_string()),
+                SockTimeout::NonBlocking,
+            )?;
             s.recv(&mut [0u8; 16]).map(|_| ())
         }
         other => panic!("未知 fixture case：{other}"),

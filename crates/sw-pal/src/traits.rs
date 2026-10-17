@@ -346,8 +346,6 @@ pub enum PalErrorKind {
     Io,
 }
 
-// P4-T2 紅燈骨架的預設主體未使用參數，允許 unused_variables 以免編譯警告淹沒測試輸出。
-#[allow(unused_variables)]
 pub trait SysEnv: Send + Sync {
     fn var(&self, k: &str) -> Option<String>;
     /// 以 `std::env::vars_os()` 實作再 lossy 轉換；不得用 `std::env::vars()`（遇非 UTF-8 會 panic）。
@@ -366,49 +364,29 @@ pub trait SysEnv: Send + Sync {
     fn errno_name(&self, code: i32) -> Option<&'static str>;
     fn pid(&self) -> u32;
 
-    // ── P4-T2 管理面方法（紅燈骨架：預設主體為 unimplemented，實作者於 posix／windows 實作後移除預設）──
-
     /// 子行程執行（等同 Python `subprocess.run(capture_output=True, text=True)`）。逾時回 `rc=-1`、`stderr="TIMEOUT"`。
-    fn run(&self, argv: &[String], timeout: Option<Duration>) -> PalResult<CmdOutput> {
-        unimplemented!("P4-T2")
-    }
+    fn run(&self, argv: &[String], timeout: Option<Duration>) -> PalResult<CmdOutput>;
     /// 原始 bytes 版本：不解碼、不做換行轉換；`env=Some(..)` 時取代子行程環境。
     fn run_raw(
         &self,
         argv: &[String],
         env: Option<&[(OsString, OsString)]>,
         timeout: Option<Duration>,
-    ) -> PalResult<CmdOutputRaw> {
-        unimplemented!("P4-T2")
-    }
+    ) -> PalResult<CmdOutputRaw>;
     /// `shutil.which` 語意；回第一個可執行的完整路徑。
-    fn which(&self, name: &str) -> Option<PathBuf> {
-        unimplemented!("P4-T2")
-    }
+    fn which(&self, name: &str) -> Option<PathBuf>;
     /// 07 §4.2 演算法：依 PATH 順序列出所有候選、去重、略過空目錄字串。
-    fn which_all(&self, name: &str) -> Vec<PathBuf> {
-        unimplemented!("P4-T2")
-    }
+    fn which_all(&self, name: &str) -> Vec<PathBuf>;
     /// `/run/systemd/system` 為目錄；Windows 恆 false。
-    fn has_systemd(&self) -> bool {
-        unimplemented!("P4-T2")
-    }
+    fn has_systemd(&self) -> bool;
     /// `uname().release` 含 `microsoft`（小寫比對）；Windows 恆 false。
-    fn is_wsl(&self) -> bool {
-        unimplemented!("P4-T2")
-    }
+    fn is_wsl(&self) -> bool;
     /// POSIX：`getgrnam(g).gr_gid ∈ getgroups() ∪ {getegid()}`；Windows 恆 false。
-    fn user_in_group(&self, g: &str) -> bool {
-        unimplemented!("P4-T2")
-    }
+    fn user_in_group(&self, g: &str) -> bool;
     /// POSIX：`$USER` 非空優先，否則 `getpwuid(geteuid()).pw_name`；Windows：Token → `"DOMAIN\\name"`。
-    fn user_identity(&self) -> String {
-        unimplemented!("P4-T2")
-    }
+    fn user_identity(&self) -> String;
     /// Windows：`%LOCALAPPDATA%`（非空）否則 `%USERPROFILE%\AppData\Local`；POSIX 為 `None`。
-    fn local_appdata(&self) -> Option<PathBuf> {
-        unimplemented!("P4-T2")
-    }
+    fn local_appdata(&self) -> Option<PathBuf>;
 }
 
 /// `SysEnv::run` 的結果；`stdout`／`stderr` 已依 Python text mode（strict、universal newlines）解碼。

@@ -3,8 +3,8 @@
 //! 比對 `strerror` 與 `os_code`；檔名部分由 `sw-proto::PyOsError` 組裝，於 P3-T12 驗證。
 mod common;
 
-use sw_pal::traits::PalError;
 use sw_pal::native_client;
+use sw_pal::traits::PalError;
 
 fn file_case(id: &str) -> common::OsErrCase {
     common::oserror_cases(common::oserror_file())

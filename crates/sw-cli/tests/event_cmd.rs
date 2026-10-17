@@ -34,6 +34,19 @@ impl sw_pal::SysEnv for DummySysEnv {
     fn stdout_is_terminal(&self) -> bool { false }
     fn errno_name(&self, _: i32) -> Option<&'static str> { None }
     fn pid(&self) -> u32 { 1 }
+    fn run(&self, _: &[String], _: Option<std::time::Duration>) -> sw_pal::PalResult<sw_pal::CmdOutput> {
+        Ok(sw_pal::CmdOutput { rc: 0, stdout: String::new(), stderr: String::new() })
+    }
+    fn run_raw(&self, _: &[String], _: Option<&[(std::ffi::OsString, std::ffi::OsString)]>, _: Option<std::time::Duration>) -> sw_pal::PalResult<sw_pal::CmdOutputRaw> {
+        Ok(sw_pal::CmdOutputRaw { rc: 0, stdout: Vec::new(), stderr: Vec::new() })
+    }
+    fn which(&self, _: &str) -> Option<std::path::PathBuf> { None }
+    fn which_all(&self, _: &str) -> Vec<std::path::PathBuf> { Vec::new() }
+    fn has_systemd(&self) -> bool { false }
+    fn is_wsl(&self) -> bool { false }
+    fn user_in_group(&self, _: &str) -> bool { false }
+    fn user_identity(&self) -> String { String::new() }
+    fn local_appdata(&self) -> Option<std::path::PathBuf> { None }
 }
 
 struct DummyFs;

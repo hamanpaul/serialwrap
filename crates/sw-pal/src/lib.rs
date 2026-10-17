@@ -11,9 +11,9 @@ pub mod device_source;
 pub mod fakes;
 pub mod fs_ops;
 pub mod osstr;
+pub mod proc_scan;
 pub mod process;
 pub mod process_tunnel;
-pub mod proc_scan;
 pub mod rpc_transport;
 pub mod select;
 pub mod service_ctl;
@@ -91,10 +91,10 @@ pub fn native() -> Platform {
     #[cfg(unix)]
     {
         use crate::clock::posix::NativeClock;
-        use crate::fs_ops::posix::NativeFsOps;
         use crate::device_source::windows_model::NullRegistryView;
-        use crate::process::posix::NativeProcessCtl;
+        use crate::fs_ops::posix::NativeFsOps;
         use crate::proc_scan::PosixProcScan;
+        use crate::process::posix::NativeProcessCtl;
         use crate::process_tunnel::posix::NativeProcessTunnel;
         use crate::rpc_transport::posix::NativeRpcConnector;
         use crate::sysenv::posix::NativeSysEnv;
@@ -134,8 +134,8 @@ pub fn native() -> Platform {
         use crate::clock::windows::NativeClock;
         use crate::device_source::windows_registry::WinRegistryView;
         use crate::fs_ops::windows::NativeFsOps;
-        use crate::process::windows::NativeProcessCtl;
         use crate::proc_scan::WindowsProcScan;
+        use crate::process::windows::NativeProcessCtl;
         use crate::process_tunnel::windows::NativeProcessTunnel;
         use crate::rpc_transport::windows::NativeRpcConnector;
         use crate::sysenv::windows::NativeSysEnv;
