@@ -241,6 +241,27 @@ fn task_xml_disabled_for_update_hold() {
 }
 
 #[test]
+fn task_xml_omits_empty_working_directory() {
+    // 原生 Windows 實測：空的 <WorkingDirectory></WorkingDirectory> 使 schtasks /Create /XML
+    // 回「value which is incorrectly formatted or out of range」；未指定工作目錄時必須省略整個元素。
+    let spec = |working_dir: &str| TaskXmlSpec {
+        name: "serialwrap".into(),
+        user_id: "HOST\\alice".into(),
+        command: "C:\\x\\serialwrapd.exe".into(),
+        arguments: String::new(),
+        working_dir: working_dir.into(),
+        enabled: true,
+    };
+    let (with_dir, without_dir) = (render_task_xml(&spec("C:\\x")), render_task_xml(&spec("")));
+    assert!(!without_dir.contains("WorkingDirectory"), "空工作目錄不得輸出元素");
+    assert_eq!(
+        with_dir.replace("      <WorkingDirectory>C:\\x</WorkingDirectory>\r\n", ""),
+        without_dir,
+        "除 WorkingDirectory 一行外其餘位元組必須相同"
+    );
+}
+
+#[test]
 fn windows_task_install_writes_xml_then_creates_task() {
     let tmp = tempfile::tempdir().unwrap();
     let env = FakeSysEnv::builder().user_identity("HOST\\alice").build();
@@ -1206,7 +1227,11 @@ fn cap_supervisor_runtime__windows_task_roundtrip() {
         definition_path: Some(def_path.clone()),
         register_held: false,
     };
-    ctl.install(&def, false);
+    let recs = ctl.install(&def, false);
+    assert!(
+        !recs.is_empty() && recs.iter().all(|r| r.rc == 0),
+        "schtasks /Create /XML 必須成功：{recs:?}"
+    );
 
     // 註冊後以 schtasks 查回 XML，確認 ExecutionTimeLimit=PT0S 已落地
     let out = std::process::Command::new("schtasks")

@@ -174,8 +174,19 @@ pub struct TaskXmlSpec {
 }
 
 /// 輸出 Task Scheduler XML（CRLF、`ExecutionTimeLimit=PT0S`）。
+///
+/// `working_dir` 為空時省略 `<WorkingDirectory>`：Task Scheduler 對空元素回
+/// 「value which is incorrectly formatted or out of range」使 `schtasks /Create /XML` 失敗。
 pub fn render_task_xml(spec: &TaskXmlSpec) -> String {
     let enabled = if spec.enabled { "true" } else { "false" };
+    let working_dir_line = if spec.working_dir.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "      <WorkingDirectory>{}</WorkingDirectory>\r\n",
+            xml_escape(&spec.working_dir)
+        )
+    };
     format!(
         concat!(
             "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n",
@@ -224,7 +235,7 @@ pub fn render_task_xml(spec: &TaskXmlSpec) -> String {
             "    <Exec>\r\n",
             "      <Command>{}</Command>\r\n",
             "      <Arguments>{}</Arguments>\r\n",
-            "      <WorkingDirectory>{}</WorkingDirectory>\r\n",
+            "{}",
             "    </Exec>\r\n",
             "  </Actions>\r\n",
             "</Task>\r\n"
@@ -235,7 +246,7 @@ pub fn render_task_xml(spec: &TaskXmlSpec) -> String {
         enabled,
         xml_escape(&spec.command),
         xml_escape(&spec.arguments),
-        xml_escape(&spec.working_dir),
+        working_dir_line,
     )
 }
 
