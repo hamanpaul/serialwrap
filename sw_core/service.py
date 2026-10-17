@@ -39,12 +39,13 @@ from .flash_endpoint import FlashEndpoint, detect_mcu_line, pump_endpoint_to_sin
 from .mcu_patterns import McuPatternRegistry
 from .multi_open import detect_multi_open
 from . import serial_port as serial_port_mod
-from .device_source import _load_exclude_coms  # #131：實作移至 device_source，此處保留匯入相容
+from .device_source import PosixDeviceSource, _load_exclude_coms  # #131：實作移至 device_source，此處保留匯入相容
 from .device_watcher import DeviceWatcher
 from .event_engine import EventEngine, EngineDeps
 from .event_engine.line_buffer import LineBuffer
 from .file_transfer import _ACK_MODES, DEFAULT_CHUNK_SIZE
 from .session_manager import SessionManager
+from .test_allowlist import AllowlistDecision, AllowlistDeviceSource
 from .util import now_iso
 from .version import resolve_version
 from .wal import WalWriter, rows_to_text_lines
@@ -233,6 +234,9 @@ class _BridgeProbe:
 
 
 class SerialwrapService:
+    # SC-19：類別層預設 None；未經 __init__ 建構的替身（既有測試以 object.__new__ 建立）呼叫 health() 仍安全。
+    _test_allowlist: AllowlistDecision | None = None
+
     def __init__(
         self,
         profiles: list[SessionProfile],
@@ -242,8 +246,13 @@ class SerialwrapService:
         by_id_dir: str = DEVICE_BY_ID_DIR,
         by_path_dir: str = DEVICE_BY_PATH_DIR,
         state_path: str | None = None,
+        test_allowlist: AllowlistDecision | None = None,
     ) -> None:
         self._wal = WalWriter()
+        # SC-19（OD-11）：只有 enabled 的判定才生效；被拒或未設定者不進入裝置發現路徑。
+        self._test_allowlist: AllowlistDecision | None = (
+            test_allowlist if test_allowlist is not None and test_allowlist.enabled else None
+        )
         self.admission = AdmissionGate()
         self._interactive_admission_tickets: dict[str, Any] = {}
         self._lock = threading.RLock()
@@ -286,6 +295,12 @@ class SerialwrapService:
             _source = WindowsDeviceSource(exclude_coms=_load_exclude_coms())
         else:
             _source = None  # 預設 PosixDeviceSource（由 DeviceWatcher 內部建立）
+        if self._test_allowlist is not None:
+            # SC-19：allowlist 只包住「掃描→發現」來源；open、BC-04 獨占鎖與 backend 選擇完全不變。
+            # 與 DeviceWatcher 預設來源相同的掃描目錄（by-id 優先、by-path 次之）。
+            if _source is None:
+                _source = PosixDeviceSource([by_id_dir, by_path_dir])
+            _source = AllowlistDeviceSource(_source, self._test_allowlist.coms)
         self._watcher = DeviceWatcher(
             by_id_dir, self._on_device_change,
             extra_scan_dirs=[by_path_dir],
@@ -692,6 +707,13 @@ class SerialwrapService:
             "daemons": mo["daemons"],
             "holders_status": mo["holders_status"],
         }
+        if self._test_allowlist is not None:
+            # SC-19：啟用時必須顯示（OD-11）；未啟用時不輸出此鍵，既有輸出逐位元組不變。
+            result["test_device_allowlist"] = {
+                "enabled": True,
+                "coms": list(self._test_allowlist.coms),
+                "source": self._test_allowlist.source,
+            }
         return result
 
     def _resolve_session_id(

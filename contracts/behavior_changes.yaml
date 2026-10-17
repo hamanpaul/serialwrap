@@ -627,7 +627,7 @@ changes:
   - id: "SC-19"
     kind: "SC"
     title: "OD-11 測試裝置 allowlist"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "hamanpaul"
       date: "2026-10-15"
@@ -648,7 +648,7 @@ changes:
     ab_participation: "diff"
     phases: ["P1"]
     case_ids: ["sc19-test-device-allowlist"]
-    compatibility_impact: "啟用時 health.status 多出 test_device_allowlist:{enabled:true,coms:[...]}；非隔離實例設定 allowlist 時 daemon 拒絕啟動（TEST_DEVICE_ALLOWLIST_REJECTED，exit 2）。allowlist 只影響裝置發現與選取，不改變獨占鎖或 backend。"
+    compatibility_impact: "啟用時 health.status 多出 test_device_allowlist:{enabled:true,coms:[...],source:env 或 config}；非隔離實例設定 allowlist 時 daemon 拒絕啟動（TEST_DEVICE_ALLOWLIST_REJECTED，exit 2）；隔離實例下 config.yaml 存在但無法讀取或解析且 env 未提供 allowlist 時同樣拒絕（reason 為 invalid config.yaml: <例外類別名>），非隔離實例維持未設定、啟動行為不變。allowlist 只影響裝置發現與選取，不改變獨占鎖或 backend。"
     approval_conditions: "OD-11 核准限制：僅對隔離實例生效（SERIALWRAP_STATE_DIR、SERIALWRAP_RUN_DIR、SERIALWRAP_CONFIG_DIR 三者都明確設定且不等於預設路徑）；正式 daemon 設定遇到即拒絕（exit 2）；只接受明確列出的 COM 名稱，不得全域放行；不關閉獨占鎖、不更換 serial backend；啟用時 health.status 必須顯示。定案細節依調和表 GAP-G-07。"
     related_decisions: ["OD-11"]
   - id: "SC-20"

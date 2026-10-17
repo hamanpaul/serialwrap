@@ -453,7 +453,8 @@
   - 兩者都有時以 env 優先。
 - 「隔離實例」的判定：`SERIALWRAP_STATE_DIR`、`SERIALWRAP_RUN_DIR`、`SERIALWRAP_CONFIG_DIR` 三者都明確設定，而且解析後都不等於未設定時的預設路徑。
 - 非隔離實例設定了 allowlist：daemon 拒絕啟動，stderr 印 `serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED: <reason>`，exit 2。
-- 啟用時 `health.status` 多出 `"test_device_allowlist":{"enabled":true,"coms":[...]}`。
+- `config.yaml` 存在但無法讀取或解析（審查修正，2026-10-17）：隔離實例且 env 未提供 allowlist 時 fail closed，reason 為 `invalid config.yaml: <例外類別名>`，exit 2；非隔離實例維持未設定（與基線對壞 config 的容錯相同）。
+- 啟用時 `health.status` 多出 `"test_device_allowlist":{"enabled":true,"coms":[...],"source":"env"|"config"}`。
 - allowlist 只影響裝置的發現與選取，不改變獨占鎖或 backend。
 
 ---

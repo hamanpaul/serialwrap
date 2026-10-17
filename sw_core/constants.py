@@ -213,6 +213,29 @@ INTERACTIVE_TOMBSTONE_MAX: int = 16
 """每個 session 保留的 expired interactive lease tombstone FIFO 上限。"""
 
 
+def default_isolation_paths() -> dict[str, str]:
+    """以「SERIALWRAP_STATE_DIR／RUN_DIR／CONFIG_DIR 皆未設定」重新計算三個目錄的預設值（SC-19，OD-11）。
+
+    隔離判定以此為比對基準，故每次呼叫都重新讀取 XDG 與 HOME，不沿用模組層常數——
+    否則外層 shell 已 export 的 ``SERIALWRAP_*_DIR`` 會讓「等於預設」的判定失真。
+    分支邏輯與 ``STATE_DIR``／``RUN_DIR``／``CONFIG_DIR`` 的預設值一致（RUN 於 STATE 未設定時的分支）。
+    """
+    home = os.path.expanduser("~")
+    state = os.path.expanduser(
+        os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.join(home, ".local", "state"), "serialwrap")
+    )
+    config = os.path.expanduser(
+        os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config"), "serialwrap")
+    )
+    runtime_home = os.environ.get("XDG_RUNTIME_DIR")
+    run = os.path.join(runtime_home, "serialwrap") if runtime_home else os.path.join(state, "run")
+    return {
+        "SERIALWRAP_STATE_DIR": state,
+        "SERIALWRAP_RUN_DIR": run,
+        "SERIALWRAP_CONFIG_DIR": config,
+    }
+
+
 def ensure_runtime_dirs() -> None:
     os.makedirs(CONFIG_DIR, exist_ok=True)
     os.makedirs(STATE_DIR, exist_ok=True)

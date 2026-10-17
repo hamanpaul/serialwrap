@@ -1119,18 +1119,18 @@ codes:
     behavior_change: []
     sources: ["sw_core/file_transfer.py:544", "sw_core/file_transfer.py:300"]
   - code: TEST_DEVICE_ALLOWLIST_REJECTED
-    status: APPROVED
-    reachable: false
-    unreachable_reason: "SC-19 已核准；daemon 拒絕啟動的判定尚未實作"
+    status: IMPLEMENTED
+    reachable: true
     scope: {interfaces: [proc], methods: ["serialwrapd"], platforms: [posix, windows]}
     meaning: "隔離測試實例的裝置 allowlist 判定不通過（非隔離實例設定了 allowlist）；stderr 印出 serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED 與原因，exit 2"
-    side_effect: "daemon 在任何狀態寫入前拒絕啟動，無 UART 或 state 副作用"
+    side_effect: "daemon 在任何狀態寫入前拒絕啟動（判定早於 ensure_runtime_dirs、lock 與 service 建構），無 UART 或 state 副作用"
     retryable: "fix_args"
     uart_tx: none
     agent_action: "移除 allowlist 設定，或改在三個隔離目錄均明確設定的實例中使用"
     extra_fields: []
-    contract_tests: []
+    contract_tests: ["tests/test_stage0_test_allowlist.py::test_daemon_refuses_start_when_rejected", "tests/test_stage0_test_allowlist.py::test_rejection_code_reaches_extraction_sink"]
     behavior_change: ["SC-19"]
+    sources: ["sw_core/test_allowlist.py:125", "sw_core/daemon.py:181"]
   - code: TIMEOUT
     status: EXISTING
     reachable: true

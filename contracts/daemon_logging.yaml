@@ -285,7 +285,7 @@ messages:
     level: ERROR
     template: "serialwrapd: 有序關機逾時，未收斂 session=%s（非優雅停止，SC-11 不計 PASS）"
     args: [shutdown.stalled]
-    source: "sw_core/service.py:602"
+    source: "sw_core/service.py:617"
 
   - id: release_state_persist_failed
     logger: serialwrap
@@ -345,7 +345,7 @@ messages:
     level: WARNING
     template: "serialwrap: console 行被拒（session=%s client=%s error_code=%s bytes=%d）"
     args: [session_id, client.client_id, error_code, len(line.encode("utf-8"))]
-    source: "sw_core/service.py:372"
+    source: "sw_core/service.py:387"
 
   - id: interactive_lease_restore_failed
     logger: serialwrap

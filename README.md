@@ -1265,6 +1265,14 @@ focused debugging:
 python3 -m unittest discover -s tests -v
 ```
 
+### Isolated test-device allowlist (OD-11 / SC-19)
+
+For isolated test instances only (throwaway daemon, com0com or other virtual COM pairs). The allowlist makes the daemon discover and select an explicit list of device names; it does not bypass the per-UART exclusive lock (BC-04), does not change the serial backend, and never bypasses Tier-2 exclusivity or handoff.
+
+- Enable with `SERIALWRAP_TEST_DEVICE_ALLOWLIST=COM7,COM8` (comma-separated, matched exactly against `DeviceInfo.by_id`), or with `windows.test_device_allowlist: [COM7, COM8]` in `config.yaml`. The environment variable takes precedence over config.
+- It is accepted only when `SERIALWRAP_STATE_DIR`, `SERIALWRAP_RUN_DIR` and `SERIALWRAP_CONFIG_DIR` are all set explicitly and none of them equals its default path. Otherwise the daemon refuses to start: `serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED: <reason>` on stderr, exit 2, before any state, run or lock file is created. A `windows.test_device_allowlist` that is not a list of strings is refused the same way. If `config.yaml` exists but cannot be read or parsed and the allowlist is not set through the environment, an isolated instance is refused too (`invalid config.yaml: <exception class>`); a non-isolated instance keeps its previous behaviour.
+- While the allowlist is active, `serialwrap daemon status` shows `test_device_allowlist: {"enabled": true, "coms": [...], "source": "env"|"config"}`. While it is inactive the key is absent.
+
 ### Real-hardware stability suite (#122)
 
 After deploying a new build to this machine (a system with a production daemon
@@ -2437,6 +2445,14 @@ python3 -m pytest tests/test_session_bind.py -v
 python3 -m unittest tests.test_multiagent_e2e -v
 python3 -m unittest tests.test_session_bind -v
 ```
+
+### 隔離實例測試裝置 allowlist（OD-11／SC-19）
+
+僅供隔離的測試實例使用（拋棄式 daemon、com0com 等虛擬 COM pair）。allowlist 讓 daemon 只發現與選取明確列出的裝置名稱；它不關閉 per-UART 獨占鎖（BC-04）、不更換 serial backend，也絕不繞過 Tier 2 獨占與交接規則。
+
+- 設定方式：環境變數 `SERIALWRAP_TEST_DEVICE_ALLOWLIST=COM7,COM8`（逗號分隔，逐字比對 `DeviceInfo.by_id`），或 `config.yaml` 的 `windows.test_device_allowlist: [COM7, COM8]`。兩者並存時環境變數優先。
+- 只有 `SERIALWRAP_STATE_DIR`、`SERIALWRAP_RUN_DIR`、`SERIALWRAP_CONFIG_DIR` 三者都明確設定、且都不等於預設路徑時才生效。不符合即拒絕啟動：stderr 輸出 `serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED: <原因>`、exit 2，且在建立任何 state、run 或 lock 檔之前就結束。`windows.test_device_allowlist` 不是字串 list 時同樣拒絕啟動。若 `config.yaml` 存在但無法讀取或解析、且未以環境變數提供 allowlist，隔離實例同樣拒絕啟動（`invalid config.yaml: <例外類別名>`）；非隔離實例維持原行為。
+- 生效時 `serialwrap daemon status` 會顯示 `test_device_allowlist: {"enabled": true, "coms": [...], "source": "env"|"config"}`；未生效時不輸出此鍵。
 
 ### 實機穩定性測試（#122）
 

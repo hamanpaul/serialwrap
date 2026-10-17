@@ -2,15 +2,31 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import signal
 import sys
+from typing import Any
 
 from sw_core.config import ProfileTemplate, load_profiles
-from sw_core.constants import CONFIG_DIR, DEFAULT_ENDPOINT, LOCK_PATH, PROFILE_DIR, ensure_runtime_dirs
+from sw_core.constants import (
+    CONFIG_DIR,
+    DEFAULT_ENDPOINT,
+    LOCK_PATH,
+    PROFILE_DIR,
+    default_isolation_paths,
+    ensure_runtime_dirs,
+)
 from sw_core.runtime_config import RuntimeConfig
 from sw_core.service import SerialwrapService
 from sw_core.session_manager import StateLoadError
 from sw_core.sysenv import force_utf8_stdio
+from sw_core.test_allowlist import (
+    ERROR_TEST_DEVICE_ALLOWLIST_REJECTED,
+    AllowlistDecision,
+    decide_on_unreadable_config,
+    enforce_allowlist,
+    resolve_test_allowlist,
+)
 
 # 這些 RPC method 的 handler 會長時間同步阻塞，須丟到 executor 執行，否則會卡住單執行緒
 # asyncio event loop，導致期間全 daemon 的所有 RPC 凍結（#52 根因；#80 補齊其餘阻塞 handler）。
@@ -142,7 +158,49 @@ def _make_windows_passthrough_templates(
     ]
 
 
+def _load_config_data() -> tuple[Any, str | None]:
+    """讀取 config.yaml 原始內容供 SC-19 判定，回傳 ``(data, error)``。
+
+    缺檔回 ``(None, None)``（未設定）；存在但讀取或解析失敗回 ``(None, 例外類別名)``，
+    由 :func:`sw_core.test_allowlist.decide_on_unreadable_config` 依隔離與否決定。
+    捕捉範圍為 Exception：``yaml.safe_load`` 除 YAMLError 外還會拋 ValueError（如不合法日期）與
+    RecursionError（過深巢狀），皆不得逸出為 traceback。
+    """
+    import yaml  # noqa: PLC0415 — 延遲匯入，與 RuntimeConfig 一致
+
+    path = os.path.join(CONFIG_DIR, "config.yaml")
+    if not os.path.isfile(path):
+        return None, None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return yaml.safe_load(fh), None
+    except Exception as exc:  # noqa: BLE001
+        return None, type(exc).__name__
+
+
+def _resolve_test_allowlist() -> AllowlistDecision:
+    """SC-19（OD-11）：判定隔離實例測試裝置 allowlist；被拒時拋 RuntimeError（見 sw_core.test_allowlist）。"""
+    config_data, config_error = _load_config_data()
+    defaults = default_isolation_paths()
+    if config_error is not None:
+        decision = decide_on_unreadable_config(os.environ, defaults=defaults, error=config_error)
+    else:
+        decision = resolve_test_allowlist(os.environ, config_data, defaults=defaults)
+    enforce_allowlist(decision)
+    return decision
+
+
 async def _run_async(args: argparse.Namespace) -> int:
+    # SC-19：測試裝置 allowlist 判定必須最先執行——早於 ensure_runtime_dirs()、lock 與 SerialwrapService
+    # 建構（後者的 SessionManager 會改寫 state.json），正式實例被拒時不留下任何狀態副作用。
+    try:
+        test_allowlist = _resolve_test_allowlist()
+    except RuntimeError as exc:
+        if len(exc.args) != 2 or exc.args[0] != ERROR_TEST_DEVICE_ALLOWLIST_REJECTED:
+            raise  # 非 SC-19 的 RuntimeError 不在此吞掉，維持原行為
+        sys.stderr.write(f"serialwrapd: {exc.args[0]}: {exc.args[1]}\n")
+        return 2
+
     ensure_runtime_dirs()
     result = load_profiles(args.profile_dir)
     if not result.profiles and not result.templates:
@@ -171,6 +229,7 @@ async def _run_async(args: argparse.Namespace) -> int:
             result.profiles,
             templates=templates,
             max_sessions=result.max_sessions,
+            test_allowlist=test_allowlist,
         )
     except StateLoadError as exc:
         # _load_state fail closed（既有 state.json 讀取失敗，非 JSON 損毀）：拒絕啟動，避免以空狀態

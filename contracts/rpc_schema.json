@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/hamanpaul/serialwrap/contracts/rpc_schema.json",
   "title": "serialwrap RPC contract",
-  "x-catalog-revision": 7,
+  "x-catalog-revision": 8,
   "x-wire": {
     "framing": "ndjson",
     "line_strip": true,
@@ -3030,7 +3030,8 @@
           "warnings",
           "multi_open",
           "foreign_holders",
-          "multi_open_detail"
+          "multi_open_detail",
+          "test_device_allowlist"
         ],
         "properties": {
           "ok": {
@@ -3288,6 +3289,40 @@
               "holders_status"
             ],
             "x-updated-by": "請求當下 on-demand 掃 /proc（multi_open.py）；不常駐"
+          },
+          "test_device_allowlist": {
+            "type": "object",
+            "x-order": [
+              "enabled",
+              "coms",
+              "source"
+            ],
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "const": true
+              },
+              "coms": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "source": {
+                "type": "string",
+                "enum": [
+                  "env",
+                  "config"
+                ]
+              }
+            },
+            "required": [
+              "enabled",
+              "coms",
+              "source"
+            ],
+            "additionalProperties": false,
+            "x-note": "僅 allowlist 生效時出現（SC-19，OD-11）且位於 multi_open_detail 之後；env（SERIALWRAP_TEST_DEVICE_ALLOWLIST）優先於 config（windows.test_device_allowlist）；被拒時 daemon 不啟動（TEST_DEVICE_ALLOWLIST_REJECTED，exit 2）"
           }
         },
         "required": [
@@ -7683,45 +7718,5 @@
       "source": "sw_core/service.py:1045-1046 → wal.py:242-253"
     }
   },
-  "x-pending": [
-    {
-      "id": "SC-19",
-      "change": "SC-19",
-      "adds": {
-        "health.status": [
-          "test_device_allowlist"
-        ]
-      },
-      "shape": {
-        "test_device_allowlist": {
-          "type": "object",
-          "properties": {
-            "enabled": {
-              "const": true
-            },
-            "coms": {
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
-            }
-          },
-          "required": [
-            "enabled",
-            "coms"
-          ],
-          "additionalProperties": false
-        }
-      },
-      "position": "after multi_open_detail；未啟用時不輸出此鍵",
-      "env": "SERIALWRAP_TEST_DEVICE_ALLOWLIST（逗號分隔）",
-      "config": "windows.test_device_allowlist",
-      "precedence": "env > config",
-      "isolation": "SERIALWRAP_STATE_DIR、SERIALWRAP_RUN_DIR、SERIALWRAP_CONFIG_DIR 三者皆明確設定且解析後都不等於預設路徑",
-      "refusal": {
-        "stderr": "serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED: <reason>\n",
-        "exit": 2
-      }
-    }
-  ]
+  "x-pending": []
 }

@@ -974,14 +974,14 @@ OD-14 #2：`platform == "passthrough"` 的 session（含 others-template fallbac
 
 ### 6.1 啟動與停止（`daemon_main.rs`）
 
-順序逐字照 02 §3.2：
+順序逐字照 02 §3.2，唯一例外為 SC-19 判定（T13 規格 4，審查修正 2026-10-17）：OD-11 allowlist 判定必須最先執行，早於 `ensure_runtime_dirs` 與 lock，因為 Service 建構內的 `SessionManager.__init__` 會寫入 `state.json`，被拒時不得留下任何副作用。
 
-1. `ensure_runtime_dirs`。
-2. `load_profiles`；結果為空時 stderr 印 `serialwrapd: no profiles loaded`。
-3. Windows device backend 時注入 `windows-default-passthrough` template（依 capability 判斷）。此 template 為 `platform=passthrough`，同樣適用 §5.12 的安靜升 READY（`SC-35`）。
-4. `instance_lock.acquire`；失敗時 stderr `serialwrapd: DAEMON_ALREADY_RUNNING`，exit 2。
-5. 建 Service；`StateLoadError` 時 exit 3。
-6. 取得 OD-11 allowlist 判定（`SC-19`）；違規時 stderr `serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED: <reason>`，exit 2。
+1. 取得 OD-11 allowlist 判定（`SC-19`）；違規時 stderr `serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED: <reason>`，exit 2，且不建立任何 runtime 目錄、不取 lock、不建 Service。
+2. `ensure_runtime_dirs`。
+3. `load_profiles`；結果為空時 stderr 印 `serialwrapd: no profiles loaded`。
+4. Windows device backend 時注入 `windows-default-passthrough` template（依 capability 判斷）。此 template 為 `platform=passthrough`，同樣適用 §5.12 的安靜升 READY（`SC-35`）。
+5. `instance_lock.acquire`；失敗時 stderr `serialwrapd: DAEMON_ALREADY_RUNNING`，exit 2。
+6. 建 Service（帶入步驟 1 的 allowlist 判定）；`StateLoadError` 時 exit 3。
 7. 依序 initial scan → rank → watcher.start（`DF-14`）→ bootstrap attach → flash endpoint。
 8. 綁定 RPC，再寫入 config.yaml 的 `socket_path`；寫入失敗印 stderr，視為非致命。
 9. `signals.wait_stop`。
