@@ -507,17 +507,17 @@ codes:
   - code: INVALID_ARGS
     status: EXISTING
     reachable: true
-    scope: {interfaces: [rpc, cli_local], methods: ["alias.assign", "command.result_tail", "command.submit", "device.attach", "device.release", "file.pull", "file.push", "log.tail_raw", "log.tail_text", "session.activity", "session.attach", "session.bind", "session.clear", "session.console_attach", "session.console_detach", "session.console_list", "session.interactive_close", "session.interactive_open", "session.interactive_send", "session.interactive_status", "session.log_start", "session.log_status", "session.log_stop", "session.pin", "session.recover", "session.self_test", "session.unpin", "argparse-boundary", "daemon start", "fallthrough", "remote"], platforms: [posix, windows]}
+    scope: {interfaces: [rpc, cli_local], methods: ["alias.assign", "command.result_tail", "command.submit", "device.attach", "device.release", "file.pull", "file.push", "log.tail_raw", "log.tail_text", "session.activity", "session.attach", "session.bind", "session.clear", "session.console_attach", "session.console_detach", "session.console_list", "session.interactive_close", "session.interactive_open", "session.interactive_send", "session.interactive_status", "session.log_start", "session.log_status", "session.log_stop", "session.pin", "session.recover", "session.self_test", "session.unpin", "argparse-boundary", "daemon restart", "daemon start", "fallthrough", "remote"], platforms: [posix, windows]}
     meaning: "參數缺漏或型別／值不合法（RPC 分派或 CLI 參數驗證）"
     side_effect: "無（service 版無附帶欄位）"
     retryable: "fix_args"
     uart_tx: none
     agent_action: "依 CLI 或 RPC 說明修正參數後重送"
     extra_fields: ["message", "ack_mode", "chunk_size", "max_console_line_chars"]
-    exit_codes: {"argparse-boundary": 1, "daemon start": 2, "fallthrough": 2, "remote": 1}
-    contract_tests: ["tests/test_bench_connect_cli.py::test_connect_parse_errors_return_structured_invalid_args", "tests/test_device_handoff.py::TestDeviceRpc::test_rpc_release_requires_selector"]
+    exit_codes: {"argparse-boundary": 1, "daemon restart": 2, "daemon start": 2, "fallthrough": 2, "remote": 1}
+    contract_tests: ["tests/test_bench_connect_cli.py::test_connect_parse_errors_return_structured_invalid_args", "tests/test_device_handoff.py::TestDeviceRpc::test_rpc_release_requires_selector", "tests/test_stage0_platform_mgmt.py::test_daemon_restart_rejects_nonlocal_target_before_stop"]
     behavior_change: []
-    sources: ["sw_core/service.py:732", "sw_core/service.py:904", "sw_core/cli.py:442", "sw_core/cli.py:2485", "sw_core/cli.py:1570"]
+    sources: ["sw_core/service.py:732", "sw_core/service.py:904", "sw_core/cli.py:442", "sw_core/cli.py:705", "sw_core/cli.py:2485", "sw_core/cli.py:1570"]
   - code: INVALID_BENCH_CONFIG
     status: EXISTING
     reachable: true
@@ -1134,16 +1134,17 @@ codes:
   - code: TIMEOUT
     status: EXISTING
     reachable: true
-    scope: {interfaces: [cli_client], methods: [], platforms: [posix, windows]}
-    meaning: "連線、傳送或接收逾時；白名單唯讀方法可重試，其他方法不可直接重送"
+    scope: {interfaces: [cli_client, cli_local], methods: [], platforms: [posix, windows]}
+    meaning: "連線、傳送或接收逾時，或 daemon 管理操作等待舊行程結束逾時；白名單唯讀方法可重試，其他方法不可直接重送"
     side_effect: "請求可能已抵達 daemon 且仍在執行"
     retryable: "conditional"
     uart_tx: possible
     agent_action: "非白名單方法不得直接重送；先以 health.ping 與回應中的 daemon_busy 判斷 daemon 狀態"
     extra_fields: ["daemon_reachable", "daemon_busy"]
-    contract_tests: ["tests/test_cli_diagnostics.py::TestCliTraceErrno::test_timeout_enrich_socket_error_does_not_pollute_main_errno", "tests/test_cli_timeout_robustness.py::TestRetryWhitelist::test_non_whitelist_method_not_retried"]
+    exit_codes: {"daemon restart": 1, "setup": 1}
+    contract_tests: ["tests/test_cli_diagnostics.py::TestCliTraceErrno::test_timeout_enrich_socket_error_does_not_pollute_main_errno", "tests/test_cli_timeout_robustness.py::TestRetryWhitelist::test_non_whitelist_method_not_retried", "tests/test_stage0_platform_mgmt.py::test_daemon_restart_timeout_does_not_start", "tests/test_stage0_platform_mgmt.py::test_reconcile_waits_and_refuses_on_timeout"]
     behavior_change: []
-    sources: ["sw_core/client.py:249", "sw_core/client.py:273", "sw_core/client.py:160"]
+    sources: ["sw_core/client.py:249", "sw_core/client.py:273", "sw_core/client.py:160", "sw_core/cli.py:752", "sw_core/setup_cmd.py:718"]
   - code: TRANSFER_ECHO_STALL
     status: EXISTING
     reachable: true

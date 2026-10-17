@@ -333,7 +333,7 @@ changes:
   - id: "SC-08"
     kind: "SC"
     title: "UDS 權限預設 0600／目錄 0700"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -360,7 +360,7 @@ changes:
   - id: "SC-09"
     kind: "SC"
     title: "設定探索順序（SERIALWRAP_CONFIG 與系統目錄）"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -387,7 +387,7 @@ changes:
   - id: "SC-10"
     kind: "SC"
     title: "lock 與 socket 路徑正規化；Windows 改用 LockFileEx"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -441,7 +441,7 @@ changes:
   - id: "SC-12"
     kind: "SC"
     title: "監管 reconcile 等待舊 daemon 結束"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -654,7 +654,7 @@ changes:
   - id: "SC-20"
     kind: "SC"
     title: "新增 daemon restart"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -1217,7 +1217,7 @@ changes:
   - id: "DF-14"
     kind: "DF"
     title: "daemon 啟動順序（scan→rank→watch）"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-15"

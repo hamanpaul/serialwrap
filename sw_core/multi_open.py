@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import os
 
+from .util import normalize_endpoint_path
+
 
 def _iter_pids(proc_root: str):
     """列舉 proc_root 下的數字 pid 目錄。"""
@@ -43,11 +45,20 @@ def _is_serialwrapd(proc_root: str, pid: int) -> bool:
     不在此處做 TGID 去重：``/proc`` 頂層只列 thread group leader（TGID）、不列同 group 的子
     thread，故同一 daemon 不會在頂層重複出現，無需去重。
     """
+    return _serialwrapd_status(proc_root, pid) is True
+
+
+def _serialwrapd_status(proc_root: str, pid: int) -> bool | None:
+    """回報 daemon 身分、非 daemon 或無法讀取的三態結果。"""
+    proc_dir = f"{proc_root}/{pid}"
     try:
-        with open(f"{proc_root}/{pid}/cmdline", "rb") as fh:
+        with open(f"{proc_dir}/cmdline", "rb") as fh:
             raw = fh.read()
+    except FileNotFoundError:
+        procfs_present = os.path.isdir(f"{proc_root}/self")
+        return False if procfs_present and not os.path.exists(proc_dir) else None
     except OSError:
-        return False
+        return None
     parts = [p.decode("utf-8", "surrogateescape") for p in raw.split(b"\0") if p]
     if not parts:
         return False
@@ -147,3 +158,58 @@ def detect_multi_open(proc_root: str = "/proc", tty_paths: list[str] | None = No
         "holders": holders,
         "holders_status": status,
     }
+
+
+def daemon_process_alive(
+    pid: int | None,
+    endpoint: str,
+    *,
+    proc_root: str = "/proc",
+) -> bool | None:
+    """以 PID 或正規化 endpoint 判定舊 daemon 是否存活；無法證明時回 None。"""
+    if pid is not None and pid > 0:
+        if os.name == "nt":
+            try:
+                from .remote_tunnel import pid_alive  # noqa: PLC0415
+
+                return pid_alive(pid, None, os_name="nt")
+            except Exception:  # noqa: BLE001 — 無法查詢程序狀態不得視為已停止
+                return None
+        try:
+            with open(f"{proc_root}/{pid}/stat", "r", encoding="ascii") as fh:
+                stat_line = fh.read()
+        except FileNotFoundError:
+            procfs_present = os.path.isdir(f"{proc_root}/self")
+            pid_present = os.path.exists(f"{proc_root}/{pid}")
+            return False if procfs_present and not pid_present else None
+        except OSError:
+            return None
+        try:
+            state = stat_line.rsplit(")", 1)[1].strip().split()[0]
+        except (IndexError, ValueError):
+            return None
+        return state not in {"Z", "X"}
+
+    if os.name == "nt":
+        return None
+    if not os.path.isdir(f"{proc_root}/self"):
+        return None
+    try:
+        pids = list(_iter_pids(proc_root))
+    except OSError:
+        return None
+
+    scan_incomplete = False
+    for candidate_pid in pids:
+        status = _serialwrapd_status(proc_root, candidate_pid)
+        if status is None:
+            scan_incomplete = True
+            continue
+        if not status:
+            continue
+        socket_path = _extract_socket_arg(proc_root, candidate_pid)
+        if socket_path is None:
+            return None
+        if normalize_endpoint_path(socket_path) == normalize_endpoint_path(endpoint):
+            return True
+    return None if scan_incomplete else False

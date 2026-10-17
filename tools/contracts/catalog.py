@@ -49,7 +49,7 @@ APPROVAL_OWNER_BY_BASIS: Final[Mapping[str, str]] = types.MappingProxyType({
 })
 # exit_codes／x-exit-codes 的封閉 context 集合
 CLI_CONTEXTS: Final[tuple[str, ...]] = (
-    "_run_rpc", "daemon start", "daemon stop", "event", "connect", "benches", "remote", "setup",
+    "_run_rpc", "daemon start", "daemon stop", "daemon restart", "event", "connect", "benches", "remote", "setup",
     "service <action>", "cmd submit", "profile test", "doctor", "argparse-boundary", "fallthrough",
 )
 # §11.3 六項不變量；ID 與 P2 cases.yaml 的 invariants 欄一致

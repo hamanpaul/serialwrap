@@ -334,7 +334,7 @@ serialwrap mcu status
 | `TARGET_ENCODER_FAILED` | rpc／posix、windows | 視情況 | 目標端 encoder 回報失敗（encoder failure sentinel 出現） | 檢查目標端 encoder 後重試 |
 | `TARGET_ENCODER_MISSING` | rpc／posix、windows | 否 | 目標端沒有可用的 encoder | 在目標端安裝 encoder 後再重試 |
 | `TEST_DEVICE_ALLOWLIST_REJECTED` | proc／posix、windows | 修正參數後 | 隔離測試實例的裝置 allowlist 判定不通過（非隔離實例設定了 allowlist）；stderr 印出 serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED 與原因，exit 2 | 移除 allowlist 設定，或改在三個隔離目錄均明確設定的實例中使用 |
-| `TIMEOUT` | cli_client／posix、windows | 視情況 | 連線、傳送或接收逾時；白名單唯讀方法可重試，其他方法不可直接重送 | 非白名單方法不得直接重送；先以 health.ping 與回應中的 daemon_busy 判斷 daemon 狀態 |
+| `TIMEOUT` | cli_client、cli_local／posix、windows | 視情況 | 連線、傳送或接收逾時，或 daemon 管理操作等待舊行程結束逾時；白名單唯讀方法可重試，其他方法不可直接重送 | 非白名單方法不得直接重送；先以 health.ping 與回應中的 daemon_busy 判斷 daemon 狀態 |
 | `TRANSFER_ECHO_STALL` | rpc／posix、windows | 是 | echo-ACK 路徑 echo 停滯；換行未送出，命令未執行 | 命令未執行，可重新傳輸 |
 | `TRANSFER_PROBE_FAILED` | rpc／posix、windows | 視情況 | 工具探測命令回報 shell 錯誤 | 確認目標端工具可用後重試 |
 | `TRANSFER_TIMEOUT` | rpc／posix、windows | 視情況 | 檔案傳輸過程中 prompt 逾時 | 確認目標端狀態後重新傳輸 |

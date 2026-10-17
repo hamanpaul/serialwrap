@@ -141,6 +141,14 @@ serialwrap cmd submit --selector COM0 --mode line --source agent:diag --cmd "ifc
 serialwrap cmd status --cmd-id <cmd_id>
 ```
 
+Configuration reads use `SERIALWRAP_CONFIG`, then `~/.config/serialwrap/config.yaml`,
+then `/etc/serialwrap/config.yaml` when present. The system file is read-only;
+writes go to `SERIALWRAP_CONFIG` when set, otherwise to the user config path.
+New runtime directories use mode `0700`; Unix sockets default to `0600`. Set
+`SERIALWRAP_SOCKET_GROUP` explicitly to use socket mode `0660` with that group.
+`daemon restart` uses `service restart` under systemd and stops, verifies exit,
+then starts the same endpoint in on-demand mode.
+
 For noisy consoles that omit the shell prompt, `cmd submit --completion-regex`
 can wait for a command-specific producer marker in `line` or `background` mode.
 Use fresh, anchored markers with a numeric exit code and a separate END line;
@@ -1608,6 +1616,9 @@ serialwrap doctor    # 驗證環境
 - WSL 啟用 systemd：於 `/etc/wsl.conf` 設 `[boot]\nsystemd=true` 後 `wsl --shutdown`（否則 `serialwrap setup` 退回 on-demand）。
 - 本機開發安裝：`./install.sh`（= `pipx install <repo>` + `serialwrap setup`）。
 - 既有 on-demand TCP 客戶端請用 `serialwrap setup --on-demand` 或 `./install.sh --on-demand` 保存 endpoint；auto 安裝可能切換至 systemd，詳見[適用範圍與限制](docs/setup-tcp-endpoint.md)。
+- 設定讀取順序為 `SERIALWRAP_CONFIG` → `~/.config/serialwrap/config.yaml` → 存在時的 `/etc/serialwrap/config.yaml`；系統設定檔唯讀，寫入落在 `SERIALWRAP_CONFIG` 或使用者設定檔。
+- 新建執行期目錄權限為 `0700`，Unix socket 預設為 `0600`；明確設定 `SERIALWRAP_SOCKET_GROUP` 時 socket 改為 `0660` 並設為該群組。
+- `daemon restart` 在 systemd 模式等同 `service restart`；on-demand 模式會先停止並確認舊 daemon 結束，再以相同 endpoint 啟動。
 
 ```bash
 # 啟動 daemon 後快速驗證
@@ -2368,7 +2379,7 @@ serialwrap wal current-seq
 Windows daemon 以 **TCP loopback** 取代 AF_UNIX 做 RPC 控制通道，使 serialwrap CLI/agent 在 Windows 擁有完整指令路徑：
 
 - **RPC endpoint**：預設 `tcp://127.0.0.1:48700`，可以 `--socket` 參數或環境變數 `SERIALWRAP_ENDPOINT`（覆寫整個 endpoint，如 `tcp://127.0.0.1:50000`）、`SERIALWRAP_TCP_PORT`（僅覆寫 port 部分）覆寫。daemon 啟動後會把有效 endpoint 寫入 `config.yaml::socket_path`，CLI `_resolve_endpoint` 自動讀取（#173 起 POSIX daemon 亦同，見下方「自訂安裝路徑與 config.yaml 同步」）。
-- **Singleton 鎖**：`msvcrt.locking`（`LK_NBLCK`）+ TCP connect 探測（`WindowsSingletonLock`，`sw_core/lock_win.py`）。語意與 POSIX `SingletonLock`（flock + Unix socket probe）對齊：endpoint 可連 → `DAEMON_ALREADY_RUNNING`；stale → 取得 msvcrt 檔鎖。
+- **Singleton 鎖**：`LockFileEx`（獨佔且不等待）+ TCP connect 探測（`WindowsSingletonLock`，`sw_core/lock_win.py`）。語意與 POSIX `SingletonLock`（flock + Unix socket probe）對齊：endpoint 可連 → `DAEMON_ALREADY_RUNNING`；stale → 取得檔案鎖。
 - **COM 列舉與藍牙排除**：從 Windows registry `HKLM\HARDWARE\DEVICEMAP\SERIALCOMM` 列舉所有 COM port（`WindowsDeviceSource`，`sw_core/device_source.py`）；雙重排除藍牙——BTHENUM PortName 掃描（主判據）+ `bthmodem` device path 啟發式（兜底），確保藍牙裝置**永不被接管**。額外手動排除清單：`config.yaml::windows.exclude_coms`（如 `["COM3"]`）。
 - **閒置非藍牙 COM 自動接管**：偵測到不在排除清單的 COM 時，daemon 以 `passthrough` profile 自動建立 session（可觀察 UART 輸出；需要下命令請先 pin 適當 profile 並 attach）。已持續被外部程序佔用的 COM **不會每輪自動輪詢重試**（與 POSIX dynamic-session 同語意；需拔插或手動 `session bind`/`session clear` 觸發）。
 - **平台 seam 分檔**：三個後端由 `sw_core/platform_backends.py` 的 `select_rpc_backend()` / `select_lock_backend()` / `select_device_backend()` 依 `os.name` 自動選擇，環境變數 `SERIALWRAP_{RPC,LOCK,DEVICE}_BACKEND`（`auto`/`posix`/`win`）可覆寫：
@@ -3074,7 +3085,7 @@ options:
 
 command groups:
   <group>
-    daemon             管理 serialwrap daemon（啟動／停止／狀態）
+    daemon             管理 serialwrap daemon（啟動／停止／重啟／狀態）
     device             實體 UART 裝置列舉與 handoff（release／attach）
     session            session 生命週期、探測、recover、console 與 interactive 操作
     alias              session 別名與 by-id 綁定管理
@@ -3108,12 +3119,13 @@ examples:
 <!-- BEGIN: cli-help marker="serialwrap-daemon-help" -->
 usage: serialwrap daemon [-h] <command> ...
 
-管理 serialwrap daemon 行程：啟動、停止與查詢執行狀態。
+管理 serialwrap daemon 行程：啟動、停止、重啟與查詢執行狀態。
 
 positional arguments:
   <command>
     start     啟動 daemon（--foreground 可前景執行；systemd 模式重導 service start）
     stop      停止執行中的 daemon
+    restart   重啟 daemon（systemd 模式重導 service restart）
     status    顯示 daemon 狀態（pid／sessions／devices／log 路徑／多開偵測 multi_open）
 
 options:

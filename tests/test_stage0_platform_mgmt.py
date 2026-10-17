@@ -1,5 +1,5 @@
 # tests/test_stage0_platform_mgmt.py
-"""Task P1-T15 平台管理（SC-08、SC-09、SC-10、SC-12、SC-20、DF-14）紅燈測試。
+"""Task P1-T15 平台管理（SC-08、SC-09、SC-10、SC-12、SC-20、DF-14）測試。
 
 依 02-stage0-python-bc.md Global Constraints：
 本模組不在頂層 import 本 Task 或本 Phase 新增的未實作函式／類別，
@@ -56,6 +56,114 @@ def test_user_config_then_system_fallback(tmp_path, monkeypatch):
     (tmp_path / "cfg").mkdir(parents=True, exist_ok=True)
     (tmp_path / "cfg" / "config.yaml").write_text("", encoding="utf-8")
     assert constants.resolve_config_path(env={}) == str(tmp_path / "cfg" / "config.yaml")
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_cli_runtime_config_reads_system_fallback(tmp_path, monkeypatch):
+    from sw_core import cli, constants
+
+    user_dir = tmp_path / "user-config"
+    system_path = tmp_path / "system" / "config.yaml"
+    system_path.parent.mkdir(parents=True)
+    system_path.write_text(
+        "supervision_mode: systemd-user\nsocket_path: /run/systemd.sock\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(constants, "CONFIG_DIR", str(user_dir))
+    monkeypatch.setattr(constants, "SYSTEM_CONFIG_PATH", str(system_path))
+    monkeypatch.delenv("SERIALWRAP_CONFIG", raising=False)
+    monkeypatch.setenv("SERIALWRAP_CONFIG_DIR", str(user_dir))
+
+    config = cli._default_runtime_config()
+
+    assert config.mode() == "systemd-user"
+    assert config.socket_path() == "/run/systemd.sock"
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_reconcile_reads_system_fallback_and_writes_user_config(tmp_path, monkeypatch):
+    from sw_core import constants
+    from sw_core.setup_cmd import reconcile
+    from sw_core.sysenv import FakeEffects
+    import yaml
+
+    user_dir = tmp_path / "user-config"
+    system_path = tmp_path / "system" / "config.yaml"
+    system_path.parent.mkdir(parents=True)
+    system_path.write_text(
+        "supervision_mode: on-demand\nsocket_path: /run/old.sock\n",
+        encoding="utf-8",
+    )
+    original = system_path.read_text(encoding="utf-8")
+    monkeypatch.setattr(constants, "CONFIG_DIR", str(user_dir))
+    monkeypatch.setattr(constants, "SYSTEM_CONFIG_PATH", str(system_path))
+    monkeypatch.delenv("SERIALWRAP_CONFIG", raising=False)
+    monkeypatch.setenv("SERIALWRAP_CONFIG_DIR", str(user_dir))
+
+    reconcile(
+        old_mode="on-demand",
+        target_mode="on-demand",
+        fx=FakeEffects(),
+        home=tmp_path,
+        socket_path="/run/new.sock",
+    )
+
+    written = yaml.safe_load((user_dir / "config.yaml").read_text(encoding="utf-8"))
+    assert written == {"supervision_mode": "on-demand", "socket_path": "/run/new.sock"}
+    assert system_path.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_device_source_reads_system_exclude_coms(tmp_path, monkeypatch):
+    from sw_core import device_source
+    from sw_core import constants
+
+    user_dir = tmp_path / "user-config"
+    system_path = tmp_path / "system" / "config.yaml"
+    system_path.parent.mkdir(parents=True)
+    system_path.write_text("windows:\n  exclude_coms: [COM9]\n", encoding="utf-8")
+    monkeypatch.setattr(device_source, "CONFIG_DIR", str(user_dir))
+    monkeypatch.setattr(constants, "SYSTEM_CONFIG_PATH", str(system_path))
+    monkeypatch.delenv("SERIALWRAP_CONFIG", raising=False)
+
+    assert device_source._load_exclude_coms() == {"COM9"}
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_daemon_config_reader_honors_serialwrap_config(tmp_path, monkeypatch):
+    from sw_core import daemon
+
+    explicit = tmp_path / "explicit.yaml"
+    explicit.write_text("windows:\n  exclude_coms: [COM7]\n", encoding="utf-8")
+    monkeypatch.setenv("SERIALWRAP_CONFIG", str(explicit))
+
+    data, error = daemon._load_config_data()
+
+    assert data == {"windows": {"exclude_coms": ["COM7"]}}
+    assert error is None
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_daemon_config_reader_reads_system_fallback(tmp_path, monkeypatch):
+    from sw_core import constants, daemon
+
+    user_dir = tmp_path / "user-config"
+    system_path = tmp_path / "system" / "config.yaml"
+    system_path.parent.mkdir(parents=True)
+    system_path.write_text("windows:\n  exclude_coms: [COM8]\n", encoding="utf-8")
+    monkeypatch.setattr(constants, "CONFIG_DIR", str(user_dir))
+    monkeypatch.setattr(constants, "SYSTEM_CONFIG_PATH", str(system_path))
+    monkeypatch.delenv("SERIALWRAP_CONFIG", raising=False)
+
+    data, error = daemon._load_config_data()
+
+    assert data == {"windows": {"exclude_coms": ["COM8"]}}
+    assert error is None
 
 
 @pytest.mark.core_portable
@@ -151,6 +259,33 @@ def test_wait_old_daemon_gone_endpoint_down_but_process_alive_times_out():
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
+def test_wait_old_daemon_gone_uses_injected_module_clock(monkeypatch):
+    import sw_core.setup_cmd as setup_cmd
+
+    t = [0.0]
+
+    class FakeTime:
+        @staticmethod
+        def monotonic():
+            return t[0]
+
+        @staticmethod
+        def sleep(seconds):
+            t[0] += seconds
+
+    monkeypatch.setattr(setup_cmd, "time", FakeTime)
+    assert setup_cmd.wait_old_daemon_gone(
+        "/tmp/old.sock",
+        42,
+        timeout_s=0.4,
+        ping=lambda _endpoint: False,
+        alive=lambda _pid: True,
+    ) is False
+    assert t[0] == pytest.approx(0.4)
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_wait_old_daemon_gone_unknown_pid_unprovable_times_out():
     (wait_old_daemon_gone,) = _load("sw_core.setup_cmd", "wait_old_daemon_gone")
     t = [0.0]
@@ -200,7 +335,7 @@ def test_new_runtime_dirs_0700(tmp_path, monkeypatch):
     new_run = tmp_path / "new_run"
     existing_cfg = tmp_path / "existing_cfg"
     existing_cfg.mkdir(parents=True, exist_ok=True)
-    os.chmod(existing_cfg, 0o755)
+    os.chmod(existing_cfg, 0o751)
 
     monkeypatch.setattr(constants, "RUN_DIR", str(new_run))
     monkeypatch.setattr(constants, "CONFIG_DIR", str(existing_cfg))
@@ -209,10 +344,14 @@ def test_new_runtime_dirs_0700(tmp_path, monkeypatch):
     monkeypatch.setattr(constants, "EVENTS_DIR", str(tmp_path / "events"))
     monkeypatch.setattr(constants, "EVENTS_RUNTIME_DIR", str(tmp_path / "events_rt"))
 
-    constants.ensure_runtime_dirs()
+    original_umask = os.umask(0o027)
+    try:
+        constants.ensure_runtime_dirs()
+    finally:
+        os.umask(original_umask)
 
     assert stat.S_IMODE(os.stat(new_run).st_mode) == 0o700
-    assert stat.S_IMODE(os.stat(existing_cfg).st_mode) == 0o755
+    assert stat.S_IMODE(os.stat(existing_cfg).st_mode) == 0o751
 
 
 @pytest.mark.posix_only
@@ -236,6 +375,33 @@ def test_lock_compares_normalized_socket(tmp_path):
         lk = SingletonLock(lock_file, non_normalized_sock)
         with pytest.raises(RuntimeError, match="DAEMON_ALREADY_RUNNING"):
             lk.acquire()
+    finally:
+        server.close()
+
+
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
+def test_lock_preserves_symlink_parent_semantics(tmp_path):
+    import asyncio
+    from sw_core.lock_posix import SingletonLock
+
+    real_parent = tmp_path / "real" / "child"
+    real_parent.mkdir(parents=True)
+    link = tmp_path / "link"
+    link.symlink_to(real_parent, target_is_directory=True)
+    socket_via_link = f"unix://{link}/../s.sock"
+
+    async def fake_handler(reader, writer):
+        writer.close()
+        await writer.wait_closed()
+
+    server = asyncio.run(
+        asyncio.start_unix_server(fake_handler, path=str(tmp_path / "real" / "s.sock"))
+    )
+    try:
+        lock = SingletonLock(str(tmp_path / "lock"), socket_via_link)
+        with pytest.raises(RuntimeError, match="DAEMON_ALREADY_RUNNING"):
+            lock.acquire()
     finally:
         server.close()
 
@@ -348,29 +514,107 @@ def test_reconcile_success_shape_unchanged(tmp_path):
     assert set(res.keys()) == {"mode", "transitioned", "applied", "ran", "pending_sudo"}
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_reconcile_waits_for_pid_when_ping_is_down(tmp_path, monkeypatch):
+    import sw_core.setup_cmd as setup_cmd
+    from sw_core.setup_cmd import reconcile
+    from sw_core.sysenv import FakeEffects
+
+    t = [0.0]
+
+    class FakeTime:
+        @staticmethod
+        def monotonic():
+            return t[0]
+
+        @staticmethod
+        def sleep(seconds):
+            t[0] += seconds
+
+    monkeypatch.setattr(setup_cmd, "time", FakeTime)
+    alive_calls = []
+    effects = FakeEffects(systemd=True)
+    result = reconcile(
+        old_mode="on-demand",
+        target_mode="systemd-user",
+        fx=effects,
+        home=tmp_path,
+        daemon_running=False,
+        old_endpoint="unix:///old.sock",
+        old_pid=42,
+        ping=lambda _endpoint: False,
+        alive=lambda pid: (alive_calls.append(pid), True)[1],
+    )
+
+    assert result["error_code"] == "TIMEOUT"
+    assert alive_calls and set(alive_calls) == {42}
+    assert not any("start" in call for call in effects.calls)
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_reconcile_known_pid_wins_over_inactive_systemd_status(tmp_path, monkeypatch):
+    import sw_core.multi_open as multi_open
+    import sw_core.setup_cmd as setup_cmd
+    from sw_core.setup_cmd import reconcile
+    from sw_core.sysenv import FakeEffects
+
+    t = [0.0]
+
+    class FakeTime:
+        @staticmethod
+        def monotonic():
+            return t[0]
+
+        @staticmethod
+        def sleep(seconds):
+            t[0] += seconds
+
+    monkeypatch.setattr(setup_cmd, "time", FakeTime)
+    monkeypatch.setattr(multi_open, "daemon_process_alive", lambda _pid, _endpoint: True)
+    effects = FakeEffects(
+        systemd=True,
+        commands={("systemctl", "--user", "is-active", "serialwrap"): (3, "inactive", "")},
+    )
+
+    result = reconcile(
+        old_mode="systemd-user",
+        target_mode="on-demand",
+        fx=effects,
+        home=tmp_path,
+        old_endpoint="unix:///old.sock",
+        old_pid=42,
+        ping=lambda _endpoint: False,
+    )
+
+    assert result["error_code"] == "TIMEOUT"
+    assert not any(call[-2:] == ["is-active", "serialwrap"] for call in effects.calls)
+    assert not any("start" in call for call in effects.calls)
+
+
 @pytest.mark.posix_only
 @pytest.mark.process_rpc
 def test_socket_bound_with_restrictive_umask(tmp_path, monkeypatch):
     import asyncio
     from sw_core.rpc_posix import JsonRpcUnixServer
 
-    umask_calls = []
     real_umask = os.umask
-
-    def spy_umask(mask):
-        umask_calls.append(mask)
-        return real_umask(mask)
-
-    monkeypatch.setattr(os, "umask", spy_umask)
+    previous_umask = real_umask(0o177)
     sock = str(tmp_path / "umask.sock")
     srv = JsonRpcUnixServer(sock, lambda m, p: {"ok": True}, blocking_methods=set())
 
     async def run():
         await srv.start()
+        mode = stat.S_IMODE(os.stat(sock).st_mode)
         await srv.stop()
+        return mode
 
-    asyncio.run(run())
-    assert 0o177 in umask_calls
+    try:
+        mode = asyncio.run(run())
+    finally:
+        real_umask(previous_umask)
+    assert mode == 0o600
 
 
 @pytest.mark.core_portable
@@ -391,7 +635,96 @@ def test_runtime_config_never_writes_system_fallback(tmp_path, monkeypatch):
     _write_config_endpoint("unix:///new/endpoint.sock")
 
     assert (cfg_dir / "config.yaml").is_file()
+    import yaml
+    written = yaml.safe_load((cfg_dir / "config.yaml").read_text(encoding="utf-8"))
+    assert written == {
+        "supervision_mode": "on-demand",
+        "socket_path": "unix:///new/endpoint.sock",
+    }
     assert sysf.read_text(encoding="utf-8") == orig_content
+
+
+@pytest.mark.posix_only
+@pytest.mark.memory_only
+def test_daemon_process_alive_requires_complete_evidence(tmp_path, monkeypatch):
+    import sw_core.multi_open as multi_open
+
+    proc_root = tmp_path / "proc"
+    (proc_root / "self").mkdir(parents=True)
+    assert multi_open.daemon_process_alive(42, "/tmp/old.sock", proc_root=str(proc_root)) is False
+    assert multi_open.daemon_process_alive(0, "/tmp/old.sock", proc_root=str(proc_root)) is False
+    assert multi_open.daemon_process_alive(
+        None, "/tmp/old.sock", proc_root=str(tmp_path / "missing")
+    ) is None
+    assert multi_open.daemon_process_alive(
+        42, "/tmp/old.sock", proc_root=str(tmp_path / "missing")
+    ) is None
+
+    hidden = proc_root / "77"
+    hidden.mkdir()
+    real_open = open
+
+    def guarded_open(path, *args, **kwargs):
+        if str(path) == str(hidden / "cmdline"):
+            raise PermissionError("cmdline denied")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(multi_open, "open", guarded_open, raising=False)
+    assert multi_open.daemon_process_alive(None, "/tmp/old.sock", proc_root=str(proc_root)) is None
+
+
+@pytest.mark.posix_only
+@pytest.mark.memory_only
+def test_daemon_process_alive_matches_endpoint_when_pid_is_unknown(tmp_path):
+    import sw_core.multi_open as multi_open
+
+    proc_root = tmp_path / "proc"
+    (proc_root / "self").mkdir(parents=True)
+    daemon = proc_root / "123"
+    daemon.mkdir()
+    (daemon / "cmdline").write_bytes(
+        b"python\0-m\0sw_core.daemon\0--socket\0/tmp/old.sock\0"
+    )
+
+    assert multi_open.daemon_process_alive(
+        None, "unix:///tmp/x/../old.sock", proc_root=str(proc_root)
+    ) is True
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_windows_lock_fake_api_closes_and_releases_fd(tmp_path, monkeypatch):
+    import sw_core.lock_win as lock_win
+    import sw_core.win32_files as win32_files
+
+    monkeypatch.setattr(lock_win, "_endpoint_alive", lambda _endpoint: False)
+    lock_calls = []
+    monkeypatch.setattr(
+        win32_files,
+        "lock_file_ex",
+        lambda fd, **_kwargs: (lock_calls.append(fd), False)[1],
+    )
+    contended = lock_win.WindowsSingletonLock(
+        str(tmp_path / "contended.lock"), "tcp://127.0.0.1:48796"
+    )
+    with pytest.raises(RuntimeError, match="DAEMON_ALREADY_RUNNING"):
+        contended.acquire()
+    with pytest.raises(OSError):
+        os.fstat(lock_calls[-1])
+
+    unlocked = []
+    monkeypatch.setattr(win32_files, "lock_file_ex", lambda fd, **_kwargs: True)
+    monkeypatch.setattr(win32_files, "unlock_file_ex", lambda fd: unlocked.append(fd))
+    acquired = lock_win.WindowsSingletonLock(
+        str(tmp_path / "released.lock"), "tcp://127.0.0.1:48796"
+    )
+    acquired.acquire()
+    fd = acquired._fd
+    assert fd is not None
+    acquired.release()
+    assert unlocked == [fd]
+    with pytest.raises(OSError):
+        os.fstat(fd)
 
 
 @pytest.mark.core_portable
@@ -417,6 +750,139 @@ def test_daemon_restart_on_demand_shape(monkeypatch, capsys):
     assert data.get("restarted") is True
     assert data.get("stopped") is True
     assert "start" in data
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_daemon_restart_starts_same_endpoint_with_start_args(monkeypatch, capsys):
+    import json
+    import sw_core.cli as cli
+    from sw_core.runtime_config import RuntimeConfig
+
+    endpoint = "/tmp/custom/serialwrap.sock"
+    fake_rc = RuntimeConfig.__new__(RuntimeConfig)
+    fake_rc._data = {"supervision_mode": "on-demand", "socket_path": endpoint}
+    monkeypatch.setattr(cli, "_safe_runtime_config", lambda: fake_rc)
+    monkeypatch.setattr(
+        cli,
+        "_resolve_local_endpoint_info",
+        lambda _args: cli._ResolvedEndpoint(endpoint, "config.yaml"),
+    )
+    monkeypatch.setattr(cli, "_run_daemon_stop", lambda _args: 0)
+    wait_calls = []
+    monkeypatch.setattr(
+        cli,
+        "wait_old_daemon_gone",
+        lambda old_endpoint, pid, **_kwargs: (wait_calls.append((old_endpoint, pid)), True)[1],
+    )
+    traced_calls = []
+
+    def rpc_traced(_args, _resolved, method, _params, **_kwargs):
+        traced_calls.append(method)
+        if method == "health.status":
+            return {"ok": True, "pid": 123}
+        return {"ok": True, "warnings": []}
+
+    monkeypatch.setattr(cli, "_rpc_call_traced", rpc_traced)
+    monkeypatch.setattr(cli, "_call_rpc_endpoint", lambda *_a, **_kw: {"ok": False})
+    monkeypatch.setattr(cli, "_find_conflicting_daemon", lambda _socket: None)
+    monkeypatch.setattr(cli, "daemon_launch_argv", lambda **_kwargs: ["/fake/serialwrapd"])
+    monkeypatch.setattr(cli, "_resolve_daemon_start_env_files", lambda _profile: [])
+    monkeypatch.setattr(cli, "_load_daemon_start_env_files", lambda _files: (dict(os.environ), []))
+    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
+    spawned = []
+
+    class FakeProcess:
+        pid = 456
+
+        @staticmethod
+        def poll():
+            return None
+
+    def fake_popen(argv, **kwargs):
+        spawned.append((argv, kwargs))
+        return FakeProcess()
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+
+    rc = cli.main(["daemon", "restart"])
+
+    assert rc == 0
+    assert wait_calls == [(endpoint, 123)]
+    assert "health.status" in traced_calls
+    argv = spawned[0][0]
+    assert argv[0] == "/fake/serialwrapd"
+    assert argv[argv.index("--socket") + 1] == endpoint
+    assert argv[argv.index("--profile-dir") + 1] == cli.PROFILE_DIR
+    assert argv[argv.index("--lock") + 1] == cli.LOCK_PATH
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_daemon_restart_timeout_does_not_start(monkeypatch, capsys):
+    import json
+    import sw_core.cli as cli
+    from sw_core.runtime_config import RuntimeConfig
+
+    fake_rc = RuntimeConfig.__new__(RuntimeConfig)
+    fake_rc._data = {"supervision_mode": "on-demand", "socket_path": "/tmp/old.sock"}
+    monkeypatch.setattr(cli, "_safe_runtime_config", lambda: fake_rc)
+    monkeypatch.setattr(
+        cli,
+        "_resolve_local_endpoint_info",
+        lambda _args: cli._ResolvedEndpoint("/tmp/old.sock", "config.yaml"),
+    )
+    monkeypatch.setattr(cli, "_rpc_call_traced", lambda *_a, **_kw: {"ok": True, "pid": 42})
+    monkeypatch.setattr(cli, "_run_daemon_stop", lambda _args: 0)
+    monkeypatch.setattr(cli, "wait_old_daemon_gone", lambda *_a, **_kw: False)
+    starts = []
+    monkeypatch.setattr(cli, "_run_daemon_start", lambda _args: starts.append(True))
+
+    rc = cli.main(["daemon", "restart"])
+
+    assert rc == 1
+    assert starts == []
+    assert json.loads(capsys.readouterr().out) == {
+        "ok": False,
+        "error_code": "TIMEOUT",
+        "phase": "restart_wait_old_exit",
+    }
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--bench", "B1", "daemon", "restart"],
+        ["--endpoint", "tcp://127.0.0.1:48755", "daemon", "restart"],
+    ],
+)
+def test_daemon_restart_rejects_nonlocal_target_before_stop(argv, monkeypatch, capsys):
+    import json
+    import sw_core.cli as cli
+    from sw_core.runtime_config import RuntimeConfig
+
+    fake_rc = RuntimeConfig.__new__(RuntimeConfig)
+    fake_rc._data = {"supervision_mode": "on-demand"}
+    monkeypatch.setattr(cli, "_safe_runtime_config", lambda: fake_rc)
+    rpc_calls = []
+    stop_calls = []
+    monkeypatch.setattr(cli, "_rpc_call_traced", lambda *a, **kw: rpc_calls.append(a))
+    monkeypatch.setattr(cli, "_run_daemon_stop", lambda _args: stop_calls.append(True))
+    monkeypatch.setattr(cli, "_rpc_backend_is_win", lambda: False)
+
+    rc = cli.main(argv)
+
+    assert rc == 2
+    assert rpc_calls == []
+    assert stop_calls == []
+    assert json.loads(capsys.readouterr().out) == {
+        "ok": False,
+        "error_code": "INVALID_ARGS",
+        "message": "daemon restart 只能重啟本機 daemon（不支援 --endpoint／--bench）",
+    }
 
 
 @pytest.mark.core_portable

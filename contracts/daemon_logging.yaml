@@ -55,7 +55,7 @@ messages:
     template: "device watcher tick 失敗，略過本輪"
     args: []
     exc_info: true
-    source: "sw_core/device_watcher.py:78"
+    source: "sw_core/device_watcher.py:83"
 
   - id: matcher_thread_exit_timeout
     logger: sw_core.event_engine.matcher

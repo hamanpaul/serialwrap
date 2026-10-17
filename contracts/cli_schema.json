@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/hamanpaul/serialwrap/contracts/cli_schema.json",
   "title": "serialwrap CLI contract",
-  "x-catalog-revision": 4,
+  "x-catalog-revision": 5,
   "x-prog": "serialwrap",
   "x-conventions": {
     "params_source": "rpc.params 的值為來源：字串為該子命令 argparse namespace 的 dest，送出 args.<dest> 原值；\"selector|com\" 表示 args.selector or args.com（盤點 01 §6.6 stream tail、§6.7 log tail-raw／tail-text）；{\"$document\": \"file\"} 表示 --file 讀入的整份 JSON 物件即為 RPC params（event add）。",
@@ -145,6 +145,21 @@
         },
         {
           "name": "stop",
+          "options": [
+            {
+              "flags": [
+                "--with-sudo"
+              ],
+              "action": "store_true",
+              "dest": "with_sudo",
+              "default": false
+            }
+          ],
+          "mutex": [],
+          "rpc": null
+        },
+        {
+          "name": "restart",
           "options": [
             {
               "flags": [
@@ -2443,6 +2458,16 @@
       "note": "endpoint 解析錯誤為 1；其他例外為 1 + INTERNAL_ERROR（目錄）"
     },
     {
+      "context": "daemon restart",
+      "success": 0,
+      "failure": 2,
+      "codes": {
+        "INVALID_ARGS": 2,
+        "TIMEOUT": 1
+      },
+      "note": "不支援遠端或 bench target 為 2；舊 daemon 離線或行程未結束逾時為 1；啟動失敗為 2"
+    },
+    {
       "context": "event",
       "success": 0,
       "failure": 2,
@@ -2511,9 +2536,10 @@
       "success": 0,
       "failure": 2,
       "codes": {
-        "FLASHING_BUSY": 2
+        "FLASHING_BUSY": 2,
+        "TIMEOUT": 1
       },
-      "note": "FLASHING_BUSY 為 2；其他例外不攔截，印 Python traceback（exit 1）"
+      "note": "FLASHING_BUSY 為 2、reconcile 等待舊 daemon 逾時為 1；其他例外不攔截，印 Python traceback（exit 1）"
     },
     {
       "context": "service <action>",
@@ -2649,25 +2675,25 @@
       "timeout_s": 5.0
     },
     "sources": [
-      "sw_core/cli.py:82",
-      "sw_core/cli.py:84"
+      "sw_core/cli.py:99",
+      "sw_core/cli.py:101"
     ]
   },
   "x-fixed-timeouts": [
     {
       "name": "daemon_stop_wait_s",
       "value": 2.0,
-      "source": "sw_core/cli.py:639"
+      "source": "sw_core/cli.py:662"
     },
     {
       "name": "daemon_start_ping_timeout_s",
       "value": 0.5,
-      "source": "sw_core/cli.py:591"
+      "source": "sw_core/cli.py:614"
     },
     {
       "name": "daemon_start_status_timeout_s",
       "value": 1.0,
-      "source": "sw_core/cli.py:602"
+      "source": "sw_core/cli.py:625"
     },
     {
       "name": "daemon_ready_poll",
@@ -2679,22 +2705,27 @@
         "tries": 50,
         "interval_s": 0.2
       },
-      "source": "sw_core/cli.py:578-580"
+      "source": "sw_core/cli.py:601-603"
     },
     {
       "name": "healthy_daemon_probe_timeout_s",
       "value": 0.5,
-      "source": "sw_core/cli.py:360-371"
+      "source": "sw_core/cli.py:381-392"
     },
     {
       "name": "setup_ping_timeout_s",
       "value": 0.5,
-      "source": "sw_core/cli.py:1632"
+      "source": "sw_core/cli.py:1762"
     },
     {
       "name": "setup_mcu_status_timeout_s",
       "value": 0.5,
-      "source": "sw_core/cli.py:1639"
+      "source": "sw_core/cli.py:1769"
+    },
+    {
+      "name": "setup_old_daemon_status_timeout_s",
+      "value": 0.5,
+      "source": "sw_core/cli.py:1785"
     },
     {
       "name": "doctor_health_status_timeout_s",
@@ -2729,12 +2760,37 @@
     {
       "name": "unix_endpoint_liveness_socket_timeout_s",
       "value": 0.2,
-      "source": "sw_core/cli.py:709"
+      "source": "sw_core/cli.py:835"
+    },
+    {
+      "name": "daemon_restart_status_timeout_s",
+      "value": 0.5,
+      "source": "sw_core/cli.py:719"
+    },
+    {
+      "name": "daemon_restart_ping_timeout_s",
+      "value": 0.2,
+      "source": "sw_core/cli.py:736"
+    },
+    {
+      "name": "setup_reconcile_ping_timeout_s",
+      "value": 0.2,
+      "source": "sw_core/cli.py:1848"
+    },
+    {
+      "name": "daemon_restart_wait_s",
+      "value": 10.0,
+      "source": "sw_core/setup_cmd.py:262"
+    },
+    {
+      "name": "daemon_exit_wait_poll_s",
+      "value": 0.2,
+      "source": "sw_core/setup_cmd.py:286"
     },
     {
       "name": "win_tcp_liveness_connect_timeout_s",
       "value": 0.2,
-      "source": "sw_core/lock_win.py:14"
+      "source": "sw_core/lock_win.py:16"
     },
     {
       "name": "remote_readiness_poll_interval_s",
@@ -2769,12 +2825,12 @@
         {
           "method": "health.ping",
           "timeout_s": 0.5,
-          "where": "spawn guard 與就緒輪詢（cli.py:366-377、599）"
+          "where": "spawn guard 與就緒輪詢（cli.py:367-378、600）"
         },
         {
           "method": "health.status",
           "timeout_s": 1.0,
-          "where": "就緒後取 warnings（cli.py:610）"
+          "where": "就緒後取 warnings（cli.py:611）"
         }
       ]
     },
@@ -2784,7 +2840,37 @@
         {
           "method": "daemon.stop",
           "timeout_s": 2.0,
-          "condition": "RPC daemon.stop 為預設路徑；僅當 supervision_mode 以 systemd 開頭且未指定顯式 target（--endpoint／--socket／--bench）時改走 service stop（cli.py:635）"
+          "condition": "RPC daemon.stop 為預設路徑；僅當 supervision_mode 以 systemd 開頭且未指定顯式 target（--endpoint／--socket／--bench）時改走 service stop（cli.py:636）"
+        }
+      ]
+    },
+    {
+      "command": "daemon restart",
+      "rpc": [
+        {
+          "method": "health.status",
+          "timeout_s": 0.5,
+          "condition": "on-demand 模式下停止前取得舊 daemon PID（cli.py:719）"
+        },
+        {
+          "method": "daemon.stop",
+          "timeout_s": 2.0,
+          "condition": "on-demand 模式先送 daemon.stop（cli.py:662）；systemd 模式直接轉 service restart"
+        },
+        {
+          "method": "health.ping",
+          "timeout_s": 0.2,
+          "where": "on-demand 停止後輪詢舊 endpoint（cli.py:736；總等待上限 setup_cmd.py:262）"
+        },
+        {
+          "method": "health.ping",
+          "timeout_s": 0.5,
+          "where": "確認舊 daemon 結束後呼叫 daemon start（cli.py:614）"
+        },
+        {
+          "method": "health.status",
+          "timeout_s": 1.0,
+          "where": "daemon start 就緒後取得 warnings（cli.py:625）"
         }
       ]
     },
@@ -2794,12 +2880,24 @@
         {
           "method": "health.ping",
           "timeout_s": 0.5,
-          "where": "cli.py:1694"
+          "where": "cli.py:1762"
         },
         {
           "method": "mcu.status",
           "timeout_s": 0.5,
-          "where": "cli.py:1701"
+          "where": "cli.py:1769"
+        },
+        {
+          "method": "health.status",
+          "timeout_s": 0.5,
+          "condition": "只有 daemon 可達且即將進入 reconcile 時取得舊 daemon PID",
+          "where": "cli.py:1785"
+        },
+        {
+          "method": "health.ping",
+          "timeout_s": 0.2,
+          "condition": "模式切換時等待舊 daemon endpoint 不可達",
+          "where": "cli.py:1848"
         }
       ]
     },
@@ -2826,7 +2924,7 @@
           "method": "health.ping",
           "timeout_s": 2.0,
           "condition": "僅 role=connect（remote -L）經 make_role_probe 呼叫；role=expose（-R）不呼叫",
-          "where": "remote_tunnel.py:665 real_ping；cli.py:1603 注入"
+          "where": "remote_tunnel.py:665 real_ping；cli.py:1633 注入"
         }
       ]
     },
@@ -2836,7 +2934,7 @@
         {
           "method": "health.ping",
           "timeout_s": 2.0,
-          "where": "remote_tunnel.py:665 real_ping；cli.py:1416 注入（connect 固定 role=connect）"
+          "where": "remote_tunnel.py:665 real_ping；cli.py:1477 注入（connect 固定 role=connect）"
         }
       ]
     }
@@ -2850,31 +2948,31 @@
     },
     {
       "name": "SERIALWRAP_DAEMON_ENV_FILE",
-      "read_by": "sw_core/cli.py:225、335",
+      "read_by": "sw_core/cli.py:221、336",
       "default": null,
       "effect": "daemon start 的 env 檔來源（有設時 strip 後非空即唯一來源；設為空白則不載入任何 env 檔）",
       "unset_resolves_to": [
         "~/OPI.env",
         "<profile_dir>/OPI.env"
       ],
-      "unset_source": "sw_core/cli.py:51-52（LEGACY_DAEMON_ENV_FILE、PROFILE_DAEMON_ENV_FILE）",
+      "unset_source": "sw_core/cli.py:57-58（LEGACY_DAEMON_ENV_FILE、PROFILE_DAEMON_ENV_FILE）",
       "blank_resolves_to": []
     },
     {
       "name": "SERIALWRAP_STATE_DIR",
-      "read_by": "sw_core/constants.py:27,31；sw_core/cli.py:1118",
+      "read_by": "sw_core/constants.py:27,31；sw_core/cli.py:1200",
       "default": null,
       "effect": "STATE_DIR／WAL／bench state 路徑（constants 於 import 時、bench state 於呼叫時）"
     },
     {
       "name": "XDG_STATE_HOME",
-      "read_by": "sw_core/constants.py:22；sw_core/cli.py:1120",
+      "read_by": "sw_core/constants.py:22；sw_core/cli.py:1202",
       "default": null,
       "effect": "STATE_DIR 與 bench state 的 fallback 根目錄"
     },
     {
       "name": "SERIALWRAP_RUN_DIR",
-      "read_by": "sw_core/constants.py:38；sw_core/cli.py:1643",
+      "read_by": "sw_core/constants.py:38；sw_core/cli.py:1671",
       "default": null,
       "effect": "RUN_DIR（socket／lock 所在）；remote 執行期目錄（呼叫時）"
     },
@@ -2883,6 +2981,12 @@
       "read_by": "sw_core/constants.py:26；sw_core/bench_registry.py:45（benches.yaml 預設路徑，呼叫時）",
       "default": null,
       "effect": "CONFIG_DIR（config.yaml、PROFILE_DIR 來源，import 時）"
+    },
+    {
+      "name": "SERIALWRAP_CONFIG",
+      "read_by": "sw_core/constants.py:103",
+      "default": null,
+      "effect": "覆寫 config.yaml 讀取與寫入路徑；讀取優先於使用者目錄及系統唯讀 fallback"
     },
     {
       "name": "XDG_CONFIG_HOME",
@@ -2947,14 +3051,6 @@
     "doctor"
   ],
   "x-pending": [
-    {
-      "id": "SC-20",
-      "change": "SC-20",
-      "adds_subcommand": [
-        "daemon",
-        "restart"
-      ]
-    },
     {
       "id": "SC-22",
       "change": "SC-22",

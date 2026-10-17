@@ -7,6 +7,7 @@ import signal
 import sys
 from typing import Any
 
+from sw_core import constants as _constants
 from sw_core.config import ProfileTemplate, load_profiles
 from sw_core.constants import (
     CONFIG_DIR,
@@ -15,6 +16,7 @@ from sw_core.constants import (
     PROFILE_DIR,
     default_isolation_paths,
     ensure_runtime_dirs,
+    resolve_config_path,
 )
 from sw_core.runtime_config import RuntimeConfig
 from sw_core.service import SerialwrapService
@@ -27,6 +29,21 @@ from sw_core.test_allowlist import (
     enforce_allowlist,
     resolve_test_allowlist,
 )
+
+_CONFIG_DIR_AT_IMPORT = CONFIG_DIR
+
+
+def _config_dir_for_resolution() -> str:
+    """取得目前設定目錄，同時保留模組與 constants 的測試注入 seam。"""
+    if CONFIG_DIR != _CONFIG_DIR_AT_IMPORT:
+        return CONFIG_DIR
+    return _constants.CONFIG_DIR
+
+
+def _config_path_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env["SERIALWRAP_CONFIG_DIR"] = _config_dir_for_resolution()
+    return env
 
 # 這些 RPC method 的 handler 會長時間同步阻塞，須丟到 executor 執行，否則會卡住單執行緒
 # asyncio event loop，導致期間全 daemon 的所有 RPC 凍結（#52 根因；#80 補齊其餘阻塞 handler）。
@@ -99,7 +116,10 @@ def _write_config_endpoint(endpoint: str) -> None:
     """
     import os  # noqa: PLC0415
     try:
-        cfg = RuntimeConfig(os.path.join(CONFIG_DIR, "config.yaml"))
+        cfg = RuntimeConfig(
+            resolve_config_path(env=_config_path_env()),
+            write_path=resolve_config_path(for_write=True, env=_config_path_env()),
+        )
         cfg.set_socket(endpoint)
     except Exception as exc:  # noqa: BLE001
         sys.stderr.write(f"serialwrapd: 寫入 config.yaml endpoint 失敗（非致命）: {exc}\n")
@@ -168,7 +188,7 @@ def _load_config_data() -> tuple[Any, str | None]:
     """
     import yaml  # noqa: PLC0415 — 延遲匯入，與 RuntimeConfig 一致
 
-    path = os.path.join(CONFIG_DIR, "config.yaml")
+    path = resolve_config_path(env=_config_path_env())
     if not os.path.isfile(path):
         return None, None
     try:

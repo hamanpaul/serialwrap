@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Mapping
 
 
 def _env_path(name: str, default: str) -> str:
@@ -25,6 +26,13 @@ _RUNTIME_HOME = os.environ.get("XDG_RUNTIME_DIR")  # 可能 None
 
 CONFIG_DIR = _env_path("SERIALWRAP_CONFIG_DIR", os.path.join(_CONFIG_HOME, "serialwrap"))
 STATE_DIR = _env_path("SERIALWRAP_STATE_DIR", os.path.join(_STATE_HOME, "serialwrap"))
+if os.name == "nt":
+    _SYSTEM_CONFIG_PATH = os.path.join(
+        os.environ.get("ProgramData", r"C:\ProgramData"), "serialwrap", "config.yaml"
+    )
+else:
+    _SYSTEM_CONFIG_PATH = "/etc/serialwrap/config.yaml"
+SYSTEM_CONFIG_PATH = os.environ.get("SERIALWRAP_TEST_SYSTEM_CONFIG_PATH", _SYSTEM_CONFIG_PATH)
 def _run_dir_default() -> str:
     # 若呼叫端只設 SERIALWRAP_STATE_DIR（常見 CI / throwaway daemon 隔離），socket/lock 必須
     # 落在 STATE_DIR 之下以維持向後相容（舊行為 RUN_DIR 預設＝STATE_DIR，即使 XDG_RUNTIME_DIR 存在）。
@@ -83,6 +91,30 @@ EVENTS_LOG_PATH = _env_path(
 )
 EVENTS_LOG_ROTATE_BYTES = 10 * 1024 * 1024
 EVENTS_LOG_BACKUP_COUNT = 3
+
+
+def resolve_config_path(
+    *,
+    for_write: bool = False,
+    env: Mapping[str, str] | None = None,
+) -> str:
+    """依優先序解析執行期設定檔；系統設定檔只供讀取。"""
+    source = os.environ if env is None else env
+    explicit = source.get("SERIALWRAP_CONFIG")
+    if explicit is not None and explicit.strip():
+        return os.path.expanduser(explicit)
+
+    config_dir = source.get("SERIALWRAP_CONFIG_DIR")
+    if config_dir is None or not config_dir.strip():
+        config_dir = CONFIG_DIR
+    user_path = os.path.join(os.path.expanduser(config_dir), "config.yaml")
+    if for_write:
+        return user_path
+    if os.path.exists(user_path):
+        return user_path
+    if os.path.exists(SYSTEM_CONFIG_PATH):
+        return SYSTEM_CONFIG_PATH
+    return user_path
 
 
 # 帳密解析終態（#140）：profile 宣告帳密來源但解析為空時，session 進此終態，
@@ -237,9 +269,29 @@ def default_isolation_paths() -> dict[str, str]:
 
 
 def ensure_runtime_dirs() -> None:
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    os.makedirs(STATE_DIR, exist_ok=True)
-    os.makedirs(RUN_DIR, exist_ok=True)
-    os.makedirs(WAL_DIR, exist_ok=True)
-    os.makedirs(EVENTS_DIR, exist_ok=True)
-    os.makedirs(EVENTS_RUNTIME_DIR, exist_ok=True)
+    for path in (CONFIG_DIR, STATE_DIR, RUN_DIR, WAL_DIR, EVENTS_DIR, EVENTS_RUNTIME_DIR):
+        _ensure_private_directory(path)
+
+
+def _ensure_private_directory(path: str) -> None:
+    """建立受管理目錄；只把本次新建的目錄設為 0700。"""
+    path = os.path.abspath(os.path.expanduser(path))
+    try:
+        os.mkdir(path, 0o700)
+    except FileNotFoundError:
+        parent = os.path.dirname(path)
+        if parent == path:
+            raise
+        _ensure_private_directory(parent)
+        try:
+            os.mkdir(path, 0o700)
+        except FileExistsError:
+            if not os.path.isdir(path):
+                raise
+        else:
+            os.chmod(path, 0o700)
+    except FileExistsError:
+        if not os.path.isdir(path):
+            raise
+    else:
+        os.chmod(path, 0o700)
