@@ -71,6 +71,8 @@ fn event_params_and_dispatch_fail_until_implemented() {
         default_skill: sw_pal::SkillPlatform::Linux,
         text_newline: "\n",
         exec_replace: true,
+        on_demand_autostart: false,
+        console_kind: sw_pal::ConsoleKind::Pty,
     };
     let p = sw_pal::ClientPlatform {
         env: std::sync::Arc::new(DummySysEnv),
@@ -78,6 +80,10 @@ fn event_params_and_dispatch_fail_until_implemented() {
         clock: std::sync::Arc::new(DummyClock),
         rpc: std::sync::Arc::new(DummyRpc),
         process: std::sync::Arc::new(DummyProcess),
+        procs: sw_pal::fakes::FakeProcScan::new(Vec::new()),
+        tunnel: sw_pal::fakes::FakeTunnel::new(false),
+        service: sw_pal::fakes::FakeServiceCtl::new(Vec::new()),
+        registry: sw_pal::fakes::FakeRegistry::new(Vec::new(), &[]),
         caps,
     };
     let env = sw_proto::runtime_paths::EnvSnapshot::from_pairs(std::iter::empty());
@@ -104,8 +110,11 @@ fn event_params_and_dispatch_fail_until_implemented() {
         paths,
         io,
         verbose: 0,
+        cli_version: sw_proto::version::version(),
     };
     let ns = sw_cli::argparse::Namespace::default();
     let _ = event_params(&ctx, &ns);
     let _ = dispatch_event(&mut ctx, &ns);
 }
+
+impl sw_pal::fs_ops::FsOps for DummyFs {}

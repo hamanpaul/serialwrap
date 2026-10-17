@@ -41,7 +41,7 @@
 | `sha2` | `=0.10.9` | sw-proto | `cli_trace` 的 `endpoint_id`、remote `identity`、release manifest digest |
 | `crossbeam-channel` | `=0.5.15` | sw-pal、sw-core、sw-daemon | 有界 MPMC 與 `select_biased!`：mailbox 的 control lane 優先、deadline receive |
 | `libc` | `=0.2.186` | sw-pal（`cfg(unix)`） | poll、flock、`TIOCEXCL`、termios、openpty、`/proc`、`getrandom` 等 POSIX syscall |
-| `windows-sys` | `=0.61.2` | sw-pal（`cfg(windows)`） | `CreateFileW`、overlapped I/O、`CancelIoEx`、`LockFileEx`、COMM、Toolhelp32、Job Object、`BCryptGenRandom`、`FILE_SHARE_DELETE`、`GetFileInformationByHandleEx`、Winsock、Console。features：`Win32_Foundation`、`Win32_Storage_FileSystem`、`Win32_System_IO`、`Win32_Devices_Communication`、`Win32_System_Threading`、`Win32_Networking_WinSock`、`Win32_System_Console`、`Win32_System_JobObjects`、`Win32_System_Diagnostics_ToolHelp`、`Win32_Security`、`Win32_Security_Cryptography`、`Win32_System_Registry`、`Win32_System_Time`、`Win32_System_SystemInformation`、`Wdk_System_Threading` |
+| `windows-sys` | `=0.61.2` | sw-pal（`cfg(windows)`） | `CreateFileW`、overlapped I/O、`CancelIoEx`、`LockFileEx`、COMM、Toolhelp32、Job Object、`BCryptGenRandom`、`FILE_SHARE_DELETE`、`GetFileInformationByHandleEx`、Winsock、Console。features：`Win32_Foundation`、`Win32_Storage_FileSystem`、`Win32_System_IO`、`Win32_Devices_Communication`、`Win32_System_Threading`、`Win32_Networking_WinSock`、`Win32_System_Console`、`Win32_System_JobObjects`、`Win32_System_Diagnostics_ToolHelp`、`Win32_Security`、`Win32_Security_Cryptography`、`Win32_System_Registry`、`Win32_System_Time`、`Win32_System_SystemInformation`、`Wdk_System_Threading`、`Win32_Globalization`（`MultiByteToWideChar`）、`Win32_System_Diagnostics_Debug`（`FormatMessageW`）（**P4-T1 修訂**：二者皆在 KERNEL32；匯入 DLL 仍限 §1.1 白名單）|
 | dev：`tempfile` | `=3.23.0` | 各 crate 測試 | 隔離目錄 |
 
 **刻意不採用**：
@@ -349,6 +349,8 @@ macro_rules! pydict { ($($k:expr => $v:expr),* $(,)?) => { ... } }  // 回應依
 
 `traits.rs` 定義全部 trait。**P3 修訂（§0.7）**：P3 只交付 client 側子集，組裝點呼叫 `sw_pal::native_client()` 回傳 `ClientPlatform`（`env`、`fs`、`clock`、`rpc`、`process`、`caps`）；P4 擴為 `Platform` 並以 `type ClientPlatform = Platform` 保留別名。下方 `Platform` 為完整目標形狀，內含各 trait 的 `Arc<dyn …>`。`fakes/`（feature `test-fakes`）提供記憶體替身給 L1 使用；替身不得冒充原生 gate（§11.2）。
 
+**P4-T1 修訂（計畫 Task 1）**：`Platform` 為 `ClientPlatform` 的超集，欄位為 `{ env, fs: Arc<dyn FsOps>, clock, rpc, process, procs: Arc<dyn ProcScan>, tunnel: Arc<dyn ProcessTunnel>, service: Arc<dyn ServiceCtl>, registry: Arc<dyn RegistryView + Sync>, caps: Capabilities }`；`Capabilities` 為 P3 `ClientCaps` 全欄位加上 `on_demand_autostart: bool`（SC-18，僅 Windows native 為 true）與 `console_kind: ConsoleKind`（`Pty`／`TcpTelnet`）。`pub type ClientPlatform = Platform`、`pub type ClientCaps = Capabilities`；`native()` 與 `native_client()` 同為組裝點。平台差異只在 `sw-pal` 內（`service_ctl/{posix,windows}.rs` 的 host 模式清單、`lib.rs` 的 `native()`）。
+
 ```rust
 // ---- 共通 ----
 pub type PalResult<T> = Result<T, PalError>;
@@ -377,6 +379,8 @@ pub struct ClientCaps { pub path_flavor: PalPathFlavor, pub af_unix: bool, pub n
 ```
 
 ### 4.1 `SysEnv`、`Clock`、`FsOps`
+
+**P4-T1 修訂（計畫 Task 1）**：`SysEnv` 增加 `run(argv, timeout) -> PalResult<CmdOutput>`、`run_raw(argv, env, timeout) -> PalResult<CmdOutputRaw>`、`which`、`which_all`、`has_systemd`、`is_wsl`、`user_in_group`、`user_identity`、`local_appdata`（P4-T2 實作；預設主體 `unimplemented!`）。`FsOps: FsRead` 增加 `write_file`、`replace`、`copy_preserving`、`read_link`、`set_mode`、`sync_dir`、`symlink_file`（P4-T5 實作）；既有 `atomic_write`、`mkdirs`、`remove_file`、`copy_tree`、`remove_tree`、`symlink_or_copy_dir`、`file_lock_exclusive` 維持 P4-T5 簽章。P3 呼叫端僅使用 `FsRead` 方法，不需修改。
 
 **P3 修訂（§0.7）**：P3 的 `SysEnv` 只交付 `var`、`vars`、`system_config_dir`、`current_user_home`、`user_home`、`current_exe`、`realpath`、`terminal_columns`、`stdout_is_terminal`、`errno_name`、`pid`；其餘（`home_dir`、`expanduser`、`is_wsl` 等）由 P4 補。`expanduser` 在 `sw-proto::pypath` 以 `HomeLookup` 實作（golden 可測）；`system_config_dir` 為 SC-09 必需。`FsOps` 在 P3 以唯讀 `FsRead`（`read`、`exists`、`is_dir`、`list_dir`）承接，P4 擴為 `FsOps: FsRead`。`Clock` 在 P3 為 `mono_ns`＋`sleep`。
 
@@ -634,6 +638,8 @@ pub trait ConsoleListener: Send {
 
 ### 4.8 `ServiceCtl`
 
+**P4-T1 修訂（計畫 Task 1）**：實際簽章以 `crates/sw-pal/src/service_ctl.rs` 為準：`action`／`action_named` 回 `ServiceResult { ok, mode, action, rc, stdout, stderr, error_code, hint, phase }`；`install(def, with_sudo) -> Vec<CmdRecord>`、`install_plan(def)`、`uninstall`、`set_enabled`、`query -> TaskQuery`、`hard_stop`；R5-F1 的 `hold_autostart`／`release_autostart`／`autostart_hold_state`／`hold_autostart_named` 回 `AutostartHoldRecord`／`HoldState`。`SupervisorDefinition` 增 `register_held: bool`（Task 10 reconcile 為 false）。`render_task_xml(&TaskXmlSpec)` 含 `enabled` 欄位。`CompositeServiceCtl` 依模式分派至 `SystemdCtl`（`systemd.rs`）、`WindowsTaskCtl`（`windows_task.rs`）、`WindowsServiceCtl`（`windows_service.rs`）。
+
 ```rust
 pub enum SupervisionMode { OnDemand, SystemdUser, SystemdSystem, WindowsTask, WindowsService, Other(String) }
 pub enum ServiceAction { Start, Stop, Restart, Status }
@@ -665,6 +671,8 @@ pub struct CmdRecord { pub argv: Vec<String>, pub rc: i32 }   // DF-12：setup �
 ```
 
 ### 4.9 `ProcessTunnel`（BC-05）、`ProcessCtl`、`ProcScan`、`SignalWait`
+
+**P4-T1 修訂（計畫 Task 1）**：`ProcScan` 方法為 `serialwrapd_instances() -> Result<Vec<DaemonProc>, ScanFailure>`、`serialwrapd_tty_holders(&[PathBuf]) -> (Vec<u32>, HolderScanStatus)`、`pid_alive(u32) -> bool`、`identity_alive(&ProcIdentity) -> bool`；`DaemonProc { pid, socket, tree }`。Windows 掃描除 `serialwrapd.exe` 外另辨識 `python*.exe` 子行程，並以 launcher＋其 Python 子行程去重為單一 daemon 實例（`dedup_launcher_children`；否則每個 Stage 1 daemon 會被誤判為多開，見 Review Focus 3）。`HolderScanStatus` 由 `traits` 再匯出，P5 `HolderReport.status` 沿用同型別。`ProcessTunnel` 方法與 §4.9 原樣；`ProcessCtl` 增 `spawn_daemon`、`poll`、`call_foreground`（P4-T4）。
 
 ```rust
 pub struct TunnelProc { pub pid: u32, pub group: ProcGroupRef, pub start_ticks: Option<u64> }
@@ -1176,7 +1184,7 @@ Windows（`ProcessTunnel::supports_control_master()==false`）的差異：
 
 - **readiness**：
   - connect：直接對本地 forward 做 `health.ping`（2.0 s）；
-  - expose + tcp：另開一條 ssh 連線執行 `ss -ltnH 'sport = :<port>'`，不使用 ControlPath；
+  - expose + tcp：以**輪詢**判定（P4-T1 修訂，見 Task 8）：每次探測各開一條新的 ssh 連線執行 `ss -ltnH 'sport = :<port>'`（不使用 ControlPath），在 ready 逾時內重試；未確認就緒前不得立即判定 ready（修正 P1 `make_ssh_check -> lambda: True` 的競態）；
   - expose + `--remote-socket`：只要行程存活即視為 ready，與 POSIX 相同。
 - **registry 鎖**：改用 `FsOps::file_lock_exclusive`（LockFileEx）。
 - **存活判定**：`ProcessTunnel::alive`，不用 `os.kill`。

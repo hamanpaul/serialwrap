@@ -17,6 +17,15 @@ from pathlib import Path
 
 import pytest
 
+# P4-T1 管理面夾具：獨立執行（--confcutdir）時不經根 conftest，故於本檔載入。
+from mgmt_fixtures import (  # noqa: E402,F401
+    live_daemon,
+    mgmt_bundle,
+    no_delegation,
+    stub_log,
+    stub_path,
+)
+
 _STANDARD_MARKERS = {
     "core_portable": "Linux 與 Windows 都必跑；禁止以平台原因 SKIP；不得宣稱測到原生 UART",
     "posix_only": "只在 POSIX 執行（PTY、POSIX 鎖、/proc、/dev/ttyMCU、AF_UNIX）",
@@ -34,6 +43,7 @@ _BLACKBOX_MARKERS = {
     "rust_only": "僅 Rust 輪執行；is_rust() 為假時 skip（原因 rust-only contract）",
     "needs_py_daemon": "需要 Python daemon 基線",
     "needs_delegation": "Rust 輪需要 Task 16 委派（Task 14 以 -m 'not needs_delegation' 排除）",
+    "case": "P4 驗收案例綁定（對應 tests/acceptance/p4_case_map.yaml）",
 }
 
 

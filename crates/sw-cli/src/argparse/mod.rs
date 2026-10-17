@@ -84,6 +84,8 @@ pub struct ParserSpec {
     pub description: Option<&'static str>,
     pub epilog: Option<&'static str>,
     pub raw_text: bool,
+    /// 只讓 description 與 epilog 保持原樣（Python `RawDescriptionHelpFormatter`）；參數 help 仍依 `raw_text` 折行。
+    pub raw_description: bool,
     pub add_help: bool,
     pub allow_abbrev: bool,
     pub actions: Vec<ActionSpec>,

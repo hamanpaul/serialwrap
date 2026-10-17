@@ -187,6 +187,7 @@ fn cli_spec_matches_schema() {
     let spec = root_spec(&SpecDefaults {
         version_line: sw_proto::version::version_line(),
         profile_dir: "/golden/config/profiles".into(),
+        lock_path: "/golden/run/serialwrapd.lock".into(),
     });
     let profile_dir = "/golden/config/profiles";
 
@@ -226,9 +227,15 @@ fn cli_spec_matches_schema() {
             .unwrap_or_else(|| panic!("群組 {name} 未在 sub.entries 中找到"));
 
         if stage == "delegate-1a" {
+            // P4-T1（計畫 Task 1 步驟 4）：委派群組的宣告式 parser 已原生，help／usage 可離線比對；
+            // 執行期路由仍由 DELEGATED_GROUPS（classify）決定，群組於各 P4 Task 完成時自委派集合移除。
             assert!(
-                matches!(entry.target, SubTarget::Delegated),
-                "委派群組 {name} 必須為 Delegated"
+                matches!(entry.target, SubTarget::Native(_)),
+                "委派群組 {name} 的宣告式 parser 必須為 Native（P4-T1）"
+            );
+            assert!(
+                sw_cli::delegate::DELEGATED_GROUPS.contains(&name),
+                "委派群組 {name} 必須仍在 DELEGATED_GROUPS（執行期路由）"
             );
             continue;
         }

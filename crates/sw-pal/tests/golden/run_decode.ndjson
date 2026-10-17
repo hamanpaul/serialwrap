@@ -1,0 +1,4 @@
+{"encoding":"UTF-8","generator":"Python 3.12 subprocess.run(argv, capture_output=True, text=True)；P4-T2 測試作者以行內腳本產生（scripts/rust/gen_run_decode_golden.py 尚未建立）","meta":true,"python":"3.12.3"}
+{"argv":["printf","a\\r\\nb\\rc\\n"],"case":"universal_newlines","decode_error":null,"rc":0,"stderr":"","stdout":"a\nb\nc\n"}
+{"argv":["printf","\\xff"],"case":"invalid_utf8","decode_error":"'utf-8' codec can't decode byte 0xff in position 0: invalid start byte","rc":null,"stderr":null,"stdout":null}
+{"argv":["cmd","/c","echo \u4e2d\u6587"],"case":"windows_acp_echo","decode_error":null,"encoding":"cp950","python":"3.12.10","rc":0,"stderr":"","stdout":"\u4e2d\u6587\n"}

@@ -50,6 +50,7 @@ fn build_specs() -> BTreeMap<&'static str, ParserSpec> {
             description: None,
             epilog: None,
             raw_text: false,
+            raw_description: false,
             add_help: true,
             allow_abbrev: true,
             actions: vec![
@@ -106,6 +107,7 @@ fn build_specs() -> BTreeMap<&'static str, ParserSpec> {
             description: None,
             epilog: None,
             raw_text: false,
+            raw_description: false,
             add_help: true,
             allow_abbrev: true,
             actions: vec![ActionSpec {
@@ -134,6 +136,7 @@ fn build_specs() -> BTreeMap<&'static str, ParserSpec> {
             description: None,
             epilog: None,
             raw_text: false,
+            raw_description: false,
             add_help: true,
             allow_abbrev: true,
             actions: vec![ActionSpec {
@@ -162,6 +165,7 @@ fn build_specs() -> BTreeMap<&'static str, ParserSpec> {
             description: None,
             epilog: None,
             raw_text: false,
+            raw_description: false,
             add_help: true,
             allow_abbrev: true,
             actions: vec![
@@ -208,6 +212,7 @@ fn build_specs() -> BTreeMap<&'static str, ParserSpec> {
             description: None,
             epilog: None,
             raw_text: false,
+            raw_description: false,
             add_help: true,
             allow_abbrev: true,
             actions: vec![ActionSpec {
@@ -236,6 +241,7 @@ fn build_specs() -> BTreeMap<&'static str, ParserSpec> {
             description: None,
             epilog: None,
             raw_text: false,
+            raw_description: false,
             add_help: true,
             allow_abbrev: true,
             actions: vec![ActionSpec {
@@ -264,6 +270,7 @@ fn build_specs() -> BTreeMap<&'static str, ParserSpec> {
             description: None,
             epilog: None,
             raw_text: false,
+            raw_description: false,
             add_help: true,
             allow_abbrev: false,
             actions: vec![
@@ -307,6 +314,7 @@ fn build_specs() -> BTreeMap<&'static str, ParserSpec> {
             description: None,
             epilog: None,
             raw_text: false,
+            raw_description: false,
             add_help: true,
             allow_abbrev: true,
             actions: vec![
@@ -350,6 +358,7 @@ fn build_specs() -> BTreeMap<&'static str, ParserSpec> {
             description: None,
             epilog: None,
             raw_text: false,
+            raw_description: false,
             add_help: true,
             allow_abbrev: true,
             actions: vec![
@@ -393,6 +402,7 @@ fn build_specs() -> BTreeMap<&'static str, ParserSpec> {
             description: None,
             epilog: None,
             raw_text: false,
+            raw_description: false,
             add_help: true,
             allow_abbrev: true,
             actions: vec![ActionSpec {
@@ -421,6 +431,7 @@ fn build_specs() -> BTreeMap<&'static str, ParserSpec> {
             description: None,
             epilog: None,
             raw_text: false,
+            raw_description: false,
             add_help: true,
             allow_abbrev: true,
             actions: vec![
@@ -490,6 +501,7 @@ fn build_specs() -> BTreeMap<&'static str, ParserSpec> {
             description: None,
             epilog: None,
             raw_text: false,
+            raw_description: false,
             add_help: true,
             allow_abbrev: true,
             actions: vec![

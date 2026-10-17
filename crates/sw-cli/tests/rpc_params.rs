@@ -60,6 +60,7 @@ fn ns(argv: &str) -> Namespace {
     let spec = root_spec(&SpecDefaults {
         version_line: "serialwrap t".into(),
         profile_dir: "/p".into(),
+        lock_path: "/golden/run/serialwrapd.lock".into(),
     });
     match parse_args(&spec, &shell_words(argv), 78) {
         ParseResult::Ok(n) => n,
@@ -71,6 +72,7 @@ fn ns_argv(argv: &[String]) -> Namespace {
     let spec = root_spec(&SpecDefaults {
         version_line: "serialwrap t".into(),
         profile_dir: "/p".into(),
+        lock_path: "/golden/run/serialwrapd.lock".into(),
     });
     match parse_args(&spec, argv, 78) {
         ParseResult::Ok(n) => n,

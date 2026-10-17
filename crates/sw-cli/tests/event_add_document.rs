@@ -40,6 +40,10 @@ fn platform(
         clock: Arc::clone(&clock) as Arc<dyn Clock>,
         rpc: Arc::clone(&conn) as Arc<dyn RpcConnector>,
         process: Arc::new(RecordingProcess::default()),
+        procs: sw_pal::fakes::FakeProcScan::new(Vec::new()),
+        tunnel: sw_pal::fakes::FakeTunnel::new(false),
+        service: sw_pal::fakes::FakeServiceCtl::new(Vec::new()),
+        registry: sw_pal::fakes::FakeRegistry::new(Vec::new(), &[]),
         caps: ClientCaps {
             path_flavor: PalPathFlavor::Posix,
             af_unix: true,
@@ -47,6 +51,8 @@ fn platform(
             default_skill: SkillPlatform::Linux,
             text_newline: "\n",
             exec_replace: true,
+            on_demand_autostart: false,
+            console_kind: sw_pal::ConsoleKind::Pty,
         },
     };
     (p, conn)

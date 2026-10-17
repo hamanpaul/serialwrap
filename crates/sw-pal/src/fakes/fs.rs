@@ -68,3 +68,107 @@ impl FsRead for MemFs {
         Ok(names.into_iter().collect())
     }
 }
+
+/// 故障注入的檔案系統包裝（P4-T1 替身）：可在 `replace`／`copy_tree` 指定位置注入失敗，其餘委派給內層。
+pub struct FaultFs {
+    inner: std::sync::Arc<dyn crate::fs_ops::FsOps>,
+    replace_fault_suffix: Mutex<Option<String>>,
+    copy_tree_fault: Mutex<bool>,
+}
+
+impl std::fmt::Debug for FaultFs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FaultFs").finish_non_exhaustive()
+    }
+}
+
+impl FaultFs {
+    pub fn wrap(inner: std::sync::Arc<dyn crate::fs_ops::FsOps>) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            inner,
+            replace_fault_suffix: Mutex::new(None),
+            copy_tree_fault: Mutex::new(false),
+        })
+    }
+
+    /// `replace(from, to)` 的 `from` 以此後綴結尾時回 `Io` 錯誤。
+    pub fn fail_replace_when_src_ends_with(&self, suffix: &str) {
+        *self.replace_fault_suffix.lock().unwrap_or_else(|e| e.into_inner()) = Some(suffix.to_string());
+    }
+
+    /// 之後的 `copy_tree` 一律失敗。
+    pub fn fail_copy_tree(&self) {
+        *self.copy_tree_fault.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    }
+}
+
+impl FsRead for FaultFs {
+    fn read(&self, p: &Path) -> PalResult<Vec<u8>> {
+        self.inner.read(p)
+    }
+    fn exists(&self, p: &Path) -> bool {
+        self.inner.exists(p)
+    }
+    fn is_dir(&self, p: &Path) -> bool {
+        self.inner.is_dir(p)
+    }
+    fn list_dir(&self, p: &Path) -> PalResult<Vec<String>> {
+        self.inner.list_dir(p)
+    }
+}
+
+impl crate::fs_ops::FsOps for FaultFs {
+    fn atomic_write(&self, p: &Path, data: &[u8], mode: Option<u32>) -> PalResult<()> {
+        self.inner.atomic_write(p, data, mode)
+    }
+    fn write_file(&self, p: &Path, data: &[u8]) -> PalResult<()> {
+        self.inner.write_file(p, data)
+    }
+    fn mkdirs(&self, p: &Path) -> PalResult<()> {
+        self.inner.mkdirs(p)
+    }
+    fn replace(&self, from: &Path, to: &Path) -> PalResult<()> {
+        let fault = self.replace_fault_suffix.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(suffix) = fault {
+            if from.to_string_lossy().ends_with(&suffix) {
+                return Err(PalError::plain(PalErrorKind::Io, "fake replace fault"));
+            }
+        }
+        self.inner.replace(from, to)
+    }
+    fn remove_file(&self, p: &Path) -> PalResult<()> {
+        self.inner.remove_file(p)
+    }
+    fn copy_preserving(&self, from: &Path, to: &Path) -> PalResult<()> {
+        self.inner.copy_preserving(from, to)
+    }
+    fn copy_tree(&self, from: &Path, to: &Path) -> PalResult<()> {
+        if *self.copy_tree_fault.lock().unwrap_or_else(|e| e.into_inner()) {
+            return Err(PalError::plain(PalErrorKind::Io, "fake copy_tree fault"));
+        }
+        self.inner.copy_tree(from, to)
+    }
+    fn remove_tree(&self, p: &Path) -> PalResult<()> {
+        self.inner.remove_tree(p)
+    }
+    fn read_link(&self, p: &Path) -> PalResult<Option<std::path::PathBuf>> {
+        self.inner.read_link(p)
+    }
+    fn set_mode(&self, p: &Path, mode: u32) -> PalResult<()> {
+        self.inner.set_mode(p, mode)
+    }
+    fn sync_dir(&self, p: &Path) -> PalResult<()> {
+        self.inner.sync_dir(p)
+    }
+    fn symlink_file(&self, link: &Path, target: &Path) -> PalResult<()> {
+        self.inner.symlink_file(link, target)
+    }
+    fn symlink_or_copy_dir(&self, link: &Path, target: &Path) -> PalResult<crate::fs_ops::LinkKind> {
+        self.inner.symlink_or_copy_dir(link, target)
+    }
+    fn file_lock_exclusive(&self, p: &Path, blocking: bool) -> PalResult<crate::fs_ops::FileLockGuard> {
+        self.inner.file_lock_exclusive(p, blocking)
+    }
+}
+
+impl crate::fs_ops::FsOps for MemFs {}

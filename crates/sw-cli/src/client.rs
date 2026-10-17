@@ -437,3 +437,15 @@ fn failure(code: ErrorCode, message: Option<String>) -> PyDict {
 fn socket_error(error: PalError) -> PyDict {
     failure(ErrorCode::SocketError, Some(error.py_message))
 }
+
+/// 管理面子命令的 RPC 薄包裝（P4-T1，計畫 §0.2）：`req_id` 依 P3 規則固定為 `1`，`ClientCrash` 由呼叫端轉 exit 1。
+pub fn call(
+    ctx: &crate::ctx::CliCtx,
+    endpoint: &str,
+    method: &str,
+    params: &PyValue,
+    timeout_s: f64,
+    retries: &PyInt,
+) -> Result<RpcOutcome, ClientCrash> {
+    rpc_call(ctx.p, endpoint, method, params, 1, timeout_s, retries)
+}

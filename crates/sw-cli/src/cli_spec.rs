@@ -3,11 +3,12 @@ use crate::argparse::{
     ActionKind, ActionSpec, ArgValue, Conv, MutexSpec, Nargs, ParserSpec, SubTarget,
     SubparserEntry, SubparsersSpec,
 };
-use crate::delegate::DELEGATED_GROUPS;
 
 pub struct SpecDefaults {
     pub version_line: String,
     pub profile_dir: String,
+    /// `daemon start --lock` 預設（Python `LOCK_PATH`；由 `RuntimePaths::lock_path` 提供）。
+    pub lock_path: String,
 }
 
 pub const GROUP_ORDER: [&str; 20] = [
@@ -39,6 +40,7 @@ fn spec_device() -> ParserSpec {
         description: Some("管理實體 UART 裝置：列舉裝置，以及把 raw device 暫時交給外部工具獨佔再收回。"),
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -54,6 +56,7 @@ fn spec_device() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -68,6 +71,7 @@ fn spec_device() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -85,6 +89,7 @@ fn spec_device() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -107,6 +112,7 @@ fn spec_session() -> ParserSpec {
         description: Some("管理 session：列舉與綁定、健康探測（self-test）、recover、console 與 interactive lease、capture log。"),
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -122,6 +128,7 @@ fn spec_session() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -136,6 +143,7 @@ fn spec_session() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -151,6 +159,7 @@ fn spec_session() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -167,6 +176,7 @@ fn spec_session() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -183,6 +193,7 @@ fn spec_session() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -198,6 +209,7 @@ fn spec_session() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -213,6 +225,7 @@ fn spec_session() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -230,6 +243,7 @@ fn spec_session() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -245,6 +259,7 @@ fn spec_session() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -262,6 +277,7 @@ fn spec_session() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -278,6 +294,7 @@ fn spec_session() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -294,6 +311,7 @@ fn spec_session() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -309,6 +327,7 @@ fn spec_session() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -328,6 +347,7 @@ fn spec_session() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -345,6 +365,7 @@ fn spec_session() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -361,6 +382,7 @@ fn spec_session() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -376,6 +398,7 @@ fn spec_session() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -391,6 +414,7 @@ fn spec_session() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -406,6 +430,7 @@ fn spec_session() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -429,6 +454,7 @@ fn spec_alias() -> ParserSpec {
         ),
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![ActionSpec {
@@ -459,6 +485,7 @@ fn spec_alias() -> ParserSpec {
                         description: None,
                         epilog: None,
                         raw_text: false,
+                        raw_description: false,
                         add_help: true,
                         allow_abbrev: true,
                         actions: vec![ActionSpec {
@@ -486,6 +513,7 @@ fn spec_alias() -> ParserSpec {
                         description: None,
                         epilog: None,
                         raw_text: false,
+                        raw_description: false,
                         add_help: true,
                         allow_abbrev: true,
                         actions: vec![
@@ -541,6 +569,7 @@ fn spec_alias() -> ParserSpec {
                         description: None,
                         epilog: None,
                         raw_text: false,
+                        raw_description: false,
                         add_help: true,
                         allow_abbrev: true,
                         actions: vec![
@@ -609,6 +638,7 @@ fn spec_alias() -> ParserSpec {
                         description: None,
                         epilog: None,
                         raw_text: false,
+                        raw_description: false,
                         add_help: true,
                         allow_abbrev: true,
                         actions: vec![
@@ -654,6 +684,7 @@ fn spec_cmd() -> ParserSpec {
         description: Some("向 session 提交命令並取回結果：line 模式看 status，background 模式用 result-tail。"),
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -669,6 +700,7 @@ fn spec_cmd() -> ParserSpec {
         description: Some("提交命令到 session（--mode line|background|interactive）。\n\n命令長度限制（--cmd 整條字串，以 UTF-8 位元組計；#129）：\n  - > 4096 bytes：接受但附 CMD_LENGTH_WARNING（過長命令可能造成 UART 緩衝溢位或 prompt timeout）\n  - > 16384 bytes：直接拒絕（CMD_TOO_LONG）\n  - 含 \\n 換行字元：直接拒絕（CMD_CONTAINS_NEWLINE），請拆成多次獨立提交\n\nbroker 對命令內容不做截斷；上述為 broker 對單一 --cmd 參數的上限，\ntarget 端 tty line buffer（常見 4096 bytes，target-dependent）才是物理單行限制。\n上限可由 `serialwrap daemon status` 回應的 limits 欄位執行期查詢，client 不需硬編碼。"),
         epilog: None,
         raw_text: true,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -691,6 +723,7 @@ fn spec_cmd() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -706,6 +739,7 @@ fn spec_cmd() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -723,6 +757,7 @@ fn spec_cmd() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -744,6 +779,7 @@ fn spec_stream() -> ParserSpec {
         description: Some("即時 tail session 解析後的文字串流（line 事件）。"),
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![ActionSpec {
@@ -773,6 +809,7 @@ fn spec_stream() -> ParserSpec {
                     description: None,
                     epilog: None,
                     raw_text: false,
+                    raw_description: false,
                     add_help: true,
                     allow_abbrev: true,
                     actions: vec![
@@ -856,6 +893,7 @@ fn spec_log() -> ParserSpec {
         description: Some("tail raw 或純文字日誌；raw 含 timestamp／source／seq／crc，可做回放與稽核。"),
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -871,6 +909,7 @@ fn spec_log() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -889,6 +928,7 @@ fn spec_log() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -913,6 +953,7 @@ fn spec_file() -> ParserSpec {
         description: Some("透過 UART 在本機與 target 之間推送（push）或拉取（pull）檔案。"),
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -928,6 +969,7 @@ fn spec_file() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -949,6 +991,7 @@ fn spec_file() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -975,6 +1018,7 @@ fn spec_wal() -> ParserSpec {
         description: Some("操作 write-ahead log（WAL）：匯出區段、重設與查詢目前 seq。"),
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![ActionSpec {
@@ -1005,6 +1049,7 @@ fn spec_wal() -> ParserSpec {
                         description: None,
                         epilog: None,
                         raw_text: false,
+                        raw_description: false,
                         add_help: true,
                         allow_abbrev: true,
                         actions: vec![
@@ -1073,6 +1118,7 @@ fn spec_wal() -> ParserSpec {
                         description: None,
                         epilog: None,
                         raw_text: false,
+                        raw_description: false,
                         add_help: true,
                         allow_abbrev: true,
                         actions: vec![ActionSpec {
@@ -1100,6 +1146,7 @@ fn spec_wal() -> ParserSpec {
                         description: None,
                         epilog: None,
                         raw_text: false,
+                        raw_description: false,
                         add_help: true,
                         allow_abbrev: true,
                         actions: vec![ActionSpec {
@@ -1132,6 +1179,7 @@ fn spec_mcu() -> ParserSpec {
         ),
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![ActionSpec {
@@ -1164,6 +1212,7 @@ fn spec_mcu() -> ParserSpec {
                         description: None,
                         epilog: None,
                         raw_text: false,
+                        raw_description: false,
                         add_help: true,
                         allow_abbrev: true,
                         actions: vec![ActionSpec {
@@ -1191,6 +1240,7 @@ fn spec_mcu() -> ParserSpec {
                         description: None,
                         epilog: None,
                         raw_text: false,
+                        raw_description: false,
                         add_help: true,
                         allow_abbrev: true,
                         actions: vec![ActionSpec {
@@ -1221,6 +1271,7 @@ fn spec_event() -> ParserSpec {
         description: Some("event-trigger 規則註冊表與 matcher 控制：新增／刪除／列舉／啟用停用規則與檢視觸發紀錄。"),
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -1236,6 +1287,7 @@ fn spec_event() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -1251,6 +1303,7 @@ fn spec_event() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -1266,6 +1319,7 @@ fn spec_event() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -1282,6 +1336,7 @@ fn spec_event() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -1297,6 +1352,7 @@ fn spec_event() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -1312,6 +1368,7 @@ fn spec_event() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -1327,6 +1384,7 @@ fn spec_event() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -1342,6 +1400,7 @@ fn spec_event() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -1359,6 +1418,7 @@ fn spec_event() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -1373,6 +1433,7 @@ fn spec_event() -> ParserSpec {
         description: None,
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -1397,6 +1458,7 @@ fn spec_profile(d: &SpecDefaults) -> ParserSpec {
         description: Some("離線驗證 profile 的 prompt/login/password/bootloader regex 是否命中一段樣本文字（#174）。"),
         epilog: None,
         raw_text: false,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -1412,6 +1474,7 @@ fn spec_profile(d: &SpecDefaults) -> ParserSpec {
         description: Some("從 --profile-dir 載入 profile YAML，找出 --profile 指定的 template，\n對 --sample 檔案內容依序跑 prompt_regex／login_regex／password_regex／\nbootloader_prompts（逐條），stdout 印 JSON 回報各 regex 是否命中與命中的行。\n純離線診斷：不連 daemon、不碰任何 UART，exit code 恆為 0。"),
         epilog: None,
         raw_text: true,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -1435,11 +1498,262 @@ fn spec_skill() -> ParserSpec {
         description: Some("把內嵌的 serialwrap 操作指南（agent skill／操作手冊）原文印到 stdout（#131）。\n唯讀、不需 daemon；可重導存檔：serialwrap skill --platform windows > SKILL_WINDOWS.md"),
         epilog: None,
         raw_text: true,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
             ActionSpec { option_strings: vec!["-h", "--help"], dest: "help", kind: ActionKind::Help, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("show this help message and exit".to_string()), metavar: None, version: None },
             ActionSpec { option_strings: vec!["--platform"], dest: "platform", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Str("auto".to_string()), choices: Some(vec!["auto", "linux", "windows"]), required: false, help: Some("指南平台；auto（預設）依目前平台選擇".to_string()), metavar: None, version: None },
+        ],
+        mutex: vec![
+        ],
+        sub: None,
+    }
+}
+
+// ---- daemon（P4-T1：Python 3.12.3 argparse 逐字對照；由 scripts/rust/capture_cli_help.py 的 apply_rust_only 擴充）
+fn spec_daemon(d: &SpecDefaults) -> ParserSpec {
+    ParserSpec {
+        prog: "serialwrap daemon".to_string(),
+        description: Some("管理 serialwrap daemon 行程：啟動、停止與查詢執行狀態。"),
+        epilog: None,
+        raw_text: false,
+        raw_description: false,
+        add_help: true,
+        allow_abbrev: true,
+        actions: vec![
+            ActionSpec { option_strings: vec!["-h", "--help"], dest: "help", kind: ActionKind::Help, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("show this help message and exit".to_string()), metavar: None, version: None },
+        ],
+        mutex: vec![
+        ],
+        sub: Some(SubparsersSpec {
+            dest: "daemon_cmd", required: true, title: None, metavar: Some("<command>"),
+            entries: vec![
+                SubparserEntry { name: "start", help: Some("啟動 daemon（--foreground 可前景執行；systemd 模式重導 service start）"), target: SubTarget::Native(Box::new(
+                    ParserSpec {
+                        prog: "serialwrap daemon start".to_string(),
+                        description: None,
+                        epilog: None,
+                        raw_text: false,
+                        raw_description: false,
+                        add_help: true,
+                        allow_abbrev: true,
+                        actions: vec![
+                            ActionSpec { option_strings: vec!["-h", "--help"], dest: "help", kind: ActionKind::Help, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("show this help message and exit".to_string()), metavar: None, version: None },
+                            ActionSpec { option_strings: vec!["--profile-dir"], dest: "profile_dir", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Str(d.profile_dir.clone()), choices: None, required: false, help: Some(format!("profile YAML 目錄（預設: {}）", d.profile_dir)), metavar: None, version: None },
+                            ActionSpec { option_strings: vec!["--lock"], dest: "lock", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Str(d.lock_path.clone()), choices: None, required: false, help: None, metavar: None, version: None },
+                            ActionSpec { option_strings: vec!["--foreground"], dest: "foreground", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: None, metavar: None, version: None },
+                            ActionSpec { option_strings: vec!["--with-sudo"], dest: "with_sudo", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("systemd-system 模式下，daemon start 重導至 service start 時以 sudo 執行".to_string()), metavar: None, version: None },
+                            ActionSpec { option_strings: vec!["--force-spawn"], dest: "force_spawn", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("跳過『已有其他 socket 的 serialwrapd 在跑』防線，強制在本次目標 socket 另外 spawn（#173；預設拒絕，避免同機誤開第二個 daemon 造成 two-reader）".to_string()), metavar: None, version: None },
+                        ],
+                        mutex: vec![
+                        ],
+                        sub: None,
+                    }
+                )) },
+                SubparserEntry { name: "stop", help: Some("停止執行中的 daemon"), target: SubTarget::Native(Box::new(
+                    ParserSpec {
+                        prog: "serialwrap daemon stop".to_string(),
+                        description: None,
+                        epilog: None,
+                        raw_text: false,
+                        raw_description: false,
+                        add_help: true,
+                        allow_abbrev: true,
+                        actions: vec![
+                            ActionSpec { option_strings: vec!["-h", "--help"], dest: "help", kind: ActionKind::Help, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("show this help message and exit".to_string()), metavar: None, version: None },
+                            ActionSpec { option_strings: vec!["--with-sudo"], dest: "with_sudo", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("systemd-system 模式下，daemon stop 重導至 service stop 時以 sudo 執行".to_string()), metavar: None, version: None },
+                        ],
+                        mutex: vec![
+                        ],
+                        sub: None,
+                    }
+                )) },
+                SubparserEntry { name: "status", help: Some("顯示 daemon 狀態（pid／sessions／devices／log 路徑／多開偵測 multi_open）"), target: SubTarget::Native(Box::new(
+                    ParserSpec {
+                        prog: "serialwrap daemon status".to_string(),
+                        description: None,
+                        epilog: None,
+                        raw_text: false,
+                        raw_description: false,
+                        add_help: true,
+                        allow_abbrev: true,
+                        actions: vec![
+                            ActionSpec { option_strings: vec!["-h", "--help"], dest: "help", kind: ActionKind::Help, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("show this help message and exit".to_string()), metavar: None, version: None },
+                        ],
+                        mutex: vec![
+                        ],
+                        sub: None,
+                    }
+                )) },
+            ],
+        }),
+    }
+}
+
+// ---- remote（P4-T1：Python 3.12.3 argparse 逐字對照；由 scripts/rust/capture_cli_help.py 的 apply_rust_only 擴充）
+fn spec_remote(_d: &SpecDefaults) -> ParserSpec {
+    ParserSpec {
+        prog: "serialwrap remote".to_string(),
+        description: Some("serialwrap remote：外包系統 ssh 建立 -R（expose，把本機 daemon 推到對端）／-L（connect，relay 情境把對端 port 拉回本機 loopback）隧道，background 常駐。
+  serialwrap remote user@host:7777        # -R 預設：expose 本機 daemon
+  serialwrap remote -L user@relay:7777    # connect（relay/雙 NAT）
+  serialwrap remote                        # 列目前隧道（status）
+  serialwrap remote close 7777|all         # 拆除
+安全：只透過 ssh-tunnel、單租戶/可信 relay 或 --remote-socket；不可對網路直接開放。"),
+        epilog: None,
+        raw_text: false,
+        raw_description: true,
+        add_help: true,
+        allow_abbrev: true,
+        actions: vec![
+            ActionSpec { option_strings: vec!["-h", "--help"], dest: "help", kind: ActionKind::Help, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("show this help message and exit".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec!["-R"], dest: "reverse", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("reverse/expose（預設）".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec!["-L"], dest: "forward", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("forward/connect（relay）".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec!["--autossh"], dest: "autossh", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("以 autossh 斷線自動重連".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec!["--local"], dest: "local", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Int, default: ArgValue::None, choices: None, required: false, help: Some("-L 本機 loopback port（預設=對端 port）".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec!["--remote-socket"], dest: "remote_socket", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("硬化：-R 建遠端 unix socket／-L 連該 socket（共享 relay 建議）".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec!["--ready-timeout"], dest: "ready_timeout", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Float, default: ArgValue::Float(10.0), choices: None, required: false, help: Some("readiness 確認上限秒數（逾時回 starting）".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec!["--ssh-opt"], dest: "ssh_opt", kind: ActionKind::Append, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::List(vec![]), choices: None, required: false, help: Some("透傳額外 ssh 參數（可重複），如 --ssh-opt=-p --ssh-opt=2222".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec![], dest: "words", kind: ActionKind::Store, nargs: Nargs::ZeroOrMore, conv: Conv::Str, default: ArgValue::None, choices: None, required: true, help: Some("[user@]host:port ｜ status ｜ close <port|all>".to_string()), metavar: None, version: None },
+        ],
+        mutex: vec![
+        ],
+        sub: None,
+    }
+}
+
+// ---- connect（P4-T1：Python 3.12.3 argparse 逐字對照；由 scripts/rust/capture_cli_help.py 的 apply_rust_only 擴充）
+fn spec_connect(_d: &SpecDefaults) -> ParserSpec {
+    ParserSpec {
+        prog: "serialwrap connect".to_string(),
+        description: Some("從 benches.yaml 解析 bench 代號，重用既有 remote -L spawn 路徑建立或拆除隧道。"),
+        epilog: None,
+        raw_text: false,
+        raw_description: false,
+        add_help: true,
+        allow_abbrev: true,
+        actions: vec![
+            ActionSpec { option_strings: vec!["-h", "--help"], dest: "help", kind: ActionKind::Help, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("show this help message and exit".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec!["--close"], dest: "close", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("拆除該代號對應 local_port 的隧道，並清除 endpoint 記憶".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec![], dest: "code", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: true, help: Some("benches.yaml 的 bench 代號".to_string()), metavar: None, version: None },
+        ],
+        mutex: vec![
+        ],
+        sub: None,
+    }
+}
+
+// ---- benches（P4-T1：Python 3.12.3 argparse 逐字對照；由 scripts/rust/capture_cli_help.py 的 apply_rust_only 擴充）
+fn spec_benches(_d: &SpecDefaults) -> ParserSpec {
+    ParserSpec {
+        prog: "serialwrap benches".to_string(),
+        description: Some("列出 benches.yaml 各代號、目前記住的 endpoint，以及本機 connect tunnel 是否仍存活。"),
+        epilog: None,
+        raw_text: false,
+        raw_description: false,
+        add_help: true,
+        allow_abbrev: true,
+        actions: vec![
+            ActionSpec { option_strings: vec!["-h", "--help"], dest: "help", kind: ActionKind::Help, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("show this help message and exit".to_string()), metavar: None, version: None },
+        ],
+        mutex: vec![
+        ],
+        sub: None,
+    }
+}
+
+// ---- supervision-mode（P4-T1：Python 3.12.3 argparse 逐字對照；由 scripts/rust/capture_cli_help.py 的 apply_rust_only 擴充）
+fn spec_supervision_mode(_d: &SpecDefaults) -> ParserSpec {
+    ParserSpec {
+        prog: "serialwrap supervision-mode".to_string(),
+        description: Some("印出 config.yaml 中的 supervision_mode，未設定時預設為 on-demand。供 shell 腳本（如 minicom_router.sh）查詢。"),
+        epilog: None,
+        raw_text: false,
+        raw_description: false,
+        add_help: true,
+        allow_abbrev: true,
+        actions: vec![
+            ActionSpec { option_strings: vec!["-h", "--help"], dest: "help", kind: ActionKind::Help, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("show this help message and exit".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec!["--force"], dest: "force", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("相容旗標：不覆寫交接護欄（flash、傳輸、活躍操作或探測不明時一律拒絕）".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec!["--with-sudo"], dest: "with_sudo", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("允許代跑需要 root／系統管理員權限的指令".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec![], dest: "words", kind: ActionKind::Store, nargs: Nargs::ZeroOrMore, conv: Conv::Str, default: ArgValue::None, choices: None, required: true, help: Some("不帶參數：印出目前監管模式；set MODE：切換並執行 reconcile".to_string()), metavar: Some("set MODE"), version: None },
+        ],
+        mutex: vec![
+        ],
+        sub: None,
+    }
+}
+
+// ---- service（P4-T1：Python 3.12.3 argparse 逐字對照；由 scripts/rust/capture_cli_help.py 的 apply_rust_only 擴充）
+fn spec_service(_d: &SpecDefaults) -> ParserSpec {
+    ParserSpec {
+        prog: "serialwrap service".to_string(),
+        description: Some("包裝 systemctl，按 config.yaml 的 supervision_mode 決定呼叫方式。
+systemd-user 模式：免 sudo。
+systemd-system 模式：start/stop/restart 需 root（加 --with-sudo 代跑）。
+on-demand 模式：不可用。"),
+        epilog: None,
+        raw_text: false,
+        raw_description: false,
+        add_help: true,
+        allow_abbrev: true,
+        actions: vec![
+            ActionSpec { option_strings: vec!["-h", "--help"], dest: "help", kind: ActionKind::Help, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("show this help message and exit".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec!["--with-sudo"], dest: "with_sudo", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("systemd-system 模式的特權動作（start/stop/restart）以 sudo 執行".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec![], dest: "action", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: Some(vec!["start", "stop", "restart", "status"]), required: true, help: Some("要執行的 systemctl 動作".to_string()), metavar: None, version: None },
+        ],
+        mutex: vec![
+        ],
+        sub: None,
+    }
+}
+
+// ---- setup（P4-T1：Python 3.12.3 argparse 逐字對照；由 scripts/rust/capture_cli_help.py 的 apply_rust_only 擴充）
+fn spec_setup(_d: &SpecDefaults) -> ParserSpec {
+    ParserSpec {
+        prog: "serialwrap setup".to_string(),
+        description: Some("物化套件資產（profiles／agent skill／minicom wrappers）到使用者位置，並 reconcile 監管模式（先停舊、再起新）。
+未指定模式時自動偵測（有 systemd → systemd-user，否則 on-demand）。
+system scope 的特權動作需 --with-sudo，否則只回報待執行的 sudo 指令。"),
+        epilog: None,
+        raw_text: true,
+        raw_description: false,
+        add_help: true,
+        allow_abbrev: true,
+        actions: vec![
+            ActionSpec { option_strings: vec!["-h", "--help"], dest: "help", kind: ActionKind::Help, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("show this help message and exit".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec!["--user"], dest: "user", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("設為 systemd-user 模式（免 sudo）".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec!["--system"], dest: "system", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("設為 systemd-system 模式（特權動作需 --with-sudo）".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec!["--on-demand"], dest: "on_demand", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("設為 on-demand 模式（無 systemd 時的降級備援）".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec!["--force"], dest: "force", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("覆蓋既有 profiles，並在 flash 進行中仍強制切換".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec!["--with-sudo"], dest: "with_sudo", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("systemd-system 模式下允許執行特權 sudo 指令（安裝 unit／enable／start）".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec!["--windows-task"], dest: "windows_task", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("Windows：以工作排程器登入自啟監管（Windows 預設）".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec!["--windows-service"], dest: "windows_service", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("Windows：以 Windows 服務監管（OD-12：只列出待執行指令）".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec!["--rollback"], dest: "rollback", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("回滾到上一個完整發佈組合（Previous）".to_string()), metavar: None, version: None },
+        ],
+        mutex: vec![
+            MutexSpec { required: false, dests: vec!["user", "system", "on_demand", "windows_task", "windows_service", "rollback"] },
+        ],
+        sub: None,
+    }
+}
+
+// ---- doctor（P4-T1：Python 3.12.3 argparse 逐字對照；由 scripts/rust/capture_cli_help.py 的 apply_rust_only 擴充）
+fn spec_doctor(_d: &SpecDefaults) -> ParserSpec {
+    ParserSpec {
+        prog: "serialwrap doctor".to_string(),
+        description: Some("對安裝與執行環境做一系列唯讀檢查並印出 JSON 報告（依平台選擇檢查清單，#131）。
+Linux：systemd／wsl_systemd／devices／serialwrap_minicom_on_path／jq_on_path／
+minicom_on_path 為 advisory（缺少不致命，不拉低整體 ok；#149）。
+Windows：serialwrap_on_path／serialwrapd_on_path／daemon_endpoint／devices 為 advisory。"),
+        epilog: None,
+        raw_text: true,
+        raw_description: false,
+        add_help: true,
+        allow_abbrev: true,
+        actions: vec![
+            ActionSpec { option_strings: vec!["-h", "--help"], dest: "help", kind: ActionKind::Help, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("show this help message and exit".to_string()), metavar: None, version: None },
         ],
         mutex: vec![
         ],
@@ -1453,6 +1767,7 @@ pub fn root_spec(d: &SpecDefaults) -> ParserSpec {
         description: Some("serialwrap client（支援本機 Unix socket 與遠端 endpoint）"),
         epilog: Some("examples:\n  serialwrap session list\n  serialwrap --endpoint tcp://127.0.0.1:7777 session list\n  serialwrap --endpoint tcp://127.0.0.1:7777 cmd submit --selector COM0 --cmd 'uname -a'"),
         raw_text: true,
+        raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
@@ -1496,26 +1811,32 @@ pub fn root_spec(d: &SpecDefaults) -> ParserSpec {
         .copied()
         .zip(group_help)
         .map(|(name, help)| {
-            let target = if DELEGATED_GROUPS.contains(&name) {
-                SubTarget::Delegated
-            } else {
-                let native = match name {
-                    "device" => spec_device(),
-                    "session" => spec_session(),
-                    "alias" => spec_alias(),
-                    "cmd" => spec_cmd(),
-                    "stream" => spec_stream(),
-                    "log" => spec_log(),
-                    "file" => spec_file(),
-                    "wal" => spec_wal(),
-                    "mcu" => spec_mcu(),
-                    "event" => spec_event(),
-                    "profile" => spec_profile(d),
-                    "skill" => spec_skill(),
-                    _ => unreachable!("缺少原生 CLI 群組規格: {name}"),
-                };
-                SubTarget::Native(Box::new(native))
+            // P4-T1：八個委派群組的宣告式 parser 一律原生（help／usage 可離線比對）；執行期路由仍由
+            // `DELEGATED_GROUPS`／`classify` 決定，群組於各 P4 Task 完成時自委派集合移除（Task 14 清空）。
+            let native = match name {
+                "daemon" => spec_daemon(d),
+                "remote" => spec_remote(d),
+                "connect" => spec_connect(d),
+                "benches" => spec_benches(d),
+                "supervision-mode" => spec_supervision_mode(d),
+                "service" => spec_service(d),
+                "setup" => spec_setup(d),
+                "doctor" => spec_doctor(d),
+                "device" => spec_device(),
+                "session" => spec_session(),
+                "alias" => spec_alias(),
+                "cmd" => spec_cmd(),
+                "stream" => spec_stream(),
+                "log" => spec_log(),
+                "file" => spec_file(),
+                "wal" => spec_wal(),
+                "mcu" => spec_mcu(),
+                "event" => spec_event(),
+                "profile" => spec_profile(d),
+                "skill" => spec_skill(),
+                _ => unreachable!("缺少原生 CLI 群組規格: {name}"),
             };
+            let target = SubTarget::Native(Box::new(native));
             SubparserEntry {
                 name,
                 help: Some(help),

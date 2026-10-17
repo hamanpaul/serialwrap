@@ -358,7 +358,7 @@ pub fn format_help(spec: &ParserSpec, width: usize) -> String {
             .to_string(),
     );
     if let Some(description) = spec.description {
-        let rendered = format_text(description, width, spec.raw_text);
+        let rendered = format_text(description, width, spec.raw_text || spec.raw_description);
         if !rendered.is_empty() {
             pieces.push(rendered);
         }
@@ -400,7 +400,7 @@ pub fn format_help(spec: &ParserSpec, width: usize) -> String {
     }
 
     if let Some(epilog) = spec.epilog {
-        let rendered = format_text(epilog, width, spec.raw_text);
+        let rendered = format_text(epilog, width, spec.raw_text || spec.raw_description);
         if !rendered.is_empty() {
             pieces.push(rendered);
         }

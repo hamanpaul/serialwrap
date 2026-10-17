@@ -232,7 +232,7 @@ fn run<R>(w: World, body: impl FnOnce(&mut CliCtx<'_>) -> R) -> Run<R> {
         vars: w.env.clone(),
         system_config_dir: w.system_config_dir.clone(),
     });
-    let fs_dyn: Arc<dyn FsRead> = Arc::new(TestFs {
+    let fs_dyn: Arc<dyn sw_pal::fs_ops::FsOps> = Arc::new(TestFs {
         files: w.files,
         dirs: w.dirs,
     });
@@ -263,6 +263,7 @@ fn run<R>(w: World, body: impl FnOnce(&mut CliCtx<'_>) -> R) -> Run<R> {
             paths,
             io: TextIo::new(&mut out, &mut err, "\n"),
             verbose: 0,
+            cli_version: sw_proto::version::version(),
         };
         body(&mut ctx)
     };
@@ -694,3 +695,5 @@ fn print_error_writes_stdout_json_and_stderr_line() {
         "serialwrap: session.list failed: BENCH_ENDPOINT_NOT_REMEMBERED: bench \"lab\" 尚未記住 endpoint；請先執行 serialwrap connect lab\n"
     );
 }
+
+impl sw_pal::fs_ops::FsOps for TestFs {}

@@ -16,6 +16,17 @@ pub mod ctx;
 pub mod delegate;
 pub mod endpoint_resolve;
 pub mod output;
+pub mod remote_tunnel;
+// P4-T1 空殼：以下模組的實作由 Stage 1B 各 Task 承接（見 docs/rust-refactor/plans/05-stage1b-rust-cli-mgmt.md）。
+pub mod doctor_cmd;
+pub mod graceful_stop;
+pub mod install_layout;
+pub mod pairing;
+pub mod rollback;
+pub mod setup_cmd;
+pub mod state_migrate;
+pub mod supervisor_defs;
+pub mod wslconf;
 
 use std::any::Any;
 use std::cell::Cell;
@@ -105,6 +116,7 @@ pub fn run(
         paths,
         io,
         verbose: 0,
+        cli_version: sw_proto::version::version(),
     };
 
     let tail: &[OsString] = argv.get(1..).unwrap_or(&[]);
@@ -115,6 +127,7 @@ pub fn run(
     let spec = root_spec(&SpecDefaults {
         version_line: sw_proto::version::version_line(),
         profile_dir: ctx.paths.profile_dir.clone(),
+        lock_path: ctx.paths.lock_path.clone(),
     });
     let tokens: Vec<String> = tail
         .iter()

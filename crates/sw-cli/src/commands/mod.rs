@@ -7,10 +7,16 @@ use crate::ctx::CliCtx;
 use crate::output;
 use sw_proto::error_codes::ErrorCode;
 
+pub mod benches_cmd;
+pub mod connect_cmd;
+pub mod daemon_cmd;
 pub mod event_cmd;
 pub mod profile_cmd;
+pub mod remote_cmd;
 pub mod rpc_cmds;
+pub mod service_cmd;
 pub mod skill_cmd;
+pub mod supervision_cmd;
 
 pub fn dispatch(ctx: &mut CliCtx, ns: &Namespace) -> i32 {
     let path = ns.path();

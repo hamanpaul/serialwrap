@@ -66,6 +66,8 @@ fn skill_default_windows_outputs_skill_windows() {
         default_skill: sw_pal::SkillPlatform::Windows,
         text_newline: "\r\n",
         exec_replace: false,
+        on_demand_autostart: true,
+        console_kind: sw_pal::ConsoleKind::TcpTelnet,
     };
     let p = sw_pal::ClientPlatform {
         env: std::sync::Arc::new(DummySysEnv),
@@ -73,6 +75,10 @@ fn skill_default_windows_outputs_skill_windows() {
         clock: std::sync::Arc::new(DummyClock),
         rpc: std::sync::Arc::new(DummyRpc),
         process: std::sync::Arc::new(DummyProcess),
+        procs: sw_pal::fakes::FakeProcScan::new(Vec::new()),
+        tunnel: sw_pal::fakes::FakeTunnel::new(false),
+        service: sw_pal::fakes::FakeServiceCtl::new(Vec::new()),
+        registry: sw_pal::fakes::FakeRegistry::new(Vec::new(), &[]),
         caps,
     };
     let env = sw_proto::runtime_paths::EnvSnapshot::from_pairs(std::iter::empty());
@@ -99,6 +105,7 @@ fn skill_default_windows_outputs_skill_windows() {
         paths,
         io,
         verbose: 0,
+        cli_version: sw_proto::version::version(),
     };
     let ns = sw_cli::argparse::Namespace::default();
     let rc = run_skill(&mut ctx, &ns);
@@ -109,3 +116,5 @@ fn skill_default_windows_outputs_skill_windows() {
         assets::SKILL_WINDOWS_MD.replace('\n', "\r\n")
     );
 }
+
+impl sw_pal::fs_ops::FsOps for DummyFs {}

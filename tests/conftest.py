@@ -49,6 +49,7 @@ os.environ["SERIALWRAP_EVENTS_RUNTIME_DIR"] = _iso("events-rt")
 # 空目錄：防 in-process 動態偵測抓到真板（two-reader）
 os.environ["SERIALWRAP_BY_ID_DIR"] = _iso("by-id")
 os.environ["SERIALWRAP_BY_PATH_DIR"] = _iso("by-path")
+os.environ["SERIALWRAP_INSTALL_ROOT"] = _iso("install")
 
 # 這些變數優先序高於上方已覆寫目錄的推導值（如 SERIALWRAP_ENDPOINT 蓋過 RUN_DIR 推導的
 # socket、PROFILE_DIR 蓋過 CONFIG_DIR/profiles）——外層 shell 若 export 會穿透隔離。
@@ -64,6 +65,10 @@ for _k in (
     "SERIALWRAP_AB_LABEL",
     "SERIALWRAP_DELEGATE_DEPTH",
     "SERIALWRAP_DELEGATE_ARGV_SHA",
+    "SW_STUB_LOG",
+    "SW_STUB_SCRIPT",
+    "SW_DELEGATE_MARKER",
+    "SERIALWRAP_RELEASE_MANIFEST",
 ):
     os.environ.pop(_k, None)
 
@@ -142,3 +147,7 @@ _MARKERS = {
 def pytest_configure(config):
     for name, desc in _MARKERS.items():
         config.addinivalue_line("markers", f"{name}: {desc}")
+    # P4-T1：P4 驗收案例綁定標記（對應 tests/acceptance/p4_case_map.yaml）
+    config.addinivalue_line("markers", "case(id): P4 驗收案例綁定（對應 p4_case_map.yaml）")
+
+

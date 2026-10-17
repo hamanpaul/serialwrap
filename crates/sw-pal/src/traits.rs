@@ -4,6 +4,22 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+// 明列項目（不用 glob）：避免 proc_scan 的 `posix`／`windows` 子模組名洩漏成 `sw_pal::posix`。
+pub use crate::proc_scan::{
+    dedup_launcher_children, extract_socket_arg, is_serialwrapd_argv, ArgvFlavor, DaemonProc, HolderScanStatus,
+    PosixProcScan, ProcIdentity, ProcScan, ScanFailure, WinProcInfo,
+};
+#[cfg(windows)]
+pub use crate::proc_scan::WindowsProcScan;
+pub use crate::process_tunnel::{ProcGroupRef, ProcessTunnel, TunnelProc};
+pub use crate::device_source::windows_model::{exclude_bluetooth, read_bt_ports, RegistryView, SERIALCOMM_KEY};
+pub use crate::fs_ops::{FileLockGuard, FsOps, LinkKind};
+pub use crate::service_ctl::{
+    encode_utf16le_bom, render_task_xml, shell_join_windows, split_windows_cmdline, AutostartHoldKind,
+    AutostartHoldRecord, CmdRecord, CompositeServiceCtl, HoldState, ServiceAction, ServiceCtl, ServiceResult,
+    SupervisionMode, SupervisorDefinition, SystemdCtl, TaskQuery, TaskXmlSpec, WindowsServiceCtl, WindowsTaskCtl,
+};
+
 pub type PalResult<T> = Result<T, PalError>;
 
 /// Python `OSError` 的平台無關表示；`py_message` 為 Python `str(OSError)` 格式，不含檔名。
@@ -330,6 +346,8 @@ pub enum PalErrorKind {
     Io,
 }
 
+// P4-T2 紅燈骨架的預設主體未使用參數，允許 unused_variables 以免編譯警告淹沒測試輸出。
+#[allow(unused_variables)]
 pub trait SysEnv: Send + Sync {
     fn var(&self, k: &str) -> Option<String>;
     /// 以 `std::env::vars_os()` 實作再 lossy 轉換；不得用 `std::env::vars()`（遇非 UTF-8 會 panic）。
@@ -347,6 +365,66 @@ pub trait SysEnv: Send + Sync {
     /// `= Python errno.errorcode.get(code)`。
     fn errno_name(&self, code: i32) -> Option<&'static str>;
     fn pid(&self) -> u32;
+
+    // ── P4-T2 管理面方法（紅燈骨架：預設主體為 unimplemented，實作者於 posix／windows 實作後移除預設）──
+
+    /// 子行程執行（等同 Python `subprocess.run(capture_output=True, text=True)`）。逾時回 `rc=-1`、`stderr="TIMEOUT"`。
+    fn run(&self, argv: &[String], timeout: Option<Duration>) -> PalResult<CmdOutput> {
+        unimplemented!("P4-T2")
+    }
+    /// 原始 bytes 版本：不解碼、不做換行轉換；`env=Some(..)` 時取代子行程環境。
+    fn run_raw(
+        &self,
+        argv: &[String],
+        env: Option<&[(OsString, OsString)]>,
+        timeout: Option<Duration>,
+    ) -> PalResult<CmdOutputRaw> {
+        unimplemented!("P4-T2")
+    }
+    /// `shutil.which` 語意；回第一個可執行的完整路徑。
+    fn which(&self, name: &str) -> Option<PathBuf> {
+        unimplemented!("P4-T2")
+    }
+    /// 07 §4.2 演算法：依 PATH 順序列出所有候選、去重、略過空目錄字串。
+    fn which_all(&self, name: &str) -> Vec<PathBuf> {
+        unimplemented!("P4-T2")
+    }
+    /// `/run/systemd/system` 為目錄；Windows 恆 false。
+    fn has_systemd(&self) -> bool {
+        unimplemented!("P4-T2")
+    }
+    /// `uname().release` 含 `microsoft`（小寫比對）；Windows 恆 false。
+    fn is_wsl(&self) -> bool {
+        unimplemented!("P4-T2")
+    }
+    /// POSIX：`getgrnam(g).gr_gid ∈ getgroups() ∪ {getegid()}`；Windows 恆 false。
+    fn user_in_group(&self, g: &str) -> bool {
+        unimplemented!("P4-T2")
+    }
+    /// POSIX：`$USER` 非空優先，否則 `getpwuid(geteuid()).pw_name`；Windows：Token → `"DOMAIN\\name"`。
+    fn user_identity(&self) -> String {
+        unimplemented!("P4-T2")
+    }
+    /// Windows：`%LOCALAPPDATA%`（非空）否則 `%USERPROFILE%\AppData\Local`；POSIX 為 `None`。
+    fn local_appdata(&self) -> Option<PathBuf> {
+        unimplemented!("P4-T2")
+    }
+}
+
+/// `SysEnv::run` 的結果；`stdout`／`stderr` 已依 Python text mode（strict、universal newlines）解碼。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CmdOutput {
+    pub rc: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// `SysEnv::run_raw` 的結果；原始 bytes。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CmdOutputRaw {
+    pub rc: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
 }
 
 pub trait FsRead: Send + Sync {
@@ -393,7 +471,39 @@ pub trait RpcStream: Send {
     fn recv(&mut self, buf: &mut [u8]) -> PalResult<usize>;
 }
 
+/// 子行程控制句柄（P4-T4）。
+#[derive(Debug, Clone)]
+pub struct ChildHandle {
+    pub pid: u32,
+}
+
 pub trait ProcessCtl: Send + Sync {
     /// 成功時不返回：POSIX execve 取代行程；Windows 等子行程結束後 `std::process::exit(child_code)`。只在失敗時返回錯誤。
     fn exec_or_wait(&self, argv: &[OsString], env_add: &[(String, String)]) -> PalError;
+
+    // ── P4-T4：ProcessCtl（spawn／poll／foreground）──
+
+    /// 啟動常駐 daemon（POSIX setsid + stdout/err 重導到 /dev/null；Windows DETACHED_PROCESS）。
+    fn spawn_daemon(
+        &self,
+        _argv: &[String],
+        _env: &[(OsString, OsString)],
+        _detached: bool,
+    ) -> PalResult<ChildHandle> {
+        unimplemented!("P4-T4")
+    }
+
+    /// 輪詢子行程狀態（非阻塞）。
+    fn poll(&self, _c: &ChildHandle) -> Option<i32> {
+        unimplemented!("P4-T4")
+    }
+
+    /// 前景同步呼叫子行程（等同 Python subprocess.call）。
+    fn call_foreground(
+        &self,
+        _argv: &[String],
+        _env: &[(OsString, OsString)],
+    ) -> PalResult<i32> {
+        unimplemented!("P4-T4")
+    }
 }

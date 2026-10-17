@@ -48,6 +48,8 @@ pub struct CliCtx<'a> {
     pub paths: sw_proto::runtime_paths::RuntimePaths,
     pub io: TextIo<'a>,
     pub verbose: i64,
+    /// `sw_proto::version::version()`（P4-T1 新增；管理面 `setup`／`doctor` 等輸出版本時使用）。
+    pub cli_version: &'static str,
 }
 
 /// 非 TTY：`BufWriter` 8192（與 Python 區塊緩衝一致，Q-06）；TTY：`LineWriter`。

@@ -28,6 +28,9 @@ windows-sys = { workspace = true, features = [
     "Win32_System_Time",
     "Win32_System_SystemInformation",
     "Wdk_System_Threading",
+    # P4-T1（arch §1.2 修訂）：MultiByteToWideChar／FormatMessageW，皆在 KERNEL32。
+    "Win32_Globalization",
+    "Win32_System_Diagnostics_Debug",
 ] }
 
 [features]

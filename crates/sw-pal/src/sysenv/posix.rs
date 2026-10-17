@@ -258,3 +258,14 @@ pub fn errno_name(code: i32) -> Option<&'static str> {
         _ => None,
     }
 }
+
+/// P4-T2：以 root 為基準的 POSIX 環境查詢型別名（正式路徑 root=`/`）。
+pub type SysEnvPosix = NativeSysEnv;
+
+#[cfg(feature = "test-fakes")]
+impl NativeSysEnv {
+    /// P4-T2 紅燈骨架：測試建構子（`test-fakes` 限定）。實作者改為記錄 root，`has_systemd` 等以 root 解析。
+    pub fn with_root(_root: PathBuf) -> Self {
+        unimplemented!("P4-T2")
+    }
+}

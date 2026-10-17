@@ -12,6 +12,11 @@ pub struct FakeClock {
 }
 
 impl FakeClock {
+    /// 建立共享用的假時鐘（P4-T1 替身介面；回 `Arc`）。
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::default())
+    }
+
     pub fn advance(&self, d: std::time::Duration) {
         let ns = d.as_nanos().min(u64::MAX as u128) as u64;
         let _ = self
@@ -20,6 +25,11 @@ impl FakeClock {
                 Some(now.saturating_add(ns))
             });
     }
+    /// 自建立起所有 `sleep` 與 `advance` 的總和（單調時間差）。
+    pub fn elapsed(&self) -> std::time::Duration {
+        std::time::Duration::from_nanos(self.now_ns.load(Ordering::SeqCst))
+    }
+
     pub fn sleeps_s(&self) -> Vec<f64> {
         self.sleeps
             .lock()

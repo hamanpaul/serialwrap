@@ -100,6 +100,7 @@ fn native_paths_match_python_3_12_golden() {
     let spec = root_spec(&SpecDefaults {
         version_line: sw_proto::version::version_line(),
         profile_dir: "/golden/config/profiles".into(),
+        lock_path: "/golden/run/serialwrapd.lock".into(),
     });
     let mut fails = Vec::new();
     for ent in std::fs::read_dir(&dir).unwrap() {
@@ -143,3 +144,42 @@ fn help_width_rules() {
     assert_eq!(help_width(Some("x"), None), 78);
     assert_eq!(help_width(None, None), 78);
 }
+
+/// P4-T1：Stage 1B 原生承接群組的 help golden（`native:false` 原本因委派而略過；Task 7–9 原生後必須逐寬度比對）。
+///
+/// `setup` 與 `supervision-mode` 不在此列：其 Rust-only 擴充使輸出與 Python 必然不同，改比對 `contracts/cli_help/rust_only`（Task 10／12）。
+#[test]
+fn stage1b_group_help_goldens_match_python_at_every_width() {
+    const STAGE_1B_GROUPS: [&str; 6] = ["daemon", "remote", "connect", "benches", "service", "doctor"];
+    let dir = common::data_root().join("contracts/cli_help/linux");
+    let spec = root_spec(&SpecDefaults {
+        version_line: sw_proto::version::version_line(),
+        profile_dir: "/golden/config/profiles".into(),
+        lock_path: "/golden/run/serialwrapd.lock".into(),
+    });
+    let mut fails = Vec::new();
+    let mut checked = 0usize;
+    for ent in std::fs::read_dir(&dir).unwrap() {
+        let path = ent.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let Some(rest) = name.strip_prefix("help_grp_") else { continue };
+        let Some((group, _)) = rest.rsplit_once("_col") else { continue };
+        if !STAGE_1B_GROUPS.contains(&group) {
+            continue;
+        }
+        let case = sw_proto::pyjson::loads(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let c = Case::from(&case);
+        checked += 1;
+        let (rc, out, err) = match parse_args(&spec, &c.argv, c.columns - 2) {
+            ParseResult::Exit(x) => (x.code, x.stdout, x.stderr),
+            ParseResult::Ok(_) => (0, String::new(), String::new()),
+            ParseResult::Delegated => (-1, String::new(), String::new()),
+        };
+        if c.parse_only_expected() != (rc, out.as_str(), err.as_str()) {
+            fails.push(format!("{name}: got rc={rc}\n{out}{err}"));
+        }
+    }
+    assert!(checked >= 6 * 9, "Stage 1B 群組 help golden 數量不足：{checked}");
+    assert!(fails.is_empty(), "{} 筆 Stage 1B help 與 Python golden 不符\n{}", fails.len(), fails.join("\n"));
+}
+

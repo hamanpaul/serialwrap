@@ -180,6 +180,98 @@ def run_parser(argv: list[str], columns: int, platform: str) -> tuple[int, str, 
     return rc, stdout_io.getvalue(), stderr_io.getvalue()
 
 
+# ── P4-T1：Rust-only 擴充（`--rust-only`）──────────────────────────────────────
+# 與 `crates/sw-cli/src/cli_spec.rs` 的 Rust-only 宣告逐項對應：Stage 1B 新增的旗標不屬於 Python 基線，
+# 因此 golden 以 Python 3.12.3 argparse 在相同 `add_argument` 擴充後擷取（計畫 Task 1 步驟 5）。
+RUST_ONLY_GROUPS = ("supervision-mode", "setup")
+RUST_ONLY_COLUMNS = (80, 120)
+
+
+def _subparser_choices(parser: argparse.ArgumentParser) -> dict:
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return action.choices
+    raise SystemExit("找不到根層子命令群組")
+
+
+def apply_rust_only(parser: argparse.ArgumentParser) -> None:
+    """把 Stage 1B 的 Rust-only 旗標加到 `supervision-mode`／`setup` 子 parser（計畫 Task 1 步驟 4 逐字）。"""
+    choices = _subparser_choices(parser)
+    sup = choices["supervision-mode"]
+    sup.add_argument(
+        "words",
+        nargs="*",
+        metavar="set MODE",
+        help="不帶參數：印出目前監管模式；set MODE：切換並執行 reconcile",
+    )
+    sup.add_argument(
+        "--force",
+        action="store_true",
+        help="相容旗標：不覆寫交接護欄（flash、傳輸、活躍操作或探測不明時一律拒絕）",
+    )
+    sup.add_argument(
+        "--with-sudo",
+        dest="with_sudo",
+        action="store_true",
+        default=False,
+        help="允許代跑需要 root／系統管理員權限的指令",
+    )
+    setup = choices["setup"]
+    mutex = setup._mutually_exclusive_groups[0]
+    added = [
+        mutex.add_argument(
+            "--windows-task",
+            dest="windows_task",
+            action="store_true",
+            help="Windows：以工作排程器登入自啟監管（Windows 預設）",
+        ),
+        mutex.add_argument(
+            "--windows-service",
+            dest="windows_service",
+            action="store_true",
+            help="Windows：以 Windows 服務監管（OD-12：只列出待執行指令）",
+        ),
+        mutex.add_argument(
+            "--rollback",
+            action="store_true",
+            help="回滾到上一個完整發佈組合（Previous）",
+        ),
+    ]
+    # argparse 的互斥群組只在成員於 `_actions` 中連續時才以 `a | b` 顯示用法；把新成員移到既有群組成員之後，
+    # 讓 golden 反映「同一互斥群組」的語意（Rust emulator 亦以群組整體渲染）。
+    anchor = next(a for a in setup._actions if a.dest == "on_demand")
+    rest = [a for a in setup._actions if a not in added]
+    position = rest.index(anchor) + 1
+    setup._actions[:] = rest[:position] + added + rest[position:]
+
+
+def write_rust_only(out_dir: Path) -> list[Path]:
+    """擷取 `contracts/cli_help/rust_only/{supervision-mode,setup}.{80,120}.txt`（COLUMNS 決定 argparse 寬度）。"""
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    written: list[Path] = []
+    out_dir.mkdir(parents=True, exist_ok=True)
+    old_columns = os.environ.get("COLUMNS")
+    try:
+        for columns in RUST_ONLY_COLUMNS:
+            os.environ["COLUMNS"] = str(columns)
+            from sw_core.cli import build_parser
+
+            parser = build_parser()
+            apply_rust_only(parser)
+            choices = _subparser_choices(parser)
+            for group in RUST_ONLY_GROUPS:
+                target = out_dir / f"{group}.{columns}.txt"
+                target.write_text(choices[group].format_help(), encoding="utf-8", newline="\n")
+                written.append(target)
+    finally:
+        if old_columns is None:
+            os.environ.pop("COLUMNS", None)
+        else:
+            os.environ["COLUMNS"] = old_columns
+    return written
+
+
 def git_rev() -> str:
     try:
         r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, capture_output=True, text=True, check=True)
@@ -192,7 +284,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="擷取 Python 3.12.3 CLI help/usage/error golden")
     parser.add_argument("--platform", choices=("linux", "windows"), help="指定 golden 平台，預設依執行環境判定")
     parser.add_argument("--out", help="輸出目錄；預設 contracts/cli_help/<platform>")
+    parser.add_argument(
+        "--rust-only",
+        action="store_true",
+        help="擷取 Stage 1B Rust-only golden（contracts/cli_help/rust_only/，P4-T1）",
+    )
     args = parser.parse_args()
+    if args.rust_only:
+        out_dir = Path(args.out) if args.out else REPO_ROOT / "contracts" / "cli_help" / "rust_only"
+        for written in write_rust_only(out_dir):
+            print(written)
+        return
     platform = args.platform or ("windows" if os.name == "nt" else "linux")
     if platform == "windows" and os.name != "nt":
         raise SystemExit("Windows CLI golden 必須由 Windows CPython 3.12.3 擷取；不可在其他平台代產")
