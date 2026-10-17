@@ -23,7 +23,7 @@ codes:
     behavior_change: []
     sources: ["sw_core/session_manager.py:1735"]
   - code: AUTOBOOT_QUIET
-    status: EXISTING
+    status: IMPLEMENTED
     reachable: true
     constant: ERROR_AUTOBOOT_QUIET
     scope: {interfaces: [rpc, rec], methods: ["command.submit", "file.pull", "file.push", "command.get"], platforms: [posix, windows]}
@@ -31,10 +31,10 @@ codes:
     side_effect: "無（零 UART 副作用）"
     retryable: "yes"
     uart_tx: none
-    agent_action: "依 retry_after_s 等待後重送；manager 層回應無 retry_after_s 時以 5 秒為間隔重試"
+    agent_action: "command.submit／file.* 直接拒絕依 retry_after_s 等待後重送；execute-time command.get 紀錄未帶 retry_after_s 時每 5 秒重試"
     extra_fields: ["retry_after_s", "hint", "session", "selector"]
-    contract_tests: ["tests/test_boot_quiet.py::TestAgentQuietGateExecute::test_execute_gated_when_quiet_armed_on_ready", "tests/test_boot_quiet.py::TestAgentQuietGateExecute::test_file_pull_gated"]
-    behavior_change: ["SC-03"]
+    contract_tests: ["tests/test_boot_quiet.py::TestAgentQuietGateExecute::test_execute_gated_when_quiet_armed_on_ready", "tests/test_boot_quiet.py::TestAgentQuietGateExecute::test_file_pull_gated", "tests/test_stage0_gate_codes.py::test_execute_time_quiet_has_retry_after", "tests/test_stage0_gate_codes.py::test_file_push_quiet_has_retry_after", "tests/test_stage0_gate_codes.py::test_manager_quiet_window_returns_remaining_retry_after", "tests/test_stage0_gate_codes.py::test_execute_time_quiet_command_record_has_no_retry_after", "tests/test_stage0_gate_codes.py::test_rpc_human_source_is_gated_like_agent", "tests/test_stage0_gate_codes.py::test_file_rpc_rechecks_spoofed_human_as_agent"]
+    behavior_change: ["SC-03", "DF-02"]
     sources: ["sw_core/service.py:671", "sw_core/service.py:683", "sw_core/session_manager.py:1155"]
   - code: BASE64_DECODE_FAILED
     status: EXISTING
@@ -398,9 +398,9 @@ codes:
     behavior_change: []
     sources: ["sw_core/rpc_posix.py:59"]
   - code: FLASHING_BUSY
-    status: EXISTING
+    status: IMPLEMENTED
     reachable: true
-    scope: {interfaces: [rpc, rec, cli_local], methods: ["device.release", "session.attach", "session.bind", "session.clear", "session.interactive_send", "session.recover", "command.get", "setup"], platforms: [posix, windows]}
+    scope: {interfaces: [rpc, rec, cli_local], methods: ["command.submit", "file.pull", "file.push", "device.release", "session.attach", "session.bind", "session.clear", "session.interactive_open", "session.interactive_send", "session.recover", "command.get", "setup"], platforms: [posix, windows]}
     meaning: "session 處於 FLASHING 或 flash 臨界區，命令或操作被拒"
     side_effect: "無（gate 拒絕）"
     retryable: "yes"
@@ -408,7 +408,7 @@ codes:
     agent_action: "等待燒錄結束（session 回到 ATTACHED 或 READY）後再重試"
     extra_fields: ["selector", "session", "interactive_id", "message", "legacy"]
     exit_codes: {"setup": 2}
-    contract_tests: ["tests/test_attach_error_surface.py::TestAttachErrorSurface::test_attach_flashing_bridge_surfaces_flashing_busy", "tests/test_attach_error_surface.py::TestAttachErrorSurface::test_attach_human_lease_flashing_maps_flashing_busy"]
+    contract_tests: ["tests/test_attach_error_surface.py::TestAttachErrorSurface::test_attach_flashing_bridge_surfaces_flashing_busy", "tests/test_attach_error_surface.py::TestAttachErrorSurface::test_attach_human_lease_flashing_maps_flashing_busy", "tests/test_stage0_gate_codes.py::test_submit_time_state_codes", "tests/test_stage0_gate_codes.py::test_interactive_open_state_codes", "tests/test_stage0_gate_codes.py::test_gate_reject_zero_side_effects"]
     behavior_change: ["SC-02"]
     sources: ["sw_core/session_manager.py:1838", "sw_core/session_manager.py:3644", "sw_core/session_manager.py:2144", "sw_core/cli.py:1707", "sw_core/cli.py:1778"]
   - code: FLASH_TARGET_IS_CONSOLE
@@ -988,29 +988,29 @@ codes:
     behavior_change: []
     sources: ["sw_core/service.py:642", "sw_core/arbiter.py:196", "sw_core/session_manager.py:2515", "sw_core/session_manager.py:3646", "sw_core/session_manager.py:4645"]
   - code: SESSION_QUEUE_FULL
-    status: EXISTING
+    status: IMPLEMENTED
     reachable: true
     scope: {interfaces: [rpc], methods: ["command.submit"], platforms: [posix, windows]}
-    meaning: "session 待執行命令已達 256 筆上限"
+    meaning: "session 已接受或執行中的命令（含已 cancel 但 worker 仍執行）達 256 筆上限"
     side_effect: "無（不入列）"
     retryable: "yes"
     uart_tx: none
     agent_action: "等待排隊命令完成後重試"
     extra_fields: ["session_id", "pending", "limit", "hint"]
-    contract_tests: ["tests/test_bounded_memory.py::test_submit_admission_control_rejects_when_pending_full"]
-    behavior_change: []
+    contract_tests: ["tests/test_bounded_memory.py::test_submit_admission_control_rejects_when_pending_full", "tests/test_stage0_gate_codes.py::test_queue_full_counts_canceled_running"]
+    behavior_change: ["SC-06"]
     sources: ["sw_core/arbiter.py:202"]
   - code: SESSION_RECOVERING
-    status: EXISTING
+    status: IMPLEMENTED
     reachable: true
-    scope: {interfaces: [rpc, rec], methods: ["device.attach", "device.release", "file.pull", "file.push", "session.attach", "session.bind", "session.clear", "session.recover", "command.get"], platforms: [posix, windows]}
+    scope: {interfaces: [rpc, rec], methods: ["command.submit", "device.attach", "device.release", "file.pull", "file.push", "session.attach", "session.bind", "session.clear", "session.interactive_open", "session.recover", "command.get"], platforms: [posix, windows]}
     meaning: "session 恢復中（RECOVERING），操作暫不可用"
     side_effect: "無（拒絕）"
     retryable: "yes"
     uart_tx: none
     agent_action: "等待恢復完成（session get_state 不再顯示 RECOVERING）後重試"
-    extra_fields: ["session"]
-    contract_tests: ["tests/test_attach_error_surface.py::TestAttachErrorSurface::test_attach_human_lease_recovering_maps_session_recovering", "tests/test_attach_error_surface.py::TestAttachErrorSurface::test_attach_recovering_bridge_surfaces_error"]
+    extra_fields: ["selector", "session"]
+    contract_tests: ["tests/test_attach_error_surface.py::TestAttachErrorSurface::test_attach_human_lease_recovering_maps_session_recovering", "tests/test_attach_error_surface.py::TestAttachErrorSurface::test_attach_recovering_bridge_surfaces_error", "tests/test_stage0_gate_codes.py::test_submit_time_state_codes", "tests/test_stage0_gate_codes.py::test_interactive_open_state_codes", "tests/test_stage0_gate_codes.py::test_gate_reject_zero_side_effects"]
     behavior_change: ["SC-01", "SC-04"]
     sources: ["sw_core/session_manager.py:2145", "sw_core/session_manager.py:3660"]
   - code: SOCKET_ERROR

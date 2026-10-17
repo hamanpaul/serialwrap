@@ -1131,7 +1131,7 @@ class TestSubmitQuietGate(unittest.TestCase):
         self.assertEqual(rec["status"], "error")
         self.assertEqual(rec["error_code"], "AUTOBOOT_QUIET")
 
-    def test_human_source_submit_not_gated(self) -> None:
+    def test_rpc_human_source_submit_is_gated(self) -> None:
         self._inject_ready_session(arm_quiet=True)
 
         resp = self.svc.rpc(
@@ -1139,9 +1139,9 @@ class TestSubmitQuietGate(unittest.TestCase):
             {"selector": "COM0", "cmd": "echo hi", "source": "human:x"},
         )
 
-        self.assertTrue(resp["ok"], "human 來源不受第一層 gate")
-        rec = self._wait_terminal(resp["cmd_id"])
-        self.assertEqual(rec["status"], "done", "human 來源亦不受第二層 gate（命令真的執行）")
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error_code"], "AUTOBOOT_QUIET")
+        self.assertIn("retry_after_s", resp)
 
 
 class TestReadyReconfirmGate(_ManagerMixin):

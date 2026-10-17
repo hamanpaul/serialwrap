@@ -144,7 +144,7 @@ changes:
   - id: "SC-01"
     kind: "SC"
     title: "RECOVERING 下 submit 與 open 回 SESSION_RECOVERING"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -171,7 +171,7 @@ changes:
   - id: "SC-02"
     kind: "SC"
     title: "FLASHING 下 submit 與 open 回 FLASHING_BUSY"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -198,7 +198,7 @@ changes:
   - id: "SC-03"
     kind: "SC"
     title: "execute-time 與 file.* 的 AUTOBOOT_QUIET 附 retry_after_s"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -279,7 +279,7 @@ changes:
   - id: "SC-06"
     kind: "SC"
     title: "CMD_PENDING_MAX 計入已 cancel 仍執行的命令"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -892,7 +892,7 @@ changes:
   - id: "DF-02"
     kind: "DF"
     title: "RPC 帶入 human: source 以 agent 對待"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-15"

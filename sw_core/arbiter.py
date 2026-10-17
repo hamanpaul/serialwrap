@@ -33,6 +33,7 @@ class _QueuedCommand:
     timeout_s: float = dataclasses.field(compare=False)
     expected_duration_s: float | None = dataclasses.field(default=None, compare=False)
     completion_regex: str | None = dataclasses.field(default=None, compare=False)
+    trusted_human: bool = dataclasses.field(default=False, compare=False)
 
 
 class CommandArbiter:
@@ -45,6 +46,7 @@ class CommandArbiter:
         self._stops: dict[str, threading.Event] = {}
         self._commands: dict[str, dict[str, Any]] = {}
         self._admission_tickets: dict[str, Any] = {}
+        self._running: dict[str, str] = {}
         self._counter = 0
 
     def register_session(self, session_id: str) -> None:
@@ -145,6 +147,7 @@ class CommandArbiter:
         completion_regex: str | None = None,
         admission_com: str | None = None,
         admission_exempt: bool = False,
+        trusted_human: bool = False,
     ) -> dict[str, Any]:
         if not valid_completion_regex(completion_regex):
             return {"ok": False, "error_code": ERROR_INVALID_COMPLETION_REGEX}
@@ -234,33 +237,64 @@ class CommandArbiter:
             if ticket is not None:
                 self._admission_tickets[cmd_id] = ticket
             self._evict_commands_locked()
-        pq.put(_QueuedCommand(sort_key=(priority, counter), cmd_id=cmd_id, session_id=session_id, command=command, source=source, mode=mode, timeout_s=timeout_s, expected_duration_s=expected_duration_s, completion_regex=completion_regex))
+        pq.put(
+            _QueuedCommand(
+                sort_key=(priority, counter),
+                cmd_id=cmd_id,
+                session_id=session_id,
+                command=command,
+                source=source,
+                mode=mode,
+                timeout_s=timeout_s,
+                expected_duration_s=expected_duration_s,
+                completion_regex=completion_regex,
+                trusted_human=trusted_human,
+            )
+        )
         result: dict[str, Any] = {"ok": True, "cmd_id": cmd_id, "status": "accepted", "session_id": session_id}
         if cmd_warning is not None:
             result["warning"] = cmd_warning
         return result
 
     def _count_pending_locked(self, session_id: str) -> int:
-        """該 session 進行中（accepted/running，done_at 為 None）的命令數。須在持有 ``self._lock`` 下呼叫。
+        """計算該 session 尚占用容量的命令數，包含仍在 worker 執行的 canceled 命令。
+
+        未終結命令以 ``done_at`` 為 None 判定；canceled-running 雖已有 ``done_at``，
+        仍由 ``_running`` 登記，在 worker 真正返回前持續計入。須持有 ``self._lock`` 呼叫。
 
         以掃描 _commands 計數而非維護獨立計數器：admission control 把 pending 上限封頂後 _commands
         大小有界（≤ CMD_HISTORY_MAX + pending 上限），掃描成本可控；且避免計數器在多處終結轉移
         （worker 成功/例外、cancel、unregister 殘留）漏增漏減而 drift。
         """
-        return sum(
+        pending = sum(
             1 for rec in self._commands.values()
             if rec.get("session_id") == session_id and not rec.get("done_at")
         )
+        running_cmd_id = self._running.get(session_id)
+        running_rec = self._commands.get(running_cmd_id or "")
+        if (
+            running_rec is not None
+            and running_rec.get("session_id") == session_id
+            and running_rec.get("status") == "canceled"
+        ):
+            pending += 1
+        return pending
 
     def _evict_commands_locked(self) -> None:
         """淘汰最舊的「已完成（有 done_at）」命令記錄，使數量回到上限（#81）。
 
-        進行中（done_at 為 None）的命令永不淘汰；全部進行中時暫時超量。
+        worker 尚未返回的命令永不淘汰，即使 cancel 已設定 ``done_at``；全部保留中的命令
+        使歷史暫時超量，worker 收尾後再收斂。
         須在持有 ``self._lock`` 下呼叫。
         """
         if len(self._commands) <= CMD_HISTORY_MAX:
             return
-        done = [(cid, rec) for cid, rec in self._commands.items() if rec.get("done_at")]
+        running_cmd_ids = set(self._running.values())
+        done = [
+            (cid, rec)
+            for cid, rec in self._commands.items()
+            if rec.get("done_at") and cid not in running_cmd_ids
+        ]
         done.sort(key=lambda kv: kv[1].get("done_at") or "")
         excess = len(self._commands) - CMD_HISTORY_MAX
         for cid, _rec in done[:excess]:
@@ -311,11 +345,17 @@ class CommandArbiter:
                     continue
                 rec["status"] = "running"
                 rec["started_at"] = now_iso()
+                self._running[session_id] = item.cmd_id
 
             try:
                 args = (session_id, item.command, item.source, item.cmd_id, item.timeout_s, item.mode, item.expected_duration_s)
-                # 未指定時保留既有 callback 七參數契約；新欄位以可選 keyword 傳遞。
-                result = self._send_cb(*args, completion_regex=item.completion_regex) if item.completion_regex is not None else self._send_cb(*args)
+                # 未指定時保留既有 callback 七參數契約；選用欄位僅在需要時傳遞。
+                options: dict[str, Any] = {}
+                if item.completion_regex is not None:
+                    options["completion_regex"] = item.completion_regex
+                if item.trusted_human:
+                    options["trusted_human"] = True
+                result = self._send_cb(*args, **options)
             except Exception:
                 with self._lock:
                     rec = self._commands.get(item.cmd_id)
@@ -323,7 +363,9 @@ class CommandArbiter:
                         rec["status"] = "error"
                         rec["error_code"] = "SEND_FAILED"
                         rec["done_at"] = now_iso()
-                        self._evict_commands_locked()  # 終結即收斂 history（Copilot 審查）
+                    if self._running.get(session_id) == item.cmd_id:
+                        self._running.pop(session_id, None)
+                    self._evict_commands_locked()  # worker 收尾後才能淘汰 canceled-running 記錄
                     self._finish_admission_locked(item.cmd_id)
                 continue
 
@@ -351,7 +393,9 @@ class CommandArbiter:
                     else:
                         rec["status"] = "done"
                     rec["done_at"] = now_iso()
-                    self._evict_commands_locked()  # 終結即收斂 history，尖峰後不再長期超量（Copilot 審查）
+                if self._running.get(session_id) == item.cmd_id:
+                    self._running.pop(session_id, None)
+                self._evict_commands_locked()  # worker 收尾後才收斂 history
                 self._finish_admission_locked(item.cmd_id)
 
     def _finish_admission_locked(self, cmd_id: str) -> None:

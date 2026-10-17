@@ -251,7 +251,7 @@ serialwrap mcu status
 | code | 介面／平台 | 可重試 | 意義 | Agent 處置 |
 |---|---|---|---|---|
 | `ALIAS_NOT_FOUND` | rpc／posix、windows | 修正參數後 | 要移除的 alias 不存在 | 以 session list 確認 alias 名稱後再重試 |
-| `AUTOBOOT_QUIET` | rpc、rec／posix、windows | 是 | session 名義為 READY，但 boot quiet 視窗進行中或 READY 再確認尚未完成 | 依 retry_after_s 等待後重送；manager 層回應無 retry_after_s 時以 5 秒為間隔重試 |
+| `AUTOBOOT_QUIET` | rpc、rec／posix、windows | 是 | session 名義為 READY，但 boot quiet 視窗進行中或 READY 再確認尚未完成 | command.submit／file.* 直接拒絕依 retry_after_s 等待後重送；execute-time command.get 紀錄未帶 retry_after_s 時每 5 秒重試 |
 | `BASE64_DECODE_FAILED` | rpc／posix、windows | 視情況 | 擷取到的 base64 內容無法解碼 | 檢查目標端 base64 工具與擷取內容後再重試 |
 | `BENCH_ENDPOINT_NOT_REMEMBERED` | cli_local／posix、windows | 修正參數後 | --bench 指定的 bench 尚未以 connect 記住 endpoint | 先執行 serialwrap connect 記住該 bench 的 endpoint 後再重試 |
 | `BENCH_STATE_IO_ERROR` | cli_local／posix、windows | 視情況 | benches.state.json 讀寫失敗（OS 錯誤） | 檢查 benches.state.json 的權限與磁碟狀態後重試 |
@@ -323,7 +323,7 @@ serialwrap mcu status
 | `SESSION_INTERACTIVE_BUSY` | rpc、rec／posix、windows | 是 | 已有不可搶占的 interactive lease，命令或檔案操作被拒 | 等待 interactive lease 結束（interactive close 或逾時）後重試 |
 | `SESSION_NOT_FOUND` | rpc／posix、windows | 修正參數後 | selector 未對應任何 session | 以 session list 確認 selector 正確後重送 |
 | `SESSION_NOT_READY` | rpc、rec／posix、windows | 視情況 | session 狀態不符（非 READY，或 bridge 不存在） | 等待 session 進入 READY 後重試；必要時以 session self-test 檢查狀態 |
-| `SESSION_QUEUE_FULL` | rpc／posix、windows | 是 | session 待執行命令已達 256 筆上限 | 等待排隊命令完成後重試 |
+| `SESSION_QUEUE_FULL` | rpc／posix、windows | 是 | session 已接受或執行中的命令（含已 cancel 但 worker 仍執行）達 256 筆上限 | 等待排隊命令完成後重試 |
 | `SESSION_RECOVERING` | rpc、rec／posix、windows | 是 | session 恢復中（RECOVERING），操作暫不可用 | 等待恢復完成（session get_state 不再顯示 RECOVERING）後重試 |
 | `SOCKET_ERROR` | cli_client／posix、windows | 視情況 | 連線失敗（connect 或 send／recv 的 OS 錯誤，或平台不支援 AF_UNIX） | 僅白名單唯讀方法可由 CLI 自動重試；其他方法先以 health.ping 確認 daemon 狀態再決定 |
 | `SOCKET_UNAVAILABLE` | proc／posix | 否 | socket 路徑存在但 connect 失敗（非 ENOENT 與 ECONNREFUSED），非 JSON 回應，以 stderr 行與 exit 2 表示 | 檢查 socket 路徑的權限與殘留檔案後重試 |

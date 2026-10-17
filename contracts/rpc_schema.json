@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/hamanpaul/serialwrap/contracts/rpc_schema.json",
   "title": "serialwrap RPC contract",
-  "x-catalog-revision": 5,
+  "x-catalog-revision": 6,
   "x-wire": {
     "framing": "ndjson",
     "line_strip": true,
@@ -1462,6 +1462,8 @@
         "INVALID_COMPLETION_REGEX",
         "INVALID_ARGS",
         "SESSION_NOT_FOUND",
+        "SESSION_RECOVERING",
+        "FLASHING_BUSY",
         "PROFILE_NOT_COMMAND_CAPABLE",
         "SESSION_NOT_READY",
         "READY_UNCONFIRMED",
@@ -1474,6 +1476,8 @@
         "INVALID_COMPLETION_REGEX",
         "INVALID_ARGS",
         "SESSION_NOT_FOUND",
+        "SESSION_RECOVERING",
+        "FLASHING_BUSY",
         "PROFILE_NOT_COMMAND_CAPABLE",
         "SESSION_NOT_READY",
         "READY_UNCONFIRMED",
@@ -2754,11 +2758,12 @@
       "errors": [
         "INVALID_ARGS",
         "SESSION_NOT_FOUND",
+        "SESSION_RECOVERING",
+        "FLASHING_BUSY",
         "PROFILE_NOT_COMMAND_CAPABLE",
         "SESSION_NOT_READY",
         "READY_UNCONFIRMED",
         "AUTOBOOT_QUIET",
-        "SESSION_RECOVERING",
         "SESSION_INTERACTIVE_BUSY",
         "SESSION_BUSY",
         "CONSOLE_LINE_LIMIT_TOO_SMALL",
@@ -2774,11 +2779,12 @@
       "error_order": [
         "INVALID_ARGS",
         "SESSION_NOT_FOUND",
+        "SESSION_RECOVERING",
+        "FLASHING_BUSY",
         "PROFILE_NOT_COMMAND_CAPABLE",
         "SESSION_NOT_READY",
         "READY_UNCONFIRMED",
         "AUTOBOOT_QUIET",
-        "SESSION_RECOVERING",
         "SESSION_INTERACTIVE_BUSY",
         "SESSION_BUSY",
         "CONSOLE_LINE_LIMIT_TOO_SMALL",
@@ -2898,11 +2904,12 @@
       "errors": [
         "INVALID_ARGS",
         "SESSION_NOT_FOUND",
+        "SESSION_RECOVERING",
+        "FLASHING_BUSY",
         "PROFILE_NOT_COMMAND_CAPABLE",
         "SESSION_NOT_READY",
         "READY_UNCONFIRMED",
         "AUTOBOOT_QUIET",
-        "SESSION_RECOVERING",
         "SESSION_INTERACTIVE_BUSY",
         "SESSION_BUSY",
         "LOCAL_FILE_NOT_FOUND",
@@ -2921,11 +2928,12 @@
       "error_order": [
         "INVALID_ARGS",
         "SESSION_NOT_FOUND",
+        "SESSION_RECOVERING",
+        "FLASHING_BUSY",
         "PROFILE_NOT_COMMAND_CAPABLE",
         "SESSION_NOT_READY",
         "READY_UNCONFIRMED",
         "AUTOBOOT_QUIET",
-        "SESSION_RECOVERING",
         "SESSION_INTERACTIVE_BUSY",
         "SESSION_BUSY",
         "LOCAL_FILE_NOT_FOUND",
@@ -4809,12 +4817,16 @@
       },
       "errors": [
         "INVALID_ARGS",
+        "SESSION_RECOVERING",
+        "FLASHING_BUSY",
         "SESSION_NOT_READY",
         "SESSION_BUSY",
         "SESSION_INTERACTIVE_BUSY"
       ],
       "error_order": [
         "INVALID_ARGS",
+        "SESSION_RECOVERING",
+        "FLASHING_BUSY",
         "SESSION_NOT_READY",
         "SESSION_BUSY",
         "SESSION_INTERACTIVE_BUSY"
@@ -4838,7 +4850,7 @@
       "status": "EXISTING",
       "source": "sw_core/service.py:840-848 → interactive_open sw_core/session_manager.py:4009",
       "x-notes": {
-        "flashing_check": "未檢查 FLASHING（FLASHING 狀態走其他狀態 → SESSION_NOT_READY）；不列為副作用",
+        "flashing_check": "明確檢查 FLASHING 並回 FLASHING_BUSY；此拒絕不列為副作用",
         "coercion_exception_precedes_validation": "轉型例外（EXCEPTION）先於 INVALID_ARGS 驗證（02 §5.2）；errors／error_order 無法表示此先後，故註記於此"
       }
     },

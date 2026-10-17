@@ -323,8 +323,25 @@ class SerialwrapService:
         for line in buf.feed(data):
             self._engine.feed_line(com, line, wal_seq)
 
-    def _send_cb(self, session_id: str, command: str, source: str, cmd_id: str, timeout_s: float, mode: str, expected_duration_s: float | None = None, completion_regex: str | None = None) -> dict[str, Any]:
-        options: dict[str, Any] = {"timeout_s": timeout_s, "mode": mode, "expected_duration_s": expected_duration_s}
+    def _send_cb(
+        self,
+        session_id: str,
+        command: str,
+        source: str,
+        cmd_id: str,
+        timeout_s: float,
+        mode: str,
+        expected_duration_s: float | None = None,
+        completion_regex: str | None = None,
+        *,
+        trusted_human: bool = False,
+    ) -> dict[str, Any]:
+        options: dict[str, Any] = {
+            "timeout_s": timeout_s,
+            "mode": mode,
+            "expected_duration_s": expected_duration_s,
+            "trusted_human": trusted_human,
+        }
         if completion_regex is not None:
             options["completion_regex"] = completion_regex
         return self._sessions.execute_command(session_id, command, source, cmd_id, **options)
@@ -339,6 +356,7 @@ class SerialwrapService:
             timeout_s=30.0,
             priority=100,
             admission_exempt=True,
+            trusted_human=True,
         )
 
     def _bg_fallback_from_arbiter(
@@ -657,13 +675,29 @@ class SerialwrapService:
         return result
 
     def _resolve_session_id(
-        self, selector: str, *, source: str = "agent"
+        self,
+        selector: str,
+        *,
+        source: str = "agent",
+        trusted_human: bool = False,
     ) -> tuple[str | None, dict[str, Any] | None]:
         state = self._sessions.get_session_state(selector)
         if not state.get("ok"):
             return None, state
         session = state["session"]
         if session.get("state") != "READY":
+            if session.get("state") == "RECOVERING":
+                return None, {
+                    "ok": False,
+                    "error_code": "SESSION_RECOVERING",
+                    "session": session,
+                }
+            if session.get("state") == "FLASHING":
+                return None, {
+                    "ok": False,
+                    "error_code": "FLASHING_BUSY",
+                    "session": session,
+                }
             # ATTACHED 且非 command-capable（無 ready_probe，僅支援 console）的 profile
             # 永遠不會進 READY，回語意明確的錯誤碼而非 SESSION_NOT_READY。
             if session.get("state") == "ATTACHED" and not session.get("command_capable", True):
@@ -685,9 +719,9 @@ class SerialwrapService:
         # arm（疑似板卡自發重開機的過渡態）時，非 human 來源的顯式命令即時拒絕——bytes
         # 若送出會落入 U-Boot autoboot 倒數窗打斷開機、以 PROMPT_TIMEOUT 吞掉。此拒絕
         # 零 UART 副作用、可重試；session 重新確認 READY 時 quiet 同步解除（session_manager
-        # 各 READY 轉移點 clear_boot_quiet）。human console／interactive lease 不經此路徑，
-        # source 前綴檢查為 belt-and-suspenders（與 execute_command 慣例一致）。
-        if not source.startswith("human:"):
+        # 各 READY 轉移點 clear_boot_quiet）。只有 daemon 內部 human console 能明確帶入
+        # trusted_human；RPC 的 source 字串不授予 gate 豁免。
+        if not trusted_human:
             # #162 有界化（優先於兩個可重試分支）：pending 已逾 READY_RECONFIRM_MAX_S／
             # READY_RECONFIRM_MAX_ATTEMPTS 落終態——daemon 已無自動路徑可解，回**不可
             # 重試**的 READY_UNCONFIRMED（刻意不帶 retry_after_s）。若仍回 AUTOBOOT_QUIET，
@@ -1056,7 +1090,9 @@ class SerialwrapService:
             expected_duration_s: float | None = float(raw_ed) if raw_ed is not None else None
             if not selector:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
-            session_id, err = self._resolve_session_id(selector, source=source)
+            session_id, err = self._resolve_session_id(
+                selector, source=source, trusted_human=False
+            )
             if err is not None:
                 return err
             assert session_id is not None
@@ -1243,7 +1279,9 @@ class SerialwrapService:
             source = str(params.get("source") or "agent")
             if not selector or not local_path or not remote_path:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
-            session_id, err = self._resolve_session_id(selector, source=source)
+            session_id, err = self._resolve_session_id(
+                selector, source=source, trusted_human=False
+            )
             if err is not None:
                 return err
             return self._sessions.file_push(
@@ -1254,6 +1292,7 @@ class SerialwrapService:
                 chunk_timeout_s=chunk_timeout_s,
                 ack_mode=ack_mode,
                 source=source,
+                trusted_human=False,
             )
 
         if method == "file.pull":
@@ -1274,7 +1313,9 @@ class SerialwrapService:
             source = str(params.get("source") or "agent")
             if not selector or not remote_path:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
-            session_id, err = self._resolve_session_id(selector, source=source)
+            session_id, err = self._resolve_session_id(
+                selector, source=source, trusted_human=False
+            )
             if err is not None:
                 return err
             return self._sessions.file_pull(
@@ -1283,6 +1324,7 @@ class SerialwrapService:
                 local_path=str(local_path) if local_path else None,
                 chunk_timeout_s=chunk_timeout_s,
                 source=source,
+                trusted_human=False,
             )
 
         if method == "event.rule_set":

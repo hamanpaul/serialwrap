@@ -2073,7 +2073,7 @@
 
 **Files**
 - Create: `tests/test_stage0_gate_codes.py`
-- Modify: `sw_core/service.py`（`_resolve_session_id`、`command.submit`、`_on_console_line`、`_send_cb`）、`sw_core/session_manager.py`（`interactive_open`、`_agent_gate_reject_locked`、`execute_command`、`_recover_after_failure`、`_handle_reboot_command`）、`sw_core/arbiter.py`（`_QueuedCommand.trusted_human`、`submit(trusted_human=…)`、`_count_pending_locked`、`_running`）
+- Modify: `sw_core/service.py`（`_resolve_session_id`、`command.submit`、`file.push`／`file.pull`、`_on_console_line`、`_send_cb`）、`sw_core/session_manager.py`（`interactive_open`、`_agent_gate_reject_locked`、`execute_command`、`file_push`／`file_pull`、`_recover_after_failure`、`_handle_reboot_command`）、`sw_core/arbiter.py`（`_QueuedCommand.trusted_human`、`submit(trusted_human=…)`、`_count_pending_locked`、`_running`、history eviction）；契約同步 `contracts/behavior_changes.yaml`、`contracts/error_codes.yaml`、`contracts/rpc_schema.json`、`contracts/daemon_logging.yaml`、`sw_core/assets/skill/SKILL.md`、`SKILL_WINDOWS.md`；規格敘述 `docs/serialwrap-spec.md`
 
 **Interfaces**
 - Consumes：既有 `_resolve_session_id`、`arbiter.submit`、`execute_command`。
@@ -2090,10 +2090,13 @@
       #   （tests/test_boot_quiet.py:921,1220、tests/test_ready_reconfirm_bounds.py:246、
       #    tests/test_session_bind.py:192,218、tests/test_multiagent_stress.py:233）
       # True／False＝明確覆寫；RPC 路徑（SerialwrapService._send_cb）一律明確傳 False 或 True
+  SessionManager.file_push(..., trusted_human: bool | None = None) -> dict[str, Any]
+  SessionManager.file_pull(..., trusted_human: bool | None = None) -> dict[str, Any]
+      # None 沿用直接呼叫 manager 的來源前綴語意；file.* RPC 明確傳 False
   SerialwrapService._send_cb(self, session_id, command, source, cmd_id, timeout_s, mode,
                              expected_duration_s=None, *, trusted_human: bool = False, **kw) -> dict[str, Any]
   ```
-  `trusted_human=True` 只由 `SerialwrapService._on_console_line`（daemon 內部 human console 路徑）設定；RPC 參數不得影響它。`source` 字串本身（WAL、命令紀錄）不變。arbiter worker 呼叫 `send_cb` 時**只在 `item.trusted_human is True` 時才傳 `trusted_human=True` 關鍵字**（比照現況 `completion_regex` 的條件傳遞），以相容 `tests/test_issue24_heartbeat.py::fake_send` 等固定參數的替身；`_send_cb` 收不到該關鍵字即為 `False`，因此 RPC 來源的 `human:` 字串一律以 agent 對待（DF-02），而直接呼叫 manager 的既有測試維持現況語意。**測試資產變更：無。**
+  `trusted_human=True` 只由 `SerialwrapService._on_console_line`（daemon 內部 human console 路徑）設定；RPC 參數不得影響它。`source` 字串本身（WAL、命令紀錄）不變。arbiter worker 呼叫 `send_cb` 時**只在 `item.trusted_human is True` 時才傳 `trusted_human=True` 關鍵字**（比照現況 `completion_regex` 的條件傳遞），以相容 `tests/test_issue24_heartbeat.py::fake_send` 等固定參數的替身；`_send_cb` 收不到該關鍵字即為 `False`，因此 RPC 來源的 `human:` 字串一律以 agent 對待（DF-02），而直接呼叫 manager 的既有測試維持現況語意。**測試資產變更**：`tests/test_boot_quiet.py::TestSubmitQuietGate::test_human_source_submit_not_gated` 改為 `test_rpc_human_source_submit_is_gated`，依 DF-02 驗證 RPC 偽造來源遭 quiet gate 拒絕；`tests/test_arbiter_flush_on_recovery.py::_mock_exec` 接受可選 `trusted_human` keyword，以配合 worker 傳遞可信旗標；`tests/test_service_human_console.py::TestServiceHumanConsole::test_human_console_regular_command_uses_line_mode` 與 `test_human_console_sudo_vim_is_interactive` 明確斷言 `trusted_human=True`（同檔既有 `admission_exempt=True` 調整屬 T08）；`tests/test_stage0_gate_codes.py::test_rpc_human_source_not_promoted_on_timeout` 為 fake bridge 補空字串 RX 回應，維持逾時恢復路徑的替身契約，未放寬斷言；`test_gate_reject_zero_side_effects` 改用真 `UARTBridge`、`FakePort` 與 `dir == "TX"` WAL 篩選；另新增本 Task 的邊界與回歸案例（見下表）。
 - Rust 對應：arch §5.4 TxClass gate「source 以 `human:` 開頭時另見 DF-02」、Admission 依 SC-01／02／03 檢查；§5.10 arbiter pending（SC-06 計數）。
 
 **錯誤優先序（凍結，submit-time `_resolve_session_id`）**：查無 → 原樣；`RECOVERING` → `{"ok":false,"error_code":"SESSION_RECOVERING","session":…}`；`FLASHING` → `{"ok":false,"error_code":"FLASHING_BUSY","session":…}`；其餘非 READY 依現況（`PROFILE_NOT_COMMAND_CAPABLE`／`SESSION_NOT_READY`）；READY 時非 `trusted_human` 依現況 `READY_UNCONFIRMED` → `AUTOBOOT_QUIET`。execute-time（`_agent_gate_reject_locked`）的 `AUTOBOOT_QUIET` 回應改為 `{"ok":false,"error_code":"AUTOBOOT_QUIET","selector":…,"retry_after_s":<quiet 剩餘秒數 round 1 位；只剩 pending 時 5.0>}`（只補 `retry_after_s`；`selector` 與 `session` 形狀差異保留，ERR-7.3-8）；`READY_UNCONFIRMED` 不帶 `retry_after_s`。
@@ -2105,19 +2108,21 @@
   import pytest
   from sw_core.arbiter import CommandArbiter
 
-  @pytest.mark.parametrize("state,code", [("RECOVERING", "SESSION_RECOVERING"), ("FLASHING", "FLASHING_BUSY")])
-  def test_submit_time_state_codes(stage0_service, state, code):
+  @pytest.mark.parametrize("state", ["RECOVERING", "FLASHING"])
+  def test_submit_time_state_codes(stage0_service, state):
       svc, sess = stage0_service
       sess.state = state
+      expected_code = {"RECOVERING": "SESSION_RECOVERING", "FLASHING": "FLASHING_BUSY"}[state]
       r = svc.rpc("command.submit", {"selector": "COM0", "cmd": "ls"})
-      assert r["ok"] is False and r["error_code"] == code and r["session"]["state"] == state
+      assert r["ok"] is False and r["error_code"] == expected_code and r["session"]["state"] == state
 
-  @pytest.mark.parametrize("state,code", [("RECOVERING", "SESSION_RECOVERING"), ("FLASHING", "FLASHING_BUSY")])
-  def test_interactive_open_state_codes(stage0_service, state, code):
+  @pytest.mark.parametrize("state", ["RECOVERING", "FLASHING"])
+  def test_interactive_open_state_codes(stage0_service, state):
       svc, sess = stage0_service
       sess.state = state
+      expected_code = {"RECOVERING": "SESSION_RECOVERING", "FLASHING": "FLASHING_BUSY"}[state]
       r = svc.rpc("session.interactive_open", {"selector": "COM0"})
-      assert r["error_code"] == code
+      assert r["error_code"] == expected_code
 
   def test_execute_time_quiet_has_retry_after(stage0_service):
       svc, sess = stage0_service
@@ -2170,10 +2175,16 @@
   | `test_released_still_session_not_ready` | `RELEASED` 下 submit → `SESSION_NOT_READY`（規格 §5.3 RELEASED 列，現況保留；回歸防護，既綠） |
   | `test_direct_manager_human_source_keeps_legacy_semantics` | 直接 `mgr.execute_command(sid, "echo hi", "human:tester", "c1")`（未傳 `trusted_human`）→ 與現況相同走 human 語意（quiet 中仍執行） |
   | `test_worker_omits_trusted_human_kwarg_for_rpc` | 以固定 7 參數的 `send_cb` 替身（同 `test_issue24_heartbeat.py::fake_send`）建 arbiter，RPC 來源命令不擲 `TypeError` |
-  | `test_gate_reject_zero_side_effects` | `SESSION_RECOVERING`／`FLASHING_BUSY`／`AUTOBOOT_QUIET` 拒絕時替身 port `writes == []`、WAL 無新 TX、命令紀錄未建立（submit-time）或 `status == "error"`（execute-time） |
+  | `test_worker_passes_trusted_human_kwarg_when_enabled` | worker 只在明確 trusted-human 命令時傳 `trusted_human=True` |
+  | `test_console_line_reaches_uart_during_quiet_with_real_bridge` | quiet 中的內部 console line 經真 bridge 產生預期 UART bytes 與 WAL TX |
+  | `test_manager_quiet_window_returns_remaining_retry_after` | execute 與 file push 的 active quiet window 回傳剩餘秒數（大於 0、至多 30.0，且非 pending-only 的 5.0） |
+  | `test_file_rpc_rechecks_spoofed_human_as_agent` | file.push／file.pull 在第一層通過後 quiet 被 arm，manager 仍收到 `trusted_human=False` 並拒絕 |
+  | `test_execute_time_quiet_command_record_has_no_retry_after` | RPC 的 `source="human:spoof"` 在 queue 後遇 execute-time quiet gate，`command.get` 記錄仍為 `AUTOBOOT_QUIET`、保留來源字串且不暴露 `retry_after_s`；零 UART／WAL TX |
+  | `test_canceled_running_record_survives_cross_session_history_eviction` | 小型 history 上限下，另一 session 的完成記錄遭淘汰時，仍執行中的 canceled 記錄保留且持續計入 pending |
+  | `test_gate_reject_zero_side_effects` | 使用真 `UARTBridge`／`FakePort` 與 `dir == "TX"` 的 WAL 記錄，確認 RECOVERING／FLASHING／quiet 的 command、file 與 interactive-open 拒絕無 UART write 或新 TX |
 - [ ] **A2 執行並確認 FAIL**：`python3 -m pytest -q tests/test_stage0_gate_codes.py` → 預期 `'SESSION_NOT_READY' != 'SESSION_RECOVERING'` 等斷言失敗與 `AttributeError: 'CommandArbiter' object has no attribute '_running'`。commit：`test(session): SC-01/02/03/06 與 DF-02 gate 錯誤碼失敗測試`
-- [ ] **B1 實作**：依錯誤優先序；`command.submit`、`file.push`／`file.pull` 呼叫 `_resolve_session_id(..., trusted_human=False)`；`_on_console_line` 以 `trusted_human=True` 呼叫 `arbiter.submit`；arbiter worker 只在 `item.trusted_human` 為 True 時呼叫 `send_cb(..., trusted_human=True)`（`_send_cb` 以 `trusted_human=<收到值，預設 False>` 明確轉傳 `execute_command`）；`execute_command` 先解析 `human = trusted_human if trusted_human is not None else source.startswith("human:")`，其後的 human 分支（`_recover_after_failure` human 升格、`_handle_reboot_command` 的 human 來源分支、gate 跳過條件）一律改看 `human` 而非直接看 `source`；`interactive_open` 在 state 檢查最前面加 `RECOVERING`／`FLASHING` 分支；`_count_pending_locked` 改為 `sum(1 for r in recs if r sid 相符 and not r["done_at"]) + (1 if running cmd 的紀錄 status == "canceled" else 0)`；worker 取件時 `_running[sid]=cmd_id`，結束（含例外）時 `pop`。
-- [ ] **B2 執行並確認 PASS**：`python3 -m pytest -q tests/test_stage0_gate_codes.py tests/test_boot_quiet.py tests/test_ready_reconfirm_bounds.py tests/test_issue26_interactive_guard.py tests/test_command_guard.py tests/test_stress_submit.py tests/test_bounded_memory.py tests/test_flash_guard.py tests/test_service_human_console.py tests/test_cowork_session_usability.py tests/test_issue24_heartbeat.py tests/test_session_bind.py tests/test_multiagent_stress.py`；`python3 -m tools.contracts check`（SC-01／02／03／06、DF-02 → `IMPLEMENTED`，`SESSION_RECOVERING`、`FLASHING_BUSY`、`AUTOBOOT_QUIET` 的 `contract_tests` 補本 Task node）；全套依 §0 第 4 點。
+- [ ] **B1 實作**：依錯誤優先序；`command.submit` 與兩個 file RPC 呼叫 `_resolve_session_id(..., trusted_human=False)`；RPC 呼叫 `file_push`／`file_pull` 時也明確傳 `trusted_human=False`，manager 預設 `None` 時保留直接呼叫既有來源前綴語意；`_on_console_line` 以 `trusted_human=True` 呼叫 `arbiter.submit`；worker 僅在 `item.trusted_human` 為 True 時傳該 keyword，`_send_cb` 對 manager 明確傳 `trusted_human`；`execute_command`、`_execute_foreground`、`_recover_after_failure` 與 file manager gate 都依解析後的 `human` 判斷，不直接信任 RPC `source`；`interactive_open` 在 state gate 先回 `RECOVERING`／`FLASHING` 對應碼；quiet 回應依目前 active window 回傳剩餘秒數、僅 reconfirm pending 時回 `READY_RECONFIRM_RETRY_S`；SC-06 用 `_running` 保留執行命令身分，pending 額外計入已 cancel 但仍由 worker 執行的命令，history eviction 跳過 `_running.values()`，worker 在成功或例外收尾、從 `_running` 移除後才淘汰 history。
+- [ ] **B2 執行並確認 PASS**：`python3 -m pytest -q tests/test_stage0_gate_codes.py tests/test_boot_quiet.py tests/test_ready_reconfirm_bounds.py tests/test_issue26_interactive_guard.py tests/test_command_guard.py tests/test_stress_submit.py tests/test_bounded_memory.py tests/test_flash_guard.py tests/test_service_human_console.py tests/test_cowork_session_usability.py tests/test_issue24_heartbeat.py tests/test_session_bind.py tests/test_multiagent_stress.py 'tests/test_bootloader_recovery.py::TestInteractiveOpenAllowAttached::test_busy_paths_after_expired_recovery_still_run_post_close' tests/test_contracts_keep_baseline.py::test_daemon_logging_all_calls_listed`；`python3 -m tools.contracts check`（SC-01／02／03／06、DF-02 → `IMPLEMENTED`，錯誤碼契約、RPC schema、兩份 SKILL 受管區段同步；`retry_after_s` 只在直接 submit／manager 回應提供，`command.get` 記錄不包含）；全套依 §0 第 4 點。
 - [ ] **B3 commit**：`fix(session): SC-01/02/03/06 修正 gate 錯誤碼與 pending 計數，DF-02 拒絕 RPC 偽造 human 來源`
 
 ---

@@ -40,6 +40,7 @@ from .constants import (
     MAX_RECOVERY_LEASE_S,
     READY_RECONFIRM_MAX_ATTEMPTS,
     READY_RECONFIRM_MAX_S,
+    READY_RECONFIRM_RETRY_S,
     REPROBE_BACKOFF_S,
     REPROBE_MAX_ATTEMPTS,
     REPROBE_MAX_INTERVAL_S,
@@ -1517,10 +1518,17 @@ class SessionManager:
                 "recommended_action": "self_test",
             }
         if session.agent_gate_active():
+            if session.boot_quiet_active():
+                retry_after_s = round(
+                    max(session.boot_quiet_until - time.monotonic(), 0.0), 1
+                )
+            else:
+                retry_after_s = READY_RECONFIRM_RETRY_S
             return {
                 "ok": False,
                 "error_code": ERROR_AUTOBOOT_QUIET,
                 "selector": session.profile.com,
+                "retry_after_s": retry_after_s,
             }
         return None
 
@@ -5404,7 +5412,9 @@ class SessionManager:
         timeout_s: float,
         execution_mode: str,
         operation: _ForegroundOperation | None = None,
+        trusted_human: bool | None = None,
     ) -> dict[str, Any]:
+        human = source.startswith("human:") if trusted_human is None else trusted_human
         prompt_regex = session.profile.prompt_regex
         pre_offset = bridge.rx_snapshot_len()
         # #130：收到 reboot 命令**當下**即設 boot quiet window，不等 banner——
@@ -5449,7 +5459,7 @@ class SessionManager:
                 "partial": False,
             }
 
-        if source.startswith("human:"):
+        if human:
             post = _PostCloseAction()
             with self._lock:
                 if not self._foreground_operation_current_locked(session, bridge, operation):
@@ -5510,10 +5520,12 @@ class SessionManager:
         mode: str = "line",
         expected_duration_s: float | None = None,
         completion_regex: str | None = None,
+        trusted_human: bool | None = None,
     ) -> dict[str, Any]:
         if not valid_completion_regex(completion_regex):
             return {"ok": False, "error_code": ERROR_INVALID_COMPLETION_REGEX}
         normalized_mode = {"fg": "line", "bg": "background"}.get(mode, mode)
+        human = source.startswith("human:") if trusted_human is None else trusted_human
         suspend_human_interactive = False
         post = _PostCloseAction()
         busy_result: dict[str, Any] | None = None
@@ -5527,12 +5539,12 @@ class SessionManager:
             # #139 execute-time gate（第二層，堵 queue race）：submit 通過第一層後、worker
             # 執行前 banner 才到（命令已在 arbiter queue）的競態於此攔下。arbiter._worker
             # 會把本 error_code 寫回命令記錄（status=error），`cmd status` 可觀測；命令
-            # 未送 UART、零副作用，READY 重新確認後可重送。human 來源循 #130 慣例放行
-            # （#114 刻意進 bootloader：human console／lease 送鍵永不 gate）。
+            # 未送 UART、零副作用，READY 重新確認後可重送。只有受信任的內部 human console
+            # 命令可略過此 gate；RPC 的 source 字串不能授權豁免。
             # #162：改判 _agent_gate_reject_locked()——quiet 過期不再解除 gate，須等
             # READY 經 nonce probe 再確認（confirm_ready）才放行；pending 逾時／逾次
             # 則改回不可重試的 READY_UNCONFIRMED。
-            if not source.startswith("human:"):
+            if not human:
                 gate = self._agent_gate_reject_locked(session)
                 if gate is not None:
                     return gate
@@ -5544,7 +5556,7 @@ class SessionManager:
                 return {"ok": False, "error_code": "SESSION_BUSY", "selector": session.profile.com}
             lease, post = self._refresh_interactive_locked(session)
             if lease is not None and normalized_mode != "interactive":
-                if not source.startswith("human:") and lease.owner.startswith("human:"):
+                if not human and lease.owner.startswith("human:"):
                     suspend_human_interactive = True
                 else:
                     busy_result = {
@@ -5581,6 +5593,7 @@ class SessionManager:
                 expected_duration_s=expected_duration_s,
                 completion_regex=completion_regex,
                 operation=operation,
+                trusted_human=human,
             )
             with self._lock:
                 aborted_by_drain = cmd_id in self._aborted_cmd_ids
@@ -5685,7 +5698,9 @@ class SessionManager:
         expected_duration_s: float | None = None,
         completion_regex: str | None = None,
         operation: _ForegroundOperation | None = None,
+        trusted_human: bool | None = None,
     ) -> dict[str, Any]:
+        human = source.startswith("human:") if trusted_human is None else trusted_human
         if normalized_mode == "interactive":
             with self._lock:
                 if not self._foreground_operation_current_locked(session, bridge, operation):
@@ -5724,6 +5739,7 @@ class SessionManager:
                 timeout_s=timeout_s,
                 execution_mode=normalized_mode,
                 operation=operation,
+                trusted_human=human,
             )
         pre_offset = bridge.rx_snapshot_len()
         if completion_regex is not None:
@@ -5790,6 +5806,7 @@ class SessionManager:
                 prompt_regex=prompt_regex,
                 pre_offset=pre_offset,
                 operation=operation,
+                trusted_human=human,
             )
         raw_text = bridge.rx_text_from(pre_offset)
         stdout = self._extract_command_stdout(raw_text, command, prompt_regex, completion_regex=completion_regex)
@@ -5816,11 +5833,13 @@ class SessionManager:
         prompt_regex: str,
         pre_offset: int,
         operation: _ForegroundOperation | None = None,
+        trusted_human: bool | None = None,
     ) -> dict[str, Any]:
+        human = source.startswith("human:") if trusted_human is None else trusted_human
         with self._lock:
             if not self._foreground_operation_current_locked(session, bridge, operation):
                 return {"ok": False, "error_code": "FLUSHED_BY_RECOVERY"}
-        if source.startswith("human:"):
+        if human:
             post = _PostCloseAction()
             with self._lock:
                 lease, post = self._refresh_interactive_locked(session)
@@ -6017,7 +6036,21 @@ class SessionManager:
             post = _PostCloseAction()
             with self._lock:
                 session = self.get_session(selector)
-                if session is None or session.bridge is None:
+                if session is None:
+                    return {"ok": False, "error_code": "SESSION_NOT_READY", "selector": selector}
+                if session.state == "RECOVERING":
+                    return {
+                        "ok": False,
+                        "error_code": "SESSION_RECOVERING",
+                        "selector": session.profile.com,
+                    }
+                if session.state == "FLASHING":
+                    return {
+                        "ok": False,
+                        "error_code": "FLASHING_BUSY",
+                        "selector": session.profile.com,
+                    }
+                if session.bridge is None:
                     return {"ok": False, "error_code": "SESSION_NOT_READY", "selector": selector}
 
                 if session.state == "READY":
@@ -6859,6 +6892,7 @@ class SessionManager:
         ack_mode: str = "auto",
         echo_timeout_s: float | None = None,
         source: str = "agent",
+        trusted_human: bool | None = None,
     ) -> dict[str, Any]:
         """將 host 端檔案推送到 target。
 
@@ -6877,6 +6911,7 @@ class SessionManager:
         """
         from .file_transfer import push_file
 
+        human = source.startswith("human:") if trusted_human is None else trusted_human
         suspend_human_interactive = False
         post = _PostCloseAction()
         busy_result: dict[str, Any] | None = None
@@ -6888,8 +6923,8 @@ class SessionManager:
             # #139：同 execute_command 的第二層 gate——file 傳輸直寫 bridge、不經
             # execute_command，須各自補 gate（僅開始前擋；傳輸中 banner 到達不中途
             # abort，由傳輸自然 timeout，屬既有行為）。
-            # #162：改判 _agent_gate_reject_locked()（AUTOBOOT_QUIET／READY_UNCONFIRMED）。
-            if not source.startswith("human:"):
+            # 直接 manager 呼叫沿用既有 source 語意；RPC 路徑明確傳入可信來源旗標。
+            if not human:
                 gate = self._agent_gate_reject_locked(session)
                 if gate is not None:
                     return gate
@@ -6897,7 +6932,7 @@ class SessionManager:
                 return {"ok": False, "error_code": "SESSION_RECOVERING"}
             lease, post = self._refresh_interactive_locked(session)
             if lease is not None:
-                if not source.startswith("human:") and lease.owner.startswith("human:"):
+                if not human and lease.owner.startswith("human:"):
                     suspend_human_interactive = True
                 else:
                     busy_result = {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY"}
@@ -6954,6 +6989,7 @@ class SessionManager:
         local_path: str | None = None,
         chunk_timeout_s: float | None = None,
         source: str = "agent",
+        trusted_human: bool | None = None,
     ) -> dict[str, Any]:
         """從 target 拉取檔案到 host。
 
@@ -6963,6 +6999,7 @@ class SessionManager:
         """
         from .file_transfer import pull_file
 
+        human = source.startswith("human:") if trusted_human is None else trusted_human
         suspend_human_interactive = False
         post = _PostCloseAction()
         busy_result: dict[str, Any] | None = None
@@ -6972,8 +7009,8 @@ class SessionManager:
             if session is None or session.bridge is None or session.state != "READY":
                 return {"ok": False, "error_code": "SESSION_NOT_READY"}
             # #139：同 file_push 的 gate（pull 同樣直寫 bridge、不經 execute_command）。
-            # #162：改判 _agent_gate_reject_locked()（AUTOBOOT_QUIET／READY_UNCONFIRMED）。
-            if not source.startswith("human:"):
+            # 直接 manager 呼叫沿用既有 source 語意；RPC 路徑明確傳入可信來源旗標。
+            if not human:
                 gate = self._agent_gate_reject_locked(session)
                 if gate is not None:
                     return gate
@@ -6981,7 +7018,7 @@ class SessionManager:
                 return {"ok": False, "error_code": "SESSION_RECOVERING"}
             lease, post = self._refresh_interactive_locked(session)
             if lease is not None:
-                if not source.startswith("human:") and lease.owner.startswith("human:"):
+                if not human and lease.owner.startswith("human:"):
                     suspend_human_interactive = True
                 else:
                     busy_result = {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY"}

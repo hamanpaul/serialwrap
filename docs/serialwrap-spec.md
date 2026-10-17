@@ -276,7 +276,7 @@ Agent 收到 sentinel 後應短暫 sleep 後重試，而非視為錯誤。
 5. `session.interactive_status` 讀畫面
 6. `session.interactive_close` 釋放 lease
 
-若 `source=human:*` 的 line command 已送出但後續未回 prompt，daemon 會優先把該 console 升級成 human interactive，而不是直接觸發 recover。這條保護僅套用 human/minicom；agent foreground command 仍保留既有 prompt timeout / recover 路徑。
+若 daemon 內部 human console 路徑送出的 line command（WAL `source=human:*`）未回 prompt，daemon 會優先把該 console 升級成 human interactive，再觸發 recover。這條保護只適用於 human/minicom console；RPC 的 `source=human:*` 參數一律按 agent 處理（DF-02）。agent foreground command 仍保留既有 prompt timeout / recover 路徑。
 
 > bootloader recovery lease（`allow_attached=True`）、recovery lease 的 stash/restore、`MAX_RECOVERY_LEASE_S` clamp、`recovery_mode` 欄位語意、idle human lease soft-preempt 與 orphan console liveness 等逐項行為，canonical 規格見 [`openspec/specs/session-interactive/spec.md`](../openspec/specs/session-interactive/spec.md)（#53）。本概覽不再追蹤這些細節。
 
