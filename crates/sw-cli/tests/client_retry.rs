@@ -1,6 +1,9 @@
 //! RPC client（白名單重試、退避、TIMEOUT 探測）測試：P3-T13 紅燈階段。
-use sw_cli::client::{rpc_call, ClientCrash};
+use std::time::Duration;
+
+use sw_cli::client::{rpc_call, sock_timeout, ClientCrash};
 use sw_pal::fakes::{fake_platform, FakeConn, StreamStep::*};
+use sw_pal::traits::SockTimeout;
 use sw_proto::pyjson::{PyInt, PyValue};
 
 fn empty() -> PyValue {
@@ -133,6 +136,44 @@ fn invalid_timeout_crashes_only_after_endpoint_parse() {
             "{t}"
         );
     }
+}
+
+#[test]
+fn timeout_conversion_matches_python_nanosecond_rounding_and_limit() {
+    assert_eq!(
+        sock_timeout(1e-12),
+        Ok(SockTimeout::Blocking(Duration::from_nanos(1)))
+    );
+
+    let last_accepted = f64::from_bits(0x4201_2e0b_e826_d694);
+    assert_eq!(
+        sock_timeout(last_accepted),
+        Ok(SockTimeout::Blocking(Duration::new(
+            9_223_372_036,
+            854_774_784,
+        )))
+    );
+
+    let first_rejected = f64::from_bits(0x4201_2e0b_e826_d695);
+    assert!(matches!(
+        sock_timeout(first_rejected),
+        Err(ClientCrash::InvalidTimeout(_))
+    ));
+
+    let (p, conn, _) = fake_platform(vec![]);
+    assert!(matches!(
+        rpc_call(
+            &p,
+            "/s.sock",
+            "device.list",
+            &empty(),
+            1,
+            first_rejected,
+            &PyInt::Small(0),
+        ),
+        Err(ClientCrash::InvalidTimeout(_))
+    ));
+    assert_eq!(conn.connect_count(), 0);
 }
 
 #[test]
