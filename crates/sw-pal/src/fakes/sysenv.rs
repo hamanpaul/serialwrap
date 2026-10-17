@@ -10,12 +10,33 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::fakes::env::FakeEnv;
-use crate::traits::{CmdOutput, CmdOutputRaw, PalError, PalErrorKind, PalResult, SysEnv};
+use crate::traits::{
+    CmdOutput, CmdOutputRaw, InterruptScope, PalError, PalErrorKind, PalResult, SysEnv,
+};
 
 #[derive(Debug, Clone)]
 enum Scripted {
-    Out { rc: i32, stdout: Vec<u8>, stderr: Vec<u8> },
-    Fail { kind: PalErrorKind, message: String },
+    Out {
+        rc: i32,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
+    Merged {
+        rc: i32,
+        output: Vec<u8>,
+    },
+    Fail {
+        kind: PalErrorKind,
+        message: String,
+    },
+}
+
+struct FakeInterruptScope;
+
+impl InterruptScope for FakeInterruptScope {
+    fn interrupted(&self) -> bool {
+        false
+    }
 }
 
 type Script = Vec<(Vec<String>, VecDeque<Scripted>)>;
@@ -83,12 +104,18 @@ impl FakeSysEnv {
 
     /// 每次 `run_raw` 的環境覆寫（`run` 恆為 `None`）。
     pub fn call_envs(&self) -> Vec<Option<Vec<(OsString, OsString)>>> {
-        self.call_envs.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.call_envs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// 每次呼叫的逾時參數。
     pub fn timeouts(&self) -> Vec<Option<Duration>> {
-        self.timeouts.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.timeouts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     fn respond(&self, argv: &[String]) -> Option<Scripted> {
@@ -101,7 +128,12 @@ impl FakeSysEnv {
         }
     }
 
-    fn record(&self, argv: &[String], env: Option<&[(OsString, OsString)]>, timeout: Option<Duration>) {
+    fn record(
+        &self,
+        argv: &[String],
+        env: Option<&[(OsString, OsString)]>,
+        timeout: Option<Duration>,
+    ) {
         self.calls
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -203,6 +235,19 @@ impl FakeSysEnvBuilder {
         self
     }
 
+    /// 指定 runner 合併後的 stdout／stderr 位元組序列。
+    pub fn command_merged(mut self, argv: &[&str], rc: i32, output: &[u8]) -> Self {
+        push_script(
+            &mut self.script,
+            owned_argv(argv),
+            Scripted::Merged {
+                rc,
+                output: output.to_vec(),
+            },
+        );
+        self
+    }
+
     /// 同一 argv 依序回應；用盡後重複最後一筆。
     pub fn command_seq(mut self, argv: &[&str], seq: &[(i32, &str, &str)]) -> Self {
         for (rc, out, err) in seq {
@@ -235,7 +280,12 @@ impl FakeSysEnvBuilder {
     pub fn build(self) -> Arc<FakeSysEnv> {
         Arc::new(FakeSysEnv {
             inner: self.inner,
-            script: Mutex::new(self.script.into_iter().map(|(k, v)| (k, v.into())).collect()),
+            script: Mutex::new(
+                self.script
+                    .into_iter()
+                    .map(|(k, v)| (k, v.into()))
+                    .collect(),
+            ),
             user: self.user,
             passwd_home: self.passwd_home,
             systemd: self.systemd,
@@ -295,6 +345,11 @@ impl SysEnv for FakeSysEnv {
                 stdout: String::from_utf8_lossy(&stdout).into_owned(),
                 stderr: String::from_utf8_lossy(&stderr).into_owned(),
             }),
+            Some(Scripted::Merged { rc, output }) => Ok(CmdOutput {
+                rc,
+                stdout: String::from_utf8_lossy(&output).into_owned(),
+                stderr: String::new(),
+            }),
             Some(Scripted::Fail { kind, message }) => Err(PalError::plain(kind, message)),
             None => Ok(CmdOutput {
                 rc: 0,
@@ -302,6 +357,36 @@ impl SysEnv for FakeSysEnv {
                 stderr: String::new(),
             }),
         }
+    }
+
+    fn run_merged(&self, argv: &[String], timeout: Option<Duration>) -> PalResult<CmdOutput> {
+        self.record(argv, None, timeout);
+        match self.respond(argv) {
+            Some(Scripted::Out { rc, stdout, stderr }) => Ok(CmdOutput {
+                rc,
+                stdout: format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr)
+                ),
+                stderr: String::new(),
+            }),
+            Some(Scripted::Merged { rc, output }) => Ok(CmdOutput {
+                rc,
+                stdout: String::from_utf8_lossy(&output).into_owned(),
+                stderr: String::new(),
+            }),
+            Some(Scripted::Fail { kind, message }) => Err(PalError::plain(kind, message)),
+            None => Ok(CmdOutput {
+                rc: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
+        }
+    }
+
+    fn interrupt_scope(&self) -> PalResult<Box<dyn InterruptScope>> {
+        Ok(Box::new(FakeInterruptScope))
     }
 
     fn run_raw(
@@ -313,6 +398,11 @@ impl SysEnv for FakeSysEnv {
         self.record(argv, env, timeout);
         match self.respond(argv) {
             Some(Scripted::Out { rc, stdout, stderr }) => Ok(CmdOutputRaw { rc, stdout, stderr }),
+            Some(Scripted::Merged { rc, output }) => Ok(CmdOutputRaw {
+                rc,
+                stdout: output,
+                stderr: Vec::new(),
+            }),
             Some(Scripted::Fail { kind, message }) => Err(PalError::plain(kind, message)),
             None => Ok(CmdOutputRaw {
                 rc: 0,

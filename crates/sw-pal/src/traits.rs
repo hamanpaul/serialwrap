@@ -5,19 +5,22 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 // 明列項目（不用 glob）：避免 proc_scan 的 `posix`／`windows` 子模組名洩漏成 `sw_pal::posix`。
-pub use crate::proc_scan::{
-    dedup_launcher_children, extract_socket_arg, is_serialwrapd_argv, ArgvFlavor, DaemonProc, HolderScanStatus,
-    PosixProcScan, ProcIdentity, ProcScan, ScanFailure, WinProcInfo,
+pub use crate::device_source::windows_model::{
+    exclude_bluetooth, read_bt_ports, RegistryView, SERIALCOMM_KEY,
 };
+pub use crate::fs_ops::{FileLockGuard, FsOps, LinkKind};
 #[cfg(windows)]
 pub use crate::proc_scan::WindowsProcScan;
+pub use crate::proc_scan::{
+    dedup_launcher_children, extract_socket_arg, is_serialwrapd_argv, ArgvFlavor, DaemonProc,
+    HolderScanStatus, PosixProcScan, ProcIdentity, ProcScan, ScanFailure, WinProcInfo,
+};
 pub use crate::process_tunnel::{ProcGroupRef, ProcessTunnel, TunnelProc};
-pub use crate::device_source::windows_model::{exclude_bluetooth, read_bt_ports, RegistryView, SERIALCOMM_KEY};
-pub use crate::fs_ops::{FileLockGuard, FsOps, LinkKind};
 pub use crate::service_ctl::{
-    encode_utf16le_bom, render_task_xml, shell_join_windows, split_windows_cmdline, AutostartHoldKind,
-    AutostartHoldRecord, CmdRecord, CompositeServiceCtl, HoldState, ServiceAction, ServiceCtl, ServiceResult,
-    SupervisionMode, SupervisorDefinition, SystemdCtl, TaskQuery, TaskXmlSpec, WindowsServiceCtl, WindowsTaskCtl,
+    encode_utf16le_bom, render_task_xml, shell_join_windows, split_windows_cmdline,
+    AutostartHoldKind, AutostartHoldRecord, CmdRecord, CompositeServiceCtl, HoldState,
+    ServiceAction, ServiceCtl, ServiceResult, SupervisionMode, SupervisorDefinition, SystemdCtl,
+    TaskQuery, TaskXmlSpec, WindowsServiceCtl, WindowsTaskCtl,
 };
 
 pub type PalResult<T> = Result<T, PalError>;
@@ -366,6 +369,17 @@ pub trait SysEnv: Send + Sync {
 
     /// 子行程執行（等同 Python `subprocess.run(capture_output=True, text=True)`）。逾時回 `rc=-1`、`stderr="TIMEOUT"`。
     fn run(&self, argv: &[String], timeout: Option<Duration>) -> PalResult<CmdOutput>;
+    /// 子行程合併 stdout／stderr。原生 POSIX／Windows 及正式假環境保留寫入順序；預設替身依 stdout、stderr 串接。
+    fn run_merged(&self, argv: &[String], timeout: Option<Duration>) -> PalResult<CmdOutput> {
+        let mut output = self.run(argv, timeout)?;
+        output.stdout.push_str(&output.stderr);
+        output.stderr.clear();
+        Ok(output)
+    }
+    /// 暫時攔截 Ctrl+C，讓呼叫端在清理資源後以 130 結束。
+    fn interrupt_scope(&self) -> PalResult<Box<dyn InterruptScope>> {
+        Ok(Box::new(NoInterruptScope))
+    }
     /// 原始 bytes 版本：不解碼、不做換行轉換；`env=Some(..)` 時取代子行程環境。
     fn run_raw(
         &self,
@@ -387,6 +401,18 @@ pub trait SysEnv: Send + Sync {
     fn user_identity(&self) -> String;
     /// Windows：`%LOCALAPPDATA%`（非空）否則 `%USERPROFILE%\AppData\Local`；POSIX 為 `None`。
     fn local_appdata(&self) -> Option<PathBuf>;
+}
+
+pub trait InterruptScope: Send + Sync {
+    fn interrupted(&self) -> bool;
+}
+
+struct NoInterruptScope;
+
+impl InterruptScope for NoInterruptScope {
+    fn interrupted(&self) -> bool {
+        false
+    }
 }
 
 /// `SysEnv::run` 的結果；`stdout`／`stderr` 已依 Python text mode（strict、universal newlines）解碼。
@@ -495,11 +521,7 @@ pub trait ProcessCtl: Send + Sync {
     }
 
     /// 前景同步呼叫子行程（等同 Python subprocess.call）。
-    fn call_foreground(
-        &self,
-        _argv: &[String],
-        _env: &[(OsString, OsString)],
-    ) -> PalResult<i64> {
+    fn call_foreground(&self, _argv: &[String], _env: &[(OsString, OsString)]) -> PalResult<i64> {
         Err(PalError::plain(
             PalErrorKind::Unsupported,
             "不支援前景子行程呼叫",

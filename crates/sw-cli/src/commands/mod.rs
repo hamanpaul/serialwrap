@@ -22,6 +22,7 @@ pub fn dispatch(ctx: &mut CliCtx, ns: &Namespace) -> i32 {
     let path = ns.path();
     match path.as_slice() {
         ["event", ..] => return event_cmd::dispatch_event(ctx, ns),
+        ["remote", ..] => return remote_cmd::run_remote(ctx, ns),
         ["skill"] => return skill_cmd::run_skill(ctx, ns),
         ["profile", "test"] => return profile_cmd::run_profile_test(ctx, ns),
         ["cmd", "submit"] => {

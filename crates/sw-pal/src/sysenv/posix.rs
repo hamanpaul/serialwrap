@@ -1,18 +1,47 @@
 //! POSIX 環境查詢。
 
-use crate::sysenv::{capture_command, exit_code, universal_newlines, CapturedOutput};
+use crate::sysenv::{
+    capture_command, capture_command_merged, exit_code, universal_newlines, CapturedOutput,
+};
 use crate::traits::{
-    posix_errno, posix_io_error, CmdOutput, CmdOutputRaw, PalError, PalErrorKind, PalResult, SysEnv,
+    posix_errno, posix_io_error, CmdOutput, CmdOutputRaw, InterruptScope, PalError, PalErrorKind,
+    PalResult, SysEnv,
 };
 use std::ffi::{CStr, CString, OsString};
 use std::io::IsTerminal;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NativeSysEnv;
+
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+struct PosixInterruptScope {
+    previous: libc::sigaction,
+}
+
+impl InterruptScope for PosixInterruptScope {
+    fn interrupted(&self) -> bool {
+        INTERRUPTED.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for PosixInterruptScope {
+    fn drop(&mut self) {
+        // SAFETY: `previous` 是建立此 scope 時由 sigaction 原樣取得的 handler 狀態。
+        unsafe {
+            libc::sigaction(libc::SIGINT, &self.previous, std::ptr::null_mut());
+        }
+    }
+}
+
+extern "C" fn record_sigint(_signal: libc::c_int) {
+    INTERRUPTED.store(true, Ordering::SeqCst);
+}
 
 impl SysEnv for NativeSysEnv {
     fn var(&self, key: &str) -> Option<String> {
@@ -109,6 +138,37 @@ impl SysEnv for NativeSysEnv {
         })
     }
 
+    fn run_merged(&self, argv: &[String], timeout: Option<Duration>) -> PalResult<CmdOutput> {
+        let (status, output) = run_bytes_merged(argv, timeout)?;
+        let stdout = decode_locale_text(&output)?;
+        let timed_out = status.is_none();
+        Ok(CmdOutput {
+            rc: status.map(exit_code).unwrap_or(-1),
+            stdout: universal_newlines(stdout),
+            stderr: if timed_out {
+                "TIMEOUT".to_string()
+            } else {
+                String::new()
+            },
+        })
+    }
+
+    fn interrupt_scope(&self) -> PalResult<Box<dyn InterruptScope>> {
+        INTERRUPTED.store(false, Ordering::SeqCst);
+        let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        let mut previous = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        action.sa_sigaction = record_sigint as *const () as libc::sighandler_t;
+        action.sa_flags = 0;
+        // SAFETY: action 是全零初始化後設定了 handler，signal mask 在呼叫前初始化。
+        unsafe {
+            libc::sigemptyset(&mut action.sa_mask);
+            if libc::sigaction(libc::SIGINT, &action, &mut previous) != 0 {
+                return Err(posix_io_error(std::io::Error::last_os_error()));
+            }
+        }
+        Ok(Box::new(PosixInterruptScope { previous }))
+    }
+
     fn run_raw(
         &self,
         argv: &[String],
@@ -184,6 +244,23 @@ fn run_bytes(
     }
 }
 
+fn run_bytes_merged(
+    argv: &[String],
+    timeout: Option<Duration>,
+) -> PalResult<(Option<std::process::ExitStatus>, Vec<u8>)> {
+    let Some(program) = argv.first() else {
+        return Err(PalError::plain(
+            PalErrorKind::InvalidInput,
+            "至少需要一個執行檔參數",
+        ));
+    };
+    let mut command = Command::new(program);
+    command.args(&argv[1..]);
+    let output = capture_command_merged(command, timeout)
+        .map_err(|error| posix_spawn_error(error, program))?;
+    Ok((output.status, output.output))
+}
+
 fn posix_spawn_error(error: std::io::Error, program: &str) -> PalError {
     if let Some(code) = error.raw_os_error() {
         let base = posix_errno(code);
@@ -229,14 +306,10 @@ fn python_utf8_decode_error(bytes: &[u8], start: usize, length: Option<usize>) -
         "invalid continuation byte"
     };
     if length.is_some() && reason == "invalid start byte" || end.saturating_sub(start) == 1 {
-        format!(
-            "'{encoding}' codec can't decode byte 0x{first:02x} in position {start}: {reason}"
-        )
+        format!("'{encoding}' codec can't decode byte 0x{first:02x} in position {start}: {reason}")
     } else {
         let last = end.saturating_sub(1).max(start);
-        format!(
-            "'{encoding}' codec can't decode bytes in position {start}-{last}: {reason}"
-        )
+        format!("'{encoding}' codec can't decode bytes in position {start}-{last}: {reason}")
     }
 }
 
@@ -282,13 +355,7 @@ fn default_search_path() -> Option<OsString> {
     }
     let mut bytes = vec![0u8; size];
     // SAFETY: bytes 的容量符合前次查詢結果。
-    let written = unsafe {
-        libc::confstr(
-            libc::_CS_PATH,
-            bytes.as_mut_ptr().cast(),
-            bytes.len(),
-        )
-    };
+    let written = unsafe { libc::confstr(libc::_CS_PATH, bytes.as_mut_ptr().cast(), bytes.len()) };
     if written == 0 {
         return None;
     }
@@ -653,6 +720,12 @@ impl SysEnv for SysEnvPosix {
     fn run(&self, argv: &[String], timeout: Option<Duration>) -> PalResult<CmdOutput> {
         NativeSysEnv.run(argv, timeout)
     }
+    fn run_merged(&self, argv: &[String], timeout: Option<Duration>) -> PalResult<CmdOutput> {
+        NativeSysEnv.run_merged(argv, timeout)
+    }
+    fn interrupt_scope(&self) -> PalResult<Box<dyn InterruptScope>> {
+        NativeSysEnv.interrupt_scope()
+    }
     fn run_raw(
         &self,
         argv: &[String],
@@ -689,7 +762,9 @@ pub type SysEnvPosix = NativeSysEnv;
 
 #[cfg(test)]
 mod tests {
-    use super::{lookup_buffer, with_retry_buffer, MAX_LOOKUP_BUFFER};
+    use super::{lookup_buffer, with_retry_buffer, NativeSysEnv, MAX_LOOKUP_BUFFER};
+    use crate::traits::SysEnv;
+    use std::time::Duration;
 
     #[test]
     fn retry_buffer_grows_after_erange() {
@@ -710,11 +785,28 @@ mod tests {
 
     #[test]
     fn retry_buffer_stops_at_one_megabyte() {
-        let (status, size) = with_retry_buffer(lookup_buffer(1), |buffer| {
-            (libc::ERANGE, buffer.len())
-        });
+        let (status, size) =
+            with_retry_buffer(lookup_buffer(1), |buffer| (libc::ERANGE, buffer.len()));
 
         assert_eq!(status, libc::ERANGE);
         assert_eq!(size, MAX_LOOKUP_BUFFER);
+    }
+
+    #[test]
+    fn merged_runner_preserves_stdout_and_stderr_write_order() {
+        let output = NativeSysEnv
+            .run_merged(
+                &[
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf first; printf second >&2; printf third".into(),
+                ],
+                Some(Duration::from_secs(3)),
+            )
+            .expect("合併 runner 執行成功");
+
+        assert_eq!(output.rc, 0);
+        assert_eq!(output.stdout, "firstsecondthird");
+        assert!(output.stderr.is_empty());
     }
 }

@@ -1,13 +1,17 @@
 //! Windows 環境查詢。
 
-use crate::sysenv::{capture_command, exit_code, universal_newlines, CapturedOutput};
+use crate::sysenv::{
+    capture_command, capture_command_merged, exit_code, universal_newlines, CapturedOutput,
+};
 use crate::traits::{
-    windows_win32_error, CmdOutput, CmdOutputRaw, PalError, PalErrorKind, PalResult, SysEnv,
+    windows_win32_error, CmdOutput, CmdOutputRaw, InterruptScope, PalError, PalErrorKind,
+    PalResult, SysEnv,
 };
 use std::ffi::OsString;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_INSUFFICIENT_BUFFER, HANDLE,
@@ -20,12 +24,41 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::{GetFileType, FILE_TYPE_CHAR};
 use windows_sys::Win32::System::Console::{
-    GetConsoleScreenBufferInfo, GetStdHandle, CONSOLE_SCREEN_BUFFER_INFO, STD_OUTPUT_HANDLE,
+    GetConsoleScreenBufferInfo, GetStdHandle, SetConsoleCtrlHandler, CONSOLE_SCREEN_BUFFER_INFO,
+    CTRL_C_EVENT, STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NativeSysEnv;
+
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+struct WindowsInterruptScope;
+
+impl InterruptScope for WindowsInterruptScope {
+    fn interrupted(&self) -> bool {
+        INTERRUPTED.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for WindowsInterruptScope {
+    fn drop(&mut self) {
+        // SAFETY: 此 scope 註冊了相同 callback，FALSE 會移除該 callback。
+        unsafe {
+            SetConsoleCtrlHandler(Some(record_ctrl_c), 0);
+        }
+    }
+}
+
+unsafe extern "system" fn record_ctrl_c(control_type: u32) -> i32 {
+    if control_type == CTRL_C_EVENT {
+        INTERRUPTED.store(true, Ordering::SeqCst);
+        1
+    } else {
+        0
+    }
+}
 
 impl SysEnv for NativeSysEnv {
     fn var(&self, key: &str) -> Option<String> {
@@ -142,6 +175,30 @@ impl SysEnv for NativeSysEnv {
         })
     }
 
+    fn run_merged(&self, argv: &[String], timeout: Option<Duration>) -> PalResult<CmdOutput> {
+        let (status, output) = run_bytes_merged(argv, timeout)?;
+        let stdout = decode_acp(&output)?;
+        let timed_out = status.is_none();
+        Ok(CmdOutput {
+            rc: status.map(exit_code).unwrap_or(-1),
+            stdout: universal_newlines(stdout),
+            stderr: if timed_out {
+                "TIMEOUT".to_string()
+            } else {
+                String::new()
+            },
+        })
+    }
+
+    fn interrupt_scope(&self) -> PalResult<Box<dyn InterruptScope>> {
+        INTERRUPTED.store(false, Ordering::SeqCst);
+        // SAFETY: callback 僅設定 lock-free 的原子旗標，不呼叫其他 Windows API。
+        if unsafe { SetConsoleCtrlHandler(Some(record_ctrl_c), 1) } == 0 {
+            return Err(windows_win32_error(unsafe { GetLastError() }));
+        }
+        Ok(Box::new(WindowsInterruptScope))
+    }
+
     fn run_raw(
         &self,
         argv: &[String],
@@ -238,6 +295,34 @@ fn run_bytes(
     }
 }
 
+fn run_bytes_merged(
+    argv: &[String],
+    timeout: Option<Duration>,
+) -> PalResult<(Option<std::process::ExitStatus>, Vec<u8>)> {
+    let Some(program) = argv.first() else {
+        return Err(PalError::plain(
+            PalErrorKind::InvalidInput,
+            "至少需要一個執行檔參數",
+        ));
+    };
+    let mut command = Command::new(program);
+    command.args(&argv[1..]);
+    let output = capture_command_merged(command, timeout).map_err(|error| {
+        let code = error
+            .raw_os_error()
+            .map(|code| code as u32)
+            .unwrap_or_else(|| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    2
+                } else {
+                    5
+                }
+            });
+        windows_win32_error(code)
+    })?;
+    Ok((output.status, output.output))
+}
+
 fn decode_acp(bytes: &[u8]) -> PalResult<String> {
     // SAFETY: GetACP 無參數，會回傳目前作用中的 Windows ANSI 字碼頁。
     decode_with_code_page(bytes, unsafe { GetACP() })
@@ -326,8 +411,8 @@ fn find_decode_error(code_page: u32, bytes: &[u8]) -> DecodeFailure {
         let byte = bytes[position];
         // CP950 的 Python codec 將末尾 0xff 視為未完成的雙位元組序列。
         // SAFETY: IsDBCSLeadByteEx 只查詢指定字碼頁中的單一位元組。
-        let lead = unsafe { IsDBCSLeadByteEx(code_page, byte) != 0 }
-            || code_page == 950 && byte == 0xff;
+        let lead =
+            unsafe { IsDBCSLeadByteEx(code_page, byte) != 0 } || code_page == 950 && byte == 0xff;
         if lead {
             if position + 1 >= bytes.len() {
                 return DecodeFailure {
@@ -449,10 +534,7 @@ fn which_windows(name: &str) -> Option<PathBuf> {
         return None;
     }
     let candidates = windows_candidates(name);
-    if let Some(found) = candidates
-        .iter()
-        .find(|candidate| candidate.is_file())
-    {
+    if let Some(found) = candidates.iter().find(|candidate| candidate.is_file()) {
         return Some(found.clone());
     }
     for directory in std::env::split_paths(&path) {

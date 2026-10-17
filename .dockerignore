@@ -15,5 +15,6 @@ tags-session-manager
 /tmp
 /dist
 /build
+/target
 /htmlcov
 /coverage

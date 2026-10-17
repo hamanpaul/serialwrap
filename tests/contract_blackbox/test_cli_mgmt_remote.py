@@ -1,32 +1,28 @@
 """P4-T8 `remote`（-R／-L／status／close／stop 別名）黑箱契約（SC-21、BC-05）。
 
-- A/B 案例（`status`／`close` 空集合、stub ssh 開通）同時執行 Python 基線與受測 CLI，比對輸出。
-  未設 Rust 受測實作時（Python 對 Python）照常通過；Rust 輪（`SERIALWRAP_AB_LABEL=rust-*`）以
-  strict xfail 標示 P4-T8 紅燈，實作完成的同一 commit 移除標記。
-- 紅燈時以 `--runxfail` 執行可看到真實失敗原因（不得以 xfailed 當作通過）。
-- `test_remote_topologies_docker` 需要 P4-T1 的 `mgmt_bundle` 夾具（`mkbundle.sh --dev --delegate-sentinel`），
-  以延遲方式依賴，避免本檔在夾具未就緒時影響整體收集。
+A/B 案例（`status`／`close` 空集合、stub ssh 開通）同時執行 Python 基線與受測 CLI，比對輸出。
+`test_remote_topologies_docker` 使用 P4-T1 的 `mgmt_bundle`（`mkbundle.sh --dev --delegate-sentinel`）
+驗證容器拓樸；P4-T7 未到位時嚴格 xfail 並保留未達成證據。fixture 延遲載入，避免本檔在夾具未就緒時影響整體收集。
 """
 from __future__ import annotations
 
 import os
 import re
+import json
+import signal
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
 
 from bb_harness import (
     cli_prefix,
-    is_rust,
     isolated_env,
     python_baseline_prefix,
     repo_root,
 )
-
-_RED = "P4-T8 紅燈"
-_RUST_ROUND = is_rust()
 
 # ssh stub：-O check 成功；ss 探測回 loopback 監聽列；spawn（含 -N）長駐，與 Python 基線共用行為。
 _SSH_STUB = """#!/bin/bash
@@ -56,7 +52,20 @@ def _norm_pid(text: str) -> str:
     return re.sub(r'"pid":\d+', '"pid":0', text)
 
 
-@pytest.mark.xfail(_RUST_ROUND, strict=True, reason=_RED)
+def _proc_status(pid: int) -> tuple[int, str] | None:
+    """讀取 Linux 的行程建立序號，避免清理時誤碰重用的 PID。"""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    except OSError:
+        return None
+    right_paren = stat.rfind(")")
+    fields = stat[right_paren + 2 :].split()
+    try:
+        return int(fields[19]), fields[0]
+    except (IndexError, ValueError):
+        return None
+
+
 def test_remote_ab_status_close_empty(tmp_path: Path) -> None:
     results: dict[str, tuple[int, str, int, str]] = {}
     for label, prefix in (("python", python_baseline_prefix()), ("cli", cli_prefix())):
@@ -80,7 +89,6 @@ def test_remote_ab_status_close_empty(tmp_path: Path) -> None:
     )
 
 
-@pytest.mark.xfail(_RUST_ROUND, strict=True, reason=_RED)
 def test_remote_ab_open_with_stub_ssh(tmp_path: Path) -> None:
     outcomes: dict[str, tuple[int, str]] = {}
     for label, prefix in (("python", python_baseline_prefix()), ("cli", cli_prefix())):
@@ -109,9 +117,97 @@ def test_remote_ab_open_with_stub_ssh(tmp_path: Path) -> None:
     assert '"status":"active"' in outcomes["cli"][1], outcomes["cli"][1]
 
 
+@pytest.mark.rust_only
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
+def test_remote_sigint_cleans_spawned_tunnel(tmp_path: Path) -> None:
+    work = tmp_path / "sigint"
+    work.mkdir()
+    env = isolated_env(work)
+    bin_dir = work / "stub-bin"
+    bin_dir.mkdir()
+    ssh = bin_dir / "ssh"
+    ssh.write_text(
+        "#!/bin/sh\n"
+        "for arg in \"$@\"; do\n"
+        "  if [ \"$arg\" = \"-O\" ]; then exit 255; fi\n"
+        "  if [ \"$arg\" = \"-N\" ]; then exec sleep 300; fi\n"
+        "done\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    ssh.chmod(0o755)
+    env["PATH"] = f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"
+    command = cli_prefix() + [
+        "--endpoint",
+        "tcp://127.0.0.1:48700",
+        "remote",
+        "-R",
+        "u@relay:48800",
+        "--ready-timeout",
+        "20",
+    ]
+    process = subprocess.Popen(
+        command,
+        cwd=repo_root(),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    tunnel_pid: int | None = None
+    tunnel_start_ticks: int | None = None
+    state_path = Path(env["SERIALWRAP_RUN_DIR"]) / "remote" / "48800.json"
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if state_path.exists():
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                tunnel_pid = int(state["pid"])
+                tunnel_start_ticks = int(state["pid_start_ticks"])
+                if state.get("status") == "spawning":
+                    break
+            if process.poll() is not None:
+                break
+            time.sleep(0.02)
+        assert tunnel_pid is not None and state_path.exists(), "CLI 未建立 isolated spawning state"
+
+        process.send_signal(signal.SIGINT)
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 130, (process.returncode, stdout, stderr)
+        assert not state_path.exists(), "Ctrl+C 後 registry state 必須移除"
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            current = _proc_status(tunnel_pid)
+            if (
+                current is None
+                or current[0] != tunnel_start_ticks
+                or current[1] in {"Z", "X", "x"}
+            ):
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError(f"Ctrl+C 後 ssh tunnel 仍存活：pid={tunnel_pid}")
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        if tunnel_pid is not None and tunnel_start_ticks is not None:
+            current = _proc_status(tunnel_pid)
+            if current is not None and current[0] == tunnel_start_ticks:
+                try:
+                    os.killpg(tunnel_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+
 @pytest.mark.case("bc05-three-topologies")
 @pytest.mark.rust_only
-@pytest.mark.xfail(strict=True, reason=_RED)
+@pytest.mark.xfail(
+    strict=True,
+    reason="P4-T7 未列入本批；daemon status 仍由 P3-T16 run_delegate stub 委派",
+)
 def test_remote_topologies_docker(tmp_path: Path, mgmt_bundle) -> None:
     if shutil.which("docker") is None:
         pytest.skip("cap docker：本機沒有 docker 指令")

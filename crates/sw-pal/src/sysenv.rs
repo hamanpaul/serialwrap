@@ -1,6 +1,9 @@
 //! `SysEnv` 的平台實作放在 `posix`／`windows` 子模組，依目標平台擇一編譯。
-use std::io::{self, Read};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom};
+use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -17,6 +20,11 @@ pub(crate) enum CapturedOutput {
         stderr: Vec<u8>,
     },
     TimedOut,
+}
+
+pub(crate) struct MergedCapturedOutput {
+    pub status: Option<ExitStatus>,
+    pub output: Vec<u8>,
 }
 
 /// 執行子行程並同時排空兩條輸出管線，避免大量輸出填滿 pipe 後造成死鎖。
@@ -67,6 +75,83 @@ pub(crate) fn capture_command(
     }
 }
 
+/// 將兩個標準輸出指向同一個暫存檔，保留子行程寫入順序且不會填滿 pipe。
+pub(crate) fn capture_command_merged(
+    mut command: Command,
+    timeout: Option<Duration>,
+) -> io::Result<MergedCapturedOutput> {
+    let (mut output, _temporary) = create_merged_output_file()?;
+    command
+        .stdout(Stdio::from(output.try_clone()?))
+        .stderr(Stdio::from(output.try_clone()?));
+    let mut child = command.spawn()?;
+    drop(command);
+    let deadline = timeout.and_then(|duration| Instant::now().checked_add(duration));
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        }
+    };
+
+    output.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    output.read_to_end(&mut bytes)?;
+    Ok(MergedCapturedOutput {
+        status,
+        output: bytes,
+    })
+}
+
+static MERGED_OUTPUT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct TemporaryOutput(PathBuf);
+
+impl Drop for TemporaryOutput {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+fn create_merged_output_file() -> io::Result<(File, TemporaryOutput)> {
+    for _ in 0..128 {
+        let sequence = MERGED_OUTPUT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "serialwrap-command-{}-{sequence}.tmp",
+            std::process::id()
+        ));
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(file) => return Ok((file, TemporaryOutput(path))),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "無法建立唯一的合併輸出暫存檔",
+    ))
+}
+
 fn read_pipe(mut pipe: impl Read) -> io::Result<Vec<u8>> {
     let mut output = Vec::new();
     pipe.read_to_end(&mut output)?;
@@ -102,10 +187,7 @@ fn receive_pipe(
             }
         }
         None => receiver.recv().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "子行程輸出讀取執行緒異常結束",
-            )
+            io::Error::new(io::ErrorKind::BrokenPipe, "子行程輸出讀取執行緒異常結束")
         })??,
     };
     Ok(Some(result))

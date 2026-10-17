@@ -6,9 +6,8 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 /// 委派集合（arch §7.4、計畫 §0.3）；`cli_spec` 與 `run` 共用。
-pub const DELEGATED_GROUPS: [&str; 8] = [
+pub const DELEGATED_GROUPS: [&str; 7] = [
     "daemon",
-    "remote",
     "connect",
     "benches",
     "supervision-mode",

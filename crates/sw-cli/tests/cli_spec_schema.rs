@@ -226,6 +226,18 @@ fn cli_spec_matches_schema() {
             .find(|entry| entry.name == name)
             .unwrap_or_else(|| panic!("群組 {name} 未在 sub.entries 中找到"));
 
+        if name == "remote" {
+            assert!(
+                matches!(entry.target, SubTarget::Native(_)),
+                "P4-T8 的 remote 群組必須原生解析"
+            );
+            assert!(
+                !sw_cli::delegate::DELEGATED_GROUPS.contains(&name),
+                "P4-T8 的 remote 群組不得留在 DELEGATED_GROUPS"
+            );
+            continue;
+        }
+
         if stage == "delegate-1a" {
             // P4-T1（計畫 Task 1 步驟 4）：委派群組的宣告式 parser 已原生，help／usage 可離線比對；
             // 執行期路由仍由 DELEGATED_GROUPS（classify）決定，群組於各 P4 Task 完成時自委派集合移除。

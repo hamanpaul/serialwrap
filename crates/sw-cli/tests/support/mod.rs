@@ -18,8 +18,8 @@ use std::sync::Arc;
 
 use sw_pal::fakes::fs::FaultFs;
 use sw_pal::fakes::{
-    platform, posix_caps, real_fs, windows_caps, FakeClock, FakeProcScan, FakeProcessCtl, FakeRegistry,
-    FakeRpcConnector, FakeServiceCtl, FakeSysEnv, FakeSysEnvBuilder, FakeTunnel,
+    platform, posix_caps, real_fs, windows_caps, FakeClock, FakeProcScan, FakeProcessCtl,
+    FakeRegistry, FakeRpcConnector, FakeServiceCtl, FakeSysEnv, FakeSysEnvBuilder, FakeTunnel,
 };
 use sw_pal::fs_ops::FsOps;
 use sw_pal::proc_scan::{DaemonProc, ProcIdentity};
@@ -130,20 +130,48 @@ impl TestEnv {
     fn default_vars(&self) -> Vec<(String, String)> {
         let mut vars = vec![
             ("HOME".to_string(), self.home().display().to_string()),
-            ("SERIALWRAP_CONFIG_DIR".to_string(), self.config_dir().display().to_string()),
-            ("SERIALWRAP_STATE_DIR".to_string(), self.state_dir().display().to_string()),
-            ("SERIALWRAP_RUN_DIR".to_string(), self.run_dir().display().to_string()),
-            ("SERIALWRAP_PROFILE_DIR".to_string(), self.config_dir().join("profiles").display().to_string()),
-            ("SERIALWRAP_BY_ID_DIR".to_string(), self.by_id_dir().display().to_string()),
-            ("SERIALWRAP_BY_PATH_DIR".to_string(), self.by_path_dir().display().to_string()),
-            ("SERIALWRAP_INSTALL_ROOT".to_string(), self.install_root().display().to_string()),
-            ("SERIALWRAP_LOG_DIR".to_string(), self.log_dir().display().to_string()),
+            (
+                "SERIALWRAP_CONFIG_DIR".to_string(),
+                self.config_dir().display().to_string(),
+            ),
+            (
+                "SERIALWRAP_STATE_DIR".to_string(),
+                self.state_dir().display().to_string(),
+            ),
+            (
+                "SERIALWRAP_RUN_DIR".to_string(),
+                self.run_dir().display().to_string(),
+            ),
+            (
+                "SERIALWRAP_PROFILE_DIR".to_string(),
+                self.config_dir().join("profiles").display().to_string(),
+            ),
+            (
+                "SERIALWRAP_BY_ID_DIR".to_string(),
+                self.by_id_dir().display().to_string(),
+            ),
+            (
+                "SERIALWRAP_BY_PATH_DIR".to_string(),
+                self.by_path_dir().display().to_string(),
+            ),
+            (
+                "SERIALWRAP_INSTALL_ROOT".to_string(),
+                self.install_root().display().to_string(),
+            ),
+            (
+                "SERIALWRAP_LOG_DIR".to_string(),
+                self.log_dir().display().to_string(),
+            ),
         ];
         if self.windows {
             vars.push(("USERPROFILE".to_string(), self.home().display().to_string()));
             vars.push((
                 "LOCALAPPDATA".to_string(),
-                self.home().join("AppData").join("Local").display().to_string(),
+                self.home()
+                    .join("AppData")
+                    .join("Local")
+                    .display()
+                    .to_string(),
             ));
         }
         vars
@@ -173,7 +201,10 @@ impl TestEnv {
     /// 本 TestEnv 的預設 POSIX socket（`<run_dir>/serialwrapd.sock`，與 CLI 由 `SERIALWRAP_RUN_DIR` 推導的預設相同）。
     /// 以 `with_rpc_ok(&t.default_socket(), …)` 註冊即可讓不帶 `--socket` 的 CLI 呼叫落在替身上。
     pub fn default_socket(&self) -> String {
-        self.run_dir().join("serialwrapd.sock").display().to_string()
+        self.run_dir()
+            .join("serialwrapd.sock")
+            .display()
+            .to_string()
     }
 
     pub fn win_endpoint() -> &'static str {
@@ -211,7 +242,8 @@ impl TestEnv {
 
     /// `doctor` 非 advisory 檢查全部通過的最小環境（P4-T9 承接細節；T1 只設定 systemd 與 dialout 群組）。
     pub fn all_required_ok(self) -> Self {
-        self.with_systemd(true).push_env_op(Box::new(|b| b.in_group("dialout")))
+        self.with_systemd(true)
+            .push_env_op(Box::new(|b| b.in_group("dialout")))
     }
 
     pub fn with_procs(mut self, procs: Vec<DaemonProc>) -> Self {
@@ -232,7 +264,10 @@ impl TestEnv {
     /// 寫 bundle 的 Task 17 形狀 manifest（`components.daemon.launcher`）與 `bin/serialwrapd`；`current_exe` 不變。
     pub fn with_manifest_launcher(self) -> Self {
         self.write_bundle_manifest_with(&[("launcher", r#"{"path":"bin/serialwrapd"}"#)]);
-        self.write_file(&self.bundle_dir().join("bin").join("serialwrapd"), b"launcher");
+        self.write_file(
+            &self.bundle_dir().join("bin").join("serialwrapd"),
+            b"launcher",
+        );
         self
     }
 
@@ -241,7 +276,10 @@ impl TestEnv {
     pub fn with_manifest_runtime_ok(self, pyver: &str) -> Self {
         let body = format!(r#"{{"path":"py/bin/python3","python_version":"{pyver}"}}"#);
         self.write_bundle_manifest_with(&[("runtime", body.as_str())]);
-        self.write_file(&self.bundle_dir().join("py").join("bin").join("python3"), b"runtime");
+        self.write_file(
+            &self.bundle_dir().join("py").join("bin").join("python3"),
+            b"runtime",
+        );
         self
     }
 
@@ -276,7 +314,8 @@ impl TestEnv {
     }
 
     pub fn with_rpc_fail_after_send(self, ep: &str, method: &str) -> Self {
-        self.rpc.fail_after_send(&self.isolated_endpoint(ep), method);
+        self.rpc
+            .fail_after_send(&self.isolated_endpoint(ep), method);
         self
     }
 
@@ -300,7 +339,8 @@ impl TestEnv {
         self.rpc.respond(&ep, "session.list", OK_SESSION_LIST);
         self.rpc.refuse_from_connect(&ep, n);
         self.procs = FakeProcScan::new(vec![daemon_proc(pid)]);
-        self.procs.alive_until_connect(pid, Arc::clone(&self.rpc), &ep, n);
+        self.procs
+            .alive_until_connect(pid, Arc::clone(&self.rpc), &ep, n);
         self
     }
 
@@ -317,15 +357,18 @@ impl TestEnv {
         let ep = self.isolated_endpoint(ep);
         self.rpc.respond(&ep, "health.ping", OK_PING);
         self.rpc.respond(&ep, "session.list", OK_SESSION_LIST);
-        self.rpc.respond(&ep, "mcu.status", r#"{"ok":true,"flashing":false}"#);
+        self.rpc
+            .respond(&ep, "mcu.status", r#"{"ok":true,"flashing":false}"#);
         let token = &sha256_hex(&format!("handoff-{pid}"))[..32];
         let grant = format!(r#"{{"ok":true,"stopping":true,"handoff_token":"{token}"}}"#);
         self.rpc.respond(&ep, "daemon.handoff_stop", &grant);
-        self.rpc.respond(&ep, "daemon.stop", r#"{"ok":true,"stopping":true}"#);
+        self.rpc
+            .respond(&ep, "daemon.stop", r#"{"ok":true,"stopping":true}"#);
         self.rpc.stop_after_send(&ep, "daemon.handoff_stop");
         self.rpc.stop_after_send(&ep, "daemon.stop");
         self.procs = FakeProcScan::new(vec![daemon_proc(pid)]);
-        self.procs.alive_until_stopped(pid, Arc::clone(&self.rpc), &ep);
+        self.procs
+            .alive_until_stopped(pid, Arc::clone(&self.rpc), &ep);
         self
     }
 
@@ -335,7 +378,11 @@ impl TestEnv {
         let counter = self.ensure_process().spawn_counter();
         self.rpc.gate_on_spawn(&ep, counter);
         self.rpc.respond(&ep, "health.ping", OK_PING);
-        self.rpc.respond(&ep, "health.status", &format!(r#"{{"ok":true,"version":"{v}"}}"#));
+        self.rpc.respond(
+            &ep,
+            "health.status",
+            &format!(r#"{{"ok":true,"version":"{v}"}}"#),
+        );
         self
     }
 
@@ -362,8 +409,11 @@ impl TestEnv {
         }
         let dir = self.run_dir().join("remote");
         std::fs::create_dir_all(&dir).expect("remote 目錄建立失敗");
-        std::fs::write(dir.join(format!("{port}.json")), dumps_dict(&state, &DISK_STABLE))
-            .expect("remote registry 寫入失敗");
+        std::fs::write(
+            dir.join(format!("{port}.json")),
+            dumps_dict(&state, &DISK_STABLE),
+        )
+        .expect("remote registry 寫入失敗");
         self
     }
 
@@ -377,10 +427,14 @@ impl TestEnv {
         self
     }
 
-    /// `FakeTunnel` 支援 ControlMaster，且 spawn 之後的行程存活（remote 開通路徑）。
+    /// 配置 remote 開通替身與可用的 ssh／autossh；依平台設定 ControlMaster 能力。
     pub fn with_tunnel_ready(mut self) -> Self {
-        self.tunnel = Some(FakeTunnel::new(true));
-        self
+        let supports_control_master = !self.windows;
+        self.tunnel = Some(FakeTunnel::new(supports_control_master));
+        self.push_env_op(Box::new(|b| {
+            b.which("ssh", "/usr/bin/ssh")
+                .which("autossh", "/usr/bin/autossh")
+        }))
     }
 
     /// 轉給 `FakeSysEnvBuilder::command`：腳本化 runner 對 `argv` 的回應（P4-T8 使用）。
@@ -390,6 +444,26 @@ impl TestEnv {
         self.push_env_op(Box::new(move |b| {
             let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
             b.command(&refs, rc, &out, &err)
+        }))
+    }
+
+    /// 以混合順序腳本化 stdout／stderr，對齊 Python `stderr=STDOUT` runner。
+    pub fn with_command_merged(self, argv: &[&str], rc: i32, output: &str) -> Self {
+        let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        let output = output.as_bytes().to_vec();
+        self.push_env_op(Box::new(move |b| {
+            let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            b.command_merged(&refs, rc, &output)
+        }))
+    }
+
+    /// 指定 argv 的 runner 回傳 PAL 例外（例如探測時 ssh 可執行檔消失）。
+    pub fn with_command_err(self, argv: &[&str], kind: PalErrorKind, message: &str) -> Self {
+        let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        let message = message.to_string();
+        self.push_env_op(Box::new(move |b| {
+            let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            b.command_err(&refs, kind, &message)
         }))
     }
 
@@ -432,17 +506,27 @@ impl TestEnv {
     /// `versions/<v>/bin/serialwrap` 安裝版本目錄（不改 current）。
     pub fn with_installed(self, v: &str) -> Self {
         let body = format!("installed-{v}");
-        make_version_dir(&self.install_root(), v, &[("bin/serialwrap", body.as_bytes())]);
+        make_version_dir(
+            &self.install_root(),
+            v,
+            &[("bin/serialwrap", body.as_bytes())],
+        );
         self
     }
 
     /// bundle 根的 `bin/serialwrap` 與 `release-manifest.json`（manifest 形狀同 `mkbundle.sh`，sha256 為真值）。
     pub fn with_bundle(self, v: &str) -> Self {
         let cli = format!("bundle-{v}");
-        self.write_file(&self.bundle_dir().join("bin").join("serialwrap"), cli.as_bytes());
+        self.write_file(
+            &self.bundle_dir().join("bin").join("serialwrap"),
+            cli.as_bytes(),
+        );
         let cli_sha = sha256_hex(&cli);
         let manifest = manifest_fixture(v, &cli_sha);
-        self.write_file(&self.bundle_dir().join("release-manifest.json"), manifest.as_bytes());
+        self.write_file(
+            &self.bundle_dir().join("release-manifest.json"),
+            manifest.as_bytes(),
+        );
         self
     }
 
@@ -467,7 +551,12 @@ impl TestEnv {
     }
 
     /// 有狀態監管模型：寫 config `supervision_mode` 並設定 `FakeServiceCtl` 的 enabled／running（`query_now` 可讀）。
-    pub fn with_supervisor_state(mut self, mode: SupervisionMode, enabled: bool, running: bool) -> Self {
+    pub fn with_supervisor_state(
+        mut self,
+        mode: SupervisionMode,
+        enabled: bool,
+        running: bool,
+    ) -> Self {
         let name = match &mode {
             SupervisionMode::OnDemand => "on-demand".to_string(),
             SupervisionMode::SystemdUser => "systemd-user".to_string(),
@@ -566,7 +655,8 @@ impl TestEnv {
 
     /// `install-journal.json` 解析結果（不存在或無法解析 → None）。
     pub fn journal_json(&self) -> Option<PyValue> {
-        let text = std::fs::read_to_string(self.install_root().join("install-journal.json")).ok()?;
+        let text =
+            std::fs::read_to_string(self.install_root().join("install-journal.json")).ok()?;
         loads(&text).ok()
     }
 
@@ -629,11 +719,18 @@ impl TestEnv {
             r#"{{"schema_version":1,"bundle_version":"test","stage":"rust-1b-test","target":"x86_64-unknown-linux-gnu","git_revision":"test","components":{{"cli":{{"implementation":"rust","version":"test","path":"bin/serialwrap","sha256":"{}"}},"python_cli_delegate":{{"entry":["py/bin/python3","-I","delegate_sentinel.py"]}},"daemon":{{{daemon}}}}}}}"#,
             "0".repeat(64)
         );
-        self.write_file(&self.bundle_dir().join("release-manifest.json"), manifest.as_bytes());
+        self.write_file(
+            &self.bundle_dir().join("release-manifest.json"),
+            manifest.as_bytes(),
+        );
     }
 
     fn platform(&self) -> sw_pal::Platform {
-        let caps = if self.windows { windows_caps() } else { posix_caps() };
+        let caps = if self.windows {
+            windows_caps()
+        } else {
+            posix_caps()
+        };
         let mut b = platform()
             .env(self.env.clone())
             .fs(self.fs.clone())
@@ -799,7 +896,12 @@ impl EventOrder {
             .filter(|(_, e)| e.as_str() == s)
             .nth(n)
             .map(|(i, _)| i)
-            .unwrap_or_else(|| panic!("event not found: {s} (occurrence {n}); events={:?}", self.events))
+            .unwrap_or_else(|| {
+                panic!(
+                    "event not found: {s} (occurrence {n}); events={:?}",
+                    self.events
+                )
+            })
     }
 
     /// 以 `prefix` 開頭的事件數。
@@ -859,13 +961,19 @@ pub fn list(items: Vec<PyValue>) -> PyValue {
 
 /// argv 字串陣列 → `PyValue::List<Str>`（斷言輔助）。
 pub fn argv_list(argv: &[&str]) -> PyValue {
-    PyValue::List(argv.iter().map(|a| PyValue::Str((*a).to_string())).collect())
+    PyValue::List(
+        argv.iter()
+            .map(|a| PyValue::Str((*a).to_string()))
+            .collect(),
+    )
 }
 
 /// UTF-16LE 位元組（可含 BOM）→ 去 BOM 後的 code unit 序列（斷言輔助；schtasks／XML 寫出格式檢查用）。
 pub fn utf16le_body(bytes: &[u8]) -> Vec<u16> {
     let body = bytes.strip_prefix(&[0xFF, 0xFE]).unwrap_or(bytes);
-    body.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
+    body.chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect()
 }
 
 /// 解析 JSON 物件文字（斷言輔助）；非法即 panic。

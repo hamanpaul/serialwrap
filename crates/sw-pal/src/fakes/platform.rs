@@ -11,15 +11,15 @@ use std::time::Duration;
 
 use crate::device_source::windows_model::RegistryView;
 use crate::fs_ops::{FileLockGuard, FsOps, LinkKind};
-use crate::process_tunnel::{ProcessTunnel, TunnelProc};
 use crate::proc_scan::{DaemonProc, HolderScanStatus, ProcIdentity, ProcScan, ScanFailure};
+use crate::process_tunnel::{ProcessTunnel, TunnelProc};
 use crate::service_ctl::{
     AutostartHoldRecord, CmdRecord, HoldState, ServiceAction, ServiceCtl, ServiceResult,
     SupervisionMode, SupervisorDefinition, TaskQuery,
 };
 use crate::traits::{
-    CmdOutput, CmdOutputRaw, ChildHandle, Clock, EndpointSpec, PalError, PalResult, ProcessCtl, RpcConnector,
-    RpcStream, SockTimeout, SysEnv,
+    ChildHandle, Clock, CmdOutput, CmdOutputRaw, EndpointSpec, InterruptScope, PalError, PalResult,
+    ProcessCtl, RpcConnector, RpcStream, SockTimeout, SysEnv,
 };
 use crate::{BackendKind, Capabilities, ConsoleKind, PalPathFlavor, Platform, SkillPlatform};
 
@@ -127,13 +127,25 @@ impl FakePlatformBuilder {
         Platform {
             env: self.env.unwrap_or_else(|| Arc::new(Unconfigured("env"))),
             fs: self.fs.unwrap_or_else(|| Arc::new(Unconfigured("fs"))),
-            clock: self.clock.unwrap_or_else(|| Arc::new(Unconfigured("clock"))),
+            clock: self
+                .clock
+                .unwrap_or_else(|| Arc::new(Unconfigured("clock"))),
             rpc: self.rpc.unwrap_or_else(|| Arc::new(Unconfigured("rpc"))),
-            process: self.process.unwrap_or_else(|| Arc::new(Unconfigured("process"))),
-            procs: self.procs.unwrap_or_else(|| Arc::new(Unconfigured("procs"))),
-            tunnel: self.tunnel.unwrap_or_else(|| Arc::new(Unconfigured("tunnel"))),
-            service: self.service.unwrap_or_else(|| Arc::new(Unconfigured("service"))),
-            registry: self.registry.unwrap_or_else(|| Arc::new(Unconfigured("registry"))),
+            process: self
+                .process
+                .unwrap_or_else(|| Arc::new(Unconfigured("process"))),
+            procs: self
+                .procs
+                .unwrap_or_else(|| Arc::new(Unconfigured("procs"))),
+            tunnel: self
+                .tunnel
+                .unwrap_or_else(|| Arc::new(Unconfigured("tunnel"))),
+            service: self
+                .service
+                .unwrap_or_else(|| Arc::new(Unconfigured("service"))),
+            registry: self
+                .registry
+                .unwrap_or_else(|| Arc::new(Unconfigured("registry"))),
             caps: self.caps,
         }
     }
@@ -181,6 +193,12 @@ impl SysEnv for Unconfigured {
         not_configured(self.0)
     }
     fn run(&self, _argv: &[String], _timeout: Option<Duration>) -> PalResult<CmdOutput> {
+        not_configured(self.0)
+    }
+    fn run_merged(&self, _argv: &[String], _timeout: Option<Duration>) -> PalResult<CmdOutput> {
+        not_configured(self.0)
+    }
+    fn interrupt_scope(&self) -> PalResult<Box<dyn InterruptScope>> {
         not_configured(self.0)
     }
     fn run_raw(
@@ -352,7 +370,12 @@ impl ServiceCtl for Unconfigured {
     fn supported_modes(&self) -> Vec<SupervisionMode> {
         not_configured(self.0)
     }
-    fn action(&self, _mode: &SupervisionMode, _action: ServiceAction, _with_sudo: bool) -> ServiceResult {
+    fn action(
+        &self,
+        _mode: &SupervisionMode,
+        _action: ServiceAction,
+        _with_sudo: bool,
+    ) -> ServiceResult {
         not_configured(self.0)
     }
     fn action_named(
@@ -373,10 +396,20 @@ impl ServiceCtl for Unconfigured {
     fn uninstall(&self, _mode: &SupervisionMode, _with_sudo: bool) -> Vec<CmdRecord> {
         not_configured(self.0)
     }
-    fn uninstall_named(&self, _mode: &SupervisionMode, _name: &str, _with_sudo: bool) -> Vec<CmdRecord> {
+    fn uninstall_named(
+        &self,
+        _mode: &SupervisionMode,
+        _name: &str,
+        _with_sudo: bool,
+    ) -> Vec<CmdRecord> {
         not_configured(self.0)
     }
-    fn set_enabled(&self, _mode: &SupervisionMode, _enabled: bool, _with_sudo: bool) -> Vec<CmdRecord> {
+    fn set_enabled(
+        &self,
+        _mode: &SupervisionMode,
+        _enabled: bool,
+        _with_sudo: bool,
+    ) -> Vec<CmdRecord> {
         not_configured(self.0)
     }
     fn query(&self, _mode: &SupervisionMode) -> TaskQuery {
@@ -427,4 +460,3 @@ impl RegistryView for Unconfigured {
         not_configured(self.0)
     }
 }
-

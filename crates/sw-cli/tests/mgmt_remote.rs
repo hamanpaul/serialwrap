@@ -6,8 +6,10 @@
 //! 規格來源：`docs/rust-refactor/plans/05-stage1b-rust-cli-mgmt.md` Task 8；盤點 `inventory/07-platform-mgmt.md` §8。
 mod support;
 
-use sw_cli::remote_tunnel::*;
 use support::*;
+use sw_cli::remote_tunnel::*;
+use sw_pal::PalErrorKind;
+use sw_proto::pyjson::{PyInt, PyValue};
 
 /// 測試用 expose 規格：`ssh_opts` 含 `-p2222`，與 plan 的位元組級 argv 斷言一致。
 fn spec(role: Role) -> TunnelSpec {
@@ -55,14 +57,14 @@ const WIN_SS_PROBE: [&str; 8] = [
     "sport = :48800",
 ];
 
-/// `-R u@relay:48800` 在預設 POSIX endpoint 下的 identity（forward_src 為隔離的預設 socket）。
-fn expose_identity() -> String {
+/// `-R u@relay:48800` 在指定 POSIX endpoint 下的 identity。
+fn expose_identity(forward_src: &str) -> String {
     compute_identity(&TunnelSpec {
         role: Role::Expose,
         ssh_target: "u@relay".into(),
         port: 48800,
         local: None,
-        forward_src: Some("/run/sw.sock".into()),
+        forward_src: Some(forward_src.to_string()),
         remote_socket: None,
         via: Via::Ssh,
         ssh_opts: vec![],
@@ -189,6 +191,15 @@ fn parse_target_errors() {
     let e = parse_target("h:0").unwrap_err();
     assert_eq!(e.code, "INVALID_TARGET");
     assert_eq!(e.message.as_deref(), Some("port 超出範圍：0"));
+
+    let e = parse_target("h:999999999999999999999").unwrap_err();
+    assert_eq!(e.code, "INVALID_TARGET");
+    assert_eq!(
+        e.message.as_deref(),
+        Some("port 超出範圍：999999999999999999999")
+    );
+
+    assert_eq!(parse_target("h:22\n").unwrap(), ("h".to_string(), 22));
 }
 
 #[test]
@@ -224,7 +235,10 @@ fn bind_loopback_only_cases() {
         "LISTEN 0 128 0.0.0.0:48800 0.0.0.0:*",
         48800
     ));
-    assert!(bind_is_loopback_only("LISTEN 0 128 [::1]:48800 [::]:*", 48800));
+    assert!(bind_is_loopback_only(
+        "LISTEN 0 128 [::1]:48800 [::]:*",
+        48800
+    ));
     assert!(!bind_is_loopback_only(
         "LISTEN 0 128 127.0.0.1:22 0.0.0.0:*",
         48800
@@ -234,14 +248,15 @@ fn bind_loopback_only_cases() {
 #[test]
 fn registry_write_disk_stable() {
     let t = TestEnv::posix();
-    let st = alive_state_with_identity("expose", 999, "abc");
+    let mut st = alive_state_with_identity("expose", 999, "abc");
+    st.insert("listen_port", PyValue::Int(PyInt::Small(48800)));
     Registry::new(&t.run_dir())
         .write(&st, 999)
         .expect("registry 寫入");
 
     // 檔名為 <port>.json，內容為 DISK_STABLE（sort_keys、緊湊、無尾端換行）。
-    let bytes = std::fs::read(t.run_dir().join("remote").join("48800.json"))
-        .expect("檔名應為 <port>.json");
+    let bytes =
+        std::fs::read(t.run_dir().join("remote").join("48800.json")).expect("檔名應為 <port>.json");
     assert!(!bytes.ends_with(b"\n"));
     let doc = String::from_utf8(bytes).expect("UTF-8");
     assert!(!doc.contains(": ") && !doc.contains(", "), "{doc}");
@@ -255,10 +270,9 @@ fn registry_write_disk_stable() {
 
 #[test]
 fn open_already_running_same_identity() {
-    let t = TestEnv::posix().with_registry_state(
-        48800,
-        alive_state_with_identity("expose", 999, &expose_identity()),
-    );
+    let base = TestEnv::posix().with_tunnel_ready();
+    let identity = expose_identity(&base.default_socket());
+    let t = base.with_registry_state(48800, alive_state_with_identity("expose", 999, &identity));
     t.tunnel().set_alive(999, true);
 
     let (rc, out, _) = t.run(&["remote", "-R", "u@relay:48800"]);
@@ -270,7 +284,7 @@ fn open_already_running_same_identity() {
 
 #[test]
 fn open_conflict_different_identity() {
-    let t = TestEnv::posix().with_registry_state(
+    let t = TestEnv::posix().with_tunnel_ready().with_registry_state(
         48800,
         alive_state_with_identity("expose", 999, "not-this-identity"),
     );
@@ -305,9 +319,23 @@ fn open_spawn_failed_reports_tail() {
 }
 
 #[test]
+fn open_spawn_failed_empty_tail_uses_error_code_as_message() {
+    let t = TestEnv::posix().with_tunnel_ready();
+    t.tunnel().die_on_spawn();
+    t.tunnel().set_tail("");
+
+    let (rc, out, _) = t.run(&["remote", "-R", "u@relay:48800"]);
+    assert_eq!(rc, 1);
+    assert_eq!(
+        out,
+        "{\"error_code\":\"TUNNEL_SPAWN_FAILED\",\"message\":\"TUNNEL_SPAWN_FAILED\",\"ok\":false}\n"
+    );
+}
+
+#[test]
 fn open_role_probe_unverified_no_retry() {
     // POSIX（PLT-O-10 KEEP）：ss 探測回空輸出即第一次失敗就 REMOTE_BIND_UNVERIFIED，不重試。
-    let t = TestEnv::posix();
+    let t = TestEnv::posix().with_tunnel_ready();
 
     let (rc, out, _) = t.run(&["remote", "-R", "u@relay:48800"]);
     assert_eq!(rc, 1);
@@ -321,12 +349,72 @@ fn open_role_probe_unverified_no_retry() {
         .filter(|call| call.iter().any(|a| a == "ss"))
         .count();
     assert_eq!(ss_calls, 1, "ss 探測只能呼叫一次");
-    assert_eq!(t.tunnel().terminated().len(), 1, "探測失敗須 terminate 隧道");
+    assert_eq!(
+        t.tunnel().terminated().len(),
+        1,
+        "探測失敗須 terminate 隧道"
+    );
+}
+
+#[test]
+fn open_role_probe_preserves_merged_stdout_stderr_order() {
+    let t = TestEnv::posix().with_tunnel_ready();
+    let cp = t
+        .run_dir()
+        .join("remote")
+        .join("cm-48800")
+        .display()
+        .to_string();
+    let argv = [
+        "ssh".to_string(),
+        "-o".to_string(),
+        format!("ControlPath={cp}"),
+        "u@relay".to_string(),
+        "ss".to_string(),
+        "-ltnH".to_string(),
+        "sport = :48800".to_string(),
+    ];
+    let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let t = t.with_command_merged(
+        &refs,
+        0,
+        "Warning: relay first\nLISTEN 0 128 0.0.0.0:48800 0.0.0.0:*\n",
+    );
+    let (rc, out, _) = t.run(&["remote", "-R", "u@relay:48800"]);
+    assert_eq!(rc, 1);
+    assert!(
+        out.contains("Warning: relay first\\nLISTEN 0 128 0.0.0.0:48800"),
+        "合併輸出必須保留寫入順序：{out}"
+    );
+}
+
+#[test]
+fn open_role_probe_runner_error_fails_and_cleans_up() {
+    let t = TestEnv::windows().with_tunnel_ready().with_command_err(
+        &WIN_SS_PROBE,
+        PalErrorKind::NotFound,
+        "[Errno 2] No such file or directory: 'ssh'",
+    );
+    let (rc, out, _) = t.run(&[
+        "remote",
+        "-R",
+        "u@relay:48800",
+        "--ssh-opt=-p2222",
+        "--ready-timeout",
+        "1",
+    ]);
+    assert_eq!(rc, 1, "runner 例外須 fail-closed：{out}");
+    assert!(out.contains("\"error_code\":\"INTERNAL_ERROR\""), "{out}");
+    assert_eq!(t.tunnel().terminated(), vec![4000]);
+    assert!(
+        !t.run_dir().join("remote").join("48800.json").exists(),
+        "清理成功後 registry 必須移除"
+    );
 }
 
 #[test]
 fn open_starting_when_deadline_exceeded() {
-    let t = TestEnv::posix();
+    let t = TestEnv::posix().with_tunnel_ready();
     let cp = t
         .run_dir()
         .join("remote")
@@ -335,20 +423,16 @@ fn open_starting_when_deadline_exceeded() {
         .to_string();
     let control_path = format!("ControlPath={cp}");
     // POSIX ssh_check：`ssh -O check` 一直失敗。
-    let check = [
-        "ssh",
-        "-O",
-        "check",
-        "-o",
-        control_path.as_str(),
-        "u@relay",
-    ];
+    let check = ["ssh", "-O", "check", "-o", control_path.as_str(), "u@relay"];
     let t = t.with_command(&check, 255, "", "");
 
     let (rc, out, _) = t.run(&["remote", "-R", "u@relay:48800", "--ready-timeout", "1"]);
     assert_eq!(rc, 0, "逾時仍為 starting，exit 0：{out}");
     assert!(out.contains("\"status\":\"starting\""), "{out}");
-    assert!(t.tunnel().terminated().is_empty(), "starting 不得 terminate");
+    assert!(
+        t.tunnel().terminated().is_empty(),
+        "starting 不得 terminate"
+    );
 }
 
 #[test]
@@ -359,6 +443,29 @@ fn open_local_on_expose_invalid_args() {
     assert_eq!(
         out,
         "{\"error_code\":\"INVALID_ARGS\",\"message\":\"--local 僅用於 -L（connect）\",\"ok\":false}\n"
+    );
+}
+
+#[test]
+fn open_local_validation_matches_python_order_and_big_integer() {
+    let t = TestEnv::posix();
+    for value in ["0", "70000"] {
+        let (rc, out, _) = t.run(&["remote", "-R", "--local", value, "h:1"]);
+        assert_eq!(rc, 1);
+        assert_eq!(
+            out,
+            "{\"error_code\":\"INVALID_ARGS\",\"message\":\"--local 僅用於 -L（connect）\",\"ok\":false}\n"
+        );
+    }
+
+    let huge = "12345678901234567890123456789012345678901234567890";
+    let (rc, out, _) = t.run(&["remote", "-L", "--local", huge, "h:1"]);
+    assert_eq!(rc, 1);
+    assert_eq!(
+        out,
+        format!(
+            "{{\"error_code\":\"INVALID_ARGS\",\"message\":\"--local 超出範圍：{huge}\",\"ok\":false}}\n"
+        )
     );
 }
 
@@ -472,7 +579,7 @@ fn registry_reads_python_written_pgid_null() {
 
 #[test]
 fn windows_role_probe_tcp_uses_new_connection() {
-    let t = TestEnv::windows();
+    let t = TestEnv::windows().with_tunnel_ready();
     let (rc, out, _) = t.run(&[
         "remote",
         "-R",
@@ -497,7 +604,7 @@ fn windows_role_probe_tcp_uses_new_connection() {
 
 #[test]
 fn windows_connect_ready_via_ping() {
-    let t = TestEnv::windows().with_rpc_ok(
+    let t = TestEnv::windows().with_tunnel_ready().with_rpc_ok(
         "tcp://127.0.0.1:48800",
         "health.ping",
         "{\"ok\":true}",
@@ -509,7 +616,7 @@ fn windows_connect_ready_via_ping() {
 
 #[test]
 fn windows_state_matches_p1_schema() {
-    let t = TestEnv::windows().with_rpc_ok(
+    let t = TestEnv::windows().with_tunnel_ready().with_rpc_ok(
         "tcp://127.0.0.1:48800",
         "health.ping",
         "{\"ok\":true}",
@@ -536,7 +643,7 @@ fn windows_state_matches_p1_schema() {
 #[test]
 fn windows_expose_probe_before_forward_ready_retries() {
     // 前 3 次 ss 回空（forward 尚未建立），第 4 次回 loopback 監聽列 → active；共 4 次，且不 terminate。
-    let t = TestEnv::windows().with_command_seq(
+    let t = TestEnv::windows().with_tunnel_ready().with_command_seq(
         &WIN_SS_PROBE,
         &[
             (0, "", ""),
@@ -554,7 +661,9 @@ fn windows_expose_probe_before_forward_ready_retries() {
 
 #[test]
 fn windows_expose_probe_rc_nonzero_is_not_ready() {
-    let t = TestEnv::windows().with_command(&WIN_SS_PROBE, 255, "", "");
+    let t = TestEnv::windows()
+        .with_tunnel_ready()
+        .with_command(&WIN_SS_PROBE, 255, "", "");
     let (rc, out, _) = t.run(&[
         "remote",
         "-R",
@@ -571,7 +680,7 @@ fn windows_expose_probe_rc_nonzero_is_not_ready() {
 #[test]
 fn windows_expose_wildcard_bind_fails_closed() {
     // ss 列出的 bind 為 wildcard（0.0.0.0）→ fail-closed：REMOTE_BIND_UNVERIFIED 並 terminate。
-    let t = TestEnv::windows().with_command_seq(
+    let t = TestEnv::windows().with_tunnel_ready().with_command_seq(
         &WIN_SS_PROBE,
         &[(0, "LISTEN 0 128 0.0.0.0:48800 0.0.0.0:*", "")],
     );
@@ -585,6 +694,60 @@ fn windows_expose_wildcard_bind_fails_closed() {
     assert_eq!(t.tunnel().terminated().len(), 1);
 }
 
+#[test]
+fn windows_wildcard_probe_retains_error_state_when_terminate_fails() {
+    let t = TestEnv::windows().with_tunnel_ready().with_command_seq(
+        &WIN_SS_PROBE,
+        &[(0, "LISTEN 0 128 0.0.0.0:48800 0.0.0.0:*", "")],
+    );
+    t.tunnel().terminate_fails(4000);
+    let (rc, out, _) = t.run(&["remote", "-R", "u@relay:48800", "--ssh-opt=-p2222"]);
+    assert_eq!(rc, 1, "清理失敗須回報：{out}");
+    assert!(out.contains("\"error_code\":\"INTERNAL_ERROR\""), "{out}");
+    let path = t.run_dir().join("remote").join("48800.json");
+    let state = std::fs::read_to_string(path).expect("終止失敗時保留 registry");
+    assert!(state.contains("\"status\":\"error\""), "{state}");
+    assert!(state.contains("\"pid\":4000"), "{state}");
+    assert!(state.contains("\"identity\":"), "{state}");
+}
+
+#[test]
+fn remote_ssh_resolution_precedes_endpoint_and_registry() {
+    let t = TestEnv::posix();
+    let (rc, out, _) = t.run(&[
+        "--endpoint",
+        "http://invalid",
+        "remote",
+        "-R",
+        "u@relay:48800",
+    ]);
+    assert_eq!(rc, 1);
+    assert!(out.contains("\"error_code\":\"SSH_NOT_FOUND\""), "{out}");
+    assert!(
+        !t.run_dir().join("remote").exists(),
+        "ssh 缺失檢查不得建立 registry 副作用"
+    );
+
+    let base = TestEnv::posix()
+        .with_registry_state(48800, alive_state_with_identity("expose", 999, "existing"));
+    base.tunnel().set_alive(999, true);
+    let (rc, out, _) = base.run(&["remote", "-R", "u@relay:48800"]);
+    assert_eq!(rc, 1);
+    assert!(out.contains("\"error_code\":\"SSH_NOT_FOUND\""), "{out}");
+    assert!(
+        base.run_dir().join("remote").join("48800.json").exists(),
+        "ssh 缺失不得刪除或改寫既有 state"
+    );
+    assert!(
+        !base
+            .run_dir()
+            .join("remote")
+            .join(".registry.lock")
+            .exists(),
+        "ssh 缺失檢查必須先於 registry lock"
+    );
+}
+
 // ---- 別名與 CLI 分派（SC-21）----
 
 #[test]
@@ -592,6 +755,9 @@ fn remote_stop_is_alias_of_close() {
     let t = TestEnv::posix().with_registry_state(48800, alive_state("expose", 999));
     t.tunnel().set_alive(999, true);
     let (rc, out, _) = t.run(&["remote", "stop", "48800"]);
-    assert_eq!((rc, out.as_str()), (0, "{\"closed\":[48800],\"ok\":true}\n"));
+    assert_eq!(
+        (rc, out.as_str()),
+        (0, "{\"closed\":[48800],\"ok\":true}\n")
+    );
     assert_eq!(t.tunnel().terminated(), vec![999]);
 }

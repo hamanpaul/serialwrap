@@ -1,11 +1,21 @@
 //! 假 `SysEnv`。
 
-use crate::traits::{CmdOutput, CmdOutputRaw, PalError, PalErrorKind, PalResult, SysEnv};
+use crate::traits::{
+    CmdOutput, CmdOutputRaw, InterruptScope, PalError, PalErrorKind, PalResult, SysEnv,
+};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
+
+struct FakeInterruptScope;
+
+impl InterruptScope for FakeInterruptScope {
+    fn interrupted(&self) -> bool {
+        false
+    }
+}
 
 #[derive(Debug)]
 pub struct FakeEnv {
@@ -110,6 +120,14 @@ impl SysEnv for FakeEnv {
             stdout: String::new(),
             stderr: String::new(),
         })
+    }
+
+    fn run_merged(&self, argv: &[String], timeout: Option<Duration>) -> PalResult<CmdOutput> {
+        self.run(argv, timeout)
+    }
+
+    fn interrupt_scope(&self) -> PalResult<Box<dyn InterruptScope>> {
+        Ok(Box::new(FakeInterruptScope))
     }
 
     fn run_raw(
