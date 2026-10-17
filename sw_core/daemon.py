@@ -22,8 +22,10 @@ BLOCKING_RPC_METHODS = {
     "file.push", "file.pull",
     "session.recover",        # force 路徑硬 sleep 10s + probe 數十秒（#80 REACT-1）
     "session.attach",         # reprobe 分支做完整 ensure_ready/probe，最壞數十秒（#80 REACT-2）
+    "device.release", "device.attach", "session.clear", "session.bind",
     "session.self_test",      # 同步等 UART（2×timeout_s）（#80 REACT-3）
     "session.console_attach",  # recover 升級分支可同步觸發 recover（#80 REACT-6）
+    "daemon.handoff_stop",    # 同步取得 manager snapshot 並凍結 admission
     # 整檔讀取（WAL/log tail），大檔在 loop 上同步讀會凍結全 daemon（#80 REACT-5）
     # command.result_tail 是 CLI `serialwrap cmd result-tail` 實際送的方法（service.rpc 內與 legacy
     # result.tail 同樣 get_background_result 讀取/切片大 capture 並序列化）；漏了它，最常用的查詢路徑
@@ -85,6 +87,21 @@ def _write_config_endpoint(endpoint: str) -> None:
         cfg.set_socket(endpoint)
     except Exception as exc:  # noqa: BLE001
         sys.stderr.write(f"serialwrapd: 寫入 config.yaml endpoint 失敗（非致命）: {exc}\n")
+
+
+def make_rpc_handler(service: SerialwrapService, stop_after_response: object):
+    """建立 daemon 控制方法與 service RPC 共用的正式分派器。"""
+    def _handle(method: str, params: dict[str, object]) -> dict[str, object]:
+        if method == "daemon.stop":
+            return {"ok": True, "stopping": True, "_rpc_after_write": stop_after_response}
+        if method == "daemon.handoff_stop":
+            result = service.handoff_stop(params)
+            if result.get("ok"):
+                result["_rpc_after_write"] = stop_after_response
+            return result
+        return service.rpc(method, params)
+
+    return _handle
 
 
 def _write_effective_endpoint(args: argparse.Namespace) -> None:
@@ -163,14 +180,12 @@ async def _run_async(args: argparse.Namespace) -> int:
         return 3
     stop_event = asyncio.Event()
 
-    def _handle(method: str, params: dict[str, object]) -> dict[str, object]:
-        if method == "daemon.stop":
-            stop_event.set()
-            return {"ok": True, "stopping": True}
-        return service.rpc(method, params)
+    def _stop_after_response() -> None:
+        # 由 RPC framing 層於 writer.drain() 完成後呼叫，確保交接回應先送出。
+        asyncio.get_running_loop().call_soon(stop_event.set)
 
     # 依平台後端選擇器建構 RPC server（Windows: TcpRpcServer / POSIX: JsonRpcUnixServer）。
-    server = _build_server(args, _handle)
+    server = _build_server(args, make_rpc_handler(service, _stop_after_response))
 
     def _stop(*_unused: object) -> None:
         stop_event.set()

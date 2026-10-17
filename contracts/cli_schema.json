@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/hamanpaul/serialwrap/contracts/cli_schema.json",
   "title": "serialwrap CLI contract",
-  "x-catalog-revision": 1,
+  "x-catalog-revision": 2,
   "x-prog": "serialwrap",
   "x-conventions": {
     "params_source": "rpc.params 的值為來源：字串為該子命令 argparse namespace 的 dest，送出 args.<dest> 原值；\"selector|com\" 表示 args.selector or args.com（盤點 01 §6.6 stream tail、§6.7 log tail-raw／tail-text）；{\"$document\": \"file\"} 表示 --file 讀入的整份 JSON 物件即為 RPC params（event add）。",
@@ -2621,7 +2621,11 @@
       "session.recover",
       "session.attach",
       "session.self_test",
-      "session.console_attach"
+      "session.console_attach",
+      "device.release",
+      "device.attach",
+      "session.clear",
+      "session.bind"
     ],
     "known_gap_methods": {
       "methods": [
@@ -2631,25 +2635,25 @@
       "timeout_s": 5.0
     },
     "sources": [
-      "sw_core/cli.py:79",
-      "sw_core/cli.py:81"
+      "sw_core/cli.py:80",
+      "sw_core/cli.py:82"
     ]
   },
   "x-fixed-timeouts": [
     {
       "name": "daemon_stop_wait_s",
       "value": 2.0,
-      "source": "sw_core/cli.py:647"
+      "source": "sw_core/cli.py:649"
     },
     {
       "name": "daemon_start_ping_timeout_s",
       "value": 0.5,
-      "source": "sw_core/cli.py:599"
+      "source": "sw_core/cli.py:601"
     },
     {
       "name": "daemon_start_status_timeout_s",
       "value": 1.0,
-      "source": "sw_core/cli.py:610"
+      "source": "sw_core/cli.py:612"
     },
     {
       "name": "daemon_ready_poll",
@@ -2661,22 +2665,22 @@
         "tries": 50,
         "interval_s": 0.2
       },
-      "source": "sw_core/cli.py:586-588"
+      "source": "sw_core/cli.py:588-590"
     },
     {
       "name": "healthy_daemon_probe_timeout_s",
       "value": 0.5,
-      "source": "sw_core/cli.py:366-377"
+      "source": "sw_core/cli.py:368-379"
     },
     {
       "name": "setup_ping_timeout_s",
       "value": 0.5,
-      "source": "sw_core/cli.py:1694"
+      "source": "sw_core/cli.py:1696"
     },
     {
       "name": "setup_mcu_status_timeout_s",
       "value": 0.5,
-      "source": "sw_core/cli.py:1701"
+      "source": "sw_core/cli.py:1703"
     },
     {
       "name": "doctor_health_status_timeout_s",
@@ -2711,7 +2715,7 @@
     {
       "name": "unix_endpoint_liveness_socket_timeout_s",
       "value": 0.2,
-      "source": "sw_core/cli.py:717"
+      "source": "sw_core/cli.py:719"
     },
     {
       "name": "win_tcp_liveness_connect_timeout_s",
@@ -2826,7 +2830,7 @@
     },
     {
       "name": "SERIALWRAP_DAEMON_ENV_FILE",
-      "read_by": "sw_core/cli.py:223、335",
+      "read_by": "sw_core/cli.py:225、335",
       "default": null,
       "effect": "daemon start 的 env 檔來源（有設時 strip 後非空即唯一來源；設為空白則不載入任何 env 檔）",
       "unset_resolves_to": [
@@ -2838,19 +2842,19 @@
     },
     {
       "name": "SERIALWRAP_STATE_DIR",
-      "read_by": "sw_core/constants.py:27,31；sw_core/cli.py:1116",
+      "read_by": "sw_core/constants.py:27,31；sw_core/cli.py:1118",
       "default": null,
       "effect": "STATE_DIR／WAL／bench state 路徑（constants 於 import 時、bench state 於呼叫時）"
     },
     {
       "name": "XDG_STATE_HOME",
-      "read_by": "sw_core/constants.py:22；sw_core/cli.py:1118",
+      "read_by": "sw_core/constants.py:22；sw_core/cli.py:1120",
       "default": null,
       "effect": "STATE_DIR 與 bench state 的 fallback 根目錄"
     },
     {
       "name": "SERIALWRAP_RUN_DIR",
-      "read_by": "sw_core/constants.py:38；sw_core/cli.py:1641",
+      "read_by": "sw_core/constants.py:38；sw_core/cli.py:1643",
       "default": null,
       "effect": "RUN_DIR（socket／lock 所在）；remote 執行期目錄（呼叫時）"
     },
@@ -2892,7 +2896,7 @@
     },
     {
       "name": "SERIALWRAP_RPC_BACKEND",
-      "read_by": "sw_core/platform_backends.py:24（經 sw_core/cli.py:668 呼叫）",
+      "read_by": "sw_core/platform_backends.py:24（經 sw_core/cli.py:670 呼叫）",
       "default": "auto",
       "effect": "RPC 後端 posix／win 判定（呼叫時）"
     },

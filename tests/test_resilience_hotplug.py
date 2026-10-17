@@ -131,7 +131,7 @@ class TestDeviceHotplug(unittest.TestCase):
             # real_path 變更
             mgr.update_devices({by_id: DeviceInfo(by_id=by_id, real_path="/dev/ttyUSB1")})
 
-            # 應先 detach 再 reattach
+            # 依基線先落 DETACHED／DEVICE_REBOUND_REQUIRED，再由裝置更新排入 attach。
             self.assertEqual(session.state, "DETACHED")
             self.assertEqual(session.last_error, "DEVICE_REBOUND_REQUIRED")
             mock_attach.assert_called_with(by_id)

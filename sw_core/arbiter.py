@@ -36,13 +36,15 @@ class _QueuedCommand:
 
 
 class CommandArbiter:
-    def __init__(self, send_cb: Callable[..., dict[str, Any]]) -> None:
+    def __init__(self, send_cb: Callable[..., dict[str, Any]], *, admission: Any | None = None) -> None:
         self._send_cb = send_cb
+        self._admission = admission
         self._lock = threading.Lock()
         self._queues: dict[str, queue.PriorityQueue[_QueuedCommand]] = {}
         self._threads: dict[str, threading.Thread] = {}
         self._stops: dict[str, threading.Event] = {}
         self._commands: dict[str, dict[str, Any]] = {}
+        self._admission_tickets: dict[str, Any] = {}
         self._counter = 0
 
     def register_session(self, session_id: str) -> None:
@@ -116,11 +118,17 @@ class CommandArbiter:
         for rec in self._commands.values():
             if rec.get("session_id") != session_id:
                 continue
-            if rec.get("done_at") is not None or rec.get("status") != "accepted":
+            if rec.get("done_at") is not None:
+                self._finish_admission_locked(str(rec.get("cmd_id") or ""))
+                continue
+            if rec.get("status") != "accepted":
                 continue
             rec["status"] = "error"
             rec["error_code"] = error_code
             rec["done_at"] = now
+            ticket = self._admission_tickets.pop(str(rec.get("cmd_id") or ""), None)
+            if ticket is not None and self._admission is not None:
+                self._admission.done(ticket)
             flushed += 1
         return flushed
 
@@ -135,6 +143,8 @@ class CommandArbiter:
         priority: int = 10,
         expected_duration_s: float | None = None,
         completion_regex: str | None = None,
+        admission_com: str | None = None,
+        admission_exempt: bool = False,
     ) -> dict[str, Any]:
         if not valid_completion_regex(completion_regex):
             return {"ok": False, "error_code": ERROR_INVALID_COMPLETION_REGEX}
@@ -162,6 +172,12 @@ class CommandArbiter:
                 "hint": "Command must not contain embedded newline characters. "
                         "Split into multiple independent submissions.",
             }
+
+        ticket = None
+        if self._admission is not None and not admission_exempt:
+            ticket = self._admission.admit("command.submit", admission_com or session_id.rsplit(":", 1)[-1])
+            if ticket is None:
+                return {"ok": False, "error_code": "FLUSHED_BY_SHUTDOWN", "reason": "handoff_frozen"}
 
         cmd_id = uuid.uuid4().hex
         now = now_iso()
@@ -193,12 +209,16 @@ class CommandArbiter:
         with self._lock:
             pq = self._queues.get(session_id)
             if pq is None:
+                if ticket is not None and self._admission is not None:
+                    self._admission.done(ticket)
                 return {"ok": False, "error_code": "SESSION_NOT_READY", "session_id": session_id}
             pending = self._count_pending_locked(session_id)
             if pending >= CMD_PENDING_MAX:
                 # 進行中（accepted/running）命令已達 per-session 硬上限：拒絕而非排隊。eviction 只能淘汰
                 # 已完成命令，無法回收尚未執行者；少了 admission control，client 比 UART worker 快時
                 # _commands 與 PriorityQueue 會持續累積 accepted/running records 而 OOM。
+                if ticket is not None and self._admission is not None:
+                    self._admission.done(ticket)
                 return {
                     "ok": False,
                     "error_code": "SESSION_QUEUE_FULL",
@@ -211,6 +231,8 @@ class CommandArbiter:
             self._counter += 1
             counter = self._counter
             self._commands[cmd_id] = rec
+            if ticket is not None:
+                self._admission_tickets[cmd_id] = ticket
             self._evict_commands_locked()
         pq.put(_QueuedCommand(sort_key=(priority, counter), cmd_id=cmd_id, session_id=session_id, command=command, source=source, mode=mode, timeout_s=timeout_s, expected_duration_s=expected_duration_s, completion_regex=completion_regex))
         result: dict[str, Any] = {"ok": True, "cmd_id": cmd_id, "status": "accepted", "session_id": session_id}
@@ -258,8 +280,11 @@ class CommandArbiter:
                 return {"ok": False, "error_code": "CMD_NOT_FOUND", "cmd_id": cmd_id}
             if rec["status"] in {"done", "error"}:
                 return {"ok": False, "error_code": "CMD_NOT_CANCELABLE", "cmd_id": cmd_id}
+            was_accepted = rec["status"] == "accepted"
             rec["status"] = "canceled"
             rec["done_at"] = now_iso()
+            if was_accepted:
+                self._finish_admission_locked(cmd_id)
             self._evict_commands_locked()  # 命令終結即收斂 history，不必等下一次 submit（Copilot 審查）
             return {"ok": True, "cmd_id": cmd_id, "status": "canceled"}
 
@@ -277,10 +302,12 @@ class CommandArbiter:
             with self._lock:
                 rec = self._commands.get(item.cmd_id)
                 if rec is None:
+                    self._finish_admission_locked(item.cmd_id)
                     continue
                 if rec.get("status") == "canceled" or rec.get("done_at"):
                     # 已被 cancel 或已被 flush 終結（#128）的記錄：跳過，不得重設 running
                     # 或執行 send_cb（防 flush 與取件之間的 race 把終端態覆寫回進行中）。
+                    self._finish_admission_locked(item.cmd_id)
                     continue
                 rec["status"] = "running"
                 rec["started_at"] = now_iso()
@@ -297,6 +324,7 @@ class CommandArbiter:
                         rec["error_code"] = "SEND_FAILED"
                         rec["done_at"] = now_iso()
                         self._evict_commands_locked()  # 終結即收斂 history（Copilot 審查）
+                    self._finish_admission_locked(item.cmd_id)
                 continue
 
             with self._lock:
@@ -324,6 +352,12 @@ class CommandArbiter:
                         rec["status"] = "done"
                     rec["done_at"] = now_iso()
                     self._evict_commands_locked()  # 終結即收斂 history，尖峰後不再長期超量（Copilot 審查）
+                self._finish_admission_locked(item.cmd_id)
+
+    def _finish_admission_locked(self, cmd_id: str) -> None:
+        ticket = self._admission_tickets.pop(cmd_id, None)
+        if ticket is not None and self._admission is not None:
+            self._admission.done(ticket)
 
     def snapshot(self) -> list[dict[str, Any]]:
         with self._lock:

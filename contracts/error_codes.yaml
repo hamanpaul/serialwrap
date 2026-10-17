@@ -158,9 +158,9 @@ codes:
     behavior_change: []
     sources: ["sw_core/arbiter.py:143"]
   - code: COMMAND_ABORTED_IN_FLIGHT
-    status: APPROVED
-    reachable: false
-    unreachable_reason: "BC-03 已核准；實作與契約測試完成前不得生效"
+    status: "IMPLEMENTED"
+    reachable: true
+    unreachable_reason: null
     scope: {interfaces: [rec], methods: ["command.get"], platforms: [posix, windows]}
     meaning: "已確認至少寫出 1 byte 後，因 release 或 recovery 而中止"
     side_effect: "命令紀錄 status 為 error；已送出部分位元組，不得自動重送"
@@ -168,7 +168,7 @@ codes:
     uart_tx: possible
     agent_action: "命令已部分送出：勿重送；先以 session self-test 確認目標狀態"
     extra_fields: []
-    contract_tests: []
+    contract_tests: ["tests/test_stage0_session_drain.py::test_bc03_abort_mapping", "tests/test_stage0_session_drain.py::test_running_command_aborted_by_release_records_code"]
     behavior_change: ["BC-03"]
   - code: COMMAND_FAILED
     status: EXISTING
@@ -441,15 +441,15 @@ codes:
   - code: FLUSHED_BY_SHUTDOWN
     status: EXISTING
     reachable: true
-    scope: {interfaces: [rec], methods: ["command.get", "command.result_tail", "result.tail"], platforms: [posix, windows]}
-    meaning: "daemon 停止時，尚未執行的排隊命令被清空（未送出，可重送）"
+    scope: {interfaces: [rpc, rec], methods: ["alias.assign", "alias.set", "alias.unassign", "command.cancel", "command.get", "command.result_tail", "command.submit", "device.attach", "device.release", "event.com_disable", "event.com_enable", "event.reload", "event.reset", "event.rule_delete", "event.rule_set", "file.pull", "file.push", "result.tail", "session.attach", "session.bind", "session.clear", "session.console_attach", "session.console_detach", "session.interactive_close", "session.interactive_open", "session.interactive_send", "session.interactive_status", "session.log_start", "session.log_stop", "session.pin", "session.recover", "session.self_test", "session.unpin", "wal.reset"], platforms: [posix, windows]}
+    meaning: "daemon 停止時，尚未執行的排隊命令被清空（未送出，可重送）；原子交接凍結後的有副作用 RPC 回 reason:\"handoff_frozen\""
     side_effect: "命令紀錄 status 為 error；未送出"
     retryable: "yes"
     uart_tx: none
     agent_action: "daemon 重新啟動並確認 session 為 READY 後才可重送"
-    extra_fields: []
-    contract_tests: ["tests/test_arbiter_flush_on_recovery.py::test_service_stop_flushes_with_shutdown_code"]
-    behavior_change: []
+    extra_fields: ["reason"]
+    contract_tests: ["tests/test_arbiter_flush_on_recovery.py::test_service_stop_flushes_with_shutdown_code", "tests/test_stage0_handoff_stop.py::test_push_after_freeze_rejected_zero_tx", "tests/test_stage0_handoff_stop.py::test_every_mutating_method_rejected_after_freeze"]
+    behavior_change: ["SC-11"]
     sources: ["sw_core/service.py:532"]
   - code: FORCE_RECOVER_TIMEOUT
     status: EXISTING
@@ -1003,7 +1003,7 @@ codes:
   - code: SESSION_RECOVERING
     status: EXISTING
     reachable: true
-    scope: {interfaces: [rpc, rec], methods: ["file.pull", "file.push", "session.attach", "command.get"], platforms: [posix, windows]}
+    scope: {interfaces: [rpc, rec], methods: ["device.attach", "device.release", "file.pull", "file.push", "session.attach", "session.bind", "session.clear", "session.recover", "command.get"], platforms: [posix, windows]}
     meaning: "session 恢復中（RECOVERING），操作暫不可用"
     side_effect: "無（拒絕）"
     retryable: "yes"

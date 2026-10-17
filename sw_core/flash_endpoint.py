@@ -104,9 +104,10 @@ class FlashEndpoint:
     支援家族清單請改用 `serialwrap mcu patterns` / `mcu status`（不經此 PTY）。
     """
 
-    def __init__(self, *, link_path, on_flash_open=None, grace=0.3):
+    def __init__(self, *, link_path, on_flash_open=None, grace=0.3, admission=None):
         self._link_path = link_path
         self._on_flash_open = on_flash_open            # (master_fd, slave_fd, first_bytes) -> None
+        self._admission = admission
         self._grace = grace
         self._master_fd = None
         self._slave_fd = None
@@ -183,6 +184,11 @@ class FlashEndpoint:
             except (OSError, BlockingIOError):
                 first = b""
             if not self._flash_active.is_set():
+                ticket = None
+                if self._admission is not None:
+                    ticket = self._admission.admit("flash.sync_probe", None)
+                    if ticket is None:
+                        continue
                 self._flash_active.set()
                 try:
                     if self._on_flash_open is not None:
@@ -193,6 +199,8 @@ class FlashEndpoint:
                     pass
                 finally:
                     self._flash_active.clear()
+                    if ticket is not None and self._admission is not None:
+                        self._admission.done(ticket)
 
 
 class FlashSink(Protocol):

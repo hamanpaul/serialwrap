@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -222,3 +223,128 @@ def make_manager(
         on_detached=lambda _s: None,
         state_path=str(tmp_path / "state.json"),
     )
+
+
+def make_service(
+    tmp_path: Path,
+    ready: list[str] | None = None,
+    port: FakePort | None = None,
+    with_fake_mcu: bool = False,
+) -> Any:
+    """建立只使用 tmp_path 狀態與替身 UART 的 SerialwrapService。"""
+    from unittest.mock import patch
+    from sw_core.service import SerialwrapService
+
+    coms = ready or ["COM0"]
+    profiles = [
+        make_profile(
+            name="p",
+            com=com,
+            by_id=f"/dev/serial/by-id/{com}",
+            platform="prpl",
+        )
+        for com in coms
+    ]
+    with patch("sw_core.service.WalWriter", lambda: WalWriter(wal_dir=str(tmp_path / "wal"))), patch(
+        "sw_core.service.TTYMCU_PATH", str(tmp_path / "ttyMCU")
+    ):
+        svc = SerialwrapService(
+            profiles,
+            by_id_dir=str(tmp_path / "by-id"),
+            by_path_dir=str(tmp_path / "by-path"),
+            state_path=str(tmp_path / "state.json"),
+        )
+    svc.stop_requested = False
+    for com in coms:
+        session = svc._sessions.get_session(com)
+        if session is None:
+            continue
+        bridge, _wal = make_bridge(
+            tmp_path,
+            port=port,
+            com=com,
+            wal=svc._wal,
+        )
+        session.bridge = bridge
+        session.state = "READY"
+        session.bridge_generation = 1
+        svc._arbiter.register_session(session.session_id)
+
+    def wait_until_admitted(method: str, com: str, timeout: float = 1.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with svc.admission._lock:
+                if any(ticket.kind == method and ticket.com == com for ticket in svc.admission._tickets.values()):
+                    return
+            time.sleep(0.005)
+        raise AssertionError(f"{method} 未在時限內取得 admission：{com}")
+
+    from sw_core.daemon import make_rpc_handler
+    production_handler = make_rpc_handler(svc, lambda: setattr(svc, "stop_requested", True))
+
+    def daemon_dispatch_for_test(request: dict[str, Any]) -> dict[str, Any]:
+        result = production_handler(str(request.get("method")), request.get("params") or {})
+        if isinstance(result, dict):
+            after_response = result.pop("_rpc_after_write", None)
+            if callable(after_response):
+                after_response()
+        return result
+
+    svc.daemon_dispatch_for_test = daemon_dispatch_for_test
+    svc.wait_until_admitted = wait_until_admitted
+    svc.session_state = lambda com: (
+        svc._sessions.get_session(com).state if svc._sessions.get_session(com) else None
+    )
+    svc.session_public = lambda com: (
+        svc._sessions.get_session(com).to_public_dict() if svc._sessions.get_session(com) else None
+    )
+    svc.wal = svc._wal
+
+    def close_for_test() -> None:
+        endpoint = getattr(svc, "_flash_endpoint", None)
+        stop = getattr(endpoint, "stop", None)
+        if callable(stop):
+            stop()
+        for row in svc._sessions.list_sessions():
+            svc._arbiter.unregister_session(row["session_id"], error_code="FLUSHED_BY_SHUTDOWN")
+        if not svc._wal.closed:
+            svc._wal.close()
+
+    svc.close_for_test = close_for_test
+
+    if with_fake_mcu:
+        class FakeMcu:
+            def __init__(self) -> None:
+                self.received = b""
+                self.started = threading.Event()
+                self.release = threading.Event()
+                self.link_path = str(tmp_path / "ttyMCU")
+
+            def write_sync(self, sync_bytes: bytes) -> str:
+                import os
+
+                fd = os.open(self.link_path, os.O_WRONLY | os.O_NOCTTY)
+                try:
+                    os.write(fd, sync_bytes)
+                finally:
+                    os.close(fd)
+                if self.started.wait(0.15):
+                    return "admitted"
+                if svc.admission.frozen:
+                    time.sleep(0.05)
+                    return "refused_frozen"
+                return "not_observed"
+
+        mcu = FakeMcu()
+
+        def on_flash_open(_master_fd: int, _slave_fd: int, first_bytes: bytes) -> None:
+            mcu.received += first_bytes
+            mcu.started.set()
+            mcu.release.wait(2.0)
+
+        svc._flash_endpoint._on_flash_open = on_flash_open
+        svc._flash_endpoint._grace = 0.005
+        svc._flash_endpoint.start()
+        svc.flash_endpoint = svc._flash_endpoint
+        return svc, mcu
+    return svc

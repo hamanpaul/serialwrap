@@ -200,7 +200,7 @@ serialwrap device attach --selector COM0
 | `CMD_NOT_CANCELABLE` | rpc／posix、windows | 否 | 命令已是 done 或 error 狀態，無法取消 | 改以 command.get 讀取既有結果，不需取消 |
 | `CMD_NOT_FOUND` | rpc／posix、windows | 否 | cmd_id 不存在（已被淘汰或從未提交），或 result_tail 無法取得該命令的結果 | 確認 cmd_id 來源；命令紀錄只保留有限筆數，紀錄不存在不代表命令未執行，不得因此重送；先以 session self-test、log tail 或 WAL 查證目標狀態，是否重新執行由操作者決定 |
 | `CMD_TOO_LONG` | rpc／posix、windows | 修正參數後 | 命令的 UTF-8 長度超過硬上限 16384 bytes，拒絕提交 | 縮短命令內容；超過 4096 bytes 的軟上限仍會成功，但會附 CMD_LENGTH_WARNING 警告（非錯誤碼） |
-| `COMMAND_ABORTED_IN_FLIGHT` | rec（未生效）／posix、windows | 否 | 已確認至少寫出 1 byte 後，因 release 或 recovery 而中止 | 命令已部分送出：勿重送；先以 session self-test 確認目標狀態 |
+| `COMMAND_ABORTED_IN_FLIGHT` | rec／posix、windows | 否 | 已確認至少寫出 1 byte 後，因 release 或 recovery 而中止 | 命令已部分送出：勿重送；先以 session self-test 確認目標狀態 |
 | `COMMAND_FAILED` | rec／posix、windows | 否 | 命令結果為 ok:false 但未帶 error_code 時的後備碼 | 視為失敗，先以 session self-test 確認狀態 |
 | `CONSOLE_LINE_LIMIT_TOO_SMALL` | rpc／posix、windows | 否 | profile 的 max_console_line_chars 太小，放不下傳輸必要的命令 | 調大 profile 的 max_console_line_chars 後重試 |
 | `CONSOLE_NOT_FOUND` | rpc／posix、windows | 否 | 指定的 console client_id 不存在 | 以 console list 取得現存 client_id 後再操作 |
@@ -221,7 +221,7 @@ serialwrap device attach --selector COM0
 | `FLASHING_BUSY` | rpc、rec、cli_local／posix、windows | 是 | session 處於 FLASHING 或 flash 臨界區，命令或操作被拒 | 等待燒錄結束（session 回到 ATTACHED 或 READY）後再重試 |
 | `FLASH_TARGET_IS_CONSOLE` | rpc／posix、windows | 修正參數後 | 燒錄目標是可下命令的 console 裝置，且未指定 force，拒絕執行 | 改選非 console 的燒錄目標；此碼目前 production 不可達，僅作為契約保留 |
 | `FLUSHED_BY_RECOVERY` | rec／posix、windows | 是 | 命令尚未執行即因 recovery 或 detach 被清空（未送出，可在 READY 後重送） | 確認 session 已回到 READY 後才可重送 |
-| `FLUSHED_BY_SHUTDOWN` | rec／posix、windows | 是 | daemon 停止時，尚未執行的排隊命令被清空（未送出，可重送） | daemon 重新啟動並確認 session 為 READY 後才可重送 |
+| `FLUSHED_BY_SHUTDOWN` | rpc、rec／posix、windows | 是 | daemon 停止時，尚未執行的排隊命令被清空（未送出，可重送）；原子交接凍結後的有副作用 RPC 回 reason:"handoff_frozen" | daemon 重新啟動並確認 session 為 READY 後才可重送 |
 | `FORCE_RECOVER_TIMEOUT` | rpc／posix、windows | 視情況 | 強制 recover（clear 後重新 attach）在 10 次、每次 1 秒的窗口內未達 READY | 以 session get_state 確認目前狀態後，再決定重試 recover 或處理裝置 |
 | `INTERACTIVE_EXPIRED` | rpc／posix、windows | 否 | 互動 lease 已逾時失效 | 重新 interactive open 取得新的 lease 後再送出 |
 | `INTERACTIVE_NOT_FOUND` | rpc／posix、windows | 否 | interactive_id 不存在，或 lease 狀態已不是 active | 重新 interactive open 取得 interactive_id |

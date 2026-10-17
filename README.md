@@ -483,10 +483,11 @@ on its own, so a manual attach/recover (or a daemon restart, which re-reads
 
 Callers must handle RPC timeouts themselves — a CLI `TIMEOUT` only means the
 CLI stopped waiting; the daemon-side operation may still complete successfully
-afterwards. `session attach`, `session recover`, `session self-test`, and
-`session console-attach` (its recover-upgrade branch can run synchronously for
-tens of seconds) are long operations executed synchronously on the daemon
-side: when `--timeout` is not given, the CLI automatically applies a fixed
+afterwards. `session attach`, `session recover`, `session self-test`,
+`session console-attach`, `device release`, `device attach`, `session clear`,
+and `session bind` block on the daemon side (`session console-attach` can run
+synchronously for tens of seconds): when `--timeout` is not given, the CLI
+automatically applies a fixed
 45 s floor instead of the general 5 s default. An explicit `--timeout` always
 wins.
 
@@ -2195,7 +2196,7 @@ recovery 把 session 降出 `READY`（或 session 重新 attach）時，佇列�
 
 ### Timeout 語意（#123）
 
-呼叫端必須自行處理 RPC timeout——CLI 回 `TIMEOUT` 只代表「CLI 不再等待」，daemon 端操作可能仍在執行、稍後成功。`session attach`／`session recover`／`session self-test`／`session console-attach`（recover 升級分支可同步跑數十秒）屬 daemon 端同步執行的**長操作**：未指定 `--timeout` 時，CLI 對這四個方法自動採固定 45 秒 floor，而非一般方法的預設 5 秒。顯式指定 `--timeout` 時一律照用。
+呼叫端必須自行處理 RPC timeout——CLI 回 `TIMEOUT` 只代表「CLI 不再等待」，daemon 端操作可能仍在執行、稍後成功。`session attach`／`session recover`／`session self-test`／`session console-attach`／`device release`／`device attach`／`session clear`／`session bind` 都會在 daemon 端阻塞（`session console-attach` 的 recover 升級分支可同步跑數十秒）：未指定 `--timeout` 時，CLI 對這八個方法自動採固定 45 秒 floor，而非一般方法的預設 5 秒。顯式指定 `--timeout` 時一律照用。
 
 floor 誠實說明：CLI 完全無從得知 daemon 端 profile 的 `timeout_s`（部分平台如 `bcm` 常設 15 秒以上、且可能多階段 login/ready probe）——真正拉長 daemon 端執行時間的其實是這個值，45 秒只是一個寬鬆常數，不是依任何單次呼叫的參數精算出來的上界。（初版曾試著讓 floor 隨 CLI 端 `recover_timeout_s`／`probe_timeout_s` 縮放，但 daemon 端對這兩個參數皆有 2 秒 cap、超過就無作用，該推導已撤回。）若操作仍逾時，可用下方 `TIMEOUT` 錯誤附帶的 `daemon_reachable`／`daemon_busy` 欄位與 `session list` 確認 daemon 是否仍在執行。
 
@@ -3043,7 +3044,7 @@ options:
   --socket SOCKET      本機 daemon 的 Unix socket 路徑（未指定時依 config.yaml 與 XDG 執行期目錄解析，可用 SERIALWRAP_RUN_DIR 覆寫）
   --endpoint ENDPOINT  遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）
   --bench CODE         使用 connect 記住的 bench 代號解析 endpoint（優先序低於 --endpoint/--socket，高於 config fallback）
-  --timeout TIMEOUT_S  RPC timeout 秒數（未指定：一般方法 5.0；長操作 session attach/recover/self-test/console-attach 自動採固定 45.0 的 floor，#123）
+  --timeout TIMEOUT_S  RPC timeout 秒數（未指定：一般方法 5.0；長操作 session attach/recover/self-test/console-attach、device release/attach、session clear/bind 自動採固定 45.0 的 floor，#123）
   --retries RETRIES    TIMEOUT／連線失敗時的重試次數，僅作用於冪等唯讀方法白名單（指數退避 0.5s 起、單次上限 5s；預設: 0）
 
 command groups:

@@ -43,6 +43,7 @@ async def serve_connection(reader, writer, handler, blocking_methods) -> None:
             req_id = obj.get("id")
             method = obj.get("method")
             params = obj.get("params")
+            after_response = None
             if not isinstance(method, str):
                 resp: dict[str, Any] = {"id": req_id, "ok": False, "error_code": "INVALID_METHOD"}
             else:
@@ -59,12 +60,17 @@ async def serve_connection(reader, writer, handler, blocking_methods) -> None:
                     result = {"ok": False, "error_code": "EXCEPTION", "message": str(exc)}
                 resp = {"id": req_id}
                 if isinstance(result, dict):
+                    after_response = result.pop("_rpc_after_write", None)
                     resp.update(result)
                 else:
                     resp.update({"ok": True, "data": result})
 
-            writer.write((json.dumps(resp, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8"))
-            await writer.drain()
+            try:
+                writer.write((json.dumps(resp, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8"))
+                await writer.drain()
+            finally:
+                if callable(after_response):
+                    after_response()
     finally:
         writer.close()
         await writer.wait_closed()

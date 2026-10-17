@@ -17,6 +17,7 @@ from .arbiter import (
     WARNING_CMD_LENGTH,
     CommandArbiter,
 )
+from .admission import AdmissionGate
 from .config import ProfileTemplate, SessionProfile
 from .command_completion import ERROR_INVALID_COMPLETION_REGEX, valid_completion_regex
 from .constants import (
@@ -67,6 +68,18 @@ _HUMAN_INTERACTIVE_COMMANDS = {
     "watch",
 }
 _ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
+
+# 依 RPC 契約 side_effects 非空且 retryable_readonly=false 的方法建立 admission 清單。
+_ADMISSION_METHODS = {
+    "alias.assign", "alias.set", "alias.unassign", "command.cancel",
+    "command.result_tail", "device.attach", "device.release", "event.com_disable",
+    "event.com_enable", "event.reload", "event.reset", "event.rule_delete",
+    "event.rule_set", "file.pull", "file.push", "result.tail", "session.attach",
+    "session.bind", "session.clear", "session.console_attach", "session.console_detach",
+    "session.interactive_close", "session.interactive_open", "session.interactive_send", "session.interactive_status",
+    "session.log_start", "session.log_stop", "session.pin", "session.recover",
+    "session.self_test", "session.unpin", "wal.reset",
+}
 
 
 def _coerce_rpc_bool(value: Any) -> bool:
@@ -229,6 +242,8 @@ class SerialwrapService:
         state_path: str | None = None,
     ) -> None:
         self._wal = WalWriter()
+        self.admission = AdmissionGate()
+        self._interactive_admission_tickets: dict[str, Any] = {}
         self._lock = threading.RLock()
         self._running = False
         self._started_at: str | None = None
@@ -236,7 +251,7 @@ class SerialwrapService:
         # #154：daemon 啟動時算一次、常駐於 instance，避免每次 RPC 都重開 VERSION 檔案。
         self._version = resolve_version()
 
-        self._arbiter = CommandArbiter(self._send_cb)
+        self._arbiter = CommandArbiter(self._send_cb, admission=self.admission)
         self._sessions = SessionManager(
             profiles,
             self._wal,
@@ -247,6 +262,7 @@ class SerialwrapService:
             on_console_line=self._on_console_line,
             on_command_flush=self._on_command_flush,
             state_path=state_path,
+            admission=self.admission,
         )
         self._engine = EventEngine(EngineDeps(
             events_dir=EVENTS_DIR,
@@ -281,6 +297,7 @@ class SerialwrapService:
         self._flash_endpoint = FlashEndpoint(
             link_path=TTYMCU_PATH,
             on_flash_open=self._on_flash_open,
+            admission=self.admission,
         )
 
     def _on_ready(self, session_id: str) -> None:
@@ -320,6 +337,7 @@ class SerialwrapService:
             mode=mode,
             timeout_s=30.0,
             priority=100,
+            admission_exempt=True,
         )
 
     def _bg_fallback_from_arbiter(
@@ -523,8 +541,13 @@ class SerialwrapService:
             if not self._running:
                 return
             self._running = False
+        self.admission.freeze()
+        self._sessions.begin_shutdown()
+        for row in self._sessions.list_sessions():
+            self._arbiter.flush_session(row["session_id"], "FLUSHED_BY_SHUTDOWN")
         self._engine.stop()
         self._watcher.stop()
+        shutdown = self._sessions.shutdown_drain()
         for row in self._sessions.list_sessions():
             sid = row["session_id"]
             # daemon shutdown 用 FLUSHED_BY_SHUTDOWN 與 recovery/detach 類路徑區隔（#128
@@ -535,6 +558,15 @@ class SerialwrapService:
             self._flash_endpoint.stop()
         except OSError:
             pass
+        if not shutdown.get("graceful", False):
+            import logging
+            logging.getLogger("serialwrap").error(
+                "serialwrapd: 有序關機逾時，未收斂 session=%s（非優雅停止，SC-11 不計 PASS）",
+                ",".join(shutdown.get("stalled", [])),
+            )
+            self._wal.sync()
+        else:
+            self._wal.close()
 
     def _wal_missing_response(self, health: dict[str, Any]) -> dict[str, Any] | None:
         """WAL 已寫過紀錄但現行檔不存在 → 明確錯誤，不用空陣列 + ok:true 帶過（#189）。
@@ -697,11 +729,124 @@ class SerialwrapService:
         （如 `tests/test_profile_pin_sticky.py::TestRpc`），此時 `_version` 未設，
         版本欄位就此略過而非拋 AttributeError。
         """
-        result = self._dispatch(method, params)
+        gate = getattr(self, "admission", None)
+        if method == "daemon.handoff_stop" and gate is not None:
+            return self.handoff_stop(params)
+
+        ticket = None
+        if gate is not None and method in _ADMISSION_METHODS:
+            ticket = gate.admit(method, self._admission_com(params))
+            if ticket is None:
+                return self._versioned_response({
+                    "ok": False,
+                    "error_code": "FLUSHED_BY_SHUTDOWN",
+                    "reason": "handoff_frozen",
+                })
+        try:
+            result = self._dispatch(method, params)
+            if method.startswith("session.interactive_"):
+                self._reconcile_interactive_admission_tickets()
+            if method == "session.interactive_open" and ticket is not None and result.get("ok"):
+                interactive_id = str(result.get("interactive_id") or result.get("interactive_session_id") or "")
+                if interactive_id:
+                    getattr(self, "_interactive_admission_tickets", {})[interactive_id] = ticket
+                    ticket = None
+            if method == "session.interactive_close" and result.get("ok"):
+                interactive_id = str(params.get("interactive_id") or "")
+                old_ticket = getattr(self, "_interactive_admission_tickets", {}).pop(interactive_id, None)
+                if old_ticket is not None:
+                    gate.done(old_ticket)
+            return self._versioned_response(result)
+        finally:
+            if ticket is not None:
+                gate.done(ticket)
+
+    def _versioned_response(self, result: dict[str, Any]) -> dict[str, Any]:
         version = getattr(self, "_version", None)
         if isinstance(result, dict) and version is not None:
             result.setdefault("version", version)
         return result
+
+    def _admission_com(self, params: dict[str, Any]) -> str | None:
+        selector = str(
+            params.get("selector") or params.get("session_id") or params.get("com")
+            or params.get("alias") or ""
+        )
+        if selector:
+            session = self._sessions.get_session(selector)
+            if session is not None:
+                profile = getattr(session, "profile", None)
+                if profile is not None:
+                    return profile.com
+                if isinstance(session, dict):
+                    com = session.get("com")
+                    return str(com) if com else None
+        interactive_id = str(params.get("interactive_id") or "")
+        if interactive_id:
+            with self._sessions._lock:
+                lease = self._sessions._interactive.get(interactive_id)
+                session = self._sessions._sessions.get(lease.session_id) if lease is not None else None
+                if session is not None:
+                    return session.profile.com
+        by_id = str(params.get("device_by_id") or params.get("by_id") or "")
+        if by_id:
+            session = self._sessions.get_session(by_id)
+            return session.profile.com if session is not None else None
+        return None
+
+    def _reconcile_interactive_admission_tickets(self) -> None:
+        tickets = getattr(self, "_interactive_admission_tickets", None)
+        gate = getattr(self, "admission", None)
+        manager = getattr(self, "_sessions", None)
+        if not isinstance(tickets, dict) or not tickets or gate is None or manager is None:
+            return
+        with manager._lock:
+            active = {
+                session.interactive_session_id
+                for session in manager._sessions.values()
+                if session.interactive_session_id is not None
+                and session.interactive_session_id in manager._interactive
+            }
+        for interactive_id in list(tickets):
+            if interactive_id not in active:
+                ticket = tickets.pop(interactive_id, None)
+                if ticket is not None:
+                    gate.done(ticket)
+
+    def handoff_stop(self, params: dict[str, Any]) -> dict[str, Any]:
+        reason = str(params.get("reason") or "update")
+        self._reconcile_interactive_admission_tickets()
+        with self._sessions._lock:
+            sessions = sorted(self._sessions._sessions.values(), key=lambda item: item.profile.com)
+            for session in sessions:
+                com = session.profile.com
+                self.admission.set_flag(com, "recovering", session.state == "RECOVERING")
+                self.admission.set_flag(
+                    com, "flashing",
+                    session.state == "FLASHING" or com in self._sessions._flash_critical_coms,
+                )
+                self.admission.set_flag(com, "lease", session.interactive_session_id is not None)
+            token, busy = self.admission.freeze_if_idle(reason)
+            if token is None:
+                rows: list[dict[str, Any]] = []
+                for com, gate_row in sorted(busy.get("by_com", {}).items()):
+                    session = next((item for item in sessions if item.profile.com == com), None)
+                    public = session.to_public_dict() if session is not None else {}
+                    ops = list(gate_row.get("ops", []))
+                    if "lease" in gate_row.get("flags", []) and "session.interactive_open" not in ops:
+                        ops.append("session.interactive_open")
+                    rows.append({
+                        "com": com,
+                        "state": public.get("state", "UNKNOWN"),
+                        "foreground_busy": bool(public.get("foreground_busy", False)),
+                        "outstanding_commands": int(public.get("outstanding_commands", 0)),
+                        "interactive_session_id": public.get("interactive_session_id"),
+                        "recovering": bool(public.get("recovering", False) or "recovering" in gate_row.get("flags", [])),
+                        "ops": sorted(ops),
+                    })
+                error_code = "FLASHING_BUSY" if busy.get("flashing") else "SESSION_BUSY"
+                return {"ok": False, "error_code": error_code, "busy": rows}
+        return {"ok": True, "stopping": True, "handoff_token": token}
 
     def _dispatch(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         if method == "health.ping":
@@ -916,6 +1061,7 @@ class SerialwrapService:
                 priority=priority,
                 expected_duration_s=expected_duration_s,
                 completion_regex=completion_regex,
+                admission_com=self._admission_com(params),
             )
 
         if method == "command.get":

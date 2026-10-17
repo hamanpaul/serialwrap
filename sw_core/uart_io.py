@@ -1909,6 +1909,8 @@ class UARTBridge:
         deadline = time.monotonic() + timeout_s
         regex = re.compile(pattern)
         while time.monotonic() < deadline:
+            if self._stop_event.is_set() or self.drain_pending:
+                return False
             with self._rx_lock:
                 # 每次持鎖重算相對偏移（#158）：等待期間 _rx_trimmed 可能因視窗修剪推進。
                 rel = max(0, from_offset - self._rx_trimmed)

@@ -19,6 +19,7 @@ import sw_core
 from sw_core.client import rpc_call
 from sw_core.daemon import BLOCKING_RPC_METHODS
 from sw_core.rpc import JsonRpcUnixServer
+from sw_core.rpc_posix import serve_connection
 
 _EXPECTED = {
     "file.push", "file.pull",
@@ -121,25 +122,37 @@ def test_health_ping_not_blocked_by_slow_command_result_tail():
 )
 @pytest.mark.posix_only
 @pytest.mark.process_rpc
-def test_release_rpc_offloaded_from_event_loop():
-    """以真實 BLOCKING_RPC_METHODS 驅動：device.release 阻塞於 drain 期間，health.ping 在 0.5 s 內回應。
+def test_release_rpc_offloaded_from_event_loop(tmp_path):
+    """真實 release drain 阻塞時，production RPC server 仍須在 0.5 秒內回 health.ping。"""
+    from stage0_fakes import FakePort, make_service
+    from sw_core.daemon import make_rpc_handler
 
-    若 device.release 不在 offload 清單（修正前），慢 handler 會在單執行緒 event loop 上
-    同步執行，並發 health.ping 被卡 → 此測試失敗；納入清單後 health.ping 即時回應。
-    """
-    tmp = tempfile.mkdtemp(prefix="sw80rel-")
-    sock = os.path.join(tmp, "t.sock")
-    slow_s = 2.0
+    release_write = threading.Event()
+    write_started = threading.Event()
 
-    def _handler(method: str, params: dict) -> dict:
-        if method == "device.release":
-            time.sleep(slow_s)  # 模擬 release drain 阻塞
-            return {"ok": True}
-        return {"ok": True, "pong": True}
+    class BlockingPort(FakePort):
+        def write(self, payload, *, cancel=None, submit_guard=None):
+            write_started.set()
+            return super().write(payload, cancel=cancel, submit_guard=submit_guard)
 
+    port = BlockingPort(block=release_write)
+    service = make_service(tmp_path, ready=["COM0"], port=port)
+    bridge = service._sessions.get_session("COM0").bridge
+    drain_started = threading.Event()
+    original_finish_drain = bridge.finish_drain
+
+    def tracked_finish_drain(*args, **kwargs):
+        drain_started.set()
+        return original_finish_drain(*args, **kwargs)
+
+    bridge.finish_drain = tracked_finish_drain
+    sock = os.fspath(tmp_path / "t.sock")
     loop = asyncio.new_event_loop()
-    # 關鍵：用 daemon 的真實 BLOCKING_RPC_METHODS，確保 device.release 確實被宣告為 offload
-    server = JsonRpcUnixServer(sock, _handler, blocking_methods=BLOCKING_RPC_METHODS)
+    server = JsonRpcUnixServer(
+        sock,
+        make_rpc_handler(service, lambda: None),
+        blocking_methods=BLOCKING_RPC_METHODS,
+    )
     ready = threading.Event()
 
     def _run() -> None:
@@ -151,15 +164,25 @@ def test_release_rpc_offloaded_from_event_loop():
     th = threading.Thread(target=_run, daemon=True)
     th.start()
     assert ready.wait(5.0), "server failed to start"
+    command_result: dict = {}
+    release_result: dict = {}
     try:
-        slow_done: dict = {}
+        submit_thread = threading.Thread(target=lambda: command_result.update(
+            rpc_call(sock, "command.submit", {
+                "selector": "COM0", "command": "echo drain", "source": "agent:test",
+                "mode": "line", "timeout_s": 30.0,
+            }, timeout_s=5.0)
+        ))
+        submit_thread.start()
+        submit_thread.join(timeout=2.0)
+        assert command_result.get("ok") is True
+        assert write_started.wait(1.0), "command did not enter the blocked UART write"
 
-        def _fire_slow() -> None:
-            slow_done["resp"] = rpc_call(sock, "device.release", {"selector": "COM0"}, timeout_s=10.0)
-
-        slow_thread = threading.Thread(target=_fire_slow)
-        slow_thread.start()
-        time.sleep(0.3)  # 確保慢 handler 已進入
+        release_thread = threading.Thread(target=lambda: release_result.update(
+            rpc_call(sock, "device.release", {"selector": "COM0"}, timeout_s=5.0)
+        ))
+        release_thread.start()
+        assert drain_started.wait(3.0), f"release did not enter bridge.finish_drain: {release_result}"
 
         t0 = time.monotonic()
         resp = rpc_call(sock, "health.ping", {}, timeout_s=5.0)
@@ -167,9 +190,12 @@ def test_release_rpc_offloaded_from_event_loop():
 
         assert resp.get("ok") and resp.get("pong")
         assert elapsed < 0.5, f"health.ping 在 device.release 進行中被阻塞 {elapsed:.2f}s"
-        slow_thread.join(timeout=10.0)
-        assert slow_done.get("resp", {}).get("ok")
+        release_write.set()
+        release_thread.join(timeout=5.0)
+        assert not release_thread.is_alive()
+        assert release_result.get("ok") is True
     finally:
+        release_write.set()
         fut = asyncio.run_coroutine_threadsafe(server.stop(), loop)
         try:
             fut.result(timeout=5.0)
@@ -178,4 +204,39 @@ def test_release_rpc_offloaded_from_event_loop():
         loop.call_soon_threadsafe(loop.stop)
         th.join(timeout=5.0)
         loop.close()
-        shutil.rmtree(tmp, ignore_errors=True)
+        service.close_for_test()
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_after_response_runs_when_rpc_write_fails():
+    class Reader:
+        sent = False
+
+        async def readline(self) -> bytes:
+            if self.sent:
+                return b""
+            self.sent = True
+            return b'{"id":1,"method":"daemon.handoff_stop","params":{}}\n'
+
+    class Writer:
+        def write(self, _payload: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            raise ConnectionResetError("client disconnected before response drain")
+
+        def close(self) -> None:
+            return None
+
+        async def wait_closed(self) -> None:
+            return None
+
+    stopped: list[bool] = []
+
+    def handler(_method: str, _params: dict) -> dict:
+        return {"ok": True, "_rpc_after_write": lambda: stopped.append(True)}
+
+    with pytest.raises(ConnectionResetError):
+        asyncio.run(serve_connection(Reader(), Writer(), handler, set()))
+    assert stopped == [True]

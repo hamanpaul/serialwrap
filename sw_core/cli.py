@@ -52,7 +52,8 @@ LEGACY_DAEMON_ENV_FILE = "~/OPI.env"
 PROFILE_DAEMON_ENV_FILE = "OPI.env"
 
 # --- #123：長操作 RPC 的 socket timeout floor -------------------------------
-# 問題：session recover／attach／self-test／console-attach（recover 升級分支）
+# 問題：session recover／attach／self-test／console-attach（recover 升級分支）、
+# device release／attach、session clear／bind
 # 的 daemon 端 handler 為同步長操作（對照 sw_core/daemon.py 的
 # BLOCKING_RPC_METHODS），host 過載或走 force recover 路徑時，daemon 端執行
 # 時間會結構性超過 CLI 舊預設 5s socket timeout，CLI 因而回「假性 TIMEOUT」
@@ -72,7 +73,7 @@ PROFILE_DAEMON_ENV_FILE = "OPI.env"
 # 因此改採固定寬鬆常數：CTRL_C 等 prompt 2s + CTRL_D 等 prompt 2s
 # （_recover_after_failure）+ force fallback 硬輪詢 10s（_force_recover 的
 # range(10)×sleep(1.0)）+ bcm 類慢板多階段 login/ready probe 與 attach
-# reprobe 裕度，取 45s 為 recover／attach／self-test／console-attach 統一
+# reprobe 裕度，取 45s 為長操作統一
 # floor；顯式 --timeout 一律照舊覆蓋。若操作仍逾時，應以 TIMEOUT 錯誤附帶的
 # daemon_reachable／daemon_busy（見 client.py 的 _probe_daemon_after_timeout）
 # 與 ``session list`` 確認 daemon 是否仍在執行，而非把這個 floor 當成精確上界。
@@ -93,6 +94,7 @@ _LONG_RPC_METHODS = frozenset({
     "session.attach",
     "session.self_test",
     "session.console_attach",  # recover 升級分支可同步跑數十秒，MAJOR-1 補上
+    "device.release", "device.attach", "session.clear", "session.bind",
 })
 
 # file.push／file.pull 已知缺口（#123 defer，MINOR-5）：兩者的 chunk 傳輸走
@@ -1932,7 +1934,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="timeout_s",
         type=float,
         default=None,
-        help="RPC timeout 秒數（未指定：一般方法 5.0；長操作 session attach/recover/self-test/console-attach 自動採固定 45.0 的 floor，#123）",
+        help="RPC timeout 秒數（未指定：一般方法 5.0；長操作 session attach/recover/self-test/console-attach、device release/attach、session clear/bind 自動採固定 45.0 的 floor，#123）",
     )
     p.add_argument(
         "--retries",

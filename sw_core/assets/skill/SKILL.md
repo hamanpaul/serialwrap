@@ -89,7 +89,7 @@ serialwrap 另提供原生 MCU flash 端點（與上面 device handoff 互補）
 
 ## Timeout 語意（#123）
 - **呼叫端必須自行處理 timeout**：CLI 回 `TIMEOUT` 只代表「CLI 不再等待」，daemon 端操作可能仍在執行、稍後成功（host 過載時尤然）。看到 TIMEOUT 先讀附帶欄位再決定下一步，勿直接重送寫入類命令。
-- **長操作自動固定 floor**：`session attach`／`session recover`／`session self-test`／`session console-attach`（recover 升級分支可同步跑數十秒）為 daemon 端同步長操作；未指定全域 `--timeout` 時 CLI 自動採固定 45s 的 floor，一般方法維持 5s。顯式指定 `--timeout` 一律照用。floor 為誠實的寬鬆常數——CLI 無從得知 daemon 端 profile 的 `timeout_s`（bcm 類平台常 15s+、多階段 probe），不隨 recover/self-test 的子命令參數縮放（daemon 端對那些參數本就有 2s cap）；仍逾時時改看下一條的診斷欄位與 `session list`。
+- **長操作自動固定 floor**：`session attach`／`session recover`／`session self-test`／`session console-attach`／`device release`／`device attach`／`session clear`／`session bind` 為 daemon 端阻塞方法（`session console-attach` 的 recover 升級分支可同步跑數十秒）；未指定全域 `--timeout` 時 CLI 自動採固定 45s 的 floor，一般方法維持 5s。顯式指定 `--timeout` 一律照用。floor 為誠實的寬鬆常數——CLI 無從得知 daemon 端 profile 的 `timeout_s`（bcm 類平台常 15s+、多階段 probe），不隨 recover/self-test 的子命令參數縮放（daemon 端對那些參數本就有 2s cap）；仍逾時時改看下一條的診斷欄位與 `session list`。
 - **TIMEOUT 錯誤帶診斷欄位**：`daemon_reachable`（1s `health.ping` 探測）分辨「daemon 死亡／斷線」（false → 檢查 daemon／裝置）與「daemon 忙碌」（true → 操作多半仍在跑，稍候以 `session list`／`self-test` 確認結果）；可達時另附 `daemon_busy`（in-flight `commands`／`sessions` 計數）。
 - **`--retries N` 僅作用唯讀方法**：只有冪等唯讀白名單（`session list`、`health.*`、`device list` 等查詢類）會在 TIMEOUT／連線失敗／`EMPTY_RESPONSE` 時指數退避重試（0.5s 起 ×2、單次上限 5s）；寫入類（attach／recover／submit…）絕不自動重送。白名單呼叫最壞總耗時約 `(retries+1) × timeout_s + 退避總和`。
 
@@ -261,7 +261,7 @@ serialwrap mcu status
 | `CMD_NOT_CANCELABLE` | rpc／posix、windows | 否 | 命令已是 done 或 error 狀態，無法取消 | 改以 command.get 讀取既有結果，不需取消 |
 | `CMD_NOT_FOUND` | rpc／posix、windows | 否 | cmd_id 不存在（已被淘汰或從未提交），或 result_tail 無法取得該命令的結果 | 確認 cmd_id 來源；命令紀錄只保留有限筆數，紀錄不存在不代表命令未執行，不得因此重送；先以 session self-test、log tail 或 WAL 查證目標狀態，是否重新執行由操作者決定 |
 | `CMD_TOO_LONG` | rpc／posix、windows | 修正參數後 | 命令的 UTF-8 長度超過硬上限 16384 bytes，拒絕提交 | 縮短命令內容；超過 4096 bytes 的軟上限仍會成功，但會附 CMD_LENGTH_WARNING 警告（非錯誤碼） |
-| `COMMAND_ABORTED_IN_FLIGHT` | rec（未生效）／posix、windows | 否 | 已確認至少寫出 1 byte 後，因 release 或 recovery 而中止 | 命令已部分送出：勿重送；先以 session self-test 確認目標狀態 |
+| `COMMAND_ABORTED_IN_FLIGHT` | rec／posix、windows | 否 | 已確認至少寫出 1 byte 後，因 release 或 recovery 而中止 | 命令已部分送出：勿重送；先以 session self-test 確認目標狀態 |
 | `COMMAND_FAILED` | rec／posix、windows | 否 | 命令結果為 ok:false 但未帶 error_code 時的後備碼 | 視為失敗，先以 session self-test 確認狀態 |
 | `CONSOLE_LINE_LIMIT_TOO_SMALL` | rpc／posix、windows | 否 | profile 的 max_console_line_chars 太小，放不下傳輸必要的命令 | 調大 profile 的 max_console_line_chars 後重試 |
 | `CONSOLE_NOT_FOUND` | rpc／posix、windows | 否 | 指定的 console client_id 不存在 | 以 console list 取得現存 client_id 後再操作 |
@@ -282,7 +282,7 @@ serialwrap mcu status
 | `FLASHING_BUSY` | rpc、rec、cli_local／posix、windows | 是 | session 處於 FLASHING 或 flash 臨界區，命令或操作被拒 | 等待燒錄結束（session 回到 ATTACHED 或 READY）後再重試 |
 | `FLASH_TARGET_IS_CONSOLE` | rpc／posix、windows | 修正參數後 | 燒錄目標是可下命令的 console 裝置，且未指定 force，拒絕執行 | 改選非 console 的燒錄目標；此碼目前 production 不可達，僅作為契約保留 |
 | `FLUSHED_BY_RECOVERY` | rec／posix、windows | 是 | 命令尚未執行即因 recovery 或 detach 被清空（未送出，可在 READY 後重送） | 確認 session 已回到 READY 後才可重送 |
-| `FLUSHED_BY_SHUTDOWN` | rec／posix、windows | 是 | daemon 停止時，尚未執行的排隊命令被清空（未送出，可重送） | daemon 重新啟動並確認 session 為 READY 後才可重送 |
+| `FLUSHED_BY_SHUTDOWN` | rpc、rec／posix、windows | 是 | daemon 停止時，尚未執行的排隊命令被清空（未送出，可重送）；原子交接凍結後的有副作用 RPC 回 reason:"handoff_frozen" | daemon 重新啟動並確認 session 為 READY 後才可重送 |
 | `FORCE_RECOVER_TIMEOUT` | rpc／posix、windows | 視情況 | 強制 recover（clear 後重新 attach）在 10 次、每次 1 秒的窗口內未達 READY | 以 session get_state 確認目前狀態後，再決定重試 recover 或處理裝置 |
 | `INTERACTIVE_EXPIRED` | rpc／posix、windows | 否 | 互動 lease 已逾時失效 | 重新 interactive open 取得新的 lease 後再送出 |
 | `INTERACTIVE_NOT_FOUND` | rpc／posix、windows | 否 | interactive_id 不存在，或 lease 狀態已不是 active | 重新 interactive open 取得 interactive_id |

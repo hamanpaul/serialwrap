@@ -705,6 +705,24 @@ class WalWriter:
             if first_error is not None:
                 raise first_error
 
+    def sync(self) -> None:
+        """同步目前已開啟的 WAL 與 mirror handle，但保留 handle 開啟。"""
+        with self._lock:
+            if self._closed:
+                return
+            first_error: Exception | None = None
+            for which in ("wal", "mirror"):
+                handle = self._handle_for(which)
+                if handle is None:
+                    continue
+                try:
+                    handle.sync()
+                except Exception as exc:
+                    if first_error is None:
+                        first_error = exc
+            if first_error is not None:
+                raise first_error
+
     def health(self) -> dict[str, Any]:
         """稽核紀錄的活體健康（#189）。
 

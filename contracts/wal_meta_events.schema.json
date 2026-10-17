@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "serialwrap WAL META events contract",
-  "x-catalog-revision": 3,
+  "x-catalog-revision": 4,
   "type": "object",
   "oneOf": [
     {
@@ -229,6 +229,41 @@
         "error": {
           "type": "string",
           "minLength": 1
+        }
+      }
+    },
+    {
+      "title": "command_aborted_in_flight",
+      "description": "已確認 UART 寫出至少 1 byte 後，命令在 drain 中止",
+      "x-status": "IMPLEMENTED",
+      "x-behavior-change": "BC-03",
+      "x-outer-record": {
+        "dir": "META",
+        "source": "system",
+        "cmd_id": "string（非 null）"
+      },
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event",
+        "confirmed_tx_bytes",
+        "tx_outcome"
+      ],
+      "properties": {
+        "event": {
+          "const": "command_aborted_in_flight"
+        },
+        "confirmed_tx_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "tx_outcome": {
+          "type": "string",
+          "enum": [
+            "complete",
+            "partial",
+            "unknown"
+          ]
         }
       }
     }
