@@ -180,6 +180,8 @@ class TestDaemonSpawnArgv:
 
     def test_source_checkout_uses_script(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delattr(sys, "frozen", raising=False)
+        # T18 起 DF-05 會查 argv0 同目錄的 serialwrapd；釘住 argv0 以免依測試執行器位置（如 ~/.local/bin）而變。
+        monkeypatch.setattr(sys, "argv", ["/nonexistent/serialwrap"])
         assert os.path.isfile(cli._daemon_script_path())  # repo checkout 前提
         assert cli._daemon_spawn_argv() == [sys.executable, cli._daemon_script_path()]
 
@@ -187,6 +189,8 @@ class TestDaemonSpawnArgv:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.delattr(sys, "frozen", raising=False)
+        # 同上：釘住 argv0，避免測試執行器同目錄的 serialwrapd 影響 DF-05 第 3 順序。
+        monkeypatch.setattr(sys, "argv", ["/nonexistent/serialwrap"])
         with mock.patch("sw_core.cli._daemon_script_path", return_value="/nonexistent/serialwrapd.py"):
             assert cli._daemon_spawn_argv() == [sys.executable, "-m", "sw_core.daemon"]
 

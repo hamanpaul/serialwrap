@@ -483,6 +483,78 @@ def _check_endpoint_reachable(proc_root: str = "/proc") -> dict:
     }
 
 
+def _check_version_pairing(manifest_path: str) -> dict:
+    """release manifest 版本配對（SC-25，非 advisory）。
+
+    只在 :func:`sw_core.release_manifest.find_release_manifest` 找到 manifest 時由
+    :func:`run_doctor` 附加；純 Python 安裝的 doctor 輸出不變。manifest 無效時
+    ``detail`` 為 ``invalid release manifest: <key>``；daemon 不可達時 ``daemon_version``
+    為 None，依判定規則列為 ``daemon_unreachable``。daemon 版本以 ``health.status`` 唯讀探測。
+    """
+    from sw_core.cli import _resolve_default_endpoint_with_source  # 延遲匯入避免循環
+    from sw_core.client import rpc_call
+    from sw_core.release_manifest import check_version_pairing, load_release_manifest
+    from sw_core.version import resolve_version
+
+    # 端點與一般 CLI 相同經 _resolve_default_endpoint_with_source 解析（含 #108 dangling fallback），
+    # 避免 config.yaml 殘留的失效路徑被誤判為 daemon_unreachable。
+    fix_unreachable = "serialwrap daemon start（或 service start）後重跑 doctor"
+    fix = "以同一發佈組合（bundle）重新安裝 CLI 與 daemon，使 release-manifest.json 與各檔案一致（detail 列出不符項）"
+    try:
+        manifest = load_release_manifest(manifest_path)
+    except ValueError as exc:
+        return {
+            "check": "version_pairing",
+            "ok": False,
+            "advisory": False,
+            "detail": str(exc),
+            "mismatches": [],
+            "fix": fix,
+        }
+
+    try:
+        endpoint, _source = _resolve_default_endpoint_with_source()
+        resp = rpc_call(endpoint, "health.status", {}, timeout_s=0.5)
+    except Exception:  # noqa: BLE001 - doctor 永不拋例外；解析或探測失敗即視為 daemon 不可達
+        resp = None
+    daemon_version = resp.get("version") if isinstance(resp, dict) and resp.get("ok") else None
+    if not isinstance(daemon_version, str) or not daemon_version.strip():
+        daemon_version = None
+
+    try:
+        item = check_version_pairing(
+            manifest,
+            manifest_dir=os.path.dirname(os.path.abspath(manifest_path)),
+            cli_version=resolve_version(),
+            daemon_version=daemon_version,
+        )
+    except Exception as exc:  # noqa: BLE001 - doctor 永不拋例外
+        return {
+            "check": "version_pairing",
+            "ok": False,
+            "advisory": False,
+            "detail": f"檢查失敗（{exc}）",
+            "mismatches": [],
+            "fix": fix,
+        }
+    if item["ok"]:
+        item["fix"] = ""
+    elif item["mismatches"] == ["daemon_unreachable"]:
+        item["fix"] = fix_unreachable  # 只缺 daemon：重裝發佈組合無助於解決
+    else:
+        item["fix"] = fix
+    return item
+
+
+def _append_version_pairing(report: list[dict]) -> None:
+    """偵測到 release manifest 時於清單末端附加 ``version_pairing``（SC-25）。"""
+    from sw_core.release_manifest import find_release_manifest  # 延遲匯入
+
+    manifest_path = find_release_manifest()
+    if manifest_path is not None:
+        report.append(_check_version_pairing(manifest_path))
+
+
 def _profile_templates_missing_bootloader_prompts(
     asset_text: str, live_text: str
 ) -> list[str]:
@@ -606,7 +678,7 @@ def run_doctor(fx=None, home=None, *, platform: str | None = None) -> list[dict]
         # Windows 單例由 WindowsSingletonLock（msvcrt 檔鎖 + TCP probe）強制，
         # 無 /proc 可掃 → 不移植 single_daemon；dialout/systemd/wsl_systemd 不適用。
         win_path_hint = "將 serialwrap.exe / serialwrapd.exe 所在目錄加入 PATH"
-        return _stamp([
+        report = [
             _check_python(),
             _check_pyyaml(),
             _check_pyserial(),
@@ -619,8 +691,10 @@ def run_doctor(fx=None, home=None, *, platform: str | None = None) -> list[dict]
             _check_wal_writable(),
             _check_profile_bootloader_prompts(),
             _check_devices_windows(),
-        ])
-    return _stamp([
+        ]
+        _append_version_pairing(report)
+        return _stamp(report)
+    report = [
         _check_python(),
         _check_pyyaml(),
         _check_on_path(fx, "serialwrap"),
@@ -649,4 +723,6 @@ def run_doctor(fx=None, home=None, *, platform: str | None = None) -> list[dict]
         _check_profile_bootloader_prompts(),
         _check_devices(),
         _check_wsl_systemd(fx),
-    ])
+    ]
+    _append_version_pairing(report)
+    return _stamp(report)

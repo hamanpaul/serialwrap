@@ -1343,6 +1343,6 @@ A/B 程序照規格 §15.9：先停 A 並確認資源釋放，才啟動 B；兩�
 - 檢查點：
   1. 既有 L2／L3 preflight 的 #154 exact 比對維持不變，並擴及 realhw 與 reliability（`TST-D-10`）。
   2. CLI 每次 RPC 的 mismatch 警告維持 Python 行為：只警告、不阻擋。
-  3. 新增 doctor check `version_pairing`（非 advisory，`SC-25`）：比對 manifest `pairing`、自身 `--version`、`daemon status.version`、manifest 的 `components.*.sha256` 與實際檔案 sha256。不一致時 `ok:false`，detail 列出差異。
+  3. 新增 doctor check `version_pairing`（非 advisory，`SC-25`）：比對 manifest `pairing`、自身 `--version`、`daemon status.version`、manifest 的 `components.*.sha256` 與實際檔案 sha256。不一致時 `ok:false`，detail 列出差異。 Python 端（P1 T18）的限縮：`components.assets.profiles_sha256` 與 `components.supervisor.definition_sha256` 只驗存在且為 64 位小寫 hex（profiles 物化路徑與監管定義由 setup／P4 產生，Python doctor 無穩定的比對來源），實際比對由 P4 Rust doctor 承接；Python 端只在偵測到 manifest 時附加此項。
   4. `setup` 與 `rollback` 在啟動新版本後必須驗證配對；失敗時回到完整的 Previous 組合。
 - `binary_sha256` 不出現在 RPC 回應中，只存在於 manifest（規格 §9.5）。

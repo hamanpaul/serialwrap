@@ -1,0 +1,4 @@
+{"files":{"README.txt":"single file\n"},"tree_sha256":"a153cdc5433792e2a7b11be1ca54432a417893d85ee9ebba69b83d4623650dd3"}
+{"files":{"a/b/c.py":"print('nested')\n","a/top.py":"x = 1\n","z.py":"y = 2\n"},"tree_sha256":"b9e4a07d243b56e4efcbcba1dee0ecf2c4e590745e6f1e78ad437c6face908df"}
+{"files":{"ascii.txt":"a\n","pkg/模組.py":"VALUE = 1\n","中.py":"# 中文檔名\n"},"tree_sha256":"c60c09a3da62b894dcad764476ea9456f95b4127b4dc336501b2d72ff2f2ad27"}
+{"files":{"B.py":"B = 1\n","a-b.py":"AB = 2\n","a.py":"A = 3\n","a/b.py":"NESTED = 4\n"},"tree_sha256":"225abfe72d4cee29fe6a364173aefa3491348018c5b6d4501876b75c6d9c44a1"}

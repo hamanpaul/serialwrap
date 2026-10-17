@@ -785,8 +785,8 @@ changes:
     related_decisions: ["OD-03", "OD-12"]
   - id: "SC-25"
     kind: "SC"
-    title: "release manifest 與 doctor version_pairing（Rust-only）"
-    status: "APPROVED"
+    title: "release manifest 與 doctor version_pairing（Python 僅在 bundle 內偵測到 manifest 時）"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -796,17 +796,18 @@ changes:
     owner_item: null
     default_if_pending: null
     applies_to:
-      python: null
+      python:
+        min_version: "0.4.0"
       rust:
         stage: "stage-1a"
     approved_at_revision: 1
     spec_refs: ["§9.5", "OD-13"]
     reconciliation_refs: ["PLT-D-12", "GAP-G-04"]
-    scope: "rust_only"
+    scope: "python_when_manifest_present"
     ab_participation: "absolute_only"
-    phases: ["P2", "P3", "P4"]
+    phases: ["P1", "P2", "P3", "P4"]
     case_ids: ["sc25-release-manifest-version-pairing"]
-    compatibility_impact: "新增 release manifest（artifact 身分與版本配對）與 doctor 的 version_pairing 檢查；CLI 既有版本警告保留。本 Phase 先登記為 rust_only。"
+    compatibility_impact: "新增 release manifest（artifact 身分與版本配對）與 doctor 的 version_pairing 檢查；CLI 既有版本警告保留。Python 側僅在 bundle 內偵測到 release manifest 時附加 version_pairing（非 advisory）；純 Python 安裝的 doctor 輸出不變。"
     approval_conditions: "警告保留；新增 manifest 與 doctor 配對檢查"
     related_decisions: ["OD-13"]
   - id: "SC-26"
@@ -973,7 +974,7 @@ changes:
   - id: "DF-05"
     kind: "DF"
     title: "daemon start 的 daemon 定位順序"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-15"

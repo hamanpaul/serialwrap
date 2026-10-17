@@ -2417,7 +2417,7 @@ serialwrap.exe doctor
 serialwrap.exe skill --platform windows
 ```
 
-- `daemon start` 的 spawn 解析（#131）：release exe（PyInstaller 凍結）→ `serialwrap.exe` 同層 `serialwrapd.exe` → PATH 上的 `serialwrapd`；原始碼 checkout → `serialwrapd.py`；pip/pipx 安裝 → `-m sw_core.daemon`。
+- `daemon start` 的 daemon 定位順序（DF-05，P1 T18；POSIX 與 Windows 相同）：發佈組合 `release-manifest.json` 的 `components.daemon.launcher.path`（manifest 由 `SERIALWRAP_RELEASE_MANIFEST` 指定，未指定時取 bundle 根的 `release-manifest.json`）→ release exe（PyInstaller 凍結）同層 `serialwrapd.exe`／PATH 上的 `serialwrapd` → 與 `serialwrap` 同目錄的 `serialwrapd`（Windows 為 `serialwrapd.exe`）→ 原始碼 checkout 的 `serialwrapd.py` → `python -m sw_core.daemon`（pip/pipx 安裝）。偵測到 release manifest 時，`serialwrap doctor` 另附非 advisory 的 `version_pairing` 檢查（SC-25）：CLI 與 daemon 版本須等於 bundle 版本，並比對 launcher／runtime／套件樹與 SKILL 資產雜湊；純 Python 安裝的 doctor 輸出不變。
 - `--endpoint` 在 Windows 的 `daemon start` 開放 **loopback tcp://** 作為本機 bind 位址（非 loopback 照舊 `REMOTE_NOT_SUPPORTED`；POSIX 行為不變）。
 
 > ⚠️ Windows 尚無 systemd 監管（PORT-8）。長期使用建議以 Windows Task Scheduler 或 NSSM 管理 `serialwrapd.exe` 生命週期；`device release` / `device attach` 編排已可用（底層 COM release/reclaim primitive 可用）。

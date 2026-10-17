@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import re
-import shutil
+import shutil  # noqa: F401 — tests/test_win_daemon_start.py 以 sw_core.cli.shutil.which 進行 patch
 import socket
 import subprocess
 import sys
@@ -33,6 +33,7 @@ from .constants import (
 from .cli_trace import configure_cli_trace_logger, emit_rpc_trace
 from .doctor_cmd import DOCTOR_ADVISORY_CHECKS, DOCTOR_ADVISORY_CHECKS_WIN, run_doctor
 from .platform_backends import select_rpc_backend
+from .release_manifest import daemon_launch_argv
 from .runtime_config import RuntimeConfig
 from .service_ctl import service_action
 from .sysenv import force_utf8_stdio
@@ -200,22 +201,12 @@ def _is_loopback_tcp(ep: str) -> bool:
 
 
 def _daemon_spawn_argv() -> list[str] | None:
-    """解析 spawn serialwrapd 的 argv（#131，Windows 路徑）。
+    """解析 spawn serialwrapd 的 argv（#131 原 Windows 路徑；T18 起委派 DF-05 定位）。
 
-    凍結（PyInstaller onefile）→ ``sys.executable`` 同層 serialwrapd.exe →
-    PATH 上的 serialwrapd，全落空回 None；原始碼 checkout → serialwrapd.py；
-    安裝套件（無 repo script）→ ``-m sw_core.daemon``。
+    spawn 本身已改呼叫 :func:`sw_core.release_manifest.daemon_launch_argv`；本函式保留
+    給既有測試（``tests/test_win_daemon_start.py``）以相同回傳契約（無法定位回 None）使用。
     """
-    if getattr(sys, "frozen", False):
-        sibling = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "serialwrapd.exe")
-        if os.path.isfile(sibling):
-            return [sibling]
-        found = shutil.which("serialwrapd")
-        return [found] if found else None
-    script = _daemon_script_path()
-    if os.path.isfile(script):
-        return [sys.executable, script]
-    return [sys.executable, "-m", "sw_core.daemon"]
+    return daemon_launch_argv(argv0=sys.argv[0]) or None
 
 
 def _decode_env_text(raw: bytes) -> str:
@@ -525,20 +516,18 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
                 "target_socket": sock,
             })
             return 2
-    if is_win:
-        daemon_argv = _daemon_spawn_argv()
-        if daemon_argv is None:
-            resp = {
-                "ok": False,
-                "error_code": "DAEMON_BINARY_NOT_FOUND",
-                "message": "找不到 serialwrapd（serialwrap.exe 同層或 PATH 上皆無）；請確認發行包完整",
-            }
-            _print(resp)
-            _mirror_err(resp, context="daemon start")
-            return 2
-    else:
-        # POSIX：argv 組法逐字保留既有行為。
-        daemon_argv = [sys.executable, _daemon_script_path()]
+    # DF-05 定位順序（release manifest launcher → 同層 serialwrapd → checkout 腳本 →
+    # python -m sw_core.daemon）；POSIX 與 Windows 共用，取代原先 spawn 不存在的 serialwrapd.py（CLI-7.4）。
+    daemon_argv = daemon_launch_argv(argv0=sys.argv[0])
+    if not daemon_argv:
+        resp = {
+            "ok": False,
+            "error_code": "DAEMON_BINARY_NOT_FOUND",
+            "message": "找不到 serialwrapd（serialwrap.exe 同層或 PATH 上皆無）；請確認發行包完整",
+        }
+        _print(resp)
+        _mirror_err(resp, context="daemon start")
+        return 2
     cmd = [
         *daemon_argv,
         "--profile-dir",

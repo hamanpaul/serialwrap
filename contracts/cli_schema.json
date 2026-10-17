@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/hamanpaul/serialwrap/contracts/cli_schema.json",
   "title": "serialwrap CLI contract",
-  "x-catalog-revision": 3,
+  "x-catalog-revision": 4,
   "x-prog": "serialwrap",
   "x-conventions": {
     "params_source": "rpc.params 的值為來源：字串為該子命令 argparse namespace 的 dest，送出 args.<dest> 原值；\"selector|com\" 表示 args.selector or args.com（盤點 01 §6.6 stream tail、§6.7 log tail-raw／tail-text）；{\"$document\": \"file\"} 表示 --file 讀入的整份 JSON 物件即為 RPC params（event add）。",
@@ -2649,25 +2649,25 @@
       "timeout_s": 5.0
     },
     "sources": [
-      "sw_core/cli.py:81",
-      "sw_core/cli.py:83"
+      "sw_core/cli.py:82",
+      "sw_core/cli.py:84"
     ]
   },
   "x-fixed-timeouts": [
     {
       "name": "daemon_stop_wait_s",
       "value": 2.0,
-      "source": "sw_core/cli.py:650"
+      "source": "sw_core/cli.py:639"
     },
     {
       "name": "daemon_start_ping_timeout_s",
       "value": 0.5,
-      "source": "sw_core/cli.py:602"
+      "source": "sw_core/cli.py:591"
     },
     {
       "name": "daemon_start_status_timeout_s",
       "value": 1.0,
-      "source": "sw_core/cli.py:613"
+      "source": "sw_core/cli.py:602"
     },
     {
       "name": "daemon_ready_poll",
@@ -2679,22 +2679,22 @@
         "tries": 50,
         "interval_s": 0.2
       },
-      "source": "sw_core/cli.py:589-591"
+      "source": "sw_core/cli.py:578-580"
     },
     {
       "name": "healthy_daemon_probe_timeout_s",
       "value": 0.5,
-      "source": "sw_core/cli.py:369-380"
+      "source": "sw_core/cli.py:360-371"
     },
     {
       "name": "setup_ping_timeout_s",
       "value": 0.5,
-      "source": "sw_core/cli.py:1643"
+      "source": "sw_core/cli.py:1632"
     },
     {
       "name": "setup_mcu_status_timeout_s",
       "value": 0.5,
-      "source": "sw_core/cli.py:1650"
+      "source": "sw_core/cli.py:1639"
     },
     {
       "name": "doctor_health_status_timeout_s",
@@ -2729,7 +2729,7 @@
     {
       "name": "unix_endpoint_liveness_socket_timeout_s",
       "value": 0.2,
-      "source": "sw_core/cli.py:720"
+      "source": "sw_core/cli.py:709"
     },
     {
       "name": "win_tcp_liveness_connect_timeout_s",
@@ -2810,6 +2810,12 @@
           "method": "health.status",
           "timeout_s": 0.5,
           "where": "doctor_cmd.py:317、382"
+        },
+        {
+          "method": "health.status",
+          "timeout_s": 0.5,
+          "condition": "僅偵測到 release manifest 時（SC-25）",
+          "where": "doctor_cmd.py:517"
         }
       ]
     },

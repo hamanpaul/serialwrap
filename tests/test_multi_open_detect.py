@@ -131,6 +131,29 @@ class TestDetectMultiOpen(unittest.TestCase):
         # 只有一個真正 daemon → 非多開
         self.assertFalse(res["multi_open"])
 
+    def test_python_m_sw_core_daemon_detected(self) -> None:
+        """DF-05 第 5 順序 `python -m sw_core.daemon`（pipx／安裝佈局）須被偵測為 daemon（P4 Task 1 同步要求）。
+
+        包含帶 `-I -B` 旗標的 bundled runtime 形式；`-m sw_core.cli` 與 `-c "-m sw_core.daemon"`
+        （裸字串）不得誤判。
+        """
+        from sw_core.multi_open import detect_multi_open
+
+        _make_fake_proc(
+            self.proc,
+            {
+                "4001": {"cmdline": "python3\0-m\0sw_core.daemon\0--socket\0/run/a.sock\0", "fd": {}},
+                "4002": {"cmdline": "python3\0-I\0-B\0-m\0sw_core.daemon\0--socket\0/run/b.sock\0", "fd": {}},
+                "4003": {"cmdline": "python3\0-m\0sw_core.cli\0status\0", "fd": {}},
+                "4004": {"cmdline": "python3\0-c\0-m sw_core.daemon\0", "fd": {}},
+            },
+        )
+        res = detect_multi_open(proc_root=str(self.proc), tty_paths=[])
+        self.assertEqual({d["pid"] for d in res["daemons"]}, {4001, 4002})
+        sockets = {d["pid"]: d["socket"] for d in res["daemons"]}
+        self.assertEqual(sockets, {4001: "/run/a.sock", 4002: "/run/b.sock"})
+        self.assertTrue(res["multi_open"])
+
     def test_missing_proc_root_degrades_unknown(self) -> None:
         from sw_core.multi_open import detect_multi_open
 

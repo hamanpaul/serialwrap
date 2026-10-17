@@ -27,13 +27,15 @@ def _iter_pids(proc_root: str):
 def _is_serialwrapd(proc_root: str, pid: int) -> bool:
     """判定 ``/proc/<pid>`` 是否為 serialwrapd daemon 程序（#101 5a）。
 
-    需涵蓋三種真實啟動形式，同時排除 ``grep serialwrapd`` 這類「裸字串含 serialwrapd」誤判：
+    需涵蓋四種真實啟動形式，同時排除 ``grep serialwrapd`` 這類「裸字串含 serialwrapd」誤判：
 
     - argv0 的 basename 為 ``serialwrapd``（直接 exec console_script，或 pipx 入口），或
     - 某個**路徑型**參數（含 ``/``）的 basename 為 ``serialwrapd``——pipx/venv console_script
       被 python 執行的形式 ``python /path/bin/serialwrapd --socket ...``（argv0=python、
       argv1=可執行檔路徑、basename 無 ``.py``；**這是實機 prod daemon 的形式**），或
-    - 某參數以 ``serialwrapd.py`` 結尾（薄 shim ``python serialwrapd.py``）。
+    - 某參數以 ``serialwrapd.py`` 結尾（薄 shim ``python serialwrapd.py``），或
+    - 連續出現 ``-m sw_core.daemon``（DF-05 第 5 順序，pipx／安裝佈局的 ``python -m`` 啟動；
+      P1 T18 起 ``daemon start`` 會實際 spawn 此形式，故須計入多開偵測，P4 計畫 Task 1 同步要求）。
 
     關鍵：對裸名 ``serialwrapd`` 要求含路徑分隔 ``/`` 才算，以排除 ``grep serialwrapd``
     （arg 為裸字串、無路徑）的誤判；``serialwrapd.py`` 因副檔名特異性高，放寬不要求路徑。
@@ -59,6 +61,9 @@ def _is_serialwrapd(proc_root: str, pid: int) -> bool:
     for p in parts[1:]:
         if "/" in p and os.path.basename(p) == "serialwrapd":
             return True
+    # python [-I -B ...] -m sw_core.daemon：-m 與模組名必須相鄰，排除 `-c "-m sw_core.daemon"` 等裸字串誤判。
+    if any(a == "-m" and b == "sw_core.daemon" for a, b in zip(parts, parts[1:])):
+        return True
     return False
 
 
