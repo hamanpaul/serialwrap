@@ -1,8 +1,7 @@
-//! P4-T3 紅燈測試：`sw_pal::service_ctl`（systemd、windows-task、windows-service 與交接前監管拉起抑制）。
+//! P4-T3 行為測試：systemd、windows-task、windows-service 與交接前監管拉起抑制。
 //!
-//! 紅燈骨架的行為方法皆為 `unimplemented!("P4-T3")`，故本檔測試在實作前應全數以該訊息 panic。
-//! 測試名稱與斷言取自 `docs/rust-refactor/plans/05-stage1b-rust-cli-mgmt.md` Task 3。
-//! 兩個 `cap_supervisor_runtime__*` 測試標記 `#[ignore]`，只由擁有者授權的主機執行。
+//! 測試名稱與斷言對應 `docs/rust-refactor/plans/05-stage1b-rust-cli-mgmt.md` Task 3。
+//! `cap_supervisor_runtime__*` 需在隔離的 systemd 容器或 Windows 環境執行。
 #![allow(dead_code, unused_imports)]
 
 use std::path::{Path, PathBuf};
@@ -10,9 +9,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sw_pal::fakes::*;
+use sw_pal::fs_ops::{FileLockGuard, FsOps, LinkKind};
 use sw_pal::service_ctl::*;
-use sw_pal::traits::{Clock, SysEnv};
-use sw_pal::PalErrorKind;
+use sw_pal::traits::{Clock, FsRead, PalError, PalErrorKind, PalResult, SysEnv};
 
 const PS_QUERY: &str = "try { (Get-ScheduledTask -TaskName 'serialwrap' -ErrorAction Stop).State.ToString() } catch { if ($_.CategoryInfo.Category -eq 'ObjectNotFound') { 'NotFound' } else { exit 3 } }";
 
@@ -34,6 +33,127 @@ fn ps_argv() -> Vec<&'static str> {
 
 fn user_dropin(home: &Path) -> PathBuf {
     home.join(".config/systemd/user/serialwrap.service.d/90-serialwrap-update-hold.conf")
+}
+
+fn supervisor_definition(
+    mode: &str,
+    name: &str,
+    register_held: bool,
+    definition_path: Option<PathBuf>,
+) -> SupervisorDefinition {
+    SupervisorDefinition {
+        mode: sm(mode),
+        name: name.into(),
+        exec: vec![
+            "C:\\p\\bin\\serialwrapd.exe".into(),
+            "--socket".into(),
+            "tcp://127.0.0.1:48700".into(),
+        ],
+        working_dir: None,
+        run_user: None,
+        env: vec![],
+        definition_path,
+        register_held,
+    }
+}
+
+fn decode_utf16le_bom(bytes: &[u8]) -> String {
+    assert_eq!(&bytes[..2], &[0xff, 0xfe]);
+    let units = bytes[2..]
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect::<Vec<_>>();
+    String::from_utf16_lossy(&units)
+}
+
+struct IsolatedSystemdFs {
+    inner: std::sync::Arc<dyn FsOps>,
+}
+
+impl FsRead for IsolatedSystemdFs {
+    fn read(&self, path: &Path) -> PalResult<Vec<u8>> {
+        if path.starts_with("/etc/systemd/system") {
+            return Err(PalError::plain(
+                PalErrorKind::NotFound,
+                "isolated systemd destination is not present in the test filesystem",
+            ));
+        }
+        self.inner.read(path)
+    }
+
+    fn exists(&self, path: &Path) -> bool {
+        !path.starts_with("/etc/systemd/system") && self.inner.exists(path)
+    }
+
+    fn is_dir(&self, path: &Path) -> bool {
+        self.inner.is_dir(path)
+    }
+
+    fn list_dir(&self, path: &Path) -> PalResult<Vec<String>> {
+        self.inner.list_dir(path)
+    }
+}
+
+impl FsOps for IsolatedSystemdFs {
+    fn atomic_write(&self, path: &Path, data: &[u8], mode: Option<u32>) -> PalResult<()> {
+        self.inner.atomic_write(path, data, mode)
+    }
+
+    fn mkdirs(&self, path: &Path) -> PalResult<()> {
+        self.inner.mkdirs(path)
+    }
+
+    fn remove_file(&self, path: &Path) -> PalResult<()> {
+        self.inner.remove_file(path)
+    }
+
+    fn copy_preserving(&self, from: &Path, to: &Path) -> PalResult<()> {
+        self.inner.copy_preserving(from, to)
+    }
+
+    fn copy_tree(&self, from: &Path, to: &Path) -> PalResult<()> {
+        self.inner.copy_tree(from, to)
+    }
+
+    fn remove_tree(&self, path: &Path) -> PalResult<()> {
+        self.inner.remove_tree(path)
+    }
+
+    fn replace(&self, from: &Path, to: &Path) -> PalResult<()> {
+        self.inner.replace(from, to)
+    }
+
+    fn write_file(&self, path: &Path, data: &[u8]) -> PalResult<()> {
+        self.inner.write_file(path, data)
+    }
+
+    fn read_link(&self, path: &Path) -> PalResult<Option<PathBuf>> {
+        self.inner.read_link(path)
+    }
+
+    fn set_mode(&self, path: &Path, mode: u32) -> PalResult<()> {
+        self.inner.set_mode(path, mode)
+    }
+
+    fn sync_dir(&self, path: &Path) -> PalResult<()> {
+        self.inner.sync_dir(path)
+    }
+
+    fn symlink_file(&self, link: &Path, target: &Path) -> PalResult<()> {
+        self.inner.symlink_file(link, target)
+    }
+
+    fn symlink_or_copy_dir(&self, link: &Path, target: &Path) -> PalResult<LinkKind> {
+        self.inner.symlink_or_copy_dir(link, target)
+    }
+
+    fn file_lock_exclusive(&self, path: &Path, blocking: bool) -> PalResult<FileLockGuard> {
+        self.inner.file_lock_exclusive(path, blocking)
+    }
+}
+
+fn isolated_systemd_fs() -> std::sync::Arc<dyn FsOps> {
+    std::sync::Arc::new(IsolatedSystemdFs { inner: real_fs() })
 }
 
 /// 使用者 systemd 的 hold／release 腳本化回應（drop-in 寫入位於 `home` 下的真實暫存目錄）。
@@ -270,12 +390,106 @@ fn systemd_query_maps_is_active() {
     assert!(matches!(mk(3, "inactive\n"), TaskQuery::NotRunning(_)));
     assert!(matches!(mk(3, "failed\n"), TaskQuery::NotRunning(_)));
     assert_eq!(mk(4, ""), TaskQuery::NotFound);
+    assert_eq!(mk(4, "inactive\n"), TaskQuery::NotFound);
 
     let env_missing = FakeSysEnv::builder()
         .command_err(&q_argv, PalErrorKind::NotFound, "No such file or directory")
         .build();
     let q = SystemdCtl::new(env_missing, real_fs(), FakeClock::new()).query(&sm("systemd-user"));
     assert!(matches!(q, TaskQuery::QueryFailed(_)), "執行檔不存在 → {q:?}");
+}
+
+#[test]
+fn systemd_install_register_held_never_enables_or_starts() {
+    let user_env = FakeSysEnv::builder().build();
+    let user_ctl = SystemdCtl::new(user_env.clone(), real_fs(), FakeClock::new());
+    let user_def = supervisor_definition("systemd-user", "serialwrap", true, None);
+    user_ctl.install(&user_def, false);
+    assert_eq!(
+        user_env.calls(),
+        vec![argv(&["systemctl", "--user", "daemon-reload"])]
+    );
+
+    let system_env = FakeSysEnv::builder().build();
+    let system_ctl = SystemdCtl::new(system_env.clone(), real_fs(), FakeClock::new());
+    let system_def = supervisor_definition("systemd-system", "serialwrap", true, None);
+    system_ctl.install(&system_def, true);
+    assert_eq!(
+        system_env.calls(),
+        vec![argv(&["sudo", "systemctl", "daemon-reload"])]
+    );
+    assert_eq!(
+        system_ctl.install_plan(&system_def),
+        vec![argv(&["sudo", "systemctl", "daemon-reload"])]
+    );
+}
+
+#[test]
+fn windows_service_install_plan_register_held_is_disabled_and_not_started() {
+    let env = FakeSysEnv::builder().build();
+    let ctl = WindowsServiceCtl::new(env, FakeClock::new());
+    let def = supervisor_definition("windows-service", "serialwrap", true, None);
+    let plan = ctl.install_plan(&def);
+    assert_eq!(plan.len(), 2);
+    assert!(plan[0]
+        .windows(2)
+        .any(|pair| pair[0] == "start=" && pair[1] == "disabled"));
+    assert!(!plan.iter().any(|argv| argv.get(1).is_some_and(|arg| arg == "start")));
+}
+
+#[test]
+fn windows_task_install_register_held_writes_disabled_xml() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = FakeSysEnv::builder().user_identity("HOST\\alice").build();
+    let ctl = WindowsTaskCtl::new(env.clone(), real_fs(), FakeClock::new());
+    let path = tmp.path().join("held.task.xml");
+    let def = supervisor_definition("windows-task", "serialwrap", true, Some(path.clone()));
+    let records = ctl.install(&def, false);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].rc, 0);
+    let xml = decode_utf16le_bom(&std::fs::read(path).unwrap());
+    assert!(xml.contains(
+        "    <AllowStartOnDemand>true</AllowStartOnDemand>\r\n    <Enabled>false</Enabled>"
+    ));
+}
+
+#[test]
+fn windows_task_install_write_failures_report_nonzero_without_running_create() {
+    let tmp = tempfile::tempdir().unwrap();
+    let blocker = tmp.path().join("not-a-directory");
+    std::fs::write(&blocker, b"x").unwrap();
+    let env = FakeSysEnv::builder().build();
+    let ctl = WindowsTaskCtl::new(env.clone(), real_fs(), FakeClock::new());
+
+    let def = supervisor_definition(
+        "windows-task",
+        "serialwrap",
+        false,
+        Some(blocker.join("task.xml")),
+    );
+    let records = ctl.install(&def, false);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].rc, -1);
+    assert_eq!(records[0].argv, ctl.install_plan(&def)[0]);
+    assert!(env.calls().is_empty(), "XML 寫入失敗後不得執行 /Create");
+
+    let mut no_path = supervisor_definition("windows-task", "serialwrap", false, None);
+    no_path.definition_path = None;
+    let records = ctl.install(&no_path, false);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].rc, -1);
+
+    let mut no_exec = supervisor_definition(
+        "windows-task",
+        "serialwrap",
+        false,
+        Some(tmp.path().join("empty.task.xml")),
+    );
+    no_exec.exec.clear();
+    let records = ctl.install(&no_exec, false);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].rc, -1);
+    assert!(env.calls().is_empty());
 }
 
 #[test]
@@ -340,6 +554,61 @@ fn windows_service_query_parses_state_code() {
     assert_eq!(q(0, "        STATE              : 4  RUNNING\r\n"), TaskQuery::Running);
     assert_eq!(q(1060, ""), TaskQuery::NotFound);
     assert!(matches!(q(5, "Access is denied.\r\n"), TaskQuery::QueryFailed(_)));
+    assert!(matches!(q(0, "unrecognized output\r\n"), TaskQuery::QueryFailed(_)));
+}
+
+#[test]
+fn windows_service_named_hold_release_restores_the_same_service() {
+    let name = "serialwrap-captest-review";
+    let qc = ["sc.exe", "qc", name];
+    let env = FakeSysEnv::builder()
+        .command_seq(
+            &qc,
+            &[
+                (0, "START_TYPE : 2 AUTO_START\r\n", ""),
+                (0, "START_TYPE : 4 DISABLED\r\n", ""),
+                (0, "START_TYPE : 2 AUTO_START\r\n", ""),
+            ],
+        )
+        .build();
+    let ctl = WindowsServiceCtl::new(env.clone(), FakeClock::new());
+    let hold = ctl
+        .hold_autostart_named(&sm("windows-service"), name, true)
+        .expect("named hold");
+    assert_eq!(hold.name.as_deref(), Some(name));
+    ctl.release_autostart(&hold, Some(true), true)
+        .expect("named release");
+    let calls = env.calls();
+    assert!(calls.iter().all(|call| !call.contains(&"serialwrap".to_string())));
+    assert!(calls.contains(&argv(&["sc.exe", "config", name, "start=", "disabled"])));
+    assert!(calls.contains(&argv(&["sc.exe", "config", name, "start=", "auto"])));
+    assert!(calls.contains(&argv(&["sc.exe", "qc", name])));
+}
+
+#[test]
+fn windows_service_hold_state_uses_return_code_not_error_text() {
+    let missing = FakeSysEnv::builder()
+        .command(&["sc.exe", "qc", "serialwrap"], 1060, "", "")
+        .build();
+    assert_eq!(
+        WindowsServiceCtl::new(missing, FakeClock::new())
+            .autostart_hold_state(&sm("windows-service")),
+        HoldState::NotHeld
+    );
+
+    let denied = FakeSysEnv::builder()
+        .command(
+            &["sc.exe", "qc", "serialwrap"],
+            5,
+            "",
+            "服務不存在，但拒絕存取",
+        )
+        .build();
+    assert!(matches!(
+        WindowsServiceCtl::new(denied, FakeClock::new())
+            .autostart_hold_state(&sm("windows-service")),
+        HoldState::QueryFailed(_)
+    ));
 }
 
 /// `contracts/golden/windows_cmdline.ndjson` 的一行：`args`（輸入）、`joined`（Windows Python `list2cmdline`）、`split`（原生 `CommandLineToArgvW`）。
@@ -492,6 +761,7 @@ fn systemd_user_hold_writes_dropin_reload_disable_verify() {
     let ctl = SystemdCtl::new(env.clone(), real_fs(), FakeClock::new());
     let hold = ctl.hold_autostart(&sm("systemd-user"), false).expect("hold 應成功");
     assert_eq!(hold.kind, AutostartHoldKind::SystemdDropIn);
+    assert_eq!(ctl.autostart_hold_state(&sm("systemd-user")), HoldState::Held);
     assert_eq!(hold.prior_restart.as_deref(), Some("on-failure"));
     assert_eq!(hold.prior_enabled, Some(true));
     let path = user_dropin(home.path());
@@ -516,6 +786,65 @@ fn systemd_user_hold_writes_dropin_reload_disable_verify() {
 }
 
 #[test]
+fn systemd_home_and_staging_paths_prefer_home_over_passwd_home() {
+    let home = tempfile::tempdir().unwrap();
+    let passwd_home = tempfile::tempdir().unwrap();
+    let user_verify = argv(&[
+        "systemctl",
+        "--user",
+        "show",
+        "serialwrap",
+        "-p",
+        "Restart",
+        "-p",
+        "RefuseManualStart",
+        "-p",
+        "UnitFileState",
+    ]);
+    let user_verify_refs = user_verify.iter().map(String::as_str).collect::<Vec<_>>();
+    let user_env = FakeSysEnv::builder()
+        .home(home.path())
+        .passwd_home(passwd_home.path())
+        .command(&user_verify_refs, 0, HOLD_VERIFY, "")
+        .build();
+    let user_ctl = SystemdCtl::new(user_env, real_fs(), FakeClock::new());
+    let user_hold = user_ctl
+        .hold_autostart(&sm("systemd-user"), false)
+        .expect("user hold");
+    assert_eq!(user_hold.dropin_path.as_deref(), Some(user_dropin(home.path()).as_path()));
+    assert!(user_dropin(home.path()).exists());
+    assert!(!user_dropin(passwd_home.path()).exists());
+
+    let system_verify = argv(&[
+        "systemctl",
+        "show",
+        "serialwrap",
+        "-p",
+        "Restart",
+        "-p",
+        "RefuseManualStart",
+        "-p",
+        "UnitFileState",
+    ]);
+    let system_verify_refs = system_verify.iter().map(String::as_str).collect::<Vec<_>>();
+    let system_env = FakeSysEnv::builder()
+        .home(home.path())
+        .passwd_home(passwd_home.path())
+        .command(&system_verify_refs, 0, HOLD_VERIFY, "")
+        .build();
+    let system_ctl = SystemdCtl::new(system_env, isolated_systemd_fs(), FakeClock::new());
+    let _system_hold = system_ctl
+        .hold_autostart(&sm("systemd-system"), true)
+        .expect("system hold");
+    let staging = home.path().join(".local/share/serialwrap/update-hold.conf");
+    assert_eq!(std::fs::read(staging).unwrap(), DROPIN_BYTES.as_bytes());
+    assert!(!passwd_home
+        .path()
+        .join(".local/share/serialwrap/update-hold.conf")
+        .exists());
+}
+
+#[test]
 fn systemd_hold_verify_mismatch_reverts_and_fails() {
     let home = tempfile::tempdir().unwrap();
     let env = user_env(home.path(), "UnitFileState=enabled\nRefuseManualStart=no\nRestart=on-failure\n", RELEASE_OK);
@@ -531,6 +860,43 @@ fn systemd_hold_verify_mismatch_reverts_and_fails() {
     assert!(tail.contains(&argv(&["systemctl", "--user", "daemon-reload"])), "撤銷後必須 daemon-reload");
     assert!(tail.contains(&argv(&["systemctl", "--user", "enable", "serialwrap"])), "撤銷時還原 prior_enabled");
     assert_eq!(ctl.autostart_hold_state(&sm("systemd-user")), HoldState::NotHeld);
+}
+
+#[test]
+fn systemd_hold_over_existing_dropin_does_not_record_post_hold_values() {
+    let home = tempfile::tempdir().unwrap();
+    let path = user_dropin(home.path());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, DROPIN_BYTES).unwrap();
+    let env = user_env(home.path(), HOLD_VERIFY, RELEASE_OK);
+    let ctl = SystemdCtl::new(env.clone(), real_fs(), FakeClock::new());
+    let hold = ctl
+        .hold_autostart(&sm("systemd-user"), false)
+        .expect("既有 hold 應可重入");
+    assert_eq!(hold.prior_restart, None);
+    assert_eq!(hold.prior_enabled, None);
+    assert_eq!(
+        env.calls(),
+        vec![
+            argv(&["systemctl", "--user", "daemon-reload"]),
+            argv(&["systemctl", "--user", "disable", "serialwrap"]),
+            argv(&[
+                "systemctl",
+                "--user",
+                "show",
+                "serialwrap",
+                "-p",
+                "Restart",
+                "-p",
+                "RefuseManualStart",
+                "-p",
+                "UnitFileState",
+            ]),
+        ]
+    );
+    ctl.release_autostart(&hold, None, false)
+        .expect("缺少原始值時應能依解除後狀態驗證");
+    assert!(!path.exists());
 }
 
 #[test]
@@ -551,7 +917,8 @@ fn systemd_system_hold_without_sudo_needs_sudo() {
     assert!(!staging.exists(), "無 sudo 時不得寫入 staging");
 
     let env_sudo = FakeSysEnv::builder().home(home.path()).build();
-    let _ = SystemdCtl::new(env_sudo.clone(), real_fs(), FakeClock::new()).hold_autostart(&sm("systemd-system"), true);
+    let _ = SystemdCtl::new(env_sudo.clone(), isolated_systemd_fs(), FakeClock::new())
+        .hold_autostart(&sm("systemd-system"), true);
     let staging_s = staging.display().to_string();
     let calls = env_sudo.calls();
     let install = vec![
@@ -578,6 +945,7 @@ fn systemd_release_removes_dropin_and_restores() {
     let n0 = env.calls().len();
     ctl.release_autostart(&hold, Some(true), false).expect("release 應成功");
     assert!(!user_dropin(home.path()).exists(), "release 必須移除 drop-in");
+    assert_eq!(ctl.autostart_hold_state(&sm("systemd-user")), HoldState::NotHeld);
     assert_eq!(
         env.calls()[n0..].to_vec(),
         vec![
@@ -620,6 +988,184 @@ fn windows_task_hold_is_disable_and_release_restores() {
     let hold2 = ctl2.hold_autostart(&sm("windows-task"), false).expect("hold2");
     ctl2.release_autostart(&hold2, Some(false), false).expect("release2");
     assert!(!env2.calls().iter().any(|c| c.contains(&"/ENABLE".to_string())), "Some(false) 不得 /ENABLE");
+}
+
+#[test]
+fn windows_task_named_hold_release_uses_the_registered_name() {
+    let name = "serialwrap-captest-review";
+    let ps = format!(
+        "try {{ (Get-ScheduledTask -TaskName '{name}' -ErrorAction Stop).State.ToString() }} catch {{ if ($_.CategoryInfo.Category -eq 'ObjectNotFound') {{ 'NotFound' }} else {{ exit 3 }} }}"
+    );
+    let ps_argv = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps.as_str()];
+    let xml_argv = ["schtasks", "/Query", "/TN", name, "/XML"];
+    let xml = "<Task><Settings><Enabled>true</Enabled></Settings></Task>";
+    let env = FakeSysEnv::builder()
+        .command(&xml_argv, 0, xml, "")
+        .command(&[
+            "schtasks",
+            "/Change",
+            "/TN",
+            name,
+            "/DISABLE",
+        ], 0, "", "")
+        .command(&ps_argv, 0, "Disabled\r\n", "")
+        .build();
+    let ctl = WindowsTaskCtl::new(env.clone(), real_fs(), FakeClock::new());
+    let hold = ctl
+        .hold_autostart_named(&sm("windows-task"), name, false)
+        .expect("named hold");
+    assert_eq!(hold.name.as_deref(), Some(name));
+    ctl.release_autostart(&hold, Some(true), false)
+        .expect("named release");
+    let calls = env.calls();
+    assert!(calls.iter().all(|call| !call.contains(&"serialwrap".to_string())));
+    assert!(calls.contains(&argv(&["schtasks", "/Change", "/TN", name, "/DISABLE"])));
+    assert!(calls.contains(&argv(&["schtasks", "/Change", "/TN", name, "/ENABLE"])));
+}
+
+#[test]
+fn windows_task_hold_rolls_back_when_running_or_query_is_ambiguous() {
+    let xml_argv = ["schtasks", "/Query", "/TN", "serialwrap", "/XML"];
+    let enabled_xml = "<Task><Settings><Enabled>true</Enabled></Settings></Task>";
+    for state in ["Running\r\n", "Unexpected\r\n"] {
+        let env = FakeSysEnv::builder()
+            .command(&xml_argv, 0, enabled_xml, "")
+            .command(
+                &["schtasks", "/Change", "/TN", "serialwrap", "/DISABLE"],
+                0,
+                "",
+                "",
+            )
+            .command(&ps_argv(), 0, state, "")
+            .build();
+        let ctl = WindowsTaskCtl::new(env.clone(), real_fs(), FakeClock::new());
+        assert!(ctl
+            .hold_autostart(&sm("windows-task"), false)
+            .is_err());
+        let calls = env.calls();
+        assert!(calls.contains(&argv(&[
+            "schtasks",
+            "/Change",
+            "/TN",
+            "serialwrap",
+            "/ENABLE",
+        ])));
+    }
+}
+
+#[test]
+fn windows_task_hold_state_parses_utf16_bom_and_ansi_xml() {
+    let task_xml = "<Task><Settings><Enabled>false</Enabled></Settings></Task>";
+    let utf16 = encode_utf16le_bom(task_xml);
+    let xml_argv = ["schtasks", "/Query", "/TN", "serialwrap", "/XML"];
+    let env_utf16 = FakeSysEnv::builder()
+        .command(&ps_argv(), 0, "Ready\r\n", "")
+        .command_raw(&xml_argv, 0, &utf16, b"")
+        .build();
+    assert_eq!(
+        WindowsTaskCtl::new(env_utf16, real_fs(), FakeClock::new())
+            .autostart_hold_state(&sm("windows-task")),
+        HoldState::Held
+    );
+
+    let ansi_xml = "<Task><Settings><Enabled>true</Enabled></Settings></Task>";
+    let env_ansi = FakeSysEnv::builder()
+        .command(&ps_argv(), 0, "Ready\r\n", "")
+        .command(&xml_argv, 0, ansi_xml, "")
+        .build();
+    assert_eq!(
+        WindowsTaskCtl::new(env_ansi, real_fs(), FakeClock::new())
+            .autostart_hold_state(&sm("windows-task")),
+        HoldState::NotHeld
+    );
+}
+
+#[test]
+fn supervision_controllers_set_enabled_and_uninstall_use_expected_argv() {
+    let system_env = FakeSysEnv::builder().build();
+    let systemd = SystemdCtl::new(system_env.clone(), real_fs(), FakeClock::new());
+    systemd.set_enabled(&sm("systemd-user"), false, false);
+    systemd.uninstall(&sm("systemd-user"), false);
+    assert_eq!(
+        system_env.calls(),
+        vec![
+            argv(&["systemctl", "--user", "disable", "serialwrap"]),
+            argv(&["systemctl", "--user", "disable", "serialwrap"]),
+        ]
+    );
+
+    let task_env = FakeSysEnv::builder().build();
+    let task = WindowsTaskCtl::new(task_env.clone(), real_fs(), FakeClock::new());
+    task.set_enabled(&sm("windows-task"), true, false);
+    task.uninstall(&sm("windows-task"), false);
+    assert_eq!(
+        task_env.calls(),
+        vec![
+            argv(&["schtasks", "/Change", "/TN", "serialwrap", "/ENABLE"]),
+            argv(&["schtasks", "/Delete", "/TN", "serialwrap", "/F"]),
+        ]
+    );
+
+    let service_env = FakeSysEnv::builder().build();
+    let service = WindowsServiceCtl::new(service_env.clone(), FakeClock::new());
+    service.set_enabled(&sm("windows-service"), true, false);
+    service.uninstall(&sm("windows-service"), false);
+    assert_eq!(
+        service_env.calls(),
+        vec![
+            argv(&["sc.exe", "config", "serialwrap", "start=", "auto"]),
+            argv(&["sc.exe", "delete", "serialwrap"]),
+        ]
+    );
+}
+
+#[test]
+fn composite_service_ctl_dispatches_and_rejects_unsupported_modes() {
+    let task_query = ps_argv();
+    let task_query_refs = task_query;
+    let xml_argv = ["schtasks", "/Query", "/TN", "serialwrap", "/XML"];
+    let env = FakeSysEnv::builder()
+        .command(
+            &["schtasks", "/Run", "/TN", "review-task"],
+            0,
+            "",
+            "",
+        )
+        .command(&task_query_refs, 0, "Ready\r\n", "")
+        .command(
+            &xml_argv,
+            0,
+            "<Task><Settings><Enabled>false</Enabled></Settings></Task>",
+            "",
+        )
+        .build();
+    let fs = real_fs();
+    let composite = CompositeServiceCtl::new(
+        vec![sm("windows-task")],
+        SystemdCtl::new(env.clone(), fs.clone(), FakeClock::new()),
+        WindowsTaskCtl::new(env.clone(), fs, FakeClock::new()),
+        WindowsServiceCtl::new(env.clone(), FakeClock::new()),
+    );
+    assert!(composite
+        .action_named(
+            &sm("windows-task"),
+            "review-task",
+            ServiceAction::Start,
+            false,
+        )
+        .ok);
+    assert_eq!(
+        composite.autostart_hold_state(&sm("windows-task")),
+        HoldState::Held
+    );
+    assert_eq!(
+        composite.action(&sm("windows-service"), ServiceAction::Start, false).error_code,
+        Some("NO_SYSTEMD")
+    );
+    assert!(matches!(
+        composite.query(&sm("windows-service")),
+        TaskQuery::QueryFailed(_)
+    ));
 }
 
 #[test]
@@ -717,7 +1263,7 @@ fn cap_supervisor_runtime__systemd_hold_blocks_restart_on_failure() {
     let unit = unit_dir.join(format!("{name}.service"));
     std::fs::write(
         &unit,
-        "[Unit]\nDescription=serialwrap hold captest\n\n[Service]\nExecStart=/bin/sh -c 'sleep 3; exit 1'\nRestart=on-failure\nRestartSec=1\n",
+        "[Unit]\nDescription=serialwrap hold captest\n\n[Service]\nExecStart=/bin/sh -c 'sleep 3; exit 1'\nRestart=on-failure\nRestartSec=1\n\n[Install]\nWantedBy=default.target\n",
     )
     .unwrap();
     let _cleanup = Cleanup { name: name.clone(), unit: unit.clone() };
@@ -734,6 +1280,7 @@ fn cap_supervisor_runtime__systemd_hold_blocks_restart_on_failure() {
     let ctl = SystemdCtl::new(env, real_fs(), clock);
     let user = sm("systemd-user");
 
+    assert_eq!(systemctl(&["enable", name.as_str()]).status.code(), Some(0));
     let _ = ctl.action_named(&user, &name, ServiceAction::Start, false);
     std::thread::sleep(Duration::from_millis(500));
     let hold = ctl.hold_autostart_named(&user, &name, false).expect("hold");

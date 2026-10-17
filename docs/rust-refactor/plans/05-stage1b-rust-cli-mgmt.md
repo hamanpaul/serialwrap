@@ -256,7 +256,7 @@ pub trait ServiceCtl: Send + Sync {
     fn hold_autostart_named(&self, mode: &SupervisionMode, name: &str, with_sudo: bool) -> Result<AutostartHoldRecord, ServiceResult>; // 同 hold_autostart，unit／task 名可指定（cap 測試用；hold_autostart＝name "serialwrap"）
 }
 pub enum AutostartHoldKind { SystemdDropIn, TaskDisabled, ServiceDisabled, NoSupervisor /* on-demand：PAL 無監管項；sw-cli 以 autostart.lock＋install-journal 閘門承擔（Task 7 SC-18） */ }
-pub struct AutostartHoldRecord { pub mode: SupervisionMode, pub kind: AutostartHoldKind, pub dropin_path: Option<PathBuf>,
+pub struct AutostartHoldRecord { pub mode: SupervisionMode, pub kind: AutostartHoldKind, pub name: Option<String> /* 具名 hold 必須由 release 還原同一監管項 */, pub dropin_path: Option<PathBuf>,
                                  pub prior_enabled: Option<bool>, pub prior_restart: Option<String> /* systemd `Restart=` 原值，例如 "on-failure" */, pub ran: Vec<CmdRecord> }
 pub enum HoldState { Held, NotHeld, QueryFailed(String) }
 pub struct TaskXmlSpec { pub name: String, pub user_id: String, pub command: String, pub arguments: String, pub working_dir: String,

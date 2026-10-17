@@ -242,6 +242,7 @@ impl ServiceCtl for FakeServiceCtl {
         Ok(AutostartHoldRecord {
             mode: mode.clone(),
             kind: kind_for(mode),
+            name: None,
             dropin_path: None,
             prior_enabled: None,
             prior_restart: None,
@@ -280,9 +281,11 @@ impl ServiceCtl for FakeServiceCtl {
     fn hold_autostart_named(
         &self,
         mode: &SupervisionMode,
-        _name: &str,
+        name: &str,
         with_sudo: bool,
     ) -> Result<AutostartHoldRecord, ServiceResult> {
-        self.hold_autostart(mode, with_sudo)
+        let mut hold = self.hold_autostart(mode, with_sudo)?;
+        hold.name = Some(name.to_string());
+        Ok(hold)
     }
 }
