@@ -7,12 +7,14 @@ pub mod clock;
 #[cfg(feature = "test-fakes")]
 pub mod fakes;
 pub mod fs_ops;
+pub mod osstr;
 pub mod process;
 pub mod rpc_transport;
 pub mod select;
 pub mod sysenv;
 pub mod traits;
 
+pub use osstr::{join_os_pieces, split_os_str, OsPiece};
 pub use traits::*;
 
 /// client 側平台能力包（arch §4 的 client 子集；P4 擴為 `Platform` 並保留別名）。

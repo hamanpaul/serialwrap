@@ -296,7 +296,12 @@ fn is_code_documented(code: &str, yaml_text: &str, skill_text: &str) -> bool {
     // 1. contracts/error_codes.yaml：尋找 code: <code_name> 及其後的 meaning / doc
     let code_pat = format!("code: {code}");
     if let Some(pos) = yaml_text.find(&code_pat) {
-        let slice = &yaml_text[pos..std::cmp::min(pos + 1000, yaml_text.len())];
+        // 視窗終點須落在 UTF-8 字元邊界上（yaml 內含多位元組中文，固定位元組窗口可能切到字元中間）。
+        let mut end = std::cmp::min(pos + 1000, yaml_text.len());
+        while !yaml_text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let slice = &yaml_text[pos..end];
         if slice.contains("meaning:") || slice.contains("doc:") {
             return true;
         }

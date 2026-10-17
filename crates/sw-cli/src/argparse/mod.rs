@@ -210,5 +210,5 @@ pub(super) fn action_metavar(action: &ActionSpec) -> String {
 }
 
 pub(super) fn py_repr(value: &str) -> String {
-    sw_proto::pyfmt::py_repr_str(value)
+    sw_proto::pyfmt::py_repr_argv(value)
 }

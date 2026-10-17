@@ -1,6 +1,5 @@
 //! endpoint 解析（#108、`cli.py:658-835`）。
 
-use std::ffi::OsString;
 use std::path::Path;
 use std::time::Duration;
 
@@ -108,7 +107,7 @@ pub fn endpoint_alive(ctx: &CliCtx, ep: &str) -> bool {
             if !ctx.p.caps.af_unix || !ctx.p.rpc.af_unix_available() {
                 return false;
             }
-            let spec = sw_pal::EndpointSpec::Unix(OsString::from(path));
+            let spec = sw_pal::EndpointSpec::Unix(crate::argv::decode(&path));
             let timeout = sw_pal::SockTimeout::Blocking(Duration::from_millis(200));
             ctx.p.rpc.connect(&spec, timeout).is_ok()
         }

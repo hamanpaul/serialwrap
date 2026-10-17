@@ -4,11 +4,11 @@
 //! `Lib/urllib/parse.py`（`urlsplit`、`_splitnetloc`、`_check_bracketed_netloc`、`_check_bracketed_host`、
 //! `_checknetloc`、`_hostinfo`、`hostname`、`port`），並以 `contracts/golden/endpoint.tsv` 逐列比對。
 //!
-//! 錯誤訊息為 Python `str(ValueError)`：包含 endpoint 的部分以 `repr` 格式輸出（見 [`crate::pyfmt::py_repr_str`]）。
+//! 錯誤訊息為 Python `str(ValueError)`：包含 endpoint 的部分以 `repr` 格式輸出（見 [`crate::pyfmt::py_repr_argv`]）。
 
 use crate::constants::LOOPBACK_TCP_HOSTS;
 use crate::pycompat::INT_MAX_STR_DIGITS;
-use crate::pyfmt::py_repr_str;
+use crate::pyfmt::py_repr_argv;
 
 /// 解析後的 RPC endpoint。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -168,7 +168,7 @@ fn check_bracketed_host(hostname: &str) -> Result<(), String> {
     }
     Err(format!(
         "{} does not appear to be an IPv4 or IPv6 address",
-        py_repr_str(hostname)
+        py_repr_argv(hostname)
     ))
 }
 
@@ -316,7 +316,7 @@ fn hostname_of(netloc: &str) -> Option<String> {
 }
 
 fn invalid_tcp(endpoint: &str) -> EndpointError {
-    EndpointError(format!("invalid tcp endpoint: {}", py_repr_str(endpoint)))
+    EndpointError(format!("invalid tcp endpoint: {}", py_repr_argv(endpoint)))
 }
 
 /// 解析 RPC endpoint（`client._parse_endpoint`）。
@@ -344,7 +344,7 @@ pub fn parse_endpoint(s: &str) -> Result<Endpoint, EndpointError> {
             if !parsed.netloc.is_empty() {
                 return Err(EndpointError(format!(
                     "invalid unix endpoint: {} (unix endpoint must use an absolute path such as 'unix:///path/to/sock')",
-                    py_repr_str(s)
+                    py_repr_argv(s)
                 )));
             }
             if !parsed.query.is_empty()
@@ -354,14 +354,14 @@ pub fn parse_endpoint(s: &str) -> Result<Endpoint, EndpointError> {
             {
                 return Err(EndpointError(format!(
                     "invalid unix endpoint: {} (unix endpoint path must be absolute)",
-                    py_repr_str(s)
+                    py_repr_argv(s)
                 )));
             }
             Ok(Endpoint::Unix(parsed.path))
         }
         other => Err(EndpointError(format!(
             "unsupported endpoint scheme: {}",
-            py_repr_str(other)
+            py_repr_argv(other)
         ))),
     }
 }

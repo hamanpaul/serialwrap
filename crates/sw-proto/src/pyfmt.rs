@@ -12,6 +12,54 @@ pub fn py_repr_float(x: f64) -> String {
     crate::pyjson::repr_float(x)
 }
 
+/// argv 內無效單位的跳脫前綴（P3-T14，Q-19）。argv 不可能含 NUL，故帶此前綴的字元一定來自跳脫。
+pub const ESCAPE_MARK: char = '\0';
+
+/// 跳脫後的 lone surrogate 碼位偏移：`ESCAPE_MARK` 之後接 `char::from_u32(ESCAPE_BASE + cp)`，`cp` 為 `0xD800..=0xDFFF`。
+const ESCAPE_BASE: u32 = 0xF0000;
+
+/// 把 lone surrogate 碼位（`0xD800..=0xDFFF`）跳脫為兩個字元（`ESCAPE_MARK` + 偏移字元）；範圍外的碼位不輸出。
+pub fn escape_surrogate(cp: u32, out: &mut String) {
+    if !(0xD800..=0xDFFF).contains(&cp) {
+        return;
+    }
+    out.push(ESCAPE_MARK);
+    if let Some(c) = char::from_u32(ESCAPE_BASE + cp) {
+        out.push(c);
+    }
+}
+
+/// 若 `c` 為跳脫字元（偏移字元）則回傳其 lone surrogate 碼位。
+pub fn surrogate_of_escape(c: char) -> Option<u32> {
+    let cp = (c as u32).checked_sub(ESCAPE_BASE)?;
+    (0xD800..=0xDFFF).contains(&cp).then_some(cp)
+}
+
+/// 單一字元的 repr 輸出（`unicode_repr` 的逐字規則）。
+fn push_repr_char(out: &mut String, c: char, quote: char) {
+    let cp = c as u32;
+    if c == quote || c == '\\' {
+        out.push('\\');
+        out.push(c);
+    } else if c == '\t' {
+        out.push_str("\\t");
+    } else if c == '\n' {
+        out.push_str("\\n");
+    } else if c == '\r' {
+        out.push_str("\\r");
+    } else if cp < 0x20 || cp == 0x7f {
+        let _ = write!(out, "\\x{cp:02x}");
+    } else if cp < 0x7f || py_isprintable(c) {
+        out.push(c);
+    } else if cp <= 0xff {
+        let _ = write!(out, "\\x{cp:02x}");
+    } else if cp <= 0xffff {
+        let _ = write!(out, "\\u{cp:04x}");
+    } else {
+        let _ = write!(out, "\\U{cp:08x}");
+    }
+}
+
 /// `repr(str)`：引號選擇、跳脫字元、`isprintable` 規則。
 ///
 /// 含單引號且不含雙引號時以雙引號包覆；其餘情況以單引號包覆並跳脫單引號。
@@ -23,30 +71,67 @@ pub fn py_repr_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push(quote);
     for c in s.chars() {
-        let cp = c as u32;
-        if c == quote || c == '\\' {
-            out.push('\\');
-            out.push(c);
-        } else if c == '\t' {
-            out.push_str("\\t");
-        } else if c == '\n' {
-            out.push_str("\\n");
-        } else if c == '\r' {
-            out.push_str("\\r");
-        } else if cp < 0x20 || cp == 0x7f {
-            let _ = write!(out, "\\x{cp:02x}");
-        } else if cp < 0x7f || py_isprintable(c) {
-            out.push(c);
-        } else if cp <= 0xff {
-            let _ = write!(out, "\\x{cp:02x}");
-        } else if cp <= 0xffff {
-            let _ = write!(out, "\\u{cp:04x}");
-        } else {
-            let _ = write!(out, "\\U{cp:08x}");
+        push_repr_char(&mut out, c, quote);
+    }
+    out.push(quote);
+    out
+}
+
+/// 含跳脫 lone surrogate 的字串之 `repr`：跳脫處以 Python 的 `\udXXX` 形式呈現（ASCII）。
+///
+/// 無跳脫字元時與 [`py_repr_str`] 完全相同。
+pub fn py_repr_argv(s: &str) -> String {
+    let has_single = s.contains('\'');
+    let has_double = s.contains('"');
+    let quote = if has_single && !has_double { '"' } else { '\'' };
+
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push(quote);
+    for segment in segments(s) {
+        match segment {
+            Segment::Char(c) => push_repr_char(&mut out, c, quote),
+            Segment::Surrogate(cp) => {
+                let _ = write!(out, "\\u{cp:04x}");
+            }
         }
     }
     out.push(quote);
     out
+}
+
+/// stderr 的 backslashreplace 形式：跳脫的 lone surrogate 以 `\udXXX` 文字呈現，其餘字元原樣。
+pub fn py_display_argv(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for segment in segments(s) {
+        match segment {
+            Segment::Char(c) => out.push(c),
+            Segment::Surrogate(cp) => {
+                let _ = write!(out, "\\u{cp:04x}");
+            }
+        }
+    }
+    out
+}
+
+/// 字串的一段：原字元，或跳脫還原的 lone surrogate 碼位。
+enum Segment {
+    Char(char),
+    Surrogate(u32),
+}
+
+/// 依 [`ESCAPE_MARK`] 規則切段；前綴後不是偏移字元者，前綴本身當作一般字元。
+fn segments(s: &str) -> impl Iterator<Item = Segment> + '_ {
+    let mut chars = s.chars().peekable();
+    std::iter::from_fn(move || {
+        let c = chars.next()?;
+        if c == ESCAPE_MARK {
+            if let Some(cp) = chars.peek().and_then(|next| surrogate_of_escape(*next)) {
+                chars.next();
+                return Some(Segment::Surrogate(cp));
+            }
+        }
+        Some(Segment::Char(c))
+    })
 }
 
 /// `str(v)`：None→"None"、True→"True"、float→repr、str 原樣、list/dict→repr。

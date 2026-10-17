@@ -82,3 +82,10 @@ pub const DELEGATE_ARGV_SHA_ENV: &str = "SERIALWRAP_DELEGATE_ARGV_SHA";
 
 /// 數值型 log level 的最大位數（`cli_trace._MAX_NUMERIC_LOG_LEVEL_DIGITS`）。
 pub const MAX_NUMERIC_LOG_LEVEL_DIGITS: usize = 4300;
+
+/// 終端機欄寬環境變數名（argparse `help_width` 讀取；`shutil.get_terminal_size` 的 `COLUMNS`）。
+pub const ENV_COLUMNS: &str = "COLUMNS";
+/// `--endpoint` 的 argparse metavar（`cli.py` 的 `metavar="ENDPOINT"`）。
+pub const METAVAR_ENDPOINT: &str = "ENDPOINT";
+/// `--bench` 的 argparse metavar（`cli.py` 的 `metavar="CODE"`）。
+pub const METAVAR_CODE: &str = "CODE";

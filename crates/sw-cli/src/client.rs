@@ -1,7 +1,6 @@
 //! RPC client：單次呼叫、唯讀白名單重試與 TIMEOUT 後探測。
 
 use crate::cli_trace::TraceMeta;
-use std::ffi::OsString;
 use std::time::Duration;
 use sw_pal::traits::{EndpointSpec, PalError, PalErrorKind, SockTimeout};
 use sw_proto::constants::{
@@ -201,18 +200,24 @@ pub fn rpc_call_once_capped(
                         ErrorCode::SocketError,
                         Some(format!(
                             "本平台無 AF_UNIX，無法連接 unix endpoint {}（請改用 tcp://127.0.0.1:<port>，#131）",
-                            sw_proto::pyfmt::py_repr_str(endpoint)
+                            sw_proto::pyfmt::py_repr_argv(endpoint)
                         )),
                     ),
                     None,
                 ));
             }
             (
-                EndpointSpec::Unix(OsString::from(path)),
+                EndpointSpec::Unix(crate::argv::decode(&path)),
                 sock_timeout(timeout_s)?,
             )
         }
         Endpoint::Tcp { host, port } => {
+            // Python 於 getaddrinfo 對非 UTF-8 主機名拋未攔截的 UnicodeError（exit 1，stdout 空）。
+            if crate::argv::has_escape(&host) {
+                return Err(ClientCrash::EncodeError(
+                    crate::argv::NOT_UTF8_MESSAGE.to_string(),
+                ));
+            }
             if let Err(error) = p.rpc.resolve_tcp(&host, port) {
                 return Ok((socket_error(error.clone()), error.os_code.map(i64::from)));
             }
@@ -231,6 +236,12 @@ pub fn rpc_call_once_capped(
         }
     };
 
+    // Q-19 (b)：參數含非 UTF-8 原文時，連線成功後、送出前以編碼錯誤結束（daemon 收到 0 筆請求行）。
+    if crate::argv::value_is_tainted(params) {
+        return Err(ClientCrash::EncodeError(
+            crate::argv::NOT_UTF8_MESSAGE.to_string(),
+        ));
+    }
     if let Err(error) = stream.send_all(&encode_request(req_id, method, params)) {
         if error.kind == PalErrorKind::TimedOut {
             return Ok((failure(ErrorCode::Timeout, None), None));

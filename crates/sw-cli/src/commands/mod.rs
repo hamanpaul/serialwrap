@@ -1,8 +1,11 @@
-//! 原生指令群組分派（P3-T14～P3-T15）：紅燈 stub。
-#![allow(unused_variables)]
+//! 原生指令群組分派（P3-T14～P3-T15）。
+//!
+//! `dispatch` 依 `ns.path()` 做平面 match；未命中回 `INVALID_ARGS`（exit 2）。
 
 use crate::argparse::Namespace;
 use crate::ctx::CliCtx;
+use crate::output;
+use sw_proto::error_codes::ErrorCode;
 
 pub mod event_cmd;
 pub mod profile_cmd;
@@ -10,5 +13,25 @@ pub mod rpc_cmds;
 pub mod skill_cmd;
 
 pub fn dispatch(ctx: &mut CliCtx, ns: &Namespace) -> i32 {
-    todo!("P3-T14: dispatch")
+    let path = ns.path();
+    match path.as_slice() {
+        ["event", ..] => return event_cmd::dispatch_event(ctx, ns),
+        ["skill"] => return skill_cmd::run_skill(ctx, ns),
+        ["profile", "test"] => return profile_cmd::run_profile_test(ctx, ns),
+        ["cmd", "submit"] => {
+            if let Some(code) = rpc_cmds::check_completion_regex(ctx, ns) {
+                return code;
+            }
+        }
+        _ => {}
+    }
+    match rpc_cmds::request_for(ns) {
+        Some((method, params)) => rpc_cmds::run_rpc(ctx, ns, method, params),
+        None => {
+            let resp = output::error_resp(ErrorCode::InvalidArgs, None);
+            let _ = output::print_json(&mut ctx.io, &resp);
+            let _ = output::mirror_err(&mut ctx.io, &resp, None);
+            2
+        }
+    }
 }

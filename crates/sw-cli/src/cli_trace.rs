@@ -75,9 +75,11 @@ pub fn trace_enabled(level: &PyInt) -> bool {
     }
 }
 
-/// SHA-256 摘要（對應 `_hash_endpoint`）：以 UTF-8 位元組計算，十六進位小寫輸出。
+/// SHA-256 摘要（對應 `_hash_endpoint`）：以 `errors="surrogateescape"` 的位元組計算，十六進位小寫輸出。
+///
+/// 非 UTF-8 路徑（P3-T14，Q-19）以原始位元組雜湊；有效 UTF-8 的輸入與純 UTF-8 計算結果相同。
 fn hash_endpoint(raw: &str) -> String {
-    sha256_hex(raw.as_bytes())
+    sha256_hex(&crate::argv::decode(raw).into_encoded_bytes())
 }
 
 /// `_loopback_endpoint_id`：IPv6 主機位址加上方括號後與埠號組合。
