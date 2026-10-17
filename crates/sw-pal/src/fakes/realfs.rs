@@ -24,18 +24,14 @@ fn is_symlink(p: &Path) -> bool {
     std::fs::symlink_metadata(p).map(|m| m.file_type().is_symlink()).unwrap_or(false)
 }
 
-/// 遞迴複製目錄樹（symlink 保留為 symlink；Unix 以外平台 symlink 退化為複製其目標內容）。
+/// 遞迴複製目錄樹；來源 symlink 依其目標內容複製，與 native `copy_tree` 一致。
 fn copy_dir_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(to)?;
+    std::fs::create_dir(to)?;
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
         let src = entry.path();
         let dst = to.join(entry.file_name());
-        let ft = entry.file_type()?;
-        if ft.is_symlink() {
-            let target = std::fs::read_link(&src)?;
-            make_symlink(&target, &dst, src.is_dir())?;
-        } else if ft.is_dir() {
+        if src.is_dir() {
             copy_dir_recursive(&src, &dst)?;
         } else {
             std::fs::copy(&src, &dst)?;
@@ -111,6 +107,22 @@ impl FsOps for RealFs {
         std::fs::copy(from, to).map(|_| ()).map_err(io_error)
     }
     fn copy_tree(&self, from: &Path, to: &Path) -> PalResult<()> {
+        match std::fs::symlink_metadata(to) {
+            Ok(_) => {
+                return Err(PalError::plain(
+                    PalErrorKind::InvalidInput,
+                    "copy_tree 目的路徑已存在",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error(error)),
+        }
+        if !std::fs::metadata(from).map_err(io_error)?.is_dir() {
+            return Err(PalError::plain(
+                PalErrorKind::InvalidInput,
+                "copy_tree 來源不是目錄",
+            ));
+        }
         copy_dir_recursive(from, to).map_err(io_error)
     }
     fn remove_tree(&self, p: &Path) -> PalResult<()> {

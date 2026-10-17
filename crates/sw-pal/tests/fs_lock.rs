@@ -265,3 +265,297 @@ fn copy_tree_and_remove_tree() {
         "remove_tree 不得跟隨外部 symlink 刪除外部檔案"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn atomic_write_uses_expected_modes_and_removes_failed_temp_files() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let fsops = sw_pal::native().fs;
+    let default_mode = tmp.path().join("default.json");
+    fsops.atomic_write(&default_mode, b"default", None).unwrap();
+    assert_eq!(mode_of(&default_mode), 0o600, "未指定 mode 時須限制為 owner-only");
+
+    let explicit_mode = tmp.path().join("explicit.json");
+    fsops
+        .atomic_write(&explicit_mode, b"explicit", Some(0o644))
+        .unwrap();
+    assert_eq!(mode_of(&explicit_mode), 0o644, "明確 mode 必須套用到結果檔案");
+
+    let readonly_destination = tmp.path().join("readonly-destination.json");
+    fs::write(&readonly_destination, b"old").unwrap();
+    fs::set_permissions(&readonly_destination, fs::Permissions::from_mode(0o400)).unwrap();
+    fsops
+        .atomic_write(&readonly_destination, b"new", None)
+        .unwrap();
+    assert_eq!(
+        fs::read(&readonly_destination).unwrap(),
+        b"new",
+        "POSIX 原子取代應可覆寫唯讀目的檔"
+    );
+
+    let blocked = tmp.path().join("blocked.json");
+    fs::create_dir(&blocked).unwrap();
+    fs::write(blocked.join("keep"), b"keep").unwrap();
+    assert!(fsops.atomic_write(&blocked, b"cannot replace", None).is_err());
+    let leftovers: Vec<_> = fs::read_dir(tmp.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("blocked.json.tmp."))
+        .collect();
+    assert!(leftovers.is_empty(), "失敗後不得殘留原子寫入暫存檔：{leftovers:?}");
+}
+
+#[test]
+fn write_mkdirs_replace_and_remove_file_operate_on_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fsops = sw_pal::native().fs;
+    let parent = tmp.path().join("nested").join("directory");
+    fsops.mkdirs(&parent).unwrap();
+    assert!(parent.is_dir());
+
+    let source = parent.join("source.txt");
+    let destination = parent.join("destination.txt");
+    fsops.write_file(&source, b"payload").unwrap();
+    fs::write(&destination, b"previous").unwrap();
+    fsops.replace(&source, &destination).unwrap();
+    assert_eq!(fs::read(&destination).unwrap(), b"payload");
+    fsops.remove_file(&destination).unwrap();
+    assert!(!destination.exists());
+}
+
+#[test]
+fn copy_preserving_copies_file_contents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source.txt");
+    let destination = tmp.path().join("destination.txt");
+    fs::write(&source, b"payload").unwrap();
+    sw_pal::native()
+        .fs
+        .copy_preserving(&source, &destination)
+        .unwrap();
+    assert_eq!(fs::read(&destination).unwrap(), b"payload");
+}
+
+#[cfg(unix)]
+#[test]
+fn copy_preserving_and_copy_tree_accept_readonly_files() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let fsops = sw_pal::native().fs;
+    let readonly = tmp.path().join("readonly.txt");
+    fs::write(&readonly, b"single").unwrap();
+    fs::set_permissions(&readonly, fs::Permissions::from_mode(0o444)).unwrap();
+    let copied = tmp.path().join("copied.txt");
+    fsops.copy_preserving(&readonly, &copied).unwrap();
+    assert_eq!(fs::read(&copied).unwrap(), b"single");
+    assert_eq!(mode_of(&copied), 0o444);
+
+    let source_tree = tmp.path().join("source-tree");
+    fs::create_dir_all(source_tree.join("nested")).unwrap();
+    let nested = source_tree.join("nested").join("readonly.sh");
+    fs::write(&nested, b"#!/bin/sh\n").unwrap();
+    fs::set_permissions(&nested, fs::Permissions::from_mode(0o555)).unwrap();
+    let destination_tree = tmp.path().join("destination-tree");
+    fsops.copy_tree(&source_tree, &destination_tree).unwrap();
+    let copied_nested = destination_tree.join("nested").join("readonly.sh");
+    assert_eq!(fs::read(&copied_nested).unwrap(), b"#!/bin/sh\n");
+    assert_eq!(mode_of(&copied_nested), 0o555);
+}
+
+#[cfg(unix)]
+#[test]
+fn copy_tree_follows_source_file_symlinks_and_rejects_existing_destination() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    let target = tmp.path().join("target.txt");
+    fs::write(&target, b"target").unwrap();
+    symlink(&target, source.join("alias.txt")).unwrap();
+
+    let fsops = sw_pal::native().fs;
+    let destination = tmp.path().join("destination");
+    fsops.copy_tree(&source, &destination).unwrap();
+    assert_eq!(fs::read(destination.join("alias.txt")).unwrap(), b"target");
+    assert!(
+        !fs::symlink_metadata(destination.join("alias.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "copy_tree 應依 shutil.copytree 預設跟隨來源 symlink"
+    );
+
+    let error = fsops.copy_tree(&source, &destination).unwrap_err();
+    assert_eq!(error.kind, PalErrorKind::InvalidInput);
+
+    let dangling_source = tmp.path().join("dangling-source");
+    fs::create_dir(&dangling_source).unwrap();
+    symlink(tmp.path().join("does-not-exist"), dangling_source.join("dangling.txt")).unwrap();
+    let dangling_error = fsops
+        .copy_tree(&dangling_source, &tmp.path().join("dangling-destination"))
+        .unwrap_err();
+    assert_eq!(dangling_error.kind, PalErrorKind::NotFound);
+}
+
+#[cfg(all(feature = "test-fakes", unix))]
+#[test]
+fn realfs_copy_tree_matches_native_destination_and_symlink_contract() {
+    use std::os::unix::fs::symlink;
+    use sw_pal::fakes::realfs::RealFs;
+    use sw_pal::fs_ops::FsOps;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    let target = tmp.path().join("target.txt");
+    fs::write(&target, b"target").unwrap();
+    symlink(&target, source.join("alias.txt")).unwrap();
+
+    let destination = tmp.path().join("destination");
+    RealFs.copy_tree(&source, &destination).unwrap();
+    assert_eq!(fs::read(destination.join("alias.txt")).unwrap(), b"target");
+    assert!(
+        !fs::symlink_metadata(destination.join("alias.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        RealFs.copy_tree(&source, &destination).unwrap_err().kind,
+        PalErrorKind::InvalidInput
+    );
+}
+
+#[test]
+fn symlink_or_copy_dir_creates_missing_link_parent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("payload");
+    fs::create_dir(&target).unwrap();
+    fs::write(target.join("item.txt"), b"payload").unwrap();
+    let link = tmp.path().join("missing").join("parents").join("skill");
+
+    sw_pal::native()
+        .fs
+        .symlink_or_copy_dir(&link, &target)
+        .unwrap();
+    assert_eq!(fs::read(link.join("item.txt")).unwrap(), b"payload");
+}
+
+#[test]
+fn read_link_set_mode_sync_dir_and_symlink_file_follow_contract() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fsops = sw_pal::native().fs;
+    let target = tmp.path().join("target.txt");
+    fs::write(&target, b"target").unwrap();
+    assert_eq!(fsops.read_link(&target).unwrap(), None);
+    fsops.sync_dir(tmp.path()).unwrap();
+
+    #[cfg(unix)]
+    {
+        let link = tmp.path().join("links").join("file.txt");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        fs::write(&link, b"replaced").unwrap();
+        fsops.symlink_file(&link, &target).unwrap();
+        assert_eq!(fsops.read_link(&link).unwrap().as_deref(), Some(target.as_path()));
+        fsops.set_mode(&target, 0o400).unwrap();
+        assert_eq!(mode_of(&target), 0o400);
+    }
+
+    #[cfg(windows)]
+    {
+        let error = fsops.symlink_file(&tmp.path().join("file-link"), &target).unwrap_err();
+        assert_eq!(error.kind, PalErrorKind::Unsupported);
+        fsops.set_mode(&target, 0o444).unwrap();
+        assert!(fs::metadata(&target).unwrap().permissions().readonly());
+    }
+}
+
+#[cfg(windows)]
+fn create_dir_symlink_or_skip(target: &std::path::Path, link: &std::path::Path) -> bool {
+    match std::os::windows::fs::symlink_dir(target, link) {
+        Ok(()) => true,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                || error.raw_os_error() == Some(1314) =>
+        {
+            eprintln!("SKIP：此 Windows 環境不允許建立目錄 symlink：{error}");
+            false
+        }
+        Err(error) => panic!("建立目錄 symlink 失敗：{error}"),
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_symlink_or_copy_dir_replaces_existing_directory_symlink() {
+    let tmp = tempfile::tempdir().unwrap();
+    let old_target = tmp.path().join("old-target");
+    let new_target = tmp.path().join("new-target");
+    fs::create_dir(&old_target).unwrap();
+    fs::create_dir(&new_target).unwrap();
+    fs::write(old_target.join("old.txt"), b"old").unwrap();
+    fs::write(new_target.join("new.txt"), b"new").unwrap();
+    let link = tmp.path().join("directory-link");
+    if !create_dir_symlink_or_skip(&old_target, &link) {
+        return;
+    }
+
+    let kind = sw_pal::native()
+        .fs
+        .symlink_or_copy_dir(&link, &new_target)
+        .unwrap();
+    assert_eq!(fs::read(old_target.join("old.txt")).unwrap(), b"old");
+    assert_eq!(fs::read(link.join("new.txt")).unwrap(), b"new");
+    if kind == LinkKind::Symlink {
+        assert_eq!(fs::read_link(&link).unwrap(), new_target);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_remove_tree_removes_directory_symlink_without_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("target");
+    fs::create_dir(&target).unwrap();
+    fs::write(target.join("keep.txt"), b"keep").unwrap();
+    let link = tmp.path().join("directory-link");
+    if !create_dir_symlink_or_skip(&target, &link) {
+        return;
+    }
+
+    sw_pal::native().fs.remove_tree(&link).unwrap();
+    assert!(fs::symlink_metadata(&link).is_err(), "目錄 symlink 本身必須被移除");
+    assert_eq!(fs::read(target.join("keep.txt")).unwrap(), b"keep");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_atomic_write_retries_while_destination_denies_delete_sharing() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("state.json");
+    fs::write(&target, b"old").unwrap();
+    // 不分享 FILE_SHARE_DELETE，讓第一次 MoveFileExW 在 handle 關閉前無法取代目的檔。
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(0x0000_0001 | 0x0000_0002)
+        .open(&target)
+        .unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(150));
+        drop(held);
+    });
+
+    sw_pal::native()
+        .fs
+        .atomic_write(&target, b"new", None)
+        .unwrap();
+    release.join().unwrap();
+    assert_eq!(fs::read(&target).unwrap(), b"new");
+}

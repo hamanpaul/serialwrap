@@ -1,7 +1,9 @@
 //! `ProcessTunnel`（BC-05）：無 pipe 的分離行程、身分核對與整棵樹終止（arch §4.9）。
 //!
-//! 平台實作在 `posix`／`windows` 子模組。本檔為 P4-T5 紅燈骨架：所有主體為 `unimplemented!("P4-T5")`。
+//! 平台實作在 `posix`／`windows` 子模組。
 
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::time::Duration;
 
@@ -39,4 +41,26 @@ pub trait ProcessTunnel: Send + Sync {
     fn stderr_tail(&self, log: &Path, max: usize) -> String;
     /// 無 ControlMaster 平台（Win32-OpenSSH）為 false。
     fn supports_control_master(&self) -> bool;
+}
+
+/// 每次重新開啟記錄檔，讀取尾端至多 `max` bytes，並以 UTF-8 replacement 解碼。
+pub(super) fn read_stderr_tail(log: &Path, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let Ok(mut file) = File::open(log) else {
+        return String::new();
+    };
+    let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+        return String::new();
+    };
+    let offset = length.saturating_sub(max as u64);
+    if file.seek(SeekFrom::Start(offset)).is_err() {
+        return String::new();
+    }
+    let mut bytes = Vec::with_capacity(length.saturating_sub(offset) as usize);
+    if file.read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }

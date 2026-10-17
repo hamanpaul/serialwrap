@@ -1,10 +1,18 @@
 //! `FsOps: FsRead`：寫入面、目錄連結與跨行程檔案鎖（arch §4.1）。
 //! 平台實作放在 `posix`／`windows` 子模組，依目標平台擇一編譯。
 //!
-//! P4-T1 只交付簽章（主體 `unimplemented!("P4-T5")`）；實作由 P4-T5 承接。
+//! 原生寫入面由 P4-T5 的 POSIX 與 Windows 後端提供；測試替身可覆寫所需方法。
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 
 use crate::traits::{FsRead, PalResult};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::HANDLE;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+#[cfg(windows)]
+use windows_sys::Win32::System::IO::OVERLAPPED;
 
 #[cfg(unix)]
 pub mod posix;
@@ -20,7 +28,7 @@ pub enum LinkKind {
     Copied,
 }
 
-/// 跨行程檔案鎖守衛。持有鎖檔的 handle；drop 時 handle 關閉，OS 隨之釋放 flock／LockFileEx。
+/// 跨行程檔案鎖守衛。持有鎖檔的 handle；drop 時明確解鎖，再關閉 handle。
 ///
 /// 只有 `FsOps::file_lock_exclusive` 的實作（P4-T5 原生、P4-T1 測試替身）可建立；`from_file` 為其共用入口。
 #[derive(Debug)]
@@ -29,7 +37,7 @@ pub struct FileLockGuard {
 }
 
 impl FileLockGuard {
-    /// 以已取得鎖的檔案 handle 建立守衛（handle 關閉即釋放鎖）。
+    /// 以已取得鎖的檔案 handle 建立守衛。
     pub fn from_file(file: std::fs::File) -> Self {
         Self { file: Some(file) }
     }
@@ -37,6 +45,26 @@ impl FileLockGuard {
     /// 守衛是否仍持有鎖檔 handle。
     pub fn is_held(&self) -> bool {
         self.file.is_some()
+    }
+}
+
+impl Drop for FileLockGuard {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        if let Some(file) = self.file.as_ref() {
+            let mut overlapped = OVERLAPPED::default();
+            // SAFETY: 此 guard 持有取鎖時使用的 handle，鎖範圍固定為 offset 0 的 1 byte。
+            unsafe {
+                UnlockFileEx(
+                    file.as_raw_handle() as HANDLE,
+                    0,
+                    1,
+                    0,
+                    &mut overlapped,
+                );
+            }
+        }
+        drop(self.file.take());
     }
 }
 
@@ -67,7 +95,7 @@ pub trait FsOps: FsRead {
     fn copy_preserving(&self, from: &Path, to: &Path) -> PalResult<()> {
         unimplemented!("P4-T5")
     }
-    /// 遞迴複製（保留相對結構與 mode）；`to` 已存在時回 `InvalidInput`。
+    /// 遞迴複製（保留相對結構與 mode）；來源 symlink 依目標內容複製，dangling symlink 會失敗；`to` 已存在時回 `InvalidInput`。
     fn copy_tree(&self, from: &Path, to: &Path) -> PalResult<()> {
         unimplemented!("P4-T5")
     }
@@ -91,7 +119,7 @@ pub trait FsOps: FsRead {
     fn symlink_file(&self, link: &Path, target: &Path) -> PalResult<()> {
         unimplemented!("P4-T5")
     }
-    /// 先移除既有 `link`，再建立目錄 symlink；失敗（Windows `ERROR_PRIVILEGE_NOT_HELD`）時改為遞迴複製（DF-16）。
+    /// 建立 `link` 父目錄，先移除既有 `link`，再建立目錄 symlink；失敗（Windows `ERROR_PRIVILEGE_NOT_HELD`）時改為遞迴複製（DF-16）。
     fn symlink_or_copy_dir(&self, link: &Path, target: &Path) -> PalResult<LinkKind> {
         unimplemented!("P4-T5")
     }
