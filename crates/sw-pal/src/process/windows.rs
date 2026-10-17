@@ -4,8 +4,12 @@ use crate::traits::{windows_win32_error, PalError, PalErrorKind, ProcessCtl};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::AsRawHandle;
+use std::os::windows::process::CommandExt;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::ptr;
+use std::sync::{Arc, Mutex};
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 use windows_sys::Win32::System::JobObjects::{
@@ -15,7 +19,8 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, GetExitCodeProcess, ResumeThread, TerminateProcess, WaitForSingleObject,
-    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, INFINITE, PROCESS_INFORMATION, STARTUPINFOW,
+    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS,
+    INFINITE, PROCESS_INFORMATION, STARTUPINFOW,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -47,7 +52,7 @@ impl ProcessCtl for NativeProcessCtl {
         startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
         let mut process_info = PROCESS_INFORMATION::default();
 
-        // SAFETY: all UTF-16 buffers are NUL terminated and remain writable/alive through the call.
+        // SAFETY: 所有 UTF-16 緩衝區皆以 NUL 結尾，且呼叫期間保持可寫並有效。
         let created = unsafe {
             CreateProcessW(
                 application_name,
@@ -134,6 +139,93 @@ impl ProcessCtl for NativeProcessCtl {
             return error;
         }
         std::process::exit(exit_code as i32)
+    }
+
+    fn spawn_daemon(
+        &self,
+        argv: &[String],
+        env: &[(OsString, OsString)],
+        detached: bool,
+    ) -> crate::traits::PalResult<crate::traits::ChildHandle> {
+        if argv.is_empty() {
+            return Err(windows_win32_error(87));
+        }
+
+        let mut command = Command::new(&argv[0]);
+        command
+            .args(&argv[1..])
+            .env_clear()
+            .envs(env.iter().map(|(key, value)| (key, value)));
+        if detached {
+            command
+                .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+        }
+
+        let child = command.spawn().map_err(process_io_error)?;
+        let pid = child.id();
+        let mut handle = crate::traits::ChildHandle::new(pid);
+        handle.native = Some(Arc::new(Mutex::new(child)));
+        Ok(handle)
+    }
+
+    fn poll(&self, child: &crate::traits::ChildHandle) -> Option<i64> {
+        let mut cached = child
+            .exit_code
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(code) = *cached {
+            return Some(code);
+        }
+        let native = child.native.as_ref()?;
+        let mut native = native.lock().ok()?;
+        let status = native.try_wait().ok()??;
+        let mut exit_code = 0u32;
+        // SAFETY: hProcess 由此 Child 持有，exit_code 指向可寫 u32。
+        let code =
+            if unsafe { GetExitCodeProcess(native.as_raw_handle() as HANDLE, &mut exit_code) } != 0
+            {
+                i64::from(exit_code)
+            } else {
+                i64::from(status.code()? as u32)
+            };
+        *cached = Some(code);
+        Some(code)
+    }
+
+    fn call_foreground(
+        &self,
+        argv: &[String],
+        env: &[(OsString, OsString)],
+    ) -> crate::traits::PalResult<i64> {
+        if argv.is_empty() {
+            return Err(windows_win32_error(87));
+        }
+        let mut child = Command::new(&argv[0])
+            .args(&argv[1..])
+            .env_clear()
+            .envs(env.iter().map(|(key, value)| (key, value)))
+            .spawn()
+            .map_err(process_io_error)?;
+        let _status = child.wait().map_err(process_io_error)?;
+        let mut exit_code = 0u32;
+        // SAFETY: hProcess 由此 Child 持有，exit_code 指向可寫 u32。
+        if unsafe { GetExitCodeProcess(child.as_raw_handle() as HANDLE, &mut exit_code) } == 0 {
+            return Err(last_error());
+        }
+        Ok(i64::from(exit_code))
+    }
+}
+
+fn process_io_error(error: std::io::Error) -> PalError {
+    match error.raw_os_error() {
+        Some(code) if code >= 0 => windows_win32_error(code as u32),
+        _ if error.kind() == std::io::ErrorKind::InvalidInput => {
+            PalError::plain(PalErrorKind::InvalidInput, error.to_string())
+        }
+        _ => PalError::plain(PalErrorKind::Io, error.to_string()),
     }
 }
 

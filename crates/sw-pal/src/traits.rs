@@ -453,6 +453,21 @@ pub trait RpcStream: Send {
 #[derive(Debug, Clone)]
 pub struct ChildHandle {
     pub pid: u32,
+    pub(crate) exit_code: std::sync::Arc<std::sync::Mutex<Option<i64>>>,
+    #[cfg(windows)]
+    pub(crate) native: Option<std::sync::Arc<std::sync::Mutex<std::process::Child>>>,
+}
+
+impl ChildHandle {
+    /// 建立跨平台子行程句柄；實際 spawn 由 `ProcessCtl` 負責。
+    pub fn new(pid: u32) -> Self {
+        Self {
+            pid,
+            exit_code: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(windows)]
+            native: None,
+        }
+    }
 }
 
 pub trait ProcessCtl: Send + Sync {
@@ -468,12 +483,15 @@ pub trait ProcessCtl: Send + Sync {
         _env: &[(OsString, OsString)],
         _detached: bool,
     ) -> PalResult<ChildHandle> {
-        unimplemented!("P4-T4")
+        Err(PalError::plain(
+            PalErrorKind::Unsupported,
+            "不支援啟動子行程",
+        ))
     }
 
     /// 輪詢子行程狀態（非阻塞）。
-    fn poll(&self, _c: &ChildHandle) -> Option<i32> {
-        unimplemented!("P4-T4")
+    fn poll(&self, _c: &ChildHandle) -> Option<i64> {
+        None
     }
 
     /// 前景同步呼叫子行程（等同 Python subprocess.call）。
@@ -481,7 +499,10 @@ pub trait ProcessCtl: Send + Sync {
         &self,
         _argv: &[String],
         _env: &[(OsString, OsString)],
-    ) -> PalResult<i32> {
-        unimplemented!("P4-T4")
+    ) -> PalResult<i64> {
+        Err(PalError::plain(
+            PalErrorKind::Unsupported,
+            "不支援前景子行程呼叫",
+        ))
     }
 }

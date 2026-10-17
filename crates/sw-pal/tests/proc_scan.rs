@@ -24,7 +24,11 @@ fn windows_launcher_and_python_child_count_as_one_daemon() {
             100,
             4,
             "serialwrapd.exe",
-            &["C:\\p\\bin\\serialwrapd.exe", "--socket", "tcp://127.0.0.1:48700"],
+            &[
+                "C:\\p\\bin\\serialwrapd.exe",
+                "--socket",
+                "tcp://127.0.0.1:48700",
+            ],
             10,
         ),
         w(
@@ -61,8 +65,98 @@ fn reused_parent_pid_does_not_swallow_child() {
             &["serialwrapd.exe", "--socket", "tcp://127.0.0.1:48701"],
             50,
         ),
-        w(101, 100, "python.exe", &["python.exe", "-I", "serialwrapd.py"], 20),
+        w(
+            101,
+            100,
+            "python.exe",
+            &["python.exe", "-I", "serialwrapd.py"],
+            20,
+        ),
     ];
+    assert_eq!(dedup_launcher_children(&procs).len(), 2);
+}
+
+#[test]
+fn windows_pyinstaller_onefile_pair_counts_as_one_daemon() {
+    let procs = vec![
+        w(
+            100,
+            4,
+            "serialwrapd.exe",
+            &[
+                "C:\\p\\bin\\serialwrapd.exe",
+                "--socket",
+                "tcp://127.0.0.1:48700",
+            ],
+            10,
+        ),
+        w(
+            101,
+            100,
+            "serialwrapd.exe",
+            &[
+                "C:\\p\\bin\\serialwrapd.exe",
+                "--internal-child",
+                "--socket",
+                "tcp://127.0.0.1:48700",
+            ],
+            11,
+        ),
+    ];
+
+    let daemons = dedup_launcher_children(&procs);
+    assert_eq!(daemons.len(), 1);
+    assert_eq!(daemons[0].pid, 100);
+    assert_eq!(daemons[0].socket.as_deref(), Some("tcp://127.0.0.1:48700"));
+    assert_eq!(
+        daemons[0].tree,
+        vec![
+            ProcIdentity {
+                pid: 100,
+                start_ticks: Some(10),
+            },
+            ProcIdentity {
+                pid: 101,
+                start_ticks: Some(11),
+            },
+        ]
+    );
+}
+
+#[test]
+fn windows_launcher_with_unknown_creation_time_is_kept_without_ticks() {
+    let procs = vec![w(100, 4, "serialwrapd.exe", &[], 0)];
+
+    let daemons = dedup_launcher_children(&procs);
+    assert_eq!(daemons.len(), 1);
+    assert_eq!(daemons[0].pid, 100);
+    assert_eq!(daemons[0].socket, None);
+    assert_eq!(
+        daemons[0].tree,
+        vec![ProcIdentity {
+            pid: 100,
+            start_ticks: None,
+        }]
+    );
+}
+
+#[test]
+fn reused_launcher_pid_does_not_swallow_launcher_child() {
+    let procs = vec![
+        w(100, 4, "serialwrapd.exe", &["serialwrapd.exe"], 50),
+        w(101, 100, "serialwrapd.exe", &["serialwrapd.exe"], 20),
+    ];
+
+    assert_eq!(dedup_launcher_children(&procs).len(), 2);
+}
+
+#[test]
+fn launcher_parent_cycle_does_not_merge_processes() {
+    let procs = vec![
+        w(100, 101, "serialwrapd.exe", &["serialwrapd.exe"], 10),
+        w(101, 100, "serialwrapd.exe", &["serialwrapd.exe"], 10),
+    ];
+
     assert_eq!(dedup_launcher_children(&procs).len(), 2);
 }
 
@@ -97,8 +191,14 @@ fn posix_scan_reads_fake_proc_root_sorted_by_pid() {
 
 #[test]
 fn is_serialwrapd_rule1_basename() {
-    assert!(is_serialwrapd_argv(&["/x/serialwrapd".into()], ArgvFlavor::Posix));
-    assert!(!is_serialwrapd_argv(&["/x/serialwrapd2".into()], ArgvFlavor::Posix));
+    assert!(is_serialwrapd_argv(
+        &["/x/serialwrapd".into()],
+        ArgvFlavor::Posix
+    ));
+    assert!(!is_serialwrapd_argv(
+        &["/x/serialwrapd2".into()],
+        ArgvFlavor::Posix
+    ));
 }
 
 #[test]
@@ -174,15 +274,17 @@ fn is_serialwrapd_windows_exe_case_insensitive() {
 
 #[test]
 fn windows_launcher_only_counts_one() {
-    let procs = vec![
-        w(
-            100,
-            4,
-            "serialwrapd.exe",
-            &["C:\\p\\bin\\serialwrapd.exe", "--socket", "tcp://127.0.0.1:48700"],
-            10,
-        ),
-    ];
+    let procs = vec![w(
+        100,
+        4,
+        "serialwrapd.exe",
+        &[
+            "C:\\p\\bin\\serialwrapd.exe",
+            "--socket",
+            "tcp://127.0.0.1:48700",
+        ],
+        10,
+    )];
     let d = dedup_launcher_children(&procs);
     assert_eq!(d.len(), 1);
     assert_eq!(
@@ -193,9 +295,7 @@ fn windows_launcher_only_counts_one() {
 
 #[test]
 fn windows_unreadable_launcher_cmdline_kept_as_unknown_socket() {
-    let procs = vec![
-        w(100, 4, "serialwrapd.exe", &[], 10),
-    ];
+    let procs = vec![w(100, 4, "serialwrapd.exe", &[], 10)];
     let d = dedup_launcher_children(&procs);
     assert_eq!(d.len(), 1);
     assert_eq!((d[0].pid, d[0].socket.as_deref()), (100, None));
@@ -238,16 +338,159 @@ fn pid_alive_self_true_and_reaped_false() {
 fn pid_alive_false_for_zombie() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join("101")).unwrap();
-    std::fs::write(tmp.path().join("101").join("stat"), "101 (zombie) Z 1 0 0\n").unwrap();
+    std::fs::write(
+        tmp.path().join("101").join("stat"),
+        "101 (zombie) Z 1 0 0\n",
+    )
+    .unwrap();
     std::fs::create_dir_all(tmp.path().join("102")).unwrap();
     std::fs::write(tmp.path().join("102").join("stat"), "102 (dead) X 1 0 0\n").unwrap();
     std::fs::create_dir_all(tmp.path().join("103")).unwrap();
-    std::fs::write(tmp.path().join("103").join("stat"), "103 (sleeping) S 1 0 0\n").unwrap();
+    std::fs::write(
+        tmp.path().join("103").join("stat"),
+        "103 (sleeping) S 1 0 0\n",
+    )
+    .unwrap();
 
     let scan = PosixProcScan::with_root(tmp.path());
     assert!(!scan.pid_alive(101));
     assert!(!scan.pid_alive(102));
     assert!(scan.pid_alive(103));
+}
+
+#[cfg(unix)]
+#[test]
+fn pid_and_identity_alive_handle_non_utf8_comm_and_matching_ticks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pid = 201;
+    std::fs::create_dir_all(tmp.path().join(pid.to_string())).unwrap();
+    std::fs::write(
+        tmp.path().join(pid.to_string()).join("stat"),
+        fake_proc_stat(pid, &[b'n', 0xff, b'm', b'e'], b'S', 778),
+    )
+    .unwrap();
+
+    let scan = PosixProcScan::with_root(tmp.path());
+    assert!(scan.pid_alive(pid));
+    assert!(scan.identity_alive(&ProcIdentity {
+        pid,
+        start_ticks: Some(778),
+    }));
+}
+
+#[cfg(unix)]
+#[test]
+fn incomplete_proc_stat_is_conservatively_alive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pid = 202;
+    std::fs::create_dir_all(tmp.path().join(pid.to_string())).unwrap();
+    std::fs::write(
+        tmp.path().join(pid.to_string()).join("stat"),
+        format!("{pid} (truncated) S 1 2\n"),
+    )
+    .unwrap();
+
+    let scan = PosixProcScan::with_root(tmp.path());
+    assert!(scan.pid_alive(pid));
+    assert!(scan.identity_alive(&ProcIdentity {
+        pid,
+        start_ticks: Some(778),
+    }));
+}
+
+#[cfg(unix)]
+#[test]
+fn missing_proc_stat_is_not_alive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pid = 203;
+    std::fs::create_dir_all(tmp.path().join(pid.to_string())).unwrap();
+
+    let scan = PosixProcScan::with_root(tmp.path());
+    assert!(!scan.pid_alive(pid));
+    assert!(!scan.identity_alive(&ProcIdentity {
+        pid,
+        start_ticks: Some(778),
+    }));
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_proc_stat_is_conservatively_alive() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // root 可繞過 mode 000，因此只在此處不會測到 PermissionDenied。
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let pid = 204;
+    let process_dir = tmp.path().join(pid.to_string());
+    std::fs::create_dir_all(&process_dir).unwrap();
+    let stat = process_dir.join("stat");
+    std::fs::write(&stat, fake_proc_stat(pid, b"blocked", b'S', 778)).unwrap();
+    std::fs::set_permissions(&stat, std::fs::Permissions::from_mode(0)).unwrap();
+
+    let scan = PosixProcScan::with_root(tmp.path());
+    assert!(scan.pid_alive(pid));
+    assert!(scan.identity_alive(&ProcIdentity {
+        pid,
+        start_ticks: Some(778),
+    }));
+}
+
+#[cfg(unix)]
+#[test]
+fn posix_tty_holder_scan_reports_matching_pid_and_ok_status() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pid = std::process::id();
+    let process_dir = tmp.path().join(pid.to_string());
+    std::fs::create_dir_all(process_dir.join("fd")).unwrap();
+    std::fs::write(process_dir.join("cmdline"), b"serialwrapd\0").unwrap();
+    let tty = tmp.path().join("tty-fake");
+    std::fs::write(&tty, b"").unwrap();
+    std::os::unix::fs::symlink(&tty, process_dir.join("fd/7")).unwrap();
+
+    let (holders, status) =
+        PosixProcScan::with_root(tmp.path()).serialwrapd_tty_holders(std::slice::from_ref(&tty));
+    assert_eq!(holders, vec![pid]);
+    assert_eq!(status, HolderScanStatus::Ok);
+}
+
+#[cfg(unix)]
+#[test]
+fn posix_tty_holder_scan_reports_unknown_on_unreadable_fd_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let process_dir = tmp.path().join("205");
+    std::fs::create_dir_all(&process_dir).unwrap();
+    std::fs::write(process_dir.join("cmdline"), b"serialwrapd\0").unwrap();
+    std::fs::write(process_dir.join("fd"), b"not a directory").unwrap();
+
+    let (holders, status) = PosixProcScan::with_root(tmp.path())
+        .serialwrapd_tty_holders(&[tmp.path().join("tty-fake")]);
+    assert!(holders.is_empty());
+    assert_eq!(status, HolderScanStatus::Unknown);
+}
+
+#[cfg(unix)]
+#[test]
+fn posix_tty_holder_scan_reports_permission_status() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // root 可繞過目錄權限，因此只在此處不會測到 PermissionDenied。
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let process_dir = tmp.path().join("206");
+    let fd_dir = process_dir.join("fd");
+    std::fs::create_dir_all(&fd_dir).unwrap();
+    std::fs::write(process_dir.join("cmdline"), b"serialwrapd\0").unwrap();
+    std::fs::set_permissions(&fd_dir, std::fs::Permissions::from_mode(0)).unwrap();
+
+    let (holders, status) = PosixProcScan::with_root(tmp.path())
+        .serialwrapd_tty_holders(&[tmp.path().join("tty-fake")]);
+    assert!(holders.is_empty());
+    assert_eq!(status, HolderScanStatus::Permission);
 }
 
 #[cfg(unix)]
@@ -263,6 +506,24 @@ fn identity_alive_detects_pid_reuse() {
 
 #[cfg(windows)]
 #[test]
+fn windows_tty_holder_scan_is_unsupported_and_empty() {
+    use sw_pal::proc_scan::WindowsProcScan;
+
+    let (holders, status) = WindowsProcScan::new().serialwrapd_tty_holders(&[]);
+    assert!(holders.is_empty());
+    assert_eq!(status, HolderScanStatus::Unsupported);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_scan_helper_hold() {
+    if std::env::var_os("SW_PAL_HELPER_HOLD").is_some() {
+        std::thread::sleep(std::time::Duration::from_secs(10));
+    }
+}
+
+#[cfg(windows)]
+#[test]
 fn windows_scan_finds_self_spawned_fake_daemon() {
     use sw_pal::proc_scan::WindowsProcScan;
     let tmp = tempfile::tempdir().unwrap();
@@ -270,20 +531,27 @@ fn windows_scan_finds_self_spawned_fake_daemon() {
     std::fs::copy(std::env::current_exe().unwrap(), &fake_exe).unwrap();
 
     let mut child = std::process::Command::new(&fake_exe)
-        .args(["--socket", "tcp://127.0.0.1:1"])
+        .args([
+            "--exact",
+            "windows_scan_helper_hold",
+            "--quiet",
+            "--",
+            "--socket",
+            "tcp://127.0.0.1:1",
+        ])
         .env("SW_PAL_HELPER_HOLD", "1")
         .spawn()
         .unwrap();
     let child_pid = child.id();
 
     let scan = WindowsProcScan::new();
-    let instances = scan.serialwrapd_instances().unwrap();
+    let instances = scan.serialwrapd_instances();
+    let _ = child.kill();
+    let _ = child.wait();
+    let instances = instances.unwrap();
     let found = instances.iter().find(|d| d.pid == child_pid);
     assert!(found.is_some());
     assert_eq!(found.unwrap().socket.as_deref(), Some("tcp://127.0.0.1:1"));
-
-    let _ = child.kill();
-    let _ = child.wait();
 
     let instances_after = scan.serialwrapd_instances().unwrap();
     assert!(!instances_after.iter().any(|d| d.pid == child_pid));
@@ -307,4 +575,17 @@ fn windows_pid_alive_never_terminates_target() {
 
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[cfg(unix)]
+fn fake_proc_stat(pid: u32, comm: &[u8], state: u8, start_ticks: u64) -> Vec<u8> {
+    let mut stat = format!("{pid} (").into_bytes();
+    stat.extend_from_slice(comm);
+    stat.extend_from_slice(b") ");
+    stat.push(state);
+    for _ in 0..18 {
+        stat.extend_from_slice(b" 0");
+    }
+    stat.extend_from_slice(format!(" {start_ticks}\n").as_bytes());
+    stat
 }

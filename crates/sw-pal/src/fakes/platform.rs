@@ -307,10 +307,10 @@ impl ProcessCtl for Unconfigured {
     ) -> PalResult<ChildHandle> {
         not_configured(self.0)
     }
-    fn poll(&self, _c: &ChildHandle) -> Option<i32> {
+    fn poll(&self, _c: &ChildHandle) -> Option<i64> {
         not_configured(self.0)
     }
-    fn call_foreground(&self, _argv: &[String], _env: &[(OsString, OsString)]) -> PalResult<i32> {
+    fn call_foreground(&self, _argv: &[String], _env: &[(OsString, OsString)]) -> PalResult<i64> {
         not_configured(self.0)
     }
 }

@@ -486,7 +486,7 @@ impl TestEnv {
     }
 
     /// 下一次 `spawn_daemon` 的 daemon 立即以 `rc` 結束（poll 腳本的第一筆）。
-    pub fn with_spawn_exits(mut self, rc: i32) -> Self {
+    pub fn with_spawn_exits(mut self, rc: i64) -> Self {
         self.ensure_process().poll_script(vec![Some(rc)]);
         self
     }

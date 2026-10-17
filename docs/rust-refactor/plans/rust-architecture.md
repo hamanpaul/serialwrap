@@ -693,8 +693,8 @@ pub trait ProcessTunnel: Send + Sync {
 pub trait ProcessCtl: Send + Sync {
     fn spawn_daemon(&self, argv: &[String], env: &[(String,String)], detached: bool) -> PalResult<ChildRef>;
     // POSIX：start_new_session、stdout/stderr→DEVNULL、stdin 繼承；Windows：DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP
-    fn poll(&self, c: &ChildRef) -> Option<i32>;
-    fn call_foreground(&self, argv: &[String], env: &[(String,String)]) -> PalResult<i32>;   // subprocess.call
+    fn poll(&self, c: &ChildRef) -> Option<i64>; // Windows 保留完整 DWORD exit code
+    fn call_foreground(&self, argv: &[String], env: &[(String,String)]) -> PalResult<i64>;   // subprocess.call
     /// Stage 1A 委派：POSIX 用 execve（行程被取代，stdio、exit code、訊號天然一致）；
     /// Windows 用 CreateProcess 繼承 handle，加入 Job(KILL_ON_JOB_CLOSE)，SetConsoleCtrlHandler(NULL,TRUE) 後等待並回傳子行程 exit code
     fn exec_or_wait(&self, argv: &[OsString], env_add: &[(String,String)]) -> PalError;   // **P3 修訂（§0.7）**：委派 argv 須保留非 UTF-8 bytes；成功時不返回，只在失敗時回錯誤

@@ -28,8 +28,8 @@ impl ProcessCtl for RecordingProcess {
 #[derive(Debug, Default)]
 pub struct FakeProcessCtl {
     spawns: Mutex<Vec<(Vec<String>, Vec<(OsString, OsString)>, bool)>>,
-    poll_script: Mutex<VecDeque<Option<i32>>>,
-    foreground_rc: Mutex<i32>,
+    poll_script: Mutex<VecDeque<Option<i64>>>,
+    foreground_rc: Mutex<i64>,
     spawn_failure: Mutex<Option<PalErrorKind>>,
     next_pid: Mutex<u32>,
     spawn_events: Mutex<Vec<(u64, String)>>,
@@ -65,12 +65,12 @@ impl FakeProcessCtl {
     }
 
     /// 之後的 `poll` 依序回傳這些結果；用盡後回 `None`（仍在執行）。
-    pub fn poll_script(&self, seq: Vec<Option<i32>>) {
+    pub fn poll_script(&self, seq: Vec<Option<i64>>) {
         *self.poll_script.lock().unwrap_or_else(|e| e.into_inner()) = seq.into();
     }
 
     /// `call_foreground` 的回傳 rc。
-    pub fn foreground_rc(&self, rc: i32) {
+    pub fn foreground_rc(&self, rc: i64) {
         *self.foreground_rc.lock().unwrap_or_else(|e| e.into_inner()) = rc;
     }
 
@@ -113,10 +113,10 @@ impl ProcessCtl for FakeProcessCtl {
         let pid = *next;
         *next += 1;
         self.spawned.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(ChildHandle { pid })
+        Ok(ChildHandle::new(pid))
     }
 
-    fn poll(&self, _c: &ChildHandle) -> Option<i32> {
+    fn poll(&self, _c: &ChildHandle) -> Option<i64> {
         self.poll_script
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -124,7 +124,7 @@ impl ProcessCtl for FakeProcessCtl {
             .flatten()
     }
 
-    fn call_foreground(&self, _argv: &[String], _env: &[(OsString, OsString)]) -> PalResult<i32> {
+    fn call_foreground(&self, _argv: &[String], _env: &[(OsString, OsString)]) -> PalResult<i64> {
         Ok(*self.foreground_rc.lock().unwrap_or_else(|e| e.into_inner()))
     }
 }
