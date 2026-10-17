@@ -90,7 +90,7 @@ changes:
   - id: "BC-04"
     kind: "BC"
     title: "Per-UART 獨占、衝突阻斷與 holder 診斷"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "hamanpaul"
       date: "2026-10-15"
@@ -252,7 +252,7 @@ changes:
   - id: "SC-05"
     kind: "SC"
     title: "device.attach 同步重新取得獨占"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -946,7 +946,7 @@ changes:
   - id: "DF-04"
     kind: "DF"
     title: "動態 session RELEASED 跨重啟保留"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-15"

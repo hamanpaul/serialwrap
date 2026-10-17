@@ -37,6 +37,7 @@ from .constants import (
 from .flash_endpoint import FlashEndpoint, detect_mcu_line, pump_endpoint_to_sink
 from .mcu_patterns import McuPatternRegistry
 from .multi_open import detect_multi_open
+from . import serial_port as serial_port_mod
 from .device_source import _load_exclude_coms  # #131：實作移至 device_source，此處保留匯入相容
 from .device_watcher import DeviceWatcher
 from .event_engine import EventEngine, EngineDeps
@@ -641,7 +642,14 @@ class SerialwrapService:
         tty_paths = [s.get("attached_real_path") for s in sessions if s.get("attached_real_path")]
         mo = detect_multi_open(tty_paths=[t for t in tty_paths if t])
         result["multi_open"] = mo["multi_open"]
-        result["foreign_holders"] = mo["holders"]
+        foreign_holders = dict(mo["holders"])
+        for device in serial_port_mod.unknown_holder_devices():
+            entry: dict[str, Any] = {"device": device, "holder_unknown": True}
+            known_pid = foreign_holders.get(device)
+            if known_pid is not None:
+                entry["pids"] = [known_pid]
+            foreign_holders[device] = entry
+        result["foreign_holders"] = foreign_holders
         result["multi_open_detail"] = {
             "daemons": mo["daemons"],
             "holders_status": mo["holders_status"],

@@ -16,8 +16,9 @@ from typing import Any, Callable
 
 from .config import UartProfile
 from . import constants as _constants
+from . import serial_port as serial_port_mod
 from .constants import DEFERRED_INPUT_MAX_BYTES, RX_RATE_WINDOW_S
-from .serial_port import SerialPort, TxResult, _posix_write_all, open_serial_port
+from .serial_port import SerialPort, TxResult, _posix_write_all
 from .telnet_console import TELNET_GREETING, TelnetFilter, escape_iac
 from .util import strip_ansi
 from .wal import WalWriter
@@ -32,6 +33,16 @@ _STALE_CONSOLE_GRACE_S = 2.0
 # 時間剪枝為主，此上限僅兜底（deque maxlen 自動丟最舊）。
 _RX_WINDOW_MAX_ENTRIES = 4096
 AUTO_TX_SOURCES: frozenset[str] = frozenset({"system"})
+
+
+def open_serial_port(
+    device_path: str,
+    profile: UartProfile,
+    *,
+    backend: str | None = None,
+) -> SerialPort:
+    """延遲委派序列埠 factory，保留既有測試注入點與平台替身能力。"""
+    return serial_port_mod.open_serial_port(device_path, profile, backend=backend)
 _TX_ACCOUNT_MAX = 512
 _PORT_WRITE_CANCEL_CACHE: dict[type, bool] = {}
 _PORT_WRITE_CANCEL_CACHE_LOCK = threading.Lock()
@@ -206,6 +217,8 @@ class UARTBridge:
         on_rx_data: Callable[[bytes], None] | None = None,
         on_bridge_down: Callable[[str], None] | None = None,
         preserved_consoles: PreservedConsoles | None = None,
+        preopened_port: SerialPort | None = None,
+        owns_port: bool = True,
     ) -> None:
         self.com = com
         self.device_path = device_path
@@ -214,6 +227,8 @@ class UARTBridge:
         self._on_console_line = on_console_line
         self._on_rx_data = on_rx_data
         self._on_bridge_down = on_bridge_down
+        self._preopened_port = preopened_port
+        self._owns_port = owns_port
 
         self._serial: SerialPort | None = None
         # POSIX 上 _serial_fd 是 _serial.fileno() 的整數別名，讓 select/os.read/os.write 熱路徑與
@@ -363,15 +378,21 @@ class UARTBridge:
                         return
                     drain_generation = self._drain_generation
 
-            port = open_serial_port(self.device_path, self.profile)
+            port = (
+                self._preopened_port
+                if self._preopened_port is not None
+                else open_serial_port(self.device_path, self.profile)
+            )
             try:
-                port.open()
+                if self._preopened_port is None:
+                    port.open()
                 port.configure(self.profile)
             except Exception:
-                try:
-                    port.close()
-                except Exception:
-                    pass
+                if self._owns_port:
+                    try:
+                        port.close()
+                    except Exception:
+                        pass
                 raise
 
             abort_start = False
@@ -439,10 +460,11 @@ class UARTBridge:
                     self._thread.start()
 
             if abort_start:
-                try:
-                    port.close()
-                except Exception:
-                    pass
+                if self._owns_port:
+                    try:
+                        port.close()
+                    except Exception:
+                        pass
                 raise RuntimeError("drain in progress")
 
     @property
@@ -662,7 +684,11 @@ class UARTBridge:
                     preserved = None
                     clients_to_close = list(self._clients.values())
 
-                close_port = port is not None and not self._port_close_attempted
+                close_port = (
+                    port is not None
+                    and self._owns_port
+                    and not self._port_close_attempted
+                )
                 if close_port:
                     self._port_close_attempted = True
                 self._serial = None
@@ -680,6 +706,8 @@ class UARTBridge:
                 self._console_thread = None
                 self._console_endpoint = None
 
+            # owns_port=False 的 PROBE bridge 把仍開啟的 handle 交還呼叫端；對 bridge
+            # drain 回條而言，該 bridge 已不再持有或使用 handle，故視為交接完成。
             handle_closed = True
             error: str | None = None
             if close_port and port is not None:

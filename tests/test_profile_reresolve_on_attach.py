@@ -9,12 +9,14 @@ CLI 出口（#181 問題 2/3）。本檔驗證 ``_reresolve_profile_on_reattach`
 """
 
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from sw_core.config import ProfileTemplate, SessionProfile, UartProfile
 from sw_core.session_manager import DeviceInfo, SessionManager
+from sw_core.uart_io import DrainReceipt
 import sw_core.session_manager as sm_mod
 from sw_core.wal import WalWriter
 import pytest
@@ -79,9 +81,26 @@ class _Base(unittest.TestCase):
         class _FakeBridge:
             def __init__(self, name, *a, **k):
                 names.append(name)
+                self._state_lock = threading.RLock()
+                self._drain_receipt = None
 
             def start(self):
                 return None
+
+            def begin_drain(self, epoch, *, preserve_consoles, deadline=None):
+                self._drain_receipt = DrainReceipt(
+                    epoch=epoch,
+                    handle_closed=True,
+                    reader_stopped=True,
+                    writer_converged=True,
+                    tx_in_flight=None,
+                    unrecorded=(),
+                    preserved=None,
+                    error=None,
+                )
+
+            def finish_drain(self, timeout_s, *, on_late_receipt=None):
+                return self._drain_receipt
 
             def stop(self):
                 return None
@@ -354,10 +373,11 @@ class TestAttachWiring(_Base):
         mgr = self._mgr()
         self._fallback_session(mgr)
         seen = []
-        mgr._reresolve_profile_on_reattach = lambda by_id: seen.append(by_id)
+        mgr._reresolve_profile_on_reattach = lambda by_id, **_kwargs: seen.append(by_id)
         self._no_bridge()
         try:
-            mgr._attach_by_id(BY_ID)
+            with mock.patch("sw_core.uart_io.open_serial_port", return_value=mock.MagicMock()):
+                mgr._attach_by_id(BY_ID)
         except Exception:
             pass
         self.assertEqual(seen, [BY_ID])

@@ -419,7 +419,7 @@ dynamic 自動偵測 session 的 COM 編號**依裝置 by-id 字典序確定性�
 - **`serialwrap doctor`** → `single_daemon` 檢查項（daemon-less，回 `{check, ok, detail, fix}`）：多開時 `ok=false`。
 - **`serialwrap daemon status`**（RPC `health.status`）→ 回應加欄位：
   - `multi_open`（bool）。
-  - `foreign_holders`（`{tty_real_path: pid}`）：持有目前 attach 中 tty 的 pid。
+  - `foreign_holders`：已識別 holder 的值為 PID；掃描不完整時值為 `{"device": tty_real_path, "holder_unknown": true}`，若另有已收集 PID 則物件含 `pids` 陣列。
   - `multi_open_detail`：`{"daemons": [{"pid": N, "socket": "<path>" | null}, ...], "holders_status": "ok" | "permission" | "unknown"}`。`holders_status` 在跨 uid 讀不到 `/proc/<pid>/fd` 時降級為 `permission`、procfs 不可用時為 `unknown`，此降級資訊本身即為輸出契約的一部分。`socket`（#173）為從各 daemon `--socket` 引數擷取的值（`sw_core/multi_open.py` 的 `_extract_socket_arg`），擷取不到時為 `null`。
 
 ### 8.5a Endpoint 發現與跨進程一致性（#173）

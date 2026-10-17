@@ -1812,7 +1812,7 @@
 
 **Files**
 - Create: `tests/test_stage0_uart_exclusive.py`
-- Modify: `sw_core/serial_port.py`、`sw_core/uart_io.py`（`preopened_port`、`owns_port`）、`sw_core/session_manager.py`（`attach_device`、`_probe_external_holder` 回 `HolderReport` 形狀、`_attach_by_id`／`_reresolve_profile_on_reattach`／`_attach_by_id_dynamic` 使用預開 port、`__init__` released 還原與實體化、`_mark_missing_devices_locked`、`_save_state` released 組出）、`contracts/rpc_schema.json`（`x-pending` 的 BC-04 `DEVICE_STILL_HELD.holder_unknown` 併入 `device.attach` 回應 schema 正式欄位並刪除該 `x-pending` 項；`holder_unknown` 屬回應 schema，不是 `error_codes.yaml` 欄位）、`contracts/error_codes.yaml`（`DEVICE_STILL_HELD` 的 `contract_tests` 補本 Task 測試 node；`behavior_change` 維持 `[BC-04, SC-05]`）、`contracts/behavior_changes.yaml`（BC-04、SC-05、DF-04 → `IMPLEMENTED`）、`tests/test_resource_markers.py`（**測試資產變更**：P0 T14 第 6 條「`windows_com`／`physical_uart` 使用數為 0」的斷言改為「`windows_com` 只允許出現在模組層或 class 層 `pytestmark` 含 `windows_native` 的項目，且每個使用者同時帶 `windows_native`」；需獨立審閱，PR 註明）（本 Task 新檔以 `pytestmark` 標 `windows_native`＋`windows_com`）
+- Modify: `sw_core/serial_port.py`、`sw_core/uart_io.py`（`preopened_port`、`owns_port`）、`sw_core/session_manager.py`（`attach_device`、`_probe_external_holder` 回 `HolderReport` 形狀、`_attach_by_id`／`_reresolve_profile_on_reattach`／`_attach_by_id_dynamic` 使用預開 port、`__init__` released 還原與實體化、`_mark_missing_devices_locked`、`_save_state` released 組出）、`sw_core/cli.py`（`device attach --force` help 說明與實際 holder 行為一致）、`contracts/rpc_schema.json`（`x-pending` 的 BC-04 `DEVICE_STILL_HELD.holder_unknown` 併入 `device.attach` 回應 schema 正式欄位並刪除該 `x-pending` 項；`holder_unknown` 屬回應 schema，不是 `error_codes.yaml` 欄位）、`contracts/error_codes.yaml`（`DEVICE_STILL_HELD` 的 `contract_tests` 補本 Task 測試 node；`behavior_change` 維持 `[BC-04, SC-05]`）、`contracts/behavior_changes.yaml`（BC-04、SC-05、DF-04 → `IMPLEMENTED`）、`tests/test_resource_markers.py`（**測試資產變更**：P0 T14 第 6 條「`windows_com`／`physical_uart` 使用數為 0」的斷言改為「`windows_com` 只允許出現在模組層或 class 層 `pytestmark` 含 `windows_native` 的項目，且每個使用者同時帶 `windows_native`」；需獨立審閱，PR 註明）（本 Task 新檔以 `pytestmark` 標 `windows_native`＋`windows_com`）
 
 **Interfaces**
 - Consumes：T07 `drain_pending`；T08 `_pending_drain`。
@@ -2031,6 +2031,7 @@
   | `test_hotplug_attach_held_sets_last_error` | 熱插 `_attach_by_id` 開檔被占 → `DETACHED`、`last_error == "ATTACH_FAILED:DeviceHeldError"`，不啟動 reader |
   | `test_dynamic_released_survives_two_restarts` | 動態 session release → 重建 `SessionManager` 兩次（同 `state.json`）→ `by_id in _released_by_ids` 且 `state.json["released"]` 仍含該列（DF-04） |
   | `test_dynamic_released_attachable_after_restart` | 動態 session release → 重建 `SessionManager` → `get_session("<COM>")` 存在且 state `RELEASED`（init 依 `_loaded_released` 實體化）→ `attach_device("<COM>")` 成功、`ATTACHING` |
+  | `test_released_unavailable_uboot_template_remains_blocked` | released `uboot-template` 重啟時已無可解析 template → 不合成空 `ready_probe` profile；保留 `_loaded_released` 與 `_released_by_ids` 阻擋並記 WARNING（符合 DF-04 缺失 template 規則） |
   | `test_offline_tick_keeps_released` | RELEASED session 裝置離線後 `update_devices([])` → state 仍 `RELEASED` |
   | `test_unconsumed_preopened_port_closed_on_release` | attach 成功但 attach thread 尚未消費時 release → 該 port `close()` 恰一次 |
   | `test_release_then_external_plain_open_succeeds` | （`posix_only`、`posix_pty`、`process_rpc`；非 root，root 下 skip 記「證據不足」；R0-F3，修正前必 FAIL）測試持有 PTY master 全程不關；throwaway daemon 對該 slave 到 `READY` → `device release` 回 ok → 子行程（模擬外部燒錄工具）一般 `os.open(slave, O_RDWR\|O_NOCTTY)` **成功**（exit 0；`EBUSY` 判 FAIL）、寫 `b"X"` 後關閉，master 端讀到 `b"X"` → `device attach` 回 `ok: True` → 20 s 內 `READY` |
@@ -2046,7 +2047,19 @@
   - `attach_device`：依凍結表與「同步 attach 的操作身分」；同步開檔使用 `open_serial_port(real_path, session.profile.uart)` 後 `port.open()`；重驗通過才 `self._preopened_ports[by_id] = op`，再清 released、`_save_state()`、`ATTACHING`、`_spawn_attach(by_id)`。`_attach_by_id` 取 `op = self._preopened_ports.pop(by_id, None)`，PROBE 與正式 bridge 依「預開 port 與 PROBE bridge」共用 `op.port`；正式 bridge `start()` 失敗時由正式 bridge 負責 close（`owns_port=True`），不得雙重 close。
   - DF-04：`__init__` 將 `_loaded_released` 中**不在** `self._sessions` 的列**直接實體化**為 `RELEASED` session（COM 取自 session_id `<profile>:<COM>`、profile 取自 pins／provenance 中的 template，套回 `released_by`／`released_at`／`released_reason`），並把 by_id 加入 `_released_by_ids`——否則 `_spawn_attach` 對 released by_id 早退（`session_manager.py` 約 2291 行），session 永遠不會被實體化，`device attach <COM>` 找不到 selector、只留下封鎖而沒有解除路徑；template 已不存在而無法實體化者保留於 `_loaded_released` 並持續阻擋，log WARNING。`_save_state` 的 `released` = 記憶體 RELEASED session 列 ∪ `_loaded_released` 中未實體化的列。`_mark_missing_devices_locked` 跳過 `state == "RELEASED"`。
 - [ ] **B2 執行並確認 PASS**：`python3 -m pytest -q tests/test_stage0_uart_exclusive.py tests/test_serial_port.py tests/test_device_handoff.py tests/test_holder_probe_portability.py tests/test_explicit_target_device_ownership.py tests/test_windows_claim.py tests/test_multi_open_detect.py tests/test_multiagent_e2e.py tests/test_human_agent_coexist.py tests/test_flash_endpoint.py tests/test_resource_markers.py tests/test_contracts_rpc_schema.py`；`python3 -m tools.contracts check`；全套依 §0 第 4 點，並檢查是否有既有測試在 bridge 開啟後以路徑再開同一 PTY slave（BC-04 預期行為；若有，**先**把該檔與測試名追加到本 Task「測試資產變更」並經獨立審閱，PR 註明，才可修改）。
-- **測試資產變更**：`tests/test_resource_markers.py` 的 `windows_com` 使用數斷言（見 Files）；其餘待 B2 全套結果追加，未追加者不得修改。
+- **測試資產變更**：`tests/test_resource_markers.py` 的 `windows_com` 使用數斷言（見 Files）。B2 審閱後追加下列 T10 測試調整：
+  - `tests/test_stage0_uart_exclusive.py`：新增本任務測試，涵蓋預開 handle／holder 診斷／零 TX、PROBE 與正式 bridge 共用 handle、release／bind／hot-unplug 對在途 PROBE 的取消與收斂、同步 open 失效分類、Windows ACCESS_DENIED 到 `DEVICE_STILL_HELD{holder_unknown:true}` 的 RPC 映射、重複 attach 與 RELEASED 清理；PROBE drain 使用阻塞 reader 驗證未收回前不關閉 handle，另驗證遺失的 uboot template 維持持久化阻擋。
+  - `tests/test_windows_claim.py::test_no_profiles_windows_passthrough_claim`：注入 fake serial port，避免無硬體的 `COM8` 機制測試觸碰主機 COM 路徑。
+  - `tests/test_boot_quiet.py::TestReadyReconfirmGate`：mock bridge 時同步 mock 預開 serial port，維持原測試的記憶體隔離。
+  - `tests/test_contracts_gap_codes.py::TestGapLastError`：三個使用 mocked bridge 的 attach case 注入 fake serial port，避免預開階段開啟實際裝置。
+  - `tests/test_device_handoff.py::TestAttachDevice` 與 `TestAttachByIdReleasedBackstop`：同步 attach 與 RELEASED backstop 使用 fake serial port，保持零硬體測試邊界。
+  - `tests/test_explicit_target_device_ownership.py::TestExplicitTargetDeviceOwnership`：mock attach bridge 的 case 注入 fake serial port。
+  - `tests/test_holder_probe_portability.py::TestHolderProbePortability`：更新不可讀 `/proc` 時的凍結結果，要求 `holder_unknown: true`。
+  - `tests/test_human_agent_coexist.py::FakeTarget`、`tests/test_multiagent_e2e.py::FakeTarget`：關閉 pytest 行程持有的 slave fd，避免 BC-04 把測試自身誤判為外部 holder；PTY 讀取在暫態錯誤時繼續等待。
+  - `tests/test_profile_reresolve_on_attach.py::TestAttachWiring` 與 `_Base._no_bridge`：對新 `preopened_op` 參數放寬替身簽章、為 attach 注入 fake serial port，並讓 PROBE 替身回傳即時安全 drain receipt，符合 BC-04 交接介面。
+  - `tests/test_session_bind.py::TestSessionBind`：四個 mock bridge 的 attach case 注入 fake serial port。
+  - `tests/test_stage0_session_drain.py::test_release_waits_for_inflight_attach_handle_receipt`：注入 fake serial port；`test_shutdown_waits_inflight_attach_before_wal_close` 以「無殘留 attach op／預開 handle 且 close 恰一次」取代對舊 cleanup callback 的觀察，仍斷言 shutdown 未越過阻塞中的開埠及 WAL 關閉順序。
+  - `tests/test_service_human_console.py` 的 `admission_exempt` 變更是 worktree 既有 T08 測試調整，與 T10 無關，本任務未修改。
 - [ ] **B3 commit**：`feat(uart): BC-04 POSIX 以 flock＋TIOCEXCL 獨占 UART 並回報 holder，device attach 同步收回`
 
 ---

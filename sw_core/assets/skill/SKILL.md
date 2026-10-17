@@ -56,7 +56,7 @@ description: 透過 serialwrap broker + CLI 進行多 agent UART 存取，提供
 當外部工具需要對同一 raw `/dev/ttyUSBx` 做**獨佔**存取（例如 `ocp-mcu-upgrade` 燒錄 MCU SBL 二進位協定）時，serialwrap 持有該 FD 會造成 two-reader 競爭、外部工具 timeout。**不要**用 `session clear`（detach 後會自動 re-attach 搶回），改用 first-class handoff：
 1. `serialwrap device release --selector COM0 --source agent:flash --reason "flash MCU"`：serialwrap 關閉該 UART FD、clean-slate 清空 console、進入 `RELEASED`，**不會自動搶回**（跨 daemon 重啟亦保留）。
 2. 外部工具獨佔該 raw device 完成燒錄。
-3. `serialwrap device attach --selector COM0`：收回裝置並重建 primary console。外部仍持有時回 `DEVICE_STILL_HELD`（附 pids）；確認外部真的結束後可加 `--force` 略過檢查。
+3. `serialwrap device attach --selector COM0`：收回裝置並重建 primary console。外部仍持有時回 `DEVICE_STILL_HELD`（附 pids）；`--force` 只略過開檔前預檢，鎖後仍識別到 holder 時不會強制搶占，須等外部持有者釋放後再試。
 4. 期間 `serialwrap session self-test --selector COM0` 在 `RELEASED` 會回 `external_holder` / `reclaimable` / `recommended_action`（`wait_external_flash` 或 `device_attach`）；屬唯讀偵測，不開 tty、不干擾燒錄。
 5. 被遺忘的 release 可由 self-test 的 `reclaimable=true` 辨識（裝置不會永久卡住，但需明確 `device attach` 收回）。
 
@@ -274,7 +274,7 @@ serialwrap mcu status
 | `DEVICE_NOT_BOUND` | rpc／posix、windows | 修正參數後 | session 未設定 device_by_id，無法 attach | 先以 session.bind 綁定裝置後再 attach |
 | `DEVICE_NOT_FOUND` | rpc／posix、windows | 視情況 | 指定的裝置或 selector 解析不到對應裝置 | 以 device list 確認裝置在線且 by_id 正確，裝置出現後再 attach |
 | `DEVICE_NOT_PRESENT` | rpc／posix、windows | 視情況 | by_id 不在目前的裝置清單中（未插入或尚未列舉） | 確認裝置已插入且 device list 可見後重試 |
-| `DEVICE_STILL_HELD` | rpc／posix、windows | 視情況 | /proc 掃描到外部程式持有該 tty，非 force 的 device attach 被拒（回應不含 holder_unknown，BC-04 尚未實作） | 等待外部持有者釋放，或確認可安全中止後以 force 重試 |
+| `DEVICE_STILL_HELD` | rpc／posix、windows | 視情況 | UART 獨占開啟或 holder 預檢確認裝置仍被占用 | 等待已識別的外部持有者釋放後重試；force 只略過開檔前預檢，不會繞過實際開檔或鎖後 holder 掃描 |
 | `ECHO_ACK_UNSUPPORTED` | rpc／posix、windows | 修正參數後 | ack_mode 為 echo，但 bridge 不支援 echo 節流送出 | 改用其他 ack_mode 重試 |
 | `EMPTY_RESPONSE` | cli_client／posix、windows | 視情況 | 連線已關閉但未收到任何一行回應 | 僅白名單唯讀方法可由 CLI 重試；其他方法先以 health.ping 確認 daemon 狀態 |
 | `ENV_FILE_SOURCE_FAILED` | cli_local／posix、windows | 修正參數後 | env 檔以 bash -lc source 執行失敗（非 0 退出），或 Windows 讀取檔案時發生 OS 錯誤 | 確認 env_file 路徑與內容後重試 |

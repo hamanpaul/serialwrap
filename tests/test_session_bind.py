@@ -752,6 +752,7 @@ class TestSessionBind(unittest.TestCase):
         )
 
         with mock.patch("sw_core.session_manager.UARTBridge") as MockBridge, \
+             mock.patch("sw_core.uart_io.open_serial_port", return_value=mock.MagicMock()), \
              mock.patch("sw_core.session_manager.probe_ready", return_value=(True, None)):
             bridge_inst = MockBridge.return_value
             bridge_inst.vtty_path = "/dev/pts/99"
@@ -808,6 +809,7 @@ class TestSessionBind(unittest.TestCase):
         dev1_by_id = "/dev/serial/by-id/usb-FTDI_BBB-if00"
 
         with mock.patch("sw_core.session_manager.UARTBridge") as MockBridge, \
+             mock.patch("sw_core.uart_io.open_serial_port", return_value=mock.MagicMock()), \
              mock.patch("sw_core.session_manager.probe_ready", return_value=(True, None)):
             MockBridge.return_value.vtty_path = "/dev/pts/10"
             MockBridge.return_value.start.return_value = None
@@ -917,6 +919,7 @@ class TestSessionBind(unittest.TestCase):
 
         with (
             mock.patch("sw_core.session_manager.UARTBridge") as MockBridge,
+            mock.patch("sw_core.uart_io.open_serial_port", return_value=mock.MagicMock()),
             mock.patch("sw_core.session_manager.probe_ready") as probe_ready,
             mock.patch("sw_core.session_manager.ensure_ready") as ensure_ready,
         ):
@@ -1043,6 +1046,7 @@ class TestSessionBind(unittest.TestCase):
         self.assertEqual(session.to_public_dict()["console_count"], 1)
 
         with mock.patch("sw_core.session_manager.UARTBridge") as MockBridge, \
+             mock.patch("sw_core.uart_io.open_serial_port", return_value=mock.MagicMock()), \
              mock.patch("sw_core.session_manager.probe_ready", return_value=(True, None)):
             MockBridge.return_value.start.return_value = None
             MockBridge.return_value.vtty_path = "/dev/pts/55"

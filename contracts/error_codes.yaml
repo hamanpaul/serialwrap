@@ -330,20 +330,20 @@ codes:
     extra_fields: ["selector", "device_by_id"]
     contract_tests: ["tests/test_device_handoff.py::TestAttachDevice::test_attach_device_not_present"]
     behavior_change: []
-    sources: ["sw_core/session_manager.py:2015"]
+    sources: ["sw_core/session_manager.py:2901"]
   - code: DEVICE_STILL_HELD
-    status: EXISTING
+    status: IMPLEMENTED
     reachable: true
     scope: {interfaces: [rpc], methods: ["device.attach"], platforms: [posix, windows]}
-    meaning: "/proc 掃描到外部程式持有該 tty，非 force 的 device attach 被拒（回應不含 holder_unknown，BC-04 尚未實作）"
+    meaning: "UART 獨占開啟或 holder 預檢確認裝置仍被占用"
     side_effect: "無"
     retryable: "conditional"
     uart_tx: none
-    agent_action: "等待外部持有者釋放，或確認可安全中止後以 force 重試"
-    extra_fields: ["pids", "selector"]
-    contract_tests: ["tests/test_device_handoff.py::TestAttachDevice::test_attach_refuses_when_externally_held"]
+    agent_action: "等待已識別的外部持有者釋放後重試；force 只略過開檔前預檢，不會繞過實際開檔或鎖後 holder 掃描"
+    extra_fields: ["holder_unknown", "pids", "selector"]
+    contract_tests: ["tests/test_stage0_uart_exclusive.py::TestManagerAttach::test_attach_device_held_keeps_released", "tests/test_device_handoff.py::TestAttachDevice::test_attach_refuses_when_externally_held", "tests/test_stage0_uart_exclusive.py::TestAttachProbeDrain::test_attach_device_force_rejects_plain_external_holder", "tests/test_stage0_uart_exclusive.py::TestManagerAttach::test_attach_device_pyserial_access_denied_maps_to_unknown_holder"]
     behavior_change: ["BC-04", "SC-05"]
-    sources: ["sw_core/session_manager.py:2020"]
+    sources: ["sw_core/session_manager.py:2925"]
   - code: ECHO_ACK_UNSUPPORTED
     status: EXISTING
     reachable: true

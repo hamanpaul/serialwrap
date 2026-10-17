@@ -2006,7 +2006,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_drel.add_argument("--reason", default=None)
     p_datt = device_sub.add_parser(
         "attach",
-        help="收回先前 release 的裝置並重建 console（外部仍持有時回 DEVICE_STILL_HELD，--force 略過）",
+        help="收回先前 release 的裝置並重建 console（--force 只略過開檔前預檢，不會搶占已識別的外部持有者）",
     )
     p_datt.add_argument("--selector", required=True)
     p_datt.add_argument("--force", action="store_true")

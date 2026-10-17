@@ -1993,7 +1993,7 @@ serialwrap 持有 UART 時，外部 flasher（如 `ocp-mcu-upgrade`）無法獨�
 serialwrap device release --selector COM0 --source agent:flash --reason "flash CC2674"
 # serialwrap 關閉該 UART、清空 console，且不會自動搶回
 ocp-mcu-upgrade -d /dev/ttyUSB1 -b 115200 -t 8 -e -s -i fw.bin
-serialwrap device attach --selector COM0   # 收回；外部仍持有時回 DEVICE_STILL_HELD，--force 可強制
+serialwrap device attach --selector COM0   # 收回；--force 只略過預檢，不能搶占已識別的外部持有者
 ```
 
 `serialwrap session self-test --selector COM0` 在 RELEASED 下會回 `external_holder` /
@@ -2162,7 +2162,7 @@ serialwrap daemon status   # multi_open / foreign_holders 欄位
 - **`serialwrap doctor`**：新增 `single_daemon` 檢查項，掃 `/proc` 找 `serialwrapd` 程序；多開時 `ok=false`、`detail` 列出在跑的 daemon 數、`fix` 指引「停掉多餘 daemon（`serialwrap service stop`；並檢查 systemd-user 與 system 是否同時在跑）」。doctor 為獨立程序、不碰 socket。
 - **`serialwrap daemon status`**：回應加三個欄位：
   - `multi_open`（bool）：是否偵測到一個以上 `serialwrapd`。
-  - `foreign_holders`（`{tty_real_path: pid}`）：哪個 pid 持有目前 attach 中的 tty。
+  - `foreign_holders`：known holder 的值為 PID；holder 掃描不完整時值為物件 `{"device": tty_real_path, "holder_unknown": true}`，若同時找到 PID 則另含 `pids` 陣列。
   - `multi_open_detail`：`{"daemons": [{"pid": N, "socket": "<path>" | null}, ...], "holders_status": "ok" | "permission" | "unknown"}`。`holders_status` 在跨 uid 讀不到 `/proc/<pid>/fd` 時降級為 `permission`（仍確認另有 daemon 存在，但無法判定持有哪條 tty）；procfs 不可用時為 `unknown`。`socket`（#173）是從各 daemon 的 `--socket` 引數擷取的值，讀不到時為 `null`。
 
 #### 自訂安裝路徑與 config.yaml 同步（#173）
@@ -3143,8 +3143,7 @@ positional arguments:
   <command>
     list      列出實體 UART 裝置（real_path 與 by-id）
     release   釋放 raw 裝置給外部工具獨佔（如 MCU 燒錄），進入 RELEASED 不自動搶回
-    attach    收回先前 release 的裝置並重建 console（外部仍持有時回 DEVICE_STILL_HELD，--force
-              略過）
+    attach    收回先前 release 的裝置並重建 console（--force 只略過開檔前預檢，不會搶占已識別的外部持有者）
 
 options:
   -h, --help  show this help message and exit

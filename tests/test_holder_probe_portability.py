@@ -142,11 +142,11 @@ class TestHolderProbePortability(unittest.TestCase):
         self.assertEqual(res["holder"], 1234)
 
     def test_no_proc_returns_empty_safely(self) -> None:
-        """當 _proc_root 不存在或無法讀取時，安全回傳空結果，不拋出例外。"""
+        """當 _proc_root 不可讀時，不拋出例外且明確標記 holder 未知。"""
         mgr = self._mgr()
         nonexistent_proc = Path(self._tmp.name) / "nonexistent_proc"
         res = mgr._probe_external_holder("/dev/ttyUSB0", _proc_root=str(nonexistent_proc))
-        self.assertEqual(res, {"pids": [], "holder": None})
+        self.assertEqual(res, {"pids": [], "holder": None, "holder_unknown": True})
 
     def test_my_pid_ignored(self) -> None:
         """自身 pid 在 _proc_root 中應被忽略，不計入 external holders。"""

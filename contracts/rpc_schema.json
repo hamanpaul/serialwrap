@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/hamanpaul/serialwrap/contracts/rpc_schema.json",
   "title": "serialwrap RPC contract",
-  "x-catalog-revision": 4,
+  "x-catalog-revision": 5,
   "x-wire": {
     "framing": "ndjson",
     "line_strip": true,
@@ -1783,6 +1783,45 @@
             "drain_timeout_epoch",
             "session"
           ]
+        },
+        "DEVICE_STILL_HELD": {
+          "type": "object",
+          "x-order": [
+            "ok",
+            "error_code",
+            "pids",
+            "holder_unknown",
+            "selector"
+          ],
+          "properties": {
+            "ok": {
+              "type": "boolean",
+              "const": false
+            },
+            "error_code": {
+              "type": "string",
+              "const": "DEVICE_STILL_HELD"
+            },
+            "pids": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            },
+            "holder_unknown": {
+              "type": "boolean"
+            },
+            "selector": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "ok",
+            "error_code",
+            "pids",
+            "holder_unknown",
+            "selector"
+          ]
         }
       }
     },
@@ -3163,11 +3202,36 @@
           "foreign_holders": {
             "type": "object",
             "additionalProperties": {
-              "type": "integer"
+              "oneOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "device",
+                    "holder_unknown"
+                  ],
+                  "properties": {
+                    "device": {
+                      "type": "string"
+                    },
+                    "holder_unknown": {
+                      "const": true
+                    },
+                    "pids": {
+                      "type": "array",
+                      "items": {
+                        "type": "integer"
+                      }
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              ]
             },
-            "x-unit": "pid",
-            "x-updated-by": "on-demand 掃 /proc（health.status 呼叫時）；包含 daemon 自身 pid（RPC-D-10／PLT-O-04）",
-            "x-note": "key 為 tty real_path，value 為持有者 pid"
+            "x-updated-by": "on-demand 掃 /proc（health.status 呼叫時）；一般值包含 daemon 自身 pid（RPC-D-10／PLT-O-04），掃描不完整時以 holder_unknown 物件回報",
+            "x-note": "key 為 tty real_path；一般 value 為持有者 pid，掃描不完整時 value 為 {device, holder_unknown, pids?}"
           },
           "multi_open_detail": {
             "type": "object",
@@ -7589,15 +7653,6 @@
     }
   },
   "x-pending": [
-    {
-      "id": "BC-04",
-      "change": "BC-04",
-      "adds": {
-        "DEVICE_STILL_HELD": [
-          "holder_unknown"
-        ]
-      }
-    },
     {
       "id": "SC-19",
       "change": "SC-19",

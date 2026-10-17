@@ -213,7 +213,7 @@ serialwrap device attach --selector COM0
 | `DEVICE_NOT_BOUND` | rpc／posix、windows | 修正參數後 | session 未設定 device_by_id，無法 attach | 先以 session.bind 綁定裝置後再 attach |
 | `DEVICE_NOT_FOUND` | rpc／posix、windows | 視情況 | 指定的裝置或 selector 解析不到對應裝置 | 以 device list 確認裝置在線且 by_id 正確，裝置出現後再 attach |
 | `DEVICE_NOT_PRESENT` | rpc／posix、windows | 視情況 | by_id 不在目前的裝置清單中（未插入或尚未列舉） | 確認裝置已插入且 device list 可見後重試 |
-| `DEVICE_STILL_HELD` | rpc／posix、windows | 視情況 | /proc 掃描到外部程式持有該 tty，非 force 的 device attach 被拒（回應不含 holder_unknown，BC-04 尚未實作） | 等待外部持有者釋放，或確認可安全中止後以 force 重試 |
+| `DEVICE_STILL_HELD` | rpc／posix、windows | 視情況 | UART 獨占開啟或 holder 預檢確認裝置仍被占用 | 等待已識別的外部持有者釋放後重試；force 只略過開檔前預檢，不會繞過實際開檔或鎖後 holder 掃描 |
 | `ECHO_ACK_UNSUPPORTED` | rpc／posix、windows | 修正參數後 | ack_mode 為 echo，但 bridge 不支援 echo 節流送出 | 改用其他 ack_mode 重試 |
 | `EMPTY_RESPONSE` | cli_client／posix、windows | 視情況 | 連線已關閉但未收到任何一行回應 | 僅白名單唯讀方法可由 CLI 重試；其他方法先以 health.ping 確認 daemon 狀態 |
 | `ENV_FILE_SOURCE_FAILED` | cli_local／posix、windows | 修正參數後 | env 檔以 bash -lc source 執行失敗（非 0 退出），或 Windows 讀取檔案時發生 OS 錯誤 | 確認 env_file 路徑與內容後重試 |

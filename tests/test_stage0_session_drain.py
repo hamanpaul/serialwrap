@@ -373,8 +373,10 @@ def test_release_drain_deadline_includes_lock_wait(tmp_path, short_drain):
 def test_release_waits_for_inflight_attach_handle_receipt(tmp_path, monkeypatch):
     from sw_core.device_watcher import DeviceInfo
     from sw_core.uart_io import DrainReceipt
+    import sw_core.uart_io as uart_io
 
     mgr, session, _old_bridge = _ready_with_port(tmp_path, FakePort())
+    monkeypatch.setattr(uart_io, "open_serial_port", lambda *_args, **_kwargs: FakePort())
     session.bridge = None
     session.state = "DETACHED"
     mgr._devices[BY_ID] = DeviceInfo(by_id=BY_ID, real_path="/dev/fake-uart")
@@ -629,7 +631,6 @@ def test_shutdown_waits_inflight_attach_before_wal_close(tmp_path, monkeypatch):
 
     port_open_started = threading.Event()
     allow_port_open = threading.Event()
-    cleanup_started = threading.Event()
     attach_finished = threading.Event()
     stop_finished = threading.Event()
     order: list[str] = []
@@ -655,19 +656,15 @@ def test_shutdown_waits_inflight_attach_before_wal_close(tmp_path, monkeypatch):
             attach_finished.set()
 
     monkeypatch.setattr(manager, "_attach_by_id", tracked_attach)
-    original_begin_cleanup = manager._begin_attach_bridge_stop_locked
-
-    def tracked_begin_cleanup(*args: Any, **kwargs: Any):
-        job = original_begin_cleanup(*args, **kwargs)
-        cleanup_started.set()
-        return job
-
-    monkeypatch.setattr(manager, "_begin_attach_bridge_stop_locked", tracked_begin_cleanup)
     original_close = service._wal.close
 
     def tracked_wal_close() -> None:
         assert attach_finished.is_set(), "WAL 在 production attach thread 收尾前關閉"
         assert not manager._attach_inflight, "WAL 關閉時 attach 仍被標記為在途"
+        assert not manager._attach_ops, "WAL 關閉時仍有 UART 開埠操作"
+        assert not manager._active_attach_ops, "WAL 關閉時仍有 worker 持有 UART handle"
+        assert not manager._preopened_ports, "WAL 關閉時仍有未消費的 UART handle"
+        assert port.close_calls == 1, "WAL 關閉前預開 UART handle 必須恰好收回一次"
         order.append("wal_close")
         original_close()
 
@@ -687,8 +684,7 @@ def test_shutdown_waits_inflight_attach_before_wal_close(tmp_path, monkeypatch):
     stopper = threading.Thread(target=stop_service)
     stopper.start()
     try:
-        assert cleanup_started.wait(2.0), "shutdown 未對在途 attach 建立關閉屏障"
-        assert not stop_finished.wait(0.05), "shutdown 未等待被 gate 阻塞的 attach"
+        assert not stop_finished.wait(0.05), "shutdown 未等待被 gate 阻塞的獨占開埠"
     finally:
         allow_port_open.set()
         stopper.join(6.0)

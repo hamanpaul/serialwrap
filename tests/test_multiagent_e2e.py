@@ -48,7 +48,13 @@ class FakeTarget:
         termios.tcsetattr(fd, termios.TCSANOW, attrs)
 
     def start(self) -> None:
-        os.write(self.master_fd, b"boot done\r\nroot@prplOS:/# ")
+        # 不讓 pytest 行程持有 slave fd；BC-04 會把同 tty 的其他 pid 視為外部 holder。
+        # daemon 開啟 slave 後會送空行 probe，_cmd_loop 再回 prompt。
+        try:
+            os.close(self.slave_fd)
+        except OSError:
+            pass
+        self.slave_fd = None
         self._cmd_thread.start()
         self._noise_thread.start()
 
@@ -57,6 +63,8 @@ class FakeTarget:
         self._cmd_thread.join(timeout=2.0)
         self._noise_thread.join(timeout=2.0)
         for fd in (self.master_fd, self.slave_fd):
+            if fd is None:
+                continue
             try:
                 os.close(fd)
             except OSError:
@@ -69,7 +77,8 @@ class FakeTarget:
             try:
                 os.write(self.master_fd, msg)
             except OSError:
-                return
+                time.sleep(0.05)
+                continue
             time.sleep(0.05)
 
     def _cmd_loop(self) -> None:
@@ -86,7 +95,8 @@ class FakeTarget:
             except BlockingIOError:
                 continue
             except OSError:
-                return
+                time.sleep(0.05)
+                continue
             if not chunk:
                 continue
             buf += chunk

@@ -210,8 +210,10 @@ class TestAttachDevice(_Base):
 
     def test_attach_reclaims_when_free(self) -> None:
         mgr, session, by_id = self._released_mgr()
+        port = mock.MagicMock()
         with mock.patch.object(mgr, "_probe_external_holder", return_value={"pids": [], "holder": None}), \
-             mock.patch.object(mgr, "_spawn_attach") as spawn_attach:
+             mock.patch.object(mgr, "_spawn_attach") as spawn_attach, \
+             mock.patch("sw_core.serial_port.open_serial_port", return_value=port):
             resp = mgr.attach_device("COM0")
         self.assertTrue(resp["ok"])
         self.assertNotIn(by_id, mgr._released_by_ids)
@@ -232,8 +234,10 @@ class TestAttachDevice(_Base):
 
     def test_attach_force_bypasses_holder_check(self) -> None:
         mgr, session, by_id = self._released_mgr()
+        port = mock.MagicMock()
         with mock.patch.object(mgr, "_probe_external_holder", return_value={"pids": [4321], "holder": 4321}) as probe, \
-             mock.patch.object(mgr, "_spawn_attach") as spawn_attach:
+             mock.patch.object(mgr, "_spawn_attach") as spawn_attach, \
+             mock.patch("sw_core.serial_port.open_serial_port", return_value=port):
             resp = mgr.attach_device("COM0", force=True)
         self.assertTrue(resp["ok"])
         probe.assert_not_called()
@@ -451,6 +455,7 @@ class TestAttachByIdReleasedBackstop(_Base):
             return True, None
 
         with mock.patch("sw_core.session_manager.UARTBridge") as bridge_cls, \
+             mock.patch("sw_core.uart_io.open_serial_port", return_value=mock.MagicMock()), \
              mock.patch("sw_core.session_manager.probe_ready", side_effect=_blocking_probe):
             bridge_cls.return_value.finish_drain.return_value = DrainReceipt(
                 epoch=0,

@@ -738,7 +738,8 @@ class TestGapLastError:
         mgr = _mgr(tmp_path, [_profile(platform="passthrough")])
         mgr._devices = {_BY_ID: DeviceInfo(by_id=_BY_ID, real_path="/dev/ttyUSB5")}
 
-        with mock.patch("sw_core.session_manager.UARTBridge") as mock_bridge:
+        with mock.patch("sw_core.session_manager.UARTBridge") as mock_bridge, \
+             mock.patch("sw_core.uart_io.open_serial_port", return_value=mock.MagicMock()):
             # bridge.start() 進行中移除裝置。
             mock_bridge.return_value.start.side_effect = lambda: mgr._devices.pop(_BY_ID, None)
             mgr._attach_by_id(_BY_ID)
@@ -860,7 +861,8 @@ class TestGapLastError:
         session = mgr.get_session("COM0")
         assert session is not None
         with mock.patch.dict(os.environ, {"SW_GAP_USER": "root", "SW_GAP_PASS": "secret"}):
-            with mock.patch("sw_core.session_manager.UARTBridge", return_value=_ScriptedBridge(waits=[False])):
+            with mock.patch("sw_core.uart_io.open_serial_port", return_value=mock.MagicMock()), \
+                 mock.patch("sw_core.session_manager.UARTBridge", return_value=_ScriptedBridge(waits=[False])):
                 mgr._attach_by_id(_BY_ID)
         assert session.last_error == "LOGIN_PROMPT_TIMEOUT"
         assert session.state == "DETACHED"
@@ -895,7 +897,8 @@ class TestGapLastError:
         session = mgr.get_session("COM0")
         assert session is not None
 
-        with mock.patch.object(UARTBridge, "start", side_effect=OSError("busy")):
+        with mock.patch("sw_core.uart_io.open_serial_port", return_value=mock.MagicMock()), \
+             mock.patch.object(UARTBridge, "start", side_effect=OSError("busy")):
             mgr._attach_by_id(_BY_ID)
 
         assert session.last_error == "ATTACH_FAILED:OSError"
