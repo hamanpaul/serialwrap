@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/hamanpaul/serialwrap/contracts/cli_schema.json",
   "title": "serialwrap CLI contract",
-  "x-catalog-revision": 2,
+  "x-catalog-revision": 3,
   "x-prog": "serialwrap",
   "x-conventions": {
     "params_source": "rpc.params 的值為來源：字串為該子命令 argparse namespace 的 dest，送出 args.<dest> 原值；\"selector|com\" 表示 args.selector or args.com（盤點 01 §6.6 stream tail、§6.7 log tail-raw／tail-text）；{\"$document\": \"file\"} 表示 --file 讀入的整份 JSON 物件即為 RPC params（event add）。",
@@ -1833,7 +1833,24 @@
         }
       ],
       "mutex": [],
-      "subcommands": null
+      "subcommands": [
+        {
+          "name": "stop",
+          "options": [
+            {
+              "flags": [],
+              "action": "store",
+              "dest": "selector",
+              "type": "str",
+              "default": "all",
+              "positional": "selector",
+              "nargs": "?"
+            }
+          ],
+          "mutex": [],
+          "rpc": null
+        }
+      ]
     },
     {
       "name": "connect",
@@ -2448,7 +2465,6 @@
         "INVALID_BENCH_CONFIG": 1,
         "INVALID_BENCH_STATE": 1,
         "REMOTE_BIND_UNVERIFIED": 1,
-        "REMOTE_NOT_SUPPORTED": 1,
         "SSH_NOT_FOUND": 1,
         "TUNNEL_CONFLICT": 1,
         "TUNNEL_SPAWN_FAILED": 1,
@@ -2467,7 +2483,6 @@
         "INTERNAL_ERROR": 1,
         "INVALID_BENCH_CONFIG": 1,
         "INVALID_BENCH_STATE": 1,
-        "REMOTE_NOT_SUPPORTED": 1,
         "TUNNEL_STATUS_ERROR": 1
       },
       "note": "失敗一律 1；argparse JSON 邊界同為 1"
@@ -2485,7 +2500,6 @@
         "INVALID_ENDPOINT": 1,
         "INVALID_TARGET": 1,
         "REMOTE_BIND_UNVERIFIED": 1,
-        "REMOTE_NOT_SUPPORTED": 1,
         "SSH_NOT_FOUND": 1,
         "TUNNEL_CONFLICT": 1,
         "TUNNEL_SPAWN_FAILED": 1
@@ -2635,25 +2649,25 @@
       "timeout_s": 5.0
     },
     "sources": [
-      "sw_core/cli.py:80",
-      "sw_core/cli.py:82"
+      "sw_core/cli.py:81",
+      "sw_core/cli.py:83"
     ]
   },
   "x-fixed-timeouts": [
     {
       "name": "daemon_stop_wait_s",
       "value": 2.0,
-      "source": "sw_core/cli.py:649"
+      "source": "sw_core/cli.py:650"
     },
     {
       "name": "daemon_start_ping_timeout_s",
       "value": 0.5,
-      "source": "sw_core/cli.py:601"
+      "source": "sw_core/cli.py:602"
     },
     {
       "name": "daemon_start_status_timeout_s",
       "value": 1.0,
-      "source": "sw_core/cli.py:612"
+      "source": "sw_core/cli.py:613"
     },
     {
       "name": "daemon_ready_poll",
@@ -2665,22 +2679,22 @@
         "tries": 50,
         "interval_s": 0.2
       },
-      "source": "sw_core/cli.py:588-590"
+      "source": "sw_core/cli.py:589-591"
     },
     {
       "name": "healthy_daemon_probe_timeout_s",
       "value": 0.5,
-      "source": "sw_core/cli.py:368-379"
+      "source": "sw_core/cli.py:369-380"
     },
     {
       "name": "setup_ping_timeout_s",
       "value": 0.5,
-      "source": "sw_core/cli.py:1696"
+      "source": "sw_core/cli.py:1643"
     },
     {
       "name": "setup_mcu_status_timeout_s",
       "value": 0.5,
-      "source": "sw_core/cli.py:1703"
+      "source": "sw_core/cli.py:1650"
     },
     {
       "name": "doctor_health_status_timeout_s",
@@ -2690,7 +2704,7 @@
     {
       "name": "remote_real_ping_timeout_s",
       "value": 2.0,
-      "source": "sw_core/remote_tunnel.py:665"
+      "source": "sw_core/remote_tunnel.py:862"
     },
     {
       "name": "client_probe_timeout_s",
@@ -2715,7 +2729,7 @@
     {
       "name": "unix_endpoint_liveness_socket_timeout_s",
       "value": 0.2,
-      "source": "sw_core/cli.py:719"
+      "source": "sw_core/cli.py:720"
     },
     {
       "name": "win_tcp_liveness_connect_timeout_s",
@@ -2725,22 +2739,22 @@
     {
       "name": "remote_readiness_poll_interval_s",
       "value": 0.2,
-      "source": "sw_core/remote_tunnel.py:153"
+      "source": "sw_core/remote_tunnel.py:252"
     },
     {
       "name": "remote_probe_runner_timeout_s",
       "value": 10.0,
-      "source": "sw_core/remote_tunnel.py:648"
+      "source": "sw_core/remote_tunnel.py:845"
     },
     {
       "name": "remote_terminate_pgid_timeout_s",
       "value": 5.0,
-      "source": "sw_core/remote_tunnel.py:373"
+      "source": "sw_core/remote_tunnel.py:497"
     },
     {
       "name": "remote_terminate_pgid_poll_step_s",
       "value": 0.1,
-      "source": "sw_core/remote_tunnel.py:399"
+      "source": "sw_core/remote_tunnel.py:523-524"
     },
     {
       "name": "doctor_other_install_version_timeout_s",
@@ -2933,14 +2947,6 @@
       "adds_subcommand": [
         "daemon",
         "restart"
-      ]
-    },
-    {
-      "id": "SC-21",
-      "change": "SC-21",
-      "adds_subcommand": [
-        "remote",
-        "stop"
       ]
     },
     {

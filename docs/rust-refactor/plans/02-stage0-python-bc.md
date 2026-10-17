@@ -2598,13 +2598,16 @@
 
 **Files**
 - Create: `sw_core/filelock.py`、`tests/test_stage0_remote_windows.py`
-- Modify: `sw_core/remote_tunnel.py`、`sw_core/cli.py`（移除 `remote`／`connect`／`benches` 的 `os.name=="nt"` 擋板、bench state 鎖改用 `filelock`、`remote stop` 別名、help 文字）、`README.md`（英繁兩段：remote stop、Windows 支援與 OD-12 信任範圍說明）、`sw_core/assets/skill/SKILL_WINDOWS.md`（移除「本期不支援 remote」段落，改為使用說明；受管區段以 `python3 -m tools.contracts skill-section` 重新產生）、`contracts/behavior_changes.yaml`（BC-05、SC-21、SC-27 → `IMPLEMENTED`）、`contracts/error_codes.yaml`（`REMOTE_NOT_SUPPORTED`：維持 `reachable: true`，`exit_codes` 移除 `connect`／`benches`／`remote` 三個 context、只留 `"daemon start": 2`，`contract_tests` 改指 `tests/test_remote_endpoint.py`／`tests/test_win_daemon_start.py` 中斷言 `daemon start --endpoint` 的 node）、`contracts/cli_schema.json`（`x-pending` 的 SC-21 `remote stop` 併入正式子命令並刪除該項）、`tests/test_remote_cli.py`、`tests/test_remote_tunnel.py`（測試資產變更，見下）
+- Modify: `sw_core/remote_tunnel.py`、`sw_core/cli.py`（移除 `remote`／`connect`／`benches` 的 `os.name=="nt"` 擋板、bench state 鎖改用 `filelock`、`remote stop` 別名、help 文字）、`README.md`（英繁兩段：remote stop、Windows 支援與 OD-12 信任範圍說明）、`sw_core/assets/skill/SKILL_WINDOWS.md`（移除「本期不支援 remote」段落，改為使用說明；受管區段以 `python3 -m tools.contracts skill-section` 重新產生）、`contracts/behavior_changes.yaml`（BC-05、SC-21、SC-27 → `IMPLEMENTED`）、`contracts/error_codes.yaml`（`REMOTE_NOT_SUPPORTED`：維持 `reachable: true`，`exit_codes` 移除 `connect`／`benches`／`remote` 三個 context、只留 `"daemon start": 2`，`behavior_change` 保留 `[SC-27, BC-05]` 追溯；`INVALID_BENCH_CONFIG`、`TUNNEL_STATUS_ERROR`、`UNKNOWN_BENCH_CODE` 的 platforms 加入 `windows`）、`contracts/cli_schema.json`（`x-pending` 的 SC-21 `remote stop` 併入正式子命令並刪除該項）、`tests/test_remote_cli.py`、`tests/test_remote_tunnel.py`、`tests/test_contracts_cli_schema.py`、`tests/test_contracts_gap_codes.py`（測試資產變更，見下）
 
 **測試資產變更**（BC-05／SC-27 的預期反轉，需獨立審閱，PR 註明）：
 - `tests/test_remote_cli.py::test_remote_windows_returns_not_supported`（約 108～121 行）：改為斷言 `os.name="nt"` 下 `serialwrap remote` 與 `serialwrap remote u@h:7777` **不**回 `REMOTE_NOT_SUPPORTED`（以替身 `status`／`open_tunnel` 回 `ok:true`），並更名為 `test_remote_windows_supported`。
 - `tests/test_remote_tunnel.py::test_guard_platform_rejects_windows`（約 442～446 行）：改為斷言 `guard_platform()` 在 `os.name="nt"` 下為 no-op（不擲 `TunnelError`），更名為 `test_guard_platform_noop_on_windows`。
 - P0 的 `tests/test_contracts_catalog.py::test_ec_exit_codes_frozen`：`REMOTE_NOT_SUPPORTED` 的期望 `exit_codes` 由 `{"daemon start": 2, "connect": 1, "benches": 1, "remote": 1}` 改為 `{"daemon start": 2}`（其餘斷言不變）。
 - `tests/test_remote_endpoint.py`（約 184 行，`daemon start --endpoint tcp://1.2.3.4:7777` → `REMOTE_NOT_SUPPORTED`）與 `tests/test_win_daemon_start.py:111,126`：**不改**——該碼在 `daemon start --endpoint` 路徑仍可達（`cli.py` 約 435 行）。
+- `tests/test_contracts_cli_schema.py::test_every_subcommand_options_match`：`remote stop` 是 `words` positional 的手動分派入口，不會建立 argparse subparser；用 `build_parser().parse_args(["remote", "stop"])` 與帶 port 的呼叫驗證實際 parser 接受的語法，不把 schema 欄位與寫死的 schema 欄位互相比較。
+- `tests/test_contracts_gap_codes.py::TestGapPosixRemoteCli`：改名為 `TestGapRemoteCli` 並標為 `core_portable`；`INVALID_BENCH_CONFIG`、`TUNNEL_STATUS_ERROR`、`UNKNOWN_BENCH_CODE` 在 `SC-27` 支援 Windows 後皆為 Windows 可達錯誤碼，並同步更新 `INTERNAL_ERROR`／`TUNNEL_STATUS_ERROR` 的 `contract_tests` 節點與 spec errata 引用。
+- `tests/test_remote_tunnel.py`：移除已過期的模組層 `fcntl` skip，逐案將不依賴 POSIX 行程 API 的測試標為 `core_portable`，保留使用 `sleep`、`os.getpgid`、`os.killpg` 的行程測試為 `posix_only`，讓可攜案例可在 Windows 收集與執行。
 
 **Interfaces**
 - Consumes：T03 `win32_files.lock_file_ex`／`unlock_file_ex`。
@@ -2625,13 +2628,14 @@
   def pid_alive(pid: int, start_ticks: int | None, *, os_name: str | None = None) -> bool
       # Windows：OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)＋GetExitCodeProcess==STILL_ACTIVE(259)＋GetProcessTimes CreationTime 比對；絕不呼叫 os.kill(pid, 0)
   def terminate_tree(pid: int, pgid: int | None, *, timeout: float = 5.0, sleep: Callable[[float], None] = time.sleep,
-                     os_name: str | None = None) -> None
-      # POSIX：既有 _terminate_pgid；Windows：os.kill(pid, signal.CTRL_BREAK_EVENT) → 每 0.1 s 檢查 → 逾時 taskkill /PID <pid> /T /F
+                         os_name: str | None = None, start_ticks: int | None = None) -> None
+          # POSIX：既有 _terminate_pgid；Windows：先比對 CreationTime，再以有 10 s timeout 的 taskkill /PID <pid> /T /F；依同一 CreationTime 有界確認已退出，失敗則 raise OSError
   def make_role_probe(spec, cp, endpoint, *, runner, ping, control_master: bool = True)
-      # control_master=False：connect → ping(endpoint)；expose+tcp → runner(["ssh", *spec.ssh_opts, "-o", "BatchMode=yes", spec.ssh_target, "ss", "-ltnH", f"sport = :{port}"])；expose+remote_socket → True
+          # control_master=False：connect → ping(endpoint)；expose+tcp → runner(["ssh", "-o", "BatchMode=yes", *spec.ssh_opts, spec.ssh_target, "ss", "-ltnH", f"sport = :{port}"])，無 listener／探測失敗回 False 重試，確認為非 loopback 才 raise REMOTE_BIND_UNVERIFIED；expose+remote_socket → 以 ssh test -S 驗證
   def make_ssh_check(spec, cp, *, runner, control_master: bool = True)
       # control_master=False → lambda: True（readiness 只靠 alive＋role probe）
   ```
+- `open_tunnel` 的 Windows expose+tcp 若輪詢逾時仍為 `starting`，必須在 readiness try 內轉成 `REMOTE_BIND_UNVERIFIED`，走既有 fail-closed teardown；teardown 失敗時保留 `status="error"` 的 registry state，並以 readiness 原錯誤作為主要例外。Windows `close` 與 cleanup 都將 registry 的 `pid_start_ticks` 傳入 `terminate_tree`。
   Registry JSON 欄位不變；Windows 上 `pgid` 寫 `null`、`pid_start_ticks` 寫 CreationTime 整數、`control_path` 仍寫入（不建立）。`close` 在 Windows 呼叫 `terminate_tree(pid, None)`。
 - Rust 對應：arch §4.9 `ProcessTunnel`（`spawn_detached` 無 pipe、`alive`、`terminate`、`supports_control_master`）、§7.7 Windows 差異（readiness 三種、registry 鎖 LockFileEx、存活 `ProcessTunnel::alive`、停止 terminate tree、argv 不帶 3 個 ControlMaster `-o`）。
 

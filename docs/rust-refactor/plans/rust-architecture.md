@@ -1180,11 +1180,12 @@ Windows（`ProcessTunnel::supports_control_master()==false`）的差異：
 
 - **readiness**：
   - connect：直接對本地 forward 做 `health.ping`（2.0 s）；
-  - expose + tcp：另開一條 ssh 連線執行 `ss -ltnH 'sport = :<port>'`，不使用 ControlPath；
-  - expose + `--remote-socket`：只要行程存活即視為 ready，與 POSIX 相同。
+  - expose + tcp：另開一條 ssh 連線執行 `ss -ltnH 'sport = :<port>'`，不使用 ControlPath；`BatchMode=yes` 放在使用者 `ssh_opts` 前。rc 非 0、輸出為空或尚未列出該 port 都視為尚未就緒並在期限內輪詢；已列出 listener 但 bind 不是 loopback 時立即以 `REMOTE_BIND_UNVERIFIED` 拒絕並清理；期限內始終未能驗證時也 fail-closed 清理，不回報 `active` 或保留未驗證隧道。
+  - expose + `--remote-socket`：以獨立 ssh 執行 `test -S <remote_socket>`；只有 rc 0 才視為 ready，行程存活本身不足以證明 forwarding 已建立。
+  - 無 ControlMaster 時，ssh check 只提供行程存活資訊；`active` 必須另有上述 role probe 或 `health.ping` 的正面證據。
 - **registry 鎖**：改用 `FsOps::file_lock_exclusive`（LockFileEx）。
 - **存活判定**：`ProcessTunnel::alive`，不用 `os.kill`。
-- **停止**：terminate tree。
+- **停止**：先以 registry 的 CreationTime 核對根行程身分，再以 `taskkill /T /F` 終止整棵樹；有界確認同一 CreationTime 已退出，終止失敗時保留 error state 並回報失敗。
 - argv 不帶 ControlMaster 相關的 3 個 `-o` 選項；identity 計算仍包含使用者的 `ssh_opts`。
 
 connect 與 benches 一併納入 Windows 支援（`SC-27`，OD-14 #7 確認），移除這兩者在 Windows 上的 `REMOTE_NOT_SUPPORTED`。

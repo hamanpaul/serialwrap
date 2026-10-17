@@ -174,7 +174,10 @@ def test_role_probe_connect_without_cm_uses_ping():
 @pytest.mark.memory_only
 def test_wait_ready_expose_tcp_without_cm_uses_separate_ssh(tmp_path):
     rt = _rt()
-    spec = _expose_tcp_spec(rt)
+    spec = rt.TunnelSpec(
+        role="expose", ssh_target="u@h", port=7777,
+        forward_src="127.0.0.1:7777", ssh_opts=("-o", "BatchMode=no"),
+    )
     control_path = str(tmp_path / "cm-7777")
     endpoint = "tcp://127.0.0.1:7777"
     calls: list[list[str]] = []
@@ -201,6 +204,112 @@ def test_wait_ready_expose_tcp_without_cm_uses_separate_ssh(tmp_path):
     for argv in calls:
         assert not any("ControlPath" in part for part in argv)
         assert argv[0] == "ssh" and "BatchMode=yes" in argv and "ss" in argv
+        assert argv.index("BatchMode=yes") < argv.index("BatchMode=no")
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_role_probe_expose_tcp_without_cm_retries_empty_listener_result():
+    rt = _rt()
+    spec = _expose_tcp_spec(rt)
+    outputs = iter([
+        (0, ""),
+        (0, "LISTEN 0 128 127.0.0.1:7777 0.0.0.0:*\n"),
+    ])
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(list(argv))
+        return next(outputs)
+
+    probe = rt.make_role_probe(
+        spec, "cm-7777", "tcp://127.0.0.1:7777", runner=runner,
+        ping=lambda ep: False, control_master=False,
+    )
+
+    assert probe() is False
+    assert probe() is True
+    assert len(calls) == 2
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_role_probe_expose_tcp_without_cm_retries_ssh_failure():
+    rt = _rt()
+    probe = rt.make_role_probe(
+        _expose_tcp_spec(rt), "cm-7777", "tcp://127.0.0.1:7777",
+        runner=lambda argv: (255, "Could not resolve hostname\n"),
+        ping=lambda ep: False, control_master=False,
+    )
+
+    assert probe() is False
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_role_probe_remote_socket_without_cm_requires_socket_evidence():
+    rt = _rt()
+    spec = rt.TunnelSpec(
+        role="expose", ssh_target="u@h", port=7777,
+        forward_src="/run/serialwrapd.sock", remote_socket="/relay/x.sock",
+        ssh_opts=("-o", "BatchMode=no"),
+    )
+    replies = iter([(1, ""), (0, "")])
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(list(argv))
+        return next(replies)
+
+    probe = rt.make_role_probe(
+        spec, "cm-7777", "", runner=runner, ping=lambda ep: False,
+        control_master=False,
+    )
+
+    assert probe() is False
+    assert probe() is True
+    assert calls[0][0:3] == ["ssh", "-o", "BatchMode=yes"]
+    assert calls[0].index("BatchMode=yes") < calls[0].index("BatchMode=no")
+    assert calls[0][-3:] == ["test", "-S", "/relay/x.sock"]
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_open_tunnel_expose_tcp_timeout_fails_closed(tmp_path, monkeypatch):
+    rt = _rt()
+    monkeypatch.setattr(rt, "supports_control_master", lambda: False)
+    monkeypatch.setattr(rt, "pid_alive", lambda pid, start_ticks, **kwargs: True)
+    terminate_calls: list[tuple] = []
+
+    def terminate_tree(pid, pgid, **kwargs):
+        terminate_calls.append((pid, pgid, kwargs.get("start_ticks")))
+
+    monkeypatch.setattr(rt, "terminate_tree", terminate_tree)
+
+    class _Clock:
+        now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+
+    clk = _Clock()
+    spec = rt.TunnelSpec(
+        role="expose", ssh_target="u@h", port=7777,
+        forward_src="127.0.0.1:7777", ready_timeout=0.25,
+    )
+    with pytest.raises(rt.TunnelError) as ei:
+        rt.open_tunnel(
+            spec, str(tmp_path),
+            spawner=lambda argv, cp, log: (4242, None, 99, lambda: ""),
+            runner=lambda argv: (0, ""), ping=lambda ep: False, clock=clk,
+        )
+
+    assert ei.value.code == "REMOTE_BIND_UNVERIFIED"
+    assert terminate_calls == [(4242, None, 99)]
+    assert rt.Registry(str(tmp_path)).read(7777) is None
 
 
 # ---------------------------------------------------------------------------
@@ -320,18 +429,133 @@ def test_close_windows_uses_terminate_tree(tmp_path, monkeypatch):
     killpg_calls: list[int] = []
 
     def spy_terminate_tree(pid, pgid, **kwargs):
-        tree_calls.append((pid, pgid))
+        tree_calls.append((pid, pgid, kwargs.get("start_ticks")))
 
     monkeypatch.setattr(os, "name", "nt")
     monkeypatch.setattr(rt, "pid_alive", lambda pid, start_ticks, **kwargs: True)
     monkeypatch.setattr(rt, "terminate_tree", spy_terminate_tree)
-    monkeypatch.setattr(os, "killpg", lambda pgid, sig: killpg_calls.append(pgid))
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: killpg_calls.append(pgid), raising=False)
     monkeypatch.setattr(rt.Registry, "lock", lambda self: contextlib.nullcontext())
 
     res = rt.close(str(tmp_path), "7777", sleep=lambda seconds: None)
     assert res == {"ok": True, "closed": [7777]}
-    assert tree_calls == [(4242, None)]
+    assert tree_calls == [(4242, None, 99)]
     assert killpg_calls == []
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_windows_terminate_tree_checks_identity_and_taskkill_exit(monkeypatch):
+    rt = _rt()
+    alive_checks: list[tuple[int, int | None]] = []
+    taskkill: dict = {}
+
+    def alive(pid, start_ticks, **kwargs):
+        alive_checks.append((pid, start_ticks))
+        return True
+
+    def run(argv, **kwargs):
+        taskkill["argv"] = list(argv)
+        taskkill.update(kwargs)
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="Access denied")
+
+    def unexpected_kill(*args, **kwargs):
+        raise AssertionError("Windows termination must not send a console signal")
+
+    monkeypatch.setattr(rt, "pid_alive", alive)
+    monkeypatch.setattr(rt.subprocess, "run", run)
+    monkeypatch.setattr(os, "kill", unexpected_kill)
+
+    with pytest.raises(OSError, match="taskkill"):
+        rt.terminate_tree(4242, None, timeout=1.0, sleep=lambda seconds: None,
+                          os_name="nt", start_ticks=9876)
+
+    assert taskkill["argv"] == ["taskkill", "/PID", "4242", "/T", "/F"]
+    assert taskkill["timeout"] == 10.0
+    assert alive_checks and all(check == (4242, 9876) for check in alive_checks)
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_windows_terminate_tree_waits_until_same_process_identity_exits(monkeypatch):
+    rt = _rt()
+    alive_checks: list[tuple[int, int | None]] = []
+    states = iter([True, True, False, False])
+    taskkill_calls: list[list[str]] = []
+
+    def alive(pid, start_ticks, **kwargs):
+        alive_checks.append((pid, start_ticks))
+        return next(states)
+
+    def run(argv, **kwargs):
+        taskkill_calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, stdout="SUCCESS", stderr="")
+
+    monkeypatch.setattr(rt, "pid_alive", alive)
+    monkeypatch.setattr(rt.subprocess, "run", run)
+    monkeypatch.setattr(os, "kill", lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("Windows termination must not send a console signal")
+    ))
+
+    rt.terminate_tree(4242, None, timeout=1.0, sleep=lambda seconds: None,
+                      os_name="nt", start_ticks=9876)
+
+    assert alive_checks == [(4242, 9876)] * 4
+    assert taskkill_calls == [["taskkill", "/PID", "4242", "/T", "/F"]]
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_close_windows_keeps_error_state_when_tree_termination_fails(tmp_path, monkeypatch):
+    rt = _rt()
+    reg = rt.Registry(str(tmp_path))
+    reg.write({
+        "listen_port": 7777, "status": "active", "role": "expose",
+        "pid": 4242, "pgid": None, "pid_start_ticks": 99, "target": "u@h",
+    })
+
+    def fail_terminate(pid, pgid, **kwargs):
+        raise OSError("taskkill failed")
+
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(rt, "pid_alive", lambda pid, start_ticks, **kwargs: True)
+    monkeypatch.setattr(rt, "terminate_tree", fail_terminate)
+    monkeypatch.setattr(rt.Registry, "lock", lambda self: contextlib.nullcontext())
+
+    res = rt.close(str(tmp_path), "7777", sleep=lambda seconds: None)
+
+    assert res == {"ok": True, "closed": []}
+    assert reg.read(7777)["status"] == "error"
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_open_tunnel_retains_error_state_when_teardown_fails(tmp_path, monkeypatch):
+    rt = _rt()
+    monkeypatch.setattr(rt, "pid_alive", lambda pid, start_ticks, **kwargs: True)
+
+    def fail_terminate(pid, pgid, **kwargs):
+        raise OSError("taskkill failed")
+
+    monkeypatch.setattr(rt, "terminate_tree", fail_terminate)
+
+    def raising_probe_factory(*args, **kwargs):
+        def probe():
+            raise rt.TunnelError("REMOTE_BIND_UNVERIFIED", "未驗證的遠端 bind")
+        return probe
+
+    with pytest.raises(rt.TunnelError) as ei:
+        rt.open_tunnel(
+            _expose_tcp_spec(rt), str(tmp_path),
+            spawner=lambda argv, cp, log: (4242, None, 99, lambda: ""),
+            runner=lambda argv: (0, ""), ping=lambda ep: False,
+            ssh_check_factory=lambda *args, **kwargs: (lambda: True),
+            role_probe_factory=raising_probe_factory,
+        )
+
+    assert ei.value.code == "REMOTE_BIND_UNVERIFIED"
+    state = rt.Registry(str(tmp_path)).read(7777)
+    assert state is not None and state["status"] == "error"
 
 
 @pytest.mark.core_portable
@@ -358,17 +582,38 @@ def test_ssh_child_has_no_pipes(tmp_path, monkeypatch):
 @pytest.mark.skipif(os.name != "nt", reason="windows_native：僅原生 Windows 執行（CreateProcess／taskkill）")
 def test_native_spawn_alive_terminate_tree(tmp_path):
     rt = _rt()
-    code = ("import subprocess,sys,time; "
-            "subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); time.sleep(60)")
+    child_pid_path = tmp_path / "child.pid"
+    child_code = "import time; time.sleep(60)"
+    code = (
+        "import subprocess,sys,time; "
+        "child=subprocess.Popen([sys.executable,'-c',sys.argv[1]]); "
+        "open(sys.argv[2],'w',encoding='utf-8').write(str(child.pid)); "
+        "time.sleep(60)"
+    )
     log = tmp_path / "t.log"
-    pid, pgid, ticks, _tail = rt.real_spawner([sys.executable, "-c", code], str(tmp_path / "cm"), str(log))
+    pid, pgid, ticks, _tail = rt.real_spawner(
+        [sys.executable, "-c", code, child_code, str(child_pid_path)],
+        str(tmp_path / "cm"), str(log),
+    )
     assert pgid is None and isinstance(ticks, int)
     assert rt.pid_alive(pid, ticks) is True
-    rt.terminate_tree(pid, None, timeout=2.0)
+    deadline = time.monotonic() + 5.0
+    while not child_pid_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert child_pid_path.exists()
+    child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+    child_ticks = rt._win_creation_time(child_pid)
+    assert child_ticks is not None and rt.pid_alive(child_pid, child_ticks) is True
+    rt.terminate_tree(pid, None, timeout=2.0, start_ticks=ticks)
     time.sleep(0.5)
     assert rt.pid_alive(pid, ticks) is False
+    assert rt.pid_alive(child_pid, child_ticks) is False
     out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True).stdout
     assert str(pid) not in out
+    child_out = subprocess.run(
+        ["tasklist", "/FI", f"PID eq {child_pid}"], capture_output=True, text=True
+    ).stdout
+    assert str(child_pid) not in child_out
 
 
 # ---------------------------------------------------------------------------

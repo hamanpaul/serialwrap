@@ -9,8 +9,8 @@
 
 - ``TestGapMemory``：行程內即可驗證的跨平台 error_code（alias、file transfer、console、
   service、event、arbiter、systemd 替身）。
-- ``TestGapPosixRemoteCli``：依賴 POSIX（remote_tunnel／fcntl）之 CLI error_code（bench／
-  tunnel status／CLI remote internal error；``posix_only``、``memory_only``）。
+- ``TestGapRemoteCli``：Windows 開放 remote／connect／benches 後也會輸出的 CLI error_code
+  （bench／tunnel status／CLI remote internal error；``core_portable``、``memory_only``）。
 - ``TestGapFramingTcp``：RPC framing 位元組（``serve_connection``）、TCP 回應格式與
   daemon spawn 失敗；會開 loopback socket／asyncio server，故標 ``process_rpc``。
 - ``TestGapPosixLock``：POSIX singleton lock 的 ``SOCKET_UNAVAILABLE``（``posix_only``）。
@@ -445,13 +445,13 @@ class TestGapMemory:
 
 
 # ---------------------------------------------------------------------------
-# POSIX 專屬 CLI 錯誤碼（依賴 remote_tunnel／fcntl；Windows 基線回傳 REMOTE_NOT_SUPPORTED）
+# Windows 同樣支援的 remote／connect／benches CLI 錯誤碼
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.posix_only
+@pytest.mark.core_portable
 @pytest.mark.memory_only
-class TestGapPosixRemoteCli:
+class TestGapRemoteCli:
     def test_invalid_bench_config_connect(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
                                           capsys: pytest.CaptureFixture[str]) -> None:
         benches = tmp_path / "benches.yaml"

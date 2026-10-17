@@ -7,7 +7,7 @@ docs/superpowers/specs/2026-07-19-remote-tunnel-cli-design.md。
 from __future__ import annotations
 
 import contextlib
-import fcntl
+import ctypes
 import hashlib
 import json
 import os
@@ -20,6 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
+from . import filelock
 from .client import rpc_call as _rpc_call
 
 # `[user@]host:port`——host 允許 ssh_config alias（不含 '@'/':' 的一段）。
@@ -92,6 +93,11 @@ def default_ssh_opts(control_path: str) -> list[str]:
     ]
 
 
+def supports_control_master(os_name: str | None = None) -> bool:
+    """回報目前平台是否支援 OpenSSH ControlMaster。"""
+    return (os_name or os.name) != "nt"
+
+
 def _direction_args(spec: TunnelSpec) -> list[str]:
     """組裝 -R 或 -L 與其隧道規格（bind:destination）。"""
     if spec.role == "expose":
@@ -106,10 +112,26 @@ def _direction_args(spec: TunnelSpec) -> list[str]:
     return ["-L", f"127.0.0.1:{local}:{dest}"]
 
 
-def build_argv(spec: TunnelSpec, control_path: str) -> list[str]:
+def build_argv(spec: TunnelSpec, control_path: str, *, control_master: bool = True) -> list[str]:
     """完整 ssh/autossh argv（含方向 -R/-L、預設 -o、--ssh-opt 透傳、target）。"""
     base = ["autossh", "-M", "0"] if spec.via == "autossh" else ["ssh"]
-    argv = [*base, "-N", "-T", *default_ssh_opts(control_path), *spec.ssh_opts]
+    defaults = default_ssh_opts(control_path)
+    if not control_master:
+        omitted = {"ControlMaster=auto", f"ControlPath={control_path}", "ControlPersist=no"}
+        filtered: list[str] = []
+        index = 0
+        while index < len(defaults):
+            if defaults[index] == "-o" and index + 1 < len(defaults):
+                if defaults[index + 1] in omitted:
+                    index += 2
+                    continue
+                filtered.extend(defaults[index : index + 2])
+                index += 2
+                continue
+            filtered.append(defaults[index])
+            index += 1
+        defaults = filtered
+    argv = [*base, "-N", "-T", *defaults, *spec.ssh_opts]
     argv += _direction_args(spec)
     argv.append(spec.ssh_target)
     return argv
@@ -136,8 +158,85 @@ def read_pid_start_ticks(pid: int) -> int | None:
         return None
 
 
-def pid_alive(pid: int, start_ticks: int | None) -> bool:
+@dataclass(frozen=True)
+class ProcIdentity:
+    """記錄行程 PID 與建立時間，用來避免 PID 重用誤判。"""
+
+    pid: int
+    start_ticks: int | None
+
+
+def _win_process_state(pid: int) -> tuple[bool, int | None]:
+    """以 Windows process API 讀取存活狀態與 CreationTime FILETIME。"""
+    if os.name != "nt":
+        return False, None
+
+    class _FileTime(ctypes.Structure):
+        _fields_ = [("dwLowDateTime", ctypes.c_uint32), ("dwHighDateTime", ctypes.c_uint32)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle_type = ctypes.c_void_p
+    dword = ctypes.c_uint32
+    bool_type = ctypes.c_int
+    open_process = kernel32.OpenProcess
+    open_process.argtypes = [dword, bool_type, dword]
+    open_process.restype = handle_type
+    get_exit_code = kernel32.GetExitCodeProcess
+    get_exit_code.argtypes = [handle_type, ctypes.POINTER(dword)]
+    get_exit_code.restype = bool_type
+    get_process_times = kernel32.GetProcessTimes
+    get_process_times.argtypes = [
+        handle_type,
+        ctypes.POINTER(_FileTime),
+        ctypes.POINTER(_FileTime),
+        ctypes.POINTER(_FileTime),
+        ctypes.POINTER(_FileTime),
+    ]
+    get_process_times.restype = bool_type
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [handle_type]
+    close_handle.restype = bool_type
+
+    process = open_process(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not process:
+        return False, None
+    try:
+        exit_code = dword()
+        if not get_exit_code(process, ctypes.byref(exit_code)) or exit_code.value != 259:
+            return False, None  # STILL_ACTIVE
+        creation = _FileTime()
+        exit_time = _FileTime()
+        kernel_time = _FileTime()
+        user_time = _FileTime()
+        if not get_process_times(
+            process,
+            ctypes.byref(creation),
+            ctypes.byref(exit_time),
+            ctypes.byref(kernel_time),
+            ctypes.byref(user_time),
+        ):
+            return True, None
+        creation_time = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+        return True, creation_time
+    finally:
+        close_handle(process)
+
+
+def _win_creation_time(pid: int) -> int | None:
+    """取得行程 CreationTime FILETIME；行程不存在或 API 讀取失敗時回 None。"""
+    _alive, creation_time = _win_process_state(pid)
+    return creation_time
+
+
+def pid_alive(pid: int, start_ticks: int | None, *, os_name: str | None = None) -> bool:
     """檢測 PID 是否存活，並以 start_ticks 防 PID 重用。"""
+    if pid <= 0:
+        return False
+    if (os_name or os.name) == "nt":
+        alive, creation_time = _win_process_state(pid)
+        if not alive:
+            return False
+        return start_ticks is None or creation_time == start_ticks
     try:
         os.kill(pid, 0)
     except OSError:
@@ -186,7 +285,7 @@ def wait_ready(
 
 
 class Registry:
-    """`<run_dir>/remote/` 下的 per-tunnel state JSON + flock 序列化。"""
+    """`<run_dir>/remote/` 下的 per-tunnel state JSON + 跨平台檔案鎖序列化。"""
 
     def __init__(self, run_dir: str) -> None:
         self.run_dir = run_dir
@@ -198,18 +297,11 @@ class Registry:
 
     @contextlib.contextmanager
     def lock(self):
-        """Exclusive flock 保護同步讀寫。"""
+        """以跨平台獨占檔案鎖保護同步讀寫。"""
         self._ensure_dir()
         lock_path = os.path.join(self.remote_dir, ".registry.lock")
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+        with filelock.exclusive_file_lock(lock_path):
             yield
-        finally:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            finally:
-                os.close(fd)
 
     def control_path(self, listen_port: int) -> str:
         """控制端點路徑（ssh -o ControlPath）。"""
@@ -275,8 +367,12 @@ def make_ssh_check(
     control_path: str,
     *,
     runner: Callable[[list[str]], tuple[int, str]],
+    control_master: bool = True,
 ) -> Callable[[], bool]:
     """回傳 `() -> bool`：以既有 master 連線跑 `ssh -O check` 確認 control socket 存活。"""
+    if not control_master:
+        return lambda: True
+
     def _check() -> bool:
         rc, _ = runner(["ssh", "-O", "check", "-o", f"ControlPath={control_path}", spec.ssh_target])
         return rc == 0
@@ -288,29 +384,57 @@ def make_role_probe(
     control_path: str,
     endpoint: str,
     *,
-    runner: Callable[[list[str]], tuple[int, str]],
+    runner: Callable[[list[str]], tuple[int, str]] | None,
     ping: Callable[[str], bool],
+    control_master: bool = True,
 ) -> Callable[[], bool]:
     """回傳 `() -> bool`：依 role 選擇對應 readiness 判定，可 raise TunnelError（REMOTE_BIND_UNVERIFIED）。
 
     - connect：以 `ping(endpoint)` 驗證本機端可用。
-    - expose + remote_socket（unix）：遠端 bind 天然限定於該 socket 路徑，fail-closed 免驗證。
+    - expose + remote_socket（unix）：POSIX 依既有 master；無 master 時以獨立 ssh 確認 socket 已建立。
     - expose + tcp：借 master 連線在 relay 端跑 `ss` 驗遠端 bind 為 loopback；
-      查不到／查失敗／wildcard bind 一律視為不安全，raise REMOTE_BIND_UNVERIFIED。
+      Windows 無 master 時，尚未出現 listener 會繼續輪詢；已出現非 loopback bind 才拒絕。
     """
     def _probe() -> bool:
         if spec.role == "connect":
             return bool(ping(endpoint))
-        # expose：unix socket 模式天然 fail-closed，免 ss 驗證
+        # expose：POSIX 依既有 master 語意；Windows 需確認 remote forward 已建立。
         if spec.remote_socket:
-            return True
-        # tcp 模式：以 master 連線在 relay 跑 ss，驗遠端 bind 為 loopback（fail-closed）
-        rc, out = runner([
-            "ssh", "-o", f"ControlPath={control_path}", spec.ssh_target,
-            "ss", "-ltnH", f"sport = :{spec.port}",
-        ])
+            if control_master:
+                return True
+            if runner is None:
+                return False
+            argv = [
+                "ssh", "-o", "BatchMode=yes", *spec.ssh_opts, spec.ssh_target,
+                "test", "-S", spec.remote_socket,
+            ]
+            rc, _ = runner(argv)
+            return rc == 0
+        # tcp 模式：以 ssh 在 relay 驗遠端 bind 為 loopback（fail-closed）。
+        if control_master:
+            argv = [
+                "ssh", "-o", f"ControlPath={control_path}", spec.ssh_target,
+                "ss", "-ltnH", f"sport = :{spec.port}",
+            ]
+        else:
+            argv = [
+                "ssh", "-o", "BatchMode=yes", *spec.ssh_opts, spec.ssh_target,
+                "ss", "-ltnH", f"sport = :{spec.port}",
+            ]
+        if runner is None:
+            return False
+        rc, out = runner(argv)
         if rc != 0 or not out.strip():
+            if not control_master:
+                return False
             raise TunnelError("REMOTE_BIND_UNVERIFIED", "無法在 relay 驗證遠端 bind")
+        has_listener = any(
+            token.endswith(f":{spec.port}")
+            for line in out.splitlines()
+            for token in line.split()
+        )
+        if not has_listener and not control_master:
+            return False
         if not _bind_is_loopback_only(out, spec.port):
             raise TunnelError("REMOTE_BIND_UNVERIFIED", out.strip()[:200])
         return True
@@ -403,11 +527,57 @@ def _terminate_pgid(
     _reap_pgid(pgid)
 
 
+def terminate_tree(
+    pid: int,
+    pgid: int | None,
+    *,
+    timeout: float = 5.0,
+    sleep: Callable[[float], None] = time.sleep,
+    os_name: str | None = None,
+    start_ticks: int | None = None,
+) -> None:
+    """POSIX 終止行程群組；Windows 驗證 CreationTime 後以 taskkill 終止整棵子行程樹。"""
+    if (os_name or os.name) != "nt":
+        _terminate_pgid(pgid if pgid is not None else pid, timeout=timeout, sleep=sleep)
+        return
+
+    def _alive() -> bool:
+        return pid_alive(pid, start_ticks, os_name="nt")
+
+    if not _alive():
+        return
+    try:
+        result = subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        if not _alive():
+            return
+        raise OSError(f"taskkill 無法終止行程樹：{exc}") from exc
+
+    if result.returncode != 0 and _alive():
+        detail = (result.stderr or result.stdout or "").strip()
+        raise OSError(f"taskkill 無法終止行程樹（exit {result.returncode}）：{detail[:200]}")
+
+    waited = 0.0
+    while _alive() and waited < timeout:
+        interval = min(0.1, timeout - waited)
+        sleep(interval)
+        waited += interval
+    if _alive():
+        raise OSError(f"PID {pid} 在 taskkill 後仍存活")
+
+
 def open_tunnel(
     spec: TunnelSpec,
     run_dir: str,
     *,
-    spawner: Callable[[list[str], str, str], tuple[int, int, int | None, Callable[[], str]]],
+    spawner: Callable[[list[str], str, str], tuple[int, int | None, int | None, Callable[[], str]]],
     runner: Callable[[list[str]], tuple[int, str]],
     ping: Callable[[str], bool],
     ssh_check_factory: Callable[..., Callable[[], bool]] = make_ssh_check,
@@ -424,8 +594,8 @@ def open_tunnel(
        等其他需要鎖的操作。）
     2. 鎖外跑 `wait_ready`：成功回 `active`／`starting`，重新取鎖寫回 state。
     3. `wait_ready` raise `TunnelError`（含 `REMOTE_BIND_UNVERIFIED`、
-       `TUNNEL_SPAWN_FAILED`）→ **fail-closed**：`_terminate_pgid()` 拆除已 spawn
-       的行程群組，並移除 durable state（不留下未驗證安全性的暴露隧道），
+       `TUNNEL_SPAWN_FAILED`）→ **fail-closed**：`terminate_tree()` 拆除已 spawn
+       的行程群組或樹，並移除 durable state（不留下未驗證安全性的暴露隧道），
        然後 re-raise。
 
     同 `listen_port` 已有存活且相同 identity 的隧道視為冪等（`already_running`
@@ -455,7 +625,9 @@ def open_tunnel(
             reg.remove(listen_port)  # 死 state → 視為過期，覆寫
 
         log_path = reg.log_path(listen_port)
-        pid, pgid, start_ticks, stderr_tail = spawner(build_argv(spec, control_path), control_path, log_path)
+        control_master = supports_control_master()
+        argv = build_argv(spec, control_path, control_master=control_master)
+        pid, pgid, start_ticks, stderr_tail = spawner(argv, control_path, log_path)
         state = {
             "identity": identity, "status": "spawning", "role": spec.role,
             "pid": pid, "pgid": pgid, "pid_start_ticks": start_ticks,
@@ -471,8 +643,13 @@ def open_tunnel(
     monotonic = active_clock.monotonic
     sleep = active_clock.sleep
     endpoint = endpoint_for(spec)
-    ssh_check = ssh_check_factory(spec, control_path, runner=runner)
-    role_probe = role_probe_factory(spec, control_path, endpoint, runner=runner, ping=ping)
+    readiness_kwargs: dict[str, object] = {"runner": runner}
+    role_probe_kwargs: dict[str, object] = {"runner": runner, "ping": ping}
+    if not control_master:
+        readiness_kwargs["control_master"] = False
+        role_probe_kwargs["control_master"] = False
+    ssh_check = ssh_check_factory(spec, control_path, **readiness_kwargs)
+    role_probe = role_probe_factory(spec, control_path, endpoint, **role_probe_kwargs)
 
     try:
         status = wait_ready(
@@ -482,11 +659,25 @@ def open_tunnel(
             alive=lambda: pid_alive(pid, start_ticks),
             stderr_tail=stderr_tail,
         )
-    except BaseException:
+        if not control_master and spec.role == "expose" and not spec.remote_socket and status == "starting":
+            raise TunnelError(
+                "REMOTE_BIND_UNVERIFIED",
+                "未能在期限內驗證 relay 上的遠端 bind 為 loopback",
+            )
+    except BaseException as readiness_error:
         # fail-closed：teardown 對任何 readiness 例外都要觸發（不只 TunnelError；
-        # 含 probe 逾時、Ctrl-C 等），拆除已 spawn 的行程群組並移除 state，
-        # 不留下暴露隧道，再原樣 re-raise。
-        _terminate_pgid(pgid, sleep=sleep)
+        # 含 probe 逾時、Ctrl-C 等），拆除已 spawn 的行程群組；拆除失敗時保留
+        # error state，供後續人工排查，且仍以原 readiness 例外作為主要錯誤。
+        try:
+            terminate_tree(pid, pgid, sleep=sleep, start_ticks=start_ticks)
+        except Exception as teardown_error:
+            state["status"] = "error"
+            try:
+                with reg.lock():
+                    reg.write(state)
+            except Exception:
+                pass
+            raise readiness_error from teardown_error
         with reg.lock():
             reg.remove(listen_port)
         raise
@@ -555,10 +746,14 @@ def close(run_dir: str, selector: str | int, *, sleep: Callable[[float], None] =
         for st in targets:
             port = int(st["listen_port"])
             pid = int(st.get("pid", -1))
-            pgid = int(st.get("pgid", pid))
             if pid > 0 and pid_alive(pid, st.get("pid_start_ticks")):
                 try:
-                    _terminate_pgid(pgid, sleep=sleep)
+                    terminate_tree(
+                        pid,
+                        st.get("pgid"),
+                        sleep=sleep,
+                        start_ticks=st.get("pid_start_ticks"),
+                    )
                 except Exception:  # noqa: BLE001 — 拆除失敗不讓例外穿越 RPC/CLI 邊界，改記錄 error 狀態
                     st["status"] = "error"
                     reg.write(st)
@@ -582,12 +777,7 @@ def _public(state: dict) -> dict:
 
 
 def guard_platform() -> None:
-    """本期 remote 隧道僅支援 POSIX；native Windows 明確拒絕（改走手動 ssh -R）。"""
-    if os.name == "nt":
-        raise TunnelError(
-            "REMOTE_NOT_SUPPORTED",
-            "native Windows 本期不支援 serialwrap remote；請手動 ssh -R（見 SKILL_WINDOWS.md）",
-        )
+    """保留相容入口；POSIX 與 Windows 皆支援 remote 隧道。"""
 
 
 def resolve_ssh_bin(via: str) -> str:
@@ -601,31 +791,38 @@ def resolve_ssh_bin(via: str) -> str:
 
 def real_spawner(
     argv: list[str], control_path: str, log_path: str
-) -> tuple[int, int, int | None, Callable[[], str]]:
+) -> tuple[int, int | None, int | None, Callable[[], str]]:
     """以 `subprocess.Popen` 背景常駐產生 ssh/autossh 行程，供 `open_tunnel` 的 `spawner` 參數注入。
 
-    `start_new_session=True` 讓子行程獨立成一個新 process group（獨立 pgid），
-    供之後 `_terminate_pgid()` 以 `killpg` 整組拆除（含 ssh 本身衍生的子行程）；
-    stdout/stderr 皆導向 `log_path`，供 readiness 失敗時的 `stderr_tail_fn` 讀取
-    診斷訊息。父行程端的 log handle 在 `Popen` 後即關閉——子行程已透過
-    `stdout=`/`stderr=` 取得自己 dup 過的 fd，父行程端保留原 handle 只會洩漏 fd。
+    POSIX 以新 session 隔離行程群組；Windows 建立新的 process group 並隱藏視窗。
+    stdin 連到 NUL，stdout/stderr 都追加到 log。父行程在 `Popen` 後關閉 log handle。
     """
     os.makedirs(os.path.dirname(control_path), exist_ok=True)
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     log = open(log_path, "ab", buffering=0)
     try:
-        proc = subprocess.Popen(
-            argv,
-            stdin=subprocess.DEVNULL,
-            stdout=log,
-            stderr=log,
-            start_new_session=True,
-            close_fds=True,
-        )
+        popen_kwargs: dict[str, object] = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": log,
+            "stderr": log,
+            "close_fds": True,
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = (
+                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+                | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            )
+        else:
+            popen_kwargs["start_new_session"] = True
+        proc = subprocess.Popen(argv, **popen_kwargs)
     finally:
         log.close()  # 子行程已 dup 走自己的 fd；父行程端不再需要，避免 fd 洩漏
-    pgid = os.getpgid(proc.pid)
-    start_ticks = read_pid_start_ticks(proc.pid)
+    if os.name == "nt":
+        pgid = None
+        start_ticks = _win_creation_time(proc.pid)
+    else:
+        pgid = os.getpgid(proc.pid)
+        start_ticks = read_pid_start_ticks(proc.pid)
 
     def _stderr_tail() -> str:
         """讀取 spawn log 尾端（供 `TUNNEL_SPAWN_FAILED` 附診斷訊息）；每次呼叫以路徑重新開檔，

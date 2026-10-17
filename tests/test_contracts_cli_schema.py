@@ -488,9 +488,18 @@ def test_every_subcommand_options_match():
                 f"群組 {group_name} 子命令集合不符：parser={parser_sub_names} != schema={schema_sub_names}"
             )
         else:
-            assert g_schema.get("subcommands") is None, (
-                f"群組 {group_name} parser 無子命令，但 schema subcommands 不為 None"
-            )
+            if group_name == "remote":
+                # remote 的既有自由目標與 close 語法由 words positional 分派；SC-21
+                # 在契約中登記為正式 stop 操作，但維持相同 parser 入口以保留既有語法。
+                schema_subcmds = g_schema.get("subcommands") or []
+                assert {sc["name"] for sc in schema_subcmds} == {"stop"}
+                assert any(a.dest == "words" and a.nargs == "*" for a in _non_help(group_parser))
+                assert parser.parse_args(["remote", "stop"]).words == ["stop"]
+                assert parser.parse_args(["remote", "stop", "7777"]).words == ["stop", "7777"]
+            else:
+                assert g_schema.get("subcommands") is None, (
+                    f"群組 {group_name} parser 無子命令，但 schema subcommands 不為 None"
+                )
 
     # (b) 以 schema 為準走訪
     for g_schema in schema.get("x-groups", []):
@@ -503,6 +512,12 @@ def test_every_subcommand_options_match():
             sub_actions = [
                 a for a in group_parser._actions if isinstance(a, argparse._SubParsersAction)
             ]
+            if gname == "remote" and not sub_actions:
+                stop = next(sc for sc in subcmds if sc["name"] == "stop")
+                assert stop["mutex"] == [] and stop["rpc"] is None
+                assert parser.parse_args(["remote", "stop"]).words == ["stop"]
+                assert parser.parse_args(["remote", "stop", "7777"]).words == ["stop", "7777"]
+                continue
             assert sub_actions, f"schema 宣告群組 {gname} 有子命令，但 parser 無 subparsers"
             sc_choices = sub_actions[0].choices
 

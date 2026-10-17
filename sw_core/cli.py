@@ -17,6 +17,7 @@ import time
 from collections.abc import Sequence
 from typing import Any
 
+from . import filelock
 from .arbiter import CMD_REJECT_BYTES, CMD_WARN_BYTES
 from .client import _af_unix_available, _parse_endpoint, rpc_call
 from .file_transfer import DEFAULT_CHUNK_SIZE
@@ -1128,23 +1129,10 @@ def _bench_state_path() -> str:
 def _lock_bench_state_doc(path: str):
     state_dir = os.path.dirname(path) or "."
     os.makedirs(state_dir, exist_ok=True)
-    if os.name == "nt":
-        with _BENCH_STATE_IO_LOCK:
-            yield
-        return
-    import fcntl  # noqa: PLC0415 -- connect 的 bench state 只在 POSIX 路徑要求 cross-process 鎖
-
     lock_path = f"{path}.lock"
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        with _BENCH_STATE_IO_LOCK:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
+    with _BENCH_STATE_IO_LOCK:
+        with filelock.exclusive_file_lock(lock_path):
+            yield
 
 
 def _load_bench_state_doc(path: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -1333,16 +1321,6 @@ def _rollback_connect_open(rt: Any, run_dir: str, listen_port: int) -> str | Non
 
 
 def _run_connect(args: argparse.Namespace) -> int:
-    if os.name == "nt":
-        resp = {
-            "ok": False,
-            "error_code": "REMOTE_NOT_SUPPORTED",
-            "message": "native Windows 本期不支援 serialwrap connect；請手動 ssh -L（見 SKILL_WINDOWS.md）",
-        }
-        _print(resp)
-        _mirror_err(resp, context="connect")
-        return 1
-
     from . import bench_registry  # noqa: PLC0415
     from . import remote_tunnel as rt  # noqa: PLC0415
 
@@ -1463,16 +1441,6 @@ def _run_connect(args: argparse.Namespace) -> int:
 
 def _run_benches(args: argparse.Namespace) -> int:
     del args
-    if os.name == "nt":
-        resp = {
-            "ok": False,
-            "error_code": "REMOTE_NOT_SUPPORTED",
-            "message": "native Windows 本期不支援 serialwrap benches；請直接檢視 benches.yaml 與 endpoint 記憶",
-        }
-        _print(resp)
-        _mirror_err(resp, context="benches")
-        return 1
-
     from . import bench_registry  # noqa: PLC0415
     from . import remote_tunnel as rt  # noqa: PLC0415
 
@@ -1532,28 +1500,7 @@ def _run_benches(args: argparse.Namespace) -> int:
 
 
 def _run_remote(args: argparse.Namespace) -> int:
-    """serialwrap remote 分派：words → status / close / open。
-
-    ``sw_core.remote_tunnel`` 於此延遲匯入（而非 cli.py 模組層級）：該模組硬依賴
-    ``fcntl``（POSIX-only），cli.py 頂層需在 Windows 也能正常 import，故不得在
-    模組層級引入。在匯入之前先於此函式最頂端攔截 native Windows（``os.name ==
-    "nt"``），統一回 ``REMOTE_NOT_SUPPORTED`` JSON——涵蓋 status／close／open 三條
-    路徑，避免 ``import remote_tunnel`` 觸發的 ``ModuleNotFoundError``（缺
-    ``fcntl``）穿越此函式與 ``main()`` 變成原始 traceback。open 分支內的
-    ``rt.guard_platform()`` 為 defense-in-depth，保留不動。全程例外皆經
-    ``except rt.TunnelError`` 與 catch-all ``except Exception`` 轉為 JSON，不讓
-    例外穿越 CLI 邊界。
-    """
-    if os.name == "nt":
-        resp = {
-            "ok": False,
-            "error_code": "REMOTE_NOT_SUPPORTED",
-            "message": "native Windows 本期不支援 serialwrap remote；請手動 ssh -R（見 SKILL_WINDOWS.md）",
-        }
-        _print(resp)
-        _mirror_err(resp, context="remote")
-        return 1
-
+    """serialwrap remote 分派：words → status／close／stop／open。"""
     from . import remote_tunnel as rt  # noqa: PLC0415
 
     try:
@@ -1562,7 +1509,7 @@ def _run_remote(args: argparse.Namespace) -> int:
         if not words or words[0] == "status":
             _print(rt.status(run_dir))
             return 0
-        if words[0] == "close":
+        if words[0] in ("close", "stop"):
             selector = words[1] if len(words) > 1 else "all"
             _print(rt.close(run_dir, selector))
             return 0
@@ -2243,11 +2190,12 @@ def build_parser() -> argparse.ArgumentParser:
             "  serialwrap remote -L user@relay:7777    # connect（relay/雙 NAT）\n"
             "  serialwrap remote                        # 列目前隧道（status）\n"
             "  serialwrap remote close 7777|all         # 拆除\n"
+            "  serialwrap remote stop [port|all]        # close 的別名，省略時拆除全部\n"
             "安全：只透過 ssh-tunnel、單租戶/可信 relay 或 --remote-socket；不可對網路直接開放。"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p_remote.add_argument("words", nargs="*", help="[user@]host:port ｜ status ｜ close <port|all>")
+    p_remote.add_argument("words", nargs="*", help="[user@]host:port ｜ status ｜ close/stop [port|all]")
     # 註：-R/-L 刻意不用 add_mutually_exclusive_group()——argparse 對同群組 store_true
     # 旗標的互斥是在 parse_args 當場 parser.error() → SystemExit(2)（usage 訊息印到
     # stderr），會讓「同時給 -R -L」整條命令繞過 _run_remote() 的 try/except

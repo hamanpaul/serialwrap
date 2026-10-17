@@ -288,7 +288,7 @@ serialwrap mcu status
 | `INTERACTIVE_NOT_FOUND` | rpc／posix、windows | 否 | interactive_id 不存在，或 lease 狀態已不是 active | 重新 interactive open 取得 interactive_id |
 | `INTERNAL_ERROR` | cli_local／posix、windows | 否 | CLI 本地流程發生未預期例外 | 回報例外訊息；勿假設操作已失敗而重送寫入型命令 |
 | `INVALID_ARGS` | rpc、cli_local／posix、windows | 修正參數後 | 參數缺漏或型別／值不合法（RPC 分派或 CLI 參數驗證） | 依 CLI 或 RPC 說明修正參數後重送 |
-| `INVALID_BENCH_CONFIG` | cli_local／posix | 修正參數後 | benches.yaml 驗證失敗 | 修正 benches.yaml 的欄位後重試 |
+| `INVALID_BENCH_CONFIG` | cli_local／posix、windows | 修正參數後 | benches.yaml 驗證失敗 | 修正 benches.yaml 的欄位後重試 |
 | `INVALID_BENCH_STATE` | cli_local／posix、windows | 修正參數後 | benches.state.json 結構錯誤 | 檢查 benches.state.json 內容，結構損壞時需人工修復後重試 |
 | `INVALID_COMPLETION_REGEX` | rpc、rec、cli_local／posix、windows | 修正參數後 | completion_regex 驗證失敗（空字串、超過 1024 bytes、無法編譯，或可匹配空字串） | 修正 completion_regex 後重送 |
 | `INVALID_ENDPOINT` | cli_client、cli_local／posix、windows | 修正參數後 | endpoint 格式錯誤（tcp 缺 host 或 port、unix 路徑非絕對、未知 scheme） | 改用 tcp://host:port 或絕對 unix socket 路徑格式後重試 |
@@ -315,7 +315,7 @@ serialwrap mcu status
 | `PULL_PARSE_FAILED` | rpc／posix、windows | 視情況 | 擷取輸出中找不到 sentinel 區段，且無 encoder 失敗 sentinel | 確認目標端 encoder 輸出正常後重試 |
 | `READY_UNCONFIRMED` | rpc、rec／posix、windows | 否 | READY 再確認逾 300 秒或已達 5 次仍未確認，拒絕 agent 命令 | 勿重送；執行 serialwrap session self-test 取分類，再依分類處理 |
 | `REMOTE_BIND_UNVERIFIED` | cli_local／posix、windows | 視情況 | expose tcp 模式下 relay 的 ss 驗證失敗，或綁定位址非 loopback | 確認 relay 僅綁定 loopback 位址後重試 |
-| `REMOTE_NOT_SUPPORTED` | cli_local／posix、windows | 修正參數後 | 此平台（原生 Windows）不支援 remote 功能 | 改在 WSL2 或 Linux 環境執行 remote 功能 |
+| `REMOTE_NOT_SUPPORTED` | cli_local／posix、windows | 修正參數後 | daemon start 不支援遠端 endpoint；Windows 僅接受 loopback endpoint | 在本機啟動 daemon；Windows 若使用 TCP endpoint，請指定 loopback 位址 |
 | `RULE_NOT_FOUND` | rpc／posix、windows | 否 | 指定的 rule_id 不存在 | 以 event rule list 確認 rule_id 後重試 |
 | `SAMPLE_READ_FAILED` | cli_local／posix、windows | 修正參數後 | profile test 讀取樣本檔失敗 | 確認樣本檔路徑與讀取權限後重試 |
 | `SEND_FAILED` | rec／posix、windows | 否 | send 回呼拋出例外，無法確定命令是否已送出（結果不明） | 勿自動重送；先以 session self-test 與 command.get 確認狀態，再由操作者決定 |
@@ -340,9 +340,9 @@ serialwrap mcu status
 | `TRANSFER_TIMEOUT` | rpc／posix、windows | 視情況 | 檔案傳輸過程中 prompt 逾時 | 確認目標端狀態後重新傳輸 |
 | `TUNNEL_CONFLICT` | cli_local／posix、windows | 修正參數後 | 指定的 port 已有身分不同的 tunnel | 關閉既有 tunnel（connect --close）或改用其他 port 後重試 |
 | `TUNNEL_SPAWN_FAILED` | cli_local／posix、windows | 視情況 | ssh 行程在就緒前即結束 | 檢查 ssh 參數與遠端可達性後重試 |
-| `TUNNEL_STATUS_ERROR` | cli_local／posix | 視情況 | connect 與 benches 讀取 tunnel 狀態時，回應格式異常或缺少 tunnels 清單（若回應帶 code 則透傳該 code） | 檢查 remote 狀態與 ssh 控制通道後重試 |
+| `TUNNEL_STATUS_ERROR` | cli_local／posix、windows | 視情況 | connect 與 benches 讀取 tunnel 狀態時，回應格式異常或缺少 tunnels 清單（若回應帶 code 則透傳該 code） | 檢查 remote 狀態與 ssh 控制通道後重試 |
 | `TUNNEL_STILL_ACTIVE` | cli_local／posix、windows | 視情況 | connect --close 之後 tunnel 仍在運作 | 以 remote status 確認 tunnel 行程狀態後再重試 close |
-| `UNKNOWN_BENCH_CODE` | cli_local／posix | 修正參數後 | bench_registry 找不到指定的 bench code | 以 benches.yaml 內存在的 bench code 重試 |
+| `UNKNOWN_BENCH_CODE` | cli_local／posix、windows | 修正參數後 | bench_registry 找不到指定的 bench code | 以 benches.yaml 內存在的 bench code 重試 |
 | `UNKNOWN_EVENT_CMD` | cli_local／posix、windows | 修正參數後 | event 子命令未知 | 改用 event 支援的子命令重試 |
 | `UNKNOWN_PROFILE` | rpc、cli_local／posix、windows | 修正參數後 | profile 名稱不存在 | 以 profile 目錄中存在的名稱重試 |
 | `WAL_MISSING` | rpc／posix、windows | 視情況 | WAL 曾寫入過（current_seq 大於 0）但目前的 WAL 檔不存在 | 執行 serialwrap doctor 檢查 WAL 目錄與狀態 |

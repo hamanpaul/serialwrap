@@ -1448,8 +1448,8 @@ pub fn run_remote(ns: &Namespace, ctx: &mut Ctx) -> i32;
 - CLI：`words` 空或 `status` → status；`close` 或 `stop`（SC-21 別名）→ `selector = if words.len() > 1 { words[1] } else { "all" }`（等同 `cli.py:1564` 的 `words[1] if len(words) > 1 else "all"`；`remote close ""` 篩出 0 筆回 `closed:[]`，**不得**當成 all）；其他 → open。錯誤 exit 1，訊息逐字照 07 §8.5；多餘 words 忽略（KEEP）。不再有 `REMOTE_NOT_SUPPORTED`（BC-05：Windows 支援）。
 - Windows（`ProcessTunnel::supports_control_master()==false`，BC-05）：
   - `build_argv(control_master=false)`：省略 `ControlMaster=auto`、`ControlPath=…`、`ControlPersist=no` 三組 `-o`，其餘相同；`compute_identity` 不變（仍含使用者 `ssh_opts`）。state JSON 照 P1 T14（`02-stage0-python-bc.md` L1949）：`pgid` 寫 `null`、`pid_start_ticks` 寫 CreationTime 整數、`control_path` **仍寫入**（不建立該檔）；讀取端容忍 `pgid:null`（1A 委派期間 Python 寫的 registry 與 Rust 混用）。
-  - readiness：`ssh_check` 改為「行程存活」；role probe：connect → 對本地 forward `health.ping`(2.0)；expose＋`--remote-socket` → true；expose＋tcp → `["ssh", *使用者 ssh_opts, "-o","BatchMode=yes", ssh_target, "ss","-ltnH","sport = :<port>"]`（新連線，不用 ControlPath）。Windows 沒有 `ssh -O check` 保證 `-R` forward 已建立，因此 **expose 探測改為輪詢**（BC-05 競態修正，§0.5 已請 P1 同步）：探測 rc≠0 或輸出無 `:<port>` 監聽列 → 「尚未就緒」，每 0.5 s 重探直到 `ready_timeout`，逾時回 `status:"starting"`（與 POSIX deadline 逾時相同形狀，不 terminate）；只有 `ss` rc 0 且列出該 port 但 `bind_is_loopback_only==false`（wildcard 或非 loopback）時才 `REMOTE_BIND_UNVERIFIED` 並 terminate（fail-closed）；connect 的 ping 失敗同樣輪詢至 deadline。POSIX 維持 PLT-O-10「第一次失敗即 `REMOTE_BIND_UNVERIFIED`」。
-  - 存活：`ProcessTunnel::alive`；停止：`terminate`（先核對根 CreationTime，再整棵樹）。
+  - readiness：`ssh_check` 只確認行程存活；role probe：connect → 對本地 forward `health.ping`(2.0)；expose＋`--remote-socket` → 另開 ssh 執行 `test -S <remote_socket>`，rc 0 才代表 forwarding 已建立；expose＋tcp → `["ssh", "-o","BatchMode=yes", *使用者 ssh_opts, ssh_target, "ss","-ltnH","sport = :<port>"]`（新連線，不用 ControlPath）。Windows 沒有 `ssh -O check` 保證 `-R` forward 已建立，因此 expose 探測須在 `ready_timeout` 內輪詢：探測 rc≠0、輸出為空或尚未列出該 port → 「尚未就緒」；只有 `ss` rc 0 且列出該 port 但 `bind_is_loopback_only==false`（wildcard 或非 loopback）時才 `REMOTE_BIND_UNVERIFIED` 並 terminate（fail-closed）。expose＋tcp 到期仍無法驗證時回 `REMOTE_BIND_UNVERIFIED` 並清理，不能留下未驗證隧道；connect ping 或 remote-socket test 未成功時可維持 `starting`，但不得標 `active`。POSIX 維持 PLT-O-10「第一次失敗即 `REMOTE_BIND_UNVERIFIED`」。
+  - 存活：`ProcessTunnel::alive`；停止：`terminate`（先核對根 CreationTime，再以 `taskkill /T /F` 終止整棵樹；有界確認同一 CreationTime 已退出，失敗時保留 error state）。
   - `forward_src`：daemon endpoint 為 tcp → `127.0.0.1:<port>`（照 `_forward_src_from_endpoint`）。
   - `ssh` 可執行檔解析：`SysEnv::which("ssh")`（Windows 依 PATHEXT 找到 `ssh.exe`），找不到 → `SSH_NOT_FOUND` `PATH 找不到 ssh`。
 
@@ -1508,7 +1508,7 @@ fn remote_stop_is_alias_of_close() {
 | `close_dead_pid_not_signalled` | pid 已死 → 不呼叫 terminate、仍列入 closed |
 | `close_terminate_error_marks_error` | terminate Err → state 寫回 `status:"error"`、不列入 closed |
 | `registry_write_disk_stable` | state 檔內容 = `DISK_STABLE` 序列化、無尾端換行、檔名 `<port>.json` |
-| `windows_role_probe_tcp_uses_new_connection` | `TestEnv::windows()` expose tcp → runner argv == `["ssh","-p2222","-o","BatchMode=yes","u@relay","ss","-ltnH","sport = :48800"]` |
+| `windows_role_probe_tcp_uses_new_connection` | `TestEnv::windows()` expose tcp → runner argv == `["ssh","-o","BatchMode=yes","-p2222","u@relay","ss","-ltnH","sport = :48800"]`；第一次未列出 listener 回 False 並重探，找到非 loopback listener 才 fail-closed |
 | `windows_connect_ready_via_ping` | ping 本地 forward ok → `active` |
 | `windows_state_matches_p1_schema` | 寫入 state 的 `pgid` 為 null、`pid_start_ticks` 為整數、`control_path` 為字串（檔案不存在） |
 | `registry_reads_python_written_pgid_null` | 以 P1 Python 形狀（`pgid:null`）的 state 檔 → `status` 正常列出、`close` 正常終止 |

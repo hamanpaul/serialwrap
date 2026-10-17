@@ -797,8 +797,8 @@ serialwrap remote tester@AGENT_OR_RELAY:7777
 - **Background daemonization**: `ssh` / `--autossh` runs in its own process
   group in the background; the command returns immediately.
 - **flock registry**: state lives under `<run-dir>/remote/` (`<port>.json` +
-  a `cm-<port>` ssh control socket), serialized with an flock so concurrent
-  `remote` / `remote close` calls don't race.
+  a `cm-<port>` ssh control socket), serialized with a cross-process file lock
+  (`flock` on POSIX, `LockFileEx` on Windows) so concurrent tunnel operations don't race.
 - **Readiness confirmation**: returns `status`: `active` = verified and
   ready; `starting` = timed out (default 10s, tunable via `--ready-timeout`)
   but the process is still alive and not yet confirmed — query
@@ -1130,6 +1130,8 @@ in Route A above.
 serialwrap remote                   # list all current tunnels (status)
 serialwrap remote close 7777        # tear down a single tunnel
 serialwrap remote close all         # tear down everything
+serialwrap remote stop 7777         # same as close
+serialwrap remote stop              # stop all tunnels
 ```
 
 #### `--remote-socket` hardening (recommended for shared relays)
@@ -1184,9 +1186,13 @@ serialwrap remote -L --remote-socket /tmp/sw-relay.sock tester@RELAY:7777
   first scp/rsync it to the UART host, then have the daemon do the file
   transfer. WAL and mirror-log paths returned by the RPC are likewise
   UART-host paths.
-- **Native Windows does not support `serialwrap remote` in this release**:
-  running it returns `REMOTE_NOT_SUPPORTED` (see the manual equivalent
-  below).
+- **Native Windows supports `serialwrap remote -R/-L`, `connect`, and
+  `benches`**. Windows uses process-tree shutdown and does not use OpenSSH
+  ControlMaster. Run `serialwrap remote stop [port|all]` to stop one or all
+  tunnels; omitting the selector stops all tunnels.
+- **OD-12 trust boundary**: a remote tunnel grants full DUT control to users
+  authenticated by SSH. Use a single-user workstation and a trusted relay; this
+  does not provide same-user isolation on a shared machine.
 - For an isolated two-container check, run `./tools/docker/remote_smoke.sh`
   directly; the full flow is documented in
   [`func-test/README.md`](./func-test/README.md) under the **Remote Support
@@ -2672,7 +2678,7 @@ serialwrap remote tester@AGENT_OR_RELAY:7777
 `serialwrap remote`（`sw_core/remote_tunnel.py`）行為：
 
 - **background 常駐**：`ssh`／`--autossh` 以獨立 process group 背景執行，指令立即回傳。
-- **flock registry**：狀態落在 `<run-dir>/remote/`（`<port>.json` + `cm-<port>` ssh control socket），以 flock 序列化並發的 `remote` / `remote close` 操作。
+- **跨行程檔案鎖 registry**：狀態落在 `<run-dir>/remote/`（`<port>.json` + `cm-<port>` ssh control socket）；POSIX 使用 `flock`，Windows 使用 `LockFileEx`，避免並發 tunnel 操作互相競爭。
 - **readiness 確認**：回傳 `status`：`active`＝已驗證就緒可用；`starting`＝逾時（預設 10s，`--ready-timeout` 可調）但行程仍存活、尚未確認，需再 `serialwrap remote` 查或重試。
 - **冪等 / 衝突偵測**：同 port 重複執行且 identity（role/target/port/local/remote_socket/via/ssh-opt 等雜湊）相同 → `already_running` no-op；identity 不同 → 拒絕並回 `TUNNEL_CONFLICT`（避免竊佔他人隧道或造成埠位混用）。
 
@@ -2902,6 +2908,8 @@ sudo tools/bench-enroll.sh --bundle /path/to/handoff/eit-test
 serialwrap remote                   # 列目前所有隧道（status）
 serialwrap remote close 7777        # 拆除單一隧道
 serialwrap remote close all         # 拆除全部
+serialwrap remote stop 7777         # 等同 close
+serialwrap remote stop              # 停止全部隧道
 ```
 
 ### `--remote-socket` 硬化（共享 relay 建議必開）
@@ -2925,7 +2933,8 @@ serialwrap remote -L --remote-socket /tmp/sw-relay.sock tester@RELAY:7777
 - **`BatchMode=yes` 為強制、無法覆寫。** readiness／安全預設 `-o` 置於使用者 `--ssh-opt` **之前**，而 OpenSSH 對同一個 key 取第一個出現的值，因此 `BatchMode`、`ExitOnForwardFailure` 與 `ControlPath` 這組設定是刻意設計成權威、使用者蓋不掉的。後果是**不接受任何互動式認證**：開隧道當下認證就必須已經是非互動的。若 reachability provider 的憑證會過期（例如 Cloudflare Access 的 token），過期時 ssh 會直接失敗且**不會給出有用的診斷訊息**——無人值守情境需改用 service token，或事先完成 refresh。
 - `daemon start` **不支援** `--endpoint`（daemon 只能在本機啟動，會回 `REMOTE_NOT_SUPPORTED`）。
 - **`file.push` / `file.pull` 的 `local_path` 是 daemon 端（UART host）的路徑**，不是 agent 本機路徑；agent 若要傳輸本機檔案，需先透過 scp/rsync 傳到 UART host，再由 daemon 執行 file transfer。WAL、mirror log 等路徑回傳值同理。
-- **native Windows 本期不支援** `serialwrap remote`：執行會回 `REMOTE_NOT_SUPPORTED`（見下方手動等價）。
+- **native Windows 支援** `serialwrap remote -R/-L`、`connect` 與 `benches`；Windows 使用整棵行程樹終止，且不使用 OpenSSH ControlMaster。可用 `serialwrap remote stop [port|all]` 停止指定隧道；省略參數時停止全部。
+- **OD-12 信任邊界**：遠端隧道讓通過 SSH 驗證的使用者取得 DUT 完整控制權。僅部署於單人工作站並使用可信 relay；這不代表共享主機具備同使用者隔離。
 - 若要做隔離式雙 container 驗證，可直接執行 `./tools/docker/remote_smoke.sh`；完整流程說明在 [`func-test/README.md`](./func-test/README.md) 的 **Remote Support Docker test flow**。
 
 ### 手動 `ssh -R` / `-L` 等價（不透過 `serialwrap remote`）
@@ -3178,10 +3187,11 @@ serialwrap remote：外包系統 ssh 建立 -R（expose，把本機 daemon 推�
   serialwrap remote -L user@relay:7777    # connect（relay/雙 NAT）
   serialwrap remote                        # 列目前隧道（status）
   serialwrap remote close 7777|all         # 拆除
+  serialwrap remote stop [port|all]        # close 的別名，省略時拆除全部
 安全：只透過 ssh-tunnel、單租戶/可信 relay 或 --remote-socket；不可對網路直接開放。
 
 positional arguments:
-  words                 [user@]host:port ｜ status ｜ close <port|all>
+  words                 [user@]host:port ｜ status ｜ close/stop [port|all]
 
 options:
   -h, --help            show this help message and exit

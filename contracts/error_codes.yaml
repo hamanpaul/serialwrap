@@ -501,7 +501,7 @@ codes:
     agent_action: "回報例外訊息；勿假設操作已失敗而重送寫入型命令"
     extra_fields: ["message"]
     exit_codes: {"benches": 1, "connect": 1, "daemon stop": 1, "event": 1, "remote": 1}
-    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapPosixRemoteCli::test_internal_error_cli_catch_all"]
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapRemoteCli::test_internal_error_cli_catch_all"]
     behavior_change: ["DF-07"]
     sources: ["sw_core/cli.py:138", "sw_core/cli.py:1456", "sw_core/cli.py:1526", "sw_core/cli.py:1615"]
   - code: INVALID_ARGS
@@ -521,7 +521,7 @@ codes:
   - code: INVALID_BENCH_CONFIG
     status: EXISTING
     reachable: true
-    scope: {interfaces: [cli_local], methods: ["benches", "connect"], platforms: [posix]}
+    scope: {interfaces: [cli_local], methods: ["benches", "connect"], platforms: [posix, windows]}
     meaning: "benches.yaml 驗證失敗"
     side_effect: "無"
     retryable: "fix_args"
@@ -529,7 +529,7 @@ codes:
     agent_action: "修正 benches.yaml 的欄位後重試"
     extra_fields: ["message"]
     exit_codes: {"benches": 1, "connect": 1}
-    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapPosixRemoteCli::test_invalid_bench_config_connect"]
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapRemoteCli::test_invalid_bench_config_connect"]
     behavior_change: []
     sources: ["sw_core/cli.py:1355", "sw_core/cli.py:1482"]
   - code: INVALID_BENCH_STATE
@@ -884,17 +884,17 @@ codes:
   - code: REMOTE_NOT_SUPPORTED
     status: EXISTING
     reachable: true
-    scope: {interfaces: [cli_local], methods: ["benches", "connect", "daemon start", "remote"], platforms: [posix, windows]}
-    meaning: "此平台（原生 Windows）不支援 remote 功能"
+    scope: {interfaces: [cli_local], methods: ["daemon start"], platforms: [posix, windows]}
+    meaning: "daemon start 不支援遠端 endpoint；Windows 僅接受 loopback endpoint"
     side_effect: "無"
     retryable: "fix_args"
     uart_tx: none
-    agent_action: "改在 WSL2 或 Linux 環境執行 remote 功能"
+    agent_action: "在本機啟動 daemon；Windows 若使用 TCP endpoint，請指定 loopback 位址"
     extra_fields: ["message"]
-    exit_codes: {"benches": 1, "connect": 1, "daemon start": 2, "remote": 1}
-    contract_tests: ["tests/test_remote_cli.py::test_remote_windows_returns_not_supported", "tests/test_remote_endpoint.py::TestCliEndpoint::test_daemon_start_rejects_endpoint"]
+    exit_codes: {"daemon start": 2}
+    contract_tests: ["tests/test_remote_endpoint.py::TestCliEndpoint::test_daemon_start_rejects_endpoint", "tests/test_win_daemon_start.py::TestEndpointCarveOut::test_non_loopback_endpoint_rejected_on_win"]
     behavior_change: ["SC-27", "BC-05"]
-    sources: ["sw_core/cli.py:434", "sw_core/cli.py:1334", "sw_core/cli.py:1464", "sw_core/cli.py:1545", "sw_core/remote_tunnel.py:586"]
+    sources: ["sw_core/cli.py:436"]
   - code: RULE_NOT_FOUND
     status: EXISTING
     reachable: true
@@ -1214,7 +1214,7 @@ codes:
   - code: TUNNEL_STATUS_ERROR
     status: EXISTING
     reachable: true
-    scope: {interfaces: [cli_local], methods: ["benches", "connect"], platforms: [posix]}
+    scope: {interfaces: [cli_local], methods: ["benches", "connect"], platforms: [posix, windows]}
     meaning: "connect 與 benches 讀取 tunnel 狀態時，回應格式異常或缺少 tunnels 清單（若回應帶 code 則透傳該 code）"
     side_effect: "無"
     retryable: "conditional"
@@ -1222,7 +1222,7 @@ codes:
     agent_action: "檢查 remote 狀態與 ssh 控制通道後重試"
     extra_fields: ["message"]
     exit_codes: {"benches": 1, "connect": 1}
-    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapPosixRemoteCli::test_tunnel_status_error_malformed"]
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapRemoteCli::test_tunnel_status_error_malformed"]
     behavior_change: []
     sources: ["sw_core/cli.py:1265", "sw_core/cli.py:1270", "sw_core/cli.py:1275", "sw_core/cli.py:1493"]
   - code: TUNNEL_STILL_ACTIVE
@@ -1242,7 +1242,7 @@ codes:
   - code: UNKNOWN_BENCH_CODE
     status: EXISTING
     reachable: true
-    scope: {interfaces: [cli_local], methods: ["connect"], platforms: [posix]}
+    scope: {interfaces: [cli_local], methods: ["connect"], platforms: [posix, windows]}
     meaning: "bench_registry 找不到指定的 bench code"
     side_effect: "無"
     retryable: "fix_args"
@@ -1250,7 +1250,7 @@ codes:
     agent_action: "以 benches.yaml 內存在的 bench code 重試"
     extra_fields: ["message"]
     exit_codes: {"connect": 1}
-    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapPosixRemoteCli::test_unknown_bench_code_connect"]
+    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapRemoteCli::test_unknown_bench_code_connect"]
     behavior_change: []
     sources: ["sw_core/cli.py:1353"]
   - code: UNKNOWN_EVENT_CMD

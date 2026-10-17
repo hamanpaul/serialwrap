@@ -1706,7 +1706,7 @@ def _roundtrip(payload: bytes, handler) -> list[bytes]:
 
 T4 實作時若再發現 `contract_tests` 為空的值，於本表追加一列（同樣格式），不得只在實作時臨時補。`USER_ENV_MISSING`（`reachable: false`）不需測試。
 
-- [ ] **Step 1：寫測試**（上兩表全部；本檔混合平台與資源，依 T14 規則**模組層不放 `pytestmark`**，每個 class 自帶一個平台 marker 與資源 marker：`TestGapMemory`（`core_portable`、`memory_only`）、`TestGapPosixRemoteCli`（`posix_only`、`memory_only`）、`TestGapFramingTcp`（framing／TCP／subprocess 類，`core_portable`、`process_rpc`）、`TestGapPosixLock`（`test_socket_unavailable_lock`，`posix_only`、`memory_only`）、`TestGapLastError`（`core_portable`、`memory_only`））。同時建立 `docs/rust-refactor/spec-errata.md` 骨架。
+- [ ] **Step 1：寫測試**（上兩表全部；本檔混合平台與資源，依 T14 規則**模組層不放 `pytestmark`**，每個 class 自帶一個平台 marker 與資源 marker：`TestGapMemory`（`core_portable`、`memory_only`）、`TestGapRemoteCli`（原 `TestGapPosixRemoteCli`；P1 T14 因 SC-27 Windows 支援改為 `core_portable`、`memory_only`）、`TestGapFramingTcp`（framing／TCP／subprocess 類，`core_portable`、`process_rpc`）、`TestGapPosixLock`（`test_socket_unavailable_lock`，`posix_only`、`memory_only`）、`TestGapLastError`（`core_portable`、`memory_only`））。同時建立 `docs/rust-refactor/spec-errata.md` 骨架。
 - [ ] **Step 2：確認紅燈** — `python3 -m pytest -q tests/test_contracts_gap_codes.py` 預期 **PASS**（特徵化）；`python3 -m tools.contracts check --only C09` 預期 exit 1，finding 為未填 `contract_tests` 的生效碼與 last_error（實測 28 筆，不含 `reachable: false` 或非目錄項）——多出或少於預期皆須先查明。
 - [ ] **Step 3：commit 測試** — `git commit -m "test(contracts): 新增缺測錯誤碼的基線特徵化測試"`（含 trailer）。
 - [ ] **Step 4：實作** 在兩份目錄的對應 entry 填入 `contract_tests: [tests/test_contracts_gap_codes.py::<test 名稱>]`。

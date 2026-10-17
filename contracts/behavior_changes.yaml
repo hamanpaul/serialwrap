@@ -117,7 +117,7 @@ changes:
   - id: "BC-05"
     kind: "BC"
     title: "Windows remote -R/-L"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "hamanpaul"
       date: "2026-10-15"
@@ -681,7 +681,7 @@ changes:
   - id: "SC-21"
     kind: "SC"
     title: "remote stop 作為 remote close 的別名"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -838,7 +838,7 @@ changes:
   - id: "SC-27"
     kind: "SC"
     title: "BC-05 Windows remote 延伸 connect 與 benches"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
