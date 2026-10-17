@@ -207,7 +207,9 @@ def generate_rows() -> list[Row]:
         for env_val in RESOLVE_ENV_VALUES:
             case_id = f"resolve_level_{case_idx:03d}"
             case_idx += 1
-            env_dict = {"SERIALWRAP_LOG_LEVEL": env_val} if env_val is not None else {}
+            # 「未設定」以非空 sentinel 表示：Python `(env or os.environ)` 對空 dict 會改讀真實環境，
+            # 使 golden 依呼叫端 shell 的 SERIALWRAP_LOG_LEVEL 而變（審查發現，見 P3-T11）。
+            env_dict = {"SERIALWRAP_LOG_LEVEL": env_val} if env_val is not None else {"_SW_GOLDEN": ""}
             res = ct.resolve_cli_trace_level(verbose, env=env_dict)
             input_str = f"{verbose}\x1f{env_val if env_val is not None else '__NONE__'}"
             expected_str = str(res)

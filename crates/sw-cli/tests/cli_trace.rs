@@ -22,6 +22,15 @@ fn unhex(s: &str) -> Vec<u8> {
         .collect()
 }
 
+/// 每個操作的最少列數下限：golden 缺列或被截斷時，迭代為空不得因此 PASS（規格 §11.3「證據不足不得 PASS」）。
+///
+/// 下限取計畫 T11 的列數（`parse_log_level` ≥60、`describe_trace_endpoint` ≥30）；
+/// `resolve_cli_trace_level`（≥80）與 `trace_enabled`（≥15）為審查提議值，皆低於目前列數（88／21）。
+fn assert_row_floor(rows: &[Row], op: &str, floor: usize) {
+    let n = rows.iter().filter(|r| r.op == op).count();
+    assert!(n >= floor, "{op} 列數 {n} 低於下限 {floor}（golden 可能缺失或被截斷）");
+}
+
 fn load_golden() -> Vec<Row> {
     let root = common::data_root();
     let path = root.join("contracts/golden/cli_trace.tsv");
@@ -89,8 +98,10 @@ fn trace_line_ok_response() {
 
 #[test]
 fn test_cli_trace_parse_log_level() {
+    let rows = load_golden();
+    assert_row_floor(&rows, "parse_log_level", 60);
     let mut fails = Vec::new();
-    for r in load_golden().into_iter().filter(|r| r.op == "parse_log_level") {
+    for r in rows.into_iter().filter(|r| r.op == "parse_log_level") {
         let raw = if r.input == "__NONE__" {
             None
         } else {
@@ -111,8 +122,10 @@ fn test_cli_trace_parse_log_level() {
 
 #[test]
 fn test_cli_trace_resolve_cli_trace_level() {
+    let rows = load_golden();
+    assert_row_floor(&rows, "resolve_cli_trace_level", 80);
     let mut fails = Vec::new();
-    for r in load_golden().into_iter().filter(|r| r.op == "resolve_cli_trace_level") {
+    for r in rows.into_iter().filter(|r| r.op == "resolve_cli_trace_level") {
         let (verbose_str, env_str) = r.input.split_once('\x1f').expect("split verbose and env");
         let verbose: i64 = verbose_str.parse().expect("parse verbose int");
         let env_level = if env_str == "__NONE__" {
@@ -137,8 +150,10 @@ fn test_cli_trace_resolve_cli_trace_level() {
 
 #[test]
 fn test_cli_trace_trace_enabled() {
+    let rows = load_golden();
+    assert_row_floor(&rows, "trace_enabled", 15);
     let mut fails = Vec::new();
-    for r in load_golden().into_iter().filter(|r| r.op == "trace_enabled") {
+    for r in rows.into_iter().filter(|r| r.op == "trace_enabled") {
         let level = if let Ok(n) = r.input.parse::<i128>() {
             PyInt::Small(n)
         } else {
@@ -155,8 +170,10 @@ fn test_cli_trace_trace_enabled() {
 
 #[test]
 fn test_cli_trace_describe_trace_endpoint() {
+    let rows = load_golden();
+    assert_row_floor(&rows, "describe_trace_endpoint", 30);
     let mut fails = Vec::new();
-    for r in load_golden().into_iter().filter(|r| r.op == "describe_trace_endpoint") {
+    for r in rows.into_iter().filter(|r| r.op == "describe_trace_endpoint") {
         let (got_transport, got_id) = describe_trace_endpoint(&r.input);
         let (want_transport, want_id) = r.expected.split_once('\x1f').expect("split transport and id");
         if got_transport != want_transport || got_id != want_id {

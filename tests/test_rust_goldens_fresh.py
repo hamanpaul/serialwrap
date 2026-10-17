@@ -26,6 +26,7 @@ GENERATORS = [
     ("gen_runtime_paths.py", "runtime_paths.windows.tsv"),
     ("gen_endpoint.py", "endpoint.tsv"),
     ("gen_wal_line.py", "wal_line.tsv"),
+    ("gen_cli_trace.py", "cli_trace.tsv"),
 ]
 
 

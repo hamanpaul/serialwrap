@@ -345,12 +345,31 @@ enum DumpFrame<'a> {
     },
 }
 
+/// 迭代序列化的節點：一般值，或尚未展開的 dict。
+///
+/// `Dict` 變體讓根節點能以借用的 [`PyDict`] 開始序列化（見 [`dumps_dict`]），不必先包成 `PyValue::Dict` 再 clone。
+#[derive(Clone, Copy)]
+enum Node<'a> {
+    Val(&'a PyValue),
+    Dict(&'a PyDict),
+}
+
 /// `json.dumps`，不含尾端換行（顯式堆疊實作，不靠遞迴）。
 pub fn dumps(v: &PyValue, o: &DumpOpts) -> String {
+    dumps_node(Node::Val(v), o)
+}
+
+/// 同 [`dumps`]，但根節點為借用的 dict：輸出與 `dumps(&PyValue::Dict(d.clone()), o)` 逐位元組相同，
+/// 且不複製整棵樹（大型 CLI 回應的 `print_json` 路徑使用）。
+pub fn dumps_dict(d: &PyDict, o: &DumpOpts) -> String {
+    dumps_node(Node::Dict(d), o)
+}
+
+fn dumps_node(root: Node<'_>, o: &DumpOpts) -> String {
     assert!(o.allow_nan, "P3 dumps only supports allow_nan=true");
     let mut out = String::new();
     let mut stack: Vec<DumpFrame<'_>> = Vec::new();
-    let mut current: Option<(&PyValue, usize)> = Some((v, 0));
+    let mut current: Option<(Node<'_>, usize)> = Some((root, 0));
 
     let colon_sep = match o.sep {
         Sep::Compact => ":",
@@ -358,63 +377,67 @@ pub fn dumps(v: &PyValue, o: &DumpOpts) -> String {
     };
 
     loop {
-        if let Some((val, level)) = current {
-            match val {
-                PyValue::Null => {
-                    out.push_str("null");
-                    current = None;
-                }
-                PyValue::Bool(true) => {
-                    out.push_str("true");
-                    current = None;
-                }
-                PyValue::Bool(false) => {
-                    out.push_str("false");
-                    current = None;
-                }
-                PyValue::Int(PyInt::Small(n)) => {
-                    write!(out, "{}", n).unwrap();
-                    current = None;
-                }
-                PyValue::Int(PyInt::Big(s)) => {
-                    out.push_str(s);
-                    current = None;
-                }
-                PyValue::Float(f) => {
-                    if f.is_nan() {
-                        out.push_str("NaN");
-                    } else if *f == f64::INFINITY {
-                        out.push_str("Infinity");
-                    } else if *f == f64::NEG_INFINITY {
-                        out.push_str("-Infinity");
-                    } else {
-                        out.push_str(&repr_float(*f));
-                    }
-                    current = None;
-                }
-                PyValue::Str(s) => {
-                    dump_str(s, o.ensure_ascii, &mut out);
-                    current = None;
-                }
-                PyValue::List(items) => {
-                    if items.is_empty() {
-                        out.push_str("[]");
+        if let Some((node, level)) = current {
+            match node {
+                Node::Val(val) => match val {
+                    PyValue::Null => {
+                        out.push_str("null");
                         current = None;
-                    } else {
-                        out.push('[');
-                        if let Sep::Indent(n) = o.sep {
-                            out.push('\n');
-                            out.push_str(&" ".repeat((level + 1) * n as usize));
-                        }
-                        stack.push(DumpFrame::Array {
-                            items: items.as_slice(),
-                            index: 0,
-                            level,
-                        });
-                        current = Some((&items[0], level + 1));
                     }
-                }
-                PyValue::Dict(d) => {
+                    PyValue::Bool(true) => {
+                        out.push_str("true");
+                        current = None;
+                    }
+                    PyValue::Bool(false) => {
+                        out.push_str("false");
+                        current = None;
+                    }
+                    PyValue::Int(PyInt::Small(n)) => {
+                        write!(out, "{}", n).unwrap();
+                        current = None;
+                    }
+                    PyValue::Int(PyInt::Big(s)) => {
+                        out.push_str(s);
+                        current = None;
+                    }
+                    PyValue::Float(f) => {
+                        if f.is_nan() {
+                            out.push_str("NaN");
+                        } else if *f == f64::INFINITY {
+                            out.push_str("Infinity");
+                        } else if *f == f64::NEG_INFINITY {
+                            out.push_str("-Infinity");
+                        } else {
+                            out.push_str(&repr_float(*f));
+                        }
+                        current = None;
+                    }
+                    PyValue::Str(s) => {
+                        dump_str(s, o.ensure_ascii, &mut out);
+                        current = None;
+                    }
+                    PyValue::List(items) => {
+                        if items.is_empty() {
+                            out.push_str("[]");
+                            current = None;
+                        } else {
+                            out.push('[');
+                            if let Sep::Indent(n) = o.sep {
+                                out.push('\n');
+                                out.push_str(&" ".repeat((level + 1) * n as usize));
+                            }
+                            stack.push(DumpFrame::Array {
+                                items: items.as_slice(),
+                                index: 0,
+                                level,
+                            });
+                            current = Some((Node::Val(&items[0]), level + 1));
+                        }
+                    }
+                    // 一般 dict 交給下一輪以 `Node::Dict` 處理，與根 dict 共用同一段邏輯。
+                    PyValue::Dict(d) => current = Some((Node::Dict(d), level)),
+                },
+                Node::Dict(d) => {
                     if d.0.is_empty() {
                         out.push_str("{}");
                         current = None;
@@ -441,7 +464,7 @@ pub fn dumps(v: &PyValue, o: &DumpOpts) -> String {
                             index: 0,
                             level,
                         });
-                        current = Some((first_val, level + 1));
+                        current = Some((Node::Val(first_val), level + 1));
                     }
                 }
             }
@@ -463,7 +486,7 @@ pub fn dumps(v: &PyValue, o: &DumpOpts) -> String {
                                 out.push_str(&" ".repeat((*level + 1) * n as usize));
                             }
                         }
-                        current = Some((&items[*index], *level + 1));
+                        current = Some((Node::Val(&items[*index]), *level + 1));
                     } else {
                         if let Sep::Indent(n) = o.sep {
                             out.push('\n');
@@ -494,7 +517,7 @@ pub fn dumps(v: &PyValue, o: &DumpOpts) -> String {
                         dump_str(keys[*index], o.ensure_ascii, &mut out);
                         out.push_str(colon_sep);
                         let val = &dict.0[keys[*index]];
-                        current = Some((val, *level + 1));
+                        current = Some((Node::Val(val), *level + 1));
                     } else {
                         if let Sep::Indent(n) = o.sep {
                             out.push('\n');
