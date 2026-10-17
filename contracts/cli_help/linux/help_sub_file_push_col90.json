@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "file",
+    "push",
+    "--help"
+  ],
+  "columns": 90,
+  "rc": 0,
+  "stdout": "usage: serialwrap file push [-h] --selector SELECTOR --local LOCAL --remote REMOTE\n                            [--chunk-size CHUNK_SIZE] [--chunk-timeout CHUNK_TIMEOUT_S]\n                            [--ack-mode {auto,echo,none}] [--source SOURCE]\n\noptions:\n  -h, --help            show this help message and exit\n  --selector SELECTOR\n  --local LOCAL\n  --remote REMOTE\n  --chunk-size CHUNK_SIZE\n  --chunk-timeout CHUNK_TIMEOUT_S\n                        單一 chunk 等待 target 回應的逾時秒數（預設：沿用 profile timeout_s，#157）\n  --ack-mode {auto,echo,none}\n                        chunk 命令行送出方式（#161）：auto=有 echo-ACK 原語即節流（預設）、echo=強制 echo-\n                        ACK、none=legacy 整行送出（急件換吞吐）\n  --source SOURCE\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

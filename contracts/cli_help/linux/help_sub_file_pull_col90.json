@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "file",
+    "pull",
+    "--help"
+  ],
+  "columns": 90,
+  "rc": 0,
+  "stdout": "usage: serialwrap file pull [-h] --selector SELECTOR --remote REMOTE [--local LOCAL]\n                            [--chunk-timeout CHUNK_TIMEOUT_S]\n                            [--ack-mode {auto,echo,none}] [--source SOURCE]\n\noptions:\n  -h, --help            show this help message and exit\n  --selector SELECTOR\n  --remote REMOTE\n  --local LOCAL\n  --chunk-timeout CHUNK_TIMEOUT_S\n                        整段 base64 讀取的逾時秒數（預設：沿用 profile timeout_s，#157）\n  --ack-mode {auto,echo,none}\n                        介面對齊 file push（#161）；pull 端目前僅驗證、不影響行為\n  --source SOURCE\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

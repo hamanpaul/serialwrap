@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "session",
+    "--"
+  ],
+  "columns": 80,
+  "rc": 2,
+  "stdout": "",
+  "stderr": "usage: serialwrap session [-h] <command> ...\nserialwrap session: error: the following arguments are required: <command>\n",
+  "native": true,
+  "post_parse_effects": false
+}

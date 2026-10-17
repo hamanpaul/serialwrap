@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "profile",
+    "--help"
+  ],
+  "columns": 60,
+  "rc": 0,
+  "stdout": "usage: serialwrap profile [-h] <command> ...\n\n離線驗證 profile 的 prompt/login/password/bootloader regex\n是否命中一段樣本文字（#174）。\n\npositional arguments:\n  <command>\n    test      對樣本文字逐一跑 prompt/login/password/bootloader\n              regex，回報是否命中\n\noptions:\n  -h, --help  show this help message and exit\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

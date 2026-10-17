@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "alias",
+    "--help"
+  ],
+  "columns": 25,
+  "rc": 0,
+  "stdout": "usage: serialwrap alias\n       [-h]\n       <command> ...\n\n管理 session 別名：列舉、指定到\nsession_id、綁定裝置 by-id\n與解除綁定。\n\npositional arguments:\n  <command>\n    list\n    列出所有 alias 綁定\n    set\n    把 alias 指定到既有\n    session_id\n    assign\n    把 alias 綁到裝置 by-\n    id（可附 profile）\n    unassign\n    移除 alias 綁定\n\noptions:\n  -h, --help\n    show this help\n    message and exit\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

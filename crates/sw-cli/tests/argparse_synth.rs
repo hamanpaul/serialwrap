@@ -52,19 +52,47 @@ fn build_specs() -> BTreeMap<&'static str, ParserSpec> {
             raw_text: false,
             add_help: true,
             allow_abbrev: true,
-            actions: vec![ActionSpec {
-                option_strings: vec!["--items"],
-                dest: "items",
-                kind: ActionKind::Store,
-                nargs: Nargs::ZeroOrMore,
-                conv: Conv::Str,
-                default: ArgValue::List(vec![]),
-                choices: None,
-                required: false,
-                help: None,
-                metavar: None,
-                version: None,
-            }],
+            actions: vec![
+                ActionSpec {
+                    option_strings: vec!["--items"],
+                    dest: "items",
+                    kind: ActionKind::Store,
+                    nargs: Nargs::ZeroOrMore,
+                    conv: Conv::Str,
+                    default: ArgValue::List(vec![]),
+                    choices: None,
+                    required: false,
+                    help: None,
+                    metavar: None,
+                    version: None,
+                },
+                ActionSpec {
+                    option_strings: vec!["-R"],
+                    dest: "R",
+                    kind: ActionKind::StoreTrue,
+                    nargs: Nargs::One,
+                    conv: Conv::Str,
+                    default: ArgValue::Bool(false),
+                    choices: None,
+                    required: false,
+                    help: None,
+                    metavar: None,
+                    version: None,
+                },
+                ActionSpec {
+                    option_strings: vec![],
+                    dest: "words",
+                    kind: ActionKind::Store,
+                    nargs: Nargs::ZeroOrMore,
+                    conv: Conv::Str,
+                    default: ArgValue::None,
+                    choices: None,
+                    required: true,
+                    help: None,
+                    metavar: None,
+                    version: None,
+                },
+            ],
             mutex: vec![],
             sub: None,
         },
@@ -576,6 +604,15 @@ fn test_argparse_synth_all_cases() {
                         PyValue::Dict(d) => d,
                         _ => panic!("vals 必須為 dict"),
                     };
+                    assert_eq!(
+                        ns.vals.len(),
+                        exp_vals.0.len(),
+                        "{}/{} argv={argv:?}: namespace 欄位數不符 (got {:?}, want {:?})",
+                        row.id,
+                        row.op,
+                        ns.vals.keys().collect::<Vec<_>>(),
+                        exp_vals.0.keys().collect::<Vec<_>>()
+                    );
                     for (k, expected_v) in &exp_vals.0 {
                         let actual_v = ns.get(k);
                         let matched = match (expected_v, actual_v) {
@@ -659,5 +696,10 @@ fn test_argparse_synth_all_cases() {
         }
     }
 
-    assert!(fails.is_empty(), "{} 筆合成案例不符:\n{}", fails.len(), fails.join("\n"));
+    assert!(
+        fails.is_empty(),
+        "{} 筆合成案例不符:\n{}",
+        fails.len(),
+        fails.join("\n")
+    );
 }

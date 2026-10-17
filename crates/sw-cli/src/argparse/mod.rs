@@ -1,7 +1,4 @@
-//! CPython 3.12.3 argparse 相容層（P3-T10 紅燈 stub）。
-//!
-//! 方言固定為 CPython 3.12.3（§0.7、arch §7.2）。子模組 `parser`／`help`／`usage`／`error` 於 P3-T10 承接。
-#![allow(unused_variables, dead_code)]
+//! CPython 3.12.3 argparse 相容層。
 
 pub mod error;
 pub mod help;
@@ -42,6 +39,7 @@ pub enum ArgValue {
     List(Vec<String>),
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub struct ActionSpec {
     pub option_strings: Vec<&'static str>,
     pub dest: &'static str,
@@ -100,14 +98,26 @@ pub struct Namespace {
 
 impl Namespace {
     pub fn get(&self, dest: &str) -> &ArgValue {
-        todo!("P3-T10: Namespace::get")
+        static NONE: ArgValue = ArgValue::None;
+        self.vals.get(dest).unwrap_or(&NONE)
     }
     pub fn str(&self, dest: &str) -> Option<&str> {
-        todo!("P3-T10: Namespace::str")
+        match self.get(dest) {
+            ArgValue::Str(value) => Some(value),
+            _ => None,
+        }
     }
     /// `["session","list"]`：`cmd` → `<group>_cmd` 的值。
     pub fn path(&self) -> Vec<&str> {
-        todo!("P3-T10: Namespace::path")
+        let Some(group) = self.str("cmd") else {
+            return Vec::new();
+        };
+        let mut path = vec![group];
+        let dest = format!("{}_cmd", group.replace('-', "_"));
+        if let Some(command) = self.str(&dest) {
+            path.push(command);
+        }
+        path
     }
 }
 
@@ -124,18 +134,81 @@ pub enum ParseResult {
 }
 
 pub fn parse_args(spec: &ParserSpec, argv: &[String], width: usize) -> ParseResult {
-    todo!("P3-T10: parse_args")
+    parser::parse_args(spec, argv, width)
 }
 
 pub fn format_help(spec: &ParserSpec, width: usize) -> String {
-    todo!("P3-T10: format_help")
+    help::format_help(spec, width)
 }
 
 pub fn format_usage(spec: &ParserSpec, width: usize) -> String {
-    todo!("P3-T10: format_usage")
+    usage::format_usage(spec, width)
 }
 
 /// `shutil.get_terminal_size`：`int(COLUMNS) > 0` 才採，否則 terminal，否則 80；再減 2（HelpFormatter）。
 pub fn help_width(columns_env: Option<&str>, terminal: Option<u16>) -> usize {
-    todo!("P3-T10: help_width")
+    let columns = columns_env
+        .and_then(sw_proto::pycompat::py_int_parse)
+        .and_then(|value| match value {
+            sw_proto::pyjson::PyInt::Small(value) if value > 0 => {
+                Some(usize::try_from(value).unwrap_or(usize::MAX))
+            }
+            sw_proto::pyjson::PyInt::Big(value) if !value.starts_with('-') && value != "0" => {
+                Some(value.parse::<usize>().unwrap_or(usize::MAX))
+            }
+            _ => None,
+        })
+        .or_else(|| terminal.map(usize::from))
+        .unwrap_or(80);
+    columns.saturating_sub(2).max(1)
+}
+
+pub(super) fn display_actions(spec: &ParserSpec) -> Vec<ActionSpec> {
+    let mut actions = Vec::with_capacity(spec.actions.len() + usize::from(spec.add_help));
+    if spec.add_help {
+        let help = spec
+            .actions
+            .iter()
+            .find(|action| action.kind == ActionKind::Help)
+            .cloned()
+            .unwrap_or(ActionSpec {
+                option_strings: vec!["-h", "--help"],
+                dest: "help",
+                kind: ActionKind::Help,
+                nargs: Nargs::One,
+                conv: Conv::Str,
+                default: ArgValue::None,
+                choices: None,
+                required: false,
+                help: Some("show this help message and exit".to_string()),
+                metavar: None,
+                version: None,
+            });
+        actions.push(help);
+    }
+    actions.extend(
+        spec.actions
+            .iter()
+            .filter(|action| action.kind != ActionKind::Help)
+            .cloned(),
+    );
+    actions
+}
+
+pub(super) fn action_metavar(action: &ActionSpec) -> String {
+    if let Some(metavar) = action.metavar {
+        return metavar.to_string();
+    }
+    if let Some(choices) = &action.choices {
+        return format!("{{{}}}", choices.join(","));
+    }
+    if action.option_strings.is_empty() {
+        action.dest.to_string()
+    } else {
+        action.dest.to_ascii_uppercase()
+    }
+}
+
+pub(super) fn py_repr(value: &str) -> String {
+    sw_proto::pyfmt::py_repr_str(value)
 }

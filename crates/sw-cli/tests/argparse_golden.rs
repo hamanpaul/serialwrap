@@ -13,6 +13,7 @@ struct Case {
     stderr: String,
     native: bool,
     post_parse_effects: bool,
+    parse_expected: Option<(i32, String, String)>,
 }
 
 impl From<&sw_proto::pyjson::PyValue> for Case {
@@ -55,6 +56,19 @@ impl From<&sw_proto::pyjson::PyValue> for Case {
             Some(sw_proto::pyjson::PyValue::Bool(b)) => *b,
             _ => false,
         };
+        let parse_expected = match (
+            d.get("parse_rc"),
+            d.get("parse_stdout"),
+            d.get("parse_stderr"),
+        ) {
+            (
+                Some(sw_proto::pyjson::PyValue::Int(sw_proto::pyjson::PyInt::Small(rc))),
+                Some(sw_proto::pyjson::PyValue::Str(stdout)),
+                Some(sw_proto::pyjson::PyValue::Str(stderr)),
+            ) => Some((*rc as i32, stdout.clone(), stderr.clone())),
+            (None, None, None) => None,
+            _ => panic!("parse_rc、parse_stdout、parse_stderr 必須同時存在且型別正確"),
+        };
         Case {
             argv,
             columns,
@@ -63,13 +77,16 @@ impl From<&sw_proto::pyjson::PyValue> for Case {
             stderr,
             native,
             post_parse_effects,
+            parse_expected,
         }
     }
 }
 
 impl Case {
     fn parse_only_expected(&self) -> (i32, &str, &str) {
-        if self.post_parse_effects {
+        if let Some((rc, stdout, stderr)) = &self.parse_expected {
+            (*rc, stdout, stderr)
+        } else if self.post_parse_effects {
             (0, "", "")
         } else {
             (self.rc, self.stdout.as_str(), self.stderr.as_str())
@@ -110,7 +127,12 @@ fn native_paths_match_python_3_12_golden() {
             ));
         }
     }
-    assert!(fails.is_empty(), "{} 筆不符\n{}", fails.len(), fails.join("\n"));
+    assert!(
+        fails.is_empty(),
+        "{} 筆不符\n{}",
+        fails.len(),
+        fails.join("\n")
+    );
 }
 
 #[test]

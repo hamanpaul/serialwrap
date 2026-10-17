@@ -54,6 +54,14 @@ def _env(env, columns):
     return e
 
 
+def test_platform_oracle_exists_and_boundary_values_are_native():
+    assert CASES, f"證據不足：{GOLDEN.relative_to(repo_root())} 沒有平台 golden"
+    for case_id in ("boundary_socket_connect", "boundary_endpoint_connect"):
+        case_path = GOLDEN / f"{case_id}.json"
+        case = json.loads(case_path.read_text(encoding="utf-8"))
+        assert case["native"] is True, f"{case_id} 的全域選項值不可當作委派群組"
+
+
 @pytest.mark.parametrize("case", list(_params()))
 def test_help_usage_error_bytes(env, case):
     c = json.loads(case.read_text(encoding="utf-8"))

@@ -32,15 +32,17 @@ def build_parsers() -> list[tuple[str, argparse.ArgumentParser, list[list[str]]]
     # P01: nargs='*'
     p01 = argparse.ArgumentParser(prog="p01")
     p01.add_argument("--items", nargs="*", default=[])
+    p01.add_argument("-R", action="store_true", default=False)
+    p01.add_argument("words", nargs="*")
     cases01 = [
         [],
         ["--items"],
         ["--items", "a"],
         ["--items", "a", "b"],
-        ["--items", "a", "b", "c"],
+        ["--items=v", "x"],
         ["--items", "--", "x"],
-        ["--items", "hello world"],
-        ["--items", "1", "2"],
+        ["x", "-R", "y"],
+        ["x", "y"],
         ["--unknown"],
         ["extra"],
     ]
@@ -59,7 +61,7 @@ def build_parsers() -> list[tuple[str, argparse.ArgumentParser, list[list[str]]]
         ["-ia", "-ib"],
         ["--item"],
         ["--item", "a", "-i", "b", "-i", "c"],
-        ["extra"],
+        ["--item", "-v foo"],
     ]
     parsers.append(("P02", p02, cases02))
 
@@ -93,7 +95,7 @@ def build_parsers() -> list[tuple[str, argparse.ArgumentParser, list[list[str]]]
         ["--bar=2"],
         ["--foo", "1", "--bar", "2"],
         ["--foo"],
-        ["--bar"],
+        ["--foo", "1", "--foo", "2"],
         ["--unknown"],
         ["extra"],
     ]
@@ -121,12 +123,12 @@ def build_parsers() -> list[tuple[str, argparse.ArgumentParser, list[list[str]]]
     p06.add_argument("-n", "--num", type=int, default=0)
     cases06 = [
         [],
-        ["--num", "42"],
+        ["--num", "-٣"],
         ["--num", "-1"],
         ["-n", "-5"],
         ["-n-3"],
         ["--num=-10"],
-        ["--num", "0"],
+        ["--num", "-1."],
         ["--num", "abc"],
         ["--num", "--", "-1"],
         ["--num"],
@@ -163,7 +165,7 @@ def build_parsers() -> list[tuple[str, argparse.ArgumentParser, list[list[str]]]
         ["--ver"],
         ["--verb"],
         ["--version=1"],
-        ["--vers"],
+        ["--help", "--ver"],
         ["--unknown"],
         ["extra"],
     ]

@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "session",
+    "recover",
+    "--help"
+  ],
+  "columns": 60,
+  "rc": 0,
+  "stdout": "usage: serialwrap session recover [-h] --selector SELECTOR\n                                  [--timeout RECOVER_TIMEOUT_S]\n                                  [--force]\n\noptions:\n  -h, --help            show this help message and exit\n  --selector SELECTOR   session_id | COMx | alias\n  --timeout RECOVER_TIMEOUT_S\n  --force               force clear+reattach if normal\n                        recovery fails\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "cmd",
+    "submit",
+    "--help"
+  ],
+  "columns": 90,
+  "rc": 0,
+  "stdout": "usage: serialwrap cmd submit [-h] --selector SELECTOR [--cmd COMMAND_TEXT]\n                             [--source SOURCE] [--mode MODE] [--priority PRIORITY]\n                             [--cmd-timeout CMD_TIMEOUT_S]\n                             [--expected-duration EXPECTED_DURATION_S]\n                             [--completion-regex COMPLETION_REGEX]\n\n提交命令到 session（--mode line|background|interactive）。\n\n命令長度限制（--cmd 整條字串，以 UTF-8 位元組計；#129）：\n  - > 4096 bytes：接受但附 CMD_LENGTH_WARNING（過長命令可能造成 UART 緩衝溢位或 prompt timeout）\n  - > 16384 bytes：直接拒絕（CMD_TOO_LONG）\n  - 含 \\n 換行字元：直接拒絕（CMD_CONTAINS_NEWLINE），請拆成多次獨立提交\n\nbroker 對命令內容不做截斷；上述為 broker 對單一 --cmd 參數的上限，\ntarget 端 tty line buffer（常見 4096 bytes，target-dependent）才是物理單行限制。\n上限可由 `serialwrap daemon status` 回應的 limits 欄位執行期查詢，client 不需硬編碼。\n\noptions:\n  -h, --help            show this help message and exit\n  --selector SELECTOR\n  --cmd COMMAND_TEXT    要執行的單行命令（UTF-8 > 4096 bytes warning、> 16384 bytes 拒絕，詳見上方說明）\n  --source SOURCE\n  --mode MODE\n  --priority PRIORITY\n  --cmd-timeout CMD_TIMEOUT_S\n  --expected-duration EXPECTED_DURATION_S\n  --completion-regex COMPLETION_REGEX\n                        每命令完成 regex（最多 1024 UTF-8 bytes）；省略則等待 profile prompt\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

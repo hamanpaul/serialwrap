@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import subprocess
@@ -23,6 +24,7 @@ if sys.version_info[:3] != (3, 12, 3):
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CLI_EXE = REPO_ROOT / "serialwrap"
+ROOT_VALUE_OPTIONS = ("--socket", "--endpoint", "--bench", "--timeout", "--retries")
 
 DELEGATED_GROUPS = {
     "daemon",
@@ -95,32 +97,87 @@ NATIVE_SUBCOMMANDS: dict[str, list[str]] = {
 
 
 def is_native(argv: list[str]) -> bool:
-    for token in argv:
-        if token in DELEGATED_GROUPS:
-            return False
-        if token.startswith("--endpoint=") and token.split("=", 1)[1] in DELEGATED_GROUPS:
-            return False
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            index += 1
+            return index >= len(argv) or argv[index] not in DELEGATED_GROUPS
+        option, separator, _value = token.partition("=")
+        matches = [name for name in ROOT_VALUE_OPTIONS if name.startswith(option)]
+        if matches and (option in ROOT_VALUE_OPTIONS or len(matches) == 1):
+            index += 1 if separator else 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return token not in DELEGATED_GROUPS
     return True
 
 
-def make_env(columns: int) -> dict[str, str]:
+def make_env(columns: int, platform: str) -> dict[str, str]:
+    if platform == "windows":
+        home = r"C:\golden\home"
+        config_dir = r"C:\golden\config"
+        state_dir = r"C:\golden\state"
+        run_dir = r"C:\golden\run"
+    else:
+        home = "/golden/home"
+        config_dir = "/golden/config"
+        state_dir = "/golden/state"
+        run_dir = "/golden/run"
     env = {
-        "HOME": "/golden/home",
-        "LANG": "C.UTF-8",
-        "LC_ALL": "C.UTF-8",
+        "HOME": home,
         "COLUMNS": str(columns),
-        "SERIALWRAP_CONFIG_DIR": "/golden/config",
-        "SERIALWRAP_STATE_DIR": "/golden/state",
-        "SERIALWRAP_RUN_DIR": "/golden/run",
+        "SERIALWRAP_CONFIG_DIR": config_dir,
+        "SERIALWRAP_STATE_DIR": state_dir,
+        "SERIALWRAP_RUN_DIR": run_dir,
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
     }
+    if platform == "linux":
+        env.update(LANG="C.UTF-8", LC_ALL="C.UTF-8")
     return env
 
 
-def run_one(argv: list[str], columns: int) -> tuple[int, str, str]:
+def run_one(argv: list[str], columns: int, platform: str) -> tuple[int, str, str]:
     cmd = [str(CLI_EXE), *argv]
-    res = subprocess.run(cmd, env=make_env(columns), capture_output=True, text=True, check=False)
+    res = subprocess.run(
+        cmd,
+        cwd=REPO_ROOT,
+        env=make_env(columns, platform),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
     return res.returncode, res.stdout, res.stderr
+
+
+def run_parser(argv: list[str], columns: int, platform: str) -> tuple[int, str, str]:
+    """直接擷取 argparse 結果，與 CLI 後續錯誤包裝分開保存。"""
+    old_env = os.environ.copy()
+    stdout_io, stderr_io = io.StringIO(), io.StringIO()
+    old_stdout, old_stderr = sys.stdout, sys.stderr
+    try:
+        for key in list(os.environ):
+            if key.startswith("SERIALWRAP_"):
+                os.environ.pop(key, None)
+        os.environ.update(make_env(columns, platform))
+
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        from sw_core.cli import build_parser
+
+        sys.stdout, sys.stderr = stdout_io, stderr_io
+        try:
+            build_parser().parse_args(argv)
+            rc = 0
+        except SystemExit as exc:
+            rc = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+    finally:
+        sys.stdout, sys.stderr = old_stdout, old_stderr
+        os.environ.clear()
+        os.environ.update(old_env)
+    return rc, stdout_io.getvalue(), stderr_io.getvalue()
 
 
 def git_rev() -> str:
@@ -133,16 +190,25 @@ def git_rev() -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="擷取 Python 3.12.3 CLI help/usage/error golden")
-    parser.add_argument("--out", default=str(REPO_ROOT / "contracts" / "cli_help" / "linux"), help="輸出目錄")
+    parser.add_argument("--platform", choices=("linux", "windows"), help="指定 golden 平台，預設依執行環境判定")
+    parser.add_argument("--out", help="輸出目錄；預設 contracts/cli_help/<platform>")
     args = parser.parse_args()
+    platform = args.platform or ("windows" if os.name == "nt" else "linux")
+    if platform == "windows" and os.name != "nt":
+        raise SystemExit("Windows CLI golden 必須由 Windows CPython 3.12.3 擷取；不可在其他平台代產")
+    if platform == "linux" and os.name == "nt":
+        raise SystemExit("Linux CLI golden 必須由 POSIX CPython 3.12.3 擷取")
+    global CLI_EXE
+    CLI_EXE = REPO_ROOT / ("serialwrap.py" if platform == "windows" else "serialwrap")
 
-    out_dir = Path(args.out)
+    default_out = REPO_ROOT / "contracts" / "cli_help" / platform
+    out_dir = Path(args.out) if args.out else default_out
     out_dir.mkdir(parents=True, exist_ok=True)
 
     cases: list[dict] = []
 
-    # 1. 根層級 --help（80 與 120 欄寬）
-    for col in (80, 120):
+    # 1. 根層級 --help（多個欄寬涵蓋文字斷行邊界）
+    for col in (20, 21, 25, 30, 40, 60, 80, 90, 120):
         cases.append({
             "id": f"help_root_col{col}",
             "argv": ["--help"],
@@ -150,10 +216,10 @@ def main() -> None:
             "post_parse_effects": False,
         })
 
-    # 2. 20 個群組各自 --help（80 與 120 欄寬）
+    # 2. 20 個群組各自 --help（多個欄寬涵蓋文字斷行邊界）
     for grp in ALL_GROUPS:
         safe_grp = grp.replace("-", "_")
-        for col in (80, 120):
+        for col in (20, 21, 25, 30, 40, 60, 80, 90, 120):
             cases.append({
                 "id": f"help_grp_{safe_grp}_col{col}",
                 "argv": [grp, "--help"],
@@ -161,12 +227,12 @@ def main() -> None:
                 "post_parse_effects": False,
             })
 
-    # 3. 12 個原生群組所有子命令 --help（80 與 120 欄寬）
+    # 3. 12 個原生群組所有子命令 --help（多個欄寬涵蓋文字斷行邊界）
     for grp, subs in NATIVE_SUBCOMMANDS.items():
         safe_grp = grp.replace("-", "_")
         for sub in subs:
             safe_sub = sub.replace("-", "_")
-            for col in (80, 120):
+            for col in (60, 80, 90, 120):
                 cases.append({
                     "id": f"help_sub_{safe_grp}_{safe_sub}_col{col}",
                     "argv": [grp, sub, "--help"],
@@ -198,7 +264,12 @@ def main() -> None:
         ("boundary_socket_connect", ["--socket", "connect"], False),
         ("boundary_endpoint_connect", ["--endpoint=connect"], False),
         ("err_dashdash_before_group", ["--", "session", "list"], False),
+        ("err_dashdash_lone", ["--"], False),
+        ("err_dashdash_after_group", ["session", "--"], False),
         ("err_dashdash_after_sub", ["session", "list", "--", "x"], False),
+        ("err_event_rm_extras_after_dashdash", ["event", "rm", "a", "b", "--"], False),
+        ("err_event_tail_short_bundle_missing_value", ["event", "tail", "-hn"], False),
+        ("err_profile_test_ambiguous_equal", ["profile", "test", "--pro=x"], False),
         ("err_vv_missing_group", ["-vv"], False),
         ("action_version", ["--version"], False),
         ("action_version_session", ["--version", "session"], False),
@@ -211,20 +282,52 @@ def main() -> None:
         ("quirk_retries_neg_one", ["--retries", "-1", "session", "list"], True),
     ]
 
-    for cid, argv, post_parse in error_cases:
-        cases.append({
-            "id": cid,
-            "argv": argv,
-            "columns": 80,
-            "post_parse_effects": post_parse,
-        })
+    if platform == "windows":
+        windows_errors = {
+            "err_empty",
+            "err_bogus",
+            "err_session_missing_sub",
+            "err_session_bogus_sub",
+            "err_retries_invalid_int",
+            "err_timeout_invalid_float",
+            "err_timeout_missing_val",
+            "err_verbose_ambiguous",
+            "err_session_list_extra",
+            "err_event_reset_missing_mut",
+        }
+        cases = [
+            {"id": "help_root_col80", "argv": ["--help"], "columns": 80, "post_parse_effects": False},
+            {"id": "help_profile_test_col80", "argv": ["profile", "test", "--help"], "columns": 80, "post_parse_effects": False},
+        ]
+        cases.extend(
+            {
+                "id": case_id,
+                "argv": argv,
+                "columns": 80,
+                "post_parse_effects": post_parse,
+            }
+            for case_id, argv, post_parse in error_cases
+            if case_id in windows_errors
+        )
+    else:
+        for cid, argv, post_parse in error_cases:
+            cases.append({
+                "id": cid,
+                "argv": argv,
+                "columns": 80,
+                "post_parse_effects": post_parse,
+            })
+
+    if platform == "windows":
+        cases = [case for case in cases if case["id"] in {"help_root_col80", "help_profile_test_col80"} or case["id"] in windows_errors]
 
     print(f"總共要擷取 {len(cases)} 筆 CLI help/usage/error 情境...")
 
     for c in cases:
         argv = c["argv"]
         col = c["columns"]
-        rc, out, err = run_one(argv, col)
+        rc, out, err = run_one(argv, col, platform)
+        parse_rc, parse_out, parse_err = run_parser(argv, col, platform)
         # 對於 `--sock /x session list` 縮寫成功情境，計畫註記：此情境只錄 rc 與 stdout
         if c["id"] == "quirk_sock_abbrev":
             err = ""
@@ -237,6 +340,8 @@ def main() -> None:
             "native": is_native(argv),
             "post_parse_effects": c["post_parse_effects"],
         }
+        if not c["post_parse_effects"] and (parse_rc, parse_out, parse_err) != (rc, out, err):
+            record.update(parse_rc=parse_rc, parse_stdout=parse_out, parse_stderr=parse_err)
         dest_file = out_dir / f"{c['id']}.json"
         dest_file.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
 

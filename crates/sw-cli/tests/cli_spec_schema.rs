@@ -1,9 +1,178 @@
 //! 比對 root_spec 宣告與 contracts/cli_schema.json 契約的一致性（P3-T10）。
 mod common;
 
-use sw_cli::argparse::SubTarget;
+use sw_cli::argparse::{ActionKind, ActionSpec, ArgValue, Conv, SubTarget};
 use sw_cli::cli_spec::{root_spec, SpecDefaults, GROUP_ORDER};
-use sw_proto::pyjson::PyValue;
+use sw_proto::pyjson::{PyDict, PyInt, PyValue};
+
+fn object(value: &PyValue) -> &PyDict {
+    match value {
+        PyValue::Dict(value) => value,
+        _ => panic!("schema 項目必須為 Object"),
+    }
+}
+
+fn list<'a>(value: &'a PyValue, context: &str) -> &'a [PyValue] {
+    match value {
+        PyValue::List(values) => values,
+        _ => panic!("{context} 必須為 Array"),
+    }
+}
+
+fn string<'a>(value: &'a PyValue, context: &str) -> &'a str {
+    match value {
+        PyValue::Str(value) => value,
+        _ => panic!("{context} 必須為 String"),
+    }
+}
+
+fn optional_string<'a>(value: Option<&'a PyValue>, context: &str) -> Option<&'a str> {
+    value.map(|value| string(value, context))
+}
+
+fn action_kind(value: &PyValue) -> ActionKind {
+    match string(value, "action") {
+        "store" => ActionKind::Store,
+        "store_true" => ActionKind::StoreTrue,
+        "count" => ActionKind::Count,
+        "append" => ActionKind::Append,
+        "version" => ActionKind::Version,
+        other => panic!("schema action 不在 argparse 子集內：{other}"),
+    }
+}
+
+fn action_default_matches(expected: &PyValue, actual: &ArgValue, profile_dir: &str) -> bool {
+    if let PyValue::Dict(value) = expected {
+        if value.0.get("env_default") == Some(&PyValue::Str("PROFILE_DIR".to_string())) {
+            return actual == &ArgValue::Str(profile_dir.to_string());
+        }
+    }
+    match (expected, actual) {
+        (PyValue::Null, ArgValue::None) => true,
+        (PyValue::Bool(expected), ArgValue::Bool(actual)) => expected == actual,
+        (PyValue::Str(expected), ArgValue::Str(actual)) => expected == actual,
+        (PyValue::Int(PyInt::Small(expected)), ArgValue::Int(PyInt::Small(actual))) => {
+            expected == actual
+        }
+        (PyValue::Int(PyInt::Small(expected)), ArgValue::Count(actual)) => {
+            *expected as i64 == *actual
+        }
+        (PyValue::Int(PyInt::Big(expected)), ArgValue::Int(PyInt::Big(actual))) => {
+            expected == actual
+        }
+        (PyValue::Float(expected), ArgValue::Float(actual)) => expected == actual,
+        (PyValue::List(expected), ArgValue::List(actual)) => {
+            expected.len() == actual.len()
+                && expected.iter().zip(actual).all(
+                    |(expected, actual)| matches!(expected, PyValue::Str(value) if value == actual),
+                )
+        }
+        _ => false,
+    }
+}
+
+fn compare_options(
+    actions: &[ActionSpec],
+    expected_options: &[PyValue],
+    context: &str,
+    profile_dir: &str,
+) {
+    let actual: Vec<&ActionSpec> = actions
+        .iter()
+        .filter(|action| action.kind != ActionKind::Help)
+        .collect();
+    assert_eq!(
+        actual.len(),
+        expected_options.len(),
+        "{context} 的 option 數量不符；這也會攔下 Rust 單邊新增的旗標"
+    );
+    let mut matched = vec![false; actual.len()];
+
+    for expected_value in expected_options {
+        let expected = object(expected_value);
+        let expected_flags: Vec<&str> =
+            list(expected.0.get("flags").expect("option flags 缺失"), "flags")
+                .iter()
+                .map(|value| string(value, "flag"))
+                .collect();
+        let Some((index, action)) = actual
+            .iter()
+            .enumerate()
+            .find(|(_, action)| action.option_strings.as_slice() == expected_flags.as_slice())
+        else {
+            panic!("{context} 缺少或錯置 flags={expected_flags:?}");
+        };
+        assert!(
+            !matched[index],
+            "{context} 重複對應 flags={expected_flags:?}"
+        );
+        matched[index] = true;
+
+        if let Some(expected) = expected.0.get("action") {
+            assert_eq!(
+                action.kind,
+                action_kind(expected),
+                "{context} flags={expected_flags:?} action"
+            );
+        }
+        if let Some(expected) = expected.0.get("dest") {
+            if let PyValue::Str(expected) = expected {
+                assert_eq!(
+                    action.dest, expected,
+                    "{context} flags={expected_flags:?} dest"
+                );
+            }
+        }
+        if let Some(expected) = expected.0.get("type") {
+            let expected = string(expected, "type");
+            let actual = match action.conv {
+                Conv::Str => "str",
+                Conv::Int => "int",
+                Conv::Float => "float",
+            };
+            assert_eq!(actual, expected, "{context} flags={expected_flags:?} type");
+        }
+        if let Some(expected) = expected.0.get("default") {
+            assert!(
+                action_default_matches(expected, &action.default, profile_dir),
+                "{context} flags={expected_flags:?} default 不符 (got {:?}, want {expected:?})",
+                action.default
+            );
+        }
+        if let Some(expected) = expected.0.get("choices") {
+            let expected: Vec<&str> = list(expected, "choices")
+                .iter()
+                .map(|value| string(value, "choice"))
+                .collect();
+            let actual = action
+                .choices
+                .as_ref()
+                .map(|values| values.iter().copied().collect::<Vec<_>>())
+                .unwrap_or_default();
+            assert_eq!(
+                actual, expected,
+                "{context} flags={expected_flags:?} choices"
+            );
+        }
+        if let Some(expected) = expected.0.get("required") {
+            let PyValue::Bool(expected) = expected else {
+                panic!("schema required 必須為 Bool");
+            };
+            assert_eq!(
+                action.required, *expected,
+                "{context} flags={expected_flags:?} required"
+            );
+        }
+        if let Some(expected) = optional_string(expected.0.get("metavar"), "metavar") {
+            assert_eq!(
+                action.metavar,
+                Some(expected),
+                "{context} flags={expected_flags:?} metavar"
+            );
+        }
+    }
+    assert!(matched.into_iter().all(|matched| matched));
+}
 
 #[test]
 fn cli_spec_matches_schema() {
@@ -11,150 +180,113 @@ fn cli_spec_matches_schema() {
     if !path.exists() {
         panic!("P0 contracts 缺少: {}", path.display());
     }
-    let schema_text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) => panic!("P0 contracts 缺少: {}: {e}", path.display()),
-    };
+    let schema_text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("P0 contracts 缺少: {}: {error}", path.display()));
     let schema = sw_proto::pyjson::loads(&schema_text).expect("cli_schema.json 必須為合規 JSON");
-
-    let root_dict = match &schema {
-        PyValue::Dict(d) => d,
-        _ => panic!("cli_schema.json 頂層必須為 Object"),
-    };
-
+    let root = object(&schema);
     let spec = root_spec(&SpecDefaults {
         version_line: sw_proto::version::version_line(),
         profile_dir: "/golden/config/profiles".into(),
     });
+    let profile_dir = "/golden/config/profiles";
 
     assert_eq!(spec.prog, "serialwrap");
+    let globals = list(
+        root.0
+            .get("x-global-options")
+            .expect("x-global-options 缺失"),
+        "x-global-options",
+    );
+    compare_options(&spec.actions, globals, "root globals", profile_dir);
 
-    // 驗證全域選項（x-global-options）
-    let global_opts = match root_dict.get("x-global-options").expect("x-global-options 缺失") {
-        PyValue::List(l) => l,
-        _ => panic!("x-global-options 必須為 List"),
-    };
-    for opt in global_opts {
-        let opt_dict = match opt {
-            PyValue::Dict(d) => d,
-            _ => panic!("global option 必須為 Dict"),
-        };
-        let flags: Vec<&str> = match opt_dict.get("flags").expect("flags 缺失") {
-            PyValue::List(l) => l
-                .iter()
-                .map(|v| match v {
-                    PyValue::Str(s) => s.as_str(),
-                    _ => panic!("flag 必須為 Str"),
-                })
-                .collect(),
-            _ => panic!("flags 必須為 List"),
-        };
-        let matched = spec
-            .actions
-            .iter()
-            .any(|a| flags.iter().any(|&f| a.option_strings.contains(&f)));
-        assert!(matched, "全域選項 {flags:?} 未在 root_spec.actions 中定義");
-    }
-
-    // 驗證 20 群組（GROUP_ORDER 與 x-groups）
     let sub = spec.sub.as_ref().expect("root_spec 必須有 sub");
     assert_eq!(sub.dest, "cmd");
     assert!(sub.required);
+    let groups = list(root.0.get("x-groups").expect("x-groups 缺失"), "x-groups");
+    assert_eq!(
+        groups.len(),
+        GROUP_ORDER.len(),
+        "契約群組數量與 GROUP_ORDER 不符"
+    );
+    assert_eq!(
+        sub.entries.len(),
+        groups.len(),
+        "Rust-only 或缺漏的命令群組"
+    );
 
-    let groups = match root_dict.get("x-groups").expect("x-groups 缺失") {
-        PyValue::List(l) => l,
-        _ => panic!("x-groups 必須為 List"),
-    };
-    assert_eq!(groups.len(), GROUP_ORDER.len(), "群組數量必須為 20");
-
-    for (idx, grp_val) in groups.iter().enumerate() {
-        let grp_dict = match grp_val {
-            PyValue::Dict(d) => d,
-            _ => panic!("group 必須為 Dict"),
-        };
-        let grp_name = match grp_dict.get("name").expect("group name 缺失") {
-            PyValue::Str(s) => s.as_str(),
-            _ => panic!("name 必須為 Str"),
-        };
-        assert_eq!(
-            grp_name, GROUP_ORDER[idx],
-            "群組順序第 {idx} 項 {grp_name} 與 GROUP_ORDER 不符"
-        );
-
-        let stage = match grp_dict.get("stage").expect("stage 缺失") {
-            PyValue::Str(s) => s.as_str(),
-            _ => panic!("stage 必須為 Str"),
-        };
-
+    for (index, group_value) in groups.iter().enumerate() {
+        let group = object(group_value);
+        let name = string(group.0.get("name").expect("group name 缺失"), "group name");
+        assert_eq!(name, GROUP_ORDER[index], "群組順序第 {index} 項不符");
+        let stage = string(group.0.get("stage").expect("stage 缺失"), "stage");
         let entry = sub
             .entries
             .iter()
-            .find(|e| e.name == grp_name)
-            .unwrap_or_else(|| panic!("群組 {grp_name} 未在 sub.entries 中找到"));
+            .find(|entry| entry.name == name)
+            .unwrap_or_else(|| panic!("群組 {name} 未在 sub.entries 中找到"));
 
         if stage == "delegate-1a" {
             assert!(
                 matches!(entry.target, SubTarget::Delegated),
-                "委派群組 {grp_name} 必須為 SubTarget::Delegated"
+                "委派群組 {name} 必須為 Delegated"
             );
-        } else if stage == "rust-1a" {
-            let grp_spec = match &entry.target {
-                SubTarget::Native(s) => s.as_ref(),
-                _ => panic!("原生群組 {grp_name} 必須為 SubTarget::Native"),
+            continue;
+        }
+        assert_eq!(stage, "rust-1a", "未知 CLI stage：{stage}");
+        let group_spec = match &entry.target {
+            SubTarget::Native(parser) => parser.as_ref(),
+            SubTarget::Delegated => panic!("原生群組 {name} 必須為 Native"),
+        };
+        let group_options = list(
+            group.0.get("options").expect("group options 缺失"),
+            "group options",
+        );
+        compare_options(
+            &group_spec.actions,
+            group_options,
+            &format!("group {name}"),
+            profile_dir,
+        );
+
+        let expected_commands = match group.0.get("subcommands") {
+            Some(PyValue::List(values)) => values.as_slice(),
+            Some(PyValue::Null) | None => &[],
+            Some(_) => panic!("subcommands 必須為 Array 或 null"),
+        };
+        let actual_commands = group_spec
+            .sub
+            .as_ref()
+            .map(|sub| sub.entries.as_slice())
+            .unwrap_or_default();
+        assert_eq!(
+            actual_commands.len(),
+            expected_commands.len(),
+            "group {name} 子命令數量不符"
+        );
+        for (command_value, command_entry) in expected_commands.iter().zip(actual_commands) {
+            let command = object(command_value);
+            let command_name = string(
+                command.0.get("name").expect("subcommand name 缺失"),
+                "subcommand name",
+            );
+            assert_eq!(
+                command_name, command_entry.name,
+                "group {name} 子命令順序或名稱不符"
+            );
+            let command_spec = match &command_entry.target {
+                SubTarget::Native(parser) => parser.as_ref(),
+                SubTarget::Delegated => panic!("子命令 {name} {command_name} 不得為委派"),
             };
-
-            // 原生群組的子命令驗證
-            let subcmds = match grp_dict.get("subcommands") {
-                Some(PyValue::List(l)) => l.as_slice(),
-                _ => &[],
-            };
-
-            if !subcmds.is_empty() {
-                let grp_sub = grp_spec.sub.as_ref().unwrap_or_else(|| {
-                    panic!("原生群組 {grp_name} 宣告了子命令但 grp_spec.sub 為 None")
-                });
-                for subcmd_val in subcmds {
-                    let subcmd_dict = match subcmd_val {
-                        PyValue::Dict(d) => d,
-                        _ => panic!("subcommand 必須為 Dict"),
-                    };
-                    let subcmd_name = match subcmd_dict.get("name").expect("subcmd name 缺失") {
-                        PyValue::Str(s) => s.as_str(),
-                        _ => panic!("subcmd name 必須為 Str"),
-                    };
-                    let sub_entry = grp_sub
-                        .entries
-                        .iter()
-                        .find(|e| e.name == subcmd_name)
-                        .unwrap_or_else(|| {
-                            panic!("群組 {grp_name} 缺少子命令 {subcmd_name}")
-                        });
-
-                    let cmd_spec = match &sub_entry.target {
-                        SubTarget::Native(s) => s.as_ref(),
-                        _ => panic!("子命令 {grp_name} {subcmd_name} 必須為 SubTarget::Native"),
-                    };
-
-                    // 比對子命令選項
-                    if let Some(PyValue::List(opts)) = subcmd_dict.get("options") {
-                        for opt_val in opts {
-                            let opt_d = match opt_val {
-                                PyValue::Dict(d) => d,
-                                _ => panic!("option 必須為 Dict"),
-                            };
-                            let dest = match opt_d.get("dest") {
-                                Some(PyValue::Str(s)) => s.as_str(),
-                                _ => continue,
-                            };
-                            let has_action = cmd_spec.actions.iter().any(|a| a.dest == dest);
-                            assert!(
-                                has_action,
-                                "子命令 {grp_name} {subcmd_name} 缺少 dest={dest} 的 action"
-                            );
-                        }
-                    }
-                }
-            }
+            let options = list(
+                command.0.get("options").expect("subcommand options 缺失"),
+                "subcommand options",
+            );
+            compare_options(
+                command_spec.actions.as_slice(),
+                options,
+                &format!("{name} {command_name}"),
+                profile_dir,
+            );
         }
     }
 }

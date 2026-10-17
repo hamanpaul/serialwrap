@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "stream",
+    "tail",
+    "--help"
+  ],
+  "columns": 90,
+  "rc": 0,
+  "stdout": "usage: serialwrap stream tail [-h] [--selector SELECTOR] [--com COM]\n                              [--from-seq FROM_SEQ] [--limit LIMIT]\n\noptions:\n  -h, --help           show this help message and exit\n  --selector SELECTOR\n  --com COM\n  --from-seq FROM_SEQ\n  --limit LIMIT\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}
