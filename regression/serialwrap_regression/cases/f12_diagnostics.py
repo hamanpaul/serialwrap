@@ -9,9 +9,13 @@ importlib.metadata` 才問得到 daemon 版本；preflight 的 `daemon_version_p
 """
 from __future__ import annotations
 
+import dataclasses
+import json
 import os
 import random
+import time
 
+from realhw import wal_oracle
 from realhw.harness import CaseResult
 from realhw.preflight import parse_version
 
@@ -87,8 +91,8 @@ def f12_version_reported_consistent(ctx):
         "那其實是 agent on-demand capture 目錄）可能完全不同；舊版 doctor 也完全沒有"
         "任何一項能揭露 daemon 實際生效的 WAL 路徑，只能用猜的。",
         "回歸即代表 doctor 又漏了 wal_dir 這項，或 wal_path 回報的其實是死路徑——"
-        "daemon 已停止寫入卻無從得知；mtime 前後比對是這條 case 唯一能在真機上驗到"
-        "的『daemon 是否真的持續在寫』活體事實，pytest 的短命 throwaway daemon 驗不出。",
+        "daemon 已停止寫入卻無從得知；以讀回 marker 紀錄驗證 daemon 持續寫入，"
+        "pytest 的短命 throwaway daemon 驗不出。",
     ),
 )
 def f12_wal_path_live(ctx):
@@ -111,7 +115,16 @@ def f12_wal_path_live(ctx):
         return CaseResult("FAIL", reason="doctor 報告缺少 wal_dir 檢查項（#148 回歸）",
                           category="test", reason_code="doctor_wal_dir_check_missing")
 
-    mtime_before = os.path.getmtime(wal_path)
+    try:
+        cur = wal_oracle.open_cursor(wal_path)
+    except OSError as exc:
+        return CaseResult(
+            "FAIL",
+            reason=f"WAL 無法開啟游標／讀取（{exc}）：wal_path={wal_path}",
+            category="environment",
+            reason_code="wal_unreadable",
+        )
+
     com = ctx.cfg["boards"][0]["com"]
     marker = f"MARKER_{random.randint(100000, 999999)}"
     cmd = ctx.sw.submit_and_wait(com, f"echo {marker}")
@@ -122,13 +135,28 @@ def f12_wal_path_live(ctx):
             reason=f"submit echo 未正常完成（status={cmd.get('status')}），無法驗證 WAL 存活",
             category="environment", reason_code="submit_precondition_failed",
         )
-    mtime_after = os.path.getmtime(wal_path)
-    ctx.note("wal-mtime.txt", f"wal_path={wal_path}\nbefore={mtime_before}\nafter={mtime_after}")
-    if mtime_after <= mtime_before:
-        return CaseResult(
-            "FAIL",
-            reason=f"送出命令後 wal_path mtime 未前進（before={mtime_before} after={mtime_after}），"
-            "daemon 疑似已停止寫入該路徑",
-            category="test", reason_code="wal_not_advancing",
-        )
-    return CaseResult("PASS")
+
+    cmd_id = cmd.get("cmd_id")
+    timeout_s = ctx.cfg.get("timeouts", {}).get("wal_oracle_s", 10.0)
+    res = wal_oracle.wait_for_marker(
+        cur,
+        marker=marker.encode("utf-8"),
+        cmd_id=cmd_id,
+        timeout_s=timeout_s,
+        sleep=time.sleep,
+    )
+    ctx.note(
+        "wal-oracle.json",
+        json.dumps(dataclasses.asdict(res), sort_keys=True, indent=2, ensure_ascii=False),
+    )
+    if res.ok:
+        return CaseResult("PASS")
+
+    category = wal_oracle.reason_category(res.reason_code)
+    return CaseResult(
+        "FAIL",
+        reason=f"WAL oracle 驗證失敗（{res.reason_code}）",
+        category=category,
+        reason_code=res.reason_code,
+        evidence={"wal-oracle.json": "wal-oracle.json"},
+    )

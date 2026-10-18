@@ -450,3 +450,218 @@ def test_native_reader_does_not_block_rotate(tmp_path):
         stop.set()
         t.join(timeout=60)
     assert not errors
+
+
+# ---------------------------------------------------------------------------
+# 審閱追加回歸測試（Reviewer A 缺陷 1～5、7 與 Reviewer B 缺陷 1～3）
+# ---------------------------------------------------------------------------
+
+@pytest.mark.core_portable
+def test_reset_allowed_when_cursor_archive_has_no_new_records(tmp_path):
+    """Reviewer A 2a / B 1：cursor 所在歸檔在 offset 後無新增紀錄時，合法 reset 仍須 PASS。"""
+    wo = _oracle()
+    p = tmp_path / "raw.wal.ndjson"
+    _append(p, _rec(1, "RX", b"boot"), _rec(2, "RX", b"ready"))
+    cur = wo.open_cursor(str(p))
+    os.replace(p, tmp_path / ARCH1)  # reset：歸檔在游標之後無新紀錄
+    _append(p, _rec(1, "RX", b"boot2"), _rec(2, "TX", b"echo MARKER_RS0\n", "crs0"))
+    r = _wait(wo, cur, marker=b"MARKER_RS0", cmd_id="crs0", allow_reset=True)
+    assert r.ok is True and r.reason_code == "ok"
+
+
+@pytest.mark.core_portable
+def test_rotate_with_seq_reset_fails_when_cursor_archive_has_no_new_records(tmp_path):
+    """Reviewer A 2b / B 1：cursor 所在歸檔無新紀錄時，錯誤的 rotate seq 重置須回傳 discontinuous。"""
+    wo = _oracle()
+    p = tmp_path / "raw.wal.ndjson"
+    _append(p, _rec(1, "RX", b"boot"), _rec(2, "RX", b"ready"))
+    cur = wo.open_cursor(str(p))
+    os.replace(p, tmp_path / ARCH1)  # rotate：無新紀錄
+    _append(p, _rec(1, "RX", b"boot2"), _rec(2, "TX", b"echo MARKER_RT0\n", "crt0"))
+    r = _wait(wo, cur, marker=b"MARKER_RT0", cmd_id="crt0", allow_reset=False)
+    assert r.ok is False and r.reason_code == "wal_seq_discontinuous"
+
+
+@pytest.mark.core_portable
+def test_missing_intermediate_archive_when_cursor_archive_has_no_new_records(tmp_path):
+    """Reviewer A 2c / B 1：首個歸檔無新紀錄但中間歸檔遺失時，current 檔有 marker 亦不得 PASS。"""
+    wo = _oracle()
+    p = tmp_path / "raw.wal.ndjson"
+    _append(p, _rec(1, "RX", b"boot"))
+    cur = wo.open_cursor(str(p))
+    os.replace(p, tmp_path / ARCH1)  # rotate 1（ARCH1 無新紀錄）
+    _append(p, _rec(2, "RX", b"mid"))
+    os.replace(p, tmp_path / ARCH2)  # rotate 2
+    (tmp_path / ARCH2).unlink()  # 刪除中間歸檔
+    _append(p, _rec(3, "TX", b"echo MARKER_S2\n", "cs2"))  # current 檔含 marker
+    r = _wait(wo, cur, marker=b"MARKER_S2", cmd_id="cs2")
+    assert r.ok is False and r.reason_code == "wal_evidence_incomplete"
+
+
+@pytest.mark.core_portable
+def test_archive_missing_with_reset_is_incomplete_evidence(tmp_path):
+    """Reviewer A 2d：歸檔遺失又伴隨 seq 重置時，判定須為 wal_evidence_incomplete（環境問題）。"""
+    wo = _oracle()
+    p = tmp_path / "raw.wal.ndjson"
+    _append(p, _rec(1, "RX", b"boot"))
+    cur = wo.open_cursor(str(p))
+    os.replace(p, tmp_path / ARCH1)
+    (tmp_path / ARCH1).unlink()  # 歸檔消失
+    _append(p, _rec(1, "RX", b"boot2"), _rec(2, "TX", b"echo MARKER_AMR\n", "camr"))
+    r = _wait(wo, cur, marker=b"MARKER_AMR", cmd_id="camr", allow_reset=True)
+    assert r.ok is False and r.reason_code == "wal_evidence_incomplete"
+
+
+@pytest.mark.core_portable
+def test_archive_sorting_handles_numeric_suffix_order(tmp_path):
+    """Reviewer A 3i / B 3：同秒歸檔後綴須依 (時間, 數字後綴) 升冪排序（.2 < .9 < .10）。"""
+    wo = _oracle()
+    p = tmp_path / "raw.wal.ndjson"
+    _append(p, _rec(1, "RX", b"init"))
+    cur = wo.open_cursor(str(p))
+
+    # 模擬同秒內連續輪替，產生 .2、.9、.10 三個歸檔
+    arch_base = "raw.wal.ndjson.20261015-000000"
+    os.replace(p, tmp_path / arch_base)
+    _append(p, _rec(2, "RX", b"in_2"))
+    os.replace(p, tmp_path / f"{arch_base}.2")
+    _append(p, _rec(3, "RX", b"in_9"))
+    os.replace(p, tmp_path / f"{arch_base}.9")
+    _append(p, _rec(4, "RX", b"in_10"))
+    os.replace(p, tmp_path / f"{arch_base}.10")
+    _append(p, _rec(5, "TX", b"echo MARKER_NUM\n", "cnum"))
+
+    r = _wait(wo, cur, marker=b"MARKER_NUM", cmd_id="cnum")
+    assert r.ok is True and r.reason_code == "ok"
+    assert r.diagnostics["archives_scanned"] == [
+        arch_base,
+        f"{arch_base}.2",
+        f"{arch_base}.9",
+        f"{arch_base}.10",
+    ]
+
+
+@pytest.mark.core_portable
+def test_archive_selection_ignores_non_archive_siblings(tmp_path):
+    """Reviewer A 3ii：忽略同目錄非標準歸檔後綴之旁系檔案（.lock、.bak、.tmp）。"""
+    wo = _oracle()
+    p = tmp_path / "raw.wal.ndjson"
+    _append(p, _rec(1, "RX", b"init"))
+    cur = wo.open_cursor(str(p))
+
+    os.replace(p, tmp_path / ARCH1)
+    # 建立旁系檔案
+    (tmp_path / "raw.wal.ndjson.lock").write_text("dummy lock content", encoding="utf-8")
+    (tmp_path / "raw.wal.ndjson.bak").write_text("dummy bak content", encoding="utf-8")
+    _append(p, _rec(2, "TX", b"echo MARKER_SIB\n", "csib"))
+
+    r = _wait(wo, cur, marker=b"MARKER_SIB", cmd_id="csib")
+    assert r.ok is True and r.reason_code == "ok"
+    assert r.diagnostics["archives_scanned"] == [ARCH1]
+
+
+@pytest.mark.core_portable
+def test_cursor_snapshot_consistency_with_racing_appender(tmp_path):
+    """Reviewer A 1 / B 2：open_cursor 時寫入者在 stat 與 read 間追加紀錄，offset 與 last_seq 須一致。"""
+    wo = _oracle()
+    p = tmp_path / "raw.wal.ndjson"
+    _append(p, _rec(1, "RX", b"boot"))
+
+    orig_read = wo.read_shared
+    appended = {"done": False}
+
+    def racing_read(path: str, offset: int) -> bytes:
+        if not appended["done"]:
+            appended["done"] = True
+            _append(Path(path), _rec(2, "RX", b"appended mid-flight"))
+        return orig_read(path, offset)
+
+    wo.read_shared = racing_read
+    try:
+        cur = wo.open_cursor(str(p))
+    finally:
+        wo.read_shared = orig_read
+
+    # offset 必須與快照資料長度對齊，last_seq 為快照最後一筆 seq (2)
+    assert cur.last_seq == 2
+    _append(p, _rec(3, "TX", b"echo MARKER_RACE\n", "crace"))
+    r = _wait(wo, cur, marker=b"MARKER_RACE", cmd_id="crace")
+    assert r.ok is True and r.reason_code == "ok"
+
+
+@pytest.mark.core_portable
+def test_cursor_offset_mid_line_drops_partial_fragment(tmp_path):
+    """Reviewer A 1：游標落在行中時，丢棄前一行殘段，不誤判 wal_record_corrupt。"""
+    wo = _oracle()
+    p = tmp_path / "raw.wal.ndjson"
+    _append(p, _rec(1, "RX", b"boot"))
+    line = json.dumps(_rec(2, "RX", b"inflight"), sort_keys=True, separators=(",", ":"))
+    with open(p, "a", encoding="utf-8") as fp:
+        fp.write(line[:30])  # 半行寫入
+    cur = wo.open_cursor(str(p))
+    with open(p, "a", encoding="utf-8") as fp:
+        fp.write(line[30:] + "\n")  # 補齊
+    _append(p, _rec(3, "TX", b"echo MARKER_MID\n", "cmid"))
+    r = _wait(wo, cur, marker=b"MARKER_MID", cmd_id="cmid")
+    assert r.ok is True and r.reason_code == "ok"
+
+
+@pytest.mark.core_portable
+def test_unlink_and_recreate_same_inode_is_incomplete_evidence(tmp_path):
+    """Reviewer A 4：external unlink 後重建若重用同 inode，偵測內容改變並回報 evidence_incomplete。"""
+    wo = _oracle()
+    p = tmp_path / "raw.wal.ndjson"
+    _append(p, _rec(1, "RX", b"boot1"), _rec(2, "RX", b"boot2"))
+    cur = wo.open_cursor(str(p))
+
+    # 模擬外部刪除後重建物件：內容不同但模擬相同 identity
+    p.unlink()
+    _append(p, _rec(1, "RX", b"recreated_unrelated_content"), _rec(2, "TX", b"echo MARKER_UNL\n", "cunl"))
+
+    r = _wait(wo, cur, marker=b"MARKER_UNL", cmd_id="cunl")
+    assert r.ok is False and r.reason_code == "wal_evidence_incomplete"
+
+
+@pytest.mark.core_portable
+def test_mtime_before_captured_at_open_cursor(tmp_path):
+    """Reviewer A 5：diagnostics 中的 mtime_before 須在 open_cursor 時取樣。"""
+    wo = _oracle()
+    p = tmp_path / "raw.wal.ndjson"
+    _append(p, _rec(1, "RX", b"x"))
+    cur = wo.open_cursor(str(p))
+    assert cur.mtime_ns is not None
+
+    time.sleep(0.01)
+    _append(p, _rec(2, "TX", b"echo MARKER_MT\n", "cmt"))
+    r = _wait(wo, cur, marker=b"MARKER_MT", cmd_id="cmt")
+    assert r.ok is True
+    assert r.diagnostics["mtime_before"] <= r.diagnostics["mtime_after"]
+
+
+@pytest.mark.core_portable
+def test_transient_read_error_retries_until_deadline(tmp_path):
+    """Reviewer A 7：暫態讀取失敗（如輪替瞬間之 FileNotFoundError）在期限內重試不致提早放棄。"""
+    wo = _oracle()
+    p = tmp_path / "raw.wal.ndjson"
+    _append(p, _rec(1, "RX", b"init"))
+    cur = wo.open_cursor(str(p))
+    _append(p, _rec(2, "TX", b"echo MARKER_TRANS\n", "ctrans"))
+
+    orig_read = wo.read_shared
+    attempts = {"count": 0}
+
+    def flaky_read(path: str, offset: int) -> bytes:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise FileNotFoundError(2, "transient file rotation race", path)
+        return orig_read(path, offset)
+
+    wo.read_shared = flaky_read
+    try:
+        r = _wait(wo, cur, marker=b"MARKER_TRANS", cmd_id="ctrans", timeout_s=5.0)
+    finally:
+        wo.read_shared = orig_read
+
+    assert r.ok is True and r.reason_code == "ok"
+    assert attempts["count"] >= 2
+

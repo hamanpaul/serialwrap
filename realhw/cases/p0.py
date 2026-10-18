@@ -1,10 +1,14 @@
 """P0 煙霧（~15 分鐘）。全部非破壞性。"""
 from __future__ import annotations
 
+import dataclasses
+import json
+import os
 import random
 import time
 from pathlib import Path
 
+from .. import wal_oracle
 from ..drivers import strip_ansi
 from ..harness import Case, CaseResult, register
 
@@ -126,21 +130,65 @@ def p0_blog_clean(ctx):
 
 
 @_case("p0-wal-live", "WAL 活性與位置",
-       hints=("live WAL 一律在 ~/.local/state/serialwrap/wal（systemd 不繼承 shell env）；勿讀 stale ~/b-log/raw.*",))
+       hints=("依 daemon status.wal_path 讀取 live WAL 並以 marker／CRC 驗證活性；勿依賴 mtime 或寫死路徑",))
 def p0_wal_live(ctx):
-    mirror = Path.home() / ".local/state/serialwrap/wal/raw.mirror.log"
-    before = mirror.stat().st_mtime if mirror.exists() else 0
+    status = ctx.sw.run("daemon", "status")
+    ctx.note("daemon-status.json", str(status))
+    wal_path = status.get("wal_path")
+    if not (isinstance(wal_path, str) and wal_path.strip()):
+        return CaseResult("FAIL", reason="daemon status 未回報 wal_path",
+                          category="test", reason_code="wal_path_missing")
+    if not os.path.exists(wal_path):
+        return CaseResult("FAIL", reason=f"wal_path={wal_path} 指向不存在的檔案",
+                          category="test", reason_code="wal_path_not_found")
+
+    try:
+        cur = wal_oracle.open_cursor(wal_path)
+    except OSError as exc:
+        return CaseResult(
+            "FAIL",
+            reason=f"WAL 無法開啟游標／讀取（{exc}）：wal_path={wal_path}",
+            category="environment",
+            reason_code="wal_unreadable",
+        )
+
     marker = f"P0WAL_{random.randint(10000, 99999)}"
-    ctx.sw.submit_and_wait("COM0", f"echo {marker}")
-    time.sleep(2)
-    if not mirror.exists() or mirror.stat().st_mtime <= before:
-        return CaseResult("FAIL", reason="live WAL mirror mtime 未跳動",
-                          category="test", reason_code="wal_mirror_stale")
-    tail = mirror.read_text(errors="replace")[-8000:]
-    if marker not in tail:
-        return CaseResult("FAIL", reason="WAL mirror 未見命令 marker",
-                          category="test", reason_code="wal_marker_missing")
-    return CaseResult("PASS")
+    boards = ctx.cfg.get("boards") or []
+    com = boards[0]["com"] if boards else "COM0"
+    cmd = ctx.sw.submit_and_wait(com, f"echo {marker}")
+    ctx.note("submit.json", str(cmd))
+    if (cmd.get("status") or "") != "done":
+        return CaseResult(
+            "FAIL",
+            reason=f"submit 失敗（status={cmd.get('status')}）",
+            category="environment",
+            reason_code="submit_precondition_failed",
+        )
+
+    cmd_id = cmd.get("cmd_id")
+    timeout_s = ctx.cfg.get("timeouts", {}).get("wal_oracle_s", 10.0)
+    res = wal_oracle.wait_for_marker(
+        cur,
+        marker=marker.encode("utf-8"),
+        cmd_id=cmd_id,
+        timeout_s=timeout_s,
+        sleep=time.sleep,
+    )
+    ctx.note(
+        "wal-oracle.json",
+        json.dumps(dataclasses.asdict(res), sort_keys=True, indent=2, ensure_ascii=False),
+    )
+    if res.ok:
+        return CaseResult("PASS")
+
+    category = wal_oracle.reason_category(res.reason_code)
+    return CaseResult(
+        "FAIL",
+        reason=f"WAL oracle 驗證失敗（{res.reason_code}）",
+        category=category,
+        reason_code=res.reason_code,
+        evidence={"wal-oracle.json": "wal-oracle.json"},
+    )
 
 
 @_case("p0-multiopen", "無多開（multi_open 假、無外來 tty 持有者）")

@@ -102,7 +102,7 @@ sudo -n systemctl restart serialwrap            # 最後手段（會重偵測所
 | `p0-clear-reattach` | session clear 自動恢復 | `serialwrap session clear --selector COM0`；輪詢 `session list` | `ready_wait_s`（180s）內回 READY | clear 沿用舊 profile，不會改偵測 |
 | `p0-selftest` | self-test 基本判讀 | `serialwrap session self-test --selector COM0` | `probe_ok=true`、`classification==OK` | 全譜情境見 P2 self-test 表 |
 | `p0-blog-clean` | b-log 純淨度（ANSI 回歸） | tmux 開關一次 `serialwrap-minicom COM0`→檢查新 `~/b-log/mini_COM0_*.log` | 無 `Script started` 標頭、ESC(0x1b) 計數＝0 | 回歸根因＝script transcript 模式（6df17a5）；預設應為 minicom 原生 `-C`（PR#98）；繞過用 `MINICOM_CAPTURE_MODE=minicom` |
-| `p0-wal-live` | WAL 活性與位置 | 戳 `echo X`→檢查 `~/.local/state/serialwrap/wal/raw.mirror.log` mtime＋grep marker | mtime 跳動、tail 含 marker | live WAL 一律在 XDG state（systemd 不繼承 shell env）；勿讀 stale `~/b-log/raw.*` 或測試洩漏的 `/tmp/sw-wal-*` |
+| `p0-wal-live` | WAL 活性與位置 | 依 `daemon status.wal_path` 讀取 live WAL 並以 marker／CRC 驗證活性 | 讀回含 marker 之新增 WAL 紀錄、驗證 seq 與 CRC | live WAL 一律在 XDG state（systemd 不繼承 shell env）；以 seq／marker／CRC oracle 判定，勿讀 stale mirror log 或依賴 mtime |
 | `p0-multiopen` | 無多開（two-reader） | `serialwrap daemon status` | `multi_open` 假、`foreign_holders` 無「自身 pid 以外」的 pid | `foreign_holders` 健康的單一 daemon 一定含**自身 pid**（非空）；真正 two-reader＝`multi_open` 為真或出現他 pid |
 
 ---

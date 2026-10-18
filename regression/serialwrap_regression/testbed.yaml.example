@@ -16,3 +16,4 @@ timeouts:
   ready_wait_s: 180
   boot_wait_s: 240
   cmd_timeout_s: 12
+  wal_oracle_s: 10.0
