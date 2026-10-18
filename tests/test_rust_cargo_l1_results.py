@@ -1,0 +1,285 @@
+"""P3-T17：`scripts/rust/cargo_l1_results.py` 的逐案結果轉換（R5-F3，`l1-results.v1`）。
+
+以假 cargo、假 libtest 可執行檔與假 runner（`tests/fixtures/libtest_sample/`）驅動，不需真 cargo。
+判定一律以 P2 Task 13 的唯一實作 `tests/acceptance/l1_judge.py` 為準（依路徑載入，不另寫判定）。
+每個測試先斷言腳本存在（紅燈原因為「尚未實作」），再斷言報告內容，最後才呼叫 P2 判定。
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from types import ModuleType
+from typing import Any
+
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.process_rpc]
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / "scripts" / "rust" / "cargo_l1_results.py"
+FIXTURE = ROOT / "tests" / "fixtures" / "libtest_sample"
+L1_JUDGE = ROOT / "tests" / "acceptance" / "l1_judge.py"
+ACCEPTANCE = ROOT / "tests" / "acceptance"
+CRATE = "sw-proto"
+TARGET = "pyjson_golden"
+A = f"cargo:{CRATE}::{TARGET}::a"
+B = f"cargo:{CRATE}::{TARGET}::b"
+C = f"cargo:{CRATE}::{TARGET}::cap_posix_pty__c"
+
+
+def _assert_script() -> None:
+    assert SCRIPT.is_file(), "scripts/rust/cargo_l1_results.py 尚未實作（P3-T17 Step 4）"
+
+
+def _load_judge() -> ModuleType:
+    assert L1_JUDGE.is_file(), (
+        "tests/acceptance/l1_judge.py 不存在：P2 Task 13 尚未合併到本分支（前置缺口，見 plan §0.2；不得自寫判定代替）"
+    )
+    spec = importlib.util.spec_from_file_location("l1_judge", L1_JUDGE)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _install(src_name: str, dst: Path) -> Path:
+    """把 fixtures 內的假工具複製到 dst 並加上執行權限（不依賴 git 的 exec bit）。"""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(FIXTURE / src_name, dst)
+    dst.chmod(0o755)
+    return dst
+
+
+def _write_exe(exe_dir: Path, name: str, *, run_out: str, exit_code: int = 0) -> Path:
+    exe_dir.mkdir(parents=True, exist_ok=True)
+    exe = _install("fake_libtest.sh", exe_dir / name)
+    shutil.copyfile(FIXTURE / "list_all.txt", exe_dir / "list_all.txt")
+    shutil.copyfile(FIXTURE / "list_ignored.txt", exe_dir / "list_ignored.txt")
+    shutil.copyfile(FIXTURE / run_out, exe_dir / "run_out.txt")
+    (exe_dir / "exit_code").write_text(str(exit_code), encoding="utf-8")
+    return exe
+
+
+def _artifact(exe: Path, target: str, *, package: str = CRATE) -> dict[str, Any]:
+    """與 `cargo test --no-run --message-format=json` 的 compiler-artifact 形狀一致（test target）。"""
+    return {
+        "reason": "compiler-artifact",
+        "package_id": f"path+file:///work/crates/{package}#{package}@0.1.0",
+        "target": {
+            "kind": ["test"],
+            "crate_types": ["bin"],
+            "name": target,
+            "src_path": f"/work/crates/{package}/tests/{target}.rs",
+            "edition": "2021",
+            "doc": False,
+            "doctest": False,
+            "test": True,
+        },
+        "profile": {"opt_level": "0", "debuginfo": 2, "debug_assertions": True, "overflow_checks": True, "test": True},
+        "features": [],
+        "filenames": [str(exe)],
+        "executable": str(exe),
+        "fresh": False,
+    }
+
+
+def _lib_artifact(package: str = CRATE) -> dict[str, Any]:
+    """lib target 沒有 test executable，腳本必須略過（不得算進 collected）。"""
+    return {
+        "reason": "compiler-artifact",
+        "package_id": f"path+file:///work/crates/{package}#{package}@0.1.0",
+        "target": {
+            "kind": ["lib"],
+            "crate_types": ["lib"],
+            "name": package.replace("-", "_"),
+            "src_path": f"/work/crates/{package}/src/lib.rs",
+            "edition": "2021",
+            "doc": True,
+            "doctest": True,
+            "test": True,
+        },
+        "profile": {"opt_level": "0", "debuginfo": 2, "debug_assertions": True, "overflow_checks": True, "test": False},
+        "features": [],
+        "filenames": [f"/work/target/debug/lib{package.replace('-', '_')}.rlib"],
+        "executable": None,
+        "fresh": False,
+    }
+
+
+def _write_cargo(bin_dir: Path, artifacts: list[dict[str, Any]], *, exit_code: int = 0) -> None:
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    _install("fake_cargo.sh", bin_dir / "cargo")
+    lines = [json.dumps(a) for a in artifacts]
+    lines.append(json.dumps({"reason": "build-finished", "success": exit_code == 0}))
+    (bin_dir / "cargo_no_run.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (bin_dir / "cargo_exit").write_text(str(exit_code), encoding="utf-8")
+
+
+def _run(cwd: Path, bin_dir: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+    env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"}
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), *args, "--", "--workspace"],
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _report(out: Path, r: subprocess.CompletedProcess[str]) -> dict[str, Any]:
+    assert out.is_file(), f"cargo_l1_results.py 未寫出報告；stderr={r.stderr[-2000:]}"
+    return json.loads(out.read_text(encoding="utf-8"))
+
+
+def _rows(rep: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {row["nodeid"]: row for row in rep["results"]}
+
+
+@pytest.mark.process_rpc
+def test_collected_from_list_not_from_run(tmp_path: Path) -> None:
+    _assert_script()
+    exe = _write_exe(tmp_path / "exe_a", TARGET, run_out="run_a_ok.txt")
+    bin_dir = tmp_path / "bin"
+    _write_cargo(bin_dir, [_artifact(exe, TARGET)])
+    out = tmp_path / "l1.json"
+    r = _run(tmp_path, bin_dir, ["--platform", "linux", "--out", str(out)])
+    rep = _report(out, r)
+    assert rep["format"] == "l1-results.v1" and rep["platform"] == "linux" and rep["finished"] is True
+    assert sorted(rep["collected"]) == sorted([A, B, C])          # 來自 --list（含 ignored 的 cap_*）
+    assert [row["nodeid"] for row in rep["results"]] == [A]        # 來自執行輸出，只有 `test a ... ok`
+    res = _load_judge().judge(rep, [A, B], platform="linux")
+    assert res["verdict"] == "INSUFFICIENT"
+    assert res["not_run"] == [B]
+
+
+@pytest.mark.process_rpc
+def test_ignored_cap_is_skipped_not_pass(tmp_path: Path) -> None:
+    _assert_script()
+    exe = _write_exe(tmp_path / "exe_a", TARGET, run_out="run_ignored_cap.txt")
+    bin_dir = tmp_path / "bin"
+    _write_cargo(bin_dir, [_artifact(exe, TARGET)])
+    out = tmp_path / "l1.json"
+    r = _run(tmp_path, bin_dir, ["--platform", "linux", "--out", str(out)])
+    rep = _report(out, r)
+    row = _rows(rep)[C]
+    assert row["outcome"] == "skipped"
+    assert row["skip_kind"] == "capability"                        # cap_posix_pty__ 前綴
+    res = _load_judge().judge(rep, [A, C], platform="linux")
+    assert res["verdict"] == "INSUFFICIENT"
+    assert C in [x["nodeid"] for x in res["skipped_required"]]
+
+
+@pytest.mark.process_rpc
+def test_failed_and_exit_code_recorded(tmp_path: Path) -> None:
+    _assert_script()
+    exe = _write_exe(tmp_path / "exe_a", TARGET, run_out="run_b_failed.txt", exit_code=101)
+    bin_dir = tmp_path / "bin"
+    _write_cargo(bin_dir, [_artifact(exe, TARGET)])
+    out = tmp_path / "l1.json"
+    r = _run(tmp_path, bin_dir, ["--platform", "linux", "--out", str(out)])
+    rep = _report(out, r)
+    assert _rows(rep)[B]["outcome"] == "failed"
+    assert rep["exit_code"] == 101
+    assert rep["finished"] is True
+    assert _load_judge().judge(rep, [A, B], platform="linux")["verdict"] == "FAIL"
+
+
+@pytest.mark.process_rpc
+def test_build_failure_is_not_success(tmp_path: Path) -> None:
+    _assert_script()
+    bin_dir = tmp_path / "bin"
+    _write_cargo(bin_dir, [_lib_artifact()], exit_code=101)        # 編譯失敗：沒有任何 test executable
+    out = tmp_path / "l1.json"
+    r = _run(tmp_path, bin_dir, ["--platform", "linux", "--out", str(out)])
+    rep = _report(out, r)
+    assert rep["finished"] is False
+    assert rep["exit_code"] == 101
+    assert rep["results"] == []
+    assert _load_judge().judge(rep, [A], platform="linux")["verdict"] == "INSUFFICIENT"
+
+
+@pytest.mark.process_rpc
+def test_timeout_marks_unfinished(tmp_path: Path) -> None:
+    _assert_script()
+    exe_a = _write_exe(tmp_path / "exe_a", TARGET, run_out="run_a_ok.txt")
+    exe_t = _write_exe(tmp_path / "exe_timeout", "pycompat_golden", run_out="run_a_ok.txt")
+    bin_dir = tmp_path / "bin"
+    _write_cargo(bin_dir, [_artifact(exe_a, TARGET), _artifact(exe_t, "pycompat_golden")])
+    runner = _install("fake_runner.sh", bin_dir / "fake_runner.sh")  # 第二支 exe 回 124
+    out = tmp_path / "l1.json"
+    r = _run(tmp_path, bin_dir, ["--platform", "windows", "--runner", str(runner), "--out", str(out)])
+    rep = _report(out, r)
+    assert rep["exit_code"] == 124
+    assert rep["finished"] is False
+    assert _load_judge().judge(rep, [A], platform="windows")["verdict"] == "INSUFFICIENT"
+
+
+@pytest.mark.process_rpc
+def test_duplicate_nodeid_preserved(tmp_path: Path) -> None:
+    _assert_script()
+    exe1 = _write_exe(tmp_path / "exe_a", TARGET, run_out="run_a_ok.txt")
+    exe2 = _write_exe(tmp_path / "exe_b", TARGET, run_out="run_a_ok.txt")   # 同 crate／target／名稱
+    bin_dir = tmp_path / "bin"
+    _write_cargo(bin_dir, [_artifact(exe1, TARGET), _artifact(exe2, TARGET)])
+    out = tmp_path / "l1.json"
+    r = _run(tmp_path, bin_dir, ["--platform", "linux", "--out", str(out)])
+    rep = _report(out, r)
+    assert rep["collected"].count(A) == 2                          # 原樣保留，不去重
+    assert [row["nodeid"] for row in rep["results"]].count(A) == 2
+    res = _load_judge().judge(rep, [A, B], platform="linux")
+    assert res["verdict"] == "INSUFFICIENT"
+    assert A in res["duplicates"]
+
+
+@pytest.mark.process_rpc
+def test_list_only_feeds_regen_lock(tmp_path: Path) -> None:
+    _assert_script()
+    exe = _write_exe(tmp_path / "exe_a", TARGET, run_out="run_a_ok.txt")
+    bin_dir = tmp_path / "bin"
+    _write_cargo(bin_dir, [_artifact(exe, TARGET)])
+    collect = tmp_path / "collect.json"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--list-only", "--out", str(collect), "--", "--workspace"],
+        cwd=tmp_path,
+        env={**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert collect.is_file(), f"--list-only 未寫出輸出；stderr={r.stderr[-2000:]}"
+    data = json.loads(collect.read_text(encoding="utf-8"))
+    assert set(data) == {"collected"}                              # 只含 collected，不含執行結果
+    assert sorted(data["collected"]) == sorted([A, B, C])
+
+    # 以 P2 Task 13 的 regen_lock.py 登記到暫存鎖檔（副本），必須成功登記三筆
+    regen = ACCEPTANCE / "regen_lock.py"
+    assert regen.is_file(), "tests/acceptance/regen_lock.py 不存在：P2 Task 13 尚未合併（前置缺口，見 plan §0.2）"
+    acc = tmp_path / "tests" / "acceptance"
+    shutil.copytree(ACCEPTANCE, acc)
+    lock = acc / "l1_required.lock.json"
+    lock.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "sets": {"t": {"linux": {"selector": {"argv": ["--workspace"], "paths": [], "markexpr": ""}, "nodeids": []}}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    rr = subprocess.run(
+        [sys.executable, str(acc / "regen_lock.py"), "--l1-add-only", "--set", "t", "--platform", "linux", "--collect", str(collect)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert rr.returncode == 0, rr.stderr[-2000:]
+    got = json.loads(lock.read_text(encoding="utf-8"))["sets"]["t"]["linux"]["nodeids"]
+    assert got == sorted([A, B, C])

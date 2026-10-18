@@ -1,0 +1,296 @@
+# P3-T18 新增的 Rust CLI→Python daemon 黑箱案例（cli_stage: 1A）。
+# 本檔僅含本 phase 新增列；P2 承接清單（cases.schema.json、基線 117 筆、regen_lock.py、cases.lock.json）
+# 尚未合併到本 worktree，合併時以 regen_lock.py --add-only 併入，不得刪改既有列。
+# 欄位依 plan 03 Task 12 §11.3 必填清單；daemon_slice 以 n/a 表示非切片案例（待 P2 schema 確認）。
+schema_version: 1
+cases:
+- case_id: test_bb_daemon_e2e.py::test_session_reaches_ready
+  title: session list 輪詢至 COM0 進入 READY
+  contract: session list 輪詢至 COM0 進入 READY
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  daemon_slice: n/a
+  prerequisites:
+  - py_daemon
+  - faketarget
+  necessity: required
+  issues: []
+  behavior_changes: []
+  expected: pass
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  cli_stage: 1A
+  phases:
+  - P3
+- case_id: test_bb_daemon_e2e.py::test_cmd_submit_status
+  title: cmd submit → cmd status 輪詢至 done，stdout 含 hi
+  contract: cmd submit → cmd status 輪詢至 done，stdout 含 hi
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  daemon_slice: n/a
+  prerequisites:
+  - py_daemon
+  - faketarget
+  necessity: required
+  issues: []
+  behavior_changes: []
+  expected: pass
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  cli_stage: 1A
+  phases:
+  - P3
+- case_id: test_bb_daemon_e2e.py::test_cmd_background_result_tail
+  title: background 命令完成後 result-tail 內容含 bg
+  contract: background 命令完成後 result-tail 內容含 bg
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  daemon_slice: n/a
+  prerequisites:
+  - py_daemon
+  - faketarget
+  necessity: required
+  issues: []
+  behavior_changes: []
+  expected: pass
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  cli_stage: 1A
+  phases:
+  - P3
+- case_id: test_bb_daemon_e2e.py::test_log_and_wal
+  title: log tail-text、wal current-seq／export、stream tail 的結構與內容
+  contract: log tail-text、wal current-seq／export、stream tail 的結構與內容
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  daemon_slice: n/a
+  prerequisites:
+  - py_daemon
+  - faketarget
+  necessity: required
+  issues: []
+  behavior_changes: []
+  expected: pass
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  cli_stage: 1A
+  phases:
+  - P3
+- case_id: test_bb_daemon_e2e.py::test_console_attach_detach
+  title: console-attach／list／detach 的 client_id 與 vtty 契約
+  contract: console-attach／list／detach 的 client_id 與 vtty 契約
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  daemon_slice: n/a
+  prerequisites:
+  - py_daemon
+  - faketarget
+  necessity: required
+  issues: []
+  behavior_changes: []
+  expected: pass
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  cli_stage: 1A
+  phases:
+  - P3
+- case_id: test_bb_daemon_e2e.py::test_interactive_lease_roundtrip
+  title: interactive open／send／status／close 與後續 cmd submit
+  contract: interactive open／send／status／close 與後續 cmd submit
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  daemon_slice: n/a
+  prerequisites:
+  - py_daemon
+  - faketarget
+  necessity: required
+  issues: []
+  behavior_changes: []
+  expected: pass
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  cli_stage: 1A
+  phases:
+  - P3
+- case_id: test_bb_daemon_e2e.py::test_recover_release_attach_no_replay
+  title: recover／release／attach 後 UART 不回放已送命令
+  contract: recover／release／attach 後 UART 不回放已送命令
+  invariants:
+  - no-interleave-no-replay
+  layer: L1
+  platforms:
+  - linux
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  daemon_slice: n/a
+  prerequisites:
+  - py_daemon
+  - faketarget
+  necessity: required
+  issues: []
+  behavior_changes: []
+  expected: pass
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  cli_stage: 1A
+  phases:
+  - P3
+- case_id: test_bb_daemon_e2e.py::test_alias_roundtrip
+  title: alias set → alias list
+  contract: alias set → alias list
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  daemon_slice: n/a
+  prerequisites:
+  - py_daemon
+  - faketarget
+  necessity: required
+  issues: []
+  behavior_changes: []
+  expected: pass
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  cli_stage: 1A
+  phases:
+  - P3
+- case_id: test_bb_daemon_e2e.py::test_event_rule_roundtrip
+  title: event add → list → rm 的 rule 往返
+  contract: event add → list → rm 的 rule 往返
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  daemon_slice: n/a
+  prerequisites:
+  - py_daemon
+  - faketarget
+  necessity: required
+  issues: []
+  behavior_changes: []
+  expected: pass
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  cli_stage: 1A
+  phases:
+  - P3
+- case_id: test_bb_daemon_e2e.py::test_device_mcu_health
+  title: device list、mcu patterns、mcu status（flashing 為 false）
+  contract: device list、mcu patterns、mcu status（flashing 為 false）
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  daemon_slice: n/a
+  prerequisites:
+  - py_daemon
+  - faketarget
+  necessity: required
+  issues: []
+  behavior_changes: []
+  expected: pass
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  cli_stage: 1A
+  phases:
+  - P3
+- case_id: test_bb_daemon_e2e.py::test_local_rejections_zero_tx
+  title: 本地拒絕的請求不產生外部 TX（rx_log 與 wal seq 不變）
+  contract: 本地拒絕的請求不產生外部 TX（rx_log 與 wal seq 不變）
+  invariants:
+  - rejected-requests-zero-tx
+  layer: L1
+  platforms:
+  - linux
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  daemon_slice: n/a
+  prerequisites:
+  - py_daemon
+  - faketarget
+  necessity: required
+  issues: []
+  behavior_changes: []
+  expected: pass
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  cli_stage: 1A
+  phases:
+  - P3
+- case_id: test_bb_daemon_e2e.py::test_no_version_warning
+  title: bundle 內 CLI 與 daemon 版本相同時 stderr 不含版本不一致警告
+  contract: bundle 內 CLI 與 daemon 版本相同時 stderr 不含版本不一致警告
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  daemon_slice: n/a
+  prerequisites:
+  - py_daemon
+  - faketarget
+  necessity: required
+  issues: []
+  behavior_changes: []
+  expected: pass
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  cli_stage: 1A
+  phases:
+  - P3

@@ -1,0 +1,18 @@
+
+running 3 tests
+test a ... ok
+test b ... FAILED
+test cap_posix_pty__c ... ignored
+
+failures:
+
+---- b stdout ----
+thread 'b' panicked at crates/sw-proto/tests/pyjson_golden.rs:4:5:
+assertion `left == right` failed
+
+failures:
+    b
+
+test result: FAILED. 1 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p sw-proto --test pyjson_golden`

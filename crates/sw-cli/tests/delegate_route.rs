@@ -1,6 +1,6 @@
-//! 委派路由分類測試（P3-T10）。
+//! 委派路由分類測試（P3-T10）；遞迴防護與 argv 指紋測試（P3-T16 追加）。
 use std::ffi::OsString;
-use sw_cli::delegate::{classify, Route};
+use sw_cli::delegate::{argv_sha256, check_recursion, classify, DelegateError, Route};
 
 fn v(s: &str) -> Vec<OsString> {
     s.split_whitespace().map(OsString::from).collect()
@@ -53,4 +53,23 @@ fn non_utf8_tokens() {
         classify(&[OsString::from("setup"), OsString::from("--user"), bad]),
         d("setup")
     );
+}
+
+#[test]
+fn recursion_rules() {
+    assert_eq!(check_recursion(None, None, "s"), Ok(0));
+    assert_eq!(check_recursion(Some("1"), Some("other"), "s"), Ok(1));
+    assert_eq!(check_recursion(Some("2"), None, "s"), Err(DelegateError::Recursion));
+    assert_eq!(check_recursion(Some("0"), Some("s"), "s"), Err(DelegateError::Recursion));
+    assert_eq!(check_recursion(Some("x"), None, "s"), Err(DelegateError::Recursion));
+    assert_eq!(check_recursion(Some("１"), None, "s"), Err(DelegateError::Recursion));
+}
+
+#[test]
+fn argv_sha_stable() {
+    let a = argv_sha256(&v("setup --user x"));
+    assert_eq!(a.len(), 64);
+    assert_eq!(a, argv_sha256(&v("setup --user x")));
+    assert_ne!(a, argv_sha256(&v("setup --user y")));
+    assert_ne!(argv_sha256(&v("a b")), argv_sha256(&v("ab")));   // 分隔符生效
 }
