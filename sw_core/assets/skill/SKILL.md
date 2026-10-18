@@ -295,7 +295,7 @@ serialwrap mcu status
 | `INVALID_JSON` | rpc_frame／posix、windows | 修正參數後 | 該行不是合法 JSON，連線保持並續讀下一行（回應無 id 與 version，且為非緊湊分隔符） | 修正請求的 JSON 格式後重送 |
 | `INVALID_METHOD` | rpc_frame／posix、windows | 修正參數後 | 請求的 method 欄位不是字串（回應保留 id，無 version） | 以字串形式的 method 重送 |
 | `INVALID_REQUEST` | rpc_frame／posix、windows | 修正參數後 | 請求 JSON 不是 object（回應無 id 與 version，且為非緊湊分隔符） | 以 JSON object 格式重送 |
-| `INVALID_RESPONSE` | cli_client／posix、windows | 否 | daemon 回應的 JSON 不是 object | 勿直接重送寫入型命令；先以 health.ping 與 session get_state 確認 daemon 與 session 狀態 |
+| `INVALID_RESPONSE` | cli_client／posix、windows | 否 | daemon 回應不是合法 JSON，或解析後不是 object | 勿直接重送寫入型命令；先以 health.ping 與 session get_state 確認 daemon 與 session 狀態 |
 | `INVALID_RULE_SCHEMA` | rpc／posix、windows | 修正參數後 | 事件規則的 schema 驗證失敗 | 依 schema 修正 rule 欄位後重送 event.rule_set |
 | `INVALID_TARGET` | cli_local／posix、windows | 修正參數後 | remote target 不是 [user@]host:port 格式，或 port 超出範圍 | 修正 target 格式後重試 |
 | `LOCAL_FILE_NOT_FOUND` | rpc／posix、windows | 修正參數後 | daemon 端看不到 local_path（以 daemon 身分判斷檔案是否存在） | 確認路徑存在且 daemon 具讀取權限後重試 |

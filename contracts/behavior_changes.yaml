@@ -866,7 +866,7 @@ changes:
   - id: "DF-01"
     kind: "DF"
     title: "event rule_id 路徑穿越防護"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-15"
@@ -1001,7 +1001,7 @@ changes:
   - id: "DF-06"
     kind: "DF"
     title: "client 非 JSON 回應改回 INVALID_RESPONSE"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-15"
@@ -1028,7 +1028,7 @@ changes:
   - id: "DF-07"
     kind: "DF"
     title: "config.yaml 壞 YAML 的明確錯誤"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-15"
@@ -1055,7 +1055,7 @@ changes:
   - id: "DF-08"
     kind: "DF"
     title: "contains 規則 flags 驗證"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-15"
@@ -1082,7 +1082,7 @@ changes:
   - id: "DF-09"
     kind: "DF"
     title: "RuleRegistry load_all 的 ValueError／TypeError"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-15"
@@ -1103,13 +1103,13 @@ changes:
     ab_participation: "diff"
     phases: ["P1", "P7"]
     case_ids: ["df09-registry-load-valueerror"]
-    compatibility_impact: "RuleRegistry.load_all 把 ValueError 與 TypeError 視為 FailedLoad；engine.start 與 reload 不再因此崩潰。"
+    compatibility_impact: "RuleRegistry.load_all 把 ValueError、TypeError 與溢位驗證錯誤視為 FailedLoad；檔案解碼失敗也列入 failed，engine.start 與 reload 不再因此崩潰。"
     approval_conditions: "可用性缺陷"
     related_decisions: []
   - id: "DF-10"
     kind: "DF"
     title: "setup system scope 遷移目標"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-15"
@@ -1136,7 +1136,7 @@ changes:
   - id: "DF-11"
     kind: "DF"
     title: "WSL systemd sudo 閘門"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-15"
@@ -1163,7 +1163,7 @@ changes:
   - id: "DF-12"
     kind: "DF"
     title: "setup／reconcile ran 欄位"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-15"
@@ -1190,7 +1190,7 @@ changes:
   - id: "DF-13"
     kind: "DF"
     title: "serialwrap-minicom-broker 改名引用"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-15"
@@ -1271,7 +1271,7 @@ changes:
   - id: "DF-16"
     kind: "DF"
     title: "Windows setup skill 複製目錄"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-15"

@@ -16,6 +16,7 @@ from __future__ import annotations
 import configparser
 import getpass
 import importlib.resources
+import logging
 import os
 import shutil
 import time
@@ -81,7 +82,12 @@ def _force_symlink(link: Path, target: Path) -> None:
         shutil.rmtree(link)
     elif link.exists():
         link.unlink()
-    link.symlink_to(target)
+    try:
+        link.symlink_to(target)
+    except OSError:
+        if os.name != "nt":
+            raise
+        shutil.copytree(target, link, dirs_exist_ok=True)
 
 
 def _remove_legacy_serialwrap_mcp_link(link: Path) -> None:
@@ -343,13 +349,19 @@ def _merge_wsl_conf_systemd(existing: str) -> str:
     return buf.getvalue()
 
 
-def ensure_wsl_systemd(fx, home) -> dict:
-    """WSL 上若 systemd 尚未啟用，寫 ``/etc/wsl.conf`` ``[boot] systemd=true``（需 sudo）。
+def ensure_wsl_systemd(
+    fx,
+    home,
+    *,
+    target_mode: str = "on-demand",
+    with_sudo: bool = False,
+) -> dict:
+    """WSL 上 systemd 尚未啟用時，依目標模式與授權處理 ``/etc/wsl.conf``。
 
     - 非 WSL → no-op（``{"wsl": False}``）。
     - 已啟用 systemd（``has_systemd``）→ no-op（``already=True``）。
-    - 需啟用 → staging + ``sudo install`` 寫 ``/etc/wsl.conf``，回報需於 Windows 端
-      ``wsl --shutdown`` 重啟（systemd 須重進 WSL 才生效，當次 setup 無法直接起 systemd 服務）。
+    - 需啟用 → 建立 staging 設定；僅目標為 systemd 模式且帶 ``with_sudo`` 時執行
+      ``sudo install``，其餘情況回傳 ``pending_sudo``。
 
     以 Effects.run 經過 sudo install（非直接 sudo tee，避免空檔）。回傳結果字典供
     cli 決定是否早退並提示使用者重啟。
@@ -367,7 +379,16 @@ def ensure_wsl_systemd(fx, home) -> dict:
     staging = home / ".local" / "share" / "serialwrap" / "wsl.conf"
     staging.parent.mkdir(parents=True, exist_ok=True)
     staging.write_text(merged, encoding="utf-8")
-    rc, _out, _err = fx.run(["sudo", "install", "-m", "0644", str(staging), "/etc/wsl.conf"])
+    cmd = ["sudo", "install", "-m", "0644", str(staging), "/etc/wsl.conf"]
+    if not target_mode.startswith("systemd") or not with_sudo:
+        return {
+            "wsl": True,
+            "already": False,
+            "enabled_now": False,
+            "needs_restart": False,
+            "pending_sudo": [cmd],
+        }
+    rc, _out, _err = fx.run(cmd)
     return {
         "wsl": True,
         "already": False,
@@ -424,12 +445,12 @@ def _system_install_cmds(home: Path, *, include_start: bool) -> list[list[str]]:
     return cmds
 
 
-def _state_path_for(mode: str, home: Path) -> Path:
+def _state_path_for(mode: str, home: Path, *, run_user: str | None = None) -> Path:
     """回傳指定 scope 的 state.json 路徑（用於跨 scope 遷移判斷）。
 
     user scope（``on-demand`` / ``systemd-user``）落在 XDG state home；
-    system scope（``systemd-system``）對應 systemd ``StateDirectory=serialwrap``
-    的 ``/var/lib/serialwrap``。同一 scope 內路徑相同 → 遷移為 no-op。
+    system scope（``systemd-system``）使用 unit 的 ``User=`` 家目錄下 daemon
+    實際採用的 XDG 預設 state 路徑。同一 scope 內路徑相同 → 遷移為 no-op。
 
     Args:
         mode: 監管模式字串。
@@ -439,7 +460,19 @@ def _state_path_for(mode: str, home: Path) -> Path:
         該 scope 對應的 ``state.json`` 路徑。
     """
     if mode == "systemd-system":
-        return Path("/var/lib/serialwrap/state.json")
+        username = run_user or _resolve_run_user()
+        try:
+            import pwd
+
+            state_home = Path(pwd.getpwnam(username).pw_dir)
+        except (ImportError, KeyError, OSError) as exc:
+            logging.getLogger(__name__).warning(
+                "無法解析 systemd system daemon 使用者 %s 的家目錄，遷移路徑退回呼叫者家目錄：%s",
+                username,
+                exc,
+            )
+            state_home = Path(home)
+        return state_home / ".local" / "state" / "serialwrap" / "state.json"
     state_home = os.environ.get("XDG_STATE_HOME") or str(home / ".local" / "state")
     return Path(state_home) / "serialwrap" / "state.json"
 
@@ -720,14 +753,19 @@ def reconcile(
             }
 
     # b. 跨 scope 才需遷移 state（best-effort、僅 dest 空才搬、絕不拋例外）。
-    legacy_state = _state_path_for(old_mode, home)
-    new_state = _state_path_for(target_mode, home)
-    if legacy_state != new_state:
-        try:
+    try:
+        run_user = (
+            _resolve_run_user()
+            if old_mode == "systemd-system" or target_mode == "systemd-system"
+            else None
+        )
+        legacy_state = _state_path_for(old_mode, home, run_user=run_user)
+        new_state = _state_path_for(target_mode, home, run_user=run_user)
+        if legacy_state != new_state:
             migrate_legacy_state(legacy_state, new_state)
-        except Exception:
-            # 遷移屬 best-effort，失敗不可中斷模式轉換。
-            pass
+    except Exception:
+        # 遷移路徑解析與檔案搬移皆屬 best-effort，失敗不可中斷模式轉換。
+        pass
 
     # c. 再起新（必在停舊之後）。
     _start_new(

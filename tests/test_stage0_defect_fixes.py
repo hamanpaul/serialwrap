@@ -1,10 +1,9 @@
-"""Stage 0 P1-T16 失敗測試（TDD red）：缺陷修正群組 DF-01、DF-06、DF-07、DF-08、DF-09、DF-10、DF-11、DF-12、DF-13、DF-16。
+"""Stage 0 P1-T16 回歸測試：缺陷修正群組 DF-01、DF-06、DF-07、DF-08、DF-09、DF-10、DF-11、DF-12、DF-13、DF-16。
 
 依據：`docs/rust-refactor/plans/02-stage0-python-bc.md` Task T16（「修正表（凍結；每列一個測試）」）。
 
-本檔只寫失敗測試，不含產品碼實作。紅燈原因應為「缺少行為」（事件 ID 未驗證、client 未攔截
-非 JSON 回應、traceback 未包成凍結 JSON、規則 flags 未驗證、load_all 未容錯、遷移目標錯誤、
-WSL sudo 未閘控、ran 恆為空、broker 找不到改名後的 router、symlink 失敗未回退為複製）。
+本檔鎖定各缺陷的外部行為，包含事件 ID 防護、非 JSON 回應、錯誤輸出、規則驗證與載入容錯、
+state 遷移、WSL sudo 閘門、ran 命令清單、broker router 定位與 Windows skill 複製回退。
 
 注意事項：
 - 新名稱 `valid_rule_id`（P1-T16 新增）一律於測試函式內延遲 import，使本檔在 Stage A 仍可被 collection。
@@ -19,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import shutil
 import socket
 import subprocess
 import sys
@@ -112,13 +112,14 @@ def _last_json_line(text: str) -> dict[str, Any]:
 
 
 def _isolate_xdg_and_home(monkeypatch: pytest.MonkeyPatch, root: Path) -> Path:
-    """把 HOME 與 XDG 目錄全部導向 tmp，避免 setup 類測試寫入真實家目錄。"""
+    """把 HOME、XDG 與明確 config 路徑導向各測試 tmp，避免 setup 寫入共享設定。"""
     home = root / "home"
     home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(root / "xdg_cfg"))
     monkeypatch.setenv("XDG_DATA_HOME", str(root / "xdg_data"))
     monkeypatch.setenv("XDG_STATE_HOME", str(root / "xdg_state"))
+    monkeypatch.setenv("SERIALWRAP_CONFIG", str(root / "config.yaml"))
     return home
 
 
@@ -173,6 +174,20 @@ def test_rule_delete_rejects_traversal(stage0_event_service: tuple[SerialwrapSer
     r = svc.rpc("event.rule_delete", {"rule_id": "../../x"})
 
     assert r["ok"] is True and r["deleted"] is False
+    assert victim.exists()
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_registry_delete_rejects_invalid_rule_id(tmp_path: Path) -> None:
+    """DF-01：直接呼叫 RuleRegistry.delete 也不得讓非法 ID 越過 registry 根目錄。"""
+    events_dir = tmp_path / "events.d"
+    events_dir.mkdir()
+    victim = tmp_path / "outside.json"
+    victim.write_text("{}", encoding="utf-8")
+    registry = RuleRegistry(str(events_dir))
+
+    assert registry.delete("../outside") is False
     assert victim.exists()
 
 
@@ -299,6 +314,71 @@ def test_service_bad_yaml_internal_error_json(
     assert obj["error_code"] == "INTERNAL_ERROR"
     assert isinstance(obj.get("message"), str) and obj["message"]
     assert set(obj) == {"ok", "error_code", "message"}
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+@pytest.mark.parametrize("daemon_command", ["start", "stop", "restart", "status"])
+def test_daemon_bad_yaml_fails_before_daemon_action(
+    daemon_command: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """DF-07：daemon 子命令遇壞 YAML 回 INTERNAL_ERROR，且不進 RPC、service 或 spawn 路徑。"""
+    _isolate_xdg_and_home(monkeypatch, tmp_path)
+    Path(os.environ["SERIALWRAP_CONFIG"]).write_text(_BAD_YAML, encoding="utf-8")
+    calls: list[str] = []
+    for name, label in (
+        ("_run_daemon_start", "start"),
+        ("_run_daemon_stop", "stop"),
+        ("_run_daemon_restart", "restart"),
+    ):
+        monkeypatch.setattr(cli_mod, name, lambda _args, label=label: calls.append(label) or 0)
+    monkeypatch.setattr(cli_mod, "_run_rpc", lambda *_a, **_k: calls.append("rpc") or 0)
+    monkeypatch.setattr(cli_mod, "service_action", lambda *_a, **_k: calls.append("service") or {"ok": True})
+    monkeypatch.setattr(cli_mod.subprocess, "Popen", lambda *_a, **_k: calls.append("spawn"))
+
+    rc = cli_mod.main(["daemon", daemon_command])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert _last_json_line(captured.out)["error_code"] == "INTERNAL_ERROR"
+    assert calls == []
+    assert "Traceback" not in captured.err
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_load_all_invalid_utf8_is_failed_load(tmp_path: Path) -> None:
+    """DF-09：規則 JSON 含無效 UTF-8 時 load_all 將它列為 failed，不中止載入。"""
+    events_dir = tmp_path / "events.d"
+    events_dir.mkdir()
+    malformed = events_dir / "bad.encoding.json"
+    malformed.write_bytes(b"\xff\xfe")
+
+    result = RuleRegistry(str(events_dir)).load_all()
+
+    assert result.rules == []
+    assert [entry.path for entry in result.failed] == [str(malformed)]
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_load_all_overflow_is_failed_load(tmp_path: Path) -> None:
+    """DF-09：規則中的 Infinity 數值觸發 OverflowError 時也須列入 failed。"""
+    events_dir = tmp_path / "events.d"
+    events_dir.mkdir()
+    malformed = events_dir / "bad.overflow.json"
+    malformed.write_text(
+        json.dumps(dict(_rule_payload("bad", "overflow"), cooldown_ms=float("inf"))),
+        encoding="utf-8",
+    )
+
+    result = RuleRegistry(str(events_dir)).load_all()
+
+    assert result.rules == []
+    assert [entry.path for entry in result.failed] == [str(malformed)]
 
 
 @pytest.mark.core_portable
@@ -436,6 +516,8 @@ def test_system_scope_migration_targets_daemon_state(tmp_path: Path, monkeypatch
         fx=fx,
         home=caller_home,
         daemon_running=False,
+        ping=lambda _endpoint: False,
+        alive=lambda _pid: False,
         any_flashing=False,
         with_sudo=True,
         force=False,
@@ -493,6 +575,43 @@ def test_wsl_systemd_sudo_with_flag_runs(
     assert len(sudo_calls) == 1
     assert sudo_calls[0][:2] == ["sudo", "install"]
     assert sudo_calls[0][-1] == "/etc/wsl.conf"
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_wsl_pending_is_reported_for_non_systemd_target(
+    tmp_path: Path,
+) -> None:
+    """DF-11：WSL 未啟用 systemd 時，即使目標不是 systemd 也回報未執行的設定命令。"""
+    fx = sysenv.FakeEffects(wsl=True, systemd=False)
+
+    result = setup_cmd.ensure_wsl_systemd(
+        fx,
+        tmp_path,
+        target_mode="on-demand",
+        with_sudo=True,
+    )
+
+    pending = result.get("pending_sudo") or []
+    assert len(pending) == 1
+    assert pending[0][:2] == ["sudo", "install"]
+    assert pending[0][-1] == "/etc/wsl.conf"
+    assert fx.calls == []
+    assert (tmp_path / ".local" / "share" / "serialwrap" / "wsl.conf").is_file()
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_wsl_already_enabled_is_reported_before_target_gate(
+    tmp_path: Path,
+) -> None:
+    """DF-11：WSL systemd 已啟用時保留 already=True，即使目標為 on-demand。"""
+    fx = sysenv.FakeEffects(wsl=True, systemd=True)
+
+    result = setup_cmd.ensure_wsl_systemd(fx, tmp_path, target_mode="on-demand")
+
+    assert result == {"wsl": True, "already": True, "enabled_now": False, "needs_restart": False}
+    assert fx.calls == []
 
 
 # ─────────────────────────────── DF-12：reconcile ran 欄位 ───────────────────────────────
@@ -567,6 +686,59 @@ def test_minicom_broker_wrapper_finds_renamed_router(tmp_path: Path, monkeypatch
     assert proc.returncode != 2, proc.stderr
     assert proc.returncode == 0, proc.stderr
     assert "FAKE_ROUTER --help" in proc.stdout
+
+
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
+def test_minicom_broker_source_layout_falls_back_to_legacy_router(tmp_path: Path) -> None:
+    """DF-13：source/assets 佈局仍可由 legacy sibling minicom_router.sh 提供 broker 入口。"""
+    tools_dir = tmp_path / "tools"
+    tools_dir.mkdir()
+    broker = tools_dir / "minicom-broker.sh"
+    shutil.copy2(
+        Path(__file__).resolve().parents[1] / "sw_core" / "assets" / "tools" / "minicom-broker.sh",
+        broker,
+    )
+    router = tools_dir / "minicom_router.sh"
+    router.write_text('#!/usr/bin/env bash\nprintf "LEGACY_ROUTER %s\\n" "$*"\n', encoding="utf-8")
+    router.chmod(0o755)
+
+    proc = subprocess.run(
+        ["bash", str(broker), "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "LEGACY_ROUTER --help"
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_reconcile_continues_when_run_user_resolution_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DF-10：state 遷移路徑 best-effort 解析失敗不得中止已開始的 reconcile。"""
+    fx = sysenv.FakeEffects(systemd=True)
+    monkeypatch.setattr(setup_cmd, "_resolve_run_user", lambda: (_ for _ in ()).throw(OSError("no user")))
+
+    result = setup_cmd.reconcile(
+        old_mode="systemd-system",
+        target_mode="systemd-user",
+        fx=fx,
+        home=tmp_path / "home",
+        daemon_running=False,
+        ping=lambda _endpoint: False,
+        alive=lambda _pid: False,
+        with_sudo=True,
+        force=False,
+        config_path=tmp_path / "config.yaml",
+    )
+
+    assert result["applied"] is True
+    assert result["mode"] == "systemd-user"
 
 
 # ─────────────────────────────── DF-16：Windows skill link 權限不足時回退為複製 ───────────────────────────────

@@ -21,6 +21,13 @@ sink:
 excluded_sources:
   - sw_core/cli_trace.py
 messages:
+  - id: setup_system_state_home_unresolved
+    logger: sw_core.setup_cmd
+    level: WARNING
+    template: "無法解析 systemd system daemon 使用者 %s 的家目錄，遷移路徑退回呼叫者家目錄：%s"
+    args: [username, exc]
+    source: "sw_core/setup_cmd.py:469"
+
   - id: auth_env_file_unparseable
     logger: sw_core.auth
     level: WARNING

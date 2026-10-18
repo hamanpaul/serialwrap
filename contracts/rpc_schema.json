@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/hamanpaul/serialwrap/contracts/rpc_schema.json",
   "title": "serialwrap RPC contract",
-  "x-catalog-revision": 8,
+  "x-catalog-revision": 9,
   "x-wire": {
     "framing": "ndjson",
     "line_strip": true,
@@ -2254,7 +2254,7 @@
       "long_timeout": false,
       "selector_chain": null,
       "status": "EXISTING",
-      "source": "sw_core/service.py:1164 → event_engine/engine.py"
+      "source": "sw_core/service.py:1403-1404 → event_engine/engine.py"
     },
     "event.reset": {
       "params": {
@@ -2307,8 +2307,8 @@
       "error_order": [],
       "side_effects": [
         {
-          "what": "清除指定 rule_id 或 selector 的 counter；寫事件 log（rule_id 未驗證，H-01）",
-          "when": "always",
+          "what": "清除合法 rule_id 或 selector 的 counter 並寫事件 log；非法 rule_id 回 cleared:0、不觸碰 counter（DF-01）",
+          "when": "valid_rule_id_or_selector",
           "idempotent": true
         }
       ],
@@ -2317,7 +2317,7 @@
       "long_timeout": false,
       "selector_chain": "raw_selector",
       "status": "EXISTING",
-      "source": "sw_core/service.py:1133-1172 → event_engine/engine.py"
+      "source": "sw_core/service.py:1397-1402 → event_engine/engine.py"
     },
     "event.rule_delete": {
       "params": {
@@ -2351,8 +2351,8 @@
       "error_order": [],
       "side_effects": [
         {
-          "what": "以未驗證 rule_id 組 path 後 unlink（路徑穿越 H-01；DF-01 APPROVED 未實作）",
-          "when": "always",
+          "what": "只以符合 RULE_ID_RE 的 rule_id 定位檔案並 unlink；非法 ID 回 deleted:false、不觸碰檔案（DF-01）",
+          "when": "valid_rule_id",
           "idempotent": false
         },
         {
@@ -2366,7 +2366,7 @@
       "long_timeout": false,
       "selector_chain": null,
       "status": "EXISTING",
-      "source": "sw_core/service.py:1133-1172 → event_engine/engine.py"
+      "source": "sw_core/service.py:1378-1380 → event_engine/engine.py"
     },
     "event.rule_get": {
       "params": {

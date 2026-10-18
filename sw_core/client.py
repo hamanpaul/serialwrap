@@ -265,7 +265,10 @@ def _rpc_call_once(socket_path: str, method: str, params: dict[str, Any], *, req
         line = buf.split(b"\n", 1)[0].strip()
         if not line:
             return {"ok": False, "error_code": "EMPTY_RESPONSE"}
-        obj = json.loads(line.decode("utf-8", errors="replace"))
+        try:
+            obj = json.loads(line.decode("utf-8", errors="replace"))
+        except ValueError:
+            return {"ok": False, "error_code": "INVALID_RESPONSE"}
         if not isinstance(obj, dict):
             return {"ok": False, "error_code": "INVALID_RESPONSE"}
         return obj

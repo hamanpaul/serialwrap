@@ -2,10 +2,21 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from typing import Iterable
 
 from .schema import Rule, RuleSchemaError, validate_rule_dict
+
+
+RULE_ID_RE: re.Pattern[str] = re.compile(
+    r"^[a-z0-9][a-z0-9-]{0,63}\.[a-z0-9][a-z0-9-]{0,63}\Z"
+)
+
+
+def valid_rule_id(rule_id: object) -> bool:
+    """判定事件規則識別字是否符合 owner.name 格式。"""
+    return isinstance(rule_id, str) and RULE_ID_RE.fullmatch(rule_id) is not None
 
 
 class RuleLoadError(Exception):
@@ -64,12 +75,12 @@ class RuleRegistry:
             try:
                 with open(full, "r", encoding="utf-8") as f:
                     data = json.load(f)
-            except (OSError, json.JSONDecodeError) as exc:
+            except (OSError, ValueError) as exc:
                 failed.append(FailedLoad(full, f"read/parse failed: {exc}"))
                 continue
             try:
                 rule = validate_rule_dict(data)
-            except RuleSchemaError as exc:
+            except (RuleSchemaError, ValueError, TypeError, OverflowError) as exc:
                 failed.append(FailedLoad(full, str(exc)))
                 continue
             rules.append(rule)
@@ -100,6 +111,8 @@ class RuleRegistry:
         return rule
 
     def delete(self, rule_id: str) -> bool:
+        if not valid_rule_id(rule_id):
+            return False
         try:
             os.unlink(self.path_for(rule_id))
             self._cache.pop(rule_id, None)

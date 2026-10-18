@@ -18,6 +18,8 @@ import time
 from collections.abc import Sequence
 from typing import Any
 
+import yaml
+
 from . import constants as _constants
 from . import filelock
 from .arbiter import CMD_REJECT_BYTES, CMD_WARN_BYTES
@@ -1792,10 +1794,13 @@ def _run_setup(args: argparse.Namespace) -> int:
     # 5. 物化套件資產到使用者可寫位置。
     materialize_assets(force=args.force)
 
-    # 5b. WSL 偵測：若在 WSL 但 systemd 尚未啟用，主動寫 /etc/wsl.conf [boot] systemd=true，
-    #     並早退提示使用者 `wsl --shutdown` 重啟後再跑 setup（systemd 須重進 WSL 才生效，
-    #     當次無法直接起 systemd 服務）。已啟用或非 WSL → no-op，照常往下走。
-    wsl_info = ensure_wsl_systemd(fx, os.path.expanduser("~"))
+    # 5b. 只有目標為 systemd 模式才處理 WSL systemd 設定；帶 --with-sudo 才寫入，否則回報待辦。
+    wsl_info = ensure_wsl_systemd(
+        fx,
+        os.path.expanduser("~"),
+        target_mode=target,
+        with_sudo=args.with_sudo,
+    )
     if wsl_info.get("needs_restart"):
         _print({
             "ok": True,
@@ -1877,6 +1882,10 @@ def _run_setup(args: argparse.Namespace) -> int:
         _print(resp)
         _mirror_err(resp, context="setup")
         return 2
+
+    wsl_pending_sudo = list(wsl_info.get("pending_sudo") or [])
+    if wsl_pending_sudo:
+        result["pending_sudo"] = wsl_pending_sudo + list(result.get("pending_sudo") or [])
 
     if result.get("error_code") == "TIMEOUT":
         _print(result)
@@ -2599,14 +2608,19 @@ def main(argv: list[str] | None = None) -> int:
         raise
 
     if args.cmd == "daemon":
-        if args.daemon_cmd == "start":
-            return _run_daemon_start(args)
-        if args.daemon_cmd == "stop":
-            return _run_daemon_stop(args)
-        if args.daemon_cmd == "restart":
-            return _run_daemon_restart(args)
-        if args.daemon_cmd == "status":
-            return _run_rpc(args, "health.status", {})
+        try:
+            # 先嚴格解析設定；daemon 子命令不得讓容錯 loader 把壞 YAML 降級為 on-demand。
+            _default_runtime_config()
+            if args.daemon_cmd == "start":
+                return _run_daemon_start(args)
+            if args.daemon_cmd == "stop":
+                return _run_daemon_stop(args)
+            if args.daemon_cmd == "restart":
+                return _run_daemon_restart(args)
+            if args.daemon_cmd == "status":
+                return _run_rpc(args, "health.status", {})
+        except Exception as exc:  # noqa: BLE001 — daemon 子命令錯誤不得穿越 CLI 邊界
+            return _print_internal_error(context=f"daemon {args.daemon_cmd}", exc=exc)
 
     if args.cmd == "device":
         if args.device_cmd == "list":
@@ -2794,22 +2808,33 @@ def main(argv: list[str] | None = None) -> int:
         return _dispatch_event(args)
 
     if args.cmd == "supervision-mode":
-        print(_default_runtime_config().mode() or "on-demand")
-        return 0
+        try:
+            print(_default_runtime_config().mode() or "on-demand")
+            return 0
+        except yaml.YAMLError as exc:
+            message = " ".join(str(exc).split())
+            sys.stderr.write(f"serialwrap supervision-mode failed: {message}\n")
+            return 1
 
     if args.cmd == "service":
-        mode = _default_runtime_config().mode() or "on-demand"
-        result = service_action(args.action, mode=mode, with_sudo=args.with_sudo)
-        _print(result)
-        _mirror_err(result, context=f"service {args.action}")
-        return 0 if result.get("ok") else 2
+        try:
+            mode = _default_runtime_config().mode() or "on-demand"
+            result = service_action(args.action, mode=mode, with_sudo=args.with_sudo)
+            _print(result)
+            _mirror_err(result, context=f"service {args.action}")
+            return 0 if result.get("ok") else 2
+        except Exception as exc:  # noqa: BLE001 — service 錯誤轉為穩定 JSON 邊界
+            return _print_internal_error(context=f"service {args.action}", exc=exc)
 
     if args.cmd == "profile":
         if args.profile_cmd == "test":
             return _run_profile_test(args)
 
     if args.cmd == "setup":
-        return _run_setup(args)
+        try:
+            return _run_setup(args)
+        except Exception as exc:  # noqa: BLE001 — setup 錯誤轉為穩定 JSON 邊界
+            return _print_internal_error(context="setup", exc=exc)
 
     if args.cmd == "doctor":
         return _run_doctor(args)

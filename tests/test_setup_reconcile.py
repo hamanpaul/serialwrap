@@ -16,6 +16,26 @@ def _cmds(fx):
     return [" ".join(c) for c in fx.calls]
 
 
+def _isolate_systemd_run_user(monkeypatch, tmp_path):
+    """把 system unit 的 User= 與 state 目錄固定在測試暫存路徑。"""
+    from types import SimpleNamespace
+
+    from sw_core import setup_cmd
+
+    run_user = "serialwrap-test-user"
+    daemon_home = tmp_path / "daemon-home"
+    monkeypatch.setattr(setup_cmd, "_resolve_run_user", lambda: run_user)
+    try:
+        import pwd
+    except ImportError:
+        return
+    monkeypatch.setattr(
+        pwd,
+        "getpwnam",
+        lambda _username: SimpleNamespace(pw_dir=str(daemon_home)),
+    )
+
+
 def test_transition_stops_old_before_starting_new(tmp_path):
     from sw_core.sysenv import FakeEffects
     from sw_core.setup_cmd import reconcile
@@ -110,12 +130,13 @@ def test_system_no_sudo_does_not_write_config_or_diverge(tmp_path):
     assert any("install" in " ".join(c) for c in res["pending_sudo"])
 
 
-def test_system_with_sudo_installs_real_unit_content(tmp_path):
+def test_system_with_sudo_installs_real_unit_content(tmp_path, monkeypatch):
     """I-2：system 模式帶 sudo → staging 寫出真實 unit 內容（非空檔），並以 sudo install 安裝。
 
     run-as-user（#76）：system unit 以安裝者本人帳號執行（非 serialwrap dedicated account），
     ExecStart 指向其 pipx serialwrapd 絕對路徑 + 固定 system socket/profile-dir。
     """
+    _isolate_systemd_run_user(monkeypatch, tmp_path)
     from sw_core.sysenv import FakeEffects
     from sw_core.setup_cmd import reconcile, _resolve_run_user, SYSTEM_SOCKET, SYSTEM_PROFILE_DIR
     fx = FakeEffects(systemd=True)
@@ -148,9 +169,10 @@ def test_transition_out_of_system_without_sudo_blocks_no_two_reader(tmp_path):
     assert not (tmp_path / ".config" / "systemd" / "user" / "serialwrap.service").exists()
 
 
-def test_transition_out_of_system_with_sudo_stops_before_starts(tmp_path):
+def test_transition_out_of_system_with_sudo_stops_before_starts(tmp_path, monkeypatch):
     """systemd-system → user 帶 sudo：先停舊 system service，再起新 user unit。"""
     from sw_core.sysenv import FakeEffects
+    _isolate_systemd_run_user(monkeypatch, tmp_path)
     from sw_core.setup_cmd import reconcile
     fx = FakeEffects(systemd=True)
     res = reconcile(old_mode="systemd-system", target_mode="systemd-user", fx=fx, home=tmp_path,

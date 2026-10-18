@@ -44,7 +44,12 @@ def test_ensure_non_wsl_is_noop():
 
 def test_ensure_wsl_with_systemd_already_enabled_noop(tmp_path):
     fx = FakeEffects(wsl=True, systemd=True)
-    r = ensure_wsl_systemd(fx, tmp_path)
+    r = ensure_wsl_systemd(
+        fx,
+        tmp_path,
+        target_mode="systemd-system",
+        with_sudo=True,
+    )
     assert r == {"wsl": True, "already": True, "enabled_now": False, "needs_restart": False}
     assert fx.calls == []
 
@@ -52,7 +57,12 @@ def test_ensure_wsl_with_systemd_already_enabled_noop(tmp_path):
 def test_ensure_wsl_without_systemd_writes_conf_and_needs_restart(tmp_path):
     """WSL 但 systemd 未啟用 → 寫 staging wsl.conf（含 [boot] systemd=true）+ sudo install + 需重啟。"""
     fx = FakeEffects(wsl=True, systemd=False)
-    r = ensure_wsl_systemd(fx, tmp_path)
+    r = ensure_wsl_systemd(
+        fx,
+        tmp_path,
+        target_mode="systemd-system",
+        with_sudo=True,
+    )
     assert r["enabled_now"] is True and r["needs_restart"] is True
     staging = tmp_path / ".local" / "share" / "serialwrap" / "wsl.conf"
     assert staging.is_file()
