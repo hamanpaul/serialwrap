@@ -6,6 +6,7 @@ from pathlib import Path
 from sw_core.config import SessionProfile, UartProfile
 from sw_core.device_watcher import DeviceInfo
 from sw_core.session_manager import SessionManager
+from sw_core.uart_io import DrainReceipt
 import sw_core.session_manager as sm_mod
 from sw_core.wal import WalWriter
 
@@ -126,7 +127,16 @@ class TestReleaseDevice(_Base):
         session = mgr.get_session("COM0")
         assert session is not None
         bridge = mock.MagicMock()
-        bridge.stop.return_value = None
+        bridge.finish_drain.return_value = DrainReceipt(
+            epoch=0,
+            handle_closed=True,
+            reader_stopped=True,
+            writer_converged=True,
+            tx_in_flight=None,
+            unrecorded=(),
+            preserved=None,
+            error=None,
+        )
         bridge.list_consoles.return_value = [{"client_id": "c1"}]
         session.bridge = bridge
         session.state = "READY"
@@ -142,7 +152,10 @@ class TestReleaseDevice(_Base):
         self.assertEqual(session.released_reason, "flash CC2674")
         self.assertIn(by_id, mgr._released_by_ids)
         self.assertIsNone(session.retained_consoles)
-        bridge.stop.assert_called_once_with(preserve_consoles=False)
+        bridge.begin_drain.assert_called_once()
+        self.assertFalse(bridge.begin_drain.call_args.kwargs["preserve_consoles"])
+        bridge.finish_drain.assert_called_once()
+        bridge.stop.assert_not_called()
 
     def test_release_idempotent(self) -> None:
         by_id = "/dev/serial/by-id/orig"
@@ -197,8 +210,10 @@ class TestAttachDevice(_Base):
 
     def test_attach_reclaims_when_free(self) -> None:
         mgr, session, by_id = self._released_mgr()
+        port = mock.MagicMock()
         with mock.patch.object(mgr, "_probe_external_holder", return_value={"pids": [], "holder": None}), \
-             mock.patch.object(mgr, "_spawn_attach") as spawn_attach:
+             mock.patch.object(mgr, "_spawn_attach") as spawn_attach, \
+             mock.patch("sw_core.serial_port.open_serial_port", return_value=port):
             resp = mgr.attach_device("COM0")
         self.assertTrue(resp["ok"])
         self.assertNotIn(by_id, mgr._released_by_ids)
@@ -219,8 +234,10 @@ class TestAttachDevice(_Base):
 
     def test_attach_force_bypasses_holder_check(self) -> None:
         mgr, session, by_id = self._released_mgr()
+        port = mock.MagicMock()
         with mock.patch.object(mgr, "_probe_external_holder", return_value={"pids": [4321], "holder": 4321}) as probe, \
-             mock.patch.object(mgr, "_spawn_attach") as spawn_attach:
+             mock.patch.object(mgr, "_spawn_attach") as spawn_attach, \
+             mock.patch("sw_core.serial_port.open_serial_port", return_value=port):
             resp = mgr.attach_device("COM0", force=True)
         self.assertTrue(resp["ok"])
         probe.assert_not_called()
@@ -438,8 +455,18 @@ class TestAttachByIdReleasedBackstop(_Base):
             return True, None
 
         with mock.patch("sw_core.session_manager.UARTBridge") as bridge_cls, \
+             mock.patch("sw_core.uart_io.open_serial_port", return_value=mock.MagicMock()), \
              mock.patch("sw_core.session_manager.probe_ready", side_effect=_blocking_probe):
-            bridge_cls.return_value.stop.return_value = None
+            bridge_cls.return_value.finish_drain.return_value = DrainReceipt(
+                epoch=0,
+                handle_closed=True,
+                reader_stopped=True,
+                writer_converged=True,
+                tx_in_flight=None,
+                unrecorded=(),
+                preserved=None,
+                error=None,
+            )
             bridge_cls.return_value.vtty_path = "/dev/pts/9"
 
             t = threading.Thread(target=mgr._attach_by_id, args=(by_id,))
@@ -459,7 +486,11 @@ class TestAttachByIdReleasedBackstop(_Base):
             self.assertIsNone(session.bridge)
             self.assertIsNone(session.attached_real_path)
             self.assertIn(by_id, mgr._released_by_ids)
-            bridge_cls.return_value.stop.assert_called_with(preserve_consoles=False)
+            bridge_cls.return_value.begin_drain.assert_called_once()
+            _, drain_kwargs = bridge_cls.return_value.begin_drain.call_args
+            self.assertFalse(drain_kwargs["preserve_consoles"])
+            bridge_cls.return_value.finish_drain.assert_called_once()
+            bridge_cls.return_value.stop.assert_not_called()
 
     def test_attach_by_id_early_returns_when_already_released(self) -> None:
         by_id = "/dev/serial/by-id/orig"

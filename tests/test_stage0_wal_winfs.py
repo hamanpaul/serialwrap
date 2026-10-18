@@ -37,13 +37,38 @@ def _load_wal_fs() -> Any:
 class FakeApi:
     """用於模擬 Windows kernel32 與 msvcrt 呼叫的替身。"""
 
-    def __init__(self, *, fail_osfhandle: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_osfhandle: bool = False,
+        create_error: int | None = None,
+        file_info_error: int | None = None,
+        delete_pending: bool = False,
+        volume_serial: int = 0x12345678,
+        file_id: int = int.from_bytes(bytes(range(16)), "little"),
+        lock_succeeds: bool = True,
+        last_error: int = 0,
+        error_sequence: list[int] | None = None,
+    ) -> None:
         self.closed: list[int] = []
         self.fail_osfhandle = fail_osfhandle
         self.create_args: list[tuple] = []
+        self.info_classes: list[int] = []
+        self.create_error = create_error
+        self.file_info_error = file_info_error
+        self.delete_pending = delete_pending
+        self.volume_serial = volume_serial
+        self.file_id = file_id
+        self.lock_succeeds = lock_succeeds
+        self.last_error = last_error
+        self.error_sequence = list(error_sequence or [])
+        self.get_last_error_calls = 0
 
     def CreateFileW(self, *a: Any) -> int:
         self.create_args.append(a)
+        if self.create_error is not None:
+            self.last_error = self.create_error
+            return -1
         return 1234
 
     def CloseHandle(self, h: int) -> int:
@@ -56,16 +81,32 @@ class FakeApi:
         return os.open(os.devnull, os.O_WRONLY)
 
     def GetLastError(self) -> int:
-        return 0
+        self.get_last_error_calls += 1
+        if self.error_sequence:
+            return self.error_sequence.pop(0)
+        return self.last_error
 
     def get_osfhandle(self, fd: int) -> int:
         return 1234
 
-    def GetFileInformationByHandleEx(self, *a: Any) -> int:
+    def GetFileInformationByHandleEx(
+        self, handle: Any, info_class: int, info_ptr: Any, size: int
+    ) -> int:
+        self.info_classes.append(info_class)
+        if self.file_info_error is not None:
+            self.last_error = self.file_info_error
+            return 0
+        info = info_ptr._obj
+        if info_class == 1:
+            info.DeletePending = int(self.delete_pending)
+        elif info_class == 18:
+            info.VolumeSerialNumber = self.volume_serial
+            for index, byte in enumerate(self.file_id.to_bytes(16, "little")):
+                info.FileId[index] = byte
         return 1
 
     def LockFileEx(self, *a: Any) -> int:
-        return 1
+        return int(self.lock_succeeds)
 
     def UnlockFileEx(self, *a: Any) -> int:
         return 1
@@ -119,6 +160,129 @@ def test_success_path_never_calls_closehandle_directly(tmp_path):
     fp = w32.open_shared_append(str(tmp_path / "w"), api=api)
     fp.close()
     assert api.closed == []
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_windows_wal_fs_uses_injected_api_and_delete_pending_only():
+    """WindowsWalFs 將 API 傳給 handle，unlinked 只查 DeletePending。"""
+    w32 = _load_w32()
+    wal_fs = _load_wal_fs()
+    api = FakeApi(delete_pending=True)
+    fs = wal_fs.WindowsWalFs(api=api)
+    wf = fs.open_append("injected-wal")
+    expected_identity = (api.volume_serial, api.file_id)
+    try:
+        assert wf.identity() == expected_identity
+        assert wf.unlinked() is True
+        assert api.info_classes == [w32.FILE_ID_INFO, w32.FILE_STANDARD_INFO]
+        assert len(api.create_args) == 1  # unlinked 不得再開路徑查名稱 identity
+    finally:
+        wf.close()
+
+    assert api.closed == []  # open_osfhandle 已接手 handle 所有權
+    assert fs.path_identity("injected-wal") == expected_identity
+    assert api.closed == [1234]  # path_identity 的查詢 handle 恰關一次
+
+
+@pytest.mark.parametrize(
+    ("error_code", "expected"),
+    [(2, None), (3, None), (5, (0, 0))],
+)
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_path_identity_maps_missing_and_access_denied(error_code, expected):
+    """路徑不存在回 None，delete-pending 的 access denied 回 identity 哨兵。"""
+    w32 = _load_w32()
+    api = FakeApi(create_error=error_code, last_error=error_code)
+    assert w32.path_identity("query-path", api=api) == expected
+
+
+@pytest.mark.parametrize("error_code", [32, 123])
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_path_identity_propagates_unexpected_winerror(error_code):
+    """未定義的 Windows 路徑錯誤必須保留原始 winerror。"""
+    w32 = _load_w32()
+    api = FakeApi(create_error=error_code, last_error=error_code)
+    with pytest.raises(OSError) as caught:
+        w32.path_identity("query-path", api=api)
+    assert getattr(caught.value, "winerror", None) == error_code
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_path_identity_uses_exception_winerror_without_rereading_last_error():
+    """錯誤碼取自例外，避免第二次 GetLastError 讀到已變動的值。"""
+    w32 = _load_w32()
+    api = FakeApi(create_error=2, error_sequence=[2, 123])
+    assert w32.path_identity("missing-path", api=api) is None
+    assert api.get_last_error_calls == 1
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_path_identity_closes_query_handle_once_when_file_info_fails():
+    """FileId 查詢失敗時，path_identity 必須恰好關閉查詢 handle 一次。"""
+    w32 = _load_w32()
+    api = FakeApi(file_info_error=123, last_error=123)
+    with pytest.raises(OSError):
+        w32.path_identity("query-path", api=api)
+    assert api.closed == [1234]
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_lock_file_ex_maps_lock_violation_and_propagates_other_errors():
+    """鎖衝突回 False，其他 LockFileEx 錯誤照常擲出。"""
+    w32 = _load_w32()
+    fd = os.open(os.devnull, os.O_RDONLY)
+    try:
+        assert w32.lock_file_ex(fd, api=FakeApi(lock_succeeds=False, last_error=33)) is False
+        api = FakeApi(lock_succeeds=False, last_error=5)
+        with pytest.raises(OSError) as caught:
+            w32.lock_file_ex(fd, api=api)
+        assert getattr(caught.value, "winerror", None) == 5
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_windows_wal_fs_rename_suffix_and_size(tmp_path):
+    """WindowsWalFs 依序選擇可用後綴，並回報檔案大小。"""
+    wal_fs = _load_wal_fs()
+    fs = wal_fs.WindowsWalFs()
+    src = tmp_path / "source.wal"
+    base = tmp_path / "archive.wal"
+    src.write_bytes(b"payload")
+    base.write_bytes(b"first")
+    (tmp_path / "archive.wal.1").write_bytes(b"second")
+
+    assert fs.size(str(src)) == len(b"payload")
+    assert fs.size(str(tmp_path / "missing.wal")) is None
+    assert fs.rename_noreplace_or_suffix(str(src), str(base)) == str(
+        tmp_path / "archive.wal.2"
+    )
+    assert (tmp_path / "archive.wal.2").read_bytes() == b"payload"
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_windows_wal_fs_raises_when_all_archive_suffixes_exist(tmp_path):
+    """歸檔本名與 .1 至 .999 全占用時必須回報 FileExistsError。"""
+    wal_fs = _load_wal_fs()
+    fs = wal_fs.WindowsWalFs()
+    src = tmp_path / "source.wal"
+    src.write_bytes(b"payload")
+    base = tmp_path / "archive.wal"
+    for suffix in range(1000):
+        path = base if suffix == 0 else tmp_path / f"archive.wal.{suffix}"
+        path.write_bytes(b"existing")
+
+    with pytest.raises(FileExistsError):
+        fs.rename_noreplace_or_suffix(str(src), str(base))
+    assert src.read_bytes() == b"payload"
 
 
 @pytest.mark.posix_only
@@ -198,7 +362,7 @@ def test_native_windows_walfs_unlinked_reports_delete_pending(tmp_path):
 
 @pytest.mark.windows_native
 @pytest.mark.memory_only
-def test_native_os_remove_semantics_recorded(tmp_path):
+def test_native_os_remove_semantics_recorded(tmp_path, record_property):
     """記錄 os.remove 在本機是 classic 或 POSIX semantics，且兩種情況皆不使偵測失準。"""
     w32 = _load_w32()
     wal_fs = _load_wal_fs()
@@ -206,18 +370,17 @@ def test_native_os_remove_semantics_recorded(tmp_path):
     fs = wal_fs.WindowsWalFs()
     wf = fs.open_append(p)
     try:
-        wf.write(b"entry\n")
+        wf.write_all_flush(b"entry\n")
         wf.sync()
         os.remove(p)
         exists = os.path.exists(p)
         ident = w32.path_identity(p)
         unlinked = wf.unlinked()
+        record_property("os_remove_semantics", "classic" if exists else "posix")
         if exists:
-            print(f"os.remove semantics: classic (delete-pending, exists=True, path_identity={ident})")
             assert unlinked is True
             assert ident == (0, 0)
         else:
-            print(f"os.remove semantics: POSIX (immediate unlinking, exists=False, path_identity={ident})")
             assert ident is None
             assert unlinked is True
     finally:
@@ -234,7 +397,7 @@ def test_native_sync_on_append_handle(tmp_path):
     fs = wal_fs.WindowsWalFs()
     wf = fs.open_append(p)
     try:
-        wf.write(b"data\n")
+        wf.write_all_flush(b"data\n")
         wf.sync()
     finally:
         wf.close()

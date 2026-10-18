@@ -43,6 +43,8 @@ os.environ["SERIALWRAP_STATE_DIR"] = _iso("state")
 os.environ["SERIALWRAP_RUN_DIR"] = _iso("run")
 os.environ["SERIALWRAP_WAL_DIR"] = _iso("wal")
 os.environ["SERIALWRAP_CONFIG_DIR"] = _iso("config")
+os.environ.pop("SERIALWRAP_TEST_SYSTEM_CONFIG_PATH", None)
+os.environ["SERIALWRAP_TEST_SYSTEM_CONFIG_PATH"] = os.path.join(_iso("system-config"), "config.yaml")
 os.environ["SERIALWRAP_LOG_DIR"] = _iso("blog")
 os.environ["SERIALWRAP_EVENTS_DIR"] = _iso("events.d")
 os.environ["SERIALWRAP_EVENTS_RUNTIME_DIR"] = _iso("events-rt")
@@ -68,6 +70,8 @@ for _k in (
     "SW_STUB_LOG",
     "SW_STUB_SCRIPT",
     "SW_DELEGATE_MARKER",
+    "SERIALWRAP_CONFIG",
+    "SERIALWRAP_TEST_DEVICE_ALLOWLIST",
     "SERIALWRAP_RELEASE_MANIFEST",
 ):
     os.environ.pop(_k, None)
@@ -151,3 +155,20 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "case(id): P4 驗收案例綁定（對應 p4_case_map.yaml）")
 
 
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """依平台與擁有者提供的 COM pair 條件標記測試 skip。"""
+    for item in items:
+        if "windows_native" in item.keywords and os.name != "nt":
+            item.add_marker(
+                pytest.mark.skip(
+                    reason="windows_native：請以 scripts/stage0/win-pytest.sh 執行（證據不足，非 PASS）"
+                )
+            )
+        if "posix_only" in item.keywords and os.name == "nt":
+            item.add_marker(pytest.mark.skip(reason="posix_only：Windows 不適用"))
+        if "windows_com" in item.keywords and not os.environ.get("SW_TEST_COM_PAIR"):
+            item.add_marker(
+                pytest.mark.skip(
+                    reason="BLOCKED-OWNER：需 OD-08 COM pair（SW_TEST_COM_PAIR；證據不足，非 PASS）"
+                )
+            )

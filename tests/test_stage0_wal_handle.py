@@ -8,7 +8,7 @@
   使本檔在實作前仍可 collection；Stage A 下各測試應因 `ModuleNotFoundError` 紅燈。
 - 依 P0 T14 規則：本檔混合 `core_portable` 與 `windows_native`，**模組層不放平台 marker**，
   平台 marker 逐函式標註；資源 marker 統一為 `memory_only`（只用暫存目錄與行程內物件）。
-- 替身 `CountingFs` 以 `PosixWalFs` 子類包裝 `WalFile`，記錄 open／close／write 並依劇本注入失敗。
+- 替身 `CountingFs` 以目前平台的預設 `WalFs` 實作包裝 `WalFile`，記錄 open／close／write 並依劇本注入失敗。
 """
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ def _load():
 
 
 def _counting_fs_cls():
-    """建立 `CountingFs` 類別：包裝 `PosixWalFs`，記錄 open／close／write 並可注入失敗劇本。
+    """建立 `CountingFs` 類別：包裝平台預設 WAL backend 並記錄 open／close／write。
 
     劇本 `script[path]` 為依序消費的動作，每次 `WalFile.write_all_flush` 消費一個（佇列空則為 `("ok",)`）：
       - `("ok",)`：委派完整寫出。
@@ -48,12 +48,13 @@ def _counting_fs_cls():
     """
     wal_fs = _load()
 
-    class CountingFs(wal_fs.PosixWalFs):
+    class CountingFs(type(wal_fs.default_wal_fs())):
         def __init__(self) -> None:
             super().__init__()
             self.opens: list[str] = []
             self.closed: list[str] = []
             self.writes: list[tuple[str, bytes]] = []
+            self.size_calls: list[str] = []
             self.script: dict[str, list[tuple]] = {}
             self.fail_always: dict[str, int] = {}
             self.open_fail: dict[str, BaseException] = {}
@@ -86,6 +87,17 @@ def _counting_fs_cls():
                         exc = wal_fs.PartialWriteError(errno.EIO, "partial write")
                         exc.sent = n  # 契約：PartialWriteError.sent＝失敗前 OS 已確認寫出的 bytes
                         raise exc
+                    if kind == "full_then_raise":
+                        inner.write_all_flush(data)
+                        raise wal_fs.PartialWriteError(
+                            errno.EIO, os.strerror(errno.EIO), sent=len(data)
+                        )
+                    if kind == "caused_partial":
+                        code = action[1]
+                        cause = OSError(code, os.strerror(code))
+                        raise wal_fs.PartialWriteError(
+                            code, str(cause), sent=0
+                        ) from cause
                     if kind != "ok":
                         raise AssertionError(f"未知劇本動作：{action!r}")
                     inner.write_all_flush(data)
@@ -104,6 +116,10 @@ def _counting_fs_cls():
                     inner.close()
 
             return _Wrapped()
+
+        def size(self, path: str) -> int | None:
+            self.size_calls.append(path)
+            return super().size(path)
 
     return CountingFs
 
@@ -150,6 +166,28 @@ def test_line_bytes_identical_to_baseline_format(tmp_path):
         raw = fp.read()
     expected = (json.dumps(rec, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
     assert raw == expected
+
+
+@pytest.mark.core_portable
+def test_empty_meta_first_append_creates_empty_mirror(tmp_path):
+    fs = _new_fs()
+    w = WalWriter(wal_dir=str(tmp_path), fs=fs)
+    rec = w.append(com="COM0", direction="META", source="system", payload=b"")
+    assert rec["loss_flag"] is False
+    assert os.path.exists(w.mirror_path)
+    assert os.path.getsize(w.mirror_path) == 0
+    assert fs.opens == [w.wal_path, w.mirror_path]
+
+
+@pytest.mark.core_portable
+def test_empty_meta_mirror_open_failure_does_not_count_as_write_failure(tmp_path):
+    fs = _new_fs()
+    w = WalWriter(wal_dir=str(tmp_path), fs=fs)
+    fs.open_fail[w.mirror_path] = PermissionError(errno.EACCES, "denied")
+    rec = w.append(com="COM0", direction="META", source="system", payload=b"")
+    assert rec["loss_flag"] is False
+    assert w.health()["write_failures"] == 0
+    assert w.unhealthy is False
 
 
 @pytest.mark.core_portable
@@ -239,9 +277,11 @@ def test_dir_removed_still_self_heals(tmp_path):
     shutil.rmtree(wal_dir)
     # 不推進任何 clock：名稱消失檢查不受 50 ms 節流影響
     rec = w.append(com="COM0", direction="RX", source="device", payload=b"b")
-    assert rec["seq"] == 2
+    assert rec["seq"] == 3
     assert os.path.exists(w.wal_path)
-    assert any(r["seq"] == 2 for r in _lines(w.wal_path))  # 紀錄落在新檔
+    rows = _lines(w.wal_path)
+    assert rows[0]["seq"] == 2 and rows[0]["dir"] == "META"
+    assert any(r["seq"] == 3 and r["payload_b64"] for r in rows)  # 紀錄落在新檔
     assert w.health()["recreated_count"] == 1
 
 
@@ -251,9 +291,10 @@ def test_file_unlinked_name_check_unthrottled(tmp_path):
     w = WalWriter(wal_dir=str(tmp_path), fs=fs)
     w.append(com="COM0", direction="RX", source="device", payload=b"a")
     os.unlink(w.wal_path)
-    w.append(com="COM0", direction="RX", source="device", payload=b"b")
+    rec = w.append(com="COM0", direction="RX", source="device", payload=b"b")
     assert os.path.exists(w.wal_path)
-    assert any(r["seq"] == 2 for r in _lines(w.wal_path))  # META 補寫由 T05 負責，本測試不斷言
+    assert rec["seq"] == 3
+    assert any(r["seq"] == 3 and r["payload_b64"] for r in _lines(w.wal_path))
 
 
 @pytest.mark.core_portable
@@ -264,6 +305,38 @@ def test_restart_resumes_max_seq(tmp_path):
         w1.append(com="COM0", direction="RX", source="device", payload=b"a")
     w2 = WalWriter(wal_dir=str(tmp_path))
     assert w2.append(com="COM0", direction="RX", source="device", payload=b"b")["seq"] == 6
+
+
+@pytest.mark.core_portable
+def test_restart_terminates_unterminated_wal_tail_before_new_record(tmp_path):
+    fs = _new_fs()
+    w1 = WalWriter(wal_dir=str(tmp_path), fs=fs)
+    w1.append(com="COM0", direction="RX", source="device", payload=b"a")
+    w1.close()
+    with open(w1.wal_path, "ab") as fp:
+        fp.write(b'{"seq":2,"partial":')
+
+    w2 = WalWriter(wal_dir=str(tmp_path), fs=fs)
+    rec = w2.append(com="COM0", direction="RX", source="device", payload=b"b")
+    assert rec["seq"] == 2 and rec["loss_flag"] is False
+    with open(w2.wal_path, "rb") as fp:
+        lines = fp.read().split(b"\n")
+    assert len(lines) == 4  # 舊紀錄、隔離的殘行、新紀錄與尾端空段
+    assert json.loads(lines[0])["seq"] == 1
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(lines[1])
+    assert json.loads(lines[2])["seq"] == 2
+    assert lines[3] == b""
+
+
+@pytest.mark.core_portable
+def test_append_reuses_rotation_size_checks_for_name_detection(tmp_path):
+    fs = _new_fs()
+    w = WalWriter(wal_dir=str(tmp_path), fs=fs)
+    w.append(com="COM0", direction="RX", source="device", payload=b"a")
+    fs.size_calls.clear()
+    w.append(com="COM0", direction="RX", source="device", payload=b"b")
+    assert fs.size_calls == [w.wal_path, w.mirror_path]
 
 
 @pytest.mark.core_portable
@@ -308,19 +381,46 @@ def test_partial_write_suffix_failure_terminates_tail(tmp_path):
 
 @pytest.mark.core_portable
 def test_full_write_then_exception_not_rewritten(tmp_path):
-    """WAL 已整行寫出（write_all_flush 正常回傳）後的後續步驟失敗，不得觸發 WAL 整行重寫。
-
-    注入點選在 append 內 WAL 寫入之後的 mirror 寫入：依規格，一般 OSError 從 write_all_flush
-    擲出即視為 sent == 0（會重寫），與「已完整寫出」語意衝突，故不在 write_all_flush 內擲。
-    """
+    """write_all_flush 已寫完整行才回報例外時，不得重寫該 WAL 行。"""
     fs = _new_fs()
     w = WalWriter(wal_dir=str(tmp_path), fs=fs)
     w.append(com="COM0", direction="RX", source="device", payload=b"a")
-    fs.script[w.mirror_path] = [("raise", errno.EIO)]  # WAL 已完整寫出之後才失敗
+    fs.script[w.wal_path] = [("full_then_raise",)]
     rec = w.append(com="COM0", direction="RX", source="device", payload=b"b")
     assert [r["seq"] for r in _lines(w.wal_path)] == [1, 2]  # 該 seq 只出現一次
     assert len(_wal_writes(fs, w)) == 2  # WAL 對 seq 2 只寫出一次
     assert rec["loss_flag"] is False
+
+
+@pytest.mark.core_portable
+def test_partial_write_error_preserves_underlying_os_message(tmp_path):
+    wal_fs = _load()
+    cause = OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+
+    class FailingStream:
+        def write(self, data):
+            raise cause
+
+    handle = wal_fs.PosixWalFile(FailingStream())
+    with pytest.raises(wal_fs.PartialWriteError) as caught:
+        handle.write_all_flush(b"x")
+    assert str(caught.value) == str(cause)
+    assert caught.value.__cause__ is cause
+    assert caught.value.sent == 0
+
+
+@pytest.mark.core_portable
+def test_health_last_write_error_uses_underlying_oserror(tmp_path):
+    fs = _new_fs()
+    w = WalWriter(wal_dir=str(tmp_path), fs=fs)
+    fs.script[w.wal_path] = [
+        ("caused_partial", errno.ENOSPC),
+        ("caused_partial", errno.ENOSPC),
+    ]
+    rec = w.append(com="COM0", direction="RX", source="device", payload=b"a")
+    cause = OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+    assert rec["loss_flag"] is True
+    assert w.health()["last_write_error"] == f"OSError: {cause}"
 
 
 @pytest.mark.core_portable

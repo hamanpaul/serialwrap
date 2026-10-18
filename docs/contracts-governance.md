@@ -16,13 +16,14 @@
 | `contracts/behavior_changes.yaml` | 行為變更登記簿。記錄所有行為變更項目（`BC-01`～`BC-05` 破壞性變更、`SC-01`～`SC-27` 規格澄清、`DF-01`～`DF-17` 與 `DF-19` 缺陷修復），定義核准決策（OD-04、OD-11、OD-13）、安全不變量（`safety_invariants`）、待確認項目（`pending_owner_confirmations`）與 A/B 測試模式。 |
 | `contracts/code_extraction.yaml` | 程式碼錯誤碼抽取規則。定義靜態 AST 抽取器如何從原始碼提取會被觸發輸出的診斷碼，宣告 `sinks`（匯入點）、`relays`（中繼點）、`passthrough`（透傳路徑）、`allow_unresolved`（允許未解析處）與 `exclude_values`（排除項）。 |
 | `contracts/rpc_schema.json` | serialwrap 自訂 NDJSON 請求／回應協定（非 JSON-RPC 2.0）Draft 2020-12 JSON Schema。定義所有 RPC 方法的請求參數、結果格式（`x-methods`）、錯誤碼清單及未實作變更暫存區（`x-pending`）。 |
-| `contracts/cli_schema.json` | CLI 子命令與退出碼 Draft 2020-12 JSON Schema。定義 CLI 參數、各子命令退出碼（`x-exit-codes`）及未實作變更暫存區（`x-pending`）。 |
+| `contracts/cli_schema.json` | CLI 子命令與退出碼 Draft 2020-12 JSON Schema。定義 CLI 參數、各子命令退出碼（`x-exit-codes`）、CLI 與 RPC 的混合呼叫表（`x-hybrid-rpc`）及未實作變更暫存區（`x-pending`）。 |
+| `contracts/release_manifest.schema.json` | 發佈組合（bundle）`release-manifest.json` 的 Draft 2020-12 JSON Schema（P1 T18 建立）。由 `sw_core/release_manifest.py` 讀取驗證，並供 P3 `mkbundle` 與 Rust doctor 沿用。manifest 是宣告而非內容證明；實際檔案比對見 `version_pairing` 與 `tree_sha256`。 |
 | `contracts/wal_record.schema.json` | Write-Ahead Log（WAL）單筆記錄的 Draft 2020-12 JSON Schema，約束 `seq`、`mono_ts_ns`、`wall_ts`、`source`、`cmd_id`、`crc32`、`payload_b64` 等結構。 |
 | `contracts/wal_meta_events.schema.json` | WAL meta 事件記錄的 JSON Schema。 |
 | `contracts/state_file.schema.json` | 持久化狀態檔（`state.json`）的 Draft 2020-12 JSON Schema。 |
 | `contracts/daemon_logging.yaml` | daemon 執行期日誌與事件記錄規範目錄。 |
 | `contracts/p0_row_coverage.yaml` | 規格調和表（spec-reconciliation）P0 列與契約凍結位置對照清單（T15 建立）。 |
-| `contracts/golden/` | 位元組級黃金測試資料目錄（例如 `rpc/line_limit.json`、`last_error/transport_stall_hint.json`），提供跨語言一致性比對標準。 |
+| `contracts/golden/` | 位元組級黃金測試資料目錄（例如 `rpc/line_limit.json`、`last_error/transport_stall_hint.json`），提供跨語言一致性比對標準。`golden/tree_sha256.ndjson` 每行為 `{"files":{relpath:內容},"tree_sha256":hex}`，供 `tree_sha256` 演算法的 Python 與 Rust 實作比對；其格式由 P1 計畫固定，因此不含 `captured_by`／`source` 欄位（非 capture 產物）。 |
 
 ---
 

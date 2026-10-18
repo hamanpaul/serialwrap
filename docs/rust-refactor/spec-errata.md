@@ -17,7 +17,7 @@
 - **涉及檔案**：`docs/rust-refactor/inventory/03-errors.md` §3.4 L190、`docs/rust-refactor/inventory/01-cli.md` §6.11 步驟 3、§6.12 步驟 4、§6.13
 - **盤點原文描述與歧義**：盤點內文 `01-cli.md` §6.11 步驟 3 明載 `serialwrap remote status` 直接印 `rt.status(run_dir)` 且 exit 0，§6.12 步驟 4 與 §6.13 將 `TUNNEL_STATUS_ERROR` 歸於 `connect --close` 與 `benches`。但在 `03-errors.md` §3.4 L190 表格簡述「remote status 回應異常」易被誤讀為 `remote status` 子命令，且計畫 `01-stage0-contracts.md` §Task T7 準備表誤寫為 patch status 後執行 `remote status`。
 - **Python 基線事實**：`serialwrap remote status` 為直接透傳且 exit 0；真正經 `_status_tunnels` 檢查並在狀態損毀（如回應非 dict、ok 為 false、或缺少 `tunnels` 清單）時拋出 `TunnelError("TUNNEL_STATUS_ERROR")` 的 CLI 命令為 `serialwrap benches`（`_run_benches`）與 `serialwrap connect --close`。
-- **特徵化測試**：`tests/test_contracts_gap_codes.py::TestGapPosixRemoteCli::test_tunnel_status_error_malformed` 透過 `cli.main(["benches"])` 驗證此碼之觸發與錯誤輸出。
+- **特徵化測試**：`tests/test_contracts_gap_codes.py::TestGapRemoteCli::test_tunnel_status_error_malformed` 透過 `cli.main(["benches"])` 驗證此碼之觸發與錯誤輸出。
 
 ### INV-ERR-02：`DEVICE_NOT_BOUND` 正常路徑不可達（僅防禦性分支）
 

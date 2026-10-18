@@ -164,6 +164,30 @@ def test_stale_mailbox_bytes_dropped_after_invalidation(tmp_path):
     assert port.writes == []
 
 
+def test_stale_telnet_chunk_advances_filter_without_uart_tx(tmp_path, monkeypatch):
+    port = FakePort()
+    b, _ = _make_bridge(tmp_path, port)
+    c = _client()
+    c.telnet = uio.TelnetFilter()
+    b._clients = {c.client_id: c}
+    b._interactive_owner = f"human:{c.client_id}"
+    replies: list[bytes] = []
+    monkeypatch.setattr(
+        b,
+        "_console_sock_send",
+        lambda _client, payload: replies.append(bytes(payload)),
+    )
+
+    captured = b.owner_gen
+    b.invalidate_deferred("reboot")
+    # IAC 跨 recv 邊界：舊 chunk 的資料仍丟棄，但 parser 必須保留協定狀態。
+    b._handle_console_rx(c, b"ab\xff", captured_owner_gen=captured)
+    b._handle_console_rx(c, b"\xfb\x1f", captured_owner_gen=b.owner_gen)
+
+    assert port.writes == []
+    assert replies == [b"\xff\xfe\x1f"]
+
+
 def test_overflow_clears_and_logs(tmp_path, monkeypatch, caplog):
     monkeypatch.setattr(uio, "DEFERRED_INPUT_MAX_BYTES", 8)
     port = FakePort()

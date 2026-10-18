@@ -43,6 +43,7 @@ async def serve_connection(reader, writer, handler, blocking_methods) -> None:
             req_id = obj.get("id")
             method = obj.get("method")
             params = obj.get("params")
+            after_response = None
             if not isinstance(method, str):
                 resp: dict[str, Any] = {"id": req_id, "ok": False, "error_code": "INVALID_METHOD"}
             else:
@@ -59,12 +60,17 @@ async def serve_connection(reader, writer, handler, blocking_methods) -> None:
                     result = {"ok": False, "error_code": "EXCEPTION", "message": str(exc)}
                 resp = {"id": req_id}
                 if isinstance(result, dict):
+                    after_response = result.pop("_rpc_after_write", None)
                     resp.update(result)
                 else:
                     resp.update({"ok": True, "data": result})
 
-            writer.write((json.dumps(resp, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8"))
-            await writer.drain()
+            try:
+                writer.write((json.dumps(resp, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8"))
+                await writer.drain()
+            finally:
+                if callable(after_response):
+                    after_response()
     finally:
         writer.close()
         await writer.wait_closed()
@@ -91,21 +97,24 @@ class JsonRpcUnixServer:
     async def start(self) -> None:
         if os.path.exists(self._socket_path):
             os.unlink(self._socket_path)
-        self._server = await asyncio.start_unix_server(self._handle_client, path=self._socket_path)
+        old_umask = os.umask(0o177)
+        try:
+            self._server = await asyncio.start_unix_server(self._handle_client, path=self._socket_path)
+        finally:
+            os.umask(old_umask)
         self._secure_socket()
 
     def _secure_socket(self) -> None:
-        """限制 socket 權限為 0660，並（若有指定）chgrp 到 SERIALWRAP_SOCKET_GROUP。
+        """預設限制 socket 權限為 0600；明確指定群組時改為 0660 並 chgrp。
 
-        systemd-system 模式下 daemon 以 serialwrap 帳號跑，需把 socket 群組設為 dialout（由 unit
-        的 Environment 指定），讓同群組的其他使用者 CLI 連得上；同時避免 world 可寫（Codex #2）。
-        user 模式 socket 在 $XDG_RUNTIME_DIR、本就僅本人可及，0660 無妨。
+        明確設定 SERIALWRAP_SOCKET_GROUP 時，讓同群組的 CLI 可連線，同時避免 world 可寫。
         """
+        group = os.environ.get("SERIALWRAP_SOCKET_GROUP")
+        mode = 0o660 if group and group.strip() else 0o600
         try:
-            os.chmod(self._socket_path, 0o660)
+            os.chmod(self._socket_path, mode)
         except OSError:
             pass
-        group = os.environ.get("SERIALWRAP_SOCKET_GROUP")
         if group and group.strip():
             try:
                 shutil.chown(self._socket_path, group=group.strip())

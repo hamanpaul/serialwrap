@@ -582,6 +582,8 @@ class TestCliTraceSetup(CliDiagnosticsMixin, unittest.TestCase):
                 trace_sink({"elapsed_ms": 1, "retry_count": 0, "errno": None, "errno_name": None})
             if method == "health.ping":
                 return {"ok": health_ok, **({} if health_ok else {"error_code": "SOCKET_ERROR"})}
+            if method == "health.status":
+                return {"ok": True, "pid": 12345}
             if method == "mcu.status":
                 return {"ok": True, "flashing": flashing}
             raise AssertionError(f"unexpected method: {method}")
@@ -617,7 +619,10 @@ class TestCliTraceSetup(CliDiagnosticsMixin, unittest.TestCase):
 
         quiet_sequence = [(item["method"], item["timeout_s"]) for item in quiet["calls"]]
         verbose_sequence = [(item["method"], item["timeout_s"]) for item in verbose["calls"]]
-        self.assertEqual(quiet_sequence, [("health.ping", 0.5), ("mcu.status", 0.5)])
+        self.assertEqual(
+            quiet_sequence,
+            [("health.ping", 0.5), ("mcu.status", 0.5), ("health.status", 0.5)],
+        )
         self.assertEqual(verbose_sequence, quiet_sequence)
         self.assertEqual(quiet["resolve_count"], 2)
         self.assertEqual(verbose["resolve_count"], 2)
@@ -626,7 +631,7 @@ class TestCliTraceSetup(CliDiagnosticsMixin, unittest.TestCase):
         self.assertEqual(self._stderr_json_lines(quiet["err"]), [])
         self.assertEqual(
             [trace["method"] for trace in self._stderr_json_lines(verbose["err"])],
-            ["health.ping", "mcu.status"],
+            ["health.ping", "mcu.status", "health.status"],
         )
         self.assertEqual(json.loads(quiet["out"])["ok"], True)
         self.assertEqual(json.loads(verbose["out"])["ok"], True)

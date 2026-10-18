@@ -486,6 +486,8 @@ def test_no_auto_resend_after_partial_in_login_fsm(tmp_path):
     user_writes = []
 
     def custom_write(payload, **kwargs):
+        if not payload.strip():
+            bridge._handle_serial_rx(b"\r\nlogin: ")
         if b"admin" in payload:
             user_writes.append(payload)
             raise TxIncompleteError(TxResult("completed", 2, len(payload), "short_write"))
@@ -495,9 +497,12 @@ def test_no_auto_resend_after_partial_in_login_fsm(tmp_path):
     port.write = custom_write
     bridge, wal = make_bridge(tmp_path, port=port)
     sp = SessionProfile(
-        name="test_p",
+        profile_name="test_p",
         com="COM0",
+        act_no=1,
+        alias="lab+1",
         device_by_id="/dev/null",
+        platform="shell",
         user_env="TEST_USER",
         pass_env="TEST_PASS",
         prompt_regex=r"root@box:~#\s",
@@ -505,7 +510,7 @@ def test_no_auto_resend_after_partial_in_login_fsm(tmp_path):
         password_regex=r"Password:\s",
         timeout_s=0.1,
     )
-    auth = SessionAuth(user="admin", password="password")
+    auth = SessionAuth(username="admin", password="password")
     bridge._handle_serial_rx(b"\r\nlogin: ")
 
     with pytest.raises(Exception):
@@ -556,3 +561,147 @@ def test_background_capture_from_seq_uses_exact_seq(tmp_path):
 
     mgr._on_bridge_rx(session.session_id, b"chunk1", wal_seq=seq0)
     assert cap.last_seq == seq0
+
+
+@pytest.mark.core_portable
+def test_echo_paced_oserror_keeps_confirmed_bytes_and_unknown_meta(tmp_path):
+    (TxResult,) = _load("sw_core.serial_port", "TxResult")
+    (TxUnknownError,) = _load("sw_core.uart_io", "TxUnknownError")
+    FakePort, make_bridge, wal_records = _load(
+        "stage0_fakes", "FakePort", "make_bridge", "wal_records"
+    )
+    port = FakePort()
+    bridge, wal = make_bridge(tmp_path, port=port)
+
+    def write(payload, *, cancel=None):
+        if payload == b"abc":
+            return TxResult("completed", 3, 3)
+        raise OSError(errno.EIO, "device disconnected")
+
+    port.write = write
+    bridge._await_echo_progress = lambda expected, offset, timeout_s: sum(
+        len(piece) for piece in expected
+    )
+
+    with pytest.raises(TxUnknownError) as ei:
+        bridge.send_command_echo_paced(
+            "abcdef", source="agent:x", cmd_id="paced-1", slice_size=3
+        )
+
+    assert (ei.value.result.outcome, ei.value.result.confirmed, ei.value.result.requested) == (
+        "unknown",
+        0,
+        3,
+    )
+    tx = [row for row in wal_records(wal) if row["dir"] == "TX"]
+    meta = [row for row in wal_records(wal) if row["dir"] == "META"]
+    assert len(tx) == 1
+    assert base64.b64decode(tx[0]["payload_b64"]) == b"abc"
+    assert len(meta) == 1
+    assert meta[0]["meta"]["event"] == "tx_outcome_unknown"
+    assert meta[0]["meta"]["unknown_range"] == [0, 3]
+    assert bridge.tx_account("paced-1") == (3, True)
+
+
+@pytest.mark.core_portable
+def test_echo_paced_logs_confirmed_bytes_on_unexpected_exception(tmp_path):
+    (TxResult,) = _load("sw_core.serial_port", "TxResult")
+    FakePort, make_bridge, wal_records = _load(
+        "stage0_fakes", "FakePort", "make_bridge", "wal_records"
+    )
+    port = FakePort(write_results=[TxResult("completed", 3, 3)])
+    bridge, wal = make_bridge(tmp_path, port=port)
+
+    def fail_echo(expected, offset, timeout_s):
+        raise OSError(errno.EIO, "echo reader failed")
+
+    bridge._await_echo_progress = fail_echo
+    with pytest.raises(OSError, match="echo reader failed"):
+        bridge.send_command_echo_paced(
+            "abc", source="agent:x", cmd_id="paced-unexpected", slice_size=3
+        )
+
+    tx = [row for row in wal_records(wal) if row["dir"] == "TX"]
+    assert len(tx) == 1
+    assert base64.b64decode(tx[0]["payload_b64"]) == b"abc"
+    assert bridge.tx_account("paced-unexpected") == (3, False)
+
+
+@pytest.mark.core_portable
+def test_tx_account_updates_before_wal_append_failure(tmp_path):
+    FakePort, make_bridge = _load("stage0_fakes", "FakePort", "make_bridge")
+
+    class FailingWal:
+        unhealthy = False
+
+        def append(self, **kwargs):
+            raise OSError(errno.EIO, "WAL append failed")
+
+    bridge, _ = make_bridge(tmp_path, port=FakePort(), wal=FailingWal())
+
+    with pytest.raises(OSError, match="WAL append failed"):
+        bridge.send_bytes(b"abc", source="agent:x", cmd_id="wal-fail-1")
+
+    assert bridge.tx_account("wal-fail-1") == (3, False)
+
+
+@pytest.mark.core_portable
+def test_pyserial_plain_oserror_keeps_confirmed_prefix(monkeypatch):
+    PySerialPort, TxResult = _load("sw_core.serial_port", "_PySerialPort", "TxResult")
+    (TxUnknownError,) = _load("sw_core.uart_io", "TxUnknownError")
+    import sys
+
+    class FakeSerialModule:
+        class SerialTimeoutException(Exception):
+            pass
+
+        class SerialException(Exception):
+            pass
+
+    class FakeSerial:
+        is_open = True
+
+        def __init__(self):
+            self.calls = 0
+
+        def write(self, payload):
+            self.calls += 1
+            if self.calls == 1:
+                return 2
+            raise OSError(errno.EIO, "device disconnected")
+
+    monkeypatch.setitem(sys.modules, "serial", FakeSerialModule)
+    port = PySerialPort.__new__(PySerialPort)
+    port._ser = FakeSerial()
+
+    with pytest.raises(TxUnknownError) as ei:
+        port.write(b"hello")
+
+    assert ei.value.result == TxResult(
+        "unknown", 2, 5, "OSError: [Errno 5] device disconnected"
+    )
+    assert ei.value.errno == errno.EIO
+
+
+@pytest.mark.core_portable
+def test_echo_wait_returns_current_progress_when_tx_cancelled(tmp_path):
+    (make_bridge,) = _load("stage0_fakes", "make_bridge")
+    bridge, _ = make_bridge(tmp_path)
+    started = threading.Event()
+    result = []
+
+    def wait_for_echo():
+        started.set()
+        result.append(
+            bridge._await_echo_progress(["not echoed"], bridge.rx_snapshot_len(), 5.0)
+        )
+
+    worker = threading.Thread(target=wait_for_echo, daemon=True)
+    worker.start()
+    assert started.wait(1.0)
+    time.sleep(0.03)
+    bridge._tx_cancel.set()
+    worker.join(0.25)
+
+    assert not worker.is_alive()
+    assert result == [0]

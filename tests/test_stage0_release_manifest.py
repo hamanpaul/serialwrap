@@ -214,9 +214,13 @@ def test_daemon_launch_argv_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
         env={"SERIALWRAP_RELEASE_MANIFEST": str(p)}, argv0="/x/serialwrap", frozen=False, script_path=none_py
     ) == [str(tmp_path / "bin" / "serialwrapd")]
 
-    side = tmp_path / "side"
-    side.mkdir()
-    d = side / "serialwrapd"
+    # T18 計畫偏差（見 changelog／回報）：manifest 查找為 argv0 的 bin/../release-manifest.json，
+    # 原 side=tmp/side 的父層即 tmp_path（_manifest 寫入處），會先命中 manifest（DF-05 步驟 1）。
+    # 改為 tmp/side/bin，使 bin/../ 不含 manifest，仍驗證步驟 3（同目錄 serialwrapd）。
+    side = tmp_path / "side" / "bin"
+    side.mkdir(parents=True)
+    # Windows 上 DF-05 步驟 3 的同目錄執行檔為 serialwrapd.exe（release_manifest 以 os.name 判定）。
+    d = side / ("serialwrapd.exe" if os.name == "nt" else "serialwrapd")
     d.write_text("#!/bin/sh\n", encoding="utf-8")
     d.chmod(0o755)
     assert rm.daemon_launch_argv(env={}, argv0=str(side / "serialwrap"), frozen=False, script_path=none_py) == [str(d)]
@@ -230,6 +234,227 @@ def test_daemon_launch_argv_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert rm.daemon_launch_argv(
         env={}, argv0="/nonexistent/serialwrap", python="/py", frozen=False, script_path=none_py
     ) == ["/py", "-m", "sw_core.daemon"]
+
+
+def test_tree_sha256_impl_matches_golden_vectors(tmp_path: Path) -> None:
+    """實作 rm.tree_sha256 對 golden 每筆向量相符（整樹掃描與 files= 兩種路徑皆需通過）。"""
+    rm = _load_rm()
+    root = Path(__file__).resolve().parents[1] / "contracts" / "golden"
+    lines = (root / "tree_sha256.ndjson").read_text(encoding="utf-8").splitlines()
+    assert len(lines) >= 4
+    for idx, line in enumerate(lines):
+        case = json.loads(line)
+        base = tmp_path / f"case{idx}"
+        for rel, data in case["files"].items():
+            target = base / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data.encode("utf-8"))
+        assert rm.tree_sha256(str(base)) == case["tree_sha256"], f"case {idx} full-walk"
+        assert rm.tree_sha256(str(base), files=list(case["files"])) == case["tree_sha256"], f"case {idx} files="
+
+
+def test_tree_sha256_excludes_nested_pycache_and_stray_pyc(tmp_path: Path) -> None:
+    """巢狀 __pycache__ 與目錄外的 .pyc 皆排除；其餘 .py 照常計入。"""
+    rm = _load_rm()
+    (tmp_path / "pkg" / "__pycache__").mkdir(parents=True)
+    (tmp_path / "pkg" / "__init__.py").write_bytes(b"")
+    (tmp_path / "pkg" / "__pycache__" / "__init__.cpython-312.pyc").write_bytes(b"\0")
+    (tmp_path / "pkg" / "stray.pyc").write_bytes(b"\1")
+    entries = f"pkg/__init__.py\0{hashlib.sha256(b'').hexdigest()}\n"
+    assert rm.tree_sha256(str(tmp_path)) == hashlib.sha256(entries.encode("utf-8")).hexdigest()
+
+
+def test_tree_sha256_missing_root_raises(tmp_path: Path) -> None:
+    """根目錄不存在時拋出 OSError，不得回傳空樹雜湊（os.walk onerror）。"""
+    rm = _load_rm()
+    with pytest.raises(OSError):
+        rm.tree_sha256(str(tmp_path / "missing"))
+
+
+def test_package_tree_sha256_matches_independent_recompute() -> None:
+    """package_tree_sha256 的 relpath 以 sw_core/ 起頭，且與獨立重算相等。"""
+    rm = _load_rm()
+    import sw_core
+
+    pkg = Path(sw_core.__file__).resolve().parent
+    pairs: list[tuple[str, str]] = []
+    for path in sorted(pkg.rglob("*")):
+        if not path.is_file():
+            continue
+        parts = path.relative_to(pkg.parent).parts
+        if "__pycache__" in parts or path.suffix == ".pyc":
+            continue
+        pairs.append(("/".join(parts), hashlib.sha256(path.read_bytes()).hexdigest()))
+    assert pairs and all(rel.startswith("sw_core/") for rel, _ in pairs)
+    entries = "".join(f"{rel}\0{h}\n" for rel, h in sorted(pairs, key=lambda kv: kv[0].encode("utf-8")))
+    assert rm.package_tree_sha256() == hashlib.sha256(entries.encode("utf-8")).hexdigest()
+
+
+def _asset_stub(name: str) -> str:
+    return {"skill": "S1", "skill_windows": "S2"}[name]
+
+
+def test_pairing_rejects_mixed_versions(tmp_path: Path) -> None:
+    """規格 §9.5／arch §10.3：CLI 與 daemon 皆須等於 bundle_version；pairing 自洽的舊版仍不得通過。"""
+    rm = _load_rm()
+    p = _manifest(tmp_path)
+    base = rm.load_release_manifest(str(p))
+    common = dict(
+        manifest_dir=str(tmp_path),
+        package_tree=lambda: "TREE",
+        asset_sha256=_asset_stub,
+    )
+
+    old_daemon = json.loads(json.dumps(base))
+    old_daemon["pairing"]["daemon_version"] = "0.3.2"
+    old_daemon["components"]["daemon"]["version"] = "0.3.2"
+    item = rm.check_version_pairing(old_daemon, cli_version="0.4.0", daemon_version="0.3.2", **common)
+    assert item["ok"] is False
+    assert item["mismatches"] == ["daemon_version"]
+
+    # 不自洽：pairing 宣告 0.4.0，但 daemon 實際回報 0.3.2
+    item = rm.check_version_pairing(base, cli_version="0.4.0", daemon_version="0.3.2", **common)
+    assert item["mismatches"] == ["daemon_version"]
+
+    old_cli = json.loads(json.dumps(base))
+    old_cli["pairing"]["cli_version"] = "0.3.2"
+    old_cli["components"]["cli"]["version"] = "0.3.2"
+    item = rm.check_version_pairing(old_cli, cli_version="0.3.2", daemon_version="0.4.0", **common)
+    assert item["ok"] is False
+    assert item["mismatches"] == ["cli_version"]
+
+
+def test_pairing_rejects_non_exact_rule_when_called_directly(tmp_path: Path) -> None:
+    """check_version_pairing 不依賴呼叫端先行驗證：rule 非 exact 直接拋 invalid release manifest。"""
+    rm = _load_rm()
+    m = rm.load_release_manifest(str(_manifest(tmp_path)))
+    m["pairing"]["rule"] = "loose"
+    with pytest.raises(ValueError, match="invalid release manifest: pairing.rule"):
+        rm.check_version_pairing(
+            m, manifest_dir=str(tmp_path), cli_version="0.4.0", daemon_version="0.4.0",
+            package_tree=lambda: "TREE", asset_sha256=_asset_stub,
+        )
+
+
+def test_hash_format_fields_must_be_strings(tmp_path: Path) -> None:
+    """64 位數字的整數不得因 str() 通過 hex 格式檢查；載入層亦拒絕非字串。"""
+    rm = _load_rm()
+    p = _manifest(tmp_path)
+    m = rm.load_release_manifest(str(p))
+    m["components"]["assets"]["profiles_sha256"] = int("1" * 64)
+    m["components"]["supervisor"]["definition_sha256"] = int("2" * 64)
+    item = rm.check_version_pairing(
+        m, manifest_dir=str(tmp_path), cli_version="0.4.0", daemon_version="0.4.0",
+        package_tree=lambda: "TREE", asset_sha256=_asset_stub,
+    )
+    assert "profiles_sha256_format" in item["mismatches"]
+    assert "supervisor_definition_sha256_format" in item["mismatches"]
+
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    raw["components"]["assets"]["profiles_sha256"] = 1234
+    p.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid release manifest: components.assets.profiles_sha256"):
+        rm.load_release_manifest(str(p))
+
+
+def test_launcher_invalid_type_rejected_and_startup_falls_back(tmp_path: Path) -> None:
+    """launcher.path 為 null／數字 → 載入拒絕（欄位名稱明確）；daemon start 退回後續定位順序而非 AttributeError。"""
+    rm = _load_rm()
+    p = _manifest(tmp_path)
+    none_py = str(tmp_path / "no-serialwrapd.py")
+    for bad in (None, 5):
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        raw["components"]["daemon"]["launcher"]["path"] = bad
+        p.write_text(json.dumps(raw), encoding="utf-8")
+        with pytest.raises(ValueError, match="invalid release manifest: components.daemon.launcher.path"):
+            rm.load_release_manifest(str(p))
+        argv = rm.daemon_launch_argv(
+            env={"SERIALWRAP_RELEASE_MANIFEST": str(p)}, argv0="/nonexistent/serialwrap",
+            python="/py", frozen=False, script_path=none_py,
+        )
+        assert argv == ["/py", "-m", "sw_core.daemon"]
+
+
+def test_absolute_launcher_path_is_not_rerooted(tmp_path: Path) -> None:
+    """dev bundle 的 launcher 為 repo 內絕對路徑：不得被 manifest 目錄重新掛載（否則假 launcher_sha256 不符）。"""
+    rm = _load_rm()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    launcher = repo / "serialwrapd.py"
+    launcher.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    p = _manifest(bundle)
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    raw["components"]["daemon"]["launcher"] = {"path": str(launcher), "sha256": rm.file_sha256(str(launcher))}
+    p.write_text(json.dumps(raw), encoding="utf-8")
+
+    loaded = rm.load_release_manifest(str(p))
+    item = rm.check_version_pairing(
+        loaded, manifest_dir=str(bundle), cli_version="0.4.0", daemon_version="0.4.0",
+        package_tree=lambda: "TREE", asset_sha256=_asset_stub,
+    )
+    assert "launcher_sha256" not in item["mismatches"]
+
+    argv = rm.daemon_launch_argv(
+        env={"SERIALWRAP_RELEASE_MANIFEST": str(p)}, argv0="/x/serialwrap",
+        frozen=False, script_path=str(tmp_path / "no-serialwrapd.py"),
+    )
+    assert argv == [os.path.abspath(str(launcher))]
+
+
+def test_deeply_nested_manifest_is_invalid_not_crash(tmp_path: Path) -> None:
+    """深層巢狀 JSON 不得以 RecursionError 穿越；回報 invalid release manifest。"""
+    rm = _load_rm()
+    p = tmp_path / rm.MANIFEST_NAME
+    p.write_text("[" * 100000 + "]" * 100000, encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid release manifest: unreadable"):
+        rm.load_release_manifest(str(p))
+
+
+def test_doctor_pairing_probes_resolved_endpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """config.yaml 殘留失效路徑時，doctor 須探測 CLI 實際解析到的 canonical endpoint（#108 fallback）。"""
+    _load_rm()
+    from sw_core import doctor_cmd
+
+    p = _manifest(tmp_path)
+    monkeypatch.setenv("SERIALWRAP_RELEASE_MANIFEST", str(p))
+    seen: list[str] = []
+
+    def fake_rpc(endpoint: str, method: str, params: dict, timeout_s: float | None = None, **_kw: Any) -> dict:
+        seen.append(endpoint)
+        return {"ok": True, "version": "0.4.0"}
+
+    with (
+        mock.patch(
+            "sw_core.cli._resolve_default_endpoint_with_source",
+            return_value=("/canonical/live.sock", "config.yaml（記錄 /stale/config.sock 不可連）"),
+        ),
+        mock.patch("sw_core.client.rpc_call", side_effect=fake_rpc),
+    ):
+        item = doctor_cmd._check_version_pairing(str(p))
+    assert seen == ["/canonical/live.sock"]
+    assert "daemon_unreachable" not in item["mismatches"]
+    assert "daemon_version" not in item["mismatches"]
+
+
+def test_doctor_pairing_fix_text_for_unreachable_only(tmp_path: Path) -> None:
+    """只缺 daemon 時 fix 指向 daemon start，而非重裝發佈組合。"""
+    _load_rm()
+    from sw_core import doctor_cmd
+
+    p = _manifest(tmp_path)
+    only_unreachable = {
+        "check": "version_pairing", "ok": False, "advisory": False,
+        "detail": "daemon_unreachable", "mismatches": ["daemon_unreachable"],
+    }
+    with (
+        mock.patch("sw_core.cli._resolve_default_endpoint_with_source", return_value=("/x.sock", "預設")),
+        mock.patch("sw_core.client.rpc_call", return_value={"ok": False}),
+        mock.patch("sw_core.release_manifest.check_version_pairing", return_value=dict(only_unreachable)),
+    ):
+        item = doctor_cmd._check_version_pairing(str(p))
+    assert item["fix"] == "serialwrap daemon start（或 service start）後重跑 doctor"
 
 
 def test_doctor_without_manifest_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -301,6 +526,9 @@ def test_cli_daemon_start_uses_launch_argv(tmp_path: Path, monkeypatch: pytest.M
         force_spawn=True,
     )
     fake_proc = mock.Mock()
+    # T18 計畫偏差（見回報）：替身行程必須仍在執行（poll() 回 None），否則
+    # _run_daemon_start 會依 DAEMON_EXITED 路徑回 2，與「spawn 成功回 0」的斷言矛盾。
+    fake_proc.poll.return_value = None
     with (
         mock.patch("sw_core.cli._safe_runtime_config", return_value=None),
         mock.patch("sw_core.cli._probe_healthy_daemon", return_value=False),

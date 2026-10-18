@@ -113,7 +113,8 @@ class TestExplicitTargetDeviceOwnership(unittest.TestCase):
         mgr2 = self._mgr([target_absent, target_present])
         with mgr2._lock:
             mgr2._devices = {PRESENT_BY_ID: DeviceInfo(by_id=PRESENT_BY_ID, real_path="/dev/ttyACM0")}
-        with mock.patch("sw_core.session_manager.UARTBridge") as MockBridge:
+        with mock.patch("sw_core.session_manager.UARTBridge") as MockBridge, \
+             mock.patch("sw_core.uart_io.open_serial_port", return_value=mock.MagicMock()):
             MockBridge.return_value.start.return_value = None
             mgr2._attach_by_id(PRESENT_BY_ID)
 
@@ -153,7 +154,8 @@ class TestExplicitTargetDeviceOwnership(unittest.TestCase):
         mgr2 = self._mgr([target_present, target_absent])
         with mgr2._lock:
             mgr2._devices = {PRESENT_BY_ID: DeviceInfo(by_id=PRESENT_BY_ID, real_path="/dev/ttyACM0")}
-        with mock.patch("sw_core.session_manager.UARTBridge") as MockBridge:
+        with mock.patch("sw_core.session_manager.UARTBridge") as MockBridge, \
+             mock.patch("sw_core.uart_io.open_serial_port", return_value=mock.MagicMock()):
             MockBridge.return_value.start.return_value = None
             mgr2._attach_by_id(PRESENT_BY_ID)
 

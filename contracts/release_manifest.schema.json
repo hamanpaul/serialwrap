@@ -1,0 +1,157 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "serialwrap release-manifest.json",
+  "description": "發佈組合（bundle）的 release manifest（規格 §9.5、OD-13；arch §10.1）。由 P1 T18 建立，供 sw_core/release_manifest.py 讀取驗證，並供 P3／P4 mkbundle 與 Rust doctor 沿用。manifest 是宣告而非內容證明：實際檔案比對見 version_pairing 與 tree_sha256。修改 contracts 內 revision 時依 P0 規則遞增 x-catalog-revision。",
+  "x-catalog-revision": 1,
+  "type": "object",
+  "required": [
+    "schema_version",
+    "bundle_version",
+    "stage",
+    "created_at",
+    "target",
+    "git_revision",
+    "contract_revision",
+    "components",
+    "pairing"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "bundle_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "stage": {
+      "type": "string",
+      "minLength": 1
+    },
+    "created_at": {
+      "type": "string",
+      "minLength": 1
+    },
+    "target": {
+      "type": "string",
+      "minLength": 1
+    },
+    "git_revision": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "contract_revision": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "contracts/ 的 git tree SHA，只記錄於 manifest（不得寫入 contracts/ 內任何檔）"
+    },
+    "components": {
+      "type": "object",
+      "required": [
+        "cli",
+        "daemon",
+        "python_cli_delegate",
+        "assets",
+        "supervisor"
+      ],
+      "properties": {
+        "cli": {
+          "type": "object",
+          "required": ["implementation", "version", "git_revision", "path", "sha256"],
+          "properties": {
+            "implementation": {"const": "rust"},
+            "version": {"type": "string", "minLength": 1},
+            "git_revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            "path": {"type": "string", "minLength": 1},
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        },
+        "daemon": {
+          "type": "object",
+          "required": ["implementation", "version", "git_revision", "launcher", "entry", "runtime", "package"],
+          "properties": {
+            "implementation": {"type": "string", "enum": ["python", "rust"]},
+            "version": {"type": "string", "minLength": 1},
+            "git_revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            "launcher": {
+              "type": "object",
+              "required": ["path", "sha256"],
+              "properties": {
+                "path": {"type": "string", "minLength": 1},
+                "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+              }
+            },
+            "entry": {
+              "type": "array",
+              "minItems": 1,
+              "items": {"type": "string"}
+            },
+            "runtime": {
+              "type": "object",
+              "required": ["path", "python_version", "sha256"],
+              "properties": {
+                "path": {"type": "string", "minLength": 1},
+                "python_version": {"type": "string", "minLength": 1},
+                "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+              }
+            },
+            "package": {
+              "type": "object",
+              "required": ["name", "version", "wheel_sha256", "tree_sha256"],
+              "properties": {
+                "name": {"type": "string", "minLength": 1},
+                "version": {"type": "string", "minLength": 1},
+                "wheel_sha256": {
+                  "type": ["string", "null"],
+                  "pattern": "^[0-9a-f]{64}$",
+                  "description": "null 僅限 mkbundle --dev 的 dev bundle（無 wheel）"
+                },
+                "tree_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+              }
+            }
+          }
+        },
+        "python_cli_delegate": {
+          "type": "object",
+          "required": ["entry", "tree_sha256"],
+          "properties": {
+            "entry": {
+              "type": "array",
+              "minItems": 1,
+              "items": {"type": "string"}
+            },
+            "tree_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        },
+        "assets": {
+          "type": "object",
+          "required": ["skill_sha256", "skill_windows_sha256", "profiles_sha256"],
+          "properties": {
+            "skill_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "skill_windows_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "profiles_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        },
+        "supervisor": {
+          "type": "object",
+          "required": ["default_mode", "definition_sha256"],
+          "properties": {
+            "default_mode": {
+              "type": "string",
+              "enum": ["systemd-user", "systemd-system", "on-demand", "windows-task", "windows-service"]
+            },
+            "definition_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        }
+      }
+    },
+    "pairing": {
+      "type": "object",
+      "required": ["rule", "cli_version", "daemon_version"],
+      "properties": {
+        "rule": {"const": "exact"},
+        "cli_version": {"type": "string", "minLength": 1},
+        "daemon_version": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

@@ -56,7 +56,7 @@ description: 透過 serialwrap broker + CLI 進行多 agent UART 存取，提供
 當外部工具需要對同一 raw `/dev/ttyUSBx` 做**獨佔**存取（例如 `ocp-mcu-upgrade` 燒錄 MCU SBL 二進位協定）時，serialwrap 持有該 FD 會造成 two-reader 競爭、外部工具 timeout。**不要**用 `session clear`（detach 後會自動 re-attach 搶回），改用 first-class handoff：
 1. `serialwrap device release --selector COM0 --source agent:flash --reason "flash MCU"`：serialwrap 關閉該 UART FD、clean-slate 清空 console、進入 `RELEASED`，**不會自動搶回**（跨 daemon 重啟亦保留）。
 2. 外部工具獨佔該 raw device 完成燒錄。
-3. `serialwrap device attach --selector COM0`：收回裝置並重建 primary console。外部仍持有時回 `DEVICE_STILL_HELD`（附 pids）；確認外部真的結束後可加 `--force` 略過檢查。
+3. `serialwrap device attach --selector COM0`：收回裝置並重建 primary console。外部仍持有時回 `DEVICE_STILL_HELD`（附 pids）；`--force` 只略過開檔前預檢，鎖後仍識別到 holder 時不會強制搶占，須等外部持有者釋放後再試。
 4. 期間 `serialwrap session self-test --selector COM0` 在 `RELEASED` 會回 `external_holder` / `reclaimable` / `recommended_action`（`wait_external_flash` 或 `device_attach`）；屬唯讀偵測，不開 tty、不干擾燒錄。
 5. 被遺忘的 release 可由 self-test 的 `reclaimable=true` 辨識（裝置不會永久卡住，但需明確 `device attach` 收回）。
 
@@ -89,7 +89,7 @@ serialwrap 另提供原生 MCU flash 端點（與上面 device handoff 互補）
 
 ## Timeout 語意（#123）
 - **呼叫端必須自行處理 timeout**：CLI 回 `TIMEOUT` 只代表「CLI 不再等待」，daemon 端操作可能仍在執行、稍後成功（host 過載時尤然）。看到 TIMEOUT 先讀附帶欄位再決定下一步，勿直接重送寫入類命令。
-- **長操作自動固定 floor**：`session attach`／`session recover`／`session self-test`／`session console-attach`（recover 升級分支可同步跑數十秒）為 daemon 端同步長操作；未指定全域 `--timeout` 時 CLI 自動採固定 45s 的 floor，一般方法維持 5s。顯式指定 `--timeout` 一律照用。floor 為誠實的寬鬆常數——CLI 無從得知 daemon 端 profile 的 `timeout_s`（bcm 類平台常 15s+、多階段 probe），不隨 recover/self-test 的子命令參數縮放（daemon 端對那些參數本就有 2s cap）；仍逾時時改看下一條的診斷欄位與 `session list`。
+- **長操作自動固定 floor**：`session attach`／`session recover`／`session self-test`／`session console-attach`／`device release`／`device attach`／`session clear`／`session bind` 為 daemon 端阻塞方法（`session console-attach` 的 recover 升級分支可同步跑數十秒）；未指定全域 `--timeout` 時 CLI 自動採固定 45s 的 floor，一般方法維持 5s。顯式指定 `--timeout` 一律照用。floor 為誠實的寬鬆常數——CLI 無從得知 daemon 端 profile 的 `timeout_s`（bcm 類平台常 15s+、多階段 probe），不隨 recover/self-test 的子命令參數縮放（daemon 端對那些參數本就有 2s cap）；仍逾時時改看下一條的診斷欄位與 `session list`。
 - **TIMEOUT 錯誤帶診斷欄位**：`daemon_reachable`（1s `health.ping` 探測）分辨「daemon 死亡／斷線」（false → 檢查 daemon／裝置）與「daemon 忙碌」（true → 操作多半仍在跑，稍候以 `session list`／`self-test` 確認結果）；可達時另附 `daemon_busy`（in-flight `commands`／`sessions` 計數）。
 - **`--retries N` 僅作用唯讀方法**：只有冪等唯讀白名單（`session list`、`health.*`、`device list` 等查詢類）會在 TIMEOUT／連線失敗／`EMPTY_RESPONSE` 時指數退避重試（0.5s 起 ×2、單次上限 5s）；寫入類（attach／recover／submit…）絕不自動重送。白名單呼叫最壞總耗時約 `(retries+1) × timeout_s + 退避總和`。
 
@@ -251,7 +251,7 @@ serialwrap mcu status
 | code | 介面／平台 | 可重試 | 意義 | Agent 處置 |
 |---|---|---|---|---|
 | `ALIAS_NOT_FOUND` | rpc／posix、windows | 修正參數後 | 要移除的 alias 不存在 | 以 session list 確認 alias 名稱後再重試 |
-| `AUTOBOOT_QUIET` | rpc、rec／posix、windows | 是 | session 名義為 READY，但 boot quiet 視窗進行中或 READY 再確認尚未完成 | 依 retry_after_s 等待後重送；manager 層回應無 retry_after_s 時以 5 秒為間隔重試 |
+| `AUTOBOOT_QUIET` | rpc、rec／posix、windows | 是 | session 名義為 READY，但 boot quiet 視窗進行中或 READY 再確認尚未完成 | command.submit／file.* 直接拒絕依 retry_after_s 等待後重送；execute-time command.get 紀錄未帶 retry_after_s 時每 5 秒重試 |
 | `BASE64_DECODE_FAILED` | rpc／posix、windows | 視情況 | 擷取到的 base64 內容無法解碼 | 檢查目標端 base64 工具與擷取內容後再重試 |
 | `BENCH_ENDPOINT_NOT_REMEMBERED` | cli_local／posix、windows | 修正參數後 | --bench 指定的 bench 尚未以 connect 記住 endpoint | 先執行 serialwrap connect 記住該 bench 的 endpoint 後再重試 |
 | `BENCH_STATE_IO_ERROR` | cli_local／posix、windows | 視情況 | benches.state.json 讀寫失敗（OS 錯誤） | 檢查 benches.state.json 的權限與磁碟狀態後重試 |
@@ -261,7 +261,7 @@ serialwrap mcu status
 | `CMD_NOT_CANCELABLE` | rpc／posix、windows | 否 | 命令已是 done 或 error 狀態，無法取消 | 改以 command.get 讀取既有結果，不需取消 |
 | `CMD_NOT_FOUND` | rpc／posix、windows | 否 | cmd_id 不存在（已被淘汰或從未提交），或 result_tail 無法取得該命令的結果 | 確認 cmd_id 來源；命令紀錄只保留有限筆數，紀錄不存在不代表命令未執行，不得因此重送；先以 session self-test、log tail 或 WAL 查證目標狀態，是否重新執行由操作者決定 |
 | `CMD_TOO_LONG` | rpc／posix、windows | 修正參數後 | 命令的 UTF-8 長度超過硬上限 16384 bytes，拒絕提交 | 縮短命令內容；超過 4096 bytes 的軟上限仍會成功，但會附 CMD_LENGTH_WARNING 警告（非錯誤碼） |
-| `COMMAND_ABORTED_IN_FLIGHT` | rec（未生效）／posix、windows | 否 | 已確認至少寫出 1 byte 後，因 release 或 recovery 而中止 | 命令已部分送出：勿重送；先以 session self-test 確認目標狀態 |
+| `COMMAND_ABORTED_IN_FLIGHT` | rec／posix、windows | 否 | 已確認至少寫出 1 byte 後，因 release 或 recovery 而中止 | 命令已部分送出：勿重送；先以 session self-test 確認目標狀態 |
 | `COMMAND_FAILED` | rec／posix、windows | 否 | 命令結果為 ok:false 但未帶 error_code 時的後備碼 | 視為失敗，先以 session self-test 確認狀態 |
 | `CONSOLE_LINE_LIMIT_TOO_SMALL` | rpc／posix、windows | 否 | profile 的 max_console_line_chars 太小，放不下傳輸必要的命令 | 調大 profile 的 max_console_line_chars 後重試 |
 | `CONSOLE_NOT_FOUND` | rpc／posix、windows | 否 | 指定的 console client_id 不存在 | 以 console list 取得現存 client_id 後再操作 |
@@ -274,7 +274,7 @@ serialwrap mcu status
 | `DEVICE_NOT_BOUND` | rpc／posix、windows | 修正參數後 | session 未設定 device_by_id，無法 attach | 先以 session.bind 綁定裝置後再 attach |
 | `DEVICE_NOT_FOUND` | rpc／posix、windows | 視情況 | 指定的裝置或 selector 解析不到對應裝置 | 以 device list 確認裝置在線且 by_id 正確，裝置出現後再 attach |
 | `DEVICE_NOT_PRESENT` | rpc／posix、windows | 視情況 | by_id 不在目前的裝置清單中（未插入或尚未列舉） | 確認裝置已插入且 device list 可見後重試 |
-| `DEVICE_STILL_HELD` | rpc／posix、windows | 視情況 | /proc 掃描到外部程式持有該 tty，非 force 的 device attach 被拒（回應不含 holder_unknown，BC-04 尚未實作） | 等待外部持有者釋放，或確認可安全中止後以 force 重試 |
+| `DEVICE_STILL_HELD` | rpc／posix、windows | 視情況 | UART 獨占開啟或 holder 預檢確認裝置仍被占用 | 等待已識別的外部持有者釋放後重試；force 只略過開檔前預檢，不會繞過實際開檔或鎖後 holder 掃描 |
 | `ECHO_ACK_UNSUPPORTED` | rpc／posix、windows | 修正參數後 | ack_mode 為 echo，但 bridge 不支援 echo 節流送出 | 改用其他 ack_mode 重試 |
 | `EMPTY_RESPONSE` | cli_client／posix、windows | 視情況 | 連線已關閉但未收到任何一行回應 | 僅白名單唯讀方法可由 CLI 重試；其他方法先以 health.ping 確認 daemon 狀態 |
 | `ENV_FILE_SOURCE_FAILED` | cli_local／posix、windows | 修正參數後 | env 檔以 bash -lc source 執行失敗（非 0 退出），或 Windows 讀取檔案時發生 OS 錯誤 | 確認 env_file 路徑與內容後重試 |
@@ -282,13 +282,13 @@ serialwrap mcu status
 | `FLASHING_BUSY` | rpc、rec、cli_local／posix、windows | 是 | session 處於 FLASHING 或 flash 臨界區，命令或操作被拒 | 等待燒錄結束（session 回到 ATTACHED 或 READY）後再重試 |
 | `FLASH_TARGET_IS_CONSOLE` | rpc／posix、windows | 修正參數後 | 燒錄目標是可下命令的 console 裝置，且未指定 force，拒絕執行 | 改選非 console 的燒錄目標；此碼目前 production 不可達，僅作為契約保留 |
 | `FLUSHED_BY_RECOVERY` | rec／posix、windows | 是 | 命令尚未執行即因 recovery 或 detach 被清空（未送出，可在 READY 後重送） | 確認 session 已回到 READY 後才可重送 |
-| `FLUSHED_BY_SHUTDOWN` | rec／posix、windows | 是 | daemon 停止時，尚未執行的排隊命令被清空（未送出，可重送） | daemon 重新啟動並確認 session 為 READY 後才可重送 |
+| `FLUSHED_BY_SHUTDOWN` | rpc、rec／posix、windows | 是 | daemon 停止時，尚未執行的排隊命令被清空（未送出，可重送）；原子交接凍結後的有副作用 RPC 回 reason:"handoff_frozen" | daemon 重新啟動並確認 session 為 READY 後才可重送 |
 | `FORCE_RECOVER_TIMEOUT` | rpc／posix、windows | 視情況 | 強制 recover（clear 後重新 attach）在 10 次、每次 1 秒的窗口內未達 READY | 以 session get_state 確認目前狀態後，再決定重試 recover 或處理裝置 |
 | `INTERACTIVE_EXPIRED` | rpc／posix、windows | 否 | 互動 lease 已逾時失效 | 重新 interactive open 取得新的 lease 後再送出 |
 | `INTERACTIVE_NOT_FOUND` | rpc／posix、windows | 否 | interactive_id 不存在，或 lease 狀態已不是 active | 重新 interactive open 取得 interactive_id |
 | `INTERNAL_ERROR` | cli_local／posix、windows | 否 | CLI 本地流程發生未預期例外 | 回報例外訊息；勿假設操作已失敗而重送寫入型命令 |
 | `INVALID_ARGS` | rpc、cli_local／posix、windows | 修正參數後 | 參數缺漏或型別／值不合法（RPC 分派或 CLI 參數驗證） | 依 CLI 或 RPC 說明修正參數後重送 |
-| `INVALID_BENCH_CONFIG` | cli_local／posix | 修正參數後 | benches.yaml 驗證失敗 | 修正 benches.yaml 的欄位後重試 |
+| `INVALID_BENCH_CONFIG` | cli_local／posix、windows | 修正參數後 | benches.yaml 驗證失敗 | 修正 benches.yaml 的欄位後重試 |
 | `INVALID_BENCH_STATE` | cli_local／posix、windows | 修正參數後 | benches.state.json 結構錯誤 | 檢查 benches.state.json 內容，結構損壞時需人工修復後重試 |
 | `INVALID_COMPLETION_REGEX` | rpc、rec、cli_local／posix、windows | 修正參數後 | completion_regex 驗證失敗（空字串、超過 1024 bytes、無法編譯，或可匹配空字串） | 修正 completion_regex 後重送 |
 | `INVALID_ENDPOINT` | cli_client、cli_local／posix、windows | 修正參數後 | endpoint 格式錯誤（tcp 缺 host 或 port、unix 路徑非絕對、未知 scheme） | 改用 tcp://host:port 或絕對 unix socket 路徑格式後重試 |
@@ -315,15 +315,15 @@ serialwrap mcu status
 | `PULL_PARSE_FAILED` | rpc／posix、windows | 視情況 | 擷取輸出中找不到 sentinel 區段，且無 encoder 失敗 sentinel | 確認目標端 encoder 輸出正常後重試 |
 | `READY_UNCONFIRMED` | rpc、rec／posix、windows | 否 | READY 再確認逾 300 秒或已達 5 次仍未確認，拒絕 agent 命令 | 勿重送；執行 serialwrap session self-test 取分類，再依分類處理 |
 | `REMOTE_BIND_UNVERIFIED` | cli_local／posix、windows | 視情況 | expose tcp 模式下 relay 的 ss 驗證失敗，或綁定位址非 loopback | 確認 relay 僅綁定 loopback 位址後重試 |
-| `REMOTE_NOT_SUPPORTED` | cli_local／posix、windows | 修正參數後 | 此平台（原生 Windows）不支援 remote 功能 | 改在 WSL2 或 Linux 環境執行 remote 功能 |
+| `REMOTE_NOT_SUPPORTED` | cli_local／posix、windows | 修正參數後 | daemon start 不支援遠端 endpoint；Windows 僅接受 loopback endpoint | 在本機啟動 daemon；Windows 若使用 TCP endpoint，請指定 loopback 位址 |
 | `RULE_NOT_FOUND` | rpc／posix、windows | 否 | 指定的 rule_id 不存在 | 以 event rule list 確認 rule_id 後重試 |
 | `SAMPLE_READ_FAILED` | cli_local／posix、windows | 修正參數後 | profile test 讀取樣本檔失敗 | 確認樣本檔路徑與讀取權限後重試 |
 | `SEND_FAILED` | rec／posix、windows | 否 | send 回呼拋出例外，無法確定命令是否已送出（結果不明） | 勿自動重送；先以 session self-test 與 command.get 確認狀態，再由操作者決定 |
 | `SESSION_BUSY` | rpc、rec／posix、windows | 是 | 同一 session 的前景操作仍在進行中 | 等待前景操作完成後重試 |
-| `SESSION_INTERACTIVE_BUSY` | rpc、rec／posix、windows | 是 | 已有不可搶占的 interactive lease，命令或檔案操作被拒 | 等待 interactive lease 結束（interactive close 或逾時）後重試 |
+| `SESSION_INTERACTIVE_BUSY` | rpc、rec／posix、windows | 是 | 已有不可搶占的 interactive lease，或 SC-13 到期收尾的 ownership restore 尚未完成；相關操作被拒 | 等待 interactive lease 結束或到期收尾完成後重試 |
 | `SESSION_NOT_FOUND` | rpc／posix、windows | 修正參數後 | selector 未對應任何 session | 以 session list 確認 selector 正確後重送 |
 | `SESSION_NOT_READY` | rpc、rec／posix、windows | 視情況 | session 狀態不符（非 READY，或 bridge 不存在） | 等待 session 進入 READY 後重試；必要時以 session self-test 檢查狀態 |
-| `SESSION_QUEUE_FULL` | rpc／posix、windows | 是 | session 待執行命令已達 256 筆上限 | 等待排隊命令完成後重試 |
+| `SESSION_QUEUE_FULL` | rpc／posix、windows | 是 | session 已接受或執行中的命令（含已 cancel 但 worker 仍執行）達 256 筆上限 | 等待排隊命令完成後重試 |
 | `SESSION_RECOVERING` | rpc、rec／posix、windows | 是 | session 恢復中（RECOVERING），操作暫不可用 | 等待恢復完成（session get_state 不再顯示 RECOVERING）後重試 |
 | `SOCKET_ERROR` | cli_client／posix、windows | 視情況 | 連線失敗（connect 或 send／recv 的 OS 錯誤，或平台不支援 AF_UNIX） | 僅白名單唯讀方法可由 CLI 自動重試；其他方法先以 health.ping 確認 daemon 狀態再決定 |
 | `SOCKET_UNAVAILABLE` | proc／posix | 否 | socket 路徑存在但 connect 失敗（非 ENOENT 與 ECONNREFUSED），非 JSON 回應，以 stderr 行與 exit 2 表示 | 檢查 socket 路徑的權限與殘留檔案後重試 |
@@ -333,16 +333,16 @@ serialwrap mcu status
 | `TARGET_DECODER_MISSING` | rpc／posix、windows | 否 | 目標端沒有 base64 或 openssl decoder | 在目標端安裝 base64 或 openssl 後再重試 |
 | `TARGET_ENCODER_FAILED` | rpc／posix、windows | 視情況 | 目標端 encoder 回報失敗（encoder failure sentinel 出現） | 檢查目標端 encoder 後重試 |
 | `TARGET_ENCODER_MISSING` | rpc／posix、windows | 否 | 目標端沒有可用的 encoder | 在目標端安裝 encoder 後再重試 |
-| `TEST_DEVICE_ALLOWLIST_REJECTED` | proc（未生效）／posix、windows | 修正參數後 | 隔離測試實例的裝置 allowlist 判定不通過（非隔離實例設定了 allowlist）；stderr 印出 serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED 與原因，exit 2 | 移除 allowlist 設定，或改在三個隔離目錄均明確設定的實例中使用 |
-| `TIMEOUT` | cli_client／posix、windows | 視情況 | 連線、傳送或接收逾時；白名單唯讀方法可重試，其他方法不可直接重送 | 非白名單方法不得直接重送；先以 health.ping 與回應中的 daemon_busy 判斷 daemon 狀態 |
+| `TEST_DEVICE_ALLOWLIST_REJECTED` | proc／posix、windows | 修正參數後 | 隔離測試實例的裝置 allowlist 判定不通過（非隔離實例設定了 allowlist）；stderr 印出 serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED 與原因，exit 2 | 移除 allowlist 設定，或改在三個隔離目錄均明確設定的實例中使用 |
+| `TIMEOUT` | cli_client、cli_local／posix、windows | 視情況 | 連線、傳送或接收逾時，或 daemon 管理操作等待舊行程結束逾時；白名單唯讀方法可重試，其他方法不可直接重送 | 非白名單方法不得直接重送；先以 health.ping 與回應中的 daemon_busy 判斷 daemon 狀態 |
 | `TRANSFER_ECHO_STALL` | rpc／posix、windows | 是 | echo-ACK 路徑 echo 停滯；換行未送出，命令未執行 | 命令未執行，可重新傳輸 |
 | `TRANSFER_PROBE_FAILED` | rpc／posix、windows | 視情況 | 工具探測命令回報 shell 錯誤 | 確認目標端工具可用後重試 |
 | `TRANSFER_TIMEOUT` | rpc／posix、windows | 視情況 | 檔案傳輸過程中 prompt 逾時 | 確認目標端狀態後重新傳輸 |
 | `TUNNEL_CONFLICT` | cli_local／posix、windows | 修正參數後 | 指定的 port 已有身分不同的 tunnel | 關閉既有 tunnel（connect --close）或改用其他 port 後重試 |
 | `TUNNEL_SPAWN_FAILED` | cli_local／posix、windows | 視情況 | ssh 行程在就緒前即結束 | 檢查 ssh 參數與遠端可達性後重試 |
-| `TUNNEL_STATUS_ERROR` | cli_local／posix | 視情況 | connect 與 benches 讀取 tunnel 狀態時，回應格式異常或缺少 tunnels 清單（若回應帶 code 則透傳該 code） | 檢查 remote 狀態與 ssh 控制通道後重試 |
+| `TUNNEL_STATUS_ERROR` | cli_local／posix、windows | 視情況 | connect 與 benches 讀取 tunnel 狀態時，回應格式異常或缺少 tunnels 清單（若回應帶 code 則透傳該 code） | 檢查 remote 狀態與 ssh 控制通道後重試 |
 | `TUNNEL_STILL_ACTIVE` | cli_local／posix、windows | 視情況 | connect --close 之後 tunnel 仍在運作 | 以 remote status 確認 tunnel 行程狀態後再重試 close |
-| `UNKNOWN_BENCH_CODE` | cli_local／posix | 修正參數後 | bench_registry 找不到指定的 bench code | 以 benches.yaml 內存在的 bench code 重試 |
+| `UNKNOWN_BENCH_CODE` | cli_local／posix、windows | 修正參數後 | bench_registry 找不到指定的 bench code | 以 benches.yaml 內存在的 bench code 重試 |
 | `UNKNOWN_EVENT_CMD` | cli_local／posix、windows | 修正參數後 | event 子命令未知 | 改用 event 支援的子命令重試 |
 | `UNKNOWN_PROFILE` | rpc、cli_local／posix、windows | 修正參數後 | profile 名稱不存在 | 以 profile 目錄中存在的名稱重試 |
 | `WAL_MISSING` | rpc／posix、windows | 視情況 | WAL 曾寫入過（current_seq 大於 0）但目前的 WAL 檔不存在 | 執行 serialwrap doctor 檢查 WAL 目錄與狀態 |

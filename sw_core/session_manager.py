@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import dataclasses
+import inspect
 import itertools
 import json
+import logging
 import os
 import re
 import shlex
@@ -12,16 +15,19 @@ import tempfile
 import threading
 import time
 import uuid
-from collections import deque
-from typing import Any, Callable
+from collections import OrderedDict, deque
+from typing import Any, Callable, Literal
 
+from . import serial_port as serial_port_mod
+from . import uart_io as uart_io_mod
 from .alias_registry import AliasRegistry
 from .auth import AuthResolution, resolve_session_auth
-from .config import ProfileTemplate, SessionProfile
+from .config import ProfileTemplate, SessionProfile, UartProfile
 from .command_completion import ERROR_INVALID_COMPLETION_REGEX, valid_completion_regex
 from .constants import (
     BG_CAPTURE_MAX_BYTES,
     BG_CAPTURE_MAX_COUNT,
+    DRAIN_TIMEOUT_MS,
     BOOT_BANNER_PATTERNS,
     BOOT_BANNER_TAIL_CHARS,
     BOOT_QUIET_WINDOW_S,
@@ -33,10 +39,12 @@ from .constants import (
     ERROR_RX_FLOOD,
     ERROR_TRANSPORT_STALL,
     HUMAN_ACTIVE_WINDOW_S,
+    INTERACTIVE_TOMBSTONE_MAX,
     LOG_DIR,
     MAX_RECOVERY_LEASE_S,
     READY_RECONFIRM_MAX_ATTEMPTS,
     READY_RECONFIRM_MAX_S,
+    READY_RECONFIRM_RETRY_S,
     REPROBE_BACKOFF_S,
     REPROBE_MAX_ATTEMPTS,
     REPROBE_MAX_INTERVAL_S,
@@ -57,9 +65,34 @@ from .login_fsm import (
     probe_ready,
 )
 from .transport_stall import classify_probe_failure, transport_stall_hint
-from .uart_io import PreservedConsoles, UARTBridge, _pty_available
+from .serial_port import SerialPort
+from .uart_io import (
+    PreservedConsoles,
+    TxIncompleteError,
+    TxPermit,
+    TxUnknownError,
+    UARTBridge,
+    _pty_available,
+)
 from .util import clean_text, now_iso
 from .wal import WalWriter
+
+
+def _login_tx_refused(exc: BaseException) -> bool:
+    """login FSM 在提交 fence 遭 quiet 或較新 login run 拒絕時回復為等待狀態。"""
+    if not isinstance(exc, TxIncompleteError):
+        return False
+    return (exc.result.error or "").removeprefix("revoked:") in {
+        "quiet",
+        "stale_login_gen",
+    }
+
+
+def _self_test_tx_refused(exc: BaseException) -> bool:
+    """self-test nonce probe 遭 quiet 拒絕時沿用可重試 quiet 回應。"""
+    if not isinstance(exc, TxIncompleteError):
+        return False
+    return (exc.result.error or "").removeprefix("revoked:") == "quiet"
 
 
 _ATTACHED_CONSOLE_LEASE_TIMEOUT_S = 86400.0
@@ -275,6 +308,48 @@ class _ForegroundOperation:
     session_id: str
     bridge: "UARTBridge"
     bridge_generation: int
+    cmd_id: str | None = None
+    kind: str = "command"
+    token: object = dataclasses.field(default_factory=object, compare=False)
+
+
+@dataclasses.dataclass
+class _AttachOp:
+    """同步取得 UART 獨占並交給 attach worker 的一次性操作身分。"""
+
+    token: object
+    session_id: str
+    by_id: str
+    bridge_generation: int
+    real_path: str
+    port: SerialPort | None = None
+    cancelled: threading.Event = dataclasses.field(default_factory=threading.Event)
+    done: threading.Event = dataclasses.field(default_factory=threading.Event)
+    probe_bridge: "UARTBridge | None" = None
+    release_request: tuple[str, str | None] | None = None
+    bind_requested: bool = False
+    port_transferred: bool = False
+    port_lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+
+
+@dataclasses.dataclass
+class _DrainJob:
+    session_id: str
+    bridge: UARTBridge
+    epoch: int
+    kind: str
+    reason: str
+    drop_consoles: bool
+    aborted_cmd_id: str | None
+    done: threading.Event
+    deadline: float
+    aborted_foreground: bool = False
+    attach_started: threading.Event | None = None
+    receipt: Any | None = None
+    target_by_id: str | None = None
+    source: str = "cli"
+    release_reason: str | None = None
+    closed_consoles: int = 0
 
 
 @dataclasses.dataclass
@@ -286,13 +361,25 @@ class _PostCloseAction:
     bridge: "UARTBridge | None" = None
     needs_resume: bool = False
     clear_owner_after_resume: bool = False
+    should_execute: Callable[[], bool] | None = None
+    on_complete: Callable[[], None] | None = None
 
     def execute(self) -> None:
-        if self.bridge is None or not self.needs_resume:
-            return
-        self.bridge.resume_interactive()
-        if self.clear_owner_after_resume:
-            self.bridge.set_interactive_owner(None)
+        try:
+            if self.bridge is None or not self.needs_resume:
+                return
+            if self.should_execute is not None and not self.should_execute():
+                return
+            try:
+                self.bridge.resume_interactive()
+            finally:
+                if self.clear_owner_after_resume and (
+                    self.should_execute is None or self.should_execute()
+                ):
+                    self.bridge.set_interactive_owner(None)
+        finally:
+            if self.on_complete is not None:
+                self.on_complete()
 
 
 @dataclasses.dataclass
@@ -306,8 +393,14 @@ class SessionRuntime:
     last_ready_at: str | None = None
     vtty_path: str | None = None
     bridge: UARTBridge | None = None
+    # attach probe 期間尚未公開給一般 session 操作的 bridge；RX quiet gate 仍須即時推送。
+    attach_bridge: UARTBridge | None = dataclasses.field(default=None, repr=False)
     attached_real_path: str | None = None
     bridge_generation: int = 0
+    login_gen: int = 0
+    _boot_quiet_lock: threading.RLock = dataclasses.field(
+        default_factory=threading.RLock, repr=False
+    )
     recovering: bool = False
     recovery_started_at: str | None = None
     pending_auto_login: bool = False
@@ -316,6 +409,10 @@ class SessionRuntime:
     _foreground_operation: _ForegroundOperation | None = dataclasses.field(default=None, repr=False)
     background_cmd_ids: list[str] = dataclasses.field(default_factory=list)
     active_capture: SessionCapture | None = None
+    drain_stalled: bool = False
+    drain_timeout_epoch: int | None = None
+    _pending_drain: _DrainJob | None = dataclasses.field(default=None, repr=False)
+    _release_persist_pending: bool = dataclasses.field(default=False, repr=False)
     retained_consoles: PreservedConsoles | None = None
     retained_human_owner: str | None = None
     retained_human_timeout_s: float | None = None
@@ -443,9 +540,10 @@ class SessionRuntime:
 
     def boot_quiet_active(self, now: float | None = None) -> bool:
         """boot quiet window 是否進行中（#130）。"""
-        if self.boot_quiet_until <= 0.0:
-            return False
-        return (time.monotonic() if now is None else now) < self.boot_quiet_until
+        with self._boot_quiet_lock:
+            if self.boot_quiet_until <= 0.0:
+                return False
+            return (time.monotonic() if now is None else now) < self.boot_quiet_until
 
     def arm_boot_quiet(self, now: float | None = None) -> None:
         """啟用／延長 boot quiet window，並清空 rolling tail（#130）。
@@ -454,20 +552,29 @@ class SessionRuntime:
         prompt，若不清掉，下一個 RX chunk 的解除檢查會被舊 prompt 誤觸發、
         quiet window 立即失效。
         """
-        base = time.monotonic() if now is None else now
-        self.boot_quiet_until = base + BOOT_QUIET_WINDOW_S
-        self.boot_banner_tail = ""
-        # #162：一旦疑似重開機，agent gate 需等 READY 經 nonce probe 再確認才解除。
-        # **重臂不延長 deadline**：banner／倒數行會在整段開機過程反覆抵達（每次都
-        # 呼叫本函式），若每次都把期限往後推，pending 的有界性即失效——週期性出現
-        # 字面 "U-Boot" 的 RX（cat /proc/cmdline、dmesg…）就能讓 gate 永久 armed。
-        # 期限只在「pending 由 False 翻 True」的那一刻起算。
-        if not self.ready_reconfirm_pending:
-            self.ready_reconfirm_pending = True
-            self.ready_reconfirm_deadline = base + READY_RECONFIRM_MAX_S
-            self.ready_reconfirm_attempts = 0
-            # 新一輪疑似重開機＝新的確認週期，清掉上一輪的終態旗標。
-            self.ready_reconfirm_failed = False
+        with self._boot_quiet_lock:
+            target = self.bridge or self.attach_bridge
+            invalidate_deferred = getattr(target, "invalidate_deferred", None)
+            if callable(invalidate_deferred):
+                invalidate_deferred("boot_quiet")
+            base = time.monotonic() if now is None else now
+            self.boot_quiet_until = base + BOOT_QUIET_WINDOW_S
+            if not self.profile.console_unlock_env:
+                self.login_gen += 1
+            self.boot_banner_tail = ""
+            # #162：一旦疑似重開機，agent gate 需等 READY 經 nonce probe 再確認才解除。
+            # **重臂不延長 deadline**：banner／倒數行會在整段開機過程反覆抵達（每次都
+            # 呼叫本函式），若每次都把期限往後推，pending 的有界性即失效——週期性出現
+            # 字面 "U-Boot" 的 RX（cat /proc/cmdline、dmesg…）就能讓 gate 永久 armed。
+            # 期限只在「pending 由 False 翻 True」的那一刻起算。
+            if not self.ready_reconfirm_pending:
+                self.ready_reconfirm_pending = True
+                self.ready_reconfirm_deadline = base + READY_RECONFIRM_MAX_S
+                self.ready_reconfirm_attempts = 0
+                # 新一輪疑似重開機＝新的確認週期，清掉上一輪的終態旗標。
+                self.ready_reconfirm_failed = False
+            self._push_probe_gate()
+            self._push_tx_gate()
 
     def clear_boot_quiet(self) -> None:
         """解除 boot quiet window 並清空 rolling tail（#130）。
@@ -475,8 +582,11 @@ class SessionRuntime:
         僅解除 TX 靜默維度；**不**清 ``ready_reconfirm_pending``（#162）——
         agent gate 的解除一律走 ``confirm_ready()``。
         """
-        self.boot_quiet_until = 0.0
-        self.boot_banner_tail = ""
+        with self._boot_quiet_lock:
+            self.boot_quiet_until = 0.0
+            self.boot_banner_tail = ""
+            self._push_probe_gate()
+            self._push_tx_gate()
 
     def confirm_ready(self) -> None:
         """READY 再確認落定（#162）：清 quiet 與 agent gate 的唯一入口。
@@ -488,11 +598,13 @@ class SessionRuntime:
 
         清 pending 的同時清掉全部有界化欄位，維持「成功是唯一正常出口」語意。
         """
-        self.clear_boot_quiet()
-        self.ready_reconfirm_pending = False
-        self.ready_reconfirm_deadline = 0.0
-        self.ready_reconfirm_attempts = 0
-        self.ready_reconfirm_failed = False
+        with self._boot_quiet_lock:
+            self.clear_boot_quiet()
+            self.ready_reconfirm_pending = False
+            self.ready_reconfirm_deadline = 0.0
+            self.ready_reconfirm_attempts = 0
+            self.ready_reconfirm_failed = False
+            self._push_tx_gate()
 
     def expire_ready_reconfirm(self, now: float | None = None, *, force: bool = False) -> bool:
         """pending 逾時／逾次 → 落 ``ready_reconfirm_failed`` 終態（#162 有界化）。
@@ -504,17 +616,49 @@ class SessionRuntime:
         ``force=True``：已有確定證據（如 RX tail 命中 bootloader prompt）證明自動
         確認不可能成功時，跳過時間／次數判定直接落終態。
         """
-        if not self.ready_reconfirm_pending:
-            return False
-        base = time.monotonic() if now is None else now
-        if not force:
-            deadline_hit = self.ready_reconfirm_deadline > 0.0 and base >= self.ready_reconfirm_deadline
-            attempts_hit = self.ready_reconfirm_attempts >= READY_RECONFIRM_MAX_ATTEMPTS
-            if not deadline_hit and not attempts_hit:
+        with self._boot_quiet_lock:
+            if not self.ready_reconfirm_pending:
                 return False
-        self.ready_reconfirm_pending = False
-        self.ready_reconfirm_failed = True
-        return True
+            base = time.monotonic() if now is None else now
+            if not force:
+                deadline_hit = self.ready_reconfirm_deadline > 0.0 and base >= self.ready_reconfirm_deadline
+                attempts_hit = self.ready_reconfirm_attempts >= READY_RECONFIRM_MAX_ATTEMPTS
+                if not deadline_hit and not attempts_hit:
+                    return False
+            self.ready_reconfirm_pending = False
+            self.ready_reconfirm_failed = True
+            self._push_tx_gate()
+            return True
+
+    def _push_probe_gate(self, bridge: UARTBridge | None = None) -> None:
+        with self._boot_quiet_lock:
+            target = bridge or self.bridge or self.attach_bridge
+            setter = getattr(target, "set_probe_gate", None) if target is not None else None
+            if callable(setter):
+                setter(
+                    quiet_until=(
+                        self.boot_quiet_until
+                        if not self.profile.console_unlock_env
+                        else 0.0
+                    ),
+                    login_gen_floor=self.login_gen,
+                    self_test_quiet_until=self.boot_quiet_until,
+                )
+
+    def _push_tx_gate(self, bridge: UARTBridge | None = None) -> None:
+        with self._boot_quiet_lock:
+            target = bridge or self.bridge or self.attach_bridge
+            setter = getattr(target, "set_tx_gate", None) if target is not None else None
+            if callable(setter):
+                setter(
+                    generation=self.bridge_generation,
+                    quiet=self.agent_gate_active(),
+                    lease_owner=(
+                        f"interactive:{self.interactive_session_id}"
+                        if self.interactive_session_id is not None
+                        else None
+                    ),
+                )
 
     def ready_reconfirm_remaining_s(self, now: float | None = None) -> float | None:
         """pending 距 deadline 的剩餘秒數；非 pending／無 deadline 時 None。"""
@@ -629,6 +773,8 @@ class SessionRuntime:
                 "line_count": self.active_capture.line_count,
                 "byte_count": self.active_capture.byte_count,
             } if self.active_capture else None,
+            "drain_stalled": self.drain_stalled,
+            "drain_timeout_epoch": self.drain_timeout_epoch,
         }
         # Windows TCP console 連線端點（#131 點 3）：無 PTY 平台恆輸出（bridge 未起時
         # 為 null，schema 跨 session 狀態穩定，consumer 不需處理 key 忽有忽無）；
@@ -651,6 +797,7 @@ class SessionManager:
         on_console_line: Callable[[str, str, str], None] | None = None,
         on_command_flush: Callable[[str, str], None] | None = None,
         state_path: str | None = None,
+        admission: Any | None = None,
     ) -> None:
         # state.json 路徑注入（#120）：daemon 走 default（模組層 STATE_PATH），測試注入 tmp。
         # fallback 於「建構時」讀模組層全域（非 def-time default），使既有
@@ -661,6 +808,7 @@ class SessionManager:
         self._on_detached = on_detached
         self._on_console_line = on_console_line
         self._on_command_flush = on_command_flush
+        self._admission = admission
         self._lock = threading.RLock()
         # state.json 寫入序列化（#133）：多 attach 執行緒並發 os.replace 同一目的檔在
         # Windows 會 WinError 5；獨立於 self._lock（snapshot 用），I/O 段專用、不巢狀他鎖。
@@ -675,6 +823,12 @@ class SessionManager:
         # _session_from_template 建立 dynamic session 時優先消費（pop）這裡的預配號。
         self._pending_com: dict[str, str] = {}
         self._attach_inflight: set[str] = set()
+        self._attach_threads: dict[str, threading.Thread] = {}
+        self._attach_ops: dict[str, _AttachOp] = {}
+        self._preopened_ports: dict[str, _AttachOp] = {}
+        self._active_attach_ops: dict[str, _AttachOp] = {}
+        self._attach_bridges: dict[str, UARTBridge] = {}
+        self._attach_start_events: dict[str, threading.Event] = {}
         # readiness 自動重探（#69）：_reprobe_inflight 防止同一 session 重複 spawn auto worker；
         # _reprobe_probe_locks 為 per-session probe 互斥（auto 用 non-blocking、manual attach/recover
         # 用 blocking），避免 auto 與 manual 在同一 bridge 上並發 probe（Finding 2）。
@@ -682,13 +836,22 @@ class SessionManager:
         self._reprobe_probe_locks: dict[str, threading.Lock] = {}
         self._reprobe_workers: list[threading.Thread] = []
         self._released_by_ids: set[str] = set()
+        self._draining_by_ids: dict[str, _DrainJob] = {}
+        self._aborted_cmd_ids: set[str] = set()
+        self._shutting_down = False
+        self._shutdown_deadline: float | None = None
+        self._shutdown_workers: set[threading.Thread] = set()
         # flash 偵測 probe 進行中的 COM（#83 RACE-2 final）：probe 已開 bridge flash_mode gate 擋 console，
         # 但 enter_flashing 之前 session.state 仍是 READY/ATTACHED，destructive op（clear/release/bind）只
         # 守 state==FLASHING → 探測窗口內仍可 detach/rebind bridge 中斷 probe。此 set 在 probe 期間封鎖。
         self._flash_critical_coms: set[str] = set()
-        self._loaded_released: dict[str, dict[str, str | None]] = {}
+        self._loaded_released: dict[str, dict[str, Any]] = {}
+        self._release_persist_events: dict[str, threading.Event] = {}
         self._background: dict[str, BackgroundCapture] = {}
         self._interactive: dict[str, InteractiveLease] = {}
+        self._tombstones: dict[str, deque[str]] = {}
+        self._interactive_post_close: dict[str, object] = {}
+        self._cancelled_tx_cmd_ids: OrderedDict[str, None] = OrderedDict()
         self._capture_fps: dict[str, Any] = {}  # capture_id → open file object
         self._templates: list[ProfileTemplate] = list(templates) if templates else []
         self._max_sessions = max_sessions
@@ -722,14 +885,287 @@ class SessionManager:
                 self._sessions[sid] = SessionRuntime(session_id=sid, profile=profile)
                 self._sessions[sid].profile_source = "yaml-target"
             self._aliases.set_for_session(sid, profile.alias)
-        for sid, meta in self._loaded_released.items():
+        for sid, meta in list(self._loaded_released.items()):
             s = self._sessions.get(sid)
+            if s is None:
+                by_id = meta.get("by_id")
+                if not isinstance(by_id, str) or not by_id:
+                    import logging
+
+                    logging.getLogger("serialwrap").warning(
+                        "released session 無法還原（session=%s、缺少 by_id），保留持久化阻擋",
+                        sid,
+                    )
+                    continue
+                sid_profile, _, sid_com = sid.rpartition(":")
+                pinned_name = self._profile_pins.get(by_id)
+                detected_name = self._profile_detected.get(by_id)
+                template_name = pinned_name or detected_name or sid_profile
+                tpl = self._template_by_name(template_name) or self._template_by_name(sid_profile)
+                if tpl is None and sid_profile in {"passthrough", "others-template"}:
+                    # 舊 state.json 不保存 template 內容；只對無命令能力的通用 passthrough
+                    # 名稱使用最小 profile。uboot-template 有 ready_probe 契約，缺少定義時
+                    # 必須保留未實體化的 RELEASED 阻擋，不能降級成另一種 profile。
+                    tpl = ProfileTemplate(
+                        profile_name=sid_profile,
+                        platform="passthrough",
+                        ready_probe="",
+                    )
+                if tpl is None:
+                    import logging
+
+                    logging.getLogger("serialwrap").warning(
+                        "released session 的 template 不存在（session=%s、profile=%s），保留持久化阻擋",
+                        sid,
+                        template_name,
+                    )
+                    continue
+                com = sid_com
+                if not isinstance(com, str) or not com:
+                    import logging
+
+                    logging.getLogger("serialwrap").warning(
+                        "released session 無法還原（session=%s、缺少 COM），保留持久化阻擋",
+                        sid,
+                    )
+                    continue
+                aliases = self._aliases.dump()
+                alias = next(
+                    (name for name, row in aliases.items() if row.get("session_id") == sid),
+                    None,
+                )
+                act_no: int | None = None
+                if isinstance(alias, str) and alias.startswith(f"{tpl.profile_name}+"):
+                    suffix = alias.rsplit("+", 1)[-1]
+                    if suffix.isdigit():
+                        act_no = int(suffix)
+                if act_no is None:
+                    match = re.fullmatch(r"COM(\d+)", com, flags=re.IGNORECASE)
+                    act_no = int(match.group(1)) + 1 if match is not None else len(self._sessions) + 1
+                if not isinstance(alias, str) or not alias:
+                    alias = f"{tpl.profile_name}+{act_no}"
+                s = self._session_from_template(
+                    tpl,
+                    by_id,
+                    com_override=com,
+                    act_no_override=act_no,
+                    alias_override=alias,
+                    session_id_override=sid,
+                )
+                source = "pin" if pinned_name else "detected" if detected_name else "fallback"
+                s.profile_source = source
             if s is not None:
                 s.state = "RELEASED"
                 s.released_by = meta.get("released_by")
                 s.released_at = meta.get("released_at")
                 s.released_reason = meta.get("reason")
+                self._loaded_released.pop(sid, None)
         self._save_state()
+
+    def begin_shutdown(self) -> None:
+        """凍結 attach、hotplug 與後置重開入口。"""
+        with self._lock:
+            self._shutting_down = True
+
+    def shutdown_drain(self, *, total_timeout_s: float = 5.0) -> dict[str, Any]:
+        """以一個共用期限等待 attach 收尾並取得所有 bridge 關閉回條。"""
+        self.begin_shutdown()
+        deadline = time.monotonic() + max(0.0, total_timeout_s)
+        with self._lock:
+            self._shutdown_deadline = deadline
+            attach_ops = {
+                id(op): op
+                for table in (self._attach_ops, self._preopened_ports, self._active_attach_ops)
+                for op in table.values()
+            }
+            for op in attach_ops.values():
+                op.cancelled.set()
+                if op.probe_bridge is not None:
+                    op.probe_bridge.begin_drain(
+                        op.bridge_generation,
+                        preserve_consoles=False,
+                        deadline=deadline,
+                    )
+            for by_id, bridge in list(self._attach_bridges.items()):
+                if by_id in self._draining_by_ids:
+                    continue
+                session = next(
+                    (row for row in self._sessions.values() if row.profile.device_by_id == by_id),
+                    None,
+                )
+                if session is not None:
+                    self._begin_attach_bridge_stop_locked(
+                        session,
+                        by_id,
+                        bridge,
+                        preserve_consoles=True,
+                        started_at=time.monotonic(),
+                    )
+            attach_threads = sorted(self._attach_threads.items())
+        stalled: list[str] = []
+        for by_id, worker in attach_threads:
+            if worker is threading.current_thread():
+                continue
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+            if worker.is_alive():
+                stalled.append(f"attach:{by_id}")
+
+        for op in attach_ops.values():
+            with self._lock:
+                unconsumed = (
+                    self._preopened_ports.get(op.by_id) is op
+                    and self._active_attach_ops.get(op.by_id) is not op
+                    and self._attach_ops.get(op.by_id) is not op
+                )
+            if unconsumed:
+                self._finish_attach_op(op)
+                continue
+            if not op.done.wait(max(0.0, deadline - time.monotonic())):
+                stalled.append(f"attachop:{op.by_id}")
+
+        with self._lock:
+            unresolved_ops = {
+                id(op): op
+                for table in (self._attach_ops, self._preopened_ports, self._active_attach_ops)
+                for op in table.values()
+            }
+        for op in unresolved_ops.values():
+            if not op.done.is_set():
+                stalled.append(f"attachop:{op.by_id}")
+
+        jobs: list[_DrainJob] = []
+        attach_cleanup_jobs: list[_DrainJob] = []
+        with self._lock:
+            for session in self._sessions.values():
+                if session._pending_drain is not None:
+                    job = session._pending_drain
+                elif session.bridge is not None:
+                    job = self._begin_drain_locked(
+                        session,
+                        kind="shutdown",
+                        reason="",
+                        drop_consoles=False,
+                        started_at=deadline,
+                        deadline=deadline,
+                    )
+                else:
+                    job = None
+                if job is not None and not any(existing is job for existing in jobs):
+                    jobs.append(job)
+            attach_cleanup_jobs = [
+                job for job in self._draining_by_ids.values()
+                if job.kind == "attach_cleanup"
+            ]
+        for job in jobs:
+            receipt = self._await_drain(job)
+            if receipt is None:
+                job.done.wait(max(0.0, deadline - time.monotonic()))
+                if not job.done.is_set() or not self._receipt_is_safe(job.receipt):
+                    stalled.append(job.session_id)
+        for job in attach_cleanup_jobs:
+            self._finish_attach_bridge_stop(job)
+            if not job.done.is_set():
+                job.done.wait(max(0.0, deadline - time.monotonic()))
+            if not job.done.is_set() or not self._receipt_is_safe(job.receipt):
+                stalled.append(f"attach:{job.session_id}")
+        return {"graceful": not stalled, "stalled": sorted(set(stalled))}
+
+    def _track_attach_bridge_stop(
+        self,
+        session: SessionRuntime,
+        by_id: str,
+        bridge: UARTBridge,
+        *,
+        preserve_consoles: bool = True,
+    ) -> Any | None:
+        """將 attach 失敗清理納入 by-id 屏障，避免回條前重新開啟裝置。"""
+        if not callable(getattr(bridge, "begin_drain", None)) or not callable(
+            getattr(bridge, "finish_drain", None)
+        ):
+            return bridge.stop(preserve_consoles=preserve_consoles)
+        started_at = time.monotonic()
+        with self._lock:
+            job = self._begin_attach_bridge_stop_locked(
+                session,
+                by_id,
+                bridge,
+                preserve_consoles=preserve_consoles,
+                started_at=started_at,
+            )
+        return self._finish_attach_bridge_stop(job)
+
+    def _begin_attach_bridge_stop_locked(
+        self,
+        session: SessionRuntime,
+        by_id: str,
+        bridge: UARTBridge,
+        *,
+        preserve_consoles: bool,
+        started_at: float,
+    ) -> _DrainJob:
+        job = _DrainJob(
+            session_id=session.session_id,
+            bridge=bridge,
+            epoch=session.bridge_generation,
+            kind="attach_cleanup",
+            reason="ATTACH_CLEANUP",
+            drop_consoles=not preserve_consoles,
+            aborted_cmd_id=None,
+            done=threading.Event(),
+            deadline=started_at + DRAIN_TIMEOUT_MS / 1000,
+                attach_started=self._attach_start_events.get(by_id)
+                if self._attach_bridges.get(by_id) is bridge else None,
+        )
+        self._draining_by_ids[by_id] = job
+        bridge.begin_drain(
+            job.epoch,
+            preserve_consoles=preserve_consoles,
+            deadline=job.deadline,
+        )
+        return job
+
+    def _finish_attach_bridge_stop(self, job: _DrainJob) -> Any | None:
+        if job.attach_started is not None and not job.attach_started.wait(
+            max(0.0, job.deadline - time.monotonic())
+        ):
+            return None
+        receipt = job.bridge.finish_drain(
+            max(0.0, job.deadline - time.monotonic()),
+            on_late_receipt=lambda late: self._complete_attach_bridge_stop(job, late),
+        )
+        if receipt is not None and self._receipt_is_safe(receipt):
+            self._complete_attach_bridge_stop(job, receipt)
+            return receipt
+        return None
+
+    def _complete_attach_bridge_stop(self, job: _DrainJob, receipt: Any) -> None:
+        if not self._receipt_is_safe(receipt):
+            return
+        with self._lock:
+            by_id = next((key for key, value in self._draining_by_ids.items() if value is job), None)
+            if by_id is None or job.done.is_set():
+                return
+            session = self._sessions.get(job.session_id)
+            if session is not None:
+                if session.attach_bridge is job.bridge:
+                    session.attach_bridge = None
+                if job.drop_consoles:
+                    session.retained_consoles = None
+                    session.retained_human_owner = None
+                    session.retained_human_timeout_s = None
+                else:
+                    self._store_retained_consoles_locked(
+                        session,
+                        getattr(receipt, "preserved", None),
+                        human_owner=session.retained_human_owner,
+                        human_timeout_s=session.retained_human_timeout_s,
+                    )
+            self._draining_by_ids.pop(by_id, None)
+            if self._attach_bridges.get(by_id) is job.bridge:
+                self._attach_bridges.pop(by_id, None)
+                self._attach_start_events.pop(by_id, None)
+            job.receipt = receipt
+            job.done.set()
 
     def _load_state(self) -> None:
         if not os.path.exists(self._state_path):
@@ -776,7 +1212,7 @@ class SessionManager:
             self._binding_overrides = normalized
         released = obj.get("released") if isinstance(obj, dict) else None
         if isinstance(released, dict):
-            loaded: dict[str, dict[str, str | None]] = {}
+            loaded: dict[str, dict[str, Any]] = {}
             for sid, meta in released.items():
                 if not isinstance(sid, str) or not isinstance(meta, dict):
                     continue
@@ -809,7 +1245,7 @@ class SessionManager:
         # during iteration 或寫出欄位彼此不一致的 state.json（Copilot review）；磁碟 I/O 留在
         # lock 外。self._lock 為 RLock，caller 已持鎖時可重入。
         with self._lock:
-            released: dict[str, dict[str, str | None]] = {}
+            released: dict[str, dict[str, Any]] = {}
             for sid, s in self._sessions.items():
                 if s.state == "RELEASED":
                     released[sid] = {
@@ -818,6 +1254,8 @@ class SessionManager:
                         "released_at": s.released_at,
                         "reason": s.released_reason,
                     }
+            for sid, meta in self._loaded_released.items():
+                released.setdefault(sid, dict(meta))
             payload = json.dumps(
                 {"aliases": self._aliases.dump(), "bindings": dict(self._binding_overrides),
                  "released": released, "profile_pins": dict(self._profile_pins),
@@ -947,15 +1385,20 @@ class SessionManager:
         self,
         tpl: ProfileTemplate,
         device_by_id: str,
+        *,
+        com_override: str | None = None,
+        act_no_override: int | None = None,
+        alias_override: str | None = None,
+        session_id_override: str | None = None,
     ) -> SessionRuntime:
         """從 template 建立新的動態 session（須在 self._lock 內呼叫）。
         注意：profile_source 由呼叫方（_attach_by_id_dynamic）在回傳後設定，此處預設值不具權威性。
         """
         # startup 確定性 rank（#100）：優先用 prepare_dynamic_rank 預配的 COM 號（與
         # attach 完成順序無關），無預配（runtime 熱插）才 fallback 最低空號。
-        com = self._pending_com.pop(device_by_id, None) or self._next_dynamic_com()
-        act_no = len(self._sessions) + 1
-        alias = f"{tpl.profile_name}+{act_no}"
+        com = com_override or self._pending_com.pop(device_by_id, None) or self._next_dynamic_com()
+        act_no = act_no_override if act_no_override is not None else len(self._sessions) + 1
+        alias = alias_override or f"{tpl.profile_name}+{act_no}"
         profile = SessionProfile(
             profile_name=tpl.profile_name,
             com=com,
@@ -982,7 +1425,7 @@ class SessionManager:
             bootloader_prompts=tpl.bootloader_prompts,
             uart=tpl.uart,
         )
-        sid = f"{profile.profile_name}:{com}"
+        sid = session_id_override or f"{profile.profile_name}:{com}"
         session = SessionRuntime(session_id=sid, profile=profile)
         self._sessions[sid] = session
         self._aliases.set_for_session(sid, alias)
@@ -1049,6 +1492,8 @@ class SessionManager:
         self,
         session: SessionRuntime,
         *,
+        kind: str = "command",
+        cmd_id: str | None = None,
         expected_duration_s: float | None = None,
     ) -> tuple[_ForegroundOperation | None, dict[str, Any] | None]:
         """以 session/bridge 身分原子取得前景操作 admission。
@@ -1068,6 +1513,8 @@ class SessionManager:
             session_id=session.session_id,
             bridge=bridge,
             bridge_generation=session.bridge_generation,
+            cmd_id=cmd_id,
+            kind=kind,
         )
         # 先關 bridge raw grant，再發佈 manager operation token；如此 TCP accept
         # 或 POSIX console attach 不會在 admission→實際 suspend 的窗口取得 raw。
@@ -1106,7 +1553,24 @@ class SessionManager:
                 # 被背壓中的 UART write 卡住。
                 flush_data = self._set_bridge_interactive_admission(operation.bridge, True)
             for source, payload in flush_data:
-                operation.bridge.send_bytes(payload, source=source, cmd_id=None)
+                client_id = source.partition(":")[2]
+                permit = TxPermit(
+                    f"console:{client_id}",
+                    operation.bridge_generation,
+                    "human_raw",
+                    owner_gen=getattr(
+                        payload,
+                        "owner_gen",
+                        getattr(operation.bridge, "owner_gen", 0),
+                    ),
+                )
+                self._send_bytes_with_permit(
+                    operation.bridge,
+                    payload,
+                    source=source,
+                    cmd_id=None,
+                    permit=permit,
+                )
         finally:
             with self._lock:
                 current = self._sessions.get(operation.session_id)
@@ -1120,6 +1584,22 @@ class SessionManager:
                     session.foreground_busy = False
                     session.fg_cmd_started_mono = None
                     session.fg_cmd_expected_duration_s = None
+
+    @staticmethod
+    def _foreground_operation_current_locked(
+        session: SessionRuntime,
+        bridge: UARTBridge,
+        operation: _ForegroundOperation | None,
+    ) -> bool:
+        if session.bridge is not bridge or session._pending_drain is not None:
+            return False
+        if operation is None:
+            return True
+        return bool(
+            session._foreground_operation is operation
+            and operation.bridge is bridge
+            and operation.bridge_generation == session.bridge_generation
+        )
 
     # --- agent 顯式命令 gate（#139/#162）----------------------------------------
     def _agent_gate_reject_locked(self, session: SessionRuntime) -> dict[str, Any] | None:
@@ -1150,10 +1630,17 @@ class SessionManager:
                 "recommended_action": "self_test",
             }
         if session.agent_gate_active():
+            if session.boot_quiet_active():
+                retry_after_s = round(
+                    max(session.boot_quiet_until - time.monotonic(), 0.0), 1
+                )
+            else:
+                retry_after_s = READY_RECONFIRM_RETRY_S
             return {
                 "ok": False,
                 "error_code": ERROR_AUTOBOOT_QUIET,
                 "selector": session.profile.com,
+                "retry_after_s": retry_after_s,
             }
         return None
 
@@ -1193,6 +1680,91 @@ class SessionManager:
     def _boot_quiet_blocks_probe(session: SessionRuntime, now: float | None = None) -> bool:
         """隱藏 lock 由 FSM 被動等待 RX 靜默；一般 profile 保留 180 秒 gate。"""
         return session.boot_quiet_active(now) and not session.profile.console_unlock_env
+
+    def _begin_login_run_locked(
+        self, session: SessionRuntime, bridge: UARTBridge | None = None
+    ) -> TxPermit:
+        """在既有 probe pre-check 的 manager lock 內建立新的登入世代 permit。"""
+        session.login_gen += 1
+        session._push_probe_gate(bridge)
+        return TxPermit(
+            f"system:login:{session.login_gen}",
+            session.bridge_generation,
+            "system_probe",
+            login_gen=session.login_gen,
+        )
+
+    def _self_test_permit_locked(
+        self, session: SessionRuntime, nonce: str
+    ) -> TxPermit:
+        """以 self-test pre-check 同一把 manager lock 擷取不可變提交身分。"""
+        return TxPermit(
+            f"system:self_test:{nonce}",
+            session.bridge_generation,
+            "self_test_probe",
+        )
+
+    @staticmethod
+    def _system_permit_context(bridge: UARTBridge, permit: TxPermit) -> Any:
+        setter = getattr(bridge, "system_permit", None)
+        return setter(permit) if callable(setter) else contextlib.nullcontext()
+
+    @staticmethod
+    def _operation_permit_context(bridge: UARTBridge, permit: TxPermit) -> Any:
+        setter = getattr(bridge, "operation_permit", None)
+        return setter(permit) if callable(setter) else contextlib.nullcontext()
+
+    @staticmethod
+    def _send_bytes_with_permit(
+        bridge: UARTBridge,
+        payload: bytes,
+        *,
+        source: str,
+        cmd_id: str | None,
+        permit: TxPermit,
+    ) -> Any:
+        """在新舊 bridge 介面間傳遞 permit，保留固定簽章測試替身相容性。"""
+        send_bytes = bridge.send_bytes
+        try:
+            parameters = inspect.signature(send_bytes).parameters
+        except (TypeError, ValueError):
+            accepts_permit = False
+        else:
+            accepts_permit = "permit" in parameters
+        if accepts_permit:
+            return send_bytes(payload, source=source, cmd_id=cmd_id, permit=permit)
+        operation_context = getattr(bridge, "operation_permit", None)
+        if callable(operation_context):
+            with operation_context(permit):
+                return send_bytes(payload, source=source, cmd_id=cmd_id)
+        return send_bytes(payload, source=source, cmd_id=cmd_id)
+
+    @staticmethod
+    def _send_command_with_permit(
+        bridge: UARTBridge,
+        command: str,
+        *,
+        source: str,
+        cmd_id: str | None,
+        permit: TxPermit,
+    ) -> Any:
+        """在新舊 bridge 介面間傳遞 permit，保留固定簽章替身相容性。"""
+        send_command = bridge.send_command
+        try:
+            parameters = inspect.signature(send_command).parameters
+        except (TypeError, ValueError):
+            accepts_permit = False
+        else:
+            accepts_permit = "permit" in parameters
+        if accepts_permit:
+            return send_command(
+                command, source=source, cmd_id=cmd_id, permit=permit
+            )
+        operation_context = getattr(bridge, "operation_permit", None)
+        if callable(operation_context):
+            with operation_context(permit):
+                return send_command(command, source=source, cmd_id=cmd_id)
+        return send_command(command, source=source, cmd_id=cmd_id)
 
     def _emit_credentials_unresolved_warning(
         self, session_id: str, com: str, auth_res: AuthResolution
@@ -1606,12 +2178,86 @@ class SessionManager:
         with self._lock:
             self._reprobe_workers = [t for t in self._reprobe_workers if t.is_alive()]
 
+    def _expire_interactive_leases_tick(self, now: float | None = None) -> int:
+        """由週期 tick 收回到期的非 human lease，並在鎖外執行還原與回放。"""
+        tick_now = time.monotonic() if now is None else now
+        post_actions: list[tuple[str, _PostCloseAction]] = []
+        expired_count = 0
+        with self._lock:
+            for interactive_id, lease in list(self._interactive.items()):
+                if lease.status != "active" or lease.owner.startswith("human:"):
+                    continue
+                if tick_now - lease.last_activity_at <= lease.timeout_s:
+                    continue
+                session = self._sessions.get(lease.session_id)
+                if session is None:
+                    self._record_interactive_terminal_locked(
+                        lease, terminal_status="expired", keep_tombstone=True,
+                    )
+                    expired_count += 1
+                    continue
+                closed, post = self._close_interactive_locked(
+                    session,
+                    interactive_id=interactive_id,
+                    terminal_status="expired",
+                    keep_tombstone=True,
+                )
+                if closed is not None:
+                    if post.needs_resume and post.bridge is not None:
+                        token = object()
+                        self._interactive_post_close[session.session_id] = token
+                        bridge_generation = session.bridge_generation
+                        expected_interactive_id = session.interactive_session_id
+                        post.should_execute = lambda s=session, b=post.bridge, g=bridge_generation, i=expected_interactive_id, t=token: self._interactive_tick_action_is_current(
+                            s, b, g, i, t,
+                        )
+                        post.on_complete = lambda s=session, t=token: self._finish_interactive_tick_action(
+                            s, t,
+                        )
+                    post_actions.append((interactive_id, post))
+                    expired_count += 1
+        for interactive_id, post in post_actions:
+            try:
+                post.execute()
+            except Exception as exc:
+                logging.getLogger("serialwrap").warning(
+                    "serialwrap: interactive lease 到期後還原失敗（interactive_id=%s error=%s）",
+                    interactive_id,
+                    type(exc).__name__,
+                )
+        return expired_count
+
+    def _interactive_tick_action_is_current(
+        self,
+        session: SessionRuntime,
+        bridge: UARTBridge,
+        bridge_generation: int,
+        interactive_id: str | None,
+        token: object,
+    ) -> bool:
+        """確認鎖外到期收尾仍屬於原 session、bridge 與 lease ownership。"""
+        with self._lock:
+            return (
+                self._interactive_post_close.get(session.session_id) is token
+                and self._sessions.get(session.session_id) is session
+                and session.bridge is bridge
+                and session.bridge_generation == bridge_generation
+                and session.interactive_session_id == interactive_id
+            )
+
+    def _finish_interactive_tick_action(self, session: SessionRuntime, token: object) -> None:
+        """鎖外到期收尾完成後解除該 session 的 lease admission gate。"""
+        with self._lock:
+            if self._interactive_post_close.get(session.session_id) is token:
+                self._interactive_post_close.pop(session.session_id, None)
+
     def reconcile_readiness(self) -> None:
         """週期性重探可復原的非 READY session。
 
         本方法由 DeviceWatcher tick 同步呼叫，因此只在 lock 內收集候選、不在此同步等待 probe；
         ATTACHED 的 readiness probe 改交背景 worker（Finding 3），DETACHED 走既有 threaded _spawn_attach。
         """
+        self._expire_interactive_leases_tick()
         now = time.monotonic()
         jobs: list[tuple[str, str, UARTBridge | None, str]] = []
         with self._lock:
@@ -1761,6 +2407,8 @@ class SessionManager:
             session.retained_human_timeout_s = human_timeout_s
 
     def _restore_retained_human_console_locked(self, session: SessionRuntime) -> None:
+        if session.session_id in self._interactive_post_close:
+            return
         owner = session.retained_human_owner
         timeout_s = session.retained_human_timeout_s
         session.retained_human_owner = None
@@ -1811,6 +2459,9 @@ class SessionManager:
             if lease is not None:
                 lease.status = "closed"
         session.interactive_session_id = None
+        if self._admission is not None:
+            self._admission.set_flag(session.profile.com, "lease", False)
+            self._admission.set_flag(session.profile.com, "recovering", False)
         session._stashed_human_lease = None  # 清除 recovery lease stash，避免跨 bridge 殘留
         # 舊 operation callback 可能仍在 join timeout 外執行；切換 bridge epoch
         # 時先撤銷其 token，避免遲到 finally 觸碰新 session 的 busy 狀態。
@@ -1826,7 +2477,298 @@ class SessionManager:
         session.background_cmd_ids.clear()
         self._on_detached(session.session_id)
 
+    def _begin_drain_locked(
+        self,
+        session: SessionRuntime,
+        *,
+        kind: str,
+        reason: str,
+        drop_consoles: bool,
+        started_at: float,
+        deadline: float | None = None,
+        target_by_id: str | None = None,
+        source: str = "cli",
+        release_reason: str | None = None,
+        bridge_override: "UARTBridge | None" = None,
+    ) -> _DrainJob | None:
+        """持 manager lock 建立去重 drain，先撤銷操作再凍結 bridge TX。"""
+        if session._pending_drain is not None:
+            return session._pending_drain
+        bridge = session.bridge or bridge_override
+        if bridge is None:
+            return None
+        by_id = session.profile.device_by_id
+        job_deadline = deadline if deadline is not None else started_at + DRAIN_TIMEOUT_MS / 1000
+        operation = session._foreground_operation
+        job = _DrainJob(
+            session_id=session.session_id,
+            bridge=bridge,
+            epoch=session.bridge_generation,
+            kind=kind,
+            reason=reason,
+            drop_consoles=drop_consoles,
+            aborted_cmd_id=operation.cmd_id if operation is not None else None,
+            done=threading.Event(),
+            deadline=job_deadline,
+            target_by_id=target_by_id,
+            source=source,
+            release_reason=release_reason,
+            aborted_foreground=session.foreground_busy,
+            attach_started=self._attach_start_events.get(by_id)
+            if by_id and self._attach_bridges.get(by_id) is bridge else None,
+        )
+        if job.aborted_cmd_id is not None:
+            self._aborted_cmd_ids.add(job.aborted_cmd_id)
+        session._pending_drain = job
+        if by_id:
+            self._draining_by_ids[by_id] = job
+        session.drain_stalled = False
+        if kind != "shutdown":
+            session.state = "RECOVERING"
+            session.last_error = reason
+        session._stashed_human_lease = None
+        if self._admission is not None:
+            self._admission.set_flag(session.profile.com, "recovering", True)
+        session._foreground_operation = None
+        session.foreground_busy = False
+        session.fg_cmd_started_mono = None
+        session.fg_cmd_expected_duration_s = None
+        if session.interactive_session_id is not None:
+            lease = self._interactive.pop(session.interactive_session_id, None)
+            if lease is not None:
+                lease.status = "closed"
+                if lease.owner.startswith("human:"):
+                    session.retained_human_owner = lease.owner
+                    session.retained_human_timeout_s = lease.timeout_s
+        session.interactive_session_id = None
+        if self._admission is not None:
+            self._admission.set_flag(session.profile.com, "lease", False)
+        self._stop_capture_locked(session)
+        for cmd_id in list(session.background_cmd_ids):
+            capture = self._background.get(cmd_id)
+            if capture is not None:
+                capture.status = "done"
+        session.background_cmd_ids.clear()
+        if kind == "release" and by_id:
+            self._released_by_ids.add(by_id)
+        if self._on_command_flush is not None:
+            self._on_command_flush(
+                session.session_id,
+                "FLUSHED_BY_SHUTDOWN" if kind == "shutdown" else "FLUSHED_BY_RECOVERY",
+            )
+        bridge.begin_drain(
+            job.epoch,
+            preserve_consoles=not drop_consoles,
+            deadline=job_deadline,
+        )
+        return job
+
+    @staticmethod
+    def _receipt_is_safe(receipt: Any) -> bool:
+        return bool(
+            getattr(receipt, "handle_closed", False)
+            and getattr(receipt, "reader_stopped", False)
+            and getattr(receipt, "writer_converged", False)
+        )
+
+    def _mark_drain_stalled(self, job: _DrainJob) -> None:
+        with self._lock:
+            session = self._sessions.get(job.session_id)
+            if session is None or session._pending_drain is not job:
+                return
+            session.drain_stalled = True
+            session.drain_timeout_epoch = job.epoch
+
+    def _await_drain(self, job: _DrainJob) -> Any | None:
+        remaining = max(0.0, job.deadline - time.monotonic())
+        if job.attach_started is not None and not job.attach_started.wait(
+            max(0.0, job.deadline - time.monotonic())
+        ):
+            self._mark_drain_stalled(job)
+            threading.Thread(
+                target=self._finish_drain_after_attach,
+                args=(job,),
+                name=f"serialwrap-drain-attach-{job.session_id}",
+                daemon=True,
+            ).start()
+            return None
+        receipt = job.bridge.finish_drain(
+            remaining,
+            on_late_receipt=lambda late: self._on_late_drain_receipt(job, late),
+        )
+        if receipt is None:
+            self._mark_drain_stalled(job)
+            return None
+        if not self._receipt_is_safe(receipt):
+            self._complete_drain(job, receipt)
+            return None
+        self._complete_drain(job, receipt)
+        return receipt
+
+    def _finish_drain_after_attach(self, job: _DrainJob) -> None:
+        if job.attach_started is None:
+            return
+        job.attach_started.wait()
+        self._await_drain(job)
+
+    def _on_late_drain_receipt(self, job: _DrainJob, receipt: Any) -> None:
+        try:
+            if not self._receipt_is_safe(receipt):
+                self._complete_drain(job, receipt)
+                return
+            self._complete_drain(job, receipt)
+        except Exception as exc:  # noqa: BLE001 — 背景回呼不得逸出 thread
+            if job.kind == "release":
+                with self._lock:
+                    session = self._sessions.get(job.session_id)
+                    if session is not None:
+                        session._release_persist_pending = True
+                import logging
+                logging.getLogger("serialwrap").error(
+                    "serialwrap: release 持久化失敗（session=%s）：%s",
+                    job.session_id,
+                    exc,
+                )
+
+    def _complete_drain(self, job: _DrainJob, receipt: Any) -> None:
+        should_attach = False
+        with self._lock:
+            session = self._sessions.get(job.session_id)
+            if session is None or session._pending_drain is not job or job.done.is_set():
+                return
+            if not self._receipt_is_safe(receipt):
+                session.drain_stalled = True
+                session.drain_timeout_epoch = job.epoch
+                job.receipt = receipt
+                return
+            job.receipt = receipt
+            if session.bridge is job.bridge and session.bridge_generation == job.epoch:
+                session.bridge = None
+                session.attached_real_path = None
+                session.vtty_path = None
+            if session.attach_bridge is job.bridge:
+                session.attach_bridge = None
+            if job.drop_consoles:
+                session.retained_consoles = None
+                session.retained_human_owner = None
+                session.retained_human_timeout_s = None
+            else:
+                self._store_retained_consoles_locked(
+                    session,
+                    getattr(receipt, "preserved", None),
+                    human_owner=session.retained_human_owner,
+                    human_timeout_s=session.retained_human_timeout_s,
+                )
+            session._pending_drain = None
+            session.drain_stalled = False
+            if self._admission is not None:
+                self._admission.set_flag(session.profile.com, "recovering", False)
+            by_id = session.profile.device_by_id
+            if by_id and self._draining_by_ids.get(by_id) is job:
+                self._draining_by_ids.pop(by_id, None)
+            if job.kind == "release":
+                session.state = "RELEASED"
+                session.released_by = job.source
+                session.released_at = session.released_at or now_iso()
+                session.released_reason = job.release_reason
+                if by_id:
+                    self._released_by_ids.add(by_id)
+                session._release_persist_pending = True
+                if self._attach_bridges.get(by_id or "") is job.bridge:
+                    self._attach_bridges.pop(by_id or "", None)
+                    self._attach_start_events.pop(by_id or "", None)
+            elif job.kind == "shutdown":
+                pass
+            else:
+                session.state = "DETACHED"
+                session.detached_at = now_iso()
+                if job.kind == "clear":
+                    session.last_error = "CLEARED"
+                elif job.kind == "bind":
+                    session.last_error = "REBOUND"
+                elif job.kind == "device_removed":
+                    session.last_error = "DEVICE_REMOVED"
+                elif job.kind == "io_error":
+                    session.last_error = f"BRIDGE_DOWN:{job.reason.removeprefix('BRIDGE_DOWN:')}"
+                elif job.kind == "recover":
+                    session.last_error = "DEVICE_REBOUND_REQUIRED"
+                self._reset_reprobe_progress_locked(session)
+                if job.kind == "clear" and by_id and by_id in self._devices:
+                    session.state = "ATTACHING"
+                    should_attach = True
+                elif job.kind == "bind":
+                    target = job.target_by_id
+                    if target:
+                        if by_id:
+                            self._released_by_ids.discard(by_id)
+                        session.released_by = None
+                        session.released_at = None
+                        session.released_reason = None
+                        session.profile = dataclasses.replace(session.profile, device_by_id=target)
+                        self._binding_overrides[session.session_id] = target
+                        has_device = target in self._devices
+                        session.state = "ATTACHING" if has_device else "DETACHED"
+                        session.last_error = None if has_device else "DEVICE_NOT_FOUND"
+                        should_attach = has_device
+                elif job.kind == "recover" and by_id and by_id in self._devices:
+                    should_attach = True
+                elif job.kind == "io_error" and by_id and by_id in self._devices:
+                    if session.pending_auto_login:
+                        session.state = "RECOVERING"
+                    else:
+                        session.state = "ATTACHING"
+                        should_attach = True
+                    session.last_error = None
+            job.done.set()
+        if job.kind == "release":
+            self._persist_release_state(job.session_id)
+        elif job.kind in {"bind", "clear"}:
+            try:
+                self._save_state()
+            except Exception:
+                raise
+        if should_attach and by_id:
+            self._spawn_attach(job.target_by_id if job.kind == "bind" and job.target_by_id else by_id)
+
+    def _persist_release_state(self, session_id: str) -> None:
+        """以單一持久化工作者完成 release；重複呼叫等待或接手失敗重試。"""
+        while True:
+            with self._lock:
+                session = self._sessions.get(session_id)
+                if session is None or not session._release_persist_pending:
+                    return
+                event = self._release_persist_events.get(session_id)
+                if event is None:
+                    event = threading.Event()
+                    self._release_persist_events[session_id] = event
+                    owner = True
+                else:
+                    owner = False
+            if not owner:
+                event.wait()
+                continue
+            try:
+                self._save_state()
+            except Exception:
+                with self._lock:
+                    session = self._sessions.get(session_id)
+                    if session is not None:
+                        session._release_persist_pending = True
+                    self._release_persist_events.pop(session_id, None)
+                    event.set()
+                raise
+            with self._lock:
+                session = self._sessions.get(session_id)
+                if session is not None:
+                    session._release_persist_pending = False
+                self._release_persist_events.pop(session_id, None)
+                event.set()
+            return
+
     def clear_session(self, selector: str) -> dict[str, Any]:
+        started_at = time.monotonic()
+        job: _DrainJob | None = None
+        detached_in_lock = False
         with self._lock:
             session = self.get_session(selector)
             if session is None:
@@ -1838,18 +2780,62 @@ class SessionManager:
                 return {"ok": False, "error_code": "FLASHING_BUSY", "selector": session.profile.com, "session": session.to_public_dict()}
             if session.state == "RELEASED" or session.profile.device_by_id in self._released_by_ids:
                 return {"ok": True, "released": True, "session": session.to_public_dict()}
-            self._detach_session_locked(session, reason="CLEARED")
             by_id = session.profile.device_by_id
-            has_device = bool(by_id and by_id in self._devices)
-            if has_device:
-                session.state = "ATTACHING"
-                session.last_error = None
-        self._save_state()
-        if has_device and by_id is not None:
-            self._spawn_attach(by_id)
+            if self._shutting_down:
+                raise RuntimeError("daemon stopping")
+            if session._pending_drain is not None:
+                return {
+                    "ok": False,
+                    "error_code": "SESSION_RECOVERING",
+                    "drain_stalled": session.drain_stalled,
+                    "drain_timeout_epoch": session.drain_timeout_epoch,
+                    "session": session.to_public_dict(),
+                }
+            if session.bridge is not None:
+                job = self._begin_drain_locked(
+                    session,
+                    kind="clear",
+                    reason="CLEARED",
+                    drop_consoles=False,
+                    started_at=started_at,
+                )
+            else:
+                self._detach_session_locked(session, reason="CLEARED", drop_consoles=False)
+                detached_in_lock = True
+                has_device = bool(by_id and by_id in self._devices)
+                session.state = "ATTACHING" if has_device else "DETACHED"
+                session.last_error = None if has_device else "CLEARED"
+                self._reset_reprobe_progress_locked(session)
+        if job is not None:
+            self._on_detached(session.session_id)
+            receipt = self._await_drain(job)
+            if receipt is None:
+                return {
+                    "ok": False,
+                    "error_code": "SESSION_RECOVERING",
+                    "drain_stalled": True,
+                    "drain_timeout_epoch": job.epoch,
+                    "session": session.to_public_dict(),
+                }
+        else:
+            if not detached_in_lock:
+                self._on_detached(session.session_id)
+            self._save_state()
+            if by_id and session.state == "ATTACHING":
+                self._spawn_attach(by_id)
         return {"ok": True, "session": session.to_public_dict()}
 
     def release_device(self, selector: str, *, source: str = "cli", reason: str | None = None) -> dict[str, Any]:
+        started_at = time.monotonic()
+        release_deadline = started_at + DRAIN_TIMEOUT_MS / 1000
+        job: _DrainJob | None = None
+        attach_op: _AttachOp | None = None
+        finish_unconsumed_op = False
+        persist_retry = False
+        detach_notified = False
+        already_released = False
+        closed_consoles = 0
+        aborted_cmd = False
         with self._lock:
             session = self.get_session(selector)
             if session is None:
@@ -1858,32 +2844,158 @@ class SessionManager:
             # （#69 r5；#83 RACE-2 final）。須先 exit_flashing 或待 probe 結束。
             if self._flash_busy_locked(session):
                 return {"ok": False, "error_code": "FLASHING_BUSY", "selector": session.profile.com, "session": session.to_public_dict()}
-            if session.state == "RELEASED":
-                return {"ok": True, "already_released": True, "session": session.to_public_dict()}
+
             by_id = session.profile.device_by_id
-            closed_consoles = len(session.bridge.list_consoles()) if session.bridge is not None else 0
-            aborted_cmd = session.foreground_busy
-            self._detach_session_locked(session, reason="RELEASED", drop_consoles=True)
-            session.state = "RELEASED"
-            session.released_by = source
-            session.released_at = now_iso()
-            session.released_reason = reason
-            self._reset_reprobe_progress_locked(session)
-            if by_id:
-                self._released_by_ids.add(by_id)
-            public = session.to_public_dict()
-        self._save_state()
-        return {"ok": True, "session": public, "closed_consoles": closed_consoles, "aborted_cmd": aborted_cmd}
+            attach_op = (
+                self._active_attach_ops.get(by_id or "")
+                or self._attach_ops.get(by_id or "")
+            )
+            if attach_op is None and by_id:
+                attach_op = self._preopened_ports.pop(by_id, None)
+                finish_unconsumed_op = attach_op is not None
+
+            if attach_op is not None:
+                already_released = session.state == "RELEASED"
+                if self._shutting_down and not already_released:
+                    raise RuntimeError("daemon stopping")
+                if attach_op.release_request is None:
+                    release_source = (session.released_by or source) if already_released else source
+                    release_reason = session.released_reason if already_released else reason
+                    attach_op.release_request = (release_source, release_reason)
+                attach_op.cancelled.set()
+                if attach_op.probe_bridge is not None:
+                    attach_op.probe_bridge.begin_drain(
+                        attach_op.bridge_generation,
+                        preserve_consoles=False,
+                        deadline=release_deadline,
+                    )
+                if not already_released:
+                    session.state = "RECOVERING"
+                    session.drain_stalled = False
+                    session.drain_timeout_epoch = None
+                    if self._admission is not None:
+                        self._admission.set_flag(session.profile.com, "recovering", True)
+            elif session.state == "RELEASED":
+                persist_retry = session._release_persist_pending
+                already_released = True
+            else:
+                if self._shutting_down:
+                    raise RuntimeError("daemon stopping")
+                if session._pending_drain is not None:
+                    if session._pending_drain.kind != "release":
+                        return {
+                            "ok": False,
+                            "error_code": "SESSION_RECOVERING",
+                            "drain_stalled": session.drain_stalled,
+                            "drain_timeout_epoch": session.drain_timeout_epoch,
+                            "session": session.to_public_dict(),
+                        }
+                    job = session._pending_drain
+                    closed_consoles = job.closed_consoles
+                    aborted_cmd = job.aborted_foreground
+                else:
+                    attach_bridge = self._attach_bridges.get(by_id or "")
+                    active_bridge = session.bridge or attach_bridge
+                    closed_consoles = len(active_bridge.list_consoles()) if session.bridge is not None else 0
+                    aborted_cmd = session.foreground_busy
+                    if active_bridge is not None:
+                        job = self._begin_drain_locked(
+                            session,
+                            kind="release",
+                            reason="RELEASED",
+                            drop_consoles=True,
+                            started_at=started_at,
+                            source=source,
+                            release_reason=reason,
+                            bridge_override=attach_bridge if session.bridge is None else None,
+                        )
+                        if job is not None:
+                            job.closed_consoles = closed_consoles
+                            detach_notified = True
+                    else:
+                        self._detach_session_locked(session, reason="RELEASED", drop_consoles=True)
+                        session.state = "RELEASED"
+                        session.released_by = source
+                        session.released_at = now_iso()
+                        session.released_reason = reason
+                        session.drain_stalled = False
+                        session._release_persist_pending = True
+                        if by_id:
+                            self._released_by_ids.add(by_id)
+                        persist_retry = True
+
+        if attach_op is not None:
+            if finish_unconsumed_op:
+                self._finish_attach_op(attach_op)
+            else:
+                attach_op.done.wait(max(0.0, release_deadline - time.monotonic()))
+            if not attach_op.done.is_set():
+                with self._lock:
+                    session.drain_stalled = True
+                    session.drain_timeout_epoch = attach_op.bridge_generation
+                    if session.state != "RELEASED":
+                        session.state = "RECOVERING"
+                return {
+                    "ok": False,
+                    "error_code": "SESSION_RECOVERING",
+                    "drain_stalled": True,
+                    "drain_timeout_epoch": attach_op.bridge_generation,
+                    "session": session.to_public_dict(),
+                }
+            if session._release_persist_pending:
+                self._persist_release_state(session.session_id)
+            if already_released:
+                return {"ok": True, "already_released": True, "session": session.to_public_dict()}
+            return {
+                "ok": True,
+                "session": session.to_public_dict(),
+                "closed_consoles": 0,
+                "aborted_cmd": False,
+            }
+        if already_released:
+            if persist_retry:
+                self._persist_release_state(session.session_id)
+            return {"ok": True, "already_released": True, "session": session.to_public_dict()}
+        if job is not None:
+            if detach_notified:
+                self._on_detached(session.session_id)
+            try:
+                receipt = self._await_drain(job)
+            except Exception:
+                with self._lock:
+                    session._release_persist_pending = True
+                raise
+            if receipt is None:
+                return {
+                    "ok": False,
+                    "error_code": "SESSION_RECOVERING",
+                    "drain_stalled": True,
+                    "drain_timeout_epoch": job.epoch,
+                    "session": session.to_public_dict(),
+                }
+            return {
+                "ok": True,
+                "session": session.to_public_dict(),
+                "closed_consoles": job.closed_consoles,
+                "aborted_cmd": job.aborted_foreground,
+            }
+        self._persist_release_state(session.session_id)
+        return {"ok": True, "session": session.to_public_dict(), "closed_consoles": closed_consoles, "aborted_cmd": aborted_cmd}
 
     def mark_flash_critical(self, com: str) -> None:
         """標記 COM 進入 flash 偵測 probe 臨界區（#83 RACE-2 final）：destructive op 一律 FLASHING_BUSY。"""
         with self._lock:
             self._flash_critical_coms.add(com)
+            if self._admission is not None:
+                self._admission.set_flag(com, "flashing", True)
 
     def unmark_flash_critical(self, com: str) -> None:
         """解除 flash probe 臨界區標記。"""
         with self._lock:
             self._flash_critical_coms.discard(com)
+            if self._admission is not None:
+                flashing = any(s.profile.com == com and s.state == "FLASHING" for s in self._sessions.values())
+                self._admission.set_flag(com, "flashing", flashing)
 
     def _flash_busy_locked(self, session: "SessionRuntime") -> bool:
         """session 是否處於 flash 臨界區（FLASHING 狀態或 probe 進行中）——須在 self._lock 內呼叫。"""
@@ -1905,8 +3017,15 @@ class SessionManager:
                 if session.state not in ("READY", "ATTACHED"):
                     continue
                 by_id = session.profile.device_by_id
-                dev = self._devices.get(by_id) if by_id else None
                 com = session.profile.com
+                if (
+                    session._pending_drain is not None
+                    or (by_id is not None and by_id in self._draining_by_ids)
+                    or session.foreground_busy
+                    or session._foreground_operation is not None
+                ):
+                    continue
+                dev = self._devices.get(by_id) if by_id else None
                 out.append({
                     "com": com,
                     "by_id": by_id,
@@ -1915,6 +3034,8 @@ class SessionManager:
                 })
                 if com:
                     self._flash_critical_coms.add(com)
+                    if self._admission is not None:
+                        self._admission.set_flag(com, "flashing", True)
         return out
 
     def enter_flashing(self, selector: str) -> dict:
@@ -1925,10 +3046,32 @@ class SessionManager:
                 return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
             if session.state == "FLASHING":
                 return {"ok": True, "already_flashing": True, "session": session.to_public_dict()}
+            if session.state == "RELEASED":
+                return {
+                    "ok": False,
+                    "error_code": "SESSION_NOT_READY",
+                    "session": session.to_public_dict(),
+                }
+            by_id = session.profile.device_by_id
+            if (
+                session.state == "RECOVERING"
+                or session._pending_drain is not None
+                or (by_id is not None and by_id in self._draining_by_ids)
+            ):
+                return {
+                    "ok": False,
+                    "error_code": "SESSION_RECOVERING",
+                    "session": session.to_public_dict(),
+                }
             session.flash_prev_state = session.state   # 記住以便結束後恢復
             session.state = "FLASHING"
+            if self._admission is not None:
+                self._admission.set_flag(session.profile.com, "flashing", True)
             if session.bridge is not None:
                 session.bridge.set_flash_mode(True)   # 擋 console 注入（C2）
+                invalidate_deferred = getattr(session.bridge, "invalidate_deferred", None)
+                if callable(invalidate_deferred):
+                    invalidate_deferred("flash")
             public = session.to_public_dict()
         return {"ok": True, "session": public}
 
@@ -1945,68 +3088,56 @@ class SessionManager:
                 session.bridge.set_flash_mode(False)
             if session.state != "FLASHING":
                 session.flash_prev_state = None
+                if self._admission is not None:
+                    self._admission.set_flag(
+                        session.profile.com,
+                        "flashing",
+                        session.profile.com in self._flash_critical_coms,
+                    )
                 return {"ok": True, "not_flashing": True, "session": session.to_public_dict()}
             session.state = session.flash_prev_state or ("READY" if session.bridge is not None else "DETACHED")
             session.flash_prev_state = None
+            if self._admission is not None:
+                self._admission.set_flag(
+                    session.profile.com,
+                    "flashing",
+                    session.profile.com in self._flash_critical_coms,
+                )
             public = session.to_public_dict()
         return {"ok": True, "session": public}
 
     def _probe_external_holder(self, real_path: str, *, _proc_root: str = "/proc") -> dict[str, Any]:
-        """唯讀偵測 real_path 是否被其他 process 持有；讀 _proc_root/*/fd，不開 tty、不做 I/O。"""
-        my_pid = os.getpid()
-        try:
-            target = os.path.realpath(real_path)
-        except OSError:
-            target = real_path
-        try:
-            target_res = os.stat(real_path)
-            target_rdev = getattr(target_res, "st_rdev", 0)
-        except OSError:
-            target_rdev = 0
-        holders: set[int] = set()
-        try:
-            entries = os.listdir(_proc_root)
-        except OSError:
-            return {"pids": [], "holder": None}
-        for entry in entries:
-            if not entry.isdigit():
-                continue
-            pid = int(entry)
-            if pid == my_pid:
-                continue
-            fd_dir = os.path.join(_proc_root, entry, "fd")
-            try:
-                fds = os.listdir(fd_dir)
-            except OSError:
-                continue
-            for fd in fds:
-                fd_path = os.path.join(fd_dir, fd)
-                try:
-                    link = os.readlink(fd_path)
-                except OSError:
-                    continue
-                matched = link == target or link == real_path
-                # 即使外部以 by-id / 其他 symlink 開啟，也以 device number(st_rdev)
-                # 比對同一個 char device，避免漏判導致 attach 誤判可收回、重回 two-reader race。
-                if not matched and target_rdev:
-                    try:
-                        fd_res = os.stat(fd_path)
-                        if getattr(fd_res, "st_rdev", 0) == target_rdev:
-                            matched = True
-                    except OSError:
-                        pass
-                if matched:
-                    holders.add(pid)
-                    break
-        ordered = sorted(holders)
-        return {"pids": ordered, "holder": (ordered[0] if ordered else None)}
+        """唯讀偵測 real_path 的 holder；掃描失敗另回 holder_unknown，不推導安全。"""
+        report = serial_port_mod.probe_holders(
+            real_path,
+            proc_root=_proc_root,
+            exclude_pid=os.getpid(),
+        )
+        pids = list(report.pids)
+        return {
+            "pids": pids,
+            "holder": pids[0] if pids else None,
+            "holder_unknown": report.holder_unknown,
+        }
 
     def attach_device(self, selector: str, *, force: bool = False) -> dict[str, Any]:
+        if self._shutting_down:
+            raise RuntimeError("daemon stopping")
         with self._lock:
             session = self.get_session(selector)
             if session is None:
                 return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
             by_id = session.profile.device_by_id
+            if self._shutting_down:
+                raise RuntimeError("daemon stopping")
+            if session._pending_drain is not None or (by_id and by_id in self._draining_by_ids):
+                return {
+                    "ok": False,
+                    "error_code": "SESSION_RECOVERING",
+                    "drain_stalled": session.drain_stalled,
+                    "drain_timeout_epoch": session.drain_timeout_epoch,
+                    "session": session.to_public_dict(),
+                }
             # 冪等：session 已 attached（有 bridge）且非 RELEASED → 直接回覆，不要改 state。
             # 否則會被設成 ATTACHING，但 _attach_by_id 因 bridge 已存在而早退，卡在 ATTACHING。
             if session.bridge is not None and session.state != "RELEASED" and by_id not in self._released_by_ids:
@@ -2014,19 +3145,190 @@ class SessionManager:
             if not by_id or by_id not in self._devices:
                 return {"ok": False, "error_code": "DEVICE_NOT_PRESENT", "selector": selector, "device_by_id": by_id}
             real_path = self._devices[by_id].real_path
+            session_id = session.session_id
+            bridge_generation = session.bridge_generation
+            profile = session.profile
+            if (
+                by_id in self._attach_ops
+                or by_id in self._preopened_ports
+                or by_id in self._active_attach_ops
+                or by_id in self._attach_bridges
+            ):
+                return {
+                    "ok": False,
+                    "error_code": "SESSION_RECOVERING",
+                    "drain_stalled": session.drain_stalled,
+                    "drain_timeout_epoch": session.drain_timeout_epoch,
+                    "session": session.to_public_dict(),
+                }
         if not force:
             holder = self._probe_external_holder(real_path)
             if holder["pids"]:
-                return {"ok": False, "error_code": "DEVICE_STILL_HELD", "pids": holder["pids"], "selector": selector}
+                return {
+                    "ok": False,
+                    "error_code": "DEVICE_STILL_HELD",
+                    "pids": holder["pids"],
+                    "holder_unknown": False,
+                    "selector": selector,
+                }
+
         with self._lock:
-            self._released_by_ids.discard(by_id)
-            session.released_by = None
-            session.released_at = None
-            session.released_reason = None
-            session.state = "ATTACHING"
-            session.last_error = None
-            self._reset_reprobe_progress_locked(session)
-            public = session.to_public_dict()
+            if self._shutting_down:
+                raise RuntimeError("daemon stopping")
+            if self._attach_ops.get(by_id) is not None or self._preopened_ports.get(by_id) is not None:
+                return {
+                    "ok": False,
+                    "error_code": "SESSION_RECOVERING",
+                    "drain_stalled": session.drain_stalled,
+                    "drain_timeout_epoch": session.drain_timeout_epoch,
+                    "session": session.to_public_dict(),
+                }
+            if session._pending_drain is not None or by_id in self._draining_by_ids:
+                return {
+                    "ok": False,
+                    "error_code": "SESSION_RECOVERING",
+                    "drain_stalled": session.drain_stalled,
+                    "drain_timeout_epoch": session.drain_timeout_epoch,
+                    "session": session.to_public_dict(),
+                }
+            if self._sessions.get(session_id) is not session:
+                return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            if session.profile.device_by_id != by_id or session.bridge_generation != bridge_generation:
+                return {
+                    "ok": False,
+                    "error_code": "SESSION_RECOVERING",
+                    "drain_stalled": session.drain_stalled,
+                    "drain_timeout_epoch": session.drain_timeout_epoch,
+                    "session": session.to_public_dict(),
+                }
+            device = self._devices.get(by_id)
+            if device is None or device.real_path != real_path:
+                return {
+                    "ok": False,
+                    "error_code": "DEVICE_NOT_PRESENT",
+                    "selector": selector,
+                    "device_by_id": by_id,
+                }
+            op = _AttachOp(
+                token=object(),
+                session_id=session_id,
+                by_id=by_id,
+                bridge_generation=bridge_generation,
+                real_path=real_path,
+            )
+            self._attach_ops[by_id] = op
+
+        port: SerialPort | None = None
+        try:
+            port = uart_io_mod.open_serial_port(real_path, profile.uart)
+            with op.port_lock:
+                op.port = port
+            port.open()
+        except serial_port_mod.DeviceHeldError as exc:
+            self._finish_attach_op(op)
+            pids = list(exc.holder.pids)
+            return {
+                "ok": False,
+                "error_code": "DEVICE_STILL_HELD",
+                "pids": pids,
+                "holder_unknown": False if pids else True,
+                "selector": selector,
+            }
+        except (serial_port_mod.DeviceNotPresentError, FileNotFoundError):
+            self._finish_attach_op(op)
+            return {
+                "ok": False,
+                "error_code": "DEVICE_NOT_PRESENT",
+                "selector": selector,
+                "device_by_id": by_id,
+            }
+        except OSError as exc:
+            with self._lock:
+                cancelled = op.cancelled.is_set() or op.release_request is not None
+                if not cancelled and self._attach_ops.get(by_id) is op:
+                    self._attach_ops.pop(by_id, None)
+                    if self._sessions.get(session_id) is session:
+                        session.state = "DETACHED"
+                        session.last_error = f"ATTACH_FAILED:{type(exc).__name__}"
+                        session.detached_at = now_iso()
+                        self._released_by_ids.discard(by_id)
+                        self._loaded_released.pop(session_id, None)
+                        session.released_by = None
+                        session.released_at = None
+                        session.released_reason = None
+                        public = session.to_public_dict()
+                    else:
+                        public = session.to_public_dict()
+                else:
+                    public = session.to_public_dict()
+            self._finish_attach_op(op)
+            if not cancelled:
+                self._save_state()
+                return {"ok": True, "session": public}
+            return {
+                "ok": False,
+                "error_code": "SESSION_RECOVERING",
+                "drain_stalled": session.drain_stalled,
+                "drain_timeout_epoch": session.drain_timeout_epoch,
+                "session": session.to_public_dict(),
+            }
+        except BaseException:
+            self._finish_attach_op(op)
+            raise
+
+        assert port is not None
+        invalid_reason: str | None = None
+        with self._lock:
+            current_device = self._devices.get(by_id)
+            if current_device is None or current_device.real_path != real_path:
+                invalid_reason = "device"
+            elif self._sessions.get(session_id) is not session:
+                invalid_reason = "session"
+            elif op.cancelled.is_set() or self._attach_ops.get(by_id) is not op:
+                invalid_reason = "operation"
+            elif session.profile.device_by_id != by_id or session.bridge_generation != bridge_generation:
+                invalid_reason = "session_changed"
+            elif session._pending_drain is not None or by_id in self._draining_by_ids:
+                invalid_reason = "drain"
+            elif self._shutting_down:
+                invalid_reason = "shutdown"
+
+            if invalid_reason is None:
+                op.port = port
+                self._preopened_ports[by_id] = op
+                self._attach_ops.pop(by_id, None)
+                self._released_by_ids.discard(by_id)
+                self._loaded_released.pop(session_id, None)
+                session.released_by = None
+                session.released_at = None
+                session.released_reason = None
+                session.state = "ATTACHING"
+                session.last_error = None
+                self._reset_reprobe_progress_locked(session)
+                public = session.to_public_dict()
+            else:
+                if self._attach_ops.get(by_id) is op:
+                    self._attach_ops.pop(by_id, None)
+
+        if invalid_reason is not None:
+            self._finish_attach_op(op)
+            if invalid_reason == "device":
+                return {
+                    "ok": False,
+                    "error_code": "DEVICE_NOT_PRESENT",
+                    "selector": selector,
+                    "device_by_id": by_id,
+                }
+            if invalid_reason == "session":
+                return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            return {
+                "ok": False,
+                "error_code": "SESSION_RECOVERING",
+                "drain_stalled": session.drain_stalled,
+                "drain_timeout_epoch": session.drain_timeout_epoch,
+                "session": session.to_public_dict(),
+            }
+
         self._save_state()
         self._spawn_attach(by_id)
         return {"ok": True, "session": public}
@@ -2036,10 +3338,75 @@ class SessionManager:
         if not device_by_id:
             return {"ok": False, "error_code": "INVALID_ARGS"}
 
+        pending_attach: _AttachOp | None = None
+        pending_attach_unconsumed = False
+        with self._lock:
+            current = self.get_session(selector)
+            if current is None:
+                return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            old_by_id = current.profile.device_by_id
+            pending_attach = (
+                self._active_attach_ops.get(old_by_id or "")
+                or self._attach_ops.get(old_by_id or "")
+            )
+            if pending_attach is None and old_by_id:
+                pending_attach = self._preopened_ports.pop(old_by_id, None)
+                pending_attach_unconsumed = pending_attach is not None
+            if pending_attach is not None:
+                pending_attach.cancelled.set()
+                pending_attach.bind_requested = True
+                if pending_attach.probe_bridge is not None:
+                    pending_attach.probe_bridge.begin_drain(
+                        pending_attach.bridge_generation,
+                        preserve_consoles=True,
+                        deadline=time.monotonic() + DRAIN_TIMEOUT_MS / 1000,
+                    )
+        if pending_attach is not None:
+            if pending_attach_unconsumed:
+                completed = self._finish_attach_op(pending_attach)
+            else:
+                completed = pending_attach.done.wait(DRAIN_TIMEOUT_MS / 1000)
+            if not completed:
+                with self._lock:
+                    current = self._sessions.get(pending_attach.session_id)
+                    if current is not None:
+                        current.state = "RECOVERING"
+                        current.drain_stalled = True
+                        current.drain_timeout_epoch = pending_attach.bridge_generation
+                        return {
+                            "ok": False,
+                            "error_code": "SESSION_RECOVERING",
+                            "drain_stalled": True,
+                            "drain_timeout_epoch": pending_attach.bridge_generation,
+                            "session": current.to_public_dict(),
+                        }
+            else:
+                with self._lock:
+                    worker = self._attach_threads.get(pending_attach.by_id)
+                if worker is not None and worker is not threading.current_thread():
+                    worker.join(timeout=0.1)
+            with self._lock:
+                if pending_attach.release_request is not None:
+                    current = self._sessions.get(pending_attach.session_id)
+                    if current is not None:
+                        return {
+                            "ok": False,
+                            "error_code": "SESSION_RECOVERING",
+                            "drain_stalled": current.drain_stalled,
+                            "drain_timeout_epoch": current.drain_timeout_epoch,
+                            "session": current.to_public_dict(),
+                        }
+            return self.bind_session(selector, device_by_id)
+
+        started_at = time.monotonic()
+        job: _DrainJob | None = None
+        unconsumed_port: SerialPort | None = None
         with self._lock:
             session = self.get_session(selector)
             if session is None:
                 return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            if self._shutting_down:
+                raise RuntimeError("daemon stopping")
             # FLASHING 或 flash probe 臨界區不得 rebind——rebind 會 detach 舊 bridge、切斷燒錄/偵測 transport
             # （#69 r5；#83 RACE-2 final）。須先 exit_flashing 或待 probe 結束。
             if self._flash_busy_locked(session):
@@ -2059,37 +3426,62 @@ class SessionManager:
                 and session.state in ("READY", "ATTACHED")
             ):
                 return {"ok": True, "already_bound": True, "session": session.to_public_dict()}
+            if session._pending_drain is not None:
+                return {
+                    "ok": False,
+                    "error_code": "SESSION_RECOVERING",
+                    "drain_stalled": session.drain_stalled,
+                    "drain_timeout_epoch": session.drain_timeout_epoch,
+                    "session": session.to_public_dict(),
+                }
             if session.bridge is not None:
-                self._detach_session_locked(session, reason="REBOUND")
-            # I1：對 RELEASED session 重綁新 by_id 屬明確覆寫（離開 RELEASED）——
-            # 須把舊 by_id 移出 _released_by_ids、清 provenance，並把 state 移出 RELEASED，
-            # 否則下方 _save_state 會以新 by_id、released_by=None 寫入半殘 released entry，
-            # 導致 daemon 重啟後 session 被復活成 RELEASED、永遠無法 attach。
-            if session.state == "RELEASED":
+                job = self._begin_drain_locked(
+                    session,
+                    kind="bind",
+                    reason="REBOUND",
+                    drop_consoles=False,
+                    started_at=started_at,
+                    target_by_id=device_by_id,
+                )
+            else:
                 old_by_id = session.profile.device_by_id
                 if old_by_id:
+                    self._attach_ops.pop(old_by_id, None)
+                    pending_op = self._preopened_ports.pop(old_by_id, None)
+                    if pending_op is not None:
+                        unconsumed_port = pending_op.port
+                if session.state == "RELEASED" and old_by_id:
                     self._released_by_ids.discard(old_by_id)
                 session.released_by = None
                 session.released_at = None
                 session.released_reason = None
-                session.state = "DETACHED"
+                session.profile = dataclasses.replace(session.profile, device_by_id=device_by_id)
                 self._reset_reprobe_progress_locked(session)
-            session.profile = dataclasses.replace(session.profile, device_by_id=device_by_id)
-            self._reset_reprobe_progress_locked(session)
-            self._binding_overrides[session.session_id] = device_by_id
-            self._save_state()
-            has_device = device_by_id in self._devices
-            if has_device:
-                session.state = "ATTACHING"
-                session.last_error = None
-                self._reset_reprobe_progress_locked(session)
+                self._binding_overrides[session.session_id] = device_by_id
+                has_device = device_by_id in self._devices
+                session.state = "ATTACHING" if has_device else "DETACHED"
+                session.last_error = None if has_device else "DEVICE_NOT_FOUND"
 
+        if unconsumed_port is not None:
+            try:
+                unconsumed_port.close()
+            except Exception:
+                pass
+        if job is not None:
+            self._on_detached(session.session_id)
+            receipt = self._await_drain(job)
+            if receipt is None:
+                return {
+                    "ok": False,
+                    "error_code": "SESSION_RECOVERING",
+                    "drain_stalled": True,
+                    "drain_timeout_epoch": job.epoch,
+                    "session": session.to_public_dict(),
+                }
+            return {"ok": True, "session": session.to_public_dict()}
+        self._save_state()
         if has_device:
             self._spawn_attach(device_by_id)
-        else:
-            with self._lock:
-                session.last_error = "DEVICE_NOT_FOUND"
-                session.state = "DETACHED"
         return {"ok": True, "session": session.to_public_dict()}
 
     def _resolve_device_key(self, selector: str) -> tuple[str | None, SessionRuntime | None]:
@@ -2241,6 +3633,8 @@ class SessionManager:
         missing_at = now_iso()
         for session in self._sessions.values():
             by_id = session.profile.device_by_id
+            if session.state == "RELEASED":
+                continue
             if not by_id or session.bridge is not None:
                 continue
             if by_id in self._devices:
@@ -2252,15 +3646,47 @@ class SessionManager:
                 session.detached_at = missing_at
 
     def update_devices(self, devices: dict[str, DeviceInfo]) -> None:
+        unconsumed_ops: list[_AttachOp] = []
         with self._lock:
+            if self._shutting_down:
+                import logging
+                logging.getLogger("serialwrap").info("shutdown 中，略過裝置更新")
+                return
             prev = self._devices
             self._devices = dict(devices)
+            for by_id, op in list(self._attach_ops.items()):
+                current = self._devices.get(by_id)
+                if current is None or current.real_path != op.real_path:
+                    op.cancelled.set()
+            for by_id, op in list(self._active_attach_ops.items()):
+                current = self._devices.get(by_id)
+                if current is None or current.real_path != op.real_path:
+                    op.cancelled.set()
+                    if op.probe_bridge is not None:
+                        op.probe_bridge.begin_drain(
+                            op.bridge_generation,
+                            preserve_consoles=True,
+                            deadline=time.monotonic() + DRAIN_TIMEOUT_MS / 1000,
+                        )
+            for by_id, op in list(self._preopened_ports.items()):
+                current = self._devices.get(by_id)
+                if (
+                    (current is None or current.real_path != op.real_path)
+                    and by_id not in self._attach_bridges
+                    and by_id not in self._active_attach_ops
+                ):
+                    self._preopened_ports.pop(by_id, None)
+                    op.cancelled.set()
+                    unconsumed_ops.append(op)
             # #100 M2/3a：device 離線後 prune 其 startup 預配（pending）COM，避免已不在線的
             # by-id 長期 reserve COM 號，導致 _next_dynamic_com 無法回收該號。
             self._pending_com = {
                 b: c for b, c in self._pending_com.items() if b in self._devices
             }
             self._mark_missing_devices_locked()
+
+        for op in unconsumed_ops:
+            self._finish_attach_op(op)
 
         changed = sorted(
             by_id for by_id in set(prev.keys()) & set(devices.keys())
@@ -2283,28 +3709,349 @@ class SessionManager:
 
     def bootstrap_attach(self) -> None:
         with self._lock:
+            if self._shutting_down:
+                return
             keys = list(self._devices.keys())
         for by_id in keys:
             self._spawn_attach(by_id)
 
     def _spawn_attach(self, by_id: str) -> None:
         with self._lock:
+            if self._shutting_down:
+                import logging
+                logging.getLogger("serialwrap").info("shutdown 中，略過 attach %s", by_id)
+                return
             if by_id in self._released_by_ids:
+                return
+            if by_id in self._draining_by_ids:
                 return
             if by_id in self._attach_inflight:
                 return
             self._attach_inflight.add(by_id)
 
         def _run() -> None:
+            retry_after_worker = False
             try:
                 self._attach_by_id(by_id)
             finally:
                 with self._lock:
                     self._attach_inflight.discard(by_id)
+                    self._attach_threads.pop(by_id, None)
+                    session = next(
+                        (row for row in self._sessions.values() if row.profile.device_by_id == by_id),
+                        None,
+                    )
+                    retry_after_worker = bool(
+                        not self._shutting_down
+                        and by_id not in self._released_by_ids
+                        and by_id not in self._draining_by_ids
+                        and by_id in self._devices
+                        and session is not None
+                        and session.bridge is None
+                        and session.state == "ATTACHING"
+                    )
+                if retry_after_worker:
+                    self._spawn_attach(by_id)
 
-        threading.Thread(target=_run, name=f"serialwrap-attach-{by_id}", daemon=True).start()
+        worker = threading.Thread(target=_run, name=f"serialwrap-attach-{by_id}", daemon=True)
+        with self._lock:
+            self._attach_threads[by_id] = worker
+        worker.start()
+
+    def _preopen_auto_attach_port(
+        self,
+        session: SessionRuntime,
+        by_id: str,
+        real_path: str,
+        profile: SessionProfile,
+    ) -> _AttachOp | None:
+        """自動 attach 先取得 UART；成功前不把 session 公開成 ATTACHING。"""
+        with self._lock:
+            if (
+                self._shutting_down
+                or session.bridge is not None
+                or session.state == "RELEASED"
+                or by_id in self._released_by_ids
+            ):
+                return None
+            existing = self._preopened_ports.get(by_id)
+            if existing is not None:
+                return existing
+            if (
+                by_id in self._attach_ops
+                or by_id in self._active_attach_ops
+                or by_id in self._draining_by_ids
+            ):
+                return None
+            if self._sessions.get(session.session_id) is not session:
+                return None
+            if session.profile.device_by_id != by_id:
+                return None
+            device = self._devices.get(by_id)
+            if device is None or device.real_path != real_path:
+                return None
+            op = _AttachOp(
+                token=object(),
+                session_id=session.session_id,
+                by_id=by_id,
+                bridge_generation=session.bridge_generation,
+                real_path=real_path,
+            )
+            self._attach_ops[by_id] = op
+
+        port: SerialPort | None = None
+        try:
+            port = uart_io_mod.open_serial_port(real_path, profile.uart)
+            with op.port_lock:
+                op.port = port
+            port.open()
+        except Exception as exc:
+            with self._lock:
+                cancelled = op.cancelled.is_set() or op.release_request is not None
+                if self._attach_ops.get(by_id) is op:
+                    self._attach_ops.pop(by_id, None)
+                    current = self._sessions.get(session.session_id)
+                    if (
+                        not cancelled
+                        and current is session
+                        and session.profile.device_by_id == by_id
+                        and session.bridge_generation == op.bridge_generation
+                        and session.state != "RELEASED"
+                        and by_id not in self._released_by_ids
+                    ):
+                        session.state = "DETACHED"
+                        session.last_error = f"ATTACH_FAILED:{type(exc).__name__}"
+                        session.detached_at = now_iso()
+            self._finish_attach_op(op)
+            return None
+
+        assert port is not None
+        with self._lock:
+            device = self._devices.get(by_id)
+            valid = bool(
+                self._attach_ops.get(by_id) is op
+                and not op.cancelled.is_set()
+                and self._sessions.get(session.session_id) is session
+                and session.profile.device_by_id == by_id
+                and session.bridge_generation == op.bridge_generation
+                and session.state != "RELEASED"
+                and by_id not in self._released_by_ids
+                and session._pending_drain is None
+                and by_id not in self._draining_by_ids
+                and not self._shutting_down
+                and device is not None
+                and device.real_path == real_path
+            )
+            if valid:
+                op.port = port
+                self._active_attach_ops[by_id] = op
+                self._attach_ops.pop(by_id, None)
+                session.state = "ATTACHING"
+                session.last_error = None
+                self._reset_reprobe_progress_locked(session)
+                return op
+            if self._attach_ops.get(by_id) is op:
+                self._attach_ops.pop(by_id, None)
+
+        self._finish_attach_op(op)
+        return None
+
+    def _preopen_dynamic_attach_port(
+        self,
+        by_id: str,
+        real_path: str,
+        profile: UartProfile,
+    ) -> tuple[_AttachOp | None, Exception | None]:
+        """動態偵測前先獨占開埠，讓 PROBE 與正式 bridge 共用同一 handle。"""
+        with self._lock:
+            if self._shutting_down or by_id in self._draining_by_ids:
+                return None, None
+            existing = self._preopened_ports.get(by_id)
+            if existing is not None:
+                return existing, None
+            if by_id in self._attach_ops or by_id in self._active_attach_ops:
+                return None, None
+            device = self._devices.get(by_id)
+            if device is None or device.real_path != real_path:
+                return None, None
+            if any(row.profile.device_by_id == by_id for row in self._sessions.values()):
+                return None, None
+            op = _AttachOp(
+                token=object(),
+                session_id=f"dynamic:{by_id}",
+                by_id=by_id,
+                bridge_generation=0,
+                real_path=real_path,
+            )
+            self._attach_ops[by_id] = op
+
+        port: SerialPort | None = None
+        try:
+            port = uart_io_mod.open_serial_port(real_path, profile)
+            with op.port_lock:
+                op.port = port
+            port.open()
+        except Exception as exc:
+            with self._lock:
+                if self._attach_ops.get(by_id) is op:
+                    self._attach_ops.pop(by_id, None)
+            self._finish_attach_op(op)
+            return None, exc
+
+        assert port is not None
+        with self._lock:
+            device = self._devices.get(by_id)
+            valid = bool(
+                self._attach_ops.get(by_id) is op
+                and not op.cancelled.is_set()
+                and not self._shutting_down
+                and by_id not in self._draining_by_ids
+                and device is not None
+                and device.real_path == real_path
+                and not any(row.profile.device_by_id == by_id for row in self._sessions.values())
+            )
+            if valid:
+                op.port = port
+                self._active_attach_ops[by_id] = op
+                self._attach_ops.pop(by_id, None)
+                return op, None
+            if self._attach_ops.get(by_id) is op:
+                self._attach_ops.pop(by_id, None)
+        self._finish_attach_op(op)
+        return None, None
+
+    def _discard_preopened_port(self, by_id: str, op: _AttachOp | None) -> None:
+        """移除並關閉仍由 manager 保管、尚未交給正式 bridge 的 handle。"""
+        if op is None:
+            return
+        self._finish_attach_op(op)
+
+    def _finish_attach_op(self, op: _AttachOp) -> bool:
+        """在 bridge 已安全交還或未啟動時，關閉並完成 attach op。"""
+        with op.port_lock:
+            if op.port is not None and not op.port_transferred:
+                try:
+                    op.port.close()
+                except Exception as exc:  # noqa: BLE001 — handle 狀態不明時維持阻擋
+                    import logging
+
+                    logging.getLogger("serialwrap").warning(
+                        "預開 UART handle 關閉失敗（by_id=%s）：%s", op.by_id, exc
+                    )
+                    return False
+                op.port = None
+
+        with self._lock:
+            for table in (self._attach_ops, self._preopened_ports, self._active_attach_ops):
+                if table.get(op.by_id) is op:
+                    table.pop(op.by_id, None)
+            release_request = op.release_request
+            session = self._sessions.get(op.session_id)
+            if release_request is not None and session is not None:
+                source, reason = release_request
+                if session.state != "RELEASED":
+                    self._detach_session_locked(session, reason="RELEASED", drop_consoles=True)
+                session.state = "RELEASED"
+                session.released_by = source
+                session.released_at = session.released_at or now_iso()
+                session.released_reason = reason
+                session.drain_stalled = False
+                session.drain_timeout_epoch = None
+                session._release_persist_pending = True
+                self._released_by_ids.add(op.by_id)
+        if release_request is not None and session is not None:
+            try:
+                self._persist_release_state(session.session_id)
+            except Exception as exc:  # noqa: BLE001 — 失敗時保持 RELEASED 阻擋並留下診斷
+                import logging
+
+                logging.getLogger("serialwrap").error(
+                    "release 持久化失敗（session=%s）：%s", session.session_id, exc
+                )
+                op.done.set()
+                return False
+        op.done.set()
+        return True
+
+    def _register_probe_bridge(self, op: _AttachOp, bridge: "UARTBridge") -> bool:
+        with self._lock:
+            if op.cancelled.is_set() or self._active_attach_ops.get(op.by_id) is not op:
+                return False
+            op.probe_bridge = bridge
+            return True
+
+    def _handoff_attach_op_locked(self, op: _AttachOp | None) -> bool:
+        """在同一把 manager lock 內把 handle 所有權轉給正式 bridge。"""
+        if op is None or op.cancelled.is_set():
+            return op is None
+        with op.port_lock:
+            op.port_transferred = True
+            op.port = None
+        if self._active_attach_ops.get(op.by_id) is op:
+            self._active_attach_ops.pop(op.by_id, None)
+        op.done.set()
+        return True
+
+    def _stop_probe_bridge_safely(self, bridge: "UARTBridge") -> bool:
+        """等待 PROBE 的 reader／writer 收斂；逾時時等候同一 drain 的遲到回條。"""
+        done = threading.Event()
+        deadline = time.monotonic() + DRAIN_TIMEOUT_MS / 1000
+        bridge.begin_drain(-1, preserve_consoles=False, deadline=deadline)
+        receipt = bridge.finish_drain(
+            max(0.0, deadline - time.monotonic()),
+            on_late_receipt=lambda _receipt: done.set(),
+        )
+        if receipt is None:
+            done.wait()
+            with bridge._state_lock:
+                receipt = bridge._drain_receipt
+        return self._receipt_is_safe(receipt)
+
+    def _record_dynamic_open_failure(
+        self,
+        by_id: str,
+        real_path: str,
+        error: Exception,
+        *,
+        template: ProfileTemplate | None,
+        source: str | None,
+    ) -> None:
+        """動態 attach 開埠失敗時保留可診斷的 DETACHED session。"""
+        notify_session_id: str | None = None
+        with self._lock:
+            device = self._devices.get(by_id)
+            if (
+                self._shutting_down
+                or by_id in self._draining_by_ids
+                or device is None
+                or device.real_path != real_path
+                or by_id in self._released_by_ids
+            ):
+                return
+            session = next(
+                (row for row in self._sessions.values() if row.profile.device_by_id == by_id),
+                None,
+            )
+            if session is not None and session.state == "RELEASED":
+                return
+            if session is None:
+                if len(self._sessions) >= self._max_sessions:
+                    return
+                selected_template = template or self._default_passthrough_template()
+                if selected_template is None:
+                    return
+                session = self._session_from_template(selected_template, by_id)
+                session.profile_source = source if template is not None and source else "fallback"
+            session.state = "DETACHED"
+            session.last_error = f"ATTACH_FAILED:{type(error).__name__}"
+            session.detached_at = now_iso()
+            notify_session_id = session.session_id
+        if notify_session_id is not None:
+            self._on_detached(notify_session_id)
 
     def _detach_by_id(self, by_id: str, *, reason: str) -> None:
+        started_at = time.monotonic()
+        jobs: list[_DrainJob] = []
         with self._lock:
             # flash 臨界區（FLASHING 或 probe 進行中）不得 detach（#83 RACE-2 final）：device hotplug 在
             # MCU reset/BSL 期間常見地讓 by_id 短暫消失，若據此 detach 會切斷燒錄/偵測 transport。略過；
@@ -2315,7 +4062,24 @@ class SessionManager:
                 and not self._flash_busy_locked(s)
             ]
             for session in targets:
-                self._detach_session_locked(session, reason=reason)
+                if session._pending_drain is not None:
+                    continue
+                kind = "device_removed" if reason == "DEVICE_REMOVED" else "recover"
+                job = self._begin_drain_locked(
+                    session,
+                    kind=kind,
+                    reason=reason,
+                    drop_consoles=False,
+                    started_at=started_at,
+                )
+                if job is not None:
+                    jobs.append(job)
+                else:
+                    session.state = "DETACHED"
+                    self._detach_session_locked(session, reason=reason, drop_consoles=False)
+        for job in jobs:
+            self._on_detached(job.session_id)
+            self._await_drain(job)
 
     def _mark_session_rx(self, session: SessionRuntime) -> None:
         """Update session's last_rx_at / last_rx_mono. Cheap; safe outside lock."""
@@ -2378,23 +4142,51 @@ class SessionManager:
         session.last_tx_at = now_iso()
         session.last_tx_mono = time.monotonic()
 
+    def revoke_tx_op(self, cmd_id: str) -> None:
+        """取消 arbiter 命令時撤銷所有持有中的 bridge permit。"""
+        targets: list[tuple[UARTBridge, list[str]]] = []
+        with self._lock:
+            for session in self._sessions.values():
+                operation = session._foreground_operation
+                if operation is None or operation.cmd_id != cmd_id:
+                    continue
+                op_ids = [cmd_id]
+                if session.interactive_session_id is not None:
+                    op_ids.append(f"interactive:{session.interactive_session_id}")
+                targets.append((operation.bridge, op_ids))
+            if not targets:
+                self._cancelled_tx_cmd_ids[cmd_id] = None
+                self._cancelled_tx_cmd_ids.move_to_end(cmd_id)
+                while len(self._cancelled_tx_cmd_ids) > 512:
+                    self._cancelled_tx_cmd_ids.pop(next(iter(self._cancelled_tx_cmd_ids)))
+        # fence lock 不可在 manager lock 內等待，尤其 Windows pyserial write 可能阻塞。
+        for bridge, op_ids in targets:
+            revoke = getattr(bridge, "revoke_ops", None)
+            if callable(revoke):
+                revoke(op_ids)
+
     def _on_bridge_console_line(self, session_id: str, client_id: str, line: str) -> None:
         if self._on_console_line is not None:
             self._on_console_line(session_id, client_id, line)
 
-    def _on_bridge_rx(self, session_id: str, data: bytes) -> None:
+    def _on_bridge_rx(
+        self,
+        session_id: str,
+        data: bytes,
+        wal_seq: int | None = None,
+    ) -> None:
         # Notify RX observers before foreground_busy gate (observers receive ALL rx).
         # IMPORTANT: Observer MUST NOT block on I/O or cross-thread wait, and MUST NOT
         # call SessionManager methods under _lock (deadlock risk). Exceptions are silently swallowed.
-        if self._rx_observers:
-            with self._lock:
-                session = self._sessions.get(session_id)
-                com = session.profile.com if session is not None else session_id
-                wal_seq = self._wal.current_seq
-                observers = list(self._rx_observers)
+        with self._lock:
+            session = self._sessions.get(session_id)
+            com = session.profile.com if session is not None else session_id
+            chunk_wal_seq = wal_seq if wal_seq is not None else self._wal.current_seq
+            observers = list(self._rx_observers)
+        if observers:
             for obs in observers:
                 try:
-                    obs(com, data, wal_seq)
+                    obs(com, data, chunk_wal_seq)
                 except Exception:
                     pass
         chunk = clean_text(data.decode("utf-8", errors="replace"))
@@ -2422,7 +4214,7 @@ class SessionManager:
                     continue
                 capture.add_chunk(chunk, BG_CAPTURE_MAX_BYTES)
                 capture.last_activity_mono = time.monotonic()
-                capture.last_seq = self._wal.current_seq
+                capture.last_seq = chunk_wal_seq
             if session.foreground_busy:
                 return
             # agent log capture（維持原行為：foreground 期間不寫 agent log）
@@ -2439,9 +4231,12 @@ class SessionManager:
                         pass
 
     def _handle_bridge_down(self, session_id: str, bridge: UARTBridge, reason: str) -> None:
+        started_at = time.monotonic()
         by_id: str | None = None
+        job: _DrainJob | None = None
         with self._lock:
-            session = self._sessions.get(session_id)
+            # callback 使用 canonical session_id；legacy 呼叫端可傳 COM 或 alias。
+            session = self.get_session(session_id)
             if session is None or session.bridge is not bridge:
                 return
             # flash 臨界區（FLASHING 或 probe 進行中）不得自動 detach+reattach（#83 RACE-2 final）：燒錄/
@@ -2450,12 +4245,16 @@ class SessionManager:
             if self._flash_busy_locked(session):
                 return
             by_id = session.profile.device_by_id
-            self._detach_session_locked(session, reason=f"BRIDGE_DOWN:{reason}")
-            if by_id and by_id in self._devices:
-                session.state = "RECOVERING" if session.pending_auto_login else "ATTACHING"
-                session.last_error = None
-        if by_id and by_id in self._devices:
-            self._spawn_attach(by_id)
+            job = self._begin_drain_locked(
+                session,
+                kind="io_error",
+                reason=f"BRIDGE_DOWN:{reason}",
+                drop_consoles=False,
+                started_at=started_at,
+            )
+        if job is not None:
+            self._on_detached(session.session_id)
+            self._await_drain(job)
 
     def _probe_existing_bridge(self, session: SessionRuntime, bridge: UARTBridge) -> dict[str, Any]:
         # 非 command-capable（無 ready_probe，含 passthrough）維持現狀不升 READY。
@@ -2483,29 +4282,40 @@ class SessionManager:
                 if current.state != "READY":
                     current.last_error = "PROMPT_UNAVAILABLE"
                 return {"ok": True, "session": current.to_public_dict()}
+            probe_permit = self._begin_login_run_locked(current, bridge)
 
         # #150：probe 前採樣 raw RX 累計，失敗後取差精煉 transport stall。
         rx_before = self._bridge_rx_total(bridge)
 
-        if session.profile.login_regex or session.profile.console_unlock_env:
-            auth, auth_res = resolve_session_auth(session.profile)
-            if self._credentials_declared_but_unresolved(session.profile, auth_res):
-                # 宣告帳密但解析空：不進 login/probe（不對 prompt 送空帳密），標終態（#140）。
-                self._emit_credentials_unresolved_warning(
-                    session.session_id, session.profile.com, auth_res
-                )
-                ok, err = False, ERROR_CREDENTIALS_UNRESOLVED
-            elif auth.console_unlock or (auth.username and auth.password):
-                ok, err = ensure_ready(bridge, session.profile, auth=auth)
-            else:
-                ok, err = probe_ready(bridge, session.profile)
-        else:
-            ok, err = probe_ready(bridge, session.profile)
+        probe_refused = False
+        try:
+            with self._system_permit_context(bridge, probe_permit):
+                if session.profile.login_regex or session.profile.console_unlock_env:
+                    auth, auth_res = resolve_session_auth(session.profile)
+                    if self._credentials_declared_but_unresolved(session.profile, auth_res):
+                        # 宣告帳密但解析空：不進 login/probe（不對 prompt 送空帳密），標終態（#140）。
+                        self._emit_credentials_unresolved_warning(
+                            session.session_id, session.profile.com, auth_res
+                        )
+                        ok, err = False, ERROR_CREDENTIALS_UNRESOLVED
+                    elif auth.console_unlock or (auth.username and auth.password):
+                        ok, err = ensure_ready(bridge, session.profile, auth=auth)
+                    else:
+                        ok, err = probe_ready(bridge, session.profile)
+                else:
+                    ok, err = probe_ready(bridge, session.profile)
+        except TxIncompleteError as exc:
+            if not _login_tx_refused(exc):
+                raise
+            # submit fence 已證明此 run 被 quiet 或更新登入世代撤銷；不將零 TX
+            # 偽裝成 transport stall，也不讓 READY reconfirm 被提前清除。
+            ok, err = False, "PROMPT_UNAVAILABLE"
+            probe_refused = True
 
         # #150：真的送過 probe 且失敗 → transport 層精煉（CREDENTIALS_UNRESOLVED
         # 不屬可精煉集合，經此為 no-op）。
         err_detail: str | None = None
-        if not ok:
+        if not ok and not probe_refused:
             err, err_detail = self._refine_probe_failure(session, bridge, err, rx_before)
 
         notify_ready = False
@@ -2537,6 +4347,10 @@ class SessionManager:
                 current.last_ready_at = now_iso()
                 self._reset_reprobe_progress_locked(current)
                 notify_ready = True
+            elif probe_refused and current.state == "READY":
+                # READY reconfirm 在 pre-submit 被 quiet／新登入世代撤銷時，保留
+                # READY 與既有 last_error；`confirm_ready()` 仍未執行，pending 不清除。
+                current.last_error_detail = None
             else:
                 current.state = "ATTACHED"
                 current.last_error = err
@@ -2549,8 +4363,21 @@ class SessionManager:
     def _attach_by_id(self, by_id: str) -> None:
         save_needed = False
         dynamic_created = False
+        capacity_rejected = False
+        preopened_op: _AttachOp | None = None
         with self._lock:
+            if self._shutting_down:
+                import logging
+                logging.getLogger("serialwrap").info("shutdown 中，略過 attach %s", by_id)
+                return
+            if by_id in self._draining_by_ids:
+                return
             session = next((s for s in self._sessions.values() if s.profile.device_by_id == by_id), None)
+            if session is not None and session.bridge is not None:
+                return
+            preopened_op = self._preopened_ports.pop(by_id, None)
+            if preopened_op is not None:
+                self._active_attach_ops[by_id] = preopened_op
             if session is None:
                 candidates = sorted(
                     [s for s in self._sessions.values() if s.state == "DETACHED" and s.profile.device_by_id not in self._devices],
@@ -2568,48 +4395,93 @@ class SessionManager:
                     logging.getLogger("serialwrap").warning(
                         "已達 max_sessions=%d，忽略裝置 %s", self._max_sessions, by_id,
                     )
-                    return
-                dynamic_created = True
+                    capacity_rejected = True
+                else:
+                    dynamic_created = True
         if save_needed:
             self._save_state()
 
         # --- 動態偵測路徑 ---
         if dynamic_created:
-            self._attach_by_id_dynamic(by_id)
+            self._attach_by_id_dynamic(by_id, preopened_op=preopened_op)
             return
+
+        if capacity_rejected:
+            if preopened_op is not None:
+                self._finish_attach_op(preopened_op)
+            return
+
+        if session is None:
+            if preopened_op is not None:
+                self._finish_attach_op(preopened_op)
+            return
+        missing_device = False
+        with self._lock:
+            device = self._devices.get(by_id)
+            if device is None:
+                session.state = "DETACHED"
+                session.last_error = "DEVICE_NOT_FOUND"
+                session.detached_at = now_iso()
+                missing_device = True
+            else:
+                real_path = device.real_path
+                profile = session.profile
+                preopened_op = self._preopened_ports.get(by_id) or preopened_op
+        if missing_device:
+            if preopened_op is not None:
+                self._finish_attach_op(preopened_op)
+            return
+        if preopened_op is None:
+            # 預先開埠成功後才公開 ATTACHING；已識別 holder 時保留 DETACHED，且 bridge 不會 TX。
+            preopened_op = self._preopen_auto_attach_port(
+                session, by_id, real_path, profile
+            )
+            if preopened_op is None:
+                return
 
         # 既有 session 的 profile 再解析（#181）：pin 逃生口與「fallback 只是暫時分類」。
         # 必須在下方開 bridge 之前做——偵測需要自己的 PROBE bridge，且換 template 會連
         # uart 參數（baud 等）一起換掉。本方法原地 mutate 同一個 session 物件，故上面
         # 取得的 session 區域變數在此之後仍然有效。
-        self._reresolve_profile_on_reattach(by_id)
+        if not self._reresolve_profile_on_reattach(by_id, preopened_op=preopened_op):
+            return
 
+        abort_attach = False
         with self._lock:
-            if session is None:
-                return
             dev = self._devices.get(by_id)
-            if dev is None:
+            if (
+                self._shutting_down
+                or by_id in self._draining_by_ids
+                or session.bridge is not None
+                or session.profile.device_by_id != by_id
+                or session.state == "RELEASED"
+                or by_id in self._released_by_ids
+                or (preopened_op is not None and preopened_op.cancelled.is_set())
+            ):
+                abort_attach = True
+            elif dev is None:
                 session.state = "DETACHED"
                 session.last_error = "DEVICE_NOT_FOUND"
                 session.detached_at = now_iso()
-                return
-            if session.bridge is not None or session.profile.device_by_id != by_id:
-                return
-            # C1 早退：release 早於 attach 開 FD 時，根本不啟動（常見情形不開 FD）。
-            if session.state == "RELEASED" or by_id in self._released_by_ids:
-                return
-            session.state = "ATTACHING"
-            session.last_error = None
-            gen_before = session.bridge_generation
-            session_id = session.session_id
-            profile = session.profile
-            require_login = session.pending_auto_login or bool(profile.login_regex or profile.console_unlock_env)
-            # 以 ready_probe 判定可否下命令；非 command-capable（含無 ready_probe 的
-            # passthrough）僅停在 ATTACHED 不 probe，有 ready_probe 的 passthrough
-            # 也要能走 probe 進 READY。
-            command_capable = profile.command_capable
-            real_path = dev.real_path
-            preserved_consoles = session.retained_consoles if isinstance(session.retained_consoles, PreservedConsoles) else None
+                abort_attach = True
+            if not abort_attach:
+                assert dev is not None
+                session.state = "ATTACHING"
+                session.last_error = None
+                gen_before = session.bridge_generation
+                session_id = session.session_id
+                profile = session.profile
+                require_login = session.pending_auto_login or bool(profile.login_regex or profile.console_unlock_env)
+                # 以 ready_probe 判定可否下命令；非 command-capable（含無 ready_probe 的
+                # passthrough）僅停在 ATTACHED 不 probe，有 ready_probe 的 passthrough
+                # 也要能走 probe 進 READY。
+                command_capable = profile.command_capable
+                real_path = dev.real_path
+                preserved_consoles = session.retained_consoles if isinstance(session.retained_consoles, PreservedConsoles) else None
+        if abort_attach:
+            if preopened_op is not None:
+                self._finish_attach_op(preopened_op)
+            return
 
         bridge = UARTBridge(
             profile.com,
@@ -2617,17 +4489,67 @@ class SessionManager:
             profile.uart,
             self._wal,
             on_console_line=lambda client_id, line, sid=session_id: self._on_bridge_console_line(sid, client_id, line),
-            on_rx_data=lambda data, sid=session_id: self._on_bridge_rx(sid, data),
+            on_rx_data=lambda data, wal_seq=None, sid=session_id: self._on_bridge_rx(
+                sid, data, wal_seq
+            ),
             on_bridge_down=lambda reason, sid=session_id: self._handle_bridge_down(sid, bridge, reason),
             preserved_consoles=preserved_consoles,
+            preopened_port=preopened_op.port if preopened_op is not None else None,
+            owns_port=True,
         )
 
+        attach_started = threading.Event()
+        abort_attach = False
+        with self._lock:
+            if (
+                self._shutting_down
+                or by_id in self._draining_by_ids
+                or session.state == "RELEASED"
+                or by_id in self._released_by_ids
+                or (preopened_op is not None and preopened_op.cancelled.is_set())
+            ):
+                abort_attach = True
+            elif self._handoff_attach_op_locked(preopened_op):
+                self._attach_bridges[by_id] = bridge
+                self._attach_start_events[by_id] = attach_started
+                session.attach_bridge = bridge
+            else:
+                abort_attach = True
+        if abort_attach:
+            if preopened_op is not None:
+                self._finish_attach_op(preopened_op)
+            return
+
         try:
-            bridge.start()
+            try:
+                bridge.start()
+            finally:
+                attach_started.set()
+            with self._lock:
+                pending_job = self._draining_by_ids.get(by_id)
+                if pending_job is None and self._shutting_down:
+                    pending_job = self._begin_attach_bridge_stop_locked(
+                        session,
+                        by_id,
+                        bridge,
+                        preserve_consoles=True,
+                        started_at=time.monotonic(),
+                    )
+            if pending_job is not None:
+                if pending_job.kind == "attach_cleanup":
+                    self._finish_attach_bridge_stop(pending_job)
+                return
             # #150：probe 前採樣 raw RX 累計（bridge 剛 start，計數從 0 起）。
             rx_before = self._bridge_rx_total(bridge)
             with self._lock:
                 boot_quiet = self._boot_quiet_blocks_probe(session)
+                probe_permit = (
+                    self._begin_login_run_locked(session, bridge)
+                    if command_capable and not boot_quiet
+                    else None
+                )
+            probe_refused = False
+            used_ensure_ready = False
             if not command_capable:
                 ok = False
                 err = None
@@ -2637,95 +4559,131 @@ class SessionManager:
                 # 以 PROMPT_UNAVAILABLE 停在 ATTACHED——window 解除後由既有
                 # reprobe / reboot recovery 流程接手升 READY。
                 ok, err = False, "PROMPT_UNAVAILABLE"
-            elif require_login:
-                auth, auth_res = resolve_session_auth(profile)
-                if self._credentials_declared_but_unresolved(profile, auth_res):
-                    # 宣告帳密但解析空：不 probe/login，掛橋停 ATTACHED 終態（#140）。
-                    self._emit_credentials_unresolved_warning(
-                        session_id, profile.com, auth_res
-                    )
-                    ok, err = False, ERROR_CREDENTIALS_UNRESOLVED
-                elif auth.console_unlock or (auth.username and auth.password):
-                    ok, err = ensure_ready(bridge, profile, auth=auth)
-                    if not ok:
-                        # #150：於 bridge.stop() 前精煉（stop 後計數仍可讀，但語意上先取）。
-                        err, err_detail = self._refine_probe_failure(session, bridge, err, rx_before)
-                        preserved = bridge.stop(preserve_consoles=True)
-                        with self._lock:
-                            self._store_retained_consoles_locked(
-                                session,
-                                preserved,
-                                human_owner=session.retained_human_owner,
-                                human_timeout_s=session.retained_human_timeout_s,
-                            )
-                            session.state = "DETACHED"
-                            session.last_error = err
-                            session.last_error_detail = err_detail
-                            session.detached_at = now_iso()
-                            session.bridge = None
-                            session.attached_real_path = None
-                        self._on_detached(session.session_id)
-                        return
-                else:
-                    # 無帳密時退回 probe，讓 human 手動登入
-                    ok, err = probe_ready(bridge, profile)
             else:
-                ok, err = probe_ready(bridge, profile)
+                try:
+                    with self._system_permit_context(bridge, probe_permit):
+                        if require_login:
+                            auth, auth_res = resolve_session_auth(profile)
+                            if self._credentials_declared_but_unresolved(profile, auth_res):
+                                # 宣告帳密但解析空：不 probe/login，掛橋停 ATTACHED 終態（#140）。
+                                self._emit_credentials_unresolved_warning(
+                                    session_id, profile.com, auth_res
+                                )
+                                ok, err = False, ERROR_CREDENTIALS_UNRESOLVED
+                            elif auth.console_unlock or (auth.username and auth.password):
+                                used_ensure_ready = True
+                                ok, err = ensure_ready(bridge, profile, auth=auth)
+                            else:
+                                # 無帳密時退回 probe，讓 human 手動登入
+                                ok, err = probe_ready(bridge, profile)
+                        else:
+                            ok, err = probe_ready(bridge, profile)
+                except TxIncompleteError as exc:
+                    if not _login_tx_refused(exc):
+                        raise
+                    ok, err = False, "PROMPT_UNAVAILABLE"
+                    probe_refused = True
+                if used_ensure_ready and not ok and not probe_refused:
+                    # #150：於 bridge.stop() 前精煉（stop 後計數仍可讀，但語意上先取）。
+                    err, err_detail = self._refine_probe_failure(session, bridge, err, rx_before)
+                    receipt = self._track_attach_bridge_stop(session, by_id, bridge)
+                    preserved = getattr(receipt, "preserved", None)
+                    with self._lock:
+                        self._store_retained_consoles_locked(
+                            session,
+                            preserved,
+                            human_owner=session.retained_human_owner,
+                            human_timeout_s=session.retained_human_timeout_s,
+                        )
+                        session.state = "DETACHED"
+                        session.last_error = err
+                        session.last_error_detail = err_detail
+                        session.detached_at = now_iso()
+                        session.bridge = None
+                        session.attached_real_path = None
+                    self._on_detached(session.session_id)
+                    return
 
             # #150：失敗才精煉；boot-quiet 合成的 PROMPT_UNAVAILABLE 沒送 probe、
             # 且 quiet 代表剛有 RX，刻意排除不精煉。
             err_detail: str | None = None
-            if not ok and not boot_quiet:
+            if not ok and not boot_quiet and not probe_refused:
                 err, err_detail = self._refine_probe_failure(session, bridge, err, rx_before)
 
             notify_ready = False
+            cleanup_job = None
+            cleanup_reason = None
             with self._lock:
                 # C1 backstop：release 落在 attach 飛行窗口（bridge.start()+probe 耗時）內時，
                 # 關掉剛開的 FD（clean slate），但**保留 RELEASED**——不可打回 DETACHED。
-                if session.state == "RELEASED" or by_id in self._released_by_ids:
-                    bridge.stop(preserve_consoles=False)
-                    session.bridge = None
-                    session.attached_real_path = None
-                    return
-                current = self._devices.get(by_id)
-                if current is None or current.real_path != real_path or session.state == "DETACHED" or session.bridge_generation != gen_before:
-                    preserved = bridge.stop(preserve_consoles=True)
-                    self._store_retained_consoles_locked(
-                        session,
-                        preserved,
-                        human_owner=session.retained_human_owner,
-                        human_timeout_s=session.retained_human_timeout_s,
-                    )
-                    session.state = "DETACHED"
-                    session.last_error = "DEVICE_REMOVED_DURING_ATTACH"
-                    session.detached_at = now_iso()
-                    session.bridge = None
-                    session.attached_real_path = None
-                    return
-                session.bridge = bridge
-                session.vtty_path = bridge.vtty_path
-                session.attached_real_path = real_path
-                session.bridge_generation += 1
-                session.retained_consoles = None
-                if ok:
-                    session.state = "READY"
-                    # #139：READY 即解除 boot quiet gate（詳見 _probe_existing_bridge 註解）。
-                    # #162：READY 確認點——confirm_ready 同步清 pending。
-                    session.confirm_ready()
-                    session.last_error = None
-                    session.last_ready_at = now_iso()
-                    session.recovering = False
-                    session.recovery_started_at = None
-                    session.pending_auto_login = False
-                    self._reset_reprobe_progress_locked(session)
-                    notify_ready = True
+                if self._shutting_down or session.state == "RELEASED" or by_id in self._released_by_ids:
+                    cleanup_reason = "released"
+                    pending_job = self._draining_by_ids.get(by_id)
+                    cleanup_job = pending_job if pending_job is not None and pending_job.bridge is bridge else None
+                    if cleanup_job is None and self._attach_bridges.get(by_id) is bridge:
+                        cleanup_job = self._begin_attach_bridge_stop_locked(
+                            session,
+                            by_id,
+                            bridge,
+                            preserve_consoles=False,
+                            started_at=time.monotonic(),
+                        )
                 else:
-                    session.state = "ATTACHED"
-                    session.last_error = err
-                    session.last_error_detail = err_detail
-                    session.recovering = False
-                    session.recovery_started_at = None
-                self._restore_retained_human_console_locked(session)
+                    current = self._devices.get(by_id)
+                    if current is None or current.real_path != real_path or session.state == "DETACHED" or session.bridge_generation != gen_before:
+                        cleanup_reason = "removed"
+                        cleanup_job = self._begin_attach_bridge_stop_locked(
+                            session,
+                            by_id,
+                            bridge,
+                            preserve_consoles=True,
+                            started_at=time.monotonic(),
+                        )
+                        session.state = "DETACHED"
+                        session.last_error = "DEVICE_REMOVED_DURING_ATTACH"
+                        session.detached_at = now_iso()
+                    else:
+                        session.bridge = bridge
+                        if session.attach_bridge is bridge:
+                            session.attach_bridge = None
+                        self._attach_bridges.pop(by_id, None)
+                        self._attach_start_events.pop(by_id, None)
+                        session.vtty_path = bridge.vtty_path
+                        session.attached_real_path = real_path
+                        session.bridge_generation += 1
+                        session._push_probe_gate(bridge)
+                        session._push_tx_gate(bridge)
+                        session.retained_consoles = None
+                        if ok:
+                            session.state = "READY"
+                            # #139：READY 即解除 boot quiet gate（詳見 _probe_existing_bridge 註解）。
+                            # #162：READY 確認點——confirm_ready 同步清 pending。
+                            session.confirm_ready()
+                            session.last_error = None
+                            session.last_ready_at = now_iso()
+                            session.recovering = False
+                            session.recovery_started_at = None
+                            session.pending_auto_login = False
+                            self._reset_reprobe_progress_locked(session)
+                            notify_ready = True
+                        else:
+                            session.state = "ATTACHED"
+                            session.last_error = err
+                            session.last_error_detail = err_detail
+                            session.recovering = False
+                            session.recovery_started_at = None
+                        self._restore_retained_human_console_locked(session)
+            if cleanup_job is not None:
+                receipt = self._finish_attach_bridge_stop(cleanup_job)
+                if cleanup_reason == "removed":
+                    with self._lock:
+                        self._store_retained_consoles_locked(
+                            session,
+                            getattr(receipt, "preserved", None),
+                            human_owner=session.retained_human_owner,
+                            human_timeout_s=session.retained_human_timeout_s,
+                        )
+                return
             if notify_ready:
                 self._on_ready(session.session_id)
         except Exception as exc:
@@ -2734,23 +4692,41 @@ class SessionManager:
             # session 退回 DETACHED 並記錄 ATTACH_FAILED:<ExcType>，不觸碰 RELEASED 狀態。
             # 此次 attach thread 結束後，_attach_inflight 由 _spawn_attach._run finally 清除，
             # 下次可透過手動 attach_device / clear_session 或裝置重新掃到（added）觸發重試。
+            with self._lock:
+                pending_job = session._pending_drain
+                if pending_job is None:
+                    candidate = self._draining_by_ids.get(by_id)
+                    if candidate is not None and candidate.bridge is bridge:
+                        pending_job = candidate
+                released = session.state == "RELEASED" or by_id in self._released_by_ids
+                bridge_still_attaching = self._attach_bridges.get(by_id) is bridge
+            if pending_job is not None:
+                if pending_job.kind == "attach_cleanup":
+                    self._finish_attach_bridge_stop(pending_job)
+                return
+            if released and not bridge_still_attaching:
+                return
             try:
-                preserved = bridge.stop(preserve_consoles=True)
+                receipt = self._track_attach_bridge_stop(session, by_id, bridge)
+                preserved = getattr(receipt, "preserved", None)
             except Exception:
                 preserved = None
             with self._lock:
-                self._store_retained_consoles_locked(
-                    session,
-                    preserved,
-                    human_owner=session.retained_human_owner,
-                    human_timeout_s=session.retained_human_timeout_s,
-                )
-                session.state = "DETACHED"
-                session.last_error = f"ATTACH_FAILED:{type(exc).__name__}"
-                session.detached_at = now_iso()
-                session.bridge = None
-                session.attached_real_path = None
-            self._on_detached(session.session_id)
+                released = session.state == "RELEASED" or by_id in self._released_by_ids
+                if not released:
+                    self._store_retained_consoles_locked(
+                        session,
+                        preserved,
+                        human_owner=session.retained_human_owner,
+                        human_timeout_s=session.retained_human_timeout_s,
+                    )
+                    session.state = "DETACHED"
+                    session.last_error = f"ATTACH_FAILED:{type(exc).__name__}"
+                    session.detached_at = now_iso()
+                    session.bridge = None
+                    session.attached_real_path = None
+            if not released:
+                self._on_detached(session.session_id)
 
     def _template_by_name(self, name: str) -> ProfileTemplate | None:
         for t in self._templates:
@@ -2892,7 +4868,12 @@ class SessionManager:
                 continue
         return None
 
-    def _reresolve_profile_on_reattach(self, by_id: str) -> None:
+    def _reresolve_profile_on_reattach(
+        self,
+        by_id: str,
+        *,
+        preopened_op: _AttachOp | None = None,
+    ) -> bool:
         """既有 session 重新 attach 前重新解析 profile（#181）。
 
         #95 建立的四層優先序（pin > sticky > detect > fallback）只實作在
@@ -2914,17 +4895,21 @@ class SessionManager:
         """
         from .config import UartProfile
 
+        if preopened_op is not None and preopened_op.cancelled.is_set():
+            self._finish_attach_op(preopened_op)
+            return False
+
         with self._lock:
             session = next(
                 (s for s in self._sessions.values() if s.profile.device_by_id == by_id),
                 None,
             )
             if session is None or session.profile_source == "yaml-target":
-                return
+                return True
             if session.bridge is not None:
-                return
+                return True
             if session.state == "RELEASED" or by_id in self._released_by_ids:
-                return
+                return False
             pin_name = self._profile_pins.get(by_id)
             pinned_tpl = self._template_by_name(pin_name) if pin_name else None
             if pinned_tpl is not None:
@@ -2932,25 +4917,38 @@ class SessionManager:
                 # 已經是該 profile 時不必動作，但同樣不往下偵測。
                 if pinned_tpl.profile_name != session.profile.profile_name:
                     if self._rematerialize_profile_locked(session, pinned_tpl, "pin"):
+                        if preopened_op is not None:
+                            preopened_op.session_id = session.session_id
                         self._save_state()
-                return
+                return True
             # **無法解析的 pin**（指向已移除或改名的 profile）視同無 pin，繼續往下偵測——
             # 與 _attach_by_id_dynamic 的四層優先序一致（那裡 `tpl is None` 時同樣會落到
             # sticky/detect）。若只因「state.json 裡留著一個字串」就 return，fallback
             # session 會被一筆失效的 pin 永久卡在「不套用 pin、也不再偵測」的死角。
             if session.profile_source != "fallback" or not self._templates:
-                return
+                return True
             if session.boot_quiet_active():
-                return
+                return True
             dev = self._devices.get(by_id)
             if dev is None:
-                return
+                return True
             real_path = dev.real_path
+            preopened_op = self._active_attach_ops.get(by_id) or preopened_op
 
         # 以獨立 PROBE bridge 偵測，與 _attach_by_id_dynamic 對稱：此刻 session.bridge
         # 為 None（上面已確認），裝置未被本 daemon 開著。同一 by_id 的並發 attach 由
         # _spawn_attach 的 _attach_inflight 擋掉。
-        probe_bridge = UARTBridge("PROBE", real_path, UartProfile(), self._wal)
+        probe_bridge = UARTBridge(
+            "PROBE",
+            real_path,
+            UartProfile(),
+            self._wal,
+            preopened_port=preopened_op.port if preopened_op is not None else None,
+            owns_port=False if preopened_op is not None else True,
+        )
+        if preopened_op is not None and not self._register_probe_bridge(preopened_op, probe_bridge):
+            self._finish_attach_op(preopened_op)
+            return False
         detected: ProfileTemplate | None = None
         try:
             probe_bridge.start()
@@ -2958,41 +4956,92 @@ class SessionManager:
         except Exception:
             detected = None
         finally:
-            try:
-                probe_bridge.stop()
-            except Exception:
-                pass
-        if detected is None:
-            return
-
+            probe_stopped = self._stop_probe_bridge_safely(probe_bridge)
+        if not probe_stopped:
+            return False
+        if preopened_op is not None:
+            with self._lock:
+                if preopened_op.probe_bridge is probe_bridge:
+                    preopened_op.probe_bridge = None
+                cancelled = preopened_op.cancelled.is_set()
+            if cancelled:
+                self._finish_attach_op(preopened_op)
+                return False
+        cancelled = False
+        invalid = False
         with self._lock:
             # 釋鎖期間狀態可能已變（hotplug／release／另一條路徑改了 profile），重驗。
             session = next(
                 (s for s in self._sessions.values() if s.profile.device_by_id == by_id),
                 None,
             )
-            if session is None or session.bridge is not None:
-                return
-            if session.profile_source != "fallback":
-                return
-            if detected.profile_name == session.profile.profile_name:
-                return
-            if self._rematerialize_profile_locked(session, detected, "detected"):
+            device = self._devices.get(by_id)
+            cancelled = preopened_op is not None and preopened_op.cancelled.is_set()
+            invalid = bool(
+                session is None
+                or session.bridge is not None
+                or device is None
+                or device.real_path != real_path
+                or cancelled
+                or (session is not None and session.state == "RELEASED")
+                or by_id in self._released_by_ids
+                or by_id in self._draining_by_ids
+                or self._shutting_down
+            )
+            if (
+                not invalid
+                and detected is not None
+                and session is not None
+                and session.profile_source == "fallback"
+                and detected.profile_name != session.profile.profile_name
+            ):
+                self._rematerialize_profile_locked(session, detected, "detected")
+                if preopened_op is not None:
+                    preopened_op.session_id = session.session_id
+                save_profile = True
+            else:
+                save_profile = False
+            if save_profile:
                 self._save_state()
+        if invalid:
+            if preopened_op is not None:
+                self._finish_attach_op(preopened_op)
+            return False
+        if detected is None:
+            return True
         # sticky（_profile_detected）刻意不在此寫入：既有不變量是「達 READY 的正向偵測
         # 才寫 sticky」（_maybe_persist_sticky），profile_source 現已是 "detected"，
         # 後續 attach 流程走到 READY 時會照既有路徑寫入。
+        return True
 
-    def _attach_by_id_dynamic(self, by_id: str) -> None:
+    def _attach_by_id_dynamic(
+        self,
+        by_id: str,
+        *,
+        preopened_op: _AttachOp | None = None,
+    ) -> None:
         """動態偵測 template 並建立新 session。"""
-        from .config import UartProfile
-
+        skip_attach = False
         with self._lock:
-            dev = self._devices.get(by_id)
-            if dev is None:
-                return
-            real_path = dev.real_path
-            probe_real_path = real_path  # detect 當時的 real_path（#95 HIGH#2 TOCTOU：sticky 須比對此值）
+            if self._shutting_down or by_id in self._draining_by_ids:
+                import logging
+                logging.getLogger("serialwrap").info("shutdown 或 drain 中，略過動態 attach %s", by_id)
+                skip_attach = True
+                real_path = ""
+            else:
+                dev = self._devices.get(by_id)
+                if dev is None:
+                    skip_attach = True
+                    real_path = ""
+                else:
+                    real_path = dev.real_path
+                    preopened_op = self._active_attach_ops.get(by_id) or self._preopened_ports.get(by_id) or preopened_op
+                    if preopened_op is not None and preopened_op.cancelled.is_set():
+                        skip_attach = True
+        if skip_attach:
+            self._discard_preopened_port(by_id, preopened_op)
+            return
+        probe_real_path = real_path  # detect 當時的 real_path（#95 HIGH#2 TOCTOU：sticky 須比對此值）
 
         # 四層優先序（#95）：pin > sticky > detect > fallback。pin/sticky 命中跳過 probe。
         tpl: ProfileTemplate | None = None
@@ -3008,9 +5057,52 @@ class SessionManager:
                 tpl = self._template_by_name(sticky_name)
                 if tpl is not None:
                     source = "sticky"
+
+        if preopened_op is None:
+            preopened_op, open_error = self._preopen_dynamic_attach_port(
+                by_id,
+                real_path,
+                UartProfile(),
+            )
+            if open_error is not None:
+                failure_template = tpl or self._default_passthrough_template()
+                failure_source = source if tpl is not None else "fallback"
+                self._record_dynamic_open_failure(
+                    by_id,
+                    real_path,
+                    open_error,
+                    template=failure_template,
+                    source=failure_source,
+                )
+                return
+            if preopened_op is None:
+                return
+
         if tpl is None:
             default_uart = UartProfile()
-            probe_bridge = UARTBridge("PROBE", real_path, default_uart, self._wal)
+            with self._lock:
+                if (
+                    self._shutting_down
+                    or by_id in self._draining_by_ids
+                    or (preopened_op is not None and preopened_op.cancelled.is_set())
+                ):
+                    skip_attach = True
+                else:
+                    skip_attach = False
+            if skip_attach:
+                self._discard_preopened_port(by_id, preopened_op)
+                return
+            probe_bridge = UARTBridge(
+                "PROBE",
+                real_path,
+                default_uart,
+                self._wal,
+                preopened_port=preopened_op.port if preopened_op is not None else None,
+                owns_port=False if preopened_op is not None else True,
+            )
+            if preopened_op is not None and not self._register_probe_bridge(preopened_op, probe_bridge):
+                self._finish_attach_op(preopened_op)
+                return
             detected: ProfileTemplate | None = None
             try:
                 probe_bridge.start()
@@ -3021,41 +5113,68 @@ class SessionManager:
             except Exception:
                 pass
             finally:
-                try:
-                    probe_bridge.stop()
-                except Exception:
-                    pass
+                probe_stopped = self._stop_probe_bridge_safely(probe_bridge)
+            if not probe_stopped:
+                return
+            if preopened_op is not None:
+                with self._lock:
+                    if preopened_op.probe_bridge is probe_bridge:
+                        preopened_op.probe_bridge = None
+                    cancelled = preopened_op.cancelled.is_set()
+                if cancelled:
+                    self._finish_attach_op(preopened_op)
+                    return
             if detected is not None:
                 tpl, source = detected, "detected"
         if tpl is None:
             tpl, source = self._default_passthrough_template(), "fallback"
         if tpl is None:
+            self._discard_preopened_port(by_id, preopened_op)
             return
 
+        skip_attach = False
         with self._lock:
             # 確認裝置仍在線且 session 數仍未超限
-            if by_id not in self._devices or len(self._sessions) >= self._max_sessions:
-                return
-            session = self._session_from_template(tpl, by_id)
-            session.profile_source = source
+            if (
+                self._shutting_down
+                or by_id in self._draining_by_ids
+                or by_id not in self._devices
+                or len(self._sessions) >= self._max_sessions
+                or (preopened_op is not None and preopened_op.cancelled.is_set())
+            ):
+                skip_attach = True
+            else:
+                session = self._session_from_template(tpl, by_id)
+                session.profile_source = source
+                if preopened_op is not None:
+                    preopened_op.session_id = session.session_id
+        if skip_attach:
+            self._discard_preopened_port(by_id, preopened_op)
+            return
 
         # 用正確 uart 參數重新開 bridge
         profile = session.profile
+        skip_attach = False
         with self._lock:
-            dev = self._devices.get(by_id)
-            if dev is None:
-                return
-            # C1 早退（dynamic 版）：release 早於 attach 開 FD 時不啟動。
-            if session.state == "RELEASED" or by_id in self._released_by_ids:
-                return
-            real_path = dev.real_path
-            session.state = "ATTACHING"
-            session.last_error = None
-            gen_before = session.bridge_generation
-            session_id = session.session_id
-            require_login = session.pending_auto_login or bool(profile.login_regex or profile.console_unlock_env)
-            # 與 _attach_by_id 一致，以 ready_probe 判定可否下命令。
-            command_capable = profile.command_capable
+            if self._shutting_down or by_id in self._draining_by_ids:
+                skip_attach = True
+            else:
+                dev = self._devices.get(by_id)
+                if dev is None or session.state == "RELEASED" or by_id in self._released_by_ids:
+                    skip_attach = True
+                else:
+                    real_path = dev.real_path
+                    session.state = "ATTACHING"
+                    session.last_error = None
+                    gen_before = session.bridge_generation
+                    session_id = session.session_id
+                    require_login = session.pending_auto_login or bool(profile.login_regex or profile.console_unlock_env)
+                    # 與 _attach_by_id 一致，以 ready_probe 判定可否下命令。
+                    command_capable = profile.command_capable
+                preopened_op = self._active_attach_ops.get(by_id) or self._preopened_ports.get(by_id) or preopened_op
+        if skip_attach:
+            self._discard_preopened_port(by_id, preopened_op)
+            return
 
         bridge = UARTBridge(
             profile.com,
@@ -3063,93 +5182,183 @@ class SessionManager:
             profile.uart,
             self._wal,
             on_console_line=lambda client_id, line, sid=session_id: self._on_bridge_console_line(sid, client_id, line),
-            on_rx_data=lambda data, sid=session_id: self._on_bridge_rx(sid, data),
+            on_rx_data=lambda data, wal_seq=None, sid=session_id: self._on_bridge_rx(
+                sid, data, wal_seq
+            ),
             on_bridge_down=lambda reason, sid=session_id: self._handle_bridge_down(sid, bridge, reason),
+            preopened_port=preopened_op.port if preopened_op is not None else None,
+            owns_port=True,
         )
 
+        attach_started = threading.Event()
+        abort_attach = False
+        with self._lock:
+            if (
+                self._shutting_down
+                or by_id in self._draining_by_ids
+                or session.state == "RELEASED"
+                or by_id in self._released_by_ids
+                or (preopened_op is not None and preopened_op.cancelled.is_set())
+            ):
+                abort_attach = True
+            elif self._handoff_attach_op_locked(preopened_op):
+                self._attach_bridges[by_id] = bridge
+                self._attach_start_events[by_id] = attach_started
+                session.attach_bridge = bridge
+            else:
+                abort_attach = True
+        if abort_attach:
+            if preopened_op is not None:
+                self._finish_attach_op(preopened_op)
+            return
+
         try:
-            bridge.start()
+            try:
+                bridge.start()
+            finally:
+                attach_started.set()
+            with self._lock:
+                pending_job = self._draining_by_ids.get(by_id)
+                if pending_job is None and self._shutting_down:
+                    pending_job = self._begin_attach_bridge_stop_locked(
+                        session,
+                        by_id,
+                        bridge,
+                        preserve_consoles=True,
+                        started_at=time.monotonic(),
+                    )
+            if pending_job is not None:
+                if pending_job.kind == "attach_cleanup":
+                    self._finish_attach_bridge_stop(pending_job)
+                return
             # #150：probe 前採樣 raw RX 累計（dynamic 路徑無 boot-quiet gate）。
             rx_before = self._bridge_rx_total(bridge)
+            with self._lock:
+                probe_permit = (
+                    self._begin_login_run_locked(session, bridge)
+                    if command_capable
+                    else None
+                )
+            probe_refused = False
+            used_ensure_ready = False
             if not command_capable:
                 ok, err = False, None
-            elif require_login:
-                auth, auth_res = resolve_session_auth(profile)
-                if self._credentials_declared_but_unresolved(profile, auth_res):
-                    # 宣告帳密但解析空：不 probe/login，掛橋停 ATTACHED 終態（#140）。
-                    self._emit_credentials_unresolved_warning(
-                        session_id, profile.com, auth_res
-                    )
-                    ok, err = False, ERROR_CREDENTIALS_UNRESOLVED
-                elif auth.console_unlock or (auth.username and auth.password):
-                    ok, err = ensure_ready(bridge, profile, auth=auth)
-                    if not ok:
-                        # #150：於 bridge.stop() 前精煉。
-                        err, err_detail = self._refine_probe_failure(session, bridge, err, rx_before)
-                        bridge.stop()
-                        with self._lock:
-                            session.state = "DETACHED"
-                            session.last_error = err
-                            session.last_error_detail = err_detail
-                            session.detached_at = now_iso()
-                            session.bridge = None
-                            session.vtty_path = None
-                            session.attached_real_path = None
-                        self._on_detached(session.session_id)
-                        return
-                else:
-                    ok, err = probe_ready(bridge, profile)
             else:
-                ok, err = probe_ready(bridge, profile)
+                try:
+                    with self._system_permit_context(bridge, probe_permit):
+                        if require_login:
+                            auth, auth_res = resolve_session_auth(profile)
+                            if self._credentials_declared_but_unresolved(profile, auth_res):
+                                # 宣告帳密但解析空：不 probe/login，掛橋停 ATTACHED 終態（#140）。
+                                self._emit_credentials_unresolved_warning(
+                                    session_id, profile.com, auth_res
+                                )
+                                ok, err = False, ERROR_CREDENTIALS_UNRESOLVED
+                            elif auth.console_unlock or (auth.username and auth.password):
+                                used_ensure_ready = True
+                                ok, err = ensure_ready(bridge, profile, auth=auth)
+                            else:
+                                ok, err = probe_ready(bridge, profile)
+                        else:
+                            ok, err = probe_ready(bridge, profile)
+                except TxIncompleteError as exc:
+                    if not _login_tx_refused(exc):
+                        raise
+                    ok, err = False, "PROMPT_UNAVAILABLE"
+                    probe_refused = True
+                if used_ensure_ready and not ok and not probe_refused:
+                    # #150：於 bridge.stop() 前精煉。
+                    err, err_detail = self._refine_probe_failure(session, bridge, err, rx_before)
+                    self._track_attach_bridge_stop(session, by_id, bridge)
+                    with self._lock:
+                        session.state = "DETACHED"
+                        session.last_error = err
+                        session.last_error_detail = err_detail
+                        session.detached_at = now_iso()
+                        session.bridge = None
+                        session.vtty_path = None
+                        session.attached_real_path = None
+                    self._on_detached(session.session_id)
+                    return
 
             # #150：失敗才精煉（dynamic 路徑無 boot-quiet 合成錯，不需排除）。
             err_detail: str | None = None
-            if not ok:
+            if not ok and not probe_refused:
                 err, err_detail = self._refine_probe_failure(session, bridge, err, rx_before)
 
             notify_ready = False
+            cleanup_job = None
+            cleanup_reason = None
             with self._lock:
                 # C1 backstop（dynamic 版）：release 落在飛行窗口內 → 關 FD、保留 RELEASED。
-                if session.state == "RELEASED" or by_id in self._released_by_ids:
-                    bridge.stop(preserve_consoles=False)
-                    session.bridge = None
-                    session.vtty_path = None
-                    session.attached_real_path = None
-                    return
-                current = self._devices.get(by_id)
-                if current is None or current.real_path != real_path or session.state == "DETACHED" or session.bridge_generation != gen_before:
-                    bridge.stop()
-                    session.state = "DETACHED"
-                    session.last_error = "DEVICE_REMOVED_DURING_ATTACH"
-                    session.detached_at = now_iso()
-                    session.bridge = None
-                    session.vtty_path = None
-                    session.attached_real_path = None
-                    return
-                session.bridge = bridge
-                session.vtty_path = bridge.vtty_path
-                session.attached_real_path = real_path
-                session.bridge_generation += 1
-                if ok:
-                    session.state = "READY"
-                    # #139：READY 即解除 boot quiet gate（詳見 _probe_existing_bridge 註解）。
-                    # #162：READY 確認點——confirm_ready 同步清 pending。
-                    session.confirm_ready()
-                    session.last_error = None
-                    session.last_ready_at = now_iso()
-                    session.recovering = False
-                    session.recovery_started_at = None
-                    session.pending_auto_login = False
-                    self._reset_reprobe_progress_locked(session)
-                    self._maybe_persist_sticky(by_id=by_id, profile_name=profile.profile_name,
-                                               source=session.profile_source, real_path=probe_real_path)
-                    notify_ready = True
+                if self._shutting_down or session.state == "RELEASED" or by_id in self._released_by_ids:
+                    cleanup_reason = "released"
+                    pending_job = self._draining_by_ids.get(by_id)
+                    cleanup_job = pending_job if pending_job is not None and pending_job.bridge is bridge else None
+                    if cleanup_job is None and self._attach_bridges.get(by_id) is bridge:
+                        cleanup_job = self._begin_attach_bridge_stop_locked(
+                            session,
+                            by_id,
+                            bridge,
+                            preserve_consoles=False,
+                            started_at=time.monotonic(),
+                        )
                 else:
-                    session.state = "ATTACHED"
-                    session.last_error = err
-                    session.last_error_detail = err_detail
-                    session.recovering = False
-                    session.recovery_started_at = None
+                    current = self._devices.get(by_id)
+                    if current is None or current.real_path != real_path or session.state == "DETACHED" or session.bridge_generation != gen_before:
+                        cleanup_reason = "removed"
+                        cleanup_job = self._begin_attach_bridge_stop_locked(
+                            session,
+                            by_id,
+                            bridge,
+                            preserve_consoles=True,
+                            started_at=time.monotonic(),
+                        )
+                        session.state = "DETACHED"
+                        session.last_error = "DEVICE_REMOVED_DURING_ATTACH"
+                        session.detached_at = now_iso()
+                    else:
+                        session.bridge = bridge
+                        if session.attach_bridge is bridge:
+                            session.attach_bridge = None
+                        self._attach_bridges.pop(by_id, None)
+                        self._attach_start_events.pop(by_id, None)
+                        session.vtty_path = bridge.vtty_path
+                        session.attached_real_path = real_path
+                        session.bridge_generation += 1
+                        session._push_probe_gate(bridge)
+                        session._push_tx_gate(bridge)
+                        if ok:
+                            session.state = "READY"
+                            # #139：READY 即解除 boot quiet gate（詳見 _probe_existing_bridge 註解）。
+                            # #162：READY 確認點——confirm_ready 同步清 pending。
+                            session.confirm_ready()
+                            session.last_error = None
+                            session.last_ready_at = now_iso()
+                            session.recovering = False
+                            session.recovery_started_at = None
+                            session.pending_auto_login = False
+                            self._reset_reprobe_progress_locked(session)
+                            self._maybe_persist_sticky(by_id=by_id, profile_name=profile.profile_name,
+                                                       source=session.profile_source, real_path=probe_real_path)
+                            notify_ready = True
+                        else:
+                            session.state = "ATTACHED"
+                            session.last_error = err
+                            session.last_error_detail = err_detail
+                            session.recovering = False
+                            session.recovery_started_at = None
+            if cleanup_job is not None:
+                receipt = self._finish_attach_bridge_stop(cleanup_job)
+                if cleanup_reason == "removed":
+                    with self._lock:
+                        self._store_retained_consoles_locked(
+                            session,
+                            getattr(receipt, "preserved", None),
+                            human_owner=session.retained_human_owner,
+                            human_timeout_s=session.retained_human_timeout_s,
+                        )
+                return
             if notify_ready:
                 self._on_ready(session.session_id)
         except Exception as exc:
@@ -3157,18 +5366,35 @@ class SessionManager:
             # bridge.start() 拋出例外（埠被佔、PermissionError 等）時，
             # 已建立的動態 session 退回 DETACHED，不污染 RELEASED，
             # 下次可透過手動 attach_device / clear_session 或裝置重新出現（added）觸發重試。
+            with self._lock:
+                pending_job = session._pending_drain
+                if pending_job is None:
+                    candidate = self._draining_by_ids.get(by_id)
+                    if candidate is not None and candidate.bridge is bridge:
+                        pending_job = candidate
+                released = session.state == "RELEASED" or by_id in self._released_by_ids
+                bridge_still_attaching = self._attach_bridges.get(by_id) is bridge
+            if pending_job is not None:
+                if pending_job.kind == "attach_cleanup":
+                    self._finish_attach_bridge_stop(pending_job)
+                return
+            if released and not bridge_still_attaching:
+                return
             try:
-                bridge.stop()
+                self._track_attach_bridge_stop(session, by_id, bridge)
             except Exception:
                 pass
             with self._lock:
-                session.state = "DETACHED"
-                session.last_error = f"ATTACH_FAILED:{type(exc).__name__}"
-                session.detached_at = now_iso()
-                session.bridge = None
-                session.vtty_path = None
-                session.attached_real_path = None
-            self._on_detached(session.session_id)
+                released = session.state == "RELEASED" or by_id in self._released_by_ids
+                if not released:
+                    session.state = "DETACHED"
+                    session.last_error = f"ATTACH_FAILED:{type(exc).__name__}"
+                    session.detached_at = now_iso()
+                    session.bridge = None
+                    session.vtty_path = None
+                    session.attached_real_path = None
+            if not released:
+                self._on_detached(session.session_id)
 
     def _last_prompt_start(self, text: str, prompt_regex: str) -> int | None:
         regex = re.compile(prompt_regex)
@@ -3218,9 +5444,36 @@ class SessionManager:
         )
         self._interactive[interactive_id] = lease
         session.interactive_session_id = interactive_id
+        if self._admission is not None:
+            self._admission.set_flag(session.profile.com, "lease", True)
         assert session.bridge is not None
         session.bridge.set_interactive_owner(owner)
+        session._push_tx_gate(session.bridge)
         return lease
+
+    def _record_interactive_terminal_locked(
+        self,
+        lease: InteractiveLease,
+        *,
+        terminal_status: Literal["closed", "expired"],
+        keep_tombstone: bool,
+    ) -> None:
+        """設定 lease 終態並維護每個 session 的有界 expired FIFO。"""
+        lease.status = terminal_status
+        if not keep_tombstone:
+            self._interactive.pop(lease.interactive_id, None)
+            return
+
+        tombstones = self._tombstones.setdefault(lease.session_id, deque())
+        if lease.interactive_id not in tombstones:
+            tombstones.append(lease.interactive_id)
+        while len(tombstones) > INTERACTIVE_TOMBSTONE_MAX:
+            expired_id = tombstones.popleft()
+            expired_lease = self._interactive.get(expired_id)
+            if expired_lease is not None and expired_lease.status == "expired":
+                self._interactive.pop(expired_id, None)
+        if not tombstones:
+            self._tombstones.pop(lease.session_id, None)
 
     def _close_interactive_locked(
         self,
@@ -3228,6 +5481,8 @@ class SessionManager:
         *,
         interactive_id: str | None = None,
         expected_owner: str | None = None,
+        terminal_status: Literal["closed", "expired"] = "closed",
+        keep_tombstone: bool = False,
     ) -> tuple[InteractiveLease | None, _PostCloseAction]:
         """Close interactive lease。回傳 (closed_lease, post_close_action)。
 
@@ -3240,9 +5495,6 @@ class SessionManager:
         lease = self._interactive.get(lease_id)
         if lease is not None and expected_owner is not None and lease.owner != expected_owner:
             return None, post
-        if lease is not None:
-            lease.status = "closed"
-            self._interactive.pop(lease_id, None)
 
         # 帶 suspended_human 的 lease（bootloader recovery 或 #53 soft preempt）關閉時 →
         # 還原 stash 的 human lease 或丟棄；不限 recovery_mode，soft preempt（recovery_mode=False）亦適用。
@@ -3270,12 +5522,36 @@ class SessionManager:
                     bridge.set_interactive_owner(None)
                 post.clear_owner_after_resume = True
 
+            if self._admission is not None:
+                self._admission.set_flag(
+                    session.profile.com,
+                    "lease",
+                    session.interactive_session_id is not None,
+                )
+
+            session._push_tx_gate(bridge)
+
+            if lease is not None:
+                self._record_interactive_terminal_locked(
+                    lease,
+                    terminal_status=terminal_status,
+                    keep_tombstone=keep_tombstone,
+                )
             return lease, post
 
         # 一般 close
         session.interactive_session_id = None
         if session.bridge is not None:
             session.bridge.set_interactive_owner(None)
+        if self._admission is not None:
+            self._admission.set_flag(session.profile.com, "lease", False)
+        session._push_tx_gate(session.bridge)
+        if lease is not None:
+            self._record_interactive_terminal_locked(
+                lease,
+                terminal_status=terminal_status,
+                keep_tombstone=keep_tombstone,
+            )
         return lease, post
 
     def _refresh_interactive_locked(
@@ -3289,6 +5565,16 @@ class SessionManager:
         if lease is None:
             _, post = self._close_interactive_locked(session, interactive_id=lease_id)
             return None, post
+        if not lease.owner.startswith("human:") and lease.expired():
+            _, post = self._close_interactive_locked(
+                session,
+                interactive_id=lease_id,
+                terminal_status="expired",
+                keep_tombstone=True,
+            )
+            restored_id = session.interactive_session_id
+            restored = self._interactive.get(restored_id) if restored_id is not None else None
+            return restored, post
         if session.bridge is None:
             _, post = self._close_interactive_locked(session, interactive_id=lease_id)
             return None, post
@@ -3311,12 +5597,6 @@ class SessionManager:
             if snapshot.get("interactive_owner") != lease.owner:
                 _, post = self._close_interactive_locked(session, interactive_id=lease_id)
                 return None, post
-        else:
-            if lease.expired():
-                _, post = self._close_interactive_locked(session, interactive_id=lease_id)
-                restored_id = session.interactive_session_id
-                restored = self._interactive.get(restored_id) if restored_id is not None else None
-                return restored, post
         return lease, post
 
     def _lease_context(
@@ -3345,6 +5625,8 @@ class SessionManager:
     def _transition_to_attached(self, session: SessionRuntime, *, reason: str) -> None:
         notify_not_ready = False
         with self._lock:
+            if session._pending_drain is not None:
+                return
             # 在途 command 的 timeout/recovery 可能在 flash endpoint 已把 session 移入 FLASHING、
             # 或 device handoff 釋放成 RELEASED 之後才跑到這；此時不得覆寫狀態，否則 FLASHING 被打回
             # ATTACHED → exit_flashing 提早 return、bridge 卡 flash 模式（#69 Finding round4）。
@@ -3357,6 +5639,8 @@ class SessionManager:
             session.recovering = False
             session.recovery_started_at = None
             session.pending_auto_login = False
+            if self._admission is not None:
+                self._admission.set_flag(session.profile.com, "recovering", False)
         if notify_not_ready:
             self._on_detached(session.session_id)
 
@@ -3403,10 +5687,19 @@ class SessionManager:
                     session = self._sessions.get(session_id)
                     if session is None:
                         return
+                    if self._shutting_down:
+                        return
+                    if session._pending_drain is not None:
+                        drain_pending = True
+                    else:
+                        drain_pending = False
                     bridge = session.bridge
                     by_id = session.profile.device_by_id
                     quiet_until = session.boot_quiet_until
                     quiet_active = self._boot_quiet_blocks_probe(session)
+                if drain_pending:
+                    time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
+                    continue
                 now = time.monotonic()
                 if quiet_active:
                     # #130 review Finding 6（順修）：改呼叫 boot_quiet_active() 統一入口，
@@ -3423,16 +5716,37 @@ class SessionManager:
                 if bridge is not None:
                     credentials_terminal = False
                     try:
-                        auth, auth_res = resolve_session_auth(session.profile)
-                        if self._credentials_declared_but_unresolved(session.profile, auth_res):
-                            # 宣告帳密但解析空：recovery 不送 ensure_ready 空 probe，記終態（#140）。
-                            self._emit_credentials_unresolved_warning(
-                                session_id, session.profile.com, auth_res
-                            )
-                            ok, err = False, ERROR_CREDENTIALS_UNRESOLVED
-                            credentials_terminal = True
-                        else:
-                            ok, err = ensure_ready(bridge, session.profile, auth=auth)
+                        with self._lock:
+                            current = self._sessions.get(session_id)
+                            if (
+                                current is None
+                                or current.bridge is not bridge
+                                or current._pending_drain is not None
+                            ):
+                                continue
+                            if self._boot_quiet_blocks_probe(current):
+                                continue
+                            probe_permit = self._begin_login_run_locked(current, bridge)
+                        with self._system_permit_context(bridge, probe_permit):
+                            auth, auth_res = resolve_session_auth(session.profile)
+                            if self._credentials_declared_but_unresolved(session.profile, auth_res):
+                                # 宣告帳密但解析空：recovery 不送 ensure_ready 空 probe，記終態（#140）。
+                                self._emit_credentials_unresolved_warning(
+                                    session_id, session.profile.com, auth_res
+                                )
+                                ok, err = False, ERROR_CREDENTIALS_UNRESOLVED
+                                credentials_terminal = True
+                            else:
+                                ok, err = ensure_ready(bridge, session.profile, auth=auth)
+                    except TxIncompleteError as exc:
+                        if _login_tx_refused(exc):
+                            # quiet/replaced run：回到 loop，下一輪依期限被動等待或重取 permit。
+                            continue
+                        import logging
+                        logging.getLogger("serialwrap").warning(
+                            "reboot-recovery ensure_ready TX 例外（session=%s）", session_id, exc_info=True
+                        )
+                        ok, err = False, "RECOVERY_ERROR"
                     except Exception:  # noqa: BLE001 — login/probe 非預期例外不得殺死 worker（致 session 永卡 RECOVERING）（#79 STA-6）
                         import logging
                         logging.getLogger("serialwrap").warning(
@@ -3442,7 +5756,7 @@ class SessionManager:
                     if ok:
                         with self._lock:
                             session = self._sessions.get(session_id)
-                            if session is None or session.bridge is not bridge:
+                            if session is None or session.bridge is not bridge or session._pending_drain is not None:
                                 continue
                             # unlocked ensure_ready 期間 session 可能被搶進 FLASHING/RELEASED；不得覆寫（#69 r4）。
                             if session.state in {"FLASHING", "RELEASED"}:
@@ -3456,12 +5770,14 @@ class SessionManager:
                             session.recovering = False
                             session.recovery_started_at = None
                             session.pending_auto_login = False
+                            if self._admission is not None:
+                                self._admission.set_flag(session.profile.com, "recovering", False)
                             self._reset_reprobe_progress_locked(session)
                         self._on_ready(session_id)
                         return
                     with self._lock:
                         session = self._sessions.get(session_id)
-                        if session is None or session.bridge is not bridge:
+                        if session is None or session.bridge is not bridge or session._pending_drain is not None:
                             continue
                         session.last_error = err
                     if credentials_terminal:
@@ -3485,6 +5801,8 @@ class SessionManager:
                 session.recovering = False
                 session.recovery_started_at = None
                 session.pending_auto_login = False
+                if self._admission is not None:
+                    self._admission.set_flag(session.profile.com, "recovering", False)
                 if session.bridge is None:
                     session.state = "DETACHED"
                     session.last_error = "RECOVERY_TIMEOUT"
@@ -3537,7 +5855,11 @@ class SessionManager:
         cmd_id: str,
         timeout_s: float,
         execution_mode: str,
+        operation: _ForegroundOperation | None = None,
+        trusted_human: bool | None = None,
+        permit: TxPermit | None = None,
     ) -> dict[str, Any]:
+        human = source.startswith("human:") if trusted_human is None else trusted_human
         prompt_regex = session.profile.prompt_regex
         pre_offset = bridge.rx_snapshot_len()
         # #130：收到 reboot 命令**當下**即設 boot quiet window，不等 banner——
@@ -3545,12 +5867,44 @@ class SessionManager:
         # banner 前緩衝的 bytes；等 banner 才靜默會讓第一發 probe 落入 autoboot 窗。
         # 若 target 其實沒重開（2s 內 prompt 回來），RX 解除檢查會立即清掉本視窗。
         with self._lock:
-            session.arm_boot_quiet()
+            if not self._foreground_operation_current_locked(session, bridge, operation):
+                return {"ok": False, "error_code": "FLUSHED_BY_RECOVERY"}
+            invalidate_deferred = getattr(bridge, "invalidate_deferred", None)
+            if callable(invalidate_deferred):
+                invalidate_deferred("reboot")
+            if permit is None:
+                permit = TxPermit(
+                    cmd_id,
+                    session.bridge_generation,
+                    "human_line" if human else "agent",
+                )
         if session.profile.console_unlock_env:
             # 已重開的舊 root prompt 不可在 recovery 中被當成解鎖證據。
             bridge.clear_rx_buffer()
         self._mark_session_tx(session)
-        bridge.send_command(command, source=source, cmd_id=cmd_id)
+        # 先送出已授權的 reboot，再於同一個寫入序列鎖內 arm quiet。若 RX 在
+        # permit 發放後、OS 提交前看到 banner，提交 fence 會先拒絕這筆命令；若
+        # 寫入成功、部分完成或結果不明，quiet 都會在下一個 UART writer 取得鎖前生效。
+        write_lock = getattr(bridge, "_write_lock", None)
+        write_context = write_lock if write_lock is not None else contextlib.nullcontext()
+        with write_context:
+            try:
+                self._send_command_with_permit(
+                    bridge,
+                    command,
+                    source=source,
+                    cmd_id=cmd_id,
+                    permit=permit,
+                )
+            except BaseException as exc:
+                tx_result = getattr(exc, "result", None)
+                if tx_result is not None and (
+                    tx_result.confirmed > 0 or tx_result.outcome == "unknown"
+                ):
+                    session.arm_boot_quiet()
+                raise
+            else:
+                session.arm_boot_quiet()
         if bridge.wait_for_regex_from(prompt_regex, pre_offset, min(timeout_s, 2.0)):
             # #139（belt-and-suspenders）：2s 內 prompt 回來，RX 解除檢查
             # （_update_boot_quiet_locked）通常已清 quiet，但 prompt 被 RX chunk 切割
@@ -3565,6 +5919,8 @@ class SessionManager:
             # 保留 pending → 後續真 banner 抵達時 gate 已是關的，且 agent 命令要等
             # 確認 probe（nonce 實證）成功才放行。
             with self._lock:
+                if not self._foreground_operation_current_locked(session, bridge, operation):
+                    return {"ok": False, "error_code": "FLUSHED_BY_RECOVERY"}
                 session.clear_boot_quiet()
             raw_text = bridge.rx_text_from(pre_offset)
             stdout = self._extract_command_stdout(raw_text, command, prompt_regex)
@@ -3575,9 +5931,13 @@ class SessionManager:
                 "partial": False,
             }
 
-        if source.startswith("human:"):
+        if human:
             post = _PostCloseAction()
             with self._lock:
+                if not self._foreground_operation_current_locked(session, bridge, operation):
+                    return {"ok": False, "error_code": "FLUSHED_BY_RECOVERY"}
+                if session.session_id in self._interactive_post_close:
+                    return {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY"}
                 lease, post = self._refresh_interactive_locked(session)
                 if lease is None:
                     lease = self._open_interactive_locked(
@@ -3603,10 +5963,14 @@ class SessionManager:
             }
 
         with self._lock:
+            if not self._foreground_operation_current_locked(session, bridge, operation):
+                return {"ok": False, "error_code": "FLUSHED_BY_RECOVERY"}
             session.pending_auto_login = True
             session.recovering = True
             session.recovery_started_at = now_iso()
             session.state = "RECOVERING"
+            if self._admission is not None:
+                self._admission.set_flag(session.profile.com, "recovering", True)
             session.last_error = None
         self._on_detached(session.session_id)
         self._spawn_reboot_recovery(session.session_id, session.profile.hard_timeout_s)
@@ -3630,15 +5994,22 @@ class SessionManager:
         mode: str = "line",
         expected_duration_s: float | None = None,
         completion_regex: str | None = None,
+        trusted_human: bool | None = None,
     ) -> dict[str, Any]:
         if not valid_completion_regex(completion_regex):
             return {"ok": False, "error_code": ERROR_INVALID_COMPLETION_REGEX}
         normalized_mode = {"fg": "line", "bg": "background"}.get(mode, mode)
+        human = source.startswith("human:") if trusted_human is None else trusted_human
         suspend_human_interactive = False
         post = _PostCloseAction()
         busy_result: dict[str, Any] | None = None
         operation: _ForegroundOperation | None = None
+        command_permit: TxPermit | None = None
+        interactive_permit: TxPermit | None = None
         with self._lock:
+            if cmd_id in self._cancelled_tx_cmd_ids:
+                self._cancelled_tx_cmd_ids.pop(cmd_id, None)
+                return {"ok": False, "error_code": "FLUSHED_BY_RECOVERY"}
             session = self._sessions.get(session_id)
             if session is not None and session.state == "FLASHING":
                 return {"ok": False, "error_code": "FLASHING_BUSY", "selector": session.profile.com}
@@ -3647,12 +6018,12 @@ class SessionManager:
             # #139 execute-time gate（第二層，堵 queue race）：submit 通過第一層後、worker
             # 執行前 banner 才到（命令已在 arbiter queue）的競態於此攔下。arbiter._worker
             # 會把本 error_code 寫回命令記錄（status=error），`cmd status` 可觀測；命令
-            # 未送 UART、零副作用，READY 重新確認後可重送。human 來源循 #130 慣例放行
-            # （#114 刻意進 bootloader：human console／lease 送鍵永不 gate）。
+            # 未送 UART、零副作用，READY 重新確認後可重送。只有受信任的內部 human console
+            # 命令可略過此 gate；RPC 的 source 字串不能授權豁免。
             # #162：改判 _agent_gate_reject_locked()——quiet 過期不再解除 gate，須等
             # READY 經 nonce probe 再確認（confirm_ready）才放行；pending 逾時／逾次
             # 則改回不可重試的 READY_UNCONFIRMED。
-            if not source.startswith("human:"):
+            if not human:
                 gate = self._agent_gate_reject_locked(session)
                 if gate is not None:
                     return gate
@@ -3664,7 +6035,7 @@ class SessionManager:
                 return {"ok": False, "error_code": "SESSION_BUSY", "selector": session.profile.com}
             lease, post = self._refresh_interactive_locked(session)
             if lease is not None and normalized_mode != "interactive":
-                if not source.startswith("human:") and lease.owner.startswith("human:"):
+                if not human and lease.owner.startswith("human:"):
                     suspend_human_interactive = True
                 else:
                     busy_result = {
@@ -3675,32 +6046,151 @@ class SessionManager:
             if busy_result is None:
                 operation, busy_result = self._begin_foreground_operation_locked(
                     session,
+                    kind="command",
+                    cmd_id=cmd_id,
                     expected_duration_s=expected_duration_s,
                 )
             bridge = session.bridge
             prompt_regex = session.profile.prompt_regex
+            if operation is not None:
+                command_permit = TxPermit(
+                    cmd_id,
+                    session.bridge_generation,
+                    "human_line" if human else "agent",
+                )
 
         human_suspended = False
+        mapped_aborted = False
         try:
             post.execute()
             if busy_result is not None:
                 return busy_result
+            if operation is not None:
+                try:
+                    from .arbiter import CommandArbiter
+
+                    CommandArbiter.register_current_cancel_callback(
+                        cmd_id, self.revoke_tx_op
+                    )
+                except Exception:  # noqa: BLE001 — direct manager calls沒有 arbiter worker
+                    pass
             if suspend_human_interactive:
                 bridge.suspend_interactive()
                 human_suspended = True
-            return self._execute_command_inner(
+            set_active = getattr(bridge, "tx_set_active", None)
+            if callable(set_active):
+                set_active(cmd_id)
+            result = self._execute_command_inner(
                 session, bridge, command, source, cmd_id,
                 timeout_s=timeout_s, normalized_mode=normalized_mode,
                 prompt_regex=prompt_regex,
                 expected_duration_s=expected_duration_s,
                 completion_regex=completion_regex,
+                operation=operation,
+                trusted_human=human,
+                command_permit=command_permit,
             )
+            with self._lock:
+                aborted_by_drain = cmd_id in self._aborted_cmd_ids
+            if aborted_by_drain and not result.get("ok", False):
+                mapped_aborted = True
+                return self._map_aborted_result(
+                    cmd_id,
+                    result,
+                    bridge=bridge,
+                    aborted_by_drain=True,
+                )
+            return result
+        except BaseException as exc:
+            with self._lock:
+                aborted_by_drain = cmd_id in self._aborted_cmd_ids
+            if aborted_by_drain or isinstance(exc, TxIncompleteError):
+                mapped_aborted = aborted_by_drain
+                return self._map_aborted_result(
+                    cmd_id,
+                    exc,
+                    bridge=bridge,
+                    aborted_by_drain=aborted_by_drain,
+                )
+            raise
         finally:
             try:
                 if human_suspended:
                     bridge.resume_interactive()
             finally:
-                self._finish_foreground_operation(session, operation)
+                try:
+                    if operation is not None:
+                        try:
+                            if not mapped_aborted:
+                                settle = getattr(bridge, "tx_settle", None)
+                                if callable(settle):
+                                    settle(cmd_id)
+                        finally:
+                            set_active = getattr(bridge, "tx_set_active", None)
+                            if callable(set_active):
+                                set_active(None)
+                finally:
+                    try:
+                        if operation is not None:
+                            try:
+                                from .arbiter import CommandArbiter
+
+                                CommandArbiter.unregister_current_cancel_callback(cmd_id)
+                            except Exception:  # noqa: BLE001 — direct manager calls沒有 arbiter worker
+                                pass
+                        self._finish_foreground_operation(session, operation)
+                    finally:
+                        with self._lock:
+                            self._aborted_cmd_ids.discard(cmd_id)
+
+    def _map_aborted_result(
+        self,
+        cmd_id: str,
+        result: dict[str, Any] | BaseException,
+        *,
+        bridge: UARTBridge,
+        aborted_by_drain: bool,
+    ) -> dict[str, Any]:
+        """依 T06 的 TX 帳本把 drain 中止結果映射成可重試狀態碼。"""
+        account = getattr(bridge, "tx_account", None)
+        confirmed, unknown = account(cmd_id) if callable(account) else (0, False)
+        tx_result = result.result if isinstance(result, TxIncompleteError) else None
+        unknown = unknown or isinstance(result, TxUnknownError) or (
+            tx_result is not None and tx_result.outcome == "unknown"
+        )
+        if confirmed > 0:
+            if unknown:
+                tx_outcome = "unknown"
+            elif tx_result is not None and (
+                tx_result.outcome != "completed" or tx_result.confirmed < tx_result.requested
+            ):
+                tx_outcome = "partial"
+            else:
+                tx_outcome = "complete"
+            self._wal.append(
+                com=bridge.com,
+                direction="META",
+                source="system",
+                cmd_id=cmd_id,
+                payload=b"",
+                meta={
+                    "event": "command_aborted_in_flight",
+                    "confirmed_tx_bytes": confirmed,
+                    "tx_outcome": tx_outcome,
+                },
+            )
+            return {"ok": False, "error_code": "COMMAND_ABORTED_IN_FLIGHT"}
+        if unknown:
+            return {"ok": False, "error_code": "SEND_FAILED"}
+        if isinstance(result, TxIncompleteError):
+            reason = (result.result.error or "").removeprefix("revoked:")
+            if reason == "quiet":
+                return {"ok": False, "error_code": ERROR_AUTOBOOT_QUIET}
+            if reason in {"cancelled", "stale_generation", "draining"}:
+                return {"ok": False, "error_code": "FLUSHED_BY_RECOVERY"}
+        if aborted_by_drain:
+            return {"ok": False, "error_code": "FLUSHED_BY_RECOVERY"}
+        return {"ok": False, "error_code": "SEND_FAILED"}
 
     def _execute_command_inner(
         self,
@@ -3715,17 +6205,37 @@ class SessionManager:
         prompt_regex: str,
         expected_duration_s: float | None = None,
         completion_regex: str | None = None,
+        operation: _ForegroundOperation | None = None,
+        trusted_human: bool | None = None,
+        command_permit: TxPermit | None = None,
     ) -> dict[str, Any]:
+        human = source.startswith("human:") if trusted_human is None else trusted_human
         if normalized_mode == "interactive":
             with self._lock:
+                if not self._foreground_operation_current_locked(session, bridge, operation):
+                    return {"ok": False, "error_code": "FLUSHED_BY_RECOVERY"}
+                if session.session_id in self._interactive_post_close:
+                    return {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY"}
                 for bg_cmd_id in list(session.background_cmd_ids):
                     capture = self._background.get(bg_cmd_id)
                     if capture is not None:
                         capture.status = "done"
                 lease = self._open_interactive_locked(session, owner=source, timeout_s=max(timeout_s, session.profile.hard_timeout_s))
+                interactive_permit = TxPermit(
+                    cmd_id,
+                    session.bridge_generation,
+                    "interactive",
+                    owner_gen=getattr(bridge, "owner_gen", 0),
+                )
             if command:
                 self._mark_session_tx(session)
-                bridge.send_command(command, source=source, cmd_id=cmd_id)
+                self._send_command_with_permit(
+                    bridge,
+                    command,
+                    source=source,
+                    cmd_id=cmd_id,
+                    permit=interactive_permit,
+                )
             return {
                 "ok": True,
                 "execution_mode": "interactive",
@@ -3735,6 +6245,8 @@ class SessionManager:
             }
 
         with self._lock:
+            if not self._foreground_operation_current_locked(session, bridge, operation):
+                return {"ok": False, "error_code": "FLUSHED_BY_RECOVERY"}
             if normalized_mode != "background":
                 for bg_cmd_id in list(session.background_cmd_ids):
                     capture = self._background.get(bg_cmd_id)
@@ -3749,6 +6261,9 @@ class SessionManager:
                 cmd_id=cmd_id,
                 timeout_s=timeout_s,
                 execution_mode=normalized_mode,
+                operation=operation,
+                trusted_human=human,
+                permit=command_permit,
             )
         pre_offset = bridge.rx_snapshot_len()
         if completion_regex is not None:
@@ -3764,6 +6279,8 @@ class SessionManager:
             # （background capture 不再被 foreground_busy 擋住），此後全程
             # （含下方等待迴圈與 CTRL_C 復原）RX 都會即時進 add_chunk()。
             with self._lock:
+                if not self._foreground_operation_current_locked(session, bridge, operation):
+                    return {"ok": False, "error_code": "FLUSHED_BY_RECOVERY"}
                 capture = BackgroundCapture(
                     cmd_id=cmd_id,
                     session_id=session.session_id,
@@ -3776,7 +6293,14 @@ class SessionManager:
                 self._evict_background_locked()
                 session.background_cmd_ids.append(cmd_id)
         self._mark_session_tx(session)
-        bridge.send_command(command, source=source, cmd_id=cmd_id)
+        assert command_permit is not None
+        self._send_command_with_permit(
+            bridge,
+            command,
+            source=source,
+            cmd_id=cmd_id,
+            permit=command_permit,
+        )
 
         # — heartbeat / keepalive 迴圈 —
         effective_timeout = timeout_s
@@ -3800,6 +6324,9 @@ class SessionManager:
             # 有 RX 活動，繼續等待
 
         if not matched:
+            with self._lock:
+                if not self._foreground_operation_current_locked(session, bridge, operation):
+                    return {"ok": False, "error_code": "FLUSHED_BY_RECOVERY"}
             return self._recover_after_failure(
                 session,
                 bridge,
@@ -3809,6 +6336,8 @@ class SessionManager:
                 command=command,
                 prompt_regex=prompt_regex,
                 pre_offset=pre_offset,
+                operation=operation,
+                trusted_human=human,
             )
         raw_text = bridge.rx_text_from(pre_offset)
         stdout = self._extract_command_stdout(raw_text, command, prompt_regex, completion_regex=completion_regex)
@@ -3834,10 +6363,18 @@ class SessionManager:
         command: str,
         prompt_regex: str,
         pre_offset: int,
+        operation: _ForegroundOperation | None = None,
+        trusted_human: bool | None = None,
     ) -> dict[str, Any]:
-        if source.startswith("human:"):
+        human = source.startswith("human:") if trusted_human is None else trusted_human
+        with self._lock:
+            if not self._foreground_operation_current_locked(session, bridge, operation):
+                return {"ok": False, "error_code": "FLUSHED_BY_RECOVERY"}
+        if human:
             post = _PostCloseAction()
             with self._lock:
+                if session.session_id in self._interactive_post_close:
+                    return {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY"}
                 lease, post = self._refresh_interactive_locked(session)
                 if lease is None:
                     lease = self._open_interactive_locked(
@@ -3863,6 +6400,9 @@ class SessionManager:
         # 除後由既有 reprobe / reboot recovery 接手升 READY。
         # 迴圈外快速早退（省掉整段設置）；真正的授權判定在迴圈**內**逐 byte 重驗。
         if not session.boot_quiet_active():
+            invalidate_deferred = getattr(bridge, "invalidate_deferred", None)
+            if callable(invalidate_deferred):
+                invalidate_deferred("recover")
             for action_name, payload in (("CTRL_C", b"\x03"), ("CTRL_D", b"\x04")):
                 # #162 回歸修（實機事故 2026-07-31）：gate 必須逐 byte 重驗。第二個 byte
                 # （CTRL-D）在第一個之後最多 min(timeout_s, 2.0) 秒才寫出，而 U-Boot
@@ -3872,14 +6412,37 @@ class SessionManager:
                 # WAL 物證：seq=87 `\x03`(23:39:11.414) → seq=94 banner arm(23:39:11.948)
                 # → seq=103 `\x04`(23:39:13.424，armed 後 1.48s) → seq=104 `=> `。
                 with self._lock:
+                    if not self._foreground_operation_current_locked(session, bridge, operation):
+                        return {"ok": False, "error_code": "FLUSHED_BY_RECOVERY"}
                     if session.boot_quiet_active():
                         break
+                    permit = TxPermit(
+                        "system:recover",
+                        session.bridge_generation,
+                        "system_probe",
+                    )
                 offset = bridge.rx_snapshot_len()
                 self._mark_session_tx(session)
-                bridge.send_bytes(payload, source="system:recover", cmd_id=None)
+                try:
+                    self._send_bytes_with_permit(
+                        bridge,
+                        payload,
+                        source="system:recover",
+                        cmd_id=None,
+                        permit=permit,
+                    )
+                except TxIncompleteError as exc:
+                    reason = (exc.result.error or "").removeprefix("revoked:")
+                    if reason == "quiet":
+                        break
+                    if reason in {"draining", "cancelled", "stale_generation"}:
+                        return {"ok": False, "error_code": "FLUSHED_BY_RECOVERY"}
+                    raise
                 if bridge.wait_for_regex_from(prompt_regex, offset, min(timeout_s, 2.0)):
                     stdout = self._extract_command_stdout(bridge.rx_text_from(pre_offset), command, prompt_regex)
                     with self._lock:
+                        if not self._foreground_operation_current_locked(session, bridge, operation):
+                            return {"ok": False, "error_code": "FLUSHED_BY_RECOVERY"}
                         self._set_terminal_capture_locked(
                             session,
                             cmd_id=cmd_id,
@@ -3904,6 +6467,8 @@ class SessionManager:
 
         partial_stdout = clean_text(bridge.rx_text_from(pre_offset))
         with self._lock:
+            if not self._foreground_operation_current_locked(session, bridge, operation):
+                return {"ok": False, "error_code": "FLUSHED_BY_RECOVERY"}
             self._set_terminal_capture_locked(
                 session,
                 cmd_id=cmd_id,
@@ -3914,6 +6479,9 @@ class SessionManager:
 
         # Auto-fallback: try force clear + reattach when both CTRL_C/D fail
         if source == "system:recover":
+            with self._lock:
+                if not self._foreground_operation_current_locked(session, bridge, operation):
+                    return {"ok": False, "error_code": "FLUSHED_BY_RECOVERY"}
             force_result = self._force_recover(session)
             if force_result.get("recovered"):
                 return {
@@ -3948,6 +6516,8 @@ class SessionManager:
             session = self.get_session(selector)
             if session is None or session.bridge is None or session.state not in {"READY", "ATTACHED"}:
                 return {"ok": False, "error_code": "SESSION_NOT_READY", "selector": selector}
+            if session.session_id in self._interactive_post_close:
+                return {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY", "selector": session.profile.com}
             payload = session.bridge.attach_console(label=label)
             if payload.get("client_id") is None:
                 # 無 PTY 平台（Windows TCP console，#84 PORT-2）：human 直接連 TCP 端點，console
@@ -4015,17 +6585,39 @@ class SessionManager:
         command: str = "",
         allow_attached: bool = False,
     ) -> dict[str, Any]:
+        command_permit: TxPermit | None = None
         while True:
             retry_after_post = False
+            command_permit = None
             post = _PostCloseAction()
             with self._lock:
                 session = self.get_session(selector)
-                if session is None or session.bridge is None:
+                if session is None:
+                    return {"ok": False, "error_code": "SESSION_NOT_READY", "selector": selector}
+                if session.state == "RECOVERING":
+                    return {
+                        "ok": False,
+                        "error_code": "SESSION_RECOVERING",
+                        "selector": session.profile.com,
+                    }
+                if session.state == "FLASHING":
+                    return {
+                        "ok": False,
+                        "error_code": "FLASHING_BUSY",
+                        "selector": session.profile.com,
+                    }
+                if session.bridge is None:
                     return {"ok": False, "error_code": "SESSION_NOT_READY", "selector": selector}
 
                 if session.state == "READY":
                     if session.foreground_busy or session._foreground_operation is not None:
                         return {"ok": False, "error_code": "SESSION_BUSY", "selector": session.profile.com}
+                    if session.session_id in self._interactive_post_close:
+                        return {
+                            "ok": False,
+                            "error_code": "SESSION_INTERACTIVE_BUSY",
+                            "interactive_session_id": session.interactive_session_id,
+                        }
                     # READY 一律走既有路徑；allow_attached 在 READY 下不改變語意。
                     existing, post = self._refresh_interactive_locked(session)
                     if post.needs_resume:
@@ -4116,6 +6708,12 @@ class SessionManager:
                                 "error_detail": "NOT_BOOTLOADER",
                             }
 
+                    if session.session_id in self._interactive_post_close:
+                        return {
+                            "ok": False,
+                            "error_code": "SESSION_INTERACTIVE_BUSY",
+                            "interactive_session_id": session.interactive_session_id,
+                        }
                     # 清除 expired lease（避免 BUSY 誤判）；若 close 需要 resume，
                     # 先在 lock 外完成 post-close，再重新評估是否要 stash human。
                     existing, post = self._refresh_interactive_locked(session)
@@ -4178,14 +6776,40 @@ class SessionManager:
                 else:
                     return {"ok": False, "error_code": "SESSION_NOT_READY", "selector": selector}
 
+                if (
+                    not retry_after_post
+                    and command
+                    and result.get("ok")
+                    and session.bridge is not None
+                ):
+                    command_permit = TxPermit(
+                        f"interactive:{lease.interactive_id}",
+                        session.bridge_generation,
+                        "interactive",
+                        owner_gen=getattr(session.bridge, "owner_gen", 0),
+                    )
+
             post.execute()
             if retry_after_post:
                 continue
             break
 
         if command:
+            assert command_permit is not None
+            try:
+                self._send_command_with_permit(
+                    bridge,
+                    command,
+                    source=owner,
+                    cmd_id=None,
+                    permit=command_permit,
+                )
+            except TxIncompleteError as exc:
+                reason = (exc.result.error or "").removeprefix("revoked:")
+                if reason == "lease":
+                    return {"ok": False, "error_code": "INTERACTIVE_EXPIRED"}
+                raise
             self._mark_session_tx(session)
-            bridge.send_command(command, source=owner, cmd_id=None)
         return result
 
     def _encode_interactive_payload(self, data: str, encoding: str) -> bytes:
@@ -4211,16 +6835,29 @@ class SessionManager:
 
     def interactive_send(self, interactive_id: str, *, data: str, encoding: str = "plain") -> dict[str, Any]:
         post = _PostCloseAction()
-        result: dict[str, Any]
+        result: dict[str, Any] | None = None
+        send_capture: tuple[SessionRuntime, UARTBridge, InteractiveLease, bytes, TxPermit] | None = None
         with self._lock:
             lease = self._interactive.get(interactive_id)
-            if lease is None or lease.status != "active":
+            if lease is None:
+                return {"ok": False, "error_code": "INTERACTIVE_NOT_FOUND", "interactive_id": interactive_id}
+            if lease.status == "expired":
+                return {"ok": False, "error_code": "INTERACTIVE_EXPIRED", "interactive_id": interactive_id}
+            if lease.status != "active":
                 return {"ok": False, "error_code": "INTERACTIVE_NOT_FOUND", "interactive_id": interactive_id}
             if lease.expired():
-                lease.status = "expired"
                 session = self._sessions.get(lease.session_id)
                 if session is not None:
-                    _, post = self._close_interactive_locked(session, interactive_id=interactive_id)
+                    _, post = self._close_interactive_locked(
+                        session,
+                        interactive_id=interactive_id,
+                        terminal_status="expired",
+                        keep_tombstone=True,
+                    )
+                else:
+                    self._record_interactive_terminal_locked(
+                        lease, terminal_status="expired", keep_tombstone=True,
+                    )
                 result = {"ok": False, "error_code": "INTERACTIVE_EXPIRED", "interactive_id": interactive_id}
             else:
                 session = self._sessions.get(lease.session_id)
@@ -4233,12 +6870,42 @@ class SessionManager:
                     result = {"ok": False, "error_code": "SESSION_BUSY", "interactive_id": interactive_id}
                 else:
                     payload = self._encode_interactive_payload(data, encoding)
-                    self._mark_session_tx(session)
-                    session.bridge.send_bytes(payload, source=lease.owner, cmd_id=None)
-                    lease.touch()
-                    result = {"ok": True, "interactive_id": interactive_id, "bytes": len(payload)}
+                    bridge = session.bridge
+                    permit = TxPermit(
+                        f"interactive:{interactive_id}",
+                        session.bridge_generation,
+                        "interactive",
+                        owner_gen=getattr(bridge, "owner_gen", 0),
+                    )
+                    send_capture = (session, bridge, lease, payload, permit)
         post.execute()
-        return result
+        if send_capture is None:
+            assert result is not None
+            return result
+        session, bridge, lease, payload, permit = send_capture
+        try:
+            self._send_bytes_with_permit(
+                bridge,
+                payload,
+                source=lease.owner,
+                cmd_id=None,
+                permit=permit,
+            )
+        except TxIncompleteError as exc:
+            reason = (exc.result.error or "").removeprefix("revoked:")
+            if reason == "lease":
+                return {"ok": False, "error_code": "INTERACTIVE_EXPIRED", "interactive_id": interactive_id}
+            if reason == "quiet":
+                return {"ok": False, "error_code": ERROR_AUTOBOOT_QUIET, "interactive_id": interactive_id}
+            if reason in {"draining", "cancelled", "stale_generation", "flashing"}:
+                return {"ok": False, "error_code": "SESSION_BUSY", "interactive_id": interactive_id}
+            raise
+        self._mark_session_tx(session)
+        with self._lock:
+            current_lease = self._interactive.get(interactive_id)
+            if current_lease is not None and current_lease.status == "active":
+                current_lease.touch()
+        return {"ok": True, "interactive_id": interactive_id, "bytes": len(payload)}
 
     def interactive_status(self, interactive_id: str, *, screen_chars: int = 2048) -> dict[str, Any]:
         post = _PostCloseAction()
@@ -4247,15 +6914,23 @@ class SessionManager:
             lease = self._interactive.get(interactive_id)
             if lease is None:
                 return {"ok": False, "error_code": "INTERACTIVE_NOT_FOUND", "interactive_id": interactive_id}
+            if lease.status == "expired":
+                return {"ok": False, "error_code": "INTERACTIVE_EXPIRED", "interactive_id": interactive_id}
+            if lease.status != "active":
+                return {"ok": False, "error_code": "INTERACTIVE_NOT_FOUND", "interactive_id": interactive_id}
             session = self._sessions.get(lease.session_id)
             if session is None or session.bridge is None:
-                return {"ok": False, "error_code": "SESSION_NOT_READY", "interactive_id": interactive_id}
-            # 先檢查 expired 再 touch
-            if lease.expired():
-                lease.status = "expired"
-                _, post = self._close_interactive_locked(session, interactive_id=interactive_id)
+                result = {"ok": False, "error_code": "SESSION_NOT_READY", "interactive_id": interactive_id}
+            elif lease.expired():
+                _, post = self._close_interactive_locked(
+                    session,
+                    interactive_id=interactive_id,
+                    terminal_status="expired",
+                    keep_tombstone=True,
+                )
                 result = {"ok": False, "error_code": "INTERACTIVE_EXPIRED", "interactive_id": interactive_id}
             else:
+                # 先確認 session/bridge，再判斷期限；成功路徑仍以 touch 延長租約。
                 lease.touch()
                 result = {
                     "ok": True,
@@ -4275,6 +6950,8 @@ class SessionManager:
             lease = self._interactive.get(interactive_id)
             if lease is None:
                 return {"ok": False, "error_code": "INTERACTIVE_NOT_FOUND", "interactive_id": interactive_id}
+            if lease.status == "expired":
+                return {"ok": False, "error_code": "INTERACTIVE_EXPIRED", "interactive_id": interactive_id}
             session = self._sessions.get(lease.session_id)
             if session is not None:
                 _, post = self._close_interactive_locked(session, interactive_id=interactive_id)
@@ -4306,6 +6983,7 @@ class SessionManager:
         suspend_human_interactive = False
         post = _PostCloseAction()
         result: dict[str, Any] | None = None
+        probe_permit: TxPermit | None = None
         # I2：RELEASED 分支須在 lock 內擷取、出 lock 後再掃 /proc（_probe_external_holder
         # 會掃整個 /proc，持 lock 期間會阻塞所有 RPC）。
         released_capture: dict[str, Any] | None = None
@@ -4497,6 +7175,7 @@ class SessionManager:
                     else:
                         nonce = uuid.uuid4().hex[:8]
                         probe = session.profile.ready_probe.replace("${nonce}", nonce)
+                        probe_permit = self._self_test_permit_locked(session, nonce)
                         session.last_probe_at = now_iso()
                         prompt_regex = session.profile.prompt_regex
                         bridge_generation = session.bridge_generation
@@ -4530,7 +7209,28 @@ class SessionManager:
         try:
             offset = bridge.rx_snapshot_len()
             self._mark_session_tx(session)
-            bridge.send_command(probe, source="system:self_test", cmd_id=None)
+            assert probe_permit is not None
+            try:
+                with self._system_permit_context(bridge, probe_permit):
+                    bridge.send_command(probe, source="system:self_test", cmd_id=None)
+            except TxIncompleteError as exc:
+                if not _self_test_tx_refused(exc):
+                    raise
+                # 與 pre-check 的 AUTOBOOT_QUIET 回應保持相同形狀；提交點拒絕後不
+                # 等 nonce，也不 confirm_ready，讓呼叫端沿用既有 wait 行動。
+                with self._lock:
+                    current_lease = (
+                        self._interactive.get(session.interactive_session_id)
+                        if session.interactive_session_id is not None
+                        else None
+                    )
+                    return {
+                        "ok": True,
+                        "classification": ERROR_AUTOBOOT_QUIET,
+                        "session": session.to_public_dict(),
+                        "recommended_action": "wait",
+                        **self._lease_context(current_lease, bridge=bridge),
+                    }
             if not bridge.wait_for_regex_from(nonce, offset, timeout_s):
                 # RX 洪水分類（#153）：nonce 被洪水淹沒 ≠ target 死了——RX 速率超閾時
                 # 回 RX_FLOOD＋wait（而非 TARGET_UNRESPONSIVE＋recover），避免上層對
@@ -4585,6 +7285,14 @@ class SessionManager:
             session = self.get_session(selector)
             if session is None:
                 return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            if session._pending_drain is not None:
+                return {
+                    "ok": False,
+                    "error_code": "SESSION_RECOVERING",
+                    "drain_stalled": session.drain_stalled,
+                    "drain_timeout_epoch": session.drain_timeout_epoch,
+                    "session": session.to_public_dict(),
+                }
             # C2：RELEASED 早退——比照 clear_session，不改 state、不 spawn、不動集合。
             if session.state == "RELEASED" or session.profile.device_by_id in self._released_by_ids:
                 return {
@@ -4623,6 +7331,9 @@ class SessionManager:
                 return {"ok": False, "error_code": "SESSION_NOT_READY", "session": session.to_public_dict()}
             else:
                 bridge = session.bridge
+                invalidate_deferred = getattr(bridge, "invalidate_deferred", None)
+                if callable(invalidate_deferred):
+                    invalidate_deferred("recover")
         if reprobe:
             # 與 auto 自動重探共用 per-session probe 互斥（Finding 2）。
             with self._lock:
@@ -4851,6 +7562,7 @@ class SessionManager:
         ack_mode: str = "auto",
         echo_timeout_s: float | None = None,
         source: str = "agent",
+        trusted_human: bool | None = None,
     ) -> dict[str, Any]:
         """將 host 端檔案推送到 target。
 
@@ -4869,10 +7581,12 @@ class SessionManager:
         """
         from .file_transfer import push_file
 
+        human = source.startswith("human:") if trusted_human is None else trusted_human
         suspend_human_interactive = False
         post = _PostCloseAction()
         busy_result: dict[str, Any] | None = None
         operation: _ForegroundOperation | None = None
+        transfer_permit: TxPermit | None = None
         with self._lock:
             session = self.get_session(selector)
             if session is None or session.bridge is None or session.state != "READY":
@@ -4880,8 +7594,8 @@ class SessionManager:
             # #139：同 execute_command 的第二層 gate——file 傳輸直寫 bridge、不經
             # execute_command，須各自補 gate（僅開始前擋；傳輸中 banner 到達不中途
             # abort，由傳輸自然 timeout，屬既有行為）。
-            # #162：改判 _agent_gate_reject_locked()（AUTOBOOT_QUIET／READY_UNCONFIRMED）。
-            if not source.startswith("human:"):
+            # 直接 manager 呼叫沿用既有 source 語意；RPC 路徑明確傳入可信來源旗標。
+            if not human:
                 gate = self._agent_gate_reject_locked(session)
                 if gate is not None:
                     return gate
@@ -4889,7 +7603,7 @@ class SessionManager:
                 return {"ok": False, "error_code": "SESSION_RECOVERING"}
             lease, post = self._refresh_interactive_locked(session)
             if lease is not None:
-                if not source.startswith("human:") and lease.owner.startswith("human:"):
+                if not human and lease.owner.startswith("human:"):
                     suspend_human_interactive = True
                 else:
                     busy_result = {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY"}
@@ -4898,7 +7612,15 @@ class SessionManager:
             profile_timeout_s = session.profile.timeout_s
             max_console_line_chars = session.profile.max_console_line_chars
             if busy_result is None:
-                operation, busy_result = self._begin_foreground_operation_locked(session)
+                operation, busy_result = self._begin_foreground_operation_locked(
+                    session,
+                    kind="file",
+                )
+                transfer_permit = TxPermit(
+                    f"file:{uuid.uuid4().hex}",
+                    session.bridge_generation,
+                    "human_line" if human else "agent",
+                )
 
         human_suspended = False
         try:
@@ -4916,18 +7638,20 @@ class SessionManager:
             if suspend_human_interactive:
                 bridge.suspend_interactive()
                 human_suspended = True
-            return push_file(
-                bridge,
-                local_path,
-                remote_path,
-                chunk_size=chunk_size,
-                timeout_s=effective_timeout_s,
-                prompt_regex=prompt_regex,
-                source=source,
-                ack_mode=ack_mode,
-                echo_timeout_s=effective_echo_timeout_s,
-                max_console_line_chars=max_console_line_chars,
-            )
+            assert transfer_permit is not None
+            with self._operation_permit_context(bridge, transfer_permit):
+                return push_file(
+                    bridge,
+                    local_path,
+                    remote_path,
+                    chunk_size=chunk_size,
+                    timeout_s=effective_timeout_s,
+                    prompt_regex=prompt_regex,
+                    source=source,
+                    ack_mode=ack_mode,
+                    echo_timeout_s=effective_echo_timeout_s,
+                    max_console_line_chars=max_console_line_chars,
+                )
         finally:
             try:
                 if human_suspended:
@@ -4943,6 +7667,7 @@ class SessionManager:
         local_path: str | None = None,
         chunk_timeout_s: float | None = None,
         source: str = "agent",
+        trusted_human: bool | None = None,
     ) -> dict[str, Any]:
         """從 target 拉取檔案到 host。
 
@@ -4952,17 +7677,19 @@ class SessionManager:
         """
         from .file_transfer import pull_file
 
+        human = source.startswith("human:") if trusted_human is None else trusted_human
         suspend_human_interactive = False
         post = _PostCloseAction()
         busy_result: dict[str, Any] | None = None
         operation: _ForegroundOperation | None = None
+        transfer_permit: TxPermit | None = None
         with self._lock:
             session = self.get_session(selector)
             if session is None or session.bridge is None or session.state != "READY":
                 return {"ok": False, "error_code": "SESSION_NOT_READY"}
             # #139：同 file_push 的 gate（pull 同樣直寫 bridge、不經 execute_command）。
-            # #162：改判 _agent_gate_reject_locked()（AUTOBOOT_QUIET／READY_UNCONFIRMED）。
-            if not source.startswith("human:"):
+            # 直接 manager 呼叫沿用既有 source 語意；RPC 路徑明確傳入可信來源旗標。
+            if not human:
                 gate = self._agent_gate_reject_locked(session)
                 if gate is not None:
                     return gate
@@ -4970,7 +7697,7 @@ class SessionManager:
                 return {"ok": False, "error_code": "SESSION_RECOVERING"}
             lease, post = self._refresh_interactive_locked(session)
             if lease is not None:
-                if not source.startswith("human:") and lease.owner.startswith("human:"):
+                if not human and lease.owner.startswith("human:"):
                     suspend_human_interactive = True
                 else:
                     busy_result = {"ok": False, "error_code": "SESSION_INTERACTIVE_BUSY"}
@@ -4979,7 +7706,15 @@ class SessionManager:
             profile_timeout_s = session.profile.timeout_s
             max_console_line_chars = session.profile.max_console_line_chars
             if busy_result is None:
-                operation, busy_result = self._begin_foreground_operation_locked(session)
+                operation, busy_result = self._begin_foreground_operation_locked(
+                    session,
+                    kind="file",
+                )
+                transfer_permit = TxPermit(
+                    f"file:{uuid.uuid4().hex}",
+                    session.bridge_generation,
+                    "human_line" if human else "agent",
+                )
 
         human_suspended = False
         try:
@@ -4993,15 +7728,17 @@ class SessionManager:
             if suspend_human_interactive:
                 bridge.suspend_interactive()
                 human_suspended = True
-            return pull_file(
-                bridge,
-                remote_path,
-                local_path,
-                timeout_s=effective_timeout_s,
-                prompt_regex=prompt_regex,
-                source=source,
-                max_console_line_chars=max_console_line_chars,
-            )
+            assert transfer_permit is not None
+            with self._operation_permit_context(bridge, transfer_permit):
+                return pull_file(
+                    bridge,
+                    remote_path,
+                    local_path,
+                    timeout_s=effective_timeout_s,
+                    prompt_regex=prompt_regex,
+                    source=source,
+                    max_console_line_chars=max_console_line_chars,
+                )
         finally:
             try:
                 if human_suspended:

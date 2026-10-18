@@ -18,13 +18,22 @@ Windows（無 ``termios``/``fcntl``）連 import 都會 ``ModuleNotFoundError``�
 from __future__ import annotations
 
 import errno
+import logging
 import os
 import re
 import sys
+import stat
+import threading
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from contextlib import AbstractContextManager
+from typing import Callable, Literal
 
 from .config import UartProfile
+
+# pyserial 後端每次持有 TX fence 的提交區段上限（plan T20）。
+PYSERIAL_SUBMIT_CHUNK = 64
 
 # termios/fcntl 僅 POSIX 有；在 Windows 上絕不於 import 期求值，否則整個 daemon 載入即失敗。
 # _BAUD_MAP 也用 termios.Bxxxx 常數，故一併放進 POSIX 守衛內。
@@ -45,6 +54,216 @@ if os.name == "posix":  # pragma: no cover - 平台相依
     }
 
 _COM_RE = re.compile(r"^COM\d+$", re.IGNORECASE)
+_EAGAIN_BACKOFF_S = 0.01
+_UNKNOWN_HOLDER_LOCK = threading.Lock()
+_UNKNOWN_HOLDER_DEVICES: set[str] = set()
+
+
+def unknown_holder_devices() -> tuple[str, ...]:
+    """回傳目前仍開啟、且外部 holder 掃描結果不完整的裝置。"""
+    with _UNKNOWN_HOLDER_LOCK:
+        return tuple(sorted(_UNKNOWN_HOLDER_DEVICES))
+
+
+def _set_holder_unknown(device_path: str, unknown: bool) -> None:
+    path = os.path.realpath(device_path)
+    with _UNKNOWN_HOLDER_LOCK:
+        if unknown:
+            _UNKNOWN_HOLDER_DEVICES.add(path)
+        else:
+            _UNKNOWN_HOLDER_DEVICES.discard(path)
+
+
+@dataclass(frozen=True)
+class HolderReport:
+    """唯讀 holder 掃描結果；掃描不完整時不可把空 PID 當成安全證明。"""
+
+    pids: tuple[int, ...]
+    holder_unknown: bool
+    status: Literal["ok", "permission", "unknown", "unsupported"]
+
+
+class DeviceHeldError(OSError):
+    """裝置已被其他開啟者占用，並附上可取得的 holder 診斷。"""
+
+    def __init__(
+        self,
+        device_path: str,
+        *,
+        holder: HolderReport,
+        os_error: str | None = None,
+    ) -> None:
+        self.device_path = device_path
+        self.holder = holder
+        self.os_error = os_error
+        super().__init__(errno.EBUSY, os_error or "device is still held", device_path)
+
+
+class DeviceNotPresentError(FileNotFoundError):
+    """開啟裝置時確認裝置路徑已不存在。"""
+
+
+def probe_holders(
+    real_path: str,
+    *,
+    proc_root: str = "/proc",
+    exclude_pid: int | None = None,
+) -> HolderReport:
+    """掃描 POSIX procfs 中指向同一 tty 的行程；不開啟裝置或送出 UART bytes。"""
+    if os.name == "nt":
+        return HolderReport((), True, "unsupported")
+
+    try:
+        target = os.path.realpath(real_path)
+    except OSError:
+        target = real_path
+    try:
+        target_stat = os.stat(real_path)
+        target_rdev = getattr(target_stat, "st_rdev", 0)
+    except OSError:
+        target_rdev = 0
+
+    holders: set[int] = set()
+    status: Literal["ok", "permission", "unknown"] = "ok"
+    try:
+        entries = os.listdir(proc_root)
+    except PermissionError:
+        return HolderReport((), True, "permission")
+    except OSError:
+        return HolderReport((), True, "permission")
+
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if exclude_pid is not None and pid == exclude_pid:
+            continue
+        fd_dir = os.path.join(proc_root, entry, "fd")
+        try:
+            fds = os.listdir(fd_dir)
+        except PermissionError:
+            status = "permission"
+            continue
+        except OSError:
+            if status == "ok":
+                status = "unknown"
+            continue
+        for fd in fds:
+            fd_path = os.path.join(fd_dir, fd)
+            try:
+                link = os.readlink(fd_path)
+            except FileNotFoundError:
+                # 行程或 fd 在掃描期間消失屬正常競態。
+                continue
+            except PermissionError:
+                status = "permission"
+                continue
+            except OSError:
+                if status == "ok":
+                    status = "unknown"
+                continue
+            matched = link == target or link == real_path
+            if not matched and target_rdev:
+                try:
+                    fd_stat = os.stat(fd_path)
+                    matched = (
+                        stat.S_ISCHR(fd_stat.st_mode)
+                        and getattr(fd_stat, "st_rdev", 0) == target_rdev
+                    )
+                except FileNotFoundError:
+                    pass
+                except PermissionError:
+                    status = "permission"
+                except OSError:
+                    if status == "ok":
+                        status = "unknown"
+            if matched:
+                holders.add(pid)
+                break
+
+    pids = tuple(sorted(holders))
+    return HolderReport(pids, not pids and status != "ok", status)
+
+
+def classify_pyserial_open_error(message: str) -> tuple[Literal["held", "not_found", "other"], int | None]:
+    """從 pyserial 的 Windows Exception repr 取出末尾 winerror 並分類。"""
+    match = re.search(r",\s*(\d+)\s*\)\s*$", message)
+    winerror = int(match.group(1)) if match is not None else None
+    if winerror in (5, 32):  # ERROR_ACCESS_DENIED / ERROR_SHARING_VIOLATION
+        return "held", winerror
+    if winerror in (2, 3):  # ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND
+        return "not_found", winerror
+    return "other", winerror
+
+
+def _posix_write_all(
+    fd: int,
+    payload: bytes,
+    cancel: threading.Event | None = None,
+    *,
+    submit_guard: Callable[[], AbstractContextManager[str | None]] | None = None,
+) -> TxResult:
+    """逐次授權 OS 寫入，並回報 OS 確認的前綴長度。"""
+    view = memoryview(payload)
+    sent = 0
+    requested = len(payload)
+    while sent < requested:
+        if cancel is not None and cancel.is_set():
+            return TxResult(
+                "completed", sent, requested,
+                "cancelled",
+            )
+        try:
+            if submit_guard is None:
+                n = os.write(fd, view[sent:])
+            else:
+                with submit_guard() as reject:
+                    if reject is not None:
+                        return TxResult(
+                            "not_submitted" if sent == 0 else "completed",
+                            sent,
+                            requested,
+                            reject if sent == 0 else f"revoked:{reject}",
+                        )
+                    n = os.write(fd, view[sent:])
+        except BlockingIOError:
+            if cancel is None:
+                time.sleep(_EAGAIN_BACKOFF_S)
+            elif cancel.wait(_EAGAIN_BACKOFF_S):
+                return TxResult("completed", sent, requested, "cancelled")
+            continue
+        except OSError as exc:
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                if cancel is None:
+                    time.sleep(_EAGAIN_BACKOFF_S)
+                elif cancel.wait(_EAGAIN_BACKOFF_S):
+                    return TxResult("completed", sent, requested, "cancelled")
+                continue
+            return TxResult(
+                "completed",
+                sent,
+                requested,
+                f"{type(exc).__name__}: {exc}",
+            )
+        if n <= 0:
+            return TxResult("completed", sent, requested, "short_write")
+        sent += n
+    return TxResult("completed", sent, requested)
+
+
+@dataclass(frozen=True)
+class TxResult:
+    """記錄一次 UART 寫入的可確認結果。"""
+
+    outcome: Literal["not_submitted", "completed", "unknown"]
+    confirmed: int
+    requested: int
+    error: str | None = None
+
+    @property
+    def complete(self) -> bool:
+        """只有完整完成且確認長度吻合時才為真。"""
+        return self.outcome == "completed" and self.confirmed == self.requested
 
 
 def _win_device_name(device_path: str) -> str:
@@ -83,8 +302,14 @@ class SerialPort(ABC):
         """
 
     @abstractmethod
-    def write(self, payload: bytes) -> None:
-        """寫出整段 ``payload``。"""
+    def write(
+        self,
+        payload: bytes,
+        *,
+        cancel: threading.Event | None = None,
+        submit_guard: Callable[[], AbstractContextManager[str | None]] | None = None,
+    ) -> TxResult | None:
+        """寫出 payload 並回傳可確認的結果。"""
 
     @abstractmethod
     def close(self) -> None:
@@ -110,13 +335,93 @@ class _PosixSerialPort(SerialPort):
         self._device_path = device_path
         self._profile = profile
         self._fd: int | None = None
+        self._flock_acquired = False
+        self._exclusive_set = False
 
     def _set_nonblock(self, fd: int) -> None:
         flags = fcntl.fcntl(fd, fcntl.F_GETFL)
         fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
     def open(self) -> None:
-        self._fd = os.open(self._device_path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        flags = os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+        try:
+            fd = os.open(self._device_path, flags)
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                raise DeviceNotPresentError(errno.ENOENT, str(exc), self._device_path) from exc
+            if exc.errno == errno.EBUSY:
+                holder = self._conflict_holder_report()
+                raise DeviceHeldError(self._device_path, holder=holder, os_error=str(exc)) from exc
+            raise
+
+        locked = False
+        exclusive = False
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
+                    holder = self._conflict_holder_report()
+                    raise DeviceHeldError(self._device_path, holder=holder, os_error=str(exc)) from exc
+                raise
+            locked = True
+
+            fcntl.ioctl(fd, termios.TIOCEXCL)
+            exclusive = True
+
+            report = probe_holders(
+                self._device_path,
+                exclude_pid=os.getpid(),
+            )
+            if report.pids:
+                raise DeviceHeldError(self._device_path, holder=report)
+            if report.status != "ok":
+                logging.getLogger("serialwrap").warning(
+                    "serialwrap: 無法確認 %s 的外部 holder（status=%s），BC-04 僅保證 serialwrap 實例互斥",
+                    self._device_path,
+                    report.status,
+                )
+                _set_holder_unknown(self._device_path, True)
+            else:
+                _set_holder_unknown(self._device_path, False)
+
+            self._fd = fd
+            self._flock_acquired = locked
+            self._exclusive_set = exclusive
+        except BaseException:
+            if exclusive:
+                self._release_exclusive(fd)
+            if locked:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+
+    def _conflict_holder_report(self) -> HolderReport:
+        report = probe_holders(self._device_path, exclude_pid=os.getpid())
+        if report.pids or report.holder_unknown:
+            return report
+        # flock/TIOCEXCL 已確認開啟失敗；掃描沒有列出 PID 時（例如同一 PID 的另一個
+        # file description）仍須明確回報 holder 未知。
+        return HolderReport((), True, report.status)
+
+    def _release_exclusive(self, fd: int) -> bool:
+        """解除 tty 物件旗標；hangup 類錯誤代表核心已清除或裝置已消失。"""
+        try:
+            fcntl.ioctl(fd, termios.TIOCNXCL)
+            return True
+        except OSError as exc:
+            if exc.errno in (errno.EIO, errno.ENXIO, errno.ENODEV):
+                return True
+            logging.getLogger("serialwrap").warning(
+                "serialwrap: TIOCNXCL failed on %s: %s", self._device_path, exc
+            )
+            return False
 
     def configure(self, profile: UartProfile) -> None:
         self._profile = profile
@@ -160,31 +465,32 @@ class _PosixSerialPort(SerialPort):
             raise OSError("serial not open")
         return os.read(fd, max_bytes)
 
-    def write(self, payload: bytes) -> None:
+    def write(
+        self,
+        payload: bytes,
+        *,
+        cancel: threading.Event | None = None,
+        submit_guard: Callable[[], AbstractContextManager[str | None]] | None = None,
+    ) -> TxResult:
         fd = self._fd
         if fd is None:
             raise OSError("serial not open")
-        view = memoryview(payload)
-        sent = 0
-        while sent < len(payload):
-            try:
-                n = os.write(fd, view[sent:])
-            except BlockingIOError:
-                time.sleep(0.01)
-                continue
-            except OSError as exc:
-                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
-                    time.sleep(0.01)
-                    continue
-                raise
-            if n <= 0:
-                break
-            sent += n
+        return _posix_write_all(fd, payload, cancel, submit_guard=submit_guard)
 
     def close(self) -> None:
         fd = self._fd
         self._fd = None
         if fd is not None:
+            _set_holder_unknown(self._device_path, False)
+            if self._exclusive_set:
+                self._release_exclusive(fd)
+                self._exclusive_set = False
+            if self._flock_acquired:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                self._flock_acquired = False
             try:
                 os.close(fd)
             except OSError:
@@ -256,12 +562,14 @@ class _PySerialPort(SerialPort):
 
     def open(self) -> None:
         try:
-            import serial
+            serial_module = globals().get("serial")
+            if serial_module is None:
+                import serial as serial_module
         except ImportError as exc:  # pragma: no cover - 缺依賴時的清楚訊息
             raise OSError(
                 "pyserial 後端需要 pyserial（pip install pyserial）"
             ) from exc
-        ser = serial.Serial()
+        ser = serial_module.Serial()
         ser.port = _win_device_name(self._device_path)
         ser.timeout = self._READ_TIMEOUT_S
         ser.write_timeout = self._WRITE_TIMEOUT_S
@@ -269,8 +577,21 @@ class _PySerialPort(SerialPort):
         self._apply(self._profile)
         try:
             ser.open()
-        except serial.SerialException as exc:
+        except serial_module.SerialException as exc:
             self._ser = None
+            kind, _ = classify_pyserial_open_error(str(exc))
+            if kind == "held":
+                raise DeviceHeldError(
+                    self._device_path,
+                    holder=HolderReport((), True, "unsupported"),
+                    os_error=str(exc),
+                ) from exc
+            if kind == "not_found":
+                raise DeviceNotPresentError(
+                    errno.ENOENT,
+                    str(exc),
+                    self._device_path,
+                ) from exc
             # 統一成 OSError，讓呼叫端（既有 except OSError 路徑）契約與 POSIX 一致。
             raise OSError(getattr(exc, "errno", None) or errno.EIO, str(exc)) from exc
 
@@ -308,7 +629,13 @@ class _PySerialPort(SerialPort):
         except serial.SerialException as exc:  # 拔線：ClearCommError/ReadFile 失敗
             raise OSError(getattr(exc, "errno", None) or errno.EIO, str(exc)) from exc
 
-    def write(self, payload: bytes) -> None:
+    def write(
+        self,
+        payload: bytes,
+        *,
+        cancel: threading.Event | None = None,
+        submit_guard: Callable[[], AbstractContextManager[str | None]] | None = None,
+    ) -> TxResult:
         import serial
 
         ser = self._ser
@@ -318,15 +645,65 @@ class _PySerialPort(SerialPort):
         view = memoryview(payload)
         sent = 0
         while sent < len(payload):
+            if cancel is not None and cancel.is_set():
+                return TxResult(
+                    "completed", sent, len(payload),
+                    "cancelled",
+                )
+            end = min(sent + PYSERIAL_SUBMIT_CHUNK, len(payload))
             try:
-                n = ser.write(view[sent:])
+                if submit_guard is None:
+                    n = ser.write(view[sent:end])
+                else:
+                    with submit_guard() as reject:
+                        if reject is not None:
+                            return TxResult(
+                                "not_submitted" if sent == 0 else "completed",
+                                sent,
+                                len(payload),
+                                reject if sent == 0 else f"revoked:{reject}",
+                            )
+                        n = ser.write(view[sent:end])
             except serial.SerialTimeoutException as exc:
-                raise OSError(errno.ETIMEDOUT, str(exc)) from exc
+                from .uart_io import TxUnknownError
+
+                result = TxResult(
+                    "unknown",
+                    sent,
+                    len(payload),
+                    f"{type(exc).__name__}: {exc}",
+                )
+                raise TxUnknownError(result, errno.ETIMEDOUT) from exc
             except serial.SerialException as exc:
-                raise OSError(getattr(exc, "errno", None) or errno.EIO, str(exc)) from exc
+                from .uart_io import TxUnknownError
+
+                result = TxResult(
+                    "unknown",
+                    sent,
+                    len(payload),
+                    f"{type(exc).__name__}: {exc}",
+                )
+                raise TxUnknownError(
+                    result,
+                    getattr(exc, "errno", None) or errno.EIO,
+                ) from exc
+            except OSError as exc:
+                from .uart_io import TxUnknownError
+
+                result = TxResult(
+                    "unknown",
+                    sent,
+                    len(payload),
+                    f"{type(exc).__name__}: {exc}",
+                )
+                raise TxUnknownError(
+                    result,
+                    getattr(exc, "errno", None) or errno.EIO,
+                ) from exc
             if not n:
-                break
+                return TxResult("completed", sent, len(payload), "short_write")
             sent += n
+        return TxResult("completed", sent, len(payload))
 
     def close(self) -> None:
         ser = self._ser
@@ -335,6 +712,16 @@ class _PySerialPort(SerialPort):
             try:
                 ser.close()
             except Exception:  # noqa: BLE001 - close best-effort
+                pass
+
+    def cancel_pending_write(self) -> None:
+        """盡力取消目前 pyserial write，不等待完成。"""
+        ser = self._ser
+        cancel_write = getattr(ser, "cancel_write", None) if ser is not None else None
+        if callable(cancel_write):
+            try:
+                cancel_write()
+            except Exception:  # noqa: BLE001 — drain deadline 不依賴取消成功
                 pass
 
     def set_baud(self, baud: int) -> None:

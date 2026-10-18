@@ -9,8 +9,8 @@
 
 - ``TestGapMemory``：行程內即可驗證的跨平台 error_code（alias、file transfer、console、
   service、event、arbiter、systemd 替身）。
-- ``TestGapPosixRemoteCli``：依賴 POSIX（remote_tunnel／fcntl）之 CLI error_code（bench／
-  tunnel status／CLI remote internal error；``posix_only``、``memory_only``）。
+- ``TestGapRemoteCli``：Windows 開放 remote／connect／benches 後也會輸出的 CLI error_code
+  （bench／tunnel status／CLI remote internal error；``core_portable``、``memory_only``）。
 - ``TestGapFramingTcp``：RPC framing 位元組（``serve_connection``）、TCP 回應格式與
   daemon spawn 失敗；會開 loopback socket／asyncio server，故標 ``process_rpc``。
 - ``TestGapPosixLock``：POSIX singleton lock 的 ``SOCKET_UNAVAILABLE``（``posix_only``）。
@@ -445,13 +445,13 @@ class TestGapMemory:
 
 
 # ---------------------------------------------------------------------------
-# POSIX 專屬 CLI 錯誤碼（依賴 remote_tunnel／fcntl；Windows 基線回傳 REMOTE_NOT_SUPPORTED）
+# Windows 同樣支援的 remote／connect／benches CLI 錯誤碼
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.posix_only
+@pytest.mark.core_portable
 @pytest.mark.memory_only
-class TestGapPosixRemoteCli:
+class TestGapRemoteCli:
     def test_invalid_bench_config_connect(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
                                           capsys: pytest.CaptureFixture[str]) -> None:
         benches = tmp_path / "benches.yaml"
@@ -738,7 +738,8 @@ class TestGapLastError:
         mgr = _mgr(tmp_path, [_profile(platform="passthrough")])
         mgr._devices = {_BY_ID: DeviceInfo(by_id=_BY_ID, real_path="/dev/ttyUSB5")}
 
-        with mock.patch("sw_core.session_manager.UARTBridge") as mock_bridge:
+        with mock.patch("sw_core.session_manager.UARTBridge") as mock_bridge, \
+             mock.patch("sw_core.uart_io.open_serial_port", return_value=mock.MagicMock()):
             # bridge.start() 進行中移除裝置。
             mock_bridge.return_value.start.side_effect = lambda: mgr._devices.pop(_BY_ID, None)
             mgr._attach_by_id(_BY_ID)
@@ -860,7 +861,8 @@ class TestGapLastError:
         session = mgr.get_session("COM0")
         assert session is not None
         with mock.patch.dict(os.environ, {"SW_GAP_USER": "root", "SW_GAP_PASS": "secret"}):
-            with mock.patch("sw_core.session_manager.UARTBridge", return_value=_ScriptedBridge(waits=[False])):
+            with mock.patch("sw_core.uart_io.open_serial_port", return_value=mock.MagicMock()), \
+                 mock.patch("sw_core.session_manager.UARTBridge", return_value=_ScriptedBridge(waits=[False])):
                 mgr._attach_by_id(_BY_ID)
         assert session.last_error == "LOGIN_PROMPT_TIMEOUT"
         assert session.state == "DETACHED"
@@ -895,7 +897,8 @@ class TestGapLastError:
         session = mgr.get_session("COM0")
         assert session is not None
 
-        with mock.patch.object(UARTBridge, "start", side_effect=OSError("busy")):
+        with mock.patch("sw_core.uart_io.open_serial_port", return_value=mock.MagicMock()), \
+             mock.patch.object(UARTBridge, "start", side_effect=OSError("busy")):
             mgr._attach_by_id(_BY_ID)
 
         assert session.last_error == "ATTACH_FAILED:OSError"

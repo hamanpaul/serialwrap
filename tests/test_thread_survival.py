@@ -29,20 +29,20 @@ def test_wal_append_best_effort_on_write_error(tmp_path):
 def test_wal_rotation_failure_best_effort_does_not_kill_reader(tmp_path, monkeypatch):
     """WAL 輪替失敗（rotation path OSError）須被 append 含住，不逃出殺 RX reader（#79 Codex 必修）。
 
-    原 _rotate_if_needed 在 append 的 try 之外執行，rotation 的 replace/fsync OSError 會逃出 append
+    原 _rotate_if_needed 在 append 的 try 之外執行，rotation 的 rename/fsync OSError 會逃出 append
     → 殺死 reader。改為自身 best-effort 含住：不拋、標 rotation_failed、續用既有檔且資料仍寫入。
     """
     w = WalWriter(wal_dir=str(tmp_path), rotate_bytes=1)  # 極小上限 → 第二筆即觸發輪替
     w.append(com="COM0", direction="RX", source="device", payload=b"first")  # 養大檔案 > 1 byte
 
-    orig_replace = os.replace
+    orig_rename = w._fs.rename_noreplace_or_suffix
 
-    def _boom_replace(src, dst, *a, **k):
+    def _boom_rename(src, base_dst):
         if str(src).endswith(("raw.wal.ndjson", "raw.mirror.log")):
             raise OSError("EIO during rotate")  # 模擬輪替 path 的 I/O 失敗
-        return orig_replace(src, dst, *a, **k)
+        return orig_rename(src, base_dst)
 
-    monkeypatch.setattr(os, "replace", _boom_replace)
+    monkeypatch.setattr(w._fs, "rename_noreplace_or_suffix", _boom_rename)
 
     rec = w.append(com="COM0", direction="RX", source="device", payload=b"second")  # 不得拋例外
     assert rec.get("rotation_failed") is True   # 輪替失敗被含住並標記（可觀測）

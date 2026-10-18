@@ -60,7 +60,8 @@ def test_system_unit_has_umask_and_socket_group():
 
 @pytest.mark.posix_only
 @pytest.mark.process_rpc
-def test_rpc_socket_is_chmod_660(tmp_path):
+def test_rpc_socket_default_mode_is_0600(tmp_path, monkeypatch):
+    monkeypatch.delenv("SERIALWRAP_SOCKET_GROUP", raising=False)
     from sw_core.rpc import JsonRpcUnixServer
     sock = str(tmp_path / "t.sock")
     loop = asyncio.new_event_loop()
@@ -86,7 +87,7 @@ def test_rpc_socket_is_chmod_660(tmp_path):
     loop.call_soon_threadsafe(loop.stop)
     t.join(timeout=5)
     loop.close()
-    assert mode == 0o660, oct(mode)
+    assert mode == 0o600, oct(mode)
 
 
 # ── #3/#5：minicom wrapper 不再硬編 /tmp socket，改走 CLI 解析（throwaway 隔離） ──
@@ -138,7 +139,9 @@ def test_enable_linger_includes_user(tmp_path, monkeypatch):
     from sw_core.setup_cmd import reconcile
     fx = FakeEffects(systemd=True)
     reconcile(old_mode="on-demand", target_mode="systemd-user", fx=fx, home=tmp_path,
-              daemon_running=False, config_path=tmp_path / "config.yaml")
+              daemon_running=False, config_path=tmp_path / "config.yaml",
+              old_endpoint="unix:///old.sock", ping=lambda _endpoint: False,
+              alive=lambda _pid: False)
     assert ["loginctl", "enable-linger", "alice"] in fx.calls
     # 不可送出沒帶使用者的版本
     assert ["loginctl", "enable-linger"] not in fx.calls

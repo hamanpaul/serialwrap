@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from dataclasses import dataclass
+from io import StringIO
 import json
 import logging
 import os
 import re
-import shutil
+import shutil  # noqa: F401 — tests/test_win_daemon_start.py 以 sw_core.cli.shutil.which 進行 patch
 import socket
 import subprocess
 import sys
@@ -17,6 +18,8 @@ import time
 from collections.abc import Sequence
 from typing import Any
 
+from . import constants as _constants
+from . import filelock
 from .arbiter import CMD_REJECT_BYTES, CMD_WARN_BYTES
 from .client import _af_unix_available, _parse_endpoint, rpc_call
 from .file_transfer import DEFAULT_CHUNK_SIZE
@@ -28,12 +31,15 @@ from .constants import (
     LOOPBACK_TCP_HOSTS,
     PROFILE_DIR,
     SOCKET_PATH,
+    resolve_config_path,
 )
 from .cli_trace import configure_cli_trace_logger, emit_rpc_trace
 from .doctor_cmd import DOCTOR_ADVISORY_CHECKS, DOCTOR_ADVISORY_CHECKS_WIN, run_doctor
 from .platform_backends import select_rpc_backend
+from .release_manifest import daemon_launch_argv
 from .runtime_config import RuntimeConfig
 from .service_ctl import service_action
+from .util import normalize_endpoint_path
 from .sysenv import force_utf8_stdio
 from .setup_cmd import (
     SYSTEM_SOCKET,
@@ -42,6 +48,7 @@ from .setup_cmd import (
     ensure_wsl_systemd,
     materialize_assets,
     reconcile,
+    wait_old_daemon_gone,
 )
 # 版本解析（#154：邏輯搬到 sw_core/version.py，daemon 端也能共用；此處保留原名
 # 重新匯出，既有呼叫點（含 --version flag、其餘既有引用）原樣不動）。
@@ -50,9 +57,22 @@ from .version import _repo_version_path, resolve_version as _resolve_version
 _USE_DEFAULT_ENV = object()
 LEGACY_DAEMON_ENV_FILE = "~/OPI.env"
 PROFILE_DAEMON_ENV_FILE = "OPI.env"
+_CLI_CONFIG_DIR_AT_IMPORT = CONFIG_DIR
+
+
+def _config_dir_for_resolution() -> str:
+    """保留舊 CLI.CONFIG_DIR 注入點，預設跟隨 constants 的設定目錄。"""
+    return CONFIG_DIR if CONFIG_DIR != _CLI_CONFIG_DIR_AT_IMPORT else _constants.CONFIG_DIR
+
+
+def _config_path_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env["SERIALWRAP_CONFIG_DIR"] = _config_dir_for_resolution()
+    return env
 
 # --- #123：長操作 RPC 的 socket timeout floor -------------------------------
-# 問題：session recover／attach／self-test／console-attach（recover 升級分支）
+# 問題：session recover／attach／self-test／console-attach（recover 升級分支）、
+# device release／attach、session clear／bind
 # 的 daemon 端 handler 為同步長操作（對照 sw_core/daemon.py 的
 # BLOCKING_RPC_METHODS），host 過載或走 force recover 路徑時，daemon 端執行
 # 時間會結構性超過 CLI 舊預設 5s socket timeout，CLI 因而回「假性 TIMEOUT」
@@ -72,7 +92,7 @@ PROFILE_DAEMON_ENV_FILE = "OPI.env"
 # 因此改採固定寬鬆常數：CTRL_C 等 prompt 2s + CTRL_D 等 prompt 2s
 # （_recover_after_failure）+ force fallback 硬輪詢 10s（_force_recover 的
 # range(10)×sleep(1.0)）+ bcm 類慢板多階段 login/ready probe 與 attach
-# reprobe 裕度，取 45s 為 recover／attach／self-test／console-attach 統一
+# reprobe 裕度，取 45s 為長操作統一
 # floor；顯式 --timeout 一律照舊覆蓋。若操作仍逾時，應以 TIMEOUT 錯誤附帶的
 # daemon_reachable／daemon_busy（見 client.py 的 _probe_daemon_after_timeout）
 # 與 ``session list`` 確認 daemon 是否仍在執行，而非把這個 floor 當成精確上界。
@@ -93,6 +113,7 @@ _LONG_RPC_METHODS = frozenset({
     "session.attach",
     "session.self_test",
     "session.console_attach",  # recover 升級分支可同步跑數十秒，MAJOR-1 補上
+    "device.release", "device.attach", "session.clear", "session.bind",
 })
 
 # file.push／file.pull 已知缺口（#123 defer，MINOR-5）：兩者的 chunk 傳輸走
@@ -197,22 +218,12 @@ def _is_loopback_tcp(ep: str) -> bool:
 
 
 def _daemon_spawn_argv() -> list[str] | None:
-    """解析 spawn serialwrapd 的 argv（#131，Windows 路徑）。
+    """解析 spawn serialwrapd 的 argv（#131 原 Windows 路徑；T18 起委派 DF-05 定位）。
 
-    凍結（PyInstaller onefile）→ ``sys.executable`` 同層 serialwrapd.exe →
-    PATH 上的 serialwrapd，全落空回 None；原始碼 checkout → serialwrapd.py；
-    安裝套件（無 repo script）→ ``-m sw_core.daemon``。
+    spawn 本身已改呼叫 :func:`sw_core.release_manifest.daemon_launch_argv`；本函式保留
+    給既有測試（``tests/test_win_daemon_start.py``）以相同回傳契約（無法定位回 None）使用。
     """
-    if getattr(sys, "frozen", False):
-        sibling = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "serialwrapd.exe")
-        if os.path.isfile(sibling):
-            return [sibling]
-        found = shutil.which("serialwrapd")
-        return [found] if found else None
-    script = _daemon_script_path()
-    if os.path.isfile(script):
-        return [sys.executable, script]
-    return [sys.executable, "-m", "sw_core.daemon"]
+    return daemon_launch_argv(argv0=sys.argv[0]) or None
 
 
 def _decode_env_text(raw: bytes) -> str:
@@ -309,7 +320,11 @@ def _load_daemon_start_env(env_file: str | None | object = _USE_DEFAULT_ENV) -> 
 
 
 def _default_runtime_config() -> RuntimeConfig:
-    return RuntimeConfig(os.path.join(CONFIG_DIR, "config.yaml"))
+    env = _config_path_env()
+    return RuntimeConfig(
+        resolve_config_path(env=env),
+        write_path=resolve_config_path(for_write=True, env=env),
+    )
 
 
 def should_auto_spawn(rc: RuntimeConfig | None = None) -> bool:
@@ -416,8 +431,10 @@ def _find_conflicting_daemon(sock: str, proc_root: str = "/proc") -> dict[str, A
     from .multi_open import detect_multi_open  # noqa: PLC0415
 
     mo = detect_multi_open(proc_root=proc_root)
+    normalized_socket = normalize_endpoint_path(sock)
     for d in mo["daemons"]:
-        if d.get("socket") != sock:
+        existing_socket = d.get("socket")
+        if existing_socket is None or normalize_endpoint_path(existing_socket) != normalized_socket:
             return d
     return None
 
@@ -522,20 +539,18 @@ def _run_daemon_start(args: argparse.Namespace) -> int:
                 "target_socket": sock,
             })
             return 2
-    if is_win:
-        daemon_argv = _daemon_spawn_argv()
-        if daemon_argv is None:
-            resp = {
-                "ok": False,
-                "error_code": "DAEMON_BINARY_NOT_FOUND",
-                "message": "找不到 serialwrapd（serialwrap.exe 同層或 PATH 上皆無）；請確認發行包完整",
-            }
-            _print(resp)
-            _mirror_err(resp, context="daemon start")
-            return 2
-    else:
-        # POSIX：argv 組法逐字保留既有行為。
-        daemon_argv = [sys.executable, _daemon_script_path()]
+    # DF-05 定位順序（release manifest launcher → 同層 serialwrapd → checkout 腳本 →
+    # python -m sw_core.daemon）；POSIX 與 Windows 共用，取代原先 spawn 不存在的 serialwrapd.py（CLI-7.4）。
+    daemon_argv = daemon_launch_argv(argv0=sys.argv[0])
+    if not daemon_argv:
+        resp = {
+            "ok": False,
+            "error_code": "DAEMON_BINARY_NOT_FOUND",
+            "message": "找不到 serialwrapd（serialwrap.exe 同層或 PATH 上皆無）；請確認發行包完整",
+        }
+        _print(resp)
+        _mirror_err(resp, context="daemon start")
+        return 2
     cmd = [
         *daemon_argv,
         "--profile-dir",
@@ -655,6 +670,109 @@ def _run_daemon_stop(args: argparse.Namespace) -> int:
         return _print_endpoint_resolution_error(exc, context="daemon.stop")
     except Exception as exc:  # noqa: BLE001 — 任何非預期例外不得穿越 CLI 邊界
         return _print_internal_error(context="daemon.stop", exc=exc)
+
+
+def _capture_cli_result(command, args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
+    """執行本地 CLI 階段並擷取其 JSON 回應，供 daemon restart 組合單一輸出。"""
+    output = StringIO()
+    with redirect_stdout(output):
+        result = command(args)
+    raw = output.getvalue().strip()
+    try:
+        payload = json.loads(raw) if raw else {"ok": result == 0}
+    except json.JSONDecodeError:
+        payload = {"ok": result == 0}
+    return result, payload if isinstance(payload, dict) else {"ok": result == 0}
+
+
+def _run_daemon_restart(args: argparse.Namespace) -> int:
+    """依目前監管模式重啟 daemon，on-demand 必須先確認舊行程結束。"""
+    rc = _safe_runtime_config()
+    mode = (rc.mode() if rc is not None else None) or "on-demand"
+    with_sudo = getattr(args, "with_sudo", False)
+    if mode.startswith("systemd"):
+        response = service_action("restart", mode=mode, with_sudo=with_sudo)
+        _print(response)
+        _mirror_err(response, context="service restart")
+        return 0 if response.get("ok") else 2
+
+    explicit_endpoint = getattr(args, "endpoint", None)
+    if getattr(args, "bench", None) or (
+        explicit_endpoint and not (_rpc_backend_is_win() and _is_loopback_tcp(explicit_endpoint))
+    ):
+        response = {
+            "ok": False,
+            "error_code": "INVALID_ARGS",
+            "message": "daemon restart 只能重啟本機 daemon（不支援 --endpoint／--bench）",
+        }
+        _print(response)
+        _mirror_err(response, context="daemon.restart")
+        return 2
+
+    try:
+        resolved = _resolve_local_endpoint_info(args)
+    except _EndpointResolutionError as exc:
+        return _print_endpoint_resolution_error(exc, context="daemon.restart")
+
+    old_pid: int | None = None
+    try:
+        status = _rpc_call_traced(args, resolved, "health.status", {}, timeout_s=0.5)
+        candidate_pid = status.get("pid")
+        if isinstance(candidate_pid, int) and candidate_pid > 0:
+            old_pid = candidate_pid
+    except Exception:  # noqa: BLE001 — 舊版或已停止 daemon 可能沒有 status 回應
+        pass
+
+    stop_rc, _stop_response = _capture_cli_result(_run_daemon_stop, args)
+
+    def ping(endpoint: str) -> bool:
+        try:
+            return bool(
+                _rpc_call_traced(
+                    args,
+                    _ResolvedEndpoint(endpoint, resolved.source),
+                    "health.ping",
+                    {},
+                    timeout_s=0.2,
+                ).get("ok")
+            )
+        except Exception:  # noqa: BLE001 — RPC 探測錯誤視為 endpoint 不可達
+            return False
+
+    from .multi_open import daemon_process_alive  # noqa: PLC0415
+
+    if not wait_old_daemon_gone(
+        resolved.endpoint,
+        old_pid,
+        ping=ping,
+        alive=lambda pid: daemon_process_alive(pid, resolved.endpoint),
+    ):
+        response = {
+            "ok": False,
+            "error_code": "TIMEOUT",
+            "phase": "restart_wait_old_exit",
+        }
+        _print(response)
+        _mirror_err(response, context="daemon.restart")
+        return 1
+
+    start_args = argparse.Namespace(**vars(args))
+    start_args.profile_dir = PROFILE_DIR
+    start_args.lock = LOCK_PATH
+    start_args.foreground = False
+    start_args.force_spawn = False
+    if getattr(start_args, "socket", None) is None and not getattr(start_args, "endpoint", None):
+        start_args.socket = resolved.endpoint
+    start_rc, start_response = _capture_cli_result(_run_daemon_start, start_args)
+    response = {
+        "ok": bool(start_response.get("ok")),
+        "restarted": True,
+        "stopped": stop_rc == 0,
+        "start": start_response,
+    }
+    _print(response)
+    _mirror_err(response, context="daemon.restart")
+    return 0 if response["ok"] else 2
 
 
 def _rpc_backend_is_win() -> bool:
@@ -1126,23 +1244,10 @@ def _bench_state_path() -> str:
 def _lock_bench_state_doc(path: str):
     state_dir = os.path.dirname(path) or "."
     os.makedirs(state_dir, exist_ok=True)
-    if os.name == "nt":
-        with _BENCH_STATE_IO_LOCK:
-            yield
-        return
-    import fcntl  # noqa: PLC0415 -- connect 的 bench state 只在 POSIX 路徑要求 cross-process 鎖
-
     lock_path = f"{path}.lock"
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        with _BENCH_STATE_IO_LOCK:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
+    with _BENCH_STATE_IO_LOCK:
+        with filelock.exclusive_file_lock(lock_path):
+            yield
 
 
 def _load_bench_state_doc(path: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -1331,16 +1436,6 @@ def _rollback_connect_open(rt: Any, run_dir: str, listen_port: int) -> str | Non
 
 
 def _run_connect(args: argparse.Namespace) -> int:
-    if os.name == "nt":
-        resp = {
-            "ok": False,
-            "error_code": "REMOTE_NOT_SUPPORTED",
-            "message": "native Windows 本期不支援 serialwrap connect；請手動 ssh -L（見 SKILL_WINDOWS.md）",
-        }
-        _print(resp)
-        _mirror_err(resp, context="connect")
-        return 1
-
     from . import bench_registry  # noqa: PLC0415
     from . import remote_tunnel as rt  # noqa: PLC0415
 
@@ -1461,16 +1556,6 @@ def _run_connect(args: argparse.Namespace) -> int:
 
 def _run_benches(args: argparse.Namespace) -> int:
     del args
-    if os.name == "nt":
-        resp = {
-            "ok": False,
-            "error_code": "REMOTE_NOT_SUPPORTED",
-            "message": "native Windows 本期不支援 serialwrap benches；請直接檢視 benches.yaml 與 endpoint 記憶",
-        }
-        _print(resp)
-        _mirror_err(resp, context="benches")
-        return 1
-
     from . import bench_registry  # noqa: PLC0415
     from . import remote_tunnel as rt  # noqa: PLC0415
 
@@ -1530,28 +1615,7 @@ def _run_benches(args: argparse.Namespace) -> int:
 
 
 def _run_remote(args: argparse.Namespace) -> int:
-    """serialwrap remote 分派：words → status / close / open。
-
-    ``sw_core.remote_tunnel`` 於此延遲匯入（而非 cli.py 模組層級）：該模組硬依賴
-    ``fcntl``（POSIX-only），cli.py 頂層需在 Windows 也能正常 import，故不得在
-    模組層級引入。在匯入之前先於此函式最頂端攔截 native Windows（``os.name ==
-    "nt"``），統一回 ``REMOTE_NOT_SUPPORTED`` JSON——涵蓋 status／close／open 三條
-    路徑，避免 ``import remote_tunnel`` 觸發的 ``ModuleNotFoundError``（缺
-    ``fcntl``）穿越此函式與 ``main()`` 變成原始 traceback。open 分支內的
-    ``rt.guard_platform()`` 為 defense-in-depth，保留不動。全程例外皆經
-    ``except rt.TunnelError`` 與 catch-all ``except Exception`` 轉為 JSON，不讓
-    例外穿越 CLI 邊界。
-    """
-    if os.name == "nt":
-        resp = {
-            "ok": False,
-            "error_code": "REMOTE_NOT_SUPPORTED",
-            "message": "native Windows 本期不支援 serialwrap remote；請手動 ssh -R（見 SKILL_WINDOWS.md）",
-        }
-        _print(resp)
-        _mirror_err(resp, context="remote")
-        return 1
-
+    """serialwrap remote 分派：words → status／close／stop／open。"""
     from . import remote_tunnel as rt  # noqa: PLC0415
 
     try:
@@ -1560,7 +1624,7 @@ def _run_remote(args: argparse.Namespace) -> int:
         if not words or words[0] == "status":
             _print(rt.status(run_dir))
             return 0
-        if words[0] == "close":
+        if words[0] in ("close", "stop"):
             selector = words[1] if len(words) > 1 else "all"
             _print(rt.close(run_dir, selector))
             return 0
@@ -1688,17 +1752,21 @@ def _run_setup(args: argparse.Namespace) -> int:
     #    否則燒錄中仍會先覆寫 profiles/wrappers/skill 才報錯（Codex #1c）。
     daemon_running = False
     any_flashing = False
+    old_endpoint: str | None = None
+    old_pid: int | None = None
+    resolved = None
     try:
         resolved = _resolve_local_endpoint_info(args)
+        old_endpoint = resolved.endpoint
         daemon_running = bool(
             _rpc_call_traced(args, resolved, "health.ping", {}, timeout_s=0.5).get("ok")
         )
     except Exception:
         daemon_running = False
     try:
-        resolved = _resolve_local_endpoint_info(args)
+        mcu_resolved = _resolve_local_endpoint_info(args)
         any_flashing = bool(
-            _rpc_call_traced(args, resolved, "mcu.status", {}, timeout_s=0.5).get("flashing")
+            _rpc_call_traced(args, mcu_resolved, "mcu.status", {}, timeout_s=0.5).get("flashing")
         )
     except Exception:
         any_flashing = False
@@ -1710,6 +1778,16 @@ def _run_setup(args: argparse.Namespace) -> int:
         _print(resp)
         _mirror_err(resp, context="setup")
         return 2
+
+    # 只有即將進入 reconciliation 才讀取舊 daemon PID；flash 護欄早退維持原本 RPC 序列。
+    if daemon_running and resolved is not None:
+        try:
+            status = _rpc_call_traced(args, resolved, "health.status", {}, timeout_s=0.5)
+            candidate_pid = status.get("pid")
+            if isinstance(candidate_pid, int) and candidate_pid > 0:
+                old_pid = candidate_pid
+        except Exception:
+            pass
 
     # 5. 物化套件資產到使用者可寫位置。
     materialize_assets(force=args.force)
@@ -1758,6 +1836,21 @@ def _run_setup(args: argparse.Namespace) -> int:
         else (SYSTEM_SOCKET if target == "systemd-system" else SOCKET_PATH)
     )
 
+    def ping_old_endpoint(endpoint: str) -> bool:
+        try:
+            source = resolved.source if resolved is not None else "setup"
+            return bool(
+                _rpc_call_traced(
+                    args,
+                    _ResolvedEndpoint(endpoint, source),
+                    "health.ping",
+                    {},
+                    timeout_s=0.2,
+                ).get("ok")
+            )
+        except Exception:  # noqa: BLE001 — RPC 探測錯誤代表舊 endpoint 不可達
+            return False
+
     # 7. reconcile（先停舊、再起新）；flash 進行中除非 force 否則拒絕。
     try:
         result = reconcile(
@@ -1766,13 +1859,13 @@ def _run_setup(args: argparse.Namespace) -> int:
             fx=fx,
             home=os.path.expanduser("~"),
             daemon_running=daemon_running,
+            old_endpoint=old_endpoint,
+            old_pid=old_pid,
+            ping=ping_old_endpoint,
             any_flashing=any_flashing,
             with_sudo=args.with_sudo,
             force=args.force,
             socket_path=effective_socket,
-            # config 寫入路徑須與所有讀取端（_default_runtime_config→CONFIG_DIR）一致，
-            # 否則自訂 XDG_CONFIG_HOME/SERIALWRAP_CONFIG_DIR 下 writer≠reader 會分歧（I-1）。
-            config_path=os.path.join(CONFIG_DIR, "config.yaml"),
         )
     except FlashingBusy as exc:
         resp = {
@@ -1784,6 +1877,11 @@ def _run_setup(args: argparse.Namespace) -> int:
         _print(resp)
         _mirror_err(resp, context="setup")
         return 2
+
+    if result.get("error_code") == "TIMEOUT":
+        _print(result)
+        _mirror_err(result, context="setup")
+        return 1
 
     payload: dict[str, Any] = {
         "ok": True,
@@ -1932,7 +2030,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="timeout_s",
         type=float,
         default=None,
-        help="RPC timeout 秒數（未指定：一般方法 5.0；長操作 session attach/recover/self-test/console-attach 自動採固定 45.0 的 floor，#123）",
+        help="RPC timeout 秒數（未指定：一般方法 5.0；長操作 session attach/recover/self-test/console-attach、device release/attach、session clear/bind 自動採固定 45.0 的 floor，#123）",
     )
     p.add_argument(
         "--retries",
@@ -1951,8 +2049,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_daemon = sub.add_parser(
         "daemon",
-        help="管理 serialwrap daemon（啟動／停止／狀態）",
-        description="管理 serialwrap daemon 行程：啟動、停止與查詢執行狀態。",
+        help="管理 serialwrap daemon（啟動／停止／重啟／狀態）",
+        description="管理 serialwrap daemon 行程：啟動、停止、重啟與查詢執行狀態。",
     )
     daemon_sub = p_daemon.add_subparsers(dest="daemon_cmd", required=True, metavar="<command>")
 
@@ -1986,6 +2084,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="systemd-system 模式下，daemon stop 重導至 service stop 時以 sudo 執行",
     )
+    p_drestart = daemon_sub.add_parser(
+        "restart",
+        help="重啟 daemon（systemd 模式重導 service restart）",
+    )
+    p_drestart.add_argument(
+        "--with-sudo",
+        dest="with_sudo",
+        action="store_true",
+        default=False,
+        help="systemd-system 模式下，daemon restart 重導至 service restart 時以 sudo 執行",
+    )
     daemon_sub.add_parser("status", help="顯示 daemon 狀態（pid／sessions／devices／log 路徑／多開偵測 multi_open）")
 
     p_device = sub.add_parser(
@@ -2004,7 +2113,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_drel.add_argument("--reason", default=None)
     p_datt = device_sub.add_parser(
         "attach",
-        help="收回先前 release 的裝置並重建 console（外部仍持有時回 DEVICE_STILL_HELD，--force 略過）",
+        help="收回先前 release 的裝置並重建 console（--force 只略過開檔前預檢，不會搶占已識別的外部持有者）",
     )
     p_datt.add_argument("--selector", required=True)
     p_datt.add_argument("--force", action="store_true")
@@ -2241,11 +2350,12 @@ def build_parser() -> argparse.ArgumentParser:
             "  serialwrap remote -L user@relay:7777    # connect（relay/雙 NAT）\n"
             "  serialwrap remote                        # 列目前隧道（status）\n"
             "  serialwrap remote close 7777|all         # 拆除\n"
+            "  serialwrap remote stop [port|all]        # close 的別名，省略時拆除全部\n"
             "安全：只透過 ssh-tunnel、單租戶/可信 relay 或 --remote-socket；不可對網路直接開放。"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p_remote.add_argument("words", nargs="*", help="[user@]host:port ｜ status ｜ close <port|all>")
+    p_remote.add_argument("words", nargs="*", help="[user@]host:port ｜ status ｜ close/stop [port|all]")
     # 註：-R/-L 刻意不用 add_mutually_exclusive_group()——argparse 對同群組 store_true
     # 旗標的互斥是在 parse_args 當場 parser.error() → SystemExit(2)（usage 訊息印到
     # stderr），會讓「同時給 -R -L」整條命令繞過 _run_remote() 的 try/except
@@ -2493,6 +2603,8 @@ def main(argv: list[str] | None = None) -> int:
             return _run_daemon_start(args)
         if args.daemon_cmd == "stop":
             return _run_daemon_stop(args)
+        if args.daemon_cmd == "restart":
+            return _run_daemon_restart(args)
         if args.daemon_cmd == "status":
             return _run_rpc(args, "health.status", {})
 

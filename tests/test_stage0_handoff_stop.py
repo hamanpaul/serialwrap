@@ -1,140 +1,22 @@
 """tests/test_stage0_handoff_stop.py — SC-11 交接停止 daemon.handoff_stop 原子交接與 admission 邊界測試。"""
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import re
+import socket
+import subprocess
+import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-# 嘗試自 stage0_fakes 匯入；若該模組尚未由 T01 建立，提供本地替身以確保 collection 成功且紅燈為預期行為
-try:
-    from stage0_fakes import FakePort, make_service, wal_records
-except ImportError:
-    try:
-        from tests.stage0_fakes import FakePort, make_service, wal_records
-    except ImportError:
-        class FakePort:
-            """SerialPort 介面替身。"""
-            def __init__(self, write_results: list[Any] | None = None, *, block: threading.Event | None = None) -> None:
-                self.writes: list[bytes] = []
-                self.close_calls: int = 0
-                self.opened: bool = True
-                self.write_results = list(write_results) if write_results is not None else None
-                self.block = block
-
-            def open(self) -> None:
-                self.opened = True
-
-            def configure(self, profile: Any) -> None:
-                pass
-
-            def read(self, max_bytes: int = 8192) -> bytes:
-                return b""
-
-            def write(self, payload: bytes, *, cancel: threading.Event | None = None) -> Any:
-                if self.block is not None:
-                    self.block.wait()
-                self.writes.append(bytes(payload))
-                if self.write_results:
-                    res = self.write_results.pop(0)
-                    if isinstance(res, BaseException):
-                        raise res
-                    return res
-                try:
-                    from sw_core.serial_port import TxResult
-                    return TxResult("completed", len(payload), len(payload))
-                except (ImportError, AttributeError):
-                    return len(payload)
-
-            def close(self) -> None:
-                self.close_calls += 1
-                self.opened = False
-
-            def set_baud(self, baud: int) -> None:
-                pass
-
-            def is_alive(self) -> bool:
-                return self.opened
-
-            def fileno(self) -> int | None:
-                return None
-
-        def make_service(tmp_path: Path, ready: list[str] | None = None, port: FakePort | None = None, with_fake_mcu: bool = False) -> Any:
-            from sw_core.service import SerialwrapService
-            from sw_core.config import SessionProfile, UartProfile
-            from sw_core.uart_io import UARTBridge
-            profiles = [SessionProfile(profile_name="p", com=c, act_no=1, alias=f"lab+{i + 1}", device_by_id=f"/dev/serial/by-id/{c}", platform="prpl", uart=UartProfile()) for i, c in enumerate(ready or ["COM0"])]
-            svc = SerialwrapService(profiles, state_path=str(tmp_path / "state.json"))
-            svc.stop_requested = False
-            if ready:
-                for c in ready:
-                    s = svc._sessions.get_session(c)
-                    if s:
-                        b = UARTBridge(com=c, device_path="fake", profile=UartProfile(), wal=svc._wal)
-                        if port is not None:
-                            b._serial = port
-                            b._serial_fd = None
-                        s.bridge = b
-                        s.state = "READY"
-                        s.bridge_generation = 1
-
-            def _dispatch_for_test(req: dict[str, Any]) -> dict[str, Any]:
-                method = req.get("method")
-                params = req.get("params") or {}
-                if method == "daemon.stop":
-                    svc.stop_requested = True
-                    return {"id": req.get("id", 1), "ok": True, "stopping": True}
-                if method == "daemon.handoff_stop":
-                    if hasattr(svc, "handoff_stop"):
-                        res = svc.handoff_stop(params)
-                        if res.get("ok"):
-                            svc.stop_requested = True
-                        return res
-                    return {"id": req.get("id", 1), "ok": False, "error_code": "METHOD_NOT_FOUND"}
-                return svc.rpc(method, params)
-
-            svc.daemon_dispatch_for_test = _dispatch_for_test
-            svc.session_state = lambda c: svc._sessions.get_session(c).state if svc._sessions.get_session(c) else None
-            svc.session_public = lambda c: svc._sessions.get_session(c).to_public_dict() if svc._sessions.get_session(c) else None
-            svc.close_for_test = lambda: svc.stop()
-            svc.wal = svc._wal
-
-            if with_fake_mcu:
-                class FakeMcu:
-                    def __init__(self) -> None:
-                        self.received: bytes = b""
-
-                mcu = FakeMcu()
-
-                class FakeFlashEndpoint:
-                    def sync_probe_for_test(self, sync_bytes: bytes) -> str:
-                        if hasattr(svc, "admission") and svc.admission.frozen:
-                            return "refused_frozen"
-                        mcu.received += sync_bytes
-                        return "admitted"
-
-                svc.flash_endpoint = FakeFlashEndpoint()
-                return svc, mcu
-
-            svc.wait_until_admitted = lambda m, c, timeout=1.0: None
-            return svc
-
-        def wal_records(wal: Any) -> list[dict[str, Any]]:
-            wal_file = Path(wal.wal_path)
-            if not wal_file.exists():
-                return []
-            records = []
-            with open(wal_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        records.append(json.loads(line))
-            return records
-
+from stage0_fakes import FakePort, make_service, wal_records
 
 def _rpc(svc: Any, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
     return svc.daemon_dispatch_for_test({"id": 1, "method": method, "params": params or {}})
@@ -157,23 +39,48 @@ def test_handoff_file_push_after_last_probe(tmp_path):
     gate = threading.Event()
     port = FakePort(block=gate)
     svc = make_service(tmp_path, ready=["COM0"], port=port)
+    payload = b"x" * 16
+    local_path = tmp_path / "upload.bin"
+    local_path.write_bytes(payload)
+    expected_md5 = hashlib.md5(payload).hexdigest()
+    bridge = svc._sessions.get_session("COM0").bridge
+
+    def target_reply(raw: bytes) -> None:
+        command = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+        if "SW_XFER_DECODER_B64_" in command:
+            output = "SW_XFER_DECODER_B64_42"
+        elif "SW_XFER_CHUNK_" in command:
+            output = "SW_XFER_CHUNK_42"
+        elif command.startswith("md5sum "):
+            output = f"{expected_md5}  /tmp/.sw_upload_test\nSW_XFER_MD5_42"
+        elif command.startswith("mv "):
+            output = "SW_XFER_MV_42"
+        else:
+            output = "SW_XFER_CLEANUP_42"
+        bridge._handle_serial_rx(f"{command}\r\n{output}\r\nroot@prplOS:/# ".encode())
+
+    port._on_write = target_reply
     assert all(not s["foreground_busy"] for s in _rpc(svc, "session.list")["sessions"])   # CLI 預檢看到閒置
-    payload = b"x" * 65536
     out: dict = {}
-    t = threading.Thread(target=lambda: out.update(_rpc(svc, "file.push", {"selector": "COM0", "data_b64": payload.hex()})))
+    t = threading.Thread(target=lambda: out.update(_rpc(svc, "file.push", {
+        "selector": "COM0", "local_path": str(local_path), "remote_path": "/tmp/result.bin",
+        "ack_mode": "none", "chunk_size": 16, "chunk_timeout_s": 2.0,
+    })))
     t.start()
     svc.wait_until_admitted("file.push", "COM0", timeout=1.0)              # 預檢之後才開始的 push
     r = _rpc(svc, "daemon.handoff_stop", {"reason": "update"})
     assert (r["ok"], r["error_code"]) == (False, "SESSION_BUSY")
-    assert r["busy"][0]["com"] == "COM0" and r["busy"][0]["ops"] == ["file.push"]
+    assert any(row["com"] == "COM0" and row["ops"] == ["file.push"] for row in r["busy"])
     assert svc.stop_requested is False and svc.admission.frozen is False
     gate.set()
     t.join(10.0)
-    assert out["ok"] is True                                                           # push 完整完成，未被截斷
-    assert b"".join(port.writes).count(b"x") >= len(payload)
+    assert not t.is_alive(), f"production file.push 未在測試期限內返回：writes={len(port.writes)} rx={bridge.rx_tail()!r}"
+    assert out.get("ok") is True and out.get("bytes") == len(payload), out              # production file.push 完整完成
+    assert base64.b64encode(payload) in b"".join(port.writes)
     r2 = _rpc(svc, "daemon.handoff_stop", {"reason": "update"})
     assert r2["ok"] is True and r2["stopping"] is True and re.fullmatch(r"[0-9a-f]{32}", r2["handoff_token"])
     assert "version" not in r2 and svc.stop_requested is True
+    svc.close_for_test()
 
 
 @pytest.mark.core_portable
@@ -183,7 +90,7 @@ def test_handoff_flash_races_prepare(tmp_path, first):
     for _ in range(200 if first == "race" else 1):
         svc, mcu = make_service(tmp_path, ready=["COM0"], with_fake_mcu=True)
         res: dict = {}
-        probe = lambda: res.__setitem__("probe", svc.flash_endpoint.sync_probe_for_test(b"\x55\x55"))   # flasher 自身 sync bytes
+        probe = lambda: res.__setitem__("probe", mcu.write_sync(b"\x55\x55"))   # 透過真實 PTY 寫入 flasher sync
         handoff = lambda: res.__setitem__("handoff", _rpc(svc, "daemon.handoff_stop", {"reason": "rollback"}))
         if first == "probe":
             probe()
@@ -204,6 +111,7 @@ def test_handoff_flash_races_prepare(tmp_path, first):
         else:                                                                          # probe 先 admit ⇒ 交接必為 FLASHING_BUSY、daemon 不停止
             assert res["handoff"]["error_code"] == "FLASHING_BUSY" and res["probe"] == "admitted"
             assert svc.stop_requested is False and svc.admission.frozen is False
+        mcu.release.set()
         svc.close_for_test()
 
 
@@ -246,6 +154,82 @@ def test_command_submit_races_handoff(tmp_path):
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
+def test_rpc_human_source_cannot_bypass_handoff_admission(tmp_path):
+    port = FakePort()
+    svc = make_service(tmp_path, ready=["COM0"], port=port)
+    assert _rpc(svc, "daemon.handoff_stop")["ok"] is True
+    result = _rpc(svc, "command.submit", {
+        "selector": "COM0", "command": "echo bypass", "source": "human:rpc",
+    })
+    assert (result.get("ok"), result.get("error_code")) == (False, "FLUSHED_BY_SHUTDOWN")
+    assert port.writes == []
+    svc.close_for_test()
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_rpc_human_source_in_flight_blocks_handoff(tmp_path):
+    release_write = threading.Event()
+    port = FakePort(block=release_write)
+    svc = make_service(tmp_path, ready=["COM0"], port=port)
+    accepted: dict[str, Any] = {}
+    request = threading.Thread(target=lambda: accepted.update(_rpc(svc, "command.submit", {
+        "selector": "COM0", "command": "echo in flight", "source": "human:rpc", "timeout_s": 0.05,
+    })))
+    request.start()
+    svc.wait_until_admitted("command.submit", "COM0", timeout=1.0)
+    result = _rpc(svc, "daemon.handoff_stop")
+    assert result.get("error_code") == "SESSION_BUSY"
+    assert "command.submit" in result.get("busy", [{}])[0].get("ops", [])
+    assert svc.admission.frozen is False and svc.stop_requested is False
+    release_write.set()
+    request.join(2.0)
+    assert accepted.get("ok") is True
+    svc.close_for_test()
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_cancelled_queued_command_does_not_leave_handoff_ticket(tmp_path):
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    svc = make_service(tmp_path, ready=["COM0"])
+
+    def blocked_send(_session_id, command, *_args, **_kwargs):
+        if command == "first":
+            worker_started.set()
+            assert release_worker.wait(3.0), "測試未能解除第一筆命令"
+        return {"ok": True}
+
+    svc._arbiter._send_cb = blocked_send
+    first = _rpc(svc, "command.submit", {"selector": "COM0", "command": "first"})
+    assert first["ok"] is True
+    assert worker_started.wait(1.0), "第一筆命令未進入 worker"
+
+    second = _rpc(svc, "command.submit", {"selector": "COM0", "command": "second"})
+    assert second["ok"] is True and second["status"] == "accepted"
+    canceled = _rpc(svc, "command.cancel", {"cmd_id": second["cmd_id"]})
+    assert (canceled.get("ok"), canceled.get("cmd_id"), canceled.get("status")) == (
+        True, second["cmd_id"], "canceled",
+    )
+
+    release_worker.set()
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        current = _rpc(svc, "command.get", {"cmd_id": first["cmd_id"]})
+        if current.get("command", {}).get("done_at"):
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("第一筆命令未在時限內完成")
+
+    handoff = _rpc(svc, "daemon.handoff_stop")
+    assert handoff.get("ok") is True, handoff
+    svc.close_for_test()
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 @pytest.mark.parametrize("method", _mutating_methods())
 def test_every_mutating_method_rejected_after_freeze(tmp_path, method):
     port = FakePort()
@@ -281,7 +265,8 @@ def test_handoff_reason_supervision_set_same_semantics(tmp_path, reason):
 def test_handoff_busy_does_not_freeze(tmp_path):
     svc = make_service(tmp_path, ready=["COM0"])
     s = svc._sessions.get_session("COM0")
-    s.interactive_session_id = "lease-123"
+    with svc._sessions._lock:
+        svc._sessions._open_interactive_locked(s, owner="agent:test", timeout_s=60.0)
     r = _rpc(svc, "daemon.handoff_stop")
     assert r.get("ok") is False and r.get("error_code") == "SESSION_BUSY"
     assert "session.interactive_open" in r.get("busy", [{}])[0].get("ops", [])
@@ -303,13 +288,89 @@ def test_handoff_recovering_flag_is_busy(tmp_path):
 @pytest.mark.posix_only
 @pytest.mark.process_rpc
 def test_handoff_ok_then_sc11_stop_order(tmp_path):
-    svc = make_service(tmp_path, ready=["COM0"])
-    r = _rpc(svc, "daemon.handoff_stop", {"reason": "update"})
-    assert r.get("ok") is True and r.get("stopping") is True
-    assert re.fullmatch(r"[0-9a-f]{32}", r.get("handoff_token", ""))
-    assert "version" not in r
-    res = svc._sessions.shutdown_drain()
-    assert res == {"graceful": True, "stalled": []}
+    isolated = tmp_path / "daemon"
+    dirs = {
+        "SERIALWRAP_CONFIG_DIR": isolated / "config",
+        "SERIALWRAP_STATE_DIR": isolated / "state",
+        "SERIALWRAP_RUN_DIR": isolated / "run",
+        "SERIALWRAP_DATA_DIR": isolated / "data",
+        "SERIALWRAP_PROFILE_DIR": isolated / "profiles",
+        "SERIALWRAP_WAL_DIR": isolated / "wal",
+        "SERIALWRAP_BY_ID_DIR": isolated / "by-id",
+        "SERIALWRAP_BY_PATH_DIR": isolated / "by-path",
+        "SERIALWRAP_LOG_DIR": isolated / "logs",
+        "SERIALWRAP_EVENTS_DIR": isolated / "events-config",
+        "SERIALWRAP_EVENTS_RUNTIME_DIR": isolated / "events-runtime",
+        "SERIALWRAP_TTYMCU_PATH": isolated / "dev" / "ttyMCU",
+    }
+    for key, path in dirs.items():
+        (path.parent if key == "SERIALWRAP_TTYMCU_PATH" else path).mkdir(
+            parents=True, exist_ok=True
+        )
+    socket_path = isolated / "run" / "serialwrapd.sock"
+    lock_path = isolated / "run" / "serialwrapd.lock"
+    env = os.environ.copy()
+    for key in list(env):
+        if key.startswith("SERIALWRAP_"):
+            env.pop(key)
+    env.update({key: str(path) for key, path in dirs.items()})
+    env.update({
+        "SERIALWRAP_ENDPOINT": str(socket_path),
+        "SERIALWRAP_EVENTS_LOG_PATH": str(isolated / "events-runtime" / "events.ndjson"),
+        "SERIALWRAP_RPC_BACKEND": "posix",
+        "SERIALWRAP_LOCK_BACKEND": "posix",
+        "SERIALWRAP_DEVICE_BACKEND": "posix",
+        "XDG_CONFIG_HOME": str(isolated / "xdg-config"),
+        "XDG_STATE_HOME": str(isolated / "xdg-state"),
+        "XDG_DATA_HOME": str(isolated / "xdg-data"),
+        "XDG_RUNTIME_DIR": str(isolated / "xdg-runtime"),
+    })
+    repo = Path(__file__).resolve().parents[1]
+    proc = subprocess.Popen(
+        [
+            sys.executable, "-m", "sw_core.daemon",
+            "--profile-dir", str(dirs["SERIALWRAP_PROFILE_DIR"]),
+            "--socket", str(socket_path),
+            "--lock", str(lock_path),
+        ],
+        cwd=repo,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 10.0
+        while not socket_path.exists() and time.monotonic() < deadline:
+            if proc.poll() is not None:
+                stderr = proc.stderr.read() if proc.stderr is not None else ""
+                raise AssertionError(f"隔離 daemon 提前退出（{proc.returncode}）：{stderr[-1000:]}")
+            time.sleep(0.02)
+        assert socket_path.exists(), "隔離 daemon 未在期限內建立 Unix socket"
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(5.0)
+            client.connect(str(socket_path))
+            request = json.dumps({
+                "id": 1,
+                "method": "daemon.handoff_stop",
+                "params": {"reason": "update"},
+            }, separators=(",", ":")).encode() + b"\n"
+            client.sendall(request)
+            response = json.loads(client.makefile("rb").readline())
+        assert response.get("ok") is True and response.get("stopping") is True
+        assert re.fullmatch(r"[0-9a-f]{32}", response.get("handoff_token", ""))
+        assert "version" not in response
+        assert proc.wait(timeout=10.0) == 0
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=3.0)
+        if proc.stderr is not None:
+            proc.stderr.close()
 
 
 @pytest.mark.core_portable
@@ -318,11 +379,12 @@ def test_handoff_stop_contract_merged():
     schema_path = Path(__file__).resolve().parents[1] / "contracts" / "rpc_schema.json"
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
     assert "daemon.handoff_stop" in schema["x-methods"]
+    assert schema["x-methods"]["daemon.handoff_stop"]["status"] == "NEW"
     assert not any(p.get("adds_method") == "daemon.handoff_stop" for p in schema.get("x-pending", []))
     assert "daemon.handoff_stop" in schema.get("x-wire", {}).get("version_absent_for", [])
 
     error_codes_path = Path(__file__).resolve().parents[1] / "contracts" / "error_codes.yaml"
     import yaml
     codes_doc = yaml.safe_load(error_codes_path.read_text(encoding="utf-8"))
-    flushed = next(e for e in codes_doc.get("error_codes", []) if e.get("code") == "FLUSHED_BY_SHUTDOWN")
+    flushed = next(e for e in codes_doc["codes"] if e.get("code") == "FLUSHED_BY_SHUTDOWN")
     assert "rpc" in flushed.get("scope", {}).get("interfaces", [])

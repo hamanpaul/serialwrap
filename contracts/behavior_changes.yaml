@@ -4,20 +4,20 @@
 # applies_to.python.min_version 為目標 release 版號（不代表 VERSION 已是該版）；rust_only 項目為 null。
 # 檔內不寫 contract_revision（tree SHA 只在 build／capture 時計算）。字串一律以雙引號呈現，避免 YAML 1.1 bool／日期陷阱。
 schema_version: 1
-revision: 1
+revision: 2
 changes:
   - id: "BC-01"
     kind: "BC"
     title: "WAL 常駐 handle、每筆 flush、Windows share-delete、自癒與缺口記錄"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "hamanpaul"
       date: "2026-10-15"
       decision_ref: "OD-04"
       basis: "owner_decision"
-    owner_confirmation: "not_required"
-    owner_item: null
-    default_if_pending: null
+    owner_confirmation: "pending_default"
+    owner_item: 4
+    default_if_pending: "`{\"ok\":false,\"error_code\":\"SESSION_RECOVERING\",\"drain_stalled\":true,\"drain_timeout_epoch\":N,\"session\":…}`。回條遲到時仍完成 release，下次再呼叫回 `already_released`"
     applies_to:
       python:
         min_version: "0.4.0"
@@ -30,13 +30,13 @@ changes:
     ab_participation: "diff"
     phases: ["P1", "P5"]
     case_ids: ["bc01-wal-resident-handle", "bc01-wal-flush-per-record", "bc01-wal-rotate-normal", "bc01-wal-external-unlink-meta", "bc01-wal-external-reader-handle", "bc01-wal-recreate-failure-stops-tx", "bc01-f12-oracle-progress"]
-    compatibility_impact: "WAL 改為常駐 handle 並每筆 flush，寫入路徑不再每筆開關檔。外部 unlink／替換（含只刪檔、目錄消失）經有界重試重建成功後，先寫首筆 META WAL_RECREATED_AFTER_EXTERNAL_UNLINK（loss_flag:true、potentially_lost_seq_range，不再靜默）；正常 rotate 不寫缺口 META。WAL 重建失敗時有界處置並停止新增自動 UART TX（已完成的 UART 寫入不因 WAL append 失敗而自動重送）。正常 rotate 門檻 67108864 與 WAL 記錄格式不變。Windows 上外部讀取者的 share-delete 相容性改變。對讀取 WAL 的 L2／L3：可能出現 META 缺口事件。"
+    compatibility_impact: "WAL 改為常駐 handle 並每筆 flush，寫入路徑不再每筆開關檔。Windows 新寫入 WAL 行尾與 mirror 內的換行由文字模式 CRLF 改為 binary 模式 LF；讀取端仍接受既有 WAL CRLF 檔案。health.status.wal 新增 unhealthy_reason 欄位。外部 unlink／替換（含只刪檔、目錄消失）經有界重試重建成功後，先寫首筆 META WAL_RECREATED_AFTER_EXTERNAL_UNLINK（loss_flag:true、potentially_lost_seq_range，不再靜默）；正常 rotate 不寫缺口 META。WAL 重建失敗時有界處置並停止新增自動 UART TX（已完成的 UART 寫入不因 WAL append 失敗而自動重送）。正常 rotate 門檻 67108864 與 WAL 記錄格式不變。Windows 上外部讀取者的 share-delete 相容性改變。對讀取 WAL 的 L2／L3：可能出現 META 缺口事件。"
     approval_conditions: "同時核准正常 rotate、外部 handle 阻擋、有界失敗處置及 META 語意；F12 oracle 由 OD-13 配套核准"
     related_decisions: ["OD-04", "OD-05", "OD-13"]
   - id: "BC-02"
     kind: "BC"
     title: "DeferredBuffer 溢位或跨上下文時整段清空"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "hamanpaul"
       date: "2026-10-15"
@@ -57,13 +57,13 @@ changes:
     ab_participation: "diff"
     phases: ["P1", "P6", "P8"]
     case_ids: ["bc02-deferred-overflow-clear", "bc02-deferred-context-switch-clear", "bc02-mailbox-stale-input-not-replayed", "bc02-normal-replay-53"]
-    compatibility_impact: "DeferredBuffer 溢位（原為截頭留尾）或發生跨上下文切換（recovery、release、reboot、lease 切換，以及 flash 認線成功（FlashSyncMatched））時，延後輸入整段清空、不回放。未發生失效時的 #53 正常回放不變。對依賴延後輸入保留尾端的 agent：溢位後不再保留尾段。"
+    compatibility_impact: "DeferredBuffer 溢位（原為截頭留尾）或 recovery、release、reboot、Quiet 重新啟動及 flash 認線成功（FlashSyncMatched）時，延後輸入整段清空、不回放。Lease hand-off 的寫入授權由 T20 permit 依 owner_gen 檢查，不觸發 BC-02 清空。未發生失效時的 #53 正常回放不變。對依賴延後輸入保留尾端的 agent：溢位後不再保留尾段。"
     approval_conditions: "保留未發生失效時的 #53 正常回放；測 mailbox 中尚未處理的舊輸入，避免清空後重新灌回"
     related_decisions: ["OD-04"]
   - id: "BC-03"
     kind: "BC"
     title: "新增 COMMAND_ABORTED_IN_FLIGHT"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "hamanpaul"
       date: "2026-10-15"
@@ -90,7 +90,7 @@ changes:
   - id: "BC-04"
     kind: "BC"
     title: "Per-UART 獨占、衝突阻斷與 holder 診斷"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "hamanpaul"
       date: "2026-10-15"
@@ -117,7 +117,7 @@ changes:
   - id: "BC-05"
     kind: "BC"
     title: "Windows remote -R/-L"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "hamanpaul"
       date: "2026-10-15"
@@ -144,7 +144,7 @@ changes:
   - id: "SC-01"
     kind: "SC"
     title: "RECOVERING 下 submit 與 open 回 SESSION_RECOVERING"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -171,7 +171,7 @@ changes:
   - id: "SC-02"
     kind: "SC"
     title: "FLASHING 下 submit 與 open 回 FLASHING_BUSY"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -198,7 +198,7 @@ changes:
   - id: "SC-03"
     kind: "SC"
     title: "execute-time 與 file.* 的 AUTOBOOT_QUIET 附 retry_after_s"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -225,15 +225,15 @@ changes:
   - id: "SC-04"
     kind: "SC"
     title: "drain 可觀測面與 release 回條（drain_stalled）"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
       decision_ref: "serialwrap-rust-spec-final.md §5.2、§5.3、§9.4"
       basis: "spec_final"
-    owner_confirmation: "pending_default"
-    owner_item: 4
-    default_if_pending: "`{\"ok\":false,\"error_code\":\"SESSION_RECOVERING\",\"drain_stalled\":true,\"drain_timeout_epoch\":N,\"session\":…}`。回條遲到時仍完成 release，下次再呼叫回 `already_released`"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
     applies_to:
       python:
         min_version: "0.4.0"
@@ -247,12 +247,12 @@ changes:
     phases: ["P1", "P5"]
     case_ids: ["sc04-drain-recovering-release-timeout"]
     compatibility_impact: "斷線、I/O error、release、clear、bind 的 detach 期間可觀測為 RECOVERING；release 在 handle 關閉回條後才回成功；超過 3000 ms 回 SESSION_RECOVERING 並附 drain_stalled:true 與 drain_timeout_epoch；SessionPublic 新增 drain_stalled、drain_timeout_epoch 兩欄（位於 capture 之後）。"
-    approval_conditions: "ADR-06 安全骨架；只有「release 遇 drain 逾時」的回應形狀需確認；規格明文；改為可喚醒、可取消；fence：授權重驗與 OS 實際提交在同一臨界區（Rust `FenceSubmitGate`、Python `_tx_fence_lock` 臨界區內單次非阻塞 `os.write`，`_state_lock` 只做 pre-check），鎖只跨非阻塞提交、不跨完成等待；禁止「驗證→放鎖→write」（R0-F1，arch §5.4 第 3 點；P1 T20、P5 Task 9 測試）。Python Windows `_PySerialPort` 是唯一例外：每段 ≤64 bytes 的 `serial.write` 在鎖內阻塞（上限 `write_timeout` 5 s），所以 `begin_drain` 取鎖有上限（`DRAIN_FENCE_ACQUIRE_S`），取不到時先凍結、在途段交 Phase 2 背景完成；drain 3,000 ms 期限自請求起算並涵蓋 Phase 1 等鎖（R3-F3，§5.2.5；P1 T07 `test_finish_drain_deadline_counts_from_begin`、T08 `test_release_drain_deadline_includes_lock_wait`、T20 `test_windows_guarded_write_stall_reports_drain_stalled_on_time`）。範圍含自動登入、密碼與 ready／reconfirm probe：Python 不得以 `permit=None`（只查 drain／flash）送出，改帶 `system_probe` permit＋`login_gen`，每次提交重驗 Quiet、世代與 Drain；`_boot_quiet_blocks_probe` 只是 pre-check（R2-F1，§5.2.1；P1 T20 `test_login_probe_quiet_armed_after_precheck_before_submit_zero_tx`、P7 Task 7 `login_probe_authorized_then_quiet_arm_before_os_submit_is_zero_tx`）"
+    approval_conditions: "ADR-06 安全骨架；只有「release 遇 drain 逾時」的回應形狀需確認；規格明文；改為可喚醒、可取消；fence：授權重驗與 OS 實際提交在同一臨界區（Rust `FenceSubmitGate`、Python `_tx_fence_lock` 臨界區內單次非阻塞 `os.write`，`_state_lock` 只做 pre-check），鎖只跨非阻塞提交、不跨完成等待；禁止「驗證→放鎖→write」（R0-F1，arch §5.4 第 3 點；P1 T20、P5 Task 9 測試）。Python Windows `_PySerialPort` 是唯一例外：每段 ≤64 bytes 的 `serial.write` 在鎖內阻塞（上限 `write_timeout` 5 s），所以 `begin_drain` 取鎖有上限（`DRAIN_FENCE_ACQUIRE_S`），取不到時先凍結、在途段交 Phase 2 背景完成；drain 3,000 ms 期限自請求起算並涵蓋 Phase 1 等鎖（R3-F3，§5.2.5；P1 T07 `test_finish_drain_deadline_counts_from_begin`、T08 `test_release_drain_deadline_includes_lock_wait`、T20 `test_windows_guarded_write_stall_reports_drain_stalled_on_time`）。範圍含自動登入、密碼與 ready／reconfirm probe：Python 不得以 `permit=None`（只查 drain／flash）送出，改帶 `system_probe` permit＋`login_gen`，每次提交重驗 Quiet、世代與 Drain；`_boot_quiet_blocks_probe` 只是 pre-check（R2-F1，§5.2.1；P1 T20 `test_login_probe_quiet_armed_after_precheck_before_submit_zero_tx`、P7 Task 7 `login_probe_authorized_then_quiet_arm_before_os_submit_zero_tx`）"
     related_decisions: []
   - id: "SC-05"
     kind: "SC"
     title: "device.attach 同步重新取得獨占"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -279,7 +279,7 @@ changes:
   - id: "SC-06"
     kind: "SC"
     title: "CMD_PENDING_MAX 計入已 cancel 仍執行的命令"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -306,7 +306,7 @@ changes:
   - id: "SC-07"
     kind: "SC"
     title: "TX WAL 只記錄 OS 已確認寫出的 bytes"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -333,7 +333,7 @@ changes:
   - id: "SC-08"
     kind: "SC"
     title: "UDS 權限預設 0600／目錄 0700"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -360,7 +360,7 @@ changes:
   - id: "SC-09"
     kind: "SC"
     title: "設定探索順序（SERIALWRAP_CONFIG 與系統目錄）"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -387,7 +387,7 @@ changes:
   - id: "SC-10"
     kind: "SC"
     title: "lock 與 socket 路徑正規化；Windows 改用 LockFileEx"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -414,7 +414,7 @@ changes:
   - id: "SC-11"
     kind: "SC"
     title: "有序關機與 daemon.handoff_stop 交接停止"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -441,7 +441,7 @@ changes:
   - id: "SC-12"
     kind: "SC"
     title: "監管 reconcile 等待舊 daemon 結束"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -468,7 +468,7 @@ changes:
   - id: "SC-13"
     kind: "SC"
     title: "lease 到期由 1 s tick 主動處理"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -495,7 +495,7 @@ changes:
   - id: "SC-14"
     kind: "SC"
     title: "flash probe 資格加註 RELEASED／RECOVERING／drain／前景操作"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -548,7 +548,7 @@ changes:
   - id: "SC-16"
     kind: "SC"
     title: "console line buffer 上限與被拒整行 WARNING log"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -627,7 +627,7 @@ changes:
   - id: "SC-19"
     kind: "SC"
     title: "OD-11 測試裝置 allowlist"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "hamanpaul"
       date: "2026-10-15"
@@ -648,13 +648,13 @@ changes:
     ab_participation: "diff"
     phases: ["P1"]
     case_ids: ["sc19-test-device-allowlist"]
-    compatibility_impact: "啟用時 health.status 多出 test_device_allowlist:{enabled:true,coms:[...]}；非隔離實例設定 allowlist 時 daemon 拒絕啟動（TEST_DEVICE_ALLOWLIST_REJECTED，exit 2）。allowlist 只影響裝置發現與選取，不改變獨占鎖或 backend。"
+    compatibility_impact: "啟用時 health.status 多出 test_device_allowlist:{enabled:true,coms:[...],source:env 或 config}；非隔離實例設定 allowlist 時 daemon 拒絕啟動（TEST_DEVICE_ALLOWLIST_REJECTED，exit 2）；隔離實例下 config.yaml 存在但無法讀取或解析且 env 未提供 allowlist 時同樣拒絕（reason 為 invalid config.yaml: <例外類別名>），非隔離實例維持未設定、啟動行為不變。allowlist 只影響裝置發現與選取，不改變獨占鎖或 backend。"
     approval_conditions: "OD-11 核准限制：僅對隔離實例生效（SERIALWRAP_STATE_DIR、SERIALWRAP_RUN_DIR、SERIALWRAP_CONFIG_DIR 三者都明確設定且不等於預設路徑）；正式 daemon 設定遇到即拒絕（exit 2）；只接受明確列出的 COM 名稱，不得全域放行；不關閉獨占鎖、不更換 serial backend；啟用時 health.status 必須顯示。定案細節依調和表 GAP-G-07。"
     related_decisions: ["OD-11"]
   - id: "SC-20"
     kind: "SC"
     title: "新增 daemon restart"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -681,7 +681,7 @@ changes:
   - id: "SC-21"
     kind: "SC"
     title: "remote stop 作為 remote close 的別名"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -785,8 +785,8 @@ changes:
     related_decisions: ["OD-03", "OD-12"]
   - id: "SC-25"
     kind: "SC"
-    title: "release manifest 與 doctor version_pairing（Rust-only）"
-    status: "APPROVED"
+    title: "release manifest 與 doctor version_pairing（Python 僅在 bundle 內偵測到 manifest 時）"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -796,17 +796,18 @@ changes:
     owner_item: null
     default_if_pending: null
     applies_to:
-      python: null
+      python:
+        min_version: "0.4.0"
       rust:
         stage: "stage-1a"
     approved_at_revision: 1
     spec_refs: ["§9.5", "OD-13"]
     reconciliation_refs: ["PLT-D-12", "GAP-G-04"]
-    scope: "rust_only"
+    scope: "python_when_manifest_present"
     ab_participation: "absolute_only"
-    phases: ["P2", "P3", "P4"]
+    phases: ["P1", "P2", "P3", "P4"]
     case_ids: ["sc25-release-manifest-version-pairing"]
-    compatibility_impact: "新增 release manifest（artifact 身分與版本配對）與 doctor 的 version_pairing 檢查；CLI 既有版本警告保留。本 Phase 先登記為 rust_only。"
+    compatibility_impact: "新增 release manifest（artifact 身分與版本配對）與 doctor 的 version_pairing 檢查；CLI 既有版本警告保留。Python 側僅在 bundle 內偵測到 release manifest 時附加 version_pairing（非 advisory）；純 Python 安裝的 doctor 輸出不變。"
     approval_conditions: "警告保留；新增 manifest 與 doctor 配對檢查"
     related_decisions: ["OD-13"]
   - id: "SC-26"
@@ -838,7 +839,7 @@ changes:
   - id: "SC-27"
     kind: "SC"
     title: "BC-05 Windows remote 延伸 connect 與 benches"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -892,7 +893,7 @@ changes:
   - id: "DF-02"
     kind: "DF"
     title: "RPC 帶入 human: source 以 agent 對待"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-15"
@@ -919,7 +920,7 @@ changes:
   - id: "DF-03"
     kind: "DF"
     title: "WAL／mirror 歸檔同名不覆蓋"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-15"
@@ -946,7 +947,7 @@ changes:
   - id: "DF-04"
     kind: "DF"
     title: "動態 session RELEASED 跨重啟保留"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-15"
@@ -973,7 +974,7 @@ changes:
   - id: "DF-05"
     kind: "DF"
     title: "daemon start 的 daemon 定位順序"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-15"
@@ -1216,7 +1217,7 @@ changes:
   - id: "DF-14"
     kind: "DF"
     title: "daemon 啟動順序（scan→rank→watch）"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-15"
@@ -1243,7 +1244,7 @@ changes:
   - id: "DF-15"
     kind: "DF"
     title: "RX 精確 WAL seq"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-15"
@@ -1297,7 +1298,7 @@ changes:
   - id: "DF-17"
     kind: "DF"
     title: "WAL／mirror 寫入失敗重試不重複 seq"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-15"
@@ -1324,7 +1325,7 @@ changes:
   - id: "DF-19"
     kind: "DF"
     title: "self-test nonce probe 提交點 quiet 重驗"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-15"
@@ -1409,7 +1410,7 @@ safety_invariants:
   - id: no_auto_resend
     title: "已有或可能有裝置副作用的命令不得自動重送"
     spec_ref: "§11.3"
-    error_codes: ["BASE64_DECODE_FAILED", "CHECKSUM_MISMATCH", "CHECKSUM_VERIFY_FAILED", "COMMAND_ABORTED_IN_FLIGHT", "COMMAND_FAILED", "CONSOLE_LINE_LIMIT_TOO_SMALL", "EMPTY_RESPONSE", "EXCEPTION", "FORCE_RECOVER_TIMEOUT", "INTERACTIVE_EXPIRED", "INVALID_RESPONSE", "MOVE_FAILED", "MOVE_TIMEOUT", "PROMPT_TIMEOUT", "PROMPT_TIMEOUT_FORCE_RECOVERED", "PROMPT_TIMEOUT_RECOVERED", "PULL_PARSE_FAILED", "SEND_FAILED", "SOCKET_ERROR", "STATE_CHANGED", "TARGET_DECODER_FAILED", "TARGET_DECODER_MISSING", "TARGET_ENCODER_FAILED", "TARGET_ENCODER_MISSING", "TIMEOUT", "TRANSFER_ECHO_STALL", "TRANSFER_PROBE_FAILED", "TRANSFER_TIMEOUT"]
+    error_codes: ["BASE64_DECODE_FAILED", "CHECKSUM_MISMATCH", "CHECKSUM_VERIFY_FAILED", "COMMAND_ABORTED_IN_FLIGHT", "COMMAND_FAILED", "CONSOLE_LINE_LIMIT_TOO_SMALL", "SESSION_RECOVERING", "EMPTY_RESPONSE", "EXCEPTION", "FORCE_RECOVER_TIMEOUT", "INTERACTIVE_EXPIRED", "INVALID_RESPONSE", "MOVE_FAILED", "MOVE_TIMEOUT", "PROMPT_TIMEOUT", "PROMPT_TIMEOUT_FORCE_RECOVERED", "PROMPT_TIMEOUT_RECOVERED", "PULL_PARSE_FAILED", "SEND_FAILED", "SOCKET_ERROR", "STATE_CHANGED", "TARGET_DECODER_FAILED", "TARGET_DECODER_MISSING", "TARGET_ENCODER_FAILED", "TARGET_ENCODER_MISSING", "TIMEOUT", "TRANSFER_ECHO_STALL", "TRANSFER_PROBE_FAILED", "TRANSFER_TIMEOUT"]
     case_ids: ["bc03-no-auto-resend", "bc03-unknown-outcome-send-failed"]
   - id: insufficient_evidence_not_pass
     title: "證據不足、擷取失敗或測試未完成不得轉為 PASS"

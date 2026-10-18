@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/hamanpaul/serialwrap/contracts/rpc_schema.json",
   "title": "serialwrap RPC contract",
-  "x-catalog-revision": 1,
+  "x-catalog-revision": 8,
   "x-wire": {
     "framing": "ndjson",
     "line_strip": true,
@@ -32,7 +32,8 @@
       "INVALID_REQUEST",
       "INVALID_METHOD",
       "EXCEPTION",
-      "daemon.stop"
+      "daemon.stop",
+      "daemon.handoff_stop"
     ]
   },
   "x-generic-errors": [
@@ -41,7 +42,8 @@
     "INVALID_JSON",
     "INVALID_REQUEST",
     "INVALID_METHOD",
-    "FLASH_TARGET_IS_CONSOLE"
+    "FLASH_TARGET_IS_CONSOLE",
+    "FLUSHED_BY_SHUTDOWN"
   ],
   "x-generic-error-notes": {
     "METHOD_NOT_FOUND": "未知 method 的回應（service.py:1174）",
@@ -49,7 +51,8 @@
     "INVALID_JSON": "framing 早退（無 id、無 version）",
     "INVALID_REQUEST": "framing 早退（非 object）",
     "INVALID_METHOD": "method 非 str（無 version）",
-    "FLASH_TARGET_IS_CONSOLE": "catalog methods=[]（rpc 範圍）；resolve_flash_target 目前無 production 呼叫端（reachable: false，03 §3.1）。列於此僅為滿足 rpc 範圍碼皆有宣告位置（test_every_rpc_code_referenced），不代表任何 method 會回傳"
+    "FLASH_TARGET_IS_CONSOLE": "catalog methods=[]（rpc 範圍）；resolve_flash_target 目前無 production 呼叫端（reachable: false，03 §3.1）。列於此僅為滿足 rpc 範圍碼皆有宣告位置（test_every_rpc_code_referenced），不代表任何 method 會回傳",
+    "FLUSHED_BY_SHUTDOWN": "AdmissionGate 已凍結後，有副作用 RPC 在任何副作用前遭拒；reason:\"handoff_frozen\""
   },
   "$defs": {
     "SessionPublic": {
@@ -99,6 +102,8 @@
         "released_at",
         "released_reason",
         "capture",
+        "drain_stalled",
+        "drain_timeout_epoch",
         "console_endpoint"
       ],
       "properties": {
@@ -403,6 +408,15 @@
             "byte_count"
           ]
         },
+        "drain_stalled": {
+          "type": "boolean"
+        },
+        "drain_timeout_epoch": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "console_endpoint": {
           "type": [
             "string",
@@ -455,7 +469,9 @@
         "released_by",
         "released_at",
         "released_reason",
-        "capture"
+        "capture",
+        "drain_stalled",
+        "drain_timeout_epoch"
       ],
       "additionalProperties": false
     },
@@ -598,6 +614,7 @@
           ],
           "x-record-error-codes": [
             "AUTOBOOT_QUIET",
+            "COMMAND_ABORTED_IN_FLIGHT",
             "COMMAND_FAILED",
             "FLASHING_BUSY",
             "FLUSHED_BY_RECOVERY",
@@ -612,7 +629,7 @@
             "SESSION_NOT_READY",
             "SESSION_RECOVERING"
           ],
-          "x-note": "命令紀錄層錯誤碼（spec §9.4）；由 error_codes.yaml scope.interfaces 含 rec 且 status 非 APPROVED 之碼推導；COMMAND_ABORTED_IN_FLIGHT（BC-03，APPROVED）未生效，不列入"
+          "x-note": "命令紀錄層錯誤碼（spec §9.4）；由 error_codes.yaml scope.interfaces 含 rec 且 status 非 APPROVED 之碼推導"
         },
         "stdout": {
           "type": "string"
@@ -904,6 +921,7 @@
           ],
           "x-record-error-codes": [
             "AUTOBOOT_QUIET",
+            "COMMAND_ABORTED_IN_FLIGHT",
             "COMMAND_FAILED",
             "FLASHING_BUSY",
             "FLUSHED_BY_RECOVERY",
@@ -918,7 +936,7 @@
             "SESSION_NOT_READY",
             "SESSION_RECOVERING"
           ],
-          "x-note": "命令紀錄層錯誤碼（spec §9.4）；由 error_codes.yaml scope.interfaces 含 rec 且 status 非 APPROVED 之碼推導；COMMAND_ABORTED_IN_FLIGHT（BC-03，APPROVED）未生效，不列入"
+          "x-note": "命令紀錄層錯誤碼（spec §9.4）；由 error_codes.yaml scope.interfaces 含 rec 且 status 非 APPROVED 之碼推導"
         },
         "from_seq": {
           "type": "integer"
@@ -1444,6 +1462,8 @@
         "INVALID_COMPLETION_REGEX",
         "INVALID_ARGS",
         "SESSION_NOT_FOUND",
+        "SESSION_RECOVERING",
+        "FLASHING_BUSY",
         "PROFILE_NOT_COMMAND_CAPABLE",
         "SESSION_NOT_READY",
         "READY_UNCONFIRMED",
@@ -1456,6 +1476,8 @@
         "INVALID_COMPLETION_REGEX",
         "INVALID_ARGS",
         "SESSION_NOT_FOUND",
+        "SESSION_RECOVERING",
+        "FLASHING_BUSY",
         "PROFILE_NOT_COMMAND_CAPABLE",
         "SESSION_NOT_READY",
         "READY_UNCONFIRMED",
@@ -1521,6 +1543,143 @@
       "status": "EXISTING",
       "source": "sw_core/daemon.py:167"
     },
+    "daemon.handoff_stop": {
+      "params": {
+        "reason": {
+          "type": "string",
+          "x-coercion": "str(params.get(k) or \"update\")",
+          "default": "update"
+        }
+      },
+      "result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "stopping",
+          "handoff_token"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "stopping": {
+            "type": "boolean",
+            "const": true
+          },
+          "handoff_token": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$"
+          }
+        },
+        "required": [
+          "ok",
+          "stopping",
+          "handoff_token"
+        ]
+      },
+      "x-error-result": {
+        "type": "object",
+        "x-order": [
+          "ok",
+          "error_code",
+          "busy"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": false
+          },
+          "error_code": {
+            "type": "string",
+            "enum": [
+              "FLASHING_BUSY",
+              "SESSION_BUSY"
+            ]
+          },
+          "busy": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "x-order": [
+                "com",
+                "state",
+                "foreground_busy",
+                "outstanding_commands",
+                "interactive_session_id",
+                "recovering",
+                "ops"
+              ],
+              "properties": {
+                "com": {
+                  "type": "string"
+                },
+                "state": {
+                  "type": "string"
+                },
+                "foreground_busy": {
+                  "type": "boolean"
+                },
+                "outstanding_commands": {
+                  "type": "integer"
+                },
+                "interactive_session_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "recovering": {
+                  "type": "boolean"
+                },
+                "ops": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "required": [
+                "com",
+                "state",
+                "foreground_busy",
+                "outstanding_commands",
+                "interactive_session_id",
+                "recovering",
+                "ops"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "ok",
+          "error_code",
+          "busy"
+        ]
+      },
+      "errors": [
+        "FLASHING_BUSY",
+        "SESSION_BUSY"
+      ],
+      "error_order": [
+        "FLASHING_BUSY",
+        "SESSION_BUSY"
+      ],
+      "side_effects": [
+        {
+          "what": "在 AdmissionGate 原子判定閒置並凍結新操作；成功後回應寫出再進入 daemon.stop 停止序列",
+          "when": "on_success",
+          "idempotent": false
+        }
+      ],
+      "retryable_readonly": false,
+      "blocking": true,
+      "long_timeout": false,
+      "selector_chain": null,
+      "status": "NEW",
+      "source": "sw_core/daemon.py:97-101 → SerialwrapService.handoff_stop sw_core/service.py:816"
+    },
     "device.attach": {
       "params": {
         "selector": {
@@ -1562,12 +1721,14 @@
       "errors": [
         "INVALID_ARGS",
         "SESSION_NOT_FOUND",
+        "SESSION_RECOVERING",
         "DEVICE_NOT_PRESENT",
         "DEVICE_STILL_HELD"
       ],
       "error_order": [
         "INVALID_ARGS",
         "SESSION_NOT_FOUND",
+        "SESSION_RECOVERING",
         "DEVICE_NOT_PRESENT",
         "DEVICE_STILL_HELD"
       ],
@@ -1579,13 +1740,93 @@
         }
       ],
       "retryable_readonly": false,
-      "blocking": false,
-      "long_timeout": false,
+      "blocking": true,
+      "long_timeout": true,
       "selector_chain": "selector",
       "status": "EXISTING",
       "source": "sw_core/service.py:737-741 → attach_device sw_core/session_manager.py:2004",
       "x-notes": {
         "proc_scan": "force=false 時 /proc 掃描於 event loop 同步執行（非 BLOCKING）；不列為副作用"
+      },
+      "x-error-results": {
+        "SESSION_RECOVERING": {
+          "type": "object",
+          "x-order": [
+            "ok",
+            "error_code",
+            "drain_stalled",
+            "drain_timeout_epoch",
+            "session"
+          ],
+          "properties": {
+            "ok": {
+              "type": "boolean",
+              "const": false
+            },
+            "error_code": {
+              "type": "string",
+              "const": "SESSION_RECOVERING"
+            },
+            "drain_stalled": {
+              "type": "boolean"
+            },
+            "drain_timeout_epoch": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "session": {
+              "$ref": "#/$defs/SessionPublic"
+            }
+          },
+          "required": [
+            "ok",
+            "error_code",
+            "drain_stalled",
+            "drain_timeout_epoch",
+            "session"
+          ]
+        },
+        "DEVICE_STILL_HELD": {
+          "type": "object",
+          "x-order": [
+            "ok",
+            "error_code",
+            "pids",
+            "holder_unknown",
+            "selector"
+          ],
+          "properties": {
+            "ok": {
+              "type": "boolean",
+              "const": false
+            },
+            "error_code": {
+              "type": "string",
+              "const": "DEVICE_STILL_HELD"
+            },
+            "pids": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            },
+            "holder_unknown": {
+              "type": "boolean"
+            },
+            "selector": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "ok",
+            "error_code",
+            "pids",
+            "holder_unknown",
+            "selector"
+          ]
+        }
       }
     },
     "device.list": {
@@ -1687,12 +1928,14 @@
       "errors": [
         "INVALID_ARGS",
         "SESSION_NOT_FOUND",
-        "FLASHING_BUSY"
+        "FLASHING_BUSY",
+        "SESSION_RECOVERING"
       ],
       "error_order": [
         "INVALID_ARGS",
         "SESSION_NOT_FOUND",
-        "FLASHING_BUSY"
+        "FLASHING_BUSY",
+        "SESSION_RECOVERING"
       ],
       "side_effects": [
         {
@@ -1712,11 +1955,52 @@
         }
       ],
       "retryable_readonly": false,
-      "blocking": false,
-      "long_timeout": false,
+      "blocking": true,
+      "long_timeout": true,
       "selector_chain": "selector",
       "status": "EXISTING",
-      "source": "sw_core/service.py:729-735 → release_device sw_core/session_manager.py:1852"
+      "source": "sw_core/service.py:729-735 → release_device sw_core/session_manager.py:1852",
+      "x-error-results": {
+        "SESSION_RECOVERING": {
+          "type": "object",
+          "x-order": [
+            "ok",
+            "error_code",
+            "drain_stalled",
+            "drain_timeout_epoch",
+            "session"
+          ],
+          "properties": {
+            "ok": {
+              "type": "boolean",
+              "const": false
+            },
+            "error_code": {
+              "type": "string",
+              "const": "SESSION_RECOVERING"
+            },
+            "drain_stalled": {
+              "type": "boolean"
+            },
+            "drain_timeout_epoch": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "session": {
+              "$ref": "#/$defs/SessionPublic"
+            }
+          },
+          "required": [
+            "ok",
+            "error_code",
+            "drain_stalled",
+            "drain_timeout_epoch",
+            "session"
+          ]
+        }
+      }
     },
     "event.com_disable": {
       "params": {
@@ -2474,11 +2758,12 @@
       "errors": [
         "INVALID_ARGS",
         "SESSION_NOT_FOUND",
+        "SESSION_RECOVERING",
+        "FLASHING_BUSY",
         "PROFILE_NOT_COMMAND_CAPABLE",
         "SESSION_NOT_READY",
         "READY_UNCONFIRMED",
         "AUTOBOOT_QUIET",
-        "SESSION_RECOVERING",
         "SESSION_INTERACTIVE_BUSY",
         "SESSION_BUSY",
         "CONSOLE_LINE_LIMIT_TOO_SMALL",
@@ -2494,11 +2779,12 @@
       "error_order": [
         "INVALID_ARGS",
         "SESSION_NOT_FOUND",
+        "SESSION_RECOVERING",
+        "FLASHING_BUSY",
         "PROFILE_NOT_COMMAND_CAPABLE",
         "SESSION_NOT_READY",
         "READY_UNCONFIRMED",
         "AUTOBOOT_QUIET",
-        "SESSION_RECOVERING",
         "SESSION_INTERACTIVE_BUSY",
         "SESSION_BUSY",
         "CONSOLE_LINE_LIMIT_TOO_SMALL",
@@ -2618,11 +2904,12 @@
       "errors": [
         "INVALID_ARGS",
         "SESSION_NOT_FOUND",
+        "SESSION_RECOVERING",
+        "FLASHING_BUSY",
         "PROFILE_NOT_COMMAND_CAPABLE",
         "SESSION_NOT_READY",
         "READY_UNCONFIRMED",
         "AUTOBOOT_QUIET",
-        "SESSION_RECOVERING",
         "SESSION_INTERACTIVE_BUSY",
         "SESSION_BUSY",
         "LOCAL_FILE_NOT_FOUND",
@@ -2641,11 +2928,12 @@
       "error_order": [
         "INVALID_ARGS",
         "SESSION_NOT_FOUND",
+        "SESSION_RECOVERING",
+        "FLASHING_BUSY",
         "PROFILE_NOT_COMMAND_CAPABLE",
         "SESSION_NOT_READY",
         "READY_UNCONFIRMED",
         "AUTOBOOT_QUIET",
-        "SESSION_RECOVERING",
         "SESSION_INTERACTIVE_BUSY",
         "SESSION_BUSY",
         "LOCAL_FILE_NOT_FOUND",
@@ -2742,7 +3030,8 @@
           "warnings",
           "multi_open",
           "foreign_holders",
-          "multi_open_detail"
+          "multi_open_detail",
+          "test_device_allowlist"
         ],
         "properties": {
           "ok": {
@@ -2795,7 +3084,8 @@
               "write_failures",
               "last_write_error",
               "recreated_count",
-              "healthy"
+              "healthy",
+              "unhealthy_reason"
             ],
             "properties": {
               "wal_dir": {
@@ -2830,6 +3120,17 @@
               },
               "healthy": {
                 "type": "boolean"
+              },
+              "unhealthy_reason": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "enum": [
+                  null,
+                  "write_failed",
+                  "recreate_failed"
+                ]
               }
             },
             "required": [
@@ -2842,9 +3143,10 @@
               "write_failures",
               "last_write_error",
               "recreated_count",
-              "healthy"
+              "healthy",
+              "unhealthy_reason"
             ],
-            "x-note": "healthy = dir_exists and dir_writable and not (seq>0 and not file_exists)；不取 WAL 鎖"
+            "x-note": "healthy = dir_exists and dir_writable and not (seq>0 and not file_exists) and not unhealthy；unhealthy_reason 為 null、write_failed 或 recreate_failed；不取 WAL 鎖"
           },
           "limits": {
             "type": "object",
@@ -2909,11 +3211,36 @@
           "foreign_holders": {
             "type": "object",
             "additionalProperties": {
-              "type": "integer"
+              "oneOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "device",
+                    "holder_unknown"
+                  ],
+                  "properties": {
+                    "device": {
+                      "type": "string"
+                    },
+                    "holder_unknown": {
+                      "const": true
+                    },
+                    "pids": {
+                      "type": "array",
+                      "items": {
+                        "type": "integer"
+                      }
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              ]
             },
-            "x-unit": "pid",
-            "x-updated-by": "on-demand 掃 /proc（health.status 呼叫時）；包含 daemon 自身 pid（RPC-D-10／PLT-O-04）",
-            "x-note": "key 為 tty real_path，value 為持有者 pid"
+            "x-updated-by": "on-demand 掃 /proc（health.status 呼叫時）；一般值包含 daemon 自身 pid（RPC-D-10／PLT-O-04），掃描不完整時以 holder_unknown 物件回報",
+            "x-note": "key 為 tty real_path；一般 value 為持有者 pid，掃描不完整時 value 為 {device, holder_unknown, pids?}"
           },
           "multi_open_detail": {
             "type": "object",
@@ -2962,6 +3289,40 @@
               "holders_status"
             ],
             "x-updated-by": "請求當下 on-demand 掃 /proc（multi_open.py）；不常駐"
+          },
+          "test_device_allowlist": {
+            "type": "object",
+            "x-order": [
+              "enabled",
+              "coms",
+              "source"
+            ],
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "const": true
+              },
+              "coms": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "source": {
+                "type": "string",
+                "enum": [
+                  "env",
+                  "config"
+                ]
+              }
+            },
+            "required": [
+              "enabled",
+              "coms",
+              "source"
+            ],
+            "additionalProperties": false,
+            "x-note": "僅 allowlist 生效時出現（SC-19，OD-11）且位於 multi_open_detail 之後；env（SERIALWRAP_TEST_DEVICE_ALLOWLIST）優先於 config（windows.test_device_allowlist）；被拒時 daemon 不啟動（TEST_DEVICE_ALLOWLIST_REJECTED，exit 2）"
           }
         },
         "required": [
@@ -3840,13 +4201,15 @@
         "INVALID_ARGS",
         "SESSION_NOT_FOUND",
         "FLASHING_BUSY",
-        "DEVICE_ALREADY_BOUND"
+        "DEVICE_ALREADY_BOUND",
+        "SESSION_RECOVERING"
       ],
       "error_order": [
         "INVALID_ARGS",
         "SESSION_NOT_FOUND",
         "FLASHING_BUSY",
-        "DEVICE_ALREADY_BOUND"
+        "DEVICE_ALREADY_BOUND",
+        "SESSION_RECOVERING"
       ],
       "side_effects": [
         {
@@ -3856,11 +4219,52 @@
         }
       ],
       "retryable_readonly": false,
-      "blocking": false,
-      "long_timeout": false,
+      "blocking": true,
+      "long_timeout": true,
       "selector_chain": "selector>session_id>com>alias",
       "status": "EXISTING",
-      "source": "sw_core/service.py:794-799 → bind_session sw_core/session_manager.py:2034"
+      "source": "sw_core/service.py:794-799 → bind_session sw_core/session_manager.py:2034",
+      "x-error-results": {
+        "SESSION_RECOVERING": {
+          "type": "object",
+          "x-order": [
+            "ok",
+            "error_code",
+            "drain_stalled",
+            "drain_timeout_epoch",
+            "session"
+          ],
+          "properties": {
+            "ok": {
+              "type": "boolean",
+              "const": false
+            },
+            "error_code": {
+              "type": "string",
+              "const": "SESSION_RECOVERING"
+            },
+            "drain_stalled": {
+              "type": "boolean"
+            },
+            "drain_timeout_epoch": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "session": {
+              "$ref": "#/$defs/SessionPublic"
+            }
+          },
+          "required": [
+            "ok",
+            "error_code",
+            "drain_stalled",
+            "drain_timeout_epoch",
+            "session"
+          ]
+        }
+      }
     },
     "session.clear": {
       "params": {
@@ -3913,12 +4317,14 @@
       "errors": [
         "INVALID_ARGS",
         "SESSION_NOT_FOUND",
-        "FLASHING_BUSY"
+        "FLASHING_BUSY",
+        "SESSION_RECOVERING"
       ],
       "error_order": [
         "INVALID_ARGS",
         "SESSION_NOT_FOUND",
-        "FLASHING_BUSY"
+        "FLASHING_BUSY",
+        "SESSION_RECOVERING"
       ],
       "side_effects": [
         {
@@ -3933,11 +4339,52 @@
         }
       ],
       "retryable_readonly": false,
-      "blocking": false,
-      "long_timeout": false,
+      "blocking": true,
+      "long_timeout": true,
       "selector_chain": "selector>session_id>com>alias",
       "status": "EXISTING",
-      "source": "sw_core/service.py:782-792 → clear_session sw_core/session_manager.py:1829"
+      "source": "sw_core/service.py:782-792 → clear_session sw_core/session_manager.py:1829",
+      "x-error-results": {
+        "SESSION_RECOVERING": {
+          "type": "object",
+          "x-order": [
+            "ok",
+            "error_code",
+            "drain_stalled",
+            "drain_timeout_epoch",
+            "session"
+          ],
+          "properties": {
+            "ok": {
+              "type": "boolean",
+              "const": false
+            },
+            "error_code": {
+              "type": "string",
+              "const": "SESSION_RECOVERING"
+            },
+            "drain_stalled": {
+              "type": "boolean"
+            },
+            "drain_timeout_epoch": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "session": {
+              "$ref": "#/$defs/SessionPublic"
+            }
+          },
+          "required": [
+            "ok",
+            "error_code",
+            "drain_stalled",
+            "drain_timeout_epoch",
+            "session"
+          ]
+        }
+      }
     },
     "session.console_attach": {
       "params": {
@@ -4039,17 +4486,24 @@
       },
       "errors": [
         "INVALID_ARGS",
-        "SESSION_NOT_READY"
+        "SESSION_NOT_READY",
+        "SESSION_INTERACTIVE_BUSY"
       ],
       "error_order": [
         "INVALID_ARGS",
-        "SESSION_NOT_READY"
+        "SESSION_NOT_READY",
+        "SESSION_INTERACTIVE_BUSY"
       ],
       "side_effects": [
         {
           "what": "新增 console client；本次新開 human lease（owner human:<client_id>，timeout max(hard_timeout_s, 86400)）",
           "when": "on_success",
           "idempotent": false
+        },
+        {
+          "what": "SC-13 到期收尾尚在還原 ownership 時回 SESSION_INTERACTIVE_BUSY，不新增 console client 或 human lease",
+          "when": "on_failure",
+          "idempotent": true
         }
       ],
       "retryable_readonly": false,
@@ -4294,17 +4748,24 @@
       },
       "errors": [
         "INVALID_ARGS",
-        "INTERACTIVE_NOT_FOUND"
+        "INTERACTIVE_NOT_FOUND",
+        "INTERACTIVE_EXPIRED"
       ],
       "error_order": [
         "INVALID_ARGS",
-        "INTERACTIVE_NOT_FOUND"
+        "INTERACTIVE_NOT_FOUND",
+        "INTERACTIVE_EXPIRED"
       ],
       "side_effects": [
         {
-          "what": "關閉 lease、還原 stashed human lease、resume interactive；session 不在時直接移除",
+          "what": "active lease 關閉、可能還原 stashed human lease 並 resume interactive；session 不在時移除 lease",
           "when": "on_success",
           "idempotent": false
+        },
+        {
+          "what": "expired tombstone 回 INTERACTIVE_EXPIRED 並保留，不移除 tombstone",
+          "when": "on_failure",
+          "idempotent": true
         }
       ],
       "retryable_readonly": false,
@@ -4405,12 +4866,16 @@
       },
       "errors": [
         "INVALID_ARGS",
+        "SESSION_RECOVERING",
+        "FLASHING_BUSY",
         "SESSION_NOT_READY",
         "SESSION_BUSY",
         "SESSION_INTERACTIVE_BUSY"
       ],
       "error_order": [
         "INVALID_ARGS",
+        "SESSION_RECOVERING",
+        "FLASHING_BUSY",
         "SESSION_NOT_READY",
         "SESSION_BUSY",
         "SESSION_INTERACTIVE_BUSY"
@@ -4425,6 +4890,11 @@
           "what": "command 非空時 bridge.send_command(command, source=owner)，TX 非冪等",
           "when": "on_success",
           "idempotent": false
+        },
+        {
+          "what": "SC-13 到期收尾尚在還原 ownership 時回 SESSION_INTERACTIVE_BUSY，不建立新 lease",
+          "when": "on_failure",
+          "idempotent": true
         }
       ],
       "retryable_readonly": false,
@@ -4434,7 +4904,7 @@
       "status": "EXISTING",
       "source": "sw_core/service.py:840-848 → interactive_open sw_core/session_manager.py:4009",
       "x-notes": {
-        "flashing_check": "未檢查 FLASHING（FLASHING 狀態走其他狀態 → SESSION_NOT_READY）；不列為副作用",
+        "flashing_check": "明確檢查 FLASHING 並回 FLASHING_BUSY；此拒絕不列為副作用",
         "coercion_exception_precedes_validation": "轉型例外（EXCEPTION）先於 INVALID_ARGS 驗證（02 §5.2）；errors／error_order 無法表示此先後，故註記於此"
       }
     },
@@ -4515,7 +4985,7 @@
           "idempotent": false
         },
         {
-          "what": "lease 已逾時：標記 status=expired 並關閉 lease（_close_interactive_locked）",
+          "what": "lease 已逾時或已由 1 s tick 收回：保留每個 session 最多 16 個 tombstone；可能還原 human lease、resume 並 flush deferred bytes",
           "when": "on_failure",
           "idempotent": false
         }
@@ -4605,7 +5075,7 @@
           "idempotent": false
         },
         {
-          "what": "lease 已逾時：標記 status=expired 並關閉 lease（_close_interactive_locked）",
+          "what": "active lease 已逾時：關閉並保留 tombstone；session/bridge 不存在時依錯誤順序先回 SESSION_NOT_READY；1 s tick 也可提前收回並 resume/flush deferred bytes",
           "when": "on_failure",
           "idempotent": false
         }
@@ -5513,12 +5983,53 @@
               "partial",
               "recovery_action"
             ]
+          },
+          {
+            "type": "object",
+            "x-branch": "SESSION_RECOVERING",
+            "x-order": [
+              "ok",
+              "error_code",
+              "drain_stalled",
+              "drain_timeout_epoch",
+              "session"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean",
+                "const": false
+              },
+              "error_code": {
+                "type": "string",
+                "const": "SESSION_RECOVERING"
+              },
+              "drain_stalled": {
+                "type": "boolean"
+              },
+              "drain_timeout_epoch": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "session": {
+                "$ref": "#/$defs/SessionPublic"
+              }
+            },
+            "required": [
+              "ok",
+              "error_code",
+              "drain_stalled",
+              "drain_timeout_epoch",
+              "session"
+            ]
           }
         ]
       },
       "errors": [
         "INVALID_ARGS",
         "SESSION_NOT_FOUND",
+        "SESSION_RECOVERING",
         "FLASHING_BUSY",
         "SESSION_NOT_READY",
         "STATE_CHANGED",
@@ -5531,6 +6042,7 @@
       "error_order": [
         "INVALID_ARGS",
         "SESSION_NOT_FOUND",
+        "SESSION_RECOVERING",
         "FLASHING_BUSY",
         "SESSION_NOT_READY",
         "STATE_CHANGED",
@@ -5573,6 +6085,47 @@
       "source": "sw_core/service.py:774-780 → recover_session sw_core/session_manager.py:4582",
       "x-notes": {
         "coercion_exception_precedes_validation": "轉型例外（EXCEPTION）先於 INVALID_ARGS 驗證（02 §5.2）；errors／error_order 無法表示此先後，故註記於此"
+      },
+      "x-error-results": {
+        "SESSION_RECOVERING": {
+          "type": "object",
+          "x-order": [
+            "ok",
+            "error_code",
+            "drain_stalled",
+            "drain_timeout_epoch",
+            "session"
+          ],
+          "properties": {
+            "ok": {
+              "type": "boolean",
+              "const": false
+            },
+            "error_code": {
+              "type": "string",
+              "const": "SESSION_RECOVERING"
+            },
+            "drain_stalled": {
+              "type": "boolean"
+            },
+            "drain_timeout_epoch": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "session": {
+              "$ref": "#/$defs/SessionPublic"
+            }
+          },
+          "required": [
+            "ok",
+            "error_code",
+            "drain_stalled",
+            "drain_timeout_epoch",
+            "session"
+          ]
+        }
       }
     },
     "session.self_test": {
@@ -7138,8 +7691,8 @@
           },
           "rotated_suffix": {
             "type": "string",
-            "pattern": "^[0-9]{8}-[0-9]{6}$",
-            "x-note": "UTC YYYYmmdd-HHMMSS"
+            "pattern": "^[0-9]{8}-[0-9]{6}(\\.[1-9][0-9]{0,2})?$",
+            "x-note": "UTC YYYYmmdd-HHMMSS；碰撞時可加 .1 至 .999"
           }
         },
         "required": [
@@ -7152,7 +7705,7 @@
       "error_order": [],
       "side_effects": [
         {
-          "what": "持 WAL 鎖；非空的 raw.wal.ndjson／raw.mirror.log rename 成 .<ts>（同秒重名覆蓋，H-19）、fsync 目錄、seq 歸 0",
+          "what": "持 WAL 鎖；非空的 raw.wal.ndjson／raw.mirror.log rename 成 .<ts>（同名加 .1 至 .999，不覆蓋既有歸檔）、fsync 目錄、seq 歸 0",
           "when": "on_success",
           "idempotent": false
         }
@@ -7165,117 +7718,5 @@
       "source": "sw_core/service.py:1045-1046 → wal.py:242-253"
     }
   },
-  "x-pending": [
-    {
-      "id": "SC-04",
-      "change": "SC-04",
-      "adds": {
-        "SessionPublic": [
-          "drain_stalled",
-          "drain_timeout_epoch"
-        ]
-      },
-      "position": "after capture, before console_endpoint"
-    },
-    {
-      "id": "BC-04",
-      "change": "BC-04",
-      "adds": {
-        "DEVICE_STILL_HELD": [
-          "holder_unknown"
-        ]
-      }
-    },
-    {
-      "id": "SC-19",
-      "change": "SC-19",
-      "adds": {
-        "health.status": [
-          "test_device_allowlist"
-        ]
-      },
-      "shape": {
-        "test_device_allowlist": {
-          "type": "object",
-          "properties": {
-            "enabled": {
-              "const": true
-            },
-            "coms": {
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
-            }
-          },
-          "required": [
-            "enabled",
-            "coms"
-          ],
-          "additionalProperties": false
-        }
-      },
-      "position": "after multi_open_detail；未啟用時不輸出此鍵",
-      "env": "SERIALWRAP_TEST_DEVICE_ALLOWLIST（逗號分隔）",
-      "config": "windows.test_device_allowlist",
-      "precedence": "env > config",
-      "isolation": "SERIALWRAP_STATE_DIR、SERIALWRAP_RUN_DIR、SERIALWRAP_CONFIG_DIR 三者皆明確設定且解析後都不等於預設路徑",
-      "refusal": {
-        "stderr": "serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED: <reason>\n",
-        "exit": 2
-      }
-    },
-    {
-      "id": "SC-11-handoff",
-      "change": "SC-11",
-      "adds_method": "daemon.handoff_stop",
-      "params": {
-        "reason": {
-          "type": "string",
-          "x-coercion": "str(params.get(k) or D)",
-          "default": "update"
-        }
-      },
-      "result": {
-        "ok": {
-          "const": true
-        },
-        "stopping": {
-          "const": true
-        },
-        "handoff_token": {
-          "type": "string",
-          "pattern": "^[0-9a-f]{32}$"
-        }
-      },
-      "errors": [
-        "FLASHING_BUSY",
-        "SESSION_BUSY"
-      ],
-      "error_order": [
-        "FLASHING_BUSY",
-        "SESSION_BUSY"
-      ],
-      "busy_row": [
-        "com",
-        "state",
-        "foreground_busy",
-        "outstanding_commands",
-        "interactive_session_id",
-        "recovering",
-        "ops"
-      ],
-      "atomicity": "busy 判定、凍結所有新的有副作用操作與發 token 在 daemon 共同 admission 邊界的同一臨界區完成；busy 時不凍結、不停止；ok 時回應寫出後走 daemon.stop 同一 SC-11 停止路徑",
-      "frozen_rejection": {
-        "error_code": "FLUSHED_BY_SHUTDOWN",
-        "reason": "handoff_frozen",
-        "applies_to": "side_effects 非空且 retryable_readonly == false 的方法＋ttyMCU sync-probe（端點沉默）"
-      },
-      "version_absent": true,
-      "retryable_readonly": false,
-      "blocking": false,
-      "long_timeout": false,
-      "selector_chain": null
-    }
-  ]
+  "x-pending": []
 }

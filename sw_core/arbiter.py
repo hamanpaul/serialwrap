@@ -33,17 +33,62 @@ class _QueuedCommand:
     timeout_s: float = dataclasses.field(compare=False)
     expected_duration_s: float | None = dataclasses.field(default=None, compare=False)
     completion_regex: str | None = dataclasses.field(default=None, compare=False)
+    trusted_human: bool = dataclasses.field(default=False, compare=False)
 
 
 class CommandArbiter:
-    def __init__(self, send_cb: Callable[..., dict[str, Any]]) -> None:
+    _worker_context = threading.local()
+
+    def __init__(
+        self,
+        send_cb: Callable[..., dict[str, Any]],
+        *,
+        admission: Any | None = None,
+        on_cancel: Callable[[str], None] | None = None,
+    ) -> None:
         self._send_cb = send_cb
+        self._admission = admission
+        self._on_cancel = on_cancel
         self._lock = threading.Lock()
         self._queues: dict[str, queue.PriorityQueue[_QueuedCommand]] = {}
         self._threads: dict[str, threading.Thread] = {}
         self._stops: dict[str, threading.Event] = {}
         self._commands: dict[str, dict[str, Any]] = {}
+        self._admission_tickets: dict[str, Any] = {}
+        self._running: dict[str, str] = {}
+        self._cancel_callbacks: dict[str, Callable[[str], None]] = {}
         self._counter = 0
+
+    @classmethod
+    def register_current_cancel_callback(
+        cls, cmd_id: str, callback: Callable[[str], None]
+    ) -> bool:
+        """讓 send callback 內的 manager 為目前 worker 命令登記取消撤銷器。"""
+        arbiter = getattr(cls._worker_context, "arbiter", None)
+        active_cmd_id = getattr(cls._worker_context, "cmd_id", None)
+        if arbiter is None or active_cmd_id != cmd_id:
+            return False
+        cancel_now = False
+        with arbiter._lock:
+            rec = arbiter._commands.get(cmd_id)
+            if rec is None:
+                return False
+            if rec.get("status") == "canceled" or rec.get("done_at"):
+                cancel_now = rec.get("status") == "canceled"
+            else:
+                arbiter._cancel_callbacks[cmd_id] = callback
+        if cancel_now:
+            callback(cmd_id)
+        return True
+
+    @classmethod
+    def unregister_current_cancel_callback(cls, cmd_id: str) -> None:
+        arbiter = getattr(cls._worker_context, "arbiter", None)
+        active_cmd_id = getattr(cls._worker_context, "cmd_id", None)
+        if arbiter is None or active_cmd_id != cmd_id:
+            return
+        with arbiter._lock:
+            arbiter._cancel_callbacks.pop(cmd_id, None)
 
     def register_session(self, session_id: str) -> None:
         with self._lock:
@@ -116,11 +161,17 @@ class CommandArbiter:
         for rec in self._commands.values():
             if rec.get("session_id") != session_id:
                 continue
-            if rec.get("done_at") is not None or rec.get("status") != "accepted":
+            if rec.get("done_at") is not None:
+                self._finish_admission_locked(str(rec.get("cmd_id") or ""))
+                continue
+            if rec.get("status") != "accepted":
                 continue
             rec["status"] = "error"
             rec["error_code"] = error_code
             rec["done_at"] = now
+            ticket = self._admission_tickets.pop(str(rec.get("cmd_id") or ""), None)
+            if ticket is not None and self._admission is not None:
+                self._admission.done(ticket)
             flushed += 1
         return flushed
 
@@ -135,6 +186,9 @@ class CommandArbiter:
         priority: int = 10,
         expected_duration_s: float | None = None,
         completion_regex: str | None = None,
+        admission_com: str | None = None,
+        admission_exempt: bool = False,
+        trusted_human: bool = False,
     ) -> dict[str, Any]:
         if not valid_completion_regex(completion_regex):
             return {"ok": False, "error_code": ERROR_INVALID_COMPLETION_REGEX}
@@ -162,6 +216,12 @@ class CommandArbiter:
                 "hint": "Command must not contain embedded newline characters. "
                         "Split into multiple independent submissions.",
             }
+
+        ticket = None
+        if self._admission is not None and not admission_exempt:
+            ticket = self._admission.admit("command.submit", admission_com or session_id.rsplit(":", 1)[-1])
+            if ticket is None:
+                return {"ok": False, "error_code": "FLUSHED_BY_SHUTDOWN", "reason": "handoff_frozen"}
 
         cmd_id = uuid.uuid4().hex
         now = now_iso()
@@ -193,12 +253,16 @@ class CommandArbiter:
         with self._lock:
             pq = self._queues.get(session_id)
             if pq is None:
+                if ticket is not None and self._admission is not None:
+                    self._admission.done(ticket)
                 return {"ok": False, "error_code": "SESSION_NOT_READY", "session_id": session_id}
             pending = self._count_pending_locked(session_id)
             if pending >= CMD_PENDING_MAX:
                 # 進行中（accepted/running）命令已達 per-session 硬上限：拒絕而非排隊。eviction 只能淘汰
                 # 已完成命令，無法回收尚未執行者；少了 admission control，client 比 UART worker 快時
                 # _commands 與 PriorityQueue 會持續累積 accepted/running records 而 OOM。
+                if ticket is not None and self._admission is not None:
+                    self._admission.done(ticket)
                 return {
                     "ok": False,
                     "error_code": "SESSION_QUEUE_FULL",
@@ -211,34 +275,67 @@ class CommandArbiter:
             self._counter += 1
             counter = self._counter
             self._commands[cmd_id] = rec
+            if ticket is not None:
+                self._admission_tickets[cmd_id] = ticket
             self._evict_commands_locked()
-        pq.put(_QueuedCommand(sort_key=(priority, counter), cmd_id=cmd_id, session_id=session_id, command=command, source=source, mode=mode, timeout_s=timeout_s, expected_duration_s=expected_duration_s, completion_regex=completion_regex))
+        pq.put(
+            _QueuedCommand(
+                sort_key=(priority, counter),
+                cmd_id=cmd_id,
+                session_id=session_id,
+                command=command,
+                source=source,
+                mode=mode,
+                timeout_s=timeout_s,
+                expected_duration_s=expected_duration_s,
+                completion_regex=completion_regex,
+                trusted_human=trusted_human,
+            )
+        )
         result: dict[str, Any] = {"ok": True, "cmd_id": cmd_id, "status": "accepted", "session_id": session_id}
         if cmd_warning is not None:
             result["warning"] = cmd_warning
         return result
 
     def _count_pending_locked(self, session_id: str) -> int:
-        """該 session 進行中（accepted/running，done_at 為 None）的命令數。須在持有 ``self._lock`` 下呼叫。
+        """計算該 session 尚占用容量的命令數，包含仍在 worker 執行的 canceled 命令。
+
+        未終結命令以 ``done_at`` 為 None 判定；canceled-running 雖已有 ``done_at``，
+        仍由 ``_running`` 登記，在 worker 真正返回前持續計入。須持有 ``self._lock`` 呼叫。
 
         以掃描 _commands 計數而非維護獨立計數器：admission control 把 pending 上限封頂後 _commands
         大小有界（≤ CMD_HISTORY_MAX + pending 上限），掃描成本可控；且避免計數器在多處終結轉移
         （worker 成功/例外、cancel、unregister 殘留）漏增漏減而 drift。
         """
-        return sum(
+        pending = sum(
             1 for rec in self._commands.values()
             if rec.get("session_id") == session_id and not rec.get("done_at")
         )
+        running_cmd_id = self._running.get(session_id)
+        running_rec = self._commands.get(running_cmd_id or "")
+        if (
+            running_rec is not None
+            and running_rec.get("session_id") == session_id
+            and running_rec.get("status") == "canceled"
+        ):
+            pending += 1
+        return pending
 
     def _evict_commands_locked(self) -> None:
         """淘汰最舊的「已完成（有 done_at）」命令記錄，使數量回到上限（#81）。
 
-        進行中（done_at 為 None）的命令永不淘汰；全部進行中時暫時超量。
+        worker 尚未返回的命令永不淘汰，即使 cancel 已設定 ``done_at``；全部保留中的命令
+        使歷史暫時超量，worker 收尾後再收斂。
         須在持有 ``self._lock`` 下呼叫。
         """
         if len(self._commands) <= CMD_HISTORY_MAX:
             return
-        done = [(cid, rec) for cid, rec in self._commands.items() if rec.get("done_at")]
+        running_cmd_ids = set(self._running.values())
+        done = [
+            (cid, rec)
+            for cid, rec in self._commands.items()
+            if rec.get("done_at") and cid not in running_cmd_ids
+        ]
         done.sort(key=lambda kv: kv[1].get("done_at") or "")
         excess = len(self._commands) - CMD_HISTORY_MAX
         for cid, _rec in done[:excess]:
@@ -258,10 +355,16 @@ class CommandArbiter:
                 return {"ok": False, "error_code": "CMD_NOT_FOUND", "cmd_id": cmd_id}
             if rec["status"] in {"done", "error"}:
                 return {"ok": False, "error_code": "CMD_NOT_CANCELABLE", "cmd_id": cmd_id}
+            was_accepted = rec["status"] == "accepted"
             rec["status"] = "canceled"
             rec["done_at"] = now_iso()
+            if was_accepted:
+                self._finish_admission_locked(cmd_id)
             self._evict_commands_locked()  # 命令終結即收斂 history，不必等下一次 submit（Copilot 審查）
-            return {"ok": True, "cmd_id": cmd_id, "status": "canceled"}
+            callback = self._on_cancel or self._cancel_callbacks.get(cmd_id)
+        if callback is not None:
+            callback(cmd_id)
+        return {"ok": True, "cmd_id": cmd_id, "status": "canceled"}
 
     def _worker(self, session_id: str, pq: queue.PriorityQueue[_QueuedCommand], stop_event: threading.Event) -> None:
         while not stop_event.is_set():
@@ -277,18 +380,46 @@ class CommandArbiter:
             with self._lock:
                 rec = self._commands.get(item.cmd_id)
                 if rec is None:
+                    self._finish_admission_locked(item.cmd_id)
                     continue
                 if rec.get("status") == "canceled" or rec.get("done_at"):
                     # 已被 cancel 或已被 flush 終結（#128）的記錄：跳過，不得重設 running
                     # 或執行 send_cb（防 flush 與取件之間的 race 把終端態覆寫回進行中）。
+                    self._finish_admission_locked(item.cmd_id)
                     continue
                 rec["status"] = "running"
                 rec["started_at"] = now_iso()
+                self._running[session_id] = item.cmd_id
 
             try:
                 args = (session_id, item.command, item.source, item.cmd_id, item.timeout_s, item.mode, item.expected_duration_s)
-                # 未指定時保留既有 callback 七參數契約；新欄位以可選 keyword 傳遞。
-                result = self._send_cb(*args, completion_regex=item.completion_regex) if item.completion_regex is not None else self._send_cb(*args)
+                # 未指定時保留既有 callback 七參數契約；選用欄位僅在需要時傳遞。
+                options: dict[str, Any] = {}
+                if item.completion_regex is not None:
+                    options["completion_regex"] = item.completion_regex
+                if item.trusted_human:
+                    options["trusted_human"] = True
+                previous_arbiter = getattr(self._worker_context, "arbiter", None)
+                previous_cmd_id = getattr(self._worker_context, "cmd_id", None)
+                self._worker_context.arbiter = self
+                self._worker_context.cmd_id = item.cmd_id
+                try:
+                    result = self._send_cb(*args, **options)
+                finally:
+                    if previous_arbiter is None:
+                        try:
+                            del self._worker_context.arbiter
+                        except AttributeError:
+                            pass
+                    else:
+                        self._worker_context.arbiter = previous_arbiter
+                    if previous_cmd_id is None:
+                        try:
+                            del self._worker_context.cmd_id
+                        except AttributeError:
+                            pass
+                    else:
+                        self._worker_context.cmd_id = previous_cmd_id
             except Exception:
                 with self._lock:
                     rec = self._commands.get(item.cmd_id)
@@ -296,7 +427,10 @@ class CommandArbiter:
                         rec["status"] = "error"
                         rec["error_code"] = "SEND_FAILED"
                         rec["done_at"] = now_iso()
-                        self._evict_commands_locked()  # 終結即收斂 history（Copilot 審查）
+                    if self._running.get(session_id) == item.cmd_id:
+                        self._running.pop(session_id, None)
+                    self._evict_commands_locked()  # worker 收尾後才能淘汰 canceled-running 記錄
+                    self._finish_admission_locked(item.cmd_id)
                 continue
 
             with self._lock:
@@ -323,7 +457,15 @@ class CommandArbiter:
                     else:
                         rec["status"] = "done"
                     rec["done_at"] = now_iso()
-                    self._evict_commands_locked()  # 終結即收斂 history，尖峰後不再長期超量（Copilot 審查）
+                if self._running.get(session_id) == item.cmd_id:
+                    self._running.pop(session_id, None)
+                self._evict_commands_locked()  # worker 收尾後才收斂 history
+                self._finish_admission_locked(item.cmd_id)
+
+    def _finish_admission_locked(self, cmd_id: str) -> None:
+        ticket = self._admission_tickets.pop(cmd_id, None)
+        if ticket is not None and self._admission is not None:
+            self._admission.done(ticket)
 
     def snapshot(self) -> list[dict[str, Any]]:
         with self._lock:

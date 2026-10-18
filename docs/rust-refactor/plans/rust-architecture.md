@@ -159,6 +159,9 @@ sw-pal ────────┘ ←  sw-cli（只依賴 sw-proto + sw-pal；�
 | `DEFAULT_TCP_PORT` | `48700`（env `SERIALWRAP_TCP_PORT` 以 Python `int()` 規則解析；空字串或非整數：CLI 與 daemon 皆 exit 1，stderr 一行 `serialwrap: invalid SERIALWRAP_TCP_PORT: ...`，見 `GAP-X1`） | constants.py:47 |
 | `LOOPBACK_TCP_HOSTS` | `["127.0.0.1","localhost","::1"]` | :49 |
 | `DEFAULT_WAL_ROTATE_BYTES` | `67108864`（條件 `size >= R`，寫入前檢查；WAL 與 mirror 各自判斷） | :65 |
+| `WAL_IDENTITY_CHECK_INTERVAL_S` | `0.05`（外部 unlink／替換身分檢查節流，§8.2） | BC-01 |
+| `WAL_RECREATE_BACKOFF_S` | `[0.01,0.05,0.2]`（外部 unlink 後重開檔案的有界退避，§8.2） | BC-01 |
+| `WAL_RECREATE_RETRY_INTERVALS_S` | `[1.0,2.0,5.0]`（重建失敗後再次嘗試的間隔，最高 5.0 秒） | BC-01 |
 | `EVENTS_LOG_ROTATE_BYTES`／`EVENTS_LOG_BACKUP_COUNT` | `10485760`／`3` | event_log.py |
 | `RX_RATE_WINDOW_S`／`RX_FLOOD_BYTES_PER_10S` | `10.0`／`20000` | :91,93 |
 | `TRANSPORT_STALL_MIN_RX_AGE_S` | `30.0` | :102 |
@@ -191,7 +194,7 @@ sw-pal ────────┘ ←  sw-cli（只依賴 sw-proto + sw-pal；�
 | 裝置 | watcher poll `1.0`；Windows BT TTL `5.0`；`max_sessions` 預設 `16` | device_*.py、config.py |
 | self-test／recover | probe timeout 預設 `2.0`；force recover `10×1.0s`；CTRL_C／CTRL_D 各等 `min(timeout_s,2.0)` | session_manager.py |
 | human console | `timeout_s=30.0`、`priority=100`、`source="human:<client_id>"`、`HUMAN_INTERACTIVE_COMMANDS`（18 個，02 §9） | service.py |
-| Drain（新） | `DRAIN_TIMEOUT_MS=3000`（§5.2.5） | 規格 |
+| Drain（新） | `DRAIN_TIMEOUT_MS=3000`（§5.2.5） | constants.py |
 
 `runtime_paths.rs`：`RuntimePaths::resolve(env: &EnvSnapshot, native: NativeTraits, home: &dyn HomeLookup) -> Result<RuntimePaths, PathsError>`（**P3 修訂（§0.7）**：路徑欄位為 `String`，golden 直接比對字串；`default_tcp_port` 為 `PyInt`，Q-15 非法 port 必須回錯，不得截斷）。逐字重現 constants.py 的 import-time 規則，包含：
 
@@ -336,12 +339,16 @@ macro_rules! pydict { ($($k:expr => $v:expr),* $(,)?) => { ... } }  // 回應依
   ```json
   {"event":"WAL_RECREATED_AFTER_EXTERNAL_UNLINK",
    "reason":"external_unlink"|"replaced"|"dir_missing",
-   "previous_identity":str|null,
+   "previous_identity":"<dev>:<ino>"|null,
    "potentially_lost_seq_range":[first,last]|null,
    "range_known":bool}
   ```
 
-  外層紀錄：`dir:"META"`、`source:"system"`、`loss_flag:true`。
+  `previous_identity` 是十進位整數組成的 `<dev>:<ino>`；Windows 為 `<VolumeSerialNumber>:<FileId128>`。
+
+  外層紀錄：`dir:"META"`、`source:"system"`、`com:"WAL"`、`loss_flag:true`。
+
+- BC-03 的 `tx_outcome_unknown` META 事件與欄位定義以 `contracts/wal_meta_events.schema.json` 為準。
 
 ---
 
@@ -467,7 +474,8 @@ pub trait SerialReader: Send {
     /// 被喚醒時 Windows 先 CancelIoEx(h,&ov) 再 GetOverlappedResult(bWait=TRUE)，已完成的 bytes 照實回報，不丟棄。
     fn read(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> PalResult<ReadOutcome>;
 }
-pub enum TxOutcome { NotSubmitted, Completed(usize), Unknown }
+pub enum TxOutcome { NotSubmitted, Completed(usize), Unknown { confirmed: usize } }
+// Unknown.confirmed 是結果不明前 OS 已確認的前綴；未知尾段長度為 requested - confirmed。
 pub struct TxResult { pub outcome: TxOutcome, pub error: Option<PalError> } // Completed(n<len)+error 表示部分完成後失敗
 /// OS 提交的序列化點（規格 §5.2.2，R0-F1）。PAL 每次要把 bytes 交給 OS 前都必須經過 gate：
 /// POSIX 一次非阻塞 `write(2)`（fd 為 O_NONBLOCK，立即返回 n 或 EAGAIN）；Windows 一次 overlapped `WriteFile` 發出（立即返回
@@ -554,7 +562,8 @@ pub trait WalFs: Send + Sync {
     fn open_append(&self, path: &Path) -> PalResult<Box<dyn WalFile>>;
     fn path_identity(&self, path: &Path) -> PalResult<Option<FileIdentity>>;  // None = 不存在
     fn size(&self, path: &Path) -> PalResult<Option<u64>>;
-    fn rename_noreplace_or_suffix(&self, from: &Path, base_to: &Path) -> PalResult<PathBuf>; // DF-03：同名時加 .1 .2 …
+    fn tail_needs_termination(&self, path: &Path) -> PalResult<bool>;
+    fn rename_noreplace_or_suffix(&self, from: &Path, base_to: &Path) -> PalResult<PathBuf>; // DF-03：優先原子 no-replace；不支援時降級；同名加 .1 .2 …
     fn sync_dir(&self, dir: &Path) -> PalResult<()>;
     fn ensure_dir(&self, dir: &Path) -> PalResult<()>;
     fn dir_writable(&self, dir: &Path) -> bool;                               // os.access(W_OK|X_OK) 等價
@@ -742,7 +751,7 @@ pub trait SignalWait: Send + Sync {
 | lane | 容量 | 內容 | 滿載策略 |
 |---|---|---|---|
 | `control` | 256 | RPC 請求、`DeviceAttached/Detached`、`DeviceRelease/Attach`、`SessionRecover*`、`CmdSubmit/Cancel`、`Interactive*`、`Console*`、`WorkerStoppedReceipt`、`WorkerDrainTimeout`、`UartIoError`、`UartTxCompleted`、timer、`Flash*`、`LogCaptureControl`、`FileTransfer`、`TransportStallDetected` | 送端最多等 `rpc_timeout`；逾時的 RPC 請求回 `TIMEOUT` 由 client 處理（daemon 不新增碼）。內部事件送端（worker、timer）一律阻塞等待，不得丟棄 |
-| `data` | 1024 個 chunk（每個 ≤8192 B） | `UartRxChunk{epoch, wal_seq, bytes}`、`ConsoleInputBytes{client_lifetime, owner_gen_at_capture, bytes}` | Reader 阻塞等待（背壓傳到 OS buffer）。WAL 在進 lane **之前**就已落盤，背壓不會丟失 RX 證據 |
+| `data` | 1024 個 chunk（每個 ≤8192 B） | `UartRxChunk{epoch, wal_seq, bytes}`、`ConsoleInputBytes{client_lifetime, deferred_epoch_at_capture, bytes}` | Reader 阻塞等待（背壓傳到 OS buffer）。WAL 在進 lane **之前**就已落盤，背壓不會丟失 RX 證據 |
 
 - 優先序：`select_biased!` 先取 control。但只要 control 內含有依 RX 順序判定的事件，就必須先把同一 `epoch` 中、序號在它之前的 data 處理完。實作方式：每個 RX chunk 帶 `rx_seq`；控制事件若依賴 RX，帶 `after_rx_seq`，actor 處理到該序號前把它暫存。這保證規格 §5.3「不得先處理後段 prompt」。
 - 有界處理延遲的目標值（規格 §5.3 要求在 Slice 2.1 前凍結，量測方法由 P5 計畫定義）：control 事件從進 lane 到處理完成 p99 ≤ 20 ms；RX flood（20000 B/10s 的 10 倍）期間仍 ≤ 50 ms。
@@ -753,7 +762,8 @@ pub trait SignalWait: Send + Sync {
 |---|---|---|
 | `conn_epoch: u64` | `SerialBackend::open_exclusive` 成功、建立 IoWorker 的那一刻（全域單調）。對外的 `bridge_generation` 另依 Python 規則維護（attach 成功才 +1） | 舊 worker 的 completion、receipt、RX；TxPermit |
 | `fsm_gen: u64` | (a) boot banner arm quiet；(b) 啟動一次 login／probe／ready-reconfirm run；(c) quiet 被清除 | login step timer、quiet timer、`ReadyProbeVerified` |
-| `owner_gen: u64` | owner 變更：lease 開或關、human raw 授予或撤銷、suspend depth 0→1 或 1→0、soft preempt、self-heal grant | DeferredBuffer 回放、console 輸入、lease 到期 |
+| `owner_gen: u64` | owner 變更：lease 開或關、human raw 授予或撤銷、suspend depth 0→1 或 1→0、soft preempt、self-heal grant | TxPermit 的 owner 權限與 lease 到期事件 |
+| `deferred_epoch: u64` | BC-02 上下文失效：drain、boot quiet、reboot、recovery、release 或 FlashSyncMatched | DeferredBuffer 回放與 `ConsoleInputBytes` mailbox 輸入 |
 
 - 事件攜帶建立時的世代；actor 比對不符就丟棄狀態轉移，但 I/O 證據仍保存（§5.6）。
 - 對外的 `drain_timeout_epoch` 取值為 `bridge_generation`，以便與 Python 對照（`SC-04`）。
@@ -775,9 +785,9 @@ pub struct Fence(Mutex<FenceState>);
 
 1. **Admission**：RPC handler 送 `CmdSubmit` 給 actor，`SessionCore` 依 §5.3 表與 SC-01／02／03 檢查狀態、gate、容量（`SC-06`），再加 `_resolve_session_id` 的 Python 順序。
 2. **出列**：actor 把命令交給 OpRunner 前重驗 epoch、owner、quiet／reconfirm、release／recovery、cancel。
-3. **OS 提交時（授權與提交同一臨界區，R0-F1）**：TxWriter 出列時先以 `Fence::admit` 做一次快速拒絕（被拒者不呼叫 PAL；通過**不算**授權）。真正的授權發生在 PAL 每次 OS 提交的 `SubmitGate::submit`（§4.2）內：`FenceSubmitGate { fence, permit }` 取 `Fence` 鎖 → 重跑 `Fence::admit`（`permit.epoch == active_epoch`、`!frozen`、class 對應的 gate 規則、世代規則（`owner_gen`／`fsm_gen`／`input_epoch`）、`op_id ∉ cancelled`）→ 通過才在**仍持鎖**時呼叫非阻塞的 `os_submit`（POSIX 一次 `write(2)`；Windows 發出 overlapped `WriteFile`）→ 提交有交出 bytes（`Accepted(n>0)`／`Pending`）時於同一臨界區設 `in_flight = Some(op_id, len)` → 放鎖。完成等待（POLLOUT、`GetOverlappedResult`）一律在鎖外。POSIX 部分寫入後的下一段再經 gate 重驗；撤銷後的尾段不交 OS（結果 `Completed(k)`＋`cancelled`，k=0 時 `NotSubmitted`，原因寫入 `TxReport.reject`）。寫入結束後取鎖清 `in_flight`，並把 `TxResult` 交給 WalWriter（只記錄確認的 bytes，`SC-07`），最後送出 `UartTxCompleted`。**禁止**「鎖內驗證、放鎖、再呼叫 OS write」的寫法：兩者之間的 Quiet／換手／drain 會讓失效世代的 bytes 被寫出（規格 §5.2.2「讀一次旗標，過一段時間再 write」）。
+3. **OS 提交時（授權與提交同一臨界區，R0-F1）**：TxWriter 出列時先以 `Fence::admit` 做一次快速拒絕（被拒者不呼叫 PAL；通過**不算**授權）。真正的授權發生在 PAL 每次 OS 提交的 `SubmitGate::submit`（§4.2）內：`FenceSubmitGate { fence, permit }` 取 `Fence` 鎖 → 重跑 `Fence::admit`（`permit.epoch == active_epoch`、`!frozen`、class 對應的 gate 規則、世代規則（`owner_gen`／`fsm_gen`／`deferred_epoch`）、`op_id ∉ cancelled`）→ 通過才在**仍持鎖**時呼叫非阻塞的 `os_submit`（POSIX 一次 `write(2)`；Windows 發出 overlapped `WriteFile`）→ 提交有交出 bytes（`Accepted(n>0)`／`Pending`）時於同一臨界區設 `in_flight = Some(op_id, len)` → 放鎖。完成等待（POLLOUT、`GetOverlappedResult`）一律在鎖外。POSIX 部分寫入後的下一段再經 gate 重驗；撤銷後的尾段不交 OS（結果 `Completed(k)`＋`cancelled`，k=0 時 `NotSubmitted`，原因寫入 `TxReport.reject`）。寫入結束後取鎖清 `in_flight`，並把 `TxResult` 交給 WalWriter（只記錄確認的 bytes，`SC-07`），最後送出 `UartTxCompleted`。**禁止**「鎖內驗證、放鎖、再呼叫 OS write」的寫法：兩者之間的 Quiet／換手／drain 會讓失效世代的 bytes 被寫出（規格 §5.2.2「讀一次旗標，過一段時間再 write」）。
 
-   actor 的任何失效操作（drain、release、quiet arm、lease close／expiry、soft preempt、flash freeze、`input_epoch++`）都在**同一把鎖**內修改 `FenceState`，因此與 OS 提交互斥，形成可測試的線性化邊界：
+   actor 的任何失效操作（drain、release、quiet arm、lease close／expiry、soft preempt、flash freeze、`deferred_epoch++`）都在**同一把鎖**內修改 `FenceState`，因此與 OS 提交互斥，形成可測試的線性化邊界：
    - 失效先取得鎖 → 之後每一次 `gate.submit` 都看到新狀態，尚未提交的 bytes 一律不交 OS（zero-TX 只對這類操作斷言，規格 §5.2.2 末段）。
    - 提交先取得鎖 → 失效呼叫阻塞到該次**非阻塞**提交返回（微秒級；不等完成），該段 bytes 已交 OS，記為在途（`in_flight`）並照實記錄，不宣稱可撤回。
    - 鎖不跨完成等待：寫入卡在完成等待（D-state、RTS/CTS 卡住）時，失效操作不被阻塞，Phase 1 仍可立即進行並以 `CancelToken` 收斂（§5.5）。
@@ -794,6 +804,10 @@ TxClass 與 gate 規則（規格 §5.2.1）：
 | `FlashProbe` | 只在對應的 `Probe(probe_id)` 時放行 |
 | 其他所有 class | `flash_mode != Off` |
 
+Python 基線的 gate 順序也須保留：`UARTBridge.send_bytes` 先套用 flash gate；flash 模式不允許該來源時靜默丟棄，之後才檢查 WAL unhealthy 並拒絕自動 TX。這保留 RPC-H-07 的 flash probe timeout 語意。
+
+Python Stage 0 對應：`UARTBridge._submit_guard` 持 `_tx_fence_lock`，在每次 POSIX `os.write`／每段不超過 64 bytes 的 pyserial write 前重驗 `TxPermit`；manager 推送 quiet／lease／probe gate，arbiter cancel 撤銷命令 permit。
+
 TxWriter 的 job queue 容量 64；滿時 OpRunner 阻塞等待（只有 OpRunner 會送 job）。
 
 ### 5.5 Two-Phase Drain Barrier（`drain.rs`）
@@ -807,7 +821,7 @@ TxWriter 的 job queue 容量 64；滿時 OpRunner 阻塞等待（只有 OpRunne
 2. state 設為 `RECOVERING`（release 也一樣）。Python 現況是 DETACHED→ATTACHING；改為 RECOVERING 屬 `SC-04`。
 3. 尚未提交的 TX job 標 `NotSubmitted`。
 4. arbiter 中 `accepted` 的命令 → `FLUSHED_BY_RECOVERY`（shutdown 用 `FLUSHED_BY_SHUTDOWN`）。
-5. DeferredBuffer 整段清空，`owner_gen++`（BC-02）。
+5. DeferredBuffer 整段清空，`deferred_epoch++`（BC-02）。
 6. 依 Python `_detach_session_locked` 契約關閉 lease 與 capture。
 7. 對 reader 呼叫 `IoWaker::wake()`，對 writer 呼叫 `CancelToken::cancel()`。
 8. 排定 `WorkerDrainTimeout{epoch, stop_id}`，3000 ms 後觸發。期限以 actor 處理該停止請求的 `now` 起算；Phase 1 取 Fence 鎖最多只等一次非阻塞提交（§5.4 第 3 點：POSIX 一次 `write(2)`、Windows 一次 overlapped `WriteFile` 發出），不等完成，所以不會把完成等待算到期限之外。Python 參考實作的 Windows `_PySerialPort` 會在鎖內阻塞寫入，對應的有上限取鎖與共同期限見 P1 T07／T20（R3-F3）。
@@ -857,7 +871,7 @@ TxWriter 的 job queue 容量 64；滿時 OpRunner 阻塞等待（只有 OpRunne
   - 結算時該 op 的 WAL 證據缺口移入有界的未解決集合（256，溢位合併最舊者為 `{gaps, bytes, first_op, last_op}` 計數）；單一 op 的缺口上限 16，溢位同樣合併。
   - 未結算 op 達 256：**不淘汰任何在途項目**；新 op 的 job 不交 OS（`NotSubmitted`＋`Frozen`、不建項目），並以 `UartIoError{reason:"TX_LEDGER_SATURATED"}` 走既有 IoError drain 收斂（新 epoch 帳本歸零）。
 - recovery、release、drain 中止在途命令時，命令紀錄依下列規則處置：
-  - `confirmed_bytes ≥ 1` → `status:"error"`、`error_code:"COMMAND_ABORTED_IN_FLIGHT"`（`retryable:false`）。
+  - `confirmed_bytes ≥ 1`（不論最後結果為 `Completed` 或 `Unknown`）→ `status:"error"`、`error_code:"COMMAND_ABORTED_IN_FLIGHT"`（`retryable:false`）。
   - 所有寫入都是 `NotSubmitted` 或 `Completed(0)` → `FLUSHED_BY_RECOVERY`。
   - 有 `Unknown` 且 `confirmed_bytes=0` → `SEND_FAILED`（沿用既有映射，見 `ERR-7.3-9`）。
 - 任何情況都不自動重送。
@@ -875,19 +889,20 @@ TxWriter 的 job queue 容量 64；滿時 OpRunner 阻塞等待（只有 OpRunne
      - 該檔 `dirty_tail` 為真時，本次實際寫出的資料為 `b"\n" ++ data`（先終結上一筆殘行；位元組結果與 P1「先寫 `\n` 再寫該行」相同），以下 `sent` 以合併後長度計。
      - `sent == 0`（含開檔失敗）：關閉該 handle、`ensure_dir`、重開，**整段**重寫一次。
      - `0 < sent < len`：**不得重寫整段**；在同一 handle 上只補寫 `data[sent..]` 一次（O_APPEND／FILE_APPEND_DATA＋唯一 writer 持鎖，補寫緊接前綴）。
-     - 重試（整段重寫或補寫）仍失敗：若最終已確認長度落在殘行內（大於終結 `\n` 的長度且小於總長），設 `dirty_tail=true`，下一次對該檔寫入前先終結殘行，殘行成為一筆讀取端判為無效、被略過的獨立行；否則 `dirty_tail=false`。本筆視為該檔寫入失敗。
+     - 重試（整段重寫或補寫）仍失敗：若最終已確認長度落在新紀錄殘行內（大於終結 `\n` 的長度且小於總長），設 `dirty_tail=true`；若原 `dirty_tail` 為真且合併寫入的最終確認長度為 0，舊殘行仍未終結，也設 `dirty_tail=true`。兩種情況都須在下一次對該檔寫入前先終結殘行，使其成為讀取端判為無效、被略過的獨立行；其餘情況（例如只確認寫出終結 `\n`）設 `dirty_tail=false`。本筆視為該檔寫入失敗。
      - 全部寫出（含補寫成功）→ 清 `dirty_tail`、本筆該檔成功；`write_all_flush` 已回 `Ok` 後的任何後續錯誤都不得觸發重寫。
   6. 失敗時設 `loss_flag`、遞增 `write_failures`、記錄 `last_write_error`；WAL 的「首次嘗試＋重試」皆失敗（含部分寫入後補寫失敗）即本筆寫入失敗：`write_failures` 只 +1（每筆每檔最多計一次，與 P1 T02 相同），`unhealthy_reason="write_failed"`，下一筆完整寫出才恢復。
-- **unlink 偵測**：每次 append 時，若距上次檢查 ≥ 50 ms，比對 `path_identity(wal_path) != wal.identity()` 或 `wal.unlinked()`。命中則：
-  1. 標記失效。
-  2. 保存舊 identity 與 seq 範圍 `[file_first_seq, seq]`。
-  3. 關閉自身 handle。
-  4. 有界重試重開，最多 3 次，間隔 10／50／200 ms。
-  5. 成功後先寫 META `WAL_RECREATED_AFTER_EXTERNAL_UNLINK`（§3.8），再寫原紀錄。
-  6. 重開失敗時 `health.healthy=false`，fence 設 `wal_unhealthy=true`（停止自動 TX），記錄仍以 `loss_flag` 回傳。
-- **rotate／reset**：同一把鎖內依序 flush、`sync()`、rename（handle 仍開著，兩平台都可以，因為 handle 帶 share-delete），成功才關閉舊 handle 並開新檔，最後 `sync_dir`。
-  - rename 失敗時沿用舊 handle，該筆紀錄帶 `rotation_failed:true`。
-  - 同名歸檔加 `.N` 後綴（`DF-03`）。
+- **unlink 偵測**：每筆 append 都檢查 WAL 目錄與檔案名稱；identity／DeletePending 比對平時以 50 ms 節流。若本筆大小檢查將輪替 WAL 或 mirror，先完成該 handle 的 identity 分類，再關閉或清除其身分。分類順序為：目錄不存在 → `dir_missing`；路徑 identity 為 `None` 或 `(0,0)` → `external_unlink`；路徑與 handle identity 不同 → `replaced`；兩者相同但 `unlinked()` 為真 → `external_unlink`。identity 查詢擲 `OSError` 時該次證據視為未知，保留現行 handle 繼續 append，不觸發重建；若該路徑也達輪替門檻，該路徑本次略過輪替，避免清除未能判讀的替換證據。
+  命中 WAL 失效時：
+  1. 保存舊 identity 與 seq 範圍 `[file_first_seq, seq]`；範圍起點未知時寫 `null` 與 `range_known:false`，重試期間新消耗的 seq 併入終點。
+  2. 關閉自身 handle；若外部替換檔已達 rotate 門檻，先依 `>= R` 輪替該檔，再在新現行檔重建紀錄。
+  3. 每次到期 append 最多嘗試一次開檔；前三次失敗後的間隔為 10／50／200 ms，第四次起為 1／2／5／5…秒，封頂 5 秒。任何路徑都不持鎖睡眠。
+  4. 重開後以 `tail_needs_termination` 檢查既存檔尾端；非空且未以換行結尾時先補一個換行，讓殘行與 META 分開。檢查、終結或 META 寫入失敗都維持不健康並依退避重試。
+  5. 成功後先寫 META `WAL_RECREATED_AFTER_EXTERNAL_UNLINK`（§3.8），再寫原紀錄；重建成功沿用既有 `_record_recreated` 診斷欄位與日誌。
+  6. 重建失敗時 `health.healthy=false`、`unhealthy_reason="recreate_failed"`，fence 設 `wal_unhealthy=true`（停止自動 TX），記錄仍以 `loss_flag` 回傳。
+- **rotate／reset**：同一把鎖內依序 flush、`sync()`、關閉自身 handle、rename；成功後 `sync_dir`，下次寫入時再開啟現行路徑。reset 只輪替大小大於 0 的檔案，兩檔共用同一 UTC 時戳，目錄同步成功後才將 seq 歸零。
+  - rotate rename 失敗時，下一筆寫入會重開原路徑並繼續附加，該筆紀錄帶 `rotation_failed:true`。
+  - 同名歸檔加 `.N` 後綴（`DF-03`）；POSIX 優先使用原子 no-replace 改名，不支援時改以 hard link 後 unlink，若 hard link 也不支援則檢查目的地後降級為一般 rename；Windows 使用不覆蓋既有目的地的改名。
   - reset 用相同機制，條件 `> 0`，seq 歸 0。
 - **shutdown**：flush 加 sync 後關閉（`SC-11`）。
 - **啟動**：掃描現行檔，取最大合法 `seq`（與 Python 相同），並記下第一筆的 seq 作為 `file_first_seq`。
@@ -947,15 +962,16 @@ TxWriter 的 job queue 容量 64；滿時 OpRunner 阻塞等待（只有 OpRunne
   struct Entry {
       client_id: String,
       client_lifetime: u64,
-      owner_gen: u64,
+      deferred_epoch_at_capture: u64,
       bytes: Vec<u8>,
   }
   ```
 
-  - 回放時只送 `owner_gen` 等於目前上下文、且 client 仍存活的項目。
-  - mailbox 中尚未處理、但帶舊 `owner_gen` 的 `ConsoleInputBytes` 一律丟棄（BC-02 測項）。
+  - 回放時只送 `deferred_epoch_at_capture` 等於目前 `deferred_epoch`、且 client 仍存活的項目。
+  - mailbox 中尚未處理、但帶舊 `deferred_epoch_at_capture` 的 `ConsoleInputBytes` 一律丟棄（BC-02 測項）。
   - 沒有發生上下文失效時，照 #53 的正常回放流程。
-  - **回放保留（07 D-22，R2-F4）**：Python 的 resume flush 在 `_foreground_operation` token 釋放前同步寫完（`session_manager.py:3699-3703`、`:1104-1120`）。Rust 回放走非同步 human lane，因此每個回放點建立 `ReplayHold`，在同一次 `Fence::with` 內設 `FenceState.replay_auth = Some(hold_id)`，HumanReplay permit 帶 `replay_hold: Some(hold_id)`。hold 存在期間 `foreground_busy()` 為 true（佇列不出列、`interactive_open`／`send` 回 `SESSION_BUSY`），最後一筆回放結算才釋放並出列。任何不經佇列的新操作取得 ownership 時，先撤銷 `replay_auth`；之後才到 OS 提交點的回放回 `ReplayRevoked`、零 TX，bytes 放回 deferred 前端，等下一個回放點再送。HumanReplay 不比對 `owner_gen`／admission，只比對 `input_epoch` 與 `replay_auth`。
+  - `deferred_epoch` 只在 BC-02 失效事件時遞增；不可用 `owner_gen` 判定 DeferredBuffer，否則 Soft Preempt 的 suspend／resume 會丟棄應正常回放的輸入。
+  - **回放保留（07 D-22，R2-F4）**：Python 的 resume flush 在 `_foreground_operation` token 釋放前同步寫完（`session_manager.py:3699-3703`、`:1104-1120`）。Rust 回放走非同步 human lane，因此每個回放點建立 `ReplayHold`，在同一次 `Fence::with` 內設 `FenceState.replay_auth = Some(hold_id)`，HumanReplay permit 帶 `replay_hold: Some(hold_id)`。hold 存在期間 `foreground_busy()` 為 true（佇列不出列、`interactive_open`／`send` 回 `SESSION_BUSY`），最後一筆回放結算才釋放並出列。任何不經佇列的新操作取得 ownership 時，先撤銷 `replay_auth`；之後才到 OS 提交點的回放回 `ReplayRevoked`、零 TX，bytes 放回 deferred 前端，等下一個回放點再送。`deferred_epoch_at_capture` 在入列前核對；HumanReplay permit 不比對 `owner_gen`／admission，只比對 `deferred_epoch` 與 `replay_auth`。
 
 ### 5.12 Passthrough 安靜升 READY（SC-35）
 
@@ -977,14 +993,14 @@ OD-14 #2：`platform == "passthrough"` 的 session（含 others-template fallbac
 
 ### 6.1 啟動與停止（`daemon_main.rs`）
 
-順序逐字照 02 §3.2：
+順序逐字照 02 §3.2，唯一例外為 SC-19 判定（T13 規格 4，審查修正 2026-10-17）：OD-11 allowlist 判定必須最先執行，早於 `ensure_runtime_dirs` 與 lock，因為 Service 建構內的 `SessionManager.__init__` 會寫入 `state.json`，被拒時不得留下任何副作用。
 
-1. `ensure_runtime_dirs`。
-2. `load_profiles`；結果為空時 stderr 印 `serialwrapd: no profiles loaded`。
-3. Windows device backend 時注入 `windows-default-passthrough` template（依 capability 判斷）。此 template 為 `platform=passthrough`，同樣適用 §5.12 的安靜升 READY（`SC-35`）。
-4. `instance_lock.acquire`；失敗時 stderr `serialwrapd: DAEMON_ALREADY_RUNNING`，exit 2。
-5. 建 Service；`StateLoadError` 時 exit 3。
-6. 取得 OD-11 allowlist 判定（`SC-19`）；違規時 stderr `serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED: <reason>`，exit 2。
+1. 取得 OD-11 allowlist 判定（`SC-19`）；違規時 stderr `serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED: <reason>`，exit 2，且不建立任何 runtime 目錄、不取 lock、不建 Service。
+2. `ensure_runtime_dirs`。
+3. `load_profiles`；結果為空時 stderr 印 `serialwrapd: no profiles loaded`。
+4. Windows device backend 時注入 `windows-default-passthrough` template（依 capability 判斷）。此 template 為 `platform=passthrough`，同樣適用 §5.12 的安靜升 READY（`SC-35`）。
+5. `instance_lock.acquire`；失敗時 stderr `serialwrapd: DAEMON_ALREADY_RUNNING`，exit 2。
+6. 建 Service（帶入步驟 1 的 allowlist 判定）；`StateLoadError` 時 exit 3。
 7. 依序 initial scan → rank → watcher.start（`DF-14`）→ bootstrap attach → flash endpoint。
 8. 綁定 RPC，再寫入 config.yaml 的 `socket_path`；寫入失敗印 stderr，視為非致命。
 9. `signals.wait_stop`。
@@ -1184,11 +1200,12 @@ Windows（`ProcessTunnel::supports_control_master()==false`）的差異：
 
 - **readiness**：
   - connect：直接對本地 forward 做 `health.ping`（2.0 s）；
-  - expose + tcp：以**輪詢**判定（P4-T1 修訂，見 Task 8）：每次探測各開一條新的 ssh 連線執行 `ss -ltnH 'sport = :<port>'`（不使用 ControlPath），在 ready 逾時內重試；未確認就緒前不得立即判定 ready（修正 P1 `make_ssh_check -> lambda: True` 的競態）；
-  - expose + `--remote-socket`：只要行程存活即視為 ready，與 POSIX 相同。
+  - expose + tcp：另開一條 ssh 連線執行 `ss -ltnH 'sport = :<port>'`，不使用 ControlPath；`BatchMode=yes` 放在使用者 `ssh_opts` 前。rc 非 0、輸出為空或尚未列出該 port 都視為尚未就緒並在期限內輪詢；已列出 listener 但 bind 不是 loopback 時立即以 `REMOTE_BIND_UNVERIFIED` 拒絕並清理；期限內始終未能驗證時也 fail-closed 清理，不回報 `active` 或保留未驗證隧道。
+  - expose + `--remote-socket`：以獨立 ssh 執行 `test -S <remote_socket>`；只有 rc 0 才視為 ready，行程存活本身不足以證明 forwarding 已建立。
+  - 無 ControlMaster 時，ssh check 只提供行程存活資訊；`active` 必須另有上述 role probe 或 `health.ping` 的正面證據。
 - **registry 鎖**：改用 `FsOps::file_lock_exclusive`（LockFileEx）。
 - **存活判定**：`ProcessTunnel::alive`，不用 `os.kill`。
-- **停止**：terminate tree。
+- **停止**：先以 registry 的 CreationTime 核對根行程身分，再以 `taskkill /T /F` 終止整棵樹；有界確認同一 CreationTime 已退出，終止失敗時保留 error state 並回報失敗。
 - argv 不帶 ControlMaster 相關的 3 個 `-o` 選項；identity 計算仍包含使用者的 `ssh_opts`。
 
 connect 與 benches 一併納入 Windows 支援（`SC-27`，OD-14 #7 確認），移除這兩者在 Windows 上的 `REMOTE_NOT_SUPPORTED`。
@@ -1346,6 +1363,6 @@ A/B 程序照規格 §15.9：先停 A 並確認資源釋放，才啟動 B；兩�
 - 檢查點：
   1. 既有 L2／L3 preflight 的 #154 exact 比對維持不變，並擴及 realhw 與 reliability（`TST-D-10`）。
   2. CLI 每次 RPC 的 mismatch 警告維持 Python 行為：只警告、不阻擋。
-  3. 新增 doctor check `version_pairing`（非 advisory，`SC-25`）：比對 manifest `pairing`、自身 `--version`、`daemon status.version`、manifest 的 `components.*.sha256` 與實際檔案 sha256。不一致時 `ok:false`，detail 列出差異。
+  3. 新增 doctor check `version_pairing`（非 advisory，`SC-25`）：比對 manifest `pairing`、自身 `--version`、`daemon status.version`、manifest 的 `components.*.sha256` 與實際檔案 sha256。不一致時 `ok:false`，detail 列出差異。 Python 端（P1 T18）的限縮：`components.assets.profiles_sha256` 與 `components.supervisor.definition_sha256` 只驗存在且為 64 位小寫 hex（profiles 物化路徑與監管定義由 setup／P4 產生，Python doctor 無穩定的比對來源），實際比對由 P4 Rust doctor 承接；Python 端只在偵測到 manifest 時附加此項。
   4. `setup` 與 `rollback` 在啟動新版本後必須驗證配對；失敗時回到完整的 Previous 組合。
 - `binary_sha256` 不出現在 RPC 回應中，只存在於 manifest（規格 §9.5）。

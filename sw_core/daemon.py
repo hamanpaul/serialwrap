@@ -2,15 +2,48 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import signal
 import sys
+from typing import Any
 
+from sw_core import constants as _constants
 from sw_core.config import ProfileTemplate, load_profiles
-from sw_core.constants import CONFIG_DIR, DEFAULT_ENDPOINT, LOCK_PATH, PROFILE_DIR, ensure_runtime_dirs
+from sw_core.constants import (
+    CONFIG_DIR,
+    DEFAULT_ENDPOINT,
+    LOCK_PATH,
+    PROFILE_DIR,
+    default_isolation_paths,
+    ensure_runtime_dirs,
+    resolve_config_path,
+)
 from sw_core.runtime_config import RuntimeConfig
 from sw_core.service import SerialwrapService
 from sw_core.session_manager import StateLoadError
 from sw_core.sysenv import force_utf8_stdio
+from sw_core.test_allowlist import (
+    ERROR_TEST_DEVICE_ALLOWLIST_REJECTED,
+    AllowlistDecision,
+    decide_on_unreadable_config,
+    enforce_allowlist,
+    resolve_test_allowlist,
+)
+
+_CONFIG_DIR_AT_IMPORT = CONFIG_DIR
+
+
+def _config_dir_for_resolution() -> str:
+    """取得目前設定目錄，同時保留模組與 constants 的測試注入 seam。"""
+    if CONFIG_DIR != _CONFIG_DIR_AT_IMPORT:
+        return CONFIG_DIR
+    return _constants.CONFIG_DIR
+
+
+def _config_path_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env["SERIALWRAP_CONFIG_DIR"] = _config_dir_for_resolution()
+    return env
 
 # 這些 RPC method 的 handler 會長時間同步阻塞，須丟到 executor 執行，否則會卡住單執行緒
 # asyncio event loop，導致期間全 daemon 的所有 RPC 凍結（#52 根因；#80 補齊其餘阻塞 handler）。
@@ -22,8 +55,10 @@ BLOCKING_RPC_METHODS = {
     "file.push", "file.pull",
     "session.recover",        # force 路徑硬 sleep 10s + probe 數十秒（#80 REACT-1）
     "session.attach",         # reprobe 分支做完整 ensure_ready/probe，最壞數十秒（#80 REACT-2）
+    "device.release", "device.attach", "session.clear", "session.bind",
     "session.self_test",      # 同步等 UART（2×timeout_s）（#80 REACT-3）
     "session.console_attach",  # recover 升級分支可同步觸發 recover（#80 REACT-6）
+    "daemon.handoff_stop",    # 同步取得 manager snapshot 並凍結 admission
     # 整檔讀取（WAL/log tail），大檔在 loop 上同步讀會凍結全 daemon（#80 REACT-5）
     # command.result_tail 是 CLI `serialwrap cmd result-tail` 實際送的方法（service.rpc 內與 legacy
     # result.tail 同樣 get_background_result 讀取/切片大 capture 並序列化）；漏了它，最常用的查詢路徑
@@ -81,10 +116,28 @@ def _write_config_endpoint(endpoint: str) -> None:
     """
     import os  # noqa: PLC0415
     try:
-        cfg = RuntimeConfig(os.path.join(CONFIG_DIR, "config.yaml"))
+        cfg = RuntimeConfig(
+            resolve_config_path(env=_config_path_env()),
+            write_path=resolve_config_path(for_write=True, env=_config_path_env()),
+        )
         cfg.set_socket(endpoint)
     except Exception as exc:  # noqa: BLE001
         sys.stderr.write(f"serialwrapd: 寫入 config.yaml endpoint 失敗（非致命）: {exc}\n")
+
+
+def make_rpc_handler(service: SerialwrapService, stop_after_response: object):
+    """建立 daemon 控制方法與 service RPC 共用的正式分派器。"""
+    def _handle(method: str, params: dict[str, object]) -> dict[str, object]:
+        if method == "daemon.stop":
+            return {"ok": True, "stopping": True, "_rpc_after_write": stop_after_response}
+        if method == "daemon.handoff_stop":
+            result = service.handoff_stop(params)
+            if result.get("ok"):
+                result["_rpc_after_write"] = stop_after_response
+            return result
+        return service.rpc(method, params)
+
+    return _handle
 
 
 def _write_effective_endpoint(args: argparse.Namespace) -> None:
@@ -125,7 +178,49 @@ def _make_windows_passthrough_templates(
     ]
 
 
+def _load_config_data() -> tuple[Any, str | None]:
+    """讀取 config.yaml 原始內容供 SC-19 判定，回傳 ``(data, error)``。
+
+    缺檔回 ``(None, None)``（未設定）；存在但讀取或解析失敗回 ``(None, 例外類別名)``，
+    由 :func:`sw_core.test_allowlist.decide_on_unreadable_config` 依隔離與否決定。
+    捕捉範圍為 Exception：``yaml.safe_load`` 除 YAMLError 外還會拋 ValueError（如不合法日期）與
+    RecursionError（過深巢狀），皆不得逸出為 traceback。
+    """
+    import yaml  # noqa: PLC0415 — 延遲匯入，與 RuntimeConfig 一致
+
+    path = resolve_config_path(env=_config_path_env())
+    if not os.path.isfile(path):
+        return None, None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return yaml.safe_load(fh), None
+    except Exception as exc:  # noqa: BLE001
+        return None, type(exc).__name__
+
+
+def _resolve_test_allowlist() -> AllowlistDecision:
+    """SC-19（OD-11）：判定隔離實例測試裝置 allowlist；被拒時拋 RuntimeError（見 sw_core.test_allowlist）。"""
+    config_data, config_error = _load_config_data()
+    defaults = default_isolation_paths()
+    if config_error is not None:
+        decision = decide_on_unreadable_config(os.environ, defaults=defaults, error=config_error)
+    else:
+        decision = resolve_test_allowlist(os.environ, config_data, defaults=defaults)
+    enforce_allowlist(decision)
+    return decision
+
+
 async def _run_async(args: argparse.Namespace) -> int:
+    # SC-19：測試裝置 allowlist 判定必須最先執行——早於 ensure_runtime_dirs()、lock 與 SerialwrapService
+    # 建構（後者的 SessionManager 會改寫 state.json），正式實例被拒時不留下任何狀態副作用。
+    try:
+        test_allowlist = _resolve_test_allowlist()
+    except RuntimeError as exc:
+        if len(exc.args) != 2 or exc.args[0] != ERROR_TEST_DEVICE_ALLOWLIST_REJECTED:
+            raise  # 非 SC-19 的 RuntimeError 不在此吞掉，維持原行為
+        sys.stderr.write(f"serialwrapd: {exc.args[0]}: {exc.args[1]}\n")
+        return 2
+
     ensure_runtime_dirs()
     result = load_profiles(args.profile_dir)
     if not result.profiles and not result.templates:
@@ -154,6 +249,7 @@ async def _run_async(args: argparse.Namespace) -> int:
             result.profiles,
             templates=templates,
             max_sessions=result.max_sessions,
+            test_allowlist=test_allowlist,
         )
     except StateLoadError as exc:
         # _load_state fail closed（既有 state.json 讀取失敗，非 JSON 損毀）：拒絕啟動，避免以空狀態
@@ -163,14 +259,12 @@ async def _run_async(args: argparse.Namespace) -> int:
         return 3
     stop_event = asyncio.Event()
 
-    def _handle(method: str, params: dict[str, object]) -> dict[str, object]:
-        if method == "daemon.stop":
-            stop_event.set()
-            return {"ok": True, "stopping": True}
-        return service.rpc(method, params)
+    def _stop_after_response() -> None:
+        # 由 RPC framing 層於 writer.drain() 完成後呼叫，確保交接回應先送出。
+        asyncio.get_running_loop().call_soon(stop_event.set)
 
     # 依平台後端選擇器建構 RPC server（Windows: TcpRpcServer / POSIX: JsonRpcUnixServer）。
-    server = _build_server(args, _handle)
+    server = _build_server(args, make_rpc_handler(service, _stop_after_response))
 
     def _stop(*_unused: object) -> None:
         stop_event.set()

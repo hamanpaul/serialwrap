@@ -1131,7 +1131,7 @@ class TestSubmitQuietGate(unittest.TestCase):
         self.assertEqual(rec["status"], "error")
         self.assertEqual(rec["error_code"], "AUTOBOOT_QUIET")
 
-    def test_human_source_submit_not_gated(self) -> None:
+    def test_rpc_human_source_submit_is_gated(self) -> None:
         self._inject_ready_session(arm_quiet=True)
 
         resp = self.svc.rpc(
@@ -1139,9 +1139,9 @@ class TestSubmitQuietGate(unittest.TestCase):
             {"selector": "COM0", "cmd": "echo hi", "source": "human:x"},
         )
 
-        self.assertTrue(resp["ok"], "human 來源不受第一層 gate")
-        rec = self._wait_terminal(resp["cmd_id"])
-        self.assertEqual(rec["status"], "done", "human 來源亦不受第二層 gate（命令真的執行）")
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error_code"], "AUTOBOOT_QUIET")
+        self.assertIn("retry_after_s", resp)
 
 
 class TestReadyReconfirmGate(_ManagerMixin):
@@ -1273,7 +1273,12 @@ class TestReadyReconfirmGate(_ManagerMixin):
         attach_bridge = FakeBridge(prompt_within_2s=True)
         attach_bridge.vtty_path = "/tmp/fake-vtty"
         attach_bridge.start = lambda: None
-        with mock.patch.object(sm_mod, "UARTBridge", return_value=attach_bridge):
+        opened_port = mock.MagicMock()
+        self.addCleanup(opened_port.close)
+        with (
+            mock.patch("sw_core.session_manager.uart_io_mod.open_serial_port", return_value=opened_port),
+            mock.patch.object(sm_mod, "UARTBridge", return_value=attach_bridge),
+        ):
             mgr._attach_by_id(session.profile.device_by_id)
         self.assertEqual(session.state, "READY")
         self.assertFalse(session.ready_reconfirm_pending, "_attach_by_id READY 落定應清 pending")

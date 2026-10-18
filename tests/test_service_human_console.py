@@ -28,6 +28,8 @@ class TestServiceHumanConsole(unittest.TestCase):
             mode="interactive",
             timeout_s=30.0,
             priority=100,
+            admission_exempt=True,
+            trusted_human=True,
         )
 
     def test_human_console_regular_command_uses_line_mode(self) -> None:
@@ -42,6 +44,8 @@ class TestServiceHumanConsole(unittest.TestCase):
             mode="line",
             timeout_s=30.0,
             priority=100,
+            admission_exempt=True,
+            trusted_human=True,
         )
 
     def test_human_console_sudo_vim_is_interactive(self) -> None:

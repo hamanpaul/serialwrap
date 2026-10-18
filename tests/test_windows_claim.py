@@ -174,6 +174,8 @@ def test_no_profiles_windows_passthrough_claim(tmp_state, monkeypatch):
     時注入 windows-default-passthrough 的修正路徑。SessionManager 收到非空 templates 後，
     _attach_by_id 守衛通過，_attach_by_id_dynamic 走 fallback passthrough 建立 session。
     """
+    from unittest.mock import MagicMock
+
     from sw_core.uart_io import UARTBridge
 
     # 注入預設 passthrough template（模擬 daemon.py Windows 路徑注入結果）
@@ -193,6 +195,12 @@ def test_no_profiles_windows_passthrough_claim(tmp_state, monkeypatch):
 
     # bridge.start() 靜默成功（不實際開 \\.\COM8；CI 環境無此 COM）
     monkeypatch.setattr(UARTBridge, "start", lambda self: None)
+    fake_port = MagicMock()
+    monkeypatch.setattr(
+        sm_mod.uart_io_mod,
+        "open_serial_port",
+        lambda *_args, **_kwargs: fake_port,
+    )
 
     # 觸發動態接管（_spawn_attach 在背景執行緒執行）
     mgr.update_devices({"COM8": DeviceInfo(by_id="COM8", real_path=r"\\.\COM8")})

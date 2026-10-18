@@ -141,6 +141,14 @@ serialwrap cmd submit --selector COM0 --mode line --source agent:diag --cmd "ifc
 serialwrap cmd status --cmd-id <cmd_id>
 ```
 
+Configuration reads use `SERIALWRAP_CONFIG`, then `~/.config/serialwrap/config.yaml`,
+then `/etc/serialwrap/config.yaml` when present. The system file is read-only;
+writes go to `SERIALWRAP_CONFIG` when set, otherwise to the user config path.
+New runtime directories use mode `0700`; Unix sockets default to `0600`. Set
+`SERIALWRAP_SOCKET_GROUP` explicitly to use socket mode `0660` with that group.
+`daemon restart` uses `service restart` under systemd and stops, verifies exit,
+then starts the same endpoint in on-demand mode.
+
 For noisy consoles that omit the shell prompt, `cmd submit --completion-regex`
 can wait for a command-specific producer marker in `line` or `background` mode.
 Use fresh, anchored markers with a numeric exit code and a separate END line;
@@ -483,10 +491,11 @@ on its own, so a manual attach/recover (or a daemon restart, which re-reads
 
 Callers must handle RPC timeouts themselves — a CLI `TIMEOUT` only means the
 CLI stopped waiting; the daemon-side operation may still complete successfully
-afterwards. `session attach`, `session recover`, `session self-test`, and
-`session console-attach` (its recover-upgrade branch can run synchronously for
-tens of seconds) are long operations executed synchronously on the daemon
-side: when `--timeout` is not given, the CLI automatically applies a fixed
+afterwards. `session attach`, `session recover`, `session self-test`,
+`session console-attach`, `device release`, `device attach`, `session clear`,
+and `session bind` block on the daemon side (`session console-attach` can run
+synchronously for tens of seconds): when `--timeout` is not given, the CLI
+automatically applies a fixed
 45 s floor instead of the general 5 s default. An explicit `--timeout` always
 wins.
 
@@ -796,8 +805,8 @@ serialwrap remote tester@AGENT_OR_RELAY:7777
 - **Background daemonization**: `ssh` / `--autossh` runs in its own process
   group in the background; the command returns immediately.
 - **flock registry**: state lives under `<run-dir>/remote/` (`<port>.json` +
-  a `cm-<port>` ssh control socket), serialized with an flock so concurrent
-  `remote` / `remote close` calls don't race.
+  a `cm-<port>` ssh control socket), serialized with a cross-process file lock
+  (`flock` on POSIX, `LockFileEx` on Windows) so concurrent tunnel operations don't race.
 - **Readiness confirmation**: returns `status`: `active` = verified and
   ready; `starting` = timed out (default 10s, tunable via `--ready-timeout`)
   but the process is still alive and not yet confirmed — query
@@ -1129,6 +1138,8 @@ in Route A above.
 serialwrap remote                   # list all current tunnels (status)
 serialwrap remote close 7777        # tear down a single tunnel
 serialwrap remote close all         # tear down everything
+serialwrap remote stop 7777         # same as close
+serialwrap remote stop              # stop all tunnels
 ```
 
 #### `--remote-socket` hardening (recommended for shared relays)
@@ -1183,9 +1194,13 @@ serialwrap remote -L --remote-socket /tmp/sw-relay.sock tester@RELAY:7777
   first scp/rsync it to the UART host, then have the daemon do the file
   transfer. WAL and mirror-log paths returned by the RPC are likewise
   UART-host paths.
-- **Native Windows does not support `serialwrap remote` in this release**:
-  running it returns `REMOTE_NOT_SUPPORTED` (see the manual equivalent
-  below).
+- **Native Windows supports `serialwrap remote -R/-L`, `connect`, and
+  `benches`**. Windows uses process-tree shutdown and does not use OpenSSH
+  ControlMaster. Run `serialwrap remote stop [port|all]` to stop one or all
+  tunnels; omitting the selector stops all tunnels.
+- **OD-12 trust boundary**: a remote tunnel grants full DUT control to users
+  authenticated by SSH. Use a single-user workstation and a trusted relay; this
+  does not provide same-user isolation on a shared machine.
 - For an isolated two-container check, run `./tools/docker/remote_smoke.sh`
   directly; the full flow is documented in
   [`func-test/README.md`](./func-test/README.md) under the **Remote Support
@@ -1263,6 +1278,14 @@ focused debugging:
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+### Isolated test-device allowlist (OD-11 / SC-19)
+
+For isolated test instances only (throwaway daemon, com0com or other virtual COM pairs). The allowlist makes the daemon discover and select an explicit list of device names; it does not bypass the per-UART exclusive lock (BC-04), does not change the serial backend, and never bypasses Tier-2 exclusivity or handoff.
+
+- Enable with `SERIALWRAP_TEST_DEVICE_ALLOWLIST=COM7,COM8` (comma-separated, matched exactly against `DeviceInfo.by_id`), or with `windows.test_device_allowlist: [COM7, COM8]` in `config.yaml`. The environment variable takes precedence over config.
+- It is accepted only when `SERIALWRAP_STATE_DIR`, `SERIALWRAP_RUN_DIR` and `SERIALWRAP_CONFIG_DIR` are all set explicitly and none of them equals its default path. Otherwise the daemon refuses to start: `serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED: <reason>` on stderr, exit 2, before any state, run or lock file is created. A `windows.test_device_allowlist` that is not a list of strings is refused the same way. If `config.yaml` exists but cannot be read or parsed and the allowlist is not set through the environment, an isolated instance is refused too (`invalid config.yaml: <exception class>`); a non-isolated instance keeps its previous behaviour.
+- While the allowlist is active, `serialwrap daemon status` shows `test_device_allowlist: {"enabled": true, "coms": [...], "source": "env"|"config"}`. While it is inactive the key is absent.
 
 ### Real-hardware stability suite (#122)
 
@@ -1593,6 +1616,9 @@ serialwrap doctor    # 驗證環境
 - WSL 啟用 systemd：於 `/etc/wsl.conf` 設 `[boot]\nsystemd=true` 後 `wsl --shutdown`（否則 `serialwrap setup` 退回 on-demand）。
 - 本機開發安裝：`./install.sh`（= `pipx install <repo>` + `serialwrap setup`）。
 - 既有 on-demand TCP 客戶端請用 `serialwrap setup --on-demand` 或 `./install.sh --on-demand` 保存 endpoint；auto 安裝可能切換至 systemd，詳見[適用範圍與限制](docs/setup-tcp-endpoint.md)。
+- 設定讀取順序為 `SERIALWRAP_CONFIG` → `~/.config/serialwrap/config.yaml` → 存在時的 `/etc/serialwrap/config.yaml`；系統設定檔唯讀，寫入落在 `SERIALWRAP_CONFIG` 或使用者設定檔。
+- 新建執行期目錄權限為 `0700`，Unix socket 預設為 `0600`；明確設定 `SERIALWRAP_SOCKET_GROUP` 時 socket 改為 `0660` 並設為該群組。
+- `daemon restart` 在 systemd 模式等同 `service restart`；on-demand 模式會先停止並確認舊 daemon 結束，再以相同 endpoint 啟動。
 
 ```bash
 # 啟動 daemon 後快速驗證
@@ -1992,7 +2018,7 @@ serialwrap 持有 UART 時，外部 flasher（如 `ocp-mcu-upgrade`）無法獨�
 serialwrap device release --selector COM0 --source agent:flash --reason "flash CC2674"
 # serialwrap 關閉該 UART、清空 console，且不會自動搶回
 ocp-mcu-upgrade -d /dev/ttyUSB1 -b 115200 -t 8 -e -s -i fw.bin
-serialwrap device attach --selector COM0   # 收回；外部仍持有時回 DEVICE_STILL_HELD，--force 可強制
+serialwrap device attach --selector COM0   # 收回；--force 只略過預檢，不能搶占已識別的外部持有者
 ```
 
 `serialwrap session self-test --selector COM0` 在 RELEASED 下會回 `external_holder` /
@@ -2161,7 +2187,7 @@ serialwrap daemon status   # multi_open / foreign_holders 欄位
 - **`serialwrap doctor`**：新增 `single_daemon` 檢查項，掃 `/proc` 找 `serialwrapd` 程序；多開時 `ok=false`、`detail` 列出在跑的 daemon 數、`fix` 指引「停掉多餘 daemon（`serialwrap service stop`；並檢查 systemd-user 與 system 是否同時在跑）」。doctor 為獨立程序、不碰 socket。
 - **`serialwrap daemon status`**：回應加三個欄位：
   - `multi_open`（bool）：是否偵測到一個以上 `serialwrapd`。
-  - `foreign_holders`（`{tty_real_path: pid}`）：哪個 pid 持有目前 attach 中的 tty。
+  - `foreign_holders`：known holder 的值為 PID；holder 掃描不完整時值為物件 `{"device": tty_real_path, "holder_unknown": true}`，若同時找到 PID 則另含 `pids` 陣列。
   - `multi_open_detail`：`{"daemons": [{"pid": N, "socket": "<path>" | null}, ...], "holders_status": "ok" | "permission" | "unknown"}`。`holders_status` 在跨 uid 讀不到 `/proc/<pid>/fd` 時降級為 `permission`（仍確認另有 daemon 存在，但無法判定持有哪條 tty）；procfs 不可用時為 `unknown`。`socket`（#173）是從各 daemon 的 `--socket` 引數擷取的值，讀不到時為 `null`。
 
 #### 自訂安裝路徑與 config.yaml 同步（#173）
@@ -2195,7 +2221,7 @@ recovery 把 session 降出 `READY`（或 session 重新 attach）時，佇列�
 
 ### Timeout 語意（#123）
 
-呼叫端必須自行處理 RPC timeout——CLI 回 `TIMEOUT` 只代表「CLI 不再等待」，daemon 端操作可能仍在執行、稍後成功。`session attach`／`session recover`／`session self-test`／`session console-attach`（recover 升級分支可同步跑數十秒）屬 daemon 端同步執行的**長操作**：未指定 `--timeout` 時，CLI 對這四個方法自動採固定 45 秒 floor，而非一般方法的預設 5 秒。顯式指定 `--timeout` 時一律照用。
+呼叫端必須自行處理 RPC timeout——CLI 回 `TIMEOUT` 只代表「CLI 不再等待」，daemon 端操作可能仍在執行、稍後成功。`session attach`／`session recover`／`session self-test`／`session console-attach`／`device release`／`device attach`／`session clear`／`session bind` 都會在 daemon 端阻塞（`session console-attach` 的 recover 升級分支可同步跑數十秒）：未指定 `--timeout` 時，CLI 對這八個方法自動採固定 45 秒 floor，而非一般方法的預設 5 秒。顯式指定 `--timeout` 時一律照用。
 
 floor 誠實說明：CLI 完全無從得知 daemon 端 profile 的 `timeout_s`（部分平台如 `bcm` 常設 15 秒以上、且可能多階段 login/ready probe）——真正拉長 daemon 端執行時間的其實是這個值，45 秒只是一個寬鬆常數，不是依任何單次呼叫的參數精算出來的上界。（初版曾試著讓 floor 隨 CLI 端 `recover_timeout_s`／`probe_timeout_s` 縮放，但 daemon 端對這兩個參數皆有 2 秒 cap、超過就無作用，該推導已撤回。）若操作仍逾時，可用下方 `TIMEOUT` 錯誤附帶的 `daemon_reachable`／`daemon_busy` 欄位與 `session list` 確認 daemon 是否仍在執行。
 
@@ -2353,7 +2379,7 @@ serialwrap wal current-seq
 Windows daemon 以 **TCP loopback** 取代 AF_UNIX 做 RPC 控制通道，使 serialwrap CLI/agent 在 Windows 擁有完整指令路徑：
 
 - **RPC endpoint**：預設 `tcp://127.0.0.1:48700`，可以 `--socket` 參數或環境變數 `SERIALWRAP_ENDPOINT`（覆寫整個 endpoint，如 `tcp://127.0.0.1:50000`）、`SERIALWRAP_TCP_PORT`（僅覆寫 port 部分）覆寫。daemon 啟動後會把有效 endpoint 寫入 `config.yaml::socket_path`，CLI `_resolve_endpoint` 自動讀取（#173 起 POSIX daemon 亦同，見下方「自訂安裝路徑與 config.yaml 同步」）。
-- **Singleton 鎖**：`msvcrt.locking`（`LK_NBLCK`）+ TCP connect 探測（`WindowsSingletonLock`，`sw_core/lock_win.py`）。語意與 POSIX `SingletonLock`（flock + Unix socket probe）對齊：endpoint 可連 → `DAEMON_ALREADY_RUNNING`；stale → 取得 msvcrt 檔鎖。
+- **Singleton 鎖**：`LockFileEx`（獨佔且不等待）+ TCP connect 探測（`WindowsSingletonLock`，`sw_core/lock_win.py`）。語意與 POSIX `SingletonLock`（flock + Unix socket probe）對齊：endpoint 可連 → `DAEMON_ALREADY_RUNNING`；stale → 取得檔案鎖。
 - **COM 列舉與藍牙排除**：從 Windows registry `HKLM\HARDWARE\DEVICEMAP\SERIALCOMM` 列舉所有 COM port（`WindowsDeviceSource`，`sw_core/device_source.py`）；雙重排除藍牙——BTHENUM PortName 掃描（主判據）+ `bthmodem` device path 啟發式（兜底），確保藍牙裝置**永不被接管**。額外手動排除清單：`config.yaml::windows.exclude_coms`（如 `["COM3"]`）。
 - **閒置非藍牙 COM 自動接管**：偵測到不在排除清單的 COM 時，daemon 以 `passthrough` profile 自動建立 session（可觀察 UART 輸出；需要下命令請先 pin 適當 profile 並 attach）。已持續被外部程序佔用的 COM **不會每輪自動輪詢重試**（與 POSIX dynamic-session 同語意；需拔插或手動 `session bind`/`session clear` 觸發）。
 - **平台 seam 分檔**：三個後端由 `sw_core/platform_backends.py` 的 `select_rpc_backend()` / `select_lock_backend()` / `select_device_backend()` 依 `os.name` 自動選擇，環境變數 `SERIALWRAP_{RPC,LOCK,DEVICE}_BACKEND`（`auto`/`posix`/`win`）可覆寫：
@@ -2402,7 +2428,7 @@ serialwrap.exe doctor
 serialwrap.exe skill --platform windows
 ```
 
-- `daemon start` 的 spawn 解析（#131）：release exe（PyInstaller 凍結）→ `serialwrap.exe` 同層 `serialwrapd.exe` → PATH 上的 `serialwrapd`；原始碼 checkout → `serialwrapd.py`；pip/pipx 安裝 → `-m sw_core.daemon`。
+- `daemon start` 的 daemon 定位順序（DF-05，P1 T18；POSIX 與 Windows 相同）：發佈組合 `release-manifest.json` 的 `components.daemon.launcher.path`（manifest 由 `SERIALWRAP_RELEASE_MANIFEST` 指定，未指定時取 bundle 根的 `release-manifest.json`）→ release exe（PyInstaller 凍結）同層 `serialwrapd.exe`／PATH 上的 `serialwrapd` → 與 `serialwrap` 同目錄的 `serialwrapd`（Windows 為 `serialwrapd.exe`）→ 原始碼 checkout 的 `serialwrapd.py` → `python -m sw_core.daemon`（pip/pipx 安裝）。偵測到 release manifest 時，`serialwrap doctor` 另附非 advisory 的 `version_pairing` 檢查（SC-25）：CLI 與 daemon 版本須等於 bundle 版本，並比對 launcher／runtime／套件樹與 SKILL 資產雜湊；純 Python 安裝的 doctor 輸出不變。
 - `--endpoint` 在 Windows 的 `daemon start` 開放 **loopback tcp://** 作為本機 bind 位址（非 loopback 照舊 `REMOTE_NOT_SUPPORTED`；POSIX 行為不變）。
 
 > ⚠️ Windows 尚無 systemd 監管（PORT-8）。長期使用建議以 Windows Task Scheduler 或 NSSM 管理 `serialwrapd.exe` 生命週期；`device release` / `device attach` 編排已可用（底層 COM release/reclaim primitive 可用）。
@@ -2436,6 +2462,14 @@ python3 -m pytest tests/test_session_bind.py -v
 python3 -m unittest tests.test_multiagent_e2e -v
 python3 -m unittest tests.test_session_bind -v
 ```
+
+### 隔離實例測試裝置 allowlist（OD-11／SC-19）
+
+僅供隔離的測試實例使用（拋棄式 daemon、com0com 等虛擬 COM pair）。allowlist 讓 daemon 只發現與選取明確列出的裝置名稱；它不關閉 per-UART 獨占鎖（BC-04）、不更換 serial backend，也絕不繞過 Tier 2 獨占與交接規則。
+
+- 設定方式：環境變數 `SERIALWRAP_TEST_DEVICE_ALLOWLIST=COM7,COM8`（逗號分隔，逐字比對 `DeviceInfo.by_id`），或 `config.yaml` 的 `windows.test_device_allowlist: [COM7, COM8]`。兩者並存時環境變數優先。
+- 只有 `SERIALWRAP_STATE_DIR`、`SERIALWRAP_RUN_DIR`、`SERIALWRAP_CONFIG_DIR` 三者都明確設定、且都不等於預設路徑時才生效。不符合即拒絕啟動：stderr 輸出 `serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED: <原因>`、exit 2，且在建立任何 state、run 或 lock 檔之前就結束。`windows.test_device_allowlist` 不是字串 list 時同樣拒絕啟動。若 `config.yaml` 存在但無法讀取或解析、且未以環境變數提供 allowlist，隔離實例同樣拒絕啟動（`invalid config.yaml: <例外類別名>`）；非隔離實例維持原行為。
+- 生效時 `serialwrap daemon status` 會顯示 `test_device_allowlist: {"enabled": true, "coms": [...], "source": "env"|"config"}`；未生效時不輸出此鍵。
 
 ### 實機穩定性測試（#122）
 
@@ -2655,7 +2689,7 @@ serialwrap remote tester@AGENT_OR_RELAY:7777
 `serialwrap remote`（`sw_core/remote_tunnel.py`）行為：
 
 - **background 常駐**：`ssh`／`--autossh` 以獨立 process group 背景執行，指令立即回傳。
-- **flock registry**：狀態落在 `<run-dir>/remote/`（`<port>.json` + `cm-<port>` ssh control socket），以 flock 序列化並發的 `remote` / `remote close` 操作。
+- **跨行程檔案鎖 registry**：狀態落在 `<run-dir>/remote/`（`<port>.json` + `cm-<port>` ssh control socket）；POSIX 使用 `flock`，Windows 使用 `LockFileEx`，避免並發 tunnel 操作互相競爭。
 - **readiness 確認**：回傳 `status`：`active`＝已驗證就緒可用；`starting`＝逾時（預設 10s，`--ready-timeout` 可調）但行程仍存活、尚未確認，需再 `serialwrap remote` 查或重試。
 - **冪等 / 衝突偵測**：同 port 重複執行且 identity（role/target/port/local/remote_socket/via/ssh-opt 等雜湊）相同 → `already_running` no-op；identity 不同 → 拒絕並回 `TUNNEL_CONFLICT`（避免竊佔他人隧道或造成埠位混用）。
 
@@ -2885,6 +2919,8 @@ sudo tools/bench-enroll.sh --bundle /path/to/handoff/eit-test
 serialwrap remote                   # 列目前所有隧道（status）
 serialwrap remote close 7777        # 拆除單一隧道
 serialwrap remote close all         # 拆除全部
+serialwrap remote stop 7777         # 等同 close
+serialwrap remote stop              # 停止全部隧道
 ```
 
 ### `--remote-socket` 硬化（共享 relay 建議必開）
@@ -2908,7 +2944,8 @@ serialwrap remote -L --remote-socket /tmp/sw-relay.sock tester@RELAY:7777
 - **`BatchMode=yes` 為強制、無法覆寫。** readiness／安全預設 `-o` 置於使用者 `--ssh-opt` **之前**，而 OpenSSH 對同一個 key 取第一個出現的值，因此 `BatchMode`、`ExitOnForwardFailure` 與 `ControlPath` 這組設定是刻意設計成權威、使用者蓋不掉的。後果是**不接受任何互動式認證**：開隧道當下認證就必須已經是非互動的。若 reachability provider 的憑證會過期（例如 Cloudflare Access 的 token），過期時 ssh 會直接失敗且**不會給出有用的診斷訊息**——無人值守情境需改用 service token，或事先完成 refresh。
 - `daemon start` **不支援** `--endpoint`（daemon 只能在本機啟動，會回 `REMOTE_NOT_SUPPORTED`）。
 - **`file.push` / `file.pull` 的 `local_path` 是 daemon 端（UART host）的路徑**，不是 agent 本機路徑；agent 若要傳輸本機檔案，需先透過 scp/rsync 傳到 UART host，再由 daemon 執行 file transfer。WAL、mirror log 等路徑回傳值同理。
-- **native Windows 本期不支援** `serialwrap remote`：執行會回 `REMOTE_NOT_SUPPORTED`（見下方手動等價）。
+- **native Windows 支援** `serialwrap remote -R/-L`、`connect` 與 `benches`；Windows 使用整棵行程樹終止，且不使用 OpenSSH ControlMaster。可用 `serialwrap remote stop [port|all]` 停止指定隧道；省略參數時停止全部。
+- **OD-12 信任邊界**：遠端隧道讓通過 SSH 驗證的使用者取得 DUT 完整控制權。僅部署於單人工作站並使用可信 relay；這不代表共享主機具備同使用者隔離。
 - 若要做隔離式雙 container 驗證，可直接執行 `./tools/docker/remote_smoke.sh`；完整流程說明在 [`func-test/README.md`](./func-test/README.md) 的 **Remote Support Docker test flow**。
 
 ### 手動 `ssh -R` / `-L` 等價（不透過 `serialwrap remote`）
@@ -3043,12 +3080,12 @@ options:
   --socket SOCKET      本機 daemon 的 Unix socket 路徑（未指定時依 config.yaml 與 XDG 執行期目錄解析，可用 SERIALWRAP_RUN_DIR 覆寫）
   --endpoint ENDPOINT  遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）
   --bench CODE         使用 connect 記住的 bench 代號解析 endpoint（優先序低於 --endpoint/--socket，高於 config fallback）
-  --timeout TIMEOUT_S  RPC timeout 秒數（未指定：一般方法 5.0；長操作 session attach/recover/self-test/console-attach 自動採固定 45.0 的 floor，#123）
+  --timeout TIMEOUT_S  RPC timeout 秒數（未指定：一般方法 5.0；長操作 session attach/recover/self-test/console-attach、device release/attach、session clear/bind 自動採固定 45.0 的 floor，#123）
   --retries RETRIES    TIMEOUT／連線失敗時的重試次數，僅作用於冪等唯讀方法白名單（指數退避 0.5s 起、單次上限 5s；預設: 0）
 
 command groups:
   <group>
-    daemon             管理 serialwrap daemon（啟動／停止／狀態）
+    daemon             管理 serialwrap daemon（啟動／停止／重啟／狀態）
     device             實體 UART 裝置列舉與 handoff（release／attach）
     session            session 生命週期、探測、recover、console 與 interactive 操作
     alias              session 別名與 by-id 綁定管理
@@ -3082,12 +3119,13 @@ examples:
 <!-- BEGIN: cli-help marker="serialwrap-daemon-help" -->
 usage: serialwrap daemon [-h] <command> ...
 
-管理 serialwrap daemon 行程：啟動、停止與查詢執行狀態。
+管理 serialwrap daemon 行程：啟動、停止、重啟與查詢執行狀態。
 
 positional arguments:
   <command>
     start     啟動 daemon（--foreground 可前景執行；systemd 模式重導 service start）
     stop      停止執行中的 daemon
+    restart   重啟 daemon（systemd 模式重導 service restart）
     status    顯示 daemon 狀態（pid／sessions／devices／log 路徑／多開偵測 multi_open）
 
 options:
@@ -3142,8 +3180,7 @@ positional arguments:
   <command>
     list      列出實體 UART 裝置（real_path 與 by-id）
     release   釋放 raw 裝置給外部工具獨佔（如 MCU 燒錄），進入 RELEASED 不自動搶回
-    attach    收回先前 release 的裝置並重建 console（外部仍持有時回 DEVICE_STILL_HELD，--force
-              略過）
+    attach    收回先前 release 的裝置並重建 console（--force 只略過開檔前預檢，不會搶占已識別的外部持有者）
 
 options:
   -h, --help  show this help message and exit
@@ -3162,10 +3199,11 @@ serialwrap remote：外包系統 ssh 建立 -R（expose，把本機 daemon 推�
   serialwrap remote -L user@relay:7777    # connect（relay/雙 NAT）
   serialwrap remote                        # 列目前隧道（status）
   serialwrap remote close 7777|all         # 拆除
+  serialwrap remote stop [port|all]        # close 的別名，省略時拆除全部
 安全：只透過 ssh-tunnel、單租戶/可信 relay 或 --remote-socket；不可對網路直接開放。
 
 positional arguments:
-  words                 [user@]host:port ｜ status ｜ close <port|all>
+  words                 [user@]host:port ｜ status ｜ close/stop [port|all]
 
 options:
   -h, --help            show this help message and exit

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shlex
@@ -17,6 +18,7 @@ from .arbiter import (
     WARNING_CMD_LENGTH,
     CommandArbiter,
 )
+from .admission import AdmissionGate
 from .config import ProfileTemplate, SessionProfile
 from .command_completion import ERROR_INVALID_COMPLETION_REGEX, valid_completion_regex
 from .constants import (
@@ -36,12 +38,14 @@ from .constants import (
 from .flash_endpoint import FlashEndpoint, detect_mcu_line, pump_endpoint_to_sink
 from .mcu_patterns import McuPatternRegistry
 from .multi_open import detect_multi_open
-from .device_source import _load_exclude_coms  # #131：實作移至 device_source，此處保留匯入相容
+from . import serial_port as serial_port_mod
+from .device_source import PosixDeviceSource, _load_exclude_coms  # #131：實作移至 device_source，此處保留匯入相容
 from .device_watcher import DeviceWatcher
 from .event_engine import EventEngine, EngineDeps
 from .event_engine.line_buffer import LineBuffer
 from .file_transfer import _ACK_MODES, DEFAULT_CHUNK_SIZE
 from .session_manager import SessionManager
+from .test_allowlist import AllowlistDecision, AllowlistDeviceSource
 from .util import now_iso
 from .version import resolve_version
 from .wal import WalWriter, rows_to_text_lines
@@ -67,6 +71,18 @@ _HUMAN_INTERACTIVE_COMMANDS = {
     "watch",
 }
 _ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
+
+# 依 RPC 契約 side_effects 非空且 retryable_readonly=false 的方法建立 admission 清單。
+_ADMISSION_METHODS = {
+    "alias.assign", "alias.set", "alias.unassign", "command.cancel",
+    "command.result_tail", "device.attach", "device.release", "event.com_disable",
+    "event.com_enable", "event.reload", "event.reset", "event.rule_delete",
+    "event.rule_set", "file.pull", "file.push", "result.tail", "session.attach",
+    "session.bind", "session.clear", "session.console_attach", "session.console_detach",
+    "session.interactive_close", "session.interactive_open", "session.interactive_send", "session.interactive_status",
+    "session.log_start", "session.log_stop", "session.pin", "session.recover",
+    "session.self_test", "session.unpin", "wal.reset",
+}
 
 
 def _coerce_rpc_bool(value: Any) -> bool:
@@ -218,6 +234,9 @@ class _BridgeProbe:
 
 
 class SerialwrapService:
+    # SC-19：類別層預設 None；未經 __init__ 建構的替身（既有測試以 object.__new__ 建立）呼叫 health() 仍安全。
+    _test_allowlist: AllowlistDecision | None = None
+
     def __init__(
         self,
         profiles: list[SessionProfile],
@@ -227,8 +246,15 @@ class SerialwrapService:
         by_id_dir: str = DEVICE_BY_ID_DIR,
         by_path_dir: str = DEVICE_BY_PATH_DIR,
         state_path: str | None = None,
+        test_allowlist: AllowlistDecision | None = None,
     ) -> None:
         self._wal = WalWriter()
+        # SC-19（OD-11）：只有 enabled 的判定才生效；被拒或未設定者不進入裝置發現路徑。
+        self._test_allowlist: AllowlistDecision | None = (
+            test_allowlist if test_allowlist is not None and test_allowlist.enabled else None
+        )
+        self.admission = AdmissionGate()
+        self._interactive_admission_tickets: dict[str, Any] = {}
         self._lock = threading.RLock()
         self._running = False
         self._started_at: str | None = None
@@ -236,7 +262,11 @@ class SerialwrapService:
         # #154：daemon 啟動時算一次、常駐於 instance，避免每次 RPC 都重開 VERSION 檔案。
         self._version = resolve_version()
 
-        self._arbiter = CommandArbiter(self._send_cb)
+        self._arbiter = CommandArbiter(
+            self._send_cb,
+            admission=self.admission,
+            on_cancel=lambda cmd_id: self._sessions.revoke_tx_op(cmd_id),
+        )
         self._sessions = SessionManager(
             profiles,
             self._wal,
@@ -247,6 +277,7 @@ class SerialwrapService:
             on_console_line=self._on_console_line,
             on_command_flush=self._on_command_flush,
             state_path=state_path,
+            admission=self.admission,
         )
         self._engine = EventEngine(EngineDeps(
             events_dir=EVENTS_DIR,
@@ -264,6 +295,12 @@ class SerialwrapService:
             _source = WindowsDeviceSource(exclude_coms=_load_exclude_coms())
         else:
             _source = None  # 預設 PosixDeviceSource（由 DeviceWatcher 內部建立）
+        if self._test_allowlist is not None:
+            # SC-19：allowlist 只包住「掃描→發現」來源；open、BC-04 獨占鎖與 backend 選擇完全不變。
+            # 與 DeviceWatcher 預設來源相同的掃描目錄（by-id 優先、by-path 次之）。
+            if _source is None:
+                _source = PosixDeviceSource([by_id_dir, by_path_dir])
+            _source = AllowlistDeviceSource(_source, self._test_allowlist.coms)
         self._watcher = DeviceWatcher(
             by_id_dir, self._on_device_change,
             extra_scan_dirs=[by_path_dir],
@@ -281,6 +318,7 @@ class SerialwrapService:
         self._flash_endpoint = FlashEndpoint(
             link_path=TTYMCU_PATH,
             on_flash_open=self._on_flash_open,
+            admission=self.admission,
         )
 
     def _on_ready(self, session_id: str) -> None:
@@ -296,6 +334,7 @@ class SerialwrapService:
         self._arbiter.flush_session(session_id, error_code)
 
     def _engine_rx_observer(self, com: str, data: bytes, wal_seq: int) -> None:
+        """以該 RX chunk 的精確 WAL seq 將完整行送入 EventEngine。"""
         with self._engine_buffers_lock:
             buf = self._engine_line_buffers.get(com)
             if buf is None:
@@ -304,22 +343,54 @@ class SerialwrapService:
         for line in buf.feed(data):
             self._engine.feed_line(com, line, wal_seq)
 
-    def _send_cb(self, session_id: str, command: str, source: str, cmd_id: str, timeout_s: float, mode: str, expected_duration_s: float | None = None, completion_regex: str | None = None) -> dict[str, Any]:
-        options: dict[str, Any] = {"timeout_s": timeout_s, "mode": mode, "expected_duration_s": expected_duration_s}
+    def _send_cb(
+        self,
+        session_id: str,
+        command: str,
+        source: str,
+        cmd_id: str,
+        timeout_s: float,
+        mode: str,
+        expected_duration_s: float | None = None,
+        completion_regex: str | None = None,
+        *,
+        trusted_human: bool = False,
+    ) -> dict[str, Any]:
+        options: dict[str, Any] = {
+            "timeout_s": timeout_s,
+            "mode": mode,
+            "expected_duration_s": expected_duration_s,
+            "trusted_human": trusted_human,
+        }
         if completion_regex is not None:
             options["completion_regex"] = completion_regex
         return self._sessions.execute_command(session_id, command, source, cmd_id, **options)
 
     def _on_console_line(self, session_id: str, client_id: str, line: str) -> None:
         mode = _human_console_mode(line)
-        self._arbiter.submit(
+        result = self._arbiter.submit(
             session_id=session_id,
             command=line,
             source=f"human:{client_id}",
             mode=mode,
             timeout_s=30.0,
             priority=100,
+            admission_exempt=True,
+            trusted_human=True,
         )
+        error_code = result.get("error_code")
+        if not result.get("ok") and error_code in {
+            "CMD_TOO_LONG",
+            "SESSION_QUEUE_FULL",
+            "SESSION_NOT_READY",
+        }:
+            logging.getLogger("serialwrap").warning(
+                "serialwrap: console 行被拒（session=%s client=%s error_code=%s bytes=%d）",
+                session_id,
+                client_id,
+                error_code,
+                len(line.encode("utf-8")),
+            )
 
     def _bg_fallback_from_arbiter(
         self, cmd_id: str, from_chunk: int = 0,
@@ -425,7 +496,9 @@ class SerialwrapService:
             except (KeyError, AttributeError):
                 fallback_baud = None
             ack = transport.acks.get(result.by_id, b"")   # 偵測時 MCU 回的 ACK，回放給 flasher
-            self._sessions.enter_flashing(com)
+            entered = self._sessions.enter_flashing(com)
+            if not entered.get("ok"):
+                return
             transport.release_held(adopt=com)   # 命中線 gate 交接 flash 生命週期；其餘 held 一併釋放
             # 命中線已進 FLASHING（由 state 守護），偵測也已結束——立即解除**全部**候選的 flash-critical
             # 標記，避免在後續（可能數分鐘的）pump 期間誤擋無關候選 COM 的 destructive op。
@@ -507,14 +580,14 @@ class SerialwrapService:
             self._started_at = now_iso()
         self._engine.start()
         self._sessions.add_rx_observer(self._engine_rx_observer)
-        self._watcher.start()
-        self._watcher.poll_once()
+        initial_devices = self._watcher.scan_once()
         # #100：在 spawn attach threads 之前，先對「當下在線的 dynamic 裝置」依 by-id
         # 排序一次配好 COM rank（兩條 startup 入口 update_devices / bootstrap_attach 都會
         # 觸發並發 attach；先預配才能消除「誰先搶到 lock 誰拿 COM0」的 race）。
-        self._sessions.prepare_dynamic_rank(list(self._watcher.devices.keys()))
-        self._sessions.update_devices(self._watcher.devices)
+        self._sessions.prepare_dynamic_rank(list(initial_devices.keys()))
+        self._sessions.update_devices(initial_devices)
         self._sessions.bootstrap_attach()
+        self._watcher.start()
         self._flash_endpoint.start()
 
     def stop(self) -> None:
@@ -522,8 +595,13 @@ class SerialwrapService:
             if not self._running:
                 return
             self._running = False
+        self.admission.freeze()
+        self._sessions.begin_shutdown()
+        for row in self._sessions.list_sessions():
+            self._arbiter.flush_session(row["session_id"], "FLUSHED_BY_SHUTDOWN")
         self._engine.stop()
         self._watcher.stop()
+        shutdown = self._sessions.shutdown_drain()
         for row in self._sessions.list_sessions():
             sid = row["session_id"]
             # daemon shutdown 用 FLUSHED_BY_SHUTDOWN 與 recovery/detach 類路徑區隔（#128
@@ -534,6 +612,15 @@ class SerialwrapService:
             self._flash_endpoint.stop()
         except OSError:
             pass
+        if not shutdown.get("graceful", False):
+            import logging
+            logging.getLogger("serialwrap").error(
+                "serialwrapd: 有序關機逾時，未收斂 session=%s（非優雅停止，SC-11 不計 PASS）",
+                ",".join(shutdown.get("stalled", [])),
+            )
+            self._wal.sync()
+        else:
+            self._wal.close()
 
     def _wal_missing_response(self, health: dict[str, Any]) -> dict[str, Any] | None:
         """WAL 已寫過紀錄但現行檔不存在 → 明確錯誤，不用空陣列 + ok:true 帶過（#189）。
@@ -608,21 +695,51 @@ class SerialwrapService:
         tty_paths = [s.get("attached_real_path") for s in sessions if s.get("attached_real_path")]
         mo = detect_multi_open(tty_paths=[t for t in tty_paths if t])
         result["multi_open"] = mo["multi_open"]
-        result["foreign_holders"] = mo["holders"]
+        foreign_holders = dict(mo["holders"])
+        for device in serial_port_mod.unknown_holder_devices():
+            entry: dict[str, Any] = {"device": device, "holder_unknown": True}
+            known_pid = foreign_holders.get(device)
+            if known_pid is not None:
+                entry["pids"] = [known_pid]
+            foreign_holders[device] = entry
+        result["foreign_holders"] = foreign_holders
         result["multi_open_detail"] = {
             "daemons": mo["daemons"],
             "holders_status": mo["holders_status"],
         }
+        if self._test_allowlist is not None:
+            # SC-19：啟用時必須顯示（OD-11）；未啟用時不輸出此鍵，既有輸出逐位元組不變。
+            result["test_device_allowlist"] = {
+                "enabled": True,
+                "coms": list(self._test_allowlist.coms),
+                "source": self._test_allowlist.source,
+            }
         return result
 
     def _resolve_session_id(
-        self, selector: str, *, source: str = "agent"
+        self,
+        selector: str,
+        *,
+        source: str = "agent",
+        trusted_human: bool = False,
     ) -> tuple[str | None, dict[str, Any] | None]:
         state = self._sessions.get_session_state(selector)
         if not state.get("ok"):
             return None, state
         session = state["session"]
         if session.get("state") != "READY":
+            if session.get("state") == "RECOVERING":
+                return None, {
+                    "ok": False,
+                    "error_code": "SESSION_RECOVERING",
+                    "session": session,
+                }
+            if session.get("state") == "FLASHING":
+                return None, {
+                    "ok": False,
+                    "error_code": "FLASHING_BUSY",
+                    "session": session,
+                }
             # ATTACHED 且非 command-capable（無 ready_probe，僅支援 console）的 profile
             # 永遠不會進 READY，回語意明確的錯誤碼而非 SESSION_NOT_READY。
             if session.get("state") == "ATTACHED" and not session.get("command_capable", True):
@@ -644,9 +761,9 @@ class SerialwrapService:
         # arm（疑似板卡自發重開機的過渡態）時，非 human 來源的顯式命令即時拒絕——bytes
         # 若送出會落入 U-Boot autoboot 倒數窗打斷開機、以 PROMPT_TIMEOUT 吞掉。此拒絕
         # 零 UART 副作用、可重試；session 重新確認 READY 時 quiet 同步解除（session_manager
-        # 各 READY 轉移點 clear_boot_quiet）。human console／interactive lease 不經此路徑，
-        # source 前綴檢查為 belt-and-suspenders（與 execute_command 慣例一致）。
-        if not source.startswith("human:"):
+        # 各 READY 轉移點 clear_boot_quiet）。只有 daemon 內部 human console 能明確帶入
+        # trusted_human；RPC 的 source 字串不授予 gate 豁免。
+        if not trusted_human:
             # #162 有界化（優先於兩個可重試分支）：pending 已逾 READY_RECONFIRM_MAX_S／
             # READY_RECONFIRM_MAX_ATTEMPTS 落終態——daemon 已無自動路徑可解，回**不可
             # 重試**的 READY_UNCONFIRMED（刻意不帶 retry_after_s）。若仍回 AUTOBOOT_QUIET，
@@ -696,11 +813,124 @@ class SerialwrapService:
         （如 `tests/test_profile_pin_sticky.py::TestRpc`），此時 `_version` 未設，
         版本欄位就此略過而非拋 AttributeError。
         """
-        result = self._dispatch(method, params)
+        gate = getattr(self, "admission", None)
+        if method == "daemon.handoff_stop" and gate is not None:
+            return self.handoff_stop(params)
+
+        ticket = None
+        if gate is not None and method in _ADMISSION_METHODS:
+            ticket = gate.admit(method, self._admission_com(params))
+            if ticket is None:
+                return self._versioned_response({
+                    "ok": False,
+                    "error_code": "FLUSHED_BY_SHUTDOWN",
+                    "reason": "handoff_frozen",
+                })
+        try:
+            result = self._dispatch(method, params)
+            if method.startswith("session.interactive_"):
+                self._reconcile_interactive_admission_tickets()
+            if method == "session.interactive_open" and ticket is not None and result.get("ok"):
+                interactive_id = str(result.get("interactive_id") or result.get("interactive_session_id") or "")
+                if interactive_id:
+                    getattr(self, "_interactive_admission_tickets", {})[interactive_id] = ticket
+                    ticket = None
+            if method == "session.interactive_close" and result.get("ok"):
+                interactive_id = str(params.get("interactive_id") or "")
+                old_ticket = getattr(self, "_interactive_admission_tickets", {}).pop(interactive_id, None)
+                if old_ticket is not None:
+                    gate.done(old_ticket)
+            return self._versioned_response(result)
+        finally:
+            if ticket is not None:
+                gate.done(ticket)
+
+    def _versioned_response(self, result: dict[str, Any]) -> dict[str, Any]:
         version = getattr(self, "_version", None)
         if isinstance(result, dict) and version is not None:
             result.setdefault("version", version)
         return result
+
+    def _admission_com(self, params: dict[str, Any]) -> str | None:
+        selector = str(
+            params.get("selector") or params.get("session_id") or params.get("com")
+            or params.get("alias") or ""
+        )
+        if selector:
+            session = self._sessions.get_session(selector)
+            if session is not None:
+                profile = getattr(session, "profile", None)
+                if profile is not None:
+                    return profile.com
+                if isinstance(session, dict):
+                    com = session.get("com")
+                    return str(com) if com else None
+        interactive_id = str(params.get("interactive_id") or "")
+        if interactive_id:
+            with self._sessions._lock:
+                lease = self._sessions._interactive.get(interactive_id)
+                session = self._sessions._sessions.get(lease.session_id) if lease is not None else None
+                if session is not None:
+                    return session.profile.com
+        by_id = str(params.get("device_by_id") or params.get("by_id") or "")
+        if by_id:
+            session = self._sessions.get_session(by_id)
+            return session.profile.com if session is not None else None
+        return None
+
+    def _reconcile_interactive_admission_tickets(self) -> None:
+        tickets = getattr(self, "_interactive_admission_tickets", None)
+        gate = getattr(self, "admission", None)
+        manager = getattr(self, "_sessions", None)
+        if not isinstance(tickets, dict) or not tickets or gate is None or manager is None:
+            return
+        with manager._lock:
+            active = {
+                session.interactive_session_id
+                for session in manager._sessions.values()
+                if session.interactive_session_id is not None
+                and session.interactive_session_id in manager._interactive
+            }
+        for interactive_id in list(tickets):
+            if interactive_id not in active:
+                ticket = tickets.pop(interactive_id, None)
+                if ticket is not None:
+                    gate.done(ticket)
+
+    def handoff_stop(self, params: dict[str, Any]) -> dict[str, Any]:
+        reason = str(params.get("reason") or "update")
+        self._reconcile_interactive_admission_tickets()
+        with self._sessions._lock:
+            sessions = sorted(self._sessions._sessions.values(), key=lambda item: item.profile.com)
+            for session in sessions:
+                com = session.profile.com
+                self.admission.set_flag(com, "recovering", session.state == "RECOVERING")
+                self.admission.set_flag(
+                    com, "flashing",
+                    session.state == "FLASHING" or com in self._sessions._flash_critical_coms,
+                )
+                self.admission.set_flag(com, "lease", session.interactive_session_id is not None)
+            token, busy = self.admission.freeze_if_idle(reason)
+            if token is None:
+                rows: list[dict[str, Any]] = []
+                for com, gate_row in sorted(busy.get("by_com", {}).items()):
+                    session = next((item for item in sessions if item.profile.com == com), None)
+                    public = session.to_public_dict() if session is not None else {}
+                    ops = list(gate_row.get("ops", []))
+                    if "lease" in gate_row.get("flags", []) and "session.interactive_open" not in ops:
+                        ops.append("session.interactive_open")
+                    rows.append({
+                        "com": com,
+                        "state": public.get("state", "UNKNOWN"),
+                        "foreground_busy": bool(public.get("foreground_busy", False)),
+                        "outstanding_commands": int(public.get("outstanding_commands", 0)),
+                        "interactive_session_id": public.get("interactive_session_id"),
+                        "recovering": bool(public.get("recovering", False) or "recovering" in gate_row.get("flags", [])),
+                        "ops": sorted(ops),
+                    })
+                error_code = "FLASHING_BUSY" if busy.get("flashing") else "SESSION_BUSY"
+                return {"ok": False, "error_code": error_code, "busy": rows}
+        return {"ok": True, "stopping": True, "handoff_token": token}
 
     def _dispatch(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         if method == "health.ping":
@@ -902,7 +1132,9 @@ class SerialwrapService:
             expected_duration_s: float | None = float(raw_ed) if raw_ed is not None else None
             if not selector:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
-            session_id, err = self._resolve_session_id(selector, source=source)
+            session_id, err = self._resolve_session_id(
+                selector, source=source, trusted_human=False
+            )
             if err is not None:
                 return err
             assert session_id is not None
@@ -915,6 +1147,7 @@ class SerialwrapService:
                 priority=priority,
                 expected_duration_s=expected_duration_s,
                 completion_regex=completion_regex,
+                admission_com=self._admission_com(params),
             )
 
         if method == "command.get":
@@ -1088,7 +1321,9 @@ class SerialwrapService:
             source = str(params.get("source") or "agent")
             if not selector or not local_path or not remote_path:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
-            session_id, err = self._resolve_session_id(selector, source=source)
+            session_id, err = self._resolve_session_id(
+                selector, source=source, trusted_human=False
+            )
             if err is not None:
                 return err
             return self._sessions.file_push(
@@ -1099,6 +1334,7 @@ class SerialwrapService:
                 chunk_timeout_s=chunk_timeout_s,
                 ack_mode=ack_mode,
                 source=source,
+                trusted_human=False,
             )
 
         if method == "file.pull":
@@ -1119,7 +1355,9 @@ class SerialwrapService:
             source = str(params.get("source") or "agent")
             if not selector or not remote_path:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
-            session_id, err = self._resolve_session_id(selector, source=source)
+            session_id, err = self._resolve_session_id(
+                selector, source=source, trusted_human=False
+            )
             if err is not None:
                 return err
             return self._sessions.file_pull(
@@ -1128,6 +1366,7 @@ class SerialwrapService:
                 local_path=str(local_path) if local_path else None,
                 chunk_timeout_s=chunk_timeout_s,
                 source=source,
+                trusted_human=False,
             )
 
         if method == "event.rule_set":

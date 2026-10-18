@@ -269,7 +269,10 @@ def test_version_absent_for_matches_runtime():
     """驗證 version_absent_for 表列的情境回應皆不含 version，且 health.ping 回應末尾含 version。"""
     schema = _schema()
     expected_absent = set(schema["x-wire"]["version_absent_for"])
-    assert expected_absent == {"INVALID_JSON", "INVALID_REQUEST", "INVALID_METHOD", "EXCEPTION", "daemon.stop"}
+    assert expected_absent == {
+        "INVALID_JSON", "INVALID_REQUEST", "INVALID_METHOD", "EXCEPTION",
+        "daemon.stop", "daemon.handoff_stop",
+    }
 
     # INVALID_JSON
     resp = json.loads(_roundtrip(b"{bad\n")[0].decode("utf-8"))
@@ -520,7 +523,7 @@ def test_params_names_match_dispatch_reads():
     schema = _schema()
     ast_names = _dispatch_param_names()
     for m, spec in schema["x-methods"].items():
-        if m == "daemon.stop":
+        if m in {"daemon.stop", "daemon.handoff_stop"}:
             continue
         expected = set(spec.get("params", {}))
         for p in spec.get("params", {}).values():
@@ -708,6 +711,7 @@ _PRECEDENCE_TRIGGER: dict[str, dict[str, Any]] = {
 _NOT_SERVICE_TESTABLE: dict[str, str] = {
     "command.cancel": "CMD_NOT_FOUND 與 CMD_NOT_CANCELABLE 同出於單一 arbiter 呼叫的內部判定，無法由替身同時造成，留待 P2 整合測試",
     "result.tail": "cmd_id 分支（CMD_NOT_FOUND）與 com/selector 分支（SESSION_NOT_FOUND）互斥，同一請求不會同時成立",
+    "daemon.handoff_stop": "交接 method 由 daemon 層處理，不經 service._dispatch",
 }
 
 

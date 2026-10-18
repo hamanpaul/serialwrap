@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Mapping
 
 
 def _env_path(name: str, default: str) -> str:
@@ -25,6 +26,13 @@ _RUNTIME_HOME = os.environ.get("XDG_RUNTIME_DIR")  # 可能 None
 
 CONFIG_DIR = _env_path("SERIALWRAP_CONFIG_DIR", os.path.join(_CONFIG_HOME, "serialwrap"))
 STATE_DIR = _env_path("SERIALWRAP_STATE_DIR", os.path.join(_STATE_HOME, "serialwrap"))
+if os.name == "nt":
+    _SYSTEM_CONFIG_PATH = os.path.join(
+        os.environ.get("ProgramData", r"C:\ProgramData"), "serialwrap", "config.yaml"
+    )
+else:
+    _SYSTEM_CONFIG_PATH = "/etc/serialwrap/config.yaml"
+SYSTEM_CONFIG_PATH = os.environ.get("SERIALWRAP_TEST_SYSTEM_CONFIG_PATH", _SYSTEM_CONFIG_PATH)
 def _run_dir_default() -> str:
     # 若呼叫端只設 SERIALWRAP_STATE_DIR（常見 CI / throwaway daemon 隔離），socket/lock 必須
     # 落在 STATE_DIR 之下以維持向後相容（舊行為 RUN_DIR 預設＝STATE_DIR，即使 XDG_RUNTIME_DIR 存在）。
@@ -63,6 +71,12 @@ DEVICE_BY_ID_DIR = _env_path("SERIALWRAP_BY_ID_DIR", "/dev/serial/by-id")
 DEVICE_BY_PATH_DIR = _env_path("SERIALWRAP_BY_PATH_DIR", "/dev/serial/by-path")
 LOG_DIR = _env_path("SERIALWRAP_LOG_DIR", os.path.join(os.path.expanduser("~"), "b-log"))
 DEFAULT_WAL_ROTATE_BYTES = 64 * 1024 * 1024
+WAL_IDENTITY_CHECK_INTERVAL_S: float = 0.05
+WAL_RECREATE_BACKOFF_S: tuple[float, ...] = (0.01, 0.05, 0.2)
+WAL_RECREATE_RETRY_INTERVALS_S: tuple[float, ...] = (1.0, 2.0, 5.0)
+DRAIN_TIMEOUT_MS: int = 3000
+# drain Phase 1 等待 TX fence 的最長秒數；不延後共同 3 秒 drain deadline。
+DRAIN_FENCE_ACQUIRE_S: float = 0.05
 EVENTS_DIR = _env_path(
     "SERIALWRAP_EVENTS_DIR",
     os.path.join(os.path.expanduser("~"), ".serialwrap", "events.d"),
@@ -77,6 +91,30 @@ EVENTS_LOG_PATH = _env_path(
 )
 EVENTS_LOG_ROTATE_BYTES = 10 * 1024 * 1024
 EVENTS_LOG_BACKUP_COUNT = 3
+
+
+def resolve_config_path(
+    *,
+    for_write: bool = False,
+    env: Mapping[str, str] | None = None,
+) -> str:
+    """依優先序解析執行期設定檔；系統設定檔只供讀取。"""
+    source = os.environ if env is None else env
+    explicit = source.get("SERIALWRAP_CONFIG")
+    if explicit is not None and explicit.strip():
+        return os.path.expanduser(explicit)
+
+    config_dir = source.get("SERIALWRAP_CONFIG_DIR")
+    if config_dir is None or not config_dir.strip():
+        config_dir = CONFIG_DIR
+    user_path = os.path.join(os.path.expanduser(config_dir), "config.yaml")
+    if for_write:
+        return user_path
+    if os.path.exists(user_path):
+        return user_path
+    if os.path.exists(SYSTEM_CONFIG_PATH):
+        return SYSTEM_CONFIG_PATH
+    return user_path
 
 
 # 帳密解析終態（#140）：profile 宣告帳密來源但解析為空時，session 進此終態，
@@ -200,13 +238,60 @@ CMD_PENDING_MAX: int = 256
 無法回收尚未執行者；少了 admission control，client 比 UART worker 快時 _commands 與 PriorityQueue 會
 持續累積 accepted/running records 而 OOM（#81 Codex 必修）。"""
 DEFERRED_INPUT_MAX_BYTES: int = 256 * 1024
-"""agent 命令期間單一 human console 的 deferred 輸入緩衝上限；超過則丟最舊位元組。"""
+"""agent 命令期間單一 human console 的 deferred 輸入緩衝上限；超過即整段清空。"""
+CONSOLE_LINE_MAX_BYTES: int = 16385
+"""human console 單行輸入緩衝上限；超過即丟棄整行。"""
+INTERACTIVE_TOMBSTONE_MAX: int = 16
+"""每個 session 保留的 expired interactive lease tombstone FIFO 上限。"""
+
+
+def default_isolation_paths() -> dict[str, str]:
+    """以「SERIALWRAP_STATE_DIR／RUN_DIR／CONFIG_DIR 皆未設定」重新計算三個目錄的預設值（SC-19，OD-11）。
+
+    隔離判定以此為比對基準，故每次呼叫都重新讀取 XDG 與 HOME，不沿用模組層常數——
+    否則外層 shell 已 export 的 ``SERIALWRAP_*_DIR`` 會讓「等於預設」的判定失真。
+    分支邏輯與 ``STATE_DIR``／``RUN_DIR``／``CONFIG_DIR`` 的預設值一致（RUN 於 STATE 未設定時的分支）。
+    """
+    home = os.path.expanduser("~")
+    state = os.path.expanduser(
+        os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.join(home, ".local", "state"), "serialwrap")
+    )
+    config = os.path.expanduser(
+        os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config"), "serialwrap")
+    )
+    runtime_home = os.environ.get("XDG_RUNTIME_DIR")
+    run = os.path.join(runtime_home, "serialwrap") if runtime_home else os.path.join(state, "run")
+    return {
+        "SERIALWRAP_STATE_DIR": state,
+        "SERIALWRAP_RUN_DIR": run,
+        "SERIALWRAP_CONFIG_DIR": config,
+    }
 
 
 def ensure_runtime_dirs() -> None:
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    os.makedirs(STATE_DIR, exist_ok=True)
-    os.makedirs(RUN_DIR, exist_ok=True)
-    os.makedirs(WAL_DIR, exist_ok=True)
-    os.makedirs(EVENTS_DIR, exist_ok=True)
-    os.makedirs(EVENTS_RUNTIME_DIR, exist_ok=True)
+    for path in (CONFIG_DIR, STATE_DIR, RUN_DIR, WAL_DIR, EVENTS_DIR, EVENTS_RUNTIME_DIR):
+        _ensure_private_directory(path)
+
+
+def _ensure_private_directory(path: str) -> None:
+    """建立受管理目錄；只把本次新建的目錄設為 0700。"""
+    path = os.path.abspath(os.path.expanduser(path))
+    try:
+        os.mkdir(path, 0o700)
+    except FileNotFoundError:
+        parent = os.path.dirname(path)
+        if parent == path:
+            raise
+        _ensure_private_directory(parent)
+        try:
+            os.mkdir(path, 0o700)
+        except FileExistsError:
+            if not os.path.isdir(path):
+                raise
+        else:
+            os.chmod(path, 0o700)
+    except FileExistsError:
+        if not os.path.isdir(path):
+            raise
+    else:
+        os.chmod(path, 0o700)

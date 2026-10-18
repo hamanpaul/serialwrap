@@ -7,25 +7,22 @@ import subprocess
 
 import pytest
 
-# POSIX-only：sw_core/remote_tunnel.py:10 頂層 import fcntl，原生 Windows 無此模組；非 POSIX 整檔略過、不 import。
-if os.name != "posix":
-    pytest.skip("remote_tunnel 依賴 POSIX fcntl（remote_tunnel.py:10）", allow_module_level=True)
-
 from sw_core import remote_tunnel as rt
 
-pytestmark = [pytest.mark.posix_only]
 
-
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_parse_target_user_host_port():
     assert rt.parse_target("tester@relay:7777") == ("tester@relay", 7777)
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_parse_target_alias_only():
     assert rt.parse_target("myrelay:22000") == ("myrelay", 22000)
 
 
+@pytest.mark.core_portable
 @pytest.mark.parametrize("bad", ["nohost", "host:", "host:abc", "host:-1", "", "a@b@c:1"])
 @pytest.mark.memory_only
 def test_parse_target_rejects_bad(bad):
@@ -34,6 +31,7 @@ def test_parse_target_rejects_bad(bad):
     assert ei.value.code == "INVALID_TARGET"
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_identity_stable_and_distinguishes_remote_socket():
     a = rt.TunnelSpec(role="expose", ssh_target="u@h", port=7777, forward_src="/run/s.sock")
@@ -44,6 +42,7 @@ def test_identity_stable_and_distinguishes_remote_socket():
     assert rt.compute_identity(a) != rt.compute_identity(c)
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_identity_distinguishes_via_and_ssh_opts():
     base = rt.TunnelSpec(role="expose", ssh_target="u@h", port=7777, forward_src="/run/s.sock")
@@ -58,6 +57,7 @@ def _cp():
     return "/run/user/1000/serialwrap/remote/cm-abc"
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_build_argv_expose_unix_socket_loopback_bind():
     spec = rt.TunnelSpec(role="expose", ssh_target="u@h", port=7777,
@@ -75,6 +75,7 @@ def test_build_argv_expose_unix_socket_loopback_bind():
     assert argv[-1] == "u@h"
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_build_argv_expose_remote_socket_hardened():
     spec = rt.TunnelSpec(role="expose", ssh_target="u@h", port=7777,
@@ -83,6 +84,7 @@ def test_build_argv_expose_remote_socket_hardened():
     assert argv[argv.index("-R") + 1] == "/relay/x.sock:/run/serialwrapd.sock"
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_build_argv_expose_tcp_forward_src():
     spec = rt.TunnelSpec(role="expose", ssh_target="u@h", port=7777,
@@ -91,6 +93,7 @@ def test_build_argv_expose_tcp_forward_src():
     assert argv[argv.index("-R") + 1] == "127.0.0.1:7777:127.0.0.1:48700"
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_build_argv_connect_tcp_loopback():
     spec = rt.TunnelSpec(role="connect", ssh_target="u@relay", port=7777, local=7777)
@@ -98,6 +101,7 @@ def test_build_argv_connect_tcp_loopback():
     assert argv[argv.index("-L") + 1] == "127.0.0.1:7777:localhost:7777"
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_build_argv_connect_remote_socket():
     spec = rt.TunnelSpec(role="connect", ssh_target="u@relay", port=7777, local=7788,
@@ -106,6 +110,7 @@ def test_build_argv_connect_remote_socket():
     assert argv[argv.index("-L") + 1] == "127.0.0.1:7788:/relay/x.sock"
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_build_argv_autossh_and_ssh_opts_passthrough():
     spec = rt.TunnelSpec(role="expose", ssh_target="u@h", port=7777,
@@ -117,6 +122,7 @@ def test_build_argv_autossh_and_ssh_opts_passthrough():
 
 
 # Task 3: Registry + PID liveness
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_registry_write_read_remove_atomic(tmp_path):
     reg = rt.Registry(str(tmp_path))
@@ -129,6 +135,7 @@ def test_registry_write_read_remove_atomic(tmp_path):
     assert reg.read(7777) is None
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_registry_remove_also_deletes_log(tmp_path):
     """`.log`（ssh stdout/stderr）須與 state/control socket 同生命週期清除，
@@ -147,6 +154,7 @@ def test_registry_remove_also_deletes_log(tmp_path):
     assert not os.path.exists(log_path)
 
 
+@pytest.mark.posix_only
 @pytest.mark.process_rpc
 def test_pid_alive_true_for_running_and_reuse_guard(tmp_path):
     proc = subprocess.Popen(["sleep", "30"])
@@ -161,6 +169,7 @@ def test_pid_alive_true_for_running_and_reuse_guard(tmp_path):
         proc.wait()
 
 
+@pytest.mark.posix_only
 @pytest.mark.process_rpc
 def test_pid_alive_false_for_dead(tmp_path):
     proc = subprocess.Popen(["true"])
@@ -168,6 +177,7 @@ def test_pid_alive_false_for_dead(tmp_path):
     assert rt.pid_alive(proc.pid, 12345) is False
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_lock_is_exclusive_serialized(tmp_path):
     # 兩次 lock 不會同時持有（LOCK_EX）；此處驗證可重入取得、釋放後再取。
@@ -196,6 +206,7 @@ def _spec_R():
                          ready_timeout=5.0)
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_wait_ready_active_when_check_and_probe_ok():
     clk = _Clock()
@@ -206,6 +217,7 @@ def test_wait_ready_active_when_check_and_probe_ok():
     assert st == "active"
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_wait_ready_starting_on_timeout_process_alive():
     clk = _Clock()
@@ -216,6 +228,7 @@ def test_wait_ready_starting_on_timeout_process_alive():
     assert st == "starting"
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_wait_ready_spawn_failed_when_process_dies():
     clk = _Clock()
@@ -228,6 +241,7 @@ def test_wait_ready_spawn_failed_when_process_dies():
     assert "publickey" in (ei.value.message or "")
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_wait_ready_remote_bind_unverified_propagates():
     clk = _Clock()
@@ -242,6 +256,7 @@ def test_wait_ready_remote_bind_unverified_propagates():
 
 
 # Task 5: probe 具體實作（ssh -O check / ss 遠端 bind / health.ping）
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_ssh_check_true_on_rc0():
     calls = []
@@ -254,6 +269,7 @@ def test_ssh_check_true_on_rc0():
     assert "-O" in calls[0] and "check" in calls[0]
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_role_probe_expose_tcp_rejects_wildcard():
     def runner(argv):
@@ -266,6 +282,7 @@ def test_role_probe_expose_tcp_rejects_wildcard():
     assert ei.value.code == "REMOTE_BIND_UNVERIFIED"
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_role_probe_expose_tcp_accepts_loopback():
     def runner(argv):
@@ -276,6 +293,7 @@ def test_role_probe_expose_tcp_accepts_loopback():
     assert probe() is True
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_role_probe_expose_tcp_rejects_interface_ip():
     def runner(argv):
@@ -288,6 +306,7 @@ def test_role_probe_expose_tcp_rejects_interface_ip():
     assert ei.value.code == "REMOTE_BIND_UNVERIFIED"
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_role_probe_expose_tcp_accepts_ipv6_loopback():
     def runner(argv):
@@ -298,6 +317,7 @@ def test_role_probe_expose_tcp_accepts_ipv6_loopback():
     assert probe() is True
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_role_probe_expose_remote_socket_skips_bind_check():
     def runner(argv):
@@ -309,6 +329,7 @@ def test_role_probe_expose_remote_socket_skips_bind_check():
     assert probe() is True
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_role_probe_connect_uses_health_ping():
     seen = {}
@@ -348,6 +369,7 @@ def _fake_spawner(alive=True, stderr=""):
     return spawn
 
 
+@pytest.mark.posix_only
 @pytest.mark.process_rpc
 def test_open_tunnel_expose_active(tmp_path):
     spec = rt.TunnelSpec(role="expose", ssh_target="u@h", port=7777, forward_src="/s.sock")
@@ -363,6 +385,7 @@ def test_open_tunnel_expose_active(tmp_path):
         spawn.procs["p"].terminate(); spawn.procs["p"].wait()
 
 
+@pytest.mark.core_portable
 @pytest.mark.process_rpc
 def test_open_tunnel_conflict_same_port_diff_identity(tmp_path):
     reg = rt.Registry(str(tmp_path))
@@ -377,6 +400,7 @@ def test_open_tunnel_conflict_same_port_diff_identity(tmp_path):
     assert ei.value.code == "TUNNEL_CONFLICT"
 
 
+@pytest.mark.posix_only
 @pytest.mark.process_rpc
 def test_open_tunnel_fail_closed_removes_state_on_bind_unverified(tmp_path):
     spec = rt.TunnelSpec(role="expose", ssh_target="u@h", port=7777, forward_src="/s.sock")
@@ -393,6 +417,7 @@ def test_open_tunnel_fail_closed_removes_state_on_bind_unverified(tmp_path):
             spawn.procs["p"].wait(timeout=2)
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_open_tunnel_already_running_noop(tmp_path):
     spec = rt.TunnelSpec(role="expose", ssh_target="u@h", port=7777, forward_src="/s.sock")
@@ -414,6 +439,7 @@ def test_open_tunnel_already_running_noop(tmp_path):
     assert res["already_running"] is True
 
 
+@pytest.mark.posix_only
 @pytest.mark.process_rpc
 def test_terminate_pgid_reaps_and_returns_promptly():
     proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
@@ -428,6 +454,7 @@ def test_terminate_pgid_reaps_and_returns_promptly():
 
 
 # Task 7: status（prune 死 state + orphan scan）與 close（killpg 整組 + verify + error-state）
+@pytest.mark.posix_only
 @pytest.mark.process_rpc
 def test_status_prunes_dead_and_lists_alive(tmp_path):
     reg = rt.Registry(str(tmp_path))
@@ -450,6 +477,7 @@ def test_status_prunes_dead_and_lists_alive(tmp_path):
         live.terminate(); live.wait()
 
 
+@pytest.mark.posix_only
 @pytest.mark.process_rpc
 def test_close_terminates_and_removes(tmp_path):
     reg = rt.Registry(str(tmp_path))
@@ -468,11 +496,13 @@ def test_close_terminates_and_removes(tmp_path):
     assert live.poll() is not None  # 已被終止
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_close_missing_is_idempotent(tmp_path):
     assert rt.close(str(tmp_path), 12345) == {"ok": True, "closed": []}
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_resolve_ssh_bin_missing(monkeypatch):
     monkeypatch.setattr(rt.shutil, "which", lambda name: None)
@@ -481,6 +511,7 @@ def test_resolve_ssh_bin_missing(monkeypatch):
     assert ei.value.code == "SSH_NOT_FOUND"
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_guard_platform_noop_on_windows(monkeypatch):
     """BC-05：guard_platform 保留函式（避免外部呼叫者匯入失敗），但在 Windows 為 no-op。"""
@@ -488,6 +519,7 @@ def test_guard_platform_noop_on_windows(monkeypatch):
     assert rt.guard_platform() is None  # 不擲 TunnelError
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_real_ping_uses_client(monkeypatch):
     # 注意：不可寫成 `seen.setdefault("ep", ep) or {"ok": True}`——setdefault
@@ -505,6 +537,7 @@ def test_real_ping_uses_client(monkeypatch):
 
 
 # Task 8 review fix：fail-closed 涵蓋 probe 逾時與任意 readiness 例外
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_make_runner_timeout_returns_nonzero(monkeypatch):
     """`subprocess.run` 逾時拋 `TimeoutExpired` 時，`make_runner()` 的 `_run` 需吞下並
@@ -518,6 +551,7 @@ def test_make_runner_timeout_returns_nonzero(monkeypatch):
     assert isinstance(msg, str)
 
 
+@pytest.mark.posix_only
 @pytest.mark.process_rpc
 def test_open_tunnel_teardown_on_nontunnel_exception(tmp_path):
     """readiness 階段丟出非 `TunnelError`（例如 `RuntimeError`）時，`open_tunnel` 仍需

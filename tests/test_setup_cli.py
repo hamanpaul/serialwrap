@@ -13,7 +13,7 @@ pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 @pytest.fixture
 def setup_env(tmp_path, monkeypatch):
     """不連任何真實 endpoint、不執行 systemctl 或 daemon stop；檔案只寫 tmp。"""
-    from sw_core import cli, sysenv
+    from sw_core import cli, multi_open, sysenv
     from sw_core.runtime_config import RuntimeConfig
 
     cfg_dir = tmp_path / "cfg"
@@ -24,8 +24,20 @@ def setup_env(tmp_path, monkeypatch):
     monkeypatch.setenv("SERIALWRAP_RPC_BACKEND", "posix")
     monkeypatch.setattr(cli, "CONFIG_DIR", str(cfg_dir))
     monkeypatch.setattr(cli, "SOCKET_PATH", str(tmp_path / "run" / "serialwrap.sock"))
+    monkeypatch.setattr(multi_open, "daemon_process_alive", lambda _pid, _endpoint: False)
     fx = sysenv.FakeEffects(systemd=True)
     monkeypatch.setattr(sysenv, "SystemEffects", lambda: fx)
+    original_run = fx.run
+
+    def run_effect(cmd, *, timeout_s=None):
+        result = original_run(cmd, timeout_s=timeout_s)
+        if cmd[-2:] == ["is-active", "serialwrap"]:
+            return 3, "inactive", ""
+        if "stop" in cmd:
+            state["reachable"] = False
+        return result
+
+    fx.run = run_effect
     # resolver 對 Unix／win TCP 的 connect 探測也須隔離，不能只 mock 最後 RPC。
     monkeypatch.setattr(cli, "_endpoint_alive", lambda endpoint: True)
     calls = []
@@ -33,9 +45,11 @@ def setup_env(tmp_path, monkeypatch):
 
     def rpc(endpoint, method, params, **kwargs):
         calls.append((endpoint, method))
-        assert method in {"health.ping", "mcu.status", "session.list"}
+        assert method in {"health.ping", "health.status", "mcu.status", "session.list"}
         if not state["reachable"]:
             raise OSError("隔離測試模擬 tunnel 暫時斷線")
+        if method == "health.status":
+            return {"ok": True, "pid": 2_000_000_000}
         return {"ok": True, "flashing": state["flashing"], "sessions": []}
 
     monkeypatch.setattr(cli, "rpc_call", rpc)
@@ -52,7 +66,7 @@ def setup_env(tmp_path, monkeypatch):
         cli=cli, fx=fx, config=config, write=write, calls=calls, state=state,
         read=lambda: RuntimeConfig(config), home=tmp_path,
     )
-    assert all(method in {"health.ping", "mcu.status", "session.list"} for _, method in calls)
+    assert all(method in {"health.ping", "health.status", "mcu.status", "session.list"} for _, method in calls)
 
 
 def test_setup_writes_config_to_xdg_config_dir_readable_by_supervision_mode(setup_env, capsys):

@@ -21,7 +21,9 @@ def test_transition_stops_old_before_starting_new(tmp_path):
     from sw_core.setup_cmd import reconcile
     fx = FakeEffects(systemd=True)
     res = reconcile(old_mode="on-demand", target_mode="systemd-user", fx=fx,
-                    home=tmp_path, daemon_running=True, any_flashing=False)
+                    home=tmp_path, daemon_running=True, any_flashing=False,
+                    old_endpoint="unix:///old.sock", ping=lambda _ep: False,
+                    alive=lambda _pid: False)
     cmds = _cmds(fx)
     stop_idx = next(i for i, c in enumerate(cmds) if "stop" in c)
     start_idx = next(i for i, c in enumerate(cmds) if "start" in c)
@@ -70,7 +72,9 @@ def test_force_overrides_flashing(tmp_path):
     from sw_core.setup_cmd import reconcile
     fx = FakeEffects(systemd=True)
     res = reconcile(old_mode="on-demand", target_mode="systemd-user", fx=fx,
-                    home=tmp_path, daemon_running=True, any_flashing=True, force=True)
+                    home=tmp_path, daemon_running=True, any_flashing=True, force=True,
+                    old_endpoint="unix:///old.sock", ping=lambda _ep: False,
+                    alive=lambda _pid: False)
     assert res["mode"] == "systemd-user"  # force 跳過 flash 護欄
 
 
@@ -82,7 +86,9 @@ def test_config_is_written_with_custom_path_and_socket(tmp_path):
     fx = FakeEffects(systemd=True)
     cfgp = tmp_path / "custom" / "config.yaml"
     res = reconcile(old_mode="on-demand", target_mode="systemd-user", fx=fx, home=tmp_path,
-                    daemon_running=False, config_path=cfgp, socket_path="/run/x.sock")
+                    daemon_running=False, config_path=cfgp, socket_path="/run/x.sock",
+                    old_endpoint="unix:///old.sock", ping=lambda _endpoint: False,
+                    alive=lambda _pid: False)
     assert res["applied"] is True
     rc = RuntimeConfig(cfgp)
     assert rc.mode() == "systemd-user"
@@ -114,7 +120,8 @@ def test_system_with_sudo_installs_real_unit_content(tmp_path):
     from sw_core.setup_cmd import reconcile, _resolve_run_user, SYSTEM_SOCKET, SYSTEM_PROFILE_DIR
     fx = FakeEffects(systemd=True)
     reconcile(old_mode="on-demand", target_mode="systemd-system", fx=fx, home=tmp_path,
-              daemon_running=False, with_sudo=True)
+              daemon_running=False, with_sudo=True, old_endpoint="unix:///old.sock",
+              ping=lambda _endpoint: False, alive=lambda _pid: False)
     staging = tmp_path / ".local" / "share" / "serialwrap" / "serialwrap.service"
     assert staging.is_file()
     content = staging.read_text(encoding="utf-8")
@@ -147,7 +154,8 @@ def test_transition_out_of_system_with_sudo_stops_before_starts(tmp_path):
     from sw_core.setup_cmd import reconcile
     fx = FakeEffects(systemd=True)
     res = reconcile(old_mode="systemd-system", target_mode="systemd-user", fx=fx, home=tmp_path,
-                    daemon_running=True, with_sudo=True)
+                    daemon_running=True, with_sudo=True, old_endpoint="unix:///old.sock",
+                    ping=lambda _ep: False, alive=lambda _pid: False)
     cmds = [" ".join(c) for c in fx.calls]
     stop_idx = next(i for i, c in enumerate(cmds) if "stop" in c)
     start_idx = next(i for i, c in enumerate(cmds) if "start" in c)

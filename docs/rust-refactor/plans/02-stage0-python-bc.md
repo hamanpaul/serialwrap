@@ -245,7 +245,9 @@
 
 **Files**
 - Create: `sw_core/wal_fs.py`、`tests/test_stage0_wal_handle.py`
-- Modify: `sw_core/wal.py`、`sw_core/constants.py`（新增 `WAL_IDENTITY_CHECK_INTERVAL_S = 0.05`、`WAL_RECREATE_BACKOFF_S = (0.01, 0.05, 0.2)`、`WAL_RECREATE_RETRY_INTERVALS_S = (1.0, 2.0, 5.0)`（之後封頂 5.0）、`DRAIN_TIMEOUT_MS = 3000`；同步回填 `docs/rust-refactor/plans/rust-architecture.md` §3.1 常數表）、`contracts/rpc_schema.json`（`health.status` 的 `wal` 子物件新增 `unhealthy_reason`，見規格第 7 點）
+- Modify: `sw_core/wal.py`、`sw_core/constants.py`（新增 `WAL_IDENTITY_CHECK_INTERVAL_S = 0.05`、`WAL_RECREATE_BACKOFF_S = (0.01, 0.05, 0.2)`、`WAL_RECREATE_RETRY_INTERVALS_S = (1.0, 2.0, 5.0)`（之後封頂 5.0）、`DRAIN_TIMEOUT_MS = 3000`）、`contracts/rpc_schema.json`（`health.status` 的 `wal` 子物件新增 `unhealthy_reason`，見規格第 7 點）、`contracts/behavior_changes.yaml`（DF-17 狀態推進）、`contracts/daemon_logging.yaml`（同步 WAL logger 呼叫點）、`docs/rust-refactor/plans/rust-architecture.md`（回填 §3.1 常數表及 §5.8 尾行語意）
+
+> `contracts/daemon_logging.yaml` 的 WAL `source` 行號須對齊 AST logger 呼叫位置；T04／T05 後續修改 `sw_core/wal.py` 時同步重校。
 
 **Interfaces**
 - Consumes：`sw_core.util.dumps_stable`、`to_printable`、`now_iso`、`monotonic_ns`（既有）。
@@ -288,13 +290,13 @@
 
 **行為規格（實作者必須逐條滿足）**
 1. handle **延遲開啟**：第一次 append 才開 WAL 與 mirror（維持現況「無流量時不產生檔案」的可觀測行為，`health.wal_file_exists` 不變）。
-2. 每筆 append：鎖外算 b64／crc；鎖內 `rotate_if_needed`（T04）→ 名稱消失檢查（第 4 點）→ `identity_check`（T05）→ `seq += 1` → 序列化 → `wal.write_all_flush(line_bytes)` → `mirror.write_all_flush(to_printable(payload).encode("utf-8"))`。檔案以 binary unbuffered 開啟；`line_bytes = (dumps_stable(record) + "\n").encode("utf-8")`。POSIX 上與現況逐位元組相同；**Windows 上現況為文字模式 `open(path, "a", encoding="utf-8")`，換行實際寫成 `\r\n`，新格式只寫 `\n`——此為 BC-01 附帶的位元組差異**，於 `contracts/behavior_changes.yaml` BC-01 的說明欄註明，並以 `windows_native` 測試釘死新格式；讀取端（`_iter_matching`／`tail_*`、T17 oracle、Rust reader）必須同時接受舊檔的 `\r\n` 行尾（`json.loads` 前 `rstrip("\r\n")`）。
+2. 每筆 append：鎖外算 b64／crc；鎖內 `rotate_if_needed`（T04）→ 名稱消失檢查（第 4 點）→ `identity_check`（T05）→ `seq += 1` → 序列化 → `wal.write_all_flush(line_bytes)` → `mirror.write_all_flush(to_printable(payload).encode("utf-8"))`。檔案以 binary unbuffered 開啟；`line_bytes = (dumps_stable(record) + "\n").encode("utf-8")`。POSIX 上與現況逐位元組相同；**Windows 上現況為文字模式 `open(path, "a", encoding="utf-8")`，WAL 行尾與 mirror 中的換行實際寫成 `\r\n`，新格式只寫 `\n`——此為 BC-01 附帶的位元組差異**，於 `contracts/behavior_changes.yaml` BC-01 的說明欄註明，並以 `windows_native` 測試釘死 WAL 新格式；讀取端（`_iter_matching`／`tail_*`、T17 oracle、Rust reader）必須同時接受舊 WAL 的 `\r\n` 行尾（`json.loads` 前 `rstrip("\r\n")`）。
 3. DF-17 與部分寫入：WAL、mirror 各自獨立重試，WAL 行任何情況下同一 seq 最多出現一次，且不得產生被串接的 NDJSON 行。以 `PartialWriteError.sent` 判定進度：
    - `sent == 0`（含 `write_all_flush` 前開檔失敗；非 `PartialWriteError` 的一般 `OSError` 一律視為 `sent == 0`，測試替身直接擲 `OSError` 即走此路）：關閉該 handle、`ensure_dir`、重開、重寫**整行**一次。
    - `0 < sent < len(data)`：**不得重寫整行**；在同一 handle 上只補寫剩餘的 `data[sent:]` 一次（POSIX `O_APPEND`／Windows `FILE_APPEND_DATA` 且唯一 writer 持鎖，故補寫緊接前綴）；補寫仍失敗 → 設 `_dirty_tail[which]=True`（下一次對該檔寫入前先寫一個 `b"\n"` 終結殘行，殘行成為一筆會被讀取端判為無效的行，不得與下一筆串接），本筆視為寫入失敗。
    - `write_all_flush` 已回傳（全部寫出）後任何後續步驟的例外都不得觸發重寫。
-   - WAL 重試仍失敗：回傳 record `loss_flag=True`、`write_failures += 1`、`last_write_error` 記重試例外（`f"{type(exc).__name__}: {exc}"`）；mirror 重試仍失敗：`write_failures += 1`、`last_write_error` 更新，回傳 record 的 `loss_flag` **維持** `False`（權威紀錄 WAL 已寫入）。既有 warning log 文字保留（盤點 04 §1.4 第 2、3 點）。
-4. 名稱消失（**不受** T05 的 50 ms 節流）：每筆 append 在寫入前檢查 `not os.path.isdir(wal_dir)` 或 `fs.size(path) is None`（rotate 本來每筆都呼叫 `size`，不增加 syscall 次數）；命中時關閉該 handle、`ensure_dir`、重開（`_recreated_count += 1`，既有 warning 保留）——常駐 fd 對已刪 inode 寫入不會報錯，若不先檢查名稱，`rmtree` 後的紀錄會寫進虛空（`tests/test_wal_missing_detection.py` 既有三個自癒測試依賴此行為）。META 補寫與 identity／DeletePending 比對由 T05 負責；T05 的節流只套用在後兩者。
+   - WAL 重試仍失敗：回傳 record `loss_flag=True`、`write_failures += 1`、`last_write_error` 記重試例外；若例外由 `PartialWriteError` 包裝，使用其底層 `OSError` 格式化（`f"{type(os_error).__name__}: {os_error}"`），保留既有健康欄位文字；mirror 重試仍失敗：`write_failures += 1`、`last_write_error` 更新，回傳 record 的 `loss_flag` **維持** `False`（權威紀錄 WAL 已寫入）。既有 warning log 文字保留（盤點 04 §1.4 第 2、3 點）。
+4. 名稱消失（**不受** T05 的 50 ms 節流）：每筆 append 在寫入前檢查 `not os.path.isdir(wal_dir)` 或 rotate 已取得的 `fs.size(path) is None`（名稱檢查重用 rotate 的 size 結果，不增加 `size` syscall 次數）；命中時關閉該 handle、`ensure_dir`、重開（`_recreated_count += 1`，既有 warning 保留）——常駐 fd 對已刪 inode 寫入不會報錯，若不先檢查名稱，`rmtree` 後的紀錄會寫進虛空（`tests/test_wal_missing_detection.py` 既有三個自癒測試依賴此行為）。META 補寫與 identity／DeletePending 比對由 T05 負責；T05 的節流只套用在後兩者。
 5. `close()`：持鎖；WAL、mirror 各自 `sync()` 後 `close()`；設 `closed=True`。之後的 append 不重開檔：回傳 record `loss_flag=True`、`write_failures += 1`、`last_write_error="WalClosed: writer closed"`，seq 照常遞增。
 6. 任一 handle 開啟成功、另一個失敗時，已開啟者保留供下次使用，不得洩漏或重複開啟；例外路徑中只有持有者負責 close。
 7. 權威 WAL 不可寫即不健康（規格 §8.2「記錄不可用時」、§1.3）：WAL（非 mirror）在第 3 點重試後仍失敗，或首次開檔失敗（含 ENOSPC、EIO、EACCES、`WalClosed` 以外）→ `unhealthy=True`、`unhealthy_reason="write_failed"`；下一筆 WAL 成功寫入即清除（`unhealthy=False`、`unhealthy_reason=None`）。mirror-only 失敗不影響 `unhealthy`。`health()` 在既有 10 鍵之後新增 `"unhealthy_reason"`（`None`｜`"write_failed"`｜`"recreate_failed"`（T05）），`healthy = 既有公式 and not self.unhealthy`；`unhealthy` property 在本 Task 建立，T05 擴充 `recreate_failed`。T05 的「停止自動 TX」對兩種 reason 一視同仁。
@@ -410,30 +412,43 @@
   | `test_wal_permanent_failure_sets_loss_flag` | WAL 兩次都失敗 → 回傳 `loss_flag is True`、`write_failures == 1`、seq 仍被消耗（下一筆 seq 為 3） |
   | `test_dir_removed_still_self_heals` | `shutil.rmtree(tmp_path)` 後**立即**（不推進 clock）append → 檔案重建、紀錄落在新檔、`health()["recreated_count"] == 1`（第 4 點不受節流） |
   | `test_file_unlinked_name_check_unthrottled` | 只 `os.unlink(wal_path)` 後立即 append → 新檔存在且含該筆（META 由 T05 補，本 Task 不斷言 META） |
+  | `test_empty_meta_first_append_creates_empty_mirror` | 首筆空 payload META 仍延遲建立空 mirror 檔並持有 handle；不寫 mirror bytes，也不計為失敗 |
   | `test_restart_resumes_max_seq` | 寫 5 筆後新建 `WalWriter(wal_dir=…)` 的下一筆 seq 為 6（盤點 04 §1.7） |
+  | `test_restart_terminates_unterminated_wal_tail_before_new_record` | 重啟時若 WAL 最後 byte 不是 LF，下一筆前先終結舊殘行；新紀錄仍為完整且可解析的獨立行 |
+  | `test_append_reuses_rotation_size_checks_for_name_detection` | 每次 append 的 WAL／mirror `fs.size` 各呼叫一次；名稱檢查重用 rotate 探測結果 |
   | `test_partial_write_then_eio_completes_suffix_only` | WAL 第一次 `os.write` 只寫前 10 bytes 後擲 `OSError(EIO)`、補寫成功 → 檔案中該筆為完整單行、JSON 可解析、全檔 seq 唯一 |
   | `test_partial_write_suffix_failure_terminates_tail` | 前綴寫出後補寫也失敗 → 回傳 `loss_flag is True`；下一筆 append 前先寫 `\n`：檔案中殘行獨立成一行（`json.loads` 失敗）、下一筆為完整獨立行、seq 不重複 |
   | `test_full_write_then_exception_not_rewritten` | 包裝 `write_all_flush` 在委派完整寫出後才擲例外 → 該 seq 只出現一次 |
+  | `test_partial_write_error_preserves_underlying_os_message` | POSIX 包裝的 `PartialWriteError` 保留底層 `OSError` 的 errno／訊息與 cause |
+  | `test_health_last_write_error_uses_underlying_oserror` | `health.last_write_error` 對部分寫入錯誤仍使用基線 `OSError: [Errno …] …` 格式 |
   | `test_wal_persistent_failure_marks_unhealthy_write_failed` | WAL 兩次寫入都 `OSError(ENOSPC)` → `health()["healthy"] is False`、`unhealthy_reason == "write_failed"`、`w.unhealthy is True`；下一筆成功 → 恢復 `None`／`True` |
   | `test_first_open_failure_marks_unhealthy` | `open_append` 擲 `PermissionError` → `unhealthy_reason == "write_failed"` |
   | `test_mirror_only_failure_keeps_healthy` | 只有 mirror 永久失敗 → `unhealthy is False` |
   | `test_native_line_ending_is_lf_only`（`windows_native`） | Windows 上寫一筆後原始 bytes 以 `b"}\n"` 結尾且不含 `b"\r\n"`；預先放入 `\r\n` 行尾的舊檔可被 `tail_raw` 正常讀出 |
 - [ ] **A2 執行並確認 FAIL**：`python3 -m pytest -q tests/test_stage0_wal_handle.py` → 預期 `ModuleNotFoundError: No module named 'sw_core.wal_fs'`。commit：`test(wal): BC-01 常駐 handle 與 DF-17 失敗測試`
 - [ ] **B1 實作**：
-  - `PosixWalFs.open_append`：`fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o666)`；`fp = os.fdopen(fd, "ab", buffering=0)`；`fdopen` 失敗時 `os.close(fd)` 再 raise。`write_all_flush`：`view = memoryview(data)`；迴圈 `n = fp.write(view[sent:])`，`n is None or n <= 0` → `PartialWriteError(errno.EIO, "short write", sent=sent)`；`OSError` → 轉成 `PartialWriteError(e.errno, str(e), sent=sent)`（`from e`）。`identity`：`st = os.fstat(fp.fileno()); return (st.st_dev, st.st_ino)`。`unlinked`：`os.fstat(...).st_nlink == 0`。`close`：`if not self._closed: self._closed = True; fp.close()`。`path_identity`：`os.stat` → `(st_dev, st_ino)`，`FileNotFoundError` → `None`。`sync_dir`：沿用 `_fsync_dir`（nt 直接 return）。
+  - `PosixWalFs.open_append`：`fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o666)`；`fp = os.fdopen(fd, "ab", buffering=0)`；`fdopen` 失敗時 `os.close(fd)` 再 raise。`write_all_flush`：`view = memoryview(data)`；迴圈 `n = fp.write(view[sent:])`，`n is None or n <= 0` → `PartialWriteError(errno.EIO, "short write", sent=sent)`；`OSError` → 以 `e.strerror or str(e)` 建立 `PartialWriteError(e.errno, ..., sent=sent)`（`from e`）。`identity`：`st = os.fstat(fp.fileno()); return (st.st_dev, st.st_ino)`。`unlinked`：`os.fstat(...).st_nlink == 0`。`close`：`if not self._closed: self._closed = True; fp.close()`。`path_identity`：`os.stat` → `(st_dev, st_ino)`，`FileNotFoundError` → `None`。`sync_dir` 的 POSIX／Windows 分支只留在 `PosixWalFs` seam 內；T02 的 `rename_noreplace_or_suffix` 不實作，交由 T04 定義並驗證。
   - `WalWriter`：新增 `_fs`、`_wal_fp: WalFile | None`、`_mirror_fp: WalFile | None`、`_closed`、`_dirty_tail: dict[str, bool]`、`_unhealthy`、`_unhealthy_reason`、`_clock = clock or time.monotonic`；`_write_record_locked(record, payload)` 改為：
     ```python
     line = (dumps_stable(record) + "\n").encode("utf-8")
     mirror = to_printable(payload).encode("utf-8")
     wal_err = self._write_one_locked("wal", line)      # 依 PartialWriteError.sent 分流：sent==0→close→ensure_dir→reopen→整行重寫一次；sent>0→只補寫 data[sent:]，再失敗設 _dirty_tail
-    mirror_err = self._write_one_locked("mirror", mirror) if mirror else None
+    if mirror:
+        mirror_err = self._write_one_locked("mirror", mirror)
+    else:
+        try:
+            self._open_handle_locked("mirror")  # 首筆空 META 仍建立空 mirror 檔，不寫入 bytes
+        except OSError:
+            pass
+        mirror_err = None
     ```
-    `_write_one_locked(which, data) -> BaseException | None`：`_dirty_tail[which]` 為真時先寫 `b"\n"`（成功才清旗標；`\n` 寫入失敗視同本筆 `sent==0`，依第 3 點重開後重寫 `\n`＋整行一次，**不得**在殘行未終結時直接寫入該行——與 Rust arch §5.8 第 5 點「`b"\n" ++ data` 合併計算 sent」位元組結果相同，R2-F3）；handle 為 None 時先 `open_append`；依規格第 3 點以 `PartialWriteError.sent` 分流（`sent==0`→關閉、`ensure_dir`、重開、重寫整行一次；`sent>0`→同 handle 補寫 `data[sent:]` 一次，失敗設 `_dirty_tail`）；成功且第一次例外為 `FileNotFoundError`（目錄消失）時沿用既有 `_recreated_count += 1` 與 warning；仍失敗回傳例外。`append` 依規格第 3、7 點設定 `loss_flag`、`write_failures`、`last_write_error`、`unhealthy`。空 payload 的 mirror 不寫（與現況相同，META 不寫 mirror）。第 4 點名稱檢查置於 `_rotate_if_needed` 之後、寫入之前。
+    `_rotate_if_needed(sizes: dict[str, int | None] | None = None) -> bool` 保留既有 bool 回傳；`append` 傳入 size snapshot dict，供名稱消失檢查重用 rotate 已取得的結果。
+    `_write_one_locked(which, data) -> BaseException | None`：`_dirty_tail[which]` 為真時先寫 `b"\n"`（成功才清旗標；`\n` 寫入失敗視同本筆 `sent==0`，依第 3 點重開後重寫 `\n`＋整行一次，**不得**在殘行未終結時直接寫入該行——與 Rust arch §5.8 第 5 點「`b"\n" ++ data` 合併計算 sent」位元組結果相同，R2-F3）；handle 為 None 時先 `open_append`；依規格第 3 點以 `PartialWriteError.sent` 分流（`sent==0`→關閉、`ensure_dir`、重開、重寫整行一次；`sent>0`→同 handle 補寫 `data[sent:]` 一次，失敗設 `_dirty_tail`）；成功且第一次例外為 `FileNotFoundError`（目錄消失）時沿用既有 `_recreated_count += 1` 與 warning；仍失敗回傳例外。`append` 依規格第 3、7 點設定 `loss_flag`、`write_failures`、`last_write_error`、`unhealthy`。空 payload 的 mirror 不寫 bytes；首次 append 仍 best-effort 開啟 mirror，以保留基線建立空 mirror 檔的行為，開啟失敗不計失敗且不影響 WAL。第 4 點名稱檢查置於 `_rotate_if_needed` 之後、寫入之前。
   - `_iter_matching`／`tail_*` 讀取時對每行先 `rstrip("\r\n")`（接受 Windows 舊檔 `\r\n`）；無法解析的行沿用現況處理（略過）。
   - `contracts/rpc_schema.json` 的 `health.status` 結果 schema：`wal` 子物件新增 `unhealthy_reason`（`null`｜`"write_failed"`｜`"recreate_failed"`），遞增 `x-catalog-revision`；P0 的 rpc schema 漂移測試須通過。
   - `close()`、`closed` 依規格第 5 點。
-  - `_load_last_seq` 不變（啟動時以 `open(..., "r")` 掃描，掃描完即關，不持有 handle）。
-- [ ] **B2 執行並確認 PASS**：`python3 -m pytest -q tests/test_stage0_wal_handle.py tests/test_wal.py tests/test_wal_integrity.py tests/test_wal_missing_detection.py tests/test_log_tail_latest.py tests/test_contracts_rpc_schema.py`（`test_wal_missing_detection.py` 三個自癒測試必須不改即通過）；`scripts/stage0/win-pytest.sh tests/test_stage0_wal_handle.py`；全套依 §0 第 4 點。
+  - `_load_last_seq` 啟動時掃描有效 seq，掃描完即關、不持有 handle；另檢查非空 WAL 最後 byte，若不是 LF 則設定 WAL `dirty_tail`，避免重啟後把新紀錄串接到殘行。
+- [ ] **B2 執行與證據狀態**：Linux 執行 `python3 -m pytest -q tests/test_stage0_wal_handle.py tests/test_wal.py tests/test_wal_integrity.py tests/test_wal_missing_detection.py tests/test_log_tail_latest.py tests/test_contracts_rpc_schema.py`（`test_wal_missing_detection.py` 三個自癒測試必須不改即通過）及全套依 §0 第 4 點。原生 Windows `scripts/stage0/win-pytest.sh tests/test_stage0_wal_handle.py` 在 T03 的 `WindowsWalFs`／share-delete handle 落地前預期有 delete-sharing 失敗，記為「待 T03 重跑／證據不足」，不得列 PASS；T03 後須原生重跑該檔與其計畫指定的 WAL 核心測試。
 - **測試資產變更**：無。
 - [ ] **B3 commit**：`perf(wal): BC-01 改為常駐 handle 與每筆 flush，mirror 失敗不重複 WAL seq`
 
@@ -479,7 +494,7 @@
       # SetFileInformationByHandle(FileDispositionInfoEx(21), DELETE|POSIX_SEMANTICS)
 
   # sw_core/wal_fs.py
-  class WindowsWalFs:  # 實作 WalFs；open_append 用 open_shared_append；unlinked 用 delete_pending；identity 用 file_identity
+  class WindowsWalFs(api: WinApi | None = None):  # 實作 WalFs；所有 Windows API 可注入；unlinked 僅用 delete_pending
   ```
 - Rust 對應：arch §4.5 `WalFs::open_append` Windows 分支、`WalFile::identity`／`unlinked`；arch §4.4 Windows `LockFileEx(EXCLUSIVE|FAIL_IMMEDIATELY, offset 0, len 1)`。
 
@@ -587,14 +602,18 @@
   | 測試名 | 斷言 |
   |---|---|
   | `test_native_windows_walfs_unlinked_reports_delete_pending` | `WindowsWalFs().open_append(p)` 後 `w32.delete_classic(p)` → `.unlinked() is True` |
-  | `test_native_os_remove_semantics_recorded` | 記錄 `os.remove` 在本機是 classic 或 POSIX semantics（輸出至測試 stdout 供證據），兩種結果都不得使 `WindowsWalFs` 的偵測失準：之後 `.unlinked()` 為真或 `path_identity` 為 `None` |
+  | `test_native_os_remove_semantics_recorded` | 以 JUnit property `os_remove_semantics` 記錄 `os.remove` 在本機是 classic 或 POSIX semantics；兩種結果都不得使 `WindowsWalFs` 的偵測失準：之後 `.unlinked()` 為真或 `path_identity` 為 `None` |
   | `test_native_sync_on_append_handle` | `WindowsWalFs().open_append(p)` 寫入後 `.sync()` 不擲例外（`FlushFileBuffers` 在 `FILE_APPEND_DATA\|SYNCHRONIZE` handle 上可用） |
   | `test_native_sync_dir_is_documented_noop` | `WindowsWalFs().sync_dir(dir)` 不擲例外、不開啟任何 handle（spy `CreateFileW` 呼叫數 0） |
   | `test_native_path_identity_missing_returns_none` | 不存在路徑 → `None` |
   | `test_native_reader_without_share_delete_blocks_rename` | 以 Python `open(p, "rb")` 持有（無 share-delete）時 `os.replace(p, q)` 擲 `PermissionError`（此為 T04 外部 reader 阻擋案例的前提） |
 - [ ] **A2 執行並確認 FAIL**：`python3 -m pytest -q tests/test_stage0_wal_winfs.py` → 預期 `ImportError: cannot import name 'win32_files'`。commit：`test(wal): BC-01 Windows share-delete handle 失敗測試`
-- [ ] **B1 實作**：依 Interfaces 與行為規格；`WinApi` 欄位在 `load_api()` 以 `ctypes.WinDLL("kernel32", use_last_error=True)` 綁定並設定 `argtypes`／`restype`（`HANDLE=ctypes.c_void_p`），`GetLastError` 綁 `ctypes.get_last_error`；結構 `FILE_STANDARD_INFO{LARGE_INTEGER AllocationSize; LARGE_INTEGER EndOfFile; DWORD NumberOfLinks; BOOLEAN DeletePending; BOOLEAN Directory}`（class 1）、`FILE_ID_INFO{ULONGLONG VolumeSerialNumber; BYTE FileId[16]}`（class 18）。`WindowsWalFs.rename_noreplace_or_suffix` 共用 T04 演算法；`sync` 走 `os.fsync`（CPython 在 Windows 對應 `_commit`→`FlushFileBuffers`）。`default_wal_fs()` 在 `os.name == "nt"` 回 `WindowsWalFs()`。
+- [ ] **B1 實作**：依 Interfaces 與行為規格；`WinApi` 欄位在 `load_api()` 以 `ctypes.WinDLL("kernel32", use_last_error=True)` 綁定並設定 `argtypes`／`restype`（`HANDLE=ctypes.c_void_p`），`GetLastError` 綁 `ctypes.get_last_error`；結構 `FILE_STANDARD_INFO{LARGE_INTEGER AllocationSize; LARGE_INTEGER EndOfFile; DWORD NumberOfLinks; BOOLEAN DeletePending; BOOLEAN Directory}`（class 1）、`FILE_ID_INFO{ULONGLONG VolumeSerialNumber; BYTE FileId[16]}`（class 18）。`WindowsWalFs(api: WinApi | None = None)` 將替身或原生 API 傳給所有 `win32_files` 呼叫；`WindowsWalFile.unlinked()` 僅呼叫 `delete_pending`。`WindowsWalFs.rename_noreplace_or_suffix` 共用 T04 演算法；`sync` 走 `os.fsync`（CPython 在 Windows 對應 `_commit`→`FlushFileBuffers`）。`default_wal_fs()` 在 `os.name == "nt"` 回 `WindowsWalFs()`。
 - [ ] **B2 執行並確認 PASS**：`python3 -m pytest -q tests/test_stage0_wal_winfs.py tests/test_stage0_wal_handle.py`；`scripts/stage0/win-pytest.sh tests/test_stage0_wal_winfs.py tests/test_stage0_wal_handle.py tests/test_wal.py tests/test_wal_integrity.py`。
+- **測試資產變更**（獨立審閱：Reviewer A 確認 API 修正未放寬斷言）：
+  - `tests/test_stage0_wal_handle.py::test_dir_removed_still_self_heals`、`::test_file_unlinked_name_check_unthrottled`：`CountingFs` base 由 `PosixWalFs` 改為 `type(default_wal_fs())`，讓原生 Windows 使用 share-delete 後端；兩項自癒斷言不變。
+  - `tests/test_stage0_wal_winfs.py::test_native_os_remove_semantics_recorded`、`::test_native_sync_on_append_handle`：依 `WalFile` Protocol 將 `write()` 改為 `write_all_flush()`；前者另以 JUnit property 留存刪除語意。
+  - `tests/test_stage0_wal_winfs.py`：新增可攜替身案例，覆蓋 `WindowsWalFs` API 注入、DeletePending、FileId／路徑錯誤映射、查詢 handle 清理、LockFileEx 錯誤映射、檔案大小與歸檔後綴（含 `.999` 用盡）。
 - [ ] **B3 commit**：`fix(wal): BC-01 Windows WAL handle 改用 CreateFileW share-delete 並提供 LockFileEx 包裝`
 
 ---
@@ -608,14 +627,14 @@
 
 **Files**
 - Create: `tests/test_stage0_wal_rotate.py`
-- Modify: `sw_core/wal.py`、`sw_core/wal_fs.py`、`docs/rust-refactor/plans/rust-architecture.md` §5.8（rotate／reset 順序改為 flush→`sync()`→關閉舊 handle→rename→開新檔→`sync_dir`；rename 失敗時重開原路徑）
+- Modify: `sw_core/wal.py`、`sw_core/wal_fs.py`、`contracts/daemon_logging.yaml`、`docs/rust-refactor/plans/rust-architecture.md` §4.5／§5.8、`docs/rust-refactor/plans/06-slice21-daemon-core.md`（rotate／reset 順序改為 flush→`sync()`→關閉舊 handle→rename→下次寫入時開新檔→`sync_dir`；rename 失敗時重開原路徑）
 
 **Interfaces**
 - Consumes：T02 `WalFs`；T03 `WindowsWalFs`。
 - Produces（Python）：
   ```python
   def rename_noreplace_or_suffix(self, src: str, base_dst: str) -> str
-      # 依序嘗試 base_dst、base_dst+".1"、…、base_dst+".999"；第一個不存在者 os.rename(src, dst) 並回傳 dst；全部存在 → FileExistsError
+      # 依序嘗試 base_dst、base_dst+".1"、…、base_dst+".999"；優先用平台原子 no-replace；不支援時先 hard link 後 unlink，若 hard link 也不支援則確認目的地不存在後用 os.rename；全部名稱均占用 → FileExistsError
   WalWriter.reset(self) -> dict[str, Any]
       # {"ok": True, "previous_seq": int, "rotated_suffix": str}；rotated_suffix＝WAL 歸檔實際後綴（含 ".N"）；
       # 沒有 WAL 可歸檔時為 ts（與現況相同）
@@ -721,13 +740,20 @@
   | `test_rotate_threshold_is_ge_and_checked_before_write` | `rotate_bytes=R`，檔案大小恰為 `R` 時下一筆先 rotate；大小 `R-1` 時不 rotate（`WAL-D7`） |
   | `test_wal_and_mirror_rotate_independently` | mirror 小於門檻時只產生 WAL 歸檔 |
   | `test_reset_without_files_returns_ts_suffix` | 無檔案時 `rotated_suffix == "20261015-030617"` 且 `ok is True` |
-  | `test_reset_directory_missing_raises_and_keeps_seq` | `rmtree` 後 `reset()` 擲 `OSError`、`current_seq` 不變（盤點 04 §1.9） |
+| `test_reset_directory_missing_raises_and_keeps_seq`（`posix_only`） | `rmtree` 後 `reset()` 擲 `OSError`、`current_seq` 不變（盤點 04 §1.9；POSIX 目錄同步語意） |
   | `test_native_rotate_with_open_handle_succeeds`（`windows_native`） | Windows 上常駐 handle 存在時 rotate 產生歸檔、新檔 seq 連續 |
-  | `test_native_rotate_blocked_by_reader_degrades`（`windows_native`） | 另一 handle 以 `open(p,"rb")` 持有時 record 帶 `rotation_failed: true`、重開原路徑後寫入持續、無遺失 seq；reader 關閉後下一筆 rotate 成功 |
+| `test_native_rotate_blocked_by_reader_degrades`（`windows_native`） | 另一 handle 以 `open(p,"rb")` 持有時 record 帶 `rotation_failed: true`、重開原路徑後寫入持續、無遺失 seq；reader 關閉後下一筆新增恰一個 WAL 歸檔 |
+| `test_rotate_falls_back_when_atomic_rename_is_unsupported`（`posix_only`） | 原子 no-replace 回 `EINVAL` 時 rotate 仍建立歸檔及 `.1` 後綴，紀錄不帶 `rotation_failed` |
+| `test_reset_reports_suffix_when_atomic_rename_is_unsupported`（`posix_only`） | 原子 no-replace 回 `EINVAL` 且時間戳歸檔已存在時，reset 保留既有內容並回傳實際 `.1` 後綴 |
+| `test_rename_falls_back_when_hardlinks_are_unsupported`（`posix_only`） | hard link 不支援且目的地在檢查後出現時，不覆蓋既有歸檔，改用下一個後綴 |
 - [ ] **A2 執行並確認 FAIL**：`python3 -m pytest -q tests/test_stage0_wal_rotate.py` → 預期 `AttributeError: 'PosixWalFs' object has no attribute 'rename_noreplace_or_suffix'` 與 suffix 斷言失敗。commit：`test(wal): BC-01 rotate／reset 同步與 DF-03 後綴失敗測試`
-- [ ] **B1 實作**：依行為規格改 `_rotate_if_needed` 與 `reset`；`rename_noreplace_or_suffix` 放在 `PosixWalFs`（`WindowsWalFs` 繼承同一實作，Windows `os.rename` 本身不覆蓋，迴圈仍以 `os.path.exists` 預判並在 `FileExistsError` 時嘗試下一個）。
+- [ ] **B1 實作**：依行為規格改 `_rotate_if_needed` 與 `reset`；`rename_noreplace_or_suffix` 放在 `PosixWalFs`（`WindowsWalFs` 繼承同一實作，Windows `os.rename` 本身不覆蓋）。POSIX 優先使用原子 no-replace；syscall 回 `EINVAL`、`ENOSYS`、`EOPNOTSUPP` 或 `ENOTSUP` 時降級為 `os.link` 後 `os.unlink`；若 hard link 也失敗，目的地仍不存在才用 `os.rename`，若已存在則轉成 `FileExistsError` 讓迴圈嘗試下一個後綴。
 - [ ] **B2 執行並確認 PASS**：`python3 -m pytest -q tests/test_stage0_wal_rotate.py tests/test_wal_integrity.py tests/test_wal.py`；`scripts/stage0/win-pytest.sh tests/test_stage0_wal_rotate.py`。
-- **測試資產變更**：無。
+- **測試資產變更**（本次獨立審閱確認必要）：
+  - `tests/test_thread_survival.py::test_wal_rotation_failure_best_effort_does_not_kill_reader`：故障注入由 monkeypatch `os.replace` 改為注入 `WalFs.rename_noreplace_or_suffix`，因輪替改走檔案系統介面；保留原有存活與 `rotation_failed` 斷言。
+  - `tests/test_stage0_wal_rotate.py::test_reset_directory_missing_raises_and_keeps_seq` 改標 `posix_only`，保留原斷言；案例使用 `PosixWalFs`，且缺目錄錯誤依賴 POSIX 目錄同步語意。
+  - `tests/test_stage0_wal_rotate.py::test_native_rotate_blocked_by_reader_degrades` 比較阻擋前後的 WAL 歸檔集合，確認 reader 關閉後確實新增一個歸檔。
+  - 新增原子改名 syscall 不支援及 hard link 不支援時的 rotate／reset 降級測試，確認 DF-03 不覆蓋且 reset 回傳實際後綴。
 - [ ] **B3 commit**：`fix(wal): BC-01 rotate／reset 依規格先 sync 並關閉 handle 再改名重開，同名歸檔加數字後綴（DF-03）`
 
 ---
@@ -741,9 +767,13 @@
 
 **Files**
 - Create: `tests/test_stage0_wal_unlink.py`
-- Modify: `sw_core/wal.py`、`sw_core/uart_io.py`（自動 TX 阻擋）、`sw_core/service.py`（`health.status.wal` 帶出新欄位，無需改碼若直接回傳 `WalWriter.health()`）、`docs/rust-refactor/plans/rust-architecture.md` §3.8（補 `com:"WAL"` 與 `previous_identity` 字串格式）、`contracts/behavior_changes.yaml`（BC-01 → `IMPLEMENTED`；不得寫 `contract_revision`）、`contracts/wal_meta_events.schema.json`（**P0 T10 已建立的唯一 META schema，只修改、不另建**：`WAL_RECREATED_AFTER_EXTERNAL_UNLINK` 補外層 `com:"WAL"`、`previous_identity` pattern、`x-status` 改 `IMPLEMENTED`，遞增 `x-catalog-revision`）、`tests/test_wal_missing_detection.py`（測試資產變更，見下）
+- Modify: `sw_core/wal.py`、`sw_core/wal_fs.py`（新增尾端換行查詢，供替換檔重建前隔離 META 行）、`sw_core/uart_io.py`（自動 TX 阻擋）、`sw_core/service.py`（`health.status.wal` 帶出新欄位，無需改碼若直接回傳 `WalWriter.health()`）、`docs/rust-refactor/plans/rust-architecture.md` §3.8／§4.5／§5.8（補 `com:"WAL"`、`previous_identity` 字串格式、尾端換行檢查與重試時序）、`contracts/behavior_changes.yaml`（BC-01 → `IMPLEMENTED`；不得寫 `contract_revision`）、`contracts/wal_meta_events.schema.json`（**P0 T10 已建立的唯一 META schema，只修改、不另建**：`WAL_RECREATED_AFTER_EXTERNAL_UNLINK` 補外層 `com:"WAL"`、`previous_identity` pattern、`x-status` 改 `IMPLEMENTED`，遞增 `x-catalog-revision`）、`contracts/daemon_logging.yaml`（同步新增／移動後的 WAL logger 呼叫來源行）、`tests/test_wal_missing_detection.py`（測試資產變更，見下）
 
-**測試資產變更**（需獨立審閱，PR 註明）：`tests/test_wal_missing_detection.py::TestWalHealth::test_recreated_wal_is_readable_again` 原斷言 `len(rows) == 1`；BC-01 重建後先寫 META，改為先過濾 `row["dir"] != "META"` 後斷言 1 列，並另斷言恰有 1 筆 `meta.event == "WAL_RECREATED_AFTER_EXTERNAL_UNLINK"`。`test_append_recreates_deleted_wal_dir`、`test_append_records_failure_when_recreate_fails` 不改（依 T02 第 4 點不節流的名稱檢查即可通過；後者的失敗路徑對應本 Task 第 5 點）。
+**測試資產變更**（需獨立審閱，PR 註明）：
+- `tests/test_wal_missing_detection.py::TestWalHealth::test_recreated_wal_is_readable_again` 原斷言 `len(rows) == 1`；BC-01 重建後先寫 META，改為先過濾 `row["dir"] != "META"` 後斷言 1 列，並另斷言恰有 1 筆 `meta.event == "WAL_RECREATED_AFTER_EXTERNAL_UNLINK"`。`test_append_recreates_deleted_wal_dir`、`test_append_records_failure_when_recreate_fails` 不改（依 T02 第 4 點不節流的名稱檢查即可通過；後者的失敗路徑對應本 Task 第 5 點）。
+- `tests/test_stage0_wal_handle.py::test_dir_removed_still_self_heals` 與 `::test_file_unlinked_name_check_unthrottled`：更新 WAL 行 seq／META 順序預期；META 會先消耗一個 seq，名稱檢查不節流的原斷言仍保留。
+- `tests/test_stage0_wal_unlink.py::test_identity_query_oserror_is_unknown_and_append_continues`：加入三種 identity 查詢 `OSError` 注入，確認查詢失敗只略過該次分類，append 仍寫入原檔且不新增 META 或 unhealthy 狀態。
+- `tests/test_stage0_wal_unlink.py::test_identity_query_oserror_at_rotate_threshold_keeps_current_file`：identity 查詢遇 `OSError` 且大小達輪替門檻時，確認該路徑保留現行 handle、略過該次輪替並繼續 append；包含 path／handle identity 與 `unlinked` 三種查詢。
 
 **Interfaces**
 - Consumes：T02／T03 `WalFs.path_identity`、`WalFile.identity`、`WalFile.unlinked`；T02 的 `unhealthy`／`unhealthy_reason`；T01 的 `TxResult`、`TxIncompleteError`；`sw_core.constants.WAL_IDENTITY_CHECK_INTERVAL_S`、`WAL_RECREATE_BACKOFF_S`、`WAL_RECREATE_RETRY_INTERVALS_S`。
@@ -768,19 +798,21 @@
 - Rust 對應：arch §3.8 META schema（本 Task 補 `com:"WAL"`）、§5.8 unlink 偵測步驟 1～6、§5.4 fence `wal_unhealthy`（`LoginProbe`／`ReadyReconfirm`／`SystemRecoverKey`／`SelfTestProbe` 被擋）。
 
 **行為規格**
-1. 偵測分兩層：(a) **名稱消失**（`not isdir(wal_dir)` 或 `fs.size(wal_path) is None`）**每筆都檢查、不節流**（T02 第 4 點的同一檢查，本 Task 在其命中時補 META）；(b) **identity／DeletePending 比對**只在距上次比對 `>= WAL_IDENTITY_CHECK_INTERVAL_S` 時做（50 ms 只是節流間隔，不代表遺失窗口上限）。mirror 同樣檢查但只重開、不寫 META。分類依下列順序，取第一個命中者：
+1. 偵測分兩層：(a) **名稱消失**（`not isdir(wal_dir)` 或 `fs.size(wal_path) is None`）**每筆都檢查、不節流**（T02 第 4 點的同一檢查，本 Task 在其命中時補 META）；(b) **identity／DeletePending 比對**平時只在距上次比對 `>= WAL_IDENTITY_CHECK_INTERVAL_S` 時做（50 ms 只是節流間隔，不代表遺失窗口上限）；若本筆因 `size >= R` 即將輪替並清除現有 handle／identity，須先完成該 handle 的失效分類，以免輪替抹除替換證據。mirror 同樣檢查但只重開、不寫 META。分類依下列順序，取第一個命中者：
    1. `not os.path.isdir(wal_dir)` → `dir_missing`；
    2. `ident = fs.path_identity(wal_path)`；`ident is None`（名稱不存在）或 `ident == (0, 0)`（Windows delete-pending 哨兵，T03 第 2 點）→ `external_unlink`；
    3. `ident != fp.identity()`（名稱存在且為真實但不同的 identity）→ `replaced`（POSIX `os.replace` 覆蓋後舊 inode 的 `st_nlink` 也會變 0，因此 identity 比對必須先於 `unlinked()`）；
    4. identity 相同但 `fp.unlinked()` 為真 → `external_unlink`。
+   5. `path_identity`、`identity` 或 `unlinked` 查詢若擲出 `OSError`（包含檔案系統不支援 `FileIdInfo` 的 50／87），該次 identity 視為未知：略過本次 identity-based 分類，使用目前 handle 繼續一般 append；若該路徑同時達輪替門檻，保留其 handle 並略過該路徑本次輪替，以免清除尚未能判讀的替換證據。不得因查詢錯誤觸發重建、寫 META、設 unhealthy，亦不得讓查詢例外離開 `append`。這只處理 identity 證據不可用，不覆蓋已由每筆名稱檢查確認的目錄／路徑消失；後續一般寫入若失敗，依 T02 寫入失敗規格處理。
 2. 命中後：記 `previous_identity = f"{dev}:{ino}"`（取不到為 `None`）、遺失範圍、關閉自身 handle、`ensure_dir`，做**一次** `open_append` 嘗試。WalWriter 任何路徑都**不得持 `_lock` 睡眠**：重試的退避以 `clock` 判定——第 i 次失敗（i=1,2,3）後，下一次嘗試只在距該次失敗 `>= WAL_RECREATE_BACKOFF_S[i-1]`（0.01、0.05、0.2 s）的下一筆 append 時進行；第 4 次失敗起間隔依 `WAL_RECREATE_RETRY_INTERVALS_S`（1 s、2 s、之後封頂 5 s）；未到嘗試時間的 append 不做任何開檔 syscall，直接回傳 `loss_flag=True`（seq 照常消耗）。
 3. 遺失範圍：`file_first_seq` 為目前 WAL 檔第一筆 seq（啟動掃描時取現行檔第一個非空行；該行能解析為 dict 且 `seq` 為 int 才算已知，否則為 `None`；rotate／reset／重建後設為下一筆寫入的 seq）。範圍＝`[file_first_seq, self._seq]`（`self._seq` 為 META 之前最後已消耗的 seq，含不健康期間消耗而未落盤的 seq）；`file_first_seq is None` 或 `self._seq < file_first_seq` → `potentially_lost_seq_range=None`、`range_known=False`。禁止填入猜測值。
 4. 重建成功：先寫 META（消耗一個 seq、外層 `loss_flag:true`），再寫原紀錄；`_recreated_count += 1`；`unhealthy=False`；`unhealthy_reason=None`。
 5. 重建失敗：**第一次失敗即**設 `unhealthy=True`、`unhealthy_reason="recreate_failed"`（重建失敗不得宣稱 healthy），本筆回傳 `loss_flag=True`、`write_failures += 1`；之後依第 2 點的時間表做有界重試（不得無限迴圈、不得持鎖睡眠、不得強制關閉他人 handle）。不健康期間的範圍在成功重建時一併涵蓋（第 3 點）。
-6. 停止自動 TX：`UARTBridge.send_bytes` 在 `_state_lock` 內檢查 `getattr(self.wal, "unhealthy", False)`（既有測試以無此屬性的 stub WAL 建 bridge）——`unhealthy_reason` 為 `write_failed`（T02）或 `recreate_failed` 皆然——且 `source == "system" or source.startswith("system:")` → 不寫 OS、回 `TxResult("not_submitted", 0, len(payload), "WAL_UNHEALTHY")` 並 raise `WalUnavailableError(result)`；agent／human 來源不受此限（規格只要求停止新增自動 TX）。來源分類必須涵蓋實際的自動 TX 呼叫者：實作前以 `grep -n 'source="system' sw_core/*.py` 列出 login probe、ready reconfirm、recover 鍵、self-test probe 等全部呼叫點並逐一確認以 `system`／`system:` 開頭，未符合者在本 Task 內改正並列入 PR 說明。
+6. 停止自動 TX：`UARTBridge.send_bytes` 在 `_state_lock` 內、flash gate 靜默丟棄之後檢查 `getattr(self.wal, "unhealthy", False)`（既有測試以無此屬性的 stub WAL 建 bridge；順序保留 RPC-H-07）——`unhealthy_reason` 為 `write_failed`（T02）或 `recreate_failed` 皆然——且 `source == "system" or source.startswith("system:")` → 不寫 OS、回 `TxResult("not_submitted", 0, len(payload), "WAL_UNHEALTHY")` 並 raise `WalUnavailableError(result)`；agent／human 來源不受此限（規格只要求停止新增自動 TX）。來源分類必須涵蓋實際的自動 TX 呼叫者：實作前以 `grep -n 'source="system' sw_core/*.py` 列出 login probe、ready reconfirm、recover 鍵、self-test probe 等全部呼叫點並逐一確認以 `system`／`system:` 開頭，未符合者在本 Task 內改正並列入 PR 說明。
 
 **Steps**
 - [ ] **A1 寫失敗測試**：`tests/test_stage0_wal_unlink.py`
+  - 補 `core_portable` 案例 `test_identity_query_oserror_is_unknown_and_append_continues`：替身分別令路徑 identity、handle identity、`unlinked` 查詢擲 `OSError`，確認 append 不外拋、不寫重建 META、不設 unhealthy，且記錄持續寫入當前 WAL。
   ```python
   from __future__ import annotations
   import json
@@ -905,6 +937,14 @@
   | `test_health_unhealthy_reason_null_when_healthy` | 正常時 `health()["unhealthy_reason"] is None` |
   | `test_unthrottled_name_check_writes_meta_immediately` | `os.unlink(wal_path)` 後**不推進 clock** 立即 append → 新檔第一行即 META `reason == "external_unlink"` |
   | `test_write_failed_also_blocks_auto_tx` | T02 的 `unhealthy_reason == "write_failed"` 時 `send_bytes(source="system:login")` 擲 `WalUnavailableError`、`port.writes == []` |
+  | `test_replaced_file_at_rotate_threshold_is_detected_before_rotation` | 替換檔大小恰為／高於 `rotate_bytes` 時，先保留替換證據與原遺失 seq 範圍，再依 `>= R` 輪替並在現行檔寫 META |
+  | `test_replaced_unterminated_file_keeps_meta_on_a_parseable_line` | 替換檔尾端沒有換行時，先終結殘行；`tail_raw()` 仍能讀到獨立 META 與後續紀錄 |
+  | `test_second_unlink_range_starts_at_first_meta_seq` | 同一 writer 連續兩次 unlink；第二筆 META 範圍由第一筆 META 的 seq 開始 |
+  | `test_zero_identity_sentinel_and_unlinked_handle_trigger_recreation` | 行為替身分別提供 `(0, 0)` sentinel、identity 相同但 `unlinked() is True`，兩案皆分類為 `external_unlink` |
+  | `test_recreate_retry_schedule_checks_each_gap_and_caps_at_five_seconds` | fake clock 在每一重試間隔前 1 ms 不觸發，達間隔後觸發；涵蓋 10／50／200 ms、1／2／5／5 s |
+  | `test_replacement_tail_inspection_failure_stays_unhealthy_until_retry` | 尾端查詢擲 `OSError` 時不寫 META、保持 `recreate_failed`；退避到期後確認／終結尾端、寫出可讀 META 並恢復健康 |
+  | `test_identity_query_oserror_at_rotate_threshold_keeps_current_file` | path／handle identity 或 `unlinked` 查詢擲 `OSError` 且檔案達輪替門檻時，保留現行 handle 並略過該路徑輪替；正常 append、不寫 META、不設 unhealthy |
+  | `test_flash_gate_precedes_wal_unhealthy_rejection` | WAL 不健康且 flash gate 開啟時，自動 TX 仍照基線靜默丟棄，不先擲 `WalUnavailableError` |
   | `test_bridge_with_stub_wal_without_unhealthy_attr` | 以無 `unhealthy` 屬性的 stub WAL 建 bridge → `send_bytes(source="system:x")` 照常寫出 |
   | `test_native_classic_delete_pending_with_external_reader`（`windows_native`） | 外部以 share-all handle 持有，`w32.delete_classic(p)` 後（先斷言 `path_identity == (0, 0)` 確認 classic 生效）`unlinked()` 為真；重建因 access denied 失敗 → `unhealthy`；外部 handle 關閉並依退避時間表後重建成功、META `reason == "external_unlink"` |
   | `test_native_posix_semantics_delete`（`windows_native`） | 以 `w32.delete_posix_semantics(p)`（`SetFileInformationByHandle(FileDispositionInfoEx, FILE_DISPOSITION_FLAG_DELETE\|FILE_DISPOSITION_FLAG_POSIX_SEMANTICS)`）刪除 → 名稱立即消失、重建成功、META `reason == "external_unlink"` |
@@ -928,14 +968,14 @@
 
 **Files**
 - Create: `tests/test_stage0_tx_outcome.py`
-- Modify: `sw_core/serial_port.py`、`sw_core/uart_io.py`、`sw_core/session_manager.py`（`_on_bridge_rx` 收 `wal_seq`、兩處 bridge 建構 lambda）、`sw_core/service.py`（RX observer 參數不變，值改精確）、`contracts/wal_meta_events.schema.json`（新增 `tx_outcome_unknown` 事件分支，遞增 `x-catalog-revision`）、`docs/rust-refactor/plans/rust-architecture.md` §4.2、§5.7（`Unknown { confirmed }`，見 Rust 對應）
+- Modify: `sw_core/serial_port.py`、`sw_core/uart_io.py`、`sw_core/session_manager.py`（`_on_bridge_rx` 收 `wal_seq`、兩處 bridge 建構 lambda）、`sw_core/service.py`（RX observer 參數不變，值改精確）、`contracts/wal_meta_events.schema.json`（新增 `tx_outcome_unknown` 事件分支，遞增 `x-catalog-revision`）、`contracts/daemon_logging.yaml`（新增 TX 帳本淘汰 WARNING 並同步來源行）、`tests/test_stage0_wal_unlink.py`（flash gate 預期結果改為 TxResult）、`docs/rust-refactor/plans/rust-architecture.md` §3.8／§4.2／§5.7、`docs/rust-refactor/plans/06-slice21-daemon-core.md`（Unknown 變體攜帶 confirmed）
 
-**相容規則（凍結；保護既有測試替身，皆不屬測試資產變更）**
+**相容規則（凍結；保護既有測試替身）**
 1. `send_bytes` 一律以兩個位置參數呼叫 `self._write_all(fd, payload)`（取消事件由 `_write_all` 內部讀 `self._tx_cancel`，T07），以相容 `tests/test_uart_flash_bridge.py:65,91`、`tests/test_refine_ownership.py:477,523,596` 以兩參數 lambda 取代 `_write_all` 的寫法；`_write_all` 回傳 `None` 視為 `TxResult("completed", n, n)`。
 2. port 路徑：僅在 `port.write` 簽名接受 `cancel` 關鍵字時才傳（`inspect.signature` 結果以 port 型別快取），以相容 `tests/test_serial_port.py:363` 的 `_FakeSerialPort.write(self, payload) -> None`；回傳 `None` 視為 `completed, n`。
 3. WAL：`rec = self.wal.append(...)`；`seq = rec.get("seq") if isinstance(rec, dict) else None`，以相容回傳 `None` 的 stub WAL（`tests/test_uart_flash_bridge.py::_RecordingWal`、`tests/test_command_completion.py::Wal`、`tests/test_console_unlock.py::Wal`）；`getattr(self.wal, "unhealthy", False)` 同 T05。
 4. 以 `object.__new__(UARTBridge)` 建立、缺新欄位的 bare bridge（`tests/test_concurrency_races.py:25`、`tests/test_suspend_resume_reentrant.py`）：新欄位（`_tx_accounts`、`_tx_frozen`、`_tx_cancel` 等）一律以 `getattr(self, "<name>", <預設>)` 讀取或以 class 層預設值提供，不得要求這些測試補欄位。
-5. `_PySerialPort.write` 對 `SerialTimeoutException`／`SerialException` 維持**擲出 `OSError` 子類**（`TxUnknownError`，errno 沿用現況映射：timeout→`ETIMEDOUT`、其他→例外 errno 或 `EIO`），以相容 `tests/test_serial_port.py::test_write_timeout_maps_to_oserror_etimedout`、`test_write_serialexception_maps_to_oserror`；結果資訊放在例外的 `.result`。
+5. `_PySerialPort.write` 對 `SerialTimeoutException`／`SerialException`／普通 `OSError` 維持**擲出 `OSError` 子類**（`TxUnknownError`，errno 沿用現況映射：timeout→`ETIMEDOUT`、其他→例外 errno 或 `EIO`）；普通 `OSError` 時 `.result.confirmed` 保留此呼叫已確認的前綴。此規則相容 `tests/test_serial_port.py::test_write_timeout_maps_to_oserror_etimedout`、`test_write_serialexception_maps_to_oserror`；結果資訊放在例外的 `.result`。
 
 **Interfaces**
 - Consumes：T02 `WalWriter.append`（回傳 record 含 `seq`）；T01 的 `TxResult`、`TxIncompleteError`、`TxUnknownError`、`SerialNotReady`（本 Task 不重複定義）。
@@ -955,7 +995,7 @@
   UARTBridge.tx_set_active(self, cmd_id: str | None) -> None      # R1-F8：目前前景命令；FIFO 溢位淘汰時跳過它（不淘汰在途證據）
   SessionManager._on_bridge_rx(self, session_id: str, data: bytes, wal_seq: int | None = None) -> None
   ```
-- Rust 對應：arch §4.2 `TxOutcome { NotSubmitted, Completed(usize), Unknown }`／`TxResult { outcome, error }`、`SerialWriter::write_gated(data, cancel, gate)`（每次 OS 提交經 `SubmitGate`，R0-F1）；§5.4 OS 提交時 fence 與「完成後把 TxResult 交給 WalWriter（只記錄確認的 bytes）」；§5.7 `confirmed_bytes`／`unknown` 累計。**arch §4.2 的 `Unknown` 必須帶已確認前綴**：本 Task 同步修訂 arch §4.2 為 `Unknown { confirmed: usize }`（`confirmed` 為結果不明前 OS 已確認的 bytes，未知尾段＝`len - confirmed`），§5.7 映射改為「`confirmed ≥ 1`（不論最後為 Completed 或 Unknown）→ `COMMAND_ABORTED_IN_FLIGHT`；`Unknown{confirmed:0}` → `SEND_FAILED`」。
+- Rust 對應：arch §4.2 `TxOutcome { NotSubmitted, Completed(usize), Unknown { confirmed: usize } }`／`TxResult { outcome, error }`、`SerialWriter::write_gated(data, cancel, gate)`（每次 OS 提交經 `SubmitGate`，R0-F1）；§5.4 OS 提交時 fence 與「完成後把 TxResult 交給 WalWriter（只記錄確認的 bytes）」；§5.7 `confirmed_bytes`／`unknown` 累計。**arch §4.2 的 `Unknown` 必須帶已確認前綴**：本 Task 同步修訂 arch §4.2 為 `Unknown { confirmed: usize }`（`confirmed` 為結果不明前 OS 已確認的 bytes，未知尾段＝`len - confirmed`），§5.7 映射改為「`confirmed ≥ 1`（不論最後為 Completed 或 Unknown）→ `COMMAND_ABORTED_IN_FLIGHT`；`Unknown{confirmed:0}` → `SEND_FAILED`」。
 
 **TX 結果判定表（凍結）**
 
@@ -967,6 +1007,7 @@
 | EAGAIN 期間 `cancel` 被設 | `completed, sent, err="cancelled"` | sent>0 時一筆 | raise |
 | pyserial 迴圈已確認寫出 k bytes 後遇 `SerialTimeoutException` 或其他 `SerialException`（k 可為 0） | `unknown, k, err=…`（未知尾段 `requested-k`） | k>0 時一筆 TX `payload[:k]`；另寫一筆 META `{"event":"tx_outcome_unknown","requested_bytes":M,"confirmed_bytes":k,"unknown_range":[k,M],"error":…}`（`source`、`cmd_id` 同原請求） | raise `TxUnknownError`（`OSError` 子類） |
 | pyserial `n` 為 0 或 None | `completed, sent, err="short_write"` | sent>0 時一筆 | raise |
+| port 寫入擲出沒有結構化進度的普通 `OSError` | `unknown, 0, len`；若後端已掌握確認前綴則以該值回報 | 已確認前綴記 TX，另記 `tx_outcome_unknown` META | raise `TxUnknownError` |
 | flash gate 擋下（`UIO-12.3-d`） | `not_submitted, 0` | 無 | 回傳、不 raise（保留靜默語意） |
 | raw console deferred（admission 關） | `not_submitted, 0, err="deferred"` | 無 | 回傳、不 raise |
 | serial 未就緒 | `not_submitted, 0, err="serial not ready"` | 無 | raise `SerialNotReady`（`TxIncompleteError`＋`RuntimeError` 雙重子類，與現況 `RuntimeError("serial not ready")` 相容） |
@@ -1131,17 +1172,24 @@
   | `test_stub_wal_returning_none_does_not_break_rx` | `append()` 回 `None` 的 stub WAL → `_handle_serial_rx` 仍送達 observer（`wal_seq is None`） |
   | `test_no_auto_resend_after_partial_in_file_transfer` | `file_transfer` 的分段寫入第 2 段得 `completed, k<n` 或 `unknown` → 該段 bytes 在 `port.writes` 中只出現一次（不重送），結果為錯誤 |
   | `test_no_auto_resend_after_partial_in_login_fsm` | login FSM 送帳號時得部分寫入 → 不重送該行，FSM 進入既有失敗分支 |
+  | `test_echo_paced_oserror_keeps_confirmed_bytes_and_unknown_meta` | 第一個 slice 已確認，下一個 slice 擲普通 `OSError` → 一筆 TX 僅含前綴、一筆 unknown META，TX 帳本保留確認 bytes 與 unknown |
+  | `test_echo_paced_logs_confirmed_bytes_on_unexpected_exception` | echo 等待在 slice 已確認後擲未預期例外 → finally 仍於鎖內寫出唯一一筆 TX 前綴並重拋原例外 |
+  | `test_tx_account_updates_before_wal_append_failure` | TX WAL append 失敗 → 命令帳本仍保留 OS 已確認的 bytes |
+  | `test_pyserial_plain_oserror_keeps_confirmed_prefix` | pyserial 已確認前綴後擲普通 `OSError` → `TxUnknownError.result.confirmed` 保留前綴 |
+  | `test_echo_wait_returns_current_progress_when_tx_cancelled` | echo 尚未到達時設定 TX cancel → 等待立即回傳目前 acked 數 |
   | `test_legacy_on_rx_data_single_arg_still_supported` | `on_rx_data=lambda d: …`（舊簽章）仍可運作，不傳 `wal_seq` |
   | `test_background_capture_from_seq_uses_exact_seq` | background capture 的 `last_seq` 等於該 chunk 的 RX seq（多 COM 交錯下） |
 - [ ] **A2 執行並確認 FAIL**：`python3 -m pytest -q tests/test_stage0_tx_outcome.py` → 預期 `ImportError: cannot import name 'TxResult'`（或斷言 `send_bytes` 回傳 `None`）。commit：`test(uart): BC-03／SC-07 TX 三態與確認 bytes 記錄失敗測試`
 - [ ] **B1 實作**：
   - `_write_all`：`sent=0`；迴圈 `os.write`；`BlockingIOError`／EAGAIN → `if cancel and cancel.wait(EAGAIN_BACKOFF_S): return TxResult("completed", sent, n_req, "cancelled")`（`EAGAIN_BACKOFF_S=0.01`，`cancel` 為 None 時 `time.sleep(0.01)` 並同時檢查 `self._tx_cancel`，見 T07）；其他 `OSError` → `TxResult("completed", sent, n_req, f"{type(e).__name__}: {e}")`；`n<=0` → `"short_write"`；完成 → `TxResult("completed", n_req, n_req)`。
   - `_PosixSerialPort.write` 委派相同演算法（抽成模組函式 `_posix_write_all(fd, payload, cancel) -> TxResult`，`UARTBridge._write_all` 也呼叫它，消除重複實作）；`_PySerialPort.write`：迴圈中 `SerialTimeoutException`／`SerialException` → `raise TxUnknownError(TxResult("unknown", sent, n, f"{type(exc).__name__}: {exc}"), <現況 errno>) from exc`（`sent` 為已確認前綴）；`not n` → 回 `TxResult("completed", sent, n, "short_write")`；完成回 `completed, n`。
-  - `send_bytes`：持 `_write_lock` 全程；`_state_lock` 內做 flash gate、T05 WAL 不健康檢查、T07 fence、raw deferred（T20 再加 permit 驗證）；鎖外（仍持 `_write_lock`）依相容規則 1／2 寫入取得 `result`（`TxUnknownError` 被捕捉後取其 `.result`，記錄完再重拋同一例外）；**仍持 `_write_lock`** 時：`log and result.confirmed > 0` → `wal.append(TX, payload[:confirmed])`；`log and result.outcome == "unknown"` → META `tx_outcome_unknown`；更新 `_tx_accounts[cmd_id]`（`cmd_id` 非 None 時；R1-F8：新 key 使表超過 512 時淘汰最舊且 `!= self._tx_active_cmd` 的項目並 log WARNING `serialwrap: tx account evicted (cmd_id=%s)`，在途前景命令的累計永不被淘汰）；釋放鎖後 `if not result.complete and result.error not in (None, "deferred"): raise TxIncompleteError(result)`（unknown 重拋 `TxUnknownError`；serial 未就緒 raise `SerialNotReady`）；回傳 `result`。
+  - `send_bytes`：持 `_write_lock` 全程；`_state_lock` 內做 flash gate、T05 WAL 不健康檢查、T07 fence、raw deferred（T20 再加 permit 驗證）；鎖外（仍持 `_write_lock`）依相容規則 1／2 寫入取得 `result`（`TxUnknownError` 被捕捉後取其 `.result`，記錄完再重拋同一例外）；**仍持 `_write_lock`** 時先更新 `_tx_accounts[cmd_id]`（`cmd_id` 非 None 時；R1-F8：新 key 使表超過 512 時淘汰最舊且 `!= self._tx_active_cmd` 的項目並以 logger `serialwrap`、訊息模板 `tx account evicted (cmd_id=%s)` 記 WARNING，在途前景命令的累計永不被淘汰），再依序 append 已確認 TX bytes 與 unknown META；WAL append 失敗不得略過帳本更新。釋放鎖後 `if not result.complete and result.error not in (None, "deferred"): raise TxIncompleteError(result)`（unknown 重拋 `TxUnknownError`；serial 未就緒 raise `SerialNotReady`）；回傳 `result`。
   - `contracts/wal_meta_events.schema.json` 新增 `tx_outcome_unknown` 分支：`required: [event, requested_bytes, confirmed_bytes, unknown_range, error]`，整數非負、`unknown_range` 兩元素、`x-behavior-change: "BC-03"`。
   - `_handle_serial_rx`：`rec = self.wal.append(...)`；`seq = rec.get("seq")`；呼叫 `self._on_rx_data` 前以 `inspect.signature` 判定是否接受 `wal_seq` 關鍵字（結果以 callback 物件的 `id()` 快取，callback 被替換時重新判定；測試會在建構後直接指派 `_on_rx_data`），接受時 `self._on_rx_data(data, wal_seq=seq)`，否則 `self._on_rx_data(data)`。`SessionManager` 兩處 lambda 改為 `lambda data, wal_seq=None, sid=session_id: self._on_bridge_rx(sid, data, wal_seq)`；`_on_bridge_rx` 以 `wal_seq if wal_seq is not None else self._wal.current_seq` 傳給 observers 與 background capture。
 - [ ] **B2 執行並確認 PASS**：`python3 -m pytest -q tests/test_stage0_tx_outcome.py tests/test_uart_io.py tests/test_serial_port.py tests/test_interactive_raw.py tests/test_file_transfer.py tests/test_event_engine.py tests/test_issue159_bg_fast_capture.py tests/test_agent_defer_tx.py tests/test_human_agent_coexist.py tests/test_multiagent_e2e.py tests/test_uart_flash_bridge.py tests/test_refine_ownership.py tests/test_command_completion.py tests/test_console_unlock.py tests/test_concurrency_races.py tests/test_login_fsm.py`；`python3 -m tools.contracts check`；全套依 §0 第 4 點。
-- **測試資產變更**：無（相容規則 1～5 保證既有替身不需改動；若仍有既有測試變紅，視為實作缺陷）。
+- **測試資產變更**（需獨立審閱，PR 註明）：
+  - `tests/test_stage0_tx_outcome.py::test_no_auto_resend_after_partial_in_login_fsm`：修正新建測試的 `SessionProfile`／`SessionAuth` 欄位名稱，並在收到空 probe 時注入 login prompt，確保測試確實抵達帳號部分寫入分支；斷言不變，對應 BC-03。Reviewer A（Claude Sonnet, max）獨立確認原 fixture 會在驗證行為前以 TypeError 失敗、prompt 注入必要且斷言未放寬。
+  - `tests/test_stage0_wal_unlink.py::test_flash_gate_precedes_wal_unhealthy_rejection`：依 BC-03 新介面將舊的 `None` 預期改為精確的 `TxResult("not_submitted", 0, requested)`，並延遲 import；Reviewer A（Claude Sonnet, max）確認該斷言符合凍結結果表且更嚴格。Reviewer B（Codex gpt-6.1-sol）對本 Task 無發現。
 - [ ] **B3 commit**：`fix(uart): BC-03 TX 區分三態並只記確認寫出的 bytes，RX 觀察者改用精確 seq`
 
 ---
@@ -1764,7 +1812,7 @@
 
 **Files**
 - Create: `tests/test_stage0_uart_exclusive.py`
-- Modify: `sw_core/serial_port.py`、`sw_core/uart_io.py`（`preopened_port`、`owns_port`）、`sw_core/session_manager.py`（`attach_device`、`_probe_external_holder` 回 `HolderReport` 形狀、`_attach_by_id`／`_reresolve_profile_on_reattach`／`_attach_by_id_dynamic` 使用預開 port、`__init__` released 還原與實體化、`_mark_missing_devices_locked`、`_save_state` released 組出）、`contracts/rpc_schema.json`（`x-pending` 的 BC-04 `DEVICE_STILL_HELD.holder_unknown` 併入 `device.attach` 回應 schema 正式欄位並刪除該 `x-pending` 項；`holder_unknown` 屬回應 schema，不是 `error_codes.yaml` 欄位）、`contracts/error_codes.yaml`（`DEVICE_STILL_HELD` 的 `contract_tests` 補本 Task 測試 node；`behavior_change` 維持 `[BC-04, SC-05]`）、`contracts/behavior_changes.yaml`（BC-04、SC-05、DF-04 → `IMPLEMENTED`）、`tests/test_resource_markers.py`（**測試資產變更**：P0 T14 第 6 條「`windows_com`／`physical_uart` 使用數為 0」的斷言改為「`windows_com` 只允許出現在模組層或 class 層 `pytestmark` 含 `windows_native` 的項目，且每個使用者同時帶 `windows_native`」；需獨立審閱，PR 註明）（本 Task 新檔以 `pytestmark` 標 `windows_native`＋`windows_com`）
+- Modify: `sw_core/serial_port.py`、`sw_core/uart_io.py`（`preopened_port`、`owns_port`）、`sw_core/session_manager.py`（`attach_device`、`_probe_external_holder` 回 `HolderReport` 形狀、`_attach_by_id`／`_reresolve_profile_on_reattach`／`_attach_by_id_dynamic` 使用預開 port、`__init__` released 還原與實體化、`_mark_missing_devices_locked`、`_save_state` released 組出）、`sw_core/cli.py`（`device attach --force` help 說明與實際 holder 行為一致）、`contracts/rpc_schema.json`（`x-pending` 的 BC-04 `DEVICE_STILL_HELD.holder_unknown` 併入 `device.attach` 回應 schema 正式欄位並刪除該 `x-pending` 項；`holder_unknown` 屬回應 schema，不是 `error_codes.yaml` 欄位）、`contracts/error_codes.yaml`（`DEVICE_STILL_HELD` 的 `contract_tests` 補本 Task 測試 node；`behavior_change` 維持 `[BC-04, SC-05]`）、`contracts/behavior_changes.yaml`（BC-04、SC-05、DF-04 → `IMPLEMENTED`）、`tests/test_resource_markers.py`（**測試資產變更**：P0 T14 第 6 條「`windows_com`／`physical_uart` 使用數為 0」的斷言改為「`windows_com` 只允許出現在模組層或 class 層 `pytestmark` 含 `windows_native` 的項目，且每個使用者同時帶 `windows_native`」；需獨立審閱，PR 註明）（本 Task 新檔以 `pytestmark` 標 `windows_native`＋`windows_com`）
 
 **Interfaces**
 - Consumes：T07 `drain_pending`；T08 `_pending_drain`。
@@ -1983,6 +2031,7 @@
   | `test_hotplug_attach_held_sets_last_error` | 熱插 `_attach_by_id` 開檔被占 → `DETACHED`、`last_error == "ATTACH_FAILED:DeviceHeldError"`，不啟動 reader |
   | `test_dynamic_released_survives_two_restarts` | 動態 session release → 重建 `SessionManager` 兩次（同 `state.json`）→ `by_id in _released_by_ids` 且 `state.json["released"]` 仍含該列（DF-04） |
   | `test_dynamic_released_attachable_after_restart` | 動態 session release → 重建 `SessionManager` → `get_session("<COM>")` 存在且 state `RELEASED`（init 依 `_loaded_released` 實體化）→ `attach_device("<COM>")` 成功、`ATTACHING` |
+  | `test_released_unavailable_uboot_template_remains_blocked` | released `uboot-template` 重啟時已無可解析 template → 不合成空 `ready_probe` profile；保留 `_loaded_released` 與 `_released_by_ids` 阻擋並記 WARNING（符合 DF-04 缺失 template 規則） |
   | `test_offline_tick_keeps_released` | RELEASED session 裝置離線後 `update_devices([])` → state 仍 `RELEASED` |
   | `test_unconsumed_preopened_port_closed_on_release` | attach 成功但 attach thread 尚未消費時 release → 該 port `close()` 恰一次 |
   | `test_release_then_external_plain_open_succeeds` | （`posix_only`、`posix_pty`、`process_rpc`；非 root，root 下 skip 記「證據不足」；R0-F3，修正前必 FAIL）測試持有 PTY master 全程不關；throwaway daemon 對該 slave 到 `READY` → `device release` 回 ok → 子行程（模擬外部燒錄工具）一般 `os.open(slave, O_RDWR\|O_NOCTTY)` **成功**（exit 0；`EBUSY` 判 FAIL）、寫 `b"X"` 後關閉，master 端讀到 `b"X"` → `device attach` 回 `ok: True` → 20 s 內 `READY` |
@@ -1998,7 +2047,19 @@
   - `attach_device`：依凍結表與「同步 attach 的操作身分」；同步開檔使用 `open_serial_port(real_path, session.profile.uart)` 後 `port.open()`；重驗通過才 `self._preopened_ports[by_id] = op`，再清 released、`_save_state()`、`ATTACHING`、`_spawn_attach(by_id)`。`_attach_by_id` 取 `op = self._preopened_ports.pop(by_id, None)`，PROBE 與正式 bridge 依「預開 port 與 PROBE bridge」共用 `op.port`；正式 bridge `start()` 失敗時由正式 bridge 負責 close（`owns_port=True`），不得雙重 close。
   - DF-04：`__init__` 將 `_loaded_released` 中**不在** `self._sessions` 的列**直接實體化**為 `RELEASED` session（COM 取自 session_id `<profile>:<COM>`、profile 取自 pins／provenance 中的 template，套回 `released_by`／`released_at`／`released_reason`），並把 by_id 加入 `_released_by_ids`——否則 `_spawn_attach` 對 released by_id 早退（`session_manager.py` 約 2291 行），session 永遠不會被實體化，`device attach <COM>` 找不到 selector、只留下封鎖而沒有解除路徑；template 已不存在而無法實體化者保留於 `_loaded_released` 並持續阻擋，log WARNING。`_save_state` 的 `released` = 記憶體 RELEASED session 列 ∪ `_loaded_released` 中未實體化的列。`_mark_missing_devices_locked` 跳過 `state == "RELEASED"`。
 - [ ] **B2 執行並確認 PASS**：`python3 -m pytest -q tests/test_stage0_uart_exclusive.py tests/test_serial_port.py tests/test_device_handoff.py tests/test_holder_probe_portability.py tests/test_explicit_target_device_ownership.py tests/test_windows_claim.py tests/test_multi_open_detect.py tests/test_multiagent_e2e.py tests/test_human_agent_coexist.py tests/test_flash_endpoint.py tests/test_resource_markers.py tests/test_contracts_rpc_schema.py`；`python3 -m tools.contracts check`；全套依 §0 第 4 點，並檢查是否有既有測試在 bridge 開啟後以路徑再開同一 PTY slave（BC-04 預期行為；若有，**先**把該檔與測試名追加到本 Task「測試資產變更」並經獨立審閱，PR 註明，才可修改）。
-- **測試資產變更**：`tests/test_resource_markers.py` 的 `windows_com` 使用數斷言（見 Files）；其餘待 B2 全套結果追加，未追加者不得修改。
+- **測試資產變更**：`tests/test_resource_markers.py` 的 `windows_com` 使用數斷言（見 Files）。B2 審閱後追加下列 T10 測試調整：
+  - `tests/test_stage0_uart_exclusive.py`：新增本任務測試，涵蓋預開 handle／holder 診斷／零 TX、PROBE 與正式 bridge 共用 handle、release／bind／hot-unplug 對在途 PROBE 的取消與收斂、同步 open 失效分類、Windows ACCESS_DENIED 到 `DEVICE_STILL_HELD{holder_unknown:true}` 的 RPC 映射、重複 attach 與 RELEASED 清理；PROBE drain 使用阻塞 reader 驗證未收回前不關閉 handle，另驗證遺失的 uboot template 維持持久化阻擋。
+  - `tests/test_windows_claim.py::test_no_profiles_windows_passthrough_claim`：注入 fake serial port，避免無硬體的 `COM8` 機制測試觸碰主機 COM 路徑。
+  - `tests/test_boot_quiet.py::TestReadyReconfirmGate`：mock bridge 時同步 mock 預開 serial port，維持原測試的記憶體隔離。
+  - `tests/test_contracts_gap_codes.py::TestGapLastError`：三個使用 mocked bridge 的 attach case 注入 fake serial port，避免預開階段開啟實際裝置。
+  - `tests/test_device_handoff.py::TestAttachDevice` 與 `TestAttachByIdReleasedBackstop`：同步 attach 與 RELEASED backstop 使用 fake serial port，保持零硬體測試邊界。
+  - `tests/test_explicit_target_device_ownership.py::TestExplicitTargetDeviceOwnership`：mock attach bridge 的 case 注入 fake serial port。
+  - `tests/test_holder_probe_portability.py::TestHolderProbePortability`：更新不可讀 `/proc` 時的凍結結果，要求 `holder_unknown: true`。
+  - `tests/test_human_agent_coexist.py::FakeTarget`、`tests/test_multiagent_e2e.py::FakeTarget`：關閉 pytest 行程持有的 slave fd，避免 BC-04 把測試自身誤判為外部 holder；PTY 讀取在暫態錯誤時繼續等待。
+  - `tests/test_profile_reresolve_on_attach.py::TestAttachWiring` 與 `_Base._no_bridge`：對新 `preopened_op` 參數放寬替身簽章、為 attach 注入 fake serial port，並讓 PROBE 替身回傳即時安全 drain receipt，符合 BC-04 交接介面。
+  - `tests/test_session_bind.py::TestSessionBind`：四個 mock bridge 的 attach case 注入 fake serial port。
+  - `tests/test_stage0_session_drain.py::test_release_waits_for_inflight_attach_handle_receipt`：注入 fake serial port；`test_shutdown_waits_inflight_attach_before_wal_close` 以「無殘留 attach op／預開 handle 且 close 恰一次」取代對舊 cleanup callback 的觀察，仍斷言 shutdown 未越過阻塞中的開埠及 WAL 關閉順序。
+  - `tests/test_service_human_console.py` 的 `admission_exempt` 變更是 worktree 既有 T08 測試調整，與 T10 無關，本任務未修改。
 - [ ] **B3 commit**：`feat(uart): BC-04 POSIX 以 flock＋TIOCEXCL 獨占 UART 並回報 holder，device attach 同步收回`
 
 ---
@@ -2012,7 +2073,7 @@
 
 **Files**
 - Create: `tests/test_stage0_gate_codes.py`
-- Modify: `sw_core/service.py`（`_resolve_session_id`、`command.submit`、`_on_console_line`、`_send_cb`）、`sw_core/session_manager.py`（`interactive_open`、`_agent_gate_reject_locked`、`execute_command`、`_recover_after_failure`、`_handle_reboot_command`）、`sw_core/arbiter.py`（`_QueuedCommand.trusted_human`、`submit(trusted_human=…)`、`_count_pending_locked`、`_running`）
+- Modify: `sw_core/service.py`（`_resolve_session_id`、`command.submit`、`file.push`／`file.pull`、`_on_console_line`、`_send_cb`）、`sw_core/session_manager.py`（`interactive_open`、`_agent_gate_reject_locked`、`execute_command`、`file_push`／`file_pull`、`_recover_after_failure`、`_handle_reboot_command`）、`sw_core/arbiter.py`（`_QueuedCommand.trusted_human`、`submit(trusted_human=…)`、`_count_pending_locked`、`_running`、history eviction）；契約同步 `contracts/behavior_changes.yaml`、`contracts/error_codes.yaml`、`contracts/rpc_schema.json`、`contracts/daemon_logging.yaml`、`sw_core/assets/skill/SKILL.md`、`SKILL_WINDOWS.md`；規格敘述 `docs/serialwrap-spec.md`
 
 **Interfaces**
 - Consumes：既有 `_resolve_session_id`、`arbiter.submit`、`execute_command`。
@@ -2029,10 +2090,13 @@
       #   （tests/test_boot_quiet.py:921,1220、tests/test_ready_reconfirm_bounds.py:246、
       #    tests/test_session_bind.py:192,218、tests/test_multiagent_stress.py:233）
       # True／False＝明確覆寫；RPC 路徑（SerialwrapService._send_cb）一律明確傳 False 或 True
+  SessionManager.file_push(..., trusted_human: bool | None = None) -> dict[str, Any]
+  SessionManager.file_pull(..., trusted_human: bool | None = None) -> dict[str, Any]
+      # None 沿用直接呼叫 manager 的來源前綴語意；file.* RPC 明確傳 False
   SerialwrapService._send_cb(self, session_id, command, source, cmd_id, timeout_s, mode,
                              expected_duration_s=None, *, trusted_human: bool = False, **kw) -> dict[str, Any]
   ```
-  `trusted_human=True` 只由 `SerialwrapService._on_console_line`（daemon 內部 human console 路徑）設定；RPC 參數不得影響它。`source` 字串本身（WAL、命令紀錄）不變。arbiter worker 呼叫 `send_cb` 時**只在 `item.trusted_human is True` 時才傳 `trusted_human=True` 關鍵字**（比照現況 `completion_regex` 的條件傳遞），以相容 `tests/test_issue24_heartbeat.py::fake_send` 等固定參數的替身；`_send_cb` 收不到該關鍵字即為 `False`，因此 RPC 來源的 `human:` 字串一律以 agent 對待（DF-02），而直接呼叫 manager 的既有測試維持現況語意。**測試資產變更：無。**
+  `trusted_human=True` 只由 `SerialwrapService._on_console_line`（daemon 內部 human console 路徑）設定；RPC 參數不得影響它。`source` 字串本身（WAL、命令紀錄）不變。arbiter worker 呼叫 `send_cb` 時**只在 `item.trusted_human is True` 時才傳 `trusted_human=True` 關鍵字**（比照現況 `completion_regex` 的條件傳遞），以相容 `tests/test_issue24_heartbeat.py::fake_send` 等固定參數的替身；`_send_cb` 收不到該關鍵字即為 `False`，因此 RPC 來源的 `human:` 字串一律以 agent 對待（DF-02），而直接呼叫 manager 的既有測試維持現況語意。**測試資產變更**：`tests/test_boot_quiet.py::TestSubmitQuietGate::test_human_source_submit_not_gated` 改為 `test_rpc_human_source_submit_is_gated`，依 DF-02 驗證 RPC 偽造來源遭 quiet gate 拒絕；`tests/test_arbiter_flush_on_recovery.py::_mock_exec` 接受可選 `trusted_human` keyword，以配合 worker 傳遞可信旗標；`tests/test_service_human_console.py::TestServiceHumanConsole::test_human_console_regular_command_uses_line_mode` 與 `test_human_console_sudo_vim_is_interactive` 明確斷言 `trusted_human=True`（同檔既有 `admission_exempt=True` 調整屬 T08）；`tests/test_stage0_gate_codes.py::test_rpc_human_source_not_promoted_on_timeout` 為 fake bridge 補空字串 RX 回應，維持逾時恢復路徑的替身契約，未放寬斷言；`test_gate_reject_zero_side_effects` 改用真 `UARTBridge`、`FakePort` 與 `dir == "TX"` WAL 篩選；另新增本 Task 的邊界與回歸案例（見下表）。
 - Rust 對應：arch §5.4 TxClass gate「source 以 `human:` 開頭時另見 DF-02」、Admission 依 SC-01／02／03 檢查；§5.10 arbiter pending（SC-06 計數）。
 
 **錯誤優先序（凍結，submit-time `_resolve_session_id`）**：查無 → 原樣；`RECOVERING` → `{"ok":false,"error_code":"SESSION_RECOVERING","session":…}`；`FLASHING` → `{"ok":false,"error_code":"FLASHING_BUSY","session":…}`；其餘非 READY 依現況（`PROFILE_NOT_COMMAND_CAPABLE`／`SESSION_NOT_READY`）；READY 時非 `trusted_human` 依現況 `READY_UNCONFIRMED` → `AUTOBOOT_QUIET`。execute-time（`_agent_gate_reject_locked`）的 `AUTOBOOT_QUIET` 回應改為 `{"ok":false,"error_code":"AUTOBOOT_QUIET","selector":…,"retry_after_s":<quiet 剩餘秒數 round 1 位；只剩 pending 時 5.0>}`（只補 `retry_after_s`；`selector` 與 `session` 形狀差異保留，ERR-7.3-8）；`READY_UNCONFIRMED` 不帶 `retry_after_s`。
@@ -2044,19 +2108,21 @@
   import pytest
   from sw_core.arbiter import CommandArbiter
 
-  @pytest.mark.parametrize("state,code", [("RECOVERING", "SESSION_RECOVERING"), ("FLASHING", "FLASHING_BUSY")])
-  def test_submit_time_state_codes(stage0_service, state, code):
+  @pytest.mark.parametrize("state", ["RECOVERING", "FLASHING"])
+  def test_submit_time_state_codes(stage0_service, state):
       svc, sess = stage0_service
       sess.state = state
+      expected_code = {"RECOVERING": "SESSION_RECOVERING", "FLASHING": "FLASHING_BUSY"}[state]
       r = svc.rpc("command.submit", {"selector": "COM0", "cmd": "ls"})
-      assert r["ok"] is False and r["error_code"] == code and r["session"]["state"] == state
+      assert r["ok"] is False and r["error_code"] == expected_code and r["session"]["state"] == state
 
-  @pytest.mark.parametrize("state,code", [("RECOVERING", "SESSION_RECOVERING"), ("FLASHING", "FLASHING_BUSY")])
-  def test_interactive_open_state_codes(stage0_service, state, code):
+  @pytest.mark.parametrize("state", ["RECOVERING", "FLASHING"])
+  def test_interactive_open_state_codes(stage0_service, state):
       svc, sess = stage0_service
       sess.state = state
+      expected_code = {"RECOVERING": "SESSION_RECOVERING", "FLASHING": "FLASHING_BUSY"}[state]
       r = svc.rpc("session.interactive_open", {"selector": "COM0"})
-      assert r["error_code"] == code
+      assert r["error_code"] == expected_code
 
   def test_execute_time_quiet_has_retry_after(stage0_service):
       svc, sess = stage0_service
@@ -2109,10 +2175,16 @@
   | `test_released_still_session_not_ready` | `RELEASED` 下 submit → `SESSION_NOT_READY`（規格 §5.3 RELEASED 列，現況保留；回歸防護，既綠） |
   | `test_direct_manager_human_source_keeps_legacy_semantics` | 直接 `mgr.execute_command(sid, "echo hi", "human:tester", "c1")`（未傳 `trusted_human`）→ 與現況相同走 human 語意（quiet 中仍執行） |
   | `test_worker_omits_trusted_human_kwarg_for_rpc` | 以固定 7 參數的 `send_cb` 替身（同 `test_issue24_heartbeat.py::fake_send`）建 arbiter，RPC 來源命令不擲 `TypeError` |
-  | `test_gate_reject_zero_side_effects` | `SESSION_RECOVERING`／`FLASHING_BUSY`／`AUTOBOOT_QUIET` 拒絕時替身 port `writes == []`、WAL 無新 TX、命令紀錄未建立（submit-time）或 `status == "error"`（execute-time） |
+  | `test_worker_passes_trusted_human_kwarg_when_enabled` | worker 只在明確 trusted-human 命令時傳 `trusted_human=True` |
+  | `test_console_line_reaches_uart_during_quiet_with_real_bridge` | quiet 中的內部 console line 經真 bridge 產生預期 UART bytes 與 WAL TX |
+  | `test_manager_quiet_window_returns_remaining_retry_after` | execute 與 file push 的 active quiet window 回傳剩餘秒數（大於 0、至多 30.0，且非 pending-only 的 5.0） |
+  | `test_file_rpc_rechecks_spoofed_human_as_agent` | file.push／file.pull 在第一層通過後 quiet 被 arm，manager 仍收到 `trusted_human=False` 並拒絕 |
+  | `test_execute_time_quiet_command_record_has_no_retry_after` | RPC 的 `source="human:spoof"` 在 queue 後遇 execute-time quiet gate，`command.get` 記錄仍為 `AUTOBOOT_QUIET`、保留來源字串且不暴露 `retry_after_s`；零 UART／WAL TX |
+  | `test_canceled_running_record_survives_cross_session_history_eviction` | 小型 history 上限下，另一 session 的完成記錄遭淘汰時，仍執行中的 canceled 記錄保留且持續計入 pending |
+  | `test_gate_reject_zero_side_effects` | 使用真 `UARTBridge`／`FakePort` 與 `dir == "TX"` 的 WAL 記錄，確認 RECOVERING／FLASHING／quiet 的 command、file 與 interactive-open 拒絕無 UART write 或新 TX |
 - [ ] **A2 執行並確認 FAIL**：`python3 -m pytest -q tests/test_stage0_gate_codes.py` → 預期 `'SESSION_NOT_READY' != 'SESSION_RECOVERING'` 等斷言失敗與 `AttributeError: 'CommandArbiter' object has no attribute '_running'`。commit：`test(session): SC-01/02/03/06 與 DF-02 gate 錯誤碼失敗測試`
-- [ ] **B1 實作**：依錯誤優先序；`command.submit`、`file.push`／`file.pull` 呼叫 `_resolve_session_id(..., trusted_human=False)`；`_on_console_line` 以 `trusted_human=True` 呼叫 `arbiter.submit`；arbiter worker 只在 `item.trusted_human` 為 True 時呼叫 `send_cb(..., trusted_human=True)`（`_send_cb` 以 `trusted_human=<收到值，預設 False>` 明確轉傳 `execute_command`）；`execute_command` 先解析 `human = trusted_human if trusted_human is not None else source.startswith("human:")`，其後的 human 分支（`_recover_after_failure` human 升格、`_handle_reboot_command` 的 human 來源分支、gate 跳過條件）一律改看 `human` 而非直接看 `source`；`interactive_open` 在 state 檢查最前面加 `RECOVERING`／`FLASHING` 分支；`_count_pending_locked` 改為 `sum(1 for r in recs if r sid 相符 and not r["done_at"]) + (1 if running cmd 的紀錄 status == "canceled" else 0)`；worker 取件時 `_running[sid]=cmd_id`，結束（含例外）時 `pop`。
-- [ ] **B2 執行並確認 PASS**：`python3 -m pytest -q tests/test_stage0_gate_codes.py tests/test_boot_quiet.py tests/test_ready_reconfirm_bounds.py tests/test_issue26_interactive_guard.py tests/test_command_guard.py tests/test_stress_submit.py tests/test_bounded_memory.py tests/test_flash_guard.py tests/test_service_human_console.py tests/test_cowork_session_usability.py tests/test_issue24_heartbeat.py tests/test_session_bind.py tests/test_multiagent_stress.py`；`python3 -m tools.contracts check`（SC-01／02／03／06、DF-02 → `IMPLEMENTED`，`SESSION_RECOVERING`、`FLASHING_BUSY`、`AUTOBOOT_QUIET` 的 `contract_tests` 補本 Task node）；全套依 §0 第 4 點。
+- [ ] **B1 實作**：依錯誤優先序；`command.submit` 與兩個 file RPC 呼叫 `_resolve_session_id(..., trusted_human=False)`；RPC 呼叫 `file_push`／`file_pull` 時也明確傳 `trusted_human=False`，manager 預設 `None` 時保留直接呼叫既有來源前綴語意；`_on_console_line` 以 `trusted_human=True` 呼叫 `arbiter.submit`；worker 僅在 `item.trusted_human` 為 True 時傳該 keyword，`_send_cb` 對 manager 明確傳 `trusted_human`；`execute_command`、`_execute_foreground`、`_recover_after_failure` 與 file manager gate 都依解析後的 `human` 判斷，不直接信任 RPC `source`；`interactive_open` 在 state gate 先回 `RECOVERING`／`FLASHING` 對應碼；quiet 回應依目前 active window 回傳剩餘秒數、僅 reconfirm pending 時回 `READY_RECONFIRM_RETRY_S`；SC-06 用 `_running` 保留執行命令身分，pending 額外計入已 cancel 但仍由 worker 執行的命令，history eviction 跳過 `_running.values()`，worker 在成功或例外收尾、從 `_running` 移除後才淘汰 history。
+- [ ] **B2 執行並確認 PASS**：`python3 -m pytest -q tests/test_stage0_gate_codes.py tests/test_boot_quiet.py tests/test_ready_reconfirm_bounds.py tests/test_issue26_interactive_guard.py tests/test_command_guard.py tests/test_stress_submit.py tests/test_bounded_memory.py tests/test_flash_guard.py tests/test_service_human_console.py tests/test_cowork_session_usability.py tests/test_issue24_heartbeat.py tests/test_session_bind.py tests/test_multiagent_stress.py 'tests/test_bootloader_recovery.py::TestInteractiveOpenAllowAttached::test_busy_paths_after_expired_recovery_still_run_post_close' tests/test_contracts_keep_baseline.py::test_daemon_logging_all_calls_listed`；`python3 -m tools.contracts check`（SC-01／02／03／06、DF-02 → `IMPLEMENTED`，錯誤碼契約、RPC schema、兩份 SKILL 受管區段同步；`retry_after_s` 只在直接 submit／manager 回應提供，`command.get` 記錄不包含）；全套依 §0 第 4 點。
 - [ ] **B3 commit**：`fix(session): SC-01/02/03/06 修正 gate 錯誤碼與 pending 計數，DF-02 拒絕 RPC 偽造 human 來源`
 
 ---
@@ -2126,7 +2198,9 @@
 
 **Files**
 - Create: `tests/test_stage0_lease_flash_console.py`
-- Modify: `sw_core/session_manager.py`（`reconcile_readiness` 呼叫 `_expire_interactive_leases_tick`、`interactive_send`／`interactive_status`／`interactive_close` 的 tombstone 判定、`collect_flash_candidates_and_mark`、`enter_flashing`）、`sw_core/uart_io.py`（`_consume_console_input`、`ConsoleClient.line_overflow`）、`sw_core/service.py`（`_on_console_line` 檢查 submit 結果並 log）、`sw_core/constants.py`（`CONSOLE_LINE_MAX_BYTES = 16385`、`INTERACTIVE_TOMBSTONE_MAX = 16`）
+- Modify: `sw_core/session_manager.py`（`reconcile_readiness` 呼叫 `_expire_interactive_leases_tick`、`_refresh_interactive_locked`、`attach_console`／`interactive_open` 的到期收尾 admission gate、`interactive_send`／`interactive_status`／`interactive_close` 的 tombstone 判定、`collect_flash_candidates_and_mark`、`enter_flashing`）、`sw_core/uart_io.py`（`_consume_console_input`、`ConsoleClient.line_overflow`）、`sw_core/service.py`（`_on_console_line` 檢查 submit 結果並 log、`_on_flash_open` 拒絕入場時釋放 probe 狀態）、`sw_core/constants.py`（`CONSOLE_LINE_MAX_BYTES = 16385`、`INTERACTIVE_TOMBSTONE_MAX = 16`）
+- Modify: `contracts/behavior_changes.yaml`（SC-13／14／16 狀態）、`contracts/error_codes.yaml`（`INTERACTIVE_EXPIRED` 的 SC-13 狀態、scope、contract tests；`SESSION_INTERACTIVE_BUSY` 收錄 ownership restore gate）、`contracts/rpc_schema.json`（interactive open/close 錯誤 side effects 與 close 錯誤順序，遞增 `x-catalog-revision`）、`contracts/daemon_logging.yaml`（新增 WARNING 模板並同步 source 行）、`sw_core/assets/skill/SKILL.md`、`sw_core/assets/skill/SKILL_WINDOWS.md`（重新產生受管 error code 區段）
+- Modify（測試資產）：`tests/test_refine_ownership.py`、`tests/test_contracts_keep_baseline.py`（變更理由見「測試資產變更」）
 
 **Interfaces**
 - Produces（Python）：
@@ -2179,12 +2253,23 @@
       assert mgr.interactive_close(lid)["error_code"] == "INTERACTIVE_EXPIRED"
       assert mgr.interactive_send(lid, data="ls")["error_code"] == "INTERACTIVE_EXPIRED"   # close 不刪 tombstone
 
+  def test_reconcile_readiness_expires_agent_lease(tmp_path):
+      mgr, s = _ready_mgr(tmp_path)
+      lid = mgr.interactive_open("COM0", owner="agent:x", timeout_s=0.05)["interactive_id"]
+      time.sleep(0.1)
+      mgr.reconcile_readiness()                     # 單獨驗證 DeviceWatcher 的週期入口
+      assert s.interactive_session_id is None
+      assert mgr._interactive[lid].status == "expired"
+      assert mgr.interactive_send(lid, data="ls")["error_code"] == "INTERACTIVE_EXPIRED"
+
   def test_status_touch_still_extends(tmp_path):
       mgr, s = _ready_mgr(tmp_path)
-      lid = mgr.interactive_open("COM0", owner="agent:x", timeout_s=0.3)["interactive_id"]
+      lid = mgr.interactive_open("COM0", owner="agent:x", timeout_s=1.0)["interactive_id"]
       for _ in range(4):
-          time.sleep(0.1); mgr.interactive_status(lid)
+          time.sleep(0.3)
+          assert mgr.interactive_status(lid)["ok"] is True
       assert mgr._expire_interactive_leases_tick() == 0
+      assert mgr._interactive[lid].status == "active"
 
   def test_flash_candidates_exclude_busy_and_draining(tmp_path):
       mgr = make_manager(tmp_path, [make_profile(platform="passthrough")])
@@ -2217,12 +2302,22 @@
   | `test_console_line_rejected_not_ready_logged` | ATTACHED（無 queue）時 line 被 `SESSION_NOT_READY` 拒絕 → WARNING 含 `error_code=SESSION_NOT_READY` |
   | `test_tombstone_fifo_bound_16` | 同 session 連續 17 個 lease 到期 → `_interactive` 中該 session 的 expired 數為 16，最舊者回 `INTERACTIVE_NOT_FOUND` |
   | `test_tick_restores_human_owner_after_soft_preempt_expiry` | soft preempt lease 到期 → bridge `interactive_owner` 還原為 human、上下文未失效的 deferred 被回放 |
+  | `test_tick_blocks_new_lease_until_owner_restore_finishes` | 用事件控制鎖外收尾交錯；收尾完成前新 open 回 `SESSION_INTERACTIVE_BUSY`，完成後 bridge 與 manager owner 一致 |
+  | `test_tick_continues_after_one_session_replay_failure` | 第一個 session replay 回報 TX unknown 時只嘗試一次，第二個 session 仍完成 resume，失敗 session suspend depth 歸零且 owner 清理 |
+  | `test_interactive_status_keeps_session_not_ready_precedence` | active lease 到期但 bridge 不存在時仍依凍結順序回 `SESSION_NOT_READY`；既有 expired tombstone 仍回 `INTERACTIVE_EXPIRED` |
   | `test_human_lease_not_expired_by_tick` | human lease 不受 timeout tick 影響（現況只看 peer） |
   | `test_flash_candidates_exclude_pending_drain` | `_pending_drain` 非 None 的 session 不在候選中 |
+  | `test_flash_candidates_exclude_draining_by_id_and_foreground_operation` | `_draining_by_ids` 與 `_foreground_operation` 各自存在時都排除候選 |
+  | `test_enter_flashing_rejects_active_drain` | `_pending_drain` 或 `_draining_by_ids` 命中時維持 READY 並回 `SESSION_RECOVERING` |
+  | `test_on_flash_open_failed_enter_releases_probe_resources` | `enter_flashing` 拒絕命中結果時不鏡射 termios／啟 pump，且釋放 held gates 與 flash-critical 標記 |
 - [ ] **A2 執行並確認 FAIL**：`python3 -m pytest -q tests/test_stage0_lease_flash_console.py` → 預期 `AttributeError: … '_expire_interactive_leases_tick'`。commit：`test(session): SC-13/14/16 lease tick、flash 資格與 console 行上限失敗測試`
 - [ ] **B1 實作**：依行為規格。
 - [ ] **B2 執行並確認 PASS**：`python3 -m pytest -q tests/test_stage0_lease_flash_console.py tests/test_login_recovery_lease.py tests/test_issue26_interactive_guard.py tests/test_flash_probe.py tests/test_flash_service_wiring.py tests/test_flashing_state.py tests/test_service_human_console.py tests/test_uart_io.py`；`python3 -m tools.contracts check`；全套依 §0 第 4 點。
-- **測試資產變更**：無（`_close_interactive_locked` 新參數有預設值，既有呼叫點與測試行為不變）。
+- **測試資產變更**（A1.5 re-lock 待獨立審閱；既有斷言維持或依 SC-13 契約精煉，PR 須列明並由獨立審閱者確認）：
+  - `tests/test_refine_ownership.py::TestRefineOwnership::test_unknown_closed_expired_and_replaced_interactive_ids_do_not_tx`：被 tombstone 保留的 replaced id 改預期 `INTERACTIVE_EXPIRED`；零 TX 斷言不變（SC-13）。
+  - `tests/test_stage0_lease_flash_console.py::test_tick_restores_human_owner_after_soft_preempt_expiry`：加入仍存活的 `ConsoleClient`（`attached_at` 設為目前時間），使替身符合 T09 resume 只回放 live client 的契約；owner／回放斷言不變（SC-13）。
+  - `tests/test_stage0_lease_flash_console.py`：補週期 reconcile 收回、touch 非 vacuous、post-close admission 交錯、雙 session replay 失敗隔離、status 錯誤順序與 flash guard 失敗回歸案例（SC-13／14）。
+  - `tests/test_contracts_keep_baseline.py::test_last_error_logging_templates_match`：將兩個既有 WARNING source 行更新為目前程式位置；原 HEAD 已因舊行號失敗，不改日誌模板斷言。
 - [ ] **B3 commit**：`fix(session): SC-13 lease 到期主動收回、SC-14 flash 認線資格、SC-16 console 行上限與拒絕診斷`
 
 ---
@@ -2360,7 +2455,7 @@
   | `test_stale_generation_permit_rejected` | 以舊 `bridge_generation` 建 permit → `not_submitted, "stale_generation"`、零 TX |
   | `test_raw_replay_invalidated_while_waiting_write_lock` | 測試持 `_write_lock`；console raw 資料與 replay 各排入一筆；`invalidate_deferred("reboot")`；放鎖 → 兩筆皆未寫入、未重新進 deferred、`port.writes == []` |
   | `test_permit_ok_path_unchanged` | 無失效事件時命令與 #53 回放的 `port.writes` 與 T06／T09 測試期望逐位元組相同 |
-  | `test_permit_none_only_for_listed_internal_callers` | AST 掃描 `sw_core/*.py`：不帶 `permit=` 的 `send_bytes(` 呼叫點集合等於第 2 點清單（R2-F1：只剩 flash pump 與 `send_secret` 內部那一次；`system:recover` 呼叫點必須帶 `permit=`） |
+  | `test_permit_none_only_for_listed_internal_callers` | AST 掃描 `sw_core/*.py` 的直接呼叫與 `send_bytes` 區域別名；未傳 `permit=` 的呼叫只允許 flash pump、`send_secret` 及兩個相容 adapter 對舊測試替身的 fallback，且依函式核對次數；明確 `permit=None` 一律 FAIL，`system:recover` 必須帶 permit |
   | `test_login_probe_quiet_armed_after_precheck_before_submit_zero_tx`（R2-F1，舊「`_boot_quiet_blocks_probe` 檢查一次後送出」實作必紅） | bridge 層：`session.bridge = bridge`（profile 無 `console_unlock_env`）；`permit = manager._begin_login_run_locked(session)`（持 `_lock` 呼叫）→ `permit.tx_class == "system_probe"`、`permit.login_gen == 1`、`bridge._gate_login_gen_floor == 1`；`with bridge.system_permit(permit): bridge.send_command("", source="system")`，`_after_tx_authorize` 設 `paused` 並等 `resume`；另一 thread 於 `paused` 後以 `bridge._on_rx_data(b"U-Boot 2024.04 (Oct 01 2024)\r\n")`（SessionManager 掛上的 RX 回呼，經 `_on_bridge_rx` → `_update_boot_quiet_locked`）模擬 RX thread 看到 banner，斷言 0.5 s 內返回、`session.boot_quiet_active() is True`、`session.login_gen == 2`、`bridge._gate_login_gen_floor == 2`、`bridge._gate_probe_quiet_until == session.boot_quiet_until`；設 `resume` → `TxIncompleteError`、`exc.result == TxResult("not_submitted", 0, 1, "quiet")`、`port.writes == []`、`wal_records` 無 `dir == "TX"` |
   | `test_attach_probe_banner_after_precheck_sends_no_login_bytes`（R2-F1，manager 端到端） | ATTACHED session（`login_regex`／`password_regex`／`prompt_regex` 設定，帳密解析為 `root`／`s3cret`，無 `console_unlock_env`）；`_after_tx_authorize` 在第一個 system 送出（prompt probe `b"\n"`）時設 `paused` 並等 `resume`；呼叫端 thread 跑 `manager._probe_existing_bridge(session, bridge)`；另一 thread 於 `paused` 後注入 banner RX（同上）再設 `resume`，之後 target 依序輸出 `login: `、`Password: `、`# `（腳本照常回應，用以證明 FSM 不會再送）→ `b"".join(port.writes) == b""`（不含 `b"\n"`、`b"root"`、`b"s3cret"`）、`wal_records` 無 `dir == "TX"` 且 `source` 以 `system` 開頭者、`session.state == "ATTACHED"`、`session.last_error == "PROMPT_UNAVAILABLE"`、`session.last_error_detail is None`、`session.ready_reconfirm_pending is True` |
   | `test_password_not_sent_when_quiet_arms_before_secret_submit`（R2-F1） | 同上 session；腳本：prompt probe `b"\n"` 後回 `login: ` → FSM 送 `b"root\n"`（正常寫出）→ 回 `Password: `；`_after_tx_authorize` 以計數器只在**第 3 次**被呼叫時（依序為 `b"\n"`、`b"root\n"`、secret）設 `paused`／等 `resume`，期間另一 thread 注入 banner RX → `port.writes == [b"\n", b"root\n"]`（逐筆相等，`b"s3cret"` 不出現在 `b"".join(port.writes)`）、`send_secret` 的例外 `result == TxResult("not_submitted", 0, 7, "quiet")`、呼叫端收斂 `last_error == "PROMPT_UNAVAILABLE"`、TX WAL 只有 `\n`、`root\n` 兩筆（secret 本就 `log=False`，也不得有 META 含 secret） |
@@ -2382,7 +2477,13 @@
 - [ ] **A2 執行並確認 FAIL**：`python3 -m pytest -q tests/test_stage0_tx_permit.py` → 預期 `ImportError: cannot import name 'TxPermit'`。commit：`test(uart): OS write 前授權 permit 零 TX 失敗測試`
 - [ ] **B1 實作**：依行為規格；`_gate_generation`、`_gate_quiet`、`_gate_lease_owner`、`_revoked_ops`、`_tx_fence_lock`（缺時以 `getattr(self, "_tx_fence_lock", None)` 惰性建立）以 class 層預設值提供（相容 bare bridge）；`_revoked_ops` 為 `collections.OrderedDict` 上限 512。T06 `send_bytes`「`_state_lock` 內檢查、鎖外寫入」改為「`_state_lock` 內 pre-check、每次 `os.write` 於 `_submit_guard` 內重驗後提交」；T07 `begin_drain` 改為以有上限的 `_tx_fence_lock.acquire(timeout=min(DRAIN_FENCE_ACQUIRE_S, 剩餘期限))` 設 `_tx_frozen`／`_tx_cancel`，取不到時照設並交由 Phase 2 背景完成（R3-F3，見「drain 取 fence 鎖有上限」）；`sw_core/constants.py` 新增 `DRAIN_FENCE_ACQUIRE_S = 0.05`；`_PySerialPort.cancel_pending_write()` 包 pyserial `cancel_write()`（無此方法時 no-op）。R2-F1：`_gate_probe_quiet_until`（0.0）、`_gate_login_gen_floor`（0）與 `system_permit()` 的 `threading.local` 同樣以 class 層預設值提供；`SessionRuntime.login_gen` 預設 0；`_push_probe_gate()` 對無 `set_probe_gate` 的替身 bridge 為 no-op，使既有 `FakeBridge`／mock `ensure_ready` 測試不需改動。R5-F2：`_gate_self_test_quiet_until`（0.0）以 class 層預設值提供；`_self_test_impl` 對無 `system_permit` 的替身 bridge 用 `contextlib.nullcontext()`，`send_command` 呼叫形狀不變；`contracts/behavior_changes.yaml` 的 DF-19 於本 commit 改 `status: IMPLEMENTED`（只遞增檔案 `revision`）。
 - [ ] **B2 執行並確認 PASS**：`python3 -m pytest -q tests/test_stage0_tx_permit.py tests/test_stage0_tx_outcome.py tests/test_stage0_bridge_drain.py tests/test_stage0_fakes.py tests/test_stage0_deferred.py tests/test_stage0_session_drain.py tests/test_stage0_gate_codes.py tests/test_interactive_raw.py tests/test_agent_defer_tx.py tests/test_human_agent_coexist.py tests/test_multiagent_e2e.py tests/test_issue26_interactive_guard.py tests/test_serial_port.py tests/test_concurrency_races.py tests/test_bootloader_recovery.py tests/test_boot_quiet.py tests/test_login_fsm.py tests/test_console_unlock.py tests/test_ready_reconfirm_bounds.py tests/test_login_recovery_lease.py tests/test_login_error_detail.py tests/test_rx_flood.py tests/test_brcm_prompt_regex.py tests/test_uart_flash_bridge.py tests/test_device_handoff.py tests/test_cowork_session_usability.py tests/test_session_bind.py`（`test_bootloader_recovery.py`／`test_boot_quiet.py` 守住 #114 autoboot 倒數救援與 boot quiet 基線，R2-F2；其後八檔守住 login FSM、console unlock、reconfirm 有界化與 flash gate 丟棄 system probe 的基線，R2-F1；最後三檔與 `test_boot_quiet.py`、`test_rx_flood.py`、`test_bootloader_recovery.py` 一起守住 `session.self_test` 各分類與鍵順序基線，R5-F2）；`python3 -m tools.contracts check`（DF-19 `IMPLEMENTED`）；全套依 §0 第 4 點。
-- **測試資產變更**：無既有測試斷言改動；`tests/stage0_fakes.py` 的 `FakePort.write` 新增可選 `submit_guard` 參數（不帶時行為與 T01 完全相同，T01／T07 既有斷言不變）；R3-F3 新增建構子關鍵字 `block_in_guard=False` 與 `cancel_pending_write()`／`cancel_write_calls`（預設值下既有斷言不變）。R2-F1 不改 `login_fsm.py` 公開函式簽章（permit 經 `system_permit()` thread-local 傳遞），既有以 `fake_ensure_ready(_bridge, _sp, auth=None)` mock 的測試（`tests/test_boot_quiet.py` 等）不需改動。R5-F2 不改 `send_command` 呼叫形狀（permit 經 `system_permit()` 傳遞），`tests/test_boot_quiet.py`、`tests/test_rx_flood.py` 以固定簽章替身 bridge 跑 self-test 的既有斷言不變。
+- **測試資產變更**（PR 須列明並由獨立審閱者確認）：
+  - `tests/test_stage0_tx_permit.py`：`_ready` 補齊成功 attach 所需的記憶體 device、RX buffer 與 bridge snapshot；spy 改用明確 `permit` 簽章，登入 fixture 使用錨定 prompt、完整行尾與固定 timeout，避免替身繞過真實 probe 條件。`test_begin_drain_fence_acquire_bounded_and_freezes_tail` 增加 `owner_gen` 收斂等待，pyserial 假物件明確提供 `is_open` 並斷言固定 chunk 常數；原有安全斷言未放寬。登入世代測試改為逐 run 驗證世代不變且跨 run 嚴格遞增；self-test golden 改經真 RPC framing 擷取 `error_code` 與拒絕原因。新增 `test_reboot_write_uncertain_arms_quiet_before_return`、`test_cancel_between_dequeue_and_manager_registration_zero_tx`、`test_interactive_open_command_expired_before_submit_zero_tx`、`test_bare_bridges_do_not_share_revoked_operation_history`、`test_attach_bridge_quiet_updates_first_attach_permit`、`test_attach_probe_failure_keeps_manual_login_path`（無帳密／未解析帳密，static／dynamic）與 console-unlock／reprobe／reboot-recovery permit 覆蓋、partial-cancel reason、AST alias／`permit=None` 防漏測試（R0-F1、R2-F1、R2-F2、R3-F3、R5-F2）。
+  - `tests/stage0_fakes.py::make_service`：建立 bridge 後發布與 session generation 對齊的 TX gate，讓 harness 不會把有效 permit 誤判為 `stale_generation`（R0-F1）。
+  - `tests/test_refine_ownership.py::TestRefineOwnership::test_unknown_closed_expired_and_replaced_interactive_ids_do_not_tx`：attach console 前發布 TX gate，保留原零 TX 與 ownership 斷言（R0-F1）。
+  - `tests/test_stage0_bridge_drain.py::test_begin_drain_invalidation_runs_inside_state_lock`：以包裝 `_invalidate_deferred_locked` 取代已移除的舊 no-op hook；保留事件交錯與 state/fence lock 斷言，不放寬 drain 語意（R0-F1）。
+  - `tests/test_contracts_keep_baseline.py::test_last_error_logging_templates_match`：更新兩個既有 logger AST source 行號至目前位置；保留 WARNING 與 session-last-error 模板逐字比對斷言（logging inventory sync）。
+  - `tests/stage0_fakes.py` 的 `FakePort.write` 接受可選 `submit_guard`；R3-F3 新增 `block_in_guard=False`、`cancel_pending_write()`／`cancel_write_calls`，預設行為不變。R2-F1 不改 `login_fsm.py` 公開簽章，R5-F2 不改 `send_command` 呼叫形狀；既有固定簽章替身仍由 adapter 相容。
 - [ ] **B3 commit**：`fix(uart): OS 寫入前於同一臨界區重驗並提交，失效者零 TX`
 
 ---
@@ -2418,8 +2519,8 @@
 **規格（凍結）**
 1. 輸入：env `SERIALWRAP_TEST_DEVICE_ALLOWLIST`（逗號分隔、各項 strip、空項忽略）優先；否則 `config.yaml` 的 `windows.test_device_allowlist`（list[str]）。兩者皆無或解析後為空 → `enabled=False`、`source="none"`。比對對象為 `DeviceInfo.by_id`（Windows＝COM 名，大小寫依原字串；POSIX＝symlink 路徑）。
 2. 隔離實例判定：`SERIALWRAP_STATE_DIR`、`SERIALWRAP_RUN_DIR`、`SERIALWRAP_CONFIG_DIR` 三者都在 env 中明確設定（strip 後非空）**且**各自 `os.path.normcase(os.path.abspath(os.path.expanduser(v)))` 不等於未設定時的預設路徑。任一不符且 allowlist 啟用 → `rejected_reason`：`"not an isolated instance: <VAR> unset"` 或 `"not an isolated instance: <VAR> equals default"`（依 STATE、RUN、CONFIG 順序回報第一個違規）。
-3. 型別錯誤（`windows.test_device_allowlist` 非 list 或含非字串）→ `rejected_reason="invalid windows.test_device_allowlist"`。
-4. daemon：判定在 `_run_async` **最前面**（`ensure_runtime_dirs()`、取 lock、建構 `SerialwrapService` 之前——`SessionManager.__init__` 尾段的 `_save_state()` 會改寫 `state.json`，正式實例被拒時不得留下任何副作用）。輸出路徑必須能被 P0 `contracts/code_extraction.yaml` 既有的 `call_arg RuntimeError` sink（`implies_interface: proc`）擷取：`test_allowlist.py` 定義 `ERROR_TEST_DEVICE_ALLOWLIST_REJECTED = "TEST_DEVICE_ALLOWLIST_REJECTED"`，判定函式 `raise RuntimeError(ERROR_TEST_DEVICE_ALLOWLIST_REJECTED, reason)`，`_run_async` 捕捉後寫 stderr `serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED: <reason>\n`、exit 2（不取 lock，故無需釋放）。不得直接以 `print` 字面輸出碼（任何 sink 都看不到，P0 C03／C04 FAIL）。通過時把 `AllowlistDecision` 以建構參數 `test_allowlist=` 傳入 `SerialwrapService`。
+3. 型別錯誤（`windows.test_device_allowlist` 非 list 或含非字串）→ `rejected_reason="invalid windows.test_device_allowlist"`。**config 讀取失敗（審查修正，2026-10-17）**：`config.yaml` 存在但無法讀取或解析（含 PyYAML 拋出的 `ValueError`、`RecursionError`，捕捉範圍為 Exception）時，若 env 未提供非空 allowlist：隔離實例（判定條件同規格 2）→ `rejected_reason="invalid config.yaml: <例外類別名>"`；非隔離實例 → 維持未設定（`enabled=False`、`source="none"`，與基線對壞 config 的容錯相同，正式實例啟動行為不變）。缺檔視為未設定。
+4. daemon：判定在 `_run_async` **最前面**（`ensure_runtime_dirs()`、取 lock、建構 `SerialwrapService` 之前——`SessionManager.__init__` 尾段的 `_save_state()` 會改寫 `state.json`，正式實例被拒時不得留下任何副作用）。輸出路徑必須能被 P0 `contracts/code_extraction.yaml` 既有的 `call_arg RuntimeError` sink（`implies_interface: proc`）擷取：`test_allowlist.py` 定義 `ERROR_TEST_DEVICE_ALLOWLIST_REJECTED = "TEST_DEVICE_ALLOWLIST_REJECTED"`，判定函式 `raise RuntimeError(ERROR_TEST_DEVICE_ALLOWLIST_REJECTED, reason)`，`_run_async` 捕捉後寫 stderr `serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED: <reason>\n`、exit 2（不取 lock，故無需釋放）。不得直接以 `print` 字面輸出碼（任何 sink 都看不到，P0 C03／C04 FAIL）。通過時把 `AllowlistDecision` 以建構參數 `test_allowlist=` 傳入 `SerialwrapService`。**實作偏離（P1 T13，審查修正 2026-10-17）**：`enforce_allowlist` 實際以字面值 `"TEST_DEVICE_ALLOWLIST_REJECTED"` 傳入 `RuntimeError`，未採常數 `ERROR_TEST_DEVICE_ALLOWLIST_REJECTED`——`call_arg RuntimeError` sink 的 `value_pattern` 只擷取字串常數、不解析名稱引用，以常數傳入時 extractor 0 筆。模組常數仍保留，由 `tests/test_stage0_test_allowlist_wiring.py::test_error_code_literal_matches_constant` 比對兩者一致（防漂移）。
 5. 生效時：裝置來源掃描結果經 `filter_allowlist`（只影響發現與選取；`open_serial_port`、BC-04 鎖、backend 選擇完全不變）；`health.status` 在 `multi_open_detail` 之後新增 `"test_device_allowlist":{"enabled":true,"coms":[…],"source":"env"|"config"}`；未啟用時**不輸出**此鍵（現有輸出逐位元組不變）。
 
 **Steps**
@@ -2497,13 +2598,16 @@
 
 **Files**
 - Create: `sw_core/filelock.py`、`tests/test_stage0_remote_windows.py`
-- Modify: `sw_core/remote_tunnel.py`、`sw_core/cli.py`（移除 `remote`／`connect`／`benches` 的 `os.name=="nt"` 擋板、bench state 鎖改用 `filelock`、`remote stop` 別名、help 文字）、`README.md`（英繁兩段：remote stop、Windows 支援與 OD-12 信任範圍說明）、`sw_core/assets/skill/SKILL_WINDOWS.md`（移除「本期不支援 remote」段落，改為使用說明；受管區段以 `python3 -m tools.contracts skill-section` 重新產生）、`contracts/behavior_changes.yaml`（BC-05、SC-21、SC-27 → `IMPLEMENTED`）、`contracts/error_codes.yaml`（`REMOTE_NOT_SUPPORTED`：維持 `reachable: true`，`exit_codes` 移除 `connect`／`benches`／`remote` 三個 context、只留 `"daemon start": 2`，`contract_tests` 改指 `tests/test_remote_endpoint.py`／`tests/test_win_daemon_start.py` 中斷言 `daemon start --endpoint` 的 node）、`contracts/cli_schema.json`（`x-pending` 的 SC-21 `remote stop` 併入正式子命令並刪除該項）、`tests/test_remote_cli.py`、`tests/test_remote_tunnel.py`（測試資產變更，見下）
+- Modify: `sw_core/remote_tunnel.py`、`sw_core/cli.py`（移除 `remote`／`connect`／`benches` 的 `os.name=="nt"` 擋板、bench state 鎖改用 `filelock`、`remote stop` 別名、help 文字）、`README.md`（英繁兩段：remote stop、Windows 支援與 OD-12 信任範圍說明）、`sw_core/assets/skill/SKILL_WINDOWS.md`（移除「本期不支援 remote」段落，改為使用說明；受管區段以 `python3 -m tools.contracts skill-section` 重新產生）、`contracts/behavior_changes.yaml`（BC-05、SC-21、SC-27 → `IMPLEMENTED`）、`contracts/error_codes.yaml`（`REMOTE_NOT_SUPPORTED`：維持 `reachable: true`，`exit_codes` 移除 `connect`／`benches`／`remote` 三個 context、只留 `"daemon start": 2`，`behavior_change` 保留 `[SC-27, BC-05]` 追溯；`INVALID_BENCH_CONFIG`、`TUNNEL_STATUS_ERROR`、`UNKNOWN_BENCH_CODE` 的 platforms 加入 `windows`）、`contracts/cli_schema.json`（`x-pending` 的 SC-21 `remote stop` 併入正式子命令並刪除該項）、`tests/test_remote_cli.py`、`tests/test_remote_tunnel.py`、`tests/test_contracts_cli_schema.py`、`tests/test_contracts_gap_codes.py`（測試資產變更，見下）
 
 **測試資產變更**（BC-05／SC-27 的預期反轉，需獨立審閱，PR 註明）：
 - `tests/test_remote_cli.py::test_remote_windows_returns_not_supported`（約 108～121 行）：改為斷言 `os.name="nt"` 下 `serialwrap remote` 與 `serialwrap remote u@h:7777` **不**回 `REMOTE_NOT_SUPPORTED`（以替身 `status`／`open_tunnel` 回 `ok:true`），並更名為 `test_remote_windows_supported`。
 - `tests/test_remote_tunnel.py::test_guard_platform_rejects_windows`（約 442～446 行）：改為斷言 `guard_platform()` 在 `os.name="nt"` 下為 no-op（不擲 `TunnelError`），更名為 `test_guard_platform_noop_on_windows`。
 - P0 的 `tests/test_contracts_catalog.py::test_ec_exit_codes_frozen`：`REMOTE_NOT_SUPPORTED` 的期望 `exit_codes` 由 `{"daemon start": 2, "connect": 1, "benches": 1, "remote": 1}` 改為 `{"daemon start": 2}`（其餘斷言不變）。
 - `tests/test_remote_endpoint.py`（約 184 行，`daemon start --endpoint tcp://1.2.3.4:7777` → `REMOTE_NOT_SUPPORTED`）與 `tests/test_win_daemon_start.py:111,126`：**不改**——該碼在 `daemon start --endpoint` 路徑仍可達（`cli.py` 約 435 行）。
+- `tests/test_contracts_cli_schema.py::test_every_subcommand_options_match`：`remote stop` 是 `words` positional 的手動分派入口，不會建立 argparse subparser；用 `build_parser().parse_args(["remote", "stop"])` 與帶 port 的呼叫驗證實際 parser 接受的語法，不把 schema 欄位與寫死的 schema 欄位互相比較。
+- `tests/test_contracts_gap_codes.py::TestGapPosixRemoteCli`：改名為 `TestGapRemoteCli` 並標為 `core_portable`；`INVALID_BENCH_CONFIG`、`TUNNEL_STATUS_ERROR`、`UNKNOWN_BENCH_CODE` 在 `SC-27` 支援 Windows 後皆為 Windows 可達錯誤碼，並同步更新 `INTERNAL_ERROR`／`TUNNEL_STATUS_ERROR` 的 `contract_tests` 節點與 spec errata 引用。
+- `tests/test_remote_tunnel.py`：移除已過期的模組層 `fcntl` skip，逐案將不依賴 POSIX 行程 API 的測試標為 `core_portable`，保留使用 `sleep`、`os.getpgid`、`os.killpg` 的行程測試為 `posix_only`，讓可攜案例可在 Windows 收集與執行。
 
 **Interfaces**
 - Consumes：T03 `win32_files.lock_file_ex`／`unlock_file_ex`。
@@ -2524,13 +2628,14 @@
   def pid_alive(pid: int, start_ticks: int | None, *, os_name: str | None = None) -> bool
       # Windows：OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)＋GetExitCodeProcess==STILL_ACTIVE(259)＋GetProcessTimes CreationTime 比對；絕不呼叫 os.kill(pid, 0)
   def terminate_tree(pid: int, pgid: int | None, *, timeout: float = 5.0, sleep: Callable[[float], None] = time.sleep,
-                     os_name: str | None = None) -> None
-      # POSIX：既有 _terminate_pgid；Windows：os.kill(pid, signal.CTRL_BREAK_EVENT) → 每 0.1 s 檢查 → 逾時 taskkill /PID <pid> /T /F
+                         os_name: str | None = None, start_ticks: int | None = None) -> None
+          # POSIX：既有 _terminate_pgid；Windows：先比對 CreationTime，再以有 10 s timeout 的 taskkill /PID <pid> /T /F；依同一 CreationTime 有界確認已退出，失敗則 raise OSError
   def make_role_probe(spec, cp, endpoint, *, runner, ping, control_master: bool = True)
-      # control_master=False：connect → ping(endpoint)；expose+tcp → runner(["ssh", *spec.ssh_opts, "-o", "BatchMode=yes", spec.ssh_target, "ss", "-ltnH", f"sport = :{port}"])；expose+remote_socket → True
+          # control_master=False：connect → ping(endpoint)；expose+tcp → runner(["ssh", "-o", "BatchMode=yes", *spec.ssh_opts, spec.ssh_target, "ss", "-ltnH", f"sport = :{port}"])，無 listener／探測失敗回 False 重試，確認為非 loopback 才 raise REMOTE_BIND_UNVERIFIED；expose+remote_socket → 以 ssh test -S 驗證
   def make_ssh_check(spec, cp, *, runner, control_master: bool = True)
       # control_master=False → lambda: True（readiness 只靠 alive＋role probe）
   ```
+- `open_tunnel` 的 Windows expose+tcp 若輪詢逾時仍為 `starting`，必須在 readiness try 內轉成 `REMOTE_BIND_UNVERIFIED`，走既有 fail-closed teardown；teardown 失敗時保留 `status="error"` 的 registry state，並以 readiness 原錯誤作為主要例外。Windows `close` 與 cleanup 都將 registry 的 `pid_start_ticks` 傳入 `terminate_tree`。
   Registry JSON 欄位不變；Windows 上 `pgid` 寫 `null`、`pid_start_ticks` 寫 CreationTime 整數、`control_path` 仍寫入（不建立）。`close` 在 Windows 呼叫 `terminate_tree(pid, None)`。
 - Rust 對應：arch §4.9 `ProcessTunnel`（`spawn_detached` 無 pipe、`alive`、`terminate`、`supports_control_master`）、§7.7 Windows 差異（readiness 三種、registry 鎖 LockFileEx、存活 `ProcessTunnel::alive`、停止 terminate tree、argv 不帶 3 個 ControlMaster `-o`）。
 
@@ -2641,7 +2746,7 @@
 
 **Files**
 - Create: `tests/test_stage0_platform_mgmt.py`
-- Modify: `sw_core/rpc_posix.py`、`sw_core/constants.py`（`resolve_config_path`、`ensure_runtime_dirs` 0700）、`sw_core/runtime_config.py`（`RuntimeConfig(read_path, write_path=None)`：讀寫路徑分離，`write_path` 預設等於 `read_path`；讀到系統 fallback 時 `write_path` 必須是使用者路徑，永不寫系統檔）、`sw_core/util.py`（`normalize_endpoint_path`）、`sw_core/lock_posix.py`、`sw_core/lock_win.py`、`sw_core/multi_open.py`（比較用正規化、提供舊 daemon 存活查詢）、`sw_core/cli.py`（跨 socket 預檢比較、`daemon restart`）、`sw_core/setup_cmd.py`（reconcile 等待、`wait_old_daemon_gone`）、`sw_core/service.py`（`start()` 順序）、`sw_core/device_watcher.py`（新增 `scan_once()`）、`README.md`（`daemon restart`、`SERIALWRAP_CONFIG`、socket 0600，英繁兩段）、`contracts/behavior_changes.yaml`（SC-08／09／10／12／20、DF-14 → `IMPLEMENTED`）、`contracts/cli_schema.json`（`x-pending` 的 SC-20 `daemon restart` 併入並刪除該項）
+- Modify: `sw_core/rpc_posix.py`、`sw_core/constants.py`（`resolve_config_path`、`ensure_runtime_dirs` 0700）、`sw_core/runtime_config.py`（`RuntimeConfig(read_path, write_path=None)`：讀寫路徑分離，`write_path` 預設等於 `read_path`；讀到系統 fallback 時 `write_path` 必須是使用者路徑，永不寫系統檔）、`sw_core/util.py`（`normalize_endpoint_path`）、`sw_core/lock_posix.py`、`sw_core/lock_win.py`、`sw_core/multi_open.py`（比較用正規化、提供舊 daemon 存活查詢）、`sw_core/cli.py`（跨 socket 預檢比較、`daemon restart`）、`sw_core/setup_cmd.py`（reconcile 等待、`wait_old_daemon_gone`）、`sw_core/service.py`（`start()` 順序）、`sw_core/device_watcher.py`（新增 `scan_once()`）、`README.md`（`daemon restart`、`SERIALWRAP_CONFIG`、socket 0600，英繁兩段）、`contracts/behavior_changes.yaml`（SC-08／09／10／12／20、DF-14 → `IMPLEMENTED`）、`contracts/error_codes.yaml`（setup／restart 的既有錯誤碼 context）、`contracts/daemon_logging.yaml`（同步 watcher logger 來源行）、`contracts/cli_schema.json`（SC-20、setup／restart RPC 與 exit-code 契約）、`tools/contracts/catalog.py`（新增 daemon restart CLI context）、`tests/conftest.py`（隔離系統設定路徑）、`docs/rust-refactor/plans/02-stage0-python-bc.md`（本節測試資產記錄）
 - 設定讀寫點（SC-09 必須逐一改寫，只改 constructor 預設值不會生效；讀用 `resolve_config_path()`、寫用 `resolve_config_path(for_write=True)`）：
   - `sw_core/cli.py:312` `_default_runtime_config()`（讀；`_safe_runtime_config` 經由它）；
   - `sw_core/daemon.py:84` `_write_config_endpoint`（寫 endpoint；讀寫分離）；
@@ -2777,7 +2882,7 @@
 - [ ] **A2 執行並確認 FAIL**：`python3 -m pytest -q tests/test_stage0_platform_mgmt.py` → 預期 `AttributeError: module 'sw_core.constants' has no attribute 'resolve_config_path'`。commit：`test(daemon): SC-08/09/10/12/20 與 DF-14 平台管理失敗測試`
 - [ ] **B1 實作**：依凍結細節；`SYSTEM_CONFIG_PATH` 常數於 `constants.py` 以 `os.name` 決定（`/etc/serialwrap/config.yaml` 或 `os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "serialwrap", "config.yaml")`），此判斷屬 Python 平台後端選擇，Rust 由 PAL `NativeTraits` 提供；`WindowsSingletonLock` 改用 `win32_files.lock_file_ex(fd)`（探測與取鎖順序維持 Windows 現況：先試連 endpoint），release 用 `unlock_file_ex`。
 - [ ] **B2 執行並確認 PASS**：`python3 -m pytest -q tests/test_stage0_platform_mgmt.py tests/test_runtime_config.py tests/test_runtime_paths.py tests/test_runtime_paths_xdg.py tests/test_daemon_lock.py tests/test_lock_win.py tests/test_setup_reconcile.py tests/test_setup_cli.py tests/test_cli_daemon_start.py tests/test_win_daemon_start.py tests/test_com_rank.py tests/test_multi_open_detect.py tests/test_rpc_tcp.py tests/test_autospawn_gate.py tests/test_rpc_blocking_offload.py tests/test_contracts_cli_schema.py`；`python3 -m tools.contracts check`；`scripts/stage0/win-pytest.sh tests/test_stage0_platform_mgmt.py tests/test_lock_win.py`；全套依 §0 第 4 點。
-- **測試資產變更**：無（`reconcile`／`RuntimeConfig` 新參數皆有預設值）；若既有 socket 權限測試斷言 `0o660` 預設，先追加到本小節並經獨立審閱。
+- **測試資產變更**（Reviewer A 的獨立審閱確認用途合理）：`tests/test_codex_fixes.py::test_rpc_socket_default_mode_is_0600`（依 SC-08 更新舊預設權限斷言）、`::test_enable_linger_includes_user`（替 SC-12 注入舊 daemon 已退出證據）；`tests/test_cli_diagnostics.py::TestCliTraceSetup::test_setup_success_trace_covers_existing_probe_rpcs_without_changing_sequence`（新增 `health.status` trace，SC-12）；`tests/test_setup_cli.py::setup_env`（替換為隔離的舊 daemon 存活替身，並提供舊 daemon PID 與 stop 後 ping 狀態，SC-12）；`tests/test_setup_reconcile.py::test_transition_stops_old_before_starting_new`、`::test_force_overrides_flashing`、`::test_config_is_written_with_custom_path_and_socket`、`::test_system_with_sudo_installs_real_unit_content`、`::test_transition_out_of_system_with_sudo_stops_before_starts`（明確注入舊 daemon 已退出證據，SC-12）；`tests/conftest.py`（固定隔離 `SYSTEM_CONFIG_PATH`，SC-09）。`tests/test_contracts_catalog.py` 與 `tests/test_stage0_test_allowlist_wiring.py` 的試探性修改已還原，不屬本次變更。
 - [ ] **B3 commit**：`feat(daemon): SC-08/09/10/12/20 平台管理對齊定稿規格並修正啟動順序（DF-14）`
 
 ---
@@ -3064,7 +3169,7 @@
 - Rust 對應：arch §10.1 manifest 欄位與 `tree_sha256` 演算法（sha256 of sorted `"<relpath>\0<sha256>\n"`）、§10.3 doctor `version_pairing`（非 advisory）；`contracts/golden/tree_sha256.ndjson` 供 Rust `sw-cli` 測試讀取比對（arch §9.1 golden 規則）。
 
 **`version_pairing` 判定（凍結）**
-1. `manifest["pairing"]["rule"] == "exact"`，且 `cli_version == pairing.cli_version == bundle_version`，且 `daemon_version == pairing.daemon_version`（daemon 不可達時 `daemon_version=None` → `ok:false`、mismatch `"daemon_unreachable"`）。
+1. `manifest["pairing"]["rule"] == "exact"`，且 `cli_version == pairing.cli_version == components.cli.version == bundle_version`，且 `daemon_version == pairing.daemon_version == components.daemon.version == bundle_version`（arch §10.3 第 1 點：daemon 的 `health.status.version` 亦須等於 `bundle_version`；daemon 不可達時 `daemon_version=None` → `ok:false`、mismatch `"daemon_unreachable"`，且 manifest 自身宣告不一致時另列 `"daemon_version"`）。
 2. `components.cli.sha256`、`components.daemon.launcher.sha256`、`components.daemon.runtime.sha256` 與 `sha256_of(<manifest_dir>/<path>)` 相等；`components.daemon.package.tree_sha256` 與 `package_tree()` 相等（Python 由 bundle 內 interpreter 執行時，`package_tree()` 即受測程式碼）；`components.python_cli_delegate.tree_sha256` 亦與 `package_tree()` 相等（Stage 1A 實際執行 `doctor` 的是被委派的 Python CLI，arch §7.4，與 daemon 共用同一 `sw_core` 子樹）；`components.assets.skill_sha256`／`skill_windows_sha256` 與 `asset_sha256("skill")`／`asset_sha256("skill_windows")` 相等。`components.assets.profiles_sha256` 與 `components.supervisor.definition_sha256` 在 Python 側**只驗存在且為 64 位小寫 hex**（profiles 物化路徑與監管定義由 setup／P4 產生，Python doctor 無穩定的比對來源）；本 Task 同步在 arch §10.3 第 3 點註明此限縮，實際比對由 P4 的 Rust doctor 承接。
 3. `mismatches` 依上列順序列出字串：`"cli_version"`、`"daemon_version"`、`"daemon_unreachable"`、`"cli_sha256"`、`"launcher_sha256"`、`"runtime_sha256"`、`"package_tree_sha256"`、`"python_cli_delegate_tree_sha256"`、`"skill_sha256"`、`"skill_windows_sha256"`、`"profiles_sha256_format"`、`"supervisor_definition_sha256_format"`；`detail` 為 `"ok"` 或 `", ".join(mismatches)`。
 4. doctor 只在 `find_release_manifest()` 非 None 時附加此 item（位置：清單末端）；manifest 解析失敗 → item `ok:false`、`detail="invalid release manifest: <key>"`。

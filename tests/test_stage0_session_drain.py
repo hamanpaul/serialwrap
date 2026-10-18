@@ -16,10 +16,10 @@ pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 # 嘗試自 stage0_fakes 匯入；若該模組尚未由 T01 建立，提供本地替身以確保 collection 成功且紅燈為預期行為
 try:
-    from stage0_fakes import FakePort, make_manager, make_profile, wal_records
+    from stage0_fakes import FakePort, make_manager, make_profile, make_service, wal_records
 except ImportError:
     try:
-        from tests.stage0_fakes import FakePort, make_manager, make_profile, wal_records
+        from tests.stage0_fakes import FakePort, make_manager, make_profile, make_service, wal_records
     except ImportError:
         class FakePort:
             """SerialPort 介面替身。"""
@@ -76,6 +76,9 @@ except ImportError:
             from sw_core.session_manager import SessionManager
             w = wal or WalWriter(wal_dir=str(tmp_path / "wal"))
             return SessionManager(profiles, w, on_ready=lambda _s: None, on_detached=lambda _s: None, state_path=str(tmp_path / "state.json"))
+
+        def make_service(*_args: Any, **_kwargs: Any):
+            raise RuntimeError("stage0_fakes.make_service 未載入")
 
         def wal_records(wal: Any) -> list[dict[str, Any]]:
             wal_file = Path(wal.wal_path)
@@ -149,6 +152,8 @@ def test_release_drain_timeout_shape(tmp_path, short_drain):
     assert r2["error_code"] == "SESSION_RECOVERING"
     a = mgr.attach_device("COM0")
     assert a["ok"] is False and a["error_code"] == "SESSION_RECOVERING"
+    recovery = mgr.recover_session("COM0")
+    assert recovery["ok"] is False and recovery["error_code"] == "SESSION_RECOVERING"
     gate.set()
     for _ in range(100):
         if mgr.get_session("COM0").state == "RELEASED":
@@ -156,6 +161,7 @@ def test_release_drain_timeout_shape(tmp_path, short_drain):
         time.sleep(0.02)
     assert mgr.get_session("COM0").state == "RELEASED"
     assert mgr.get_session("COM0").to_public_dict()["drain_stalled"] is False
+    assert mgr.get_session("COM0").to_public_dict()["drain_timeout_epoch"] == 4
     assert mgr.release_device("COM0")["already_released"] is True
     assert port.close_calls == 1
 
@@ -194,12 +200,13 @@ def test_bridge_down_goes_recovering_then_attaching(tmp_path):
     gate = threading.Event()
     port = FakePort(block=gate)
     mgr, s, b = _ready_with_port(tmp_path, port)
+    mgr._devices[BY_ID] = object()
     t = threading.Thread(target=lambda: b.send_bytes(b"abc", source="agent:x"))
     t.start()
     time.sleep(0.05)
     spawned = []
     mgr._spawn_attach = lambda by_id: spawned.append(by_id)
-    th = threading.Thread(target=lambda: mgr._handle_bridge_down("COM0", "io error"))
+    th = threading.Thread(target=lambda: mgr._handle_bridge_down(s.session_id, b, "io error"))
     th.start()
     time.sleep(0.05)
     assert mgr.get_session("COM0").state == "RECOVERING"
@@ -302,12 +309,14 @@ def test_direct_bridge_stop_timeout_blocks_reopen(tmp_path, short_drain):
     threading.Thread(target=lambda: b.send_bytes(b"abc", source="agent:x"), daemon=True).start()
     time.sleep(0.05)
     # 觸發 attach 失敗收尾逾時
-    mgr._handle_bridge_down("COM0", "attach failed")
+    mgr._handle_bridge_down(s.session_id, b, "attach failed")
     assert hasattr(mgr, "_draining_by_ids") and BY_ID in mgr._draining_by_ids
     created = []
-    mgr._spawn_attach = lambda by_id: created.append(by_id)
-    mgr._spawn_attach(BY_ID)
+    original_spawn_attach = mgr._spawn_attach
+    mgr._attach_by_id = lambda by_id: created.append(by_id)
+    original_spawn_attach(BY_ID)
     assert len(created) == 0
+    assert BY_ID not in mgr._attach_inflight
     gate.set()
 
 
@@ -361,13 +370,112 @@ def test_release_drain_deadline_includes_lock_wait(tmp_path, short_drain):
     assert port.close_calls == 1
 
 
+def test_release_waits_for_inflight_attach_handle_receipt(tmp_path, monkeypatch):
+    from sw_core.device_watcher import DeviceInfo
+    from sw_core.uart_io import DrainReceipt
+    import sw_core.uart_io as uart_io
+
+    mgr, session, _old_bridge = _ready_with_port(tmp_path, FakePort())
+    monkeypatch.setattr(uart_io, "open_serial_port", lambda *_args, **_kwargs: FakePort())
+    session.bridge = None
+    session.state = "DETACHED"
+    mgr._devices[BY_ID] = DeviceInfo(by_id=BY_ID, real_path="/dev/fake-uart")
+    probe_started = threading.Event()
+    probe_continue = threading.Event()
+    drain_started = threading.Event()
+    close_receipt = threading.Event()
+
+    class AttachingBridge:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            self.frozen = False
+            self.begin_calls = 0
+            self.finish_calls = 0
+            self.writes: list[bytes] = []
+            self.vtty_path = None
+
+        def start(self) -> None:
+            return None
+
+        def rx_total_bytes(self) -> int:
+            return 0
+
+        def send_command(self, command: str, **_kwargs: Any) -> None:
+            if self.frozen:
+                raise RuntimeError("bridge drain 已凍結 TX")
+            self.writes.append(command.encode())
+
+        def list_consoles(self) -> list[dict[str, Any]]:
+            return []
+
+        def begin_drain(self, *_args: Any, **_kwargs: Any) -> None:
+            self.begin_calls += 1
+            self.frozen = True
+            drain_started.set()
+
+        def finish_drain(self, _timeout_s: float, **_kwargs: Any) -> Any | None:
+            self.finish_calls += 1
+            if not close_receipt.wait(2.0):
+                return None
+            return DrainReceipt(
+                epoch=session.bridge_generation,
+                handle_closed=True,
+                reader_stopped=True,
+                writer_converged=True,
+                tx_in_flight=None,
+                unrecorded=(),
+                preserved=None,
+                error=None,
+            )
+
+    bridge = AttachingBridge()
+    monkeypatch.setattr(sm_mod, "UARTBridge", lambda *_args, **_kwargs: bridge)
+
+    def blocked_probe(_bridge: AttachingBridge, _profile: Any) -> tuple[bool, str]:
+        probe_started.set()
+        assert probe_continue.wait(2.0)
+        with pytest.raises(RuntimeError, match="drain 已凍結 TX"):
+            _bridge.send_command("echo late probe")
+        return False, "PROMPT_TIMEOUT"
+
+    monkeypatch.setattr(sm_mod, "probe_ready", blocked_probe)
+    monkeypatch.setattr(mgr, "_refine_probe_failure", lambda *_args: ("PROMPT_TIMEOUT", None))
+    attach = threading.Thread(target=mgr._attach_by_id, args=(BY_ID,))
+    attach.start()
+    assert probe_started.wait(1.0)
+
+    release_result: dict[str, Any] = {}
+    release_done = threading.Event()
+
+    def release() -> None:
+        release_result.update(mgr.release_device("COM0"))
+        release_done.set()
+
+    release_thread = threading.Thread(target=release)
+    release_thread.start()
+    assert drain_started.wait(1.0)
+    assert not release_done.wait(0.05)
+    close_receipt.set()
+    assert release_done.wait(1.0)
+    assert release_result["ok"] is True
+    assert mgr.get_session("COM0").state == "RELEASED"
+
+    probe_continue.set()
+    release_thread.join(1.0)
+    attach.join(1.0)
+    assert not attach.is_alive()
+    assert bridge.begin_calls == 1 and bridge.finish_calls == 1
+    assert bridge.writes == []
+    assert mgr.get_session("COM0").state == "RELEASED"
+
+
 def test_aborted_command_not_resent(tmp_path):
-    mgr, s, b = _ready_with_port(tmp_path, FakePort())
+    port = FakePort()
+    mgr, s, b = _ready_with_port(tmp_path, port)
     b.send_bytes(b"TEST_PAYLOAD", source="agent:x", cmd_id="c_abort")
     mgr.release_device("COM0")
     tx_entries = [r for r in wal_records(mgr._wal) if r.get("dir") == "TX" and r.get("cmd_id") == "c_abort"]
     assert len(tx_entries) == 1
-    assert [w for w in s.bridge._serial.writes if b"TEST_PAYLOAD" in w] == [b"TEST_PAYLOAD"]
+    assert [w for w in port.writes if b"TEST_PAYLOAD" in w] == [b"TEST_PAYLOAD"]
 
 
 def test_drain_abort_mapping_survives_settle_race(tmp_path):
@@ -402,6 +510,7 @@ def test_running_command_aborted_by_release_records_code(tmp_path):
     b._tx_accounts["c_long"] = (1, False)
     from sw_core.session_manager import _ForegroundOperation
     s._foreground_operation = _ForegroundOperation(
+        session_id=s.session_id,
         token=object(),
         bridge=b,
         bridge_generation=s.bridge_generation,
@@ -419,7 +528,7 @@ def test_late_completion_does_not_touch_new_session(tmp_path):
     mgr, s, b = _ready_with_port(tmp_path, FakePort())
     old_gen = s.bridge_generation
     from sw_core.session_manager import _ForegroundOperation
-    old_op = _ForegroundOperation(token=object(), bridge=b, bridge_generation=old_gen, cmd_id="old_c")
+    old_op = _ForegroundOperation(session_id=s.session_id, token=object(), bridge=b, bridge_generation=old_gen, cmd_id="old_c")
     s._foreground_operation = old_op
     mgr.release_device("COM0")
     mgr.attach_device("COM0")
@@ -440,6 +549,9 @@ def test_reject_paths_have_zero_side_effects(tmp_path, short_drain):
     gate = threading.Event()
     port = FakePort(block=gate)
     mgr, s, b = _ready_with_port(tmp_path, port)
+    writer = threading.Thread(target=lambda: b.send_bytes(b"abc", source="agent:x"), daemon=True)
+    writer.start()
+    time.sleep(0.05)
     r1 = mgr.release_device("COM0")
     tx_before = len([r for r in wal_records(mgr._wal) if r.get("dir") == "TX"])
     port.writes.clear()
@@ -452,17 +564,38 @@ def test_reject_paths_have_zero_side_effects(tmp_path, short_drain):
     assert len([r for r in wal_records(mgr._wal) if r.get("dir") == "TX"]) == tx_before
     assert os.path.getmtime(mgr._state_path) == state_mtime
     gate.set()
+    writer.join(1.0)
 
 
 def test_shutdown_drains_then_closes_wal(tmp_path):
-    mgr, s, b = _ready_with_port(tmp_path, FakePort())
+    svc = make_service(tmp_path, ready=["COM0"], port=FakePort())
+    mgr = svc._sessions
+    s = mgr.get_session("COM0")
+    b = s.bridge
     call_order = []
-    b.begin_drain = lambda *args, **kwargs: call_order.append("begin_drain")
-    b.finish_drain = lambda *args, **kwargs: call_order.append("finish_drain")
-    orig_close = mgr._wal.close
-    mgr._wal.close = lambda: (call_order.append("wal_close"), orig_close())
-    res = mgr.shutdown_drain(total_timeout_s=5.0)
-    assert res == {"graceful": True, "stalled": []}
+    original_begin_drain = b.begin_drain
+    original_finish_drain = b.finish_drain
+
+    def tracked_begin_drain(*args, **kwargs):
+        call_order.append("begin_drain")
+        return original_begin_drain(*args, **kwargs)
+
+    def tracked_finish_drain(*args, **kwargs):
+        call_order.append("finish_drain")
+        return original_finish_drain(*args, **kwargs)
+
+    b.begin_drain = tracked_begin_drain
+    b.finish_drain = tracked_finish_drain
+    orig_shutdown_drain = mgr.shutdown_drain
+    def tracked_shutdown_drain(*args, **kwargs):
+        result = orig_shutdown_drain(*args, **kwargs)
+        assert result == {"graceful": True, "stalled": []}
+        return result
+    mgr.shutdown_drain = tracked_shutdown_drain
+    orig_close = svc._wal.close
+    svc._wal.close = lambda: (call_order.append("wal_close"), orig_close())
+    svc._running = True
+    svc.stop()
     assert call_order == ["begin_drain", "finish_drain", "wal_close"]
 
 
@@ -483,28 +616,86 @@ def test_shutdown_gate_blocks_hotplug_after_drain_start(tmp_path):
     assert r"/s/by-id/usb-NEW" not in mgr._sessions
 
 
-def test_shutdown_waits_inflight_attach_before_wal_close(tmp_path):
-    mgr, s, b = _ready_with_port(tmp_path, FakePort())
-    gate = threading.Event()
+def test_shutdown_waits_inflight_attach_before_wal_close(tmp_path, monkeypatch):
+    from sw_core.device_watcher import DeviceInfo
+    import sw_core.uart_io as uart_io
+
+    service = make_service(tmp_path, ready=["COM0"])
+    manager = service._sessions
+    session = manager.get_session("COM0")
+    assert session is not None
+    by_id = session.profile.device_by_id
+    session.bridge = None
+    session.state = "DETACHED"
+    manager._devices[by_id] = DeviceInfo(by_id=by_id, real_path=str(tmp_path / "fake-uart"))
+
+    port_open_started = threading.Event()
+    allow_port_open = threading.Event()
+    attach_finished = threading.Event()
+    stop_finished = threading.Event()
+    order: list[str] = []
+    stop_errors: list[BaseException] = []
 
     class BlockingPort(FakePort):
         def open(self):
-            gate.wait()
+            port_open_started.set()
+            if not allow_port_open.wait(3.0):
+                raise TimeoutError("測試未釋放隔離 serial port open")
             super().open()
 
     port = BlockingPort()
-    order = []
-    mgr.begin_shutdown = lambda: order.append("begin_shutdown")
-    orig_close = mgr._wal.close
-    mgr._wal.close = lambda: (order.append("wal_close"), orig_close())
-    th = threading.Thread(target=lambda: (order.append("attach_start"), port.open(), order.append("attach_done")))
-    th.start()
-    time.sleep(0.05)
-    mgr.begin_shutdown()
-    gate.set()
-    th.join(2.0)
-    mgr._wal.close()
-    assert order == ["attach_start", "begin_shutdown", "attach_done", "wal_close"]
+    monkeypatch.setattr(uart_io, "open_serial_port", lambda *_args, **_kwargs: port)
+
+    original_attach = manager._attach_by_id
+
+    def tracked_attach(target_by_id: str) -> None:
+        try:
+            original_attach(target_by_id)
+        finally:
+            order.append("attach_done")
+            attach_finished.set()
+
+    monkeypatch.setattr(manager, "_attach_by_id", tracked_attach)
+    original_close = service._wal.close
+
+    def tracked_wal_close() -> None:
+        assert attach_finished.is_set(), "WAL 在 production attach thread 收尾前關閉"
+        assert not manager._attach_inflight, "WAL 關閉時 attach 仍被標記為在途"
+        assert not manager._attach_ops, "WAL 關閉時仍有 UART 開埠操作"
+        assert not manager._active_attach_ops, "WAL 關閉時仍有 worker 持有 UART handle"
+        assert not manager._preopened_ports, "WAL 關閉時仍有未消費的 UART handle"
+        assert port.close_calls == 1, "WAL 關閉前預開 UART handle 必須恰好收回一次"
+        order.append("wal_close")
+        original_close()
+
+    service._wal.close = tracked_wal_close
+    service._running = True
+    manager._spawn_attach(by_id)
+    assert port_open_started.wait(2.0), "production _attach_by_id 未進入隔離 port.open"
+
+    def stop_service() -> None:
+        try:
+            service.stop()
+        except BaseException as exc:  # noqa: BLE001 — 由主測試執行緒斷言
+            stop_errors.append(exc)
+        finally:
+            stop_finished.set()
+
+    stopper = threading.Thread(target=stop_service)
+    stopper.start()
+    try:
+        assert not stop_finished.wait(0.05), "shutdown 未等待被 gate 阻塞的獨占開埠"
+    finally:
+        allow_port_open.set()
+        stopper.join(6.0)
+
+    assert not stopper.is_alive(), "service.stop 未在 attach 收尾後完成"
+    assert not stop_errors, stop_errors
+    assert attach_finished.is_set()
+    assert order == ["attach_done", "wal_close"]
+    assert port.writes == [], "shutdown 後不得送出 attach probe"
+    assert port.close_calls == 1
+    assert service._wal.closed is True
 
 
 def test_shutdown_timeout_is_reported_not_graceful(tmp_path):
@@ -518,7 +709,7 @@ def test_shutdown_timeout_is_reported_not_graceful(tmp_path):
     elapsed = time.monotonic() - t0
     assert elapsed < 5.5
     assert res["graceful"] is False
-    assert "COM0" in res["stalled"]
+    assert s.session_id in res["stalled"]
     assert getattr(mgr._wal, "closed", False) is False
 
 
@@ -551,3 +742,42 @@ def test_release_persist_failure_keeps_blocking(tmp_path, monkeypatch):
     assert BY_ID in mgr._released_by_ids
     mgr._spawn_attach(BY_ID)
     assert mgr.get_session("COM0").bridge is None
+
+
+def test_duplicate_release_waits_for_persist_completion(tmp_path, monkeypatch):
+    mgr, _session, _bridge = _ready_with_port(tmp_path, FakePort())
+    save_started = threading.Event()
+    allow_save = threading.Event()
+    original_save = mgr._save_state
+    calls = 0
+
+    def blocked_save() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            save_started.set()
+            assert allow_save.wait(2.0)
+        original_save()
+
+    monkeypatch.setattr(mgr, "_save_state", blocked_save)
+    results: dict[str, Any] = {}
+    first = threading.Thread(target=lambda: results.update(first=mgr.release_device("COM0")))
+    first.start()
+    assert save_started.wait(1.0)
+
+    second_done = threading.Event()
+
+    def duplicate_release() -> None:
+        results["second"] = mgr.release_device("COM0")
+        second_done.set()
+
+    second = threading.Thread(target=duplicate_release)
+    second.start()
+    assert not second_done.wait(0.05)
+    allow_save.set()
+    first.join(1.0)
+    second.join(1.0)
+    assert not first.is_alive() and not second.is_alive()
+    assert results["first"]["ok"] is True
+    assert results["second"]["ok"] is True and results["second"]["already_released"] is True
+    assert calls == 1

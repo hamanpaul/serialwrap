@@ -67,6 +67,11 @@ class DeviceWatcher:
         if added or removed:
             self._on_change(added, removed)
 
+    def scan_once(self) -> dict[str, DeviceInfo]:
+        """同步掃描並更新快照，不啟動背景 thread 或通知 on_change。"""
+        self._devices = self._scan()
+        return self.devices
+
     def _loop(self) -> None:
         while not self._stop_event.is_set():
             try:
