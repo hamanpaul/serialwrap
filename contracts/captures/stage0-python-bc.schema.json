@@ -1,0 +1,198 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Stage 0 Python Baseline Behavioral Changes Captures Schema",
+  "type": "object",
+  "x-normalized": [
+    "inode",
+    "dev",
+    "FileId",
+    "wall_ts",
+    "mono_ts_ns",
+    "uuid",
+    "tmp_prefix"
+  ],
+  "required": [
+    "schema_version",
+    "git_revision",
+    "wal",
+    "bc03_mapping",
+    "release_drain_timeout_shape",
+    "device_attach_results"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "git_revision": {
+      "type": "string"
+    },
+    "wal": {
+      "type": "object",
+      "required": [
+        "rotate_bytes",
+        "rotate_compare",
+        "rotate_check",
+        "crc_empty",
+        "meta_empty_payload",
+        "seq_after_rotate",
+        "seq_after_reset",
+        "seq_after_restart",
+        "seq_after_external_unlink",
+        "meta_recreated_example"
+      ],
+      "properties": {
+        "rotate_bytes": {
+          "type": "integer"
+        },
+        "rotate_compare": {
+          "type": "string"
+        },
+        "rotate_check": {
+          "type": "string"
+        },
+        "crc_empty": {
+          "type": "string"
+        },
+        "meta_empty_payload": {
+          "type": "object",
+          "required": [
+            "len",
+            "payload_b64"
+          ],
+          "properties": {
+            "len": {
+              "type": "integer"
+            },
+            "payload_b64": {
+              "type": "string"
+            }
+          }
+        },
+        "seq_after_rotate": {
+          "type": "integer"
+        },
+        "seq_after_reset": {
+          "type": "integer"
+        },
+        "seq_after_restart": {
+          "type": "integer"
+        },
+        "seq_after_external_unlink": {
+          "type": "object",
+          "required": [
+            "meta_seq_delta",
+            "record_seq_delta"
+          ],
+          "properties": {
+            "meta_seq_delta": {
+              "type": "integer"
+            },
+            "record_seq_delta": {
+              "type": "integer"
+            }
+          }
+        },
+        "meta_recreated_example": {
+          "type": "object"
+        }
+      }
+    },
+    "bc03_mapping": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "account",
+          "aborted_by_drain",
+          "expected"
+        ],
+        "properties": {
+          "account": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "boolean"
+              }
+            ],
+            "items": false,
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "aborted_by_drain": {
+            "type": "boolean"
+          },
+          "expected": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "release_drain_timeout_shape": {
+      "type": "object",
+      "required": [
+        "keys",
+        "error_code",
+        "drain_stalled",
+        "drain_timeout_epoch_type"
+      ],
+      "properties": {
+        "keys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "error_code": {
+          "type": "string"
+        },
+        "drain_stalled": {
+          "type": "boolean"
+        },
+        "drain_timeout_epoch_type": {
+          "type": "string"
+        }
+      }
+    },
+    "device_attach_results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "case",
+          "expected"
+        ],
+        "properties": {
+          "case": {
+            "type": "string"
+          },
+          "expected": {
+            "type": "object",
+            "required": [
+              "ok",
+              "error_code",
+              "state"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean"
+              },
+              "error_code": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "state": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

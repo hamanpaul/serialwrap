@@ -1,0 +1,180 @@
+{
+  "bc03_mapping": [
+    {
+      "aborted_by_drain": true,
+      "account": [
+        2,
+        false
+      ],
+      "expected": "COMMAND_ABORTED_IN_FLIGHT"
+    },
+    {
+      "aborted_by_drain": true,
+      "account": [
+        2,
+        true
+      ],
+      "expected": "COMMAND_ABORTED_IN_FLIGHT"
+    },
+    {
+      "aborted_by_drain": false,
+      "account": [
+        2,
+        false
+      ],
+      "expected": "COMMAND_ABORTED_IN_FLIGHT"
+    },
+    {
+      "aborted_by_drain": true,
+      "account": [
+        0,
+        true
+      ],
+      "expected": "SEND_FAILED"
+    },
+    {
+      "aborted_by_drain": false,
+      "account": [
+        0,
+        true
+      ],
+      "expected": "SEND_FAILED"
+    },
+    {
+      "aborted_by_drain": true,
+      "account": [
+        0,
+        false
+      ],
+      "expected": "FLUSHED_BY_RECOVERY"
+    },
+    {
+      "aborted_by_drain": false,
+      "account": [
+        0,
+        false
+      ],
+      "expected": "SEND_FAILED"
+    }
+  ],
+  "device_attach_results": [
+    {
+      "case": "drain_in_progress",
+      "expected": {
+        "error_code": "SESSION_RECOVERING",
+        "ok": false,
+        "state": "RECOVERING"
+      }
+    },
+    {
+      "case": "already_attached",
+      "expected": {
+        "error_code": null,
+        "ok": true,
+        "state": "READY"
+      }
+    },
+    {
+      "case": "device_not_present",
+      "expected": {
+        "error_code": "DEVICE_NOT_PRESENT",
+        "ok": false,
+        "state": "RELEASED"
+      }
+    },
+    {
+      "case": "held_by_external_probe",
+      "expected": {
+        "error_code": "DEVICE_STILL_HELD",
+        "ok": false,
+        "state": "RELEASED"
+      }
+    },
+    {
+      "case": "held_by_open_conflict",
+      "expected": {
+        "error_code": "DEVICE_STILL_HELD",
+        "ok": false,
+        "state": "RELEASED"
+      }
+    },
+    {
+      "case": "open_failed_device_not_present",
+      "expected": {
+        "error_code": "DEVICE_NOT_PRESENT",
+        "ok": false,
+        "state": "RELEASED"
+      }
+    },
+    {
+      "case": "open_failed_other_oserror",
+      "expected": {
+        "error_code": null,
+        "ok": true,
+        "state": "DETACHED"
+      }
+    },
+    {
+      "case": "attach_success",
+      "expected": {
+        "error_code": null,
+        "ok": true,
+        "state": "ATTACHING"
+      }
+    }
+  ],
+  "git_revision": "9b2d4e998e9d183bf6776d40d9a55d212f9accce",
+  "release_drain_timeout_shape": {
+    "drain_stalled": true,
+    "drain_timeout_epoch_type": "int",
+    "error_code": "SESSION_RECOVERING",
+    "keys": [
+      "ok",
+      "error_code",
+      "drain_stalled",
+      "drain_timeout_epoch",
+      "session"
+    ]
+  },
+  "schema_version": 1,
+  "wal": {
+    "crc_empty": "00000000",
+    "meta_empty_payload": {
+      "len": 0,
+      "payload_b64": ""
+    },
+    "meta_recreated_example": {
+      "cmd_id": null,
+      "com": "WAL",
+      "crc32": "00000000",
+      "dir": "META",
+      "len": 0,
+      "loss_flag": true,
+      "meta": {
+        "event": "WAL_RECREATED_AFTER_EXTERNAL_UNLINK",
+        "potentially_lost_seq_range": [
+          1,
+          2
+        ],
+        "previous_identity": "<id>:<id>",
+        "range_known": true,
+        "reason": "external_unlink"
+      },
+      "mono_ts_ns": 0,
+      "payload_b64": "",
+      "seq": 3,
+      "source": "system",
+      "wall_ts": "<wall_ts>"
+    },
+    "rotate_bytes": 67108864,
+    "rotate_check": "before_write",
+    "rotate_compare": ">=",
+    "seq_after_external_unlink": {
+      "meta_seq_delta": 1,
+      "record_seq_delta": 1
+    },
+    "seq_after_reset": 1,
+    "seq_after_restart": 1,
+    "seq_after_rotate": 1
+  }
+}
