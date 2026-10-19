@@ -896,4 +896,18 @@ impl RuntimeConfig {
     pub fn socket_path(&self) -> Option<&YValue> {
         self.data.get_str("socket_path")
     }
+
+    /// 07 §5.1：socket_path Some 才覆寫。
+    pub fn set_mode(&mut self, _mode: &str, _socket_path: Option<&str>) {
+        todo!("not implemented: P4-T6")
+    }
+
+    pub fn set_socket(&mut self, _endpoint: &str) {
+        todo!("not implemented: P4-T6")
+    }
+
+    /// safe_dump(allow_unicode=true, sort_keys=true)
+    pub fn to_yaml(&self) -> String {
+        todo!("not implemented: P4-T6")
+    }
 }

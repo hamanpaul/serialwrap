@@ -36,6 +36,120 @@ impl PyValue {
             PyValue::Dict(d) => !d.0.is_empty(),
         }
     }
+
+    pub fn is_null(&self) -> bool {
+        matches!(self, PyValue::Null)
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            PyValue::Str(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            PyValue::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            PyValue::Int(PyInt::Small(n)) => Some(*n as i64),
+            PyValue::Int(PyInt::Big(s)) => s.parse().ok(),
+            _ => None,
+        }
+    }
+
+    pub fn as_array(&self) -> Option<&Vec<PyValue>> {
+        match self {
+            PyValue::List(l) => Some(l),
+            _ => None,
+        }
+    }
+
+    pub fn get(&self, key: &str) -> Option<&PyValue> {
+        match self {
+            PyValue::Dict(d) => d.get(key),
+            _ => None,
+        }
+    }
+}
+
+static NULL_PYVALUE: PyValue = PyValue::Null;
+
+impl std::ops::Index<&str> for PyValue {
+    type Output = PyValue;
+    fn index(&self, key: &str) -> &Self::Output {
+        match self {
+            PyValue::Dict(d) => d.get(key).unwrap_or(&NULL_PYVALUE),
+            _ => &NULL_PYVALUE,
+        }
+    }
+}
+
+impl std::ops::Index<usize> for PyValue {
+    type Output = PyValue;
+    fn index(&self, idx: usize) -> &Self::Output {
+        match self {
+            PyValue::List(l) => l.get(idx).unwrap_or(&NULL_PYVALUE),
+            _ => &NULL_PYVALUE,
+        }
+    }
+}
+
+impl std::ops::Index<&str> for PyDict {
+    type Output = PyValue;
+    fn index(&self, key: &str) -> &Self::Output {
+        self.get(key).unwrap_or(&NULL_PYVALUE)
+    }
+}
+
+impl PartialEq<&str> for PyValue {
+    fn eq(&self, other: &&str) -> bool {
+        match self {
+            PyValue::Str(s) => s.as_str() == *other,
+            _ => false,
+        }
+    }
+}
+
+impl PartialEq<str> for PyValue {
+    fn eq(&self, other: &str) -> bool {
+        match self {
+            PyValue::Str(s) => s.as_str() == other,
+            _ => false,
+        }
+    }
+}
+
+impl PartialEq<String> for PyValue {
+    fn eq(&self, other: &String) -> bool {
+        match self {
+            PyValue::Str(s) => s == other,
+            _ => false,
+        }
+    }
+}
+
+impl PartialEq<bool> for PyValue {
+    fn eq(&self, other: &bool) -> bool {
+        match self {
+            PyValue::Bool(b) => b == other,
+            _ => false,
+        }
+    }
+}
+
+impl PartialEq<i64> for PyValue {
+    fn eq(&self, other: &i64) -> bool {
+        match self {
+            PyValue::Int(PyInt::Small(n)) => *n == (*other as i128),
+            _ => false,
+        }
+    }
 }
 
 /// Python 整數；超出 i128 時以正規化十進位字串保存（含負號）。

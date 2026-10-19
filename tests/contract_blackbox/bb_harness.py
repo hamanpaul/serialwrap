@@ -68,6 +68,10 @@ def python_baseline_interpreter() -> list[str]:
 
 def cli_prefix() -> list[str]:
     cli = ab_env().get("SERIALWRAP_CLI_EXE")
+    if cli == "/bin/serialwrap" and not Path("/bin/serialwrap").exists():
+        sw_bundle = os.environ.get("SW_BUNDLE")
+        if sw_bundle:
+            cli = str(Path(sw_bundle) / "bin" / "serialwrap")
     if not cli:
         return python_baseline_prefix()
     if cli.endswith(".py"):

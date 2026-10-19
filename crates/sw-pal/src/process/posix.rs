@@ -12,6 +12,14 @@ use std::process::{Command, Stdio};
 pub struct NativeProcessCtl;
 
 impl ProcessCtl for NativeProcessCtl {
+    fn spawn_elevated(
+        &self,
+        _exe: &std::path::Path,
+        _args: &[String],
+    ) -> crate::traits::PalResult<crate::traits::ElevatedOutcome> {
+        todo!("P4-T19: NativeProcessCtl::spawn_elevated 尚未實作")
+    }
+
     fn exec_or_wait(&self, argv: &[OsString], env_add: &[(String, String)]) -> PalError {
         if argv.is_empty() {
             return crate::traits::posix_errno(libc::EINVAL);

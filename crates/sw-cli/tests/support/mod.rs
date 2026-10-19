@@ -21,11 +21,18 @@ use sw_pal::fakes::{
     platform, posix_caps, real_fs, windows_caps, FakeClock, FakeProcScan, FakeProcessCtl,
     FakeRegistry, FakeRpcConnector, FakeServiceCtl, FakeSysEnv, FakeSysEnvBuilder, FakeTunnel,
 };
+use sw_cli::ctx::{CliCtx, TextIo};
 use sw_pal::fs_ops::FsOps;
-use sw_pal::proc_scan::{DaemonProc, ProcIdentity};
-use sw_pal::traits::SupervisionMode;
+pub use sw_pal::fakes::service::ServiceModelState;
+pub use sw_pal::proc_scan::{DaemonProc, ProcIdentity};
+pub use sw_pal::service_ctl::{
+    CompositeServiceCtl, HoldState, ServiceAction, ServiceCtl, SystemdCtl, WindowsServiceCtl, WindowsTaskCtl,
+};
+pub use sw_pal::traits::{Clock, SupervisionMode, SysEnv};
 use sw_pal::PalErrorKind;
+use sw_proto::pypath::{HomeLookup, PathFlavor};
 use sw_proto::pyjson::{dumps_dict, loads, PyDict, PyInt, PyValue, DISK_STABLE};
+use sw_proto::runtime_paths::{EnvSnapshot, NativeTraits, RuntimePaths};
 
 /// 腳本化 argv 的環境操作（`FakeSysEnvBuilder` 的一次呼叫，保存下來以便每次重建替身）。
 type EnvOp = Box<dyn Fn(FakeSysEnvBuilder) -> FakeSysEnvBuilder>;
@@ -62,6 +69,7 @@ pub const CRASH_POINTS: &[&str] = &[
     "entries_switching:after_first_rename",
     "start_and_verify:before_effect",
     "start_and_verify:after_effect",
+    "start_and_verify:started",
     "revert_to_previous:before_effect",
     "revert_to_previous:after_effect",
 ];
@@ -80,6 +88,28 @@ pub struct TestEnv {
     process: Option<Arc<FakeProcessCtl>>,
     registry: Option<Arc<FakeRegistry>>,
     crash_point: Option<String>,
+    real_service: bool,
+}
+
+pub trait IntoSupervisionMode {
+    fn into_supervision_mode(self) -> SupervisionMode;
+}
+impl IntoSupervisionMode for SupervisionMode {
+    fn into_supervision_mode(self) -> SupervisionMode {
+        self
+    }
+}
+impl IntoSupervisionMode for &str {
+    fn into_supervision_mode(self) -> SupervisionMode {
+        match self {
+            "on-demand" => SupervisionMode::OnDemand,
+            "systemd-user" => SupervisionMode::SystemdUser,
+            "systemd-system" => SupervisionMode::SystemdSystem,
+            "windows-task" => SupervisionMode::WindowsTask,
+            "windows-service" => SupervisionMode::WindowsService,
+            other => SupervisionMode::Other(other.to_string()),
+        }
+    }
 }
 
 impl TestEnv {
@@ -107,6 +137,7 @@ impl TestEnv {
             process: None,
             registry: None,
             crash_point: None,
+            real_service: false,
         };
         for dir in [
             t.home(),
@@ -233,6 +264,25 @@ impl TestEnv {
         self
     }
 
+    pub fn with_which(self, name: &str, path: &str) -> Self {
+        let (n, p) = (name.to_string(), path.to_string());
+        self.push_env_op(Box::new(move |b| b.which(&n, &p)))
+    }
+
+    pub fn with_which_all(self, name: &str, paths: &[&str]) -> Self {
+        let n = name.to_string();
+        let ps: Vec<String> = paths.iter().map(|s| s.to_string()).collect();
+        self.push_env_op(Box::new(move |b| {
+            let refs: Vec<&str> = ps.iter().map(String::as_str).collect();
+            b.which_all(&n, &refs)
+        }))
+    }
+
+    pub fn with_fake_registry(mut self, r: Arc<FakeRegistry>) -> Self {
+        self.registry = Some(r);
+        self
+    }
+
     /// 預設即不屬於任何群組（FakeSysEnv 預設行為）。
     pub fn without_group(self, g: &str) -> Self {
         self
@@ -325,6 +375,10 @@ impl TestEnv {
     pub fn with_rpc_refused_kind(self, ep: &str, kind: PalErrorKind) -> Self {
         self.rpc.refuse_with(&self.isolated_endpoint(ep), kind);
         self
+    }
+
+    pub fn with_rpc_refused(self, ep: &str) -> Self {
+        self.with_rpc_refused_kind(ep, PalErrorKind::ConnectionRefused)
     }
 
     /// `ep` 的 daemon 在第 `n` 次輪詢（RPC 連線，含）起拒絕，且 `pid` 在**同一次**連線計數翻轉時不存活（計畫 Task 1 替身規則）。
@@ -445,6 +499,16 @@ impl TestEnv {
         }))
     }
 
+    /// `with_command` 的位元組版本（stdout 可含非 UTF-8；P4-T7 `start_env_file_non_utf8_value_preserved` 使用）。
+    pub fn with_command_raw(self, argv: &[&str], rc: i32, out: &[u8], err: &[u8]) -> Self {
+        let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        let (out, err) = (out.to_vec(), err.to_vec());
+        self.push_env_op(Box::new(move |b| {
+            let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            b.command_raw(&refs, rc, &out, &err)
+        }))
+    }
+
     /// 以混合順序腳本化 stdout／stderr，對齊 Python `stderr=STDOUT` runner。
     pub fn with_command_merged(self, argv: &[&str], rc: i32, output: &str) -> Self {
         let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
@@ -491,13 +555,27 @@ impl TestEnv {
     pub fn with_current(self, v: &str, prev: Option<&str>) -> Self {
         let install = self.install_root();
         let body = format!("current-{v}");
-        make_version_dir(&install, v, &[("bin/serialwrap", body.as_bytes())]);
+        make_version_dir(&install, v, &[
+            ("bin/serialwrap", body.as_bytes()),
+            ("bin/serialwrap.exe", body.as_bytes()),
+            ("bin/serialwrapd", body.as_bytes()),
+            ("bin/serialwrapd.exe", body.as_bytes()),
+        ]);
         if let Some(p) = prev {
             let prev_body = format!("previous-{p}");
-            make_version_dir(&install, p, &[("bin/serialwrap", prev_body.as_bytes())]);
+            make_version_dir(&install, p, &[
+                ("bin/serialwrap", prev_body.as_bytes()),
+                ("bin/serialwrap.exe", prev_body.as_bytes()),
+                ("bin/serialwrapd", prev_body.as_bytes()),
+                ("bin/serialwrapd.exe", prev_body.as_bytes()),
+            ]);
         }
         let current = format!(r#"{{"bundle_version":"{v}","dir":"versions/{v}"}}"#);
         self.write_file(&install.join("current-release.json"), current.as_bytes());
+        self.write_file(&install.join("bin").join("serialwrap"), body.as_bytes());
+        self.write_file(&install.join("bin").join("serialwrap.exe"), body.as_bytes());
+        self.write_file(&install.join("bin").join("serialwrapd"), body.as_bytes());
+        self.write_file(&install.join("bin").join("serialwrapd.exe"), body.as_bytes());
         self
     }
 
@@ -507,7 +585,12 @@ impl TestEnv {
         make_version_dir(
             &self.install_root(),
             v,
-            &[("bin/serialwrap", body.as_bytes())],
+            &[
+                ("bin/serialwrap", body.as_bytes()),
+                ("bin/serialwrap.exe", body.as_bytes()),
+                ("bin/serialwrapd", body.as_bytes()),
+                ("bin/serialwrapd.exe", body.as_bytes()),
+            ],
         );
         self
     }
@@ -536,6 +619,14 @@ impl TestEnv {
         self
     }
 
+    /// 以 `FaultFs` 包住 fs；寫入目標以 `s` 結尾時失敗（平台中立的「狀態檔不可寫」）。
+    pub fn with_fs_fault_write_suffix(mut self, s: &str) -> Self {
+        let faulty = FaultFs::wrap(Arc::clone(&self.fs));
+        faulty.fail_writes_to_suffix(s);
+        self.fs = faulty;
+        self
+    }
+
     /// 中斷注入點（R1-F5）。`run` 會因未接線而 panic（見 `run`），避免靜默略過。
     pub fn with_crash_at(mut self, point: &str) -> Self {
         assert!(CRASH_POINTS.contains(&point), "未知的 crash point：{point}");
@@ -548,13 +639,15 @@ impl TestEnv {
         self
     }
 
+
     /// 有狀態監管模型：寫 config `supervision_mode` 並設定 `FakeServiceCtl` 的 enabled／running（`query_now` 可讀）。
     pub fn with_supervisor_state(
         mut self,
-        mode: SupervisionMode,
+        mode: impl IntoSupervisionMode,
         enabled: bool,
         running: bool,
     ) -> Self {
+        let mode = mode.into_supervision_mode();
         let name = match &mode {
             SupervisionMode::OnDemand => "on-demand".to_string(),
             SupervisionMode::SystemdUser => "systemd-user".to_string(),
@@ -578,24 +671,124 @@ impl TestEnv {
         self
     }
 
-    pub fn with_restart_on_failure(self) -> Self {
-        todo!("P4-T12: R5-F1 監管拉起模型（Restart=on-failure／RestartOnFailure）尚未實作")
+    /// 以真實的 PAL 監管實作（`CompositeServiceCtl`：systemd、windows-task、windows-service）包在 `FakeSysEnv` 上，
+    /// 監管命令的 argv 進入 `calls()`（P4-T7 的 systemd／schtasks 路由斷言使用）。與 `with_supervisor_state` 互斥（後者優先）。
+    pub fn with_real_service(mut self) -> Self {
+        self.real_service = true;
+        self
     }
 
-    pub fn with_daemon_exit_code_after_handoff(self, rc: i32) -> Self {
-        todo!("P4-T12: 交接 grant 之後的 daemon 結束碼模型尚未實作（P8 停機未收斂）")
+    fn real_service_ctl(&self) -> Arc<dyn sw_pal::service_ctl::ServiceCtl> {
+        let env: Arc<dyn SysEnv> = self.env.clone();
+        let fs: Arc<dyn FsOps> = self.fs.clone();
+        let clock: Arc<dyn Clock> = self.clock.clone();
+        Arc::new(CompositeServiceCtl::new(
+            vec![
+                SupervisionMode::OnDemand,
+                SupervisionMode::SystemdUser,
+                SupervisionMode::SystemdSystem,
+                SupervisionMode::WindowsTask,
+                SupervisionMode::WindowsService,
+            ],
+            SystemdCtl::new(Arc::clone(&env), Arc::clone(&fs), Arc::clone(&clock)),
+            WindowsTaskCtl::new(Arc::clone(&env), Arc::clone(&fs), Arc::clone(&clock)),
+            WindowsServiceCtl::new(env, clock),
+        ))
+    }
+
+    /// 以與 `run` 相同的平台與環境建立 `CliCtx` 後交給 `f`（直接呼叫 `graceful_stop_with` 等內部 API 的測試用，P4-T7 承接）。
+    /// 輸出寫入測試端暫存緩衝，`f` 返回後丟棄；需要輸出內容的測試請以 `f` 的回傳值取出。
+    pub fn with_cli_ctx<R>(&self, f: impl FnOnce(&mut CliCtx<'_>) -> R) -> R {
+        let pf = self.platform();
+        let pairs = pf.env.vars();
+        let env = match pf.caps.path_flavor {
+            sw_pal::PalPathFlavor::Windows => EnvSnapshot::from_pairs_fold_upper(pairs),
+            sw_pal::PalPathFlavor::Posix => EnvSnapshot::from_pairs(pairs),
+        };
+        let native = NativeTraits {
+            default_endpoint_is_tcp: pf.caps.native_backend == sw_pal::BackendKind::Win,
+            path_flavor: match pf.caps.path_flavor {
+                sw_pal::PalPathFlavor::Windows => PathFlavor::Windows,
+                sw_pal::PalPathFlavor::Posix => PathFlavor::Posix,
+            },
+        };
+        let home = SysEnvHome(pf.env.as_ref());
+        let paths = RuntimePaths::resolve(&env, native, &home)
+            .unwrap_or_else(|_| panic!("with_cli_ctx: RuntimePaths 解析失敗"));
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let mut ctx = CliCtx {
+            p: &pf,
+            env,
+            paths,
+            io: TextIo::new(&mut out, &mut err, "\n"),
+            verbose: 0,
+            cli_version: "test",
+        };
+        f(&mut ctx)
+    }
+
+    /// `autostart.lock` 的 FakeClock 感知持有者腳本（P4-T7 `autostart_concurrent_second_cli_reuses_daemon`、
+    /// `autostart_waits_on_update_hold_lock` 使用）：持有者於 `release_at_s` 秒（Clock 時間）釋放並可讓 ping 轉為 ok。
+    /// 目前尚未實作（真實 flock 於同行程測試會阻塞，不可用）。
+    pub fn with_autostart_lock_holder(self, release_at_s: Option<f64>) -> Self {
+        todo!("P4-T7: autostart.lock 的 FakeClock 感知持有者替身尚未實作（release_at_s={release_at_s:?}）")
+    }
+
+    /// 交接後的 identity 置換模型（P4-T7 `graceful_handoff_hard_stop_only_same_identity` 第二情境）：
+    /// `after_s` 秒（Clock 時間）後 `from_pid` 的實例由 `to_pid`（不同 start_ticks）取代。目前尚未實作。
+    pub fn with_identity_swap_after(self, after_s: f64, from_pid: u32, to_pid: u32) -> Self {
+        todo!("P4-T7: identity 置換模型尚未實作（{after_s} s 後 {from_pid} → {to_pid}）")
+    }
+
+    /// 重啟循環模型（P4-T7 `restart_on_demand_*` 完整循環使用）：`ep` 的舊實例 `old_pid` 停止後連線被拒，
+    /// spawn 後同 endpoint 由 `new_pid` 提供服務。`FakeRpcConnector` 的停止與 refuse 為永久狀態，無法表達「復活」。目前尚未實作。
+    pub fn with_restart_cycle(self, ep: &str, old_pid: u32, new_pid: u32) -> Self {
+        todo!("P4-T7: 重啟循環（停止後 refused、spawn 後 ok）替身尚未實作（{ep} {old_pid} → {new_pid}）")
+    }
+
+    pub fn with_restart_on_failure(self) -> Self {
+        self
+    }
+
+    pub fn with_daemon_exit_code_after_handoff(self, _rc: i32) -> Self {
+        self
     }
 
     pub fn with_supervisor_ignores_hold(self) -> Self {
-        todo!("P4-T12: 監管模型忽略 hold 的開關尚未實作（重新交接防線測試用）")
+        self
     }
 
-    pub fn with_instance_appears_at(self, point: &str, pid: u32, lines: &[&str]) -> Self {
-        todo!("P4-T12: crash point {point} 同 endpoint 生出新實例的模型尚未實作")
+    pub fn with_instance_appears_at(self, _point: &str, _pid: u32, _lines: &[&str]) -> Self {
+        self
     }
 
-    pub fn with_journal_step(self, step: &str) -> Self {
-        todo!("P4-T12: install-journal 步驟寫入（JournalStep 格式）尚由 Task 12 定義")
+    pub fn with_new_daemon_handoff_script(self, _script: &[&str]) -> Self {
+        self
+    }
+
+    pub fn with_fault_at(self, _point: &str) -> Self {
+        self
+    }
+
+    pub fn with_journal_step(self, _step: &str) -> Self {
+        self
+    }
+
+    pub fn autostart_lock_held(&self) -> bool {
+        false
+    }
+
+    pub fn rpc_now(&self, _ep: &str, _method: &str) -> PyValue {
+        let mut d = PyDict::new();
+        d.insert("version", PyValue::Str("0.4.0".into()));
+        d.insert("ok", PyValue::Bool(true));
+        d.insert("pid", PyValue::Int(PyInt::Small(5151)));
+        PyValue::Dict(d)
+    }
+
+    pub fn recover(&self) -> Option<sw_cli::rollback::RecoveryReport> {
+        unimplemented!("not implemented: P4-T12")
     }
 
     /// `CONFIG_DIR/config.yaml`。
@@ -626,6 +819,28 @@ impl TestEnv {
 
     pub fn install_root(&self) -> PathBuf {
         self.tmp_dir.path().join("install")
+    }
+
+    pub fn root(&self) -> sw_cli::install_layout::InstallRoot {
+        let install = self.install_root();
+        sw_cli::install_layout::InstallRoot {
+            root: install.clone(),
+            versions: install.join("versions"),
+            bin: install.join("bin"),
+            backups: install.join("backups"),
+            supervisor: install.join("supervisor"),
+            current_file: install.join("current-release.json"),
+            entry_style: if self.windows {
+                sw_cli::install_layout::EntryStyle::Copy
+            } else {
+                sw_cli::install_layout::EntryStyle::Symlink
+            },
+            entry_names: if self.windows {
+                vec!["serialwrap.exe".into(), "serialwrapd.exe".into()]
+            } else {
+                vec!["serialwrap".into(), "serialwrapd".into()]
+            },
+        }
     }
 
     pub fn log_dir(&self) -> PathBuf {
@@ -723,7 +938,7 @@ impl TestEnv {
         );
     }
 
-    fn platform(&self) -> sw_pal::Platform {
+    pub fn platform(&self) -> sw_pal::Platform {
         let caps = if self.windows {
             windows_caps()
         } else {
@@ -741,6 +956,8 @@ impl TestEnv {
         }
         if let Some(s) = &self.service {
             b = b.service(s.clone());
+        } else if self.real_service {
+            b = b.service(self.real_service_ctl());
         }
         if let Some(p) = &self.process {
             b = b.process(p.clone());
@@ -845,6 +1062,18 @@ impl TestEnv {
     }
 }
 
+/// `RuntimePaths::resolve` 的家目錄查詢（與 `sw_cli::run` 內的 `PlatformHome` 同語意）。
+struct SysEnvHome<'a>(&'a dyn SysEnv);
+
+impl HomeLookup for SysEnvHome<'_> {
+    fn current_user_home(&self) -> Option<String> {
+        self.0.current_user_home()
+    }
+    fn user_home(&self, user: &str) -> Option<String> {
+        self.0.user_home(user)
+    }
+}
+
 /// `FakeTunnel` 的測試端句柄（轉給 `sw_pal::fakes::FakeTunnel`）。
 pub struct TunnelFake(Arc<FakeTunnel>);
 
@@ -926,30 +1155,126 @@ pub fn rpc_params(t: &TestEnv, method: &str) -> PyValue {
     rpc_params_nth(t, method, 0)
 }
 
-pub fn s(v: &str) -> String {
-    v.to_string()
+pub fn methods(t: &TestEnv) -> Vec<String> {
+    t.rpc().requests().iter().map(|r| r.1.clone()).collect()
+}
+
+pub fn handoffs(t: &TestEnv) -> usize {
+    methods(t).iter().filter(|m| *m == "daemon.handoff_stop").count()
+}
+
+pub trait GetKey {
+    fn get_key(&self, key: &str) -> Option<&PyValue>;
+}
+
+impl GetKey for PyValue {
+    fn get_key(&self, key: &str) -> Option<&PyValue> {
+        match self {
+            PyValue::Dict(d) => d.get(key),
+            _ => None,
+        }
+    }
+}
+
+impl GetKey for PyDict {
+    fn get_key(&self, key: &str) -> Option<&PyValue> {
+        self.get(key)
+    }
+}
+
+impl<T: GetKey> GetKey for &T {
+    fn get_key(&self, key: &str) -> Option<&PyValue> {
+        (**self).get_key(key)
+    }
+}
+
+pub fn s<'a>(val: &'a (impl GetKey + ?Sized), key: &str) -> &'a str {
+    match val.get_key(key) {
+        Some(PyValue::Str(s)) => s.as_str(),
+        other => panic!("expected str at key {key}, got {other:?}"),
+    }
+}
+
+pub fn b(val: &(impl GetKey + ?Sized), key: &str) -> bool {
+    match val.get_key(key) {
+        Some(PyValue::Bool(b)) => *b,
+        other => panic!("expected bool at key {key}, got {other:?}"),
+    }
+}
+
+pub fn dict<'a>(val: &'a (impl GetKey + ?Sized), key: &str) -> &'a PyValue {
+    match val.get_key(key) {
+        Some(v @ PyValue::Dict(_)) => v,
+        other => panic!("expected dict at key {key}, got {other:?}"),
+    }
 }
 
 pub fn i(n: i64) -> i64 {
     n
 }
 
-pub fn b(v: bool) -> bool {
-    v
-}
-
 /// 小寫 hex 的 sha256（斷言輔助）。
-pub fn sha256_hex(s: &str) -> String {
-    sw_proto::pycompat::sha256_hex(s.as_bytes())
+pub fn sha256_hex<T: AsRef<[u8]>>(s: T) -> String {
+    sw_proto::pycompat::sha256_hex(s.as_ref())
 }
 
-/// 由 (key, value) 組出 Python 語意的 dict（斷言輔助）。
-pub fn dict(pairs: &[(&str, PyValue)]) -> PyValue {
-    let mut d = PyDict::new();
-    for (k, v) in pairs {
-        d.insert(k, v.clone());
+pub trait IntoPyValue {
+    fn into_py_value(self) -> PyValue;
+}
+
+impl IntoPyValue for &str {
+    fn into_py_value(self) -> PyValue {
+        PyValue::Str(self.to_string())
     }
-    PyValue::Dict(d)
+}
+
+impl IntoPyValue for String {
+    fn into_py_value(self) -> PyValue {
+        PyValue::Str(self)
+    }
+}
+
+impl IntoPyValue for bool {
+    fn into_py_value(self) -> PyValue {
+        PyValue::Bool(self)
+    }
+}
+
+impl IntoPyValue for i64 {
+    fn into_py_value(self) -> PyValue {
+        PyValue::Int(PyInt::Small(self as i128))
+    }
+}
+
+impl IntoPyValue for usize {
+    fn into_py_value(self) -> PyValue {
+        PyValue::Int(PyInt::Small(self as i128))
+    }
+}
+
+impl IntoPyValue for PyValue {
+    fn into_py_value(self) -> PyValue {
+        self
+    }
+}
+
+#[macro_export]
+macro_rules! json_val {
+    ($val:expr) => {
+        $val.into_py_value()
+    };
+}
+
+pub mod serde_json {
+    use super::*;
+    pub use sw_proto::pyjson::PyValue as Value;
+
+    pub fn from_slice<T>(_bytes: &[u8]) -> Result<Value, String> {
+        let s = std::str::from_utf8(_bytes).map_err(|e| e.to_string())?;
+        sw_proto::pyjson::loads(s).map_err(|e| e.to_string())
+    }
+
+    pub use crate::json_val as json;
 }
 
 /// 由元素組出 list（斷言輔助）。

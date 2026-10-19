@@ -37,6 +37,21 @@ pub struct FakeProcessCtl {
 }
 
 impl FakeProcessCtl {
+    /// P4-T19：`spawn_elevated` 的呼叫紀錄 `(exe, args)`，依呼叫順序。
+    pub fn elevated_spawns(&self) -> Vec<(std::path::PathBuf, Vec<String>)> {
+        todo!("P4-T19: FakeProcessCtl::elevated_spawns 尚未實作")
+    }
+
+    /// P4-T19：之後的 `spawn_elevated` 一律回傳 `outcome`（未設定時視為 `Exited(0)`）。
+    pub fn elevation_result(&self, outcome: crate::traits::ElevatedOutcome) {
+        todo!("P4-T19: FakeProcessCtl::elevation_result 尚未實作")
+    }
+
+    /// P4-T19：`setupc list` 的替身結果：既有 com0com pair（`(a, b)` 如 `("COM20", "COM21")`）。
+    pub fn set_com0com_pairs(&self, pairs: &[(&str, &str)]) {
+        todo!("P4-T19: FakeProcessCtl::set_com0com_pairs 尚未實作")
+    }
+
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             next_pid: Mutex::new(9000),
@@ -81,6 +96,14 @@ impl FakeProcessCtl {
 }
 
 impl ProcessCtl for FakeProcessCtl {
+    fn spawn_elevated(
+        &self,
+        _exe: &std::path::Path,
+        _args: &[String],
+    ) -> PalResult<crate::traits::ElevatedOutcome> {
+        todo!("P4-T19: FakeProcessCtl::spawn_elevated 尚未實作")
+    }
+
     fn exec_or_wait(&self, argv: &[OsString], env_add: &[(String, String)]) -> PalError {
         PalError::plain(
             PalErrorKind::Unsupported,

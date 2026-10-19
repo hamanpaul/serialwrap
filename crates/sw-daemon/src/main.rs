@@ -1,6 +1,7 @@
-//! `serialwrapd` 空殼（P3-T1）：Stage 1A 尚無 Rust daemon，daemon 本體由 P4 之後承接。
+//! `serialwrapd` 入口（P4-T17）：Stage 1 由 launcher 承接（`sw_daemon::launcher::run`）。
 
 fn main() {
-    eprintln!("serialwrapd: Stage 1A 尚無 Rust daemon");
-    std::process::exit(2)
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let p = sw_pal::native_client();
+    std::process::exit(sw_daemon::launcher::run(argv, &p));
 }

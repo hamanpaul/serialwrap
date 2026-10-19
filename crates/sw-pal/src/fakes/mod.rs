@@ -24,7 +24,7 @@ pub use fs::{FaultFs, MemFs};
 pub use platform::{platform, posix_caps, windows_caps, FakePlatformBuilder};
 pub use proc::FakeProcScan;
 pub use process::{FakeProcessCtl, RecordingProcess};
-pub use realfs::real_fs;
+pub use realfs::{file_mode, real_fs};
 pub use registry::FakeRegistry;
 pub use rpc::{FakeConn, FakeRpcConnector, ScriptedConnector, StreamStep};
 pub use service::FakeServiceCtl;

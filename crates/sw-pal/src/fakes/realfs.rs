@@ -223,3 +223,18 @@ impl FsOps for RealFs {
 pub fn real_fs() -> Arc<dyn FsOps> {
     Arc::new(RealFs)
 }
+
+/// 讀取檔案權限位（`mode & 0o7777`）；平台無 POSIX 權限位（Windows）時回 `None`。
+/// 供 `crates/sw-pal` 以外的測試在不寫平台 `cfg` 的前提下斷言 mode（arch §2.1 cfg 邊界）。
+pub fn file_mode(p: &Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).ok().map(|m| m.permissions().mode() & 0o7777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = p;
+        None
+    }
+}

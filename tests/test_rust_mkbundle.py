@@ -12,6 +12,8 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -248,3 +250,331 @@ def test_help_lists_supported_options_without_building():
     assert result.returncode == 0, result.stderr
     for option in ("--target", "--profile", "--out", "--print-dir"):
         assert option in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# P4-T17：sw-daemon launcher 與自含式 dev bundle（紅燈；strict xfail，P4-T17 實作完成的同一 commit 移除 marker）
+# ---------------------------------------------------------------------------
+
+P4_T17_RED = pytest.mark.xfail(strict=True, reason="P4-T17 紅燈")
+
+
+def _build_bundle(out: Path, version_override: str | None = None) -> Path:
+    """以 `mkbundle.sh --dev` 建立指定目錄的新 bundle；失敗以 AssertionError 呈現（含 stderr）。"""
+    _require_cargo()
+    args = [str(MKBUNDLE), "--dev", "--out", str(out)]
+    if version_override is not None:
+        args += ["--version-override", version_override]
+    res = subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        timeout=900,
+        cwd=str(REPO),
+        check=False,
+    )
+    assert res.returncode == 0, (
+        f"mkbundle.sh {' '.join(args[1:])} 失敗（rc={res.returncode}）：{res.stderr.strip()}"
+    )
+    return out
+
+
+def _vdir(out: Path, version: str = VERSION) -> Path:
+    return out / "versions" / version
+
+
+def _full_listing(root: Path) -> dict[str, str]:
+    """相對路徑 → 內容 sha256（含 __pycache__ 與 *.pyc；symlink 記為 `symlink:<目標>`；目錄不列）。"""
+    listing: dict[str, str] = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in dirnames + filenames:
+            p = Path(dirpath) / name
+            rel = p.relative_to(root).as_posix()
+            if p.is_symlink():
+                listing[rel] = "symlink:" + os.readlink(p)
+            elif p.is_file():
+                listing[rel] = _sha256(p)
+    return listing
+
+
+def _is_bytecode(rel: str) -> bool:
+    return "__pycache__" in rel.split("/") or rel.endswith(".pyc")
+
+
+def _tree_sha256_stdlib(root: Path, subtree: str | None = None) -> str:
+    """與 `sw_core.release_manifest.tree_sha256` 同演算法（規格 §9.5）：排除 __pycache__ 與 *.pyc；
+    relpath 以 `/` 分隔、相對於 root、依 UTF-8 位元組序；每列 `<relpath>\\0<sha256>\\n` 的 sha256。"""
+    base = root / subtree if subtree else root
+    rows: list[tuple[str, str]] = []
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = sorted(d for d in dirnames if d != "__pycache__")
+        for name in filenames:
+            if name.endswith(".pyc"):
+                continue
+            p = Path(dirpath) / name
+            rows.append((p.relative_to(root).as_posix(), _sha256(p)))
+    rows.sort(key=lambda kv: kv[0].encode("utf-8"))
+    body = "".join(f"{rel}\0{digest}\n" for rel, digest in rows)
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _harness_env(tmp: Path) -> dict[str, str]:
+    harness_dir = str(REPO / "tests" / "contract_blackbox")
+    if harness_dir not in sys.path:
+        sys.path.insert(0, harness_dir)
+    from bb_harness import isolated_env
+
+    env = isolated_env(tmp)
+    # 本檔要觀察 entry 的 `-B` 是否生效；不能由測試環境的 PYTHONDONTWRITEBYTECODE 代勞。
+    env.pop("PYTHONDONTWRITEBYTECODE", None)
+    return env
+
+
+def _send_rpc(endpoint: str, method: str, params: dict):
+    harness_dir = str(REPO / "tests" / "contract_blackbox")
+    if harness_dir not in sys.path:
+        sys.path.insert(0, harness_dir)
+    from bb_daemon import _send_rpc as send
+
+    return send(endpoint, method, params, timeout_s=1.0)
+
+
+def _wait_ready(endpoint: str, proc: subprocess.Popen, timeout_s: float = 30.0) -> dict:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise AssertionError(f"daemon 提早結束 rc={proc.returncode}")
+        res = _send_rpc(endpoint, "health.ping", {})
+        if res and res.get("ok") is True:
+            return res
+        time.sleep(0.2)
+    raise AssertionError(f"health.ping 於 {timeout_s} s 內未回 ok：{endpoint}")
+
+
+def _count_procs_with(token: str) -> int:
+    count = 0
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            raw = Path("/proc", entry, "cmdline").read_bytes()
+        except OSError:
+            continue
+        if token.encode("utf-8") in raw:
+            count += 1
+    return count
+
+
+def _run_daemon_session(bundle_root: Path, env: dict, work: Path) -> None:
+    """以 `bin/serialwrapd`（launcher）啟動 daemon，經 Rust CLI 委派一次 `session list`，最後 `daemon stop`。"""
+    launcher = bundle_root / "bin" / "serialwrapd"
+    assert launcher.is_file(), f"bin/serialwrapd（Stage 1 launcher）缺失：{launcher}"
+    work.mkdir(parents=True, exist_ok=True)
+    sockdir = Path(tempfile.mkdtemp(prefix="swd-", dir=tempfile.gettempdir()))
+    proc: subprocess.Popen | None = None
+    try:
+        sock = sockdir / "s"
+        with open(work / "daemon.log", "w", encoding="utf-8") as log:
+            proc = subprocess.Popen(
+                [
+                    str(launcher),
+                    "--socket", str(sock),
+                    "--lock", str(sockdir / "l"),
+                    "--profile-dir", str(work / "profiles"),
+                ],
+                env=env,
+                cwd=str(work),
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+            _wait_ready(str(sock), proc)
+            cli_env = dict(env, SERIALWRAP_ENDPOINT=str(sock))
+            listed = subprocess.run(
+                [str(bundle_root / "bin" / "serialwrap"), "session", "list"],
+                env=cli_env,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+            assert listed.returncode == 0, f"委派命令 session list 失敗：{listed.stderr.strip()}"
+            stopped = subprocess.run(
+                [str(bundle_root / "bin" / "serialwrap"), "daemon", "stop"],
+                env=cli_env,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+            assert stopped.returncode == 0, f"daemon stop 失敗：{stopped.stderr.strip()}"
+            proc.wait(timeout=20)
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+        shutil.rmtree(sockdir, ignore_errors=True)
+
+
+@P4_T17_RED
+def test_bundle_python_run_leaves_tree_unchanged(tmp_path):
+    out = _build_bundle(tmp_path / "bundle dir")
+    vdir = _vdir(out)
+    symlinks = sorted(p.relative_to(vdir).as_posix() for p in vdir.rglob("*") if p.is_symlink())
+    assert not symlinks, f"自含式 bundle 不得含 symlink（bundle 指紋對 symlink 一律拒絕）：{symlinks}"
+
+    env = _harness_env(tmp_path / "iso")
+    before = _full_listing(vdir)
+    before_tree = _tree_sha256_stdlib(vdir)
+    _run_daemon_session(out, env, tmp_path / "main")
+    after = _full_listing(vdir)
+
+    new_bytecode = sorted(k for k in set(after) - set(before) if _is_bytecode(k))
+    assert not new_bytecode, f"啟動並執行 Python daemon 後不得新增位元組碼（entry 缺 -B）：{new_bytecode[:10]}"
+    changed = sorted(k for k in before if after.get(k) != before[k])
+    assert not changed, f"執行後既有檔案內容不得改變：{changed[:10]}"
+    assert _tree_sha256_stdlib(vdir) == before_tree, "執行後 bundle_tree_sha256 不得改變"
+
+    # 對照組：複本 bundle 的 daemon entry 去掉 -B，同一流程必須產生位元組碼，證明上方檢測有效。
+    ctrl = tmp_path / "control bundle"
+    shutil.copytree(out, ctrl, symlinks=True)
+    ctrl_manifest = _vdir(ctrl) / "release-manifest.json"
+    ctrl_doc = json.loads(ctrl_manifest.read_text(encoding="utf-8"))
+    ctrl_doc["components"]["daemon"]["entry"] = [
+        item for item in ctrl_doc["components"]["daemon"]["entry"] if item != "-B"
+    ]
+    ctrl_manifest.write_text(json.dumps(ctrl_doc, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    ctrl_before = _full_listing(_vdir(ctrl))
+    _run_daemon_session(ctrl, env, tmp_path / "control")
+    ctrl_after = _full_listing(_vdir(ctrl))
+    ctrl_new = [k for k in set(ctrl_after) - set(ctrl_before) if _is_bytecode(k)]
+    assert ctrl_new, "對照組（entry 無 -B）未產生位元組碼：上方檢測無法證明有效"
+
+
+@P4_T17_RED
+def test_bundle_py_is_self_contained(tmp_path):
+    out = _build_bundle(tmp_path / "bundle dir")
+    py_dir = _vdir(out) / "py"
+    pths = sorted(p.relative_to(py_dir).as_posix() for p in py_dir.rglob("*.pth"))
+    assert not pths, f"自含式 bundle 的 py/ 不得含 .pth（指向 repo）：{pths}"
+
+    py = py_dir / "bin" / "python3"
+    assert not py.is_symlink(), "py/bin/python3 必須為一般檔（venv --copies）"
+    r = subprocess.run(
+        [str(py), "-I", "-c", "import sw_core, os; print(os.path.dirname(os.path.abspath(sw_core.__file__)))"],
+        capture_output=True,
+        text=True,
+        cwd=str(tmp_path),
+        check=False,
+    )
+    assert r.returncode == 0, r.stderr
+    loaded = Path(r.stdout.strip()).resolve()
+    assert loaded.is_relative_to(py_dir.resolve()), f"sw_core 必須由 bundle 內的 py/ 提供，實際載入 {loaded}"
+
+
+@P4_T17_RED
+def test_bundle_two_versions_have_distinct_tree_sha256(tmp_path):
+    versions = ("0.4.0", "0.4.1")
+    fingerprints: dict[str, str] = {}
+    for version in versions:
+        out = _build_bundle(tmp_path / f"bundle-{version}", version_override=version)
+        vdir = _vdir(out, version)
+
+        cli = subprocess.run(
+            [str(out / "bin" / "serialwrap"), "--version"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert cli.returncode == 0 and cli.stdout.strip() == f"serialwrap {version}", cli.stderr
+
+        py = subprocess.run(
+            [str(vdir / "py" / "bin" / "python3"), "-I", "-m", "sw_core.cli", "--version"],
+            capture_output=True,
+            text=True,
+            cwd=str(tmp_path),
+            check=False,
+        )
+        assert py.returncode == 0 and py.stdout.strip() == f"serialwrap {version}", py.stderr
+
+        m = json.loads((vdir / "release-manifest.json").read_text(encoding="utf-8"))
+        assert m["bundle_version"] == version
+        assert m["pairing"] == {"rule": "exact", "cli_version": version, "daemon_version": version}
+        fingerprints[version] = _tree_sha256_stdlib(vdir)
+
+    assert fingerprints["0.4.0"] != fingerprints["0.4.1"], "不同版本的 bundle_tree_sha256 必須不同"
+
+
+@P4_T17_RED
+def test_bundle_daemon_components_and_sha256sums(bundle):
+    out = bundle.out()
+    vdir = _vdir(out)
+    d = _manifest(out)["components"]["daemon"]
+    assert d["implementation"] == "python"
+    assert d["version"] == VERSION
+    assert d["entry"] == ["py/bin/python3", "-I", "-B", "py/serialwrapd.py"]
+    assert d["launcher"]["path"] == "bin/serialwrapd"
+    assert d["launcher"]["sha256"] == _sha256(vdir / "bin" / "serialwrapd")
+    assert d["runtime"]["path"] == "py/bin/python3"
+    assert d["runtime"]["sha256"] == _sha256(vdir / "py" / "bin" / "python3")
+    assert d["runtime"]["python_version"] == _meta_python_version()
+    assert d["package"]["name"] == "serialwrap"
+    assert d["package"]["version"] == VERSION
+    assert d["package"]["tree_sha256"] == _tree_sha256_stdlib(vdir / "py", "sw_core")
+
+    sums = vdir / "SHA256SUMS"
+    assert sums.is_file(), f"缺少 SHA256SUMS：{sums}"
+    listed: list[str] = []
+    for line in sums.read_text(encoding="utf-8").splitlines():
+        digest, sep, rel = line.partition("  ")
+        assert sep and len(digest) == 64, f"SHA256SUMS 列格式須為 `<sha256>  <relpath>`：{line!r}"
+        assert _sha256(vdir / rel) == digest, f"SHA256SUMS 與實際檔案不符：{rel}"
+        listed.append(rel)
+    assert listed == sorted(listed), "SHA256SUMS 必須依 relpath 排序"
+    deployed = {
+        p.relative_to(vdir).as_posix()
+        for p in vdir.rglob("*")
+        if p.is_file() and p.name not in ("SHA256SUMS", "release-manifest.json")
+    }
+    missing = sorted(deployed - set(listed))
+    assert not missing, f"SHA256SUMS 漏列部署檔：{missing[:10]}"
+
+
+@P4_T17_RED
+def test_bundle_launcher_starts_python_daemon(bundle, tmp_path):
+    out = bundle.out()
+    launcher = out / "bin" / "serialwrapd"
+    assert launcher.is_file(), f"bin/serialwrapd（Stage 1 launcher）缺失：{launcher}"
+    env = _harness_env(tmp_path / "iso")
+    sockdir = Path(tempfile.mkdtemp(prefix="swl-", dir=tempfile.gettempdir()))
+    proc: subprocess.Popen | None = None
+    try:
+        sock = sockdir / "s"
+        with open(tmp_path / "daemon.log", "w", encoding="utf-8") as log:
+            proc = subprocess.Popen(
+                [
+                    str(launcher),
+                    "--socket", str(sock),
+                    "--lock", str(sockdir / "l"),
+                    "--profile-dir", str(tmp_path / "profiles"),
+                ],
+                env=env,
+                cwd=str(tmp_path),
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+            ping = _wait_ready(str(sock), proc)
+            assert ping.get("ok") is True
+            instances = _count_procs_with(str(sock))
+            assert instances == 1, (
+                f"launcher 應以 execve 取代自身，socket {sock} 只能對應 1 個 daemon 行程"
+                f"（multi_open 規則 2；實際 {instances}）"
+            )
+            _send_rpc(str(sock), "daemon.stop", {})
+            proc.wait(timeout=20)
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+        shutil.rmtree(sockdir, ignore_errors=True)

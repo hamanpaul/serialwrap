@@ -1370,12 +1370,13 @@ def test_bc_real_bc_case_ids_frozen() -> None:
     assert "OD-13" in by_id["BC-01"].related_decisions
 
 
+@pytest.mark.xfail(strict=True, reason="P4-T19 紅燈：SC 期望含 SC-36；SC-08 撤回與 SC-34／35 待 P1-OC 合併")
 def test_bc_real_sc_df_ranges() -> None:
-    """SC-01~SC-27 與 DF-01~DF-17、DF-19 編號範圍凍結，DF-19 屬性完備。"""
+    """SC 範圍依 P4-T19 為 SC-01～SC-27 去除 SC-08 並加入 SC-34、35、36；DF-01～DF-17、DF-19 編號範圍凍結，DF-19 屬性完備。"""
     changes, _, _ = _bc()
     by_id = {c.id: c for c in changes}
     sc_ids = {c.id for c in changes if c.kind == "SC"}
-    assert sc_ids == {f"SC-{i:02d}" for i in range(1, 28)}
+    assert sc_ids == {f"SC-{i:02d}" for i in range(1, 28)} - {"SC-08"} | {"SC-34", "SC-35", "SC-36"}
     df_ids = {c.id for c in changes if c.kind == "DF"}
     assert df_ids == {f"DF-{i:02d}" for i in range(1, 18)} | {"DF-19"}
 
@@ -1387,14 +1388,15 @@ def test_bc_real_sc_df_ranges() -> None:
     assert df19.applies_rust_stage == "slice-2.1"
 
 
+@pytest.mark.xfail(strict=True, reason="P4-T19 紅燈：SC-36 尚未登錄於 behavior_changes.yaml")
 def test_bc_real_rust_only_python_null() -> None:
-    """scope 為 rust_only 者 applies_python_min 為 None，特定 SC 項目為 rust_only。"""
+    """scope 為 rust_only 者 applies_python_min 為 None，特定 SC 項目為 rust_only（含 P4-T19 的 SC-36）。"""
     changes, _, _ = _bc()
     by_id = {c.id: c for c in changes}
     for c in changes:
         if c.scope == "rust_only":
             assert c.applies_python_min is None, f"{c.id} applies_python_min 應為 None"
-    for sc_id in ("SC-15", "SC-17", "SC-18", "SC-22", "SC-23", "SC-24", "SC-26"):
+    for sc_id in ("SC-15", "SC-17", "SC-18", "SC-22", "SC-23", "SC-24", "SC-26", "SC-36"):
         assert by_id[sc_id].scope == "rust_only", f"{sc_id} scope 應為 rust_only"
     assert by_id["SC-25"].scope in {"rust_only", "python_when_manifest_present"}
 
@@ -1410,6 +1412,17 @@ def test_bc_real_sc22_switch_guard_not_force_overridable() -> None:
     assert "--force" in sc22.approval_conditions
     assert "force_ignored" in sc22.compatibility_impact
     assert sc22.case_ids == ("sc22-supervision-mode-set",)
+
+
+@pytest.mark.xfail(strict=True, reason="P4-T19 紅燈：SC-36 尚未登錄於 behavior_changes.yaml")
+def test_sc36_registered() -> None:
+    """SC-36（OD-15 Windows 安裝選用 com0com 元件）登記為 Rust-only、僅絕對值比對、P4／P8 階段，綁定 P4-T19 案例。"""
+    sc36 = _bc_by_id()["SC-36"]
+    assert sc36.scope == "rust_only"
+    assert sc36.ab_participation == "absolute_only"
+    assert list(sc36.phases) == ["P4", "P8"]
+    assert sc36.approval.decision_ref == "OD-15"
+    assert sc36.case_ids == ("sc36-win-installer-com0com-optional",)
 
 
 def test_bc_real_ab_participation() -> None:

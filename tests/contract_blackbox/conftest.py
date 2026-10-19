@@ -151,6 +151,11 @@ def _no_system_config() -> None:
 @pytest.fixture(scope="session", autouse=True)
 def _artifact_identity() -> None:
     from bb_harness import cli_prefix, is_rust
+    cli_env = os.environ.get("SERIALWRAP_CLI_EXE")
+    if cli_env == "/bin/serialwrap" and not Path("/bin/serialwrap").exists():
+        sw_bundle = os.environ.get("SW_BUNDLE")
+        if sw_bundle:
+            os.environ["SERIALWRAP_CLI_EXE"] = str(Path(sw_bundle) / "bin" / "serialwrap")
     prefix = cli_prefix()
     target_path = Path(prefix[-1])
     if not target_path.exists():

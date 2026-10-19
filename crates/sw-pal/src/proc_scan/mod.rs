@@ -23,6 +23,19 @@ pub struct DaemonProc {
     pub tree: Vec<ProcIdentity>,
 }
 
+impl DaemonProc {
+    pub fn win(pid: u32, ep: &str) -> Self {
+        Self {
+            pid,
+            socket: Some(ep.to_string()),
+            tree: vec![ProcIdentity {
+                pid,
+                start_ticks: None,
+            }],
+        }
+    }
+}
+
 /// 行程識別資訊（PID 與建立時間戳 / start_ticks）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcIdentity {

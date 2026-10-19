@@ -23,6 +23,9 @@ pub use crate::service_ctl::{
     TaskQuery, TaskXmlSpec, WindowsServiceCtl, WindowsTaskCtl,
 };
 
+// P4-T19：提權結果型別定義於 process 模組，此處再匯出供 trait 與呼叫端共用。
+pub use crate::process::ElevatedOutcome;
+
 pub type PalResult<T> = Result<T, PalError>;
 
 /// Python `OSError` 的平台無關表示；`py_message` 為 Python `str(OSError)` 格式，不含檔名。
@@ -525,6 +528,17 @@ pub trait ProcessCtl: Send + Sync {
         Err(PalError::plain(
             PalErrorKind::Unsupported,
             "不支援前景子行程呼叫",
+        ))
+    }
+
+    // ── P4-T19：提權啟動（SC-36）──
+
+    /// Windows：`ShellExecuteExW(lpVerb="runas", SEE_MASK_NOCLOSEPROCESS)` 啟動 `exe` 並等待結束；
+    /// 使用者拒絕 UAC 回 `ElevatedOutcome::Declined`。POSIX：`Err(kind=Unsupported)`。
+    fn spawn_elevated(&self, _exe: &Path, _args: &[String]) -> PalResult<ElevatedOutcome> {
+        Err(PalError::plain(
+            PalErrorKind::Unsupported,
+            "不支援提權啟動",
         ))
     }
 }

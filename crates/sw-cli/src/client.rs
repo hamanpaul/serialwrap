@@ -439,6 +439,34 @@ fn socket_error(error: PalError) -> PyDict {
 }
 
 /// 管理面子命令的 RPC 薄包裝（P4-T1，計畫 §0.2）：`req_id` 依 P3 規則固定為 `1`，`ClientCrash` 由呼叫端轉 exit 1。
+/// RPC 失敗發生的階段（P4-T7 SC-18 判定用；由 `rpc_call_once` 的內部分支直接產生，不解析訊息）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailPhase {
+    Connect,
+    Send,
+    Recv,
+}
+
+/// 型別化的 RPC 失敗 metadata（P4-T7）。`maybe_sent` 為 send_all 已開始呼叫。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RpcFailure {
+    pub phase: FailPhase,
+    pub pal_kind: Option<sw_pal::PalErrorKind>,
+    pub maybe_sent: bool,
+}
+
+/// 同 `call`，另回傳型別化失敗 metadata（P4-T7 紅燈骨架）。
+pub fn call_with_failure(
+    ctx: &crate::ctx::CliCtx,
+    ep: &str,
+    method: &str,
+    params: &PyValue,
+    timeout_s: f64,
+    retries: &PyInt,
+) -> (RpcOutcome, Option<RpcFailure>) {
+    todo!("P4-T7: call_with_failure")
+}
+
 pub fn call(
     ctx: &crate::ctx::CliCtx,
     endpoint: &str,

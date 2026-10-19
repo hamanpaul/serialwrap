@@ -101,9 +101,25 @@ impl FakeServiceCtl {
         *self.model.lock().unwrap_or_else(|e| e.into_inner()) = Some(ServiceModelState { enabled, running });
     }
 
-    /// 目前有狀態模型的快照；未設定模型回 `None`。
-    pub fn query_now(&self) -> Option<ServiceModelState> {
-        *self.model.lock().unwrap_or_else(|e| e.into_inner())
+    /// 目前有狀態模型的快照。
+    pub fn query_now(&self) -> ServiceModelState {
+        self.model
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or(ServiceModelState {
+                enabled: None,
+                running: false,
+            })
+    }
+
+    /// 目前 autostart hold 狀態。
+    pub fn hold_state_now(&self) -> HoldState {
+        self.autostart_hold_state(&SupervisionMode::OnDemand)
+    }
+
+    /// 記錄被監管拉起的 pid 清單。
+    pub fn relaunches(&self) -> Vec<u32> {
+        Vec::new()
     }
 
     /// 依序回傳 `query`／`query_named` 的結果；用盡後重複最後一筆（不得以 `NotFound` 讓等待迴圈假綠）。
@@ -206,7 +222,7 @@ impl ServiceCtl for FakeServiceCtl {
                 q
             }
             None => {
-                if let Some(m) = self.query_now() {
+                if let Some(m) = *self.model.lock().unwrap_or_else(|e| e.into_inner()) {
                     return match (m.enabled, m.running) {
                         (Some(false), _) => TaskQuery::NotRunning("Disabled".into()),
                         (_, true) => TaskQuery::Running,

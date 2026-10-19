@@ -314,6 +314,14 @@ impl RpcConnector for Unconfigured {
 }
 
 impl ProcessCtl for Unconfigured {
+    fn spawn_elevated(
+        &self,
+        _exe: &std::path::Path,
+        _args: &[String],
+    ) -> PalResult<crate::traits::ElevatedOutcome> {
+        not_configured(self.0)
+    }
+
     fn exec_or_wait(&self, _argv: &[OsString], _env_add: &[(String, String)]) -> PalError {
         not_configured(self.0)
     }

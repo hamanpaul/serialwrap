@@ -71,3 +71,20 @@ pub fn remembered_bench_endpoint(benches: &PyDict, code: &str) -> Result<Option<
     Ok(Some(stripped.to_string()))
 }
 
+/// 記憶特定 bench 代號的 endpoint（加跨行程鎖；紅燈 stub）。
+pub fn remember(
+    _ctx: &CliCtx<'_>,
+    _code: &str,
+    _endpoint: &str,
+) -> Result<(), BenchStateError> {
+    unimplemented!("not implemented: P4-T9: bench_state::remember")
+}
+
+/// 清除特定 bench 代號的 endpoint 記憶（加跨行程鎖；紅燈 stub）。
+pub fn forget(
+    _ctx: &CliCtx<'_>,
+    _code: &str,
+) -> Result<(), BenchStateError> {
+    unimplemented!("not implemented: P4-T9: bench_state::forget")
+}
+

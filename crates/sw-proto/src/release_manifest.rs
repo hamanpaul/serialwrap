@@ -120,3 +120,31 @@ pub fn parse_current_release(text: &str) -> Result<CurrentRelease, ManifestError
         dir: str_field(&root, "dir")?,
     })
 }
+
+/// `components.com0com` 選用元件（P4-T19，SC-36，OD-15）：只在 Windows bundle 出現，缺席為合法狀態。
+///
+/// 紅燈階段（TDD）：欄位依計畫 Task 19 Produces；解析本體與 `com0com()` 由 P4-T19 實作。
+#[derive(Clone, Debug, PartialEq)]
+pub struct Com0comComponent {
+    pub optional: bool,
+    pub default_selected: bool,
+    pub requires_elevation: bool,
+    pub experimental: bool,
+    pub version: String,
+    pub sha256: String,
+    /// 固定為 `"GPL-2.0"`。
+    pub license: String,
+    pub license_file: String,
+    pub source_offer_file: String,
+    pub provenance_file: String,
+    pub helper: String,
+    /// 預設 pair（`("COM20", "COM21")`）。
+    pub default_pair: (String, String),
+}
+
+impl ReleaseManifest {
+    /// 取得 `components.com0com`；缺席回 `None`。
+    pub fn com0com(&self) -> Option<Com0comComponent> {
+        todo!("P4-T19: components.com0com 解析尚未實作")
+    }
+}

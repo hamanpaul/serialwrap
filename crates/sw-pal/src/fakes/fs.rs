@@ -73,6 +73,7 @@ impl FsRead for MemFs {
 pub struct FaultFs {
     inner: std::sync::Arc<dyn crate::fs_ops::FsOps>,
     replace_fault_suffix: Mutex<Option<String>>,
+    write_target_fault_suffix: Mutex<Option<String>>,
     copy_tree_fault: Mutex<bool>,
 }
 
@@ -87,6 +88,7 @@ impl FaultFs {
         std::sync::Arc::new(Self {
             inner,
             replace_fault_suffix: Mutex::new(None),
+            write_target_fault_suffix: Mutex::new(None),
             copy_tree_fault: Mutex::new(false),
         })
     }
@@ -94,6 +96,17 @@ impl FaultFs {
     /// `replace(from, to)` 的 `from` 以此後綴結尾時回 `Io` 錯誤。
     pub fn fail_replace_when_src_ends_with(&self, suffix: &str) {
         *self.replace_fault_suffix.lock().unwrap_or_else(|e| e.into_inner()) = Some(suffix.to_string());
+    }
+
+    /// 寫入目標以此後綴結尾時回 `Io` 錯誤：涵蓋 `atomic_write(p)`、`write_file(p)` 與 `replace(_, to)`
+    /// （平台中立地模擬目標檔不可寫，取代以 `cfg(unix)` chmod 的作法）。
+    pub fn fail_writes_to_suffix(&self, suffix: &str) {
+        *self.write_target_fault_suffix.lock().unwrap_or_else(|e| e.into_inner()) = Some(suffix.to_string());
+    }
+
+    fn write_target_faulted(&self, target: &Path) -> bool {
+        let fault = self.write_target_fault_suffix.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        matches!(fault, Some(suffix) if target.to_string_lossy().ends_with(&suffix))
     }
 
     /// 之後的 `copy_tree` 一律失敗。
@@ -119,9 +132,15 @@ impl FsRead for FaultFs {
 
 impl crate::fs_ops::FsOps for FaultFs {
     fn atomic_write(&self, p: &Path, data: &[u8], mode: Option<u32>) -> PalResult<()> {
+        if self.write_target_faulted(p) {
+            return Err(PalError::plain(PalErrorKind::Io, "fake write fault"));
+        }
         self.inner.atomic_write(p, data, mode)
     }
     fn write_file(&self, p: &Path, data: &[u8]) -> PalResult<()> {
+        if self.write_target_faulted(p) {
+            return Err(PalError::plain(PalErrorKind::Io, "fake write fault"));
+        }
         self.inner.write_file(p, data)
     }
     fn mkdirs(&self, p: &Path) -> PalResult<()> {
@@ -133,6 +152,9 @@ impl crate::fs_ops::FsOps for FaultFs {
             if from.to_string_lossy().ends_with(&suffix) {
                 return Err(PalError::plain(PalErrorKind::Io, "fake replace fault"));
             }
+        }
+        if self.write_target_faulted(to) {
+            return Err(PalError::plain(PalErrorKind::Io, "fake write fault"));
         }
         self.inner.replace(from, to)
     }

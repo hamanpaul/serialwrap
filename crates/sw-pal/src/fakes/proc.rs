@@ -95,6 +95,10 @@ impl FakeProcScan {
     pub fn holders(&self, v: Vec<u32>, st: HolderScanStatus) {
         *self.holders.lock().unwrap_or_else(|e| e.into_inner()) = (v, Some(st));
     }
+
+    pub fn set_serialwrapd_tty_holders(&self, v: &[u32]) {
+        self.holders(v.to_vec(), HolderScanStatus::Ok);
+    }
 }
 
 impl ProcScan for FakeProcScan {

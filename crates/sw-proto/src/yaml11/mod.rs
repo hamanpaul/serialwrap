@@ -5,6 +5,8 @@
 
 mod resolve;
 
+pub mod emit;
+
 pub use resolve::resolve_plain;
 
 use crate::pyjson::{PyDict, PyInt, PyValue};

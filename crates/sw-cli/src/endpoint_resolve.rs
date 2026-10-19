@@ -280,3 +280,13 @@ pub fn print_endpoint_resolution_error(
     1
 }
 
+/// SC-09 寫入目標：SERIALWRAP_CONFIG（strip 非空）> CONFIG_DIR/config.yaml；永不為系統唯讀 fallback
+pub fn config_write_path(_ctx: &CliCtx) -> std::path::PathBuf {
+    todo!("not implemented: P4-T6")
+}
+
+/// mkdir parents → to_yaml → 直接覆寫（非原子，KEEP）
+pub fn save_runtime_config(_ctx: &CliCtx, _cfg: &RuntimeConfig) -> Result<(), ConfigError> {
+    todo!("not implemented: P4-T6")
+}
+

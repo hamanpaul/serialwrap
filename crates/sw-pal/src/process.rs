@@ -6,3 +6,12 @@
 pub mod posix;
 #[cfg(windows)]
 pub mod windows;
+
+/// `ProcessCtl::spawn_elevated` 的結果（P4-T19，SC-36，OD-15）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ElevatedOutcome {
+    /// 提權行程已結束，附結束碼。
+    Exited(i32),
+    /// 使用者拒絕 UAC（`ERROR_CANCELLED`）。
+    Declined,
+}
