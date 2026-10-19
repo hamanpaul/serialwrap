@@ -93,6 +93,7 @@ targets:
 - 查看生效結果：`serialwrap session list`（`profile`／`profile_source`／
   `attached_real_path`）；查 profile 檔本身直接開 YAML（`type`／`notepad`）。
 - 改完 profile 後 `serialwrap daemon stop` ＋ `serialwrap daemon start` 重載。
+- `platform=passthrough`（含 `others-template`）：經 pin／explicit target 選定後不 login、不 probe（即使設 `ready_probe`），attach 停在 `ATTACHED`（零 TX；動態偵測仍先送一個 `\n` 探測）；連續 30 秒無 RX 自動升 `READY` 並可下命令（SC-35）。`ATTACHED` 時 `cmd submit` 回 `SESSION_NOT_READY` 並附 `passthrough_ready_in_s`；命令建議帶 `--completion-regex`，`file.push`／`file.pull` 對 passthrough 一律回 `PROFILE_NOT_COMMAND_CAPABLE`。
 
 ## 5. 找到 human console 的連線端口
 
@@ -188,6 +189,7 @@ serialwrap device attach --selector COM0
 - **COM 獨占（BC-04）**：daemon 持有某 COM 時，其他程式（TeraTerm 直連 `COMx`、燒錄工具）**不可再直接開該 COM**——Windows 回 `ERROR_ACCESS_DENIED`，serialwrap 對應為 `DEVICE_STILL_HELD`（`pids: []`、`holder_unknown: true`，原因不明時不可視為可收回）。人類 console 走第 5～8 節的 serialwrap console 端口；外部工具獨佔先 `device release`，用完再 `device attach`。
 - **設定探索順序（SC-09）**：`SERIALWRAP_CONFIG` → `%USERPROFILE%\.config\serialwrap\config.yaml` → 存在時的 `%ProgramData%\serialwrap\config.yaml`（系統檔唯讀）；寫入落在 `SERIALWRAP_CONFIG`（有設定時）或使用者設定檔。
 - **socket 權限基線**：POSIX Unix socket 維持 `0660`，新建目錄權限依 process umask 決定；Windows 走 loopback TCP（`tcp://127.0.0.1:48700`），不套用此權限模型。
+- **release 逾時（`DRAIN_STALLED`）**：`device release` 的 drain 逾 3 秒仍無成功的 handle 關閉回條時回 `DRAIN_STALLED`，session 維持 `RECOVERING`。此時**不要**讓燒錄工具開啟該 COM；以 `session list` 輪詢至 `RELEASED` 才交接，上限到期仍為 `RECOVERING` 時交由操作員檢查 daemon 與 handle。
 
 ## 12. 疑難排解
 

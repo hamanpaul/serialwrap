@@ -7,19 +7,31 @@
 """
 from __future__ import annotations
 
+import base64
+import json
 import random
 import time
+from pathlib import Path
+from typing import Any
 
+import yaml
 from realhw.harness import CaseResult
 
 from ..harness import Case, register
 from .. import guards
+from .f10_login_creds import (
+    _reclaim_and_ensure_ready,
+    _sandbox_symlink_for_board,
+    _session_by_com,
+    _wait_state,
+)
 
 
-def _case(id, title, issues, hints=(), requires=(), destructive=True):
+def _case(id, title, issues, hints=(), requires=(), destructive=True, pending_issue=False):
     def deco(fn):
         register(Case(id=id, family="F9", title=title, run=fn, issues=tuple(issues),
-                      destructive=destructive, requires=tuple(requires), hints=tuple(hints)))
+                      destructive=destructive, requires=tuple(requires), hints=tuple(hints),
+                      pending_issue=pending_issue))
         return fn
     return deco
 
@@ -487,3 +499,273 @@ def f9_spontaneous_reboot_agent_gated(ctx):
         ctx.tmux.kill(ses)
         guards.ensure_ready(ctx, com, timeout_s=boot_wait_s)
         _wait_quiet_cleared(ctx, com, timeout_s=boot_wait_s)
+
+
+def parse_wal_ndjson(text: str) -> tuple[list[dict[str, Any]], str]:
+    """解析 sandbox ``raw.wal.ndjson`` 全文，回傳 ``(紀錄, 證據問題)``；問題為空字串＝證據完整可用。
+
+    判定（證據不足不得 PASS，規格 §11.3）：
+    - 以換行結尾的非空行必須是 JSON object，無法解析即為證據缺損；
+    - 最後一行若無換行結尾視為 daemon 寫入中，略過；
+    - ``seq`` 必須自 1 起連續遞增，缺號或亂序代表擷取缺口。
+    """
+    records: list[dict[str, Any]] = []
+    for idx, line in enumerate(text.split("\n")[:-1], start=1):
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            return records, f"WAL 第 {idx} 行無法解析為 JSON"
+        if not isinstance(rec, dict):
+            return records, f"WAL 第 {idx} 行不是 JSON object"
+        records.append(rec)
+    for expect, rec in enumerate(records, start=1):
+        if rec.get("seq") != expect:
+            return records, f"WAL seq 缺口或亂序：預期 {expect}、實得 {rec.get('seq')!r}"
+    return records, ""
+
+
+def count_tx(records: list[dict[str, Any]]) -> int:
+    """WAL 紀錄中 ``dir == "TX"`` 的筆數（任何 com、任何 payload）。"""
+    return sum(1 for rec in records if rec.get("dir") == "TX")
+
+
+def has_tx_containing(records: list[dict[str, Any]], needle: str) -> bool:
+    """是否有 TX 紀錄的 payload（base64 解碼後）含 ``needle``，用以證明 WAL 確實擷取到該命令。"""
+    for rec in records:
+        if rec.get("dir") != "TX":
+            continue
+        try:
+            payload = base64.b64decode(str(rec.get("payload_b64") or ""), validate=True)
+        except ValueError:
+            continue
+        if needle.encode("utf-8") in payload:
+            return True
+    return False
+
+
+PT_QUIET_S: float = 30.0          # SC-35 靜默下限；regression 套件不 import 產品碼，與 PASSTHROUGH_READY_QUIET_S 同值
+PT_ATTACH_WINDOW_S: float = 90.0  # 自 daemon 就緒起最長等待 READY（靜默 30 秒＋餘裕）
+_PT_AGE_TOL_S: float = 0.1        # daemon 的 last_rx_age_s 取至 0.1 秒，比較時容許取整誤差
+_PT_CMD_TERMINAL = frozenset({"done", "error", "canceled"})
+
+
+def _rx_active(sample: dict[str, Any], quiet_s: float) -> bool:
+    if int(sample.get("rx_bytes_last_10s") or 0) > 0:
+        return True
+    age = sample.get("last_rx_age_s")
+    return age is not None and float(age) < quiet_s
+
+
+def evaluate_pt_quiet_ready(samples: list[dict[str, Any]], *, attach_sent_s: float,
+                            quiet_s: float = PT_QUIET_S) -> tuple[str, str, str]:
+    """SC-35 真板 oracle 純函式，回傳 ``(verdict, reason_code, reason)``。
+
+    ``samples`` 依時間排序，每筆為一次 ``session list`` 觀測：``t0``／``t1`` 為 RPC 送出前、
+    回應收到後的 monotonic 秒；``state``；``last_rx_age_s``；``rx_bytes_last_10s``；
+    ``tx`` 為截至該次觀測的 WAL TX 累計筆數；``wal_problem`` 為該次讀取的證據問題（空字串＝無）。
+    ``attach_sent_s`` 為 daemon 啟動前的 monotonic 秒：session 建立不可能早於此，故 ATTACHED 起算不早於此。
+    """
+    if not samples:
+        return ("SKIP", "insufficient_evidence", "未取得任何 session 觀測")
+    for s in samples:
+        if int(s.get("tx") or 0) > 0:
+            return ("FAIL", "passthrough_attach_sent_tx",
+                    f"passthrough attach 至 READY 期間 WAL 出現 {s['tx']} 筆 TX（SC-35 要求零 TX）")
+    for s in samples:
+        if s.get("wal_problem"):
+            return ("SKIP", "insufficient_evidence", f"WAL 證據不完整：{s['wal_problem']}")
+    ready = next((i for i, s in enumerate(samples) if s.get("state") == "READY"), None)
+    if ready is None:
+        last = samples[-1]
+        if _rx_active(last, quiet_s):
+            return ("SKIP", "rx_not_quiet", "板子持續輸出（最後觀測仍有 RX 未靜默），無法驗證安靜升 READY")
+        return ("FAIL", "quiet_not_promoted",
+                f"靜默 {quiet_s:.0f} 秒後仍未升 READY（最後 state={last.get('state')!r}）")
+    ready_sample = samples[ready]
+    # 下限一：ATTACHED 起算不早於 attach_sent_s，故 READY 不早於 attach_sent_s + quiet_s。
+    # 下限二：READY 前（仍為 ATTACHED）觀測到的 RX 必定早於 promotion，故 promotion 需 ≥ 該 RX + quiet_s；
+    # RX 年齡推得的時刻為真值的下界（取整誤差由 _PT_AGE_TOL_S 容許）。
+    # READY 只能發生在 t1 之前，故 t1 若早於下限即為確定的違規，優先於下方的歧義 SKIP 判定。
+    lower = attach_sent_s + quiet_s
+    for s in samples[:ready]:
+        age = s.get("last_rx_age_s")
+        if age is not None:
+            lower = max(lower, float(s["t0"]) - float(age) + quiet_s)
+    if float(ready_sample["t1"]) + _PT_AGE_TOL_S < lower:
+        return ("FAIL", "quiet_promoted_early",
+                f"READY 早於 30 秒靜默下限（attach 後 {float(ready_sample['t1']) - attach_sent_s:.1f} 秒即觀測到 READY），違反 SC-35")
+    # READY 觀測點本身的 RX 可能發生在 promotion 之後（SC-35：READY 後 RX 不降級），無法區分，故保守 SKIP。
+    if _rx_active(ready_sample, quiet_s):
+        return ("SKIP", "rx_not_quiet",
+                "READY 觀測當下仍有 RX（last_rx_age_s < 30），無法證明 READY 前連續靜默 30 秒（證據不足）")
+    return ("PASS", "", "attach 至 READY 全程 WAL 零 TX，且 READY 不早於 30 秒靜默下限")
+
+
+def command_from_get(resp: dict[str, Any]) -> dict[str, Any]:
+    """``cmd status`` 回應為 ``{"ok": ..., "command": {...}}``；取出其中的 command 紀錄（缺則空 dict）。"""
+    command = resp.get("command") if isinstance(resp, dict) else None
+    return dict(command) if isinstance(command, dict) else {}
+
+
+def evaluate_pt_command(command: dict[str, Any], *, marker: str, wal_problem: str,
+                        wal_marker_seen: bool) -> tuple[str, str, str]:
+    """``cmd submit --completion-regex`` 的 oracle：產品行為先判；證據不足降為 SKIP，絕不為 PASS。"""
+    status = command.get("status")
+    completed = (status == "done" and not command.get("partial")
+                 and marker in str(command.get("stdout") or ""))
+    if not completed:
+        return ("FAIL", "completion_regex_not_matched",
+                f"READY 後以 --completion-regex 送出的 echo 未完成（status={status!r}, partial={command.get('partial')!r}）")
+    if wal_problem:
+        return ("SKIP", "insufficient_evidence", f"WAL 證據不完整：{wal_problem}")
+    if not wal_marker_seen:
+        return ("SKIP", "insufficient_evidence", "WAL 未記錄該命令的 TX（證據不足，不得 PASS）")
+    return ("PASS", "", "passthrough READY 後 --completion-regex 命令完成，且 WAL 有對應 TX 紀錄")
+
+
+def _verdict_result(verdict: str, reason: str, reason_code: str, evidence: dict[str, str]) -> CaseResult:
+    category = {"SKIP": "environment", "FAIL": "test"}.get(verdict, "")
+    return CaseResult(verdict, reason=reason, category=category, reason_code=reason_code, evidence=evidence)
+
+
+@_case(
+    "pt-quiet-ready",
+    "passthrough（真板 U-Boot／MCU 線）attach 後零 TX、靜默 30 秒才升 READY，且 cmd submit --completion-regex 可完成",
+    issues=(),
+    pending_issue=True,
+    hints=(
+        "throwaway daemon 以 explicit target 釘定 pt-quiet-ready（passthrough）綁 COM0 的 sandbox by-id 線；"
+        "不走動態偵測，故 attach 前不會有 PROBE 探測，WAL 全部 TX 皆為該 session 所送。",
+        "判定：自 daemon 就緒起每秒取樣直到 READY；attach 至 READY 全程 WAL 零 TX；READY 不得早於 30 秒靜默下限。",
+        "板子持續輸出（最後觀測仍有 RX 未靜默）時無法驗證安靜升 READY，判 SKIP（environment），不得判 PASS。",
+        "WAL 缺漏、無法解析或 seq 有缺口時判 SKIP insufficient_evidence，原始 WAL 留作 evidence。",
+        "命令 `echo PTQ_<nonce>` 的完成條件為 `(?m)^PTQ_<nonce>\\r*$`（錨定行首，命令回顯的行不以 marker 起頭而不會誤匹配）；echo 屬 U-Boot 唯讀白名單。",
+        "issues 欄待擁有者為 OD-14 開立 issue 號後補上（不得填假號）。",
+    ),
+)
+def pt_quiet_ready(ctx: Any) -> CaseResult:
+    """SC-35 真板 oracle：passthrough 不介入 UART、靜默 30 秒後才升 READY，READY 後命令可用。"""
+    board = ctx.cfg["boards"][0]
+    com = str(board["com"])
+    by_id_dir = ctx.case_dir / "byid"
+    try:
+        symlink_name = _sandbox_symlink_for_board(board, by_id_dir)
+    except LookupError as exc:
+        return CaseResult("SKIP", reason=str(exc), category="environment",
+                          reason_code="board_by_id_not_found")
+
+    release = ctx.sw.run("device", "release", "--selector", com,
+                         "--source", "agent:swreg", "--reason", "pt-quiet-ready regression")
+    ctx.note("device-release.json", str(release))
+    if not release.get("ok"):
+        return CaseResult("FAIL", reason=f"prod device release 失敗（selector={com}）：{release!r}",
+                          category="environment", reason_code="release_failed")
+
+    profile_yaml = yaml.safe_dump(
+        {
+            "defaults": {},
+            "profiles": {"pt-quiet-ready": {
+                "platform": "passthrough", "prompt_regex": ".*", "login_regex": "$^",
+                "password_regex": "$^", "ready_probe": "", "timeout_s": 15,
+                "uart": {"baud": 115200, "data_bits": 8, "parity": "N", "stop_bits": 1,
+                         "flow_control": "none", "xonxoff": False},
+            }},
+            # explicit target 取代動態偵測：不會有 detect_template 的 PROBE 探測，故 WAL 全部 TX 皆屬該 session。
+            "targets": [{"act_no": 1, "com": com, "profile": "pt-quiet-ready",
+                         "device_by_id": symlink_name}],
+        },
+        allow_unicode=True, sort_keys=False,
+    )
+    result: CaseResult | None = None
+    try:
+        result = _run_pt_quiet_ready(ctx, com, by_id_dir, profile_yaml)
+    finally:
+        # 收尾與 f10 同一契約：prod device attach 收回裝置並等 READY。
+        reclaim = _reclaim_and_ensure_ready(ctx, com)
+    return reclaim or result
+
+
+def _read_wal_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
+
+
+def _sample_until_ready(ta: Any, com: str, wal_path: Path, *, timeout_s: float) -> list[dict[str, Any]]:
+    """每秒取樣 session 狀態與 WAL（TX 累計、證據問題），直到 READY 或時限。"""
+    samples: list[dict[str, Any]] = []
+    deadline = time.monotonic() + timeout_s
+    while True:
+        t0 = time.monotonic()
+        sess = _session_by_com(ta.run("session", "list"), com)
+        t1 = time.monotonic()
+        records, problem = parse_wal_ndjson(_read_wal_text(wal_path))
+        samples.append({
+            "t0": t0, "t1": t1,
+            "state": sess.get("state"),
+            "last_rx_age_s": sess.get("last_rx_age_s"),
+            "rx_bytes_last_10s": sess.get("rx_bytes_last_10s"),
+            "tx": count_tx(records),
+            "wal_problem": problem,
+        })
+        if sess.get("state") == "READY" or time.monotonic() >= deadline:
+            return samples
+        time.sleep(1.0)
+
+
+def _run_pt_quiet_ready(ctx: Any, com: str, by_id_dir: Any, profile_yaml: str) -> CaseResult:
+    """throwaway 內的 SC-35 觀測：時間軌跡判定 → READY 後 --completion-regex 命令完成判定。"""
+    workdir = ctx.case_dir / "ta"
+    wal_path = workdir / "wal" / "raw.wal.ndjson"
+    try:
+        daemon_start_s = time.monotonic()
+        with guards.ThrowawayDaemon(exe=str(ctx.cfg["serialwrap_exe"]), workdir=workdir,
+                                    by_id_dir=by_id_dir, profile_yaml=profile_yaml) as ta:
+            samples = _sample_until_ready(ta, com, wal_path, timeout_s=PT_ATTACH_WINDOW_S)
+            timeline_note = ctx.note("pt-quiet-timeline.json",
+                                     json.dumps(samples, ensure_ascii=False, indent=1))
+            verdict, reason_code, reason = evaluate_pt_quiet_ready(
+                samples, attach_sent_s=daemon_start_s)
+            if verdict != "PASS":
+                return _verdict_result(verdict, reason, reason_code, {"timeline": timeline_note})
+
+            marker = f"PTQ_{random.randint(10000, 99999)}"
+            regex = rf"(?m)^{marker}\r*$"
+            sub = ta.run("cmd", "submit", "--selector", com, "--source", "agent:swreg",
+                         "--cmd", f"echo {marker}", "--mode", "line",
+                         "--completion-regex", regex, timeout=60)
+            cmd_id = str(sub.get("cmd_id") or "")
+            if not sub.get("ok") or not cmd_id:
+                submit_note = ctx.note("cmd-submit.json", json.dumps(sub, ensure_ascii=False, indent=1))
+                return _verdict_result(
+                    "FAIL",
+                    f"READY 後 cmd submit 被拒絕（error_code={sub.get('error_code')!r}）",
+                    "cmd_submit_rejected",
+                    {"timeline": timeline_note, "cmd-submit": submit_note},
+                )
+            command: dict[str, Any] = {}
+            deadline = time.monotonic() + 60.0
+            while True:
+                command = command_from_get(ta.run("cmd", "status", "--cmd-id", cmd_id))
+                if command.get("status") in _PT_CMD_TERMINAL or time.monotonic() >= deadline:
+                    break
+                time.sleep(1.0)
+            status_note = ctx.note("cmd-status.json", json.dumps(command, ensure_ascii=False, indent=1))
+            wal_text = _read_wal_text(wal_path)
+            raw_wal_note = ctx.note("raw.wal.ndjson", wal_text)
+            records, wal_problem = parse_wal_ndjson(wal_text)
+            verdict, reason_code, reason = evaluate_pt_command(
+                command, marker=marker, wal_problem=wal_problem,
+                wal_marker_seen=has_tx_containing(records, marker))
+            return _verdict_result(verdict, reason, reason_code, {
+                "timeline": timeline_note, "cmd-status": status_note, "raw-wal": raw_wal_note,
+            })
+    except RuntimeError as exc:
+        log_path = workdir / "daemon.log"
+        log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else "(無 daemon.log)"
+        ctx.note("throwaway-start-failed.txt", f"{exc}\n\n--- daemon.log ---\n{log_text}")
+        return CaseResult(
+            "SKIP",
+            reason=f"throwaway daemon 未在時限內就緒：{exc}",
+            category="environment", reason_code="throwaway_start_failed",
+        )

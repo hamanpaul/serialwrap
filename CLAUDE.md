@@ -197,7 +197,7 @@ serialwrap 是讓多個 agent 與多個 human console 共用**同一條 UART** �
 
 - `ATTACHED`：bridge 已掛上，但 target 還沒確認進入可執行 prompt；這時候 **human console 仍可 attach 進去做手動登入或觀察 boot/log**。
 - `READY`：agent 命令可進入 arbiter。
-- `platform=passthrough` 的 session 是否 probe 由 `ready_probe` 決定（SES-16.6-01）：無 `ready_probe` 者不 probe、停在 `ATTACHED`；有 `ready_probe` 者仍會 probe 進 `READY`。
+- 非 passthrough 的 session 是否 probe 由 `ready_probe` 決定（SES-16.6-01）：無 `ready_probe` 者不 probe、停在 `ATTACHED`；有 `ready_probe` 者仍會 probe 進 `READY`。`platform=passthrough` 則不論 `ready_probe` 一律不 login、不 probe（SC-35）：經 explicit target／pin／sticky 選定後 attach 零 TX 停在 `ATTACHED`，連續 30 秒無 RX 自動升 `READY`（`PASSTHROUGH_READY_QUIET_S`）；動態偵測與 `fallback` 的 re-attach 仍先由 PROBE bridge 送一個 `\n` 探測。
 
 ### WAL 與結果擷取
 
@@ -257,7 +257,7 @@ POSIX 上 human console 走 PTY（minicom 開 `/dev/pts/N`）；無 PTY 的平�
 - `platform=shell`：generic Linux login，走 prompt → login → ready_probe。
 - `platform=bcm`：Broadcom 原生平台，登入後進入 BCM CLI（`>`），需 `post_login_cmd: "sh"` 切到 Linux shell（`#`），`timeout_s` 建議加大（15s+）。
 - `platform=prpl`：prplOS，prompt_regex 匹配 prefix，不依賴行尾錨點。
-- `platform=passthrough`：無 `ready_probe` 時停在 `ATTACHED`，適合未知設備觀察；有 `ready_probe` 時仍可 probe 進 `READY`。
+- `platform=passthrough`：經 pin／explicit target 選定後不 login、不 probe（即使設 `ready_probe`），attach 零 TX 停在 `ATTACHED`（動態偵測仍先送一個 `\n` 探測），適合未知設備觀察；連續 30 秒無 RX 後自動升 `READY` 並可下命令（完成條件見 `docs/command-completion.md`，建議帶 `--completion-regex`）。
 
 ### 新增能力通常要同步改多個面
 

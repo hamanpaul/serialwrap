@@ -153,6 +153,16 @@ POSIX takes `flock` plus `TIOCEXCL` and re-scans holders before any I/O; a
 conflicting open returns `DEVICE_STILL_HELD` with `pids` and `holder_unknown`).
 Use `serialwrap session console-attach` for a human console, or
 `serialwrap device release` to hand the raw device to an external tool.
+`device release` waits up to 3 seconds for the bridge to drain and close the
+handle. On timeout it returns `error_code: DRAIN_STALLED` with
+`drain_stalled: true` and `drain_timeout_epoch`, and the session stays
+`RECOVERING`: do not let an external tool open the device. Poll
+`serialwrap session list` until the state is `RELEASED` before handing off. A
+late successful close receipt still completes the release and persists
+`RELEASED`. Calling `device release` again does not speed this up, and
+`DRAIN_STALLED` is not retryable (`retryable: "no"`). If the state is still
+`RECOVERING` when your polling limit expires, stop polling and have an operator
+check the daemon and the handle.
 
 For noisy consoles that omit the shell prompt, `cmd submit --completion-regex`
 can wait for a command-specific producer marker in `line` or `background` mode.
@@ -214,15 +224,32 @@ or `READY`.
 
 - `ATTACHED` means the bridge exists and human console access is available, but
   line commands are not guaranteed to be frameable.
-- `READY` means the profile has a usable prompt and `ready_probe`; agent command
-  submission is allowed.
+- `READY` means agent command submission is allowed. Command-capable profiles
+  reach it after a usable prompt and `ready_probe` round-trip; passthrough
+  sessions reach it after 30 seconds without RX (see below).
 - `RELEASED` means the real device has been handed off to an external tool.
 - `FLASHING` means the MCU flash endpoint is currently bridging an external
   flasher.
 
-Command-capable profiles require a non-empty `ready_probe`. Passthrough-style
-profiles intentionally stay at `ATTACHED` and return
-`PROFILE_NOT_COMMAND_CAPABLE` for `cmd submit`.
+Command-capable profiles require a non-empty `ready_probe`; non-passthrough
+profiles without one stay at `ATTACHED` and return `PROFILE_NOT_COMMAND_CAPABLE`
+for `cmd submit`. A `platform=passthrough` profile (including `others-template`)
+never logs in or probes once it is selected, even when `ready_probe` is set
+(SC-35): its session stays `ATTACHED` with zero TX and moves to `READY`
+automatically after 30 seconds without RX. Because such a console may never print
+a shell prompt, pass `--completion-regex` to `cmd submit` for every command.
+Dynamic auto-detection (which selects passthrough only when no template matches)
+and re-detection on each attach of a `fallback` session still send one `\n`
+probe from a separate PROBE bridge before the session exists; pin the profile or
+use an explicit target (or sticky) to avoid it. While `ATTACHED`, `cmd submit`
+returns `SESSION_NOT_READY` with `passthrough_ready_in_s`, and `file push` /
+`file pull` on a passthrough profile always return `PROFILE_NOT_COMMAND_CAPABLE`.
+A passthrough command completes on `--completion-regex` when given, else on a
+usable `prompt_regex`. When no completion condition matches (none is usable, or
+the given regex or prompt never matches), it returns `PROMPT_TIMEOUT`
+(`recovery_action: NONE`), sends no Ctrl-C or Ctrl-D, and the session stays
+`READY`; read the captured output with `command.result_tail`
+(`serialwrap cmd result-tail --cmd-id`).
 
 ### Profiles and Binding
 
@@ -264,7 +291,7 @@ treated as **provisional** — a session that landed there (typically because th
 board was still spewing boot logs at attach time, so nothing was ever measured)
 gets another detection attempt on its next attach. Sessions resolved from an
 explicit YAML `target`, from sticky, or from a successful detection are
-authoritative and are never re-resolved. Detection sends `\r`, so it is skipped
+authoritative and are never re-resolved. Detection sends `\n`, so it is skipped
 inside the boot quiet window that protects U-Boot autoboot.
 
 Use stable `/dev/serial/by-id/` or `/dev/serial/by-path/` selectors rather than
@@ -1467,6 +1494,7 @@ stateDiagram-v2
     ATTACHED --> READY: login ok
     ATTACHED --> READY: auto re-probe ok
     ATTACHED --> READY: recover ok
+    ATTACHED --> READY: passthrough 靜默 30 秒
     ATTACHED --> DETACHED: detach
     DETACHED --> ATTACHING: auto re-probe
     READY --> ATTACHED: recover fallback
@@ -1491,13 +1519,13 @@ broker 能框出命令的輸出（送出 → 看到 prompt → 取回 stdout）�
 取決於它綁的 profile 是否 **command-capable**：
 
 - **command_capable** = profile 的 `ready_probe` 非空（取代舊的「`platform == passthrough` 就不可用」寫死）。
-- 無 `ready_probe`（如 `others-template` 這種純 console / passthrough profile）→ 維持 `ATTACHED`；
-  對它 `cmd submit` 會回明確的 **`PROFILE_NOT_COMMAND_CAPABLE`**（附 hint），而非語意不清的 `SESSION_NOT_READY`。
+- 無 `ready_probe` 的非 passthrough profile → 維持 `ATTACHED`；對它 `cmd submit` 會回明確的 **`PROFILE_NOT_COMMAND_CAPABLE`**（附 hint），而非語意不清的 `SESSION_NOT_READY`。
+- **`platform=passthrough`（含 `others-template`）一經選定（explicit target、`session pin` 或 sticky）即不 login、不送 `ready_probe`**，即使已設定 `ready_probe` 也一樣（SC-35）。attach 時零 TX 並停在 `ATTACHED`；連續 **30 秒**沒有 RX 即自動升 `READY`。動態偵測（只有在沒有任何 template 匹配時才會選中 passthrough）與 `fallback` session 每次 re-attach 的重新偵測，仍會在 session 建立前由獨立的 PROBE bridge 送出一個 `\n` 探測；要避免，請 pin 該 profile 或使用 explicit target。`ATTACHED` 時 `cmd submit` 回 `SESSION_NOT_READY` 並附 `passthrough_ready_in_s`（剩餘秒數）；`file.push`／`file.pull` 對 passthrough 一律回 `PROFILE_NOT_COMMAND_CAPABLE`。
+  命令完成條件依序為 `cmd submit --completion-regex`（console 不送 prompt 時建議每次都帶）、可用的 profile `prompt_regex`；兩者皆未命中（或皆不可用）則回 `PROMPT_TIMEOUT`（`recovery_action: NONE`），不送 Ctrl-C／Ctrl-D，session 維持 `READY`；擷取到的輸出以 `command.result_tail`（`serialwrap cmd result-tail --cmd-id`）讀回。
 - 有 `ready_probe`（+ 能匹配目標 prompt 的 `prompt_regex`）→ 走正常 probe 進 `READY`，`cmd submit` 可用。
-- `READY` 與底層是 OS shell 或 bootloader **無關**：只要 profile 的 prompt/`ready_probe` 對得上即可。
-  停在 U-Boot 的板子可綁 **`uboot-template`**（`prompt_regex` 匹配 `=>` / `u-boot>` / `CFE>`，
-  `ready_probe: echo __READY__${nonce}`）進 `READY`，然後 `cmd submit --cmd 'printenv'` 下 U-Boot 命令。
-- `self_test` / get-state 會在最外層回 `command_capable`，呼叫端可據此分辨「ATTACHED 但本就不可下命令」與「ATTACHED 應可進 READY」。
+- `READY` 與底層是 OS shell 或 bootloader **無關**：只要 profile 的 prompt/`ready_probe` 對得上即可。非 passthrough 的 bootloader command profile 亦同。
+  停在 U-Boot 的板子可綁 **`uboot-template`**（`prompt_regex` 匹配 `=>` / `u-boot>` / `CFE>`；其 `ready_probe` 在 passthrough 下不會送出），靜默 30 秒後升 `READY`，然後 `cmd submit --cmd 'printenv'` 下 U-Boot 命令。
+- `self_test` / get-state 會在最外層回 `command_capable`。對非 passthrough 的 session，它可分辨「ATTACHED 但本就不可下命令」與「ATTACHED 應可進 READY」；對 passthrough 不適用：`others-template` 的 `command_capable` 為 `false`，仍會在 30 秒靜默後升 `READY`，判讀時請看 `classification: PASSTHROUGH` 與 `passthrough_ready_in_s`。
 
 > 注意：OS profile（prpl/shell）若板子掉進 U-Boot，OS 的 `prompt_regex` 對不上 → **不會** READY（正確：避免把 Linux 命令送進 bootloader）。
 
@@ -1637,6 +1665,7 @@ serialwrap doctor    # 驗證環境
 - 新建執行期目錄權限依 process umask 決定；Unix socket 維持 `0660`，可設定 `SERIALWRAP_SOCKET_GROUP` 指定 socket 群組。
 - `daemon restart` 在 systemd 模式等同 `service restart`；on-demand 模式會先停止並確認舊 daemon 結束，再以相同 endpoint 啟動。
 - daemon 持有裝置時不可再直接開 tty，請走 `serialwrap session console-attach` 或 `device release`（BC-04：POSIX 以 `flock`＋`TIOCEXCL` 獨占並於任何 I/O 前重掃 holder；衝突開啟回 `DEVICE_STILL_HELD`，附 `pids` 與 `holder_unknown`）。
+- `device release` 的 drain 等待上限為 3 秒：逾時仍未收到成功的 handle 關閉回條時，RPC 回 `error_code=DRAIN_STALLED`（附 `drain_stalled: true`、`drain_timeout_epoch`），session 維持 `RECOVERING`，**不要**讓外部工具開啟該裝置。以 `serialwrap session list` 輪詢，只有 `RELEASED` 才交接；上限到期仍為 `RECOVERING` 時停止輪詢，交由操作員檢查 daemon 與 handle。晚到的成功回條仍會完成 release 並持久化；再次 `device release` 不會加速完成，`DRAIN_STALLED` 不可盲目重試（`retryable: "no"`）。
 
 ```bash
 # 啟動 daemon 後快速驗證
@@ -1676,7 +1705,7 @@ target 或 pin 綁定實體 UART；動態偵測會跳過解鎖 profile。解鎖�
 - `session list` 的 `profile_source` 欄位顯示來源：`pin` / `sticky` / `detected` / `fallback` / `yaml-target`。
 - 錯誤碼：`UNKNOWN_PROFILE`（profile 名不存在）、`PROFILE_IS_EXPLICIT`（對 YAML explicit-target 裝置 pin/unpin）、`DEVICE_NOT_FOUND`（selector 解析不到裝置）、`INVALID_ARGS`（缺 selector/profile）。
 - **生效時機（#181 起）**：pin/unpin 寫入後**不主動**重新 attach，但**下一次 attach 就會套用**——對已存在的 session 執行 `serialwrap session clear --selector <COM>` 即可，不必重啟 daemon。pin 命中時繞過偵測（不開 PROBE bridge），session_id 依新 profile 名重算（如 `others-template:COM2` → `prpl-template:COM2`），COM 號、`act_no`、`device_by_id` 與使用者自訂 alias 均保留，掛在該 session 上的 human console 也不會被丟掉。
-- **fallback 是暫時分類（#181）**：掉進 `others-template` 的 session 多半是 attach 當下板子還在噴 boot log、根本沒量測過（`last_probe_at` 為 `null`），而它的空 `ready_probe` 會讓 `command_capable` 永久為 false。因此 `profile_source` 為 `fallback` 的 session 在**下一次 attach 時會再偵測一次**；`yaml-target` / `sticky` / `detected` 是宣告過或量測過的，一律不重解析。偵測會送 `\r`，故 boot quiet window（U-Boot autoboot 保護，#130）內跳過。
+- **fallback 是暫時分類（#181）**：掉進 `others-template` 的 session 多半是 attach 當下板子還在噴 boot log、根本沒量測過（`last_probe_at` 為 `null`），而它的空 `ready_probe` 會讓 `command_capable` 永久為 false。因此 `profile_source` 為 `fallback` 的 session 在**下一次 attach 時會再偵測一次**；`yaml-target` / `sticky` / `detected` 是宣告過或量測過的，一律不重解析。偵測會送 `\n`，故 boot quiet window（U-Boot autoboot 保護，#130）內跳過。
 - **卡在 fallback 時的排查順序**：`serialwrap session self-test --selector <COM>` → 若回 `recommended_action: "pin_profile"` 與 `suggested_profile`，照它給的 `session pin` + `session clear` 兩行套用即可。`command_capable` 純粹由 profile 的 `ready_probe` 決定，**與 session state 或 console 是否被佔用無關**（COM 掛著 console 一樣能下命令），不要往「session 被佔用」的方向排查。
 
 ### COM 編號確定性綁定 by-id（#100）
@@ -1846,7 +1875,7 @@ serialwrap service restart
 
 若 shell device 已經自動登入，`serialwrap` 會直接用 prompt + `ready_probe` 驗證；若先看到 `login:` / `password:`，則會依 `user_env` / `pass_env` 自動登入。像 Orange Pi 常見的 `orangepi3 login:`，建議 `login_regex` 用 `(?mi)^.*login:\\s*$`。
 
-`others-template` 使用 `platform=passthrough`。attach 時不做 prompt/login/ready 限制，只建立 broker bridge，讓 `ttyUSB` 與 broker 建出的 `ttyPTS` 直接透傳；這類 session 會停在 `ATTACHED`，適合不認識的設備先用 minicom/human console 觀察。
+`others-template` 使用 `platform=passthrough`。attach 時不做 prompt/login/ready 限制，只建立 broker bridge，讓 `ttyUSB` 與 broker 建出的 `ttyPTS` 直接透傳；這類 session 經 pin／explicit target 選定後 attach 時不 login、不送 probe，零 TX 停在 `ATTACHED`（動態偵測仍會先送一個 `\n` 探測，見「`ATTACHED` vs `READY`」一節），適合不認識的設備先用 minicom/human console 觀察；連續 30 秒無 RX 後會自動升 `READY`，之後可下命令（建議以 `cmd submit --completion-regex` 指定完成條件）。
 
 ### 範例：debug probe（如 TI XDS110）passthrough explicit target（#186）
 
@@ -1897,7 +1926,7 @@ targets:
 當 DeviceWatcher 偵測到新 UART 裝置且沒有任何 explicit binding 匹配時，daemon 會自動執行 template 偵測：
 
 1. 用預設 UART 參數（115200/8N1）開啟臨時 bridge
-2. 送 `\r` 到 UART，等待 3 秒收集輸出
+2. 送 `\n`（空命令）到 UART，等待 3 秒收集輸出
 3. 依 profiles YAML 定義順序（passthrough 排最後），依序嘗試各 template 的 `prompt_regex` → 匹配即選定
 4. 若 prompt 不匹配但 `login_regex` 匹配 → 選為候選
 5. 全不匹配 → fallback 到 passthrough
@@ -2145,7 +2174,7 @@ serialwrap session self-test --selector COM0
 - `ATTACHED_NOT_READY`：bridge 已掛，但 prompt probe 失敗（如 boot log 中、前景程式仍在跑）
 - `REBOOTING`：agent 已送出 reboot 類指令，正在等待 target 重開機完畢後自動 relogin
 - `HUMAN_INTERACTIVE_ACTIVE`：human console 目前握有 interactive ownership，不適合 agent 干預
-- `PASSTHROUGH`：platform 設為 passthrough，session 已 ATTACHED，適合透明 bridge 模式
+- `PASSTHROUGH`：platform 設為 passthrough，session 停在 ATTACHED（零 TX），適合透明 bridge 模式；連續 30 秒無 RX 後升 `READY`（SC-35）。READY 後的 passthrough 仍分類為 `PASSTHROUGH`，`recommended_action: none`，不 probe、無 `probe_ok`
 - `AUTOBOOT_QUIET`（#130）：session 名義上是 `READY`，但已進入 boot quiet window（自發重開機的過渡態），不送 nonce probe；等它自己解除或過期，勿反覆呼叫。#139 起同一字串也作為 `cmd submit`／`file push`／`file pull` 在此過渡態的**可重試 `error_code`**——即時拒絕、零 UART 副作用（bytes 不落入 autoboot 倒數窗），session 重新確認 `READY` 後重送即可。#162 起 gate 的解除**綁 READY 再確認**（nonce probe；probe 的 `\n` 順帶消耗 askconsole 啟用 banner）：quiet 過期或 RX prompt 解除都不再直接放行 agent 命令，過渡態可由 `session list` 的 `ready_reconfirm_pending` 欄位觀測；pending-only（quiet 已過期）拒絕的 `retry_after_s` 固定 `5.0`
 - `READY_UNCONFIRMED`（#162 有界化）：READY 再確認逾 `READY_RECONFIRM_MAX_S`（300s）或 `READY_RECONFIRM_MAX_ATTEMPTS`（5 次）仍未成功的**不可重試**終態——不帶 `retry_after_s`、帶 `recommended_action: "self_test"`。收到此碼請**停止重試**，改 `session self-test` 取分類（多半會是 `BOOTLOADER`）再以 `interactive-open --allow-attached` 處理
 - `BOOTLOADER_STUCK`（#162）：readiness probe 失敗且 RX tail 尾行命中 bootloader prompt 的 `last_error`；`self-test`／`recover` 據此回 `classification: "BOOTLOADER"` ＋ `recommended_action: "recover_interactive"`
@@ -2399,7 +2428,7 @@ Windows daemon 以 **TCP loopback** 取代 AF_UNIX 做 RPC 控制通道，使 se
 - **RPC endpoint**：預設 `tcp://127.0.0.1:48700`，可以 `--socket` 參數或環境變數 `SERIALWRAP_ENDPOINT`（覆寫整個 endpoint，如 `tcp://127.0.0.1:50000`）、`SERIALWRAP_TCP_PORT`（僅覆寫 port 部分）覆寫。daemon 啟動後會把有效 endpoint 寫入 `config.yaml::socket_path`，CLI `_resolve_endpoint` 自動讀取（#173 起 POSIX daemon 亦同，見下方「自訂安裝路徑與 config.yaml 同步」）。
 - **Singleton 鎖**：`LockFileEx`（獨佔且不等待）+ TCP connect 探測（`WindowsSingletonLock`，`sw_core/lock_win.py`）。語意與 POSIX `SingletonLock`（flock + Unix socket probe）對齊：endpoint 可連 → `DAEMON_ALREADY_RUNNING`；stale → 取得檔案鎖。
 - **COM 列舉與藍牙排除**：從 Windows registry `HKLM\HARDWARE\DEVICEMAP\SERIALCOMM` 列舉所有 COM port（`WindowsDeviceSource`，`sw_core/device_source.py`）；雙重排除藍牙——BTHENUM PortName 掃描（主判據）+ `bthmodem` device path 啟發式（兜底），確保藍牙裝置**永不被接管**。額外手動排除清單：`config.yaml::windows.exclude_coms`（如 `["COM3"]`）。
-- **閒置非藍牙 COM 自動接管**：偵測到不在排除清單的 COM 時，daemon 以 `passthrough` profile 自動建立 session（可觀察 UART 輸出；需要下命令請先 pin 適當 profile 並 attach）。已持續被外部程序佔用的 COM **不會每輪自動輪詢重試**（與 POSIX dynamic-session 同語意；需拔插或手動 `session bind`/`session clear` 觸發）。
+- **閒置非藍牙 COM 自動接管**：偵測到不在排除清單的 COM 時，daemon 以 `passthrough` profile 自動建立 session（可觀察 UART 輸出；靜默 30 秒後可升 `READY` 並下命令，但仍建議先 pin 有 prompt 的 profile 並 attach）。已持續被外部程序佔用的 COM **不會每輪自動輪詢重試**（與 POSIX dynamic-session 同語意；需拔插或手動 `session bind`/`session clear` 觸發）。
 - **平台 seam 分檔**：三個後端由 `sw_core/platform_backends.py` 的 `select_rpc_backend()` / `select_lock_backend()` / `select_device_backend()` 依 `os.name` 自動選擇，環境變數 `SERIALWRAP_{RPC,LOCK,DEVICE}_BACKEND`（`auto`/`posix`/`win`）可覆寫：
   - RPC：`sw_core/rpc_posix.py`（Unix socket）↔ `sw_core/rpc_win.py`（TCP loopback `TcpRpcServer`）
   - Lock：`sw_core/lock_posix.py`（`SingletonLock` flock）↔ `sw_core/lock_win.py`（`WindowsSingletonLock` msvcrt）
@@ -2590,8 +2619,7 @@ CLI（`bind` 只改 device、`recover`/`clear` 沿用舊 profile）。在 produc
    （space）約 30 秒，攔截「Hit any key to stop autoboot」視窗；若是 boot menu，送對應鍵
    （例如 `0` = Exit）掉到 U-Boot console（prompt 例如 `U-Boot> `）。（#130 的 boot quiet
    window 只 gate `source=system` 的自動 probe，**不擋 interactive lease 鍵擊**，此手法不受影響。）
-4. **走完整 serialwrap 路徑驗證**：`session self-test`（期望 `OK`/`probe_ok=True`/`READY`）→
-   `cmd submit --cmd 'printenv' --mode line`（期望框出 env dump）。
+4. **走完整 serialwrap 路徑驗證**：passthrough 不 probe，`session list` 觀察到 `state` 由 `ATTACHED` 在靜默 30 秒後自動升為 `READY`（期間不應有任何 TX）；`session self-test` 期望 `classification: PASSTHROUGH`、`recommended_action: none`（無 `probe_ok`，READY 的 passthrough 不 probe）→ `cmd submit --cmd 'printenv' --mode line`（期望框出 env dump；完成條件由 `uboot-template` 的 `prompt_regex` 提供，板子若不回 prompt 則加 `--completion-regex`）。
 5. **還原**：送 `boot` 回正常 OS → 停 throwaway daemon → `device attach --selector COMx` 收回
    → 等板子開機穩定後（早期 PCIe/kernel 噪音會干擾偵測）重啟 production daemon，讓 detection
    重新綁回原 profile。

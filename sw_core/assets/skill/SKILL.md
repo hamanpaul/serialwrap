@@ -40,10 +40,11 @@ description: 透過 serialwrap broker + CLI 進行多 agent UART 存取，提供
    - **`error_code: WAL_MISSING`（#189）**：已寫過紀錄但現行 WAL 檔不存在＝稽核紀錄在 daemon 運行期間被刪掉（常見於外部工具 rmtree 掉 WAL 目錄），該區段**無法復原**。不要當成「這段時間沒有輸出」。daemon 會在下一次寫入自動重建目錄續寫；用 `serialwrap doctor` 的 `wal_writable` 檢查確認目錄狀態。所有回應都帶 `wal_path` / `wal_file_exists`，可據此分辨「查得到但沒資料」與「檔案不見了」。
 
 ## command_capable 與 READY 判定（#51）
-- 一個 session 是否「可下命令」由其 profile 的 `ready_probe` 是否非空決定（`command_capable = bool(profile.ready_probe.strip())`），**與底層是 OS shell 或 bootloader 無關**——只要 `prompt_regex` 對得上、`ready_probe` 能 round-trip 即可進 `READY`（含 U-Boot 之類 bootloader command profile，如 `uboot-template`）。
-- **非 command-capable**（無 `ready_probe`，如 `others-template`、未設 `ready_probe` 的 passthrough）：session 維持 `ATTACHED`、**不**轉 `READY`；此時 `cmd submit` 回 `PROFILE_NOT_COMMAND_CAPABLE`。
+- 一個 session 是否「可下命令」由其 profile 的 `ready_probe` 是否非空決定（`command_capable = bool(profile.ready_probe.strip())`），**與底層是 OS shell 或 bootloader 無關**——非 passthrough 的 profile 只要 `prompt_regex` 對得上、`ready_probe` 能 round-trip 即可進 `READY`（含非 passthrough 的 U-Boot 之類 bootloader command profile）。`platform=passthrough` 的 profile（如 `uboot-template`）不 probe，靜默 30 秒後才升 `READY`（見下）。
+- **非 passthrough 且無 `ready_probe`**：session 維持 `ATTACHED`、**不**轉 `READY`；此時 `cmd submit` 回 `PROFILE_NOT_COMMAND_CAPABLE`。
+- **`platform=passthrough`（含 `others-template`，即使設了 `ready_probe`）**：經 pin／explicit target 選定後 attach 不 login、不 probe，零 TX 停在 `ATTACHED`（動態偵測與 `fallback` 的 re-attach 仍先送一個 `\n` 探測，見下方 `pin_profile` 出口）；連續 30 秒無 RX 後自動升 `READY`（SC-35），之後可下命令。`ATTACHED` 時 `cmd submit` 回 `SESSION_NOT_READY` 並附 `passthrough_ready_in_s`（剩餘秒數）；`file.push`／`file.pull` 對 passthrough 一律回 `PROFILE_NOT_COMMAND_CAPABLE`。命令完成依序以 `--completion-regex`（console 不送 prompt 時建議每次都帶）、可用的 `prompt_regex` 判定；兩者皆未命中（或皆不可用）則回 `PROMPT_TIMEOUT`（`recovery_action: NONE`），不送 Ctrl-C／Ctrl-D，session 維持 `READY`；擷取輸出以 `serialwrap cmd result-tail --cmd-id` 讀回。
 - `command_capable` **純粹由 profile 的 `ready_probe` 決定**，與 session state 或 console 是否被佔用無關——COM 上掛著 human console 一樣能下命令，看到這個錯誤不要往「session 被佔用」排查（#181）。
-- **卡在 `others-template` fallback 時的出口（#181）**：先 `serialwrap session self-test --selector <COM>`；若回 `recommended_action: "pin_profile"` 與 `suggested_profile`（daemon 拿最近 RX 比對過所有 template 的 `prompt_regex`），照它給的兩行套用即可：
+- **卡在 `others-template` fallback 時的出口（#181）**：先 `serialwrap session self-test --selector <COM>`；若回 `recommended_action: "pin_profile"` 與 `suggested_profile`（daemon 拿最近 RX 比對過所有 template 的 `prompt_regex`），照它給的兩行套用即可（`others-template` 的 `prompt_regex` 為 `.*`，不能作為完成條件；pin 到有 prompt 的 profile 才有 prompt 完成判定）：
   ```bash
   serialwrap session pin   --selector <COM> --profile <suggested_profile>
   serialwrap session clear --selector <COM>   # 下一次 attach 就套用，不必重啟 daemon
@@ -59,6 +60,7 @@ description: 透過 serialwrap broker + CLI 進行多 agent UART 存取，提供
 3. `serialwrap device attach --selector COM0`：收回裝置並重建 primary console。外部仍持有時回 `DEVICE_STILL_HELD`（附 pids）；`--force` 只略過開檔前預檢，鎖後仍識別到 holder 時不會強制搶占，須等外部持有者釋放後再試。
 4. 期間 `serialwrap session self-test --selector COM0` 在 `RELEASED` 會回 `external_holder` / `reclaimable` / `recommended_action`（`wait_external_flash` 或 `device_attach`）；屬唯讀偵測，不開 tty、不干擾燒錄。
 5. 被遺忘的 release 可由 self-test 的 `reclaimable=true` 辨識（裝置不會永久卡住，但需明確 `device attach` 收回）。
+6. 若 `device release` 回 `DRAIN_STALLED`（drain 逾 3 秒仍無成功的 handle 關閉回條）：session 維持 `RECOVERING`，**不要**讓外部工具開啟該裝置；以 `session list` 輪詢，只有 `RELEASED` 才交接，上限到期仍為 `RECOVERING` 時交由操作員檢查 daemon 與 handle。`DRAIN_STALLED` 不可盲目重試；晚到的成功回條仍會完成 release。
 
 ## UART 獨占、socket 權限與設定探索（BC-04、SC-09）
 - **BC-04**：daemon 持有裝置時**不可再直接開 tty**（勿 `minicom -D /dev/ttyUSBx`、勿在外部腳本 `open()` 同一 tty）。POSIX 以 `flock`＋`TIOCEXCL` 獨占，並在任何 I/O 前重掃 holder；衝突時 `session attach`／`device attach` 回 `DEVICE_STILL_HELD`（附 `pids` 與 `holder_unknown`；`holder_unknown: true` 代表查不到 PID 不等於無 holder，不可視為可收回）。人類 console 走 `serialwrap session console-attach`（或 `serialwrap-minicom`），外部工具獨佔走上方 `device release`／`device attach`。

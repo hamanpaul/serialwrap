@@ -182,7 +182,7 @@ sequenceDiagram
 #### 其他
 
 - 若 session 僅為 `ATTACHED`，`session.console_attach` 仍可使用，且該 console 會自動拿到 raw human ownership，方便手動登入或觀察 boot/log
-- `platform=passthrough` 的 session attach 後不做 prompt/login/ready 探測，直接停在 `ATTACHED`，供未知設備走純 bridge/passthrough 路徑
+- `platform=passthrough` 的 session attach 後不做 prompt/login/ready 探測（即使設定 `ready_probe`，SC-35），經 explicit target／pin 選定時零 TX 停在 `ATTACHED`（動態偵測仍先送一個 `\n` 探測），供未知設備走純 bridge/passthrough 路徑；連續 30 秒無 RX 後自動升 `READY` 並可下命令
 
 ### 5.3 Command record
 
@@ -725,7 +725,7 @@ gate、`REMOTE_NOT_SUPPORTED`、`INVALID_ARGS`）且 exit code 非零時：
 - `log.tail_text`
 - `wal.range`
 
-> **`session.attach` 回傳契約（#94）**：對 command-capable session，未進入 `READY` 的 bridge-present 狀態一律回 `ok:false` + 頂層 `error_code`（開機窗／probe 未成功→`PROMPT_UNAVAILABLE`／`session.last_error`；`FLASHING`→`FLASHING_BUSY`；`RECOVERING`→`SESSION_RECOVERING`；`human:*` interactive lease 佔用而不 probe→`last_error`；其餘→`NOT_READY`），CLI exit code = `2` 並在 stderr 印一行具體錯誤。**回 `ok:true` 的情形**：達 `READY`（可下命令；human lease 下與人交錯）、`ATTACHING`（fresh attach 進行中／async accept）、`RELEASED`（裝置已 release／`released_by_id`，回 `released:true` + `recommended_action=device_attach`，屬保護性 no-op、不建立 bridge，需 `device attach` 重取）、`platform=passthrough`（非 command-capable、`ready_probe` 空、停 `ATTACHED` 即成功）。此為「誠實回報未達 READY、可重試（daemon 有界自動重探）、非致命」契約，供上層 driver 據以 retry/wait。
+> **`session.attach`／`session.recover` 回傳契約（SC-34）**：command-capable session 的 attach 未能達 `READY`，一般拒絕分支固定回 `ok:false`、頂層 `error_code=SESSION_NOT_READY`、`last_error` 與 `last_error_detail`（可為 null）；`FLASHING` 與 `RECOVERING` 仍分別回 `FLASHING_BUSY`、`SESSION_RECOVERING`。recover 的 REPROBE 未恢復時回 `ok:true`、`recovering:false`、`action=REPROBE`、`recovered:false`、`error_code=SESSION_NOT_READY`，並附頂層 `last_error`、`last_error_detail`。依 `last_error` 判斷後續處置；終態值不可盲目重試。CLI 對 attach 失敗回 exit code `2`。**attach 回 `ok:true` 的情形**：達 `READY`、`ATTACHING`（fresh attach 進行中／async accept）、`RELEASED`（裝置已 release／`released_by_id`，回 `released:true` + `recommended_action=device_attach`，需 `device attach` 重取）、`platform=passthrough`（不論 `ready_probe`，停 `ATTACHED` 即成功）。
 
 ## 12. `minicom_router.sh` 行為
 
@@ -809,7 +809,7 @@ targets:
 
 **`platform=prpl`**：prplOS 平台。`prompt_regex` 應匹配 prompt prefix，例如 `(?m)^root@prplOS:.*# `。不依賴行尾錨點，以適應 prompt 後接 driver / kernel log 的情境。`ready_probe` 保持最小 `echo __READY__${nonce}`。
 
-**`platform=passthrough`**：不做 `ready_probe` / login 流程。daemon 只建立 UART bridge 與 console PTY，session 停在 `ATTACHED`，由 human console 或後續人工判斷設備型態。
+**`platform=passthrough`**：不做 `ready_probe` / login 流程（SC-35）。daemon 只建立 UART bridge 與 console PTY，attach 零 TX（已選定的 profile；動態偵測仍先送一個 `\n` 探測）停在 `ATTACHED`，由 human console 觀察設備型態；連續 30 秒沒有 RX 即自動升 `READY`（`PASSTHROUGH_READY_QUIET_S`），之後 `cmd submit` 可用，完成條件見 `docs/command-completion.md`（建議帶 `--completion-regex`）。
 
 ### 13.4 裝置識別
 
@@ -833,7 +833,7 @@ targets:
 **偵測流程**（`login_fsm.detect_template()`）：
 
 1. 用預設 UART 參數（115200/8N1）開啟臨時 probe bridge
-2. `bridge.clear_rx_buffer()` + `bridge.send_command("")`（送 `\r`）
+2. `bridge.clear_rx_buffer()` + `bridge.send_command("")`（送 `\n`）
 3. 等待 `probe_timeout_s`（預設 3 秒）收集 UART 輸出
 4. 取得 `bridge.rx_tail()` snapshot
 5. 依序嘗試各 template（passthrough 排最後）：

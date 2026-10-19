@@ -65,7 +65,7 @@ doctor 全綠、testbed 板卡 READY、tmux/minicom 存在、無殘留 throwaway
 | F6 RPC 不凍結 | #80 #52 | 長操作中 `daemon status` 往返不凍結、雙板互不餓死 | 否 |
 | F7 檔案傳輸 | #21 #32 #161 #166 | binary round-trip md5 一致、不靜默截斷；可用 base64 或 OpenSSL 搭配 md5sum，不因只缺 base64 就 SKIP；明確 `CHECKSUM_MISMATCH` 一律為 `FAIL/test/binary_roundtrip_mismatch`，不受工具探測值影響；`PULL_PARSE_FAILED`、`MOVE_FAILED`、逾時等未完成傳輸維持環境 `SKIP`；push 預設走 #161 echo-ACK 節流（echo 停滯獨立 reason_code `transfer_echo_stall`） | 否 |
 | F8 daemon 單一性 | #101 #53 | `multi_open`／`foreign_holders` 正確回報第二 daemon 與 tty 持有者 | 否 |
-| F9 開機/U-Boot／BRCM 登入 | #69 #130 #139 #44 #14 #20 #224 | autoboot 窗不被 probe 打斷、quiet window 不擋 human／真 READY 後的 agent 命令、自發重開機過渡態 agent 命令被 `AUTOBOOT_QUIET` 攔下（#139）、開機中 attach 自動 reprobe、U-Boot 停留不踢 console；BRCM 重開後帶前導空白的 BDK prompt 能自動登入、切 `sh` 並回 READY | **是（reboot）** |
+| F9 開機/U-Boot／BRCM 登入 | #69 #130 #139 #44 #14 #20 #224 | autoboot 窗不被 probe 打斷、quiet window 不擋 human／真 READY 後的 agent 命令、自發重開機過渡態 agent 命令被 `AUTOBOOT_QUIET` 攔下（#139）、開機中 attach 自動 reprobe、U-Boot 停留不踢 console；BRCM 重開後帶前導空白的 BDK prompt 能自動登入、切 `sh` 並回 READY；passthrough 真板 attach 零 TX、靜默 30 秒升 READY 並以 `--completion-regex` 完成（SC-35，`pt-quiet-ready`，見下節待補表） | **是（reboot；pt-quiet-ready 為 throwaway＋release）** |
 | F10 登入帳密 | #140 #19 | 帳密解析空→`CREDENTIALS_UNRESOLVED` 終態不送空帳密、補帳密後恢復 | **是（throwaway＋release）** |
 | F10 裝置交接（`f10_device_handoff.py`） | Stage 0 待補（`f10-release-drain-receipt`、`f10-release-aborts-inflight-command`，見下節） | release 的 ok 回條只在 handle 關閉後送出（BC-04／SC-04）；在途命令於 release 後 `COMMAND_ABORTED_IN_FLIGHT` 且 TX 不重送（BC-03） | **是（throwaway＋release）** |
 | F11 RX 洪水/傳輸層 | #153 #150 | 洪水下 probe 失敗分類為 `RX_FLOOD`（等排空、排空後自癒回 READY）、`rx_bytes_last_10s`／`last_rx_age_s`／`last_tx_age_s`／`last_error_detail` 觀測面存在且合理（真 usbip stall 需人工操作、排除自動化，heuristic 由 pytest 覆蓋） | **部分（flood case 佔用 COM0 數十秒）** |
@@ -75,7 +75,7 @@ doctor 全綠、testbed 板卡 READY、tmux/minicom 存在、無殘留 throwaway
 
 ### Stage 0 待補 issue 的 case（`pending_issue`）
 
-Stage 0 行為變更（BC-02、BC-03、BC-04／SC-04）的實機 case 已撰寫，但擁有者尚未為它們開立 issue。依 Stage 0 計畫（T21）規定：
+Stage 0 行為變更（BC-02、BC-03、BC-04／SC-04、SC-35）的實機 case 已撰寫，但擁有者尚未為它們開立 issue。依 Stage 0 計畫（T21）規定：
 
 - `Case(pending_issue=True)` 且 `issues=()`，待擁有者開立 issue 號後改填 `issues=("#NNN",)` 並把 `pending_issue` 移除。**不得**填假號，**不得**自行開 issue。
 - `pending_issue` 與 `issues` 互斥；`register()` 只對 `pending_issue=True` 的 case 接受空 `issues`，其餘 case 仍拒絕空 `issues`（#155）。
@@ -86,6 +86,7 @@ Stage 0 行為變更（BC-02、BC-03、BC-04／SC-04）的實機 case 已撰寫�
 | `f10-release-drain-receipt` | F10 | `device release` 的 ok 回條只在 handle 關閉後送出（外部 `open(tty)` 成功時間 ≤ 回應時間，否則 FAIL `release_receipt_before_handle_close`） | TestPilot（`allow_destructive: true`）；非 root 執行 | BLOCKED-OWNER（Stage 0 bench） |
 | `f10-release-aborts-inflight-command` | F10 | 長命令在途時 release，`COMMAND_ABORTED_IN_FLIGHT`；同 cmd_id 的 TX 重複出現 → FAIL `resend_detected` | 同上 | BLOCKED-OWNER |
 | `f5-deferred-dropped-after-reboot` | F5 | agent 命令在途時鍵入的舊按鍵，於 reboot（上下文失效）後不回放；對照組（未 reboot）須回放，否則 SKIP `insufficient_evidence` | tmux＋minicom（`requires: tmux`），`destructive=True` | BLOCKED-OWNER |
+| `pt-quiet-ready` | F9 | passthrough（真板 U-Boot／MCU 線）attach 至 READY 全程 WAL 零 TX、READY 不早於靜默 30 秒下限，`cmd submit --completion-regex` 完成（SC-35）；板子最後觀測仍有 RX 時判 SKIP `rx_not_quiet`，WAL 證據缺漏判 SKIP `insufficient_evidence` | throwaway（explicit target 釘定 passthrough profile 綁 COM0，sandbox by-id 只放該線；無動態偵測、無 PROBE）＋prod `device release`／`attach` 收尾，`destructive=True` | BLOCKED-OWNER（bench 實跑；OD-14 對應 issue 待擁有者開立，`issues=()` 於 PR 說明） |
 
 執行順序以 case id 排序（`harness.ordered()`）：`f10-release-*` 落在既有 `f10-creds-*` 之後、`f10-unresolved-*` 之前，屬 F10 family 內的 id 排序結果；破壞性 F10 case 彼此皆以 throwaway＋`device release`／`attach` 收尾。
 
