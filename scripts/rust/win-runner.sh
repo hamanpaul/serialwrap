@@ -40,6 +40,15 @@ local_appdata_unix="$(wslpath -u "$local_appdata" 2>/dev/null)" || {
 run_id="$(date +%y%m%d-%H%M%S)-$$"
 staging="$local_appdata_unix/Temp/sw-rust-test/$run_id"
 mkdir -p "$staging/tmp" "$staging/data"
+# drvfs 以 `case=dir` 掛載時，WSL 建立的目錄會被設為「逐目錄區分大小寫」，其下由 Windows
+# 程式新建的子目錄也會繼承；測試在 TMP 下建立的檔案因而失去 Windows 原生的不分大小寫語意
+# （例如 PATHEXT 的 `.EXE` 查不到 `.exe`）。staging/tmp 仍為空時即關閉該屬性，失敗則中止
+# （不得在非原生語意下產生 Windows 證據）。
+if ! fsutil.exe file setCaseSensitiveInfo "$(wslpath -w "$staging/tmp")" disable >/dev/null 2>&1; then
+  echo "win-runner.sh: 無法關閉 staging TMP 的逐目錄大小寫區分（fsutil setCaseSensitiveInfo）；證據不足" >&2
+  rm -rf -- "$staging"
+  exit 2
+fi
 keep_staging="${SW_WIN_KEEP:-0}"
 print_staging="${SW_WIN_PRINT_STAGING:-0}"
 cleanup() {
