@@ -48,6 +48,15 @@ else
   unset CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER || true
 fi
 
+if [[ "$is_wsl" == "1" && " ${PACKAGES[*]} " == *" sw-daemon "* ]]; then
+  daemon_exe="$ROOT/target/x86_64-pc-windows-gnu/debug/serialwrapd.exe"
+  if [[ -n "${SW_WIN_EXTRA_FILES:-}" ]]; then
+    export SW_WIN_EXTRA_FILES="$SW_WIN_EXTRA_FILES:$daemon_exe"
+  else
+    export SW_WIN_EXTRA_FILES="$daemon_exe"
+  fi
+fi
+
 collector_args=(--platform windows)
 if [[ "$is_wsl" == "1" ]]; then
   collector_args+=(--runner "$RUNNER")

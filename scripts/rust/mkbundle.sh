@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
-# 建立 Stage 1A 開發 bundle；`--delegate-sentinel` 提供後續管理面測試使用的精簡 bundle。
+# 建立 Stage 1A 自含式開發 bundle；`--delegate-sentinel` 保留後續管理面測試用的精簡 bundle。
 set -euo pipefail
 
 usage() {
   cat <<'EOF'
 用法：
-  scripts/rust/mkbundle.sh --dev --out <目錄> [--target <triple>] [--profile debug|release] [--print-dir]
+  scripts/rust/mkbundle.sh --dev --out <目錄> [--target <triple>] [--profile debug|release] [--version-override <版本>] [--print-dir]
   scripts/rust/mkbundle.sh --dev --delegate-sentinel --out <目錄> [其他選項]
 
 選項：
   --dev                    建立開發 bundle（目前唯一支援的 bundle 類型）
   --delegate-sentinel      將委派入口改為 P4 測試 sentinel
-  --target <triple>        指定 Rust target；Windows bundle 由 P3-T17 承接
+  --target <triple>        指定 Rust target；Windows 正式 bundle 由擁有者 runner 建置
   --profile <name>         選擇 debug 或 release，預設為 debug
+  --version-override <v>   以同一編譯輸入覆寫 CLI 與 daemon bundle 版本
   --out <目錄>             指定輸出目錄
   --print-dir              保留後續階段介面；成功時 stdout 一律輸出絕對目錄
   -h, --help               顯示此說明
@@ -25,6 +26,7 @@ SENTINEL=0
 PROFILE=debug
 TARGET=""
 OUT="$REPO_ROOT/target/mkbundle-dev"
+VERSION_OVERRIDE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -56,6 +58,14 @@ while [[ $# -gt 0 ]]; do
       PROFILE="$2"
       shift 2
       ;;
+    --version-override)
+      if [[ $# -lt 2 ]]; then
+        echo "mkbundle.sh: --version-override 缺少版本參數" >&2
+        exit 2
+      fi
+      VERSION_OVERRIDE="$2"
+      shift 2
+      ;;
     *) echo "mkbundle.sh: 未知參數 $1" >&2; exit 2 ;;
   esac
 done
@@ -80,14 +90,20 @@ case "$TARGET" in
     ;;
 esac
 
-BUILD_ARGS=(build -p sw-cli)
+VERSION="${VERSION_OVERRIDE:-$(tr -d ' \n' < "$REPO_ROOT/VERSION")}"
+if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "mkbundle.sh: bundle version 必須符合 MAJOR.MINOR.PATCH" >&2
+  exit 2
+fi
+
+BUILD_ARGS=(build -p sw-cli -p sw-daemon)
 if [[ "$PROFILE" == release ]]; then
   BUILD_ARGS+=(--release)
 fi
 if [[ "$TARGET" != "$HOST_TRIPLE" ]]; then
   BUILD_ARGS+=(--target "$TARGET")
 fi
-(cd "$REPO_ROOT" && CARGO_TARGET_DIR="$REPO_ROOT/target" cargo "${BUILD_ARGS[@]}" --quiet)
+(cd "$REPO_ROOT" && SW_BUNDLE_VERSION="$VERSION" CARGO_TARGET_DIR="$REPO_ROOT/target" cargo "${BUILD_ARGS[@]}" --quiet)
 
 BUILD_DIR="$REPO_ROOT/target"
 if [[ "$TARGET" != "$HOST_TRIPLE" ]]; then
@@ -95,19 +111,17 @@ if [[ "$TARGET" != "$HOST_TRIPLE" ]]; then
 fi
 BUILD_DIR+="/$PROFILE"
 BIN_SRC="$BUILD_DIR/serialwrap"
+DAEMON_SRC="$BUILD_DIR/serialwrapd"
 CLI_NAME=serialwrap
+DAEMON_NAME=serialwrapd
 if [[ ! -x "$BIN_SRC" && -x "$BUILD_DIR/serialwrap.exe" ]]; then
   BIN_SRC="$BUILD_DIR/serialwrap.exe"
+  DAEMON_SRC="$BUILD_DIR/serialwrapd.exe"
   CLI_NAME=serialwrap.exe
+  DAEMON_NAME=serialwrapd.exe
 fi
-if [[ ! -x "$BIN_SRC" ]]; then
+if [[ ! -x "$BIN_SRC" || ! -x "$DAEMON_SRC" ]]; then
   echo "mkbundle.sh: cargo build 後仍找不到 $BIN_SRC" >&2
-  exit 1
-fi
-
-VERSION="$(tr -d ' \n' < "$REPO_ROOT/VERSION")"
-if [[ -z "$VERSION" ]]; then
-  echo "mkbundle.sh: VERSION 不得為空" >&2
   exit 1
 fi
 mkdir -p "$OUT"
@@ -157,18 +171,49 @@ with open(path, "w", encoding="utf-8") as handle:
 PY
 else
   VERSION_DIR="$OUT/versions/$VERSION"
+  if [[ -e "$VERSION_DIR" ]]; then
+    rm -rf -- "$VERSION_DIR"
+  fi
   mkdir -p "$VERSION_DIR/bin" "$OUT/bin"
   cp "$BIN_SRC" "$VERSION_DIR/bin/$CLI_NAME"
+  cp "$DAEMON_SRC" "$VERSION_DIR/bin/$DAEMON_NAME"
   chmod +x "$VERSION_DIR/bin/$CLI_NAME"
+  chmod +x "$VERSION_DIR/bin/$DAEMON_NAME"
 
   PY_DIR="$VERSION_DIR/py"
-  python3 -m venv --system-site-packages "$PY_DIR"
+  python3 -m venv --copies --system-site-packages "$PY_DIR"
+  if [[ -L "$PY_DIR/lib64" ]]; then
+    rm -- "$PY_DIR/lib64"
+  fi
   PYTHON="$PY_DIR/bin/python3"
   PY_SITE="$("$PYTHON" -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
   mkdir -p "$PY_SITE"
-  printf '%s\n' "$REPO_ROOT" > "$PY_SITE/serialwrap_repo.pth"
 
-  PYTHON_VERSION="$("$PYTHON" -I -c 'import platform; print(platform.python_version())')"
+  python3 - "$REPO_ROOT/sw_core" "$PY_DIR/sw_core" "$PY_SITE/sw_core" \
+    "$REPO_ROOT/serialwrapd.py" "$PY_DIR/serialwrapd.py" "$VERSION" \
+    "$PY_DIR/VERSION" "$PY_SITE/VERSION" <<'PY'
+import os
+import pathlib
+import shutil
+import sys
+
+source, bundled_package, installed_package, daemon_source, daemon_target, version, *version_paths = sys.argv[1:]
+source_path = pathlib.Path(source)
+for root, dirs, files in os.walk(source_path, followlinks=False):
+    for name in dirs + files:
+        path = pathlib.Path(root) / name
+        if path.is_symlink():
+            raise SystemExit(f"sw_core 含 symlink，無法建立自含 bundle：{path}")
+
+ignore = shutil.ignore_patterns("__pycache__", "*.pyc")
+shutil.copytree(source_path, bundled_package, ignore=ignore)
+shutil.copytree(source_path, installed_package, ignore=ignore)
+shutil.copy2(daemon_source, daemon_target)
+for path in map(pathlib.Path, version_paths):
+    path.write_text(version + "\n", encoding="utf-8")
+PY
+
+  PYTHON_VERSION="$("$PYTHON" -I -B -c 'import platform; print(platform.python_version())')"
   EXPECTED_PYTHON_VERSION="$(python3 - "$REPO_ROOT/contracts/cli_help/_meta.json" <<'PY'
 import json
 import sys
@@ -183,7 +228,7 @@ PY
   fi
 
   # 以 P1 的正式實作先核對 golden，再計算 bundle 內的 Python package tree。
-  "$PYTHON" -I - "$REPO_ROOT/contracts/golden/tree_sha256.ndjson" "$VERSION_DIR" <<'PY'
+  "$PYTHON" -I -B - "$REPO_ROOT/contracts/golden/tree_sha256.ndjson" "$VERSION_DIR" <<'PY'
 import json
 import pathlib
 import sys
@@ -206,10 +251,10 @@ for number, line in enumerate(golden_path.read_text(encoding="utf-8").splitlines
             raise SystemExit(f"tree_sha256 golden #{number} 不符：{actual}")
 PY
 
-  PACKAGE_TREE_SHA="$("$PYTHON" -I -c 'import sw_core.release_manifest as m; print(m.package_tree_sha256())')"
-  PROFILE_TREE_SHA="$("$PYTHON" -I -c 'import sw_core.release_manifest as m, sys; print(m.tree_sha256(sys.argv[1]))' "$REPO_ROOT/sw_core/assets/profiles")"
+  PACKAGE_TREE_SHA="$("$PYTHON" -I -B -c 'import sw_core.release_manifest as m; print(m.package_tree_sha256())')"
+  PROFILE_TREE_SHA="$("$PYTHON" -I -B -c 'import sw_core.release_manifest as m, sys; print(m.tree_sha256(sys.argv[1]))' "$REPO_ROOT/sw_core/assets/profiles")"
   CLI_SHA="$(sha256_file "$VERSION_DIR/bin/$CLI_NAME")"
-  LAUNCHER_SHA="$(sha256_file "$REPO_ROOT/serialwrapd.py")"
+  LAUNCHER_SHA="$(sha256_file "$VERSION_DIR/bin/$DAEMON_NAME")"
   RUNTIME_REALPATH="$(realpath "$PYTHON")"
   RUNTIME_SHA="$(sha256_file "$RUNTIME_REALPATH")"
   SKILL_SHA="$(sha256_file "$REPO_ROOT/sw_core/assets/skill/SKILL.md")"
@@ -221,8 +266,7 @@ PY
 
   python3 - "$MANIFEST" "$VERSION" "$TARGET" "$GIT_REVISION" "$CONTRACT_REVISION" \
     "$CLI_NAME" "$CLI_SHA" "$PACKAGE_TREE_SHA" "$PYTHON_VERSION" "$LAUNCHER_SHA" \
-    "$RUNTIME_SHA" "$SKILL_SHA" "$SKILL_WINDOWS_SHA" "$PROFILE_TREE_SHA" "$SUPERVISOR_SHA" \
-    "$REPO_ROOT" <<'PY'
+    "$RUNTIME_SHA" "$SKILL_SHA" "$SKILL_WINDOWS_SHA" "$PROFILE_TREE_SHA" "$SUPERVISOR_SHA" <<'PY'
 import datetime
 import json
 import sys
@@ -243,8 +287,7 @@ import sys
     skill_windows_sha,
     profiles_sha,
     supervisor_sha,
-    repo_root,
-) = sys.argv[1:17]
+) = sys.argv[1:16]
 python_entry = ["py/bin/python3", "-I", "-B", "-m", "sw_core.cli"]
 manifest = {
     "schema_version": 1,
@@ -271,8 +314,8 @@ manifest = {
             "implementation": "python",
             "version": version,
             "git_revision": revision,
-            "entry": ["py/bin/python3", "-I", "-B", f"{repo_root}/serialwrapd.py"],
-            "launcher": {"path": f"{repo_root}/serialwrapd.py", "sha256": launcher_sha},
+            "entry": ["py/bin/python3", "-I", "-B", "py/serialwrapd.py"],
+            "launcher": {"path": "bin/serialwrapd", "sha256": launcher_sha},
             "runtime": {
                 "path": "py/bin/python3",
                 "python_version": python_version,
@@ -307,10 +350,46 @@ with open(path, "w", encoding="utf-8") as handle:
 PY
 
   ln -sfn "../versions/$VERSION/bin/$CLI_NAME" "$OUT/bin/$CLI_NAME"
+  ln -sfn "../versions/$VERSION/bin/$DAEMON_NAME" "$OUT/bin/$DAEMON_NAME"
   if [[ "$(realpath "$OUT/bin/$CLI_NAME")" != "$(realpath "$VERSION_DIR/bin/$CLI_NAME")" ]]; then
     echo "mkbundle.sh: bin/$CLI_NAME symlink 未指向 versions/$VERSION/bin/$CLI_NAME" >&2
     exit 1
   fi
+  if [[ "$(realpath "$OUT/bin/$DAEMON_NAME")" != "$(realpath "$VERSION_DIR/bin/$DAEMON_NAME")" ]]; then
+    echo "mkbundle.sh: bin/$DAEMON_NAME symlink 未指向 versions/$VERSION/bin/$DAEMON_NAME" >&2
+    exit 1
+  fi
+
+  if find "$VERSION_DIR" -type l -print -quit | grep -q .; then
+    echo "mkbundle.sh: dev bundle 不得含 symlink：$(find "$VERSION_DIR" -type l -print -quit)" >&2
+    exit 1
+  fi
+
+  python3 - "$VERSION_DIR" <<'PY'
+import hashlib
+import os
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+rows = []
+for directory, names, files in os.walk(root, followlinks=False):
+    for name in names + files:
+        path = pathlib.Path(directory) / name
+        if path.is_symlink():
+            raise SystemExit(f"dev bundle 不得含 symlink：{path}")
+    for name in files:
+        path = pathlib.Path(directory) / name
+        relative = path.relative_to(root).as_posix()
+        if relative in {"release-manifest.json", "SHA256SUMS"}:
+            continue
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        rows.append((relative, digest))
+rows.sort(key=lambda item: item[0].encode("utf-8"))
+with (root / "SHA256SUMS").open("w", encoding="utf-8", newline="\n") as handle:
+    for relative, digest in rows:
+        handle.write(f"{digest}  {relative}\n")
+PY
 
   SCHEMA="$REPO_ROOT/contracts/release_manifest.schema.json"
   if [[ ! -f "$SCHEMA" ]]; then

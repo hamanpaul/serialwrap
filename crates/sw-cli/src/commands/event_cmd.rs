@@ -162,7 +162,7 @@ pub fn dispatch_event(ctx: &mut CliCtx, ns: &Namespace) -> i32 {
     if let Err(error) = print_json(&mut ctx.io, &resp) {
         return print_internal_error(&mut ctx.io, &context, &py_io_error_text(&error));
     }
-    let _ = warn_version_mismatch(&mut ctx.io, &resp, sw_proto::version::version());
+    let _ = warn_version_mismatch(&mut ctx.io, &resp, ctx.cli_version);
     let _ = mirror_err(&mut ctx.io, &resp, Some(&context));
     if resp.get_truthy("ok") {
         0

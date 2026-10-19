@@ -299,7 +299,7 @@ pub fn run_rpc(ctx: &mut CliCtx, ns: &Namespace, method: &str, params: PyValue) 
             .io
             .err_str(&format!("{}\n", format_err_line(&resp, Some(method))));
     }
-    let _ = warn_version_mismatch(&mut ctx.io, &resp, sw_proto::version::version());
+    let _ = warn_version_mismatch(&mut ctx.io, &resp, ctx.cli_version);
     if ok {
         0
     } else {

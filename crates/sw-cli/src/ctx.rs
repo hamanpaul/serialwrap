@@ -48,7 +48,7 @@ pub struct CliCtx<'a> {
     pub paths: sw_proto::runtime_paths::RuntimePaths,
     pub io: TextIo<'a>,
     pub verbose: i64,
-    /// `sw_proto::version::version()`（P4-T1 新增；管理面 `setup`／`doctor` 等輸出版本時使用）。
+    /// 與 daemon 共用編譯輸入的 CLI 版本（管理面與 RPC 版本警告皆使用）。
     pub cli_version: &'static str,
 }
 

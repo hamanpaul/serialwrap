@@ -191,7 +191,12 @@ fn is_forbidden_code_literal(s: &str) -> bool {
         return false;
     }
     // 允許清單：SERIALWRAP_*, SW_*, UNKNOWN_ERROR
-    if s.starts_with("SERIALWRAP_") || s.starts_with("SW_") || s == "UNKNOWN_ERROR" {
+    // CARGO_PKG_VERSION 是編譯期套件中繼資料名稱，不是 RPC 錯誤碼。
+    if s.starts_with("SERIALWRAP_")
+        || s.starts_with("SW_")
+        || s == "UNKNOWN_ERROR"
+        || s == "CARGO_PKG_VERSION"
+    {
         return false;
     }
     true
@@ -336,6 +341,12 @@ fn no_forbidden_uppercase_string_literals_in_sw_cli_src() {
         violations.is_empty(),
         "發現禁止的錯誤碼字串常值（應使用 ErrorCode::*）：{violations:?}"
     );
+}
+
+#[test]
+fn package_version_build_variable_is_not_an_error_code() {
+    assert!(!is_forbidden_code_literal("CARGO_PKG_VERSION"));
+    assert!(is_forbidden_code_literal("SESSION_NOT_READY"));
 }
 
 #[test]

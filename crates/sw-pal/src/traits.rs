@@ -503,6 +503,16 @@ pub trait ProcessCtl: Send + Sync {
     /// 成功時不返回：POSIX execve 取代行程；Windows 等子行程結束後 `std::process::exit(child_code)`。只在失敗時返回錯誤。
     fn exec_or_wait(&self, argv: &[OsString], env_add: &[(String, String)]) -> PalError;
 
+    /// 以指定平台選項執行前景程序；POSIX 預設忽略選項並沿用 execve。
+    fn exec_or_wait_opts(
+        &self,
+        argv: &[OsString],
+        env_add: &[(String, String)],
+        _opts: crate::process::ExecOpts,
+    ) -> PalError {
+        self.exec_or_wait(argv, env_add)
+    }
+
     // ── P4-T4：ProcessCtl（spawn／poll／foreground）──
 
     /// 啟動常駐 daemon（POSIX setsid + stdout/err 重導到 /dev/null；Windows DETACHED_PROCESS）。

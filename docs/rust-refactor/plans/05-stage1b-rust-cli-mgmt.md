@@ -3583,7 +3583,7 @@ python3 scripts/rust/check_cfg_boundary.py && python3 -m pytest -q tests/ && pyt
 **Changelog fragment:** `changelog.d/<issue>-rust-p4-launcher-bundle.md`（`type: feat`，`scope: rust-daemon`）
 
 **Files:**
-- Create: `crates/sw-daemon/src/launcher.rs`；Modify: `crates/sw-daemon/src/main.rs`（P3 空殼 → 呼叫 `launcher::run`；檔頭 crate 屬性 `#![windows_subsystem = "windows"]`——這是 crate 屬性不是 `cfg`，非 Windows target 忽略）
+- Create: `crates/sw-daemon/src/launcher.rs`；Modify: `crates/sw-daemon/src/main.rs`（P3 空殼 → 呼叫 `launcher::run`；檔頭 crate 屬性 `#![windows_subsystem = "windows"]`——這是 crate 屬性不是 `cfg`，非 Windows target 忽略）、`crates/sw-daemon/Cargo.toml`（launcher 定位測試啟用 `sw-pal` 的 `test-fakes`）
 - Modify: `crates/sw-pal/src/process.rs`、`crates/sw-pal/src/process/windows.rs`（`exec_or_wait_opts`）
 - Create: `crates/sw-proto/src/yaml11/emit.rs`、`crates/sw-proto/src/bench_registry.rs`、`crates/sw-proto/src/digest.rs`（sha2 包裝，供 sw-cli 使用）
 - Create: `scripts/rust/goldens/gen_yaml_golden.py`、`crates/sw-proto/tests/golden/yaml_emit.ndjson`、`crates/sw-proto/tests/yaml_emit.rs`、`crates/sw-proto/tests/bench_registry.rs`、`crates/sw-daemon/tests/launcher.rs`
@@ -3597,8 +3597,8 @@ python3 scripts/rust/check_cfg_boundary.py && python3 -m pytest -q tests/ && pyt
 // sw-daemon/src/launcher.rs
 pub fn launcher_argv(manifest_dir: &Path, m: &ReleaseManifest, argv_tail: &[OsString]) -> Result<Vec<OsString>, LauncherError>;
 // implementation=="python"：entry（相對 manifest 目錄轉絕對）＋argv_tail；entry 尾段為 <abs>/py/serialwrapd.py（multi_open 規則 2）
-pub fn run(argv: Vec<OsString>, p: &sw_pal::Platform) -> i32;   // 定位 manifest（current_exe 的上兩層）→ launcher_argv → exec_or_wait_opts
-pub enum LauncherError { ManifestNotFound(String), ManifestInvalid(String), UnsupportedImplementation(String) }
+pub fn run(argv: Vec<OsString>, p: &sw_pal::Platform) -> i32;   // Windows 先讀 bin/current-release.json；否則依 realpath(current_exe) 上兩層 → launcher_argv → exec_or_wait_opts
+pub enum LauncherError { ManifestNotFound(String), ManifestInvalid(String), ProcessStart { program: String, reason: String }, UnsupportedImplementation(String) }
 // 失敗：stderr 一行 `serialwrapd: <原因>` 後 exit 2（不印 JSON；daemon 非 CLI 介面）
 // sw-pal/src/process.rs
 pub struct ExecOpts { pub no_window: bool, pub kill_on_close: bool }
@@ -3612,7 +3612,7 @@ pub fn safe_dump(v: &YValue, allow_unicode: bool, sort_keys: bool) -> String;   
 // sw-proto/src/bench_registry.rs（07 §9.1 逐字）
 pub struct BenchEntry { pub code: String, pub target: String, pub remote_socket: Option<String>, pub remote_port: Option<u16>,
                         pub local_port: u16, pub ssh_opts: Vec<String>, pub autossh: bool }
-pub fn load_benches(text: &str) -> Result<BTreeMap<String, BenchEntry>, BenchConfigError>;   // 訊息逐字照 07 §9.1（INVALID_BENCH_CONFIG）
+pub fn load_benches(text: &str) -> Result<BTreeMap<String, BenchEntry>, BenchConfigError>;   // 欄位驗證逐字照 07 §9.1（INVALID_BENCH_CONFIG）；YAML parser error 維持 INTERNAL_ERROR
 pub fn resolve(benches: &BTreeMap<String, BenchEntry>, code: &str) -> Result<&BenchEntry, BenchConfigError>;   // UNKNOWN_BENCH_CODE `unknown bench code: <code>`
 // sw-proto/src/digest.rs
 pub fn sha256_hex(data: &[u8]) -> String;  pub struct Sha256Stream; impl Sha256Stream { pub fn new() -> Self; pub fn update(&mut self, b: &[u8]); pub fn hex(self) -> String; }
@@ -3639,13 +3639,20 @@ pub const CLI_VERSION: &str = match option_env!("SW_BUNDLE_VERSION") { Some(v) =
 |---|---|
 | `launcher_argv_python_entry_absolute_and_tail_preserved` | manifest entry `["py/bin/python3","-I","-B","py/serialwrapd.py"]`、tail `["--socket","/s","--lock","/l"]` → `[<dir>/py/bin/python3,"-I","-B",<dir>/py/serialwrapd.py,"--socket","/s","--lock","/l"]`（含空白與非 ASCII 的 tail 原樣保留） |
 | `launcher_argv_matches_multi_open_rule2` | 結果 argv 以 `is_serialwrapd_argv(.., Posix)` 判定為 true |
+| `launcher_argv_preserves_shell_argument_containing_slash` | `sh -c` 腳本 `echo a/b` 原樣保留，不當成 manifest 相對路徑 |
+| `launcher_rejects_bare_program_that_would_search_path` | `entry[0]` 為 bare executable 名稱時 fail closed，不讓 Windows `CreateProcessW` 搜尋 PATH |
 | `launcher_rejects_rust_implementation_in_stage1` | `implementation:"rust"` → `UnsupportedImplementation`、stderr 一行、exit 2 |
+| `launcher_current_release_pointer_selects_version_manifest` | `bin/current-release.json` 指向 `versions/<v>`；穩定入口使用該版本 manifest，且不要求 root manifest |
+| `launcher_manifest_errors_do_not_expose_debug_variant` | 無效 JSON 錯誤顯示原因，不洩漏 `InvalidJson(...)` debug 包裝 |
+| `launcher_process_start_error_names_program_without_manifest_label` | exec 失敗訊息包含 argv0，且不誤標成 manifest 錯誤 |
+| `executable_file_busy_retries_until_spawn_succeeds` | 測試替身注入兩次 `ExecutableFileBusy`，spawn helper 重試後成功；launcher 子程序啟動走同一重試 helper |
 | `launcher_posix_exec_replaces_process`（POSIX 真實） | 以 helper manifest 指向 `sh -c 'echo $$'` → 印出的 pid 等於 launcher 子行程 pid（execve） |
 | `launcher_exit_code_passthrough`（POSIX 與原生 Windows） | entry 為 `exit 7` 的 helper → launcher exit 7 |
-| `launcher_windows_parent_kill_kills_child`（原生 Windows） | `TerminateProcess(launcher)` 後 1 s 內 Python helper 已結束（Job Object kill-on-close） |
-| `launcher_windows_gui_subsystem`（原生 Windows） | `objdump -p serialwrapd.exe` 的 `Subsystem` 為 `Windows GUI`；從 `windows-task` 啟動不產生 console 視窗（以 `GetConsoleWindow()==NULL` 的 helper 回報） |
+| `launcher::tests::current_release_resolves_manifest_from_memfs` | MemFs 測試 `bin/current-release.json` 的版本目錄解析 |
+| `cap_windows_native__launcher_parent_kill_kills_child`（原生 Windows） | `TerminateProcess(launcher)` 後 1 s 內 Python helper 已結束（Job Object kill-on-close；ignored 案例由 `windows_native` capability gate 執行） |
+| `cap_windows_native__launcher_gui_subsystem`（原生 Windows） | 自含 PE Optional Header 解析器讀 `Subsystem==2`；從 `windows-task` 等價的無 console 情境啟動後 `GetConsoleWindow()==NULL`。解析器直接讀 PE 欄位，取代依賴 host `objdump -p`，欄位與檢查目的相同 |
 
-`tests/test_rust_mkbundle.py` 追加：`test_bundle_python_run_leaves_tree_unchanged`（R5 審查後續，`process_rpc`）：`mkbundle.sh --dev` 建 bundle → `find <bundle>/versions/$V -type l` 為空；記 P9 Task 3 同演算法的 `bundle_tree_sha256`（stdlib 重算）→ 以 `bin/serialwrapd --socket <tmp>/s --lock <tmp>/l` 啟動 daemon、等 `health.ping` ok、經 Rust CLI 跑一次委派命令（`serialwrap session list`）與 `daemon stop` → 樹內無 `__pycache__`／`*.pyc` 新增、指紋與啟動前相同；把 entry 的 `-B` 拿掉的對照組必紅；`test_bundle_py_is_self_contained`（`py/` 下無 `*.pth` 指向 repo；`py/bin/python3 -I -c "import sw_core,os;print(os.path.dirname(sw_core.__file__))"` 位於 bundle 內）、`test_bundle_two_versions_have_distinct_tree_sha256`（`--version-override 0.4.0` 與 `0.4.1`：`--version` 分別為 `serialwrap 0.4.0`／`0.4.1`、bundle 內 Python `serialwrap --version` 相同、兩者 `tree_sha256` 不同、`pairing` 兩欄等於各自版本）、`test_bundle_daemon_components_and_sha256sums`（manifest 含 `launcher`／`runtime`／`package.tree_sha256`；`SHA256SUMS` 每行與實際檔案相符）、`test_bundle_launcher_starts_python_daemon`（隔離 env 下 `bin/serialwrapd --socket <tmp>/s --lock <tmp>/l --profile-dir <tmp>/p` 啟動後 `health.ping` ok、`ProcScan` 視為 1 個實例）。
+`tests/test_rust_mkbundle.py` 追加：`test_bundle_python_run_leaves_tree_unchanged`（R5 審查後續，`process_rpc`）：`mkbundle.sh --dev` 建 bundle → `find <bundle>/versions/$V -type l` 為空；記 P9 Task 3 同演算法的 `bundle_tree_sha256`（stdlib 重算）→ 以 `bin/serialwrapd --socket <tmp>/s --lock <tmp>/l` 啟動 daemon、等 `health.ping` ok、經 Rust CLI 跑一次委派命令（`serialwrap session list`）與 `daemon stop` → 樹內無 `__pycache__`／`*.pyc` 新增、指紋與啟動前相同；把 entry 的 `-B` 拿掉的對照組必紅；`test_bundle_py_is_self_contained`（`py/` 下無 `*.pth` 指向 repo；`py/bin/python3 -I -c "import sw_core,os;print(os.path.dirname(sw_core.__file__))"` 位於 bundle 內，確認實際載入的 `site-packages/sw_core` 樹與 manifest 的 `package.tree_sha256` 相符且部署檔列於 `SHA256SUMS`）、`test_bundle_two_versions_have_distinct_tree_sha256`（`--version-override 0.4.0` 與 `0.4.1`：`--version` 分別為 `serialwrap 0.4.0`／`0.4.1`、bundle 內 Python `serialwrap --version` 相同、兩者 `tree_sha256` 不同、`pairing` 兩欄等於各自版本；再啟動 0.4.0 daemon 執行 `session list`，stderr 不得出現版本不一致警告）、`test_bundle_daemon_components_and_sha256sums`（manifest 含 `launcher`／`runtime`／`package.tree_sha256`；`SHA256SUMS` 每行與實際檔案相符）、`test_bundle_launcher_starts_python_daemon`（隔離 env 下 `bin/serialwrapd --socket <tmp>/s --lock <tmp>/l --profile-dir <tmp>/p` 啟動後 `health.ping` ok、`ProcScan` 視為 1 個實例）。
 
 - [ ] **步驟 2：執行並確認 FAIL**：`cargo test -p sw-proto --test yaml_emit --test bench_registry; cargo test -p sw-daemon --test launcher` → `not implemented: P4-T17`；`python3 -m pytest -q tests/test_rust_mkbundle.py --runxfail` 追加案例失敗。
 - [ ] **步驟 3：實作**：依 Produces；`gen_yaml_golden.py` 先產 golden 並 commit；`launcher::run` 不讀 `PATH`、不讀 `SERIALWRAP_*` 以外的設定；`exec_or_wait_opts` 的 Windows 實作只在 `sw-pal/src/process/windows.rs`。
@@ -3654,7 +3661,8 @@ pub const CLI_VERSION: &str = match option_env!("SW_BUNDLE_VERSION") { Some(v) =
 ```bash
 python3 scripts/rust/goldens/gen_yaml_golden.py --check
 cargo test -p sw-proto --test yaml_emit --test bench_registry && cargo test -p sw-daemon --test launcher
-scripts/rust/win-test.sh --package sw-daemon -- launcher
+scripts/rust/win-test.sh --caps windows_native --package sw-daemon -- launcher
+cargo test -p sw-daemon --lib
 python3 -m pytest -q tests/test_rust_mkbundle.py
 python3 scripts/rust/check_cfg_boundary.py
 ```
@@ -3664,6 +3672,8 @@ python3 scripts/rust/check_cfg_boundary.py
 **BLOCKED-OWNER：**
 - 正式 Windows bundle 的 bundled Python runtime（非 venv）由擁有者 Windows 自架 runner 產生並原生 build launcher；本環境只驗 dev bundle。
 - OD-08：本 Task 動到 PAL（`exec_or_wait_opts`），PR 必附原生 Windows COM handle 證據；OD-15 起為可執行 gate（擁有者 host `SW_TEST_COM_PAIR=COM20:COM21`＋OD-11 隔離實例、allowlist `COM20`，orchestrator 代跑；host 不可用才記「證據不足」）。
+- Windows `STARTF_USESTDHANDLES` 會讓 PAL 的共用 `exec_or_wait_opts` 轉交父行程標準 handle（CLI delegate 也走此原語）；僅在三個 handle 都有效時啟用，其他呼叫保留既有預設。
+- Task 11 `verify_bundle` 尚未實作；本 Task 的 bundle 測試只證明實際載入的 `site-packages/sw_core` 與 manifest 樹指紋一致且每個部署檔受 `SHA256SUMS` 覆蓋，不宣稱完成 Task 11 的 runtime verifier。
 
 ---
 

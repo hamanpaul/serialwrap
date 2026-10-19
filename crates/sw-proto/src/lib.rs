@@ -2,6 +2,7 @@
 pub mod bench_registry;
 pub mod config_types;
 pub mod constants;
+pub mod digest;
 pub mod endpoint;
 pub mod error_codes;
 pub mod pycompat;

@@ -110,7 +110,7 @@ def test_venv_python_runs_cli_version(bundle):
     out = bundle.out()
     py = out / "versions" / VERSION / "py" / "bin" / "python3"
     r = subprocess.run(
-        [str(py), "-I", "-m", "sw_core.cli", "--version"],
+        [str(py), "-I", "-B", "-m", "sw_core.cli", "--version"],
         capture_output=True,
         text=True,
         check=False,
@@ -155,9 +155,10 @@ def test_daemon_block_fields_nonempty_and_dev_bundle_shape(bundle):
     d = _manifest(out)["components"]["daemon"]
     assert d["git_revision"]
     assert d["launcher"]["sha256"] and d["runtime"]["sha256"] and d["package"]["tree_sha256"]
-    # dev bundle 沒有 Rust launcher 與 wheel：launcher 指向 repo 的 serialwrapd.py，wheel_sha256 為 null
-    assert Path(d["launcher"]["path"]) == REPO / "serialwrapd.py"
-    assert d["launcher"]["sha256"] == _sha256(REPO / "serialwrapd.py")
+    # dev bundle 的 Rust launcher 指向版本目錄內的 serialwrapd，且不含 wheel。
+    launcher = out / "versions" / VERSION / "bin" / "serialwrapd"
+    assert d["launcher"]["path"] == "bin/serialwrapd"
+    assert d["launcher"]["sha256"] == _sha256(launcher)
     assert d["package"]["wheel_sha256"] is None
     assert d["runtime"]["python_version"] == _meta_python_version()
 
@@ -250,13 +251,6 @@ def test_help_lists_supported_options_without_building():
     assert result.returncode == 0, result.stderr
     for option in ("--target", "--profile", "--out", "--print-dir"):
         assert option in result.stdout
-
-
-# ---------------------------------------------------------------------------
-# P4-T17：sw-daemon launcher 與自含式 dev bundle（紅燈；strict xfail，P4-T17 實作完成的同一 commit 移除 marker）
-# ---------------------------------------------------------------------------
-
-P4_T17_RED = pytest.mark.xfail(strict=True, reason="P4-T17 紅燈")
 
 
 def _build_bundle(out: Path, version_override: str | None = None) -> Path:
@@ -399,6 +393,7 @@ def _run_daemon_session(bundle_root: Path, env: dict, work: Path) -> None:
                 check=False,
             )
             assert listed.returncode == 0, f"委派命令 session list 失敗：{listed.stderr.strip()}"
+            assert listed.stderr == "", f"session list 不應出現錯誤的版本警告：{listed.stderr!r}"
             stopped = subprocess.run(
                 [str(bundle_root / "bin" / "serialwrap"), "daemon", "stop"],
                 env=cli_env,
@@ -416,7 +411,6 @@ def _run_daemon_session(bundle_root: Path, env: dict, work: Path) -> None:
         shutil.rmtree(sockdir, ignore_errors=True)
 
 
-@P4_T17_RED
 def test_bundle_python_run_leaves_tree_unchanged(tmp_path):
     out = _build_bundle(tmp_path / "bundle dir")
     vdir = _vdir(out)
@@ -451,7 +445,6 @@ def test_bundle_python_run_leaves_tree_unchanged(tmp_path):
     assert ctrl_new, "對照組（entry 無 -B）未產生位元組碼：上方檢測無法證明有效"
 
 
-@P4_T17_RED
 def test_bundle_py_is_self_contained(tmp_path):
     out = _build_bundle(tmp_path / "bundle dir")
     py_dir = _vdir(out) / "py"
@@ -470,9 +463,16 @@ def test_bundle_py_is_self_contained(tmp_path):
     assert r.returncode == 0, r.stderr
     loaded = Path(r.stdout.strip()).resolve()
     assert loaded.is_relative_to(py_dir.resolve()), f"sw_core 必須由 bundle 內的 py/ 提供，實際載入 {loaded}"
+    assert loaded.name == "sw_core" and loaded.parent.name == "site-packages", (
+        f"隔離模式實際載入的 sw_core 應位於 bundle site-packages：{loaded}"
+    )
+    manifest = _manifest(out)
+    package_hash = manifest["components"]["daemon"]["package"]["tree_sha256"]
+    assert _tree_sha256_stdlib(loaded.parent, "sw_core") == package_hash, (
+        "實際匯入的 site-packages/sw_core 必須與 manifest 套件樹指紋相同"
+    )
 
 
-@P4_T17_RED
 def test_bundle_two_versions_have_distinct_tree_sha256(tmp_path):
     versions = ("0.4.0", "0.4.1")
     fingerprints: dict[str, str] = {}
@@ -501,11 +501,12 @@ def test_bundle_two_versions_have_distinct_tree_sha256(tmp_path):
         assert m["bundle_version"] == version
         assert m["pairing"] == {"rule": "exact", "cli_version": version, "daemon_version": version}
         fingerprints[version] = _tree_sha256_stdlib(vdir)
+        if version == "0.4.0":
+            _run_daemon_session(out, _harness_env(tmp_path / "override-iso"), tmp_path / "override-daemon")
 
     assert fingerprints["0.4.0"] != fingerprints["0.4.1"], "不同版本的 bundle_tree_sha256 必須不同"
 
 
-@P4_T17_RED
 def test_bundle_daemon_components_and_sha256sums(bundle):
     out = bundle.out()
     vdir = _vdir(out)
@@ -540,7 +541,6 @@ def test_bundle_daemon_components_and_sha256sums(bundle):
     assert not missing, f"SHA256SUMS 漏列部署檔：{missing[:10]}"
 
 
-@P4_T17_RED
 def test_bundle_launcher_starts_python_daemon(bundle, tmp_path):
     out = bundle.out()
     launcher = out / "bin" / "serialwrapd"

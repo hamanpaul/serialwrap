@@ -42,6 +42,12 @@ use sw_proto::error_codes::ErrorCode;
 use sw_proto::pypath::{HomeLookup, PathFlavor};
 use sw_proto::runtime_paths::{EnvSnapshot, NativeTraits, PathsError, RuntimePaths};
 
+/// CLI 版本；bundle 以同一個編譯輸入配對 CLI 與 daemon。
+pub const CLI_VERSION: &str = match option_env!("SW_BUNDLE_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 /// `cli.py` `_JSON_BOUNDARY_GLOBAL_OPTIONS`（逐字）。
 const JSON_BOUNDARY_GLOBAL_OPTIONS: [&str; 5] = [
     "--socket",
@@ -116,7 +122,7 @@ pub fn run(
         paths,
         io,
         verbose: 0,
-        cli_version: sw_proto::version::version(),
+        cli_version: CLI_VERSION,
     };
 
     let tail: &[OsString] = argv.get(1..).unwrap_or(&[]);
@@ -125,7 +131,7 @@ pub fn run(
     }
 
     let spec = root_spec(&SpecDefaults {
-        version_line: sw_proto::version::version_line(),
+        version_line: format!("serialwrap {CLI_VERSION}"),
         profile_dir: ctx.paths.profile_dir.clone(),
         lock_path: ctx.paths.lock_path.clone(),
     });

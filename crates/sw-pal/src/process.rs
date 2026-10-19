@@ -7,6 +7,15 @@ pub mod posix;
 #[cfg(windows)]
 pub mod windows;
 
+/// 前景執行程序的啟動選項。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExecOpts {
+    /// Windows 下不建立 console 視窗。
+    pub no_window: bool,
+    /// Windows 下以 Job Object 確保 launcher 結束時清除子行程。
+    pub kill_on_close: bool,
+}
+
 /// `ProcessCtl::spawn_elevated` 的結果（P4-T19，SC-36，OD-15）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ElevatedOutcome {

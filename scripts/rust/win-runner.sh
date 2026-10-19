@@ -109,6 +109,11 @@ if [[ -n "${SW_WIN_EXTRA_FILES:-}" ]]; then
   done
 fi
 
+if [[ -f "$staging/serialwrapd.exe" ]]; then
+  SW_TEST_SERIALWRAPD="$(wslpath -w "$staging/serialwrapd.exe")"
+  export SW_TEST_SERIALWRAPD
+fi
+
 export SW_TEST_DATA_DIR="$staging/data"
 export TMP="$staging/tmp"
 export TEMP="$staging/tmp"
@@ -131,7 +136,7 @@ append_wsl_env() {
   wsl_env="${wsl_env//::/:}"
 }
 
-for name in SW_TEST_CAPS SW_TEST_COM_PAIR SW_TEST_SEED RUST_BACKTRACE RUST_TEST_THREADS; do
+for name in SW_TEST_CAPS SW_TEST_COM_PAIR SW_TEST_SEED SW_TEST_SERIALWRAPD RUST_BACKTRACE RUST_TEST_THREADS; do
   [[ -v "$name" ]] && append_wsl_env "${name}"
 done
 while IFS= read -r name; do

@@ -4,9 +4,9 @@
 //! 每列 `{"input": <JSON 值>, "allow_unicode": bool, "out": "<PyYAML 輸出>"}`；`sort_keys` 固定為 true。
 //! 本檔不使用 `CARGO_MANIFEST_DIR`（`check_cfg_boundary` 的 test-data-path 規則），改以 `include_str!` 內嵌語料。
 
-use sw_proto::pyjson::{self, PyValue};
+use sw_proto::pyjson::{self, PyInt, PyValue};
 use sw_proto::yaml11::emit::safe_dump;
-use sw_proto::yaml11::{YMap, YValue};
+use sw_proto::yaml11::{safe_load, YMap, YValue};
 
 const GOLDEN: &str = include_str!("golden/yaml_emit.ndjson");
 const MIN_ROWS: usize = 150;
@@ -64,4 +64,62 @@ fn yaml_emit_matches_pyyaml_golden() {
         fails.len(),
         fails[..fails.len().min(20)].join("\n\n")
     );
+}
+
+#[test]
+fn nested_sequence_mapping_round_trips_without_extra_sequence() {
+    let value = YValue::Seq(vec![YValue::Seq(vec![YValue::Map(YMap(vec![(
+        YValue::Str("a".into()),
+        YValue::Int(PyInt::Small(1)),
+    )]))])]);
+    let dumped = safe_dump(&value, true, true);
+    assert_eq!(dumped, "- - a: 1\n");
+    assert_eq!(safe_load(&dumped).expect("輸出應可解析"), value);
+}
+
+#[test]
+fn non_string_scalar_mapping_keys_are_sorted() {
+    let map = YValue::Map(YMap(vec![
+        (YValue::Int(PyInt::Small(2)), YValue::Str("two".into())),
+        (YValue::Int(PyInt::Small(1)), YValue::Str("one".into())),
+    ]));
+    assert_eq!(safe_dump(&map, true, true), "1: one\n2: two\n");
+}
+
+#[test]
+fn boolean_float_and_timestamp_mapping_keys_are_sorted() {
+    let numeric = YValue::Map(YMap(vec![
+        (YValue::Float(2.0), YValue::Str("two".into())),
+        (YValue::Bool(true), YValue::Str("one".into())),
+        (YValue::Bool(false), YValue::Str("zero".into())),
+        (YValue::Int(PyInt::Small(-1)), YValue::Str("negative".into())),
+    ]));
+    assert_eq!(
+        safe_dump(&numeric, true, true),
+        "-1: negative\nfalse: zero\ntrue: one\n2.0: two\n"
+    );
+
+    let timestamps = YValue::Map(YMap(vec![
+        (
+            YValue::Timestamp {
+                py_str: "2002-01-01".into(),
+            },
+            YValue::Str("later".into()),
+        ),
+        (
+            YValue::Timestamp {
+                py_str: "2001-01-01".into(),
+            },
+            YValue::Str("earlier".into()),
+        ),
+    ]));
+    assert_eq!(
+        safe_dump(&timestamps, true, true),
+        "2001-01-01: earlier\n2002-01-01: later\n"
+    );
+}
+
+#[test]
+fn root_binary_has_no_document_end_marker() {
+    assert_eq!(safe_dump(&YValue::Binary(b"abc".to_vec()), true, true), "!!binary |\n  YWJj\n");
 }

@@ -199,3 +199,26 @@ fn resolve_unknown_code_is_rejected() {
     assert_eq!(err.code, "UNKNOWN_BENCH_CODE");
     assert_eq!(err.message, "unknown bench code: nope");
 }
+
+#[test]
+fn yaml_syntax_errors_keep_internal_error_classification() {
+    let error = load_benches("benches: [\n").expect_err("YAML 語法錯誤應失敗");
+    assert_eq!(error.code, "INTERNAL_ERROR");
+}
+
+#[test]
+fn strings_strip_python_control_whitespace() {
+    let benches = load_benches(
+        r#"benches:
+  "\x1c dut \x1c":
+    target: "\x1cuser@host\x1c"
+    remote_socket: /run/s
+    local_port: 2222
+    ssh_opts: []
+    autossh: false
+"#,
+    )
+    .expect("Python str.strip 應移除 U+001C");
+    assert!(benches.contains_key("dut"));
+    assert_eq!(benches["dut"].target, "user@host");
+}

@@ -1,5 +1,6 @@
 //! Windows CreateProcess 與 Job Object 委派。
 
+use crate::process::ExecOpts;
 use crate::traits::{windows_win32_error, PalError, PalErrorKind, ProcessCtl};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -10,8 +11,12 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::ptr;
 use std::sync::{Arc, Mutex};
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_OBJECT_0};
-use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+};
+use windows_sys::Win32::System::Console::{
+    GetStdHandle, SetConsoleCtrlHandler, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -19,8 +24,8 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, GetExitCodeProcess, ResumeThread, TerminateProcess, WaitForSingleObject,
-    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS,
-    INFINITE, PROCESS_INFORMATION, STARTUPINFOW,
+    CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+    DETACHED_PROCESS, INFINITE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -36,6 +41,22 @@ impl ProcessCtl for NativeProcessCtl {
     }
 
     fn exec_or_wait(&self, argv: &[OsString], env_add: &[(String, String)]) -> PalError {
+        self.exec_or_wait_opts(
+            argv,
+            env_add,
+            ExecOpts {
+                no_window: false,
+                kill_on_close: true,
+            },
+        )
+    }
+
+    fn exec_or_wait_opts(
+        &self,
+        argv: &[OsString],
+        env_add: &[(String, String)],
+        opts: ExecOpts,
+    ) -> PalError {
         if argv.is_empty() {
             return windows_win32_error(87);
         }
@@ -58,6 +79,25 @@ impl ProcessCtl for NativeProcessCtl {
         let mut environment = environment_block(env_add);
         let mut startup = STARTUPINFOW::default();
         startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        // GUI launcher 無 console 時仍須把由父行程繼承的 pipe／檔案 handle 傳給 helper。
+        // 沒有三個有效 handle（例如 windows-task 無 console 啟動）時保留系統預設。
+        // SAFETY: GetStdHandle 只讀取目前行程的預定標準 handle；後續只在三者皆非空且有效時轉交，未解參考 handle。
+        let std_handles = unsafe {
+            [
+                GetStdHandle(STD_INPUT_HANDLE),
+                GetStdHandle(STD_OUTPUT_HANDLE),
+                GetStdHandle(STD_ERROR_HANDLE),
+            ]
+        };
+        if std_handles
+            .iter()
+            .all(|handle| !handle.is_null() && *handle != INVALID_HANDLE_VALUE)
+        {
+            startup.dwFlags |= STARTF_USESTDHANDLES;
+            startup.hStdInput = std_handles[0];
+            startup.hStdOutput = std_handles[1];
+            startup.hStdError = std_handles[2];
+        }
         let mut process_info = PROCESS_INFORMATION::default();
 
         // SAFETY: 所有 UTF-16 緩衝區皆以 NUL 結尾，且呼叫期間保持可寫並有效。
@@ -68,7 +108,9 @@ impl ProcessCtl for NativeProcessCtl {
                 ptr::null(),
                 ptr::null(),
                 1,
-                CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+                CREATE_SUSPENDED
+                    | CREATE_UNICODE_ENVIRONMENT
+                    | if opts.no_window { CREATE_NO_WINDOW } else { 0 },
                 environment.as_mut_ptr().cast(),
                 ptr::null(),
                 &startup,
@@ -80,37 +122,42 @@ impl ProcessCtl for NativeProcessCtl {
             return unsafe { windows_win32_error(GetLastError()) };
         }
 
-        // SAFETY: NULL attributes 與名稱建立匿名 Job Object。
-        let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
-        if job.is_null() {
-            let error = last_error();
-            terminate_and_close(&process_info, ptr::null_mut());
-            return error;
-        }
-        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags =
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
-        // SAFETY: limits 為正確大小且完整初始化的 Job Object 結構。
-        let configured = unsafe {
-            SetInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
+        let job = if opts.kill_on_close {
+            // SAFETY: NULL attributes 與名稱建立匿名 Job Object。
+            let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
+            if job.is_null() {
+                let error = last_error();
+                terminate_and_close(&process_info, ptr::null_mut());
+                return error;
+            }
+            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            limits.BasicLimitInformation.LimitFlags =
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
+            // SAFETY: limits 為正確大小且完整初始化的 Job Object 結構。
+            let configured = unsafe {
+                SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            };
+            if configured == 0 {
+                let error = last_error();
+                terminate_and_close(&process_info, job);
+                return error;
+            }
+            // SAFETY: process_info.hProcess 與 job 均由本次 Win32 建立呼叫取得。
+            let assigned = unsafe { AssignProcessToJobObject(job, process_info.hProcess) };
+            if assigned == 0 {
+                let error = last_error();
+                terminate_and_close(&process_info, job);
+                return error;
+            }
+            job
+        } else {
+            ptr::null_mut()
         };
-        if configured == 0 {
-            let error = last_error();
-            terminate_and_close(&process_info, job);
-            return error;
-        }
-        // SAFETY: process_info.hProcess 與 job 均由本次 Win32 建立呼叫取得。
-        let assigned = unsafe { AssignProcessToJobObject(job, process_info.hProcess) };
-        if assigned == 0 {
-            let error = last_error();
-            terminate_and_close(&process_info, job);
-            return error;
-        }
         // SAFETY: 將忽略 Ctrl-C 的旗標設在子行程建立後，避免旗標被子行程繼承。
         if unsafe { SetConsoleCtrlHandler(None, 1) } == 0 {
             let error = last_error();
@@ -137,11 +184,13 @@ impl ProcessCtl for NativeProcessCtl {
         let got_code = unsafe { GetExitCodeProcess(process_info.hProcess, &mut exit_code) };
         let exit_error = (got_code == 0).then(last_error);
         restore_ctrl_handler();
-        // SAFETY: 這三個 handle 均由此函式建立，且各關閉一次。
+        // SAFETY: thread 與 process handle 各關閉一次；Job Object 若建立也只關閉一次。
         unsafe {
             CloseHandle(process_info.hThread);
             CloseHandle(process_info.hProcess);
-            CloseHandle(job);
+            if !job.is_null() {
+                CloseHandle(job);
+            }
         }
         if let Some(error) = exit_error {
             return error;

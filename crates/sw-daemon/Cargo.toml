@@ -14,3 +14,6 @@ path = "src/main.rs"
 sw-core = { path = "../sw-core" }
 sw-proto = { path = "../sw-proto" }
 sw-pal = { path = "../sw-pal" }
+
+[dev-dependencies]
+sw-pal = { path = "../sw-pal", features = ["test-fakes"] }
