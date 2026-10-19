@@ -5,7 +5,7 @@
   ],
   "columns": 40,
   "rc": 0,
-  "stdout": "usage: serialwrap device [-h]\n                         <command> ...\n\n管理實體 UART 裝置：列舉裝置，以及把 raw device\n暫時交給外部工具獨佔再收回。\n\npositional arguments:\n  <command>\n    list      列出實體 UART 裝置（real_path 與\n              by-id）\n    release   釋放 raw 裝置給外部工具獨佔（如 MCU\n              燒錄），進入 RELEASED 不自動搶回\n    attach    收回先前 release 的裝置並重建\n              console（外部仍持有時回 DEVICE_S\n              TILL_HELD，--force 略過）\n\noptions:\n  -h, --help  show this help message\n              and exit\n",
+  "stdout": "usage: serialwrap device [-h]\n                         <command> ...\n\n管理實體 UART 裝置：列舉裝置，以及把 raw device\n暫時交給外部工具獨佔再收回。\n\npositional arguments:\n  <command>\n    list      列出實體 UART 裝置（real_path 與\n              by-id）\n    release   釋放 raw 裝置給外部工具獨佔（如 MCU\n              燒錄），進入 RELEASED 不自動搶回\n    attach    收回先前 release 的裝置並重建\n              console（--force\n              只略過開檔前預檢，不會搶占已識別的外部持有者）\n\noptions:\n  -h, --help  show this help message\n              and exit\n",
   "stderr": "",
   "native": true,
   "post_parse_effects": false

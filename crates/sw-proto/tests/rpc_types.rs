@@ -31,11 +31,13 @@ fn retry_whitelist_is_exactly_11() {
     assert!(!Method::SessionInteractiveStatus.is_retryable_readonly());
 }
 
+// 測試名稱為 l1_required.lock.json 凍結的 nodeid，不得改名；P1 主線（#123 延伸）把
+// device.release／device.attach／session.clear／session.bind 併入長操作，集合由 4 增為 8。
 #[test]
 fn long_timeout_is_exactly_4() {
     let l = set(Method::known().iter().filter(|m| Method::parse(m).uses_long_timeout()).copied());
     assert_eq!(l, set(sw_proto::constants::LONG_RPC_METHODS));
-    assert_eq!(l.len(), 4);
+    assert_eq!(l.len(), 8);
 }
 
 #[test]

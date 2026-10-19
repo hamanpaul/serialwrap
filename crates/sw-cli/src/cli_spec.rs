@@ -84,7 +84,7 @@ fn spec_device() -> ParserSpec {
         ],
         sub: None,
     })) },
-                SubparserEntry { name: "attach", help: Some("收回先前 release 的裝置並重建 console（外部仍持有時回 DEVICE_STILL_HELD，--force 略過）"), target: SubTarget::Native(Box::new(ParserSpec {
+                SubparserEntry { name: "attach", help: Some("收回先前 release 的裝置並重建 console（--force 只略過開檔前預檢，不會搶占已識別的外部持有者）"), target: SubTarget::Native(Box::new(ParserSpec {
         prog: "serialwrap device attach".to_string(),
         description: None,
         epilog: None,
@@ -1515,7 +1515,7 @@ fn spec_skill() -> ParserSpec {
 fn spec_daemon(d: &SpecDefaults) -> ParserSpec {
     ParserSpec {
         prog: "serialwrap daemon".to_string(),
-        description: Some("管理 serialwrap daemon 行程：啟動、停止與查詢執行狀態。"),
+        description: Some("管理 serialwrap daemon 行程：啟動、停止、重啟與查詢執行狀態。"),
         epilog: None,
         raw_text: false,
         raw_description: false,
@@ -1569,6 +1569,24 @@ fn spec_daemon(d: &SpecDefaults) -> ParserSpec {
                         sub: None,
                     }
                 )) },
+                SubparserEntry { name: "restart", help: Some("重啟 daemon（systemd 模式重導 service restart）"), target: SubTarget::Native(Box::new(
+                    ParserSpec {
+                        prog: "serialwrap daemon restart".to_string(),
+                        description: None,
+                        epilog: None,
+                        raw_text: false,
+                        raw_description: false,
+                        add_help: true,
+                        allow_abbrev: true,
+                        actions: vec![
+                            ActionSpec { option_strings: vec!["-h", "--help"], dest: "help", kind: ActionKind::Help, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("show this help message and exit".to_string()), metavar: None, version: None },
+                            ActionSpec { option_strings: vec!["--with-sudo"], dest: "with_sudo", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("systemd-system 模式下，daemon restart 重導至 service restart 時以 sudo 執行".to_string()), metavar: None, version: None },
+                        ],
+                        mutex: vec![
+                        ],
+                        sub: None,
+                    }
+                )) },
                 SubparserEntry { name: "status", help: Some("顯示 daemon 狀態（pid／sessions／devices／log 路徑／多開偵測 multi_open）"), target: SubTarget::Native(Box::new(
                     ParserSpec {
                         prog: "serialwrap daemon status".to_string(),
@@ -1600,6 +1618,7 @@ fn spec_remote(_d: &SpecDefaults) -> ParserSpec {
   serialwrap remote -L user@relay:7777    # connect（relay/雙 NAT）
   serialwrap remote                        # 列目前隧道（status）
   serialwrap remote close 7777|all         # 拆除
+  serialwrap remote stop [port|all]        # close 的別名，省略時拆除全部
 安全：只透過 ssh-tunnel、單租戶/可信 relay 或 --remote-socket；不可對網路直接開放。"),
         epilog: None,
         raw_text: false,
@@ -1615,7 +1634,7 @@ fn spec_remote(_d: &SpecDefaults) -> ParserSpec {
             ActionSpec { option_strings: vec!["--remote-socket"], dest: "remote_socket", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("硬化：-R 建遠端 unix socket／-L 連該 socket（共享 relay 建議）".to_string()), metavar: None, version: None },
             ActionSpec { option_strings: vec!["--ready-timeout"], dest: "ready_timeout", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Float, default: ArgValue::Float(10.0), choices: None, required: false, help: Some("readiness 確認上限秒數（逾時回 starting）".to_string()), metavar: None, version: None },
             ActionSpec { option_strings: vec!["--ssh-opt"], dest: "ssh_opt", kind: ActionKind::Append, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::List(vec![]), choices: None, required: false, help: Some("透傳額外 ssh 參數（可重複），如 --ssh-opt=-p --ssh-opt=2222".to_string()), metavar: None, version: None },
-            ActionSpec { option_strings: vec![], dest: "words", kind: ActionKind::Store, nargs: Nargs::ZeroOrMore, conv: Conv::Str, default: ArgValue::None, choices: None, required: true, help: Some("[user@]host:port ｜ status ｜ close <port|all>".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec![], dest: "words", kind: ActionKind::Store, nargs: Nargs::ZeroOrMore, conv: Conv::Str, default: ArgValue::None, choices: None, required: true, help: Some("[user@]host:port ｜ status ｜ close/stop [port|all]".to_string()), metavar: None, version: None },
         ],
         mutex: vec![
         ],
@@ -1777,7 +1796,7 @@ pub fn root_spec(d: &SpecDefaults) -> ParserSpec {
             ActionSpec { option_strings: vec!["--socket"], dest: "socket", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("本機 daemon 的 Unix socket 路徑（未指定時依 config.yaml 與 XDG 執行期目錄解析，可用 SERIALWRAP_RUN_DIR 覆寫）".to_string()), metavar: None, version: None },
             ActionSpec { option_strings: vec!["--endpoint"], dest: "endpoint", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）".to_string()), metavar: Some(sw_proto::constants::METAVAR_ENDPOINT), version: None },
             ActionSpec { option_strings: vec!["--bench"], dest: "bench", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("使用 connect 記住的 bench 代號解析 endpoint（優先序低於 --endpoint/--socket，高於 config fallback）".to_string()), metavar: Some(sw_proto::constants::METAVAR_CODE), version: None },
-            ActionSpec { option_strings: vec!["--timeout"], dest: "timeout_s", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Float, default: ArgValue::None, choices: None, required: false, help: Some("RPC timeout 秒數（未指定：一般方法 5.0；長操作 session attach/recover/self-test/console-attach 自動採固定 45.0 的 floor，#123）".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec!["--timeout"], dest: "timeout_s", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Float, default: ArgValue::None, choices: None, required: false, help: Some("RPC timeout 秒數（未指定：一般方法 5.0；長操作 session attach/recover/self-test/console-attach、device release/attach、session clear/bind 自動採固定 45.0 的 floor，#123）".to_string()), metavar: None, version: None },
             ActionSpec { option_strings: vec!["--retries"], dest: "retries", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Int, default: ArgValue::Int(sw_proto::pyjson::PyInt::Small(0)), choices: None, required: false, help: Some("TIMEOUT／連線失敗時的重試次數，僅作用於冪等唯讀方法白名單（指數退避 0.5s 起、單次上限 5s；預設: 0）".to_string()), metavar: None, version: None },
         ],
         mutex: vec![
@@ -1785,7 +1804,7 @@ pub fn root_spec(d: &SpecDefaults) -> ParserSpec {
         sub: None,
     };
     let group_help: [&str; 20] = [
-        "管理 serialwrap daemon（啟動／停止／狀態）",
+        "管理 serialwrap daemon（啟動／停止／重啟／狀態）",
         "實體 UART 裝置列舉與 handoff（release／attach）",
         "session 生命週期、探測、recover、console 與 interactive 操作",
         "session 別名與 by-id 綁定管理",

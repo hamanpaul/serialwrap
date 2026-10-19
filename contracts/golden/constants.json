@@ -7,7 +7,11 @@
   "cli.DEFAULT_RPC_TIMEOUT_S": 5.0,
   "cli.ENDPOINT_PROBE_TIMEOUT_S": 0.2,
   "cli.LONG_RPC_METHODS": [
+    "device.attach",
+    "device.release",
     "session.attach",
+    "session.bind",
+    "session.clear",
     "session.console_attach",
     "session.recover",
     "session.self_test"

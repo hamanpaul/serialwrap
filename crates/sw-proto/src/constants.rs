@@ -50,11 +50,15 @@ pub const DEFAULT_RPC_TIMEOUT_S: f64 = 5.0;
 /// 長 RPC 逾時下限秒數（`cli.LONG_RPC_TIMEOUT_FLOOR_S`）。
 pub const LONG_RPC_TIMEOUT_FLOOR_S: f64 = 45.0;
 /// 使用長逾時的方法（`cli.LONG_RPC_METHODS`）。
-pub const LONG_RPC_METHODS: [&str; 4] = [
+pub const LONG_RPC_METHODS: [&str; 8] = [
     "session.recover",
     "session.attach",
     "session.self_test",
     "session.console_attach",
+    "device.release",
+    "device.attach",
+    "session.clear",
+    "session.bind",
 ];
 
 /// endpoint 存活探測逾時秒數（`cli.ENDPOINT_PROBE_TIMEOUT_S`）。

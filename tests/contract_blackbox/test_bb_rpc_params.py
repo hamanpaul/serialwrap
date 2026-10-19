@@ -17,11 +17,16 @@ pytestmark = [pytest.mark.core_portable, pytest.mark.process_rpc]
 DATA_PATH = Path(__file__).resolve().parent / "data" / "rpc_params.json"
 ROWS = json.loads(DATA_PATH.read_text(encoding="utf-8"))
 
+# 對齊 Python 基線 `sw_core/cli.py` 的 `_LONG_RPC_METHODS`（P1 主線 #123 延伸後為 8 個方法）。
 _LONG_TIMEOUT_METHODS = {
     "session.attach",
     "session.recover",
     "session.self_test",
     "session.console_attach",
+    "device.release",
+    "device.attach",
+    "session.clear",
+    "session.bind",
 }
 
 

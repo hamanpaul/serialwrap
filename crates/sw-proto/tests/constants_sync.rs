@@ -146,7 +146,7 @@ fn test_constants_sync_with_golden() {
         to_set(sw_proto::constants::LONG_RPC_METHODS.iter().copied()),
         to_set(golden_long_methods.iter().map(String::as_str))
     );
-    assert_eq!(sw_proto::constants::LONG_RPC_METHODS.len(), 4);
+    assert_eq!(sw_proto::constants::LONG_RPC_METHODS.len(), 8);
 
     // 15. ENDPOINT_PROBE_TIMEOUT_S
     assert_eq!(
