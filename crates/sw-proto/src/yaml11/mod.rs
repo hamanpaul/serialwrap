@@ -49,12 +49,37 @@ impl YMap {
 /// YAML 解析錯誤（訊息非契約，見 plan G5）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct YamlError {
+    /// 問題描述（PyYAML `problem` 的等價文字；解析器錯誤不含位置後綴）。
     pub message: String,
+    /// 來源位置 `(line, column)`，皆 1-based；無法定位（例如文件層級檢查）時為 `None`。
+    pub position: Option<(usize, usize)>,
+}
+
+impl YamlError {
+    /// 單行摘要：`problem (line <l>, column <c>)`；無位置時只有 `problem`。
+    ///
+    /// DF-07 的 `config.yaml 解析失敗: <path>: <摘要>` 即取此值（plan Task 6；摘要本身非契約，見 `behavior_changes.yaml` DF-07 附註）。
+    pub fn summary(&self) -> String {
+        match self.position {
+            Some((line, column)) => {
+                format!("{} (line {line}, column {column})", self.message)
+            }
+            None => self.message.clone(),
+        }
+    }
+
+    /// 為尚未定位的錯誤補上位置；已有位置者保留最內層（先設定者）的位置。
+    pub(crate) fn with_default_position(mut self, position: (usize, usize)) -> Self {
+        if self.position.is_none() {
+            self.position = Some(position);
+        }
+        self
+    }
 }
 
 impl std::fmt::Display for YamlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
+        write!(f, "{}", self.summary())
     }
 }
 

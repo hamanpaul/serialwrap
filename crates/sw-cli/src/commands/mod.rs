@@ -24,6 +24,8 @@ pub fn dispatch(ctx: &mut CliCtx, ns: &Namespace) -> i32 {
         ["event", ..] => return event_cmd::dispatch_event(ctx, ns),
         ["remote", ..] => return remote_cmd::run_remote(ctx, ns),
         ["skill"] => return skill_cmd::run_skill(ctx, ns),
+        ["service"] => return service_cmd::run_service(ns, ctx),
+        ["supervision-mode"] => return supervision_cmd::run_supervision_mode(ns, ctx),
         ["profile", "test"] => return profile_cmd::run_profile_test(ctx, ns),
         ["cmd", "submit"] => {
             if let Some(code) = rpc_cmds::check_completion_regex(ctx, ns) {

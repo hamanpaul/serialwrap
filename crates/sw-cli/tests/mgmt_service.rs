@@ -148,3 +148,75 @@ fn config_save_never_writes_system_fallback() {
     let custom_after = std::fs::read_to_string(&custom_p).unwrap();
     assert!(custom_after.contains("supervision_mode: windows-task"));
 }
+
+/// Python 基線 `hint`（`service_action` 的 on-demand 分支）。
+const ON_DEMAND_HINT: &str =
+    "目前為 on-demand 監管模式（無 systemd 服務）。使用 `serialwrap daemon start/stop`。";
+
+#[test]
+fn service_non_string_mode_bool_keys_match_python_json() {
+    // Python：json.dumps 把 bool key 轉為 "true"／"false"；sort_keys 依原始 key 排序（False < True）。
+    let t = TestEnv::posix().with_config("supervision_mode: {true: 1, false: 2}\n");
+    let (rc, out, err) = t.run(&["service", "start"]);
+    assert_eq!(rc, 2);
+    assert_eq!(
+        out,
+        format!(
+            "{{\"action\":\"start\",\"error_code\":\"NO_SYSTEMD\",\"hint\":\"{ON_DEMAND_HINT}\",\"mode\":{{\"false\":2,\"true\":1}},\"ok\":false}}\n"
+        )
+    );
+    assert!(err.starts_with("serialwrap: service start failed: NO_SYSTEMD"));
+}
+
+#[test]
+fn service_non_string_mode_null_key_matches_python_json() {
+    let t = TestEnv::posix().with_config("supervision_mode: {null: 1}\n");
+    let (rc, out, _err) = t.run(&["service", "start"]);
+    assert_eq!(rc, 2);
+    assert!(out.contains("\"mode\":{\"null\":1}"), "{out}");
+}
+
+#[test]
+fn service_non_string_mode_date_is_typeerror_exit1_without_stdout() {
+    // Python：json.dumps 拋 TypeError，traceback 結束（exit 1、stdout 空）；未執行任何監管命令。
+    let t = TestEnv::posix().with_config("supervision_mode: 2020-01-01\n");
+    let (rc, out, err) = t.run(&["service", "start"]);
+    assert_eq!((rc, out.as_str()), (1, ""));
+    assert_eq!(err, "TypeError: Object of type date is not JSON serializable\n");
+    assert!(t.calls().is_empty(), "不可序列化時不得呼叫系統指令");
+}
+
+#[test]
+fn service_non_string_mode_mixed_keys_is_typeerror_exit1_without_stdout() {
+    // Python：sort_keys 下 str 與 int key 無法比較（sorted 拋 TypeError）。
+    let t = TestEnv::posix().with_config("supervision_mode: {1: a, b: c}\n");
+    let (rc, out, err) = t.run(&["service", "start"]);
+    assert_eq!((rc, out.as_str()), (1, ""));
+    assert_eq!(
+        err,
+        "TypeError: '<' not supported between instances of 'str' and 'int'\n"
+    );
+}
+
+#[test]
+fn service_bad_constructor_tag_reports_line_and_column() {
+    // DF-07：建構器錯誤（未知 tag）同樣帶 `(line l, column c)`；service 走 INTERNAL_ERROR 形狀。
+    let t = TestEnv::posix().with_config("supervision_mode: !foo bar\n");
+    let (rc, out, err) = t.run(&["service", "start"]);
+    assert_eq!(rc, 1);
+    assert!(
+        out.contains("could not determine a constructor for the tag '!foo' (line 1, column "),
+        "{out}"
+    );
+    assert!(err.starts_with("serialwrap: service start failed: INTERNAL_ERROR: config.yaml 解析失敗:"));
+}
+
+#[test]
+fn supervision_mode_bad_yaml_summary_has_problem_line_and_column() {
+    // DF-07 摘要：`problem (line l, column c)`，單行。
+    let t = TestEnv::posix().with_config("supervision_mode: [unterminated\n");
+    let (rc, out, err) = t.run(&["supervision-mode"]);
+    assert_eq!((rc, out.as_str()), (1, ""));
+    assert!(err.ends_with("(line 2, column 1)\n"), "{err}");
+    assert_eq!(err.matches('\n').count(), 1);
+}

@@ -1049,7 +1049,7 @@ changes:
     ab_participation: "diff"
     phases: ["P1", "P4"]
     case_ids: ["df07-bad-config-yaml"]
-    compatibility_impact: "config.yaml 壞 YAML：supervision-mode 於 stderr 印一行並 exit 1；service、setup、daemon 印 {error_code:INTERNAL_ERROR,…} 並 exit 1；setup 其餘未預期例外比照辦理。"
+    compatibility_impact: "config.yaml 壞 YAML：supervision-mode 於 stderr 印一行並 exit 1；service、setup、daemon 印 {error_code:INTERNAL_ERROR,…} 並 exit 1；setup 其餘未預期例外比照辦理。附註（P4-T6）：訊息格式為 `config.yaml 解析失敗: <path>: <摘要>`；<摘要> 為 `problem (line <l>, column <c>)`（1-based，掃描器與建構器錯誤皆附位置，見 plan Task 6），換行一律改為空白以維持單行；problem 為 yaml-rust2 解析器文字，非 PyYAML problem 逐字對照。A/B 比較器只比 code、exit、stderr 行數與前綴 `config.yaml 解析失敗: <path>`（摘要屬非契約，G1）。"
     approval_conditions: "保留 exit 1，改為明確錯誤；同上"
     related_decisions: []
   - id: "DF-08"

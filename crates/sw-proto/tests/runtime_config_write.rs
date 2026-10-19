@@ -115,3 +115,29 @@ fn runtime_config_set_mode_keeps_other_keys() {
         Some("windows-task")
     );
 }
+
+#[test]
+fn yaml_error_summary_is_single_line_problem_with_position() {
+    // 掃描器錯誤：位置為 1-based line／column（plan Task 6 DF-07 摘要格式）。
+    let Err(err) = sw_proto::yaml11::safe_load("supervision_mode: [unterminated\n") else {
+        panic!("預期 YAML 解析錯誤");
+    };
+    assert_eq!(err.position, Some((2, 1)));
+    let summary = err.summary();
+    assert!(summary.ends_with(" (line 2, column 1)"), "{summary}");
+    assert!(!summary.contains('\n'));
+
+    // 建構器錯誤（未知 tag）：node 起點位置。
+    let Err(err) = sw_proto::yaml11::safe_load("a: !foo b\n") else {
+        panic!("預期建構器錯誤");
+    };
+    assert_eq!(
+        err.message,
+        "could not determine a constructor for the tag '!foo'"
+    );
+    assert!(
+        err.summary().contains("(line 1, column "),
+        "{}",
+        err.summary()
+    );
+}

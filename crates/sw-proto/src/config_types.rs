@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use crate::pycompat::{decode_utf8_strict, py_float_parse, py_int_parse, py_strip, PyOsError, UnicodeDecodeError};
 use crate::pyjson::PyInt;
 use crate::pypath::PathFlavor;
+use crate::yaml11::emit;
 use crate::yaml11::{py_str_of, py_truthy_of, safe_load, YMap, YValue, YamlError};
 
 /// `sw_core/config.py` `UartProfile`（09 §2.1）。
@@ -98,7 +99,7 @@ pub enum ConfigError {
 impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ConfigError::Yaml(e) => write!(f, "YamlError: {}", e.message),
+            ConfigError::Yaml(e) => write!(f, "YamlError: {}", e.summary()),
             ConfigError::Value(msg) => write!(f, "ValueError: {msg}"),
             ConfigError::Os(e) => write!(f, "OSError: {e}"),
             ConfigError::Decode(e) => write!(f, "DecodeError: {e}"),
@@ -898,16 +899,39 @@ impl RuntimeConfig {
     }
 
     /// 07 §5.1：socket_path Some 才覆寫。
-    pub fn set_mode(&mut self, _mode: &str, _socket_path: Option<&str>) {
-        todo!("not implemented: P4-T6")
+    ///
+    /// 對應 `sw_core/runtime_config.py` `set_mode`：`supervision_mode` 必寫；`socket_path` 只在 `Some` 時覆寫，
+    /// 其餘鍵（例如 `windows:`）原樣保留。
+    pub fn set_mode(&mut self, mode: &str, socket_path: Option<&str>) {
+        upsert_str_key(&mut self.data, "supervision_mode", mode);
+        if let Some(endpoint) = socket_path {
+            upsert_str_key(&mut self.data, "socket_path", endpoint);
+        }
     }
 
-    pub fn set_socket(&mut self, _endpoint: &str) {
-        todo!("not implemented: P4-T6")
+    /// 對應 `set_socket`：只更新 `socket_path`，不改動 `supervision_mode`（#84 PORT-4）。
+    pub fn set_socket(&mut self, endpoint: &str) {
+        upsert_str_key(&mut self.data, "socket_path", endpoint);
     }
 
-    /// safe_dump(allow_unicode=true, sort_keys=true)
+    /// `yaml.safe_dump(data, allow_unicode=True)`（PyYAML 預設 `sort_keys=True`）的位元組等價輸出。
+    ///
+    /// 已知殘差（非契約，見 plan P4-T6）：PyYAML 對「同一物件被多處參照」會輸出 anchor／alias（`&id001`／`*id001`），
+    /// 本函式以樹狀展開輸出，重新載入後語意相同、位元組不同。僅當 `config.yaml` 使用 alias 且經 `set_mode`／`set_socket` 寫回時才會出現差異；無 alias 的設定位元組相同。
     pub fn to_yaml(&self) -> String {
-        todo!("not implemented: P4-T6")
+        emit::safe_dump(&YValue::Map(self.data.clone()), true, true)
+    }
+}
+
+/// 以字串 key 覆寫值（既有 key 原位取代，否則附加於尾端；對應 Python `dict.__setitem__`）。
+fn upsert_str_key(map: &mut YMap, key: &str, value: &str) {
+    let value = YValue::Str(value.to_string());
+    match map
+        .0
+        .iter_mut()
+        .find(|(k, _)| matches!(k, YValue::Str(s) if s == key))
+    {
+        Some(slot) => slot.1 = value,
+        None => map.0.push((YValue::Str(key.to_string()), value)),
     }
 }

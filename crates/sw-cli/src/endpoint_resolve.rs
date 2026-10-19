@@ -1,6 +1,6 @@
 //! endpoint 解析（#108、`cli.py:658-835`）。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::bench_state::{load_bench_state_doc, remembered_bench_endpoint, BenchStateError};
@@ -8,8 +8,8 @@ use crate::ctx::CliCtx;
 use sw_proto::config_types::{ConfigError, RuntimeConfig};
 use sw_proto::endpoint::{parse_endpoint, Endpoint};
 use sw_proto::error_codes::ErrorCode;
-use sw_proto::pycompat::{decode_utf8_strict, PyOsError};
-use sw_proto::pypath::{HomeLookup, PathFlavor};
+use sw_proto::pycompat::{decode_utf8_strict, py_strip, PyOsError};
+use sw_proto::pypath::{self, HomeLookup, PathFlavor};
 use sw_proto::runtime_paths::{bench_state_path, resolve_config_path};
 use sw_proto::yaml11::{py_truthy_of, YValue};
 
@@ -114,32 +114,40 @@ pub fn endpoint_alive(ctx: &CliCtx, ep: &str) -> bool {
     }
 }
 
-/// SC-09：`resolve_config_path(...)` 後讀取；不存在 → 空 `RuntimeConfig`。
-pub fn load_runtime_config(ctx: &CliCtx) -> Result<RuntimeConfig, ConfigError> {
+/// SC-09 讀取目標：`resolve_config_path(...)`（`SERIALWRAP_CONFIG` > `CONFIG_DIR/config.yaml`（存在時）
+/// > 系統唯讀 fallback（存在時）> `CONFIG_DIR/config.yaml`）。
+pub fn config_read_path(ctx: &CliCtx) -> String {
     let flavor = flavor_of(ctx);
     let home = EnvHome(ctx.p.env.as_ref());
     let sys_cfg_dir = ctx.p.env.system_config_dir();
-    let config_path = resolve_config_path(
-        &ctx.env,
-        &ctx.paths,
-        &sys_cfg_dir,
-        flavor,
-        &home,
-        &|p| ctx.p.fs.exists(Path::new(p)),
-    );
+    resolve_config_path(&ctx.env, &ctx.paths, &sys_cfg_dir, flavor, &home, &|p| {
+        ctx.p.fs.exists(Path::new(p))
+    })
+}
+
+/// PAL I/O 錯誤 → `ConfigError::Os`（`OSError` 形狀，檔名為 `path`）。
+fn config_os_error(path: &str, pal_err: sw_pal::PalError) -> ConfigError {
+    ConfigError::Os(PyOsError {
+        errno: pal_err.os_code.map(|c| c as i64),
+        winerror: pal_err.winerror.map(|c| c as i64),
+        strerror: Some(pal_err.strerror),
+        filename: Some(path.to_string()),
+        plain: None,
+    })
+}
+
+/// SC-09：`resolve_config_path(...)` 後讀取；不存在 → 空 `RuntimeConfig`。
+pub fn load_runtime_config(ctx: &CliCtx) -> Result<RuntimeConfig, ConfigError> {
+    let config_path = config_read_path(ctx);
     let p = Path::new(&config_path);
     if !ctx.p.fs.exists(p) {
         return RuntimeConfig::from_text(None);
     }
-    let bytes = ctx.p.fs.read(p).map_err(|pal_err| {
-        ConfigError::Os(PyOsError {
-            errno: pal_err.os_code.map(|c| c as i64),
-            winerror: pal_err.winerror.map(|c| c as i64),
-            strerror: Some(pal_err.strerror),
-            filename: Some(config_path.clone()),
-            plain: None,
-        })
-    })?;
+    let bytes = ctx
+        .p
+        .fs
+        .read(p)
+        .map_err(|pal_err| config_os_error(&config_path, pal_err))?;
     let text = decode_utf8_strict(&bytes)?;
     RuntimeConfig::from_text(Some(&text))
 }
@@ -280,13 +288,43 @@ pub fn print_endpoint_resolution_error(
     1
 }
 
-/// SC-09 寫入目標：SERIALWRAP_CONFIG（strip 非空）> CONFIG_DIR/config.yaml；永不為系統唯讀 fallback
-pub fn config_write_path(_ctx: &CliCtx) -> std::path::PathBuf {
-    todo!("not implemented: P4-T6")
+/// SC-09 寫入目標：SERIALWRAP_CONFIG（strip 非空）> CONFIG_DIR/config.yaml；永不為系統唯讀 fallback。
+///
+/// 對應 `sw_core/constants.py` `resolve_config_path(for_write=True)`：寫入路徑不看檔案是否存在。
+pub fn config_write_path(ctx: &CliCtx) -> PathBuf {
+    if let Some(explicit) = ctx.env.get("SERIALWRAP_CONFIG") {
+        if !py_strip(explicit).is_empty() {
+            let home = EnvHome(ctx.p.env.as_ref());
+            return PathBuf::from(pypath::expanduser(
+                flavor_of(ctx),
+                explicit,
+                &ctx.env,
+                &home,
+            ));
+        }
+    }
+    PathBuf::from(&ctx.paths.config_yaml)
 }
 
-/// mkdir parents → to_yaml → 直接覆寫（非原子，KEEP）
-pub fn save_runtime_config(_ctx: &CliCtx, _cfg: &RuntimeConfig) -> Result<(), ConfigError> {
-    todo!("not implemented: P4-T6")
+/// `RuntimeConfig.set_*` 的寫入：mkdir parents → `to_yaml` → 直接覆寫（非原子，KEEP）。
+///
+/// 寫入一律走 [`config_write_path`]，不寫系統唯讀 fallback（SC-09）。換行依 `ctx.p.caps.text_newline`
+/// 轉換，對應 Python `Path.write_text` 的文字模式（Windows 寫成 CRLF）。
+pub fn save_runtime_config(ctx: &CliCtx, cfg: &RuntimeConfig) -> Result<(), ConfigError> {
+    let path = config_write_path(ctx);
+    let path_text = path.display().to_string();
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        ctx.p
+            .fs
+            .mkdirs(parent)
+            .map_err(|pal_err| config_os_error(&path_text, pal_err))?;
+    }
+    let text = cfg.to_yaml().replace('\n', ctx.p.caps.text_newline);
+    ctx.p
+        .fs
+        .write_file(&path, text.as_bytes())
+        .map_err(|pal_err| config_os_error(&path_text, pal_err))
 }
-

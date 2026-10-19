@@ -195,6 +195,12 @@ impl TestEnv {
             ),
         ];
         if self.windows {
+            // Windows 路徑風格（`join_win`）會把設定檔組成 `<dir>\config.yaml`，在 POSIX 宿主上不是同一檔；
+            // 明示 `SERIALWRAP_CONFIG` 讓讀寫兩端指向 `with_config` 寫入的隔離檔（P4-T6 承接，僅影響 windows()）。
+            vars.push((
+                "SERIALWRAP_CONFIG".to_string(),
+                self.config_path().display().to_string(),
+            ));
             vars.push(("USERPROFILE".to_string(), self.home().display().to_string()));
             vars.push((
                 "LOCALAPPDATA".to_string(),
@@ -792,8 +798,15 @@ impl TestEnv {
     }
 
     /// `CONFIG_DIR/config.yaml`。
+    ///
+    /// POSIX 形狀（`posix()`）以 `/` 串接，與 CLI 的 `os.path.join` 語意一致（同 [`Self::default_socket`]），
+    /// 使原生 Windows 主機上 CLI 印出的路徑（例如 DF-07 摘要）與測試期望值逐字相同。
     pub fn config_path(&self) -> PathBuf {
-        self.config_dir().join("config.yaml")
+        if self.windows {
+            self.config_dir().join("config.yaml")
+        } else {
+            PathBuf::from(format!("{}/config.yaml", self.config_dir().display()))
+        }
     }
 
     /// 隔離 `HOME`（tmp 下的 `home/`）。

@@ -1024,7 +1024,7 @@ pub fn sw_cli::endpoint_resolve::save_runtime_config(ctx: &Ctx, cfg: &RuntimeCon
 pub fn sw_cli::commands::service_cmd::run_service(ns: &Namespace, ctx: &mut Ctx) -> i32;
 pub fn sw_cli::commands::supervision_cmd::run_supervision_mode(ns: &Namespace, ctx: &mut Ctx) -> i32;  // 無 words：查詢；words[0]=="set" 交給 Task 10 的 run_supervision_set
 pub fn sw_cli::commands::supervision_cmd::load_config_or_report(ctx: &mut Ctx, kind: ConfigErrorReport) -> Result<RuntimeConfig, i32>; // DF-07
-pub enum ConfigErrorReport { PlainStderr /* supervision-mode */, JsonInternalError /* service/setup/daemon */ }
+pub enum ConfigErrorReport { PlainStderr /* supervision-mode */, JsonInternalError(String /* mirror context，例如 "service start"、"daemon start" */) /* service/setup/daemon */ }
 ```
 
 行為：
@@ -1362,7 +1362,7 @@ fn windows_task_restart_aborts_when_daemon_never_exits() {
 pub fn run_daemon_start(ns: &Namespace, ctx: &mut Ctx) -> i32 {
     let is_win = endpoint_resolve::rpc_backend_is_win(ctx);
     if let Some(r) = check_endpoint_args(ns, is_win) { return emit_err(ctx, r, "daemon start", 2); }
-    let cfg = match load_config_or_report(ctx, ConfigErrorReport::JsonInternalError) { Ok(c) => c, Err(rc) => return rc };
+    let cfg = match load_config_or_report(ctx, ConfigErrorReport::JsonInternalError("daemon start".into())) { Ok(c) => c, Err(rc) => return rc };
     let mode = SupervisionMode::parse(mode_str(&cfg).as_deref().unwrap_or("on-demand"));
     if mode != SupervisionMode::OnDemand { return route_service(ctx, &mode, ServiceAction::Start, ns.flag("with_sudo"), "service start"); }
     let local = match endpoint_resolve::resolve_local_endpoint_info(ns, ctx) { Ok(r) => r, Err(e) => return print_endpoint_err(ctx, e, "daemon start") };

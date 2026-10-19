@@ -170,12 +170,14 @@ fn radix_to_decimal_string(digits: &[u32], radix: u32) -> String {
 fn parse_radix_int(sign: i128, raw: &str, radix: u32, err_msg: &str) -> Result<PyInt, YamlError> {
     if raw.is_empty() {
         return Err(YamlError {
+            position: None,
             message: err_msg.into(),
         });
     }
     let mut digits = Vec::with_capacity(raw.len());
     for c in raw.chars() {
         let d = c.to_digit(radix).ok_or_else(|| YamlError {
+            position: None,
             message: err_msg.into(),
         })?;
         digits.push(d);
@@ -199,10 +201,12 @@ fn parse_sexagesimal(sign: i128, rest: &str) -> Result<PyInt, YamlError> {
     for part in &parts {
         if part.is_empty() {
             return Err(YamlError {
+                position: None,
                 message: "invalid sexagesimal int".into(),
             });
         }
         let d = part.parse::<u32>().map_err(|_| YamlError {
+            position: None,
             message: "invalid sexagesimal int".into(),
         })?;
         digits.push(d);
@@ -266,6 +270,7 @@ fn construct_int(s: &str) -> Result<PyInt, YamlError> {
 
     if rest.is_empty() || rest.chars().any(|c| !c.is_ascii_digit()) {
         return Err(YamlError {
+            position: None,
             message: "invalid decimal int".into(),
         });
     }
@@ -304,6 +309,7 @@ fn construct_float(s: &str) -> Result<f64, YamlError> {
         let parts: Vec<&str> = rest.split(':').collect();
         for part in parts.iter().rev() {
             let digit = part.parse::<f64>().map_err(|_| YamlError {
+                position: None,
                 message: "invalid float".into(),
             })?;
             val += digit * base;
@@ -312,6 +318,7 @@ fn construct_float(s: &str) -> Result<f64, YamlError> {
         return Ok(sign * val);
     }
     let val = rest.parse::<f64>().map_err(|_| YamlError {
+        position: None,
         message: "invalid float".into(),
     })?;
     if val == 0.0 && sign < 0.0 {
@@ -332,6 +339,7 @@ fn construct_timestamp(s: &str) -> Result<YValue, YamlError> {
     let caps = match re.captures(s) {
         Ok(Some(c)) => c,
         _ => return Err(YamlError {
+            position: None,
             message: "invalid timestamp format".into(),
         }),
     };
@@ -342,10 +350,12 @@ fn construct_timestamp(s: &str) -> Result<YValue, YamlError> {
         .as_str()
         .parse::<i32>()
         .map_err(|_| YamlError {
+            position: None,
             message: "invalid year".into(),
         })?;
     if year < 1 {
         return Err(YamlError {
+            position: None,
             message: "year out of range".into(),
         });
     }
@@ -355,6 +365,7 @@ fn construct_timestamp(s: &str) -> Result<YValue, YamlError> {
         .as_str()
         .parse::<u32>()
         .map_err(|_| YamlError {
+            position: None,
             message: "invalid month".into(),
         })?;
     let day = caps
@@ -363,17 +374,20 @@ fn construct_timestamp(s: &str) -> Result<YValue, YamlError> {
         .as_str()
         .parse::<u32>()
         .map_err(|_| YamlError {
+            position: None,
             message: "invalid day".into(),
         })?;
 
     if !(1..=12).contains(&month) {
         return Err(YamlError {
+            position: None,
             message: "month out of range".into(),
         });
     }
     let max_days = days_in_month(year, month);
     if !(1..=max_days).contains(&day) {
         return Err(YamlError {
+            position: None,
             message: "day out of range".into(),
         });
     }
@@ -390,6 +404,7 @@ fn construct_timestamp(s: &str) -> Result<YValue, YamlError> {
         .as_str()
         .parse::<u32>()
         .map_err(|_| YamlError {
+            position: None,
             message: "invalid hour".into(),
         })?;
     let minute = caps
@@ -398,6 +413,7 @@ fn construct_timestamp(s: &str) -> Result<YValue, YamlError> {
         .as_str()
         .parse::<u32>()
         .map_err(|_| YamlError {
+            position: None,
             message: "invalid minute".into(),
         })?;
     let second = caps
@@ -406,11 +422,13 @@ fn construct_timestamp(s: &str) -> Result<YValue, YamlError> {
         .as_str()
         .parse::<u32>()
         .map_err(|_| YamlError {
+            position: None,
             message: "invalid second".into(),
         })?;
 
     if hour > 23 || minute > 59 || second > 59 {
         return Err(YamlError {
+            position: None,
             message: "time out of range".into(),
         });
     }
@@ -441,10 +459,12 @@ fn construct_timestamp(s: &str) -> Result<YValue, YamlError> {
             .as_str()
             .parse::<u32>()
             .map_err(|_| YamlError {
+                position: None,
                 message: "invalid tz hour".into(),
             })?;
         let tz_minute = if let Some(m) = caps.name("tz_minute") {
             m.as_str().parse::<u32>().map_err(|_| YamlError {
+                position: None,
                 message: "invalid tz minute".into(),
             })?
         } else {
@@ -454,6 +474,7 @@ fn construct_timestamp(s: &str) -> Result<YValue, YamlError> {
         let total = tz_hour * 60 + tz_minute;
         if total >= 24 * 60 {
             return Err(YamlError {
+                position: None,
                 message: "tz out of range".into(),
             });
         }
@@ -476,6 +497,7 @@ fn b64_val(b: u8) -> Result<u8, YamlError> {
         b'+' => Ok(62),
         b'/' => Ok(63),
         _ => Err(YamlError {
+            position: None,
             message: "invalid base64 char".into(),
         }),
     }
@@ -492,6 +514,7 @@ fn py_base64_decode(s: &str) -> Result<Vec<u8>, YamlError> {
             // Non-base64 ascii ignored in Python binascii.a2b_base64
         } else {
             return Err(YamlError {
+                position: None,
                 message: "non-ascii byte in base64".into(),
             });
         }
@@ -499,6 +522,7 @@ fn py_base64_decode(s: &str) -> Result<Vec<u8>, YamlError> {
 
     if clean.len() % 4 != 0 {
         return Err(YamlError {
+            position: None,
             message: "failed to decode base64 data: Incorrect padding".into(),
         });
     }
@@ -520,6 +544,7 @@ fn py_base64_decode(s: &str) -> Result<Vec<u8>, YamlError> {
 
         if pad2 && !pad3 {
             return Err(YamlError {
+                position: None,
                 message: "invalid padding".into(),
             });
         }
@@ -612,19 +637,44 @@ fn tag_name(tag: &Option<Tag>) -> Option<String> {
 
 #[derive(Clone, Debug)]
 enum AstNode {
+    /// `pos` 為節點起點的 `(line, column)`（1-based），供建構錯誤回報位置（DF-07 摘要）。
     Scalar {
         value: String,
         style: TScalarStyle,
         tag: Option<Tag>,
+        pos: (usize, usize),
     },
     Sequence {
         tag: Option<Tag>,
         items: Vec<AstNode>,
+        pos: (usize, usize),
     },
     Mapping {
         tag: Option<Tag>,
         pairs: Vec<(AstNode, AstNode)>,
+        pos: (usize, usize),
     },
+}
+
+impl AstNode {
+    fn pos(&self) -> (usize, usize) {
+        match self {
+            AstNode::Scalar { pos, .. } | AstNode::Sequence { pos, .. } | AstNode::Mapping { pos, .. } => *pos,
+        }
+    }
+}
+
+/// 每行起點的字元索引（第 1 行起點為 0）；`\n` 與獨立 `\r` 視為換行，與 yaml-rust2 的行計數一致。
+fn line_starts_of(chars: &[char]) -> Vec<usize> {
+    let mut starts = vec![0];
+    for (idx, ch) in chars.iter().enumerate() {
+        match ch {
+            '\n' => starts.push(idx + 1),
+            '\r' if chars.get(idx + 1) != Some(&'\n') => starts.push(idx + 1),
+            _ => {}
+        }
+    }
+    starts
 }
 
 /// alias 展開後節點總數上限（PyYAML 以共享參照載入，不受影響；Rust 為樹狀複製，須設上限防指數膨脹）。
@@ -635,6 +685,8 @@ const MAX_DEPTH: usize = 200;
 struct AstParser<'a> {
     events: &'a [(Event, usize)],
     chars: &'a [char],
+    /// 每行起點的字元索引（見 [`line_starts_of`]），用於把事件索引換算為 `(line, column)`。
+    line_starts: Vec<usize>,
     /// 文件最後一個區塊純量事件的索引，且原文無結尾換行（此時 PyYAML 不補 "\n"，yaml-rust2 會補）。
     eof_block_scalar: Option<usize>,
     pos: usize,
@@ -654,9 +706,18 @@ impl<'a> AstParser<'a> {
             Ok((ev, *idx))
         } else {
             Err(YamlError {
+                position: None,
                 message: "unexpected end of events".to_string(),
             })
         }
+    }
+
+    /// 字元索引 → `(line, column)`（1-based）。
+    fn position_of(&self, idx: usize) -> (usize, usize) {
+        let count = self.line_starts.partition_point(|&start| start <= idx);
+        let line_index = count.max(1) - 1;
+        let start = self.line_starts.get(line_index).copied().unwrap_or(0);
+        (line_index + 1, idx.saturating_sub(start) + 1)
     }
 
     /// 區塊純量 header（`|`／`>` 與 chomping／indent 指示符）是否含 keep（`+`）。
@@ -676,11 +737,13 @@ impl<'a> AstParser<'a> {
     fn parse_node(&mut self, depth: usize) -> Result<(AstNode, usize), YamlError> {
         if depth > MAX_DEPTH {
             return Err(YamlError {
+                position: None,
                 message: "recursion limit exceeded".into(),
             });
         }
         let (ev, idx) = self.next()?;
         let ev_pos = self.pos - 1;
+        let pos = self.position_of(idx);
         let ev = ev.clone();
         match ev {
             Event::Scalar(mut value, style, anchor_id, tag) => {
@@ -698,7 +761,7 @@ impl<'a> AstParser<'a> {
                     value.clear();
                 }
                 self.nodes += 1;
-                let node = AstNode::Scalar { value, style, tag };
+                let node = AstNode::Scalar { value, style, tag, pos };
                 if anchor_id > 0 {
                     self.anchor_map.insert(anchor_id, (node.clone(), 1));
                 }
@@ -709,12 +772,14 @@ impl<'a> AstParser<'a> {
                     self.nodes = self.nodes.saturating_add(*size);
                     if self.nodes > MAX_EXPANDED_NODES {
                         return Err(YamlError {
+                            position: None,
                             message: "alias expansion limit exceeded".into(),
                         });
                     }
                     Ok((target.clone(), *size))
                 } else {
                     Err(YamlError {
+                        position: None,
                         message: format!("found undefined alias {anchor_id}"),
                     })
                 }
@@ -729,7 +794,7 @@ impl<'a> AstParser<'a> {
                     items.push(n);
                 }
                 self.next()?; // consume SequenceEnd
-                let node = AstNode::Sequence { tag, items };
+                let node = AstNode::Sequence { tag, items, pos };
                 if anchor_id > 0 {
                     self.anchor_map.insert(anchor_id, (node.clone(), size));
                 }
@@ -746,13 +811,14 @@ impl<'a> AstParser<'a> {
                     pairs.push((k, v));
                 }
                 self.next()?; // consume MappingEnd
-                let node = AstNode::Mapping { tag, pairs };
+                let node = AstNode::Mapping { tag, pairs, pos };
                 if anchor_id > 0 {
                     self.anchor_map.insert(anchor_id, (node.clone(), size));
                 }
                 Ok((node, size))
             }
             _ => Err(YamlError {
+                position: None,
                 message: format!("unexpected event: {:?}", ev),
             }),
         }
@@ -761,7 +827,7 @@ impl<'a> AstParser<'a> {
 
 fn is_merge_key(node: &AstNode) -> bool {
     match node {
-        AstNode::Scalar { value, style, tag } => {
+        AstNode::Scalar { value, style, tag, .. } => {
             if *style == TScalarStyle::Plain && value == "<<" {
                 match tag {
                     None => true,
@@ -792,6 +858,7 @@ fn collect_merge_pairs(
 ) -> Result<(), YamlError> {
     if depth > 200 {
         return Err(YamlError {
+            position: None,
             message: "recursion limit exceeded".into(),
         });
     }
@@ -803,6 +870,7 @@ fn collect_merge_pairs(
                 Ok(())
             } else {
                 Err(YamlError {
+                    position: None,
                     message: "expected a mapping or list of mappings for merging".into(),
                 })
             }
@@ -811,6 +879,7 @@ fn collect_merge_pairs(
             for item in items.iter().rev() {
                 if !matches!(item, AstNode::Mapping { .. }) {
                     return Err(YamlError {
+                        position: None,
                         message: "expected a mapping or list of mappings for merging".into(),
                     });
                 }
@@ -819,6 +888,7 @@ fn collect_merge_pairs(
                     merge_pairs.extend(m.0);
                 } else {
                     return Err(YamlError {
+                        position: None,
                         message: "expected a mapping or list of mappings for merging".into(),
                     });
                 }
@@ -826,6 +896,7 @@ fn collect_merge_pairs(
             Ok(())
         }
         _ => Err(YamlError {
+            position: None,
             message: "expected a mapping or list of mappings for merging".into(),
         }),
     }
@@ -846,6 +917,7 @@ fn eval_scalar(
                 "yes" | "true" | "on" => Ok(YValue::Bool(true)),
                 "no" | "false" | "off" => Ok(YValue::Bool(false)),
                 _ => Err(YamlError {
+                    position: None,
                     message: format!("invalid bool value: {value}"),
                 }),
             },
@@ -853,6 +925,7 @@ fn eval_scalar(
             "binary" => py_base64_decode(value).map(YValue::Binary),
             "timestamp" => construct_timestamp(value),
             _ => Err(YamlError {
+                position: None,
                 message: format!("could not determine a constructor for the tag '{t}'"),
             }),
         };
@@ -875,6 +948,7 @@ fn eval_scalar(
             Some("timestamp") => construct_timestamp(value),
             // SafeConstructor 對 tag:yaml.org,2002:merge／value 沒有 constructor（鍵位置另由 eval_key／is_merge_key 處理）。
             Some("merge") | Some("value") => Err(YamlError {
+                position: None,
                 message: format!("could not determine a constructor for the tag '{}'", resolve_plain(value).unwrap_or("")),
             }),
             _ => Ok(YValue::Str(value.to_string())),
@@ -886,7 +960,7 @@ fn eval_scalar(
 
 /// mapping key 位置：`=`（tag:yaml.org,2002:value）依 `flatten_mapping` 轉為 str。
 fn eval_key(node: &AstNode, depth: usize) -> Result<YValue, YamlError> {
-    if let AstNode::Scalar { value, style: TScalarStyle::Plain, tag: None } = node {
+    if let AstNode::Scalar { value, style: TScalarStyle::Plain, tag: None, .. } = node {
         if value == "=" {
             return Ok(YValue::Str("=".to_string()));
         }
@@ -901,6 +975,7 @@ fn eval_sequence(
 ) -> Result<YValue, YamlError> {
     if depth > 200 {
         return Err(YamlError {
+            position: None,
             message: "recursion limit exceeded".into(),
         });
     }
@@ -912,6 +987,7 @@ fn eval_sequence(
                 if let AstNode::Mapping { pairs, .. } = item {
                     if pairs.len() != 1 {
                         return Err(YamlError {
+                            position: None,
                             message: "expected a single mapping item".into(),
                         });
                     }
@@ -920,6 +996,7 @@ fn eval_sequence(
                     seq_items.push(YValue::Seq(vec![k, v]));
                 } else {
                     return Err(YamlError {
+                        position: None,
                         message: "expected a mapping of length 1".into(),
                     });
                 }
@@ -927,6 +1004,7 @@ fn eval_sequence(
             return Ok(YValue::Seq(seq_items));
         } else if t != "seq" {
             return Err(YamlError {
+                position: None,
                 message: format!("could not determine a constructor for the tag '{t}'"),
             });
         }
@@ -946,6 +1024,7 @@ fn eval_mapping(
 ) -> Result<YValue, YamlError> {
     if depth > 200 {
         return Err(YamlError {
+            position: None,
             message: "recursion limit exceeded".into(),
         });
     }
@@ -957,6 +1036,7 @@ fn eval_mapping(
                 let k_val = eval_key(k_node, depth + 1)?;
                 if matches!(k_val, YValue::Seq(_) | YValue::Map(_) | YValue::Set(_)) {
                     return Err(YamlError {
+                        position: None,
                         message: "found unhashable key".into(),
                     });
                 }
@@ -967,6 +1047,7 @@ fn eval_mapping(
             return Ok(YValue::Set(set_elements));
         } else if t != "map" {
             return Err(YamlError {
+                position: None,
                 message: format!("could not determine a constructor for the tag '{t}'"),
             });
         }
@@ -982,6 +1063,7 @@ fn eval_mapping(
             let k_val = eval_key(k_node, depth + 1)?;
             if matches!(k_val, YValue::Seq(_) | YValue::Map(_) | YValue::Set(_)) {
                 return Err(YamlError {
+                    position: None,
                     message: "found unhashable key".into(),
                 });
             }
@@ -1001,15 +1083,20 @@ fn eval_mapping(
 }
 
 fn eval_node(node: &AstNode, depth: usize) -> Result<YValue, YamlError> {
+    eval_node_at(node, depth).map_err(|err| err.with_default_position(node.pos()))
+}
+
+fn eval_node_at(node: &AstNode, depth: usize) -> Result<YValue, YamlError> {
     if depth > 200 {
         return Err(YamlError {
+            position: None,
             message: "recursion limit exceeded".into(),
         });
     }
     match node {
-        AstNode::Scalar { value, style, tag } => eval_scalar(value, *style, tag),
-        AstNode::Sequence { tag, items } => eval_sequence(tag, items, depth),
-        AstNode::Mapping { tag, pairs } => eval_mapping(tag, pairs, depth),
+        AstNode::Scalar { value, style, tag, .. } => eval_scalar(value, *style, tag),
+        AstNode::Sequence { tag, items, .. } => eval_sequence(tag, items, depth),
+        AstNode::Mapping { tag, pairs, .. } => eval_mapping(tag, pairs, depth),
     }
 }
 
@@ -1031,6 +1118,7 @@ fn check_printable(text: &str) -> Result<(), YamlError> {
             | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}');
         if !ok {
             return Err(YamlError {
+                position: None,
                 message: format!("unacceptable character #x{:04x}: special characters are not allowed", c as u32),
             });
         }
@@ -1099,7 +1187,7 @@ fn validate_tokens(text: &str) -> Result<(), YamlError> {
             break;
         }
     }
-    let err = |m: &str| YamlError { message: m.to_string() };
+    let err = |m: &str| YamlError { position: None, message: m.to_string() };
 
     // 1. 重複 anchor（每份文件獨立）、directive 規則、起首 `...`。
     let mut seen_anchor = std::collections::HashSet::new();
@@ -1306,8 +1394,10 @@ pub(super) fn build_document(text: &str) -> Result<YValue, YamlError> {
 
     let mut parser = Parser::new_from_str(clean_text);
     let mut sink = EventSink { events: Vec::new() };
+    // 掃描器錯誤：`info()` 為問題描述，`marker()` 為 1-based line、0-based col（Display 顯示 col+1）。
     parser.load(&mut sink, true).map_err(|e| YamlError {
-        message: e.to_string(),
+        message: e.info().to_string(),
+        position: Some((e.marker().line(), e.marker().col() + 1)),
     })?;
 
     let doc_start_count = sink
@@ -1320,6 +1410,7 @@ pub(super) fn build_document(text: &str) -> Result<YValue, YamlError> {
     }
     if doc_start_count > 1 {
         return Err(YamlError {
+            position: None,
             message: "expected a single document in the stream".to_string(),
         });
     }
@@ -1364,6 +1455,7 @@ pub(super) fn build_document(text: &str) -> Result<YValue, YamlError> {
     let mut ast_parser = AstParser {
         events: doc_events,
         chars: &chars,
+        line_starts: line_starts_of(&chars),
         eof_block_scalar,
         pos: 0,
         anchor_map: HashMap::new(),

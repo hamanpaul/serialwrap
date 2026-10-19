@@ -238,6 +238,20 @@ fn cli_spec_matches_schema() {
             continue;
         }
 
+        // P4-T6：service、supervision-mode 已原生並自 DELEGATED_GROUPS 移除（同 P4-T8 remote 的處理）；
+        // schema 的 stage 仍為 delegate-1a，故只核對原生解析與委派集合不含此群組。
+        if matches!(name, "service" | "supervision-mode") {
+            assert!(
+                matches!(entry.target, SubTarget::Native(_)),
+                "P4-T6 的 {name} 群組必須原生解析"
+            );
+            assert!(
+                !sw_cli::delegate::DELEGATED_GROUPS.contains(&name),
+                "P4-T6 的 {name} 群組不得留在 DELEGATED_GROUPS"
+            );
+            continue;
+        }
+
         if stage == "delegate-1a" {
             // P4-T1（計畫 Task 1 步驟 4）：委派群組的宣告式 parser 已原生，help／usage 可離線比對；
             // 執行期路由仍由 DELEGATED_GROUPS（classify）決定，群組於各 P4 Task 完成時自委派集合移除。

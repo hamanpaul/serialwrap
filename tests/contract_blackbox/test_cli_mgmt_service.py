@@ -52,3 +52,45 @@ def test_service_ab_on_demand(tmp_path: Path, no_delegation: Path) -> None:
     assert data["mode"] == "on-demand"
     assert data["action"] == "start"
     assert "serialwrap: service start failed: NO_SYSTEMD" in results["cli"][2]
+
+
+@pytest.mark.parametrize(
+    ("config_text", "stderr_exact"),
+    [
+        # bool／None key：json.dumps 轉為 "true"／"false"／"null"（sort_keys 依原始 key）。
+        ("supervision_mode: {true: 1, false: 2}\n", True),
+        ("supervision_mode: {null: 1}\n", True),
+        # 不可序列化（date）與 sort_keys 無法比較的 key：Python 以 traceback 結束（exit 1、stdout 空）；
+        # stderr 只比最後一行（TypeError 訊息）。
+        ("supervision_mode: 2020-01-01\n", False),
+        ("supervision_mode: {1: a, b: c}\n", False),
+    ],
+)
+def test_service_ab_non_string_mode(
+    tmp_path: Path, no_delegation: Path, config_text: str, stderr_exact: bool
+) -> None:
+    results: dict[str, tuple[int, str, str]] = {}
+    for label, prefix in (("python", python_baseline_prefix()), ("cli", cli_prefix())):
+        work = tmp_path / label
+        work.mkdir()
+        env = isolated_env(work)
+        env["SW_DELEGATE_MARKER"] = str(no_delegation)
+        cfg = Path(env["SERIALWRAP_CONFIG_DIR"]) / "config.yaml"
+        cfg.write_text(config_text, encoding="utf-8")
+        proc = subprocess.run(
+            prefix + ["service", "start"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        results[label] = (proc.returncode, proc.stdout, proc.stderr)
+
+    assert results["cli"][0] == results["python"][0]
+    assert results["cli"][1] == results["python"][1]
+    if stderr_exact:
+        assert results["cli"][2] == results["python"][2]
+    else:
+        py_last = results["python"][2].strip().splitlines()[-1]
+        cli_last = results["cli"][2].strip().splitlines()[-1]
+        assert cli_last == py_last
