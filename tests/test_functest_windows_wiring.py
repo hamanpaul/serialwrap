@@ -9,6 +9,7 @@ import sys
 from typing import Any
 
 import pytest
+import yaml
 
 pytestmark = [pytest.mark.core_portable]
 
@@ -88,6 +89,9 @@ def test_windows_wiring_env_and_argv(monkeypatch: pytest.MonkeyPatch, tmp_path: 
             profile_path = h.root / "profiles" / "func-test.yaml"
         profile_content = profile_path.read_text(encoding="utf-8")
         assert "COM7" in profile_content
+        target_row = yaml.safe_load(profile_content)["targets"][0]
+        assert target_row["com"] == "COM0"
+        assert target_row["device_by_id"] == "COM7"
 
         bridge_argv = getattr(h, "bridge_argv", captured_bridge.get("args", [[]])[0])
         assert "--endpoint" in bridge_argv and "win-serial" in bridge_argv
@@ -137,6 +141,7 @@ def test_windows_allowlist_not_enabled_stops(monkeypatch: pytest.MonkeyPatch) ->
     ))
     monkeypatch.setattr(daemon_harness.subprocess, "Popen", _capture_popen({}))
     monkeypatch.setattr(h, "wait_endpoint", lambda *_a, **_k: None)
+    monkeypatch.setattr(h, "_spawn_bridge", lambda *_a, **_k: None)
     monkeypatch.setattr(h, "_query_daemon_status", lambda: {"test_device_allowlist": {"enabled": False}})
 
     with pytest.raises(Exception) as exc_info:
@@ -160,3 +165,47 @@ def test_windows_device_event_cap_missing(monkeypatch: pytest.MonkeyPatch) -> No
     with pytest.raises(runner.StepError) as exc_info:
         h.device_event("remove")
     assert "cap_missing:by_id_link" in str(exc_info.value)
+
+
+@pytest.mark.memory_only
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--mode", "bridge", "--selftest-report", "selftest.json", "--daemon-com", "COM20", "--bridge-com", "COM21"],
+        ["--mode", "bridge", "--selftest-report", "selftest.json", "--daemon-com", "COM20", "--bridge-com", "COM21", "--transport-mode", "virtual_pty"],
+    ],
+)
+def test_windows_bridge_requires_supported_transport(
+    monkeypatch: pytest.MonkeyPatch, argv: list[str]
+) -> None:
+    """驗證 Windows bridge 必須明確指定支援的傳輸模式。"""
+    import runner
+
+    monkeypatch.setattr(runner.os, "name", "nt")
+    with pytest.raises(SystemExit) as exc_info:
+        runner.main(argv)
+    assert exc_info.value.code == 2
+
+
+@pytest.mark.memory_only
+def test_windows_pty_mode_reports_capability_skip(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """驗證 Windows pty 模式回報能力 SKIP，不載入 POSIX fake target。"""
+    import json
+    import runner
+    from lib.yaml_loader import TestCase
+
+    tc = TestCase(name="pty-capability", category="test", severity="low", target={}, profile={}, env_files={}, steps=[])
+    monkeypatch.setattr(runner.os, "name", "nt")
+    monkeypatch.setattr(runner.pathlib, "Path", lambda _value=".": tmp_path)
+    monkeypatch.setattr(runner, "discover_test_cases", lambda *args, **kwargs: [tc])
+    monkeypatch.setattr(runner.TestRunner, "run", lambda self: pytest.fail("Windows pty must be skipped"))
+    monkeypatch.setattr(runner.TestRunner, "_write_manifest", lambda self, *args, **kwargs: None)
+
+    result = runner.main(["--report-dir", str(tmp_path)])
+    report = json.loads((tmp_path / "func-test-report.json").read_text(encoding="utf-8"))
+
+    assert result == 1
+    assert report["results"][0]["verdict"] == "SKIP"
+    assert "cap_missing" in report["results"][0]["message"]

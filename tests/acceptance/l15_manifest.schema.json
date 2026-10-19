@@ -96,7 +96,8 @@
       "required": [
         "cli",
         "daemon",
-        "release_manifest_sha256"
+        "release_manifest_sha256",
+        "deployed_content"
       ],
       "properties": {
         "cli": {
@@ -173,6 +174,29 @@
             "null"
           ],
           "pattern": "^[0-9a-f]{64}$"
+        },
+        "deployed_content": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "start",
+            "end",
+            "daemon_live"
+          ],
+          "properties": {
+            "start": {
+              "$ref": "#/$defs/deployedContent"
+            },
+            "end": {
+              "$ref": "#/$defs/deployedContent"
+            },
+            "daemon_live": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/liveDaemon"
+              }
+            }
+          }
         }
       }
     },
@@ -344,7 +368,7 @@
       ],
       "properties": {
         "wire": {
-          "type": "object",
+          "type": ["object", "null"],
           "required": [
             "path",
             "sha256"
@@ -361,7 +385,7 @@
           }
         },
         "control": {
-          "type": "object",
+          "type": ["object", "null"],
           "required": [
             "path",
             "sha256"
@@ -378,7 +402,7 @@
           }
         },
         "correlation": {
-          "type": "object",
+          "type": ["object", "null"],
           "required": [
             "path",
             "sha256"
@@ -395,7 +419,7 @@
           }
         },
         "dut_stderr": {
-          "type": "object",
+          "type": ["object", "null"],
           "required": [
             "path",
             "sha256"
@@ -412,11 +436,11 @@
           }
         },
         "wal_dir": {
-          "type": "string",
+          "type": ["string", "null"],
           "minLength": 1
         },
         "cli_log": {
-          "type": "object",
+          "type": ["object", "null"],
           "required": [
             "path",
             "sha256"
@@ -431,6 +455,132 @@
               "pattern": "^[0-9a-f]{64}$"
             }
           }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "digestOrNull": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "deployedContent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "measured_at",
+        "cli_configured",
+        "cli_resolved",
+        "cli_sha256",
+        "install_dir",
+        "release_manifest_sha256",
+        "bundle_tree_sha256",
+        "runtime_tree_sha256",
+        "entry_dir_sha256",
+        "daemon_configured",
+        "daemon_resolved",
+        "daemon_sha256",
+        "error"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "deployed-content.v1"
+        },
+        "measured_at": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cli_configured": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cli_resolved": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cli_sha256": {
+          "$ref": "#/$defs/digestOrNull"
+        },
+        "install_dir": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "release_manifest_sha256": {
+          "$ref": "#/$defs/digestOrNull"
+        },
+        "bundle_tree_sha256": {
+          "$ref": "#/$defs/digestOrNull"
+        },
+        "runtime_tree_sha256": {
+          "$ref": "#/$defs/digestOrNull"
+        },
+        "entry_dir_sha256": {
+          "$ref": "#/$defs/digestOrNull"
+        },
+        "daemon_configured": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "daemon_resolved": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "daemon_sha256": {
+          "$ref": "#/$defs/digestOrNull"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "liveDaemon": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pid",
+        "image_path",
+        "image_sha256",
+        "in_install",
+        "error"
+      ],
+      "properties": {
+        "pid": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "image_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "image_sha256": {
+          "$ref": "#/$defs/digestOrNull"
+        },
+        "in_install": {
+          "type": "boolean"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     }

@@ -218,6 +218,67 @@ def test_deployed_content_daemon_outside_install_flagged(tmp_path: pathlib.Path)
     assert m_none["daemon_resolved"] is None
 
 
+@pytest.mark.memory_only
+def test_missing_daemon_file_without_manifest_sha_is_mismatch(tmp_path: pathlib.Path) -> None:
+    """驗證 manifest 沒有有效 daemon hash 時，不會讓不存在的 daemon 誤判相符。"""
+    import realhw.deployed_content as dc
+
+    install = tmp_path / "install"
+    (install / "bin").mkdir(parents=True)
+    cli = install / "bin" / "serialwrap"
+    cli.write_bytes(b"cli")
+    missing_daemon = install / "bin" / "serialwrapd"
+    (install / "release-manifest.json").write_text(json.dumps({
+        "schema_version": "release-manifest.v1",
+        "components": {
+            "cli": {"path": "bin/serialwrap", "sha256": _sha256_bytes(b"cli")},
+            "daemon": {"launcher": {"path": "bin/serialwrapd"}},
+        },
+    }), encoding="utf-8")
+
+    result = dc.measure(cli, daemon_argv=[str(missing_daemon)])
+
+    assert result["error"] == "daemon_mismatch"
+    assert result["daemon_sha256"] is None
+
+
+@pytest.mark.memory_only
+def test_deployed_content_cli_keeps_live_daemon_outside_schema_object(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """驗證 CLI 把 live daemon 寫到獨立 sidecar，deployed-content.v1 不增加未登記欄位。"""
+    import realhw.deployed_content as dc
+
+    cli = tmp_path / "serialwrap"
+    cli.write_bytes(b"cli")
+    measured = {
+        "schema_version": "deployed-content.v1",
+        "measured_at": "2026-10-19T00:00:00+00:00",
+        "cli_configured": str(cli),
+        "cli_resolved": str(cli),
+        "cli_sha256": None,
+        "install_dir": None,
+        "release_manifest_sha256": None,
+        "bundle_tree_sha256": None,
+        "runtime_tree_sha256": None,
+        "entry_dir_sha256": None,
+        "daemon_configured": None,
+        "daemon_resolved": None,
+        "daemon_sha256": None,
+        "error": "unresolved",
+    }
+    live = {"pid": 123, "image_path": "/fake/daemon", "image_sha256": None, "in_install": False, "error": None}
+    monkeypatch.setattr(dc, "measure", lambda *args, **kwargs: dict(measured))
+    monkeypatch.setattr(dc, "live_daemon", lambda *args, **kwargs: dict(live))
+    output = tmp_path / "measure.json"
+
+    assert dc.main(["--cli", str(cli), "--daemon-pid", "123", "--out", str(output)]) == 0
+
+    assert "live_daemon" not in json.loads(output.read_text(encoding="utf-8"))
+    sidecar = output.with_name(output.name + ".live-daemon.json")
+    assert json.loads(sidecar.read_text(encoding="utf-8")) == live
+
+
 @pytest.mark.process_rpc
 def test_deployed_content_live_daemon_image(tmp_path: pathlib.Path) -> None:
     """驗證 live_daemon 取得執行中 daemon 行程之影像路徑與 sha256，並檢查是否在安裝目錄下。"""

@@ -24,6 +24,34 @@ python3 func-test/runner.py -t rc-01-interactive-mode-switch -r 20
 python3 func-test/runner.py -l
 ```
 
+## Bridge 模式與執行證據
+
+`pty` 模式維持既有本機 FakeTarget 路徑；`bridge` 模式則由獨立的 `uart-stdio-bridge` 接上本機 process 或 Docker DUT。執行 bridge 前，必須提供符合 Task 8 資格檢查的 selftest 報告：
+
+```bash
+python3 func-test/runner.py \
+  --mode bridge \
+  --case sm-01-attach-to-ready \
+  --selftest-report /path/to/selftest-report.json \
+  --report-dir /path/to/report-root
+
+# 同一批案例各跑一次 FakeTarget PTY 與外部 bridge
+python3 func-test/runner.py \
+  --mode both \
+  --selftest-report /path/to/selftest-report.json
+```
+
+bridge 執行只會把 daemon 的 state、run、WAL、config、log、events 與裝置索引目錄放在該次 harness 的暫存根目錄。`SERIALWRAP_CLI_EXE` 與 `SERIALWRAP_DAEMON_EXE` 可選擇要測的 CLI 與 daemon；兩者不會傳給隔離 daemon 作為產品設定。Windows bridge 需明確指定兩個 com0com 端點：
+
+```powershell
+python func-test/runner.py --mode bridge `
+  --selftest-report C:\reports\selftest-report.json `
+  --daemon-com COM20 --bridge-com COM21 `
+  --transport-mode virtual_com0com
+```
+
+執行結果寫到 `<report-dir>/<case>/<mode>/<run-index>/`，並在 report root 產生 `func-test-report.json`。每次 run 包含 `manifest.json`、`cli.ndjson`、`daemon.log` 與隔離 WAL 複本；bridge 模式另外包含 wire、control、DUT stderr、correlation 與 `comparison.json`。不存在的證據檔在 manifest 中記為 `null`，不建立空檔冒充證據。`tests/acceptance/cases.yaml` 尚未建立時，`cases_yaml_sha256` 為 `null` 且 `gate_eligible` 為 `false`。工具自測或核准 revision 不合格時，bridge run 會以 `INSUFFICIENT_EVIDENCE` 結束，不會標為 PASS。
+
 ## 目錄結構
 
 ```
@@ -31,18 +59,26 @@ func-test/
 ├── runner.py              # 測試執行器
 ├── README.md
 ├── lib/
-│   ├── fake_target.py     # 可組態 PTY fake target
-│   ├── daemon_harness.py  # Daemon 生命週期管理
-│   ├── cli_client.py      # CLI 呼叫包裝
-│   ├── console_client.py  # Console PTY 模擬
-│   ├── expect_engine.py   # 期望語法比對引擎
-│   └── yaml_loader.py     # YAML 載入
+│   ├── fake_target.py      # 可組態 PTY fake target
+│   ├── daemon_harness.py   # 隔離 daemon 與 DUT 的生命週期管理
+│   ├── bridge_session.py   # 外部 bridge、settle 與 wire tail
+│   ├── correlation.py      # 每步驟的操作與證據邊界
+│   ├── artifact_identity.py # CLI 與 daemon artifact 身分
+│   ├── target_config.py    # 跨平台 DUT 組態匯入
+│   ├── cli_client.py       # CLI 呼叫包裝
+│   ├── console_client.py   # POSIX PTY 與 Windows Telnet console
+│   ├── expect_engine.py    # 期望語法比對引擎
+│   └── yaml_loader.py      # YAML 載入
 └── cases/
     ├── sm-*.yaml          # 狀態機轉移測試
     ├── ha-*.yaml          # Human-agent 共用測試
     ├── rc-*.yaml          # 競態條件測試
     ├── re-*.yaml          # 復原測試
     └── co-*.yaml          # Console I/O 測試
+
+realhw/
+├── deployed_content.py    # 實際部署內容與 daemon image 量測
+└── telnet_client.py       # Windows console 共用的 Telnet codec
 ```
 
 ## YAML test case 格式
@@ -72,6 +108,12 @@ steps:                   # 測試步驟（循序執行）
   - action: cli
     argv: [...]
     expect: { ok: true }
+
+bridge:                   # 外部 bridge 模式的適用性與證據比較
+  applicable: true
+  compare: full            # full | none | until_op:<op_id>
+  run_args: []             # 僅接受 bridge run 的白名單參數
+  secrets_from_env: []     # 可選；列出需遮蔽的環境變數名稱
 ```
 
 ## 支援的 action
@@ -92,6 +134,13 @@ steps:                   # 測試步驟（循序執行）
 | `inject_device_event` | 模擬裝置拔插 |
 | `target_stop_responding` | Target 暫停回應 |
 | `repeat` | 重複執行子步驟 |
+| `shell` | 在 harness 根目錄與隔離環境中執行 shell 命令 |
+| `target_emit` | 由 DUT 輸出指定 bytes |
+| `wait_for_file` | 等待指定檔案出現 |
+| `write_file` | 展開變數後以 UTF-8 寫入檔案 |
+| `wait_state` | 輪詢 session，直到進入指定狀態 |
+
+`console_write.input_raw` 依 Latin-1 字元值逐 byte 傳送，適合 ESC、Tab 等特殊按鍵；超出 U+00FF 的字元會使該步驟失敗。
 
 ## 與 unittest 的差異
 

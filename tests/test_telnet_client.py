@@ -117,6 +117,7 @@ def test_telnet_console_against_fake_server():
 
     try:
         console = TelnetConsole(f"127.0.0.1:{port}", timeout_s=5.0)
+        assert console._socket.gettimeout() == 5.0
         console.write(b"ls\r\n")
         # server 收到協商回覆 (DO ECHO, DO SGA: fffd01fffd03) + b"ls\r\n"
         time_limit = time.monotonic() + 3.0
@@ -133,3 +134,63 @@ def test_telnet_console_against_fake_server():
     finally:
         server_done.set()
         th.join(timeout=2.0)
+
+
+@pytest.mark.process_rpc
+def test_telnet_console_read_collects_split_response_until_quiet() -> None:
+    """驗證 Telnet read 會累積分段回應，直到短暫靜默或呼叫逾時。"""
+    from lib.console_client import TelnetConsole
+
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.bind(("127.0.0.1", 0))
+    server_sock.listen(1)
+    port = server_sock.getsockname()[1]
+
+    def server_thread() -> None:
+        conn, _ = server_sock.accept()
+        try:
+            conn.sendall(b"EXEC:echo x\r\n")
+            time.sleep(0.12)
+            conn.sendall(b"RESULT:echo x:OK\r\n")
+            time.sleep(0.2)
+        finally:
+            conn.close()
+            server_sock.close()
+
+    thread = threading.Thread(target=server_thread, daemon=True)
+    thread.start()
+    console = TelnetConsole(f"127.0.0.1:{port}", timeout_s=2.0)
+    try:
+        received = console.read(timeout_s=1.0)
+        assert received == b"EXEC:echo x\r\nRESULT:echo x:OK\r\n"
+    finally:
+        console.close()
+        thread.join(timeout=2.0)
+
+
+@pytest.mark.memory_only
+def test_telnet_console_write_honors_character_delay(monkeypatch: pytest.MonkeyPatch) -> None:
+    """驗證 Telnet console 的逐字元輸出會套用 YAML delay_ms。"""
+    from lib.console_client import TelnetConsole
+    from realhw.telnet_client import TelnetClientCodec
+
+    class FakeSocket:
+        def __init__(self) -> None:
+            self.sent: list[bytes] = []
+
+        def sendall(self, data: bytes) -> None:
+            self.sent.append(data)
+
+    client = TelnetConsole.__new__(TelnetConsole)
+    client._closed = False
+    client.timeout_s = 5.0
+    client._codec = TelnetClientCodec()
+    client._socket = FakeSocket()
+    sleeps: list[float] = []
+    monkeypatch.setattr(client, "_receive", lambda timeout_s: False)
+    monkeypatch.setattr("lib.console_client.time.sleep", lambda seconds: sleeps.append(seconds))
+
+    client.write(b"\xffb", delay_ms=25)
+
+    assert client._socket.sent == [b"\xff\xff", b"b"]
+    assert sleeps == [0.025]

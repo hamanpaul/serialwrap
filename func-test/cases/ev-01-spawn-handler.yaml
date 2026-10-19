@@ -1,4 +1,3 @@
----
 meta:
   name: ev-01-spawn-handler
   category: event-engine
@@ -23,9 +22,9 @@ steps:
   - action: wait_ready
     timeout_s: 20
 
-  - action: shell
-    cmd: |
-      cat > /tmp/sw-ev-test-rule.json <<'JSON'
+  - action: write_file
+    path: "{run.root}/ev-rule.json"
+    content: |
       {
         "schema_version": 1,
         "owner": "ev",
@@ -33,20 +32,21 @@ steps:
         "kind": "tool",
         "selectors": ["COM0"],
         "pattern": {"kind": "contains", "value": "Kernel panic"},
-        "handler": {"shell": "touch /tmp/sw-ev-test-fired"},
+        "handler": {"shell": "\"{python}\" -c \"import pathlib,sys; pathlib.Path(sys.argv[1]).touch()\" \"{run.root}/ev-fired\""},
         "auto_enable_com_on_load": true,
         "timeout_ms": 3000
       }
-      JSON
-      rm -f /tmp/sw-ev-test-fired
+
+  - action: shell
+    cmd: '"{python}" -c "import pathlib,sys; pathlib.Path(sys.argv[1]).unlink(missing_ok=True)" "{run.root}/ev-fired"'
 
   - action: cli
-    argv: [event, add, --file, /tmp/sw-ev-test-rule.json]
+    argv: ["event", "add", "--file", "{run.root}/ev-rule.json"]
     expect:
       ok: true
 
   - action: cli
-    argv: [event, status, --selector, COM0]
+    argv: ["event", "status", "--selector", "COM0"]
     expect:
       ok: true
 
@@ -57,16 +57,20 @@ steps:
     payload: "Kernel panic - not syncing\n"
 
   - action: wait_for_file
-    path: /tmp/sw-ev-test-fired
+    path: "{run.root}/ev-fired"
     timeout_s: 8
 
   - action: cli
-    argv: [event, tail, --rule-id, ev.panic-marker, -n, "10"]
+    argv: ["event", "tail", "--rule-id", "ev.panic-marker", "-n", "10"]
     save_as: tail_resp
     expect:
       ok: true
       has_keys: ["entries"]
 
-  # Cleanup
   - action: shell
-    cmd: rm -f /tmp/sw-ev-test-fired /tmp/sw-ev-test-rule.json
+    cmd: '"{python}" -c "import pathlib,sys; [pathlib.Path(p).unlink(missing_ok=True) for p in sys.argv[1:]]" "{run.root}/ev-fired" "{run.root}/ev-rule.json"'
+
+bridge:
+  applicable: true
+  compare: full
+  windows_caps: [windows_com]

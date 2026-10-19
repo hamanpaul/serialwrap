@@ -14,13 +14,15 @@ class TestCase:
     name: str
     category: str
     severity: str
-    description: str
+    description: str = ""
     tags: list[str] = field(default_factory=list)
     repeat: int = 1
     target: dict[str, Any] = field(default_factory=dict)
     profile: dict[str, Any] = field(default_factory=dict)
     env_files: dict[str, str] = field(default_factory=dict)
     steps: list[dict[str, Any]] = field(default_factory=list)
+    bridge: dict[str, Any] = field(default_factory=lambda: {"applicable": False, "compare": "none"})
+    scenario: dict[str, Any] | None = None
     source_path: str = ""
 
 
@@ -42,6 +44,8 @@ def load_test_case(path: pathlib.Path) -> TestCase:
         profile=raw.get("profile") or {},
         env_files=raw.get("env_files") or {},
         steps=raw.get("steps") or [],
+        bridge=raw.get("bridge") or {"applicable": False, "compare": "none"},
+        scenario=meta.get("scenario") or raw.get("scenario"),
         source_path=str(path),
     )
 

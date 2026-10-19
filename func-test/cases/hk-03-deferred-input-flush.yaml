@@ -58,6 +58,16 @@ steps:
     expect:
       state: "READY"
 
+  - action: assert_wal
+    expect:
+      any_tx_contains_raw: ["echo deferred\r"]
+      tx_source_prefix: "human:"
+
   - action: detach_console
     console_id: "{con.client_id}"
     selector: COM0
+
+bridge:
+  applicable: true
+  compare: full
+  windows_caps: [windows_com]

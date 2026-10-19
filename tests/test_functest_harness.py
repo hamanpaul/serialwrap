@@ -167,6 +167,11 @@ def test_functest_manifest_records_deployed_bracket(monkeypatch, tmp_path):
         return fake_measures[min(idx, len(fake_measures) - 1)]
 
     monkeypatch.setattr(realhw.deployed_content, "measure", fake_measure)
+    monkeypatch.setattr(
+        realhw.deployed_content,
+        "live_daemon",
+        lambda pid, install: {"pid": pid, "image_path": "/fake/daemon", "in_install": False, "error": None},
+    )
 
     orig_start = daemon_harness.DaemonHarness.start
     orig_stop = daemon_harness.DaemonHarness.stop
@@ -186,7 +191,8 @@ def test_functest_manifest_records_deployed_bracket(monkeypatch, tmp_path):
 
     monkeypatch.setattr(daemon_harness.DaemonHarness, "start", tracked_start)
     monkeypatch.setattr(daemon_harness.DaemonHarness, "stop", tracked_stop)
-    monkeypatch.setattr(runner.TestRunner, "_wait_for_socket", lambda self, timeout_s=5.0: None)
+    monkeypatch.setattr(daemon_harness.DaemonHarness, "wait_endpoint", lambda self, timeout_s=5.0: None)
+    monkeypatch.setattr(runner.TestRunner, "_cli", lambda self, argv, timeout=10.0: {"pid": 12345})
 
     report_dir = tmp_path / "reports"
     case = TestCase(
@@ -208,7 +214,17 @@ def test_functest_manifest_records_deployed_bracket(monkeypatch, tmp_path):
     assert manifest["artifacts"]["deployed_content"] == {
         "start": fake_measures[0],
         "end": fake_measures[1],
+        "daemon_live": [
+            {"pid": 12345, "image_path": "/fake/daemon", "in_install": False, "error": None}
+        ],
     }
+    assert manifest["tool"]["approved"] is False
+    assert manifest["dut"]["seed"] == 0
+    assert manifest["evidence"]["wire"] is None
+    assert not (manifest_file.parent / "not-applicable" / "wire.ndjson").exists()
+    assert manifest["artifacts"]["deployed_content"]["daemon_live"] == [
+        {"pid": 12345, "image_path": "/fake/daemon", "in_install": False, "error": None}
+    ]
 
     measure_calls = [i for i, c in enumerate(calls) if c[0] == "measure"]
     start_calls = [i for i, c in enumerate(calls) if c[0] == "start"]
@@ -231,6 +247,28 @@ def test_artifact_env_names_popped_by_repo_conftest():
     content = conftest_path.read_text(encoding="utf-8")
     assert '"SERIALWRAP_CLI_EXE"' in content or "'SERIALWRAP_CLI_EXE'" in content
     assert '"SERIALWRAP_DAEMON_EXE"' in content or "'SERIALWRAP_DAEMON_EXE'" in content
+
+
+@pytest.mark.memory_only
+def test_cli_subprocess_uses_explicit_utf8(monkeypatch: pytest.MonkeyPatch) -> None:
+    """驗證 Windows CLI 輸出固定以 UTF-8 解碼並替換非法位元組。"""
+    from lib import cli_client
+
+    captured: dict[str, Any] = {}
+
+    class FakeResult:
+        returncode = 0
+        stdout = '{"ok":true}'
+        stderr = ""
+
+    monkeypatch.setattr(cli_client, "resolve_cli_exe", lambda: ["serialwrap"])
+    monkeypatch.setattr(cli_client.subprocess, "run", lambda *args, **kwargs: captured.update(kwargs) or FakeResult())
+
+    result = cli_client.cli_run([], socket_path="tcp://127.0.0.1:1", env={})
+
+    assert result["ok"] is True
+    assert captured["encoding"] == "utf-8"
+    assert captured["errors"] == "replace"
 
 
 @pytest.mark.memory_only
@@ -264,10 +302,12 @@ def test_settle_snapshot_retries_until_stable(monkeypatch):
     from lib import bridge_session
 
     call_count = 0
+    barrier_params: list[dict[str, Any]] = []
 
     def fake_call(action: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         nonlocal call_count
         if action == "barrier":
+            barrier_params.append(dict(params or {}))
             call_count += 1
             offsets = 30 if call_count >= 5 else (10 * ((call_count + 1) // 2) + (call_count % 2))
             return {"status": "ok", "offsets": {"serial_read": offsets}, "settled": True}
@@ -291,6 +331,8 @@ def test_settle_snapshot_retries_until_stable(monkeypatch):
     res = bs.snapshot(settle=True)
     assert res["settled"] is True
     assert res["wal_seq"] == 42
+    assert barrier_params
+    assert all("quiet_ms" not in params or params["quiet_ms"] >= 500 for params in barrier_params)
 
     call_count = 0
 
@@ -304,6 +346,73 @@ def test_settle_snapshot_retries_until_stable(monkeypatch):
     monkeypatch.setattr(bs, "call", fake_call_unstable)
     res_unstable = bs.snapshot(settle=True)
     assert res_unstable["settled"] is False
+
+
+@pytest.mark.memory_only
+def test_profile_login_defaults_and_uart_overrides_are_nested() -> None:
+    """驗證 login_regex 的相容預設值保留，uart.* 覆寫合併到 uart 子區段。"""
+    import yaml
+    from lib import daemon_harness
+
+    h = daemon_harness.DaemonHarness(daemon_harness.HarnessConfig(profile_overrides={
+        "login_regex": "(?i)login",
+        "uart.baud": 230400,
+        "uart.flow_control": "none",
+    }))
+    profile = yaml.safe_load(h._build_profile_yaml("COM7"))["profiles"]["func-test-template"]
+
+    assert profile["password_regex"] == "(?i)password"
+    assert profile["user_env"] == "USER"
+    assert profile["pass_env"] == "PASS"
+    assert profile["uart"]["baud"] == 230400
+    assert profile["uart"]["flow_control"] == "none"
+    assert "uart.baud" not in profile
+
+
+@pytest.mark.memory_only
+def test_harness_preserves_bridge_shutdown_result() -> None:
+    """驗證 harness 保存 bridge 的 exit code 與關閉 manifest 結果。"""
+    from lib import daemon_harness
+
+    expected = {"exit_code": 3, "closed_cleanly": False, "failure": "HARNESS_EVIDENCE_WRITE_FAILED"}
+
+    class FakeBridgeSession:
+        def stop(self) -> dict[str, Any]:
+            return dict(expected)
+
+    h = daemon_harness.DaemonHarness()
+    h.bridge = FakeBridgeSession()
+    h.stop()
+
+    assert h.bridge_stop_result == expected
+
+
+@pytest.mark.memory_only
+def test_wire_tail_uses_stream_offsets_and_does_not_join_streams(tmp_path: pathlib.Path) -> None:
+    """驗證 WireTail 只串接同一埠世代的連續 offset，並回傳 stream_offset。"""
+    import base64
+    from lib.bridge_session import WireTail
+
+    wire = tmp_path / "wire.ndjson"
+    records = [
+        {"seq": 1, "port_id": "p1", "endpoint_generation": 1, "observation": "serial_read", "stream_offset": 0, "payload_b64": base64.b64encode(b"ab").decode()},
+        {"seq": 2, "port_id": "p2", "endpoint_generation": 1, "observation": "serial_read", "stream_offset": 0, "payload_b64": base64.b64encode(b"CD").decode()},
+        {"seq": 3, "port_id": "p1", "endpoint_generation": 1, "observation": "serial_read", "stream_offset": 2, "payload_b64": base64.b64encode(b"ef").decode()},
+    ]
+    wire.write_text("".join(json.dumps(row) + "\n" for row in records), encoding="utf-8")
+    tail = WireTail(wire)
+
+    assert tail.find(b"ef", observation="serial_read", timeout_s=0) == 2
+    assert tail.find(b"bC", observation="serial_read", timeout_s=0) is None
+
+    records[2]["endpoint_generation"] = 2
+    wire.write_text("".join(json.dumps(row) + "\n" for row in (records[0], records[2])), encoding="utf-8")
+    assert tail.find(b"bc", observation="serial_read", timeout_s=0) is None
+
+    records[2]["endpoint_generation"] = 1
+    records[2]["stream_offset"] = 3
+    wire.write_text("".join(json.dumps(row) + "\n" for row in (records[0], records[2])), encoding="utf-8")
+    assert tail.find(b"bc", observation="serial_read", timeout_s=0) is None
 
 
 @pytest.mark.process_rpc

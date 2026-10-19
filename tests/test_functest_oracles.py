@@ -34,13 +34,17 @@ def test_mode_stats_separate():
         {"case_id": "c2", "mode": "bridge", "run_index": 0, "verdict": "PASS"},
         {"case_id": "c2", "mode": "bridge", "run_index": 1, "verdict": "PASS"},
     ]
-    report = runner.build_summary_report(results, independent_cases=["c1", "c2"])
+    results.append({"case_id": "c2", "mode": "bridge", "run_index": 2, "verdict": "SKIP"})
+    started_at = "2026-10-19T00:00:00+00:00"
+    report = runner.build_summary_report(results, independent_cases=["c1", "c2"], started_at=started_at)
     assert report["independent_cases"] == 2
     assert report["modes"]["pty"]["runs"] == 4
-    assert report["modes"]["bridge"]["runs"] == 4
+    assert report["modes"]["bridge"]["runs"] == 5
+    assert report["modes"]["bridge"]["skip"] == 1
+    assert report["started_at"] == started_at
 
 
-def test_unqualified_bridge_never_pass(tmp_path: pathlib.Path):
+def test_unqualified_bridge_never_pass(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch):
     """驗證未核准或不合格的 bridge 自測報告絕不會得到 PASS，改記 INSUFFICIENT_EVIDENCE。"""
     import runner
 
@@ -51,9 +55,136 @@ def test_unqualified_bridge_never_pass(tmp_path: pathlib.Path):
         "qualified": False,
     }), encoding="utf-8")
 
+    bridge_src = REPO_ROOT / "tools" / "uart_stdio_bridge" / "src"
+    if str(bridge_src) not in sys.path:
+        sys.path.insert(0, str(bridge_src))
+    import uart_stdio_bridge.selftest.runner as selftest_runner
+
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(selftest_runner, "load_approved_revision", lambda path=None: {"tree_sha256": "approved"})
+
+    def unqualified(report: dict[str, Any], **kwargs: Any) -> bool:
+        calls.append({"report": report, "approved": kwargs.get("approved")})
+        return False
+
+    monkeypatch.setattr(selftest_runner, "is_qualified", unqualified)
     verdict, gate_eligible = runner.evaluate_bridge_eligibility(bad_report)
     assert gate_eligible is False
     assert verdict == "INSUFFICIENT_EVIDENCE"
+    assert calls and calls[0]["report"]["qualified"] is False
+    assert calls[0]["approved"] == {"tree_sha256": "approved"}
+
+
+def test_cases_yaml_digest_requires_matching_freeze_lock(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """驗證承接清單缺鎖或 revision 不合時不具 gate 資格。"""
+    import runner
+    from lib.yaml_loader import TestCase
+
+    monkeypatch.setattr(runner, "ROOT_DIR", tmp_path)
+    acceptance = tmp_path / "tests" / "acceptance"
+    acceptance.mkdir(parents=True)
+    cases_path = acceptance / "cases.yaml"
+    cases_path.write_text("schema_version: 1\nrevision: r1\n", encoding="utf-8")
+    tc = TestCase(name="frozen", category="test", severity="low", target={}, profile={}, env_files={}, steps=[])
+    tr = runner.TestRunner(tc, mode="bridge", report_dir=tmp_path / "reports")
+
+    digest, frozen = tr._acceptance_cases_info()
+    assert len(digest or "") == 64
+    assert frozen is False
+
+    required_sets = {"stage0", "cli_1A", "cli_1B", "slice_2.1", "slice_2.2", "slice_2.3", "slice_2.4"}
+    (acceptance / "cases.lock.json").write_text(json.dumps({
+        "schema_version": 1,
+        "cases_revision": "r1",
+        "sets": {key: [] for key in required_sets},
+    }), encoding="utf-8")
+    assert tr._acceptance_cases_info() == (digest, True)
+
+
+def test_full_bridge_comparison_uses_final_settle_marker(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path):
+    """驗證 full 比較窗口固定在最終 __settle_end__ marker。"""
+    import runner
+
+    bridge_src = REPO_ROOT / "tools" / "uart_stdio_bridge" / "src"
+    if str(bridge_src) not in sys.path:
+        sys.path.insert(0, str(bridge_src))
+    import uart_stdio_bridge.compare as compare_module
+    from lib.yaml_loader import TestCase
+
+    captured: dict[str, Any] = {}
+
+    def fake_compare(inputs: Any) -> dict[str, Any]:
+        captured["until_op"] = inputs.until_op
+        return {"verdict": "PASS", "reasons": []}
+
+    monkeypatch.setattr(compare_module, "compare", fake_compare)
+    tc = TestCase(
+        name="full-window",
+        category="test",
+        severity="low",
+        target={"com": "COM0"},
+        profile={},
+        env_files={},
+        bridge={"applicable": True, "compare": "full"},
+    )
+    tr = runner.TestRunner(tc, mode="bridge", report_dir=tmp_path)
+    tr.run_dir.mkdir(parents=True)
+
+    tr._compare_evidence("full")
+
+    assert captured["until_op"] == "__settle_end__"
+
+
+def test_comparison_insufficient_evidence_stays_insufficient():
+    """驗證比較器的 INSUFFICIENT_EVIDENCE 不會被折成產品 FAIL。"""
+    import runner
+    from lib.yaml_loader import TestCase
+
+    tc = TestCase(name="comparison", category="test", severity="low", target={}, profile={}, env_files={}, steps=[])
+    tr = runner.TestRunner(tc, mode="bridge")
+    tr._bridge_eligible = True
+    tr.comparison = {"verdict": "INSUFFICIENT_EVIDENCE"}
+
+    assert tr._final_verdict(ok=False) == "INSUFFICIENT_EVIDENCE"
+
+
+def test_settle_marker_records_unsettled_evidence():
+    """驗證 settle marker 未達 settled 時會將本次 run 降為證據不足。"""
+    import runner
+    from lib.yaml_loader import TestCase
+
+    tc = TestCase(name="unsettled", category="test", severity="low", target={}, profile={}, env_files={}, steps=[])
+    tr = runner.TestRunner(tc, mode="bridge")
+
+    class FakeCorrelation:
+        def op_start(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def op_end(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+    tr.correlation = FakeCorrelation()
+    tr._bridge_snapshot = lambda *, settle: {"settled": False, "wire": None}  # type: ignore[method-assign]
+    tr._settle_marker("__settle_end__", 0)
+
+    assert tr._settle_failure is not None
+    assert tr._final_verdict(ok=True) == "INSUFFICIENT_EVIDENCE"
+
+
+def test_bridge_shutdown_failure_downgrades_pass():
+    """驗證 bridge shutdown 不乾淨時即使步驟與比較器通過仍屬證據不足。"""
+    import runner
+    from lib.yaml_loader import TestCase
+
+    tc = TestCase(name="shutdown", category="test", severity="low", target={}, profile={}, env_files={}, steps=[])
+    tr = runner.TestRunner(tc, mode="bridge")
+    tr._bridge_eligible = True
+    tr.comparison = {"verdict": "PASS"}
+    tr._bridge_shutdown_failure = "bridge exit 3"
+
+    assert tr._final_verdict(ok=True) == "INSUFFICIENT_EVIDENCE"
 
 
 def test_has_interactive_computed_from_console_list():
@@ -82,8 +213,8 @@ def test_any_tx_contains_raw_list_and_prefix():
     import runner
 
     records = [
-        {"source": "human:1", "payload_b64": "G1tB"},  # \x1b[A
-        {"source": "agent:1", "payload_b64": "CQ=="},   # \t
+        {"dir": "TX", "source": "human:1", "payload_b64": "G1tB"},  # \x1b[A
+        {"dir": "TX", "source": "agent:1", "payload_b64": "CQ=="},   # \t
     ]
     assert runner.check_wal_tx_contains_raw(records, ["\x1b[A"], tx_source_prefix="human:") is True
     assert runner.check_wal_tx_contains_raw(records, ["\t"], tx_source_prefix="human:") is False
@@ -173,10 +304,16 @@ def test_cowork01_ready_reachable():
     steps = data.get("steps", [])
     bad_cmd_idx = -1
     next_submit_idx = -1
+    def is_submit(step: dict[str, Any]) -> bool:
+        if step.get("action") == "submit_command":
+            return True
+        argv = step.get("argv", [])
+        return step.get("action") == "cli" and len(argv) >= 2 and argv[:2] == ["cmd", "submit"]
+
     for idx, s in enumerate(steps):
-        if s.get("action") in ("submit_command", "cli") and ("bad-hang" in str(s)):
+        if is_submit(s) and "bad-hang" in str(s):
             bad_cmd_idx = idx
-        elif bad_cmd_idx >= 0 and s.get("action") in ("submit_command", "cli") and ("cmd" in str(s) or "command" in str(s)):
+        elif bad_cmd_idx >= 0 and is_submit(s):
             next_submit_idx = idx
             break
 
@@ -200,6 +337,14 @@ def test_brcm_secret_from_env_file(monkeypatch: pytest.MonkeyPatch):
     assert b"admin" in extracted
 
 
+def test_bridge_secrets_from_environment_are_resolved(monkeypatch: pytest.MonkeyPatch):
+    """驗證 bridge.secrets_from_env 的環境變數值會以 bytes 傳入遮蔽清單。"""
+    import runner
+
+    monkeypatch.setenv("FUNC_TEST_SECRET", "secret-value")
+    assert runner.resolve_secrets_from_env(["FUNC_TEST_SECRET", "MISSING_SECRET"]) == [b"secret-value"]
+
+
 def test_expand_in_shell_and_wait_for_file(tmp_path: pathlib.Path):
     """驗證 runner 的變數展開支援 {run.root}，並套用至 shell.cmd、wait_for_file.path 與 write_file.path。"""
     import runner
@@ -219,6 +364,147 @@ def test_expand_in_shell_and_wait_for_file(tmp_path: pathlib.Path):
 
     assert tr._expand("echo {run.root}") == f"echo {tmp_path}"
     assert tr._expand("{run.root}/x") == f"{tmp_path}/x"
+
+    ready_file = tmp_path / "ready"
+    ready_file.write_text("ok", encoding="utf-8")
+    tr._step_wait_for_file({"path": "{run.root}/ready", "timeout_s": 0.1}, 0)
+
+
+def test_write_file_expands_json_values_without_breaking_windows_paths(tmp_path: pathlib.Path):
+    """驗證 JSON 內容先解析再展開，可保留 Windows 路徑反斜線。"""
+    import runner
+    from lib.yaml_loader import TestCase
+
+    tc = TestCase(name="json-write", category="test", severity="low", target={}, profile={}, env_files={}, steps=[])
+    tr = runner.TestRunner(tc)
+    tr.variables["python"] = r"C:\Python312\python.exe"
+    tr.variables["run"] = {"root": r"C:\Users\tester\AppData\Local\Temp\run-1"}
+    out = tmp_path / "rule.json"
+
+    tr._step_write_file({
+        "path": str(out),
+        "content": '{"python":"{python}","output":"{run.root}/ev-fired"}',
+    }, 0)
+
+    parsed = json.loads(out.read_text(encoding="utf-8"))
+    assert parsed == {
+        "python": r"C:\Python312\python.exe",
+        "output": r"C:\Users\tester\AppData\Local\Temp\run-1/ev-fired",
+    }
+
+
+def test_parallel_captures_non_step_exceptions():
+    """驗證 parallel 子步驟拋出的非 StepError 會向上回報。"""
+    import runner
+    from lib.yaml_loader import TestCase
+
+    tc = TestCase(name="parallel-error", category="test", severity="low", target={}, profile={}, env_files={}, steps=[])
+    tr = runner.TestRunner(tc)
+
+    with pytest.raises(runner.StepError, match="parallel"):
+        tr._step_parallel({"steps": [{"action": "sleep", "seconds": "abc"}]}, 1)
+
+
+def test_main_list_prints_every_case(capsys: pytest.CaptureFixture[str]):
+    """驗證 --list 會輸出所有案例，不在第一筆提早返回。"""
+    import runner
+
+    assert runner.main(["--list"]) == 0
+    output = capsys.readouterr().out
+    assert "brcm-01-login-flow" in output
+    assert "sm-04-device-unplug" in output
+
+
+def test_scenarios_option_fails_until_task_11(monkeypatch: pytest.MonkeyPatch):
+    """驗證尚未支援的 --scenarios 不會被解析後靜默忽略。"""
+    import runner
+
+    monkeypatch.setattr(runner, "discover_test_cases", lambda *args, **kwargs: [])
+    with pytest.raises(SystemExit) as exc_info:
+        runner.main(["--scenarios"])
+    assert exc_info.value.code == 2
+
+
+def test_bridge_mode_skips_inapplicable_case_without_starting_harness(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+):
+    """驗證 bridge.applicable=false 會記為 SKIP 且不啟動 daemon。"""
+    import runner
+    from lib.yaml_loader import TestCase
+
+    tc = TestCase(
+        name="not-bridge-applicable",
+        category="test",
+        severity="low",
+        target={},
+        profile={},
+        env_files={},
+        steps=[],
+        bridge={"applicable": False, "compare": "none"},
+    )
+    monkeypatch.setattr(runner, "discover_test_cases", lambda *args, **kwargs: [tc])
+    monkeypatch.setattr(runner.TestRunner, "run", lambda self: pytest.fail("SKIP case must not start harness"))
+    monkeypatch.setattr(runner.TestRunner, "_write_manifest", lambda self, *args, **kwargs: None)
+
+    rc = runner.main([
+        "--mode", "bridge",
+        "--case", tc.name,
+        "--selftest-report", str(tmp_path / "not-read.json"),
+        "--report-dir", str(tmp_path / "reports"),
+    ])
+
+    report = json.loads((tmp_path / "reports" / "func-test-report.json").read_text(encoding="utf-8"))
+    assert rc == 1
+    assert report["results"][0]["verdict"] == "SKIP"
+    assert report["modes"]["bridge"]["skip"] == 1
+
+
+def test_bridge_run_args_reach_harness_config(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path):
+    """驗證 case bridge.run_args 由 runner 傳入 HarnessConfig。"""
+    import runner
+    from lib import artifact_identity
+    from lib.yaml_loader import TestCase
+
+    config_type = runner.HarnessConfig
+    captured: dict[str, Any] = {}
+
+    class FakeHarness:
+        def __init__(self, config: Any) -> None:
+            captured["config"] = config
+            self.root = tmp_path / "harness"
+            self.endpoint = "unix:///tmp/isolated.sock"
+            self.env = {}
+
+        def start(self) -> None:
+            raise runner.StepError("測試停止")
+
+        def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr(runner, "evaluate_bridge_eligibility", lambda *_: ("PASS", True))
+    monkeypatch.setattr(runner, "HarnessConfig", lambda **kwargs: config_type(**kwargs))
+    monkeypatch.setattr(runner, "DaemonHarness", FakeHarness)
+    monkeypatch.setattr(runner.TestRunner, "_new_correlation", lambda self: None)
+    monkeypatch.setattr(runner.TestRunner, "_tool_identity", lambda self: {"approved": True})
+    monkeypatch.setattr(runner.TestRunner, "_capture_live_daemon", lambda self: None)
+    monkeypatch.setattr(runner.TestRunner, "_write_manifest", lambda self, *args, **kwargs: None)
+    monkeypatch.setattr(artifact_identity, "collect_artifacts", lambda *args, **kwargs: {})
+    monkeypatch.setattr("realhw.deployed_content.measure", lambda *args, **kwargs: {})
+
+    tc = TestCase(
+        name="bridge-args",
+        category="test",
+        severity="low",
+        target={},
+        profile={},
+        env_files={},
+        steps=[],
+        bridge={"applicable": True, "compare": "none", "run_args": ["--read-chunk", "64"]},
+    )
+    tr = runner.TestRunner(tc, mode="bridge", selftest_report=tmp_path / "selftest.json", report_dir=tmp_path)
+    tr.run()
+
+    assert captured["config"].bridge_run_args == ("--read-chunk", "64")
 
 
 def test_report_never_embeds_payload():

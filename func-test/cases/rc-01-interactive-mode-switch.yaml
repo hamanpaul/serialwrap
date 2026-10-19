@@ -59,3 +59,8 @@ steps:
   - action: wait_command_done
     cmd_id: "{post_race.cmd_id}"
     timeout_s: 10
+
+bridge:
+  applicable: true
+  compare: full
+  windows_caps: [windows_com]
