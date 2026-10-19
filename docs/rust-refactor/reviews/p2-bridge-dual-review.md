@@ -1572,3 +1572,369 @@ FAILED tests/test_wal_missing_detection.py::TestWalHealth::test_recreated_wal_is
 > [!NOTE]
 > 401 項失敗為並行 P1 worktree 尚未合併之已知 Stage 0 BC 基準；未引入任何新增測試失敗。
 
+## P2-T2（補審，Task 原未經抽取而缺正規 TDD／雙審）
+
+- 來源：workflow `wf_324d13ee-770`；修正 commit `1095ac8`（實作者 Codex gpt-6-luna）
+
+### 審查 A（Sonnet max）
+
+P2-T2 review. Worktree: `~/prj_pri/serialwrap-worktrees/rust-refactor` (branch feature/rust-refactor, HEAD d5cb480). The T2 files are unchanged since 80fa3b7, and I modified no repo files. There are 12 findings, and the first one is high severity.
+
+Requested command: `python3 -m pytest -q tools/uart_stdio_bridge/tests/test_records.py tools/uart_stdio_bridge/tests/test_writer.py tests/test_acceptance_schemas.py` gave `26 passed in 0.78s`. That is the 25 plan-listed tests plus one extra T7-builder test in `tests/test_acceptance_schemas.py`. The T5/T7 consumer tests also pass (66 passed).
+
+**Conformant, checked**
+- **CRC:** I recomputed all 6 golden vectors with an independent bitwise CRC-32 (reflected 0xEDB88320, init and xorout 0xFFFFFFFF). All match, and the fixture is identical to the plan text. The variant and format equal the product WAL (`& 0xFFFFFFFF:08x`).
+- **Record format:** the schema `required` set is exactly the 20 fields with `additionalProperties:false`, and the observation-to-dir mapping and META shape match the plan.
+- **Boundary:** `evidence/*` imports only the stdlib, and `test_boundary.py` carries the AST guard.
+- **Later tasks:** a real `uart_stdio_bridge run` session produced wire and control records that all validate against `bridge_record` and `bridge_control`. File modes were 0600 and the directory 0700. The T7 `evidence_builder` output validates against `bridge_record` and `correlation`. T3's `EndpointWriteUncertain` feeds T5's `write_uncertain` META with `accepted_len:null` and `loss_flag:true`.
+
+**File legend (all under `~/prj_pri/serialwrap-worktrees/rust-refactor`)**
+- `writer.py`, `records.py`, `manifest.py` and `clock.py` are in `tools/uart_stdio_bridge/src/uart_stdio_bridge/evidence/`.
+- `core.py` is `tools/uart_stdio_bridge/src/uart_stdio_bridge/bridge/core.py`.
+- `runner.py` is `tools/uart_stdio_bridge/src/uart_stdio_bridge/selftest/runner.py`.
+- `test_writer.py` is `tools/uart_stdio_bridge/tests/test_writer.py`.
+- `bridge_record.schema.json` is `tests/acceptance/bridge_record.schema.json`.
+- `test_acceptance_schemas.py` is `tests/test_acceptance_schemas.py`.
+- Repro scripts and the mutation harness are in `<scratch>` (`exp/e1`..`e8`, `mutate.py`).
+
+**Findings**
+
+1. **HIGH, `flush()`/`close()` are unbounded and `close()` can silently abandon records (`writer.py:223-266`).**
+   - `flush(timeout_s)` never uses `timeout_s` (line 224 is a bare `self._queue.join()`). It also holds `_lock` across `os_fsync`, which stalls every `emit_*` and `failure` reader.
+   - `close()` calls `self._queue.put(None)` with no timeout (line 249) and ignores whether `join(timeout=10.0)` expired (line 250). It swallows fsync and `os.close` errors (lines 253-260).
+   - Repro, worker blocked in `os_write`:
+     - `flush(timeout_s=0.3)` is still blocked after 3 s.
+     - With the queue full, `close()` blocks until the worker is released.
+     - With the queue not full, `close()` returns after 10 s with `records:0,bytes:0` and `failure None`, although an emitted record was never written, and it closes the fd under the live worker.
+     - `close()` with a failing fsync also returns a clean summary with `failure None`.
+   - Impact in the bridge: `core.py:610` `_flush_writer()` runs in barrier, checkpoint and shutdown with no other bound, although the plan's T5 barrier promises `timeout_ms=5000`. `core.py:1162-1219` would then write `closed_cleanly:true`.
+   - Fix:
+     - Wait on `with self._queue.all_tasks_done:` until `unfinished_tasks==0` or the deadline. On expiry set `failure="HARNESS_EVIDENCE_WRITE_FAILED"` and raise `EvidenceFailure`. Run the fsync outside `_lock`.
+     - In `close()`, use `put(None, timeout=...)`. If the queue is full or the thread is still alive after join, set failure and do not close the fd. Make fsync and close errors set failure.
+     - Use one errno classifier for the worker, `flush` and `close`. This also fixes ENOSPC at fsync, which `writer.py:233-237` labels `WRITE_FAILED` instead of `HARNESS_DISK_FULL`.
+     - Add `test_writer_flush_timeout_raises` and `test_writer_close_stuck_worker_sets_failure`.
+
+2. **MEDIUM, the plan's `evidence_failure` META is never written (plan I2-1 step 2: on overflow "寫一筆 evidence_failure META（若仍可寫）").**
+   - Only the schema enum and one test sample mention it. After a fail-stop the file just ends, with no seq or offset gap at the tail and no in-band marker with `loss_flag:true`.
+   - The dropped record's seq and `_offsets` stay consumed (`writer.py:140-144, 166, 207`), so `offsets()` over-reports.
+   - Fix: reserve one queue slot, `Queue(maxsize=max_pending_records+1)`, and enforce the limit for normal records. On overflow, `put_nowait` a prebuilt `make_meta_record(meta={"event":"evidence_failure","code":...}, loss_flag=True)`. Roll back `_seq` and `_offsets[key]` for the record that was not enqueued. On the first worker failure, make one best-effort attempt to append the same META. Test: after overflow and release, the last line is that META with seq = last+1.
+
+3. **MEDIUM, the worker keeps writing after the first failure (`writer.py:94-121`).**
+   - Repro: with ENOSPC on record 2 of 4, the file holds seq 1,3,4. With a 20-byte partial write then ENOSPC, there is a corrupt merged line, and `close()` reports bytes=1180 against a 1200-byte file, with a sha256 that does not match the file.
+   - Fix: after `get()`, check `failure` under the lock. If it is set, skip `os_write`, just call `task_done()` and count the item as dropped, so the file ends at the last good record. Test `test_writer_stops_writing_after_failure`.
+
+4. **MEDIUM, lifecycle holes drop data silently.**
+   - `emit_*` after `close()` returns a seq and enqueues to a queue nobody drains, with `failure None`.
+   - `emit_*` before `start()` is accepted. `flush()` before `start()` blocks forever, and `close()` without `start()` returns zeros, dropping the queued record.
+   - Fix: add a state field (`new`/`running`/`closed`). Raise `EvidenceFailure` from `emit_*` and `flush` unless the state is `running`. Make `close()` set failure if items are pending.
+
+5. **MEDIUM, the "uncertain write is not a success" rule is not encoded in the schema (`bridge_record.schema.json`, `allOf` from line 117, event enum at lines 152-169).**
+   - The schema accepts `write_uncertain` with `accepted_len == requested_len` and `loss_flag:false`, and also `write_uncertain` with no fields at all. It accepts `evidence_failure` with no `code` and `loss_flag:false`. Spec §15.6.2 forbids filling the requested length in as the accepted length.
+   - Fix: add `allOf` if/then clauses.
+     - For `write_uncertain`: `loss_flag` const true. `meta` requires `event`, `observation` (enum `dut_stdin_write`/`serial_write`), `offset_start` (int ≥0), `requested_len` (int ≥1), `accepted_len` (type null) and `error`.
+     - For `evidence_failure`: `loss_flag` true and `meta.code` matching `^HARNESS_[A-Z0-9_]+$`.
+     - Add matching negative tests.
+
+6. **MEDIUM, the tests do not protect the guarantees.**
+   - Mutation testing on a scratch copy killed 31 of 55 non-equivalent mutants; 24 survived.
+   - Key survivors:
+     - `test_writer_concurrent_emit_unique_seq` (`test_writer.py:206-229`) sorts by seq, so deleting `_emit_lock` passes. Without the lock, 4 of 6 runs wrote out-of-order lines, which `load_wire` flags as `HARNESS_SEQ_GAP`. Assert `[r["seq"] for r in recs] == list(range(1,4001))` in file order.
+     - `loss_flag=True` pass-through in `make_meta_record` and `emit_meta` is untested. Add a test that the on-disk META has `"loss_flag":true`.
+     - base64 alphabet and padding are untested. A urlsafe alphabet or stripped padding passes, because no payload needs `+`, `/` or `=`. Add 1-, 2- and 3-byte and `range(256)` payloads with `b64decode(..., validate=True) == payload`.
+     - `_check_common` (seq or generation <1) and `clock_id()` have no tests.
+     - Deleting the whole schema `allOf`, or any single clause (`len` min, data `loss_flag`, data `meta`, event enum, dir mapping, payload pattern, source, seq/generation min, META offset/crc), keeps all tests green. Add negative cases for META and data.
+     - Windows `com_driver`, `windows_build` and hvci parsing are untested.
+
+7. **MEDIUM, `platform_info(endpoint="win-serial", com_driver=..., com_driver_install_method=...)` is dead code.**
+   - `core.py:1216` and `runner.py:55` call `platform_info()` with no arguments, and `cli.py` has no `--com-driver-install-method`. So `com_driver` (§15.8.3 driver qualification) never reaches the bridge manifest or the selftest report.
+   - Fix: pass `endpoint=self.endpoint.kind` and the driver info at both call sites, add the CLI option, and add a unit test for the win-serial branch.
+
+8. **LOW, validation runs after the counters change (`writer.py:140-147, 185-189`).**
+   - `_seq += 1` and `_offsets[key] += len(payload)` happen before `make_*` and `dumps_record` can raise. Repro: unknown observation, generation 0 and a META without `event` made seq jump 1→5, and `offsets("COM0",0)` showed phantom offsets. The Bridge masks this by failing stop, but direct API users get an undetectable seq gap.
+   - Fix: build the record from candidate values and commit the counters only on success. Add a test.
+
+9. **LOW, `write_json_atomic` changes permissions on a pre-existing parent directory (`manifest.py:25`).**
+   - It calls `ensure_private_dir(parent)`, which chmods the parent to 0700. Probe: 0755 became 0700, and writing into `/tmp` raised PermissionError. The plan only requires the file to be 0600.
+   - Fix: use `path.parent.mkdir(parents=True, exist_ok=True)` only.
+
+10. **LOW, `clock_id()` is re-evaluated per control record while the writer uses a single value (`core.py:507,518`).**
+    - The Windows formula `int(time.time()-time.monotonic())` depends on the wall clock and Python 3.12's 15.6 ms monotonic tick. `control.ndjson` could therefore carry a `clock_id` different from `wire.ndjson`. I could not reproduce this on Linux.
+    - Fix: cache it with `functools.lru_cache(maxsize=1)` in `clock.py`.
+
+11. **LOW, schema and records hardening.**
+    - `wall_ts` is only `minLength:1`. The product WAL schema pins `^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d{6})?\+00:00$`, and the bridge schema accepts "yesterday" and the `Z` form that 80fa3b7 had to fix.
+    - `make_meta_record` accepts any non-empty `event`: the writer persisted `bridge_strat`, and only the schema rejects it.
+    - `make_data_record` accepts an empty payload.
+    - Fix: pin the same `wall_ts` pattern. Validate `event` against a `META_EVENTS` set exported from `records.py` and add a test that it equals the schema enum. Reject `len(payload)==0`. Optionally make `start()` call `ensure_private_dir(parent)`, since the Interfaces comment implies it and today only the callers do.
+
+12. **LOW, process.**
+    - 32ce5a7 landed the implementation with no tests. 80fa3b7 changed `records.py`, `writer.py` and `manifest.py` and added the tests in the same commit, by the same author, so there was no red phase (plan §1 items 2 and 5). The mutation survivors in finding 6 show the cost.
+    - Fix: have an independent test author add the missing tests from findings 1-8 and 11 as a separate `test(...)` commit.
+
+### 審查 B（Codex gpt-6.1-sol medium）
+
+The Codex review ran and returned findings. Its stdout was cut to the last 15000 bytes by `tail -c`, so the start of the transcript is not included.
+
+```
+: __version__,
+        "tree_sha256": tool_tree_sha256(),
+    }
+
+    integrity_res = verify_integrity(evidence_dir, wal_dir, checkpoint=checkpoint_path)
+    wire_records = integrity_res.wire_records
+    wal_records = integrity_res.wal_records
+    correlation_records = integrity_res.correlation_records
+    problems = list(integrity_res.problems)
+
+    run_id = "compare-run"
+    case_id = "compare-case"
+    if wire_records:
+        run_id = str(wire_records[0].get("run_id", run_id))
+        case_id = str(wire_records[0].get("case_id", case_id))
+    elif correlation_records:
+        run_id = str(correlation_records[0].get("run_id", run_id))
+        case_id = str(correlation_records[0].get("case_id", case_id))
+
+    zero_offsets = {
+        "serial_read": 0,
+        "dut_stdin_write": 0,
+        "dut_stdout_read": 0,
+        "serial_write": 0,
+    }
+
+    if problems:
+        reasons_list: list[str] = []
+        for p in problems:
+            code = p["code"]
+            if code not in reasons_list:
+                reasons_list.append(code)
+        return {
+            "schema_version": "comparison.v1",
+            "run_id": run_id,
+            "case_id": case_id,
+            "verdict": "INSUFFICIENT_EVIDENCE",
+            "reasons": reasons_list,
+            "tool": tool_info,
+            "integrity": integrity_res.integrity_data,
+            "window": {
+                "until_op": inputs.until_op,
+                "wal_seq": 0,
+                "wire_offsets": zero_offsets,
+                "endpoint_generation": 1,
+            },
+            "streams": [],
+            "invariants": [],
+        }
+
+    # 窗口判定
+    window_record: dict[str, Any] | None = None
+    if inputs.until_op is not None:
+        for r in correlation_records:
+            if (
+                r.get("op_id") == inputs.until_op
+                and r.get("kind") == "op_start"
+                and r.get("settled") is True
+            ):
+                window_record = r
+                break
+    else:
+        for r in reversed(correlation_records):
+            if r.get("settled") is True:
+                window_record = r
+                break
+
+    if window_record is None:
+        return {
+            "schema_version": "comparison.v1",
+            "run_id": run_id,
+            "case_id": case_id,
+            "verdict": "INSUFFICIENT_EVIDENCE",
+            "reasons": ["HARNESS_WINDOW_UNSETTLED"],
+            "tool": tool_info,
+            "integrity": integrity_res.integrity_data,
+            "window": {
+                "until_op": inputs.until_op,
+                "wal_seq": 0,
+                "wire_offsets": zero_offsets,
+                "endpoint_generation": 1,
+            },
+            "streams": [],
+            "invariants": [],
+            while thread is not None and thread.is_alive():
+                if self._pump_states.get(name) == "paused":
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    event.clear()
+                    self._state_changed.notify_all()
+                    raise TimeoutError(f"{direction} reader 未能暫停")
+                self._state_changed.wait(min(remaining, 0.05))
+
+    def _resume_reader(self, direction: str) -> None:
+        direction = direction.upper()
+        if direction not in self._reader_pause:
+            raise ValueError("dir 必須是 TX 或 RX")
+        self._reader_pause[direction].clear()
+        with self._state_changed:
+            self._state_changed.notify_all()
+
+    def _pause_writer(self, direction: str, timeout_s: float = 2.0) -> None:
+        direction = direction.upper()
+        name = "tx_writer" if direction == "TX" else "rx_writer"
+        event = self._writer_pause[direction]
+        event.set()
+        deadline = time.monotonic() + timeout_s
+        with self._state_changed:
+            self._state_changed.notify_all()
+            thread = self._threads.get(name)
+            while thread is not None and thread.is_alive():
+                if self._pump_states.get(name) == "paused":
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    event.clear()
+                    self._state_changed.notify_all()
+                    raise TimeoutError(f"{direction} writer 未能暫停")
+                self._state_changed.wait(min(remaining, 0.05))
+
+    def _resume_writer(self, direction: str) -> None:
+        self._writer_pause[direction.upper()].clear()
+        with self._state_changed:
+            self._state_changed.notify_all()
+
+    def _dut_generation(self) -> int:
+        with self._state_lock:
+            return self._dut_generation_value or int(getattr(self.dut, "generation", 0))
+
+    def _process_generation(self) -> int:
+        with self._state_lock:
+            return int(getattr(self.dut, "generation", 0))
+
+    def _should_discard_tx_remainder(self, process_generation: int) -> bool:
+        with self._state_lock:
+            if self._tx_restart_discard_generation != process_generation:
+                return False
+            self._tx_restart_discard_generation = None
+            return True
+
+codex
+已用記憶體替身重現三個 writer 問題：`close()` 遇到 ENOSPC 仍回報無失敗、關閉後仍接受新紀錄但沒有 writer thread 寫入，以及 `flush(timeout_s)` 忽略期限。另在核對 schema 與比較器對 `write_uncertain` 的拒絕條件是否一致。
+exec
+/bin/bash -lc "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tools/uart_stdio_bridge/src python3 - <<'PY'
+... (verification script omitted for brevity) ...
+PY
+nl -ba tests/acceptance/bridge_record.schema.json | sed -n '154,192p'; nl -ba tools/uart_stdio_bridge/src/uart_stdio_bridge/compare/wire_reader.py | sed -n '389,405p'" in ~/prj_pri/serialwrap-worktrees/rust-refactor
+ succeeded in 31ms:
+incomplete write_uncertain schema errors: 0
+incomplete write_uncertain reader problems: []
+   154	                  "bridge_start",
+   155	                  "bridge_stop",
+   156	                  "peer_state",
+   157	                  "endpoint_generation",
+   158	                  "dut_generation",
+   159	                  "dut_stdout_eof",
+   160	                  "dut_exited",
+   161	                  "write_uncertain",
+   162	                  "io_error",
+   163	                  "mark",
+   164	                  "fault",
+   165	                  "evidence_failure",
+   166	                  "quiesce",
+   167	                  "checkpoint"
+   168	                ]
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "dir": {
+            "enum": [
+              "TX",
+              "RX"
+            ]
+          },
+          "stream_offset": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "len": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "loss_flag": {
+            "const": false
+          },
+   ...
+   389	                    "code": "HARNESS_SCHEMA_INVALID",
+   390	                    "file": str(wire_path),
+   391	                    "line_no": line_no,
+   392	                    "detail": "bridge_meta 的 len/payload_b64/crc32 必須為 0/\"\"/00000000",
+   393	                })
+   394	            if "event" not in meta:
+   395	                problems.append({
+   396	                    "code": "HARNESS_SCHEMA_INVALID",
+   397	                    "file": str(wire_path),
+   398	                    "line_no": line_no,
+   399	                    "detail": "bridge_meta 的 meta 必須包含 event 鍵",
+   400	                })
+   401	        else:
+   402	            expected_dir = "TX" if observation in ("serial_read", "dut_stdin_write") else "RX"
+   403	            if direction != expected_dir:
+   404	                problems.append({
+   405	                    "code": "HARNESS_SCHEMA_INVALID",
+
+codex
+指定測試：`26 passed`。以下為具體 findings；未修改檔案。
+
+1. **high — `close()` 吞掉最終同步失敗，可能宣告乾淨關閉。**  
+   [writer.py:253](tools/uart_stdio_bridge/src/uart_stdio_bridge/evidence/writer.py:253) 捕捉 `fsync` 的 `OSError` 後直接略過。注入 ENOSPC 已重現：`close()` 正常返回、`failure is None`；T5 因此可寫出 `closed_cleanly:true`，違反 §15.4.3。  
+   **修正：**保存第一個同步／關檔失敗碼；ENOSPC／EDQUOT／EFBIG 分類為 `HARNESS_DISK_FULL`。T5 在 `close()` 後重新檢查 writer failure，失敗必須 exit 3、manifest 標示非乾淨關閉。補上「僅最後一次 fsync 失敗」測試。
+
+2. **medium — 關閉後仍接受紀錄，造成靜默遺失。**  
+   [writer.py:134](tools/uart_stdio_bridge/src/uart_stdio_bridge/evidence/writer.py:134) 的 `emit_data()` 與 `emit_meta()` 只檢查 failure，未檢查 `_closed`，也未與 `close()` 同步。已重現：關閉後 emit 回傳 seq 2、queue 留下一筆、worker 已退出、failure 仍為 None。  
+   **修正：**以相同鎖序列化 emit 與關閉；進入關閉狀態後拒絕新紀錄，確保 sentinel 前包含全部已接受紀錄。補關閉後 emit 與並發 close／emit 測試。
+
+3. **medium — `flush(timeout_s)` 完全忽略期限，錄證卡住時無法 fail-stop。**  
+   [writer.py:223](tools/uart_stdio_bridge/src/uart_stdio_bridge/evidence/writer.py:223) 無條件呼叫 `queue.join()`。阻塞寫入替身下，`flush(timeout_s=0.01)` 超過 0.1 秒仍未返回，failure 也未設定；T5 barrier／shutdown 可因此永久等待。  
+   **修正：**使用 deadline 等待佇列完成，逾時設定失敗並拋出 `EvidenceFailure`；`close()` 的 sentinel 入列及 thread 結束也須有界，且不得在 worker 尚存活時關閉其 fd。補阻塞寫入的期限測試。
+
+4. **medium — 不完整的 `write_uncertain` 可通過 schema 與 T7 完整性檢查。**  
+   [bridge_record.schema.json:154](tests/acceptance/bridge_record.schema.json:154) 僅限制事件名稱；[wire_reader.py:394](tools/uart_stdio_bridge/src/uart_stdio_bridge/compare/wire_reader.py:394) 僅要求存在 `event`。已重現：`meta={"event":"write_uncertain"}`、`loss_flag:false`，缺少全部不確定區間欄位，兩者仍回報零錯誤，無法保證 §15.6.2 要求。  
+   **修正：**兩處同步強制 `observation`、`offset_start`、`requested_len`、`accepted_len:null`、`error` 與 `loss_flag:true`；比較器遇到不確定寫入事件必須判證據不足。補逐欄刪除與錯誤 loss flag 的拒絕測試。
+```
+
+Notes on this output:
+- The first Bash call was not rerun. The command ran once and returned output, so the timeout retry did not apply.
+- The middle of the codex transcript (a long code dump and the verification script body) was elided as shown above. Its results are kept: the schema and reader checks returned 0 schema errors and no reader problems.
+- The codex run reported `26 passed` for the three specified test files.
+- The four findings above are Codex's own. I did not independently verify them, and the files were not modified.
+
+### 實作者處置
+
+__EXIT__:0
+
+The codex run finished and returned the following:
+
+已完成 P2-T2 審查修正，修改都在指定 worktree，未執行 commit、push、reset、checkout 或 stash。
+
+**已修正**
+- Writer 的 `flush()` 與 `close()` 加上期限；超時或 fsync／close 失敗會記錄錯誤。Worker 尚未退出時不會關閉它仍在使用的 fd；Bridge 關閉後會重新檢查 writer 狀態，避免錯報乾淨關閉。
+- 補上 overflow 與 worker 寫入失敗時的 `evidence_failure` META；失敗後停止寫入後續普通紀錄。未入列或建構失敗的紀錄不再消耗 seq／offset。
+- 加入 writer 生命週期檢查，拒絕尚未啟動或已關閉時的 emit／flush，並序列化 emit 與 close。
+- Schema 與比較器都會拒絕不完整的 `write_uncertain`／`evidence_failure`，並要求正確的 `loss_flag` 與欄位。
+- 將 Windows driver 資訊接到 bridge 與 selftest；固定 `clock_id`、UTC `wall_ts` 格式，並加強 META event、空 payload、base64 等驗證。
+- 補上對應回歸測試與 changelog fragment。缺少的測試先以失敗確認，再修實作；涉及的主要檔案有 tools/uart_stdio_bridge/src/uart_stdio_bridge/evidence/writer.py、tests/acceptance/bridge_record.schema.json、tools/uart_stdio_bridge/src/uart_stdio_bridge/compare/wire_reader.py。
+
+**拒絕／無法處理**
+- Reviewer A #12：這是既有提交流程的歷史問題；在禁止改 Git 歷史且不得 commit 的限制下，無法補成獨立測試提交。
+
+**驗證結果**
+- `python3 -m pytest -q tools/uart_stdio_bridge/tests`：242 passed, 2 failed, 2 skipped，另有 45 warnings。兩個失敗是 `test_approved_revision_matches_tool_tree` 和 `test_approved_revision_reviewer_present`，都因缺少 `tools/uart_stdio_bridge/APPROVED_REVISION.json`；該檔不在 HEAD 或 Git index 中。
+- `python3 -m pytest -q tests/test_acceptance_schemas.py`：7 passed。
+- `git diff --check`：通過。
+
+Prompt file: <scratch>
+Log file: <scratch>
+

@@ -1,0 +1,7 @@
+{
+  "schema_version": "bridge-approved.v1",
+  "tree_sha256": "9eaed6de5abd3d75d18929b6fdb3bdac7e1929fe32f666c3193c9983005ecd1c",
+  "reviewer": "Claude Opus 5.5（主 agent；非實作者，依 Sonnet max＋Codex gpt-6.1-sol 雙審結論核准）",
+  "review_ref": "docs/rust-refactor/reviews/p2-bridge-dual-review.md（P2-T1～T9 與 P2-T2 補審；修正 commit 1095ac8）",
+  "date": "2026-10-19"
+}
