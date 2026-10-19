@@ -145,11 +145,15 @@ def test_timeout_zero_nonblocking(env):
 
 
 @pytest.mark.core_portable
-def test_timeout_negative_exit_1(env, tmp_path):
-    """--timeout -1 為非法逾時值，在 socket 建立時拋出例外退出碼為 1，stdout 為空。"""
-    sock_path = str(tmp_path / "unused.sock")
+def test_timeout_negative_exit_1(env):
+    """--timeout -1 為非法逾時值，在 socket 建立時拋出例外退出碼為 1，stdout 為空。
+
+    用 TCP endpoint：Windows CPython 無 AF_UNIX，unix 路徑會先回 SOCKET_ERROR（rc 2）而走不到
+    settimeout；TCP 在兩平台都於 `create_connection` 內 settimeout 拋 ValueError（不會連線）。
+    unix 路徑的同一契約由 `test_unix_bad_timeout` 覆蓋。
+    """
     r = run_cli(
-        ["--timeout", "-1", "--socket", sock_path, "session", "list"],
+        ["--timeout", "-1", "--socket", "tcp://127.0.0.1:9", "session", "list"],
         env=env,
     )
     assert r.rc == 1

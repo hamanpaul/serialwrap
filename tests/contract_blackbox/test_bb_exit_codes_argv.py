@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from bb_harness import run_cli
+from bb_harness import NL, run_cli
 
 pytestmark = [pytest.mark.process_rpc]
 
@@ -167,7 +167,7 @@ def test_nul_in_ok_response_is_printed(env, stubd):
     s = stubd({"default": [{"reply": {"ok": True, "text": "a\x00b"}}]})
     r = run_cli(["--socket", s.endpoint, "log", "tail-text", "--com", "COM0"], env=env)
     assert r.rc == 0
-    assert r.stdout == b'{"ok":true,"text":"a\\u0000b"}\n'
+    assert r.stdout == b'{"ok":true,"text":"a\\u0000b"}' + NL
 
 
 @pytest.mark.core_portable
@@ -176,7 +176,7 @@ def test_nul_in_failed_response_is_printed(env, stubd):
     s = stubd({"default": [{"reply": {"ok": False, "error_code": "X", "text": "a\x00b"}}]})
     r = run_cli(["--socket", s.endpoint, "log", "tail-text", "--com", "COM0"], env=env)
     assert r.rc == 2
-    assert r.stdout == b'{"error_code":"X","ok":false,"text":"a\\u0000b"}\n'
+    assert r.stdout == b'{"error_code":"X","ok":false,"text":"a\\u0000b"}' + NL
 
 
 # ---------------------------------------------------------------------------

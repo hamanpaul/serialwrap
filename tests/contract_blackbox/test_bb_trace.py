@@ -6,6 +6,7 @@ stdlib-only，不得 import sw_core／serialwrap／serialwrapd。
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -22,6 +23,17 @@ def test_trace_stderr_json_format(env):
     err_lines = r.stderr.decode("utf-8").splitlines()
     assert len(err_lines) >= 2
 
+    if os.name == "nt":
+        # Windows CPython 無 AF_UNIX：Python 基線（client.py `_rpc_call_once`）不嘗試連線、不記 errno。
+        expected_errno, expected_errno_name = None, None
+        expected_line = (
+            "serialwrap: session.list failed: SOCKET_ERROR: 本平台無 AF_UNIX，無法連接 unix endpoint "
+            "'/nonexistent/x.sock'（請改用 tcp://127.0.0.1:<port>，#131）"
+        )
+    else:
+        expected_errno, expected_errno_name = 2, "ENOENT"
+        expected_line = "serialwrap: session.list failed: SOCKET_ERROR: [Errno 2] No such file or directory"
+
     trace_obj = json.loads(err_lines[0])
     assert isinstance(trace_obj.get("elapsed_ms"), int)
     trace_obj["elapsed_ms"] = 0
@@ -32,12 +44,12 @@ def test_trace_stderr_json_format(env):
         "method": "session.list",
         "elapsed_ms": 0,
         "error_code": "SOCKET_ERROR",
-        "errno": 2,
-        "errno_name": "ENOENT",
+        "errno": expected_errno,
+        "errno_name": expected_errno_name,
         "retry_count": 0,
         "timeout_s": 5.0,
     }
-    assert err_lines[1] == "serialwrap: session.list failed: SOCKET_ERROR: [Errno 2] No such file or directory"
+    assert err_lines[1] == expected_line
 
 
 @pytest.mark.core_portable
