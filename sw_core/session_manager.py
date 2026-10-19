@@ -43,6 +43,7 @@ from .constants import (
     INTERACTIVE_TOMBSTONE_MAX,
     LOG_DIR,
     MAX_RECOVERY_LEASE_S,
+    PASSTHROUGH_READY_QUIET_S,
     READY_RECONFIRM_MAX_ATTEMPTS,
     READY_RECONFIRM_MAX_S,
     READY_RECONFIRM_RETRY_S,
@@ -226,6 +227,26 @@ def _is_reboot_command(command: str) -> bool:
     return any(token == "-r" or token == "--reboot" or token.startswith("-r") for token in tokens[1:])
 
 
+def _passthrough_completion_pattern(
+    profile: SessionProfile,
+    completion_regex: str | None,
+) -> str | None:
+    """依序選擇 passthrough 命令完成條件；None 表示只能等 RX 靜默。"""
+    if completion_regex is not None:
+        return completion_regex
+    return profile.prompt_regex if valid_completion_regex(profile.prompt_regex) else None
+
+
+def passthrough_file_transfer_error(session: dict[str, Any]) -> dict[str, Any]:
+    """建立拒絕 passthrough 檔案傳輸的穩定 RPC 回應。"""
+    return {
+        "ok": False,
+        "error_code": "PROFILE_NOT_COMMAND_CAPABLE",
+        "hint": "passthrough profile 不支援 file.push／file.pull；請使用互動 console。",
+        "session": session,
+    }
+
+
 @dataclasses.dataclass
 class BackgroundCapture:
     cmd_id: str
@@ -399,6 +420,8 @@ class SessionRuntime:
     attach_bridge: UARTBridge | None = dataclasses.field(default=None, repr=False)
     attached_real_path: str | None = None
     bridge_generation: int = 0
+    # passthrough ATTACHED 狀態的最近 RX 時刻；僅記憶體使用，不對外公開或持久化。
+    passthrough_quiet_since: float | None = None
     login_gen: int = 0
     _boot_quiet_lock: threading.RLock = dataclasses.field(
         default_factory=threading.RLock, repr=False
@@ -515,6 +538,16 @@ class SessionRuntime:
         prev = getattr(self, "_state", None)
         if prev is not None and prev != value:
             self.last_state_change_at = now_iso()
+            if value == "ATTACHED" and self.profile.platform == "passthrough":
+                self.passthrough_quiet_since = time.monotonic()
+            elif value != "ATTACHED":
+                self.passthrough_quiet_since = None
+        elif (
+            value == "ATTACHED"
+            and self.profile.platform == "passthrough"
+            and self.passthrough_quiet_since is None
+        ):
+            self.passthrough_quiet_since = time.monotonic()
         self._state = value
 
     def compute_idle_ms(self) -> int | None:
@@ -591,12 +624,12 @@ class SessionRuntime:
             self._push_tx_gate()
 
     def confirm_ready(self) -> None:
-        """READY 再確認落定（#162）：清 quiet 與 agent gate 的唯一入口。
+        """READY 確認落定（#162）：清 quiet 與 agent gate。
 
         由各 READY 確認點呼叫（attach probe／reboot recovery／self-test nonce
-        成功）——皆為「對 UART 實際驗證過 prompt 或 nonce」的時點。**不**包含
-        reboot 命令 2s 內 prompt 回顯（見 ``_handle_reboot_command``）：prpl/OpenWrt
-        的 ``reboot`` 是非同步的，shell 會立刻重印 prompt，該回顯不是 READY 實證。
+        成功）；passthrough 另以核准的 RX 靜默時間窗作為 READY 判定，不送確認 probe。
+        **不**包含 reboot 命令 2s 內 prompt 回顯（見 ``_handle_reboot_command``）：
+        prpl/OpenWrt 的 ``reboot`` 是非同步的，shell 會立刻重印 prompt，該回顯不是 READY 實證。
 
         清 pending 的同時清掉全部有界化欄位，維持「成功是唯一正常出口」語意。
         """
@@ -606,6 +639,18 @@ class SessionRuntime:
             self.ready_reconfirm_deadline = 0.0
             self.ready_reconfirm_attempts = 0
             self.ready_reconfirm_failed = False
+            self._push_tx_gate()
+
+    def reset_passthrough_boot_gate(self) -> None:
+        """passthrough 重掛時清除前一 profile 留下的 boot quiet／READY gate。"""
+        with self._boot_quiet_lock:
+            self.boot_quiet_until = 0.0
+            self.boot_banner_tail = ""
+            self.ready_reconfirm_pending = False
+            self.ready_reconfirm_deadline = 0.0
+            self.ready_reconfirm_attempts = 0
+            self.ready_reconfirm_failed = False
+            self._push_probe_gate()
             self._push_tx_gate()
 
     def expire_ready_reconfirm(self, now: float | None = None, *, force: bool = False) -> bool:
@@ -678,6 +723,8 @@ class SessionRuntime:
         判定前先跑 ``expire_ready_reconfirm()``：pending 逾時／逾次即翻終態，之後
         本函式對它回 False，由呼叫端改回不可重試的 ``READY_UNCONFIRMED``。
         """
+        if self.profile.platform == "passthrough":
+            return False
         self.expire_ready_reconfirm(now)
         return self.boot_quiet_active(now) or self.ready_reconfirm_pending
 
@@ -1616,6 +1663,8 @@ class SessionManager:
           逾 ``READY_RECONFIRM_MAX_S`` 或逾 ``READY_RECONFIRM_MAX_ATTEMPTS``，或已由
           bootloader 證據直接落終態——daemon 已無自動路徑，繼續重試只會無界迴圈。
         """
+        if session.profile.platform == "passthrough":
+            return None
         # 先評估有界化終態：agent_gate_active() 內部亦會呼叫，此處顯式呼叫以確保
         # 「先落終態、再判 gate」的順序，讓 failed 旗標在同一個 lock 區間內即時可讀。
         session.expire_ready_reconfirm()
@@ -1969,6 +2018,9 @@ class SessionManager:
             return None
         if session.state in {"RELEASED", "FLASHING", "ATTACHING", "RECOVERING"}:
             return None
+        # passthrough 不執行 READY reconfirm 或 ATTACHED readiness probe。
+        if session.profile.platform == "passthrough" and session.state in {"ATTACHED", "READY"}:
+            return None
         # #162 有界化：排 probe 前先評估 pending 是否已逾時／逾次落終態——落定後
         # pending 為 False，下方 READY 分支自然不再排 probe，gate 也改回不可重試的
         # READY_UNCONFIRMED（見 _agent_gate_reject_locked）。
@@ -2092,6 +2144,8 @@ class SessionManager:
         if not by_id or by_id in self._released_by_ids or by_id not in self._devices:
             return False
         if session.state not in ("ATTACHED", "READY"):
+            return False
+        if session.profile.platform == "passthrough":
             return False
         # #162：READY 需再確認 pending 才 valid（pending 已被其他確認點清掉＝
         # 不必再 probe）；_is_reprobe_prompt_error 檢查僅施於 ATTACHED。
@@ -2262,13 +2316,18 @@ class SessionManager:
         self._expire_interactive_leases_tick()
         now = time.monotonic()
         jobs: list[tuple[str, str, UARTBridge | None, str]] = []
+        promoted: list[str] = []
         with self._lock:
+            promoted = self._promote_quiet_passthrough_locked(now)
             for session in list(self._sessions.values()):
                 prepared = self._prepare_reprobe_locked(session, now)
                 if prepared is None:
                     continue
                 action, prepared_session, bridge, by_id = prepared
                 jobs.append((action, prepared_session.session_id, bridge, by_id))
+
+        for session_id in promoted:
+            self._on_ready(session_id)
 
         for action, session_id, bridge, by_id in jobs:
             if action == "attach":
@@ -3591,7 +3650,12 @@ class SessionManager:
                 }
             if session.bridge is not None:
                 lease, post = self._refresh_interactive_locked(session)
-                if lease is not None and lease.owner.startswith("human:"):
+                if (
+                    session.profile.platform == "passthrough"
+                    and session.state == "ATTACHED"
+                ):
+                    result = {"ok": True, "session": session.to_public_dict()}
+                elif lease is not None and lease.owner.startswith("human:"):
                     # #94：有 human lease 時不 probe（免干擾人類），但仍依 attach 契約誠實回報狀態
                     # （command-capable 未達 READY → ok:False + 狀態專用 error_code）。
                     result = self._attach_state_result(session, session.to_public_dict())
@@ -4130,11 +4194,63 @@ class SessionManager:
             self._await_drain(job)
 
     def _mark_session_rx(self, session: SessionRuntime) -> None:
-        """Update session's last_rx_at / last_rx_mono. Cheap; safe outside lock."""
+        """更新 RX 時刻；passthrough ATTACHED 的每筆 RX 也重設安靜計時。"""
         session.last_rx_at = now_iso()
         session.last_rx_mono = time.monotonic()
+        if session.profile.platform == "passthrough" and session.state == "ATTACHED":
+            session.passthrough_quiet_since = session.last_rx_mono
         # RX 恢復即重臂 transport stall 一次性告警（#150）：下次再 stall 允許再告警一次。
         session.transport_stall_warned = False
+
+    def passthrough_ready_in_s(self, session: SessionRuntime, now: float) -> float | None:
+        """回報 passthrough ATTACHED session 進入 READY 尚需的安靜秒數。"""
+        if session.profile.platform != "passthrough" or session.state != "ATTACHED":
+            return None
+        quiet_since = session.passthrough_quiet_since
+        if quiet_since is None:
+            return round(PASSTHROUGH_READY_QUIET_S, 1)
+        return round(max(0.0, PASSTHROUGH_READY_QUIET_S - (now - quiet_since)), 1)
+
+    def _promote_quiet_passthrough_locked(self, now: float) -> list[str]:
+        """將通過 30 秒 RX 靜默且沒有阻擋條件的 passthrough session 升為 READY。"""
+        if self._shutting_down:
+            return []
+        promoted: list[str] = []
+        for session in self._sessions.values():
+            if session.profile.platform != "passthrough" or session.state != "ATTACHED":
+                continue
+            by_id = session.profile.device_by_id
+            if (
+                session.bridge is None
+                or session._pending_drain is not None
+                or (by_id is not None and by_id in self._draining_by_ids)
+                or (by_id is not None and by_id in self._released_by_ids)
+                or self._flash_busy_locked(session)
+            ):
+                continue
+            pending_op = (
+                self._active_attach_ops.get(by_id or "")
+                or self._attach_ops.get(by_id or "")
+                or self._preopened_ports.get(by_id or "")
+            )
+            if pending_op is not None and getattr(pending_op, "release_request", None) is not None:
+                continue
+            quiet_since = session.passthrough_quiet_since
+            if quiet_since is None:
+                session.passthrough_quiet_since = now
+                continue
+            if now - quiet_since < PASSTHROUGH_READY_QUIET_S:
+                continue
+            session.state = "READY"
+            session.confirm_ready()
+            session.last_error = None
+            session.last_ready_at = now_iso()
+            session.recovering = False
+            session.recovery_started_at = None
+            session.pending_auto_login = False
+            self._reset_reprobe_progress_locked(session)
+            promoted.append(session.session_id)
+        return promoted
 
     def _update_boot_quiet_locked(self, session: SessionRuntime, chunk: str) -> None:
         """依 RX 內容維護 boot quiet window（#130）。須在 ``self._lock`` 內呼叫。
@@ -4159,6 +4275,8 @@ class SessionManager:
         兩發都通過 gate。rolling tail 原本的用途（跨 chunk 切割的 banner）不受影響：
         舊 tail 仍完整接在 chunk 前面。
         """
+        if session.profile.platform == "passthrough":
+            return
         window = session.boot_banner_tail[-BOOT_BANNER_TAIL_CHARS:] + chunk
         if detect_boot_banner(window):
             session.arm_boot_quiet()
@@ -4238,13 +4356,14 @@ class SessionManager:
                 except Exception:
                     pass
         chunk = clean_text(data.decode("utf-8", errors="replace"))
-        if not chunk:
-            return
         with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
                 return
-            self._mark_session_rx(session)
+            if chunk or session.profile.platform == "passthrough":
+                self._mark_session_rx(session)
+            if not chunk:
+                return
             # #130：quiet window 維護須看見**所有** RX（含 foreground 期間），
             # 故置於 foreground_busy gate 之前。
             self._update_boot_quiet_locked(session, chunk)
@@ -4305,6 +4424,11 @@ class SessionManager:
             self._await_drain(job)
 
     def _probe_existing_bridge(self, session: SessionRuntime, bridge: UARTBridge) -> dict[str, Any]:
+        if session.profile.platform == "passthrough":
+            current = self._sessions.get(session.session_id)
+            if current is None or current.bridge is not bridge:
+                return {"ok": False, "error_code": "SESSION_NOT_READY"}
+            return {"ok": True, "session": current.to_public_dict()}
         # 非 command-capable（無 ready_probe，含 passthrough）維持現狀不升 READY。
         if not session.profile.command_capable:
             current = self._sessions.get(session.session_id)
@@ -4519,11 +4643,12 @@ class SessionManager:
                 gen_before = session.bridge_generation
                 session_id = session.session_id
                 profile = session.profile
-                require_login = session.pending_auto_login or bool(profile.login_regex or profile.console_unlock_env)
-                # 以 ready_probe 判定可否下命令；非 command-capable（含無 ready_probe 的
-                # passthrough）僅停在 ATTACHED 不 probe，有 ready_probe 的 passthrough
-                # 也要能走 probe 進 READY。
-                command_capable = profile.command_capable
+                passthrough = profile.platform == "passthrough"
+                require_login = not passthrough and (
+                    session.pending_auto_login or bool(profile.login_regex or profile.console_unlock_env)
+                )
+                # passthrough 一律停在 ATTACHED；ready_probe 只描述命令能力，不授權 attach probe。
+                command_capable = profile.command_capable and not passthrough
                 real_path = dev.real_path
                 preserved_consoles = session.retained_consoles if isinstance(session.retained_consoles, PreservedConsoles) else None
         if abort_attach:
@@ -4590,7 +4715,10 @@ class SessionManager:
             # #150：probe 前採樣 raw RX 累計（bridge 剛 start，計數從 0 起）。
             rx_before = self._bridge_rx_total(bridge)
             with self._lock:
-                boot_quiet = self._boot_quiet_blocks_probe(session)
+                boot_quiet = (
+                    profile.platform != "passthrough"
+                    and self._boot_quiet_blocks_probe(session)
+                )
                 probe_permit = (
                     self._begin_login_run_locked(session, bridge)
                     if command_capable and not boot_quiet
@@ -4655,7 +4783,12 @@ class SessionManager:
             # #150：失敗才精煉；boot-quiet 合成的 PROMPT_UNAVAILABLE 沒送 probe、
             # 且 quiet 代表剛有 RX，刻意排除不精煉。
             err_detail: str | None = None
-            if not ok and not boot_quiet and not probe_refused:
+            if (
+                not ok
+                and not boot_quiet
+                and not probe_refused
+                and profile.platform != "passthrough"
+            ):
                 err, err_detail = self._refine_probe_failure(session, bridge, err, rx_before)
 
             notify_ready = False
@@ -4720,6 +4853,9 @@ class SessionManager:
                             session.last_error_detail = err_detail
                             session.recovering = False
                             session.recovery_started_at = None
+                            if profile.platform == "passthrough":
+                                session.pending_auto_login = False
+                                session.reset_passthrough_boot_gate()
                         self._restore_retained_human_console_locked(session)
             if cleanup_job is not None:
                 receipt = self._finish_attach_bridge_stop(cleanup_job)
@@ -5216,9 +5352,12 @@ class SessionManager:
                     session.last_error = None
                     gen_before = session.bridge_generation
                     session_id = session.session_id
-                    require_login = session.pending_auto_login or bool(profile.login_regex or profile.console_unlock_env)
-                    # 與 _attach_by_id 一致，以 ready_probe 判定可否下命令。
-                    command_capable = profile.command_capable
+                    passthrough = profile.platform == "passthrough"
+                    require_login = not passthrough and (
+                        session.pending_auto_login or bool(profile.login_regex or profile.console_unlock_env)
+                    )
+                    # passthrough 一律不執行 attach probe 或登入流程。
+                    command_capable = profile.command_capable and not passthrough
                 preopened_op = self._active_attach_ops.get(by_id) or self._preopened_ports.get(by_id) or preopened_op
         if skip_attach:
             self._discard_preopened_port(by_id, preopened_op)
@@ -5331,7 +5470,7 @@ class SessionManager:
 
             # #150：失敗才精煉（dynamic 路徑無 boot-quiet 合成錯，不需排除）。
             err_detail: str | None = None
-            if not ok and not probe_refused:
+            if not ok and not probe_refused and profile.platform != "passthrough":
                 err, err_detail = self._refine_probe_failure(session, bridge, err, rx_before)
 
             notify_ready = False
@@ -5396,6 +5535,9 @@ class SessionManager:
                             session.last_error_detail = err_detail
                             session.recovering = False
                             session.recovery_started_at = None
+                            if profile.platform == "passthrough":
+                                session.pending_auto_login = False
+                                session.reset_passthrough_boot_gate()
             if cleanup_job is not None:
                 receipt = self._finish_attach_bridge_stop(cleanup_job)
                 if cleanup_reason == "removed":
@@ -6300,7 +6442,8 @@ class SessionManager:
                     capture = self._background.get(bg_cmd_id)
                     if capture is not None:
                         capture.status = "done"
-        if _is_reboot_command(command):
+        passthrough = session.profile.platform == "passthrough"
+        if not passthrough and _is_reboot_command(command):
             return self._handle_reboot_command(
                 session,
                 bridge,
@@ -6313,6 +6456,11 @@ class SessionManager:
                 trusted_human=human,
                 permit=command_permit,
             )
+        completion_pattern = (
+            _passthrough_completion_pattern(session.profile, completion_regex)
+            if passthrough
+            else completion_regex or prompt_regex
+        )
         pre_offset = bridge.rx_snapshot_len()
         if completion_regex is not None:
             self._wal.append(
@@ -6363,7 +6511,8 @@ class SessionManager:
                 break
             wait_chunk = min(silence_limit, remaining)
             pre_rx = bridge.rx_snapshot_len()
-            if bridge.wait_for_regex_from(completion_regex or prompt_regex, pre_offset, wait_chunk):
+            wait_pattern = completion_pattern if completion_pattern is not None else r"(?!)"
+            if bridge.wait_for_regex_from(wait_pattern, pre_offset, wait_chunk):
                 matched = True
                 break
             if bridge.rx_snapshot_len() == pre_rx:
@@ -6388,7 +6537,19 @@ class SessionManager:
                 trusted_human=human,
             )
         raw_text = bridge.rx_text_from(pre_offset)
-        stdout = self._extract_command_stdout(raw_text, command, prompt_regex, completion_regex=completion_regex)
+        if (
+            passthrough
+            and completion_regex is not None
+            and not valid_completion_regex(prompt_regex)
+        ):
+            completion_match = re.search(completion_regex, raw_text)
+            stdout = clean_text(
+                raw_text[:completion_match.end()] if completion_match is not None else raw_text
+            )
+        else:
+            stdout = self._extract_command_stdout(
+                raw_text, command, prompt_regex, completion_regex=completion_regex
+            )
         result: dict[str, Any] = {
             "ok": True,
             "execution_mode": normalized_mode,
@@ -6439,6 +6600,24 @@ class SessionManager:
                 "stdout": "",
                 "partial": True,
                 "recovery_action": "PROMOTE_HUMAN_INTERACTIVE",
+            }
+
+        if session.profile.platform == "passthrough":
+            partial_stdout = clean_text(bridge.rx_text_from(pre_offset))
+            with self._lock:
+                if not self._foreground_operation_current_locked(session, bridge, operation):
+                    return {"ok": False, "error_code": "FLUSHED_BY_RECOVERY"}
+                self._set_terminal_capture_locked(
+                    session,
+                    cmd_id=cmd_id,
+                    chunks=[partial_stdout] if partial_stdout else None,
+                    error_code="PROMPT_TIMEOUT",
+                )
+            return {
+                "ok": False,
+                "error_code": "PROMPT_TIMEOUT",
+                "partial": True,
+                "recovery_action": "NONE",
             }
 
         # #130 review Finding 1c（必修）：boot quiet window 內不送 CTRL_C/CTRL_D——這兩個
@@ -7125,11 +7304,30 @@ class SessionManager:
                             "recommended_action": "console_attach",
                             **lease_context,
                         }
+                    elif (
+                        session.profile.platform == "passthrough"
+                        and session.state == "READY"
+                    ):
+                        result = {
+                            "ok": True,
+                            "classification": "PASSTHROUGH",
+                            "session": session.to_public_dict(),
+                            "attached_real_path": attached_real_path,
+                            "current_real_path": device.real_path,
+                            "attached_vtty": snapshot.get("vtty"),
+                            "bridge_generation": session.bridge_generation,
+                            "recommended_action": "none",
+                            **lease_context,
+                        }
                     elif session.state == "ATTACHED":
                         if session.profile.platform == "passthrough":
                             classification = "PASSTHROUGH"
                             recommended_action = "console_attach"
-                            extra: dict[str, Any] = {}
+                            extra: dict[str, Any] = {
+                                "passthrough_ready_in_s": self.passthrough_ready_in_s(
+                                    session, time.monotonic()
+                                )
+                            }
                             # #181：fallback 是**未經量測**的 catch-all 分類，且空
                             # ready_probe 讓 command_capable 永久 false。把最近的 RX 拿去
                             # 比對所有 template，命中就直接給出可執行的出口，而不是只回
@@ -7141,7 +7339,7 @@ class SessionManager:
                                 if suggested is not None:
                                     com = session.profile.com
                                     recommended_action = "pin_profile"
-                                    extra = {
+                                    extra.update({
                                         "suggested_profile": suggested,
                                         "hint": (
                                             f"此 session 為未經量測的 fallback 分類，RX 內容匹配 "
@@ -7149,7 +7347,7 @@ class SessionManager:
                                             f"{com} --profile {suggested} 之後 serialwrap session "
                                             f"clear --selector {com}。"
                                         ),
-                                    }
+                                    })
                         elif session.last_error == "LOGIN_REQUIRED":
                             classification = "LOGIN_REQUIRED"
                             recommended_action = "console_attach"
@@ -7407,7 +7605,11 @@ class SessionManager:
                 # #162 C3：手動 recover 失敗且 RX tail 顯示板子卡在 bootloader → 回可
                 # 行動分類，取代目前無資訊的 PROMPT_UNAVAILABLE（operator 才知道要開
                 # interactive 手動 `boot`，而不是繼續無效重試）。
-                matched = self._bootloader_evidence(session, bridge)
+                matched = (
+                    self._bootloader_evidence(session, bridge)
+                    if session.profile.platform != "passthrough"
+                    else None
+                )
                 if matched is not None or payload["last_error"] == ERROR_BOOTLOADER_STUCK:
                     payload["classification"] = "BOOTLOADER"
                     payload["recommended_action"] = "recover_interactive"
@@ -7639,7 +7841,11 @@ class SessionManager:
         transfer_permit: TxPermit | None = None
         with self._lock:
             session = self.get_session(selector)
-            if session is None or session.bridge is None or session.state != "READY":
+            if session is None:
+                return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            if session.profile.platform == "passthrough":
+                return passthrough_file_transfer_error(session.to_public_dict())
+            if session.bridge is None or session.state != "READY":
                 return {"ok": False, "error_code": "SESSION_NOT_READY"}
             # #139：同 execute_command 的第二層 gate——file 傳輸直寫 bridge、不經
             # execute_command，須各自補 gate（僅開始前擋；傳輸中 banner 到達不中途
@@ -7735,7 +7941,11 @@ class SessionManager:
         transfer_permit: TxPermit | None = None
         with self._lock:
             session = self.get_session(selector)
-            if session is None or session.bridge is None or session.state != "READY":
+            if session is None:
+                return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            if session.profile.platform == "passthrough":
+                return passthrough_file_transfer_error(session.to_public_dict())
+            if session.bridge is None or session.state != "READY":
                 return {"ok": False, "error_code": "SESSION_NOT_READY"}
             # #139：同 file_push 的 gate（pull 同樣直寫 bridge、不經 execute_command）。
             # 直接 manager 呼叫沿用既有 source 語意；RPC 路徑明確傳入可信來源旗標。

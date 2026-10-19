@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/hamanpaul/serialwrap/contracts/rpc_schema.json",
   "title": "serialwrap RPC contract",
-  "x-catalog-revision": 11,
+  "x-catalog-revision": 13,
   "x-wire": {
     "framing": "ndjson",
     "line_strip": true,
@@ -1504,6 +1504,41 @@
       "x-notes": {
         "error_order_basis": "03 §4 gate 順序：regex→selector→state→READY_UNCONFIRMED→quiet→長度→換行→queue（pending）",
         "coercion_exception_precedes_validation": "轉型例外（EXCEPTION）先於 INVALID_ARGS 驗證（02 §5.2）；errors／error_order 無法表示此先後，故註記於此"
+      },
+      "x-error-results": {
+        "SESSION_NOT_READY": {
+          "type": "object",
+          "x-order": [
+            "ok",
+            "error_code",
+            "passthrough_ready_in_s",
+            "session"
+          ],
+          "properties": {
+            "ok": {
+              "type": "boolean",
+              "const": false
+            },
+            "error_code": {
+              "type": "string",
+              "const": "SESSION_NOT_READY"
+            },
+            "passthrough_ready_in_s": {
+              "type": "number",
+              "minimum": 0,
+              "x-unit": "s",
+              "x-note": "passthrough ATTACHED session 距離連續 30 秒無 RX 而升為 READY 的剩餘時間；其他 profile 不回傳"
+            },
+            "session": {
+              "$ref": "#/$defs/SessionPublic"
+            }
+          },
+          "required": [
+            "ok",
+            "error_code",
+            "session"
+          ]
+        }
       }
     },
     "daemon.stop": {
@@ -2802,9 +2837,9 @@
       "errors": [
         "INVALID_ARGS",
         "SESSION_NOT_FOUND",
+        "PROFILE_NOT_COMMAND_CAPABLE",
         "SESSION_RECOVERING",
         "FLASHING_BUSY",
-        "PROFILE_NOT_COMMAND_CAPABLE",
         "SESSION_NOT_READY",
         "READY_UNCONFIRMED",
         "AUTOBOOT_QUIET",
@@ -2823,9 +2858,9 @@
       "error_order": [
         "INVALID_ARGS",
         "SESSION_NOT_FOUND",
+        "PROFILE_NOT_COMMAND_CAPABLE",
         "SESSION_RECOVERING",
         "FLASHING_BUSY",
-        "PROFILE_NOT_COMMAND_CAPABLE",
         "SESSION_NOT_READY",
         "READY_UNCONFIRMED",
         "AUTOBOOT_QUIET",
@@ -2948,9 +2983,9 @@
       "errors": [
         "INVALID_ARGS",
         "SESSION_NOT_FOUND",
+        "PROFILE_NOT_COMMAND_CAPABLE",
         "SESSION_RECOVERING",
         "FLASHING_BUSY",
-        "PROFILE_NOT_COMMAND_CAPABLE",
         "SESSION_NOT_READY",
         "READY_UNCONFIRMED",
         "AUTOBOOT_QUIET",
@@ -2972,9 +3007,9 @@
       "error_order": [
         "INVALID_ARGS",
         "SESSION_NOT_FOUND",
+        "PROFILE_NOT_COMMAND_CAPABLE",
         "SESSION_RECOVERING",
         "FLASHING_BUSY",
-        "PROFILE_NOT_COMMAND_CAPABLE",
         "SESSION_NOT_READY",
         "READY_UNCONFIRMED",
         "AUTOBOOT_QUIET",
@@ -7099,6 +7134,7 @@
               "attached_vtty",
               "bridge_generation",
               "recommended_action",
+              "passthrough_ready_in_s",
               "suggested_profile",
               "hint",
               "matched_prompt",
@@ -7168,6 +7204,12 @@
                   "wait_external_flash",
                   "self_test"
                 ]
+              },
+              "passthrough_ready_in_s": {
+                "type": "number",
+                "minimum": 0,
+                "x-unit": "s",
+                "x-note": "僅 ATTACHED passthrough 分支回傳；READY passthrough 以 recommended_action=none 回傳"
               },
               "suggested_profile": {
                 "type": "string"

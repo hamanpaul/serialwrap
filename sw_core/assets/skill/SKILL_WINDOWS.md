@@ -268,8 +268,8 @@ serialwrap device attach --selector COM0
 | `NO_ACTIVE_CAPTURE` | rpc／posix、windows | 否 | session 沒有進行中的 log capture | 確認是否已執行 log start；若無進行中的 capture 則無需 stop |
 | `NO_SYSTEMD` | cli_local／posix、windows | 修正參數後 | on-demand 或未知的監管模式下呼叫 service 管理動作 | 依 supervision_mode 改用正確的 daemon 管理方式（on-demand 使用 daemon start 與 daemon stop） |
 | `PROFILE_IS_EXPLICIT` | rpc／posix、windows | 修正參數後 | session 的 profile 來源為 yaml-target，不可 pin 或 unpin | 改為修改 YAML target 設定，而非使用 pin 或 unpin |
-| `PROFILE_NOT_COMMAND_CAPABLE` | rpc／posix、windows | 否 | session 為 ATTACHED 且 profile 不支援命令（command_capable 為 false） | 改用 command-capable 的 profile，或改以 console 進行互動操作 |
-| `PROMPT_TIMEOUT` | rpc、rec／posix、windows | 否 | 命令逾時，且 CTRL-C 與 CTRL-D 都未能救回 prompt | 命令結果不明：先以 session self-test 與 session get_state 確認狀態，再由操作者決定是否重送 |
+| `PROFILE_NOT_COMMAND_CAPABLE` | rpc／posix、windows | 否 | session 為 ATTACHED 且非 passthrough 的 profile 不支援命令（command_capable 為 false），或 file.push／file.pull 的目標為 passthrough（任何狀態） | 命令使用 command-capable profile；passthrough 檔案傳輸改用互動 console |
+| `PROMPT_TIMEOUT` | rpc、rec／posix、windows | 否 | 命令逾時且未達完成條件；一般 profile 可能以 CTRL-C／CTRL-D 救援，passthrough 維持 READY 且不送救援按鍵 | 命令結果不明：先以 session self-test 與 session get_state 確認狀態，再由操作者決定是否重送 |
 | `PROMPT_TIMEOUT_FORCE_RECOVERED` | rpc／posix、windows | 否 | 命令逾時後，經 force clear 與重新 attach 成功（ok:true 回應，非失敗） | 命令已執行，勿重送；以 session get_state 確認當前狀態 |
 | `PROMPT_TIMEOUT_RECOVERED` | rpc、rec／posix、windows | 否 | 命令逾時後 CTRL-C 或 CTRL-D 救回 prompt（ok:true 回應）；命令紀錄不寫入此碼，僅 capture 保留 | 命令已中止且不會自動重送；依 stdout 判斷結果，必要時由操作者決定是否重送 |
 | `PULL_PARSE_FAILED` | rpc／posix、windows | 視情況 | 擷取輸出中找不到 sentinel 區段，且無 encoder 失敗 sentinel | 確認目標端 encoder 輸出正常後重試 |
@@ -282,7 +282,7 @@ serialwrap device attach --selector COM0
 | `SESSION_BUSY` | rpc、rec／posix、windows | 是 | 同一 session 的前景操作仍在進行中 | 等待前景操作完成後重試 |
 | `SESSION_INTERACTIVE_BUSY` | rpc、rec／posix、windows | 是 | 已有不可搶占的 interactive lease，或 SC-13 到期收尾的 ownership restore 尚未完成；相關操作被拒 | 等待 interactive lease 結束或到期收尾完成後重試 |
 | `SESSION_NOT_FOUND` | rpc／posix、windows | 修正參數後 | selector 未對應任何 session | 以 session list 確認 selector 正確後重送 |
-| `SESSION_NOT_READY` | rpc、rec／posix、windows | 視情況 | session 狀態不符（非 READY，或 bridge 不存在）；session.attach／session.recover 失敗時另附 last_error、last_error_detail | session.attach／session.recover 失敗時先讀 last_error、last_error_detail 並依 Session last_error 表處置；終態值勿反覆重試，其他暫時狀況可等待 READY 後再重試 |
+| `SESSION_NOT_READY` | rpc、rec／posix、windows | 視情況 | session 狀態不符（非 READY，或 bridge 不存在）；session.attach／session.recover 失敗時另附 last_error、last_error_detail；passthrough ATTACHED 時附 passthrough_ready_in_s | session.attach／session.recover 失敗時先讀 last_error、last_error_detail 並依 Session last_error 表處置；終態值勿反覆重試，其他暫時狀況可等待 READY 後再重試 |
 | `SESSION_QUEUE_FULL` | rpc／posix、windows | 是 | session 已接受或執行中的命令（含已 cancel 但 worker 仍執行）達 256 筆上限 | 等待排隊命令完成後重試 |
 | `SESSION_RECOVERING` | rpc、rec／posix、windows | 是 | session 恢復中（RECOVERING），操作暫不可用 | 等待恢復完成（session get_state 不再顯示 RECOVERING）後重試 |
 | `SOCKET_ERROR` | cli_client／posix、windows | 視情況 | 連線失敗（connect 或 send／recv 的 OS 錯誤，或平台不支援 AF_UNIX） | 僅白名單唯讀方法可由 CLI 自動重試；其他方法先以 health.ping 確認 daemon 狀態再決定 |

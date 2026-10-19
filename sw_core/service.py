@@ -44,7 +44,7 @@ from .device_watcher import DeviceWatcher
 from .event_engine import EventEngine, EngineDeps
 from .event_engine.line_buffer import LineBuffer
 from .file_transfer import _ACK_MODES, DEFAULT_CHUNK_SIZE
-from .session_manager import SessionManager
+from .session_manager import SessionManager, passthrough_file_transfer_error
 from .test_allowlist import AllowlistDecision, AllowlistDeviceSource
 from .util import now_iso
 from .version import resolve_version
@@ -722,11 +722,14 @@ class SerialwrapService:
         *,
         source: str = "agent",
         trusted_human: bool = False,
+        file_transfer: bool = False,
     ) -> tuple[str | None, dict[str, Any] | None]:
         state = self._sessions.get_session_state(selector)
         if not state.get("ok"):
             return None, state
         session = state["session"]
+        if file_transfer and session.get("platform") == "passthrough":
+            return None, passthrough_file_transfer_error(session)
         if session.get("state") != "READY":
             if session.get("state") == "RECOVERING":
                 return None, {
@@ -740,6 +743,24 @@ class SerialwrapService:
                     "error_code": "FLASHING_BUSY",
                     "session": session,
                 }
+            if (
+                session.get("state") == "ATTACHED"
+                and session.get("platform") == "passthrough"
+            ):
+                runtime = self._sessions.get_session(selector)
+                ready_in = (
+                    self._sessions.passthrough_ready_in_s(runtime, time.monotonic())
+                    if runtime is not None
+                    else None
+                )
+                response: dict[str, Any] = {
+                    "ok": False,
+                    "error_code": "SESSION_NOT_READY",
+                }
+                if ready_in is not None:
+                    response["passthrough_ready_in_s"] = ready_in
+                response["session"] = session
+                return None, response
             # ATTACHED 且非 command-capable（無 ready_probe，僅支援 console）的 profile
             # 永遠不會進 READY，回語意明確的錯誤碼而非 SESSION_NOT_READY。
             if session.get("state") == "ATTACHED" and not session.get("command_capable", True):
@@ -763,7 +784,7 @@ class SerialwrapService:
         # 零 UART 副作用、可重試；session 重新確認 READY 時 quiet 同步解除（session_manager
         # 各 READY 轉移點 clear_boot_quiet）。只有 daemon 內部 human console 能明確帶入
         # trusted_human；RPC 的 source 字串不授予 gate 豁免。
-        if not trusted_human:
+        if not trusted_human and session.get("platform") != "passthrough":
             # #162 有界化（優先於兩個可重試分支）：pending 已逾 READY_RECONFIRM_MAX_S／
             # READY_RECONFIRM_MAX_ATTEMPTS 落終態——daemon 已無自動路徑可解，回**不可
             # 重試**的 READY_UNCONFIRMED（刻意不帶 retry_after_s）。若仍回 AUTOBOOT_QUIET，
@@ -1322,7 +1343,7 @@ class SerialwrapService:
             if not selector or not local_path or not remote_path:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
             session_id, err = self._resolve_session_id(
-                selector, source=source, trusted_human=False
+                selector, source=source, trusted_human=False, file_transfer=True
             )
             if err is not None:
                 return err
@@ -1356,7 +1377,7 @@ class SerialwrapService:
             if not selector or not remote_path:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
             session_id, err = self._resolve_session_id(
-                selector, source=source, trusted_human=False
+                selector, source=source, trusted_human=False, file_transfer=True
             )
             if err is not None:
                 return err

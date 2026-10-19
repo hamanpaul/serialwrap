@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import replace
 import os
 try:  # POSIX-only：原生 Windows 無 pty 模組；僅 POSIX PTY 測試（posix_only + posix_pty）使用
     import pty
@@ -213,6 +214,36 @@ def test_completion_regex_producer_completes(tmp_path: Any) -> None:
         assert result["partial"] is False
         assert "out" in result["stdout"]
         assert result["stdout"].strip().endswith("__END__")
+
+
+@pytest.mark.parametrize("prompt_regex", [".*", "["], ids=["empty-match", "invalid-regex"])
+def test_completion_regex_stops_stdout_at_marker_for_unusable_prompt(
+    tmp_path: Any, prompt_regex: str
+) -> None:
+    """完成標記後同 chunk 的 prompt／log 不進 stdout，無效 prompt 也不拋錯。"""
+    profile = replace(_make_others_profile(), prompt_regex=prompt_regex)
+    response = (
+        b"run_proc\r\nout\r\n__RC__=0\r\n__END__\r\n"
+        b"# next prompt\r\nasync log line\r\n"
+    )
+
+    def on_write(data: bytes) -> bytes | None:
+        return response if b"run_proc" in data else None
+
+    with setup_device(tmp_path, profile, on_write=on_write) as (_target, _bridge, mgr, session, _wal):
+        _drive_passthrough_ready(mgr, session)
+        completion_regex = r"(?m)^__RC__=[0-9]+\r*\n__END__\r*$"
+        result = mgr.execute_command(
+            session.session_id,
+            "run_proc",
+            "agent:test",
+            "cmd-completion-tail",
+            timeout_s=2.0,
+            completion_regex=completion_regex,
+        )
+
+    assert result["ok"] is True
+    assert result["stdout"] == "run_proc\nout\n__RC__=0\n__END__"
 
 
 def test_uboot_prompt_completes(tmp_path: Any) -> None:

@@ -805,27 +805,27 @@ codes:
     status: EXISTING
     reachable: true
     scope: {interfaces: [rpc], methods: ["command.submit", "file.pull", "file.push"], platforms: [posix, windows]}
-    meaning: "session 為 ATTACHED 且 profile 不支援命令（command_capable 為 false）"
+    meaning: "session 為 ATTACHED 且非 passthrough 的 profile 不支援命令（command_capable 為 false），或 file.push／file.pull 的目標為 passthrough（任何狀態）"
     side_effect: "無"
     retryable: "no"
     uart_tx: none
-    agent_action: "改用 command-capable 的 profile，或改以 console 進行互動操作"
+    agent_action: "命令使用 command-capable profile；passthrough 檔案傳輸改用互動 console"
     extra_fields: ["hint", "session"]
-    contract_tests: ["tests/test_cowork_session_usability.py::TestCommandCapableGate::test_non_passthrough_empty_ready_probe_cmd_submit_still_not_capable"]
-    behavior_change: []
+    contract_tests: ["tests/test_cowork_session_usability.py::TestCommandCapableGate::test_non_passthrough_empty_ready_probe_cmd_submit_still_not_capable", "tests/test_p1oc_sc35_commands.py::test_file_push_pull_passthrough_rejected"]
+    behavior_change: ["SC-35"]
     sources: ["sw_core/service.py:628"]
   - code: PROMPT_TIMEOUT
     status: EXISTING
     reachable: true
     scope: {interfaces: [rpc, rec], methods: ["command.get", "command.result_tail", "result.tail", "session.recover"], platforms: [posix, windows]}
-    meaning: "命令逾時，且 CTRL-C 與 CTRL-D 都未能救回 prompt"
-    side_effect: "可能已送出 \\x03（CTRL-C）與 \\x04（CTRL-D）；session 轉為 ATTACHED，排隊命令以 FLUSHED_BY_RECOVERY 終結，background capture 以 status=error 結束"
+    meaning: "命令逾時且未達完成條件；一般 profile 可能以 CTRL-C／CTRL-D 救援，passthrough 維持 READY 且不送救援按鍵"
+    side_effect: "命令本身已送出；一般 profile 可能再送 CTRL-C／CTRL-D 並轉為 ATTACHED，passthrough 不送救援按鍵且維持 READY；background capture 以 status=error 結束"
     retryable: "no"
     uart_tx: confirmed
     agent_action: "命令結果不明：先以 session self-test 與 session get_state 確認狀態，再由操作者決定是否重送"
     extra_fields: ["partial", "recovery_action"]
-    contract_tests: ["tests/test_bad_command_recovery.py::TestBadCommandRecovery::test_timeout_without_recovery_demotes_then_re_ready", "tests/test_bad_command_recovery.py::TestBadCommandRecovery::test_timeout_without_recovery_does_not_double_flush"]
-    behavior_change: []
+    contract_tests: ["tests/test_bad_command_recovery.py::TestBadCommandRecovery::test_timeout_without_recovery_demotes_then_re_ready", "tests/test_bad_command_recovery.py::TestBadCommandRecovery::test_timeout_without_recovery_does_not_double_flush", "tests/test_p1oc_sc35_commands.py::test_unusable_prompt_times_out_without_recovery_keys", "tests/test_p1oc_sc35_commands.py::test_completion_miss_no_demote", "tests/test_p1oc_sc35_commands.py::test_reboot_command_not_special_on_passthrough", "tests/test_p1oc_sc35_commands.py::test_background_mode_same_completion_rules"]
+    behavior_change: ["SC-35"]
     sources: ["sw_core/session_manager.py:3927", "sw_core/session_manager.py:3911"]
   - code: PROMPT_TIMEOUT_FORCE_RECOVERED
     status: EXISTING
@@ -993,14 +993,14 @@ codes:
     status: IMPLEMENTED
     reachable: true
     scope: {interfaces: [rpc, rec], methods: ["command.submit", "file.pull", "file.push", "session.attach", "session.console_attach", "session.console_detach", "session.console_list", "session.interactive_open", "session.interactive_send", "session.interactive_status", "session.recover", "command.get"], platforms: [posix, windows]}
-    meaning: "session 狀態不符（非 READY，或 bridge 不存在）；session.attach／session.recover 失敗時另附 last_error、last_error_detail"
+    meaning: "session 狀態不符（非 READY，或 bridge 不存在）；session.attach／session.recover 失敗時另附 last_error、last_error_detail；passthrough ATTACHED 時附 passthrough_ready_in_s"
     side_effect: "無（gate 拒絕）；例外：session.attach／session.recover 於 probe 之後回此碼時，probe 位元組可能已送出"
     retryable: "conditional"
     uart_tx: none
     agent_action: "session.attach／session.recover 失敗時先讀 last_error、last_error_detail 並依 Session last_error 表處置；終態值勿反覆重試，其他暫時狀況可等待 READY 後再重試"
-    extra_fields: ["error_detail", "selector", "session", "session_id", "interactive_id", "last_error", "last_error_detail"]
-    contract_tests: ["tests/test_bootloader_recovery.py::TestInteractiveOpenAllowAttached::test_allow_attached_false_rejects_attached", "tests/test_cowork_session_usability.py::TestCommandCapableGate::test_command_capable_when_ready_probe_set", "tests/test_p1oc_sc34_last_error.py::test_attach_state_result_separates_last_error", "tests/test_p1oc_sc34_last_error.py::test_recover_reprobe_not_recovered_shape"]
-    behavior_change: ["SC-34"]
+    extra_fields: ["error_detail", "selector", "session", "session_id", "interactive_id", "last_error", "last_error_detail", "passthrough_ready_in_s"]
+    contract_tests: ["tests/test_bootloader_recovery.py::TestInteractiveOpenAllowAttached::test_allow_attached_false_rejects_attached", "tests/test_cowork_session_usability.py::TestCommandCapableGate::test_command_capable_when_ready_probe_set", "tests/test_p1oc_sc34_last_error.py::test_attach_state_result_separates_last_error", "tests/test_p1oc_sc34_last_error.py::test_recover_reprobe_not_recovered_shape", "tests/test_p1oc_sc35_state.py::test_submit_attached_passthrough_session_not_ready"]
+    behavior_change: ["SC-34", "SC-35"]
     sources: ["sw_core/service.py:642", "sw_core/arbiter.py:196", "sw_core/session_manager.py:2515", "sw_core/session_manager.py:3646", "sw_core/session_manager.py:4645"]
   - code: SESSION_QUEUE_FULL
     status: IMPLEMENTED
