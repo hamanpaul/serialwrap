@@ -65,8 +65,12 @@ function Get-LoopbackListenerSnapshot() {
         return [pscustomobject]@{ ok = $false; listeners = @(); error = 'Get-NetTCPConnection 不可用' }
     }
     try {
+        # wslrelay.exe 是 WSL localhost 轉送：它代表 WSL 端（Linux）行程開的 listener，會隨同機其他
+        # Linux 工作增減，與本輪 Windows throwaway daemon 無關；不排除會讓釋放檢查誤判。
+        $relayPids = @(Get-Process -Name 'wslrelay' -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
         $listeners = @(Get-NetTCPConnection -State Listen -ErrorAction Stop |
             Where-Object { $_.LocalAddress -eq '127.0.0.1' -or $_.LocalAddress -eq '::1' } |
+            Where-Object { $_.OwningProcess -notin $relayPids } |
             ForEach-Object {
             '{0}|{1}|{2}' -f $_.LocalAddress, $_.LocalPort, $_.OwningProcess
         } | Sort-Object -Unique)
