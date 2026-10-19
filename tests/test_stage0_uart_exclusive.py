@@ -857,10 +857,10 @@ class TestAttachProbeDrain:
                     timeout=5.0,
                 )
                 sessions = _sessions_from_cli(status.stdout)
-                if sessions and sessions[0].get("state") == "READY":
+                if sessions and sessions[0].get("state") == "ATTACHED":
                     break
                 time.sleep(0.1)
-            assert sessions and sessions[0].get("state") == "READY"
+            assert sessions and sessions[0].get("state") == "ATTACHED"
             rel = subprocess.run(
                 [sys.executable, "-m", "sw_core.cli", "--socket", sock, "device", "release", "--selector", "COM0"],
                 env=env,
@@ -894,10 +894,10 @@ class TestAttachProbeDrain:
                     timeout=5.0,
                 )
                 sessions = _sessions_from_cli(status.stdout)
-                if sessions and sessions[0].get("state") == "READY":
+                if sessions and sessions[0].get("state") == "ATTACHED":
                     break
                 time.sleep(0.1)
-            assert sessions and sessions[0].get("state") == "READY"
+            assert sessions and sessions[0].get("state") == "ATTACHED"
         finally:
             dproc.kill()
             dproc.wait()

@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import time
 from unittest import mock
 
 import pytest
@@ -117,7 +118,10 @@ def test_tx_does_not_restart_window(tmp_path, monkeypatch):
     assert s.state == "READY" and port.writes == []
 
 
-@pytest.mark.parametrize("blocker", ["draining", "released", "flash_critical", "no_bridge"])
+@pytest.mark.parametrize(
+    "blocker",
+    ["draining", "released", "released_set", "release_request", "pending_drain", "flash_critical", "no_bridge"],
+)
 def test_blocked_states_not_promoted(tmp_path, blocker):
     mgr, s, port = _attached_pt(tmp_path)
     by_id = s.profile.device_by_id
@@ -125,6 +129,12 @@ def test_blocked_states_not_promoted(tmp_path, blocker):
         mgr._draining_by_ids[by_id] = mock.MagicMock()
     elif blocker == "released":
         s.state = "RELEASED"
+    elif blocker == "released_set":
+        mgr._released_by_ids.add(by_id)
+    elif blocker == "release_request":
+        mgr._active_attach_ops[by_id] = mock.Mock(release_request=("owner", None))
+    elif blocker == "pending_drain":
+        s._pending_drain = mock.Mock()
     elif blocker == "flash_critical":
         mgr.mark_flash_critical(s.profile.com)
     else:
@@ -132,6 +142,16 @@ def test_blocked_states_not_promoted(tmp_path, blocker):
     with mgr._lock:
         assert mgr._promote_quiet_passthrough_locked(2000.0) == []
     assert s.state != "READY"
+
+
+@pytest.mark.parametrize("data", [b"\r", b"\x1b[0m"])
+def test_raw_control_rx_restarts_window(tmp_path, monkeypatch, data):
+    mgr, s, _port = _attached_pt(tmp_path)
+    monkeypatch.setattr("sw_core.session_manager.time.monotonic", lambda: 1020.0)
+
+    mgr._on_bridge_rx(s.session_id, data)
+
+    assert s.passthrough_quiet_since == 1020.0
 
 
 def test_attach_passthrough_zero_tx_even_with_ready_probe(tmp_path, monkeypatch):
@@ -154,6 +174,40 @@ def test_attach_passthrough_zero_tx_even_with_ready_probe(tmp_path, monkeypatch)
 
     assert s.state == "ATTACHED"
     assert s.last_error is None
+    assert port.writes == []
+
+
+def test_dynamic_passthrough_attach_zero_tx_even_with_ready_probe(tmp_path, monkeypatch):
+    from sw_core.config import ProfileTemplate, UartProfile
+
+    port = FakePort()
+    mgr = make_manager(tmp_path, [])
+    mgr._templates = [
+        ProfileTemplate(
+            profile_name="uboot-template",
+            platform="passthrough",
+            prompt_regex=UBOOT_PROMPT,
+            ready_probe=UBOOT_READY,
+            uart=UartProfile(),
+        )
+    ]
+    mgr._profile_pins[BY_ID] = "uboot-template"
+    mgr._devices[BY_ID] = DeviceInfo(by_id=BY_ID, real_path=REAL_PATH)
+    monkeypatch.setattr(
+        sm_mod,
+        "detect_template",
+        lambda *_args, **_kwargs: pytest.fail("passthrough pin 不得啟動 PROBE 偵測"),
+    )
+    monkeypatch.setattr(UARTBridge, "start", lambda self: None)
+
+    with mock.patch("sw_core.uart_io.open_serial_port", return_value=port):
+        mgr._attach_by_id_dynamic(BY_ID)
+
+    sessions = list(mgr._sessions.values())
+    assert len(sessions) == 1
+    assert sessions[0].profile.platform == "passthrough"
+    assert sessions[0].state == "ATTACHED"
+    assert sessions[0].last_error is None
     assert port.writes == []
 
 
@@ -202,6 +256,34 @@ def test_ready_passthrough_skips_quiet_gates(tmp_path):
         svc._arbiter.unregister_session(s.session_id, error_code="FLUSHED_BY_SHUTDOWN")
 
 
+def test_execute_worker_sends_ready_passthrough_command_during_reconfirm(tmp_path):
+    mgr, s, port = _attached_pt(tmp_path)
+    s.state = "READY"
+    s.ready_reconfirm_pending = True
+    svc = _svc_for(mgr)
+    svc._arbiter.register_session(s.session_id)
+    try:
+        accepted = svc.rpc(
+            "command.submit",
+            {"selector": "COM0", "cmd": "ls", "mode": "line", "timeout_s": 0.2},
+        )
+        assert accepted["ok"] is True
+        cmd_id = accepted["cmd_id"]
+        deadline = time.monotonic() + 2.0
+        command = None
+        while time.monotonic() < deadline:
+            command = svc.rpc("command.get", {"cmd_id": cmd_id})["command"]
+            if command["status"] in {"done", "error"}:
+                break
+            time.sleep(0.01)
+
+        assert command is not None and command["status"] == "error", command
+        assert command["error_code"] == "PROMPT_TIMEOUT"
+        assert port.writes == [b"ls\n"]
+    finally:
+        svc._arbiter.unregister_session(s.session_id, error_code="FLUSHED_BY_SHUTDOWN")
+
+
 def test_self_test_ready_passthrough_zero_tx(tmp_path):
     mgr, s, port = _attached_pt(tmp_path)
     s.state = "READY"
@@ -232,6 +314,38 @@ def test_recover_passthrough_no_probe(tmp_path):
     assert port.writes == []
 
 
+def test_recover_passthrough_does_not_classify_bootloader(tmp_path, monkeypatch):
+    mgr, s, port = _attached_pt(tmp_path, prompt_regex=UBOOT_PROMPT, ready_probe=UBOOT_READY)
+    monkeypatch.setattr(mgr, "_bootloader_evidence", lambda *_args: "=> ")
+
+    result = mgr.recover_session("COM0")
+
+    assert result["error_code"] == "SESSION_NOT_READY"
+    assert "classification" not in result
+    assert "recommended_action" not in result
+    assert port.writes == []
+
+
+def test_quiet_promotion_is_suppressed_during_shutdown(tmp_path):
+    mgr, s, port = _attached_pt(tmp_path)
+    mgr._shutting_down = True
+
+    with mgr._lock:
+        promoted = mgr._promote_quiet_passthrough_locked(2000.0)
+
+    assert promoted == []
+    assert s.state == "ATTACHED"
+    assert port.writes == []
+
+
+def test_passthrough_is_excluded_from_reprobe_paths(tmp_path):
+    mgr, s, _port = _attached_pt(tmp_path)
+
+    assert mgr._prepare_reprobe_locked(s, 2000.0) is None
+    with mgr._lock:
+        assert mgr._reprobe_target_still_valid_locked(s, s.bridge, 2000.0) is False
+
+
 def test_attach_attached_passthrough_ok(tmp_path):
     mgr, s, port = _attached_pt(tmp_path, prompt_regex=UBOOT_PROMPT, ready_probe=UBOOT_READY)
     result = mgr.attach_session("COM0")
@@ -244,13 +358,20 @@ def test_bridge_down_returns_to_attached_and_restarts_window(tmp_path, monkeypat
     mgr, s, port = _attached_pt(tmp_path)
     s.state = "READY"
     old_bridge = s.bridge
-    mgr._handle_bridge_down(s.session_id, old_bridge, "test-bridge-down")
-
     monkeypatch.setattr("sw_core.session_manager.time.monotonic", lambda: 5000.0)
     monkeypatch.setattr(UARTBridge, "start", lambda self: None)
-    with mock.patch("sw_core.uart_io.open_serial_port", return_value=FakePort()):
-        mgr._attach_by_id(BY_ID)
+    spawned = []
 
+    def _attach_inline(by_id):
+        spawned.append(by_id)
+        mgr._attach_by_id(by_id)
+
+    # 以同步替身完成既有的自動重連排程，避免再手動啟動第二個競跑 attach worker。
+    monkeypatch.setattr(mgr, "_spawn_attach", _attach_inline)
+    with mock.patch("sw_core.uart_io.open_serial_port", return_value=FakePort()):
+        mgr._handle_bridge_down(s.session_id, old_bridge, "test-bridge-down")
+
+    assert spawned == [BY_ID]
     assert s.state == "ATTACHED"
     assert s.passthrough_quiet_since == 5000.0
 

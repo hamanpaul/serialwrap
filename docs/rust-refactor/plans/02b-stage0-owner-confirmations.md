@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 把 `owner-decisions-2026-10-15.md` OD-14（2026-10-16）對調和表 §3 擁有者確認清單 #1～#7 的裁決，套用到 P1 交付後的 Python Stage 0 基線（`sw_core/`）與 P0 契約（`contracts/`）：#1 attach／recover 的 `error_code` 與 `last_error` 分離（新 SC-34）；#2 `platform=passthrough` 30 秒安靜自動 `READY` 並可送命令（新 SC-35）；#3 UDS socket 維持 `0660`（SC-08 撤回，還原 P1 T15 的 0600／0700）；#4 release drain 逾時新增錯誤碼 `DRAIN_STALLED`（修訂 SC-04）；#5～#7（DF-02、SC-26、SC-27）確認原預設的簿記。每項先寫失敗測試再實作，讓 Python 基線先滿足新契約，作為 Rust（P5～P8）承接與 Sequential A/B 的 A 側。
+**Goal:** 把 `owner-decisions-2026-10-15.md` OD-14（2026-10-16）對調和表 §3 擁有者確認清單 #1～#7 的裁決，套用到 P1 交付後的 Python Stage 0 基線（`sw_core/`）與 P0 契約（`contracts/`）：#1 attach／recover 的 `error_code` 與 `last_error` 分離（新 SC-34）；#2 `platform=passthrough` 30 秒安靜自動 `READY` 並可送命令（新 SC-35）；#3 UDS socket 維持 `0660`（SC-08 撤回，撤回 P1 T15 對 socket 與新建目錄權限的收緊）；#4 release drain 逾時新增錯誤碼 `DRAIN_STALLED`（修訂 SC-04）；#5～#7（DF-02、SC-26、SC-27）確認原預設的簿記。每項先寫失敗測試再實作，讓 Python 基線先滿足新契約，作為 Rust（P5～P8）承接與 Sequential A/B 的 A 側。
 
 **Architecture:** 只改 Python 產品碼、P0 契約資料、P0 契約工具的一條驗證規則與測試資產，不建立 Rust crate、不新增 CLI 子命令／參數／RPC method（OD-14 相容原則：外部指令格式只能新增不能修改；狀態與回應欄位內容可調整）。本 Phase **在 P1 全部 Task 完成並合併後執行**，疊在 P1 交付物之上；`02-stage0-python-bc.md` 本身不修改（其行號為進行中的 P1 工作流所依賴），與 P1 的差異一律在本計畫各 Task 的「與 P1 的調和」小節處理。
 
@@ -206,7 +206,7 @@
   ```
   recover REPROBE 未恢復時：`payload["error_code"] = "SESSION_NOT_READY"`、`payload["last_error"] = result["session"].get("last_error")`、`payload["last_error_detail"] = result["session"].get("last_error_detail")`，依序在 `session` 之後加入；BOOTLOADER 判定 `matched is not None or payload["last_error"] == ERROR_BOOTLOADER_STUCK`。
 - Produces（契約）：
-  - `error_codes.yaml`：刪除頂層 `passthrough:`；`NOT_READY` 改 `reachable: false`、`unreachable_reason: "SC-34（OD-14 #1）起 session.attach 改回 SESSION_NOT_READY"`、`behavior_change: ["SC-34"]`（status 仍 `EXISTING`）、`contract_tests` 改為本 Task 的 unreachable 證明測試；`SESSION_NOT_READY` 的 `meaning` 補「session.attach／session.recover 失敗時附 last_error、last_error_detail」、`extra_fields` 加 `"last_error"`、`"last_error_detail"`、`behavior_change` 加 `"SC-34"`、`contract_tests` 加本 Task node。
+  - `error_codes.yaml`：保留頂層 `passthrough: []`（loader 會無條件讀取此鍵，meta entries 全數移除）；`NOT_READY` 改 `reachable: false`、`unreachable_reason: "SC-34（OD-14 #1）起 session.attach 改回 SESSION_NOT_READY"`、`behavior_change: ["SC-34"]`（status 仍 `EXISTING`）、`contract_tests` 改為本 Task 的 unreachable 證明測試；`SESSION_NOT_READY` 的 `meaning` 補「session.attach／session.recover 失敗時附 last_error、last_error_detail」、`extra_fields` 加 `"last_error"`、`"last_error_detail"`、`behavior_change` 加 `"SC-34"`、`contract_tests` 加本 Task node。
   - `code_extraction.yaml`：刪除 `namespaces.error_code.passthrough` 的三條 `emits: last_error_passthrough` 規則（改為 `passthrough: []`）。
   - `session_last_errors.yaml`：檔頭說明 `promoted_via` 改為「該值會出現在所列方法回應頂層 `last_error` 欄位（SC-34 起不再進 `error_code`）」；各值的 `promoted_via` 資料不變。
   - `rpc_schema.json`：`session.attach` 與 `session.recover` 的 `errors` 刪 `"@last_error_passthrough"`、`"NOT_READY"`；attach 新增失敗分支 schema `x-order: ["ok","error_code","last_error","last_error_detail","session"]`；recover REPROBE 分支 `x-order` 在 `session` 後加 `"error_code","last_error","last_error_detail"`，`last_error`／`last_error_detail` 型別 `["string","null"]`；`x-catalog-revision` +1。
@@ -268,7 +268,9 @@
 | `tests/test_contracts_gap_codes.py` | `TestGapMemory::test_not_ready_attach_state_result` | 改斷言 `SESSION_NOT_READY`＋`last_error is None`；`NOT_READY` 的 contract_tests 改指 `test_not_ready_code_unreachable_in_source` |
 | `tests/test_contracts_extract.py` | 真實抽取斷言含 `last_error_passthrough` 者（現行約 687 行）、真實碼清單含 `NOT_READY` 者（約 657 行） | 改斷言不含；合成設定案例（inline YAML 的 `emits: last_error_passthrough`）屬抽取器能力測試，**保留** |
 | `tests/test_contracts_catalog.py` | `test_ec_passthrough_single_meta_entry` | 改名 `test_ec_no_passthrough_meta_entry`，斷言 `passthrough == ()` |
+| `tests/test_contracts_catalog.py` | `test_ec_unreachable_set` | 不可達既有錯誤碼集合加入 `NOT_READY` | SC-34 將舊 attach 錯誤碼標記為不可達 |
 | `tests/test_bootloader_recovery.py`、`tests/test_login_recovery_lease.py`、`tests/test_profile_reresolve_on_attach.py`、`tests/test_boot_quiet.py` | 斷言 recover／attach `error_code` 為 last_error 值者 | 改讀 `last_error` 欄位 |
+| `tests/test_resilience_hotplug.py` | `TestDeviceHotplug::test_recover_session_attached_failed_reprobe_stays_attached` | 斷言 REPROBE 回 `SESSION_NOT_READY`，並分別檢查頂層及 session 內的 `last_error`／`last_error_detail` | 核對 recover REPROBE 契約欄位 |
 
 ---
 
@@ -283,7 +285,7 @@
 
 **Files**
 - Create: `tests/test_p1oc_socket_perm.py`
-- Modify: `sw_core/rpc_posix.py`、`sw_core/constants.py`、`changelog.d/rust-p1-platform-mgmt.md`、`tests/test_stage0_platform_mgmt.py`（下列「測試資產變更」）、`README.md`（若 P1 改寫了 socket 權限說明，中英兩段還原為 0660）
+- Modify: `sw_core/rpc_posix.py`、`sw_core/constants.py`、`changelog.d/rust-p1-platform-mgmt.md`、`tests/test_stage0_platform_mgmt.py`、`tests/test_codex_fixes.py`（下列「測試資產變更」）、`README.md`、`sw_core/assets/skill/SKILL.md`、`sw_core/assets/skill/SKILL_WINDOWS.md`（P1 改寫的 socket 權限說明還原為 0660，並移除已撤回的 SC-08 標記）
 
 **Steps**
 - [ ] **A1 寫失敗測試**：`tests/test_p1oc_socket_perm.py`（`pytestmark = [pytest.mark.posix_only, pytest.mark.process_rpc]`）
@@ -322,6 +324,31 @@
       mode, gid = asyncio.run(run())
       assert mode == 0o660 and gid == os.getgid()
 
+  def test_socket_group_chgrp_to_supplementary_group(tmp_path, monkeypatch):
+      selected = None
+      for candidate_gid in os.getgroups():
+          if candidate_gid == os.getegid():
+              continue
+          try:
+              candidate_name = grp.getgrgid(candidate_gid).gr_name
+          except KeyError:
+              continue
+          selected = (candidate_gid, candidate_name)
+          break
+      if selected is None:
+          pytest.skip("目前程序沒有可辨識的附加群組")
+      expected_gid, g = selected
+      monkeypatch.setenv("SERIALWRAP_SOCKET_GROUP", f"  {g}  ")
+      p = str(tmp_path / "supplementary.sock")
+      async def run():
+          srv = JsonRpcUnixServer(p, lambda m, q: {"ok": True}); await srv.start()
+          try:
+              st = os.stat(p); return stat.S_IMODE(st.st_mode), st.st_gid
+          finally:
+              await srv.stop()
+      mode, gid = asyncio.run(run())
+      assert mode == 0o660 and gid == expected_gid
+
   def test_socket_group_unknown_ignored(tmp_path, monkeypatch):
       monkeypatch.setenv("SERIALWRAP_SOCKET_GROUP", "no-such-group-p1oc")
       assert _mode_after_start(str(tmp_path / "s.sock")) == 0o660
@@ -341,24 +368,24 @@
 
 | 檔案 | 測試 | 改動 |
 |---|---|---|
-| `tests/test_stage0_platform_mgmt.py` | 斷言 socket `0o600` 者（P1 T15，現行約 100 行） | 改斷言 `0o660`，測試名中的 `0600` 改 `0660` |
-| `tests/test_stage0_platform_mgmt.py` | 斷言新建目錄 `0o700` 者（約 214 行） | 刪除該斷言（目錄權限屬基線 umask），保留 SC-09 等其他斷言；docstring 移除 SC-08 |
-| `tests/test_stage0_platform_mgmt.py` | group 時 `0o660` 者（約 191 行） | 不改（基線同義） |
+| `tests/test_stage0_platform_mgmt.py` | socket `0o600` 斷言；`test_socket_group_mode_0660`；`test_new_runtime_dirs_0700` | socket 預期改為 `0o660`；group 時的 `0o660` 斷言不改；目錄測試改名 `test_existing_runtime_dir_permissions_unchanged`，只保留既有 `CONFIG_DIR` 權限不變的斷言，新建目錄 umask 由 `test_p1oc_socket_perm.py::test_runtime_dirs_not_forced_0700` 覆蓋；docstring 移除 SC-08 |
+| `tests/test_codex_fixes.py` | `test_rpc_socket_default_mode_is_0600` | 改名 `test_rpc_socket_default_mode_is_0660`，預期由 `0o600` 改為 `0o660` |
+| `tests/test_p1oc_socket_perm.py` | `test_socket_group_chgrp_to_supplementary_group` | 新增真實群組變更斷言：選取非 effective GID 的可辨識附加群組，確認 socket `st_gid` 改為該 GID；沒有符合群組時 skip |
 
 ---
 
 ## Task T4：`DRAIN_STALLED`：release drain 逾時新錯誤碼
 
-- **範圍**：`device.release` 的 drain 自停止請求起算（含 Phase 1 等鎖，R3-F3）超過 `DRAIN_TIMEOUT_MS` 仍無成功回條（含回條 `handle_closed is False`）→ `{"ok":false,"error_code":"DRAIN_STALLED","drain_stalled":true,"drain_timeout_epoch":<bridge_generation>,"session":…}`；仍 stalled 時再次 release → 同形；drain 進行中未逾時的重複 release 共用同一期限；回條遲到 → daemon 自行完成 release（`RELEASED`＋持久化），之後 release 回 `already_released`。drain 中的 `device.attach`／`session.clear`／`session.bind`／`session.recover` **維持** `SESSION_RECOVERING`＋drain 欄位。依據：OD-14 #4；調和表 SC-04、SES-16.3a；arch §5.5。
+- **範圍**：`device.release` 的 drain 自停止請求起算（含 Phase 1 等鎖，R3-F3）超過 `DRAIN_TIMEOUT_MS` 仍無成功回條，或收到 `handle_closed is False` 失敗回條（此分支可立即回應）→ `{"ok":false,"error_code":"DRAIN_STALLED","drain_stalled":true,"drain_timeout_epoch":<bridge_generation>,"session":…}`；仍 stalled 時再次 release → 同形；drain 進行中未逾時的重複 release 共用首次期限；回條遲到 → daemon 自行完成 release（`RELEASED`＋持久化），之後 release 回 `already_released`。drain 中的 `device.attach`／`session.attach`／`session.clear`／`session.bind`／`session.recover` **維持** `SESSION_RECOVERING`＋drain 欄位。依據：OD-14 #4；調和表 SC-04、SES-16.3a；arch §5.5。
 - **Test author model**：agy-gemini-3.8-flash-high　**Implementer model**：codex-gpt-6-luna-max（drain barrier）
-- **Changelog fragment**：`changelog.d/rust-p1oc-drain-stalled.md`（`type: change`，`scope: session`）：`device release` 等待 handle 關閉超過 3 秒時改回新錯誤碼 `DRAIN_STALLED`（附 `drain_stalled`、`drain_timeout_epoch`）；release 仍會在背景完成，請以 `session get_state` 確認 `RELEASED` 後再交接，勿重開裝置。
-- **BLOCKED-OWNER**：無（OD-15：Windows 原生 guarded write 逾時情境改在擁有者 host 的 COM20 實跑，見 B2）。
+- **Changelog fragment**：`changelog.d/rust-p1oc-drain-stalled.md`（`type: change`，`scope: session`）：`device release` drain 超過 3 秒或 handle 關閉回條失敗時回新錯誤碼 `DRAIN_STALLED`（附 `drain_stalled`、`drain_timeout_epoch`）；release 仍可能在背景完成，請在有限等待內以 `session get_state` 確認 `RELEASED` 後再交接；若仍為 `RECOVERING`，停止重試並交由操作員檢查，勿重開裝置。release 尚未完成時，`session attach`／`session clear` 維持回 `SESSION_RECOVERING`。
+- **BLOCKED-OWNER**：無（OD-15：Windows 原生 pyserial write 的 RTS/CTS 背壓情境在擁有者 host 的 COM20／COM21 實跑，見 B2）。
 
 **與 P1 的調和**：P1 T08 的「回應形狀（凍結）」表中 release 逾時、drain 中再次 release、close 失敗三列回 `SESSION_RECOVERING`；本 Task 只改這三列為 `DRAIN_STALLED`，「drain 中 `device.attach`」列不改。P1 T08／T20 的既有測試（`tests/test_stage0_session_drain.py::test_release_drain_timeout_shape`、`test_failed_close_receipt_keeps_recovering`、`test_release_drain_deadline_includes_lock_wait`、T20 `test_windows_guarded_write_stall_reports_drain_stalled_on_time`）列入測試資產變更。
 
 **Files**
 - Create: `tests/test_p1oc_drain_stalled.py`
-- Modify: `sw_core/constants.py`（`ERROR_DRAIN_STALLED`）、`sw_core/session_manager.py`（`release_device` 逾時／去重／close 失敗分支）、`contracts/error_codes.yaml`（新碼；`SESSION_RECOVERING` 的 `scope.methods` 移除 `device.release`（若 P1 已加）、`behavior_change` 保留 SC-04）、`contracts/behavior_changes.yaml`（SC-04 `compatibility_impact`／`approval_conditions` 改寫為 DRAIN_STALLED；`safety_invariants` 的 `no_auto_resend`、`no_reopen_before_handoff` 加 `DRAIN_STALLED`）、`contracts/rpc_schema.json`（`device.release.errors` 加 `DRAIN_STALLED`、`error_order` 依實作序、失敗分支 `x-order: ["ok","error_code","drain_stalled","drain_timeout_epoch","session"]`；`x-catalog-revision` +1）、兩份 SKILL 受管區段、`tests/` 下列「測試資產變更」
+- Modify: `sw_core/constants.py`（`ERROR_DRAIN_STALLED`）、`sw_core/session_manager.py`（`release_device` 逾時／去重／close 失敗分支、`session.attach` drain guard）、`scripts/stage0/drain_timing.py`（新逾時碼量測）、`contracts/error_codes.yaml`（新碼；`SESSION_RECOVERING` 的 `scope.methods` 移除 `device.release`（若 P1 已加）、`behavior_change` 保留 SC-04）、`contracts/behavior_changes.yaml`（SC-04 `compatibility_impact`／`approval_conditions` 改寫為 DRAIN_STALLED；`safety_invariants` 的 `no_auto_resend`、`no_reopen_before_handoff` 加 `DRAIN_STALLED`）、`contracts/rpc_schema.json`（`device.release.errors` 加 `DRAIN_STALLED`、`error_order` 依實作序、失敗分支 `x-order: ["ok","error_code","drain_stalled","drain_timeout_epoch","session"]`；`x-catalog-revision` +1）、`contracts/daemon_logging.yaml`、`contracts/cli_schema.json`（修正行號來源）、兩份 SKILL 受管區段、`tests/test_contracts_keep_baseline.py`（同一行號來源同步）、`tests/` 下列「測試資產變更」、`contracts/captures/stage0-python-bc.json`
 
 **Interfaces**
 - Produces（契約，`error_codes.yaml` 依字母序插入）：
@@ -368,13 +395,13 @@
     reachable: true
     constant: ERROR_DRAIN_STALLED
     scope: {interfaces: [rpc], methods: ["device.release"], platforms: [posix, windows]}
-    meaning: "device.release 的 drain 自停止請求起算（含 Phase 1 等鎖）超過 3000 ms 仍未取得 handle 關閉回條"
-    side_effect: "release 已開始但未完成：session 為 RECOVERING、by_id 已列入 released 集合（阻擋自動 attach）、在途前景命令已中止（結果見 command.get）；handle 尚未確認關閉，回條晚到時 daemon 自行完成 release（RELEASED 並持久化）"
+    meaning: "device.release 的 drain 超過 3000 ms 仍無成功 handle 關閉回條，或收到 handle_closed=false 失敗回條（後者可立即回應）"
+    side_effect: "release 已開始但未完成：session 為 RECOVERING、by_id 已列入 released 集合（阻擋自動 attach）、在途前景命令已中止（結果見 command.get）；尚無成功關閉確認時，成功回條晚到可由 daemon 完成 release（RELEASED 並持久化），失敗回條則維持 RECOVERING 並需操作員處置"
     retryable: "no"
     uart_tx: possible
-    agent_action: "不要重開或讓外部工具開啟該裝置；以 session get_state 輪詢至 state 為 RELEASED 後再交接；再次 device release 只會回 DRAIN_STALLED 或 already_released，不會加速完成"
+    agent_action: "不要重開或讓外部工具開啟該裝置；以有界等待輪詢 session get_state，只有 state 為 RELEASED 才交接；等待期限內仍為 RECOVERING 時停止重試並交由操作員檢查 daemon／handle；再次 device release 不會加速完成"
     extra_fields: ["drain_stalled", "drain_timeout_epoch", "session"]
-    contract_tests: ["tests/test_p1oc_drain_stalled.py::test_release_timeout_returns_drain_stalled", "tests/test_p1oc_drain_stalled.py::test_late_receipt_completes_release"]
+    contract_tests: ["tests/test_p1oc_drain_stalled.py::test_release_timeout_returns_drain_stalled", "tests/test_p1oc_drain_stalled.py::test_late_receipt_completes_release", "tests/test_p1oc_drain_stalled.py::test_close_failure_returns_drain_stalled"]
     behavior_change: ["SC-04"]
     sources: ["sw_core/session_manager.py:<release_device 逾時分支行號>"]
   ```
@@ -431,14 +458,17 @@
   | 測試名 | 斷言 |
   |---|---|
   | `test_close_failure_returns_drain_stalled` | `FakePort.close` 擲 `OSError` → release 回 `DRAIN_STALLED`、state `RECOVERING`、`attach_device` 不開新 handle |
-  | `test_duplicate_release_before_deadline_shares_deadline` | 第一個 release 於 thread 中等待；50 ms 後第二個 release → 兩者都在第一個請求起算的期限內回 `DRAIN_STALLED`（第二個的耗時 < `short_drain` 期限＋100 ms），close 只發一次 |
+| `test_duplicate_release_before_deadline_shares_deadline` | 第一個 release 於 thread 中等待；50 ms 後第二個 release → 兩者都在第一個請求起算的期限內回 `DRAIN_STALLED`（第二個的耗時 < `short_drain` 期限＋100 ms），close 只發一次 |
+| `test_duplicate_release_during_attach_op_shares_first_deadline`、`test_stalled_attach_op_duplicate_keeps_diagnostics_and_expired_deadline` | attach op 尚未完成時，並行及逾時後重複 release 沿用首次期限，且不清除 `drain_stalled`／`drain_timeout_epoch` |
   | `test_clear_bind_recover_during_drain_session_recovering` | stalled 中 `clear_session`／`bind_session`／`recover_session(force=False)` → 各回 `SESSION_RECOVERING`＋drain 欄位 |
+| `test_session_attach_during_stalled_release_returns_session_recovering`、`test_session_attach_probe_racing_stalled_release_returns_session_recovering` | stalled 中及既有同步 probe 遇到 stalled release 時，`session.attach` 回 `SESSION_RECOVERING`＋drain 欄位，不誤回 `released:true` |
+| `test_drain_timing_counts_drain_stalled_timeout`、`test_drain_timing_does_not_count_immediate_close_failure_as_timeout` | 3,000 ms 後的 `DRAIN_STALLED` 計入逾時；早回的 close 失敗與其他錯誤不冒稱 timeout |
   | `test_drain_stalled_catalog_entry` | P0 loader 讀 `DRAIN_STALLED`：`retryable == "no"`、`uart_tx == "possible"`、`scope.methods == ("device.release",)`、`behavior_change == ("SC-04",)`；`no_auto_resend` 與 `no_reopen_before_handoff` 的 `error_codes` 含 `DRAIN_STALLED` |
   | `test_cli_device_release_drain_stalled_exit` | 以 RPC stub 回 `DRAIN_STALLED` 形狀，`serialwrap device release --selector COM0` 的 stdout JSON `error_code == "DRAIN_STALLED"`、exit code 與其他 `ok:false` RPC 回應相同（`_run_rpc` 既有規則，不新增 exit code） |
-  | `test_windows_guarded_write_stall_drain_stalled_native`（`windows_native`＋`windows_com`） | OD-11 隔離實例＋`SERIALWRAP_TEST_DEVICE_ALLOWLIST=COM20`；COM21 端不讀取使 COM20 寫入卡住（RTS/CTS 或 bridge 停讀）→ release 在 3,000 ms＋500 ms 內回 `DRAIN_STALLED`，回條前 COM20 不可被第二次開啟（`ERROR_ACCESS_DENIED`），解除後 `RELEASED` 且外部可開 COM20 |
+| `test_windows_guarded_write_stall_drain_stalled_native`（`windows_native`＋`windows_com`） | COM20 使用 RTS/CTS、COM21 將 RTS 拉低，實際阻塞 COM20 原生 pyserial `write` 至少 250 ms 後才開始 release；只在確認 OS write 已阻塞後停用 `cancel_pending_write`，以驗證 3,000 ms deadline；release 在 3,000 ms ± 500 ms 回 `DRAIN_STALLED`，回條前 COM20 不可被第二次開啟（`ERROR_ACCESS_DENIED`），恢復 CTS 後 `RELEASED` 且外部可開 COM20 |
 - [ ] **A2 執行並確認 FAIL**：`python3 -m pytest -q tests/test_p1oc_drain_stalled.py` → 預期 `'SESSION_RECOVERING' != 'DRAIN_STALLED'`、目錄缺 `DRAIN_STALLED`。commit：`test(session): DRAIN_STALLED release drain 逾時失敗測試`
 - [ ] **B1 實作**：release 逾時、去重、close 失敗三分支改用 `ERROR_DRAIN_STALLED`；其他 drain 中拒絕維持 `SESSION_RECOVERING`；契約依 Interfaces；SKILL 重新產生。
-- [ ] **B2 執行並確認 PASS**：`python3 -m pytest -q tests/test_p1oc_drain_stalled.py tests/test_stage0_session_drain.py tests/test_stage0_permit.py tests/test_device_handoff.py tests/test_contracts_catalog.py tests/test_contracts_rpc_schema.py tests/test_contracts_skill_section.py`（P1 T20 測試檔名以實際為準）；`python3 -m tools.contracts check`；Windows 原生 `scripts/stage0/win-pytest.sh -m windows_native tests/test_p1oc_drain_stalled.py`（擁有者 host，COM20／COM21）；全套。
+- [ ] **B2 執行並確認 PASS**：`python3 -m pytest -q tests/test_p1oc_drain_stalled.py tests/test_stage0_session_drain.py tests/test_stage0_tx_permit.py tests/test_device_handoff.py tests/test_contracts_catalog.py tests/test_contracts_rpc_schema.py tests/test_contracts_skill_section.py`；`python3 -m tools.contracts check`；Windows 原生 `scripts/stage0/win-pytest.sh -m windows_native tests/test_p1oc_drain_stalled.py`（擁有者 host，COM20／COM21）；全套。
 - [ ] **B3 commit**：`feat(session): release drain 逾時改回 DRAIN_STALLED（OD-14 #4）`
 
 **測試資產變更**（獨立審閱）
@@ -447,7 +477,13 @@
 |---|---|---|
 | `tests/test_stage0_session_drain.py` | `test_release_drain_timeout_shape` | release 與重複 release 的 `error_code` 改 `DRAIN_STALLED`；其中 `attach_device` 的 `SESSION_RECOVERING` 斷言不改 |
 | `tests/test_stage0_session_drain.py` | `test_failed_close_receipt_keeps_recovering`、`test_release_drain_deadline_includes_lock_wait` | release 回應碼改 `DRAIN_STALLED` |
-| P1 T20 測試檔 | `test_windows_guarded_write_stall_reports_drain_stalled_on_time` | release 回應碼改 `DRAIN_STALLED`，時限斷言不變 |
+| `tests/test_stage0_session_drain.py` | `test_reject_paths_have_zero_side_effects` | 第二次 release 回應碼改 `DRAIN_STALLED`，零 TX／持久化副作用斷言保留 |
+| `tests/test_stage0_uart_exclusive.py` | `TestAttachProbeDrain` release 斷言 | release 回應碼改 `DRAIN_STALLED`，`SESSION_RECOVERING` state 與不 close 斷言保留 |
+| `tests/test_stage0_captures.py`、`contracts/captures/stage0-python-bc.json` | `release_drain_timeout_shape` | 凍結回應碼由 `SESSION_RECOVERING` 改為 `DRAIN_STALLED` |
+| `tests/test_contracts_keep_baseline.py` | `test_last_error_logging_templates_match` | `CREDENTIALS_UNRESOLVED` 與 `TRANSPORT_STALL` 對應到 logger 呼叫目前行號，維持模板逐字比對 |
+| `tests/test_p1oc_drain_stalled.py` | CLI、Windows 原生測試及本 Task 新增測試 | CLI mock 改用現存 `_resolve_endpoint_info` API，未刪除回應斷言；Windows 案例以 COM20／COM21 RTS/CTS 實際阻塞 pyserial write，不以人工 Event 暫停替代 OS 寫入；新增 attach-op 共用期限與診斷、`session.attach` race、`drain_timing.py` 逾時分類測試 |
+| `tests/test_stage0_session_drain.py`、`tests/test_stage0_uart_exclusive.py`、`tests/test_p1oc_drain_stalled.py` | `clear_session` 與 attach/release guard | release stalled 時先檢查 pending drain，再判斷 RELEASED，避免 `session.clear`／`session.attach` 回 `ok:true, released:true`；拒絕回應仍帶 drain 欄位 |
+| `tests/test_stage0_tx_permit.py` | `test_windows_guarded_write_stall_reports_drain_stalled_on_time` | release 回應碼改 `DRAIN_STALLED`，原時限斷言不變 |
 
 ---
 
@@ -556,6 +592,7 @@
 | `tests/test_cowork_session_usability.py`、`tests/test_profile_reresolve_on_attach.py` | 斷言 uboot-template（passthrough＋ready_probe）attach 時送 probe 或經 probe 進 READY 者 | 改斷言零 TX、`ATTACHED`，READY 改由 `_promote_quiet_passthrough_locked` 驅動 |
 | `tests/test_login_fsm.py` | 以 passthrough 平台驅動 session 層登入者（純 `login_fsm` 函式測試不改） | 改為非 passthrough 平台或改斷言不呼叫 |
 | `contracts/error_codes.yaml` 的 `PROFILE_NOT_COMMAND_CAPABLE.contract_tests` | 指向上列 cowork 測試 | 改指非 passthrough 版本 |
+| `tests/test_stage0_uart_exclusive.py` | `TestAttachProbeDrain` 兩個 release 前的 state 斷言（passthrough＋空 `ready_probe`） | `READY`→`ATTACHED`（SC-35 零 TX，停 `ATTACHED`；release 測試的 drain 前置條件不變） |
 
 ---
 
@@ -606,14 +643,14 @@
 
 ## Task T7：文件、SKILL 受管區段、#155 回歸 case、docker／Windows 原生驗證收尾
 
-- **範圍**：(1) `README.md` 英文與繁中兩段：`session attach`／`recover` 失敗欄位（`last_error`、`last_error_detail`）、`device release` 的 `DRAIN_STALLED` 處置、passthrough 30 秒自動 READY 與完成條件建議（建議一律帶 `--completion-regex`）、socket 權限 0660＋`SERIALWRAP_SOCKET_GROUP`；(2) `docs/command-completion.md` 加「passthrough」小節（三層規則）；`CLAUDE.md`「Platform 行為差異」passthrough 一列改寫（`CLAUDE.md` 為 single source，三個 symlink 自動同步）；(3) 確認兩份 SKILL 受管區段為最新；(4) #155：新增 `regression/` case `pt-quiet-ready`（真板 U-Boot／MCU 線：attach 後 30 s 內零 TX、靜默後 READY、`cmd submit --completion-regex` 成功）並於 `docs/regression-plugin.md` 對照表登記；(5) OD-15 驗證：P2 Task 17 docker 環境已合併時以 `scripts/docker/run-l15.sh` 跑本 Phase 新測試與全套、以 `scripts/docker/run-systemd.sh` 驗 socket 群組權限，報告標 `L1.5-docker`（不計為 L2／L3）；擁有者 Windows host 以 COM20／COM21（OD-11 隔離實例＋allowlist `COM20`）跑 `windows_native` 子集；修正後 Python 基線的 docker 48h 長跑（P2 `run-longrun.sh`）於本 Phase 合併後啟動（OD-15 (6)：P1 完成、修正後基線就緒）。
+- **範圍**：(1) `README.md` 英文與繁中兩段：`session attach`／`recover` 失敗欄位（`last_error`、`last_error_detail`）、`device release` 的 `DRAIN_STALLED` 處置、passthrough 30 秒自動 READY 與完成條件建議（建議一律帶 `--completion-regex`）、socket 權限 0660＋`SERIALWRAP_SOCKET_GROUP`；(2) `docs/command-completion.md` 加「passthrough」小節（三層規則）；`CLAUDE.md`「Platform 行為差異」passthrough 一列改寫（`CLAUDE.md` 為 single source，三個 symlink 自動同步）；(3) 確認兩份 SKILL 受管區段為最新，並手動改寫未受管的「command_capable 與 READY 判定」敘述，明確說明 passthrough 即使帶 `ready_probe` 也不 probe、ATTACHED 靜默 30 秒後升 READY，以及 ATTACHED 時 `command.submit` 回 `SESSION_NOT_READY`＋`passthrough_ready_in_s`；(4) #155：新增 `regression/` case `pt-quiet-ready`（真板 U-Boot／MCU 線：attach 後 30 s 內零 TX、靜默後 READY、`cmd submit --completion-regex` 成功）並於 `docs/regression-plugin.md` 對照表登記；(5) OD-15 驗證：P2 Task 17 docker 環境已合併時以 `scripts/docker/run-l15.sh` 跑本 Phase 新測試與全套、以 `scripts/docker/run-systemd.sh` 驗 socket 群組權限，報告標 `L1.5-docker`（不計為 L2／L3）；擁有者 Windows host 以 COM20／COM21（OD-11 隔離實例＋allowlist `COM20`）跑 `windows_native` 子集；修正後 Python 基線的 docker 48h 長跑（P2 `run-longrun.sh`）於本 Phase 合併後啟動（OD-15 (6)：P1 完成、修正後基線就緒）。
 - **Test author model**：agy-gemini-3.8-flash-high　**Implementer model**：haiku-xhigh（文件與資料，介面已定）
 - **Changelog fragment**：`changelog.d/rust-p1oc-docs.md`（`type: change`，`scope: docs`）：同步 OD-14 對外文件（attach／recover 欄位、DRAIN_STALLED、passthrough 自動 READY、socket 0660）。
-- **BLOCKED-OWNER**：`pt-quiet-ready` 真板實跑（bench）；docker 驗證若 P2 docker 環境未合併則延後（見 Global Constraints）。
+- **BLOCKED-OWNER**：`pt-quiet-ready` 真板實跑（bench）；docker 驗證若 P2 docker 環境未合併則延後（見 Global Constraints）。收尾紀錄：`scripts/docker/` 於本 Phase 執行時尚不存在（P2 Task 17 未合併），docker 驗證記為「待補」gate；擁有者 host Windows 原生結果於 PR 描述記錄。
 
 **Files**
 - Create: `tests/test_p1oc_docs.py`、`regression/`（`pt-quiet-ready` case 檔，路徑依 `docs/regression-plugin.md` SOP）
-- Modify: `README.md`、`docs/command-completion.md`、`CLAUDE.md`、`docs/regression-plugin.md`、兩份 SKILL（只經 `skill-section` 產生）
+- Modify: `README.md`、`docs/serialwrap-spec.md`、`docs/command-completion.md`、`CLAUDE.md`、`docs/regression-plugin.md`、`regression/serialwrap_regression/cases/f10_login_creds.py`、兩份 SKILL（error_code／session_last_error 受管區段只經 `skill-section` 產生；「command_capable 與 READY 判定」未受管敘述另依本 Task 手動同步）
 
 **Steps**
 - [ ] **A1 寫失敗測試**：`tests/test_p1oc_docs.py`（`pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]`）
@@ -637,7 +674,7 @@
 
 1. T1～T7 全部 B3 commit 完成；`python3 -m pytest -q tests/` 零失敗；`python3 -m tools.contracts check` 與 `python3 -m policy_check --repo .` 通過。
 2. `behavior_changes.yaml`：SC-34、SC-35 為 `IMPLEMENTED`；無 SC-08；`pending_owner_confirmations: []`；SC-04、DF-02、SC-26、SC-27、SC-34、SC-35 為 `owner_confirmation: confirmed`。
-3. `error_codes.yaml`：含 `DRAIN_STALLED`（IMPLEMENTED）、無 `passthrough:`、`NOT_READY.reachable is False`；`rpc_schema.json` 無 `@last_error_passthrough`。
+3. `error_codes.yaml`：含 `DRAIN_STALLED`（IMPLEMENTED）、無 `passthrough` meta 項（頂層保留空 `passthrough: []`，見 T2 的 `error_codes.yaml` 條目）、`NOT_READY.reachable is False`；`rpc_schema.json` 無 `@last_error_passthrough`。
 4. 下游通知已寫入：P3 Task 8 需重新產生 `error_codes.rs`；P5～P8 的 A 側基線以本 Phase 合併後的 `sw_core` 為準。
 5. PR 描述記錄 #155 評估結論、OD-15 docker／Windows 原生驗證結果或「待補」gate。
 

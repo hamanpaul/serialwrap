@@ -357,7 +357,7 @@ codes:
     extra_fields: ["drain_stalled", "drain_timeout_epoch", "session"]
     contract_tests: ["tests/test_p1oc_drain_stalled.py::test_release_timeout_returns_drain_stalled", "tests/test_p1oc_drain_stalled.py::test_late_receipt_completes_release", "tests/test_p1oc_drain_stalled.py::test_close_failure_returns_drain_stalled"]
     behavior_change: ["SC-04"]
-    sources: ["sw_core/session_manager.py:2947", "sw_core/session_manager.py:2978"]
+    sources: ["sw_core/session_manager.py:3006", "sw_core/session_manager.py:3037"]
   - code: ECHO_ACK_UNSUPPORTED
     status: EXISTING
     reachable: true

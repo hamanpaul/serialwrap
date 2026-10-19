@@ -76,7 +76,7 @@ _RUST_STAGES: Final[tuple[str, ...]] = (
     "stage-1a", "stage-1b", "slice-2.1", "slice-2.2", "slice-2.3", "slice-2.4", "stage-3",
 )
 _PHASES: Final[tuple[str, ...]] = tuple(f"P{i}" for i in range(10))
-_OWNER_ITEM_RANGE: Final[range] = range(1, 8)
+_OWNER_ITEM_MIN: Final[int] = 1
 _SAFETY_SPEC_REF: Final[str] = "§11.3"
 _PASSTHROUGH_NAMESPACE_REF: Final[str] = "session_last_errors"
 
@@ -321,7 +321,7 @@ def _is_int(value: object) -> bool:
 
 
 def _in_owner_item(value: object) -> bool:
-    return _is_int(value) and value in _OWNER_ITEM_RANGE
+    return _is_int(value) and value >= _OWNER_ITEM_MIN
 
 
 def _label(entry: object, key: str, index: int) -> str:
@@ -793,12 +793,12 @@ def _check_changes(p: _Problems, changes: list[Any], file_rev: int | None) -> No
         if "owner_confirmation" in raw:
             _check_enum(p, f"{loc}.owner_confirmation", oc, _OWNER_CONFIRMATIONS)
         if "owner_item" in raw and oi is not None and not _in_owner_item(oi):
-            p.add(f"{loc}.owner_item", f"必須為 null 或 1..7 的整數，實際為 {oi!r}")
+            p.add(f"{loc}.owner_item", f"必須為 null 或 ≥1 的整數，實際為 {oi!r}")
         if "default_if_pending" in raw and dip is not None:
             _check_str(p, f"{loc}.default_if_pending", dip)
         if oc == "pending_default":
             if not _in_owner_item(oi):
-                p.add(f"{loc}.owner_item", "owner_confirmation 為 pending_default 時 owner_item 必須為 1..7")
+                p.add(f"{loc}.owner_item", "owner_confirmation 為 pending_default 時 owner_item 必須為 ≥1 的整數")
             if not (isinstance(dip, str) and dip.strip()):
                 p.add(f"{loc}.default_if_pending", "owner_confirmation 為 pending_default 時 default_if_pending 必須為非空字串")
         scope = raw.get("scope")
@@ -911,7 +911,7 @@ def _check_pending(p: _Problems, raw: object, change_ids: set[str]) -> None:
         if "item" in o:
             item = o["item"]
             if not _in_owner_item(item):
-                p.add(f"{loc}.item", f"必須為 1..7 的整數，實際為 {item!r}")
+                p.add(f"{loc}.item", f"必須為 ≥1 的整數，實際為 {item!r}")
             elif item in items_seen:
                 p.add(f"{loc}.item", f"item 重複: {item}")
             else:

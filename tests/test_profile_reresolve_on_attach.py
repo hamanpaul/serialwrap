@@ -11,6 +11,7 @@ CLI 出口（#181 問題 2/3）。本檔驗證 ``_reresolve_profile_on_reattach`
 import tempfile
 import threading
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -19,6 +20,7 @@ from sw_core.session_manager import DeviceInfo, SessionManager
 from sw_core.uart_io import DrainReceipt
 import sw_core.session_manager as sm_mod
 from sw_core.wal import WalWriter
+from tests.stage0_fakes import FakePort
 import pytest
 
 pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
@@ -299,6 +301,36 @@ class TestPinEscapeHatch(_Base):
             "/dev/serial/by-id/other")
 
 
+class TestPassthroughGateReset(_Base):
+    def test_pin_from_prpl_clears_old_boot_quiet_gate(self):
+        mgr = self._mgr()
+        session = self._fallback_session(mgr)
+        session.profile = replace(
+            session.profile,
+            profile_name=PRPL.profile_name,
+            platform=PRPL.platform,
+            prompt_regex=PRPL.prompt_regex,
+            ready_probe=PRPL.ready_probe,
+        )
+        session.state = "DETACHED"
+        session.arm_boot_quiet()
+        mgr._profile_pins[BY_ID] = OTHERS.profile_name
+        port = FakePort()
+        mgr._devices[BY_ID] = DeviceInfo(by_id=BY_ID, real_path="/dev/ttyUSB2")
+
+        with (
+            mock.patch.object(sm_mod.UARTBridge, "start", lambda _bridge: None),
+            mock.patch("sw_core.uart_io.open_serial_port", return_value=port),
+        ):
+            mgr._attach_by_id(BY_ID)
+
+        self.assertEqual(session.profile.platform, "passthrough")
+        self.assertEqual(session.state, "ATTACHED")
+        self.assertFalse(session.boot_quiet_active())
+        self.assertFalse(session.ready_reconfirm_pending)
+        self.assertEqual(port.writes, [])
+
+
 class TestFallbackIsProvisional(_Base):
     def test_fallback_session_redetects_on_reattach(self):
         """#181 問題 2：fallback 是未經量測的分類，重新 attach 時再給一次偵測機會。"""
@@ -480,6 +512,8 @@ class TestNotCommandCapableHint(_Base):
     def test_hint_names_the_usable_escape_hatch(self):
         mgr = self._mgr()
         session = self._fallback_session(mgr)
+        # passthrough 已有獨立的 SESSION_NOT_READY gate；此處保留一般 profile 的舊 hint 回歸。
+        session.profile = replace(session.profile, platform="prpl")
         session.bridge = mock.MagicMock()
         session.state = "ATTACHED"
 
