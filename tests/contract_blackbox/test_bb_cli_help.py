@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -65,10 +66,17 @@ def test_platform_oracle_exists_and_boundary_values_are_native():
 @pytest.mark.parametrize("case", list(_params()))
 def test_help_usage_error_bytes(env, case):
     c = json.loads(case.read_text(encoding="utf-8"))
-    if c.get("post_parse_effects"):
+    # 解析後會連線的案例：POSIX 下 SERIALWRAP_RUN_DIR=/golden/run 與 `--sock /x` 皆不存在，
+    # 連線必為 ENOENT，輸出可確定性比對（A/B 兩輪同 SKIP 會被比較器判證據不足）；
+    # Windows 預設 endpoint 為 TCP loopback，可能碰到實際 daemon，才維持 SKIP。
+    if c.get("post_parse_effects") and os.name == "nt":
         pytest.skip("解析後連線行為由其他黑箱案例覆蓋")
     r = run_cli(c["argv"], env=_env(env, c["columns"]))
     nl = NL.decode()
+    if c.get("post_parse_effects") and c["stderr"] == "":
+        # capture_cli_help.py 對 `--sock /x session list` 只錄 rc 與 stdout（plan Task 10），stderr 不比對。
+        assert (r.rc, r.stdout.decode()) == (c["rc"], c["stdout"].replace("\n", nl))
+        return
     assert (r.rc, r.stdout.decode(), r.stderr.decode()) == (
         c["rc"],
         c["stdout"].replace("\n", nl),

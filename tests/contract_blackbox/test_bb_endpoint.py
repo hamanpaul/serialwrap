@@ -1,7 +1,7 @@
 """P3-T12 黑箱：endpoint 解析（#108 dangling fallback、SC-09 config 探索）與 `--bench` state 讀取。
 
 期望值依 Python 基線（`sw_core/cli.py:658-835`、`1115-1188`）實測；Rust 輪以 `SERIALWRAP_CLI_EXE` 指向 Rust 產物時執行同一組斷言。
-SC-09（`SERIALWRAP_CONFIG`）相關案例在 P1 合併前 Python 基線為紅燈，依 plan §0.2 以 strict xfail 標示，P1 合併後移除標記。
+SC-09（`SERIALWRAP_CONFIG`）相關案例原以 strict xfail 標示 P1 前置（plan §0.2）；P1 SC-09 已併入（017fbf1），標記已移除。
 stdlib-only；不得 import sw_core／serialwrap／serialwrapd。
 """
 from __future__ import annotations
@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from bb_harness import NL, is_rust, run_cli
+from bb_harness import NL, run_cli
 
 pytestmark = [pytest.mark.process_rpc]
 
@@ -20,15 +20,6 @@ _CORRUPT_MSG = 'bench "lab" 的 endpoint 記憶損壞；請重新執行 serialwr
 _NOT_REMEMBERED_MSG = 'bench "lab" 尚未記住 endpoint；請先執行 serialwrap connect lab'
 _SESSION_LIST_REPLY = {"ok": True, "sessions": []}
 _SESSION_LIST_SCRIPT = {"methods": {"session.list": [{"reply": _SESSION_LIST_REPLY}]}}
-# 僅對 Python 基線標 xfail；Rust 輪（SERIALWRAP_AB_LABEL=rust-*）照常斷言，避免 strict XPASS 誤紅。
-_SC09_XFAIL = pytest.mark.xfail(
-    condition=not is_rust(),
-    strict=True,
-    raises=AssertionError,
-    reason="P1 SC-09 前置未合併：Python 基線尚未讀取 SERIALWRAP_CONFIG（plan §0.2，P1 合併後移除）",
-)
-
-
 def _line(obj: dict) -> bytes:
     """CLI JSON 輸出：`sort_keys`、緊湊分隔、`ensure_ascii=False`（Q-01）。"""
     return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8") + NL
@@ -194,11 +185,10 @@ def test_dangling_config_socket_falls_back_to_canonical(env, stubd, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# SC-09：SERIALWRAP_CONFIG（P1 前置，目前 Python 基線為紅燈）
+# SC-09：SERIALWRAP_CONFIG（P1 前置已併入）
 # ---------------------------------------------------------------------------
 
 
-@_SC09_XFAIL
 @pytest.mark.core_portable
 def test_serialwrap_config_env_selects_config_file(env, stubd, tmp_path):
     s = stubd(_SESSION_LIST_SCRIPT, transport="tcp")
@@ -212,7 +202,6 @@ def test_serialwrap_config_env_selects_config_file(env, stubd, tmp_path):
     assert r.stderr == b""
 
 
-@_SC09_XFAIL
 @pytest.mark.posix_only
 def test_missing_serialwrap_config_does_not_read_user_config(env, stubd, tmp_path):
     # 指定但不存在的 SERIALWRAP_CONFIG 為空設定，不得回退讀取使用者 config.yaml（SC-09）。

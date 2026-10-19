@@ -163,6 +163,12 @@ def live_daemon(tmp_path: Path, env: dict[str, str]) -> Iterator[LiveDaemon]:
     daemon: PyDaemon | None = None
     try:
         target.start(Path(env["SERIALWRAP_BY_ID_DIR"]))
+        # P1 BC-04 的外部 holder 偵測（sw_core/serial_port.py probe_holders）會把仍持有 slave fd 的
+        # pytest 行程視為外部 holder（ATTACH_FAILED:DeviceHeldError）；比照 test_bb_daemon_e2e.py
+        # 的 DaemonAttachableTarget，連結建立後立即關閉 slave。passthrough 只需停在 ATTACHED。
+        if target.slave_fd is not None:
+            os.close(target.slave_fd)
+            target.slave_fd = None
         profile_dir = tmp_path / "live-profiles"
         profile_dir.mkdir(parents=True, exist_ok=True)
         (profile_dir / "live.yaml").write_text(LIVE_PROFILE_YAML, encoding="utf-8")
