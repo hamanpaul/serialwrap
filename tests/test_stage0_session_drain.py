@@ -146,10 +146,10 @@ def test_release_drain_timeout_shape(tmp_path, short_drain):
     time.sleep(0.05)
     r = mgr.release_device("COM0")
     assert {k: r[k] for k in ("ok", "error_code", "drain_stalled", "drain_timeout_epoch")} == {
-        "ok": False, "error_code": "SESSION_RECOVERING", "drain_stalled": True, "drain_timeout_epoch": 4}
+        "ok": False, "error_code": "DRAIN_STALLED", "drain_stalled": True, "drain_timeout_epoch": 4}
     assert r["session"]["state"] == "RECOVERING" and r["session"]["drain_stalled"] is True
     r2 = mgr.release_device("COM0")
-    assert r2["error_code"] == "SESSION_RECOVERING"
+    assert r2["error_code"] == "DRAIN_STALLED"
     a = mgr.attach_device("COM0")
     assert a["ok"] is False and a["error_code"] == "SESSION_RECOVERING"
     recovery = mgr.recover_session("COM0")
@@ -329,7 +329,7 @@ def test_failed_close_receipt_keeps_recovering(tmp_path):
     port = ErrorClosePort()
     mgr, s, b = _ready_with_port(tmp_path, port)
     r = mgr.release_device("COM0")
-    assert r["ok"] is False and r["error_code"] == "SESSION_RECOVERING"
+    assert r["ok"] is False and r["error_code"] == "DRAIN_STALLED"
     assert mgr.get_session("COM0").state == "RECOVERING"
     assert getattr(mgr.get_session("COM0"), "drain_stalled", False) is True
     assert getattr(mgr.get_session("COM0"), "_pending_drain", None) is not None
@@ -355,7 +355,7 @@ def test_release_drain_deadline_includes_lock_wait(tmp_path, short_drain):
     t0 = time.monotonic()
     r = mgr.release_device("COM0")
     elapsed = time.monotonic() - t0
-    assert r["error_code"] == "SESSION_RECOVERING"
+    assert r["error_code"] == "DRAIN_STALLED"
     assert r["drain_stalled"] is True
     assert r["drain_timeout_epoch"] == 4
     assert elapsed < 0.4, f"elapsed {elapsed}s >= 0.4s (舊實作 finish 才起算)"

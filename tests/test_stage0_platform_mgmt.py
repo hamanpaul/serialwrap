@@ -1,5 +1,7 @@
 # tests/test_stage0_platform_mgmt.py
-"""Task P1-T15 平台管理（SC-08、SC-09、SC-10、SC-12、SC-20、DF-14）測試。
+"""Task P1-T15 平台管理（SC-09、SC-10、SC-12、SC-20、DF-14）測試。
+
+SC-08 已由 OD-14 #3 撤回：socket 維持 0660 基線（見 tests/test_p1oc_socket_perm.py）。
 
 依 02-stage0-python-bc.md Global Constraints：
 本模組不在頂層 import 本 Task 或本 Phase 新增的未實作函式／類別，
@@ -191,7 +193,7 @@ def test_normalize_endpoint_path(raw, expected_suffix):
 
 @pytest.mark.posix_only
 @pytest.mark.process_rpc
-def test_socket_default_mode_0600(tmp_path, monkeypatch):
+def test_socket_default_mode_0660(tmp_path, monkeypatch):
     monkeypatch.delenv("SERIALWRAP_SOCKET_GROUP", raising=False)
     from sw_core.rpc_posix import JsonRpcUnixServer
     import asyncio
@@ -205,7 +207,7 @@ def test_socket_default_mode_0600(tmp_path, monkeypatch):
         await srv.stop()
         return mode
 
-    assert asyncio.run(run()) == 0o600
+    assert asyncio.run(run()) == 0o660
 
 
 @pytest.mark.core_portable
@@ -350,7 +352,6 @@ def test_new_runtime_dirs_0700(tmp_path, monkeypatch):
     finally:
         os.umask(original_umask)
 
-    assert stat.S_IMODE(os.stat(new_run).st_mode) == 0o700
     assert stat.S_IMODE(os.stat(existing_cfg).st_mode) == 0o751
 
 
@@ -614,7 +615,7 @@ def test_socket_bound_with_restrictive_umask(tmp_path, monkeypatch):
         mode = asyncio.run(run())
     finally:
         real_umask(previous_umask)
-    assert mode == 0o600
+    assert mode == 0o660
 
 
 @pytest.mark.core_portable

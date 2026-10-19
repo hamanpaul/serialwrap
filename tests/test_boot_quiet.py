@@ -791,7 +791,8 @@ class TestAttachAndRecoverProbeQuietGate(_ManagerMixin):
 
         self.assertEqual(bridge.sent, [], "quiet window 內 attach_session 不得送 probe")
         self.assertFalse(result.get("ok"))
-        self.assertEqual(result.get("error_code"), "PROMPT_UNAVAILABLE")
+        self.assertEqual(result.get("error_code"), "SESSION_NOT_READY")
+        self.assertEqual(result.get("last_error"), "PROMPT_UNAVAILABLE")
         self.assertEqual(result["session"]["state"], "ATTACHED")
 
     def test_recover_session_attached_branch_gated_during_quiet(self) -> None:
@@ -804,7 +805,8 @@ class TestAttachAndRecoverProbeQuietGate(_ManagerMixin):
 
         self.assertEqual(bridge.sent, [], "quiet window 內 recover_session 不得送 probe")
         self.assertFalse(result.get("recovered", False))
-        self.assertEqual(result.get("error_code"), "PROMPT_UNAVAILABLE")
+        self.assertEqual(result.get("error_code"), "SESSION_NOT_READY")
+        self.assertEqual(result.get("last_error"), "PROMPT_UNAVAILABLE")
 
     def test_gate_is_not_vacuous(self) -> None:
         mgr, session, bridge = self._make_attached_with_quiet()

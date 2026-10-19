@@ -75,14 +75,16 @@ class TestCommandCapableGate(unittest.TestCase):
         )
 
     def test_empty_ready_probe_not_command_capable_cmd_submit(self) -> None:
-        """空 ready_probe 的 passthrough session 在 ATTACHED 下，
-        cmd submit 應回 PROFILE_NOT_COMMAND_CAPABLE。"""
+        """空 ready_probe 的 passthrough session 在 ATTACHED 下（SC-35），
+        cmd submit 應回 SESSION_NOT_READY 並附 passthrough_ready_in_s
+        （passthrough 於 30 秒無 RX 後自動 READY，不再是 PROFILE_NOT_COMMAND_CAPABLE）。"""
         profiles = [_make_profile(platform="passthrough", ready_probe="")]
         mgr = self._make_manager(profiles)
         session = mgr.get_session("COM0")
         assert session is not None
         session.bridge = mock.MagicMock()
         session.state = "ATTACHED"
+        session.passthrough_quiet_since = time.monotonic()
 
         # 公開狀態應標示為非 command-capable
         public = session.to_public_dict()
@@ -100,7 +102,34 @@ class TestCommandCapableGate(unittest.TestCase):
 
         resp = svc.rpc("command.submit", {"selector": "COM0", "cmd": "ls"})
         self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error_code"], "SESSION_NOT_READY")
+        self.assertIn("passthrough_ready_in_s", resp)
+        self.assertGreater(resp["passthrough_ready_in_s"], 0.0)
+        self.assertLessEqual(resp["passthrough_ready_in_s"], 30.0)
+
+    def test_non_passthrough_empty_ready_probe_cmd_submit_still_not_capable(self) -> None:
+        """非 passthrough 平台且空 ready_probe 的 ATTACHED session（SC-35 回歸防護）：
+        cmd submit 仍應回 PROFILE_NOT_COMMAND_CAPABLE，且不附 passthrough_ready_in_s。"""
+        profiles = [_make_profile(platform="prpl", ready_probe="")]
+        mgr = self._make_manager(profiles)
+        session = mgr.get_session("COM0")
+        assert session is not None
+        session.bridge = mock.MagicMock()
+        session.state = "ATTACHED"
+
+        from sw_core.service import SerialwrapService
+
+        with (
+            mock.patch("sw_core.service.WalWriter"),
+            mock.patch("sw_core.service.DeviceWatcher"),
+        ):
+            svc = SerialwrapService([])
+        svc._sessions = mgr  # type: ignore[attr-defined]
+
+        resp = svc.rpc("command.submit", {"selector": "COM0", "cmd": "ls"})
+        self.assertFalse(resp["ok"])
         self.assertEqual(resp["error_code"], "PROFILE_NOT_COMMAND_CAPABLE")
+        self.assertNotIn("passthrough_ready_in_s", resp)
 
     def test_command_capable_when_ready_probe_set(self) -> None:
         """profile 有 ready_probe 時 command_capable 為真，

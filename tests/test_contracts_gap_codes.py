@@ -341,7 +341,9 @@ class TestGapMemory:
         s.state = "ATTACHED"
         s.last_error = None
 
-        assert mgr._attach_state_result(s, s.to_public_dict())["error_code"] == "NOT_READY"
+        res = mgr._attach_state_result(s, s.to_public_dict())
+        assert res["error_code"] == "SESSION_NOT_READY"
+        assert res["last_error"] is None
 
     def test_force_recover_timeout(self, tmp_path: Path) -> None:
         mgr = _mgr(tmp_path, [_profile()])

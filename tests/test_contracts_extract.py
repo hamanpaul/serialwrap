@@ -654,7 +654,7 @@ TRICKY_ERROR_CODES = {
     "AUTOBOOT_QUIET", "READY_UNCONFIRMED", "CMD_TOO_LONG", "CMD_CONTAINS_NEWLINE",
     "INVALID_COMPLETION_REGEX", "FLUSHED_BY_RECOVERY", "FLUSHED_BY_SHUTDOWN", "SEND_FAILED",
     "COMMAND_FAILED", "TARGET_DECODER_MISSING", "TARGET_ENCODER_MISSING", "TRANSFER_PROBE_FAILED",
-    "NOT_READY", "INVALID_TARGET", "BENCH_ENDPOINT_NOT_REMEMBERED", "TUNNEL_STATUS_ERROR",
+    "INVALID_TARGET", "BENCH_ENDPOINT_NOT_REMEMBERED", "TUNNEL_STATUS_ERROR",
     "DAEMON_ALREADY_RUNNING", "SOCKET_UNAVAILABLE", "NEEDS_SUDO", "NO_SYSTEMD",
 }
 TRICKY_LAST_ERRORS = {
@@ -672,7 +672,9 @@ def _real():
 
 
 def test_real_repo_tricky_error_codes_found():
-    assert TRICKY_ERROR_CODES <= _real().values("error_code")
+    real_codes = _real().values("error_code")
+    assert TRICKY_ERROR_CODES <= real_codes
+    assert "NOT_READY" not in real_codes
 
 
 def test_real_repo_tricky_last_errors_found():
@@ -684,7 +686,7 @@ def test_real_repo_non_codes_excluded():
 
 
 def test_real_repo_passthrough_detected():
-    assert "last_error_passthrough" in _real().values("error_code", include_passthrough=True)
+    assert "last_error_passthrough" not in _real().values("error_code", include_passthrough=True)
 
 
 def test_real_repo_proc_codes_marked():

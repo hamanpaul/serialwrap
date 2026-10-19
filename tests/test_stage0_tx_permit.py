@@ -550,7 +550,7 @@ def test_windows_guarded_write_stall_reports_drain_stalled_on_time(tmp_path: Pat
     el = time.monotonic() - t0
     assert {k: r[k] for k in ("ok", "error_code", "drain_stalled", "drain_timeout_epoch")} == {
         "ok": False,
-        "error_code": "SESSION_RECOVERING",
+        "error_code": "DRAIN_STALLED",
         "drain_stalled": True,
         "drain_timeout_epoch": 4,
     }

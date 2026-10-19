@@ -943,13 +943,10 @@ def test_ec_credentials_unresolved_not_an_error_code() -> None:
     assert "CREDENTIALS_UNRESOLVED" not in _ec_by_code()
 
 
-def test_ec_passthrough_single_meta_entry() -> None:
-    """passthrough 必須恰有一筆 last_error_passthrough meta entry。"""
+def test_ec_no_passthrough_meta_entry() -> None:
+    """passthrough 必須為空（SC-34 OD-14 #1 移除 last_error_passthrough meta entry）。"""
     codes, passthrough = _ec()
-    assert [p.id for p in passthrough] == ["last_error_passthrough"]
-    pt = passthrough[0]
-    assert pt.namespace_ref == "session_last_errors"
-    assert pt.owner_confirmation in {"pending_default", "confirmed"}
+    assert passthrough == ()
 
 
 def test_ec_bc03_status_tracks_change() -> None:
@@ -1371,11 +1368,11 @@ def test_bc_real_bc_case_ids_frozen() -> None:
 
 
 def test_bc_real_sc_df_ranges() -> None:
-    """SC-01~SC-27 與 DF-01~DF-17、DF-19 編號範圍凍結，DF-19 屬性完備。"""
+    """SC 範圍為 SC-01～SC-27 撤回 SC-08 並新增 SC-34、SC-35（OD-14）；DF-01～DF-17、DF-19 編號範圍凍結，DF-19 屬性完備。"""
     changes, _, _ = _bc()
     by_id = {c.id: c for c in changes}
     sc_ids = {c.id for c in changes if c.kind == "SC"}
-    assert sc_ids == {f"SC-{i:02d}" for i in range(1, 28)}
+    assert sc_ids == ({f"SC-{i:02d}" for i in range(1, 28)} - {"SC-08"}) | {"SC-34", "SC-35"}
     df_ids = {c.id for c in changes if c.kind == "DF"}
     assert df_ids == {f"DF-{i:02d}" for i in range(1, 18)} | {"DF-19"}
 
@@ -1451,11 +1448,11 @@ def test_bc_real_safety_invariants() -> None:
 
 
 def test_bc_real_pending_items() -> None:
-    """待擁有者確認項目與其對應之 owner_item 及編號清單驗證。"""
+    """OD-14 全數裁決後不再有待確認項目（pending 清空）；確認項 #1～#7 的對照改由 test_p1oc_catalog.py 驗證。"""
     changes, confirmations, _ = _bc()
     pending = {c.id: c.owner_item for c in changes if c.owner_confirmation == "pending_default"}
-    assert pending == {"SC-08": 3, "SC-04": 4, "DF-02": 5, "SC-26": 6, "SC-27": 7}
-    assert [o.item for o in confirmations] == [1, 2, 3, 4, 5, 6, 7]
+    assert pending == {}
+    assert [o.item for o in confirmations] == []
 
 
 def test_bc_real_case_ids_globally_unique() -> None:
