@@ -143,3 +143,30 @@ def test_remote_state_dir_resolution_order(tmp_path):
         tmp_path / "serialwrap" / "remote"
     got = drivers.remote_state_dir({})
     assert str(got).endswith(".local/state/serialwrap/run/remote")
+
+
+def test_submit_and_wait_forwards_source(monkeypatch):
+    """P2-T14：SwCli.submit_and_wait(..., source=) 以 --source 帶入提交來源（lr-mixed 每 worker 一個 source）。
+
+    未指定 source 時 argv 不得出現 --source（維持既有行為）。
+    """
+    import subprocess
+
+    argvs: list[list[str]] = []
+
+    def fake_run(argv, timeout=30.0):
+        argvs.append(list(argv))
+        out = '{"cmd_id":"c1"}' if "submit" in argv else '{"command":{"status":"done"}}'
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(drivers, "_run", fake_run)
+
+    drivers.SwCli().submit_and_wait("COM0", "echo x", settle_s=0, poll_s=0, source="agent:rhw2")
+    submit = next(a for a in argvs if "submit" in a)
+    assert "--source" in submit
+    assert submit[submit.index("--source") + 1] == "agent:rhw2"
+
+    argvs.clear()
+    drivers.SwCli().submit_and_wait("COM0", "echo x", settle_s=0, poll_s=0)
+    submit = next(a for a in argvs if "submit" in a)
+    assert "--source" not in submit
