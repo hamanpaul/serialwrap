@@ -114,7 +114,7 @@ profile 行長預算後，F7 需使用對應版本重新執行；受影響板須
 
 | case | 狀態 | 原因 |
 |---|---|---|
-| `f4-background-result-tail-consistent` | **FAIL（刻意保留的紅燈哨兵）** | #159：background quiet-window 對快速完成命令整段吞輸出且回 `lost: False`——case 正確抓到產品缺陷，**勿改 oracle 遷就**；#159 修復即轉綠 |
+| `f4-background-result-tail-consistent` | **預期 PASS**（#159 已修，常駐回歸防線；若重現紅燈須經擁有者核准後依 §11.4 登記 XFAIL 哨兵，含 issue、失敗特徵、期限） | #159：background quiet-window 對快速完成命令整段吞輸出且回 `lost: False`；case 曾正確抓到此產品缺陷，**勿改 oracle 遷就**。修復後 case 轉綠並常駐。Stage 0 bench 實跑結果屬 BLOCKED-OWNER（TST-D-6） |
 | `f7-binary-roundtrip-md5`／`f7-larger-file-not-truncated` | 逐板嘗試；兩板皆 SKIP `target_tool_missing`（誠實判定） | **#166 根因翻案**：傳輸層無罪（手工 base64 往返 md5 完全一致），**兩塊 bench 板都沒有 `base64`**（PATH 與 busybox applet 皆無；`md5sum`／`openssl` 有）——協定硬依賴 `base64` 才是根因。先前 COM0「工具齊全」是探測 sentinel 誤判（命令本文含 `TOOLS_OK`、回顯即恆真，已改用 `TOOLS_$((6*7))`）。另附帶：prpl console 有 **505 字元單行上限**（超過即靜默截斷、status 仍 done），是 chunk 512 撞 `TRANSFER_ECHO_STALL` 的原因 |
 
 #156（recover CTRL_C 路徑不 flush 佇列）已修——根因＝`SessionManager` 無管道通知

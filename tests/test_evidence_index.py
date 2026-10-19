@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -50,6 +51,7 @@ def test_evidence_index_schema_and_check(tmp_path: pathlib.Path):
         cwd=REPO,
         capture_output=True,
         text=True,
+        encoding="utf-8",
     )
     assert proc_curr.returncode == 5, (
         f"check_evidence_index.py --stage 0 must exit 5 (BLOCKED) with blocked_owner items, "
@@ -85,6 +87,7 @@ def test_evidence_index_schema_and_check(tmp_path: pathlib.Path):
         cwd=REPO,
         capture_output=True,
         text=True,
+        encoding="utf-8",
     )
     assert proc_all_present.returncode == 0, (
         f"All present with matching sha256 must exit 0, got {proc_all_present.returncode}:\n"
@@ -100,8 +103,120 @@ def test_evidence_index_schema_and_check(tmp_path: pathlib.Path):
         cwd=REPO,
         capture_output=True,
         text=True,
+        encoding="utf-8",
     )
     assert proc_bad_sha.returncode == 1, (
         f"sha256 mismatch must exit 1, got {proc_bad_sha.returncode}:\n"
         f"{proc_bad_sha.stderr}\n{proc_bad_sha.stdout}"
     )
+
+
+INDEX_PATH = REPO / "tests/acceptance/stage0_evidence_index.yaml"
+
+
+def _load_index() -> dict:
+    return yaml.safe_load(INDEX_PATH.read_text(encoding="utf-8"))
+
+
+def _checker_root(tmp_path: pathlib.Path, index_data: dict) -> pathlib.Path:
+    """建立僅含索引與 cases.yaml 副本的暫存根目錄（checker 的 --root 語意＝含 tests/acceptance 的目錄）。"""
+    root = tmp_path / "root"
+    acc = root / "tests" / "acceptance"
+    acc.mkdir(parents=True)
+    (acc / "cases.yaml").write_text((REPO / "tests/acceptance/cases.yaml").read_text(encoding="utf-8"), encoding="utf-8")
+    (acc / "stage0_evidence_index.yaml").write_text(
+        yaml.safe_dump(index_data, allow_unicode=True, sort_keys=False), encoding="utf-8"
+    )
+    return root
+
+
+def _run_checker(root: pathlib.Path, env_extra: dict | None = None) -> subprocess.CompletedProcess:
+    env = dict(os.environ)
+    env.update(env_extra or {})
+    return subprocess.run(
+        [sys.executable, str(REPO / "tests/acceptance/check_evidence_index.py"), "--stage", "0", "--root", str(root)],
+        cwd=REPO, capture_output=True, text=True, encoding="utf-8", env=env,
+    )
+
+
+@pytest.mark.process_rpc
+def test_evidence_index_rejects_uncovered_platform_row(tmp_path: pathlib.Path):
+    """Windows 適用案例缺少某一檔的 windows 列 → FAIL（不得以 Linux 單份報告冒充雙平台證據）。"""
+    data = _load_index()
+    victim = next(
+        i for i in data["items"]
+        if i.get("platform") == "windows" and i.get("case_ids") == ["co-01-line-buffering"] and i.get("evidence") == "manifest.json"
+    )
+    data["items"].remove(victim)
+    proc = _run_checker(_checker_root(tmp_path, data))
+    assert proc.returncode == 1, f"expected FAIL, got {proc.returncode}:\n{proc.stderr}"
+    assert "uncovered_evidence co-01-line-buffering windows manifest.json" in proc.stderr
+
+
+@pytest.mark.process_rpc
+def test_evidence_index_rejects_missing_required_item(tmp_path: pathlib.Path):
+    """§4 必要項目（此處為 B13）從索引刪除 → FAIL，不得以刪列縮小出口清單。"""
+    data = _load_index()
+    data["items"] = [i for i in data["items"] if i["id"] != "S0-B13-WIN-COM-CI-RUNNER"]
+    proc = _run_checker(_checker_root(tmp_path, data))
+    assert proc.returncode == 1, f"expected FAIL, got {proc.returncode}:\n{proc.stderr}"
+    assert "missing_required_item S0-B13-WIN-COM-CI-RUNNER" in proc.stderr
+
+
+@pytest.mark.process_rpc
+def test_evidence_index_rejects_evidence_outside_case(tmp_path: pathlib.Path):
+    """單案例列的 evidence 不屬該案例清單，或 artifact_path 檔名不對應 → FAIL。"""
+    data = _load_index()
+    row = next(i for i in data["items"] if i["id"] == "S0-f1-limits-queryable-linux-report-json")
+    row["evidence"] = "stdout.log"
+    proc = _run_checker(_checker_root(tmp_path, data))
+    assert proc.returncode == 1
+    assert "evidence_not_in_case S0-f1-limits-queryable-linux-report-json" in proc.stderr
+
+    data = _load_index()
+    row = next(i for i in data["items"] if i["id"] == "S0-f1-limits-queryable-linux-report-json")
+    row["artifact_path"] = "evidence/stage0/f1-limits-queryable/linux/report.md"
+    proc = _run_checker(_checker_root(tmp_path / "b", data))
+    assert proc.returncode == 1
+    assert "artifact_name_mismatch S0-f1-limits-queryable-linux-report-json" in proc.stderr
+
+
+@pytest.mark.process_rpc
+def test_evidence_index_checker_survives_legacy_stdout_encoding():
+    """Windows 非 UTF-8 locale 下 checker 仍輸出完整訊息並回 BLOCKED（5），不擲 UnicodeEncodeError。"""
+    proc = _run_checker(REPO, env_extra={"PYTHONIOENCODING": "cp1252"})
+    assert proc.returncode == 5, f"expected BLOCKED (5), got {proc.returncode}:\n{proc.stderr}"
+    assert "UnicodeEncodeError" not in proc.stderr
+
+
+@pytest.mark.process_rpc
+@pytest.mark.parametrize("missing_evidence", ["wire.ndjson", "comparison.json", "wal/"])
+def test_evidence_index_rejects_missing_func_test_attachment(tmp_path: pathlib.Path, missing_evidence: str):
+    """func-test 案例的必要附件（wire、comparison、WAL 目錄）任一缺列 → FAIL，不得以 manifest 單檔代表全部證據。"""
+    data = _load_index()
+    victim = next(
+        i for i in data["items"]
+        if i.get("platform") == "linux" and i.get("case_ids") == ["brcm-01-login-flow"] and i.get("evidence") == missing_evidence
+    )
+    data["items"].remove(victim)
+    proc = _run_checker(_checker_root(tmp_path, data))
+    assert proc.returncode == 1, f"expected FAIL, got {proc.returncode}:\n{proc.stderr}"
+    assert f"uncovered_evidence brcm-01-login-flow linux {missing_evidence}" in proc.stderr
+
+
+@pytest.mark.process_rpc
+def test_evidence_index_explicit_index_and_cases_paths(tmp_path: pathlib.Path):
+    """--index／--cases 可獨立於 --root 指定：索引與 artifact 根目錄分離；指定路徑不存在時回 2。"""
+    cases_path = REPO / "tests/acceptance/cases.yaml"
+    proc = subprocess.run(
+        [sys.executable, str(REPO / "tests/acceptance/check_evidence_index.py"), "--stage", "0",
+         "--root", str(tmp_path / "evidence-only"), "--index", str(INDEX_PATH), "--cases", str(cases_path)],
+        cwd=REPO, capture_output=True, text=True, encoding="utf-8",
+    )
+    assert proc.returncode == 5, f"expected BLOCKED (5), got {proc.returncode}:\n{proc.stderr}"
+    proc = subprocess.run(
+        [sys.executable, str(REPO / "tests/acceptance/check_evidence_index.py"), "--stage", "0",
+         "--root", str(tmp_path / "evidence-only"), "--index", str(tmp_path / "absent.yaml"), "--cases", str(cases_path)],
+        cwd=REPO, capture_output=True, text=True, encoding="utf-8",
+    )
+    assert proc.returncode == 2, f"expected usage error (2), got {proc.returncode}:\n{proc.stderr}"

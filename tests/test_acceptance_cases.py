@@ -140,9 +140,18 @@ def test_case_ids_unique():
 
 @pytest.mark.memory_only
 def test_regression_cases_have_issues():
+    # 規則修正（P2-T12 實作者）：P1 T21 新增的 pending_issue 案例（擁有者尚未開立 issue 號）
+    # 依 docs/regression-plugin.md 與 registry 規則允許 issues 為空，但不得以假號補位；
+    # 與 issues 互斥。其餘 regression 案例仍須有 issue。
     cases = _load_cases().get("cases", [])
-    bad = [c["case_id"] for c in cases if c.get("suite") == "regression" and not c.get("issues")]
+    bad = [
+        c["case_id"]
+        for c in cases
+        if c.get("suite") == "regression" and not c.get("issues") and not c.get("pending_issue")
+    ]
     assert bad == [], f"regression cases missing issues: {bad}"
+    both = [c["case_id"] for c in cases if c.get("pending_issue") and c.get("issues")]
+    assert both == [], f"pending_issue 與 issues 互斥，不得同時存在: {both}"
 
 
 @pytest.mark.memory_only
@@ -239,7 +248,8 @@ def test_windows_com_not_satisfied_by_memory():
     cases = _load_cases().get("cases", [])
     bad = []
     for c in cases:
-        caps = c.get("capabilities") or []
+        # P2-T12 審查修正：platform_capabilities.windows 亦為 Windows 能力宣告來源，守衛須一併檢查
+        caps = list(c.get("capabilities") or []) + list((c.get("platform_capabilities") or {}).get("windows") or [])
         if "windows_com" in caps:
             layer = c.get("layer")
             platforms = c.get("platforms") or []
@@ -251,10 +261,65 @@ def test_windows_com_not_satisfied_by_memory():
 
 
 @pytest.mark.memory_only
+def test_pending_issue_matches_registry():
+    """pending_issue 不得自標繞過 #155：yaml 與 regression registry 的待補清單與 issues 逐筆一致（P2-T12 審查修正）。"""
+    sys.path.insert(0, str(REPO / "regression"))
+    try:
+        from serialwrap_regression import harness as rh
+    finally:
+        sys.path.pop(0)
+    reg = {c.id: c for c in rh.load_registry()}
+    cases = [c for c in _load_cases().get("cases", []) if c.get("suite") == "regression"]
+    yaml_pending = {c["case_id"] for c in cases if c.get("pending_issue")}
+    reg_pending = {cid for cid, c in reg.items() if c.pending_issue}
+    assert yaml_pending == reg_pending, f"pending_issue 不一致：yaml={sorted(yaml_pending)} registry={sorted(reg_pending)}"
+    mismatched = [
+        c["case_id"]
+        for c in cases
+        if sorted(c.get("issues") or []) != sorted(reg[c["case_id"]].issues)
+    ]
+    assert mismatched == [], f"regression issues 與 registry 不一致: {mismatched}"
+
+
+@pytest.mark.process_rpc
+def test_regen_lock_refuses_denominator_attr_change(tmp_path: pathlib.Path):
+    """既有案例的分母屬性（platforms／layer／expected 等）被改動時，--add-only 與 --check 皆拒絕（P2-T12 審查修正）。"""
+    regen_script = REPO / "tests/acceptance/regen_lock.py"
+    cases_data = _load_cases()
+    target = next(c for c in cases_data["cases"] if c["case_id"] == "f1-too-long-rejected")
+    target["platforms"] = ["linux"]  # 無聲縮小分母：Windows 覆蓋消失，但集合 ID 不變
+    tmp_cases = tmp_path / "cases.yaml"
+    tmp_cases.write_text(yaml.safe_dump(cases_data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    tmp_lock = tmp_path / "cases.lock.json"
+    orig_lock = (REPO / "tests/acceptance/cases.lock.json").read_text(encoding="utf-8")
+    tmp_lock.write_text(orig_lock, encoding="utf-8")
+    (tmp_path / "cases.counts.json").write_text(
+        (REPO / "tests/acceptance/cases.counts.json").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+
+    add = subprocess.run(
+        [sys.executable, str(regen_script), "--add-only", "--cases", str(tmp_cases), "--lock", str(tmp_lock)],
+        cwd=REPO, capture_output=True, text=True, encoding="utf-8",
+    )
+    assert add.returncode == 1, f"expected refusal, got {add.returncode}:\n{add.stderr}"
+    assert "分母屬性變更" in add.stderr
+    assert tmp_lock.read_text(encoding="utf-8") == orig_lock, "Lock file must remain unchanged on refusal"
+
+    chk = subprocess.run(
+        [sys.executable, str(regen_script), "--check", "--cases", str(tmp_cases), "--lock", str(tmp_lock)],
+        cwd=REPO, capture_output=True, text=True, encoding="utf-8",
+    )
+    assert chk.returncode == 1
+    assert "案例屬性與 cases.yaml 不一致：f1-too-long-rejected" in chk.stderr
+
+
+@pytest.mark.memory_only
 def test_behavior_changes_exist():
     bc_path = REPO / "contracts/behavior_changes.yaml"
     bc_data = yaml.safe_load(bc_path.read_text(encoding="utf-8"))
-    valid_ids = {bc["id"] for bc in bc_data.get("behavior_changes", [])}
+    # 修正（P2-T12 實作者）：P0 契約檔（contracts/behavior_changes.yaml）頂層鍵為 `changes`，
+    # 與 tests/test_contracts_cli_schema.py、test_contracts_rpc_schema.py 一致；原本讀 `behavior_changes` 恆為空集合。
+    valid_ids = {bc["id"] for bc in bc_data.get("changes", [])}
     cases = _load_cases().get("cases", [])
     bad = []
     for c in cases:
@@ -413,6 +478,7 @@ def test_regen_lock_check_clean():
         cwd=REPO,
         capture_output=True,
         text=True,
+        encoding="utf-8",
     )
     assert proc.returncode == 0, f"regen_lock.py --check failed (rc={proc.returncode}):\n{proc.stderr}\n{proc.stdout}"
 
@@ -440,6 +506,7 @@ def test_regen_lock_refuses_removal(tmp_path: pathlib.Path):
         cwd=REPO,
         capture_output=True,
         text=True,
+        encoding="utf-8",
     )
     assert proc.returncode == 1, f"Expected exit 1 when removing required case, got {proc.returncode}"
     assert tmp_lock.read_text(encoding="utf-8") == orig_lock, "Lock file must remain unchanged on refusal"

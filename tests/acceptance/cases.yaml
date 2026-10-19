@@ -1,0 +1,3107 @@
+# tests/acceptance/cases.yaml：Stage 0 案例承接清單（P2-T12）
+# 單一權威欄位定義見 tests/acceptance/cases.schema.json；凍結鎖見 cases.lock.json（regen_lock.py 唯一寫入者）。
+# 來源：docs/rust-refactor/plans/03-stage0-test-infra.md Task 12 承接表；registry 與情境 meta 為事實來源。
+# 與計畫的刻意偏離（P2-T12 審查修正，須於 PR 說明）：
+#   - rm-topo-*（5 筆，docker 容器封閉拓樸）capabilities 為 [docker]，不含 physical_uart：容器拓樸不需 UART；
+#     計畫 Task 12 的 L3 共同欄位（含 physical_uart）與逐列表（docker）不一致，本檔依逐列表與 realhw registry requires=('docker',)。
+#   - platform_capabilities（選填，計畫外欄位）：只用於 windows，列出 Windows 實際需要的能力（如 windows_com），
+#     取代 Linux 專用的 posix_pty；windows_com 守衛同時檢查 capabilities 與 platform_capabilities.windows。
+#   - pending_issue（P1-T21 規則）：f5-deferred-dropped-after-reboot、f10-release-drain-receipt、
+#     f10-release-aborts-inflight-command 尚無擁有者開立的 issue 號，issues 為空，與 regression registry 逐筆對拍。
+#   - f10-release-*：補 posix_throwaway_daemon（經 _run_with_handoff 使用 POSIX-only 的 ThrowawayDaemon），與 f10-creds-* 同族。
+#   - win-wal-av-*：evidence 以 scripts/stage0/spike3_win_wal.py 實際產物 <case-id>.json 為準。
+schema_version: 1
+revision: 2026-10-15.1
+spec: docs/rust-refactor/serialwrap-rust-spec-final.md
+invariant_ids: [zero_tx_on_reject, no_forbidden_interleave, no_stale_context_replay, no_reopen_before_handoff, no_auto_resend, insufficient_evidence_not_pass]
+features:
+  wal_basic: '2.1'
+  arbiter: '2.1'
+  shell_login_min: '2.1'
+  quiet_gate_min: '2.1'
+  drain_release: '2.1'
+  exclusive_open: '2.1'
+  background_capture: '2.1'
+  self_test_basic: '2.1'
+  activity_observe: '2.1'
+  multi_open_detect: '2.1'
+  recovery_min: '2.1'
+  state_persistence: '2.1'
+  console_pty: '2.2'
+  console_telnet: '2.2'
+  raw_line_mode: '2.2'
+  lease: '2.2'
+  suspend_resume: '2.2'
+  deferred_buffer: '2.2'
+  login_full: '2.3'
+  quiet_reconfirm: '2.3'
+  event_engine: '2.3'
+  stall_recovery: '2.3'
+  rx_flood_classification: '2.3'
+  file_transfer: '2.4'
+  device_handoff_full: '2.4'
+  mcu_flash: '2.4'
+  supervision: '2.4'
+  remote_cli: 1B
+cases:
+- case_id: f1-limits-queryable
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f01_cmd_contract.py:31
+  family: F1
+  title: daemon status 可執行期查詢命令長度上限
+  contract: '#129：limits 欄位須可查詢，client 不必硬編碼上限值。'
+  invariants: []
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart]
+  cli_stage: 1B
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [arbiter]
+  necessity: required
+  issues: ['#129', '#27']
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f1-too-long-rejected
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f01_cmd_contract.py:48
+  family: F1
+  title: 超過硬上限的命令直接拒收，且不拖累後續命令
+  contract: '#23：超長命令曾造成 daemon 端行為異常（非乾淨拒收）；本 case 驗證拒收後 session 未卡死。'
+  invariants: [zero_tx_on_reject]
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [arbiter]
+  necessity: required
+  issues: ['#23', '#27']
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f1-newline-rejected
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f01_cmd_contract.py:74
+  family: F1
+  title: 含換行字元的命令直接拒收
+  contract: '#27：``--cmd`` 內嵌 ``\n`` 須被 admission control 擋下，不得穿透到 UART。'
+  invariants: [zero_tx_on_reject]
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [arbiter]
+  necessity: required
+  issues: ['#27']
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f1-near-limit-no-logout
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f01_cmd_contract.py:89
+  family: F1
+  title: 接近 warn 門檻的合法長命令不致 session 登出
+  contract: '#19：長度落在 warn（非拒收）區間的合法命令，曾回歸性造成 target 端登出。'
+  invariants: []
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [arbiter, shell_login_min]
+  necessity: required
+  issues: ['#19']
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f1-cmdid-survives-timeout
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f01_cmd_contract.py:124
+  family: F1
+  title: 命令逾時後 cmd_id 仍可查詢，不回 CMD_NOT_FOUND
+  contract: '#15：命令逾時（PROMPT_TIMEOUT 及其 CTRL_C/CTRL_D 復原路徑）後，cmd_id 記錄曾一度消失。'
+  invariants: [no_auto_resend]
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [arbiter]
+  necessity: required
+  issues: ['#15']
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f2-queue-full-backpressure
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f02_backpressure.py:97
+  family: F2
+  title: 連發未等待命令觸發 SESSION_QUEUE_FULL 背壓，且事後可恢復
+  contract: '#81：per-session pending 命令數必須有硬上限（backpressure），超量拒收而非無界排隊 OOM。'
+  invariants: [zero_tx_on_reject]
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [arbiter]
+  necessity: required
+  issues: ['#81']
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f2-history-bounded-rss
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f02_backpressure.py:157
+  family: F2
+  title: 200 次命令後 daemon RSS 增量有界（history eviction 生效）
+  contract: '#81：``_commands`` history 需有界淘汰（``CMD_HISTORY_MAX``），否則長跑 daemon RSS 無界成長。'
+  invariants: []
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [physical_uart]
+  cli_stage: 1B
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [arbiter]
+  necessity: required
+  issues: ['#81']
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f2-rx-window-crossing-prompt
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f02_backpressure.py:249
+  family: F2
+  title: RX 視窗飽和跨界後 prompt 匹配不失效（offset 絕對偏移語意）
+  contract: '#158：RX 視窗有界修剪破壞 offset 語意——緩衝飽和後 ``rx_snapshot_len()`` 恆等於 131072，``wait_for_regex_from(pattern, pre_offset)`` 切片永遠空字串，prompt 永不匹配 → PROMPT_TIMEOUT、stdout 空、recovery 誤送 CTRL_D 登出 console。修復＝絕對串流偏移 記帳；本 case 決定性重演跨界並驗證錯誤行為零再現。'
+  invariants: []
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [arbiter]
+  necessity: required
+  issues: ['#158']
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f2-recovery-flushes-queue
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f02_backpressure.py:309
+  family: F2
+  title: session recover 後舊佇列已 flush，立即 submit 不再連鎖 QUEUE_FULL
+  contract: '#128：``session recover`` 必須原子終結舊佇列的 accepted 命令，否則 stale 記錄長期佔用 ``CMD_PENDING_MAX`` 額度，之後每次 submit 都連鎖 ``SESSION_QUEUE_FULL``，直到 daemon 重啟為止。'
+  invariants: [no_auto_resend]
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [arbiter, recovery_min]
+  necessity: required
+  issues: ['#128', '#156']
+  behavior_changes: [SC-04]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f3-fail-error-code
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f03_observability.py:19
+  family: F3
+  title: 失敗 CLI 必有非空 error_code＋stderr
+  contract: 失敗 CLI 必有非空 error_code＋stderr
+  invariants: []
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [arbiter]
+  necessity: required
+  issues: ['#94']
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f3-cmd-fail-observable
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f03_observability.py:32
+  family: F3
+  title: cmd submit 對不存在 selector 必須可觀測失敗
+  contract: cmd submit 對不存在 selector 必須可觀測失敗
+  invariants: [zero_tx_on_reject]
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [arbiter]
+  necessity: required
+  issues: ['#94']
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f3-device-error-names-selector
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f03_observability.py:48
+  family: F3
+  title: 不存在 selector 的錯誤輸出須點名該 selector
+  contract: 不存在 selector 的錯誤輸出須點名該 selector
+  invariants: []
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [arbiter]
+  necessity: required
+  issues: ['#16']
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f3-log-tail-latest
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f03_observability.py:66
+  family: F3
+  title: log tail-text 預設參數需含最新一段（非從最舊 seq 起算）
+  contract: log tail-text 預設參數需含最新一段（非從最舊 seq 起算）
+  invariants: []
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [wal_basic]
+  necessity: required
+  issues: ['#124']
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f4-activity-classification
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f04_session_semantics.py:43
+  family: F4
+  title: session activity 分類欄位須存在且為合法值（安靜／活動皆可區分）
+  contract: '#34：session activity 的分類欄位曾缺失或恆為空值。'
+  invariants: []
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [activity_observe]
+  necessity: required
+  issues: ['#34']
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f4-background-result-tail-consistent
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f04_session_semantics.py:95
+  family: F4
+  title: background 命令的 result-tail 增量拼接須不漏不重
+  contract: '#28：background 模式輸出經 result-tail 增量讀取，曾發生 chunk 邊界漏段或重複段。'
+  invariants: []
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [background_capture]
+  necessity: required
+  issues: ['#28']
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f4-interactive-line-cmd-defined
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f04_session_semantics.py:168
+  family: F4
+  title: interactive lease 期間 line 命令的終態語意須明確（拒絕或排隊完成，不得懸空逾時）
+  contract: '#26：interactive lease 開啟期間送 line 模式命令，過去曾出現「被接受卻永遠等不到 prompt」（最終 PROMPT_TIMEOUT）的未定義行為。合法終態僅二擇一：'
+  invariants: []
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart]
+  cli_stage: 1A
+  daemon_slice: '2.2'
+  stage0_required: true
+  prerequisites: [lease]
+  necessity: required
+  issues: ['#26']
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: 需 Lease（Slice 2.2）
+- case_id: f5-raw-ownership-survives-agent-rounds
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f05_console_coexist.py:75
+  family: F5
+  title: raw interactive ownership 撐過連續 5 輪 agent 命令（suspend/resume 不掉權）
+  contract: 開 console 拿 ownership → 連續 5 輪 agent 命令 → ownership 與 Tab 補完須仍在（#78 回歸）。
+  invariants: [no_forbidden_interleave]
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [physical_uart, human_frontend]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: true
+  prerequisites: [raw_line_mode, suspend_resume]
+  necessity: required
+  issues: ['#78']
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f5-deferred-bytes-flushed
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f05_console_coexist.py:141
+  family: F5
+  title: agent 命令執行期間 human console 按鍵不丟（deferred buffer 正確 flush）
+  contract: 命令執行中送 "ec"（不含 Enter）→ 命令結束後補 Tab → 應出現 "echo"（#78 回歸）。
+  invariants: [no_stale_context_replay]
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [physical_uart, human_frontend]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: true
+  prerequisites: [suspend_resume, deferred_buffer]
+  necessity: required
+  issues: ['#78']
+  behavior_changes: [BC-02]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f5-console-peer-gone-recycled
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f05_console_coexist.py:205
+  family: F5
+  title: 對端消失（非正常 detach）後 console 正確回收，無假性佔用
+  contract: 'kill 對端 tmux → console-list 應自動回收該筆 → 新開 console 仍可取得 ownership（#53 #11 回歸）。'
+  invariants: []
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: 以 SIGKILL minicom 製造 PTY 對端異常消失；Windows Telnet 只有 socket EOF／RST 語意，無孤兒 PTY，`HumanFrontend.crash()` 的 RST 不等價
+  capabilities: [physical_uart, human_frontend]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: true
+  prerequisites: [console_pty, console_telnet, raw_line_mode]
+  necessity: required
+  issues: ['#53', '#11']
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f5-second-console-linebuffer
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f05_console_coexist.py:261
+  family: F5
+  title: 第二個 console 走 line-buffer、不搶 ownership，也不擋 agent 命令
+  contract: '第一 console 持 ownership 時開第二個 → 第二個非 owner＋期間 agent 命令仍成功（#7 #8 回歸）。'
+  invariants: [no_forbidden_interleave]
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [physical_uart, human_frontend]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: true
+  prerequisites: [raw_line_mode]
+  necessity: required
+  issues: ['#7', '#8']
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f5-deferred-dropped-after-reboot
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f05_console_coexist.py:492
+  family: F5
+  title: agent 命令在途時 human 鍵入的舊按鍵，於 reboot（上下文失效）後不回放；未 reboot 之對照組照常回放
+  contract: BC-02 實機 oracle：reboot 臂的畫面與 WAL 不得出現 STALE；對照組（未 reboot）須出現 STALE 才能判 PASS。
+  invariants: [no_stale_context_replay]
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: 依賴 tmux＋minicom（POSIX PTY human console）；Windows Telnet frontend 無對應 reboot 對照實測
+  capabilities: [physical_uart, tmux, human_frontend]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [suspend_resume, deferred_buffer, console_pty]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-02]
+  destructive: true
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+  pending_issue: true
+- case_id: f6-ping-during-long-op
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f06_rpc_liveness.py:41
+  family: F6
+  title: 長操作執行中 daemon RPC 仍即時回應（不被凍結）
+  contract: 對 COM0 送 8 秒長命令、期間每 0.5s 打 ``daemon status`` 量測往返耗時。
+  invariants: []
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: true
+  prerequisites: [arbiter]
+  necessity: required
+  issues: ['#80']
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f6-two-boards-no-starvation
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f06_rpc_liveness.py:91
+  family: F6
+  title: COM0 長操作不得餓死 COM1 命令（雙板互不干擾）
+  contract: 執行緒 A 對 COM0 送 5 秒長命令；主執行緒延遲 1s 後對 COM1 送短命令。
+  invariants: [no_forbidden_interleave]
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart, two_boards]
+  cli_stage: 1A
+  daemon_slice: '2.2'
+  stage0_required: true
+  prerequisites: [arbiter]
+  necessity: required
+  issues: ['#80', '#52']
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f7-binary-roundtrip-md5
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f07_file_transfer.py:300
+  family: F7
+  title: binary round-trip md5 一致（含 null byte）
+  contract: binary round-trip md5 一致（含 null byte）
+  invariants: []
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart, target_b64_tool]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: true
+  prerequisites: [file_transfer]
+  necessity: conditional
+  issues: ['#32', '#21', '#161', '#166']
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f7-larger-file-not-truncated
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f07_file_transfer.py:309
+  family: F7
+  title: 1MB 檔案 push→pull 不靜默截斷
+  contract: 1MB 檔案 push→pull 不靜默截斷
+  invariants: []
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart, target_b64_tool]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: true
+  prerequisites: [file_transfer]
+  necessity: conditional
+  issues: ['#21', '#161', '#166']
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f8-tty-holders-reported
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f08_daemon_singleton.py:20
+  family: F8
+  title: daemon status 正確回報各板 tty 持有者（#101 被動偵測基線）
+  contract: '#101 被動偵測契約基線：foreign_holders 須正確映射每板 tty→serialwrapd 持有者 pid， doctor 的 single_daemon 與之一致。偵測面壞掉（掃描失效、映射空缺、pid 錯置）即回歸。'
+  invariants: [no_reopen_before_handoff]
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: Python Windows holder 偵測恆失效（`GAP-G-03`），Rust 由 SC-17 回 `holder_unknown`
+  capabilities: [physical_uart]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: true
+  prerequisites: [multi_open_detect, exclusive_open]
+  necessity: required
+  issues: ['#101', '#53']
+  behavior_changes: [BC-04]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f8-second-daemon-detected
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f08_daemon_singleton.py:79
+  family: F8
+  title: 第二個 daemon（two-reader）須被 prod 被動偵測
+  contract: 起一個不綁裝置的 throwaway 第二 daemon，驗 prod daemon status 被動偵測到（#101 回歸）。
+  invariants: []
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: ThrowawayDaemon 為 POSIX-only（nohup、`/tmp` RUN_DIR、unix socket）
+  capabilities: [physical_uart, posix_throwaway_daemon]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: true
+  prerequisites: [multi_open_detect]
+  necessity: required
+  issues: ['#101']
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f9-reboot-autoboot-unmolested
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f09_boot_uboot.py:27
+  family: F9
+  title: reboot 後 daemon 自身 probe 不得打斷 autoboot（boot quiet window）
+  contract: '#130：reboot 觸發的 boot quiet window 必須擋住 daemon 自己的 readiness reprobe。'
+  invariants: [zero_tx_on_reject]
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart, uboot_board]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [quiet_gate_min]
+  necessity: conditional
+  issues: ['#130']
+  behavior_changes: []
+  destructive: true
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f9-quiet-window-agent-passthrough
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f09_boot_uboot.py:77
+  family: F9
+  title: boot quiet window 不得擋真 READY 後的顯式 agent 命令
+  contract: '#130：boot quiet window 解除條件是 READY，但視窗本身仍可能持續到 180s；即便如此， 一旦 session（真正）回到 READY，agent 顯式命令必須直接送達，不得被 quiet window 誤擋。'
+  invariants: [zero_tx_on_reject]
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart, uboot_board]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [quiet_gate_min, quiet_reconfirm]
+  necessity: conditional
+  issues: ['#130']
+  behavior_changes: []
+  destructive: true
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f9-attach-during-boot-reprobes
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f09_boot_uboot.py:163
+  family: F9
+  title: 開機窗期間人為撞擊 clear+attach 後，daemon 須自動 reprobe 回 READY
+  contract: '#69 #14 #20：開機期間人為撞擊（clear 後在 boot 窗內 attach）造成 session 落在 DETACHED，daemon 的自動 reprobe／hotplug 邏輯必須不靠人為介入，自行把 session 帶回 READY——不得卡死在 DETACHED。'
+  invariants: []
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart, uboot_board]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [quiet_reconfirm]
+  necessity: conditional
+  issues: ['#69', '#14', '#20']
+  behavior_changes: []
+  destructive: true
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f9-uboot-readonly-and-console-kept
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f09_boot_uboot.py:227
+  family: F9
+  title: U-Boot 停留期間唯讀操作＋console 不得被踢，離開後自動回 READY
+  contract: '#44 #130：板子停留在 U-Boot 期間，既有 human console 不得被踢；唯讀命令 （printenv 等）須正常運作；用 ``boot`` 離開後 session 必須自動恢復 READY。'
+  invariants: []
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [physical_uart, uboot_board, human_frontend]
+  cli_stage: 1B
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [quiet_reconfirm, console_pty]
+  necessity: conditional
+  issues: ['#44', '#130']
+  behavior_changes: []
+  destructive: true
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f9-spontaneous-reboot-agent-gated
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f09_boot_uboot.py:347
+  family: F9
+  title: 自發重開機（daemon 不知情）期間 agent 顯式命令必須被 AUTOBOOT_QUIET 擋下
+  contract: '#139（#130 Finding 4 收斂）：human console 送 reboot（daemon 視角＝自發重開機、 session 名義上停 READY、RX banner arm quiet）期間，agent 顯式命令不得再被放行——'
+  invariants: [zero_tx_on_reject, no_stale_context_replay]
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [physical_uart, uboot_board, human_frontend]
+  cli_stage: 1B
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [quiet_reconfirm, console_pty]
+  necessity: conditional
+  issues: ['#139', '#130']
+  behavior_changes: []
+  destructive: true
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f9-brcm-spaced-prompt-reboot-login
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f09_brcm_reboot_login.py:85
+  family: F9
+  title: BRCM 重開機後帶前導空白提示符可自動登入並恢復 READY
+  contract: BRCM 重開機後帶前導空白提示符可自動登入並恢復 READY
+  invariants: []
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart, brcm_board]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [login_full, quiet_reconfirm]
+  necessity: conditional
+  issues: ['#224']
+  behavior_changes: []
+  destructive: true
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f10-unresolved-creds-terminal
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f10_login_creds.py:286
+  family: F10
+  title: 帳密解析失敗須落終態 CREDENTIALS_UNRESOLVED、不得靜默送空帳密迴圈
+  contract: '#140 oracle：帳密來源宣告但解析為空時，daemon 不得送空帳密迴圈，須落終態 ``CREDENTIALS_UNRESOLVED`` 且不自動重探。全程在 throwaway daemon sandbox 內重現， prod 端只做 device release／attach 交接，組態零接觸。'
+  invariants: [zero_tx_on_reject]
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: ThrowawayDaemon 為 POSIX-only
+  capabilities: [physical_uart, posix_throwaway_daemon]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [login_full]
+  necessity: required
+  issues: ['#140']
+  behavior_changes: []
+  destructive: true
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f10-creds-fixed-then-ready
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f10_login_creds.py:416
+  family: F10
+  title: 補上有效帳密後 bcm 登入路徑恢復、session 回 READY
+  contract: '#140 oracle 的另一半：補上有效帳密後，bcm 登入路徑須恢復、session 能到 READY——證明 ``CREDENTIALS_UNRESOLVED`` 並非不可逆終態，補帳密＋re-attach 即可正常復原。'
+  invariants: [no_reopen_before_handoff]
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: ThrowawayDaemon 為 POSIX-only
+  capabilities: [physical_uart, posix_throwaway_daemon]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [login_full, drain_release]
+  necessity: required
+  issues: ['#140']
+  behavior_changes: []
+  destructive: true
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f10-release-drain-receipt
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f10_device_handoff.py:350
+  family: F10
+  title: 實板 console 持續 TX 時 device release 的 ok 回條只在 handle 關閉後送出
+  contract: 實板 console 持續 TX 時 device release 的 ok 回條只在 handle 關閉後送出
+  invariants: [no_reopen_before_handoff]
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: 'ThrowawayDaemon 為 POSIX-only；外部 open(tty) 探測依賴 POSIX TIOCEXCL 語意；Windows 交接以 #54 release 與 win-com-cancel-close 承接'
+  capabilities: [physical_uart, posix_throwaway_daemon]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [drain_release]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-04, SC-04]
+  destructive: true
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+  pending_issue: true
+- case_id: f10-release-aborts-inflight-command
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f10_device_handoff.py:365
+  family: F10
+  title: 長命令在途時 device release 後 cmd status 為 COMMAND_ABORTED_IN_FLIGHT 且 TX 不重送
+  contract: 長命令在途時 device release 後 cmd status 為 COMMAND_ABORTED_IN_FLIGHT 且 TX 不重送
+  invariants: [no_auto_resend]
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: ThrowawayDaemon 為 POSIX-only；release 在途命令的 WAL 計數依賴 POSIX 交接流程；Windows 在途中止以 win-com-cancel-close 承接
+  capabilities: [physical_uart, posix_throwaway_daemon]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [arbiter, drain_release]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-03]
+  destructive: true
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+  pending_issue: true
+- case_id: f11-last-rx-age-sane
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f11_rx_flood.py:41
+  family: F11
+  title: session 觀測面須含 last_rx_age_s/last_tx_age_s/last_error_detail 且值合理
+  contract: '#150 觀測面缺口不得再現：stall（RX 單邊凍結）過去在 session list 看不出來—— idle_for_ms 取 max(rx,tx) 被 probe/human TX 拉小。新欄位 last_rx_age_s／last_tx_age_s ／last_error_detail 必須存在；剛完成一次 echo 往返後 last_rx_age_s 須為新鮮小值。'
+  invariants: []
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: true
+  prerequisites: [activity_observe]
+  necessity: required
+  issues: ['#150']
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f11-flood-probe-classified
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f11_rx_flood.py:99
+  family: F11
+  title: console 洪水下 probe 失敗須分類為 RX_FLOOD（等排空），排空後自癒回 READY
+  contract: '#153：console 被灌爆時 probe 失敗曾被誤分類為 PROMPT_UNAVAILABLE／ TARGET_UNRESPONSIVE（「灌爆」與「死了」擠同一碼），上層被誤導去重建 session 而非等排空。oracle：洪水中 self-test/attach 不得再回誤導碼、RX 指標非零、 排空後自癒回 READY。只動 COM0（prpl），COM1 不碰。'
+  invariants: []
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [rx_flood_classification, self_test_basic]
+  necessity: required
+  issues: ['#153']
+  behavior_changes: []
+  destructive: true
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f12-version-reported-consistent
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f12_diagnostics.py:33
+  family: F12
+  title: daemon status 回報版本欄位，且與 pinned CLI --version 一致（#154 診斷可信度）
+  contract: daemon status 必須直接帶版本欄位（不靠 fallback），且與 pinned CLI 同源。
+  invariants: []
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart]
+  cli_stage: 1B
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: []
+  necessity: required
+  issues: ['#154']
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f12-wal-path-live
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f12_diagnostics.py:84
+  family: F12
+  title: daemon status 的 wal_path 真實存在且持續寫入；doctor 含 wal_dir 診斷項（#148）
+  contract: wal_path 需指向實際存在、持續被寫入的檔案；doctor 需含 wal_dir 檢查項。
+  invariants: [insufficient_evidence_not_pass]
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart]
+  cli_stage: 1B
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [wal_basic]
+  necessity: required
+  issues: ['#148']
+  behavior_changes: [BC-01]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: p0-doctor
+  suite: realhw
+  source_ref: realhw/cases/p0.py:24
+  family: P0
+  title: doctor 全綠＋兩板 READY
+  contract: doctor 全綠＋兩板 READY
+  invariants: []
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart, two_boards]
+  cli_stage: 1B
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: p0-cmd-async
+  suite: realhw
+  source_ref: realhw/cases/p0.py:44
+  family: P0
+  title: cmd submit→status async 全流程
+  contract: cmd submit→status async 全流程
+  invariants: []
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart, two_boards]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [arbiter, background_capture]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: p0-console-raw
+  suite: realhw
+  source_ref: realhw/cases/p0.py:59
+  family: P0
+  title: minicom 連線＋raw ownership（Tab 補完）
+  contract: minicom 連線＋raw ownership（Tab 補完）
+  invariants: []
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [physical_uart, human_frontend, two_boards]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: true
+  prerequisites: [raw_line_mode]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: p0-clear-reattach
+  suite: realhw
+  source_ref: realhw/cases/p0.py:89
+  family: P0
+  title: session clear 自動 re-attach
+  contract: session clear 自動 re-attach
+  invariants: []
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart, two_boards]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [drain_release]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: p0-selftest
+  suite: realhw
+  source_ref: realhw/cases/p0.py:98
+  family: P0
+  title: self-test 基本判讀
+  contract: self-test 基本判讀
+  invariants: []
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [self_test_basic]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: p0-blog-clean
+  suite: realhw
+  source_ref: realhw/cases/p0.py:109
+  family: P0
+  title: b-log 純淨度（無 ANSI transcript 回歸）
+  contract: b-log 純淨度（無 ANSI transcript 回歸）
+  invariants: []
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: 驗的是 minicom capture 檔（`~/b-log/mini_COM0_*.log`），Windows Telnet frontend 無對應產物
+  capabilities: [physical_uart, tmux]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: true
+  prerequisites: [console_pty]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: p0-wal-live
+  suite: realhw
+  source_ref: realhw/cases/p0.py:132
+  family: P0
+  title: WAL 活性與位置
+  contract: WAL 活性與位置
+  invariants: [insufficient_evidence_not_pass]
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [wal_basic]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-01]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: p0-multiopen
+  suite: realhw
+  source_ref: realhw/cases/p0.py:194
+  family: P0
+  title: 無多開（multi_open 假、無外來 tty 持有者）
+  contract: 無多開（multi_open 假、無外來 tty 持有者）
+  invariants: []
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: Python Windows multi_open 恆失效（`GAP-G-03`）
+  capabilities: [physical_uart]
+  cli_stage: 1B
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [multi_open_detect, exclusive_open]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-04]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: p1-con-fanout
+  suite: realhw
+  source_ref: realhw/cases/p1_console.py:34
+  family: P1
+  title: human 即時看到 agent 命令與回應（T6）
+  contract: human 即時看到 agent 命令與回應（T6）
+  invariants: []
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [physical_uart, human_frontend, two_boards]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: true
+  prerequisites: [console_pty, console_telnet]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: p1-con-defer
+  suite: realhw
+  source_ref: realhw/cases/p1_console.py:59
+  family: P1
+  title: human 打字不擋 agent（T7 suspend/deferred/resume）
+  contract: human 打字不擋 agent（T7 suspend/deferred/resume）
+  invariants: [no_stale_context_replay]
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [physical_uart, human_frontend, two_boards]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: true
+  prerequisites: [suspend_resume, deferred_buffer]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-02]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: p1-con-busy
+  suite: realhw
+  source_ref: realhw/cases/p1_console.py:113
+  family: P1
+  title: human_active 窗內 agent 不奪 interactive（SESSION_INTERACTIVE_BUSY）
+  contract: human_active 窗內 agent 不奪 interactive（SESSION_INTERACTIVE_BUSY）
+  invariants: []
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [physical_uart, human_frontend, two_boards]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: true
+  prerequisites: [lease]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: p1-con-softpreempt
+  suite: realhw
+  source_ref: realhw/cases/p1_console.py:140
+  family: P1
+  title: 閒置降級：agent 軟奪 idle human lease（soft_preempted）
+  contract: 閒置降級：agent 軟奪 idle human lease（soft_preempted）
+  invariants: []
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [physical_uart, human_frontend, two_boards]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: true
+  prerequisites: [lease]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: p1-con-liveness
+  suite: realhw
+  source_ref: realhw/cases/p1_console.py:175
+  family: P1
+  title: human console SIGKILL 後孤兒偵測（human_attached 轉 false）
+  contract: human console SIGKILL 後孤兒偵測（human_attached 轉 false）
+  invariants: []
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: 以 `pgrep minicom`＋`kill -9` 製造對端異常消失（`p1_console.py:20-29`）；Windows socket EOF 偵測無孤兒語意
+  capabilities: [physical_uart, human_frontend, two_boards]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: true
+  prerequisites: [console_pty, console_telnet]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: p1-con-orphan
+  suite: realhw
+  source_ref: realhw/cases/p1_console.py:206
+  family: P1
+  title: 孤兒回收後重開 minicom 立即拿回 raw ownership（#76 自癒）
+  contract: 孤兒回收後重開 minicom 立即拿回 raw ownership（#76 自癒）
+  invariants: []
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: 同上（孤兒只來自 SIGKILL／crash）
+  capabilities: [physical_uart, human_frontend, two_boards]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: true
+  prerequisites: [console_pty, console_telnet]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: p1-con-second
+  suite: realhw
+  source_ref: realhw/cases/p1_console.py:266
+  family: P1
+  title: 第二個 console 走 line-buffer（恰一個 interactive owner）
+  contract: 第二個 console 走 line-buffer（恰一個 interactive owner）
+  invariants: [no_forbidden_interleave]
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [physical_uart, human_frontend, two_boards]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: true
+  prerequisites: [raw_line_mode]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: p1-cmd-modes
+  suite: realhw
+  source_ref: realhw/cases/p1_cmd.py:51
+  family: P1
+  title: 三模式（line／background／interactive）＋錯誤碼
+  contract: 三模式（line／background／interactive）＋錯誤碼
+  invariants: []
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart, two_boards]
+  cli_stage: 1A
+  daemon_slice: '2.2'
+  stage0_required: true
+  prerequisites: [lease, background_capture]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: p1-cmd-serial
+  suite: realhw
+  source_ref: realhw/cases/p1_cmd.py:133
+  family: P1
+  title: 多來源並發序列化（單 UART 單寫入者、無 cross-talk）
+  contract: 多來源並發序列化（單 UART 單寫入者、無 cross-talk）
+  invariants: [no_forbidden_interleave]
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart, two_boards]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [arbiter]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: p1-cmd-file
+  suite: realhw
+  source_ref: realhw/cases/p1_cmd.py:185
+  family: P1
+  title: UART 檔案 push/pull round-trip＋RPC 不凍結
+  contract: UART 檔案 push/pull round-trip＋RPC 不凍結
+  invariants: []
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart, two_boards]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: true
+  prerequisites: [file_transfer]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: p1-wal-reset
+  suite: realhw
+  source_ref: realhw/cases/p1_wal.py:38
+  family: P1
+  title: wal reset 契約＋console 不斷線（T1/T2/T3）
+  contract: wal reset 契約＋console 不斷線（T1/T2/T3）
+  invariants: []
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [physical_uart, human_frontend, two_boards]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: true
+  prerequisites: [wal_basic, console_pty]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: 讀 console（Slice 2.2）
+- case_id: p1-wal-fullrun
+  suite: realhw
+  source_ref: realhw/cases/p1_wal.py:87
+  family: P1
+  title: 逐案 seq 嚴格遞增＋console 存活（T8）
+  contract: 逐案 seq 嚴格遞增＋console 存活（T8）
+  invariants: []
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [physical_uart, human_frontend, two_boards]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: true
+  prerequisites: [wal_basic, console_pty]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: 讀 console（Slice 2.2）
+- case_id: p1-rst-daemon
+  suite: realhw
+  source_ref: realhw/cases/p1_restart.py:31
+  family: P1
+  title: systemd restart 後映射／profile 逐板不變（#100/#95）
+  contract: systemd restart 後映射／profile 逐板不變（#100/#95）
+  invariants: []
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: '`sudo systemctl restart`；Windows `windows-task` 版本由 P4 建立（`requires` 由 Task 14 補 `supervisor_runtime`，使 Windows 能力式 SKIP 生效）'
+  capabilities: [physical_uart, two_boards, supervisor_runtime]
+  cli_stage: 1B
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [state_persistence]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: true
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: p1-rst-reboot
+  suite: realhw
+  source_ref: realhw/cases/p1_restart.py:77
+  family: P1
+  title: target reboot 後自動恢復 READY＋console 存活＋WAL 連續
+  contract: target reboot 後自動恢復 READY＋console 存活＋WAL 連續
+  invariants: []
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [physical_uart, two_boards, deployed_recent, human_frontend]
+  cli_stage: 1B
+  daemon_slice: '2.3'
+  stage0_required: true
+  prerequisites: [quiet_reconfirm, console_pty]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: true
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: p1-rst-bootwindow
+  suite: realhw
+  source_ref: realhw/cases/p1_restart.py:124
+  family: P1
+  title: 開機窗 clear+attach 不卡死、最終自動 READY（#69/#94）
+  contract: 開機窗 clear+attach 不卡死、最終自動 READY（#69/#94）
+  invariants: []
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart, two_boards, deployed_recent]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: true
+  prerequisites: [quiet_reconfirm]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: true
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: p1-rst-recover
+  suite: realhw
+  source_ref: realhw/cases/p1_restart.py:146
+  family: P1
+  title: session recover 後 self-test OK（TIMEOUT≠失敗是契約）
+  contract: session recover 後 self-test OK（TIMEOUT≠失敗是契約）
+  invariants: [no_auto_resend]
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart, two_boards]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [recovery_min]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: true
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: p1-ho-cycle
+  suite: realhw
+  source_ref: realhw/cases/p1_handoff.py:28
+  family: P1
+  title: release→外部獨佔→attach 回 DEVICE_STILL_HELD→收回 READY
+  contract: release→外部獨佔→attach 回 DEVICE_STILL_HELD→收回 READY
+  invariants: [no_reopen_before_handoff]
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: 外部持有者為 `minicom -D`、holder 以 `/proc` 判定
+  capabilities: [physical_uart, two_boards, tmux]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: true
+  prerequisites: [device_handoff_full]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-04]
+  destructive: true
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: p1-ho-persist
+  suite: realhw
+  source_ref: realhw/cases/p1_handoff.py:80
+  family: P1
+  title: RELEASED 跨 daemon restart 持久（不被搶回）
+  contract: RELEASED 跨 daemon restart 持久（不被搶回）
+  invariants: []
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: systemd restart
+  capabilities: [physical_uart, two_boards, supervisor_runtime]
+  cli_stage: 1B
+  daemon_slice: '2.4'
+  stage0_required: true
+  prerequisites: [device_handoff_full, state_persistence]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: true
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: p1-hp-cycle
+  suite: realhw
+  source_ref: realhw/cases/p1_hotplug.py:92
+  family: P1
+  title: COM1 熱移除轉 DETACHED、COM0 不受擾、回插自動回原 COM READY（含 Windows 端自動救援）
+  contract: COM1 熱移除轉 DETACHED、COM0 不受擾、回插自動回原 COM READY（含 Windows 端自動救援）
+  invariants: [no_reopen_before_handoff]
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: usbipd 由 WSL 端操作 Linux daemon
+  capabilities: [physical_uart, two_boards, usbipd]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [drain_release, exclusive_open]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-04]
+  destructive: true
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: p1-hp-reorder
+  suite: realhw
+  source_ref: realhw/cases/p1_hotplug.py:142
+  family: P1
+  title: 兩板反序回插仍各回原 COM，restart 後 rank 不翻轉（#100）
+  contract: 兩板反序回插仍各回原 COM，restart 後 rank 不翻轉（#100）
+  invariants: []
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: 同上
+  capabilities: [physical_uart, two_boards, usbipd, supervisor_runtime]
+  cli_stage: 1B
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [drain_release, state_persistence]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: true
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: lr-mixed
+  suite: realhw
+  source_ref: realhw/cases/longrun.py:274
+  family: longrun
+  title: 混合負載長跑＋事後分析（agent×4＋human＋快照）
+  contract: 混合負載長跑＋事後分析（agent×4＋human＋快照）
+  invariants: [zero_tx_on_reject, no_forbidden_interleave, no_stale_context_replay, no_reopen_before_handoff, no_auto_resend, insufficient_evidence_not_pass]
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [physical_uart, two_boards, human_frontend, longrun_bench]
+  cli_stage: 1B
+  daemon_slice: '2.4'
+  stage0_required: true
+  prerequisites: [console_pty, console_telnet, lease, background_capture]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [events.ndjson, snapshots.ndjson, longrun-analysis.md, observer.ndjson, wal/, release-gate.json]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: rm-topo-direct
+  suite: realhw
+  source_ref: realhw/cases/remote.py:77
+  family: remote
+  title: direct：-R expose＋-L connect＋close/prune 全流程（容器封閉世界）
+  contract: direct：-R expose＋-L connect＋close/prune 全流程（容器封閉世界）
+  invariants: []
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: 容器拓樸只在 Linux
+  capabilities: [docker]
+  cli_stage: 1B
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [remote_cli]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-05]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: rm-topo-nat-host
+  suite: realhw
+  source_ref: realhw/cases/remote.py:83
+  family: remote
+  title: NAT→host relay＋攻擊者容器隔離斷言
+  contract: NAT→host relay＋攻擊者容器隔離斷言
+  invariants: []
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: 同上
+  capabilities: [docker]
+  cli_stage: 1B
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [remote_cli]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-05]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: rm-topo-dual-nat
+  suite: realhw
+  source_ref: realhw/cases/remote.py:89
+  family: remote
+  title: 雙 NAT relay＋兩側繞行隔離斷言
+  contract: 雙 NAT relay＋兩側繞行隔離斷言
+  invariants: []
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: 同上
+  capabilities: [docker]
+  cli_stage: 1B
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [remote_cli]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-05]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: rm-topo-agent-pull
+  suite: realhw
+  source_ref: realhw/cases/remote.py:95
+  family: remote
+  title: 方向反轉：agent 端 -L 拉 uart 的 serialwrapd.sock（無 -R、無 relay）
+  contract: 方向反轉：agent 端 -L 拉 uart 的 serialwrapd.sock（無 -R、無 relay）
+  invariants: []
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: 同上
+  capabilities: [docker]
+  cli_stage: 1B
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [remote_cli]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-05]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: rm-topo-gwports
+  suite: realhw
+  source_ref: realhw/cases/remote.py:101
+  family: remote
+  title: GatewayPorts/--remote-socket fail-closed＋teardown 複查
+  contract: GatewayPorts/--remote-socket fail-closed＋teardown 複查
+  invariants: []
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: 同上
+  capabilities: [docker]
+  cli_stage: 1B
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [remote_cli]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-05]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: rm-live-e2e
+  suite: realhw
+  source_ref: realhw/cases/remote.py:203
+  family: remote
+  title: -R expose 至容器→穿隧道 session list＋真板 marker＋WAL 歸因→close 淨空、daemon pid 不變
+  contract: -R expose 至容器→穿隧道 session list＋真板 marker＋WAL 歸因→close 淨空、daemon pid 不變
+  invariants: []
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: Windows remote 承接於 P4（SC-27）
+  capabilities: [physical_uart, docker, two_boards, remote_capability]
+  cli_stage: 1B
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [remote_cli]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-05]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: rm-live-orphan
+  suite: realhw
+  source_ref: realhw/cases/remote.py:283
+  family: remote
+  title: kill -9 隧道 ssh→remote status prune 自癒→重開成功
+  contract: kill -9 隧道 ssh→remote status prune 自癒→重開成功
+  invariants: []
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: 同上
+  capabilities: [physical_uart, docker, two_boards, remote_capability]
+  cli_stage: 1B
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [remote_cli]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-05]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: rm-live-cycle
+  suite: realhw
+  source_ref: realhw/cases/remote.py:336
+  family: remote
+  title: open/close ×5 registry 不累積、daemon 零觸碰
+  contract: open/close ×5 registry 不累積、daemon 零觸碰
+  invariants: []
+  layer: L3
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: 同上
+  capabilities: [physical_uart, docker, two_boards, remote_capability]
+  cli_stage: 1B
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [remote_cli]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-05]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: brcm-01-login-flow
+  suite: func-test
+  source_ref: func-test/cases/brcm-01-login-flow.yaml
+  family: L15
+  title: '驗證 Broadcom 平台的雙階段登入流程： 1. 帳號密碼 admin/admin 登入 Broadcom CLI (> prompt) 2. post_login_cmd "sh" 進入 Linux shell (# prompt) 3. ready_probe 驗證 nonce 4. session 狀態到達 READY 後可執行命令
+
+    '
+  contract: '驗證 Broadcom 平台的雙階段登入流程： 1. 帳號密碼 admin/admin 登入 Broadcom CLI (> prompt) 2. post_login_cmd "sh" 進入 Linux shell (# prompt) 3. ready_probe 驗證 nonce 4. session 狀態到達 READY 後可執行命令
+
+    '
+  invariants: []
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: true
+  prerequisites: [login_full]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: co-01-line-buffering
+  suite: func-test
+  source_ref: func-test/cases/co-01-line-buffering.yaml
+  family: L15
+  title: 驗證 human console 的 line buffering：輸入整行後才送進 arbiter
+  contract: 驗證 human console 的 line buffering：輸入整行後才送進 arbiter
+  invariants: []
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: true
+  prerequisites: [console_pty, raw_line_mode]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: cowork-01-agent-bad-cmd
+  suite: func-test
+  source_ref: func-test/cases/cowork-01-agent-bad-cmd.yaml
+  family: L15
+  title: Agent 送壞命令卡住 → timeout recover → human 操作不受影響 → agent 再次正常
+  contract: Agent 送壞命令卡住 → timeout recover → human 操作不受影響 → agent 再次正常
+  invariants: [no_auto_resend]
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: true
+  prerequisites: [arbiter, recovery_min, console_pty]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: ev-01-spawn-handler
+  suite: func-test
+  source_ref: func-test/cases/ev-01-spawn-handler.yaml
+  family: L15
+  title: 端到端：UART 行 → event rule → spawned handler
+  contract: 端到端：UART 行 → event rule → spawned handler
+  invariants: []
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: true
+  prerequisites: [event_engine]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: ha-01-human-then-agent
+  suite: func-test
+  source_ref: func-test/cases/ha-01-human-then-agent.yaml
+  family: L15
+  title: Human attach console 觀察 → 執行 line 命令 → detach → agent 命令成功
+  contract: Human attach console 觀察 → 執行 line 命令 → detach → agent 命令成功
+  invariants: []
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: true
+  prerequisites: [console_pty]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: ha-05-concurrent-submit
+  suite: func-test
+  source_ref: func-test/cases/ha-05-concurrent-submit.yaml
+  family: L15
+  title: 多個 agent 併發 submit，驗證命令全部完成且 WAL 記錄正確
+  contract: 多個 agent 併發 submit，驗證命令全部完成且 WAL 記錄正確
+  invariants: [no_forbidden_interleave]
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [arbiter, wal_basic]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-07]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: hk-01-special-keys-raw
+  suite: func-test
+  source_ref: func-test/cases/hk-01-special-keys-raw.yaml
+  family: L15
+  title: 驗證 ESC 序列（方向鍵）及 Tab 在 raw interactive mode 下正確透傳到 UART
+  contract: 驗證 ESC 序列（方向鍵）及 Tab 在 raw interactive mode 下正確透傳到 UART
+  invariants: []
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: true
+  prerequisites: [raw_line_mode]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: hk-02-agent-preempt-human
+  suite: func-test
+  source_ref: func-test/cases/hk-02-agent-preempt-human.yaml
+  family: L15
+  title: Agent 命令在 human raw interactive session 期間正確搶佔執行
+  contract: Agent 命令在 human raw interactive session 期間正確搶佔執行
+  invariants: [no_forbidden_interleave]
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: true
+  prerequisites: [suspend_resume]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: hk-03-deferred-input-flush
+  suite: func-test
+  source_ref: func-test/cases/hk-03-deferred-input-flush.yaml
+  family: L15
+  title: Human 在 agent 執行期間的輸入會累積在 deferred buffer，agent 完成後 flush 到 UART
+  contract: Human 在 agent 執行期間的輸入會累積在 deferred buffer，agent 完成後 flush 到 UART
+  invariants: [no_stale_context_replay]
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: true
+  prerequisites: [deferred_buffer]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-02]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: hk-04-minicom-exit-cleanup
+  suite: func-test
+  source_ref: func-test/cases/hk-04-minicom-exit-cleanup.yaml
+  family: L15
+  title: Console detach 正確釋放 interactive ownership，agent 不再被阻擋
+  contract: Console detach 正確釋放 interactive ownership，agent 不再被阻擋
+  invariants: []
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: true
+  prerequisites: [raw_line_mode]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: rc-01-interactive-mode-switch
+  suite: func-test
+  source_ref: func-test/cases/rc-01-interactive-mode-switch.yaml
+  family: L15
+  title: Interactive lease 過期/關閉後，驗證 console 輸入正確回到 line buffering 模式
+  contract: Interactive lease 過期/關閉後，驗證 console 輸入正確回到 line buffering 模式
+  invariants: []
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: true
+  prerequisites: [raw_line_mode, suspend_resume]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: sm-01-attach-to-ready
+  suite: func-test
+  source_ref: func-test/cases/sm-01-attach-to-ready.yaml
+  family: L15
+  title: 驗證正常路徑：DETACHED → ATTACHING → READY，並能成功執行命令
+  contract: 驗證正常路徑：DETACHED → ATTACHING → READY，並能成功執行命令
+  invariants: []
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [shell_login_min]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: sm-04-device-unplug
+  suite: func-test
+  source_ref: func-test/cases/sm-04-device-unplug.yaml
+  family: L15
+  title: READY 狀態下裝置拔除，驗證 session 轉為 DETACHED
+  contract: READY 狀態下裝置拔除，驗證 session 轉為 DETACHED
+  invariants: [no_reopen_before_handoff]
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: Windows 端點無 by-id link（`by_id_link:false`），拔除需實體或 PnP（L2）
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [drain_release]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: l15-context-switch-deferred-input
+  suite: l15-scenario
+  source_ref: func-test/scenarios/l15-context-switch-deferred-input.yaml
+  family: L15
+  title: 上下文切換（Recovery、Release、Lease）後未完成 deferred 輸入被清除而不重播（§15.7.1，BC-02）
+  contract: 上下文切換（Recovery、Release、Lease）後未完成 deferred 輸入被清除而不重播（§15.7.1，BC-02）
+  invariants: [no_stale_context_replay]
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: true
+  prerequisites: [arbiter, console_pty, suspend_resume, deferred_buffer]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-02]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
+  implemented_by: 03-stage0-test-infra.md
+  cross_slice_reason: null
+- case_id: l15-delayed-reply
+  suite: l15-scenario
+  source_ref: func-test/scenarios/l15-delayed-reply.yaml
+  family: L15
+  title: 命令延遲回覆逾時處理，命令狀態結束於 error 且不重複發送（§15.7.1）
+  contract: 命令延遲回覆逾時處理，命令狀態結束於 error 且不重複發送（§15.7.1）
+  invariants: [no_auto_resend]
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [arbiter]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-03]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
+  implemented_by: 03-stage0-test-infra.md
+  cross_slice_reason: null
+- case_id: l15-dut-reboot-port-alive
+  suite: l15-scenario
+  source_ref: func-test/scenarios/l15-dut-reboot-port-alive.yaml
+  family: L15
+  title: DUT 重開機但序列埠保持連線，舊上下文未完成輸入不在重開後重播（§15.7.1）
+  contract: DUT 重開機但序列埠保持連線，舊上下文未完成輸入不在重開後重播（§15.7.1）
+  invariants: [no_stale_context_replay]
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.3'
+  stage0_required: true
+  prerequisites: [arbiter, console_pty, quiet_reconfirm]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-02]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
+  implemented_by: 03-stage0-test-infra.md
+  cross_slice_reason: null
+- case_id: l15-dut-silent
+  suite: l15-scenario
+  source_ref: func-test/scenarios/l15-dut-silent.yaml
+  family: L15
+  title: DUT 靜默不回覆時逾時處理，比較器判定位元組一致（§15.7.1）
+  contract: DUT 靜默不回覆時逾時處理，比較器判定位元組一致（§15.7.1）
+  invariants: [insufficient_evidence_not_pass]
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: true
+  prerequisites: [arbiter, recovery_min]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
+  implemented_by: 03-stage0-test-infra.md
+  cross_slice_reason: null
+- case_id: l15-exclusive-open
+  suite: l15-scenario
+  source_ref: func-test/scenarios/l15-exclusive-open.yaml
+  family: L15
+  title: 端點被外部獨占持有時 attach 回 DEVICE_STILL_HELD 且零 TX，釋放後成功取得（§15.7.1）
+  contract: 端點被外部獨占持有時 attach 回 DEVICE_STILL_HELD 且零 TX，釋放後成功取得（§15.7.1）
+  invariants: [no_reopen_before_handoff, zero_tx_on_reject]
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: POSIX flock／TIOCEXCL 語意；Windows 由 win-com-open-exclusive 承接
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [exclusive_open, drain_release]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-04, SC-05]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
+  implemented_by: 03-stage0-test-infra.md
+  cross_slice_reason: null
+- case_id: l15-half-prompt
+  suite: l15-scenario
+  source_ref: func-test/scenarios/l15-half-prompt.yaml
+  family: L15
+  title: 提示符分段輸出時命令狀態未完成，後半出現後完成（§15.7.1）
+  contract: 提示符分段輸出時命令狀態未完成，後半出現後完成（§15.7.1）
+  invariants: []
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [arbiter, shell_login_min]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
+  implemented_by: 03-stage0-test-infra.md
+  cross_slice_reason: null
+- case_id: l15-multi-source-contention-cli
+  suite: l15-scenario
+  source_ref: func-test/scenarios/l15-multi-source-contention-cli.yaml
+  family: L15
+  title: 多來源 CLI 同時競爭提交，TX 輸出連續且被拒命令零 TX（§15.7.1）
+  contract: 多來源 CLI 同時競爭提交，TX 輸出連續且被拒命令零 TX（§15.7.1）
+  invariants: [no_forbidden_interleave, zero_tx_on_reject]
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [arbiter, wal_basic]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-07]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
+  implemented_by: 03-stage0-test-infra.md
+  cross_slice_reason: null
+- case_id: l15-multi-source-contention-console
+  suite: l15-scenario
+  source_ref: func-test/scenarios/l15-multi-source-contention-console.yaml
+  family: L15
+  title: CLI 與 console 混合競爭時，命令與輸入不互相切斷且保持連續（§15.7.1）
+  contract: CLI 與 console 混合競爭時，命令與輸入不互相切斷且保持連續（§15.7.1）
+  invariants: [no_forbidden_interleave]
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: true
+  prerequisites: [arbiter, console_pty, raw_line_mode]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
+  implemented_by: 03-stage0-test-infra.md
+  cross_slice_reason: null
+- case_id: l15-reboot-min-guard
+  suite: l15-scenario
+  source_ref: func-test/scenarios/l15-reboot-min-guard.yaml
+  family: L15
+  title: 開機 Quiet 窗口內拒絕命令且零 TX，窗口結束後恢復 READY（§11.6 Slice 2.1）
+  contract: 開機 Quiet 窗口內拒絕命令且零 TX，窗口結束後恢復 READY（§11.6 Slice 2.1）
+  invariants: [zero_tx_on_reject, no_auto_resend]
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [arbiter, quiet_gate_min]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
+  implemented_by: 03-stage0-test-infra.md
+  cross_slice_reason: null
+- case_id: l15-reject-zero-tx
+  suite: l15-scenario
+  source_ref: func-test/scenarios/l15-reject-zero-tx.yaml
+  family: L15
+  title: 含換行或超長命令被拒時，外部 serial_read 與 WAL TX 皆為零（§11.3 不變量 1）
+  contract: 含換行或超長命令被拒時，外部 serial_read 與 WAL TX 皆為零（§11.3 不變量 1）
+  invariants: [zero_tx_on_reject, insufficient_evidence_not_pass]
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [arbiter]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
+  implemented_by: 03-stage0-test-infra.md
+  cross_slice_reason: null
+- case_id: l15-release-inflight
+  suite: l15-scenario
+  source_ref: func-test/scenarios/l15-release-inflight.yaml
+  family: L15
+  title: 釋放端點時在途命令終態明確且不自動重送，釋放後端點已關閉
+  contract: 釋放端點時在途命令終態明確且不自動重送，釋放後端點已關閉
+  invariants: [no_reopen_before_handoff, no_auto_resend, insufficient_evidence_not_pass]
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: assert_peer_closed 需 peer_state；Windows 由 win-com-cancel-close 承接
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [drain_release, arbiter]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-03, SC-04]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
+  implemented_by: 03-stage0-test-infra.md
+  cross_slice_reason: null
+- case_id: l15-slow-reader-backpressure
+  suite: l15-scenario
+  source_ref: func-test/scenarios/l15-slow-reader-backpressure.yaml
+  family: L15
+  title: DUT 停讀時寫入出現背壓且緩衝有界，恢復後命令連續且無自動重送（§15.7.1）
+  contract: DUT 停讀時寫入出現背壓且緩衝有界，恢復後命令連續且無自動重送（§15.7.1）
+  invariants: [no_forbidden_interleave, no_auto_resend]
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [arbiter]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
+  implemented_by: 03-stage0-test-infra.md
+  cross_slice_reason: null
+- case_id: l15-stale-event-delay
+  suite: l15-scenario
+  source_ref: func-test/scenarios/l15-stale-event-delay.yaml
+  family: L15
+  title: 延遲回覆在 session recover 後到達，舊命令排隊不重播且 WAL 保留晚到輸出（§15.7.1）
+  contract: 延遲回覆在 session recover 後到達，舊命令排隊不重播且 WAL 保留晚到輸出（§15.7.1）
+  invariants: [no_stale_context_replay, insufficient_evidence_not_pass]
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [arbiter, recovery_min, wal_basic]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
+  implemented_by: 03-stage0-test-infra.md
+  cross_slice_reason: null
+- case_id: l15-transport-disconnect
+  suite: l15-scenario
+  source_ref: func-test/scenarios/l15-transport-disconnect.yaml
+  family: L15
+  title: 傳輸層斷線重連，斷線期間命令終態明確且重連後無自動重送（§15.7.1）
+  contract: 傳輸層斷線重連，斷線期間命令終態明確且重連後無自動重送（§15.7.1）
+  invariants: [no_auto_resend, insufficient_evidence_not_pass]
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: com0com 只有 peer close，未經實測不得計 transport_disconnect（§15.8.3）
+  capabilities: [posix_pty, process_rpc, transport_disconnect]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [arbiter, recovery_min]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-03, SC-04]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
+  implemented_by: 03-stage0-test-infra.md
+  cross_slice_reason: null
+- case_id: l15-wal-interference
+  suite: l15-scenario
+  source_ref: func-test/scenarios/l15-wal-interference.yaml
+  family: L15
+  title: 外部介入 WAL（輪替、外部 unlink、讀取鎖定與 reset）時 daemon 恢復與記錄（§15.7.1）
+  contract: 外部介入 WAL（輪替、外部 unlink、讀取鎖定與 reset）時 daemon 恢復與記錄（§15.7.1）
+  invariants: [insufficient_evidence_not_pass]
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [wal_basic]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-01]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
+  implemented_by: 03-stage0-test-infra.md
+  cross_slice_reason: null
+- case_id: win-com-open-exclusive
+  suite: windows-native
+  source_ref: func-test/scenarios/win-com-open-exclusive.yaml
+  family: WIN
+  title: Windows COM 端點獨占開啟：daemon 持有時外部無法開啟，release 後外部可開啟，外部持有時 attach 被拒且零 TX
+  contract: daemon 持有 COM 時外部獨占開啟失敗；release 後外部可立即開啟；外部持有時 attach 回拒絕且零 TX（BC-04、SC-05）
+  invariants: [no_reopen_before_handoff, zero_tx_on_reject]
+  layer: L1.5
+  platforms: [windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [windows_com, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [exclusive_open]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-04, SC-05, SC-19]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
+  implemented_by: 03-stage0-test-infra.md（`func-test/scenarios/win-com-open-exclusive.yaml`，Task 11）
+  cross_slice_reason: null
+- case_id: win-com-txrx-bridge
+  suite: windows-native
+  source_ref: func-test/scenarios/win-com-txrx-bridge.yaml
+  family: WIN
+  title: Windows 原生 COM 雙向 TX/RX 傳輸與 console 輸入，比較器 full PASS
+  contract: 原生 COM 雙向傳輸位元組連續無交錯，比較器判定 full PASS（SC-19）
+  invariants: [no_forbidden_interleave, insufficient_evidence_not_pass]
+  layer: L1.5
+  platforms: [windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [windows_com, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [arbiter]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-19]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
+  implemented_by: 03-stage0-test-infra.md（`func-test/scenarios/win-com-txrx-bridge.yaml`）
+  cross_slice_reason: null
+- case_id: win-com-cancel-close
+  suite: windows-native
+  source_ref: func-test/scenarios/win-com-cancel-close.yaml
+  family: WIN
+  title: Windows COM 命令取消與釋放：取消後命令終態明確，釋放後外部可立即獨占開啟
+  contract: 取消後命令終態明確且不自動重送；釋放後外部可立即獨占開啟（BC-03、SC-04）
+  invariants: [no_reopen_before_handoff, no_auto_resend]
+  layer: L1.5
+  platforms: [windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [windows_com, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [drain_release]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-03, SC-04]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
+  implemented_by: 03-stage0-test-infra.md（`func-test/scenarios/win-com-cancel-close.yaml`）
+  cross_slice_reason: null
+- case_id: win-wal-av-rotate
+  suite: windows-native
+  source_ref: docs/rust-refactor/plans/02-stage0-python-bc.md
+  family: WIN
+  title: 防毒／索引服務持有 WAL 檔時的 rotate 行為（Spike 3）
+  contract: EDR 或索引服務短暫持有 WAL 檔時，輪替行為符合 BC-01 有界處置，不得靜默丟記錄
+  invariants: []
+  layer: L1.5
+  platforms: [windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [windows_com, endpoint_av]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [wal_basic]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-01]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [win-wal-av-rotate.json]
+  implemented_by: 02-stage0-python-bc.md（Spike 3）
+  cross_slice_reason: null
+- case_id: win-wal-av-unlink
+  suite: windows-native
+  source_ref: docs/rust-refactor/plans/02-stage0-python-bc.md
+  family: WIN
+  title: 防毒／索引服務期間外部 unlink WAL 檔的重建與 META 缺口記錄（Spike 3）
+  contract: 外部 unlink WAL 後，重建成功須先寫 META 缺口記錄（BC-01）
+  invariants: []
+  layer: L1.5
+  platforms: [windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [windows_com, endpoint_av]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [wal_basic]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-01]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [win-wal-av-unlink.json]
+  implemented_by: 02-stage0-python-bc.md
+  cross_slice_reason: null
+- case_id: win-wal-av-reader-handle
+  suite: windows-native
+  source_ref: docs/rust-refactor/plans/02-stage0-python-bc.md
+  family: WIN
+  title: 外部讀取者持有 WAL handle 時的寫入與 share-delete 行為（Spike 3）
+  contract: 外部讀取者持有 WAL handle 時，daemon 寫入與 share-delete 相容性符合 BC-01
+  invariants: []
+  layer: L1.5
+  platforms: [windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [windows_com, endpoint_av]
+  cli_stage: 1A
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [wal_basic]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-01]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [win-wal-av-reader-handle.json]
+  implemented_by: 02-stage0-python-bc.md
+  cross_slice_reason: null
+- case_id: win-wal-f12-progress
+  suite: windows-native
+  source_ref: docs/rust-refactor/plans/02-stage0-python-bc.md
+  family: WIN
+  title: F12 WAL 進度 oracle 於防毒掃描期間的判定
+  contract: 防毒掃描期間 F12 WAL 進度 oracle 判定正確（BC-01）
+  invariants: []
+  layer: L2
+  platforms: [windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [physical_uart, endpoint_av]
+  cli_stage: 1B
+  daemon_slice: '2.1'
+  stage0_required: true
+  prerequisites: [wal_basic]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-01]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: 02-stage0-python-bc.md
+  cross_slice_reason: null
+- case_id: win-task-logon-trigger
+  suite: windows-native
+  source_ref: docs/rust-refactor/plans/05-stage1b-rust-cli-mgmt.md
+  family: WIN
+  title: Logon 觸發的 Task Scheduler 工作啟動 daemon（Spike 2）
+  contract: 使用者登入觸發的排程工作正確啟動 daemon（SC-24）
+  invariants: []
+  layer: L3
+  platforms: [windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [supervisor_runtime, interactive_desktop]
+  cli_stage: 1B
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [supervision]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-24]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: 05-stage1b-rust-cli-mgmt.md（Spike 2）
+  cross_slice_reason: null
+- case_id: win-task-single-instance
+  suite: windows-native
+  source_ref: docs/rust-refactor/plans/05-stage1b-rust-cli-mgmt.md
+  family: WIN
+  title: Task Scheduler 工作單一實例保證
+  contract: 同一排程工作不會同時產生兩個 daemon 實例（SC-24）
+  invariants: []
+  layer: L3
+  platforms: [windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [supervisor_runtime]
+  cli_stage: 1B
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [supervision]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-24]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: 05-stage1b-rust-cli-mgmt.md
+  cross_slice_reason: null
+- case_id: win-task-restart-on-failure
+  suite: windows-native
+  source_ref: docs/rust-refactor/plans/05-stage1b-rust-cli-mgmt.md
+  family: WIN
+  title: Task Scheduler 工作失敗後的自動重啟
+  contract: daemon 失敗後排程工作依設定自動重啟（SC-24）
+  invariants: []
+  layer: L3
+  platforms: [windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [supervisor_runtime]
+  cli_stage: 1B
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [supervision]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-24]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: 05-stage1b-rust-cli-mgmt.md
+  cross_slice_reason: null
+- case_id: win-task-72h
+  suite: windows-native
+  source_ref: docs/rust-refactor/plans/05-stage1b-rust-cli-mgmt.md
+  family: WIN
+  title: Task Scheduler 工作 72 小時長跑監管
+  contract: 排程監管下 daemon 連續 72 小時維持可用（SC-24）
+  invariants: []
+  layer: L3
+  platforms: [windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [supervisor_runtime, longrun_bench]
+  cli_stage: 1B
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [supervision]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-24]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: 05-stage1b-rust-cli-mgmt.md
+  cross_slice_reason: null
+- case_id: win-remote-native-l1
+  suite: windows-native
+  source_ref: docs/rust-refactor/plans/02-stage0-python-bc.md
+  family: WIN
+  title: Windows 原生 remote CLI 的 L1 測試（不再回 REMOTE_NOT_SUPPORTED）
+  contract: Windows 原生 remote -R／-L 不回 REMOTE_NOT_SUPPORTED，並以非阻塞轉接執行（BC-05、SC-21、SC-27）
+  invariants: []
+  layer: L1
+  platforms: [windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [windows_native, process_rpc]
+  cli_stage: 1B
+  daemon_slice: null
+  stage0_required: true
+  prerequisites: [remote_cli]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-05, SC-21, SC-27]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: 02-stage0-python-bc.md（T14 `tests/test_stage0_remote_windows.py` 經 `scripts/stage0/win-pytest.sh` 原生執行）
+  cross_slice_reason: null
+- case_id: win-remote-openssh-3topo
+  suite: windows-native
+  source_ref: docs/rust-refactor/plans/02-stage0-python-bc.md
+  family: WIN
+  title: Win32-OpenSSH 對真實 relay 的既有三種拓樸
+  contract: Windows 原生 remote 在真實 relay 上維持既有三種拓樸行為（BC-05）
+  invariants: []
+  layer: L3
+  platforms: [windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [windows_native, remote_capability]
+  cli_stage: 1B
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: [remote_cli]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-05]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: 02-stage0-python-bc.md（T14 BLOCKED-OWNER：Win32-OpenSSH 對真實 relay 的既有三拓樸）
+  cross_slice_reason: null
+- case_id: p2-1-mcu-flash-manual
+  suite: manual-procedure
+  source_ref: realhw/procedures/p2-1-mcu-flash.md
+  family: MANUAL
+  title: P2-1 MCU 韌體升級（/dev/ttyMCU）實機燒錄與 session 恢復
+  contract: ocp-mcu-upgrade 燒錄回 Return error code 0x0；燒後 session 自動恢復 ATTACHED；daemon PID 不變；其他 COM 狀態不變
+  invariants: []
+  layer: manual
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: '`/dev/ttyMCU` PTY-bridge 為 POSIX-only；Windows 燒錄走 #54 device release'
+  capabilities: [physical_uart, mcu_line]
+  cli_stage: 1B
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [mcu_flash]
+  necessity: required
+  issues: ['#55']
+  behavior_changes: []
+  destructive: true
+  expected: PASS
+  sentinel: null
+  evidence: [flash.log, procedure-checklist.md, daemon-status-before.json, daemon-status-after.json]
+  implemented_by: realhw/procedures/p2-1-mcu-flash.md
+  cross_slice_reason: null
+  procedure:
+    path: realhw/procedures/p2-1-mcu-flash.md
+    revision: 6e9b7a331256b13833e479683f1c1a5db4d248e2
+    entry: 手動，依下方步驟逐步執行
+    owner: 擁有者（實機）
+    counted_in: none

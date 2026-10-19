@@ -1,0 +1,459 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serialwrap.local/schemas/acceptance-cases.schema.json",
+  "title": "Stage 0 案例承接清單（tests/acceptance/cases.yaml）",
+  "description": "承接清單欄位的單一權威（P2-T12）。下游切片新增案例一律以本 schema 欄位登記；只增不改，列舉擴充需獨立審閱。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "revision",
+    "spec",
+    "invariant_ids",
+    "features",
+    "cases"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "revision": {
+      "type": "string",
+      "minLength": 1
+    },
+    "spec": {
+      "type": "string",
+      "minLength": 1
+    },
+    "invariant_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "zero_tx_on_reject",
+          "no_forbidden_interleave",
+          "no_stale_context_replay",
+          "no_reopen_before_handoff",
+          "no_auto_resend",
+          "insufficient_evidence_not_pass"
+        ]
+      },
+      "minItems": 6,
+      "maxItems": 6
+    },
+    "features": {
+      "type": "object",
+      "description": "前置功能 → 最早可用切片（用於檢查跨切片依賴）。remote_cli 為 CLI 階段而非切片，值為 1B。",
+      "additionalProperties": {
+        "enum": [
+          "2.1",
+          "2.2",
+          "2.3",
+          "2.4",
+          "1B"
+        ]
+      }
+    },
+    "cases": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/case"
+      }
+    }
+  },
+  "$defs": {
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "case_id",
+        "suite",
+        "source_ref",
+        "family",
+        "title",
+        "contract",
+        "invariants",
+        "layer",
+        "platforms",
+        "windows_status",
+        "windows_gap_reason",
+        "capabilities",
+        "cli_stage",
+        "daemon_slice",
+        "stage0_required",
+        "prerequisites",
+        "necessity",
+        "issues",
+        "behavior_changes",
+        "destructive",
+        "expected",
+        "sentinel",
+        "evidence",
+        "implemented_by",
+        "cross_slice_reason"
+      ],
+      "properties": {
+        "case_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$"
+        },
+        "suite": {
+          "enum": [
+            "regression",
+            "realhw",
+            "func-test",
+            "l15-scenario",
+            "windows-native",
+            "manual-procedure"
+          ]
+        },
+        "source_ref": {
+          "type": "string",
+          "minLength": 1
+        },
+        "family": {
+          "enum": [
+            "F1",
+            "F2",
+            "F3",
+            "F4",
+            "F5",
+            "F6",
+            "F7",
+            "F8",
+            "F9",
+            "F10",
+            "F11",
+            "F12",
+            "P0",
+            "P1",
+            "remote",
+            "longrun",
+            "L15",
+            "WIN",
+            "MANUAL"
+          ]
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "contract": {
+          "type": "string",
+          "minLength": 1
+        },
+        "invariants": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "zero_tx_on_reject",
+              "no_forbidden_interleave",
+              "no_stale_context_replay",
+              "no_reopen_before_handoff",
+              "no_auto_resend",
+              "insufficient_evidence_not_pass"
+            ]
+          }
+        },
+        "layer": {
+          "enum": [
+            "L1",
+            "L1.5",
+            "L2",
+            "L3",
+            "manual"
+          ]
+        },
+        "platforms": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "linux",
+              "windows"
+            ]
+          }
+        },
+        "windows_status": {
+          "enum": [
+            "native",
+            "ported",
+            "gap"
+          ]
+        },
+        "windows_gap_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "capabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "platform_capabilities": {
+          "type": "object",
+          "description": "選填（P2-T12 計畫外欄位，須於 PR 登記）：各平台實際需要的能力，取代 capabilities 中 posix_pty 等 Linux 專用能力。目前只用於 windows；windows_com 守衛（test_windows_com_not_satisfied_by_memory）同時檢查 capabilities 與本欄位。",
+          "additionalProperties": false,
+          "properties": {
+            "windows": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "cli_stage": {
+          "enum": [
+            "1A",
+            "1B",
+            null
+          ]
+        },
+        "daemon_slice": {
+          "enum": [
+            "2.1",
+            "2.2",
+            "2.3",
+            "2.4",
+            null
+          ]
+        },
+        "stage0_required": {
+          "type": "boolean"
+        },
+        "prerequisites": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "necessity": {
+          "enum": [
+            "required",
+            "conditional"
+          ]
+        },
+        "issues": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^#[0-9]+$"
+          }
+        },
+        "pending_issue": {
+          "type": "boolean",
+          "default": false,
+          "description": "true 表示擁有者尚未開立 issue 號（P1 T21 規則）；與 issues 互斥，不得以假號補位。"
+        },
+        "behavior_changes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^(BC|SC|DF)-[0-9]{2}$"
+          }
+        },
+        "destructive": {
+          "type": "boolean"
+        },
+        "expected": {
+          "enum": [
+            "PASS",
+            "XFAIL"
+          ]
+        },
+        "sentinel": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "issue",
+                "signature",
+                "expires"
+              ],
+              "properties": {
+                "issue": {
+                  "type": "string",
+                  "pattern": "^#[0-9]+$"
+                },
+                "signature": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "expires": {
+                  "type": "string",
+                  "format": "date"
+                }
+              }
+            }
+          ]
+        },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "implemented_by": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cross_slice_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "procedure": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "revision",
+            "entry",
+            "owner",
+            "counted_in"
+          ],
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "revision": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$"
+            },
+            "entry": {
+              "type": "string",
+              "minLength": 1
+            },
+            "owner": {
+              "type": "string",
+              "minLength": 1
+            },
+            "counted_in": {
+              "const": "none"
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "description": "expected 與 sentinel 綁定：XFAIL 必有哨兵（§11.4），PASS 不得帶哨兵。",
+          "if": {
+            "required": [
+              "expected"
+            ],
+            "properties": {
+              "expected": {
+                "const": "XFAIL"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "sentinel"
+            ],
+            "properties": {
+              "sentinel": {
+                "type": "object"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "sentinel": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "description": "windows_status 與 windows_gap_reason 綁定：gap 必填理由，native／ported 必為 null。",
+          "if": {
+            "required": [
+              "windows_status"
+            ],
+            "properties": {
+              "windows_status": {
+                "const": "gap"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "windows_gap_reason": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "windows_gap_reason": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "description": "pending_issue 與 issues 互斥（P1 T21 規則，不得以假號補位）。",
+          "if": {
+            "required": [
+              "pending_issue"
+            ],
+            "properties": {
+              "pending_issue": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "issues": {
+                "maxItems": 0
+              }
+            }
+          }
+        },
+        {
+          "description": "手動程序必須登記 procedure 區塊（§11.6：counted_in 恆為 none）。",
+          "if": {
+            "required": [
+              "suite"
+            ],
+            "properties": {
+              "suite": {
+                "const": "manual-procedure"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "procedure"
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

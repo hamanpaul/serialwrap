@@ -2,6 +2,7 @@
 """func-test bridge 模式煙霧測試（POSIX PTY、DUT 模擬器與比較器端到端）。"""
 from __future__ import annotations
 
+import hashlib
 import json
 import pathlib
 import subprocess
@@ -116,10 +117,13 @@ def test_bridge_smoke_sm01(tmp_path: pathlib.Path) -> None:
     manifest_path = case_dir / "manifest.json"
     assert manifest_path.exists(), f"未找到 manifest.json: {manifest_path}"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert manifest["cases_yaml_sha256"] is None
+    # P2-T12 後承接清單已存在且與凍結鎖一致：manifest 須記錄其實際摘要（原斷言寫死 Task 10 前的 None）
+    cases_yaml = REPO_ROOT / "tests" / "acceptance" / "cases.yaml"
+    assert manifest["cases_yaml_sha256"] == hashlib.sha256(cases_yaml.read_bytes()).hexdigest()
     assert manifest["dut"]["seed"] == 0
     report = json.loads((report_dir / "func-test-report.json").read_text(encoding="utf-8"))
-    assert report["results"][0]["gate_eligible"] is False
+    # 承接清單與凍結鎖一致時 gate 具資格（原斷言寫死 Task 10 前的 False；反向案例見 test_acceptance_gate_requires_consistent_lock）
+    assert report["results"][0]["gate_eligible"] is True
     schema_path = REPO_ROOT / "tests" / "acceptance" / "l15_manifest.schema.json"
     if schema_path.exists():
         import jsonschema
@@ -159,3 +163,39 @@ def test_bridge_smoke_sm04_until_op(tmp_path: pathlib.Path) -> None:
     comp_data = json.loads(comp_path.read_text(encoding="utf-8"))
     assert comp_data.get("window", {}).get("until_op") == "s002-inject_device_event"
     assert comp_data.get("verdict") == "PASS"
+
+
+@pytest.mark.process_rpc
+def test_acceptance_gate_requires_consistent_lock(tmp_path: pathlib.Path) -> None:
+    """承接清單與凍結鎖不一致時，runner 的 _acceptance_cases_info 必須判定 gate 不具資格（§11.3）。"""
+    code = (
+        "import json, pathlib, sys, types\n"
+        f"sys.path.insert(0, {str(FUNC_TEST_DIR)!r})\n"
+        "import runner\n"
+        f"src = pathlib.Path({str(REPO_ROOT / 'tests' / 'acceptance')!r})\n"
+        "def build(tamper):\n"
+        "    root = pathlib.Path(sys.argv[1]) / ('tampered' if tamper else 'clean')\n"
+        "    acc = root / 'tests' / 'acceptance'\n"
+        "    acc.mkdir(parents=True, exist_ok=True)\n"
+        "    (acc / 'cases.yaml').write_bytes((src / 'cases.yaml').read_bytes())\n"
+        "    (acc / 'regen_lock.py').write_bytes((src / 'regen_lock.py').read_bytes())\n"
+        "    (acc / 'cases.counts.json').write_bytes((src / 'cases.counts.json').read_bytes())\n"
+        "    lock = json.loads((src / 'cases.lock.json').read_text(encoding='utf-8'))\n"
+        "    if tamper:\n"
+        "        lock['sets']['stage0'] = lock['sets']['stage0'][1:]\n"
+        "    (acc / 'cases.lock.json').write_text(json.dumps(lock), encoding='utf-8')\n"
+        "    runner.ROOT_DIR = root\n"
+        "    stub = types.SimpleNamespace(_sha256=lambda path: 'stub')\n"
+        "    return runner.TestRunner._acceptance_cases_info(stub)[1]\n"
+        "print(json.dumps({'clean': build(False), 'tampered': build(True)}))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code, str(tmp_path)],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    assert proc.returncode == 0, f"gate probe failed:\nstdout: {proc.stdout}\nstderr: {proc.stderr}"
+    result = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert result == {"clean": True, "tampered": False}, result

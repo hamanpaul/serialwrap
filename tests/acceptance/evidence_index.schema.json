@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serialwrap.local/schemas/stage-evidence-index.schema.json",
+  "title": "Stage 出口證據索引（§15.12）",
+  "description": "stage0_evidence_index.yaml 與後續 stage{1a,1b,2,3}_evidence_index.yaml 共用的 schema（P2-T12）。present 項必須有 artifact_path 與 sha256；單案例列（case_ids 非空）必須有 platform 與 evidence（P2-T12 審查修正）。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "stage",
+    "items"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "stage": {
+      "type": "string",
+      "pattern": "^[0-9][a-z]?$"
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/item"
+      }
+    }
+  },
+  "$defs": {
+    "item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "requirement",
+        "spec_ref",
+        "case_ids",
+        "artifact_path",
+        "sha256",
+        "status",
+        "owner"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+        },
+        "requirement": {
+          "type": "string",
+          "minLength": 1
+        },
+        "spec_ref": {
+          "type": "string",
+          "minLength": 1
+        },
+        "case_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]*$"
+          }
+        },
+        "artifact_path": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "description": "相對於 --root 的路徑；不得為絕對路徑或含 ..。"
+        },
+        "sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "status": {
+          "enum": [
+            "present",
+            "missing",
+            "blocked_owner"
+          ]
+        },
+        "owner": {
+          "type": "string",
+          "minLength": 1
+        },
+        "platform": {
+          "enum": [
+            "linux",
+            "windows"
+          ],
+          "description": "適用平台。案例列必填；非案例列（bridge、L1 判定、基線、OD-09、B 項）可省略（多平台或無平台）。"
+        },
+        "evidence": {
+          "type": "string",
+          "minLength": 1,
+          "description": "對應 cases.yaml 該案例 evidence 清單中的一項（目錄以結尾 / 表示，例如 wal/）；單案例列必填。"
+        }
+      },
+      "if": {
+        "properties": {
+          "status": {
+            "const": "present"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "artifact_path",
+          "sha256"
+        ],
+        "properties": {
+          "artifact_path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "case_ids"
+            ],
+            "properties": {
+              "case_ids": {
+                "minItems": 1
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "platform",
+              "evidence"
+            ]
+          }
+        }
+      ]
+    }
+  }
+}
