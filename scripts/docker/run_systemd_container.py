@@ -16,7 +16,7 @@ ROOT = pathlib.Path("/tmp/sw-t17")
 def _stderr_probe(mode: str) -> tuple[bool, str]:
     token = "OD15_INVALID_DAEMON_ARGUMENT"
     if mode == "systemd-user":
-        unit_dir = pathlib.Path("/home/swtest/.config/systemd/user")
+        unit_dir = systemd_container.USER_HOME / ".config" / "systemd" / "user"
     else:
         unit_dir = pathlib.Path("/etc/systemd/system")
     unit_path = unit_dir / "serialwrap-stderr-probe.service"
