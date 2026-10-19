@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 from datetime import datetime, timezone
 import json
+import re
 from typing import Any
 import zlib
 
@@ -17,6 +18,24 @@ OBSERVATIONS = {
 }
 META_OBSERVATION = "bridge_meta"
 BRIDGE_SOURCE = "bridge:external"
+META_EVENTS = frozenset(
+    {
+        "bridge_start",
+        "bridge_stop",
+        "peer_state",
+        "endpoint_generation",
+        "dut_generation",
+        "dut_stdout_eof",
+        "dut_exited",
+        "write_uncertain",
+        "io_error",
+        "mark",
+        "fault",
+        "evidence_failure",
+        "quiesce",
+        "checkpoint",
+    }
+)
 
 
 def crc32_hex(payload: bytes) -> str:
@@ -36,9 +55,14 @@ def wall_ts_now() -> str:
 
 def _check_common(*, seq: int, endpoint_generation: int, dut_generation: int) -> None:
     """驗證 seq 與兩個 generation 皆 ≥1（§15.6.2）。"""
-    if seq < 1:
+    if type(seq) is not int or seq < 1:
         raise ValueError(f"seq 必須 ≥1：{seq}")
-    if endpoint_generation < 1 or dut_generation < 1:
+    if (
+        type(endpoint_generation) is not int
+        or type(dut_generation) is not int
+        or endpoint_generation < 1
+        or dut_generation < 1
+    ):
         raise ValueError(
             f"generation 必須 ≥1：endpoint={endpoint_generation} dut={dut_generation}"
         )
@@ -75,6 +99,10 @@ def make_data_record(
     """建立資料傳輸紀錄（DIR 為 TX 或 RX）；未知 observation 一律 ValueError，不猜方向。"""
     if observation not in OBSERVATIONS:
         raise ValueError(f"未知 observation：{observation!r}")
+    if not isinstance(payload, bytes) or not payload:
+        raise ValueError("payload 必須是非空 bytes")
+    if type(stream_offset) is not int or stream_offset < 0:
+        raise ValueError(f"stream_offset 必須是非負整數：{stream_offset!r}")
     _check_common(seq=seq, endpoint_generation=endpoint_generation, dut_generation=dut_generation)
     direction = OBSERVATIONS[observation]
     return {
@@ -115,10 +143,37 @@ def make_meta_record(
     meta: dict[str, Any],
     loss_flag: bool = False,
 ) -> dict[str, Any]:
-    """建立中繼事件紀錄（DIR 為 META）；`meta["event"]` 必須為非空字串。"""
+    """建立中繼事件紀錄（DIR 為 META）；事件必須符合 bridge.v1 值域。"""
     event = meta.get("event") if isinstance(meta, dict) else None
-    if not isinstance(event, str) or not event:
-        raise ValueError(f"META 紀錄缺少 meta.event：{meta!r}")
+    if not isinstance(event, str) or event not in META_EVENTS:
+        raise ValueError(f"META 紀錄含未知 meta.event：{event!r}")
+    if type(loss_flag) is not bool:
+        raise ValueError(f"loss_flag 必須是 bool：{loss_flag!r}")
+    if event == "write_uncertain":
+        observation = meta.get("observation")
+        offset_start = meta.get("offset_start")
+        requested_len = meta.get("requested_len")
+        if (
+            observation not in ("dut_stdin_write", "serial_write")
+            or type(offset_start) is not int
+            or offset_start < 0
+            or type(requested_len) is not int
+            or requested_len < 1
+            or "accepted_len" not in meta
+            or meta["accepted_len"] is not None
+            or not isinstance(meta.get("error"), str)
+            or not meta["error"]
+            or loss_flag is not True
+        ):
+            raise ValueError("write_uncertain META 必須描述 loss_flag=true 的不確定寫入區間")
+    elif event == "evidence_failure":
+        code = meta.get("code")
+        if (
+            not isinstance(code, str)
+            or re.fullmatch(r"HARNESS_[A-Z0-9_]+", code) is None
+            or loss_flag is not True
+        ):
+            raise ValueError("evidence_failure META 必須含 HARNESS_* code 並設 loss_flag=true")
     _check_common(seq=seq, endpoint_generation=endpoint_generation, dut_generation=dut_generation)
     return {
         "schema_version": "bridge.v1",

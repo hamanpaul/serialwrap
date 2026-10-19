@@ -35,6 +35,8 @@ class BridgeConfig:
     barrier_quiet_ms: int = 500
     stderr_cap_bytes: int = 268_435_456
     allow_dut_exit: bool = False
+    com_driver: dict[str, Any] | None = None
+    com_driver_install_method: str | None = None
     test_overrides: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -1165,6 +1167,8 @@ class Bridge:
         except Exception as exc:
             summary = self._evidence_summary()
             self._writer_failed(exc)
+        # close() 的最後一次 fsync/close 也可能首次失敗；不得把它寫成乾淨關閉。
+        self._check_writer_failure()
         self._closed_at = self._wall_ts()
         try:
             self._write_manifest(summary)
@@ -1206,14 +1210,19 @@ class Bridge:
         )
         from uart_stdio_bridge.identity import tool_tree_sha256
 
+        transport = self.endpoint.describe()
         manifest = bridge_manifest(
             run_id=self.cfg.run_id,
             case_id=self.cfg.case_id,
             tool={"name": TOOL_NAME, "version": __version__, "tree_sha256": tool_tree_sha256()},
-            transport=self.endpoint.describe(),
+            transport=transport,
             dut=self.dut.describe(),
             evidence={"wire": wire_info},
-            platform_info=platform_info(),
+            platform_info=platform_info(
+                endpoint=transport.get("kind"),
+                com_driver=self.cfg.com_driver,
+                com_driver_install_method=self.cfg.com_driver_install_method,
+            ),
             started_at=self._started_at,
             closed_at=self._closed_at,
             closed_cleanly=self._failure is None,

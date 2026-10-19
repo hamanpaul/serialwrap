@@ -69,6 +69,10 @@ def _run_command(argv: list[str]) -> int:
     parser.add_argument("--read-chunk", type=int, default=4096)
     parser.add_argument("--write-timeout-s", type=float, default=5.0)
     parser.add_argument("--allow-dut-exit", action="store_true")
+    parser.add_argument("--com-driver-name")
+    parser.add_argument("--com-driver-version")
+    parser.add_argument("--com-driver-sha256")
+    parser.add_argument("--com-driver-install-method")
     args = parser.parse_args(argv)
 
     evidence_dir = pathlib.Path(args.evidence_dir).resolve()
@@ -278,6 +282,12 @@ def _run_command(argv: list[str]) -> int:
             write_timeout_s=args.write_timeout_s,
             stderr_cap_bytes=stderr_cap,
             allow_dut_exit=args.allow_dut_exit,
+            com_driver={
+                "name": args.com_driver_name,
+                "version": args.com_driver_version,
+                "sha256": args.com_driver_sha256,
+            },
+            com_driver_install_method=args.com_driver_install_method,
             test_overrides={
                 name: value
                 for name, value in os.environ.items()

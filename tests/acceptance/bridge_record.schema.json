@@ -48,7 +48,7 @@
     },
     "wall_ts": {
       "type": "string",
-      "minLength": 1
+      "pattern": "^\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d(\\.\\d{6})?\\+00:00$"
     },
     "clock_id": {
       "type": "string",
@@ -95,7 +95,7 @@
     },
     "payload_b64": {
       "type": "string",
-      "pattern": "^[A-Za-z0-9+/]*={0,2}$"
+      "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
     },
     "crc32": {
       "type": "string",
@@ -237,6 +237,117 @@
         "properties": {
           "dir": {
             "const": "RX"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "observation": {
+            "const": "bridge_meta"
+          },
+          "meta": {
+            "properties": {
+              "event": {
+                "const": "write_uncertain"
+              }
+            },
+            "required": [
+              "event"
+            ]
+          }
+        },
+        "required": [
+          "observation",
+          "meta"
+        ]
+      },
+      "then": {
+        "properties": {
+          "loss_flag": {
+            "const": true
+          },
+          "meta": {
+            "required": [
+              "event",
+              "observation",
+              "offset_start",
+              "requested_len",
+              "accepted_len",
+              "error"
+            ],
+            "properties": {
+              "event": {
+                "const": "write_uncertain"
+              },
+              "observation": {
+                "enum": [
+                  "dut_stdin_write",
+                  "serial_write"
+                ]
+              },
+              "offset_start": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "requested_len": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "accepted_len": {
+                "type": "null"
+              },
+              "error": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "observation": {
+            "const": "bridge_meta"
+          },
+          "meta": {
+            "properties": {
+              "event": {
+                "const": "evidence_failure"
+              }
+            },
+            "required": [
+              "event"
+            ]
+          }
+        },
+        "required": [
+          "observation",
+          "meta"
+        ]
+      },
+      "then": {
+        "properties": {
+          "loss_flag": {
+            "const": true
+          },
+          "meta": {
+            "required": [
+              "event",
+              "code"
+            ],
+            "properties": {
+              "event": {
+                "const": "evidence_failure"
+              },
+              "code": {
+                "type": "string",
+                "pattern": "^HARNESS_[A-Z0-9_]+$"
+              }
+            }
           }
         }
       }

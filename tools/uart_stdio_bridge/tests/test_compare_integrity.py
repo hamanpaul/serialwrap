@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from evidence_builder import EvidenceSet, comparator_api, wal_reader_api
+from evidence_builder import EvidenceSet, _load_compare_module, comparator_api, wal_reader_api
 
 
 pytestmark = pytest.mark.core_portable
@@ -65,3 +67,43 @@ def test_wal_archive_order(tmp_path):
     records, problems = load_wal(ev.wal_dir)
     assert problems == []
     assert [record.payload for record in records] == [b"archive-a", b"archive-b", b"current"]
+
+
+@pytest.mark.memory_only
+def test_incomplete_write_uncertain_record_is_insufficient_evidence(tmp_path):
+    load_wire = _load_compare_module("wire_reader").load_wire
+    ev = EvidenceSet.clean(tmp_path)
+    records = [json.loads(line) for line in ev.wire_path.read_text(encoding="utf-8").splitlines()]
+    last = records[-1]
+    records.append({
+        "schema_version": "bridge.v1",
+        "run_id": last["run_id"],
+        "case_id": last["case_id"],
+        "seq": last["seq"] + 1,
+        "mono_ts_ns": last["mono_ts_ns"] + 1,
+        "wall_ts": last["wall_ts"],
+        "clock_id": last["clock_id"],
+        "port_id": last["port_id"],
+        "endpoint_generation": last["endpoint_generation"],
+        "dut_generation": last["dut_generation"],
+        "dir": "META",
+        "observation": "bridge_meta",
+        "stream_offset": None,
+        "len": 0,
+        "payload_b64": "",
+        "crc32": "00000000",
+        "source": "bridge:external",
+        "cmd_id": None,
+        "loss_flag": False,
+        "meta": {"event": "write_uncertain"},
+    })
+    ev.wire_path.write_text(
+        "".join(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    manifest = json.loads(ev.manifest_path.read_text(encoding="utf-8"))
+    ev._refresh_wire_digest(manifest)
+
+    _, problems = load_wire(ev.evidence_dir)
+    codes = {problem["code"] for problem in problems}
+    assert "HARNESS_INSUFFICIENT_EVIDENCE" in codes

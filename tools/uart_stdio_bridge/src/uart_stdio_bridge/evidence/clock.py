@@ -7,8 +7,10 @@ import pathlib
 import socket
 import sys
 import time
+from functools import lru_cache
 
 
+@lru_cache(maxsize=1)
 def clock_id() -> str:
     """產生本機單調時鐘識別碼。
 

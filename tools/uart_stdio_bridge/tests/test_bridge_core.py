@@ -137,6 +137,85 @@ def test_partial_write_to_dut_records_accepted_only(tmp_path: Path):
 
 
 @pytest.mark.posix_pty
+def test_final_writer_fsync_failure_marks_bridge_unclean(tmp_path: Path):
+    import errno
+
+    from uart_stdio_bridge.bridge.core import Bridge, BridgeConfig
+    from uart_stdio_bridge.evidence.writer import EvidenceWriter
+
+    fsync_calls = {"n": 0}
+
+    def fail_final_fsync(fd):
+        fsync_calls["n"] += 1
+        if fsync_calls["n"] <= 2:
+            return None
+        raise OSError(errno.ENOSPC, "final sync failed")
+
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+    writer = EvidenceWriter(
+        evidence_dir / "wire.ndjson",
+        run_id="r1",
+        case_id="c1",
+        clock_id="clk1",
+        os_fsync=fail_final_fsync,
+    )
+    bridge = Bridge(
+        BridgeConfig(run_id="r1", case_id="c1", port_id="COM0", evidence_dir=evidence_dir),
+        FakeEndpoint(),
+        StubDutProcess(),
+        writer,
+        dut_control=None,
+    )
+    bridge.start()
+    bridge.handle_action("shutdown", {}, "shutdown")
+    assert bridge.wait() == 3
+    assert fsync_calls["n"] >= 3
+    manifest = json.loads((evidence_dir / "bridge-manifest.json").read_text(encoding="utf-8"))
+    assert manifest["failure"] == "HARNESS_DISK_FULL"
+    assert manifest["closed_cleanly"] is False
+
+
+def test_bridge_manifest_passes_endpoint_and_driver_metadata(tmp_path: Path, monkeypatch):
+    from uart_stdio_bridge.bridge.core import Bridge, BridgeConfig
+    from uart_stdio_bridge.evidence import manifest as evidence_manifest
+
+    calls = []
+    monkeypatch.setattr(
+        evidence_manifest,
+        "platform_info",
+        lambda **kwargs: calls.append(kwargs) or {"os": "Windows"},
+    )
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+    (evidence_dir / "wire.ndjson").write_bytes(b"")
+    endpoint = FakeEndpoint()
+    endpoint.describe = lambda: {"kind": "win-serial"}
+    bridge = Bridge(
+        BridgeConfig(
+            run_id="r1",
+            case_id="c1",
+            port_id="COM0",
+            evidence_dir=evidence_dir,
+            com_driver={"name": "com0com", "version": "3.0", "sha256": "a" * 64},
+            com_driver_install_method="signed-installer",
+        ),
+        endpoint,
+        StubDutProcess(),
+        writer=object(),
+        dut_control=None,
+    )
+    bridge._write_manifest({"records": 0, "bytes": 0, "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"})
+    assert calls == [{
+        "endpoint": "win-serial",
+        "com_driver": {"name": "com0com", "version": "3.0", "sha256": "a" * 64},
+        "com_driver_install_method": "signed-installer",
+    }]
+    report = json.loads((evidence_dir / "bridge-manifest.json").read_text(encoding="utf-8"))
+    assert report["platform_info"]["os"] == "Windows"
+
+
+@pytest.mark.posix_pty
 def test_dut_pipe_accepted_total_matches_received(bridge_proc):
     """真 echo DUT 帶 read-delay 時，2 MiB 寫入的各筆長度總和與實收完全一致。"""
     b = bridge_proc(extra_dut_argv=["--read-delay-ms", "50"])

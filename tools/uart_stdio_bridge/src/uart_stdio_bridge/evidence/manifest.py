@@ -22,7 +22,7 @@ def write_json_atomic(path: pathlib.Path, obj: dict[str, Any]) -> None:
     """原子化寫入 JSON 檔，POSIX 下設權限 0o600。"""
     content = json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     target_dir = path.parent
-    ensure_private_dir(target_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(dir=str(target_dir), prefix=f".{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:

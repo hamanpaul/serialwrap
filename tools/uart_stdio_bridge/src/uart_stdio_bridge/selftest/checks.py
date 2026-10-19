@@ -87,6 +87,8 @@ class SelftestContext:
     transport_mode: str
     work_dir: pathlib.Path
     seed: int = 20261015
+    com_driver: dict[str, Any] | None = None
+    com_driver_install_method: str | None = None
 
 
 # -----------------------------------------------------------------------------

@@ -51,6 +51,25 @@ CORRELATION_REQUIRED: tuple[str, ...] = (
     "settled",
 )
 
+_META_EVENTS = frozenset(
+    {
+        "bridge_start",
+        "bridge_stop",
+        "peer_state",
+        "endpoint_generation",
+        "dut_generation",
+        "dut_stdout_eof",
+        "dut_exited",
+        "write_uncertain",
+        "io_error",
+        "mark",
+        "fault",
+        "evidence_failure",
+        "quiesce",
+        "checkpoint",
+    }
+)
+
 
 def _is_hex64(s: Any) -> bool:
     return isinstance(s, str) and len(s) == 64 and all(c in "0123456789abcdef" for c in s.lower())
@@ -62,6 +81,15 @@ def _is_int(v: Any, min_val: int = 0) -> bool:
 
 def _is_hex8(s: Any) -> bool:
     return isinstance(s, str) and len(s) == 8 and all(c in "0123456789abcdef" for c in s)
+
+
+def _is_harness_code(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and value.startswith("HARNESS_")
+        and len(value) > len("HARNESS_")
+        and all(char in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_" for char in value[len("HARNESS_") :])
+    )
 
 
 def load_wire(
@@ -391,13 +419,47 @@ def load_wire(
                     "line_no": line_no,
                     "detail": "bridge_meta 的 len/payload_b64/crc32 必須為 0/\"\"/00000000",
                 })
-            if "event" not in meta:
+            event = meta.get("event")
+            if not isinstance(event, str) or event not in _META_EVENTS:
                 problems.append({
                     "code": "HARNESS_SCHEMA_INVALID",
                     "file": str(wire_path),
                     "line_no": line_no,
-                    "detail": "bridge_meta 的 meta 必須包含 event 鍵",
+                    "detail": "bridge_meta 的 meta.event 不在 bridge.v1 值域",
                 })
+            elif event == "write_uncertain":
+                uncertain_observation = meta.get("observation")
+                valid_uncertain = (
+                    uncertain_observation in ("dut_stdin_write", "serial_write")
+                    and _is_int(meta.get("offset_start"), 0)
+                    and _is_int(meta.get("requested_len"), 1)
+                    and "accepted_len" in meta
+                    and meta.get("accepted_len") is None
+                    and isinstance(meta.get("error"), str)
+                    and bool(meta.get("error"))
+                    and loss_flag is True
+                )
+                if not valid_uncertain:
+                    problems.append({
+                        "code": "HARNESS_SCHEMA_INVALID",
+                        "file": str(wire_path),
+                        "line_no": line_no,
+                        "detail": "write_uncertain META 欄位或 loss_flag 不符合 bridge.v1",
+                    })
+                problems.append({
+                    "code": "HARNESS_INSUFFICIENT_EVIDENCE",
+                    "file": str(wire_path),
+                    "line_no": line_no,
+                    "detail": "write_uncertain 表示寫入接受長度不明，本次證據不得判為 PASS",
+                })
+            elif event == "evidence_failure":
+                if not _is_harness_code(meta.get("code")) or loss_flag is not True:
+                    problems.append({
+                        "code": "HARNESS_SCHEMA_INVALID",
+                        "file": str(wire_path),
+                        "line_no": line_no,
+                        "detail": "evidence_failure META 必須含 HARNESS_* code 並設 loss_flag=true",
+                    })
         else:
             expected_dir = "TX" if observation in ("serial_read", "dut_stdin_write") else "RX"
             if direction != expected_dir:

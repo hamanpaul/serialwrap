@@ -52,7 +52,11 @@ def run_selftest(ctx: SelftestContext, *, only: Sequence[str] | None = None) -> 
                 break
 
     from uart_stdio_bridge.evidence.manifest import platform_info
-    p_info = platform_info()
+    p_info = platform_info(
+        endpoint=ctx.endpoint,
+        com_driver=ctx.com_driver,
+        com_driver_install_method=ctx.com_driver_install_method,
+    )
     p_info["evidence_layer"] = "native-windows" if ctx.endpoint == "win-serial" else "posix-pty"
     p_info["com_pair"] = list(ctx.com_pair) if ctx.com_pair else None
 
@@ -220,6 +224,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", required=True, help="報告輸出目錄")
     parser.add_argument("--only", help="只執行指定檢查項目，逗號分隔，例如 ST-01,ST-02")
     parser.add_argument("--seed", type=int, default=20261015, help="隨機種子")
+    parser.add_argument("--com-driver-name")
+    parser.add_argument("--com-driver-version")
+    parser.add_argument("--com-driver-sha256")
+    parser.add_argument("--com-driver-install-method")
 
     args = parser.parse_args(argv)
 
@@ -258,6 +266,12 @@ def main(argv: list[str] | None = None) -> int:
         transport_mode=transport_mode,
         work_dir=work_dir,
         seed=args.seed,
+        com_driver={
+            "name": args.com_driver_name,
+            "version": args.com_driver_version,
+            "sha256": args.com_driver_sha256,
+        },
+        com_driver_install_method=args.com_driver_install_method,
     )
 
     report = run_selftest(ctx, only=only_list)

@@ -110,6 +110,56 @@ def test_meta_requires_event():
         records.make_meta_record(**_meta_kwargs(meta={}))
 
 
+def test_meta_rejects_unknown_event():
+    from uart_stdio_bridge.evidence import records
+
+    with pytest.raises(ValueError):
+        records.make_meta_record(**_meta_kwargs(meta={"event": "bridge_strat"}))
+
+
+def test_meta_events_match_schema_enum():
+    from uart_stdio_bridge.evidence import records
+
+    schema = json.loads(BRIDGE_RECORD_SCHEMA.read_text(encoding="utf-8"))
+    meta_schema = next(
+        clause["then"]["properties"]["meta"]
+        for clause in schema["allOf"]
+        if clause.get("if", {}).get("properties", {}).get("observation", {}).get("const") == "bridge_meta"
+    )
+    assert set(meta_schema["properties"]["event"]["enum"]) == records.META_EVENTS
+
+
+def test_make_data_record_rejects_empty_payload():
+    from uart_stdio_bridge.evidence import records
+
+    with pytest.raises(ValueError):
+        records.make_data_record(**_data_kwargs(payload=b""))
+
+
+@pytest.mark.parametrize("seq,endpoint_generation,dut_generation", [(0, 1, 1), (1, 0, 1), (1, 1, 0)])
+def test_common_record_counters_must_be_positive(seq, endpoint_generation, dut_generation):
+    from uart_stdio_bridge.evidence import records
+
+    with pytest.raises(ValueError):
+        records.make_data_record(**_data_kwargs(
+            seq=seq,
+            endpoint_generation=endpoint_generation,
+            dut_generation=dut_generation,
+        ))
+
+
+def test_base64_is_standard_alphabet_and_padded():
+    import base64
+
+    from uart_stdio_bridge.evidence import records
+
+    for payload in (b"\x00", b"\x00\x01", b"\x00\x01\x02", bytes(range(256))):
+        rec = records.make_data_record(**_data_kwargs(payload=payload))
+        encoded = rec["payload_b64"]
+        assert base64.b64decode(encoded, validate=True) == payload
+        assert encoded == base64.b64encode(payload).decode("ascii")
+
+
 def test_unknown_observation_rejected():
     from uart_stdio_bridge.evidence import records
 
@@ -138,3 +188,15 @@ def test_records_validate_against_schema():
     for rec in samples:
         errors = sorted(validator.iter_errors(json.loads(records.dumps_record(rec))), key=str)
         assert errors == [], errors
+
+
+def test_data_record_rejects_invalid_wall_timestamp_against_schema():
+    import jsonschema
+
+    from uart_stdio_bridge.evidence import records
+
+    schema = json.loads(BRIDGE_RECORD_SCHEMA.read_text(encoding="utf-8"))
+    validator = jsonschema.Draft202012Validator(schema)
+    for wall_ts in ("yesterday", "2026-10-15T03:06:17Z", "2026-10-15T03:06:17.1+00:00"):
+        rec = records.make_data_record(**_data_kwargs(wall_ts=wall_ts))
+        assert list(validator.iter_errors(rec)), wall_ts
