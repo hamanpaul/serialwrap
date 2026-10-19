@@ -43,23 +43,6 @@ def _normalize_case_id(cid: str) -> str:
     return name_clean
 
 
-def _normalize_argv(argv: list[str]) -> list[str]:
-    """去除路徑參數 (--junitxml=..., --out ...) 用於比對 selector.argv。"""
-    out = []
-    skip_next = False
-    for arg in argv:
-        if skip_next:
-            skip_next = False
-            continue
-        if arg in ("--junitxml", "--out", "--report"):
-            skip_next = True
-            continue
-        if arg.startswith("--junitxml=") or arg.startswith("--out=") or arg.startswith("--report="):
-            continue
-        out.append(arg)
-    return out
-
-
 def judge_stage1a(
     ab_report_path: Path | None,
     l1_results_dir: Path,
@@ -524,94 +507,13 @@ def judge_stage1a(
                     skipped_required = list(judged.get("skipped_required", []))
                     duplicates = list(judged.get("duplicates", []))
                 else:
-                    reasons: list[str] = []
-                    rep_format = rep.get("format", "")
-                    rep_platform = rep.get("platform", "")
-                    if rep_format != "l1-results.v1":
-                        reasons.append(f"format invalid: {rep_format}")
-                    if rep_platform != platform:
-                        reasons.append(f"platform mismatch: {rep_platform} != {platform}")
-
-                    runner = rep.get("runner", "")
-                    exit_code = rep.get("exit_code", 0)
-                    finished = rep.get("finished", False)
-
-                    lock_argv = lock_sel.get("argv", [])
-                    rep_argv = rep.get("argv", [])
-
-                    if runner == "cargo":
-                        if _normalize_argv(rep_argv) != _normalize_argv(lock_argv):
-                            reasons.append(f"selector mismatch: {rep_argv} != {lock_argv}")
-                    elif runner == "pytest":
-                        norm_lock = _normalize_argv(lock_argv)
-                        norm_rep = _normalize_argv(rep_argv)
-                        it = iter(norm_rep)
-                        if not all(arg in it for arg in norm_lock):
-                            reasons.append(f"selector mismatch: {lock_argv} not in {rep_argv}")
-
-                    rep_results = rep.get("results", [])
-                    rep_collected = rep.get("collected", [])
-
-                    node_counts: dict[str, int] = {}
-                    for r in rep_results:
-                        n = r.get("nodeid", "")
-                        node_counts[n] = node_counts.get(n, 0) + 1
-                    for n in rep_collected:
-                        node_counts[n] = max(node_counts.get(n, 0), rep_collected.count(n))
-                    duplicates = [n for n, c in node_counts.items() if c > 1]
-                    if duplicates:
-                        reasons.append("duplicate nodeid")
-
-                    if subfolder == "blackbox":
-                        junit_file = l1_results_dir / platform / subfolder / "junit.xml"
-                        if junit_file.is_file():
-                            try:
-                                root = ET.parse(junit_file).getroot()
-                                ts = root.find(".//testsuite")
-                                if ts is None:
-                                    ts = root
-                                j_tests = int(ts.attrib.get("tests", 0))
-                                j_fails = int(ts.attrib.get("failures", 0))
-                                j_errs = int(ts.attrib.get("errors", 0))
-                                j_skips = int(ts.attrib.get("skipped", 0))
-
-                                r_fails = sum(1 for r in rep_results if r.get("outcome") in ("failed", "error"))
-                                r_skips = sum(1 for r in rep_results if r.get("outcome") in ("skipped", "ignored", "xfail", "xfailed"))
-                                if j_tests != len(rep_results) or (j_fails + j_errs) != r_fails or j_skips != r_skips:
-                                    reasons.append("junit/l1-results mismatch")
-                            except Exception as e:
-                                reasons.append(f"junit parse error: {e}")
-
-                    results_by_node = {r.get("nodeid"): r for r in rep_results}
-                    missing = sorted(set(required_nodes) - set(results_by_node.keys()))
-
-                    skipped_required = [
-                        r
-                        for r in rep_results
-                        if r.get("nodeid") in set(required_nodes)
-                        and r.get("outcome") in ("skipped", "ignored", "xfail", "xfailed")
-                    ]
-                    failed = [
-                        r for r in rep_results if r.get("outcome") in ("failed", "error", "xpassed")
-                    ]
-
-                    if not finished:
-                        reasons.append("runner did not finish")
-                    if exit_code != 0 and not failed:
-                        reasons.append(f"runner exit {exit_code} != 0")
-
-                    not_passed = [
-                        r for r in rep_results if r.get("nodeid") in set(required_nodes) and r.get("outcome") != "passed"
-                    ]
-
-                    if any("selector mismatch" in r for r in reasons) or any("format invalid" in r for r in reasons) or any("platform mismatch" in r for r in reasons) or any("junit" in r for r in reasons):
-                        verdict = "evidence-insufficient"
-                    elif failed:
-                        verdict = "FAIL"
-                    elif missing or skipped_required or duplicates or reasons or not_passed:
-                        verdict = "INSUFFICIENT"
-                    else:
-                        verdict = "PASS"
+                    # 計畫 R5-F3：L1 判定一律依路徑載入 P2 Task 13 的 l1_judge.py（唯一判定實作），
+                    # 不得自寫判定代替；缺檔或無 judge() 時該列記證據不足，不得轉 PASS。
+                    verdict = "evidence-insufficient"
+                    reasons = [f"l1_judge.py 缺少或無 judge()（P2 Task 13 前置缺口）: {judge_script}"]
+                    missing = []
+                    skipped_required = []
+                    duplicates = []
 
                 if verdict != "PASS":
                     l1_ok = False
