@@ -97,6 +97,32 @@
           "type": "string",
           "minLength": 1,
           "description": "對應 cases.yaml 該案例 evidence 清單中的一項（目錄以結尾 / 表示，例如 wal/）；單案例列必填。"
+        },
+        "l1_set": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "set_id",
+            "platforms"
+          ],
+          "description": "（P2-T13，R5-F3）選填。帶此欄位的 present 項目以 l1_judge 判定：artifact_path 為目錄，逐平台讀 <platform>/resource-report.json 與 junit.xml；set_id 為 l1_required.lock.json 的集合鍵。",
+          "properties": {
+            "set_id": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9_:.-]*$"
+            },
+            "platforms": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "enum": [
+                  "linux",
+                  "windows"
+                ]
+              }
+            }
+          }
         }
       },
       "if": {

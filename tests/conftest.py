@@ -16,6 +16,7 @@ import tempfile
 import pytest
 
 import liveguard
+import resource_report_plugin as _rrp  # 資源報告外掛（P2-T13）；本模組不 import sw_core
 
 # ---- 第 0 步：live 快照（必須在覆寫任何 env 之前）----
 _MODE = os.environ.get("SERIALWRAP_LIVE_GATE", "strict").strip().lower()
@@ -27,6 +28,8 @@ _PRE_SHELL_WAL = (
     liveguard.snap_file(os.path.join(_SHELL_WAL_DIR, "raw.wal.ndjson")) if _SHELL_WAL_DIR else None
 )
 _PRE_DAEMON = liveguard.snap_daemon()
+# deployed_content 量測用（R5-F4）：下方第 1 層會 pop 這兩個變數，須先保留
+_rrp.capture_deployed_env(os.environ)
 
 # ---- 第 1 層：強制 env 隔離（硬覆寫——外層 shell 可能 export 指向 live 的值）----
 _ISO_ROOT = tempfile.mkdtemp(prefix="sw-pytest-iso-")
@@ -145,6 +148,27 @@ _MARKERS = {
 def pytest_configure(config):
     for name, desc in _MARKERS.items():
         config.addinivalue_line("markers", f"{name}: {desc}")
+    # 報告 hook 的唯一宿主；同名只註冊一次（完整 pytest tests/ 與黑箱 conftest 可能同時載入）
+    if not config.pluginmanager.has_plugin(_rrp.PLUGIN_NAME):
+        config.pluginmanager.register(_rrp, _rrp.PLUGIN_NAME)
+
+
+def pytest_ignore_collect(collection_path, config):
+    """Windows collection 前排除模組層 posix_only 的測試檔（避免頂層 import pty／termios 造成 collection error）。"""
+    if _rrp.ignore_on_windows(collection_path, config):
+        return True
+    return None
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_make_collect_report(collector):
+    """命令列明確指定的檔案不經 pytest_ignore_collect（pytest 對 initial path 不呼叫該 hook），此處同樣排除。
+
+    被排除的模組不 import、不產生項目；路徑仍記入資源報告的 not_collected_platform（P2-T13）。
+    """
+    if isinstance(collector, pytest.Module) and _rrp.ignore_on_windows(collector.path, collector.config):
+        return pytest.CollectReport(collector.nodeid, "passed", None, [])
+    return None
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
@@ -156,11 +180,14 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                     reason="windows_native：請以 scripts/stage0/win-pytest.sh 執行（證據不足，非 PASS）"
                 )
             )
+            item.stash[_rrp.CAPABILITY_SKIP] = True
         if "posix_only" in item.keywords and os.name == "nt":
             item.add_marker(pytest.mark.skip(reason="posix_only：Windows 不適用"))
+            item.stash[_rrp.CAPABILITY_SKIP] = True
         if "windows_com" in item.keywords and not os.environ.get("SW_TEST_COM_PAIR"):
             item.add_marker(
                 pytest.mark.skip(
                     reason="BLOCKED-OWNER：需 OD-08 COM pair（SW_TEST_COM_PAIR；證據不足，非 PASS）"
                 )
             )
+            item.stash[_rrp.CAPABILITY_SKIP] = True

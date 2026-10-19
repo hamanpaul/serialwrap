@@ -8,6 +8,7 @@ import os
 import pathlib
 import subprocess
 import sys
+from xml.sax.saxutils import quoteattr
 
 import pytest
 import yaml
@@ -16,6 +17,60 @@ import yaml
 pytestmark = [pytest.mark.core_portable]
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
+
+
+def _load_checker_module():
+    """依路徑載入 check_evidence_index.py（與 checker 子程序使用同一份 l1_artifact_digest）。"""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("checker_under_test", REPO / "tests/acceptance/check_evidence_index.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _write_l1_pass_artifacts(base: pathlib.Path, set_id: str, platforms: list[str]) -> str:
+    """P2-T13：為 l1_set 項目寫出全部必要 nodeid 皆 passed 的 l1-results.v1 報告與 junit（由凍結鎖產生）。
+
+    回傳目錄的 sha256（與 checker 的 l1_artifact_digest 同式）。T12 原本以 dummy 檔案代表所有項目；
+    l1_set 項目改以 l1_judge 判定，dummy 無法通過判定，故此處改寫為真實 PASS 形狀的報告。
+    """
+    lock = json.loads((REPO / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    for plat in platforms:
+        spec = lock["sets"][set_id][plat]
+        nodeids = list(spec["nodeids"])
+        out = base / plat
+        out.mkdir(parents=True, exist_ok=True)
+        report = {
+            "schema_version": 2,
+            "format": "l1-results.v1",
+            "runner": "pytest",
+            "platform": plat,
+            "argv": ["/x/pytest/__main__.py", *spec["selector"]["argv"]],
+            "markexpr": spec["selector"]["markexpr"],
+            "counts": {},
+            "resources": {},
+            "not_collected_platform": [],
+            "collected": nodeids,
+            "deselected": [],
+            "results": [
+                {"nodeid": nid, "outcome": "passed", "skip_kind": None,
+                 "phases": {"setup": "passed", "call": "passed", "teardown": "passed"}}
+                for nid in nodeids
+            ],
+            "core_portable_platform_skips": [],
+            "exit_code": 0,
+            "finished": True,
+            "deployed_content": None,
+        }
+        (out / "resource-report.json").write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+        # junit 以 testcase 元素為準（l1 判定的 junit 計數層；P2-T13 審查修正）。
+        cases = "".join(f'<testcase classname="pytest" name={quoteattr(nid)}/>' for nid in nodeids)
+        (out / "junit.xml").write_text(
+            f'<?xml version="1.0"?><testsuite name="pytest" tests="{len(nodeids)}" failures="0" errors="0" skipped="0">{cases}</testsuite>\n',
+            encoding="utf-8",
+        )
+    return _load_checker_module().l1_artifact_digest(base, platforms)
 
 
 @pytest.mark.process_rpc
@@ -73,6 +128,11 @@ def test_evidence_index_schema_and_check(tmp_path: pathlib.Path):
         if not rel_path:
             rel_path = f"artifacts/{item['id']}.json"
             item["artifact_path"] = rel_path
+        if item.get("l1_set"):
+            item["sha256"] = _write_l1_pass_artifacts(
+                mock_root / rel_path, item["l1_set"]["set_id"], item["l1_set"]["platforms"]
+            )
+            continue
         file_path = mock_root / rel_path
         file_path.parent.mkdir(parents=True, exist_ok=True)
         dummy_content = f"dummy artifact content for {item['id']}\n".encode("utf-8")

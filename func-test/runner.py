@@ -505,7 +505,7 @@ class TestRunner:
         if checker.is_file():
             try:
                 result = subprocess.run(
-                    [sys.executable, str(checker), "--check"],
+                    [sys.executable, str(checker), "--check", "--cases-only"],
                     cwd=ROOT_DIR,
                     capture_output=True,
                     text=True,

@@ -124,7 +124,7 @@ def test_windows_collection_excludes_posix_modules(tmp_path: Path) -> None:
         "tests/test_wal.py",
     ]
     env = dict(os.environ)
-    env["PYTHONPATH"] = f"{tmp_path}:{os.getcwd()}"
+    env["PYTHONPATH"] = os.pathsep.join([str(tmp_path), os.getcwd()])
     env["SW_RESOURCE_REPORT"] = str(report_file)
     res = subprocess.run(cmd, capture_output=True, text=True, env=env)
     assert res.returncode == 0, f"pytest collect failed: {res.stdout}\n{res.stderr}"
@@ -155,7 +155,7 @@ def test_core_portable_platform_skip_fails_session(tmp_path: Path) -> None:
     )
     report_file = tmp_path / "report.json"
     env = dict(os.environ)
-    env["PYTHONPATH"] = f"{os.getcwd()}:{os.getcwd()}/tests"
+    env["PYTHONPATH"] = os.pathsep.join([os.getcwd(), os.path.join(os.getcwd(), "tests")])
     env["SW_RESOURCE_REPORT"] = str(report_file)
     res = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", str(test_dir / "test_sample.py")],
@@ -215,53 +215,79 @@ def test_resource_report_written(tmp_path: Path) -> None:
     assert data["counts"]["core_portable"]["passed"] > 0
 
 
+def _install_layout(tmp_path: Path, tag: str) -> dict:
+    """建立最小安裝樹並回傳路徑與摘要（R5-F4；Task 10 測試的最小安裝）。
+
+    POSIX：`inst/bin/serialwrap`、`inst/bin/serialwrapd`、旁載 `inst/bin/version.dll`，入口由 `inst/bin` 直接執行。
+    Windows（`os.name == "nt"`，realhw/deployed_content.py 的 current-release sidecar 規則）：
+    穩定入口目錄 `stable/` 僅含 `serialwrap.exe`、`serialwrapd.exe`、`current-release.json`（指向 `inst`），
+    安裝樹 `inst/bin` 含同位元組的 `.exe` 與旁載 `version.dll`（入口目錄不得有旁載，entry_dir_check）。
+    """
+    base = tmp_path / tag
+    inst = base / "inst"
+    bin_dir = inst / "bin"
+    bin_dir.mkdir(parents=True)
+    windows = os.name == "nt"
+    cli_name = "serialwrap.exe" if windows else "serialwrap"
+    daemon_name = "serialwrapd.exe" if windows else "serialwrapd"
+    cli_payload = b"#!/bin/sh\nexit 0\n"
+    daemon_payload = b"#!/bin/sh\nexit 0\n"
+    (bin_dir / cli_name).write_bytes(cli_payload)
+    (bin_dir / daemon_name).write_bytes(daemon_payload)
+    for name in (cli_name, daemon_name):
+        (bin_dir / name).chmod(0o755)
+    (bin_dir / "version.dll").write_bytes(b"sideloaded dummy dll")
+    cli_sha = hashlib.sha256(cli_payload).hexdigest()
+    daemon_sha = hashlib.sha256(daemon_payload).hexdigest()
+    manifest_file = inst / "release-manifest.json"
+    manifest_file.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "components": {
+                    "cli": {"sha256": cli_sha},
+                    "daemon": {"launcher": {"sha256": daemon_sha}, "runtime": {"sha256": daemon_sha}},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    if windows:
+        stable = base / "stable"
+        stable.mkdir()
+        cli_file = stable / cli_name
+        cli_file.write_bytes(cli_payload)
+        (stable / daemon_name).write_bytes(daemon_payload)
+        (stable / "current-release.json").write_text(json.dumps({"dir": str(inst)}), encoding="utf-8")
+    else:
+        cli_file = bin_dir / cli_name
+    return {
+        "cli": cli_file,
+        "daemon": bin_dir / daemon_name,
+        "inst": inst,
+        "manifest_sha": hashlib.sha256(manifest_file.read_bytes()).hexdigest(),
+        "daemon_name": daemon_name,
+    }
+
+
 @pytest.mark.process_rpc
 def test_resource_report_deployed_content(tmp_path: Path) -> None:
-    """以 Task 10 測試的最小安裝 tmp/'inst'（含 bin/serialwrap、release-manifest.json、旁載 bin/version.dll）：
+    """以最小安裝（POSIX 與 Windows 兩種版面，見 _install_layout）：
 
-    子程序帶 SERIALWRAP_CLI_EXE=<inst>/bin/serialwrap、SERIALWRAP_DAEMON_EXE=<inst>/bin/serialwrapd、
-    SW_RESOURCE_REPORT=<tmp>/r.json 跑 tests/test_wal.py → 報告 deployed_content.start 與 .end 的
-    bundle_tree_sha256 皆等於 realhw.deployed_content.tree_digests(inst)[0]（含旁載檔的值）、
-    release_manifest_sha256 == sha256_file(inst/'release-manifest.json')；
-    不帶 SERIALWRAP_CLI_EXE 再跑一次 → deployed_content is None（鍵存在）。
+    子程序帶 SERIALWRAP_CLI_EXE、SERIALWRAP_DAEMON_EXE、SW_RESOURCE_REPORT 跑 tests/test_wal.py →
+    報告 deployed_content.start 與 .end 的 bundle_tree_sha256 皆等於 tree_digests(inst)[0]（含旁載檔）、
+    release_manifest_sha256 == sha256_file(inst/release-manifest.json)；不帶 SERIALWRAP_CLI_EXE 再跑 → deployed_content is None。
     """
     import realhw.deployed_content as deployed_content
 
-    inst = tmp_path / "inst"
-    bin_dir = inst / "bin"
-    bin_dir.mkdir(parents=True)
-    cli_file = bin_dir / "serialwrap"
-    cli_file.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    cli_file.chmod(0o755)
-    daemon_file = bin_dir / "serialwrapd"
-    daemon_file.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    daemon_file.chmod(0o755)
-    sideload = bin_dir / "version.dll"
-    sideload.write_bytes(b"sideloaded dummy dll")
-
-    cli_sha = hashlib.sha256(cli_file.read_bytes()).hexdigest()
-    daemon_sha = hashlib.sha256(daemon_file.read_bytes()).hexdigest()
-
-    manifest_file = inst / "release-manifest.json"
-    manifest_data = {
-        "schema_version": 1,
-        "components": {
-            "cli": {"sha256": cli_sha},
-            "daemon": {
-                "launcher": {"sha256": daemon_sha},
-                "runtime": {"sha256": daemon_sha},
-            },
-        },
-    }
-    manifest_file.write_text(json.dumps(manifest_data), encoding="utf-8")
-    manifest_sha = hashlib.sha256(manifest_file.read_bytes()).hexdigest()
-
+    layout = _install_layout(tmp_path, "case1")
+    inst = layout["inst"]
     expected_tree_sha, _ = deployed_content.tree_digests(inst)
 
     report_file1 = tmp_path / "r1.json"
     env1 = dict(os.environ)
-    env1["SERIALWRAP_CLI_EXE"] = str(cli_file)
-    env1["SERIALWRAP_DAEMON_EXE"] = str(daemon_file)
+    env1["SERIALWRAP_CLI_EXE"] = str(layout["cli"])
+    env1["SERIALWRAP_DAEMON_EXE"] = str(layout["daemon"])
     env1["SW_RESOURCE_REPORT"] = str(report_file1)
     res1 = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "tests/test_wal.py"],
@@ -275,10 +301,12 @@ def test_resource_report_deployed_content(tmp_path: Path) -> None:
     assert "deployed_content" in data1
     dc1 = data1["deployed_content"]
     assert dc1 is not None
+    assert dc1["start"]["error"] is None, dc1["start"]
+    assert dc1["end"]["error"] is None, dc1["end"]
     assert dc1["start"]["bundle_tree_sha256"] == expected_tree_sha
     assert dc1["end"]["bundle_tree_sha256"] == expected_tree_sha
-    assert dc1["start"]["release_manifest_sha256"] == manifest_sha
-    assert dc1["end"]["release_manifest_sha256"] == manifest_sha
+    assert dc1["start"]["release_manifest_sha256"] == layout["manifest_sha"]
+    assert dc1["end"]["release_manifest_sha256"] == layout["manifest_sha"]
 
     report_file2 = tmp_path / "r2.json"
     env2 = dict(os.environ)
@@ -300,32 +328,18 @@ def test_resource_report_deployed_content(tmp_path: Path) -> None:
 
 @pytest.mark.process_rpc
 def test_resource_report_cli_without_daemon_env_unmeasured(tmp_path: Path) -> None:
-    """同上但不設 SERIALWRAP_DAEMON_EXE → deployed_content.start.error == .end.error == 'daemon_env_missing'、
+    """同上但不設 SERIALWRAP_DAEMON_EXE → start／end.error == "daemon_env_missing"、digest 皆 None；
+    daemon 設為安裝樹外的檔案 → error == "daemon_outside_install"。
 
-    digest 皆 None；設成 repo 的 tests/contract_blackbox/bin/py-serialwrapd → error == 'daemon_outside_install'。
+    repo 外的 daemon 一律建在 tmp_path 內（P2-T13 審查修正：原測試會把 stub 寫進 tests/contract_blackbox/bin，
+    與 P3 追蹤路徑衝突並被複製進 Windows staging）。
     """
-    inst = tmp_path / "inst"
-    bin_dir = inst / "bin"
-    bin_dir.mkdir(parents=True)
-    cli_file = bin_dir / "serialwrap"
-    cli_file.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    cli_file.chmod(0o755)
-
-    cli_sha = hashlib.sha256(cli_file.read_bytes()).hexdigest()
-    manifest_file = inst / "release-manifest.json"
-    manifest_data = {
-        "schema_version": 1,
-        "components": {
-            "cli": {"sha256": cli_sha},
-            "daemon": {"launcher": {"sha256": "0" * 64}, "runtime": {"sha256": "0" * 64}},
-        },
-    }
-    manifest_file.write_text(json.dumps(manifest_data), encoding="utf-8")
+    layout = _install_layout(tmp_path, "case2")
 
     # Case 1: SERIALWRAP_DAEMON_EXE 未設
     report1 = tmp_path / "r1.json"
     env1 = dict(os.environ)
-    env1["SERIALWRAP_CLI_EXE"] = str(cli_file)
+    env1["SERIALWRAP_CLI_EXE"] = str(layout["cli"])
     env1.pop("SERIALWRAP_DAEMON_EXE", None)
     env1["SW_RESOURCE_REPORT"] = str(report1)
     res1 = subprocess.run(
@@ -334,6 +348,7 @@ def test_resource_report_cli_without_daemon_env_unmeasured(tmp_path: Path) -> No
         text=True,
         env=env1,
     )
+    assert res1.returncode == 0, res1.stdout + res1.stderr
     assert report1.exists()
     d1 = json.loads(report1.read_text(encoding="utf-8"))
     dc1 = d1.get("deployed_content")
@@ -343,16 +358,16 @@ def test_resource_report_cli_without_daemon_env_unmeasured(tmp_path: Path) -> No
     assert dc1["start"]["bundle_tree_sha256"] is None
     assert dc1["end"]["bundle_tree_sha256"] is None
 
-    # Case 2: SERIALWRAP_DAEMON_EXE 設為 repo 外部檔案
-    outside_daemon = Path("tests/contract_blackbox/bin/py-serialwrapd").resolve()
-    outside_daemon.parent.mkdir(parents=True, exist_ok=True)
-    if not outside_daemon.exists():
-        outside_daemon.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        outside_daemon.chmod(0o755)
+    # Case 2: SERIALWRAP_DAEMON_EXE 設為安裝樹外的檔案（建在 tmp_path，不寫入 repo）
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    outside_daemon = outside_dir / layout["daemon_name"]
+    outside_daemon.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    outside_daemon.chmod(0o755)
 
     report2 = tmp_path / "r2.json"
     env2 = dict(os.environ)
-    env2["SERIALWRAP_CLI_EXE"] = str(cli_file)
+    env2["SERIALWRAP_CLI_EXE"] = str(layout["cli"])
     env2["SERIALWRAP_DAEMON_EXE"] = str(outside_daemon)
     env2["SW_RESOURCE_REPORT"] = str(report2)
     res2 = subprocess.run(
@@ -369,14 +384,45 @@ def test_resource_report_cli_without_daemon_env_unmeasured(tmp_path: Path) -> No
     assert dc2["end"]["error"] == "daemon_outside_install"
 
 
-@pytest.mark.memory_only
-def test_windows_com_never_counted_without_device() -> None:
-    """報告中 resources.windows_com.passed 為 0（P0 T14 第 6 條：本 Stage 無 windows_com 的 tests/ item）。"""
-    import tests.resource_report as resource_report
+@pytest.mark.process_rpc
+def test_windows_com_never_counted_without_device(tmp_path: Path) -> None:
+    """無 SW_TEST_COM_PAIR 時，windows_com 項目不得計為 passed（P0 T14 第 6 條；§11.2 不以模擬代替 windows_com）。
 
-    records: list[dict] = []
-    summary = resource_report.summarize(records, ignored=[], platform="linux")
-    assert summary["resources"]["windows_com"]["passed"] == 0
+    P2-T13 審查修正：原測試只餵空清單（空轉）。現況 tests/ 有兩個檔使用 windows_com（已知清單鎖定，新增者須審閱），
+    本測試實際以缺 device 的環境執行它們，斷言 resources.windows_com.passed == 0 且至少有一個 skipped。
+    （計畫 Task 13 寫「本 Stage 無 windows_com 的 tests/ item」與現況不符，差異已於 PR 說明記錄。）
+    """
+    import tests.resource_report as resource_report  # noqa: F401  （確認模組可載入）
+
+    known = {"tests/test_spike1_remaining.py", "tests/test_stage0_uart_exclusive.py"}
+    users: set[str] = set()
+    for path in sorted(Path("tests").rglob("test_*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Attribute)
+                and node.attr == "windows_com"
+                and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "mark"
+            ):
+                users.add(path.as_posix())
+                break
+    assert users == known, f"windows_com 使用檔與已知清單不符（新增者須審閱）：{sorted(users)}"
+
+    report_file = tmp_path / "r.json"
+    env = dict(os.environ)
+    env.pop("SW_TEST_COM_PAIR", None)
+    env["SW_RESOURCE_REPORT"] = str(report_file)
+    res = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-m", "windows_com", *sorted(known)],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert report_file.exists(), res.stdout + res.stderr
+    data = json.loads(report_file.read_text(encoding="utf-8"))
+    assert data["resources"]["windows_com"]["passed"] == 0, data["resources"]["windows_com"]
+    assert data["resources"]["windows_com"]["skipped"] >= 1, data["resources"]["windows_com"]
 
 
 @pytest.mark.memory_only
@@ -456,7 +502,7 @@ def test_resource_report_l1_results_fields(tmp_path: Path) -> None:
     )
     report_file = tmp_path / "r.json"
     env = dict(os.environ)
-    env["PYTHONPATH"] = f"{os.getcwd()}:{os.getcwd()}/tests"
+    env["PYTHONPATH"] = os.pathsep.join([os.getcwd(), os.path.join(os.getcwd(), "tests")])
     env["SW_RESOURCE_REPORT"] = str(report_file)
     res = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "-k", "not test_c", str(test_dir / "test_items.py")],
@@ -516,7 +562,7 @@ def test_resource_report_phase_outcomes(tmp_path: Path) -> None:
     )
     report_file = tmp_path / "r.json"
     env = dict(os.environ)
-    env["PYTHONPATH"] = f"{os.getcwd()}:{os.getcwd()}/tests"
+    env["PYTHONPATH"] = os.pathsep.join([os.getcwd(), os.path.join(os.getcwd(), "tests")])
     env["SW_RESOURCE_REPORT"] = str(report_file)
     res = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", str(test_dir / "test_phases.py")],
@@ -569,7 +615,7 @@ def test_resource_report_interrupted_not_finished(tmp_path: Path) -> None:
     )
     report_file = tmp_path / "r.json"
     env = dict(os.environ)
-    env["PYTHONPATH"] = f"{os.getcwd()}:{os.getcwd()}/tests"
+    env["PYTHONPATH"] = os.pathsep.join([os.getcwd(), os.path.join(os.getcwd(), "tests")])
     env["SW_RESOURCE_REPORT"] = str(report_file)
     res = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", str(test_dir / "test_flow.py")],
@@ -585,8 +631,13 @@ def test_resource_report_interrupted_not_finished(tmp_path: Path) -> None:
     results = report.get("results", [])
     assert len(results) <= 2
 
-    nodeids = [f"{test_dir / 'test_flow.py'}::test_{i}" for i in (1, 2, 3)]
-    verdict = l1_judge.judge(report, nodeids, platform="linux")
+    # P2-T13 修正：pytest 的 nodeid 相對於 rootdir（本測試的 sub 目錄，例如 test_flow.py::test_1），
+    # 不是絕對路徑；原草稿以絕對路徑組必要集合，與 pytest 實際 nodeid 永不相符，會把三個案例都判成 missing。
+    # 必要集合改取報告的收集清單（plan：collected 為 session.items 的 nodeid），仍為三個案例。
+    nodeids = list(report["collected"])
+    assert len(nodeids) == 3
+    # 平台取報告本身記錄的執行平台（Windows 上為 windows）；hard-code linux 會使判定成為 INVALID（P2-T13 審查修正）。
+    verdict = l1_judge.judge(report, nodeids, platform=report["platform"])
     assert verdict["verdict"] == "INSUFFICIENT"
     assert any("runner exit 2" in r for r in verdict.get("reasons", []))
     assert len(verdict.get("not_run", [])) > 0
@@ -608,6 +659,9 @@ def test_regen_lock_base_check_detects_removal(tmp_path: Path) -> None:
     acc_dir = repo_dir / "tests" / "acceptance"
     acc_dir.mkdir(parents=True)
     shutil.copy("tests/acceptance/regen_lock.py", acc_dir / "regen_lock.py")
+    # 預設 --check 同時驗案例鎖（P2-T13 審查修正：缺案例清單即失敗），故一併複製一致的案例檔。
+    for name in ("cases.yaml", "cases.lock.json", "cases.counts.json"):
+        shutil.copy(f"tests/acceptance/{name}", acc_dir / name)
 
     lock_file = acc_dir / "l1_required.lock.json"
     init_lock = {
@@ -708,9 +762,11 @@ def test_resource_report_plugin_works_under_confcutdir(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     (sub_dir / "test_one.py").write_text(
+        "import sys\n"
         "import pytest\n"
         "pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]\n"
-        "def test_standalone(): pass\n",
+        "def test_standalone():\n"
+        "    assert not any(m == 'sw_core' or m.startswith('sw_core.') for m in sys.modules)\n",
         encoding="utf-8",
     )
     report_file = tmp_path / "r.json"
@@ -752,3 +808,205 @@ def test_resource_report_plugin_works_under_confcutdir(tmp_path: Path) -> None:
     d_full = json.loads(report_file_full.read_text(encoding="utf-8"))
     nodeids = [r["nodeid"] for r in d_full.get("results", [])]
     assert len(nodeids) == len(set(nodeids)), "Duplicate nodeids found in results"
+
+
+def _conftest_registering_plugin(path: Path) -> str:
+    """回傳子目錄 conftest 內容：只以路徑載入報告外掛並註冊（寫法同 P3 黑箱 conftest）。"""
+    plugin_path = Path("tests/resource_report_plugin.py").resolve()
+    return (
+        "import importlib.util\n"
+        f"spec = importlib.util.spec_from_file_location('sw_resource_report', r'{plugin_path}')\n"
+        "mod = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(mod)\n"
+        "def pytest_configure(config):\n"
+        "    if not config.pluginmanager.has_plugin('sw_resource_report'):\n"
+        "        config.pluginmanager.register(mod, 'sw_resource_report')\n"
+    )
+
+
+@pytest.mark.process_rpc
+def test_resource_report_subtest_failure_marks_row(tmp_path: Path) -> None:
+    """pytest 9 subtest 失敗 → 父列 outcome 為 failed（P2-T13 審查修正：原實作讓 SubtestReport 覆寫 call，記成 passed）。"""
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "test_sub.py").write_text(
+        "import unittest, pytest\n"
+        "pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]\n"
+        "class T(unittest.TestCase):\n"
+        "    def test_sub_fail(self):\n"
+        "        for i in range(3):\n"
+        "            with self.subTest(i=i):\n"
+        "                self.assertTrue(i != 1)\n"
+        "def test_plain():\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    report_file = tmp_path / "r.json"
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join([os.getcwd(), os.path.join(os.getcwd(), "tests")])
+    env["SW_RESOURCE_REPORT"] = str(report_file)
+    res = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "resource_report_plugin", str(sub / "test_sub.py")],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert res.returncode == 1, res.stdout + res.stderr
+    data = json.loads(report_file.read_text(encoding="utf-8"))
+    rows = {r["nodeid"].split("::")[-1]: r for r in data["results"]}
+    assert rows["test_sub_fail"]["outcome"] == "failed"
+    assert rows["test_plain"]["outcome"] == "passed"
+
+
+@pytest.mark.process_rpc
+def test_resource_report_setup_only_records_no_passed_row(tmp_path: Path) -> None:
+    """--setup-only 不進入 call：不得記為 passed（P2-T13 審查修正）；l1_judge 判為 not_run。"""
+    import tests.acceptance.l1_judge as l1_judge
+
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "test_so.py").write_text(
+        "import pytest\n"
+        "pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]\n"
+        "def test_one(): assert False\n"
+        "def test_two(): pass\n",
+        encoding="utf-8",
+    )
+    report_file = tmp_path / "r.json"
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join([os.getcwd(), os.path.join(os.getcwd(), "tests")])
+    env["SW_RESOURCE_REPORT"] = str(report_file)
+    res = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "--setup-only", "-p", "resource_report_plugin", str(sub / "test_so.py")],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+    data = json.loads(report_file.read_text(encoding="utf-8"))
+    assert data["results"] == []
+    assert len(data["collected"]) == 2
+    verdict = l1_judge.judge(data, data["collected"], platform=data["platform"])
+    assert verdict["verdict"] == "INSUFFICIENT"
+    assert len(verdict["not_run"]) == 2
+
+
+@pytest.mark.process_rpc
+def test_resource_report_multi_marker_counts(tmp_path: Path) -> None:
+    """同一項目帶多個資源 marker：每個資源各計一次，平台只計一次（P2-T13 審查修正）。"""
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "test_multi.py").write_text(
+        "import pytest\n"
+        "pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only, pytest.mark.process_rpc]\n"
+        "def test_both(): pass\n",
+        encoding="utf-8",
+    )
+    report_file = tmp_path / "r.json"
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join([os.getcwd(), os.path.join(os.getcwd(), "tests")])
+    env["SW_RESOURCE_REPORT"] = str(report_file)
+    res = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "resource_report_plugin", str(sub / "test_multi.py")],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+    data = json.loads(report_file.read_text(encoding="utf-8"))
+    assert data["resources"]["memory_only"]["passed"] == 1
+    assert data["resources"]["process_rpc"]["passed"] == 1
+    assert data["counts"]["core_portable"]["passed"] == 1
+
+
+@pytest.mark.process_rpc
+def test_resource_report_stale_removed_when_run_killed(tmp_path: Path) -> None:
+    """上一次執行留下的報告在本次 sessionstart 即移除；本次被中途終止時不得留下舊的 finished:true（P2-T13 審查修正）。"""
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "conftest.py").write_text(
+        "import os\n"
+        "def pytest_collection_finish(session):\n"
+        "    os._exit(3)\n",
+        encoding="utf-8",
+    )
+    (sub / "test_k.py").write_text("def test_x(): pass\n", encoding="utf-8")
+    report_file = tmp_path / "r.json"
+    report_file.write_text(json.dumps({"finished": True, "exit_code": 0, "stale": True}), encoding="utf-8")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join([os.getcwd(), os.path.join(os.getcwd(), "tests")])
+    env["SW_RESOURCE_REPORT"] = str(report_file)
+    res = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "resource_report_plugin", str(sub)],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert res.returncode == 3, res.stdout + res.stderr
+    assert not report_file.exists(), "被終止的執行不得留下舊報告"
+
+
+@pytest.mark.process_rpc
+def test_resource_report_argv_under_pytest_main(tmp_path: Path) -> None:
+    """以 pytest.main() 啟動（Windows win-pytest.sh 的方式）時 argv 記錄 pytest 實際參數（P2-T13 審查修正）。"""
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "conftest.py").write_text(_conftest_registering_plugin(sub), encoding="utf-8")
+    (sub / "test_argv.py").write_text(
+        "import pytest\npytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]\ndef test_a(): pass\n",
+        encoding="utf-8",
+    )
+    report_file = tmp_path / "r.json"
+    env = dict(os.environ)
+    env["SW_RESOURCE_REPORT"] = str(report_file)
+    res = subprocess.run(
+        [sys.executable, "-c", "import sys, pytest; raise SystemExit(pytest.main(sys.argv[1:]))", "-q", str(sub)],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+    data = json.loads(report_file.read_text(encoding="utf-8"))
+    assert data["argv"][1:] == ["-q", str(sub)], data["argv"]
+
+
+@pytest.mark.memory_only
+def test_summarize_counts_every_resource_marker() -> None:
+    """summarize 對多資源列逐一計數，平台總數只計一次。"""
+    import tests.resource_report as resource_report
+
+    records = [
+        {"nodeid": "a", "platform": "core_portable", "resources": ["process_rpc", "posix_pty"],
+         "outcome": "passed", "is_platform_skip": False},
+        {"nodeid": "b", "platform": "core_portable", "resource": "memory_only",
+         "outcome": "failed", "is_platform_skip": False},
+    ]
+    summary = resource_report.summarize(records, ignored=[], platform="linux")
+    assert summary["resources"]["process_rpc"]["passed"] == 1
+    assert summary["resources"]["posix_pty"]["passed"] == 1
+    assert summary["resources"]["memory_only"]["failed"] == 1
+    assert summary["counts"]["core_portable"] == {"passed": 1, "failed": 1, "skipped": 0}
+
+
+@pytest.mark.memory_only
+def test_workflow_ci_l1_gates() -> None:
+    """CI 閘門（P2-T13 審查修正）：PR 對 base 的鎖檔只增檢查、labeled 事件不重跑其餘 job、
+    自架 COM job 不接受 fork PR、selftest 帶 --out、func-test 逐一執行三個 win-com 情境（--case 為完全相符 stem）。"""
+    wf = yaml.safe_load(Path(".github/workflows/tests.yml").read_text(encoding="utf-8"))
+    jobs = wf["jobs"]
+    pytest_job = jobs["pytest"]
+    lock_steps = [st for st in pytest_job["steps"] if "regen_lock.py --check --base origin/${{ github.base_ref }}" in str(st.get("run", ""))]
+    assert len(lock_steps) == 1, "pytest job 須含 regen_lock --check --base 步驟"
+    assert "pull_request" in str(lock_steps[0].get("if", ""))
+    for name in ("pytest", "bridge-tools", "bridge-tools-windows", "pytest-windows"):
+        assert "labeled" in str(jobs[name].get("if", "")), f"{name} 須排除 labeled 事件"
+    com = jobs["windows-com-selfhosted"]
+    assert "head.repo.full_name == github.repository" in str(com.get("if", ""))
+    com_text = yaml.dump(com["steps"])
+    assert "uart-stdio-bridge selftest" in com_text and "--out" in com_text
+    assert "--transport-mode virtual_com0com" in com_text
+    for case in ("win-com-txrx-bridge", "win-com-open-exclusive", "win-com-cancel-close"):
+        assert case in com_text, f"windows-com-selfhosted 須執行 {case}"
+    assert '--case "win-com-*"' not in com_text  # --case 為完全相符的 stem，不支援 glob
+    pw_text = yaml.dump(jobs["pytest-windows"]["steps"])
+    assert "--junitxml" in pw_text

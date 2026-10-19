@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serialwrap.local/schemas/l1-results.schema.json",
+  "title": "l1-results.v1 報告（P2-T13，R5-F3／R5-F4；schema_version 2）",
+  "description": "SW_RESOURCE_REPORT 寫出的 pytest 報告，同時是 L1 判定（tests/acceptance/l1_judge.py）的輸入。判定端另以 judge() 核對欄位語意；本 schema 僅描述結構。",
+  "type": "object",
+  "required": [
+    "schema_version", "format", "runner", "platform", "argv", "markexpr",
+    "counts", "resources", "not_collected_platform", "core_portable_platform_skips",
+    "collected", "deselected", "results", "exit_code", "finished", "deployed_content"
+  ],
+  "properties": {
+    "schema_version": {"const": 2},
+    "format": {"const": "l1-results.v1"},
+    "runner": {"enum": ["pytest", "cargo"]},
+    "platform": {"enum": ["linux", "windows"]},
+    "argv": {"type": "array", "items": {"type": "string"}},
+    "markexpr": {"type": "string"},
+    "counts": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/tally"}
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/tally"}
+    },
+    "not_collected_platform": {"type": "array", "items": {"type": "string"}},
+    "core_portable_platform_skips": {"type": "array", "items": {"type": "string"}},
+    "collected": {"type": "array", "items": {"type": "string"}},
+    "deselected": {"type": "array", "items": {"type": "string"}},
+    "results": {"type": "array", "items": {"$ref": "#/$defs/row"}},
+    "exit_code": {"type": "integer"},
+    "finished": {"type": "boolean"},
+    "deployed_content": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "required": ["start", "end"],
+          "properties": {
+            "start": {"$ref": "#/$defs/deployedContent"},
+            "end": {"$ref": "#/$defs/deployedContent"},
+            "daemon_live": {"type": "array"}
+          }
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "tally": {
+      "type": "object",
+      "required": ["passed", "failed", "skipped"],
+      "additionalProperties": false,
+      "properties": {
+        "passed": {"type": "integer", "minimum": 0},
+        "failed": {"type": "integer", "minimum": 0},
+        "skipped": {"type": "integer", "minimum": 0}
+      }
+    },
+    "row": {
+      "type": "object",
+      "required": ["nodeid", "outcome", "skip_kind", "phases"],
+      "additionalProperties": false,
+      "properties": {
+        "nodeid": {"type": "string", "minLength": 1},
+        "outcome": {"enum": ["passed", "failed", "skipped", "error", "xfailed", "xpassed"]},
+        "skip_kind": {"enum": ["platform", "capability", "other", null]},
+        "phases": {
+          "type": "object",
+          "required": ["setup", "call", "teardown"],
+          "additionalProperties": false,
+          "properties": {
+            "setup": {"enum": ["passed", "failed", "skipped", null]},
+            "call": {"enum": ["passed", "failed", "skipped", null]},
+            "teardown": {"enum": ["passed", "failed", "skipped", null]}
+          }
+        }
+      }
+    },
+    "deployedContent": {
+      "type": "object",
+      "required": ["schema_version", "error", "bundle_tree_sha256", "release_manifest_sha256"],
+      "properties": {
+        "schema_version": {"const": "deployed-content.v1"},
+        "error": {"type": ["string", "null"]},
+        "bundle_tree_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "release_manifest_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
+      }
+    }
+  }
+}
