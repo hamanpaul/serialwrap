@@ -274,7 +274,13 @@ struct BrokenPipeWriter;
 
 impl Write for BrokenPipeWriter {
     fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
-        Err(io::Error::from_raw_os_error(32))
+        // 平台真實的斷管 OS 錯誤（不用 cfg）：POSIX 為 EPIPE（32）；Windows 的 32 是
+        // ERROR_SHARING_VIOLATION，斷管為 ERROR_BROKEN_PIPE（109）／ERROR_NO_DATA（232）。
+        let code = [32, 109, 232]
+            .into_iter()
+            .find(|&c| io::Error::from_raw_os_error(c).kind() == io::ErrorKind::BrokenPipe)
+            .expect("本平台無對應斷管的 OS 錯誤碼");
+        Err(io::Error::from_raw_os_error(code))
     }
 
     fn flush(&mut self) -> io::Result<()> {

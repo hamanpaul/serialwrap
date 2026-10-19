@@ -210,7 +210,14 @@ fn check_int_digits(value: &PyValue) -> Result<(), String> {
 }
 
 /// Python `str(OSError)`（`[Errno N] strerror`）。Rust 的 `Display` 會追加 ` (os error N)`，於此去除。
+///
+/// 斷管：Python 寫 stdout 遇斷管一律為 `BrokenPipeError: [Errno 32] Broken pipe`（POSIX 為 EPIPE；
+/// Windows CRT 把 `ERROR_BROKEN_PIPE`／`ERROR_NO_DATA` 映射成 EPIPE）。Rust 在 Windows 的
+/// `raw_os_error` 是 Win32 碼，不能直接當 errno 印，故依 `ErrorKind` 統一輸出。
 fn py_io_error_text(error: &std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::BrokenPipe {
+        return "[Errno 32] Broken pipe".to_string();
+    }
     match error.raw_os_error() {
         Some(code) => {
             let display = error.to_string();
