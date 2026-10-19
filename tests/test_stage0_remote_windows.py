@@ -608,12 +608,12 @@ def test_native_spawn_alive_terminate_tree(tmp_path):
     time.sleep(0.5)
     assert rt.pid_alive(pid, ticks) is False
     assert rt.pid_alive(child_pid, child_ticks) is False
-    out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True).stdout
-    assert str(pid) not in out
-    child_out = subprocess.run(
-        ["tasklist", "/FI", f"PID eq {child_pid}"], capture_output=True, text=True
-    ).stdout
-    assert str(child_pid) not in child_out
+    # tasklist 輸出為系統 ANSI 碼頁（繁中為 Big5），不可用 text=True 依 UTF-8 解碼；
+    # PID 僅含 ASCII 數字，以 bytes 比對即可保持同等斷言強度。
+    out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True).stdout
+    assert str(pid).encode("ascii") not in out
+    child_out = subprocess.run(["tasklist", "/FI", f"PID eq {child_pid}"], capture_output=True).stdout
+    assert str(child_pid).encode("ascii") not in child_out
 
 
 # ---------------------------------------------------------------------------

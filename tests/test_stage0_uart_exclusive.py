@@ -1725,7 +1725,8 @@ class TestWindowsNativeCom:
         com_pair = os.environ.get("SW_TEST_COM_PAIR")
         if not com_pair:
             pytest.skip("EVIDENCE_MISSING: SW_TEST_COM_PAIR not configured")
-        com_a = com_pair.split(",")[0].strip()
+        # 格式依 rust-architecture.md：SW_TEST_COM_PAIR=COMa:COMb（COMa＝DUT-side A，serialwrap 開啟）
+        com_a = com_pair.split(":")[0].strip()
         p1 = sp._PySerialPort(com_a, UartProfile())
         p1.open()
         try:
