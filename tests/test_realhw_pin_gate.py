@@ -255,6 +255,8 @@ def test_state_dir_windows(tmp_path, monkeypatch):
     from realhw import preflight as rp
 
     monkeypatch.setenv("HOME", str(tmp_path))
+    # Windows 原生 Python 的 expanduser("~") 取 USERPROFILE 而非 HOME（與產品 sw_core.constants._xdg 相同）
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.delenv("XDG_STATE_HOME", raising=False)
     assert rp.resolve_state_dir({}, os_name="nt") == tmp_path / ".local" / "state" / "serialwrap"
 
