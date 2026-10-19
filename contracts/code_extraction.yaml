@@ -26,10 +26,7 @@ namespaces:
       - {kind: subscript_load, key: error_code}
       - {kind: attribute_load, attr: code}
       - {kind: attribute_load, attr: error_code}
-    passthrough:
-      - {kind: attribute_load, attr: last_error, emits: last_error_passthrough}
-      - {kind: call_method_arg, method: get, arg: last_error, emits: last_error_passthrough}
-      - {kind: subscript_load, key: last_error, emits: last_error_passthrough}
+    passthrough: []
   session_last_error:
     sinks:
       - {kind: attribute_store, attr: last_error}

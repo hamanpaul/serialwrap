@@ -1038,7 +1038,7 @@ def test_ec_unreachable_set() -> None:
     """EXISTING 不可達碼集合精確凍結，且所有 APPROVED 碼必須不可達。"""
     by = _ec_by_code()
     unreachable_existing = {c for c, e in by.items() if not e.reachable and e.status == "EXISTING"}
-    assert unreachable_existing == {"FLASH_TARGET_IS_CONSOLE", "UNKNOWN_EVENT_CMD", "COMMAND_FAILED"}
+    assert unreachable_existing == {"FLASH_TARGET_IS_CONSOLE", "UNKNOWN_EVENT_CMD", "COMMAND_FAILED", "NOT_READY"}
     approved = {c for c, e in by.items() if e.status == "APPROVED"}
     unreachable = {c for c, e in by.items() if not e.reachable}
     assert approved <= unreachable

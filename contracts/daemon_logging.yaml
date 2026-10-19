@@ -136,7 +136,7 @@ messages:
     level: WARNING
     template: "已達 max_sessions=%d，忽略裝置 %s"
     args: [max_sessions, by_id]
-    source: "sw_core/session_manager.py:4395"
+    source: "sw_core/session_manager.py:4401"
 
   - id: reboot_recovery_ensure_ready_exception
     logger: serialwrap
@@ -144,7 +144,7 @@ messages:
     template: "reboot-recovery ensure_ready 例外（session=%s），續迴圈待逾時收尾"
     args: [session_id]
     exc_info: true
-    source: "sw_core/session_manager.py:5752"
+    source: "sw_core/session_manager.py:5758"
 
   - id: console_rx_handler_exception
     logger: serialwrap
@@ -306,14 +306,14 @@ messages:
     level: WARNING
     template: "預開 UART handle 關閉失敗（by_id=%s）：%s"
     args: [op.by_id, exc]
-    source: "sw_core/session_manager.py:3938"
+    source: "sw_core/session_manager.py:3944"
 
   - id: attach_op_release_state_persist_failed
     logger: serialwrap
     level: ERROR
     template: "release 持久化失敗（session=%s）：%s"
     args: [session.session_id, exc]
-    source: "sw_core/session_manager.py:3968"
+    source: "sw_core/session_manager.py:3974"
 
   - id: shutdown_skip_device_update
     logger: serialwrap
@@ -321,7 +321,7 @@ messages:
     dropped: true
     template: "shutdown 中，略過裝置更新"
     args: []
-    source: "sw_core/session_manager.py:3653"
+    source: "sw_core/session_manager.py:3659"
 
   - id: shutdown_skip_profile_attach
     logger: serialwrap
@@ -329,7 +329,7 @@ messages:
     dropped: true
     template: "shutdown 中，略過 attach %s"
     args: [by_id]
-    source: "sw_core/session_manager.py:3722"
+    source: "sw_core/session_manager.py:3728"
 
   - id: shutdown_skip_attach_start
     logger: serialwrap
@@ -337,7 +337,7 @@ messages:
     dropped: true
     template: "shutdown 中，略過 attach %s"
     args: [by_id]
-    source: "sw_core/session_manager.py:4371"
+    source: "sw_core/session_manager.py:4377"
 
   - id: shutdown_skip_dynamic_attach
     logger: serialwrap
@@ -345,7 +345,7 @@ messages:
     dropped: true
     template: "shutdown 或 drain 中，略過動態 attach %s"
     args: [by_id]
-    source: "sw_core/session_manager.py:5028"
+    source: "sw_core/session_manager.py:5034"
 
   - id: console_line_rejected
     logger: serialwrap
@@ -374,25 +374,25 @@ messages:
     template: "reboot-recovery ensure_ready TX 例外（session=%s）"
     args: [session_id]
     exc_info: true
-    source: "sw_core/session_manager.py:5746"
+    source: "sw_core/session_manager.py:5752"
 
   - id: test_kill_after_save_ignored_non_isolated
     logger: serialwrap
     level: WARNING
     template: "SERIALWRAP_TEST_KILL_AFTER_SAVE=1 已忽略：%s（非隔離實例不得終止行程）"
     args: [reason]
-    source: "sw_core/session_manager.py:7766"
+    source: "sw_core/session_manager.py:7774"
 
   - id: test_kill_after_save_fired
     logger: serialwrap
     level: WARNING
     template: "SERIALWRAP_TEST_KILL_AFTER_SAVE=1：state 已落盤，於回應前以 os._exit(137) 模擬程序被殺（隔離實例）"
     args: []
-    source: "sw_core/session_manager.py:7771"
+    source: "sw_core/session_manager.py:7779"
 
   - id: test_pause_before_release_save_ignored_non_isolated
     logger: serialwrap
     level: WARNING
     template: "SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE 已忽略：%s（非隔離實例不得暫停）"
     args: [reason]
-    source: "sw_core/session_manager.py:7793"
+    source: "sw_core/session_manager.py:7801"

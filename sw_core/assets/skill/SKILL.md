@@ -49,7 +49,7 @@ description: 透過 serialwrap broker + CLI 進行多 agent UART 存取，提供
   serialwrap session clear --selector <COM>   # 下一次 attach 就套用，不必重啟 daemon
   ```
   `fallback` 是**未經量測**的暫時分類（attach 當下板子還在噴 boot log 就會掉進來），下一次 attach 本來也會自動再偵測一次；pin 則是繞過偵測的權威指定。`yaml-target` 的 session 不接受 pin（回 `PROFILE_IS_EXPLICIT`）。
-- `SESSION_NOT_READY` 保留給「`command_capable` 為 True 但尚未通過 probe（仍 `ATTACHED`）」的情形——這種等 probe 完成或 `session recover` 即可。
+- `SESSION_NOT_READY` 用於 `command_capable` session 尚未達 `READY` 的情形。遇到 `session.attach`／`session.recover` 回應時，先讀頂層 `last_error`、`last_error_detail` 並依 Session last_error 表處置；終態值不可盲目重試。
 - `serialwrap session self-test` 的最外層 result 直接帶 `command_capable` 欄位，不必鑽進巢狀 dict 判斷。
 
 ## 裝置 handoff（把 raw device 暫時交給外部工具，如 MCU 韌體燒錄）（#54）
@@ -60,9 +60,9 @@ description: 透過 serialwrap broker + CLI 進行多 agent UART 存取，提供
 4. 期間 `serialwrap session self-test --selector COM0` 在 `RELEASED` 會回 `external_holder` / `reclaimable` / `recommended_action`（`wait_external_flash` 或 `device_attach`）；屬唯讀偵測，不開 tty、不干擾燒錄。
 5. 被遺忘的 release 可由 self-test 的 `reclaimable=true` 辨識（裝置不會永久卡住，但需明確 `device attach` 收回）。
 
-## UART 獨占、socket 權限與設定探索（BC-04、SC-08、SC-09）
+## UART 獨占、socket 權限與設定探索（BC-04、SC-09）
 - **BC-04**：daemon 持有裝置時**不可再直接開 tty**（勿 `minicom -D /dev/ttyUSBx`、勿在外部腳本 `open()` 同一 tty）。POSIX 以 `flock`＋`TIOCEXCL` 獨占，並在任何 I/O 前重掃 holder；衝突時 `session attach`／`device attach` 回 `DEVICE_STILL_HELD`（附 `pids` 與 `holder_unknown`；`holder_unknown: true` 代表查不到 PID 不等於無 holder，不可視為可收回）。人類 console 走 `serialwrap session console-attach`（或 `serialwrap-minicom`），外部工具獨佔走上方 `device release`／`device attach`。
-- **SC-08**：新建執行期目錄為 `0700`，Unix socket 預設 `0600`（只有 daemon 擁有者可連）。需讓群組成員連入時，須明確設定 `SERIALWRAP_SOCKET_GROUP`，socket 才改為 `0660` 並 chgrp；未設定時其他使用者連不上屬預期行為，不是 daemon 故障。
+- **POSIX socket 權限基線**：Unix socket 維持 `0660`；新建執行期目錄權限依 process umask 決定。可設定 `SERIALWRAP_SOCKET_GROUP` 將 socket 設為指定群組。
 - **SC-09**：設定讀取順序為 `SERIALWRAP_CONFIG` → `~/.config/serialwrap/config.yaml` → 存在時的 `/etc/serialwrap/config.yaml`（系統檔唯讀）；寫入落在 `SERIALWRAP_CONFIG`（有設定時）或使用者設定檔。排查 socket 路徑或監管模式不符時，先確認實際生效的是哪一份設定。
 
 ## MCU 韌體燒錄端點 `/dev/ttyMCU`（#55）
@@ -309,7 +309,7 @@ serialwrap mcu status
 | `MOVE_FAILED` | rpc／posix、windows | 視情況 | mv 之後未見 sentinel，無法確認檔案搬移結果 | 先確認目標檔與暫存檔狀態，再決定是否重試 |
 | `MOVE_TIMEOUT` | rpc／posix、windows | 視情況 | mv 之後 prompt 逾時，搬移結果不明 | 先確認目標檔與暫存檔狀態，再決定是否重試 |
 | `NEEDS_SUDO` | cli_local／posix | 修正參數後 | systemd-system 的 start、stop 或 restart 未帶 --with-sudo | 加上 --with-sudo 後重試（提權動作需人工確認） |
-| `NOT_READY` | rpc／posix、windows | 視情況 | session 為 command-capable 且狀態非 READY／ATTACHING，又無 last_error 可回報 | 等待 session 進入 READY 後重試；必要時以 session self-test 取得分類 |
+| `NOT_READY` | rpc／posix、windows | 視情況 | session 為 command-capable 且狀態非 READY／ATTACHING，又無 last_error 可回報；SC-34 起 session.attach 改回 SESSION_NOT_READY | 此碼目前 production 不可達，僅作為契約保留；session.attach／session.recover 失敗時請讀取頂層 last_error 並依該值的處置指引操作 |
 | `NO_ACTIVE_CAPTURE` | rpc／posix、windows | 否 | session 沒有進行中的 log capture | 確認是否已執行 log start；若無進行中的 capture 則無需 stop |
 | `NO_SYSTEMD` | cli_local／posix、windows | 修正參數後 | on-demand 或未知的監管模式下呼叫 service 管理動作 | 依 supervision_mode 改用正確的 daemon 管理方式（on-demand 使用 daemon start 與 daemon stop） |
 | `PROFILE_IS_EXPLICIT` | rpc／posix、windows | 修正參數後 | session 的 profile 來源為 yaml-target，不可 pin 或 unpin | 改為修改 YAML target 設定，而非使用 pin 或 unpin |
@@ -327,7 +327,7 @@ serialwrap mcu status
 | `SESSION_BUSY` | rpc、rec／posix、windows | 是 | 同一 session 的前景操作仍在進行中 | 等待前景操作完成後重試 |
 | `SESSION_INTERACTIVE_BUSY` | rpc、rec／posix、windows | 是 | 已有不可搶占的 interactive lease，或 SC-13 到期收尾的 ownership restore 尚未完成；相關操作被拒 | 等待 interactive lease 結束或到期收尾完成後重試 |
 | `SESSION_NOT_FOUND` | rpc／posix、windows | 修正參數後 | selector 未對應任何 session | 以 session list 確認 selector 正確後重送 |
-| `SESSION_NOT_READY` | rpc、rec／posix、windows | 視情況 | session 狀態不符（非 READY，或 bridge 不存在） | 等待 session 進入 READY 後重試；必要時以 session self-test 檢查狀態 |
+| `SESSION_NOT_READY` | rpc、rec／posix、windows | 視情況 | session 狀態不符（非 READY，或 bridge 不存在）；session.attach／session.recover 失敗時另附 last_error、last_error_detail | session.attach／session.recover 失敗時先讀 last_error、last_error_detail 並依 Session last_error 表處置；終態值勿反覆重試，其他暫時狀況可等待 READY 後再重試 |
 | `SESSION_QUEUE_FULL` | rpc／posix、windows | 是 | session 已接受或執行中的命令（含已 cancel 但 worker 仍執行）達 256 筆上限 | 等待排隊命令完成後重試 |
 | `SESSION_RECOVERING` | rpc、rec／posix、windows | 是 | session 恢復中（RECOVERING），操作暫不可用 | 等待恢復完成（session get_state 不再顯示 RECOVERING）後重試 |
 | `SOCKET_ERROR` | cli_client／posix、windows | 視情況 | 連線失敗（connect 或 send／recv 的 OS 錯誤，或平台不支援 AF_UNIX） | 僅白名單唯讀方法可由 CLI 自動重試；其他方法先以 health.ping 確認 daemon 狀態再決定 |
@@ -351,8 +351,6 @@ serialwrap mcu status
 | `UNKNOWN_EVENT_CMD` | cli_local／posix、windows | 修正參數後 | event 子命令未知 | 改用 event 支援的子命令重試 |
 | `UNKNOWN_PROFILE` | rpc、cli_local／posix、windows | 修正參數後 | profile 名稱不存在 | 以 profile 目錄中存在的名稱重試 |
 | `WAL_MISSING` | rpc／posix、windows | 視情況 | WAL 曾寫入過（current_seq 大於 0）但目前的 WAL 檔不存在 | 執行 serialwrap doctor 檢查 WAL 目錄與狀態 |
-
-passthrough：last_error_passthrough — session.attach 在 command-capable 且 state 不是 READY／ATTACHING、也不是 FLASHING／RECOVERING 時回 error_code=last_error；session.recover 的 REPROBE 分支未恢復時以 ok:true 回 error_code=last_error 或 SESSION_NOT_READY（值見下方 last_error 表）
 <!-- END: generated-fact marker="error-codes" -->
 
 ### Session last_error

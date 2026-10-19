@@ -217,7 +217,9 @@ class TestDeviceHotplug(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["action"], "REPROBE")
         self.assertFalse(result["recovered"])
-        self.assertEqual(result["error_code"], "PROMPT_TIMEOUT")
+        self.assertEqual(result["error_code"], "SESSION_NOT_READY")
+        self.assertEqual(result["last_error"], "PROMPT_TIMEOUT")
+        self.assertIsNone(result["last_error_detail"])
         self.assertEqual(result["session"]["state"], "ATTACHED")
         self.assertEqual(result["session"]["last_error"], "PROMPT_TIMEOUT")
 

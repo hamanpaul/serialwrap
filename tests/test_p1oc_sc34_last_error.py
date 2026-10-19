@@ -195,11 +195,11 @@ def test_catalog_has_no_passthrough_section() -> None:
     codes, passthrough = catalog.load_error_codes(ROOT)
     assert passthrough == ()
     cfg = extract.load_extraction_config(ROOT / "contracts" / "code_extraction.yaml")
-    ec_ns = cfg.namespaces.get("error_code")
+    ec_ns = next((ns for ns in cfg.namespaces if ns.name == "error_code"), None)
     assert ec_ns is not None
-    assert ec_ns.passthrough == []
+    assert ec_ns.passthrough == ()
     rpc_schema_text = (ROOT / "contracts" / "rpc_schema.json").read_text(encoding="utf-8")
-    assert "@last_error_passthrough" not in rpc_schema_text
+    assert "last_error_passthrough" not in rpc_schema_text
 
 
 def test_rpc_attach_response_matches_schema(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -228,7 +228,9 @@ def test_rpc_attach_response_matches_schema(tmp_path: Path, monkeypatch: pytest.
     assert resp["ok"] is False
     assert resp["error_code"] == "SESSION_NOT_READY"
     assert resp["last_error"] == "CREDENTIALS_UNRESOLVED"
-    assert list(resp.keys()) == ["ok", "error_code", "last_error", "last_error_detail", "session"]
+    expected_order = ["ok", "error_code", "last_error", "last_error_detail", "session"]
+    assert list(resp.keys()) == [*expected_order, "version"]
+    assert resp["version"] == svc._version
 
     schema_doc = json.loads((ROOT / "contracts" / "rpc_schema.json").read_text(encoding="utf-8"))
     attach_res = schema_doc["x-methods"]["session.attach"]["result"]
@@ -237,4 +239,4 @@ def test_rpc_attach_response_matches_schema(tmp_path: Path, monkeypatch: pytest.
     assert fail_schema is not None, "rpc_schema.json 必須包含 attach 失敗分支（x-order: [ok, error_code, last_error, last_error_detail, session]）"
     resolver = jsonschema.RefResolver.from_schema(schema_doc)
     jsonschema.validate(instance=resp, schema=fail_schema, resolver=resolver)
-    assert list(resp.keys()) == fail_schema.get("x-order")
+    assert [key for key in resp if key != "version"] == fail_schema.get("x-order")

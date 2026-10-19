@@ -3527,16 +3527,22 @@ class SessionManager:
     def _attach_state_result(self, session: SessionRuntime, snap: dict[str, Any]) -> dict[str, Any]:
         """#94：依 attach 契約把 session 快照轉成回傳 dict。command-capable 卡在非 READY/ATTACHING
         的態回 ok:False + 狀態專用 error_code（FLASHING→FLASHING_BUSY、RECOVERING→SESSION_RECOVERING、
-        其餘→last_error/NOT_READY）；READY / ATTACHING（attach 進行中）與 passthrough（非
+        其餘→SESSION_NOT_READY，並另外回報 last_error 欄位）；READY / ATTACHING（attach 進行中）與 passthrough（非
         command-capable）回 ok:True。統一 human-lease / bridge-present else / 同步 probe 三處邏輯，
         避免各分支 error_code 映射分歧（codex 對抗審查第三輪補洞）。"""
         state = snap.get("state")
         if session.profile.command_capable and state not in ("READY", "ATTACHING"):
-            code = {
-                "FLASHING": "FLASHING_BUSY",
-                "RECOVERING": "SESSION_RECOVERING",
-            }.get(state) or snap.get("last_error") or "NOT_READY"
-            return {"ok": False, "error_code": code, "session": snap}
+            if state == "FLASHING":
+                return {"ok": False, "error_code": "FLASHING_BUSY", "session": snap}
+            if state == "RECOVERING":
+                return {"ok": False, "error_code": "SESSION_RECOVERING", "session": snap}
+            return {
+                "ok": False,
+                "error_code": "SESSION_NOT_READY",
+                "last_error": snap.get("last_error"),
+                "last_error_detail": snap.get("last_error_detail"),
+                "session": snap,
+            }
         return {"ok": True, "session": snap}
 
     def attach_session(self, selector: str) -> dict[str, Any]:
@@ -7353,12 +7359,14 @@ class SessionManager:
                 "session": result["session"],
             }
             if not recovered:
-                payload["error_code"] = result["session"].get("last_error") or "SESSION_NOT_READY"
+                payload["error_code"] = "SESSION_NOT_READY"
+                payload["last_error"] = result["session"].get("last_error")
+                payload["last_error_detail"] = result["session"].get("last_error_detail")
                 # #162 C3：手動 recover 失敗且 RX tail 顯示板子卡在 bootloader → 回可
                 # 行動分類，取代目前無資訊的 PROMPT_UNAVAILABLE（operator 才知道要開
                 # interactive 手動 `boot`，而不是繼續無效重試）。
                 matched = self._bootloader_evidence(session, bridge)
-                if matched is not None or payload["error_code"] == ERROR_BOOTLOADER_STUCK:
+                if matched is not None or payload["last_error"] == ERROR_BOOTLOADER_STUCK:
                     payload["classification"] = "BOOTLOADER"
                     payload["recommended_action"] = "recover_interactive"
                     if matched is not None:

@@ -735,16 +735,17 @@ codes:
     sources: ["sw_core/service_ctl.py:42", "sw_core/cli.py:456", "sw_core/cli.py:639"]
   - code: NOT_READY
     status: EXISTING
-    reachable: true
+    reachable: false
     scope: {interfaces: [rpc], methods: ["session.attach"], platforms: [posix, windows]}
-    meaning: "session 為 command-capable 且狀態非 READY／ATTACHING，又無 last_error 可回報"
+    meaning: "session 為 command-capable 且狀態非 READY／ATTACHING，又無 last_error 可回報；SC-34 起 session.attach 改回 SESSION_NOT_READY"
+    unreachable_reason: "SC-34（OD-14 #1）起 session.attach 改回 SESSION_NOT_READY"
     side_effect: "無"
     retryable: "conditional"
     uart_tx: none
-    agent_action: "等待 session 進入 READY 後重試；必要時以 session self-test 取得分類"
+    agent_action: "此碼目前 production 不可達，僅作為契約保留；session.attach／session.recover 失敗時請讀取頂層 last_error 並依該值的處置指引操作"
     extra_fields: ["session"]
-    contract_tests: ["tests/test_contracts_gap_codes.py::TestGapMemory::test_not_ready_attach_state_result"]
-    behavior_change: []
+    contract_tests: ["tests/test_p1oc_sc34_last_error.py::test_not_ready_code_unreachable_in_source"]
+    behavior_change: ["SC-34"]
     sources: ["sw_core/session_manager.py:2146"]
   - code: NO_ACTIVE_CAPTURE
     status: EXISTING
@@ -796,7 +797,7 @@ codes:
     uart_tx: none
     agent_action: "改用 command-capable 的 profile，或改以 console 進行互動操作"
     extra_fields: ["hint", "session"]
-    contract_tests: ["tests/test_cowork_session_usability.py::TestCommandCapableGate::test_empty_ready_probe_not_command_capable_cmd_submit"]
+    contract_tests: ["tests/test_cowork_session_usability.py::TestCommandCapableGate::test_non_passthrough_empty_ready_probe_cmd_submit_still_not_capable"]
     behavior_change: []
     sources: ["sw_core/service.py:628"]
   - code: PROMPT_TIMEOUT
@@ -975,17 +976,17 @@ codes:
     behavior_change: []
     sources: ["sw_core/session_manager.py:1720", "sw_core/session_manager.py:2158", "sw_core/session_manager.py:3937"]
   - code: SESSION_NOT_READY
-    status: EXISTING
+    status: IMPLEMENTED
     reachable: true
     scope: {interfaces: [rpc, rec], methods: ["command.submit", "file.pull", "file.push", "session.attach", "session.console_attach", "session.console_detach", "session.console_list", "session.interactive_open", "session.interactive_send", "session.interactive_status", "session.recover", "command.get"], platforms: [posix, windows]}
-    meaning: "session 狀態不符（非 READY，或 bridge 不存在）"
+    meaning: "session 狀態不符（非 READY，或 bridge 不存在）；session.attach／session.recover 失敗時另附 last_error、last_error_detail"
     side_effect: "無（gate 拒絕）；例外：session.attach／session.recover 於 probe 之後回此碼時，probe 位元組可能已送出"
     retryable: "conditional"
     uart_tx: none
-    agent_action: "等待 session 進入 READY 後重試；必要時以 session self-test 檢查狀態"
-    extra_fields: ["error_detail", "selector", "session", "session_id", "interactive_id"]
-    contract_tests: ["tests/test_bootloader_recovery.py::TestInteractiveOpenAllowAttached::test_allow_attached_false_rejects_attached", "tests/test_cowork_session_usability.py::TestCommandCapableGate::test_command_capable_when_ready_probe_set"]
-    behavior_change: []
+    agent_action: "session.attach／session.recover 失敗時先讀 last_error、last_error_detail 並依 Session last_error 表處置；終態值勿反覆重試，其他暫時狀況可等待 READY 後再重試"
+    extra_fields: ["error_detail", "selector", "session", "session_id", "interactive_id", "last_error", "last_error_detail"]
+    contract_tests: ["tests/test_bootloader_recovery.py::TestInteractiveOpenAllowAttached::test_allow_attached_false_rejects_attached", "tests/test_cowork_session_usability.py::TestCommandCapableGate::test_command_capable_when_ready_probe_set", "tests/test_p1oc_sc34_last_error.py::test_attach_state_result_separates_last_error", "tests/test_p1oc_sc34_last_error.py::test_recover_reprobe_not_recovered_shape"]
+    behavior_change: ["SC-34"]
     sources: ["sw_core/service.py:642", "sw_core/arbiter.py:196", "sw_core/session_manager.py:2515", "sw_core/session_manager.py:3646", "sw_core/session_manager.py:4645"]
   - code: SESSION_QUEUE_FULL
     status: IMPLEMENTED
@@ -1296,10 +1297,4 @@ codes:
     contract_tests: ["tests/test_wal_missing_detection.py::TestReadPathsReportMissing::test_tail_raw_reports_wal_missing", "tests/test_wal_missing_detection.py::TestReadPathsReportMissing::test_tail_text_reports_wal_missing"]
     behavior_change: []
     sources: ["sw_core/service.py:545"]
-passthrough:
-  - id: last_error_passthrough
-    namespace_ref: session_last_errors
-    scope: {interfaces: [rpc], methods: ["session.attach", "session.recover"], platforms: [posix, windows]}
-    rule: "session.attach 在 command-capable 且 state 不是 READY／ATTACHING、也不是 FLASHING／RECOVERING 時回 error_code=last_error；session.recover 的 REPROBE 分支未恢復時以 ok:true 回 error_code=last_error 或 SESSION_NOT_READY"
-    owner_confirmation: pending_default
-    reconciliation_refs: [RPC-D-02, ERR-7.2-b, ERR-7.3-1, SES-16.5-02]
+passthrough: []

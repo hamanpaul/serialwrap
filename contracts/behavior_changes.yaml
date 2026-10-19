@@ -1,10 +1,11 @@
 # 行為變更登記（BC／SC／DF）。由 P0-T5 建立，對應 docs/rust-refactor/plans/01-stage0-contracts.md T5 與調和表 spec-reconciliation.md §1。
-# BC-01～BC-05 依 OD-04 核准；SC-01～SC-27 與 DF-01～DF-17、DF-19 依定稿規格與調和表推導（DF-18 保留給 P7）。
+# BC-01～BC-05 依 OD-04 核准；SC-01～SC-27（SC-08 已依 OD-14 #3 撤回）與 SC-34、SC-35、DF-01～DF-17、DF-19 依定稿規格、調和表與 OD-14 推導（DF-18 保留給 P7）。
+# SC-08 依 OD-14 #3 撤回（UDS 維持 0660），編號保留不重用。
 # 登錄時全部為 APPROVED（核准未實作）；實作後依狀態推進協定改為 IMPLEMENTED，VERIFIED 只由擁有者標記。
 # applies_to.python.min_version 為目標 release 版號（不代表 VERSION 已是該版）；rust_only 項目為 null。
 # 檔內不寫 contract_revision（tree SHA 只在 build／capture 時計算）。字串一律以雙引號呈現，避免 YAML 1.1 bool／日期陷阱。
 schema_version: 1
-revision: 2
+revision: 3
 changes:
   - id: "BC-01"
     kind: "BC"
@@ -231,9 +232,9 @@ changes:
       date: "2026-10-15"
       decision_ref: "serialwrap-rust-spec-final.md §5.2、§5.3、§9.4"
       basis: "spec_final"
-    owner_confirmation: "pending_default"
+    owner_confirmation: "confirmed"
     owner_item: 4
-    default_if_pending: "`{\"ok\":false,\"error_code\":\"SESSION_RECOVERING\",\"drain_stalled\":true,\"drain_timeout_epoch\":N,\"session\":…}`。回條遲到時仍完成 release，下次再呼叫回 `already_released`"
+    default_if_pending: null
     applies_to:
       python:
         min_version: "0.4.0"
@@ -248,7 +249,7 @@ changes:
     case_ids: ["sc04-drain-recovering-release-timeout"]
     compatibility_impact: "斷線、I/O error、release、clear、bind 的 detach 期間可觀測為 RECOVERING；release 在 handle 關閉回條後才回成功；超過 3000 ms 回 SESSION_RECOVERING 並附 drain_stalled:true 與 drain_timeout_epoch；SessionPublic 新增 drain_stalled、drain_timeout_epoch 兩欄（位於 capture 之後）。"
     approval_conditions: "ADR-06 安全骨架；只有「release 遇 drain 逾時」的回應形狀需確認；規格明文；改為可喚醒、可取消；fence：授權重驗與 OS 實際提交在同一臨界區（Rust `FenceSubmitGate`、Python `_tx_fence_lock` 臨界區內單次非阻塞 `os.write`，`_state_lock` 只做 pre-check），鎖只跨非阻塞提交、不跨完成等待；禁止「驗證→放鎖→write」（R0-F1，arch §5.4 第 3 點；P1 T20、P5 Task 9 測試）。Python Windows `_PySerialPort` 是唯一例外：每段 ≤64 bytes 的 `serial.write` 在鎖內阻塞（上限 `write_timeout` 5 s），所以 `begin_drain` 取鎖有上限（`DRAIN_FENCE_ACQUIRE_S`），取不到時先凍結、在途段交 Phase 2 背景完成；drain 3,000 ms 期限自請求起算並涵蓋 Phase 1 等鎖（R3-F3，§5.2.5；P1 T07 `test_finish_drain_deadline_counts_from_begin`、T08 `test_release_drain_deadline_includes_lock_wait`、T20 `test_windows_guarded_write_stall_reports_drain_stalled_on_time`）。範圍含自動登入、密碼與 ready／reconfirm probe：Python 不得以 `permit=None`（只查 drain／flash）送出，改帶 `system_probe` permit＋`login_gen`，每次提交重驗 Quiet、世代與 Drain；`_boot_quiet_blocks_probe` 只是 pre-check（R2-F1，§5.2.1；P1 T20 `test_login_probe_quiet_armed_after_precheck_before_submit_zero_tx`、P7 Task 7 `login_probe_authorized_then_quiet_arm_before_os_submit_zero_tx`）"
-    related_decisions: []
+    related_decisions: ["OD-14"]
   - id: "SC-05"
     kind: "SC"
     title: "device.attach 同步重新取得獨占"
@@ -329,33 +330,6 @@ changes:
     case_ids: ["sc07-tx-wal-os-confirmed-bytes"]
     compatibility_impact: "TX WAL 只記錄 OS 已確認寫出的 bytes，順序等於實際寫入順序；TX WAL 內容可能短於送出的 payload。"
     approval_conditions: "TX WAL 只記錄 OS 已確認寫出的 bytes，順序等於實際寫入順序"
-    related_decisions: []
-  - id: "SC-08"
-    kind: "SC"
-    title: "UDS 權限預設 0600／目錄 0700"
-    status: "IMPLEMENTED"
-    approval:
-      owner: "spec-final"
-      date: "2026-10-15"
-      decision_ref: "serialwrap-rust-spec-final.md ADR-04"
-      basis: "spec_final"
-    owner_confirmation: "pending_default"
-    owner_item: 3
-    default_if_pending: "預設 `0600`，新建目錄 `0700`；system 模式明確指定 `SERIALWRAP_SOCKET_GROUP` 時用 `0660` 加 chgrp"
-    applies_to:
-      python:
-        min_version: "0.4.0"
-      rust:
-        stage: "slice-2.1"
-    approved_at_revision: 1
-    spec_refs: ["ADR-04"]
-    reconciliation_refs: ["RPC-D-05"]
-    scope: "both"
-    ab_participation: "diff"
-    phases: ["P1", "P5"]
-    case_ids: ["sc08-uds-perm-0600"]
-    compatibility_impact: "socket 預設 0600、新建目錄 0700；既有依 0660 群組存取的 client 需明確設定 SERIALWRAP_SOCKET_GROUP 才能維持（owner #3）。"
-    approval_conditions: "預設改 `0600`；system 模式明確指定 group 時保留 `0660`"
     related_decisions: []
   - id: "SC-09"
     kind: "SC"
@@ -819,9 +793,9 @@ changes:
       date: "2026-10-15"
       decision_ref: "serialwrap-rust-spec-final.md §5.5"
       basis: "spec_final"
-    owner_confirmation: "pending_default"
+    owner_confirmation: "confirmed"
     owner_item: 6
-    default_if_pending: "`shell` 走 `cmd.exe /d /s /c`；用 Job Object 處理 timeout；env 白名單加 `SYSTEMROOT`、`COMSPEC`、`PATHEXT`、`TEMP`、`TMP`、`USERPROFILE`"
+    default_if_pending: null
     applies_to:
       python: null
       rust:
@@ -835,7 +809,7 @@ changes:
     case_ids: ["sc26-windows-event-handler"]
     compatibility_impact: "Windows event handler：exec 走 CreateProcess 加 Job Object；shell 走 cmd.exe /d /s /c；timeout 以 TerminateJobObject 終止；env 白名單新增 SYSTEMROOT、COMSPEC、PATHEXT、TEMP、TMP、USERPROFILE。POSIX 行為不變。"
     approval_conditions: "Windows 語意必須定義"
-    related_decisions: []
+    related_decisions: ["OD-14"]
   - id: "SC-27"
     kind: "SC"
     title: "BC-05 Windows remote 延伸 connect 與 benches"
@@ -845,9 +819,9 @@ changes:
       date: "2026-10-15"
       decision_ref: "serialwrap-rust-spec-final.md BC-05"
       basis: "spec_final"
-    owner_confirmation: "pending_default"
+    owner_confirmation: "confirmed"
     owner_item: 7
-    default_if_pending: "**涵蓋**，移除這兩者在 Windows 上的 `REMOTE_NOT_SUPPORTED`"
+    default_if_pending: null
     applies_to:
       python:
         min_version: "0.4.0"
@@ -862,7 +836,61 @@ changes:
     case_ids: ["sc27-windows-connect-benches"]
     compatibility_impact: "BC-05 的 Windows remote 範圍延伸到 connect 與 benches；兩者在 Windows 上移除 REMOTE_NOT_SUPPORTED。"
     approval_conditions: "依調和表 PLT-D-08（BC-05 範圍）：延伸到 connect 與 benches，移除兩者在 Windows 上的 REMOTE_NOT_SUPPORTED（擁有者確認 #7，預設涵蓋）。"
-    related_decisions: []
+    related_decisions: ["OD-14"]
+  - id: "SC-34"
+    kind: "SC"
+    title: "session.attach／recover 的 error_code 與 last_error 分離"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "hamanpaul"
+      date: "2026-10-16"
+      decision_ref: "OD-14"
+      basis: "owner_decision"
+    owner_confirmation: "confirmed"
+    owner_item: 1
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.1"
+    approved_at_revision: 3
+    spec_refs: ["§9.3", "ADR-07", "OD-14"]
+    reconciliation_refs: ["RPC-D-02", "ERR-7.2-b", "ERR-7.3-1", "SES-16.5-02"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P5", "P7"]
+    case_ids: ["sc34-attach-recover-last-error-field"]
+    compatibility_impact: "session.attach 失敗時 error_code 固定為 SESSION_NOT_READY（不再是 last_error 值或 NOT_READY），另以 last_error、last_error_detail 欄位回報；session.recover REPROBE 未恢復時 error_code 固定為 SESSION_NOT_READY 並附同兩欄。依 error_code 比對 last_error 值的 agent 須改讀 last_error 欄位。"
+    approval_conditions: "OD-14 #1：分離；CLI／RPC method 與參數不變"
+    related_decisions: ["OD-14"]
+  - id: "SC-35"
+    kind: "SC"
+    title: "platform=passthrough 30 秒安靜自動 READY 並可送命令"
+    status: "APPROVED"
+    approval:
+      owner: "hamanpaul"
+      date: "2026-10-16"
+      decision_ref: "OD-14"
+      basis: "owner_decision"
+    owner_confirmation: "confirmed"
+    owner_item: 2
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.1"
+    approved_at_revision: 3
+    spec_refs: ["§5.3", "§5.2.1", "OD-14"]
+    reconciliation_refs: ["SES-16.4-03", "SES-16.6-01"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P5", "P7", "P8"]
+    case_ids: ["sc35-passthrough-quiet-ready", "sc35-passthrough-command-completion"]
+    compatibility_impact: "passthrough session 不再登入或送 ready_probe（含 uboot-template）；ATTACHED 連續 30 秒無 RX 自動轉 READY 並接受 command.submit；ATTACHED 時 submit 由 PROFILE_NOT_COMMAND_CAPABLE 改為 SESSION_NOT_READY＋passthrough_ready_in_s；file.push／file.pull 對 passthrough 回 PROFILE_NOT_COMMAND_CAPABLE；命令未命中完成條件時不送 CTRL_C／CTRL_D、session 維持 READY。"
+    approval_conditions: "OD-14 #2：serialwrap 不介入 passthrough UART；完成條件只用既有機制"
+    related_decisions: ["OD-14"]
   - id: "DF-01"
     kind: "DF"
     title: "event rule_id 路徑穿越防護"
@@ -899,9 +927,9 @@ changes:
       date: "2026-10-15"
       decision_ref: "spec-reconciliation.md §1.2"
       basis: "reconciliation"
-    owner_confirmation: "pending_default"
+    owner_confirmation: "confirmed"
     owner_item: 5
-    default_if_pending: "一律以 agent 對待（gate 與升格都比照 agent）；daemon 內部的 human console 路徑不受影響"
+    default_if_pending: null
     applies_to:
       python:
         min_version: "0.4.0"
@@ -916,7 +944,7 @@ changes:
     case_ids: ["df02-human-source-spoof"]
     compatibility_impact: "RPC 帶入的 source 以 human: 開頭時一律以 agent 對待（gate 與升格都比照 agent）；依賴 human source 的既有 client 行為改變。daemon 內部 human console 路徑不受影響。"
     approval_conditions: "安全 gate 可被偽造繞過"
-    related_decisions: []
+    related_decisions: ["OD-14"]
   - id: "DF-03"
     kind: "DF"
     title: "WAL／mirror 歸檔同名不覆蓋"
@@ -1349,42 +1377,7 @@ changes:
     compatibility_impact: "session.self_test 的 nonce probe 在每次 OS 提交前重驗 boot quiet 與 bridge 世代／epoch；被擋時回與 pre-check 同形的 AUTOBOOT_QUIET（零 TX），不等 nonce、不 confirm_ready。FLASHING 中仍回 TARGET_UNRESPONSIVE。"
     approval_conditions: "self-test 是 READY_UNCONFIRMED 的建議出口，不受 ready reconfirm 擋；不與 login run 世代掛鉤；pre-check 通過後才 arm 的 quiet 使 probe 零 TX（來源 SES-16.6-08，R5-F2）。"
     related_decisions: []
-pending_owner_confirmations:
-  - item: 1
-    topic: "session.attach／recover 把 last_error（含 CREDENTIALS_UNRESOLVED）放進 error_code"
-    refs: ["RPC-D-02", "ERR-7.2-b", "ERR-7.3-1", "SES-16.5-02"]
-    default: "保留現況；error_codes.yaml 只放一筆 passthrough 項、不計入 RPC 碼"
-    affects: ["error_codes:passthrough:last_error_passthrough", "session_last_errors:CREDENTIALS_UNRESOLVED"]
-  - item: 2
-    topic: "規格中「passthrough ATTACHED 可進 Arbiter」的例外"
-    refs: ["SES-16.4-03"]
-    default: "不啟用，維持 PROFILE_NOT_COMMAND_CAPABLE"
-    affects: []
-  - item: 3
-    topic: "UDS 權限"
-    refs: ["RPC-D-05", "SC-08"]
-    default: "預設 0600、新建目錄 0700；system 模式明確指定 SERIALWRAP_SOCKET_GROUP 時 0660 加 chgrp"
-    affects: ["SC-08"]
-  - item: 4
-    topic: "release 遇 drain 逾時的回應"
-    refs: ["SC-04"]
-    default: "{ok:false, error_code:SESSION_RECOVERING, drain_stalled:true, drain_timeout_epoch:N, session:…}；回條遲到時仍完成 release，下次呼叫回 already_released"
-    affects: ["SC-04"]
-  - item: 5
-    topic: "RPC 帶入的 human: source"
-    refs: ["RPC-H-05", "DF-02"]
-    default: "一律以 agent 對待；daemon 內部 human console 路徑不受影響"
-    affects: ["DF-02"]
-  - item: 6
-    topic: "Windows event handler"
-    refs: ["EVT-D-S6", "SC-26"]
-    default: "shell 走 cmd.exe /d /s /c；Job Object 處理 timeout；env 白名單加 SYSTEMROOT、COMSPEC、PATHEXT、TEMP、TMP、USERPROFILE"
-    affects: ["SC-26"]
-  - item: 7
-    topic: "BC-05 的 Windows remote 是否涵蓋 connect／benches"
-    refs: ["SC-27"]
-    default: "涵蓋，移除兩者在 Windows 的 REMOTE_NOT_SUPPORTED"
-    affects: ["SC-27"]
+pending_owner_confirmations: []
 safety_invariants:
   - id: zero_tx_on_reject
     title: "被拒絕且依契約應為零副作用的請求，外部 TX 必須為零"

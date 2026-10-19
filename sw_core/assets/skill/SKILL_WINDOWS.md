@@ -183,11 +183,11 @@ serialwrap device release --selector COM0 --source agent:flash --reason "flash M
 serialwrap device attach --selector COM0
 ```
 
-### COM 獨占與設定（BC-04、SC-08、SC-09）
+### COM 獨占與設定（BC-04、SC-09）
 
 - **COM 獨占（BC-04）**：daemon 持有某 COM 時，其他程式（TeraTerm 直連 `COMx`、燒錄工具）**不可再直接開該 COM**——Windows 回 `ERROR_ACCESS_DENIED`，serialwrap 對應為 `DEVICE_STILL_HELD`（`pids: []`、`holder_unknown: true`，原因不明時不可視為可收回）。人類 console 走第 5～8 節的 serialwrap console 端口；外部工具獨佔先 `device release`，用完再 `device attach`。
 - **設定探索順序（SC-09）**：`SERIALWRAP_CONFIG` → `%USERPROFILE%\.config\serialwrap\config.yaml` → 存在時的 `%ProgramData%\serialwrap\config.yaml`（系統檔唯讀）；寫入落在 `SERIALWRAP_CONFIG`（有設定時）或使用者設定檔。
-- **socket 權限（SC-08）**：Unix socket 預設 `0600`、新建目錄 `0700` 只適用 POSIX；Windows 走 loopback TCP（`tcp://127.0.0.1:48700`），不套用此權限模型。
+- **socket 權限基線**：POSIX Unix socket 維持 `0660`，新建目錄權限依 process umask 決定；Windows 走 loopback TCP（`tcp://127.0.0.1:48700`），不套用此權限模型。
 
 ## 12. 疑難排解
 
@@ -263,7 +263,7 @@ serialwrap device attach --selector COM0
 | `MOVE_FAILED` | rpc／posix、windows | 視情況 | mv 之後未見 sentinel，無法確認檔案搬移結果 | 先確認目標檔與暫存檔狀態，再決定是否重試 |
 | `MOVE_TIMEOUT` | rpc／posix、windows | 視情況 | mv 之後 prompt 逾時，搬移結果不明 | 先確認目標檔與暫存檔狀態，再決定是否重試 |
 | `NEEDS_SUDO` | cli_local／posix | 修正參數後 | systemd-system 的 start、stop 或 restart 未帶 --with-sudo | 加上 --with-sudo 後重試（提權動作需人工確認） |
-| `NOT_READY` | rpc／posix、windows | 視情況 | session 為 command-capable 且狀態非 READY／ATTACHING，又無 last_error 可回報 | 等待 session 進入 READY 後重試；必要時以 session self-test 取得分類 |
+| `NOT_READY` | rpc／posix、windows | 視情況 | session 為 command-capable 且狀態非 READY／ATTACHING，又無 last_error 可回報；SC-34 起 session.attach 改回 SESSION_NOT_READY | 此碼目前 production 不可達，僅作為契約保留；session.attach／session.recover 失敗時請讀取頂層 last_error 並依該值的處置指引操作 |
 | `NO_ACTIVE_CAPTURE` | rpc／posix、windows | 否 | session 沒有進行中的 log capture | 確認是否已執行 log start；若無進行中的 capture 則無需 stop |
 | `NO_SYSTEMD` | cli_local／posix、windows | 修正參數後 | on-demand 或未知的監管模式下呼叫 service 管理動作 | 依 supervision_mode 改用正確的 daemon 管理方式（on-demand 使用 daemon start 與 daemon stop） |
 | `PROFILE_IS_EXPLICIT` | rpc／posix、windows | 修正參數後 | session 的 profile 來源為 yaml-target，不可 pin 或 unpin | 改為修改 YAML target 設定，而非使用 pin 或 unpin |
@@ -281,7 +281,7 @@ serialwrap device attach --selector COM0
 | `SESSION_BUSY` | rpc、rec／posix、windows | 是 | 同一 session 的前景操作仍在進行中 | 等待前景操作完成後重試 |
 | `SESSION_INTERACTIVE_BUSY` | rpc、rec／posix、windows | 是 | 已有不可搶占的 interactive lease，或 SC-13 到期收尾的 ownership restore 尚未完成；相關操作被拒 | 等待 interactive lease 結束或到期收尾完成後重試 |
 | `SESSION_NOT_FOUND` | rpc／posix、windows | 修正參數後 | selector 未對應任何 session | 以 session list 確認 selector 正確後重送 |
-| `SESSION_NOT_READY` | rpc、rec／posix、windows | 視情況 | session 狀態不符（非 READY，或 bridge 不存在） | 等待 session 進入 READY 後重試；必要時以 session self-test 檢查狀態 |
+| `SESSION_NOT_READY` | rpc、rec／posix、windows | 視情況 | session 狀態不符（非 READY，或 bridge 不存在）；session.attach／session.recover 失敗時另附 last_error、last_error_detail | session.attach／session.recover 失敗時先讀 last_error、last_error_detail 並依 Session last_error 表處置；終態值勿反覆重試，其他暫時狀況可等待 READY 後再重試 |
 | `SESSION_QUEUE_FULL` | rpc／posix、windows | 是 | session 已接受或執行中的命令（含已 cancel 但 worker 仍執行）達 256 筆上限 | 等待排隊命令完成後重試 |
 | `SESSION_RECOVERING` | rpc、rec／posix、windows | 是 | session 恢復中（RECOVERING），操作暫不可用 | 等待恢復完成（session get_state 不再顯示 RECOVERING）後重試 |
 | `SOCKET_ERROR` | cli_client／posix、windows | 視情況 | 連線失敗（connect 或 send／recv 的 OS 錯誤，或平台不支援 AF_UNIX） | 僅白名單唯讀方法可由 CLI 自動重試；其他方法先以 health.ping 確認 daemon 狀態再決定 |
@@ -305,8 +305,6 @@ serialwrap device attach --selector COM0
 | `UNKNOWN_EVENT_CMD` | cli_local／posix、windows | 修正參數後 | event 子命令未知 | 改用 event 支援的子命令重試 |
 | `UNKNOWN_PROFILE` | rpc、cli_local／posix、windows | 修正參數後 | profile 名稱不存在 | 以 profile 目錄中存在的名稱重試 |
 | `WAL_MISSING` | rpc／posix、windows | 視情況 | WAL 曾寫入過（current_seq 大於 0）但目前的 WAL 檔不存在 | 執行 serialwrap doctor 檢查 WAL 目錄與狀態 |
-
-passthrough：last_error_passthrough — session.attach 在 command-capable 且 state 不是 READY／ATTACHING、也不是 FLASHING／RECOVERING 時回 error_code=last_error；session.recover 的 REPROBE 分支未恢復時以 ok:true 回 error_code=last_error 或 SESSION_NOT_READY（值見下方 last_error 表）
 <!-- END: generated-fact marker="error-codes" -->
 
 ### Session last_error

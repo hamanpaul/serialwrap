@@ -1,5 +1,6 @@
 # session last_error 權威目錄（ADR-07、spec §9.3、§10.1）。由 P0-T4 建立，對應盤點 docs/rust-refactor/inventory/03-errors.md §5。
 # 與 contracts/error_codes.yaml 為獨立命名空間：本檔的值不計入 RPC／CLI error_code 數目；CREDENTIALS_UNRESOLVED 不得列於 error_codes.yaml。
+# promoted_via 表示該值會出現在所列方法回應頂層 last_error 欄位（SC-34 起不再進 error_code）。
 # 計數一律由本檔資料產生；驗證器、規則與測試不得以字面數字斷言筆數（OD-06）。
 # values 依 value 升冪排序（Python 字串順序）；動態前綴以 kind: dynamic_prefix 表示，value 為 `NAME:*`。
 # terminal 不手寫：由 cleared_by（無任何 auto: 項）與 auto_reprobe（兩邊皆 false）推導，T1 驗證器強制一致。

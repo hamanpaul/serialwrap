@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/hamanpaul/serialwrap/contracts/rpc_schema.json",
   "title": "serialwrap RPC contract",
-  "x-catalog-revision": 9,
+  "x-catalog-revision": 10,
   "x-wire": {
     "framing": "ndjson",
     "line_strip": true,
@@ -43,6 +43,7 @@
     "INVALID_REQUEST",
     "INVALID_METHOD",
     "FLASH_TARGET_IS_CONSOLE",
+    "NOT_READY",
     "FLUSHED_BY_SHUTDOWN"
   ],
   "x-generic-error-notes": {
@@ -52,6 +53,7 @@
     "INVALID_REQUEST": "framing 早退（非 object）",
     "INVALID_METHOD": "method 非 str（無 version）",
     "FLASH_TARGET_IS_CONSOLE": "catalog methods=[]（rpc 範圍）；resolve_flash_target 目前無 production 呼叫端（reachable: false，03 §3.1）。列於此僅為滿足 rpc 範圍碼皆有宣告位置（test_every_rpc_code_referenced），不代表任何 method 會回傳",
+    "NOT_READY": "SC-34（OD-14 #1）起 session.attach 改回 SESSION_NOT_READY（reachable: false）；列於此僅為滿足 rpc 範圍碼皆有宣告位置（test_every_rpc_code_referenced），不代表任何 method 會回傳",
     "FLUSHED_BY_SHUTDOWN": "AdmissionGate 已凍結後，有副作用 RPC 在任何副作用前遭拒；reason:\"handoff_frozen\""
   },
   "$defs": {
@@ -166,7 +168,7 @@
             "string",
             "null"
           ],
-          "x-namespace": "session 命名空間（session_last_errors）；session.attach／session.recover 可原樣外流為 RPC error_code（error_codes passthrough: last_error_passthrough）"
+          "x-namespace": "session 命名空間（session_last_errors）；session.attach／session.recover 於頂層回報 last_error，不轉成 RPC error_code（SC-34）"
         },
         "last_error_detail": {
           "type": [
@@ -4064,31 +4066,88 @@
       },
       "result": {
         "type": "object",
-        "x-order": [
-          "ok",
-          "released",
-          "recommended_action",
-          "session"
-        ],
+        "x-note": "session.attach 回應依成功或 SESSION_NOT_READY 失敗分支驗證；各分支 x-order 對應回應鍵序",
         "properties": {
           "ok": {
-            "type": "boolean",
-            "const": true
-          },
-          "released": {
-            "type": "boolean",
-            "const": true
-          },
-          "recommended_action": {
-            "type": "string"
-          },
-          "session": {
-            "$ref": "#/$defs/SessionPublic"
+            "type": "boolean"
           }
         },
         "required": [
-          "ok",
-          "session"
+          "ok"
+        ],
+        "oneOf": [
+          {
+            "type": "object",
+            "x-order": [
+              "ok",
+              "released",
+              "recommended_action",
+              "session"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean",
+                "const": true
+              },
+              "released": {
+                "type": "boolean",
+                "const": true
+              },
+              "recommended_action": {
+                "type": "string"
+              },
+              "session": {
+                "$ref": "#/$defs/SessionPublic"
+              }
+            },
+            "required": [
+              "ok",
+              "session"
+            ]
+          },
+          {
+            "type": "object",
+            "x-branch": "SESSION_NOT_READY",
+            "x-order": [
+              "ok",
+              "error_code",
+              "last_error",
+              "last_error_detail",
+              "session"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean",
+                "const": false
+              },
+              "error_code": {
+                "type": "string",
+                "const": "SESSION_NOT_READY"
+              },
+              "last_error": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "last_error_detail": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "session": {
+                "$ref": "#/$defs/SessionPublic"
+              }
+            },
+            "required": [
+              "ok",
+              "error_code",
+              "last_error",
+              "last_error_detail",
+              "session"
+            ]
+          }
         ]
       },
       "errors": [
@@ -4099,9 +4158,7 @@
         "FLASHING_BUSY",
         "SESSION_RECOVERING",
         "SESSION_NOT_READY",
-        "STATE_CHANGED",
-        "NOT_READY",
-        "@last_error_passthrough"
+        "STATE_CHANGED"
       ],
       "error_order": [
         "INVALID_ARGS",
@@ -4111,9 +4168,7 @@
         "FLASHING_BUSY",
         "SESSION_RECOVERING",
         "SESSION_NOT_READY",
-        "STATE_CHANGED",
-        "NOT_READY",
-        "@last_error_passthrough"
+        "STATE_CHANGED"
       ],
       "side_effects": [
         {
@@ -5766,6 +5821,8 @@
               "recovered",
               "session",
               "error_code",
+              "last_error",
+              "last_error_detail",
               "classification",
               "recommended_action",
               "matched_prompt"
@@ -5800,6 +5857,18 @@
               },
               "matched_prompt": {
                 "type": "string"
+              },
+              "last_error": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "last_error_detail": {
+                "type": [
+                  "string",
+                  "null"
+                ]
               }
             },
             "required": [
@@ -6036,8 +6105,7 @@
         "FORCE_RECOVER_TIMEOUT",
         "PROMPT_TIMEOUT",
         "PROMPT_TIMEOUT_RECOVERED",
-        "PROMPT_TIMEOUT_FORCE_RECOVERED",
-        "@last_error_passthrough"
+        "PROMPT_TIMEOUT_FORCE_RECOVERED"
       ],
       "error_order": [
         "INVALID_ARGS",
@@ -6049,8 +6117,7 @@
         "FORCE_RECOVER_TIMEOUT",
         "PROMPT_TIMEOUT",
         "PROMPT_TIMEOUT_RECOVERED",
-        "PROMPT_TIMEOUT_FORCE_RECOVERED",
-        "@last_error_passthrough"
+        "PROMPT_TIMEOUT_FORCE_RECOVERED"
       ],
       "side_effects": [
         {
