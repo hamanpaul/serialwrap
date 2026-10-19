@@ -36,20 +36,8 @@ def ensure_realhw_importable() -> Path:
     return REPO_ROOT
 
 
-def version_gate(cli_version: str, daemon_version: str) -> str | None:
-    """pinned CLI 與 daemon 版本必須一致；解析失敗或不齊回問題字串（suite-refuse）。"""
-    a = _VERSION_RE.search(cli_version or "")
-    b = _VERSION_RE.search(daemon_version or "")
-    if a is None or b is None:
-        return f"版本解析失敗：cli={cli_version!r} daemon={daemon_version!r}（#154 gate）"
-    va = tuple(map(int, a.groups()))
-    vb = tuple(map(int, b.groups()))
-    if va != vb:
-        return (
-            f"client↔daemon 版本不齊：cli={'.'.join(map(str, va))} "
-            f"daemon={'.'.join(map(str, vb))}（#154 gate，suite-refuse）"
-        )
-    return None
+ensure_realhw_importable()
+from realhw.preflight import version_gate
 
 
 def stale_client_note(path_version: str, pinned_version: str) -> str | None:
@@ -98,30 +86,22 @@ def _tools_missing() -> list[str]:
 
 
 def _run_preflight_windows(cfg: dict[str, Any]) -> dict[str, Any]:
-    """Windows 單板回歸前置檢查；僅支援不依賴 POSIX 工具的 case。
+    """Windows 回歸前置檢查；平台限制由 case capability gate 表達。
 
-    不 import ``realhw.preflight``（其 fcntl/pgrep/PTY 假設只適用 POSIX）。
-    仍共用 bench.lock，確認 daemon、doctor、雙板 READY 與 pinned 版本。
+    使用共用跨平台 bench lock，並確認 daemon、doctor、板卡 READY 與 pinned 版本。
     """
-    import msvcrt
-    from realhw import drivers
+    from realhw import drivers, frontends, preflight as rp
 
-    exe = Path(str(cfg["serialwrap_exe"]))
+    resolved_exe, _identity = rp.resolve_serialwrap_exe(cfg)
+    exe = Path(resolved_exe)
     problems: list[str] = []
     notes: list[str] = []
     if not exe.is_file():
         problems.append(f"pinned serialwrap 不存在：{exe}")
-    lock_path = Path.home() / ".local" / "state" / "serialwrap" / "bench.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_BINARY, 0o600)
+    lock_fd = rp.acquire_benchlock(rp.bench_lock_path(cfg))
+    if lock_fd is None:
+        problems.append("bench.lock 已被其他測試持有")
     try:
-        os.lseek(lock_fd, 0, os.SEEK_SET)
-        try:
-            msvcrt.locking(lock_fd, msvcrt.LK_NBLCK, 1)
-        except OSError:
-            problems.append("bench.lock 已被其他測試持有")
-            os.close(lock_fd)
-            lock_fd = None
         sw = drivers.SwCli(exe=str(exe))
         daemon = sw.run("daemon", "status")
         if not daemon.get("ok") or not daemon.get("running"):
@@ -144,13 +124,33 @@ def _run_preflight_windows(cfg: dict[str, Any]) -> dict[str, Any]:
         gate = version_gate(cli_version, daemon_version_probe(sw))
         if gate:
             problems.append(gate)
+        leaked = rp._leaked_daemons()
+        if leaked:
+            problems.append("殘留 throwaway daemon：" + "; ".join(leaked))
+        if rp._other_pytest():
+            problems.append("偵測到其他 pytest 執行中")
+        if rp._state_polluted(cfg):
+            problems.append("live state.json 含污染哨兵")
+        external = rp._external_testpilot()
+        if external:
+            problems.append("偵測到其他 testpilot run：" + "; ".join(external))
+        frontend_ok, _detail = frontends.frontend_capability(cfg)
+        cross_os_guard, cross_os_detail = rp.cross_os_holder_check(
+            cfg, [str(board["com"]) for board in cfg["boards"]])
+        if cross_os_guard == "held":
+            problems.append(f"跨 OS bench 守衛：{cross_os_detail or '另一側仍持有本 bench 裝置'}")
+        elif cross_os_guard in {"unknown", "unconfigured"}:
+            notes.append(f"跨 OS bench 守衛 {cross_os_guard}：{cross_os_detail or '未設定 probe'}")
         return {
             "ok": not problems,
             "problems": problems,
             "notes": notes,
-            "missing_caps": {"posix": "windows_posix_tools_unavailable"},
+            "missing_caps": rp.platform_missing_caps(frontend_ok=frontend_ok, cfg=cfg),
             "deployed_version": cli_version,
+            "daemon_pid": daemon.get("pid"),
             "benchlock_fd": lock_fd,
+            "cross_os_guard": cross_os_guard,
+            "cross_os_detail": cross_os_detail,
         }
     except Exception:
         if lock_fd is not None:
@@ -163,16 +163,18 @@ def run_preflight(cfg: dict[str, Any]) -> dict[str, Any]:
     ensure_realhw_importable()
     if os.name == "nt":
         return _run_preflight_windows(cfg)
-    from realhw import drivers, preflight as rp
+    from realhw import drivers, frontends, preflight as rp
 
-    exe = str(cfg["serialwrap_exe"])
+    exe, _identity = rp.resolve_serialwrap_exe(cfg)
     sw = drivers.SwCli(exe=exe)
-    lock_fd = rp.acquire_benchlock(rp.bench_lock_path())
+    lock_fd = rp.acquire_benchlock(rp.bench_lock_path(cfg))
     try:
         boards_expected = [b["com"] for b in cfg["boards"]]
         boards_ready = [
             s.get("com") for s in sw.sessions() if s.get("state") == "READY" and s.get("com")
         ]
+        cross_os_guard, cross_os_detail = rp.cross_os_holder_check(
+            cfg, boards_expected)
         checks = rp.Checks(
             git_behind=rp._git_behind(REPO_ROOT),
             doctor_ok=rp._doctor_ok(sw),
@@ -184,16 +186,21 @@ def run_preflight(cfg: dict[str, Any]) -> dict[str, Any]:
             state_polluted=rp._state_polluted(),
             benchlock_ok=lock_fd is not None,  # 注入實際結果（跨-plan 簽章教訓：勿留預設）
             external_testpilot=tuple(rp._external_testpilot()),
+            cross_os_guard=cross_os_guard,
+            cross_os_detail=cross_os_detail,
         )
         ok, problems = rp.evaluate(checks)
 
         cli_version = str(sw.run("--version").get("_raw", "")).strip()
+        daemon = sw.run("daemon", "status")
         gate = version_gate(cli_version, daemon_version_probe(sw))
         if gate is not None:
             ok = False
             problems.append(gate)
 
         notes: list[str] = []
+        if cross_os_guard in {"unknown", "unconfigured"}:
+            notes.append(f"跨 OS bench 守衛 {cross_os_guard}：{cross_os_detail or '未設定 probe'}")
         path_exe = shutil.which("serialwrap")
         if path_exe and os.path.realpath(path_exe) != os.path.realpath(exe):
             path_version = str(
@@ -207,9 +214,14 @@ def run_preflight(cfg: dict[str, Any]) -> dict[str, Any]:
             "ok": bool(ok),
             "problems": list(problems),
             "notes": notes,
-            "missing_caps": {},
+            "missing_caps": rp.platform_missing_caps(
+                frontend_ok=frontends.frontend_capability(cfg)[0], cfg=cfg
+            ),
             "deployed_version": cli_version,
+            "daemon_pid": daemon.get("pid"),
             "benchlock_fd": lock_fd,
+            "cross_os_guard": cross_os_guard,
+            "cross_os_detail": cross_os_detail,
         }
     except Exception:
         if lock_fd is not None:

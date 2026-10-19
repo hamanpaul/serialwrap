@@ -27,6 +27,9 @@ from types import SimpleNamespace
 import pytest
 
 pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+RESOURCE_AUDIT_WAIVERS = {
+    "interactive_desktop": "只驗證案例 capability 字串，未啟動 tmux 或桌面資源",
+}
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "regression"))
@@ -58,9 +61,98 @@ def test_new_cases_registered_with_family_and_flags():
     assert c_f5.family == "F5"
     f5_existing = [c for c in registry if c.family == "F5" and c.id != "f5-deferred-dropped-after-reboot"]
     assert f5_existing, "No existing F5 cases found in registry"
-    expected_requires = f5_existing[0].requires
-    assert all(c.requires == expected_requires for c in f5_existing)
-    assert c_f5.requires == expected_requires
+    ported = {
+        "f5-raw-ownership-survives-agent-rounds",
+        "f5-deferred-bytes-flushed",
+        "f5-console-peer-gone-recycled",
+        "f5-second-console-linebuffer",
+    }
+    for case in f5_existing:
+        if case.id == "f5-console-peer-gone-recycled":
+            assert {"human_frontend", "posix_orphan_semantics"} <= set(case.requires)
+        elif case.id in ported:
+            assert case.requires == ("human_frontend",)
+        else:
+            assert case.requires == ("tmux",)
+    assert {"tmux", "posix_throwaway_daemon"} <= set(c_f5.requires)
+
+
+@pytest.mark.parametrize("case_name", ["p1_con_liveness", "p1_con_orphan"])
+def test_realhw_orphan_cases_refuse_vacuous_frontend(monkeypatch, case_name):
+    from realhw.cases import p1_console
+
+    monkeypatch.setattr(p1_console.time, "sleep", lambda _seconds: None)
+
+    class Human:
+        def __init__(self):
+            self.crashed = False
+
+        def open(self, _com):
+            return None
+
+        def alive(self):
+            return False
+
+        def crash(self):
+            self.crashed = True
+            raise AssertionError("未 attach 的 frontend 不應被當成孤兒測試輸入")
+
+        def close(self):
+            return None
+
+    human = Human()
+    notes = []
+
+    class Sw:
+        def run(self, *args):
+            if args[:2] == ("session", "console-list"):
+                return {"consoles": []}
+            return {"human_attached": False}
+
+    ctx = SimpleNamespace(
+        human=lambda *_args: human,
+        sw=Sw(),
+        note=lambda *args: notes.append(args),
+    )
+    result = getattr(p1_console, case_name)(ctx)
+    assert result.verdict == "FAIL"
+    assert result.category == "environment"
+    assert result.reason_code == "minicom_spawn_failed"
+    assert not human.crashed
+
+
+def test_regression_orphan_case_refuses_empty_console_list(monkeypatch):
+    from serialwrap_regression.cases import f05_console_coexist
+
+    monkeypatch.setattr(f05_console_coexist.time, "sleep", lambda _seconds: None)
+
+    class Human:
+        def open(self, _com):
+            return None
+
+        def alive(self):
+            return True
+
+        def crash(self):
+            raise AssertionError("沒有 console attach，不應呼叫 crash")
+
+        def close(self):
+            return None
+
+    class Sw:
+        def run(self, *_args):
+            return {"consoles": []}
+
+    ctx = SimpleNamespace(
+        cfg={"boards": [{"com": "COM0"}]},
+        human=lambda *_args: Human(),
+        sw=Sw(),
+        note=lambda *_args: None,
+    )
+    result = f05_console_coexist.f5_console_peer_gone_recycled(ctx)
+    assert result.verdict == "FAIL"
+    assert result.category == "environment"
+    assert result.reason_code == "minicom_spawn_failed"
 
 
 def test_f10_release_receipt_oracle_with_fake_ctx():

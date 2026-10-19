@@ -17,8 +17,34 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _make_install(root: Path) -> Path:
-    """最小安裝：bin/serialwrap（內容 b"cli"）、旁載 bin/version.dll、release-manifest.json。"""
+def _make_install(root: Path) -> tuple[Path, Path]:
+    """建立符合目前平台安裝版型的最小 CLI 與 bundle。"""
+    if os.name == "nt":
+        bundle = root / "versions" / "v1"
+        bindir = root / "bin"
+        bundle_bin = bundle / "bin"
+        bindir.mkdir(parents=True)
+        bundle_bin.mkdir(parents=True)
+        cli_bytes, daemon_bytes = b"cli", b"daemon"
+        exe = bindir / "serialwrap.exe"
+        daemon = bindir / "serialwrapd.exe"
+        (bundle_bin / exe.name).write_bytes(cli_bytes)
+        (bundle_bin / daemon.name).write_bytes(daemon_bytes)
+        exe.write_bytes(cli_bytes)
+        daemon.write_bytes(daemon_bytes)
+        (bindir / "current-release.json").write_text(
+            json.dumps({"dir": str(bundle)}), encoding="utf-8")
+        manifest = {
+            "schema_version": "release-manifest.v1",
+            "components": {
+                "cli": {"path": "bin/serialwrap.exe", "sha256": hashlib.sha256(cli_bytes).hexdigest()},
+                "daemon": {"launcher": {"path": "bin/serialwrapd.exe",
+                                           "sha256": hashlib.sha256(daemon_bytes).hexdigest()}},
+            },
+        }
+        (bundle / "release-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        return bundle, exe
+
     bindir = root / "bin"
     bindir.mkdir(parents=True)
     exe = bindir / "serialwrap"
@@ -28,19 +54,20 @@ def _make_install(root: Path) -> Path:
     manifest = {"schema_version": "release-manifest.v1",
                 "components": {"cli": {"sha256": hashlib.sha256(b"cli").hexdigest()}}}
     (root / "release-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-    return root
+    return root, exe
 
 
 def _wire_main(monkeypatch, tmp_path: Path, *, cli_version: str, daemon_version: str,
-               pid: int = 77):
+               pid: int = 77, serialwrap_exe: Path | None = None):
     """把 realhw.__main__.main 的所有 I/O 換成替身（不碰 live）。回傳 (exe, cfg)。"""
     from realhw import __main__ as realhw_main
     from realhw import preflight
 
-    exe = tmp_path / "bin" / "serialwrap"
+    exe = serialwrap_exe or (tmp_path / "bin" / "serialwrap")
     exe.parent.mkdir(parents=True, exist_ok=True)
-    exe.write_bytes(b"cli-binary")
-    exe.chmod(0o755)
+    if serialwrap_exe is None:
+        exe.write_bytes(b"cli-binary")
+        exe.chmod(0o755)
     cfg = {"boards": [{"com": "COM0", "serial": "S0"}], "tmux_prefix": "realhw",
            "usbipd_exe": "/tmp/usbipd.exe", "win_serialwrap_exe": "",
            "serialwrap_exe": str(exe), "human_frontend": "auto", "bench_lock_path": ""}
@@ -141,13 +168,14 @@ def test_realhw_report_deployed_content(tmp_path, monkeypatch):
     from realhw import deployed_content as dc
     from realhw import harness
 
-    inst = _make_install(tmp_path / "v1")
+    inst, exe = _make_install(tmp_path / "v1")
     # daemon 行程由本測試自行 spawn（sys.executable 子行程）；realhw 只能量測「實際在服務」的映像
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     order: list[str] = []
     try:
         _wire_main(monkeypatch, tmp_path, cli_version="serialwrap 0.3.2",
-                   daemon_version="0.3.2", pid=child.pid)
+                   daemon_version="0.3.2", pid=child.pid,
+                   serialwrap_exe=exe)
         # 把 measure 與 case／write_reports 的呼叫序記下來
         real_measure = dc.measure
 
@@ -226,8 +254,9 @@ def test_acquire_benchlock_exclusive_posix(tmp_path):
 def test_state_dir_windows(tmp_path, monkeypatch):
     from realhw import preflight as rp
 
-    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
-    assert rp.resolve_state_dir({}, os_name="nt") == tmp_path / "serialwrap"
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    assert rp.resolve_state_dir({}, os_name="nt") == tmp_path / ".local" / "state" / "serialwrap"
 
     # _state_polluted 讀 resolve_state_dir(cfg) 指向的 state.json（污染哨兵：bindings 值含 /tmp/）
     state_dir = tmp_path / "serialwrap"
@@ -246,7 +275,7 @@ def test_cross_os_holder_check():
 
     cfg = {"boards": [{"com": "COM0", "serial": "AC01QZT0"}],
            "cross_os_probe_argv": ["fake-other-os", "serialwrap", "daemon", "status"]}
-    payload = {"sessions": [{"com": "COM0", "state": "READY",
+    payload = {"sessions": [{"com": "COM9", "state": "READY",
                              "device_by_id": "USB\\VID_0403+PID_6001+AC01QZT0A"}]}
 
     def _ok_run(argv, *args, **kwargs):
@@ -257,6 +286,10 @@ def test_cross_os_holder_check():
 
     status, detail = rp.cross_os_holder_check(cfg, ["COM0"], run=_ok_run)
     assert status == "held" and detail
+
+    payload["sessions"][0]["device_by_id"] = "COM7"
+    status, detail = rp.cross_os_holder_check(cfg, ["COM0"], run=_ok_run)
+    assert status == "unknown" and detail
 
     status, detail = rp.cross_os_holder_check(cfg, ["COM0"], run=_down_run)
     assert status == "unknown" and detail

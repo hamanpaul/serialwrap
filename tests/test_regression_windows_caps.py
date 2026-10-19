@@ -7,6 +7,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,7 +23,32 @@ pytestmark = [pytest.mark.core_portable]
 RESOURCE_AUDIT_WAIVERS = {"interactive_desktop": "只比對 requires 中的 tmux 能力字串，從不啟動 tmux"}
 
 
-def _make_install(root: Path) -> Path:
+def _make_install(root: Path) -> tuple[Path, Path]:
+    if os.name == "nt":
+        bundle = root / "versions" / "v1"
+        bindir = root / "bin"
+        bundle_bin = bundle / "bin"
+        bindir.mkdir(parents=True)
+        bundle_bin.mkdir(parents=True)
+        cli_bytes, daemon_bytes = b"cli", b"daemon"
+        exe, daemon = bindir / "serialwrap.exe", bindir / "serialwrapd.exe"
+        (bundle_bin / exe.name).write_bytes(cli_bytes)
+        (bundle_bin / daemon.name).write_bytes(daemon_bytes)
+        exe.write_bytes(cli_bytes)
+        daemon.write_bytes(daemon_bytes)
+        (bindir / "current-release.json").write_text(
+            json.dumps({"dir": str(bundle)}), encoding="utf-8")
+        manifest = {
+            "schema_version": "release-manifest.v1",
+            "components": {
+                "cli": {"path": "bin/serialwrap.exe", "sha256": hashlib.sha256(cli_bytes).hexdigest()},
+                "daemon": {"launcher": {"path": "bin/serialwrapd.exe",
+                                           "sha256": hashlib.sha256(daemon_bytes).hexdigest()}},
+            },
+        }
+        (bundle / "release-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        return bundle, exe
+
     bindir = root / "bin"
     bindir.mkdir(parents=True)
     exe = bindir / "serialwrap"
@@ -32,7 +58,7 @@ def _make_install(root: Path) -> Path:
     manifest = {"schema_version": "release-manifest.v1",
                 "components": {"cli": {"sha256": hashlib.sha256(b"cli").hexdigest()}}}
     (root / "release-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-    return root
+    return root, exe
 
 
 @pytest.mark.memory_only
@@ -40,8 +66,7 @@ def test_regression_report_deployed_content(tmp_path):
     from realhw import deployed_content as dc
     from serialwrap_regression.reporter import RegressionReporter
 
-    inst = _make_install(tmp_path / "v1")
-    exe = inst / "bin" / "serialwrap"
+    inst, exe = _make_install(tmp_path / "v1")
     start = dc.measure(exe)
 
     def _plugin(start_value, report_dir):
@@ -81,12 +106,37 @@ def test_platform_missing_caps_windows():
     from realhw import preflight
 
     caps = preflight.platform_missing_caps(os_name="nt", frontend_ok=True)
-    assert set(caps) == {"tmux", "posix_throwaway_daemon", "usbipd", "supervisor_runtime"}
+    assert set(caps) == {
+        "tmux", "posix_throwaway_daemon", "usbipd", "supervisor_runtime",
+        "posix_orphan_semantics",
+    }
     for key, value in caps.items():
         assert value == f"cap_missing:{key}"
 
     caps_no_frontend = preflight.platform_missing_caps(os_name="nt", frontend_ok=False)
     assert caps_no_frontend["human_frontend"] == "cap_missing:human_frontend"
+
+
+@pytest.mark.memory_only
+def test_posix_capabilities_use_pinned_tool_paths(tmp_path):
+    from realhw import preflight
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    cli = bindir / "serialwrap"
+    daemon = bindir / "serialwrapd"
+    usbipd = tmp_path / "usbipd.exe"
+    for path in (cli, daemon, usbipd):
+        path.write_bytes(b"tool")
+    configured = {"serialwrap_exe": str(cli), "usbipd_exe": str(usbipd),
+                  "human_frontend": "tmux"}
+    caps = preflight.platform_missing_caps(
+        os_name="posix", frontend_ok=True, cfg=configured,
+        which=lambda name: "/usr/bin/tmux" if name == "tmux" else (
+            "/usr/bin/systemctl" if name == "systemctl" else None
+        ),
+    )
+    assert caps == {}
 
 
 @pytest.mark.memory_only
@@ -137,10 +187,15 @@ def test_regression_case_requires_updated():
         "f9-spontaneous-reboot-agent-gated",
     ]
     for cid in human_cases:
-        assert tuple(reg[cid].requires) == ("human_frontend",), cid
+        assert "human_frontend" in reg[cid].requires and "tmux" not in reg[cid].requires, cid
+    assert "posix_orphan_semantics" in reg["f5-console-peer-gone-recycled"].requires
+    assert "tmux" in reg["f5-deferred-dropped-after-reboot"].requires
+    assert "posix_throwaway_daemon" in reg["f5-deferred-dropped-after-reboot"].requires
     for cid in ("f10-unresolved-creds-terminal", "f10-creds-fixed-then-ready",
                 "f8-second-daemon-detected"):
         assert "posix_throwaway_daemon" in reg[cid].requires, cid
+    for cid in ("f10-release-drain-receipt", "f10-release-aborts-inflight-command"):
+        assert {"posix_throwaway_daemon", "tmux"} <= set(reg[cid].requires), cid
 
 
 @pytest.mark.memory_only
@@ -224,6 +279,8 @@ def test_realhw_requires_reflect_dependencies():
         "p1-ho-persist": {"supervisor_runtime"},
         "p1-hp-cycle": {"usbipd"},
         "p1-hp-reorder": {"usbipd", "supervisor_runtime"},
+        "p1-con-liveness": {"posix_orphan_semantics"},
+        "p1-con-orphan": {"posix_orphan_semantics"},
     }
     caps = preflight.platform_missing_caps(os_name="nt", frontend_ok=True)
     for cid, needed in expected.items():

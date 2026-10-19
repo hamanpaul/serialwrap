@@ -31,6 +31,32 @@ class RegressionReporter:
 
         artifacts = dict(getattr(run_result, "artifacts", {}) or {})
         meta = dict(artifacts.get("regression_meta") or self._plugin.run_meta or {})
+        from realhw import deployed_content
+
+        cfg = self._plugin._load_cfg()
+        exe = str(cfg.get("serialwrap_exe") or "serialwrap")
+        start = meta.pop("deployed_content_start", None)
+        if not isinstance(start, dict):
+            start = {
+                "schema_version": deployed_content.SCHEMA,
+                "measured_at": None,
+                "cli_configured": exe,
+                "cli_resolved": None,
+                "cli_sha256": None,
+                "install_dir": None,
+                "release_manifest_sha256": None,
+                "bundle_tree_sha256": None,
+                "runtime_tree_sha256": None,
+                "entry_dir_sha256": None,
+                "daemon_configured": None,
+                "daemon_resolved": None,
+                "daemon_sha256": None,
+                "error": "not_measured",
+            }
+        end = deployed_content.measure(exe)
+        meta["deployed_content"] = deployed_content.bracket(
+            start, end, live=meta.pop("deployed_content_live", []) or []
+        )
         meta["fw_ver"] = str(getattr(run_result, "fw_ver", "") or "")
         meta["run_id"] = str(getattr(run_result, "run_id", "") or "")
         meta["issues_map"] = {

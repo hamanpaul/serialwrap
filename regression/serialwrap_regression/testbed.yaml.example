@@ -1,6 +1,9 @@
 # serialwrap_regression testbed 範例。
 # 實跑時可在同目錄放 testbed.yaml 覆蓋（如 allow_destructive: true）；缺檔即用本檔。
 serialwrap_exe: ~/.local/bin/serialwrap  # pinned 部署版 CLI（#154 防線；勿走 PATH）
+bench_lock_path: ~/.local/state/serialwrap/bench.lock  # Linux 與 reliability 共用；Windows 必填
+human_frontend: auto  # auto|tmux|telnet；Windows 使用 loopback Telnet console
+cross_os_probe_argv: []                  # 另一 OS 的唯讀 session-list 命令；未設定時由擁有者排程避免重疊
 allow_destructive: false                 # true 才跑 F9（reboot）／F10（throwaway 交接）
 tmux_prefix: swreg
 boards:

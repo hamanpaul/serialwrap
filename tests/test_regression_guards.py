@@ -50,7 +50,7 @@ def test_uboot_allowed(cmd):
 
 
 def test_leave_rejects_non_whitelisted_via():
-    con = guards.UBootConsole(ctx=None, com="COM0", tmux_session="s")
+    con = guards.UBootConsole(ctx=None, com="COM0", frontend=None)
     with pytest.raises(guards.UBootGuardError):
         con.leave(via="poweroff")
 

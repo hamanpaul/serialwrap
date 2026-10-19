@@ -352,6 +352,7 @@ def _body_inflight_abort(ctx: Any, ta: guards.ThrowawayDaemon, ta_com: str, boar
     "實板 console 持續 TX 時 device release 的 ok 回條只在 handle 關閉後送出",
     issues=(),
     pending_issue=True,
+    requires=("posix_throwaway_daemon", "tmux"),
     hints=(
         "外部 reader 在 release 前即開始輪詢 open(tty)（TIOCEXCL 下非 root 會 EBUSY），第一次成功的時刻即 handle 關閉時刻。",
         "回條時間 ≤ 第一次成功 open 的時刻 → FAIL（回條早於 handle 關閉）。root 執行會繞過 TIOCEXCL，case 直接 SKIP。",
@@ -367,6 +368,7 @@ def f10_release_drain_receipt(ctx: Any) -> CaseResult:
     "長命令在途時 device release 後 cmd status 為 COMMAND_ABORTED_IN_FLIGHT 且 TX 不重送",
     issues=(),
     pending_issue=True,
+    requires=("posix_throwaway_daemon", "tmux"),
     hints=(
         "submit `sleep 20; echo X`（在途 TX 已寫出）後 release；oracle 以 WAL 同 cmd_id 的 TX 計數判定重送。",
         "issues 欄待擁有者為 Stage 0 開立 issue 號後補上（不得填假號）。",

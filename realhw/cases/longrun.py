@@ -4,9 +4,9 @@
   ndjson（快照序列＋事件序列）收斂成統計：per_source 命令計數、stuck_attached
   連續非 READY 區段、pid_changes、daemon_death_at、rss_trend。單測釘死行為。
 - `lr-mixed` case（tier="longrun"）：4 個 agent worker thread（輪流對兩板送命令，
-  mix line／background／interactive）＋1 個 human 模擬 thread（tmux minicom COM0，
+  mix line／background／interactive）＋1 個 human 模擬 thread（共用 human frontend，
   每 2-5 分鐘敲一行）＋1 個 snapshot thread（每 `snapshot_interval_s` 記狀態/RSS/pid），
-  跑到 `duration_s` 或 SIGINT 停；重大事件（daemon pid==0／兩板同時非 READY >15min）
+  跑到 `duration_s` 或 SIGINT 停；重大事件（確認 daemon 行程已退出／兩板同時非 READY >15min）
   只停負載記事件、**不重啟 daemon**（保留現場）；收尾以 `analyze()` 產出分析報告。
 
 無人環境穩健性優先：所有 thread 迴圈的單一動作包 try/except（記事件續跑、不殺整跑），
@@ -20,15 +20,25 @@ import random
 import signal
 import threading
 import time
+from collections import OrderedDict
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+from .. import frontends, procobs
 from ..harness import Case, CaseResult, register
 
 # 重大事件／FAIL 級門檻（秒）
 MAJOR_BOTH_DOWN_S = 15 * 60  # 兩板同時非 READY 持續超過此值＝重大事件
 FAIL_STUCK_S = 15 * 60       # 單板連續非 READY ≥此值＝FAIL 級統計
 _COUNTED_KINDS = ("submit", "done", "error")
+BG_PENDING_MAX = 64
+BG_POLL_INTERVAL_S = 1.0
+BG_RESOLVE_WARN_S = 30.0
+BG_FINAL_DRAIN_S = 30.0
+LR_WORKER_JOIN_TIMEOUT_S = 30.0
+BG_TERMINAL = frozenset({"done", "error", "canceled"})
 
 
 # --------------------------------------------------------------------------- #
@@ -48,11 +58,14 @@ def analyze(snapshots: list[dict], events: list[dict]) -> dict:
     per_source: dict[str, dict[str, int]] = {}
     for ev in events:
         kind = ev.get("kind")
-        if kind not in _COUNTED_KINDS:
+        if kind not in _COUNTED_KINDS and kind != "bg_result":
             continue
         src = ev.get("source") or "?"
         bucket = per_source.setdefault(src, {"submit": 0, "done": 0, "error": 0})
-        bucket[kind] += 1
+        if kind == "bg_result":
+            bucket["done" if ev.get("status") == "done" else "error"] += 1
+        else:
+            bucket[kind] += 1
 
     # stuck_attached：每個 COM 的連續非 READY 區段（起訖 t 與時長）
     coms: list[str] = []
@@ -85,14 +98,22 @@ def analyze(snapshots: list[dict], events: list[dict]) -> dict:
             stuck.append({"com": com, "from_t": open_from, "to_t": last_t,
                           "duration_s": last_t - open_from})
 
-    # pid 變更與 daemon 死亡
+    # pid 變更與 daemon 死亡；新事件只在行程確認退出後記錄，兼容舊的 pid=0 快照。
     pid_changes = 0
     daemon_death_at: int | None = None
+    for ev in events:
+        if ev.get("kind") == "major" and ev.get("detail") == "daemon_death":
+            value = ev.get("t_at", ev.get("t"))
+            if isinstance(value, int):
+                daemon_death_at = value
+                break
     prev_pid: int | None = None
     for snap in snapshots:
         pid = snap.get("pid")
         if pid == 0 and daemon_death_at is None:
             daemon_death_at = snap.get("t")
+        if pid is None:
+            continue  # null 代表無觀測，不算 PID 變更，也不代表 daemon 死亡。
         if prev_pid and pid and pid != prev_pid:  # 兩端皆非 0 才算「重啟」變更
             pid_changes += 1
         prev_pid = pid
@@ -117,25 +138,9 @@ def analyze(snapshots: list[dict], events: list[dict]) -> dict:
 # --------------------------------------------------------------------------- #
 # I/O helpers（編排用；純函式部分保持無副作用）
 # --------------------------------------------------------------------------- #
-def _read_rss_kb(pid: int) -> int:
-    """讀 /proc/<pid>/status 的 VmRSS（kB）；pid 無效或讀不到回 0。"""
-    if not pid or pid <= 0:
-        return 0
-    try:
-        text = Path(f"/proc/{pid}/status").read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return 0
-    for line in text.splitlines():
-        if line.startswith("VmRSS:"):
-            parts = line.split()
-            if len(parts) >= 2 and parts[1].isdigit():
-                return int(parts[1])
-    return 0
-
-
 def _append_ndjson(path: Path, obj: dict) -> None:
     with open(path, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        fh.write(json.dumps(obj, ensure_ascii=False, sort_keys=True) + "\n")
         fh.flush()
 
 
@@ -170,9 +175,10 @@ class _EventLog:
 
     def emit(self, source: str, kind: str, **detail: Any) -> None:
         rec: dict[str, Any] = {"t": int(time.monotonic() - self._start),
+                               "wall_ts": datetime.now(timezone.utc).isoformat(),
                                "source": source, "kind": kind}
         rec.update(detail)
-        line = json.dumps(rec, ensure_ascii=False)
+        line = json.dumps(rec, ensure_ascii=False, sort_keys=True)
         with self._lock:
             try:
                 self._fh.write(line + "\n")
@@ -188,12 +194,192 @@ class _EventLog:
                 pass
 
 
-def _tmux_alive(tmux: Any, session: str) -> bool:
-    """以 capture 內容判斷 tmux session/minicom 是否還活著（死掉 capture 為空）。"""
-    try:
-        return bool((tmux.capture(session) or "").strip())
-    except Exception:
+def _human_frontend(ctx: Any, tag: str, role: str) -> Any:
+    """取得共用 frontend；相容未提供 factory 的舊測試 context。"""
+    factory = getattr(ctx, "human", None)
+    if callable(factory):
+        return factory(tag, role)
+    factory = frontends.make_frontend_factory(
+        {"human_frontend": "tmux"}, tmux=ctx.tmux, sw=ctx.sw)
+    return factory(tag, role)
+
+
+@dataclass
+class _PendingBackground:
+    cmd_id: str
+    source: str
+    com: str
+    round_: int
+    submitted_at: float
+    slow_reported: bool = False
+    poll_error_reported: bool = False
+
+
+class BgResultTracker:
+    """長跑期間輪詢 background 命令，避免產品 history 淘汰未擷取結果。"""
+
+    def __init__(self, sw: Any, elog: _EventLog, *, pending_max: int = BG_PENDING_MAX,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        if pending_max < 1:
+            raise ValueError("pending_max 必須大於零")
+        self._sw = sw
+        self._elog = elog
+        self._pending_max = int(pending_max)
+        self._clock = clock
+        self._condition = threading.Condition()
+        self._pending: OrderedDict[str, _PendingBackground] = OrderedDict()
+        self.max_pending_seen = 0
+
+    def add(self, cmd_id: str, *, source: str, com: str, round_: int,
+            stop: threading.Event) -> None:
+        started = self._clock()
+        waited = False
+        with self._condition:
+            while len(self._pending) >= self._pending_max and not stop.is_set():
+                waited = True
+                self._condition.wait(timeout=0.05)
+            wait_s = max(0.0, self._clock() - started) if waited else 0.0
+            pending = _PendingBackground(str(cmd_id), source, com, int(round_), self._clock())
+            self._pending[pending.cmd_id] = pending
+            self.max_pending_seen = max(self.max_pending_seen, len(self._pending))
+            self._condition.notify_all()
+        if waited:
+            self._elog.emit(source, "bg_backpressure", wait_s=wait_s)
+
+    def pending_count(self) -> int:
+        with self._condition:
+            return len(self._pending)
+
+    def _record_poll_error(self, pending: _PendingBackground, detail: str) -> None:
+        if pending.poll_error_reported:
+            return
+        pending.poll_error_reported = True
+        self._elog.emit(pending.source, "bg_poll_error", cmd_id=pending.cmd_id,
+                        detail=detail, com=pending.com, round=pending.round_)
+
+    def _finish(self, pending: _PendingBackground, *, lost: bool,
+                status: str | None = None, error_code: Any = None) -> None:
+        age_s = max(0.0, self._clock() - pending.submitted_at)
+        if lost:
+            self._elog.emit(pending.source, "bg_lost", cmd_id=pending.cmd_id,
+                            reason="CMD_NOT_FOUND", age_s=age_s,
+                            com=pending.com, round=pending.round_)
+        else:
+            self._elog.emit(pending.source, "bg_result", cmd_id=pending.cmd_id,
+                            status=status, error_code=error_code, latency_s=age_s,
+                            com=pending.com, round=pending.round_)
+        with self._condition:
+            if self._pending.get(pending.cmd_id) is pending:
+                del self._pending[pending.cmd_id]
+                self._condition.notify_all()
+
+    def _poll_one(self, pending: _PendingBackground, *, deadline: float | None = None) -> bool:
+        kwargs: dict[str, float] = {}
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            kwargs["timeout"] = remaining
+        try:
+            response = self._sw.run("cmd", "status", "--cmd-id", pending.cmd_id, **kwargs)
+        except Exception as exc:
+            self._record_poll_error(pending, repr(exc))
+            return False
+        if not isinstance(response, dict):
+            self._record_poll_error(pending, f"cmd status 回應非物件：{type(response).__name__}")
+            return False
+        error_code = response.get("error_code")
+        command = response.get("command") or response
+        if not isinstance(command, dict):
+            self._record_poll_error(pending, f"cmd status command 非物件：{type(command).__name__}")
+            return False
+        error_code = command.get("error_code") or error_code
+        if error_code == "CMD_NOT_FOUND":
+            self._finish(pending, lost=True)
+            return True
+        if response.get("_error") or response.get("ok") is False:
+            self._record_poll_error(pending, str(response.get("_error") or error_code or "RPC error"))
+            return False
+        status = command.get("status")
+        if status in BG_TERMINAL:
+            self._finish(pending, lost=False, status=str(status), error_code=error_code)
+            return True
+        if status not in {"accepted", "running", "queued"}:
+            self._record_poll_error(pending, f"未知或缺少 status：{status!r}")
+        age_s = max(0.0, self._clock() - pending.submitted_at)
+        if age_s >= BG_RESOLVE_WARN_S and not pending.slow_reported:
+            pending.slow_reported = True
+            self._elog.emit(pending.source, "bg_slow", cmd_id=pending.cmd_id,
+                            age_s=age_s, com=pending.com, round=pending.round_)
         return False
+
+    def poll_once(self, *, stop: threading.Event | None = None,
+                  deadline: float | None = None) -> int:
+        """依提交順序查詢 pending；停止或到期時不再開始下一筆 RPC。"""
+        with self._condition:
+            pending = list(self._pending.values())
+        removed = 0
+        for item in pending:
+            if stop is not None and stop.is_set():
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            if self._poll_one(item, deadline=deadline):
+                removed += 1
+        return removed
+
+    def run(self, stop: threading.Event) -> None:
+        source = "bg_resolver"
+        started = self._clock()
+        self._elog.emit(source, "worker_start")
+        next_alive = started + 300.0
+        reason = "stop"
+        try:
+            while not stop.is_set():
+                try:
+                    self.poll_once(stop=stop,
+                                   deadline=time.monotonic() + BG_POLL_INTERVAL_S)
+                except Exception as exc:
+                    reason = "error"
+                    self._elog.emit(source, "worker_error", detail=repr(exc))
+                    stop.set()
+                    with self._condition:
+                        self._condition.notify_all()
+                    break
+                now = self._clock()
+                if now >= next_alive:
+                    self._elog.emit(source, "worker_alive")
+                    next_alive = now + 300.0
+                stop.wait(BG_POLL_INTERVAL_S)
+        finally:
+            self._elog.emit(source, "worker_stop", reason=reason)
+
+    def final_drain(self, timeout_s: float = BG_FINAL_DRAIN_S) -> int:
+        """停止負載後只輪詢仍 pending 的命令至終態或逾時。"""
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        while self.pending_count() and time.monotonic() < deadline:
+            self.poll_once(deadline=deadline)
+            remaining_s = deadline - time.monotonic()
+            if self.pending_count() and remaining_s > 0:
+                time.sleep(min(BG_POLL_INTERVAL_S, remaining_s))
+        remaining = self.pending_count()
+        if remaining:
+            self._elog.emit("bg_resolver", "bg_drain", remaining=remaining)
+        return remaining
+
+
+def _join_workers(threads: list[threading.Thread], elog: _EventLog,
+                  timeout_s: float = LR_WORKER_JOIN_TIMEOUT_S) -> list[str]:
+    """以單一總期限等待 worker，未結束者寫入 evidence 並回傳名稱。"""
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    timed_out: list[str] = []
+    for thread in threads:
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        if thread.is_alive():
+            timed_out.append(thread.name)
+            elog.emit("orchestrator", "worker_join_timeout", worker=thread.name,
+                      timeout_s=max(0.0, float(timeout_s)))
+    return timed_out
 
 
 def _render_analysis_md(analysis: dict, meta: dict, major: dict,
@@ -275,13 +461,13 @@ def _case(id, title, hints=(), requires=(), destructive=False):
     "lr-mixed",
     "混合負載長跑＋事後分析（agent×4＋human＋快照）",
     hints=(
-        "同板多 worker 以 per-board lock 序列化，避免 FOREGROUND_BUSY 噪音；仍為多 source 競爭仲裁",
+        "同板多 worker 以 per-board lock 序列化；仍為多 source 競爭仲裁",
         "SIGINT 提前收斂＝記 sigint event、停負載，仍產出 longrun-analysis.md",
-        "重大事件（daemon pid==0／兩板同時非 READY >15min）只停負載記事件、不自動重啟 daemon（保留現場）",
-        "snapshot RSS 讀 /proc/<MainPID>/status VmRSS，MainPID 來自 systemctl show",
+        "重大事件（daemon 已退出／兩板同時非 READY >15min）只停負載記事件、不自動重啟 daemon（保留現場）",
+        "snapshot PID 取 daemon status；RSS 使用平台 adapter 觀測",
         "interactive 輪撞到 human raw owner 回 SESSION_INTERACTIVE_BUSY＝benign（不計 error）",
     ),
-    requires=("tmux", "two_boards"),
+    requires=("human_frontend", "two_boards"),
 )
 def lr_mixed(ctx) -> CaseResult:
     cfg = ctx.cfg
@@ -301,6 +487,7 @@ def lr_mixed(ctx) -> CaseResult:
     major: dict = {}  # {"kind":..., "t":...}——第一個重大事件
     elog = _EventLog(events_path, start)
     board_locks = {b: threading.Lock() for b in boards}
+    tracker = BgResultTracker(ctx.sw, elog)
 
     def rel_t() -> int:
         return int(time.monotonic() - start)
@@ -311,7 +498,8 @@ def lr_mixed(ctx) -> CaseResult:
         marker = f"LR_{tag}_{n}_{random.randint(1000, 9999)}"
         elog.emit(source, "submit", com=board, round=n, mode="line")
         with board_locks[board]:
-            cmd = ctx.sw.submit_and_wait(board, f"echo {marker}", cmd_timeout=10.0)
+            cmd = ctx.sw.submit_and_wait(board, f"echo {marker}", cmd_timeout=10.0,
+                                         source=source)
         if cmd.get("status") == "done" and marker in (cmd.get("stdout") or ""):
             elog.emit(source, "done", com=board, round=n, mode="line")
         else:
@@ -324,9 +512,13 @@ def lr_mixed(ctx) -> CaseResult:
         elog.emit(source, "submit", com=board, round=n, mode="background")
         with board_locks[board]:
             sub = ctx.sw.run("cmd", "submit", "--selector", board,
-                             "--mode", "background", "--cmd", f"echo {marker}")
+                             "--mode", "background", "--cmd", f"echo {marker}",
+                             "--source", source)
         if sub.get("cmd_id"):
-            elog.emit(source, "done", com=board, round=n, mode="background")
+            cmd_id = str(sub["cmd_id"])
+            elog.emit(source, "submit_accepted", com=board, round=n, mode="background",
+                      cmd_id=cmd_id)
+            tracker.add(cmd_id, source=source, com=board, round_=n, stop=stop)
         else:
             code = sub.get("error_code") or sub.get("_error")
             elog.emit(source, "error", com=board, round=n, mode="background", detail=str(code))
@@ -351,81 +543,161 @@ def lr_mixed(ctx) -> CaseResult:
     def agent_worker(i: int) -> None:
         source = f"agent:rhw{i}"
         n = 0
-        while not stop.is_set():
-            n += 1
-            board = boards[(i + n) % len(boards)]  # 輪流對兩板
-            try:
-                if n % 10 == 0:        # 每第 10 輪：interactive open/close
-                    _do_interactive(source, board, n)
-                elif n % 3 == 0:       # 每第 3 輪：background echo
-                    _do_background(source, board, n)
-                else:                  # 其餘：line submit_and_wait
-                    _do_line(source, board, n)
-            except Exception as exc:   # 單一動作例外＝記事件續跑，不殺整跑
-                elog.emit(source, "worker_error", com=board, round=n, detail=repr(exc))
-            _sleep_stop(stop, random.uniform(0.5, 2.0))
+        reason = "stop"
+        elog.emit(source, "worker_start")
+        next_alive = time.monotonic() + 300.0
+        try:
+            while not stop.is_set():
+                n += 1
+                board = boards[(i + n) % len(boards)]  # 輪流對兩板
+                try:
+                    if n % 10 == 0:        # 每第 10 輪：interactive open/close
+                        _do_interactive(source, board, n)
+                    elif n % 3 == 0:       # 每第 3 輪：background echo
+                        _do_background(source, board, n)
+                    else:                  # 其餘：line submit_and_wait
+                        _do_line(source, board, n)
+                except Exception as exc:   # 單一動作例外＝記事件續跑，不殺整跑
+                    elog.emit(source, "worker_error", com=board, round=n, detail=repr(exc))
+                if time.monotonic() >= next_alive:
+                    elog.emit(source, "worker_alive")
+                    next_alive = time.monotonic() + 300.0
+                _sleep_stop(stop, random.uniform(0.5, 2.0))
+        except Exception as exc:
+            reason = "error"
+            elog.emit(source, "worker_error", detail=repr(exc))
+        finally:
+            elog.emit(source, "worker_stop", reason=reason)
 
     def human_worker() -> None:
-        ses = ctx.tmux.name("lrhuman")
         n = 0
         opened = False
+        human = None
+        reason = "stop"
+        elog.emit("human", "worker_start")
+        next_alive = time.monotonic() + 300.0
         try:
             while not stop.is_set():
                 try:
-                    if not _tmux_alive(ctx.tmux, ses):
+                    if human is None or not human.alive():
                         if opened:
                             elog.emit("human", "minicom_dead", com="COM0")
-                        ctx.tmux.kill(ses)  # 清可能的殘留
-                        ctx.tmux.new(ses, "serialwrap-minicom COM0")
+                            human.close()
+                        human = _human_frontend(ctx, "lrhuman", "minicom")
+                        human.open("COM0")
                         opened = True
                         elog.emit("human", "minicom_open", com="COM0")
-                        if _sleep_stop(stop, 6):  # 等 console-attach＋minicom 起來
+                        delay = 6.0 if human.kind == "tmux-minicom" else 0.0
+                        if _sleep_stop(stop, delay):
                             break
                         continue
                     if _sleep_stop(stop, random.uniform(120, 300)):  # 2-5 分鐘
                         break
                     n += 1
-                    ctx.tmux.send(ses, f"echo HUMAN_TICK_{n}")
+                    human.send_line(f"echo HUMAN_TICK_{n}")
                     elog.emit("human", "tick", com="COM0", n=n)
+                    if time.monotonic() >= next_alive:
+                        elog.emit("human", "worker_alive")
+                        next_alive = time.monotonic() + 300.0
                 except Exception as exc:
                     elog.emit("human", "human_error", detail=repr(exc))
                     _sleep_stop(stop, 5)
+        except Exception as exc:
+            reason = "error"
+            elog.emit("human", "worker_error", detail=repr(exc))
         finally:
-            ctx.tmux.kill(ses)
+            if human is not None:
+                try:
+                    human.close()
+                except Exception as exc:
+                    elog.emit("human", "human_error", detail=repr(exc))
+            elog.emit("human", "worker_stop", reason=reason)
 
     def snapshot_worker() -> None:
         both_down_since: int | None = None
-        while not stop.is_set():
-            try:
-                pid = ctx.systemd.main_pid()
-                sessions = {b: ctx.sw.session(b).get("state") for b in boards}
-                rss = _read_rss_kb(pid)
-                t = rel_t()
-                _append_ndjson(snaps_path, {"t": t, "sessions": sessions,
-                                            "rss_kb": rss, "pid": pid})
-                # 重大事件偵測
-                if pid == 0:
-                    if not major:
-                        major.update({"kind": "daemon_death", "t": t})
-                        elog.emit("orchestrator", "major", detail="daemon_death", t_at=t)
-                    stop.set()
-                    break
-                both_down = all(sessions.get(b) != "READY" for b in boards)
-                if both_down:
-                    if both_down_since is None:
-                        both_down_since = t
-                    elif t - both_down_since >= MAJOR_BOTH_DOWN_S:
-                        if not major:
-                            major.update({"kind": "both_boards_stuck", "t": t})
-                            elog.emit("orchestrator", "major",
-                                      detail="both_boards_stuck", t_at=t)
-                        stop.set()
-                        break
-                else:
-                    both_down_since = None
-            except Exception as exc:
-                elog.emit("orchestrator", "snapshot_error", detail=repr(exc))
-            _sleep_stop(stop, snap_interval)
+        last_pid: int | None = None
+        failed_probes = 0
+        elog.emit("orchestrator", "worker_start")
+        next_alive = time.monotonic() + 300.0
+        reason = "stop"
+        try:
+            while not stop.is_set():
+                try:
+                    try:
+                        status = ctx.sw.run("daemon", "status")
+                        raw_pid = status.get("pid")
+                        if status.get("_error") or status.get("ok") is False:
+                            raise RuntimeError(str(status.get("error_code") or
+                                                   status.get("_error") or "RPC error"))
+                        pid = int(raw_pid) if raw_pid is not None and int(raw_pid) > 0 else None
+                        if pid is None:
+                            raise ValueError("daemon status 缺少有效 pid")
+                        if last_pid is not None and pid != last_pid:
+                            elog.emit("orchestrator", "pid_change", old_pid=last_pid, pid=pid)
+                        last_pid = pid
+                        failed_probes = 0
+                        pid_error = None
+                    except Exception as exc:
+                        pid = None
+                        failed_probes += 1
+                        pid_error = str(exc)
+
+                    sessions = {b: ctx.sw.session(b).get("state") for b in boards}
+                    rss: int | None = None
+                    rss_error: str | None = None
+                    if pid is not None:
+                        rss_value = procobs.rss_kb(pid)
+                        if isinstance(rss_value, int) and rss_value > 0:
+                            rss = rss_value
+                        else:
+                            rss_error = "process working-set query returned no value"
+                    t = rel_t()
+                    snapshot = {"t": t, "wall_ts": datetime.now(timezone.utc).isoformat(),
+                                "sessions": sessions, "rss_kb": rss, "pid": pid}
+                    if pid_error:
+                        snapshot["pid_probe_error"] = pid_error
+                    if rss_error:
+                        snapshot["rss_probe_error"] = rss_error
+                    _append_ndjson(snaps_path, snapshot)
+
+                    if failed_probes >= 3 and last_pid is not None:
+                        try:
+                            dead = not procobs.pid_alive(last_pid)
+                        except Exception:
+                            dead = False
+                        if dead:
+                            if not major:
+                                major.update({"kind": "daemon_death", "t": t})
+                                elog.emit("orchestrator", "major", detail="daemon_death", t_at=t,
+                                          pid=last_pid)
+                            stop.set()
+                            break
+
+                    both_down = all(sessions.get(b) != "READY" for b in boards)
+                    if both_down:
+                        if both_down_since is None:
+                            both_down_since = t
+                        elif t - both_down_since >= MAJOR_BOTH_DOWN_S:
+                            if not major:
+                                major.update({"kind": "both_boards_stuck", "t": t})
+                                elog.emit("orchestrator", "major",
+                                          detail="both_boards_stuck", t_at=t)
+                            stop.set()
+                            break
+                    else:
+                        both_down_since = None
+                    if time.monotonic() >= next_alive:
+                        elog.emit("orchestrator", "worker_alive")
+                        next_alive = time.monotonic() + 300.0
+                    _sleep_stop(stop, snap_interval)
+                except Exception as exc:
+                    elog.emit("orchestrator", "snapshot_error", detail=repr(exc), t=rel_t())
+                    _sleep_stop(stop, snap_interval)
+        except Exception as exc:
+            reason = "error"
+            elog.emit("orchestrator", "worker_error", detail=repr(exc))
+        finally:
+            elog.emit("orchestrator", "worker_stop", reason=reason)
 
     # ---- SIGINT → 提前收斂 ----
     def _on_sigint(signum, frame):
@@ -441,13 +713,16 @@ def lr_mixed(ctx) -> CaseResult:
     elog.emit("orchestrator", "start", duration_s=duration_s, workers=n_workers)
 
     threads = [threading.Thread(target=snapshot_worker, name="lr-snap", daemon=True),
-               threading.Thread(target=human_worker, name="lr-human", daemon=True)]
+               threading.Thread(target=human_worker, name="lr-human", daemon=True),
+               threading.Thread(target=tracker.run, args=(stop,), name="lr-bg-resolver", daemon=True)]
     threads += [threading.Thread(target=agent_worker, args=(i,), name=f"lr-agent{i}",
                                  daemon=True) for i in range(n_workers)]
     for th in threads:
         th.start()
 
     deadline = start + duration_s
+    worker_join_timeouts: list[str] = []
+    bg_remaining = 0
     try:
         while not stop.is_set():
             if duration_s > 0 and time.monotonic() >= deadline:
@@ -455,8 +730,15 @@ def lr_mixed(ctx) -> CaseResult:
             stop.wait(timeout=1.0)  # 短輪詢，不 sleep 整段 duration
     finally:
         stop.set()
-        for th in threads:
-            th.join(timeout=30)
+        worker_join_timeouts = _join_workers(threads, elog)
+        resolver = next((th for th in threads if th.name == "lr-bg-resolver"), None)
+        if resolver is not None and resolver.is_alive():
+            bg_remaining = tracker.pending_count()
+            if bg_remaining:
+                elog.emit("bg_resolver", "bg_drain", remaining=bg_remaining,
+                          reason="resolver_join_timeout")
+        else:
+            bg_remaining = tracker.final_drain(BG_FINAL_DRAIN_S)
         elog.emit("orchestrator", "stop")
         elog.close()
         if prev_handler is not None:
@@ -494,6 +776,27 @@ def lr_mixed(ctx) -> CaseResult:
     if tot_submit >= 10 and tot_error / max(tot_submit, 1) > 0.5:
         reasons.append(f"命令錯誤率過高：{tot_error}/{tot_submit}")
 
+    monitor_gaps: list[str] = []
+    stop_event = next((event for event in events if event.get("kind") == "stop"), None)
+    stop_t = stop_event.get("t", float("inf")) if stop_event else float("inf")
+    if not snapshots:
+        monitor_gaps.append("沒有快照")
+    if any(event.get("kind") == "snapshot_error" for event in events):
+        monitor_gaps.append("快照輪次失敗")
+    if any(snapshot.get("pid_probe_error") or snapshot.get("rss_probe_error")
+           for snapshot in snapshots):
+        monitor_gaps.append("PID 或 RSS 觀測失敗")
+    if any(event.get("kind") == "worker_stop" and event.get("reason") == "error"
+           and event.get("t", float("inf")) <= stop_t for event in events):
+        monitor_gaps.append("worker 提前結束")
+    if worker_join_timeouts or any(event.get("kind") == "worker_join_timeout"
+                                   for event in events):
+        monitor_gaps.append("worker 未在期限內結束")
+    if bg_remaining:
+        monitor_gaps.append(f"background 結果未收斂：{bg_remaining}")
+    if monitor_gaps:
+        reasons.append("長跑觀測證據不完整：" + "；".join(monitor_gaps))
+
     reason_code = ""
     if analysis["daemon_death_at"] is not None or major.get("kind") == "daemon_death":
         reason_code = "daemon_died"
@@ -501,6 +804,8 @@ def lr_mixed(ctx) -> CaseResult:
         reason_code = "both_boards_stuck"
     elif long_stuck:
         reason_code = "board_stuck"
+    elif monitor_gaps:
+        reason_code = "monitor_died"
     elif reasons:
         reason_code = "cmd_error_rate_high"
 

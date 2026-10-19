@@ -9,6 +9,7 @@ import signal
 import socket
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -127,17 +128,15 @@ def stub_sw() -> _StubSw:
     return _StubSw()
 
 
-class _AnyTmux:
-    """任何方法呼叫都回傳固定字串的 tmux 替身（只供 crash 語意測試，不啟動 tmux）。"""
+class _PaneTmux:
+    def pane_pid(self, _session):
+        return "4242"
 
-    def __init__(self, out: str) -> None:
-        self._out = out
+    def name(self, tag):
+        return tag
 
-    def __getattr__(self, name):
-        def _call(*args, **kwargs):
-            return self._out
-
-        return _call
+    def new(self, *_args):
+        return None
 
 
 def _endpoint_resp(port: int) -> dict:
@@ -237,13 +236,33 @@ def test_capture_bounded(fake_telnet_server, stub_sw):
 def test_frontend_crash_semantics(fake_telnet_server, stub_sw, monkeypatch):
     from realhw import frontends
 
-    # tmux 模式：crash() 對 minicom 程序送 SIGKILL（以 stub os.kill 記錄；不真的殺行程）
+    # tmux pane 的 PID 是 router；crash() 必須定位並終止其 minicom 子行程。
     kills: list[tuple[int, int]] = []
     monkeypatch.setattr(frontends.os, "kill", lambda pid, sig: kills.append((pid, sig)))
-    mh = frontends.TmuxMinicomFrontend(_AnyTmux("4242"), "t5")
+    monkeypatch.setattr(
+        frontends.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="4242 1 bash serialwrap-minicom COM0\n4243 4242 minicom -D /dev/pts/3\n",
+            stderr="",
+        ),
+    )
+    mh = frontends.TmuxMinicomFrontend(_PaneTmux(), "t5")
     mh.open("COM0")
-    mh.crash()
-    assert (4242, signal.SIGKILL) in kills
+    assert mh.crash() == 4243
+    assert (4243, getattr(signal, "SIGKILL", signal.SIGTERM)) in kills
+
+    # 找不到 minicom child 必須明確失敗，不能靜默略過。
+    monkeypatch.setattr(
+        frontends.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0, stdout="4242 1 bash serialwrap-minicom COM0\n", stderr=""
+        ),
+    )
+    with pytest.raises(frontends.FrontendError, match="minicom"):
+        mh.crash()
 
     # telnet 模式：crash() 前設 SO_LINGER(1,0)，對端收到 RST（ConnectionResetError），而非 FIN
     stub_sw.responses[("session", "console-attach")] = _endpoint_resp(fake_telnet_server.port)

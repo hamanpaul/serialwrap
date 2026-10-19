@@ -59,15 +59,15 @@ def _await_terminal(ctx, cmd_id, *, timeout_s: float, poll_s: float = 0.5) -> di
     return last
 
 
-def _tab_complete_check(ctx, ses: str) -> bool:
+def _tab_complete_check(ctx, human: Any) -> bool:
     """照 ``p0-console-raw`` 手法：送 "ec"（不含 Enter）＋Tab，capture 應含 "echo"。
 
     回傳補完是否成功（True＝仍是 raw 路徑；False＝疑似掉回 line-buffer）。
     """
-    ctx.tmux.send(ses, "ec", enter=False)
-    ctx.tmux.send_key(ses, "Tab")
+    human.send_text("ec")
+    human.send_key("Tab")
     time.sleep(2)
-    pane = ctx.tmux.capture(ses)
+    pane = human.capture()
     ctx.note("pane-tab.txt", pane)
     return "echo" in strip_ansi(pane)
 
@@ -76,20 +76,20 @@ def _tab_complete_check(ctx, ses: str) -> bool:
     "f5-raw-ownership-survives-agent-rounds",
     "raw interactive ownership 撐過連續 5 輪 agent 命令（suspend/resume 不掉權）",
     issues=("#78",),
-    requires=("tmux",),
+    requires=("human_frontend",),
     hints=(
         "每輪 submit_and_wait 都會觸發 bridge.suspend_interactive()→執行→resume_interactive()，"
         "若 resume 路徑有回歸，ownership 可能在某輪之後悄悄消失或退化成 line-buffer。",
-        "照 p0-console-raw：new-session 後 sleep 6 等 console-attach＋minicom 起來。",
+        "照 p0-console-raw：frontend open 後 sleep 6 等 console-attach 完成。",
     ),
 )
 def f5_raw_ownership_survives_agent_rounds(ctx):
     """開 console 拿 ownership → 連續 5 輪 agent 命令 → ownership 與 Tab 補完須仍在（#78 回歸）。"""
     com = ctx.cfg["boards"][0]["com"]
-    ses = ctx.tmux.name("f5rnd")
-    ctx.tmux.new(ses, f"serialwrap-minicom {com}")
+    human = ctx.human("f5rnd", "minicom")
+    human.open(com)
     try:
-        time.sleep(6)  # 等 console-attach＋minicom 起來
+        time.sleep(6)  # 等 console frontend attach
         consoles = _console_list(ctx, com)
         if not _has_owner(consoles):
             return CaseResult(
@@ -124,17 +124,17 @@ def f5_raw_ownership_survives_agent_rounds(ctx):
                 reason_code="raw_ownership_lost_after_rounds",
             )
 
-        if not _tab_complete_check(ctx, ses):
+        if not _tab_complete_check(ctx, human):
             return CaseResult(
                 "FAIL",
                 reason="5 輪 agent 命令後 Tab 補完未出現（疑似 raw 路徑掉回 line-buffer，#78 回歸）",
                 category="test",
                 reason_code="raw_fallback_linebuffer",
             )
-        ctx.tmux.send_key(ses, "C-u")  # 清掉半行 "ec"，還原乾淨 prompt
+        human.send_key("C-u")  # 清掉半行 "ec"，還原乾淨 prompt
         return CaseResult("PASS")
     finally:
-        ctx.tmux.kill(ses)
+        human.close()
         time.sleep(3)  # 等 router 清理 detach
 
 
@@ -142,7 +142,7 @@ def f5_raw_ownership_survives_agent_rounds(ctx):
     "f5-deferred-bytes-flushed",
     "agent 命令執行期間 human console 按鍵不丟（deferred buffer 正確 flush）",
     issues=("#78",),
-    requires=("tmux",),
+    requires=("human_frontend",),
     hints=(
         "agent 命令執行中 bridge 會 suspend human raw mode，此時的按鍵會進 deferred buffer；"
         "命令結束 resume 時應把 deferred buffer flush 回 UART，不應丟鍵。",
@@ -152,10 +152,10 @@ def f5_raw_ownership_survives_agent_rounds(ctx):
 def f5_deferred_bytes_flushed(ctx):
     """命令執行中送 "ec"（不含 Enter）→ 命令結束後補 Tab → 應出現 "echo"（#78 回歸）。"""
     com = ctx.cfg["boards"][0]["com"]
-    ses = ctx.tmux.name("f5def")
-    ctx.tmux.new(ses, f"serialwrap-minicom {com}")
+    human = ctx.human("f5def", "minicom")
+    human.open(com)
     try:
-        time.sleep(6)  # 等 console-attach＋minicom 起來
+        time.sleep(6)  # 等 console frontend attach
         consoles = _console_list(ctx, com)
         if not _has_owner(consoles):
             return CaseResult(
@@ -177,15 +177,15 @@ def f5_deferred_bytes_flushed(ctx):
             )
 
         time.sleep(0.5)  # 讓 daemon 進入該命令、suspend_interactive() 已生效
-        ctx.tmux.send(ses, "ec", enter=False)  # 命令執行中送鍵，應進 deferred buffer
+        human.send_text("ec")  # 命令執行中送鍵，應進 deferred buffer
 
         terminal = _await_terminal(ctx, cmd_id, timeout_s=10.0)
         ctx.note("terminal.json", str(terminal))
         time.sleep(2)  # 等 resume_interactive() flush 完成（如 plan 所述）
 
-        ctx.tmux.send_key(ses, "Tab")
+        human.send_key("Tab")
         time.sleep(2)
-        pane = ctx.tmux.capture(ses)
+        pane = human.capture()
         ctx.note("pane-tab.txt", pane)
         if "echo" not in strip_ansi(pane):
             return CaseResult(
@@ -195,10 +195,10 @@ def f5_deferred_bytes_flushed(ctx):
                 category="test",
                 reason_code="deferred_bytes_lost",
             )
-        ctx.tmux.send_key(ses, "C-u")  # 清掉半行，還原乾淨 prompt
+        human.send_key("C-u")  # 清掉半行，還原乾淨 prompt
         return CaseResult("PASS")
     finally:
-        ctx.tmux.kill(ses)
+        human.close()
         time.sleep(3)  # 等 router 清理 detach
 
 
@@ -206,7 +206,7 @@ def f5_deferred_bytes_flushed(ctx):
     "f5-console-peer-gone-recycled",
     "對端消失（非正常 detach）後 console 正確回收，無假性佔用",
     issues=("#53", "#11"),
-    requires=("tmux",),
+    requires=("human_frontend", "posix_orphan_semantics"),
     hints=(
         "tmux kill-session 模擬對端異常消失（非透過 minicom 正常退出 detach）；daemon 需靠"
         "holder-probe／socket EOF 之類的機制自行偵測對端已離開才能回收 console。",
@@ -216,14 +216,28 @@ def f5_deferred_bytes_flushed(ctx):
 def f5_console_peer_gone_recycled(ctx):
     """kill 對端 tmux → console-list 應自動回收該筆 → 新開 console 仍可取得 ownership（#53 #11 回歸）。"""
     com = ctx.cfg["boards"][0]["com"]
-    ses = ctx.tmux.name("f5peer")
-    ctx.tmux.new(ses, f"serialwrap-minicom {com}")
+    human = ctx.human("f5peer", "minicom")
     try:
-        time.sleep(6)  # 等 console-attach＋minicom 起來
+        human.open(com)
+    except Exception as exc:
+        human.close()
+        return CaseResult("FAIL", reason=f"minicom frontend 啟動失敗：{exc}",
+                          category="environment", reason_code="minicom_spawn_failed")
+    try:
+        time.sleep(6)  # 等 console frontend attach
         consoles_opened = _console_list(ctx, com)
+        if not human.alive() or not consoles_opened:
+            return CaseResult(
+                "FAIL",
+                reason="crash 前 human frontend 未存活或 console 尚未 attach",
+                category="environment",
+                reason_code="minicom_spawn_failed",
+            )
         count_opened = len(consoles_opened)
 
-        ctx.tmux.kill(ses)  # 模擬對端消失（不做正常 detach）
+        killed_pid = human.crash()  # 模擬 minicom process 異常消失，不做正常 detach
+        ctx.note("killed-pids.txt", str(killed_pid))
+        human.close()
         time.sleep(10)
 
         consoles_after = _console_list(ctx, com)
@@ -237,12 +251,12 @@ def f5_console_peer_gone_recycled(ctx):
                 reason_code="orphan_console_not_recycled",
             )
     finally:
-        ctx.tmux.kill(ses)  # 保險：前面已 kill 過也無妨（idempotent）
+        human.close()  # 保險：前面已關閉也無妨
 
-    ses2 = ctx.tmux.name("f5peer2")
-    ctx.tmux.new(ses2, f"serialwrap-minicom {com}")
+    human2 = ctx.human("f5peer2", "minicom")
+    human2.open(com)
     try:
-        time.sleep(6)  # 等 console-attach＋minicom 起來
+        time.sleep(6)  # 等 console frontend attach
         consoles_new = _console_list(ctx, com)
         if not _has_owner(consoles_new):
             return CaseResult(
@@ -254,7 +268,7 @@ def f5_console_peer_gone_recycled(ctx):
             )
         return CaseResult("PASS")
     finally:
-        ctx.tmux.kill(ses2)
+        human2.close()
         time.sleep(3)  # 等 router 清理 detach
 
 
@@ -262,7 +276,7 @@ def f5_console_peer_gone_recycled(ctx):
     "f5-second-console-linebuffer",
     "第二個 console 走 line-buffer、不搶 ownership，也不擋 agent 命令",
     issues=("#7", "#8"),
-    requires=("tmux",),
+    requires=("human_frontend",),
     hints=(
         "第一個 console 已持 raw interactive ownership 期間再開第二個，第二個應停在"
         "line-buffer（interactive_owner=false），且 agent 命令走 arbiter、不受任何 console 佔用影響"
@@ -272,11 +286,11 @@ def f5_console_peer_gone_recycled(ctx):
 def f5_second_console_linebuffer(ctx):
     """第一 console 持 ownership 時開第二個 → 第二個非 owner＋期間 agent 命令仍成功（#7 #8 回歸）。"""
     com = ctx.cfg["boards"][0]["com"]
-    ses1 = ctx.tmux.name("f5two1")
-    ses2 = ctx.tmux.name("f5two2")
+    human1 = ctx.human("f5two1", "minicom")
+    human2 = ctx.human("f5two2", "minicom")
     try:
-        ctx.tmux.new(ses1, f"serialwrap-minicom {com}")
-        time.sleep(6)  # 等第一個 console-attach＋minicom 起來
+        human1.open(com)
+        time.sleep(6)  # 等第一個 console frontend attach
         consoles_one = _console_list(ctx, com)
         if not _has_owner(consoles_one):
             return CaseResult(
@@ -286,8 +300,8 @@ def f5_second_console_linebuffer(ctx):
                 reason_code="raw_ownership_not_granted",
             )
 
-        ctx.tmux.new(ses2, f"serialwrap-minicom {com}")
-        time.sleep(6)  # 等第二個 console-attach＋minicom 起來
+        human2.open(com)
+        time.sleep(6)  # 等第二個 console frontend attach
         consoles_two = _console_list(ctx, com)
         if len(consoles_two) < 2:
             return CaseResult(
@@ -318,8 +332,8 @@ def f5_second_console_linebuffer(ctx):
             )
         return CaseResult("PASS")
     finally:
-        ctx.tmux.kill(ses2)
-        ctx.tmux.kill(ses1)
+        human2.close()
+        human1.close()
         time.sleep(3)  # 等 router 清理 detach
 
 
@@ -494,7 +508,7 @@ def _stale_arm(ctx: Any, com: str, *, reboot: bool, boot_wait_s: float) -> dict[
     "agent 命令在途時 human 鍵入的舊按鍵，於 reboot（上下文失效）後不回放；未 reboot 之對照組照常回放",
     issues=(),
     pending_issue=True,
-    requires=("tmux",),
+    requires=("tmux", "posix_throwaway_daemon"),
     destructive=True,
     hints=(
         "對照組先跑：`sleep 5` 在途期間鍵入 echo STALE，命令結束 resume 時應回放（scrollback 與 WAL TX 見 STALE）。",

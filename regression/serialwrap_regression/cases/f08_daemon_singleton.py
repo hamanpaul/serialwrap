@@ -80,6 +80,7 @@ def f8_tty_holders_reported(ctx):
     "f8-second-daemon-detected",
     "第二個 daemon（two-reader）須被 prod 被動偵測",
     issues=("#101",),
+    requires=("posix_throwaway_daemon",),
     hints=(
         "唯讀實查 daemon status：multi_open（bool）與 multi_open_detail.daemons（list[{pid}]）"
         "為健康單一 daemon 時分別為 false／單一元素；second daemon 存在期間應翻正／列出第二筆。",

@@ -36,18 +36,18 @@ def _wal_tail_seq(ctx):
 
 
 @_case("p1-wal-reset", "wal reset 契約＋console 不斷線（T1/T2/T3）",
-       hints=("console 掛 console-attach 取 vtty、tmux cat 讀 RX（比照 coexist 輕量法）",
+       hints=("console 經 human frontend 讀取 RX（比照 coexist 輕量法）",
               "reset 後 current-seq 應歸零並重新累積，且與 live WAL 檔尾 seq 相等"),
-       requires=("tmux", "two_boards"))
+       requires=("human_frontend", "two_boards"))
 def p1_wal_reset(ctx):
-    att = ctx.sw.run("session", "console-attach", "--selector", "COM0", "--label", "realhw")
-    ctx.note("console-attach.json", str(att))
-    vtty, cid = att.get("vtty"), att.get("client_id")
-    if not vtty or not cid:
-        return CaseResult("FAIL", reason=f"console-attach 未回 vtty/client_id（{att.get('error_code')}）",
+    human = ctx.human("walreset", "reader")
+    try:
+        human.open("COM0")
+    except Exception as exc:
+        return CaseResult("FAIL", reason=f"console-attach 失敗：{exc}",
                           category="test", reason_code="console_attach_failed")
-    ses = ctx.tmux.name("walreset")
-    ctx.tmux.new(ses, f"cat {vtty}")
+    cid = human.client_id()
+    ctx.note("console-attach.json", str({"client_id": cid, "frontend": human.kind}))
     try:
         time.sleep(1)
         if (ctx.sw.run("wal", "current-seq").get("seq") or 0) == 0:
@@ -61,10 +61,11 @@ def p1_wal_reset(ctx):
         time.sleep(1)
         cl = ctx.sw.run("session", "console-list", "--selector", "COM0")
         ctx.note("console-list.json", str(cl))
-        if not any(c.get("client_id") == cid for c in cl.get("consoles") or []):
+        consoles = cl.get("consoles") or []
+        if (cid and not any(c.get("client_id") == cid for c in consoles)) or (not cid and not consoles):
             return CaseResult("FAIL", reason="reset 後原 console client 掉線",
                               category="test", reason_code="console_dropped")
-        pane = ctx.tmux.capture(ses)
+        pane = human.capture()
         ctx.note("pane.txt", pane)
         if not find_marker(pane, "T1_ALIVE"):
             return CaseResult("FAIL", reason="console 未見 reset 後命令 marker",
@@ -79,23 +80,22 @@ def p1_wal_reset(ctx):
                               category="test", reason_code="wal_integrity")
         return CaseResult("PASS")
     finally:
-        ctx.tmux.kill(ses)
-        ctx.sw.run("session", "console-detach", "--selector", "COM0", "--client-id", cid)
+        human.close()
         time.sleep(1)
 
 
 @_case("p1-wal-fullrun", "逐案 seq 嚴格遞增＋console 存活（T8）",
        hints=("歷史 flaky（t8 假 PTY ~50%）在實機版應穩；async line race——等待要足",),
-       requires=("tmux", "two_boards"))
+       requires=("human_frontend", "two_boards"))
 def p1_wal_fullrun(ctx):
-    att = ctx.sw.run("session", "console-attach", "--selector", "COM0", "--label", "realhw")
-    ctx.note("console-attach.json", str(att))
-    vtty, cid = att.get("vtty"), att.get("client_id")
-    if not vtty or not cid:
-        return CaseResult("FAIL", reason=f"console-attach 未回 vtty/client_id（{att.get('error_code')}）",
+    human = ctx.human("walfull", "reader")
+    try:
+        human.open("COM0")
+    except Exception as exc:
+        return CaseResult("FAIL", reason=f"console-attach 失敗：{exc}",
                           category="test", reason_code="console_attach_failed")
-    ses = ctx.tmux.name("walfull")
-    ctx.tmux.new(ses, f"cat {vtty}")
+    cid = human.client_id()
+    ctx.note("console-attach.json", str({"client_id": cid, "frontend": human.kind}))
     try:
         time.sleep(1)
         ctx.sw.run("wal", "reset")
@@ -117,10 +117,11 @@ def p1_wal_fullrun(ctx):
                               category="test", reason_code="wal_export_empty")
         cl = ctx.sw.run("session", "console-list", "--selector", "COM0")
         ctx.note("console-list.json", str(cl))
-        if not any(c.get("client_id") == cid for c in cl.get("consoles") or []):
+        consoles = cl.get("consoles") or []
+        if (cid and not any(c.get("client_id") == cid for c in consoles)) or (not cid and not consoles):
             return CaseResult("FAIL", reason="fullrun 期間 console client 掉線",
                               category="test", reason_code="console_dropped")
-        pane = ctx.tmux.capture(ses)
+        pane = human.capture()
         ctx.note("pane.txt", pane)
         missing = [m for m in markers if not find_marker(pane, m)]
         if missing:
@@ -128,6 +129,5 @@ def p1_wal_fullrun(ctx):
                               category="test", reason_code="console_fanout_lost")
         return CaseResult("PASS")
     finally:
-        ctx.tmux.kill(ses)
-        ctx.sw.run("session", "console-detach", "--selector", "COM0", "--client-id", cid)
+        human.close()
         time.sleep(1)

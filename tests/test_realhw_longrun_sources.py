@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import json
+import subprocess
 import threading
 import time
 from collections import Counter, OrderedDict
@@ -549,3 +550,139 @@ def test_final_drain_only_pending(tmp_path):
     assert drains and drains[-1]["remaining"] == 3
     final = {e["cmd_id"] for e in _events(tmp_path) if e["kind"] == "bg_result"}
     assert final == set(ids[:20])
+
+
+@pytest.mark.memory_only
+def test_bg_tracker_rejects_malformed_command_and_keeps_pending(tmp_path):
+    sw = _ScriptedSw()
+    sw.set("c1", {"ok": True, "command": "not-an-object"}, _done())
+    tracker = longrun.BgResultTracker(sw, _elog(tmp_path))
+    tracker.add("c1", source="agent:rhw0", com="COM0", round_=1,
+                stop=threading.Event())
+
+    tracker.poll_once()
+    assert tracker.pending_count() == 1
+    errors = [event for event in _events(tmp_path) if event["kind"] == "bg_poll_error"]
+    assert len(errors) == 1 and errors[0]["cmd_id"] == "c1"
+
+    tracker.poll_once()
+    assert tracker.pending_count() == 0
+    assert [event["kind"] for event in _events(tmp_path)].count("bg_result") == 1
+
+
+@pytest.mark.memory_only
+def test_bg_tracker_poll_respects_stop_between_items(tmp_path):
+    sw = _ScriptedSw()
+    tracker = longrun.BgResultTracker(sw, _elog(tmp_path))
+    stop = threading.Event()
+    for cid in ("c1", "c2"):
+        tracker.add(cid, source="agent:rhw0", com="COM0", round_=1, stop=stop)
+    stop.set()
+
+    assert tracker.poll_once(stop=stop) == 0
+    assert sw.calls == []
+
+
+@pytest.mark.memory_only
+def test_bg_tracker_final_drain_obeys_wall_deadline(tmp_path):
+    class _SlowSw:
+        def __init__(self):
+            self.timeouts = []
+
+        def run(self, *args, timeout=30.0):
+            self.timeouts.append(timeout)
+            time.sleep(min(0.01, max(0.0, timeout)))
+            return _running()
+
+    sw = _SlowSw()
+    tracker = longrun.BgResultTracker(sw, _elog(tmp_path))
+    stop = threading.Event()
+    for index in range(20):
+        tracker.add(f"c{index}", source="agent:rhw0", com="COM0", round_=index,
+                    stop=stop)
+
+    started = time.monotonic()
+    remaining = tracker.final_drain(timeout_s=0.05)
+    elapsed = time.monotonic() - started
+
+    assert remaining == 20
+    assert elapsed < 0.2
+    assert 0 < len(sw.timeouts) < 20
+    assert max(sw.timeouts) <= 0.05
+
+
+@pytest.mark.memory_only
+def test_bg_tracker_worker_error_is_reported_and_stops_load(tmp_path, monkeypatch):
+    tracker = longrun.BgResultTracker(_ScriptedSw(), _elog(tmp_path))
+    stop = threading.Event()
+
+    def _boom(**kwargs):
+        raise RuntimeError("poll loop failed")
+
+    monkeypatch.setattr(tracker, "poll_once", _boom)
+    tracker.run(stop)
+
+    events = _events(tmp_path)
+    assert stop.is_set()
+    assert any(event["kind"] == "worker_error" and event["source"] == "bg_resolver"
+               for event in events)
+    assert any(event["kind"] == "worker_stop" and event["source"] == "bg_resolver"
+               and event["reason"] == "error" for event in events)
+
+
+@pytest.mark.memory_only
+def test_longrun_worker_join_timeout_is_recorded(tmp_path):
+    release = threading.Event()
+    thread = threading.Thread(target=release.wait, name="blocked-worker", daemon=True)
+    thread.start()
+    elog = _elog(tmp_path)
+    try:
+        timed_out = longrun._join_workers([thread], elog, timeout_s=0.01)
+        assert timed_out == ["blocked-worker"]
+        assert any(event["kind"] == "worker_join_timeout"
+                   for event in _events(tmp_path))
+    finally:
+        release.set()
+        thread.join(timeout=1.0)
+
+
+@pytest.mark.memory_only
+def test_lr_mixed_snapshot_error_does_not_end_monitor_or_pass(tmp_path, monkeypatch):
+    class _OneSessionFailureSw(_LrSw):
+        def __init__(self):
+            super().__init__()
+            self.failed = False
+
+        def session(self, com):
+            if not self.failed:
+                self.failed = True
+                raise TimeoutError("single session-list timeout")
+            return {"state": "READY"}
+
+    monkeypatch.setattr(longrun.random, "uniform", _fast_uniform)
+    ctx = _ctx(tmp_path, _OneSessionFailureSw(), duration_s=1, workers=1, snap=0.02)
+    result = longrun.lr_mixed(ctx)
+
+    events = _events(ctx.case_dir)
+    snapshots = _read_jsonl(ctx.case_dir / "snapshots.ndjson")
+    assert any(event["kind"] == "snapshot_error" for event in events)
+    assert len(snapshots) > 0
+    assert result.verdict == "FAIL"
+    assert result.reason_code == "monitor_died"
+
+
+@pytest.mark.memory_only
+def test_lr_mixed_zero_rss_is_recorded_as_missing_observation(tmp_path, monkeypatch):
+    from realhw.cases import longrun as module
+
+    monkeypatch.setattr(longrun.random, "uniform", _fast_uniform)
+    monkeypatch.setattr(module.procobs, "rss_kb", lambda pid: 0)
+    ctx = _ctx(tmp_path, _LrSw(), duration_s=1, workers=1, snap=0.02)
+    result = longrun.lr_mixed(ctx)
+
+    snapshots = _read_jsonl(ctx.case_dir / "snapshots.ndjson")
+    assert snapshots
+    assert all(snapshot["rss_kb"] is None for snapshot in snapshots)
+    assert all(snapshot["rss_probe_error"] for snapshot in snapshots)
+    assert result.verdict == "FAIL"
+    assert result.reason_code == "monitor_died"

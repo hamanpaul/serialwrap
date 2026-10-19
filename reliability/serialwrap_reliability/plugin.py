@@ -85,7 +85,9 @@ class Plugin(PluginBase):
             "git": head,
             "tiers": "plugin",
             "started_at": dt.datetime.now().strftime("%y%m%d-%H%M%S"),
-            "preflight_notes": list(preflight["problems"]),
+            "preflight_notes": list(preflight["problems"]) + list(preflight.get("notes", [])),
+            "cross_os_guard": preflight.get("cross_os_guard", "unconfigured"),
+            "cross_os_detail": preflight.get("cross_os_detail"),
             "boards": [
                 {
                     "com": str(board.get("com", "")),

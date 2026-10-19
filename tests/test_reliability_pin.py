@@ -41,6 +41,16 @@ def test_reliability_pin_and_gate(tmp_path, monkeypatch):
     bound = (getattr(ctx.sw, "exe", None), getattr(ctx.sw, "_exe", None))
     assert str(exe) in bound
 
+    home = tmp_path / "home"
+    tilde_exe = home / ".local" / "bin" / "serialwrap"
+    tilde_exe.parent.mkdir(parents=True)
+    tilde_exe.write_bytes(b"tilde-cli")
+    monkeypatch.setenv("HOME", str(home))
+    tilde_cfg = dict(cfg, serialwrap_exe="~/.local/bin/serialwrap")
+    tilde_ctx = core.build_ctx(tilde_cfg, tmp_path / "tilde-report")
+    tilde_bound = (getattr(tilde_ctx.sw, "exe", None), getattr(tilde_ctx.sw, "_exe", None))
+    assert str(tilde_exe) in tilde_bound
+
     # (2) 版本不齊（CLI 0.3.2／daemon 0.3.1）→ run_preflight ok False 且 problems 含 #154 gate
     def _dispatch(self, *args, timeout=30.0):
         if args == ("--version",):
@@ -84,6 +94,7 @@ def test_reliability_testbed_keys():
             "serialwrap_exe": "/opt/sw/bin/serialwrap",
             "bench_lock_path": "/var/lock/bench.lock",
             "human_frontend": "telnet",
+            "cross_os_probe_argv": ["other-os", "serialwrap", "session", "list"],
             "tmux_prefix": "realhw",
             "usbipd_exe": "/x/usbipd.exe",
             "win_serialwrap_exe": "",
@@ -94,3 +105,4 @@ def test_reliability_testbed_keys():
     assert cfg["serialwrap_exe"] == "/opt/sw/bin/serialwrap"
     assert cfg["bench_lock_path"] == "/var/lock/bench.lock"
     assert cfg["human_frontend"] == "telnet"
+    assert cfg["cross_os_probe_argv"] == ["other-os", "serialwrap", "session", "list"]

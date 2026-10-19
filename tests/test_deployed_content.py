@@ -13,8 +13,6 @@ from typing import Any
 
 import pytest
 
-pytestmark = [pytest.mark.core_portable]
-
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
@@ -26,6 +24,7 @@ def _sha256_file(p: pathlib.Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
+@pytest.mark.posix_only
 @pytest.mark.memory_only
 def test_deployed_content_sideload_changes_tree(tmp_path: pathlib.Path) -> None:
     """驗證在安裝目錄旁載檔案會改變 bundle/runtime tree digest，但 release-manifest 與 CLI sha256 保持不變。"""
@@ -65,6 +64,7 @@ def test_deployed_content_sideload_changes_tree(tmp_path: pathlib.Path) -> None:
     assert b["runtime_tree_sha256"] != a["runtime_tree_sha256"]
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_deployed_content_algorithm_vector(tmp_path: pathlib.Path) -> None:
     """驗證 tree_digests 演算法向量符合 sorted <posix relpath>\\0<sha256>\\n 之規範。"""
@@ -93,6 +93,7 @@ def test_deployed_content_algorithm_vector(tmp_path: pathlib.Path) -> None:
     assert runtime_tree == expected_runtime_tree
 
 
+@pytest.mark.posix_only
 @pytest.mark.memory_only
 def test_deployed_content_rehashes_preserved_mtime(tmp_path: pathlib.Path) -> None:
     """驗證 measure 每次皆重新計算內容雜湊，即使檔案 mtime/size 被竄改保留仍能正確識別差異。"""
@@ -122,6 +123,7 @@ def test_deployed_content_rehashes_preserved_mtime(tmp_path: pathlib.Path) -> No
     assert m1["bundle_tree_sha256"] != m2["bundle_tree_sha256"]
 
 
+@pytest.mark.posix_only
 @pytest.mark.memory_only
 def test_deployed_content_errors_null_digests(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """驗證當出現 error 時，除 install_dir 外所有 digest 欄位一律為 null。"""
@@ -171,6 +173,7 @@ def test_deployed_content_errors_null_digests(tmp_path: pathlib.Path, monkeypatc
     assert m_sym["runtime_tree_sha256"] is None
 
 
+@pytest.mark.posix_only
 @pytest.mark.memory_only
 def test_deployed_content_daemon_outside_install_flagged(tmp_path: pathlib.Path) -> None:
     """驗證 daemon_argv 指向安裝目錄外或 sha256 不符時正確標記 error。"""
@@ -218,6 +221,7 @@ def test_deployed_content_daemon_outside_install_flagged(tmp_path: pathlib.Path)
     assert m_none["daemon_resolved"] is None
 
 
+@pytest.mark.posix_only
 @pytest.mark.memory_only
 def test_missing_daemon_file_without_manifest_sha_is_mismatch(tmp_path: pathlib.Path) -> None:
     """驗證 manifest 沒有有效 daemon hash 時，不會讓不存在的 daemon 誤判相符。"""
@@ -242,6 +246,7 @@ def test_missing_daemon_file_without_manifest_sha_is_mismatch(tmp_path: pathlib.
     assert result["daemon_sha256"] is None
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_deployed_content_cli_keeps_live_daemon_outside_schema_object(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
@@ -280,6 +285,7 @@ def test_deployed_content_cli_keeps_live_daemon_outside_schema_object(
 
 
 @pytest.mark.process_rpc
+@pytest.mark.core_portable
 def test_deployed_content_live_daemon_image(tmp_path: pathlib.Path) -> None:
     """驗證 live_daemon 取得執行中 daemon 行程之影像路徑與 sha256，並檢查是否在安裝目錄下。"""
     import realhw.deployed_content as dc
@@ -299,6 +305,7 @@ def test_deployed_content_live_daemon_image(tmp_path: pathlib.Path) -> None:
         proc.wait(timeout=5.0)
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_deployed_content_windows_stable_bin_sidecar(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """驗證 Windows 佈局下穩定 bin 目錄中旁載檔與複本不一致會被正確檢測。"""

@@ -287,6 +287,7 @@ def _reclaim_and_ensure_ready(ctx: Any, com: str) -> CaseResult | None:
     "f10-unresolved-creds-terminal",
     "帳密解析失敗須落終態 CREDENTIALS_UNRESOLVED、不得靜默送空帳密迴圈",
     issues=("#140",),
+    requires=("posix_throwaway_daemon",),
     hints=(
         "prod device release 交出 COM1（bcm）後，sandbox by-id 只放這一條線；profile 照 prod bcm "
         "template 結構複製、只覆寫 env_file 指向不存在路徑，逼出 #140 情境。",
@@ -417,6 +418,7 @@ def f10_unresolved_creds_terminal(ctx: Any) -> CaseResult:
     "f10-creds-fixed-then-ready",
     "補上有效帳密後 bcm 登入路徑恢復、session 回 READY",
     issues=("#140",),
+    requires=("posix_throwaway_daemon",),
     hints=(
         "帳密自 prod bcm template 宣告的來源（env_file 或 os.environ fallback）唯讀取得後寫入 "
         "sandbox creds.env；帳密值只落地檔案，evidence／note 只記長度，絕不記實際值。",
