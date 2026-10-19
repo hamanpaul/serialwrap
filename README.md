@@ -148,6 +148,11 @@ New runtime directories use mode `0700`; Unix sockets default to `0600`. Set
 `SERIALWRAP_SOCKET_GROUP` explicitly to use socket mode `0660` with that group.
 `daemon restart` uses `service restart` under systemd and stops, verifies exit,
 then starts the same endpoint in on-demand mode.
+While the daemon holds a device, the tty can no longer be opened directly (BC-04:
+POSIX takes `flock` plus `TIOCEXCL` and re-scans holders before any I/O; a
+conflicting open returns `DEVICE_STILL_HELD` with `pids` and `holder_unknown`).
+Use `serialwrap session console-attach` for a human console, or
+`serialwrap device release` to hand the raw device to an external tool.
 
 For noisy consoles that omit the shell prompt, `cmd submit --completion-regex`
 can wait for a command-specific producer marker in `line` or `background` mode.
@@ -1619,6 +1624,7 @@ serialwrap doctor    # 驗證環境
 - 設定讀取順序為 `SERIALWRAP_CONFIG` → `~/.config/serialwrap/config.yaml` → 存在時的 `/etc/serialwrap/config.yaml`；系統設定檔唯讀，寫入落在 `SERIALWRAP_CONFIG` 或使用者設定檔。
 - 新建執行期目錄權限為 `0700`，Unix socket 預設為 `0600`；明確設定 `SERIALWRAP_SOCKET_GROUP` 時 socket 改為 `0660` 並設為該群組。
 - `daemon restart` 在 systemd 模式等同 `service restart`；on-demand 模式會先停止並確認舊 daemon 結束，再以相同 endpoint 啟動。
+- daemon 持有裝置時不可再直接開 tty，請走 `serialwrap session console-attach` 或 `device release`（BC-04：POSIX 以 `flock`＋`TIOCEXCL` 獨占並於任何 I/O 前重掃 holder；衝突開啟回 `DEVICE_STILL_HELD`，附 `pids` 與 `holder_unknown`）。
 
 ```bash
 # 啟動 daemon 後快速驗證

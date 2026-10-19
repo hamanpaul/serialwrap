@@ -41,6 +41,7 @@ policy_version: 1.0.18
   - `core_portable` 的正確性不由稽核單獨保證：`core_portable` 集合須以原生 Windows 實跑（`py -3.12 -m pytest -m core_portable`）確認；稽核只能判定標註是否自洽，無法判定測試是否真的可攜。
   - `windows_com` 只能標在真正以原生 Windows serial backend 開啟 COM 裝置的測試（socket 或記憶體 stream 不算）；`physical_uart` 需實體 USB-UART 與 DUT。本環境不得宣稱任何 `windows_com`／`physical_uart` 證據，P0 稽核斷言兩者使用數為 0。
   - 新增測試檔須依上述規則帶 `pytestmark`、class 或函式 marker；同檔混合平台時平台 marker 放在 class／函式層，不放模組層。
+- **Windows 原生 pytest runner（Rust 重構 P1 T01，`scripts/stage0/win-pytest.sh`）**：在 WSL 端執行 `scripts/stage0/win-pytest.sh -m windows_native tests/`（其餘參數原樣傳給 pytest）；它把版本庫已追蹤與未忽略的檔案複製到 Windows 本機 `%LOCALAPPDATA%\Temp\sw-stage0\<run>`，以 `py -3.12` 執行 pytest，模組層 `pytestmark` 為 `posix_only` 的檔案先以 AST 判定並 `--ignore`，結束印 `summary.json` 路徑（`collected`／`passed`／`failed`／`skipped`／`rc`／`pytest_exit`／`finished`／`duplicates`）。環境變數：`SW_WIN_TIMEOUT`（秒，預設 900）、`SW_WIN_KEEP=1`（保留 staging）。exit code：`0` 通過；`3` Windows Python 缺 `pytest`／`PyYAML`／`pyserial`／`jsonschema`（安裝需擁有者同意，結果記「證據不足」）；`4` 無法以 AST 解析某測試檔的 `pytestmark`，或 junit 未完成；`5` 以 `-m windows_native`／`windows_com` 執行時有 item 被 skip（被 skip 的原生測試不得計為 PASS）；`124` 逾時（已終止 Windows 行程樹）；`125` runner 本身失敗（取不到 `LOCALAPPDATA`、無法確認 Windows 行程已終止等）。pytest 原生 exit status（1 失敗、2 中斷等）原樣傳回；`summary.json` 的 `passed` 非空不等於 Stage 0 L1 出口 PASS。
 
 ## 回歸 case 政策（#155）
 
@@ -203,6 +204,8 @@ serialwrap 是讓多個 agent 與多個 human console 共用**同一條 UART** �
 - 權威記錄為 `raw.wal.ndjson`、人類可讀鏡像為 `raw.mirror.log`，預設落在 XDG state home（`~/.local/state/serialwrap/wal/`，可由 `SERIALWRAP_WAL_DIR` 覆寫；舊版為 `/tmp/serialwrap/wal/`）。
 - 每筆 WAL 都有 `seq`、`mono_ts_ns`、`wall_ts`、`source`、`cmd_id`、`crc32`、`payload_b64`。
 - `background` 命令不是直接把所有輸出塞回 `command.get`；需要透過 `command.result_tail` 逐段讀取 capture。
+- **常駐 handle（BC-01，Rust 重構 P1 T02～T05）**：`WalWriter` 對 WAL 與 mirror 各持一個 binary unbuffered 常駐 handle，每筆 append 寫完即 flush；每個 handle 只關閉一次（先解除所有權再 close，任何例外路徑都不重複關閉），daemon 停止時由 `close()` 收尾。輪替順序固定為「`_close_handle_locked(sync=True)` 關閉並 fsync 舊 handle → `rename_noreplace_or_suffix` 改名為 `<path>.<UTC ts>`（目標已存在時依序加數字後綴、不覆蓋，DF-03）→ `sync_dir` → 下一筆 append 才重開新檔」；不可在 handle 仍開啟時改名或刪檔。輪替失敗為 best-effort（告警後續用既有檔案，不殺 RX reader）。
+- **Windows 行尾差異（BC-01 附帶位元組差異）**：舊版 Windows 以文字模式寫入，WAL 行尾與 mirror 換行實際為 `\r\n`；新格式一律只寫 `\n`（POSIX 與現況逐位元組相同）。所有讀取端（`_iter_matching`／`tail_*`、F12／`p0-wal-live` oracle、Rust reader）必須在 `json.loads` 前 `rstrip("\r\n")`，同時接受舊檔的 `\r\n`。
 
 ### Agent 日誌 capture
 
@@ -230,6 +233,8 @@ serialwrap 是讓多個 agent 與多個 human console 共用**同一條 UART** �
 - `state.json` 與 WAL 相關輸出會加上 `sort_keys=True`，避免不必要的 diff 與測試波動。
 
 ### human console 預設走 raw interactive 模式
+
+> **BC-04（Rust 重構 P1 T10）**：daemon 持有 UART 時**不可再直接開該 tty／COM**（含 `minicom -D /dev/ttyUSBx`、外部腳本 `open()`）。POSIX 以 `flock`＋`TIOCEXCL` 獨占並於任何 I/O 前重掃 holder；Windows 第二次開啟回 `ERROR_ACCESS_DENIED`。衝突一律回 `DEVICE_STILL_HELD{pids, holder_unknown}`，`holder_unknown: true` 不可視為可收回。人類 console 走 `serialwrap session console-attach`／`serialwrap-minicom`，外部工具獨佔走 `device release`／`device attach`。
 
 `console-attach` 在 `ATTACHED` 或 `READY` 狀態下，會自動授予第一個 human console **raw interactive ownership**：所有 console bytes 透過 `UARTBridge.send_bytes()` 即時透傳到 UART（方向鍵/Tab 等特殊按鍵可用）；第二個以後的 console 仍走 line-buffer 路徑。
 

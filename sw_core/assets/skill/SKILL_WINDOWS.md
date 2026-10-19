@@ -183,6 +183,12 @@ serialwrap device release --selector COM0 --source agent:flash --reason "flash M
 serialwrap device attach --selector COM0
 ```
 
+### COM 獨占與設定（BC-04、SC-08、SC-09）
+
+- **COM 獨占（BC-04）**：daemon 持有某 COM 時，其他程式（TeraTerm 直連 `COMx`、燒錄工具）**不可再直接開該 COM**——Windows 回 `ERROR_ACCESS_DENIED`，serialwrap 對應為 `DEVICE_STILL_HELD`（`pids: []`、`holder_unknown: true`，原因不明時不可視為可收回）。人類 console 走第 5～8 節的 serialwrap console 端口；外部工具獨佔先 `device release`，用完再 `device attach`。
+- **設定探索順序（SC-09）**：`SERIALWRAP_CONFIG` → `%USERPROFILE%\.config\serialwrap\config.yaml` → 存在時的 `%ProgramData%\serialwrap\config.yaml`（系統檔唯讀）；寫入落在 `SERIALWRAP_CONFIG`（有設定時）或使用者設定檔。
+- **socket 權限（SC-08）**：Unix socket 預設 `0600`、新建目錄 `0700` 只適用 POSIX；Windows 走 loopback TCP（`tcp://127.0.0.1:48700`），不套用此權限模型。
+
 ## 12. 疑難排解
 
 - 任何指令連不上 → `serialwrap doctor` 看 `daemon_endpoint`；未在跑則

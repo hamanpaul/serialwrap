@@ -60,6 +60,11 @@ description: 透過 serialwrap broker + CLI 進行多 agent UART 存取，提供
 4. 期間 `serialwrap session self-test --selector COM0` 在 `RELEASED` 會回 `external_holder` / `reclaimable` / `recommended_action`（`wait_external_flash` 或 `device_attach`）；屬唯讀偵測，不開 tty、不干擾燒錄。
 5. 被遺忘的 release 可由 self-test 的 `reclaimable=true` 辨識（裝置不會永久卡住，但需明確 `device attach` 收回）。
 
+## UART 獨占、socket 權限與設定探索（BC-04、SC-08、SC-09）
+- **BC-04**：daemon 持有裝置時**不可再直接開 tty**（勿 `minicom -D /dev/ttyUSBx`、勿在外部腳本 `open()` 同一 tty）。POSIX 以 `flock`＋`TIOCEXCL` 獨占，並在任何 I/O 前重掃 holder；衝突時 `session attach`／`device attach` 回 `DEVICE_STILL_HELD`（附 `pids` 與 `holder_unknown`；`holder_unknown: true` 代表查不到 PID 不等於無 holder，不可視為可收回）。人類 console 走 `serialwrap session console-attach`（或 `serialwrap-minicom`），外部工具獨佔走上方 `device release`／`device attach`。
+- **SC-08**：新建執行期目錄為 `0700`，Unix socket 預設 `0600`（只有 daemon 擁有者可連）。需讓群組成員連入時，須明確設定 `SERIALWRAP_SOCKET_GROUP`，socket 才改為 `0660` 並 chgrp；未設定時其他使用者連不上屬預期行為，不是 daemon 故障。
+- **SC-09**：設定讀取順序為 `SERIALWRAP_CONFIG` → `~/.config/serialwrap/config.yaml` → 存在時的 `/etc/serialwrap/config.yaml`（系統檔唯讀）；寫入落在 `SERIALWRAP_CONFIG`（有設定時）或使用者設定檔。排查 socket 路徑或監管模式不符時，先確認實際生效的是哪一份設定。
+
 ## MCU 韌體燒錄端點 `/dev/ttyMCU`（#55）
 serialwrap 另提供原生 MCU flash 端點（與上面 device handoff 互補）：daemon 持續維持 real tty 唯一 reader 的同時，提供 byte-transparent 的 `/dev/ttyMCU`（位於 daemon RUN_DIR 下）給外部 flasher 直接燒錄。
 - 查詢可燒的 MCU 家族 pattern（family／probe／expect／baud）：`serialwrap mcu patterns`。
