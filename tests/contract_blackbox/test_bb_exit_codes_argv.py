@@ -22,7 +22,9 @@ from bb_harness import run_cli
 pytestmark = [pytest.mark.process_rpc]
 
 # 非 UTF-8 位元組 0xFF 的 surrogateescape 字串（子行程 argv 會原樣還原為該位元組）。
-BAD = os.fsdecode(b"\xff")
+# 不用 os.fsdecode：Windows 的檔案系統編碼為 strict UTF-8，模組層 fsdecode 會在收集期拋
+# UnicodeDecodeError，連 core_portable 案例都無法收集；POSIX（UTF-8 fs 編碼＋surrogateescape）結果相同。
+BAD = b"\xff".decode("utf-8", "surrogateescape")
 BAD_ESC_STDERR = b"argument is not valid UTF-8"
 
 
@@ -98,7 +100,7 @@ _ZERO_TX_ARGV = [
     pytest.param(["session", "clear", "--selector=" + BAD], id="equals-form"),
     pytest.param(["session", "clear", "--sel", BAD], id="abbreviated-space-form"),
     pytest.param(["session", "clear", "--sel=" + BAD], id="abbreviated-equals-form"),
-    pytest.param(["cmd", "submit", "--selector", "A", "--cmd=echo " + os.fsdecode(b"\xe9")], id="cmd-equals"),
+    pytest.param(["cmd", "submit", "--selector", "A", "--cmd=echo " + b"\xe9".decode("utf-8", "surrogateescape")], id="cmd-equals"),
     pytest.param(
         ["session", "interactive-send", "--interactive-id", "i", "--data=" + BAD],
         id="interactive-send-equals",
