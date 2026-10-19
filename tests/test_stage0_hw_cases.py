@@ -9,7 +9,9 @@
 5. 三份 runbook 與三支腳本固定首段欄位；
 6. Spike 3 四個 case_id 與 P2 一致；
 7. Spike 3 證據 JSON schema 拒絕缺 edr；
-8. 非隔離實例忽略 SERIALWRAP_TEST_KILL_AFTER_SAVE 並示警。
+8. 非隔離實例忽略 SERIALWRAP_TEST_KILL_AFTER_SAVE 並示警；
+9. 子行程（見 tests/test_stage0_kill_hook_subprocess.py）：隔離實例建構子不觸發鉤子、release 持久化後以 137 終止，
+   情境 (b) commit 前暫停點 arrived 後 kill -9 不留 RELEASED。
 """
 from __future__ import annotations
 
@@ -288,3 +290,4 @@ def test_kill_hook_ignored_on_non_isolated_instance(tmp_path, monkeypatch, caplo
         and ("SERIALWRAP_TEST_KILL_AFTER_SAVE" in record.message or "kill" in record.message.lower())
         for record in caplog.records
     ), "Expected WARNING logged when SERIALWRAP_TEST_KILL_AFTER_SAVE set on non-isolated instance"
+

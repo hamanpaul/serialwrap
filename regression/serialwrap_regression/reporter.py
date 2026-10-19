@@ -36,6 +36,10 @@ class RegressionReporter:
         meta["issues_map"] = {
             case_id: list(registry[case_id].issues) for case_id, _ in results if case_id in registry
         }
+        # 待補 issue 的 case（Stage 0 pending_issue）：報表需可辨識，避免與「已掛 issue」混淆。
+        meta["pending_issue_cases"] = sorted(
+            case_id for case_id, _ in results if case_id in registry and registry[case_id].pending_issue
+        )
 
         ctx = getattr(self._plugin, "ctx", None)
         report_dir = (

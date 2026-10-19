@@ -24,6 +24,9 @@ class Case:
     destructive: bool = False
     requires: tuple[str, ...] = ()
     hints: tuple[str, ...] = ()
+    # Stage 0 待補 issue：擁有者尚未為該行為開立 issue 時，issues 保持空 tuple、此旗標為真；
+    # 不得以假號補位。與 issues 互斥。正式 case 維持預設 False，空 issues 仍拒絕（#155）。
+    pending_issue: bool = False
 
 
 REGISTRY: list[Case] = []
@@ -32,7 +35,9 @@ REGISTRY: list[Case] = []
 def register(case: Case) -> Case:
     if case.family not in FAMILY_ORDER:
         raise ValueError(f"未知 family：{case.family}（case={case.id}）")
-    if not case.issues:
+    if case.pending_issue and case.issues:
+        raise ValueError(f"pending_issue 與 issues 互斥：{case.id}")
+    if not case.issues and not case.pending_issue:
         raise ValueError(f"case 必須掛至少一個已修 issue：{case.id}")
     if any(c.id == case.id for c in REGISTRY):
         raise ValueError(f"duplicate case id: {case.id}")

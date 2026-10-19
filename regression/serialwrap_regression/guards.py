@@ -206,6 +206,52 @@ class ThrowawayDaemon:
         data["_stderr"] = (cp.stderr or "").strip()
         return data
 
+    def run_timed(self, *args: str, timeout: float = 30.0) -> tuple[dict, float | None]:
+        """同 ``run``，但回傳 stdout 第一個位元組抵達的 monotonic 時間（回應送達時刻的近似，不含 CLI 行程結束）。
+
+        回條語意判定（BC-04 release drain receipt）不得以 ``subprocess.run`` 返回時間量測：
+        那已含 CLI 行程退出與 pipe 收尾，會把「回應早於 handle 關閉」的回歸掩蓋成 PASS。
+        """
+        import json
+        import os
+        import threading
+        import time
+
+        proc = subprocess.Popen(
+            [self._exe, *args], env=self._env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        first: list[float] = []
+        chunks: list[bytes] = []
+
+        def _reader() -> None:
+            fd = proc.stdout.fileno()
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    return
+                if not first:
+                    first.append(time.monotonic())
+                chunks.append(chunk)
+
+        reader = threading.Thread(target=_reader, daemon=True)
+        reader.start()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            raise
+        reader.join(10)
+        err = proc.stderr.read() if proc.stderr is not None else b""
+        out = b"".join(chunks).decode("utf-8", errors="replace").strip()
+        try:
+            data = json.loads(out) if out else {}
+        except json.JSONDecodeError:
+            data = {"_raw": out}
+        data["_rc"] = proc.returncode
+        data["_stderr"] = err.decode("utf-8", errors="replace").strip()
+        return data, (first[0] if first else None)
+
     def wal_text(self) -> str:
         """讀 sandbox WAL 全文（evidence／TX 行為斷言用）。"""
         parts = []

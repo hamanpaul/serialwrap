@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serialwrap.local/schemas/stage0/spike3_evidence.schema.json",
+  "title": "Stage 0 Spike 3 Windows WAL／EDR 證據",
+  "description": "docs/rust-refactor/plans/02-stage0-python-bc.md T21：scripts/stage0/spike3_win_wal.py 每次執行輸出一份證據 JSON。edr 缺欄即不合格（EDR 攔截查詢結果必須記錄，查不到寫 unknown）。",
+  "type": "object",
+  "required": ["case_id", "run_at", "env", "artifact", "steps", "observations", "edr", "verdict", "fallback"],
+  "additionalProperties": false,
+  "properties": {
+    "case_id": {
+      "type": "string",
+      "enum": ["win-wal-av-rotate", "win-wal-av-unlink", "win-wal-av-reader-handle", "win-wal-f12-progress"]
+    },
+    "run_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "env": {
+      "type": "object",
+      "description": "同 T19 env（§1.1.1）；查不到的值一律為 unknown，不得填 0 或空字串。",
+      "required": ["os"],
+      "properties": {
+        "os": {"type": "string"},
+        "os_build": {"type": "string"},
+        "python": {"type": "string"},
+        "platform": {"type": "string"},
+        "virtualization": {"type": "string", "enum": ["wsl2", "native", "vm", "unknown"]},
+        "cpu": {"type": "string"},
+        "cpu_count": {"anyOf": [{"type": "integer", "minimum": 1}, {"const": "unknown"}]},
+        "memory_bytes": {"anyOf": [{"type": "integer", "minimum": 1}, {"const": "unknown"}]},
+        "storage_device": {"type": "string"},
+        "fs_type": {"type": "string"},
+        "power": {"type": "string"},
+        "endpoint_av": {"type": "string"}
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "required": ["binary"],
+      "properties": {
+        "binary": {"type": "string"},
+        "revision": {"type": "string"},
+        "tree_sha256": {"type": "string"}
+      }
+    },
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["op", "ts", "result"],
+        "additionalProperties": false,
+        "properties": {
+          "op": {"type": "string"},
+          "ts": {"type": "string", "format": "date-time"},
+          "result": {"type": "string"}
+        }
+      }
+    },
+    "observations": {
+      "type": "object"
+    },
+    "edr": {
+      "type": "object",
+      "description": "EDR 產品與狀態（OD-05 代表機台為第三方企業 EDR）；攔截查詢結果需 EDR 主控台權限，查不到寫 unknown。",
+      "required": ["product", "status", "interceptions"],
+      "additionalProperties": false,
+      "properties": {
+        "product": {"type": "string"},
+        "status": {"type": "string"},
+        "interceptions": {
+          "anyOf": [
+            {"type": "integer", "minimum": 0},
+            {"const": "unknown"}
+          ]
+        }
+      }
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["PASS", "FAIL", "INSUFFICIENT_EVIDENCE"]
+    },
+    "fallback": {
+      "type": "string",
+      "description": "失敗或證據不足時的退路（不得關閉防護後宣稱符合）；無退路寫 none。"
+    }
+  }
+}

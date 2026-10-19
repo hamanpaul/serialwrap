@@ -84,6 +84,15 @@ def _isolation_reason(env: Mapping[str, str], defaults: Mapping[str, str]) -> st
     return None
 
 
+def isolation_reason(env: Mapping[str, str], defaults: Mapping[str, str]) -> str | None:
+    """公開的隔離實例判定：全部符合回 None，否則回傳不符原因。
+
+    供 ``sw_core.session_manager`` 的 Stage 0 測試鉤子（``SERIALWRAP_TEST_KILL_AFTER_SAVE``）共用同一判定，
+    避免兩處各自實作隔離條件而漂移。
+    """
+    return _isolation_reason(env, defaults)
+
+
 def resolve_test_allowlist(
     env: Mapping[str, str],
     config_data: Mapping[str, Any] | None,

@@ -130,3 +130,37 @@ def test_load_testbed_defaults(tmp_path):
     real = tmp_path / "testbed.yaml"
     real.write_text("allow_destructive: true\nboards: []\n", encoding="utf-8")
     assert core.load_testbed(example)["allow_destructive"] is True
+
+
+def test_pending_issue_accepts_empty_issues():
+    """Stage 0 待補 issue：pending_issue=True 且 issues 為空可註冊（不得以假號補位）。"""
+    case = harness.register(_mk("p-pending", issues=(), pending_issue=True))
+    assert case.pending_issue is True
+    assert case.issues == ()
+
+
+def test_pending_issue_and_issues_are_mutually_exclusive():
+    with pytest.raises(ValueError, match="互斥"):
+        harness.register(_mk("p-both", issues=("#94",), pending_issue=True))
+
+
+def test_empty_issues_still_rejected_without_pending_flag():
+    """正式 case 維持 #155 規則：空 issues 且未標 pending_issue 一律拒絕。"""
+    with pytest.raises(ValueError, match="issue"):
+        harness.register(_mk("p-none", issues=(), pending_issue=False))
+
+
+def test_case_dict_emits_pending_issue_key():
+    harness.register(_mk("p-dict", issues=(), pending_issue=True))
+    dicts = core.build_case_dicts(list(harness.REGISTRY), CFG)
+    meta = dicts[0]["metadata"]
+    assert meta["pending_issue"] is True
+    assert meta["issues"] == []
+
+
+def test_case_dict_pending_issue_false_for_issue_bound_case():
+    harness.register(_mk("p-bound", issues=("#94",)))
+    dicts = core.build_case_dicts(list(harness.REGISTRY), CFG)
+    meta = dicts[0]["metadata"]
+    assert meta["pending_issue"] is False
+    assert meta["issues"] == ["#94"]

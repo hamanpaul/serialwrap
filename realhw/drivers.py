@@ -184,6 +184,18 @@ class TmuxCtl:
     def capture(self, session: str) -> str:
         return _run(["tmux", "capture-pane", "-p", "-t", session]).stdout
 
+    def capture_history(self, session: str) -> tuple[str, bool]:
+        """含 scrollback 的整段擷取；回傳 (文字, 是否可能被截斷)。
+
+        ``history_size`` 達到 ``history_limit`` 時舊行已被捲出 scrollback，擷取不完整，呼叫端不得據此判 PASS。
+        """
+        text = _run(["tmux", "capture-pane", "-p", "-S", "-", "-t", session]).stdout
+        info = _run(["tmux", "display-message", "-p", "-t", session,
+                     "#{history_size} #{history_limit}"]).stdout.split()
+        truncated = (len(info) != 2 or not info[0].isdigit() or not info[1].isdigit()
+                     or int(info[1]) <= 0 or int(info[0]) >= int(info[1]))
+        return text, truncated
+
     def kill(self, session: str) -> None:
         _run(["tmux", "kill-session", "-t", session])
 

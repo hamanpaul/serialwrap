@@ -64,6 +64,7 @@ def case_to_dict(case: harness.Case, cfg: dict[str, Any]) -> dict[str, Any]:
         "metadata": {
             "family": case.family,
             "issues": list(case.issues),
+            "pending_issue": bool(case.pending_issue),
             "destructive": bool(case.destructive),
             "requires": list(case.requires),
             "hints": list(case.hints),

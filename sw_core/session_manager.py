@@ -1237,7 +1237,7 @@ class SessionManager:
                                       for k, v in detected.items()
                                       if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip()}
 
-    def _save_state(self) -> None:
+    def _save_state(self, *, release_kill_point: bool = False) -> None:
         state_dir = os.path.dirname(self._state_path) or "."
         os.makedirs(state_dir, exist_ok=True)
         # snapshot 一律在 lock 內建（迭代 _sessions、複製 _binding_overrides/_profile_pins/
@@ -1298,7 +1298,7 @@ class SessionManager:
                         os.remove(tmp_path)
                 except OSError:
                     pass
-
+        _test_kill_after_save_hook(release_kill_point)
     def _next_dynamic_com(self) -> str:
         """分配下一個可用的 COM 編號（須在 self._lock 內呼叫）。
 
@@ -2748,7 +2748,7 @@ class SessionManager:
                 event.wait()
                 continue
             try:
-                self._save_state()
+                self._save_state(release_kill_point=_test_release_persist_point())
             except Exception:
                 with self._lock:
                     session = self._sessions.get(session_id)
@@ -7745,3 +7745,59 @@ class SessionManager:
                     bridge.resume_interactive()
             finally:
                 self._finish_foreground_operation(session, operation)
+
+
+def _test_kill_after_save_hook(release_kill_point: bool) -> None:
+    """Stage 0 實機測試鉤子（T21）：``SessionManager._save_state`` 落盤成功後、回應送達前，模擬程序被殺。
+
+    只有 release 持久化（``release_kill_point=True``，即 ``_persist_release_state``）才可能終止行程；
+    建構子與其他 ``_save_state`` 呼叫不終止，否則 daemon 在收到任何 RPC 前就會死。
+    僅隔離實例生效（SC-19 判定：STATE／RUN／CONFIG 三目錄皆明確設定且非預設值）；
+    非隔離實例設定 ``SERIALWRAP_TEST_KILL_AFTER_SAVE=1`` 時只寫 WARNING、不終止行程。
+    置於模組尾端並延遲 import，使既有 logger 呼叫的行號（``contracts/daemon_logging.yaml``）不位移。
+    """
+    if (os.environ.get("SERIALWRAP_TEST_KILL_AFTER_SAVE") or "").strip() != "1":
+        return
+    from .constants import default_isolation_paths
+    from .test_allowlist import isolation_reason
+
+    reason = isolation_reason(os.environ, default_isolation_paths())
+    if reason is not None:
+        logging.getLogger("serialwrap").warning(
+            "SERIALWRAP_TEST_KILL_AFTER_SAVE=1 已忽略：%s（非隔離實例不得終止行程）", reason)
+        return
+    if not release_kill_point:
+        return
+    logging.getLogger("serialwrap").warning(
+        "SERIALWRAP_TEST_KILL_AFTER_SAVE=1：state 已落盤，於回應前以 os._exit(137) 模擬程序被殺（隔離實例）")
+    os._exit(137)
+
+
+def _test_release_persist_point() -> bool:
+    """Stage 0 實機測試鉤子（T21）：release 持久化的 commit 前暫停點；回傳 True 表示本次為 release 持久化。
+
+    呼叫端 ``_persist_release_state`` 以 ``self._save_state(release_kill_point=_test_release_persist_point())`` 取得旗標，
+    使暫停點位於 state.json 落盤前、且不增加 session_manager 既有行號（keep-baseline 以行號釘住部分 logger 來源）。
+    僅隔離實例生效：環境變數 ``SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE`` 指向目錄時，行程寫入 ``arrived`` 標記後，
+    每 50 ms 輪詢 ``go`` 標記（上限 600 s）才繼續；操作者看到 ``arrived`` 後記錄 state.json 快照並 kill -9，
+    可確定 kill 發生在 commit 之前。非隔離實例只寫 WARNING、不暫停。
+    """
+    raw = (os.environ.get("SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE") or "").strip()
+    if not raw:
+        return True
+    from .constants import default_isolation_paths
+    from .test_allowlist import isolation_reason
+
+    reason = isolation_reason(os.environ, default_isolation_paths())
+    if reason is not None:
+        logging.getLogger("serialwrap").warning(
+            "SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE 已忽略：%s（非隔離實例不得暫停）", reason)
+        return True
+    os.makedirs(raw, exist_ok=True)
+    with open(os.path.join(raw, "arrived"), "w", encoding="utf-8") as fp:
+        fp.write(f"pid={os.getpid()}\n")
+    go_path = os.path.join(raw, "go")
+    deadline = time.monotonic() + 600.0
+    while not os.path.exists(go_path) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return True

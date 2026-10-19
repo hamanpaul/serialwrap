@@ -61,16 +61,41 @@ doctor 全綠、testbed 板卡 READY、tmux/minicom 存在、無殘留 throwaway
 | F2 背壓 | #81 #128 #156 #158 | `SESSION_QUEUE_FULL` backpressure、history/capture 淘汰、recovery flush 佇列、RX 視窗飽和跨界 prompt 不失效 | 否 |
 | F3 失敗可觀測性 | #94 #16 #124 | 失敗必有非空 `error_code`＋stderr、log tail 預設取最新、錯誤指名 selector | 否 |
 | F4 狀態語義 | #34 #26 #28 | activity 分類可區分、background result-tail 不漏不重、interactive 中 line cmd 行為明確 | 否 |
-| F5 console 共存 | #78 #7 #8 #42 #11 #53 | raw ownership 多輪 suspend/resume 不丟、deferred 不丟鍵、對端消失回收、不掛 stale pts | 否 |
+| F5 console 共存 | #78 #7 #8 #42 #11 #53；Stage 0 待補（`f5-deferred-dropped-after-reboot`，見下節） | raw ownership 多輪 suspend/resume 不丟、deferred 不丟鍵、對端消失回收、不掛 stale pts；reboot（上下文失效）後舊按鍵不回放（BC-02） | **部分（reboot case）** |
 | F6 RPC 不凍結 | #80 #52 | 長操作中 `daemon status` 往返不凍結、雙板互不餓死 | 否 |
 | F7 檔案傳輸 | #21 #32 #161 #166 | binary round-trip md5 一致、不靜默截斷；可用 base64 或 OpenSSL 搭配 md5sum，不因只缺 base64 就 SKIP；明確 `CHECKSUM_MISMATCH` 一律為 `FAIL/test/binary_roundtrip_mismatch`，不受工具探測值影響；`PULL_PARSE_FAILED`、`MOVE_FAILED`、逾時等未完成傳輸維持環境 `SKIP`；push 預設走 #161 echo-ACK 節流（echo 停滯獨立 reason_code `transfer_echo_stall`） | 否 |
 | F8 daemon 單一性 | #101 #53 | `multi_open`／`foreign_holders` 正確回報第二 daemon 與 tty 持有者 | 否 |
 | F9 開機/U-Boot／BRCM 登入 | #69 #130 #139 #44 #14 #20 #224 | autoboot 窗不被 probe 打斷、quiet window 不擋 human／真 READY 後的 agent 命令、自發重開機過渡態 agent 命令被 `AUTOBOOT_QUIET` 攔下（#139）、開機中 attach 自動 reprobe、U-Boot 停留不踢 console；BRCM 重開後帶前導空白的 BDK prompt 能自動登入、切 `sh` 並回 READY | **是（reboot）** |
 | F10 登入帳密 | #140 #19 | 帳密解析空→`CREDENTIALS_UNRESOLVED` 終態不送空帳密、補帳密後恢復 | **是（throwaway＋release）** |
+| F10 裝置交接（`f10_device_handoff.py`） | Stage 0 待補（`f10-release-drain-receipt`、`f10-release-aborts-inflight-command`，見下節） | release 的 ok 回條只在 handle 關閉後送出（BC-04／SC-04）；在途命令於 release 後 `COMMAND_ABORTED_IN_FLIGHT` 且 TX 不重送（BC-03） | **是（throwaway＋release）** |
 | F11 RX 洪水/傳輸層 | #153 #150 | 洪水下 probe 失敗分類為 `RX_FLOOD`（等排空、排空後自癒回 READY）、`rx_bytes_last_10s`／`last_rx_age_s`／`last_tx_age_s`／`last_error_detail` 觀測面存在且合理（真 usbip stall 需人工操作、排除自動化，heuristic 由 pytest 覆蓋） | **部分（flood case 佔用 COM0 數十秒）** |
 | F12 診斷保真 | #154 #148 | `daemon status` 直接帶 `version` 欄位（不靠 `/proc cmdline + importlib.metadata` 繞路）、且與 pinned CLI `--version` 一致——版本欄位悄悄消失時 preflight 的 fallback 會靜默接手掩蓋，僅此 case 斷言快路徑本身；`daemon status` 的 `wal_path` 真實存在且送一筆命令後讀回含 marker 之新增 WAL 紀錄並驗證 CRC 判定活性（非死路徑）、`doctor` 報告含 `wal_dir` 檢查項（#148） | 否 |
 
 執行順序＝F3→F1→F5→F6→F2→F4→F7→F8→F12→F9→F10→F11（破壞性壓軸；F11 flood 殿後避免殘 log 污染他 family 基線）。
+
+### Stage 0 待補 issue 的 case（`pending_issue`）
+
+Stage 0 行為變更（BC-02、BC-03、BC-04／SC-04）的實機 case 已撰寫，但擁有者尚未為它們開立 issue。依 Stage 0 計畫（T21）規定：
+
+- `Case(pending_issue=True)` 且 `issues=()`，待擁有者開立 issue 號後改填 `issues=("#NNN",)` 並把 `pending_issue` 移除。**不得**填假號，**不得**自行開 issue。
+- `pending_issue` 與 `issues` 互斥；`register()` 只對 `pending_issue=True` 的 case 接受空 `issues`，其餘 case 仍拒絕空 `issues`（#155）。
+- case 中繼資料輸出 `pending_issue` 欄位，報表可辨識待補項目。
+
+| case id | family | 行為 | 實跑入口 | 狀態 |
+|---|---|---|---|---|
+| `f10-release-drain-receipt` | F10 | `device release` 的 ok 回條只在 handle 關閉後送出（外部 `open(tty)` 成功時間 ≤ 回應時間，否則 FAIL `release_receipt_before_handle_close`） | TestPilot（`allow_destructive: true`）；非 root 執行 | BLOCKED-OWNER（Stage 0 bench） |
+| `f10-release-aborts-inflight-command` | F10 | 長命令在途時 release，`COMMAND_ABORTED_IN_FLIGHT`；同 cmd_id 的 TX 重複出現 → FAIL `resend_detected` | 同上 | BLOCKED-OWNER |
+| `f5-deferred-dropped-after-reboot` | F5 | agent 命令在途時鍵入的舊按鍵，於 reboot（上下文失效）後不回放；對照組（未 reboot）須回放，否則 SKIP `insufficient_evidence` | tmux＋minicom（`requires: tmux`），`destructive=True` | BLOCKED-OWNER |
+
+執行順序以 case id 排序（`harness.ordered()`）：`f10-release-*` 落在既有 `f10-creds-*` 之後、`f10-unresolved-*` 之前，屬 F10 family 內的 id 排序結果；破壞性 F10 case 彼此皆以 throwaway＋`device release`／`attach` 收尾。
+
+Stage 0 實機程序與腳本（非 TestPilot case，手動執行，各檔首段含 `entry`、`revision`、`expected`、`owner`、`evidence_dir`、`rollback`）：
+
+- `realhw/procedures/stage0-release-kill.md`：release 持久化前後 kill（`SERIALWRAP_TEST_KILL_AFTER_SAVE=1` 僅於 release 落盤後、隔離實例生效；`SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE=<目錄>` 提供 commit 前的 `arrived` 暫停點）。
+- `realhw/procedures/stage0-windows-remote-topologies.md`：Windows remote 三拓樸（BC-05、OD-12 信任範圍）。
+- `realhw/procedures/stage0-spike1-win-vcom.md`：Spike 1 Windows 虛擬 COM 資格（需管理員，OD-01／OD-08 退路）。
+- `scripts/stage0/spike3_win_wal.py --list`：Spike 3 四個 case（`win-wal-av-rotate`、`win-wal-av-unlink`、`win-wal-av-reader-handle`、`win-wal-f12-progress`）；於 Windows host 以 `py -3.12` 執行，證據 JSON 依 `scripts/stage0/spike3_evidence.schema.json` 驗證（EDR 欄位必填）。非 Windows host 執行只產出 `INSUFFICIENT_EVIDENCE`，不得作為證據。
+- `scripts/stage0/drain_timing.py`：Linux 與 Windows 實體 USB-UART 依序量測 release 耗時分佈與 3,000 ms 逾時次數。
 
 ## U-Boot 唯讀護欄（F9 硬約束）
 
