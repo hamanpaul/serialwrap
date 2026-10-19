@@ -104,7 +104,11 @@ def test_deferred_still_blocked(tmp_path):
         platform="linux",
         started_at=fakes_od09.ts(21, 0),
     )
-    result = _gate().evaluate(run.inputs(mode="candidate", acceptance_path=env.acceptance))
+    result = _gate().evaluate(run.inputs(
+        mode="candidate",
+        acceptance_path=env.acceptance,
+        baseline=env.baseline_gates["linux"],
+    ))
     checks = {item["id"]: item["result"] for item in result["checks"]}
     for check_id in ("resources", "min_effective_load", "comparison_uncertainty"):
         assert checks[check_id] == "BLOCKED"

@@ -53,6 +53,7 @@ _DEPENDENTS = {
     "liveness": ("liveness_daemon_exit", "liveness_restart"),
 }
 _BASELINE_GROUPS = ("evidence", "integrity", "safety", "liveness")
+_DEFERRED_KEYS = ("resources", "min_effective_load", "comparison_uncertainty")
 _BASELINE_IDS = ("error_rate_absolute", "engine_verdict")
 
 
@@ -650,6 +651,9 @@ def evaluate(inputs: GateInputs) -> dict[str, Any]:
     pre_frozen_missing = started_dt is None
     for name, item in _frozen_items(acceptance):
         if item.get("status") != "frozen":
+            continue
+        # 基線模式不評估延後項（NOT_APPLICABLE_BASELINE）；其凍結時點不得使基線 baseline_result 失效（§15.11.4）
+        if not is_candidate and name in _DEFERRED_KEYS:
             continue
         frozen_at = _parse_wall(item.get("frozen_at"))
         if frozen_at is None or started_dt is None or frozen_at >= started_dt:

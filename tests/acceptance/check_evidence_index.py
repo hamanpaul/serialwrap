@@ -226,6 +226,36 @@ def _safe_relpath(rel: str) -> bool:
     return not p.is_absolute() and ".." not in p.parts and not rel.startswith("~")
 
 
+def _present_problems(item: dict[str, Any], root: pathlib.Path) -> list[str]:
+    """status 為 present 的單檔項目之完整性（路徑安全、檔案存在、sha256 相符）；空清單即通過。"""
+    iid = item.get("id", "<no-id>")
+    rel = item.get("artifact_path")
+    if not rel or not _safe_relpath(rel):
+        return [f"bad_artifact_path {iid}: {rel!r}"]
+    target = root / rel
+    if not target.is_file():
+        return [f"artifact_missing {iid}: {rel}"]
+    digest = _sha256(target)
+    if digest != item.get("sha256"):
+        return [f"sha256_mismatch {iid}: 索引 {item.get('sha256')} 實際 {digest}"]
+    return []
+
+
+def verify_item(index_path: pathlib.Path, item_id: str, *, root: pathlib.Path) -> tuple[dict[str, Any] | None, list[str]]:
+    """回傳索引中 `item_id` 的項目與違規清單（P2-T16）。
+
+    違規：項目不存在（`item_missing`）、status 非 present（`not_present`）、檔案缺失、路徑不安全、sha256 不符。
+    只適用單檔 present 項目；不讀取 artifact 內容，不做 CLI 的 stage 級檢查。
+    """
+    index = yaml.safe_load(index_path.read_text(encoding="utf-8")) or {}
+    item = next((x for x in index.get("items") or [] if x.get("id") == item_id), None)
+    if item is None:
+        return None, [f"item_missing {item_id}"]
+    if item.get("status") != "present":
+        return item, [f"not_present {item_id}: status={item.get('status')}"]
+    return item, _present_problems(item, root)
+
+
 def _path_matches_evidence(rel: str, evidence: str) -> bool:
     """artifact_path 是否對應 evidence 名稱：檔名相等；目錄（以 / 結尾）則需為路徑段。"""
     parts = pathlib.PurePosixPath(rel).parts
@@ -313,16 +343,7 @@ def check(stage: str, root: pathlib.Path, index_path: pathlib.Path | None = None
                 _check_l1_item(iid, item, root, lock, fails, blocked)
             continue
         if status == "present":
-            if not rel or not _safe_relpath(rel):
-                fails.append(f"bad_artifact_path {iid}: {rel!r}")
-                continue
-            target = root / rel
-            if not target.is_file():
-                fails.append(f"artifact_missing {iid}: {rel}")
-                continue
-            digest = _sha256(target)
-            if digest != item.get("sha256"):
-                fails.append(f"sha256_mismatch {iid}: 索引 {item.get('sha256')} 實際 {digest}")
+            fails.extend(_present_problems(item, root))
         elif status in ("missing", "blocked_owner"):
             blocked.append(f"{status} {iid}")
         elif rel and not _safe_relpath(rel):

@@ -10,7 +10,7 @@ import shlex
 import subprocess
 import sys
 import textwrap
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
@@ -443,7 +443,7 @@ def test_real_acceptance_roundtrip_propose_freeze_check_gate(tmp_path):
         assert all(value is not None for platform in od09.PLATFORMS
                    for value in after["thresholds"][key]["per_platform"][platform].values())
         assert set(after["thresholds"][key]) == set(before["thresholds"][key]) | {
-            "decision_id", "approved_by", "overrides", "proposal_sha256", "baseline_evidence"
+            "frozen_at", "decision_id", "approved_by", "overrides", "proposal_sha256", "baseline_evidence"
         }
 
 
@@ -825,3 +825,318 @@ def test_od09_procedure_doc():
             parser.parse_args(words[3:])
             commands.append(words[3])
     assert set(commands) >= {"stats", "propose", "freeze", "check", "register-candidate"}
+
+
+def _doc_bash_lines() -> list[str]:
+    path = ROOT / "docs" / "rust-refactor" / "procedures" / "od09-deferred-freeze.md"
+    fence = chr(96) * 3
+    in_bash = False
+    lines: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip().startswith(fence + "bash"):
+            in_bash = True
+            continue
+        if in_bash and line.strip().startswith(fence):
+            in_bash = False
+            continue
+        if in_bash:
+            lines.append(line.strip())
+    return lines
+
+
+@pytest.mark.memory_only
+def test_od09_procedure_doc_gate_baseline_reruns_carry_wal_dir():
+    """文件中的 gate 基線重跑必須帶 --wal-dir（缺漏時安全檢查 INSUFFICIENT_EVIDENCE，見 Review）。"""
+    baseline_lines = [
+        line for line in _doc_bash_lines()
+        if line.startswith("python3 -m realhw.acceptance.gate ") and "--mode baseline" in line
+    ]
+    assert len(baseline_lines) == 2
+    assert all("--wal-dir" in line for line in baseline_lines)
+    text = (ROOT / "docs" / "rust-refactor" / "procedures" / "od09-deferred-freeze.md").read_text(encoding="utf-8")
+    assert "EVIDENCE_ROOT" in text and "check_evidence_index.py" in text
+
+
+@pytest.mark.memory_only
+def test_baseline_stats_accepts_non_grid_snapshot_times(tmp_path):
+    """引擎快照非整點（首快照 t≈1 s、間隔 300.5 s、無末快照）時，時長與 gate 的連續時長一致，不得誤判不足。"""
+    env = _new_env(tmp_path)
+    od09 = _od09()
+    run = env.linux_run
+    rows = run.snapshots[:-1]
+    run.set_snapshots([dict(row, t=1 + index * 300.5) for index, row in enumerate(rows)])
+    stats = od09.baseline_stats(env.linux_case_dir, platform="linux", release_manifest=env.linux_manifest)
+    assert stats.duration_s == od09.workload(env.acceptance)["min_continuous_duration_s"]
+    assert od09.validate_baseline(stats, acceptance_path=env.acceptance) == []
+
+
+@pytest.mark.memory_only
+def test_baseline_stats_requires_single_start_and_stop(tmp_path):
+    env = _new_env(tmp_path)
+    od09 = _od09()
+    env.linux_run.set_events([row for row in env.linux_run.events if row["kind"] != "stop"])
+    with pytest.raises(ValueError, match="start"):
+        od09.baseline_stats(env.linux_case_dir, platform="linux", release_manifest=env.linux_manifest)
+
+
+@pytest.mark.memory_only
+def test_propose_rejects_swapped_platform_labels(tmp_path):
+    env = _new_env(tmp_path)
+    od09 = _od09()
+    with pytest.raises(ValueError, match="不得互換"):
+        od09.propose(env.windows_stats, env.linux_stats, baseline_gates=env.baseline_gates)
+
+
+@pytest.mark.memory_only
+def test_propose_rejects_violating_stats(tmp_path):
+    env = _new_env(tmp_path)
+    od09 = _od09()
+    stats = replace(env.linux_stats, daemon_implementation="rust")
+    with pytest.raises(ValueError, match="拒絕提案"):
+        od09.propose(stats, env.windows_stats, baseline_gates=env.baseline_gates)
+
+
+@pytest.mark.memory_only
+def test_propose_rejects_mismatched_baseline_gate(tmp_path):
+    env = _new_env(tmp_path)
+    od09 = _od09()
+    gates = dict(env.baseline_gates)
+    gates["windows"] = env.baseline_gates["linux"]
+    with pytest.raises(ValueError, match="windows 基線 gate"):
+        od09.propose(env.linux_stats, env.windows_stats, baseline_gates=gates)
+
+
+@pytest.mark.memory_only
+def test_stats_cli_writes_nothing_on_violation(tmp_path, capsys):
+    env = _new_env(tmp_path)
+    od09 = _od09()
+    manifest = tmp_path / "rust-manifest.json"
+    _write_json(manifest, {"components": {"daemon": {"implementation": "rust"}}})
+    out = tmp_path / "stats-linux.json"
+    code = od09.main([
+        "stats", "--case-dir", str(env.linux_case_dir), "--platform", "linux",
+        "--release-manifest", str(manifest), "--out", str(out),
+    ])
+    assert code == 1
+    assert not out.exists()
+    assert json.loads(capsys.readouterr().out.strip().splitlines()[-1])["ok"] is False
+
+
+@pytest.mark.memory_only
+def test_propose_cli_rejects_violating_stats(tmp_path, capsys):
+    env = _new_env(tmp_path)
+    od09 = _od09()
+    linux_stats = tmp_path / "linux-stats.json"
+    _write_json(linux_stats, asdict(replace(env.linux_stats, daemon_implementation="rust")))
+    windows_stats = tmp_path / "windows-stats.json"
+    _write_json(windows_stats, asdict(env.windows_stats))
+    code = od09.main([
+        "propose", "--linux-stats", str(linux_stats), "--windows-stats", str(windows_stats),
+        "--baseline-gate", f"linux={env.baseline_gates['linux']}",
+        "--baseline-gate", f"windows={env.baseline_gates['windows']}",
+        "--out", str(tmp_path / "proposal.json"),
+    ])
+    assert code == 1
+    assert not (tmp_path / "proposal.json").exists()
+
+
+@pytest.mark.memory_only
+def test_freeze_rejects_missing_ledger(tmp_path):
+    env = _new_env(tmp_path)
+    proposal = _make_proposal(env)
+    env.ledger.unlink()
+    od09 = _od09()
+    before = env.acceptance.read_bytes()
+    with pytest.raises(ValueError, match="ledger 不存在"):
+        od09.freeze(
+            env.acceptance, proposal, decision_id="OD-09-F1", approved_by="owner", overrides={},
+            stage0_index=env.stage0_index, evidence_root=env.evidence_root, ledger_path=env.ledger,
+            addenda_path=env.addenda, now=fakes_od09.ts(20, 9),
+        )
+    assert env.acceptance.read_bytes() == before
+
+
+@pytest.mark.memory_only
+def test_freeze_treats_non_utf8_ledger_as_too_late(tmp_path):
+    env = _new_env(tmp_path)
+    proposal = _make_proposal(env)
+    env.ledger.write_bytes(b"\xff\xfe\n")
+    od09 = _od09()
+    before = env.acceptance.read_bytes()
+    with pytest.raises(od09.Od09Error) as error:
+        od09.freeze(
+            env.acceptance, proposal, decision_id="OD-09-F1", approved_by="owner", overrides={},
+            stage0_index=env.stage0_index, evidence_root=env.evidence_root, ledger_path=env.ledger,
+            addenda_path=env.addenda, now=fakes_od09.ts(20, 9),
+        )
+    assert error.value.code == "HARNESS_OD09_TOO_LATE"
+    assert env.acceptance.read_bytes() == before
+
+
+@pytest.mark.memory_only
+def test_freeze_rejects_backdated_now(tmp_path):
+    env = _new_env(tmp_path)
+    proposal = _make_proposal(env)
+    proposal["generated_at"] = fakes_od09.ts(20, 10)
+    proposal["proposal_sha256"] = _proposal_digest(proposal)
+    od09 = _od09()
+    before = env.acceptance.read_bytes()
+    with pytest.raises(od09.Od09Error) as error:
+        od09.freeze(
+            env.acceptance, proposal, decision_id="OD-09-F1", approved_by="owner", overrides={},
+            stage0_index=env.stage0_index, evidence_root=env.evidence_root, ledger_path=env.ledger,
+            addenda_path=env.addenda, now=fakes_od09.ts(20, 9),
+        )
+    assert error.value.code == "HARNESS_OD09_BASELINE_INVALID"
+    assert any("回填" in item for item in error.value.detail)
+    assert env.acceptance.read_bytes() == before
+
+
+@pytest.mark.memory_only
+def test_freeze_stores_utc_frozen_at(tmp_path):
+    env = _new_env(tmp_path)
+    _freeze(env, now="2026-11-20T10:00:00+01:00")
+    frozen = _load_yaml(env.acceptance)["thresholds"]
+    assert all(frozen[key]["frozen_at"] == "2026-11-20T09:00:00+00:00" for key in _od09().DEFERRED_KEYS)
+
+
+@pytest.mark.memory_only
+def test_freeze_preflight_rejects_unwritable_addenda_before_replace(tmp_path):
+    env = _new_env(tmp_path)
+    proposal = _make_proposal(env)
+    before = env.acceptance.read_bytes()
+    env.addenda.unlink()
+    env.addenda.mkdir()
+    od09 = _od09()
+    with pytest.raises(OSError):
+        od09.freeze(
+            env.acceptance, proposal, decision_id="OD-09-F1", approved_by="owner", overrides={},
+            stage0_index=env.stage0_index, evidence_root=env.evidence_root, ledger_path=env.ledger,
+            addenda_path=env.addenda, now=fakes_od09.ts(20, 9),
+        )
+    assert env.acceptance.read_bytes() == before
+    env.addenda.rmdir()
+    env.addenda.write_text("| decision_id | 主題 | 日期 | 內容 |\n", encoding="utf-8")
+    report, _ = _freeze(env, proposal=proposal)
+    assert report["revision"] != "" and env.acceptance.read_bytes() != before
+
+
+@pytest.mark.memory_only
+def test_freeze_retries_after_addenda_failure(tmp_path, monkeypatch):
+    """門檻檔已凍結但附加列失敗：同一提案重跑補寫附加列並回傳同一份報告，不得回報 TOO_LATE。"""
+    env = _new_env(tmp_path)
+    proposal = _make_proposal(env)
+    od09 = _od09()
+    real_append = od09._append_addenda
+    calls = {"count": 0}
+
+    def flaky_append(path, row):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise OSError("simulated addenda write failure")
+        return real_append(path, row)
+
+    monkeypatch.setattr(od09, "_append_addenda", flaky_append)
+    options = dict(
+        decision_id="OD-09-F1", approved_by="owner", overrides={},
+        stage0_index=env.stage0_index, evidence_root=env.evidence_root, ledger_path=env.ledger,
+        addenda_path=env.addenda, now=fakes_od09.ts(20, 9),
+    )
+    with pytest.raises(OSError):
+        od09.freeze(env.acceptance, proposal, **options)
+    frozen_bytes = env.acceptance.read_bytes()
+    assert "OD-09 延後項凍結" not in env.addenda.read_text(encoding="utf-8")
+    report = od09.freeze(env.acceptance, proposal, **options)
+    assert env.acceptance.read_bytes() == frozen_bytes
+    assert report["acceptance_sha256"] == hashlib.sha256(frozen_bytes).hexdigest()
+    assert env.addenda.read_text(encoding="utf-8").count("OD-09 延後項凍結") == 1
+
+
+@pytest.mark.memory_only
+def test_addenda_row_escapes_pipe_characters(tmp_path):
+    env = _new_env(tmp_path)
+    proposal = _make_proposal(env)
+    _od09().freeze(
+        env.acceptance, proposal, decision_id="OD-09|F1", approved_by="a|b", overrides={},
+        stage0_index=env.stage0_index, evidence_root=env.evidence_root, ledger_path=env.ledger,
+        addenda_path=env.addenda, now=fakes_od09.ts(20, 9),
+    )
+    text = env.addenda.read_text(encoding="utf-8")
+    assert r"| OD-09\|F1 | OD-09 延後項凍結 |" in text
+    assert r"approved_by=a\|b" in text
+
+
+@pytest.mark.memory_only
+@pytest.mark.parametrize("field,value", [
+    ("frozen_at", ""),
+    ("decision_id", ""),
+    ("approved_by", ""),
+    ("proposal_sha256", "not-a-hash"),
+    ("baseline_evidence", {}),
+    ("overrides", {"resources.rss_budget.linux": 1}),
+    ("baseline_evidence", {
+        "linux": {"item_id": "S0-L3-BASELINE-WINDOWS-48H", "artifact_path": "x", "sha256": "0" * 64},
+        "windows": {"item_id": "S0-L3-BASELINE-WINDOWS-48H", "artifact_path": "x", "sha256": "0" * 64},
+    }),
+])
+def test_schema_rejects_forged_freeze_record(tmp_path, field, value):
+    """凍結紀錄欄位不得以空值或格式錯誤的內容通過 gate 的 schema（單一寫入者需工具可核對）。"""
+    env = _new_env(tmp_path)
+    _freeze(env)
+    acceptance = _load_yaml(env.acceptance)
+    acceptance["thresholds"]["resources"][field] = value
+    _write_yaml(env.acceptance, acceptance)
+    with pytest.raises(ValueError, match="不符 schema"):
+        _gate().load_acceptance(env.acceptance)
+
+
+@pytest.mark.memory_only
+def test_cli_missing_inputs_exit_2(tmp_path):
+    env = _new_env(tmp_path)
+    od09 = _od09()
+    assert od09.main([
+        "check", "--acceptance", str(tmp_path / "missing.yaml"), "--run-started-at", fakes_od09.ts(21, 0),
+    ]) == 2
+    assert od09.main([
+        "freeze", "--acceptance", str(env.acceptance), "--proposal", str(tmp_path / "missing.json"),
+        "--decision-id", "OD-09-F1", "--approved-by", "owner", "--stage0-index", str(env.stage0_index),
+        "--evidence-root", str(env.evidence_root), "--ledger", str(env.ledger), "--addenda", str(env.addenda),
+        "--out", str(tmp_path / "report.json"),
+    ]) == 2
+
+
+@pytest.mark.process_rpc
+def test_register_candidate_concurrent_duplicate_run_id_rejected(tmp_path):
+    """兩個程序同時以同一 run_id 登記：ledger 鎖須使恰有一筆成功，另一筆回報重複。"""
+    env = _new_env(tmp_path)
+    _freeze(env)
+    go = tmp_path / "go"
+    script = textwrap.dedent(f"""
+        import sys, time
+        from pathlib import Path
+        sys.path.insert(0, {str(ROOT)!r})
+        from realhw.acceptance import od09_freeze
+        go = Path({str(go)!r})
+        while not go.exists():
+            time.sleep(0.01)
+        try:
+            od09_freeze.register_candidate_start(
+                Path({str(env.acceptance)!r}), item_id="S1B-L3-MIXED-48H-WINDOWS", platform="windows",
+                run_id="dup", started_at={fakes_od09.ts(21, 0)!r}, ledger_path=Path({str(env.ledger)!r}),
+            )
+            print("ok")
+        except ValueError:
+            print("duplicate")
+    """)
+    procs = [
+        subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        for _ in range(2)
+    ]
+    go.write_text("go", encoding="utf-8")
+    outputs = []
+    for proc in procs:
+        stdout, stderr = proc.communicate(timeout=120)
+        assert proc.returncode == 0, stderr
+        outputs.append(stdout.strip())
+    assert sorted(outputs) == ["duplicate", "ok"]
+    assert len(env.ledger.read_text(encoding="utf-8").splitlines()) == 1

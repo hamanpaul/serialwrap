@@ -456,6 +456,16 @@ def test_post_hoc_freeze_is_blocked(tmp_path):
     assert out["release_gate_result"] == "BLOCKED"
 
 
+def test_baseline_ignores_deferred_freeze_timing(tmp_path):
+    """OD-09 凍結後以新 revision 重跑基線 gate：延後項凍結晚於基線起點，不得使基線 pre_frozen／baseline_result 失效。"""
+    gate = _gate()
+    run = LongrunFixture(tmp_path).healthy(hours=48, platform="linux")
+    acceptance = run.filled_acceptance(frozen_at=(run.started + timedelta(days=1)).isoformat(timespec="seconds"))
+    out = gate.evaluate(run.inputs(mode="baseline", acceptance_path=acceptance))
+    assert _check(out, "pre_frozen")["result"] == "PASS"
+    assert out["baseline_result"] == "PASS"
+
+
 def test_stitched_segments_fail(tmp_path):
     gate = _gate()
     run = LongrunFixture(tmp_path).healthy(hours=48, platform="linux")

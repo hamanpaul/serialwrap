@@ -481,22 +481,29 @@
           "type": "string"
         },
         "frozen_at": {
-          "type": "string"
+          "type": "string",
+          "minLength": 1
         },
         "decision_id": {
-          "type": "string"
+          "type": "string",
+          "minLength": 1
         },
         "approved_by": {
-          "type": "string"
+          "type": "string",
+          "minLength": 1
         },
         "overrides": {
-          "type": "object"
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^resources\\.per_platform\\.(linux|windows)\\.(rss_peak_kb|rss_steady_kb|rss_slope_kb_per_h)$"
+          }
         },
         "proposal_sha256": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
         },
         "baseline_evidence": {
-          "type": "object"
+          "$ref": "#/$defs/baseline_evidence"
         },
         "per_platform": {
           "type": "object",
@@ -530,6 +537,7 @@
           "frozen_at",
           "decision_id",
           "approved_by",
+          "overrides",
           "proposal_sha256",
           "baseline_evidence"
         ],
@@ -584,22 +592,29 @@
           "type": "string"
         },
         "frozen_at": {
-          "type": "string"
+          "type": "string",
+          "minLength": 1
         },
         "decision_id": {
-          "type": "string"
+          "type": "string",
+          "minLength": 1
         },
         "approved_by": {
-          "type": "string"
+          "type": "string",
+          "minLength": 1
         },
         "overrides": {
-          "type": "object"
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^min_effective_load\\.per_platform\\.(linux|windows)\\.(min_completed_per_board_source|max_idle_gap_s)$"
+          }
         },
         "proposal_sha256": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
         },
         "baseline_evidence": {
-          "type": "object"
+          "$ref": "#/$defs/baseline_evidence"
         },
         "per_platform": {
           "type": "object",
@@ -633,6 +648,7 @@
           "frozen_at",
           "decision_id",
           "approved_by",
+          "overrides",
           "proposal_sha256",
           "baseline_evidence"
         ],
@@ -687,22 +703,29 @@
           "type": "string"
         },
         "frozen_at": {
-          "type": "string"
+          "type": "string",
+          "minLength": 1
         },
         "decision_id": {
-          "type": "string"
+          "type": "string",
+          "minLength": 1
         },
         "approved_by": {
-          "type": "string"
+          "type": "string",
+          "minLength": 1
         },
         "overrides": {
-          "type": "object"
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^comparison_uncertainty\\.per_platform\\.(linux|windows)\\.(error_rate_abs_tolerance|throughput_ratio_tolerance|stuck_s_tolerance|max_reruns)$"
+          }
         },
         "proposal_sha256": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
         },
         "baseline_evidence": {
-          "type": "object"
+          "$ref": "#/$defs/baseline_evidence"
         },
         "per_platform": {
           "type": "object",
@@ -736,6 +759,7 @@
           "frozen_at",
           "decision_id",
           "approved_by",
+          "overrides",
           "proposal_sha256",
           "baseline_evidence"
         ],
@@ -984,6 +1008,66 @@
         },
         "max_reruns": {
           "type": "null"
+        }
+      }
+    },
+    "baseline_evidence": {
+      "type": "object",
+      "required": [
+        "linux",
+        "windows"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "linux": {
+          "$ref": "#/$defs/baseline_evidence_entry_linux"
+        },
+        "windows": {
+          "$ref": "#/$defs/baseline_evidence_entry_windows"
+        }
+      }
+    },
+    "baseline_evidence_entry_linux": {
+      "type": "object",
+      "required": [
+        "item_id",
+        "artifact_path",
+        "sha256"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "item_id": {
+          "const": "S0-L3-BASELINE-LINUX-48H"
+        },
+        "artifact_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "baseline_evidence_entry_windows": {
+      "type": "object",
+      "required": [
+        "item_id",
+        "artifact_path",
+        "sha256"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "item_id": {
+          "const": "S0-L3-BASELINE-WINDOWS-48H"
+        },
+        "artifact_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
         }
       }
     }
