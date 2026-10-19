@@ -358,3 +358,40 @@ def test_winexcl_cli_non_windows_exit2(capsys, monkeypatch):
     assert code == 2
     assert "windows only" in captured.err.lower()
     assert calls == []
+
+
+def test_winexcl_handoff_rpc_error_inconclusive_and_recovers():
+    """release 後 RPC 中途失敗：記 inconclusive（不得判 exclusive），板子仍 RELEASED 時 best-effort 重新 attach。"""
+    winexcl = _winexcl()
+
+    class RaisingAfterRelease(FakeSwCli):
+        def run(self, *args):
+            if tuple(args[:2]) == ("device", "release"):
+                super().run(*args)
+                raise RuntimeError("RPC timeout")
+            return super().run(*args)
+
+    sw = RaisingAfterRelease()
+    result, _ = _handoff(winexcl, sw)
+    assert result["verdict"] == "inconclusive"
+    assert result["reason"] == "rpc_error"
+    names = [step["name"] for step in result["steps"]]
+    assert "rpc_error" in names and names[-1] == "recover_attach"
+    assert sw.state == "READY"
+    assert sum(call[:2] == ("device", "attach") for call in sw.calls) == 1
+
+
+def test_winexcl_handoff_rpc_error_before_release_does_not_reattach():
+    winexcl = _winexcl()
+
+    class RaisingOnStatus(FakeSwCli):
+        def run(self, *args):
+            if tuple(args[:2]) == ("daemon", "status"):
+                raise RuntimeError("RPC timeout")
+            return super().run(*args)
+
+    sw = RaisingOnStatus()
+    result, _ = _handoff(winexcl, sw)
+    assert result["verdict"] == "inconclusive"
+    assert result["reason"] == "rpc_error"
+    assert sum(call[:2] == ("device", "attach") for call in sw.calls) == 0

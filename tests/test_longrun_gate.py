@@ -99,6 +99,8 @@ class LongrunFixture:
         self._write_acceptance(self._acceptance)
 
         start_event = self._event("start", 0)
+        # 引擎 start 事件宣告目標時長與 agent worker 數（engine: emit("start", duration_s=, workers=)）
+        start_event.update({"duration_s": self.duration_s, "workers": sum(1 for s in WORKERS if s.startswith("agent:"))})
         self.events = [start_event]
         for source in WORKERS:
             self.events.append({**self._event("worker_start", 0), "source": source})
@@ -116,18 +118,20 @@ class LongrunFixture:
                 alive.update({"source": source, "worker": source})
                 self.events.append(alive)
         for source in WORKERS:
+            # 引擎正常收尾的 reason 為 "stop"（deadline 後 stop.set()）；worker_stop 可略早於 stop 事件
             stopped = self._event("worker_stop", self.duration_s)
-            stopped.update({"source": source, "reason": "completed"})
+            stopped.update({"source": source, "reason": "stop"})
             self.events.append(stopped)
         self.events.append(self._event("stop", self.duration_s))
         self.events.sort(key=lambda row: (row.get("t", 0), row["kind"] == "start"))
 
         self.snapshots = []
         for t in range(0, self.duration_s + 1, 300):
+            # engine snapshots 的 pid 位於頂層（realhw/cases/longrun.py snapshot = {"t","pid","rss_kb",...}）
             self.snapshots.append({
                 "t": t,
                 "wall_ts": self._wall(t),
-                "daemon": {"pid": 4242, "ok": True},
+                "pid": 4242,
                 "rss_kb": 40000,
                 "sessions": {"COM0": "READY", "COM1": "READY"},
             })
@@ -140,13 +144,17 @@ class LongrunFixture:
             "supervision": {"mode": "systemd-user", "auto_restart_disabled": True, "evidence": "Restart=no"},
         }
         self.observer = [header]
+        # sw_core.service.daemon status 的真實形狀：foreign_holders 為 {tty: pid | {device, holder_unknown}}
+        holders = ({device: {"device": device, "holder_unknown": True} for device in ("COM5", "COM6")}
+                   if platform == "windows" else {})
         for t in range(0, self.duration_s + 1, 10):
             daemon = {
                 "ok": True,
                 "pid": 4242,
+                "pid_alive": True,
                 "version": "0.3.2",
                 "multi_open": False,
-                "foreign_holders": [],
+                "foreign_holders": copy.deepcopy(holders),
                 "holder_unknown": platform == "windows",
                 "wal_healthy": True,
             }
@@ -259,6 +267,9 @@ class LongrunFixture:
 
     def baseline_gate(self):
         out = _gate().evaluate(self.inputs(mode="baseline"))
+        # 基線為較早的獨立執行，於預設凍結時點（started − 1 日）之前結束；候選與基線同時間軸時無法合法凍結（§14.2）
+        out["run"]["started_at_utc"] = (self.started - timedelta(days=4)).isoformat(timespec="seconds")
+        out["run"]["ended_at_utc"] = (self.started - timedelta(days=2)).isoformat(timespec="seconds")
         path = self.root / "baseline-release-gate.json"
         path.write_text(json.dumps(out, ensure_ascii=False, sort_keys=True), encoding="utf-8")
         return path
@@ -270,7 +281,7 @@ class LongrunFixture:
         fields_by_key = {
             "resources": {
                 "linux": {"rss_peak_kb": 60000, "rss_steady_kb": 50000, "rss_slope_kb_per_h": 100},
-                "windows": {"rss_peak_kb": 40000, "rss_steady_kb": 35000, "rss_slope_kb_per_h": 100},
+                "windows": {"rss_peak_kb": 40000, "rss_steady_kb": 40000, "rss_slope_kb_per_h": 100},
             },
             "min_effective_load": {"min_completed_per_board_source": {"COM0|agent:rhw0": 1}, "max_idle_gap_s": 200000},
             "comparison_uncertainty": {"error_rate_abs_tolerance": 0.01, "throughput_ratio_tolerance": 0.02,
@@ -620,7 +631,8 @@ def test_effective_hour_excludes_non_ready(tmp_path):
     run = LongrunFixture(tmp_path).healthy(hours=48, platform="linux")
     run.set_attached("COM0", 3600, 10800)
     out = gate.evaluate(run.inputs(mode="baseline"))
-    assert out["counts"]["COM0|agent:rhw0"]["effective_hour"] == 46
+    # 非 READY 區段由 10 s 觀測樣本推得：3600 s 起至 10790 s 的覆蓋（7190 s）須自 48 h 扣除
+    assert out["counts"]["COM0|agent:rhw0"]["effective_hour"] == pytest.approx((172800 - 7190) / 3600, abs=1e-9)
 
 
 def test_stuck_bounds_open_segment(tmp_path):
@@ -683,7 +695,7 @@ def test_stuck_bounds_math(tmp_path):
     assert result["upper_s"] == 900
 
 
-def test_stuck_relative_insufficient_when_overlapping(tmp_path):
+def test_stuck_relative_insufficient_when_overlapping(tmp_path, monkeypatch):
     gate = _gate()
     baseline = LongrunFixture(tmp_path / "baseline").healthy(hours=48, platform="linux")
     baseline_path = baseline.baseline_gate()
@@ -741,7 +753,7 @@ def test_safety_double_holder_fail(tmp_path):
 def test_safety_double_holder_windows_exclusive_evidence_pass(tmp_path):
     gate = _gate()
     run = LongrunFixture(tmp_path).healthy(hours=48, platform="windows")
-    base = gate.evaluate(run.inputs(mode="baseline"))
+    base = json.loads(run.baseline_gate().read_text(encoding="utf-8"))
     check = _check(base, "safety_double_holder")
     assert check["result"] == "PASS"
     assert check["detail"]["holder_unknown_samples"] == len(run.observer) - 1
@@ -826,7 +838,7 @@ def test_safety_double_holder_windows_violation_fail(tmp_path):
 
     second = LongrunFixture(tmp_path / "handoff").healthy(hours=48, platform="windows")
     second.set_handoff("pre", "COM1", verdict="violated")
-    second.drop_excl_evidence()
+    second.drop_handoff("post", "COM1")
     second_out = gate.evaluate(second.inputs(mode="baseline"))
     assert _check(second_out, "safety_double_holder")["result"] == "FAIL"
     assert second_out["release_gate_result"] == "FAIL"
@@ -1020,6 +1032,8 @@ def test_min_load_too_low_insufficient(tmp_path):
 def test_uncertainty_band_insufficient(tmp_path):
     gate = _gate()
     run = LongrunFixture(tmp_path).healthy(hours=48, platform="linux")
+    # 基線須為 100 次完成（與 test_throughput_relative 相同）；預設 healthy 只有 50 次完成，會使比率失真
+    run.replace_command_events(_commands(100))
     baseline = run.baseline_gate()
     acceptance = run.filled_acceptance()
     value = _yaml().safe_load(acceptance.read_text(encoding="utf-8"))
@@ -1137,3 +1151,328 @@ def test_cli_exit_codes(tmp_path, monkeypatch):
         ])
         assert code == expected
 
+
+
+def _edit_report_meta(run, *, drop=()):
+    path = run.report_dir / "report.json"
+    report = json.loads(path.read_text(encoding="utf-8"))
+    for key in drop:
+        report["meta"].pop(key, None)
+    path.write_text(json.dumps(report, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+
+
+def _mutate_acceptance(run, mutate):
+    value = _yaml().safe_load(run.acceptance_path.read_text(encoding="utf-8"))
+    mutate(value)
+    run._write_acceptance(value)
+
+
+def _sample_rows(run):
+    return [row for row in run.observer if row.get("kind") == "sample"]
+
+
+def _wal_meta_unknown(seq: int, *, wall_ts: str):
+    return {
+        "cmd_id": None, "com": "COM0", "crc32": "00000000", "dir": "META", "len": 0, "loss_flag": False,
+        "meta": {"event": "tx_outcome_unknown", "requested_bytes": 5, "confirmed_bytes": 2,
+                 "unknown_range": [2, 5], "error": "EIO"},
+        "mono_ts_ns": seq * 1_000_000_000, "payload_b64": "", "seq": seq, "source": "agent:rhw0",
+        "wall_ts": wall_ts,
+    }
+
+
+def test_run_timestamps_fall_back_to_engine_events(tmp_path):
+    """真實 run 的 report.json 不寫 started／ended_at_utc；gate 須回退到 start／stop 事件的 wall_ts。"""
+    gate = _gate()
+    run = LongrunFixture(tmp_path).healthy(hours=48, platform="linux")
+    _edit_report_meta(run, drop=("started_at_utc", "ended_at_utc"))
+    out = gate.evaluate(run.inputs(mode="baseline"))
+    assert out["run"]["started_at_utc"] == run._wall(0)
+    assert out["run"]["ended_at_utc"] == run._wall(run.duration_s)
+    assert _check(out, "pre_frozen")["result"] == "PASS"
+
+
+def test_worker_stop_before_stop_event_is_normal_drain(tmp_path):
+    """引擎先 join worker 再做 final drain 才寫 stop；worker_stop 早於 stop 事件屬正常收尾，不得判提前停止。"""
+    gate = _gate()
+    run = LongrunFixture(tmp_path).healthy(hours=48, platform="linux")
+    for row in run.events:
+        if row["kind"] == "worker_stop":
+            row["t"] = run.duration_s - 3
+            row["wall_ts"] = run._wall(run.duration_s - 3)
+        elif row["kind"] == "stop":
+            row["t"] = run.duration_s + 25
+            row["wall_ts"] = run._wall(run.duration_s + 25)
+    run.set_events(run.events)
+    out = gate.evaluate(run.inputs(mode="baseline"))
+    assert _check(out, "worker_liveness")["result"] == "PASS"
+    assert _check(out, "continuous_duration")["result"] == "PASS"
+
+
+def test_worker_early_stop_is_premature(tmp_path):
+    gate = _gate()
+    run = LongrunFixture(tmp_path).healthy(hours=48, platform="linux")
+    for row in run.events:
+        if row["kind"] == "worker_stop" and row["source"] == "agent:rhw1":
+            row.update({"t": 3600, "reason": "stop", "wall_ts": run._wall(3600)})
+    run.set_events(run.events)
+    check = _check(gate.evaluate(run.inputs(mode="baseline")), "worker_liveness")
+    assert check["result"] == "INSUFFICIENT_EVIDENCE"
+    assert check["detail"]["premature_stop"] == ["agent:rhw1"]
+
+
+def test_worker_error_reason_is_premature(tmp_path):
+    gate = _gate()
+    run = LongrunFixture(tmp_path).healthy(hours=48, platform="linux")
+    for row in run.events:
+        if row["kind"] == "worker_stop" and row["source"] == "agent:rhw2":
+            row["reason"] = "error"
+    run.set_events(run.events)
+    check = _check(gate.evaluate(run.inputs(mode="baseline")), "worker_liveness")
+    assert check["result"] == "INSUFFICIENT_EVIDENCE"
+    assert "agent:rhw2" in check["detail"]["premature_stop"]
+
+
+def test_worker_missing_entirely_is_insufficient(tmp_path):
+    """整個 agent worker 未啟動（連事件都沒有）仍須被發現；預期集合來自 start.workers。"""
+    gate = _gate()
+    run = LongrunFixture(tmp_path).healthy(hours=48, platform="linux")
+    run.set_events([row for row in run.events if row.get("source") != "agent:rhw3"])
+    check = _check(gate.evaluate(run.inputs(mode="baseline")), "worker_liveness")
+    assert check["result"] == "INSUFFICIENT_EVIDENCE"
+    assert check["detail"]["missing"] == ["agent:rhw3"]
+
+
+def test_start_workers_field_missing_is_insufficient(tmp_path):
+    gate = _gate()
+    run = LongrunFixture(tmp_path).healthy(hours=48, platform="linux")
+    for row in run.events:
+        if row["kind"] == "start":
+            row.pop("workers", None)
+    run.set_events(run.events)
+    check = _check(gate.evaluate(run.inputs(mode="baseline")), "worker_liveness")
+    assert check["result"] == "INSUFFICIENT_EVIDENCE"
+    assert check["detail"]["reason"] == "start_workers_missing"
+
+
+def test_safety_fail_not_overwritten_by_pre_frozen_block(tmp_path):
+    """凍結時點違規只能把相依 check 改 BLOCKED；實際的未授權 TX（FAIL）不得被覆寫（§14.2 安全不可豁免）。"""
+    gate = _gate()
+    run = LongrunFixture(tmp_path).healthy(hours=48, platform="linux")
+    run.set_wal([_wal_record(3, b"echo x\n", source="agent:intruder", wall_ts=run._wall(20))])
+    later = (run.started + timedelta(days=1)).isoformat(timespec="seconds")
+    _mutate_acceptance(run, lambda value: value["safety"].__setitem__("frozen_at", later))
+    out = gate.evaluate(run.inputs(mode="candidate", baseline=None))
+    assert _check(out, "pre_frozen")["result"] == "BLOCKED"
+    assert _check(out, "safety_unauthorized_tx")["result"] == "FAIL"
+    assert out["release_gate_result"] == "FAIL"
+
+
+def test_safety_bare_agent_source_is_fail(tmp_path):
+    gate = _gate()
+    run = LongrunFixture(tmp_path).healthy(hours=48, platform="linux")
+    run.set_wal([_wal_record(3, b"echo x\n", source="agent", wall_ts=run._wall(20))])
+    out = gate.evaluate(run.inputs(mode="baseline"))
+    assert _check(out, "safety_unauthorized_tx")["result"] == "FAIL"
+
+
+def test_tx_outcome_unknown_is_insufficient_not_pass(tmp_path):
+    gate = _gate()
+    run = LongrunFixture(tmp_path).healthy(hours=48, platform="linux")
+    run.set_wal([
+        _wal_record(3, b"echo LR_rhw0_0_0001\n", source="agent:rhw0", wall_ts=run._wall(20)),
+        _wal_meta_unknown(4, wall_ts=run._wall(21)),
+    ])
+    out = gate.evaluate(run.inputs(mode="baseline"))
+    assert _check(out, "safety_unauthorized_tx")["result"] == "INSUFFICIENT_EVIDENCE"
+    assert _check(out, "safety_dangerous_auto_resend")["result"] == "INSUFFICIENT_EVIDENCE"
+
+
+def test_wal_seq_gap_is_insufficient_not_pass(tmp_path):
+    gate = _gate()
+    run = LongrunFixture(tmp_path).healthy(hours=48, platform="linux")
+    run.set_wal([
+        _wal_record(1, b"echo ok\n", source="agent:rhw0", wall_ts=run._wall(10)),
+        _wal_record(3, b"echo ok2\n", source="agent:rhw0", wall_ts=run._wall(11)),
+    ])
+    out = gate.evaluate(run.inputs(mode="baseline"))
+    assert _check(out, "safety_unauthorized_tx")["result"] == "INSUFFICIENT_EVIDENCE"
+    assert _check(out, "safety_dangerous_auto_resend")["result"] == "INSUFFICIENT_EVIDENCE"
+
+
+def test_empty_run_wal_is_insufficient_not_pass(tmp_path):
+    gate = _gate()
+    run = LongrunFixture(tmp_path).healthy(hours=48, platform="linux")
+    run.set_wal([])
+    out = gate.evaluate(run.inputs(mode="baseline"))
+    assert _check(out, "safety_unauthorized_tx")["result"] == "INSUFFICIENT_EVIDENCE"
+    assert _check(out, "safety_dangerous_auto_resend")["result"] == "INSUFFICIENT_EVIDENCE"
+
+
+def test_foreign_holders_dict_own_pid_pass_other_pid_fail(tmp_path):
+    """真實形狀：{tty: pid}（pid 可能就是本 daemon）或 {tty: {device, holder_unknown, pids?}}。"""
+    gate = _gate()
+    run = LongrunFixture(tmp_path).healthy(hours=48, platform="linux")
+
+    def set_holders(holders):
+        for row in _sample_rows(run):
+            row["daemon"]["foreign_holders"] = copy.deepcopy(holders)
+        run.set_observer(run.observer)
+
+    def double_holder():
+        return _check(gate.evaluate(run.inputs(mode="baseline")), "safety_double_holder")
+
+    set_holders({"/dev/ttyUSB0": 4242, "/dev/ttyUSB1": 4242})
+    assert double_holder()["result"] == "PASS"
+    set_holders({"/dev/ttyUSB0": 4242, "/dev/ttyUSB1": 5555})
+    failed = double_holder()
+    assert failed["result"] == "FAIL" and failed["detail"]["events"] > 0
+    set_holders({"/dev/ttyUSB0": {"device": "/dev/ttyUSB0", "holder_unknown": True, "pids": [4242]}})
+    assert double_holder()["result"] == "PASS"
+    set_holders({"/dev/ttyUSB0": {"device": "/dev/ttyUSB0", "holder_unknown": True, "pids": [5555]}})
+    assert double_holder()["result"] == "FAIL"
+
+
+def test_null_pid_run_over_limit_is_insufficient(tmp_path):
+    gate = _gate()
+    run = LongrunFixture(tmp_path).healthy(hours=48, platform="linux")
+    for row in _sample_rows(run):
+        if 1000 <= row["t_mono"] < 4000:
+            row["daemon"] = {**row["daemon"], "ok": False, "pid": None, "pid_alive": True}
+    run.set_observer(run.observer)
+    for row in run.snapshots:
+        if 1000 <= row["t"] < 4000:
+            row["pid"] = None
+    run.set_snapshots(run.snapshots)
+    check = _check(gate.evaluate(run.inputs(mode="baseline")), "observation_gaps")
+    assert check["result"] == "INSUFFICIENT_EVIDENCE"
+    assert any(item.get("reason") == "pid_null" for item in check["detail"]["gaps"])
+
+
+def test_single_failed_sample_is_neutral(tmp_path):
+    """單筆 RPC 失敗（pid_alive 由最後一次成功 pid 判定為存活）不得造成 INSUFFICIENT 或 FAIL。"""
+    gate = _gate()
+    run = LongrunFixture(tmp_path).healthy(hours=48, platform="linux")
+    for row in _sample_rows(run):
+        if row["t_mono"] == 500.0:
+            row["daemon"] = {**row["daemon"], "ok": False, "pid": None, "pid_alive": True}
+    run.set_observer(run.observer)
+    out = gate.evaluate(run.inputs(mode="baseline"))
+    assert _check(out, "liveness_daemon_exit")["result"] == "PASS"
+    assert _check(out, "observation_gaps")["result"] == "PASS"
+
+
+def test_stuck_bounds_ignore_samples_outside_run_window(tmp_path):
+    """pre／post handoff 的 RELEASED 樣本不屬於負載 run，不得計入 stuck 上下界。"""
+    gate = _gate()
+    run = LongrunFixture(tmp_path).healthy(hours=48, platform="windows")
+    extra = [{"kind": "sample", "wall_ts": run._wall(t), "t_mono": float(t),
+              "daemon": {"ok": True, "pid": 4242, "pid_alive": True, "multi_open": False, "foreign_holders": {},
+                         "holder_unknown": False, "wal_healthy": True},
+              "sessions": {"COM0": "RELEASED", "COM1": "READY"}, "procscan": {"other_serialwrapd": []}}
+             for t in (-400, -200, -100)]
+    run.set_observer([run.observer[0], *extra, *run.observer[1:]])
+    out = gate.evaluate(run.inputs(mode="baseline"))
+    assert out["stuck"]["COM0"]["total_lower_s"] == 0
+    assert out["stuck"]["COM0"]["total_upper_s"] == 0
+
+
+def test_probe_series_ignores_pre_handoff_probes(tmp_path):
+    """pre 段探測（t<0）不得把第一筆 run 內探測之前的間隔誤算成缺口。"""
+    gate = _gate()
+    run = LongrunFixture(tmp_path).healthy(hours=48, platform="windows")
+    probes = _read_jsonl(run.excl_dir / "probes.ndjson")
+    others = [row for row in probes if row["com"] != "COM0"]
+    com0 = [dict(row, t=row["t"] + 250, wall_ts=run._wall(row["t"] + 250))
+            for row in probes if row["com"] == "COM0" and row["t"] + 250 <= run.duration_s]
+    pre = dict(com0[0], t=-400, wall_ts=run._wall(-400))
+    _jsonl(run.excl_dir / "probes.ndjson", others + com0 + [pre])
+    out = gate.evaluate(run.inputs(mode="baseline"))
+    assert _check(out, "safety_double_holder")["result"] == "PASS"
+
+
+def test_device_unbound_ignores_inconclusive_not_ready_records(tmp_path):
+    gate = _gate()
+    run = LongrunFixture(tmp_path).healthy(hours=48, platform="windows")
+    rows = _read_jsonl(run.excl_dir / "probes.ndjson")
+    rows.append({"kind": "excl_probe", "com": "COM0", "t": 600, "wall_ts": run._wall(600), "expected_device": None,
+                 "before": {"state": "RELEASED", "device": None}, "after": None, "attempts": [],
+                 "daemon": {"pid": 4242, "created_at": 133000000000000000},
+                 "verdict": "inconclusive", "reason": "not_ready"})
+    _jsonl(run.excl_dir / "probes.ndjson", rows)
+    out = gate.evaluate(run.inputs(mode="baseline"))
+    assert _check(out, "safety_double_holder")["result"] == "PASS"
+
+
+def test_supervision_null_is_insufficient_not_crash(tmp_path):
+    gate = _gate()
+    run = LongrunFixture(tmp_path).healthy(hours=48, platform="linux")
+    run.observer[0]["supervision"] = None
+    run.set_observer(run.observer)
+    out = gate.evaluate(run.inputs(mode="baseline"))
+    assert _check(out, "fault_retention_attested")["result"] == "INSUFFICIENT_EVIDENCE"
+
+
+def test_resources_steady_and_slope_fail_paths(tmp_path):
+    gate = _gate()
+    run = LongrunFixture(tmp_path).healthy(hours=48, platform="linux")
+    run.filled_acceptance()
+    for row in run.snapshots:
+        row["rss_kb"] = 60000
+    run.set_snapshots(run.snapshots)
+    out = gate.evaluate(run.inputs(mode="candidate", baseline=run.baseline_gate()))
+    steady = _check(out, "resources")
+    assert steady["result"] == "FAIL"
+    assert steady["detail"]["over"] == ["steady"]
+
+    slope_run = LongrunFixture(tmp_path / "slope").healthy(hours=48, platform="linux")
+    slope_run.filled_acceptance()
+    for row in slope_run.snapshots:
+        row["rss_kb"] = 40000 + row["t"] // 2
+    slope_run.set_snapshots(slope_run.snapshots)
+    out = gate.evaluate(slope_run.inputs(mode="candidate", baseline=slope_run.baseline_gate()))
+    slope = _check(out, "resources")
+    assert slope["result"] == "FAIL"
+    assert "slope" in slope["detail"]["over"]
+
+
+def test_baseline_min_load_records_calibration(tmp_path):
+    gate = _gate()
+    run = LongrunFixture(tmp_path).healthy(hours=48, platform="linux")
+    detail = _check(gate.evaluate(run.inputs(mode="baseline")), "min_effective_load")["detail"]
+    assert detail["calibration"]["per_board_hour"]["COM0|agent:rhw0"]["completed"] == 50
+    assert detail["calibration"]["max_idle_gap_s"]["COM0|agent:rhw0"] == 2
+
+
+def test_baseline_only_board_source_is_insufficient_in_relative_checks(tmp_path):
+    gate = _gate()
+    run = LongrunFixture(tmp_path).healthy(hours=48, platform="linux")
+    baseline = run.baseline_gate()
+    run.replace_command_events(_commands(10, source="agent:rhw0", com="COM0"))
+    out = gate.evaluate(run.inputs(mode="candidate", baseline=baseline, acceptance_path=run.filled_acceptance()))
+    error_rate = _check(out, "error_rate_relative")
+    assert error_rate["result"] == "INSUFFICIENT_EVIDENCE"
+    assert error_rate["detail"]["COM1|human:h1"]["reason"] == "candidate_missing"
+    throughput = _check(out, "throughput_relative")
+    assert throughput["detail"]["COM1|human:h1"]["reason"] == "candidate_missing"
+    assert throughput["result"] != "PASS"
+
+
+def test_main_internal_error_exit_code_is_not_fail(tmp_path):
+    gate = _gate()
+    run = LongrunFixture(tmp_path).healthy(hours=48, platform="linux")
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("schema_version: [unclosed\n", encoding="utf-8")
+    rc = gate.main(["--report-dir", str(run.report_dir), "--case-dir", str(run.case_dir),
+                    "--acceptance", str(bad), "--platform", "linux", "--mode", "baseline",
+                    "--out", str(tmp_path / "out.json")])
+    assert rc == gate.EXIT_ERROR == 3
+
+
+def test_invalid_utf8_events_are_evidence_problem_not_crash(tmp_path):
+    gate = _gate()
+    run = LongrunFixture(tmp_path).healthy(hours=48, platform="linux")
+    with (run.case_dir / "events.ndjson").open("ab") as stream:
+        stream.write(b"\xff\xfe\n")
+    out = gate.evaluate(run.inputs(mode="baseline"))
+    assert _check(out, "evidence_parse")["result"] == "INSUFFICIENT_EVIDENCE"
