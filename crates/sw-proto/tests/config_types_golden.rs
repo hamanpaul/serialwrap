@@ -17,11 +17,17 @@ impl ProfileFs for DirFs {
 fn load_profiles_golden() {
     let base = common::data_root().join("contracts/golden/profiles_fixtures");
     let base = std::fs::canonicalize(base).unwrap().to_string_lossy().into_owned();
+    // Windows 的 canonicalize 回傳 verbatim 路徑（`\\?\C:\…`），其中 `/` 不是分隔符，
+    // 後續以 `/` 串接的 fixture 子目錄會整個查無；去掉 verbatim 前綴改用一般絕對路徑。
+    let base = base.strip_prefix(r"\\?\").map(str::to_owned).unwrap_or(base);
     let mut fails = Vec::new();
     for r in common::golden("load_profiles.tsv") {
         let dir = format!("{base}/{}", r.input);
         let got = match load_profiles(&dir, &DirFs) {
-            Ok(res) => common::load_result_json(&res).replace(&dir, "${FIXTURE}"),
+            // JSON 輸出中的 `\` 會跳脫成 `\\`（Windows 路徑），先換跳脫形，再換原形。
+            Ok(res) => common::load_result_json(&res)
+                .replace(&dir.replace('\\', "\\\\"), "${FIXTURE}")
+                .replace(&dir, "${FIXTURE}"),
             Err(e) => common::config_error_kind(&e),
         };
         if got != r.expected { fails.push(format!("{}: got {got}\nwant {}", r.input, r.expected)); }
