@@ -126,7 +126,7 @@ class _Variant:
 
     @property
     def exe(self) -> Path:
-        return self._ensure() / "bin" / "serialwrap"
+        return self._ensure() / "bin" / ("serialwrap.exe" if os.name == "nt" else "serialwrap")
 
     @property
     def manifest(self) -> Path:
@@ -134,12 +134,18 @@ class _Variant:
 
 
 def _probe_entry(vdir: Path) -> list[str]:
+    if os.name == "nt":
+        # Windows dev bundle（win-blackbox.ps1）的直譯器依 runtime 為 py\python.exe 或
+        # py\Scripts\python.exe；沿用複本 manifest 原 entry[0]（改寫前讀取）。
+        data = json.loads((vdir / "release-manifest.json").read_text(encoding="utf-8"))
+        return [data["components"]["python_cli_delegate"]["entry"][0], "-I", str(PROBE)]
     return ["py/bin/python3", "-I", str(PROBE)]
 
 
 def _self_loop_entry(vdir: Path) -> list[str]:
-    # 相對於 manifest 目錄解析為 bundle 內的 Rust 執行檔自身
-    return ["bin/serialwrap"]
+    # 相對於 manifest 目錄解析為 bundle 內的 Rust 執行檔自身；Windows dev bundle 的執行檔只在
+    # 根層 bin\serialwrap.exe（versions\<V>\ 下沒有 bin）
+    return ["../../bin/serialwrap.exe"] if os.name == "nt" else ["bin/serialwrap"]
 
 
 def _broken_entry(vdir: Path) -> list[str]:

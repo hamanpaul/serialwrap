@@ -70,6 +70,10 @@ def pytest_configure(config: pytest.Config) -> None:
 
 
 def pytest_runtest_setup(item: pytest.Item) -> None:
+    # 獨立執行（--confcutdir）不載入 root conftest 的平台 skip；Windows 上 posix_only 案例以
+    # applicability.json 的鍵 "posix_only" 為原因 SKIP，比較器才會判為合法的不適用。
+    if item.get_closest_marker("posix_only") and os.name == "nt":
+        pytest.skip("posix_only")
     if item.get_closest_marker("rust_only"):
         from bb_harness import is_rust
         if not is_rust():
