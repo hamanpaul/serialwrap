@@ -2014,7 +2014,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\n═══ 結果 ═══")
     print(f"通過: {passed}  跳過: {skipped}  非通過: {failed}  合計: {len(results)}")
     print(f"報告: {report_path}")
-    return 1 if failed else 0
+    # SKIP 亦屬非 PASS：Task 10 契約為「任一 verdict ≠ PASS → exit 1」，跳過不得計為通過。
+    return 1 if (failed or skipped) else 0
 
 
 if __name__ == "__main__":
