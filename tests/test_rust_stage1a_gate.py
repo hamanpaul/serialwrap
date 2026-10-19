@@ -37,7 +37,6 @@ COVERAGE_SRC = ROOT / "tests" / "contract_blackbox" / "data" / "coverage_1a.json
 pytestmark = [
     pytest.mark.core_portable,
     pytest.mark.process_rpc,
-    pytest.mark.xfail(strict=True, raises=(NotImplementedError, AssertionError), reason="P3-T18 紅燈"),
 ]
 
 A1 = "test_bb_rpc_params.py::test_rpc_params_wire"  # L1 黑箱案例（有證據）

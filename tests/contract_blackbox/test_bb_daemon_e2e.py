@@ -139,6 +139,11 @@ def rig_factory(tmp_path: Path, env: dict[str, str], py_daemon):
         return rig
 
     yield _make
+    for rig in made:
+        try:
+            rig.daemon.stop()
+        except Exception:
+            pass
     for target in targets:
         target.stop()
     shutil.rmtree(sock_root, ignore_errors=True)

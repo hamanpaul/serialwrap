@@ -1279,6 +1279,34 @@ focused debugging:
 python3 -m unittest discover -s tests -v
 ```
 
+### Rust CLI (Stage 1A) Build and A/B Execution
+
+> [!NOTE]
+> Stage 1A does not constitute a production checkpoint. It delivers the data-plane Rust CLI with transparent delegation for management groups to Python.
+
+- **Native CLI groups (13)**: `device`, `session` (including `console-attach` / `console-detach`), `alias`, `cmd`, `stream`, `log`, `file`, `wal`, `mcu`, `event`, `profile`, `skill`, `remote`.
+- **Delegated management groups (7)**: `daemon`, `connect`, `benches`, `supervision-mode`, `service`, `setup`, `doctor` (transparently delegated to Python via release manifest entry).
+
+#### Build and Bundle
+
+```bash
+# Build Rust workspace
+cargo build --workspace
+
+# Create development bundle under target/mkbundle-dev
+./scripts/rust/mkbundle.sh --dev
+```
+
+#### A/B Blackbox Verification
+
+```bash
+# Linux A/B differential verification against Python baseline
+./scripts/rust/ab_blackbox.sh --profile debug
+
+# Windows native blackbox verification via PowerShell / WSL interop
+./scripts/rust/win-blackbox.sh
+```
+
 ### Isolated test-device allowlist (OD-11 / SC-19)
 
 For isolated test instances only (throwaway daemon, com0com or other virtual COM pairs). The allowlist makes the daemon discover and select an explicit list of device names; it does not bypass the per-UART exclusive lock (BC-04), does not change the serial backend, and never bypasses Tier-2 exclusivity or handoff.
@@ -2461,6 +2489,34 @@ python3 -m unittest discover -s tests -v
 python3 -m pytest tests/test_session_bind.py -v
 python3 -m unittest tests.test_multiagent_e2e -v
 python3 -m unittest tests.test_session_bind -v
+```
+
+### Rust CLI（Stage 1A）建置與 A/B 執行
+
+> [!NOTE]
+> Stage 1A 不構成生產檢查點。此階段交付資料面 Rust CLI，並將未承接的管理群組透明委派至 Python。
+
+- **原生群組（13 個）**：`device`、`session`（含 `console-attach`／`console-detach`）、`alias`、`cmd`、`stream`、`log`、`file`、`wal`、`mcu`、`event`、`profile`、`skill`、`remote`。
+- **委派管理群組（7 個）**：`daemon`、`connect`、`benches`、`supervision-mode`、`service`、`setup`、`doctor`（透過 release manifest 的絕對入口透明交給 Python 執行）。
+
+#### 建置與 Bundle
+
+```bash
+# 建置 Rust workspace
+cargo build --workspace
+
+# 建立開發 bundle（輸出至 target/mkbundle-dev）
+./scripts/rust/mkbundle.sh --dev
+```
+
+#### A/B 黑箱驗證
+
+```bash
+# Linux A/B 差分黑箱驗證（對照 Python 基線）
+./scripts/rust/ab_blackbox.sh --profile debug
+
+# Windows 原生黑箱驗證（透過 PowerShell / WSL interop）
+./scripts/rust/win-blackbox.sh
 ```
 
 ### 隔離實例測試裝置 allowlist（OD-11／SC-19）

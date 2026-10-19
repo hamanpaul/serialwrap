@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "cases_revision": "p3-t18",
+  "sets": {
+    "cli_1A": [
+      "test_bb_daemon_e2e.py::test_alias_roundtrip",
+      "test_bb_daemon_e2e.py::test_cmd_background_result_tail",
+      "test_bb_daemon_e2e.py::test_cmd_submit_status",
+      "test_bb_daemon_e2e.py::test_console_attach_detach",
+      "test_bb_daemon_e2e.py::test_device_mcu_health",
+      "test_bb_daemon_e2e.py::test_event_rule_roundtrip",
+      "test_bb_daemon_e2e.py::test_interactive_lease_roundtrip",
+      "test_bb_daemon_e2e.py::test_local_rejections_zero_tx",
+      "test_bb_daemon_e2e.py::test_log_and_wal",
+      "test_bb_daemon_e2e.py::test_no_version_warning",
+      "test_bb_daemon_e2e.py::test_recover_release_attach_no_replay",
+      "test_bb_daemon_e2e.py::test_session_reaches_ready"
+    ],
+    "cli_1B": []
+  }
+}

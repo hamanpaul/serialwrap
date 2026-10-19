@@ -18,7 +18,6 @@ CMP = ROOT / "scripts" / "rust" / "ab_compare.py"
 pytestmark = [
     pytest.mark.core_portable,
     pytest.mark.process_rpc,
-    pytest.mark.xfail(strict=True, raises=(NotImplementedError, AssertionError), reason="P3-T18 紅燈"),
 ]
 
 INNER = {
