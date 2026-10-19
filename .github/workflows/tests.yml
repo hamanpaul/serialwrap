@@ -15,7 +15,8 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          # 釘 CPython 3.12.3：Stage 1A argparse 相容層的方言基準（arch §7.2、plan §0.7）。
+          python-version: "3.12.3"
       - name: 安裝測試相依（預設安裝，不含 [redos] extra）
         # pyserial：讓 #84 PORT-1 的 pyserial 後端單元測試（_PySerialPort read/write/例外轉譯）
         # 在 Linux CI 亦可執行（生產 Linux 預設走 termios 後端，但 CI 需覆蓋 Windows 後端邏輯）。
