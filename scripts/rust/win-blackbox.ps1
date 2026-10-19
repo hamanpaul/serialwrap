@@ -296,9 +296,11 @@ function Invoke-Blackbox([string]$Name, [string]$JunitPath, [string]$CliPath, [s
     } else {
         Remove-Item Env:SW_RESOURCE_REPORT -ErrorAction SilentlyContinue
     }
-    $arguments = @('-3.12', '-m', 'pytest', 'tests/contract_blackbox', '--confcutdir=tests/contract_blackbox',
-                   '-p', 'no:cacheprovider', "--junitxml=$JunitPath")
-    if ($RustRun) { $arguments += @('-m', 'core_portable or windows_native') }
+    # A、B 兩輪使用同一 selector（＝ s1a_blackbox windows selector，與 Linux ab_blackbox.sh 對稱），
+    # 否則 A 多出的 posix_only 案例會在比較器判 case-set-mismatch。
+    $arguments = @('-3.12', '-m', 'pytest', 'tests/contract_blackbox', '-m', 'core_portable or windows_native',
+                   '--confcutdir=tests/contract_blackbox', '-p', 'no:cacheprovider', '-o', 'xfail_strict=true',
+                   "--junitxml=$JunitPath")
     if ($RuntimeMissing) { $arguments += @('-k', 'not test_bb_cli_help and not test_bb_delegation') }
     $stdoutPath = Join-Path $OutDir "$Name.stdout.log"
     $stderrPath = Join-Path $OutDir "$Name.stderr.log"
@@ -392,6 +394,10 @@ try {
     if (-not (Test-Path -LiteralPath $runtimeExe -PathType Leaf)) { throw "delegate runtime 不存在：$runtimeRoot" }
     $bundleRoot = New-WindowsDevBundle $bundleRoot $rustExecutable $stagingRepo $runtimeRoot $runtimeExe $revision $contractsRevision
     $bundleBin = Join-Path $bundleRoot 'bin'
+    # 供 WSL 端 win-blackbox.sh 產生 A/B identity（daemon tree／runtime sha256 取自此 manifest）。
+    $bundleVersion = (Get-Content -LiteralPath (Join-Path $stagingRepo 'VERSION') -Raw).Trim()
+    Copy-Item -LiteralPath (Join-Path $bundleRoot "versions\$bundleVersion\release-manifest.json") `
+        -Destination (Join-Path $outputRoot 'windows-release-manifest.json') -Force
 
     $aJunit = Join-Path $outputRoot 'a.xml'
     $l1Directory = Join-Path $outputRoot 'l1\windows\blackbox'

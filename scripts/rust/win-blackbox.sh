@@ -95,9 +95,86 @@ set -e
 
 set +e
 if [[ "$NO_COMPARE" -eq 0 && -f "$out_dir/a.xml" && -f "$out_dir/b.xml" ]]; then
-  python3 "$ROOT/scripts/rust/ab_compare.py" \
+  # 依 ab_compare.py 介面（P3-T18）產生必要清單與兩邊 identity；daemon tree／runtime sha256
+  # 取自 win-blackbox.ps1 匯出的 Windows bundle manifest，缺檔時 identity 欄位留空由比較器判 fail。
+  (cd "$ROOT" && python3 - "$ROOT" "$out_dir" "$release_exe" <<'PY'
+import hashlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+root, out, rust_exe = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
+
+
+def sha(p: Path) -> str:
+    return hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else ""
+
+
+def dir_sha(p: Path) -> str:
+    h = hashlib.sha256()
+    for f in sorted(p.rglob("*")):
+        if f.is_file() and "__pycache__" not in f.parts:
+            h.update(f.relative_to(p).as_posix().encode())
+            h.update(f.read_bytes())
+    return h.hexdigest()
+
+
+lock = json.loads((root / "tests/acceptance/cases.lock.json").read_text(encoding="utf-8"))
+cov = json.loads((root / "tests/contract_blackbox/data/coverage_1a.json").read_text(encoding="utf-8"))
+req = set(lock.get("sets", {}).get("cli_1A", [])) | set(cov.get("p3_extra", []))
+req = sorted(c for c in req if ".py::" in c or c.startswith("test_bb_"))
+# Windows 只要求凍結的 s1a_blackbox windows 集合內的案例（posix_only 案例兩輪皆不選取，
+# 若留在必要清單會被判 required-missing）；集合本身由 l1_required.lock.json 凍結、不得縮減。
+l1_lock = json.loads((root / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+win_ids = {n.removeprefix("tests/contract_blackbox/")
+           for n in l1_lock["sets"]["s1a_blackbox"]["windows"]["nodeids"]}
+req = [c for c in req if c in win_ids]
+(out / "required_cases.txt").write_text("\n".join(req) + "\n", encoding="utf-8")
+
+manifest_path = out / "windows-release-manifest.json"
+manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else {}
+daemon = manifest.get("components", {}).get("daemon", {})
+git_rev = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+contract_rev = subprocess.check_output(["git", "rev-parse", "HEAD:contracts"], cwd=root, text=True).strip()
+# Python 輪以 P1 package_tree_sha256() 計算（與 Rust 輪 manifest 值必須相同，由比較器斷言）
+py_tree = subprocess.check_output(
+    [sys.executable, "-c", "import sw_core.release_manifest as m; print(m.package_tree_sha256())"],
+    cwd=root, text=True).strip()
+version = (root / "VERSION").read_text(encoding="utf-8").strip()
+evidence = [{"path": str(p), "sha256": sha(p)}
+            for p in (out / "a.xml", out / "b.xml", out / "release-check.json", out / "required_cases.txt",
+                      manifest_path)
+            if p.is_file()]
+common = {
+    "daemon_version": version,
+    "daemon_git_revision": git_rev,
+    "daemon_runtime_sha256": daemon.get("runtime", {}).get("sha256", ""),
+    "contract_revision": contract_rev,
+    "case_list_sha256": "",
+    "tool_revision": f"{git_rev}+{dir_sha(root / 'tests/contract_blackbox')}",
+    "platform": "windows",
+    "config_digest": sha(manifest_path),
+    "dut_identity": "bb_stubd",
+    "evidence_files": evidence,
+}
+cli_a = root / "serialwrap.py"
+id_a = dict(common, cli_path=str(cli_a), cli_sha256=sha(cli_a), cli_implementation="python",
+            daemon_tree_sha256=py_tree)
+id_b = dict(common, cli_path=str(rust_exe), cli_sha256=sha(rust_exe), cli_implementation="rust",
+            daemon_tree_sha256=daemon.get("package", {}).get("tree_sha256", ""))
+(out / "identity-a.json").write_text(json.dumps(id_a, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+(out / "identity-b.json").write_text(json.dumps(id_b, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+  ) && python3 "$ROOT/scripts/rust/ab_compare.py" \
     --a "$out_dir/a.xml" \
     --b "$out_dir/b.xml" \
+    --a-label "python-win" \
+    --b-label "rust-1a-win" \
+    --identity-a "$out_dir/identity-a.json" \
+    --identity-b "$out_dir/identity-b.json" \
+    --applicability "$ROOT/tests/contract_blackbox/data/applicability.json" \
+    --required "$out_dir/required_cases.txt" \
     --out "$out_dir/ab-report.json"
 fi
 
