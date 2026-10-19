@@ -60,7 +60,7 @@ def test_system_unit_has_umask_and_socket_group():
 
 @pytest.mark.posix_only
 @pytest.mark.process_rpc
-def test_rpc_socket_default_mode_is_0600(tmp_path, monkeypatch):
+def test_rpc_socket_default_mode_is_0660(tmp_path, monkeypatch):
     monkeypatch.delenv("SERIALWRAP_SOCKET_GROUP", raising=False)
     from sw_core.rpc import JsonRpcUnixServer
     sock = str(tmp_path / "t.sock")
@@ -87,7 +87,7 @@ def test_rpc_socket_default_mode_is_0600(tmp_path, monkeypatch):
     loop.call_soon_threadsafe(loop.stop)
     t.join(timeout=5)
     loop.close()
-    assert mode == 0o600, oct(mode)
+    assert mode == 0o660, oct(mode)
 
 
 # ── #3/#5：minicom wrapper 不再硬編 /tmp socket，改走 CLI 解析（throwaway 隔離） ──

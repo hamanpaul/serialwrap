@@ -59,6 +59,38 @@ def test_socket_group_chgrp(tmp_path, monkeypatch):
     assert mode == 0o660 and gid == os.getgid()
 
 
+def test_socket_group_chgrp_to_supplementary_group(tmp_path, monkeypatch):
+    selected_group = None
+    for candidate_gid in os.getgroups():
+        if candidate_gid == os.getegid():
+            continue
+        try:
+            candidate_name = grp.getgrgid(candidate_gid).gr_name
+        except KeyError:
+            continue
+        selected_group = (candidate_gid, candidate_name)
+        break
+    if selected_group is None:
+        pytest.skip("目前程序沒有可辨識的附加群組")
+
+    expected_gid, group_name = selected_group
+    monkeypatch.setenv("SERIALWRAP_SOCKET_GROUP", f"  {group_name}  ")
+    p = str(tmp_path / "supplementary.sock")
+
+    async def run():
+        srv = JsonRpcUnixServer(p, lambda m, q: {"ok": True})
+        await srv.start()
+        try:
+            st = os.stat(p)
+            return stat.S_IMODE(st.st_mode), st.st_gid
+        finally:
+            await srv.stop()
+
+    mode, gid = asyncio.run(run())
+    assert mode == 0o660
+    assert gid == expected_gid
+
+
 def test_socket_group_unknown_ignored(tmp_path, monkeypatch):
     # 不存在的群組：chgrp 失敗應被忽略，權限仍為 0660
     monkeypatch.setenv("SERIALWRAP_SOCKET_GROUP", "no-such-group-p1oc")

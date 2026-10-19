@@ -331,7 +331,7 @@ def test_socket_group_mode_0660(tmp_path, monkeypatch):
 
 @pytest.mark.posix_only
 @pytest.mark.memory_only
-def test_new_runtime_dirs_0700(tmp_path, monkeypatch):
+def test_existing_runtime_dir_permissions_unchanged(tmp_path, monkeypatch):
     from sw_core import constants
 
     new_run = tmp_path / "new_run"

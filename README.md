@@ -144,8 +144,8 @@ serialwrap cmd status --cmd-id <cmd_id>
 Configuration reads use `SERIALWRAP_CONFIG`, then `~/.config/serialwrap/config.yaml`,
 then `/etc/serialwrap/config.yaml` when present. The system file is read-only;
 writes go to `SERIALWRAP_CONFIG` when set, otherwise to the user config path.
-New runtime directories use mode `0700`; Unix sockets default to `0600`. Set
-`SERIALWRAP_SOCKET_GROUP` explicitly to use socket mode `0660` with that group.
+New runtime directories follow the process umask; Unix sockets use mode `0660`.
+Set `SERIALWRAP_SOCKET_GROUP` explicitly to assign the socket group.
 `daemon restart` uses `service restart` under systemd and stops, verifies exit,
 then starts the same endpoint in on-demand mode.
 While the daemon holds a device, the tty can no longer be opened directly (BC-04:
@@ -466,6 +466,18 @@ hot unplug, re-attach — terminate not-yet-started commands with
 `FLUSHED_BY_RECOVERY`; daemon shutdown uses `FLUSHED_BY_SHUTDOWN`. Both carry
 the same semantics: the command was never executed and can be resubmitted once
 the session is `READY` again.
+
+#### Attach and recovery errors (SC-34)
+
+For a command-capable session that remains outside `READY` after attach, the
+RPC error code is `SESSION_NOT_READY`; the response also includes top-level
+`last_error` and `last_error_detail` fields (either may be null). A failed
+`session.recover` REPROBE likewise reports `SESSION_NOT_READY` and these fields
+when `recovered` is false. Read `last_error` to identify the cause. Follow the
+session last-error guidance for terminal values such as
+`CREDENTIALS_UNRESOLVED` or `BOOTLOADER_STUCK`; do not retry those blindly.
+Temporary prompt or boot-window failures can be retried after checking session
+state and reprobe progress.
 
 #### Credential resolution (`CREDENTIALS_UNRESOLVED`, #140)
 
@@ -1622,7 +1634,7 @@ serialwrap doctor    # 驗證環境
 - 本機開發安裝：`./install.sh`（= `pipx install <repo>` + `serialwrap setup`）。
 - 既有 on-demand TCP 客戶端請用 `serialwrap setup --on-demand` 或 `./install.sh --on-demand` 保存 endpoint；auto 安裝可能切換至 systemd，詳見[適用範圍與限制](docs/setup-tcp-endpoint.md)。
 - 設定讀取順序為 `SERIALWRAP_CONFIG` → `~/.config/serialwrap/config.yaml` → 存在時的 `/etc/serialwrap/config.yaml`；系統設定檔唯讀，寫入落在 `SERIALWRAP_CONFIG` 或使用者設定檔。
-- 新建執行期目錄權限為 `0700`，Unix socket 預設為 `0600`；明確設定 `SERIALWRAP_SOCKET_GROUP` 時 socket 改為 `0660` 並設為該群組。
+- 新建執行期目錄權限依 process umask 決定；Unix socket 維持 `0660`，可設定 `SERIALWRAP_SOCKET_GROUP` 指定 socket 群組。
 - `daemon restart` 在 systemd 模式等同 `service restart`；on-demand 模式會先停止並確認舊 daemon 結束，再以相同 endpoint 啟動。
 - daemon 持有裝置時不可再直接開 tty，請走 `serialwrap session console-attach` 或 `device release`（BC-04：POSIX 以 `flock`＋`TIOCEXCL` 獨占並於任何 I/O 前重掃 holder；衝突開啟回 `DEVICE_STILL_HELD`，附 `pids` 與 `holder_unknown`）。
 
@@ -2149,7 +2161,7 @@ serialwrap session self-test --selector COM0
 
 若 `session attach` 剛好撞上 DUT 開機窗，target 仍在噴 boot log 或 prompt 尚未出現，session 可能暫時停在非 `READY`：
 
-> **`session attach` 回傳契約（#94）**：command-capable session 未能自動達 `READY` 時，`session attach` 會回**非零 exit（`2`）+ 頂層 `error_code`**（如 `PROMPT_UNAVAILABLE`、`RX_FLOOD`），CLI 並在 stderr 印一行具體錯誤（早期版本一律回 `ok:true`、錯誤只埋在 `session.last_error`，上層因而拿到空 error）。這是「尚未達 READY」的**誠實回報、可重試**——daemon 會有界自動重探、通常數秒內回 `READY`（`RX_FLOOD` 為洪水排空後 3s 內接手，#153）——**非致命**；自動化上層應據此 retry/wait，勿當永久失敗。（仍回 `ok:true` 的例外：`READY`、`ATTACHING`（attach 進行中）、`RELEASED`（裝置已 release、回 `recommended_action=device_attach`、需 `device attach` 重取）、`platform=passthrough`（停 `ATTACHED` 即成功）。）
+> **`session attach`／`session recover` 回傳契約（SC-34）**：command-capable session 的 attach 未能達 `READY`，一般拒絕分支固定回 `error_code=SESSION_NOT_READY`，並在頂層附 `last_error`、`last_error_detail`（可為 null）；`FLASHING` 與 `RECOVERING` 仍分別回 `FLASHING_BUSY`、`SESSION_RECOVERING`。recover 的 REPROBE 未恢復時回 `ok:true`、`recovering:false`、`action=REPROBE`、`recovered:false`、`error_code=SESSION_NOT_READY`，並附相同的頂層診斷欄位。依 `last_error` 判斷下一步：終態值（如 `CREDENTIALS_UNRESOLVED`、`BOOTLOADER_STUCK`）依 Session last_error 處置，不可盲目重試；暫時的 prompt／開機窗失敗則先查看 session 狀態及自動重探進度。CLI 對 attach 失敗仍以 exit code `2` 回報；`ok:true` 的 passthrough、`READY`、`ATTACHING`、`RELEASED` 等情形維持原行為。
 >
 > **stderr 一行具體錯誤的完整形狀（#172）**：`serialwrap: {method 或 context} failed: {error_code}[: {message}][（hint: ...)]`——`error_code` 一定露出，`message`／`hint` 有值才追加在後。修正前 `_run_rpc` 有 `error_code` 時會把 `message` 短路丟掉（`SOCKET_ERROR` 的 `message` 正是 `str(OSError)`，是分辨 socket 路徑算錯／daemon 已死／權限不符的關鍵資訊），且 `daemon start`／`daemon stop`／`event`／`remote`／`setup`／`service` 等非 RPC 錯誤出口原本 exit 非零時 stderr 全空。只讀 stderr 的呼叫端（如 testpilot）現在能拿到完整原因，不再是冒號後空白的字面。
 

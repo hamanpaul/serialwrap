@@ -269,29 +269,9 @@ def default_isolation_paths() -> dict[str, str]:
 
 
 def ensure_runtime_dirs() -> None:
-    for path in (CONFIG_DIR, STATE_DIR, RUN_DIR, WAL_DIR, EVENTS_DIR, EVENTS_RUNTIME_DIR):
-        _ensure_private_directory(path)
-
-
-def _ensure_private_directory(path: str) -> None:
-    """建立受管理目錄；只把本次新建的目錄設為 0700。"""
-    path = os.path.abspath(os.path.expanduser(path))
-    try:
-        os.mkdir(path, 0o700)
-    except FileNotFoundError:
-        parent = os.path.dirname(path)
-        if parent == path:
-            raise
-        _ensure_private_directory(parent)
-        try:
-            os.mkdir(path, 0o700)
-        except FileExistsError:
-            if not os.path.isdir(path):
-                raise
-        else:
-            os.chmod(path, 0o700)
-    except FileExistsError:
-        if not os.path.isdir(path):
-            raise
-    else:
-        os.chmod(path, 0o700)
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    os.makedirs(RUN_DIR, exist_ok=True)
+    os.makedirs(WAL_DIR, exist_ok=True)
+    os.makedirs(EVENTS_DIR, exist_ok=True)
+    os.makedirs(EVENTS_RUNTIME_DIR, exist_ok=True)
