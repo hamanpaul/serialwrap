@@ -9,8 +9,8 @@ permissions:
 
 jobs:
   policy:
-    uses: hamanpaul/paulsha-conventions/.github/workflows/reusable-policy-check.yml@7539d5252159eac50e278ec2a3bcbc5189d396ab # v1.0.18
+    uses: hamanpaul/paulsha-conventions/.github/workflows/reusable-policy-check.yml@2dcf2f815afeddc477c1cacc33df9beb06ae14fb # v1.0.19
     with:
       policy_profile: flat
-      policy_version: "1.0.18"
-      policy_engine_ref: 7539d5252159eac50e278ec2a3bcbc5189d396ab
+      policy_version: "1.0.19"
+      policy_engine_ref: 2dcf2f815afeddc477c1cacc33df9beb06ae14fb

@@ -1,5 +1,5 @@
 policy_profile: flat
-policy_version: "1.0.18"
+policy_version: "1.0.19"
 # R-12：正式啟用既有 feature/ 與 fix/ 分支契約，不使用豁免 label。
 branch_source:
   allowed_prefixes: [feature, fix]
