@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import pathlib
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -26,6 +27,44 @@ class TestCase:
     source_path: str = ""
 
 
+_REVISION_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.\d+$")
+_ALLOWED_INVARIANTS = frozenset({
+    "zero_tx_on_reject",
+    "no_forbidden_interleave",
+    "no_stale_context_replay",
+    "no_reopen_before_handoff",
+    "no_auto_resend",
+    "insufficient_evidence_not_pass",
+})
+
+
+def _validate_scenario_meta(scenario: Any, path: pathlib.Path) -> None:
+    """驗證 meta.scenario 之規格與型別約束。"""
+    if not isinstance(scenario, dict):
+        raise ValueError(f"{path}: meta.scenario 必須是 dict")
+    rev = scenario.get("revision")
+    if not isinstance(rev, str) or not _REVISION_RE.match(rev):
+        raise ValueError(f"{path}: scenario.revision 格式錯誤: {rev!r}")
+    seed = scenario.get("seed")
+    if not isinstance(seed, int) or isinstance(seed, bool):
+        raise ValueError(f"{path}: scenario.seed 必須為整數: {seed!r}")
+    caps = scenario.get("capabilities")
+    if not isinstance(caps, list) or not caps:
+        raise ValueError(f"{path}: scenario.capabilities 必須為非空 list")
+    timeout_s = scenario.get("timeout_s")
+    if not isinstance(timeout_s, (int, float)) or timeout_s <= 0:
+        raise ValueError(f"{path}: scenario.timeout_s 必須 > 0: {timeout_s!r}")
+    invariants = scenario.get("invariants")
+    if not isinstance(invariants, list):
+        raise ValueError(f"{path}: scenario.invariants 必須為 list")
+    unknown = set(invariants) - _ALLOWED_INVARIANTS
+    if unknown:
+        raise ValueError(f"{path}: scenario.invariants 包含未知 ID: {unknown}")
+    expected = scenario.get("expected")
+    if expected != "PASS":
+        raise ValueError(f"{path}: scenario.expected 必須為 'PASS': {expected!r}")
+
+
 def load_test_case(path: pathlib.Path) -> TestCase:
     """從 YAML 檔案載入 TestCase。"""
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -33,6 +72,10 @@ def load_test_case(path: pathlib.Path) -> TestCase:
         raise ValueError(f"{path}: YAML 頂層必須是 dict")
 
     meta = raw.get("meta") or {}
+    scenario = meta.get("scenario") or raw.get("scenario")
+    if scenario is not None:
+        _validate_scenario_meta(scenario, path)
+
     return TestCase(
         name=meta.get("name", path.stem),
         category=meta.get("category", "unknown"),
@@ -45,7 +88,7 @@ def load_test_case(path: pathlib.Path) -> TestCase:
         env_files=raw.get("env_files") or {},
         steps=raw.get("steps") or [],
         bridge=raw.get("bridge") or {"applicable": False, "compare": "none"},
-        scenario=meta.get("scenario") or raw.get("scenario"),
+        scenario=scenario,
         source_path=str(path),
     )
 

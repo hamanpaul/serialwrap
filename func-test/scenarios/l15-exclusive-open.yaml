@@ -1,0 +1,61 @@
+---
+meta:
+  name: l15-exclusive-open
+  category: l15-scenario
+  severity: critical
+  description: "端點被外部獨占持有時 attach 回 DEVICE_STILL_HELD 且零 TX，釋放後成功取得（§15.7.1）"
+  scenario:
+    revision: "2026-10-15.1"
+    seed: 1015
+    capabilities: [posix_pty, process_rpc]
+    timeout_s: 60
+    invariants: [no_reopen_before_handoff, zero_tx_on_reject]
+    behavior_changes: []
+    expected: PASS
+    daemon_slice: "2.1"
+bridge: {applicable: true, only: true, compare: full}
+target:
+  platform: prpl
+  boot_banner: "boot done\r\nroot@prplOS:/# "
+  noise: {enabled: false}
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+profile:
+  prompt_regex: '(?m)^root@prplOS:.*# '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+steps:
+  - action: wait_ready
+    timeout_s: 20
+  - action: op_begin
+    op_id: release
+  - action: cli
+    argv: ["device", "release", "--selector", "COM0"]
+    expect: {ok: true}
+  - action: op_end
+    op_id: release
+  - action: assert_peer_closed
+    at_op: release
+    until_op: release
+  - action: hold_endpoint
+    mode: excl
+    seconds: 30
+    save_as: held_ep
+    expect: {opened: true}
+  - action: op_begin
+    op_id: attach-held
+  - action: cli
+    argv: ["device", "attach", "--selector", "COM0"]
+    expect: {ok: false, error_code: DEVICE_STILL_HELD}
+  - action: op_end
+    op_id: attach-held
+  - action: assert_zero_tx
+    op_id: attach-held
+  - action: release_endpoint
+    from: held_ep
+  - action: cli
+    argv: ["device", "attach", "--selector", "COM0"]
+    expect: {ok: true}
+  - action: wait_ready
+    timeout_s: 20
+  - action: assert_compare

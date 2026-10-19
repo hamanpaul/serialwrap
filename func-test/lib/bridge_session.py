@@ -164,6 +164,7 @@ class BridgeSession:
                     if not isinstance(control_info, str):
                         raise StepError("bridge BRIDGE_READY 缺少 control_info")
                     self.control_info = _PATH_CLASS(control_info)
+                    self.ready_item = item
                     from uart_stdio_bridge.bridge.control import ControlClient
 
                     self._control_client = ControlClient(self.control_info, timeout_s=30.0)
@@ -237,20 +238,55 @@ class BridgeSession:
             "wire_seq": int(result.get("wire_seq", 0)),
         }
 
+    def _attach_peer_open(self, snap: dict[str, Any]) -> dict[str, Any]:
+        peer_open = None
+        if self._control_client is not None:
+            try:
+                st = self.call("status")
+                peer_open = st.get("peer_open")
+            except Exception:
+                pass
+        snap["peer_open"] = peer_open
+        return snap
+
+    def describe(self) -> dict[str, Any]:
+        """回傳端點描述資訊（如 slave_path, com 與當下 peer_open）。"""
+        res: dict[str, Any] = {}
+        if hasattr(self, "ready_item") and isinstance(self.ready_item, dict):
+            if "slave_path" in self.ready_item:
+                res["slave_path"] = self.ready_item["slave_path"]
+            if "com" in self.ready_item:
+                res["com"] = self.ready_item["com"]
+        if self._control_client is not None:
+            try:
+                st = self.call("status")
+                res["peer_open"] = st.get("peer_open")
+            except Exception:
+                pass
+        return res
+
     def snapshot(self, *, settle: bool) -> dict[str, Any]:
         """取 WAL／wire 邊界；必要時重試到 offsets 與 WAL seq 穩定。"""
+        immediate_peer_open = None
+        if self._control_client is not None:
+            try:
+                st = self.call("status")
+                immediate_peer_open = st.get("peer_open")
+            except Exception:
+                pass
+
         if not settle:
             wire_raw = self.call("barrier", {"mode": "passive", "quiet_ms": 0, "timeout_ms": 500})
             seq = self._wal_current_seq()
             wire = self._wire_result(wire_raw)
-            return {"settled": wire_raw.get("settled") is True, "wal_seq": seq, "wire": wire}
+            return {"settled": wire_raw.get("settled") is True, "wal_seq": seq, "wire": wire, "peer_open": immediate_peer_open}
 
         if self.quiesce:
             first: dict[str, Any] = {}
             try:
                 first = self.call("barrier", {"mode": "quiesce", "quiet_ms": self._quiet_ms, "timeout_ms": 5000})
                 if first.get("settled") is not True:
-                    return {"settled": False, "wal_seq": self._wal_current_seq(), "wire": self._wire_result(first)}
+                    return {"settled": False, "wal_seq": self._wal_current_seq(), "wire": self._wire_result(first), "peer_open": immediate_peer_open}
                 for _ in range(10):
                     seq1 = self._wal_current_seq()
                     time.sleep(self._quiet_ms / 1000)
@@ -263,8 +299,8 @@ class BridgeSession:
                     wire1 = self._wire_result(first)
                     wire2 = self._wire_result(second)
                     if second.get("settled") is True and wire1["offsets"] == wire2["offsets"]:
-                        return {"settled": True, "wal_seq": seq2, "wire": wire2}
-                return {"settled": False, "wal_seq": self._wal_current_seq(), "wire": self._wire_result(first)}
+                        return {"settled": True, "wal_seq": seq2, "wire": wire2, "peer_open": immediate_peer_open}
+                return {"settled": False, "wal_seq": self._wal_current_seq(), "wire": self._wire_result(first), "peer_open": immediate_peer_open}
             finally:
                 try:
                     self.call("resume_pump", {"dir": "RX"})
@@ -288,8 +324,8 @@ class BridgeSession:
                 and seq1 == seq2
                 and wire1["offsets"] == wire2["offsets"]
             ):
-                return {"settled": True, "wal_seq": seq2, "wire": wire2}
-        return {"settled": False, "wal_seq": self._wal_current_seq(), "wire": wire2}
+                return {"settled": True, "wal_seq": seq2, "wire": wire2, "peer_open": immediate_peer_open}
+        return {"settled": False, "wal_seq": self._wal_current_seq(), "wire": wire2, "peer_open": immediate_peer_open}
 
     def checkpoint(self) -> pathlib.Path:
         """要求 bridge 落下 wire/control 一致前綴 checkpoint。"""

@@ -116,7 +116,40 @@ bridge:                   # 外部 bridge 模式的適用性與證據比較
   secrets_from_env: []     # 可選；列出需遮蔽的環境變數名稱
 ```
 
+### 情境測試結構（meta.scenario）
+
+L1.5 外部情境測試與平台情境檔在 `meta` 下增加 `scenario` 宣告區段（§15.7.1）：
+
+```yaml
+meta:
+  name: l15-reject-zero-tx
+  category: l15-scenario
+  severity: critical
+  description: "含換行或超長命令被拒時，外部 serial_read 與 WAL TX 皆為零"
+  scenario:
+    revision: "2026-10-15.1"               # 格式 ^\d{4}-\d{2}-\d{2}\.\d+$
+    seed: 1015                            # 隨機種子整數
+    capabilities: [posix_pty, process_rpc] # 所需前置能力清單
+    timeout_s: 60                         # 逾時秒數
+    invariants:                           # 宣告的不變量（必須有對應 enforcer 步驟）
+      - zero_tx_on_reject
+      - insufficient_evidence_not_pass
+    behavior_changes: []                  # 關聯的行為變更標記
+    expected: PASS                        # 預期結果
+bridge: {applicable: true, only: true, compare: full}
+```
+
+不變量清單（§11.3 六個核心不變量）：
+- `zero_tx_on_reject`: 被拒命令在 wire 與 WAL TX 皆為零（由 `assert_zero_tx` 強制）。
+- `no_forbidden_interleave`: 輸出串流無非法交錯（由 `assert_wire_contiguous` 強制）。
+- `no_stale_context_replay`: 舊上下文輸入不在切換後送出（由 `assert_wire_absent` 強制）。
+- `no_reopen_before_handoff`: 交接完成前不重開端點（POSIX 由 `assert_peer_closed` 強制；Windows 以 `hold_endpoint` 獨占驗證）。
+- `no_auto_resend`: 命令不自動重送（由 `assert_command_resolved` 或 `assert_wire_contiguous` 強制）。
+- `insufficient_evidence_not_pass`: 證據不足不得轉為 PASS（由 `assert_compare`、`assert_zero_tx` 或 `assert_wal_meta` 強制）。
+
 ## 支援的 action
+
+### 基礎通用 action
 
 | Action | 說明 |
 |--------|------|
@@ -141,6 +174,36 @@ bridge:                   # 外部 bridge 模式的適用性與證據比較
 | `wait_state` | 輪詢 session，直到進入指定狀態 |
 
 `console_write.input_raw` 依 Latin-1 字元值逐 byte 傳送，適合 ESC、Tab 等特殊按鍵；超出 U+00FF 的字元會使該步驟失敗。
+
+### Bridge 專用協調 action（Task 11）
+
+僅在 `--mode bridge` 模式可用；在 `pty` 模式執行會拋出 `StepError("bridge-only action")`：
+
+| Action | 參數 | 說明 |
+|--------|------|------|
+| `op_begin` | `op_id`、`settle`（預設 true） | 標記操作區間起點，寫入 correlation `op_start` 並記錄 snapshot |
+| `op_end` | `op_id`、`settle`（預設 true） | 標記操作區間終點，寫入 correlation `op_end` 並記錄 snapshot |
+| `bridge_control` | `action_name`、`params`、`expect_error` | 呼叫外部 bridge 控制介面（如 `transport_disconnect`、`transport_reconnect`） |
+| `dut_control` | `msg` | `bridge_control dut_control` 的簡寫，發送控制訊息給 DUT |
+| `wait_wire_marker` | `marker`、`observation`（預設 `serial_read`）、`timeout_s` | 在 wire 串流中搜尋指定 marker，逾時拋出 StepError |
+| `assert_zero_tx` | `op_id` | 驗證指定 op 區間內 wire `serial_read` 與 WAL TX 增量皆為零 |
+| `assert_wire_contiguous` | `payloads`（list[str]） | 驗證各 payload 在 wire `serial_read` 串流中連續出現且未被交錯切斷 |
+| `assert_compare` | `until_op`（可選） | 立即觸發比較器 checkpoint 比對，非 PASS 即失敗 |
+| `wal_control` | `op`（`unlink_current` \| `hold_reader` \| `reset`）、`seconds` | 操縱 WAL 檔案（刪除現行檔、持有 reader handle 或重置） |
+| `assert_wal_meta` | `contains_value`、`loss_flag`、`has_keys` | 驗證 WAL META 紀錄欄位與 loss 標記（如外部刪檔後重建） |
+| `assert_wal_marker` | `marker`、`dir`（`TX` \| `RX`） | 驗證 WAL 紀錄中包含指定 marker 且 CRC32 正確 |
+| `assert_command_resolved` | `from`、`timeout_s`、`payload` | 驗證在途命令收斂至終態且 wire 串流出現次數 ≤1（被拒命令出現 0 次） |
+| `assert_wire_absent` | `marker`、`after_op`、`observation`（預設 `serial_read`） | 驗證在指定 op 結束後，wire 串流中未出現該 marker（舊上下文無殘留） |
+| `assert_peer_closed` | `at_op`、`until_op` | 驗證在 `at_op` 結束時端點已關閉（`peer_open` 為 false）且至 `until_op` 開始前未重開 |
+| `hold_endpoint` | `mode`（`open` \| `flock` \| `excl`）、`seconds`、`save_as`、`expect` | 測試替身佔用受測序列埠/PTY slave，回傳 `{"opened": bool, "error": str}` |
+| `release_endpoint` | `from` | 提前釋放 `hold_endpoint` 取得的序列埠/PTY handle（清除 TIOCEXCL） |
+
+## 變數展開規則
+
+runner 支援在字串參數中透過 `{...}` 參照與衍生變數：
+- `{save_as.field}`：參照先前記住的步驟結果欄位（例如 `{st.status}`、`{ok1.cmd_id}`）。
+- `{save_as.limits.max_submit_cmd_bytes_plus_one_x}`：對任何整數欄位 `F`，`F_plus_one_x` 會衍生展開為長度 `F+1` 的 `"x"` 字串（常用於邊界與超長拒絕測試）。
+- `{N_x}`：字元重複語法，例如 `{15980_x}` 展開為長度 15980 的 `"x"` 字串（用於精確構造接近緩衝區上限的 payload）。
 
 ## 與 unittest 的差異
 
