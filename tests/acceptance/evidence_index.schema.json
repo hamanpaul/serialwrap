@@ -37,7 +37,8 @@
         "artifact_path",
         "sha256",
         "status",
-        "owner"
+        "owner",
+        "required_layer"
       ],
       "properties": {
         "id": {
@@ -85,6 +86,19 @@
         "owner": {
           "type": "string",
           "minLength": 1
+        },
+        "required_layer": {
+          "enum": [
+            "L1",
+            "L1.5-local",
+            "L1.5-docker",
+            "host-throwaway",
+            "native-windows",
+            "L2-bench",
+            "L3-bench",
+            "hw-bench"
+          ],
+          "description": "最低可接受證據層級；L1 由 l1_judge 判定。"
         },
         "platform": {
           "enum": [

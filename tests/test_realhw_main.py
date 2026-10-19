@@ -176,3 +176,17 @@ def test_main_argv_default_uses_sys_argv(monkeypatch, tmp_path):
 
     assert realhw_main.main() == 0
     assert (report_dir / "report.json").is_file()
+
+
+def test_main_loads_explicit_config_argument(monkeypatch, tmp_path):
+    config = tmp_path / "docker-config.json"
+    config.write_text("{}\n", encoding="utf-8")
+    loaded = []
+
+    def load_cfg(path=None, **kwargs):
+        loaded.append(path)
+        return {}
+
+    monkeypatch.setattr(realhw_main.harness, "load_cfg", load_cfg)
+    assert realhw_main.main(["--config", str(config), "--tier", "p0", "--list"]) == 0
+    assert loaded == [config]

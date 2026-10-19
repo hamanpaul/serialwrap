@@ -48,6 +48,7 @@ def _complete(report: dict) -> dict:
     out.setdefault("markexpr", "")
     out.setdefault("counts", {})
     out.setdefault("resources", {})
+    out.setdefault("uart_kind", "native")
     out.setdefault("not_collected_platform", [])
     out.setdefault("core_portable_platform_skips", [])
     out.setdefault("deployed_content", None)
@@ -83,6 +84,26 @@ def test_l1_judge_single_pass_not_enough() -> None:
     junit = {"tests": 1, "failures": 0, "errors": 0, "skipped": 0}
     verdict_junit = _judge(report, required, platform="linux", junit=junit)
     assert verdict_junit["verdict"] == "INSUFFICIENT"
+
+
+@pytest.mark.memory_only
+def test_l1_judge_pty_fake_cannot_satisfy_physical_uart():
+    required = ["tests/test_uart.py::test_device"]
+    report = {
+        "format": "l1-results.v1",
+        "platform": "linux",
+        "uart_kind": "pty-fake",
+        "finished": True,
+        "exit_code": 0,
+        "collected": required,
+        "deselected": [],
+        "resources": {"physical_uart": {"passed": 1, "failed": 0, "skipped": 0}},
+        "results": [{"nodeid": required[0], "outcome": "passed", "skip_kind": None,
+                     "phases": {"setup": "passed", "call": "passed", "teardown": "passed"}}],
+    }
+    verdict = _judge(report, required, platform="linux")
+    assert verdict["verdict"] == "INSUFFICIENT"
+    assert "uart_kind_not_native" in verdict["reasons"]
 
 
 @pytest.mark.memory_only
@@ -776,6 +797,7 @@ def _write_platform_evidence(base: Path, plat: str, argv: list[str], nodeids: li
     report = {
         "schema_version": 2, "format": "l1-results.v1", "runner": "pytest", "platform": plat,
         "argv": ["/x/pytest/__main__.py", *argv], "markexpr": "", "counts": {}, "resources": {},
+        "uart_kind": "native",
         "not_collected_platform": [], "core_portable_platform_skips": [],
         "collected": list(nodeids), "deselected": [], "results": results,
         "exit_code": 1 if fail_nid else 0, "finished": True, "deployed_content": None,

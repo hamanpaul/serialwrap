@@ -50,6 +50,7 @@ def _write_l1_pass_artifacts(base: pathlib.Path, set_id: str, platforms: list[st
             "markexpr": spec["selector"]["markexpr"],
             "counts": {},
             "resources": {},
+            "uart_kind": "native",
             "not_collected_platform": [],
             "collected": nodeids,
             "deselected": [],
@@ -135,9 +136,37 @@ def test_evidence_index_schema_and_check(tmp_path: pathlib.Path):
             continue
         file_path = mock_root / rel_path
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        dummy_content = f"dummy artifact content for {item['id']}\n".encode("utf-8")
+        required_layer = item.get("required_layer")
+        strict_layers = {"L1.5-docker", "host-throwaway", "native-windows", "L2-bench", "L3-bench", "hw-bench"}
+        if required_layer in strict_layers and file_path.suffix.lower() == ".json":
+            uart_kind = "pty-fake" if required_layer == "L1.5-docker" else "native"
+            report = {
+                "producer": "test-evidence-index-fixture",
+                "evidence_layer": required_layer,
+                "uart_kind": uart_kind,
+                "results": [{"case_id": item["id"], "verdict": "PASS"}],
+            }
+            if required_layer == "L1.5-docker":
+                report.update({
+                    "topology": "docker-2c",
+                    "image_digests": {name: "sha256:" + "a" * 64
+                                      for name in ("serialwrap", "dut-sim", "systemd")},
+                    "implementation": "python",
+                    "package_tree_sha256": "a" * 64,
+                })
+            dummy_content = (json.dumps(report, sort_keys=True) + "\n").encode("utf-8")
+        else:
+            dummy_content = f"dummy artifact content for {item['id']}\n".encode("utf-8")
         file_path.write_bytes(dummy_content)
         item["sha256"] = hashlib.sha256(dummy_content).hexdigest()
+        if required_layer in {"native-windows", "L2-bench", "L3-bench", "hw-bench"} and file_path.suffix.lower() != ".json":
+            sidecar = file_path.with_name(file_path.name + ".evidence.json")
+            sidecar.write_text(json.dumps({
+                "producer": "test-evidence-index-fixture",
+                "evidence_layer": required_layer,
+                "uart_kind": "native",
+                "results": [{"case_id": item["id"], "verdict": "PASS"}],
+            }), encoding="utf-8")
 
     mock_index = mock_acc / "stage0_evidence_index.yaml"
     mock_index.write_text(yaml.safe_dump(temp_index_data), encoding="utf-8")
@@ -221,6 +250,22 @@ def test_evidence_index_rejects_missing_required_item(tmp_path: pathlib.Path):
     proc = _run_checker(_checker_root(tmp_path, data))
     assert proc.returncode == 1, f"expected FAIL, got {proc.returncode}:\n{proc.stderr}"
     assert "missing_required_item S0-B13-WIN-COM-CI-RUNNER" in proc.stderr
+
+
+@pytest.mark.process_rpc
+@pytest.mark.parametrize("item_id", [
+    "S0-L15-DOCKER-48H-LINUX",
+    "S0-L15-DOCKER-SUPERVISION-72H-USER",
+    "S0-L15-DOCKER-SUPERVISION-72H-SYSTEM",
+    "S0-L15-DOCKER-SYSTEMD-USER",
+    "S0-L15-DOCKER-SYSTEMD-SYSTEM",
+])
+def test_evidence_index_rejects_missing_docker_required_item(tmp_path: pathlib.Path, item_id: str):
+    data = _load_index()
+    data["items"] = [item for item in data["items"] if item["id"] != item_id]
+    proc = _run_checker(_checker_root(tmp_path, data))
+    assert proc.returncode == 1, f"expected FAIL, got {proc.returncode}:\n{proc.stderr}"
+    assert f"missing_required_item {item_id}" in proc.stderr
 
 
 @pytest.mark.process_rpc

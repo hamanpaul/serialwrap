@@ -46,6 +46,17 @@ def test_label_report_rejects_unknown_and_conflicting_layer():
                         uart_kind="pty-fake", image_digests={"serialwrap": "sha256:" + "a" * 64})
     assert r["evidence_layer"] == "L1.5-docker" and r["producer"] == "run-l15.sh"
     assert r["topology"] == "docker-2c" and r["uart_kind"] == "pty-fake"
+    with pytest.raises(ValueError, match="producer_missing"):
+        el.label_report({}, evidence_layer="L1.5-docker", producer=" ", topology="docker-2c", uart_kind="pty-fake")
+    with pytest.raises(ValueError, match="uart_kind_unknown"):
+        el.label_report({}, evidence_layer="L1.5-docker", producer="run-l15.sh", topology="docker-2c",
+                        uart_kind="virtual")
+    with pytest.raises(ValueError, match="evidence_layer_unknown"):
+        el.label_report({}, evidence_layer=["L1.5-docker"], producer="run-l15.sh", topology="docker-2c",
+                        uart_kind="pty-fake")
+    with pytest.raises(ValueError, match="evidence_report_invalid"):
+        el.label_report([], evidence_layer="L1.5-docker", producer="run-l15.sh", topology="docker-2c",
+                        uart_kind="pty-fake")
 
 
 def test_fail_closed_missing_layer_for_docker_and_throwaway_producers():
@@ -56,6 +67,8 @@ def test_fail_closed_missing_layer_for_docker_and_throwaway_producers():
     with pytest.raises(ValueError, match="evidence_layer_unknown"):
         el.validate_report_layer({"producer": "run-l15.sh", "evidence_layer": "L2"})
     assert el.validate_report_layer({"producer": "run-l15.sh", "evidence_layer": "L1.5-docker"}) == "L1.5-docker"
+    with pytest.raises(ValueError, match="evidence_layer_unknown"):
+        el.validate_report_layer({"evidence_layer": ["L1.5-docker"]})
 
 
 def test_assert_not_real_board():
@@ -67,3 +80,5 @@ def test_assert_not_real_board():
     with pytest.raises(AssertionError):
         el.assert_not_real_board({"evidence_layer": "L1.5-docker", "counts_as": ["L2-bench"]}, "L1.5-docker")
     el.assert_not_real_board({"evidence_layer": "L1.5-docker", "counts_as": ["L1.5-local"]}, "L1.5-docker")
+    with pytest.raises(AssertionError):
+        el.assert_not_real_board({"evidence_layer": "L1.5-docker", "counts_as": [1]}, "L1.5-docker")

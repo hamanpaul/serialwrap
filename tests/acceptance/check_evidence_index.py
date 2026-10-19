@@ -11,7 +11,8 @@ schema 取自本檔同目錄的 evidence_index.schema.json。--root 預設為 re
   schema     索引符合 evidence_index.schema.json；單案例列（case_ids 非空）必填 platform 與 evidence。
   stage      索引的 stage 與 --stage 一致。
   ids        item id 不重複；artifact_path 不重複、不得為絕對路徑或含 ..；case_ids 皆為 cases.yaml 已知案例。
-  file       status 為 present 的項目：檔案存在且 sha256 與實際相符（只驗完整性，不讀取 artifact 內容）。
+  file       status 為 present 的項目：檔案存在且 sha256 與實際相符。
+  layer      Docker、throwaway、Windows 與 bench 證據須有有效來源標記；Docker 結果須全 PASS。
   evidence   單案例列的 evidence 必為該案例 cases.yaml evidence 清單之一，artifact_path 須對應該檔名（目錄以 / 結尾者比對路徑段）。
   cover      （stage 0）每個 stage0_required 案例，對其每個適用平台（linux；windows 限 windows_status native／ported）
              與 evidence 清單中每一項，都必須有至少一列覆蓋（§11.6、§15.12：逐檔登錄，不得只靠單一報告）。
@@ -27,11 +28,10 @@ schema 取自本檔同目錄的 evidence_index.schema.json。--root 預設為 re
              缺 l1_set 即 FAIL，不得退回只核對 sha256。
 
 退出碼：
-  0  索引完整、所有 present 項檔案完整性相符，且無 missing／blocked_owner 項目。
-     注意：exit 0 不是 verdict PASS；checker 不讀取 artifact 內容，FAIL 或 INSUFFICIENT 的報告只要 sha256 相符仍會 exit 0。
+  0  索引完整、所有 present 項檔案完整性與來源標記相符，且無 missing／blocked_owner 項目。
   1  FAIL：schema 不合、stage 不符、重複 id／路徑、路徑不安全、未知案例、evidence 不屬該案例、
-     檔名不對應、present 項檔案缺失或 sha256 不符、覆蓋缺口、必要項目缺列
-  2  用法或輸入錯誤（索引／案例檔不存在、stage 參數不合法；--index／--cases 指定的路徑不存在亦同）
+     檔名不對應、present 項檔案缺失或 sha256 不符、來源標記／報告無效、覆蓋缺口、必要項目缺列
+  2  用法或輸入錯誤（索引／案例檔不存在、stage 參數不合法、item 缺 required_layer；--index／--cases 指定路徑不存在亦同）
   5  BLOCKED：無 FAIL，但存在 missing 或 blocked_owner 項目（不得視為通過）
 
 BLOCKED 與 FAIL 同時存在時回 1（FAIL 優先）。
@@ -65,6 +65,7 @@ EXIT_OK = 0
 EXIT_FAIL = 1
 EXIT_USAGE = 2
 EXIT_BLOCKED = 5
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 STAGE_RE = re.compile(r"^[0-9][a-z]?$")
 
@@ -90,10 +91,17 @@ STAGE0_REQUIRED_ITEM_IDS = frozenset({
     "S0-B13-WIN-COM-CI-RUNNER",
     "S0-B14-CROSS-OS-BENCH-MUTEX",
     "S0-B15-BENCH-NOT-SUBSTITUTED",
+    "S0-SPIKE1-REMAINING",
+    "S0-WIN-TASK-THROWAWAY-72H",
     "S0-BLOCKED-P2-1-MCU-MANUAL-FLASH-LOG",
     "S0-BLOCKED-P2-1-MCU-MANUAL-PROCEDURE-CHECKLIST",
     "S0-BLOCKED-P2-1-MCU-MANUAL-DAEMON-STATUS-BEFORE",
     "S0-BLOCKED-P2-1-MCU-MANUAL-DAEMON-STATUS-AFTER",
+    "S0-L15-DOCKER-48H-LINUX",
+    "S0-L15-DOCKER-SUPERVISION-72H-USER",
+    "S0-L15-DOCKER-SUPERVISION-72H-SYSTEM",
+    "S0-L15-DOCKER-SYSTEMD-USER",
+    "S0-L15-DOCKER-SYSTEMD-SYSTEM",
 })
 REQUIRED_ITEM_IDS_BY_STAGE: dict[str, frozenset[str]] = {"0": STAGE0_REQUIRED_ITEM_IDS}
 
@@ -241,11 +249,106 @@ def _present_problems(item: dict[str, Any], root: pathlib.Path) -> list[str]:
     return []
 
 
+def _load_evidence_labels() -> Any:
+    """由同目錄載入標記 helper，讓 checker 仍可獨立以腳本方式執行。"""
+    spec = importlib.util.spec_from_file_location("sw_evidence_labels", HERE / "evidence_labels.py")
+    if spec is None or spec.loader is None:
+        raise ImportError("cannot load evidence_labels.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _present_layer_problems(item: dict[str, Any], root: pathlib.Path) -> list[str]:
+    """校驗 present 證據的來源、層級與可用結果；L1 交由唯一的 l1_judge 判定。"""
+    required = item.get("required_layer")
+    if required == "L1":
+        return []
+    rel = item.get("artifact_path")
+    if not isinstance(rel, str):
+        return []
+    path = root / rel
+    if not path.is_file():
+        return []
+    labels = _load_evidence_labels()
+    iid = item.get("id", "<no-id>")
+    strict_layers = {"L1.5-docker", "host-throwaway", "native-windows", *labels.REAL_LAYERS}
+    if pathlib.PurePosixPath(rel).suffix.lower() != ".json":
+        if required not in labels.REAL_LAYERS and required != "native-windows":
+            return ([f"evidence_report_invalid {iid}: 必須使用 JSON 證據報告"]
+                    if required in strict_layers else [])
+        # 非 JSON native/真板 artifact（例如 report.md、junit.xml）必須有同名 .evidence.json 標記 sidecar。
+        path = path.with_name(path.name + ".evidence.json")
+        if not path.is_file():
+            return [f"evidence_label_missing {iid}: {path.name}"]
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        if required in strict_layers:
+            return [f"evidence_report_invalid {item.get('id', '<no-id>')}: {exc}"]
+        return []
+    if not isinstance(report, dict):
+        return ([f"evidence_report_invalid {iid}: JSON 根節點不是物件"]
+                if required in strict_layers else [])
+    if required not in strict_layers and "evidence_layer" not in report and report.get("producer") not in labels.FAIL_CLOSED_PRODUCERS:
+        return []
+    # 真板／實機 bench 的 JSON 報告（例：Task 15 gate.py 產出的 release-gate.json）依 Task 12／17 契約不必自帶標記；
+    # 缺標即拒收（fail-closed）只適用 docker／throwaway runner 產出者。帶有標記者仍照下列規則完整校驗。
+    if (required in labels.REAL_LAYERS and "evidence_layer" not in report
+            and report.get("producer") not in labels.FAIL_CLOSED_PRODUCERS
+            and report.get("uart_kind") in (None, "native")
+            and pathlib.PurePosixPath(rel).suffix.lower() == ".json"):
+        return []
+    try:
+        report_layer = labels.validate_report_layer(report)
+    except ValueError as exc:
+        return [f"{exc.args[0]} {iid}"]
+    producer = report.get("producer")
+    if not isinstance(producer, str) or not producer.strip():
+        return [f"evidence_producer_missing {iid}"]
+    uart_kind = report.get("uart_kind")
+    if not isinstance(uart_kind, str) or uart_kind not in labels.UART_KINDS:
+        return [f"uart_kind_invalid {iid}"]
+    if required in labels.REAL_LAYERS and uart_kind != "native":
+        return [f"uart_kind_not_native {iid}: {uart_kind}"]
+    try:
+        labels.assert_not_real_board(report, required)
+    except AssertionError:
+        return [f"evidence_layer_mismatch {iid}: throwaway/docker 不可滿足 {required}"]
+    if not labels.layer_satisfies(report_layer, required):
+        return [f"evidence_layer_mismatch {iid}: report={report_layer} required={required}"]
+    if report_layer in {"L1.5-docker", "host-throwaway", "native-windows"}:
+        results = report.get("results")
+        if not isinstance(results, list) or not results:
+            return [f"evidence_report_invalid {iid}: results 必須是非空陣列"]
+        if any(not isinstance(row, dict) or row.get("verdict") != "PASS" for row in results):
+            return [f"evidence_not_pass {iid}"]
+    if required == "L1.5-docker":
+        if report_layer != "L1.5-docker":
+            return [f"evidence_layer_mismatch {iid}: report={report_layer} required={required}"]
+        if report.get("topology") != "docker-2c":
+            return [f"evidence_topology_invalid {iid}"]
+        if uart_kind != "pty-fake":
+            return [f"uart_kind_invalid {iid}: Docker 證據必須為 pty-fake"]
+        images = report.get("image_digests")
+        expected_images = {"serialwrap", "dut-sim", "systemd"}
+        if (not isinstance(images, dict) or set(images) != expected_images
+                or any(not isinstance(value, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None
+                       for value in images.values())):
+            return [f"evidence_image_digests_invalid {iid}"]
+        implementation = report.get("implementation")
+        tree_key = "bundle_tree_sha256" if implementation == "rust" else "package_tree_sha256"
+        if implementation not in (None, "python", "rust") or not isinstance(report.get(tree_key), str) \
+                or _SHA256_RE.fullmatch(report[tree_key]) is None:
+            return [f"evidence_tree_digest_invalid {iid}"]
+    return []
+
+
 def verify_item(index_path: pathlib.Path, item_id: str, *, root: pathlib.Path) -> tuple[dict[str, Any] | None, list[str]]:
     """回傳索引中 `item_id` 的項目與違規清單（P2-T16）。
 
-    違規：項目不存在（`item_missing`）、status 非 present（`not_present`）、檔案缺失、路徑不安全、sha256 不符。
-    只適用單檔 present 項目；不讀取 artifact 內容，不做 CLI 的 stage 級檢查。
+    違規：項目不存在（`item_missing`）、status 非 present（`not_present`）、檔案缺失、路徑不安全、sha256 或證據標記不符。
+    只適用單檔 present 項目，不做 CLI 的 stage 級覆蓋檢查。
     """
     index = yaml.safe_load(index_path.read_text(encoding="utf-8")) or {}
     item = next((x for x in index.get("items") or [] if x.get("id") == item_id), None)
@@ -253,7 +356,7 @@ def verify_item(index_path: pathlib.Path, item_id: str, *, root: pathlib.Path) -
         return None, [f"item_missing {item_id}"]
     if item.get("status") != "present":
         return item, [f"not_present {item_id}: status={item.get('status')}"]
-    return item, _present_problems(item, root)
+    return item, _present_problems(item, root) + _present_layer_problems(item, root)
 
 
 def _path_matches_evidence(rel: str, evidence: str) -> bool:
@@ -296,9 +399,21 @@ def check(stage: str, root: pathlib.Path, index_path: pathlib.Path | None = None
 
     schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
     validator = jsonschema.Draft202012Validator(schema)
-    for err in sorted(validator.iter_errors(index), key=lambda e: list(e.path)):
+    schema_errors = sorted(validator.iter_errors(index), key=lambda e: list(e.path))
+    missing_required_layer = any(
+        err.validator == "required"
+        and isinstance(err.instance, dict)
+        and "required_layer" in (err.validator_value or [])
+        and "required_layer" not in err.instance
+        for err in schema_errors
+    )
+    for err in schema_errors:
         loc = "/".join(str(x) for x in err.path) or "<root>"
         fails.append(f"schema_invalid {loc}: {err.message}")
+    if schema_errors:
+        for line in fails:
+            print(f"[evidence-index] FAIL {line}", file=sys.stderr)
+        return EXIT_USAGE if missing_required_layer else EXIT_FAIL
 
     if str(index.get("stage")) != stage:
         fails.append(f"stage_mismatch index.stage={index.get('stage')!r} 與參數 --stage {stage} 不符")
@@ -344,6 +459,7 @@ def check(stage: str, root: pathlib.Path, index_path: pathlib.Path | None = None
             continue
         if status == "present":
             fails.extend(_present_problems(item, root))
+            blocked.extend(_present_layer_problems(item, root))
         elif status in ("missing", "blocked_owner"):
             blocked.append(f"{status} {iid}")
         elif rel and not _safe_relpath(rel):

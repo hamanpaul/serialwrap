@@ -107,6 +107,8 @@ def od09_env(
         "tests/acceptance/stage0_evidence_index.yaml",
         "tests/acceptance/check_evidence_index.py",
         "tests/acceptance/evidence_index.schema.json",
+        # checker 依同目錄載入的證據層級 helper（Task 17）；缺它則替身 repo 內的 checker 無法執行。
+        "tests/acceptance/evidence_labels.py",
     )
     for relative in source_files:
         source = ROOT / relative

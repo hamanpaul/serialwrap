@@ -6,7 +6,7 @@
   "type": "object",
   "required": [
     "schema_version", "format", "runner", "platform", "argv", "markexpr",
-    "counts", "resources", "not_collected_platform", "core_portable_platform_skips",
+    "counts", "resources", "uart_kind", "not_collected_platform", "core_portable_platform_skips",
     "collected", "deselected", "results", "exit_code", "finished", "deployed_content"
   ],
   "properties": {
@@ -24,6 +24,7 @@
       "type": "object",
       "additionalProperties": {"$ref": "#/$defs/tally"}
     },
+    "uart_kind": {"enum": ["native", "pty-fake"]},
     "not_collected_platform": {"type": "array", "items": {"type": "string"}},
     "core_portable_platform_skips": {"type": "array", "items": {"type": "string"}},
     "collected": {"type": "array", "items": {"type": "string"}},

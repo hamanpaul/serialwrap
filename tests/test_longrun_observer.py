@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import threading
+import importlib.util
 
 import pytest
 
@@ -197,7 +198,7 @@ def test_procscan_unknown_daemon_pid_is_not_claimed_empty(monkeypatch):
 
 @pytest.mark.parametrize("tokens, expected", [
     (["serialwrapd", "--socket", "/run/x.sock"], True),
-    (["/usr/bin/python3", "/home/u/.local/bin/serialwrapd", "--socket", "/run/x.sock"], True),
+    (["/usr/bin/python3", "/opt/serialwrap/bin/serialwrapd", "--socket", "/run/x.sock"], True),
     (["python3", "serialwrapd.py", "daemon"], True),
     (["python3", "-m", "sw_core.daemon"], True),
     (["python3", "-m", "serialwrapd"], True),
@@ -256,3 +257,42 @@ def test_observer_binding_rpc_error_does_not_abort(tmp_path):
     header = _read_rows(out)[0]
     assert header["device_binding"] == {"COM0": None, "COM1": None}
     assert any(row.get("kind") == "sample" for row in _read_rows(out))
+
+
+def _docker_runtime():
+    path = Path(__file__).resolve().parents[1] / "scripts/docker/runtime.py"
+    spec = importlib.util.spec_from_file_location("sw_docker_runtime", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec is not None and spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _write_observer(path: Path, times: list[float]) -> None:
+    rows = [{"kind": "header"}]
+    rows.extend({
+        "kind": "sample", "t_mono": stamp,
+        "daemon": {"ok": True, "pid": 4242, "multi_open": False},
+        "procscan": {"other_serialwrapd": []},
+        "sessions": {"COM0": "READY", "COM1": "READY"},
+    } for stamp in times)
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+
+def test_docker_observer_rejects_short_span_and_insufficient_samples(tmp_path):
+    runtime = _docker_runtime()
+    path = tmp_path / "observer.ndjson"
+    _write_observer(path, [0.0, 10.0])
+    metrics, failures, _header = runtime.read_observer(path, hours=1, interval_s=10.0)
+    assert metrics["observed_s"] == 10.0
+    assert "observer_duration_insufficient" in failures
+    assert "observer_sample_count_insufficient" in failures
+
+
+def test_docker_observer_rejects_large_gap_and_non_monotonic_timestamps(tmp_path):
+    runtime = _docker_runtime()
+    path = tmp_path / "observer.ndjson"
+    _write_observer(path, [0.0, 31.0, 30.0])
+    _metrics, failures, _header = runtime.read_observer(path, hours=0, interval_s=10.0)
+    assert "observer_timestamps_not_monotonic" in failures
+    assert "observer_gap_exceeded" in failures

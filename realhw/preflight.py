@@ -207,6 +207,9 @@ def _tools_missing(cfg: dict, *, os_name: str | None = None) -> list[str]:
     for tool in ("tmux", "minicom"):
         if not shutil.which(tool):
             missing.append(tool)
+    # Docker 假 UART 仍需測試前端；只豁免真機 USB/IP 與 sudo 工具。
+    if cfg.get("uart_kind") == "pty-fake":
+        return missing
     if not Path(cfg["usbipd_exe"]).exists():
         missing.append("usbipd")
     try:

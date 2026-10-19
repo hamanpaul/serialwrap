@@ -105,8 +105,55 @@ def _set_bc_status(node, bc_id: str, status: str) -> bool:
     return False
 
 
+def _valid_p1_gate_env(tmp_path: Path) -> dict[str, str]:
+    import yaml  # noqa: PLC0415
+
+    changes_path = tmp_path / "behavior_changes.yaml"
+    codes_path = tmp_path / "error_codes.yaml"
+    changes_path.write_text(yaml.safe_dump({"changes": [
+        {"id": item, "status": "IMPLEMENTED"}
+        for item in ("BC-01", "BC-02", "BC-03", "BC-04", "BC-05", "SC-34", "SC-35")
+    ]}), encoding="utf-8")
+    codes_path.write_text(yaml.safe_dump({"codes": [{"code": "DRAIN_STALLED"}]}), encoding="utf-8")
+    return {"SW_BC_PATH": str(changes_path), "SW_ERROR_CODES_PATH": str(codes_path)}
+
+
+def _bundle_fixture(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    binaries = path / "bin"
+    binaries.mkdir()
+    files = {}
+    for name in ("serialwrap", "serialwrapd"):
+        target = binaries / name
+        target.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        target.chmod(0o755)
+        files[name] = hashlib.sha256(target.read_bytes()).hexdigest()
+    zeros40 = "0" * 40
+    zeros64 = "0" * 64
+    manifest = {
+        "schema_version": 1, "bundle_version": "0.1.0", "stage": "test", "created_at": "fixture",
+        "target": "linux", "git_revision": zeros40, "contract_revision": zeros40,
+        "components": {
+            "cli": {"implementation": "rust", "version": "0.1.0", "git_revision": zeros40,
+                    "path": "bin/serialwrap", "sha256": files["serialwrap"]},
+            "daemon": {"implementation": "rust", "version": "0.1.0", "git_revision": zeros40,
+                       "launcher": {"path": "bin/serialwrapd", "sha256": files["serialwrapd"]},
+                       "entry": ["bin/serialwrapd"],
+                       "runtime": {"path": "runtime", "python_version": "3.12", "sha256": zeros64},
+                       "package": {"name": "serialwrap", "version": "0.1.0", "wheel_sha256": zeros64,
+                                   "tree_sha256": zeros64}},
+            "python_cli_delegate": {"entry": ["python3"], "tree_sha256": zeros64},
+            "assets": {"skill_sha256": zeros64, "skill_windows_sha256": zeros64, "profiles_sha256": zeros64},
+            "supervisor": {"default_mode": "on-demand", "definition_sha256": zeros64},
+        },
+        "pairing": {"rule": "exact", "cli_version": "0.1.0", "daemon_version": "0.1.0"},
+    }
+    (path / "release-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return path
+
+
 def _checker_run(tmp_path: Path, report: dict, required_layer: str | None) -> subprocess.CompletedProcess:
-    """建立含合成證據索引的暫存 repo（tests/acceptance 整棵複製後覆寫 stage0 索引），以 --stage 0 執行 checker。"""
+    """保留 Stage 0 正式索引，只追加不承接 case 覆蓋的合成標記項目。"""
     import yaml  # noqa: PLC0415
 
     _require(CHECKER, "Task 12 check_evidence_index.py")
@@ -121,7 +168,7 @@ def _checker_run(tmp_path: Path, report: dict, required_layer: str | None) -> su
         "id": "S0-SYNTH-LAYER",
         "requirement": "OD-15 證據層級合成項",
         "spec_ref": "OD-15",
-        "case_ids": ["sm-01-attach-to-ready"],
+        "case_ids": [],
         "artifact_path": rel.as_posix(),
         "sha256": hashlib.sha256(payload).hexdigest(),
         "status": "present",
@@ -129,12 +176,16 @@ def _checker_run(tmp_path: Path, report: dict, required_layer: str | None) -> su
     }
     if required_layer is not None:
         item["required_layer"] = required_layer
-    index = {"schema_version": 1, "stage": "0", "items": [item]}
+    # 保留正式 Stage 0 分母與 case 覆蓋，只追加單一合成項目供層級規則測試。
+    index = yaml.safe_load((repo / "tests" / "acceptance" / "stage0_evidence_index.yaml").read_text(encoding="utf-8"))
+    index["items"].append(item)
     (repo / "tests" / "acceptance" / "stage0_evidence_index.yaml").write_text(
         yaml.safe_dump(index, allow_unicode=True, sort_keys=False), encoding="utf-8")
     return subprocess.run(
         [sys.executable, str(repo / "tests" / "acceptance" / "check_evidence_index.py"),
-         "--stage", "0", "--root", str(evidence)],
+         "--stage", "0", "--root", str(evidence),
+         "--index", str(repo / "tests" / "acceptance" / "stage0_evidence_index.yaml"),
+         "--cases", str(repo / "tests" / "acceptance" / "cases.yaml")],
         cwd=repo, capture_output=True, text=True, timeout=120,
     )
 
@@ -169,6 +220,7 @@ def test_compose_no_real_serial_devices():
                 for bad in FORBIDDEN_DEVICES:
                     assert bad not in text, f"{name}.{key} 含真實裝置路徑 {bad}"
         assert svc.get("privileged", False) is False, f"{name} 不得 privileged"
+        assert "cap_add" not in svc, f"{name} 不得新增超出 systemd 容器政策的 capabilities"
         # systemd profile 的例外只允許 cgroup: host 與 /sys/fs/cgroup 掛載；其他服務一律不得使用
         systemd = any(str(p).startswith("systemd") for p in (svc.get("profiles") or []))
         if systemd:
@@ -194,22 +246,64 @@ def test_run_l15_dry_run_labels_report():
     r = _run_script(RUN_L15, "pytest-physical-uart", "--dry-run")
     assert r.returncode == 0, _tail(r)
     assert "--evidence-layer L1.5-docker" in r.stdout
+    assert "-m posix_pty" in r.stdout
+    assert "-m physical_uart" not in r.stdout
 
 
 @pytest.mark.process_rpc
-def test_run_systemd_dry_run_asserts_dropin():
-    r = _run_script(RUN_SYSTEMD, "--mode", "systemd-user", "--dry-run")
+def test_run_l15_dry_run_uses_full_suite_by_default(tmp_path):
+    bundle = _bundle_fixture(tmp_path / "bundle")
+    r = _run_script(RUN_L15, "func-test-bridge", "--dry-run", "--bundle", str(bundle))
+    assert r.returncode == 0, _tail(r)
+    assert "--scenarios" in r.stdout
+    assert "--case" not in r.stdout
+    assert f"{bundle}:/opt/sw-bundle:ro" in r.stdout
+
+
+@pytest.mark.process_rpc
+def test_run_l15_refuses_invalid_bundle_before_dry_run(tmp_path):
+    r = _run_script(RUN_L15, "func-test-bridge", "--dry-run", "--bundle", str(tmp_path))
+    assert r.returncode == 2, _tail(r)
+    assert "bundle manifest 無效" in r.stderr
+
+
+@pytest.mark.process_rpc
+@pytest.mark.parametrize(
+    ("suite", "expected"),
+    [("realhw-p0p1", "--tier p0\\,p1"), ("regression-nondestructive", "testpilot --root")],
+)
+def test_run_l15_dry_run_uses_suite_entrypoint(suite, expected):
+    r = _run_script(RUN_L15, suite, "--dry-run")
+    assert r.returncode == 0, _tail(r)
+    assert expected in r.stdout
+
+
+@pytest.mark.process_rpc
+def test_run_systemd_dry_run_asserts_dropin(tmp_path):
+    r = _run_script(RUN_SYSTEMD, "--mode", "systemd-user", "--dry-run", env=_valid_p1_gate_env(tmp_path))
     assert r.returncode == 0, _tail(r)
     assert "systemctl --user show serialwrap -p Restart -p RefuseManualStart" in r.stdout
     assert "Restart=no" in r.stdout
     assert "RefuseManualStart=yes" in r.stdout
     assert "journalctl --user -u serialwrap -o cat" in r.stdout
+    assert "build_dut_image.sh" not in r.stdout
 
 
 @pytest.mark.process_rpc
-def test_longrun_and_supervision_isolated():
-    lr = _run_script(RUN_LONGRUN, "--hours", "48", "--dry-run")
-    sv = _run_script(RUN_SUPERVISION, "--hours", "72", "--mode", "systemd-user", "--dry-run")
+def test_run_systemd_system_dry_run_uses_system_scope(tmp_path):
+    r = _run_script(RUN_SYSTEMD, "--mode", "systemd-system", "--dry-run",
+                    env=_valid_p1_gate_env(tmp_path))
+    assert r.returncode == 0, _tail(r)
+    assert "systemctl show serialwrap -p Restart -p RefuseManualStart" in r.stdout
+    assert "journalctl -u serialwrap -o cat" in r.stdout
+    assert "systemctl --user" not in r.stdout
+
+
+@pytest.mark.process_rpc
+def test_longrun_and_supervision_isolated(tmp_path):
+    gate_env = _valid_p1_gate_env(tmp_path)
+    lr = _run_script(RUN_LONGRUN, "--hours", "48", "--dry-run", env=gate_env)
+    sv = _run_script(RUN_SUPERVISION, "--hours", "72", "--mode", "systemd-user", "--dry-run", env=gate_env)
     assert lr.returncode == 0, _tail(lr)
     assert sv.returncode == 0, _tail(sv)
     lr_project = _compose_project(lr.stdout)
@@ -232,13 +326,31 @@ def test_longrun_refuses_before_p1(tmp_path):
 
 
 @pytest.mark.process_rpc
+def test_supervision_refuses_before_p1(tmp_path):
+    import yaml  # noqa: PLC0415
+
+    doc = yaml.safe_load(BC_PATH.read_text(encoding="utf-8"))
+    for item in ("BC-01", "BC-02", "BC-03", "BC-04", "BC-05"):
+        assert _set_bc_status(doc, item, "IMPLEMENTED"), f"找不到 {item}"
+    bc_copy = tmp_path / "behavior_changes.yaml"
+    ec_copy = tmp_path / "error_codes.yaml"
+    bc_copy.write_text(yaml.safe_dump(doc, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    ec_copy.write_text("codes: []\n", encoding="utf-8")
+    env = {"SW_BC_PATH": str(bc_copy), "SW_ERROR_CODES_PATH": str(ec_copy)}
+    r = _run_script(RUN_SUPERVISION, "--hours", "72", "--mode", "systemd-user", "--dry-run", env=env)
+    assert r.returncode == 3, _tail(r)
+    assert "P1-OC 未合併" in r.stderr
+
+
+@pytest.mark.process_rpc
 @pytest.mark.parametrize(
     ("required", "layer", "producer"),
     [(req, lay, prod) for req in REAL_LAYERS
      for lay, prod in (("L1.5-docker", "run-l15.sh"), ("host-throwaway", "win-task-throwaway.ps1"))],
 )
 def test_evidence_index_rejects_docker_for_l2(tmp_path, required, layer, producer):
-    r = _checker_run(tmp_path, {"producer": producer, "evidence_layer": layer}, required)
+    r = _checker_run(tmp_path, {"producer": producer, "evidence_layer": layer, "uart_kind": "native",
+                                "results": [{"case_id": "probe", "verdict": "PASS"}]}, required)
     assert r.returncode == 5, _tail(r)
     assert "evidence_layer_mismatch" in r.stdout, _tail(r)
 
@@ -251,9 +363,27 @@ def test_evidence_index_fail_closed_missing_layer(tmp_path):
 
 
 @pytest.mark.process_rpc
+@pytest.mark.parametrize("report", [
+    {"producer": "run-l15.sh", "evidence_layer": ["L1.5-docker"]},
+    {"producer": "run-l15.sh", "evidence_layer": "L1.5-docker", "uart_kind": "pty-fake",
+     "results": [{"case_id": "probe", "verdict": "FAIL"}]},
+    {"producer": "run-l15.sh", "evidence_layer": "L1.5-docker", "uart_kind": "pty-fake",
+     "results": [{"case_id": "probe", "verdict": "INSUFFICIENT_EVIDENCE"}]},
+])
+def test_evidence_index_rejects_invalid_docker_report(tmp_path, report):
+    r = _checker_run(tmp_path, report, "L1.5-docker")
+    assert r.returncode == 5, _tail(r)
+    assert any(token in r.stdout for token in (
+        "evidence_layer_unknown", "evidence_report_invalid", "evidence_not_pass",
+        "evidence_topology_invalid", "evidence_image_digests_invalid",
+    )), _tail(r)
+
+
+@pytest.mark.process_rpc
 def test_evidence_index_requires_required_layer(tmp_path):
     r = _checker_run(tmp_path, {"producer": "run-l15.sh", "evidence_layer": "L1.5-docker"}, None)
     assert r.returncode == 2, _tail(r)
+    assert "schema_invalid" in r.stderr, _tail(r)
 
 
 @pytest.mark.process_rpc
@@ -300,3 +430,38 @@ def test_docker_smoke_two_container(tmp_path):
     assert all(str(v).startswith("sha256:") for v in digests.values())
     verdicts = {row.get("case_id"): row.get("verdict") for row in report.get("results", [])}
     assert verdicts.get("sm-01-attach-to-ready") == "PASS", _tail(r)
+
+
+@pytest.mark.memory_only
+def test_l15_suite_runtime_import_and_cli_paths_match_serialwrap_image():
+    """回歸：容器內 runner 使用的 runtime 模組必須有 import，預設 CLI／daemon 路徑須與 serialwrap image 安裝位置一致。
+
+    serialwrap.Dockerfile 以容器系統 Python 安裝 repo（不建 /opt/serialwrap/.venv），console script 位於
+    /usr/local/bin；runner 若仍指向 .venv，func-test 會以 FileNotFoundError 失敗、realhw／regression suite
+    會因未 import runtime 而 NameError。
+    """
+    import ast  # noqa: PLC0415
+
+    suite = SCRIPTS / "run_l15_suite.py"
+    tree = ast.parse(suite.read_text(encoding="utf-8"))
+    used = {node.value.id for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)}
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported |= {(alias.asname or alias.name).split(".")[0] for alias in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            imported |= {alias.asname or alias.name for alias in node.names}
+    assert "runtime" in used and "runtime" in imported, "run_l15_suite.py 使用 runtime.* 但未 import"
+
+    dockerfile = (REPO / "tools" / "docker" / "serialwrap.Dockerfile").read_text(encoding="utf-8")
+    image_has_venv = "/opt/serialwrap/.venv" in dockerfile
+    defaults = [node.args[1].value for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "get"
+                and len(node.args) == 2 and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value in {"SERIALWRAP_CLI_EXE", "SERIALWRAP_DAEMON_EXE"}]
+    assert len(defaults) == 2, defaults
+    regression_cli = re.search(r"^\s*CONTAINER_CLI=(\S+)$", RUN_L15.read_text(encoding="utf-8"), re.M)
+    assert regression_cli is not None
+    for path in [*defaults, regression_cli.group(1)]:
+        assert image_has_venv or "/.venv/" not in path, f"{path} 指向 serialwrap image 不存在的 venv"

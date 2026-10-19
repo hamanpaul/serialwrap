@@ -38,11 +38,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--only")
     ap.add_argument("--skip", default="")
     ap.add_argument("--duration", default="32h", help="longrun 時長（<N>h/<N>m/<N>s）")
+    ap.add_argument("--config", type=Path, help="指定本次執行的隔離組態 JSON")
     ap.add_argument("--report-dir")
     ap.add_argument("--list", action="store_true")
     args = ap.parse_args(argv)
 
-    cfg = harness.load_cfg()
+    cfg = harness.load_cfg(args.config)
+    uart_kind = cfg.get("uart_kind", "native")
+    if uart_kind not in {"native", "pty-fake"}:
+        ap.error("config uart_kind 必須是 native 或 pty-fake")
     cfg["duration_s"] = harness.parse_duration(args.duration)
     tiers = [t.strip() for t in args.tier.split(",") if t.strip()]
     selected = harness.select_cases(harness.REGISTRY, tiers=tiers, only=args.only,
@@ -128,6 +132,7 @@ def main(argv: list[str] | None = None) -> int:
             "version": version,
             "git": git,
             "tiers": args.tier, "started_at": ts, "preflight_notes": problems,
+            "uart_kind": uart_kind,
             "started_at_utc": started_at_utc,
             "cli_identity": exe_identity,
             "daemon_identity": {"pid": pid, "version": daemon_version,

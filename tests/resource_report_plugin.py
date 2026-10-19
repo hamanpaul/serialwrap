@@ -307,6 +307,10 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     # argv：sys.argv[0] 加上 pytest 實際收到的參數。以 pytest.main() 啟動時 sys.argv 為 ['-c']，
     # 只記 sys.argv 會使 selector 比對失效（P2-T13 審查修正；`python -m pytest` 下結果與原來相同）。
     invocation = [str(a) for a in config.invocation_params.args]
+    uart_kind = os.environ.get("SW_UART_KIND", "native")
+    if uart_kind not in {"native", "pty-fake"}:
+        session.exitstatus = 1
+        uart_kind = uart_kind.strip()
     report: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "format": FORMAT,
@@ -324,5 +328,6 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         "exit_code": session.exitstatus,
         "finished": True,
         "deployed_content": deployed,
+        "uart_kind": uart_kind,
     }
     _write_report(path, report)

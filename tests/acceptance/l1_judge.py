@@ -207,6 +207,12 @@ def judge(
     if not _schema_errors(report):
         invalid.extend(_consistency_errors(report["results"]))
 
+    physical_uart = (report.get("resources") or {}).get("physical_uart") or {}
+    if (isinstance(physical_uart, Mapping)
+            and any(isinstance(value, int) and value > 0 for value in physical_uart.values())
+            and report.get("uart_kind") != "native"):
+        insufficient.append("uart_kind_not_native")
+
     collected = [str(x) for x in (report.get("collected") or [])]
     deselected = [str(x) for x in (report.get("deselected") or [])]
     results = [row for row in (report.get("results") or []) if isinstance(row, Mapping)]
