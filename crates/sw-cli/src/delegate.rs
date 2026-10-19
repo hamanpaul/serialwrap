@@ -157,7 +157,7 @@ pub fn resolve_target(
         let bundle_root = exe_dir.parent().ok_or_else(|| {
             DelegateError::Unavailable(format!("release manifest not found: {}", exe.display()))
         })?;
-        bundle_root.join(current.dir).join("release-manifest.json")
+        join_relative(bundle_root, &current.dir).join("release-manifest.json")
     } else {
         let real_exe = p.env.realpath(&exe).map_err(|_| {
             DelegateError::Unavailable(format!("release manifest not found: {}", exe.display()))
@@ -191,11 +191,11 @@ pub fn resolve_target(
     })?;
 
     let manifest_dir = manifest_path.parent().unwrap_or_else(|| Path::new(""));
-    let entry_path = PathBuf::from(&manifest.python_cli_delegate_entry[0]);
-    let entry_path = if entry_path.is_absolute() {
-        entry_path
+    let entry_raw = &manifest.python_cli_delegate_entry[0];
+    let entry_path = if Path::new(entry_raw).is_absolute() {
+        PathBuf::from(entry_raw)
     } else {
-        manifest_dir.join(entry_path)
+        join_relative(manifest_dir, entry_raw)
     };
     if !p.fs.exists(&entry_path) || p.fs.is_dir(&entry_path) {
         return Err(DelegateError::Unavailable(format!(
@@ -227,6 +227,21 @@ pub fn resolve_target(
 }
 
 /// 只在錯誤時返回 1。
+/// 以字串逐段接上 manifest／current-release.json 內的相對路徑（不 canonicalize、不解析 symlink）。
+///
+/// 檔案內容一律以 `/` 分段；逐段 `push` 讓 Windows 產生原生 `\\` 分隔的路徑（`CreateProcessW`
+/// 的 `lpApplicationName` 與比對皆以此為準），POSIX 結果與 `Path::join` 相同。
+fn join_relative(base: &Path, rel: &str) -> PathBuf {
+    if Path::new(rel).is_absolute() {
+        return PathBuf::from(rel);
+    }
+    let mut out = base.to_path_buf();
+    for segment in rel.split('/').filter(|segment| !segment.is_empty()) {
+        out.push(segment);
+    }
+    out
+}
+
 pub fn run_delegate(ctx: &mut CliCtx, argv_tail: &[OsString], group: &str) -> i32 {
     let argv_sha = argv_sha256(argv_tail);
     let depth = match check_recursion(
