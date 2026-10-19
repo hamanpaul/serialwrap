@@ -15,9 +15,9 @@ changes:
       date: "2026-10-15"
       decision_ref: "OD-04"
       basis: "owner_decision"
-    owner_confirmation: "pending_default"
-    owner_item: 4
-    default_if_pending: "`{\"ok\":false,\"error_code\":\"SESSION_RECOVERING\",\"drain_stalled\":true,\"drain_timeout_epoch\":N,\"session\":…}`。回條遲到時仍完成 release，下次再呼叫回 `already_released`"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
     applies_to:
       python:
         min_version: "0.4.0"
@@ -231,9 +231,9 @@ changes:
       date: "2026-10-15"
       decision_ref: "serialwrap-rust-spec-final.md §5.2、§5.3、§9.4"
       basis: "spec_final"
-    owner_confirmation: "not_required"
-    owner_item: null
-    default_if_pending: null
+    owner_confirmation: "pending_default"
+    owner_item: 4
+    default_if_pending: "`{\"ok\":false,\"error_code\":\"SESSION_RECOVERING\",\"drain_stalled\":true,\"drain_timeout_epoch\":N,\"session\":…}`。回條遲到時仍完成 release，下次再呼叫回 `already_released`"
     applies_to:
       python:
         min_version: "0.4.0"
@@ -1410,7 +1410,7 @@ safety_invariants:
   - id: no_auto_resend
     title: "已有或可能有裝置副作用的命令不得自動重送"
     spec_ref: "§11.3"
-    error_codes: ["BASE64_DECODE_FAILED", "CHECKSUM_MISMATCH", "CHECKSUM_VERIFY_FAILED", "COMMAND_ABORTED_IN_FLIGHT", "COMMAND_FAILED", "CONSOLE_LINE_LIMIT_TOO_SMALL", "SESSION_RECOVERING", "EMPTY_RESPONSE", "EXCEPTION", "FORCE_RECOVER_TIMEOUT", "INTERACTIVE_EXPIRED", "INVALID_RESPONSE", "MOVE_FAILED", "MOVE_TIMEOUT", "PROMPT_TIMEOUT", "PROMPT_TIMEOUT_FORCE_RECOVERED", "PROMPT_TIMEOUT_RECOVERED", "PULL_PARSE_FAILED", "SEND_FAILED", "SOCKET_ERROR", "STATE_CHANGED", "TARGET_DECODER_FAILED", "TARGET_DECODER_MISSING", "TARGET_ENCODER_FAILED", "TARGET_ENCODER_MISSING", "TIMEOUT", "TRANSFER_ECHO_STALL", "TRANSFER_PROBE_FAILED", "TRANSFER_TIMEOUT"]
+    error_codes: ["BASE64_DECODE_FAILED", "CHECKSUM_MISMATCH", "CHECKSUM_VERIFY_FAILED", "COMMAND_ABORTED_IN_FLIGHT", "COMMAND_FAILED", "CONSOLE_LINE_LIMIT_TOO_SMALL", "EMPTY_RESPONSE", "EXCEPTION", "FORCE_RECOVER_TIMEOUT", "INTERACTIVE_EXPIRED", "INVALID_RESPONSE", "MOVE_FAILED", "MOVE_TIMEOUT", "PROMPT_TIMEOUT", "PROMPT_TIMEOUT_FORCE_RECOVERED", "PROMPT_TIMEOUT_RECOVERED", "PULL_PARSE_FAILED", "SEND_FAILED", "SOCKET_ERROR", "STATE_CHANGED", "TARGET_DECODER_FAILED", "TARGET_DECODER_MISSING", "TARGET_ENCODER_FAILED", "TARGET_ENCODER_MISSING", "TIMEOUT", "TRANSFER_ECHO_STALL", "TRANSFER_PROBE_FAILED", "TRANSFER_TIMEOUT"]
     case_ids: ["bc03-no-auto-resend", "bc03-unknown-outcome-send-failed"]
   - id: insufficient_evidence_not_pass
     title: "證據不足、擷取失敗或測試未完成不得轉為 PASS"

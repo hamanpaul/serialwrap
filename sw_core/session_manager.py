@@ -1237,7 +1237,7 @@ class SessionManager:
                                       for k, v in detected.items()
                                       if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip()}
 
-    def _save_state(self, *, release_kill_point: bool = False) -> None:
+    def _save_state(self) -> None:
         state_dir = os.path.dirname(self._state_path) or "."
         os.makedirs(state_dir, exist_ok=True)
         # snapshot 一律在 lock 內建（迭代 _sessions、複製 _binding_overrides/_profile_pins/
@@ -1298,7 +1298,7 @@ class SessionManager:
                         os.remove(tmp_path)
                 except OSError:
                     pass
-        _test_kill_after_save_hook(release_kill_point)
+        _test_kill_after_save_hook(False)
     def _next_dynamic_com(self) -> str:
         """分配下一個可用的 COM 編號（須在 self._lock 內呼叫）。
 
@@ -2748,7 +2748,7 @@ class SessionManager:
                 event.wait()
                 continue
             try:
-                self._save_state(release_kill_point=_test_release_persist_point())
+                _save_release_state(self)
             except Exception:
                 with self._lock:
                     session = self._sessions.get(session_id)
@@ -7776,7 +7776,7 @@ def _test_kill_after_save_hook(release_kill_point: bool) -> None:
 def _test_release_persist_point() -> bool:
     """Stage 0 實機測試鉤子（T21）：release 持久化的 commit 前暫停點；回傳 True 表示本次為 release 持久化。
 
-    呼叫端 ``_persist_release_state`` 以 ``self._save_state(release_kill_point=_test_release_persist_point())`` 取得旗標，
+    呼叫端 ``_persist_release_state`` 經模組層 ``_save_release_state`` 先取得旗標、再呼叫 ``_save_state()``，
     使暫停點位於 state.json 落盤前、且不增加 session_manager 既有行號（keep-baseline 以行號釘住部分 logger 來源）。
     僅隔離實例生效：環境變數 ``SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE`` 指向目錄時，行程寫入 ``arrived`` 標記後，
     每 50 ms 輪詢 ``go`` 標記（上限 600 s）才繼續；操作者看到 ``arrived`` 後記錄 state.json 快照並 kill -9，
@@ -7801,3 +7801,17 @@ def _test_release_persist_point() -> bool:
     while not os.path.exists(go_path) and time.monotonic() < deadline:
         time.sleep(0.05)
     return True
+
+
+def _save_release_state(manager: "SessionManager") -> None:
+    """release 持久化（``_persist_release_state``）專用的落盤入口：組合 T21 兩個隔離實例測試鉤子。
+
+    順序固定為「commit 前暫停點 → ``manager._save_state()`` → 落盤後 kill 鉤子（release 旗標為 True）」。
+    ``_save_state`` 維持無參數簽章，使既有以無參數替身 monkeypatch ``_save_state`` 的測試
+    （T08 ``test_release_persist_failure_keeps_blocking`` 等）仍走真實 release 持久化路徑；
+    ``_save_state`` 內部的鉤子呼叫一律帶 False（建構子與其他存檔不得終止行程）。
+    置於模組尾端，使既有 logger 呼叫的行號（``contracts/daemon_logging.yaml``）不位移。
+    """
+    release_kill_point = _test_release_persist_point()
+    manager._save_state()
+    _test_kill_after_save_hook(release_kill_point)
