@@ -778,10 +778,15 @@ mod review_regression_tests {
 
     #[test]
     fn only_character_handles_are_terminals() {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_TYPE_DISK, FILE_TYPE_PIPE, FILE_TYPE_REMOTE, FILE_TYPE_UNKNOWN,
+        };
+        // FILE_TYPE_CHAR 即 2；原本的 `!is_terminal_file_type(2)` 與上一行自相矛盾，改為逐一列出非 char 型別。
         assert!(is_terminal_file_type(FILE_TYPE_CHAR));
-        assert!(!is_terminal_file_type(0));
-        assert!(!is_terminal_file_type(1));
-        assert!(!is_terminal_file_type(2));
+        assert!(!is_terminal_file_type(FILE_TYPE_UNKNOWN));
+        assert!(!is_terminal_file_type(FILE_TYPE_DISK));
+        assert!(!is_terminal_file_type(FILE_TYPE_PIPE));
+        assert!(!is_terminal_file_type(FILE_TYPE_REMOTE));
     }
 }
 
