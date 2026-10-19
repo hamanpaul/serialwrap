@@ -1,0 +1,245 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serialwrap.local/schemas/bridge_record.schema.json",
+  "title": "serialwrap bridge.v1 wire 紀錄（wire.ndjson 單行，§15.6.2）",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "case_id",
+    "seq",
+    "mono_ts_ns",
+    "wall_ts",
+    "clock_id",
+    "port_id",
+    "endpoint_generation",
+    "dut_generation",
+    "dir",
+    "observation",
+    "stream_offset",
+    "len",
+    "payload_b64",
+    "crc32",
+    "source",
+    "cmd_id",
+    "loss_flag",
+    "meta"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "bridge.v1"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "case_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "mono_ts_ns": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "wall_ts": {
+      "type": "string",
+      "minLength": 1
+    },
+    "clock_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "port_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "endpoint_generation": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "dut_generation": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "dir": {
+      "enum": [
+        "TX",
+        "RX",
+        "META"
+      ]
+    },
+    "observation": {
+      "enum": [
+        "serial_read",
+        "dut_stdin_write",
+        "dut_stdout_read",
+        "serial_write",
+        "bridge_meta"
+      ]
+    },
+    "stream_offset": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "len": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "payload_b64": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9+/]*={0,2}$"
+    },
+    "crc32": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}$"
+    },
+    "source": {
+      "const": "bridge:external"
+    },
+    "cmd_id": {
+      "type": "null"
+    },
+    "loss_flag": {
+      "type": "boolean"
+    },
+    "meta": {
+      "type": "object"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "observation": {
+            "const": "bridge_meta"
+          }
+        },
+        "required": [
+          "observation"
+        ]
+      },
+      "then": {
+        "properties": {
+          "dir": {
+            "const": "META"
+          },
+          "stream_offset": {
+            "type": "null"
+          },
+          "len": {
+            "const": 0
+          },
+          "payload_b64": {
+            "const": ""
+          },
+          "crc32": {
+            "const": "00000000"
+          },
+          "meta": {
+            "type": "object",
+            "required": [
+              "event"
+            ],
+            "properties": {
+              "event": {
+                "enum": [
+                  "bridge_start",
+                  "bridge_stop",
+                  "peer_state",
+                  "endpoint_generation",
+                  "dut_generation",
+                  "dut_stdout_eof",
+                  "dut_exited",
+                  "write_uncertain",
+                  "io_error",
+                  "mark",
+                  "fault",
+                  "evidence_failure",
+                  "quiesce",
+                  "checkpoint"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "dir": {
+            "enum": [
+              "TX",
+              "RX"
+            ]
+          },
+          "stream_offset": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "len": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "loss_flag": {
+            "const": false
+          },
+          "meta": {
+            "type": "object",
+            "maxProperties": 0
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "observation": {
+            "enum": [
+              "serial_read",
+              "dut_stdin_write"
+            ]
+          }
+        },
+        "required": [
+          "observation"
+        ]
+      },
+      "then": {
+        "properties": {
+          "dir": {
+            "const": "TX"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "observation": {
+            "enum": [
+              "dut_stdout_read",
+              "serial_write"
+            ]
+          }
+        },
+        "required": [
+          "observation"
+        ]
+      },
+      "then": {
+        "properties": {
+          "dir": {
+            "const": "RX"
+          }
+        }
+      }
+    }
+  ]
+}

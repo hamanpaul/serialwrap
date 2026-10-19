@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "serialwrap-uart-stdio-bridge"
+version = "0.1.0"
+description = "serialwrap 外部 UART-stdio bridge 與測試基礎工具"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    'pyserial==3.5; sys_platform == "win32"',
+]
+
+[project.optional-dependencies]
+dev = [
+    "jsonschema==4.10.3",
+    "pytest==9.0.3",
+    "PyYAML==6.0.3",
+]
+
+[project.scripts]
+uart-stdio-bridge = "uart_stdio_bridge.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

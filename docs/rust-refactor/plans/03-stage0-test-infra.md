@@ -560,9 +560,11 @@ class Endpoint(Protocol):
     generation: int               # endpoint_generation，open() 後為 1
     def open(self) -> None
     def read(self, max_bytes: int, timeout_s: float) -> bytes
-        # 無資料或 peer 未開啟：回 b""（不 raise）；I/O 錯誤 raise EndpointError
+        # 無資料、peer 未開啟或 disconnect 後尚未 reconnect：等至 timeout 回 b""（不 raise）
+        # 從未 open 或已 close：raise EndpointError；I/O 錯誤亦 raise EndpointError
     def write_some(self, data: bytes, timeout_s: float) -> int
         # 回傳實際被 OS 接受的 bytes（0 < n ≤ len(data)）；timeout 內 0 bytes 被接受：回 0
+        # disconnect 後尚未 reconnect：等至 timeout 回 0；從未 open 或已 close：raise EndpointError
         # 接受長度不明：raise EndpointWriteUncertain（呼叫端記 write_uncertain META、loss_flag）
     def peer_open(self) -> bool | None
         # POSIX：slave 端目前是否有 opener（poll 無 POLLHUP）；Windows：None（不可得知）
@@ -577,7 +579,7 @@ class Endpoint(Protocol):
 
 # endpoints/__init__.py
 def open_endpoint(spec: dict[str, Any]) -> Endpoint
-    # spec={"kind":"posix-pty","by_id_link":str,"peer_gate":bool}
+    # 建立並 open adapter 後回傳；spec={"kind":"posix-pty","by_id_link":str,"peer_gate":bool}
     #    | {"kind":"win-serial","com":str,"baud":int,"transport_mode":"virtual_com0com"|"physical_usb_uart","allow_peer_close":bool}
 
 # endpoints/posix_pty.py
@@ -594,9 +596,9 @@ class WinSerialEndpoint:
 - slave 無任何 opener 時，master 的 `poll` 回 `POLLHUP`、`read` 得 `EIO`；但 `write` 到 master **成功**，bytes 會交給下一個 opener。
 - `tty.setraw(slave)` 後再關閉 slave，raw termios 狀態在 pty 存續期間保留給下一個 opener。
 
-因此 `PosixPtyEndpoint.open()`：`pty.openpty()` → `tty.setraw(slave_fd)` → 記 `slave_path=os.ttyname(slave_fd)` → **關閉 slave_fd**（bridge 不持有端 A，§15.3）→ master 設 `O_NONBLOCK` → 建 `by_id_link` symlink（先移除舊 link）。`read`：`poll([master], timeout)`；`POLLHUP` 時回 `b""`（並更新 `peer_open()`=False），`EIO` 視同 peer 關閉回 `b""`。`write_some`：`peer_gate=True` 且 `peer_open()` 為 False 時**不寫**、等待至 timeout 回 0（避免把 bytes 交給下一個 opener）；否則 `os.write`，`EAGAIN` 時 `poll(POLLOUT)` 等到 timeout，回實際接受長度。`disconnect(remove_link=True)`：移除 link、關 master（之後 slave opener 讀到 EIO／hangup）。`reconnect()`：重新 openpty（新 slave 路徑）、重建 link、`generation += 1`。`capabilities()` 全 True。
+因此 `PosixPtyEndpoint.open()`：`pty.openpty()` → `tty.setraw(slave_fd)` → 記 `slave_path=os.ttyname(slave_fd)` → **關閉 slave_fd**（bridge 不持有端 A，§15.3）→ master 設 `O_NONBLOCK` → 建 `by_id_link` symlink（先移除舊 link）。`read`：以不超過 10 ms 的 poll 切片等待；若 event 同時帶 `POLLIN|POLLHUP`，先 `os.read` 排空已到資料，只有 `POLLHUP` 且無 `POLLIN` 才視為 peer 關閉並節流等待至 timeout；`EIO` 視同 peer 關閉。`write_some`：每次 `os.write` 前都重新檢查 peer gate；`peer_gate=True` 且 `peer_open()` 為 False 時**不寫**、等待至 timeout 回 0，`EAGAIN`／`EIO` 重試亦同。資料 I/O 與端點生命週期以鎖同步，跨入新 generation 的讀取回 `b""`、尚未接受資料的寫入回 0。`disconnect(remove_link=True)`：移除 link、關 master（之後 slave opener 讀到 EIO／hangup）；斷線到重連期間，讀取等滿 timeout 回 `b""`、寫入等滿 timeout 回 0。`reconnect()`：重新 openpty（新 slave 路徑）、重建 link、`generation += 1`。PTY 核心可能保留已接受但未讀的 bytes 給下一個 opener；情境若要求上下文隔離，必須先 `reconnect()`。`disconnect(remove_link=False)` 只可用於隔離測試目錄，因留下的 pts symlink 可能指向後續被重新指派的路徑。`peer_open()` 是即時取樣；週期性 watcher 可能漏掉兩次取樣間完成的關閉與重開。`capabilities()` 全 True。
 
-**Windows 行為**：`serial_factory` 預設為 `serial.Serial`（lazy import，非 Windows 不 import）。`open()`：`Serial(port=com, baudrate=baud, bytesize=8, parity="N", stopbits=1, timeout=0.05, write_timeout=None, exclusive=None)`；失敗 raise `EndpointError`。`read`：設 `timeout=timeout_s` 後 `read(max_bytes)`（pySerial 回傳已到 bytes，可短讀）。`write_some`：設 `write_timeout=timeout_s` 後 `n = ser.write(data)`；`SerialTimeoutException` → raise `EndpointWriteUncertain(len(data), "write timeout")`（pySerial 3.5 Windows 在逾時時不回報已寫長度）；回傳 `n`。`peer_open()` 回 None。`capabilities()`：`transport_disconnect=False`、`by_id_link=False`、`peer_state=False`。`disconnect()`：`allow_peer_close=False` 時 raise `EndpointError("HARNESS_CAPABILITY_UNAVAILABLE")`；True 時關閉 COM-B 並在 `describe()` 標 `"last_fault":"peer_close"`（不是 transport_disconnect）。`reconnect()`：重新 open，`generation += 1`。`link_remove/link_add` raise `EndpointError("HARNESS_CAPABILITY_UNAVAILABLE")`。
+**Windows 行為**：`serial_factory` 預設為 `serial.Serial`（lazy import，非 Windows 不 import）。`open()`：`Serial(port=com, baudrate=baud, bytesize=8, parity="N", stopbits=1, timeout=0.05, write_timeout=None, exclusive=None)`；失敗 raise `EndpointError`。`read`：timeout 未變時不重設 pySerial 屬性；需要時設 `timeout=timeout_s` 後 `read(max_bytes)`（pySerial 回傳已到 bytes，可短讀）。`write_some`：設 `write_timeout=max(timeout_s, 0.001)` 後 `n = ser.write(data)`；逾時 → raise `EndpointWriteUncertain(len(data), "write timeout")`（pySerial 3.5 Windows 在逾時時不回報已寫長度）；必須驗證 `0 <= n <= len(data)`，超界視為長度不確定。`peer_open()` 回 None。`capabilities()`：`transport_disconnect=False`、`by_id_link=False`、`peer_state=False`。`disconnect()`：`allow_peer_close=False` 時 raise `EndpointError("HARNESS_CAPABILITY_UNAVAILABLE")`；True 時關閉 COM-B 並在 `describe()` 標 `"last_fault":"peer_close"`（不是 transport_disconnect）。斷線後至重連前，`read`／`write_some` 分別等滿 timeout 回 `b""`／0。`reconnect()`：若仍開啟 COM handle，必須 `allow_peer_close=True` 才可關閉後重開，並標 `last_fault="peer_close"`；若已 disconnect，直接重開；成功後 `generation += 1`。I/O 與生命週期操作以鎖同步，設定值相同時不重設 pySerial timeout。`link_remove/link_add` raise `EndpointError("HARNESS_CAPABILITY_UNAVAILABLE")`。
 
 ### T 步驟
 
@@ -624,8 +626,15 @@ def test_master_pollhup_and_write_when_no_slave_opener():
 | `test_full_byte_range_both_directions` | peer 寫 `bytes(range(256))*16` → `read` 累積後完全相等；`write_some` 寫同資料 → peer 讀到完全相等（無換行轉換、無 echo） |
 | `test_peer_gate_blocks_write_without_opener` | 無 opener 時 `write_some(b"x", 0.2)==0` 且耗時 ≥0.2 s；之後 peer 開啟讀取 0.2 s 內讀不到任何 byte |
 | `test_peer_gate_disabled_writes_queue` | `peer_gate=False` 時無 opener 的 `write_some(b"x",0.2)==1` |
+| `test_write_without_peer_at_backpressure_does_not_spin` | 無 peer 且 PTY buffer 滿時，`peer_gate=False` 的寫入等滿 timeout 回 0，CPU 使用接近 0 |
 | `test_partial_write_reports_accepted_len` | peer 開啟但不讀；反覆 `write_some(b"\x55"*65536, 0.05)` 直到回傳 < 要求長度；累計接受量等於 peer 之後讀出的總量 |
 | `test_read_timeout_returns_empty` | peer 開啟無資料時 `read(4096, 0.1)==b""` 且耗時 ≥0.1 s |
+| `test_read_drains_pending_after_peer_close` | peer 寫 `b"LAST"` 後立即關閉；`read` 仍回傳尾端 bytes、`peer_open() is False`，下一個 opener 讀不到舊資料 |
+| `test_idle_read_without_peer_waits_without_spinning` | 無 opener 時 `read(4096,0.1)` 等滿 timeout，CPU 使用接近 0 |
+| `test_peer_gate_rechecks_after_backpressure` | 注入第一次 `os.write` 回 EAGAIN 並關閉 peer；重試不得寫入，下一個 opener 讀不到該資料 |
+| `test_disconnected_endpoint_waits_then_reconnects` | disconnect 後 read 等滿 timeout 回 `b""`、write 等滿 timeout 回 0；reconnect 世代遞增且可雙向傳輸 |
+| `test_reconnect_during_pumps_does_not_raise` | pump thread 持續呼叫 read／write 時反覆 reconnect，不得因 fd 被關閉而 raise `EndpointError` |
+| `test_open_endpoint_returns_open_adapter_and_validates_spec` | factory 回傳 generation 1 的已開啟 adapter，並拒絕無效 spec |
 | `test_disconnect_removes_link_and_peer_sees_hangup` | `disconnect(remove_link=True)` 後 link 不存在；peer 的 `os.read` raise `OSError`（EIO）或回 `b""` |
 | `test_reconnect_increments_generation_and_new_slave` | `reconnect()==2`、`generation==2`、新 `slave_path` 與舊不同、link 指向新路徑 |
 | `test_link_remove_add_keeps_pty` | `link_remove()` 後 link 不存在但已開啟的 peer 仍可雙向傳輸；`link_add()` 後 link 恢復且指向同一 `slave_path` |
@@ -638,22 +647,28 @@ def test_master_pollhup_and_write_when_no_slave_opener():
 |---|---|
 | `test_open_uses_exact_params` | `FakeSerial` 收到 `port="COMb", baudrate=115200, bytesize=8, parity="N", stopbits=1`，`timeout` 為數值 |
 | `test_write_some_returns_accepted` | FakeSerial `write` 回 3 → `write_some(b"abcde",1.0)==3` |
+| `test_write_some_rejects_impossible_accepted_lengths` | write 回傳負數或大於要求長度時 raise `EndpointWriteUncertain` |
+| `test_io_does_not_reconfigure_unchanged_timeouts` | 連續相同 timeout 的 read／write 不重設 pySerial timeout；零秒 write timeout 設為至少 1 ms |
 | `test_write_timeout_is_uncertain` | FakeSerial `write` raise `SerialTimeoutException` → raise `EndpointWriteUncertain`，`requested_len==5` |
 | `test_capabilities_no_transport_disconnect` | `capabilities()=={"transport_disconnect":False,"by_id_link":False,"peer_state":False}`；`peer_open() is None` |
 | `test_disconnect_refused_without_peer_close` | `allow_peer_close=False` 時 `disconnect(remove_link=False)` raise `EndpointError`，訊息含 `HARNESS_CAPABILITY_UNAVAILABLE` |
 | `test_peer_close_labelled_not_transport_disconnect` | `allow_peer_close=True` 時 `disconnect` 後 `describe()["last_fault"]=="peer_close"` |
+| `test_reconnect_requires_peer_close_permission_for_open_handle` | 已開啟 handle 且 `allow_peer_close=False` 時，reconnect 以 `HARNESS_CAPABILITY_UNAVAILABLE` 拒絕關閉 COM |
+| `test_disconnected_endpoint_waits_then_reconnects` | disconnect 後 read／write 等滿 timeout 回空結果；reconnect 後 generation 遞增且可寫入 |
+| `test_io_and_reconnect_are_serialized` | read 未完成時 reconnect 不可先關閉正在使用的 handle；兩個操作完成且不 raise `EndpointError` |
+| `test_open_endpoint_dispatches_and_opens_win_serial` | factory 依 spec 建立並開啟 Windows adapter，參數正確透傳；無效 spec raise `ValueError` |
 | `test_link_ops_unavailable` | `link_remove()`、`link_add()` 皆 raise `EndpointError`（含 `HARNESS_CAPABILITY_UNAVAILABLE`） |
 | `test_transport_mode_validated` | `transport_mode="virtual_pty"` → `ValueError` |
 | `test_cap_windows_com__roundtrip_full_byte_range` | （`@pytest.mark.windows_com`；讀 `SW_TEST_COM_PAIR`）測試以 pySerial 開 COMa 為受測端，endpoint 開 COMb；雙向 `bytes(range(256))*16` 完全相等 |
 | `test_cap_windows_com__exclusive_second_open_fails` | endpoint 開 COMb 後再以 pySerial 開 COMb 必定失敗（Windows 通訊裝置獨占） |
 
-- [ ] **T3-2：執行並確認 FAIL**：`python3 -m pytest -q tools/uart_stdio_bridge/tests -k "endpoint or kernel"` → `test_pty_kernel_semantics` 應 PASS（事實測試，不依賴實作；若 FAIL 代表核心語意與本計畫假設不同，停止並回報），其餘 `ModuleNotFoundError`。
+- [ ] **T3-2：執行並確認 FAIL**：僅執行 Task 3 三個指定測試檔：`python3 -m pytest -q tools/uart_stdio_bridge/tests/test_posix_pty_endpoint.py tools/uart_stdio_bridge/tests/test_win_serial_endpoint.py tools/uart_stdio_bridge/tests/test_pty_kernel_semantics.py`；`test_pty_kernel_semantics` 應 PASS（事實測試，不依賴實作；若 FAIL 代表核心語意與本計畫假設不同，停止並回報），其餘端點測試為契約語意紅燈。不可用 `-k` 從整個工具測試目錄選取，以免誤收後續 Task 的測試。
 - [ ] **T3-3：commit 測試**：`git commit -m "test(bridge): 新增 PTY 核心語意事實測試與端點 adapter 失敗測試"`。
 
 ### I 步驟
 
 - [ ] **I3-1：實作** `base.py`、`posix_pty.py`、`win_serial.py`、`__init__.py`，照 Interfaces 與上方行為。`posix_pty.py` 不得以 `#ifdef` 式平台判斷散布在其他模組；`open_endpoint` 是唯一選擇點。peer 狀態以 `poll` 判定，不輪詢 `/proc`。
-- [ ] **I3-2：執行並確認 PASS**：`python3 -m pytest -q tools/uart_stdio_bridge/tests -k "endpoint or kernel"` 全綠；`windows_com` 測試顯示為 skipped 且訊息含「證據不足，非 PASS」。在 Windows host 經 interop 跑一次 `py -3.12 -m pytest -q tools\uart_stdio_bridge\tests\test_win_serial_endpoint.py`（fake 部分）並保存輸出於 `~/b-log/rust-refactor/p2/win-endpoint-l1.txt`。
+- [ ] **I3-2：執行並確認 PASS**：僅執行 Task 3 三個指定測試檔：`python3 -m pytest -q tools/uart_stdio_bridge/tests/test_posix_pty_endpoint.py tools/uart_stdio_bridge/tests/test_win_serial_endpoint.py tools/uart_stdio_bridge/tests/test_pty_kernel_semantics.py` 全綠；`windows_com` 測試顯示為 skipped 且訊息含「證據不足，非 PASS」。在 Windows host 經 interop 跑一次 `py -3.12 -m pytest -q tools\uart_stdio_bridge\tests\test_win_serial_endpoint.py`（fake 部分）並保存輸出於 `~/b-log/rust-refactor/p2/win-endpoint-l1.txt`。`windows_com` 原生 gate 未執行或 skip 時不得宣稱為 PASS。
 - [ ] **I3-3：commit**：`git commit -m "feat(bridge): 實作 POSIX PTY 與 Windows pySerial 端點 adapter（只持有對端 B）"`＋fragment。
 
 ---

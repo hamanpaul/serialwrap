@@ -1,0 +1,17 @@
+{
+  "approved_revision": "2026-10-15.1",
+  "rules": {
+    "secret_tx_unlogged": {
+      "name": "secret_tx_unlogged",
+      "description": "產品 send_secret 刻意不寫入 WAL，比較時允許在 WAL 紀錄邊界略過 wire TX 中的 secret + '\\n'，並記錄 rules_applied",
+      "rationale": "盤點 06 §5.3：send_secret 避免帳密落盤於 WAL",
+      "direction": "TX"
+    },
+    "wal_com_alias": {
+      "name": "wal_com_alias",
+      "description": "允許 port_map 一埠對應多個 WAL com 名稱（例如 COM0 與 PROBE）",
+      "rationale": "盤點 04 §1.6：PROBE 探針可能使用別名寫入 WAL",
+      "direction": "BOTH"
+    }
+  }
+}

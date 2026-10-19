@@ -1,0 +1,44 @@
+{
+  "config": {
+    "boot_banner": "boot done\r\nroot@prplOS:/# ",
+    "commands": {
+      "default": "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# ",
+      "overrides": {
+        "hang": {
+          "interactive": true
+        },
+        "slow": {
+          "delay_ms": 700,
+          "response": "S\r\n# "
+        }
+      }
+    },
+    "noise": {
+      "enabled": false
+    },
+    "platform": "prpl"
+  },
+  "source_blob": "93553e6:func-test/lib/fake_target.py",
+  "steps": [
+    {
+      "input_b64": "c2xvdwo=",
+      "output_b64": "Uw0KIyA=",
+      "wait_ms": 1200
+    },
+    {
+      "input_b64": "bHMK",
+      "output_b64": "RVhFQzpscw0KUkVTVUxUOmxzOk9LDQpyb290QHBycGxPUzovIyA=",
+      "wait_ms": 500
+    },
+    {
+      "input_b64": "aGFuZwo=",
+      "output_b64": "",
+      "wait_ms": 500
+    },
+    {
+      "input_b64": "Cg==",
+      "output_b64": "cm9vdEBwcnBsT1M6LyMg",
+      "wait_ms": 500
+    }
+  ]
+}

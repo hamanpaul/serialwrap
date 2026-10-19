@@ -30,3 +30,37 @@ jobs:
       - name: 執行測試套件（含 re2 線性引擎）
         # 覆蓋 #91 re2 路徑：matcher 以 re2 線性引擎求值、免疫所有 catastrophic backtracking。
         run: python3 -m pytest -q tests/
+
+  bridge-tools:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安裝 bridge 測試相依與 socat
+        run: |
+          sudo apt-get update && sudo apt-get install -y socat
+          python3 -m pip install --disable-pip-version-check pytest==9.0.3 PyYAML==6.0.3 jsonschema==4.10.3
+      - name: 執行 uart_stdio_bridge 工具自測
+        run: python3 -m pytest -q tools/uart_stdio_bridge/tests
+
+  bridge-tools-windows:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安裝 bridge 測試相依（含 Windows pyserial）
+        run: python -m pip install --disable-pip-version-check pytest==9.0.3 PyYAML==6.0.3 jsonschema==4.10.3 pyserial==3.5
+      - name: 執行 uart_stdio_bridge 免驅動 Windows L1 自測
+        run: python -m pytest -q tools/uart_stdio_bridge/tests -m "not posix_pty and not docker and not windows_com"
