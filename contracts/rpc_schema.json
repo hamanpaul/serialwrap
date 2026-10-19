@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/hamanpaul/serialwrap/contracts/rpc_schema.json",
   "title": "serialwrap RPC contract",
-  "x-catalog-revision": 10,
+  "x-catalog-revision": 11,
   "x-wire": {
     "framing": "ndjson",
     "line_strip": true,
@@ -1931,13 +1931,15 @@
         "INVALID_ARGS",
         "SESSION_NOT_FOUND",
         "FLASHING_BUSY",
-        "SESSION_RECOVERING"
+        "SESSION_RECOVERING",
+        "DRAIN_STALLED"
       ],
       "error_order": [
         "INVALID_ARGS",
         "SESSION_NOT_FOUND",
         "FLASHING_BUSY",
-        "SESSION_RECOVERING"
+        "SESSION_RECOVERING",
+        "DRAIN_STALLED"
       ],
       "side_effects": [
         {
@@ -1983,6 +1985,46 @@
             },
             "drain_stalled": {
               "type": "boolean"
+            },
+            "drain_timeout_epoch": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "session": {
+              "$ref": "#/$defs/SessionPublic"
+            }
+          },
+          "required": [
+            "ok",
+            "error_code",
+            "drain_stalled",
+            "drain_timeout_epoch",
+            "session"
+          ]
+        },
+        "DRAIN_STALLED": {
+          "type": "object",
+          "x-order": [
+            "ok",
+            "error_code",
+            "drain_stalled",
+            "drain_timeout_epoch",
+            "session"
+          ],
+          "properties": {
+            "ok": {
+              "type": "boolean",
+              "const": false
+            },
+            "error_code": {
+              "type": "string",
+              "const": "DRAIN_STALLED"
+            },
+            "drain_stalled": {
+              "type": "boolean",
+              "const": true
             },
             "drain_timeout_epoch": {
               "type": [

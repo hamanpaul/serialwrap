@@ -8,7 +8,8 @@ entry: python3 scripts/stage0/drain_timing.py --device <by-id 路徑|COMx|alias>
 revision: 本檔 git blob sha1（執行時寫入輸出 JSON 的 tool_revision；等同 git rev-parse HEAD:scripts/stage0/drain_timing.py）
 expected: 每輪流程為「等 READY → 送出持續 TX 的長命令並確認仍在途 → 量測 device release → device attach → 等回 READY」。
   輸出每次 release 的 daemon 端耗時（外部 first-byte 時間扣除 CLI 基準值 cli_overhead_ms）、ok 回應、drain_stalled 與
-  SESSION_RECOVERING 逾時次數，以及 p50／p95／max。ok=false 且非 SESSION_RECOVERING 的樣本標為 invalid、不進分佈；
+  DRAIN_STALLED 逾時次數，以及 p50／p95／max。只有達到 timeout_ms 的 DRAIN_STALLED 算逾時樣本；
+  SESSION_RECOVERING 或早於期限的 DRAIN_STALLED（例如 handle close 失敗）標為 invalid、不進分佈；
   有 invalid 或準備步驟（READY、在途、attach 回 READY）失敗時 exit 非 0。逾時門檻 3000 ms 以 SC-04 為準，本腳本只量測不判定 PASS／FAIL。
   --unplug-prompt 時於第 k 次迭代「TX 進行中」提示拔除 USB，記錄 write 不返回情境下的 release 回應與錯誤碼。
 owner: 擁有者實機（Linux 與 Windows 實體 USB-UART 依序；bench 需獨占該 COM／by-id 裝置）
@@ -35,6 +36,7 @@ from typing import Any
 DEFAULT_TIMEOUT_MS = 3000
 UNPLUG_AT_ITERATION = 1  # --unplug-prompt 時於此（0-based）迭代的 TX 進行中提示拔線
 SESSION_RECOVERING = "SESSION_RECOVERING"
+DRAIN_STALLED = "DRAIN_STALLED"
 TERMINAL_CMD_STATES = ("done", "error", "timeout")
 LONG_TX_BYTES = 4000  # 接近 CMD_WARN_BYTES（4 KB）：UART 寫入需數百毫秒，release 會落在持續 TX 中
 LONG_TX_HEAD = "sleep 20; echo X; "
@@ -193,7 +195,7 @@ def measure_once(exe: str, com: str, timeout_ms: int, cli_overhead_ms: float,
     daemon_ms = round(max(0.0, external_ms - cli_overhead_ms), 3)
     error_code = resp.get("error_code")
     stalled = bool(resp.get("drain_stalled"))
-    timed_out = stalled or error_code == SESSION_RECOVERING or daemon_ms > timeout_ms
+    timed_out = error_code == DRAIN_STALLED and stalled and daemon_ms >= timeout_ms
     sample.update({
         "external_first_byte_ms": first_byte,
         "external_total_ms": timing["total_ms"],
@@ -206,8 +208,11 @@ def measure_once(exe: str, com: str, timeout_ms: int, cli_overhead_ms: float,
         "unplug_prompted_at": unplug_note,
         "release_rc": resp.get("_rc"),
     })
-    if not resp.get("ok") and error_code != SESSION_RECOVERING:
-        sample["invalid_reason"] = f"release 回應 ok=false 且非 SESSION_RECOVERING（error_code={error_code!r}）"
+    if not resp.get("ok") and not timed_out:
+        sample["invalid_reason"] = (
+            f"release 未達可量測的 {timeout_ms} ms DRAIN_STALLED 逾時"
+            f"（error_code={error_code!r}, daemon_drain_ms={daemon_ms}）"
+        )
         sample["valid"] = False
         # 收尾仍需嘗試 attach，避免留下 RELEASED
         _cli(exe, "device", "attach", "--selector", com)

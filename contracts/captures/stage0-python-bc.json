@@ -127,7 +127,7 @@
   "release_drain_timeout_shape": {
     "drain_stalled": true,
     "drain_timeout_epoch_type": "int",
-    "error_code": "SESSION_RECOVERING",
+    "error_code": "DRAIN_STALLED",
     "keys": [
       "ok",
       "error_code",

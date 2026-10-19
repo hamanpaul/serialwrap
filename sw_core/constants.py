@@ -75,6 +75,7 @@ WAL_IDENTITY_CHECK_INTERVAL_S: float = 0.05
 WAL_RECREATE_BACKOFF_S: tuple[float, ...] = (0.01, 0.05, 0.2)
 WAL_RECREATE_RETRY_INTERVALS_S: tuple[float, ...] = (1.0, 2.0, 5.0)
 DRAIN_TIMEOUT_MS: int = 3000
+ERROR_DRAIN_STALLED: str = "DRAIN_STALLED"
 # drain Phase 1 等待 TX fence 的最長秒數；不延後共同 3 秒 drain deadline。
 DRAIN_FENCE_ACQUIRE_S: float = 0.05
 EVENTS_DIR = _env_path(

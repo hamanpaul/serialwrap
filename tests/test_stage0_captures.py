@@ -48,7 +48,7 @@ def test_capture_contains_required_frozen_values(tmp_path):
     assert want["wal"]["seq_after_reset"] == 1 and want["wal"]["seq_after_rotate"] == 1
     assert {m["expected"] for m in want["bc03_mapping"]} == {
         "COMMAND_ABORTED_IN_FLIGHT", "SEND_FAILED", "FLUSHED_BY_RECOVERY"}
-    assert want["release_drain_timeout_shape"]["error_code"] == "SESSION_RECOVERING"
+    assert want["release_drain_timeout_shape"]["error_code"] == "DRAIN_STALLED"
 
 
 def test_microbench_smoke_crosses_rotate(tmp_path):

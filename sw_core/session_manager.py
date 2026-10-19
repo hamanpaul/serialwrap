@@ -28,6 +28,7 @@ from .constants import (
     BG_CAPTURE_MAX_BYTES,
     BG_CAPTURE_MAX_COUNT,
     DRAIN_TIMEOUT_MS,
+    ERROR_DRAIN_STALLED,
     BOOT_BANNER_PATTERNS,
     BOOT_BANNER_TAIL_CHARS,
     BOOT_QUIET_WINDOW_S,
@@ -327,6 +328,7 @@ class _AttachOp:
     done: threading.Event = dataclasses.field(default_factory=threading.Event)
     probe_bridge: "UARTBridge | None" = None
     release_request: tuple[str, str | None] | None = None
+    release_deadline: float | None = None
     bind_requested: bool = False
     port_transferred: bool = False
     port_lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
@@ -2778,11 +2780,6 @@ class SessionManager:
             # 守法一致；須先 exit_flashing 或待 probe 結束。
             if self._flash_busy_locked(session):
                 return {"ok": False, "error_code": "FLASHING_BUSY", "selector": session.profile.com, "session": session.to_public_dict()}
-            if session.state == "RELEASED" or session.profile.device_by_id in self._released_by_ids:
-                return {"ok": True, "released": True, "session": session.to_public_dict()}
-            by_id = session.profile.device_by_id
-            if self._shutting_down:
-                raise RuntimeError("daemon stopping")
             if session._pending_drain is not None:
                 return {
                     "ok": False,
@@ -2791,6 +2788,11 @@ class SessionManager:
                     "drain_timeout_epoch": session.drain_timeout_epoch,
                     "session": session.to_public_dict(),
                 }
+            if session.state == "RELEASED" or session.profile.device_by_id in self._released_by_ids:
+                return {"ok": True, "released": True, "session": session.to_public_dict()}
+            by_id = session.profile.device_by_id
+            if self._shutting_down:
+                raise RuntimeError("daemon stopping")
             if session.bridge is not None:
                 job = self._begin_drain_locked(
                     session,
@@ -2858,10 +2860,14 @@ class SessionManager:
                 already_released = session.state == "RELEASED"
                 if self._shutting_down and not already_released:
                     raise RuntimeError("daemon stopping")
-                if attach_op.release_request is None:
+                first_release_request = attach_op.release_request is None
+                if first_release_request:
                     release_source = (session.released_by or source) if already_released else source
                     release_reason = session.released_reason if already_released else reason
                     attach_op.release_request = (release_source, release_reason)
+                    attach_op.release_deadline = release_deadline
+                else:
+                    release_deadline = attach_op.release_deadline or release_deadline
                 attach_op.cancelled.set()
                 if attach_op.probe_bridge is not None:
                     attach_op.probe_bridge.begin_drain(
@@ -2871,8 +2877,9 @@ class SessionManager:
                     )
                 if not already_released:
                     session.state = "RECOVERING"
-                    session.drain_stalled = False
-                    session.drain_timeout_epoch = None
+                    if first_release_request:
+                        session.drain_stalled = False
+                        session.drain_timeout_epoch = None
                     if self._admission is not None:
                         self._admission.set_flag(session.profile.com, "recovering", True)
             elif session.state == "RELEASED":
@@ -2937,7 +2944,7 @@ class SessionManager:
                         session.state = "RECOVERING"
                 return {
                     "ok": False,
-                    "error_code": "SESSION_RECOVERING",
+                    "error_code": ERROR_DRAIN_STALLED,
                     "drain_stalled": True,
                     "drain_timeout_epoch": attach_op.bridge_generation,
                     "session": session.to_public_dict(),
@@ -2968,7 +2975,7 @@ class SessionManager:
             if receipt is None:
                 return {
                     "ok": False,
-                    "error_code": "SESSION_RECOVERING",
+                    "error_code": ERROR_DRAIN_STALLED,
                     "drain_stalled": True,
                     "drain_timeout_epoch": job.epoch,
                     "session": session.to_public_dict(),
@@ -3557,6 +3564,22 @@ class SessionManager:
             by_id = session.profile.device_by_id
             if not by_id:
                 return {"ok": False, "error_code": "DEVICE_NOT_BOUND", "session": session.to_public_dict()}
+            pending_attach_op = (
+                self._active_attach_ops.get(by_id)
+                or self._attach_ops.get(by_id)
+                or self._preopened_ports.get(by_id)
+            )
+            release_in_progress = (
+                pending_attach_op is not None and pending_attach_op.release_request is not None
+            )
+            if session._pending_drain is not None or release_in_progress:
+                return {
+                    "ok": False,
+                    "error_code": "SESSION_RECOVERING",
+                    "drain_stalled": session.drain_stalled,
+                    "drain_timeout_epoch": session.drain_timeout_epoch,
+                    "session": session.to_public_dict(),
+                }
             # C2：RELEASED 早退——比照 clear_session，不改 state、不 spawn、不動集合，
             # 避免卡死 ATTACHING 與下一次 _save_state 把 released map 寫空。
             if session.state == "RELEASED" or by_id in self._released_by_ids:
@@ -3607,6 +3630,25 @@ class SessionManager:
             with self._lock:
                 current = self._sessions.get(session.session_id)
                 cur_by_id = current.profile.device_by_id if current is not None else None
+                current_attach_op = (
+                    self._active_attach_ops.get(cur_by_id or "")
+                    or self._attach_ops.get(cur_by_id or "")
+                    or self._preopened_ports.get(cur_by_id or "")
+                )
+                release_in_progress = (
+                    current_attach_op is not None
+                    and current_attach_op.release_request is not None
+                )
+                if current is not None and (
+                    current._pending_drain is not None or release_in_progress
+                ):
+                    return {
+                        "ok": False,
+                        "error_code": "SESSION_RECOVERING",
+                        "drain_stalled": current.drain_stalled,
+                        "drain_timeout_epoch": current.drain_timeout_epoch,
+                        "session": current.to_public_dict(),
+                    }
                 if current is not None and (
                     current.state == "RELEASED"
                     or (cur_by_id and cur_by_id in self._released_by_ids)

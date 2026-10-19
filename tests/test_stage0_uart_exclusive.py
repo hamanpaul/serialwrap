@@ -354,7 +354,7 @@ class TestAttachProbeDrain:
 
         response = mgr.release_device("COM0")
         assert response["ok"] is False
-        assert response["error_code"] == "SESSION_RECOVERING"
+        assert response["error_code"] == "DRAIN_STALLED"
         assert response["drain_stalled"] is True
         assert session.state == "RECOVERING"
         assert port.close_calls == 0

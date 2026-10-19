@@ -247,8 +247,8 @@ changes:
     ab_participation: "diff"
     phases: ["P1", "P5"]
     case_ids: ["sc04-drain-recovering-release-timeout"]
-    compatibility_impact: "斷線、I/O error、release、clear、bind 的 detach 期間可觀測為 RECOVERING；release 在 handle 關閉回條後才回成功；超過 3000 ms 回 SESSION_RECOVERING 並附 drain_stalled:true 與 drain_timeout_epoch；SessionPublic 新增 drain_stalled、drain_timeout_epoch 兩欄（位於 capture 之後）。"
-    approval_conditions: "ADR-06 安全骨架；只有「release 遇 drain 逾時」的回應形狀需確認；規格明文；改為可喚醒、可取消；fence：授權重驗與 OS 實際提交在同一臨界區（Rust `FenceSubmitGate`、Python `_tx_fence_lock` 臨界區內單次非阻塞 `os.write`，`_state_lock` 只做 pre-check），鎖只跨非阻塞提交、不跨完成等待；禁止「驗證→放鎖→write」（R0-F1，arch §5.4 第 3 點；P1 T20、P5 Task 9 測試）。Python Windows `_PySerialPort` 是唯一例外：每段 ≤64 bytes 的 `serial.write` 在鎖內阻塞（上限 `write_timeout` 5 s），所以 `begin_drain` 取鎖有上限（`DRAIN_FENCE_ACQUIRE_S`），取不到時先凍結、在途段交 Phase 2 背景完成；drain 3,000 ms 期限自請求起算並涵蓋 Phase 1 等鎖（R3-F3，§5.2.5；P1 T07 `test_finish_drain_deadline_counts_from_begin`、T08 `test_release_drain_deadline_includes_lock_wait`、T20 `test_windows_guarded_write_stall_reports_drain_stalled_on_time`）。範圍含自動登入、密碼與 ready／reconfirm probe：Python 不得以 `permit=None`（只查 drain／flash）送出，改帶 `system_probe` permit＋`login_gen`，每次提交重驗 Quiet、世代與 Drain；`_boot_quiet_blocks_probe` 只是 pre-check（R2-F1，§5.2.1；P1 T20 `test_login_probe_quiet_armed_after_precheck_before_submit_zero_tx`、P7 Task 7 `login_probe_authorized_then_quiet_arm_before_os_submit_zero_tx`）"
+    compatibility_impact: "斷線、I/O error、release、clear、bind 的 detach 期間可觀測為 RECOVERING；release 在 handle 關閉回條後才回成功；超過 3000 ms 的 release drain 逾時回 DRAIN_STALLED，並附 drain_stalled:true 與 drain_timeout_epoch；SessionPublic 新增 drain_stalled、drain_timeout_epoch 兩欄（位於 capture 之後）。"
+    approval_conditions: "ADR-06 安全骨架；OD-14 #4 裁決 release drain 逾時回 DRAIN_STALLED；規格明文；改為可喚醒、可取消；fence：授權重驗與 OS 實際提交在同一臨界區（Rust `FenceSubmitGate`、Python `_tx_fence_lock` 臨界區內單次非阻塞 `os.write`，`_state_lock` 只做 pre-check），鎖只跨非阻塞提交、不跨完成等待；禁止「驗證→放鎖→write」（R0-F1，arch §5.4 第 3 點；P1 T20、P5 Task 9 測試）。Python Windows `_PySerialPort` 是唯一例外：每段 ≤64 bytes 的 `serial.write` 在鎖內阻塞（上限 `write_timeout` 5 s），所以 `begin_drain` 取鎖有上限（`DRAIN_FENCE_ACQUIRE_S`），取不到時先凍結、在途段交 Phase 2 背景完成；drain 3,000 ms 期限自請求起算並涵蓋 Phase 1 等鎖（R3-F3，§5.2.5；P1 T07 `test_finish_drain_deadline_counts_from_begin`、T08 `test_release_drain_deadline_includes_lock_wait`、T20 `test_windows_guarded_write_stall_reports_drain_stalled_on_time`）。範圍含自動登入、密碼與 ready／reconfirm probe：Python 不得以 `permit=None`（只查 drain／flash）送出，改帶 `system_probe` permit＋`login_gen`，每次提交重驗 Quiet、世代與 Drain；`_boot_quiet_blocks_probe` 只是 pre-check（R2-F1，§5.2.1；P1 T20 `test_login_probe_quiet_armed_after_precheck_before_submit_zero_tx`、P7 Task 7 `login_probe_authorized_then_quiet_arm_before_os_submit_zero_tx`）"
     related_decisions: ["OD-14"]
   - id: "SC-05"
     kind: "SC"
@@ -1398,12 +1398,12 @@ safety_invariants:
   - id: no_reopen_before_handoff
     title: "舊 I/O worker 未完成交接前，不得另開同一受管端點，亦不得回覆釋放成功"
     spec_ref: "§11.3"
-    error_codes: ["DEVICE_STILL_HELD", "SESSION_RECOVERING"]
+    error_codes: ["DEVICE_STILL_HELD", "DRAIN_STALLED", "SESSION_RECOVERING"]
     case_ids: ["sc04-drain-recovering-release-timeout", "bc04-device-attach-sync-reacquire", "sc05-device-attach-sync-exclusive"]
   - id: no_auto_resend
     title: "已有或可能有裝置副作用的命令不得自動重送"
     spec_ref: "§11.3"
-    error_codes: ["BASE64_DECODE_FAILED", "CHECKSUM_MISMATCH", "CHECKSUM_VERIFY_FAILED", "COMMAND_ABORTED_IN_FLIGHT", "COMMAND_FAILED", "CONSOLE_LINE_LIMIT_TOO_SMALL", "EMPTY_RESPONSE", "EXCEPTION", "FORCE_RECOVER_TIMEOUT", "INTERACTIVE_EXPIRED", "INVALID_RESPONSE", "MOVE_FAILED", "MOVE_TIMEOUT", "PROMPT_TIMEOUT", "PROMPT_TIMEOUT_FORCE_RECOVERED", "PROMPT_TIMEOUT_RECOVERED", "PULL_PARSE_FAILED", "SEND_FAILED", "SOCKET_ERROR", "STATE_CHANGED", "TARGET_DECODER_FAILED", "TARGET_DECODER_MISSING", "TARGET_ENCODER_FAILED", "TARGET_ENCODER_MISSING", "TIMEOUT", "TRANSFER_ECHO_STALL", "TRANSFER_PROBE_FAILED", "TRANSFER_TIMEOUT"]
+    error_codes: ["BASE64_DECODE_FAILED", "CHECKSUM_MISMATCH", "CHECKSUM_VERIFY_FAILED", "COMMAND_ABORTED_IN_FLIGHT", "COMMAND_FAILED", "CONSOLE_LINE_LIMIT_TOO_SMALL", "DRAIN_STALLED", "EMPTY_RESPONSE", "EXCEPTION", "FORCE_RECOVER_TIMEOUT", "INTERACTIVE_EXPIRED", "INVALID_RESPONSE", "MOVE_FAILED", "MOVE_TIMEOUT", "PROMPT_TIMEOUT", "PROMPT_TIMEOUT_FORCE_RECOVERED", "PROMPT_TIMEOUT_RECOVERED", "PULL_PARSE_FAILED", "SEND_FAILED", "SOCKET_ERROR", "STATE_CHANGED", "TARGET_DECODER_FAILED", "TARGET_DECODER_MISSING", "TARGET_ENCODER_FAILED", "TARGET_ENCODER_MISSING", "TIMEOUT", "TRANSFER_ECHO_STALL", "TRANSFER_PROBE_FAILED", "TRANSFER_TIMEOUT"]
     case_ids: ["bc03-no-auto-resend", "bc03-unknown-outcome-send-failed"]
   - id: insufficient_evidence_not_pass
     title: "證據不足、擷取失敗或測試未完成不得轉為 PASS"

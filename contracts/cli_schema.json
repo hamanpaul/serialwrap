@@ -2997,7 +2997,7 @@
     },
     {
       "name": "SERIALWRAP_CONFIG",
-      "read_by": "sw_core/constants.py:103",
+      "read_by": "sw_core/constants.py:104",
       "default": null,
       "effect": "覆寫 config.yaml 讀取與寫入路徑；讀取優先於使用者目錄及系統唯讀 fallback"
     },

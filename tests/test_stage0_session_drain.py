@@ -559,7 +559,7 @@ def test_reject_paths_have_zero_side_effects(tmp_path, short_drain):
     a = mgr.attach_device("COM0")
     assert a["ok"] is False and a["error_code"] == "SESSION_RECOVERING"
     r2 = mgr.release_device("COM0")
-    assert r2["ok"] is False and r2["error_code"] == "SESSION_RECOVERING"
+    assert r2["ok"] is False and r2["error_code"] == "DRAIN_STALLED"
     assert port.writes == []
     assert len([r for r in wal_records(mgr._wal) if r.get("dir") == "TX"]) == tx_before
     assert os.path.getmtime(mgr._state_path) == state_mtime

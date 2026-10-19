@@ -344,6 +344,20 @@ codes:
     contract_tests: ["tests/test_stage0_uart_exclusive.py::TestManagerAttach::test_attach_device_held_keeps_released", "tests/test_device_handoff.py::TestAttachDevice::test_attach_refuses_when_externally_held", "tests/test_stage0_uart_exclusive.py::TestAttachProbeDrain::test_attach_device_force_rejects_plain_external_holder", "tests/test_stage0_uart_exclusive.py::TestManagerAttach::test_attach_device_pyserial_access_denied_maps_to_unknown_holder"]
     behavior_change: ["BC-04", "SC-05"]
     sources: ["sw_core/session_manager.py:2925"]
+  - code: DRAIN_STALLED
+    status: IMPLEMENTED
+    reachable: true
+    constant: ERROR_DRAIN_STALLED
+    scope: {interfaces: [rpc], methods: ["device.release"], platforms: [posix, windows]}
+    meaning: "device.release 的 drain 超過 3000 ms 仍無成功 handle 關閉回條，或收到 handle_closed=false 失敗回條（後者可立即回應）"
+    side_effect: "release 已開始但未完成：session 為 RECOVERING、by_id 已列入 released 集合（阻擋自動 attach）、在途前景命令已中止（結果見 command.get）；尚無成功關閉確認時，成功回條晚到可由 daemon 完成 release（RELEASED 並持久化），失敗回條則維持 RECOVERING 並需操作員處置"
+    retryable: "no"
+    uart_tx: possible
+    agent_action: "不要重開或讓外部工具開啟該裝置；依呼叫端等待上限輪詢 session get_state，只有 state 為 RELEASED 才交接；上限到期仍為 RECOVERING 時停止輪詢並交由操作員檢查 daemon／handle；再次 device release 不會加速完成"
+    extra_fields: ["drain_stalled", "drain_timeout_epoch", "session"]
+    contract_tests: ["tests/test_p1oc_drain_stalled.py::test_release_timeout_returns_drain_stalled", "tests/test_p1oc_drain_stalled.py::test_late_receipt_completes_release", "tests/test_p1oc_drain_stalled.py::test_close_failure_returns_drain_stalled"]
+    behavior_change: ["SC-04"]
+    sources: ["sw_core/session_manager.py:2947", "sw_core/session_manager.py:2978"]
   - code: ECHO_ACK_UNSUPPORTED
     status: EXISTING
     reachable: true
