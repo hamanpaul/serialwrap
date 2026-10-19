@@ -441,6 +441,8 @@ pub trait FsRead: Send + Sync {
     fn exists(&self, p: &Path) -> bool;
     /// `os.path.isdir`。
     fn is_dir(&self, p: &Path) -> bool;
+    /// 判斷路徑本身是否為一般檔案，不跟隨 symlink。
+    fn is_file(&self, p: &Path) -> bool;
     /// `os.listdir`；Windows 錯誤為 WinError 風格。
     fn list_dir(&self, p: &Path) -> PalResult<Vec<String>>;
 }
@@ -546,9 +548,6 @@ pub trait ProcessCtl: Send + Sync {
     /// Windows：`ShellExecuteExW(lpVerb="runas", SEE_MASK_NOCLOSEPROCESS)` 啟動 `exe` 並等待結束；
     /// 使用者拒絕 UAC 回 `ElevatedOutcome::Declined`。POSIX：`Err(kind=Unsupported)`。
     fn spawn_elevated(&self, _exe: &Path, _args: &[String]) -> PalResult<ElevatedOutcome> {
-        Err(PalError::plain(
-            PalErrorKind::Unsupported,
-            "不支援提權啟動",
-        ))
+        Err(PalError::plain(PalErrorKind::Unsupported, "不支援提權啟動"))
     }
 }

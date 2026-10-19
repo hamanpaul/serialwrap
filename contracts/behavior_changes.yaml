@@ -807,7 +807,7 @@ changes:
     ab_participation: "absolute_only"
     phases: ["P1", "P2", "P3", "P4"]
     case_ids: ["sc25-release-manifest-version-pairing"]
-    compatibility_impact: "新增 release manifest（artifact 身分與版本配對）與 doctor 的 version_pairing 檢查；CLI 既有版本警告保留。Python 側僅在 bundle 內偵測到 release manifest 時附加 version_pairing（非 advisory）；純 Python 安裝的 doctor 輸出不變。"
+    compatibility_impact: "新增 release manifest（artifact 身分與版本配對）與 doctor 的 version_pairing 檢查；CLI 既有版本警告保留。Python 側僅在 bundle 內偵測到 release manifest 時附加 version_pairing（非 advisory）；純 Python 安裝的 doctor 輸出不變。Stage 1 bundle 可選記錄 components.daemon.state_schema 與 components.supervisor.task_xml_template_sha256；未提供欄位的舊 manifest 仍有效。"
     approval_conditions: "警告保留；新增 manifest 與 doctor 配對檢查"
     related_decisions: ["OD-13"]
   - id: "SC-26"

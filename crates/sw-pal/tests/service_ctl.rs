@@ -89,6 +89,10 @@ impl FsRead for IsolatedSystemdFs {
         self.inner.is_dir(path)
     }
 
+    fn is_file(&self, path: &Path) -> bool {
+        self.inner.is_file(path)
+    }
+
     fn list_dir(&self, path: &Path) -> PalResult<Vec<String>> {
         self.inner.list_dir(path)
     }

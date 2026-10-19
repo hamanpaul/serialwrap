@@ -1,9 +1,6 @@
-//! P4-T11 安裝佈局、release manifest 驗證與版本配對 gate（§9.5、§12.1、SC-25）的失敗測試。
+//! P4-T11 安裝佈局、release manifest 驗證與版本配對 gate（§9.5、§12.1、SC-25）的回歸測試。
 //!
-//! 紅燈階段（TDD）：`sw_cli::install_layout`／`sw_cli::pairing` 的函式本體為 `unimplemented!("P4-T11: …")`，
-//! 本檔案的案例應以 `not implemented: P4-T11` panic 或斷言不符失敗，不得因編譯錯誤或 fixture 錯誤失敗。
-//! 替身與 `TestEnv` 由 P4-T1（`tests/support/mod.rs`）提供；本 Task 只將 `TestEnv::platform()` 由私有改為公開，
-//! 讓本檔以 `CliCtx`（經 [`Rig`]）呼叫需要 `ctx` 的介面。
+//! 替身與 `TestEnv` 由 P4-T1（`tests/support/mod.rs`）提供；本檔以 `CliCtx`（經 [`Rig`]）呼叫需要 `ctx` 的介面。
 //! 規格來源：`docs/rust-refactor/plans/05-stage1b-rust-cli-mgmt.md` Task 11；盤點 `inventory/07-platform-mgmt.md`。
 
 mod common;
@@ -23,11 +20,8 @@ use sw_pal::fakes::{
 use sw_pal::SysEnv;
 use sw_proto::pyjson::{PyDict, PyValue};
 use sw_proto::pypath::{HomeLookup, PathFlavor};
-use sw_proto::release_manifest::{parse_current_release, parse_manifest, ReleaseManifest};
+use sw_proto::release_manifest::{parse_current_release, parse_manifest};
 use sw_proto::runtime_paths::{EnvSnapshot, NativeTraits, RuntimePaths};
-
-/// 測試用 bundle 的 git revision（符合 schema 的 40 位小寫 hex）。
-const REV: &str = "0123456789abcdef0123456789abcdef01234567";
 
 /// `CliCtx` 的擁有者（測試用）：平台、環境快照與路徑由此持有，[`Rig::ctx`] 以借用產生 `CliCtx`。
 struct Rig {
@@ -136,45 +130,6 @@ fn sha_bytes(body: &[u8]) -> String {
     sw_proto::pycompat::sha256_hex(body)
 }
 
-/// P1 golden 演算法的測試端參考實作（與 `sw_core.release_manifest.tree_sha256` 同一定義）：
-/// 依 relpath 的位元組序排序，彙總 `"<relpath>\0<sha256>\n"` 後再取 sha256。
-fn ref_tree(files: &[(String, Vec<u8>)]) -> String {
-    let mut sorted: Vec<&(String, Vec<u8>)> = files.iter().collect();
-    sorted.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-    let mut acc = String::new();
-    for (rel, body) in sorted {
-        acc.push_str(&format!("{rel}\0{}\n", sha_bytes(body)));
-    }
-    sha_bytes(acc.as_bytes())
-}
-
-/// 遞迴收集 `base` 下的一般檔（排除 `__pycache__` 目錄與 `*.pyc`），relpath 以 `/` 連接並加上 `prefix`。
-fn collect_tree(base: &Path, prefix: &str) -> Vec<(String, Vec<u8>)> {
-    fn walk(dir: &Path, rel: &str, out: &mut Vec<(String, Vec<u8>)>) {
-        let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(dir)
-            .expect("目錄讀取失敗")
-            .map(|e| e.expect("目錄項目讀取失敗"))
-            .collect();
-        entries.sort_by_key(|e| e.file_name());
-        for entry in entries {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let path = entry.path();
-            if path.is_dir() {
-                if name == "__pycache__" {
-                    continue;
-                }
-                walk(&path, &format!("{rel}{name}/"), out);
-            } else if !name.ends_with(".pyc") {
-                let body = std::fs::read(&path).expect("檔案讀取失敗");
-                out.push((format!("{rel}{name}"), body));
-            }
-        }
-    }
-    let mut out = Vec::new();
-    walk(base, prefix, &mut out);
-    out
-}
-
 /// 安裝根樹快照（相對路徑、大小、mtime），供「失敗時不得改動」斷言。
 fn tree_snapshot(dir: &Path) -> Vec<(String, u64, SystemTime)> {
     fn walk(dir: &Path, rel: &str, out: &mut Vec<(String, u64, SystemTime)>) {
@@ -197,79 +152,6 @@ fn tree_snapshot(dir: &Path) -> Vec<(String, u64, SystemTime)> {
     out
 }
 
-/// 寫入後與 `mkbundle.sh --dev` 同形狀的 bundle 指紋（檔案與 manifest 皆已落地）。
-struct BundleFixture {
-    manifest: String,
-    cli_sha: String,
-    launcher_sha: String,
-    runtime_sha: String,
-}
-
-impl BundleFixture {
-    fn parsed(&self) -> ReleaseManifest {
-        parse_manifest(&self.manifest).unwrap_or_else(|e| panic!("manifest 解析失敗：{e:?}"))
-    }
-}
-
-/// 在 `dir` 寫入 bundle（`bin/serialwrap`、`bin/serialwrapd`、`py/bin/python3`、`py/sw_core/…`）與
-/// `release-manifest.json`，並回傳與之一致的 manifest。
-///
-/// 摘要慣例與 P1 `sw_core.release_manifest` 相同：daemon 套件樹的 relpath 以 `sw_core/` 開頭（相對於套件父目錄 `py/`）；
-/// `profiles_sha256` 為 `py/sw_core/assets/profiles` 的一般樹雜湊（relpath 相對於該目錄）；
-/// SKILL 與 supervisor 定義為單檔 sha256。
-fn write_bundle(dir: &Path, v: &str) -> BundleFixture {
-    let files: Vec<(&str, Vec<u8>)> = vec![
-        ("bin/serialwrap", format!("cli-{v}\n").into_bytes()),
-        ("bin/serialwrapd", format!("launcher-{v}\n").into_bytes()),
-        ("py/bin/python3", format!("runtime-{v}\n").into_bytes()),
-        ("py/sw_core/__init__.py", b"VERSION = 1\n".to_vec()),
-        ("py/sw_core/cli.py", format!("# cli {v}\n").into_bytes()),
-        ("py/sw_core/systemd_units.py", b"UNITS = []\n".to_vec()),
-        ("py/sw_core/assets/skill/SKILL.md", b"skill\n".to_vec()),
-        (
-            "py/sw_core/assets/skill/SKILL_WINDOWS.md",
-            b"skill windows\n".to_vec(),
-        ),
-        (
-            "py/sw_core/assets/profiles/default.yaml",
-            b"profile: default\n".to_vec(),
-        ),
-    ];
-    for (rel, body) in &files {
-        let path = dir.join(rel);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).expect("bundle 目錄建立失敗");
-        }
-        std::fs::write(&path, body).expect("bundle 檔案寫入失敗");
-    }
-    let body_of =
-        |rel: &str| -> Vec<u8> { std::fs::read(dir.join(rel)).expect("bundle 讀取失敗") };
-    let cli_sha = sha_bytes(&body_of("bin/serialwrap"));
-    let launcher_sha = sha_bytes(&body_of("bin/serialwrapd"));
-    let runtime_sha = sha_bytes(&body_of("py/bin/python3"));
-    let pkg_tree = ref_tree(&collect_tree(&dir.join("py").join("sw_core"), "sw_core/"));
-    let profiles_tree = ref_tree(&collect_tree(
-        &dir.join("py")
-            .join("sw_core")
-            .join("assets")
-            .join("profiles"),
-        "",
-    ));
-    let skill_sha = sha_bytes(&body_of("py/sw_core/assets/skill/SKILL.md"));
-    let skill_win_sha = sha_bytes(&body_of("py/sw_core/assets/skill/SKILL_WINDOWS.md"));
-    let supervisor_sha = sha_bytes(&body_of("py/sw_core/systemd_units.py"));
-    let manifest = format!(
-        r#"{{"schema_version":1,"bundle_version":"{v}","stage":"1A","created_at":"2026-10-19T00:00:00Z","target":"x86_64-unknown-linux-gnu","git_revision":"{REV}","contract_revision":"{REV}","components":{{"cli":{{"implementation":"rust","version":"{v}","git_revision":"{REV}","path":"bin/serialwrap","sha256":"{cli_sha}"}},"daemon":{{"implementation":"python","version":"{v}","git_revision":"{REV}","launcher":{{"path":"bin/serialwrapd","sha256":"{launcher_sha}"}},"entry":["py/bin/python3","-I","-B","-m","sw_core.cli"],"runtime":{{"path":"py/bin/python3","python_version":"3.12.3","sha256":"{runtime_sha}"}},"package":{{"name":"serialwrap","version":"{v}","wheel_sha256":null,"tree_sha256":"{pkg_tree}"}}}},"python_cli_delegate":{{"entry":["py/bin/python3","-I","-B","-m","sw_core.cli"],"tree_sha256":"{pkg_tree}"}},"assets":{{"skill_sha256":"{skill_sha}","skill_windows_sha256":"{skill_win_sha}","profiles_sha256":"{profiles_tree}"}},"supervisor":{{"default_mode":"on-demand","definition_sha256":"{supervisor_sha}"}}}},"pairing":{{"rule":"exact","cli_version":"{v}","daemon_version":"{v}"}}}}"#
-    );
-    std::fs::write(dir.join("release-manifest.json"), &manifest).expect("manifest 寫入失敗");
-    BundleFixture {
-        manifest,
-        cli_sha,
-        launcher_sha,
-        runtime_sha,
-    }
-}
-
 /// `PyDict` 的字串欄位（斷言輔助）。
 fn dict_str(d: &PyDict, key: &str) -> String {
     match d.get(key) {
@@ -284,6 +166,11 @@ fn matching_digests(fx: &BundleFixture) -> Vec<(String, String)> {
         ("bin/serialwrap".to_string(), fx.cli_sha.clone()),
         ("bin/serialwrapd".to_string(), fx.launcher_sha.clone()),
         ("py/bin/python3".to_string(), fx.runtime_sha.clone()),
+        ("stable_entry:serialwrap".to_string(), fx.cli_sha.clone()),
+        (
+            "stable_entry:serialwrapd".to_string(),
+            fx.launcher_sha.clone(),
+        ),
     ]
 }
 
@@ -351,6 +238,174 @@ fn switch_failure_mid_way_restores_previous_entries() {
 }
 
 #[test]
+fn switch_entries_validates_all_sources_before_touching_existing_entries() {
+    let t = TestEnv::windows().with_install_root();
+    let mut rig = Rig::from_env(&t);
+    let ctx = rig.ctx();
+    let root = resolve_install_root(&ctx);
+    t.write_file(&root.bin.join("serialwrap.exe"), b"old-cli");
+    t.write_file(&root.bin.join("serialwrapd.exe"), b"old-daemon");
+    let version_dir = root.root.join("versions").join("0.4.0");
+    t.write_file(&version_dir.join("bin/serialwrap.exe"), b"new-cli");
+
+    assert!(switch_entries(&ctx, &root, &version_dir).is_err());
+    assert_eq!(
+        std::fs::read(root.bin.join("serialwrap.exe")).unwrap(),
+        b"old-cli"
+    );
+    assert_eq!(
+        std::fs::read(root.bin.join("serialwrapd.exe")).unwrap(),
+        b"old-daemon"
+    );
+    assert!(!root.bin.join("serialwrap.exe.new").exists());
+}
+
+#[test]
+fn switch_entries_rejects_non_regular_source_before_mutation() {
+    let t = TestEnv::windows().with_install_root();
+    let mut rig = Rig::from_env(&t);
+    let ctx = rig.ctx();
+    let root = resolve_install_root(&ctx);
+    t.write_file(&root.bin.join("serialwrap.exe"), b"old-cli");
+    t.write_file(&root.bin.join("serialwrapd.exe"), b"old-daemon");
+    let version_dir = root.root.join("versions").join("0.4.0");
+    t.write_file(&version_dir.join("bin/serialwrap.exe"), b"new-cli");
+    std::fs::create_dir_all(version_dir.join("bin/serialwrapd.exe"))
+        .expect("建立非一般檔案入口目錄");
+
+    assert!(switch_entries(&ctx, &root, &version_dir).is_err());
+    assert_eq!(
+        std::fs::read(root.bin.join("serialwrap.exe")).unwrap(),
+        b"old-cli"
+    );
+    assert_eq!(
+        std::fs::read(root.bin.join("serialwrapd.exe")).unwrap(),
+        b"old-daemon"
+    );
+    assert!(!root.bin.join("serialwrap.exe.new").exists());
+}
+
+#[test]
+fn switch_entries_rejects_relative_version_dir_without_mutation() {
+    let t = TestEnv::windows().with_install_root();
+    let mut rig = Rig::from_env(&t);
+    let ctx = rig.ctx();
+    let root = resolve_install_root(&ctx);
+    t.write_file(&root.bin.join("serialwrap.exe"), b"old-cli");
+    t.write_file(&root.bin.join("serialwrapd.exe"), b"old-daemon");
+
+    assert!(switch_entries(&ctx, &root, Path::new("versions/0.4.0")).is_err());
+    assert_eq!(
+        std::fs::read(root.bin.join("serialwrap.exe")).unwrap(),
+        b"old-cli"
+    );
+    assert_eq!(
+        std::fs::read(root.bin.join("serialwrapd.exe")).unwrap(),
+        b"old-daemon"
+    );
+}
+
+#[test]
+fn cleanup_old_entries_removes_only_generated_entry_backups() {
+    let t = TestEnv::windows().with_install_root();
+    let mut rig = Rig::from_env(&t);
+    let ctx = rig.ctx();
+    let root = resolve_install_root(&ctx);
+    for name in [
+        "serialwrap.exe.old.20261020-123456",
+        "serialwrapd.exe.old.20261020-123456-001",
+    ] {
+        t.write_file(&root.bin.join(name), b"generated backup");
+    }
+    for name in [
+        "deploy.old.sh",
+        "notes.old.txt",
+        "serialwrap.exe.old.not-a-timestamp",
+    ] {
+        t.write_file(&root.bin.join(name), b"unrelated file");
+    }
+    let version_dir = make_version_dir(
+        &root.root,
+        "0.4.0",
+        &[
+            ("bin/serialwrap.exe", &b"new-cli"[..]),
+            ("bin/serialwrapd.exe", &b"new-daemon"[..]),
+        ],
+    );
+
+    switch_entries(&ctx, &root, &version_dir).expect("有效版本應切換");
+    assert!(!root.bin.join("serialwrap.exe.old.20261020-123456").exists());
+    assert!(!root
+        .bin
+        .join("serialwrapd.exe.old.20261020-123456-001")
+        .exists());
+    for name in [
+        "deploy.old.sh",
+        "notes.old.txt",
+        "serialwrap.exe.old.not-a-timestamp",
+    ] {
+        assert!(root.bin.join(name).exists(), "不得刪除無關檔案 {name}");
+    }
+}
+
+#[test]
+fn switch_failure_reports_revert_failure() {
+    let t = TestEnv::windows()
+        .with_install_root()
+        .with_fs_fault_replace_suffix("serialwrapd.exe.new")
+        .with_fs_fault_replace_source_contains("serialwrap.exe.old.");
+    let mut rig = Rig::from_env(&t);
+    let ctx = rig.ctx();
+    let root = resolve_install_root(&ctx);
+    t.write_file(&root.bin.join("serialwrap.exe"), b"old-cli");
+    t.write_file(&root.bin.join("serialwrapd.exe"), b"old-daemon");
+    let version_dir = make_version_dir(
+        &root.root,
+        "0.4.0",
+        &[
+            ("bin/serialwrap.exe", &b"new-cli"[..]),
+            ("bin/serialwrapd.exe", &b"new-daemon"[..]),
+        ],
+    );
+
+    let err = switch_entries(&ctx, &root, &version_dir).expect_err("回復失敗必須回報");
+    assert!(format!("{err:?}").contains("RevertFailed"), "err={err:?}");
+}
+
+#[test]
+fn revert_entries_attempts_remaining_entries_after_one_failure() {
+    let t = TestEnv::windows()
+        .with_install_root()
+        .with_fs_fault_replace_suffix("serialwrap.exe.old.missing");
+    let mut rig = Rig::from_env(&t);
+    let ctx = rig.ctx();
+    let root = resolve_install_root(&ctx);
+    t.write_file(&root.bin.join("serialwrap.exe"), b"new-cli");
+    t.write_file(&root.bin.join("serialwrapd.exe"), b"new-daemon");
+    let report = SwitchReport {
+        replaced: vec![
+            ("serialwrapd.exe".to_string(), None),
+            ("serialwrap.exe".to_string(), None),
+        ],
+        old_files: vec![root.bin.join("serialwrap.exe.old.missing")],
+    };
+
+    let err = revert_entries(&ctx, &root, &report).expect_err("第一個入口回復失敗應回報");
+    assert!(
+        format!("{err:?}").contains("RevertEntriesFailed"),
+        "err={err:?}"
+    );
+    assert!(
+        !root.bin.join("serialwrapd.exe").exists(),
+        "後續入口仍須嘗試回復"
+    );
+    assert_eq!(
+        std::fs::read(root.bin.join("serialwrap.exe")).unwrap(),
+        b"new-cli"
+    );
+}
+
+#[test]
 fn pairing_reports_daemon_version_mismatch() {
     let t = TestEnv::posix();
     let fx = write_bundle(&t.bundle_dir(), "0.4.0");
@@ -364,6 +419,53 @@ fn pairing_reports_daemon_version_mismatch() {
             d[0].actual.as_str()
         ),
         ("daemon_version", "0.4.0", "0.3.2")
+    );
+}
+
+#[test]
+fn manifest_optional_metadata_rejects_non_strings() {
+    let base = r#"{"schema_version":1,"bundle_version":"0.4.0","stage":"1A","target":"x86_64-unknown-linux-gnu","git_revision":"0123456789abcdef0123456789abcdef01234567","components":{"python_cli_delegate":{"entry":["py/bin/python3"]},"daemon":{"state_schema":1},"supervisor":{"task_xml_template_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}}}"#;
+    assert!(
+        parse_manifest(base).is_err(),
+        "daemon.state_schema 非字串時必須拒絕"
+    );
+
+    let bad_template = base.replace(
+        "\"state_schema\":1",
+        "\"state_schema\":\"python-state-v0\"",
+    ).replace(
+        "\"task_xml_template_sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"",
+        "\"task_xml_template_sha256\":true",
+    );
+    assert!(
+        parse_manifest(&bad_template).is_err(),
+        "supervisor.task_xml_template_sha256 非字串時必須拒絕"
+    );
+
+    let valid = base.replace("\"state_schema\":1", "\"state_schema\":\"python-state-v0\"");
+    let bad_hash = valid.replace(
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "not-a-sha256",
+    );
+    assert!(
+        parse_manifest(&bad_hash).is_err(),
+        "task_xml_template_sha256 必須為 64 位小寫十六進位"
+    );
+    let manifest = parse_manifest(&valid).expect("optional metadata 為字串時應可解析");
+    assert_eq!(manifest.state_schema(), Some("python-state-v0"));
+    assert_eq!(
+        manifest.task_xml_template_sha256(),
+        Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+    );
+}
+
+#[test]
+fn task_xml_template_hash_is_golden_and_includes_working_directory_slot() {
+    let template = sw_pal::service_ctl::TASK_XML_TEMPLATE;
+    assert!(template.contains("{WORKING_DIRECTORY}"));
+    assert_eq!(
+        sha_bytes(template.as_bytes()),
+        "d7a97770f2f0a3b41e51cdfaa95366391cf7f5e6ab523b0b2685542f24740965"
     );
 }
 
@@ -382,6 +484,29 @@ fn install_root_env_override() {
     let root = resolve_install_root(&ctx);
     assert_eq!(root.root, PathBuf::from("/x"));
     assert_eq!(root.bin, PathBuf::from("/x/bin"));
+}
+
+#[test]
+fn windows_install_root_override_preserves_absolute_host_path() {
+    let home = tempfile::tempdir().unwrap();
+    let expected = home.path().join("install");
+    let expected_text = expected.display().to_string();
+    let exe = home.path().join("serialwrap.exe");
+    let mut rig = custom_rig(
+        true,
+        home.path(),
+        &[("SERIALWRAP_INSTALL_ROOT", expected_text.as_str())],
+        &exe,
+        None,
+    );
+    let ctx = rig.ctx();
+    let root = resolve_install_root(&ctx);
+    assert_eq!(root.root, expected);
+    assert_eq!(
+        root.bin,
+        PathBuf::from(format!("{}\\bin", expected.display()))
+    );
+    assert!(root.bin.is_absolute(), "假 Windows 下仍須保留 tmp 絕對路徑");
 }
 
 #[test]
@@ -514,6 +639,23 @@ fn stage_version_existing_corrupt_refused() {
 }
 
 #[test]
+fn stage_version_rejects_non_semver_path_components() {
+    let t = TestEnv::posix();
+    let mut rig = Rig::from_env(&t);
+    let ctx = rig.ctx();
+    let root = resolve_install_root(&ctx);
+    let bundle = t.bundle_dir();
+    let fx = write_bundle(&bundle, "0.4.0");
+    let mut manifest = fx.parsed();
+    manifest.bundle_version = "..".to_string();
+
+    let err = stage_version(&ctx, &root, &bundle, &manifest)
+        .expect_err("bundle_version 不得成為路徑元件");
+    assert!(matches!(err, LayoutError::Parse { .. }), "err={err:?}");
+    assert!(!root.versions.exists(), "拒絕不合法版本時不得建立版本目錄");
+}
+
+#[test]
 fn verify_bundle_detects_tree_tamper() {
     let t = TestEnv::posix();
     let mut rig = Rig::from_env(&t);
@@ -521,12 +663,7 @@ fn verify_bundle_detects_tree_tamper() {
     let bundle = t.bundle_dir();
     let fx = write_bundle(&bundle, "0.4.0");
     let m = fx.parsed();
-    if let Err(diffs) = verify_bundle(&ctx, &bundle, &m) {
-        assert!(
-            diffs.iter().all(|d| d.field != "tree_sha256:daemon"),
-            "未改動前 daemon 樹不得報差異：{diffs:?}"
-        );
-    }
+    verify_bundle(&ctx, &bundle, &m).expect("原始 bundle 必須通過驗證");
     let target = bundle.join("py").join("sw_core").join("cli.py");
     let mut body = std::fs::read(&target).unwrap();
     let last = body.len() - 1;
@@ -538,6 +675,178 @@ fn verify_bundle_detects_tree_tamper() {
         diffs.iter().any(|d| d.field == "tree_sha256:daemon"),
         "diffs={diffs:?}"
     );
+}
+
+#[test]
+fn verify_windows_bundle_fixture_uses_native_temp_paths() {
+    let t = TestEnv::windows();
+    let mut rig = Rig::from_env(&t);
+    let ctx = rig.ctx();
+    let bundle = t.bundle_dir();
+    let fx = write_complete_bundle(&bundle, "0.4.0", "x86_64-pc-windows-gnu", true, &[], &[]);
+
+    verify_bundle(&ctx, &bundle, &fx.parsed())
+        .expect("假 Windows 平台也應以宿主暫存路徑驗證完整 bundle");
+}
+
+#[test]
+fn verify_bundle_rejects_windows_drive_component_paths() {
+    let t = TestEnv::windows();
+    let mut rig = Rig::from_env(&t);
+    let ctx = rig.ctx();
+    let bundle = t.bundle_dir();
+    let fx = write_complete_bundle(&bundle, "0.4.0", "x86_64-pc-windows-gnu", true, &[], &[]);
+    for path in ["C:outside-cli", "C:/outside-cli"] {
+        let manifest = fx.manifest.replace(
+            "\"path\":\"bin/serialwrap.exe\"",
+            &format!("\"path\":\"{path}\""),
+        );
+        t.write_file(&bundle.join("release-manifest.json"), manifest.as_bytes());
+        let m = parse_manifest(&manifest).expect("危險路徑由 bundle verifier 拒絕");
+        let diffs = verify_bundle(&ctx, &bundle, &m).expect_err("Windows 磁碟機路徑不得逃逸");
+        assert!(
+            diffs
+                .iter()
+                .any(|diff| diff.field == "sha256:bin/serialwrap"),
+            "危險路徑須產生 CLI digest 差異：{diffs:?}"
+        );
+    }
+}
+
+#[test]
+fn verify_bundle_checks_declared_and_undeclared_python_bytecode() {
+    let t = TestEnv::posix();
+    let mut rig = Rig::from_env(&t);
+    let ctx = rig.ctx();
+    let bundle = t.bundle_dir();
+    let fx = write_bundle(&bundle, "0.4.0");
+    let m = fx.parsed();
+    verify_bundle(&ctx, &bundle, &m).expect("含已宣告 pyc 的 pristine bundle 應通過");
+
+    let pyc = bundle.join("py/sw_core/__pycache__/cli.cpython-312.pyc");
+    t.write_file(&pyc, b"tampered bytecode");
+    let diffs = verify_bundle(&ctx, &bundle, &m).expect_err("已宣告 pyc 被竄改必須失敗");
+    assert!(diffs
+        .iter()
+        .any(|d| d.field == "sha256:py/sw_core/__pycache__/cli.cpython-312.pyc"));
+
+    t.write_file(&pyc, b"compiled cli\n");
+    std::fs::remove_file(&pyc).expect("刪除測試 pyc 失敗");
+    let diffs = verify_bundle(&ctx, &bundle, &m).expect_err("已宣告 pyc 遺失必須失敗");
+    assert!(diffs
+        .iter()
+        .any(|d| d.field == "sha256:py/sw_core/__pycache__/cli.cpython-312.pyc"));
+
+    t.write_file(
+        &bundle.join("py/sw_core/__pycache__/undeclared.pyc"),
+        b"extra",
+    );
+    let diffs = verify_bundle(&ctx, &bundle, &m).expect_err("未宣告 pyc 必須失敗");
+    assert!(diffs
+        .iter()
+        .any(|d| d.field == "sha256:py/sw_core/__pycache__/undeclared.pyc"));
+}
+
+#[test]
+fn verify_bundle_rejects_missing_digest_and_component_paths_that_escape() {
+    let t = TestEnv::posix();
+    let mut rig = Rig::from_env(&t);
+    let ctx = rig.ctx();
+    let bundle = t.bundle_dir();
+    let fx = write_bundle(&bundle, "0.4.0");
+    let cli_line = format!("{}  bin/serialwrap\n", fx.cli_sha);
+
+    let mut incomplete = fx
+        .manifest
+        .replace(&format!(r#","sha256":"{}""#, fx.cli_sha), "");
+    assert_ne!(incomplete, fx.manifest, "測試須移除 CLI digest 欄位");
+    t.write_file(&bundle.join("release-manifest.json"), incomplete.as_bytes());
+    let m = parse_manifest(&incomplete).expect("缺 digest 的結構性 fixture 應可供 verifier 拒絕");
+    std::fs::remove_file(bundle.join("bin/serialwrap")).expect("刪除 CLI fixture 失敗");
+    let sums_path = bundle.join("SHA256SUMS");
+    let sums = std::fs::read_to_string(&sums_path).expect("讀取 SHA256SUMS 失敗");
+    t.write_file(&sums_path, sums.replace(&cli_line, "").as_bytes());
+    let diffs = verify_bundle(&ctx, &bundle, &m).expect_err("缺 digest 與檔案都不得形成假通過");
+    assert!(diffs.iter().any(|d| d.field == "sha256:bin/serialwrap"));
+
+    let outside = bundle.parent().unwrap().join("outside-cli");
+    t.write_file(&outside, format!("cli-0.4.0\n").as_bytes());
+    for escaped_path in ["../outside-cli".to_string(), outside.display().to_string()] {
+        incomplete = fx.manifest.replace(
+            "\"path\":\"bin/serialwrap\"",
+            &format!("\"path\":\"{escaped_path}\""),
+        );
+        t.write_file(&bundle.join("release-manifest.json"), incomplete.as_bytes());
+        let m = parse_manifest(&incomplete).expect("逃逸路徑 fixture 應可解析後由 verifier 拒絕");
+        let diffs = verify_bundle(&ctx, &bundle, &m).expect_err("component path 不得離開 bundle");
+        assert!(diffs.iter().any(|d| d.field == "sha256:bin/serialwrap"));
+    }
+}
+
+#[test]
+#[ignore = "pytest 以真實 mkbundle.sh --dev 輸出設定 SERIALWRAP_TEST_MKBUNDLE_DIR"]
+fn real_mkbundle_dev_output_verifies() {
+    let bundle = std::env::var_os("SERIALWRAP_TEST_MKBUNDLE_DIR")
+        .map(PathBuf::from)
+        .expect("pytest 必須提供真實 dev bundle 目錄");
+    let manifest_text = std::fs::read_to_string(bundle.join("release-manifest.json"))
+        .expect("讀取真實 release manifest 失敗");
+    let manifest = parse_manifest(&manifest_text).expect("真實 release manifest 必須可解析");
+    let t = TestEnv::posix();
+    let mut rig = Rig::from_env(&t);
+    let ctx = rig.ctx();
+    verify_bundle(&ctx, &bundle, &manifest)
+        .expect("mkbundle.sh --dev 產物必須通過 Rust verify_bundle");
+}
+
+#[test]
+fn stage_version_refuses_missing_malformed_or_mismatched_existing_manifest() {
+    for damage in ["missing", "malformed", "mismatched"] {
+        let t = TestEnv::posix();
+        let mut rig = Rig::from_env(&t);
+        let ctx = rig.ctx();
+        let root = resolve_install_root(&ctx);
+        let bundle = t.bundle_dir();
+        let fx = write_bundle(&bundle, "0.4.0");
+        let m = fx.parsed();
+        let installed = stage_version(&ctx, &root, &bundle, &m).expect("初次 stage 應成功");
+        let manifest = installed.join("release-manifest.json");
+        match damage {
+            "missing" => std::fs::remove_file(&manifest).expect("移除 manifest 失敗"),
+            "malformed" => t.write_file(&manifest, b"not json"),
+            _ => {
+                let altered = fx.manifest.replace(
+                    "\"bundle_version\":\"0.4.0\"",
+                    "\"bundle_version\":\"0.4.0\",\"x-fixture\":\"changed\"",
+                );
+                t.write_file(&manifest, altered.as_bytes());
+            }
+        }
+        let err = stage_version(&ctx, &root, &bundle, &m)
+            .expect_err("既有版本的 manifest 缺失、損壞或不同時必須拒絕");
+        assert!(
+            matches!(err, LayoutError::ExistingCorrupt(_)),
+            "damage={damage} err={err:?}"
+        );
+    }
+}
+
+#[test]
+fn stage_version_verification_error_caps_rendered_diffs() {
+    let t = TestEnv::posix();
+    let mut rig = Rig::from_env(&t);
+    let ctx = rig.ctx();
+    let root = resolve_install_root(&ctx);
+    let bundle = t.bundle_dir();
+    let fx = write_bundle(&bundle, "0.4.0");
+    let m = fx.parsed();
+    for n in 0..25 {
+        t.write_file(&bundle.join(format!("extra-{n:02}.dat")), b"unlisted");
+    }
+
+    let err = stage_version(&ctx, &root, &bundle, &m).expect_err("未宣告檔案不得 stage");
+    let rendered = err.to_string();
+    assert!(rendered.contains("另有 5 項差異"), "rendered={rendered}");
 }
 
 #[test]
@@ -614,6 +923,28 @@ fn pairing_item_matches_p1_shape() {
 }
 
 #[test]
+fn pairing_item_rejects_non_exact_rule() {
+    let t = TestEnv::posix();
+    let bundle = t.bundle_dir();
+    let fx = write_bundle(&bundle, "0.4.0");
+    let mut m = fx.parsed();
+    let mut pairing = PyDict::new();
+    pairing.insert("rule", PyValue::Str("loose".to_string()));
+    pairing.insert("cli_version", PyValue::Str("0.4.0".to_string()));
+    pairing.insert("daemon_version", PyValue::Str("0.4.0".to_string()));
+    m.raw.insert("pairing", PyValue::Dict(pairing));
+
+    let item = pairing_item(&m, &bundle, "0.4.0", Some("0.4.0"));
+    assert_eq!(item.get("ok"), Some(&PyValue::Bool(false)));
+    assert_eq!(
+        item.get("mismatches"),
+        Some(&PyValue::List(vec![PyValue::Str(
+            "pairing_rule".to_string()
+        )]))
+    );
+}
+
+#[test]
 fn install_lock_second_updater_times_out_without_changes() {
     let t = TestEnv::posix();
     let mut rig = Rig::from_env(&t);
@@ -650,6 +981,61 @@ fn install_lock_second_updater_times_out_without_changes() {
         before,
         "取鎖失敗時安裝根樹（含 mtime）不得改變"
     );
+}
+
+#[test]
+fn install_lock_creates_missing_root_for_first_install() {
+    let t = TestEnv::posix();
+    let mut rig = Rig::from_env(&t);
+    let ctx = rig.ctx();
+    let root = resolve_install_root(&ctx);
+    std::fs::remove_dir_all(&root.root).expect("移除 TestEnv 預建安裝根");
+    assert!(!root.root.exists(), "首次安裝測試起點必須沒有安裝根");
+
+    let _guard = install_lock(&ctx, &root).expect("首次安裝應先建立安裝根再取得鎖");
+    assert!(root.root.is_dir());
+    assert!(root.root.join(".install.lock").is_file());
+}
+
+#[test]
+fn install_lock_error_uses_clean_pal_message() {
+    let t = TestEnv::posix();
+    let mut rig = Rig::from_env(&t);
+    let ctx = rig.ctx();
+    let root = resolve_install_root(&ctx);
+    std::fs::remove_dir_all(&root.root).expect("移除測試安裝根");
+    std::fs::write(&root.root, b"not a directory").expect("建立阻擋目錄的測試檔");
+
+    let error = install_lock(&ctx, &root).expect_err("安裝根為一般檔案時應回錯");
+    let message = dict_str(&error, "message");
+    assert!(
+        !message.contains("PalError {"),
+        "不得把 PAL Debug 輸出給使用者：{message}"
+    );
+    assert!(message.contains("安裝根"), "應提供可讀錯誤：{message}");
+}
+
+#[test]
+fn verify_bundle_errors_do_not_include_pal_debug_structs() {
+    let t = TestEnv::posix();
+    write_bundle(&t.bundle_dir(), "0.4.0");
+    std::fs::remove_dir_all(t.bundle_dir().join("py/sw_core"))
+        .expect("移除 package 樹以注入讀取錯誤");
+    let m = parse_manifest(
+        &std::fs::read_to_string(t.bundle_dir().join("release-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let mut rig = Rig::from_env(&t);
+    let ctx = rig.ctx();
+
+    let diffs = verify_bundle(&ctx, &t.bundle_dir(), &m).expect_err("缺 package 時應失敗");
+    assert!(!diffs.is_empty());
+    for diff in diffs {
+        assert!(
+            !diff.expected.contains("PalError {") && !diff.actual.contains("PalError {"),
+            "不得洩漏 PAL Debug 輸出：{diff:?}"
+        );
+    }
 }
 
 #[test]
@@ -761,6 +1147,69 @@ fn pairing_exact_all_ok() {
     let m = fx.parsed();
     let d = check_pairing(&m, "0.4.0", Some("0.4.0"), &matching_digests(&fx));
     assert!(d.is_empty(), "全相符時不得有差異：{d:?}");
+}
+
+#[test]
+fn pairing_rejects_component_paths_outside_bundle() {
+    let t = TestEnv::posix();
+    let fx = write_bundle(&t.bundle_dir(), "0.4.0");
+    let manifest = fx
+        .manifest
+        .replace("\"path\":\"bin/serialwrap\"", "\"path\":\"../outside-cli\"");
+    let m = parse_manifest(&manifest).expect("逃逸路徑由 pairing gate 拒絕，不由基本 parser 拒絕");
+    let mut digests = matching_digests(&fx);
+    digests[0].0 = "../outside-cli".to_string();
+
+    let diffs = check_pairing(&m, "0.4.0", Some("0.4.0"), &digests);
+    assert!(
+        diffs
+            .iter()
+            .any(|diff| diff.field == "sha256:../outside-cli"
+                && diff.expected == "bundle-relative path"),
+        "component digest 不得由 bundle 外路徑滿足：{diffs:?}"
+    );
+}
+
+#[test]
+fn pairing_undeclared_digest_never_matches_missing_evidence() {
+    let t = TestEnv::posix();
+    let fx = write_bundle(&t.bundle_dir(), "0.4.0");
+    let m = fx.parsed();
+    let diffs = check_pairing(
+        &m,
+        "0.4.0",
+        Some("0.4.0"),
+        &[("not-declared".to_string(), "missing".to_string())],
+    );
+    assert!(
+        diffs.iter().any(|diff| diff.field == "sha256:not-declared"),
+        "未宣告 digest 不得因 actual 文字為 missing 而通過：{diffs:?}"
+    );
+}
+
+#[test]
+fn pairing_item_respects_symlink_or_copy_package_directories() {
+    let t = TestEnv::posix();
+    let bundle = t.bundle_dir();
+    let fx = write_bundle(&bundle, "0.4.0");
+    let outside = bundle.parent().unwrap().join("external-package");
+    t.write_file(&outside.join("injected.py"), b"outside");
+    let link = bundle.join("py/sw_core/external");
+    let link_kind = t.with_cli_ctx(|ctx| {
+        ctx.p
+            .fs
+            .symlink_or_copy_dir(&link, &outside)
+            .expect("建立 package 目錄 symlink／複本失敗")
+    });
+    let m = fx.parsed();
+
+    let item = pairing_item(&m, &bundle, "0.4.0", Some("0.4.0"));
+    let expected_ok = link_kind == sw_pal::fs_ops::LinkKind::Symlink;
+    assert_eq!(
+        item.get("ok"),
+        Some(&PyValue::Bool(expected_ok)),
+        "symlink 目錄不納入樹雜湊；權限不足而複製的目錄則屬套件內容"
+    );
 }
 
 #[test]

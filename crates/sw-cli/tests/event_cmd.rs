@@ -54,6 +54,7 @@ impl sw_pal::FsRead for DummyFs {
     fn read(&self, _: &std::path::Path) -> sw_pal::PalResult<Vec<u8>> { unimplemented!() }
     fn exists(&self, _: &std::path::Path) -> bool { false }
     fn is_dir(&self, _: &std::path::Path) -> bool { false }
+    fn is_file(&self, _: &std::path::Path) -> bool { false }
     fn list_dir(&self, _: &std::path::Path) -> sw_pal::PalResult<Vec<String>> { unimplemented!() }
 }
 

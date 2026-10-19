@@ -42,6 +42,8 @@ fn test_parse_manifest_fixture_normal() {
                 "-m".into(),
                 "sw_core.cli".into(),
             ],
+            state_schema: None,
+            task_xml_template_sha256: None,
             raw: manifest.raw.clone(),
         }
     );
@@ -117,6 +119,35 @@ fn test_parse_manifest_schema_version_2() {
 fn test_parse_manifest_invalid_json() {
     let text = r#"not valid json {"#;
     assert!(matches!(parse_manifest(text), Err(ManifestError::InvalidJson(_))));
+}
+
+#[test]
+fn test_parse_manifest_rejects_missing_or_non_exact_pairing_rule() {
+    let base = r#"{
+      "schema_version": 1,
+      "bundle_version": "0.3.2",
+      "stage": "1A",
+      "target": "x86_64-unknown-linux-gnu",
+      "git_revision": "abcdef0123456789",
+      "components": {
+        "python_cli_delegate": {
+          "entry": ["py/python"]
+        }
+      },
+      "pairing": {"cli_version": "0.3.2", "daemon_version": "0.3.2"}
+    }"#;
+    assert!(
+        matches!(parse_manifest(base), Err(ManifestError::Schema(_))),
+        "缺 pairing.rule 時必須拒絕"
+    );
+    let invalid = base.replace(
+        r#""cli_version": "0.3.2""#,
+        r#""rule": "loose", "cli_version": "0.3.2""#,
+    );
+    assert!(
+        matches!(parse_manifest(&invalid), Err(ManifestError::Schema(_))),
+        "pairing.rule 不是 exact 時必須拒絕"
+    );
 }
 
 #[test]

@@ -26,6 +26,7 @@ pub mod rollback;
 pub mod setup_cmd;
 pub mod state_migrate;
 pub mod supervisor_defs;
+mod tree_digest;
 pub mod wslconf;
 
 use std::any::Any;

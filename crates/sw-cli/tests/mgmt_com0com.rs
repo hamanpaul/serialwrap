@@ -74,18 +74,22 @@ fn manifest_text(v: &str, cli_sha: &str, component: Option<String>) -> String {
 /// 寫出 Windows 測試 bundle：`bin/serialwrap`、`bin/sw-com0com-helper.exe`、manifest；`with_component` 為真時附 `optional/com0com/`。
 fn write_bundle(t: &TestEnv, v: &str, with_component: bool) {
     let root = t.bundle_dir();
-    let cli = format!("bundle-{v}");
-    t.write_file(&root.join("bin").join("serialwrap"), cli.as_bytes());
-    t.write_file(&root.join(HELPER_REL), b"fixture-helper");
-    let component = with_component.then(|| {
-        let files = component_files();
-        for (rel, body) in &files {
-            t.write_file(&root.join(rel), body);
-        }
-        com0com_component_json(&component_digest(&files))
-    });
-    let manifest = manifest_text(v, &sha256_hex(&cli), component);
-    t.write_file(&root.join("release-manifest.json"), manifest.as_bytes());
+    let mut files = vec![(HELPER_REL, b"fixture-helper".to_vec())];
+    let mut components = Vec::new();
+    if with_component {
+        let component_files = component_files();
+        let digest = component_digest(&component_files);
+        components.push(("com0com", com0com_component_json(&digest)));
+        files.extend(component_files);
+    }
+    write_complete_bundle(
+        &root,
+        v,
+        "x86_64-pc-windows-gnu",
+        true,
+        &files,
+        &components,
+    );
 }
 
 /// 已啟動 `windows-task` 監管、附 process 替身的 Windows 測試環境，bundle 版本為 `v`。
@@ -157,7 +161,7 @@ fn svec(items: &[&str]) -> Vec<String> {
 }
 
 fn helper_exe(t: &TestEnv) -> PathBuf {
-    t.bundle_dir().join("bin").join("sw-com0com-helper.exe")
+    t.bundle_dir().join(HELPER_REL)
 }
 
 /// 以 `PyValue::Dict` 取欄位（缺欄位即 panic 並印出原值）。

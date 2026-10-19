@@ -177,6 +177,60 @@ pub struct TaskXmlSpec {
 ///
 /// `working_dir` 為空時省略 `<WorkingDirectory>`：Task Scheduler 對空元素回
 /// 「value which is incorrectly formatted or out of range」使 `schtasks /Create /XML` 失敗。
+/// Task Scheduler XML 完整未代入樣板；release manifest 以此位元組序列計算摘要。
+pub const TASK_XML_TEMPLATE: &str = concat!(
+    "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n",
+    "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n",
+    "  <RegistrationInfo>\r\n",
+    "    <Description>serialwrap UART broker daemon (windows-task)</Description>\r\n",
+    "    <URI>\\{TASK_NAME}</URI>\r\n",
+    "  </RegistrationInfo>\r\n",
+    "  <Triggers>\r\n",
+    "    <LogonTrigger>\r\n",
+    "      <Enabled>true</Enabled>\r\n",
+    "      <UserId>{USER_ID}</UserId>\r\n",
+    "    </LogonTrigger>\r\n",
+    "  </Triggers>\r\n",
+    "  <Principals>\r\n",
+    "    <Principal id=\"Author\">\r\n",
+    "      <UserId>{USER_ID}</UserId>\r\n",
+    "      <LogonType>InteractiveToken</LogonType>\r\n",
+    "      <RunLevel>LeastPrivilege</RunLevel>\r\n",
+    "    </Principal>\r\n",
+    "  </Principals>\r\n",
+    "  <Settings>\r\n",
+    "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n",
+    "    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n",
+    "    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\r\n",
+    "    <AllowHardTerminate>true</AllowHardTerminate>\r\n",
+    "    <StartWhenAvailable>true</StartWhenAvailable>\r\n",
+    "    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\r\n",
+    "    <IdleSettings>\r\n",
+    "      <StopOnIdleEnd>false</StopOnIdleEnd>\r\n",
+    "      <RestartOnIdle>false</RestartOnIdle>\r\n",
+    "    </IdleSettings>\r\n",
+    "    <AllowStartOnDemand>true</AllowStartOnDemand>\r\n",
+    "    <Enabled>{ENABLED}</Enabled>\r\n",
+    "    <Hidden>false</Hidden>\r\n",
+    "    <RunOnlyIfIdle>false</RunOnlyIfIdle>\r\n",
+    "    <WakeToRun>false</WakeToRun>\r\n",
+    "    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\r\n",
+    "    <Priority>7</Priority>\r\n",
+    "    <RestartOnFailure>\r\n",
+    "      <Interval>PT1M</Interval>\r\n",
+    "      <Count>999</Count>\r\n",
+    "    </RestartOnFailure>\r\n",
+    "  </Settings>\r\n",
+    "  <Actions Context=\"Author\">\r\n",
+    "    <Exec>\r\n",
+    "      <Command>{COMMAND}</Command>\r\n",
+    "      <Arguments>{ARGUMENTS}</Arguments>\r\n",
+    "{WORKING_DIRECTORY}",
+    "    </Exec>\r\n",
+    "  </Actions>\r\n",
+    "</Task>\r\n"
+);
+
 pub fn render_task_xml(spec: &TaskXmlSpec) -> String {
     let enabled = if spec.enabled { "true" } else { "false" };
     let working_dir_line = if spec.working_dir.is_empty() {
@@ -187,67 +241,13 @@ pub fn render_task_xml(spec: &TaskXmlSpec) -> String {
             xml_escape(&spec.working_dir)
         )
     };
-    format!(
-        concat!(
-            "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n",
-            "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n",
-            "  <RegistrationInfo>\r\n",
-            "    <Description>serialwrap UART broker daemon (windows-task)</Description>\r\n",
-            "    <URI>\\{}</URI>\r\n",
-            "  </RegistrationInfo>\r\n",
-            "  <Triggers>\r\n",
-            "    <LogonTrigger>\r\n",
-            "      <Enabled>true</Enabled>\r\n",
-            "      <UserId>{}</UserId>\r\n",
-            "    </LogonTrigger>\r\n",
-            "  </Triggers>\r\n",
-            "  <Principals>\r\n",
-            "    <Principal id=\"Author\">\r\n",
-            "      <UserId>{}</UserId>\r\n",
-            "      <LogonType>InteractiveToken</LogonType>\r\n",
-            "      <RunLevel>LeastPrivilege</RunLevel>\r\n",
-            "    </Principal>\r\n",
-            "  </Principals>\r\n",
-            "  <Settings>\r\n",
-            "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n",
-            "    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n",
-            "    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\r\n",
-            "    <AllowHardTerminate>true</AllowHardTerminate>\r\n",
-            "    <StartWhenAvailable>true</StartWhenAvailable>\r\n",
-            "    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\r\n",
-            "    <IdleSettings>\r\n",
-            "      <StopOnIdleEnd>false</StopOnIdleEnd>\r\n",
-            "      <RestartOnIdle>false</RestartOnIdle>\r\n",
-            "    </IdleSettings>\r\n",
-            "    <AllowStartOnDemand>true</AllowStartOnDemand>\r\n",
-            "    <Enabled>{}</Enabled>\r\n",
-            "    <Hidden>false</Hidden>\r\n",
-            "    <RunOnlyIfIdle>false</RunOnlyIfIdle>\r\n",
-            "    <WakeToRun>false</WakeToRun>\r\n",
-            "    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\r\n",
-            "    <Priority>7</Priority>\r\n",
-            "    <RestartOnFailure>\r\n",
-            "      <Interval>PT1M</Interval>\r\n",
-            "      <Count>999</Count>\r\n",
-            "    </RestartOnFailure>\r\n",
-            "  </Settings>\r\n",
-            "  <Actions Context=\"Author\">\r\n",
-            "    <Exec>\r\n",
-            "      <Command>{}</Command>\r\n",
-            "      <Arguments>{}</Arguments>\r\n",
-            "{}",
-            "    </Exec>\r\n",
-            "  </Actions>\r\n",
-            "</Task>\r\n"
-        ),
-        xml_escape(&spec.name),
-        xml_escape(&spec.user_id),
-        xml_escape(&spec.user_id),
-        enabled,
-        xml_escape(&spec.command),
-        xml_escape(&spec.arguments),
-        working_dir_line,
-    )
+    TASK_XML_TEMPLATE
+        .replace("{TASK_NAME}", &xml_escape(&spec.name))
+        .replace("{USER_ID}", &xml_escape(&spec.user_id))
+        .replace("{ENABLED}", enabled)
+        .replace("{COMMAND}", &xml_escape(&spec.command))
+        .replace("{ARGUMENTS}", &xml_escape(&spec.arguments))
+        .replace("{WORKING_DIRECTORY}", &working_dir_line)
 }
 
 /// UTF-16LE 並加 BOM（`FF FE`）。

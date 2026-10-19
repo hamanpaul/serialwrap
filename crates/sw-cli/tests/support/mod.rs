@@ -32,6 +32,7 @@ pub use sw_pal::traits::{Clock, SupervisionMode, SysEnv};
 use sw_pal::PalErrorKind;
 use sw_proto::pypath::{HomeLookup, PathFlavor};
 use sw_proto::pyjson::{dumps_dict, loads, PyDict, PyInt, PyValue, DISK_STABLE};
+use sw_proto::release_manifest::{parse_manifest, ReleaseManifest};
 use sw_proto::runtime_paths::{EnvSnapshot, NativeTraits, RuntimePaths};
 
 /// 腳本化 argv 的環境操作（`FakeSysEnvBuilder` 的一次呼叫，保存下來以便每次重建替身）。
@@ -557,63 +558,61 @@ impl TestEnv {
         self
     }
 
-    /// `install/current-release.json` 與 `versions/<v>/bin/serialwrap`；`prev` 給定時一併建立 `versions/<prev>`。
+    /// 建立目前版本與 current 檔；POSIX 寫 `<root>/current-release.json`，Windows 寫 `<root>/bin/current-release.json`。
     pub fn with_current(self, v: &str, prev: Option<&str>) -> Self {
-        let install = self.install_root();
+        let root = self.root();
+        let join = |base: &Path, child: &str| {
+            if self.windows {
+                PathBuf::from(format!("{}\\{child}", base.display()))
+            } else {
+                base.join(child)
+            }
+        };
         let body = format!("current-{v}");
-        make_version_dir(&install, v, &[
-            ("bin/serialwrap", body.as_bytes()),
-            ("bin/serialwrap.exe", body.as_bytes()),
-            ("bin/serialwrapd", body.as_bytes()),
-            ("bin/serialwrapd.exe", body.as_bytes()),
-        ]);
+        for name in ["serialwrap", "serialwrap.exe", "serialwrapd", "serialwrapd.exe"] {
+            let version_dir = join(&root.versions, v);
+            let bin = join(&version_dir, "bin");
+            self.write_file(&join(&bin, name), body.as_bytes());
+        }
         if let Some(p) = prev {
             let prev_body = format!("previous-{p}");
-            make_version_dir(&install, p, &[
-                ("bin/serialwrap", prev_body.as_bytes()),
-                ("bin/serialwrap.exe", prev_body.as_bytes()),
-                ("bin/serialwrapd", prev_body.as_bytes()),
-                ("bin/serialwrapd.exe", prev_body.as_bytes()),
-            ]);
+            for name in ["serialwrap", "serialwrap.exe", "serialwrapd", "serialwrapd.exe"] {
+                let version_dir = join(&root.versions, p);
+                let bin = join(&version_dir, "bin");
+                self.write_file(&join(&bin, name), prev_body.as_bytes());
+            }
         }
         let current = format!(r#"{{"bundle_version":"{v}","dir":"versions/{v}"}}"#);
-        self.write_file(&install.join("current-release.json"), current.as_bytes());
-        self.write_file(&install.join("bin").join("serialwrap"), body.as_bytes());
-        self.write_file(&install.join("bin").join("serialwrap.exe"), body.as_bytes());
-        self.write_file(&install.join("bin").join("serialwrapd"), body.as_bytes());
-        self.write_file(&install.join("bin").join("serialwrapd.exe"), body.as_bytes());
+        self.write_file(&root.current_file, current.as_bytes());
+        for name in ["serialwrap", "serialwrap.exe", "serialwrapd", "serialwrapd.exe"] {
+            self.write_file(&join(&root.bin, name), body.as_bytes());
+        }
         self
     }
 
     /// `versions/<v>/bin/serialwrap` 安裝版本目錄（不改 current）。
     pub fn with_installed(self, v: &str) -> Self {
         let body = format!("installed-{v}");
-        make_version_dir(
-            &self.install_root(),
-            v,
-            &[
-                ("bin/serialwrap", body.as_bytes()),
-                ("bin/serialwrap.exe", body.as_bytes()),
-                ("bin/serialwrapd", body.as_bytes()),
-                ("bin/serialwrapd.exe", body.as_bytes()),
-            ],
-        );
+        let root = self.root();
+        let join = |base: &Path, child: &str| {
+            if self.windows {
+                PathBuf::from(format!("{}\\{child}", base.display()))
+            } else {
+                base.join(child)
+            }
+        };
+        for name in ["serialwrap", "serialwrap.exe", "serialwrapd", "serialwrapd.exe"] {
+            let version_dir = join(&root.versions, v);
+            let bin = join(&version_dir, "bin");
+            self.write_file(&join(&bin, name), body.as_bytes());
+        }
         self
     }
 
     /// bundle 根的 `bin/serialwrap` 與 `release-manifest.json`（manifest 形狀同 `mkbundle.sh`，sha256 為真值）。
     pub fn with_bundle(self, v: &str) -> Self {
-        let cli = format!("bundle-{v}");
-        self.write_file(
-            &self.bundle_dir().join("bin").join("serialwrap"),
-            cli.as_bytes(),
-        );
-        let cli_sha = sha256_hex(&cli);
-        let manifest = manifest_fixture(v, &cli_sha);
-        self.write_file(
-            &self.bundle_dir().join("release-manifest.json"),
-            manifest.as_bytes(),
-        );
+        let target = if self.windows { "x86_64-pc-windows-gnu" } else { "x86_64-unknown-linux-gnu" };
+        write_complete_bundle(&self.bundle_dir(), v, target, self.windows, &[], &[]);
         self
     }
 
@@ -621,6 +620,14 @@ impl TestEnv {
     pub fn with_fs_fault_replace_suffix(mut self, s: &str) -> Self {
         let faulty = FaultFs::wrap(Arc::clone(&self.fs));
         faulty.fail_replace_when_src_ends_with(s);
+        self.fs = faulty;
+        self
+    }
+
+    /// 以 FaultFs 包住 fs；來源路徑含 part 時讓 replace 失敗。
+    pub fn with_fs_fault_replace_source_contains(mut self, part: &str) -> Self {
+        let faulty = FaultFs::wrap(Arc::clone(&self.fs));
+        faulty.fail_replace_when_src_contains(part);
         self.fs = faulty;
         self
     }
@@ -836,13 +843,22 @@ impl TestEnv {
 
     pub fn root(&self) -> sw_cli::install_layout::InstallRoot {
         let install = self.install_root();
+        let join = |base: &Path, child: &str| {
+            if self.windows { PathBuf::from(format!("{}\\{child}", base.display())) } else { base.join(child) }
+        };
+        let versions = join(&install, "versions");
+        let bin = join(&install, "bin");
         sw_cli::install_layout::InstallRoot {
             root: install.clone(),
-            versions: install.join("versions"),
-            bin: install.join("bin"),
-            backups: install.join("backups"),
-            supervisor: install.join("supervisor"),
-            current_file: install.join("current-release.json"),
+            versions,
+            bin: bin.clone(),
+            backups: join(&install, "backups"),
+            supervisor: join(&install, "supervisor"),
+            current_file: if self.windows {
+                join(&bin, "current-release.json")
+            } else {
+                install.join("current-release.json")
+            },
             entry_style: if self.windows {
                 sw_cli::install_layout::EntryStyle::Copy
             } else {
@@ -1320,8 +1336,107 @@ pub fn json(text: &str) -> PyValue {
 /// 以 Task 17 形狀組出的 release manifest（schema_version 1；sha256 由呼叫端提供）。
 pub fn manifest_fixture(v: &str, cli_sha256: &str) -> String {
     format!(
-        r#"{{"schema_version":1,"bundle_version":"{v}","stage":"rust-1b-test","target":"x86_64-unknown-linux-gnu","git_revision":"test","components":{{"cli":{{"implementation":"rust","version":"{v}","path":"bin/serialwrap","sha256":"{cli_sha256}"}},"python_cli_delegate":{{"entry":["py/bin/python3","-I","delegate_sentinel.py"]}}}}}}"#
+        r#"{{"schema_version":1,"bundle_version":"{v}","stage":"1A","created_at":"2026-10-19T00:00:00Z","target":"x86_64-unknown-linux-gnu","git_revision":"{revision}","contract_revision":"{revision}","components":{{"cli":{{"implementation":"rust","version":"{v}","git_revision":"{revision}","path":"bin/serialwrap","sha256":"{cli_sha256}"}},"daemon":{{"implementation":"python","version":"{v}","git_revision":"{revision}","launcher":{{"path":"bin/serialwrapd","sha256":"{zero}"}},"entry":["py/bin/python3","-I","-B","-m","sw_core.cli"],"runtime":{{"path":"py/bin/python3","python_version":"3.12.3","sha256":"{zero}"}},"package":{{"name":"serialwrap","version":"{v}","wheel_sha256":null,"tree_sha256":"{zero}"}},"state_schema":"python-state-v0"}},"python_cli_delegate":{{"entry":["py/bin/python3","-I","-B","-m","sw_core.cli"],"tree_sha256":"{zero}"}},"assets":{{"skill_sha256":"{zero}","skill_windows_sha256":"{zero}","profiles_sha256":"{zero}"}},"supervisor":{{"default_mode":"on-demand","definition_sha256":"{zero}","task_xml_template_sha256":"{task_xml}"}}}},"pairing":{{"rule":"exact","cli_version":"{v}","daemon_version":"{v}"}}}}"#,
+        revision = "0123456789abcdef0123456789abcdef01234567",
+        zero = "0".repeat(64),
+        task_xml = sha256_hex(sw_pal::service_ctl::TASK_XML_TEMPLATE),
     )
+}
+
+/// 與 `mkbundle.sh --dev` 同形狀的測試 bundle 指紋。
+#[derive(Clone, Debug)]
+pub struct BundleFixture {
+    pub manifest: String,
+    pub cli_sha: String,
+    pub launcher_sha: String,
+    pub runtime_sha: String,
+}
+
+impl BundleFixture {
+    pub fn parsed(&self) -> ReleaseManifest {
+        parse_manifest(&self.manifest).unwrap_or_else(|e| panic!("manifest 解析失敗：{e}"))
+    }
+}
+
+/// 寫出 POSIX 形狀的完整 bundle，含 Python bytecode 及 `SHA256SUMS`。
+pub fn write_bundle(dir: &Path, v: &str) -> BundleFixture {
+    write_complete_bundle(dir, v, "x86_64-unknown-linux-gnu", false, &[], &[])
+}
+
+/// 寫出完整測試 bundle；額外 component 的 JSON 值會加入 manifest，額外檔案會納入 checksum。
+pub fn write_complete_bundle(
+    dir: &Path,
+    v: &str,
+    target: &str,
+    windows: bool,
+    extra_files: &[(&str, Vec<u8>)],
+    extra_components: &[(&str, String)],
+) -> BundleFixture {
+    const REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
+    let cli_path = if windows { "bin/serialwrap.exe" } else { "bin/serialwrap" };
+    let launcher_path = if windows { "bin/serialwrapd.exe" } else { "bin/serialwrapd" };
+    let mut files = vec![
+        (cli_path.to_string(), format!("cli-{v}\n").into_bytes()),
+        (launcher_path.to_string(), format!("launcher-{v}\n").into_bytes()),
+        ("py/bin/python3".to_string(), format!("runtime-{v}\n").into_bytes()),
+        ("py/sw_core/__init__.py".to_string(), b"VERSION = 1\n".to_vec()),
+        ("py/sw_core/cli.py".to_string(), format!("# cli {v}\n").into_bytes()),
+        ("py/sw_core/systemd_units.py".to_string(), b"UNITS = []\n".to_vec()),
+        ("py/sw_core/assets/skill/SKILL.md".to_string(), b"skill\n".to_vec()),
+        ("py/sw_core/assets/skill/SKILL_WINDOWS.md".to_string(), b"skill windows\n".to_vec()),
+        ("py/sw_core/assets/profiles/default.yaml".to_string(), b"profile: default\n".to_vec()),
+        ("py/sw_core/__pycache__/cli.cpython-312.pyc".to_string(), b"compiled cli\n".to_vec()),
+        ("py/sw_core/stale.pyc".to_string(), b"compiled module\n".to_vec()),
+    ];
+    files.extend(extra_files.iter().map(|(path, body)| (path.to_string(), body.clone())));
+    for (relative, body) in &files {
+        let path = dir.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("bundle 目錄建立失敗");
+        }
+        std::fs::write(path, body).expect("bundle 檔案寫入失敗");
+    }
+
+    let body_of = |relative: &str| -> &[u8] {
+        files.iter().find(|(path, _)| path == relative).map(|(_, body)| body.as_slice())
+            .unwrap_or_else(|| panic!("bundle 缺少檔案：{relative}"))
+    };
+    let cli_sha = sha256_hex(body_of(cli_path));
+    let launcher_sha = sha256_hex(body_of(launcher_path));
+    let runtime_sha = sha256_hex(body_of("py/bin/python3"));
+    let package_tree = fixture_tree_sha256(&files, "py/sw_core/", "sw_core/");
+    let profile_tree = fixture_tree_sha256(&files, "py/sw_core/assets/profiles/", "");
+    let skill_sha = sha256_hex(body_of("py/sw_core/assets/skill/SKILL.md"));
+    let skill_windows_sha = sha256_hex(body_of("py/sw_core/assets/skill/SKILL_WINDOWS.md"));
+    let supervisor_sha = sha256_hex(body_of("py/sw_core/systemd_units.py"));
+    let task_xml_sha = sha256_hex(sw_pal::service_ctl::TASK_XML_TEMPLATE);
+    let extra_json = extra_components.iter().map(|(key, value)| format!(r#","{key}":{value}"#)).collect::<String>();
+    let manifest = format!(
+        r#"{{"schema_version":1,"bundle_version":"{v}","stage":"1A","created_at":"2026-10-19T00:00:00Z","target":"{target}","git_revision":"{REVISION}","contract_revision":"{REVISION}","components":{{"cli":{{"implementation":"rust","version":"{v}","git_revision":"{REVISION}","path":"{cli_path}","sha256":"{cli_sha}"}},"daemon":{{"implementation":"python","version":"{v}","git_revision":"{REVISION}","launcher":{{"path":"{launcher_path}","sha256":"{launcher_sha}"}},"entry":["py/bin/python3","-I","-B","-m","sw_core.cli"],"runtime":{{"path":"py/bin/python3","python_version":"3.12.3","sha256":"{runtime_sha}"}},"package":{{"name":"serialwrap","version":"{v}","wheel_sha256":null,"tree_sha256":"{package_tree}"}},"state_schema":"python-state-v0"}},"python_cli_delegate":{{"entry":["py/bin/python3","-I","-B","-m","sw_core.cli"],"tree_sha256":"{package_tree}"}},"assets":{{"skill_sha256":"{skill_sha}","skill_windows_sha256":"{skill_windows_sha}","profiles_sha256":"{profile_tree}"}},"supervisor":{{"default_mode":"on-demand","definition_sha256":"{supervisor_sha}","task_xml_template_sha256":"{task_xml_sha}"}}{extra_json}}},"pairing":{{"rule":"exact","cli_version":"{v}","daemon_version":"{v}"}}}}"#
+    );
+    std::fs::write(dir.join("release-manifest.json"), &manifest).expect("manifest 寫入失敗");
+
+    let mut sums = files.iter().map(|(path, body)| (path.clone(), sha256_hex(body))).collect::<Vec<_>>();
+    sums.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    let sums_text = sums.iter().map(|(path, digest)| format!("{digest}  {path}\n")).collect::<String>();
+    std::fs::write(dir.join("SHA256SUMS"), sums_text).expect("SHA256SUMS 寫入失敗");
+    BundleFixture { manifest, cli_sha, launcher_sha, runtime_sha }
+}
+
+fn fixture_tree_sha256(files: &[(String, Vec<u8>)], prefix: &str, rel_prefix: &str) -> String {
+    let mut entries = files.iter().filter_map(|(path, body)| {
+        let relative = path.strip_prefix(prefix)?;
+        if relative.is_empty() || relative.split('/').any(|part| part == "__pycache__") || relative.ends_with(".pyc") {
+            return None;
+        }
+        Some((format!("{rel_prefix}{relative}"), sha256_hex(body)))
+    }).collect::<Vec<_>>();
+    entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    let mut material = String::new();
+    for (relative, digest) in entries {
+        material.push_str(&format!("{relative}\0{digest}\n"));
+    }
+    sha256_hex(material.as_bytes())
 }
 
 /// 在 `root/versions/<v>/` 下寫入檔案（相對路徑 `files`），回傳版本目錄。

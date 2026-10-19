@@ -134,6 +134,9 @@ impl FsRead for TestFs {
     fn is_dir(&self, p: &Path) -> bool {
         self.dirs.contains(p)
     }
+    fn is_file(&self, p: &Path) -> bool {
+        matches!(self.files.get(p), Some(Ok(_)))
+    }
     fn list_dir(&self, _p: &Path) -> PalResult<Vec<String>> {
         Err(not_found())
     }

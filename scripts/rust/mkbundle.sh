@@ -260,13 +260,33 @@ PY
   SKILL_SHA="$(sha256_file "$REPO_ROOT/sw_core/assets/skill/SKILL.md")"
   SKILL_WINDOWS_SHA="$(sha256_file "$REPO_ROOT/sw_core/assets/skill/SKILL_WINDOWS.md")"
   SUPERVISOR_SHA="$(sha256_file "$REPO_ROOT/sw_core/systemd_units.py")"
+  TASK_XML_TEMPLATE_SHA="$("$PYTHON" -I -B - "$REPO_ROOT/crates/sw-pal/src/service_ctl.rs" <<'PY'
+import ast
+import hashlib
+import pathlib
+import re
+import sys
+
+source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+start = source.index("pub const TASK_XML_TEMPLATE: &str = concat!(")
+match = re.search(r"concat!\((.*?)\n\s*\);", source[start:], re.S)
+if match is None:
+    raise SystemExit("找不到 TASK_XML_TEMPLATE")
+parts = re.findall(r'^\s*("(?:\\.|[^"\\])*")\s*,?\s*$', match.group(1), re.M)
+if not parts:
+    raise SystemExit("render_task_xml 樣板為空")
+template = "".join(ast.literal_eval(part) for part in parts)
+print(hashlib.sha256(template.encode("utf-8")).hexdigest())
+PY
+  )"
   GIT_REVISION="$(git -C "$REPO_ROOT" rev-parse HEAD)"
   CONTRACT_REVISION="$(git -C "$REPO_ROOT" rev-parse HEAD:contracts)"
   MANIFEST="$VERSION_DIR/release-manifest.json"
 
   python3 - "$MANIFEST" "$VERSION" "$TARGET" "$GIT_REVISION" "$CONTRACT_REVISION" \
     "$CLI_NAME" "$CLI_SHA" "$PACKAGE_TREE_SHA" "$PYTHON_VERSION" "$LAUNCHER_SHA" \
-    "$RUNTIME_SHA" "$SKILL_SHA" "$SKILL_WINDOWS_SHA" "$PROFILE_TREE_SHA" "$SUPERVISOR_SHA" <<'PY'
+    "$RUNTIME_SHA" "$SKILL_SHA" "$SKILL_WINDOWS_SHA" "$PROFILE_TREE_SHA" "$SUPERVISOR_SHA" \
+    "$TASK_XML_TEMPLATE_SHA" <<'PY'
 import datetime
 import json
 import sys
@@ -287,7 +307,8 @@ import sys
     skill_windows_sha,
     profiles_sha,
     supervisor_sha,
-) = sys.argv[1:16]
+    task_xml_template_sha,
+) = sys.argv[1:17]
 python_entry = ["py/bin/python3", "-I", "-B", "-m", "sw_core.cli"]
 manifest = {
     "schema_version": 1,
@@ -315,6 +336,7 @@ manifest = {
             "version": version,
             "git_revision": revision,
             "entry": ["py/bin/python3", "-I", "-B", "py/serialwrapd.py"],
+            "state_schema": "python-state-v0",
             "launcher": {"path": "bin/serialwrapd", "sha256": launcher_sha},
             "runtime": {
                 "path": "py/bin/python3",
@@ -336,6 +358,7 @@ manifest = {
         "supervisor": {
             "default_mode": "on-demand",
             "definition_sha256": supervisor_sha,
+            "task_xml_template_sha256": task_xml_template_sha,
         },
     },
     "pairing": {

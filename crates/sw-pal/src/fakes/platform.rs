@@ -242,6 +242,9 @@ impl crate::traits::FsRead for Unconfigured {
     fn is_dir(&self, _p: &Path) -> bool {
         not_configured(self.0)
     }
+    fn is_file(&self, _p: &Path) -> bool {
+        not_configured(self.0)
+    }
     fn list_dir(&self, _p: &Path) -> PalResult<Vec<String>> {
         not_configured(self.0)
     }

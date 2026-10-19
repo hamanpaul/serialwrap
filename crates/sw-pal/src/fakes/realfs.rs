@@ -70,6 +70,9 @@ impl FsRead for RealFs {
     fn is_dir(&self, p: &Path) -> bool {
         p.is_dir()
     }
+    fn is_file(&self, p: &Path) -> bool {
+        std::fs::symlink_metadata(p).is_ok_and(|metadata| metadata.file_type().is_file())
+    }
     fn list_dir(&self, p: &Path) -> PalResult<Vec<String>> {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(p).map_err(io_error)? {

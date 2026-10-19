@@ -30,6 +30,10 @@ impl FsRead for NativeFsOps {
         NativeFsRead.is_dir(path)
     }
 
+    fn is_file(&self, path: &Path) -> bool {
+        NativeFsRead.is_file(path)
+    }
+
     fn list_dir(&self, path: &Path) -> PalResult<Vec<String>> {
         NativeFsRead.list_dir(path)
     }
@@ -311,6 +315,10 @@ impl FsRead for NativeFsRead {
 
     fn is_dir(&self, path: &Path) -> bool {
         path.is_dir()
+    }
+
+    fn is_file(&self, path: &Path) -> bool {
+        fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
     }
 
     fn list_dir(&self, path: &Path) -> PalResult<Vec<String>> {

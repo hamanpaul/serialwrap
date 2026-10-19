@@ -45,6 +45,16 @@ impl FsRead for MemFs {
             .contains(path)
     }
 
+    fn is_file(&self, path: &Path) -> bool {
+        matches!(
+            self.files
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(path),
+            Some(Ok(_))
+        )
+    }
+
     fn list_dir(&self, path: &Path) -> PalResult<Vec<String>> {
         let files = self.files.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(Err(error)) = files.get(path) {
@@ -73,6 +83,7 @@ impl FsRead for MemFs {
 pub struct FaultFs {
     inner: std::sync::Arc<dyn crate::fs_ops::FsOps>,
     replace_fault_suffix: Mutex<Option<String>>,
+    replace_fault_contains: Mutex<Option<String>>,
     write_target_fault_suffix: Mutex<Option<String>>,
     copy_tree_fault: Mutex<bool>,
 }
@@ -88,6 +99,7 @@ impl FaultFs {
         std::sync::Arc::new(Self {
             inner,
             replace_fault_suffix: Mutex::new(None),
+            replace_fault_contains: Mutex::new(None),
             write_target_fault_suffix: Mutex::new(None),
             copy_tree_fault: Mutex::new(false),
         })
@@ -96,6 +108,11 @@ impl FaultFs {
     /// `replace(from, to)` 的 `from` 以此後綴結尾時回 `Io` 錯誤。
     pub fn fail_replace_when_src_ends_with(&self, suffix: &str) {
         *self.replace_fault_suffix.lock().unwrap_or_else(|e| e.into_inner()) = Some(suffix.to_string());
+    }
+
+    /// `replace(from, to)` 的來源路徑含有此字串時回 `Io` 錯誤。
+    pub fn fail_replace_when_src_contains(&self, part: &str) {
+        *self.replace_fault_contains.lock().unwrap_or_else(|e| e.into_inner()) = Some(part.to_string());
     }
 
     /// 寫入目標以此後綴結尾時回 `Io` 錯誤：涵蓋 `atomic_write(p)`、`write_file(p)` 與 `replace(_, to)`
@@ -125,6 +142,9 @@ impl FsRead for FaultFs {
     fn is_dir(&self, p: &Path) -> bool {
         self.inner.is_dir(p)
     }
+    fn is_file(&self, p: &Path) -> bool {
+        self.inner.is_file(p)
+    }
     fn list_dir(&self, p: &Path) -> PalResult<Vec<String>> {
         self.inner.list_dir(p)
     }
@@ -148,10 +168,12 @@ impl crate::fs_ops::FsOps for FaultFs {
     }
     fn replace(&self, from: &Path, to: &Path) -> PalResult<()> {
         let fault = self.replace_fault_suffix.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if let Some(suffix) = fault {
-            if from.to_string_lossy().ends_with(&suffix) {
-                return Err(PalError::plain(PalErrorKind::Io, "fake replace fault"));
-            }
+        let contains = self.replace_fault_contains.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let from_text = from.to_string_lossy();
+        if matches!(fault, Some(suffix) if from_text.ends_with(&suffix))
+            || matches!(contains, Some(part) if from_text.contains(&part))
+        {
+            return Err(PalError::plain(PalErrorKind::Io, "fake replace fault"));
         }
         if self.write_target_faulted(to) {
             return Err(PalError::plain(PalErrorKind::Io, "fake write fault"));

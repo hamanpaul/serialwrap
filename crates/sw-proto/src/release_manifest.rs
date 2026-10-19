@@ -1,10 +1,9 @@
-//! Release manifest 與 current-release 解析（P3-T7；arch §10.1）。
+//! Release manifest 與 current-release 解析（P3-T7／P4-T11；arch §10.1）。
 //!
-//! 結構驗證依照計畫文字：`schema_version` 必須為整數 1；`components.python_cli_delegate.entry` 必須為非空、
-//! 元素皆為字串的 list。`contracts/release_manifest.schema.json` 為 P1-T18 交付物，本 worktree 尚未存在；
-//! 此處以計畫文字實作，缺口由 `tests/release_manifest.rs::test_schema_contract_present` 明示。
+//! 保留 manifest 完整欄位供下游檢查，同時驗證必要結構及 P4 新增的 optional metadata 型別。
 
 use crate::pyjson::{self, PyDict, PyInt, PyValue};
+use std::fmt::{self, Display, Formatter};
 
 /// 已驗證的 release manifest。
 #[derive(Clone, Debug, PartialEq)]
@@ -15,6 +14,10 @@ pub struct ReleaseManifest {
     pub target: String,
     pub git_revision: String,
     pub python_cli_delegate_entry: Vec<String>,
+    /// Python daemon 的狀態格式版本；舊 manifest 可省略。
+    pub state_schema: Option<String>,
+    /// Task Scheduler XML 未代入樣板的 SHA-256；舊 manifest 可省略。
+    pub task_xml_template_sha256: Option<String>,
     /// 頂層物件的完整內容（保留未知欄位）。
     pub raw: PyDict,
 }
@@ -33,6 +36,15 @@ pub enum ManifestError {
     InvalidJson(String),
     /// JSON 合法但不符合結構（內容為說明）。
     Schema(String),
+}
+
+impl Display for ManifestError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            ManifestError::InvalidJson(message) => write!(f, "manifest JSON 無效：{message}"),
+            ManifestError::Schema(message) => write!(f, "manifest 結構無效：{message}"),
+        }
+    }
 }
 
 fn schema_err(msg: &str) -> ManifestError {
@@ -54,6 +66,32 @@ fn str_field(d: &PyDict, key: &str) -> Result<String, ManifestError> {
     }
 }
 
+fn optional_str_path(root: &PyDict, path: &[&str]) -> Result<Option<String>, ManifestError> {
+    let Some((first, rest)) = path.split_first() else {
+        return Ok(None);
+    };
+    let mut value = root.get(first);
+    for key in rest {
+        let Some(PyValue::Dict(parent)) = value else {
+            return Ok(None);
+        };
+        value = parent.get(key);
+    }
+    match value {
+        None => Ok(None),
+        Some(PyValue::Str(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(schema_err(&format!("欄位 {} 必須為字串", path.join(".")))),
+    }
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .as_bytes()
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+}
+
 /// 解析並驗證 release manifest（JSON 文字）。
 pub fn parse_manifest(text: &str) -> Result<ReleaseManifest, ManifestError> {
     let root = parse_json_object(text)?;
@@ -68,6 +106,27 @@ pub fn parse_manifest(text: &str) -> Result<ReleaseManifest, ManifestError> {
     let stage = str_field(&root, "stage")?;
     let target = str_field(&root, "target")?;
     let git_revision = str_field(&root, "git_revision")?;
+    if let Some(pairing) = root.get("pairing") {
+        let PyValue::Dict(pairing) = pairing else {
+            return Err(schema_err("欄位 pairing 必須為物件"));
+        };
+        if !matches!(pairing.get("rule"), Some(PyValue::Str(rule)) if rule == "exact") {
+            return Err(schema_err("欄位 pairing.rule 必須為 exact"));
+        }
+    }
+    let state_schema = optional_str_path(&root, &["components", "daemon", "state_schema"])?;
+    let task_xml_template_sha256 = optional_str_path(
+        &root,
+        &["components", "supervisor", "task_xml_template_sha256"],
+    )?;
+    if task_xml_template_sha256
+        .as_deref()
+        .is_some_and(|digest| !is_sha256_hex(digest))
+    {
+        return Err(schema_err(
+            "欄位 components.supervisor.task_xml_template_sha256 必須為 64 位小寫十六進位",
+        ));
+    }
 
     let components = match root.get("components") {
         Some(PyValue::Dict(d)) => d,
@@ -108,6 +167,8 @@ pub fn parse_manifest(text: &str) -> Result<ReleaseManifest, ManifestError> {
         target,
         git_revision,
         python_cli_delegate_entry,
+        state_schema,
+        task_xml_template_sha256,
         raw: root,
     })
 }
@@ -143,6 +204,16 @@ pub struct Com0comComponent {
 }
 
 impl ReleaseManifest {
+    /// 取得 `components.daemon.state_schema`；舊 manifest 回傳 `None`。
+    pub fn state_schema(&self) -> Option<&str> {
+        self.state_schema.as_deref()
+    }
+
+    /// 取得 `components.supervisor.task_xml_template_sha256`；舊 manifest 回傳 `None`。
+    pub fn task_xml_template_sha256(&self) -> Option<&str> {
+        self.task_xml_template_sha256.as_deref()
+    }
+
     /// 取得 `components.com0com`；缺席回 `None`。
     pub fn com0com(&self) -> Option<Com0comComponent> {
         todo!("P4-T19: components.com0com 解析尚未實作")
