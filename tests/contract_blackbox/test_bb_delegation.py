@@ -20,7 +20,7 @@ from typing import Callable
 import pytest
 
 import bb_harness
-from bb_harness import is_rust, python_baseline_prefix, repo_root, run_cli
+from bb_harness import python_baseline_prefix, repo_root, run_cli
 
 REPO = repo_root()
 MKBUNDLE = REPO / "scripts" / "rust" / "mkbundle.sh"
@@ -33,17 +33,8 @@ pytestmark = [
     pytest.mark.needs_delegation,
 ]
 
-# 紅燈（P3-T16）：僅 Rust 輪標 xfail（strict）；Python 基線輪的 A 組與 B 組（rust_only）行為不受影響。
-_RED = pytest.mark.xfail(
-    condition=is_rust(),
-    strict=True,
-    raises=(NotImplementedError, AssertionError),
-    reason="P3-T16 紅燈",
-)
-
-
 def _case(argv: list[str], *, red: bool = True):
-    return pytest.param(argv, id=" ".join(argv), marks=[_RED] if red else [])
+    return pytest.param(argv, id=" ".join(argv))
 
 
 # A：兩種 artifact 都必須產生與 Python 完全相同的 rc／stdout／stderr
@@ -77,6 +68,13 @@ class _DevBundle:
 
     def out(self) -> Path:
         if self._out is None:
+            supplied = os.environ.get("SW_WIN_DEV_BUNDLE") if os.name == "nt" else None
+            if supplied:
+                # Windows 主機直接使用互通腳本建立的本機 dev bundle，避免在 Windows 啟動 POSIX .sh。
+                out = Path(supplied)
+                assert (out / "bin" / "serialwrap.exe").is_file(), f"Windows dev bundle 缺少 CLI：{out}"
+                self._out = out
+                return self._out
             out = self._root / "dev-bundle"
             res = subprocess.run(
                 [str(MKBUNDLE), "--dev", "--out", str(out)],
@@ -185,7 +183,6 @@ def test_delegated_output_identical_to_python(env, argv):
     assert (r.rc, r.stdout, r.stderr) == (py.returncode, py.stdout, py.stderr)
 
 
-@_RED
 def test_daemon_status_via_stub(env, stubd):
     s = stubd({"methods": {"health.status": [{"reply": {"ok": True, "pid": 1, "version": "x"}}]}})
     py = subprocess.run([*python_baseline_prefix(), "--socket", s.endpoint, "daemon", "status"],
@@ -196,7 +193,6 @@ def test_daemon_status_via_stub(env, stubd):
 
 # B：Rust-only 委派機制
 @pytest.mark.rust_only
-@_RED
 def test_missing_manifest(tmp_path, env):
     src = Path(bb_harness.cli_prefix()[-1])
     assert src.exists(), f"受測 Rust CLI 不存在（{src}）"
@@ -214,7 +210,6 @@ def test_missing_manifest(tmp_path, env):
 
 
 @pytest.mark.rust_only
-@_RED
 @pytest.mark.parametrize("exit_code", [0, 37, 1])
 def test_probe_receives_argv_env_stdin_and_exit_code(probe_bundle, env, tmp_path, exit_code):
     counter = tmp_path / "count"
@@ -229,7 +224,6 @@ def test_probe_receives_argv_env_stdin_and_exit_code(probe_bundle, env, tmp_path
 
 
 @pytest.mark.rust_only
-@_RED
 def test_exec_failure_runs_nothing_and_does_not_fall_back(broken_entry_bundle, env, tmp_path):
     # entry[0] 存在但不可執行（chmod 000）→ exec failed；不得改走 PATH 或重試
     marker = tmp_path / "marker"
@@ -246,7 +240,6 @@ def test_exec_failure_runs_nothing_and_does_not_fall_back(broken_entry_bundle, e
 
 
 @pytest.mark.rust_only
-@_RED
 def test_recursion_detected_when_entry_points_to_self(self_loop_bundle, env):
     r = run_cli(["doctor"], env=env, timeout_s=20)
     assert r.rc == 1
@@ -254,7 +247,6 @@ def test_recursion_detected_when_entry_points_to_self(self_loop_bundle, env):
 
 
 @pytest.mark.rust_only
-@_RED
 def test_never_searches_path(probe_bundle, tmp_path, env):
     fake = tmp_path / "fakebin"
     fake.mkdir()
@@ -269,7 +261,6 @@ def test_never_searches_path(probe_bundle, tmp_path, env):
 
 @pytest.mark.rust_only
 @pytest.mark.posix_only
-@_RED
 def test_exec_replaces_process_and_sigterm_reaches_child(probe_bundle, env):
     e = dict(env, PROBE_READ_STDIN="1")
     p = subprocess.Popen(
@@ -289,7 +280,6 @@ def test_exec_replaces_process_and_sigterm_reaches_child(probe_bundle, env):
 
 
 @pytest.mark.rust_only
-@_RED
 def test_no_output_before_delegation(probe_bundle, env):
     r = run_cli(["-v", "--socket", "/nope", "daemon", "status"],
                 env=dict(env, SERIALWRAP_LOG_LEVEL="DEBUG"))

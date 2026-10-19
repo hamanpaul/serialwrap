@@ -25,8 +25,6 @@ VERSION = (REPO / "VERSION").read_text(encoding="utf-8").strip()
 pytestmark = [
     pytest.mark.posix_only,
     pytest.mark.process_rpc,
-    # 紅燈（P3-T16）：mkbundle.sh 目前只支援 --delegate-sentinel，完整 dev bundle 尚未實作。
-    pytest.mark.xfail(strict=True, raises=(NotImplementedError, AssertionError), reason="P3-T16 紅燈"),
 ]
 
 
@@ -47,7 +45,7 @@ class _LazyBundle:
     def out(self) -> Path:
         _require_cargo()
         if self._out is None:
-            out = self._root / "dev-bundle"
+            out = self._root / "dev bundle"
             res = subprocess.run(
                 [str(MKBUNDLE), "--dev", "--out", str(out)],
                 capture_output=True,
@@ -100,6 +98,10 @@ def test_bin_serialwrap_is_symlink_into_versions(bundle):
     assert Path(os.path.realpath(link)) == Path(
         os.path.realpath(out / "versions" / VERSION / "bin" / "serialwrap")
     )
+
+
+def test_out_path_with_spaces(bundle):
+    assert " " in str(bundle.out())
 
 
 def test_venv_python_runs_cli_version(bundle):
@@ -182,4 +184,67 @@ def test_doctor_via_bundle_reports_version_pairing(bundle, tmp_path):
         timeout=120,
         check=False,
     )
-    assert b"version_pairing" in r.stdout, f"doctor 輸出缺少 version_pairing：{r.stdout!r}；stderr={r.stderr!r}"
+    report = json.loads(r.stdout)
+    checks = report if isinstance(report, list) else report.get("checks", [])
+    version_pairing = next(
+        (item for item in checks if item.get("check") == "version_pairing"), None
+    )
+    assert version_pairing is not None, (
+        f"doctor 輸出缺少 version_pairing：{r.stdout!r}；stderr={r.stderr!r}"
+    )
+    assert version_pairing["mismatches"] == ["daemon_unreachable"]
+
+
+def test_windows_target_is_rejected_before_build(tmp_path):
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    cargo_called = tmp_path / "cargo-called"
+    fake_rustc = fake_bin / "rustc"
+    fake_rustc.write_text(
+        "#!/bin/sh\nprintf 'host: x86_64-unknown-linux-gnu\\n'\n",
+        encoding="utf-8",
+    )
+    fake_rustc.chmod(0o755)
+    fake_cargo = fake_bin / "cargo"
+    fake_cargo.write_text(
+        "#!/bin/sh\n: > \"$SW_CARGO_CALLED\"\nexit 0\n",
+        encoding="utf-8",
+    )
+    fake_cargo.chmod(0o755)
+    env = dict(
+        os.environ,
+        PATH=f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        SW_CARGO_CALLED=str(cargo_called),
+    )
+
+    result = subprocess.run(
+        [
+            str(MKBUNDLE),
+            "--dev",
+            "--target",
+            "x86_64-pc-windows-gnu",
+            "--out",
+            str(tmp_path / "windows-bundle"),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+
+    assert result.returncode == 2, result.stderr
+    assert "P3-T17" in result.stderr
+    assert not cargo_called.exists()
+
+
+def test_help_lists_supported_options_without_building():
+    result = subprocess.run(
+        [str(MKBUNDLE), "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    for option in ("--target", "--profile", "--out", "--print-dir"):
+        assert option in result.stdout

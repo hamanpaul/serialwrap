@@ -1,9 +1,9 @@
-//! Stage 1A 委派路由（P3-T10：`DELEGATED_GROUPS`、`Route`、`classify`）已實作；委派執行由 P3-T16 實作。
-#![allow(unused_variables)]
+//! Stage 1A 委派路由與 manifest 固定入口執行。
 
 use crate::ctx::CliCtx;
+use crate::output;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// 委派集合（arch §7.4、計畫 §0.3）；`cli_spec` 與 `run` 共用。
 pub const DELEGATED_GROUPS: [&str; 7] = [
@@ -90,7 +90,14 @@ pub enum DelegateError {
 
 /// sha256(各元素 `OsStr::as_encoded_bytes()` 以 `"\0"` 連接)。
 pub fn argv_sha256(argv_tail: &[OsString]) -> String {
-    todo!("P3-T16: argv_sha256")
+    let mut encoded = Vec::new();
+    for (index, value) in argv_tail.iter().enumerate() {
+        if index != 0 {
+            encoded.push(0);
+        }
+        encoded.extend_from_slice(value.as_encoded_bytes());
+    }
+    sw_proto::pycompat::sha256_hex(&encoded)
 }
 
 /// `SERIALWRAP_DELEGATE_DEPTH`／`SERIALWRAP_DELEGATE_ARGV_SHA` 遞迴防護；回傳 incoming depth。
@@ -99,7 +106,17 @@ pub fn check_recursion(
     sha_raw: Option<&str>,
     my_sha: &str,
 ) -> Result<u32, DelegateError> {
-    todo!("P3-T16: check_recursion")
+    let depth = match depth_raw {
+        None => 0,
+        Some(raw) if !raw.is_empty() && raw.bytes().all(|byte| byte.is_ascii_digit()) => {
+            raw.parse::<u32>().map_err(|_| DelegateError::Recursion)?
+        }
+        Some(_) => return Err(DelegateError::Recursion),
+    };
+    if depth >= 2 || sha_raw == Some(my_sha) {
+        return Err(DelegateError::Recursion);
+    }
+    Ok(depth)
 }
 
 pub struct DelegateTarget {
@@ -111,10 +128,150 @@ pub fn resolve_target(
     p: &sw_pal::ClientPlatform,
     argv_tail: &[OsString],
 ) -> Result<DelegateTarget, DelegateError> {
-    todo!("P3-T16: resolve_target")
+    let exe = p.env.current_exe().map_err(|_| {
+        DelegateError::Unavailable("release manifest not found: current executable".to_string())
+    })?;
+    let exe_dir = exe.parent().ok_or_else(|| {
+        DelegateError::Unavailable(format!("release manifest not found: {}", exe.display()))
+    })?;
+    let current_release_path = exe_dir.join("current-release.json");
+
+    let manifest_path = if p.fs.exists(&current_release_path) {
+        let bytes = p.fs.read(&current_release_path).map_err(|error| {
+            DelegateError::Unavailable(format!(
+                "invalid release manifest: current-release.json: {}",
+                error.py_message
+            ))
+        })?;
+        let text = std::str::from_utf8(&bytes).map_err(|error| {
+            DelegateError::Unavailable(format!(
+                "invalid release manifest: current-release.json: {error}"
+            ))
+        })?;
+        let current = sw_proto::release_manifest::parse_current_release(text).map_err(|error| {
+            DelegateError::Unavailable(format!(
+                "invalid release manifest: current-release.json: {}",
+                manifest_error_detail(error)
+            ))
+        })?;
+        let bundle_root = exe_dir.parent().ok_or_else(|| {
+            DelegateError::Unavailable(format!("release manifest not found: {}", exe.display()))
+        })?;
+        bundle_root.join(current.dir).join("release-manifest.json")
+    } else {
+        let real_exe = p.env.realpath(&exe).map_err(|_| {
+            DelegateError::Unavailable(format!("release manifest not found: {}", exe.display()))
+        })?;
+        let version_dir = real_exe.parent().and_then(Path::parent).ok_or_else(|| {
+            DelegateError::Unavailable(format!(
+                "release manifest not found: {}",
+                real_exe.display()
+            ))
+        })?;
+        version_dir.join("release-manifest.json")
+    };
+
+    if !p.fs.exists(&manifest_path) {
+        return Err(DelegateError::Unavailable(format!(
+            "release manifest not found: {}",
+            manifest_path.display()
+        )));
+    }
+    let bytes = p.fs.read(&manifest_path).map_err(|error| {
+        DelegateError::Unavailable(format!("invalid release manifest: {}", error.py_message))
+    })?;
+    let text = std::str::from_utf8(&bytes).map_err(|error| {
+        DelegateError::Unavailable(format!("invalid release manifest: {error}"))
+    })?;
+    let manifest = sw_proto::release_manifest::parse_manifest(text).map_err(|error| {
+        DelegateError::Unavailable(format!(
+            "invalid release manifest: {}",
+            manifest_error_detail(error)
+        ))
+    })?;
+
+    let manifest_dir = manifest_path.parent().unwrap_or_else(|| Path::new(""));
+    let entry_path = PathBuf::from(&manifest.python_cli_delegate_entry[0]);
+    let entry_path = if entry_path.is_absolute() {
+        entry_path
+    } else {
+        manifest_dir.join(entry_path)
+    };
+    if !p.fs.exists(&entry_path) || p.fs.is_dir(&entry_path) {
+        return Err(DelegateError::Unavailable(format!(
+            "delegate entry not found: {}",
+            entry_path.display()
+        )));
+    }
+
+    let mut argv = Vec::with_capacity(
+        manifest
+            .python_cli_delegate_entry
+            .len()
+            .saturating_add(argv_tail.len()),
+    );
+    argv.push(entry_path.into_os_string());
+    argv.extend(
+        manifest
+            .python_cli_delegate_entry
+            .iter()
+            .skip(1)
+            .map(OsString::from),
+    );
+    argv.extend(argv_tail.iter().cloned());
+
+    Ok(DelegateTarget {
+        argv,
+        manifest_path,
+    })
 }
 
 /// 只在錯誤時返回 1。
 pub fn run_delegate(ctx: &mut CliCtx, argv_tail: &[OsString], group: &str) -> i32 {
-    todo!("P3-T16: run_delegate")
+    let argv_sha = argv_sha256(argv_tail);
+    let depth = match check_recursion(
+        ctx.p.env.var("SERIALWRAP_DELEGATE_DEPTH").as_deref(),
+        ctx.p.env.var("SERIALWRAP_DELEGATE_ARGV_SHA").as_deref(),
+        &argv_sha,
+    ) {
+        Ok(depth) => depth,
+        Err(error) => return print_delegate_error(ctx, group, error),
+    };
+    let target = match resolve_target(ctx.p, argv_tail) {
+        Ok(target) => target,
+        Err(error) => return print_delegate_error(ctx, group, error),
+    };
+
+    let env_add = [
+        (
+            "SERIALWRAP_DELEGATE_DEPTH".to_string(),
+            (depth + 1).to_string(),
+        ),
+        ("SERIALWRAP_DELEGATE_ARGV_SHA".to_string(), argv_sha),
+        (
+            "SERIALWRAP_RELEASE_MANIFEST".to_string(),
+            target.manifest_path.to_string_lossy().into_owned(),
+        ),
+    ];
+    let error = ctx.p.process.exec_or_wait(&target.argv, &env_add);
+    print_delegate_error(
+        ctx,
+        group,
+        DelegateError::Unavailable(format!("exec failed: {}", error.py_message)),
+    )
+}
+
+fn print_delegate_error(ctx: &mut CliCtx, group: &str, error: DelegateError) -> i32 {
+    let message = match error {
+        DelegateError::Unavailable(reason) => format!("delegation target unavailable: {reason}"),
+        DelegateError::Recursion => "delegation recursion detected".to_string(),
+    };
+    output::print_internal_error(&mut ctx.io, group, &message)
+}
+
+fn manifest_error_detail(error: sw_proto::release_manifest::ManifestError) -> String {
+    match error {
+        sw_proto::release_manifest::ManifestError::InvalidJson(detail)
+        | sw_proto::release_manifest::ManifestError::Schema(detail) => detail,
+    }
 }

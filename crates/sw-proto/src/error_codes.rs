@@ -55,7 +55,7 @@ pub enum ErrorCode {
     DeviceNotFound,
     /// by_id 不在目前的裝置清單中（未插入或尚未列舉）
     DeviceNotPresent,
-    /// /proc 掃描到外部程式持有該 tty，非 force 的 device attach 被拒（回應不含 holder_unknown，BC-04 尚未實作）
+    /// UART 獨占開啟或 holder 預檢確認裝置仍被占用
     DeviceStillHeld,
     /// ack_mode 為 echo，但 bridge 不支援 echo 節流送出
     EchoAckUnsupported,
@@ -71,7 +71,7 @@ pub enum ErrorCode {
     FlashTargetIsConsole,
     /// 命令尚未執行即因 recovery 或 detach 被清空（未送出，可在 READY 後重送）
     FlushedByRecovery,
-    /// daemon 停止時，尚未執行的排隊命令被清空（未送出，可重送）
+    /// daemon 停止時，尚未執行的排隊命令被清空（未送出，可重送）；原子交接凍結後的有副作用 RPC 回 reason:"handoff_frozen"
     FlushedByShutdown,
     /// 強制 recover（clear 後重新 attach）在 10 次、每次 1 秒的窗口內未達 READY
     ForceRecoverTimeout,
@@ -137,7 +137,7 @@ pub enum ErrorCode {
     ReadyUnconfirmed,
     /// expose tcp 模式下 relay 的 ss 驗證失敗，或綁定位址非 loopback
     RemoteBindUnverified,
-    /// 此平台（原生 Windows）不支援 remote 功能
+    /// daemon start 不支援遠端 endpoint；Windows 僅接受 loopback endpoint
     RemoteNotSupported,
     /// 指定的 rule_id 不存在
     RuleNotFound,
@@ -147,13 +147,13 @@ pub enum ErrorCode {
     SendFailed,
     /// 同一 session 的前景操作仍在進行中
     SessionBusy,
-    /// 已有不可搶占的 interactive lease，命令或檔案操作被拒
+    /// 已有不可搶占的 interactive lease，或 SC-13 到期收尾的 ownership restore 尚未完成；相關操作被拒
     SessionInteractiveBusy,
     /// selector 未對應任何 session
     SessionNotFound,
     /// session 狀態不符（非 READY，或 bridge 不存在）
     SessionNotReady,
-    /// session 待執行命令已達 256 筆上限
+    /// session 已接受或執行中的命令（含已 cancel 但 worker 仍執行）達 256 筆上限
     SessionQueueFull,
     /// session 恢復中（RECOVERING），操作暫不可用
     SessionRecovering,
@@ -175,7 +175,7 @@ pub enum ErrorCode {
     TargetEncoderMissing,
     /// 隔離測試實例的裝置 allowlist 判定不通過（非隔離實例設定了 allowlist）；stderr 印出 serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED 與原因，exit 2
     TestDeviceAllowlistRejected,
-    /// 連線、傳送或接收逾時；白名單唯讀方法可重試，其他方法不可直接重送
+    /// 連線、傳送或接收逾時，或 daemon 管理操作等待舊行程結束逾時；白名單唯讀方法可重試，其他方法不可直接重送
     Timeout,
     /// echo-ACK 路徑 echo 停滯；換行未送出，命令未執行
     TransferEchoStall,
@@ -251,7 +251,7 @@ impl ErrorCode {
             interfaces: &[Interface::Rpc, Interface::Rec],
             retryable: Retryable::Yes,
             reachable: true,
-            status: Status::Existing,
+            status: Status::Implemented,
         },
         ErrorMeta {
             code: "BASE64_DECODE_FAILED",
@@ -320,8 +320,8 @@ impl ErrorCode {
             code: "COMMAND_ABORTED_IN_FLIGHT",
             interfaces: &[Interface::Rec],
             retryable: Retryable::No,
-            reachable: false,
-            status: Status::Approved,
+            reachable: true,
+            status: Status::Implemented,
         },
         ErrorMeta {
             code: "COMMAND_FAILED",
@@ -412,7 +412,7 @@ impl ErrorCode {
             interfaces: &[Interface::Rpc],
             retryable: Retryable::Conditional,
             reachable: true,
-            status: Status::Existing,
+            status: Status::Implemented,
         },
         ErrorMeta {
             code: "ECHO_ACK_UNSUPPORTED",
@@ -447,7 +447,7 @@ impl ErrorCode {
             interfaces: &[Interface::Rpc, Interface::Rec, Interface::CliLocal],
             retryable: Retryable::Yes,
             reachable: true,
-            status: Status::Existing,
+            status: Status::Implemented,
         },
         ErrorMeta {
             code: "FLASH_TARGET_IS_CONSOLE",
@@ -465,7 +465,7 @@ impl ErrorCode {
         },
         ErrorMeta {
             code: "FLUSHED_BY_SHUTDOWN",
-            interfaces: &[Interface::Rec],
+            interfaces: &[Interface::Rpc, Interface::Rec],
             retryable: Retryable::Yes,
             reachable: true,
             status: Status::Existing,
@@ -482,7 +482,7 @@ impl ErrorCode {
             interfaces: &[Interface::Rpc],
             retryable: Retryable::No,
             reachable: true,
-            status: Status::Existing,
+            status: Status::Implemented,
         },
         ErrorMeta {
             code: "INTERACTIVE_NOT_FOUND",
@@ -755,14 +755,14 @@ impl ErrorCode {
             interfaces: &[Interface::Rpc],
             retryable: Retryable::Yes,
             reachable: true,
-            status: Status::Existing,
+            status: Status::Implemented,
         },
         ErrorMeta {
             code: "SESSION_RECOVERING",
             interfaces: &[Interface::Rpc, Interface::Rec],
             retryable: Retryable::Yes,
             reachable: true,
-            status: Status::Existing,
+            status: Status::Implemented,
         },
         ErrorMeta {
             code: "SOCKET_ERROR",
@@ -824,12 +824,12 @@ impl ErrorCode {
             code: "TEST_DEVICE_ALLOWLIST_REJECTED",
             interfaces: &[Interface::Proc],
             retryable: Retryable::FixArgs,
-            reachable: false,
-            status: Status::Approved,
+            reachable: true,
+            status: Status::Implemented,
         },
         ErrorMeta {
             code: "TIMEOUT",
-            interfaces: &[Interface::CliClient],
+            interfaces: &[Interface::CliClient, Interface::CliLocal],
             retryable: Retryable::Conditional,
             reachable: true,
             status: Status::Existing,
