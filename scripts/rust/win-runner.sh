@@ -105,6 +105,8 @@ export TMP="$staging/tmp"
 export TEMP="$staging/tmp"
 
 # WSLENV 不支援萬用字元；逐一轉送目前 shell 中的 SERIALWRAP_* 變數。
+# 一般變數不加方向旗標（雙向轉送）：擁有者 host 的 WSL 2.6.1 實測 `NAME/u` 不會轉送到
+# WSL→Win32 啟動的行程（`NAME`／`NAME/w` 會），與文件語意相反；不帶旗標在任何版本都會轉送。
 wsl_env="${WSLENV:-}"
 append_wsl_env() {
   local entry="$1" name="${1%%/*}" existing
@@ -121,10 +123,10 @@ append_wsl_env() {
 }
 
 for name in SW_TEST_CAPS SW_TEST_COM_PAIR SW_TEST_SEED RUST_BACKTRACE RUST_TEST_THREADS; do
-  [[ -v "$name" ]] && append_wsl_env "${name}/u"
+  [[ -v "$name" ]] && append_wsl_env "${name}"
 done
 while IFS= read -r name; do
-  [[ "$name" == SERIALWRAP_* ]] && append_wsl_env "${name}/u"
+  [[ "$name" == SERIALWRAP_* ]] && append_wsl_env "${name}"
 done < <(compgen -e)
 append_wsl_env "SW_TEST_DATA_DIR/p"
 append_wsl_env "TMP/p"
