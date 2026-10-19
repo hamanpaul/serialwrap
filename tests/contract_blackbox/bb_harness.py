@@ -39,7 +39,7 @@ def ab_env() -> dict[str, str]:
             from ab_env import AB_ENV
             return dict(AB_ENV)
         except ImportError:
-            keys = ("SERIALWRAP_CLI_EXE", "SERIALWRAP_DAEMON_EXE", "SERIALWRAP_AB_LABEL")
+            keys = ("SERIALWRAP_CLI_EXE", "SERIALWRAP_DAEMON_EXE", "SERIALWRAP_AB_LABEL", "SW_BASELINE_PYTHON")
             return {k: os.environ[k] for k in keys if k in os.environ}
 
 
@@ -54,13 +54,14 @@ def is_rust() -> bool:
 def python_baseline_prefix() -> list[str]:
     root = repo_root()
     if os.name == "nt":
-        return [sys.executable, str(root / "serialwrap.py")]
+        baseline = ab_env().get("SW_BASELINE_PYTHON") or sys.executable
+        return [baseline, str(root / "serialwrap.py")]
     return [str(root / "serialwrap")]
 
 
 def python_baseline_interpreter() -> list[str]:
     if os.name == "nt":
-        return [sys.executable]
+        return [ab_env().get("SW_BASELINE_PYTHON") or sys.executable]
     py = shutil.which("python3")
     return [py if py else sys.executable]
 
@@ -70,7 +71,8 @@ def cli_prefix() -> list[str]:
     if not cli:
         return python_baseline_prefix()
     if cli.endswith(".py"):
-        return [sys.executable, cli]
+        interpreter = ab_env().get("SW_BASELINE_PYTHON") if os.name == "nt" else None
+        return [interpreter or sys.executable, cli]
     return [cli]
 
 

@@ -80,15 +80,33 @@ def mgmt_bundle(env: dict[str, str], tmp_path: Path) -> Iterator[MgmtBundle]:
     """
     script = repo_root() / "scripts" / "rust" / "mkbundle.sh"
     out = tmp_path / "bundle"
-    res = subprocess.run(
-        ["bash", str(script), "--dev", "--delegate-sentinel", "--out", str(out), "--print-dir"],
-        capture_output=True,
-        text=True,
-        timeout=900,
-        check=False,
-    )
-    assert res.returncode == 0, res.stderr
-    bundle_dir = Path(res.stdout.strip().splitlines()[-1])
+    supplied = os.environ.get("SW_WIN_DEV_BUNDLE") if os.name == "nt" else None
+    if supplied:
+        # Windows 主機沿用本機 dev bundle，避免在 Windows 啟動 POSIX .sh。
+        shutil.copytree(supplied, out, symlinks=True)
+        bundle_dir = out
+        version = (repo_root() / "VERSION").read_text(encoding="utf-8").strip()
+        version_manifest = bundle_dir / "versions" / version / "release-manifest.json"
+        assert version_manifest.is_file(), f"Windows dev bundle 缺少版本 manifest：{version_manifest}"
+        manifest_data = json.loads(version_manifest.read_text(encoding="utf-8"))
+        entry = manifest_data["components"]["python_cli_delegate"]["entry"]
+        sentinel = str((Path(__file__).resolve().parent / "delegate_sentinel.py").resolve())
+        manifest_data["components"]["python_cli_delegate"]["entry"] = [entry[0], "-I", sentinel]
+        version_manifest.write_text(
+            json.dumps(manifest_data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        shutil.copy2(version_manifest, bundle_dir / "release-manifest.json")
+    else:
+        res = subprocess.run(
+            ["bash", str(script), "--dev", "--delegate-sentinel", "--out", str(out), "--print-dir"],
+            capture_output=True,
+            text=True,
+            timeout=900,
+            check=False,
+        )
+        assert res.returncode == 0, res.stderr
+        bundle_dir = Path(res.stdout.strip().splitlines()[-1])
     manifest = bundle_dir / "release-manifest.json"
     env["SERIALWRAP_RELEASE_MANIFEST"] = str(manifest)
     env["SW_DELEGATE_MARKER"] = str(bundle_dir / "DELEGATED")

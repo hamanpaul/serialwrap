@@ -7,5 +7,10 @@ from __future__ import annotations
 
 import os
 
-AB_KEYS: tuple[str, ...] = ("SERIALWRAP_CLI_EXE", "SERIALWRAP_DAEMON_EXE", "SERIALWRAP_AB_LABEL")
+AB_KEYS: tuple[str, ...] = (
+    "SERIALWRAP_CLI_EXE",
+    "SERIALWRAP_DAEMON_EXE",
+    "SERIALWRAP_AB_LABEL",
+    "SW_BASELINE_PYTHON",
+)
 AB_ENV: dict[str, str] = {k: os.environ[k] for k in AB_KEYS if k in os.environ}
