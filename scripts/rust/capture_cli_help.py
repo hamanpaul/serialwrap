@@ -184,7 +184,9 @@ def run_parser(argv: list[str], columns: int, platform: str) -> tuple[int, str, 
 # 與 `crates/sw-cli/src/cli_spec.rs` 的 Rust-only 宣告逐項對應：Stage 1B 新增的旗標不屬於 Python 基線，
 # 因此 golden 以 Python 3.12.3 argparse 在相同 `add_argument` 擴充後擷取（計畫 Task 1 步驟 5）。
 RUST_ONLY_GROUPS = ("supervision-mode", "setup")
-RUST_ONLY_COLUMNS = (80, 120)
+# 與平台 golden 的群組 `--help` 案例同一組欄寬（步驟 2），使黑箱 Rust 輪對 `setup`／`supervision-mode`
+# 的每個 `help_grp_*_col<N>` 案例都有 Rust-only oracle（P4 gate：原只擷取 80／120，其餘寬度無 oracle）。
+RUST_ONLY_COLUMNS = (20, 21, 25, 30, 40, 60, 80, 90, 120)
 
 
 def _subparser_choices(parser: argparse.ArgumentParser) -> dict:
@@ -263,7 +265,7 @@ def apply_rust_only(parser: argparse.ArgumentParser) -> None:
 
 
 def write_rust_only(out_dir: Path) -> list[Path]:
-    """擷取 `contracts/cli_help/rust_only/{supervision-mode,setup}.{80,120}.txt`（COLUMNS 決定 argparse 寬度）。"""
+    """擷取 `contracts/cli_help/rust_only/{supervision-mode,setup}.<COLUMNS>.txt`（`RUST_ONLY_COLUMNS` 每個寬度；COLUMNS 決定 argparse 寬度）。"""
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
     written: list[Path] = []

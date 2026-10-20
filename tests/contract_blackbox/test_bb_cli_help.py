@@ -18,6 +18,10 @@ from bb_harness import NL, is_rust, python_baseline_interpreter, repo_root, run_
 GOLDEN = repo_root() / "contracts" / "cli_help" / ("windows" if NL == b"\r\n" else "linux")
 META = json.loads((repo_root() / "contracts" / "cli_help" / "_meta.json").read_text(encoding="utf-8"))
 CASES = sorted(p for p in GOLDEN.glob("*.json") if p.name != "_meta.json")
+# Stage 1B Rust-only 擴充（SC-22／SC-23／SC-24／SC-36，absolute_only）使這兩個群組的 `--help` 與 Python 基線必然不同；
+# Rust 輪改以 `capture_cli_help.py --rust-only`（Python 3.12.3 argparse＋同一組擴充）擷取的 golden 為 oracle。
+RUST_ONLY_HELP = repo_root() / "contracts" / "cli_help" / "rust_only"
+RUST_ONLY_HELP_GROUPS = ("setup", "supervision-mode")
 pytestmark = [pytest.mark.core_portable, pytest.mark.process_rpc]
 
 
@@ -73,6 +77,13 @@ def test_help_usage_error_bytes(env, case):
         pytest.skip("解析後連線行為由其他黑箱案例覆蓋")
     r = run_cli(c["argv"], env=_env(env, c["columns"]))
     nl = NL.decode()
+    argv = c["argv"]
+    if is_rust() and len(argv) == 2 and argv[0] in RUST_ONLY_HELP_GROUPS and argv[1] == "--help":
+        golden = RUST_ONLY_HELP / f"{argv[0]}.{c['columns']}.txt"
+        assert golden.is_file(), f"證據不足：缺少 Rust-only help golden {golden.relative_to(repo_root())}"
+        expected = golden.read_text(encoding="utf-8")
+        assert (r.rc, r.stdout.decode(), r.stderr.decode()) == (0, expected.replace("\n", nl), "")
+        return
     if c.get("post_parse_effects") and c["stderr"] == "":
         # capture_cli_help.py 對 `--sock /x session list` 只錄 rc 與 stdout（plan Task 10），stderr 不比對。
         assert (r.rc, r.stdout.decode()) == (c["rc"], c["stdout"].replace("\n", nl))

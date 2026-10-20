@@ -184,8 +184,16 @@ def broken_entry_bundle(tmp_path: Path, dev_base: _DevBundle, monkeypatch: pytes
 
 @pytest.mark.parametrize("argv", SAME_AS_PYTHON)
 def test_delegated_output_identical_to_python(env, argv):
-    py = subprocess.run([*python_baseline_prefix(), *argv], env=env, capture_output=True, check=False)
     r = run_cli(argv, env=env)
+    if bb_harness.is_rust() and argv == ["setup", "--help"]:
+        # Stage 1B 原生承接 setup 並加入 Rust-only 旗標（SC-23／SC-24／SC-36，absolute_only），help 與 Python 必然不同；
+        # oracle 改為 `capture_cli_help.py --rust-only` 擷取的 golden（同 test_bb_cli_help 的 Rust 輪）。
+        golden = REPO / "contracts" / "cli_help" / "rust_only" / f"setup.{env.get('COLUMNS', '80')}.txt"
+        assert golden.is_file(), f"證據不足：缺少 Rust-only help golden {golden}"
+        nl = bb_harness.NL.decode()
+        assert (r.rc, r.stdout.decode(), r.stderr) == (0, golden.read_text(encoding="utf-8").replace("\n", nl), b"")
+        return
+    py = subprocess.run([*python_baseline_prefix(), *argv], env=env, capture_output=True, check=False)
     assert (r.rc, r.stdout, r.stderr) == (py.returncode, py.stdout, py.stderr)
 
 
