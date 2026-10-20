@@ -386,3 +386,7 @@ OD-14（2026-10-16）裁決套用到 Python Stage 0 基線與 P0 契約。新 SC
 4. P7-T18A 的 `bb_faketarget` 擴充鍵（`noise` 等）與 P5-T15a（`noise_interval_s`）可能重複，P7 執行時需合併為單一參數。
 5. P8-T10 新建 `crates/sw-daemon/tests/support/service_rig.rs` 與 P5-T18 `support/mod.rs` 既有 `ServiceRig` 可能同名衝突，P8 執行時應改為擴充既有型別。
 6. arch 文件（`rust-architecture.md`）尚未同步本次定案（`HolderScanStatus` 共用、`FakeClock::at`、`pycompat_s21.tsv`、P8 SC 改號）；由各 owner Task 依其「修訂 arch」步驟寫回。
+
+### 執行期待追蹤項目（2026-10-20）
+
+- `tests/test_stage0_uart_exclusive.py::TestManagerAttach::test_concurrent_attach_device_single_open`：合併 P1-OC＋P2 後主線全套 7 輪中 2 次非確定性失敗（失敗時未保存 traceback；單獨連跑 10 次、整檔、4800 程序 `/proc` 負載皆通過；依序 attach 已確認由 preopened 擋下，排除「負載下退化為依序雙 open」）。`e71dbe2` 已加 thread 完成斷言並於失敗訊息附兩次 attach 回應；**未判為 flaky、未放行**，下次重現時依訊息定位根因（候選：鎖競爭使 attach 超過期限、前序測試洩漏的 thread／狀態）。
