@@ -75,6 +75,21 @@ class Finding:
     message: str
 
 
+def _command_argv(command: str) -> list[str]:
+    """解析 policy 命令，並將 python/python3 綁定至目前執行中的直譯器。"""
+    argv = shlex.split(command)
+    if argv:
+        executable = argv[0].casefold().removesuffix(".exe")
+        if (
+            "/" not in argv[0]
+            and "\\" not in argv[0]
+            and executable in {"python", "python3"}
+            and sys.executable
+        ):
+            argv[0] = sys.executable
+    return argv
+
+
 def check_catalog_against_emissions(cat: Catalogs, res: ExtractionResult) -> list[Finding]:
     """比對契約目錄與程式碼抽出值（C02 C03 C04 C06）。"""
     findings: list[Finding] = []
@@ -487,7 +502,7 @@ def check_generated_facts(repo_root: Path, policy: Mapping[str, Any]) -> list[Fi
 
         try:
             proc = subprocess.run(
-                shlex.split(command),
+                _command_argv(command),
                 cwd=str(repo_root),
                 capture_output=True,
                 text=True,
@@ -748,7 +763,7 @@ def _run_extract_command(extract_cmd: str, repo_root: Path) -> list[str]:
         env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{env.get('PYTHONPATH', '')}".rstrip(os.pathsep)
 
     proc = subprocess.run(
-        shlex.split(extract_cmd),
+        _command_argv(extract_cmd),
         cwd=str(repo_root),
         capture_output=True,
         text=True,

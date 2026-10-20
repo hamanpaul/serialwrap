@@ -1,6 +1,8 @@
 """Agent 觸發式 per-session 日誌 capture 測試"""
 from __future__ import annotations
 
+import builtins
+import errno
 import os
 import shutil
 import tempfile
@@ -210,7 +212,7 @@ class TestConfigLogDir(unittest.TestCase):
 
         profiles = load_profiles(tmpdir).profiles
         self.assertEqual(len(profiles), 1)
-        self.assertEqual(profiles[0].log_dir, "/my/log/dir")
+        self.assertEqual(profiles[0].log_dir, os.path.normpath("/my/log/dir"))
 
     def test_target_overrides_defaults(self) -> None:
         import tempfile
@@ -244,7 +246,7 @@ class TestConfigLogDir(unittest.TestCase):
         from sw_core.config import load_profiles
 
         profiles = load_profiles(tmpdir).profiles
-        self.assertEqual(profiles[0].log_dir, "/target/dir")
+        self.assertEqual(profiles[0].log_dir, os.path.normpath("/target/dir"))
 
     def test_profile_template_overrides_defaults(self) -> None:
         import tempfile
@@ -278,7 +280,7 @@ class TestConfigLogDir(unittest.TestCase):
         from sw_core.config import load_profiles
 
         profiles = load_profiles(tmpdir).profiles
-        self.assertEqual(profiles[0].log_dir, "/profile/dir")
+        self.assertEqual(profiles[0].log_dir, os.path.normpath("/profile/dir"))
 
 
 # ── 新增測試：錯誤路徑 ──────────────────────────────────────
@@ -304,18 +306,34 @@ class TestLogStartErrorPaths(unittest.TestCase):
         )
 
     def test_open_permission_denied(self) -> None:
-        """log_dir 存在但無寫入權限時回傳 LOG_OPEN_FAILED"""
+        """log 檔開啟被拒（PermissionError）時回傳 LOG_OPEN_FAILED
+
+        以故障注入取代 chmod：POSIX 權限位在 Windows 目錄上不生效（且 root 會繞過），
+        chmod 寫法無法在 Windows／root 下確定性地製造拒絕。這裡只對 session_manager
+        的 open 入口（模組層 shadow，不影響其他模組）對 log_dir 下的檔案丟 PermissionError，
+        其餘 open 轉交真正的 builtins.open。原三項斷言保留不變，另加「注入確實命中一次」斷言。
+        """
         bad_dir = os.path.join(self._tmpdir, "readonly")
         os.makedirs(bad_dir)
-        os.chmod(bad_dir, 0o444)
-        try:
+        # 比對兩側皆經 normpath/normcase，避免分隔符或大小寫差異造成假陰性（平台無關）
+        bad_key = os.path.normcase(os.path.normpath(bad_dir))
+        real_open = builtins.open
+        denied: list[str] = []
+
+        def _deny_log_file(path, *args, **kwargs):
+            target = os.fspath(path)
+            if os.path.normcase(os.path.dirname(os.path.normpath(target))) == bad_key:
+                denied.append(target)
+                raise PermissionError(errno.EACCES, "Permission denied", target)
+            return real_open(path, *args, **kwargs)
+
+        with patch("sw_core.session_manager.open", side_effect=_deny_log_file, create=True):
             mgr = self._make_mgr(log_dir=bad_dir)
             result = mgr.log_start("COM0")
-            self.assertFalse(result["ok"])
-            self.assertEqual(result["error_code"], "LOG_OPEN_FAILED")
-            self.assertIn("detail", result)
-        finally:
-            os.chmod(bad_dir, 0o755)
+        self.assertEqual(len(denied), 1)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_code"], "LOG_OPEN_FAILED")
+        self.assertIn("detail", result)
 
     def test_log_stop_session_not_found(self) -> None:
         mgr = self._make_mgr(log_dir=self._tmpdir)

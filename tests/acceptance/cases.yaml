@@ -7,11 +7,12 @@
 #   - platform_capabilities（選填，計畫外欄位）：只用於 windows，列出 Windows 實際需要的能力（如 windows_com），
 #     取代 Linux 專用的 posix_pty；windows_com 守衛同時檢查 capabilities 與 platform_capabilities.windows。
 #   - pending_issue（P1-T21 規則）：f5-deferred-dropped-after-reboot、f10-release-drain-receipt、
-#     f10-release-aborts-inflight-command 尚無擁有者開立的 issue 號，issues 為空，與 regression registry 逐筆對拍。
+#     f10-release-aborts-inflight-command、pt-quiet-ready（P1-OC，OD-14 對應 issue 待擁有者開立）尚無擁有者開立的 issue 號，
+#     issues 為空，與 regression registry 逐筆對拍。
 #   - f10-release-*：補 posix_throwaway_daemon（經 _run_with_handoff 使用 POSIX-only 的 ThrowawayDaemon），與 f10-creds-* 同族。
 #   - win-wal-av-*：evidence 以 scripts/stage0/spike3_win_wal.py 實際產物 <case-id>.json 為準。
 schema_version: 1
-revision: 2026-10-15.1
+revision: 2026-10-20.1
 spec: docs/rust-refactor/serialwrap-rust-spec-final.md
 invariant_ids: [zero_tx_on_reject, no_forbidden_interleave, no_stale_context_replay, no_reopen_before_handoff, no_auto_resend, insufficient_evidence_not_pass]
 features:
@@ -870,6 +871,32 @@ cases:
   evidence: [report.json, report.md]
   implemented_by: existing
   cross_slice_reason: null
+- case_id: pt-quiet-ready
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f09_boot_uboot.py:633
+  family: F9
+  title: passthrough（真板 U-Boot／MCU 線）attach 後零 TX、靜默 30 秒才升 READY，且 cmd submit --completion-regex 可完成
+  contract: 'SC-35 真板 oracle：passthrough 不介入 UART，attach 至 READY 全程 WAL 零 TX，READY 不得早於 30 秒靜默下限；READY 後 cmd submit --completion-regex 須完成。板子最後觀測仍有 RX 時判 SKIP rx_not_quiet，WAL 證據缺漏判 SKIP insufficient_evidence。全程在 throwaway daemon sandbox 內重現，prod 端只做 device release／attach 交接。'
+  invariants: [zero_tx_on_reject]
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: 'ThrowawayDaemon 與 /dev/serial/by-id 符號連結沙盒為 POSIX-only；Windows 原生 passthrough 實機安靜升 READY 的 bench 尚未登錄（時間注入由 pytest 覆蓋）'
+  capabilities: [physical_uart, posix_throwaway_daemon]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [drain_release]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-35]
+  destructive: true
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+  pending_issue: true
 - case_id: f10-unresolved-creds-terminal
   suite: regression
   source_ref: regression/serialwrap_regression/cases/f10_login_creds.py:286

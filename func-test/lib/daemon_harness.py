@@ -66,9 +66,22 @@ def build_isolated_env(
 
 
 def resolve_cli_exe() -> list[str]:
-    """解析實際使用的 CLI argv。"""
+    """解析 CLI 身分對應的可執行檔路徑，不含 Windows Python interpreter。"""
     executable = os.environ.get("SERIALWRAP_CLI_EXE")
-    return [executable] if executable else [str(ROOT_DIR / "serialwrap")]
+    if executable:
+        return [executable]
+    return [str(ROOT_DIR / "serialwrap")]
+
+
+def resolve_cli_command() -> list[str]:
+    """解析可直接交給 subprocess 執行的 CLI argv。"""
+    argv = resolve_cli_exe()
+    if os.environ.get("SERIALWRAP_CLI_EXE"):
+        return argv
+    if os.name == "nt":
+        interpreter = os.environ.get("PYTHON") or sys.executable
+        return [interpreter, *argv]
+    return argv
 
 
 def resolve_daemon_argv() -> list[str]:
@@ -168,7 +181,7 @@ class DaemonHarness:
         return self._evidence_dir
 
     def get_cli_argv(self) -> list[str]:
-        argv = resolve_cli_exe()
+        argv = resolve_cli_command()
         endpoint_flag = "--endpoint" if self.endpoint.startswith("tcp://") else "--socket"
         return [*argv, endpoint_flag, self.endpoint]
 
@@ -493,5 +506,5 @@ class DaemonHarness:
 
 __all__ = [
     "ARTIFACT_ENV", "ISOLATED_DIR_ENV", "DaemonHarness", "HarnessConfig", "StepError",
-    "build_isolated_env", "free_port", "resolve_cli_exe", "resolve_daemon_argv",
+    "build_isolated_env", "free_port", "resolve_cli_exe", "resolve_cli_command", "resolve_daemon_argv",
 ]

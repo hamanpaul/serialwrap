@@ -4,7 +4,8 @@
 長跑與監管 runner 的 P1 前置條件與隔離、證據索引的 evidence_layer 規則（經 check_evidence_index.py）、
 報告 uart_kind（resource_report_plugin）、以及能力式 SKIP 的兩容器真跑 smoke。
 
-模組層只放平台 marker；資源 marker 逐一標在測試函式上（tests/test_resource_markers.py 的 mixed-scope 規則）。
+同檔混合平台（執行 scripts/docker/*.sh 的 bash runner 含 smoke 為 posix_only，其餘為 core_portable）與資源，依 Task 14 規則 2 模組層不放 marker，
+平台與資源 marker 逐一標在測試函式上（tests/test_resource_markers.py 的 mixed-scope 規則）。
 """
 
 from __future__ import annotations
@@ -19,8 +20,6 @@ import sys
 from pathlib import Path
 
 import pytest
-
-pytestmark = pytest.mark.core_portable
 
 REPO = Path(__file__).resolve().parents[1]
 COMPOSE = REPO / "tools" / "docker" / "compose.l15.yaml"
@@ -199,6 +198,7 @@ def _docker_available() -> bool:
         return False
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_compose_two_app_containers():
     services = _compose_services()
@@ -210,6 +210,7 @@ def test_compose_two_app_containers():
     assert dut.get("network_mode") == "none"
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_compose_no_real_serial_devices():
     services = _compose_services()
@@ -232,6 +233,8 @@ def test_compose_no_real_serial_devices():
                 f"{name} 非 systemd profile 不得掛載 /sys/fs/cgroup"
 
 
+# POSIX-only（§10.4）：_run_script（tests/test_docker_l15.py:71）用 bash 執行 scripts/docker/*.sh；run-l15.sh:43／common.sh:7 需 POSIX bash 與 python3（WSL 路徑轉換 rc=127，Git Bash 缺 python3 rc=49）。
+@pytest.mark.posix_only
 @pytest.mark.process_rpc
 def test_run_l15_dry_run_uses_sandbox_by_id():
     r = _run_script(RUN_L15, "pytest-physical-uart", "--dry-run")
@@ -241,6 +244,8 @@ def test_run_l15_dry_run_uses_sandbox_by_id():
     assert "/dev/serial/by-id" not in r.stdout
 
 
+# POSIX-only（§10.4）：_run_script（tests/test_docker_l15.py:71）用 bash 執行 scripts/docker/*.sh；run-l15.sh:43／common.sh:7 需 POSIX bash 與 python3（WSL 路徑轉換 rc=127，Git Bash 缺 python3 rc=49）。
+@pytest.mark.posix_only
 @pytest.mark.process_rpc
 def test_run_l15_dry_run_labels_report():
     r = _run_script(RUN_L15, "pytest-physical-uart", "--dry-run")
@@ -250,6 +255,8 @@ def test_run_l15_dry_run_labels_report():
     assert "-m physical_uart" not in r.stdout
 
 
+# POSIX-only（§10.4）：_run_script（tests/test_docker_l15.py:71）用 bash 執行 scripts/docker/*.sh；run-l15.sh:43／common.sh:7 需 POSIX bash 與 python3（WSL 路徑轉換 rc=127，Git Bash 缺 python3 rc=49）。
+@pytest.mark.posix_only
 @pytest.mark.process_rpc
 def test_run_l15_dry_run_uses_full_suite_by_default(tmp_path):
     bundle = _bundle_fixture(tmp_path / "bundle")
@@ -260,6 +267,8 @@ def test_run_l15_dry_run_uses_full_suite_by_default(tmp_path):
     assert f"{bundle}:/opt/sw-bundle:ro" in r.stdout
 
 
+# POSIX-only（§10.4）：_run_script（tests/test_docker_l15.py:71）用 bash 執行 scripts/docker/*.sh；run-l15.sh:43／common.sh:7 需 POSIX bash 與 python3（WSL 路徑轉換 rc=127，Git Bash 缺 python3 rc=49）。
+@pytest.mark.posix_only
 @pytest.mark.process_rpc
 def test_run_l15_refuses_invalid_bundle_before_dry_run(tmp_path):
     r = _run_script(RUN_L15, "func-test-bridge", "--dry-run", "--bundle", str(tmp_path))
@@ -267,6 +276,8 @@ def test_run_l15_refuses_invalid_bundle_before_dry_run(tmp_path):
     assert "bundle manifest 無效" in r.stderr
 
 
+# POSIX-only（§10.4）：_run_script（tests/test_docker_l15.py:71）用 bash 執行 scripts/docker/*.sh；run-l15.sh:43／common.sh:7 需 POSIX bash 與 python3（WSL 路徑轉換 rc=127，Git Bash 缺 python3 rc=49）。
+@pytest.mark.posix_only
 @pytest.mark.process_rpc
 @pytest.mark.parametrize(
     ("suite", "expected"),
@@ -278,6 +289,8 @@ def test_run_l15_dry_run_uses_suite_entrypoint(suite, expected):
     assert expected in r.stdout
 
 
+# POSIX-only（§10.4）：_run_script（tests/test_docker_l15.py:71）用 bash 執行 scripts/docker/*.sh；run-l15.sh:43／common.sh:7 需 POSIX bash 與 python3（WSL 路徑轉換 rc=127，Git Bash 缺 python3 rc=49）。
+@pytest.mark.posix_only
 @pytest.mark.process_rpc
 def test_run_systemd_dry_run_asserts_dropin():
     r = _run_script(RUN_SYSTEMD, "--mode", "systemd-user", "--dry-run")
@@ -289,6 +302,8 @@ def test_run_systemd_dry_run_asserts_dropin():
     assert "build_dut_image.sh" not in r.stdout
 
 
+# POSIX-only（§10.4）：_run_script（tests/test_docker_l15.py:71）用 bash 執行 scripts/docker/*.sh；run-l15.sh:43／common.sh:7 需 POSIX bash 與 python3（WSL 路徑轉換 rc=127，Git Bash 缺 python3 rc=49）。
+@pytest.mark.posix_only
 @pytest.mark.process_rpc
 def test_run_systemd_system_dry_run_uses_system_scope():
     r = _run_script(RUN_SYSTEMD, "--mode", "systemd-system", "--dry-run")
@@ -298,6 +313,8 @@ def test_run_systemd_system_dry_run_uses_system_scope():
     assert "systemctl --user" not in r.stdout
 
 
+# POSIX-only（§10.4）：_run_script（tests/test_docker_l15.py:71）用 bash 執行 scripts/docker/*.sh；run-l15.sh:43／common.sh:7 需 POSIX bash 與 python3（WSL 路徑轉換 rc=127，Git Bash 缺 python3 rc=49）。
+@pytest.mark.posix_only
 @pytest.mark.process_rpc
 def test_longrun_and_supervision_isolated(tmp_path):
     gate_env = _valid_p1_gate_env(tmp_path)
@@ -311,6 +328,8 @@ def test_longrun_and_supervision_isolated(tmp_path):
     assert _volume_sources(lr.stdout).isdisjoint(_volume_sources(sv.stdout))
 
 
+# POSIX-only（§10.4）：_run_script（tests/test_docker_l15.py:71）用 bash 執行 scripts/docker/*.sh；run-l15.sh:43／common.sh:7 需 POSIX bash 與 python3（WSL 路徑轉換 rc=127，Git Bash 缺 python3 rc=49）。
+@pytest.mark.posix_only
 @pytest.mark.process_rpc
 def test_longrun_refuses_before_p1(tmp_path):
     import yaml  # noqa: PLC0415
@@ -324,6 +343,8 @@ def test_longrun_refuses_before_p1(tmp_path):
     assert "P1 未合併：BC-01 非 IMPLEMENTED" in r.stderr
 
 
+# POSIX-only（§10.4）：_run_script（tests/test_docker_l15.py:71）用 bash 執行 scripts/docker/*.sh；run-l15.sh:43／common.sh:7 需 POSIX bash 與 python3（WSL 路徑轉換 rc=127，Git Bash 缺 python3 rc=49）。
+@pytest.mark.posix_only
 @pytest.mark.process_rpc
 def test_supervision_refuses_before_p1(tmp_path):
     import yaml  # noqa: PLC0415
@@ -341,6 +362,7 @@ def test_supervision_refuses_before_p1(tmp_path):
     assert "P1-OC 未合併" in r.stderr
 
 
+@pytest.mark.core_portable
 @pytest.mark.process_rpc
 @pytest.mark.parametrize(
     ("required", "layer", "producer"),
@@ -354,6 +376,7 @@ def test_evidence_index_rejects_docker_for_l2(tmp_path, required, layer, produce
     assert "evidence_layer_mismatch" in r.stdout, _tail(r)
 
 
+@pytest.mark.core_portable
 @pytest.mark.process_rpc
 def test_evidence_index_fail_closed_missing_layer(tmp_path):
     r = _checker_run(tmp_path, {"producer": "run-longrun.sh"}, "L1.5-docker")
@@ -361,6 +384,7 @@ def test_evidence_index_fail_closed_missing_layer(tmp_path):
     assert "evidence_layer_missing" in r.stdout, _tail(r)
 
 
+@pytest.mark.core_portable
 @pytest.mark.process_rpc
 @pytest.mark.parametrize("report", [
     {"producer": "run-l15.sh", "evidence_layer": ["L1.5-docker"]},
@@ -378,6 +402,7 @@ def test_evidence_index_rejects_invalid_docker_report(tmp_path, report):
     )), _tail(r)
 
 
+@pytest.mark.core_portable
 @pytest.mark.process_rpc
 def test_evidence_index_requires_required_layer(tmp_path):
     r = _checker_run(tmp_path, {"producer": "run-l15.sh", "evidence_layer": "L1.5-docker"}, None)
@@ -385,6 +410,7 @@ def test_evidence_index_requires_required_layer(tmp_path):
     assert "schema_invalid" in r.stderr, _tail(r)
 
 
+@pytest.mark.core_portable
 @pytest.mark.process_rpc
 def test_resource_report_uart_kind(tmp_path):
     _require(RESOURCE_PLUGIN, "Task 13 resource_report_plugin")
@@ -411,6 +437,8 @@ def test_resource_report_uart_kind(tmp_path):
         assert data["uart_kind"] == expect
 
 
+# POSIX-only（§10.4）：_run_script（tests/test_docker_l15.py:71）用 bash 執行 scripts/docker/*.sh；run-l15.sh:43／common.sh:7 需 POSIX bash 與 python3（WSL 路徑轉換 rc=127，Git Bash 缺 python3 rc=49）。
+@pytest.mark.posix_only
 @pytest.mark.process_rpc
 def test_docker_smoke_two_container(tmp_path):
     # 本檔未註冊 docker marker（P0 T14 註冊表）；能力缺失以執行期能力式 SKIP 表達
@@ -431,6 +459,7 @@ def test_docker_smoke_two_container(tmp_path):
     assert verdicts.get("sm-01-attach-to-ready") == "PASS", _tail(r)
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_l15_suite_runtime_import_and_cli_paths_match_serialwrap_image():
     """回歸：容器內 runner 使用的 runtime 模組必須有 import，預設 CLI／daemon 路徑須與 serialwrap image 安裝位置一致。
@@ -466,6 +495,7 @@ def test_l15_suite_runtime_import_and_cli_paths_match_serialwrap_image():
         assert image_has_venv or "/.venv/" not in path, f"{path} 指向 serialwrap image 不存在的 venv"
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_systemd_container_runners_resolve_imports_and_host_bind_paths():
     """回歸：systemd 容器內 runner 的 import、bridge 證據路徑與 runuser argv 必須能在真跑時成立。

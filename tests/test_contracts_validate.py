@@ -985,13 +985,26 @@ def test_c14_command_failure_exit_code(tmp_path):
     )
     policy = {
         "generated_facts": [
-            {"command": "sh -c 'printf \"OLD\"; exit 7'", "reflected_in": "SKILL.md", "marker": "error-codes"},
+            {"command": "python3 -c \"import sys; sys.stdout.write('OLD'); sys.exit(7)\"", "reflected_in": "SKILL.md", "marker": "error-codes"},
         ]
     }
     findings = _load("validate").check_generated_facts(tmp_path, policy)
     hits = _find(findings, "C14")
     assert len(hits) == 1
     assert "exit=7" in hits[0].message
+
+
+@pytest.mark.memory_only
+def test_command_argv_only_rebinds_bare_python(monkeypatch):
+    """只替換 PATH 查找的 python 別名，不覆蓋明確指定的直譯器路徑。"""
+    validate = _load("validate")
+
+    assert validate._command_argv("python3 -m x")[0] == sys.executable
+    assert validate._command_argv("/opt/py/bin/python3 -m x")[0] == "/opt/py/bin/python3"
+    assert validate._command_argv("sh -c x")[0] == "sh"
+
+    monkeypatch.setattr(validate.sys, "executable", "")
+    assert validate._command_argv("python3 -m x")[0] == "python3"
 
 
 @pytest.mark.memory_only

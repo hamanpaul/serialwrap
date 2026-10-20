@@ -83,8 +83,9 @@ def test_handoff_file_push_after_last_probe(tmp_path):
     svc.close_for_test()
 
 
-@pytest.mark.core_portable
-@pytest.mark.memory_only
+# POSIX-only（§10.4）：tests/stage0_fakes.py:327 用 os.O_NOCTTY、:348 啟動 flash PTY；ttyMCU PTY-bridge 僅 POSIX（CLAUDE.md）。
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 @pytest.mark.parametrize("first", ["probe", "handoff", "race"])
 def test_handoff_flash_races_prepare(tmp_path, first):
     for _ in range(200 if first == "race" else 1):

@@ -446,12 +446,19 @@ def test_bridge_mode_skips_inapplicable_case_without_starting_harness(
     monkeypatch.setattr(runner.TestRunner, "run", lambda self: pytest.fail("SKIP case must not start harness"))
     monkeypatch.setattr(runner.TestRunner, "_write_manifest", lambda self, *args, **kwargs: None)
 
-    rc = runner.main([
+    args = [
         "--mode", "bridge",
         "--case", tc.name,
         "--selftest-report", str(tmp_path / "not-read.json"),
         "--report-dir", str(tmp_path / "reports"),
-    ])
+    ]
+    if os.name == "nt":
+        args.extend([
+            "--daemon-com", "COM20",
+            "--bridge-com", "COM21",
+            "--transport-mode", "virtual_com0com",
+        ])
+    rc = runner.main(args)
 
     report = json.loads((tmp_path / "reports" / "func-test-report.json").read_text(encoding="utf-8"))
     assert rc == 1

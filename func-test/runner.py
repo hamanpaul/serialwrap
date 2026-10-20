@@ -47,7 +47,14 @@ from lib.console_client import (
     console_write,
 )
 from lib.correlation import CorrelationLog
-from lib.daemon_harness import DaemonHarness, HarnessConfig, StepError, resolve_cli_exe, resolve_daemon_argv
+from lib.daemon_harness import (
+    DaemonHarness,
+    HarnessConfig,
+    StepError,
+    resolve_cli_command,
+    resolve_cli_exe,
+    resolve_daemon_argv,
+)
 from lib.expect_engine import check_expect
 from lib.target_config import TargetConfig
 from lib.yaml_loader import TestCase, discover_test_cases
@@ -323,11 +330,12 @@ class TestRunner:
                 self._bridge_eligible = True
 
         target_cfg = TargetConfig.from_yaml(self.tc.target)
-        cli_argv = resolve_cli_exe()
+        cli_exe = resolve_cli_exe()
+        cli_argv = resolve_cli_command()
         daemon_argv = resolve_daemon_argv()
         from lib.artifact_identity import collect_artifacts
         from realhw import deployed_content
-        self._deployed_start = deployed_content.measure(cli_argv[0], daemon_argv=daemon_argv)
+        self._deployed_start = deployed_content.measure(cli_exe[0], daemon_argv=daemon_argv)
         self._bridge_tool = self._tool_identity()
         if self.tc.bridge.get("secrets_from_env_file"):
             self._secrets = resolve_secrets_from_env_file(self.tc.env_files, self.tc.bridge["secrets_from_env_file"])
@@ -414,7 +422,7 @@ class TestRunner:
                             f"closed_cleanly={stop_result.get('closed_cleanly')}, "
                             f"failure={stop_result.get('failure')}"
                         )
-            self._deployed_end = deployed_content.measure(cli_argv[0], daemon_argv=daemon_argv)
+            self._deployed_end = deployed_content.measure(cli_exe[0], daemon_argv=daemon_argv)
 
         if self.mode == "bridge" and ok:
             compare_mode = self.tc.bridge.get("compare", "none")
@@ -874,12 +882,13 @@ class TestRunner:
         from realhw import deployed_content
         from uart_stdio_bridge.evidence.manifest import platform_info
 
-        cli_argv = resolve_cli_exe()
+        cli_exe = resolve_cli_exe()
+        cli_argv = resolve_cli_command()
         daemon_argv = resolve_daemon_argv()
         if not self._deployed_start:
-            self._deployed_start = deployed_content.measure(cli_argv[0], daemon_argv=daemon_argv)
+            self._deployed_start = deployed_content.measure(cli_exe[0], daemon_argv=daemon_argv)
         if not self._deployed_end:
-            self._deployed_end = deployed_content.measure(cli_argv[0], daemon_argv=daemon_argv)
+            self._deployed_end = deployed_content.measure(cli_exe[0], daemon_argv=daemon_argv)
         artifact_record = self._artifact_record(artifacts or collect_artifacts(cli_argv, daemon_argv, ROOT_DIR))
 
         bridge_src = ROOT_DIR / "tools" / "uart_stdio_bridge" / "src"

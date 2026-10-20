@@ -101,7 +101,10 @@ time.sleep(600)
 
 
 def test_kill_before_release_commit_leaves_last_valid_state(tmp_path):
-    """情境 (b)：release 持久化 commit 前以 kill -9 終止（確定性暫停點 arrived 後才 kill）；state.json 不得宣稱 RELEASED。"""
+    """情境 (b)：release 持久化 commit 前強制終止（確定性暫停點 arrived 後才 kill）；state.json 不得宣稱 RELEASED。
+
+    強制終止使用 ``Popen.kill()``：POSIX 為 SIGKILL，Windows 為 TerminateProcess（無 ``signal.SIGKILL``）。
+    """
     import signal
     import time
 
@@ -123,12 +126,19 @@ def test_kill_before_release_commit_leaves_last_valid_state(tmp_path):
         # 暫停點已確認：此時 state.json 尚未寫入 release 項目（commit 前）。
         pre = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
         assert not (pre.get("released") or {}), pre
-        proc.send_signal(signal.SIGKILL)
+        assert proc.poll() is None, "確定性暫停點抵達前，子行程不得已自行結束"
+        # 不使用 send_signal(signal.SIGKILL)：Windows 的 signal 模組沒有 SIGKILL，send_signal 亦不接受它。
+        # Popen.kill() 在 POSIX 送 SIGKILL、在 Windows 呼叫 TerminateProcess，語意皆為不可攔截的強制終止。
+        proc.kill()
         proc.wait(timeout=30)
     finally:
         if proc.poll() is None:
             proc.kill()
             proc.wait()
-    assert proc.returncode == -signal.SIGKILL
+    if os.name == "nt":
+        # Windows：CPython 的 Popen.kill() 以 TerminateProcess(handle, 1) 結束子行程，exit code 精確為 1。
+        assert proc.returncode == 1, proc.returncode
+    else:
+        assert proc.returncode == -signal.SIGKILL
     post = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
     assert not (post.get("released") or {}), f"commit 前被殺不得留下 RELEASED 紀錄：{post}"

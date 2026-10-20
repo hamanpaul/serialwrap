@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "cases_revision": "2026-10-15.1",
+  "cases_revision": "2026-10-20.1",
   "sets": {
     "stage0": [
       "brcm-01-login-flow",
@@ -152,6 +152,7 @@
       "p1-hp-cycle",
       "p1-rst-bootwindow",
       "p1-rst-recover",
+      "pt-quiet-ready",
       "sm-01-attach-to-ready",
       "sm-04-device-unplug",
       "win-com-cancel-close",
@@ -258,6 +259,7 @@
       "p1-wal-fullrun",
       "p1-wal-reset",
       "p2-1-mcu-flash-manual",
+      "pt-quiet-ready",
       "rc-01-interactive-mode-switch",
       "rm-live-cycle",
       "rm-live-e2e",
@@ -501,6 +503,7 @@
       "p1-rst-recover",
       "p1-wal-fullrun",
       "p1-wal-reset",
+      "pt-quiet-ready",
       "rc-01-interactive-mode-switch",
       "rm-live-cycle",
       "rm-live-e2e",
@@ -609,6 +612,7 @@
       "p1-wal-fullrun",
       "p1-wal-reset",
       "p2-1-mcu-flash-manual",
+      "pt-quiet-ready",
       "rc-01-interactive-mode-switch",
       "rm-live-cycle",
       "rm-live-e2e",
@@ -1879,6 +1883,19 @@
       "necessity": "required",
       "daemon_slice": "2.4",
       "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "pt-quiet-ready": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
       "stage0_required": false
     },
     "rc-01-interactive-mode-switch": {

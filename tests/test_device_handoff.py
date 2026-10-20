@@ -182,7 +182,9 @@ class TestProbeExternalHolder(_Base):
         proc = Path(self._tmp.name) / "proc"
         (proc / "1234" / "fd").mkdir(parents=True)
         os.symlink("/dev/ttyUSB9", proc / "1234" / "fd" / "5")
-        res = mgr._probe_external_holder("/dev/ttyUSB9", _proc_root=str(proc))
+        # 釘 POSIX procfs 分支：probe_holders 在 os.name == "nt" 時直接回 unsupported（見 test_holder_probe_portability.py）
+        with mock.patch.object(os, "name", "posix"):
+            res = mgr._probe_external_holder("/dev/ttyUSB9", _proc_root=str(proc))
         self.assertEqual(res["pids"], [1234])
         self.assertEqual(res["holder"], 1234)
 
@@ -191,7 +193,8 @@ class TestProbeExternalHolder(_Base):
         proc = Path(self._tmp.name) / "proc"
         (proc / "1234" / "fd").mkdir(parents=True)
         os.symlink("/dev/ttyUSB0", proc / "1234" / "fd" / "5")
-        res = mgr._probe_external_holder("/dev/ttyUSB9", _proc_root=str(proc))
+        with mock.patch.object(os, "name", "posix"):
+            res = mgr._probe_external_holder("/dev/ttyUSB9", _proc_root=str(proc))
         self.assertEqual(res["pids"], [])
         self.assertIsNone(res["holder"])
 

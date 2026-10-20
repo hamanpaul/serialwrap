@@ -182,12 +182,17 @@ def test_write_never_targets_system_file(tmp_path, monkeypatch):
 @pytest.mark.core_portable
 @pytest.mark.memory_only
 @pytest.mark.parametrize("raw,expected_suffix", [
+    # 參數字面值維持 POSIX 形式，使 pytest nodeid 在 Linux／Windows 一致（§11.3 case 識別）；
+    # 平台相依的期望值於測試本體以 os.path.normpath 產生。
     ("unix:///run/x/../x/s.sock", "/run/x/s.sock"),
     ("/run//x/./s.sock", "/run/x/s.sock"),
     ("tcp://127.0.0.1:48700", "tcp://127.0.0.1:48700"),
 ])
 def test_normalize_endpoint_path(raw, expected_suffix):
     (normalize_endpoint_path,) = _load("sw_core.util", "normalize_endpoint_path")
+    # Unix 路徑於 Windows 為反斜線（abspath 另加磁碟機，endswith 仍成立）；TCP 不經路徑正規化。
+    if not expected_suffix.startswith("tcp://"):
+        expected_suffix = os.path.normpath(expected_suffix)
     assert normalize_endpoint_path(raw).endswith(expected_suffix)
 
 

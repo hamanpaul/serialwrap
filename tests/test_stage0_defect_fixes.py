@@ -116,6 +116,7 @@ def _isolate_xdg_and_home(monkeypatch: pytest.MonkeyPatch, root: Path) -> Path:
     home = root / "home"
     home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(root / "xdg_cfg"))
     monkeypatch.setenv("XDG_DATA_HOME", str(root / "xdg_data"))
     monkeypatch.setenv("XDG_STATE_HOME", str(root / "xdg_state"))
@@ -742,6 +743,17 @@ def test_reconcile_continues_when_run_user_resolution_fails(
 
 
 # ─────────────────────────────── DF-16：Windows skill link 權限不足時回退為複製 ───────────────────────────────
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_windows_home_is_isolated_by_pytest_conftest() -> None:
+    """Windows pytest 的 HOME 與 USERPROFILE 都必須指向本輪隔離目錄。"""
+    if os.name == "nt":
+        home = Path(os.environ["USERPROFILE"])
+        assert Path(os.environ["HOME"]) == home
+        assert home.name == "home"
+        assert home.parent.name.startswith("sw-pytest-iso-")
 
 
 @pytest.mark.core_portable

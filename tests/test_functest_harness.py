@@ -60,6 +60,7 @@ def test_harness_isolates_nine_dirs_and_strips_all_serialwrap(monkeypatch, tmp_p
     h = daemon_harness.DaemonHarness(daemon_harness.HarnessConfig(mode="pty"))
     monkeypatch.setattr(daemon_harness.subprocess, "Popen", _capture_popen(captured))
     monkeypatch.setattr(h, "wait_endpoint", lambda *_a, **_k: None)
+    monkeypatch.setattr(h, "_start_fake_target", lambda: None)
     h.start()
     try:
         env = captured["env"]
@@ -85,6 +86,23 @@ def test_cli_exe_env_override(monkeypatch):
 
 
 @pytest.mark.memory_only
+def test_cli_command_uses_python_without_changing_executable_identity(monkeypatch):
+    """Windows 命令以 Python 執行 CLI 腳本，CLI 身分仍是腳本路徑。"""
+    from lib import daemon_harness
+
+    monkeypatch.delenv("SERIALWRAP_CLI_EXE", raising=False)
+    monkeypatch.delenv("PYTHON", raising=False)
+    monkeypatch.setattr(daemon_harness.os, "name", "nt")
+    monkeypatch.setattr(daemon_harness.sys, "executable", r"C:\Python\python.exe")
+
+    script = str(daemon_harness.ROOT_DIR / "serialwrap")
+    assert daemon_harness.resolve_cli_exe() == [script]
+    resolve_command = getattr(daemon_harness, "resolve_cli_command", None)
+    assert callable(resolve_command), "Windows 命令 argv 應由獨立 resolver 提供"
+    assert resolve_command() == [r"C:\Python\python.exe", script]
+
+
+@pytest.mark.memory_only
 def test_daemon_exe_env_override(monkeypatch):
     """驗證 SERIALWRAP_DAEMON_EXE 環境變數可覆寫 daemon 執行檔路徑與 Popen argv。"""
     from lib import daemon_harness
@@ -95,6 +113,7 @@ def test_daemon_exe_env_override(monkeypatch):
     h = daemon_harness.DaemonHarness(daemon_harness.HarnessConfig(mode="pty"))
     monkeypatch.setattr(daemon_harness.subprocess, "Popen", _capture_popen(captured))
     monkeypatch.setattr(h, "wait_endpoint", lambda *_a, **_k: None)
+    monkeypatch.setattr(h, "_start_fake_target", lambda: None)
     h.start()
     try:
         argv = captured["args"]
@@ -116,6 +135,7 @@ def test_daemon_log_not_devnull(monkeypatch, tmp_path):
     h = daemon_harness.DaemonHarness(daemon_harness.HarnessConfig(mode="pty", evidence_dir=evidence_dir))
     monkeypatch.setattr(daemon_harness.subprocess, "Popen", _capture_popen(captured))
     monkeypatch.setattr(h, "wait_endpoint", lambda *_a, **_k: None)
+    monkeypatch.setattr(h, "_start_fake_target", lambda: None)
     h.start()
     try:
         assert captured["stdout"] is not None
@@ -129,13 +149,13 @@ def test_daemon_log_not_devnull(monkeypatch, tmp_path):
         h.stop()
 
 
-@pytest.mark.memory_only
+@pytest.mark.process_rpc
 def test_artifact_identity_python_baseline():
     """驗證 Python 基線的 artifact identity 收集結果。"""
     from lib import artifact_identity, daemon_harness
 
     repo_root = daemon_harness.ROOT_DIR
-    cli_argv = daemon_harness.resolve_cli_exe()
+    cli_argv = daemon_harness.resolve_cli_command()
     daemon_argv = daemon_harness.resolve_daemon_argv()
     artifacts = artifact_identity.collect_artifacts(cli_argv, daemon_argv, repo_root)
     assert artifacts["daemon"]["implementation"] == "python"
@@ -144,7 +164,41 @@ def test_artifact_identity_python_baseline():
     assert len(pkg_sha) == 64 and all(c in "0123456789abcdef" for c in pkg_sha)
     assert len(repo_sha) == 64 and all(c in "0123456789abcdef" for c in repo_sha)
     assert pkg_sha != repo_sha
+    assert pathlib.Path(artifacts["cli"]["path"]) == (repo_root / "serialwrap").resolve()
+    cli_sha = artifacts["cli"]["sha256"]
+    assert len(cli_sha) == 64 and all(c in "0123456789abcdef" for c in cli_sha)
     assert artifacts["cli"]["version_stdout"].startswith("serialwrap ")
+
+
+@pytest.mark.memory_only
+def test_artifact_identity_expands_cli_path_before_version_call(tmp_path, monkeypatch):
+    """CLI 版本探測使用 expanduser/resolve 後的路徑，避免 ~ 路徑靜默失敗。"""
+    from lib import artifact_identity
+
+    home = tmp_path / "home"
+    cli = home / "bin" / "serialwrap"
+    cli.parent.mkdir(parents=True)
+    cli.write_text("python cli fixture\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+
+    calls = []
+
+    class VersionResult:
+        stdout = "serialwrap 0.3.2\n"
+
+    def _run(argv, **_kwargs):
+        calls.append(argv)
+        return VersionResult()
+
+    monkeypatch.setattr(artifact_identity.subprocess, "run", _run)
+    result = artifact_identity.collect_artifacts(
+        ["~/bin/serialwrap"], ["/missing/serialwrapd.exe"], tmp_path
+    )
+
+    assert calls == [[str(cli.resolve()), "--version"]]
+    assert result["cli"]["path"] == str(cli.resolve())
+    assert result["cli"]["version_stdout"].startswith("serialwrap ")
 
 
 @pytest.mark.memory_only
@@ -261,7 +315,7 @@ def test_cli_subprocess_uses_explicit_utf8(monkeypatch: pytest.MonkeyPatch) -> N
         stdout = '{"ok":true}'
         stderr = ""
 
-    monkeypatch.setattr(cli_client, "resolve_cli_exe", lambda: ["serialwrap"])
+    monkeypatch.setattr(cli_client, "resolve_cli_command", lambda: ["serialwrap"])
     monkeypatch.setattr(cli_client.subprocess, "run", lambda *args, **kwargs: captured.update(kwargs) or FakeResult())
 
     result = cli_client.cli_run([], socket_path="tcp://127.0.0.1:1", env={})
@@ -272,10 +326,11 @@ def test_cli_subprocess_uses_explicit_utf8(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 @pytest.mark.memory_only
-def test_bridge_mode_maps_device_event_to_link_ops():
+def test_bridge_mode_maps_device_event_to_link_ops(monkeypatch):
     """驗證 bridge 模式下 device_event、target_emit、pause_target 正確映射至 bridge 呼叫。"""
     from lib import daemon_harness
 
+    monkeypatch.setattr(daemon_harness.os, "name", "posix")
     calls: list[tuple[str, Any]] = []
 
     class FakeBridgeSession:
@@ -294,6 +349,10 @@ def test_bridge_mode_maps_device_event_to_link_ops():
 
     h.pause_target(5)
     assert calls[-1] == ("dut_control", {"msg": {"action": "pause_responding", "duration_ms": 5000}})
+
+    monkeypatch.setattr(daemon_harness.os, "name", "nt")
+    with pytest.raises(daemon_harness.StepError, match="cap_missing:by_id_link"):
+        h.device_event("remove")
 
 
 @pytest.mark.memory_only

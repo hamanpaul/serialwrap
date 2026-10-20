@@ -448,7 +448,9 @@ class TestCliTraceTcpAndRetry(CliDiagnosticsMixin, unittest.TestCase):
         self.assertEqual(trace["endpoint_transport"], "tcp")
         self.assertEqual(trace["endpoint_id"], "127.0.0.1:48700")
         self.assertEqual(trace["errno"], errno.ECONNREFUSED)
-        self.assertEqual(trace["errno_name"], "ECONNREFUSED")
+        # errno_name 契約為 errno.errorcode.get(errno)（inventory/01-cli.md）；
+        # Windows 上 ECONNREFUSED == 10061，對應名稱為 WSAECONNREFUSED，不得寫死 POSIX 名稱。
+        self.assertEqual(trace["errno_name"], errno.errorcode.get(errno.ECONNREFUSED))
 
     def test_retry_success_clears_errno_and_reports_retry_count(self) -> None:
         reply_sock = _TcpReplySocket({"ok": True, "sessions": []})
@@ -705,7 +707,10 @@ class TestCliTraceNoExtraRpcOnTraceSinkFailure(CliDiagnosticsMixin, unittest.Tes
                         self._invoke_main(argv)
 
                 self.assertEqual(len(calls), 1, "主請求送出後不得因 trace_sink 相關 TypeError 再呼叫第二次 RPC")
-                self.assertEqual(calls[0][0], cli.SOCKET_PATH)
+                expected_endpoint = (
+                    "tcp://127.0.0.1:48700" if cli._rpc_backend_is_win() else cli.SOCKET_PATH
+                )
+                self.assertEqual(calls[0][0], expected_endpoint)
                 self.assertEqual(calls[0][2]["retries"], 0)
                 self.assertIsNotNone(calls[0][2]["trace_sink"])
 

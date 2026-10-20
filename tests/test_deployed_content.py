@@ -26,10 +26,20 @@ def _sha256_file(p: pathlib.Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
+def _pin_posix_layout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """釘 POSIX bundle 佈局：install_dir 依 os.name 分支（nt 走 current-release.json）。
+
+    本檔這些測試的假安裝樹皆為 POSIX 佈局（install = cli.parent.parent）；Windows 佈局另由
+    test_deployed_content_windows_stable_bin_sidecar 覆蓋。僅影響單一測試，不 skip、不改斷言。
+    """
+    monkeypatch.setattr(os, "name", "posix")
+
+
 @pytest.mark.memory_only
-def test_deployed_content_sideload_changes_tree(tmp_path: pathlib.Path) -> None:
+def test_deployed_content_sideload_changes_tree(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """驗證在安裝目錄旁載檔案會改變 bundle/runtime tree digest，但 release-manifest 與 CLI sha256 保持不變。"""
     import realhw.deployed_content as dc
+    _pin_posix_layout(monkeypatch)
 
     v1 = tmp_path / "v1"
     bin_dir = v1 / "bin"
@@ -94,9 +104,10 @@ def test_deployed_content_algorithm_vector(tmp_path: pathlib.Path) -> None:
 
 
 @pytest.mark.memory_only
-def test_deployed_content_rehashes_preserved_mtime(tmp_path: pathlib.Path) -> None:
+def test_deployed_content_rehashes_preserved_mtime(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """驗證 measure 每次皆重新計算內容雜湊，即使檔案 mtime/size 被竄改保留仍能正確識別差異。"""
     import realhw.deployed_content as dc
+    _pin_posix_layout(monkeypatch)
 
     v1 = tmp_path / "v1"
     bin_dir = v1 / "bin"
@@ -126,6 +137,7 @@ def test_deployed_content_rehashes_preserved_mtime(tmp_path: pathlib.Path) -> No
 def test_deployed_content_errors_null_digests(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """驗證當出現 error 時，除 install_dir 外所有 digest 欄位一律為 null。"""
     import realhw.deployed_content as dc
+    _pin_posix_layout(monkeypatch)
 
     # 1. unresolved: CLI 不在含 release-manifest.json 的安裝內
     unresolved_cli = tmp_path / "loose" / "serialwrap"
@@ -172,9 +184,10 @@ def test_deployed_content_errors_null_digests(tmp_path: pathlib.Path, monkeypatc
 
 
 @pytest.mark.memory_only
-def test_deployed_content_daemon_outside_install_flagged(tmp_path: pathlib.Path) -> None:
+def test_deployed_content_daemon_outside_install_flagged(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """驗證 daemon_argv 指向安裝目錄外或 sha256 不符時正確標記 error。"""
     import realhw.deployed_content as dc
+    _pin_posix_layout(monkeypatch)
 
     v1 = tmp_path / "v1"
     (v1 / "bin").mkdir(parents=True, exist_ok=True)
@@ -219,9 +232,10 @@ def test_deployed_content_daemon_outside_install_flagged(tmp_path: pathlib.Path)
 
 
 @pytest.mark.memory_only
-def test_missing_daemon_file_without_manifest_sha_is_mismatch(tmp_path: pathlib.Path) -> None:
+def test_missing_daemon_file_without_manifest_sha_is_mismatch(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """驗證 manifest 沒有有效 daemon hash 時，不會讓不存在的 daemon 誤判相符。"""
     import realhw.deployed_content as dc
+    _pin_posix_layout(monkeypatch)
 
     install = tmp_path / "install"
     (install / "bin").mkdir(parents=True)

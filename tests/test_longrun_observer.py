@@ -19,6 +19,18 @@ def _observer():
     return importlib.import_module("realhw.acceptance.observer")
 
 
+@pytest.fixture(autouse=True)
+def _no_process_enumeration(monkeypatch):
+    """memory_only 契約：本模組不起子行程。
+
+    `run_observer` 的第一筆樣本會經 `_ProcScan` 呼叫 `_all_serialwrapd_pids()`；原生 Windows 上該函式以
+    wmic／powershell Get-CimInstance 起子行程（單次 0.5 s 以上），會讓 duration_s=0.3 的測試只取到 1 筆樣本。
+    本模組驗的是唯讀呼叫、節流與紀錄形狀，不驗行程列舉，故以固定替身 [4242]（與 StubSwCli 的 daemon pid
+    相同，即沒有其他 serialwrapd）取代。行程列舉的判定邏輯由 test_sample_* 與 test_procscan_* 以各自替身覆蓋。
+    """
+    monkeypatch.setattr(_observer(), "_all_serialwrapd_pids", lambda: [4242])
+
+
 class StubSwCli:
     def __init__(self, *, fail_on_daemon_call: int | None = None):
         self.calls = []

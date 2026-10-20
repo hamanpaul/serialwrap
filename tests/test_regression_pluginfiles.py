@@ -63,4 +63,4 @@ def test_testbed_example_loads_with_boards(tmp_path):
     assert cfg["allow_destructive"] is False
     coms = [b["com"] for b in cfg["boards"]]
     assert coms == ["COM0", "COM1"]
-    assert cfg["serialwrap_exe"].endswith("/.local/bin/serialwrap")
+    assert Path(cfg["serialwrap_exe"]).parts[-3:] == (".local", "bin", "serialwrap")

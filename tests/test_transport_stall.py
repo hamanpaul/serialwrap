@@ -77,23 +77,40 @@ class TestClassifyProbeFailure(unittest.TestCase):
 
 
 class TestResolveUsbBusid(unittest.TestCase):
+    """resolve_usb_busid 的 POSIX 分支（/sys realpath 解析）。
+
+    產品在 os.name != "posix" 時直接回 None。此類於呼叫期間釘住 os.name="posix"，使 Windows 宿主
+    也實際走解析邏輯；realpath 已 mock，不碰真實 /sys。非 posix 分支由 test_non_posix_os_name_returns_none 明示。
+    """
+
     def test_vhci_path_resolves_busid(self) -> None:
         target = "/sys/devices/platform/vhci_hcd.0/usb1/1-1/1-1:1.0/ttyUSB0"
-        with mock.patch.object(os.path, "realpath", return_value=target):
+        with mock.patch.object(os.path, "realpath", return_value=target), \
+             mock.patch.object(os, "name", "posix"):
             self.assertEqual(transport_stall.resolve_usb_busid("/dev/ttyUSB0"), "1-1")
 
     def test_nested_hub_busid(self) -> None:
         target = "/sys/devices/pci0000:00/usb3/3-2/3-2.1/3-2.1:1.0/ttyUSB1"
-        with mock.patch.object(os.path, "realpath", return_value=target):
+        with mock.patch.object(os.path, "realpath", return_value=target), \
+             mock.patch.object(os, "name", "posix"):
             self.assertEqual(transport_stall.resolve_usb_busid("/dev/ttyUSB1"), "3-2.1")
 
     def test_non_usb_path_returns_none(self) -> None:
         target = "/sys/devices/platform/serial8250/tty/ttyS0"
-        with mock.patch.object(os.path, "realpath", return_value=target):
+        with mock.patch.object(os.path, "realpath", return_value=target), \
+             mock.patch.object(os, "name", "posix"):
             self.assertIsNone(transport_stall.resolve_usb_busid("/dev/ttyS0"))
 
     def test_realpath_exception_returns_none(self) -> None:
-        with mock.patch.object(os.path, "realpath", side_effect=OSError("boom")):
+        with mock.patch.object(os.path, "realpath", side_effect=OSError("boom")), \
+             mock.patch.object(os, "name", "posix"):
+            self.assertIsNone(transport_stall.resolve_usb_busid("/dev/ttyUSB0"))
+
+    def test_non_posix_os_name_returns_none(self) -> None:
+        """os.name 非 posix（Windows）時直接回 None，不解析 /sys。"""
+        target = "/sys/devices/platform/vhci_hcd.0/usb1/1-1/1-1:1.0/ttyUSB0"
+        with mock.patch.object(os.path, "realpath", return_value=target), \
+             mock.patch.object(os, "name", "nt"):
             self.assertIsNone(transport_stall.resolve_usb_busid("/dev/ttyUSB0"))
 
     def test_none_real_path_returns_none(self) -> None:

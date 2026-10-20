@@ -156,7 +156,9 @@ def test_tombstone_fifo_bound_16(tmp_path) -> None:
         r = mgr.interactive_open("COM0", owner="agent:x", timeout_s=0.001)
         assert r["ok"] is True
         lease_ids.append(r["interactive_id"])
-        time.sleep(0.005)
+        # Windows time.monotonic 解析度約 15.625 ms（GetTickCount64），5 ms sleep 可能讀到
+        # 同一刻度而使 lease 尚未過期；sleep 拉到 50 ms（遠大於 timeout 0.001 與解析度）即與平台無關。
+        time.sleep(0.05)
         assert mgr._expire_interactive_leases_tick() == 1
     tombstones = [
         lease for lease in mgr._interactive.values()

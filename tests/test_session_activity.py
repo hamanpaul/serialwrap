@@ -5,6 +5,7 @@ integration with SessionManager._on_bridge_rx and _mark_session_tx.
 """
 from __future__ import annotations
 
+import itertools
 import time
 import unittest
 from typing import Any
@@ -65,11 +66,15 @@ class TestSessionRuntimeActivityFields(unittest.TestCase):
     def test_state_change_auto_updates_last_state_change_at(self) -> None:
         s = _make_session()
         self.assertIsNone(s.last_state_change_at)
-        s.state = "ATTACHING"
-        first = s.last_state_change_at
-        self.assertIsNotNone(first)
-        s.state = "READY"
-        second = s.last_state_change_at
+        # 以遞增替身取代牆鐘：Windows 上連續呼叫 datetime.now 可能得到相同字串，
+        # 本測試驗證的是「不同轉換會產生新時間戳」，與時鐘解析度無關。
+        stamps = (f"2026-01-01T00:00:00.{i:06d}+00:00" for i in itertools.count())
+        with mock.patch("sw_core.session_manager.now_iso", side_effect=stamps):
+            s.state = "ATTACHING"
+            first = s.last_state_change_at
+            self.assertIsNotNone(first)
+            s.state = "READY"
+            second = s.last_state_change_at
         self.assertIsNotNone(second)
         # different transitions produce a fresh timestamp string
         self.assertNotEqual(first, second)

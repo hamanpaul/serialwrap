@@ -225,6 +225,11 @@ class TestServiceStartRankWiring(unittest.TestCase):
         self._old_wal = os.environ.get("SERIALWRAP_WAL_DIR")
         os.environ["SERIALWRAP_WAL_DIR"] = self._tmp.name
         self.addCleanup(self._restore_wal)
+        # 固定 device 後端為 posix：service 在 Windows 會改選 WindowsDeviceSource 並列舉真實 registry COM，
+        # 與本測試的 fake by-id 目錄脫鉤；此處釘 by-id 目錄後端，使三平台行為一致。
+        env_patch = mock.patch.dict(os.environ, {"SERIALWRAP_DEVICE_BACKEND": "posix"})
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
         # fake by-id 目錄：兩條 symlink 指向不同 real_path（避免 DeviceWatcher 同 real_path 去重）。
         self._byid = Path(self._tmp.name) / "by-id"
         self._byid.mkdir()

@@ -15,6 +15,7 @@ import ast
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -388,13 +389,20 @@ def test_resource_report_cli_without_daemon_env_unmeasured(tmp_path: Path) -> No
 def test_windows_com_never_counted_without_device(tmp_path: Path) -> None:
     """無 SW_TEST_COM_PAIR 時，windows_com 項目不得計為 passed（P0 T14 第 6 條；§11.2 不以模擬代替 windows_com）。
 
-    P2-T13 審查修正：原測試只餵空清單（空轉）。現況 tests/ 有兩個檔使用 windows_com（已知清單鎖定，新增者須審閱），
+    P2-T13 審查修正：原測試只餵空清單（空轉）。現況 tests/ 有三個檔使用 windows_com（已知清單鎖定，新增者須審閱），
     本測試實際以缺 device 的環境執行它們，斷言 resources.windows_com.passed == 0 且至少有一個 skipped。
     （計畫 Task 13 寫「本 Stage 無 windows_com 的 tests/ item」與現況不符，差異已於 PR 說明記錄。）
     """
     import tests.resource_report as resource_report  # noqa: F401  （確認模組可載入）
 
-    known = {"tests/test_spike1_remaining.py", "tests/test_stage0_uart_exclusive.py"}
+    # tests/test_p1oc_drain_stalled.py：P1-OC-T4 新增，已審閱——TestWindowsNativeDrainStalled 經
+    # sw_core.serial_port.open_serial_port 於 SW_TEST_COM_PAIR 指定的真實 COM 上以 pyserial 後端開啟
+    # （非 socket、非記憶體替身；唯一 monkeypatch 為寫入逾時常數），缺 device 時 skip，符合 windows_com 定義。
+    known = {
+        "tests/test_p1oc_drain_stalled.py",
+        "tests/test_spike1_remaining.py",
+        "tests/test_stage0_uart_exclusive.py",
+    }
     users: set[str] = set()
     for path in sorted(Path("tests").rglob("test_*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -998,6 +1006,24 @@ def test_workflow_ci_l1_gates() -> None:
     lock_steps = [st for st in pytest_job["steps"] if "regen_lock.py --check --base origin/${{ github.base_ref }}" in str(st.get("run", ""))]
     assert len(lock_steps) == 1, "pytest job 須含 regen_lock --check --base 步驟"
     assert "pull_request" in str(lock_steps[0].get("if", ""))
+    lock_command = str(lock_steps[0].get("run", ""))
+    allowed_removals = (
+        "tests/test_cli_stderr_full_error.py::TestRunRpcStderrKeepsMessage::test_socket_error_stderr_includes_error_code_and_message",
+        "tests/test_contracts_catalog.py::test_ec_passthrough_single_meta_entry",
+        "tests/test_docker_l15.py::test_longrun_and_supervision_isolated",
+        "tests/test_docker_l15.py::test_longrun_refuses_before_p1",
+        "tests/test_docker_l15.py::test_run_l15_dry_run_labels_report",
+        "tests/test_docker_l15.py::test_run_l15_dry_run_uses_sandbox_by_id",
+        "tests/test_docker_l15.py::test_run_systemd_dry_run_asserts_dropin",
+        "tests/test_stage0_handoff_stop.py::test_handoff_flash_races_prepare[handoff]",
+        "tests/test_stage0_handoff_stop.py::test_handoff_flash_races_prepare[probe]",
+        "tests/test_stage0_handoff_stop.py::test_handoff_flash_races_prepare[race]",
+    )
+    for nodeid in allowed_removals:
+        assert nodeid in lock_command, f"L1 擁有者裁決清單缺少 {nodeid}"
+    lock_tokens = shlex.split(lock_command)
+    allow_index = lock_tokens.index("--allow-removal")
+    assert tuple(lock_tokens[allow_index + 1 :]) == allowed_removals
     for name in ("pytest", "bridge-tools", "bridge-tools-windows", "pytest-windows"):
         assert "labeled" in str(jobs[name].get("if", "")), f"{name} 須排除 labeled 事件"
     com = jobs["windows-com-selfhosted"]
@@ -1010,3 +1036,9 @@ def test_workflow_ci_l1_gates() -> None:
     assert '--case "win-com-*"' not in com_text  # --case 為完全相符的 stem，不支援 glob
     pw_text = yaml.dump(jobs["pytest-windows"]["steps"])
     assert "--junitxml" in pw_text
+
+
+@pytest.mark.memory_only
+def test_win_pytest_does_not_add_ineffective_safe_directory() -> None:
+    script = Path("scripts/stage0/win-pytest.sh").read_text(encoding="utf-8")
+    assert "config --local --add safe.directory" not in script

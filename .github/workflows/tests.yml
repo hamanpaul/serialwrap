@@ -39,7 +39,19 @@ jobs:
       - name: L1 必要集合鎖只增檢查（對 PR base，P2-T13 R5-F3）
         # 基準 rev 的鎖檔中既有的 (set, platform, nodeid) 消失或 selector 改變即失敗；移除須 --allow-removal 並於 PR 說明。
         if: github.event_name == 'pull_request'
-        run: python3 tests/acceptance/regen_lock.py --check --base origin/${{ github.base_ref }}
+        # 此次裁決僅允許下列 10 個精確 nodeid 消失；其他移除仍由鎖檢查拒絕。
+        run: >-
+          python3 tests/acceptance/regen_lock.py --check --base origin/${{ github.base_ref }} --allow-removal
+          'tests/test_cli_stderr_full_error.py::TestRunRpcStderrKeepsMessage::test_socket_error_stderr_includes_error_code_and_message'
+          'tests/test_contracts_catalog.py::test_ec_passthrough_single_meta_entry'
+          'tests/test_docker_l15.py::test_longrun_and_supervision_isolated'
+          'tests/test_docker_l15.py::test_longrun_refuses_before_p1'
+          'tests/test_docker_l15.py::test_run_l15_dry_run_labels_report'
+          'tests/test_docker_l15.py::test_run_l15_dry_run_uses_sandbox_by_id'
+          'tests/test_docker_l15.py::test_run_systemd_dry_run_asserts_dropin'
+          'tests/test_stage0_handoff_stop.py::test_handoff_flash_races_prepare[handoff]'
+          'tests/test_stage0_handoff_stop.py::test_handoff_flash_races_prepare[probe]'
+          'tests/test_stage0_handoff_stop.py::test_handoff_flash_races_prepare[race]'
 
   bridge-tools:
     if: github.event.action != 'labeled'

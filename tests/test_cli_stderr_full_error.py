@@ -8,6 +8,8 @@
 2. 非 RPC 錯誤出口（``daemon start`` 於 systemd-system 模式重導 ``service start``
    失敗，例如未帶 ``--with-sudo`` 觸發 ``NEEDS_SUDO``）：exit 非零時 stderr 不得
    為空，須含 ``error_code`` 與 ``hint``。
+
+依 Task 14 規則 2：同檔混合平台，模組層不放 marker，平台與資源 marker 逐函式（或 class）標註。
 """
 from __future__ import annotations
 
@@ -20,12 +22,13 @@ from unittest import mock
 from sw_core import cli
 import pytest
 
-pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
-
 
 class TestRunRpcStderrKeepsMessage(unittest.TestCase):
     """驗收 1：對不存在的 socket 下 `session list`，stderr 含路徑與 errno。"""
 
+    # POSIX-only（§10.4）：tests/test_cli_stderr_full_error.py:36 連 AF_UNIX ENOENT、:44 檢查 [Errno 2]；sw_core/client.py:239-244 的 Windows 分支回本平台無 AF_UNIX。
+    @pytest.mark.posix_only
+    @pytest.mark.process_rpc
     def test_socket_error_stderr_includes_error_code_and_message(self) -> None:
         socket_path = "/tmp/sw172-no-such-daemon.sock"
         out, err = io.StringIO(), io.StringIO()
@@ -46,6 +49,8 @@ class TestRunRpcStderrKeepsMessage(unittest.TestCase):
         self.assertFalse(parsed["ok"])
         self.assertEqual(parsed["error_code"], "SOCKET_ERROR")
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_message_only_response_does_not_duplicate(self) -> None:
         """無 error_code 但有 message（既有 #94 fallback）：不得重複印同一句話。"""
         stub_resp = {"ok": False, "message": "boom"}
@@ -59,7 +64,32 @@ class TestRunRpcStderrKeepsMessage(unittest.TestCase):
         self.assertEqual(stderr_text.count("boom"), 1)
         self.assertIn("failed: boom", stderr_text)
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
+    def test_error_code_and_message_both_reach_stderr(self) -> None:
+        """#172 平台中立路徑：以 mock rpc_call 回 SOCKET_ERROR＋message，code 與 message 皆須露出（不依賴 AF_UNIX）。
 
+        與 posix_only 的 AF_UNIX 驗收互補：Windows 上仍能驗到「有 error_code 時 message 不被短路丟棄」。
+        """
+        import json
+
+        stub_resp = {"ok": False, "error_code": "SOCKET_ERROR", "message": "[Errno 2] No such file or directory"}
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("sw_core.cli.rpc_call", return_value=stub_resp):
+            with redirect_stdout(out), redirect_stderr(err):
+                rc = cli.main(["session", "list"])
+
+        self.assertEqual(rc, 2)
+        stderr_text = err.getvalue()
+        self.assertIn("failed: SOCKET_ERROR", stderr_text)
+        self.assertIn("[Errno 2]", stderr_text)
+        parsed = json.loads(out.getvalue())
+        self.assertFalse(parsed["ok"])
+        self.assertEqual(parsed["error_code"], "SOCKET_ERROR")
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestNonRpcExitsMirrorStderr(unittest.TestCase):
     """驗收 2：`daemon start` 重導 `service start`（systemd-system 未帶 --with-sudo）
     失敗時，exit 2 且 stderr 含 NEEDS_SUDO 與 hint。"""

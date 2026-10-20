@@ -124,7 +124,7 @@ def test_load_testbed_defaults(tmp_path):
     example.write_text("boards:\n  - com: COM0\n    serial: S0\n", encoding="utf-8")
     cfg = core.load_testbed(example)
     assert cfg["allow_destructive"] is False
-    assert cfg["serialwrap_exe"].endswith("/.local/bin/serialwrap")
+    assert Path(cfg["serialwrap_exe"]).parts[-3:] == (".local", "bin", "serialwrap")
     assert not cfg["serialwrap_exe"].startswith("~")
     assert cfg["timeouts"]["ready_wait_s"] == 180
     real = tmp_path / "testbed.yaml"

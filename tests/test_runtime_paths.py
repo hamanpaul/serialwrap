@@ -45,6 +45,7 @@ class TestRuntimePaths(unittest.TestCase):
                 os.environ,
                 {
                     "HOME": home,
+                    "USERPROFILE": home,
                     "SERIALWRAP_STATE_DIR": state_dir,
                     "SERIALWRAP_RUN_DIR": run_dir,
                     "SERIALWRAP_WAL_DIR": "~/b-log",
@@ -55,7 +56,10 @@ class TestRuntimePaths(unittest.TestCase):
 
                 self.assertEqual(constants.STATE_DIR, state_dir)
                 self.assertEqual(constants.RUN_DIR, run_dir)
-                self.assertEqual(constants.WAL_DIR, os.path.join(home, "b-log"))
+                self.assertEqual(
+                    os.path.normpath(constants.WAL_DIR),
+                    os.path.normpath(os.path.join(home, "b-log")),
+                )
 
                 constants.ensure_runtime_dirs()
 

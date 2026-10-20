@@ -42,7 +42,7 @@ class TestCliDaemonStart(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             env_files = cli._resolve_daemon_start_env_files("/tmp/any-profile-dir")
 
-        self.assertEqual(env_files, ["~/OPI.env", "/tmp/any-profile-dir/OPI.env"])
+        self.assertEqual(env_files, ["~/OPI.env", os.path.join("/tmp/any-profile-dir", "OPI.env")])
 
     @pytest.mark.memory_only
     def test_resolve_daemon_start_env_files_explicit_override_wins(self) -> None:
@@ -409,6 +409,8 @@ class TestDaemonStartSpawnGuard(unittest.TestCase):
         with (
             mock.patch("sw_core.cli.should_auto_spawn", return_value=True),
             mock.patch("sw_core.cli._probe_healthy_daemon", return_value=False),
+            # POSIX spawn 防線（#173）只在非 win backend 執行（見 _run_daemon_start）；此處釘 POSIX 分支。
+            mock.patch("sw_core.cli._rpc_backend_is_win", return_value=False),
             mock.patch("sw_core.cli._find_conflicting_daemon", return_value=conflict) as finder,
             mock.patch("sw_core.cli.subprocess.Popen") as popen,
             mock.patch("sw_core.cli._print") as printer,
@@ -434,6 +436,8 @@ class TestDaemonStartSpawnGuard(unittest.TestCase):
         with (
             mock.patch("sw_core.cli.should_auto_spawn", return_value=True),
             mock.patch("sw_core.cli._probe_healthy_daemon", return_value=False),
+            # POSIX spawn 防線（#173）只在非 win backend 執行（見 _run_daemon_start）；此處釘 POSIX 分支。
+            mock.patch("sw_core.cli._rpc_backend_is_win", return_value=False),
             mock.patch("sw_core.cli._find_conflicting_daemon", return_value=conflict),
             mock.patch("sw_core.cli.subprocess.Popen") as popen,
             mock.patch("sw_core.cli._print") as printer,
@@ -478,6 +482,8 @@ class TestDaemonStartSpawnGuard(unittest.TestCase):
         with (
             mock.patch("sw_core.cli.should_auto_spawn", return_value=True),
             mock.patch("sw_core.cli._probe_healthy_daemon", return_value=False),
+            # POSIX spawn 防線（#173）只在非 win backend 執行（見 _run_daemon_start）；此處釘 POSIX 分支。
+            mock.patch("sw_core.cli._rpc_backend_is_win", return_value=False),
             mock.patch("sw_core.cli._find_conflicting_daemon", return_value=None) as finder,
             mock.patch("sw_core.cli._resolve_daemon_start_env_files", return_value=[]),
             mock.patch("sw_core.cli._load_daemon_start_env_files", return_value=({}, [])),

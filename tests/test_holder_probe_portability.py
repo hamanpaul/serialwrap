@@ -29,6 +29,17 @@ class StatResultWithoutRdev:
         self.st_mode = mode
 
 
+def _probe_posix_branch(mgr: SessionManager, path: str, proc: str) -> dict:
+    """以 POSIX procfs 分支呼叫 _probe_external_holder。
+
+    `probe_holders` 在 os.name == "nt" 時直接回 unsupported、不掃描 proc 目錄。本檔要驗證的是
+    procfs 比對邏輯，假 /proc 與 stat 替身皆為暫存檔或記憶體物件，不需真實 /proc；因此於呼叫期間
+    釘住 os.name，讓 Linux 與 Windows 宿主都走同一條分支。只影響本次呼叫，不 skip、不改斷言。
+    """
+    with mock.patch.object(os, "name", "posix"):
+        return mgr._probe_external_holder(path, _proc_root=proc)
+
+
 class TestHolderProbePortability(unittest.TestCase):
     """#199 缺 st_rdev 之 _probe_external_holder 跨平台容錯測試。"""
 
@@ -56,7 +67,7 @@ class TestHolderProbePortability(unittest.TestCase):
 
         with mock.patch("sw_core.session_manager.os.stat") as mock_stat:
             mock_stat.return_value = StatResultWithoutRdev()
-            res = mgr._probe_external_holder("/dev/ttyUSB0", _proc_root=str(proc))
+            res = _probe_posix_branch(mgr, "/dev/ttyUSB0", str(proc))
 
         self.assertEqual(res["pids"], [1234])
         self.assertEqual(res["holder"], 1234)
@@ -74,7 +85,7 @@ class TestHolderProbePortability(unittest.TestCase):
             return StatResultWithoutRdev()
 
         with mock.patch("sw_core.session_manager.os.stat", side_effect=_stat_side_effect):
-            res = mgr._probe_external_holder("/dev/ttyUSB0", _proc_root=str(proc))
+            res = _probe_posix_branch(mgr, "/dev/ttyUSB0", str(proc))
 
         self.assertEqual(res["pids"], [])
         self.assertIsNone(res["holder"])
@@ -90,7 +101,7 @@ class TestHolderProbePortability(unittest.TestCase):
             return StatResultWithRdev(rdev=500)
 
         with mock.patch("sw_core.session_manager.os.stat", side_effect=_stat_side_effect):
-            res = mgr._probe_external_holder("/dev/ttyUSB0", _proc_root=str(proc))
+            res = _probe_posix_branch(mgr, "/dev/ttyUSB0", str(proc))
 
         self.assertEqual(res["pids"], [1234])
         self.assertEqual(res["holder"], 1234)
@@ -108,7 +119,7 @@ class TestHolderProbePortability(unittest.TestCase):
             return StatResultWithRdev(rdev=501)
 
         with mock.patch("sw_core.session_manager.os.stat", side_effect=_stat_side_effect):
-            res = mgr._probe_external_holder("/dev/ttyUSB0", _proc_root=str(proc))
+            res = _probe_posix_branch(mgr, "/dev/ttyUSB0", str(proc))
 
         self.assertEqual(res["pids"], [])
         self.assertIsNone(res["holder"])
@@ -124,7 +135,7 @@ class TestHolderProbePortability(unittest.TestCase):
             return StatResultWithRdev(rdev=0)
 
         with mock.patch("sw_core.session_manager.os.stat", side_effect=_stat_side_effect):
-            res = mgr._probe_external_holder("/dev/ttyUSB0", _proc_root=str(proc))
+            res = _probe_posix_branch(mgr, "/dev/ttyUSB0", str(proc))
 
         self.assertEqual(res["pids"], [])
         self.assertIsNone(res["holder"])
@@ -136,16 +147,30 @@ class TestHolderProbePortability(unittest.TestCase):
         (proc / "1234" / "fd").mkdir(parents=True)
         os.symlink("/dev/ttyUSB0", proc / "1234" / "fd" / "3")
 
-        res = mgr._probe_external_holder("/dev/ttyUSB0", _proc_root=str(proc))
+        res = _probe_posix_branch(mgr, "/dev/ttyUSB0", str(proc))
 
         self.assertEqual(res["pids"], [1234])
         self.assertEqual(res["holder"], 1234)
+
+    def test_nt_branch_reports_holder_unknown(self) -> None:
+        """os.name == "nt" 時 probe_holders 不掃 procfs，回 holder_unknown（不得誤報為「無 holder」）。"""
+        mgr = self._mgr()
+        proc = Path(self._tmp.name) / "proc"
+        (proc / "1234" / "fd").mkdir(parents=True)
+        os.symlink("/dev/ttyUSB0", proc / "1234" / "fd" / "3")
+
+        with mock.patch.object(os, "name", "nt"):
+            res = mgr._probe_external_holder("/dev/ttyUSB0", _proc_root=str(proc))
+
+        self.assertEqual(res["pids"], [])
+        self.assertIsNone(res["holder"])
+        self.assertTrue(res["holder_unknown"])
 
     def test_no_proc_returns_empty_safely(self) -> None:
         """當 _proc_root 不可讀時，不拋出例外且明確標記 holder 未知。"""
         mgr = self._mgr()
         nonexistent_proc = Path(self._tmp.name) / "nonexistent_proc"
-        res = mgr._probe_external_holder("/dev/ttyUSB0", _proc_root=str(nonexistent_proc))
+        res = _probe_posix_branch(mgr, "/dev/ttyUSB0", str(nonexistent_proc))
         self.assertEqual(res, {"pids": [], "holder": None, "holder_unknown": True})
 
     def test_my_pid_ignored(self) -> None:
@@ -156,6 +181,6 @@ class TestHolderProbePortability(unittest.TestCase):
         (proc / str(my_pid) / "fd").mkdir(parents=True)
         os.symlink("/dev/ttyUSB0", proc / str(my_pid) / "fd" / "3")
 
-        res = mgr._probe_external_holder("/dev/ttyUSB0", _proc_root=str(proc))
+        res = _probe_posix_branch(mgr, "/dev/ttyUSB0", str(proc))
         self.assertEqual(res["pids"], [])
         self.assertIsNone(res["holder"])

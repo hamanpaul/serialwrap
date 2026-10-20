@@ -85,13 +85,21 @@ def _make_executable(path):
 def test_system_effects_which_all_finds_all_matches_in_path_order(monkeypatch):
     from sw_core.sysenv import SystemEffects
 
+    # Windows 的 which_all 依設計只比對 PATHEXT 副檔名，無副檔名的 myserialwrap 不會命中；
+    # 故 Windows 以 PATHEXT=.EXE 與 myserialwrap.EXE 驗證同一語意（PATH 順序、去重）。
+    # POSIX 維持無副檔名的可執行檔。
+    if sys.platform == "win32":
+        monkeypatch.setenv("PATHEXT", ".EXE")
+        exe_name = "myserialwrap.EXE"
+    else:
+        exe_name = "myserialwrap"
     with tempfile.TemporaryDirectory() as tmp:
         dir_a = os.path.join(tmp, "a")
         dir_b = os.path.join(tmp, "b")
         os.mkdir(dir_a)
         os.mkdir(dir_b)
-        path_a = os.path.join(dir_a, "myserialwrap")
-        path_b = os.path.join(dir_b, "myserialwrap")
+        path_a = os.path.join(dir_a, exe_name)
+        path_b = os.path.join(dir_b, exe_name)
         _make_executable(path_a)
         _make_executable(path_b)
         monkeypatch.setenv("PATH", os.pathsep.join([dir_a, dir_b]))

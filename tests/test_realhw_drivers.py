@@ -1,6 +1,7 @@
 """#122 drivers 純函式單測（不碰 live）。"""
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 from realhw import drivers
@@ -142,7 +143,8 @@ def test_remote_state_dir_resolution_order(tmp_path):
     assert drivers.remote_state_dir({"XDG_RUNTIME_DIR": str(tmp_path)}) == \
         tmp_path / "serialwrap" / "remote"
     got = drivers.remote_state_dir({})
-    assert str(got).endswith(".local/state/serialwrap/run/remote")
+    # 以 Path.parts 比對尾段，避免字串後綴依賴 "/"（Windows 分隔符為反斜線）
+    assert Path(got).parts[-5:] == (".local", "state", "serialwrap", "run", "remote")
 
 
 def test_submit_and_wait_forwards_source(monkeypatch):

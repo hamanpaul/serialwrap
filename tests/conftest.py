@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 import sys
 import tempfile
 
@@ -21,13 +22,98 @@ import resource_report_plugin as _rrp  # 資源報告外掛（P2-T13）；本模
 # ---- 第 0 步：live 快照（必須在覆寫任何 env 之前）----
 _MODE = os.environ.get("SERIALWRAP_LIVE_GATE", "strict").strip().lower()
 _SHELL_WAL_DIR = os.environ.get("SERIALWRAP_WAL_DIR")  # 覆寫前的外層 shell 值
-_PRE_STATE = liveguard.snap_file(liveguard.live_state_path())
-_PRE_WAL = liveguard.snap_file(liveguard.live_wal_path())
-_PRE_CONFIG = liveguard.snap_file(liveguard.live_config_path())
+
+
+def _snapshot_windows_user_home(profile: str) -> dict[str, object]:
+    """快照 Windows 使用者家目錄中 setup 可能寫入的 serialwrap 靜態資產。"""
+    if not profile or not os.path.isabs(profile) or not os.path.isdir(profile):
+        raise RuntimeError("Windows USERPROFILE 不存在或不是絕對路徑，無法保護真實家目錄")
+
+    def _metadata(path: str):
+        info = os.lstat(path)
+        return (info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+    def _is_reparse_point(info) -> bool:
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        return stat.S_ISLNK(info.st_mode) or bool(
+            getattr(info, "st_file_attributes", 0) & reparse_flag
+        )
+
+    def _snapshot_path(root: str):
+        try:
+            root_info = os.lstat(root)
+        except FileNotFoundError:
+            return None
+        entries = [(".", _metadata(root))]
+        if stat.S_ISDIR(root_info.st_mode) and not _is_reparse_point(root_info):
+            def _raise_walk_error(error):
+                raise error
+
+            for current, directories, files in os.walk(
+                root, topdown=True, followlinks=False, onerror=_raise_walk_error
+            ):
+                directories.sort()
+                files.sort()
+                for name in directories + files:
+                    path = os.path.join(current, name)
+                    info = os.lstat(path)
+                    entries.append((os.path.relpath(path, root), _metadata(path)))
+                    if name in directories and _is_reparse_point(info):
+                        directories.remove(name)
+        return tuple(entries)
+
+    roots = {
+        ".agents/skills/serialwrap": os.path.join(profile, ".agents", "skills", "serialwrap"),
+        ".local/share/serialwrap": os.path.join(profile, ".local", "share", "serialwrap"),
+    }
+    snapshot = {label: _snapshot_path(path) for label, path in roots.items()}
+
+    bin_dir = os.path.join(profile, ".local", "bin")
+    try:
+        serialwrap_names = sorted(name for name in os.listdir(bin_dir) if name.startswith("serialwrap"))
+    except FileNotFoundError:
+        serialwrap_names = []
+    snapshot[".local/bin/serialwrap*"] = tuple(
+        (name, _snapshot_path(os.path.join(bin_dir, name))) for name in serialwrap_names
+    )
+    return snapshot
+
+
+_REAL_WINDOWS_USERPROFILE = os.environ.get("USERPROFILE") if os.name == "nt" else None
+if os.name == "nt" and not _REAL_WINDOWS_USERPROFILE:
+    raise RuntimeError("Windows USERPROFILE 未設定，無法執行隔離 pytest")
+_LIVE_STATE_PATH = liveguard.live_state_path()
+_LIVE_WAL_PATH = liveguard.live_wal_path()
+_LIVE_CONFIG_PATH = liveguard.live_config_path()
+_PRE_STATE = liveguard.snap_file(_LIVE_STATE_PATH)
+_PRE_WAL = liveguard.snap_file(_LIVE_WAL_PATH)
+_PRE_CONFIG = liveguard.snap_file(_LIVE_CONFIG_PATH)
 _PRE_SHELL_WAL = (
     liveguard.snap_file(os.path.join(_SHELL_WAL_DIR, "raw.wal.ndjson")) if _SHELL_WAL_DIR else None
 )
 _PRE_DAEMON = liveguard.snap_daemon()
+_PRE_WINDOWS_USER_HOME = (
+    _snapshot_windows_user_home(_REAL_WINDOWS_USERPROFILE)
+    if _REAL_WINDOWS_USERPROFILE is not None
+    else None
+)
+
+
+def _snap_live_daemon():
+    """Windows 隔離後暫用原始 USERPROFILE，讓唯讀 daemon 探測沿用 live config 路徑。"""
+    if _REAL_WINDOWS_USERPROFILE is None:
+        return liveguard.snap_daemon()
+    isolated_profile = os.environ.get("USERPROFILE")
+    os.environ["USERPROFILE"] = _REAL_WINDOWS_USERPROFILE
+    try:
+        return liveguard.snap_daemon()
+    finally:
+        if isolated_profile is None:
+            os.environ.pop("USERPROFILE", None)
+        else:
+            os.environ["USERPROFILE"] = isolated_profile
+
+
 # deployed_content 量測用（R5-F4）：下方第 1 層會 pop 這兩個變數，須先保留
 _rrp.capture_deployed_env(os.environ)
 
@@ -39,6 +125,19 @@ def _iso(name: str) -> str:
     path = os.path.join(_ISO_ROOT, name)
     os.makedirs(path, exist_ok=True)
     return path
+
+
+if os.name == "nt":
+    _ISO_HOME = _iso("home")
+    os.environ["USERPROFILE"] = _ISO_HOME
+    os.environ["HOME"] = _ISO_HOME
+    _HOME_DRIVE, _HOME_PATH = os.path.splitdrive(_ISO_HOME)
+    if _HOME_DRIVE:
+        os.environ["HOMEDRIVE"] = _HOME_DRIVE
+        os.environ["HOMEPATH"] = _HOME_PATH or os.path.sep
+    else:
+        os.environ.pop("HOMEDRIVE", None)
+        os.environ.pop("HOMEPATH", None)
 
 
 os.environ["SERIALWRAP_STATE_DIR"] = _iso("state")
@@ -95,16 +194,39 @@ def _isolate_state_path(tmp_path, monkeypatch):
 def pytest_sessionfinish(session, exitstatus):
     results = [
         ("state", liveguard.classify_state(
-            _PRE_STATE, liveguard.snap_file(liveguard.live_state_path()), mode=_MODE)),
+            _PRE_STATE, liveguard.snap_file(_LIVE_STATE_PATH), mode=_MODE)),
         ("wal", liveguard.classify_wal(
-            _PRE_WAL, liveguard.snap_file(liveguard.live_wal_path()), mode=_MODE)),
+            _PRE_WAL, liveguard.snap_file(_LIVE_WAL_PATH), mode=_MODE)),
         ("config", liveguard.classify_config(
-            _PRE_CONFIG, liveguard.snap_file(liveguard.live_config_path()))),
-        ("daemon", liveguard.classify_daemon(_PRE_DAEMON, liveguard.snap_daemon(), mode=_MODE)),
+            _PRE_CONFIG, liveguard.snap_file(_LIVE_CONFIG_PATH))),
+        ("daemon", liveguard.classify_daemon(_PRE_DAEMON, _snap_live_daemon(), mode=_MODE)),
     ]
     if _PRE_SHELL_WAL is not None:
         results.append(("shell-wal", liveguard.classify_shell_wal(
             _PRE_SHELL_WAL, liveguard.snap_file(os.path.join(_SHELL_WAL_DIR, "raw.wal.ndjson")))))
+    if _PRE_WINDOWS_USER_HOME is not None:
+        try:
+            post_windows_home = _snapshot_windows_user_home(_REAL_WINDOWS_USERPROFILE)
+        except (OSError, RuntimeError) as exc:
+            results.append(("windows-userprofile", (
+                liveguard.VERDICT_FAIL,
+                f"Windows 家目錄快照無法完成（{type(exc).__name__}）",
+            )))
+        else:
+            changed = sorted(
+                label for label, before in _PRE_WINDOWS_USER_HOME.items()
+                if post_windows_home.get(label) != before
+            )
+            if changed:
+                results.append(("windows-userprofile", (
+                    liveguard.VERDICT_FAIL,
+                    "Windows 使用者家目錄受保護項目變更：" + ", ".join(changed),
+                )))
+            else:
+                results.append(("windows-userprofile", (
+                    liveguard.VERDICT_PASS,
+                    "Windows 使用者家目錄受保護項目快照一致",
+                )))
 
     tr = session.config.pluginmanager.get_plugin("terminalreporter")
 
@@ -119,7 +241,7 @@ def pytest_sessionfinish(session, exitstatus):
         line = f"[live-guard:{name}] {verdict}: {reason}"
         if verdict == liveguard.VERDICT_FAIL:
             failed = True
-        if verdict != liveguard.VERDICT_PASS:
+        if verdict != liveguard.VERDICT_PASS or name == "windows-userprofile":
             _emit(line, red=(verdict == liveguard.VERDICT_FAIL),
                   yellow=(verdict == liveguard.VERDICT_WARN))
     if failed:

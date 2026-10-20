@@ -130,6 +130,14 @@ git -C "$repo" ls-files -z --cached --others --exclude-standard --deduplicate > 
     done < "$manifest"
 )
 
+# Windows 原生測試會查詢提交歷史與工作樹差異；讓 staging 有完整的目前分支歷史。
+git -C "$stage" init -q
+git -C "$stage" config --local core.autocrlf false
+git -C "$stage" config --local core.filemode false
+git -C "$stage" fetch -q --no-tags "$repo" HEAD
+git -C "$stage" update-ref HEAD FETCH_HEAD
+git -C "$stage" read-tree HEAD
+
 cd "$stage"
 pytest_exit=0
 require_native=0

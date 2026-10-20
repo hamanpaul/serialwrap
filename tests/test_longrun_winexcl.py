@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import os
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -352,6 +353,8 @@ def test_winexcl_cli_non_windows_exit2(capsys, monkeypatch):
     winexcl = _winexcl()
     calls = []
     monkeypatch.setattr(winexcl, "SwCli", lambda *args, **kwargs: calls.append((args, kwargs)), raising=False)
+    # 釘 POSIX：winexcl.main 以 os.name != "nt" 判定非 Windows，此測試驗證其 exit 2 分支。
+    monkeypatch.setattr(os, "name", "posix")
     code = winexcl.main(["handoff", "--phase", "pre", "--serialwrap-exe", "serialwrap",
                          "--boards", "COM0", "--observer-header", "observer.ndjson", "--excl-dir", "."])
     captured = capsys.readouterr()

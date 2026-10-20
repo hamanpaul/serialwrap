@@ -8,7 +8,7 @@ import subprocess
 import time
 from typing import Any
 
-from .daemon_harness import resolve_cli_exe
+from .daemon_harness import resolve_cli_command
 
 
 def cli_run(
@@ -21,7 +21,7 @@ def cli_run(
 ) -> dict[str, Any]:
     """執行 JSON CLI，保留 stdout/stderr 並可追加 cli.ndjson。"""
     endpoint_flag = "--endpoint" if socket_path.startswith("tcp://") or os.name == "nt" else "--socket"
-    full_argv = [*resolve_cli_exe(), endpoint_flag, socket_path, *argv]
+    full_argv = [*resolve_cli_command(), endpoint_flag, socket_path, *argv]
     started_ns = time.monotonic_ns()
     try:
         proc = subprocess.run(

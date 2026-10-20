@@ -46,6 +46,7 @@ def test_reliability_pin_and_gate(tmp_path, monkeypatch):
     tilde_exe.parent.mkdir(parents=True)
     tilde_exe.write_bytes(b"tilde-cli")
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     tilde_cfg = dict(cfg, serialwrap_exe="~/.local/bin/serialwrap")
     tilde_ctx = core.build_ctx(tilde_cfg, tmp_path / "tilde-report")
     tilde_bound = (getattr(tilde_ctx.sw, "exe", None), getattr(tilde_ctx.sw, "_exe", None))

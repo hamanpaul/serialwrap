@@ -29,10 +29,16 @@ def collect_artifacts(
     """收集實際解析到的 CLI／daemon 身分與 Python 程式碼摘要。"""
     if not cli_argv or not daemon_argv:
         raise ValueError("CLI 與 daemon argv 均不得為空")
-    cli_path = pathlib.Path(cli_argv[0]).expanduser().resolve()
+    cli_is_python = len(cli_argv) > 1 and pathlib.Path(cli_argv[1]).name == "serialwrap"
+    cli_path = pathlib.Path(cli_argv[1] if cli_is_python else cli_argv[0]).expanduser().resolve()
     try:
+        version_argv = (
+            [cli_argv[0], str(cli_path), "--version"]
+            if cli_is_python
+            else [str(cli_path), "--version"]
+        )
         version_proc = subprocess.run(
-            [str(cli_path), "--version"],
+            version_argv,
             capture_output=True,
             text=True,
             timeout=5.0,
