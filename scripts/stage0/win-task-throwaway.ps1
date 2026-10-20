@@ -12,6 +12,8 @@ param(
 
     [string]$Bundle,
 
+    [string]$AllowCom = "COM24",
+
     [switch]$Cleanup,
 
     [switch]$WhatIf
@@ -22,6 +24,10 @@ $ErrorActionPreference = "Stop"
 
 if ($RunId -cnotmatch '^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}\z') {
     throw "RunId must match YYYYMMDDTHHMMSSZ-xxxxxx exactly."
+}
+$throwawayAllowedComs = @("COM24")
+if ($throwawayAllowedComs -cnotcontains $AllowCom) {
+    throw "-AllowCom must be one of the explicitly allowed throwaway COM ports: $($throwawayAllowedComs -join ', ')."
 }
 if ($Cleanup -and $WhatIf) {
     throw "-Cleanup and -WhatIf cannot be combined."
@@ -90,7 +96,7 @@ $environment = [ordered]@{
     SERIALWRAP_EVENTS_LOG_PATH = "$root\events-runtime\events.ndjson"
     SERIALWRAP_BY_ID_DIR = "$root\by-id"
     SERIALWRAP_BY_PATH_DIR = "$root\by-path"
-    SERIALWRAP_TEST_DEVICE_ALLOWLIST = "COM20"
+    SERIALWRAP_TEST_DEVICE_ALLOWLIST = $AllowCom
     SERIALWRAP_ENDPOINT = $rpcEndpoint
     SERIALWRAP_SOCKET = $rpcEndpoint
 }

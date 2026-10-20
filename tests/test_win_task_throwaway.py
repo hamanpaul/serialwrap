@@ -5,7 +5,7 @@
 1. throwaway 工作名稱前綴 `serialwrap-throwaway-<run_id>`，嚴禁等於或衝突正式 `serialwrap` 工作；
    run_id 格式必須符合 `^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$`。
 2. 五個 `SERIALWRAP_*_DIR` 環境變數皆位於 `<localappdata>\\sw-throwaway\\<run_id>\\` 之下；
-   `SERIALWRAP_TEST_DEVICE_ALLOWLIST` 為 COM20；RPC endpoint 為 loopback TCP 且 port ≠ 48700。
+   `SERIALWRAP_TEST_DEVICE_ALLOWLIST` 預設為 COM24，且只允許明確列出的 COM24；RPC endpoint 為 loopback TCP 且 port ≠ 48700。
 3. `win-task-throwaway.ps1 -WhatIf` 輸出的 Task XML 包含 `<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>`、
    `<URI>\\serialwrap-throwaway-<rid></URI>`，所有路徑在隔離根下，且不含 `\\serialwrap</URI>`。
 4. `-Cleanup` 僅移除 throwaway 排程工作，不影響正式 `serialwrap` 工作的存在與否。
@@ -83,7 +83,7 @@ def test_throwaway_report_schema_and_evidence_gate(tmp_path):
             }.items()
         },
         "endpoint": "tcp://127.0.0.1:49153",
-        "allowlist": "COM20",
+        "allowlist": "COM24",
         "task_xml": {"path": "task.xml", "sha256": "b" * 64},
         "started_at": "2026-10-16T12:00:00Z",
         "finished_at": "2026-10-19T13:00:01Z",
@@ -157,7 +157,7 @@ def test_throwaway_name_prefix_and_not_production():
 @pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_throwaway_env_all_under_isolated_root():
-    """驗證五個 SERIALWRAP_*_DIR 在隔離目錄下、COM20 允許名單與獨立 TCP port。"""
+    """驗證隔離目錄、COM24 允許名單與獨立 TCP port。"""
     from realhw.acceptance.spike1_remaining import throwaway_env
 
     rid = "20261016T120000Z-a1b2c3"
@@ -189,7 +189,7 @@ def test_throwaway_env_all_under_isolated_root():
         )
         assert "\\serialwrap\\" not in val and "/serialwrap/" not in val, f"{k}={val} 不得指向正式 serialwrap 目錄"
 
-    assert env.get("SERIALWRAP_TEST_DEVICE_ALLOWLIST") == "COM20"
+    assert env.get("SERIALWRAP_TEST_DEVICE_ALLOWLIST") == "COM24"
     assert env.get("SERIALWRAP_ENDPOINT") == env.get("SERIALWRAP_SOCKET")
 
     assert "SERIALWRAP_SOCKET" in env
@@ -206,6 +206,24 @@ def test_throwaway_env_all_under_isolated_root():
         throwaway_env("20261016T120000Z-A1B2C3", localappdata)
     with pytest.raises(ValueError):
         throwaway_env("20261016T120000Z-a1b2c3\n", localappdata)
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_throwaway_allow_com_is_explicitly_limited_to_com24():
+    """throwaway 長跑只接受專用 COM24；Spike 1 的其他 pair 不可流入 allowlist。"""
+    from realhw.acceptance.spike1_remaining import throwaway_env
+
+    rid = "20261016T120000Z-a1b2c3"
+    localappdata = r"C:\Users\u\AppData\Local"
+    assert throwaway_env(rid, localappdata, allow_com="COM24")[
+        "SERIALWRAP_TEST_DEVICE_ALLOWLIST"
+    ] == "COM24"
+    for reserved_or_unlisted in (
+        "COM20", "COM21", "COM22", "COM23", "COM25", "COM4", "COM5", "COM26", "com24",
+    ):
+        with pytest.raises(ValueError):
+            throwaway_env(rid, localappdata, allow_com=reserved_or_unlisted)
 
 
 @pytest.mark.windows_native
@@ -239,7 +257,14 @@ def test_task_xml_whatif(tmp_path):
     ]
     whatif_env = dict(os.environ)
     whatif_env["LOCALAPPDATA"] = r"C:\Users\測試\AppData\Local"
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=whatif_env)
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        timeout=30,
+        env=whatif_env,
+    )
     assert proc.returncode == 0, f"-WhatIf 失敗 (rc={proc.returncode}):\nSTDOUT: {proc.stdout}\nSTDERR: {proc.stderr}"
 
     out = proc.stdout
@@ -268,29 +293,66 @@ def test_task_xml_whatif(tmp_path):
     expected_env = throwaway_env(rid, whatif_env["LOCALAPPDATA"])
     assert env == expected_env
 
+    explicit_allowed_cmd = [*cmd, "-AllowCom", "COM24"]
+    explicit_allowed = subprocess.run(
+        explicit_allowed_cmd,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        timeout=30,
+        env=whatif_env,
+    )
+    assert explicit_allowed.returncode == 0, (
+        f"-AllowCom COM24 應被接受：{explicit_allowed.stdout}\n{explicit_allowed.stderr}"
+    )
+
+    for disallowed_com in ("COM20", "COM21", "COM22", "COM23", "COM25", "COM4", "COM5", "COM26"):
+        invalid_allowlist_cmd = [*cmd, "-AllowCom", disallowed_com]
+        invalid_allowlist = subprocess.run(
+            invalid_allowlist_cmd,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=30,
+            env=whatif_env,
+        )
+        assert invalid_allowlist.returncode != 0, (
+            f"-AllowCom {disallowed_com} 應被拒絕：{invalid_allowlist.stdout}\n{invalid_allowlist.stderr}"
+        )
+
     for invalid_rid in (rid.upper(), rid + "\n"):
         invalid_cmd = list(cmd)
         invalid_cmd[invalid_cmd.index(rid)] = invalid_rid
-        invalid = subprocess.run(invalid_cmd, capture_output=True, text=True, timeout=30, env=whatif_env)
+        invalid = subprocess.run(
+            invalid_cmd,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=30,
+            env=whatif_env,
+        )
         assert invalid.returncode != 0
 
     if os.name == "nt":
         validator = tmp_path / "validate-task-xml.ps1"
         xml_path = tmp_path / "task.xml"
+        validation_task_name = f"serialwrap-throwaway-validate-{rid}-{secrets.token_hex(3)}"
         xml_path.write_bytes(xml_text.encode("utf-16"))
         validator.write_text(
             "$service = New-Object -ComObject Schedule.Service\n"
             "$service.Connect()\n"
             "$folder = $service.GetFolder('\\')\n"
             "$xml = [System.IO.File]::ReadAllText($args[0])\n"
-            "$folder.RegisterTask($args[1], $xml, 1, $null, $null, 3, $null) | Out-Null\n",
+            "try { $folder.RegisterTask($args[1], $xml, 1, $null, $null, 3, $null) | Out-Null } "
+            "finally { $folder.DeleteTask($args[1], 0) }\n",
             encoding="ascii",
         )
         validate = subprocess.run(
             [ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(validator),
-             str(xml_path), f"serialwrap-throwaway-validate-{rid}"],
+             str(xml_path), validation_task_name],
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=30,
         )
         assert validate.returncode == 0, f"TASK_VALIDATE_ONLY 拒絕 XML：{validate.stdout}\n{validate.stderr}"
@@ -329,7 +391,13 @@ def test_cleanup_removes_only_throwaway(tmp_path, request):
     ]
 
     def cleanup_task():
-        completed = subprocess.run(cleanup_cmd, capture_output=True, text=True, timeout=30)
+        completed = subprocess.run(
+            cleanup_cmd,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=30,
+        )
         if completed.returncode == 0 and os.environ.get("LOCALAPPDATA"):
             test_root = Path(os.environ["LOCALAPPDATA"]) / "sw-throwaway" / rid
             shutil.rmtree(test_root, ignore_errors=True)
@@ -360,7 +428,13 @@ def test_cleanup_removes_only_throwaway(tmp_path, request):
         "-Bundle",
         str(bundle),
     ]
-    reg_proc = subprocess.run(register_cmd, capture_output=True, text=True, timeout=30)
+    reg_proc = subprocess.run(
+        register_cmd,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        timeout=30,
+    )
     assert reg_proc.returncode == 0, f"註冊 throwaway 工作失敗:\n{reg_proc.stderr}"
 
     # 執行 -Cleanup
@@ -434,6 +508,7 @@ def test_generated_launcher_redirects_stderr_and_obeys_deadline(tmp_path):
         [ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(launcher_path)],
         capture_output=True,
         text=True,
+        errors="replace",
         timeout=15,
         env=inherited_env,
     )

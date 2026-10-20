@@ -70,7 +70,7 @@
       }
     },
     "endpoint": {"type": "string", "pattern": "^tcp://127\\.0\\.0\\.1:(?!48700$)[0-9]+$"},
-    "allowlist": {"const": "COM20"},
+    "allowlist": {"const": "COM24"},
     "task_xml": {
       "type": "object",
       "additionalProperties": false,

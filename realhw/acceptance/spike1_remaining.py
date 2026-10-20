@@ -22,6 +22,7 @@ _TEST_PAIR_ALLOWLIST = {
     "DUT-side": "COM20:COM21",
     "Console-side": "COM22:COM23",
 }
+_THROWAWAY_COM_ALLOWLIST = frozenset({"COM24"})
 _DIR_ENV_KEYS = (
     "SERIALWRAP_STATE_DIR",
     "SERIALWRAP_RUN_DIR",
@@ -39,9 +40,16 @@ def throwaway_task_name(run_id: str) -> str:
     return f"serialwrap-throwaway-{run_id}"
 
 
-def throwaway_env(run_id: str, localappdata: str) -> dict[str, str]:
+def throwaway_env(
+    run_id: str,
+    localappdata: str,
+    *,
+    allow_com: str = "COM24",
+) -> dict[str, str]:
     """產生完全位於本次 run 根目錄內的 Windows daemon 環境。"""
     throwaway_task_name(run_id)
+    if not isinstance(allow_com, str) or allow_com not in _THROWAWAY_COM_ALLOWLIST:
+        raise ValueError("throwaway 長跑只允許 COM24")
     if not isinstance(localappdata, str) or not localappdata.strip():
         raise ValueError("localappdata 不得為空")
     local_root = PureWindowsPath(localappdata)
@@ -64,7 +72,7 @@ def throwaway_env(run_id: str, localappdata: str) -> dict[str, str]:
         "SERIALWRAP_EVENTS_LOG_PATH": str(root / "events-runtime" / "events.ndjson"),
         "SERIALWRAP_BY_ID_DIR": str(root / "by-id"),
         "SERIALWRAP_BY_PATH_DIR": str(root / "by-path"),
-        "SERIALWRAP_TEST_DEVICE_ALLOWLIST": "COM20",
+        "SERIALWRAP_TEST_DEVICE_ALLOWLIST": allow_com,
         "SERIALWRAP_ENDPOINT": f"tcp://127.0.0.1:{port}",
         "SERIALWRAP_SOCKET": f"tcp://127.0.0.1:{port}",
     }
