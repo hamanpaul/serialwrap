@@ -253,7 +253,12 @@ impl ServiceCtl for WindowsServiceCtl {
                 "binPath=".into(),
                 bin_path,
                 "start=".into(),
-                if def.register_held { "disabled" } else { "auto" }.into(),
+                if def.register_held {
+                    "disabled"
+                } else {
+                    "auto"
+                }
+                .into(),
                 "obj=".into(),
                 "NT AUTHORITY\\LocalService".into(),
             ],

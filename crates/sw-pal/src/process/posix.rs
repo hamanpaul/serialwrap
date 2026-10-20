@@ -17,7 +17,10 @@ impl ProcessCtl for NativeProcessCtl {
         _exe: &std::path::Path,
         _args: &[String],
     ) -> crate::traits::PalResult<crate::traits::ElevatedOutcome> {
-        todo!("P4-T19: NativeProcessCtl::spawn_elevated 尚未實作")
+        Err(crate::traits::PalError::plain(
+            PalErrorKind::Unsupported,
+            "POSIX 不支援提權啟動",
+        ))
     }
 
     fn exec_or_wait(&self, argv: &[OsString], env_add: &[(String, String)]) -> PalError {

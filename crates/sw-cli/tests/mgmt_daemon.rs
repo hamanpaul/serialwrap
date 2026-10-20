@@ -50,6 +50,13 @@ fn has_key(v: &PyValue, key: &str) -> bool {
     }
 }
 
+fn object_len(v: &PyValue) -> usize {
+    match v {
+        PyValue::Dict(d) => d.0.len(),
+        _ => panic!("JSON 不是物件"),
+    }
+}
+
 fn fstr(v: &PyValue, key: &str) -> String {
     match field(v, key) {
         PyValue::Str(s) => s.clone(),
@@ -173,6 +180,25 @@ fn start_treats_normalized_same_socket_as_no_conflict() {
 }
 
 #[test]
+fn start_conflict_normalization_expands_user_home() {
+    let t0 = TestEnv::posix();
+    let home = t0.home();
+    // POSIX 旗標以 `/` 接上（Python `posixpath`）；Windows 主機模擬時 `Path::join` 會用 `\\`，與 `~/x.sock` 展開結果不同形。
+    let target = format!("{}/x.sock", home.display());
+    let t = t0
+        .with_var("HOME", &home.display().to_string())
+        .with_procs(vec![daemon_proc(4242, Some("~/x.sock"))])
+        .with_process();
+    let (rc, out, _) = t.run(&["--socket", &target, "daemon", "start"]);
+    assert_eq!(rc, 2);
+    assert_eq!(
+        fstr(&json(&out), "error_code"),
+        "DAEMON_BINARY_NOT_FOUND",
+        "同一個展開後 endpoint 不應被誤判為另一個 daemon"
+    );
+}
+
+#[test]
 fn autostart_only_when_request_never_sent() {
     // 第一次 session.list 連線被拒（請求從未送出）→ 自動啟動後重送一次。
     // 註：計畫原文未含 `with_process`／`with_rpc_after_spawn`；自動啟動需要 spawn 與 spawn 後的 ping 才能成立。
@@ -183,7 +209,7 @@ fn autostart_only_when_request_never_sent() {
         .with_rpc_after_spawn(TestEnv::win_endpoint(), &["health.ping", "health.status"]);
     let (rc, out, err) = t.run(&["session", "list"]);
     assert_eq!(rc, 0, "{out}");
-    assert_eq!(out, format!("{SESSION_LIST_OK}\n"));
+    assert_eq!(out, format!("{SESSION_LIST_OK}\r\n"));
     assert!(err.starts_with(
         "serialwrap: on-demand：預設 endpoint tcp://127.0.0.1:48700 沒有 daemon，已自動啟動（pid="
     ));
@@ -249,8 +275,9 @@ fn start_endpoint_loopback_allowed_windows() {
 
 #[test]
 fn start_endpoint_socket_mismatch_invalid_args() {
-    let t = TestEnv::posix();
-    let (rc, out, _) = t.run(&["--endpoint", "unix:///tmp/a.sock", "--socket", "/tmp/b.sock", "daemon", "start"]);
+    // Windows loopback endpoint 可達到 mismatch 檢查；POSIX 會先拒絕 endpoint。
+    let t = TestEnv::windows();
+    let (rc, out, _) = t.run(&["--endpoint", "tcp://127.0.0.1:48701", "--socket", "tcp://127.0.0.1:48702", "daemon", "start"]);
     assert_eq!(rc, 2);
     let j = json(&out);
     assert_eq!(fstr(&j, "error_code"), "INVALID_ARGS");
@@ -258,6 +285,14 @@ fn start_endpoint_socket_mismatch_invalid_args() {
         fstr(&j, "message"),
         "--endpoint 與 --socket 不一致；daemon start 請擇一指定 bind 位址"
     );
+}
+
+#[test]
+fn start_posix_endpoint_rejection_precedes_socket_mismatch() {
+    let t = TestEnv::posix();
+    let (rc, out, _) = t.run(&["--endpoint", "unix:///tmp/a.sock", "--socket", "/tmp/b.sock", "daemon", "start"]);
+    assert_eq!(rc, 2);
+    assert_eq!(fstr(&json(&out), "error_code"), "REMOTE_NOT_SUPPORTED");
 }
 
 #[test]
@@ -292,6 +327,18 @@ fn start_unknown_mode_routes_no_systemd() {
 }
 
 #[test]
+fn start_preserves_non_string_supervision_mode_json_type() {
+    let t = TestEnv::posix()
+        .with_config("supervision_mode: [a, b]\n")
+        .with_real_service();
+    let (_, out, _) = t.run(&["daemon", "start"]);
+    assert_eq!(
+        field(&json(&out), "mode"),
+        &PyValue::List(vec![PyValue::Str("a".into()), PyValue::Str("b".into())])
+    );
+}
+
+#[test]
 fn start_already_running() {
     let (t0, sock) = posix_with_socket();
     let t = t0.with_process().with_rpc_ok(&sock, "health.ping", PING_OK);
@@ -302,6 +349,7 @@ fn start_already_running() {
     assert!(fbool(&j, "ok"));
     assert_eq!(fstr(&j, "socket"), sock);
     assert_eq!(t.process().spawn_count(), 0);
+    assert_eq!(t.rpc().timeouts_s(), vec![0.5]);
 }
 
 #[test]
@@ -408,6 +456,34 @@ fn start_locate_honors_release_manifest_env() {
 }
 
 #[test]
+fn start_manifest_relative_path_returns_absolute_launcher() {
+    fn relative_path(from: &std::path::Path, to: &std::path::Path) -> PathBuf {
+        let from = from.components().collect::<Vec<_>>();
+        let to = to.components().collect::<Vec<_>>();
+        let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+        let mut relative = PathBuf::new();
+        for _ in common..from.len() {
+            relative.push("..");
+        }
+        for component in to.iter().skip(common) {
+            relative.push(component.as_os_str());
+        }
+        relative
+    }
+
+    let t = TestEnv::posix().with_manifest_launcher();
+    let manifest = t.bundle_dir().join("release-manifest.json");
+    let cwd = std::env::current_dir().expect("current directory");
+    let relative = relative_path(&cwd, &manifest);
+    assert!(!relative.is_absolute());
+    let t = t.with_var("SERIALWRAP_RELEASE_MANIFEST", &relative.display().to_string());
+    let argv = t.with_cli_ctx(|ctx| {
+        sw_cli::commands::daemon_cmd::locate_daemon_argv(ctx).expect("manifest launcher")
+    });
+    assert!(PathBuf::from(&argv[0]).is_absolute(), "launcher path 必須正規化為絕對路徑：{argv:?}");
+}
+
+#[test]
 fn start_binary_not_found() {
     let t = TestEnv::posix().with_process();
     let (rc, out, err) = t.run(&["daemon", "start"]);
@@ -479,7 +555,11 @@ fn start_env_file_non_utf8_value_preserved() {
         .with_rpc_after_spawn(&sock, &["health.ping", "health.status"]);
     let (rc, out, _) = t.run(&["daemon", "start"]);
     assert_eq!(rc, 0, "{out}");
-    assert_eq!(first_spawn_env(&t, "B"), Some(vec![0xff, 0xfe]));
+    let expected = sw_pal::os_string_from_bytes(&[0xff, 0xfe]);
+    assert_eq!(
+        first_spawn_env(&t, "B"),
+        Some(expected.as_encoded_bytes().to_vec())
+    );
 }
 
 #[test]
@@ -513,21 +593,33 @@ fn start_foreground_returns_child_rc() {
 #[test]
 fn start_daemon_exited() {
     let t = TestEnv::posix().with_manifest_launcher().with_spawn_exits(2);
-    let (rc, out, _) = t.run(&["daemon", "start"]);
+    let (rc, out, err) = t.run(&["daemon", "start"]);
     assert_eq!(rc, 2);
     let j = json(&out);
     assert_eq!(fstr(&j, "error_code"), "DAEMON_EXITED");
     assert!(fbool(&j, "ok") == false);
     assert_eq!(fint(&j, "returncode"), 2);
     assert!(fint(&j, "pid") > 0);
+    assert_eq!(object_len(&j), 4, "DAEMON_EXITED 不應額外帶 message");
+    assert_eq!(
+        out,
+        format!("{{\"error_code\":\"DAEMON_EXITED\",\"ok\":false,\"pid\":{},\"returncode\":2}}\n", fint(&j, "pid"))
+    );
+    assert_eq!(err, "serialwrap: daemon start failed: DAEMON_EXITED\n");
 }
 
 #[test]
 fn start_not_ready_posix_15_attempts() {
     let t = TestEnv::posix().with_manifest_launcher().with_process();
-    let (rc, out, _) = t.run(&["daemon", "start"]);
+    let (rc, out, err) = t.run(&["daemon", "start"]);
     assert_eq!(rc, 2);
     assert_eq!(fstr(&json(&out), "error_code"), "DAEMON_NOT_READY");
+    assert_eq!(object_len(&json(&out)), 3, "DAEMON_NOT_READY 不應額外帶 message");
+    assert_eq!(
+        out,
+        format!("{{\"error_code\":\"DAEMON_NOT_READY\",\"ok\":false,\"pid\":{}}}\n", fint(&json(&out), "pid"))
+    );
+    assert_eq!(err, "serialwrap: daemon start failed: DAEMON_NOT_READY\n");
     let sleeps = t.clock().sleeps_s();
     assert_eq!(sleeps.len(), 15);
     assert!(sleeps.iter().all(|s| (s - 0.2).abs() < 1e-9));
@@ -568,6 +660,25 @@ fn start_success_includes_warnings_and_env_files() {
     assert!(fbool(&j, "ok"));
     assert_eq!(fstr_list(&j, "warnings"), vec!["no_profiles_loaded".to_string()]);
     assert_eq!(fstr_list(&j, "env_files"), vec![path]);
+    assert_eq!(t.rpc().timeouts_s(), vec![0.5, 0.5, 1.0]);
+}
+
+#[test]
+fn start_success_omits_empty_warnings() {
+    let t0 = TestEnv::posix();
+    let sock = t0.default_socket();
+    let t = t0
+        .with_manifest_launcher()
+        .with_process()
+        .with_rpc_after_spawn(&sock, &["health.ping", "health.status"]);
+    t.rpc().respond(
+        &t.isolated_endpoint(&sock),
+        "health.status",
+        r#"{"ok":true,"pid":9000,"version":"0.4.0","warnings":[]}"#,
+    );
+    let (rc, out, _) = t.run(&["daemon", "start"]);
+    assert_eq!(rc, 0, "{out}");
+    assert!(!has_key(&json(&out), "warnings"));
 }
 
 #[test]
@@ -602,13 +713,36 @@ fn stop_routes_supervised_unless_explicit_target() {
 }
 
 #[test]
+fn stop_empty_endpoint_routes_systemd_like_python() {
+    let t = TestEnv::posix()
+        .with_config("supervision_mode: systemd-user\n")
+        .with_systemd(true)
+        .with_real_service();
+    let (_, _, _) = t.run(&["--endpoint", "", "daemon", "stop"]);
+    assert_eq!(t.calls(), vec![argv(&["systemctl", "--user", "stop", "serialwrap"])]);
+}
+
+#[test]
+fn stop_unknown_systemd_prefix_preserves_no_systemd_route() {
+    let t = TestEnv::posix()
+        .with_config("supervision_mode: systemd-foo\n")
+        .with_real_service();
+    let (rc, out, _) = t.run(&["daemon", "stop"]);
+    assert_eq!(rc, 2);
+    assert_eq!(fstr(&json(&out), "error_code"), "NO_SYSTEMD");
+    assert_eq!(fstr(&json(&out), "_routed_to"), "service stop");
+    assert_eq!(rpc_count(&t, "daemon.stop"), 0);
+    assert!(t.calls().is_empty());
+}
+
+#[test]
 fn stop_rpc_timeout_fixed_2s_no_retries() {
     // `--retries 3 --timeout 9`：daemon stop 的 RPC 固定 2.0 s 且不重試。
-    // 註：FakeRpcConnector 不記錄逾時值，「timeout 2.0」斷言無法由替身觀察（已記錄為缺口）；此處只驗證送出次數。
     let (t0, sock) = posix_with_socket();
     let t = t0.with_rpc_ok(&sock, "daemon.stop", r#"{"ok":true,"stopping":true}"#);
     let (_, _, _) = t.run(&["--retries", "3", "--timeout", "9", "--socket", &sock, "daemon", "stop"]);
     assert_eq!(rpc_count(&t, "daemon.stop"), 1);
+    assert_eq!(t.rpc().timeouts_s(), vec![2.0]);
 }
 
 #[test]
@@ -682,6 +816,39 @@ fn restart_on_demand_not_running_wraps_start() {
     assert!(fbool(&j, "restarted"));
     assert!(!fbool(&j, "stopped"));
     assert!(fbool(field(&j, "start"), "ok"));
+}
+
+#[test]
+fn restart_waits_for_process_when_ping_is_already_down() {
+    let (t0, sock) = posix_with_socket();
+    let t = t0
+        .with_process()
+        .with_manifest_launcher()
+        .with_procs(vec![daemon_proc(4321, Some(&sock))])
+        .with_rpc_refused(&sock);
+    let (rc, out, _) = t.run(&["daemon", "restart"]);
+    assert_eq!(rc, 1);
+    assert_eq!(out, "{\"error_code\":\"TIMEOUT\",\"ok\":false,\"phase\":\"restart_wait_old_exit\"}\n");
+    assert_eq!(t.process().spawn_count(), 0, "舊行程仍存活時不得啟動新 daemon");
+    assert!(t.clock().elapsed() >= Duration::from_secs(10));
+}
+
+#[test]
+fn restart_keeps_nested_start_stderr() {
+    let t0 = TestEnv::posix();
+    let env_file = t0.home().join("OPI.env");
+    t0.write_file(&env_file, b"A=1\n");
+    let env_path = env_file.display().to_string();
+    let sock = t0.default_socket();
+    let t = t0
+        .with_var("SERIALWRAP_DAEMON_ENV_FILE", &env_path)
+        .with_command_raw(&["bash", "-lc", ENV_SOURCE_SCRIPT, "serialwrap", &env_path], 1, b"", b"boom\n")
+        .with_manifest_launcher()
+        .with_process()
+        .with_rpc_after_spawn(&sock, &["health.ping"]);
+    let (rc, _, err) = t.run(&["daemon", "restart"]);
+    assert_eq!(rc, 2);
+    assert!(err.lines().any(|line| line == "serialwrap: daemon start failed: ENV_FILE_SOURCE_FAILED: boom"), "巢狀 start stderr 遺失：{err}");
 }
 
 #[test]
@@ -805,7 +972,7 @@ fn autostart_concurrent_second_cli_reuses_daemon() {
         .with_process();
     let (rc, out, err) = t.run(&["session", "list"]);
     assert_eq!(rc, 0, "{out}");
-    assert_eq!(out, format!("{SESSION_LIST_OK}\n"));
+    assert_eq!(out, format!("{SESSION_LIST_OK}\r\n"));
     assert!(t.process().spawns().is_empty(), "AlreadyUp 不得 spawn");
     assert_eq!(rpc_count(&t, "session.list"), 1, "重送 1 次");
     assert!(!err.contains("已自動啟動"));
@@ -821,8 +988,28 @@ fn autostart_loser_daemon_exited_but_healthy_is_success() {
         .with_rpc_after_spawn(TestEnv::win_endpoint(), &["health.ping", "health.status"]);
     let (rc, out, err) = t.run(&["session", "list"]);
     assert_eq!(rc, 0, "{out}");
-    assert_eq!(out, format!("{SESSION_LIST_OK}\n"));
+    assert_eq!(out, format!("{SESSION_LIST_OK}\r\n"));
     assert!(!err.contains("自動啟動失敗"));
+}
+
+#[test]
+fn autostart_nested_start_already_running_without_pid_is_reused() {
+    let endpoint = TestEnv::win_endpoint();
+    let t = TestEnv::windows()
+        .with_manifest_launcher()
+        .with_process()
+        .with_rpc_ok(endpoint, "session.list", SESSION_LIST_OK);
+    t.rpc().refuse_first(endpoint, 1);
+    t.rpc().respond_seq(
+        &t.isolated_endpoint(endpoint),
+        "health.ping",
+        &[r#"{"ok":false}"#, PING_OK],
+    );
+    let (rc, out, err) = t.run(&["session", "list"]);
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(out, format!("{SESSION_LIST_OK}\r\n"));
+    assert_eq!(t.process().spawn_count(), 0, "巢狀 start 的 already_running 不得回報 pid=0");
+    assert!(!err.contains("已自動啟動"));
 }
 
 #[test]
@@ -876,6 +1063,26 @@ fn autostart_suppressed_while_install_journal_present() {
     assert_eq!(rc, 0, "{out}");
     assert_eq!(t.process().spawn_count(), 1);
     assert_eq!(rpc_count(&t, "session.list"), 1);
+}
+
+#[test]
+fn autostart_rechecks_install_journal_after_waiting_for_lock() {
+    let t = TestEnv::windows()
+        .with_install_root()
+        .with_installed("0.4.0")
+        .with_autostart_lock_holder_creating_journal(3.0)
+        .with_manifest_launcher()
+        .with_process();
+    let (rc, out, err) = t.run(&["session", "list"]);
+    assert_eq!(rc, 2);
+    assert_eq!(fstr(&json(&out), "error_code"), "SOCKET_ERROR");
+    assert!(t.process().spawns().is_empty(), "journal 在等待鎖時出現後不得 spawn");
+    assert_eq!(rpc_count(&t, "session.list"), 0, "不得重送未送出的請求");
+    assert_eq!(
+        err.lines().filter(|line| line.contains("install-journal.json 存在")).count(),
+        1
+    );
+    assert!(t.journal_bytes().is_some(), "測試替身須於鎖釋放時建立 journal");
 }
 
 #[test]

@@ -67,7 +67,7 @@ fn setup_rollback_and_user_mutually_exclusive() {
             // 逐字比對（計畫 Task 1 步驟 3 第 10 點）：與 Python argparse＋擴充實測一致。
             assert_eq!(
                 x.stderr,
-                "usage: serialwrap setup [-h]\n                        [--user | --system | --on-demand | --windows-task | --windows-service | --rollback]\n                        [--force] [--with-sudo]\nserialwrap setup: error: argument --rollback: not allowed with argument --user\n"
+                "usage: serialwrap setup [-h]\n                        [--user | --system | --on-demand | --windows-task | --windows-service | --rollback]\n                        [--force] [--with-sudo]\n                        [--with-com0com | --remove-com0com]\nserialwrap setup: error: argument --rollback: not allowed with argument --user\n"
             );
         }
         _ => panic!("預期 ParseResult::Exit(2)"),

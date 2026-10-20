@@ -333,6 +333,7 @@ fn with_native_cli_ctx<R>(f: impl FnOnce(&mut CliCtx<'_>) -> R) -> R {
         io: TextIo::new(&mut out, &mut err, "\n"),
         verbose: 0,
         cli_version: "test",
+        autostart_lock: None,
     };
     f(&mut ctx)
 }

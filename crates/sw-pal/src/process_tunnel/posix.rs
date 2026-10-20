@@ -196,13 +196,8 @@ fn close_extra_fds(limit: libc::rlim_t) -> io::Result<()> {
                 return Err(error);
             }
             // SAFETY: 只為已存在的額外 fd 加上 FD_CLOEXEC。
-            if unsafe {
-                libc::fcntl(
-                    fd as libc::c_int,
-                    libc::F_SETFD,
-                    flags | libc::FD_CLOEXEC,
-                )
-            } == 0
+            if unsafe { libc::fcntl(fd as libc::c_int, libc::F_SETFD, flags | libc::FD_CLOEXEC) }
+                == 0
             {
                 break;
             }
@@ -220,13 +215,7 @@ fn reap_pid(pid: u32) -> bool {
     loop {
         let mut status = 0;
         // SAFETY: WNOHANG 僅檢查並回收指定子行程，不等待其他行程。
-        let result = unsafe {
-            libc::waitpid(
-                pid as libc::pid_t,
-                &mut status,
-                libc::WNOHANG,
-            )
-        };
+        let result = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
         if result == pid as libc::pid_t {
             return true;
         }

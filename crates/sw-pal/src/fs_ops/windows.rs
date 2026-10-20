@@ -22,6 +22,34 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
+/// `ERROR_PRIVILEGE_NOT_HELD`：未啟用開發者模式且非提權時建立 symlink 的錯誤碼。
+const ERROR_PRIVILEGE_NOT_HELD: u32 = 1314;
+
+/// 依建立 symlink 的結果決定連結或回退為遞迴複製（DF-16）；`create` 失敗時回傳 `GetLastError()`。
+fn link_or_copy(
+    link: &Path,
+    target: &Path,
+    create: impl FnOnce() -> Result<(), u32>,
+) -> PalResult<LinkKind> {
+    match create() {
+        Ok(()) => Ok(LinkKind::Symlink),
+        Err(ERROR_PRIVILEGE_NOT_HELD) => {
+            copy_tree(target, link)?;
+            Ok(LinkKind::Copied)
+        }
+        Err(code) => Err(windows_win32_error(code)),
+    }
+}
+
+/// 測試用：以 `ERROR_PRIVILEGE_NOT_HELD` 取代實際建立 symlink，驗證回退複製路徑，不依賴主機是否啟用開發者模式。
+#[cfg(feature = "test-fakes")]
+#[doc(hidden)]
+pub fn symlink_or_copy_dir_privilege_not_held(link: &Path, target: &Path) -> PalResult<LinkKind> {
+    fs::create_dir_all(parent_dir(link)).map_err(file_error)?;
+    remove_existing(link)?;
+    link_or_copy(link, target, || Err(ERROR_PRIVILEGE_NOT_HELD))
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NativeFsRead;
 
@@ -58,10 +86,7 @@ impl FsOps for NativeFsOps {
         file.sync_all().map_err(file_error)?;
         drop(file);
 
-        replace_with_permission_retries(
-            || self.replace(&temp_path, path),
-            std::thread::sleep,
-        )?;
+        replace_with_permission_retries(|| self.replace(&temp_path, path), std::thread::sleep)?;
         cleanup.disarm();
         Ok(())
     }
@@ -99,6 +124,14 @@ impl FsOps for NativeFsOps {
     fn copy_preserving(&self, from: &Path, to: &Path) -> PalResult<()> {
         fs::copy(from, to).map_err(file_error)?;
         copy_file_metadata(from, to)
+    }
+
+    fn sync_file(&self, path: &Path) -> PalResult<()> {
+        OpenOptions::new()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(file_error)
     }
 
     fn copy_tree(&self, from: &Path, to: &Path) -> PalResult<()> {
@@ -142,24 +175,21 @@ impl FsOps for NativeFsOps {
         remove_existing(link)?;
         let link_w = wide_path(link);
         let target_w = wide_path(target);
-        // SAFETY: 路徑均為 NUL 結尾 UTF-16；旗標啟用目錄 symlink 與免提權建立。
-        let created = unsafe {
-            CreateSymbolicLinkW(
-                link_w.as_ptr(),
-                target_w.as_ptr(),
-                SYMBOLIC_LINK_FLAG_DIRECTORY | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE,
-            )
-        };
-        if created {
-            return Ok(LinkKind::Symlink);
-        }
-        let code = unsafe { GetLastError() };
-        if code == 1314 {
-            copy_tree(target, link)?;
-            Ok(LinkKind::Copied)
-        } else {
-            Err(windows_win32_error(code))
-        }
+        link_or_copy(link, target, || {
+            // SAFETY: 路徑均為 NUL 結尾 UTF-16；旗標啟用目錄 symlink 與免提權建立。
+            let created = unsafe {
+                CreateSymbolicLinkW(
+                    link_w.as_ptr(),
+                    target_w.as_ptr(),
+                    SYMBOLIC_LINK_FLAG_DIRECTORY | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE,
+                )
+            };
+            if created {
+                Ok(())
+            } else {
+                Err(unsafe { GetLastError() })
+            }
+        })
     }
 
     fn file_lock_exclusive(&self, path: &Path, blocking: bool) -> PalResult<FileLockGuard> {
@@ -449,7 +479,6 @@ fn has_trailing_separator(path: &Path) -> bool {
         .is_some_and(|unit| unit == b'\\' as u16 || unit == b'/' as u16)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::replace_with_permission_retries;
@@ -480,7 +509,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(attempts, 3);
-        assert_eq!(delays, [Duration::from_millis(10), Duration::from_millis(20)]);
+        assert_eq!(
+            delays,
+            [Duration::from_millis(10), Duration::from_millis(20)]
+        );
     }
 
     #[test]

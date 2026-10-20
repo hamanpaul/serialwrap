@@ -259,6 +259,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sw-com0com-helper"
+version = "0.3.2"
+dependencies = [
+ "sw-pal",
+]
+
+[[package]]
 name = "sw-core"
 version = "0.3.2"
 dependencies = [

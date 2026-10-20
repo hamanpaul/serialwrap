@@ -80,5 +80,56 @@ pub fn run_supervision_mode(ns: &Namespace, ctx: &mut CliCtx) -> i32 {
 }
 
 pub fn run_supervision_set(ns: &Namespace, ctx: &mut CliCtx, mode: &str) -> i32 {
-    todo!("not implemented: P4-T10: run_supervision_set")
+    let words: Vec<String> = match ns.get("words") {
+        ArgValue::List(items) => items.clone(),
+        ArgValue::Str(item) => vec![item.clone()],
+        _ => Vec::new(),
+    };
+    if words.len() != 2 || words.first().map(String::as_str) != Some("set") {
+        let response = output::error_resp(
+            sw_proto::error_codes::ErrorCode::InvalidArgs,
+            Some("用法：serialwrap supervision-mode [set MODE]"),
+        );
+        let _ = output::print_json(&mut ctx.io, &response);
+        let _ = output::mirror_err(&mut ctx.io, &response, Some("supervision-mode"));
+        return 2;
+    }
+    let target = sw_pal::service_ctl::SupervisionMode::parse(mode);
+    let supported = ctx.p.service.supported_modes();
+    let mode_is_known = matches!(
+        target,
+        sw_pal::service_ctl::SupervisionMode::OnDemand
+            | sw_pal::service_ctl::SupervisionMode::SystemdUser
+            | sw_pal::service_ctl::SupervisionMode::SystemdSystem
+            | sw_pal::service_ctl::SupervisionMode::WindowsTask
+            | sw_pal::service_ctl::SupervisionMode::WindowsService
+    );
+    if !mode_is_known
+        || (!matches!(target, sw_pal::service_ctl::SupervisionMode::OnDemand)
+            && !(matches!(target, sw_pal::service_ctl::SupervisionMode::WindowsService)
+                && ctx.p.caps.path_flavor == sw_pal::PalPathFlavor::Windows)
+            && !supported.contains(&target))
+    {
+        let joined = supported
+            .iter()
+            .map(sw_pal::service_ctl::SupervisionMode::as_str)
+            .collect::<Vec<_>>()
+            .join("、");
+        let response = output::error_resp(
+            sw_proto::error_codes::ErrorCode::InvalidArgs,
+            Some(&format!(
+                "監管模式 {} 不適用於本平台（可用：{}）",
+                target.as_str(), joined
+            )),
+        );
+        let _ = output::print_json(&mut ctx.io, &response);
+        let _ = output::mirror_err(&mut ctx.io, &response, Some("supervision-mode"));
+        return 2;
+    }
+    crate::rollback::run_supervision_switch(
+        ctx,
+        &target,
+        matches!(ns.get("with_sudo"), ArgValue::Bool(true)),
+        matches!(ns.get("force"), ArgValue::Bool(true)),
+    )
 }

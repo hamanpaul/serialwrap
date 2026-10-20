@@ -641,6 +641,35 @@ fn collect_all_files(ctx: &Ctx<'_>, root: &Path) -> Result<Vec<String>, String> 
     Ok(paths)
 }
 
+fn com0com_digest(
+    ctx: &Ctx<'_>,
+    dir: &Path,
+    component: &sw_proto::release_manifest::Com0comComponent,
+) -> Result<String, String> {
+    let root = manifest_path(ctx, dir, component.path.trim_end_matches('/'));
+    let mut paths = collect_all_files(ctx, &root)?;
+    paths.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    if paths.is_empty() {
+        return Err("optional/com0com 目錄沒有檔案".into());
+    }
+    let mut content = Vec::new();
+    for relative in paths {
+        if !safe_sum_path(path_flavor(ctx), &relative) {
+            return Err(format!("com0com 元件含不安全路徑：{relative}"));
+        }
+        let bytes = ctx
+            .p
+            .fs
+            .read(&root.join(&relative))
+            .map_err(|error| pal_error_message(&error))?;
+        content.extend_from_slice(component.path.as_bytes());
+        content.extend_from_slice(relative.as_bytes());
+        content.push(0);
+        content.extend_from_slice(&bytes);
+    }
+    Ok(sha256_hex(&content))
+}
+
 fn safe_sum_path(flavor: PathFlavor, relative: &str) -> bool {
     if relative.is_empty()
         || pypath::isabs(flavor, relative)
@@ -864,6 +893,34 @@ pub fn verify_bundle(
         check_file_digest(
             ctx, dir, m, path_field, hash_field, fallback, field, &mut diffs,
         );
+    }
+
+    if let Some(component) = m.com0com() {
+        check_file_digest(
+            ctx,
+            dir,
+            m,
+            Some("components.com0com.helper.path"),
+            "components.com0com.helper.sha256",
+            "",
+            "components.com0com.helper.sha256",
+            &mut diffs,
+        );
+        match com0com_digest(ctx, dir, &component) {
+            Ok(actual) if actual == component.sha256 => {}
+            Ok(actual) => add_pairing_diff(
+                &mut diffs,
+                "components.com0com.sha256",
+                &component.sha256,
+                actual,
+            ),
+            Err(actual) => add_pairing_diff(
+                &mut diffs,
+                "components.com0com.sha256",
+                &component.sha256,
+                actual,
+            ),
+        }
     }
 
     let package_tree = tree_sha256_with_prefix(ctx, &dir.join("py").join("sw_core"), "sw_core/");

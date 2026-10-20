@@ -9,9 +9,10 @@
 - ``sw-core``：只允許 ``sw-proto``、``sw-pal``；
 - ``sw-daemon``：只允許 ``sw-core``、``sw-proto``、``sw-pal``；
 - ``sw-cli``：只允許 ``sw-proto``、``sw-pal``（不得連結 ``sw-core``／``sw-daemon``）。
+- ``sw-com0com-helper``：只允許 ``sw-pal``；提權 helper 不得繞過 PAL 直接呼叫平台 API。
 
 另：``sw-pal`` 以外的 crate 不得直接依賴 ``libc``／``windows-sys``。
-五個必要成員缺一（名稱不符或未納入 workspace）為工具錯誤；未登錄於允許表的 workspace 成員視為違規。
+六個必要成員缺一（名稱不符或未納入 workspace）為工具錯誤；未登錄於允許表的 workspace 成員視為違規。
 違規列出 ``<crate> -> <dep>: <rule>``；乾淨 exit 0，違規 exit 1，工具錯誤 exit 2。
 """
 from __future__ import annotations
@@ -28,6 +29,7 @@ PROTO = "sw-proto"
 CLI = "sw-cli"
 CORE = "sw-core"
 DAEMON = "sw-daemon"
+COM0COM_HELPER = "sw-com0com-helper"
 PLATFORM_LIBS = frozenset({"libc", "windows-sys"})
 
 # 依賴允許表（arch §1.3）：成員 → 允許直接依賴的 workspace 成員。
@@ -37,6 +39,7 @@ ALLOWED_WORKSPACE_DEPS: dict[str, frozenset[str]] = {
     CORE: frozenset({PROTO, PAL}),
     DAEMON: frozenset({CORE, PROTO, PAL}),
     CLI: frozenset({PROTO, PAL}),
+    COM0COM_HELPER: frozenset({PAL}),
 }
 
 

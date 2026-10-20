@@ -116,6 +116,24 @@ fn test_parse_manifest_schema_version_2() {
 }
 
 #[test]
+fn test_parse_manifest_schema_version_float_one_matches_python() {
+    // Python `load_release_manifest` 接受 schema_version 1.0（1.0 != 1 為假）；Rust 須與基線一致。
+    let text = r#"{
+      "schema_version": 1.0,
+      "bundle_version": "0.3.2",
+      "stage": "1A",
+      "target": "x86_64-unknown-linux-gnu",
+      "git_revision": "abcdef0123456789",
+      "components": {
+        "python_cli_delegate": {
+          "entry": ["py/python"]
+        }
+      }
+    }"#;
+    assert!(parse_manifest(text).is_ok());
+}
+
+#[test]
 fn test_parse_manifest_invalid_json() {
     let text = r#"not valid json {"#;
     assert!(matches!(parse_manifest(text), Err(ManifestError::InvalidJson(_))));

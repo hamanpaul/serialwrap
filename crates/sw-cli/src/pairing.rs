@@ -200,6 +200,30 @@ fn package_tree_sha256(manifest_dir: &Path) -> std::io::Result<String> {
     .map_err(|message| IoError::new(ErrorKind::Other, message))
 }
 
+fn com0com_component_sha256(manifest_dir: &Path, m: &ReleaseManifest) -> Option<String> {
+    let component = m.com0com()?;
+    let root = manifest_dir.join(component.path.trim_end_matches('/'));
+    let files = crate::tree_digest::collect_file_paths(
+        &crate::tree_digest::NativeTreeSource,
+        &root,
+        "",
+        false,
+    )
+    .ok()?;
+    if files.is_empty() {
+        return None;
+    }
+    let mut material = Vec::new();
+    for (relative, path) in files {
+        let bytes = fs::read(path).ok()?;
+        material.extend_from_slice(component.path.as_bytes());
+        material.extend_from_slice(relative.as_bytes());
+        material.push(0);
+        material.extend_from_slice(&bytes);
+    }
+    Some(sha256_hex(&material))
+}
+
 fn valid_sha256(value: Option<&str>) -> bool {
     value.is_some_and(|s| {
         s.len() == 64
@@ -262,6 +286,19 @@ pub fn pairing_item(
         "components.daemon.runtime.sha256",
     ) {
         mismatches.push("runtime_sha256".to_string());
+    }
+    if let Some(component) = m.com0com() {
+        if com0com_component_sha256(manifest_dir, m).as_deref() != Some(component.sha256.as_str()) {
+            mismatches.push("com0com_sha256".to_string());
+        }
+        if !file_matches(
+            manifest_dir,
+            m,
+            "components.com0com.helper.path",
+            "components.com0com.helper.sha256",
+        ) {
+            mismatches.push("com0com_helper_sha256".to_string());
+        }
     }
 
     let actual_tree = package_tree_sha256(manifest_dir).ok();

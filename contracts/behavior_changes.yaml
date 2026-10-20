@@ -4,7 +4,7 @@
 # applies_to.python.min_version 為目標 release 版號（不代表 VERSION 已是該版）；rust_only 項目為 null。
 # 檔內不寫 contract_revision（tree SHA 只在 build／capture 時計算）。字串一律以雙引號呈現，避免 YAML 1.1 bool／日期陷阱。
 schema_version: 1
-revision: 2
+revision: 3
 changes:
   - id: "BC-01"
     kind: "BC"
@@ -601,7 +601,7 @@ changes:
   - id: "SC-18"
     kind: "SC"
     title: "Windows on-demand 首次需求啟動（Rust-only）"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -708,7 +708,7 @@ changes:
   - id: "SC-22"
     kind: "SC"
     title: "supervision-mode set（Rust-only）"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -734,7 +734,7 @@ changes:
   - id: "SC-23"
     kind: "SC"
     title: "setup --rollback 與 §12.1 七步更新流程（Rust-only）"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -760,7 +760,7 @@ changes:
   - id: "SC-24"
     kind: "SC"
     title: "監管模式 windows-task 與 windows-service（Rust-only）"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -863,6 +863,32 @@ changes:
     compatibility_impact: "BC-05 的 Windows remote 範圍延伸到 connect 與 benches；兩者在 Windows 上移除 REMOTE_NOT_SUPPORTED。"
     approval_conditions: "依調和表 PLT-D-08（BC-05 範圍）：延伸到 connect 與 benches，移除兩者在 Windows 上的 REMOTE_NOT_SUPPORTED（擁有者確認 #7，預設涵蓋）。"
     related_decisions: []
+  - id: "SC-36"
+    kind: "SC"
+    title: "Windows 安裝的 com0com 選用元件"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "hamanpaul"
+      date: "2026-10-16"
+      decision_ref: "OD-15"
+      basis: "owner_decision"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python: null
+      rust:
+        stage: "stage-1b"
+    approved_at_revision: 1
+    spec_refs: ["OD-15", "§9.5"]
+    reconciliation_refs: ["SC-36"]
+    scope: "rust_only"
+    ab_participation: "absolute_only"
+    phases: ["P4", "P8"]
+    case_ids: ["sc36-win-installer-com0com-optional"]
+    compatibility_impact: "Windows bundle 可選附 com0com 3.0.0.0；預設不安裝。基本安裝不需管理員，只有明確安裝或移除此元件時才以 UAC 啟動 bundle helper。UAC 拒絕或 helper 失敗不影響基本安裝；本體 rollback 不移除 driver。元件附 GPLv2 授權與原始碼提供資訊，Spike 1 剩餘項目通過前維持 experimental。"
+    approval_conditions: "依 OD-15：元件為預設不選取的 Windows 選項，helper 單獨提權；基本安裝與更新不提權，rollback 不操作 driver。Spike 1 剩餘項目需於 HVCI 開啟機台全數通過前維持 experimental:true。"
+    related_decisions: ["OD-15", "OD-01", "OD-08"]
   - id: "DF-01"
     kind: "DF"
     title: "event rule_id 路徑穿越防護"
@@ -995,7 +1021,7 @@ changes:
     ab_participation: "diff"
     phases: ["P1", "P4"]
     case_ids: ["df05-daemon-locate-order"]
-    compatibility_impact: "daemon start 的定位順序為 manifest launcher → 與 CLI 同目錄的 serialwrapd → Python -m sw_core.daemon fallback（POSIX 亦然）；不再 spawn 不存在的 serialwrapd.py。"
+    compatibility_impact: "daemon start 的定位順序為 manifest launcher → 與 CLI 同目錄的 serialwrapd → Python -m sw_core.daemon fallback（POSIX 亦然）；不再 spawn 不存在的 serialwrapd.py。Rust DAEMON_BINARY_NOT_FOUND message 為「找不到 serialwrapd（release manifest 的 launcher、CLI 同層 serialwrapd、manifest 的 Python runtime 皆不存在）；請確認發行包完整」。systemd-system setup 的 ExecStart 使用穩定入口 <InstallRoot.bin>/serialwrapd 絕對路徑，不搜尋 PATH；A/B unit 比較先將 ExecStart 可執行檔路徑正規化為 <serialwrapd>。"
     approval_conditions: "確認是缺陷（推論可重現 `DAEMON_EXITED`）。01 §12「POSIX 無 `-m` fallback」併入此列"
     related_decisions: []
   - id: "DF-06"
@@ -1028,7 +1054,7 @@ changes:
   - id: "DF-07"
     kind: "DF"
     title: "config.yaml 壞 YAML 的明確錯誤"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-15"
@@ -1109,7 +1135,7 @@ changes:
   - id: "DF-10"
     kind: "DF"
     title: "setup system scope 遷移目標"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-15"
@@ -1136,7 +1162,7 @@ changes:
   - id: "DF-11"
     kind: "DF"
     title: "WSL systemd sudo 閘門"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-15"
@@ -1163,7 +1189,7 @@ changes:
   - id: "DF-12"
     kind: "DF"
     title: "setup／reconcile ran 欄位"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-15"
@@ -1271,7 +1297,7 @@ changes:
   - id: "DF-16"
     kind: "DF"
     title: "Windows setup skill 複製目錄"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-15"

@@ -352,6 +352,9 @@ pub enum PalErrorKind {
     Io,
 }
 
+/// [`SysEnv::run`]／`run_merged` 逾時時 `CmdOutput.stderr` 的固定標記（呼叫端據此辨識逾時，非 RPC 錯誤碼）。
+pub const RUN_TIMEOUT_STDERR: &str = "TIMEOUT";
+
 pub trait SysEnv: Send + Sync {
     fn var(&self, k: &str) -> Option<String>;
     /// 以 `std::env::vars_os()` 實作再 lossy 轉換；不得用 `std::env::vars()`（遇非 UTF-8 會 panic）。
@@ -550,4 +553,5 @@ pub trait ProcessCtl: Send + Sync {
     fn spawn_elevated(&self, _exe: &Path, _args: &[String]) -> PalResult<ElevatedOutcome> {
         Err(PalError::plain(PalErrorKind::Unsupported, "不支援提權啟動"))
     }
+
 }

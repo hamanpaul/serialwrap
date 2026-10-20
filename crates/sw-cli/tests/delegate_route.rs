@@ -1,6 +1,8 @@
 //! 委派路由分類測試（P3-T10）；遞迴防護與 argv 指紋測試（P3-T16 追加）。
 use std::ffi::OsString;
-use sw_cli::delegate::{argv_sha256, check_recursion, classify, DelegateError, Route};
+use sw_cli::delegate::{
+    argv_sha256, check_recursion, classify, classify_with_groups, DelegateError, Route,
+};
 
 fn v(s: &str) -> Vec<OsString> {
     s.split_whitespace().map(OsString::from).collect()
@@ -9,13 +11,13 @@ fn v(s: &str) -> Vec<OsString> {
 #[test]
 fn classify_table() {
     let d = |g| Route::Delegate { group: g };
+    let groups = &["daemon", "setup", "doctor"];
     let cases: &[(&str, Route)] = &[
         ("", Route::Native),
         ("session list", Route::Native),
         ("session console-attach --selector A", Route::Native),
         ("daemon status", d("daemon")),
         ("--socket daemon session list", Route::Native),
-        // P4-T6：service 已原生（不再委派）；委派路由以仍委派的 doctor 保留覆蓋。
         ("--sock x service status", Route::Native),
         ("--sock x doctor", d("doctor")),
         ("--socket=x remote", Route::Native),
@@ -24,7 +26,6 @@ fn classify_table() {
         ("-- doctor", d("doctor")),
         ("-h", Route::Native),
         ("--version daemon", d("daemon")),
-        // P4-T9：connect、benches 已原生（不再委派）；委派路由以仍委派的 setup、doctor 保留覆蓋。
         ("--timeout -1 doctor", d("doctor")),
         ("--v setup", d("setup")),
         ("--bench", Route::Native),
@@ -32,11 +33,13 @@ fn classify_table() {
         ("--retries=2 doctor", d("doctor")),
         ("--socket connect", Route::Native),
         ("--endpoint=connect", Route::Native),
-        ("--ret 1 daemon start", d("daemon")),
+        ("--ret 1 setup --on-demand", d("setup")),
         ("profile test --profile p", Route::Native),
     ];
     for (argv, want) in cases {
-        assert_eq!(classify(&v(argv)), *want, "{argv:?}");
+        assert_eq!(classify_with_groups(&v(argv), groups), *want, "{argv:?}");
+        // P4-T14：DELEGATED_GROUPS 已清空，預設 classify 全數為 Native。
+        assert_eq!(classify(&v(argv)), Route::Native, "{argv:?}");
     }
 }
 
@@ -44,9 +47,38 @@ fn classify_table() {
 fn non_utf8_tokens() {
     let d = |g| Route::Delegate { group: g };
     let bad = sw_pal::fakes::non_utf8_os_string(&[0xff]);
+    let groups = &["daemon", "setup", "doctor"];
     assert_eq!(
-        classify(&[OsString::from("--socket"), bad.clone(), OsString::from("daemon")]),
+        classify_with_groups(
+            &[
+                OsString::from("--socket"),
+                bad.clone(),
+                OsString::from("daemon")
+            ],
+            groups
+        ),
         d("daemon")
+    );
+    assert_eq!(
+        classify_with_groups(&[bad.clone(), OsString::from("daemon")], groups),
+        Route::Native
+    );
+    assert_eq!(
+        classify_with_groups(
+            &[OsString::from("setup"), OsString::from("--user"), bad.clone()],
+            groups
+        ),
+        d("setup")
+    );
+
+    // DELEGATED_GROUPS 清空後一律為 Native
+    assert_eq!(
+        classify(&[
+            OsString::from("--socket"),
+            bad.clone(),
+            OsString::from("setup")
+        ]),
+        Route::Native
     );
     assert_eq!(
         classify(&[bad.clone(), OsString::from("daemon")]),
@@ -54,7 +86,7 @@ fn non_utf8_tokens() {
     );
     assert_eq!(
         classify(&[OsString::from("setup"), OsString::from("--user"), bad]),
-        d("setup")
+        Route::Native
     );
 }
 
@@ -62,10 +94,22 @@ fn non_utf8_tokens() {
 fn recursion_rules() {
     assert_eq!(check_recursion(None, None, "s"), Ok(0));
     assert_eq!(check_recursion(Some("1"), Some("other"), "s"), Ok(1));
-    assert_eq!(check_recursion(Some("2"), None, "s"), Err(DelegateError::Recursion));
-    assert_eq!(check_recursion(Some("0"), Some("s"), "s"), Err(DelegateError::Recursion));
-    assert_eq!(check_recursion(Some("x"), None, "s"), Err(DelegateError::Recursion));
-    assert_eq!(check_recursion(Some("１"), None, "s"), Err(DelegateError::Recursion));
+    assert_eq!(
+        check_recursion(Some("2"), None, "s"),
+        Err(DelegateError::Recursion)
+    );
+    assert_eq!(
+        check_recursion(Some("0"), Some("s"), "s"),
+        Err(DelegateError::Recursion)
+    );
+    assert_eq!(
+        check_recursion(Some("x"), None, "s"),
+        Err(DelegateError::Recursion)
+    );
+    assert_eq!(
+        check_recursion(Some("１"), None, "s"),
+        Err(DelegateError::Recursion)
+    );
 }
 
 #[test]
@@ -74,5 +118,5 @@ fn argv_sha_stable() {
     assert_eq!(a.len(), 64);
     assert_eq!(a, argv_sha256(&v("setup --user x")));
     assert_ne!(a, argv_sha256(&v("setup --user y")));
-    assert_ne!(argv_sha256(&v("a b")), argv_sha256(&v("ab")));   // 分隔符生效
+    assert_ne!(argv_sha256(&v("a b")), argv_sha256(&v("ab"))); // 分隔符生效
 }

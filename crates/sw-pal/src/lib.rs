@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 pub mod clock;
+pub mod com0com;
 pub mod device_source;
 #[cfg(feature = "test-fakes")]
 pub mod fakes;
@@ -20,7 +21,7 @@ pub mod service_ctl;
 pub mod sysenv;
 pub mod traits;
 
-pub use osstr::{join_os_pieces, split_os_str, OsPiece};
+pub use osstr::{join_os_pieces, os_string_from_bytes, split_os_str, OsPiece};
 pub use traits::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

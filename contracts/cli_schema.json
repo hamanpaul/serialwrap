@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/hamanpaul/serialwrap/contracts/cli_schema.json",
   "title": "serialwrap CLI contract",
-  "x-catalog-revision": 5,
+  "x-catalog-revision": 6,
   "x-prog": "serialwrap",
   "x-conventions": {
     "params_source": "rpc.params 的值為來源：字串為該子命令 argparse namespace 的 dest，送出 args.<dest> 原值；\"selector|com\" 表示 args.selector or args.com（盤點 01 §6.6 stream tail、§6.7 log tail-raw／tail-text）；{\"$document\": \"file\"} 表示 --file 讀入的整份 JSON 物件即為 RPC params（event add）。",
@@ -2537,6 +2537,9 @@
       "failure": 2,
       "codes": {
         "FLASHING_BUSY": 2,
+        "CHECKSUM_VERIFY_FAILED": 2,
+        "DEVICE_STILL_HELD": 2,
+        "SESSION_BUSY": 2,
         "TIMEOUT": 1
       },
       "note": "FLASHING_BUSY 為 2、reconcile 等待舊 daemon 逾時為 1；其他例外不攔截，印 Python traceback（exit 1）"
@@ -3050,22 +3053,49 @@
     "setup",
     "doctor"
   ],
-  "x-pending": [
+  "x-rust-only": [
     {
-      "id": "SC-22",
       "change": "SC-22",
-      "adds_subcommand": [
+      "subcommand": [
         "supervision-mode",
         "set"
+      ],
+      "options": [
+        "--with-sudo",
+        "--force"
       ]
     },
     {
-      "id": "SC-23",
       "change": "SC-23",
-      "adds_option": [
+      "option": [
         "setup",
         "--rollback"
-      ]
+      ],
+      "action": "store_true",
+      "dest": "rollback",
+      "default": false
+    },
+    {
+      "change": "SC-36",
+      "option": [
+        "setup",
+        "--with-com0com"
+      ],
+      "action": "store_true",
+      "dest": "with_com0com",
+      "default": false
+    },
+    {
+      "change": "SC-36",
+      "option": [
+        "setup",
+        "--remove-com0com"
+      ],
+      "action": "store_true",
+      "dest": "remove_com0com",
+      "default": false
     }
+  ],
+  "x-pending": [
   ]
 }

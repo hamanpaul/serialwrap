@@ -183,18 +183,43 @@ pub fn rpc_call_origin(
     retries: &PyInt,
     origin: ParamOrigin,
 ) -> Result<RpcOutcome, ClientCrash> {
+    rpc_call_origin_with_failure(p, endpoint, method, params, req_id, timeout_s, retries, origin)
+        .map(|(outcome, _)| outcome)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rpc_call_origin_with_failure(
+    p: &sw_pal::ClientPlatform,
+    endpoint: &str,
+    method: &str,
+    params: &PyValue,
+    req_id: i64,
+    timeout_s: f64,
+    retries: &PyInt,
+    origin: ParamOrigin,
+) -> Result<(RpcOutcome, Option<RpcFailure>), ClientCrash> {
     let started_ns = p.clock.mono_ns();
     let attempts = attempt_limit(retries, RETRYABLE_READONLY_METHODS.contains(&method));
     let mut delay_s = RETRY_BACKOFF_BASE_S;
     let mut retry_count = 0_i64;
     let mut last_errno = None;
+    let mut last_failure = None;
     let mut response = PyDict::new();
 
     for attempt in 0..attempts {
-        let (current, errno) =
-            rpc_call_once_origin(p, endpoint, method, params, req_id, timeout_s, origin)?;
+        let (current, errno, failure) = rpc_call_once_capped_origin_meta(
+            p,
+            endpoint,
+            method,
+            params,
+            req_id,
+            timeout_s,
+            CLIENT_RESPONSE_MAX_BYTES,
+            origin,
+        )?;
         response = current;
         last_errno = errno;
+        last_failure = failure;
 
         let transient = matches!(response.get("error_code"), Some(PyValue::Str(code))
             if TRANSIENT_ERROR_CODES.contains(&code.as_str()));
@@ -223,15 +248,18 @@ pub fn rpc_call_origin(
         .and_then(|code| i32::try_from(code).ok())
         .and_then(|code| p.env.errno_name(code))
         .map(str::to_string);
-    Ok(RpcOutcome {
-        resp: response,
-        meta: TraceMeta {
-            elapsed_ms,
-            retry_count,
-            errno: last_errno,
-            errno_name,
+    Ok((
+        RpcOutcome {
+            resp: response,
+            meta: TraceMeta {
+                elapsed_ms,
+                retry_count,
+                errno: last_errno,
+                errno_name,
+            },
         },
-    })
+        last_failure,
+    ))
 }
 
 /// 只供測試以小上限驗 response cap；產品路徑一律用 `CLIENT_RESPONSE_MAX_BYTES`。
@@ -268,9 +296,26 @@ fn rpc_call_once_capped_origin(
     max_bytes: usize,
     origin: ParamOrigin,
 ) -> Result<(PyDict, Option<i64>), ClientCrash> {
+    rpc_call_once_capped_origin_meta(
+        p, endpoint, method, params, req_id, timeout_s, max_bytes, origin,
+    )
+    .map(|(resp, errno, _)| (resp, errno))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rpc_call_once_capped_origin_meta(
+    p: &sw_pal::ClientPlatform,
+    endpoint: &str,
+    method: &str,
+    params: &PyValue,
+    req_id: i64,
+    timeout_s: f64,
+    max_bytes: usize,
+    origin: ParamOrigin,
+) -> Result<(PyDict, Option<i64>, Option<RpcFailure>), ClientCrash> {
     let parsed = match parse_endpoint(endpoint) {
         Ok(parsed) => parsed,
-        Err(error) => return Ok((failure(ErrorCode::InvalidEndpoint, Some(error.0)), None)),
+        Err(error) => return Ok((failure(ErrorCode::InvalidEndpoint, Some(error.0)), None, None)),
     };
 
     let (spec, timeout) = match parsed {
@@ -284,6 +329,7 @@ fn rpc_call_once_capped_origin(
                             sw_proto::pyfmt::py_repr_argv(endpoint)
                         )),
                     ),
+                    None,
                     None,
                 ));
             }
@@ -300,7 +346,7 @@ fn rpc_call_once_capped_origin(
                 ));
             }
             if let Err(error) = p.rpc.resolve_tcp(&host, port) {
-                return Ok((socket_error(error.clone()), error.os_code.map(i64::from)));
+                return Ok((socket_error(error.clone()), error.os_code.map(i64::from), None));
             }
             (EndpointSpec::Tcp { host, port }, sock_timeout(timeout_s)?)
         }
@@ -309,11 +355,28 @@ fn rpc_call_once_capped_origin(
     let mut stream = match p.rpc.connect(&spec, timeout) {
         Ok(stream) => stream,
         Err(error) if error.kind == PalErrorKind::TimedOut => {
-            return Ok((failure(ErrorCode::Timeout, None), None));
+            return Ok((
+                failure(ErrorCode::Timeout, None),
+                None,
+                Some(RpcFailure {
+                    phase: FailPhase::Connect,
+                    pal_kind: Some(error.kind),
+                    maybe_sent: false,
+                }),
+            ));
         }
         Err(error) => {
             let errno = error.os_code.map(i64::from);
-            return Ok((socket_error(error), errno));
+            let kind = error.kind;
+            return Ok((
+                socket_error(error),
+                errno,
+                Some(RpcFailure {
+                    phase: FailPhase::Connect,
+                    pal_kind: Some(kind),
+                    maybe_sent: false,
+                }),
+            ));
         }
     };
 
@@ -326,10 +389,27 @@ fn rpc_call_once_capped_origin(
     }
     if let Err(error) = stream.send_all(&encode_request(req_id, method, params)) {
         if error.kind == PalErrorKind::TimedOut {
-            return Ok((failure(ErrorCode::Timeout, None), None));
+            return Ok((
+                failure(ErrorCode::Timeout, None),
+                None,
+                Some(RpcFailure {
+                    phase: FailPhase::Send,
+                    pal_kind: Some(error.kind),
+                    maybe_sent: true,
+                }),
+            ));
         }
         let errno = error.os_code.map(i64::from);
-        return Ok((socket_error(error), errno));
+        let kind = error.kind;
+        return Ok((
+            socket_error(error),
+            errno,
+            Some(RpcFailure {
+                phase: FailPhase::Send,
+                pal_kind: Some(kind),
+                maybe_sent: true,
+            }),
+        ));
     }
 
     let mut bytes = Vec::new();
@@ -338,11 +418,28 @@ fn rpc_call_once_capped_origin(
         let read = match stream.recv(&mut chunk) {
             Ok(read) => read,
             Err(error) if error.kind == PalErrorKind::TimedOut => {
-                return Ok((failure(ErrorCode::Timeout, None), None));
+                return Ok((
+                    failure(ErrorCode::Timeout, None),
+                    None,
+                    Some(RpcFailure {
+                        phase: FailPhase::Recv,
+                        pal_kind: Some(error.kind),
+                        maybe_sent: true,
+                    }),
+                ));
             }
             Err(error) => {
                 let errno = error.os_code.map(i64::from);
-                return Ok((socket_error(error), errno));
+                let kind = error.kind;
+                return Ok((
+                    socket_error(error),
+                    errno,
+                    Some(RpcFailure {
+                        phase: FailPhase::Recv,
+                        pal_kind: Some(kind),
+                        maybe_sent: true,
+                    }),
+                ));
             }
         };
         if read == 0 {
@@ -354,7 +451,7 @@ fn rpc_call_once_capped_origin(
             break;
         }
         if bytes.len() > max_bytes {
-            return Ok((failure(ErrorCode::InvalidResponse, None), None));
+            return Ok((failure(ErrorCode::InvalidResponse, None), None, None));
         }
     }
 
@@ -364,13 +461,13 @@ fn rpc_call_once_capped_origin(
         .unwrap_or(bytes.len());
     let line = trim_ascii(&bytes[..line_end]);
     if line.is_empty() {
-        return Ok((failure(ErrorCode::EmptyResponse, None), None));
+        return Ok((failure(ErrorCode::EmptyResponse, None), None, None));
     }
 
     let decoded = String::from_utf8_lossy(line);
     match loads(&decoded) {
-        Ok(PyValue::Dict(response)) => Ok((response, None)),
-        Ok(_) | Err(_) => Ok((failure(ErrorCode::InvalidResponse, None), None)),
+        Ok(PyValue::Dict(response)) => Ok((response, None, None)),
+        Ok(_) | Err(_) => Ok((failure(ErrorCode::InvalidResponse, None), None, None)),
     }
 }
 
@@ -455,7 +552,7 @@ pub struct RpcFailure {
     pub maybe_sent: bool,
 }
 
-/// 同 `call`，另回傳型別化失敗 metadata（P4-T7 紅燈骨架）。
+/// 同 `call`，另回傳型別化失敗 metadata（SC-18 判斷依據）。
 pub fn call_with_failure(
     ctx: &crate::ctx::CliCtx,
     ep: &str,
@@ -463,8 +560,30 @@ pub fn call_with_failure(
     params: &PyValue,
     timeout_s: f64,
     retries: &PyInt,
-) -> (RpcOutcome, Option<RpcFailure>) {
-    todo!("P4-T7: call_with_failure")
+) -> Result<(RpcOutcome, Option<RpcFailure>), ClientCrash> {
+    call_with_failure_origin(ctx, ep, method, params, timeout_s, retries, ParamOrigin::Argv)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_with_failure_origin(
+    ctx: &crate::ctx::CliCtx,
+    ep: &str,
+    method: &str,
+    params: &PyValue,
+    timeout_s: f64,
+    retries: &PyInt,
+    origin: ParamOrigin,
+) -> Result<(RpcOutcome, Option<RpcFailure>), ClientCrash> {
+    rpc_call_origin_with_failure(
+        ctx.p,
+        ep,
+        method,
+        params,
+        1,
+        timeout_s,
+        retries,
+        origin,
+    )
 }
 
 pub fn call(

@@ -1,15 +1,13 @@
-"""P4-T10 `setup` 與 `supervision-mode set` 黑箱契約（SC-12、SC-22、SC-24、DF-10～DF-13、DF-16）。
+"""P4-T10 `setup` 與 `supervision-mode set` 黑箱契約。
 
-A/B 案例（on-demand 隔離、stub systemctl user setup、reconcile timeout）同時執行 Python 基線與受測 CLI，
-比對輸出與物化樹。
-預設執行（Python 基線）時 A/B 案例應通過（Python 對 Python）；以 SERIALWRAP_AB_LABEL=rust-1b
-執行時，setup 與 supervision-mode 仍委派 sentinel（exit 97），因此案例應失敗（紅燈，exit 97）。
+A/B 案例會在隔離目錄、stub PATH 與測試 daemon 下比較 Python 基線和受測 CLI。
 """
 from __future__ import annotations
 
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import threading
@@ -37,6 +35,26 @@ def _get_cli_prefix() -> list[str]:
     return pref
 
 
+def _reconcile_cli_prefix(work: Path) -> list[str]:
+    """setup reconcile A/B 的受測入口：比對的是「已安裝 CLI 的 setup」語意（Task 10）。
+
+    直接執行 bundle 內 `bin/serialwrap` 時，旁邊的 `release-manifest.json` 會使 Rust CLI 走 §12.1
+    首次安裝／更新流程（SC-23，Rust-only，由 test_cli_mgmt_update.py 承接），與 Python `setup` 不可比。
+    故把同一個受測執行檔複製到沒有 release manifest 的目錄後執行；Python 前綴（.py 或直譯器）原樣使用。
+    """
+    pref = _get_cli_prefix()
+    if len(pref) != 1:
+        return pref
+    exe = Path(pref[0])
+    if not (exe.parent.parent / "release-manifest.json").is_file():
+        return pref
+    dest_dir = work / "rust-cli" / "bin"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / exe.name
+    shutil.copy2(exe, dest)
+    return [str(dest)]
+
+
 def _stub_path(work: Path) -> str:
     bin_dir = work / "exec_bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
@@ -57,9 +75,10 @@ def _normalize_output(text: str, work: Path) -> str:
 
 def test_setup_ab_on_demand_isolated(tmp_path: Path) -> None:
     results: dict[str, tuple[int, str, list[str]]] = {}
-    for label, prefix in (("python", python_baseline_prefix()), ("cli", _get_cli_prefix())):
+    for label in ("python", "cli"):
         work = tmp_path / label
         work.mkdir()
+        prefix = python_baseline_prefix() if label == "python" else _reconcile_cli_prefix(work)
         env = isolated_env(work)
         env["PATH"] = _stub_path(work)
         proc = subprocess.run(
@@ -87,9 +106,10 @@ def test_setup_ab_on_demand_isolated(tmp_path: Path) -> None:
 
 def test_setup_ab_user_with_stub_systemctl(tmp_path: Path) -> None:
     results: dict[str, tuple[int, str, str]] = {}
-    for label, prefix in (("python", python_baseline_prefix()), ("cli", _get_cli_prefix())):
+    for label in ("python", "cli"):
         work = tmp_path / label
         work.mkdir()
+        prefix = python_baseline_prefix() if label == "python" else _reconcile_cli_prefix(work)
         env = isolated_env(work)
         env["PATH"] = _stub_path(work)
 
@@ -157,11 +177,13 @@ def test_setup_ab_user_with_stub_systemctl(tmp_path: Path) -> None:
     assert results["cli"][2] == results["python"][2]
 
 
+@pytest.mark.case("sc12-reconcile-wait-old-daemon")
 def test_setup_ab_reconcile_timeout(tmp_path: Path) -> None:
     results: dict[str, tuple[int, str]] = {}
-    for label, prefix in (("python", python_baseline_prefix()), ("cli", _get_cli_prefix())):
+    for label in ("python", "cli"):
         work = tmp_path / label
         work.mkdir()
+        prefix = python_baseline_prefix() if label == "python" else _reconcile_cli_prefix(work)
         env = isolated_env(work)
         env["PATH"] = _stub_path(work)
 

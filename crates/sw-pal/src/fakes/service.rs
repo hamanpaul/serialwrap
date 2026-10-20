@@ -5,7 +5,10 @@
 #![allow(unused_variables)]
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 
 use crate::service_ctl::{
     AutostartHoldKind, AutostartHoldRecord, CmdRecord, HoldState, ServiceAction, ServiceCtl,
@@ -34,7 +37,9 @@ fn action_name(action: ServiceAction) -> &'static str {
 
 fn kind_for(mode: &SupervisionMode) -> AutostartHoldKind {
     match mode {
-        SupervisionMode::SystemdUser | SupervisionMode::SystemdSystem => AutostartHoldKind::SystemdDropIn,
+        SupervisionMode::SystemdUser | SupervisionMode::SystemdSystem => {
+            AutostartHoldKind::SystemdDropIn
+        }
         SupervisionMode::WindowsTask => AutostartHoldKind::TaskDisabled,
         SupervisionMode::WindowsService => AutostartHoldKind::ServiceDisabled,
         _ => AutostartHoldKind::NoSupervisor,
@@ -48,8 +53,12 @@ pub struct FakeServiceCtl {
     responses: Mutex<VecDeque<ServiceResult>>,
     query_seq: Mutex<VecDeque<TaskQuery>>,
     last_query: Mutex<Option<TaskQuery>>,
-    held: Mutex<bool>,
+    held: Arc<AtomicBool>,
+    ignore_hold: AtomicBool,
+    hold_prior_restart: Mutex<Option<String>>,
     model: Mutex<Option<ServiceModelState>>,
+    hard_stop_rpc: Mutex<Option<(Arc<super::rpc::FakeRpcConnector>, String)>>,
+    start_spawn_counter: Mutex<Option<Arc<std::sync::atomic::AtomicUsize>>>,
 }
 
 /// 有狀態監管模型的快照（`FakeServiceCtl::set_model`／`query_now`）：`enabled` 為 `None` 表示未註冊。
@@ -98,7 +107,8 @@ impl FakeServiceCtl {
     /// 設定有狀態模型（`TestEnv::with_supervisor_state` 使用）：之後的 start／stop／restart／hard_stop／set_enabled
     /// 會更新 `enabled`／`running`，未腳本化的 `query` 由此狀態推導（`enabled==Some(false)`→`Disabled`、running→`Running`、其餘→`Ready`）。
     pub fn set_model(&self, enabled: Option<bool>, running: bool) {
-        *self.model.lock().unwrap_or_else(|e| e.into_inner()) = Some(ServiceModelState { enabled, running });
+        *self.model.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(ServiceModelState { enabled, running });
     }
 
     /// 目前有狀態模型的快照。
@@ -112,9 +122,41 @@ impl FakeServiceCtl {
             })
     }
 
+    /// 配置 hard stop 後要停止的測試 RPC endpoint。
+    pub fn stop_rpc_on_hard_stop(&self, rpc: Arc<super::rpc::FakeRpcConnector>, endpoint: &str) {
+        *self.hard_stop_rpc.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((rpc, endpoint.to_string()));
+    }
+
+    /// 模擬受監管器啟動 daemon，解除 RPC 替身的 spawn gate，但不記成 CLI 直接 spawn。
+    pub fn set_start_spawn_counter(&self, counter: Arc<std::sync::atomic::AtomicUsize>) {
+        *self
+            .start_spawn_counter
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(counter);
+    }
+
     /// 目前 autostart hold 狀態。
     pub fn hold_state_now(&self) -> HoldState {
         self.autostart_hold_state(&SupervisionMode::OnDemand)
+    }
+
+    /// 監管 hold 狀態的共享旗標，供 RPC 替身模擬 RestartOnFailure。
+    pub fn hold_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.held)
+    }
+
+    /// 設定假監管器是否忽略自動啟動 hold。
+    pub fn set_ignore_hold(&self, ignore: bool) {
+        self.ignore_hold.store(ignore, Ordering::SeqCst);
+    }
+
+    /// 設定假 systemd hold 所觀察到的 Restart 原值。
+    pub fn set_hold_prior_restart(&self, restart: Option<String>) {
+        *self
+            .hold_prior_restart
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = restart;
     }
 
     /// 記錄被監管拉起的 pid 清單。
@@ -132,7 +174,12 @@ impl FakeServiceCtl {
         self.actions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push((super::next_event_seq(), mode_name(mode), action.to_string(), with_sudo));
+            .push((
+                super::next_event_seq(),
+                mode_name(mode),
+                action.to_string(),
+                with_sudo,
+            ));
         let mut model = self.model.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(m) = model.as_mut() {
             match action {
@@ -141,6 +188,16 @@ impl FakeServiceCtl {
                 "set_enabled:true" => m.enabled = Some(true),
                 "set_enabled:false" => m.enabled = Some(false),
                 _ => {}
+            }
+        }
+        if action == "hard_stop" {
+            if let Some((rpc, endpoint)) = self
+                .hard_stop_rpc
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+            {
+                rpc.stop_endpoint(endpoint);
             }
         }
     }
@@ -173,9 +230,42 @@ impl ServiceCtl for FakeServiceCtl {
         self.modes.clone()
     }
 
-    fn action(&self, mode: &SupervisionMode, action: ServiceAction, with_sudo: bool) -> ServiceResult {
+    fn action(
+        &self,
+        mode: &SupervisionMode,
+        action: ServiceAction,
+        with_sudo: bool,
+    ) -> ServiceResult {
         self.log(mode, action_name(action), with_sudo);
-        self.next_result(mode, action_name(action))
+        if action == ServiceAction::Start {
+            if let Some(counter) = self
+                .start_spawn_counter
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+            {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let mut result = self.next_result(mode, action_name(action));
+        if action == ServiceAction::Start
+            && self.held.load(Ordering::SeqCst)
+            && !self.ignore_hold.load(Ordering::SeqCst)
+        {
+            if let Some(model) = self
+                .model
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_mut()
+            {
+                model.running = false;
+            }
+            result.ok = false;
+            result.rc = Some(1);
+            result.error_code = Some("INTERNAL_ERROR".into());
+            result.hint = Some("autostart hold 生效中，拒絕啟動".into());
+        }
+        result
     }
 
     fn action_named(
@@ -203,18 +293,32 @@ impl ServiceCtl for FakeServiceCtl {
         Vec::new()
     }
 
-    fn uninstall_named(&self, mode: &SupervisionMode, _name: &str, with_sudo: bool) -> Vec<CmdRecord> {
+    fn uninstall_named(
+        &self,
+        mode: &SupervisionMode,
+        _name: &str,
+        with_sudo: bool,
+    ) -> Vec<CmdRecord> {
         self.log(mode, "uninstall", with_sudo);
         Vec::new()
     }
 
-    fn set_enabled(&self, mode: &SupervisionMode, enabled: bool, with_sudo: bool) -> Vec<CmdRecord> {
+    fn set_enabled(
+        &self,
+        mode: &SupervisionMode,
+        enabled: bool,
+        with_sudo: bool,
+    ) -> Vec<CmdRecord> {
         self.log(mode, &format!("set_enabled:{enabled}"), with_sudo);
         Vec::new()
     }
 
     fn query(&self, _mode: &SupervisionMode) -> TaskQuery {
-        let next = self.query_seq.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+        let next = self
+            .query_seq
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front();
         let mut last = self.last_query.lock().unwrap_or_else(|e| e.into_inner());
         match next {
             Some(q) => {
@@ -254,14 +358,18 @@ impl ServiceCtl for FakeServiceCtl {
         if !scripted.ok {
             return Err(scripted);
         }
-        *self.held.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.held.store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(AutostartHoldRecord {
             mode: mode.clone(),
             kind: kind_for(mode),
             name: None,
             dropin_path: None,
             prior_enabled: None,
-            prior_restart: None,
+            prior_restart: self
+                .hold_prior_restart
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone(),
             ran: Vec::new(),
         })
     }
@@ -282,12 +390,12 @@ impl ServiceCtl for FakeServiceCtl {
         if !scripted.ok {
             return Err(scripted);
         }
-        *self.held.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        self.held.store(false, std::sync::atomic::Ordering::SeqCst);
         Ok(Vec::new())
     }
 
     fn autostart_hold_state(&self, _mode: &SupervisionMode) -> HoldState {
-        if *self.held.lock().unwrap_or_else(|e| e.into_inner()) {
+        if self.held.load(std::sync::atomic::Ordering::SeqCst) {
             HoldState::Held
         } else {
             HoldState::NotHeld

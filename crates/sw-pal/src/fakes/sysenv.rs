@@ -55,6 +55,7 @@ pub struct FakeSysEnv {
     calls: Mutex<Vec<(u64, Vec<String>)>>,
     call_envs: Mutex<Vec<Option<Vec<(OsString, OsString)>>>>,
     timeouts: Mutex<Vec<Option<Duration>>>,
+    start_spawn_counter: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 #[derive(Debug, Default)]
@@ -68,10 +69,32 @@ pub struct FakeSysEnvBuilder {
     groups: Vec<String>,
     which: BTreeMap<String, Vec<PathBuf>>,
     local_appdata: Option<PathBuf>,
+    start_spawn_counter: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 fn owned_argv(argv: &[&str]) -> Vec<String> {
     argv.iter().map(|s| s.to_string()).collect()
+}
+
+fn is_supervisor_start(argv: &[String]) -> bool {
+    if argv
+        .first()
+        .is_some_and(|program| program.ends_with("schtasks") || program.ends_with("schtasks.exe"))
+    {
+        return argv.iter().any(|arg| arg.eq_ignore_ascii_case("/Run"));
+    }
+    argv.iter().any(|arg| arg == "start")
+        && argv.iter().any(|arg| arg == "serialwrap")
+        && argv.iter().any(|arg| arg == "systemctl")
+}
+
+fn bundled_cli_version(path: &str) -> Option<String> {
+    let parts = path.split(|ch| ch == '/' || ch == '\\').collect::<Vec<_>>();
+    let index = parts.iter().position(|part| *part == "versions")?;
+    parts
+        .get(index + 1)
+        .filter(|version| !version.is_empty())
+        .map(|version| (*version).to_string())
 }
 
 fn push_script(script: &mut Script, argv: Vec<String>, step: Scripted) {
@@ -211,6 +234,15 @@ impl FakeSysEnvBuilder {
         self
     }
 
+    /// 受監管模式的 start 指令成功時，增加測試 daemon 的啟動計數。
+    pub fn start_spawn_counter(
+        mut self,
+        counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.start_spawn_counter = Some(counter);
+        self
+    }
+
     pub fn current_exe(mut self, p: &Path) -> Self {
         self.inner.exe = p.to_path_buf();
         self
@@ -296,6 +328,7 @@ impl FakeSysEnvBuilder {
             calls: Mutex::new(Vec::new()),
             call_envs: Mutex::new(Vec::new()),
             timeouts: Mutex::new(Vec::new()),
+            start_spawn_counter: self.start_spawn_counter,
         })
     }
 }
@@ -339,7 +372,38 @@ impl SysEnv for FakeSysEnv {
 
     fn run(&self, argv: &[String], timeout: Option<Duration>) -> PalResult<CmdOutput> {
         self.record(argv, None, timeout);
-        match self.respond(argv) {
+        let response = self.respond(argv).or_else(|| {
+            if argv.len() == 2
+                && argv[1] == "--version"
+                && (argv[0].ends_with("serialwrap") || argv[0].ends_with("serialwrap.exe"))
+            {
+                let version = bundled_cli_version(&argv[0]).unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+                Some(Scripted::Out {
+                    rc: 0,
+                    stdout: format!("serialwrap {version}\n").into_bytes(),
+                    stderr: Vec::new(),
+                })
+            } else if argv == ["schtasks", "/Query", "/TN", "serialwrap", "/XML"] {
+                Some(Scripted::Out {
+                    rc: 0,
+                    stdout: b"<?xml version=\"1.0\" encoding=\"UTF-16\"?><Task><Settings><Enabled>true</Enabled></Settings></Task>".to_vec(),
+                    stderr: Vec::new(),
+                })
+            } else {
+                None
+            }
+        });
+        let rc = match &response {
+            Some(Scripted::Out { rc, .. }) | Some(Scripted::Merged { rc, .. }) => *rc,
+            Some(Scripted::Fail { .. }) => -1,
+            None => 0,
+        };
+        if rc == 0 && is_supervisor_start(argv) {
+            if let Some(counter) = &self.start_spawn_counter {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        match response {
             Some(Scripted::Out { rc, stdout, stderr }) => Ok(CmdOutput {
                 rc,
                 stdout: String::from_utf8_lossy(&stdout).into_owned(),

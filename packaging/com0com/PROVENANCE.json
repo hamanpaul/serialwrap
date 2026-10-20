@@ -1,0 +1,9 @@
+{
+  "upstream_file": "com0com-3.0.0.0-i386-and-x64-signed.zip",
+  "md5": "a07aa80024cca837dacc75d3573285ff",
+  "sha256": "6e5d4359865277430d4ae88c73fb7e648a0ed8e81aea5002478179cfcb0bb0e1",
+  "authenticode_signer": "CyberCircuits",
+  "timestamp_authority": "COMODO",
+  "spike1_evidence": "擁有者 host 的 b-log 下 rust-refactor/spike1/；剩餘項目仍待 HVCI 開啟機台驗證",
+  "experimental": true
+}

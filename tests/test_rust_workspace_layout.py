@@ -11,7 +11,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 pytestmark = [pytest.mark.core_portable, pytest.mark.process_rpc]
 
-CRATES = ["sw-proto", "sw-pal", "sw-core", "sw-daemon", "sw-cli"]
+CRATES = ["sw-proto", "sw-pal", "sw-core", "sw-daemon", "sw-cli", "sw-com0com-helper"]
 
 
 @pytest.fixture(autouse=True)

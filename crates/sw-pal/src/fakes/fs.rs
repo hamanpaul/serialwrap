@@ -86,13 +86,15 @@ pub struct FaultFs {
     replace_fault_contains: Mutex<Option<String>>,
     write_target_fault_suffix: Mutex<Option<String>>,
     copy_tree_fault: Mutex<bool>,
-    lock_block: Mutex<Option<(
-        PathBuf,
-        std::sync::Arc<super::clock::FakeClock>,
-        Option<u64>,
-        Option<(PathBuf, Vec<u8>)>,
-        bool,
-    )>>,
+    lock_block: Mutex<
+        Option<(
+            PathBuf,
+            std::sync::Arc<super::clock::FakeClock>,
+            Option<u64>,
+            Option<(PathBuf, Vec<u8>)>,
+            bool,
+        )>,
+    >,
 }
 
 impl std::fmt::Debug for FaultFs {
@@ -115,28 +117,44 @@ impl FaultFs {
 
     /// `replace(from, to)` 的 `from` 以此後綴結尾時回 `Io` 錯誤。
     pub fn fail_replace_when_src_ends_with(&self, suffix: &str) {
-        *self.replace_fault_suffix.lock().unwrap_or_else(|e| e.into_inner()) = Some(suffix.to_string());
+        *self
+            .replace_fault_suffix
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(suffix.to_string());
     }
 
     /// `replace(from, to)` 的來源路徑含有此字串時回 `Io` 錯誤。
     pub fn fail_replace_when_src_contains(&self, part: &str) {
-        *self.replace_fault_contains.lock().unwrap_or_else(|e| e.into_inner()) = Some(part.to_string());
+        *self
+            .replace_fault_contains
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(part.to_string());
     }
 
     /// 寫入目標以此後綴結尾時回 `Io` 錯誤：涵蓋 `atomic_write(p)`、`write_file(p)` 與 `replace(_, to)`
     /// （平台中立地模擬目標檔不可寫，取代以 `cfg(unix)` chmod 的作法）。
     pub fn fail_writes_to_suffix(&self, suffix: &str) {
-        *self.write_target_fault_suffix.lock().unwrap_or_else(|e| e.into_inner()) = Some(suffix.to_string());
+        *self
+            .write_target_fault_suffix
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(suffix.to_string());
     }
 
     fn write_target_faulted(&self, target: &Path) -> bool {
-        let fault = self.write_target_fault_suffix.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let fault = self
+            .write_target_fault_suffix
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         matches!(fault, Some(suffix) if target.to_string_lossy().ends_with(&suffix))
     }
 
     /// 之後的 `copy_tree` 一律失敗。
     pub fn fail_copy_tree(&self) {
-        *self.copy_tree_fault.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        *self
+            .copy_tree_fault
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = true;
     }
 
     /// 模擬另一個行程持有鎖，直到假時鐘到達指定時間；`None` 表示一直持有。
@@ -204,8 +222,16 @@ impl crate::fs_ops::FsOps for FaultFs {
         self.inner.mkdirs(p)
     }
     fn replace(&self, from: &Path, to: &Path) -> PalResult<()> {
-        let fault = self.replace_fault_suffix.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let contains = self.replace_fault_contains.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let fault = self
+            .replace_fault_suffix
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let contains = self
+            .replace_fault_contains
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let from_text = from.to_string_lossy();
         if matches!(fault, Some(suffix) if from_text.ends_with(&suffix))
             || matches!(contains, Some(part) if from_text.contains(&part))
@@ -223,8 +249,15 @@ impl crate::fs_ops::FsOps for FaultFs {
     fn copy_preserving(&self, from: &Path, to: &Path) -> PalResult<()> {
         self.inner.copy_preserving(from, to)
     }
+    fn sync_file(&self, p: &Path) -> PalResult<()> {
+        self.inner.sync_file(p)
+    }
     fn copy_tree(&self, from: &Path, to: &Path) -> PalResult<()> {
-        if *self.copy_tree_fault.lock().unwrap_or_else(|e| e.into_inner()) {
+        if *self
+            .copy_tree_fault
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
             return Err(PalError::plain(PalErrorKind::Io, "fake copy_tree fault"));
         }
         self.inner.copy_tree(from, to)
@@ -244,14 +277,25 @@ impl crate::fs_ops::FsOps for FaultFs {
     fn symlink_file(&self, link: &Path, target: &Path) -> PalResult<()> {
         self.inner.symlink_file(link, target)
     }
-    fn symlink_or_copy_dir(&self, link: &Path, target: &Path) -> PalResult<crate::fs_ops::LinkKind> {
+    fn symlink_or_copy_dir(
+        &self,
+        link: &Path,
+        target: &Path,
+    ) -> PalResult<crate::fs_ops::LinkKind> {
         self.inner.symlink_or_copy_dir(link, target)
     }
-    fn file_lock_exclusive(&self, p: &Path, blocking: bool) -> PalResult<crate::fs_ops::FileLockGuard> {
+    fn file_lock_exclusive(
+        &self,
+        p: &Path,
+        blocking: bool,
+    ) -> PalResult<crate::fs_ops::FileLockGuard> {
         let mut lock_block = self.lock_block.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((path, clock, release_at_ns, file, created)) = lock_block.as_mut() {
             if path == p && release_at_ns.is_none_or(|release| clock.mono_ns() < release) {
-                return Err(PalError::plain(PalErrorKind::WouldBlock, "fake external lock holder"));
+                return Err(PalError::plain(
+                    PalErrorKind::WouldBlock,
+                    "fake external lock holder",
+                ));
             }
             if path == p && !*created {
                 if let Some((target, contents)) = file {
@@ -265,4 +309,8 @@ impl crate::fs_ops::FsOps for FaultFs {
     }
 }
 
-impl crate::fs_ops::FsOps for MemFs {}
+impl crate::fs_ops::FsOps for MemFs {
+    fn sync_file(&self, _p: &Path) -> PalResult<()> {
+        Ok(())
+    }
+}

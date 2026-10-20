@@ -237,12 +237,29 @@ def apply_rust_only(parser: argparse.ArgumentParser) -> None:
             help="回滾到上一個完整發佈組合（Previous）",
         ),
     ]
+    com0com_mutex = setup.add_mutually_exclusive_group()
+    com0com_added = [
+        com0com_mutex.add_argument(
+            "--with-com0com",
+            dest="with_com0com",
+            action="store_true",
+            help="Windows：選擇安裝實驗性的 com0com 虛擬序列埠（僅此選用元件會要求 UAC）",
+        ),
+        com0com_mutex.add_argument(
+            "--remove-com0com",
+            dest="remove_com0com",
+            action="store_true",
+            help="Windows：移除 com0com 預設虛擬序列埠 pair",
+        ),
+    ]
     # argparse 的互斥群組只在成員於 `_actions` 中連續時才以 `a | b` 顯示用法；把新成員移到既有群組成員之後，
     # 讓 golden 反映「同一互斥群組」的語意（Rust emulator 亦以群組整體渲染）。
     anchor = next(a for a in setup._actions if a.dest == "on_demand")
     rest = [a for a in setup._actions if a not in added]
     position = rest.index(anchor) + 1
     setup._actions[:] = rest[:position] + added + rest[position:]
+    # 保留新選項在 CLI 規格中的順序，且只讓兩個 com0com 動作互斥。
+    setup._actions.extend(action for action in com0com_added if action not in setup._actions)
 
 
 def write_rust_only(out_dir: Path) -> list[Path]:

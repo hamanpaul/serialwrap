@@ -124,10 +124,24 @@ pub fn run(
         io,
         verbose: 0,
         cli_version: CLI_VERSION,
+        autostart_lock: None,
     };
 
     let tail: &[OsString] = argv.get(1..).unwrap_or(&[]);
-    if let delegate::Route::Delegate { group } = delegate::classify(tail) {
+    let delegate_route = if let Some(test_group) = ctx.env.get("SERIALWRAP_TEST_DELEGATE_GROUP") {
+        const CANDIDATES: [&'static str; 8] = [
+            "daemon", "service", "supervision-mode", "remote", "connect", "benches", "setup",
+            "doctor",
+        ];
+        if let Some(&matched) = CANDIDATES.iter().find(|g| **g == test_group) {
+            delegate::classify_with_groups(tail, &[matched])
+        } else {
+            delegate::classify(tail)
+        }
+    } else {
+        delegate::classify(tail)
+    };
+    if let delegate::Route::Delegate { group } = delegate_route {
         return delegate::run_delegate(&mut ctx, tail, group);
     }
 

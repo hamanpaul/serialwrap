@@ -195,6 +195,15 @@ fn directory_delegate_entry_is_reported() {
 #[test]
 fn run_delegate_increments_depth_and_executes_once_with_three_environment_values() {
     let fixture = Fixture::new(Some("1"));
+    fixture
+        .env
+        .vars
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(
+            "SERIALWRAP_TEST_DELEGATE_GROUP".to_string(),
+            "doctor".to_string(),
+        );
     fixture.install_current_release();
     fixture.install_manifest();
     fixture.write_entry();

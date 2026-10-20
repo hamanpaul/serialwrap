@@ -14,24 +14,25 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use sw_cli::ctx::{CliCtx, TextIo};
 use sw_pal::fakes::fs::FaultFs;
+pub use sw_pal::fakes::service::ServiceModelState;
 use sw_pal::fakes::{
     platform, posix_caps, real_fs, windows_caps, FakeClock, FakeProcScan, FakeProcessCtl,
     FakeRegistry, FakeRpcConnector, FakeServiceCtl, FakeSysEnv, FakeSysEnvBuilder, FakeTunnel,
 };
-use sw_cli::ctx::{CliCtx, TextIo};
-use sw_pal::fs_ops::FsOps;
-pub use sw_pal::fakes::service::ServiceModelState;
+use sw_pal::fs_ops::{FileLockGuard, FsOps, LinkKind};
 pub use sw_pal::proc_scan::{DaemonProc, ProcIdentity};
 pub use sw_pal::service_ctl::{
-    CompositeServiceCtl, HoldState, ServiceAction, ServiceCtl, SystemdCtl, WindowsServiceCtl, WindowsTaskCtl,
+    CompositeServiceCtl, HoldState, ServiceAction, ServiceCtl, SystemdCtl, WindowsServiceCtl,
+    WindowsTaskCtl,
 };
-pub use sw_pal::traits::{Clock, SupervisionMode, SysEnv};
+pub use sw_pal::traits::{Clock, FsRead, PalResult, SupervisionMode, SysEnv};
 use sw_pal::PalErrorKind;
-use sw_proto::pypath::{HomeLookup, PathFlavor};
 use sw_proto::pyjson::{dumps_dict, loads, PyDict, PyInt, PyValue, DISK_STABLE};
+use sw_proto::pypath::{HomeLookup, PathFlavor};
 use sw_proto::release_manifest::{parse_manifest, ReleaseManifest};
 use sw_proto::runtime_paths::{EnvSnapshot, NativeTraits, RuntimePaths};
 
@@ -57,6 +58,7 @@ pub const CRASH_POINTS: &[&str] = &[
     "snapshot_taken:before_effect",
     "snapshot_taken:after_effect",
     "stop_supervisor:before_effect",
+    "stop_supervisor:after_hold",
     "stop_supervisor:after_effect",
     "confirm_released:before_effect",
     "confirm_released:after_effect",
@@ -75,12 +77,96 @@ pub const CRASH_POINTS: &[&str] = &[
     "revert_to_previous:after_effect",
 ];
 
+struct EventFs {
+    inner: Arc<dyn FsOps>,
+    events: Arc<Mutex<Vec<(u64, String)>>>,
+}
+
+impl EventFs {
+    fn wrap(inner: Arc<dyn FsOps>) -> (Arc<dyn FsOps>, Arc<Mutex<Vec<(u64, String)>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        (
+            Arc::new(Self { inner, events: Arc::clone(&events) }),
+            events,
+        )
+    }
+
+    fn record_write(&self, path: &Path, bytes: &[u8]) {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else { return; };
+        let label = if name == "install-journal.json" {
+            loads(&String::from_utf8_lossy(bytes))
+                .ok()
+                .and_then(|value| match value {
+                    PyValue::Dict(value) => value.get("step").and_then(|step| match step {
+                        PyValue::Str(step) => Some(format!("journal:{step}")),
+                        _ => None,
+                    }),
+                    _ => None,
+                })
+        } else if name == "autostart-hold.json" {
+            Some("fs:write autostart-hold.json".to_string())
+        } else {
+            None
+        };
+        if let Some(label) = label {
+            self.events.lock().unwrap_or_else(|e| e.into_inner())
+                .push((sw_pal::fakes::next_event_seq(), label));
+        }
+    }
+}
+
+impl FsRead for EventFs {
+    fn read(&self, path: &Path) -> PalResult<Vec<u8>> { self.inner.read(path) }
+    fn exists(&self, path: &Path) -> bool { self.inner.exists(path) }
+    fn is_dir(&self, path: &Path) -> bool { self.inner.is_dir(path) }
+    fn is_file(&self, path: &Path) -> bool { self.inner.is_file(path) }
+    fn list_dir(&self, path: &Path) -> PalResult<Vec<String>> { self.inner.list_dir(path) }
+}
+
+impl FsOps for EventFs {
+    fn atomic_write(&self, path: &Path, bytes: &[u8], mode: Option<u32>) -> PalResult<()> {
+        self.inner.atomic_write(path, bytes, mode)?;
+        self.record_write(path, bytes);
+        Ok(())
+    }
+    fn write_file(&self, path: &Path, bytes: &[u8]) -> PalResult<()> {
+        self.inner.write_file(path, bytes)?;
+        self.record_write(path, bytes);
+        Ok(())
+    }
+    fn mkdirs(&self, path: &Path) -> PalResult<()> { self.inner.mkdirs(path) }
+    fn replace(&self, from: &Path, to: &Path) -> PalResult<()> { self.inner.replace(from, to) }
+    fn remove_file(&self, path: &Path) -> PalResult<()> {
+        self.inner.remove_file(path)?;
+        if path.file_name().and_then(|name| name.to_str()) == Some("autostart-hold.json") {
+            self.events.lock().unwrap_or_else(|e| e.into_inner())
+                .push((sw_pal::fakes::next_event_seq(), "fs:remove autostart-hold.json".into()));
+        }
+        Ok(())
+    }
+    fn copy_preserving(&self, from: &Path, to: &Path) -> PalResult<()> { self.inner.copy_preserving(from, to) }
+    fn sync_file(&self, path: &Path) -> PalResult<()> { self.inner.sync_file(path) }
+    fn copy_tree(&self, from: &Path, to: &Path) -> PalResult<()> { self.inner.copy_tree(from, to) }
+    fn remove_tree(&self, path: &Path) -> PalResult<()> { self.inner.remove_tree(path) }
+    fn read_link(&self, path: &Path) -> PalResult<Option<PathBuf>> { self.inner.read_link(path) }
+    fn set_mode(&self, path: &Path, mode: u32) -> PalResult<()> { self.inner.set_mode(path, mode) }
+    fn sync_dir(&self, path: &Path) -> PalResult<()> { self.inner.sync_dir(path) }
+    fn symlink_file(&self, link: &Path, target: &Path) -> PalResult<()> { self.inner.symlink_file(link, target) }
+    fn symlink_or_copy_dir(&self, link: &Path, target: &Path) -> PalResult<LinkKind> {
+        self.inner.symlink_or_copy_dir(link, target)
+    }
+    fn file_lock_exclusive(&self, path: &Path, blocking: bool) -> PalResult<FileLockGuard> {
+        self.inner.file_lock_exclusive(path, blocking)
+    }
+}
+
 pub struct TestEnv {
     tmp_dir: tempfile::TempDir,
     windows: bool,
     ops: Vec<EnvOp>,
     env: Arc<FakeSysEnv>,
     fs: Arc<dyn FsOps>,
+    fs_events: Arc<Mutex<Vec<(u64, String)>>>,
     clock: Arc<FakeClock>,
     rpc: Arc<FakeRpcConnector>,
     procs: Arc<FakeProcScan>,
@@ -90,6 +176,16 @@ pub struct TestEnv {
     registry: Option<Arc<FakeRegistry>>,
     crash_point: Option<String>,
     real_service: bool,
+    retained_locks: Mutex<Vec<sw_pal::fs_ops::FileLockGuard>>,
+    active_daemon_endpoint: Option<String>,
+    active_daemon_pid: Option<u32>,
+    restart_on_failure: bool,
+    daemon_exit_code_after_handoff: Option<i32>,
+    supervisor_ignores_hold: bool,
+    new_daemon_handoff_pids: Option<Vec<u32>>,
+    instance_appears: Option<(String, String, u32, Vec<String>)>,
+    /// 群組成員（`build_env` 逐一套用；`without_group` 可移除）。
+    groups: Vec<String>,
 }
 
 pub trait IntoSupervisionMode {
@@ -124,21 +220,32 @@ impl TestEnv {
 
     fn new(windows: bool) -> Self {
         let tmp_dir = tempfile::tempdir().expect("tempdir 建立失敗");
+        let (fs, fs_events) = EventFs::wrap(real_fs());
         let mut t = Self {
             tmp_dir,
             windows,
             ops: Vec::new(),
             env: FakeSysEnv::builder().build(),
-            fs: real_fs(),
+            fs,
+            fs_events,
             clock: FakeClock::new(),
             rpc: FakeRpcConnector::new(),
             procs: FakeProcScan::new(Vec::new()),
             tunnel: None,
             service: None,
             process: None,
-            registry: None,
+            registry: windows.then(|| FakeRegistry::new(Vec::new(), &[])),
             crash_point: None,
             real_service: false,
+            retained_locks: Mutex::new(Vec::new()),
+            active_daemon_endpoint: None,
+            active_daemon_pid: None,
+            restart_on_failure: false,
+            daemon_exit_code_after_handoff: None,
+            supervisor_ignores_hold: false,
+            new_daemon_handoff_pids: None,
+            instance_appears: None,
+            groups: Vec::new(),
         };
         for dir in [
             t.home(),
@@ -229,6 +336,9 @@ impl TestEnv {
         for (k, v) in self.default_vars() {
             b = b.var(&k, &v);
         }
+        for group in &self.groups {
+            b = b.in_group(group);
+        }
         for op in &self.ops {
             b = op(b);
         }
@@ -264,7 +374,11 @@ impl TestEnv {
     }
 
     pub fn with_systemd(self, flag: bool) -> Self {
-        self.push_env_op(Box::new(move |b| b.systemd(flag)))
+        let mut env = self.push_env_op(Box::new(move |b| b.systemd(flag)));
+        if flag && env.service.is_none() {
+            env.real_service = true;
+        }
+        env
     }
 
     pub fn with_wsl(self, flag: bool) -> Self {
@@ -295,15 +409,23 @@ impl TestEnv {
         self
     }
 
-    /// 預設即不屬於任何群組（FakeSysEnv 預設行為）。
-    pub fn without_group(self, g: &str) -> Self {
+    /// 移除群組成員（P4-T13：先前版本為 no-op，無法驗證「非 dialout」情境）。
+    pub fn without_group(mut self, g: &str) -> Self {
+        self.groups.retain(|member| member != g);
+        self.env = self.build_env();
         self
     }
 
-    /// `doctor` 非 advisory 檢查全部通過的最小環境（P4-T9 承接細節；T1 只設定 systemd 與 dialout 群組）。
-    pub fn all_required_ok(self) -> Self {
+    /// `doctor` 非 advisory 檢查全部通過的最小環境（P4-T13）：systemd、dialout 群組、`serialwrap`／`serialwrapd` 在 PATH，
+    /// 以 `CLI_VERSION` 回應的健康 daemon（`version_pairing` 需要 daemon 版本與 bundle 一致）。
+    pub fn all_required_ok(mut self) -> Self {
+        self.groups.push("dialout".to_string());
+        let ep = self.default_socket();
+        let health = format!(r#"{{"ok":true,"pid":1234,"version":"{}"}}"#, sw_cli::CLI_VERSION);
         self.with_systemd(true)
-            .push_env_op(Box::new(|b| b.in_group("dialout")))
+            .with_which("serialwrap", "/usr/local/bin/serialwrap")
+            .with_which("serialwrapd", "/usr/local/bin/serialwrapd")
+            .with_rpc_ok(&ep, "health.status", &health)
     }
 
     pub fn with_procs(mut self, procs: Vec<DaemonProc>) -> Self {
@@ -319,6 +441,28 @@ impl TestEnv {
 
     fn ensure_process(&mut self) -> &Arc<FakeProcessCtl> {
         self.process.get_or_insert_with(FakeProcessCtl::new)
+    }
+
+    fn ensure_test_service(&mut self, replace_real: bool) {
+        if self.service.is_some() || (self.real_service && !replace_real) {
+            return;
+        }
+        let modes = if self.windows {
+            vec![
+                SupervisionMode::OnDemand,
+                SupervisionMode::WindowsTask,
+                SupervisionMode::WindowsService,
+            ]
+        } else {
+            vec![
+                SupervisionMode::OnDemand,
+                SupervisionMode::SystemdUser,
+                SupervisionMode::SystemdSystem,
+            ]
+        };
+        let service = FakeServiceCtl::new(modes);
+        self.rpc.set_supervisor_hold_signal(service.hold_signal());
+        self.service = Some(service);
     }
 
     /// 寫 bundle 的 Task 17 形狀 manifest（`components.daemon.launcher`）與 `bin/serialwrapd`；`current_exe` 不變。
@@ -438,27 +582,50 @@ impl TestEnv {
     /// 綁定同一計數器，故 `pid_alive` 與 ping 在同一次輪詢轉為不存活。
     pub fn with_daemon_alive_then_gone(mut self, ep: &str, pid: u32, n: usize) -> Self {
         let ep = self.isolated_endpoint(ep);
-        self.rpc.respond(&ep, "health.ping", OK_PING);
+        self.rpc.respond(&ep, "health.ping", &health_response(pid));
+        self.rpc
+            .respond(&ep, "health.status", &health_response(pid));
         self.rpc.respond(&ep, "session.list", OK_SESSION_LIST);
         self.rpc.refuse_from_connect(&ep, n);
         self.procs = FakeProcScan::new(vec![daemon_proc(pid)]);
         self.procs
             .alive_until_connect(pid, Arc::clone(&self.rpc), &ep, n);
+        self.active_daemon_endpoint = Some(ep);
+        self.active_daemon_pid = Some(pid);
         self
     }
 
     pub fn with_daemon_alive_forever(mut self, ep: &str, pid: u32) -> Self {
         let ep = self.isolated_endpoint(ep);
-        self.rpc.respond(&ep, "health.ping", OK_PING);
+        self.rpc.respond(&ep, "health.ping", &health_response(pid));
+        self.rpc
+            .respond(&ep, "health.status", &health_response(pid));
+        let token = &sha256_hex(&format!("handoff-{pid}"))[..32];
+        self.rpc.respond(
+            &ep,
+            "daemon.handoff_stop",
+            &format!(r#"{{"ok":true,"stopping":true,"handoff_token":"{token}"}}"#),
+        );
+        self.rpc.respond(&ep, "mcu.status", r#"{"ok":true,"flashing":false}"#);
+        self.rpc.respond(&ep, "session.list", OK_SESSION_LIST);
         self.procs = FakeProcScan::new(vec![daemon_proc(pid)]);
+        self.procs.follow_rpc_relaunch(Arc::clone(&self.rpc), &ep);
+        self.procs
+            .alive_until_stopped(pid, Arc::clone(&self.rpc), &ep);
+        self.active_daemon_endpoint = Some(ep);
+        self.active_daemon_pid = Some(pid);
         self
     }
 
     /// 閒置 daemon（`flashing:false`、單一 COM0 閒置，無 busy）：`daemon.handoff_stop` 回 grant（32 hex token），
     /// 之後 `ep` 停止（refused），pid 隨之不存活；`daemon.stop` 同語意。
     pub fn with_idle_daemon(mut self, ep: &str, pid: u32) -> Self {
+        self.ensure_process();
+        self.ensure_test_service(false);
         let ep = self.isolated_endpoint(ep);
-        self.rpc.respond(&ep, "health.ping", OK_PING);
+        self.rpc.respond(&ep, "health.ping", &health_response(pid));
+        self.rpc
+            .respond(&ep, "health.status", &health_response(pid));
         self.rpc.respond(&ep, "session.list", OK_SESSION_LIST);
         self.rpc
             .respond(&ep, "mcu.status", r#"{"ok":true,"flashing":false}"#);
@@ -470,23 +637,139 @@ impl TestEnv {
         self.rpc.stop_after_send(&ep, "daemon.handoff_stop");
         self.rpc.stop_after_send(&ep, "daemon.stop");
         self.procs = FakeProcScan::new(vec![daemon_proc(pid)]);
+        self.procs.follow_rpc_relaunch(Arc::clone(&self.rpc), &ep);
         self.procs
             .alive_until_stopped(pid, Arc::clone(&self.rpc), &ep);
+        self.active_daemon_endpoint = Some(ep);
+        self.active_daemon_pid = Some(pid);
+        if let Some(service) = &self.service {
+            service.stop_rpc_on_hard_stop(
+                Arc::clone(&self.rpc),
+                self.active_daemon_endpoint.as_deref().unwrap_or_default(),
+            );
+        }
+        self.configure_handoff_relaunch();
         self
     }
 
-    /// `health.ping` 與 `health.status.version`（spawn 之後才可連線，對應「新 spawn 的 daemon」）。
-    pub fn with_new_daemon_reporting_version(mut self, v: &str) -> Self {
-        let ep = self.isolated_endpoint(&self.default_socket());
-        let counter = self.ensure_process().spawn_counter();
-        self.rpc.gate_on_spawn(&ep, counter);
-        self.rpc.respond(&ep, "health.ping", OK_PING);
-        self.rpc.respond(
-            &ep,
-            "health.status",
-            &format!(r#"{{"ok":true,"version":"{v}"}}"#),
-        );
+    /// 以本 TestEnv 的預設 POSIX endpoint 配置閒置 daemon。
+    pub fn with_idle_daemon_default(self, pid: u32) -> Self {
+        let endpoint = self.default_socket();
+        self.with_idle_daemon(&endpoint, pid)
+    }
+
+    /// 對本 TestEnv 的預設 POSIX endpoint 配置單一 RPC 成功回應。
+    pub fn with_rpc_ok_default(self, method: &str, line: &str) -> Self {
+        let endpoint = self.default_socket();
+        self.with_rpc_ok(&endpoint, method, line)
+    }
+
+    /// 將本 TestEnv 的預設 POSIX endpoint 設為連線拒絕。
+    pub fn with_rpc_refused_default(self) -> Self {
+        let endpoint = self.default_socket();
+        self.with_rpc_refused(&endpoint)
+    }
+
+    /// 將下一個被拒絕的 daemon 連線標記為等待流程的 `health.ping#gone` 事件。
+    pub fn with_gone_ping_event(self) -> Self {
+        if let Some(endpoint) = self.active_daemon_endpoint.as_deref() {
+            self.rpc.refused_connect_as(endpoint, "health.ping");
+        }
         self
+    }
+
+    /// 設定更新後 daemon 的版本回應；若舊 daemon 正在同一 endpoint 運作，保留舊回應直到 handoff 與 spawn。
+    pub fn with_new_daemon_reporting_version(mut self, v: &str) -> Self {
+        let endpoint = if self.windows { Self::win_endpoint().to_string() } else { self.default_socket() };
+        let ep = self.isolated_endpoint(&endpoint);
+        let old_sessions = self.rpc.configured_response(&ep, "session.list")
+            .unwrap_or_else(|| OK_SESSION_LIST.to_string());
+        let current_state = std::fs::read_to_string(&self.root().current_file).ok()
+            .and_then(|contents| loads(&contents).ok())
+            .and_then(|value| match value {
+                PyValue::Dict(value) => {
+                    let current = value.get("bundle_version").and_then(|item| match item { PyValue::Str(version) => Some(version.clone()), _ => None });
+                    let previous = value.get("previous").and_then(|item| match item { PyValue::Dict(previous) => previous.get("bundle_version").and_then(|item| match item { PyValue::Str(version) => Some(version.clone()), _ => None }), _ => None });
+                    Some((current, previous))
+                }
+                _ => None,
+            });
+        let current = current_state.as_ref().and_then(|(current, _)| current.clone()).unwrap_or_else(|| v.to_string());
+        let bundle_version = std::fs::read_to_string(self.bundle_dir().join("release-manifest.json")).ok()
+            .and_then(|contents| loads(&contents).ok())
+            .and_then(|value| match value { PyValue::Dict(value) => value.get("bundle_version").and_then(|item| match item { PyValue::Str(version) => Some(version.clone()), _ => None }), _ => None })
+            .or_else(|| current_state.as_ref().and_then(|(_, previous)| previous.clone()))
+            .unwrap_or_else(|| v.to_string());
+        let counter = self.ensure_process().spawn_counter();
+        if let Some(service) = &self.service { service.set_start_spawn_counter(Arc::clone(&counter)); }
+        let env_counter = Arc::clone(&counter);
+        self = self.push_env_op(Box::new(move |builder| builder.start_spawn_counter(Arc::clone(&env_counter))));
+        if self.active_daemon_endpoint.as_deref() == Some(ep.as_str()) {
+            self.rpc.respond_after_relaunch(&ep, "health.ping", OK_PING);
+            if self.rpc.configured_response(&ep, "health.status").is_some_and(|line| line.contains("\"version\":\"test\"")) {
+                self.rpc.respond(&ep, "health.status", &format!(r#"{{"ok":true,"pid":{},"version":"{}","wal":{{"healthy":true}}}}"#, self.active_daemon_pid.unwrap_or(5252), current));
+            }
+        } else {
+            self.rpc.clear_refusal(&ep);
+            self.rpc.gate_on_spawn(&ep, Arc::clone(&counter));
+            self.rpc.respond(&ep, "health.ping", OK_PING);
+            self.rpc.respond(
+                &ep,
+                "health.status",
+                &format!(r#"{{"ok":true,"pid":5252,"version":"{v}","wal":{{"healthy":true}}}}"#),
+            );
+            let token = &sha256_hex("handoff-5252")[..32];
+            self.rpc.respond(
+                &ep,
+                "daemon.handoff_stop",
+                &format!(r#"{{"ok":true,"stopping":true,"handoff_token":"{token}"}}"#),
+            );
+            self.rpc.respond(&ep, "session.list", OK_SESSION_LIST);
+        }
+        self.rpc.revive_after_spawn(&ep, counter, 5252);
+        self.rpc.stop_after_send(&ep, "daemon.handoff_stop");
+        self.rpc.respond(&ep, "alias.list", r#"{"ok":true,"aliases":[]}"#);
+        self.rpc.respond(&ep, "device.list", r#"{"ok":true,"devices":[]}"#);
+        let cli_name = if self.windows { "serialwrap.exe" } else { "serialwrap" };
+        let target_cli = self.root().versions.join(&bundle_version).join("bin").join(cli_name).to_string_lossy().into_owned();
+        let output = format!("serialwrap {v}\n");
+        self = self.with_command(&[&target_cli, "--version"], 0, &output, "");
+        if current != bundle_version {
+            let previous_cli = self.root().versions.join(&current).join("bin").join(cli_name).to_string_lossy().into_owned();
+            let previous_output = format!("serialwrap {current}\n");
+            self = self.with_command(&[&previous_cli, "--version"], 0, &previous_output, "");
+        }
+        let target_status = format!(r#"{{"ok":true,"pid":5252,"version":"{v}","wal":{{"healthy":true}}}}"#);
+        let restored_status = format!(r#"{{"ok":true,"pid":5252,"version":"{current}","wal":{{"healthy":true}}}}"#);
+        self.rpc.respond_after_relaunch_seq(&ep, "health.status", &[&target_status, &restored_status]);
+        self.rpc.respond_after_relaunch_seq(&ep, "session.list", &[OK_SESSION_LIST, &old_sessions]);
+        self.rpc.respond_after_relaunch_seq(&ep, "alias.list", &[r#"{"ok":true,"aliases":[]}"#, r#"{"ok":true,"aliases":[]}"#]);
+        self.rpc.respond_after_relaunch_seq(&ep, "device.list", &[r#"{"ok":true,"devices":[]}"#, r#"{"ok":true,"devices":[]}"#]);
+        self
+    }
+
+    /// 設定只由下一次 spawn 後的新 daemon 回傳的 RPC 回應。
+    pub fn with_rpc_after_relaunch(self, method: &str, line: &str) -> Self {
+        let endpoint = if self.windows { Self::win_endpoint().to_string() } else { self.default_socket() };
+        self.rpc.respond_after_relaunch(&endpoint, method, line);
+        self
+    }
+
+    /// 依序設定重新拉起後的 RPC 回應；用盡後重複最後一筆。
+    pub fn with_rpc_after_relaunch_seq(self, method: &str, lines: &[&str]) -> Self {
+        let endpoint = if self.windows { Self::win_endpoint().to_string() } else { self.default_socket() };
+        self.rpc.respond_after_relaunch_seq(&endpoint, method, lines);
+        self
+    }
+
+    /// 新版 daemon spawn 後 RPC 立即拒絕，但 process scan 仍看見新 PID。
+    pub fn with_new_daemon_rpc_down(self) -> Self {
+        let mut env = self.with_new_daemon_reporting_version("0.4.1");
+        let endpoint = if env.windows { Self::win_endpoint().to_string() } else { env.default_socket() };
+        let counter = env.ensure_process().spawn_counter();
+        env.rpc.refuse_after_spawn(&endpoint, counter);
+        env.procs.follow_rpc_relaunch(Arc::clone(&env.rpc), &endpoint);
+        env
     }
 
     /// 測試端 endpoint 映射（恆等）。RPC 替身不接觸真實 socket，故 endpoint 只是鍵；TCP 與 unix 皆原樣保留，
@@ -605,57 +888,125 @@ impl TestEnv {
     /// 建立目前版本與 current 檔；POSIX 寫 `<root>/current-release.json`，Windows 寫 `<root>/bin/current-release.json`。
     pub fn with_current(self, v: &str, prev: Option<&str>) -> Self {
         let root = self.root();
-        let join = |base: &Path, child: &str| {
-            if self.windows {
-                PathBuf::from(format!("{}\\{child}", base.display()))
-            } else {
-                base.join(child)
-            }
-        };
-        let body = format!("current-{v}");
-        for name in ["serialwrap", "serialwrap.exe", "serialwrapd", "serialwrapd.exe"] {
-            let version_dir = join(&root.versions, v);
-            let bin = join(&version_dir, "bin");
-            self.write_file(&join(&bin, name), body.as_bytes());
-        }
-        if let Some(p) = prev {
-            let prev_body = format!("previous-{p}");
-            for name in ["serialwrap", "serialwrap.exe", "serialwrapd", "serialwrapd.exe"] {
-                let version_dir = join(&root.versions, p);
-                let bin = join(&version_dir, "bin");
-                self.write_file(&join(&bin, name), prev_body.as_bytes());
+        let target = if self.windows { "x86_64-pc-windows-gnu" } else { "x86_64-unknown-linux-gnu" };
+        for version in std::iter::once(v).chain(prev.into_iter()) {
+            let version_dir = root.versions.join(version);
+            if !version_dir.join("release-manifest.json").exists() {
+                write_complete_bundle(&version_dir, version, target, self.windows, &[], &[]);
             }
         }
-        let current = format!(r#"{{"bundle_version":"{v}","dir":"versions/{v}"}}"#);
+        let previous = prev.map_or_else(
+            || ",\"previous\":null".to_string(),
+            |version| {
+                format!(",\"previous\":{{\"bundle_version\":\"{version}\",\"dir\":\"versions/{version}\"}}")
+            },
+        );
+        let backup_dir = prev.map(|previous| {
+            let dir = root.backups.join(format!("{previous}-to-{v}-history"));
+            std::fs::create_dir_all(&dir).expect("Previous 歷史備份目錄建立失敗");
+            let config = std::fs::read(self.config_path()).unwrap_or_else(|_| b"supervision_mode: on-demand\n".to_vec());
+            let mode = String::from_utf8_lossy(&config).lines().find_map(|line| {
+                line.split_once(':').filter(|(key, _)| key.trim() == "supervision_mode").map(|(_, value)| value.trim().to_string())
+            }).unwrap_or_else(|| "on-demand".into());
+            self.write_history_backup(&dir, &mode);
+            dir.to_string_lossy().into_owned()
+        });
+        let backup = backup_dir.as_deref().map_or_else(String::new, |path| {
+            let escaped = path.replace('\\', "\\\\");
+            format!(",\"backup_dir\":\"{escaped}\"")
+        });
+        let current = format!(r#"{{"bundle_version":"{v}","dir":"versions/{v}"{previous}{backup}}}"#);
         self.write_file(&root.current_file, current.as_bytes());
-        for name in ["serialwrap", "serialwrap.exe", "serialwrapd", "serialwrapd.exe"] {
-            self.write_file(&join(&root.bin, name), body.as_bytes());
+        for name in root.entry_names.iter() {
+            let source = root.versions.join(v).join("bin").join(name);
+            let target = root.bin.join(name);
+            let bytes = std::fs::read(&source).unwrap_or_else(|_| format!("current-{v}").into_bytes());
+            self.write_file(&target, &bytes);
         }
         self
     }
 
+    /// 改寫測試 current 的 Previous 備份監管快照，模擬歷史安裝時的實際模式。
+    pub fn with_previous_backup_mode(&self, mode: &str) {
+        let root = self.root();
+        let current = std::fs::read_to_string(&root.current_file).expect("current-release.json 讀取失敗");
+        let value = loads(&current).expect("current-release.json 解析失敗");
+        let backup = match value {
+            PyValue::Dict(value) => value.get("backup_dir").and_then(|item| match item { PyValue::Str(text) => Some(PathBuf::from(text)), _ => None }),
+            _ => None,
+        }.expect("current-release.json 缺少歷史 backup_dir");
+        self.write_history_backup(&backup, mode);
+    }
+
+    fn write_history_backup(&self, dir: &Path, mode: &str) {
+        let endpoint = if self.windows { Self::win_endpoint().to_string() } else { self.default_socket() };
+        let registration_path = match mode {
+            "windows-task" => Some(self.root().supervisor.join("serialwrap.task.xml")),
+            "systemd-user" => Some(self.config_dir().join("systemd/user/serialwrap.service")),
+            "systemd-system" => Some(self.home().join(".local/share/serialwrap/serialwrap.service")),
+            _ => None,
+        };
+        let mut registration = PyDict::new();
+        registration.insert("enabled", if mode == "on-demand" { PyValue::Null } else { PyValue::Bool(true) });
+        registration.insert("endpoint", PyValue::Str(endpoint.clone()));
+        registration.insert("mode", PyValue::Str(mode.to_string()));
+        registration.insert("registration", registration_path.as_ref().map(|path| PyValue::Str(path.to_string_lossy().into_owned())).unwrap_or(PyValue::Null));
+        registration.insert("running", PyValue::Bool(false));
+        let registration_bytes = dumps_dict(&registration, &DISK_STABLE).into_bytes();
+        self.write_file(&dir.join("registration.json"), &registration_bytes);
+        let config = format!("supervision_mode: {mode}\n");
+        self.write_file(&dir.join("config.yaml"), config.as_bytes());
+        if mode == "windows-task" {
+            let xml = sw_pal::service_ctl::render_task_xml(&sw_pal::service_ctl::TaskXmlSpec {
+                name: "serialwrap".into(),
+                user_id: self.env.user_identity(),
+                command: self.root().bin.join("serialwrapd.exe").to_string_lossy().into_owned(),
+                arguments: format!("--socket {endpoint}"),
+                working_dir: self.root().bin.to_string_lossy().into_owned(),
+                enabled: true,
+            });
+            self.write_file(&dir.join("registered.task.xml"), &sw_pal::service_ctl::encode_utf16le_bom(&xml));
+        } else if mode == "systemd-user" {
+            let unit = format!("[Unit]\nDescription=serialwrap\n[Service]\nExecStart=/usr/local/bin/serialwrapd --socket {endpoint}\n[Install]\nWantedBy=default.target\n");
+            self.write_file(&dir.join("registered.unit"), unit.as_bytes());
+        }
+        let mut files = Vec::new();
+        for name in ["config.yaml", "registration.json", "registered.task.xml", "registered.unit"] {
+            let path = dir.join(name);
+            if !path.exists() { continue; }
+            let bytes = std::fs::read(&path).expect("歷史備份檔讀取失敗");
+            files.push(PyValue::Dict(PyDict::from_pairs(vec![
+                ("path".into(), PyValue::Str(path.to_string_lossy().into_owned())),
+                ("relative".into(), PyValue::Str(name.into())),
+                ("sha256".into(), PyValue::Str(sw_proto::digest::sha256_hex(&bytes))),
+            ])));
+        }
+        let manifest = PyDict::from_pairs(vec![
+            ("files".into(), PyValue::List(files)),
+            ("schema_version".into(), PyValue::Int(PyInt::Small(1))),
+        ]);
+        self.write_file(&dir.join("manifest.json"), dumps_dict(&manifest, &DISK_STABLE).as_bytes());
+    }
+
     /// `versions/<v>/bin/serialwrap` 安裝版本目錄（不改 current）。
     pub fn with_installed(self, v: &str) -> Self {
-        let body = format!("installed-{v}");
         let root = self.root();
-        let join = |base: &Path, child: &str| {
-            if self.windows {
-                PathBuf::from(format!("{}\\{child}", base.display()))
-            } else {
-                base.join(child)
-            }
-        };
-        for name in ["serialwrap", "serialwrap.exe", "serialwrapd", "serialwrapd.exe"] {
-            let version_dir = join(&root.versions, v);
-            let bin = join(&version_dir, "bin");
-            self.write_file(&join(&bin, name), body.as_bytes());
+        let version_dir = root.versions.join(v);
+        if !version_dir.join("release-manifest.json").exists() {
+            let target = if self.windows { "x86_64-pc-windows-gnu" } else { "x86_64-unknown-linux-gnu" };
+            write_complete_bundle(&version_dir, v, target, self.windows, &[], &[]);
         }
         self
     }
 
     /// bundle 根的 `bin/serialwrap` 與 `release-manifest.json`（manifest 形狀同 `mkbundle.sh`，sha256 為真值）。
-    pub fn with_bundle(self, v: &str) -> Self {
-        let target = if self.windows { "x86_64-pc-windows-gnu" } else { "x86_64-unknown-linux-gnu" };
+    pub fn with_bundle(mut self, v: &str) -> Self {
+        self.ensure_test_service(false);
+        let target = if self.windows {
+            "x86_64-pc-windows-gnu"
+        } else {
+            "x86_64-unknown-linux-gnu"
+        };
         write_complete_bundle(&self.bundle_dir(), v, target, self.windows, &[], &[]);
         self
     }
@@ -664,8 +1015,23 @@ impl TestEnv {
     pub fn with_fs_fault_replace_suffix(mut self, s: &str) -> Self {
         let faulty = FaultFs::wrap(Arc::clone(&self.fs));
         faulty.fail_replace_when_src_ends_with(s);
+        faulty.fail_writes_to_suffix(s);
         self.fs = faulty;
         self
+    }
+
+    /// 持有 install root 的安裝鎖，模擬另一個 updater 正在執行。
+    pub fn with_install_lock_holder(self) -> Self {
+        let lock_path = self.install_root().join(".install.lock");
+        let guard = self.fs.file_lock_exclusive(&lock_path, false).expect("測試安裝鎖取得失敗");
+        self.retained_locks.lock().unwrap_or_else(|error| error.into_inner()).push(guard);
+        self
+    }
+
+    pub fn acquire_install_lock(&mut self) {
+        let lock_path = self.install_root().join(".install.lock");
+        let guard = self.fs.file_lock_exclusive(&lock_path, false).expect("測試安裝鎖取得失敗");
+        self.retained_locks.lock().unwrap_or_else(|error| error.into_inner()).push(guard);
     }
 
     /// 以 FaultFs 包住 fs；來源路徑含 part 時讓 replace 失敗。
@@ -696,7 +1062,6 @@ impl TestEnv {
         self
     }
 
-
     /// 有狀態監管模型：寫 config `supervision_mode` 並設定 `FakeServiceCtl` 的 enabled／running（`query_now` 可讀）。
     pub fn with_supervisor_state(
         mut self,
@@ -714,11 +1079,26 @@ impl TestEnv {
             SupervisionMode::Other(s) => s.clone(),
         };
         self.set_config_key("supervision_mode", &name);
-        let svc = self
-            .service
-            .get_or_insert_with(|| FakeServiceCtl::new(vec![mode.clone()]))
-            .clone();
+        self.ensure_test_service(true);
+        let svc = self.service.as_ref().expect("test service configured").clone();
+        self.rpc.set_supervisor_hold_signal(svc.hold_signal());
         svc.set_model(Some(enabled), running);
+        if mode == SupervisionMode::WindowsTask {
+            let root = self.root();
+            let path = root.supervisor.join("serialwrap.task.xml");
+            let xml = sw_pal::service_ctl::render_task_xml(&sw_pal::service_ctl::TaskXmlSpec {
+                name: "serialwrap".into(),
+                user_id: self.env.user_identity(),
+                command: root.bin.join("serialwrapd.exe").to_string_lossy().into_owned(),
+                arguments: "--socket tcp://127.0.0.1:48700".into(),
+                working_dir: root.bin.to_string_lossy().into_owned(),
+                enabled,
+            });
+            self.write_file(&path, &sw_pal::service_ctl::encode_utf16le_bom(&xml));
+        } else if mode == SupervisionMode::SystemdUser {
+            let path = self.home().join(".config/systemd/user/serialwrap.service");
+            self.write_file(&path, b"[Unit]\nDescription=serialwrap daemon\n[Service]\nExecStart=%h/.local/bin/serialwrapd\nRestart=on-failure\n[Install]\nWantedBy=default.target\n");
+        }
         self
     }
 
@@ -739,14 +1119,21 @@ impl TestEnv {
         let env: Arc<dyn SysEnv> = self.env.clone();
         let fs: Arc<dyn FsOps> = self.fs.clone();
         let clock: Arc<dyn Clock> = self.clock.clone();
-        Arc::new(CompositeServiceCtl::new(
+        let modes = if self.windows {
+            vec![
+                SupervisionMode::OnDemand,
+                SupervisionMode::WindowsTask,
+                SupervisionMode::WindowsService,
+            ]
+        } else {
             vec![
                 SupervisionMode::OnDemand,
                 SupervisionMode::SystemdUser,
                 SupervisionMode::SystemdSystem,
-                SupervisionMode::WindowsTask,
-                SupervisionMode::WindowsService,
-            ],
+            ]
+        };
+        Arc::new(CompositeServiceCtl::new(
+            modes,
             SystemdCtl::new(Arc::clone(&env), Arc::clone(&fs), Arc::clone(&clock)),
             WindowsTaskCtl::new(Arc::clone(&env), Arc::clone(&fs), Arc::clone(&clock)),
             WindowsServiceCtl::new(env, clock),
@@ -781,20 +1168,58 @@ impl TestEnv {
             io: TextIo::new(&mut out, &mut err, "\n"),
             verbose: 0,
             cli_version: "test",
+            autostart_lock: None,
         };
-        f(&mut ctx)
+        let result = f(&mut ctx);
+        if let Some(lock) = ctx.autostart_lock.take() {
+            self.retained_locks
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(lock);
+        }
+        result
     }
 
     /// `autostart.lock` 的 FakeClock 感知持有者腳本（P4-T7 `autostart_concurrent_second_cli_reuses_daemon`、
     /// `autostart_waits_on_update_hold_lock` 使用）：持有者於 `release_at_s` 秒（Clock 時間）釋放並可讓 ping 轉為 ok。
-    /// 目前尚未實作（真實 flock 於同行程測試會阻塞，不可用）。
-    pub fn with_autostart_lock_holder(self, release_at_s: Option<f64>) -> Self {
-        todo!("P4-T7: autostart.lock 的 FakeClock 感知持有者替身尚未實作（release_at_s={release_at_s:?}）")
+    /// 以 FakeClock 控制的檔案鎖替身模擬另一個行程持鎖。
+    pub fn with_autostart_lock_holder(mut self, release_at_s: Option<f64>) -> Self {
+        let lock_path = self.run_dir().join("autostart.lock");
+        let gate = FaultFs::wrap(Arc::clone(&self.fs));
+        let release_at_ns = release_at_s.map(|seconds| {
+            (seconds.max(0.0) * 1_000_000_000.0)
+                .ceil()
+                .min(u64::MAX as f64) as u64
+        });
+        gate.block_lock_until(&lock_path, Arc::clone(&self.clock), release_at_ns);
+        self.fs = gate;
+        self
+    }
+
+    /// 持有自動啟動鎖期間建立 install journal，模擬 updater 在 CLI 等鎖時開始切換。
+    pub fn with_autostart_lock_holder_creating_journal(mut self, release_at_s: f64) -> Self {
+        let lock_path = self.run_dir().join("autostart.lock");
+        let journal_path = self.install_root().join("install-journal.json");
+        let release_at_ns = (release_at_s.max(0.0) * 1_000_000_000.0)
+            .ceil()
+            .min(u64::MAX as f64) as u64;
+        let gate = FaultFs::wrap(Arc::clone(&self.fs));
+        gate.block_lock_until_and_create_file(
+            &lock_path,
+            Arc::clone(&self.clock),
+            release_at_ns,
+            &journal_path,
+            br#"{"step":"backup_complete"}"#,
+        );
+        self.fs = gate;
+        self
     }
 
     /// `benches.state.json.lock` 被另一行程持有且不釋放：`bench_state::remember`／`forget` 取鎖失敗（P4-T9，SC-27）。
     pub fn with_bench_state_lock_holder(mut self) -> Self {
-        let lock_path = self.bench_state_path().with_file_name("benches.state.json.lock");
+        let lock_path = self
+            .bench_state_path()
+            .with_file_name("benches.state.json.lock");
         let gate = FaultFs::wrap(Arc::clone(&self.fs));
         gate.block_lock_until(&lock_path, Arc::clone(&self.clock), None);
         self.fs = gate;
@@ -802,38 +1227,108 @@ impl TestEnv {
     }
 
     /// 交接後的 identity 置換模型（P4-T7 `graceful_handoff_hard_stop_only_same_identity` 第二情境）：
-    /// `after_s` 秒（Clock 時間）後 `from_pid` 的實例由 `to_pid`（不同 start_ticks）取代。目前尚未實作。
+    /// `after_s` 秒（Clock 時間）後 `from_pid` 的實例由 `to_pid`（不同 start_ticks）取代。
     pub fn with_identity_swap_after(self, after_s: f64, from_pid: u32, to_pid: u32) -> Self {
-        todo!("P4-T7: identity 置換模型尚未實作（{after_s} s 後 {from_pid} → {to_pid}）")
+        if let Some(endpoint) = self.active_daemon_endpoint.as_deref() {
+            let response = health_response(to_pid);
+            self.rpc.respond_at(
+                endpoint,
+                "health.status",
+                Arc::clone(&self.clock),
+                std::time::Duration::from_secs_f64(after_s.max(0.0)),
+                &response,
+            );
+            self.procs
+                .alive_until_stopped(to_pid, Arc::clone(&self.rpc), endpoint);
+        }
+        self.procs.replace_identity_after(
+            Arc::clone(&self.clock),
+            std::time::Duration::from_secs_f64(after_s.max(0.0)),
+            from_pid,
+            to_pid,
+        );
+        self
     }
 
     /// 重啟循環模型（P4-T7 `restart_on_demand_*` 完整循環使用）：`ep` 的舊實例 `old_pid` 停止後連線被拒，
-    /// spawn 後同 endpoint 由 `new_pid` 提供服務。`FakeRpcConnector` 的停止與 refuse 為永久狀態，無法表達「復活」。目前尚未實作。
-    pub fn with_restart_cycle(self, ep: &str, old_pid: u32, new_pid: u32) -> Self {
-        todo!("P4-T7: 重啟循環（停止後 refused、spawn 後 ok）替身尚未實作（{ep} {old_pid} → {new_pid}）")
-    }
-
-    pub fn with_restart_on_failure(self) -> Self {
+    /// spawn 後同 endpoint 由 `new_pid` 提供服務。
+    pub fn with_restart_cycle(mut self, ep: &str, old_pid: u32, new_pid: u32) -> Self {
+        let ep = self.isolated_endpoint(ep);
+        self.rpc
+            .respond(&ep, "health.ping", &health_response(old_pid));
+        self.rpc
+            .respond(&ep, "health.status", &health_response(old_pid));
+        self.rpc
+            .respond(&ep, "daemon.stop", r#"{"ok":true,"stopping":true}"#);
+        self.rpc.stop_after_send(&ep, "daemon.stop");
+        let counter = self.ensure_process().spawn_counter();
+        self.rpc.revive_after_spawn(&ep, counter, new_pid);
+        self.procs = FakeProcScan::new(vec![daemon_proc(old_pid)]);
+        self.procs
+            .alive_until_stopped(old_pid, Arc::clone(&self.rpc), &ep);
+        self.active_daemon_endpoint = Some(ep);
+        self.active_daemon_pid = Some(old_pid);
         self
     }
 
-    pub fn with_daemon_exit_code_after_handoff(self, _rc: i32) -> Self {
+    pub fn with_restart_on_failure(mut self) -> Self {
+        self.restart_on_failure = true;
+        if let Some(service) = &self.service { service.set_hold_prior_restart(Some("on-failure".into())); }
+        self.configure_handoff_relaunch();
         self
     }
 
-    pub fn with_supervisor_ignores_hold(self) -> Self {
+    pub fn with_daemon_exit_code_after_handoff(mut self, rc: i32) -> Self {
+        self.daemon_exit_code_after_handoff = Some(rc);
+        self.configure_handoff_relaunch();
         self
     }
 
-    pub fn with_instance_appears_at(self, _point: &str, _pid: u32, _lines: &[&str]) -> Self {
+    pub fn with_supervisor_ignores_hold(mut self) -> Self {
+        self.supervisor_ignores_hold = true;
+        self.rpc.set_ignore_supervisor_hold(true);
+        if let Some(service) = &self.service { service.set_ignore_hold(true); }
         self
     }
 
-    pub fn with_new_daemon_handoff_script(self, _script: &[&str]) -> Self {
+    pub fn with_new_daemon_handoff_pids(mut self, pids: &[u32]) -> Self {
+        self.new_daemon_handoff_pids = Some(pids.to_vec());
+        self.configure_handoff_relaunch();
         self
     }
 
-    pub fn with_fault_at(self, _point: &str) -> Self {
+    pub fn with_instance_appears_at(mut self, point: &str, pid: u32, lines: &[&str]) -> Self {
+        let raw_endpoint = if self.windows {
+            Self::win_endpoint().to_string()
+        } else {
+            self.default_socket()
+        };
+        let endpoint = self.isolated_endpoint(&raw_endpoint);
+        self.instance_appears = Some((endpoint, point.to_string(), pid, lines.iter().map(|line| (*line).to_string()).collect()));
+        self
+    }
+
+    pub fn with_new_daemon_handoff_script(self, script: &[&str]) -> Self {
+        let endpoint = self.active_daemon_endpoint.clone().unwrap_or_else(|| self.isolated_endpoint(&self.default_socket()));
+        let pid = self.active_daemon_pid.unwrap_or(4242);
+        let token = &sha256_hex(&format!("handoff-{pid}"))[..32];
+        let grant = format!(r#"{{"ok":true,"stopping":true,"handoff_token":"{token}"}}"#);
+        let mut replies = vec![grant];
+        for (index, reply) in script.iter().enumerate() {
+            if *reply == "<recv_timeout>" {
+                self.rpc.recv_timeout_once_after(&endpoint, "daemon.handoff_stop", index + 1);
+            } else {
+                replies.push((*reply).to_string());
+            }
+        }
+        replies.push(format!(r#"{{"ok":true,"stopping":true,"handoff_token":"{token}"}}"#));
+        let refs = replies.iter().map(String::as_str).collect::<Vec<_>>();
+        self.rpc.respond_seq(&endpoint, "daemon.handoff_stop", &refs);
+        self
+    }
+
+    pub fn with_fault_at(mut self, point: &str) -> Self {
+        self.crash_point = Some(point.to_string());
         self
     }
 
@@ -842,7 +1337,45 @@ impl TestEnv {
     }
 
     pub fn autostart_lock_held(&self) -> bool {
-        false
+        let path = self.run_dir().join("autostart.lock");
+        real_fs().file_lock_exclusive(&path, false).is_err()
+    }
+
+    fn configure_handoff_relaunch(&self) {
+        let (Some(endpoint), Some(old_pid)) = (
+            self.active_daemon_endpoint.as_deref(),
+            self.active_daemon_pid,
+        ) else {
+            return;
+        };
+        if self.supervisor_ignores_hold && !(self.restart_on_failure && self.daemon_exit_code_after_handoff.is_some_and(|rc| rc != 0)) {
+            let token = &sha256_hex(&format!("handoff-{old_pid}"))[..32];
+            let grant = format!(r#"{{"ok":true,"stopping":true,"handoff_token":"{token}"}}"#);
+            let busy = r#"{"ok":false,"error_code":"SESSION_BUSY","busy":[{"com":"COM0","state":"READY","foreground_busy":true,"outstanding_commands":0,"interactive_session_id":null,"recovering":false,"ops":["file.push"]}]}"#;
+            self.rpc.respond_seq(endpoint, "daemon.handoff_stop", &[&grant, busy]);
+            self.rpc.relaunch_after_send(endpoint, "daemon.handoff_stop", &[9000]);
+            return;
+        }
+        if !self.restart_on_failure || !self.daemon_exit_code_after_handoff.is_some_and(|rc| rc != 0) {
+            return;
+        }
+        let pids = self
+            .new_daemon_handoff_pids
+            .clone()
+            .unwrap_or_else(|| vec![9000]);
+        let mut response_pids = vec![old_pid];
+        response_pids.extend(pids.iter().copied());
+        let grants = response_pids
+            .iter()
+            .map(|pid| {
+                let token = &sha256_hex(&format!("handoff-{pid}"))[..32];
+                format!(r#"{{"ok":true,"stopping":true,"handoff_token":"{token}"}}"#)
+            })
+            .collect::<Vec<_>>();
+        let refs = grants.iter().map(String::as_str).collect::<Vec<_>>();
+        self.rpc.respond_seq(endpoint, "daemon.handoff_stop", &refs);
+        self.rpc
+            .relaunch_after_send(endpoint, "daemon.handoff_stop", &pids);
     }
 
     pub fn rpc_now(&self, _ep: &str, _method: &str) -> PyValue {
@@ -854,7 +1387,37 @@ impl TestEnv {
     }
 
     pub fn recover(&self) -> Option<sw_cli::rollback::RecoveryReport> {
-        unimplemented!("not implemented: P4-T12")
+        let platform = self.platform();
+        let env = if platform.caps.path_flavor == sw_pal::PalPathFlavor::Windows {
+            EnvSnapshot::from_pairs_fold_upper(platform.env.vars())
+        } else {
+            EnvSnapshot::from_pairs(platform.env.vars())
+        };
+        let flavor = if platform.caps.path_flavor == sw_pal::PalPathFlavor::Windows {
+            PathFlavor::Windows
+        } else {
+            PathFlavor::Posix
+        };
+        let native = NativeTraits {
+            default_endpoint_is_tcp: platform.caps.native_backend == sw_pal::BackendKind::Win,
+            path_flavor: flavor,
+        };
+        let home = SysEnvHome(platform.env.as_ref());
+        let paths = RuntimePaths::resolve(&env, native, &home).ok()?;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let io = TextIo::new(&mut stdout, &mut stderr, platform.caps.text_newline);
+        let mut ctx = CliCtx {
+            p: &platform,
+            env,
+            paths,
+            io,
+            verbose: 0,
+            cli_version: sw_cli::CLI_VERSION,
+            autostart_lock: None,
+        };
+        let root = sw_cli::install_layout::resolve_install_root(&ctx);
+        sw_cli::rollback::recover_journal(&mut ctx, &root)
     }
 
     /// `CONFIG_DIR/config.yaml`。
@@ -897,7 +1460,11 @@ impl TestEnv {
     pub fn root(&self) -> sw_cli::install_layout::InstallRoot {
         let install = self.install_root();
         let join = |base: &Path, child: &str| {
-            if self.windows { PathBuf::from(format!("{}\\{child}", base.display())) } else { base.join(child) }
+            if self.windows {
+                PathBuf::from(format!("{}\\{child}", base.display()))
+            } else {
+                base.join(child)
+            }
         };
         let versions = join(&install, "versions");
         let bin = join(&install, "bin");
@@ -977,8 +1544,15 @@ impl TestEnv {
 
     /// 版本目錄內檔案的位元組（`install/versions/<v>/<rel>`）。
     pub fn version_bytes(&self, v: &str, rel: &str) -> Vec<u8> {
-        std::fs::read(self.install_root().join("versions").join(v).join(rel))
+        std::fs::read(self.root().versions.join(v).join(rel))
             .unwrap_or_else(|e| panic!("version_bytes({v}, {rel}) 讀取失敗：{e}"))
+    }
+
+    /// 穩定入口檔案位元組，依 fake 平台路徑語意讀取。
+    pub fn entry_bytes(&self, name: &str) -> Vec<u8> {
+        let root = self.root();
+        std::fs::read(root.bin.join(name))
+            .unwrap_or_else(|e| panic!("entry_bytes({name}) 讀取失敗：{e}"))
     }
 
     /// 寫入檔案（自動建立父目錄）。
@@ -1053,15 +1627,57 @@ impl TestEnv {
 
     /// 以 `sw_cli::run` 執行（`argv[0]` 為程式名）；回傳 `(rc, stdout, stderr)`。
     pub fn run(&self, argv: &[&str]) -> (i32, String, String) {
-        if self.crash_point.is_some() {
-            todo!("P4-T12: FaultPlan（sw_cli::run 的中斷注入）尚未接線；with_crash_at 不得靜默略過")
-        }
+        sw_cli::rollback::set_test_crash_point(self.crash_point.clone());
+        let hook = self.instance_appears.as_ref().map(|(endpoint, point, pid, lines)| {
+            let endpoint = endpoint.to_string();
+            let point = point.to_string();
+            let pid = *pid;
+            let lines = lines.clone();
+            let rpc = Arc::clone(&self.rpc);
+            let procs = Arc::clone(&self.procs);
+            let windows = self.windows;
+            let callback: Box<dyn FnOnce()> = Box::new(move || {
+                let reply = if lines.is_empty() {
+                    let token = &sha256_hex(&format!("handoff-{pid}"))[..32];
+                    format!(r#"{{"ok":true,"stopping":true,"handoff_token":"{token}"}}"#)
+                } else {
+                    let code = if lines.iter().any(|line| line.contains("flash")) { "FLASHING_BUSY" } else { "SESSION_BUSY" };
+                    format!(
+                        r#"{{"ok":false,"error_code":"{code}","busy":[{{"com":"COM0","state":"{}","foreground_busy":{},"outstanding_commands":0,"interactive_session_id":null,"recovering":false,"ops":[{}]}}]}}"#,
+                        if code == "FLASHING_BUSY" { "FLASHING" } else { "READY" },
+                        code == "SESSION_BUSY",
+                        lines.iter().map(|line| format!("\"{line}\"")).collect::<Vec<_>>().join(",")
+                    )
+                };
+                rpc.revive_endpoint(&endpoint);
+                rpc.respond(&endpoint, "health.ping", &format!(r#"{{"ok":true,"pid":{pid},"version":"test"}}"#));
+                rpc.respond(&endpoint, "health.status", &format!(r#"{{"ok":true,"pid":{pid},"version":"test"}}"#));
+                rpc.respond(&endpoint, "mcu.status", r#"{"ok":true,"flashing":false}"#);
+                rpc.respond(&endpoint, "session.list", OK_SESSION_LIST);
+                rpc.respond(&endpoint, "daemon.handoff_stop", &reply);
+                if lines.is_empty() {
+                    rpc.stop_after_send(&endpoint, "daemon.handoff_stop");
+                }
+                let appeared = if windows { DaemonProc::win(pid, &endpoint) } else {
+                    DaemonProc { pid, socket: Some(endpoint), tree: vec![ProcIdentity { pid, start_ticks: None }] }
+                };
+                procs.script(vec![vec![appeared]]);
+            });
+            (point, callback)
+        });
+        let (hook_point, hook_callback) = match hook { Some((point, callback)) => (Some(point), Some(callback)), None => (None, None) };
+        sw_cli::rollback::set_test_hook(hook_point, hook_callback);
         let pf = self.platform();
         let mut full: Vec<OsString> = vec![OsString::from("serialwrap")];
         full.extend(argv.iter().map(OsString::from));
         let mut out: Vec<u8> = Vec::new();
         let mut err: Vec<u8> = Vec::new();
-        let rc = sw_cli::run(full, &pf, &mut out, &mut err);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sw_cli::run(full, &pf, &mut out, &mut err)
+        }));
+        sw_cli::rollback::set_test_crash_point(None);
+        sw_cli::rollback::set_test_hook(None, None);
+        let rc = result.unwrap_or(137);
         (
             rc,
             String::from_utf8_lossy(&out).into_owned(),
@@ -1116,14 +1732,26 @@ impl TestEnv {
             .unwrap_or_else(|| panic!("fake component not configured: process"))
     }
 
+    /// Windows 登錄替身；非 Windows 測試環境未配置時會明確失敗。
+    pub fn registry(&self) -> &Arc<FakeRegistry> {
+        self.registry
+            .as_ref()
+            .unwrap_or_else(|| panic!("fake component not configured: registry"))
+    }
+
     /// 合併 `rpc:<method>`、`run:<argv>`、`spawn:<argv0>`、`service:<action>` 事件，依全程單調序號排序（跨來源合併）。
     ///
-    /// 尚未涵蓋（Task 7／12 承接）：`rpc:<method>#gone`（refused 連線的 method 須由 RpcConnector 傳入，現簽章不含）與
-    /// `journal:<step>`（journal 寫入尚未接線）。
+    /// `rpc:<method>#gone` 由測試替身明確標記；`journal:<step>`（journal 寫入尚未接線）由 Task 12 承接。
     pub fn event_order(&self) -> EventOrder {
         let mut events: Vec<(u64, String)> = Vec::new();
+        for (seq, label) in self.fs_events.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            events.push((*seq, label.clone()));
+        }
         for (seq, method) in self.rpc.request_events() {
             events.push((seq, format!("rpc:{method}")));
+        }
+        for (seq, method) in self.rpc.refused_connect_events() {
+            events.push((seq, format!("rpc:{method}#gone")));
         }
         for (seq, argv) in self.env.call_events() {
             events.push((seq, format!("run:{}", argv.join(" "))));
@@ -1243,7 +1871,10 @@ pub fn methods(t: &TestEnv) -> Vec<String> {
 }
 
 pub fn handoffs(t: &TestEnv) -> usize {
-    methods(t).iter().filter(|m| *m == "daemon.handoff_stop").count()
+    methods(t)
+        .iter()
+        .filter(|m| *m == "daemon.handoff_stop")
+        .count()
 }
 
 pub trait GetKey {
@@ -1427,22 +2058,64 @@ pub fn write_complete_bundle(
     extra_components: &[(&str, String)],
 ) -> BundleFixture {
     const REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
-    let cli_path = if windows { "bin/serialwrap.exe" } else { "bin/serialwrap" };
-    let launcher_path = if windows { "bin/serialwrapd.exe" } else { "bin/serialwrapd" };
+    let cli_path = if windows {
+        "bin/serialwrap.exe"
+    } else {
+        "bin/serialwrap"
+    };
+    let launcher_path = if windows {
+        "bin/serialwrapd.exe"
+    } else {
+        "bin/serialwrapd"
+    };
     let mut files = vec![
         (cli_path.to_string(), format!("cli-{v}\n").into_bytes()),
-        (launcher_path.to_string(), format!("launcher-{v}\n").into_bytes()),
-        ("py/bin/python3".to_string(), format!("runtime-{v}\n").into_bytes()),
-        ("py/sw_core/__init__.py".to_string(), b"VERSION = 1\n".to_vec()),
-        ("py/sw_core/cli.py".to_string(), format!("# cli {v}\n").into_bytes()),
-        ("py/sw_core/systemd_units.py".to_string(), b"UNITS = []\n".to_vec()),
-        ("py/sw_core/assets/skill/SKILL.md".to_string(), b"skill\n".to_vec()),
-        ("py/sw_core/assets/skill/SKILL_WINDOWS.md".to_string(), b"skill windows\n".to_vec()),
-        ("py/sw_core/assets/profiles/default.yaml".to_string(), b"profile: default\n".to_vec()),
-        ("py/sw_core/__pycache__/cli.cpython-312.pyc".to_string(), b"compiled cli\n".to_vec()),
-        ("py/sw_core/stale.pyc".to_string(), b"compiled module\n".to_vec()),
+        (
+            launcher_path.to_string(),
+            format!("launcher-{v}\n").into_bytes(),
+        ),
+        (
+            "py/bin/python3".to_string(),
+            format!("runtime-{v}\n").into_bytes(),
+        ),
+        (
+            "py/sw_core/__init__.py".to_string(),
+            b"VERSION = 1\n".to_vec(),
+        ),
+        (
+            "py/sw_core/cli.py".to_string(),
+            format!("# cli {v}\n").into_bytes(),
+        ),
+        (
+            "py/sw_core/systemd_units.py".to_string(),
+            b"UNITS = []\n".to_vec(),
+        ),
+        (
+            "py/sw_core/assets/skill/SKILL.md".to_string(),
+            b"skill\n".to_vec(),
+        ),
+        (
+            "py/sw_core/assets/skill/SKILL_WINDOWS.md".to_string(),
+            b"skill windows\n".to_vec(),
+        ),
+        (
+            "py/sw_core/assets/profiles/default.yaml".to_string(),
+            b"profile: default\n".to_vec(),
+        ),
+        (
+            "py/sw_core/__pycache__/cli.cpython-312.pyc".to_string(),
+            b"compiled cli\n".to_vec(),
+        ),
+        (
+            "py/sw_core/stale.pyc".to_string(),
+            b"compiled module\n".to_vec(),
+        ),
     ];
-    files.extend(extra_files.iter().map(|(path, body)| (path.to_string(), body.clone())));
+    files.extend(
+        extra_files
+            .iter()
+            .map(|(path, body)| (path.to_string(), body.clone())),
+    );
     for (relative, body) in &files {
         let path = dir.join(relative);
         if let Some(parent) = path.parent() {
@@ -1452,7 +2125,10 @@ pub fn write_complete_bundle(
     }
 
     let body_of = |relative: &str| -> &[u8] {
-        files.iter().find(|(path, _)| path == relative).map(|(_, body)| body.as_slice())
+        files
+            .iter()
+            .find(|(path, _)| path == relative)
+            .map(|(_, body)| body.as_slice())
             .unwrap_or_else(|| panic!("bundle 缺少檔案：{relative}"))
     };
     let cli_sha = sha256_hex(body_of(cli_path));
@@ -1464,27 +2140,47 @@ pub fn write_complete_bundle(
     let skill_windows_sha = sha256_hex(body_of("py/sw_core/assets/skill/SKILL_WINDOWS.md"));
     let supervisor_sha = sha256_hex(body_of("py/sw_core/systemd_units.py"));
     let task_xml_sha = sha256_hex(sw_pal::service_ctl::TASK_XML_TEMPLATE);
-    let extra_json = extra_components.iter().map(|(key, value)| format!(r#","{key}":{value}"#)).collect::<String>();
+    let extra_json = extra_components
+        .iter()
+        .map(|(key, value)| format!(r#","{key}":{value}"#))
+        .collect::<String>();
     let manifest = format!(
         r#"{{"schema_version":1,"bundle_version":"{v}","stage":"1A","created_at":"2026-10-19T00:00:00Z","target":"{target}","git_revision":"{REVISION}","contract_revision":"{REVISION}","components":{{"cli":{{"implementation":"rust","version":"{v}","git_revision":"{REVISION}","path":"{cli_path}","sha256":"{cli_sha}"}},"daemon":{{"implementation":"python","version":"{v}","git_revision":"{REVISION}","launcher":{{"path":"{launcher_path}","sha256":"{launcher_sha}"}},"entry":["py/bin/python3","-I","-B","-m","sw_core.cli"],"runtime":{{"path":"py/bin/python3","python_version":"3.12.3","sha256":"{runtime_sha}"}},"package":{{"name":"serialwrap","version":"{v}","wheel_sha256":null,"tree_sha256":"{package_tree}"}},"state_schema":"python-state-v0"}},"python_cli_delegate":{{"entry":["py/bin/python3","-I","-B","-m","sw_core.cli"],"tree_sha256":"{package_tree}"}},"assets":{{"skill_sha256":"{skill_sha}","skill_windows_sha256":"{skill_windows_sha}","profiles_sha256":"{profile_tree}"}},"supervisor":{{"default_mode":"on-demand","definition_sha256":"{supervisor_sha}","task_xml_template_sha256":"{task_xml_sha}"}}{extra_json}}},"pairing":{{"rule":"exact","cli_version":"{v}","daemon_version":"{v}"}}}}"#
     );
     std::fs::write(dir.join("release-manifest.json"), &manifest).expect("manifest 寫入失敗");
 
-    let mut sums = files.iter().map(|(path, body)| (path.clone(), sha256_hex(body))).collect::<Vec<_>>();
+    let mut sums = files
+        .iter()
+        .map(|(path, body)| (path.clone(), sha256_hex(body)))
+        .collect::<Vec<_>>();
     sums.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-    let sums_text = sums.iter().map(|(path, digest)| format!("{digest}  {path}\n")).collect::<String>();
+    let sums_text = sums
+        .iter()
+        .map(|(path, digest)| format!("{digest}  {path}\n"))
+        .collect::<String>();
     std::fs::write(dir.join("SHA256SUMS"), sums_text).expect("SHA256SUMS 寫入失敗");
-    BundleFixture { manifest, cli_sha, launcher_sha, runtime_sha }
+    BundleFixture {
+        manifest,
+        cli_sha,
+        launcher_sha,
+        runtime_sha,
+    }
 }
 
 fn fixture_tree_sha256(files: &[(String, Vec<u8>)], prefix: &str, rel_prefix: &str) -> String {
-    let mut entries = files.iter().filter_map(|(path, body)| {
-        let relative = path.strip_prefix(prefix)?;
-        if relative.is_empty() || relative.split('/').any(|part| part == "__pycache__") || relative.ends_with(".pyc") {
-            return None;
-        }
-        Some((format!("{rel_prefix}{relative}"), sha256_hex(body)))
-    }).collect::<Vec<_>>();
+    let mut entries = files
+        .iter()
+        .filter_map(|(path, body)| {
+            let relative = path.strip_prefix(prefix)?;
+            if relative.is_empty()
+                || relative.split('/').any(|part| part == "__pycache__")
+                || relative.ends_with(".pyc")
+            {
+                return None;
+            }
+            Some((format!("{rel_prefix}{relative}"), sha256_hex(body)))
+        })
+        .collect::<Vec<_>>();
     entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
     let mut material = String::new();
     for (relative, digest) in entries {
@@ -1536,4 +2232,8 @@ fn daemon_proc(pid: u32) -> DaemonProc {
             start_ticks: None,
         }],
     }
+}
+
+fn health_response(pid: u32) -> String {
+    format!(r#"{{"ok":true,"pid":{pid},"version":"test"}}"#)
 }

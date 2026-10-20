@@ -187,15 +187,31 @@ fn is_forbidden_code_literal(s: &str) -> bool {
     if !chars[0].is_ascii_uppercase() {
         return false;
     }
-    if !chars.iter().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_') {
+    if !chars
+        .iter()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
+    {
         return false;
     }
-    // 允許清單：SERIALWRAP_*, SW_*, UNKNOWN_ERROR
-    // CARGO_PKG_VERSION 是編譯期套件中繼資料名稱，不是 RPC 錯誤碼。
+    // 允許清單：環境變數名稱、INI DEFAULT 區段名稱、SERIALWRAP_*、SW_*、UNKNOWN_ERROR。
+    // CARGO_PKG_VERSION 是編譯期套件中繼資料名稱；其餘允許值也不是 RPC 錯誤碼。
     if s.starts_with("SERIALWRAP_")
         || s.starts_with("SW_")
         || s == "UNKNOWN_ERROR"
         || s == "CARGO_PKG_VERSION"
+        || matches!(
+            s,
+            "HOME"
+                | "USERPROFILE"
+                | "HOMEDRIVE"
+                | "HOMEPATH"
+                | "USER"
+                | "LOGNAME"
+                | "SUDO_USER"
+                | "XDG_CONFIG_HOME"
+                | "XDG_DATA_HOME"
+                | "DEFAULT"
+        )
     {
         return false;
     }
@@ -273,7 +289,8 @@ fn extract_error_code_variants(source: &str) -> Vec<String> {
             .chars()
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
             .collect();
-        if !ident.is_empty() && ident.chars().next().unwrap().is_ascii_alphabetic() {
+        // ErrorCode::parse／as_str 是型別方法，不是 enum variant；variant 一律以 UpperCamel 開頭。
+        if !ident.is_empty() && ident.chars().next().unwrap().is_ascii_uppercase() {
             variants.push(ident);
         }
         rest = after;
@@ -329,13 +346,19 @@ fn error_resp_type_enforcement_and_execution() {
     // 執行期呼叫：在 red stage 呼叫 todo!() 會 panic 失敗
     let code = ErrorCode::parse("INVALID_ENDPOINT").expect("INVALID_ENDPOINT must parse");
     let resp = sw_cli::output::error_resp(code, Some("test message"));
-    assert_eq!(resp.get("ok"), Some(&sw_proto::pyjson::PyValue::Bool(false)));
+    assert_eq!(
+        resp.get("ok"),
+        Some(&sw_proto::pyjson::PyValue::Bool(false))
+    );
 }
 
 #[test]
 fn no_forbidden_uppercase_string_literals_in_sw_cli_src() {
     // 2. 掃描 crates/sw-cli/src/**/*.rs（剝除註解後），任何符合 "[A-Z][A-Z0-9_]{3,}" 的字串常值即失敗
-    let src_dir = common::data_root().join("crates").join("sw-cli").join("src");
+    let src_dir = common::data_root()
+        .join("crates")
+        .join("sw-cli")
+        .join("src");
     let violations = scan_forbidden_literals(&src_dir);
     assert!(
         violations.is_empty(),
@@ -346,7 +369,19 @@ fn no_forbidden_uppercase_string_literals_in_sw_cli_src() {
 #[test]
 fn package_version_build_variable_is_not_an_error_code() {
     assert!(!is_forbidden_code_literal("CARGO_PKG_VERSION"));
+    assert!(!is_forbidden_code_literal("HOME"));
+    assert!(!is_forbidden_code_literal("DEFAULT"));
     assert!(is_forbidden_code_literal("SESSION_NOT_READY"));
+}
+
+#[test]
+fn emitted_code_extractor_ignores_associated_methods() {
+    assert_eq!(
+        extract_error_code_variants(
+            "ErrorCode::SessionBusy.as_str(); ErrorCode::parse(code); ErrorCode::as_str",
+        ),
+        vec!["SessionBusy".to_string()]
+    );
 }
 
 #[test]
@@ -366,7 +401,11 @@ fn extracted_emitted_codes_documented_and_written_to_target() {
     fs::write(&out_file, &out_text).expect("寫入 target/emitted_codes.sw-cli.txt 失敗");
 
     let yaml_p = root.join("contracts").join("error_codes.yaml");
-    let skill_p = root.join("sw_core").join("assets").join("skill").join("SKILL.md");
+    let skill_p = root
+        .join("sw_core")
+        .join("assets")
+        .join("skill")
+        .join("SKILL.md");
     let yaml_text = fs::read_to_string(&yaml_p).unwrap_or_default();
     let skill_text = fs::read_to_string(&skill_p).unwrap_or_default();
 

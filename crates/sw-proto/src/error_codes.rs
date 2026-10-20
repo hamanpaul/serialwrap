@@ -19,7 +19,7 @@ pub enum ErrorCode {
     BenchStateIoError,
     /// 傳輸後 md5 校驗值不符
     ChecksumMismatch,
-    /// 目標端 md5sum 無回應或無法擷取校驗值
+    /// 目標端 md5sum 無回應或無法擷取校驗值；Rust setup phases: rollback_verify、update_verify、install_recover
     ChecksumVerifyFailed,
     /// 命令字串含換行字元，拒絕送入 UART
     CmdContainsNewline,
@@ -43,9 +43,9 @@ pub enum ErrorCode {
     DaemonAlreadyRunningElsewhere,
     /// Windows 後端找不到 serialwrapd 可執行檔
     DaemonBinaryNotFound,
-    /// spawn 後 daemon 行程在就緒前即退出
+    /// spawn 後 daemon 行程在就緒前即退出；Rust setup phase 包含 update_start_and_verify
     DaemonExited,
-    /// spawn 後等待時間內 health.ping 未成功
+    /// spawn 後等待時間內 health.ping 未成功；Rust setup phase 包含 update_start_and_verify
     DaemonNotReady,
     /// 指定的 by_id 已綁定到其他 session
     DeviceAlreadyBound,
@@ -55,7 +55,7 @@ pub enum ErrorCode {
     DeviceNotFound,
     /// by_id 不在目前的裝置清單中（未插入或尚未列舉）
     DeviceNotPresent,
-    /// UART 獨占開啟或 holder 預檢確認裝置仍被占用
+    /// UART 獨占開啟或 holder 預檢確認裝置仍被占用；setup phases: update_safety_check、update_confirm_released、rollback_verify、install_recover、supervision_set_safety_check、supervision_set_release
     DeviceStillHeld,
     /// ack_mode 為 echo，但 bridge 不支援 echo 節流送出
     EchoAckUnsupported,
@@ -65,7 +65,7 @@ pub enum ErrorCode {
     EnvFileSourceFailed,
     /// handler 拋出未預期例外，framing 層以 message 回傳（回應無 version）
     Exception,
-    /// session 處於 FLASHING 或 flash 臨界區，命令或操作被拒
+    /// session 處於 FLASHING 或 flash 臨界區，命令或操作被拒；Rust phase 包含 update_safety_check、supervision_set_safety_check
     FlashingBusy,
     /// 燒錄目標是可下命令的 console 裝置，且未指定 force，拒絕執行
     FlashTargetIsConsole,
@@ -79,7 +79,7 @@ pub enum ErrorCode {
     InteractiveExpired,
     /// interactive_id 不存在，或 lease 狀態已不是 active
     InteractiveNotFound,
-    /// CLI 本地流程發生未預期例外
+    /// CLI 本地流程發生未預期例外；Rust CLI phase 包含 service_disable、service_enable、service_restart_enable、autostart_lock、update_journal、update_autostart_hold、update_autostart_release、install_recover、update_start_and_verify
     InternalError,
     /// 參數缺漏或型別／值不合法（RPC 分派或 CLI 參數驗證）
     InvalidArgs,
@@ -113,7 +113,7 @@ pub enum ErrorCode {
     MoveFailed,
     /// mv 之後 prompt 逾時，搬移結果不明
     MoveTimeout,
-    /// systemd-system 的 start、stop 或 restart 未帶 --with-sudo
+    /// systemd-system 的 start、stop 或 restart 未帶 --with-sudo；windows-service 的 service_disable phase 未帶 --with-sudo；Rust setup phase 包含 update_autostart_hold
     NeedsSudo,
     /// session 為 command-capable 且狀態非 READY／ATTACHING，又無 last_error 可回報
     NotReady,
@@ -145,7 +145,7 @@ pub enum ErrorCode {
     SampleReadFailed,
     /// send 回呼拋出例外，無法確定命令是否已送出（結果不明）
     SendFailed,
-    /// 同一 session 的前景操作仍在進行中
+    /// 同一 session 的前景操作仍在進行中；setup phases: update_safety_check、update_confirm_released、update_revert、rollback_verify、install_recover、supervision_set_safety_check
     SessionBusy,
     /// 已有不可搶占的 interactive lease，或 SC-13 到期收尾的 ownership restore 尚未完成；相關操作被拒
     SessionInteractiveBusy,
@@ -175,7 +175,7 @@ pub enum ErrorCode {
     TargetEncoderMissing,
     /// 隔離測試實例的裝置 allowlist 判定不通過（非隔離實例設定了 allowlist）；stderr 印出 serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED 與原因，exit 2
     TestDeviceAllowlistRejected,
-    /// 連線、傳送或接收逾時，或 daemon 管理操作等待舊行程結束逾時；白名單唯讀方法可重試，其他方法不可直接重送
+    /// 連線、傳送或接收逾時，或 daemon 管理操作等待舊行程結束逾時；CLI phase 包含 restart_wait_old_exit、reconcile_wait_old_exit、service_stop_wait_stop、service_restart_wait_stop、autostart_lock、install_lock、update_confirm_released、update_start_and_verify、update_autostart_hold、update_revert、install_recover、supervision_set_safety_check；白名單唯讀方法可重試，其他方法不可直接重送
     Timeout,
     /// echo-ACK 路徑 echo 停滯；換行未送出，命令未執行
     TransferEchoStall,
@@ -283,7 +283,7 @@ impl ErrorCode {
         },
         ErrorMeta {
             code: "CHECKSUM_VERIFY_FAILED",
-            interfaces: &[Interface::Rpc],
+            interfaces: &[Interface::Rpc, Interface::CliLocal],
             retryable: Retryable::Conditional,
             reachable: true,
             status: Status::Existing,
@@ -409,7 +409,7 @@ impl ErrorCode {
         },
         ErrorMeta {
             code: "DEVICE_STILL_HELD",
-            interfaces: &[Interface::Rpc],
+            interfaces: &[Interface::Rpc, Interface::CliLocal],
             retryable: Retryable::Conditional,
             reachable: true,
             status: Status::Implemented,
@@ -724,7 +724,7 @@ impl ErrorCode {
         },
         ErrorMeta {
             code: "SESSION_BUSY",
-            interfaces: &[Interface::Rpc, Interface::Rec],
+            interfaces: &[Interface::Rpc, Interface::Rec, Interface::CliLocal],
             retryable: Retryable::Yes,
             reachable: true,
             status: Status::Existing,

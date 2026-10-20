@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use super::rpc::FakeRpcConnector;
 use crate::proc_scan::{DaemonProc, HolderScanStatus, ProcIdentity, ProcScan, ScanFailure};
+use crate::traits::Clock;
 
 #[derive(Debug, Clone)]
 enum GateKind {
@@ -33,6 +34,9 @@ pub struct FakeProcScan {
     alive: Mutex<BTreeMap<u32, Vec<bool>>>,
     gates: Mutex<BTreeMap<u32, ConnectGate>>,
     holders: Mutex<(Vec<u32>, Option<HolderScanStatus>)>,
+    holders_script: Mutex<Vec<(Vec<u32>, HolderScanStatus)>>,
+    replacement: Mutex<Option<(Arc<super::clock::FakeClock>, u64, u32, DaemonProc)>>,
+    rpc_relaunch: Mutex<Option<(Arc<super::rpc::FakeRpcConnector>, String)>>,
 }
 
 impl FakeProcScan {
@@ -53,6 +57,12 @@ impl FakeProcScan {
         *self.failing.lock().unwrap_or_else(|e| e.into_inner()) = true;
     }
 
+    /// 將 RPC 監管模型新拉起的 PID 納入 process scan 快照。
+    pub fn follow_rpc_relaunch(&self, rpc: Arc<super::rpc::FakeRpcConnector>, endpoint: &str) {
+        *self.rpc_relaunch.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((rpc, endpoint.to_string()));
+    }
+
     /// 指定 pid 的存活序列（依序；用盡後保持最後一筆）。
     pub fn alive_script(&self, pid: u32, seq: Vec<bool>) {
         self.alive
@@ -63,18 +73,26 @@ impl FakeProcScan {
 
     /// `pid` 在 `conn` 對 `ep` 的連線次數達 `n` 之前存活，達到後不存活（與 `refuse_from_connect(ep, n)` 同輪翻轉）。
     pub fn alive_until_connect(&self, pid: u32, conn: Arc<FakeRpcConnector>, ep: &str, n: usize) {
-        self.gates
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(pid, ConnectGate { conn, ep: ep.to_string(), kind: GateKind::BelowConnects(n) });
+        self.gates.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            pid,
+            ConnectGate {
+                conn,
+                ep: ep.to_string(),
+                kind: GateKind::BelowConnects(n),
+            },
+        );
     }
 
     /// `pid` 在 `conn` 對 `ep` 進入 `stop_after_send` 停止狀態之前存活（之後不存活）。
     pub fn alive_until_stopped(&self, pid: u32, conn: Arc<FakeRpcConnector>, ep: &str) {
-        self.gates
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(pid, ConnectGate { conn, ep: ep.to_string(), kind: GateKind::UntilStopped });
+        self.gates.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            pid,
+            ConnectGate {
+                conn,
+                ep: ep.to_string(),
+                kind: GateKind::UntilStopped,
+            },
+        );
     }
 
     fn gate_alive(gate: &ConnectGate) -> bool {
@@ -86,7 +104,12 @@ impl FakeProcScan {
 
     /// 非消耗性查詢：`pid` 是否已由連線閘門判定為不存活（不推進任何腳本序列）。
     fn gate_says_gone(&self, pid: u32) -> bool {
-        match self.gates.lock().unwrap_or_else(|e| e.into_inner()).get(&pid) {
+        match self
+            .gates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&pid)
+        {
             Some(g) => !Self::gate_alive(g),
             None => false,
         }
@@ -96,13 +119,71 @@ impl FakeProcScan {
         *self.holders.lock().unwrap_or_else(|e| e.into_inner()) = (v, Some(st));
     }
 
+    /// 依序回傳序列埠 holder 掃描結果；用盡後回到固定結果。
+    pub fn holders_script(&self, seq: Vec<(Vec<u32>, HolderScanStatus)>) {
+        *self
+            .holders_script
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = seq;
+    }
+
     pub fn set_serialwrapd_tty_holders(&self, v: &[u32]) {
         self.holders(v.to_vec(), HolderScanStatus::Ok);
+    }
+
+    /// 在 FakeClock 指定時間以新的 PID 與 start_ticks 取代目前 daemon identity。
+    pub fn replace_identity_after(
+        &self,
+        clock: Arc<super::clock::FakeClock>,
+        after: std::time::Duration,
+        from_pid: u32,
+        to_pid: u32,
+    ) {
+        let socket = self
+            .base
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|daemon| daemon.pid == from_pid)
+            .and_then(|daemon| daemon.socket.clone());
+        let replacement = DaemonProc {
+            pid: to_pid,
+            socket,
+            tree: vec![ProcIdentity {
+                pid: to_pid,
+                start_ticks: Some(u64::from(to_pid)),
+            }],
+        };
+        let at = clock
+            .mono_ns()
+            .saturating_add(after.as_nanos().min(u64::MAX as u128) as u64);
+        *self.replacement.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((clock, at, from_pid, replacement));
+    }
+
+    fn apply_replacement(&self) {
+        let mut scheduled = self.replacement.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((clock, at, from_pid, replacement)) = scheduled.as_ref() else {
+            return;
+        };
+        if clock.mono_ns() < *at {
+            return;
+        }
+        let from_pid = *from_pid;
+        let replacement = replacement.clone();
+        let mut base = self.base.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = base.iter_mut().find(|daemon| daemon.pid == from_pid) {
+            *slot = replacement;
+        } else {
+            base.push(replacement);
+        }
+        *scheduled = None;
     }
 }
 
 impl ProcScan for FakeProcScan {
     fn serialwrapd_instances(&self) -> Result<Vec<DaemonProc>, ScanFailure> {
+        self.apply_replacement();
         if *self.failing.lock().unwrap_or_else(|e| e.into_inner()) {
             return Err(ScanFailure);
         }
@@ -110,23 +191,63 @@ impl ProcScan for FakeProcScan {
         if !script.is_empty() {
             return Ok(script.remove(0));
         }
-        let base = self.base.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        Ok(base.into_iter().filter(|d| !self.gate_says_gone(d.pid)).collect())
+        let mut base = self.base.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some((rpc, endpoint)) = self
+            .rpc_relaunch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            if let Some(pid) = rpc.relaunched_pid(endpoint) {
+                if !base.iter().any(|daemon| daemon.pid == pid) {
+                    base.push(DaemonProc {
+                        pid,
+                        socket: Some(endpoint.clone()),
+                        tree: vec![ProcIdentity {
+                            pid,
+                            start_ticks: None,
+                        }],
+                    });
+                }
+            }
+        }
+        Ok(base
+            .into_iter()
+            .filter(|d| !self.gate_says_gone(d.pid))
+            .collect())
     }
 
     fn serialwrapd_tty_holders(&self, _paths: &[PathBuf]) -> (Vec<u32>, HolderScanStatus) {
+        let mut script = self
+            .holders_script
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !script.is_empty() {
+            return script.remove(0);
+        }
         let guard = self.holders.lock().unwrap_or_else(|e| e.into_inner());
         (guard.0.clone(), guard.1.unwrap_or(HolderScanStatus::Ok))
     }
 
     fn pid_alive(&self, pid: u32) -> bool {
-        if let Some(gate) = self.gates.lock().unwrap_or_else(|e| e.into_inner()).get(&pid).cloned() {
+        self.apply_replacement();
+        if let Some(gate) = self
+            .gates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&pid)
+            .cloned()
+        {
             return Self::gate_alive(&gate);
         }
         {
             let mut alive = self.alive.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(seq) = alive.get_mut(&pid) {
-                return if seq.len() > 1 { seq.remove(0) } else { seq.first().copied().unwrap_or(false) };
+                return if seq.len() > 1 {
+                    seq.remove(0)
+                } else {
+                    seq.first().copied().unwrap_or(false)
+                };
             }
         }
         self.base
@@ -137,6 +258,7 @@ impl ProcScan for FakeProcScan {
     }
 
     fn identity_alive(&self, id: &ProcIdentity) -> bool {
+        self.apply_replacement();
         if !self.pid_alive(id.pid) {
             return false;
         }

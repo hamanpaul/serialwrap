@@ -120,6 +120,7 @@ fn skill_default_windows_outputs_skill_windows() {
         io,
         verbose: 0,
         cli_version: sw_proto::version::version(),
+        autostart_lock: None,
     };
     let ns = sw_cli::argparse::Namespace::default();
     let rc = run_skill(&mut ctx, &ns);

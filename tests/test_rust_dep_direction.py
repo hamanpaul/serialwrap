@@ -24,6 +24,7 @@ OK_LAYOUT: dict[str, list[tuple[str, str]]] = {
     "sw-core": [("sw-proto", "normal"), ("sw-pal", "normal")],
     "sw-daemon": [("sw-core", "normal"), ("sw-proto", "normal"), ("sw-pal", "normal")],
     "sw-cli": [("sw-proto", "normal"), ("sw-pal", "normal"), ("sw-pal", "dev")],
+    "sw-com0com-helper": [("sw-pal", "normal")],
 }
 
 
@@ -113,6 +114,7 @@ def test_missing_member_is_tool_error(tmp_path):
         "sw-core": [("sw-proto", "normal"), ("sw-pal", "normal")],
         "sw-daemon": [("sw-core", "normal")],
         "sw-client": [("sw-core", "normal")],
+        "sw-com0com-helper": [("sw-pal", "normal")],
     }
     ws = _make_ws(tmp_path, layout)
     r = _run(ws)

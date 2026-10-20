@@ -1646,19 +1646,56 @@ fn spec_remote(_d: &SpecDefaults) -> ParserSpec {
 fn spec_connect(_d: &SpecDefaults) -> ParserSpec {
     ParserSpec {
         prog: "serialwrap connect".to_string(),
-        description: Some("從 benches.yaml 解析 bench 代號，重用既有 remote -L spawn 路徑建立或拆除隧道。"),
+        description: Some(
+            "從 benches.yaml 解析 bench 代號，重用既有 remote -L spawn 路徑建立或拆除隧道。",
+        ),
         epilog: None,
         raw_text: false,
         raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
-            ActionSpec { option_strings: vec!["-h", "--help"], dest: "help", kind: ActionKind::Help, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("show this help message and exit".to_string()), metavar: None, version: None },
-            ActionSpec { option_strings: vec!["--close"], dest: "close", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("拆除該代號對應 local_port 的隧道，並清除 endpoint 記憶".to_string()), metavar: None, version: None },
-            ActionSpec { option_strings: vec![], dest: "code", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: true, help: Some("benches.yaml 的 bench 代號".to_string()), metavar: None, version: None },
+            ActionSpec {
+                option_strings: vec!["-h", "--help"],
+                dest: "help",
+                kind: ActionKind::Help,
+                nargs: Nargs::One,
+                conv: Conv::Str,
+                default: ArgValue::None,
+                choices: None,
+                required: false,
+                help: Some("show this help message and exit".to_string()),
+                metavar: None,
+                version: None,
+            },
+            ActionSpec {
+                option_strings: vec!["--close"],
+                dest: "close",
+                kind: ActionKind::StoreTrue,
+                nargs: Nargs::One,
+                conv: Conv::Str,
+                default: ArgValue::Bool(false),
+                choices: None,
+                required: false,
+                help: Some("拆除該代號對應 local_port 的隧道，並清除 endpoint 記憶".to_string()),
+                metavar: None,
+                version: None,
+            },
+            ActionSpec {
+                option_strings: vec![],
+                dest: "code",
+                kind: ActionKind::Store,
+                nargs: Nargs::One,
+                conv: Conv::Str,
+                default: ArgValue::None,
+                choices: None,
+                required: true,
+                help: Some("benches.yaml 的 bench 代號".to_string()),
+                metavar: None,
+                version: None,
+            },
         ],
-        mutex: vec![
-        ],
+        mutex: vec![],
         sub: None,
     }
 }
@@ -1667,17 +1704,28 @@ fn spec_connect(_d: &SpecDefaults) -> ParserSpec {
 fn spec_benches(_d: &SpecDefaults) -> ParserSpec {
     ParserSpec {
         prog: "serialwrap benches".to_string(),
-        description: Some("列出 benches.yaml 各代號、目前記住的 endpoint，以及本機 connect tunnel 是否仍存活。"),
+        description: Some(
+            "列出 benches.yaml 各代號、目前記住的 endpoint，以及本機 connect tunnel 是否仍存活。",
+        ),
         epilog: None,
         raw_text: false,
         raw_description: false,
         add_help: true,
         allow_abbrev: true,
-        actions: vec![
-            ActionSpec { option_strings: vec!["-h", "--help"], dest: "help", kind: ActionKind::Help, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("show this help message and exit".to_string()), metavar: None, version: None },
-        ],
-        mutex: vec![
-        ],
+        actions: vec![ActionSpec {
+            option_strings: vec!["-h", "--help"],
+            dest: "help",
+            kind: ActionKind::Help,
+            nargs: Nargs::One,
+            conv: Conv::Str,
+            default: ArgValue::None,
+            choices: None,
+            required: false,
+            help: Some("show this help message and exit".to_string()),
+            metavar: None,
+            version: None,
+        }],
+        mutex: vec![],
         sub: None,
     }
 }
@@ -1708,22 +1756,61 @@ fn spec_supervision_mode(_d: &SpecDefaults) -> ParserSpec {
 fn spec_service(_d: &SpecDefaults) -> ParserSpec {
     ParserSpec {
         prog: "serialwrap service".to_string(),
-        description: Some("包裝 systemctl，按 config.yaml 的 supervision_mode 決定呼叫方式。
+        description: Some(
+            "包裝 systemctl，按 config.yaml 的 supervision_mode 決定呼叫方式。
 systemd-user 模式：免 sudo。
 systemd-system 模式：start/stop/restart 需 root（加 --with-sudo 代跑）。
-on-demand 模式：不可用。"),
+on-demand 模式：不可用。",
+        ),
         epilog: None,
         raw_text: false,
         raw_description: false,
         add_help: true,
         allow_abbrev: true,
         actions: vec![
-            ActionSpec { option_strings: vec!["-h", "--help"], dest: "help", kind: ActionKind::Help, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("show this help message and exit".to_string()), metavar: None, version: None },
-            ActionSpec { option_strings: vec!["--with-sudo"], dest: "with_sudo", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("systemd-system 模式的特權動作（start/stop/restart）以 sudo 執行".to_string()), metavar: None, version: None },
-            ActionSpec { option_strings: vec![], dest: "action", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: Some(vec!["start", "stop", "restart", "status"]), required: true, help: Some("要執行的 systemctl 動作".to_string()), metavar: None, version: None },
+            ActionSpec {
+                option_strings: vec!["-h", "--help"],
+                dest: "help",
+                kind: ActionKind::Help,
+                nargs: Nargs::One,
+                conv: Conv::Str,
+                default: ArgValue::None,
+                choices: None,
+                required: false,
+                help: Some("show this help message and exit".to_string()),
+                metavar: None,
+                version: None,
+            },
+            ActionSpec {
+                option_strings: vec!["--with-sudo"],
+                dest: "with_sudo",
+                kind: ActionKind::StoreTrue,
+                nargs: Nargs::One,
+                conv: Conv::Str,
+                default: ArgValue::Bool(false),
+                choices: None,
+                required: false,
+                help: Some(
+                    "systemd-system 模式的特權動作（start/stop/restart）以 sudo 執行".to_string(),
+                ),
+                metavar: None,
+                version: None,
+            },
+            ActionSpec {
+                option_strings: vec![],
+                dest: "action",
+                kind: ActionKind::Store,
+                nargs: Nargs::One,
+                conv: Conv::Str,
+                default: ArgValue::None,
+                choices: Some(vec!["start", "stop", "restart", "status"]),
+                required: true,
+                help: Some("要執行的 systemctl 動作".to_string()),
+                metavar: None,
+                version: None,
+            },
         ],
-        mutex: vec![
-        ],
+        mutex: vec![],
         sub: None,
     }
 }
@@ -1750,9 +1837,12 @@ system scope 的特權動作需 --with-sudo，否則只回報待執行的 sudo �
             ActionSpec { option_strings: vec!["--windows-task"], dest: "windows_task", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("Windows：以工作排程器登入自啟監管（Windows 預設）".to_string()), metavar: None, version: None },
             ActionSpec { option_strings: vec!["--windows-service"], dest: "windows_service", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("Windows：以 Windows 服務監管（OD-12：只列出待執行指令）".to_string()), metavar: None, version: None },
             ActionSpec { option_strings: vec!["--rollback"], dest: "rollback", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("回滾到上一個完整發佈組合（Previous）".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec!["--with-com0com"], dest: "with_com0com", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("Windows：選擇安裝實驗性的 com0com 虛擬序列埠（僅此選用元件會要求 UAC）".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec!["--remove-com0com"], dest: "remove_com0com", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("Windows：移除 com0com 預設虛擬序列埠 pair".to_string()), metavar: None, version: None },
         ],
         mutex: vec![
             MutexSpec { required: false, dests: vec!["user", "system", "on_demand", "windows_task", "windows_service", "rollback"] },
+            MutexSpec { required: false, dests: vec!["with_com0com", "remove_com0com"] },
         ],
         sub: None,
     }
@@ -1762,20 +1852,31 @@ system scope 的特權動作需 --with-sudo，否則只回報待執行的 sudo �
 fn spec_doctor(_d: &SpecDefaults) -> ParserSpec {
     ParserSpec {
         prog: "serialwrap doctor".to_string(),
-        description: Some("對安裝與執行環境做一系列唯讀檢查並印出 JSON 報告（依平台選擇檢查清單，#131）。
+        description: Some(
+            "對安裝與執行環境做一系列唯讀檢查並印出 JSON 報告（依平台選擇檢查清單，#131）。
 Linux：systemd／wsl_systemd／devices／serialwrap_minicom_on_path／jq_on_path／
 minicom_on_path 為 advisory（缺少不致命，不拉低整體 ok；#149）。
-Windows：serialwrap_on_path／serialwrapd_on_path／daemon_endpoint／devices 為 advisory。"),
+Windows：serialwrap_on_path／serialwrapd_on_path／daemon_endpoint／devices 為 advisory。",
+        ),
         epilog: None,
         raw_text: true,
         raw_description: false,
         add_help: true,
         allow_abbrev: true,
-        actions: vec![
-            ActionSpec { option_strings: vec!["-h", "--help"], dest: "help", kind: ActionKind::Help, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("show this help message and exit".to_string()), metavar: None, version: None },
-        ],
-        mutex: vec![
-        ],
+        actions: vec![ActionSpec {
+            option_strings: vec!["-h", "--help"],
+            dest: "help",
+            kind: ActionKind::Help,
+            nargs: Nargs::One,
+            conv: Conv::Str,
+            default: ArgValue::None,
+            choices: None,
+            required: false,
+            help: Some("show this help message and exit".to_string()),
+            metavar: None,
+            version: None,
+        }],
+        mutex: vec![],
         sub: None,
     }
 }

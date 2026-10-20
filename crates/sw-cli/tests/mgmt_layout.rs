@@ -86,6 +86,7 @@ impl Rig {
             io: TextIo::new(&mut self.out, &mut self.err, self.p.caps.text_newline),
             verbose: 0,
             cli_version: sw_proto::version::version(),
+            autostart_lock: None,
         }
     }
 }
@@ -774,7 +775,8 @@ fn verify_bundle_rejects_missing_digest_and_component_paths_that_escape() {
     for escaped_path in ["../outside-cli".to_string(), outside.display().to_string()] {
         incomplete = fx.manifest.replace(
             "\"path\":\"bin/serialwrap\"",
-            &format!("\"path\":\"{escaped_path}\""),
+            // JSON 字串跳脫（Windows 絕對路徑含 `\\`，直接內插會成為無效跳脫序列）。
+            &format!("\"path\":\"{}\"", escaped_path.replace('\\', "\\\\")),
         );
         t.write_file(&bundle.join("release-manifest.json"), incomplete.as_bytes());
         let m = parse_manifest(&incomplete).expect("逃逸路徑 fixture 應可解析後由 verifier 拒絕");

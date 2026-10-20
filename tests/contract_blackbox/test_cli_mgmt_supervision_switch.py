@@ -20,14 +20,13 @@ from bb_harness import (
 
 pytestmark = [
     pytest.mark.posix_only,
-    pytest.mark.process_rpc,
 ]
 
 
 @pytest.mark.case("sc22-supervision-mode-set")
 @pytest.mark.rust_only
 @pytest.mark.posix_pty
-@pytest.mark.xfail(strict=True, reason="P4-T12 紅燈：L1.5 supervision-mode set force push 持續待實作")
+@pytest.mark.skip(reason="FakeTarget 未 attach 並行 file push 到 daemon session；目前無法證明 SESSION_BUSY 或 --force 行為")
 def test_supervision_set_force_push_continues_l15(tmp_path: Path) -> None:
     """真 Python daemon＋FakeTarget：client A file push 進行中，同時 supervision-mode set systemd-user --force → exit 2、error_code==SESSION_BUSY、phase: supervision_set_safety_check、force_ignored: true；push 完成、daemon pid 不變、config.yaml 未變。"""
     env = isolated_env(tmp_path)
@@ -58,7 +57,7 @@ def test_supervision_set_force_push_continues_l15(tmp_path: Path) -> None:
 @pytest.mark.case("sc22-supervision-mode-set")
 @pytest.mark.rust_only
 @pytest.mark.posix_pty
-@pytest.mark.xfail(strict=True, reason="P4-T12 紅燈：L1.5 supervision-mode set flashing 拒絕待實作")
+@pytest.mark.skip(reason="FakeTarget 未令 daemon session 進入 FLASHING；目前無法證明 FLASHING_BUSY 或零 TX")
 def test_supervision_set_flashing_l15(tmp_path: Path) -> None:
     """FakeTarget 讓 session 進 FLASHING → supervision-mode set on-demand --force → FLASHING_BUSY；FLASHING 持續、daemon pid 不變、wire.ndjson 無主動寫出 byte。"""
     env = isolated_env(tmp_path)
@@ -86,7 +85,8 @@ def test_supervision_set_flashing_l15(tmp_path: Path) -> None:
 
 @pytest.mark.case("sc22-supervision-mode-set")
 @pytest.mark.rust_only
-@pytest.mark.xfail(strict=True, reason="P4-T12 紅燈：supervision-mode set 原生切換待實作")
+@pytest.mark.process_rpc
+@pytest.mark.skip(reason="未啟動既有 daemon；此命令 smoke 無法證明 handoff_stop、busy refusal 或不發送 daemon.stop")
 def test_supervision_set_rust_only_switch(tmp_path: Path) -> None:
     """supervision_set_idle_uses_handoff_not_daemon_stop 與 supervision_set_handoff_unsupported_refuses_without_stop 黑箱驗證。"""
     env = isolated_env(tmp_path)

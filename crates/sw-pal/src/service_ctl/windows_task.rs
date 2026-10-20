@@ -487,10 +487,7 @@ impl ServiceCtl for WindowsTaskCtl {
     }
 }
 
-fn create_task_argv(
-    name: &str,
-    definition_path: Option<&std::path::Path>,
-) -> Vec<String> {
+fn create_task_argv(name: &str, definition_path: Option<&std::path::Path>) -> Vec<String> {
     vec![
         "schtasks".into(),
         "/Create".into(),

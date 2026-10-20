@@ -280,6 +280,7 @@ fn run<R>(w: World, body: impl FnOnce(&mut CliCtx<'_>) -> R) -> Run<R> {
             io: TextIo::new(&mut out, &mut err, "\n"),
             verbose: 0,
             cli_version: sw_proto::version::version(),
+            autostart_lock: None,
         };
         body(&mut ctx)
     };

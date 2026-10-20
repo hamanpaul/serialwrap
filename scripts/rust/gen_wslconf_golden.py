@@ -38,11 +38,25 @@ CASES: list[tuple[str, str]] = [
         "case_sensitive_keys",
         "[interop]\nenabled=true\nappendWindowsPath=false\n",
     ),
+    ("default_section", "[DEFAULT]\nmetadata=true\n[boot]\nsystemd=false\n"),
+    (
+        "repeated_default_sections",
+        "[DEFAULT]\nfirst=true\n[network]\nhostname=demo\n[DEFAULT]\nsecond=true\n",
+    ),
     ("key_colon_value", "[user]\ndefault: alice\n"),
     ("continuation_line", "[automount]\noptions = metadata,\n\tumask=22\n"),
     (
         "multiple_sections_with_boot",
         "[network]\nhostname = demo\n\n[boot]\ncommand = /usr/bin/run\n",
+    ),
+    (
+        "section_header_trailing_text",
+        "[automount]\nenabled=true\n[boot] # keep\nsystemd=false\n[network]trailing\nhostname=x\n",
+    ),
+    ("section_header_spacing_preserved", "[ boot ]\nvalue = kept\n[ ]\nempty = named\n"),
+    (
+        "blank_line_in_continuation",
+        "[user]\ncommand = first\n\n\tthird\n[boot]\nsystemd=false\n",
     ),
 ]
 

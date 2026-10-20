@@ -88,10 +88,12 @@ for rel in \
   contracts/rpc_schema.json \
   contracts/release_manifest.schema.json \
   tests/contract_blackbox/data \
+  crates/sw-cli/tests/golden \
   crates/sw-cli/src \
   sw_core/constants.py \
   sw_core/assets/skill \
   sw_core/assets/profiles \
+  sw_core/assets/tools \
   VERSION; do
   copy_data "$rel"
 done

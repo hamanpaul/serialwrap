@@ -12,7 +12,7 @@ use std::process::{Command, Stdio};
 use std::ptr;
 use std::sync::{Arc, Mutex};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    CloseHandle, FreeLibrary, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::System::Console::{
     GetStdHandle, SetConsoleCtrlHandler, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -22,11 +22,15 @@ use windows_sys::Win32::System::JobObjects::{
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
 };
+use windows_sys::Win32::System::LibraryLoader::{
+    GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
+};
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, GetExitCodeProcess, ResumeThread, TerminateProcess, WaitForSingleObject,
     CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
     DETACHED_PROCESS, INFINITE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
 };
+use windows_sys::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NativeProcessCtl;
@@ -34,10 +38,99 @@ pub struct NativeProcessCtl;
 impl ProcessCtl for NativeProcessCtl {
     fn spawn_elevated(
         &self,
-        _exe: &std::path::Path,
-        _args: &[String],
+        exe: &std::path::Path,
+        args: &[String],
     ) -> crate::traits::PalResult<crate::traits::ElevatedOutcome> {
-        todo!("P4-T19: NativeProcessCtl::spawn_elevated 尚未實作")
+        use crate::traits::ElevatedOutcome;
+        use std::ffi::OsStr;
+
+        if exe.as_os_str().encode_wide().any(|unit| unit == 0)
+            || args
+                .iter()
+                .any(|arg| arg.encode_utf16().any(|unit| unit == 0))
+        {
+            return Err(crate::traits::PalError::plain(
+                PalErrorKind::InvalidInput,
+                "embedded null byte",
+            ));
+        }
+
+        let mut shell_name: Vec<u16> = OsStr::new("shell32.dll").encode_wide().collect();
+        shell_name.push(0);
+        let module = unsafe {
+            LoadLibraryExW(
+                shell_name.as_ptr(),
+                ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        };
+        if module.is_null() {
+            return Err(windows_win32_error(unsafe { GetLastError() }));
+        }
+
+        let procedure = unsafe { GetProcAddress(module, c"ShellExecuteExW".as_ptr().cast()) };
+        let Some(procedure) = procedure else {
+            let code = unsafe { GetLastError() };
+            unsafe { FreeLibrary(module) };
+            return Err(windows_win32_error(code));
+        };
+        // Shell32 只在明確選用提權時動態載入，避免產品匯入表新增 ShellExecuteExW。
+        let shell_execute: unsafe extern "system" fn(*mut SHELLEXECUTEINFOW) -> i32 =
+            unsafe { std::mem::transmute(procedure) };
+
+        let mut verb: Vec<u16> = OsStr::new("runas").encode_wide().collect();
+        verb.push(0);
+        let mut file: Vec<u16> = exe.as_os_str().encode_wide().collect();
+        file.push(0);
+        let mut parameters =
+            quote_command_line(&args.iter().map(OsString::from).collect::<Vec<_>>());
+        parameters.push(0);
+        let mut info = SHELLEXECUTEINFOW::default();
+        info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+        info.fMask = SEE_MASK_NOCLOSEPROCESS;
+        info.lpVerb = verb.as_ptr();
+        info.lpFile = file.as_ptr();
+        info.lpParameters = if args.is_empty() {
+            ptr::null()
+        } else {
+            parameters.as_ptr()
+        };
+        info.nShow = 0;
+
+        let result = unsafe { shell_execute(&mut info) };
+        if result == 0 {
+            let code = unsafe { GetLastError() };
+            unsafe { FreeLibrary(module) };
+            if code == 1223 {
+                return Ok(ElevatedOutcome::Declined);
+            }
+            return Err(windows_win32_error(code));
+        }
+        if info.hProcess.is_null() {
+            unsafe { FreeLibrary(module) };
+            return Err(crate::traits::PalError::plain(
+                PalErrorKind::Io,
+                "ShellExecuteExW 未回傳提權行程 handle",
+            ));
+        }
+
+        let wait = unsafe { WaitForSingleObject(info.hProcess, INFINITE) };
+        let mut exit_code = 0u32;
+        let got_exit_code = wait == WAIT_OBJECT_0
+            && unsafe { GetExitCodeProcess(info.hProcess, &mut exit_code) } != 0;
+        let wait_error = if got_exit_code {
+            None
+        } else {
+            Some(unsafe { GetLastError() })
+        };
+        unsafe {
+            CloseHandle(info.hProcess);
+            FreeLibrary(module);
+        }
+        if let Some(code) = wait_error {
+            return Err(windows_win32_error(code));
+        }
+        Ok(ElevatedOutcome::Exited(exit_code as i32))
     }
 
     fn exec_or_wait(&self, argv: &[OsString], env_add: &[(String, String)]) -> PalError {

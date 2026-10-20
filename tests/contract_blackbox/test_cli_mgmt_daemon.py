@@ -164,6 +164,7 @@ def test_daemon_start_stop_ab_real_daemon(tmp_path: Path, env: dict[str, str], p
     assert results["cli"] == results["python"]
 
 
+@pytest.mark.case("sc20-daemon-restart")
 def test_daemon_restart_ab(tmp_path: Path, env: dict[str, str], no_delegation: Path) -> None:
     """SC-20：on-demand restart 後 pid 改變；兩實作輸出形狀 {ok,restarted,start,stopped} 正規化後相同。
 
@@ -173,11 +174,42 @@ def test_daemon_restart_ab(tmp_path: Path, env: dict[str, str], no_delegation: P
     """
     from bb_daemon import _send_rpc
 
+    cli_env = env
+    if is_rust():
+        # dev sentinel bundle 不含 daemon component；提供同層 Python daemon launcher 以實測 DF-05。
+        launcher_dir = tmp_path / "rust-daemon-bin"
+        launcher_dir.mkdir()
+        launcher = launcher_dir / ("serialwrapd.exe" if os.name == "nt" else "serialwrapd")
+        launcher.write_text(
+            "#!/bin/sh\nexec \"" + str(repo_root() / "tests/contract_blackbox/bin/py-serialwrapd") + "\" \"$@\"\n",
+            encoding="utf-8",
+        )
+        launcher.chmod(0o755)
+        manifest = tmp_path / "rust-test-release-manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "bundle_version": "rust-p4-test",
+                    "stage": "rust-1b-test",
+                    "target": "test",
+                    "git_revision": "test",
+                    "components": {
+                        "daemon": {"launcher": {"path": f"rust-daemon-bin/{launcher.name}"}},
+                        "python_cli_delegate": {"entry": ["serialwrap.py"]},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        cli_env = {**env, "SERIALWRAP_RELEASE_MANIFEST": str(manifest)}
+
     if not is_rust() and _foreign_serialwrapd_pids():
         pytest.skip("宿主已有非測試 serialwrapd（SC-10 多開預檢會阻擋 restart 的 spawn；只讀偵測，未觸碰）")
     results: dict[str, str] = {}
     # 先跑受測 CLI，再跑 Python 基線：宿主衝突只影響基線 oracle，受測輪次的失敗才能獨立呈現。
     for label, prefix in (("cli", cli_prefix()), ("python", python_baseline_prefix())):
+        run_env = cli_env if label == "cli" else env
         sock = str(tmp_path / f"restart-{label}.sock")
         profile_dir = tmp_path / f"restart-{label}-profiles"
         profile_dir.mkdir(parents=True, exist_ok=True)
@@ -185,7 +217,7 @@ def test_daemon_restart_ab(tmp_path: Path, env: dict[str, str], no_delegation: P
         try:
             assert _rpc_pid(sock) == before_pid, "重啟前 daemon 必須健康且 pid 一致"
             res = subprocess.run(
-                prefix + ["--socket", sock, "daemon", "restart"], env=env, capture_output=True, text=True, timeout=120
+                prefix + ["--socket", sock, "daemon", "restart"], env=run_env, capture_output=True, text=True, timeout=120
             )
             assert res.returncode == 0, res.stderr
             after = _rpc_pid(sock)
@@ -195,7 +227,7 @@ def test_daemon_restart_ab(tmp_path: Path, env: dict[str, str], no_delegation: P
             results[label] = _normalize(res.stdout, sock)
         finally:
             # 收尾：停止重啟後的 daemon（由 CLI 啟動，非 pytest 子行程）；舊 pid 若仍存活只針對本測試建立的 pid。
-            subprocess.run(prefix + ["--socket", sock, "daemon", "stop"], env=env, capture_output=True, timeout=60)
+            subprocess.run(prefix + ["--socket", sock, "daemon", "stop"], env=run_env, capture_output=True, timeout=60)
             try:
                 os.kill(before_pid, 15)
             except ProcessLookupError:
@@ -205,6 +237,7 @@ def test_daemon_restart_ab(tmp_path: Path, env: dict[str, str], no_delegation: P
 
 @pytest.mark.rust_only
 @pytest.mark.windows_native
+@pytest.mark.case("sc18-windows-ondemand-autostart")
 def test_autostart_l15_tx_once(tmp_path: Path, env: dict[str, str], no_delegation: Path) -> None:
     """SC-18（原生 Windows）：無 daemon 時 `cmd submit` 經 on-demand 自動啟動，DUT 端 `echo X\\r` 恰出現一次。
 

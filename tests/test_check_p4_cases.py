@@ -59,6 +59,9 @@ def gate(tmp_path, monkeypatch):
     monkeypatch.setattr(mod, "LOCK", acceptance / "p4_required.lock.json")
     monkeypatch.setattr(mod, "ERROR_CODES", codes)
     monkeypatch.setattr(mod, "EVIDENCE_DIR", ev)
+    # P4-T16 新增 L1 完整性規則；本檔只測案例證據邏輯，L1 規則由
+    # tests/test_rust_bench_tools.py::test_check_l1_completeness_rules 以合成報告獨立覆蓋。
+    monkeypatch.setattr(mod, "P4_L1_SETS", {})
     monkeypatch.setattr(mod, "head_commit", lambda: HEAD)
     mod.artifact = artifact  # type: ignore[attr-defined]
     mod.tmp = tmp_path  # type: ignore[attr-defined]

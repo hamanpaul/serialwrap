@@ -18,6 +18,7 @@ windows-sys = { workspace = true, features = [
     "Win32_System_IO",
     "Win32_Devices_Communication",
     "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
     "Win32_Networking_WinSock",
     "Win32_System_Console",
     "Win32_System_JobObjects",
@@ -31,6 +32,7 @@ windows-sys = { workspace = true, features = [
     # P4-T1（arch §1.2 修訂）：MultiByteToWideChar／FormatMessageW，皆在 KERNEL32。
     "Win32_Globalization",
     "Win32_System_Diagnostics_Debug",
+    "Win32_UI_Shell",
 ] }
 
 [features]

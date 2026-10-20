@@ -47,11 +47,7 @@ impl SystemdCtl {
         self.env
             .var("HOME")
             .filter(|home| !home.is_empty())
-            .or_else(|| {
-                self.env
-                    .current_user_home()
-                    .filter(|home| !home.is_empty())
-            })
+            .or_else(|| self.env.current_user_home().filter(|home| !home.is_empty()))
             .map(PathBuf::from)
     }
 
@@ -542,7 +538,11 @@ impl ServiceCtl for SystemdCtl {
         if !matches!(def.mode, SupervisionMode::SystemdSystem) {
             return Vec::new();
         }
-        let mut plan = vec![vec!["sudo".into(), "systemctl".into(), "daemon-reload".into()]];
+        let mut plan = vec![vec![
+            "sudo".into(),
+            "systemctl".into(),
+            "daemon-reload".into(),
+        ]];
         if !def.register_held {
             plan.push(vec![
                 "sudo".into(),

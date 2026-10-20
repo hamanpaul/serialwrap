@@ -698,6 +698,19 @@ serialwrap.exe skill --platform windows   # print the full Windows operating gui
 On Windows, MCU flashing should use `device release` / `device attach`; the
 Linux `/dev/ttyMCU` PTY bridge model is not used.
 
+#### Optional com0com component
+
+Windows bundles can include the signed com0com 3.0.0.0 virtual serial driver as
+an optional component. It is not selected by default, and the normal serialwrap
+install or update does not require administrator rights. Run
+`serialwrap setup --with-com0com` to install the default COM20/COM21 pair; only
+the bundled helper requests UAC elevation. Run `serialwrap setup
+--remove-com0com` to remove that pair. Declining UAC or a helper failure leaves
+the base installation successful and is reported under
+`optional_components.com0com`. The driver remains experimental until the
+remaining Spike 1 checks pass with HVCI enabled. The bundle includes the GPLv2
+license, the com0com 3.0.0.0 source link, and a written source offer.
+
 ### Remote Support
 
 When an FAE engineer overseas (a US/EU telecom customer site) uses serialwrap
@@ -2448,6 +2461,10 @@ Windows daemon 以 **TCP loopback** 取代 AF_UNIX 做 RPC 控制通道，使 se
   - Lock：`sw_core/lock_posix.py`（`SingletonLock` flock）↔ `sw_core/lock_win.py`（`WindowsSingletonLock` msvcrt）
   - Device：`PosixDeviceSource`（`/dev/serial/by-id`）↔ `WindowsDeviceSource`（SERIALCOMM registry）
 - POSIX 路徑全程 byte-identical（shim 維持相容）。
+
+### Windows 選用元件：com0com
+
+Windows 發佈組合可附 com0com 3.0.0.0 虛擬序列埠 driver，預設不安裝；一般 serialwrap 安裝與更新仍不需要管理員權限。明確執行 `serialwrap setup --with-com0com` 才會由 bundle 內 helper 單獨請求 UAC，並安裝預設 COM20／COM21 pair。執行 `serialwrap setup --remove-com0com` 可移除此 pair。拒絕 UAC 或 helper 失敗不會讓基本安裝失敗，結果會列在 `optional_components.com0com`。Spike 1 剩餘項目在 HVCI 開啟的機台全數通過前仍標示為實驗性。套件附 GPLv2 授權、com0com 3.0.0.0 原始碼連結與書面提供承諾。
 
 #### 建置 Windows 可執行檔（PyInstaller）
 

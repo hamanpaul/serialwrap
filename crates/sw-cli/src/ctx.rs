@@ -50,6 +50,8 @@ pub struct CliCtx<'a> {
     pub verbose: i64,
     /// 與 daemon 共用編譯輸入的 CLI 版本（管理面與 RPC 版本警告皆使用）。
     pub cli_version: &'static str,
+    /// 交接流程持有的 on-demand 自動啟動鎖；呼叫端完成切換後釋放。
+    pub autostart_lock: Option<sw_pal::fs_ops::FileLockGuard>,
 }
 
 /// 非 TTY：`BufWriter` 8192（與 Python 區塊緩衝一致，Q-06）；TTY：`LineWriter`。

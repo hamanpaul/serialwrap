@@ -76,6 +76,12 @@ impl FsOps for NativeFsOps {
         copy_file_metadata(from, to)
     }
 
+    fn sync_file(&self, path: &Path) -> PalResult<()> {
+        File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(posix_io_error)
+    }
+
     fn copy_tree(&self, from: &Path, to: &Path) -> PalResult<()> {
         copy_tree(from, to)
     }

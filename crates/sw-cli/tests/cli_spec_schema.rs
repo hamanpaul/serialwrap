@@ -238,6 +238,19 @@ fn cli_spec_matches_schema() {
             continue;
         }
 
+        // P4-T7：daemon 已原生承接，執行期不得再交由 Python delegate。
+        if name == "daemon" {
+            assert!(
+                matches!(entry.target, SubTarget::Native(_)),
+                "P4-T7 的 daemon 群組必須原生解析"
+            );
+            assert!(
+                !sw_cli::delegate::DELEGATED_GROUPS.contains(&name),
+                "P4-T7 的 daemon 群組不得留在 DELEGATED_GROUPS"
+            );
+            continue;
+        }
+
         // P4-T9：connect、benches 已原生承接（SC-27），自 DELEGATED_GROUPS 移除。
         if matches!(name, "connect" | "benches") {
             assert!(
@@ -261,6 +274,32 @@ fn cli_spec_matches_schema() {
             assert!(
                 !sw_cli::delegate::DELEGATED_GROUPS.contains(&name),
                 "P4-T6 的 {name} 群組不得留在 DELEGATED_GROUPS"
+            );
+            continue;
+        }
+
+        // P4-T10：setup 已原生承接，自 DELEGATED_GROUPS 移除。
+        if name == "setup" {
+            assert!(
+                matches!(entry.target, SubTarget::Native(_)),
+                "P4-T10 的 setup 群組必須原生解析"
+            );
+            assert!(
+                !sw_cli::delegate::DELEGATED_GROUPS.contains(&name),
+                "P4-T10 的 setup 群組不得留在 DELEGATED_GROUPS"
+            );
+            continue;
+        }
+
+        // P4-T14：doctor 已原生承接，自 DELEGATED_GROUPS 移除（委派集合清空）。
+        if name == "doctor" {
+            assert!(
+                matches!(entry.target, SubTarget::Native(_)),
+                "P4-T14 的 doctor 群組必須原生解析"
+            );
+            assert!(
+                !sw_cli::delegate::DELEGATED_GROUPS.contains(&name),
+                "P4-T14 的 doctor 群組不得留在 DELEGATED_GROUPS"
             );
             continue;
         }

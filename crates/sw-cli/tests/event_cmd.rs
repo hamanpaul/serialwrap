@@ -125,6 +125,7 @@ fn event_params_and_dispatch_fail_until_implemented() {
         io,
         verbose: 0,
         cli_version: sw_proto::version::version(),
+        autostart_lock: None,
     };
     let ns = sw_cli::argparse::Namespace::default();
     let _ = event_params(&ctx, &ns);

@@ -47,6 +47,19 @@ pub fn run_service(ns: &Namespace, ctx: &mut CliCtx) -> i32 {
         },
     };
     let mode = SupervisionMode::parse(&mode_name);
+    if matches!(
+        mode,
+        SupervisionMode::WindowsTask | SupervisionMode::WindowsService
+    ) && matches!(action, ServiceAction::Stop | ServiceAction::Restart)
+    {
+        let (mut resp, code) = service_action_response(ctx, &mode, action, with_sudo, &context);
+        if let Some(raw) = raw_mode_json {
+            resp.insert("mode", raw);
+        }
+        let _ = output::print_json(&mut ctx.io, &resp);
+        let _ = output::mirror_err(&mut ctx.io, &resp, Some(&context));
+        return code;
+    }
     // on-demand／未知模式不呼叫任何監管後端（Python `service_action` 亦不呼叫 systemctl）；結果與 NO_SYSTEMD 相同。
     let result = if mode.is_supervised() {
         ctx.p.service.action(&mode, action, with_sudo)
@@ -62,6 +75,164 @@ pub fn run_service(ns: &Namespace, ctx: &mut CliCtx) -> i32 {
     let _ = output::print_json(&mut ctx.io, &resp);
     let _ = output::mirror_err(&mut ctx.io, &resp, Some(&context));
     code
+}
+
+/// 供 daemon 管理命令重用 `service` 的監管行為與輸出。
+pub fn run_service_action(
+    ctx: &mut CliCtx<'_>,
+    mode: &SupervisionMode,
+    action: ServiceAction,
+    with_sudo: bool,
+    context: &str,
+    routed_to: Option<&str>,
+) -> i32 {
+    run_service_action_with_mode_value(ctx, mode, action, with_sudo, context, routed_to, None)
+}
+
+pub fn run_service_action_with_mode_value(
+    ctx: &mut CliCtx<'_>,
+    mode: &SupervisionMode,
+    action: ServiceAction,
+    with_sudo: bool,
+    context: &str,
+    routed_to: Option<&str>,
+    raw_mode: Option<PyValue>,
+) -> i32 {
+    let (mut resp, code) = service_action_response(ctx, mode, action, with_sudo, context);
+    if let Some(raw_mode) = raw_mode {
+        resp.insert("mode", raw_mode);
+    }
+    if let Some(route) = routed_to {
+        resp.insert("_routed_to", PyValue::Str(route.to_string()));
+    }
+    let _ = output::print_json(&mut ctx.io, &resp);
+    let _ = output::mirror_err(&mut ctx.io, &resp, Some(context));
+    code
+}
+
+fn service_action_response(
+    ctx: &mut CliCtx<'_>,
+    mode: &SupervisionMode,
+    action: ServiceAction,
+    with_sudo: bool,
+    context: &str,
+) -> (PyDict, i32) {
+    if matches!(
+        mode,
+        SupervisionMode::WindowsTask | SupervisionMode::WindowsService
+    ) && matches!(action, ServiceAction::Stop | ServiceAction::Restart)
+    {
+        let keep_disabled = action == ServiceAction::Restart;
+        let phase = if keep_disabled {
+            "service_restart_wait_stop"
+        } else {
+            "service_stop_wait_stop"
+        };
+        match crate::graceful_stop::graceful_stop(
+            ctx,
+            mode,
+            &crate::endpoint_resolve::local_default_endpoint(ctx),
+            with_sudo,
+            keep_disabled,
+            phase,
+        ) {
+            Ok(report) => {
+                let mut resp = PyDict::new();
+                resp.insert("ok", PyValue::Bool(true));
+                resp.insert("mode", PyValue::Str(mode.as_str().to_string()));
+                resp.insert("action", PyValue::Str(action.as_str().to_string()));
+                resp.insert("graceful", PyValue::Bool(report.graceful));
+                if let Some(rc) = report.rc {
+                    resp.insert("rc", PyValue::Int(PyInt::Small(i128::from(rc))));
+                }
+                if !report.stdout.is_empty() {
+                    resp.insert("stdout", PyValue::Str(report.stdout));
+                }
+                if !report.stderr.is_empty() {
+                    resp.insert("stderr", PyValue::Str(report.stderr));
+                }
+                if action == ServiceAction::Restart {
+                    let enabled = ctx.p.service.set_enabled(mode, true, with_sudo);
+                    if enabled.iter().any(|command| command.rc != 0) {
+                        let mut failed = service_failure(
+                            mode,
+                            action,
+                            "重新啟用監管項失敗",
+                            "service_restart_enable",
+                        );
+                        failed.insert("graceful", PyValue::Bool(report.graceful));
+                        return (failed, 2);
+                    }
+                    let start = ctx.p.service.action(mode, ServiceAction::Start, with_sudo);
+                    let mut started = result_to_pydict(&start);
+                    started.insert("action", PyValue::Str("restart".to_string()));
+                    started.insert("graceful", PyValue::Bool(report.graceful));
+                    return (started, if start.ok { 0 } else { 2 });
+                }
+                return (resp, 0);
+            }
+            Err(crate::graceful_stop::StopFailure::Timeout { phase, .. }) => {
+                let mut resp = service_failure(mode, action, "daemon 未在期限內結束", phase);
+                resp.insert("graceful", PyValue::Bool(false));
+                if keep_disabled {
+                    resp.insert(
+                        "hint",
+                        PyValue::Str("舊 daemon 未在 10 秒內結束；工作已停用以免 RestartOnFailure 拉起，確認後執行 serialwrap service start".to_string()),
+                    );
+                }
+                return (resp, 2);
+            }
+            Err(
+                crate::graceful_stop::StopFailure::Service(result)
+                | crate::graceful_stop::StopFailure::Hold(result),
+            ) => {
+                let mut resp = result_to_pydict(&result);
+                resp.insert("action", PyValue::Str(action.as_str().to_string()));
+                resp.insert("graceful", PyValue::Bool(false));
+                return (resp, 2);
+            }
+            Err(other) => {
+                let mut resp =
+                    service_failure(mode, action, &format!("daemon 停止失敗：{other:?}"), phase);
+                resp.insert("graceful", PyValue::Bool(false));
+                return (resp, 2);
+            }
+        }
+    }
+
+    let result = if mode.is_supervised() {
+        ctx.p.service.action(mode, action, with_sudo)
+    } else {
+        no_systemd_result(mode, action)
+    };
+    let code = if result.ok { 0 } else { 2 };
+    (result_to_pydict(&result), code)
+}
+
+fn service_failure(
+    mode: &SupervisionMode,
+    action: ServiceAction,
+    message: &str,
+    phase: &'static str,
+) -> PyDict {
+    let mut resp = PyDict::new();
+    resp.insert("ok", PyValue::Bool(false));
+    resp.insert("mode", PyValue::Str(mode.as_str().to_string()));
+    resp.insert("action", PyValue::Str(action.as_str().to_string()));
+    resp.insert(
+        "error_code",
+        PyValue::Str(
+            if phase.starts_with("service_") && phase.contains("wait_stop") {
+                ErrorCode::Timeout.as_str()
+            } else {
+                ErrorCode::InternalError.as_str()
+            }
+            .to_string(),
+        ),
+    );
+    resp.insert("message", PyValue::Str(message.to_string()));
+    resp.insert("phase", PyValue::Str(phase.to_string()));
+    resp
 }
 
 /// `ServiceResult` → 回應物件（Python `service_action` 的 dict 形狀）。
@@ -124,7 +295,7 @@ fn no_systemd_result(mode: &SupervisionMode, action: ServiceAction) -> ServiceRe
 ///
 /// 已知殘差（非契約，`supervision_mode` 非字串本即異常輸入）：數值型 key 的輸出順序由 `pyjson` 以字串排序，
 /// 與 Python 的數值排序可能不同（例如 `{10: a, 9: b}`）。
-fn yvalue_to_pyvalue(value: &YValue) -> Result<PyValue, String> {
+pub(crate) fn yvalue_to_pyvalue(value: &YValue) -> Result<PyValue, String> {
     Ok(match value {
         YValue::Null => PyValue::Null,
         YValue::Bool(flag) => PyValue::Bool(*flag),

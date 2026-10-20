@@ -98,6 +98,8 @@ pub fn parse_manifest(text: &str) -> Result<ReleaseManifest, ManifestError> {
 
     let schema_version = match root.get("schema_version") {
         Some(PyValue::Int(PyInt::Small(1))) => 1,
+        // Python 基線 `load_release_manifest` 以 `!= 1` 判定，故 1.0 亦有效（布林已由 PyValue::Bool 分流拒絕）。
+        Some(PyValue::Float(f)) if *f == 1.0 => 1,
         Some(_) => return Err(schema_err("schema_version 必須為 1")),
         None => return Err(schema_err("缺少 schema_version")),
     };
@@ -126,6 +128,15 @@ pub fn parse_manifest(text: &str) -> Result<ReleaseManifest, ManifestError> {
         return Err(schema_err(
             "欄位 components.supervisor.task_xml_template_sha256 必須為 64 位小寫十六進位",
         ));
+    }
+
+    if let Some(PyValue::Dict(comps)) = root.get("components") {
+        if let Some(com0com) = comps.get("com0com") {
+            let PyValue::Dict(com0com) = com0com else {
+                return Err(schema_err("欄位 components.com0com 必須為物件"));
+            };
+            let _ = parse_com0com(com0com)?;
+        }
     }
 
     let components = match root.get("components") {
@@ -184,7 +195,6 @@ pub fn parse_current_release(text: &str) -> Result<CurrentRelease, ManifestError
 
 /// `components.com0com` 選用元件（P4-T19，SC-36，OD-15）：只在 Windows bundle 出現，缺席為合法狀態。
 ///
-/// 紅燈階段（TDD）：欄位依計畫 Task 19 Produces；解析本體與 `com0com()` 由 P4-T19 實作。
 #[derive(Clone, Debug, PartialEq)]
 pub struct Com0comComponent {
     pub optional: bool,
@@ -192,15 +202,142 @@ pub struct Com0comComponent {
     pub requires_elevation: bool,
     pub experimental: bool,
     pub version: String,
+    pub path: String,
     pub sha256: String,
     /// 固定為 `"GPL-2.0"`。
     pub license: String,
     pub license_file: String,
     pub source_offer_file: String,
     pub provenance_file: String,
-    pub helper: String,
+    pub helper: Com0comHelper,
     /// 預設 pair（`("COM20", "COM21")`）。
     pub default_pair: (String, String),
+}
+
+/// 提權 helper 的 bundle 路徑與完整性摘要。
+#[derive(Clone, Debug, PartialEq)]
+pub struct Com0comHelper {
+    pub path: String,
+    pub sha256: String,
+}
+
+fn required_bool(d: &PyDict, key: &str) -> Result<bool, ManifestError> {
+    match d.get(key) {
+        Some(PyValue::Bool(value)) => Ok(*value),
+        _ => Err(ManifestError::Schema(format!(
+            "欄位 components.com0com.{key} 缺少或非布林值"
+        ))),
+    }
+}
+
+fn required_string(d: &PyDict, key: &str) -> Result<String, ManifestError> {
+    match d.get(key) {
+        Some(PyValue::Str(value)) if !value.is_empty() => Ok(value.clone()),
+        _ => Err(ManifestError::Schema(format!(
+            "欄位 components.com0com.{key} 缺少或非字串"
+        ))),
+    }
+}
+
+fn parse_com0com(d: &PyDict) -> Result<Com0comComponent, ManifestError> {
+    let optional = required_bool(d, "optional")?;
+    let default_selected = required_bool(d, "default_selected")?;
+    let requires_elevation = required_bool(d, "requires_elevation")?;
+    let experimental = required_bool(d, "experimental")?;
+    let version = required_string(d, "version")?;
+    let path = required_string(d, "path")?;
+    let sha256 = required_string(d, "sha256")?;
+    let license = required_string(d, "license")?;
+    let license_file = required_string(d, "license_file")?;
+    let source_offer_file = required_string(d, "source_offer_file")?;
+    let provenance_file = required_string(d, "provenance_file")?;
+    let helper = match d.get("helper") {
+        Some(PyValue::Dict(helper)) => Com0comHelper {
+            path: required_string(helper, "path")?,
+            sha256: required_string(helper, "sha256")?,
+        },
+        _ => return Err(schema_err("欄位 components.com0com.helper 必須為物件")),
+    };
+    let default_pair = match d.get("default_pair") {
+        Some(PyValue::List(items)) if items.len() == 2 => match (&items[0], &items[1]) {
+            (PyValue::Str(a), PyValue::Str(b)) => (a.clone(), b.clone()),
+            _ => {
+                return Err(schema_err(
+                    "欄位 components.com0com.default_pair 必須含兩個字串",
+                ))
+            }
+        },
+        _ => {
+            return Err(schema_err(
+                "欄位 components.com0com.default_pair 必須為兩項陣列",
+            ))
+        }
+    };
+
+    if !optional || default_selected || !requires_elevation {
+        return Err(schema_err(
+            "components.com0com 必須為選用、預設未選取且需要提權",
+        ));
+    }
+    if version != "3.0.0.0" {
+        return Err(schema_err("components.com0com.version 必須為 3.0.0.0"));
+    }
+    if path != "optional/com0com/" {
+        return Err(schema_err(
+            "components.com0com.path 必須為 optional/com0com/",
+        ));
+    }
+    if !is_sha256_hex(&sha256) {
+        return Err(schema_err(
+            "欄位 components.com0com.sha256 必須為 64 位小寫十六進位",
+        ));
+    }
+    if !is_sha256_hex(&helper.sha256) {
+        return Err(schema_err(
+            "欄位 components.com0com.helper.sha256 必須為 64 位小寫十六進位",
+        ));
+    }
+    if license != "GPL-2.0" {
+        return Err(schema_err("components.com0com.license 必須為 GPL-2.0"));
+    }
+    if license_file != "optional/com0com/LICENSE-GPLv2.txt"
+        || source_offer_file != "optional/com0com/SOURCE.md"
+        || provenance_file != "optional/com0com/PROVENANCE.json"
+        || !matches!(
+            helper.path.as_str(),
+            "bin/sw-com0com-helper" | "bin/sw-com0com-helper.exe"
+        )
+    {
+        return Err(schema_err("components.com0com 含不安全的 bundle 相對路徑"));
+    }
+    if default_pair.0.eq_ignore_ascii_case(&default_pair.1)
+        || [&default_pair.0, &default_pair.1].iter().any(|port| {
+            let Some(digits) = port.strip_prefix("COM") else {
+                return true;
+            };
+            digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    {
+        return Err(schema_err(
+            "components.com0com.default_pair 必須為兩個不同 COM 埠",
+        ));
+    }
+
+    Ok(Com0comComponent {
+        optional,
+        default_selected,
+        requires_elevation,
+        experimental,
+        version,
+        path,
+        sha256,
+        license,
+        license_file,
+        source_offer_file,
+        provenance_file,
+        helper,
+        default_pair,
+    })
 }
 
 impl ReleaseManifest {
@@ -216,6 +353,12 @@ impl ReleaseManifest {
 
     /// 取得 `components.com0com`；缺席回 `None`。
     pub fn com0com(&self) -> Option<Com0comComponent> {
-        todo!("P4-T19: components.com0com 解析尚未實作")
+        let Some(PyValue::Dict(components)) = self.raw.get("components") else {
+            return None;
+        };
+        let Some(PyValue::Dict(com0com)) = components.get("com0com") else {
+            return None;
+        };
+        parse_com0com(com0com).ok()
     }
 }

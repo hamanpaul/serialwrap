@@ -41,7 +41,7 @@
 | `sha2` | `=0.10.9` | sw-proto | `cli_trace` 的 `endpoint_id`、remote `identity`、release manifest digest |
 | `crossbeam-channel` | `=0.5.15` | sw-pal、sw-core、sw-daemon | 有界 MPMC 與 `select_biased!`：mailbox 的 control lane 優先、deadline receive |
 | `libc` | `=0.2.186` | sw-pal（`cfg(unix)`） | poll、flock、`TIOCEXCL`、termios、openpty、`/proc`、`getrandom` 等 POSIX syscall |
-| `windows-sys` | `=0.61.2` | sw-pal（`cfg(windows)`） | `CreateFileW`、overlapped I/O、`CancelIoEx`、`LockFileEx`、COMM、Toolhelp32、Job Object、`BCryptGenRandom`、`FILE_SHARE_DELETE`、`GetFileInformationByHandleEx`、Winsock、Console。features：`Win32_Foundation`、`Win32_Storage_FileSystem`、`Win32_System_IO`、`Win32_Devices_Communication`、`Win32_System_Threading`、`Win32_Networking_WinSock`、`Win32_System_Console`、`Win32_System_JobObjects`、`Win32_System_Diagnostics_ToolHelp`、`Win32_Security`、`Win32_Security_Cryptography`、`Win32_System_Registry`、`Win32_System_Time`、`Win32_System_SystemInformation`、`Wdk_System_Threading`、`Win32_Globalization`（`MultiByteToWideChar`）、`Win32_System_Diagnostics_Debug`（`FormatMessageW`）（**P4-T1 修訂**：二者皆在 KERNEL32；匯入 DLL 仍限 §1.1 白名單）|
+| `windows-sys` | `=0.61.2` | sw-pal（`cfg(windows)`） | `CreateFileW`、overlapped I/O、`CancelIoEx`、`LockFileEx`、COMM、Toolhelp32、Job Object、`BCryptGenRandom`、`FILE_SHARE_DELETE`、`GetFileInformationByHandleEx`、Winsock、Console。features：`Win32_Foundation`、`Win32_Storage_FileSystem`、`Win32_System_IO`、`Win32_Devices_Communication`、`Win32_System_Threading`、`Win32_Networking_WinSock`、`Win32_System_Console`、`Win32_System_JobObjects`、`Win32_System_Diagnostics_ToolHelp`、`Win32_Security`、`Win32_Security_Cryptography`、`Win32_System_Registry`、`Win32_System_Time`、`Win32_System_SystemInformation`、`Wdk_System_Threading`、`Win32_Globalization`（`MultiByteToWideChar`）、`Win32_System_Diagnostics_Debug`（`FormatMessageW`）、`Win32_System_LibraryLoader`、`Win32_UI_Shell`（**P4-T1／P4-T19 修訂**：前二者支援 KERNEL32 訊息處理；後二者只供 `sw-pal` 以 `LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_SYSTEM32)` 動態解析 `ShellExecuteExW`，不在產品匯入表靜態匯入 SHELL32，仍須通過 `check_win_imports.py`）|
 | dev：`tempfile` | `=3.23.0` | 各 crate 測試 | 隔離目錄 |
 
 **刻意不採用**：
@@ -89,12 +89,13 @@ serialwrap/
 │   │            （規格的 bench_registry.rs → sw-proto；state_migrate.rs → sw-cli）
 │   ├── sw-daemon/                  # bin `serialwrapd`
 │   │   └── src/ main.rs service.rs daemon_main.rs **framing.rs health.rs launcher.rs**
-│   └── sw-cli/                     # bin `serialwrap`
-│       └── src/ main.rs **lib.rs ctx.rs** client.rs remote_tunnel.rs doctor_cmd.rs setup_cmd.rs cli_trace.rs
+│   ├── sw-cli/                     # bin `serialwrap`
+│   │   └── src/ main.rs **lib.rs ctx.rs** client.rs remote_tunnel.rs doctor_cmd.rs setup_cmd.rs cli_trace.rs
 │                **argparse/{mod.rs,parser.rs,help.rs,usage.rs,error.rs} cli_spec.rs output.rs endpoint_resolve.rs
 │                delegate.rs bench_state.rs state_migrate.rs install_layout.rs rollback.rs assets.rs
 │                commands/{rpc_cmds.rs,daemon_cmd.rs,service_cmd.rs,supervision_cmd.rs,remote_cmd.rs,connect_cmd.rs,
 │                          benches_cmd.rs,event_cmd.rs,profile_cmd.rs,skill_cmd.rs}**
+│   └── sw-com0com-helper/          # bin `sw-com0com-helper`；UAC 後唯一呼叫 com0com PAL 的安裝／移除 helper
 ├── scripts/rust/ **win-runner.sh win-test.sh check_cfg_boundary.py mkbundle.sh capture_cli_help.py gen_error_codes.py**
 ├── tests/contract_blackbox/        # Python pytest 黑箱；不 import sw_core
 └── tests/acceptance/               # 案例承接清單與 schema（規格 §3.2）
@@ -106,9 +107,10 @@ serialwrap/
 sw-proto  ←  sw-core  ←  sw-daemon
    ↑           ↑
 sw-pal ────────┘ ←  sw-cli（只依賴 sw-proto + sw-pal；不得連結 sw-core）
+sw-pal ──────────────────────────── sw-com0com-helper
 ```
 
-`sw-pal` 不依賴 `sw-proto`，平台型別在 PAL 內自行定義。`sw-cli` 不連結 `sw-core`，避免 CLI 夾帶 daemon 邏輯並維持啟動成本。CLI 需要的純資料語意（regex 驗證、profile 載入、bench registry）放在 `sw-proto`。
+`sw-pal` 不依賴 `sw-proto`，平台型別在 PAL 內自行定義。`sw-cli` 不連結 `sw-core`，避免 CLI 夾帶 daemon 邏輯並維持啟動成本。`sw-com0com-helper` 只依賴 `sw-pal`，確保提權後的 setupc 與登錄操作仍經 PAL。CLI 需要的純資料語意（regex 驗證、profile 載入、bench registry）放在 `sw-proto`。
 
 ### 1.4 執行緒模型：std thread＋有界 crossbeam channel（不採用 tokio）
 

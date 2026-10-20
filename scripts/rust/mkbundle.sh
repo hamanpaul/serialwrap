@@ -5,7 +5,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 用法：
-  scripts/rust/mkbundle.sh --dev --out <目錄> [--target <triple>] [--profile debug|release] [--version-override <版本>] [--print-dir]
+  scripts/rust/mkbundle.sh --dev --out <目錄> [--target <triple>] [--profile debug|release] [--version-override <版本>] [--with-com0com <signed zip>] [--with-com0com-fixture <fixture zip>] [--print-dir]
   scripts/rust/mkbundle.sh --dev --delegate-sentinel --out <目錄> [其他選項]
 
 選項：
@@ -14,6 +14,8 @@ usage() {
   --target <triple>        指定 Rust target；Windows 正式 bundle 由擁有者 runner 建置
   --profile <name>         選擇 debug 或 release，預設為 debug
   --version-override <v>   以同一編譯輸入覆寫 CLI 與 daemon bundle 版本
+  --with-com0com <zip>     驗證上游簽章套件雜湊並抽取 x64 driver payload
+  --with-com0com-fixture <zip> 僅供測試：略過上游雜湊驗證，仍檢查完整 x64 payload
   --out <目錄>             指定輸出目錄
   --print-dir              保留後續階段介面；成功時 stdout 一律輸出絕對目錄
   -h, --help               顯示此說明
@@ -27,6 +29,8 @@ PROFILE=debug
 TARGET=""
 OUT="$REPO_ROOT/target/mkbundle-dev"
 VERSION_OVERRIDE=""
+COM0COM_ZIP=""
+COM0COM_FIXTURE=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -66,6 +70,23 @@ while [[ $# -gt 0 ]]; do
       VERSION_OVERRIDE="$2"
       shift 2
       ;;
+    --with-com0com)
+      if [[ $# -lt 2 ]]; then
+        echo "mkbundle.sh: --with-com0com 缺少 signed zip" >&2
+        exit 2
+      fi
+      COM0COM_ZIP="$2"
+      shift 2
+      ;;
+    --with-com0com-fixture)
+      if [[ $# -lt 2 ]]; then
+        echo "mkbundle.sh: --with-com0com-fixture 缺少 zip" >&2
+        exit 2
+      fi
+      COM0COM_ZIP="$2"
+      COM0COM_FIXTURE=1
+      shift 2
+      ;;
     *) echo "mkbundle.sh: 未知參數 $1" >&2; exit 2 ;;
   esac
 done
@@ -76,6 +97,14 @@ if [[ "$DEV" -ne 1 ]]; then
 fi
 if [[ "$PROFILE" != debug && "$PROFILE" != release ]]; then
   echo "mkbundle.sh: --profile 僅支援 debug 或 release" >&2
+  exit 2
+fi
+if [[ -n "$COM0COM_ZIP" && ! -f "$COM0COM_ZIP" ]]; then
+  echo "mkbundle.sh: com0com zip 不存在：$COM0COM_ZIP" >&2
+  exit 2
+fi
+if [[ "$SENTINEL" -eq 1 && -n "$COM0COM_ZIP" ]]; then
+  echo "mkbundle.sh: com0com 需使用完整 --dev bundle，不能與 --delegate-sentinel 合併" >&2
   exit 2
 fi
 
@@ -97,6 +126,9 @@ if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 fi
 
 BUILD_ARGS=(build -p sw-cli -p sw-daemon)
+if [[ -n "$COM0COM_ZIP" ]]; then
+  BUILD_ARGS+=(-p sw-com0com-helper)
+fi
 if [[ "$PROFILE" == release ]]; then
   BUILD_ARGS+=(--release)
 fi
@@ -134,7 +166,8 @@ sha256_file() {
 if [[ "$SENTINEL" -eq 1 ]]; then
   # P4 管理面測試需要在 bundle bin 下直接執行 sentinel，維持既有精簡格式。
   mkdir -p "$OUT/bin" "$OUT/py/bin"
-  cp "$BIN_SRC" "$OUT/bin/$CLI_NAME"
+  # 輸出位置可能是指向版本檔的 symlink；先移除 symlink，避免覆寫其目標。
+  cp --remove-destination "$BIN_SRC" "$OUT/bin/$CLI_NAME"
   chmod +x "$OUT/bin/$CLI_NAME"
   PY_SRC="$(command -v python3)"
   ln -sf "$(readlink -f "$PY_SRC")" "$OUT/py/bin/python3"
@@ -179,6 +212,53 @@ else
   cp "$DAEMON_SRC" "$VERSION_DIR/bin/$DAEMON_NAME"
   chmod +x "$VERSION_DIR/bin/$CLI_NAME"
   chmod +x "$VERSION_DIR/bin/$DAEMON_NAME"
+
+  HELPER_NAME=sw-com0com-helper
+  HELPER_MANIFEST_PATH=""
+  COM0COM_SHA=""
+  if [[ -n "$COM0COM_ZIP" ]]; then
+    if [[ "$TARGET" == *-windows-* ]]; then
+      HELPER_NAME+=.exe
+    fi
+    HELPER_SRC="$BUILD_DIR/$HELPER_NAME"
+    if [[ ! -x "$HELPER_SRC" ]]; then
+      echo "mkbundle.sh: cargo build 後仍找不到 com0com helper：$HELPER_SRC" >&2
+      exit 1
+    fi
+    cp "$HELPER_SRC" "$VERSION_DIR/bin/$HELPER_NAME"
+    chmod +x "$VERSION_DIR/bin/$HELPER_NAME"
+    HELPER_MANIFEST_PATH="bin/$HELPER_NAME"
+
+    COM0COM_DIR="$VERSION_DIR/optional/com0com"
+    mkdir -p "$COM0COM_DIR"
+    EXTRACT_ARGS=("$COM0COM_ZIP" "$COM0COM_DIR" --provenance "$REPO_ROOT/packaging/com0com/PROVENANCE.json")
+    if [[ "$COM0COM_FIXTURE" -eq 1 ]]; then
+      EXTRACT_ARGS+=(--fixture)
+    fi
+    python3 "$REPO_ROOT/scripts/rust/extract_com0com.py" "${EXTRACT_ARGS[@]}"
+    cp "$REPO_ROOT/packaging/com0com/LICENSE-GPLv2.txt" "$COM0COM_DIR/"
+    cp "$REPO_ROOT/packaging/com0com/SOURCE.md" "$COM0COM_DIR/"
+    cp "$REPO_ROOT/packaging/com0com/PROVENANCE.json" "$COM0COM_DIR/"
+    COM0COM_SHA="$(python3 - "$VERSION_DIR" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+files = sorted(
+    (path for path in (root / "optional/com0com").rglob("*") if path.is_file()),
+    key=lambda path: path.relative_to(root).as_posix().encode("utf-8"),
+)
+content = bytearray()
+for path in files:
+    content.extend(path.relative_to(root).as_posix().encode("utf-8"))
+    content.append(0)
+    content.extend(path.read_bytes())
+print(hashlib.sha256(content).hexdigest())
+PY
+    )"
+    COM0COM_HELPER_SHA="$(sha256sum "$VERSION_DIR/$HELPER_MANIFEST_PATH" | cut -d ' ' -f 1)"
+  fi
 
   PY_DIR="$VERSION_DIR/py"
   python3 -m venv --copies --system-site-packages "$PY_DIR"
@@ -286,7 +366,7 @@ PY
   python3 - "$MANIFEST" "$VERSION" "$TARGET" "$GIT_REVISION" "$CONTRACT_REVISION" \
     "$CLI_NAME" "$CLI_SHA" "$PACKAGE_TREE_SHA" "$PYTHON_VERSION" "$LAUNCHER_SHA" \
     "$RUNTIME_SHA" "$SKILL_SHA" "$SKILL_WINDOWS_SHA" "$PROFILE_TREE_SHA" "$SUPERVISOR_SHA" \
-    "$TASK_XML_TEMPLATE_SHA" <<'PY'
+    "$TASK_XML_TEMPLATE_SHA" "$COM0COM_SHA" "$HELPER_MANIFEST_PATH" "${COM0COM_HELPER_SHA:-}" <<'PY'
 import datetime
 import json
 import sys
@@ -308,7 +388,10 @@ import sys
     profiles_sha,
     supervisor_sha,
     task_xml_template_sha,
-) = sys.argv[1:17]
+    com0com_sha,
+    com0com_helper,
+    com0com_helper_sha,
+) = sys.argv[1:20]
 python_entry = ["py/bin/python3", "-I", "-B", "-m", "sw_core.cli"]
 manifest = {
     "schema_version": 1,
@@ -367,6 +450,22 @@ manifest = {
         "daemon_version": version,
     },
 }
+if com0com_sha:
+    manifest["components"]["com0com"] = {
+        "optional": True,
+        "default_selected": False,
+        "requires_elevation": True,
+        "experimental": True,
+        "version": "3.0.0.0",
+        "path": "optional/com0com/",
+        "sha256": com0com_sha,
+        "license": "GPL-2.0",
+        "license_file": "optional/com0com/LICENSE-GPLv2.txt",
+        "source_offer_file": "optional/com0com/SOURCE.md",
+        "provenance_file": "optional/com0com/PROVENANCE.json",
+        "helper": {"path": com0com_helper, "sha256": com0com_helper_sha},
+        "default_pair": ["COM20", "COM21"],
+    }
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(manifest, handle, ensure_ascii=False, indent=2, sort_keys=True)
     handle.write("\n")

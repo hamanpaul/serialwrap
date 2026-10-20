@@ -2,9 +2,9 @@
 //! 平台實作放在 `posix`／`windows` 子模組，依目標平台擇一編譯。
 //!
 //! 原生寫入面由 P4-T5 的 POSIX 與 Windows 後端提供；測試替身可覆寫所需方法。
-use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
+use std::path::{Path, PathBuf};
 
 use crate::traits::{FsRead, PalResult};
 #[cfg(windows)]
@@ -55,13 +55,7 @@ impl Drop for FileLockGuard {
             let mut overlapped = OVERLAPPED::default();
             // SAFETY: 此 guard 持有取鎖時使用的 handle，鎖範圍固定為 offset 0 的 1 byte。
             unsafe {
-                UnlockFileEx(
-                    file.as_raw_handle() as HANDLE,
-                    0,
-                    1,
-                    0,
-                    &mut overlapped,
-                );
+                UnlockFileEx(file.as_raw_handle() as HANDLE, 0, 1, 0, &mut overlapped);
             }
         }
         drop(self.file.take());
@@ -93,6 +87,10 @@ pub trait FsOps: FsRead {
     }
     /// 複製單一檔案並保留 mode。
     fn copy_preserving(&self, from: &Path, to: &Path) -> PalResult<()> {
+        unimplemented!("P4-T5")
+    }
+    /// 將已寫入的檔案內容與中繼資料同步至穩定儲存。
+    fn sync_file(&self, p: &Path) -> PalResult<()> {
         unimplemented!("P4-T5")
     }
     /// 遞迴複製（保留相對結構與 mode）；來源 symlink 依目標內容複製，dangling symlink 會失敗；`to` 已存在時回 `InvalidInput`。

@@ -36,7 +36,10 @@ impl FakeTunnel {
 
     /// 依呼叫順序回傳 `(argv, log)`。
     pub fn spawned(&self) -> Vec<(Vec<String>, PathBuf)> {
-        self.spawned.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.spawned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn set_alive(&self, pid: u32, alive: bool) {
@@ -48,7 +51,10 @@ impl FakeTunnel {
 
     /// 依呼叫順序回傳 `terminate` 過的 pid。
     pub fn terminated(&self) -> Vec<u32> {
-        self.terminated.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.terminated
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn set_tail(&self, s: &str) {
@@ -105,7 +111,10 @@ impl ProcessTunnel for FakeTunnel {
             .unwrap_or_else(|e| e.into_inner())
             .contains(&p.pid)
         {
-            return Err(PalError::plain(PalErrorKind::AccessDenied, "fake terminate failure"));
+            return Err(PalError::plain(
+                PalErrorKind::AccessDenied,
+                "fake terminate failure",
+            ));
         }
         self.terminated
             .lock()
@@ -117,7 +126,13 @@ impl ProcessTunnel for FakeTunnel {
 
     fn stderr_tail(&self, _log: &Path, max: usize) -> String {
         let tail = self.tail.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        tail.chars().rev().take(max).collect::<Vec<_>>().into_iter().rev().collect()
+        tail.chars()
+            .rev()
+            .take(max)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
     }
 
     fn supports_control_master(&self) -> bool {

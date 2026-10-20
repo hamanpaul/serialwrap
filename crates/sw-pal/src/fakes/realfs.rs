@@ -23,11 +23,28 @@ fn io_error(e: std::io::Error) -> PalError {
 }
 
 fn is_real_dir(p: &Path) -> bool {
-    std::fs::symlink_metadata(p).map(|m| m.is_dir()).unwrap_or(false)
+    std::fs::symlink_metadata(p)
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
 }
 
 fn is_symlink(p: &Path) -> bool {
-    std::fs::symlink_metadata(p).map(|m| m.file_type().is_symlink()).unwrap_or(false)
+    std::fs::symlink_metadata(p)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn is_symlink_dir(p: &Path) -> bool {
+    use std::os::windows::fs::FileTypeExt;
+    std::fs::symlink_metadata(p)
+        .map(|metadata| metadata.file_type().is_symlink_dir())
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn is_symlink_dir(_p: &Path) -> bool {
+    false
 }
 
 /// 遞迴複製目錄樹；來源 symlink 依其目標內容複製，與 native `copy_tree` 一致。
@@ -76,7 +93,13 @@ impl FsRead for RealFs {
     fn list_dir(&self, p: &Path) -> PalResult<Vec<String>> {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(p).map_err(io_error)? {
-            out.push(entry.map_err(io_error)?.file_name().to_string_lossy().into_owned());
+            out.push(
+                entry
+                    .map_err(io_error)?
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
         }
         Ok(out)
     }
@@ -115,6 +138,13 @@ impl FsOps for RealFs {
     fn copy_preserving(&self, from: &Path, to: &Path) -> PalResult<()> {
         std::fs::copy(from, to).map(|_| ()).map_err(io_error)
     }
+    fn sync_file(&self, path: &Path) -> PalResult<()> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(io_error)
+    }
     fn copy_tree(&self, from: &Path, to: &Path) -> PalResult<()> {
         match std::fs::symlink_metadata(to) {
             Ok(_) => {
@@ -135,7 +165,9 @@ impl FsOps for RealFs {
         copy_dir_recursive(from, to).map_err(io_error)
     }
     fn remove_tree(&self, p: &Path) -> PalResult<()> {
-        if is_real_dir(p) {
+        if is_symlink_dir(p) {
+            std::fs::remove_dir(p).map_err(io_error)
+        } else if is_real_dir(p) {
             std::fs::remove_dir_all(p).map_err(io_error)
         } else if std::fs::symlink_metadata(p).is_ok() {
             // symlink（含指向目錄者）與一般檔：僅移除連結本身，不跟隨。
@@ -166,7 +198,9 @@ impl FsOps for RealFs {
     fn sync_dir(&self, p: &Path) -> PalResult<()> {
         #[cfg(unix)]
         {
-            std::fs::File::open(p).and_then(|f| f.sync_all()).map_err(io_error)
+            std::fs::File::open(p)
+                .and_then(|f| f.sync_all())
+                .map_err(io_error)
         }
         #[cfg(not(unix))]
         {
@@ -203,7 +237,10 @@ impl FsOps for RealFs {
             if rc != 0 {
                 let err = std::io::Error::last_os_error();
                 if !blocking && err.raw_os_error() == Some(libc::EWOULDBLOCK) {
-                    return Err(PalError::plain(PalErrorKind::WouldBlock, "file lock held by another process"));
+                    return Err(PalError::plain(
+                        PalErrorKind::WouldBlock,
+                        "file lock held by another process",
+                    ));
                 }
                 return Err(io_error(err));
             }
@@ -217,7 +254,10 @@ impl FsOps for RealFs {
         #[cfg(not(any(unix, windows)))]
         {
             let _ = (p, blocking);
-            Err(PalError::plain(PalErrorKind::Unsupported, "test fake file lock is unsupported on this platform"))
+            Err(PalError::plain(
+                PalErrorKind::Unsupported,
+                "test fake file lock is unsupported on this platform",
+            ))
         }
     }
 }
@@ -233,7 +273,9 @@ pub fn file_mode(p: &Path) -> Option<u32> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(p).ok().map(|m| m.permissions().mode() & 0o7777)
+        std::fs::metadata(p)
+            .ok()
+            .map(|m| m.permissions().mode() & 0o7777)
     }
     #[cfg(not(unix))]
     {

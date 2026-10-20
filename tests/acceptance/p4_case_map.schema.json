@@ -29,6 +29,10 @@
           "necessity"
         ],
         "properties": {
+          "evidence_status": {
+            "type": "string",
+            "enum": ["BLOCKED-OWNER"]
+          },
           "case_id": {
             "type": "string"
           },

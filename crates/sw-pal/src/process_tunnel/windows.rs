@@ -155,7 +155,8 @@ impl ProcessTunnel for NativeProcessTunnel {
                 "Windows 行程通道需要 WinTree 群組識別",
             ));
         }
-        let Some(root) = open_process_checked(process.pid, PROCESS_QUERY_LIMITED_INFORMATION)? else {
+        let Some(root) = open_process_checked(process.pid, PROCESS_QUERY_LIMITED_INFORMATION)?
+        else {
             return Ok(());
         };
         let Some(actual_root_time) = process_creation_time(root.0) else {

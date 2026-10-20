@@ -7,6 +7,20 @@
 
 use std::ffi::{OsStr, OsString};
 
+/// 依目前平台將位元組轉成 OS 字串；POSIX 保留非 UTF-8 位元組。
+#[cfg(unix)]
+pub fn os_string_from_bytes(bytes: &[u8]) -> OsString {
+    use std::os::unix::ffi::OsStringExt;
+
+    OsString::from_vec(bytes.to_vec())
+}
+
+/// 依目前平台將位元組轉成 OS 字串；Windows 子行程輸出以 UTF-8 替代字元解碼。
+#[cfg(windows)]
+pub fn os_string_from_bytes(bytes: &[u8]) -> OsString {
+    OsString::from(String::from_utf8_lossy(bytes).into_owned())
+}
+
 /// OS 字串的一段：有效文字，或一個無效單位（lone surrogate 碼位，`0xD800..=0xDFFF`）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OsPiece {
@@ -85,4 +99,18 @@ pub fn join_os_pieces(pieces: &[OsPiece]) -> OsString {
         }
     }
     OsString::from_wide(&units)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::os_string_from_bytes;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn os_string_from_bytes_preserves_invalid_posix_bytes() {
+        assert_eq!(
+            os_string_from_bytes(&[0xff, 0xfe]).as_bytes(),
+            &[0xff, 0xfe]
+        );
+    }
 }

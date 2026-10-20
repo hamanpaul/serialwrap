@@ -269,6 +269,9 @@ impl FsOps for Unconfigured {
     fn copy_preserving(&self, _from: &Path, _to: &Path) -> PalResult<()> {
         not_configured(self.0)
     }
+    fn sync_file(&self, _p: &Path) -> PalResult<()> {
+        not_configured(self.0)
+    }
     fn copy_tree(&self, _from: &Path, _to: &Path) -> PalResult<()> {
         not_configured(self.0)
     }
