@@ -1315,15 +1315,26 @@ class TestManagerAttach:
         port.open.side_effect = record_open
         monkeypatch.setattr(sp, "open_serial_port", lambda *a, **k: port)
 
+        results: list[object] = []
+
+        def attach() -> None:
+            try:
+                results.append(mgr.attach_device("COM0"))
+            except BaseException as exc:  # 失敗時保留例外供診斷
+                results.append(exc)
+
         with mock.patch.object(mgr, "_spawn_attach") as spawn_mock:
-            t1 = threading.Thread(target=lambda: mgr.attach_device("COM0"))
-            t2 = threading.Thread(target=lambda: mgr.attach_device("COM0"))
+            t1 = threading.Thread(target=attach)
+            t2 = threading.Thread(target=attach)
             t1.start()
             t2.start()
-            t1.join(timeout=2.0)
-            t2.join(timeout=2.0)
+            t1.join(timeout=10.0)
+            t2.join(timeout=10.0)
+            # 全套負載下曾非確定性失敗（7 輪全套中 2 次，未取得 traceback）：先斷言兩個 attach 都已完成，
+            # 再檢查單一 open；失敗訊息帶出兩次 attach 的實際回應以利定位。
+            assert not t1.is_alive() and not t2.is_alive(), f"attach 未在期限內完成；results={results!r}"
 
-        assert len(open_calls) == 1
+        assert len(open_calls) == 1, f"open_calls={len(open_calls)} results={results!r}"
         spawn_mock.assert_called_once_with(by_id)
 
     def test_preopened_port_reused_by_probe_and_bridge(self, tmp_path, monkeypatch):
