@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import shutil
 import signal
 import subprocess
 import sys
@@ -89,16 +90,32 @@ def _engine_row(path: pathlib.Path) -> dict[str, Any] | None:
     return next((row for row in report.get("results", []) if row.get("id") == "lr-mixed"), None)
 
 
+def resolve_artifacts(
+    environ: Any,
+    *,
+    venv: pathlib.Path = pathlib.Path("/opt/serialwrap/.venv"),
+    which: Any = shutil.which,
+) -> tuple[pathlib.Path, pathlib.Path]:
+    """解析受測 CLI／daemon：SW_BUNDLE → venv（存在時）→ PATH；皆無時明確失敗。
+
+    長跑在無監管的 serialwrap image（系統 pip 安裝）執行，systemd image 才有 venv（§15.11.2 故障保留）。
+    """
+    bundle = environ.get("SW_BUNDLE")
+    if bundle:
+        root = pathlib.Path(bundle)
+        return root / "bin" / "serialwrap", root / "bin" / "serialwrapd"
+    if (venv / "bin" / "serialwrap").exists() and (venv / "bin" / "serialwrapd").exists():
+        return venv / "bin" / "serialwrap", venv / "bin" / "serialwrapd"
+    cli, daemon = which("serialwrap"), which("serialwrapd")
+    if not cli or not daemon:
+        raise FileNotFoundError("找不到受測 serialwrap／serialwrapd（SW_BUNDLE、venv、PATH 皆無）")
+    return pathlib.Path(cli), pathlib.Path(daemon)
+
+
 def main() -> int:
     hours = int(os.environ["SW_HOURS"])
     run_id = os.environ["SW_DOCKER_RUN_ID"]
-    cli = pathlib.Path(os.environ.get("SW_BUNDLE", "/opt/serialwrap/.venv")).joinpath(
-        "bin/serialwrap" if os.environ.get("SW_BUNDLE") else "bin/serialwrap"
-    )
-    daemon = pathlib.Path(os.environ.get("SW_BUNDLE", "/opt/serialwrap/.venv")).joinpath("bin/serialwrapd")
-    if not os.environ.get("SW_BUNDLE"):
-        cli = pathlib.Path("/opt/serialwrap/.venv/bin/serialwrap")
-        daemon = pathlib.Path("/opt/serialwrap/.venv/bin/serialwrapd")
+    cli, daemon = resolve_artifacts(os.environ)
     env = runtime.isolated_env(ROOT / "isolation", cli=cli, daemon=daemon)
     bridge_procs: list[subprocess.Popen] = []
     observer: subprocess.Popen | None = None
