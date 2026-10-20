@@ -325,3 +325,110 @@ cases:
   - sw-cli::p4_case_placeholders::df16_windows_skill_copy
   evidence: target/p4-evidence/df16-windows-skill-copy.json
   necessity: required
+- case_id: win-task-logon-trigger
+  invariants:
+  - insufficient_evidence_not_pass
+  layer: L3
+  platforms:
+  - windows
+  capabilities:
+  - windows_native
+  - supervisor_runtime
+  - interactive_desktop
+  artifact: rust-cli-bundle
+  tests:
+  - tests/test_rust_spike2_tools.py::test_whatif_schtasks_only_throwaway_task_name
+  - tests/test_rust_spike2_tools.py::test_ps1_destructive_commands_limited_to_install_root
+  - tests/test_rust_spike2_tools.py::test_deploy_docs_have_five_sections
+  evidence: target/p4-evidence/win-task-logon-trigger.json
+  necessity: required
+  skip_registered:
+    python: rust-only 契約（behavior_changes 已登記）
+- case_id: win-task-single-instance
+  invariants:
+  - insufficient_evidence_not_pass
+  layer: L3
+  platforms:
+  - windows
+  capabilities:
+  - windows_native
+  - supervisor_runtime
+  artifact: rust-cli-bundle
+  tests:
+  - tests/test_rust_spike2_tools.py::test_judge_single_instance_count_2_fails
+  - tests/test_rust_spike2_tools.py::test_whatif_schtasks_only_throwaway_task_name
+  evidence: target/p4-evidence/win-task-single-instance.json
+  necessity: required
+  skip_registered:
+    python: rust-only 契約（behavior_changes 已登記）
+- case_id: win-task-restart-on-failure
+  invariants:
+  - insufficient_evidence_not_pass
+  - no_reopen_before_handoff
+  layer: L3
+  platforms:
+  - windows
+  capabilities:
+  - windows_native
+  - supervisor_runtime
+  artifact: rust-cli-bundle
+  tests:
+  - tests/test_rust_spike2_tools.py::test_judge_restart_120s_fails
+  - tests/test_rust_spike2_tools.py::test_whatif_schtasks_only_throwaway_task_name
+  evidence: target/p4-evidence/win-task-restart-on-failure.json
+  necessity: required
+  skip_registered:
+    python: rust-only 契約（behavior_changes 已登記）
+- case_id: win-task-72h
+  invariants:
+  - insufficient_evidence_not_pass
+  layer: L3
+  platforms:
+  - windows
+  capabilities:
+  - windows_native
+  - supervisor_runtime
+  - longrun_bench
+  artifact: rust-cli-bundle
+  tests:
+  - tests/test_rust_spike2_tools.py::test_judge_72h_continuous_sampling_passes
+  - tests/test_rust_spike2_tools.py::test_judge_71_9h_runtime_fails
+  - tests/test_rust_spike2_tools.py::test_judge_sample_gap_2h_insufficient
+  evidence: target/p4-evidence/win-task-72h.json
+  necessity: required
+  skip_registered:
+    python: rust-only 契約（behavior_changes 已登記）
+- case_id: p1-rst-daemon
+  invariants:
+  - no_reopen_before_handoff
+  layer: L1.5
+  platforms:
+  - windows
+  capabilities:
+  - windows_native
+  - supervisor_runtime
+  artifact: rust-cli-bundle
+  tests:
+  - tests/test_rust_spike2_tools.py::test_judge_restart_120s_fails
+  - tests/test_rust_spike2_tools.py::test_deploy_docs_have_five_sections
+  - sw-cli::mgmt_graceful_stop::windows_task_restart_aborts_when_daemon_never_exits
+  evidence: target/p4-evidence/p1-rst-daemon.json
+  necessity: required
+  skip_registered:
+    python: rust-only 契約（behavior_changes 已登記）
+- case_id: rm-live-e2e
+  invariants:
+  - no_forbidden_interleave
+  layer: L2
+  platforms:
+  - windows
+  capabilities:
+  - windows_native
+  artifact: rust-cli-bundle
+  tests:
+  - tests/test_rust_spike2_tools.py::test_deploy_docs_have_five_sections
+  - sw-cli::mgmt_remote::windows_connect_ready_via_ping
+  evidence: target/p4-evidence/rm-live-e2e.json
+  necessity: required
+  skip_registered:
+    python: rust-only 契約（behavior_changes 已登記）
