@@ -238,6 +238,19 @@ fn cli_spec_matches_schema() {
             continue;
         }
 
+        // P4-T9：connect、benches 已原生承接（SC-27），自 DELEGATED_GROUPS 移除。
+        if matches!(name, "connect" | "benches") {
+            assert!(
+                matches!(entry.target, SubTarget::Native(_)),
+                "P4-T9 的 {name} 群組必須原生解析"
+            );
+            assert!(
+                !sw_cli::delegate::DELEGATED_GROUPS.contains(&name),
+                "P4-T9 的 {name} 群組不得留在 DELEGATED_GROUPS"
+            );
+            continue;
+        }
+
         // P4-T6：service、supervision-mode 已原生並自 DELEGATED_GROUPS 移除（同 P4-T8 remote 的處理）；
         // schema 的 stage 仍為 delegate-1a，故只核對原生解析與委派集合不含此群組。
         if matches!(name, "service" | "supervision-mode") {

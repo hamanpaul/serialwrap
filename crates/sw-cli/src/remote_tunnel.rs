@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use sw_pal::fs_ops::{FileLockGuard, FsOps};
 use sw_pal::process_tunnel::{ProcGroupRef, TunnelProc};
-use sw_pal::traits::{InterruptScope, PalError, PalResult};
+use sw_pal::traits::{InterruptScope, PalError};
 use sw_pal::PalPathFlavor;
 use sw_proto::endpoint::{parse_endpoint, Endpoint};
 use sw_proto::error_codes::ErrorCode;
@@ -51,15 +51,16 @@ pub struct TunnelSpec {
 /// 隧道錯誤：code 為穩定錯誤碼，message 逐字照 07 §8.5。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TunnelError {
-    pub code: &'static str,
+    /// 錯誤碼；`String` 以容納 `remote status` 回應原樣傳入的碼（P4-T9 `status_tunnels_from`）。
+    pub code: String,
     pub message: Option<String>,
-    interrupted: bool,
+    pub(crate) interrupted: bool,
 }
 
 impl TunnelError {
     fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
-            code: code.as_str(),
+            code: code.as_str().to_string(),
             message: Some(message.into()),
             interrupted: false,
         }
@@ -67,9 +68,18 @@ impl TunnelError {
 
     fn interrupted() -> Self {
         Self {
-            code: ErrorCode::InternalError.as_str(),
+            code: ErrorCode::InternalError.as_str().to_string(),
             message: None,
             interrupted: true,
+        }
+    }
+
+    /// 以任意錯誤碼與可選訊息建立（connect／benches 與 `status` 回應轉換共用）。
+    pub(crate) fn coded(code: impl Into<String>, message: Option<String>) -> Self {
+        Self {
+            code: code.into(),
+            message,
+            interrupted: false,
         }
     }
 }
@@ -276,6 +286,12 @@ fn has_listener(ss_out: &str, port: u16) -> bool {
     })
 }
 
+/// `Registry::lock` 的失敗：`path` 為 Python 對應錯誤會回報的路徑（目錄建立失敗為 remote 目錄，取鎖失敗為 `.registry.lock`）。
+pub struct RegistryLockError {
+    pub path: PathBuf,
+    pub error: PalError,
+}
+
 /// <run_dir>/remote/<port>.json registry。
 pub struct Registry {
     pub remote_dir: PathBuf,
@@ -288,9 +304,17 @@ impl Registry {
         }
     }
 
-    pub fn lock(&self, fs: &dyn FsOps) -> PalResult<FileLockGuard> {
-        fs.mkdirs(&self.remote_dir)?;
+    pub fn lock(&self, fs: &dyn FsOps) -> Result<FileLockGuard, RegistryLockError> {
+        fs.mkdirs(&self.remote_dir)
+            .map_err(|error| RegistryLockError {
+                path: self.remote_dir.clone(),
+                error,
+            })?;
         fs.file_lock_exclusive(&self.lock_path(), true)
+            .map_err(|error| RegistryLockError {
+                path: self.lock_path(),
+                error,
+            })
     }
 
     pub fn read(&self, port: i64) -> Option<PyDict> {
@@ -538,8 +562,8 @@ pub fn status(ctx: &CliCtx<'_>, run_dir: &Path) -> PyDict {
         Ok(guard) => guard,
         Err(error) => {
             return internal_error_response(pal_path_message(
-                &error,
-                &registry.lock_path(),
+                &error.error,
+                &error.path,
                 ctx.p.caps.path_flavor,
             ))
         }
@@ -604,8 +628,8 @@ pub fn close(ctx: &CliCtx<'_>, run_dir: &Path, selector: &str) -> PyDict {
         Ok(guard) => guard,
         Err(error) => {
             return internal_error_response(pal_path_message(
-                &error,
-                &registry.lock_path(),
+                &error.error,
+                &error.path,
                 ctx.p.caps.path_flavor,
             ))
         }
@@ -1079,8 +1103,8 @@ fn proc_from_state(state: &PyDict, control_master: bool) -> TunnelProc {
 fn registry_lock(ctx: &CliCtx<'_>, registry: &Registry) -> Result<FileLockGuard, TunnelError> {
     registry.lock(ctx.p.fs.as_ref()).map_err(|error| {
         internal_tunnel_error(pal_path_message(
-            &error,
-            &registry.lock_path(),
+            &error.error,
+            &error.path,
             ctx.p.caps.path_flavor,
         ))
     })
@@ -1217,8 +1241,8 @@ fn emit_tunnel_error(ctx: &mut CliCtx<'_>, error: &TunnelError) -> i32 {
         .message
         .as_deref()
         .filter(|message| !message.is_empty())
-        .unwrap_or(error.code);
-    let response = error_response(error.code, message);
+        .unwrap_or(error.code.as_str());
+    let response = error_response(&error.code, message);
     emit_response(ctx, &response, 0, 1)
 }
 
@@ -1237,7 +1261,7 @@ fn emit_response(ctx: &mut CliCtx<'_>, response: &PyDict, success: i32, failure:
     }
 }
 
-fn panic_message(payload: &(dyn Any + Send)) -> String {
+pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> String {
     payload
         .downcast_ref::<String>()
         .cloned()

@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// 委派集合（arch §7.4、計畫 §0.3）；`cli_spec` 與 `run` 共用。
-pub const DELEGATED_GROUPS: [&str; 5] = ["daemon", "connect", "benches", "setup", "doctor"];
+pub const DELEGATED_GROUPS: [&str; 3] = ["daemon", "setup", "doctor"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Route {

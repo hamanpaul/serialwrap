@@ -202,6 +202,11 @@ impl TestEnv {
                 "SERIALWRAP_CONFIG".to_string(),
                 self.config_path().display().to_string(),
             ));
+            // benches.yaml 同理：Windows 路徑風格會把 `SERIALWRAP_CONFIG_DIR` 組成 `<dir>\benches.yaml`（P4-T9 承接）。
+            vars.push((
+                "SERIALWRAP_BENCHES_FILE".to_string(),
+                self.config_dir().join("benches.yaml").display().to_string(),
+            ));
             vars.push(("USERPROFILE".to_string(), self.home().display().to_string()));
             vars.push((
                 "LOCALAPPDATA".to_string(),
@@ -748,6 +753,15 @@ impl TestEnv {
         todo!("P4-T7: autostart.lock 的 FakeClock 感知持有者替身尚未實作（release_at_s={release_at_s:?}）")
     }
 
+    /// `benches.state.json.lock` 被另一行程持有且不釋放：`bench_state::remember`／`forget` 取鎖失敗（P4-T9，SC-27）。
+    pub fn with_bench_state_lock_holder(mut self) -> Self {
+        let lock_path = self.bench_state_path().with_file_name("benches.state.json.lock");
+        let gate = FaultFs::wrap(Arc::clone(&self.fs));
+        gate.block_lock_until(&lock_path, Arc::clone(&self.clock), None);
+        self.fs = gate;
+        self
+    }
+
     /// 交接後的 identity 置換模型（P4-T7 `graceful_handoff_hard_stop_only_same_identity` 第二情境）：
     /// `after_s` 秒（Clock 時間）後 `from_pid` 的實例由 `to_pid`（不同 start_ticks）取代。目前尚未實作。
     pub fn with_identity_swap_after(self, after_s: f64, from_pid: u32, to_pid: u32) -> Self {
@@ -891,8 +905,9 @@ impl TestEnv {
         self.tmp_dir.path().join("run")
     }
 
+    /// 與 CLI 由 `SERIALWRAP_STATE_DIR` 推得的路徑相同（`<state dir>/benches.state.json`，07 §9.2）。
     pub fn bench_state_path(&self) -> PathBuf {
-        self.tmp_dir.path().join("bench_state.json")
+        self.state_dir().join("benches.state.json")
     }
 
     /// `install-journal.json` 解析結果（不存在或無法解析 → None）。

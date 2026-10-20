@@ -2,6 +2,9 @@
 
 A/B 案例同時以 Python 基線與受測 CLI 執行並比對輸出：
 stub ssh：connect → benches → connect --close → benches 四步輸出 Python／Rust 相同（pid 正規化）。
+
+已知 A/B 差異（本檔未覆蓋此情境，不納入比對）：`benches.yaml` 語法錯誤時兩實作皆回 INTERNAL_ERROR，
+但 message 文字不同（Python 為 libyaml 文字，Rust 為 sw-proto yaml11 解析器文字）。來源為 sw-proto 解析器，非 P4-T9 範圍。
 """
 from __future__ import annotations
 

@@ -213,7 +213,24 @@ cases:
   - windows_native
   artifact: rust-cli-bundle
   tests:
+  - sw-cli::mgmt_connect::connect_open_remembers_flat_endpoint
+  - sw-cli::mgmt_connect::connect_close_refuses_mismatched_identity
+  - sw-cli::mgmt_connect::connect_unknown_code
+  - sw-cli::mgmt_connect::connect_invalid_config_extra_key
+  - sw-cli::mgmt_connect::connect_target_requires_user_at_host
+  - sw-cli::mgmt_connect::connect_nested_state_preserved
+  - sw-cli::mgmt_connect::connect_remember_failure_rolls_back
+  - sw-cli::mgmt_connect::connect_close_still_active
+  - sw-cli::mgmt_connect::connect_close_clears_memory
+  - sw-cli::mgmt_connect::connect_missing_code_json_boundary
+  - sw-cli::mgmt_connect::benches_sorted_with_alive
+  - sw-cli::mgmt_connect::benches_status_tunnels_from_error_shapes
+  - sw-cli::mgmt_connect::windows_connect_supported
+  - sw-cli::mgmt_connect::bench_state_lock_cross_process
+  - sw-cli::mgmt_connect::bench_state_lock_held_refuses_write
+  - sw-cli::mgmt_connect::bench_state_concurrent_writers_keep_all_entries
   - sw-cli::mgmt_remote::windows_state_matches_p1_schema
+  - tests/contract_blackbox/test_cli_mgmt_connect.py::test_connect_benches_ab
   evidence: target/p4-evidence/sc27-windows-connect-benches.json
   necessity: required
 - case_id: df05-daemon-locate-order

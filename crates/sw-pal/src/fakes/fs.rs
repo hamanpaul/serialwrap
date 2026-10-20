@@ -1,6 +1,6 @@
 //! 記憶體內唯讀檔案系統。
 
-use crate::traits::{FsRead, PalError, PalErrorKind, PalResult};
+use crate::traits::{Clock, FsRead, PalError, PalErrorKind, PalResult};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -86,6 +86,13 @@ pub struct FaultFs {
     replace_fault_contains: Mutex<Option<String>>,
     write_target_fault_suffix: Mutex<Option<String>>,
     copy_tree_fault: Mutex<bool>,
+    lock_block: Mutex<Option<(
+        PathBuf,
+        std::sync::Arc<super::clock::FakeClock>,
+        Option<u64>,
+        Option<(PathBuf, Vec<u8>)>,
+        bool,
+    )>>,
 }
 
 impl std::fmt::Debug for FaultFs {
@@ -102,6 +109,7 @@ impl FaultFs {
             replace_fault_contains: Mutex::new(None),
             write_target_fault_suffix: Mutex::new(None),
             copy_tree_fault: Mutex::new(false),
+            lock_block: Mutex::new(None),
         })
     }
 
@@ -129,6 +137,35 @@ impl FaultFs {
     /// 之後的 `copy_tree` 一律失敗。
     pub fn fail_copy_tree(&self) {
         *self.copy_tree_fault.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    }
+
+    /// 模擬另一個行程持有鎖，直到假時鐘到達指定時間；`None` 表示一直持有。
+    pub fn block_lock_until(
+        &self,
+        path: &Path,
+        clock: std::sync::Arc<super::clock::FakeClock>,
+        release_at_ns: Option<u64>,
+    ) {
+        *self.lock_block.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((path.to_path_buf(), clock, release_at_ns, None, false));
+    }
+
+    /// 鎖於假時鐘到期釋放時，先建立指定檔案，供測試鎖內重查 journal 的競態。
+    pub fn block_lock_until_and_create_file(
+        &self,
+        path: &Path,
+        clock: std::sync::Arc<super::clock::FakeClock>,
+        release_at_ns: u64,
+        file: &Path,
+        contents: &[u8],
+    ) {
+        *self.lock_block.lock().unwrap_or_else(|e| e.into_inner()) = Some((
+            path.to_path_buf(),
+            clock,
+            Some(release_at_ns),
+            Some((file.to_path_buf(), contents.to_vec())),
+            false,
+        ));
     }
 }
 
@@ -211,6 +248,19 @@ impl crate::fs_ops::FsOps for FaultFs {
         self.inner.symlink_or_copy_dir(link, target)
     }
     fn file_lock_exclusive(&self, p: &Path, blocking: bool) -> PalResult<crate::fs_ops::FileLockGuard> {
+        let mut lock_block = self.lock_block.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((path, clock, release_at_ns, file, created)) = lock_block.as_mut() {
+            if path == p && release_at_ns.is_none_or(|release| clock.mono_ns() < release) {
+                return Err(PalError::plain(PalErrorKind::WouldBlock, "fake external lock holder"));
+            }
+            if path == p && !*created {
+                if let Some((target, contents)) = file {
+                    self.inner.write_file(target, contents)?;
+                }
+                *created = true;
+            }
+        }
+        drop(lock_block);
         self.inner.file_lock_exclusive(p, blocking)
     }
 }

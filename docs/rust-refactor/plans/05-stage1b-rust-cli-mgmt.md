@@ -1607,7 +1607,7 @@ fn connect_close_refuses_mismatched_identity() {
 
 - [ ] **步驟 2：執行並確認 FAIL**：`cargo test -p sw-cli --test mgmt_connect` → `not implemented: P4-T9`。
 - [ ] **步驟 3：實作**：照「行為」；移除委派。`contracts/behavior_changes.yaml` SC-27 `status: IMPLEMENTED`（`case_ids` 不改），`p4_case_map.yaml` 把 `sc27-windows-connect-benches` 綁到本 Task 測試。
-- [ ] **步驟 4：執行並確認 PASS**：`cargo test -p sw-cli --test mgmt_connect`、`scripts/rust/win-test.sh --package sw-cli -- mgmt_connect`、黑箱兩實作。
+- [ ] **步驟 4：執行並確認 PASS**：`cargo test -p sw-cli --test mgmt_connect`、`scripts/rust/win-test.sh --package sw-cli -- --test mgmt_connect`、黑箱兩實作。
 - [ ] **步驟 5：commit**：`feat(rust-cli): 原生承接 connect 與 benches（含 Windows）`
 
 **BLOCKED-OWNER：** Windows 測試團隊工作站經真實 bench relay 的 `connect`／`--bench` 端到端（需 bench 與 relay 帳號）。

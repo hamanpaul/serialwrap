@@ -23,6 +23,8 @@ pub fn dispatch(ctx: &mut CliCtx, ns: &Namespace) -> i32 {
     match path.as_slice() {
         ["event", ..] => return event_cmd::dispatch_event(ctx, ns),
         ["remote", ..] => return remote_cmd::run_remote(ctx, ns),
+        ["connect"] => return connect_cmd::run_connect(ns, ctx),
+        ["benches"] => return benches_cmd::run_benches(ns, ctx),
         ["skill"] => return skill_cmd::run_skill(ctx, ns),
         ["service"] => return service_cmd::run_service(ns, ctx),
         ["supervision-mode"] => return supervision_cmd::run_supervision_mode(ns, ctx),

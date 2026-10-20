@@ -317,6 +317,21 @@ pub fn bench_state_path(env: &EnvSnapshot, f: PathFlavor, home: &dyn HomeLookup)
     pypath::join(f, &expanded, &["benches.state.json"])
 }
 
+/// `bench_registry._default_benches_path()`：`SERIALWRAP_BENCHES_FILE`（strip 後非空才採用，原值再 `expanduser`）；
+/// 否則 `<config_dir>/benches.yaml`。`config_dir` 傳入 `RuntimePaths::config_dir`（與 `_default_config_dir()` 同源）。
+pub fn benches_yaml_path(
+    env: &EnvSnapshot,
+    f: PathFlavor,
+    home: &dyn HomeLookup,
+    config_dir: &str,
+) -> String {
+    let raw = match env.get("SERIALWRAP_BENCHES_FILE") {
+        Some(v) if !py_strip(v).is_empty() => v.to_string(),
+        _ => pypath::join(f, config_dir, &["benches.yaml"]),
+    };
+    pypath::expanduser(f, &raw, env, home)
+}
+
 /// `resolve_config_path()`（SC-09，逐字對齊 P1 `constants.resolve_config_path(for_write=False)`，02 T15）。
 ///
 /// 1. `$SERIALWRAP_CONFIG` strip 後非空 → `expanduser` 後原樣回傳（即使檔案不存在）；

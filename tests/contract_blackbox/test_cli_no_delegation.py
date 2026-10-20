@@ -31,8 +31,8 @@ GROUP_PROBES: list[list[str]] = [
 ]
 
 # 仍在委派集合（DELEGATED_GROUPS）中的群組；Task 14 清空後不再需要 xfail。
-# P4-T6 已移除 service、supervision-mode（其 xfail marker 於同一 commit 移除，strict=True 防止漏移除）。
-STILL_DELEGATED_TODAY = {"daemon", "connect", "benches", "setup", "doctor"}
+# P4-T6、T9 已分別移除 service、supervision-mode、connect、benches（其 xfail marker 於同一 commit 移除，strict=True 防止漏移除）。
+STILL_DELEGATED_TODAY = {"daemon", "setup", "doctor"}
 
 
 def _probe_param(argv: list[str]):

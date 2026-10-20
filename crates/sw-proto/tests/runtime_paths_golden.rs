@@ -89,6 +89,40 @@ fn test_bench_state_path() {
     }
 }
 
+/// `bench_registry._default_benches_path()`（`_env_path`）：`SERIALWRAP_BENCHES_FILE` strip 後為空視為未設定；
+/// 非空時採原值（不 strip）再 `expanduser`；未設定時為 `<config_dir>/benches.yaml`。
+#[test]
+fn test_benches_yaml_path() {
+    let cases: &[(&[(&str, &str)], &str)] = &[
+        (&[("HOME", "/h")], "/cfg/benches.yaml"),
+        (
+            &[("HOME", "/h"), ("SERIALWRAP_BENCHES_FILE", "")],
+            "/cfg/benches.yaml",
+        ),
+        (
+            &[("HOME", "/h"), ("SERIALWRAP_BENCHES_FILE", "   ")],
+            "/cfg/benches.yaml",
+        ),
+        (
+            &[("HOME", "/h"), ("SERIALWRAP_BENCHES_FILE", " /b/x.yaml ")],
+            " /b/x.yaml ",
+        ),
+        (
+            &[("HOME", "/h"), ("SERIALWRAP_BENCHES_FILE", "~/x.yaml")],
+            "/h/x.yaml",
+        ),
+    ];
+    for (pairs, want) in cases {
+        let got = sw_proto::runtime_paths::benches_yaml_path(
+            &env_of(pairs),
+            PathFlavor::Posix,
+            &H,
+            "/cfg",
+        );
+        assert_eq!(&got, want, "env={pairs:?}");
+    }
+}
+
 /// SC-09（plan 04 Task 7；逐字對齊 P1 `constants.resolve_config_path(for_write=False)`，02 T15）：
 /// `$SERIALWRAP_CONFIG` strip 後非空 → expanduser 後原樣回傳（即使不存在）；
 /// 否則 `CONFIG_DIR/config.yaml` 存在 → 它；否則 `<system_config_dir>/config.yaml` 存在 → 它；否則 `CONFIG_DIR/config.yaml`。
