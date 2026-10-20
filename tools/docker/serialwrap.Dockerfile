@@ -18,7 +18,9 @@ RUN apt-get update \
        > /etc/apt/sources.list.d/docker.sources \
     && apt-get update \
     && apt-get install -y --no-install-recommends bash "docker-ce-cli=${DOCKER_CE_CLI_VERSION}" jq minicom procps socat tmux \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    # 長跑 preflight 要求 serialwrap doctor 非 advisory 項全綠；長跑容器以 root 執行，加入 dialout 以符合 doctor 檢查
+    && usermod -aG dialout root
 
 WORKDIR /opt/serialwrap
 COPY . /opt/serialwrap

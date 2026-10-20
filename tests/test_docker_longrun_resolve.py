@@ -48,3 +48,11 @@ def test_missing_everywhere_fails_loudly(tmp_path):
     mod = _load()
     with pytest.raises(FileNotFoundError):
         mod.resolve_artifacts({}, venv=tmp_path / "nope", which=lambda n: None)
+
+
+def test_serialwrap_image_root_in_dialout():
+    """長跑 preflight 要求 serialwrap doctor 非 advisory 項全綠；容器以 root 執行，
+    root 須在 dialout 群組以符合 doctor 的 dialout 檢查（只改測試 image，不改產品基線）。"""
+    dockerfile = pathlib.Path(__file__).resolve().parents[1] / "tools" / "docker" / "serialwrap.Dockerfile"
+    text = dockerfile.read_text(encoding="utf-8")
+    assert "usermod -aG dialout root" in text
