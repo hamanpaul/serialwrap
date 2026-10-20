@@ -112,6 +112,26 @@ def resolve_artifacts(
     return pathlib.Path(cli), pathlib.Path(daemon)
 
 
+def capture_doctor(env: dict[str, str], output: pathlib.Path) -> int:
+    """以長跑隔離環境執行唯讀 doctor，保存完整 JSON 供 preflight 拒跑診斷。"""
+    cli = env["SERIALWRAP_CLI_EXE"]
+    output.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        result = subprocess.run(
+            [cli, "doctor"], env=env, capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        output.write_text(
+            json.dumps({"capture_error": f"{type(exc).__name__}: {exc}"},
+                       ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return 125
+    output.write_text(result.stdout, encoding="utf-8")
+    output.with_suffix(".stderr.log").write_text(result.stderr, encoding="utf-8")
+    return int(result.returncode)
+
+
 def main() -> int:
     hours = int(os.environ["SW_HOURS"])
     run_id = os.environ["SW_DOCKER_RUN_ID"]
@@ -141,6 +161,7 @@ def main() -> int:
             evidence_root=runtime.host_evidence_root(OUT) / "bridge",
         )
         runtime.start_daemon_and_wait(env, timeout_s=120)
+        capture_doctor(env, OUT / "doctor.json")
         observer_path = OUT / "observer.ndjson"
         observer_log = (OUT / "observer.log").open("w", encoding="utf-8")
         observer = subprocess.Popen(

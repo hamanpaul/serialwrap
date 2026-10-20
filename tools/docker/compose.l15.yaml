@@ -18,6 +18,7 @@ services:
       # serialwrap 容器透過 Docker API 啟動唯一命名的 DUT；持有此 socket 等同主機 root 權限。
       - /var/run/docker.sock:/var/run/docker.sock
     group_add:
+      - dialout
       - "${SW_DOCKER_GID:-0}"
     tmpfs:
       - /run/sw-fake:mode=1777

@@ -238,6 +238,7 @@ def run_observer(sw: Any, boards: list[str], *, interval_s: float, out: Path, st
     next_probe = 0.0
 
     started = time.monotonic()
+    next_sample = started
     while not stop.is_set():
         now = time.monotonic()
         elapsed = now - started
@@ -254,7 +255,13 @@ def run_observer(sw: Any, boards: list[str], *, interval_s: float, out: Path, st
                               "error": type(exc).__name__}
                 _append(probes_path, {"kind": "excl_probe", "com": com, **record})
             next_probe = now + float(excl_probe_interval_s)
-        wait = float(interval_s)
+        # 以固定期限排程，將 RPC／程序掃描耗時納入週期，避免長跑取樣逐筆漂移。
+        next_sample += float(interval_s)
+        after_sample = time.monotonic()
+        if interval_s > 0 and next_sample <= after_sample:
+            missed = int((after_sample - next_sample) // float(interval_s)) + 1
+            next_sample += missed * float(interval_s)
+        wait = max(0.0, next_sample - time.monotonic())
         if duration_s is not None:
             wait = min(wait, max(0.0, duration_s - (time.monotonic() - started)))
         if probe_enabled:
