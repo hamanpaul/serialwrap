@@ -113,6 +113,10 @@ impl ProcessTunnel for NativeProcessTunnel {
             }
         }
         send_group_signal(pgid, libc::SIGKILL).map_err(posix_io_error)?;
+        // 07 §8.4 `_terminate_pgid`：SIGKILL＋reap 後即視為完成，不回報錯誤。
+        // SIGKILL 無法被忽略；有界等待只為及時回收本行程可回收的子行程。逾時仍見群組
+        // 只會是非本行程子行程的 zombie（例如 PID 1 不回收的容器／PID namespace），
+        // 此時回錯誤會讓 `remote close`／`connect --close` 把已終止的隧道標成 error，與 Python 基線不同。
         let reap_deadline = std::time::Instant::now() + Duration::from_secs(1);
         loop {
             reap_group(pgid);
@@ -123,10 +127,7 @@ impl ProcessTunnel for NativeProcessTunnel {
                 Err(error) => return Err(posix_io_error(error)),
             }
             if std::time::Instant::now() >= reap_deadline {
-                return Err(PalError::plain(
-                    PalErrorKind::TimedOut,
-                    "SIGKILL 後行程群組仍未收斂",
-                ));
+                return Ok(());
             }
             std::thread::sleep(Duration::from_millis(10));
         }

@@ -164,3 +164,65 @@ def test_connect_benches_ab(tmp_path: Path) -> None:
     assert py_steps[2][0] == 0  # close rc 0
     assert py_steps[3][0] == 0  # benches after close rc 0
     assert '"alive":false' in py_steps[3][1]
+
+
+# PID 1 只等待自己啟動的子行程、從不回收其他孤兒（容器無 init、`unshare --pid` 的情境）。
+_NON_REAPING_PID1 = """import json, subprocess, sys
+prefix = json.loads(sys.argv[1])
+out = []
+for args in (["connect", "B1"], ["connect", "B1", "--close"], ["benches"]):
+    r = subprocess.run(prefix + args, capture_output=True, text=True, timeout=60)
+    out.append([r.returncode, r.stdout])
+subprocess.run(prefix + ["connect", "B1", "--close"], capture_output=True, timeout=30)
+print(json.dumps(out))
+"""
+
+
+def _unshare_pidns_argv() -> list[str] | None:
+    """可用時回傳以非 root 使用者建立獨立 PID／mount namespace 的 argv 前綴；不可用回 None。"""
+    argv = ["unshare", "--user", "--map-current-user", "--pid", "--fork", "--mount", "--mount-proc"]
+    try:
+        probe = subprocess.run(argv + ["true"], capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return argv if probe.returncode == 0 else None
+
+
+@pytest.mark.case("sc27-windows-connect-benches")
+def test_connect_close_with_non_reaping_pid1(tmp_path: Path) -> None:
+    """PID 1 不回收孤兒時，`connect --close` 仍須回報已關閉且清除記憶（07 §8.4 `_terminate_pgid` 語意）。
+
+    回歸：Rust PAL 曾在 SIGKILL 後把殘留的 zombie 群組當成「未收斂」而回錯誤，使隧道被標為 error、
+    `closed` 為空；Python 基線於 SIGKILL＋reap 後即視為完成。兩實作輸出須相同。
+    """
+    unshare = _unshare_pidns_argv()
+    if unshare is None:
+        pytest.skip("此宿主無法以非特權 unshare 建立 PID namespace（環境能力不足，非 PASS）")
+    results: dict[str, Any] = {}
+    for label, prefix in (("python", python_baseline_prefix()), ("cli", cli_prefix())):
+        work = tmp_path / label
+        work.mkdir(parents=True, exist_ok=True)
+        env = isolated_env(work)
+        env["PATH"] = _stub_path(work)
+        cfg_dir = work / "config"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        (cfg_dir / "benches.yaml").write_text(_BENCHES_YAML, encoding="utf-8")
+        env["SERIALWRAP_CONFIG_DIR"] = str(cfg_dir)
+        driver = work / "pid1.py"
+        driver.write_text(_NON_REAPING_PID1, encoding="utf-8")
+        proc = subprocess.run(
+            unshare + ["python3", "-I", str(driver), json.dumps(prefix)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        assert proc.returncode == 0, proc.stderr
+        steps = [(rc, _norm_pid(out)) for rc, out in json.loads(proc.stdout)]
+        results[label] = steps
+
+    assert results["cli"] == results["python"]
+    connect, close, benches = results["python"]
+    assert connect[0] == 0 and '"status":"active"' in connect[1]
+    assert close == (0, '{"closed":[49001],"ok":true}\n')
+    assert benches[0] == 0 and '"alive":false' in benches[1]
