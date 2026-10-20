@@ -23,6 +23,12 @@ fn runtime_path(t: &TestEnv) -> String {
         .into_owned()
 }
 
+/// `TestEnv::posix()` 下 doctor 以 POSIX 旗標（Python `posixpath.join`）接上 `default.yaml`；
+/// Linux 主機與 `Path::join` 相同，Windows 主機模擬 POSIX 時分隔符為 `/`（profile 目錄本身仍為主機路徑）。
+fn posix_flavor_profile_path(t: &TestEnv) -> String {
+    format!("{}/default.yaml", t.config_dir().join("profiles").display())
+}
+
 trait PyDictExt {
     fn contains_key(&self, k: &str) -> bool;
 }
@@ -410,7 +416,7 @@ fn bootloader_prompts_drift() {
         s(check, "detail"),
         format!(
             "線上 {} 的 brcm-template 缺 bootloader_prompts（出貨資產有）",
-            live_path.display()
+            posix_flavor_profile_path(&t)
         )
     );
 }
@@ -418,7 +424,6 @@ fn bootloader_prompts_drift() {
 #[test]
 fn bootloader_prompts_not_materialized() {
     let t = TestEnv::posix();
-    let live_path = t.config_dir().join("profiles").join("default.yaml");
     let (rc, out, _) = t.run(&["doctor"]);
     assert_eq!(rc, 0);
     let doc = json(&out);
@@ -426,7 +431,7 @@ fn bootloader_prompts_not_materialized() {
     assert!(b(check, "ok"));
     assert_eq!(
         s(check, "detail"),
-        format!("線上 profile 未物化（{}），略過", live_path.display())
+        format!("線上 profile 未物化（{}），略過", posix_flavor_profile_path(&t))
     );
 }
 

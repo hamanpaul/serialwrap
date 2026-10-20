@@ -581,7 +581,11 @@ fn daemon_runtime(ctx: &CliCtx, state: &ManifestState) -> Result<String, String>
             if !safe_component_path(&relative) {
                 return Err(format!("invalid release manifest: {KEY_RUNTIME_PATH}"));
             }
-            let runtime = dir.join(&relative);
+            // 逐段接上（同 delegate::join_relative）：Windows 產生原生 `\\` 分隔，與 Python `Path(dir) / rel` 一致。
+            let mut runtime = dir.clone();
+            for segment in relative.split('/').filter(|segment| !segment.is_empty()) {
+                runtime.push(segment);
+            }
             if !ctx.p.fs.exists(&runtime) {
                 return Err(format!("daemon runtime 不存在：{}", runtime.display()));
             }
@@ -611,7 +615,7 @@ fn run_runtime(ctx: &CliCtx, runtime: &str, code: &str) -> RuntimeRun {
     match ctx.p.env.run(&argv, Some(RUNTIME_TIMEOUT)) {
         Ok(out) if out.rc == 0 => RuntimeRun::Output(py_strip(&out.stdout).to_string()),
         // 逾時：POSIX／Windows 的 run 慣例為 rc -1 且 stderr 為 TIMEOUT。
-        Ok(out) if out.rc == -1 && out.stderr == "TIMEOUT" => {
+        Ok(out) if out.rc == -1 && out.stderr == sw_pal::RUN_TIMEOUT_STDERR => {
             RuntimeRun::Unrunnable(REASON_TIMEOUT.to_string())
         }
         Ok(out) => RuntimeRun::NonZero(out.rc),

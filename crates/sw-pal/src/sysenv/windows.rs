@@ -183,7 +183,7 @@ impl SysEnv for NativeSysEnv {
             rc: status.map(exit_code).unwrap_or(-1),
             stdout: universal_newlines(stdout),
             stderr: if timed_out {
-                "TIMEOUT".to_string()
+                crate::traits::RUN_TIMEOUT_STDERR.to_string()
             } else {
                 String::new()
             },
@@ -286,7 +286,7 @@ fn run_bytes(
             });
         windows_win32_error(code)
     })? {
-        CapturedOutput::TimedOut => Ok((-1, Vec::new(), b"TIMEOUT".to_vec())),
+        CapturedOutput::TimedOut => Ok((-1, Vec::new(), crate::traits::RUN_TIMEOUT_STDERR.as_bytes().to_vec())),
         CapturedOutput::Exited {
             status,
             stdout,
