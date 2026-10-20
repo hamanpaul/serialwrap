@@ -1439,6 +1439,16 @@ fn emit_error(ctx: &mut CliCtx<'_>, response: &PyDict, context: &str, exit: i32)
     exit
 }
 
+/// 安裝類請求（rollback／bundle 首次安裝或更新）一律在入口取得安裝鎖；走到這裡代表入口判定與分支不一致，fail closed。
+fn missing_install_lock(ctx: &mut CliCtx<'_>) -> i32 {
+    let mut response = output::error_resp(
+        ErrorCode::InternalError,
+        Some("安裝類 setup 未持有安裝鎖（入口判定與分支不一致）"),
+    );
+    response.insert("phase", PyValue::Str("install_lock".into()));
+    emit_error(ctx, &response, "setup", 2)
+}
+
 pub fn run_setup(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
     if flag(ns, "rollback") && (flag(ns, "with_com0com") || flag(ns, "remove_com0com")) {
         let response = output::error_resp(
@@ -1476,9 +1486,27 @@ pub fn run_setup(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
     }
 
     let install_root = install_layout::resolve_install_root(ctx);
-    let install_lock = match install_layout::install_lock(ctx, &install_root) {
-        Ok(lock) => lock,
-        Err(response) => return emit_error(ctx, &response, "setup", 2),
+    // 安裝鎖只由 update／rollback／首次安裝（§12.1）整筆持有；一般 setup（Task 10 reconcile，與 Python 雙邊對齊）
+    // 不得在安裝根新增 `.install.lock`。安裝根已有鎖檔或殘留 journal 時（曾安裝或更新中斷），一般 setup 仍先取鎖，
+    // 與進行中的 updater 互斥並在鎖內處理殘留 journal。
+    let install_request = flag(ns, "rollback")
+        || (matches!(
+            install_layout::classify_exe(ctx, &install_root),
+            install_layout::ExeLocation::External(_)
+        ) && !matches!(
+            install_layout::locate_manifest(ctx),
+            Err(install_layout::LayoutError::ManifestNotFound(_))
+        ));
+    let needs_install_lock = install_request
+        || ctx.p.fs.exists(&install_root.root.join(".install.lock"))
+        || ctx.p.fs.exists(&install_root.root.join("install-journal.json"));
+    let mut install_lock = if needs_install_lock {
+        match install_layout::install_lock(ctx, &install_root) {
+            Ok(lock) => Some(lock),
+            Err(response) => return emit_error(ctx, &response, "setup", 2),
+        }
+    } else {
+        None
     };
     if let Err(code) = crate::commands::supervision_cmd::load_config_or_report(
         ctx,
@@ -1514,11 +1542,14 @@ pub fn run_setup(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
         }
     };
     if flag(ns, "rollback") {
+        let Some(lock) = install_lock.take() else {
+            return missing_install_lock(ctx);
+        };
         let mut report = crate::rollback::run_rollback_locked(
             ctx,
             flag(ns, "with_sudo"),
             flag(ns, "force"),
-            install_lock,
+            lock,
         );
         add_left_installed_report(ctx, &mut report);
         return crate::rollback::emit_update_report(
@@ -1551,6 +1582,9 @@ pub fn run_setup(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
                         return emit_error(ctx, &response, "setup", 2);
                     }
                 };
+                let Some(lock) = install_lock.take() else {
+                    return missing_install_lock(ctx);
+                };
                 let mut report = if current.is_some() {
                     let target = match resolve_target_mode(ns, ctx) {
                         Ok(target) => target,
@@ -1562,10 +1596,10 @@ pub fn run_setup(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
                         &target,
                         flag(ns, "with_sudo"),
                         flag(ns, "force"),
-                        install_lock,
+                        lock,
                     )
                 } else {
-                    crate::rollback::run_install_locked(ctx, bundle_dir, ns, install_lock)
+                    crate::rollback::run_install_locked(ctx, bundle_dir, ns, lock)
                 };
                 if report.ok && flag(ns, "with_com0com") {
                     add_optional_install_result(ctx, &mut report);

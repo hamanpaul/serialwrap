@@ -1057,3 +1057,31 @@ fn supervision_set_bad_words() {
         "用法：serialwrap supervision-mode [set MODE]"
     );
 }
+
+// 一般 setup（Task 10 reconcile，雙邊 A/B 對齊）不得在安裝根新增 `.install.lock`：
+// 安裝鎖只由 update／rollback／首次安裝持有（Task 11／12）。修正前一般 setup 也會建立鎖檔，
+// 使 `test_setup_ab_on_demand_isolated` 的安裝根樹與 Python 基線不一致。
+#[test]
+fn plain_setup_does_not_create_install_lock() {
+    let t = TestEnv::posix()
+        .with_real_service()
+        .with_config("supervision_mode: on-demand\n");
+    let (rc, out, _) = t.run(&["setup", "--on-demand"]);
+    assert_eq!(rc, 0, "{out}");
+    assert!(!t.install_root().join(".install.lock").exists());
+}
+
+// 安裝根已有鎖檔（曾安裝／更新進行中）時，一般 setup 仍先取鎖，與 updater 互斥：持鎖者不放 → TIMEOUT、無任何 RPC。
+#[test]
+fn plain_setup_waits_for_existing_install_lock_holder() {
+    let t = TestEnv::posix()
+        .with_real_service()
+        .with_config("supervision_mode: on-demand\n")
+        .with_install_lock_holder();
+    let (rc, out, _) = t.run(&["setup", "--on-demand"]);
+    assert_eq!(rc, 2, "{out}");
+    let result = json(&out);
+    assert_eq!(str_field(&result, "error_code"), "TIMEOUT");
+    assert_eq!(str_field(&result, "phase"), "install_lock");
+    assert!(t.rpc().requests().is_empty());
+}
