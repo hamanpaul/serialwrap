@@ -74,3 +74,11 @@ steps:
     expect:
       ok: true
       command.status: "done"
+
+bridge:
+  applicable: true
+  compare: full
+  windows_caps: [windows_com]
+  secrets_from_env_file:
+    file: brcm.env
+    keys: [BRCM_PASS]

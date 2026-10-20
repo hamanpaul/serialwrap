@@ -41,20 +41,20 @@ def validate_uboot_cmd(cmd: str) -> None:
 
 
 class UBootConsole:
-    """經 tmux 內 console（serialwrap-minicom）與 U-Boot 互動；只暴露唯讀操作。
+    """經人類 console frontend 與 U-Boot 互動；只暴露唯讀操作。
 
-    建構不做 I/O（可單測 leave 驗證）；互動皆走 ctx.tmux 對 tmux_session 送鍵／capture。
+    建構不做 I/O（可單測 leave 驗證）；UART 操作只經注入的 HumanFrontend。
     """
 
-    def __init__(self, ctx: Any, com: str, tmux_session: str) -> None:
+    def __init__(self, ctx: Any, com: str, frontend: Any) -> None:
         self._ctx = ctx
         self._com = com
-        self._ses = tmux_session
+        self._frontend = frontend
 
     def _capture(self) -> str:
         from realhw.drivers import strip_ansi
 
-        return strip_ansi(self._ctx.tmux.capture(self._ses))
+        return strip_ansi(self._frontend.capture())
 
     def at_prompt(self) -> bool:
         return bool(_UBOOT_PROMPT.search(self._capture()))
@@ -63,7 +63,7 @@ class UBootConsole:
         """週期送鍵直到出現 U-Boot prompt；autoboot 窗僅 3s，需在 reboot 後立即呼叫。"""
         deadline = time.monotonic() + window_s
         while time.monotonic() < deadline:
-            self._ctx.tmux.send(self._ses, "", enter=True)  # 任意鍵（Enter）停 autoboot
+            self._frontend.send_key("Enter")  # 任意鍵（Enter）停 autoboot
             time.sleep(0.3)
             if self.at_prompt():
                 return True
@@ -72,7 +72,7 @@ class UBootConsole:
     def readonly_cmd(self, cmd: str, settle_s: float = 1.5) -> str:
         """白名單驗證後送出，回傳 capture 文字；非白名單一律 raise、bytes 不落 UART。"""
         validate_uboot_cmd(cmd)
-        self._ctx.tmux.send(self._ses, cmd, enter=True)
+        self._frontend.send_line(cmd)
         time.sleep(settle_s)
         return self._capture()
 
@@ -85,7 +85,7 @@ class UBootConsole:
         """
         if via not in LEAVE_ALLOWED:
             raise UBootGuardError(f"非法離開方式：{via!r}（允許：{LEAVE_ALLOWED}）")
-        self._ctx.tmux.send(self._ses, via, enter=True)
+        self._frontend.send_line(via)
 
 
 def ensure_ready(ctx: Any, com: str, *, timeout_s: float, recover: bool = True) -> bool:
@@ -112,6 +112,9 @@ _TA_ENV_DIRS: tuple[str, ...] = (
     "SERIALWRAP_BY_ID_DIR",
     "SERIALWRAP_BY_PATH_DIR",
     "SERIALWRAP_CONFIG_DIR",
+    "SERIALWRAP_LOG_DIR",
+    "SERIALWRAP_EVENTS_DIR",
+    "SERIALWRAP_EVENTS_RUNTIME_DIR",
     "SERIALWRAP_PROFILE_DIR",
 )
 
@@ -130,6 +133,9 @@ def throwaway_env(workdir: Path, by_id_dir: Path, run_dir: Path) -> dict[str, st
         "SERIALWRAP_BY_ID_DIR": by_id_dir,
         "SERIALWRAP_BY_PATH_DIR": workdir / "bypath",  # 空目錄＝主機 by-path 對 throwaway 不可見
         "SERIALWRAP_CONFIG_DIR": workdir / "config",
+        "SERIALWRAP_LOG_DIR": workdir / "logs",
+        "SERIALWRAP_EVENTS_DIR": workdir / "events",
+        "SERIALWRAP_EVENTS_RUNTIME_DIR": workdir / "events-runtime",
         "SERIALWRAP_PROFILE_DIR": workdir / "profiles",
     }
     for key, path in mapping.items():
@@ -157,7 +163,8 @@ class ThrowawayDaemon:
     def __enter__(self) -> "ThrowawayDaemon":
         import tempfile
 
-        for sub in ("state", "wal", "config", "profiles", "bypath"):
+        for sub in ("state", "wal", "config", "logs", "events", "events-runtime",
+                    "profiles", "bypath"):
             (self._workdir / sub).mkdir(parents=True, exist_ok=True)
         self._by_id_dir.mkdir(parents=True, exist_ok=True)
         (self._workdir / "profiles" / "default.yaml").write_text(

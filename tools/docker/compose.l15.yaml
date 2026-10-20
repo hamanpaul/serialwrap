@@ -1,0 +1,65 @@
+services:
+  serialwrap:
+    image: ${SW_SERIALWRAP_IMAGE:-serialwrap-l15:local}
+    build:
+      context: ../..
+      dockerfile: tools/docker/serialwrap.Dockerfile
+    working_dir: /opt/serialwrap
+    network_mode: none
+    user: "${SW_CONTAINER_UID:-0}:${SW_CONTAINER_GID:-0}"
+    stdin_open: true
+    tty: false
+    environment:
+      PYTHONPATH: /opt/serialwrap:/opt/serialwrap/tools/uart_stdio_bridge/src
+      SERIALWRAP_BY_ID_DIR: /run/sw-fake/by-id
+      SERIALWRAP_BY_PATH_DIR: /run/sw-fake/by-path
+      SW_UART_KIND: pty-fake
+    volumes:
+      # serialwrap 容器透過 Docker API 啟動唯一命名的 DUT；持有此 socket 等同主機 root 權限。
+      - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      - "${SW_DOCKER_GID:-0}"
+    tmpfs:
+      - /run/sw-fake:mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  dut-sim:
+    image: ${SW_DUT_SERVICE_IMAGE:-serialwrap-dut-sim-l15:local}
+    build:
+      context: ../uart_stdio_bridge
+      dockerfile: docker/Dockerfile.dut
+    stdin_open: true
+    tty: false
+    network_mode: none
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    pids_limit: 64
+
+  systemd:
+    image: ${SW_SYSTEMD_IMAGE:-serialwrap-systemd:local}
+    build:
+      context: ../..
+      dockerfile: tools/docker/systemd.Dockerfile
+    profiles:
+      - systemd-user
+      - systemd-system
+    network_mode: none
+    cgroup: host
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      # docker.sock 讓 bridge 從隔離的 systemd 容器啟動唯一命名的 DUT；持有此 socket 等同主機 root 權限。
+      - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      - "${SW_DOCKER_GID:-0}"
+    tmpfs:
+      - /run
+      - /run/lock
+      - /tmp
+    stop_grace_period: 30s

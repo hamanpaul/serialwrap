@@ -1,0 +1,69 @@
+---
+meta:
+  name: win-com-cancel-close
+  category: l15-scenario
+  severity: critical
+  description: "Windows COM 命令取消與釋放：取消後命令終態明確，釋放後外部可立即獨占開啟（§15.7.1）"
+  platforms: [windows]
+  scenario:
+    revision: "2026-10-15.1"
+    seed: 1015
+    capabilities: [windows_com, process_rpc]
+    timeout_s: 60
+    invariants: [no_reopen_before_handoff, no_auto_resend]
+    behavior_changes: []
+    expected: PASS
+    daemon_slice: "2.1"
+bridge: {applicable: true, only: true, compare: full}
+target:
+  platform: prpl
+  boot_banner: "boot done\r\nroot@prplOS:/# "
+  noise: {enabled: false}
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+  plan:
+    schema_version: "dut-plan.v1"
+    seed: 1015
+    triggers:
+      - id: stop-w-slow
+        line_contains: "W_SLOW"
+        action:
+          kind: delay_reply
+          delay_ms: 6000
+profile:
+  prompt_regex: '(?m)^root@prplOS:.*# '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+steps:
+  - action: wait_ready
+    timeout_s: 20
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:w1", "--cmd", "echo W_SLOW", "--cmd-timeout", "30"]
+    save_as: s
+  - action: cli
+    argv: ["cmd", "cancel", "--cmd-id", "{s.cmd_id}"]
+    expect: {ok: true}
+  - action: assert_command_resolved
+    from: s
+    timeout_s: 10
+    payload: "echo W_SLOW\n"
+  - action: op_begin
+    op_id: release
+  - action: cli
+    argv: ["device", "release", "--selector", "COM0"]
+    expect: {ok: true}
+  - action: op_end
+    op_id: release
+  - action: hold_endpoint
+    mode: open
+    seconds: 10
+    save_as: h_win
+    expect: {opened: true}
+  - action: release_endpoint
+    from: h_win
+  - action: cli
+    argv: ["device", "attach", "--selector", "COM0"]
+    expect: {ok: true}
+  - action: wait_ready
+    timeout_s: 20
+  - action: assert_compare

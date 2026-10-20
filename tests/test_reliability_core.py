@@ -288,10 +288,11 @@ def test_make_skip_result_shape():
 @pytest.mark.memory_only
 def test_build_ctx_injects_win_cli(monkeypatch, tmp_path):
     core.ensure_realhw_importable()
-    from realhw import drivers
+    from realhw import drivers, preflight
 
     class FakeSwCli:
-        pass
+        def __init__(self, *, exe: str) -> None:
+            self.exe = exe
 
     class FakeTmuxCtl:
         def __init__(self, prefix: str) -> None:
@@ -313,12 +314,14 @@ def test_build_ctx_injects_win_cli(monkeypatch, tmp_path):
     monkeypatch.setattr(drivers, "Usbipd", FakeUsbipd)
     monkeypatch.setattr(drivers, "Systemd", FakeSystemd)
     monkeypatch.setattr(drivers, "WinSwCli", FakeWinSwCli)
+    monkeypatch.setattr(preflight, "resolve_serialwrap_exe", lambda _cfg: ("pinned-cli", {}))
     ctx = core.build_ctx({
         "tmux_prefix": "realhw",
         "usbipd_exe": "/x/usbipd.exe",
         "win_serialwrap_exe": "/mnt/c/serialwrap.exe",
     }, tmp_path)
     assert isinstance(ctx.sw, FakeSwCli)
+    assert ctx.sw.exe == "pinned-cli"
     assert isinstance(ctx.tmux, FakeTmuxCtl) and ctx.tmux.prefix == "realhw"
     assert isinstance(ctx.usbipd, FakeUsbipd) and ctx.usbipd.exe == "/x/usbipd.exe"
     assert isinstance(ctx.systemd, FakeSystemd)
@@ -464,11 +467,21 @@ def test_longrun_runner_result_joins_even_if_thread_already_finished():
 def test_run_preflight_acquires_benchlock_and_collects_missing(monkeypatch, tmp_path):
     """防靜默失效雙斷言：benchlock 有被嘗試取鎖並注入 collect；missing_caps 有被收集。"""
     core.ensure_realhw_importable()
-    from realhw import preflight
+    from realhw import drivers, frontends, preflight
+
+    class FakeSwCli:
+        def run(self, *args):
+            if args == ("--version",):
+                return {"_raw": "serialwrap 0.2.3"}
+            if args == ("daemon", "status"):
+                return {"version": "0.2.3"}
+            return {}
+
+    monkeypatch.setattr(drivers, "SwCli", lambda exe=None: FakeSwCli())
 
     lockfile = tmp_path / "bench.lock"
     seen: dict = {}
-    monkeypatch.setattr(preflight, "bench_lock_path", lambda: lockfile)
+    monkeypatch.setattr(preflight, "bench_lock_path", lambda cfg=None: lockfile)
     real_acquire = preflight.acquire_benchlock
 
     def spy_acquire(path):
@@ -487,13 +500,21 @@ def test_run_preflight_acquires_benchlock_and_collects_missing(monkeypatch, tmp_
     caps = preflight.Capabilities(remote_capability=True,
                                   deployed_version="serialwrap 0.2.3", docker=False)
     monkeypatch.setattr(preflight, "collect_capabilities", lambda sw: caps)
+    monkeypatch.setattr(frontends, "frontend_capability", lambda cfg: (True, None))
+    monkeypatch.setattr(
+        preflight,
+        "platform_missing_caps",
+        lambda **kwargs: {"usbipd": "cap_missing:usbipd"},
+    )
 
     out = core.run_preflight({"boards": [], "win_serialwrap_exe": ""})
     assert seen["acquire_path"] == lockfile
     assert seen["benchlock_ok"] is True
     assert seen["win_passed"] is True
     assert out["ok"] is True
-    assert out["missing_caps"] == {"docker": "docker_unavailable"}
+    assert out["missing_caps"] == {
+        "docker": "docker_unavailable", "usbipd": "cap_missing:usbipd"
+    }
     assert out["deployed_version"] == "serialwrap 0.2.3"
     assert out["benchlock_fd"] is not None
 
@@ -505,7 +526,7 @@ def test_run_preflight_closes_benchlock_on_collect_error(monkeypatch, tmp_path):
     from realhw import preflight
 
     lockfile = tmp_path / "bench.lock"
-    monkeypatch.setattr(preflight, "bench_lock_path", lambda: lockfile)
+    monkeypatch.setattr(preflight, "bench_lock_path", lambda cfg=None: lockfile)
 
     def boom(*args, **kwargs):
         raise RuntimeError("collect boom")
@@ -522,10 +543,10 @@ def test_run_preflight_closes_benchlock_on_collect_error(monkeypatch, tmp_path):
 @pytest.mark.memory_only
 def test_run_preflight_refuses_when_benchlock_held(monkeypatch, tmp_path):
     core.ensure_realhw_importable()
-    from realhw import preflight
+    from realhw import drivers, preflight
 
     lockfile = tmp_path / "bench.lock"
-    monkeypatch.setattr(preflight, "bench_lock_path", lambda: lockfile)
+    monkeypatch.setattr(preflight, "bench_lock_path", lambda cfg=None: lockfile)
     held_fd = preflight.acquire_benchlock(lockfile)
     assert held_fd is not None
 
@@ -537,9 +558,79 @@ def test_run_preflight_refuses_when_benchlock_held(monkeypatch, tmp_path):
         preflight, "evaluate",
         lambda c: (c["benchlock_ok"],
                    [] if c["benchlock_ok"] else ["bench 互斥：benchlock 已被持有（拒跑）"]))
+    class NoProbeSwCli:
+        def run(self, *_args, **_kwargs):
+            raise AssertionError("benchlock 拒跑後不應執行版本 probe")
+
+    monkeypatch.setattr(drivers, "SwCli", lambda exe=None: NoProbeSwCli())
     out = core.run_preflight({"boards": [], "win_serialwrap_exe": ""})
     assert out["ok"] is False
     assert out["benchlock_fd"] is None
     assert any("benchlock" in p for p in out["problems"])
     os.close(held_fd)
     assert out["missing_caps"] == {} and out["deployed_version"] == ""
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_run_preflight_reports_version_probe_failure(monkeypatch, tmp_path):
+    core.ensure_realhw_importable()
+    from realhw import drivers, frontends, preflight
+
+    class FailedVersionSwCli:
+        def run(self, *args, **_kwargs):
+            if args == ("--version",):
+                raise OSError("serialwrap missing")
+            return {"version": "0.2.3", "pid": 1}
+
+    monkeypatch.setattr(drivers, "SwCli", lambda exe=None: FailedVersionSwCli())
+    monkeypatch.setattr(drivers, "WinSwCli", lambda _exe: object())
+    monkeypatch.setattr(preflight, "bench_lock_path", lambda cfg=None: tmp_path / "bench.lock")
+    monkeypatch.setattr(preflight, "acquire_benchlock", lambda _path: 7)
+    monkeypatch.setattr(preflight, "collect", lambda *args, **kwargs: SimpleNamespace(
+        cross_os_guard="unconfigured", cross_os_detail=None
+    ))
+    monkeypatch.setattr(preflight, "evaluate", lambda _checks: (True, []))
+    monkeypatch.setattr(preflight, "cross_os_holder_check", lambda *_args: ("unconfigured", None))
+    monkeypatch.setattr(frontends, "frontend_capability", lambda _cfg: (True, None))
+    monkeypatch.setattr(preflight, "platform_missing_caps", lambda **_kwargs: {})
+
+    out = core.run_preflight({"boards": [], "serialwrap_exe": "missing", "win_serialwrap_exe": ""})
+    assert out["ok"] is False
+    assert any("#154 gate: version probe failed" in item for item in out["problems"])
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_run_preflight_applies_cross_os_holder_guard(monkeypatch, tmp_path):
+    core.ensure_realhw_importable()
+    from realhw import drivers, frontends, preflight
+
+    class NoVersionSwCli:
+        def run(self, *_args, **_kwargs):
+            raise AssertionError("held guard must refuse before version probe")
+
+    monkeypatch.setattr(drivers, "SwCli", lambda exe=None: NoVersionSwCli())
+    monkeypatch.setattr(drivers, "WinSwCli", lambda _exe: object())
+    monkeypatch.setattr(preflight, "bench_lock_path", lambda cfg=None: tmp_path / "bench.lock")
+    monkeypatch.setattr(preflight, "acquire_benchlock", lambda _path: 7)
+    monkeypatch.setattr(preflight, "collect", lambda *args, **kwargs: {})
+    monkeypatch.setattr(preflight, "evaluate", lambda checks: (
+        checks["cross_os_guard"] != "held",
+        [] if checks["cross_os_guard"] != "held" else ["cross OS held"],
+    ))
+    monkeypatch.setattr(preflight, "cross_os_holder_check", lambda cfg, boards: (
+        "held", "COM9 持有相同 bench board"
+    ))
+    monkeypatch.setattr(frontends, "frontend_capability", lambda _cfg: (True, None))
+    monkeypatch.setattr(preflight, "platform_missing_caps", lambda **_kwargs: {})
+
+    out = core.run_preflight({
+        "boards": [{"com": "COM0", "serial": "S0"}],
+        "cross_os_probe_argv": ["probe"],
+        "serialwrap_exe": "missing",
+        "win_serialwrap_exe": "",
+    })
+    assert out["ok"] is False
+    assert out["cross_os_guard"] == "held"
+    assert out["cross_os_detail"] == "COM9 持有相同 bench board"

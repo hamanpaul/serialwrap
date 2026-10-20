@@ -1,0 +1,2184 @@
+{
+  "schema_version": 1,
+  "cases_revision": "2026-10-15.1",
+  "sets": {
+    "stage0": [
+      "brcm-01-login-flow",
+      "co-01-line-buffering",
+      "cowork-01-agent-bad-cmd",
+      "ev-01-spawn-handler",
+      "f1-cmdid-survives-timeout",
+      "f1-limits-queryable",
+      "f1-near-limit-no-logout",
+      "f1-newline-rejected",
+      "f1-too-long-rejected",
+      "f11-last-rx-age-sane",
+      "f12-version-reported-consistent",
+      "f12-wal-path-live",
+      "f2-history-bounded-rss",
+      "f2-queue-full-backpressure",
+      "f2-recovery-flushes-queue",
+      "f2-rx-window-crossing-prompt",
+      "f3-cmd-fail-observable",
+      "f3-device-error-names-selector",
+      "f3-fail-error-code",
+      "f3-log-tail-latest",
+      "f4-activity-classification",
+      "f4-background-result-tail-consistent",
+      "f4-interactive-line-cmd-defined",
+      "f5-console-peer-gone-recycled",
+      "f5-deferred-bytes-flushed",
+      "f5-raw-ownership-survives-agent-rounds",
+      "f5-second-console-linebuffer",
+      "f6-ping-during-long-op",
+      "f6-two-boards-no-starvation",
+      "f7-binary-roundtrip-md5",
+      "f7-larger-file-not-truncated",
+      "f8-second-daemon-detected",
+      "f8-tty-holders-reported",
+      "ha-01-human-then-agent",
+      "ha-05-concurrent-submit",
+      "hk-01-special-keys-raw",
+      "hk-02-agent-preempt-human",
+      "hk-03-deferred-input-flush",
+      "hk-04-minicom-exit-cleanup",
+      "l15-context-switch-deferred-input",
+      "l15-delayed-reply",
+      "l15-dut-reboot-port-alive",
+      "l15-dut-silent",
+      "l15-exclusive-open",
+      "l15-half-prompt",
+      "l15-multi-source-contention-cli",
+      "l15-multi-source-contention-console",
+      "l15-reboot-min-guard",
+      "l15-reject-zero-tx",
+      "l15-release-inflight",
+      "l15-slow-reader-backpressure",
+      "l15-stale-event-delay",
+      "l15-transport-disconnect",
+      "l15-wal-interference",
+      "lr-mixed",
+      "p0-blog-clean",
+      "p0-clear-reattach",
+      "p0-cmd-async",
+      "p0-console-raw",
+      "p0-doctor",
+      "p0-multiopen",
+      "p0-selftest",
+      "p0-wal-live",
+      "p1-cmd-file",
+      "p1-cmd-modes",
+      "p1-cmd-serial",
+      "p1-con-busy",
+      "p1-con-defer",
+      "p1-con-fanout",
+      "p1-con-liveness",
+      "p1-con-orphan",
+      "p1-con-second",
+      "p1-con-softpreempt",
+      "p1-ho-cycle",
+      "p1-ho-persist",
+      "p1-hp-cycle",
+      "p1-hp-reorder",
+      "p1-rst-bootwindow",
+      "p1-rst-daemon",
+      "p1-rst-reboot",
+      "p1-rst-recover",
+      "p1-wal-fullrun",
+      "p1-wal-reset",
+      "rc-01-interactive-mode-switch",
+      "sm-01-attach-to-ready",
+      "sm-04-device-unplug",
+      "win-com-cancel-close",
+      "win-com-open-exclusive",
+      "win-com-txrx-bridge",
+      "win-remote-native-l1",
+      "win-wal-av-reader-handle",
+      "win-wal-av-rotate",
+      "win-wal-av-unlink",
+      "win-wal-f12-progress"
+    ],
+    "cli_1A": [
+      "brcm-01-login-flow",
+      "ev-01-spawn-handler",
+      "f1-cmdid-survives-timeout",
+      "f1-near-limit-no-logout",
+      "f1-newline-rejected",
+      "f1-too-long-rejected",
+      "f10-creds-fixed-then-ready",
+      "f10-release-aborts-inflight-command",
+      "f10-release-drain-receipt",
+      "f10-unresolved-creds-terminal",
+      "f11-flood-probe-classified",
+      "f11-last-rx-age-sane",
+      "f2-queue-full-backpressure",
+      "f2-recovery-flushes-queue",
+      "f2-rx-window-crossing-prompt",
+      "f3-cmd-fail-observable",
+      "f3-device-error-names-selector",
+      "f3-fail-error-code",
+      "f3-log-tail-latest",
+      "f4-activity-classification",
+      "f4-background-result-tail-consistent",
+      "f4-interactive-line-cmd-defined",
+      "f6-two-boards-no-starvation",
+      "f7-binary-roundtrip-md5",
+      "f7-larger-file-not-truncated",
+      "f9-attach-during-boot-reprobes",
+      "f9-brcm-spaced-prompt-reboot-login",
+      "f9-quiet-window-agent-passthrough",
+      "f9-reboot-autoboot-unmolested",
+      "ha-05-concurrent-submit",
+      "l15-delayed-reply",
+      "l15-dut-silent",
+      "l15-exclusive-open",
+      "l15-half-prompt",
+      "l15-multi-source-contention-cli",
+      "l15-reboot-min-guard",
+      "l15-reject-zero-tx",
+      "l15-release-inflight",
+      "l15-slow-reader-backpressure",
+      "l15-stale-event-delay",
+      "l15-transport-disconnect",
+      "l15-wal-interference",
+      "p0-clear-reattach",
+      "p0-cmd-async",
+      "p0-selftest",
+      "p0-wal-live",
+      "p1-cmd-file",
+      "p1-cmd-modes",
+      "p1-cmd-serial",
+      "p1-ho-cycle",
+      "p1-hp-cycle",
+      "p1-rst-bootwindow",
+      "p1-rst-recover",
+      "sm-01-attach-to-ready",
+      "sm-04-device-unplug",
+      "win-com-cancel-close",
+      "win-com-open-exclusive",
+      "win-com-txrx-bridge",
+      "win-wal-av-reader-handle",
+      "win-wal-av-rotate",
+      "win-wal-av-unlink"
+    ],
+    "cli_1B": [
+      "brcm-01-login-flow",
+      "co-01-line-buffering",
+      "cowork-01-agent-bad-cmd",
+      "ev-01-spawn-handler",
+      "f1-cmdid-survives-timeout",
+      "f1-limits-queryable",
+      "f1-near-limit-no-logout",
+      "f1-newline-rejected",
+      "f1-too-long-rejected",
+      "f10-creds-fixed-then-ready",
+      "f10-release-aborts-inflight-command",
+      "f10-release-drain-receipt",
+      "f10-unresolved-creds-terminal",
+      "f11-flood-probe-classified",
+      "f11-last-rx-age-sane",
+      "f12-version-reported-consistent",
+      "f12-wal-path-live",
+      "f2-history-bounded-rss",
+      "f2-queue-full-backpressure",
+      "f2-recovery-flushes-queue",
+      "f2-rx-window-crossing-prompt",
+      "f3-cmd-fail-observable",
+      "f3-device-error-names-selector",
+      "f3-fail-error-code",
+      "f3-log-tail-latest",
+      "f4-activity-classification",
+      "f4-background-result-tail-consistent",
+      "f4-interactive-line-cmd-defined",
+      "f5-console-peer-gone-recycled",
+      "f5-deferred-bytes-flushed",
+      "f5-deferred-dropped-after-reboot",
+      "f5-raw-ownership-survives-agent-rounds",
+      "f5-second-console-linebuffer",
+      "f6-ping-during-long-op",
+      "f6-two-boards-no-starvation",
+      "f7-binary-roundtrip-md5",
+      "f7-larger-file-not-truncated",
+      "f8-second-daemon-detected",
+      "f8-tty-holders-reported",
+      "f9-attach-during-boot-reprobes",
+      "f9-brcm-spaced-prompt-reboot-login",
+      "f9-quiet-window-agent-passthrough",
+      "f9-reboot-autoboot-unmolested",
+      "f9-spontaneous-reboot-agent-gated",
+      "f9-uboot-readonly-and-console-kept",
+      "ha-01-human-then-agent",
+      "ha-05-concurrent-submit",
+      "hk-01-special-keys-raw",
+      "hk-02-agent-preempt-human",
+      "hk-03-deferred-input-flush",
+      "hk-04-minicom-exit-cleanup",
+      "l15-context-switch-deferred-input",
+      "l15-delayed-reply",
+      "l15-dut-reboot-port-alive",
+      "l15-dut-silent",
+      "l15-exclusive-open",
+      "l15-half-prompt",
+      "l15-multi-source-contention-cli",
+      "l15-multi-source-contention-console",
+      "l15-reboot-min-guard",
+      "l15-reject-zero-tx",
+      "l15-release-inflight",
+      "l15-slow-reader-backpressure",
+      "l15-stale-event-delay",
+      "l15-transport-disconnect",
+      "l15-wal-interference",
+      "lr-mixed",
+      "p0-blog-clean",
+      "p0-clear-reattach",
+      "p0-cmd-async",
+      "p0-console-raw",
+      "p0-doctor",
+      "p0-multiopen",
+      "p0-selftest",
+      "p0-wal-live",
+      "p1-cmd-file",
+      "p1-cmd-modes",
+      "p1-cmd-serial",
+      "p1-con-busy",
+      "p1-con-defer",
+      "p1-con-fanout",
+      "p1-con-liveness",
+      "p1-con-orphan",
+      "p1-con-second",
+      "p1-con-softpreempt",
+      "p1-ho-cycle",
+      "p1-ho-persist",
+      "p1-hp-cycle",
+      "p1-hp-reorder",
+      "p1-rst-bootwindow",
+      "p1-rst-daemon",
+      "p1-rst-reboot",
+      "p1-rst-recover",
+      "p1-wal-fullrun",
+      "p1-wal-reset",
+      "p2-1-mcu-flash-manual",
+      "rc-01-interactive-mode-switch",
+      "rm-live-cycle",
+      "rm-live-e2e",
+      "rm-live-orphan",
+      "rm-topo-agent-pull",
+      "rm-topo-direct",
+      "rm-topo-dual-nat",
+      "rm-topo-gwports",
+      "rm-topo-nat-host",
+      "sm-01-attach-to-ready",
+      "sm-04-device-unplug",
+      "win-com-cancel-close",
+      "win-com-open-exclusive",
+      "win-com-txrx-bridge",
+      "win-remote-native-l1",
+      "win-remote-openssh-3topo",
+      "win-task-72h",
+      "win-task-logon-trigger",
+      "win-task-restart-on-failure",
+      "win-task-single-instance",
+      "win-wal-av-reader-handle",
+      "win-wal-av-rotate",
+      "win-wal-av-unlink",
+      "win-wal-f12-progress"
+    ],
+    "slice_2.1": [
+      "f1-cmdid-survives-timeout",
+      "f1-limits-queryable",
+      "f1-near-limit-no-logout",
+      "f1-newline-rejected",
+      "f1-too-long-rejected",
+      "f12-version-reported-consistent",
+      "f12-wal-path-live",
+      "f2-history-bounded-rss",
+      "f2-queue-full-backpressure",
+      "f2-recovery-flushes-queue",
+      "f2-rx-window-crossing-prompt",
+      "f3-cmd-fail-observable",
+      "f3-device-error-names-selector",
+      "f3-fail-error-code",
+      "f3-log-tail-latest",
+      "f4-activity-classification",
+      "f4-background-result-tail-consistent",
+      "ha-05-concurrent-submit",
+      "l15-delayed-reply",
+      "l15-exclusive-open",
+      "l15-half-prompt",
+      "l15-multi-source-contention-cli",
+      "l15-reboot-min-guard",
+      "l15-reject-zero-tx",
+      "l15-release-inflight",
+      "l15-slow-reader-backpressure",
+      "l15-stale-event-delay",
+      "l15-transport-disconnect",
+      "l15-wal-interference",
+      "p0-clear-reattach",
+      "p0-cmd-async",
+      "p0-doctor",
+      "p0-multiopen",
+      "p0-selftest",
+      "p0-wal-live",
+      "p1-cmd-serial",
+      "p1-hp-cycle",
+      "p1-hp-reorder",
+      "p1-rst-daemon",
+      "p1-rst-recover",
+      "sm-01-attach-to-ready",
+      "sm-04-device-unplug",
+      "win-com-cancel-close",
+      "win-com-open-exclusive",
+      "win-com-txrx-bridge",
+      "win-wal-av-reader-handle",
+      "win-wal-av-rotate",
+      "win-wal-av-unlink",
+      "win-wal-f12-progress"
+    ],
+    "slice_2.2": [
+      "co-01-line-buffering",
+      "cowork-01-agent-bad-cmd",
+      "f1-cmdid-survives-timeout",
+      "f1-limits-queryable",
+      "f1-near-limit-no-logout",
+      "f1-newline-rejected",
+      "f1-too-long-rejected",
+      "f12-version-reported-consistent",
+      "f12-wal-path-live",
+      "f2-history-bounded-rss",
+      "f2-queue-full-backpressure",
+      "f2-recovery-flushes-queue",
+      "f2-rx-window-crossing-prompt",
+      "f3-cmd-fail-observable",
+      "f3-device-error-names-selector",
+      "f3-fail-error-code",
+      "f3-log-tail-latest",
+      "f4-activity-classification",
+      "f4-background-result-tail-consistent",
+      "f4-interactive-line-cmd-defined",
+      "f5-console-peer-gone-recycled",
+      "f5-deferred-bytes-flushed",
+      "f5-deferred-dropped-after-reboot",
+      "f5-raw-ownership-survives-agent-rounds",
+      "f5-second-console-linebuffer",
+      "f6-ping-during-long-op",
+      "f6-two-boards-no-starvation",
+      "f8-second-daemon-detected",
+      "f8-tty-holders-reported",
+      "ha-01-human-then-agent",
+      "ha-05-concurrent-submit",
+      "hk-01-special-keys-raw",
+      "hk-02-agent-preempt-human",
+      "hk-03-deferred-input-flush",
+      "hk-04-minicom-exit-cleanup",
+      "l15-context-switch-deferred-input",
+      "l15-delayed-reply",
+      "l15-exclusive-open",
+      "l15-half-prompt",
+      "l15-multi-source-contention-cli",
+      "l15-multi-source-contention-console",
+      "l15-reboot-min-guard",
+      "l15-reject-zero-tx",
+      "l15-release-inflight",
+      "l15-slow-reader-backpressure",
+      "l15-stale-event-delay",
+      "l15-transport-disconnect",
+      "l15-wal-interference",
+      "p0-blog-clean",
+      "p0-clear-reattach",
+      "p0-cmd-async",
+      "p0-console-raw",
+      "p0-doctor",
+      "p0-multiopen",
+      "p0-selftest",
+      "p0-wal-live",
+      "p1-cmd-modes",
+      "p1-cmd-serial",
+      "p1-con-busy",
+      "p1-con-defer",
+      "p1-con-fanout",
+      "p1-con-liveness",
+      "p1-con-orphan",
+      "p1-con-second",
+      "p1-con-softpreempt",
+      "p1-hp-cycle",
+      "p1-hp-reorder",
+      "p1-rst-daemon",
+      "p1-rst-recover",
+      "p1-wal-fullrun",
+      "p1-wal-reset",
+      "rc-01-interactive-mode-switch",
+      "sm-01-attach-to-ready",
+      "sm-04-device-unplug",
+      "win-com-cancel-close",
+      "win-com-open-exclusive",
+      "win-com-txrx-bridge",
+      "win-wal-av-reader-handle",
+      "win-wal-av-rotate",
+      "win-wal-av-unlink",
+      "win-wal-f12-progress"
+    ],
+    "slice_2.3": [
+      "brcm-01-login-flow",
+      "co-01-line-buffering",
+      "cowork-01-agent-bad-cmd",
+      "ev-01-spawn-handler",
+      "f1-cmdid-survives-timeout",
+      "f1-limits-queryable",
+      "f1-near-limit-no-logout",
+      "f1-newline-rejected",
+      "f1-too-long-rejected",
+      "f10-creds-fixed-then-ready",
+      "f10-release-aborts-inflight-command",
+      "f10-release-drain-receipt",
+      "f10-unresolved-creds-terminal",
+      "f11-flood-probe-classified",
+      "f11-last-rx-age-sane",
+      "f12-version-reported-consistent",
+      "f12-wal-path-live",
+      "f2-history-bounded-rss",
+      "f2-queue-full-backpressure",
+      "f2-recovery-flushes-queue",
+      "f2-rx-window-crossing-prompt",
+      "f3-cmd-fail-observable",
+      "f3-device-error-names-selector",
+      "f3-fail-error-code",
+      "f3-log-tail-latest",
+      "f4-activity-classification",
+      "f4-background-result-tail-consistent",
+      "f4-interactive-line-cmd-defined",
+      "f5-console-peer-gone-recycled",
+      "f5-deferred-bytes-flushed",
+      "f5-deferred-dropped-after-reboot",
+      "f5-raw-ownership-survives-agent-rounds",
+      "f5-second-console-linebuffer",
+      "f6-ping-during-long-op",
+      "f6-two-boards-no-starvation",
+      "f8-second-daemon-detected",
+      "f8-tty-holders-reported",
+      "ha-01-human-then-agent",
+      "ha-05-concurrent-submit",
+      "hk-01-special-keys-raw",
+      "hk-02-agent-preempt-human",
+      "hk-03-deferred-input-flush",
+      "hk-04-minicom-exit-cleanup",
+      "l15-context-switch-deferred-input",
+      "l15-delayed-reply",
+      "l15-dut-reboot-port-alive",
+      "l15-dut-silent",
+      "l15-exclusive-open",
+      "l15-half-prompt",
+      "l15-multi-source-contention-cli",
+      "l15-multi-source-contention-console",
+      "l15-reboot-min-guard",
+      "l15-reject-zero-tx",
+      "l15-release-inflight",
+      "l15-slow-reader-backpressure",
+      "l15-stale-event-delay",
+      "l15-transport-disconnect",
+      "l15-wal-interference",
+      "p0-blog-clean",
+      "p0-clear-reattach",
+      "p0-cmd-async",
+      "p0-console-raw",
+      "p0-doctor",
+      "p0-multiopen",
+      "p0-selftest",
+      "p0-wal-live",
+      "p1-cmd-modes",
+      "p1-cmd-serial",
+      "p1-con-busy",
+      "p1-con-defer",
+      "p1-con-fanout",
+      "p1-con-liveness",
+      "p1-con-orphan",
+      "p1-con-second",
+      "p1-con-softpreempt",
+      "p1-hp-cycle",
+      "p1-hp-reorder",
+      "p1-rst-bootwindow",
+      "p1-rst-daemon",
+      "p1-rst-reboot",
+      "p1-rst-recover",
+      "p1-wal-fullrun",
+      "p1-wal-reset",
+      "rc-01-interactive-mode-switch",
+      "rm-live-cycle",
+      "rm-live-e2e",
+      "rm-live-orphan",
+      "rm-topo-agent-pull",
+      "rm-topo-direct",
+      "rm-topo-dual-nat",
+      "rm-topo-gwports",
+      "rm-topo-nat-host",
+      "sm-01-attach-to-ready",
+      "sm-04-device-unplug",
+      "win-com-cancel-close",
+      "win-com-open-exclusive",
+      "win-com-txrx-bridge",
+      "win-wal-av-reader-handle",
+      "win-wal-av-rotate",
+      "win-wal-av-unlink",
+      "win-wal-f12-progress"
+    ],
+    "slice_2.4": [
+      "brcm-01-login-flow",
+      "co-01-line-buffering",
+      "cowork-01-agent-bad-cmd",
+      "ev-01-spawn-handler",
+      "f1-cmdid-survives-timeout",
+      "f1-limits-queryable",
+      "f1-near-limit-no-logout",
+      "f1-newline-rejected",
+      "f1-too-long-rejected",
+      "f10-creds-fixed-then-ready",
+      "f10-release-aborts-inflight-command",
+      "f10-release-drain-receipt",
+      "f10-unresolved-creds-terminal",
+      "f11-flood-probe-classified",
+      "f11-last-rx-age-sane",
+      "f12-version-reported-consistent",
+      "f12-wal-path-live",
+      "f2-history-bounded-rss",
+      "f2-queue-full-backpressure",
+      "f2-recovery-flushes-queue",
+      "f2-rx-window-crossing-prompt",
+      "f3-cmd-fail-observable",
+      "f3-device-error-names-selector",
+      "f3-fail-error-code",
+      "f3-log-tail-latest",
+      "f4-activity-classification",
+      "f4-background-result-tail-consistent",
+      "f4-interactive-line-cmd-defined",
+      "f5-console-peer-gone-recycled",
+      "f5-deferred-bytes-flushed",
+      "f5-deferred-dropped-after-reboot",
+      "f5-raw-ownership-survives-agent-rounds",
+      "f5-second-console-linebuffer",
+      "f6-ping-during-long-op",
+      "f6-two-boards-no-starvation",
+      "f8-second-daemon-detected",
+      "f8-tty-holders-reported",
+      "ha-01-human-then-agent",
+      "ha-05-concurrent-submit",
+      "hk-01-special-keys-raw",
+      "hk-02-agent-preempt-human",
+      "hk-03-deferred-input-flush",
+      "hk-04-minicom-exit-cleanup",
+      "l15-context-switch-deferred-input",
+      "l15-delayed-reply",
+      "l15-dut-reboot-port-alive",
+      "l15-dut-silent",
+      "l15-exclusive-open",
+      "l15-half-prompt",
+      "l15-multi-source-contention-cli",
+      "l15-multi-source-contention-console",
+      "l15-reboot-min-guard",
+      "l15-reject-zero-tx",
+      "l15-release-inflight",
+      "l15-slow-reader-backpressure",
+      "l15-stale-event-delay",
+      "l15-transport-disconnect",
+      "l15-wal-interference",
+      "lr-mixed",
+      "p0-blog-clean",
+      "p0-clear-reattach",
+      "p0-cmd-async",
+      "p0-console-raw",
+      "p0-doctor",
+      "p0-multiopen",
+      "p0-selftest",
+      "p0-wal-live",
+      "p1-cmd-file",
+      "p1-cmd-modes",
+      "p1-cmd-serial",
+      "p1-con-busy",
+      "p1-con-defer",
+      "p1-con-fanout",
+      "p1-con-liveness",
+      "p1-con-orphan",
+      "p1-con-second",
+      "p1-con-softpreempt",
+      "p1-ho-cycle",
+      "p1-ho-persist",
+      "p1-hp-cycle",
+      "p1-hp-reorder",
+      "p1-rst-bootwindow",
+      "p1-rst-daemon",
+      "p1-rst-reboot",
+      "p1-rst-recover",
+      "p1-wal-fullrun",
+      "p1-wal-reset",
+      "p2-1-mcu-flash-manual",
+      "rc-01-interactive-mode-switch",
+      "rm-live-cycle",
+      "rm-live-e2e",
+      "rm-live-orphan",
+      "rm-topo-agent-pull",
+      "rm-topo-direct",
+      "rm-topo-dual-nat",
+      "rm-topo-gwports",
+      "rm-topo-nat-host",
+      "sm-01-attach-to-ready",
+      "sm-04-device-unplug",
+      "win-com-cancel-close",
+      "win-com-open-exclusive",
+      "win-com-txrx-bridge",
+      "win-task-72h",
+      "win-task-logon-trigger",
+      "win-task-restart-on-failure",
+      "win-task-single-instance",
+      "win-wal-av-reader-handle",
+      "win-wal-av-rotate",
+      "win-wal-av-unlink",
+      "win-wal-f12-progress"
+    ]
+  },
+  "case_attrs": {
+    "brcm-01-login-flow": {
+      "suite": "func-test",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "co-01-line-buffering": {
+      "suite": "func-test",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "cowork-01-agent-bad-cmd": {
+      "suite": "func-test",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "ev-01-spawn-handler": {
+      "suite": "func-test",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "f1-cmdid-survives-timeout": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "f1-limits-queryable": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "f1-near-limit-no-logout": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "f1-newline-rejected": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "f1-too-long-rejected": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "f10-creds-fixed-then-ready": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "f10-release-aborts-inflight-command": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "f10-release-drain-receipt": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "f10-unresolved-creds-terminal": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "f11-flood-probe-classified": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "f11-last-rx-age-sane": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "f12-version-reported-consistent": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "f12-wal-path-live": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "f2-history-bounded-rss": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "f2-queue-full-backpressure": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "f2-recovery-flushes-queue": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "f2-rx-window-crossing-prompt": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "f3-cmd-fail-observable": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "f3-device-error-names-selector": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "f3-fail-error-code": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "f3-log-tail-latest": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "f4-activity-classification": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "f4-background-result-tail-consistent": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "f4-interactive-line-cmd-defined": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "f5-console-peer-gone-recycled": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "f5-deferred-bytes-flushed": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "f5-deferred-dropped-after-reboot": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "f5-raw-ownership-survives-agent-rounds": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "f5-second-console-linebuffer": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "f6-ping-during-long-op": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "f6-two-boards-no-starvation": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "f7-binary-roundtrip-md5": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "conditional",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "f7-larger-file-not-truncated": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "conditional",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "f8-second-daemon-detected": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "f8-tty-holders-reported": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "f9-attach-during-boot-reprobes": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "conditional",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "f9-brcm-spaced-prompt-reboot-login": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "conditional",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "f9-quiet-window-agent-passthrough": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "conditional",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "f9-reboot-autoboot-unmolested": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "conditional",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "f9-spontaneous-reboot-agent-gated": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "conditional",
+      "daemon_slice": "2.3",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "f9-uboot-readonly-and-console-kept": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "conditional",
+      "daemon_slice": "2.3",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "ha-01-human-then-agent": {
+      "suite": "func-test",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "ha-05-concurrent-submit": {
+      "suite": "func-test",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "hk-01-special-keys-raw": {
+      "suite": "func-test",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "hk-02-agent-preempt-human": {
+      "suite": "func-test",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "hk-03-deferred-input-flush": {
+      "suite": "func-test",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "hk-04-minicom-exit-cleanup": {
+      "suite": "func-test",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "l15-context-switch-deferred-input": {
+      "suite": "l15-scenario",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "l15-delayed-reply": {
+      "suite": "l15-scenario",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "l15-dut-reboot-port-alive": {
+      "suite": "l15-scenario",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "l15-dut-silent": {
+      "suite": "l15-scenario",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "l15-exclusive-open": {
+      "suite": "l15-scenario",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "l15-half-prompt": {
+      "suite": "l15-scenario",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "l15-multi-source-contention-cli": {
+      "suite": "l15-scenario",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "l15-multi-source-contention-console": {
+      "suite": "l15-scenario",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "l15-reboot-min-guard": {
+      "suite": "l15-scenario",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "l15-reject-zero-tx": {
+      "suite": "l15-scenario",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "l15-release-inflight": {
+      "suite": "l15-scenario",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "l15-slow-reader-backpressure": {
+      "suite": "l15-scenario",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "l15-stale-event-delay": {
+      "suite": "l15-scenario",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "l15-transport-disconnect": {
+      "suite": "l15-scenario",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "l15-wal-interference": {
+      "suite": "l15-scenario",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "lr-mixed": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "p0-blog-clean": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "p0-clear-reattach": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "p0-cmd-async": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "p0-console-raw": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "p0-doctor": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "p0-multiopen": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "p0-selftest": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "p0-wal-live": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "p1-cmd-file": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "p1-cmd-modes": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "p1-cmd-serial": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "p1-con-busy": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "p1-con-defer": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "p1-con-fanout": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "p1-con-liveness": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "p1-con-orphan": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "p1-con-second": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "p1-con-softpreempt": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "p1-ho-cycle": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "p1-ho-persist": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "p1-hp-cycle": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "p1-hp-reorder": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "p1-rst-bootwindow": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "p1-rst-daemon": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "p1-rst-reboot": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "p1-rst-recover": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "p1-wal-fullrun": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "p1-wal-reset": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "p2-1-mcu-flash-manual": {
+      "suite": "manual-procedure",
+      "layer": "manual",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "rc-01-interactive-mode-switch": {
+      "suite": "func-test",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "rm-live-cycle": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "rm-live-e2e": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "rm-live-orphan": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "rm-topo-agent-pull": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "rm-topo-direct": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "rm-topo-dual-nat": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "rm-topo-gwports": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "rm-topo-nat-host": {
+      "suite": "realhw",
+      "layer": "L3",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "sm-01-attach-to-ready": {
+      "suite": "func-test",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "sm-04-device-unplug": {
+      "suite": "func-test",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "win-com-cancel-close": {
+      "suite": "windows-native",
+      "layer": "L1.5",
+      "platforms": [
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "win-com-open-exclusive": {
+      "suite": "windows-native",
+      "layer": "L1.5",
+      "platforms": [
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "win-com-txrx-bridge": {
+      "suite": "windows-native",
+      "layer": "L1.5",
+      "platforms": [
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "win-remote-native-l1": {
+      "suite": "windows-native",
+      "layer": "L1",
+      "platforms": [
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1B",
+      "stage0_required": true
+    },
+    "win-remote-openssh-3topo": {
+      "suite": "windows-native",
+      "layer": "L3",
+      "platforms": [
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "win-task-72h": {
+      "suite": "windows-native",
+      "layer": "L3",
+      "platforms": [
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "win-task-logon-trigger": {
+      "suite": "windows-native",
+      "layer": "L3",
+      "platforms": [
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "win-task-restart-on-failure": {
+      "suite": "windows-native",
+      "layer": "L3",
+      "platforms": [
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "win-task-single-instance": {
+      "suite": "windows-native",
+      "layer": "L3",
+      "platforms": [
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "win-wal-av-reader-handle": {
+      "suite": "windows-native",
+      "layer": "L1.5",
+      "platforms": [
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "win-wal-av-rotate": {
+      "suite": "windows-native",
+      "layer": "L1.5",
+      "platforms": [
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "win-wal-av-unlink": {
+      "suite": "windows-native",
+      "layer": "L1.5",
+      "platforms": [
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1A",
+      "stage0_required": true
+    },
+    "win-wal-f12-progress": {
+      "suite": "windows-native",
+      "layer": "L2",
+      "platforms": [
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.1",
+      "cli_stage": "1B",
+      "stage0_required": true
+    }
+  }
+}

@@ -17,9 +17,9 @@ testpilot run serialwrap_regression --case f3-fail-error-code  # 單一 case
 
 - **何時跑**：改動 sw_core／daemon 行為後（非破壞集，分鐘級）；發版前（含 destructive 全跑）。
 - **報告**：`~/b-log/regression-reports/tp-<ts>/report.md`／`report.json`，每條列 family、對應 issues、分類與 evidence 連結。
-- **bench 互斥**：與 reliability／wifi_llapi 共用 benchlock（`~/.local/state/serialwrap/bench.lock`），他者持鎖即整場拒跑。
-- **Windows 限定執行**：Windows 的 TestPilot venv 可 `pip install --no-deps -e regression/`；於 `regression/serialwrap_regression/testbed.yaml` 指定已安裝、與 daemon 同版的 `serialwrap_exe`、`platform: bcm` STA 及 `allow_destructive: true`，再跑 `testpilot run serialwrap_regression --case f9-brcm-spaced-prompt-reboot-login`。Windows preflight 檢查 daemon／doctor／WAL／板卡 READY／版本及 benchlock；其餘依賴 tmux/minicom/PTY 的 case 在 Windows 記 SKIP，不當作可執行。此 case 會重開 STA，測後仍須確認 READY。#224 的 WAL range 模式 `truncated=true` 代表**還有下一頁**，不是紀錄遺失。
-- **背景啟動注意**：preflight 的外部 testpilot 偵測用 `pgrep -af 'testpilot ru[n]'`——若你的包裝行程（如 `bash -c "... testpilot run ..."`）cmdline 含該字面字串會**自我匹配拒跑**；背景跑請用不含該字串的 launcher script（首輪實測實證）。
+- **bench 互斥**：regression、reliability 與 wifi_llapi 共用 `bench_lock_path`。Linux 未設定時使用 `~/.local/state/serialwrap/bench.lock`；Windows 必須設定可由所有測試套件共同開啟的 lock 路徑。若測試跨越 WSL 與 Windows，兩邊檔案鎖互不相通；請在 regression 根組態或 reliability 的 `serialwrap_reliability` 區段設定 `cross_os_probe_argv` 執行另一側唯讀 `serialwrap session list`。probe 回報裝置被持有時 preflight 拒跑；無法確認時記錄 `unknown`，由擁有者排程避免重疊（OD-10）。
+- **Windows 能力式執行**：Windows preflight 檢查 pinned CLI、daemon／doctor／WAL／板卡 READY、版本及 bench lock。缺少 `tmux`、`usbipd`、systemd、POSIX throwaway daemon 或 POSIX PTY 孤兒回收能力，會讓相依 case 以 `cap_missing:<capability>` 記為 SKIP；不相依的 case 照常執行。`human_frontend: auto` 在 Windows 選 loopback Telnet frontend，因此一般 F5 console、U-Boot、realhw console 與長跑 human 輸入可使用 Telnet；POSIX PTY 孤兒語意案例會能力式 SKIP。#224 的 WAL range 模式 `truncated=true` 代表**還有下一頁**，不是紀錄遺失。
+- **背景啟動注意**：preflight 以平台行程快照掃描 pytest、serialwrapd 與 testpilot；Windows 使用 ToolHelp 與 CIM／WMIC 命令列資料。相關行程的命令列無法取得時會回報證據不足並拒跑；`testpilot.exe run` 也會辨識為進行中的測試。
 
 ## testbed 組態
 
@@ -28,6 +28,9 @@ testpilot run serialwrap_regression --case f3-fail-error-code  # 單一 case
 | 鍵 | 預設 | 說明 |
 |---|---|---|
 | `serialwrap_exe` | `~/.local/bin/serialwrap` | **pinned 部署版 CLI**。case 一律走此絕對路徑，不吃 venv PATH（#154 防線） |
+| `bench_lock_path` | Linux：`~/.local/state/serialwrap/bench.lock`；Windows：必填 | regression、reliability 與 wifi_llapi 共用的跨工具 bench lock |
+| `human_frontend` | `auto` | `auto` 在 POSIX 選 tmux/minicom，在 Windows 選 loopback Telnet；亦可指定 `tmux` 或 `telnet` |
+| `cross_os_probe_argv` | `[]` | regression 根組態與 reliability 的 `serialwrap_reliability` 區段皆可設定；輸出須有 `sessions` 陣列，依實體 serial／`device_by_id` 比對，不依賴 COM 編號；持有時拒跑，無法確認時記錄守衛狀態（OD-10） |
 | `allow_destructive` | `false` | `true` 才實跑 F9（reboot）／F10（throwaway 交接）；否則記 SKIP（`destructive_gated`） |
 | `boards` | COM0=prpl、COM1=bcm | bench 板卡（com／alias／serial／platform） |
 | `timeouts.ready_wait_s` | 180 | 收尾等 READY 上限 |
@@ -38,10 +41,11 @@ testpilot run serialwrap_regression --case f3-fail-error-code  # 單一 case
 
 ## preflight（suite-refuse 條件）
 
-doctor 全綠、testbed 板卡 READY、tmux/minicom 存在、無殘留 throwaway daemon、無並行 pytest、state 無污染哨兵、benchlock 取得、無外部 testpilot run，以及——
+doctor 全綠、testbed 板卡 READY、無殘留 throwaway daemon、無並行 pytest、state 無污染哨兵、benchlock 取得、無外部 testpilot run，以及——
 
 - **版本 gate（#154）**：pinned CLI `--version` 與 daemon 版本（優先讀 `daemon status` 的 `version` 欄位；欄位缺席才落回讀 daemon pid 的 venv `importlib.metadata`）不一致 → 整場拒跑。
 - PATH 上解析到的 serialwrap 若與 pinned 不同版（如 venv stale client），記入 preflight notes（不擋——本 plugin 不使用它）。
+- **平台能力**：`platform_missing_caps` 會依目前平台與 pinned tool 路徑，把工具缺項交給 case `requires` 做能力式 SKIP；Windows 不以全域平台條件略過所有 case。選到 `human_frontend: telnet` 時不需要 tmux/minicom。
 
 ## 分診契約（serialwrap＝受測物）
 
@@ -115,7 +119,7 @@ profile 行長預算後，F7 需使用對應版本重新執行；受影響板須
 
 | case | 狀態 | 原因 |
 |---|---|---|
-| `f4-background-result-tail-consistent` | **FAIL（刻意保留的紅燈哨兵）** | #159：background quiet-window 對快速完成命令整段吞輸出且回 `lost: False`——case 正確抓到產品缺陷，**勿改 oracle 遷就**；#159 修復即轉綠 |
+| `f4-background-result-tail-consistent` | **預期 PASS**（#159 已修，常駐回歸防線；若重現紅燈須經擁有者核准後依 §11.4 登記 XFAIL 哨兵，含 issue、失敗特徵、期限） | #159：background quiet-window 對快速完成命令整段吞輸出且回 `lost: False`；case 曾正確抓到此產品缺陷，**勿改 oracle 遷就**。修復後 case 轉綠並常駐。Stage 0 bench 實跑結果屬 BLOCKED-OWNER（TST-D-6） |
 | `f7-binary-roundtrip-md5`／`f7-larger-file-not-truncated` | 逐板嘗試；兩板皆 SKIP `target_tool_missing`（誠實判定） | **#166 根因翻案**：傳輸層無罪（手工 base64 往返 md5 完全一致），**兩塊 bench 板都沒有 `base64`**（PATH 與 busybox applet 皆無；`md5sum`／`openssl` 有）——協定硬依賴 `base64` 才是根因。先前 COM0「工具齊全」是探測 sentinel 誤判（命令本文含 `TOOLS_OK`、回顯即恆真，已改用 `TOOLS_$((6*7))`）。另附帶：prpl console 有 **505 字元單行上限**（超過即靜默截斷、status 仍 done），是 chunk 512 撞 `TRANSFER_ECHO_STALL` 的原因 |
 
 #156（recover CTRL_C 路徑不 flush 佇列）已修——根因＝`SessionManager` 無管道通知

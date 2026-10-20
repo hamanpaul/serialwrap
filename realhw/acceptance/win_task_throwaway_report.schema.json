@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serialwrap.local/schemas/win-task-throwaway.v1.json",
+  "title": "Windows host throwaway 排程監管報告",
+  "type": "object",
+  "additionalProperties": false,
+  "allOf": [
+    {"contains": {"properties": {"check_id": {"const": "task_registration"}}, "required": ["check_id"]}},
+    {"contains": {"properties": {"check_id": {"const": "duration_gt_72h"}}, "required": ["check_id"]}},
+    {"contains": {"properties": {"check_id": {"const": "health_polling"}}, "required": ["check_id"]}},
+    {"contains": {"properties": {"check_id": {"const": "task_history"}}, "required": ["check_id"]}},
+    {"contains": {"properties": {"check_id": {"const": "cleanup"}}, "required": ["check_id"]}}
+  ],
+  "required": [
+    "schema_version",
+    "evidence_layer",
+    "producer",
+    "uart_kind",
+    "run_id",
+    "task_name",
+    "principal_sid",
+    "bundle_revision",
+    "bundle_sha256",
+    "root",
+    "paths",
+    "endpoint",
+    "allowlist",
+    "task_xml",
+    "started_at",
+    "finished_at",
+    "duration_s",
+    "poll_interval_s",
+    "poll_count",
+    "missing_poll_count",
+    "task_history_enabled",
+    "restart_count",
+    "last_task_result",
+    "results"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "evidence_layer": {"const": "host-throwaway"},
+    "producer": {"const": "win-task-throwaway.ps1"},
+    "uart_kind": {"const": "native"},
+    "run_id": {"type": "string", "pattern": "^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$"},
+    "task_name": {"type": "string", "pattern": "^serialwrap-throwaway-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$"},
+    "principal_sid": {"type": "string", "minLength": 1},
+    "bundle_revision": {"type": "string", "minLength": 1},
+    "bundle_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "root": {"type": "string", "minLength": 1},
+    "paths": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state", "run", "config", "profiles", "wal", "log", "data",
+        "events", "events_runtime", "by_id", "by_path"
+      ],
+      "properties": {
+        "state": {"type": "string", "minLength": 1},
+        "run": {"type": "string", "minLength": 1},
+        "config": {"type": "string", "minLength": 1},
+        "profiles": {"type": "string", "minLength": 1},
+        "wal": {"type": "string", "minLength": 1},
+        "log": {"type": "string", "minLength": 1},
+        "data": {"type": "string", "minLength": 1},
+        "events": {"type": "string", "minLength": 1},
+        "events_runtime": {"type": "string", "minLength": 1},
+        "by_id": {"type": "string", "minLength": 1},
+        "by_path": {"type": "string", "minLength": 1}
+      }
+    },
+    "endpoint": {"type": "string", "pattern": "^tcp://127\\.0\\.0\\.1:(?!48700$)[0-9]+$"},
+    "allowlist": {"const": "COM20"},
+    "task_xml": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "started_at": {"type": "string", "format": "date-time"},
+    "finished_at": {"type": "string", "format": "date-time"},
+    "duration_s": {"type": "number", "exclusiveMinimum": 259200},
+    "poll_interval_s": {"const": 300},
+    "poll_count": {"type": "integer", "minimum": 1},
+    "missing_poll_count": {"type": "integer", "minimum": 0},
+    "task_history_enabled": {"type": "boolean"},
+    "restart_count": {"type": ["integer", "null"], "minimum": 0},
+    "last_task_result": {"type": ["integer", "null"]},
+    "results": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["check_id", "verdict"],
+        "properties": {
+          "check_id": {
+            "enum": [
+              "task_registration",
+              "duration_gt_72h",
+              "health_polling",
+              "task_history",
+              "cleanup"
+            ]
+          },
+          "verdict": {"enum": ["PASS", "FAIL", "NOT_RUN"]},
+          "details": {"type": "string"}
+        }
+      }
+    }
+  }
+}

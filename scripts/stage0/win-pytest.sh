@@ -137,54 +137,9 @@ if ! cmd.exe /c py -3.12 -c "import pytest, yaml, serial, jsonschema"; then
     printf '%s\n' 'win-pytest: Windows Python 缺 pytest/PyYAML/pyserial/jsonschema' >&2
     pytest_exit=3
 else
-    ignore_file="$run_dir/ignore-args.bin"
-    if python3 - "$stage" > "$ignore_file" <<'PY'
-import ast
-import sys
-from pathlib import Path
-
-root = Path(sys.argv[1])
-tests = root / "tests"
-ignores: set[str] = set()
-for path in sorted(tests.rglob("test_*.py")):
-    rel = path.relative_to(root).as_posix()
-    try:
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, SyntaxError):
-        print(f"win-pytest: 無法解析 {rel} 的 pytestmark", file=sys.stderr)
-        raise SystemExit(4)
-
-    for statement in tree.body:
-        if isinstance(statement, ast.Assign):
-            is_pytestmark = any(
-                isinstance(target, ast.Name) and target.id == "pytestmark"
-                for target in statement.targets
-            )
-            value = statement.value
-        elif isinstance(statement, ast.AnnAssign):
-            is_pytestmark = (
-                isinstance(statement.target, ast.Name)
-                and statement.target.id == "pytestmark"
-            )
-            value = statement.value
-        else:
-            continue
-        if not is_pytestmark or value is None:
-            continue
-        if any(
-            isinstance(node, ast.Attribute) and node.attr == "posix_only"
-            for node in ast.walk(value)
-        ):
-            ignores.add(rel)
-
-for rel in sorted(ignores):
-    sys.stdout.buffer.write(f"--ignore={rel}\0".encode("utf-8"))
-PY
-    then
-        ignore_args=()
-        while IFS= read -r -d '' arg; do
-            ignore_args+=("$arg")
-        done < "$ignore_file"
+    # P2-T13 審查修正：不再以 AST 產生 --ignore 清單。posix_only 模組由 tests/conftest.py 的
+    # pytest_ignore_collect（與 pytest_make_collect_report，命令列明確指定者）排除；指令參數須與鎖檔 selector.argv 一致。
+    {
 
         stage_win=$(wslpath -w "$stage")
         run_win=$(wslpath -w "$run_dir")
@@ -229,7 +184,8 @@ PY
         done
         append_wslenv PYTHONUTF8
 
-        pytest_args=(-q -rs -p no:cacheprovider "--junitxml=$junit_win" "${ignore_args[@]}" "$@")
+        # 只傳入呼叫者的參數（含 -q）與 junit 路徑；不另注入 -rs／-p no:cacheprovider（會使報告 argv 與鎖檔不符）。
+        pytest_args=("--junitxml=$junit_win" "$@")
         export SW_WIN_PYTEST_ARGS_JSON
         SW_WIN_PYTEST_ARGS_JSON=$(python3 -c \
             'import json, sys; print(json.dumps(sys.argv[1:], separators=(",", ":")))' \
@@ -383,9 +339,7 @@ PS
                 sleep 1
             done
         fi
-    else
-        pytest_exit=$?
-    fi
+    }
 fi
 
 if [[ -f "$stage/junit.xml" ]]; then

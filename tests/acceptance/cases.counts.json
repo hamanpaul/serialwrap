@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "cases_revision": "2026-10-15.1",
+  "total": 120,
+  "by_suite": {
+    "func-test": 13,
+    "l15-scenario": 15,
+    "manual-procedure": 1,
+    "realhw": 37,
+    "regression": 41,
+    "windows-native": 13
+  },
+  "by_layer": {
+    "L1": 1,
+    "L1.5": 34,
+    "L2": 42,
+    "L3": 42,
+    "manual": 1
+  },
+  "by_slice": {
+    "2.1": 49,
+    "2.2": 32,
+    "2.3": 26,
+    "2.4": 11,
+    "None": 2
+  }
+}

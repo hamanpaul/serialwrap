@@ -14,6 +14,8 @@ from serialwrap_regression.preflight import REPO_ROOT, ensure_realhw_importable
 
 _TESTBED_DEFAULTS: dict[str, Any] = {
     "serialwrap_exe": "~/.local/bin/serialwrap",
+    "bench_lock_path": "",
+    "human_frontend": "auto",
     "allow_destructive": False,
     "tmux_prefix": "swreg",
     "timeouts": {"ready_wait_s": 180, "boot_wait_s": 240, "cmd_timeout_s": 12},
@@ -142,19 +144,31 @@ def failure_payload(result_dict: dict[str, Any]) -> dict[str, Any] | None:
 def build_ctx(cfg: dict[str, Any], report_dir: Path) -> Any:
     """建 realhw Ctx（sw 綁 pinned exe；usbipd／win 本 plugin 不用）。"""
     ensure_realhw_importable()
-    from realhw import drivers
+    from realhw import drivers, frontends
     from realhw.harness import Ctx
 
+    sw = drivers.SwCli(exe=str(cfg.get("serialwrap_exe") or "serialwrap"))
+    tmux = drivers.TmuxCtl(str(cfg.get("tmux_prefix") or "swreg"))
     return Ctx(
         cfg=cfg,
         report_dir=report_dir,
         case_dir=report_dir,
-        sw=drivers.SwCli(exe=str(cfg["serialwrap_exe"])),
-        tmux=drivers.TmuxCtl(str(cfg.get("tmux_prefix") or "swreg")),
+        sw=sw,
+        tmux=tmux,
         usbipd=None,
         systemd=drivers.Systemd(),
         win=None,
+        human=frontends.make_frontend_factory(cfg, tmux=tmux, sw=sw),
     )
+
+
+def platform_missing_caps(*, os_name: str | None = None, frontend_ok: bool,
+                          cfg: dict[str, Any] | None = None) -> dict[str, str]:
+    """轉交共用平台能力判定，讓兩個 plugin 使用同一組 SKIP reason code。"""
+    ensure_realhw_importable()
+    from realhw.preflight import platform_missing_caps as missing
+
+    return missing(os_name=os_name, frontend_ok=frontend_ok, cfg=cfg)
 
 
 def run_case_blackbox(case_id: str, ctx: Any) -> Any:

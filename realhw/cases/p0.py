@@ -59,10 +59,10 @@ def p0_cmd_async(ctx):
 @_case("p0-console-raw", "minicom 連線＋raw ownership（Tab 補完）",
        hints=("方向鍵/Tab 失效＝掉回 line-buffer，多半 orphan lease 佔住授予閘（#76/#99）",
               "minicom 顯示 Offline（DCD 未拉）不影響輸入"),
-       requires=("tmux", "two_boards"))
+       requires=("human_frontend", "two_boards"))
 def p0_console_raw(ctx):
-    ses = ctx.tmux.name("p0con")
-    ctx.tmux.new(ses, "serialwrap-minicom COM0")
+    human = ctx.human("p0con", "minicom")
+    human.open("COM0")
     try:
         time.sleep(6)  # 等 console-attach＋minicom 起來
         cl = ctx.sw.run("session", "console-list", "--selector", "COM0")
@@ -71,18 +71,18 @@ def p0_console_raw(ctx):
         if not any(c.get("interactive_owner") for c in consoles):
             return CaseResult("FAIL", reason="第一個 console 未拿到 raw interactive ownership",
                               category="test", reason_code="raw_ownership_not_granted")
-        ctx.tmux.send(ses, "ec", enter=False)
-        ctx.tmux.send_key(ses, "Tab")
+        human.send_text("ec")
+        human.send_key("Tab")
         time.sleep(2)
-        pane = ctx.tmux.capture(ses)
+        pane = human.capture()
         ctx.note("pane.txt", pane)
         if "echo" not in strip_ansi(pane):
             return CaseResult("FAIL", reason="Tab 補完未出現（raw 路徑疑掉回 line-buffer）",
                               category="test", reason_code="raw_fallback_linebuffer")
-        ctx.tmux.send_key(ses, "C-u")  # 清掉半行，還原乾淨 prompt
+        human.send_key("C-u")  # 清掉半行，還原乾淨 prompt
         return CaseResult("PASS")
     finally:
-        ctx.tmux.kill(ses)
+        human.close()
         time.sleep(3)  # 等 router 清理 detach
 
 

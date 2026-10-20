@@ -1,0 +1,100 @@
+schema_version: 1
+revision: "2026-10-15.1"
+authority: "發版長跑門檻唯一來源（spec §15.11.4、§14.2、OD-09）；其他前端不得維護另一份數值"
+owner_decisions: [OD-09, OD-10, OD-13]
+workload:
+  engine_case: lr-mixed
+  engine_files: [realhw/cases/longrun.py]
+  min_continuous_duration_s: 172800
+  allow_segment_stitching: false
+  snapshot_interval_s: 300
+  observer_interval_s: 10
+  max_observation_gap_factor: 2.0
+  windows_excl_probe_interval_s: 300   # Windows 長跑期間第二開啟探測週期（winexcl）；屬 workload 契約，A/B 兩側須相同（計入 workload_contract_sha256）
+counting:
+  status: frozen
+  frozen_at: "2026-10-15T00:00:00+00:00"
+  pair_key: [source, round]
+  expected_reject_kinds: [busy]
+  expected_reject_error_codes: [SESSION_INTERACTIVE_BUSY]
+  unresolved_policy: count_as_unexpected_error
+  worker_error_policy: count_as_unexpected_error
+  definitions:
+    submitted: "kind == submit"
+    completed: "kind == done，或 kind == bg_result 且 status == done（background 以執行期收斂即時寫入的 bg_result 為準；submit_accepted 不算完成；bg_lost 不算完成）"
+    bg_lost: "kind == bg_lost（產品 history 淘汰前測試端未取得結果；不是終態，該 pair 計入 unresolved，並使 background_result_coverage 判 INSUFFICIENT_EVIDENCE）"
+    expected_rejects: "kind in expected_reject_kinds，或 kind == error 且 detail 屬 expected_reject_error_codes"
+    unexpected_errors: "kind == error 且非 expected reject；加上 kind == bg_result 且 status ∈ {error, canceled}；加上 worker_error（每個 (source, round) 至多計 1 次）"
+    unresolved: "submit 之後同 (source, round) 沒有 done／error／busy／worker_error／bg_result 終態（bg_lost、bg_slow、bg_poll_error、bg_drain 都不是終態；已計入 worker_error 的 pair 不再計 unresolved，避免分子重複）"
+    accepted: "submitted - expected_rejects"
+    error_rate: "(unexpected_errors + unresolved) / accepted"
+    effective_duration_s: "events stop.t - start.t，扣除 observer 判定該板非 READY 的確定區間（兩端樣本皆非 READY）；逐板計算"
+    effective_hour: "effective_duration_s / 3600（逐板）；throughput = completed / effective_hour"
+thresholds:
+  unexpected_cmd_error_rate:
+    status: frozen
+    frozen_at: "2026-10-15T00:00:00+00:00"
+    decision: OD-09
+    max_ratio: 0.01
+    relative: not_higher_than_baseline
+    granularity: [platform, board, source]
+  effective_throughput:
+    status: frozen
+    frozen_at: "2026-10-15T00:00:00+00:00"
+    decision: OD-09
+    metric: "completed per effective hour"
+    min_ratio_of_baseline: 0.95
+    granularity: [platform, board, source]
+  stuck_attached:
+    status: frozen
+    frozen_at: "2026-10-15T00:00:00+00:00"
+    decision: OD-09
+    total_s: not_higher_than_baseline
+    longest_s: not_higher_than_baseline
+    granularity: [platform, board]
+    bounds_rule: "候選上界 ≤ 基線下界 → PASS；候選下界 > 基線上界 → FAIL；其餘 INSUFFICIENT_EVIDENCE"
+  resources:                 # §15.11.5：Linux／Windows 分開凍結、逐平台比較，不合併平均
+    status: deferred
+    decision: OD-09
+    freeze_deadline: "Stage 0 修正後 Python 48h 基線（Linux、Windows 各一）完成後、任何 Rust 候選長跑開始前"
+    per_platform:
+      linux:   {rss_peak_kb: null, rss_steady_kb: null, rss_slope_kb_per_h: null}
+      windows: {rss_peak_kb: null, rss_steady_kb: null, rss_slope_kb_per_h: null}
+  min_effective_load:
+    status: deferred
+    decision: OD-09
+    freeze_deadline: "同 resources"
+    per_platform:
+      linux:   {min_completed_per_board_source: null, max_idle_gap_s: null}
+      windows: {min_completed_per_board_source: null, max_idle_gap_s: null}
+  comparison_uncertainty:
+    status: deferred
+    decision: OD-09
+    freeze_deadline: "同 resources"
+    per_platform:
+      linux:   {error_rate_abs_tolerance: null, throughput_ratio_tolerance: null, stuck_s_tolerance: null, max_reruns: null}
+      windows: {error_rate_abs_tolerance: null, throughput_ratio_tolerance: null, stuck_s_tolerance: null, max_reruns: null}
+safety:
+  status: frozen
+  frozen_at: "2026-10-15T00:00:00+00:00"
+  waivable: false
+  unauthorized_tx: 0
+  forbidden_double_holder: 0
+  cross_context_replay: 0
+  dangerous_auto_resend: 0
+  allowed_tx_source_regex: "^(agent:rhw[0-9]+|human:[A-Za-z0-9._:-]+|system|system:[a-z_]+)$"
+liveness:
+  status: frozen
+  frozen_at: "2026-10-15T00:00:00+00:00"
+  unexpected_daemon_exit: 0
+  unexpected_restart: 0
+  pid_generation_change: 0
+  worker_heartbeat_max_gap_s: 600       # 2 × worker_alive 週期（300 s）
+evidence:
+  require_pinned_cli: true
+  require_engine_report: true
+  require_observer: true
+  require_wal_dir: true
+  require_fault_retention_attestation: true   # §15.11.2／Spike 8：observer 首筆記錄監管自動重啟已關閉或等價措施
+  require_windows_exclusive_evidence: true    # §6.2 Windows：雙重持有判定以 dwShareMode=0 獨占開啟證據為準（winexcl），holder_unknown 只作診斷（R1-F7）
+  context_time_tolerance_s: 2.0               # WAL wall_ts 與 events wall_ts 對齊容差；落在容差內的判定記為不確定

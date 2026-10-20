@@ -1,2 +1,9 @@
 # 確保 uart_stdio_bridge 工具原始碼於跨平台檢出時維持 LF 行尾，以維護 tree_sha256 一致性（OD-15）
 tools/uart_stdio_bridge/** text eol=lf
+# Stage 0 承接清單與人工程序的位元組雜湊（test_manual_procedure_not_counted）需跨平台維持 LF（P2-T12）
+realhw/procedures/*.md text eol=lf
+tests/acceptance/** text eol=lf
+# OD-09 凍結門檻檔、候選登記 ledger 與 owner-decisions addenda 的位元組雜湊需跨平台維持 LF（P2-T16）
+realhw/acceptance/longrun_acceptance.yaml text eol=lf
+realhw/acceptance/candidate_longrun_starts.ndjson text eol=lf
+docs/rust-refactor/owner-decisions-addenda.md text eol=lf

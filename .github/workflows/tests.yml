@@ -1,11 +1,17 @@
 name: Tests
-on: [pull_request]
+on:
+  pull_request:
+    # labeled：PR 事後加上 run-windows-com 標籤時才會觸發 windows-com-selfhosted（P2-T13）
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   pytest:
+    # labeled 事件只為 windows-com-selfhosted 而開，其餘 job 不因加標籤而重跑（P2-T13 審查修正）
+    if: github.event.action != 'labeled'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,8 +36,13 @@ jobs:
       - name: 執行測試套件（含 re2 線性引擎）
         # 覆蓋 #91 re2 路徑：matcher 以 re2 線性引擎求值、免疫所有 catastrophic backtracking。
         run: python3 -m pytest -q tests/
+      - name: L1 必要集合鎖只增檢查（對 PR base，P2-T13 R5-F3）
+        # 基準 rev 的鎖檔中既有的 (set, platform, nodeid) 消失或 selector 改變即失敗；移除須 --allow-removal 並於 PR 說明。
+        if: github.event_name == 'pull_request'
+        run: python3 tests/acceptance/regen_lock.py --check --base origin/${{ github.base_ref }}
 
   bridge-tools:
+    if: github.event.action != 'labeled'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -50,6 +61,7 @@ jobs:
         run: python3 -m pytest -q tools/uart_stdio_bridge/tests
 
   bridge-tools-windows:
+    if: github.event.action != 'labeled'
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
@@ -64,3 +76,83 @@ jobs:
         run: python -m pip install --disable-pip-version-check pytest==9.0.3 PyYAML==6.0.3 jsonschema==4.10.3 pyserial==3.5
       - name: 執行 uart_stdio_bridge 免驅動 Windows L1 自測
         run: python -m pytest -q tools/uart_stdio_bridge/tests -m "not posix_pty and not docker and not windows_com"
+
+  pytest-windows:
+    # §11.5「每個 PR 雙平台 L1」：hosted Windows 免驅動 L1（core_portable 與 windows_native）。
+    # 只證明免驅動 Windows L1，不得計為 windows_com（原生 COM 證據見 windows-com-selfhosted）。
+    # 報告同時供 l1_judge 判定（s0_win_pytest 集合，tests/acceptance/l1_required.lock.json）；
+    # 指令必須與鎖檔 selector.argv 一致（去掉 --junitxml 後逐字相同，P2-T13 審查修正）。
+    if: github.event.action != 'labeled'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安裝免驅動 Windows L1 相依
+        run: python -m pip install --disable-pip-version-check pytest==9.0.3 PyYAML==6.0.3 jsonschema==4.10.3 pyserial==3.5
+      - name: 執行免驅動 Windows L1（含資源報告與 junit）
+        env:
+          SW_RESOURCE_REPORT: resource-report-windows.json
+        run: python -m pytest -q tests -m "core_portable or windows_native" --junitxml=junit-windows.xml
+      - name: 上傳資源報告與 junit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: l1-windows
+          path: |
+            resource-report-windows.json
+            junit-windows.xml
+          if-no-files-found: warn
+
+  windows-com-selfhosted:
+    # OD-08／OD-15：自架 Windows COM runner（label serialwrap-com）。runner 未註冊時 job 排隊不執行；
+    # 切片／Stage 出口由 check_evidence_index.py 以缺證據判 BLOCKED，不得以 job 未執行視為通過。
+    # 只允許 workflow_dispatch，或同 repo 分支的 PR 帶 run-windows-com 標籤（fork PR 不得進入自架 runner）。
+    if: github.event_name == 'workflow_dispatch' || (contains(github.event.pull_request.labels.*.name, 'run-windows-com') && github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: [self-hosted, windows, serialwrap-com]
+    timeout-minutes: 90
+    env:
+      # com0com pair：COM20＝serialwrap／受測端、COM21＝bridge／測試端（OD-15）
+      SW_TEST_COM_PAIR: COM20:COM21
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安裝相依與 bridge 工具
+        run: |
+          python -m pip install --disable-pip-version-check pytest==9.0.3 PyYAML==6.0.3 jsonschema==4.10.3 pyserial==3.5
+          python -m pip install --disable-pip-version-check ./tools/uart_stdio_bridge
+      - name: bridge 自測（win-serial）
+        # --out 必填；virtual_com0com 為 OD-15 的 com0com pair（P2-T13 審查修正）
+        shell: pwsh
+        run: uart-stdio-bridge selftest --endpoint win-serial --com-pair $env:SW_TEST_COM_PAIR --transport-mode virtual_com0com --out selftest-win-serial
+      - name: 原生 COM 測試（windows_com）
+        shell: pwsh
+        run: python -m pytest -q tools/uart_stdio_bridge/tests -m windows_com --junitxml=windows-com-junit.xml
+      - name: func-test 外部 bridge（win-com-*）
+        # --case 為完全相符的 stem（不支援 glob），逐一執行三個情境；Windows 必須指定 daemon／bridge COM 與傳輸模式。
+        shell: pwsh
+        run: |
+          foreach ($case in @("win-com-txrx-bridge", "win-com-open-exclusive", "win-com-cancel-close")) {
+            python func-test/runner.py --mode bridge --scenarios --case $case --daemon-com COM20 --bridge-com COM21 --transport-mode virtual_com0com --report-dir "func-test-win-com/$case"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: 上傳報告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-com-selfhosted
+          path: |
+            windows-com-junit.xml
+            selftest-win-serial
+            func-test-win-com
+          if-no-files-found: warn

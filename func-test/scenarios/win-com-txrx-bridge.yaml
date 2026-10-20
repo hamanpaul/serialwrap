@@ -1,0 +1,45 @@
+---
+meta:
+  name: win-com-txrx-bridge
+  category: l15-scenario
+  severity: critical
+  description: "Windows 原生 COM 雙向 TX/RX 傳輸與 console 輸入，比較器 full PASS（§15.7.1）"
+  platforms: [windows]
+  scenario:
+    revision: "2026-10-15.1"
+    seed: 1015
+    capabilities: [windows_com, process_rpc]
+    timeout_s: 60
+    invariants: [no_forbidden_interleave, insufficient_evidence_not_pass]
+    behavior_changes: []
+    expected: PASS
+    daemon_slice: "2.1"
+bridge: {applicable: true, only: true, compare: full}
+target:
+  platform: prpl
+  boot_banner: "boot done\r\nroot@prplOS:/# "
+  noise: {enabled: false}
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+profile:
+  prompt_regex: '(?m)^root@prplOS:.*# '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+steps:
+  - action: wait_ready
+    timeout_s: 20
+  - action: repeat
+    count: 50
+    steps:
+      - action: cli
+        argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:w1", "--cmd", "echo W_TEST"]
+  - action: attach_console
+    selector: COM0
+    label: win-con
+    save_as: wcon
+  - action: console_write
+    console_id: "{wcon.client_id}"
+    input_raw: " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~\r"
+  - action: assert_wire_contiguous
+    payloads: ["echo W_TEST\n"]
+  - action: assert_compare

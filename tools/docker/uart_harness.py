@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import shlex
 import signal
@@ -34,8 +35,8 @@ FUNC_TEST_DIR = ROOT_DIR / "func-test"
 if str(FUNC_TEST_DIR) not in sys.path:
     sys.path.insert(0, str(FUNC_TEST_DIR))
 
-from lib.daemon_harness import DaemonHarness, HarnessConfig  # noqa: E402
-from lib.fake_target import TargetConfig  # noqa: E402
+from lib.daemon_harness import DaemonHarness, HarnessConfig, resolve_cli_exe  # noqa: E402
+from lib.target_config import TargetConfig  # noqa: E402
 
 _ENV_KEYS = (
     "SERIALWRAP_STATE_DIR",
@@ -46,7 +47,7 @@ _ENV_KEYS = (
 
 
 def _serialwrap_bin() -> str:
-    return str(ROOT_DIR / "serialwrap")
+    return os.environ.get("SERIALWRAP_CLI_EXE") or resolve_cli_exe()[0]
 
 
 def _json_cmd(argv: list[str], env: dict[str, str], timeout: float = 5.0) -> dict[str, object]:

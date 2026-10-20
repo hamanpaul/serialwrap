@@ -240,7 +240,7 @@ def f9_attach_during_boot_reprobes(ctx):
     "f9-uboot-readonly-and-console-kept",
     "U-Boot 停留期間唯讀操作＋console 不得被踢，離開後自動回 READY",
     issues=("#44", "#130"),
-    requires=("tmux",),
+    requires=("human_frontend",),
     hints=(
         "全程只能經 guards.UBootConsole 唯讀白名單互動，絕不可繞過送 saveenv/setenv/flash 寫入。",
         "#44 的回歸是『U-Boot 停留會把既有 human console 踢掉』——用 console-list 數量比對。",
@@ -252,21 +252,21 @@ def f9_uboot_readonly_and_console_kept(ctx):
     """
     com = ctx.cfg["boards"][0]["com"]
     boot_wait_s = float(ctx.cfg["timeouts"]["boot_wait_s"])
-    ses = ctx.tmux.name("f9uboot")
-    ctx.tmux.new(ses, f"serialwrap-minicom {com}")
+    human = ctx.human("f9uboot", "minicom")
+    human.open(com)
     ub: guards.UBootConsole | None = None
     interrupted = False
     left = False
 
     try:
-        time.sleep(6)  # 等 console-attach＋minicom 起來（照 p0-console-raw／f8 手法）
+        time.sleep(6)  # 等 console frontend attach
         cl_before = ctx.sw.run("session", "console-list", "--selector", com)
         ctx.note("console-list-before.json", str(cl_before))
         count_before = len(cl_before.get("consoles") or [])
 
-        ub = guards.UBootConsole(ctx, com, ses)
+        ub = guards.UBootConsole(ctx, com, human)
         # 經 human console 送 reboot（非 agent submit），才能無縫接著 interrupt_autoboot。
-        ctx.tmux.send(ses, "reboot")
+        human.send_line("reboot")
 
         # 60s 窗：Linux shutdown → U-Boot banner 可能吃掉 20s 以上，窗太短會假 FAIL；
         # interrupt_autoboot 以 0.3s 週期送鍵，3 秒 autoboot 窗一到即可攔住。
@@ -321,8 +321,8 @@ def f9_uboot_readonly_and_console_kept(ctx):
                 if ub is not None:
                     ub.leave("reset")
             except Exception:
-                ctx.tmux.send(ses, "reset")  # 護欄異常時的最後手段，仍只送 reset
-        ctx.tmux.kill(ses)
+                human.send_line("reset")  # 護欄異常時的最後手段，仍只送 reset
+        human.close()
         # 雙保險：不論上面哪個分支提前 return，都再確認一次板子確實回到 READY。
         guards.ensure_ready(ctx, com, timeout_s=boot_wait_s)
 
@@ -360,7 +360,7 @@ def _wait_quiet_cleared(ctx, com: str, *, timeout_s: float) -> tuple[bool, dict]
     "f9-spontaneous-reboot-agent-gated",
     "自發重開機（daemon 不知情）期間 agent 顯式命令必須被 AUTOBOOT_QUIET 擋下",
     issues=("#139", "#130"),
-    requires=("tmux",),
+    requires=("human_frontend",),
     hints=(
         "受測窗口＝『state=READY 且 boot_quiet_remaining_s 非 null』的過渡態（human console"
         " 送 reboot、daemon 視角為自發重開機、state 停留 READY）；90s 內未觀測到該組合屬"
@@ -383,13 +383,13 @@ def f9_spontaneous_reboot_agent_gated(ctx):
     """
     com = ctx.cfg["boards"][0]["com"]
     boot_wait_s = float(ctx.cfg["timeouts"]["boot_wait_s"])
-    ses = ctx.tmux.name("f9spon")
-    ctx.tmux.new(ses, f"serialwrap-minicom {com}")
+    human = ctx.human("f9spon", "minicom")
+    human.open(com)
 
     try:
-        time.sleep(6)  # 等 console-attach＋minicom 拿到 raw ownership（照 f9-uboot-readonly 手法）
+        time.sleep(6)  # 等 console frontend attach 並取得 raw ownership
         # 經 human console 送 reboot——daemon 視角為自發重開機，session 停 READY。
-        ctx.tmux.send(ses, "reboot")
+        human.send_line("reboot")
 
         # 以 0.5s 週期輪詢，等「state==READY 且 boot_quiet_remaining_s 非 null」的
         # 受測窗口；逐拍存時序作 evidence（順帶佐證 round-3 抖動歸因）。
@@ -496,7 +496,7 @@ def f9_spontaneous_reboot_agent_gated(ctx):
     finally:
         # 收尾還原：任何路徑不得把板留在 U-Boot／非 READY，**且不得把仍在倒數的
         # quiet window 留給下一案**（首輪驗收實證：殘留 quiet 級聯拖垮 f9-uboot 案）。
-        ctx.tmux.kill(ses)
+        human.close()
         guards.ensure_ready(ctx, com, timeout_s=boot_wait_s)
         _wait_quiet_cleared(ctx, com, timeout_s=boot_wait_s)
 

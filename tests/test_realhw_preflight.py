@@ -38,6 +38,14 @@ def test_missing_tool_fails():
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
+def test_fake_uart_preflight_skips_host_usb_and_sudo_requirements(monkeypatch):
+    monkeypatch.setattr(preflight.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(preflight, "_run", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("sudo 不應執行")))
+    assert preflight._tools_missing({"uart_kind": "pty-fake", "usbipd_exe": "/missing"}, os_name="posix") == ["tmux", "minicom"]
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_other_pytest_fails_with_mutex_reason():
     ok, problems = preflight.evaluate(_checks(other_pytest=True))
     assert not ok and any("live guard" in p for p in problems)
@@ -144,16 +152,12 @@ def test_external_testpilot_refuses_suite():
 def test_external_testpilot_ignores_own_pid(monkeypatch):
     me = os.getpid()
     monkeypatch.setattr(
-        preflight,
-        "_run",
-        lambda argv, timeout=30.0: SimpleNamespace(
-            returncode=0,
-            stdout=(
-                f"{me} testpilot run serialwrap_reliability --case p0-doctor\n"
-                "4321 testpilot run wifi_llapi --case smoke\n"
-            ),
-            stderr="",
-        ),
+        preflight.procobs,
+        "list_processes",
+        lambda: [
+            {"pid": me, "cmdline": "testpilot run serialwrap_reliability --case p0-doctor"},
+            {"pid": 4321, "cmdline": "testpilot run wifi_llapi --case smoke"},
+        ],
     )
     assert preflight._external_testpilot() == ["4321 testpilot run wifi_llapi --case smoke"]
 

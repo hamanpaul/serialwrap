@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import random
-import subprocess
 import time
 
 from ..drivers import find_marker, strip_ansi
@@ -17,13 +16,24 @@ def _case(id, title, hints=(), requires=(), destructive=False):
     return deco
 
 
-def _minicom_pids() -> set[int]:
-    cp = subprocess.run(["pgrep", "-x", "minicom"], capture_output=True, text=True)
-    return {int(p) for p in cp.stdout.split() if p.strip().isdigit()}
+def _open_human(ctx, tag: str):
+    human = ctx.human(tag, "minicom")
+    human.open("COM0")
+    return human
 
 
-def _kill9(pid: int) -> None:
-    subprocess.run(["kill", "-9", str(pid)], capture_output=True, text=True)
+def _human_attached_for_orphan(ctx, human, com: str) -> CaseResult | None:
+    consoles = ctx.sw.run("session", "console-list", "--selector", com).get("consoles") or []
+    self_test = ctx.sw.run("session", "self-test", "--selector", com)
+    ctx.note("console-before-crash.json", str({"consoles": consoles, "self_test": self_test}))
+    if not human.alive() or not self_test.get("human_attached") or not consoles:
+        return CaseResult(
+            "FAIL",
+            reason="crash 前 human frontend 未存活或 console 尚未 attach",
+            category="environment",
+            reason_code="minicom_spawn_failed",
+        )
+    return None
 
 
 def _close_lease(ctx, iid: str) -> None:
@@ -33,10 +43,9 @@ def _close_lease(ctx, iid: str) -> None:
 
 @_case("p1-con-fanout", "human 即時看到 agent 命令與回應（T6）",
        hints=("畫面缺 marker 先確認 console 沒掉回 line-buffer、無洩漏 daemon 掉字",),
-       requires=("tmux", "two_boards"))
+       requires=("human_frontend", "two_boards"))
 def p1_con_fanout(ctx):
-    ses = ctx.tmux.name("fanout")
-    ctx.tmux.new(ses, "serialwrap-minicom COM0")
+    human = _open_human(ctx, "fanout")
     try:
         time.sleep(6)
         markers = [f"T6_{i}_{random.randint(1000, 9999)}" for i in range(3)]
@@ -44,7 +53,7 @@ def p1_con_fanout(ctx):
             ctx.sw.submit_and_wait("COM0", f"echo {m}")
             time.sleep(0.5)
         time.sleep(2)
-        pane = ctx.tmux.capture(ses)
+        pane = human.capture()
         ctx.note("pane.txt", pane)
         missing = [m for m in markers if not find_marker(pane, m)]
         if missing:
@@ -52,7 +61,7 @@ def p1_con_fanout(ctx):
                               category="test", reason_code="console_fanout_lost")
         return CaseResult("PASS")
     finally:
-        ctx.tmux.kill(ses)
+        human.close()
         time.sleep(3)
 
 
@@ -60,10 +69,9 @@ def p1_con_fanout(ctx):
        hints=("deferred flush 後 human 輸入應自成一行、不與 agent 命令 byte 交錯",
               "T7 deferred 只捕捉 agent 命令『執行期間』抵達的按鍵；submit 之前敲的半行"
               "在 raw 模式即時透傳、會與命令交錯污染 stdout——須於執行視窗內敲（#122 實機）"),
-       requires=("tmux", "two_boards"))
+       requires=("human_frontend", "two_boards"))
 def p1_con_defer(ctx):
-    ses = ctx.tmux.name("defer")
-    ctx.tmux.new(ses, "serialwrap-minicom COM0")
+    human = _open_human(ctx, "defer")
     try:
         time.sleep(6)
         # async submit 一個帶延遲的 agent 命令撐開執行視窗，再於視窗內敲 human 半行
@@ -78,7 +86,7 @@ def p1_con_defer(ctx):
                               category="test", reason_code="submit_no_cmd_id")
         t0 = time.monotonic()
         time.sleep(0.4)  # 待命令進入執行（sleep 視窗）
-        ctx.tmux.send(ses, "echo HUMAN_HALF", enter=False)  # 執行期間敲入 → deferred
+        human.send_text("echo HUMAN_HALF")  # 執行期間敲入 → deferred
         command: dict = {}
         deadline = time.monotonic() + 25
         while time.monotonic() < deadline:
@@ -96,30 +104,29 @@ def p1_con_defer(ctx):
         if took > 15:
             return CaseResult("FAIL", reason=f"agent 命令耗時 {took:.1f}s（疑似被 human console 阻擋）",
                               category="test", reason_code="defer_agent_blocked")
-        ctx.tmux.send_key(ses, "Enter")  # flush deferred
+        human.send_key("Enter")  # flush deferred
         time.sleep(2)
-        pane = ctx.tmux.capture(ses)
+        pane = human.capture()
         ctx.note("pane.txt", pane)
         if not find_marker(pane, "HUMAN_HALF"):
             return CaseResult("FAIL", reason="deferred human 輸入未 flush 回 UART",
                               category="test", reason_code="defer_flush_lost")
         return CaseResult("PASS")
     finally:
-        ctx.tmux.send_key(ses, "C-u")  # 清殘留輸入行，避免污染後續 console case
-        ctx.tmux.kill(ses)
+        human.send_key("C-u")  # 清殘留輸入行，避免污染後續 console case
+        human.close()
         time.sleep(3)
 
 
 @_case("p1-con-busy", "human_active 窗內 agent 不奪 interactive（SESSION_INTERACTIVE_BUSY）",
        hints=("human_active 窗＝60s（HUMAN_ACTIVE_WINDOW_S）；剛敲鍵即在窗內",),
-       requires=("tmux", "two_boards"))
+       requires=("human_frontend", "two_boards"))
 def p1_con_busy(ctx):
-    ses = ctx.tmux.name("conbusy")
-    ctx.tmux.new(ses, "serialwrap-minicom COM0")
+    human = _open_human(ctx, "conbusy")
     iid = ""
     try:
         time.sleep(6)
-        ctx.tmux.send(ses, "echo BUSYCHK", enter=False)  # 造 human_active（半行、不送出）
+        human.send_text("echo BUSYCHK")  # 造 human_active（半行、不送出）
         time.sleep(1)
         res = ctx.sw.run("session", "interactive-open", "--selector", "COM0",
                          "--owner", "agent:realhw", "--timeout", "10")
@@ -132,17 +139,16 @@ def p1_con_busy(ctx):
         return CaseResult("PASS")
     finally:
         _close_lease(ctx, iid)  # 萬一意外拿到 lease，收回
-        ctx.tmux.send_key(ses, "C-u")
-        ctx.tmux.kill(ses)
+        human.send_key("C-u")
+        human.close()
         time.sleep(3)
 
 
 @_case("p1-con-softpreempt", "閒置降級：agent 軟奪 idle human lease（soft_preempted）",
        hints=("閒置降級不中斷 human console；close 後原 console owner 應恢復",),
-       requires=("tmux", "two_boards"))
+       requires=("human_frontend", "two_boards"))
 def p1_con_softpreempt(ctx):
-    ses = ctx.tmux.name("softp")
-    ctx.tmux.new(ses, "serialwrap-minicom COM0")
+    human = _open_human(ctx, "softp")
     iid = ""
     try:
         time.sleep(6)  # 起 minicom 後刻意不輸入
@@ -168,27 +174,29 @@ def p1_con_softpreempt(ctx):
         return CaseResult("PASS")
     finally:
         _close_lease(ctx, iid)
-        ctx.tmux.kill(ses)
+        human.close()
         time.sleep(3)
 
 
 @_case("p1-con-liveness", "human console SIGKILL 後孤兒偵測（human_attached 轉 false）",
        hints=("勿 pkill -f（self-match exit 144）；孤兒只來自 SIGKILL/crash",
-              "只殺本套件新起的 minicom（before/after PID 差集），不動既有 minicom"),
-       requires=("tmux", "two_boards"))
+              "crash() 只終止本 case frontend 啟動的 console，不掃描或終止既有 minicom"),
+       requires=("human_frontend", "two_boards", "posix_orphan_semantics"))
 def p1_con_liveness(ctx):
-    before = _minicom_pids()
-    ses = ctx.tmux.name("liveness")
-    ctx.tmux.new(ses, "serialwrap-minicom COM0")
+    human = ctx.human("liveness", "minicom")
+    try:
+        human.open("COM0")
+    except Exception as exc:
+        human.close()
+        return CaseResult("FAIL", reason=f"minicom frontend 啟動失敗：{exc}",
+                          category="environment", reason_code="minicom_spawn_failed")
     try:
         time.sleep(6)
-        ours = _minicom_pids() - before
-        if not ours:
-            return CaseResult("FAIL", reason="未偵測到本套件新起的 minicom PID",
-                              category="environment", reason_code="minicom_spawn_failed")
-        for pid in ours:
-            _kill9(pid)  # 模擬 crash（SIGKILL 不觸發正常 detach）
-        ctx.note("killed-pids.txt", str(sorted(ours)))
+        missing = _human_attached_for_orphan(ctx, human, "COM0")
+        if missing:
+            return missing
+        killed_pid = human.crash()  # 由 frontend 只終止本 case 的 minicom child
+        ctx.note("killed-pids.txt", str(killed_pid))
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
             st = ctx.sw.run("session", "self-test", "--selector", "COM0")
@@ -199,7 +207,7 @@ def p1_con_liveness(ctx):
         return CaseResult("FAIL", reason="≤60s 內 human_attached 未轉 false（孤兒未回收）",
                           category="test", reason_code="orphan_not_recycled")
     finally:
-        ctx.tmux.kill(ses)
+        human.close()
         time.sleep(3)
 
 
@@ -207,18 +215,24 @@ def p1_con_liveness(ctx):
        hints=("#76 孤兒回收＋自癒；不需 daemon restart",
               "孤兒 lease 由 liveness 探測（self-test）觸發回收、非背景計時器；且『重開拿回 raw』"
               "只在孤兒『已回收後』重開才成立——回收前重開者落 line-buffer 且事後不升等（#122 實機）"),
-       requires=("tmux", "two_boards"))
+       requires=("human_frontend", "two_boards", "posix_orphan_semantics"))
 def p1_con_orphan(ctx):
-    before = _minicom_pids()
-    ses1 = ctx.tmux.name("orphan1")
-    ctx.tmux.new(ses1, "serialwrap-minicom COM0")
-    ses2 = ctx.tmux.name("orphan2")
+    human1 = ctx.human("orphan1", "minicom")
+    try:
+        human1.open("COM0")
+    except Exception as exc:
+        human1.close()
+        return CaseResult("FAIL", reason=f"minicom frontend 啟動失敗：{exc}",
+                          category="environment", reason_code="minicom_spawn_failed")
+    human2 = ctx.human("orphan2", "minicom")
     try:
         time.sleep(6)
-        ours = _minicom_pids() - before
-        for pid in ours:  # 製造孤兒（SIGKILL 不觸發正常 detach）
-            _kill9(pid)
-        ctx.tmux.kill(ses1)
+        missing = _human_attached_for_orphan(ctx, human1, "COM0")
+        if missing:
+            return missing
+        killed_pid = human1.crash()
+        ctx.note("killed-pids.txt", str(killed_pid))
+        human1.close()
         # 先輪詢 self-test 驅動孤兒回收（human_attached→False），再重開第二個 minicom；
         # 若在回收前重開，第二 console 會落 line-buffer 且事後不再升等（#76 語意）。
         recycled = False
@@ -233,7 +247,7 @@ def p1_con_orphan(ctx):
         if not recycled:
             return CaseResult("FAIL", reason="≤60s 內孤兒未回收（human_attached 未轉 False）",
                               category="test", reason_code="orphan_not_recycled")
-        ctx.tmux.new(ses2, "serialwrap-minicom COM0")  # 回收後重開，不 restart daemon
+        human2.open("COM0")  # 回收後重開，不 restart daemon
         cl: dict = {}
         owned = False
         deadline = time.monotonic() + 20
@@ -247,32 +261,31 @@ def p1_con_orphan(ctx):
         if not owned:
             return CaseResult("FAIL", reason="重開 minicom 未拿回 raw interactive ownership",
                               category="test", reason_code="raw_ownership_not_granted")
-        ctx.tmux.send(ses2, "ec", enter=False)
-        ctx.tmux.send_key(ses2, "Tab")
+        human2.send_text("ec")
+        human2.send_key("Tab")
         time.sleep(2)
-        pane = ctx.tmux.capture(ses2)
+        pane = human2.capture()
         ctx.note("pane.txt", pane)
         if "echo" not in strip_ansi(pane):
             return CaseResult("FAIL", reason="Tab 補完未出現（raw 路徑疑掉回 line-buffer）",
                               category="test", reason_code="raw_fallback_linebuffer")
-        ctx.tmux.send_key(ses2, "C-u")
+        human2.send_key("C-u")
         return CaseResult("PASS")
     finally:
-        ctx.tmux.kill(ses1)
-        ctx.tmux.kill(ses2)
+        human1.close()
+        human2.close()
         time.sleep(3)
 
 
 @_case("p1-con-second", "第二個 console 走 line-buffer（恰一個 interactive owner）",
        hints=("第二 console 走 line-buffer 是契約；只第一個拿 raw ownership",),
-       requires=("tmux", "two_boards"))
+       requires=("human_frontend", "two_boards"))
 def p1_con_second(ctx):
-    ses1 = ctx.tmux.name("second1")
-    ses2 = ctx.tmux.name("second2")
-    ctx.tmux.new(ses1, "serialwrap-minicom COM0")
+    human1 = _open_human(ctx, "second1")
+    human2 = ctx.human("second2", "minicom")
     try:
         time.sleep(6)
-        ctx.tmux.new(ses2, "serialwrap-minicom COM0")
+        human2.open("COM0")
         time.sleep(6)
         cl = ctx.sw.run("session", "console-list", "--selector", "COM0")
         ctx.note("console-list.json", str(cl))
@@ -287,6 +300,6 @@ def p1_con_second(ctx):
                               category="test", reason_code="second_console_missing")
         return CaseResult("PASS")
     finally:
-        ctx.tmux.kill(ses1)
-        ctx.tmux.kill(ses2)
+        human1.close()
+        human2.close()
         time.sleep(3)
