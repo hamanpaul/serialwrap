@@ -40,7 +40,7 @@ if ((DRY_RUN)); then
     print_command docker compose -f "$COMPOSE_FILE" -p "$PROJECT" build serialwrap dut-sim
     print_command docker compose -f "$COMPOSE_FILE" -p "$PROJECT" --profile systemd-user build systemd
     print_command docker compose -f "$COMPOSE_FILE" -p "$PROJECT" run --rm --no-deps -T \
-        -v "$VOLUME_ROOT:/tmp/sw-t17" -v "$OUT:/evidence" \
+        -v "$VOLUME_ROOT:/tmp/sw-t17" -v "$OUT:/evidence" -v "$OUT:$OUT" -e "SW_HOST_EVIDENCE_DIR=$OUT" \
         -e "SW_DOCKER_RUN_ID=od15-$RUN_ID" -e "SW_HOURS=$HOURS" -e "SW_DUT_IMAGE=$DUT_IMAGE" \
         serialwrap python3 scripts/docker/run_longrun_container.py
     echo "+ gate=BC-01..05,SC-34,SC-35,DRAIN_STALLED；不足時在 dry-run 前 exit 3"
@@ -72,7 +72,7 @@ trap cleanup EXIT INT TERM
 docker compose -f "$COMPOSE_FILE" -p "$PROJECT" build serialwrap dut-sim
 docker compose -f "$COMPOSE_FILE" -p "$PROJECT" --profile systemd-user build systemd
 docker compose -f "$COMPOSE_FILE" -p "$PROJECT" run --rm --no-deps -T \
-    -v "$VOLUME_ROOT:/tmp/sw-t17" -v "$OUT:/evidence" \
+    -v "$VOLUME_ROOT:/tmp/sw-t17" -v "$OUT:/evidence" -v "$OUT:$OUT" -e SW_HOST_EVIDENCE_DIR="$OUT" \
     -e SW_DOCKER_RUN_ID -e SW_HOURS -e SW_DUT_IMAGE \
     -e SW_SERIALWRAP_IMAGE -e SW_SYSTEMD_IMAGE \
     serialwrap python3 scripts/docker/run_longrun_container.py

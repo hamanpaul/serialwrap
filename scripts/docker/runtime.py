@@ -70,6 +70,16 @@ def write_profiles(env: dict[str, str]) -> None:
                                                 encoding="utf-8")
 
 
+def host_evidence_root(default: pathlib.Path = pathlib.Path("/evidence")) -> pathlib.Path:
+    """回傳 host 與容器同路徑的證據根目錄。
+
+    bridge 經 docker.sock 啟動 DUT 時，`--mount type=bind,src=...` 由 host docker daemon 解析；
+    證據（含 dut-control／dut-input）必須放在 host 與容器路徑一致的掛載下，否則 DUT 掛載失敗即退出。
+    """
+    value = os.environ.get("SW_HOST_EVIDENCE_DIR", "").strip()
+    return pathlib.Path(value) if value else default
+
+
 def start_bridges(env: dict[str, str], *, dut_image: str, run_id: str,
                   evidence_root: pathlib.Path) -> list[subprocess.Popen]:
     """於 serialwrap 容器內啟動兩個 bridge，各自以 Docker 啟動一個 DUT。"""

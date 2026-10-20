@@ -32,7 +32,7 @@ case "$MODE" in
     systemd-user|systemd-system) ;;
     *) echo "不支援的 systemd 模式：$MODE" >&2; exit 2 ;;
 esac
-sw_require_p1_oc "$REPO_ROOT"
+# P1／P1-OC 前置只約束長跑與監管 runner（計畫 §0 前置表）；systemd 生命週期驗證照常執行。
 
 RUN_ID="$(printenv SW_DOCKER_RUN_ID 2>/dev/null || true)"
 if [[ -z "$RUN_ID" ]]; then RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"; fi
@@ -93,7 +93,7 @@ cd "$REPO_ROOT"
 docker compose -f "$COMPOSE_FILE" -p "$PROJECT" build serialwrap dut-sim
 docker compose -f "$COMPOSE_FILE" -p "$PROJECT" --profile "$MODE" build systemd
 CONTAINER_ID="$(docker compose -f "$COMPOSE_FILE" -p "$PROJECT" --profile "$MODE" run -d --no-deps \
-    --name "$CONTAINER_NAME" -v "$OUT/volumes:/tmp/sw-t17" -v "$OUT:/evidence" systemd /sbin/init)"
+    --name "$CONTAINER_NAME" -v "$OUT/volumes:/tmp/sw-t17" -v "$OUT:/evidence" -v "$OUT:$OUT" systemd /sbin/init)"
 
 wait_systemd_ready() {
     local state
@@ -112,5 +112,5 @@ wait_systemd_ready() {
 wait_systemd_ready
 docker exec -e SW_HOST_UID="$(id -u)" -e SW_HOST_GID="$(id -g)" \
     -e SW_SERIALWRAP_IMAGE="$SERIALWRAP_IMAGE" -e SW_DUT_IMAGE="$DUT_SERVICE_IMAGE" \
-    -e SW_SYSTEMD_IMAGE="$SYSTEMD_IMAGE" -i "$CONTAINER_ID" \
-    python3 scripts/docker/run_systemd_container.py --mode "$MODE" --run-id "od15-$RUN_ID"
+    -e SW_SYSTEMD_IMAGE="$SYSTEMD_IMAGE" -e PYTHONPATH=/opt/serialwrap -e SW_HOST_EVIDENCE_DIR="$OUT" -i "$CONTAINER_ID" \
+    /opt/serialwrap/.venv/bin/python scripts/docker/run_systemd_container.py --mode "$MODE" --run-id "od15-$RUN_ID"

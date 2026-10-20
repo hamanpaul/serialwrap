@@ -39,9 +39,9 @@ def _user_env(env: dict[str, str]) -> dict[str, str]:
 
 def _run_as_user(env: dict[str, str], argv: list[str], *, timeout: float = 120.0) -> subprocess.CompletedProcess[str]:
     user_env = _user_env(env)
-    command = ["runuser", "-u", USER, "--preserve-environment", "--", "env"]
-    command.extend(f"{key}={value}" for key, value in user_env.items())
-    command.extend(argv)
+    # 環境只經 subprocess env 傳遞（--preserve-environment 原樣保留）；不得展開成 `env KEY=VALUE` argv，
+    # 否則常駐的 runuser 父行程 cmdline 會含 SERIALWRAP_DAEMON_EXE=/…/serialwrapd，被 #101 多開偵測誤認為另一個 daemon。
+    command = ["runuser", "-u", USER, "--preserve-environment", "--", *argv]
     return subprocess.run(command, cwd=REPO, env=user_env, capture_output=True, text=True,
                           check=False, timeout=timeout)
 
@@ -287,7 +287,7 @@ def write_report(path: pathlib.Path, *, suite: str, mode: str, results: list[dic
 def serve(mode: str, env: dict[str, str], run_id: str) -> tuple[list[subprocess.Popen], int, int]:
     write_daemon_wrapper(env)
     bridge_procs = runtime.start_bridges(env, dut_image=os.environ["SW_DUT_IMAGE"],
-                                         run_id=run_id, evidence_root=pathlib.Path("/evidence/bridge"))
+                                         run_id=run_id, evidence_root=runtime.host_evidence_root() / "bridge")
     for index in range(2):
         link = pathlib.Path(env["SERIALWRAP_BY_ID_DIR"]) / f"usb-fake-{index}"
         os.chown(link.resolve(), 1000, -1)

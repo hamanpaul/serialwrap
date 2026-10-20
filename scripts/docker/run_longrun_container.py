@@ -121,7 +121,7 @@ def main() -> int:
         runtime.write_profiles(env)
         bridge_procs = runtime.start_bridges(
             env, dut_image=os.environ["SW_DUT_IMAGE"], run_id=run_id,
-            evidence_root=OUT / "bridge",
+            evidence_root=runtime.host_evidence_root(OUT) / "bridge",
         )
         runtime.start_daemon_and_wait(env, timeout_s=120)
         observer_path = OUT / "observer.ndjson"

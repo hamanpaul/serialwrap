@@ -44,11 +44,11 @@ if ((DRY_RUN)); then
     print_command docker compose -f "$COMPOSE_FILE" -p "$PROJECT" build serialwrap dut-sim
     print_command docker compose -f "$COMPOSE_FILE" -p "$PROJECT" --profile "$MODE" build systemd
     print_command docker compose -f "$COMPOSE_FILE" -p "$PROJECT" --profile "$MODE" run -d --name "$CONTAINER_NAME" \
-        -v "$VOLUME_ROOT:/tmp/sw-t17" -v "$OUT:/evidence" systemd /sbin/init
+        -v "$VOLUME_ROOT:/tmp/sw-t17" -v "$OUT:/evidence" -v "$OUT:$OUT" systemd /sbin/init
     print_command docker exec -e "SW_HOST_UID=$(id -u)" -e "SW_HOST_GID=$(id -g)" \
         -e "SW_SERIALWRAP_IMAGE=$SERIALWRAP_IMAGE" -e "SW_DUT_IMAGE=$DUT_IMAGE" \
-        -e "SW_SYSTEMD_IMAGE=$SYSTEMD_IMAGE" "$CONTAINER_NAME" \
-        python3 scripts/docker/run_supervision_container.py --mode "$MODE" --hours "$HOURS" --run-id "od15-$RUN_ID"
+        -e "SW_SYSTEMD_IMAGE=$SYSTEMD_IMAGE" -e PYTHONPATH=/opt/serialwrap -e "SW_HOST_EVIDENCE_DIR=$OUT" "$CONTAINER_NAME" \
+        /opt/serialwrap/.venv/bin/python scripts/docker/run_supervision_container.py --mode "$MODE" --hours "$HOURS" --run-id "od15-$RUN_ID"
     echo "+ systemd 就緒等待：最多 120 秒；服務 READY 後才啟動 observer"
     echo "+ observer PASS 條件：觀測跨度至少 ${HOURS}h-20s、樣本數足夠、最大間隔不超過 30s、所有樣本健康"
     echo "+ evidence_layer=L1.5-docker producer=run-supervision.sh topology=docker-2c uart_kind=pty-fake"
@@ -79,7 +79,7 @@ cd "$REPO_ROOT"
 docker compose -f "$COMPOSE_FILE" -p "$PROJECT" build serialwrap dut-sim
 docker compose -f "$COMPOSE_FILE" -p "$PROJECT" --profile "$MODE" build systemd
 CONTAINER_ID="$(docker compose -f "$COMPOSE_FILE" -p "$PROJECT" --profile "$MODE" run -d --no-deps \
-    --name "$CONTAINER_NAME" -v "$VOLUME_ROOT:/tmp/sw-t17" -v "$OUT:/evidence" systemd /sbin/init)"
+    --name "$CONTAINER_NAME" -v "$VOLUME_ROOT:/tmp/sw-t17" -v "$OUT:/evidence" -v "$OUT:$OUT" systemd /sbin/init)"
 
 wait_systemd_ready() {
     local state
@@ -95,5 +95,5 @@ wait_systemd_ready() {
 
 wait_systemd_ready
 docker exec -e SW_HOST_UID -e SW_HOST_GID -e SW_SERIALWRAP_IMAGE -e SW_DUT_IMAGE -e SW_SYSTEMD_IMAGE \
-    -i "$CONTAINER_ID" python3 scripts/docker/run_supervision_container.py \
+    -e PYTHONPATH=/opt/serialwrap -e SW_HOST_EVIDENCE_DIR="$OUT" -i "$CONTAINER_ID" /opt/serialwrap/.venv/bin/python scripts/docker/run_supervision_container.py \
     --mode "$MODE" --hours "$HOURS" --run-id "$SW_DOCKER_RUN_ID"

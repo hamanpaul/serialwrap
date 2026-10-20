@@ -279,8 +279,8 @@ def test_run_l15_dry_run_uses_suite_entrypoint(suite, expected):
 
 
 @pytest.mark.process_rpc
-def test_run_systemd_dry_run_asserts_dropin(tmp_path):
-    r = _run_script(RUN_SYSTEMD, "--mode", "systemd-user", "--dry-run", env=_valid_p1_gate_env(tmp_path))
+def test_run_systemd_dry_run_asserts_dropin():
+    r = _run_script(RUN_SYSTEMD, "--mode", "systemd-user", "--dry-run")
     assert r.returncode == 0, _tail(r)
     assert "systemctl --user show serialwrap -p Restart -p RefuseManualStart" in r.stdout
     assert "Restart=no" in r.stdout
@@ -290,9 +290,8 @@ def test_run_systemd_dry_run_asserts_dropin(tmp_path):
 
 
 @pytest.mark.process_rpc
-def test_run_systemd_system_dry_run_uses_system_scope(tmp_path):
-    r = _run_script(RUN_SYSTEMD, "--mode", "systemd-system", "--dry-run",
-                    env=_valid_p1_gate_env(tmp_path))
+def test_run_systemd_system_dry_run_uses_system_scope():
+    r = _run_script(RUN_SYSTEMD, "--mode", "systemd-system", "--dry-run")
     assert r.returncode == 0, _tail(r)
     assert "systemctl show serialwrap -p Restart -p RefuseManualStart" in r.stdout
     assert "journalctl -u serialwrap -o cat" in r.stdout
@@ -465,3 +464,48 @@ def test_l15_suite_runtime_import_and_cli_paths_match_serialwrap_image():
     assert regression_cli is not None
     for path in [*defaults, regression_cli.group(1)]:
         assert image_has_venv or "/.venv/" not in path, f"{path} 指向 serialwrap image 不存在的 venv"
+
+
+@pytest.mark.memory_only
+def test_systemd_container_runners_resolve_imports_and_host_bind_paths():
+    """回歸：systemd 容器內 runner 的 import、bridge 證據路徑與 runuser argv 必須能在真跑時成立。
+
+    systemd.Dockerfile 只在 /opt/serialwrap/.venv 安裝相依（系統 python3 無 PyYAML、無 scripts／tests 套件路徑），
+    故 runner 須以 venv python＋PYTHONPATH=/opt/serialwrap 執行；bridge 經 docker.sock 啟動 DUT 時 bind src 由
+    host docker daemon 解析，證據根須為 host 同路徑掛載（SW_HOST_EVIDENCE_DIR）；runuser 不得把含
+    SERIALWRAP_DAEMON_EXE=/…/serialwrapd 的環境展開成 argv，否則 #101 多開偵測把 runuser 父行程誤認為 daemon。
+    """
+    for script in (RUN_SYSTEMD, RUN_SUPERVISION):
+        text = script.read_text(encoding="utf-8")
+        assert re.search(r"python3 scripts/docker/run_\w+_container\.py", text) is None, script.name
+        assert "/opt/serialwrap/.venv/bin/python scripts/docker/" in text, script.name
+        assert "PYTHONPATH=/opt/serialwrap" in text, script.name
+    for script in (RUN_SYSTEMD, RUN_SUPERVISION, RUN_LONGRUN):
+        text = script.read_text(encoding="utf-8")
+        assert '-v "$OUT:$OUT"' in text, f"{script.name} 缺 host 同路徑證據掛載"
+        assert "SW_HOST_EVIDENCE_DIR" in text, script.name
+
+    sys.path.insert(0, str(REPO))
+    try:
+        from scripts.docker import runtime, systemd_container  # noqa: PLC0415
+    finally:
+        sys.path.remove(str(REPO))
+    captured: list[list[str]] = []
+
+    def _fake_run(argv, **kwargs):
+        captured.append(list(argv))
+        assert kwargs["env"]["SERIALWRAP_DAEMON_EXE"].endswith("/serialwrapd")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.delenv("SW_HOST_EVIDENCE_DIR", raising=False)
+        assert runtime.host_evidence_root(Path("/evidence")) == Path("/evidence")
+        monkey.setenv("SW_HOST_EVIDENCE_DIR", "/host/out")
+        assert runtime.host_evidence_root(Path("/evidence")) == Path("/host/out")
+        monkey.setattr(systemd_container.subprocess, "run", _fake_run)
+        systemd_container._run_as_user({"SERIALWRAP_DAEMON_EXE": "/opt/serialwrap/.venv/bin/serialwrapd"},
+                                       ["/opt/serialwrap/.venv/bin/serialwrap", "daemon", "start"])
+    finally:
+        monkey.undo()
+    assert captured and not any("serialwrapd" in arg for arg in captured[0]), captured
