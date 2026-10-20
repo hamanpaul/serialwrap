@@ -342,6 +342,20 @@ try {
     $requiredPaths = @('serialwrap.py', 'serialwrapd.py', 'sw_core', 'tests/contract_blackbox',
                        'tests/ab_env.py', 'VERSION', 'contracts')
     foreach ($relative in $requiredPaths) { $null = Copy-RepoPath $sourceRoot $relative $stagingRepo $true }
+    # P4-T16：test_cli_mgmt_ab_suite 由凍結鎖讀 AB_CASES 並收集每個凍結 pytest 節點；
+    # 鎖檔與節點所在檔（含 tests/contract_blackbox 以外者）一併放入 snapshot，缺少即視為 snapshot 不完整。
+    $null = Copy-RepoPath $sourceRoot 'tests/acceptance' $stagingRepo $true
+    $p4Lock = Join-Path $sourceRoot 'tests/acceptance/p4_required.lock.json'
+    $p4Files = [System.Collections.Generic.HashSet[string]]::new()
+    foreach ($case in (Get-Content -LiteralPath $p4Lock -Raw -Encoding UTF8 | ConvertFrom-Json).cases) {
+        foreach ($node in @($case.tests)) {
+            if ($node -is [string] -and $node.StartsWith('tests/') -and $node.Contains('::')) {
+                $file = $node.Substring(0, $node.IndexOf('::'))
+                if (-not $file.StartsWith('tests/contract_blackbox/')) { $null = $p4Files.Add($file) }
+            }
+        }
+    }
+    foreach ($relative in $p4Files) { $null = Copy-RepoPath $sourceRoot $relative $stagingRepo $true }
     foreach ($relative in @('tests/resource_report.py', 'tests/resource_report_plugin.py',
                             'realhw/deployed_content.py')) {
         if (-not (Copy-RepoPath $sourceRoot $relative $stagingRepo $false)) { $missing.Add($relative) }
