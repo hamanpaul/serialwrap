@@ -415,12 +415,35 @@ def test_background_results_survive_history_eviction(tmp_path):
     assert not [e for e in ev2 if e["kind"] in ("bg_result", "done") and e["cmd_id"] in lost_ids]
 
 
+class _FakeClock:
+    """執行緒安全的假時鐘：只由測試端推進，供 BgResultTracker 的 clock= 注入。
+
+    `read_seen` 在任一執行緒讀取時置位，讓測試能確認第五筆已記下 started，才推進時間。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._now = 0.0
+        self.read_seen = threading.Event()
+
+    def __call__(self) -> float:
+        with self._lock:
+            self.read_seen.set()
+            return self._now
+
+    def advance(self, dt: float) -> None:
+        with self._lock:
+            self._now += dt
+
+
 @pytest.mark.memory_only
 def test_bg_pending_bounded_backpressure(tmp_path):
     sw = _ScriptedSw()
     for cid in ("c1", "c2", "c3", "c4", "c5"):
         sw.set(cid, _running())
-    tracker = longrun.BgResultTracker(sw, _elog(tmp_path), pending_max=4)
+    # Windows 的 time.monotonic 解析度約 15.6 ms，故注入假時鐘以確定性量測等待時間。
+    clock = _FakeClock()
+    tracker = longrun.BgResultTracker(sw, _elog(tmp_path), pending_max=4, clock=clock)
     stop = threading.Event()
     for cid in ("c1", "c2", "c3", "c4"):
         tracker.add(cid, source="agent:rhw0", com="COM0", round_=1, stop=stop)
@@ -432,10 +455,13 @@ def test_bg_pending_bounded_backpressure(tmp_path):
         tracker.add("c5", source="agent:rhw0", com="COM0", round_=1, stop=stop)
         fifth_done.set()
 
+    clock.read_seen.clear()
     th = threading.Thread(target=_fifth, daemon=True)
     th.start()
+    assert clock.read_seen.wait(2.0)  # 第五筆已在 add 內讀取 started，之後才推進假時鐘
     time.sleep(0.2)
     assert not fifth_done.is_set()  # 滿載時 add 阻塞（測試端背壓）
+    clock.advance(0.25)  # 模擬等待 0.25 s；tracker 只透過注入的假時鐘量測
     sw.set("c1", _done())
     tracker.poll_once()  # c1 終態 → 移出 pending，騰出位置
     assert fifth_done.wait(2.0)
@@ -444,7 +470,7 @@ def test_bg_pending_bounded_backpressure(tmp_path):
     assert tracker.max_pending_seen <= 4
     assert tracker.pending_count() <= 4
     bp = [e for e in _events(tmp_path) if e["kind"] == "bg_backpressure"]
-    assert len(bp) == 1 and bp[0]["wait_s"] >= 0.2
+    assert len(bp) == 1 and bp[0]["wait_s"] == pytest.approx(0.25)
 
     for cid in ("c2", "c3", "c4", "c5"):
         sw.set(cid, _done())
