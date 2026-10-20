@@ -28,7 +28,7 @@
 
 ## 建立與啟動 throwaway 工作
 
-1. 從 repo 根目錄在 Windows PowerShell 建立 Python 基線 bundle；若 PyInstaller 已存在就不安裝或升級。若缺少，才裝入 Python 3.12 的使用者 site，使用 2025-08-03 發布的 PyInstaller 6.15.0。
+1. 從 repo 根目錄在 PowerShell 7（`pwsh.exe`）建立 Python 基線 bundle；`build_windows.ps1` 的 exe smoke-test 參數 `--help` 在 Windows PowerShell 5.1 會觸發 parser error。若 PyInstaller 已存在就不安裝或升級；若缺少，才裝入 Python 3.12 的使用者 site，使用 2025-08-03 發布的 PyInstaller 6.15.0。
 
     $repoRoot = (Get-Location).Path
     $env:PYTHONDONTWRITEBYTECODE = "1"
