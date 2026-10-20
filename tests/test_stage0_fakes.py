@@ -110,3 +110,46 @@ def test_junit_summary_records_exit_and_duplicates(tmp_path):   # R5-F3：summar
     assert s["duplicates"] == ["tests/test_a.py::t1"] and [k["nodeid"] for k in s["skipped"]] == ["tests/test_a.py::t2"]
     assert js.summarize(x, pytest_exit=2, require_native=False)["rc"] == 2
     assert js.summarize(tmp_path / "missing.xml", pytest_exit=0, require_native=False)["finished"] is False
+
+
+@pytest.mark.core_portable
+def test_junit_summary_rc5_only_for_native_or_com_skips(tmp_path):
+    """計畫 02 T01 step 8：只有 windows_native（或 windows_com 證據）項目被 skip 才回 5；
+    core_portable 的能力型 skip（缺 re2、缺 TxRx 短接埠）不影響原生證據判定。
+    無 resource-report 可判定 marker 時維持嚴格（任何 skip → 5），不得因缺資料而放寬。"""
+    import json as _json
+
+    p = Path(__file__).resolve().parents[1] / "scripts" / "stage0" / "junit_summary.py"
+    spec = importlib.util.spec_from_file_location("junit_summary", p)
+    js = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(js)
+    x = tmp_path / "j.xml"
+    x.write_text('<testsuites><testsuite tests="2" failures="0" errors="0" skipped="1">'
+                 '<testcase classname="tests.test_a" name="t1"/>'
+                 '<testcase classname="tests.test_a" name="t2"><skipped message="cap"/></testcase>'
+                 '</testsuite></testsuites>', encoding="utf-8")
+
+    def report(native_skipped: int, com_skipped: int) -> Path:
+        r = tmp_path / f"rr-{native_skipped}-{com_skipped}.json"
+        r.write_text(_json.dumps({
+            "counts": {"core_portable": {"failed": 0, "passed": 1, "skipped": 1},
+                       "windows_native": {"failed": 0, "passed": 0, "skipped": native_skipped},
+                       "posix_only": {"failed": 0, "passed": 0, "skipped": 0}},
+            "resources": {"windows_com": {"failed": 0, "passed": 0, "skipped": com_skipped}},
+        }), encoding="utf-8")
+        return r
+
+    # 只有 core_portable 能力型 skip → 不回 5
+    assert js.summarize(x, pytest_exit=0, require_native=True, resource_report=report(0, 0))["rc"] == 0
+    # windows_native 項目被 skip → 5
+    assert js.summarize(x, pytest_exit=0, require_native=True, resource_report=report(1, 0))["rc"] == 5
+    # windows_com 證據項目被 skip → 5
+    assert js.summarize(x, pytest_exit=0, require_native=True, resource_report=report(0, 1))["rc"] == 5
+    # 無 resource-report（或檔案不存在／毀損）→ 維持嚴格
+    assert js.summarize(x, pytest_exit=0, require_native=True)["rc"] == 5
+    assert js.summarize(x, pytest_exit=0, require_native=True, resource_report=tmp_path / "nope.json")["rc"] == 5
+    bad = tmp_path / "bad.json"
+    bad.write_text("{", encoding="utf-8")
+    assert js.summarize(x, pytest_exit=0, require_native=True, resource_report=bad)["rc"] == 5
+    # require_native 關閉時不受影響
+    assert js.summarize(x, pytest_exit=0, require_native=False, resource_report=report(1, 1))["rc"] == 0

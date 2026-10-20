@@ -37,11 +37,25 @@ def _nodeid(classname: str, name: str) -> str:
     return "::".join([module_path, *class_parts, name])
 
 
+def _native_skip_count(resource_report: str | Path | None) -> int | None:
+    """回傳 windows_native 平台與 windows_com 資源的 skip 數；無法判定時回 None。"""
+    if resource_report is None:
+        return None
+    try:
+        data = json.loads(Path(resource_report).read_text(encoding="utf-8"))
+        native = int(data["counts"]["windows_native"]["skipped"])
+        com = int(data.get("resources", {}).get("windows_com", {}).get("skipped", 0))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return native + com
+
+
 def summarize(
     junit: str | Path,
     *,
     pytest_exit: int,
     require_native: bool,
+    resource_report: str | Path | None = None,
 ) -> dict[str, Any]:
     """解析收集、結果、skip、重複 nodeid 與最終退出碼。"""
     path = Path(junit)
@@ -82,8 +96,11 @@ def summarize(
     if not finished and rc == 0:
         rc = 4
     elif finished and require_native and skipped and rc == 0:
-        # 呼叫端以 -m windows_native 或 windows_com 執行時，任何 skip 都表示原生證據不完整。
-        rc = 5
+        # 計畫 02 T01 step 8：只有 windows_native（或 windows_com 證據）項目被 skip 才回 5。
+        # 判定 marker 需 resource-report；無法取得或無法解析時維持嚴格（任何 skip 都視為原生證據不完整）。
+        native_skips = _native_skip_count(resource_report)
+        if native_skips is None or native_skips > 0:
+            rc = 5
 
     return {
         "collected": collected,
@@ -102,6 +119,7 @@ def main() -> int:
     parser.add_argument("--junit", type=Path, required=True)
     parser.add_argument("--pytest-exit", type=int, required=True)
     parser.add_argument("--require-native", action="store_true")
+    parser.add_argument("--resource-report", type=Path, default=None)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
@@ -109,6 +127,7 @@ def main() -> int:
         args.junit,
         pytest_exit=args.pytest_exit,
         require_native=args.require_native,
+        resource_report=args.resource_report,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(

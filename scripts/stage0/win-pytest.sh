@@ -369,6 +369,10 @@ summary_args=(
 )
 if [[ "$require_native" == "1" ]]; then
     summary_args+=(--require-native)
+    # 以 resource-report 判定被 skip 的是否為 windows_native／windows_com 項目（計畫 02 T01 step 8）
+    if [[ -f "$run_dir/resource-report.json" ]]; then
+        summary_args+=(--resource-report "$run_dir/resource-report.json")
+    fi
 fi
 if python3 "$repo/scripts/stage0/junit_summary.py" "${summary_args[@]}"; then
     final_rc=0
