@@ -83,6 +83,8 @@
    - state/run/config/profiles/WAL/log/data/events/events-runtime/by-id/by-path 均在 `%LOCALAPPDATA%\sw-throwaway\<run_id>\` 內；`SERIALWRAP_ENDPOINT` 與 `SERIALWRAP_SOCKET` 指向同一個 run 專屬 loopback port，且不是 48700。
    - `SERIALWRAP_TEST_DEVICE_ALLOWLIST=COM24`，值只能是明確允許的 COM24。Launcher 會先清除所有繼承的 `SERIALWRAP_*` 變數，再只套用列出的隔離設定。
 
+   Windows Python-baseline bundle 的唯讀 `daemon status` 在 owner host 實測超過一般 5 秒 RPC timeout；初始查詢與輪詢都明確使用 `--timeout 30`。這只延長 CLI 等待 RPC 回覆的時間，不改變查詢內容或端點。
+
 3. 確認 run id 尚未使用後才註冊。註冊會建立該 run 專屬目錄與 launcher，不會覆寫既有目錄或同名工作：
 
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\stage0\win-task-throwaway.ps1 -RunId $runId -Hours 73 -Bundle $bundle -AllowCom COM24
@@ -96,7 +98,7 @@
     $cli = Join-Path $bundle "serialwrap.exe"
     $port = 49152 + ([Convert]::ToInt32($runId.Substring($runId.Length - 6), 16) % 16384)
     $endpoint = "tcp://127.0.0.1:$port"
-    $statusOutput = & $cli --endpoint $endpoint daemon status
+    $statusOutput = & $cli --endpoint $endpoint --timeout 30 daemon status
     $statusExit = $LASTEXITCODE
     $initialStatus = $statusOutput | ConvertFrom-Json
     if ($statusExit -ne 0 -or -not $initialStatus.ok -or -not $initialStatus.test_device_allowlist.enabled -or
@@ -122,7 +124,7 @@
     $stopAt = [DateTime]::Parse($StopAtUtc).ToUniversalTime()
     while ([DateTime]::UtcNow -lt $stopAt) {
       $started = [DateTime]::UtcNow
-      $output = (& $Cli --endpoint $Endpoint daemon status 2>&1 | Out-String).Trim()
+      $output = (& $Cli --endpoint $Endpoint --timeout 30 daemon status 2>&1 | Out-String).Trim()
       $row = [ordered]@{ observed_at = $started.ToString("o"); endpoint = $Endpoint; exit_code = $LASTEXITCODE; output = $output }
       (ConvertTo-Json -InputObject $row -Compress) | Add-Content -LiteralPath $Log -Encoding UTF8
       $wait = 300 - [int]([DateTime]::UtcNow - $started).TotalSeconds
