@@ -200,6 +200,15 @@ cases:
   artifact: rust-cli-bundle
   tests:
   - sw-cli::p4_case_placeholders::sc25_release_manifest_version_pairing
+  - sw-cli::mgmt_doctor::version_pairing_daemon_down_is_unreachable
+  - sw-cli::mgmt_doctor::version_pairing_mismatch_detail
+  - sw-cli::mgmt_doctor::version_pairing_invalid_manifest
+  - sw-cli::mgmt_doctor::version_pairing_unreadable_manifest
+  - sw-cli::mgmt_doctor::version_pairing_parse_only_optional_field_key
+  - sw-cli::mgmt_doctor::version_pairing_schema_version_float_one_is_valid
+  - sw-cli::mgmt_doctor::python_runtime_missing_manifest
+  - tests/contract_blackbox/test_cli_mgmt_doctor.py::test_doctor_ab_shared_checks
+  - tests/contract_blackbox/test_cli_mgmt_doctor.py::test_doctor_ab_version_pairing_in_bundle
   evidence: target/p4-evidence/sc25-release-manifest-version-pairing.json
   necessity: required
   skip_registered:

@@ -73,7 +73,8 @@ fn expected_digest<'a>(m: &'a ReleaseManifest, path: &str) -> Option<&'a str> {
     })
 }
 
-fn safe_component_path(value: &str) -> bool {
+/// bundle 內相對路徑的安全檢查（拒絕空值、絕對路徑、磁碟機代號與 `..`）；doctor 執行 runtime 前共用。
+pub(crate) fn safe_component_path(value: &str) -> bool {
     let normalized = value.replace('\\', "/");
     let bytes = normalized.as_bytes();
     let windows_drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';

@@ -1,10 +1,27 @@
 //! P4-T13 `doctor` 全部檢查原生與 version_pairing（SC-25）失敗測試。
 mod support;
 
+use std::time::Duration;
+
 use support::*;
+use sw_cli::doctor_cmd::{PYSERIAL_CODE, PYYAML_CODE, PY_VERSION_CODE};
 use sw_pal::fakes::FakeRegistry;
 use sw_pal::proc_scan::{DaemonProc, ProcIdentity};
+use sw_pal::PalErrorKind;
 use sw_proto::pyjson::{PyDict, PyValue};
+
+/// 固定修復提示（07 §7.3／Task 13 步驟 1：runtime 無法定位或無法執行）。
+const FIX_REINSTALL: &str = "重新安裝發佈組合（serialwrap setup）";
+
+/// 測試用 daemon runtime 絕對 argv 首項（與 doctor 執行時一致）。
+fn runtime_path(t: &TestEnv) -> String {
+    t.bundle_dir()
+        .join("py")
+        .join("bin")
+        .join("python3")
+        .to_string_lossy()
+        .into_owned()
+}
 
 trait PyDictExt {
     fn contains_key(&self, k: &str) -> bool;
@@ -85,7 +102,7 @@ fn find_check<'a>(doc: &'a PyValue, name: &str) -> &'a PyDict {
 
 #[test]
 fn linux_check_order_and_advisory_stamp() {
-    let t = TestEnv::posix().with_manifest_runtime_ok("3.12.7");
+    let t = TestEnv::posix().with_doctor_bundle("3.12.7");
     let (rc, out, _) = t.run(&["doctor"]);
     assert_eq!(rc, 0);
     let doc = json(&out);
@@ -125,7 +142,8 @@ fn linux_check_order_and_advisory_stamp() {
             assert_eq!(s(d, "fix"), "");
         }
         if s(d, "check") == "version_pairing" {
-            assert!(!d.contains_key("fix") && d.contains_key("mismatches"));
+            // 與 Python 基線（sw_core/doctor_cmd.py `_check_version_pairing`）相同：version_pairing 帶 fix（ok 時為 ""）。
+            assert!(d.contains_key("fix") && d.contains_key("mismatches"));
         }
     }
 }
@@ -133,13 +151,13 @@ fn linux_check_order_and_advisory_stamp() {
 #[test]
 fn overall_ok_ignores_advisory_failures_only() {
     let t = TestEnv::posix()
-        .with_manifest_runtime_ok("3.12.7")
+        .with_doctor_bundle("3.12.7")
         .all_required_ok()
         .with_which_missing("jq");
     let doc1 = json(&t.run(&["doctor"]).1);
     assert!(b(&doc1, "ok"));
     let t2 = TestEnv::posix()
-        .with_manifest_runtime_ok("3.12.7")
+        .with_doctor_bundle("3.12.7")
         .all_required_ok()
         .without_group("dialout");
     let doc2 = json(&t2.run(&["doctor"]).1);
@@ -148,7 +166,10 @@ fn overall_ok_ignores_advisory_failures_only() {
 
 #[test]
 fn windows_check_order() {
-    let t = TestEnv::windows().with_manifest_runtime_ok("3.12.7");
+    // devices（Windows）需要 SERIALCOMM 登錄檢視；未配置時替身會 panic（support 契約），此處給空登錄。
+    let t = TestEnv::windows()
+        .with_fake_registry(FakeRegistry::new(vec![], &[]))
+        .with_doctor_bundle("3.12.7");
     let (rc, out, _) = t.run(&["doctor"]);
     assert_eq!(rc, 0);
     let doc = json(&out);
@@ -182,7 +203,8 @@ fn windows_check_order() {
             assert_eq!(s(d, "fix"), "");
         }
         if s(d, "check") == "version_pairing" {
-            assert!(!d.contains_key("fix") && d.contains_key("mismatches"));
+            // 與 Python 基線（sw_core/doctor_cmd.py `_check_version_pairing`）相同：version_pairing 帶 fix（ok 時為 ""）。
+            assert!(d.contains_key("fix") && d.contains_key("mismatches"));
         }
     }
 }
@@ -217,6 +239,16 @@ fn other_installs_multi_versions_differ() {
         s(check, "detail"),
         "/a/serialwrap=serialwrap 0.3.2；/b/serialwrap=serialwrap 0.4.0"
     );
+    // `--version` 探測為固定 2.0 s（不讀 --timeout／--retries）。
+    let version_timeouts: Vec<_> = t
+        .calls()
+        .iter()
+        .zip(t.sysenv_timeouts())
+        .filter(|(argv, _)| argv.last().map(String::as_str) == Some("--version"))
+        .map(|(_, timeout)| timeout)
+        .collect();
+    assert_eq!(version_timeouts.len(), 2);
+    assert!(version_timeouts.iter().all(|timeout| *timeout == Some(Duration::from_secs(2))));
 }
 
 #[test]
@@ -272,7 +304,8 @@ fn endpoint_reachable_tcp_always_alive_posix() {
         }],
     };
     let t = TestEnv::posix()
-        .with_config("socket: tcp://127.0.0.1:1\n")
+        // runtime config 的鍵為 socket_path（runtime_config.py `socket_path()`）；原 fixture 寫成 socket 而未被讀取。
+        .with_config("socket_path: tcp://127.0.0.1:1\n")
         .with_procs(vec![p1]);
     let (rc, out, _) = t.run(&["doctor"]);
     assert_eq!(rc, 0);
@@ -477,7 +510,7 @@ fn python_runtime_missing_manifest() {
 
 #[test]
 fn version_pairing_daemon_down_is_unreachable() {
-    let t = TestEnv::posix().with_manifest_runtime_ok("3.12.7");
+    let t = TestEnv::posix().with_doctor_bundle("3.12.7");
     let (rc, out, _) = t.run(&["doctor"]);
     assert_eq!(rc, 0);
     let doc = json(&out);
@@ -499,9 +532,10 @@ fn version_pairing_daemon_down_is_unreachable() {
 
 #[test]
 fn version_pairing_mismatch_detail() {
-    let t = TestEnv::posix().with_manifest_runtime_ok("3.12.7");
+    let t = TestEnv::posix().with_doctor_bundle("3.12.7");
     let ep = t.default_socket();
-    let t = t.with_rpc_ok(&ep, "health.status", r#"{"ok":true,"version":"0.3.2"}"#);
+    // 與 CLI 版本（workspace 0.3.2）不同的舊版本，確保只產生 daemon_version 不符。
+    let t = t.with_rpc_ok(&ep, "health.status", r#"{"ok":true,"version":"0.2.9"}"#);
     let (rc, out, _) = t.run(&["doctor"]);
     assert_eq!(rc, 0);
     let doc = json(&out);
@@ -521,7 +555,14 @@ fn version_pairing_mismatch_detail() {
 #[test]
 fn version_pairing_invalid_manifest() {
     let t = TestEnv::posix();
-    let bad_manifest = r#"{"schema_version":1,"bundle_version":"test","stage":"rust-1b-test"}"#;
+    // 完整 manifest 但缺 `pairing`（計畫 Task 13 表列案例）；Python 基線依 _REQUIRED 順序回報第一個缺漏鍵。
+    let full = manifest_fixture(sw_cli::CLI_VERSION, &"0".repeat(64));
+    let mut root = match json(&full) {
+        PyValue::Dict(d) => d,
+        other => panic!("manifest 應為物件：{other:?}"),
+    };
+    root.0.shift_remove("pairing");
+    let bad_manifest = sw_proto::pyjson::dumps_dict(&root, &sw_proto::pyjson::DISK_STABLE);
     t.write_file(
         &t.bundle_dir().join("release-manifest.json"),
         bad_manifest.as_bytes(),
@@ -540,6 +581,188 @@ fn version_pairing_invalid_manifest() {
         })
         .collect();
     assert!(mismatches.is_empty());
+}
+
+#[test]
+fn pyyaml_import_failure_is_not_installed_with_fix() {
+    // runtime 存在、可執行但匯入失敗（rc≠0）：07 §7.3 的 未安裝 與 安裝 PyYAML 提示。
+    let t = TestEnv::posix().with_doctor_bundle_except("3.12.7", &[PYYAML_CODE]);
+    let rt = runtime_path(&t);
+    let t = t.with_command(&[rt.as_str(), "-I", "-c", PYYAML_CODE], 1, "", "ModuleNotFoundError: yaml");
+    let (rc, out, _) = t.run(&["doctor"]);
+    assert_eq!(rc, 0);
+    let doc = json(&out);
+    let check = find_check(&doc, "pyyaml");
+    assert!(!b(check, "ok"));
+    assert_eq!(s(check, "detail"), "未安裝");
+    assert_eq!(s(check, "fix"), "安裝 PyYAML（pipx 安裝會自動帶入）");
+}
+
+#[test]
+fn windows_pyserial_import_failure_is_not_installed_with_fix() {
+    let t = TestEnv::windows()
+        .with_fake_registry(FakeRegistry::new(vec![], &[]))
+        .with_doctor_bundle_except("3.12.7", &[PYSERIAL_CODE]);
+    let rt = runtime_path(&t);
+    let t = t.with_command(&[rt.as_str(), "-I", "-c", PYSERIAL_CODE], 1, "", "ModuleNotFoundError: serial");
+    let (rc, out, _) = t.run(&["doctor"]);
+    assert_eq!(rc, 0);
+    let doc = json(&out);
+    let check = find_check(&doc, "pyserial");
+    assert!(!b(check, "ok"));
+    assert_eq!(s(check, "detail"), "未安裝");
+    assert_eq!(
+        s(check, "fix"),
+        "安裝 pyserial（pipx 於 Windows 自動帶入；release exe 已內嵌）"
+    );
+}
+
+#[test]
+fn python_runtime_nonzero_rc_is_unrunnable() {
+    let t = TestEnv::posix().with_doctor_bundle_except("3.12.7", &[PY_VERSION_CODE]);
+    let rt = runtime_path(&t);
+    let t = t.with_command(&[rt.as_str(), "-I", "-c", PY_VERSION_CODE], 2, "", "boom");
+    let (rc, out, _) = t.run(&["doctor"]);
+    assert_eq!(rc, 0);
+    let doc = json(&out);
+    let check = find_check(&doc, "python");
+    assert!(!b(check, "ok"));
+    assert_eq!(s(check, "detail"), "無法執行 daemon Python runtime（rc=2）");
+    assert_eq!(s(check, "fix"), FIX_REINSTALL);
+}
+
+#[test]
+fn runtime_spawn_error_is_unrunnable_not_not_installed() {
+    // spawn 失敗屬「無法執行」，不是「未安裝」（後者只指 runtime 有跑且匯入失敗）。
+    let t = TestEnv::posix().with_doctor_bundle_except("3.12.7", &[PYYAML_CODE]);
+    let rt = runtime_path(&t);
+    let t = t.with_command_err(&[rt.as_str(), "-I", "-c", PYYAML_CODE], PalErrorKind::NotFound, "no such file");
+    let (rc, out, _) = t.run(&["doctor"]);
+    assert_eq!(rc, 0);
+    let doc = json(&out);
+    let check = find_check(&doc, "pyyaml");
+    assert!(!b(check, "ok"));
+    assert!(s(check, "detail").starts_with("無法執行 daemon Python runtime（"));
+    assert_eq!(s(check, "fix"), FIX_REINSTALL);
+}
+
+#[test]
+fn runtime_timeout_is_unrunnable_not_not_installed() {
+    let t = TestEnv::posix().with_doctor_bundle_except("3.12.7", &[PYYAML_CODE]);
+    let rt = runtime_path(&t);
+    let t = t.with_command(&[rt.as_str(), "-I", "-c", PYYAML_CODE], -1, "", "TIMEOUT");
+    let (rc, out, _) = t.run(&["doctor"]);
+    assert_eq!(rc, 0);
+    let doc = json(&out);
+    let check = find_check(&doc, "pyyaml");
+    assert!(!b(check, "ok"));
+    assert_eq!(s(check, "detail"), "無法執行 daemon Python runtime（逾時（5 s））");
+    assert_eq!(s(check, "fix"), FIX_REINSTALL);
+}
+
+#[test]
+fn version_pairing_unreadable_manifest() {
+    // 位元組非 UTF-8：Python `load_release_manifest` 為 unreadable（非「找不到」）。
+    let t = TestEnv::posix();
+    t.write_file(
+        &t.bundle_dir().join("release-manifest.json"),
+        &[0xffu8, 0xfe, b'{', b'}'],
+    );
+    let (rc, out, _) = t.run(&["doctor"]);
+    assert_eq!(rc, 0);
+    let doc = json(&out);
+    let check = find_check(&doc, "version_pairing");
+    assert!(!b(check, "ok"));
+    assert_eq!(s(check, "detail"), "invalid release manifest: unreadable");
+    assert!(list(check, "mismatches").is_empty());
+    let last = list(&doc, "checks").last().expect("checks 非空").as_dict();
+    assert_eq!(s(last, "check"), "version_pairing");
+}
+
+#[test]
+fn version_pairing_parse_only_optional_field_key() {
+    // 結構驗證通過、僅 sw_proto 嚴格解析拒絕的可選欄位：回報該欄位 key，不得為 unreadable。
+    let t = TestEnv::posix();
+    let manifest = manifest_fixture(sw_cli::CLI_VERSION, &"0".repeat(64)).replacen(
+        "\"task_xml_template_sha256\":\"",
+        "\"task_xml_template_sha256\":\"ZZ",
+        1,
+    );
+    t.write_file(&t.bundle_dir().join("release-manifest.json"), manifest.as_bytes());
+    let (rc, out, _) = t.run(&["doctor"]);
+    assert_eq!(rc, 0);
+    let doc = json(&out);
+    let check = find_check(&doc, "version_pairing");
+    assert!(!b(check, "ok"));
+    assert_eq!(
+        s(check, "detail"),
+        "invalid release manifest: components.supervisor.task_xml_template_sha256"
+    );
+    assert!(list(check, "mismatches").is_empty());
+}
+
+#[test]
+fn version_pairing_schema_version_float_one_is_valid() {
+    // Python 基線接受 schema_version 1.0；doctor 不得回報 invalid（其餘 mismatch 來自測試 manifest 的零摘要）。
+    let t = TestEnv::posix();
+    let manifest = manifest_fixture(sw_cli::CLI_VERSION, &"0".repeat(64)).replacen(
+        "\"schema_version\":1,",
+        "\"schema_version\":1.0,",
+        1,
+    );
+    assert!(manifest.contains("\"schema_version\":1.0,"));
+    t.write_file(&t.bundle_dir().join("release-manifest.json"), manifest.as_bytes());
+    let (rc, out, _) = t.run(&["doctor"]);
+    assert_eq!(rc, 0);
+    let doc = json(&out);
+    let check = find_check(&doc, "version_pairing");
+    assert!(!s(check, "detail").starts_with("invalid release manifest"));
+}
+
+#[test]
+fn runtime_path_outside_bundle_is_not_executed() {
+    // 絕對路徑 runtime 不得被執行（與 pairing 的 bundle 內相對路徑限制一致）。
+    let t = TestEnv::posix();
+    let manifest = manifest_fixture(sw_cli::CLI_VERSION, &"0".repeat(64)).replacen(
+        "\"runtime\":{\"path\":\"py/bin/python3\"",
+        "\"runtime\":{\"path\":\"/usr/bin/python3\"",
+        1,
+    );
+    assert!(manifest.contains("/usr/bin/python3"));
+    t.write_file(&t.bundle_dir().join("release-manifest.json"), manifest.as_bytes());
+    let (rc, out, _) = t.run(&["doctor"]);
+    assert_eq!(rc, 0);
+    let doc = json(&out);
+    let py = find_check(&doc, "python");
+    assert!(!b(py, "ok"));
+    assert_eq!(
+        s(py, "detail"),
+        "無法定位 daemon Python runtime（invalid release manifest: components.daemon.runtime.path）"
+    );
+    assert!(!t
+        .calls()
+        .iter()
+        .any(|argv| argv.first().map(String::as_str) == Some("/usr/bin/python3")));
+}
+
+#[test]
+fn doctor_ignores_timeout_and_retries() {
+    // doctor 的固定逾時（health.status 0.5 s、runtime 5 s、--version 2 s）不讀 --timeout／--retries（01 §4.6）。
+    let t = TestEnv::posix().with_doctor_bundle("3.12.7");
+    let (rc, _out, _) = t.run(&["--timeout", "99", "--retries", "5", "doctor"]);
+    assert_eq!(rc, 0);
+    let rpc = t.rpc().timeouts_s();
+    assert!(!rpc.is_empty());
+    assert!(rpc.iter().all(|seconds| (seconds - 0.5).abs() < 1e-9), "health.status 逾時應為 0.5 s：{rpc:?}");
+    let runtime_timeouts: Vec<_> = t
+        .calls()
+        .iter()
+        .zip(t.sysenv_timeouts())
+        .filter(|(argv, _)| argv.get(1).map(String::as_str) == Some("-I"))
+        .map(|(_, timeout)| timeout)
+        .collect();
+    assert!(!runtime_timeouts.is_empty());
+    assert!(runtime_timeouts.iter().all(|timeout| *timeout == Some(Duration::from_secs(5))));
 }
 
 #[test]

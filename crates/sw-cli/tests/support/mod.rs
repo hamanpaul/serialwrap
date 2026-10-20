@@ -343,6 +343,45 @@ impl TestEnv {
         self
     }
 
+    /// P4-T13 `doctor` 用：完整 release manifest（`write_complete_bundle`，bundle_version＝CLI 版本，`pairing` 與各 digest 一致）
+    /// 與 daemon runtime 的 `-I -c` 查詢腳本（argv 逐字取自 `doctor_cmd` 的常數；`pyver` 為 `python` 檢查的輸出）。
+    /// 不啟動 daemon；daemon 版本由呼叫端以 `with_rpc_ok` 另行註冊。
+    pub fn with_doctor_bundle(self, pyver: &str) -> Self {
+        self.with_doctor_bundle_except(pyver, &[])
+    }
+
+    /// 同 `with_doctor_bundle`，但 `skip` 列出的 `-c` 查詢不註冊預設成功腳本（由呼叫端以 `with_command*` 自行腳本化；
+    /// 同 argv 的腳本是累加佇列，不能以後註冊覆寫先註冊者）。
+    pub fn with_doctor_bundle_except(self, pyver: &str, skip: &[&str]) -> Self {
+        let windows = self.windows;
+        let target = if windows { "x86_64-pc-windows-gnu" } else { "x86_64-unknown-linux-gnu" };
+        write_complete_bundle(&self.bundle_dir(), sw_cli::CLI_VERSION, target, windows, &[], &[]);
+        let runtime = self
+            .bundle_dir()
+            .join("py")
+            .join("bin")
+            .join("python3")
+            .to_string_lossy()
+            .into_owned();
+        let rt = runtime.as_str();
+        let mut env = self;
+        if !skip.contains(&sw_cli::doctor_cmd::PY_VERSION_CODE) {
+            env = env.with_command(&[rt, "-I", "-c", sw_cli::doctor_cmd::PY_VERSION_CODE], 0, &format!("{pyver}\n"), "");
+        }
+        if !skip.contains(&sw_cli::doctor_cmd::PYYAML_CODE) {
+            env = env.with_command(&[rt, "-I", "-c", sw_cli::doctor_cmd::PYYAML_CODE], 0, "6.0.1\n", "");
+        }
+        if !skip.contains(&sw_cli::doctor_cmd::PYSERIAL_CODE) {
+            env = env.with_command(&[rt, "-I", "-c", sw_cli::doctor_cmd::PYSERIAL_CODE], 0, "3.5\n", "");
+        }
+        env
+    }
+
+    /// 每次 `run`／`run_raw` 的逾時參數（與 `calls()` 平行）。
+    pub fn sysenv_timeouts(&self) -> Vec<Option<std::time::Duration>> {
+        self.env.timeouts()
+    }
+
     /// `(ep, method)` 的單一成功回應（`FakeRpcConnector::respond`）。
     pub fn with_rpc_ok(self, ep: &str, method: &str, line: &str) -> Self {
         self.rpc.respond(&self.isolated_endpoint(ep), method, line);

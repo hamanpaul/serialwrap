@@ -27,6 +27,7 @@ pub fn dispatch(ctx: &mut CliCtx, ns: &Namespace) -> i32 {
         ["benches"] => return benches_cmd::run_benches(ns, ctx),
         ["skill"] => return skill_cmd::run_skill(ctx, ns),
         ["service"] => return service_cmd::run_service(ns, ctx),
+        ["doctor"] => return crate::doctor_cmd::run_doctor_cmd(ns, ctx),
         ["supervision-mode"] => return supervision_cmd::run_supervision_mode(ns, ctx),
         ["profile", "test"] => return profile_cmd::run_profile_test(ctx, ns),
         ["cmd", "submit"] => {
