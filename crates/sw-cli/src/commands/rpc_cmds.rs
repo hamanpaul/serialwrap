@@ -7,6 +7,7 @@
 use crate::argparse::{ArgValue, Namespace};
 use crate::cli_trace::{format_trace_line, resolve_cli_trace_level, trace_enabled};
 use crate::client::{self, ClientCrash};
+use crate::commands::daemon_cmd::{self, AutostartDecision};
 use crate::ctx::CliCtx;
 use crate::endpoint_resolve::{
     print_endpoint_resolution_error, resolve_endpoint_info, EndpointArgs, ResolveFailure,
@@ -264,20 +265,72 @@ pub fn run_rpc(ctx: &mut CliCtx, ns: &Namespace, method: &str, params: PyValue) 
         _ => PyInt::Small(0),
     };
     let level = resolve_cli_trace_level(ctx.verbose, ctx.env.get("SERIALWRAP_LOG_LEVEL"));
-    let outcome = match client::rpc_call(
-        ctx.p,
+    let (mut outcome, failure) = match client::call_with_failure(
+        ctx,
         &resolved.endpoint,
         method,
         &params,
-        1,
         timeout_s,
         &retries,
     ) {
-        Ok(outcome) => outcome,
+        Ok(result) => result,
         Err(ClientCrash::InvalidTimeout(message)) | Err(ClientCrash::EncodeError(message)) => {
             return internal_error(ctx, &message);
         }
     };
+
+    match daemon_cmd::maybe_autostart_on_demand(
+        ctx,
+        method,
+        &resolved,
+        failure.as_ref(),
+        &outcome.resp,
+    ) {
+        AutostartDecision::Started { pid } => {
+            let _ = ctx.io.err_str(&format!(
+                "serialwrap: on-demand：預設 endpoint {} 沒有 daemon，已自動啟動（pid={pid}）\n",
+                resolved.endpoint
+            ));
+            match client::call(
+                ctx,
+                &resolved.endpoint,
+                method,
+                &params,
+                timeout_s,
+                &PyInt::Small(0),
+            ) {
+                Ok(retry) => outcome = retry,
+                Err(ClientCrash::InvalidTimeout(message) | ClientCrash::EncodeError(message)) => {
+                    return internal_error(ctx, &message);
+                }
+            }
+        }
+        AutostartDecision::AlreadyUp => {
+            match client::call(
+                ctx,
+                &resolved.endpoint,
+                method,
+                &params,
+                timeout_s,
+                &PyInt::Small(0),
+            ) {
+                Ok(retry) => outcome = retry,
+                Err(ClientCrash::InvalidTimeout(message) | ClientCrash::EncodeError(message)) => {
+                    return internal_error(ctx, &message);
+                }
+            }
+        }
+        AutostartDecision::Failed(failure) => {
+            let code = match failure.get("error_code") {
+                Some(PyValue::Str(value)) => value.as_str(),
+                _ => ErrorCode::InternalError.as_str(),
+            };
+            let _ = ctx
+                .io
+                .err_str(&format!("serialwrap: on-demand 自動啟動失敗: {code}\n"));
+        }
+        AutostartDecision::NotApplicable => {}
+    }
 
     if trace_enabled(&level) {
         let line = format_trace_line(

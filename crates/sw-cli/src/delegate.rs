@@ -5,8 +5,16 @@ use crate::output;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-/// 委派集合（arch §7.4、計畫 §0.3）；`cli_spec` 與 `run` 共用。
-pub const DELEGATED_GROUPS: [&str; 3] = ["daemon", "setup", "doctor"];
+/// Stage 1B 後委派集合為空；機制保留僅供緊急回退，回退須另登記 behavior change（arch §7.4、計畫 §0.3）。
+pub const DELEGATED_GROUPS: [&str; 0] = [];
+
+/// Stage 1B 後委派集合為空；機制保留僅供緊急回退，回退須另登記 behavior change。
+pub fn maybe_delegate(argv_tail: &[OsString]) -> Option<&'static str> {
+    match classify(argv_tail) {
+        Route::Delegate { group } => Some(group),
+        Route::Native => None,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Route {
@@ -16,6 +24,14 @@ pub enum Route {
 
 /// 在任何有損 UTF-8 轉換之前執行：逐 token 以 `to_str()` 比對選項與群組名。
 pub fn classify(argv_tail: &[OsString]) -> Route {
+    classify_with_groups(argv_tail, &DELEGATED_GROUPS)
+}
+
+/// 依指定的群組清單分類命令列（供委派機制測試與測試注入使用）。
+pub fn classify_with_groups(argv_tail: &[OsString], groups: &[&'static str]) -> Route {
+    if groups.is_empty() {
+        return Route::Native;
+    }
     const VALUE_OPTIONS: [&str; 5] = [
         "--socket",
         "--endpoint",
@@ -32,9 +48,9 @@ pub fn classify(argv_tail: &[OsString]) -> Route {
             let Some(group) = argv_tail.get(index + 1).and_then(|value| value.to_str()) else {
                 return Route::Native;
             };
-            return if DELEGATED_GROUPS.contains(&group) {
+            return if groups.contains(&group) {
                 Route::Delegate {
-                    group: DELEGATED_GROUPS
+                    group: groups
                         .iter()
                         .copied()
                         .find(|item| *item == group)
@@ -59,9 +75,9 @@ pub fn classify(argv_tail: &[OsString]) -> Route {
             };
             continue;
         }
-        return if DELEGATED_GROUPS.contains(&token) {
+        return if groups.contains(&token) {
             Route::Delegate {
-                group: DELEGATED_GROUPS
+                group: groups
                     .iter()
                     .copied()
                     .find(|item| *item == token)

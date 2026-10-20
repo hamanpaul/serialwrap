@@ -1,15 +1,13 @@
 """P4-T14 終端類承接黑箱：`serialwrap-minicom` 以 Rust CLI 執行時的 attach／detach 行為。
 
 - wrapper 來源為 `sw_core/assets/tools/minicom_router.sh`（`setup` 物化的同一來源檔）。mgmt_bundle 不含物化結果，
-  因此本檔於 bundle 的 `bin/` 下複製為 `serialwrap-minicom`（比照 P4-T10 物化結果，不改動內容）。
+  因此本檔於 bundle 的 `bin/` 下物化為 `serialwrap-minicom`（比照 P4-T10 物化結果，不改動內容）。
 - minicom 以 `stubs/bin/minicom` 取代，只記錄 `-D <vtty>` 並依 `SW_STUB_MINICOM_HOLD_S` 停留。
 - daemon 一律在隔離 env（`SERIALWRAP_*` 目錄、HOME、XDG）內執行；socket 與 PTY 皆為測試專用。
 - 所有案例只在 Rust 輪執行（`rust_only`），並需要 POSIX PTY。
 
-紅燈階段：`test_minicom_wrapper_auto_start_daemon_on_demand` 依賴 Rust `daemon start`（P4-T7）與委派清空（P4-T14）；
-目前 `daemon start` 與 `supervision-mode` 仍委派，故以 `xfail(strict=True)` 標示。`attach_detach` 與
-`sigterm` 案例在 P3 原生 console-attach／console-detach 上已實測 PASS（wrapper 在 live daemon 已就緒時不呼叫
-`supervision-mode`），因此不標 xfail；它們是承接驗證，須附突變檢查（計畫 §0.1）。
+綠燈階段：P4-T14 終端承接已完成，包含 `attach_detach`、`sigterm` detach trap、以及經 Rust CLI
+`daemon start` 的 on-demand auto-start 端到端驗收。
 """
 from __future__ import annotations
 
@@ -17,6 +15,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -37,6 +36,9 @@ def _materialize_wrapper(bundle) -> Path:
     dst = bundle.materialized_bin / "serialwrap-minicom"
     shutil.copyfile(WRAPPER_SRC, dst)
     dst.chmod(0o755)
+    assert dst.is_file(), f"wrapper 未成功物化：{dst}"
+    assert dst.read_bytes() == WRAPPER_SRC.read_bytes(), "物化 wrapper 位元組與來源資產不一致"
+    assert (dst.stat().st_mode & 0o111) != 0, f"wrapper 缺少可執行權限：{oct(dst.stat().st_mode)}"
     return dst
 
 
@@ -117,11 +119,32 @@ def test_minicom_wrapper_sigterm_still_detaches(mgmt_bundle, live_daemon, env, s
     assert [c["client_id"] for c in after] == baseline, "detach 不得移除 daemon 既有 console"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="P4-T14 紅燈：daemon start／supervision-mode 仍委派 Python（P4-T7、P4-T14 未完成）",
-)
 def test_minicom_wrapper_auto_start_daemon_on_demand(mgmt_bundle, env, stub_path, stub_log, tmp_path):
+    from test_cli_mgmt_daemon import _foreign_serialwrapd_pids
+
+    if _foreign_serialwrapd_pids():
+        if not os.environ.get("SW_IN_PID_NS"):
+            unshare = shutil.which("unshare")
+            if unshare:
+                child_env = dict(os.environ)
+                child_env["SW_IN_PID_NS"] = "1"
+                cmd = [
+                    unshare,
+                    "-r",
+                    "-m",
+                    "-p",
+                    "-f",
+                    "--mount-proc",
+                    sys.executable,
+                    "-m",
+                    "pytest",
+                    "-q",
+                    f"{__file__}::test_minicom_wrapper_auto_start_daemon_on_demand",
+                ]
+                r = subprocess.run(cmd, env=child_env, capture_output=True, text=True)
+                assert r.returncode == 0, f"unshare 隔離執行失敗：\nstdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+                return
+        pytest.fail("宿主已有非測試 serialwrapd 且無 unshare 隔離能力（SC-10 多開預檢阻擋，無法取得 auto-start 證據）")
     _materialize_wrapper(mgmt_bundle)
     wrapper = mgmt_bundle.materialized_bin / "serialwrap-minicom"
     # DF-05 第二順位：與 CLI 同目錄的 serialwrapd。以 shim 指向本 repo 的 Python daemon（與 bb_harness.daemon_prefix 同源）。
@@ -155,4 +178,9 @@ def test_minicom_wrapper_auto_start_daemon_on_demand(mgmt_bundle, env, stub_path
         assert _minicom_clients(resp.get("consoles") or []) == [], "wrapper 結束後 minicom client 應已 detach"
     finally:
         _send_rpc(sock, "daemon.stop", {}, timeout_s=5.0)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if _send_rpc(sock, "health.ping", {}, timeout_s=0.5) is None:
+                break
+            time.sleep(0.1)
         target.stop()
