@@ -69,11 +69,22 @@ fn spawn_daemon_closes_inherited_non_cloexec_fds_in_both_modes() {
                 )
                 .unwrap(),
         );
-        let mut fds = std::fs::read_dir(format!("/proc/{}/fd", child.handle.pid))
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        fds.sort();
+        // spawn 回傳時子行程已 exec，但動態載入器可能仍短暫開著共享程式庫的 fd（readlink 前即消失）；
+        // 在期限內重讀直到穩定。繼承而未關閉的 fd 會存活整個 `sleep 5`，期限到仍會判定失敗。
+        let read_fds = || {
+            let mut fds = std::fs::read_dir(format!("/proc/{}/fd", child.handle.pid))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            fds.sort();
+            fds
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut fds = read_fds();
+        while fds != ["0", "1", "2"] && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            fds = read_fds();
+        }
         assert_eq!(fds, vec!["0", "1", "2"]);
         drop(child);
     }

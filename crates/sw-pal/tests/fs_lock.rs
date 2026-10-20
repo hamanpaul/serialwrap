@@ -199,13 +199,23 @@ fn symlink_or_copy_dir_windows_fallback_copies() {
     fs::write(target.join("sub").join("b.txt"), b"beta").unwrap();
     let link = tmp.path().join("link");
 
-    let kind = sw_pal::native()
-        .fs
-        .symlink_or_copy_dir(&link, &target)
-        .unwrap();
+    // 回退路徑：以 ERROR_PRIVILEGE_NOT_HELD（非開發者模式）取代實際建立，主機設定不影響判定。
+    let kind = sw_pal::fs_ops::windows::symlink_or_copy_dir_privilege_not_held(&link, &target).unwrap();
     assert_eq!(kind, LinkKind::Copied, "非開發者模式的 Windows 應回退為遞迴複製");
+    assert!(!fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "回退結果必須是真目錄");
     assert_eq!(fs::read(link.join("a.txt")).unwrap(), b"alpha");
     assert_eq!(fs::read(link.join("sub").join("b.txt")).unwrap(), b"beta");
+
+    // 原生路徑：主機啟用開發者模式時建立 symlink，否則回退複製；兩者內容都必須可讀。
+    let native_link = tmp.path().join("native-link");
+    let kind = sw_pal::native()
+        .fs
+        .symlink_or_copy_dir(&native_link, &target)
+        .unwrap();
+    let is_symlink = fs::symlink_metadata(&native_link).unwrap().file_type().is_symlink();
+    assert_eq!(is_symlink, kind == LinkKind::Symlink, "回報種類須與實際檔案型別一致");
+    assert_eq!(fs::read(native_link.join("a.txt")).unwrap(), b"alpha");
+    assert_eq!(fs::read(native_link.join("sub").join("b.txt")).unwrap(), b"beta");
 }
 
 #[test]
