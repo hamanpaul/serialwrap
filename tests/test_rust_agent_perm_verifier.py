@@ -69,7 +69,6 @@ def _cap_eff_zero() -> bool:
 @pytest.mark.process_rpc
 @pytest.mark.skipif(os.name != "posix", reason="POSIX 權限位元")
 @pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root 會繞過權限位元")
-@pytest.mark.xfail(strict=True, reason="P4-T15 紅燈")
 def test_same_owner_readonly_tree_is_not_blocked(tmp_path):
     # R4-F3 反例（取代舊 test_readonly_tree_reports_blocked）：同一身分擁有的 0555 樹，
     # 此刻 write／rename／replace／parent_dir_write 全被拒，但擁有者可 chmod 恢復寫權（本測試的 finally 就是這麼做），
@@ -100,7 +99,6 @@ def test_same_owner_readonly_tree_is_not_blocked(tmp_path):
 @pytest.mark.process_rpc
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="依賴 /proc/self/status CapEff")
 @pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root 會繞過權限位元")
-@pytest.mark.xfail(strict=True, reason="P4-T15 紅燈")
 def test_foreign_owned_readonly_target_reports_blocked():
     # 不同 owner 的 fixture：系統 sh（root 擁有、整條祖先鏈對本身分唯讀）
     target = Path(shutil.which("sh") or "/bin/sh")
@@ -117,7 +115,6 @@ def test_foreign_owned_readonly_target_reports_blocked():
 
 @pytest.mark.core_portable
 @pytest.mark.process_rpc
-@pytest.mark.xfail(strict=True, reason="P4-T15 紅燈")
 def test_writable_tree_reports_not_blocked_and_restores(tmp_path):
     f = tmp_path / "serialwrap"
     f.write_bytes(b"orig")
@@ -151,7 +148,6 @@ ROOT_RO = {"/": (0, 0o40755), "/opt/sw": (0, 0o40555), "/opt/sw/serialwrap": (0,
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
-@pytest.mark.xfail(strict=True, reason="P4-T15 紅燈")
 def test_classify_requires_every_restore_check_false():
     m = _load()
     assert m.classify(DENIED, _chk(False)) == ("blocked", True, 0)
@@ -163,7 +159,6 @@ def test_classify_requires_every_restore_check_false():
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
-@pytest.mark.xfail(strict=True, reason="P4-T15 紅燈")
 def test_writable_grandparent_reports_ancestor_replace():
     m = _load()
     fs = dict(ROOT_RO, **{"/opt": (0, 0o40777)})               # 只有祖父目錄 /opt 可寫、無 sticky
@@ -174,7 +169,6 @@ def test_writable_grandparent_reports_ancestor_replace():
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
-@pytest.mark.xfail(strict=True, reason="P4-T15 紅燈")
 def test_sticky_grandparent_with_foreign_child_is_blocked():
     m = _load()
     fs = dict(ROOT_RO, **{"/opt": (0, 0o41777)})               # sticky 且 /opt/sw 非本身分擁有 → 不能改名
@@ -185,7 +179,6 @@ def test_sticky_grandparent_with_foreign_child_is_blocked():
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
-@pytest.mark.xfail(strict=True, reason="P4-T15 紅燈")
 def test_agent_owned_ancestor_reports_owner_chmod():
     m = _load()
     fs = {"/": (0, 0o40755), "/srv": (0, 0o40755), "/srv/agent": (1000, 0o40555),
@@ -197,7 +190,6 @@ def test_agent_owned_ancestor_reports_owner_chmod():
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
-@pytest.mark.xfail(strict=True, reason="P4-T15 紅燈")
 def test_cap_fowner_reports_privilege_and_missing_capeff_is_unknown():
     m = _load()
     fs = dict(ROOT_RO, **{"/opt": (0, 0o40755)})
@@ -210,7 +202,6 @@ def test_cap_fowner_reports_privilege_and_missing_capeff_is_unknown():
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
-@pytest.mark.xfail(strict=True, reason="P4-T15 紅燈")
 def test_unreadable_ancestor_is_unknown_not_blocked():
     m = _load()
     fs = dict(ROOT_RO, **{"/opt": (0, 0o40755)})
@@ -221,7 +212,6 @@ def test_unreadable_ancestor_is_unknown_not_blocked():
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
-@pytest.mark.xfail(strict=True, reason="P4-T15 紅燈")
 def test_symlink_target_checks_both_chains():
     m = _load()
     fs = dict(ROOT_RO, **{"/opt": (0, 0o40755), "/usr": (0, 0o40755), "/usr/bin": (0, 0o40755),
@@ -234,7 +224,6 @@ def test_symlink_target_checks_both_chains():
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
-@pytest.mark.xfail(strict=True, reason="P4-T15 紅燈")
 def test_windows_privilege_table():
     m = _load()
     f = m.windows_privilege_possible
@@ -249,7 +238,6 @@ def test_windows_privilege_table():
 @pytest.mark.windows_native
 @pytest.mark.process_rpc
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows DACL")
-@pytest.mark.xfail(strict=True, reason="P4-T15 紅燈")
 def test_windows_owner_with_denied_write_is_not_blocked(tmp_path):
     # Windows 版 R4-F3 反例：本身分擁有的檔案即使 DACL deny (W,D)，擁有者仍隱含 WRITE_DAC，可自行改回
     f = tmp_path / "serialwrap.exe"
@@ -271,7 +259,6 @@ def test_windows_owner_with_denied_write_is_not_blocked(tmp_path):
 
 @pytest.mark.core_portable
 @pytest.mark.process_rpc
-@pytest.mark.xfail(strict=True, reason="P4-T15 紅燈")
 def test_bad_args_exit2():
     # 腳本不存在時 Python 也會回 exit 2，因此先斷言檔案存在，並要求 stderr 明確指出缺少 --targets。
     assert SCRIPT.is_file(), "scripts/rust/verify_agent_perms.py 尚未交付"
@@ -282,7 +269,6 @@ def test_bad_args_exit2():
 
 @pytest.mark.core_portable
 @pytest.mark.process_rpc
-@pytest.mark.xfail(strict=True, reason="P4-T15 紅燈")
 def test_json_out_file_written(tmp_path):
     target = tmp_path / "serialwrap"
     target.write_bytes(b"x")
@@ -297,7 +283,6 @@ def test_json_out_file_written(tmp_path):
 
 @pytest.mark.core_portable
 @pytest.mark.process_rpc
-@pytest.mark.xfail(strict=True, reason="P4-T15 紅燈")
 def test_verifier_never_touches_real_target(tmp_path):
     target = tmp_path / "serialwrap"
     target.write_bytes(b"orig")
@@ -312,7 +297,6 @@ def test_verifier_never_touches_real_target(tmp_path):
 @pytest.mark.posix_only
 @pytest.mark.process_rpc
 @pytest.mark.skipif(os.name != "posix", reason="POSIX 權限位元與 uid／gid")
-@pytest.mark.xfail(strict=True, reason="P4-T15 紅燈")
 def test_verifier_never_changes_permissions(tmp_path):
     # 0555 target 置於 tmp_path 下三層目錄；前後比對 target 與每個祖先目錄的 mode／uid／gid。
     l1 = tmp_path / "l1"
@@ -342,7 +326,6 @@ def test_verifier_never_changes_permissions(tmp_path):
 @pytest.mark.posix_only
 @pytest.mark.process_rpc
 @pytest.mark.skipif(os.name != "posix", reason="SIGKILL 僅 POSIX")
-@pytest.mark.xfail(strict=True, reason="P4-T15 紅燈")
 def test_verifier_interrupted_leaves_no_real_change(tmp_path):
     target = tmp_path / "serialwrap"
     target.write_bytes(b"orig")
@@ -365,3 +348,152 @@ def test_verifier_interrupted_leaves_no_real_change(tmp_path):
     # 再次執行應清掉超過 1 小時的舊 sentinel
     _run(target)
     assert not stale.exists()
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_classify_empty_results_is_unknown():
+    m = _load()
+    assert m.classify([], _chk(False)) == ("unknown", None, 4)
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_classify_allowed_none_is_unknown():
+    m = _load()
+    unclassified_op = [{"target": "/opt/sw/serialwrap", "op": "write", "allowed": None, "error": "ETXTBSY"}]
+    assert m.classify(unclassified_op, _chk(False)) == ("unknown", None, 4)
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_cap_eff_nonzero_without_target_bits_is_unknown():
+    m = _load()
+    fs = dict(ROOT_RO, **{"/opt": (0, 0o40755)})
+    # CAP_SYS_ADMIN is bit 21 (1 << 21), bits 0, 1, 3 are 0
+    checks = m.posix_restore_checks("/opt/sw/serialwrap", **_fake(fs, set(), cap_eff=1 << 21))
+    assert [c["possible"] for c in checks if c["kind"] == "privilege"] == [None]
+    assert m.classify(DENIED, checks) == ("unknown", None, 4)
+
+
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
+@pytest.mark.skipif(os.name != "posix", reason="POSIX 檔案系統權限")
+def test_directory_target_probes_inside_directory(tmp_path):
+    # 可寫目錄 target 應判定 allowed: True
+    dir_writable = tmp_path / "writable_dir"
+    dir_writable.mkdir()
+    p, rep = _run(dir_writable)
+    write_op = next(r for r in rep["results"] if r["target"] == str(dir_writable) and r["op"] == "write")
+    assert write_op["allowed"] is True
+    assert rep["verdict"] == "not_blocked"
+
+    # 唯讀目錄 target 應判定 allowed: False，且錯誤非 EISDIR
+    dir_ro = tmp_path / "ro_dir"
+    dir_ro.mkdir()
+    dir_ro.chmod(0o555)
+    try:
+        p, rep = _run(dir_ro)
+        write_op = next(r for r in rep["results"] if r["target"] == str(dir_ro) and r["op"] == "write")
+        assert write_op["allowed"] is False
+        assert write_op["error"] != "IsADirectoryError"
+    finally:
+        dir_ro.chmod(0o755)
+
+
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
+@pytest.mark.skipif(os.name != "posix", reason="POSIX 符號連結與檔案屬性")
+def test_clean_stale_sentinels_does_not_delete_dirs_or_symlinks(tmp_path):
+    m = _load()
+    old = time.time() - 7200
+
+    # 1. 建立以 .permprobe- 為前綴的目錄，內有檔案
+    probe_dir = tmp_path / ".permprobe-12345-0123456789abcdef"
+    probe_dir.mkdir()
+    (probe_dir / "notes.txt").write_text("keep me")
+    os.utime(probe_dir, (old, old))
+
+    # 2. 建立以 .permprobe- 為前綴的符號連結
+    target_file = tmp_path / "real_file.txt"
+    target_file.write_text("target")
+    probe_link = tmp_path / ".permprobe-12345-fedcba9876543210"
+    probe_link.symlink_to(target_file)
+    try:
+        os.lutime(probe_link, (old, old))
+    except (AttributeError, OSError):
+        pass
+
+    # 3. 建立正常的過期 sentinel 普通檔案
+    stale_file = tmp_path / ".permprobe-12345-1122334455667788"
+    stale_file.write_bytes(b"probe")
+    os.utime(stale_file, (old, old))
+
+    m._clean_stale_sentinels(str(tmp_path))
+
+    # 目錄與符號連結必須完整保留，只有符合 regex 之普通檔案被刪除
+    assert probe_dir.is_dir()
+    assert (probe_dir / "notes.txt").exists()
+    assert probe_link.is_symlink()
+    assert not stale_file.exists()
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_windows_api_shim_failed_token_query_is_unknown():
+    m = _load()
+
+    class FailingTokenShim:
+        def query_process_token(self):
+            return None, None, None  # OpenProcessToken 失敗
+
+        def query_owner_and_dacl(self, path):
+            return "S-1-5-21-123", False, True
+
+        def test_open(self, path, access, is_dir=False):
+            return False  # ERROR_ACCESS_DENIED
+
+    checks = m.windows_restore_checks("C:\\serialwrap", _win_api=FailingTokenShim())
+    # token 查詢失敗時，owner 與 privilege 必須為 None（證據不足），classify 必須回 unknown
+    assert any(c["kind"] == "owner" and c["possible"] is None for c in checks)
+    assert any(c["kind"] == "privilege" and c["possible"] is None for c in checks)
+    assert m.classify(DENIED, checks) == ("unknown", None, 4)
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_windows_api_shim_access_denied_vs_sharing_violation():
+    m = _load()
+
+    class SharingViolationShim:
+        def test_open(self, path, access, is_dir=False):
+            # 模擬 ERROR_SHARING_VIOLATION (32) 非權限拒絕
+            return None
+
+    results = m.probe_target_operations("C:\\serialwrap\\serialwrap.exe", _win_api=SharingViolationShim())
+    rename_op = next(r for r in results if r["op"] == "rename")
+    assert rename_op["allowed"] is None  # 不是 False！
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_windows_resolved_chain_checked():
+    m = _load()
+
+    class MockWinApi:
+        def __init__(self):
+            self.tested_paths = []
+
+        def query_process_token(self):
+            return "S-1-5-21-123", {"SeChangeNotifyPrivilege"}, "absent"
+
+        def query_owner_and_dacl(self, path):
+            self.tested_paths.append(path)
+            return "S-1-5-21-999", False, True
+
+        def test_open(self, path, access, is_dir=False):
+            return False
+
+    api = MockWinApi()
+    checks = m.windows_restore_checks("C:\\sw\\serialwrap.exe", _win_api=api)
+    assert any("C:\\sw" in c["path"] for c in checks)

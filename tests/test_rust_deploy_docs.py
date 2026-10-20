@@ -58,7 +58,6 @@ def _load_validate():
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
-@pytest.mark.xfail(strict=True, reason="P4-T15 紅燈")
 def test_deploy_doc_has_required_sections():
     assert PERM_MODEL.is_file(), f"缺少文件：{PERM_MODEL.relative_to(ROOT).as_posix()}"
     lines = {line.strip() for line in PERM_MODEL.read_text(encoding="utf-8").splitlines()}
@@ -68,7 +67,6 @@ def test_deploy_doc_has_required_sections():
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
-@pytest.mark.xfail(strict=True, reason="P4-T15 紅燈")
 def test_deploy_doc_never_claims_same_user_isolation():
     # OD-12：兩份 deploy 文件與 README 不得宣稱「同使用者隔離」，除非同一行含「不得宣稱」。
     scanned = (PERM_MODEL, WIN_INSTALL, README)
@@ -85,7 +83,6 @@ def test_deploy_doc_never_claims_same_user_isolation():
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
-@pytest.mark.xfail(strict=True, reason="P4-T15 紅燈")
 def test_deploy_doc_rejects_not_blocked_and_unknown_as_evidence():
     assert PERM_MODEL.is_file(), f"缺少文件：{PERM_MODEL.relative_to(ROOT).as_posix()}"
     text = PERM_MODEL.read_text(encoding="utf-8")
@@ -99,7 +96,6 @@ def test_deploy_doc_rejects_not_blocked_and_unknown_as_evidence():
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
-@pytest.mark.xfail(strict=True, reason="P4-T15 紅燈")
 def test_readme_bilingual_mentions_new_commands():
     lines = README.read_text(encoding="utf-8").splitlines()
     en_idx = next((i for i, line in enumerate(lines) if line.strip() == "## English"), None)
