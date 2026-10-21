@@ -46,7 +46,8 @@ def _reconcile_cli_prefix(work: Path) -> list[str]:
     if len(pref) != 1:
         return pref
     exe = Path(pref[0])
-    if not (exe.parent.parent / "release-manifest.json").is_file():
+    # dev bundle 的 bin/serialwrap 是 symlink；manifest 在實際版本目錄的父層，須先解析 symlink。
+    if not (exe.resolve().parent.parent / "release-manifest.json").is_file():
         return pref
     dest_dir = work / "rust-cli" / "bin"
     dest_dir.mkdir(parents=True, exist_ok=True)

@@ -213,7 +213,8 @@ def test_missing_manifest(tmp_path, env):
     exe = tmp_path / "serialwrap"
     exe.write_bytes(src.read_bytes())
     exe.chmod(0o755)
-    r = subprocess.run([str(exe), "doctor"], env=env, capture_output=True, check=False)
+    delegate_env = dict(env, SERIALWRAP_TEST_DELEGATE_GROUP="doctor")
+    r = subprocess.run([str(exe), "doctor"], env=delegate_env, capture_output=True, check=False)
     assert r.returncode == 1
     out = _parse(r.stdout, r.stderr, r.returncode)
     assert out["error_code"] == "INTERNAL_ERROR"
@@ -227,7 +228,13 @@ def test_missing_manifest(tmp_path, env):
 @pytest.mark.parametrize("exit_code", [0, 37, 1])
 def test_probe_receives_argv_env_stdin_and_exit_code(probe_bundle, env, tmp_path, exit_code):
     counter = tmp_path / "count"
-    e = dict(env, PROBE_READ_STDIN="1", PROBE_EXIT=str(exit_code), PROBE_COUNTER=str(counter))
+    e = dict(
+        env,
+        SERIALWRAP_TEST_DELEGATE_GROUP="setup",
+        PROBE_READ_STDIN="1",
+        PROBE_EXIT=str(exit_code),
+        PROBE_COUNTER=str(counter),
+    )
     r = run_cli(["--socket", "/x y", "setup", "--user", "é", "--", "-z"], env=e, stdin=b"hello")
     assert r.rc == exit_code
     got = _parse(r.stdout, r.stderr, r.rc)
@@ -245,7 +252,10 @@ def test_exec_failure_runs_nothing_and_does_not_fall_back(broken_entry_bundle, e
     fake.mkdir()
     (fake / "python3").write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
     (fake / "python3").chmod(0o755)
-    r = run_cli(["doctor"], env=dict(env, PATH=f"{fake}:{env['PATH']}"))
+    r = run_cli(
+        ["doctor"],
+        env=dict(env, SERIALWRAP_TEST_DELEGATE_GROUP="doctor", PATH=f"{fake}:{env['PATH']}"),
+    )
     assert r.rc == 1
     assert _parse(r.stdout, r.stderr, r.rc)["message"].startswith(
         "delegation target unavailable: exec failed: "
@@ -255,7 +265,7 @@ def test_exec_failure_runs_nothing_and_does_not_fall_back(broken_entry_bundle, e
 
 @pytest.mark.rust_only
 def test_recursion_detected_when_entry_points_to_self(self_loop_bundle, env):
-    r = run_cli(["doctor"], env=env, timeout_s=20)
+    r = run_cli(["doctor"], env=dict(env, SERIALWRAP_TEST_DELEGATE_GROUP="doctor"), timeout_s=20)
     assert r.rc == 1
     assert _parse(r.stdout, r.stderr, r.rc)["message"] == "delegation recursion detected"
 
@@ -269,14 +279,17 @@ def test_never_searches_path(probe_bundle, tmp_path, env):
         p = fake / name
         p.write_text(f"#!/bin/sh\ntouch {marker}\nexit 99\n", encoding="utf-8")
         p.chmod(0o755)
-    r = run_cli(["doctor"], env=dict(env, PATH=f"{fake}:{env['PATH']}"))
+    r = run_cli(
+        ["doctor"],
+        env=dict(env, SERIALWRAP_TEST_DELEGATE_GROUP="doctor", PATH=f"{fake}:{env['PATH']}"),
+    )
     assert r.rc == 0 and not marker.exists()
 
 
 @pytest.mark.rust_only
 @pytest.mark.posix_only
 def test_exec_replaces_process_and_sigterm_reaches_child(probe_bundle, env):
-    e = dict(env, PROBE_READ_STDIN="1")
+    e = dict(env, SERIALWRAP_TEST_DELEGATE_GROUP="doctor", PROBE_READ_STDIN="1")
     p = subprocess.Popen(
         [*bb_harness.cli_prefix(), "doctor"], env=e, stdin=subprocess.PIPE, stdout=subprocess.PIPE
     )
@@ -296,5 +309,5 @@ def test_exec_replaces_process_and_sigterm_reaches_child(probe_bundle, env):
 @pytest.mark.rust_only
 def test_no_output_before_delegation(probe_bundle, env):
     r = run_cli(["-v", "--socket", "/nope", "daemon", "status"],
-                env=dict(env, SERIALWRAP_LOG_LEVEL="DEBUG"))
+                env=dict(env, SERIALWRAP_TEST_DELEGATE_GROUP="daemon", SERIALWRAP_LOG_LEVEL="DEBUG"))
     assert r.stderr == b""  # probe 不寫 stderr；Rust 端在委派前不得輸出 trace 或任何字元
