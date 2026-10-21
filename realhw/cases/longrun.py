@@ -273,12 +273,20 @@ class BgResultTracker:
                 del self._pending[pending.cmd_id]
                 self._condition.notify_all()
 
-    def _poll_one(self, pending: _PendingBackground, *, deadline: float | None = None) -> bool:
+    def _poll_one(
+        self,
+        pending: _PendingBackground,
+        *,
+        deadline: float | None = None,
+        timeout_limit_s: float | None = None,
+    ) -> bool:
         kwargs: dict[str, float] = {}
         if deadline is not None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return False
+            if timeout_limit_s is not None:
+                remaining = min(remaining, timeout_limit_s)
             kwargs["timeout"] = remaining
         try:
             response = self._sw.run("cmd", "status", "--cmd-id", pending.cmd_id, **kwargs)
@@ -314,7 +322,8 @@ class BgResultTracker:
         return False
 
     def poll_once(self, *, stop: threading.Event | None = None,
-                  deadline: float | None = None) -> int:
+                  deadline: float | None = None,
+                  timeout_limit_s: float | None = None) -> int:
         """依提交順序查詢 pending；停止或到期時不再開始下一筆 RPC。"""
         with self._condition:
             pending = list(self._pending.values())
@@ -324,7 +333,7 @@ class BgResultTracker:
                 break
             if deadline is not None and time.monotonic() >= deadline:
                 break
-            if self._poll_one(item, deadline=deadline):
+            if self._poll_one(item, deadline=deadline, timeout_limit_s=timeout_limit_s):
                 removed += 1
         return removed
 
@@ -356,9 +365,10 @@ class BgResultTracker:
 
     def final_drain(self, timeout_s: float = BG_FINAL_DRAIN_S) -> int:
         """停止負載後只輪詢仍 pending 的命令至終態或逾時。"""
-        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        timeout_limit_s = max(0.0, float(timeout_s))
+        deadline = time.monotonic() + timeout_limit_s
         while self.pending_count() and time.monotonic() < deadline:
-            self.poll_once(deadline=deadline)
+            self.poll_once(deadline=deadline, timeout_limit_s=timeout_limit_s)
             remaining_s = deadline - time.monotonic()
             if self.pending_count() and remaining_s > 0:
                 time.sleep(min(BG_POLL_INTERVAL_S, remaining_s))
