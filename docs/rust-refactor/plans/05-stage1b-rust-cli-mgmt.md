@@ -3547,7 +3547,7 @@ cargo test --workspace && cargo build --workspace --release
 scripts/rust/win-test.sh --l1-set s1b_cargo --package sw-pal --package sw-cli
 SW_BUNDLE=$(scripts/rust/mkbundle.sh --dev --delegate-sentinel --print-dir)
 SERIALWRAP_CLI_EXE=$SW_BUNDLE/bin/serialwrap SERIALWRAP_AB_LABEL=rust-1b SW_RESOURCE_REPORT=target/p4-evidence/l1/linux/20groups/resource-report.json \
-  python3 -m pytest -q tests/contract_blackbox -m "core_portable or posix_only" --junitxml=target/p4-evidence/l1/linux/20groups/junit.xml    # R5-F3：l1-results.v1 供 check_p4_cases --l1-results（argv＝s1b_20groups linux selector）
+  python3 -m pytest tests/contract_blackbox -m "core_portable or posix_only" --junitxml=target/p4-evidence/l1/linux/20groups/junit.xml    # R5-F3：l1-results.v1 供 check_p4_cases --l1-results（argv＝s1b_20groups linux selector）；理由：lock selector 為權威，R5-F3。
 python3 scripts/rust/cargo_l1_results.py --platform linux --out target/p4-evidence/l1/linux/cargo/resource-report.json -- --workspace
 SERIALWRAP_CLI_EXE=$SW_BUNDLE/bin/serialwrap python3 -m pytest -q tests/test_multiagent_e2e.py tests/test_human_agent_coexist.py
 SERIALWRAP_CLI_EXE=$SW_BUNDLE/bin/serialwrap python3 func-test/runner.py --mode bridge --selftest-report <P2 Task 8 selftest 報告> --report-dir target/p4-evidence/l15-linux   # P2 既有 13 case＋11 L1.5 scenario 以 Rust CLI 執行
