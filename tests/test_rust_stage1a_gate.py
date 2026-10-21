@@ -82,6 +82,14 @@ def _l1_lock() -> dict[str, Any]:
 def _report(platform: str, *, runner: str, argv: list[str], markexpr: str, nodeids: list[str],
             outcomes: dict[str, str] | None = None, exit_code: int = 0, finished: bool = True) -> dict[str, Any]:
     outcomes = outcomes or {n: "passed" for n in nodeids}
+    tally = {"passed": 0, "failed": 0, "skipped": 0}
+    for outcome in outcomes.values():
+        if outcome in tally:
+            tally[outcome] += 1
+        elif outcome == "xfailed":
+            tally["skipped"] += 1
+        elif outcome == "xpassed":
+            tally["failed"] += 1
     return {
         "schema_version": 2,
         "format": "l1-results.v1",
@@ -89,11 +97,17 @@ def _report(platform: str, *, runner: str, argv: list[str], markexpr: str, nodei
         "platform": platform,
         "argv": argv,
         "markexpr": markexpr,
+        "counts": {"all": tally},
+        "resources": {},
+        "uart_kind": "native",
+        "not_collected_platform": [],
         "collected": list(nodeids),
         "deselected": [],
         "results": [
             {"nodeid": n, "outcome": o, "skip_kind": ("other" if o == "skipped" else None),
-             "phases": {"setup": "passed", "call": "passed", "teardown": "passed"}}
+             "phases": {"setup": "passed", "call": ("skipped" if o in ("skipped", "xfailed") else
+                                                           "failed" if o in ("failed", "error", "xpassed") else "passed"),
+                        "teardown": "passed"}}
             for n, o in outcomes.items()
         ],
         "exit_code": exit_code,

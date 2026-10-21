@@ -361,8 +361,18 @@ def _report_base_diff(base: dict[str, Any], head: dict[str, Any], allow_removal:
 
 
 def _read_collect(path: pathlib.Path) -> list[str]:
+    raw = path.read_text(encoding="utf-8")
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        value = None
+    if isinstance(value, dict) and isinstance(value.get("collected"), list):
+        if not all(isinstance(item, str) for item in value["collected"]):
+            raise ValueError(f"collect JSON 的 collected 必須全為字串：{path}")
+        return list(value["collected"])
+
     ids: list[str] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in raw.splitlines():
         text = line.strip()
         if "::" in text:
             ids.append(text)

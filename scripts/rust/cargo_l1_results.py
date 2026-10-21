@@ -205,6 +205,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "platform": args.platform,
                     "argv": args.cargo_args,
                     "markexpr": "",
+                    "counts": {"all": {"passed": 0, "failed": 0, "skipped": 0}},
+                    "resources": {},
+                    "uart_kind": "native",
+                    "not_collected_platform": [],
                     "collected": [],
                     "deselected": [],
                     "results": [],
@@ -301,6 +305,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
     results = [row for target in targets for row in target.results]
+    tally = {"passed": 0, "failed": 0, "skipped": 0}
+    for result in results:
+        outcome = result["outcome"]
+        if outcome in tally:
+            tally[outcome] += 1
+        elif outcome in ("xfailed", "xpassed"):
+            tally["failed" if outcome == "xpassed" else "skipped"] += 1
     report = {
         "schema_version": 2,
         "format": "l1-results.v1",
@@ -308,6 +319,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "platform": args.platform,
         "argv": args.cargo_args,
         "markexpr": "",
+        "counts": {"all": tally},
+        "resources": {},
+        "uart_kind": "native",
+        "not_collected_platform": [],
         "collected": collected,
         "deselected": [],
         "results": results,
