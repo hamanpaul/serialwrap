@@ -244,7 +244,7 @@ def entry(
         "tool_revision": target["tool_revision"],
         "case_list_sha256": target["case_list_sha256"],
         "l1_set_sha256": None,
-        "workload_sha256": "w" * 64 if is_l3 else None,
+        "workload_sha256": "f" * 64 if is_l3 else None,
         "environment_id": api.environment_id(ENV_DOC),
         "produced_at": ts(10 + n, 0),
         "started_at": ts(10 + n, 0),
@@ -271,8 +271,17 @@ def target_trees(index_path: Path, platform: str, *, stage: str = "3") -> dict[s
 
 
 def deployed_bracket(cli_exe: Path) -> dict[str, Any]:
-    """以 P2 deployed_content.measure 實際量測安裝內容的前後值。"""
+    """以 P2 deployed_content.measure 實際量測安裝內容與 daemon 的前後值。"""
     from realhw.deployed_content import measure
 
-    measured = measure(Path(cli_exe))
-    return {"start": measured, "end": measured}
+    cli = Path(cli_exe)
+    daemon = cli.parent / "serialwrapd"
+    measured = measure(cli, daemon_argv=[str(daemon)])
+    live = {
+        "pid": 4321,
+        "image_path": measured.get("daemon_resolved"),
+        "image_sha256": measured.get("daemon_sha256"),
+        "in_install": measured.get("error") is None,
+        "error": None if measured.get("error") is None else "image_unavailable",
+    }
+    return {"start": measured, "end": dict(measured), "daemon_live": [live]}

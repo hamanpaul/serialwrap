@@ -939,6 +939,21 @@ def test_environment_id_requires_keys(tmp_path):
     assert evidence_index.environment_id(ordered) == evidence_index.environment_id(reversed_keys)
 
 
+def test_missing_l1_lock_makes_l1_item_missing(tmp_path):
+    evidence_index = _evidence_api()
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
+    catalog = evidence_index.load_exit_catalog()
+    status, reasons = evidence_index.item_status(
+        evidence_index.load_index(idx),
+        catalog["S3-L1-RELEASE-CONTRACT-LINUX"],
+        evidence_root=tmp_path,
+        cases={},
+        l1_lock={"schema_version": 1, "sets": {}},
+    )
+    assert status == "MISSING"
+    assert reasons == ["linux: no frozen l1 set: s3_release_contract"]
+
+
 def test_index_file_stable_format(tmp_path):
     evidence_index = _evidence_api()
     idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
