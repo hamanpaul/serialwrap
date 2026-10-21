@@ -106,13 +106,14 @@ def test_missing_objdump_is_insufficient(tmp_path: Path) -> None:
         [sys.executable, str(SCRIPT), str(_exe(tmp_path))],
         capture_output=True,
         text=True,
-        env={"PATH": str(empty)},  # 找不到 x86_64-w64-mingw32-objdump
+        env={"PATH": str(empty), "PYTHONUTF8": "1"},  # 找不到 objdump，且固定子程序 stdout 編碼
         check=False,
     )
     assert r.returncode == 2  # 證據不足，不得 ok
-    if r.stdout.strip():
+    stdout = r.stdout or ""
+    if stdout.strip():
         try:
-            parsed = json.loads(r.stdout)
+            parsed = json.loads(stdout)
         except json.JSONDecodeError:
             parsed = {}
         assert parsed.get("ok") is not True
