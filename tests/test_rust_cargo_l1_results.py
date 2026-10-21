@@ -238,7 +238,8 @@ def test_timeout_marks_unfinished(tmp_path: Path) -> None:
         runner = bin_dir / "fake_runner.cmd"
         runner.write_text(
             "@echo off\r\n"
-            'if /i "%~nx1"=="exe_timeout.cmd" exit /b 124\r\n'
+            'set "target=%~1"\r\n'
+            'if /i "%target:\\exe_timeout\\=%" neq "%target%" exit /b 124\r\n'
             'call "%~1" %2 %3 %4 %5\r\n'
             "exit /b %errorlevel%\r\n",
             encoding="utf-8",
