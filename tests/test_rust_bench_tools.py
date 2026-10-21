@@ -448,8 +448,8 @@ def test_no_onefile_shared_system_tmp_is_insufficient_not_pass(tmp_path: Path) -
     """負向：共用系統暫存根的他人寫入無法歸屬 → INSUFFICIENT（ok false），不得判 PASS（審查 #5）。"""
     probe = f"sw-p4t16-probe-{os.getpid()}.bin"
     cli_text = (
-        "import os, tempfile\n"
-        f"p = os.path.join('/tmp' if os.name == 'posix' else tempfile.gettempdir(), {probe!r})\n"
+        "import os\n"
+        f"p = os.path.join(os.environ['SYS_ROOT'], {probe!r})\n"
         "open(p, 'w').write('x')\n"
         "os.remove(p)\n"
     )
