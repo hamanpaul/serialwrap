@@ -301,9 +301,15 @@ def _entry_file_path(evidence_root: Path, file_row: Mapping[str, Any]) -> Path |
         return None
     root = Path(evidence_root).resolve()
     # 測試與早期索引呼叫端會傳 repo root；正式 ingest 傳 evidence root。
-    roots = (root, root / "evidence") if (root / "evidence").is_dir() else (root,)
-    for candidate_root in roots:
-        candidate = candidate_root / rel_path
+    candidates = [(root, rel_path)]
+    if (root / "evidence").is_dir():
+        candidates.append((root / "evidence", rel_path))
+    # 反向情形：entry 路徑以 evidence 目錄名開頭（相對索引所在的上層目錄記錄，如 `evidence/<file>`），
+    # 而呼叫端傳的是該 evidence 目錄本身；去掉開頭目錄名後仍限定在 evidence root 之內解析。
+    if len(rel_path.parts) > 1 and rel_path.parts[0] == root.name:
+        candidates.append((root, Path(*rel_path.parts[1:])))
+    for candidate_root, candidate_rel in candidates:
+        candidate = candidate_root / candidate_rel
         try:
             candidate.resolve(strict=True).relative_to(candidate_root)
             if candidate.is_file() and not candidate.is_symlink():
