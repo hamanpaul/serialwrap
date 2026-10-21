@@ -126,6 +126,10 @@ if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 fi
 
 BUILD_ARGS=(build -p sw-cli -p sw-daemon)
+# 更新 race barrier 僅編入 `--dev` bundle；正式 bundle 不帶測試 feature。
+if [[ "$DEV" -eq 1 ]]; then
+  BUILD_ARGS+=(--features sw-cli/test-fakes)
+fi
 if [[ -n "$COM0COM_ZIP" ]]; then
   BUILD_ARGS+=(-p sw-com0com-helper)
 fi
@@ -135,9 +139,14 @@ fi
 if [[ "$TARGET" != "$HOST_TRIPLE" ]]; then
   BUILD_ARGS+=(--target "$TARGET")
 fi
-(cd "$REPO_ROOT" && SW_BUNDLE_VERSION="$VERSION" CARGO_TARGET_DIR="$REPO_ROOT/target" cargo "${BUILD_ARGS[@]}" --quiet)
+# 呼叫端可指定隔離的 Cargo target dir；相對路徑一律相對 repo root 解讀。
+BUILD_ROOT="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
+if [[ "$BUILD_ROOT" != /* ]]; then
+  BUILD_ROOT="$REPO_ROOT/$BUILD_ROOT"
+fi
+(cd "$REPO_ROOT" && SW_BUNDLE_VERSION="$VERSION" CARGO_TARGET_DIR="$BUILD_ROOT" cargo "${BUILD_ARGS[@]}" --quiet)
 
-BUILD_DIR="$REPO_ROOT/target"
+BUILD_DIR="$BUILD_ROOT"
 if [[ "$TARGET" != "$HOST_TRIPLE" ]]; then
   BUILD_DIR+="/$TARGET"
 fi

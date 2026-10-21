@@ -16,6 +16,16 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ -n "${SW_TEST_COM_PAIR:-}" && "$SW_TEST_COM_PAIR" != "COM20:COM21" ]]; then
+  echo "win-blackbox.sh: 只允許 Stage 1A DUT-side COM pair COM20:COM21" >&2
+  exit 2
+fi
+selftest_timeout="${SW_WIN_SELFTEST_TIMEOUT_S:-900}"
+if [[ ! "$selftest_timeout" =~ ^[1-9][0-9]*$ ]]; then
+  echo "win-blackbox.sh: SW_WIN_SELFTEST_TIMEOUT_S 必須是正整數秒數" >&2
+  exit 2
+fi
+
 run_id="$(date +%y%m%d-%H%M%S)-$$"
 out_dir="$ROOT/target/win-blackbox/$run_id"
 release_exe="$ROOT/target/x86_64-pc-windows-gnu/release/serialwrap.exe"
@@ -77,6 +87,7 @@ contract_revision="$(git -C "$ROOT" rev-parse HEAD:contracts)"
 python3123="$local_appdata\sw-rust-test\py-3.12.3"
 ps_args=(-NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w "$ROOT/scripts/rust/win-blackbox.ps1")"
   -RustExe "$rust_win" -RepoSnapshot "$repo_win" -OutDir "$out_win"
+  -SelftestTimeoutSeconds "$selftest_timeout"
   -GitRevision "$git_revision" -ContractRevision "$contract_revision")
 if [[ -d "$(wslpath -u "$python3123" 2>/dev/null)" ]]; then
   ps_args+=(-Python3123 "$python3123")

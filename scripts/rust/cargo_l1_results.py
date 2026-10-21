@@ -249,7 +249,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         collected.extend(_nodeid(target, name) for name in target.collected_names)
 
     if args.list_only:
-        _read_report(args.out, {"collected": collected})
+        # 凍結分母只收正常執行的非 cap_* 測試；ignored 案例仍留在完整報告供 judge 對帳。
+        lock_collected = [
+            _nodeid(target, name)
+            for target in targets
+            for name in target.collected_names
+            if name not in target.ignored_names and not name.startswith("cap_")
+        ]
+        _read_report(args.out, {"collected": lock_collected})
         return 0 if finished else 1
 
     summaries: list[dict[str, Any]] = []

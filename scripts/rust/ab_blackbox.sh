@@ -27,6 +27,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ -n "${SW_TEST_COM_PAIR:-}" && "$SW_TEST_COM_PAIR" != "COM20:COM21" ]]; then
+  echo "ab_blackbox.sh: 只允許 Stage 1A DUT-side COM pair COM20:COM21" >&2
+  exit 2
+fi
+
 BUNDLE_OUT="$REPO_ROOT/target/mkbundle-dev"
 "$REPO_ROOT/scripts/rust/mkbundle.sh" --dev --profile "$PROFILE" --out "$BUNDLE_OUT"
 
@@ -87,9 +92,6 @@ set +e
 env -u SERIALWRAP_CLI_EXE -u SERIALWRAP_DAEMON_EXE -u SERIALWRAP_AB_LABEL \
   SW_AB_PIDLOG="$A_PIDS" python3 -m pytest tests/contract_blackbox \
   -m "core_portable or posix_only" \
-  --confcutdir=tests/contract_blackbox \
-  -p no:cacheprovider \
-  -o xfail_strict=true \
   --junitxml="$A_XML"
 a_rc=$?
 set -e
@@ -261,9 +263,6 @@ fi
 set +e
 env "${b_env[@]}" python3 -m pytest tests/contract_blackbox \
   -m "core_portable or posix_only" \
-  --confcutdir=tests/contract_blackbox \
-  -p no:cacheprovider \
-  -o xfail_strict=true \
   --junitxml="$B_XML"
 b_rc=$?
 set -e

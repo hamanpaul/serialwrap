@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import importlib.util
 import json
 import sys
@@ -43,12 +44,194 @@ def _normalize_case_id(cid: str) -> str:
     return name_clean
 
 
+def _l15_case_rows(
+    case_id: str,
+    meta: dict[str, Any],
+    reports: list[tuple[str, dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    platforms = meta.get("platforms")
+    allowed_platforms = set(platforms) if isinstance(platforms, list) and platforms else None
+    rows: list[dict[str, Any]] = []
+    for platform, report in reports:
+        if allowed_platforms is not None and platform not in allowed_platforms:
+            continue
+        results = report.get("results")
+        if isinstance(results, list):
+            rows.extend(
+                row for row in results
+                if isinstance(row, dict) and row.get("case_id") == case_id
+            )
+    return rows
+
+
+def _l15_case_status(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return "evidence-insufficient"
+    if any(row.get("verdict") != "PASS" for row in rows):
+        return "FAIL"
+    if any(row.get("gate_eligible") is not True for row in rows):
+        return "evidence-insufficient"
+    return "PASS"
+
+
+def _is_rust_pytest_case(case_id: str) -> bool:
+    path, separator, _ = case_id.partition("::")
+    return bool(separator) and Path(path).name.startswith("test_rust_") and path.endswith(".py")
+
+
+def _pytest_junit_cases(path: Path | None, errors: list[str]) -> dict[str, list[str]]:
+    cases: dict[str, list[str]] = {}
+    if path is None:
+        return cases
+    if not path.is_file():
+        errors.append(f"缺少 pytest JUnit 報告: {path}")
+        return cases
+    try:
+        root = ET.parse(path).getroot()
+    except Exception as e:
+        errors.append(f"讀取 pytest JUnit 報告失敗: {e}")
+        return cases
+
+    report_failed = False
+    for suite in root.iter("testsuite"):
+        try:
+            if int(suite.attrib.get("failures", 0)) or int(suite.attrib.get("errors", 0)):
+                errors.append("pytest JUnit 報告含失敗或錯誤")
+                report_failed = True
+                break
+        except (TypeError, ValueError):
+            errors.append("pytest JUnit 報告的失敗計數無效")
+            report_failed = True
+            break
+
+    testcases = list(root.iter("testcase"))
+    if any(testcase.find("failure") is not None or testcase.find("error") is not None for testcase in testcases):
+        report_failed = True
+
+    for testcase in testcases:
+        nodeid = testcase.get("nodeid")
+        if nodeid:
+            case_id = _normalize_case_id(nodeid)
+            if case_id.startswith("tests/"):
+                case_id = case_id[len("tests/"):]
+        else:
+            case_id = _normalize_case_id(f"{testcase.get('classname', '')}::{testcase.get('name', '')}")
+        if not case_id:
+            continue
+        if report_failed or testcase.find("failure") is not None or testcase.find("error") is not None:
+            outcome = "failed"
+        elif testcase.find("skipped") is not None:
+            outcome = "skipped"
+        else:
+            outcome = "passed"
+        cases.setdefault(case_id, []).append(outcome)
+    return cases
+
+
+WINDOWS_COM_FORMAT = "windows-com-evidence.v1"
+WINDOWS_COM_PAIR = "COM20:COM21"
+WINDOWS_COM_P4_NODE = "tests/contract_blackbox/test_cli_mgmt_daemon.py::test_autostart_l15_tx_once"
+WINDOWS_COM_SEQUENCE = (
+    "python-daemon-start", "session-list-ready", "cmd-submit", "cmd-status-poll",
+    "device-release", "session-list-released", "device-attach", "session-list-ready",
+)
+
+
+def _dedupe_consecutive(names: list[str]) -> list[str]:
+    out: list[str] = []
+    for name in names:
+        if not out or out[-1] != name:
+            out.append(name)
+    return out
+
+
+def _read_json_dict(path: Path) -> dict[str, Any] | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _windows_com_verdict(evidence_dir: Path) -> tuple[str, list[str]]:
+    """只接受 `<evidence_dir>/windows-com.json`（與 win-blackbox.ps1 的 OutDir 同層）並逐項驗證。
+
+    不採信任何 `verdict`／`windows_com` 頂層欄位以外的後門（`report.json`、`com-selftest.json` 不再參與判定）。
+    回傳 (狀態, 原因清單)；狀態為 PASS、FAIL（doc 明示失敗）或 BLOCKED-OWNER（證據缺漏或不符）。
+    """
+    doc = _read_json_dict(evidence_dir / "windows-com.json")
+    if doc is None:
+        return "BLOCKED-OWNER", ["缺少或無法解析 windows-com.json"]
+    if doc.get("windows_com") == "FAIL":
+        return "FAIL", ["windows-com.json 明示 FAIL"]
+    reasons: list[str] = []
+    if doc.get("format") != WINDOWS_COM_FORMAT:
+        reasons.append(f"format 不符：{doc.get('format')!r}")
+    if doc.get("com_pair") != WINDOWS_COM_PAIR:
+        reasons.append(f"com_pair 不符：{doc.get('com_pair')!r}")
+    if doc.get("windows_com") != "PASS":
+        reasons.append(f"windows_com 非 PASS：{doc.get('windows_com')!r}")
+    p4 = doc.get("p4_case")
+    if not (isinstance(p4, dict) and p4.get("nodeid") == WINDOWS_COM_P4_NODE and p4.get("outcome") == "passed"):
+        reasons.append(f"p4_case 非凍結案例 passed：{p4!r}")
+    bridge_stop = doc.get("bridge_stop")
+    if not (isinstance(bridge_stop, dict) and bridge_stop.get("status") == "PASS"):
+        reasons.append("bridge_stop 非 PASS")
+
+    com_dir = evidence_dir / "windows-com"
+    # S0 自測：以 OutDir 內相對路徑讀取，不採信 JSON 內的 Windows 絕對路徑。
+    selftest = _read_json_dict(com_dir / "bridge-selftest" / "selftest-report.json")
+    if selftest is None or selftest.get("verdict") != "PASS":
+        reasons.append("bridge-selftest/selftest-report.json 缺漏或 verdict 非 PASS")
+
+    # 序列：步驟依序為凍結清單，允許結尾的 daemon-stop（finally 清理）；所有含 returncode 的步驟必須為 0。
+    sequence = _read_json_dict(com_dir / "sequence-result.json")
+    if sequence is None or sequence.get("result") != "PASS":
+        reasons.append("sequence-result.json 缺漏或 result 非 PASS")
+    elif isinstance(sequence.get("steps"), list):
+        steps = [s for s in sequence["steps"] if isinstance(s, dict)]
+        deduped = _dedupe_consecutive([str(s.get("name")) for s in steps])
+        expected = list(WINDOWS_COM_SEQUENCE)
+        tail = deduped[len(expected):]
+        if deduped[:len(expected)] != expected or tail not in ([], ["daemon-stop"]):
+            reasons.append(f"sequence 步驟順序不符：{deduped}")
+        bad = [s.get("name") for s in steps if "returncode" in s and s.get("returncode") != 0]
+        if bad:
+            reasons.append(f"sequence 步驟 returncode 非 0：{bad}")
+    else:
+        reasons.append("sequence-result.json 缺少 steps")
+
+    # wire：DUT 端必須有 dut_stdin_write 的 TX，內容含 `echo hi`。
+    wire = com_dir / "bridge" / "wire.ndjson"
+    found_tx = False
+    if wire.is_file():
+        for line in wire.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(row, dict) or row.get("dir") != "TX" or row.get("observation") != "dut_stdin_write":
+                continue
+            try:
+                payload = base64.b64decode(str(row.get("payload_b64", "")), validate=True)
+            except (ValueError, TypeError):
+                continue
+            if b"echo hi" in payload:
+                found_tx = True
+                break
+    if not found_tx:
+        reasons.append("wire.ndjson 缺少 dut_stdin_write TX（echo hi）或檔案不存在")
+
+    return ("PASS" if not reasons else "BLOCKED-OWNER"), reasons
+
+
 def judge_stage1a(
     ab_report_path: Path | None,
     l1_results_dir: Path,
     out_path: Path,
     win_report_path: Path | None = None,
-    l15_report_path: Path | None = None,
+    l15_report_inputs: list[tuple[str, Path]] | None = None,
+    pytest_junit_path: Path | None = None,
     windows_com_dir: Path | None = None,
     repo_root: Path | None = None,
 ) -> int:
@@ -124,34 +307,30 @@ def judge_stage1a(
     else:
         errors.append("缺少 ab-report")
 
-    # 4. l15-report
-    l15_data: dict[str, Any] | None = None
-    if l15_report_path and l15_report_path.is_file():
+    # 4. L1.5 報告依平台標記；缺檔或格式錯誤不提供可通過的案例證據。
+    l15_reports: list[tuple[str, dict[str, Any]]] = []
+    for platform, report_path in l15_report_inputs or []:
+        if not report_path.is_file():
+            errors.append(f"缺少 {platform} l15-report: {report_path}")
+            continue
         try:
-            l15_data = json.loads(l15_report_path.read_text(encoding="utf-8"))
+            report_data = json.loads(report_path.read_text(encoding="utf-8"))
+            if not isinstance(report_data, dict):
+                errors.append(f"{platform} l15-report 格式錯誤: {report_path}")
+                continue
+            l15_reports.append((platform, report_data))
         except Exception as e:
-            errors.append(f"讀取 l15-report 失敗: {e}")
+            errors.append(f"讀取 {platform} l15-report 失敗: {e}")
 
-    # 5. Windows COM
-    windows_com = "BLOCKED-OWNER"
+    pytest_cases = _pytest_junit_cases(pytest_junit_path, errors)
+
+    # 5. Windows COM：--windows-com 指向 OutDir；逐項驗證 windows-com.json 與其引用的子證據。
+    windows_com_reasons: list[str] = []
     if windows_com_dir and windows_com_dir.is_dir():
-        has_pass = False
-        for report_name in ("report.json", "windows-com.json", "com-selftest.json"):
-            rf = windows_com_dir / report_name
-            if rf.is_file():
-                try:
-                    rep_doc = json.loads(rf.read_text(encoding="utf-8"))
-                    if rep_doc.get("windows_com") == "PASS" or rep_doc.get("verdict") == "PASS":
-                        has_pass = True
-                        break
-                except Exception:
-                    pass
-        if has_pass:
-            windows_com = "PASS"
-        else:
-            windows_com = "BLOCKED-OWNER"
+        windows_com, windows_com_reasons = _windows_com_verdict(windows_com_dir)
     else:
         windows_com = "BLOCKED-OWNER"
+        windows_com_reasons = ["未提供 Windows COM 證據目錄（--windows-com）"]
 
     # 6. Windows L1
     if win_report_path and win_report_path.is_file():
@@ -199,7 +378,21 @@ def judge_stage1a(
         evidence = None
 
         if layer == "L1":
-            if cid in ab_cases:
+            source_ref = meta.get("source_ref")
+            prefix = "tests/contract_blackbox/"
+            if isinstance(source_ref, str) and source_ref.startswith(prefix):
+                source_case = source_ref[len(prefix):]
+                matching_rows = ab_cases_by_norm.get(source_case, [])
+                if not matching_rows:
+                    status = "evidence-insufficient"
+                elif all(r.get("class") in ("ok", "rust-only-ok") for r in matching_rows):
+                    status = "ok"
+                    evidence = matching_rows
+                else:
+                    failing = [r for r in matching_rows if r.get("class") not in ("ok", "rust-only-ok")]
+                    status = failing[0].get("class", "regression") if failing else "evidence-insufficient"
+                    evidence = matching_rows
+            elif cid in ab_cases:
                 abc = ab_cases[cid]
                 status = abc.get("class", "evidence-insufficient")
                 evidence = abc
@@ -215,35 +408,17 @@ def judge_stage1a(
             else:
                 status = "evidence-insufficient"
         elif layer == "L1.5":
-            if l15_data and isinstance(l15_data, dict):
-                l15_results = l15_data.get("results")
-                if isinstance(l15_results, list):
-                    case_l15 = [r for r in l15_results if isinstance(r, dict) and r.get("case_id") == cid]
-                    if not case_l15:
-                        status = "evidence-insufficient"
-                    elif any(r.get("verdict") != "PASS" for r in case_l15):
-                        status = "FAIL"
-                        evidence = case_l15
-                    elif any(r.get("gate_eligible") is not True for r in case_l15):
-                        status = "evidence-insufficient"
-                        evidence = case_l15
-                    else:
-                        status = "PASS"
-                        evidence = case_l15
-                elif l15_data.get("pass") and l15_data.get("gate_eligible"):
-                    status = "PASS"
-                    evidence = l15_data
-                else:
-                    status = "evidence-insufficient"
-            else:
-                status = "evidence-insufficient"
+            case_l15 = _l15_case_rows(cid, meta, l15_reports)
+            status = _l15_case_status(case_l15)
+            evidence = case_l15 or None
         elif layer in ("L2", "L3"):
-            if l15_data and isinstance(l15_data, dict) and l15_data.get("evidence_layer") == "L1.5-docker":
-                l15_results = l15_data.get("results") or []
-                if any(isinstance(r, dict) and r.get("case_id") == cid for r in l15_results):
-                    status = "evidence-insufficient"
-                else:
-                    status = "BLOCKED-OWNER"
+            has_l15_docker_row = any(
+                report.get("evidence_layer") == "L1.5-docker"
+                and _l15_case_rows(cid, meta, [(platform, report)])
+                for platform, report in l15_reports
+            )
+            if has_l15_docker_row:
+                status = "evidence-insufficient"
             else:
                 status = "BLOCKED-OWNER"
         else:
@@ -297,15 +472,12 @@ def judge_stage1a(
                        (ec in ab_cases_by_norm and all(r.get("class") in ("ok", "rust-only-ok") for r in ab_cases_by_norm[ec])):
                         has_e2e_or_l15 = True
                         break
-                if not has_e2e_or_l15 and l15_data and isinstance(l15_data, dict):
-                    l15_results = l15_data.get("results")
-                    if isinstance(l15_results, list):
-                        for lc in l15:
-                            if any(isinstance(r, dict) and r.get("case_id") == lc and r.get("verdict") == "PASS" and r.get("gate_eligible") is True for r in l15_results):
-                                has_e2e_or_l15 = True
-                                break
-                    elif l15 and l15_data.get("pass") and l15_data.get("gate_eligible"):
-                        has_e2e_or_l15 = True
+                if not has_e2e_or_l15:
+                    for lc in l15:
+                        l15_meta = case_meta.get(lc, {})
+                        if _l15_case_status(_l15_case_rows(lc, l15_meta, l15_reports)) == "PASS":
+                            has_e2e_or_l15 = True
+                            break
 
                 if not has_e2e_or_l15:
                     row_status = "evidence-insufficient"
@@ -342,6 +514,14 @@ def judge_stage1a(
             errors.append(f"安全不變量數量不足: {len(inv_list)} < 5")
             invariants_ok = False
 
+        has_rust_pytest_cases = any(
+            _is_rust_pytest_case(case_id)
+            for inv in inv_list
+            for case_id in inv.get("cases", [])
+        )
+        if has_rust_pytest_cases and pytest_junit_path is None:
+            errors.append("安全不變量含 test_rust_ pytest 案例，但缺少 pytest JUnit 報告")
+
         for inv in inv_list:
             inv_id = inv.get("id")
             title = inv.get("title")
@@ -353,16 +533,16 @@ def judge_stage1a(
 
             for c in inv_cases:
                 passed = False
-                if (c in ab_cases and ab_cases[c].get("class") in ("ok", "rust-only-ok")) or \
+                if _is_rust_pytest_case(c):
+                    outcomes = pytest_cases.get(_normalize_case_id(c), [])
+                    passed = bool(outcomes) and all(outcome == "passed" for outcome in outcomes)
+                elif (c in ab_cases and ab_cases[c].get("class") in ("ok", "rust-only-ok")) or \
                    (c in ab_cases_by_norm and all(r.get("class") in ("ok", "rust-only-ok") for r in ab_cases_by_norm[c])):
                     passed = True
                 elif any(node.endswith(c) or ("::" in c and node.endswith(c.split("::")[-1])) for node in cargo_pass_nodes):
                     passed = True
-                elif l15_data and isinstance(l15_data, dict):
-                    l15_results = l15_data.get("results")
-                    if isinstance(l15_results, list):
-                        if any(isinstance(r, dict) and r.get("case_id") == c and r.get("verdict") == "PASS" for r in l15_results):
-                            passed = True
+                elif _l15_case_status(_l15_case_rows(c, case_meta.get(c, {}), l15_reports)) == "PASS":
+                    passed = True
                 if not passed:
                     missing_or_failed.append(c)
 
@@ -542,6 +722,7 @@ def judge_stage1a(
         or not l1_ok
         or windows_l1 != "PASS"
         or ab_result != "pass"
+        or windows_com == "FAIL"
     ):
         overall = "FAIL"
     else:
@@ -559,6 +740,7 @@ def judge_stage1a(
         "coverage": coverage_rows,
         "l1": l1_rows,
         "windows_com": windows_com,
+        "windows_com_reasons": windows_com_reasons,
         "windows_l1": windows_l1,
         "overall": overall,
         "errors": errors,
@@ -573,6 +755,18 @@ def judge_stage1a(
 
 
 def main(argv: list[str] | None = None) -> int:
+    def parse_l15_report(value: str) -> tuple[str, Path]:
+        for platform in ("linux", "windows"):
+            prefix = f"{platform}="
+            if value.startswith(prefix):
+                path = value[len(prefix):]
+                if not path:
+                    raise argparse.ArgumentTypeError("L1.5 報告路徑不可為空")
+                return platform, Path(path)
+        if not value:
+            raise argparse.ArgumentTypeError("L1.5 報告路徑不可為空")
+        return "linux", Path(value)
+
     parser = argparse.ArgumentParser(description="Stage 1A gate 判定器")
     parser.add_argument("--ab-report", type=Path, default=None, help="A/B 比較報告 JSON")
     parser.add_argument(
@@ -583,10 +777,16 @@ def main(argv: list[str] | None = None) -> int:
         "--win-report", type=Path, default=None, help="Windows 測試報告 JSON"
     )
     parser.add_argument(
-        "--l15-report", type=Path, default=None, help="L1.5 功能測試報告 JSON"
+        "--l15-report", action="append", type=parse_l15_report, default=[],
+        help="L1.5 功能測試報告；未帶平台前綴時視為 linux，也可指定 linux=<path> 或 windows=<path>；可重複指定",
     )
     parser.add_argument(
-        "--windows-com", type=Path, default=None, help="Windows COM 驗證目錄"
+        "--pytest-junit-report", type=Path, default=None,
+        help="SW_REQUIRE_CARGO=1 完整 pytest 執行的 JUnit XML",
+    )
+    parser.add_argument(
+        "--windows-com", type=Path, default=None,
+        help="Windows COM 證據 OutDir（須含 windows-com.json；win-blackbox.ps1 的輸出根目錄）",
     )
     parser.add_argument(
         "--repo", type=Path, default=None, help="Repo 根目錄（預設自動推算）"
@@ -598,7 +798,8 @@ def main(argv: list[str] | None = None) -> int:
         l1_results_dir=args.l1_results,
         out_path=args.out,
         win_report_path=args.win_report,
-        l15_report_path=args.l15_report,
+        l15_report_inputs=args.l15_report,
+        pytest_junit_path=args.pytest_junit_report,
         windows_com_dir=args.windows_com,
         repo_root=args.repo,
     )
