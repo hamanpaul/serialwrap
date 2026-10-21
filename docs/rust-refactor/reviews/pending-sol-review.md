@@ -10,6 +10,17 @@ Codex 帳號額度於 2026-10-21 約 18:28（台北）用完，恢復時間 2026
 | feature/rust-refactor-p9a | 24f42d0 | P9-T7B L1.5 A/B 差分 | Sonnet max | 待補審 |
 | feature/rust-refactor-p9a | d6c08e0 | P9-T7 A/B 絕對契約與差分判定 | Sonnet max | 待補審 |
 | feature/rust-refactor-p9a | 5a038a1 | P9-T14 Stage 0～3 出口證據索引 | Sonnet max | 待補審 |
+| feature/rust-refactor | a1ba28b | 1 Stage 1 exit closure 第 1 輪：sw-cli 收斂 | Sonnet max | 待補審 |
+| feature/rust-refactor | 58e539d | 1 Stage 1 exit closure 第 1 輪：閘門與 A/B 腳本 | Sonnet max | 待補審 |
+| feature/rust-refactor | d457a72 | 1 Stage 1 exit closure 第 1 輪：Docker systemd 腳本 | Sonnet max | 待補審 |
+| feature/rust-refactor | b3ec03b | 1 Stage 1 exit closure 第 1 輪：contract_blackbox 夾具 | Sonnet max | 待補審 |
+| feature/rust-refactor | f8e31b2 | 1 Stage 1 exit closure 第 1 輪：閘門單元測試 | Sonnet max | 待補審 |
+| feature/rust-refactor | 79475c8 | 1 Stage 1 exit closure 第 1 輪：凍結案例 add-only 與計畫指令 | Sonnet max | 待補審 |
+| feature/rust-refactor | 87592d4 | 1 Stage 1 exit closure 第 2 輪：ab_blackbox_1b 腳本模式與身分 | Sonnet max | 待補審 |
+| feature/rust-refactor | 0d49f83 | 1 Stage 1 exit closure 第 2 輪：daemon EIO／current-release 路徑 | Sonnet max | 待補審 |
+| feature/rust-refactor | 5283883 | 1 Stage 1 exit closure 第 2 輪：P4 登記拒絕髒樹 | Sonnet max | 待補審 |
+| feature/rust-refactor | 03d101a | 1 Stage 1 exit closure 第 2 輪：L15 延遲回覆與 runner fail-closed | Sonnet max | 待補審 |
+| feature/rust-refactor | c0c3c29 | 1 Stage 1 exit closure 第 2 輪：Windows COM 閘門 schema | Sonnet max | 待補審 |
 
 後續新增的單審 commit 一律追加於此表。
 
