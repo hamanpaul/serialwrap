@@ -9,8 +9,10 @@ A/B 案例同時以 Python 基線與受測 CLI 執行並比對輸出。預設執
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -246,12 +248,32 @@ def test_autostart_l15_tx_once(tmp_path: Path, env: dict[str, str], no_delegatio
     """
     if os.name != "nt":
         pytest.skip("windows_native：僅原生 Windows 執行")
-    if not os.environ.get("SW_TEST_COM_PAIR"):
+    com_pair = os.environ.get("SW_TEST_COM_PAIR")
+    if not com_pair:
         pytest.skip("BLOCKED-OWNER：需 SW_TEST_COM_PAIR（OD-08／OD-15 擁有者 host 的 com0com 配對）")
+    assert com_pair == "COM20:COM21", "本案例只允許 DUT-side pair COM20:COM21"
     wire = os.environ.get("SW_TEST_DUT_WIRE")
     assert wire, "SW_TEST_DUT_WIRE 必須指向 DUT 模擬器的 wire.ndjson"
 
-    res = run_cli(["cmd", "submit", "--selector", "COM0", "--cmd", "echo X"], env=env, timeout_s=120)
-    assert res.rc == 0, res.stderr
-    text = Path(wire).read_text(encoding="utf-8", errors="replace")
-    assert text.count("echo X\r") == 1
+    # fixture 會清除外層 SERIALWRAP_*；重新只放行受測端 COM20，避免掃描其他主機序列埠。
+    env["SERIALWRAP_TEST_DEVICE_ALLOWLIST"] = "COM20"
+    # 使用本案例獨有的 loopback endpoint，避免連到主機既有 daemon 或其他 throwaway run。
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        env["SERIALWRAP_ENDPOINT"] = f"tcp://127.0.0.1:{listener.getsockname()[1]}"
+
+    res = None
+    try:
+        res = run_cli(["cmd", "submit", "--selector", "COM0", "--cmd", "echo X"], env=env, timeout_s=120.0)
+        assert res.rc == 0, res.stderr.decode("utf-8", errors="replace")
+        rows = [json.loads(line) for line in Path(wire).read_text(encoding="utf-8").splitlines() if line]
+        dut_tx = b"".join(
+            base64.b64decode(row["payload_b64"], validate=True)
+            for row in rows
+            if row.get("dir") == "TX" and row.get("observation") == "dut_stdin_write"
+        )
+        assert dut_tx.count(b"echo X\r") == 1
+    finally:
+        stop = run_cli(["daemon", "stop"], env=env, timeout_s=60.0)
+        if res is not None and res.rc == 0:
+            assert stop.rc == 0, stop.stderr.decode("utf-8", errors="replace")

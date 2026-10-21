@@ -2,7 +2,7 @@
 
 A/B 案例（`status`／`close` 空集合、stub ssh 開通）同時執行 Python 基線與受測 CLI，比對輸出。
 `test_remote_topologies_docker` 使用 P4-T1 的 `mgmt_bundle`（`mkbundle.sh --dev --delegate-sentinel`）
-驗證容器拓樸；P4-T7 未到位時嚴格 xfail 並保留未達成證據。fixture 延遲載入，避免本檔在夾具未就緒時影響整體收集。
+驗證 Rust CLI 在四種容器拓樸的遠端行為。fixture 延遲載入，避免本檔在夾具未就緒時影響整體收集。
 """
 from __future__ import annotations
 
@@ -204,10 +204,8 @@ def test_remote_sigint_cleans_spawned_tunnel(tmp_path: Path) -> None:
 
 @pytest.mark.case("bc05-three-topologies")
 @pytest.mark.rust_only
-@pytest.mark.xfail(
-    strict=True,
-    reason="P4-T7 未列入本批；daemon status 仍由 P3-T16 run_delegate stub 委派",
-)
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
 def test_remote_topologies_docker(tmp_path: Path, mgmt_bundle) -> None:
     if shutil.which("docker") is None:
         pytest.skip("cap docker：本機沒有 docker 指令")

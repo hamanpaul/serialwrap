@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,7 @@ from typing import Any, Callable, Iterator
 import pytest
 
 from bb_harness import repo_root
+from bb_l15 import bundle_manifest_path
 
 STUBS_BIN = Path(__file__).resolve().parent / "stubs" / "bin"
 LIVE_PROFILE_YAML = """profiles:
@@ -80,13 +82,21 @@ def mgmt_bundle(env: dict[str, str], tmp_path: Path) -> Iterator[MgmtBundle]:
     """
     script = repo_root() / "scripts" / "rust" / "mkbundle.sh"
     out = tmp_path / "bundle"
-    supplied = os.environ.get("SW_WIN_DEV_BUNDLE") if os.name == "nt" else None
-    if supplied:
+    supplied_g5 = os.environ.get("SW_G5_MGMT_BUNDLE")
+    supplied_windows = os.environ.get("SW_WIN_DEV_BUNDLE") if os.name == "nt" else None
+    if supplied_g5:
+        bundle_dir = Path(supplied_g5).resolve()
+        root = repo_root().resolve()
+        assert root in bundle_dir.parents, f"G5 管理 bundle 須位於本 worktree：{bundle_dir}"
+        manifest = bundle_manifest_path(bundle_dir)
+        assert manifest.is_file(), f"G5 管理 bundle 缺少 manifest：{bundle_dir}"
+        assert not (bundle_dir / "DELEGATED").exists(), f"G5 管理 bundle 起始時已有委派 marker：{bundle_dir}"
+    elif supplied_windows:
         # Windows 主機沿用本機 dev bundle，避免在 Windows 啟動 POSIX .sh。
-        shutil.copytree(supplied, out, symlinks=True)
+        shutil.copytree(supplied_windows, out, symlinks=True)
         bundle_dir = out
         version = (repo_root() / "VERSION").read_text(encoding="utf-8").strip()
-        version_manifest = bundle_dir / "versions" / version / "release-manifest.json"
+        version_manifest = bundle_manifest_path(bundle_dir, version)
         assert version_manifest.is_file(), f"Windows dev bundle 缺少版本 manifest：{version_manifest}"
         manifest_data = json.loads(version_manifest.read_text(encoding="utf-8"))
         entry = manifest_data["components"]["python_cli_delegate"]["entry"]
@@ -96,7 +106,6 @@ def mgmt_bundle(env: dict[str, str], tmp_path: Path) -> Iterator[MgmtBundle]:
             json.dumps(manifest_data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
-        shutil.copy2(version_manifest, bundle_dir / "release-manifest.json")
     else:
         res = subprocess.run(
             ["bash", str(script), "--dev", "--delegate-sentinel", "--out", str(out), "--print-dir"],
@@ -107,7 +116,7 @@ def mgmt_bundle(env: dict[str, str], tmp_path: Path) -> Iterator[MgmtBundle]:
         )
         assert res.returncode == 0, res.stderr
         bundle_dir = Path(res.stdout.strip().splitlines()[-1])
-    manifest = bundle_dir / "release-manifest.json"
+    manifest = bundle_manifest_path(bundle_dir)
     env["SERIALWRAP_RELEASE_MANIFEST"] = str(manifest)
     env["SW_DELEGATE_MARKER"] = str(bundle_dir / "DELEGATED")
     bundle = MgmtBundle(
