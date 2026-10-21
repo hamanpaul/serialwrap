@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "session",
+    "--help"
+  ],
+  "columns": 120,
+  "rc": 0,
+  "stdout": "usage: serialwrap session [-h] <command> ...\n\n管理 session：列舉與綁定、健康探測（self-test）、recover、console 與 interactive lease、capture log。\n\npositional arguments:\n  <command>\n    list              列出所有 session 及其狀態\n    clear             清除 session（detach 後會自動 re-attach；交接外部請改用 device release）\n    bind              把 session 綁定到指定裝置 by-id\n    pin               把 device 釘到指定 profile（最高優先，繞過偵測）\n    unpin             解除 device 的 profile pin（保留 sticky）\n    attach            將 session attach 到裝置並建立 bridge\n    self-test         探測 session 健康度，回報 classification 與 recommended_action\n    activity          顯示 session 的 RX／TX／state 活動\n    recover           重建 bridge 修復不健康的 session（TARGET_UNRESPONSIVE 時用這個，非 device attach）\n    console-attach    附加一個 console reader 到 session\n    console-detach    卸除指定的 console reader\n    console-list      列出 session 上的 console readers\n    interactive-open  開啟 interactive lease（給全螢幕互動程式用）\n    interactive-send  送出按鍵／資料到 interactive lease\n    interactive-status\n                      讀取 interactive lease 目前畫面與狀態\n    interactive-close\n                      關閉 interactive lease\n    log-start         開始該 session 的 capture log\n    log-stop          停止該 session 的 capture log\n    log-status        查詢該 session 的 capture log 狀態\n\noptions:\n  -h, --help          show this help message and exit\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

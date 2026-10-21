@@ -15,6 +15,7 @@ tags-session-manager
 /tmp
 /dist
 /build
+/target
 /htmlcov
 /coverage
 # OD-15 docker runner 的證據輸出（含容器 root 擁有的 0700 目錄）不得進入 build context

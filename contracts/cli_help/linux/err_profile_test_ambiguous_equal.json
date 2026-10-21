@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "profile",
+    "test",
+    "--pro=x"
+  ],
+  "columns": 80,
+  "rc": 2,
+  "stdout": "",
+  "stderr": "usage: serialwrap profile test [-h] --profile PROFILE --sample SAMPLE\n                               [--profile-dir PROFILE_DIR]\nserialwrap profile test: error: ambiguous option: --pro=x could match --profile, --profile-dir\n",
+  "native": true,
+  "post_parse_effects": false
+}

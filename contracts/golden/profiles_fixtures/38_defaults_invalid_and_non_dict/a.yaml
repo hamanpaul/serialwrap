@@ -1,0 +1,4 @@
+defaults: 5
+profiles:
+  p:
+    platform: shell

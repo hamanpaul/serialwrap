@@ -440,6 +440,8 @@ impl SessionLastError {
 }
 ```
 
+> **勘誤（P3-T8 審查，2026-10-17）**：上方 Rust 段以 arch §3.2（`plans/rust-architecture.md`「`error_codes.rs`」條）與 `plans/04-stage1a-rust-cli.md` Task 8 Interfaces 為準：`ErrorMeta` 不含 `uart_tx`（YAML 的 `uart_tx` 仍是資料欄，未進入生成型別；若擁有者要求進入 META，須於 P3 Task 13 依賴 META 前補生成器）；`RpcErrorCode`／`LastErrorPassthrough` 依 SC-34 不產生；`SessionLastError` 的字串方法為 `as_string`（非 `as_wire`）；`USER_ENV_MISSING` 的 `reachable:false` 由生成檔文件註解表達，`SessionLastError` 無 META。
+
 YAML→Rust 映射：`rpc→Interface::Rpc`、`rpc_frame→RpcFrame`、`cli_client→CliClient`、`cli_local→CliLocal`、`rec→Rec`、`proc→Proc`；`"yes"→Retryable::Yes`、`"no"→No`、`"conditional"→Conditional`、`"fix_args"→FixArgs`；`EXISTING→Status::Existing`、`APPROVED→Approved`、`IMPLEMENTED→Implemented`、`VERIFIED→Verified`。`wal_record.schema.json` 對應 `sw_proto::wal_types::WalRecord`（arch §3.8）；`state_file.schema.json` 對應 `sw_core::state_store`；`rpc_schema.json` 的 `x-methods` 鍵集合對應 `sw_proto::rpc_types::Method`（arch §3.5）。
 
 ---

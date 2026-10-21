@@ -1,0 +1,15 @@
+base: &base
+  platform: prpl
+  prompt_regex: "P"
+  timeout_s: 3
+
+profiles:
+  derived:
+    <<: *base
+    prompt_regex: "D"
+  plain:
+    <<: [*base]
+
+targets:
+  - {profile: derived, device_by_id: d1}
+  - {profile: plain, device_by_id: d2}

@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "remote",
+    "--help"
+  ],
+  "columns": 21,
+  "rc": 0,
+  "stdout": "usage: serialwrap remote\n       [-h] [-R]\n       [-L]\n       [--autossh]\n       [--local LOCAL]\n       [--remote-socket REMOTE_SOCKET]\n       [--ready-timeout READY_TIMEOUT]\n       [--ssh-opt SSH_OPT]\n       [words ...]\n\nserialwrap remote：外包系統 ssh 建立 -R（expose，把本機 daemon 推到對端）／-L（connect，relay 情境把對端 port 拉回本機 loopback）隧道，background 常駐。\n  serialwrap remote user@host:7777        # -R 預設：expose 本機 daemon\n  serialwrap remote -L user@relay:7777    # connect（relay/雙 NAT）\n  serialwrap remote                        # 列目前隧道（status）\n  serialwrap remote close 7777|all         # 拆除\n  serialwrap remote stop [port|all]        # close 的別名，省略時拆除全部\n安全：只透過 ssh-tunnel、單租戶/可信 relay 或 --remote-socket；不可對網路直接開放。\n\npositional arguments:\n  words\n    [user@]host:por\n    t ｜ status ｜\n    close/stop\n    [port|all]\n\noptions:\n  -h, --help\n    show this help\n    message and\n    exit\n  -R\n    reverse/expose（\n    預設）\n  -L\n    forward/connect\n    （relay）\n  --autossh\n    以 autossh\n    斷線自動重連\n  --local LOCAL\n    -L 本機 loopback\n    port（預設=對端\n    port）\n  --remote-socket REMOTE_SOCKET\n    硬化：-R 建遠端 unix\n    socket／-L 連該\n    socket（共享 relay\n    建議）\n  --ready-timeout READY_TIMEOUT\n    readiness\n    確認上限秒數（逾時回\n    starting）\n  --ssh-opt SSH_OPT\n    透傳額外 ssh\n    參數（可重複），如\n    --ssh-opt=-p\n    --ssh-opt=2222\n",
+  "stderr": "",
+  "native": false,
+  "post_parse_effects": false
+}

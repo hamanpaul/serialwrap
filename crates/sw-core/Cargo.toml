@@ -1,0 +1,11 @@
+[package]
+name = "sw-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# 業務 actor 與仲裁（Stage 2 承接；P3 為空殼）。
+[dependencies]
+sw-proto = { path = "../sw-proto" }
+sw-pal = { path = "../sw-pal" }

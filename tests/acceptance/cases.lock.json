@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "cases_revision": "2026-10-20.1",
+  "cases_revision": "2026-10-21.1",
   "sets": {
     "stage0": [
       "brcm-01-login-flow",
@@ -99,6 +99,18 @@
       "win-wal-f12-progress"
     ],
     "cli_1A": [
+      "bb-alias-roundtrip",
+      "bb-cmd-background-result-tail",
+      "bb-cmd-submit-status",
+      "bb-console-attach-detach",
+      "bb-device-mcu-health",
+      "bb-event-rule-roundtrip",
+      "bb-interactive-lease-roundtrip",
+      "bb-local-rejections-zero-tx",
+      "bb-log-and-wal",
+      "bb-no-version-warning",
+      "bb-recover-release-attach-no-replay",
+      "bb-session-reaches-ready",
       "brcm-01-login-flow",
       "ev-01-spawn-handler",
       "f1-cmdid-survives-timeout",
@@ -163,6 +175,18 @@
       "win-wal-av-unlink"
     ],
     "cli_1B": [
+      "bb-alias-roundtrip",
+      "bb-cmd-background-result-tail",
+      "bb-cmd-submit-status",
+      "bb-console-attach-detach",
+      "bb-device-mcu-health",
+      "bb-event-rule-roundtrip",
+      "bb-interactive-lease-roundtrip",
+      "bb-local-rejections-zero-tx",
+      "bb-log-and-wal",
+      "bb-no-version-warning",
+      "bb-recover-release-attach-no-replay",
+      "bb-session-reaches-ready",
       "brcm-01-login-flow",
       "co-01-line-buffering",
       "cowork-01-agent-bad-cmd",
@@ -638,6 +662,150 @@
     ]
   },
   "case_attrs": {
+    "bb-alias-roundtrip": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "bb-cmd-background-result-tail": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "bb-cmd-submit-status": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "bb-console-attach-detach": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "bb-device-mcu-health": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "bb-event-rule-roundtrip": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "bb-interactive-lease-roundtrip": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "bb-local-rejections-zero-tx": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "bb-log-and-wal": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "bb-no-version-warning": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "bb-recover-release-attach-no-replay": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "bb-session-reaches-ready": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
     "brcm-01-login-flow": {
       "suite": "func-test",
       "layer": "L1.5",

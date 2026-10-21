@@ -1,0 +1,11 @@
+profiles:
+  t:
+    platform: shell
+    user_env: TPL_U
+    username: rootuser
+    console_unlock_env: TPL_UNLOCK
+
+targets:
+  - {profile: t, device_by_id: d1, user_env: ~, console_unlock_env: "  "}
+  - {profile: t, device_by_id: d2, username: ""}
+  - {profile: t, device_by_id: d3, username: 42}

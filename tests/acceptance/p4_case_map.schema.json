@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "serialwrap P4 acceptance case map schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "cases"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer"
+    },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "case_id",
+          "invariants",
+          "layer",
+          "platforms",
+          "capabilities",
+          "artifact",
+          "tests",
+          "evidence",
+          "necessity"
+        ],
+        "properties": {
+          "evidence_status": {
+            "type": "string",
+            "enum": ["BLOCKED-OWNER"]
+          },
+          "case_id": {
+            "type": "string"
+          },
+          "invariants": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "insufficient_evidence_not_pass",
+                "no_auto_resend",
+                "no_forbidden_interleave",
+                "no_reopen_before_handoff",
+                "no_stale_context_replay",
+                "zero_tx_on_reject"
+              ]
+            }
+          },
+          "layer": {
+            "type": "string",
+            "enum": [
+              "L1",
+              "L1.5",
+              "L2",
+              "L3"
+            ]
+          },
+          "platforms": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "linux",
+                "windows"
+              ]
+            }
+          },
+          "capabilities": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "type": "string"
+            }
+          },
+          "artifact": {
+            "type": "string",
+            "enum": [
+              "rust-cli-bundle",
+              "sw-pal-test-bin"
+            ]
+          },
+          "tests": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "evidence": {
+            "type": "string",
+            "pattern": "^target/p4-evidence/[^/]+\\.json$"
+          },
+          "necessity": {
+            "type": "string",
+            "enum": [
+              "required",
+              "optional"
+            ]
+          },
+          "skip_registered": {
+            "type": "object",
+            "propertyNames": {
+              "enum": [
+                "python",
+                "rust",
+                "linux",
+                "windows"
+              ]
+            },
+            "additionalProperties": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,13 @@
+[package]
+name = "sw-com0com-helper"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "sw-com0com-helper"
+path = "src/main.rs"
+
+[dependencies]
+sw-pal = { path = "../sw-pal" }

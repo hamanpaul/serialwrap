@@ -1,0 +1,14 @@
+{
+  "argv": [
+    "profile",
+    "test",
+    "--profile",
+    "p"
+  ],
+  "columns": 80,
+  "rc": 2,
+  "stdout": "",
+  "stderr": "usage: serialwrap profile test [-h] --profile PROFILE --sample SAMPLE\n                               [--profile-dir PROFILE_DIR]\nserialwrap profile test: error: the following arguments are required: --sample\n",
+  "native": true,
+  "post_parse_effects": false
+}

@@ -27,21 +27,21 @@
 | Linux target | `x86_64-unknown-linux-gnu` |
 | Windows target | `x86_64-pc-windows-gnu`。開發迴圈在 WSL 以 `x86_64-w64-mingw32-gcc` 交叉連結，再經 interop 執行（§9.4）。**正式 gate 與 release artifact 一律在擁有者 Windows 自架 runner 上原生 build/link**（同一 target triple，`stable-x86_64-pc-windows-gnu` host toolchain），以符合 ADR-01「cross check 不取代原生 build/link」 |
 | profile.release | `opt-level=3`、`lto="thin"`、`codegen-units=1`、`panic="unwind"`、`debug=1`、`strip="none"`（符號另存）；RPC 邊界以 `catch_unwind` 對應 Python 的 `EXCEPTION` |
-| `.cargo/config.toml` | `[target.x86_64-pc-windows-gnu] linker = "x86_64-w64-mingw32-gcc"`、`runner = "scripts/rust/win-runner.sh"` |
-| Windows 連結檢查 | release pipeline 以 `objdump -p` 確認匯入 DLL 只有 `KERNEL32`、`ADVAPI32`、`WS2_32`、`ntdll`、`bcryptprimitives`／`bcrypt`、`USERENV`、`msvcrt`／`api-ms-win-crt-*`；出現 mingw 執行期 DLL 時判定失敗 |
+| `.cargo/config.toml` | **P3 修訂（§0.7）**：不設 `runner`／`linker`。host triple 即 `x86_64-pc-windows-gnu` 的原生 Windows runner 上，`[target.<triple>].runner` 會套用到不帶 `--target` 的原生 `cargo test`。WSL 交叉執行改由 `scripts/rust/win-test.sh`／`win-runner.sh` 偵測 WSL（`WSL_DISTRO_NAME` 或 `/proc/sys/fs/binfmt_misc/WSLInterop`）後以 `CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER`、`CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER` 環境變數注入；`.cargo/config.toml` 只放與平台無關的設定，無設定時可省略（P3-T1 省略此檔） |
+| Windows 連結檢查 | release pipeline 以 `objdump -p` 確認匯入 DLL 只有 `KERNEL32`、`ADVAPI32`、`WS2_32`、`ntdll`、`bcryptprimitives`／`bcrypt`、`USERENV`、`msvcrt`／`api-ms-win-crt-*`；出現 mingw 執行期 DLL 時判定失敗（明列禁止 `libgcc_s_seh-1.dll`、`libwinpthread-1.dll`、`libstdc++-6.dll`）。**P3 修訂（§0.7）**：允許清單加入 `api-ms-win-core-*`（Rust std 的 `WaitOnAddress` 匯入 `api-ms-win-core-synch-l1-2-0.dll`；2026-10 實測交叉編譯 std exe 的匯入表） |
 
 ### 1.2 依賴（全部 `=` 釘版本；版本至 2026-10-15 皆已發佈兩週以上）
 
 | crate | 版本 | 使用者 | 理由 |
 |---|---|---|---|
-| `indexmap` | `=2.11.4` | sw-proto | `PyDict` 需要保留插入序（Python dict 語意）。MSRV 1.63 |
+| `indexmap` | `=2.11.4` | sw-proto、sw-cli | `PyDict` 需要保留插入序（Python dict 語意）；sw-cli 的 argparse `Namespace` 同樣需要插入序（P3-T10 Produces）。MSRV 1.63 |
 | `fancy-regex` | `=0.16.2`（`default-features=false, features=["std","unicode","perf"]`） | sw-proto | Python `re` 方言的**執行**引擎：支援 lookaround、backreference、atomic group，並以 `backtrack_limit` 限制回溯（ADR-01）。語法**接受與否**由自製 `pyre` 決定（§3.6） |
 | `yaml-rust2` | `=0.10.4`（`default-features=false`） | sw-proto | 只用低階事件解析器：它保留 scalar style，plain 與 quoted 才能分辨，再由自製 resolver 重現 PyYAML `SafeLoader` 的 YAML 1.1 解析（§3.7）。serde_yaml 走 YAML 1.2 且丟失 style，不採用 |
 | `crc32fast` | `=1.5.0` | sw-proto | IEEE CRC-32（zlib 相同 poly／init／xorout） |
 | `sha2` | `=0.10.9` | sw-proto | `cli_trace` 的 `endpoint_id`、remote `identity`、release manifest digest |
 | `crossbeam-channel` | `=0.5.15` | sw-pal、sw-core、sw-daemon | 有界 MPMC 與 `select_biased!`：mailbox 的 control lane 優先、deadline receive |
 | `libc` | `=0.2.186` | sw-pal（`cfg(unix)`） | poll、flock、`TIOCEXCL`、termios、openpty、`/proc`、`getrandom` 等 POSIX syscall |
-| `windows-sys` | `=0.61.2` | sw-pal（`cfg(windows)`） | `CreateFileW`、overlapped I/O、`CancelIoEx`、`LockFileEx`、COMM、Toolhelp32、Job Object、`BCryptGenRandom`、`FILE_SHARE_DELETE`、`GetFileInformationByHandleEx`、Winsock、Console。features：`Win32_Foundation`、`Win32_Storage_FileSystem`、`Win32_System_IO`、`Win32_Devices_Communication`、`Win32_System_Threading`、`Win32_Networking_WinSock`、`Win32_System_Console`、`Win32_System_JobObjects`、`Win32_System_Diagnostics_ToolHelp`、`Win32_Security`、`Win32_Security_Cryptography`、`Win32_System_Registry`、`Win32_System_Time`、`Win32_System_SystemInformation`、`Wdk_System_Threading` |
+| `windows-sys` | `=0.61.2` | sw-pal（`cfg(windows)`） | `CreateFileW`、overlapped I/O、`CancelIoEx`、`LockFileEx`、COMM、Toolhelp32、Job Object、`BCryptGenRandom`、`FILE_SHARE_DELETE`、`GetFileInformationByHandleEx`、Winsock、Console。features：`Win32_Foundation`、`Win32_Storage_FileSystem`、`Win32_System_IO`、`Win32_Devices_Communication`、`Win32_System_Threading`、`Win32_Networking_WinSock`、`Win32_System_Console`、`Win32_System_JobObjects`、`Win32_System_Diagnostics_ToolHelp`、`Win32_Security`、`Win32_Security_Cryptography`、`Win32_System_Registry`、`Win32_System_Time`、`Win32_System_SystemInformation`、`Wdk_System_Threading`、`Win32_Globalization`（`MultiByteToWideChar`）、`Win32_System_Diagnostics_Debug`（`FormatMessageW`）、`Win32_System_LibraryLoader`、`Win32_UI_Shell`（**P4-T1／P4-T19 修訂**：前二者支援 KERNEL32 訊息處理；後二者只供 `sw-pal` 以 `LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_SYSTEM32)` 動態解析 `ShellExecuteExW`，不在產品匯入表靜態匯入 SHELL32，仍須通過 `check_win_imports.py`）|
 | dev：`tempfile` | `=3.23.0` | 各 crate 測試 | 隔離目錄 |
 
 **刻意不採用**：
@@ -59,7 +59,7 @@
 serialwrap/
 ├── Cargo.toml                      # [workspace] members=["crates/*"], resolver="2", [workspace.package] edition/rust-version
 ├── rust-toolchain.toml
-├── .cargo/config.toml
+├── .cargo/config.toml              # P3-T1 省略（§0.7：無平台無關設定）
 ├── contracts/
 │   ├── error_codes.yaml            # RPC/CLI error_code（含 interface、reachable、retryable…）
 │   ├── session_last_errors.yaml    # session last_error 獨立命名空間
@@ -78,7 +78,7 @@ serialwrap/
 │   ├── sw-pal/                     # 唯一允許平台 cfg 的 crate
 │   │   └── src/ lib.rs traits.rs sysenv.rs serial.rs device_source.rs device_watcher.rs lock.rs wal_fs.rs
 │   │            rpc_transport.rs console_pty.rs console_com0com.rs service_ctl.rs process_tunnel.rs
-│   │            **console_tcp.rs proc_scan.rs clock.rs fs_ops.rs process.rs signal.rs fakes/{mod.rs,serial.rs,clock.rs,fs.rs,proc.rs,console.rs}**
+│   │            **console_tcp.rs proc_scan.rs clock.rs fs_ops.rs process.rs signal.rs select.rs fakes/{mod.rs,env.rs,rpc.rs,process.rs,serial.rs,clock.rs,fs.rs,proc.rs,console.rs}**
 │   │            （每個平台相依檔另有 `<name>/posix.rs`、`<name>/windows.rs` 子模組）
 │   ├── sw-core/                    # 業務：actor、仲裁、登入、WAL、console、事件
 │   │   └── src/ lib.rs session_manager.rs uart_bridge.rs telnet_console.rs arbiter.rs login_fsm.rs wal.rs
@@ -89,12 +89,13 @@ serialwrap/
 │   │            （規格的 bench_registry.rs → sw-proto；state_migrate.rs → sw-cli）
 │   ├── sw-daemon/                  # bin `serialwrapd`
 │   │   └── src/ main.rs service.rs daemon_main.rs **framing.rs health.rs launcher.rs**
-│   └── sw-cli/                     # bin `serialwrap`
-│       └── src/ main.rs client.rs remote_tunnel.rs doctor_cmd.rs setup_cmd.rs cli_trace.rs
+│   ├── sw-cli/                     # bin `serialwrap`
+│   │   └── src/ main.rs **lib.rs ctx.rs** client.rs remote_tunnel.rs doctor_cmd.rs setup_cmd.rs cli_trace.rs
 │                **argparse/{mod.rs,parser.rs,help.rs,usage.rs,error.rs} cli_spec.rs output.rs endpoint_resolve.rs
 │                delegate.rs bench_state.rs state_migrate.rs install_layout.rs rollback.rs assets.rs
 │                commands/{rpc_cmds.rs,daemon_cmd.rs,service_cmd.rs,supervision_cmd.rs,remote_cmd.rs,connect_cmd.rs,
 │                          benches_cmd.rs,event_cmd.rs,profile_cmd.rs,skill_cmd.rs}**
+│   └── sw-com0com-helper/          # bin `sw-com0com-helper`；UAC 後唯一呼叫 com0com PAL 的安裝／移除 helper
 ├── scripts/rust/ **win-runner.sh win-test.sh check_cfg_boundary.py mkbundle.sh capture_cli_help.py gen_error_codes.py**
 ├── tests/contract_blackbox/        # Python pytest 黑箱；不 import sw_core
 └── tests/acceptance/               # 案例承接清單與 schema（規格 §3.2）
@@ -106,9 +107,10 @@ serialwrap/
 sw-proto  ←  sw-core  ←  sw-daemon
    ↑           ↑
 sw-pal ────────┘ ←  sw-cli（只依賴 sw-proto + sw-pal；不得連結 sw-core）
+sw-pal ──────────────────────────── sw-com0com-helper
 ```
 
-`sw-pal` 不依賴 `sw-proto`，平台型別在 PAL 內自行定義。`sw-cli` 不連結 `sw-core`，避免 CLI 夾帶 daemon 邏輯並維持啟動成本。CLI 需要的純資料語意（regex 驗證、profile 載入、bench registry）放在 `sw-proto`。
+`sw-pal` 不依賴 `sw-proto`，平台型別在 PAL 內自行定義。`sw-cli` 不連結 `sw-core`，避免 CLI 夾帶 daemon 邏輯並維持啟動成本。`sw-com0com-helper` 只依賴 `sw-pal`，確保提權後的 setupc 與登錄操作仍經 PAL。CLI 需要的純資料語意（regex 驗證、profile 載入、bench registry）放在 `sw-proto`。
 
 ### 1.4 執行緒模型：std thread＋有界 crossbeam channel（不採用 tokio）
 
@@ -130,9 +132,10 @@ sw-pal ────────┘ ←  sw-cli（只依賴 sw-proto + sw-pal；�
 在 `sw-pal` 以外的 crate（sw-proto、sw-core、sw-daemon、sw-cli）禁止下列寫法：
 
 - 任何 `#[cfg(...)]`、`#![cfg(...)]`、`#[cfg_attr(...)]`、`cfg!(...)`，其謂詞含 `unix`、`windows`、`target_os`、`target_family`、`target_env`、`target_vendor`、`debug_assertions`。
-- `use std::os::unix`、`use std::os::windows`、`libc::`、`windows_sys::`。
-- `build.rs`、`[build-dependencies]`。
-- Cargo.toml 內的 `[target.'cfg(` 區段。
+- `use std::os::unix`、`use std::os::windows`（含 `use std::{…, os::unix::…}` 群組寫法）、`libc::`、`windows_sys::`。
+- `std::env::consts::OS`、`FAMILY` 的執行期比較（**P3 補列（§0.7）**：業務碼不得以 OS 名稱分支）。
+- `build.rs`、`[build-dependencies]`（含引號 key 與表形式 `[build-dependencies.x]`）、`[package] build`。
+- Cargo.toml 內的任何 `[target.…]` 區段（**P3 加嚴（§0.7）**：triple 表與 `cfg(...)` 表同樣是平台分支）。
 
 允許的寫法：`#[cfg(test)]`，以及 `#[cfg(feature = "test-fakes")]`（白名單只有這一個 feature）。
 
@@ -195,7 +198,7 @@ sw-pal ────────┘ ←  sw-cli（只依賴 sw-proto + sw-pal；�
 | human console | `timeout_s=30.0`、`priority=100`、`source="human:<client_id>"`、`HUMAN_INTERACTIVE_COMMANDS`（18 個，02 §9） | service.py |
 | Drain（新） | `DRAIN_TIMEOUT_MS=3000`（§5.2.5） | constants.py |
 
-`runtime_paths.rs`：`RuntimePaths::resolve(env: &EnvSnapshot, native: NativeTraits) -> RuntimePaths`。逐字重現 constants.py 的 import-time 規則，包含：
+`runtime_paths.rs`：`RuntimePaths::resolve(env: &EnvSnapshot, native: NativeTraits, home: &dyn HomeLookup) -> Result<RuntimePaths, PathsError>`（**P3 修訂（§0.7）**：路徑欄位為 `String`，golden 直接比對字串；`default_tcp_port` 為 `PyInt`，Q-15 非法 port 必須回錯，不得截斷）。逐字重現 constants.py 的 import-time 規則，包含：
 
 - `_env_path`：strip 後為空視為未設；非空值不 strip；`expanduser`。
 - `_xdg`：空字串視為未設，不 expanduser。
@@ -223,14 +226,14 @@ pub enum PyInt { Small(i128), Big(String /* 正規化十進位 */) }
 pub struct PyDict(indexmap::IndexMap<String, PyValue>);   // 插入序；重複 key：值取後者、位置保留首次
 pub struct DumpOpts { pub sep: Sep, pub ensure_ascii: bool, pub sort_keys: bool, pub allow_nan: bool }
 pub enum Sep { Compact /* "," ":" */, Default /* ", " ": " */, Indent(u8) /* ",\n" + ": " */ }
-pub fn loads(s: &str) -> Result<PyValue, JsonDecodeError>;     // json.loads(strict=True)
+pub fn loads(s: &str) -> Result<PyValue, JsonError>;     // json.loads(strict=True)；**P3 修訂（§0.7）**：`JsonError` 含 `Decode`（ValueError 類）與 `Recursion`（RecursionError 類）兩變體，Python `RecursionError` 不是 `ValueError`
 pub fn dumps(v: &PyValue, o: &DumpOpts) -> String;
 macro_rules! pydict { ($($k:expr => $v:expr),* $(,)?) => { ... } }  // 回應依 Python 插入序逐行對照
 ```
 
 規則：
 
-1. **解析**：接受 `NaN`、`Infinity`、`-Infinity`；字串內出現 raw 控制字元（<0x20）時報錯；不含 `.`／`e` 的數字一律是 int，超過 i128 的存為 `Big`；浮點以 correctly-rounded 解析，`1e400` → `inf`；`\uXXXX` 支援 surrogate pair，lone surrogate 轉成 U+FFFD（Python 會保留，屬已登記的非契約差異 `RPC-H-03`）；巢狀深度上限 `JSON_MAX_DEPTH`，值由 Stage 0 擷取，超過時視同 Python `RecursionError`（連線關閉、不回應）。
+1. **解析**：接受 `NaN`、`Infinity`、`-Infinity`；字串內出現 raw 控制字元（<0x20）時報錯；不含 `.`／`e` 的數字一律是 int，超過 i128 的存為 `Big`；浮點以 correctly-rounded 解析，`1e400` → `inf`；`\uXXXX` 支援 surrogate pair，lone surrogate 轉成 U+FFFD（Python 會保留，屬已登記的非契約差異 `RPC-H-03`）；巢狀深度上限 `JSON_MAX_DEPTH` 為 Rust 自訂常數（**P3 修訂（§0.7）**，登記為非契約差異）：Python 上限隨平台與 C 堆疊而變（Linux 3.12.3 約 9998、Windows 3.12.10 約 2998），不以 Stage 0 單一數值凍結；超過時回 `JsonError::Recursion`，對應 Python `RecursionError`（連線關閉、不回應）。
 2. **字串輸出**：`"`→`\"`、`\\`、`\n` `\r` `\t` `\b` `\f` 用短跳脫；其他 <0x20 → `\u00xx`（小寫 hex）；`/`、DEL、U+2028／2029 不跳脫。`ensure_ascii=true` 時非 ASCII → `\uxxxx`（小寫，BMP 外拆 surrogate pair）。
 3. **float 輸出**等於 Python `repr(float)`：
    - 非有限值輸出 `NaN`／`Infinity`／`-Infinity`。
@@ -301,13 +304,15 @@ macro_rules! pydict { ($($k:expr => $v:expr),* $(,)?) => { ... } }  // 回應依
   - `\Z` → `\z`。
   - `\s` 擴成 Python 集合 `[\t\n\x0b\x0c\r\x1c-\x1f \x85\p{White_Space}]`。
   - `(?x)` 展開處理；字元類交集等語法另行轉寫。
-  - 無法轉譯的構造回傳 `Untranslatable`，呼叫端視同不合法，例如 `INVALID_COMPLETION_REGEX`。殘餘差異清單由契約測試列舉並登記。
+  - 無法轉譯的構造回傳 `Untranslatable`。CLI 相容入口 `completion_regex_check` 依 Task 5 契約將其視為可交由 Python daemon 檢查；daemon 入口必須呼叫 `completion_regex_check_strict`，將 `Untranslatable` 視為不合法，避免證據不足時放行。其他 daemon 驗證路徑亦須採 fail-closed。殘餘差異清單由契約測試列舉並登記。
 - API：
 
   ```rust
-  pub fn compile(pat:&str, flags:PyFlags) -> Result<PyRegex, PyReError>;
+  pub fn compile(pat:&str, flags:PyFlags) -> Result<PyRegex, CompileError>;
   impl PyRegex { fn search(&self, hay:&str) -> Option<PyMatch>; fn search_from(&self, hay:&str, pos:usize) -> Option<PyMatch>; }
   ```
+
+  completion 驗證分為 `completion_regex_check`（保留 CLI 對 `Untranslatable` 的相容行為）與 `completion_regex_check_strict`（供 daemon 使用，遇到 `Untranslatable` 一律回 `Invalid`）；`valid_completion_regex_strict` 是後者的布林包裝。呼叫端不得以寬鬆入口代替 daemon 的嚴格驗證。
 
   執行時 `backtrack_limit=1_000_000`。超過上限時當作「未匹配」並遞增 `regex_backtrack_exhausted` 診斷計數，只寫 log。
 - 用途：`valid_completion_regex`（CLI 本地預檢與 daemon）、profile regex（prompt／login／password／bootloader）、event rule regex、`profile test`。
@@ -319,9 +324,9 @@ macro_rules! pydict { ($($k:expr => $v:expr),* $(,)?) => { ... } }  // 回應依
   - int：含 `0x`、`0o`、舊式八進位 `0[0-7]+`、`0b`、六十進位、`_`。
   - float：含 `.inf`、`.nan`、六十進位。
   - null：`~`、`null`、空值。
-  - timestamp：輸出 `PyValue::Str` 並附 `Timestamp` 標記，只有不吃 timestamp 的欄位會讀到。
+  - timestamp：輸出 `YValue` 的 timestamp 變體（**P3 修訂（§0.7）**，不再是 `PyValue::Str` 加標記），只有不吃 timestamp 的欄位會讀到。
   - quoted scalar 一律是 str。`!!str` 等 explicit tag 皆支援。
-  - 產出 `PyValue`。
+  - 產出 `YValue`（含 timestamp、binary、非字串 key；**P3 修訂（§0.7）**：`PyValue::Dict` 只容字串 key，無法表示 YAML 非字串 key 與 binary，故另立 `YValue`）。
 - `emit.rs`：`safe_dump(PyValue::Dict, allow_unicode=true, sort_keys=true)` 的子集輸出，僅限 block mapping／sequence 與 scalar。scalar 樣式選擇移植 PyYAML `Emitter.analyze_scalar` 與 `choose_scalar_style`（plain／single-quoted／double-quoted）。用於 `config.yaml`，golden 對照 PyYAML。
 - `config_types.rs`：`load_profiles(dir, fs) -> Result<LoadResult, ConfigError>`，逐字重現 09 §2 的規則，包括 helper 轉型、templates 只取最後一個檔（`EVT-D-C2` 保留）、raise 與靜默的分流。另含 `RuntimeConfig`（`supervision_mode`、`socket_path`、`windows.exclude_coms`，新增 `windows.test_device_allowlist` 見 `SC-19`）與 `UartProfile`。
 
@@ -351,13 +356,15 @@ macro_rules! pydict { ($($k:expr => $v:expr),* $(,)?) => { ... } }  // 回應依
 
 ## 4. `sw-pal`：平台抽象層（完整 trait）
 
-`traits.rs` 定義全部 trait。`sw_pal::native()` 回傳 `Platform`，內含各 trait 的 `Arc<dyn …>`。`fakes/`（feature `test-fakes`）提供記憶體替身給 L1 使用；替身不得冒充原生 gate（§11.2）。
+`traits.rs` 定義全部 trait。**P3 修訂（§0.7）**：P3 只交付 client 側子集，組裝點呼叫 `sw_pal::native_client()` 回傳 `ClientPlatform`（`env`、`fs`、`clock`、`rpc`、`process`、`caps`）；P4 擴為 `Platform` 並以 `type ClientPlatform = Platform` 保留別名。下方 `Platform` 為完整目標形狀，內含各 trait 的 `Arc<dyn …>`。`fakes/`（feature `test-fakes`）提供記憶體替身給 L1 使用；替身不得冒充原生 gate（§11.2）。
+
+**P4-T1 修訂（計畫 Task 1）**：`Platform` 為 `ClientPlatform` 的超集，欄位為 `{ env, fs: Arc<dyn FsOps>, clock, rpc, process, procs: Arc<dyn ProcScan>, tunnel: Arc<dyn ProcessTunnel>, service: Arc<dyn ServiceCtl>, registry: Arc<dyn RegistryView + Sync>, caps: Capabilities }`；`Capabilities` 為 P3 `ClientCaps` 全欄位加上 `on_demand_autostart: bool`（SC-18，僅 Windows native 為 true）與 `console_kind: ConsoleKind`（`Pty`／`TcpTelnet`）。`pub type ClientPlatform = Platform`、`pub type ClientCaps = Capabilities`；`native()` 與 `native_client()` 同為組裝點。平台差異只在 `sw-pal` 內（`service_ctl/{posix,windows}.rs` 的 host 模式清單、`lib.rs` 的 `native()`）。
 
 ```rust
 // ---- 共通 ----
 pub type PalResult<T> = Result<T, PalError>;
 #[derive(Debug, Clone)]
-pub struct PalError { pub kind: PalErrorKind, pub os_code: Option<i32>, pub py_message: String }
+pub struct PalError { pub kind: PalErrorKind, pub os_code: Option<i32>, pub winerror: Option<i32>, pub strerror: String, pub py_message: String }   // **P3 修訂（§0.7）**：加 `winerror`、`strerror`（Python OSError 的兩個屬性分開保存）
 // py_message：Python str(OSError) 格式；POSIX "[Errno N] <strerror>"，Windows "[WinError N] <FormatMessageW 系統語系>"
 pub enum PalErrorKind { NotFound, PermissionDenied, AccessDenied, Busy, WouldBlock, TimedOut, Cancelled,
                         Interrupted, InvalidInput, Unsupported, BrokenPipe, ConnectionRefused, AddrInUse, Eof, Io }
@@ -375,9 +382,16 @@ pub struct Platform {
 pub struct Capabilities { pub console_kind: ConsoleKind, pub native_rpc: RpcBackendKind, pub native_lock: LockBackendKind,
     pub native_device: DeviceBackendKind, pub holder_scan: HolderScanCapability, pub flash_endpoint: bool /* /dev/ttyMCU */,
     pub com0com_console: bool, pub path_flavor: PathFlavor, pub exec_replace: bool }
+/// **P3 修訂（§0.7）**：client 側能力值（P4 併入 `Capabilities`）。業務 crate 只讀這些值，不比較 OS 名稱（§2.1）。
+pub struct ClientCaps { pub path_flavor: PalPathFlavor, pub af_unix: bool, pub native_backend: BackendKind,
+    pub default_skill: SkillPlatform, pub text_newline: &'static str /* "\n" ｜ "\r\n"（Q-05） */, pub exec_replace: bool }
 ```
 
 ### 4.1 `SysEnv`、`Clock`、`FsOps`
+
+**P4-T1 修訂（計畫 Task 1）**：`SysEnv` 增加 `run(argv, timeout) -> PalResult<CmdOutput>`、`run_raw(argv, env, timeout) -> PalResult<CmdOutputRaw>`、`which`、`which_all`、`has_systemd`、`is_wsl`、`user_in_group`、`user_identity`、`local_appdata`（P4-T2 實作）。`FsOps: FsRead` 增加 `write_file`、`replace`、`copy_preserving`、`read_link`、`set_mode`、`sync_dir`、`symlink_file`（P4-T5 實作）；既有 `atomic_write`、`mkdirs`、`remove_file`、`copy_tree`、`remove_tree`、`symlink_or_copy_dir`、`file_lock_exclusive` 維持 P4-T5 簽章。P3 呼叫端僅使用 `FsRead` 方法，不需修改。
+
+**P3 修訂（§0.7）**：P3 的 `SysEnv` 只交付 `var`、`vars`、`system_config_dir`、`current_user_home`、`user_home`、`current_exe`、`realpath`、`terminal_columns`、`stdout_is_terminal`、`errno_name`、`pid`；其餘（`home_dir`、`expanduser`、`is_wsl` 等）由 P4 補。`expanduser` 在 `sw-proto::pypath` 以 `HomeLookup` 實作（golden 可測）；`system_config_dir` 為 SC-09 必需。`FsOps` 在 P3 以唯讀 `FsRead`（`read`、`exists`、`is_dir`、`list_dir`）承接，P4 擴為 `FsOps: FsRead`。`Clock` 在 P3 為 `mono_ns`＋`sleep`。
 
 ```rust
 pub trait SysEnv: Send + Sync {
@@ -529,7 +543,7 @@ pub enum WatcherEvent { Delta { added: Vec<DeviceInfo>, removed: Vec<DeviceInfo>
 ### 4.4 `InstanceLock`（Tier 1）
 
 ```rust
-pub enum EndpointSpec { Unix(PathBuf), Tcp { host: String, port: u16 } }
+pub enum EndpointSpec { Unix(OsString) /* **P3 修訂（§0.7）**：原 PathBuf；保留非 UTF-8 路徑 bytes（Q-19a） */, Tcp { host: String, port: u16 } }
 pub trait InstanceLockFactory: Send + Sync {
     /// POSIX：makedirs → open(0600) → flock(EX|NB)（失敗 → AlreadyRunning）→ socket 檔存在時 0.2s 試連：
     ///   連得上 → AlreadyRunning；ENOENT/ECONNREFUSED → unlink stale；其他錯誤 → SocketUnavailable → 寫 "pid\n" + fsync
@@ -578,12 +592,15 @@ pub trait WalFile: Send {
 pub trait RpcConnector: Send + Sync {
     fn af_unix_available(&self) -> bool;
     /// connect 逾時 → Err(kind=TimedOut)；其他 → Err(py_message=Python str(OSError))
-    fn connect(&self, ep: &EndpointSpec, timeout: Duration) -> PalResult<Box<dyn RpcStream>>;
+    fn connect(&self, ep: &EndpointSpec, t: SockTimeout) -> PalResult<Box<dyn RpcStream>>;   // **P3 修訂（§0.7）**：`SockTimeout { Blocking(Duration), NonBlocking }`；Python `settimeout(0)` 非阻塞語意（Q-10）無法以 Duration 表達
+    /// **P3 修訂（§0.7）**：只做 getaddrinfo（Q-10：TCP 位址解析早於 timeout 驗證）；失敗的 PalError 與 connect 內的 gaierror 相同。
+    fn resolve_tcp(&self, host: &str, port: u16) -> PalResult<()>;
 }
-pub trait RpcStream: std::io::Read + std::io::Write + Send {
-    fn set_timeout(&mut self, t: Option<Duration>) -> PalResult<()>;
-    fn last_errno(&self) -> Option<i32>;       // cli_trace 的 errno/errno_name
+pub trait RpcStream: Send {   // **P3 修訂（§0.7）**
+    fn send_all(&mut self, data: &[u8]) -> PalResult<()>;   // sendall；Blocking(d) 為整體上限
+    fn recv(&mut self, buf: &mut [u8]) -> PalResult<usize>; // 每次呼叫各自套 timeout；0 = EOF
 }
+// errno 由 PalError.os_code 提供（cli_trace 的 errno/errno_name）；不另設 last_errno。
 pub struct ListenOptions { pub mode: u32, pub group: Option<String>, pub ensure_dir_mode: Option<u32> }
 // SC-08 已撤回（OD-14 #3）：維持 Python 基線——bind 後 mode 0o660；ensure_dir_mode 為 None（目錄依基線預設建立，不設 0o700）；
 // group（SERIALWRAP_SOCKET_GROUP strip 後非空）有值時另 chgrp，失敗時忽略（與 Python 相同）
@@ -632,6 +649,8 @@ pub trait ConsoleListener: Send {
 
 ### 4.8 `ServiceCtl`
 
+**P4-T1 修訂（計畫 Task 1）**：實際簽章以 `crates/sw-pal/src/service_ctl.rs` 為準：`action`／`action_named` 回 `ServiceResult { ok, mode, action, rc, stdout, stderr, error_code, hint, phase }`；`install(def, with_sudo) -> Vec<CmdRecord>`、`install_plan(def)`、`uninstall`、`set_enabled`、`query -> TaskQuery`、`hard_stop`；R5-F1 的 `hold_autostart`／`release_autostart`／`autostart_hold_state`／`hold_autostart_named` 回 `AutostartHoldRecord`／`HoldState`。`SupervisorDefinition` 增 `register_held: bool`（Task 10 reconcile 為 false）。`render_task_xml(&TaskXmlSpec)` 含 `enabled` 欄位。`CompositeServiceCtl` 依模式分派至 `SystemdCtl`（`systemd.rs`）、`WindowsTaskCtl`（`windows_task.rs`）、`WindowsServiceCtl`（`windows_service.rs`）。
+
 ```rust
 pub enum SupervisionMode { OnDemand, SystemdUser, SystemdSystem, WindowsTask, WindowsService, Other(String) }
 pub enum ServiceAction { Start, Stop, Restart, Status }
@@ -664,6 +683,8 @@ pub struct CmdRecord { pub argv: Vec<String>, pub rc: i32 }   // DF-12：setup �
 
 ### 4.9 `ProcessTunnel`（BC-05）、`ProcessCtl`、`ProcScan`、`SignalWait`
 
+**P4-T1 修訂（計畫 Task 1）**：`ProcScan` 方法為 `serialwrapd_instances() -> Result<Vec<DaemonProc>, ScanFailure>`、`serialwrapd_tty_holders(&[PathBuf]) -> (Vec<u32>, HolderScanStatus)`、`pid_alive(u32) -> bool`、`identity_alive(&ProcIdentity) -> bool`；`DaemonProc { pid, socket, tree }`。Windows 掃描除 `serialwrapd.exe` 外另辨識 `python*.exe` 子行程，並以 launcher＋其 Python 子行程去重為單一 daemon 實例（`dedup_launcher_children`；否則每個 Stage 1 daemon 會被誤判為多開，見 Review Focus 3）。`HolderScanStatus` 由 `traits` 再匯出，P5 `HolderReport.status` 沿用同型別。`ProcessTunnel` 方法與 §4.9 原樣；`ProcessCtl` 增 `spawn_daemon`、`poll`、`call_foreground`（P4-T4）。
+
 ```rust
 pub struct TunnelProc { pub pid: u32, pub group: ProcGroupRef, pub start_ticks: Option<u64> }
 // start_ticks：POSIX 取 /proc/<pid>/stat 第 22 欄；Windows 取 CreationTime FILETIME
@@ -683,11 +704,11 @@ pub trait ProcessTunnel: Send + Sync {
 pub trait ProcessCtl: Send + Sync {
     fn spawn_daemon(&self, argv: &[String], env: &[(String,String)], detached: bool) -> PalResult<ChildRef>;
     // POSIX：start_new_session、stdout/stderr→DEVNULL、stdin 繼承；Windows：DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP
-    fn poll(&self, c: &ChildRef) -> Option<i32>;
-    fn call_foreground(&self, argv: &[String], env: &[(String,String)]) -> PalResult<i32>;   // subprocess.call
+    fn poll(&self, c: &ChildRef) -> Option<i64>; // Windows 保留完整 DWORD exit code
+    fn call_foreground(&self, argv: &[String], env: &[(String,String)]) -> PalResult<i64>;   // subprocess.call
     /// Stage 1A 委派：POSIX 用 execve（行程被取代，stdio、exit code、訊號天然一致）；
     /// Windows 用 CreateProcess 繼承 handle，加入 Job(KILL_ON_JOB_CLOSE)，SetConsoleCtrlHandler(NULL,TRUE) 後等待並回傳子行程 exit code
-    fn exec_or_wait(&self, argv: &[String], env: &[(String,String)]) -> !;
+    fn exec_or_wait(&self, argv: &[OsString], env_add: &[(String,String)]) -> PalError;   // **P3 修訂（§0.7）**：委派 argv 須保留非 UTF-8 bytes；成功時不返回，只在失敗時回錯誤
 }
 pub struct DaemonProc { pub pid: u32, pub socket: Option<String> }
 pub trait ProcScan: Send + Sync {
@@ -927,7 +948,7 @@ TxWriter 的 job queue 容量 64；滿時 OpRunner 阻塞等待（只有 OpRunne
 | dispatcher | 8，每條 rule 1 | 丟新加 `event_dropped` |
 | RPC 連線 | 128 | 超過時 acceptor 暫停 accept（kernel backlog 承接） |
 | RPC 請求行 | 65536 B | 斷線不回應（`RPC-H-02`） |
-| client 回應累積 | 16 MiB | 視同 `INVALID_RESPONSE`（Python 無限制；Rust 加上限，不影響正常回應） |
+| client 回應累積 | 256 MiB（**P3 修訂（§0.7）**：原 16 MiB；登記為 Rust-only 非契約差異，見 `spec-reconciliation.md` NC-01） | 視同 `INVALID_RESPONSE`（Python 無限制；Rust 加上限，不影響正常回應；`wal export --limit 50000` 回應可超過 16 MiB） |
 | interactive tombstone | 每 session 16 | FIFO |
 | reprobe／attach thread | 每 session 或 by_id 1 | inflight 去重 |
 
@@ -1110,6 +1131,7 @@ fn dispatch(&self, method: &str, p: &PyDict) -> Result<PyDict, PyErr> {
   - epilog 原文輸出。
 - 錯誤一律走 stderr：`usage: …\n{prog}: error: {msg}\n`，exit 2。
 - golden：`scripts/rust/capture_cli_help.py` 以 Python 3.12 對每個 parser 路徑擷取 `--help`（`COLUMNS=80` 與 `120`）以及約 60 個錯誤情境，存入 `contracts/cli_help/`。Rust 單元測試與 `tests/contract_blackbox` 都比對這份 golden。基線 Python 版本固定 3.12（CI 版本）。
+- **P3 修訂（§0.7）**：argparse 方言釘 **CPython 3.12.3**（`invalid choice` 引號與 `--help` 子命令欄寬在 3.12.x 間不同，同一 Rust 引擎只能對齊一個方言）。
 
 ### 7.3 Endpoint 解析、client、trace
 
@@ -1145,7 +1167,7 @@ fn dispatch(&self, method: &str, p: &PyDict) -> Result<PyDict, PyErr> {
 
 **保真要求**：
 
-- argv 原樣傳遞（含全域選項）；env 繼承，僅加上述兩個變數。
+- argv 原樣傳遞（含全域選項）；env 繼承，並加上三個變數（**P3 修訂（§0.7）**）：`SERIALWRAP_DELEGATE_DEPTH`、`SERIALWRAP_DELEGATE_ARGV_SHA`、`SERIALWRAP_RELEASE_MANIFEST=<manifest 絕對路徑>`（Python `python -m sw_core.cli` 下 `find_release_manifest(argv0)` 找不到 bundle manifest；登記為 `spec-reconciliation.md` NC-03）。
 - stdin、stdout、stderr 直接繼承，不經 pipe。
 - exit code 原樣回傳；POSIX 以 `execve` 取代行程，訊號語意天然一致；Windows 見 §4.9。
 - Rust 端不重送、不重試、不自行加逾時。

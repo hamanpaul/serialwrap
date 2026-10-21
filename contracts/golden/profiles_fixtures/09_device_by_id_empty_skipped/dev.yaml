@@ -1,0 +1,10 @@
+profiles:
+  p:
+    platform: shell
+
+targets:
+  - profile: p
+  - profile: p
+    device_by_id: "   "
+  - profile: p
+    device_by_id: 12345

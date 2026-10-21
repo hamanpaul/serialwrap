@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "session",
+    "activity",
+    "--help"
+  ],
+  "columns": 90,
+  "rc": 0,
+  "stdout": "usage: serialwrap session activity [-h] --selector SELECTOR\n\noptions:\n  -h, --help           show this help message and exit\n  --selector SELECTOR  session_id | COMx | alias\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

@@ -19,7 +19,7 @@ TESTS = Path(__file__).resolve().parent
 PLATFORM = {"core_portable", "posix_only", "windows_native"}
 RESOURCE = {"memory_only", "process_rpc", "posix_pty", "windows_com", "physical_uart",
             "supervisor_runtime", "interactive_desktop"}
-BUILTIN = {"parametrize", "skipif", "skip", "xfail", "usefixtures", "filterwarnings"}
+BUILTIN = {"parametrize", "skipif", "skip", "xfail", "usefixtures", "filterwarnings", "case"}
 PLATFORM_COND = re.compile(r"sys\.platform|os\.name|platform\.system|AF_UNIX|openpty|geteuid|fcntl|msvcrt"
                            r"|win32|_IS_WIN|IS_WINDOWS|posix")
 

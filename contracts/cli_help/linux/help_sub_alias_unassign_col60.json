@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "alias",
+    "unassign",
+    "--help"
+  ],
+  "columns": 60,
+  "rc": 0,
+  "stdout": "usage: serialwrap alias unassign [-h] --alias ALIAS\n\noptions:\n  -h, --help     show this help message and exit\n  --alias ALIAS\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

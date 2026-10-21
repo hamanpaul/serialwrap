@@ -1,0 +1,9 @@
+profiles:
+  p:
+    platform: prpl
+    uart: {baud: "38400", data_bits: 7.9, stop_bits: true}
+
+targets:
+  - {profile: p, device_by_id: d1, uart: {baud: true, data_bits: " 1_0 ", stop_bits: "x"}}
+  - {profile: p, device_by_id: d2, uart: "not-a-dict"}
+  - {profile: p, device_by_id: d3, uart: {baud: -9.9, parity: "e", flow_control: "XON", xonxoff: "false"}}

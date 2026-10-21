@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "alias",
+    "assign",
+    "--help"
+  ],
+  "columns": 120,
+  "rc": 0,
+  "stdout": "usage: serialwrap alias assign [-h] --by-id BY_ID --alias ALIAS [--profile PROFILE]\n\noptions:\n  -h, --help         show this help message and exit\n  --by-id BY_ID\n  --alias ALIAS\n  --profile PROFILE\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

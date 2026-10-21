@@ -1,0 +1,17 @@
+{"case": "empty", "input": "", "expected": "[boot]\nsystemd = true\n\n"}
+{"case": "existing_boot_empty", "input": "[boot]\n", "expected": "[boot]\nsystemd = true\n\n"}
+{"case": "existing_boot_systemd_false", "input": "[boot]\nsystemd=false\n", "expected": "[boot]\nsystemd = true\n\n"}
+{"case": "existing_boot_systemd_true", "input": "[boot]\nsystemd=true\n", "expected": "[boot]\nsystemd = true\n\n"}
+{"case": "bad_format_missing_section", "input": "systemd=false\n", "expected": "[boot]\nsystemd = true\n\n"}
+{"case": "bad_format_duplicate_section", "input": "[boot]\nsystemd=false\n[boot]\n", "expected": "[boot]\nsystemd = true\n\n"}
+{"case": "bad_format_duplicate_option", "input": "[boot]\nsystemd=false\nsystemd=true\n", "expected": "[boot]\nsystemd = true\n\n"}
+{"case": "with_comments", "input": "# comment\n; semi comment\n[network]\ngenerateResolvConf=false\n", "expected": "[network]\ngenerateResolvConf = false\n\n[boot]\nsystemd = true\n\n"}
+{"case": "case_sensitive_keys", "input": "[interop]\nenabled=true\nappendWindowsPath=false\n", "expected": "[interop]\nenabled = true\nappendWindowsPath = false\n\n[boot]\nsystemd = true\n\n"}
+{"case": "default_section", "input": "[DEFAULT]\nmetadata=true\n[boot]\nsystemd=false\n", "expected": "[DEFAULT]\nmetadata = true\n\n[boot]\nsystemd = true\n\n"}
+{"case": "repeated_default_sections", "input": "[DEFAULT]\nfirst=true\n[network]\nhostname=demo\n[DEFAULT]\nsecond=true\n", "expected": "[DEFAULT]\nfirst = true\nsecond = true\n\n[network]\nhostname = demo\n\n[boot]\nsystemd = true\n\n"}
+{"case": "key_colon_value", "input": "[user]\ndefault: alice\n", "expected": "[user]\ndefault = alice\n\n[boot]\nsystemd = true\n\n"}
+{"case": "continuation_line", "input": "[automount]\noptions = metadata,\n\tumask=22\n", "expected": "[automount]\noptions = metadata,\n\tumask=22\n\n[boot]\nsystemd = true\n\n"}
+{"case": "multiple_sections_with_boot", "input": "[network]\nhostname = demo\n\n[boot]\ncommand = /usr/bin/run\n", "expected": "[network]\nhostname = demo\n\n[boot]\ncommand = /usr/bin/run\nsystemd = true\n\n"}
+{"case": "section_header_trailing_text", "input": "[automount]\nenabled=true\n[boot] # keep\nsystemd=false\n[network]trailing\nhostname=x\n", "expected": "[automount]\nenabled = true\n\n[boot]\nsystemd = true\n\n[network]\nhostname = x\n\n"}
+{"case": "section_header_spacing_preserved", "input": "[ boot ]\nvalue = kept\n[ ]\nempty = named\n", "expected": "[ boot ]\nvalue = kept\n\n[ ]\nempty = named\n\n[boot]\nsystemd = true\n\n"}
+{"case": "blank_line_in_continuation", "input": "[user]\ncommand = first\n\n\tthird\n[boot]\nsystemd=false\n", "expected": "[user]\ncommand = first\n\t\n\tthird\n\n[boot]\nsystemd = true\n\n"}

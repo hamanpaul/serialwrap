@@ -1,0 +1,642 @@
+{"input":"y","allow_unicode":true,"out":"y\n...\n"}
+{"input":{"k":"y","n":["y"]},"allow_unicode":true,"out":"k: y\nn:\n- y\n"}
+{"input":"Y","allow_unicode":true,"out":"Y\n...\n"}
+{"input":{"k":"Y","n":["Y"]},"allow_unicode":true,"out":"k: Y\nn:\n- Y\n"}
+{"input":"yes","allow_unicode":true,"out":"'yes'\n"}
+{"input":{"k":"yes","n":["yes"]},"allow_unicode":true,"out":"k: 'yes'\nn:\n- 'yes'\n"}
+{"input":"Yes","allow_unicode":true,"out":"'Yes'\n"}
+{"input":{"k":"Yes","n":["Yes"]},"allow_unicode":true,"out":"k: 'Yes'\nn:\n- 'Yes'\n"}
+{"input":"YES","allow_unicode":true,"out":"'YES'\n"}
+{"input":{"k":"YES","n":["YES"]},"allow_unicode":true,"out":"k: 'YES'\nn:\n- 'YES'\n"}
+{"input":"n","allow_unicode":true,"out":"n\n...\n"}
+{"input":{"k":"n","n":["n"]},"allow_unicode":true,"out":"k: n\nn:\n- n\n"}
+{"input":"N","allow_unicode":true,"out":"N\n...\n"}
+{"input":{"k":"N","n":["N"]},"allow_unicode":true,"out":"k: N\nn:\n- N\n"}
+{"input":"no","allow_unicode":true,"out":"'no'\n"}
+{"input":{"k":"no","n":["no"]},"allow_unicode":true,"out":"k: 'no'\nn:\n- 'no'\n"}
+{"input":"No","allow_unicode":true,"out":"'No'\n"}
+{"input":{"k":"No","n":["No"]},"allow_unicode":true,"out":"k: 'No'\nn:\n- 'No'\n"}
+{"input":"NO","allow_unicode":true,"out":"'NO'\n"}
+{"input":{"k":"NO","n":["NO"]},"allow_unicode":true,"out":"k: 'NO'\nn:\n- 'NO'\n"}
+{"input":"true","allow_unicode":true,"out":"'true'\n"}
+{"input":{"k":"true","n":["true"]},"allow_unicode":true,"out":"k: 'true'\nn:\n- 'true'\n"}
+{"input":"True","allow_unicode":true,"out":"'True'\n"}
+{"input":{"k":"True","n":["True"]},"allow_unicode":true,"out":"k: 'True'\nn:\n- 'True'\n"}
+{"input":"TRUE","allow_unicode":true,"out":"'TRUE'\n"}
+{"input":{"k":"TRUE","n":["TRUE"]},"allow_unicode":true,"out":"k: 'TRUE'\nn:\n- 'TRUE'\n"}
+{"input":"false","allow_unicode":true,"out":"'false'\n"}
+{"input":{"k":"false","n":["false"]},"allow_unicode":true,"out":"k: 'false'\nn:\n- 'false'\n"}
+{"input":"False","allow_unicode":true,"out":"'False'\n"}
+{"input":{"k":"False","n":["False"]},"allow_unicode":true,"out":"k: 'False'\nn:\n- 'False'\n"}
+{"input":"FALSE","allow_unicode":true,"out":"'FALSE'\n"}
+{"input":{"k":"FALSE","n":["FALSE"]},"allow_unicode":true,"out":"k: 'FALSE'\nn:\n- 'FALSE'\n"}
+{"input":"on","allow_unicode":true,"out":"'on'\n"}
+{"input":{"k":"on","n":["on"]},"allow_unicode":true,"out":"k: 'on'\nn:\n- 'on'\n"}
+{"input":"On","allow_unicode":true,"out":"'On'\n"}
+{"input":{"k":"On","n":["On"]},"allow_unicode":true,"out":"k: 'On'\nn:\n- 'On'\n"}
+{"input":"ON","allow_unicode":true,"out":"'ON'\n"}
+{"input":{"k":"ON","n":["ON"]},"allow_unicode":true,"out":"k: 'ON'\nn:\n- 'ON'\n"}
+{"input":"off","allow_unicode":true,"out":"'off'\n"}
+{"input":{"k":"off","n":["off"]},"allow_unicode":true,"out":"k: 'off'\nn:\n- 'off'\n"}
+{"input":"Off","allow_unicode":true,"out":"'Off'\n"}
+{"input":{"k":"Off","n":["Off"]},"allow_unicode":true,"out":"k: 'Off'\nn:\n- 'Off'\n"}
+{"input":"OFF","allow_unicode":true,"out":"'OFF'\n"}
+{"input":{"k":"OFF","n":["OFF"]},"allow_unicode":true,"out":"k: 'OFF'\nn:\n- 'OFF'\n"}
+{"input":"~","allow_unicode":true,"out":"'~'\n"}
+{"input":{"k":"~","n":["~"]},"allow_unicode":true,"out":"k: '~'\nn:\n- '~'\n"}
+{"input":"null","allow_unicode":true,"out":"'null'\n"}
+{"input":{"k":"null","n":["null"]},"allow_unicode":true,"out":"k: 'null'\nn:\n- 'null'\n"}
+{"input":"Null","allow_unicode":true,"out":"'Null'\n"}
+{"input":{"k":"Null","n":["Null"]},"allow_unicode":true,"out":"k: 'Null'\nn:\n- 'Null'\n"}
+{"input":"NULL","allow_unicode":true,"out":"'NULL'\n"}
+{"input":{"k":"NULL","n":["NULL"]},"allow_unicode":true,"out":"k: 'NULL'\nn:\n- 'NULL'\n"}
+{"input":"","allow_unicode":true,"out":"''\n"}
+{"input":{"k":"","n":[""]},"allow_unicode":true,"out":"k: ''\nn:\n- ''\n"}
+{"input":"1","allow_unicode":true,"out":"'1'\n"}
+{"input":{"k":"1","n":["1"]},"allow_unicode":true,"out":"k: '1'\nn:\n- '1'\n"}
+{"input":"-1","allow_unicode":true,"out":"'-1'\n"}
+{"input":{"k":"-1","n":["-1"]},"allow_unicode":true,"out":"k: '-1'\nn:\n- '-1'\n"}
+{"input":"+1","allow_unicode":true,"out":"'+1'\n"}
+{"input":{"k":"+1","n":["+1"]},"allow_unicode":true,"out":"k: '+1'\nn:\n- '+1'\n"}
+{"input":"0","allow_unicode":true,"out":"'0'\n"}
+{"input":{"k":"0","n":["0"]},"allow_unicode":true,"out":"k: '0'\nn:\n- '0'\n"}
+{"input":"007","allow_unicode":true,"out":"'007'\n"}
+{"input":{"k":"007","n":["007"]},"allow_unicode":true,"out":"k: '007'\nn:\n- '007'\n"}
+{"input":"0o17","allow_unicode":true,"out":"0o17\n...\n"}
+{"input":{"k":"0o17","n":["0o17"]},"allow_unicode":true,"out":"k: 0o17\nn:\n- 0o17\n"}
+{"input":"017","allow_unicode":true,"out":"'017'\n"}
+{"input":{"k":"017","n":["017"]},"allow_unicode":true,"out":"k: '017'\nn:\n- '017'\n"}
+{"input":"0x1F","allow_unicode":true,"out":"'0x1F'\n"}
+{"input":{"k":"0x1F","n":["0x1F"]},"allow_unicode":true,"out":"k: '0x1F'\nn:\n- '0x1F'\n"}
+{"input":"0b1010","allow_unicode":true,"out":"'0b1010'\n"}
+{"input":{"k":"0b1010","n":["0b1010"]},"allow_unicode":true,"out":"k: '0b1010'\nn:\n- '0b1010'\n"}
+{"input":"1_000","allow_unicode":true,"out":"'1_000'\n"}
+{"input":{"k":"1_000","n":["1_000"]},"allow_unicode":true,"out":"k: '1_000'\nn:\n- '1_000'\n"}
+{"input":"1:20","allow_unicode":true,"out":"'1:20'\n"}
+{"input":{"k":"1:20","n":["1:20"]},"allow_unicode":true,"out":"k: '1:20'\nn:\n- '1:20'\n"}
+{"input":"1.0","allow_unicode":true,"out":"'1.0'\n"}
+{"input":{"k":"1.0","n":["1.0"]},"allow_unicode":true,"out":"k: '1.0'\nn:\n- '1.0'\n"}
+{"input":"1e3","allow_unicode":true,"out":"1e3\n...\n"}
+{"input":{"k":"1e3","n":["1e3"]},"allow_unicode":true,"out":"k: 1e3\nn:\n- 1e3\n"}
+{"input":"1.5e+3","allow_unicode":true,"out":"'1.5e+3'\n"}
+{"input":{"k":"1.5e+3","n":["1.5e+3"]},"allow_unicode":true,"out":"k: '1.5e+3'\nn:\n- '1.5e+3'\n"}
+{"input":".5","allow_unicode":true,"out":"'.5'\n"}
+{"input":{"k":".5","n":[".5"]},"allow_unicode":true,"out":"k: '.5'\nn:\n- '.5'\n"}
+{"input":"-.5","allow_unicode":true,"out":"-.5\n...\n"}
+{"input":{"k":"-.5","n":["-.5"]},"allow_unicode":true,"out":"k: -.5\nn:\n- -.5\n"}
+{"input":".inf","allow_unicode":true,"out":"'.inf'\n"}
+{"input":{"k":".inf","n":[".inf"]},"allow_unicode":true,"out":"k: '.inf'\nn:\n- '.inf'\n"}
+{"input":"-.inf","allow_unicode":true,"out":"'-.inf'\n"}
+{"input":{"k":"-.inf","n":["-.inf"]},"allow_unicode":true,"out":"k: '-.inf'\nn:\n- '-.inf'\n"}
+{"input":".Inf","allow_unicode":true,"out":"'.Inf'\n"}
+{"input":{"k":".Inf","n":[".Inf"]},"allow_unicode":true,"out":"k: '.Inf'\nn:\n- '.Inf'\n"}
+{"input":".NaN","allow_unicode":true,"out":"'.NaN'\n"}
+{"input":{"k":".NaN","n":[".NaN"]},"allow_unicode":true,"out":"k: '.NaN'\nn:\n- '.NaN'\n"}
+{"input":".nan","allow_unicode":true,"out":"'.nan'\n"}
+{"input":{"k":".nan","n":[".nan"]},"allow_unicode":true,"out":"k: '.nan'\nn:\n- '.nan'\n"}
+{"input":"=","allow_unicode":true,"out":"'='\n"}
+{"input":{"k":"=","n":["="]},"allow_unicode":true,"out":"k: '='\nn:\n- '='\n"}
+{"input":"<<","allow_unicode":true,"out":"'<<'\n"}
+{"input":{"k":"<<","n":["<<"]},"allow_unicode":true,"out":"k: '<<'\nn:\n- '<<'\n"}
+{"input":"0.","allow_unicode":true,"out":"'0.'\n"}
+{"input":{"k":"0.","n":["0."]},"allow_unicode":true,"out":"k: '0.'\nn:\n- '0.'\n"}
+{"input":"1,000","allow_unicode":true,"out":"1,000\n...\n"}
+{"input":{"k":"1,000","n":["1,000"]},"allow_unicode":true,"out":"k: 1,000\nn:\n- 1,000\n"}
+{"input":"2001-12-14","allow_unicode":true,"out":"'2001-12-14'\n"}
+{"input":{"k":"2001-12-14","n":["2001-12-14"]},"allow_unicode":true,"out":"k: '2001-12-14'\nn:\n- '2001-12-14'\n"}
+{"input":"2001-12-14t21:59:43.10-05:00","allow_unicode":true,"out":"'2001-12-14t21:59:43.10-05:00'\n"}
+{"input":{"k":"2001-12-14t21:59:43.10-05:00","n":["2001-12-14t21:59:43.10-05:00"]},"allow_unicode":true,"out":"k: '2001-12-14t21:59:43.10-05:00'\nn:\n- '2001-12-14t21:59:43.10-05:00'\n"}
+{"input":"2001-12-14 21:59:43.10 -5","allow_unicode":true,"out":"'2001-12-14 21:59:43.10 -5'\n"}
+{"input":{"k":"2001-12-14 21:59:43.10 -5","n":["2001-12-14 21:59:43.10 -5"]},"allow_unicode":true,"out":"k: '2001-12-14 21:59:43.10 -5'\nn:\n- '2001-12-14 21:59:43.10 -5'\n"}
+{"input":"2001-12-15 2:59:43.10","allow_unicode":true,"out":"'2001-12-15 2:59:43.10'\n"}
+{"input":{"k":"2001-12-15 2:59:43.10","n":["2001-12-15 2:59:43.10"]},"allow_unicode":true,"out":"k: '2001-12-15 2:59:43.10'\nn:\n- '2001-12-15 2:59:43.10'\n"}
+{"input":" a","allow_unicode":true,"out":"' a'\n"}
+{"input":{"k":" a","n":[" a"]},"allow_unicode":true,"out":"k: ' a'\nn:\n- ' a'\n"}
+{"input":"a ","allow_unicode":true,"out":"'a '\n"}
+{"input":{"k":"a ","n":["a "]},"allow_unicode":true,"out":"k: 'a '\nn:\n- 'a '\n"}
+{"input":" ","allow_unicode":true,"out":"' '\n"}
+{"input":{"k":" ","n":[" "]},"allow_unicode":true,"out":"k: ' '\nn:\n- ' '\n"}
+{"input":"\ta","allow_unicode":true,"out":"\"\\ta\"\n"}
+{"input":{"k":"\ta","n":["\ta"]},"allow_unicode":true,"out":"k: \"\\ta\"\nn:\n- \"\\ta\"\n"}
+{"input":"a\tb","allow_unicode":true,"out":"\"a\\tb\"\n"}
+{"input":{"k":"a\tb","n":["a\tb"]},"allow_unicode":true,"out":"k: \"a\\tb\"\nn:\n- \"a\\tb\"\n"}
+{"input":"a\nb","allow_unicode":true,"out":"'a\n\n  b'\n"}
+{"input":{"k":"a\nb","n":["a\nb"]},"allow_unicode":true,"out":"k: 'a\n\n  b'\nn:\n- 'a\n\n  b'\n"}
+{"input":"a\n","allow_unicode":true,"out":"'a\n\n  '\n"}
+{"input":{"k":"a\n","n":["a\n"]},"allow_unicode":true,"out":"k: 'a\n\n  '\nn:\n- 'a\n\n  '\n"}
+{"input":"\n","allow_unicode":true,"out":"'\n\n  '\n"}
+{"input":{"k":"\n","n":["\n"]},"allow_unicode":true,"out":"k: '\n\n  '\nn:\n- '\n\n  '\n"}
+{"input":"line1\nline2\n","allow_unicode":true,"out":"'line1\n\n  line2\n\n  '\n"}
+{"input":{"k":"line1\nline2\n","n":["line1\nline2\n"]},"allow_unicode":true,"out":"k: 'line1\n\n  line2\n\n  '\nn:\n- 'line1\n\n  line2\n\n  '\n"}
+{"input":"a\r\nb","allow_unicode":true,"out":"\"a\\r\\nb\"\n"}
+{"input":{"k":"a\r\nb","n":["a\r\nb"]},"allow_unicode":true,"out":"k: \"a\\r\\nb\"\nn:\n- \"a\\r\\nb\"\n"}
+{"input":"ab","allow_unicode":true,"out":"'a  b'\n"}
+{"input":{"k":"ab","n":["ab"]},"allow_unicode":true,"out":"k: 'a  b'\nn:\n- 'a  b'\n"}
+{"input":" ","allow_unicode":true,"out":"'   '\n"}
+{"input":{"k":" ","n":[" "]},"allow_unicode":true,"out":"k: '   '\nn:\n- '   '\n"}
+{"input":" x","allow_unicode":true,"out":" x\n...\n"}
+{"input":{"k":" x","n":[" x"]},"allow_unicode":true,"out":"k:  x\nn:\n-  x\n"}
+{"input":"  leading and trailing  ","allow_unicode":true,"out":"'  leading and trailing  '\n"}
+{"input":{"k":"  leading and trailing  ","n":["  leading and trailing  "]},"allow_unicode":true,"out":"k: '  leading and trailing  '\nn:\n- '  leading and trailing  '\n"}
+{"input":"a: b","allow_unicode":true,"out":"'a: b'\n"}
+{"input":{"k":"a: b","n":["a: b"]},"allow_unicode":true,"out":"k: 'a: b'\nn:\n- 'a: b'\n"}
+{"input":"a:b","allow_unicode":true,"out":"a:b\n...\n"}
+{"input":{"k":"a:b","n":["a:b"]},"allow_unicode":true,"out":"k: a:b\nn:\n- a:b\n"}
+{"input":"a #b","allow_unicode":true,"out":"'a #b'\n"}
+{"input":{"k":"a #b","n":["a #b"]},"allow_unicode":true,"out":"k: 'a #b'\nn:\n- 'a #b'\n"}
+{"input":"a#b","allow_unicode":true,"out":"a#b\n...\n"}
+{"input":{"k":"a#b","n":["a#b"]},"allow_unicode":true,"out":"k: a#b\nn:\n- a#b\n"}
+{"input":"#a","allow_unicode":true,"out":"'#a'\n"}
+{"input":{"k":"#a","n":["#a"]},"allow_unicode":true,"out":"k: '#a'\nn:\n- '#a'\n"}
+{"input":"a: ","allow_unicode":true,"out":"'a: '\n"}
+{"input":{"k":"a: ","n":["a: "]},"allow_unicode":true,"out":"k: 'a: '\nn:\n- 'a: '\n"}
+{"input":"key:","allow_unicode":true,"out":"'key:'\n"}
+{"input":{"k":"key:","n":["key:"]},"allow_unicode":true,"out":"k: 'key:'\nn:\n- 'key:'\n"}
+{"input":"http://x","allow_unicode":true,"out":"http://x\n...\n"}
+{"input":{"k":"http://x","n":["http://x"]},"allow_unicode":true,"out":"k: http://x\nn:\n- http://x\n"}
+{"input":"tcp://127.0.0.1:48700","allow_unicode":true,"out":"tcp://127.0.0.1:48700\n...\n"}
+{"input":{"k":"tcp://127.0.0.1:48700","n":["tcp://127.0.0.1:48700"]},"allow_unicode":true,"out":"k: tcp://127.0.0.1:48700\nn:\n- tcp://127.0.0.1:48700\n"}
+{"input":"C:\\Users\\a","allow_unicode":true,"out":"C:\\Users\\a\n...\n"}
+{"input":{"k":"C:\\Users\\a","n":["C:\\Users\\a"]},"allow_unicode":true,"out":"k: C:\\Users\\a\nn:\n- C:\\Users\\a\n"}
+{"input":"\\\\server\\share","allow_unicode":true,"out":"\\\\server\\share\n...\n"}
+{"input":{"k":"\\\\server\\share","n":["\\\\server\\share"]},"allow_unicode":true,"out":"k: \\\\server\\share\nn:\n- \\\\server\\share\n"}
+{"input":"a'b","allow_unicode":true,"out":"a'b\n...\n"}
+{"input":{"k":"a'b","n":["a'b"]},"allow_unicode":true,"out":"k: a'b\nn:\n- a'b\n"}
+{"input":"a\"b","allow_unicode":true,"out":"a\"b\n...\n"}
+{"input":{"k":"a\"b","n":["a\"b"]},"allow_unicode":true,"out":"k: a\"b\nn:\n- a\"b\n"}
+{"input":"'quoted'","allow_unicode":true,"out":"'''quoted'''\n"}
+{"input":{"k":"'quoted'","n":["'quoted'"]},"allow_unicode":true,"out":"k: '''quoted'''\nn:\n- '''quoted'''\n"}
+{"input":"\"dq\"","allow_unicode":true,"out":"'\"dq\"'\n"}
+{"input":{"k":"\"dq\"","n":["\"dq\""]},"allow_unicode":true,"out":"k: '\"dq\"'\nn:\n- '\"dq\"'\n"}
+{"input":"-a","allow_unicode":true,"out":"-a\n...\n"}
+{"input":{"k":"-a","n":["-a"]},"allow_unicode":true,"out":"k: -a\nn:\n- -a\n"}
+{"input":"- a","allow_unicode":true,"out":"'- a'\n"}
+{"input":{"k":"- a","n":["- a"]},"allow_unicode":true,"out":"k: '- a'\nn:\n- '- a'\n"}
+{"input":"?a","allow_unicode":true,"out":"?a\n...\n"}
+{"input":{"k":"?a","n":["?a"]},"allow_unicode":true,"out":"k: ?a\nn:\n- ?a\n"}
+{"input":"? a","allow_unicode":true,"out":"'? a'\n"}
+{"input":{"k":"? a","n":["? a"]},"allow_unicode":true,"out":"k: '? a'\nn:\n- '? a'\n"}
+{"input":":a","allow_unicode":true,"out":":a\n...\n"}
+{"input":{"k":":a","n":[":a"]},"allow_unicode":true,"out":"k: :a\nn:\n- :a\n"}
+{"input":",a","allow_unicode":true,"out":"',a'\n"}
+{"input":{"k":",a","n":[",a"]},"allow_unicode":true,"out":"k: ',a'\nn:\n- ',a'\n"}
+{"input":"[a","allow_unicode":true,"out":"'[a'\n"}
+{"input":{"k":"[a","n":["[a"]},"allow_unicode":true,"out":"k: '[a'\nn:\n- '[a'\n"}
+{"input":"]a","allow_unicode":true,"out":"']a'\n"}
+{"input":{"k":"]a","n":["]a"]},"allow_unicode":true,"out":"k: ']a'\nn:\n- ']a'\n"}
+{"input":"{a","allow_unicode":true,"out":"'{a'\n"}
+{"input":{"k":"{a","n":["{a"]},"allow_unicode":true,"out":"k: '{a'\nn:\n- '{a'\n"}
+{"input":"}a","allow_unicode":true,"out":"'}a'\n"}
+{"input":{"k":"}a","n":["}a"]},"allow_unicode":true,"out":"k: '}a'\nn:\n- '}a'\n"}
+{"input":"&a","allow_unicode":true,"out":"'&a'\n"}
+{"input":{"k":"&a","n":["&a"]},"allow_unicode":true,"out":"k: '&a'\nn:\n- '&a'\n"}
+{"input":"*a","allow_unicode":true,"out":"'*a'\n"}
+{"input":{"k":"*a","n":["*a"]},"allow_unicode":true,"out":"k: '*a'\nn:\n- '*a'\n"}
+{"input":"!a","allow_unicode":true,"out":"'!a'\n"}
+{"input":{"k":"!a","n":["!a"]},"allow_unicode":true,"out":"k: '!a'\nn:\n- '!a'\n"}
+{"input":"|a","allow_unicode":true,"out":"'|a'\n"}
+{"input":{"k":"|a","n":["|a"]},"allow_unicode":true,"out":"k: '|a'\nn:\n- '|a'\n"}
+{"input":">a","allow_unicode":true,"out":"'>a'\n"}
+{"input":{"k":">a","n":[">a"]},"allow_unicode":true,"out":"k: '>a'\nn:\n- '>a'\n"}
+{"input":"'a","allow_unicode":true,"out":"'''a'\n"}
+{"input":{"k":"'a","n":["'a"]},"allow_unicode":true,"out":"k: '''a'\nn:\n- '''a'\n"}
+{"input":"%a","allow_unicode":true,"out":"'%a'\n"}
+{"input":{"k":"%a","n":["%a"]},"allow_unicode":true,"out":"k: '%a'\nn:\n- '%a'\n"}
+{"input":"@a","allow_unicode":true,"out":"'@a'\n"}
+{"input":{"k":"@a","n":["@a"]},"allow_unicode":true,"out":"k: '@a'\nn:\n- '@a'\n"}
+{"input":"`a","allow_unicode":true,"out":"'`a'\n"}
+{"input":{"k":"`a","n":["`a"]},"allow_unicode":true,"out":"k: '`a'\nn:\n- '`a'\n"}
+{"input":"-","allow_unicode":true,"out":"'-'\n"}
+{"input":{"k":"-","n":["-"]},"allow_unicode":true,"out":"k: '-'\nn:\n- '-'\n"}
+{"input":"?","allow_unicode":true,"out":"'?'\n"}
+{"input":{"k":"?","n":["?"]},"allow_unicode":true,"out":"k: '?'\nn:\n- '?'\n"}
+{"input":":","allow_unicode":true,"out":"':'\n"}
+{"input":{"k":":","n":[":"]},"allow_unicode":true,"out":"k: ':'\nn:\n- ':'\n"}
+{"input":"\u0001","allow_unicode":true,"out":"\"\\x01\"\n"}
+{"input":{"k":"\u0001","n":["\u0001"]},"allow_unicode":true,"out":"k: \"\\x01\"\nn:\n- \"\\x01\"\n"}
+{"input":"ab","allow_unicode":true,"out":"\"a\\x7Fb\"\n"}
+{"input":{"k":"ab","n":["ab"]},"allow_unicode":true,"out":"k: \"a\\x7Fb\"\nn:\n- \"a\\x7Fb\"\n"}
+{"input":"\u001b[0m","allow_unicode":true,"out":"\"\\e[0m\"\n"}
+{"input":{"k":"\u001b[0m","n":["\u001b[0m"]},"allow_unicode":true,"out":"k: \"\\e[0m\"\nn:\n- \"\\e[0m\"\n"}
+{"input":"\u0000","allow_unicode":true,"out":"\"\\0\"\n"}
+{"input":{"k":"\u0000","n":["\u0000"]},"allow_unicode":true,"out":"k: \"\\0\"\nn:\n- \"\\0\"\n"}
+{"input":"\b","allow_unicode":true,"out":"\"\\b\"\n"}
+{"input":{"k":"\b","n":["\b"]},"allow_unicode":true,"out":"k: \"\\b\"\nn:\n- \"\\b\"\n"}
+{"input":"\f","allow_unicode":true,"out":"\"\\f\"\n"}
+{"input":{"k":"\f","n":["\f"]},"allow_unicode":true,"out":"k: \"\\f\"\nn:\n- \"\\f\"\n"}
+{"input":"","allow_unicode":true,"out":"\"\\x7F\"\n"}
+{"input":{"k":"","n":[""]},"allow_unicode":true,"out":"k: \"\\x7F\"\nn:\n- \"\\x7F\"\n"}
+{"input":"中文","allow_unicode":true,"out":"中文\n...\n"}
+{"input":{"k":"中文","n":["中文"]},"allow_unicode":true,"out":"k: 中文\nn:\n- 中文\n"}
+{"input":"繁體 字串","allow_unicode":true,"out":"繁體 字串\n...\n"}
+{"input":{"k":"繁體 字串","n":["繁體 字串"]},"allow_unicode":true,"out":"k: 繁體 字串\nn:\n- 繁體 字串\n"}
+{"input":"日本語","allow_unicode":true,"out":"日本語\n...\n"}
+{"input":{"k":"日本語","n":["日本語"]},"allow_unicode":true,"out":"k: 日本語\nn:\n- 日本語\n"}
+{"input":"é","allow_unicode":true,"out":"é\n...\n"}
+{"input":{"k":"é","n":["é"]},"allow_unicode":true,"out":"k: é\nn:\n- é\n"}
+{"input":"😀","allow_unicode":true,"out":"😀\n...\n"}
+{"input":{"k":"😀","n":["😀"]},"allow_unicode":true,"out":"k: 😀\nn:\n- 😀\n"}
+{"input":"a😀b","allow_unicode":true,"out":"a😀b\n...\n"}
+{"input":{"k":"a😀b","n":["a😀b"]},"allow_unicode":true,"out":"k: a😀b\nn:\n- a😀b\n"}
+{"input":"﻿","allow_unicode":true,"out":"\"\\uFEFF\"\n"}
+{"input":{"k":"﻿","n":["﻿"]},"allow_unicode":true,"out":"k: \"\\uFEFF\"\nn:\n- \"\\uFEFF\"\n"}
+{"input":"​","allow_unicode":true,"out":"​\n...\n"}
+{"input":{"k":"​","n":["​"]},"allow_unicode":true,"out":"k: ​\nn:\n- ​\n"}
+{"input":"COM3","allow_unicode":true,"out":"COM3\n...\n"}
+{"input":{"k":"COM3","n":["COM3"]},"allow_unicode":true,"out":"k: COM3\nn:\n- COM3\n"}
+{"input":"COM10","allow_unicode":true,"out":"COM10\n...\n"}
+{"input":{"k":"COM10","n":["COM10"]},"allow_unicode":true,"out":"k: COM10\nn:\n- COM10\n"}
+{"input":"/dev/serial/by-id/usb-FTDI_x-if00-port0","allow_unicode":true,"out":"/dev/serial/by-id/usb-FTDI_x-if00-port0\n...\n"}
+{"input":{"k":"/dev/serial/by-id/usb-FTDI_x-if00-port0","n":["/dev/serial/by-id/usb-FTDI_x-if00-port0"]},"allow_unicode":true,"out":"k: /dev/serial/by-id/usb-FTDI_x-if00-port0\nn:\n- /dev/serial/by-id/usb-FTDI_x-if00-port0\n"}
+{"input":"~/.config/serialwrap","allow_unicode":true,"out":"~/.config/serialwrap\n...\n"}
+{"input":{"k":"~/.config/serialwrap","n":["~/.config/serialwrap"]},"allow_unicode":true,"out":"k: ~/.config/serialwrap\nn:\n- ~/.config/serialwrap\n"}
+{"input":"${HOME}","allow_unicode":true,"out":"${HOME}\n...\n"}
+{"input":{"k":"${HOME}","n":["${HOME}"]},"allow_unicode":true,"out":"k: ${HOME}\nn:\n- ${HOME}\n"}
+{"input":"windows","allow_unicode":true,"out":"windows\n...\n"}
+{"input":{"k":"windows","n":["windows"]},"allow_unicode":true,"out":"k: windows\nn:\n- windows\n"}
+{"input":"lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet ","allow_unicode":true,"out":"'lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet\n  lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet '\n"}
+{"input":{"k":"lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet ","n":["lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet "]},"allow_unicode":true,"out":"k: 'lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet\n  lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet '\nn:\n- 'lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet\n  lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet '\n"}
+{"input":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx","allow_unicode":true,"out":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n...\n"}
+{"input":{"k":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx","n":["xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"]},"allow_unicode":true,"out":"k: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\nn:\n- xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"}
+{"input":"中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文","allow_unicode":true,"out":"中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文\n...\n"}
+{"input":{"k":"中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文","n":["中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文"]},"allow_unicode":true,"out":"k: 中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文\nn:\n- 中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文\n"}
+{"input":0,"allow_unicode":true,"out":"0\n...\n"}
+{"input":{"k":0,"n":[0]},"allow_unicode":true,"out":"k: 0\nn:\n- 0\n"}
+{"input":-1,"allow_unicode":true,"out":"-1\n...\n"}
+{"input":{"k":-1,"n":[-1]},"allow_unicode":true,"out":"k: -1\nn:\n- -1\n"}
+{"input":42,"allow_unicode":true,"out":"42\n...\n"}
+{"input":{"k":42,"n":[42]},"allow_unicode":true,"out":"k: 42\nn:\n- 42\n"}
+{"input":9007199254740993,"allow_unicode":true,"out":"9007199254740993\n...\n"}
+{"input":{"k":9007199254740993,"n":[9007199254740993]},"allow_unicode":true,"out":"k: 9007199254740993\nn:\n- 9007199254740993\n"}
+{"input":1000000000000000000000000000000,"allow_unicode":true,"out":"1000000000000000000000000000000\n...\n"}
+{"input":{"k":1000000000000000000000000000000,"n":[1000000000000000000000000000000]},"allow_unicode":true,"out":"k: 1000000000000000000000000000000\nn:\n- 1000000000000000000000000000000\n"}
+{"input":true,"allow_unicode":true,"out":"true\n...\n"}
+{"input":{"k":true,"n":[true]},"allow_unicode":true,"out":"k: true\nn:\n- true\n"}
+{"input":false,"allow_unicode":true,"out":"false\n...\n"}
+{"input":{"k":false,"n":[false]},"allow_unicode":true,"out":"k: false\nn:\n- false\n"}
+{"input":null,"allow_unicode":true,"out":"null\n...\n"}
+{"input":{"k":null,"n":[null]},"allow_unicode":true,"out":"k: null\nn:\n- null\n"}
+{"input":0.0,"allow_unicode":true,"out":"0.0\n...\n"}
+{"input":{"k":0.0,"n":[0.0]},"allow_unicode":true,"out":"k: 0.0\nn:\n- 0.0\n"}
+{"input":1.0,"allow_unicode":true,"out":"1.0\n...\n"}
+{"input":{"k":1.0,"n":[1.0]},"allow_unicode":true,"out":"k: 1.0\nn:\n- 1.0\n"}
+{"input":0.1,"allow_unicode":true,"out":"0.1\n...\n"}
+{"input":{"k":0.1,"n":[0.1]},"allow_unicode":true,"out":"k: 0.1\nn:\n- 0.1\n"}
+{"input":1e+16,"allow_unicode":true,"out":"1.0e+16\n...\n"}
+{"input":{"k":1e+16,"n":[1e+16]},"allow_unicode":true,"out":"k: 1.0e+16\nn:\n- 1.0e+16\n"}
+{"input":1.5e-07,"allow_unicode":true,"out":"1.5e-07\n...\n"}
+{"input":{"k":1.5e-07,"n":[1.5e-07]},"allow_unicode":true,"out":"k: 1.5e-07\nn:\n- 1.5e-07\n"}
+{"input":123456789.125,"allow_unicode":true,"out":"123456789.125\n...\n"}
+{"input":{"k":123456789.125,"n":[123456789.125]},"allow_unicode":true,"out":"k: 123456789.125\nn:\n- 123456789.125\n"}
+{"input":-2.5,"allow_unicode":true,"out":"-2.5\n...\n"}
+{"input":{"k":-2.5,"n":[-2.5]},"allow_unicode":true,"out":"k: -2.5\nn:\n- -2.5\n"}
+{"input":{"windows":{"exclude_coms":["COM3","COM10"]}},"allow_unicode":true,"out":"windows:\n  exclude_coms:\n  - COM3\n  - COM10\n"}
+{"input":{"tcp":"tcp://127.0.0.1:48700","path":"C:\\Users\\a"},"allow_unicode":true,"out":"path: C:\\Users\\a\ntcp: tcp://127.0.0.1:48700\n"}
+{"input":{"z":1,"a":2,"m":{"y":1,"b":2}},"allow_unicode":true,"out":"a: 2\nm:\n  b: 2\n  y: 1\nz: 1\n"}
+{"input":{"b":[1,2.5,true,null,"x"],"a":{}},"allow_unicode":true,"out":"a: {}\nb:\n- 1\n- 2.5\n- true\n- null\n- x\n"}
+{"input":[],"allow_unicode":true,"out":"[]\n"}
+{"input":{},"allow_unicode":true,"out":"{}\n"}
+{"input":[[],{},[1,[2,[3]]]],"allow_unicode":true,"out":"- []\n- {}\n- - 1\n  - - 2\n    - - 3\n"}
+{"input":{"a":{"b":{"c":[1,{"d":null}]}}},"allow_unicode":true,"out":"a:\n  b:\n    c:\n    - 1\n    - d: null\n"}
+{"input":{"a: b":1,"":2,"1":3,"true":4,"null":5,"#k":6,"-k":7,"中文":"值"},"allow_unicode":true,"out":"? ''\n: 2\n'#k': 6\n-k: 7\n'1': 3\n'a: b': 1\n'null': 5\n'true': 4\n中文: 值\n"}
+{"input":[[{"a":1}]],"allow_unicode":true,"out":"- - a: 1\n"}
+{"input":[[{"a":1,"b":2},3]],"allow_unicode":true,"out":"- - a: 1\n    b: 2\n  - 3\n"}
+{"input":[[[1,2]]],"allow_unicode":true,"out":"- - - 1\n    - 2\n"}
+{"input":{"k":[[{"a":1},2],3]},"allow_unicode":true,"out":"k:\n- - a: 1\n  - 2\n- 3\n"}
+{"input":[["multi\nline"]],"allow_unicode":true,"out":"- - 'multi\n\n    line'\n"}
+{"input":[["word word word word word word word word word word word word word word word word word word word word end"]],"allow_unicode":true,"out":"- - word word word word word word word word word word word word word word word word\n    word word word word end\n"}
+{"input":{"a\nb":1},"allow_unicode":true,"out":"? 'a\n\n  b'\n: 1\n"}
+{"input":{"x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x ":1},"allow_unicode":true,"out":"'x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x ': 1\n"}
+{"input":{"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx":1},"allow_unicode":true,"out":"? xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n: 1\n"}
+{"input":{"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx":1},"allow_unicode":true,"out":"? xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n: 1\n"}
+{"input":{"":[1,2]},"allow_unicode":true,"out":"? ''\n: - 1\n  - 2\n"}
+{"input":{"unicode":"\t "},"allow_unicode":true,"out":"unicode: \"\\t \"\n"}
+{"input":{"unicode":"\t😀"},"allow_unicode":true,"out":"unicode: \"\\t\\U0001F600\"\n"}
+{"input":{"f":[1.0,0.1,1e+16,1.5e-07,-2.5,123456789.125,-0.0]},"allow_unicode":true,"out":"f:\n- 1.0\n- 0.1\n- 1.0e+16\n- 1.5e-07\n- -2.5\n- 123456789.125\n- -0.0\n"}
+{"input":{"i":[0,-1,9007199254740993,1000000000000000000000000000000,-1000000000000000000000000000000]},"allow_unicode":true,"out":"i:\n- 0\n- -1\n- 9007199254740993\n- 1000000000000000000000000000000\n- -1000000000000000000000000000000\n"}
+{"input":{"long":["word word word word word word word word word word word word word word word word word word word word end","xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"]},"allow_unicode":true,"out":"long:\n- word word word word word word word word word word word word word word word word\n  word word word word end\n- xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"}
+{"input":{"lines":"first\nsecond\n\nthird","crlf":"a\r\nb","tab":"a\tb"},"allow_unicode":true,"out":"crlf: \"a\\r\\nb\"\nlines: 'first\n\n  second\n\n\n  third'\ntab: \"a\\tb\"\n"}
+{"input":"y","allow_unicode":false,"out":"y\n...\n"}
+{"input":{"k":"y","n":["y"]},"allow_unicode":false,"out":"k: y\nn:\n- y\n"}
+{"input":"Y","allow_unicode":false,"out":"Y\n...\n"}
+{"input":{"k":"Y","n":["Y"]},"allow_unicode":false,"out":"k: Y\nn:\n- Y\n"}
+{"input":"yes","allow_unicode":false,"out":"'yes'\n"}
+{"input":{"k":"yes","n":["yes"]},"allow_unicode":false,"out":"k: 'yes'\nn:\n- 'yes'\n"}
+{"input":"Yes","allow_unicode":false,"out":"'Yes'\n"}
+{"input":{"k":"Yes","n":["Yes"]},"allow_unicode":false,"out":"k: 'Yes'\nn:\n- 'Yes'\n"}
+{"input":"YES","allow_unicode":false,"out":"'YES'\n"}
+{"input":{"k":"YES","n":["YES"]},"allow_unicode":false,"out":"k: 'YES'\nn:\n- 'YES'\n"}
+{"input":"n","allow_unicode":false,"out":"n\n...\n"}
+{"input":{"k":"n","n":["n"]},"allow_unicode":false,"out":"k: n\nn:\n- n\n"}
+{"input":"N","allow_unicode":false,"out":"N\n...\n"}
+{"input":{"k":"N","n":["N"]},"allow_unicode":false,"out":"k: N\nn:\n- N\n"}
+{"input":"no","allow_unicode":false,"out":"'no'\n"}
+{"input":{"k":"no","n":["no"]},"allow_unicode":false,"out":"k: 'no'\nn:\n- 'no'\n"}
+{"input":"No","allow_unicode":false,"out":"'No'\n"}
+{"input":{"k":"No","n":["No"]},"allow_unicode":false,"out":"k: 'No'\nn:\n- 'No'\n"}
+{"input":"NO","allow_unicode":false,"out":"'NO'\n"}
+{"input":{"k":"NO","n":["NO"]},"allow_unicode":false,"out":"k: 'NO'\nn:\n- 'NO'\n"}
+{"input":"true","allow_unicode":false,"out":"'true'\n"}
+{"input":{"k":"true","n":["true"]},"allow_unicode":false,"out":"k: 'true'\nn:\n- 'true'\n"}
+{"input":"True","allow_unicode":false,"out":"'True'\n"}
+{"input":{"k":"True","n":["True"]},"allow_unicode":false,"out":"k: 'True'\nn:\n- 'True'\n"}
+{"input":"TRUE","allow_unicode":false,"out":"'TRUE'\n"}
+{"input":{"k":"TRUE","n":["TRUE"]},"allow_unicode":false,"out":"k: 'TRUE'\nn:\n- 'TRUE'\n"}
+{"input":"false","allow_unicode":false,"out":"'false'\n"}
+{"input":{"k":"false","n":["false"]},"allow_unicode":false,"out":"k: 'false'\nn:\n- 'false'\n"}
+{"input":"False","allow_unicode":false,"out":"'False'\n"}
+{"input":{"k":"False","n":["False"]},"allow_unicode":false,"out":"k: 'False'\nn:\n- 'False'\n"}
+{"input":"FALSE","allow_unicode":false,"out":"'FALSE'\n"}
+{"input":{"k":"FALSE","n":["FALSE"]},"allow_unicode":false,"out":"k: 'FALSE'\nn:\n- 'FALSE'\n"}
+{"input":"on","allow_unicode":false,"out":"'on'\n"}
+{"input":{"k":"on","n":["on"]},"allow_unicode":false,"out":"k: 'on'\nn:\n- 'on'\n"}
+{"input":"On","allow_unicode":false,"out":"'On'\n"}
+{"input":{"k":"On","n":["On"]},"allow_unicode":false,"out":"k: 'On'\nn:\n- 'On'\n"}
+{"input":"ON","allow_unicode":false,"out":"'ON'\n"}
+{"input":{"k":"ON","n":["ON"]},"allow_unicode":false,"out":"k: 'ON'\nn:\n- 'ON'\n"}
+{"input":"off","allow_unicode":false,"out":"'off'\n"}
+{"input":{"k":"off","n":["off"]},"allow_unicode":false,"out":"k: 'off'\nn:\n- 'off'\n"}
+{"input":"Off","allow_unicode":false,"out":"'Off'\n"}
+{"input":{"k":"Off","n":["Off"]},"allow_unicode":false,"out":"k: 'Off'\nn:\n- 'Off'\n"}
+{"input":"OFF","allow_unicode":false,"out":"'OFF'\n"}
+{"input":{"k":"OFF","n":["OFF"]},"allow_unicode":false,"out":"k: 'OFF'\nn:\n- 'OFF'\n"}
+{"input":"~","allow_unicode":false,"out":"'~'\n"}
+{"input":{"k":"~","n":["~"]},"allow_unicode":false,"out":"k: '~'\nn:\n- '~'\n"}
+{"input":"null","allow_unicode":false,"out":"'null'\n"}
+{"input":{"k":"null","n":["null"]},"allow_unicode":false,"out":"k: 'null'\nn:\n- 'null'\n"}
+{"input":"Null","allow_unicode":false,"out":"'Null'\n"}
+{"input":{"k":"Null","n":["Null"]},"allow_unicode":false,"out":"k: 'Null'\nn:\n- 'Null'\n"}
+{"input":"NULL","allow_unicode":false,"out":"'NULL'\n"}
+{"input":{"k":"NULL","n":["NULL"]},"allow_unicode":false,"out":"k: 'NULL'\nn:\n- 'NULL'\n"}
+{"input":"","allow_unicode":false,"out":"''\n"}
+{"input":{"k":"","n":[""]},"allow_unicode":false,"out":"k: ''\nn:\n- ''\n"}
+{"input":"1","allow_unicode":false,"out":"'1'\n"}
+{"input":{"k":"1","n":["1"]},"allow_unicode":false,"out":"k: '1'\nn:\n- '1'\n"}
+{"input":"-1","allow_unicode":false,"out":"'-1'\n"}
+{"input":{"k":"-1","n":["-1"]},"allow_unicode":false,"out":"k: '-1'\nn:\n- '-1'\n"}
+{"input":"+1","allow_unicode":false,"out":"'+1'\n"}
+{"input":{"k":"+1","n":["+1"]},"allow_unicode":false,"out":"k: '+1'\nn:\n- '+1'\n"}
+{"input":"0","allow_unicode":false,"out":"'0'\n"}
+{"input":{"k":"0","n":["0"]},"allow_unicode":false,"out":"k: '0'\nn:\n- '0'\n"}
+{"input":"007","allow_unicode":false,"out":"'007'\n"}
+{"input":{"k":"007","n":["007"]},"allow_unicode":false,"out":"k: '007'\nn:\n- '007'\n"}
+{"input":"0o17","allow_unicode":false,"out":"0o17\n...\n"}
+{"input":{"k":"0o17","n":["0o17"]},"allow_unicode":false,"out":"k: 0o17\nn:\n- 0o17\n"}
+{"input":"017","allow_unicode":false,"out":"'017'\n"}
+{"input":{"k":"017","n":["017"]},"allow_unicode":false,"out":"k: '017'\nn:\n- '017'\n"}
+{"input":"0x1F","allow_unicode":false,"out":"'0x1F'\n"}
+{"input":{"k":"0x1F","n":["0x1F"]},"allow_unicode":false,"out":"k: '0x1F'\nn:\n- '0x1F'\n"}
+{"input":"0b1010","allow_unicode":false,"out":"'0b1010'\n"}
+{"input":{"k":"0b1010","n":["0b1010"]},"allow_unicode":false,"out":"k: '0b1010'\nn:\n- '0b1010'\n"}
+{"input":"1_000","allow_unicode":false,"out":"'1_000'\n"}
+{"input":{"k":"1_000","n":["1_000"]},"allow_unicode":false,"out":"k: '1_000'\nn:\n- '1_000'\n"}
+{"input":"1:20","allow_unicode":false,"out":"'1:20'\n"}
+{"input":{"k":"1:20","n":["1:20"]},"allow_unicode":false,"out":"k: '1:20'\nn:\n- '1:20'\n"}
+{"input":"1.0","allow_unicode":false,"out":"'1.0'\n"}
+{"input":{"k":"1.0","n":["1.0"]},"allow_unicode":false,"out":"k: '1.0'\nn:\n- '1.0'\n"}
+{"input":"1e3","allow_unicode":false,"out":"1e3\n...\n"}
+{"input":{"k":"1e3","n":["1e3"]},"allow_unicode":false,"out":"k: 1e3\nn:\n- 1e3\n"}
+{"input":"1.5e+3","allow_unicode":false,"out":"'1.5e+3'\n"}
+{"input":{"k":"1.5e+3","n":["1.5e+3"]},"allow_unicode":false,"out":"k: '1.5e+3'\nn:\n- '1.5e+3'\n"}
+{"input":".5","allow_unicode":false,"out":"'.5'\n"}
+{"input":{"k":".5","n":[".5"]},"allow_unicode":false,"out":"k: '.5'\nn:\n- '.5'\n"}
+{"input":"-.5","allow_unicode":false,"out":"-.5\n...\n"}
+{"input":{"k":"-.5","n":["-.5"]},"allow_unicode":false,"out":"k: -.5\nn:\n- -.5\n"}
+{"input":".inf","allow_unicode":false,"out":"'.inf'\n"}
+{"input":{"k":".inf","n":[".inf"]},"allow_unicode":false,"out":"k: '.inf'\nn:\n- '.inf'\n"}
+{"input":"-.inf","allow_unicode":false,"out":"'-.inf'\n"}
+{"input":{"k":"-.inf","n":["-.inf"]},"allow_unicode":false,"out":"k: '-.inf'\nn:\n- '-.inf'\n"}
+{"input":".Inf","allow_unicode":false,"out":"'.Inf'\n"}
+{"input":{"k":".Inf","n":[".Inf"]},"allow_unicode":false,"out":"k: '.Inf'\nn:\n- '.Inf'\n"}
+{"input":".NaN","allow_unicode":false,"out":"'.NaN'\n"}
+{"input":{"k":".NaN","n":[".NaN"]},"allow_unicode":false,"out":"k: '.NaN'\nn:\n- '.NaN'\n"}
+{"input":".nan","allow_unicode":false,"out":"'.nan'\n"}
+{"input":{"k":".nan","n":[".nan"]},"allow_unicode":false,"out":"k: '.nan'\nn:\n- '.nan'\n"}
+{"input":"=","allow_unicode":false,"out":"'='\n"}
+{"input":{"k":"=","n":["="]},"allow_unicode":false,"out":"k: '='\nn:\n- '='\n"}
+{"input":"<<","allow_unicode":false,"out":"'<<'\n"}
+{"input":{"k":"<<","n":["<<"]},"allow_unicode":false,"out":"k: '<<'\nn:\n- '<<'\n"}
+{"input":"0.","allow_unicode":false,"out":"'0.'\n"}
+{"input":{"k":"0.","n":["0."]},"allow_unicode":false,"out":"k: '0.'\nn:\n- '0.'\n"}
+{"input":"1,000","allow_unicode":false,"out":"1,000\n...\n"}
+{"input":{"k":"1,000","n":["1,000"]},"allow_unicode":false,"out":"k: 1,000\nn:\n- 1,000\n"}
+{"input":"2001-12-14","allow_unicode":false,"out":"'2001-12-14'\n"}
+{"input":{"k":"2001-12-14","n":["2001-12-14"]},"allow_unicode":false,"out":"k: '2001-12-14'\nn:\n- '2001-12-14'\n"}
+{"input":"2001-12-14t21:59:43.10-05:00","allow_unicode":false,"out":"'2001-12-14t21:59:43.10-05:00'\n"}
+{"input":{"k":"2001-12-14t21:59:43.10-05:00","n":["2001-12-14t21:59:43.10-05:00"]},"allow_unicode":false,"out":"k: '2001-12-14t21:59:43.10-05:00'\nn:\n- '2001-12-14t21:59:43.10-05:00'\n"}
+{"input":"2001-12-14 21:59:43.10 -5","allow_unicode":false,"out":"'2001-12-14 21:59:43.10 -5'\n"}
+{"input":{"k":"2001-12-14 21:59:43.10 -5","n":["2001-12-14 21:59:43.10 -5"]},"allow_unicode":false,"out":"k: '2001-12-14 21:59:43.10 -5'\nn:\n- '2001-12-14 21:59:43.10 -5'\n"}
+{"input":"2001-12-15 2:59:43.10","allow_unicode":false,"out":"'2001-12-15 2:59:43.10'\n"}
+{"input":{"k":"2001-12-15 2:59:43.10","n":["2001-12-15 2:59:43.10"]},"allow_unicode":false,"out":"k: '2001-12-15 2:59:43.10'\nn:\n- '2001-12-15 2:59:43.10'\n"}
+{"input":" a","allow_unicode":false,"out":"' a'\n"}
+{"input":{"k":" a","n":[" a"]},"allow_unicode":false,"out":"k: ' a'\nn:\n- ' a'\n"}
+{"input":"a ","allow_unicode":false,"out":"'a '\n"}
+{"input":{"k":"a ","n":["a "]},"allow_unicode":false,"out":"k: 'a '\nn:\n- 'a '\n"}
+{"input":" ","allow_unicode":false,"out":"' '\n"}
+{"input":{"k":" ","n":[" "]},"allow_unicode":false,"out":"k: ' '\nn:\n- ' '\n"}
+{"input":"\ta","allow_unicode":false,"out":"\"\\ta\"\n"}
+{"input":{"k":"\ta","n":["\ta"]},"allow_unicode":false,"out":"k: \"\\ta\"\nn:\n- \"\\ta\"\n"}
+{"input":"a\tb","allow_unicode":false,"out":"\"a\\tb\"\n"}
+{"input":{"k":"a\tb","n":["a\tb"]},"allow_unicode":false,"out":"k: \"a\\tb\"\nn:\n- \"a\\tb\"\n"}
+{"input":"a\nb","allow_unicode":false,"out":"'a\n\n  b'\n"}
+{"input":{"k":"a\nb","n":["a\nb"]},"allow_unicode":false,"out":"k: 'a\n\n  b'\nn:\n- 'a\n\n  b'\n"}
+{"input":"a\n","allow_unicode":false,"out":"'a\n\n  '\n"}
+{"input":{"k":"a\n","n":["a\n"]},"allow_unicode":false,"out":"k: 'a\n\n  '\nn:\n- 'a\n\n  '\n"}
+{"input":"\n","allow_unicode":false,"out":"'\n\n  '\n"}
+{"input":{"k":"\n","n":["\n"]},"allow_unicode":false,"out":"k: '\n\n  '\nn:\n- '\n\n  '\n"}
+{"input":"line1\nline2\n","allow_unicode":false,"out":"'line1\n\n  line2\n\n  '\n"}
+{"input":{"k":"line1\nline2\n","n":["line1\nline2\n"]},"allow_unicode":false,"out":"k: 'line1\n\n  line2\n\n  '\nn:\n- 'line1\n\n  line2\n\n  '\n"}
+{"input":"a\r\nb","allow_unicode":false,"out":"\"a\\r\\nb\"\n"}
+{"input":{"k":"a\r\nb","n":["a\r\nb"]},"allow_unicode":false,"out":"k: \"a\\r\\nb\"\nn:\n- \"a\\r\\nb\"\n"}
+{"input":"ab","allow_unicode":false,"out":"\"a\\Nb\"\n"}
+{"input":{"k":"ab","n":["ab"]},"allow_unicode":false,"out":"k: \"a\\Nb\"\nn:\n- \"a\\Nb\"\n"}
+{"input":" ","allow_unicode":false,"out":"\"\\L\"\n"}
+{"input":{"k":" ","n":[" "]},"allow_unicode":false,"out":"k: \"\\L\"\nn:\n- \"\\L\"\n"}
+{"input":" x","allow_unicode":false,"out":"\"\\_x\"\n"}
+{"input":{"k":" x","n":[" x"]},"allow_unicode":false,"out":"k: \"\\_x\"\nn:\n- \"\\_x\"\n"}
+{"input":"  leading and trailing  ","allow_unicode":false,"out":"'  leading and trailing  '\n"}
+{"input":{"k":"  leading and trailing  ","n":["  leading and trailing  "]},"allow_unicode":false,"out":"k: '  leading and trailing  '\nn:\n- '  leading and trailing  '\n"}
+{"input":"a: b","allow_unicode":false,"out":"'a: b'\n"}
+{"input":{"k":"a: b","n":["a: b"]},"allow_unicode":false,"out":"k: 'a: b'\nn:\n- 'a: b'\n"}
+{"input":"a:b","allow_unicode":false,"out":"a:b\n...\n"}
+{"input":{"k":"a:b","n":["a:b"]},"allow_unicode":false,"out":"k: a:b\nn:\n- a:b\n"}
+{"input":"a #b","allow_unicode":false,"out":"'a #b'\n"}
+{"input":{"k":"a #b","n":["a #b"]},"allow_unicode":false,"out":"k: 'a #b'\nn:\n- 'a #b'\n"}
+{"input":"a#b","allow_unicode":false,"out":"a#b\n...\n"}
+{"input":{"k":"a#b","n":["a#b"]},"allow_unicode":false,"out":"k: a#b\nn:\n- a#b\n"}
+{"input":"#a","allow_unicode":false,"out":"'#a'\n"}
+{"input":{"k":"#a","n":["#a"]},"allow_unicode":false,"out":"k: '#a'\nn:\n- '#a'\n"}
+{"input":"a: ","allow_unicode":false,"out":"'a: '\n"}
+{"input":{"k":"a: ","n":["a: "]},"allow_unicode":false,"out":"k: 'a: '\nn:\n- 'a: '\n"}
+{"input":"key:","allow_unicode":false,"out":"'key:'\n"}
+{"input":{"k":"key:","n":["key:"]},"allow_unicode":false,"out":"k: 'key:'\nn:\n- 'key:'\n"}
+{"input":"http://x","allow_unicode":false,"out":"http://x\n...\n"}
+{"input":{"k":"http://x","n":["http://x"]},"allow_unicode":false,"out":"k: http://x\nn:\n- http://x\n"}
+{"input":"tcp://127.0.0.1:48700","allow_unicode":false,"out":"tcp://127.0.0.1:48700\n...\n"}
+{"input":{"k":"tcp://127.0.0.1:48700","n":["tcp://127.0.0.1:48700"]},"allow_unicode":false,"out":"k: tcp://127.0.0.1:48700\nn:\n- tcp://127.0.0.1:48700\n"}
+{"input":"C:\\Users\\a","allow_unicode":false,"out":"C:\\Users\\a\n...\n"}
+{"input":{"k":"C:\\Users\\a","n":["C:\\Users\\a"]},"allow_unicode":false,"out":"k: C:\\Users\\a\nn:\n- C:\\Users\\a\n"}
+{"input":"\\\\server\\share","allow_unicode":false,"out":"\\\\server\\share\n...\n"}
+{"input":{"k":"\\\\server\\share","n":["\\\\server\\share"]},"allow_unicode":false,"out":"k: \\\\server\\share\nn:\n- \\\\server\\share\n"}
+{"input":"a'b","allow_unicode":false,"out":"a'b\n...\n"}
+{"input":{"k":"a'b","n":["a'b"]},"allow_unicode":false,"out":"k: a'b\nn:\n- a'b\n"}
+{"input":"a\"b","allow_unicode":false,"out":"a\"b\n...\n"}
+{"input":{"k":"a\"b","n":["a\"b"]},"allow_unicode":false,"out":"k: a\"b\nn:\n- a\"b\n"}
+{"input":"'quoted'","allow_unicode":false,"out":"'''quoted'''\n"}
+{"input":{"k":"'quoted'","n":["'quoted'"]},"allow_unicode":false,"out":"k: '''quoted'''\nn:\n- '''quoted'''\n"}
+{"input":"\"dq\"","allow_unicode":false,"out":"'\"dq\"'\n"}
+{"input":{"k":"\"dq\"","n":["\"dq\""]},"allow_unicode":false,"out":"k: '\"dq\"'\nn:\n- '\"dq\"'\n"}
+{"input":"-a","allow_unicode":false,"out":"-a\n...\n"}
+{"input":{"k":"-a","n":["-a"]},"allow_unicode":false,"out":"k: -a\nn:\n- -a\n"}
+{"input":"- a","allow_unicode":false,"out":"'- a'\n"}
+{"input":{"k":"- a","n":["- a"]},"allow_unicode":false,"out":"k: '- a'\nn:\n- '- a'\n"}
+{"input":"?a","allow_unicode":false,"out":"?a\n...\n"}
+{"input":{"k":"?a","n":["?a"]},"allow_unicode":false,"out":"k: ?a\nn:\n- ?a\n"}
+{"input":"? a","allow_unicode":false,"out":"'? a'\n"}
+{"input":{"k":"? a","n":["? a"]},"allow_unicode":false,"out":"k: '? a'\nn:\n- '? a'\n"}
+{"input":":a","allow_unicode":false,"out":":a\n...\n"}
+{"input":{"k":":a","n":[":a"]},"allow_unicode":false,"out":"k: :a\nn:\n- :a\n"}
+{"input":",a","allow_unicode":false,"out":"',a'\n"}
+{"input":{"k":",a","n":[",a"]},"allow_unicode":false,"out":"k: ',a'\nn:\n- ',a'\n"}
+{"input":"[a","allow_unicode":false,"out":"'[a'\n"}
+{"input":{"k":"[a","n":["[a"]},"allow_unicode":false,"out":"k: '[a'\nn:\n- '[a'\n"}
+{"input":"]a","allow_unicode":false,"out":"']a'\n"}
+{"input":{"k":"]a","n":["]a"]},"allow_unicode":false,"out":"k: ']a'\nn:\n- ']a'\n"}
+{"input":"{a","allow_unicode":false,"out":"'{a'\n"}
+{"input":{"k":"{a","n":["{a"]},"allow_unicode":false,"out":"k: '{a'\nn:\n- '{a'\n"}
+{"input":"}a","allow_unicode":false,"out":"'}a'\n"}
+{"input":{"k":"}a","n":["}a"]},"allow_unicode":false,"out":"k: '}a'\nn:\n- '}a'\n"}
+{"input":"&a","allow_unicode":false,"out":"'&a'\n"}
+{"input":{"k":"&a","n":["&a"]},"allow_unicode":false,"out":"k: '&a'\nn:\n- '&a'\n"}
+{"input":"*a","allow_unicode":false,"out":"'*a'\n"}
+{"input":{"k":"*a","n":["*a"]},"allow_unicode":false,"out":"k: '*a'\nn:\n- '*a'\n"}
+{"input":"!a","allow_unicode":false,"out":"'!a'\n"}
+{"input":{"k":"!a","n":["!a"]},"allow_unicode":false,"out":"k: '!a'\nn:\n- '!a'\n"}
+{"input":"|a","allow_unicode":false,"out":"'|a'\n"}
+{"input":{"k":"|a","n":["|a"]},"allow_unicode":false,"out":"k: '|a'\nn:\n- '|a'\n"}
+{"input":">a","allow_unicode":false,"out":"'>a'\n"}
+{"input":{"k":">a","n":[">a"]},"allow_unicode":false,"out":"k: '>a'\nn:\n- '>a'\n"}
+{"input":"'a","allow_unicode":false,"out":"'''a'\n"}
+{"input":{"k":"'a","n":["'a"]},"allow_unicode":false,"out":"k: '''a'\nn:\n- '''a'\n"}
+{"input":"%a","allow_unicode":false,"out":"'%a'\n"}
+{"input":{"k":"%a","n":["%a"]},"allow_unicode":false,"out":"k: '%a'\nn:\n- '%a'\n"}
+{"input":"@a","allow_unicode":false,"out":"'@a'\n"}
+{"input":{"k":"@a","n":["@a"]},"allow_unicode":false,"out":"k: '@a'\nn:\n- '@a'\n"}
+{"input":"`a","allow_unicode":false,"out":"'`a'\n"}
+{"input":{"k":"`a","n":["`a"]},"allow_unicode":false,"out":"k: '`a'\nn:\n- '`a'\n"}
+{"input":"-","allow_unicode":false,"out":"'-'\n"}
+{"input":{"k":"-","n":["-"]},"allow_unicode":false,"out":"k: '-'\nn:\n- '-'\n"}
+{"input":"?","allow_unicode":false,"out":"'?'\n"}
+{"input":{"k":"?","n":["?"]},"allow_unicode":false,"out":"k: '?'\nn:\n- '?'\n"}
+{"input":":","allow_unicode":false,"out":"':'\n"}
+{"input":{"k":":","n":[":"]},"allow_unicode":false,"out":"k: ':'\nn:\n- ':'\n"}
+{"input":"\u0001","allow_unicode":false,"out":"\"\\x01\"\n"}
+{"input":{"k":"\u0001","n":["\u0001"]},"allow_unicode":false,"out":"k: \"\\x01\"\nn:\n- \"\\x01\"\n"}
+{"input":"ab","allow_unicode":false,"out":"\"a\\x7Fb\"\n"}
+{"input":{"k":"ab","n":["ab"]},"allow_unicode":false,"out":"k: \"a\\x7Fb\"\nn:\n- \"a\\x7Fb\"\n"}
+{"input":"\u001b[0m","allow_unicode":false,"out":"\"\\e[0m\"\n"}
+{"input":{"k":"\u001b[0m","n":["\u001b[0m"]},"allow_unicode":false,"out":"k: \"\\e[0m\"\nn:\n- \"\\e[0m\"\n"}
+{"input":"\u0000","allow_unicode":false,"out":"\"\\0\"\n"}
+{"input":{"k":"\u0000","n":["\u0000"]},"allow_unicode":false,"out":"k: \"\\0\"\nn:\n- \"\\0\"\n"}
+{"input":"\b","allow_unicode":false,"out":"\"\\b\"\n"}
+{"input":{"k":"\b","n":["\b"]},"allow_unicode":false,"out":"k: \"\\b\"\nn:\n- \"\\b\"\n"}
+{"input":"\f","allow_unicode":false,"out":"\"\\f\"\n"}
+{"input":{"k":"\f","n":["\f"]},"allow_unicode":false,"out":"k: \"\\f\"\nn:\n- \"\\f\"\n"}
+{"input":"","allow_unicode":false,"out":"\"\\x7F\"\n"}
+{"input":{"k":"","n":[""]},"allow_unicode":false,"out":"k: \"\\x7F\"\nn:\n- \"\\x7F\"\n"}
+{"input":"中文","allow_unicode":false,"out":"\"\\u4E2D\\u6587\"\n"}
+{"input":{"k":"中文","n":["中文"]},"allow_unicode":false,"out":"k: \"\\u4E2D\\u6587\"\nn:\n- \"\\u4E2D\\u6587\"\n"}
+{"input":"繁體 字串","allow_unicode":false,"out":"\"\\u7E41\\u9AD4 \\u5B57\\u4E32\"\n"}
+{"input":{"k":"繁體 字串","n":["繁體 字串"]},"allow_unicode":false,"out":"k: \"\\u7E41\\u9AD4 \\u5B57\\u4E32\"\nn:\n- \"\\u7E41\\u9AD4 \\u5B57\\u4E32\"\n"}
+{"input":"日本語","allow_unicode":false,"out":"\"\\u65E5\\u672C\\u8A9E\"\n"}
+{"input":{"k":"日本語","n":["日本語"]},"allow_unicode":false,"out":"k: \"\\u65E5\\u672C\\u8A9E\"\nn:\n- \"\\u65E5\\u672C\\u8A9E\"\n"}
+{"input":"é","allow_unicode":false,"out":"\"\\xE9\"\n"}
+{"input":{"k":"é","n":["é"]},"allow_unicode":false,"out":"k: \"\\xE9\"\nn:\n- \"\\xE9\"\n"}
+{"input":"😀","allow_unicode":false,"out":"\"\\U0001F600\"\n"}
+{"input":{"k":"😀","n":["😀"]},"allow_unicode":false,"out":"k: \"\\U0001F600\"\nn:\n- \"\\U0001F600\"\n"}
+{"input":"a😀b","allow_unicode":false,"out":"\"a\\U0001F600b\"\n"}
+{"input":{"k":"a😀b","n":["a😀b"]},"allow_unicode":false,"out":"k: \"a\\U0001F600b\"\nn:\n- \"a\\U0001F600b\"\n"}
+{"input":"﻿","allow_unicode":false,"out":"\"\\uFEFF\"\n"}
+{"input":{"k":"﻿","n":["﻿"]},"allow_unicode":false,"out":"k: \"\\uFEFF\"\nn:\n- \"\\uFEFF\"\n"}
+{"input":"​","allow_unicode":false,"out":"\"\\u200B\"\n"}
+{"input":{"k":"​","n":["​"]},"allow_unicode":false,"out":"k: \"\\u200B\"\nn:\n- \"\\u200B\"\n"}
+{"input":"COM3","allow_unicode":false,"out":"COM3\n...\n"}
+{"input":{"k":"COM3","n":["COM3"]},"allow_unicode":false,"out":"k: COM3\nn:\n- COM3\n"}
+{"input":"COM10","allow_unicode":false,"out":"COM10\n...\n"}
+{"input":{"k":"COM10","n":["COM10"]},"allow_unicode":false,"out":"k: COM10\nn:\n- COM10\n"}
+{"input":"/dev/serial/by-id/usb-FTDI_x-if00-port0","allow_unicode":false,"out":"/dev/serial/by-id/usb-FTDI_x-if00-port0\n...\n"}
+{"input":{"k":"/dev/serial/by-id/usb-FTDI_x-if00-port0","n":["/dev/serial/by-id/usb-FTDI_x-if00-port0"]},"allow_unicode":false,"out":"k: /dev/serial/by-id/usb-FTDI_x-if00-port0\nn:\n- /dev/serial/by-id/usb-FTDI_x-if00-port0\n"}
+{"input":"~/.config/serialwrap","allow_unicode":false,"out":"~/.config/serialwrap\n...\n"}
+{"input":{"k":"~/.config/serialwrap","n":["~/.config/serialwrap"]},"allow_unicode":false,"out":"k: ~/.config/serialwrap\nn:\n- ~/.config/serialwrap\n"}
+{"input":"${HOME}","allow_unicode":false,"out":"${HOME}\n...\n"}
+{"input":{"k":"${HOME}","n":["${HOME}"]},"allow_unicode":false,"out":"k: ${HOME}\nn:\n- ${HOME}\n"}
+{"input":"windows","allow_unicode":false,"out":"windows\n...\n"}
+{"input":{"k":"windows","n":["windows"]},"allow_unicode":false,"out":"k: windows\nn:\n- windows\n"}
+{"input":"lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet ","allow_unicode":false,"out":"'lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet\n  lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet '\n"}
+{"input":{"k":"lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet ","n":["lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet "]},"allow_unicode":false,"out":"k: 'lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet\n  lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet '\nn:\n- 'lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet\n  lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet '\n"}
+{"input":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx","allow_unicode":false,"out":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n...\n"}
+{"input":{"k":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx","n":["xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"]},"allow_unicode":false,"out":"k: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\nn:\n- xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"}
+{"input":"中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文","allow_unicode":false,"out":"\"\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\\n  \\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\\n  \\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\\n  \\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\\n  \\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\\n  \\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\"\n"}
+{"input":{"k":"中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文","n":["中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文"]},"allow_unicode":false,"out":"k: \"\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\\n  \\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\\n  \\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\\n  \\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\\n  \\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\\n  \\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\"\nn:\n- \"\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\\n  \\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\\n  \\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\\n  \\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\\n  \\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\\n  \\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\\u4E2D\\u6587\"\n"}
+{"input":0,"allow_unicode":false,"out":"0\n...\n"}
+{"input":{"k":0,"n":[0]},"allow_unicode":false,"out":"k: 0\nn:\n- 0\n"}
+{"input":-1,"allow_unicode":false,"out":"-1\n...\n"}
+{"input":{"k":-1,"n":[-1]},"allow_unicode":false,"out":"k: -1\nn:\n- -1\n"}
+{"input":42,"allow_unicode":false,"out":"42\n...\n"}
+{"input":{"k":42,"n":[42]},"allow_unicode":false,"out":"k: 42\nn:\n- 42\n"}
+{"input":9007199254740993,"allow_unicode":false,"out":"9007199254740993\n...\n"}
+{"input":{"k":9007199254740993,"n":[9007199254740993]},"allow_unicode":false,"out":"k: 9007199254740993\nn:\n- 9007199254740993\n"}
+{"input":1000000000000000000000000000000,"allow_unicode":false,"out":"1000000000000000000000000000000\n...\n"}
+{"input":{"k":1000000000000000000000000000000,"n":[1000000000000000000000000000000]},"allow_unicode":false,"out":"k: 1000000000000000000000000000000\nn:\n- 1000000000000000000000000000000\n"}
+{"input":true,"allow_unicode":false,"out":"true\n...\n"}
+{"input":{"k":true,"n":[true]},"allow_unicode":false,"out":"k: true\nn:\n- true\n"}
+{"input":false,"allow_unicode":false,"out":"false\n...\n"}
+{"input":{"k":false,"n":[false]},"allow_unicode":false,"out":"k: false\nn:\n- false\n"}
+{"input":null,"allow_unicode":false,"out":"null\n...\n"}
+{"input":{"k":null,"n":[null]},"allow_unicode":false,"out":"k: null\nn:\n- null\n"}
+{"input":0.0,"allow_unicode":false,"out":"0.0\n...\n"}
+{"input":{"k":0.0,"n":[0.0]},"allow_unicode":false,"out":"k: 0.0\nn:\n- 0.0\n"}
+{"input":1.0,"allow_unicode":false,"out":"1.0\n...\n"}
+{"input":{"k":1.0,"n":[1.0]},"allow_unicode":false,"out":"k: 1.0\nn:\n- 1.0\n"}
+{"input":0.1,"allow_unicode":false,"out":"0.1\n...\n"}
+{"input":{"k":0.1,"n":[0.1]},"allow_unicode":false,"out":"k: 0.1\nn:\n- 0.1\n"}
+{"input":1e+16,"allow_unicode":false,"out":"1.0e+16\n...\n"}
+{"input":{"k":1e+16,"n":[1e+16]},"allow_unicode":false,"out":"k: 1.0e+16\nn:\n- 1.0e+16\n"}
+{"input":1.5e-07,"allow_unicode":false,"out":"1.5e-07\n...\n"}
+{"input":{"k":1.5e-07,"n":[1.5e-07]},"allow_unicode":false,"out":"k: 1.5e-07\nn:\n- 1.5e-07\n"}
+{"input":123456789.125,"allow_unicode":false,"out":"123456789.125\n...\n"}
+{"input":{"k":123456789.125,"n":[123456789.125]},"allow_unicode":false,"out":"k: 123456789.125\nn:\n- 123456789.125\n"}
+{"input":-2.5,"allow_unicode":false,"out":"-2.5\n...\n"}
+{"input":{"k":-2.5,"n":[-2.5]},"allow_unicode":false,"out":"k: -2.5\nn:\n- -2.5\n"}
+{"input":{"windows":{"exclude_coms":["COM3","COM10"]}},"allow_unicode":false,"out":"windows:\n  exclude_coms:\n  - COM3\n  - COM10\n"}
+{"input":{"tcp":"tcp://127.0.0.1:48700","path":"C:\\Users\\a"},"allow_unicode":false,"out":"path: C:\\Users\\a\ntcp: tcp://127.0.0.1:48700\n"}
+{"input":{"z":1,"a":2,"m":{"y":1,"b":2}},"allow_unicode":false,"out":"a: 2\nm:\n  b: 2\n  y: 1\nz: 1\n"}
+{"input":{"b":[1,2.5,true,null,"x"],"a":{}},"allow_unicode":false,"out":"a: {}\nb:\n- 1\n- 2.5\n- true\n- null\n- x\n"}
+{"input":[],"allow_unicode":false,"out":"[]\n"}
+{"input":{},"allow_unicode":false,"out":"{}\n"}
+{"input":[[],{},[1,[2,[3]]]],"allow_unicode":false,"out":"- []\n- {}\n- - 1\n  - - 2\n    - - 3\n"}
+{"input":{"a":{"b":{"c":[1,{"d":null}]}}},"allow_unicode":false,"out":"a:\n  b:\n    c:\n    - 1\n    - d: null\n"}
+{"input":{"a: b":1,"":2,"1":3,"true":4,"null":5,"#k":6,"-k":7,"中文":"值"},"allow_unicode":false,"out":"? ''\n: 2\n'#k': 6\n-k: 7\n'1': 3\n'a: b': 1\n'null': 5\n'true': 4\n\"\\u4E2D\\u6587\": \"\\u503C\"\n"}
+{"input":[[{"a":1}]],"allow_unicode":false,"out":"- - a: 1\n"}
+{"input":[[{"a":1,"b":2},3]],"allow_unicode":false,"out":"- - a: 1\n    b: 2\n  - 3\n"}
+{"input":[[[1,2]]],"allow_unicode":false,"out":"- - - 1\n    - 2\n"}
+{"input":{"k":[[{"a":1},2],3]},"allow_unicode":false,"out":"k:\n- - a: 1\n  - 2\n- 3\n"}
+{"input":[["multi\nline"]],"allow_unicode":false,"out":"- - 'multi\n\n    line'\n"}
+{"input":[["word word word word word word word word word word word word word word word word word word word word end"]],"allow_unicode":false,"out":"- - word word word word word word word word word word word word word word word word\n    word word word word end\n"}
+{"input":{"a\nb":1},"allow_unicode":false,"out":"? 'a\n\n  b'\n: 1\n"}
+{"input":{"x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x ":1},"allow_unicode":false,"out":"'x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x ': 1\n"}
+{"input":{"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx":1},"allow_unicode":false,"out":"? xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n: 1\n"}
+{"input":{"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx":1},"allow_unicode":false,"out":"? xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n: 1\n"}
+{"input":{"":[1,2]},"allow_unicode":false,"out":"? ''\n: - 1\n  - 2\n"}
+{"input":{"unicode":"\t "},"allow_unicode":false,"out":"unicode: \"\\t\\_\"\n"}
+{"input":{"unicode":"\t😀"},"allow_unicode":false,"out":"unicode: \"\\t\\U0001F600\"\n"}
+{"input":{"f":[1.0,0.1,1e+16,1.5e-07,-2.5,123456789.125,-0.0]},"allow_unicode":false,"out":"f:\n- 1.0\n- 0.1\n- 1.0e+16\n- 1.5e-07\n- -2.5\n- 123456789.125\n- -0.0\n"}
+{"input":{"i":[0,-1,9007199254740993,1000000000000000000000000000000,-1000000000000000000000000000000]},"allow_unicode":false,"out":"i:\n- 0\n- -1\n- 9007199254740993\n- 1000000000000000000000000000000\n- -1000000000000000000000000000000\n"}
+{"input":{"long":["word word word word word word word word word word word word word word word word word word word word end","xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"]},"allow_unicode":false,"out":"long:\n- word word word word word word word word word word word word word word word word\n  word word word word end\n- xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"}
+{"input":{"lines":"first\nsecond\n\nthird","crlf":"a\r\nb","tab":"a\tb"},"allow_unicode":false,"out":"crlf: \"a\\r\\nb\"\nlines: 'first\n\n  second\n\n\n  third'\ntab: \"a\\tb\"\n"}
+{"input":{},"allow_unicode":true,"out":"{}\n"}
+{"input":{"supervision_mode":"on-demand"},"allow_unicode":true,"out":"supervision_mode: on-demand\n"}
+{"input":{"socket_path":"tcp://127.0.0.1:48700","supervision_mode":"windows-task"},"allow_unicode":true,"out":"socket_path: tcp://127.0.0.1:48700\nsupervision_mode: windows-task\n"}
+{"input":{"windows":{"exclude_coms":["COM3","COM10"]}},"allow_unicode":true,"out":"windows:\n  exclude_coms:\n  - COM3\n  - COM10\n"}
+{"input":{"greeting":"你好世界","supervision_mode":"systemd-user"},"allow_unicode":true,"out":"greeting: 你好世界\nsupervision_mode: systemd-user\n"}
+{"input":{"supervision_mode":"on-demand","tag":"on"},"allow_unicode":true,"out":"supervision_mode: on-demand\ntag: 'on'\n"}

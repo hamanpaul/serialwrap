@@ -1,0 +1,21 @@
+{"args":[],"joined":"","split":[]}
+{"args":["a","b"],"joined":"a b","split":["a","b"]}
+{"args":["hello world"],"joined":"\"hello world\"","split":["hello world"]}
+{"args":["a\"b"],"joined":"a\\\"b","split":["a\"b"]}
+{"args":["C:\\path\\"],"joined":"C:\\path\\","split":["C:\\path\\"]}
+{"args":["C:\\Program Files\\serialwrap\\"],"joined":"\"C:\\Program Files\\serialwrap\\\\\"","split":["C:\\Program Files\\serialwrap\\"]}
+{"args":[""],"joined":"\"\"","split":[""]}
+{"args":["a\tb"],"joined":"\"a\tb\"","split":["a\tb"]}
+{"args":["\\\"x"],"joined":"\\\\\\\"x","split":["\\\"x"]}
+{"args":["\u6e2c\u8a66 \u4e2d\u6587","x"],"joined":"\"\u6e2c\u8a66 \u4e2d\u6587\" x","split":["\u6e2c\u8a66 \u4e2d\u6587","x"]}
+{"args":["--socket","tcp://127.0.0.1:48700"],"joined":"--socket tcp://127.0.0.1:48700","split":["--socket","tcp://127.0.0.1:48700"]}
+{"args":["a\\\\b","c d\\"],"joined":"a\\\\b \"c d\\\\\"","split":["a\\\\b","c d\\"]}
+{"args":["\"",""],"joined":"\\\" \"\"","split":["\"",""]}
+{"args":["a&b","x|y","p<q"],"joined":"a&b x|y p<q","split":["a&b","x|y","p<q"]}
+{"args":["x\\","y z"],"joined":"x\\ \"y z\"","split":["x\\","y z"]}
+{"args":["\"quoted\""],"joined":"\\\"quoted\\\"","split":["\"quoted\""]}
+{"args":["C:\\A&B\\serialwrapd.exe","--flag=value with space"],"joined":"C:\\A&B\\serialwrapd.exe \"--flag=value with space\"","split":["C:\\A&B\\serialwrapd.exe","--flag=value with space"]}
+{"args":["trailing\\\\",""],"joined":"trailing\\\\ \"\"","split":["trailing\\\\",""]}
+{"args":["back\\\\\\\"slash"],"joined":"back\\\\\\\\\\\\\\\"slash","split":["back\\\\\\\"slash"]}
+{"args":["",""],"joined":"\"\" \"\"","split":["",""]}
+{"args":["sp ace","\\","tail\\"],"joined":"\"sp ace\" \\ tail\\","split":["sp ace","\\","tail\\"]}

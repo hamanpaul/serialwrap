@@ -1,0 +1,251 @@
+# Rust CI 與 Stage 1A 出口 gate 的 PR 側 workflow（P3-T19；依 docs/rust-refactor/plans/04-stage1a-rust-cli.md Task 19、規格 §11.5）。
+#
+# 三個 job（job id 即 GitHub 檢查名稱，required check 以 job id 設定，故不設 name:）：
+#   - rust-linux：每個 PR；Linux 原生建置測試＋Windows GNU 交叉檢查＋黑箱 A/B（Rust CLI 輪）。
+#   - rust-windows-hosted：每個 PR；GitHub 託管 Windows 免驅動 L1（portable）與匯入 DLL 檢查。
+#     只證明免驅動 Windows L1，不得計為 windows_com（OD-08）。
+#   - rust-windows-com：自架 Windows COM bench；僅 PR 帶 label run-windows-com（且為同 repo 分支）、
+#     手動觸發或排程觸發。自架 bench 不得直接執行未核准的不受信任 PR 程式碼（規格 §11.5）。
+#
+# 本檔不使用 continue-on-error：任何失敗都以紅燈呈現，不得以略過放行。
+name: Rust
+
+on:
+  pull_request:
+    # labeled 讓維護者在審過 PR 後加上 run-windows-com 標籤即可觸發 COM bench。
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+  schedule:
+    # 排程只觸發 COM bench（rust-windows-com）；cron 為擁有者可調整的預設值（每週一 03:00 UTC）。
+    - cron: "0 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  rust-linux:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # 同一 PR 的新提交取代舊的執行。不得在 workflow 層級設 concurrency，以免取消進行中的 COM bench。
+    concurrency:
+      group: rust-linux-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    env:
+      # 交叉 cargo 的 Windows GNU 連結器；不寫入 .cargo/config.toml（arch §1.1）。
+      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 架構證據與黑箱會讀取 Git blob／revision（與 tests.yml 相同理由）。
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          # 釘 CPython 3.12.3：argparse 相容層的方言基準（arch §7.2、plan §0.7）。
+          python-version: "3.12.3"
+      - name: "安裝 Rust toolchain 1.96.1（含 x86_64-pc-windows-gnu target）"
+        uses: dtolnay/rust-toolchain@1.96.1
+        with:
+          targets: x86_64-pc-windows-gnu
+      - name: "安裝 Windows GNU 連結器（gcc-mingw-w64-x86-64）"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64
+      - name: "安裝 Python 相依（PyYAML、pytest、jsonschema）"
+        run: python3 -m pip install --disable-pip-version-check pyyaml==6.0.3 pytest==9.0.3 jsonschema==4.10.3
+      - name: "架構邊界：cfg 邊界檢查"
+        run: python3 scripts/rust/check_cfg_boundary.py
+      - name: "架構邊界：crate 依賴方向檢查"
+        run: python3 scripts/rust/check_dep_direction.py
+      - name: "cargo check（Linux）"
+        run: cargo check --workspace --all-targets
+      - name: "cargo check（Windows GNU target）"
+        run: cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
+      - name: "cargo test（Linux，全部 feature）"
+        run: cargo test --workspace --all-features
+      - name: "錯誤碼生成檔與 contracts 一致性"
+        run: python3 scripts/rust/gen_error_codes.py --check
+      - name: "Rust 相關 pytest（SW_REQUIRE_CARGO=1：缺 cargo 即 FAIL，不得 SKIP）"
+        run: SW_REQUIRE_CARGO=1 python3 -m pytest -q tests/test_rust_*.py
+      - name: "建置 Stage 1A 開發 bundle"
+        run: scripts/rust/mkbundle.sh --dev --out target/dev-bundle
+      - name: "黑箱契約 harness（Rust CLI 輪，tests/contract_blackbox）"
+        run: |
+          SERIALWRAP_CLI_EXE=$PWD/target/dev-bundle/bin/serialwrap SERIALWRAP_AB_LABEL=rust-1a python3 -m pytest -q tests/contract_blackbox --confcutdir=tests/contract_blackbox -p no:cacheprovider
+      - name: "L1.5 核心 smoke（sm-01-attach-to-ready，PTY 外部模式）"
+        # 依賴 P2 的 func-test/runner.py 外部模式（--mode pty）；P2 未合併前此步驟會因未知參數失敗，
+        # 屬「證據不足」缺口，不得以 continue-on-error 放行。
+        run: SERIALWRAP_CLI_EXE=$PWD/target/dev-bundle/bin/serialwrap python3 func-test/runner.py --mode pty --case sm-01-attach-to-ready
+
+  rust-windows-hosted:
+    if: github.event_name != 'schedule'
+    runs-on: windows-latest
+    timeout-minutes: 90
+    concurrency:
+      group: rust-windows-hosted-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    env:
+      # rust-toolchain.toml 只釘 channel（不含 host）；windows-latest 的 rustup 預設 host 為 MSVC，
+      # 若不指定，檔案會解析為 1.96.1-x86_64-pc-windows-msvc。RUSTUP_TOOLCHAIN 優先序高於該檔，強制使用 GNU host。
+      RUSTUP_TOOLCHAIN: 1.96.1-x86_64-pc-windows-gnu
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.3"
+      - name: "探測映像內建 MinGW-w64 工具（gcc、dlltool、objdump）"
+        id: mingw-probe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $hasAll = $true
+          foreach ($name in @('gcc', 'dlltool')) {
+            if (-not (Get-Command $name -ErrorAction SilentlyContinue)) { $hasAll = $false }
+          }
+          if (-not ((Get-Command x86_64-w64-mingw32-objdump -ErrorAction SilentlyContinue) -or (Get-Command objdump -ErrorAction SilentlyContinue))) {
+            $hasAll = $false
+          }
+          "present=$($hasAll.ToString().ToLower())" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
+      - name: "安裝 MSYS2 MinGW-w64（GNU host 的 gcc 連結器與 binutils；僅映像缺件時）"
+        id: msys2
+        if: steps.mingw-probe.outputs.present != 'true'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-binutils
+      - name: "將 MSYS2 MinGW-w64 bin 加入後續步驟 PATH（僅安裝 MSYS2 時）"
+        if: steps.mingw-probe.outputs.present != 'true'
+        shell: pwsh
+        run: Add-Content -LiteralPath $env:GITHUB_PATH -Value '${{ steps.msys2.outputs.msys2-location }}\mingw64\bin'
+      - name: "安裝 Rust 1.96.1（windows-gnu host 釘版）並斷言 host"
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.96.1-x86_64-pc-windows-gnu --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $ver = (rustc -vV | Out-String)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Output $ver
+          if ($ver -notmatch '(?m)^host: x86_64-pc-windows-gnu\s*$') { throw "rustc host 不是 x86_64-pc-windows-gnu：$ver" }
+      - name: "提供 x86_64-w64-mingw32-objdump 名稱（check_win_imports.py 所需）"
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Command x86_64-w64-mingw32-objdump -ErrorAction SilentlyContinue)) {
+            # 映像若只提供無前綴的 objdump，複製一份同行為的前綴名稱供檢查腳本使用。
+            $plain = Get-Command objdump -ErrorAction Stop
+            $shimDir = Join-Path $env:RUNNER_TEMP 'mingw-shim'
+            New-Item -ItemType Directory -Path $shimDir -Force | Out-Null
+            Copy-Item -LiteralPath $plain.Source -Destination (Join-Path $shimDir 'x86_64-w64-mingw32-objdump.exe') -Force
+            Add-Content -LiteralPath $env:GITHUB_PATH -Value $shimDir
+          }
+      - name: "免驅動 portable L1（cargo test --workspace）"
+        shell: pwsh
+        run: |
+          cargo test --workspace
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: "原生 release 建置與匯入 DLL allowlist 檢查"
+        shell: pwsh
+        run: |
+          cargo build -p sw-cli --release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/rust/check_win_imports.py target/release/serialwrap.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: "寫入 job summary（證據邊界）"
+        shell: pwsh
+        run: |
+          @"
+          ## rust-windows-hosted 證據邊界
+          - 本 job 只證明免驅動 Windows L1（cargo test --workspace）與原生產物匯入 DLL 檢查。
+          - cap_* ignored 測試（需桌面或實機資源）未於本 job 執行：證據不足。
+          - 本 job 不計為 windows_com（OD-08）；Windows COM 證據見 rust-windows-com（自架 runner）。
+          "@ | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+
+  rust-windows-com:
+    # 自架 runner 只執行：label run-windows-com 的同 repo PR、手動觸發、排程。
+    if: >-
+      (github.event_name == 'pull_request' &&
+      contains(github.event.pull_request.labels.*.name, 'run-windows-com') &&
+      github.event.pull_request.head.repo.full_name == github.repository) ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule'
+    runs-on: [self-hosted, windows, serialwrap-com]
+    timeout-minutes: 120
+    # 同一台 COM bench 只允許一個執行，排隊而非取消，避免兩輪競用 COM 埠。
+    # 本 job 不受其他 PR 新提交或 label 事件影響（不設 workflow 層級 concurrency）。
+    concurrency:
+      group: windows-com-bench
+      cancel-in-progress: false
+    env:
+      # 同 rust-windows-hosted：強制 windows-gnu host，不落入 rust-toolchain.toml 解析出的 MSVC。
+      RUSTUP_TOOLCHAIN: 1.96.1-x86_64-pc-windows-gnu
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: "前置檢查：runner 必須提供 SW_TEST_COM_PAIR 與 SW_PY3123"
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:SW_TEST_COM_PAIR) { throw 'SW_TEST_COM_PAIR 未設定（例：COM20:COM21）；證據不足，不得略過' }
+          if (-not $env:SW_PY3123) { throw 'SW_PY3123 未設定（CPython 3.12.3 目錄）；證據不足，不得略過' }
+      - name: "確認 Rust 1.96.1（windows-gnu）並斷言 host"
+        shell: powershell
+        run: |
+          rustup toolchain install 1.96.1-x86_64-pc-windows-gnu --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $ver = (rustc -vV | Out-String)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Output $ver
+          if ($ver -notmatch '(?m)^host: x86_64-pc-windows-gnu\s*$') { throw "rustc host 不是 x86_64-pc-windows-gnu：$ver" }
+      - name: "原生 release 建置"
+        shell: powershell
+        run: |
+          cargo build -p sw-cli --release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: "Windows COM 黑箱（win-blackbox.ps1；含 COM pair 與 CPython 3.12.3 基線）"
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = $env:GITHUB_WORKSPACE
+          $out = Join-Path $root 'windows-com'
+          # 與 win-blackbox.sh 相同：CLI 複製到暫存目錄執行，避免汙染 build 目錄的資源檢查。
+          $stage = Join-Path $env:RUNNER_TEMP 'sw-rust-stage'
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          $exe = Join-Path $stage 'serialwrap.exe'
+          Copy-Item -LiteralPath (Join-Path $root 'target\release\serialwrap.exe') -Destination $exe -Force
+          $gitRev = (git -C $root rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $contractRev = (git -C $root rev-parse HEAD:contracts).Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'scripts\rust\win-blackbox.ps1') `
+            -RustExe $exe -RepoSnapshot $root -OutDir $out `
+            -GitRevision $gitRev -ContractRevision $contractRev `
+            -Python3123 $env:SW_PY3123 -ComPair $env:SW_TEST_COM_PAIR
+          exit $LASTEXITCODE
+      - name: "100 次連續啟動檢查（win-startup-100.ps1）"
+        if: always()
+        shell: powershell
+        run: |
+          $root = $env:GITHUB_WORKSPACE
+          $exe = Join-Path $env:RUNNER_TEMP 'sw-rust-stage\serialwrap.exe'
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'scripts\rust\win-startup-100.ps1') `
+            -Exe $exe -OutDir (Join-Path $root 'windows-com\startup')
+          exit $LASTEXITCODE
+      - name: "清除暫存執行檔"
+        if: always()
+        shell: powershell
+        run: Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'sw-rust-stage') -Recurse -Force -ErrorAction SilentlyContinue
+      - name: "上傳 Windows COM 證據"
+        # 證據缺件即失敗（規格 §11.3：證據不足不得通過）。
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-com-evidence
+          path: windows-com/
+          if-no-files-found: error

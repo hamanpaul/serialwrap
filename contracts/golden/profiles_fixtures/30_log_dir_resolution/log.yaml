@@ -1,0 +1,18 @@
+defaults:
+  log_dir: "dl/../dl2"
+profiles:
+  with-own:
+    platform: prpl
+    log_dir: "tlogs/"
+  no-own:
+    platform: prpl
+  empty-own:
+    platform: prpl
+    log_dir: ""
+
+targets:
+  - {profile: with-own, device_by_id: d1}
+  - {profile: no-own, device_by_id: d2}
+  - {profile: with-own, device_by_id: d3, log_dir: ""}
+  - {profile: with-own, device_by_id: d4, log_dir: "t/./x/.."}
+  - {profile: empty-own, device_by_id: d5}

@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "wal",
+    "current-seq",
+    "--help"
+  ],
+  "columns": 60,
+  "rc": 0,
+  "stdout": "usage: serialwrap wal current-seq [-h]\n\noptions:\n  -h, --help  show this help message and exit\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "serialwrap spike2 windows task evidence schema",
+  "x-catalog-revision": 1,
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "case_id",
+    "evidence_layer",
+    "task_name",
+    "user",
+    "artifact_sha256",
+    "machine_id",
+    "os_build",
+    "started_at",
+    "ended_at",
+    "observations",
+    "task_xml_sha256",
+    "verdict_inputs"
+  ],
+  "properties": {
+    "case_id": {
+      "type": "string",
+      "description": "案例 ID（例如 win-task-72h, win-task-single-instance 等）"
+    },
+    "evidence_layer": {
+      "type": "string",
+      "enum": [
+        "host-throwaway",
+        "native-windows",
+        "windows-task"
+      ],
+      "description": "證據層級（OD-15 throwaway 必為 host-throwaway）"
+    },
+    "task_name": {
+      "type": "string",
+      "description": "Windows Task Scheduler 工作名稱"
+    },
+    "user": {
+      "type": "string",
+      "description": "執行使用者身分"
+    },
+    "artifact_sha256": {
+      "type": "object",
+      "description": "受測組件的 SHA256 雜湊",
+      "additionalProperties": false,
+      "required": [
+        "cli",
+        "launcher",
+        "runtime"
+      ],
+      "properties": {
+        "cli": {
+          "type": "string",
+          "pattern": "^(?!0{64})[0-9a-fA-F]{64}$"
+        },
+        "launcher": {
+          "type": "string",
+          "pattern": "^(?!0{64})[0-9a-fA-F]{64}$"
+        },
+        "runtime": {
+          "type": "string",
+          "pattern": "^(?!0{64})[0-9a-fA-F]{64}$"
+        }
+      }
+    },
+    "machine_id": {
+      "type": "string",
+      "description": "測試機器識別碼"
+    },
+    "os_build": {
+      "type": "string",
+      "description": "作業系統版本/組建編號"
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?Z$",
+      "description": "開始時間戳（UTC ISO-8601）"
+    },
+    "ended_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?Z$",
+      "description": "結束時間戳（UTC ISO-8601）"
+    },
+    "observations": {
+      "type": "array",
+      "description": "取樣與觀測值序列",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+          "ts",
+          "kind",
+          "value"
+        ],
+        "properties": {
+          "ts": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?Z$"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "value": {}
+        }
+      }
+    },
+    "task_xml_sha256": {
+      "type": "string",
+      "pattern": "^(?!0{64})[0-9a-fA-F]{64}$",
+      "description": "Scheduled Task XML 定義的 SHA256 雜湊"
+    },
+    "verdict_inputs": {
+      "type": "object",
+      "description": "判定器所需輸入參數或設定值"
+    }
+  }
+}

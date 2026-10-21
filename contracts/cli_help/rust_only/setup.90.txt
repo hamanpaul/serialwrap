@@ -1,0 +1,20 @@
+usage: serialwrap setup [-h]
+                        [--user | --system | --on-demand | --windows-task | --windows-service | --rollback]
+                        [--force] [--with-sudo] [--with-com0com | --remove-com0com]
+
+物化套件資產（profiles／agent skill／minicom wrappers）到使用者位置，並 reconcile 監管模式（先停舊、再起新）。
+未指定模式時自動偵測（有 systemd → systemd-user，否則 on-demand）。
+system scope 的特權動作需 --with-sudo，否則只回報待執行的 sudo 指令。
+
+options:
+  -h, --help         show this help message and exit
+  --user             設為 systemd-user 模式（免 sudo）
+  --system           設為 systemd-system 模式（特權動作需 --with-sudo）
+  --on-demand        設為 on-demand 模式（無 systemd 時的降級備援）
+  --force            覆蓋既有 profiles，並在 flash 進行中仍強制切換
+  --with-sudo        systemd-system 模式下允許執行特權 sudo 指令（安裝 unit／enable／start）
+  --windows-task     Windows：以工作排程器登入自啟監管（Windows 預設）
+  --windows-service  Windows：以 Windows 服務監管（OD-12：只列出待執行指令）
+  --rollback         回滾到上一個完整發佈組合（Previous）
+  --with-com0com     Windows：選擇安裝實驗性的 com0com 虛擬序列埠（僅此選用元件會要求 UAC）
+  --remove-com0com   Windows：移除 com0com 預設虛擬序列埠 pair

@@ -1,0 +1,14 @@
+{
+  "argv": [
+    "--endpoint=connect"
+  ],
+  "columns": 80,
+  "rc": 1,
+  "stdout": "{\"error_code\":\"INVALID_ARGS\",\"ok\":false}\n",
+  "stderr": "usage: serialwrap [-h] [--version] [-v] [--socket SOCKET]\n                  [--endpoint ENDPOINT] [--bench CODE] [--timeout TIMEOUT_S]\n                  [--retries RETRIES]\n                  <group> ...\nserialwrap: error: the following arguments are required: <group>\nserialwrap: connect failed: INVALID_ARGS\n",
+  "native": true,
+  "post_parse_effects": false,
+  "parse_rc": 2,
+  "parse_stdout": "",
+  "parse_stderr": "usage: serialwrap [-h] [--version] [-v] [--socket SOCKET]\n                  [--endpoint ENDPOINT] [--bench CODE] [--timeout TIMEOUT_S]\n                  [--retries RETRIES]\n                  <group> ...\nserialwrap: error: the following arguments are required: <group>\n"
+}

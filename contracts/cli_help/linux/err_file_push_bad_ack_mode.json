@@ -1,0 +1,20 @@
+{
+  "argv": [
+    "file",
+    "push",
+    "--selector",
+    "C",
+    "--local",
+    "a",
+    "--remote",
+    "b",
+    "--ack-mode",
+    "bad"
+  ],
+  "columns": 80,
+  "rc": 2,
+  "stdout": "",
+  "stderr": "usage: serialwrap file push [-h] --selector SELECTOR --local LOCAL --remote\n                            REMOTE [--chunk-size CHUNK_SIZE]\n                            [--chunk-timeout CHUNK_TIMEOUT_S]\n                            [--ack-mode {auto,echo,none}] [--source SOURCE]\nserialwrap file push: error: argument --ack-mode: invalid choice: 'bad' (choose from 'auto', 'echo', 'none')\n",
+  "native": true,
+  "post_parse_effects": false
+}

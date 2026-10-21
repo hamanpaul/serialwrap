@@ -12,7 +12,7 @@
 #   - f10-release-*：補 posix_throwaway_daemon（經 _run_with_handoff 使用 POSIX-only 的 ThrowawayDaemon），與 f10-creds-* 同族。
 #   - win-wal-av-*：evidence 以 scripts/stage0/spike3_win_wal.py 實際產物 <case-id>.json 為準。
 schema_version: 1
-revision: 2026-10-20.1
+revision: 2026-10-21.1
 spec: docs/rust-refactor/serialwrap-rust-spec-final.md
 invariant_ids: [zero_tx_on_reject, no_forbidden_interleave, no_stale_context_replay, no_reopen_before_handoff, no_auto_resend, insufficient_evidence_not_pass]
 features:
@@ -3132,3 +3132,391 @@ cases:
     entry: 手動，依下方步驟逐步執行
     owner: 擁有者（實機）
     counted_in: none
+
+# P3-T18：黑箱案例依 P2 schema 登記；case_id 使用穩定 slug，原 pytest nodeid 保留於 source_ref。
+- case_id: bb-session-reaches-ready
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_reaches_ready
+  family: P0
+  title: session list 輪詢至 COM0 進入 READY
+  contract: session list 輪詢至 COM0 進入 READY
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY 假 DUT；Windows 原生 L1 由對應平台集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: bb-cmd-submit-status
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_cmd_submit_status
+  family: P0
+  title: cmd submit → cmd status 輪詢至 done，stdout 含 hi
+  contract: cmd submit → cmd status 輪詢至 done，stdout 含 hi
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY 假 DUT；Windows 原生 L1 由對應平台集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: bb-cmd-background-result-tail
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_cmd_background_result_tail
+  family: P0
+  title: background 命令完成後 result-tail 內容含 bg
+  contract: background 命令完成後 result-tail 內容含 bg
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY 假 DUT；Windows 原生 L1 由對應平台集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: bb-log-and-wal
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+  family: P0
+  title: log tail-text、wal current-seq／export、stream tail 的結構與內容
+  contract: log tail-text、wal current-seq／export、stream tail 的結構與內容
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY 假 DUT；Windows 原生 L1 由對應平台集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: bb-console-attach-detach
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_console_attach_detach
+  family: P0
+  title: console-attach／list／detach 的 client_id 與 vtty 契約
+  contract: console-attach／list／detach 的 client_id 與 vtty 契約
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY 假 DUT；Windows 原生 L1 由對應平台集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: bb-interactive-lease-roundtrip
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_interactive_lease_roundtrip
+  family: P0
+  title: interactive open／send／status／close 與後續 cmd submit
+  contract: interactive open／send／status／close 與後續 cmd submit
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY 假 DUT；Windows 原生 L1 由對應平台集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: bb-recover-release-attach-no-replay
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_recover_release_attach_no_replay
+  family: P0
+  title: recover／release／attach 後 UART 不回放已送命令
+  contract: recover／release／attach 後 UART 不回放已送命令
+  invariants:
+  - no_stale_context_replay
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY 假 DUT；Windows 原生 L1 由對應平台集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: bb-alias-roundtrip
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_alias_roundtrip
+  family: P0
+  title: alias set → alias list
+  contract: alias set → alias list
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY 假 DUT；Windows 原生 L1 由對應平台集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: bb-event-rule-roundtrip
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_rule_roundtrip
+  family: P0
+  title: event add → list → rm 的 rule 往返
+  contract: event add → list → rm 的 rule 往返
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY 假 DUT；Windows 原生 L1 由對應平台集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: bb-device-mcu-health
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_device_mcu_health
+  family: P0
+  title: device list、mcu patterns、mcu status（flashing 為 false）
+  contract: device list、mcu patterns、mcu status（flashing 為 false）
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY 假 DUT；Windows 原生 L1 由對應平台集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: bb-local-rejections-zero-tx
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_local_rejections_zero_tx
+  family: P0
+  title: 本地拒絕的請求不產生外部 TX（rx_log 與 wal seq 不變）
+  contract: 本地拒絕的請求不產生外部 TX（rx_log 與 wal seq 不變）
+  invariants:
+  - zero_tx_on_reject
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY 假 DUT；Windows 原生 L1 由對應平台集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: bb-no-version-warning
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_no_version_warning
+  family: P0
+  title: bundle 內 CLI 與 daemon 版本相同時 stderr 不含版本不一致警告
+  contract: bundle 內 CLI 與 daemon 版本相同時 stderr 不含版本不一致警告
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY 假 DUT；Windows 原生 L1 由對應平台集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null

@@ -1,0 +1,25 @@
+[package]
+name = "sw-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# bin `serialwrap`。只依賴 sw-proto＋sw-pal，不得連結 sw-core（arch §1.3）。
+[lib]
+name = "sw_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "serialwrap"
+path = "src/main.rs"
+
+[dependencies]
+sw-proto = { path = "../sw-proto" }
+sw-pal = { path = "../sw-pal" }
+# Namespace 的插入序字典（argparse 型別宣告，P3-T10 Produces 直接引用 indexmap::IndexMap）。
+indexmap = { workspace = true }
+
+[dev-dependencies]
+sw-pal = { path = "../sw-pal", features = ["test-fakes"] }
+tempfile = { workspace = true }

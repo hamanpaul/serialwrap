@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "profile",
+    "test",
+    "--help"
+  ],
+  "columns": 90,
+  "rc": 0,
+  "stdout": "usage: serialwrap profile test [-h] --profile PROFILE --sample SAMPLE\n                               [--profile-dir PROFILE_DIR]\n\n從 --profile-dir 載入 profile YAML，找出 --profile 指定的 template，\n對 --sample 檔案內容依序跑 prompt_regex／login_regex／password_regex／\nbootloader_prompts（逐條），stdout 印 JSON 回報各 regex 是否命中與命中的行。\n純離線診斷：不連 daemon、不碰任何 UART，exit code 恆為 0。\n\noptions:\n  -h, --help            show this help message and exit\n  --profile PROFILE     要測試的 template 名稱（如 brcm-template）\n  --sample SAMPLE       樣本文字檔路徑（如一段真實 console capture log）\n  --profile-dir PROFILE_DIR\n                        profile YAML 目錄（預設: /golden/config/profiles）\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

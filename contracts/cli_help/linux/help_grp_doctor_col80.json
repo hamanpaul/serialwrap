@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "doctor",
+    "--help"
+  ],
+  "columns": 80,
+  "rc": 0,
+  "stdout": "usage: serialwrap doctor [-h]\n\n對安裝與執行環境做一系列唯讀檢查並印出 JSON 報告（依平台選擇檢查清單，#131）。\nLinux：systemd／wsl_systemd／devices／serialwrap_minicom_on_path／jq_on_path／\nminicom_on_path 為 advisory（缺少不致命，不拉低整體 ok；#149）。\nWindows：serialwrap_on_path／serialwrapd_on_path／daemon_endpoint／devices 為 advisory。\n\noptions:\n  -h, --help  show this help message and exit\n",
+  "stderr": "",
+  "native": false,
+  "post_parse_effects": false
+}

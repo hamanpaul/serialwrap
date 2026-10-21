@@ -1,0 +1,10 @@
+{"encoding":"UTF-8","generator":"Python 3.12 subprocess.run(capture_output=True, text=True)","meta":true,"python":"3.12.3"}
+{"argv":["printf","a\\r\\nb\\rc\\n"],"case":"universal_newlines","decode_error":null,"rc":0,"stderr":"","stdout":"a\nb\nc\n"}
+{"argv":["printf","\\xff"],"case":"invalid_utf8","decode_error":"'utf-8' codec can't decode byte 0xff in position 0: invalid start byte","rc":null,"stderr":null,"stdout":null}
+{"argv":["printf","\\xc2"],"case":"invalid_utf8_truncated_lead","decode_error":"'utf-8' codec can't decode byte 0xc2 in position 0: unexpected end of data","rc":null,"stderr":null,"stdout":null}
+{"argv":["printf","\\xe2\\x82A"],"case":"invalid_utf8_bad_continuation","decode_error":"'utf-8' codec can't decode bytes in position 0-1: invalid continuation byte","rc":null,"stderr":null,"stdout":null}
+{"argv":["printf","\\xe0\\x80\\x80"],"case":"invalid_utf8_overlong","decode_error":"'utf-8' codec can't decode byte 0xe0 in position 0: invalid continuation byte","rc":null,"stderr":null,"stdout":null}
+{"argv":["printf","\\xed\\xa0\\x80"],"case":"invalid_utf8_surrogate","decode_error":"'utf-8' codec can't decode byte 0xed in position 0: invalid continuation byte","rc":null,"stderr":null,"stdout":null}
+{"argv":["printf","\\xf4\\x90\\x80\\x80"],"case":"invalid_utf8_out_of_range","decode_error":"'utf-8' codec can't decode byte 0xf4 in position 0: invalid continuation byte","rc":null,"stderr":null,"stdout":null}
+{"argv":["/usr/bin/python3","-c","import sys; sys.stdout.buffer.write(bytes.fromhex('a4a4ff'))"],"case":"windows_cp950_invalid_bytes","decode_error":"'cp950' codec can't decode byte 0xff in position 2: incomplete multibyte sequence","encoding":"cp950","rc":null,"stderr":null,"stdout":null}
+{"argv":["cmd","/c","echo \u4e2d\u6587"],"case":"windows_acp_echo","decode_error":null,"encoding":"cp950","python":"3.12.10","rc":0,"stderr":"","stdout":"\u4e2d\u6587\n"}

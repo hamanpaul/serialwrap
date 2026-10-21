@@ -1,0 +1,277 @@
+[
+  {
+    "argv": ["device", "list"],
+    "method": "device.list",
+    "params": "{}"
+  },
+  {
+    "argv": ["device", "release", "--selector", "A"],
+    "method": "device.release",
+    "params": "{\"selector\":\"A\",\"source\":\"cli\",\"reason\":null}"
+  },
+  {
+    "argv": ["device", "release", "--selector", "A", "--source", "x", "--reason", "r"],
+    "method": "device.release",
+    "params": "{\"selector\":\"A\",\"source\":\"x\",\"reason\":\"r\"}"
+  },
+  {
+    "argv": ["device", "attach", "--selector", "A"],
+    "method": "device.attach",
+    "params": "{\"selector\":\"A\",\"force\":false}"
+  },
+  {
+    "argv": ["device", "attach", "--selector", "A", "--force"],
+    "method": "device.attach",
+    "params": "{\"selector\":\"A\",\"force\":true}"
+  },
+  {
+    "argv": ["session", "list"],
+    "method": "session.list",
+    "params": "{}"
+  },
+  {
+    "argv": ["session", "clear", "--selector", "A"],
+    "method": "session.clear",
+    "params": "{\"selector\":\"A\"}"
+  },
+  {
+    "argv": ["session", "bind", "--selector", "A", "--device-by-id", "/dev/x"],
+    "method": "session.bind",
+    "params": "{\"selector\":\"A\",\"device_by_id\":\"/dev/x\"}"
+  },
+  {
+    "argv": ["session", "pin", "--selector", "A", "--profile", "p"],
+    "method": "session.pin",
+    "params": "{\"selector\":\"A\",\"profile\":\"p\"}"
+  },
+  {
+    "argv": ["session", "unpin", "--selector", "A"],
+    "method": "session.unpin",
+    "params": "{\"selector\":\"A\"}"
+  },
+  {
+    "argv": ["session", "attach", "--selector", "A"],
+    "method": "session.attach",
+    "params": "{\"selector\":\"A\"}"
+  },
+  {
+    "argv": ["session", "self-test", "--selector", "A"],
+    "method": "session.self_test",
+    "params": "{\"selector\":\"A\",\"timeout_s\":2.0,\"strict_human_lock\":false}"
+  },
+  {
+    "argv": ["session", "self-test", "--selector", "A", "--probe-timeout", "3", "--strict-human-lock"],
+    "method": "session.self_test",
+    "params": "{\"selector\":\"A\",\"timeout_s\":3.0,\"strict_human_lock\":true}"
+  },
+  {
+    "argv": ["session", "activity", "--selector", "A"],
+    "method": "session.activity",
+    "params": "{\"selector\":\"A\"}"
+  },
+  {
+    "argv": ["session", "recover", "--selector", "A"],
+    "method": "session.recover",
+    "params": "{\"selector\":\"A\",\"timeout_s\":2.0,\"force\":false}"
+  },
+  {
+    "argv": ["session", "recover", "--selector", "A", "--timeout", "7", "--force"],
+    "method": "session.recover",
+    "params": "{\"selector\":\"A\",\"timeout_s\":7.0,\"force\":true}"
+  },
+  {
+    "argv": ["session", "console-attach", "--selector", "A"],
+    "method": "session.console_attach",
+    "params": "{\"selector\":\"A\"}"
+  },
+  {
+    "argv": ["session", "console-attach", "--selector", "A", "--label", "m"],
+    "method": "session.console_attach",
+    "params": "{\"selector\":\"A\",\"label\":\"m\"}"
+  },
+  {
+    "argv": ["session", "console-attach", "--selector", "A", "--label", ""],
+    "method": "session.console_attach",
+    "params": "{\"selector\":\"A\"}"
+  },
+  {
+    "argv": ["session", "console-detach", "--selector", "A", "--client-id", "c"],
+    "method": "session.console_detach",
+    "params": "{\"selector\":\"A\",\"client_id\":\"c\"}"
+  },
+  {
+    "argv": ["session", "console-list", "--selector", "A"],
+    "method": "session.console_list",
+    "params": "{\"selector\":\"A\"}"
+  },
+  {
+    "argv": ["session", "interactive-open", "--selector", "A"],
+    "method": "session.interactive_open",
+    "params": "{\"selector\":\"A\",\"owner\":\"agent\",\"timeout_s\":60.0,\"command\":\"\",\"allow_attached\":false}"
+  },
+  {
+    "argv": ["session", "interactive-open", "--selector", "A", "--owner", "o", "--timeout", "5", "--command", "top", "--allow-attached"],
+    "method": "session.interactive_open",
+    "params": "{\"selector\":\"A\",\"owner\":\"o\",\"timeout_s\":5.0,\"command\":\"top\",\"allow_attached\":true}"
+  },
+  {
+    "argv": ["session", "interactive-send", "--interactive-id", "i", "--data", "d"],
+    "method": "session.interactive_send",
+    "params": "{\"interactive_id\":\"i\",\"data\":\"d\",\"encoding\":\"plain\"}"
+  },
+  {
+    "argv": ["session", "interactive-status", "--interactive-id", "i"],
+    "method": "session.interactive_status",
+    "params": "{\"interactive_id\":\"i\",\"screen_chars\":2048}"
+  },
+  {
+    "argv": ["session", "interactive-close", "--interactive-id", "i"],
+    "method": "session.interactive_close",
+    "params": "{\"interactive_id\":\"i\"}"
+  },
+  {
+    "argv": ["session", "log-start", "--selector", "A"],
+    "method": "session.log_start",
+    "params": "{\"selector\":\"A\"}"
+  },
+  {
+    "argv": ["session", "log-stop", "--selector", "A"],
+    "method": "session.log_stop",
+    "params": "{\"selector\":\"A\"}"
+  },
+  {
+    "argv": ["session", "log-status", "--selector", "A"],
+    "method": "session.log_status",
+    "params": "{\"selector\":\"A\"}"
+  },
+  {
+    "argv": ["alias", "list"],
+    "method": "alias.list",
+    "params": "{}"
+  },
+  {
+    "argv": ["alias", "set", "--session-id", "s", "--alias", "a"],
+    "method": "alias.set",
+    "params": "{\"session_id\":\"s\",\"alias\":\"a\"}"
+  },
+  {
+    "argv": ["alias", "assign", "--by-id", "b", "--alias", "a"],
+    "method": "alias.assign",
+    "params": "{\"by_id\":\"b\",\"alias\":\"a\"}"
+  },
+  {
+    "argv": ["alias", "assign", "--by-id", "b", "--alias", "a", "--profile", "p"],
+    "method": "alias.assign",
+    "params": "{\"by_id\":\"b\",\"alias\":\"a\",\"profile\":\"p\"}"
+  },
+  {
+    "argv": ["alias", "unassign", "--alias", "a"],
+    "method": "alias.unassign",
+    "params": "{\"alias\":\"a\"}"
+  },
+  {
+    "argv": ["cmd", "submit", "--selector", "A"],
+    "method": "command.submit",
+    "params": "{\"selector\":\"A\",\"cmd\":\"\",\"source\":\"agent\",\"mode\":\"line\",\"priority\":10,\"timeout_s\":10.0}"
+  },
+  {
+    "argv": ["cmd", "submit", "--selector", "A", "--cmd", "ls", "--source", "s", "--mode", "whatever", "--priority", "3", "--cmd-timeout", "1.5", "--expected-duration", "9", "--completion-regex", "DONE$"],
+    "method": "command.submit",
+    "params": "{\"selector\":\"A\",\"cmd\":\"ls\",\"source\":\"s\",\"mode\":\"whatever\",\"priority\":3,\"timeout_s\":1.5,\"expected_duration_s\":9.0,\"completion_regex\":\"DONE$\"}"
+  },
+  {
+    "argv": ["cmd", "submit", "--selector", "A", "--cmd-timeout", "inf", "--priority", "99999999999999999999999"],
+    "method": "command.submit",
+    "params": "{\"selector\":\"A\",\"cmd\":\"\",\"source\":\"agent\",\"mode\":\"line\",\"priority\":99999999999999999999999,\"timeout_s\":Infinity}"
+  },
+  {
+    "argv": ["cmd", "status", "--cmd-id", "c"],
+    "method": "command.get",
+    "params": "{\"cmd_id\":\"c\"}"
+  },
+  {
+    "argv": ["cmd", "result-tail", "--cmd-id", "c"],
+    "method": "command.result_tail",
+    "params": "{\"cmd_id\":\"c\",\"from_chunk\":0,\"limit\":200}"
+  },
+  {
+    "argv": ["cmd", "cancel", "--cmd-id", "c"],
+    "method": "command.cancel",
+    "params": "{\"cmd_id\":\"c\"}"
+  },
+  {
+    "argv": ["stream", "tail"],
+    "method": "result.tail",
+    "params": "{\"from_seq\":0,\"limit\":200}"
+  },
+  {
+    "argv": ["stream", "tail", "--com", "COM1"],
+    "method": "result.tail",
+    "params": "{\"from_seq\":0,\"limit\":200,\"selector\":\"COM1\"}"
+  },
+  {
+    "argv": ["stream", "tail", "--selector", "A", "--com", "B", "--from-seq", "5", "--limit", "1"],
+    "method": "result.tail",
+    "params": "{\"from_seq\":5,\"limit\":1,\"selector\":\"A\"}"
+  },
+  {
+    "argv": ["log", "tail-raw"],
+    "method": "log.tail_raw",
+    "params": "{\"limit\":200}"
+  },
+  {
+    "argv": ["log", "tail-raw", "--from-seq", "0"],
+    "method": "log.tail_raw",
+    "params": "{\"limit\":200,\"from_seq\":0}"
+  },
+  {
+    "argv": ["log", "tail-text", "--com", "COM2", "--limit", "5"],
+    "method": "log.tail_text",
+    "params": "{\"limit\":5,\"selector\":\"COM2\"}"
+  },
+  {
+    "argv": ["file", "push", "--selector", "A", "--local", "l", "--remote", "r"],
+    "method": "file.push",
+    "params": "{\"selector\":\"A\",\"local_path\":\"l\",\"remote_path\":\"r\",\"chunk_size\":512,\"ack_mode\":\"auto\",\"source\":\"agent\"}"
+  },
+  {
+    "argv": ["file", "push", "--selector", "A", "--local", "l", "--remote", "r", "--chunk-timeout", "3", "--ack-mode", "none", "--chunk-size", "64"],
+    "method": "file.push",
+    "params": "{\"selector\":\"A\",\"local_path\":\"l\",\"remote_path\":\"r\",\"chunk_size\":64,\"ack_mode\":\"none\",\"source\":\"agent\",\"chunk_timeout_s\":3.0}"
+  },
+  {
+    "argv": ["file", "pull", "--selector", "A", "--remote", "r"],
+    "method": "file.pull",
+    "params": "{\"selector\":\"A\",\"remote_path\":\"r\",\"ack_mode\":\"auto\",\"source\":\"agent\"}"
+  },
+  {
+    "argv": ["file", "pull", "--selector", "A", "--remote", "r", "--local", "l", "--chunk-timeout", "2"],
+    "method": "file.pull",
+    "params": "{\"selector\":\"A\",\"remote_path\":\"r\",\"ack_mode\":\"auto\",\"source\":\"agent\",\"local_path\":\"l\",\"chunk_timeout_s\":2.0}"
+  },
+  {
+    "argv": ["wal", "export"],
+    "method": "wal.range",
+    "params": "{\"from_seq\":0,\"to_seq\":0,\"limit\":1000}"
+  },
+  {
+    "argv": ["wal", "reset"],
+    "method": "wal.reset",
+    "params": "{}"
+  },
+  {
+    "argv": ["wal", "current-seq"],
+    "method": "wal.current_seq",
+    "params": "{}"
+  },
+  {
+    "argv": ["mcu", "patterns"],
+    "method": "mcu.patterns",
+    "params": "{}"
+  },
+  {
+    "argv": ["mcu", "status"],
+    "method": "mcu.status",
+    "params": "{}"
+  }
+]

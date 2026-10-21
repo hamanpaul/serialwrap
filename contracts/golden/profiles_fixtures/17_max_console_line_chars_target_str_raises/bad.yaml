@@ -1,0 +1,5 @@
+profiles:
+  p:
+    platform: prpl
+targets:
+  - {profile: p, device_by_id: d1, max_console_line_chars: "80"}

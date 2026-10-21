@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "cmd",
+    "result-tail",
+    "--help"
+  ],
+  "columns": 60,
+  "rc": 0,
+  "stdout": "usage: serialwrap cmd result-tail [-h] --cmd-id CMD_ID\n                                  [--from-chunk FROM_CHUNK]\n                                  [--limit LIMIT]\n\noptions:\n  -h, --help            show this help message and exit\n  --cmd-id CMD_ID\n  --from-chunk FROM_CHUNK\n  --limit LIMIT\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

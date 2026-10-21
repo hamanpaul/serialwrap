@@ -24,6 +24,13 @@ code_paths:
   - "serialwrap"
   - "serialwrapd.py"
   - "install.sh"
+  # Rust 重構（P3-T1）：crate 原始碼、workspace 與工具鏈設定、regen／cfg 邊界腳本
+  - "crates/**"
+  - "scripts/rust/**"
+  - "Cargo.toml"
+  - "Cargo.lock"
+  - "rust-toolchain.toml"
+  - ".cargo/**"
 cli:
   - command: "./serialwrap"
     help_args: ["--help"]

@@ -1,0 +1,15 @@
+profiles:
+  t1:
+    platform: shell
+    username_env: U_FROM_USERNAME_ENV
+    password_env: P_FROM_PASSWORD_ENV
+  t2:
+    platform: shell
+    user_env: ""
+    login_env: U_LOGIN
+    pw_env: P_PW
+
+targets:
+  - {profile: t1, device_by_id: d1}
+  - {profile: t1, device_by_id: d2, login_env: TARGET_LOGIN}
+  - {profile: t2, device_by_id: d3, pass_env: "  "}
