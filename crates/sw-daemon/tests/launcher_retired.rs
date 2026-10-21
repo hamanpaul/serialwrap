@@ -9,7 +9,13 @@ mod fixtures {
 
     /// 直接建構（不經 `parse`，故不做 validate_retirement）。
     fn build(name: &str) -> ReleaseManifest {
-        let text = std::fs::read_to_string(format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let text = match name {
+            "stage3_retired_but_python_impl.json" => {
+                include_str!("fixtures/stage3_retired_but_python_impl.json")
+            }
+            "stage3_retired_rust.json" => include_str!("fixtures/stage3_retired_rust.json"),
+            _ => panic!("未知 manifest fixture: {name}"),
+        };
         let raw: serde_json::Value = serde_json::from_str(&text).unwrap();
         ReleaseManifest {
             schema_version: raw["schema_version"].as_u64().unwrap() as u32,
@@ -35,11 +41,26 @@ mod fixtures {
 
 #[test]
 fn tampered_retired_manifest_refuses_python_child() {
-    let m = fixtures::stage3_retired_but_python_impl();   // 繞過 validate_retirement 直接建構
-    assert!(matches!(resolve_launch(&m), Err(LaunchError::PythonDaemonRetired)));
+    let m = fixtures::stage3_retired_but_python_impl(); // 繞過 validate_retirement 直接建構
+    assert!(matches!(
+        resolve_launch(&m),
+        Err(LaunchError::PythonDaemonRetired)
+    ));
 }
 
 #[test]
 fn retired_rust_manifest_runs_native() {
-    assert!(matches!(resolve_launch(&fixtures::stage3_retired_rust()), Ok(LaunchPlan::RustNative)));
+    assert!(matches!(
+        resolve_launch(&fixtures::stage3_retired_rust()),
+        Ok(LaunchPlan::RustNative)
+    ));
+}
+
+#[test]
+fn retired_python_error_matches_launcher_contract() {
+    let error = resolve_launch(&fixtures::stage3_retired_but_python_impl()).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "serialwrapd: INTERNAL_ERROR: python daemon retired by release manifest"
+    );
 }

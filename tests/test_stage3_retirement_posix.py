@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import tarfile
@@ -78,7 +79,58 @@ def test_mkbundle_accepts_existing_flags(tmp_path):
     r = subprocess.run(["bash", str(MKBUNDLE), "--target", LINUX_TARGET, "--dev", "--out", str(out), "--plan-only"],
                        cwd=ROOT, capture_output=True, text=True, timeout=300)
     assert r.returncode == 0, r.stdout + r.stderr
+    plan = json.loads(r.stdout.strip().splitlines()[-1])
+    assert plan["stage"] == "1A"
     assert not out.exists()                                                     # --plan-only 不 build
+
+
+@pytest.mark.process_rpc
+def test_mkbundle_does_not_print_unbuilt_bundle_dir():
+    r = _run_mkbundle(ROOT, "--print-dir")
+    assert r.returncode == 2
+    assert "HARNESS_BUILD_UNAVAILABLE" in r.stdout + r.stderr
+    assert r.stdout == ""
+
+
+@pytest.mark.memory_only
+def test_pack_bundle_preserves_hardlinked_file_bytes(tmp_path):
+    source = tmp_path / "bundle"
+    source.mkdir()
+    first = source / "first.bin"
+    second = source / "second.bin"
+    payload = b"hardlinked release payload"
+    first.write_bytes(payload)
+    os.link(first, second)
+    archive_path = tmp_path / "bundle.tar.gz"
+
+    _retirement().pack_bundle(source, archive_path)
+
+    with tarfile.open(archive_path, "r:gz") as archive:
+        members = {member.name: member for member in archive.getmembers()}
+        assert members["second.bin"].isfile()
+        assert members["second.bin"].size == len(payload)
+        assert archive.extractfile("second.bin").read() == payload
+
+
+@pytest.mark.memory_only
+def test_verify_archive_handles_null_target_id_map(tmp_path):
+    repo = tmp_path / "repo"
+    index_path = repo / "docs" / "rust-refactor" / "evidence" / "index.json"
+    index_path.parent.mkdir(parents=True)
+    index_path.write_text(json.dumps({"stage_targets": {"3": {"linux": {}}}}), encoding="utf-8")
+    archive_path = tmp_path / "empty-linux.tar.gz"
+    with tarfile.open(archive_path, "w:gz"):
+        pass
+
+    violations, _ = _retirement().verify_archive(
+        {"retired": True, "evidence_index": "docs/rust-refactor/evidence/index.json",
+         "stage3_target_artifact_ids": None},
+        repo_root=repo,
+        platform="linux",
+        archive=archive_path,
+    )
+
+    assert "retirement: archive manifest unreadable: linux" in violations
 
 
 @pytest.mark.memory_only

@@ -28,7 +28,7 @@ from typing import Any, Literal
 MANIFEST_NAME = "release-manifest.json"
 MANIFEST_ENV = "SERIALWRAP_RELEASE_MANIFEST"
 
-# 必填欄位（與 contracts/release_manifest.schema.json 的 required 一致）。
+# Python 執行期載入器保留舊版 daemon 契約；Stage 3 Rust 退役 manifest 由跨語言 schema 驗證。
 # 每一列為 (父路徑, 必填鍵)；父路徑空字串代表 manifest 頂層。
 _REQUIRED: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("", (

@@ -92,11 +92,25 @@ def _dotted(node: ast.AST) -> str:
 
 
 @pytest.mark.memory_only
-def test_stage3_candidate_buildable_before_approval():
-    plan = retirement.bundle_plan("3", retirement.load_retirement(), dev=False)
+def test_stage3_bundle_plan_marks_candidate_before_approval():
+    plan = retirement.bundle_plan("3", {"retired": False}, dev=False)
     assert plan["candidate"] is True and plan["publishable"] is False
     assert plan["manifest_retirement"] == {"python_daemon": "removed"}
     assert plan["include_python_runtime"] is False and plan["daemon_implementation"] == "rust"
+
+
+@pytest.mark.memory_only
+def test_stage3_default_retirement_file_is_candidate_before_approval():
+    plan = retirement.bundle_plan("3", retirement.load_retirement(), dev=False)
+    assert plan["candidate"] is True and plan["publishable"] is False
+
+
+@pytest.mark.memory_only
+@pytest.mark.parametrize("value", [1, "true", None])
+def test_bundle_plan_rejects_non_boolean_retirement(value):
+    with pytest.raises(retirement.HarnessError) as exc:
+        retirement.bundle_plan("2.4", {"retired": value}, dev=False)
+    assert exc.value.code == "HARNESS_RETIREMENT_INCONSISTENT"
 
 
 @pytest.mark.memory_only
@@ -104,8 +118,11 @@ def test_retired_true_requires_stage3_evidence(tmp_path):
     repo = fakes_retirement.retirement_repo(tmp_path, stage3_result="BLOCKED")
     idx = repo / "docs/rust-refactor/evidence/index.json"
     targets = json.loads(idx.read_text(encoding="utf-8"))["stage_targets"]["3"]
+    effective_version = json.loads(
+        (repo / "bundles" / "linux" / "release-manifest.json").read_text(encoding="utf-8")
+    )["bundle_version"]
     r = dict(retirement.load_retirement(repo / "packaging" / "python_daemon_retirement.json"), retired=True,
-             approved_by="owner", approved_at=fakes.ts(30, 1), decision_ref="OD-14", effective_bundle_version="1.0.0",
+             approved_by="owner", approved_at=fakes.ts(30, 1), decision_ref="OD-14", effective_bundle_version=effective_version,
              stage3_target_artifact_ids={p: targets[p]["artifact_id"] for p in ("linux", "windows")},
              evidence_index_sha256=jsonio.sha256_file(idx))
     v = retirement.verify(r, repo_root=repo, mode="release", evidence_root=repo / "evidence",
@@ -134,15 +151,19 @@ def test_release_clean_tested_bundle_passes(tmp_path):                        # 
 
 @pytest.mark.memory_only
 @pytest.mark.parametrize("platform", ["linux", "windows"])
-@pytest.mark.parametrize("rel, component", [("bin/serialwrapd", "daemon.launcher"), ("bin/serialwrap", "cli")])
-def test_release_refuses_swapped_binary_with_approved_manifest(tmp_path, platform, rel, component):   # R2-F7
+@pytest.mark.parametrize("component", ["daemon.launcher", "cli"])
+def test_release_refuses_swapped_binary_with_approved_manifest(tmp_path, platform, component):   # R2-F7
     repo = fakes_retirement.retirement_repo(tmp_path, stage3_result="PASS")
     r = fakes_retirement.approved(repo)
     bundle = repo / "bundles" / platform
-    manifest_before = (bundle / "release-manifest.json").read_bytes()
+    manifest_path = bundle / "release-manifest.json"
+    manifest_before = manifest_path.read_bytes()
+    doc = json.loads(manifest_before)
+    rel = (doc["components"]["daemon"]["launcher"]["path"]
+           if component == "daemon.launcher" else doc["components"]["cli"]["path"])
     (bundle / rel).write_bytes(b"#!/bin/sh\necho swapped\n")                  # 受測後替換，manifest 原封不動
-    assert (bundle / "release-manifest.json").read_bytes() == manifest_before
-    assert jsonio.sha256_file(bundle / "release-manifest.json") == r["stage3_target_artifact_ids"][platform]
+    assert manifest_path.read_bytes() == manifest_before
+    assert jsonio.sha256_file(manifest_path) == r["stage3_target_artifact_ids"][platform]
     v = _release(repo, r)
     assert f"retirement: bundle manifest mismatch: {platform}" not in v          # manifest 檢查本身仍會通過……
     assert f"retirement: bundle content mismatch: {platform}: release component sha256 mismatch: {platform} {component}" in v
@@ -496,6 +517,11 @@ def test_release_workflow_gates_python_artifact_chains():
             < idx["gh release upload"], idx
         upload = job["steps"][idx["gh release upload"]]["run"]
         assert "SHA256SUMS-" in upload and "SW_STAGE3_BUNDLE_DIR" not in upload   # 只上傳已驗證 archive 與其 SHA256SUMS
+        for step in job["steps"]:
+            for env_name, value in step.get("env", {}).items():
+                assert not (env_name.startswith("SW_") and re.fullmatch(
+                    rf"\$\{{\{{\s*env\.{re.escape(env_name)}\s*\}}\}}", value
+                )), (name, step.get("name"), env_name, value)
 
 
 @pytest.mark.memory_only
@@ -519,3 +545,64 @@ def test_pytest_suite_does_not_depend_on_wheel():
                         and isinstance(node.args[0], ast.Constant) and node.args[0].value == "serialwrap"):
                     bad.append((str(path), node.lineno, "importlib.metadata.distribution('serialwrap')"))
     assert bad == []
+
+
+@pytest.mark.memory_only
+@pytest.mark.parametrize("rel", ["py/python.exe", "lib/sw_core/cli.py", "serialwrapd.py"])
+def test_release_and_archive_refuse_python_runtime_payload(tmp_path, rel):
+    repo = fakes_retirement.retirement_repo(tmp_path, stage3_result="PASS")
+    approved = fakes_retirement.approved(repo)
+    bundle = repo / "bundles" / "linux"
+    residual = bundle / rel
+    residual.parent.mkdir(parents=True, exist_ok=True)
+    residual.write_bytes(b"python runtime")
+
+    release_violations = _release(repo, approved)
+    detected_path = "py" if rel.startswith("py/") else rel
+    assert f"retirement: bundle contains python runtime: linux: {detected_path}" in release_violations
+
+    archive = tmp_path / "serialwrap-linux.tar.gz"
+    retirement.pack_bundle(bundle, archive)
+    archive_violations, _ = retirement.verify_archive(
+        approved, repo_root=repo, platform="linux", archive=archive
+    )
+    assert f"retirement: archive contains python runtime: linux: {detected_path}" in archive_violations
+
+
+@pytest.mark.memory_only
+def test_verify_archive_rechecks_index_hash_and_target_identity(tmp_path):
+    repo = fakes_retirement.retirement_repo(tmp_path, stage3_result="PASS")
+    approved = fakes_retirement.approved(repo)
+    bundle = repo / "bundles" / "linux"
+    archive = tmp_path / "serialwrap-linux.tar.gz"
+    retirement.pack_bundle(bundle, archive)
+
+    index = repo / "docs" / "rust-refactor" / "evidence" / "index.json"
+    index.write_bytes(index.read_bytes() + b" ")
+    violations, _ = retirement.verify_archive(
+        approved, repo_root=repo, platform="linux", archive=archive
+    )
+    assert "retirement: evidence index sha256 mismatch" in violations
+
+    approved = fakes_retirement.approved(repo)
+    approved["stage3_target_artifact_ids"]["linux"] = "0" * 64
+    violations, _ = retirement.verify_archive(
+        approved, repo_root=repo, platform="linux", archive=archive
+    )
+    assert "retirement: stage3 target artifact mismatch: linux" in violations
+
+
+@pytest.mark.memory_only
+def test_unpack_archive_reports_unsupported_compression(tmp_path, monkeypatch):
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "one.txt").write_text("one", encoding="utf-8")
+    archive = tmp_path / "one.zip"
+    retirement.pack_bundle(bundle, archive)
+
+    def unsupported(*_args, **_kwargs):
+        raise NotImplementedError("unsupported compression")
+
+    monkeypatch.setattr(retirement.zipfile.ZipFile, "open", unsupported)
+    result = retirement._unpack_archive(archive.read_bytes(), tmp_path / "extract", kind="zip")
+    assert result is not None and result.startswith("retirement: archive unreadable:")

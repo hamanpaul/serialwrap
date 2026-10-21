@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -66,6 +67,24 @@ def retirement_repo(root: Path, *, stage3_result: str) -> Path:
         keep.mkdir(parents=True, exist_ok=True)
         (keep / ".keep").write_text("", encoding="utf-8")
 
+    l1_nodeids = {
+        "linux": ["tests/contract_blackbox/test_release_contract.py::test_frozen_contract"],
+        "windows": ["tests/contract_blackbox/test_release_contract.py::test_frozen_contract"],
+    }
+    l1_lock = {
+        "schema_version": 1,
+        "sets": {
+            "s3_release_contract": {
+                platform: {"selector": {"argv": ["-q"], "markexpr": ""}, "nodeids": nodeids}
+                for platform, nodeids in l1_nodeids.items()
+            }
+        },
+    }
+    (root / "tests" / "acceptance" / "l1_required.lock.json").write_text(
+        json.dumps(l1_lock, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
     _write_json(root / RETIREMENT_REL, _unapproved())
 
     # 先建 bundle 並放入資產，再設 target（bundle_tree_sha256 因此涵蓋資產檔）
@@ -118,10 +137,21 @@ def entry(repo: Path, item_id: str, result: str, *, platform: str, n: int = 0):
     root 設為索引所在目錄，並以 `files` 明確指定相對 `repo/evidence` 的報告。P9-T16 測試中所有 entry 建立一律經此函式。
     """
     import fakes_evidence
+    from tools.stage3 import evidence_index
 
     index_dir = (repo / INDEX_REL).parent
     files = _stub_report(repo, item_id, result, platform, n)
-    return fakes_evidence.entry(index_dir, item_id, result, platform=platform, n=n, files=files)
+    catalog = evidence_index.load_exit_catalog()
+    item = catalog[item_id]
+    extra = {}
+    if item.required_l1_set is not None:
+        lock = json.loads((repo / "tests" / "acceptance" / "l1_required.lock.json").read_text(encoding="utf-8"))
+        nodeids = lock["sets"][item.required_l1_set][platform]["nodeids"]
+        digest = hashlib.sha256(json.dumps(sorted(nodeids), separators=(",", ":")).encode()).hexdigest()
+        extra = {"producer": "ingest:junit", "l1_set_sha256": digest}
+    return fakes_evidence.entry(
+        index_dir, item_id, result, platform=platform, n=n, files=files, **extra
+    )
 
 
 def approved(repo: Path) -> dict:
@@ -131,6 +161,8 @@ def approved(repo: Path) -> dict:
 
     idx = repo / INDEX_REL
     targets = json.loads(idx.read_text(encoding="utf-8"))["stage_targets"]["3"]
+    linux_manifest = repo / "bundles" / "linux" / "release-manifest.json"
+    bundle_version = json.loads(linux_manifest.read_text(encoding="utf-8"))["bundle_version"]
     return {
         "retired": True,
         "evidence_index": INDEX_REL,
@@ -138,7 +170,7 @@ def approved(repo: Path) -> dict:
         "approved_by": "owner",
         "approved_at": fakes.ts(30, 1),
         "decision_ref": "OD-14",
-        "effective_bundle_version": "1.0.0",
+        "effective_bundle_version": bundle_version,
         "stage3_target_artifact_ids": {p: targets[p]["artifact_id"] for p in PLATFORMS},
     }
 

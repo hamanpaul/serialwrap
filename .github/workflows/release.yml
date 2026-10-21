@@ -16,9 +16,32 @@ jobs:
       policy_version: "1.0.19"
       policy_engine_ref: 2dcf2f815afeddc477c1cacc33df9beb06ae14fb
 
-  publish:
+  retirement-gate:
     runs-on: ubuntu-latest
     needs: project-policy
+    outputs:
+      retired: ${{ steps.retirement.outputs.retired }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Read retirement switch
+        id: retirement
+        run: python3 -m tools.stage3 retirement github-output >> "$GITHUB_OUTPUT"
+
+      - name: Verify retirement approval
+        if: steps.retirement.outputs.retired == 'true'
+        run: python3 -m tools.stage3 retirement verify --mode repo
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: [project-policy, retirement-gate]
 
     steps:
       - name: Check out repository
@@ -54,6 +77,7 @@ jobs:
           python3 -m pytest -q tests/
 
       - name: Build wheel
+        if: needs.retirement-gate.outputs.retired != 'true'
         run: python3 -m build --wheel
 
       - name: Create GitHub Release
@@ -68,6 +92,7 @@ jobs:
           gh release create "$TAG_NAME" --verify-tag --generate-notes --title "$TAG_NAME"
 
       - name: Upload wheel to release
+        if: needs.retirement-gate.outputs.retired != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ github.ref_name }}
@@ -77,7 +102,8 @@ jobs:
     # 在 windows-latest 以 PyInstaller 打 one-file exe，附加到同一個 release（#84 PORT-4）。
     # needs: publish —— 等 publish job 建好 GitHub Release 後才上傳 exe。
     runs-on: windows-latest
-    needs: publish
+    needs: [publish, retirement-gate]
+    if: needs.retirement-gate.outputs.retired != 'true'
 
     steps:
       - name: Check out repository
@@ -116,3 +142,108 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ github.ref_name }}
         run: gh release upload "$env:TAG_NAME" dist/serialwrap.exe dist/serialwrapd.exe --clobber
+
+  publish-stage3-bundle-linux:
+    runs-on: [self-hosted, linux, serialwrap-release]
+    needs: [retirement-gate, publish]
+    if: needs.retirement-gate.outputs.retired == 'true'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Stage 3 verifier dependency
+        run: python3 -m pip install --disable-pip-version-check pyyaml
+
+      - name: Verify frozen Stage 3 bundles
+        run: |
+          test -n "$SW_STAGE3_BUNDLE_DIR"
+          test -n "$SW_EVIDENCE_ROOT"
+          python3 -m tools.stage3 retirement verify --mode release --evidence-root "$SW_EVIDENCE_ROOT" \
+            --bundle-manifest "linux=$SW_STAGE3_BUNDLE_DIR/linux/release-manifest.json" \
+            --bundle-manifest "windows=$SW_STAGE3_BUNDLE_DIR/windows/release-manifest.json"
+
+      - name: Pack tested Linux bundle
+        run: |
+          archive="$RUNNER_TEMP/serialwrap-${GITHUB_REF_NAME}-linux.tar.gz"
+          python3 -m tools.stage3 retirement pack --bundle-dir "$SW_STAGE3_BUNDLE_DIR/linux" --out "$archive"
+
+      - name: Verify tested Linux archive
+        run: |
+          archive="$RUNNER_TEMP/serialwrap-${GITHUB_REF_NAME}-linux.tar.gz"
+          sums="$RUNNER_TEMP/SHA256SUMS-linux"
+          python3 -m tools.stage3 retirement verify-archive --platform linux --archive "$archive" --sha256sums "$sums"
+
+      - name: Verify Linux archive checksum
+        run: (cd "$RUNNER_TEMP" && sha256sum -c SHA256SUMS-linux)
+
+      - name: Upload verified Linux bundle
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: gh release upload "$TAG_NAME" "$RUNNER_TEMP/serialwrap-${TAG_NAME}-linux.tar.gz" "$RUNNER_TEMP/SHA256SUMS-linux" --clobber
+
+  publish-stage3-bundle-windows:
+    runs-on: [self-hosted, windows, serialwrap-release]
+    needs: [retirement-gate, publish]
+    if: needs.retirement-gate.outputs.retired == 'true'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Stage 3 verifier dependency
+        run: python -m pip install --disable-pip-version-check pyyaml
+
+      - name: Verify frozen Stage 3 bundles
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SW_STAGE3_BUNDLE_DIR) -or [string]::IsNullOrWhiteSpace($env:SW_EVIDENCE_ROOT)) {
+            throw 'SW_STAGE3_BUNDLE_DIR and SW_EVIDENCE_ROOT are required'
+          }
+          python -m tools.stage3 retirement verify --mode release --evidence-root $env:SW_EVIDENCE_ROOT `
+            --bundle-manifest "linux=$($env:SW_STAGE3_BUNDLE_DIR)\linux\release-manifest.json" `
+            --bundle-manifest "windows=$($env:SW_STAGE3_BUNDLE_DIR)\windows\release-manifest.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Pack tested Windows bundle
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "serialwrap-$($env:GITHUB_REF_NAME)-windows.zip"
+          python -m tools.stage3 retirement pack --bundle-dir "$env:SW_STAGE3_BUNDLE_DIR\windows" --out $archive
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify tested Windows archive
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "serialwrap-$($env:GITHUB_REF_NAME)-windows.zip"
+          $sums = Join-Path $env:RUNNER_TEMP 'SHA256SUMS-windows'
+          python -m tools.stage3 retirement verify-archive --platform windows --archive $archive --sha256sums $sums
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify Windows archive checksum
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "serialwrap-$($env:GITHUB_REF_NAME)-windows.zip"
+          $sums = Join-Path $env:RUNNER_TEMP 'SHA256SUMS-windows'
+          $expected = (Get-Content $sums -Raw).Trim().Split(' ')[0]
+          $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw 'archive SHA256 does not match SHA256SUMS-windows' }
+
+      - name: Upload verified Windows bundle
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "serialwrap-$($env:TAG_NAME)-windows.zip"
+          $sums = Join-Path $env:RUNNER_TEMP 'SHA256SUMS-windows'
+          gh release upload $env:TAG_NAME $archive $sums --clobber

@@ -568,7 +568,7 @@ def test_pipx_layout_no_longer_spawns_missing_serialwrapd_py(tmp_path: Path) -> 
 
 
 def test_manifest_schema_file_matches_loader_required_keys(tmp_path: Path) -> None:
-    """contracts/release_manifest.schema.json 的 required 與 load_release_manifest 驗證鍵一致（含 python_cli_delegate、assets、supervisor）。"""
+    """核對 schema 的共通欄位、舊版 delegate 條件與 Python daemon 欄位。"""
     rm = _load_rm()
     schema_path = Path(__file__).resolve().parents[1] / "contracts" / "release_manifest.schema.json"
     assert schema_path.is_file(), f"schema file missing: {schema_path}"
@@ -586,8 +586,25 @@ def test_manifest_schema_file_matches_loader_required_keys(tmp_path: Path) -> No
         "components",
         "pairing",
     }.issubset(top_required)
-    comp_required = set(schema.get("properties", {}).get("components", {}).get("required", []))
-    assert {"cli", "daemon", "python_cli_delegate", "assets", "supervisor"}.issubset(comp_required)
+    components_schema = schema.get("properties", {}).get("components", {})
+    comp_required = set(components_schema.get("required", []))
+    assert {"cli", "daemon", "assets", "supervisor"}.issubset(comp_required)
+    delegate_branch = next(
+        branch for branch in schema.get("allOf", [])
+        if branch.get("if") == {"not": {"required": ["retirement"]}}
+    )
+    assert "python_cli_delegate" in delegate_branch["then"]["properties"]["components"]["required"]
+
+    python_daemon_branch = next(
+        branch for branch in schema.get("allOf", [])
+        if branch.get("if", {}).get("properties", {}).get("components", {})
+        .get("properties", {}).get("daemon", {}).get("properties", {})
+        .get("implementation", {}).get("const") == "python"
+    )
+    daemon_required = set(
+        python_daemon_branch["then"]["properties"]["components"]["properties"]["daemon"]["required"]
+    )
+    assert {"entry", "runtime", "package"}.issubset(daemon_required)
 
     for key in ("components.python_cli_delegate", "components.assets", "components.supervisor"):
         parts = key.split(".")
