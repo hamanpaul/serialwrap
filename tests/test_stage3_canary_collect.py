@@ -308,11 +308,160 @@ def test_submit_result_recorded(tmp_path):
 def test_result_poll_rate_limited(tmp_path):
     from tools.stage3 import canary_collect
 
-    env = _env(tmp_path, _submits(1, 120), policy_over={"result_poll_max_per_cycle": 50})
+    env = _env(tmp_path, _submits(1, 120), policy_over={"collector.result_poll_max_per_cycle": 7})
     run = _CannedRun(_daemon(env.wal))
     out = canary_collect.collect_once(env.cli, env.ledger, env.pol, platform="linux", run=run)
     assert out["new_submits"] == 120
-    assert len(_cmd_status_calls(run)) == 50
+    assert len(_cmd_status_calls(run)) == 7
+
+
+def test_pending_poll_rotates_past_old_nonterminal_commands(tmp_path):
+    fakes = _fakes()
+    from tools.stage3 import canary_collect
+
+    env = _env(tmp_path, [], policy_over={"collector.result_poll_max_per_cycle": 50})
+    cmd_ids = [fakes.uuid_cmd_id(value) for value in range(1, 71)]
+    first_seen = {
+        cmd_id: "2026-11-02T01:00:00+00:00" if index < 60 else "2026-11-02T01:01:00+00:00"
+        for index, cmd_id in enumerate(cmd_ids)
+    }
+    env.ledger.mkdir(parents=True)
+    (env.ledger / "pending_results.json").write_text(json.dumps(first_seen), encoding="utf-8")
+    statuses = {
+        cmd_id: {"ok": True, "command": {"status": "running" if index < 60 else "done", "error_code": None}}
+        for index, cmd_id in enumerate(cmd_ids)
+    }
+    run = _CannedRun(_daemon(env.wal), cmd_status=statuses.__getitem__)
+
+    for _ in range(3):
+        canary_collect.drain_results_once(env.cli, env.ledger, env.pol, run=run)
+
+    results = [row for row in _ledger(env.ledger) if row.get("type") == "submit_result"]
+    assert {row["cmd_id"] for row in results if row["status"] == "done"} == set(cmd_ids[60:])
+
+
+def test_pending_poll_cursor_survives_collect_state_reset(tmp_path):
+    fakes = _fakes()
+    from tools.stage3 import canary_collect
+
+    env = _env(tmp_path, [], policy_over={"collector.result_poll_max_per_cycle": 50})
+    cmd_ids = [fakes.uuid_cmd_id(value) for value in range(1, 121)]
+    pending = {cmd_id: f"2026-11-02T01:{index // 60:02d}:{index % 60:02d}+00:00" for index, cmd_id in enumerate(cmd_ids)}
+    env.ledger.mkdir(parents=True)
+    (env.ledger / "pending_results.json").write_text(json.dumps(pending), encoding="utf-8")
+    run = _CannedRun(
+        _daemon(env.wal),
+        cmd_status=lambda _cmd_id: {"ok": True, "command": {"status": "running", "error_code": None}},
+    )
+
+    canary_collect.drain_results_once(env.cli, env.ledger, env.pol, run=run)
+    canary_collect.drain_results_once(env.cli, env.ledger, env.pol, run=run)
+    first_batches = [
+        [call[call.index("--cmd-id") + 1] for call in _cmd_status_calls(run)[:50]],
+        [call[call.index("--cmd-id") + 1] for call in _cmd_status_calls(run)[50:100]],
+    ]
+    canary_collect._save_poll_state(env.ledger, selected=[], last_polled=None)
+    canary_collect.drain_results_once(env.cli, env.ledger, env.pol, run=run)
+    third_batch = [call[call.index("--cmd-id") + 1] for call in _cmd_status_calls(run)[100:]]
+
+    assert first_batches == [cmd_ids[:50], cmd_ids[50:100]]
+    assert third_batch == cmd_ids[100:] + cmd_ids[:30]
+
+
+def test_canceled_and_interactive_results_do_not_stay_pending(tmp_path):
+    fakes = _fakes()
+    from tools.stage3 import canary_collect
+
+    env = _env(tmp_path, [])
+    cmd_ids = [fakes.uuid_cmd_id(value) for value in (1, 2)]
+    env.ledger.mkdir(parents=True)
+    (env.ledger / "pending_results.json").write_text(
+        json.dumps({cmd_ids[0]: "2026-11-02T01:00:00+00:00", cmd_ids[1]: "2026-11-02T01:00:01+00:00"}),
+        encoding="utf-8",
+    )
+    statuses = {
+        cmd_ids[0]: {"ok": True, "command": {"status": "canceled", "error_code": None}},
+        cmd_ids[1]: {"ok": True, "command": {"status": "interactive", "error_code": None}},
+    }
+
+    assert canary_collect.drain_results_once(
+        env.cli, env.ledger, env.pol, run=_CannedRun(_daemon(env.wal), cmd_status=statuses.__getitem__)
+    ) == 0
+    results = [row for row in _ledger(env.ledger) if row.get("type") == "submit_result"]
+    assert {(row["cmd_id"], row["status"], row["error_code"]) for row in results} == {
+        (cmd_ids[0], "unknown", "CANCELED"),
+        (cmd_ids[1], "unknown", "INTERACTIVE"),
+    }
+
+
+def test_expired_pending_is_removed_after_cli_exception(tmp_path):
+    fakes = _fakes()
+    from tools.stage3 import canary_collect
+
+    env = _env(tmp_path, [])
+    cmd_id = fakes.uuid_cmd_id(1)
+    env.ledger.mkdir(parents=True)
+    (env.ledger / "pending_results.json").write_text(
+        json.dumps({cmd_id: "2026-10-30T00:00:00+00:00"}), encoding="utf-8"
+    )
+
+    def cli_error(*_args, **_kwargs):
+        raise FileNotFoundError("CLI disappeared")
+
+    assert canary_collect.drain_results_once(
+        env.cli, env.ledger, env.pol, run=cli_error, now=lambda: "2026-11-02T00:00:00+00:00"
+    ) == 0
+    records = _ledger(env.ledger)
+    result = next(row for row in records if row.get("type") == "submit_result")
+    assert result["cmd_id"] == cmd_id
+    assert result["status"] == "unknown" and result["reason"] == "STALE_NON_TERMINAL"
+    assert any(row.get("detail") == "cmd_status_error:FileNotFoundError" for row in records)
+
+
+def test_drain_reads_pending_state_without_reparsing_ledger(tmp_path, monkeypatch):
+    fakes = _fakes()
+    from tools.stage3 import canary_collect
+
+    env = _env(tmp_path, [])
+    cmd_id = fakes.uuid_cmd_id(1)
+    env.ledger.mkdir(parents=True)
+    (env.ledger / "pending_results.json").write_text(
+        json.dumps({cmd_id: "2026-11-02T01:00:00+00:00"}), encoding="utf-8"
+    )
+
+    def fail_ledger_read(_ledger_dir):
+        raise AssertionError("drain must not parse the full ledger")
+
+    monkeypatch.setattr(canary_collect, "_read_ledger", fail_ledger_read)
+    assert canary_collect.drain_results_once(
+        env.cli, env.ledger, env.pol, run=_CannedRun(_daemon(env.wal))
+    ) == 0
+    result = next(row for row in _ledger(env.ledger) if row.get("type") == "submit_result")
+    assert result["cmd_id"] == cmd_id and result["status"] == "done"
+
+
+def test_only_exact_cmd_not_found_is_treated_as_eviction(tmp_path):
+    fakes = _fakes()
+    from tools.stage3 import canary_collect
+
+    env = _env(tmp_path, [])
+    aliases = ("COMMAND_NOT_FOUND", "NOT_FOUND", "X_CMD_NOT_FOUND", "cmd_not_found")
+    cmd_ids = [fakes.uuid_cmd_id(value) for value in range(1, len(aliases) + 1)]
+    env.ledger.mkdir(parents=True)
+    (env.ledger / "pending_results.json").write_text(
+        json.dumps({cmd_id: "2026-11-02T01:00:00+00:00" for cmd_id in cmd_ids}), encoding="utf-8"
+    )
+    statuses = {
+        cmd_id: {"ok": False, "error_code": alias, "cmd_id": cmd_id}
+        for cmd_id, alias in zip(cmd_ids, aliases)
+    }
+
+    assert canary_collect.drain_results_once(
+        env.cli, env.ledger, env.pol, run=_CannedRun(_daemon(env.wal), cmd_status=statuses.__getitem__)
+    ) == len(aliases)
+    records = _ledger(env.ledger)
+    assert not [row for row in records if row.get("type") == "submit_result"]
+    assert set(json.loads((env.ledger / "pending_results.json").read_text(encoding="utf-8"))) == set(cmd_ids)
 
 
 def test_canary_results_survive_history_eviction(tmp_path):
@@ -349,6 +498,177 @@ def test_daemon_down_snapshot_recorded(tmp_path):
     assert snaps and snaps[-1]["daemon_ok"] is False
     assert snaps[-1]["error"]
     assert [r for r in recs if r["type"] == "submit"] == []  # daemon 失聯不呼叫 harvest
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("[Errno 111] Connection refused", "connect_refused"),
+        ("[Errno 2] No such file or directory", "not_running"),
+        ("[WinError 10061] No connection could be made", "connect_refused"),
+        ("[WinError 2] The system cannot find the file specified", "not_running"),
+        ("[Errno 22] Invalid argument", "daemon_status_failed:rc=2"),
+    ],
+)
+def test_socket_failure_marks_confirmed_dead_daemon(message, expected):
+    from tools.stage3 import canary_collect
+    from tools.stage3.proc import CmdResult
+
+    def run(argv, **_kwargs):
+        assert argv[1:3] == ["daemon", "status"]
+        return CmdResult(
+            rc=2,
+            stdout=json.dumps({"ok": False, "error_code": "SOCKET_ERROR", "message": message}),
+            stderr=f"serialwrap daemon.status: SOCKET_ERROR: {message}",
+            elapsed_s=0.0,
+            timed_out=False,
+        )
+
+    snapshot = canary_collect.take_snapshot(Path("serialwrap"), platform="linux", run=run)
+    assert snapshot.daemon_ok is False
+    assert snapshot.error == expected
+
+
+def test_prepfreeze_wal_submits_are_not_counted(tmp_path):
+    fakes = _fakes()
+    from tools.stage3 import canary_collect
+
+    old_id, new_id = fakes.uuid_cmd_id(1), fakes.uuid_cmd_id(2)
+    rows = [
+        fakes.wal_record(1, cmd_id=old_id, wall_ts="2026-10-31T23:59:59+00:00"),
+        fakes.wal_record(2, cmd_id=new_id, wall_ts="2026-11-01T00:00:01+00:00"),
+    ]
+    env = _env(tmp_path, rows)
+    run = _CannedRun(_daemon(env.wal))
+
+    out = canary_collect.collect_once(env.cli, env.ledger, env.pol, platform="linux", run=run)
+
+    submits = [row for row in _ledger(env.ledger) if row.get("type") == "submit"]
+    assert out["new_submits"] == 1
+    assert [row["cmd_id"] for row in submits] == [new_id]
+
+
+def test_torn_ledger_line_does_not_stop_collector(tmp_path):
+    fakes = _fakes()
+    from tools.stage3 import canary_collect
+
+    cmd_id = fakes.uuid_cmd_id(1)
+    env = _env(tmp_path, [fakes.wal_record(1, cmd_id=cmd_id)])
+    env.ledger.mkdir(parents=True)
+    (env.ledger / "ledger.ndjson").write_bytes(b'{"type":"snapshot","broken":')
+
+    out = canary_collect.collect_once(env.cli, env.ledger, env.pol, platform="linux", run=_CannedRun(_daemon(env.wal)))
+
+    from tools.stage3 import jsonio
+
+    records, malformed = jsonio.read_ndjson(env.ledger / "ledger.ndjson")
+    assert out["snapshot_ok"] is True and out["new_submits"] == 1
+    assert malformed == [1]
+    assert any(row.get("detail") == "malformed_ledger_line:1" for row in records)
+
+
+def test_collect_loop_uses_injected_monotonic_clock_and_stops(tmp_path, monkeypatch):
+    from threading import Event
+
+    from tools.stage3 import canary_collect
+
+    env = _env(tmp_path, [], policy_over={"collector.interval_s": 3})
+    clock = [0.0]
+    collected_at: list[float] = []
+    stop = Event()
+
+    def collect(*_args, **_kwargs):
+        collected_at.append(clock[0])
+        if len(collected_at) == 2:
+            stop.set()
+
+    def sleep(delay):
+        clock[0] += delay
+
+    monkeypatch.setattr(canary_collect, "collect_once", collect)
+    canary_collect.collect_loop(
+        env.cli,
+        env.ledger,
+        env.pol,
+        platform="linux",
+        stop=stop,
+        monotonic=lambda: clock[0],
+        sleep=sleep,
+    )
+
+    assert collected_at == [0.0, 3.0]
+
+
+def test_collect_loop_drains_pending_between_collections(tmp_path, monkeypatch):
+    from threading import Event
+
+    from tools.stage3 import canary_collect
+
+    env = _env(tmp_path, [], policy_over={"collector.interval_s": 4})
+    env.ledger.mkdir(parents=True)
+    pending_path = env.ledger / "pending_results.json"
+    poll_state_path = env.ledger / "pending_poll_state.json"
+    first_id = "00000000000000000000000000000001"
+    second_id = "00000000000000000000000000000002"
+    clock = [0.0]
+    events: list[str] = []
+    stop = Event()
+
+    def collect(*_args, **_kwargs):
+        events.append("collect")
+        if events.count("collect") == 1:
+            pending_path.write_text(
+                json.dumps(
+                    {
+                        first_id: "2026-11-02T01:00:00+00:00",
+                        second_id: "2026-11-02T01:00:01+00:00",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            poll_state_path.write_text(
+                json.dumps(
+                    {
+                        "last_cmd_id": first_id,
+                        "last_first_seen": "2026-11-02T01:00:00+00:00",
+                        "last_polled_ids": [first_id],
+                    }
+                ),
+                encoding="utf-8",
+            )
+        else:
+            stop.set()
+
+    def drain(*_args, **_kwargs):
+        events.append("drain")
+        poll_state_path.write_text(
+            json.dumps(
+                {
+                    "last_cmd_id": second_id,
+                    "last_first_seen": "2026-11-02T01:00:01+00:00",
+                    "last_polled_ids": [second_id],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return 2
+
+    def sleep(delay):
+        clock[0] += delay
+
+    monkeypatch.setattr(canary_collect, "collect_once", collect)
+    monkeypatch.setattr(canary_collect, "drain_results_once", drain)
+    canary_collect.collect_loop(
+        env.cli,
+        env.ledger,
+        env.pol,
+        platform="linux",
+        stop=stop,
+        monotonic=lambda: clock[0],
+        sleep=sleep,
+    )
+
+    assert events == ["collect", "drain", "collect"]
 
 
 def test_policy_ref_written_with_revision(tmp_path):
@@ -431,6 +751,7 @@ def test_resolve_artifact_windows_current_release(tmp_path):
     bin_dir.mkdir(parents=True)
     cli = bin_dir / "serialwrap.exe"
     shutil.copyfile(bundle / "bin" / "serialwrap", cli)
+    shutil.copyfile(bundle / "bin" / "serialwrapd", bin_dir / "serialwrapd.exe")
     (bin_dir / "current-release.json").write_text(
         json.dumps({"bundle_version": "0.9.0", "dir": str(bundle)}), encoding="utf-8"
     )
@@ -439,6 +760,32 @@ def test_resolve_artifact_windows_current_release(tmp_path):
         cli, daemon_pid=11, daemon_version="0.9.0", daemon_sha=lambda pid: daemon_sha, layout="windows"
     )
     _assert_verified(res, bundle, fakes.sha256_file(bundle / "release-manifest.json"))
+
+
+def test_windows_entry_directory_rejects_sideloaded_files(tmp_path):
+    fakes = _fakes()
+    from tools.stage3 import canary_collect
+
+    install = tmp_path / "install"
+    bundle = fakes.make_bundle(install / "versions" / "0.9.0")
+    entry_dir = install / "bin"
+    entry_dir.mkdir(parents=True)
+    cli = entry_dir / "serialwrap.exe"
+    shutil.copyfile(bundle / "bin" / "serialwrap", cli)
+    shutil.copyfile(bundle / "bin" / "serialwrapd", entry_dir / "serialwrapd.exe")
+    (entry_dir / "current-release.json").write_text(
+        json.dumps({"bundle_version": "0.9.0", "dir": str(bundle)}), encoding="utf-8"
+    )
+    daemon_sha = fakes.sha256_file(bundle / "bin" / "serialwrapd")
+    assert canary_collect.resolve_artifact(
+        cli, daemon_pid=11, daemon_version="0.9.0", daemon_sha=lambda _pid: daemon_sha, layout="windows"
+    )[2] == "verified"
+
+    (entry_dir / "version.dll").write_bytes(b"sideloaded")
+    artifact_id, _manifest, check, trees = canary_collect.resolve_artifact(
+        cli, daemon_pid=11, daemon_version="0.9.0", daemon_sha=lambda _pid: daemon_sha, layout="windows"
+    )
+    assert artifact_id is None and check == "tree_invalid" and trees is None
 
 
 def test_deployed_tree_matches_task3_algorithm(tmp_path):
@@ -537,6 +884,36 @@ def test_unhashable_deployed_tree_not_attributed(tmp_path, monkeypatch):
     assert snap.runtime_tree_sha256 is None
 
 
+def test_deployed_tree_reports_relative_path_when_file_changes_during_hash(tmp_path, monkeypatch):
+    fakes = _fakes()
+    from tools.stage3 import canary_collect
+    from tools.stage3.reason_codes import HarnessError
+
+    bundle = fakes.make_bundle(tmp_path / "bundle")
+    real_fstat = os.fstat
+    calls = 0
+
+    def changed_fstat(fd):
+        nonlocal calls
+        result = real_fstat(fd)
+        calls += 1
+        if calls != 2:
+            return result
+        return SimpleNamespace(
+            st_dev=result.st_dev,
+            st_ino=result.st_ino,
+            st_size=result.st_size,
+            st_mtime_ns=result.st_mtime_ns + 1,
+            st_mode=result.st_mode,
+        )
+
+    monkeypatch.setattr(canary_collect.os, "fstat", changed_fstat)
+    with pytest.raises(HarnessError) as ei:
+        canary_collect.deployed_tree_digests(bundle)
+    assert ei.value.detail.startswith("file changed during hashing: ")
+    assert str(bundle) not in ei.value.detail
+
+
 def test_new_cli_old_daemon_not_attributed(tmp_path):
     fakes = _fakes()
     from tools.stage3 import canary_collect
@@ -617,6 +994,81 @@ def test_pack_collector_runs_outside_repo(tmp_path):
     assert any(n.endswith("stage3_reason_codes.json") for n in names)
     assert not any(n.endswith("ab_runner.py") for n in names)
     assert not any("sw_core" in n for n in names)
+
+
+def test_pack_collector_uses_reproducible_zip_metadata(tmp_path):
+    from tools.stage3.pack_collector import pack
+
+    first = pack(tmp_path / "first.pyz")
+    with zipfile.ZipFile(first) as archive:
+        infos = archive.infolist()
+    assert infos
+    assert all(info.date_time == (1980, 1, 1, 0, 0, 0) for info in infos)
+    assert all((info.external_attr >> 16) & 0o777 == 0o644 for info in infos)
+
+    second = pack(tmp_path / "second.pyz")
+    assert first.read_bytes() == second.read_bytes()
+
+
+def test_collector_revision_hash_is_computed_once_per_process(tmp_path, monkeypatch):
+    from tools.stage3 import canary_collect
+
+    pyz = tmp_path / "sw-canary.pyz"
+    pyz.write_bytes(b"running collector")
+    calls: list[Path] = []
+
+    def digest(path):
+        calls.append(Path(path))
+        return "a" * 64
+
+    clear_cache = getattr(canary_collect.collector_revision, "cache_clear", lambda: None)
+    clear_cache()
+    monkeypatch.setattr(sys, "argv", [str(pyz)])
+    monkeypatch.setattr(canary_collect.jsonio, "sha256_file", digest)
+    try:
+        assert canary_collect.collector_revision() == "a" * 64
+        assert canary_collect.collector_revision() == "a" * 64
+        assert calls == [pyz]
+    finally:
+        getattr(canary_collect.collector_revision, "cache_clear", lambda: None)()
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        lambda tmp_path: [
+            "note", "--ledger-dir", str(tmp_path / "ledger"), "--kind", "planned_restart",
+            "--from", "2026-11-02T01:00:00", "--to", "2026-11-02T02:00:00+00:00",
+            "--reason", "未使用時區", "--author", "owner", "--host-id", "h1", "--platform", "linux",
+        ],
+        lambda tmp_path: [
+            "collect", "--once", "--cli", str(tmp_path / "serialwrap"), "--ledger-dir", str(tmp_path / "ledger"),
+            "--policy", str(tmp_path / "missing-policy.json"), "--platform", "linux",
+        ],
+    ],
+)
+def test_cli_value_and_file_errors_are_json(argv, tmp_path, capsys):
+    from tools.stage3.collector_main import main
+
+    assert main(argv(tmp_path)) == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result["ok"] is False and result["reason_code"] == "HARNESS_CLI_ERROR"
+
+
+def test_cli_output_uses_utf8_with_cp1252_console(tmp_path):
+    args = [
+        "note", "--ledger-dir", str(tmp_path / "ledger"), "--kind", "planned_restart",
+        "--from", "2026-11-02T01:00:00+00:00", "--to", "2026-11-02T02:00:00+00:00",
+        "--reason", "重啟驗證", "--author", "owner", "--host-id", "h1", "--platform", "linux",
+    ]
+    code = "from tools.stage3.collector_main import main; raise SystemExit(main(" + repr(args) + "))"
+    env = {**os.environ, "PYTHONIOENCODING": "cp1252"}
+    proc = subprocess.run(
+        [sys.executable, "-c", code], cwd=REPO, env=env, capture_output=True, text=True, encoding="utf-8", timeout=30
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "重啟驗證" in proc.stdout
+    assert json.loads(proc.stdout)["record"]["reason"] == "重啟驗證"
 
 
 def test_collector_modules_stdlib_only():
