@@ -1,0 +1,93 @@
+# L1.5 A/B 正規化規則（唯一允許的比較寬容度）。
+#
+# 本檔只列具名規則，不提供 regex；`tools/stage3/ab_diff.py` 只依本檔正規化後比對，
+# 不得另寫寬鬆比對（arch §9.3、規格 §15.6.3）。未列於 ab_diff.py `_RULE_KEYS` 的頂層鍵一律拒絕
+# （HARNESS_COMPARATOR_ERROR），避免拼錯或未併入的規則被靜默忽略。
+#
+# 版本治理：
+# - 本檔內容變更（含新增鍵、新增 volatile_keys 項目）必須經獨立審閱，並更新 approved_revision／reviewed_by。
+# - 變更即改變 contract_revision（arch §9.3 所定義之契約修訂）。
+#
+# 來源分界：
+# - 基底段（P5-T20 建立的「具名映射」）：本分支（feature/rust-refactor-p9a）不含 P5 產物，
+#   目前不存在該段；待 P5 分支合併時須以 Modify 併入，不得在此處以推測內容補寫，
+#   併入時同步擴充 ab_diff.py 的 _RULE_KEYS 白名單。
+# - 本次追加段（P9-T7B）：g1_exception_message、g2_set_paths、volatile_keys（計畫原列 14 項）、
+#   instance_root_placeholder。
+# - 審查修正追加（P9-T7B review fix）：volatile_keys 中標示「審查追加」的項目（時間類、計數類與 PID 類）、
+#   pty_path_placeholder、poll_commands。以上同樣尚未獨立審閱。
+#
+# 審閱狀態：尚未獨立審閱，以下兩欄保留為 null，不得視為已核准。
+approved_revision: null
+reviewed_by: null
+
+# G1（spec-reconciliation.md 通則 G1）：EXCEPTION 的 message 文字不屬契約，只比對 error_code。
+# 套用於任何 error_code == "EXCEPTION" 的 JSON 物件（例：RPC-H-08、RPC-H-11）。
+g1_exception_message: true
+
+# G2（spec-reconciliation.md 通則 G2）：Python 中順序未定義的集合，比較時以集合（排序後）比對。
+# command 為 argv 中必須連續出現的子命令片段；json_path 為回應物件內的點路徑。
+# 僅列 spec-reconciliation.md 明文標為 G2 的條目（目前只有 RPC-H-13）。
+g2_set_paths:
+  - command: [event, reload]   # RPC-H-13：event.reload 回傳清單，Python 為 set 差集順序；Rust 輸出升冪
+    json_path: added
+    source: RPC-H-13
+  - command: [event, reload]   # RPC-H-13
+    json_path: removed
+    source: RPC-H-13
+  - command: [event, reload]   # RPC-H-13
+    json_path: changed
+    source: RPC-H-13
+
+# 比較前刪除的鍵（不影響判定的易變欄位，任意巢狀層級）。
+# 第一段為計畫原列的 14 項；「審查追加」段為 P9-T7B 審查依真實 L1.5 報告（261021-*）統計出的
+# 時間戳、計時器與 PID 欄位，屬行程或時序觀測值，不是產品契約。
+volatile_keys:
+  - pid
+  - cmd_id
+  - wall_ts
+  - elapsed_ms
+  - socket
+  - created_at
+  - started_at
+  - finished_at
+  - last_rx_at
+  - last_tx_at
+  - last_probe_at
+  - last_state_change_at
+  - last_ready_at
+  - detached_at
+  # 以下為審查追加（尚未獨立審閱）
+  - accepted_at
+  - done_at
+  - released_at
+  - next_reprobe_at
+  - idle_for_ms
+  - last_rx_age_s
+  - last_tx_age_s
+  - rx_rate_bps
+  - boot_quiet_remaining_s
+  - ready_reconfirm_remaining_s
+  - pids
+  # host /proc 掃描觀測（非 DUT 行為）：foreign_holders 的存在與否隨掃描時序變動（同一程式的相鄰 run
+  # 會一次有、一次無）；multi_open_detail 列出同機其他 serialwrapd 行程，取決於當下 host 上跑什麼。
+  # 注意：這使 L1.5 A/B 不再比對 foreign_holders 與 multi_open_detail；若要比對，須另以不依賴 host 掃描時序的確定性案例覆蓋（待審閱決定）。
+  - foreign_holders
+  - multi_open_detail
+  # daemon status 首次快照的 WAL 序號：啟動期寫入的非同步時序決定快照值（相鄰 run 為 0／4／5），
+  # 最終 WAL 內容每次皆為 11 筆；WAL 內容由 comparison.v1 逐筆比對，不由此欄位判定。
+  - current_seq
+
+# 字串中出現的報告／實例根目錄絕對路徑，比較前以此佔位字串取代（需為絕對路徑且至少兩個片段）。
+instance_root_placeholder: "<ROOT>"
+
+# 審查追加（尚未獨立審閱）：字串中的 `/dev/pts/<N>` 換成此佔位字串（值與物件鍵共用）。
+# 持有者 PTY 編號每次執行都會不同，不是產品行為；但 PTY 的存在與數量仍被比對。
+pty_path_placeholder: "<PTY>"
+
+# 審查追加（尚未獨立審閱）：輪詢型 CLI 呼叫的子命令前綴。連續且 argv 尾端相同者只比最後一筆，
+# 因為輪詢次數隨時序變動（同一 run 內 session list 的次數兩側可能不同）。
+poll_commands:
+  - [session, list]
+  - [cmd, status]
+  - [daemon, status]
