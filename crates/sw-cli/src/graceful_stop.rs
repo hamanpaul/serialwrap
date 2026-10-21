@@ -320,6 +320,7 @@ pub fn graceful_stop_with_existing_hold(
                 ));
             }
         };
+        crate::rollback::test_pause_after("handoff_stop:replied");
         chain.push(HandoffLink {
             token: token.clone(),
             pid: id.pid,

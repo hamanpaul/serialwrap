@@ -50,6 +50,53 @@ fn crash_if(point: &str) {
     }
 }
 
+/// 開發 bundle 的環境變數屏障；正式 bundle 會編譯成無操作。
+#[cfg(feature = "test-fakes")]
+pub(crate) fn test_pause_after(point: &str) {
+    if std::env::var("SW_TEST_UPDATE_PAUSE_AFTER").ok().as_deref() != Some(point) {
+        return;
+    }
+    let dir = std::env::var_os("SW_TEST_UPDATE_PAUSE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| panic!("SW_TEST_UPDATE_PAUSE_DIR 必須與 SW_TEST_UPDATE_PAUSE_AFTER 一起設定"));
+    let name = point.replace('/', "_").replace(':', "_");
+    let reached = dir.join(format!("{name}.reached"));
+    let resume = dir.join(format!("{name}.resume"));
+    std::fs::create_dir_all(&dir).unwrap_or_else(|error| panic!("建立 update hook 目錄失敗：{error}"));
+    std::fs::write(&reached, point).unwrap_or_else(|error| panic!("寫入 update hook reached 失敗：{error}"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(180);
+    while !resume.is_file() {
+        if std::time::Instant::now() >= deadline {
+            panic!("等待 update hook resume 逾時：{point}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = std::fs::remove_file(resume);
+    let _ = std::fs::remove_file(reached);
+}
+
+#[cfg(not(feature = "test-fakes"))]
+pub(crate) fn test_pause_after(_point: &str) {}
+
+fn test_force_verify_failure(
+    started: Result<PyDict, OpFailure>,
+) -> Result<PyDict, OpFailure> {
+    #[cfg(feature = "test-fakes")]
+    if let Ok(value) = std::env::var("SW_TEST_UPDATE_FORCE_VERIFY_FAIL") {
+        if value == "smoke_failed" {
+            return Err(OpFailure {
+                code: ErrorCode::InternalError.as_str(),
+                phase: "update_start_and_verify",
+                reason: Some("smoke_failed"),
+                message: Some("測試鉤子要求新版 daemon smoke 驗證失敗".into()),
+                detail: PyDict::new(),
+            });
+        }
+        panic!("不支援的 SW_TEST_UPDATE_FORCE_VERIFY_FAIL 值：{value}");
+    }
+    started
+}
+
 fn as_str(value: &PyValue) -> Option<&str> {
     match value {
         PyValue::Str(value) => Some(value),
@@ -1248,6 +1295,7 @@ fn execute_change_with_restore(
     if force_requested { safety_detail.insert("force_ignored", PyValue::Bool(true)); }
     add_step(&mut report, StepName::SafetyCheck, true, safety_detail);
     crash_if("safety_check:after_effect");
+    test_pause_after("safety_check");
 
     crash_if("snapshot_taken:before_effect");
     let (mut original, snapshot_dir) = match persist_original_snapshot(ctx, &root, &sup, &daemon) {
@@ -1575,6 +1623,8 @@ fn execute_change_with_restore(
     }
     let started = start_and_verify(ctx, &root, target_mode, &endpoint, original.daemon.is_some(), original.daemon.is_some(), &manifest, with_sudo, original.daemon.as_ref());
     crash_if("start_and_verify:started");
+    test_pause_after("start_and_verify:started");
+    let started = test_force_verify_failure(started);
     match started {
         Ok(detail) => {
             add_step(&mut report, StepName::StartAndVerify, true, detail);
