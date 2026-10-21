@@ -248,7 +248,7 @@ def test_windows_owner_with_denied_write_is_not_blocked(tmp_path):
         assert p.returncode == 3 and rep["verdict"] == "not_blocked" and rep["blocked"] is False
         assert [r["allowed"] for r in rep["results"] if r["target"] == str(f) and r["op"] == "write"] == [False]
         assert any(c["path"] == str(f) and c["kind"] in ("owner", "dacl_write") and c["possible"] is True
-                   for c in rep["restore_checks"])
+                   for c in rep["restore_checks"]), rep["restore_checks"]
         assert f.read_bytes() == b"x"
     finally:
         subprocess.run(["icacls", str(f), "/reset"], check=False, capture_output=True)

@@ -19,8 +19,10 @@ from __future__ import annotations
 import argparse
 import errno
 import json
+import ntpath
 import os
 from pathlib import Path
+import posixpath
 import re
 import secrets
 import stat
@@ -31,12 +33,12 @@ from typing import Any
 _SENTINEL_RE = re.compile(r"^\.permprobe-\d+-[0-9a-fA-F]{8,16}(\.r)?$")
 
 
-def _ancestor_dirs(path: str) -> list[str]:
+def _ancestor_dirs(path: str, path_module=os.path) -> list[str]:
     """回傳指定路徑的所有祖先目錄（不含 path 本身），由近至遠，直到根目錄。"""
     ancestors = []
     curr = path
     while True:
-        parent = os.path.dirname(curr)
+        parent = path_module.dirname(curr)
         if parent == curr:
             break
         ancestors.append(parent)
@@ -269,12 +271,12 @@ def posix_restore_checks(
     *,
     lstat=os.lstat,
     access=os.access,
-    realpath=os.path.realpath,
+    realpath=posixpath.realpath,
     euid: int | None = None,
     cap_eff: int | None = _SENTINEL,  # type: ignore
 ) -> list[dict[str, Any]]:
     """執行 POSIX 恢復寫權能力檢查。純函式，依賴可注入。"""
-    target_abs = os.path.abspath(target)
+    target_abs = posixpath.abspath(target)
     if euid is None:
         euid = os.geteuid() if hasattr(os, "geteuid") else 0
 
@@ -299,7 +301,12 @@ def posix_restore_checks(
     # 1. 字面鏈與解析鏈的所有唯一路徑：owner_chmod
     all_paths: list[str] = []
     seen: set[str] = set()
-    for p in ([literal_target] + _ancestor_dirs(literal_target) + [resolved_target] + _ancestor_dirs(resolved_target)):
+    for p in (
+        [literal_target]
+        + _ancestor_dirs(literal_target, posixpath)
+        + [resolved_target]
+        + _ancestor_dirs(resolved_target, posixpath)
+    ):
         if p not in seen:
             seen.add(p)
             all_paths.append(p)
@@ -323,13 +330,16 @@ def posix_restore_checks(
     # 2. 所有非根祖先目錄：ancestor_replace
     non_root_ancestors: list[str] = []
     seen_anc: set[str] = set()
-    for a in (_ancestor_dirs(literal_target) + _ancestor_dirs(resolved_target)):
+    for a in (
+        _ancestor_dirs(literal_target, posixpath)
+        + _ancestor_dirs(resolved_target, posixpath)
+    ):
         if a != "/" and a not in seen_anc:
             seen_anc.add(a)
             non_root_ancestors.append(a)
 
     for a in non_root_ancestors:
-        parent = os.path.dirname(a)
+        parent = posixpath.dirname(a)
         try:
             parent_ok = access(parent, os.W_OK | (os.X_OK if hasattr(os, "X_OK") else 0))
             st_parent = lstat(parent)
@@ -677,7 +687,12 @@ def windows_restore_checks(target: str, *, _win_api: Any = None) -> list[dict[st
 
     all_paths: list[str] = []
     seen: set[str] = set()
-    for p in ([literal_target] + _ancestor_dirs(literal_target) + [resolved_target] + _ancestor_dirs(resolved_target)):
+    for p in (
+        [literal_target]
+        + _ancestor_dirs(literal_target, ntpath)
+        + [resolved_target]
+        + _ancestor_dirs(resolved_target, ntpath)
+    ):
         if p not in seen:
             seen.add(p)
             all_paths.append(p)
@@ -731,8 +746,11 @@ def windows_restore_checks(target: str, *, _win_api: Any = None) -> list[dict[st
     # ancestor_replace check（檢查字面與解析之非磁碟根祖先目錄）
     non_root_ancestors: list[str] = []
     seen_anc: set[str] = set()
-    for a in (_ancestor_dirs(literal_target) + _ancestor_dirs(resolved_target)):
-        parent = os.path.dirname(a)
+    for a in (
+        _ancestor_dirs(literal_target, ntpath)
+        + _ancestor_dirs(resolved_target, ntpath)
+    ):
+        parent = ntpath.dirname(a)
         if parent == a:
             continue
         if a not in seen_anc:
@@ -740,7 +758,7 @@ def windows_restore_checks(target: str, *, _win_api: Any = None) -> list[dict[st
             non_root_ancestors.append(a)
 
     for a in non_root_ancestors:
-        parent = os.path.dirname(a)
+        parent = ntpath.dirname(a)
         del_a = win_api.test_open(a, DELETE)
         add_p = win_api.test_open(parent, FILE_ADD_SUBDIRECTORY)
         if del_a is True and add_p is True:
