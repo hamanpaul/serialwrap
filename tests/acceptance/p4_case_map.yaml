@@ -1,6 +1,6 @@
-# P4 驗收案例綁定映射表（P4-T1 建立；承接測試以 Rust `<crate>::<test file>::<fn>`，pytest 以 node id 並加 `@pytest.mark.case`）。
-# 占位節點（sw-cli::p4_case_placeholders::*）為測試作者尚未交付之承接測試的暫置節點；check_p4_cases.py 不接受只綁占位節點的案例作為證據。
-# 注意：sc20／sc21 的正式承接依賴 P1 的 `daemon restart`／`remote stop` Python parser（P1 未在本分支），在 P1 同步前不得視為就緒。
+# P4 驗收案例綁定映射表（P4-T1 建立；Rust 節點使用 `<crate>::<test file>::<fn>`，pytest 使用 node id 並加 `@pytest.mark.case`）。
+# 每個必要案例都須綁定正式承接測試；舊占位節點已由各 P4 Task 的實際測試取代，不得計為證據。
+# SC-20／SC-21 的 Python 對照入口已由 P1 合併，A/B 黑箱測試會驗證兩者的相容行為。
 # bc05-process-lifecycle-stop-restart：Windows 原生證據為 crates/sw-pal/tests/process_tunnel.rs 的
 #   windows_terminate_tree_kills_child_and_grandchild（#[cfg(windows)]，於擁有者 host 執行）；Linux 證據為 POSIX 節點。
 schema_version: 1
@@ -337,7 +337,6 @@ cases:
   capabilities: []
   artifact: rust-cli-bundle
   tests:
-  - sw-cli::p4_case_placeholders::sc25_release_manifest_version_pairing
   - sw-cli::mgmt_doctor::version_pairing_daemon_down_is_unreachable
   - sw-cli::mgmt_doctor::version_pairing_mismatch_detail
   - sw-cli::mgmt_doctor::version_pairing_invalid_manifest
@@ -455,7 +454,7 @@ cases:
   capabilities: []
   artifact: rust-cli-bundle
   tests:
-  - sw-cli::p4_case_placeholders::df13_minicom_broker_rename
+  - sw-cli::mgmt_setup::materialize_wrappers_posix_only
   evidence: target/p4-evidence/df13-minicom-broker-rename.json
   necessity: required
 - case_id: df16-windows-skill-copy

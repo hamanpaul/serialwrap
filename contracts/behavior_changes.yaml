@@ -575,7 +575,7 @@ changes:
   - id: "SC-18"
     kind: "SC"
     title: "Windows on-demand 首次需求啟動（Rust-only）"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -682,7 +682,7 @@ changes:
   - id: "SC-22"
     kind: "SC"
     title: "supervision-mode set（Rust-only）"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -708,7 +708,7 @@ changes:
   - id: "SC-23"
     kind: "SC"
     title: "setup --rollback 與 §12.1 七步更新流程（Rust-only）"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -734,7 +734,7 @@ changes:
   - id: "SC-24"
     kind: "SC"
     title: "監管模式 windows-task 與 windows-service（Rust-only）"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
