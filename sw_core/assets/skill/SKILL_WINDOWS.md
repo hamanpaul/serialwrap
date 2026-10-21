@@ -217,7 +217,7 @@ serialwrap device attach --selector COM0
 | `BENCH_ENDPOINT_NOT_REMEMBERED` | cli_local／posix、windows | 修正參數後 | --bench 指定的 bench 尚未以 connect 記住 endpoint | 先執行 serialwrap connect 記住該 bench 的 endpoint 後再重試 |
 | `BENCH_STATE_IO_ERROR` | cli_local／posix、windows | 視情況 | benches.state.json 讀寫失敗（OS 錯誤） | 檢查 benches.state.json 的權限與磁碟狀態後重試 |
 | `CHECKSUM_MISMATCH` | rpc／posix、windows | 視情況 | 傳輸後 md5 校驗值不符 | 重新傳輸；若持續不符，檢查來源檔與目標端儲存狀態 |
-| `CHECKSUM_VERIFY_FAILED` | rpc／posix、windows | 視情況 | 目標端 md5sum 無回應或無法擷取校驗值 | 確認目標端具備 md5sum 工具後重試 |
+| `CHECKSUM_VERIFY_FAILED` | rpc、cli_local／posix、windows | 視情況 | 目標端 md5sum 無回應或無法擷取校驗值 | 確認目標端具備 md5sum 工具後重試；若為 setup bundle 驗證失敗則確認 release manifest 與 bundle 檔案完整性 |
 | `CMD_CONTAINS_NEWLINE` | rpc／posix、windows | 修正參數後 | 命令字串含換行字元，拒絕送入 UART | 移除命令中的換行並以單行命令重送 |
 | `CMD_NOT_CANCELABLE` | rpc／posix、windows | 否 | 命令已是 done 或 error 狀態，無法取消 | 改以 command.get 讀取既有結果，不需取消 |
 | `CMD_NOT_FOUND` | rpc／posix、windows | 否 | cmd_id 不存在（已被淘汰或從未提交），或 result_tail 無法取得該命令的結果 | 確認 cmd_id 來源；命令紀錄只保留有限筆數，紀錄不存在不代表命令未執行，不得因此重送；先以 session self-test、log tail 或 WAL 查證目標狀態，是否重新執行由操作者決定 |
@@ -235,20 +235,20 @@ serialwrap device attach --selector COM0
 | `DEVICE_NOT_BOUND` | rpc／posix、windows | 修正參數後 | session 未設定 device_by_id，無法 attach | 先以 session.bind 綁定裝置後再 attach |
 | `DEVICE_NOT_FOUND` | rpc／posix、windows | 視情況 | 指定的裝置或 selector 解析不到對應裝置 | 以 device list 確認裝置在線且 by_id 正確，裝置出現後再 attach |
 | `DEVICE_NOT_PRESENT` | rpc／posix、windows | 視情況 | by_id 不在目前的裝置清單中（未插入或尚未列舉） | 確認裝置已插入且 device list 可見後重試 |
-| `DEVICE_STILL_HELD` | rpc／posix、windows | 視情況 | UART 獨占開啟或 holder 預檢確認裝置仍被占用 | 等待已識別的外部持有者釋放後重試；force 只略過開檔前預檢，不會繞過實際開檔或鎖後 holder 掃描 |
+| `DEVICE_STILL_HELD` | rpc、cli_local／posix、windows | 視情況 | UART 獨占開啟或 holder 預檢確認裝置仍被占用 | 等待已識別的外部持有者釋放後重試；force 只略過開檔前預檢，不會繞過實際開檔或鎖後 holder 掃描 |
 | `DRAIN_STALLED` | rpc／posix、windows | 否 | device.release 的 drain 超過 3000 ms 仍無成功 handle 關閉回條，或收到 handle_closed=false 失敗回條（後者可立即回應） | 不要重開或讓外部工具開啟該裝置；依呼叫端等待上限輪詢 session get_state，只有 state 為 RELEASED 才交接；上限到期仍為 RECOVERING 時停止輪詢並交由操作員檢查 daemon／handle；再次 device release 不會加速完成 |
 | `ECHO_ACK_UNSUPPORTED` | rpc／posix、windows | 修正參數後 | ack_mode 為 echo，但 bridge 不支援 echo 節流送出 | 改用其他 ack_mode 重試 |
 | `EMPTY_RESPONSE` | cli_client／posix、windows | 視情況 | 連線已關閉但未收到任何一行回應 | 僅白名單唯讀方法可由 CLI 重試；其他方法先以 health.ping 確認 daemon 狀態 |
 | `ENV_FILE_SOURCE_FAILED` | cli_local／posix、windows | 修正參數後 | env 檔以 bash -lc source 執行失敗（非 0 退出），或 Windows 讀取檔案時發生 OS 錯誤 | 確認 env_file 路徑與內容後重試 |
 | `EXCEPTION` | rpc_frame／posix、windows | 否 | handler 拋出未預期例外，framing 層以 message 回傳（回應無 version） | 視為結果不明：先以 command.get 或 session get_state 確認狀態，不可假設未執行而直接重送 |
-| `FLASHING_BUSY` | rpc、rec、cli_local／posix、windows | 是 | session 處於 FLASHING 或 flash 臨界區，命令或操作被拒 | 等待燒錄結束（session 回到 ATTACHED 或 READY）後再重試 |
+| `FLASHING_BUSY` | rpc、rec、cli_local／posix、windows | 是 | session 處於 FLASHING 或 flash 臨界區，命令或操作被拒；Rust phase 包含 update_safety_check、supervision_set_safety_check | 等待燒錄結束（session 回到 ATTACHED 或 READY）後再重試 |
 | `FLASH_TARGET_IS_CONSOLE` | rpc／posix、windows | 修正參數後 | 燒錄目標是可下命令的 console 裝置，且未指定 force，拒絕執行 | 改選非 console 的燒錄目標；此碼目前 production 不可達，僅作為契約保留 |
 | `FLUSHED_BY_RECOVERY` | rec／posix、windows | 是 | 命令尚未執行即因 recovery 或 detach 被清空（未送出，可在 READY 後重送） | 確認 session 已回到 READY 後才可重送 |
 | `FLUSHED_BY_SHUTDOWN` | rpc、rec／posix、windows | 是 | daemon 停止時，尚未執行的排隊命令被清空（未送出，可重送）；原子交接凍結後的有副作用 RPC 回 reason:"handoff_frozen" | daemon 重新啟動並確認 session 為 READY 後才可重送 |
 | `FORCE_RECOVER_TIMEOUT` | rpc／posix、windows | 視情況 | 強制 recover（clear 後重新 attach）在 10 次、每次 1 秒的窗口內未達 READY | 以 session get_state 確認目前狀態後，再決定重試 recover 或處理裝置 |
 | `INTERACTIVE_EXPIRED` | rpc／posix、windows | 否 | 互動 lease 已逾時失效 | 重新 interactive open 取得新的 lease 後再送出 |
 | `INTERACTIVE_NOT_FOUND` | rpc／posix、windows | 否 | interactive_id 不存在，或 lease 狀態已不是 active | 重新 interactive open 取得 interactive_id |
-| `INTERNAL_ERROR` | cli_local／posix、windows | 否 | CLI 本地流程發生未預期例外 | 回報例外訊息；勿假設操作已失敗而重送寫入型命令 |
+| `INTERNAL_ERROR` | cli_local／posix、windows | 否 | CLI 本地流程發生未預期例外；Rust CLI phase 包含 service_disable、service_enable、service_restart_enable、autostart_lock、update_journal、update_autostart_hold、update_autostart_release、install_recover、update_start_and_verify | 回報例外訊息；勿假設操作已失敗而重送寫入型命令 |
 | `INVALID_ARGS` | rpc、cli_local／posix、windows | 修正參數後 | 參數缺漏或型別／值不合法（RPC 分派或 CLI 參數驗證） | 依 CLI 或 RPC 說明修正參數後重送 |
 | `INVALID_BENCH_CONFIG` | cli_local／posix、windows | 修正參數後 | benches.yaml 驗證失敗 | 修正 benches.yaml 的欄位後重試 |
 | `INVALID_BENCH_STATE` | cli_local／posix、windows | 修正參數後 | benches.state.json 結構錯誤 | 檢查 benches.state.json 內容，結構損壞時需人工修復後重試 |
@@ -281,7 +281,7 @@ serialwrap device attach --selector COM0
 | `RULE_NOT_FOUND` | rpc／posix、windows | 否 | 指定的 rule_id 不存在 | 以 event rule list 確認 rule_id 後重試 |
 | `SAMPLE_READ_FAILED` | cli_local／posix、windows | 修正參數後 | profile test 讀取樣本檔失敗 | 確認樣本檔路徑與讀取權限後重試 |
 | `SEND_FAILED` | rec／posix、windows | 否 | send 回呼拋出例外，無法確定命令是否已送出（結果不明） | 勿自動重送；先以 session self-test 與 command.get 確認狀態，再由操作者決定 |
-| `SESSION_BUSY` | rpc、rec／posix、windows | 是 | 同一 session 的前景操作仍在進行中 | 等待前景操作完成後重試 |
+| `SESSION_BUSY` | rpc、rec、cli_local／posix、windows | 是 | 同一 session 的前景操作仍在進行中 | 等待前景操作完成後重試 |
 | `SESSION_INTERACTIVE_BUSY` | rpc、rec／posix、windows | 是 | 已有不可搶占的 interactive lease，或 SC-13 到期收尾的 ownership restore 尚未完成；相關操作被拒 | 等待 interactive lease 結束或到期收尾完成後重試 |
 | `SESSION_NOT_FOUND` | rpc／posix、windows | 修正參數後 | selector 未對應任何 session | 以 session list 確認 selector 正確後重送 |
 | `SESSION_NOT_READY` | rpc、rec／posix、windows | 視情況 | session 狀態不符（非 READY，或 bridge 不存在）；session.attach／session.recover 失敗時另附 last_error、last_error_detail；passthrough ATTACHED 時附 passthrough_ready_in_s | session.attach／session.recover 失敗時先讀 last_error、last_error_detail 並依 Session last_error 表處置；終態值勿反覆重試，其他暫時狀況可等待 READY 後再重試 |
@@ -296,7 +296,7 @@ serialwrap device attach --selector COM0
 | `TARGET_ENCODER_FAILED` | rpc／posix、windows | 視情況 | 目標端 encoder 回報失敗（encoder failure sentinel 出現） | 檢查目標端 encoder 後重試 |
 | `TARGET_ENCODER_MISSING` | rpc／posix、windows | 否 | 目標端沒有可用的 encoder | 在目標端安裝 encoder 後再重試 |
 | `TEST_DEVICE_ALLOWLIST_REJECTED` | proc／posix、windows | 修正參數後 | 隔離測試實例的裝置 allowlist 判定不通過（非隔離實例設定了 allowlist）；stderr 印出 serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED 與原因，exit 2 | 移除 allowlist 設定，或改在三個隔離目錄均明確設定的實例中使用 |
-| `TIMEOUT` | cli_client、cli_local／posix、windows | 視情況 | 連線、傳送或接收逾時，或 daemon 管理操作等待舊行程結束逾時；白名單唯讀方法可重試，其他方法不可直接重送 | 非白名單方法不得直接重送；先以 health.ping 與回應中的 daemon_busy 判斷 daemon 狀態 |
+| `TIMEOUT` | cli_client、cli_local／posix、windows | 視情況 | 連線、傳送或接收逾時，或 daemon 管理操作等待舊行程結束逾時；CLI phase 包含 restart_wait_old_exit、reconcile_wait_old_exit、service_stop_wait_stop、service_restart_wait_stop、autostart_lock、install_lock、update_confirm_released、update_start_and_verify、update_autostart_hold、update_revert、install_recover、supervision_set_safety_check；白名單唯讀方法可重試，其他方法不可直接重送 | 非白名單方法不得直接重送；先以 health.ping 與回應中的 daemon_busy 判斷 daemon 狀態 |
 | `TRANSFER_ECHO_STALL` | rpc／posix、windows | 是 | echo-ACK 路徑 echo 停滯；換行未送出，命令未執行 | 命令未執行，可重新傳輸 |
 | `TRANSFER_PROBE_FAILED` | rpc／posix、windows | 視情況 | 工具探測命令回報 shell 錯誤 | 確認目標端工具可用後重試 |
 | `TRANSFER_TIMEOUT` | rpc／posix、windows | 視情況 | 檔案傳輸過程中 prompt 逾時 | 確認目標端狀態後重新傳輸 |

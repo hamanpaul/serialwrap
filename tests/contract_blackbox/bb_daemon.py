@@ -1,0 +1,256 @@
+"""以 daemon_prefix() 啟動的 Python daemon 包裝。
+
+提供 subprocess 啟動、socket 與 health.ping 探測、daemon.stop 與清理，
+並支援 $SW_AB_PIDLOG 記錄。
+stdlib-only，不得 import sw_core／serialwrap／serialwrapd。
+"""
+from __future__ import annotations
+
+import json
+import os
+import signal
+import socket
+import subprocess
+import time
+from pathlib import Path
+from typing import Any, Mapping
+
+from bb_harness import daemon_prefix
+
+
+def _send_rpc(endpoint: str, method: str, params: dict[str, Any], timeout_s: float = 1.0) -> dict[str, Any] | None:
+    sock = None
+    try:
+        if "://" in endpoint:
+            if endpoint.startswith("tcp://"):
+                host_port = endpoint[6:]
+                host, port_str = host_port.split(":", 1)
+                sock = socket.create_connection((host, int(port_str)), timeout=timeout_s)
+            elif endpoint.startswith("unix://"):
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.settimeout(timeout_s)
+                sock.connect(endpoint[7:])
+            else:
+                return None
+        else:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(timeout_s)
+            sock.connect(endpoint)
+
+        payload = json.dumps({"id": 1, "method": method, "params": params}).encode("utf-8") + b"\n"
+        sock.sendall(payload)
+
+        buf = b""
+        while b"\n" not in buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        if not buf:
+            return None
+        line = buf.split(b"\n", 1)[0].strip()
+        if not line:
+            return None
+        res = json.loads(line.decode("utf-8", errors="replace"))
+        return res if isinstance(res, dict) else None
+    except Exception:
+        return None
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def _collect_pids(pid: int) -> list[int]:
+    pids = [pid]
+    queue = [pid]
+    while queue:
+        curr = queue.pop(0)
+        task_dir = Path(f"/proc/{curr}/task")
+        if task_dir.is_dir():
+            try:
+                for t in task_dir.iterdir():
+                    child_file = t / "children"
+                    if child_file.is_file():
+                        try:
+                            content = child_file.read_text().strip()
+                            for c in content.split():
+                                c_int = int(c)
+                                if c_int not in pids:
+                                    pids.append(c_int)
+                                    queue.append(c_int)
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+    return pids
+
+
+class PyDaemon:
+    def __init__(self, env: Mapping[str, str], *, profile_dir: Path, socket: str, lock: Path) -> None:
+        self.env = dict(env)
+        self.profile_dir = Path(profile_dir)
+        self.socket = socket
+        self.lock = Path(lock)
+        self.workdir = self.lock.parent
+        self.proc: subprocess.Popen | None = None
+        self._pids: list[int] = []
+
+    def start(self, timeout_s: float = 15.0) -> None:
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        stderr_path = self.workdir / "daemon.stderr"
+        with open(stderr_path, "ab") as stderr_file:
+            cmd = daemon_prefix() + [
+                "--profile-dir",
+                str(self.profile_dir),
+                "--socket",
+                self.socket,
+                "--lock",
+                str(self.lock),
+            ]
+            self.proc = subprocess.Popen(
+                cmd,
+                env=self.env,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_file,
+                start_new_session=(os.name == "posix"),
+            )
+
+        # 立即記錄 pid 到 pidlog（即使未達 ready 亦可供釋放檢查追蹤）
+        pidlog = os.environ.get("SW_AB_PIDLOG")
+        if pidlog:
+            record = {
+                "pid": self.proc.pid,
+                "children": [],
+                "socket": self.socket,
+                "lock": str(self.lock),
+                "run_dir": str(self.workdir),
+            }
+            with open(pidlog, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, separators=(",", ":")) + "\n")
+
+        deadline = time.monotonic() + timeout_s
+        ready = False
+        while time.monotonic() < deadline:
+            if self.proc.poll() is not None:
+                raise RuntimeError(f"Daemon process died prematurely with rc={self.proc.returncode}")
+            res = _send_rpc(self.socket, "health.ping", {}, timeout_s=0.5)
+            if res and res.get("ok"):
+                ready = True
+                break
+            time.sleep(0.1)
+
+        if not ready:
+            self.stop()
+            raise TimeoutError(f"Daemon failed to respond to health.ping within {timeout_s}s")
+
+        self._pids = _collect_pids(self.proc.pid)
+        if pidlog and len(self._pids) > 1:
+            record = {
+                "pid": self.proc.pid,
+                "children": [p for p in self._pids if p != self.proc.pid],
+                "socket": self.socket,
+                "lock": str(self.lock),
+                "run_dir": str(self.workdir),
+            }
+            with open(pidlog, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, separators=(",", ":")) + "\n")
+
+    def stop(self, timeout_s: float = 5.0) -> None:
+        if self.proc is None:
+            return
+        proc = self.proc
+        pid = proc.pid
+        try:
+            _send_rpc(self.socket, "daemon.stop", {}, timeout_s=1.0)
+        except Exception:
+            pass
+
+        try:
+            proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            if os.name == "posix":
+                try:
+                    os.killpg(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+            else:
+                proc.terminate()
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                if os.name == "posix":
+                    try:
+                        os.killpg(pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                else:
+                    proc.kill()
+                try:
+                    proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    pass
+
+        # 有界確認主行程消失
+        if proc.poll() is None:
+            raise RuntimeError(f"Daemon process pid={pid} 於 stop 後仍存活")
+
+        # POSIX 下確認子行程消失
+        if os.name == "posix":
+            for child_pid in self._pids:
+                if child_pid != pid:
+                    try:
+                        os.kill(child_pid, signal.SIGTERM)
+                    except OSError:
+                        pass
+            # 輪詢等待子行程消失（最長 2s）
+            deadline = time.monotonic() + 2.0
+            alive_children = []
+            while time.monotonic() < deadline:
+                alive_children = []
+                for child_pid in self._pids:
+                    if child_pid != pid:
+                        try:
+                            os.kill(child_pid, 0)
+                            alive_children.append(child_pid)
+                        except OSError:
+                            pass
+                if not alive_children:
+                    break
+                time.sleep(0.05)
+            if alive_children:
+                for child_pid in alive_children:
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                time.sleep(0.1)
+                final_alive = [c for c in alive_children if os.path.exists(f"/proc/{c}")]
+                if final_alive:
+                    raise RuntimeError(f"Daemon 子行程 {final_alive} 於 stop 後仍未消失")
+
+        # 確認 socket 消失
+        sock_path: Path | None = None
+        if self.socket.startswith("unix://"):
+            sock_path = Path(self.socket[7:])
+        elif "://" not in self.socket:
+            sock_path = Path(self.socket)
+
+        if sock_path:
+            sock_deadline = time.monotonic() + 2.0
+            while sock_path.exists() and time.monotonic() < sock_deadline:
+                time.sleep(0.05)
+            if sock_path.exists():
+                try:
+                    sock_path.unlink()
+                except OSError:
+                    pass
+                raise RuntimeError(f"Daemon socket {sock_path} 於 stop 後仍未消失")
+
+        self.proc = None
+
+    @property
+    def pids(self) -> list[int]:
+        return list(self._pids)

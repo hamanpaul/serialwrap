@@ -389,7 +389,7 @@ def test_resource_report_cli_without_daemon_env_unmeasured(tmp_path: Path) -> No
 def test_windows_com_never_counted_without_device(tmp_path: Path) -> None:
     """無 SW_TEST_COM_PAIR 時，windows_com 項目不得計為 passed（P0 T14 第 6 條；§11.2 不以模擬代替 windows_com）。
 
-    P2-T13 審查修正：原測試只餵空清單（空轉）。現況 tests/ 有三個檔使用 windows_com（已知清單鎖定，新增者須審閱），
+    P2-T13 審查修正：原測試只餵空清單（空轉）。現況 tests/ 有四個檔使用 windows_com（已知清單鎖定，新增者須審閱），
     本測試實際以缺 device 的環境執行它們，斷言 resources.windows_com.passed == 0 且至少有一個 skipped。
     （計畫 Task 13 寫「本 Stage 無 windows_com 的 tests/ item」與現況不符，差異已於 PR 說明記錄。）
     """
@@ -399,6 +399,7 @@ def test_windows_com_never_counted_without_device(tmp_path: Path) -> None:
     # sw_core.serial_port.open_serial_port 於 SW_TEST_COM_PAIR 指定的真實 COM 上以 pyserial 後端開啟
     # （非 socket、非記憶體替身；唯一 monkeypatch 為寫入逾時常數），缺 device 時 skip，符合 windows_com 定義。
     known = {
+        "tests/contract_blackbox/test_cli_mgmt_daemon.py",
         "tests/test_p1oc_drain_stalled.py",
         "tests/test_spike1_remaining.py",
         "tests/test_stage0_uart_exclusive.py",

@@ -575,7 +575,7 @@ changes:
   - id: "SC-18"
     kind: "SC"
     title: "Windows on-demand 首次需求啟動（Rust-only）"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -682,7 +682,7 @@ changes:
   - id: "SC-22"
     kind: "SC"
     title: "supervision-mode set（Rust-only）"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -708,7 +708,7 @@ changes:
   - id: "SC-23"
     kind: "SC"
     title: "setup --rollback 與 §12.1 七步更新流程（Rust-only）"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -734,7 +734,7 @@ changes:
   - id: "SC-24"
     kind: "SC"
     title: "監管模式 windows-task 與 windows-service（Rust-only）"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-10-15"
@@ -891,6 +891,32 @@ changes:
     compatibility_impact: "passthrough session 不再登入或送 ready_probe（含 uboot-template）；ATTACHED 連續 30 秒無 RX 自動轉 READY 並接受 command.submit；ATTACHED 時 submit 由 PROFILE_NOT_COMMAND_CAPABLE 改為 SESSION_NOT_READY＋passthrough_ready_in_s；file.push／file.pull 對 passthrough 回 PROFILE_NOT_COMMAND_CAPABLE；命令未命中完成條件時不送 CTRL_C／CTRL_D、session 維持 READY。"
     approval_conditions: "OD-14 #2：serialwrap 不介入 passthrough UART；完成條件只用既有機制"
     related_decisions: ["OD-14"]
+  - id: "SC-36"
+    kind: "SC"
+    title: "Windows 安裝的 com0com 選用元件"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "hamanpaul"
+      date: "2026-10-16"
+      decision_ref: "OD-15"
+      basis: "owner_decision"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python: null
+      rust:
+        stage: "stage-1b"
+    approved_at_revision: 1
+    spec_refs: ["OD-15", "§9.5"]
+    reconciliation_refs: ["SC-36"]
+    scope: "rust_only"
+    ab_participation: "absolute_only"
+    phases: ["P4", "P8"]
+    case_ids: ["sc36-win-installer-com0com-optional"]
+    compatibility_impact: "Windows bundle 可選附 com0com 3.0.0.0；預設不安裝。基本安裝不需管理員，只有明確安裝或移除此元件時才以 UAC 啟動 bundle helper。UAC 拒絕或 helper 失敗不影響基本安裝；本體 rollback 不移除 driver。元件附 GPLv2 授權與原始碼提供資訊，Spike 1 剩餘項目通過前維持 experimental。"
+    approval_conditions: "依 OD-15：元件為預設不選取的 Windows 選項，helper 單獨提權；基本安裝與更新不提權，rollback 不操作 driver。Spike 1 剩餘項目需於 HVCI 開啟機台全數通過前維持 experimental:true。"
+    related_decisions: ["OD-15", "OD-01", "OD-08"]
   - id: "DF-01"
     kind: "DF"
     title: "event rule_id 路徑穿越防護"

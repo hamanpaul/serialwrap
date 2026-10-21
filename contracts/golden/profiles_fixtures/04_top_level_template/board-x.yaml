@@ -1,0 +1,4 @@
+platform: shell
+ready_probe: "echo __READY__${nonce}"
+targets:
+  - device_by_id: dev-top

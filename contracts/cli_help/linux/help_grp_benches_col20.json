@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "benches",
+    "--help"
+  ],
+  "columns": 20,
+  "rc": 0,
+  "stdout": "usage: serialwrap benches\n       [-h]\n\n列出 benches.yaml\n各代號、目前記住的\nendpoint，以及本機\nconnect tunnel\n是否仍存活。\n\noptions:\n  -h, --help\n    show this help\n    message and\n    exit\n",
+  "stderr": "",
+  "native": false,
+  "post_parse_effects": false
+}

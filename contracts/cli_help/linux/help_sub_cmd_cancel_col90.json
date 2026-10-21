@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "cmd",
+    "cancel",
+    "--help"
+  ],
+  "columns": 90,
+  "rc": 0,
+  "stdout": "usage: serialwrap cmd cancel [-h] --cmd-id CMD_ID\n\noptions:\n  -h, --help       show this help message and exit\n  --cmd-id CMD_ID\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

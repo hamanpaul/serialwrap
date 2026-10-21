@@ -1,11 +1,19 @@
 [package]
 name = "sw-daemon"
-version = "0.0.0"
-edition = "2021"
-publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# bin `serialwrapd`（P3 只放空殼；P4 之後承接 daemon 本體）。
+[[bin]]
+name = "serialwrapd"
+path = "src/main.rs"
 
 [dependencies]
+sw-core = { path = "../sw-core" }
 sw-proto = { path = "../sw-proto" }
+sw-pal = { path = "../sw-pal" }
 
 [dev-dependencies]
-serde_json = "=1.0.151"
+sw-pal = { path = "../sw-pal", features = ["test-fakes"] }

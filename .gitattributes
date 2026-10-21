@@ -7,3 +7,4 @@ tests/acceptance/** text eol=lf
 realhw/acceptance/longrun_acceptance.yaml text eol=lf
 realhw/acceptance/candidate_longrun_starts.ndjson text eol=lf
 docs/rust-refactor/owner-decisions-addenda.md text eol=lf
+crates/sw-pal/tests/golden/serialwrap.task.xml -text

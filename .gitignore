@@ -35,5 +35,5 @@ runtime/
 # OD-09 ledger 的跨程序鎖檔（realhw/acceptance/od09_freeze.py，P2-T16）
 *.ndjson.lock
 
-# Rust cargo 建置產物（P9-T16 起 repo 根有 Cargo workspace）
+# Rust cargo 建置產物（P3-T1）
 /target/

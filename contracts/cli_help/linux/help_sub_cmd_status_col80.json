@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "cmd",
+    "status",
+    "--help"
+  ],
+  "columns": 80,
+  "rc": 0,
+  "stdout": "usage: serialwrap cmd status [-h] --cmd-id CMD_ID\n\noptions:\n  -h, --help       show this help message and exit\n  --cmd-id CMD_ID\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

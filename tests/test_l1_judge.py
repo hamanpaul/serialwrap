@@ -617,6 +617,12 @@ def _capability_gated(nodeid: str, cache: dict) -> bool:
     以 AST 判斷，不執行測試；只看 skip 相關呼叫中是否引用 gate 名稱（P2-T13 審查修正：凍結的 Windows 集合不得含能力 SKIP 案例）。
     """
     import ast
+    import re
+
+    # Rust/libtest nodeid 由 cargo_l1_results.py 正規化為 cargo:<crate>::<target>::<test>；
+    # 能力測試以 cap_ 前綴標示，不能把 crate 名當成 Python 測試檔路徑解析。
+    if nodeid.startswith("cargo:"):
+        return bool(re.match(r"^cap_", nodeid.rsplit("::", 1)[-1]))
 
     path, _, rest = nodeid.partition("::")
     parts = [p.split("[", 1)[0] for p in rest.split("::")]
@@ -652,7 +658,20 @@ def _capability_gated(nodeid: str, cache: dict) -> bool:
     for deco in target.decorator_list:
         if _gate_refs(deco) and _has_skip_call(deco):
             return True
-    return bool(_gate_refs(target) and _has_skip_call(target))
+    gate_refs = _gate_refs(target)
+    if gate_refs == {"SW_TEST_COM_PAIR"} and any(
+        (isinstance(deco, ast.Attribute) and deco.attr == "windows_com")
+        or (
+            isinstance(deco, ast.Call)
+            and isinstance(deco.func, ast.Attribute)
+            and deco.func.attr == "windows_com"
+        )
+        for deco in target.decorator_list
+    ):
+        # 必要的原生 COM 案例可在提供凍結 COM 配對的 Windows runner 執行；
+        # windows_com marker 使資源需求明確，並由 runner 的 SW_TEST_COM_PAIR 提供。
+        return False
+    return bool(gate_refs and _has_skip_call(target))
 
 
 @pytest.mark.memory_only
@@ -900,3 +919,44 @@ def test_junit_counts_testcase_layer(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     assert checker._junit_counts(junit) == {"tests": 3, "failures": 2, "errors": 0, "skipped": 0}
+
+
+@pytest.mark.process_rpc
+def test_l1_add_only_removes_only_explicitly_approved_nodeids(tmp_path: Path) -> None:
+    """已替換的凍結占位節點須逐名核准移除，未列名或多列名都不得改鎖。"""
+    lock_path = tmp_path / "lock.json"
+    original = {
+        "schema_version": 1,
+        "sets": {
+            "s1b_cargo": {
+                "linux": {
+                    "selector": {"argv": ["--workspace"], "paths": [], "markexpr": ""},
+                    "nodeids": ["cargo:sw-cli::target::old_placeholder", "cargo:sw-cli::target::kept"],
+                }
+            }
+        },
+    }
+    lock_path.write_text(json.dumps(original), encoding="utf-8")
+    original_bytes = lock_path.read_bytes()
+    collect = tmp_path / "collect.json"
+    collect.write_text(json.dumps({"collected": ["cargo:sw-cli::target::kept", "cargo:sw-cli::target::replacement"]}), encoding="utf-8")
+    regen = [sys.executable, "tests/acceptance/regen_lock.py", "--lock-file", str(lock_path),
+             "--l1-add-only", "--set", "s1b_cargo", "--platform", "linux", "--collect", str(collect)]
+
+    refused = subprocess.run(regen, capture_output=True, text=True, cwd=REPO_ROOT)
+    assert refused.returncode == 1, refused.stdout + refused.stderr
+    assert lock_path.read_bytes() == original_bytes
+
+    allowed = subprocess.run([*regen, "--allow-removal", "cargo:sw-cli::target::old_placeholder"],
+                             capture_output=True, text=True, cwd=REPO_ROOT)
+    assert allowed.returncode == 0, allowed.stdout + allowed.stderr
+    revised = json.loads(lock_path.read_text(encoding="utf-8"))
+    assert revised["sets"]["s1b_cargo"]["linux"]["nodeids"] == [
+        "cargo:sw-cli::target::kept", "cargo:sw-cli::target::replacement"
+    ]
+
+    revised_bytes = lock_path.read_bytes()
+    overapproved = subprocess.run([*regen, "--allow-removal", "cargo:sw-cli::target::missing"],
+                                  capture_output=True, text=True, cwd=REPO_ROOT)
+    assert overapproved.returncode == 1, overapproved.stdout + overapproved.stderr
+    assert lock_path.read_bytes() == revised_bytes

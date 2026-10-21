@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "event",
+    "list",
+    "--help"
+  ],
+  "columns": 120,
+  "rc": 0,
+  "stdout": "usage: serialwrap event list [-h] [--selector SELECTOR] [--owner OWNER]\n\noptions:\n  -h, --help           show this help message and exit\n  --selector SELECTOR\n  --owner OWNER\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

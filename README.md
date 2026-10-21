@@ -742,6 +742,19 @@ serialwrap.exe skill --platform windows   # print the full Windows operating gui
 On Windows, MCU flashing should use `device release` / `device attach`; the
 Linux `/dev/ttyMCU` PTY bridge model is not used.
 
+#### Optional com0com component
+
+Windows bundles can include the signed com0com 3.0.0.0 virtual serial driver as
+an optional component. It is not selected by default, and the normal serialwrap
+install or update does not require administrator rights. Run
+`serialwrap setup --with-com0com` to install the default COM20/COM21 pair; only
+the bundled helper requests UAC elevation. Run `serialwrap setup
+--remove-com0com` to remove that pair. Declining UAC or a helper failure leaves
+the base installation successful and is reported under
+`optional_components.com0com`. The driver remains experimental until the
+remaining Spike 1 checks pass with HVCI enabled. The bundle includes the GPLv2
+license, the com0com 3.0.0.0 source link, and a written source offer.
+
 ### Remote Support
 
 When an FAE engineer overseas (a US/EU telecom customer site) uses serialwrap
@@ -1321,6 +1334,67 @@ focused debugging:
 
 ```bash
 python3 -m unittest discover -s tests -v
+```
+
+### Rust CLI Build, Bundle, and Lifecycle (Stage 1B)
+
+Stage 1B implements native Rust CLI handling for all 20 CLI groups (`DELEGATED_GROUPS` is empty), native daemon lifecycle, supervision modes, and atomic update/rollback:
+
+- **Native CLI groups (20)**: `device`, `session` (including `console-attach` / `console-detach`), `alias`, `cmd`, `stream`, `log`, `file`, `wal`, `mcu`, `event`, `profile`, `skill`, `remote`, `daemon`, `connect`, `benches`, `supervision-mode`, `service`, `setup`, `doctor`. All 20 groups operate natively without delegation.
+
+#### Build and Bundle
+
+```bash
+# Build Rust workspace
+cargo build --workspace
+
+# Create development bundle under target/mkbundle-dev
+./scripts/rust/mkbundle.sh --dev
+```
+
+#### First Installation
+
+```powershell
+# Windows Task supervision setup (user session, no admin privilege required)
+serialwrap setup --windows-task
+
+# Optional com0com driver setup (requires administrator elevation, SC-36, OD-15)
+serialwrap setup --with-com0com
+```
+
+#### Lifecycle and Supervision Management
+
+- **Lifecycle Control**: `daemon restart` provides two-reader-safe daemon recycling (stops the old daemon gracefully, waits up to 10 seconds for process exit and device handle release, and launches the new instance).
+- **Supervision Management**: `supervision-mode set <MODE>` switches active supervision between `on-demand`, `systemd-user`, `systemd-system`, `windows-task`, and `windows-service` (on Windows, `windows-service` outputs `pending_sudo` instructions for operator execution). Switching performs fail-closed safety preflight and atomic handoff (`daemon.handoff_stop`): active flashing, file transfers, in-flight commands, active leases, or unconfirmed probes refuse the switch; `--force` does not override this safety guard (records `force_ignored: true`).
+- **Windows Task Supervision**: `windows-task` operates via Windows Task Scheduler (`schtasks`) with `ExecutionTimeLimit=PT0S`, enabling detached daemon persistence across user sessions with automatic start on user login and restart on failure.
+- **Rollback and Recovery**: `setup --rollback` atomically restores the previous bundle version, CLI binary, Python daemon runtime, and supervisor definitions using `install-journal.json`.
+
+#### First-install and Update Error Handling
+
+| Phase | Common Error Codes | Operator Guidance |
+|---|---|---|
+| `update_safety_check` | `SESSION_BUSY`, `FLASHING_BUSY` | Flashing, file transfer, or command in flight; wait for completion before retrying (`--force` does not override) |
+| `update_confirm_released` | `TIMEOUT`, `DEVICE_STILL_HELD` | Old daemon did not terminate within 10 s or device held; verify process exit and retry (no switch made) |
+| `install_lock` | `TIMEOUT` | Lock held by another `setup` instance; verify concurrent operations |
+| `update_verify` / `rollback_verify` | `CHECKSUM_VERIFY_FAILED` | Bundle SHA256 or manifest mismatch; re-acquire or rebuild bundle |
+| `update_start_and_verify` | `DAEMON_EXITED`, `DAEMON_NOT_READY` | New daemon failed health verification; automatically reverted to previous version |
+| `update_autostart_hold` | `INTERNAL_ERROR`, `NEEDS_SUDO` | Failed to hold supervisor autostart; check permissions |
+| `revert_pending` / `install_recover` | `SESSION_BUSY`, `TIMEOUT` | Daemon handoff refused during recovery; wait for idle and run `setup` again |
+
+#### Deployment and Verification References
+
+- [Agent Permission Model](docs/rust-refactor/deploy/agent-permission-model.md)
+- [Windows Installation, Update, and Rollback Guide](docs/rust-refactor/deploy/windows-install-update-rollback.md)
+- [Agent Permission Verifier Tool](scripts/rust/verify_agent_perms.py)
+
+#### A/B Blackbox Verification
+
+```bash
+# Linux A/B differential verification against Python baseline
+./scripts/rust/ab_blackbox.sh --profile debug
+
+# Windows native blackbox verification via PowerShell / WSL interop
+./scripts/rust/win-blackbox.sh
 ```
 
 ### Isolated test-device allowlist (OD-11 / SC-19)
@@ -2435,6 +2509,10 @@ Windows daemon 以 **TCP loopback** 取代 AF_UNIX 做 RPC 控制通道，使 se
   - Device：`PosixDeviceSource`（`/dev/serial/by-id`）↔ `WindowsDeviceSource`（SERIALCOMM registry）
 - POSIX 路徑全程 byte-identical（shim 維持相容）。
 
+### Windows 選用元件：com0com
+
+Windows 發佈組合可附 com0com 3.0.0.0 虛擬序列埠 driver，預設不安裝；一般 serialwrap 安裝與更新仍不需要管理員權限。明確執行 `serialwrap setup --with-com0com` 才會由 bundle 內 helper 單獨請求 UAC，並安裝預設 COM20／COM21 pair。執行 `serialwrap setup --remove-com0com` 可移除此 pair。拒絕 UAC 或 helper 失敗不會讓基本安裝失敗，結果會列在 `optional_components.com0com`。Spike 1 剩餘項目在 HVCI 開啟的機台全數通過前仍標示為實驗性。套件附 GPLv2 授權、com0com 3.0.0.0 原始碼連結與書面提供承諾。
+
 #### 建置 Windows 可執行檔（PyInstaller）
 
 `serialwrapd.exe` / `serialwrap.exe` 以 PyInstaller one-file 打包（`serialwrap.spec`）。
@@ -2508,6 +2586,67 @@ python3 -m unittest discover -s tests -v
 python3 -m pytest tests/test_session_bind.py -v
 python3 -m unittest tests.test_multiagent_e2e -v
 python3 -m unittest tests.test_session_bind -v
+```
+
+### Rust CLI 建置、Bundle 與生命週期管理（Stage 1B）
+
+Stage 1B 將 20 個 CLI 群組全數以 Rust 原生實作（`DELEGATED_GROUPS` 委派集合為空），並交付原生 daemon 生命週期、監管模式切換與原子更新／回滾：
+
+- **原生群組（20 個）**：`device`、`session`（含 `console-attach`／`console-detach`）、`alias`、`cmd`、`stream`、`log`、`file`、`wal`、`mcu`、`event`、`profile`、`skill`、`remote`、`daemon`、`connect`、`benches`、`supervision-mode`、`service`、`setup`、`doctor`。全部 20 個群組均為原生執行，無委派殘留。
+
+#### 建置與 Bundle
+
+```bash
+# 建置 Rust workspace
+cargo build --workspace
+
+# 建立開發 bundle（輸出至 target/mkbundle-dev）
+./scripts/rust/mkbundle.sh --dev
+```
+
+#### 首次安裝
+
+```powershell
+# 1. 預設使用 Windows Task 排程監管安裝（使用者身分，無須管理員特權）
+serialwrap setup --windows-task
+
+# 2. 選用安裝 com0com 虛擬序列埠驅動（需要系統管理員提權，SC-36，OD-15）
+serialwrap setup --with-com0com
+```
+
+#### 生命週期與監管管理
+
+- **生命週期控制**：`daemon restart` 提供具備 two-reader 安全防護之重啟機制（有序停止舊 daemon、等待行程於 10 秒內完全結束並釋放裝置控制代碼，確認釋放後再啟動新實例）。
+- **監管模式切換**：`supervision-mode set <MODE>` 可在 `on-demand`、`systemd-user`、`systemd-system`、`windows-task` 與 `windows-service` 之間動態切換（Windows 上 `windows-service` 輸出 `pending_sudo` 指令由管理員執行）。切換前執行嚴格之安全預檢與原子交接（`daemon.handoff_stop`）：若有 Flash 燒錄、檔案傳輸、活躍操作或探測不明時一律拒絕切換，且此保護**不受 `--force` 影響**（`--force` 不覆寫交接護欄，只在輸出標記 `force_ignored:true`）。
+- **Windows Task 監管**：`windows-task` 透過 Windows Task Scheduler（`schtasks`）排程工作進行監管，設定 `ExecutionTimeLimit=PT0S`，常駐背景運行並於使用者登入時自動啟動，崩潰時自動重啟（`RestartOnFailure`）。
+- **版本回滾**：`setup --rollback` 透過 `install-journal.json` 原子回滾至上一有效版本之二進位檔、Python runtime 與監管排程設定。
+
+#### 首次安裝與更新錯誤處置對照表
+
+| 階段 (`phase`) | 常見錯誤碼 (`error_code`) | 操作者處置指南 |
+|---|---|---|
+| `update_safety_check` | `SESSION_BUSY`, `FLASHING_BUSY` | Target 正處於 flash 燒錄、檔案傳輸或命令執行中；等待完成後重試（`--force` 不會覆寫） |
+| `update_confirm_released` | `TIMEOUT`, `DEVICE_STILL_HELD` | 舊 daemon 未能在 10 秒內完全終止或裝置未釋放；確認行程退出後重試（未進行切換） |
+| `install_lock` | `TIMEOUT` | 無法取得 `.install.lock` 鎖；確認是否有並行之 `setup` 實例正在執行 |
+| `update_verify` / `rollback_verify` | `CHECKSUM_VERIFY_FAILED` | 安裝包 SHA256 或 release-manifest 校驗失敗；重新取得或重新打包安裝 bundle |
+| `update_start_and_verify` | `DAEMON_EXITED`, `DAEMON_NOT_READY` | 新版 daemon 啟動或健康檢查失敗；系統已自動回退至原始版本 |
+| `update_autostart_hold` | `INTERNAL_ERROR`, `NEEDS_SUDO` | 抑制排程工作自動重啟失敗；檢查使用者權限（若為 service 需提權） |
+| `revert_pending` / `install_recover` | `SESSION_BUSY`, `TIMEOUT` | 復原時停止目前 daemon 被拒；等待 daemon 閒置後再次執行 `setup` 完成復原 |
+
+#### 部署與驗證參考文件
+
+- [Agent 權限模型與部署規範](docs/rust-refactor/deploy/agent-permission-model.md)
+- [Windows 安裝、更新與回滾作業指南](docs/rust-refactor/deploy/windows-install-update-rollback.md)
+- [Agent 權限驗證工具](scripts/rust/verify_agent_perms.py)
+
+#### A/B 黑箱驗證
+
+```bash
+# Linux A/B 差分黑箱驗證（對照 Python 基線）
+./scripts/rust/ab_blackbox.sh --profile debug
+
+# Windows 原生黑箱驗證（透過 PowerShell / WSL interop）
+./scripts/rust/win-blackbox.sh
 ```
 
 ### 隔離實例測試裝置 allowlist（OD-11／SC-19）
@@ -2991,7 +3130,7 @@ serialwrap remote -L --remote-socket /tmp/sw-relay.sock tester@RELAY:7777
 - `daemon start` **不支援** `--endpoint`（daemon 只能在本機啟動，會回 `REMOTE_NOT_SUPPORTED`）。
 - **`file.push` / `file.pull` 的 `local_path` 是 daemon 端（UART host）的路徑**，不是 agent 本機路徑；agent 若要傳輸本機檔案，需先透過 scp/rsync 傳到 UART host，再由 daemon 執行 file transfer。WAL、mirror log 等路徑回傳值同理。
 - **native Windows 支援** `serialwrap remote -R/-L`、`connect` 與 `benches`；Windows 使用整棵行程樹終止，且不使用 OpenSSH ControlMaster。可用 `serialwrap remote stop [port|all]` 停止指定隧道；省略參數時停止全部。
-- **OD-12 信任邊界**：遠端隧道讓通過 SSH 驗證的使用者取得 DUT 完整控制權。僅部署於單人工作站並使用可信 relay；這不代表共享主機具備同使用者隔離。
+- **OD-12 信任邊界**：遠端隧道讓通過 SSH 驗證的使用者取得 DUT 完整控制權。僅部署於單人工作站並使用可信 relay；不得宣稱同使用者隔離。
 - 若要做隔離式雙 container 驗證，可直接執行 `./tools/docker/remote_smoke.sh`；完整流程說明在 [`func-test/README.md`](./func-test/README.md) 的 **Remote Support Docker test flow**。
 
 ### 手動 `ssh -R` / `-L` 等價（不透過 `serialwrap remote`）

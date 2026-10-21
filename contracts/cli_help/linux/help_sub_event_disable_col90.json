@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "event",
+    "disable",
+    "--help"
+  ],
+  "columns": 90,
+  "rc": 0,
+  "stdout": "usage: serialwrap event disable [-h] --selector SELECTOR\n\noptions:\n  -h, --help           show this help message and exit\n  --selector SELECTOR\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

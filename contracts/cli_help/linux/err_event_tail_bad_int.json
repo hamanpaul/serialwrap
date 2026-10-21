@@ -1,0 +1,14 @@
+{
+  "argv": [
+    "event",
+    "tail",
+    "-n",
+    "x"
+  ],
+  "columns": 80,
+  "rc": 2,
+  "stdout": "",
+  "stderr": "usage: serialwrap event tail [-h] [--rule-id RULE_ID] [--selector SELECTOR]\n                             [-n N] [--since SINCE]\nserialwrap event tail: error: argument -n: invalid int value: 'x'\n",
+  "native": true,
+  "post_parse_effects": false
+}

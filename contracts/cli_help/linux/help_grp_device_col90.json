@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "device",
+    "--help"
+  ],
+  "columns": 90,
+  "rc": 0,
+  "stdout": "usage: serialwrap device [-h] <command> ...\n\n管理實體 UART 裝置：列舉裝置，以及把 raw device 暫時交給外部工具獨佔再收回。\n\npositional arguments:\n  <command>\n    list      列出實體 UART 裝置（real_path 與 by-id）\n    release   釋放 raw 裝置給外部工具獨佔（如 MCU 燒錄），進入 RELEASED 不自動搶回\n    attach    收回先前 release 的裝置並重建 console（--force 只略過開檔前預檢，不會搶占已識別的外部持有者）\n\noptions:\n  -h, --help  show this help message and exit\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

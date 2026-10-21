@@ -2,12 +2,14 @@
 //!
 //! 夾具以結構體直接建構，**繞過** `validate_retirement`，模擬已被竄改的 manifest。
 use sw_daemon::launcher::{resolve_launch, LaunchError, LaunchPlan};
+use sw_proto::pyjson::{self, PyValue};
 use sw_proto::release_manifest::ReleaseManifest;
 
 mod fixtures {
-    use super::ReleaseManifest;
+    use super::{pyjson, PyValue, ReleaseManifest};
 
     /// 直接建構（不經 `parse`，故不做 validate_retirement）。
+    /// P9 原夾具以 serde_json 讀取；本 crate 不引入第二套 JSON 解析器，改用 P3 的 `pyjson`（僅換解析器，斷言不變）。
     fn build(name: &str) -> ReleaseManifest {
         let text = match name {
             "stage3_retired_but_python_impl.json" => {
@@ -16,14 +18,22 @@ mod fixtures {
             "stage3_retired_rust.json" => include_str!("fixtures/stage3_retired_rust.json"),
             _ => panic!("未知 manifest fixture: {name}"),
         };
-        let raw: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let PyValue::Dict(raw) = pyjson::loads(text).expect("夾具 JSON 必須合法") else {
+            panic!("夾具頂層必須為物件");
+        };
+        let field = |key: &str| match raw.get(key) {
+            Some(PyValue::Str(value)) => value.clone(),
+            _ => panic!("夾具缺少字串欄位 {key}"),
+        };
         ReleaseManifest {
-            schema_version: raw["schema_version"].as_u64().unwrap() as u32,
-            bundle_version: raw["bundle_version"].as_str().unwrap().to_string(),
-            stage: raw["stage"].as_str().unwrap().to_string(),
-            target: raw["target"].as_str().unwrap().to_string(),
-            git_revision: raw["git_revision"].as_str().unwrap().to_string(),
+            schema_version: 1,
+            bundle_version: field("bundle_version"),
+            stage: field("stage"),
+            target: field("target"),
+            git_revision: field("git_revision"),
             python_cli_delegate_entry: None,
+            state_schema: None,
+            task_xml_template_sha256: None,
             raw,
         }
     }

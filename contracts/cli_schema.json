@@ -2436,11 +2436,11 @@
         "DAEMON_EXITED": 2,
         "DAEMON_NOT_READY": 2,
         "ENV_FILE_SOURCE_FAILED": 2,
-        "INTERNAL_ERROR": 1,
         "INVALID_ARGS": 2,
         "NEEDS_SUDO": 2,
         "NO_SYSTEMD": 2,
-        "REMOTE_NOT_SUPPORTED": 2
+        "REMOTE_NOT_SUPPORTED": 2,
+        "INTERNAL_ERROR": 1
       },
       "note": "含 already_running 成功為 0；--foreground 回傳 daemon 子程序 exit code（不在此表）"
     },
@@ -2472,9 +2472,9 @@
       "success": 0,
       "failure": 2,
       "codes": {
-        "INTERNAL_ERROR": 1,
         "INVALID_ARGS": 2,
-        "TIMEOUT": 1
+        "TIMEOUT": 1,
+        "INTERNAL_ERROR": 1
       },
       "note": "不支援遠端或 bench target 為 2；舊 daemon 離線或行程未結束逾時為 1；啟動失敗為 2"
     },
@@ -2548,8 +2548,11 @@
       "failure": 2,
       "codes": {
         "FLASHING_BUSY": 2,
-        "INTERNAL_ERROR": 1,
-        "TIMEOUT": 1
+        "CHECKSUM_VERIFY_FAILED": 2,
+        "DEVICE_STILL_HELD": 2,
+        "SESSION_BUSY": 2,
+        "TIMEOUT": 1,
+        "INTERNAL_ERROR": 1
       },
       "note": "FLASHING_BUSY 為 2；壞 YAML 與其他未預期例外回 INTERNAL_ERROR、exit 1；reconcile 等待舊 daemon 逾時為 1"
     },
@@ -2558,9 +2561,9 @@
       "success": 0,
       "failure": 2,
       "codes": {
-        "INTERNAL_ERROR": 1,
         "NEEDS_SUDO": 2,
-        "NO_SYSTEMD": 2
+        "NO_SYSTEMD": 2,
+        "INTERNAL_ERROR": 1
       },
       "note": "NEEDS_SUDO／NO_SYSTEMD 為 2；壞 YAML 與未預期例外回 INTERNAL_ERROR、exit 1"
     },
@@ -3063,22 +3066,48 @@
     "setup",
     "doctor"
   ],
-  "x-pending": [
+  "x-rust-only": [
     {
-      "id": "SC-22",
       "change": "SC-22",
-      "adds_subcommand": [
+      "subcommand": [
         "supervision-mode",
         "set"
+      ],
+      "options": [
+        "--with-sudo",
+        "--force"
       ]
     },
     {
-      "id": "SC-23",
       "change": "SC-23",
-      "adds_option": [
+      "option": [
         "setup",
         "--rollback"
-      ]
+      ],
+      "action": "store_true",
+      "dest": "rollback",
+      "default": false
+    },
+    {
+      "change": "SC-36",
+      "option": [
+        "setup",
+        "--with-com0com"
+      ],
+      "action": "store_true",
+      "dest": "with_com0com",
+      "default": false
+    },
+    {
+      "change": "SC-36",
+      "option": [
+        "setup",
+        "--remove-com0com"
+      ],
+      "action": "store_true",
+      "dest": "remove_com0com",
+      "default": false
     }
-  ]
+  ],
+  "x-pending": []
 }

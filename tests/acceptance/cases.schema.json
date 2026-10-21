@@ -103,6 +103,7 @@
             "realhw",
             "func-test",
             "l15-scenario",
+            "contract-blackbox",
             "windows-native",
             "manual-procedure"
           ]

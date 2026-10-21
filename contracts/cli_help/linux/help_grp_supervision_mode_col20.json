@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "supervision-mode",
+    "--help"
+  ],
+  "columns": 20,
+  "rc": 0,
+  "stdout": "usage: serialwrap supervision-mode\n       [-h]\n\n印出 config.yaml 中的 \nsupervision_mode，未\n設定時預設為 on-demand。供\nshell 腳本（如 minicom\n_router.sh）查詢。\n\noptions:\n  -h, --help\n    show this help\n    message and\n    exit\n",
+  "stderr": "",
+  "native": false,
+  "post_parse_effects": false
+}

@@ -39,6 +39,15 @@ if ! docker info >/dev/null 2>&1; then
   exit 0
 fi
 
+CLI_PATH=serialwrap
+CLI_BUNDLE_MOUNT=()
+if [[ -n "${SERIALWRAP_CLI_BUNDLE_DIR:-}" ]]; then
+  [[ -d "$SERIALWRAP_CLI_BUNDLE_DIR" ]] || fail "找不到 SERIALWRAP_CLI_BUNDLE_DIR：$SERIALWRAP_CLI_BUNDLE_DIR"
+  CLI_BUNDLE_SOURCE=$(cd -- "$SERIALWRAP_CLI_BUNDLE_DIR" && pwd)
+  CLI_PATH=/opt/sw-bundle/bin/serialwrap
+  CLI_BUNDLE_MOUNT=(--mount "type=bind,source=$CLI_BUNDLE_SOURCE,target=/opt/sw-bundle,readonly")
+fi
+
 CONTAINERS=()
 NETWORKS=()
 
@@ -113,13 +122,13 @@ mk_net() {
 
 start_plain() {  # start_plain <name> <network>
   docker rm -f "$1" >/dev/null 2>&1 || true
-  docker run -d --init --name "$1" --network "$2" "${IMAGE_TAG}" sleep infinity >/dev/null
+  docker run -d --init --name "$1" --network "$2" ${CLI_BUNDLE_MOUNT[@]+"${CLI_BUNDLE_MOUNT[@]}"} "${IMAGE_TAG}" sleep infinity >/dev/null
   CONTAINERS+=("$1")
 }
 
 start_uart() {  # start_uart <name> <network> — 容器主行程即 uart_harness.py（fake target + serialwrapd）
   docker rm -f "$1" >/dev/null 2>&1 || true
-  docker run -d --init --name "$1" --network "$2" -u tester "${IMAGE_TAG}" \
+  docker run -d --init --name "$1" --network "$2" -u tester ${CLI_BUNDLE_MOUNT[@]+"${CLI_BUNDLE_MOUNT[@]}"} "${IMAGE_TAG}" \
     python3 /opt/serialwrap/tools/docker/uart_harness.py >/dev/null
   CONTAINERS+=("$1")
 }
@@ -178,7 +187,7 @@ uart_load_env() {
 uart_exec() {  # uart_exec <container> <serialwrap-subcmd...>
   local c=$1; shift
   uart_load_env "$c"
-  docker exec -u tester "${UART_ENV_ARGS[@]}" "$c" serialwrap "$@"
+  docker exec -u tester "${UART_ENV_ARGS[@]}" "$c" "$CLI_PATH" "$@"
 }
 uart_open() { local c=$1; shift; uart_exec "$c" remote "$@"; }
 uart_close_all() { uart_exec "$1" remote close all; }
@@ -215,7 +224,7 @@ uart_socket_path() {  # uart_socket_path <container> — daemon harness 的 sock
 
 # ── connect 端（-L，拓樸 3 dual_nat 與拓樸 4 agent_pull 用）：固定 RUN_DIR，無 daemon，不需動態 env 檔 ──
 ROLE_RUN_DIR=/home/tester/.sw-run
-role_exec() { local c=$1; shift; docker exec -u tester -e SERIALWRAP_RUN_DIR="${ROLE_RUN_DIR}" "$c" serialwrap "$@"; }
+role_exec() { local c=$1; shift; docker exec -u tester -e SERIALWRAP_RUN_DIR="${ROLE_RUN_DIR}" "$c" "$CLI_PATH" "$@"; }
 role_open() { local c=$1; shift; role_exec "$c" remote "$@"; }
 role_close_all() { role_exec "$1" remote close all; }
 role_status() { role_exec "$1" remote status; }
@@ -226,7 +235,7 @@ role_state_files() {
 # ── endpoint 端（agent CLI／attacker）：純 --endpoint，與 remote CLI 的 RUN_DIR 無關 ──
 endpoint_exec() {  # endpoint_exec <container> <user> <endpoint> <serialwrap-subcmd...>
   local c=$1 u=$2 ep=$3; shift 3
-  docker exec -u "$u" "$c" serialwrap --endpoint "$ep" "$@"
+  docker exec -u "$u" "$c" "$CLI_PATH" --endpoint "$ep" "$@"
 }
 
 assert_no_tunnel_process() {  # assert_no_tunnel_process <container> [user]

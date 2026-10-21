@@ -1,0 +1,5 @@
+profiles:
+  x:
+    platform: shell
+targets:
+  - {profile: x, device_by_id: dx}

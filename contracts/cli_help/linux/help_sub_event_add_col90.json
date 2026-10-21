@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "event",
+    "add",
+    "--help"
+  ],
+  "columns": 90,
+  "rc": 0,
+  "stdout": "usage: serialwrap event add [-h] --file FILE\n\noptions:\n  -h, --help   show this help message and exit\n  --file FILE\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

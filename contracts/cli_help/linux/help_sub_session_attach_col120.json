@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "session",
+    "attach",
+    "--help"
+  ],
+  "columns": 120,
+  "rc": 0,
+  "stdout": "usage: serialwrap session attach [-h] --selector SELECTOR\n\noptions:\n  -h, --help           show this help message and exit\n  --selector SELECTOR  session_id | COMx | alias\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

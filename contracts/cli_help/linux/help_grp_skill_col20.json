@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "skill",
+    "--help"
+  ],
+  "columns": 20,
+  "rc": 0,
+  "stdout": "usage: serialwrap skill\n       [-h]\n       [--platform {auto,linux,windows}]\n\n把內嵌的 serialwrap 操作指南（agent skill／操作手冊）原文印到 stdout（#131）。\n唯讀、不需 daemon；可重導存檔：serialwrap skill --platform windows > SKILL_WINDOWS.md\n\noptions:\n  -h, --help\n    show this help message and exit\n  --platform {auto,linux,windows}\n    指南平台；auto（預設）依目前平台選擇\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "device",
+    "release",
+    "--help"
+  ],
+  "columns": 90,
+  "rc": 0,
+  "stdout": "usage: serialwrap device release [-h] --selector SELECTOR [--source SOURCE]\n                                 [--reason REASON]\n\noptions:\n  -h, --help           show this help message and exit\n  --selector SELECTOR\n  --source SOURCE\n  --reason REASON\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

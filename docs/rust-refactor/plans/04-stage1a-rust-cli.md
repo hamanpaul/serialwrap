@@ -70,7 +70,7 @@
   各 Task 標頭的「Changelog fragment」只寫檔名與正文；`type` 一律 `feat`（Task 2、17、18、19 的測試／工具類為 `change`），`scope` 為 `rust-cli`。不得使用 `### Added` 之類的 Keep a Changelog 標題。
 - 每個 commit 前：`cargo test --workspace`（已實作部分）、`python3 -m pytest -q tests/`、`python3 -m policy_check --repo .`。紅燈 commit 允許 Rust 測試失敗，但 `python3 -m pytest -q tests/` 中**非本 phase 新增**的測試不得出現新失敗；本 phase 新增、預期紅燈的 pytest 以 `pytest.mark.xfail(strict=True, reason="P3-T<n> 紅燈")` 標示（本文件的測試範例未逐一寫出此 decorator，紅燈 commit 時一律補上），實作完成的同一 commit 移除標記。
 - **紅燈不得是 collection error**：`xfail` 攔不住 import 失敗或語法錯誤。Step 1 必須同時提交可 import 的 stub 模組（Python：函式本體 `raise NotImplementedError("P3-T<n>")`；腳本：存在但 `sys.exit(2)`），讓紅燈發生在執行期 assertion，並以 `xfail(strict=True, raises=(NotImplementedError, AssertionError))` 標示。
-- **marker（P0 T14）**：本 phase 新增的每個 pytest 檔都帶 `pytestmark`，平台 marker 恰一個（`core_portable`／`posix_only`／`windows_native`）、資源 marker 至少一個（`memory_only`／`process_rpc`／`posix_pty`…），只用 P0 註冊的詞彙。對照：`tests/test_rust_cfg_boundary.py`、`test_rust_goldens_fresh.py`、`test_rust_error_codes_gen.py`、`test_rust_ab_compare.py`、`test_rust_stage1a_gate.py`、`test_rust_check_win_imports.py` → `core_portable`＋`process_rpc`（皆以 subprocess 執行腳本）；`test_rust_ci_workflow.py`、`test_ab_env_bbproc.py`、`test_rust_readme_trust_scope.py` → `core_portable`＋`memory_only`；`test_rust_workspace_layout.py` → `core_portable`＋`process_rpc`；`test_rust_mkbundle.py`、`test_rust_win_scripts.py` → `posix_only`＋`process_rpc`；`tests/contract_blackbox/**` → 依案例：stub／subprocess 類 `core_portable`＋`process_rpc`，PTY／daemon 類 `posix_only`＋`posix_pty`＋`process_rpc`，Windows 專屬 `windows_native`＋`process_rpc`。黑箱另註冊的非平台 marker 只有 `rust_only`、`needs_py_daemon`、`needs_delegation`。
+- **marker（P0 T14）**：本 phase 新增的每個 pytest 檔都帶 `pytestmark`，平台 marker 恰一個（`core_portable`／`posix_only`／`windows_native`）、資源 marker 至少一個（`memory_only`／`process_rpc`／`posix_pty`…），只用 P0 註冊的詞彙。對照：`tests/test_rust_cfg_boundary.py`、`test_rust_goldens_fresh.py`、`test_rust_error_codes_gen.py`、`test_rust_ab_compare.py`、`test_rust_stage1a_gate.py`、`test_rust_check_win_imports.py` → `core_portable`＋`process_rpc`（皆以 subprocess 執行腳本）；`test_rust_ci_workflow.py`、`test_rust_readme_trust_scope.py` → `core_portable`＋`memory_only`；`test_ab_env_bbproc.py` → `posix_only`＋`memory_only`；`test_rust_workspace_layout.py` → `core_portable`＋`process_rpc`；`test_rust_mkbundle.py`、`test_rust_win_scripts.py` → `posix_only`＋`process_rpc`；`tests/contract_blackbox/**` → 依案例：stub／subprocess 類 `core_portable`＋`process_rpc`，PTY／daemon 類 `posix_only`＋`posix_pty`＋`process_rpc`，Windows 專屬 `windows_native`＋`process_rpc`。黑箱另註冊的非平台 marker 只有 `rust_only`、`needs_py_daemon`、`needs_delegation`。
 
 ### 0.6 模型分工總表（master plan §2；測試作者 ≠ 實作者）
 
@@ -117,6 +117,13 @@ arch 前言規定分計畫不得牴觸 arch，要牴觸時先改 arch。下列�
 | §7.2 | 未指定 patch 版本 | argparse 方言釘 **CPython 3.12.3**（`invalid choice` 引號與 `--help` 子命令欄寬在 3.12.x 間不同） | 同一 Rust 引擎只能對齊一個方言 |
 | §7.4 | 委派 env「僅加兩個變數」 | 加三個：`SERIALWRAP_DELEGATE_DEPTH`、`SERIALWRAP_DELEGATE_ARGV_SHA`、`SERIALWRAP_RELEASE_MANIFEST=<manifest 絕對路徑>` | Python `python -m sw_core.cli` 下 `find_release_manifest(argv0)` 找不到 bundle manifest |
 | §3.3（新增） | — | JSON 巢狀深度上限為 Rust 自訂常數，登記為非契約差異 | Python 上限隨平台與 C 堆疊而變（Linux 3.12.3 約 9998、Windows 3.12.10 約 2998） |
+| §4 `PalError` | `PalError{kind,os_code,py_message}` | `PalError{kind,os_code,winerror,strerror,py_message}` | Python `OSError` 的 `winerror`、`strerror` 屬性分開保存（`traits.rs`） |
+| §4 `ClientCaps` | arch §4 只有完整的 `Capabilities`，無 client 子集 | `ClientCaps{path_flavor,af_unix,native_backend,default_skill,text_newline,exec_replace}`，值型別為 `PalPathFlavor`、`BackendKind`、`SkillPlatform` | 業務碼只看 capability 值（§2.1）；P4 併入 `Capabilities` |
+| §4.4 `EndpointSpec::Unix` | `Unix(PathBuf)` | `Unix(OsString)` | 非 UTF-8 socket 路徑須以原始 bytes 運作（Q-19(a)） |
+| §4.6 `RpcConnector` | 無 `resolve_tcp` | 新增 `resolve_tcp(host, port) -> PalResult<()>` | Q-10：TCP `getaddrinfo` 早於 timeout 驗證，需獨立呼叫 |
+| §1.3 檔案樹 | sw-cli 無 `lib.rs`、`ctx.rs`；sw-pal 無 `select.rs`、`fakes/{env,rpc,process}.rs` | 補列上述檔案（P3 實際落地 stub） | P3-T1 Files 清單 |
+| §2.1 禁止清單 | 未列群組 `use`、OS 名稱比較；`[target.'cfg(` 區段 | 補列 `std::env::consts::OS`／`FAMILY`、群組 `use`、`[package] build`、引號 key 與表形式 build 鍵，`[target.…]` 任何 triple 表 | 審查修正：閘門以語意檢查，文件與閘門須一致 |
+| §1.2、Task 1 Interfaces | sw-cli 依賴列為 proto＋pal | sw-cli 另依賴 `indexmap =2.11.4` | argparse `Namespace` 插入序（P3-T10 Produces 直接引用 `IndexMap`）；arch §1.2 已列 sw-cli 為 indexmap 使用者 |
 
 ---
 
@@ -210,7 +217,7 @@ arch 前言規定分計畫不得牴觸 arch，要牴觸時先改 arch。下列�
   - `Cargo.toml`：`[workspace] members = ["crates/*"]`、`resolver = "2"`；`[workspace.package] version = "<VERSION 檔內容>"`、`edition = "2021"`、`rust-version = "1.96"`；`[workspace.dependencies]` 照 arch §1.2 全部 `=` 釘版；`[profile.release]` 照 arch §1.1。
   - `rust-toolchain.toml`：`channel = "1.96.1"`、`targets = ["x86_64-unknown-linux-gnu","x86_64-pc-windows-gnu"]`。
   - `.cargo/config.toml`：**不設** `runner` 與 `linker`（§0.7；原生 Windows runner 的 host triple 就是 `x86_64-pc-windows-gnu`，`[target.<triple>].runner` 會套用到不帶 `--target` 的原生 `cargo test`）。只放與平台無關的設定（例如 `[term]`）；若無設定可省略此檔。WSL 交叉執行改由 `scripts/rust/win-test.sh`／`win-runner.sh` 偵測 WSL（`WSL_DISTRO_NAME` 或 `/proc/sys/fs/binfmt_misc/WSLInterop`）後以 `CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=scripts/rust/win-runner.sh`、`CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc` 環境變數注入（兩支腳本由 Task 17 交付）。
-  - crate 依賴：`sw-proto`（indexmap、fancy-regex、yaml-rust2、sha2；dev：`tempfile`）；`sw-pal`（`[target.'cfg(unix)'.dependencies] libc`、`[target.'cfg(windows)'.dependencies] windows-sys`，`[features] test-fakes = []`；dev：`tempfile`）；`sw-cli`（`sw-proto`、`sw-pal`；dev：`sw-pal` 加 `features=["test-fakes"]`、`tempfile`；`[lib] name="sw_cli"`、`[[bin]] name="serialwrap" path="src/main.rs"`）；`sw-core`（`sw-proto`、`sw-pal`）；`sw-daemon`（`[[bin]] name="serialwrapd"`，依賴 `sw-core`、`sw-proto`、`sw-pal`）。
+  - crate 依賴：`sw-proto`（indexmap、fancy-regex、yaml-rust2、sha2；dev：`tempfile`）；`sw-pal`（`[target.'cfg(unix)'.dependencies] libc`、`[target.'cfg(windows)'.dependencies] windows-sys`，`[features] test-fakes = []`；dev：`tempfile`）；`sw-cli`（`sw-proto`、`sw-pal`、`indexmap`（P3-T10 的 `Namespace` 直接引用 `indexmap::IndexMap`，§0.7）；dev：`sw-pal` 加 `features=["test-fakes"]`、`tempfile`；`[lib] name="sw_cli"`、`[[bin]] name="serialwrap" path="src/main.rs"`）；`sw-core`（`sw-proto`、`sw-pal`）；`sw-daemon`（`[[bin]] name="serialwrapd"`，依賴 `sw-core`、`sw-proto`、`sw-pal`）。
   - `scripts/rust/check_cfg_boundary.py [--root DIR]`：stdout 每行 `<relpath>:<line>: <rule>: <text>`；exit 0（乾淨）／1（違規）。
   - `scripts/rust/check_dep_direction.py [--root DIR]`：執行 `cargo metadata --format-version 1 --filter-platform <triple>`（兩個 triple 各一次），違規列出 `<crate> -> <dep>: <rule>`，exit 0／1。
 
@@ -219,10 +226,11 @@ arch 前言規定分計畫不得牴觸 arch，要牴觸時先改 arch。下列�
 | 規則 ID | 掃描範圍（排除 `crates/sw-pal/`） | 命中條件 |
 |---|---|---|
 | `cfg-predicate` | `crates/*/{src,tests,benches,examples}/**/*.rs` | `#[cfg(`、`#![cfg(`、`#[cfg_attr(`、`cfg!(` 的謂詞不是由 `test`、`feature = "test-fakes"` 與 `all`／`any`／`not` 組成 |
-| `os-module` | 同上 | `std::os::unix`、`std::os::windows` |
+| `os-module` | 同上 | `std::os::unix`、`std::os::windows`（含群組 `use` 寫法） |
+| `os-name` | 同上 | `std::env::consts::OS`、`FAMILY`（執行期 OS 名稱比較，arch §2.1；審查修正新增） |
 | `ffi-crate` | 同上 | `libc::`、`windows_sys::` |
-| `build-script` | `crates/*/build.rs` 存在；`crates/*/Cargo.toml` 含 `build =` 或 `[build-dependencies]` | 任一 |
-| `target-section` | `crates/*/Cargo.toml`（排除 sw-pal） | `[target.'cfg(` |
+| `build-script` | `crates/*/build.rs` 存在；`crates/*/Cargo.toml`（tomllib 解析）含 `[package] build`、任何 `build-dependencies`（頂層或 target 表內） | 任一 |
+| `target-section` | `crates/*/Cargo.toml`（排除 sw-pal） | 任何 `[target.…]` 區段（含 triple 表；審查修正加嚴） |
 | `dep-direction` | `cargo metadata` | `sw-cli` 依賴 `sw-core`；`sw-pal` 依賴 `sw-proto`；`sw-proto` 依賴任何 workspace crate；`sw-pal` 以外直接依賴 `libc`／`windows-sys` |
 | `test-data-path` | `crates/*/tests/**/*.rs`（含 sw-pal） | `CARGO_MANIFEST_DIR` 出現在 `tests/common/mod.rs` 以外（測試資料一律經 `data_root()`，Step 4 第 7 點） |
 
@@ -606,7 +614,7 @@ def test_isolated_env_strips_all_serialwrap_vars(env, monkeypatch, tmp_path):
 
 （`test_bb_harness_selftest.py` 模組層 `pytestmark = [pytest.mark.core_portable, pytest.mark.process_rpc]`，`test_faketarget_login_flow` 以函式層 `posix_only`＋`posix_pty` 覆寫平台——因同檔混合平台，模組層改只放資源 marker、各函式自帶平台 marker，遵守 P0 T14 規則 2。）
 
-`tests/test_ab_env_bbproc.py`（`core_portable`、`memory_only`）：
+`tests/test_ab_env_bbproc.py`（`posix_only`、`memory_only`）：
 
 ```python
 import importlib.util, sys
@@ -1116,9 +1124,9 @@ Expected：PASS。
 ```rust
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PyFlags(pub u32);
-impl PyFlags { pub const I: u32 = 2; pub const L: u32 = 4; pub const M: u32 = 8; pub const S: u32 = 16; pub const U: u32 = 32; pub const X: u32 = 64; pub const A: u32 = 256; }
+impl PyFlags { pub const T: u32 = 1; pub const I: u32 = 2; pub const L: u32 = 4; pub const M: u32 = 8; pub const S: u32 = 16; pub const U: u32 = 32; pub const X: u32 = 64; pub const A: u32 = 256; }
 #[derive(Debug, Clone, PartialEq)]
-pub struct PyReError { pub msg: String, pub pos: Option<usize>, pub line_col: Option<(usize, usize)> }
+pub struct PyReError { pub msg: String, pub pos: Option<usize>, pub line_col: Option<(usize, usize)>, pub value_error: bool }
 impl std::fmt::Display for PyReError {}   // pattern 含 "\n"：msg + " (line L, column C)"；否則 msg + " at position N"；pos 為 None：msg
 #[derive(Debug, Clone, PartialEq)]
 pub enum CompileError { Re(PyReError), Recursion, Overflow(String) /* Python OverflowError，例如 a{99999999999} */, Untranslatable(String) }
@@ -1135,12 +1143,16 @@ pub const PARSE_DEPTH_LIMIT: usize;     // gen_pyre.py 以二分搜尋量得 Pyt
 pub enum CompletionCheck { Valid, Invalid, Crash(String) /* Python 未攔的例外（OverflowError）→ 呼叫端 exit 1、stdout 空 */ }
 pub fn completion_regex_check(v: Option<&crate::pyjson::PyValue>) -> CompletionCheck;
 pub fn valid_completion_regex(v: Option<&crate::pyjson::PyValue>) -> bool;   // = matches!(completion_regex_check(v), Valid)
+pub fn completion_regex_check_strict(v: Option<&crate::pyjson::PyValue>) -> CompletionCheck; // daemon 使用；Untranslatable → Invalid
+pub fn valid_completion_regex_strict(v: Option<&crate::pyjson::PyValue>) -> bool; // 嚴格入口的布林包裝
 // command_completion.py:11-23：None → Valid；非 Str 或空 → Invalid；UTF-8 長度 > COMPLETION_REGEX_MAX_BYTES(1024) → Invalid；
 // compile 的 Re／Recursion → Invalid（Python 攔 re.error／RecursionError）；Overflow → Crash（Python 只攔 re.error、UnicodeEncodeError、
 // RecursionError，OverflowError 會變 traceback；KEEP：exit 1、stdout 空）；
 // Untranslatable → Valid（Python 端可接受、Rust 轉譯不出時**不在 CLI 本地拒絕**，交由 daemon 自行驗證；不 fail-closed，避免拒絕 Python 接受的輸入）；
 // 可轉譯且 search("") 有結果 → Invalid
 ```
+
+`Untranslatable → Valid` 僅適用 CLI 的相容入口；Rust daemon 與其他做授權／排隊前檢查的路徑必須使用 strict 入口並 fail-closed。此雙 API 裁決消除 arch §3.6 原先未區分 CLI 與 daemon 呼叫端的衝突。
 
 超過 `BACKTRACK_LIMIT` 視為未匹配（arch §3.6）；`Untranslatable` 的構造清單寫入 `contracts/golden/pyre.residuals.txt`（殘餘差異，EVT-D-S15）。殘餘檔格式（每行一筆，`\t` 分隔）：`<pattern 的 hex>\t<構造名>\t<核可者>\t<核可紀錄（PR 留言連結或日期＋審查者）>`；**不以 case id 豁免**。比對規則：只有在 Rust `compile(pattern)` 實際回 `Untranslatable(<同一構造名>)` 時，該 pattern 的 `compile` 列（Python `ok`）與連帶的 `search`／`completion_valid` 列才可視為已登記差異；Rust 結果是其他任何值（含 `ok` 但 search 位置不同、`err:` 文字不同）一律 FAIL。另有測試檢查殘餘檔：無重複列、每列都被至少一個 golden pattern 用到（未使用即過期 → FAIL）、核可欄非空、總筆數 ≤ 20、不含 `sw_core/assets/profiles/*.yaml` 與 `UBOOT_FALLBACK_PROMPTS` 的任何 regex。殘餘檔由**審查者**（非實作者）於 Step 5 後寫入核可欄；實作者只能提出候選。
 

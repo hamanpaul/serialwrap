@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "event",
+    "--help"
+  ],
+  "columns": 90,
+  "rc": 0,
+  "stdout": "usage: serialwrap event [-h] <command> ...\n\nevent-trigger 規則註冊表與 matcher 控制：新增／刪除／列舉／啟用停用規則與檢視觸發紀錄。\n\npositional arguments:\n  <command>\n    add       從 JSON 檔註冊或更新一條規則\n    rm        依 id 刪除一條規則\n    list      列出規則（可依 selector／owner 過濾）\n    show      依 id 顯示單一規則內容\n    enable    啟用指定 selector 的規則 matcher\n    disable   停用指定 selector 的規則 matcher\n    status    顯示 matcher 狀態（可依 selector 過濾）\n    reset     重設規則計數／狀態（--rule-id 或 --selector 擇一）\n    reload    重新載入規則註冊表\n    tail      檢視規則觸發紀錄（可依 rule-id／selector 過濾）\n\noptions:\n  -h, --help  show this help message and exit\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

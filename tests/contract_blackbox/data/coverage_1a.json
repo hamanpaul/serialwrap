@@ -1,0 +1,875 @@
+{
+  "schema": "coverage-1a.v1",
+  "source": "docs/rust-refactor/plans/04-stage1a-rust-cli.md Task 14（55 列）、Task 15（event 10 子命令、profile test、skill）",
+  "evidence_rule": "data_plane 列需 e2e 或 l15 至少一個真實 daemon 路徑證據；每列必須有 stub 證據；l15 留待 P2 cases.yaml",
+  "rows": [
+    {
+      "id": "rpc-01",
+      "command": "device list",
+      "method": "device.list",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_device_mcu_health"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-02",
+      "command": "device release --selector A",
+      "method": "device.release",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_recover_release_attach_no_replay"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-03",
+      "command": "device release --selector A --source x --reason r",
+      "method": "device.release",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_recover_release_attach_no_replay"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-04",
+      "command": "device attach --selector A",
+      "method": "device.attach",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_recover_release_attach_no_replay"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-05",
+      "command": "device attach --selector A --force",
+      "method": "device.attach",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_recover_release_attach_no_replay"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-06",
+      "command": "session list",
+      "method": "session.list",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_session_reaches_ready"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-07",
+      "command": "session clear --selector A",
+      "method": "session.clear",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [],
+      "l15": []
+    },
+    {
+      "id": "rpc-08",
+      "command": "session bind --selector A --device-by-id /dev/x",
+      "method": "session.bind",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [],
+      "l15": []
+    },
+    {
+      "id": "rpc-09",
+      "command": "session pin --selector A --profile p",
+      "method": "session.pin",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [],
+      "l15": []
+    },
+    {
+      "id": "rpc-10",
+      "command": "session unpin --selector A",
+      "method": "session.unpin",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [],
+      "l15": []
+    },
+    {
+      "id": "rpc-11",
+      "command": "session attach --selector A",
+      "method": "session.attach",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [],
+      "l15": []
+    },
+    {
+      "id": "rpc-12",
+      "command": "session self-test --selector A",
+      "method": "session.self_test",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [],
+      "l15": []
+    },
+    {
+      "id": "rpc-13",
+      "command": "session self-test --selector A --probe-timeout 3 --strict-human-lock",
+      "method": "session.self_test",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [],
+      "l15": []
+    },
+    {
+      "id": "rpc-14",
+      "command": "session activity --selector A",
+      "method": "session.activity",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [],
+      "l15": []
+    },
+    {
+      "id": "rpc-15",
+      "command": "session recover --selector A",
+      "method": "session.recover",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_recover_release_attach_no_replay"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-16",
+      "command": "session recover --selector A --timeout 7 --force",
+      "method": "session.recover",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_recover_release_attach_no_replay"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-17",
+      "command": "session console-attach --selector A",
+      "method": "session.console_attach",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_console_attach_detach"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-18",
+      "command": "session console-attach --selector A --label m",
+      "method": "session.console_attach",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_console_attach_detach"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-19",
+      "command": "session console-attach --selector A --label ",
+      "method": "session.console_attach",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_console_attach_detach"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-20",
+      "command": "session console-detach --selector A --client-id c",
+      "method": "session.console_detach",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_console_attach_detach"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-21",
+      "command": "session console-list --selector A",
+      "method": "session.console_list",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_console_attach_detach"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-22",
+      "command": "session interactive-open --selector A",
+      "method": "session.interactive_open",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_interactive_lease_roundtrip"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-23",
+      "command": "session interactive-open --selector A --owner o --timeout 5 --command top --allow-attached",
+      "method": "session.interactive_open",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_interactive_lease_roundtrip"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-24",
+      "command": "session interactive-send --interactive-id i --data d",
+      "method": "session.interactive_send",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_interactive_lease_roundtrip"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-25",
+      "command": "session interactive-status --interactive-id i",
+      "method": "session.interactive_status",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_interactive_lease_roundtrip"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-26",
+      "command": "session interactive-close --interactive-id i",
+      "method": "session.interactive_close",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_interactive_lease_roundtrip"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-27",
+      "command": "session log-start --selector A",
+      "method": "session.log_start",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [],
+      "l15": []
+    },
+    {
+      "id": "rpc-28",
+      "command": "session log-stop --selector A",
+      "method": "session.log_stop",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [],
+      "l15": []
+    },
+    {
+      "id": "rpc-29",
+      "command": "session log-status --selector A",
+      "method": "session.log_status",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [],
+      "l15": []
+    },
+    {
+      "id": "rpc-30",
+      "command": "alias list",
+      "method": "alias.list",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_alias_roundtrip"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-31",
+      "command": "alias set --session-id s --alias a",
+      "method": "alias.set",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_alias_roundtrip"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-32",
+      "command": "alias assign --by-id b --alias a",
+      "method": "alias.assign",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [],
+      "l15": []
+    },
+    {
+      "id": "rpc-33",
+      "command": "alias assign --by-id b --alias a --profile p",
+      "method": "alias.assign",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [],
+      "l15": []
+    },
+    {
+      "id": "rpc-34",
+      "command": "alias unassign --alias a",
+      "method": "alias.unassign",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [],
+      "l15": []
+    },
+    {
+      "id": "rpc-35",
+      "command": "cmd submit --selector A",
+      "method": "command.submit",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_cmd_submit_status"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-36",
+      "command": "cmd submit --selector A --cmd ls --source s --mode whatever --priority 3 --cmd-timeout 1.5 --expected-duration 9 --completion-regex DONE$",
+      "method": "command.submit",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_cmd_submit_status"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-37",
+      "command": "cmd submit --selector A --cmd-timeout inf --priority 99999999999999999999999",
+      "method": "command.submit",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_cmd_submit_status"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-38",
+      "command": "cmd status --cmd-id c",
+      "method": "command.get",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_cmd_submit_status"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-39",
+      "command": "cmd result-tail --cmd-id c",
+      "method": "command.result_tail",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_cmd_background_result_tail"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-40",
+      "command": "cmd cancel --cmd-id c",
+      "method": "command.cancel",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [],
+      "l15": []
+    },
+    {
+      "id": "rpc-41",
+      "command": "stream tail",
+      "method": "result.tail",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_log_and_wal"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-42",
+      "command": "stream tail --com COM1",
+      "method": "result.tail",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_log_and_wal"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-43",
+      "command": "stream tail --selector A --com B --from-seq 5 --limit 1",
+      "method": "result.tail",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_log_and_wal"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-44",
+      "command": "log tail-raw",
+      "method": "log.tail_raw",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [],
+      "l15": []
+    },
+    {
+      "id": "rpc-45",
+      "command": "log tail-raw --from-seq 0",
+      "method": "log.tail_raw",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [],
+      "l15": []
+    },
+    {
+      "id": "rpc-46",
+      "command": "log tail-text --com COM2 --limit 5",
+      "method": "log.tail_text",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_log_and_wal"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-47",
+      "command": "file push --selector A --local l --remote r",
+      "method": "file.push",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [],
+      "l15": []
+    },
+    {
+      "id": "rpc-48",
+      "command": "file push --selector A --local l --remote r --chunk-timeout 3 --ack-mode none --chunk-size 64",
+      "method": "file.push",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [],
+      "l15": []
+    },
+    {
+      "id": "rpc-49",
+      "command": "file pull --selector A --remote r",
+      "method": "file.pull",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [],
+      "l15": []
+    },
+    {
+      "id": "rpc-50",
+      "command": "file pull --selector A --remote r --local l --chunk-timeout 2",
+      "method": "file.pull",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [],
+      "l15": []
+    },
+    {
+      "id": "rpc-51",
+      "command": "wal export",
+      "method": "wal.range",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_log_and_wal"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-52",
+      "command": "wal reset",
+      "method": "wal.reset",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [],
+      "l15": []
+    },
+    {
+      "id": "rpc-53",
+      "command": "wal current-seq",
+      "method": "wal.current_seq",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_log_and_wal"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-54",
+      "command": "mcu patterns",
+      "method": "mcu.patterns",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_device_mcu_health"
+      ],
+      "l15": []
+    },
+    {
+      "id": "rpc-55",
+      "command": "mcu status",
+      "method": "mcu.status",
+      "data_plane": true,
+      "stub": [
+        "test_bb_rpc_params.py::test_rpc_params_wire"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_device_mcu_health"
+      ],
+      "l15": []
+    },
+    {
+      "id": "event-add",
+      "command": "event add",
+      "method": "event.rule_set",
+      "data_plane": true,
+      "stub": [
+        "test_bb_event.py::test_event_subcommands_wire_params"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_event_rule_roundtrip"
+      ],
+      "l15": []
+    },
+    {
+      "id": "event-rm",
+      "command": "event rm",
+      "method": "event.rule_delete",
+      "data_plane": true,
+      "stub": [
+        "test_bb_event.py::test_event_subcommands_wire_params"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_event_rule_roundtrip"
+      ],
+      "l15": []
+    },
+    {
+      "id": "event-list",
+      "command": "event list",
+      "method": "event.rule_list",
+      "data_plane": true,
+      "stub": [
+        "test_bb_event.py::test_event_subcommands_wire_params"
+      ],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_event_rule_roundtrip"
+      ],
+      "l15": []
+    },
+    {
+      "id": "event-show",
+      "command": "event show",
+      "method": "event.rule_get",
+      "data_plane": true,
+      "stub": [
+        "test_bb_event.py::test_event_subcommands_wire_params"
+      ],
+      "e2e": [],
+      "l15": []
+    },
+    {
+      "id": "event-enable",
+      "command": "event enable",
+      "method": "event.com_enable",
+      "data_plane": true,
+      "stub": [
+        "test_bb_event.py::test_event_subcommands_wire_params"
+      ],
+      "e2e": [],
+      "l15": []
+    },
+    {
+      "id": "event-disable",
+      "command": "event disable",
+      "method": "event.com_disable",
+      "data_plane": true,
+      "stub": [
+        "test_bb_event.py::test_event_subcommands_wire_params"
+      ],
+      "e2e": [],
+      "l15": []
+    },
+    {
+      "id": "event-status",
+      "command": "event status",
+      "method": "event.com_status",
+      "data_plane": true,
+      "stub": [
+        "test_bb_event.py::test_event_subcommands_wire_params"
+      ],
+      "e2e": [],
+      "l15": []
+    },
+    {
+      "id": "event-reset",
+      "command": "event reset",
+      "method": "event.reset",
+      "data_plane": true,
+      "stub": [
+        "test_bb_event.py::test_event_subcommands_wire_params"
+      ],
+      "e2e": [],
+      "l15": []
+    },
+    {
+      "id": "event-reload",
+      "command": "event reload",
+      "method": "event.reload",
+      "data_plane": true,
+      "stub": [
+        "test_bb_event.py::test_event_subcommands_wire_params"
+      ],
+      "e2e": [],
+      "l15": []
+    },
+    {
+      "id": "event-tail",
+      "command": "event tail",
+      "method": "event.tail",
+      "data_plane": true,
+      "stub": [
+        "test_bb_event.py::test_event_subcommands_wire_params"
+      ],
+      "e2e": [],
+      "l15": []
+    },
+    {
+      "id": "profile-test",
+      "command": "profile test",
+      "method": null,
+      "data_plane": false,
+      "stub": [
+        "test_bb_profile.py::test_success"
+      ],
+      "e2e": [],
+      "l15": []
+    },
+    {
+      "id": "skill",
+      "command": "skill",
+      "method": null,
+      "data_plane": false,
+      "stub": [
+        "test_bb_skill.py::test_skill_matches_python"
+      ],
+      "e2e": [],
+      "l15": []
+    }
+  ],
+  "p3_extra": [
+    "test_bb_daemon_e2e.py::test_console_attach_detach",
+    "test_bb_rpc_params.py::test_rpc_params_wire"
+  ],
+  "invariants": [
+    {
+      "id": "rejected-requests-zero-tx",
+      "title": "被拒請求外部 TX 為零",
+      "surface": "CLI 本地拒絕",
+      "cases": [
+        "test_bb_daemon_e2e.py::test_local_rejections_zero_tx",
+        "test_bb_exit_codes.py::test_completion_regex_local",
+        "test_bb_exit_codes.py::test_completion_regex_overflow",
+        "test_bb_exit_codes.py::test_unix_bad_timeout"
+      ],
+      "l15": []
+    },
+    {
+      "id": "no-auto-resend-side-effects",
+      "title": "有副作用的命令不得自動重送",
+      "surface": "client 重試白名單",
+      "cases": [
+        "client_retry.rs::non_whitelist_never_retries",
+        "test_bb_client.py::test_side_effect_methods_single_send"
+      ],
+      "l15": []
+    },
+    {
+      "id": "delegation-once-no-path",
+      "title": "委派只執行一次、不經 PATH",
+      "surface": "委派",
+      "cases": [
+        "test_bb_delegation.py::test_probe_receives_argv_env_stdin_and_exit_code",
+        "test_bb_delegation.py::test_exec_failure_runs_nothing_and_does_not_fall_back",
+        "test_bb_delegation.py::test_never_searches_path"
+      ],
+      "l15": []
+    },
+    {
+      "id": "no-interleave-no-replay",
+      "title": "不得交錯不同來源 bytes；Recovery／Release／Reboot／Lease 不回放；舊 worker 交接前不重開",
+      "surface": "daemon 仍為 Python；Rust CLI 只組包",
+      "cases": [
+        "test_bb_daemon_e2e.py::test_recover_release_attach_no_replay"
+      ],
+      "l15": [],
+      "note": "P2 L1.5 情境 case_id 待 P2 cases.yaml 合併後回填（layer L1.5、invariant 標註）"
+    },
+    {
+      "id": "evidence-insufficient-never-pass",
+      "title": "證據不足不得轉 PASS",
+      "surface": "gate 本身",
+      "cases": [
+        "test_rust_ab_compare.py::test_classification",
+        "test_rust_stage1a_gate.py::test_l1_single_passing_case_is_insufficient"
+      ],
+      "l15": []
+    }
+  ]
+}

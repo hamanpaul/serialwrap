@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "session",
+    "unpin",
+    "--help"
+  ],
+  "columns": 80,
+  "rc": 0,
+  "stdout": "usage: serialwrap session unpin [-h] --selector SELECTOR\n\noptions:\n  -h, --help           show this help message and exit\n  --selector SELECTOR  session_id | COMx | alias | by-id | by-path\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

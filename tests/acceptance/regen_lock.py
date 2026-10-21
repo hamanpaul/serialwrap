@@ -10,6 +10,7 @@
   python3 tests/acceptance/regen_lock.py --l1-add-only --set <id> --platform <linux|windows> --collect <檔>
           (--selector <json檔> | --argv-json <json> [--paths-json <json>] [--markexpr <str>])
                                                       # L1 必要集合只增（P2-T13，R5-F3）；既有 nodeid 消失即 exit 1 且不寫檔；
+                                                      # 經核准替換者須逐名列 --allow-removal，且清單必須與消失集合完全相符；
                                                       # 新增 set／平台時必須給 selector（檔案或行內 JSON 皆可）
 
 集合定義（字典序排序的 case_id）：
@@ -361,8 +362,18 @@ def _report_base_diff(base: dict[str, Any], head: dict[str, Any], allow_removal:
 
 
 def _read_collect(path: pathlib.Path) -> list[str]:
+    raw = path.read_text(encoding="utf-8")
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        value = None
+    if isinstance(value, dict) and isinstance(value.get("collected"), list):
+        if not all(isinstance(item, str) for item in value["collected"]):
+            raise ValueError(f"collect JSON 的 collected 必須全為字串：{path}")
+        return list(value["collected"])
+
     ids: list[str] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in raw.splitlines():
         text = line.strip()
         if "::" in text:
             ids.append(text)
@@ -392,7 +403,7 @@ def _selector_from_args(args: argparse.Namespace) -> tuple[dict[str, Any] | None
 
 
 def cmd_l1_add_only(lock_path: pathlib.Path, set_id: str, platform: str, collect: pathlib.Path,
-                    selector: dict[str, Any] | None) -> int:
+                    selector: dict[str, Any] | None, allow_removal: list[str]) -> int:
     if platform not in L1_PLATFORMS or not SET_ID_RE.match(set_id or ""):
         print("[regen_lock] 用法錯誤：--set 與 --platform（linux|windows）必填", file=sys.stderr)
         return 2
@@ -417,17 +428,22 @@ def cmd_l1_add_only(lock_path: pathlib.Path, set_id: str, platform: str, collect
             print(f"[regen_lock] REFUSED selector 與鎖檔不同：{set_id}.{platform}", file=sys.stderr)
             return 1
         removed = sorted(set(spec["nodeids"]) - set(collected))
-        if removed:
-            print("[regen_lock] REFUSED：既有 nodeid 不在新收集結果中，鎖檔未變更：", file=sys.stderr)
-            for nid in removed:
-                print(f"  - {set_id}.{platform} {nid}", file=sys.stderr)
-            print("[regen_lock] 移除須擁有者裁決並於 PR 說明（§11.3）。", file=sys.stderr)
+        allowed = set(allow_removal)
+        unapproved = sorted(set(removed) - allowed)
+        unused_approval = sorted(allowed - set(removed))
+        if unapproved or unused_approval:
+            print("[regen_lock] REFUSED：nodeid 移除核准須與實際消失集合完全相符，鎖檔未變更：", file=sys.stderr)
+            for nid in unapproved:
+                print(f"  - 未列名 {set_id}.{platform} {nid}", file=sys.stderr)
+            for nid in unused_approval:
+                print(f"  - 未消失 {set_id}.{platform} {nid}", file=sys.stderr)
+            print("[regen_lock] 每筆移除都須對應已核准的案例／測試替換並於交付說明列明。", file=sys.stderr)
             return 1
         added = sorted(set(collected) - set(spec["nodeids"]))
-        if not added:
+        if not added and not removed:
             print(f"[regen_lock] {set_id}.{platform} 無新增 nodeid，鎖檔未變更")
             return 0
-        new_spec = {"selector": spec["selector"], "nodeids": sorted(set(spec["nodeids"]) | set(collected))}
+        new_spec = {"selector": spec["selector"], "nodeids": sorted(set(collected) | (set(spec["nodeids"]) - set(removed)))}
         added_count = len(added)
     lock["schema_version"] = 1
     lock.setdefault("sets", {}).setdefault(set_id, {})[platform] = new_spec
@@ -437,7 +453,8 @@ def cmd_l1_add_only(lock_path: pathlib.Path, set_id: str, platform: str, collect
             print(f"[regen_lock] REFUSED {problem}", file=sys.stderr)
         return 1
     _write(lock_path, _dump_l1(lock))
-    print(f"[regen_lock] wrote {lock_path.name}：{set_id}.{platform} 新增 {added_count} 筆 nodeid")
+    removed_count = len(removed) if spec is not None else 0
+    print(f"[regen_lock] wrote {lock_path.name}：{set_id}.{platform} 新增 {added_count} 筆、核准移除 {removed_count} 筆 nodeid")
     return 0
 
 
@@ -447,13 +464,13 @@ def main(argv: list[str] | None = None) -> int:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--check", action="store_true", help="驗證案例鎖（若存在）與 L1 鎖結構")
     mode.add_argument("--add-only", action="store_true", help="重算並寫回；既有 ID 消失或分母屬性改動即拒絕")
-    mode.add_argument("--l1-add-only", action="store_true", help="L1 必要集合只增登記")
+    mode.add_argument("--l1-add-only", action="store_true", help="L1 必要集合只增登記；核准替換可逐名搭配 --allow-removal")
     parser.add_argument("--cases", type=pathlib.Path, default=DEFAULT_CASES, help="cases.yaml 路徑")
     parser.add_argument("--lock", type=pathlib.Path, default=DEFAULT_LOCK, help="cases.lock.json 路徑")
     parser.add_argument("--lock-file", type=pathlib.Path, default=DEFAULT_L1_LOCK, help="l1_required.lock.json 路徑")
     parser.add_argument("--base", default=None, help="--check 時的基準 rev（以其 L1 鎖比對只增）")
     parser.add_argument("--allow-removal", action="extend", nargs="+", default=[], metavar="NODEID",
-                        help="擁有者裁決允許移除的 nodeid（須於 PR 說明）")
+                        help="經核准替換而允許移除的 nodeid；須逐名列出且於交付說明對應新測試")
     parser.add_argument("--set", dest="set_id", default=None, help="--l1-add-only：集合 ID")
     parser.add_argument("--platform", default=None, help="--l1-add-only：linux 或 windows")
     parser.add_argument("--collect", type=pathlib.Path, default=None, help="--l1-add-only：collect-only 輸出檔")
@@ -474,7 +491,8 @@ def main(argv: list[str] | None = None) -> int:
         if err is not None:
             print(f"[regen_lock] 用法錯誤：{err}", file=sys.stderr)
             return 2
-        return cmd_l1_add_only(args.lock_file, args.set_id or "", args.platform or "", args.collect, selector)
+        return cmd_l1_add_only(args.lock_file, args.set_id or "", args.platform or "", args.collect, selector,
+                               list(args.allow_removal))
     if args.check:
         rc = cmd_check(args.cases, args.lock)
         if args.cases_only:

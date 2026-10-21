@@ -1,0 +1,62 @@
+{
+  "arbiter.CMD_REJECT_BYTES": 16384,
+  "arbiter.CMD_WARN_BYTES": 4096,
+  "arch.CLIENT_RESPONSE_MAX_BYTES": 268435456,
+  "arch.DELEGATE_ARGV_SHA_ENV": "SERIALWRAP_DELEGATE_ARGV_SHA",
+  "arch.DELEGATE_DEPTH_ENV": "SERIALWRAP_DELEGATE_DEPTH",
+  "cli.DEFAULT_RPC_TIMEOUT_S": 5.0,
+  "cli.ENDPOINT_PROBE_TIMEOUT_S": 0.2,
+  "cli.LONG_RPC_METHODS": [
+    "device.attach",
+    "device.release",
+    "session.attach",
+    "session.bind",
+    "session.clear",
+    "session.console_attach",
+    "session.recover",
+    "session.self_test"
+  ],
+  "cli.LONG_RPC_TIMEOUT_FLOOR_S": 45.0,
+  "cli_trace.MAX_NUMERIC_LOG_LEVEL_DIGITS": 4300,
+  "client.PROBE_DEADLINE_S": 2.5,
+  "client.PROBE_METHODS": [
+    "health.ping",
+    "health.status"
+  ],
+  "client.PROBE_TIMEOUT_S": 1.0,
+  "client.RECV_CHUNK": 65536,
+  "client.RETRYABLE_READONLY_METHODS": [
+    "alias.list",
+    "device.list",
+    "health.ping",
+    "health.status",
+    "mcu.patterns",
+    "mcu.status",
+    "session.activity",
+    "session.console_list",
+    "session.get_state",
+    "session.list",
+    "session.log_status"
+  ],
+  "client.RETRY_BACKOFF_BASE_S": 0.5,
+  "client.RETRY_BACKOFF_MAX_S": 5.0,
+  "client.TRANSIENT_ERROR_CODES": [
+    "EMPTY_RESPONSE",
+    "SOCKET_ERROR",
+    "TIMEOUT"
+  ],
+  "command_completion.COMPLETION_REGEX_MAX_BYTES": 1024,
+  "constants.DEFAULT_TCP_PORT_RAW_DEFAULT": "48700",
+  "constants.LOOPBACK_TCP_HOSTS": [
+    "127.0.0.1",
+    "::1",
+    "localhost"
+  ],
+  "constants.SYSTEM_SOCKET": "/run/serialwrap/serialwrapd.sock",
+  "file_transfer.FILE_ACK_MODES": [
+    "auto",
+    "echo",
+    "none"
+  ],
+  "file_transfer.FILE_DEFAULT_CHUNK_SIZE": 512
+}

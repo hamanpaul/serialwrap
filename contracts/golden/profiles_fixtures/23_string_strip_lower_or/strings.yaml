@@ -1,0 +1,12 @@
+profiles:
+  p:
+    platform: "  PRPL  "
+    prompt_regex: "  ^root# "
+    login_regex: "  ^login:\\s*$  "
+    password_regex: "   "
+    post_login_cmd: "  sh  "
+    ready_probe: ""
+
+targets:
+  - {profile: p, device_by_id: d1, platform: "", prompt_regex: "", login_regex: "  x  ", ready_probe: "  "}
+  - {profile: p, device_by_id: d2, platform: " Shell ", prompt_regex: "  keep-space ", ready_probe: ~}

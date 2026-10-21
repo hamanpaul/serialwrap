@@ -93,13 +93,14 @@ codes:
   - code: CHECKSUM_VERIFY_FAILED
     status: EXISTING
     reachable: true
-    scope: {interfaces: [rpc], methods: ["file.pull", "file.push"], platforms: [posix, windows]}
+    scope: {"interfaces":["rpc","cli_local"],"methods":["file.pull","file.push","setup"],"platforms":["posix","windows"]}
     meaning: "目標端 md5sum 無回應或無法擷取校驗值"
     side_effect: "push 先清除遠端暫存檔（cleanup）"
     retryable: "conditional"
     uart_tx: confirmed
-    agent_action: "確認目標端具備 md5sum 工具後重試"
+    agent_action: "確認目標端具備 md5sum 工具後重試；若為 setup bundle 驗證失敗則確認 release manifest 與 bundle 檔案完整性"
     extra_fields: []
+    exit_codes: {"setup":2}
     contract_tests: ["tests/test_transfer_portability.py::TestTransferPortability::test_failed_md5_does_not_write_unverified_pull", "tests/test_transfer_portability.py::TestTransferPortability::test_md5_filename_collision_does_not_count_as_success"]
     behavior_change: []
     sources: ["sw_core/file_transfer.py:232", "sw_core/file_transfer.py:330"]
@@ -334,13 +335,14 @@ codes:
   - code: DEVICE_STILL_HELD
     status: IMPLEMENTED
     reachable: true
-    scope: {interfaces: [rpc], methods: ["device.attach"], platforms: [posix, windows]}
+    scope: {"interfaces":["rpc","cli_local"],"methods":["device.attach","setup","supervision-mode set"],"platforms":["posix","windows"]}
     meaning: "UART 獨占開啟或 holder 預檢確認裝置仍被占用"
     side_effect: "無"
     retryable: "conditional"
     uart_tx: none
     agent_action: "等待已識別的外部持有者釋放後重試；force 只略過開檔前預檢，不會繞過實際開檔或鎖後 holder 掃描"
     extra_fields: ["holder_unknown", "pids", "selector"]
+    exit_codes: {"setup":2}
     contract_tests: ["tests/test_stage0_uart_exclusive.py::TestManagerAttach::test_attach_device_held_keeps_released", "tests/test_device_handoff.py::TestAttachDevice::test_attach_refuses_when_externally_held", "tests/test_stage0_uart_exclusive.py::TestAttachProbeDrain::test_attach_device_force_rejects_plain_external_holder", "tests/test_stage0_uart_exclusive.py::TestManagerAttach::test_attach_device_pyserial_access_denied_maps_to_unknown_holder"]
     behavior_change: ["BC-04", "SC-05"]
     sources: ["sw_core/session_manager.py:2925"]
@@ -415,7 +417,7 @@ codes:
     status: IMPLEMENTED
     reachable: true
     scope: {interfaces: [rpc, rec, cli_local], methods: ["command.submit", "file.pull", "file.push", "device.release", "session.attach", "session.bind", "session.clear", "session.interactive_open", "session.interactive_send", "session.recover", "command.get", "setup"], platforms: [posix, windows]}
-    meaning: "session 處於 FLASHING 或 flash 臨界區，命令或操作被拒"
+    meaning: "session 處於 FLASHING 或 flash 臨界區，命令或操作被拒；Rust phase 包含 update_safety_check、supervision_set_safety_check"
     side_effect: "無（gate 拒絕）"
     retryable: "yes"
     uart_tx: none
@@ -508,7 +510,7 @@ codes:
     status: EXISTING
     reachable: true
     scope: {interfaces: [cli_local], methods: ["benches", "connect", "daemon start", "daemon status", "daemon stop", "daemon restart", "event", "remote", "setup", "service <action>"], platforms: [posix, windows]}
-    meaning: "CLI 本地流程發生未預期例外"
+    meaning: "CLI 本地流程發生未預期例外；Rust CLI phase 包含 service_disable、service_enable、service_restart_enable、autostart_lock、update_journal、update_autostart_hold、update_autostart_release、install_recover、update_start_and_verify"
     side_effect: "無（CLI 本地例外；若發生於 RPC 呼叫之後，daemon 端副作用不在此碼判定範圍）"
     retryable: "no"
     uart_tx: none
@@ -517,7 +519,7 @@ codes:
     exit_codes: {"benches": 1, "connect": 1, "daemon start": 1, "daemon status": 1, "daemon stop": 1, "daemon restart": 1, "event": 1, "remote": 1, "setup": 1, "service <action>": 1}
     contract_tests: ["tests/test_contracts_gap_codes.py::TestGapRemoteCli::test_internal_error_cli_catch_all", "tests/test_stage0_defect_fixes.py::test_service_bad_yaml_internal_error_json", "tests/test_stage0_defect_fixes.py::test_setup_unexpected_exception_internal_error_json", "tests/test_stage0_defect_fixes.py::test_daemon_bad_yaml_fails_before_daemon_action"]
     behavior_change: ["DF-07"]
-    sources: ["sw_core/cli.py:160-164", "sw_core/cli.py:673-674", "sw_core/cli.py:1197-1198", "sw_core/cli.py:2622-2623", "sw_core/cli.py:2826-2827", "sw_core/cli.py:2836-2837"]
+    sources: ["sw_core/cli.py:160-164","sw_core/cli.py:673-674","sw_core/cli.py:1197-1198","sw_core/cli.py:2622-2623","sw_core/cli.py:2826-2827","sw_core/cli.py:2836-2837","sw_core/cli.py:138","sw_core/cli.py:1456","sw_core/cli.py:1526","sw_core/cli.py:1615"]
   - code: INVALID_ARGS
     status: EXISTING
     reachable: true
@@ -640,7 +642,7 @@ codes:
     extra_fields: []
     contract_tests: ["tests/test_contracts_gap_codes.py::TestGapFramingTcp::test_invalid_response_non_object", "tests/test_stage0_defect_fixes.py::test_client_non_json_response_invalid_response"]
     behavior_change: ["DF-06"]
-    sources: ["sw_core/client.py:268-273"]
+    sources: ["sw_core/client.py:268-273","sw_core/client.py:270"]
   - code: INVALID_RULE_SCHEMA
     status: EXISTING
     reachable: true
@@ -953,13 +955,14 @@ codes:
   - code: SESSION_BUSY
     status: EXISTING
     reachable: true
-    scope: {interfaces: [rpc, rec], methods: ["file.pull", "file.push", "session.interactive_open", "session.interactive_send", "command.get"], platforms: [posix, windows]}
+    scope: {"interfaces":["rpc","rec","cli_local"],"methods":["file.pull","file.push","session.interactive_open","session.interactive_send","command.get","setup","supervision-mode set"],"platforms":["posix","windows"]}
     meaning: "同一 session 的前景操作仍在進行中"
     side_effect: "無（拒絕）"
     retryable: "yes"
     uart_tx: none
     agent_action: "等待前景操作完成後重試"
     extra_fields: ["selector", "interactive_id"]
+    exit_codes: {"setup":2}
     contract_tests: ["tests/test_refine_ownership.py::TestRefineOwnership::test_blocking_command_rejects_competing_pull_without_tx", "tests/test_refine_ownership.py::TestRefineOwnership::test_blocking_pull_rejects_competing_foreground_command_without_tx"]
     behavior_change: []
     sources: ["sw_core/session_manager.py:1062", "sw_core/session_manager.py:3664", "sw_core/session_manager.py:4028", "sw_core/session_manager.py:4233"]
@@ -1150,7 +1153,7 @@ codes:
     status: EXISTING
     reachable: true
     scope: {interfaces: [cli_client, cli_local], methods: [], platforms: [posix, windows]}
-    meaning: "連線、傳送或接收逾時，或 daemon 管理操作等待舊行程結束逾時；白名單唯讀方法可重試，其他方法不可直接重送"
+    meaning: "連線、傳送或接收逾時，或 daemon 管理操作等待舊行程結束逾時；CLI phase 包含 restart_wait_old_exit、reconcile_wait_old_exit、service_stop_wait_stop、service_restart_wait_stop、autostart_lock、install_lock、update_confirm_released、update_start_and_verify、update_autostart_hold、update_revert、install_recover、supervision_set_safety_check；白名單唯讀方法可重試，其他方法不可直接重送"
     side_effect: "請求可能已抵達 daemon 且仍在執行"
     retryable: "conditional"
     uart_tx: possible

@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "setup",
+    "--help"
+  ],
+  "columns": 40,
+  "rc": 0,
+  "stdout": "usage: serialwrap setup [-h]\n                        [--user | --system | --on-demand]\n                        [--force]\n                        [--with-sudo]\n\n物化套件資產（profiles／agent skill／minicom wrappers）到使用者位置，並 reconcile 監管模式（先停舊、再起新）。\n未指定模式時自動偵測（有 systemd → systemd-user，否則 on-demand）。\nsystem scope 的特權動作需 --with-sudo，否則只回報待執行的 sudo 指令。\n\noptions:\n  -h, --help   show this help message and exit\n  --user       設為 systemd-user 模式（免 sudo）\n  --system     設為 systemd-system 模式（特權動作需 --with-sudo）\n  --on-demand  設為 on-demand 模式（無 systemd 時的降級備援）\n  --force      覆蓋既有 profiles，並在 flash 進行中仍強制切換\n  --with-sudo  systemd-system 模式下允許執行特權 sudo 指令（安裝 unit／enable／start）\n",
+  "stderr": "",
+  "native": false,
+  "post_parse_effects": false
+}

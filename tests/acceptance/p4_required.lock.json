@@ -1,0 +1,530 @@
+{
+  "amended_commits": [
+    "c5db13557b4131afb9c790391ca37fd12877e902",
+    "63c2095f524a4e6a0de2619f6c65ed1bb653b231",
+    "7f032cddea6a7260a8e20b795951e834d6681694",
+    "640e8386528f5ab0184bad8f891b2129cacc83ba",
+    "313d792863ab380c7dc10c43d756aac0debf2f19"
+  ],
+  "case_set_sha256": "44656f22129e31603081bb7cba2991afa1c34109f14ef207f4a317333698bb90",
+  "cases": [
+    {
+      "case_id": "bc05-process-lifecycle-stop-restart",
+      "sha256": "41d94d07c0676cb09102b72fcd816dbbc3c78e391e5639580f6f3c73db10ae1f",
+      "tests": [
+        "sw-pal::process_tunnel::posix_terminate_kills_whole_group_including_grandchild",
+        "sw-pal::process_tunnel::windows_terminate_tree_kills_child_and_grandchild"
+      ]
+    },
+    {
+      "case_id": "bc05-three-topologies",
+      "sha256": "8858f5f54497c01e730939b52e12ca81270850767b77c6cd017197ceda997a9f",
+      "tests": [
+        "tests/contract_blackbox/test_cli_mgmt_remote.py::test_remote_topologies_docker"
+      ]
+    },
+    {
+      "case_id": "bc05-windows-remote-local",
+      "sha256": "0852b2763e64239bdb9541d02688025ffe76700826fd058f5eb6bc626e589bf0",
+      "tests": [
+        "sw-cli::mgmt_remote::windows_connect_ready_via_ping"
+      ]
+    },
+    {
+      "case_id": "bc05-windows-remote-reverse",
+      "sha256": "aa07c27e46e8df0eed571bd768d8256ac13035e36e8e7752b6339a4843e79b1e",
+      "tests": [
+        "sw-cli::mgmt_remote::windows_expose_probe_before_forward_ready_retries"
+      ]
+    },
+    {
+      "case_id": "df05-daemon-locate-order",
+      "sha256": "2dee5e6516ae443741d15c6527426e91ca68efc3735a369d59817a8939f1612f",
+      "tests": [
+        "sw-cli::mgmt_daemon::start_binary_not_found",
+        "sw-cli::mgmt_daemon::start_locate_honors_release_manifest_env",
+        "sw-cli::mgmt_daemon::start_locate_order_sibling_then_runtime"
+      ]
+    },
+    {
+      "case_id": "df07-bad-config-yaml",
+      "sha256": "74c739f4ec140194df8740f1db4e07b6d2359d1887eef73ea79aabf2d052c168",
+      "tests": [
+        "sw-cli::p4_case_placeholders::df07_bad_config_yaml"
+      ]
+    },
+    {
+      "case_id": "df10-system-scope-state-path",
+      "sha256": "3943f7c09d8e1c8e602bc714782dd7b1b2026793f3d7211b4d6496208cba4327",
+      "tests": [
+        "sw-cli::mgmt_setup::df10_system_state_migration_target"
+      ]
+    },
+    {
+      "case_id": "df11-wsl-systemd-sudo-gate",
+      "sha256": "138b0f2d49dafc6bde6334c1fc55cb34c6f0d2dfda180711d6964c1638d9eaca",
+      "tests": [
+        "sw-cli::mgmt_setup::wsl_systemd_target_with_sudo_installs",
+        "sw-cli::mgmt_setup::wsl_without_sudo_never_runs_sudo_install"
+      ]
+    },
+    {
+      "case_id": "df12-setup-ran-field",
+      "sha256": "8d663fc9ffdde114fb1c7bed2ee93709e9d5e4591df3038912e6cdc4410157f3",
+      "tests": [
+        "sw-cli::mgmt_setup::on_demand_to_systemd_user_stops_waits_then_starts",
+        "sw-cli::mgmt_setup::windows_default_target_is_windows_task"
+      ]
+    },
+    {
+      "case_id": "df13-minicom-broker-rename",
+      "sha256": "88881d41e6467d65a0430600d3802838caebf155b18c36f4975b9286306d5f03",
+      "tests": [
+        "sw-cli::p4_case_placeholders::df13_minicom_broker_rename"
+      ]
+    },
+    {
+      "case_id": "df16-windows-skill-copy",
+      "sha256": "7095ed531306f83a05d532320a81fcd1aa318754c0b06c767e9e8b800156e52f",
+      "tests": [
+        "sw-cli::mgmt_setup::materialize_skill_always_refreshed_and_linked",
+        "sw-pal::fs_lock::symlink_or_copy_dir_windows_fallback_copies"
+      ]
+    },
+    {
+      "case_id": "p1-rst-daemon",
+      "sha256": "b75b2e0bcf9902d6abd4f7a3588a188f6675538464ce6ed09e95e3fd80d803cd",
+      "tests": [
+        "sw-cli::mgmt_graceful_stop::windows_task_restart_aborts_when_daemon_never_exits",
+        "tests/test_rust_spike2_tools.py::test_deploy_docs_have_five_sections",
+        "tests/test_rust_spike2_tools.py::test_judge_restart_120s_fails"
+      ]
+    },
+    {
+      "case_id": "rm-live-e2e",
+      "sha256": "a93cb4166e680d72edcb12106884994ca08ecf2d1beb3b1ef6bbc82f13a10e95",
+      "tests": [
+        "sw-cli::mgmt_remote::windows_connect_ready_via_ping",
+        "tests/test_rust_spike2_tools.py::test_deploy_docs_have_five_sections"
+      ]
+    },
+    {
+      "case_id": "sc10-lock-path-normalize-lockfileex",
+      "sha256": "eb3130ef7186a0bf8689f9a411fadcaa3faaae05aa4c6350ac87e5d665638cb0",
+      "tests": [
+        "sw-pal::fs_lock::file_lock_nonblocking_contention_wouldblock"
+      ]
+    },
+    {
+      "case_id": "sc12-reconcile-wait-old-daemon",
+      "sha256": "af9eefd8b73f3dccd07b8797fd0d5f1c97c0e7c49c57c065f9a24b625968f47d",
+      "tests": [
+        "sw-cli::mgmt_setup::on_demand_to_systemd_user_stops_waits_then_starts",
+        "sw-cli::mgmt_setup::reconcile_aborts_when_old_daemon_never_exits",
+        "tests/contract_blackbox/test_cli_mgmt_setup.py::test_setup_ab_reconcile_timeout"
+      ]
+    },
+    {
+      "case_id": "sc17-windows-multi-open-scan",
+      "sha256": "dbef455e67e6f8b22b33f8a486fa88d0cf1e466163e0ee205ee4906f77f9d8bf",
+      "tests": [
+        "sw-pal::proc_scan::windows_launcher_and_python_child_count_as_one_daemon"
+      ]
+    },
+    {
+      "case_id": "sc18-windows-ondemand-autostart",
+      "sha256": "85c3907d1917201a5a4269077aad087b5334ca7a3ddf928f1b39028384bb5454",
+      "tests": [
+        "sw-cli::mgmt_daemon::autostart_concurrent_second_cli_reuses_daemon",
+        "sw-cli::mgmt_daemon::autostart_connect_timeout_no_resend",
+        "sw-cli::mgmt_daemon::autostart_disabled_on_posix_caps",
+        "sw-cli::mgmt_daemon::autostart_failure_reports_stderr",
+        "sw-cli::mgmt_daemon::autostart_loser_daemon_exited_but_healthy_is_success",
+        "sw-cli::mgmt_daemon::autostart_nested_start_already_running_without_pid_is_reused",
+        "sw-cli::mgmt_daemon::autostart_not_for_daemon_status",
+        "sw-cli::mgmt_daemon::autostart_not_for_daemon_stop",
+        "sw-cli::mgmt_daemon::autostart_not_for_explicit_endpoint",
+        "sw-cli::mgmt_daemon::autostart_not_for_timeout",
+        "sw-cli::mgmt_daemon::autostart_only_when_request_never_sent",
+        "sw-cli::mgmt_daemon::autostart_permission_denied_no_resend",
+        "sw-cli::mgmt_daemon::autostart_rechecks_install_journal_after_waiting_for_lock",
+        "sw-cli::mgmt_daemon::autostart_suppressed_while_install_journal_present",
+        "sw-cli::mgmt_daemon::autostart_waits_on_update_hold_lock",
+        "sw-cli::mgmt_daemon::no_autostart_or_resend_after_send_phase_failure",
+        "tests/contract_blackbox/test_cli_mgmt_daemon.py::test_autostart_l15_tx_once"
+      ]
+    },
+    {
+      "case_id": "sc20-daemon-restart",
+      "sha256": "a9b4ce48ee6149aaae1324986bcee0dc8038bff65ab85ad90c87b28caf588a9a",
+      "tests": [
+        "sw-cli::mgmt_daemon::restart_keeps_nested_start_stderr",
+        "sw-cli::mgmt_daemon::restart_on_demand_not_running_wraps_start",
+        "sw-cli::mgmt_daemon::restart_on_demand_output_matches_p1_shape",
+        "sw-cli::mgmt_daemon::restart_on_demand_stop_wait_start",
+        "sw-cli::mgmt_daemon::restart_on_demand_timeout_is_p1_shape",
+        "sw-cli::mgmt_daemon::restart_supervised_systemd_equals_service_restart",
+        "sw-cli::mgmt_daemon::restart_waits_for_process_when_ping_is_already_down",
+        "tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_restart_ab"
+      ]
+    },
+    {
+      "case_id": "sc21-remote-stop-alias",
+      "sha256": "9317a075e68a89ab243380ca3802b1f5b69aff098434f72a979bb8b54e303b5c",
+      "tests": [
+        "sw-cli::mgmt_remote::remote_stop_is_alias_of_close"
+      ]
+    },
+    {
+      "case_id": "sc22-supervision-mode-set",
+      "sha256": "ccbc2d922c76cccd961210f98a7b939234893e9651a33ba9a5e68a5aa045a6b4",
+      "tests": [
+        "sw-cli::mgmt_setup::reconcile_handed_off_never_sends_daemon_stop",
+        "sw-cli::mgmt_setup::reconcile_stops_old_matrix",
+        "sw-cli::mgmt_setup::supervision_set_bad_words",
+        "sw-cli::mgmt_setup::supervision_set_invalid_mode_no_probe",
+        "sw-cli::mgmt_supervision_switch::supervision_set_crash_after_hold_recovers_on_next_setup",
+        "sw-cli::mgmt_supervision_switch::supervision_set_file_push_after_probe_handoff_refused",
+        "sw-cli::mgmt_supervision_switch::supervision_set_flash_races_handoff_refused",
+        "sw-cli::mgmt_supervision_switch::supervision_set_force_idle_same_result_as_without",
+        "sw-cli::mgmt_supervision_switch::supervision_set_force_refuses_flashing",
+        "sw-cli::mgmt_supervision_switch::supervision_set_handoff_recv_timeout_no_hard_stop",
+        "sw-cli::mgmt_supervision_switch::supervision_set_handoff_unsupported_refuses_without_stop",
+        "sw-cli::mgmt_supervision_switch::supervision_set_hold_record_write_failure_no_side_effects",
+        "sw-cli::mgmt_supervision_switch::supervision_set_idle_uses_handoff_not_daemon_stop",
+        "sw-cli::mgmt_supervision_switch::supervision_set_no_daemon_precheck_relaunch_flash_refused",
+        "sw-cli::mgmt_supervision_switch::supervision_set_no_daemon_switches_without_stop_rpc",
+        "sw-cli::mgmt_supervision_switch::supervision_set_ping_down_process_alive_refuses",
+        "sw-cli::mgmt_supervision_switch::supervision_set_probe_bad_response_refuses",
+        "sw-cli::mgmt_supervision_switch::supervision_set_probe_failure_has_no_side_effects",
+        "sw-cli::mgmt_supervision_switch::supervision_set_procscan_failure_refuses",
+        "sw-cli::mgmt_supervision_switch::supervision_set_recover_ambiguous_state_refuses",
+        "sw-cli::mgmt_supervision_switch::supervision_set_refuses_interactive_or_recovering_or_command",
+        "sw-cli::mgmt_supervision_switch::supervision_set_relaunched_busy_releases_hold",
+        "sw-cli::mgmt_supervision_switch::supervision_set_release_failure_keeps_hold_record",
+        "sw-cli::mgmt_supervision_switch::supervision_set_same_mode_or_pending_only_never_hands_off",
+        "sw-cli::mgmt_supervision_switch::supervision_set_timeout_after_grant_exit1"
+      ]
+    },
+    {
+      "case_id": "sc23-setup-rollback",
+      "sha256": "1a764f410cda2db941d61ba4e340fd678ecc9de8fcf841b2e8fb326f19c87c62",
+      "tests": [
+        "sw-cli::mgmt_update::crash_points_cover_every_journal_step",
+        "sw-cli::mgmt_update::fresh_install_materializes_profiles_and_sets_windows_task",
+        "sw-cli::mgmt_update::journal_persists_original_snapshot_before_disable",
+        "sw-cli::mgmt_update::journal_recovery_after_crash_mid_switch",
+        "sw-cli::mgmt_update::journal_recovery_backup_started_never_uses_partial_backup",
+        "sw-cli::mgmt_update::journal_recovery_failure_keeps_journal_and_skips_op",
+        "sw-cli::mgmt_update::journal_recovery_refuses_while_new_daemon_flashing",
+        "sw-cli::mgmt_update::journal_recovery_rejects_missing_or_mismatched_snapshot_without_side_effects",
+        "sw-cli::mgmt_update::journal_recovery_release_failure_keeps_journal",
+        "sw-cli::mgmt_update::journal_recovery_releases_persistent_systemd_hold",
+        "sw-cli::mgmt_update::journal_recovery_restarts_original_on_demand_daemon_after_stop",
+        "sw-cli::mgmt_update::journal_recovery_restores_original_enabled_and_running_windows_task",
+        "sw-cli::mgmt_update::journal_recovery_with_unverifiable_backup_keeps_journal",
+        "sw-cli::mgmt_update::journal_write_failure_aborts_before_effect",
+        "sw-cli::mgmt_update::pairing_failure_after_switch_reverts_to_complete_previous",
+        "sw-cli::mgmt_update::revert_deferred_releases_hold",
+        "sw-cli::mgmt_update::revert_handoff_recv_timeout_no_hard_stop",
+        "sw-cli::mgmt_update::revert_handoff_unsupported_new_daemon_keeps_journal",
+        "sw-cli::mgmt_update::revert_new_daemon_rpc_down_process_alive_defers",
+        "sw-cli::mgmt_update::revert_refuses_while_new_daemon_pushing",
+        "sw-cli::mgmt_update::revert_rehold_before_new_daemon_handoff",
+        "sw-cli::mgmt_update::rollback_cross_mode_failure_recovers_current",
+        "sw-cli::mgmt_update::rollback_cross_mode_windows_task_to_on_demand",
+        "sw-cli::mgmt_update::rollback_force_does_not_override_file_transfer",
+        "sw-cli::mgmt_update::rollback_force_does_not_override_flashing",
+        "sw-cli::mgmt_update::rollback_keeps_current_state_same_schema",
+        "sw-cli::mgmt_update::rollback_not_cli_only",
+        "sw-cli::mgmt_update::rollback_refuses_incompatible_state_schema",
+        "sw-cli::mgmt_update::rollback_reregisters_previous_task",
+        "sw-cli::mgmt_update::rollback_revert_refuses_while_previous_daemon_pushing",
+        "sw-cli::mgmt_update::rollback_twice_rolls_forward",
+        "sw-cli::mgmt_update::rollback_without_previous_is_unavailable",
+        "sw-cli::mgmt_update::switch_never_starts_before_backup_committed",
+        "sw-cli::mgmt_update::systemd_rollback_daemon_reload_after_unit_restore",
+        "sw-cli::mgmt_update::update_accepts_ready_and_released_sessions_together",
+        "sw-cli::mgmt_update::update_backup_contains_required_files",
+        "sw-cli::mgmt_update::update_busy_appears_after_disable_aborts",
+        "sw-cli::mgmt_update::update_busy_background_command",
+        "sw-cli::mgmt_update::update_busy_handoff_releases_hold",
+        "sw-cli::mgmt_update::update_busy_interactive_lease",
+        "sw-cli::mgmt_update::update_busy_recovering",
+        "sw-cli::mgmt_update::update_file_push_after_last_probe",
+        "sw-cli::mgmt_update::update_flash_races_prepare",
+        "sw-cli::mgmt_update::update_flashing_busy",
+        "sw-cli::mgmt_update::update_force_does_not_override_file_transfer",
+        "sw-cli::mgmt_update::update_force_does_not_override_flashing",
+        "sw-cli::mgmt_update::update_force_does_not_override_interactive_or_recovering",
+        "sw-cli::mgmt_update::update_force_does_not_skip_identity_or_probe",
+        "sw-cli::mgmt_update::update_force_idle_same_result_as_without",
+        "sw-cli::mgmt_update::update_force_recheck_after_disable_still_aborts",
+        "sw-cli::mgmt_update::update_handoff_malformed_grant_refuses",
+        "sw-cli::mgmt_update::update_handoff_recv_timeout_no_hard_stop",
+        "sw-cli::mgmt_update::update_handoff_unsupported_daemon_refuses_without_stop",
+        "sw-cli::mgmt_update::update_happy_path_steps_in_order",
+        "sw-cli::mgmt_update::update_hard_stop_never_targets_relaunched_identity",
+        "sw-cli::mgmt_update::update_hold_failure_sends_no_stop_rpc",
+        "sw-cli::mgmt_update::update_identity_unknown_blocks",
+        "sw-cli::mgmt_update::update_instance_before_start_rehandoff",
+        "sw-cli::mgmt_update::update_interrupt_injection_every_point_recovers_to_previous",
+        "sw-cli::mgmt_update::update_interrupt_injection_every_point_releases_hold",
+        "sw-cli::mgmt_update::update_lock_contention_no_side_effects",
+        "sw-cli::mgmt_update::update_materializes_assets_preserving_profiles",
+        "sw-cli::mgmt_update::update_never_sends_plain_daemon_stop",
+        "sw-cli::mgmt_update::update_no_daemon_still_holds_until_switch",
+        "sw-cli::mgmt_update::update_old_daemon_never_exits_aborts_without_switch",
+        "sw-cli::mgmt_update::update_on_demand_holds_autostart_lock_until_new_daemon_started",
+        "sw-cli::mgmt_update::update_on_demand_not_running_skips_daemon_start",
+        "sw-cli::mgmt_update::update_refuses_incompatible_state_schema",
+        "sw-cli::mgmt_update::update_refuses_while_file_transfer_in_progress",
+        "sw-cli::mgmt_update::update_relaunch_loop_aborts_without_switch",
+        "sw-cli::mgmt_update::update_relaunched_instance_during_backup_rehandoff_refuses_flash",
+        "sw-cli::mgmt_update::update_relaunched_instance_rehandoff_ok_continues",
+        "sw-cli::mgmt_update::update_release_then_rollback_keeps_released",
+        "sw-cli::mgmt_update::update_released_session_auto_attached_reverts",
+        "sw-cli::mgmt_update::update_rpc_down_child_holds_com_blocks",
+        "sw-cli::mgmt_update::update_safety_malformed_session_list_refuses",
+        "sw-cli::mgmt_update::update_safety_probe_timeout_refuses",
+        "sw-cli::mgmt_update::update_smoke_failure_reverts",
+        "sw-cli::mgmt_update::update_start_failure_writes_failure_json",
+        "sw-cli::mgmt_update::update_systemd_exit1_after_handoff_not_relaunched",
+        "sw-cli::mgmt_update::update_systemd_system_hold_needs_sudo",
+        "sw-cli::mgmt_update::update_tty_still_held_posix_aborts",
+        "sw-cli::mgmt_update::update_verify_failed_no_side_effects",
+        "sw-cli::mgmt_update::update_version_ok_but_health_fails_reverts",
+        "sw-cli::mgmt_update::update_wal_unhealthy_reverts",
+        "sw-cli::mgmt_update::update_windows_task_exit1_after_handoff_not_relaunched",
+        "sw-cli::mgmt_update::update_windows_task_graceful_before_switch",
+        "tests/contract_blackbox/test_cli_mgmt_update.py::test_fresh_install_blackbox"
+      ]
+    },
+    {
+      "case_id": "sc24-windows-task-service",
+      "sha256": "9d8c9fc371b6ddc1132c1fb194984c7ad6179e1e356947dd98aebf675d63c555",
+      "tests": [
+        "sw-cli::mgmt_setup::windows_default_target_is_windows_task",
+        "sw-cli::mgmt_setup::windows_service_target_pending_only",
+        "sw-pal::service_ctl::windows_task_install_writes_xml_then_creates_task"
+      ]
+    },
+    {
+      "case_id": "sc25-release-manifest-version-pairing",
+      "sha256": "dfdfcd50bae8a311104b978f6cc92e794e15e8a2ccec1b005bfd42b840dff1a4",
+      "tests": [
+        "sw-cli::mgmt_doctor::python_runtime_missing_manifest",
+        "sw-cli::mgmt_doctor::version_pairing_daemon_down_is_unreachable",
+        "sw-cli::mgmt_doctor::version_pairing_invalid_manifest",
+        "sw-cli::mgmt_doctor::version_pairing_mismatch_detail",
+        "sw-cli::mgmt_doctor::version_pairing_parse_only_optional_field_key",
+        "sw-cli::mgmt_doctor::version_pairing_schema_version_float_one_is_valid",
+        "sw-cli::mgmt_doctor::version_pairing_unreadable_manifest",
+        "sw-cli::p4_case_placeholders::sc25_release_manifest_version_pairing",
+        "tests/contract_blackbox/test_cli_mgmt_doctor.py::test_doctor_ab_shared_checks",
+        "tests/contract_blackbox/test_cli_mgmt_doctor.py::test_doctor_ab_version_pairing_in_bundle"
+      ]
+    },
+    {
+      "case_id": "sc27-windows-connect-benches",
+      "sha256": "f363bddfabf0e87d9eb8a15b58f148271fc655bbd05d3f410927072716034130",
+      "tests": [
+        "sw-cli::mgmt_connect::bench_state_concurrent_writers_keep_all_entries",
+        "sw-cli::mgmt_connect::bench_state_lock_cross_process",
+        "sw-cli::mgmt_connect::bench_state_lock_held_refuses_write",
+        "sw-cli::mgmt_connect::benches_sorted_with_alive",
+        "sw-cli::mgmt_connect::benches_status_tunnels_from_error_shapes",
+        "sw-cli::mgmt_connect::connect_close_clears_memory",
+        "sw-cli::mgmt_connect::connect_close_refuses_mismatched_identity",
+        "sw-cli::mgmt_connect::connect_close_still_active",
+        "sw-cli::mgmt_connect::connect_invalid_config_extra_key",
+        "sw-cli::mgmt_connect::connect_missing_code_json_boundary",
+        "sw-cli::mgmt_connect::connect_nested_state_preserved",
+        "sw-cli::mgmt_connect::connect_open_remembers_flat_endpoint",
+        "sw-cli::mgmt_connect::connect_remember_failure_rolls_back",
+        "sw-cli::mgmt_connect::connect_target_requires_user_at_host",
+        "sw-cli::mgmt_connect::connect_unknown_code",
+        "sw-cli::mgmt_connect::windows_connect_supported",
+        "sw-cli::mgmt_remote::windows_state_matches_p1_schema",
+        "tests/contract_blackbox/test_cli_mgmt_connect.py::test_connect_benches_ab"
+      ]
+    },
+    {
+      "case_id": "sc36-win-installer-com0com-optional",
+      "sha256": "ac117bea8f97ec0cd75d7bc1fd9a6ce86dc19d9a526e3468165d82f995fd1da9",
+      "tests": [
+        "sw-cli::mgmt_com0com::base_install_never_elevates",
+        "sw-cli::mgmt_com0com::bundle_component_sha_mismatch_rejected",
+        "sw-cli::mgmt_com0com::bundle_helper_sha_mismatch_rejected",
+        "sw-cli::mgmt_com0com::bundle_without_component_verifies",
+        "sw-cli::mgmt_com0com::component_absent_with_flag",
+        "sw-cli::mgmt_com0com::existing_pair_not_reinstalled",
+        "sw-cli::mgmt_com0com::experimental_stderr_line",
+        "sw-cli::mgmt_com0com::helper_failure_reported",
+        "sw-cli::mgmt_com0com::malformed_com0com_helper_fields_rejected",
+        "sw-cli::mgmt_com0com::manifest_com0com_component_optional",
+        "sw-cli::mgmt_com0com::plain_setup_reports_existing_pair_without_elevation",
+        "sw-cli::mgmt_com0com::registry_probe_error_does_not_skip_elevated_install",
+        "sw-cli::mgmt_com0com::remove_com0com_plan",
+        "sw-cli::mgmt_com0com::remove_uses_installed_bundle_ignoring_manifest_override",
+        "sw-cli::mgmt_com0com::rollback_does_not_touch_driver",
+        "sw-cli::mgmt_com0com::rollback_rejects_com0com_flags",
+        "sw-cli::mgmt_com0com::spawn_elevated_unsupported_on_posix",
+        "sw-cli::mgmt_com0com::standalone_remove_failure_is_nonzero",
+        "sw-cli::mgmt_com0com::tampered_optional_payload_blocks_install_and_remove_before_elevation",
+        "sw-cli::mgmt_com0com::uac_declined_keeps_base_ok",
+        "sw-cli::mgmt_com0com::update_reports_existing_pair_even_when_new_bundle_omits_component",
+        "sw-cli::mgmt_com0com::version_pairing_checks_optional_component_and_helper_digests",
+        "sw-cli::mgmt_com0com::with_com0com_elevates_exactly_helper",
+        "sw-cli::parser_mgmt::setup_rollback_and_user_mutually_exclusive",
+        "sw-pal::com0com::ignores_malformed_or_incomplete_setupc_rows",
+        "sw-pal::com0com::lists_complete_pairs_from_registry_without_setupc",
+        "sw-pal::com0com::parses_complete_com0com_pairs",
+        "sw-pal::com0com::registry_errors_are_returned_for_caller_to_handle",
+        "sw-pal::com0com::validates_com_port_names",
+        "tests/contract_blackbox/test_cli_mgmt_com0com.py::test_bundle_license_files_present",
+        "tests/contract_blackbox/test_cli_mgmt_com0com.py::test_cli_schema_flags_rust_only",
+        "tests/contract_blackbox/test_cli_mgmt_com0com.py::test_incomplete_installer_payload_fails_closed",
+        "tests/contract_blackbox/test_cli_mgmt_com0com.py::test_installer_only_zip_extracts_complete_x64_payload",
+        "tests/contract_blackbox/test_cli_mgmt_com0com.py::test_readme_com0com_both_languages",
+        "tests/contract_blackbox/test_cli_mgmt_com0com.py::test_signed_zip_hash_mismatch_fails_before_extraction",
+        "tests/test_contracts_catalog.py::test_sc36_registered"
+      ]
+    },
+    {
+      "case_id": "win-task-72h",
+      "sha256": "09372d1a3f55bf696f6bac5194d1d067559917d0a319eeb52aa1afe0d40a54c3",
+      "tests": [
+        "tests/test_rust_spike2_tools.py::test_judge_71_9h_runtime_fails",
+        "tests/test_rust_spike2_tools.py::test_judge_72h_continuous_sampling_passes",
+        "tests/test_rust_spike2_tools.py::test_judge_sample_gap_2h_insufficient"
+      ]
+    },
+    {
+      "case_id": "win-task-logon-trigger",
+      "sha256": "0909857b0877f6e46055ec655c26f2a5eb88e315c7ce81e5f773623d0430b21e",
+      "tests": [
+        "tests/test_rust_spike2_tools.py::test_deploy_docs_have_five_sections",
+        "tests/test_rust_spike2_tools.py::test_ps1_destructive_commands_limited_to_install_root",
+        "tests/test_rust_spike2_tools.py::test_whatif_schtasks_only_throwaway_task_name"
+      ]
+    },
+    {
+      "case_id": "win-task-restart-on-failure",
+      "sha256": "09d22e81be26f0e2a574d871730cf8f25d044c4a64d6a56db79a062a499072cc",
+      "tests": [
+        "tests/test_rust_spike2_tools.py::test_judge_restart_120s_fails",
+        "tests/test_rust_spike2_tools.py::test_whatif_schtasks_only_throwaway_task_name"
+      ]
+    },
+    {
+      "case_id": "win-task-single-instance",
+      "sha256": "4561226ac024da9e23fe105868a1e685f99fe3032bc4f957734dd8729aef03b6",
+      "tests": [
+        "tests/test_rust_spike2_tools.py::test_judge_single_instance_count_2_fails",
+        "tests/test_rust_spike2_tools.py::test_whatif_schtasks_only_throwaway_task_name"
+      ]
+    }
+  ],
+  "error_codes_at_freeze": [
+    "ALIAS_NOT_FOUND",
+    "AUTOBOOT_QUIET",
+    "BASE64_DECODE_FAILED",
+    "BENCH_ENDPOINT_NOT_REMEMBERED",
+    "BENCH_STATE_IO_ERROR",
+    "CHECKSUM_MISMATCH",
+    "CHECKSUM_VERIFY_FAILED",
+    "CMD_CONTAINS_NEWLINE",
+    "CMD_NOT_CANCELABLE",
+    "CMD_NOT_FOUND",
+    "CMD_TOO_LONG",
+    "COMMAND_ABORTED_IN_FLIGHT",
+    "COMMAND_FAILED",
+    "CONSOLE_LINE_LIMIT_TOO_SMALL",
+    "CONSOLE_NOT_FOUND",
+    "DAEMON_ALREADY_RUNNING",
+    "DAEMON_ALREADY_RUNNING_ELSEWHERE",
+    "DAEMON_BINARY_NOT_FOUND",
+    "DAEMON_EXITED",
+    "DAEMON_NOT_READY",
+    "DEVICE_ALREADY_BOUND",
+    "DEVICE_NOT_BOUND",
+    "DEVICE_NOT_FOUND",
+    "DEVICE_NOT_PRESENT",
+    "DEVICE_STILL_HELD",
+    "DRAIN_STALLED",
+    "ECHO_ACK_UNSUPPORTED",
+    "EMPTY_RESPONSE",
+    "ENV_FILE_SOURCE_FAILED",
+    "EXCEPTION",
+    "FLASHING_BUSY",
+    "FLASH_TARGET_IS_CONSOLE",
+    "FLUSHED_BY_RECOVERY",
+    "FLUSHED_BY_SHUTDOWN",
+    "FORCE_RECOVER_TIMEOUT",
+    "INTERACTIVE_EXPIRED",
+    "INTERACTIVE_NOT_FOUND",
+    "INTERNAL_ERROR",
+    "INVALID_ARGS",
+    "INVALID_BENCH_CONFIG",
+    "INVALID_BENCH_STATE",
+    "INVALID_COMPLETION_REGEX",
+    "INVALID_ENDPOINT",
+    "INVALID_JSON",
+    "INVALID_METHOD",
+    "INVALID_REQUEST",
+    "INVALID_RESPONSE",
+    "INVALID_RULE_SCHEMA",
+    "INVALID_TARGET",
+    "LOCAL_FILE_NOT_FOUND",
+    "LOG_OPEN_FAILED",
+    "METHOD_NOT_FOUND",
+    "MOVE_FAILED",
+    "MOVE_TIMEOUT",
+    "NEEDS_SUDO",
+    "NOT_READY",
+    "NO_ACTIVE_CAPTURE",
+    "NO_SYSTEMD",
+    "PROFILE_IS_EXPLICIT",
+    "PROFILE_NOT_COMMAND_CAPABLE",
+    "PROMPT_TIMEOUT",
+    "PROMPT_TIMEOUT_FORCE_RECOVERED",
+    "PROMPT_TIMEOUT_RECOVERED",
+    "PULL_PARSE_FAILED",
+    "READY_UNCONFIRMED",
+    "REMOTE_BIND_UNVERIFIED",
+    "REMOTE_NOT_SUPPORTED",
+    "RULE_NOT_FOUND",
+    "SAMPLE_READ_FAILED",
+    "SEND_FAILED",
+    "SESSION_BUSY",
+    "SESSION_INTERACTIVE_BUSY",
+    "SESSION_NOT_FOUND",
+    "SESSION_NOT_READY",
+    "SESSION_QUEUE_FULL",
+    "SESSION_RECOVERING",
+    "SOCKET_ERROR",
+    "SOCKET_UNAVAILABLE",
+    "SSH_NOT_FOUND",
+    "STATE_CHANGED",
+    "TARGET_DECODER_FAILED",
+    "TARGET_DECODER_MISSING",
+    "TARGET_ENCODER_FAILED",
+    "TARGET_ENCODER_MISSING",
+    "TEST_DEVICE_ALLOWLIST_REJECTED",
+    "TIMEOUT",
+    "TRANSFER_ECHO_STALL",
+    "TRANSFER_PROBE_FAILED",
+    "TRANSFER_TIMEOUT",
+    "TUNNEL_CONFLICT",
+    "TUNNEL_SPAWN_FAILED",
+    "TUNNEL_STATUS_ERROR",
+    "TUNNEL_STILL_ACTIVE",
+    "UNKNOWN_BENCH_CODE",
+    "UNKNOWN_EVENT_CMD",
+    "UNKNOWN_PROFILE",
+    "WAL_MISSING"
+  ],
+  "frozen_commit": "3a5d338f6d61c4bc1b2cddf45dccf824f601702f",
+  "schema_version": 2
+}

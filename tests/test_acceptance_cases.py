@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import collections
+import ast
 import datetime
 import hashlib
 import json
@@ -27,6 +28,32 @@ def _load_cases() -> dict[str, Any]:
 def _ids(suite: str) -> set[str]:
     cases = _load_cases()
     return {c["case_id"] for c in cases.get("cases", []) if c.get("suite") == suite}
+
+
+@pytest.mark.memory_only
+def test_contract_blackbox_cases_match_test_functions():
+    """contract-blackbox 案例須與 Stage 1A daemon black-box 測試一一對應。"""
+    source = REPO / "tests/contract_blackbox/test_bb_daemon_e2e.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    names = {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name.startswith("test_")
+    }
+    cases = [c for c in _load_cases().get("cases", []) if c.get("suite") == "contract-blackbox"]
+    expected_refs = {
+        f"tests/contract_blackbox/test_bb_daemon_e2e.py::{name}" for name in names
+    }
+    actual_refs = {c["source_ref"] for c in cases}
+    expected_ids = {f"bb-{name.removeprefix('test_').replace('_', '-')}" for name in names}
+
+    assert actual_refs == expected_refs, (
+        f"contract-blackbox source_ref 與測試函式不一致：缺少 {sorted(expected_refs - actual_refs)}；"
+        f"多出 {sorted(actual_refs - expected_refs)}"
+    )
+    assert len(actual_refs) == len(cases), "contract-blackbox source_ref 不得重複"
+    assert {c["case_id"] for c in cases} == expected_ids
 
 
 def _slice_to_tuple(s: str) -> tuple[int, ...]:

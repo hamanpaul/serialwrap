@@ -1,0 +1,16 @@
+{
+  "argv": [
+    "session",
+    "recover",
+    "--selector",
+    "A",
+    "--timeout",
+    "x"
+  ],
+  "columns": 80,
+  "rc": 2,
+  "stdout": "",
+  "stderr": "usage: serialwrap session recover [-h] --selector SELECTOR\n                                  [--timeout RECOVER_TIMEOUT_S] [--force]\nserialwrap session recover: error: argument --timeout: invalid float value: 'x'\n",
+  "native": true,
+  "post_parse_effects": false
+}
