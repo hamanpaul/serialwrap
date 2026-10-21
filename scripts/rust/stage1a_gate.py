@@ -129,6 +129,7 @@ def _pytest_junit_cases(path: Path | None, errors: list[str]) -> dict[str, list[
 
 
 WINDOWS_COM_FORMAT = "windows-com-evidence.v1"
+WINDOWS_COM_SEQUENCE_FORMAT = "windows-com-sequence.v1"
 WINDOWS_COM_PAIR = "COM20:COM21"
 WINDOWS_COM_P4_NODE = "tests/contract_blackbox/test_cli_mgmt_daemon.py::test_autostart_l15_tx_once"
 WINDOWS_COM_SEQUENCE = (
@@ -185,21 +186,31 @@ def _windows_com_verdict(evidence_dir: Path) -> tuple[str, list[str]]:
         reasons.append("bridge-selftest/selftest-report.json 缺漏或 verdict 非 PASS")
 
     # 序列：步驟依序為凍結清單，允許結尾的 daemon-stop（finally 清理）；所有含 returncode 的步驟必須為 0。
-    sequence = _read_json_dict(com_dir / "sequence-result.json")
-    if sequence is None or sequence.get("result") != "PASS":
-        reasons.append("sequence-result.json 缺漏或 result 非 PASS")
-    elif isinstance(sequence.get("steps"), list):
-        steps = [s for s in sequence["steps"] if isinstance(s, dict)]
-        deduped = _dedupe_consecutive([str(s.get("name")) for s in steps])
-        expected = list(WINDOWS_COM_SEQUENCE)
-        tail = deduped[len(expected):]
-        if deduped[:len(expected)] != expected or tail not in ([], ["daemon-stop"]):
-            reasons.append(f"sequence 步驟順序不符：{deduped}")
-        bad = [s.get("name") for s in steps if "returncode" in s and s.get("returncode") != 0]
-        if bad:
-            reasons.append(f"sequence 步驟 returncode 非 0：{bad}")
+    # 真機 win-blackbox.ps1 寫入 windows-com/sequence.json（format=windows-com-sequence.v1，頂層 result／steps）；
+    # sequence-result.json 只是 wrapper 外層（status／report），此處僅核對其 status 為 PASS。
+    sequence = _read_json_dict(com_dir / "sequence.json")
+    wrapper = _read_json_dict(com_dir / "sequence-result.json")
+    if sequence is None or sequence.get("format") != WINDOWS_COM_SEQUENCE_FORMAT or sequence.get("result") != "PASS":
+        reasons.append("sequence.json 缺漏、format 不符或 result 非 PASS")
     else:
-        reasons.append("sequence-result.json 缺少 steps")
+        if (sequence.get("serialwrap_com"), sequence.get("bridge_com")) != ("COM20", "COM21"):
+            reasons.append(
+                f"serialwrap_com／bridge_com 不符：{sequence.get('serialwrap_com')!r}／{sequence.get('bridge_com')!r}"
+            )
+        if wrapper is None or wrapper.get("status") != "PASS":
+            reasons.append("sequence-result.json 缺漏或 status 非 PASS")
+        if isinstance(sequence.get("steps"), list):
+            steps = [s for s in sequence["steps"] if isinstance(s, dict)]
+            deduped = _dedupe_consecutive([str(s.get("name")) for s in steps])
+            expected = list(WINDOWS_COM_SEQUENCE)
+            tail = deduped[len(expected):]
+            if deduped[:len(expected)] != expected or tail not in ([], ["daemon-stop"]):
+                reasons.append(f"sequence 步驟順序不符：{deduped}")
+            bad = [s.get("name") for s in steps if "returncode" in s and s.get("returncode") != 0]
+            if bad:
+                reasons.append(f"sequence 步驟 returncode 非 0：{bad}")
+        else:
+            reasons.append("sequence.json 缺少 steps")
 
     # wire：DUT 端必須有 dut_stdin_write 的 TX，內容含 `echo hi`。
     wire = com_dir / "bridge" / "wire.ndjson"

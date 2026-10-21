@@ -261,7 +261,15 @@ def _write_windows_com_fixture(out: Path, mode: str) -> None:
     steps = [{"name": "python-daemon-start", "pid": 1}] + [
         {"name": n, "returncode": 0} for n in names[1:]
     ]
-    (com / "sequence-result.json").write_text(json.dumps({"result": "PASS", "steps": steps}), encoding="utf-8")
+    # 依真機 win-blackbox.ps1 的佈局：sequence.json（頂層 result／steps）＋ sequence-result.json（wrapper 的 status／report）。
+    sequence_doc = {
+        "format": "windows-com-sequence.v1", "result": "PASS", "com_pair": "COM20:COM21",
+        "serialwrap_com": "COM20", "bridge_com": "COM21", "steps": steps,
+    }
+    (com / "sequence.json").write_text(json.dumps(sequence_doc), encoding="utf-8")
+    (com / "sequence-result.json").write_text(
+        json.dumps({"status": "PASS", "exit": 0, "report": sequence_doc}), encoding="utf-8"
+    )
     import base64
     rows = [{"dir": "RX", "observation": "dut_stdout_read", "payload_b64": base64.b64encode(b"ok\n").decode()}]
     if mode != "no-wire":
