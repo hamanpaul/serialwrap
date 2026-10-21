@@ -996,23 +996,31 @@ def test_gate_report_reuse_carries_measured_tree(tmp_path):
     # Stage 3 target：runtime 檔與 b 相同 → 沿用成立
     fk = _fe()
     b3 = fk.make_bundle(tmp_path / "b3", stage="3")
+    # make_bundle 只在 stage≠3 時建 py/ 委派樹；複製 b 的 py/，使 b3 的 runtime 檔確實與 b 相同（本案前提）
+    shutil.copytree(b / "py", b3 / "py")
     _ix().set_target(w.idx, stage="3", platform="linux", release_manifest=b3 / "release-manifest.json",
                      contract_revision="c" * 40, tool_revision="t" * 40, case_list_sha256=_sha(CASES_LOCK),
                      set_by="test", now=SET_AT, bundle_dir=b3)
+    # 沿用條件要求 environment_id 等其餘欄位全同；替身 entry 預設用 fakes 的 ENV_DOC，改為與被引用 entry 相同
     reuse = _fe().entry(w.root, "S3-L3-AB-48H-LINUX", "PASS", platform="linux", n=7,
-                        reuse_of=gate_entry.entry_id)
+                        reuse_of=gate_entry.entry_id, environment_id=gate_entry.environment_id)
     _ix().add_entry(w.idx, reuse, catalog=w.cat)
     status, _ = _status(w, "S3-L3-AB-48H-LINUX")
     assert status == "SATISFIED"
 
     # Stage 3 bundle 另加 bin/version.dll（新 artifact、新 target）→ 同一 reuse_of 必須 STALE
     b3x = fk.make_bundle(tmp_path / "b3x", stage="3")
+    shutil.copytree(b / "py", b3x / "py")
     (b3x / "bin" / "version.dll").write_bytes(b"sideloaded-dll")
+    # make_bundle 對同 stage 產出位元組相同的 manifest；改 created_at 使其成為新 artifact（同 manifest 換內容會被 set_target 拒絕）
+    m3x = json.loads((b3x / "release-manifest.json").read_text(encoding="utf-8"))
+    m3x["created_at"] = "2026-10-31T00:00:00+00:00"
+    _write_json(b3x / "release-manifest.json", m3x)
     _ix().set_target(w.idx, stage="3", platform="linux", release_manifest=b3x / "release-manifest.json",
                      contract_revision="c" * 40, tool_revision="t" * 40, case_list_sha256=_sha(CASES_LOCK),
                      set_by="test", now=NOW, bundle_dir=b3x)
     reuse2 = _fe().entry(w.root, "S3-L3-AB-48H-LINUX", "PASS", platform="linux", n=8,
-                         reuse_of=gate_entry.entry_id)
+                         reuse_of=gate_entry.entry_id, environment_id=gate_entry.environment_id)
     _ix().add_entry(w.idx, reuse2, catalog=w.cat)
     status2, reasons2 = _status(w, "S3-L3-AB-48H-LINUX")
     assert status2 == "STALE"
