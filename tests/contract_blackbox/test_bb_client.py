@@ -160,15 +160,9 @@ def test_timeout_negative_exit_1(env):
     assert r.stdout == b""
 
 
-@pytest.mark.xfail(
-    condition=not is_rust(),
-    strict=True,
-    raises=AssertionError,
-    reason="P1 DF-06 前置未合併：Python 基線收到非 JSON 回應仍印 traceback（plan §0.2，P1 合併後移除）",
-)
 @pytest.mark.core_portable
 def test_not_json_is_invalid_response(env, stubd):
-    """daemon 回傳非 JSON 內容時，client 應回報 INVALID_RESPONSE 且 rc 為 2（DF-06 前置）。"""
+    """daemon 回傳非 JSON 內容時，client 應回報 INVALID_RESPONSE 且 rc 為 2（DF-06）。"""
     s = stubd({"default": [{"reply_raw": "not json\n"}]})
     r = run_cli(["--socket", s.endpoint, "session", "list"], env=env)
     assert r.rc == 2

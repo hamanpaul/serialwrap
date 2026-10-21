@@ -617,6 +617,12 @@ def _capability_gated(nodeid: str, cache: dict) -> bool:
     以 AST 判斷，不執行測試；只看 skip 相關呼叫中是否引用 gate 名稱（P2-T13 審查修正：凍結的 Windows 集合不得含能力 SKIP 案例）。
     """
     import ast
+    import re
+
+    # Rust/libtest nodeid 由 cargo_l1_results.py 正規化為 cargo:<crate>::<target>::<test>；
+    # 能力測試以 cap_ 前綴標示，不能把 crate 名當成 Python 測試檔路徑解析。
+    if nodeid.startswith("cargo:"):
+        return bool(re.match(r"^cap_", nodeid.rsplit("::", 1)[-1]))
 
     path, _, rest = nodeid.partition("::")
     parts = [p.split("[", 1)[0] for p in rest.split("::")]
@@ -652,7 +658,20 @@ def _capability_gated(nodeid: str, cache: dict) -> bool:
     for deco in target.decorator_list:
         if _gate_refs(deco) and _has_skip_call(deco):
             return True
-    return bool(_gate_refs(target) and _has_skip_call(target))
+    gate_refs = _gate_refs(target)
+    if gate_refs == {"SW_TEST_COM_PAIR"} and any(
+        (isinstance(deco, ast.Attribute) and deco.attr == "windows_com")
+        or (
+            isinstance(deco, ast.Call)
+            and isinstance(deco.func, ast.Attribute)
+            and deco.func.attr == "windows_com"
+        )
+        for deco in target.decorator_list
+    ):
+        # 必要的原生 COM 案例可在提供凍結 COM 配對的 Windows runner 執行；
+        # windows_com marker 使資源需求明確，並由 runner 的 SW_TEST_COM_PAIR 提供。
+        return False
+    return bool(gate_refs and _has_skip_call(target))
 
 
 @pytest.mark.memory_only

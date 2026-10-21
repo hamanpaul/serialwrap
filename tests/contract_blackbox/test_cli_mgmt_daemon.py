@@ -237,6 +237,7 @@ def test_daemon_restart_ab(tmp_path: Path, env: dict[str, str], no_delegation: P
 
 @pytest.mark.rust_only
 @pytest.mark.windows_native
+@pytest.mark.windows_com
 @pytest.mark.case("sc18-windows-ondemand-autostart")
 def test_autostart_l15_tx_once(tmp_path: Path, env: dict[str, str], no_delegation: Path) -> None:
     """SC-18（原生 Windows）：無 daemon 時 `cmd submit` 經 on-demand 自動啟動，DUT 端 `echo X\\r` 恰出現一次。

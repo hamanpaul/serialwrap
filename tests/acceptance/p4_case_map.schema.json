@@ -1,5 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serialwrap.local/schemas/p4-case-map.schema.json",
   "title": "serialwrap P4 acceptance case map schema",
   "type": "object",
   "additionalProperties": false,

@@ -128,7 +128,6 @@ def test_daemon_prefix_resolution(monkeypatch):
 # P2 Task 13 的 L1 報告 plugin 與獨立執行時的 sessionfinish 斷言；見 plan Task 2 conftest 段落。
 @pytest.mark.core_portable
 @pytest.mark.process_rpc
-@pytest.mark.xfail(strict=True, raises=(AssertionError, pytest.UsageError), reason="P3-T2: 依賴 P2-T13 resource_report_plugin.py（spec §11.3）")
 def test_bb_standalone_writes_l1_report(tmp_path):
     import os
     import subprocess
