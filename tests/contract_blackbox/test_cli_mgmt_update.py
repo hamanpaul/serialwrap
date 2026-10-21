@@ -18,6 +18,7 @@ import pytest
 from bb_harness import isolated_env, repo_root
 from bb_l15 import (
     BridgeTarget,
+    current_release_path,
     daemon_pid,
     finish_test_rig,
     installed_version,
@@ -193,7 +194,7 @@ def test_update_file_push_after_last_probe_l15(tmp_path: Path, env: dict[str, st
     )
     push_thread = None
     old_pid = daemon_pid(env)
-    current_bytes = (root / "bin" / "current-release.json").read_bytes()
+    current_bytes = current_release_path(root).read_bytes()
     try:
         update_thread.start()
         wait_pause(pause_dir, "safety_check")
@@ -210,7 +211,7 @@ def test_update_file_push_after_last_probe_l15(tmp_path: Path, env: dict[str, st
         assert data.get("handoff") == "refused", data
         assert daemon_pid(env) == old_pid
         assert installed_version(env) == "0.4.0"
-        assert (root / "bin" / "current-release.json").read_bytes() == current_bytes
+        assert current_release_path(root).read_bytes() == current_bytes
         assert not any("shutdown" in json.dumps(row, ensure_ascii=False).lower() for row in wal_rows(env))
         push_thread.join(180.0)
         assert not push_thread.is_alive(), "1 MiB file push 未結束"

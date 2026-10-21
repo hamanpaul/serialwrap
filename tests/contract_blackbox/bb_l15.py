@@ -329,9 +329,14 @@ def select_bundle(env: dict[str, str], bundle: Path) -> Path:
     return bundle / "bin" / "serialwrap"
 
 
+def current_release_path(install_root: Path) -> Path:
+    """安裝根的 current-release.json：POSIX 位於安裝根下，Windows 位於 bin\\（與 install_layout.rs 一致）。"""
+    return install_root / "bin" / "current-release.json" if os.name == "nt" else install_root / "current-release.json"
+
+
 def installed_version(env: dict[str, str]) -> str:
     current = json.loads(
-        (Path(env["SERIALWRAP_INSTALL_ROOT"]) / "bin" / "current-release.json").read_text(encoding="utf-8")
+        current_release_path(Path(env["SERIALWRAP_INSTALL_ROOT"])).read_text(encoding="utf-8")
     )
     version = current.get("bundle_version")
     assert isinstance(version, str) and version
@@ -619,7 +624,9 @@ def control_marks(evidence_dir: Path) -> list[dict[str, Any]]:
 def start_file_push(cli: Path, env: dict[str, str], source: Path, remote: str) -> tuple[threading.Thread, list[subprocess.CompletedProcess[str]]]:
     result: list[subprocess.CompletedProcess[str]] = []
     thread = threading.Thread(
-        target=lambda: result.append(run_cli(cli, ["--timeout", "180", "file", "push", "--selector", "COM0", "--local", str(source), "--remote", remote, "--ack-mode", "echo"], env, timeout_s=180.0)),
+        # 橋接 DUT 上 echo ACK 約 1.6 KB/s，1 MiB 需約 640 s，超過 180 s 逾時；本 helper 只用來佔住傳輸中的 session，
+        # 故改 ack-mode none + chunk 4096（實測約 65 KB/s，約 16 s）。逾時與檔案大小不變，斷言由各測試自行判定。
+        target=lambda: result.append(run_cli(cli, ["--timeout", "180", "file", "push", "--selector", "COM0", "--local", str(source), "--remote", remote, "--ack-mode", "none", "--chunk-size", "4096"], env, timeout_s=180.0)),
         daemon=True,
     )
     thread.start()

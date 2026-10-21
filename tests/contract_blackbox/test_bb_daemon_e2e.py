@@ -79,6 +79,12 @@ class DaemonAttachableTarget(FakeTarget):
                     chunk = os.read(self.master_fd, 4096)
                 except OSError:
                     # daemon 尚未開啟或正在重開 slave 時，PTY master 會短暫回 EIO。
+                    # 與 HEAD 版 wrapper 一致：slave 重開視為目標重新開機，回到 LOGIN 狀態，
+                    # 之後的 CLI attach 必須重新登入（否則 target.user 的變更永遠不會被讀到）。
+                    state = "LOGIN"
+                    line_buf.clear()
+                    prev_was_cr = False
+                    self._holding_command = False
                     if self._stop.wait(0.05):
                         break
                     continue
@@ -519,13 +525,15 @@ def test_session_attach_restarts_cleared_session(rig):
     cleared = rig.cli_json(["session", "clear", "--selector", "COM0"])
     assert cleared["session"]["session_id"] == session_id
 
+    # 重新 attach 需等 clear 內建的重試循環（DETACHED→ATTACHING），給予足夠時間。
     not_ready = _poll(
         lambda: (
             row
             if (row := _session_com0(rig)) is not None
             and row["state"] in {"ATTACHED", "DETACHED"}
             else None
-        )
+        ),
+        timeout_s=75,
     )
     assert not_ready["session_id"] == session_id
     assert not_ready["state"] in {"ATTACHED", "DETACHED"}

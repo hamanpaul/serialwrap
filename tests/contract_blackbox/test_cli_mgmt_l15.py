@@ -18,6 +18,7 @@ import pytest
 from bb_harness import cli_prefix
 from bb_l15 import (
     BridgeTarget,
+    current_release_path,
     control_marks,
     daemon_pid,
     installed_version,
@@ -150,7 +151,8 @@ def test_update_busy_l15_zero_tx(tmp_path: Path, env: dict[str, str]) -> None:
         submitted = rpc(env, "command.submit", {"selector": "COM0", "cmd": "hold", "mode": "background", "timeout_s": 120})
         assert submitted.get("ok") is True and isinstance(submitted.get("cmd_id"), str), submitted
         cmd_id = submitted["cmd_id"]
-        wait_wire_contains(bridge.evidence_dir, b"hold\r")
+        # daemon 送出的行尾依平台而異：POSIX 為 LF，Windows 為 CR（與 TX 實際位元組一致）。
+        wait_wire_contains(bridge.evidence_dir, b"hold\n" if os.name != "nt" else b"hold\r")
         tx_before = tx_bytes(bridge.evidence_dir)
 
         result = run_cli(new_cli, ["setup", "--on-demand"], env, timeout_s=120.0)
@@ -185,7 +187,7 @@ def test_update_file_push_after_last_probe_l15(tmp_path: Path, env: dict[str, st
         daemon=True,
     )
     old_pid = daemon_pid(env)
-    current_bytes = (Path(env["SERIALWRAP_INSTALL_ROOT"]) / "bin" / "current-release.json").read_bytes()
+    current_bytes = current_release_path(Path(env["SERIALWRAP_INSTALL_ROOT"])).read_bytes()
     try:
         update_thread.start()
         wait_pause(pause_dir, "safety_check")
@@ -203,7 +205,7 @@ def test_update_file_push_after_last_probe_l15(tmp_path: Path, env: dict[str, st
         assert data.get("handoff") == "refused", data
         assert daemon_pid(env) == old_pid
         assert installed_version(env) == "0.4.0"
-        assert (Path(env["SERIALWRAP_INSTALL_ROOT"]) / "bin" / "current-release.json").read_bytes() == current_bytes
+        assert current_release_path(Path(env["SERIALWRAP_INSTALL_ROOT"])).read_bytes() == current_bytes
         assert not any("shutdown" in json.dumps(row, ensure_ascii=False).lower() for row in wal_rows(env))
         push_thread.join(180.0)
         assert not push_thread.is_alive(), "1 MiB file push 未結束"
