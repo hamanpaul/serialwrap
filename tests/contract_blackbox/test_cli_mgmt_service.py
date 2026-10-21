@@ -60,8 +60,7 @@ def test_service_ab_on_demand(tmp_path: Path, no_delegation: Path) -> None:
         # bool／None key：json.dumps 轉為 "true"／"false"／"null"（sort_keys 依原始 key）。
         ("supervision_mode: {true: 1, false: 2}\n", True),
         ("supervision_mode: {null: 1}\n", True),
-        # 不可序列化（date）與 sort_keys 無法比較的 key：Python 以 traceback 結束（exit 1、stdout 空）；
-        # stderr 只比最後一行（TypeError 訊息）。
+        # 不可序列化（date）與 sort_keys 無法比較的 key：CLI 邊界輸出 INTERNAL_ERROR JSON，stderr 保留錯誤末行。
         ("supervision_mode: 2020-01-01\n", False),
         ("supervision_mode: {1: a, b: c}\n", False),
     ],

@@ -38,11 +38,11 @@ pub fn run_service(ns: &Namespace, ctx: &mut CliCtx) -> i32 {
         // 非字串的 truthy 值：Python 原樣帶入結果的 `mode` 欄位（json.dumps 形狀），監管判定以其 str() 進行（皆落入 NO_SYSTEMD）。
         Some(other) => match yvalue_to_pyvalue(other) {
             Ok(raw) => (py_str_of(other), Some(raw)),
-            // Python：`_print` 的 `json.dumps` 拋 TypeError，traceback 結束（exit 1、stdout 空）。
+            // Python 的 `_print` 例外由 CLI 邊界轉為 INTERNAL_ERROR JSON；回應訊息沿用 TypeError 的內容。
             // 此路徑在 on-demand／未知模式分支，未執行任何監管命令，故無副作用可還原。
             Err(message) => {
-                let _ = ctx.io.err_str(&format!("{message}\n"));
-                return 1;
+                let public_message = message.strip_prefix("TypeError: ").unwrap_or(&message);
+                return output::print_internal_error(&mut ctx.io, &context, public_message);
             }
         },
     };

@@ -177,24 +177,35 @@ fn service_non_string_mode_null_key_matches_python_json() {
 }
 
 #[test]
-fn service_non_string_mode_date_is_typeerror_exit1_without_stdout() {
-    // Python：json.dumps 拋 TypeError，traceback 結束（exit 1、stdout 空）；未執行任何監管命令。
+fn service_non_string_mode_date_reports_internal_error_json() {
+    // Python CLI 邊界會把 json.dumps 的 TypeError 轉為 INTERNAL_ERROR JSON；未執行任何監管命令。
     let t = TestEnv::posix().with_config("supervision_mode: 2020-01-01\n");
     let (rc, out, err) = t.run(&["service", "start"]);
-    assert_eq!((rc, out.as_str()), (1, ""));
-    assert_eq!(err, "TypeError: Object of type date is not JSON serializable\n");
+    assert_eq!(rc, 1);
+    assert_eq!(
+        out,
+        "{\"error_code\":\"INTERNAL_ERROR\",\"message\":\"Object of type date is not JSON serializable\",\"ok\":false}\n"
+    );
+    assert_eq!(
+        err,
+        "serialwrap: service start failed: INTERNAL_ERROR: Object of type date is not JSON serializable\n"
+    );
     assert!(t.calls().is_empty(), "不可序列化時不得呼叫系統指令");
 }
 
 #[test]
-fn service_non_string_mode_mixed_keys_is_typeerror_exit1_without_stdout() {
-    // Python：sort_keys 下 str 與 int key 無法比較（sorted 拋 TypeError）。
+fn service_non_string_mode_mixed_keys_reports_internal_error_json() {
+    // Python CLI 邊界會把 sort_keys 的 TypeError 轉為 INTERNAL_ERROR JSON。
     let t = TestEnv::posix().with_config("supervision_mode: {1: a, b: c}\n");
     let (rc, out, err) = t.run(&["service", "start"]);
-    assert_eq!((rc, out.as_str()), (1, ""));
+    assert_eq!(rc, 1);
+    assert_eq!(
+        out,
+        "{\"error_code\":\"INTERNAL_ERROR\",\"message\":\"'<' not supported between instances of 'str' and 'int'\",\"ok\":false}\n"
+    );
     assert_eq!(
         err,
-        "TypeError: '<' not supported between instances of 'str' and 'int'\n"
+        "serialwrap: service start failed: INTERNAL_ERROR: '<' not supported between instances of 'str' and 'int'\n"
     );
 }
 
