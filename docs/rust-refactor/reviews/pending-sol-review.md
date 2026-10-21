@@ -10,6 +10,7 @@ Codex 帳號額度於 2026-10-21 約 18:28（台北）用完，恢復時間 2026
 | feature/rust-refactor-p9a | 24f42d0 | P9-T7B L1.5 A/B 差分 | Sonnet max | 待補審 |
 | feature/rust-refactor-p9a | d6c08e0 | P9-T7 A/B 絕對契約與差分判定 | Sonnet max | 待補審 |
 | feature/rust-refactor-p9a | 5a038a1 | P9-T14 Stage 0～3 出口證據索引 | Sonnet max | 待補審 |
+| feature/rust-refactor-p9a | cbf40e9 | P9-T15 OD-09 凍結結果的 Stage 3 消費端與唯讀核對 | Sonnet max | 待補審 |
 
 後續新增的單審 commit 一律追加於此表。
 
