@@ -44,6 +44,7 @@ fn platform(
         tunnel: sw_pal::fakes::FakeTunnel::new(false),
         service: sw_pal::fakes::FakeServiceCtl::new(Vec::new()),
         registry: sw_pal::fakes::FakeRegistry::new(Vec::new(), &[]),
+        serial: sw_pal::fakes::serial::FakeSerialBackend::new(),
         caps: ClientCaps {
             path_flavor: PalPathFlavor::Posix,
             af_unix: true,

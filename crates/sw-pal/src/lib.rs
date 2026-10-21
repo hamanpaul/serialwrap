@@ -7,7 +7,10 @@ use std::sync::Arc;
 
 pub mod clock;
 pub mod com0com;
+#[cfg(feature = "test-fakes")]
+pub mod conformance;
 pub mod device_source;
+pub mod device_watcher;
 #[cfg(feature = "test-fakes")]
 pub mod fakes;
 pub mod fs_ops;
@@ -17,10 +20,14 @@ pub mod process;
 pub mod process_tunnel;
 pub mod rpc_transport;
 pub mod select;
+pub mod serial;
 pub mod service_ctl;
 pub mod sysenv;
 pub mod traits;
 
+#[cfg(feature = "test-fakes")]
+pub use conformance::PeerEnd;
+pub use device_watcher::{DeviceWatcher, WatcherHandle};
 pub use osstr::{join_os_pieces, os_string_from_bytes, split_os_str, OsPiece};
 pub use traits::*;
 
@@ -81,6 +88,8 @@ pub struct Platform {
     pub tunnel: Arc<dyn ProcessTunnel>,
     pub service: Arc<dyn ServiceCtl>,
     pub registry: Arc<dyn RegistryView + Sync>,
+    /// 序列埠後端（arch §4.2）：POSIX 為 `PosixSerialBackend`，Windows 為 Task 3 骨架。
+    pub serial: Arc<dyn SerialBackend>,
     pub caps: Capabilities,
 }
 
@@ -117,6 +126,7 @@ pub fn native() -> Platform {
             procs: Arc::new(PosixProcScan::new()),
             tunnel: Arc::new(NativeProcessTunnel),
             registry: Arc::new(NullRegistryView),
+            serial: Arc::new(crate::serial::posix::PosixSerialBackend::new()),
             caps: Capabilities {
                 path_flavor: PalPathFlavor::Posix,
                 af_unix: true,
@@ -158,6 +168,7 @@ pub fn native() -> Platform {
             procs: Arc::new(WindowsProcScan::new()),
             tunnel: Arc::new(NativeProcessTunnel),
             registry: Arc::new(WinRegistryView),
+            serial: Arc::new(crate::serial::WindowsSerialStub),
             caps: Capabilities {
                 path_flavor: PalPathFlavor::Windows,
                 af_unix: false,

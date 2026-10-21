@@ -1,0 +1,596 @@
+//! P5-T19 daemon 行程測試共用支援（`daemon_process.rs`、`restart_after_commit.rs`）。
+//!
+//! 限制（`scripts/rust/check_cfg_boundary.py`）：測試碼不得出現平台 cfg、`std::os` 平台模組與 FFI crate。
+//! POSIX 專用能力一律經 `sw_pal`（RPC 連線、PTY 對端）或外部 POSIX 工具（`chmod`、`id`、`kill`）取得。
+//! PTY 假 DUT 以既有黑箱 `tests/contract_blackbox/bb_faketarget.py` 的 `FakeTarget` 實作（子行程，stdin/stdout 指令協定）。
+#![cfg(feature = "test-fakes")]
+#![allow(dead_code)]
+#![allow(unused_imports)]
+
+use std::collections::BTreeMap;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+use sw_pal::traits::{DeviceInfo, EndpointSpec, SockTimeout};
+use sw_proto::pyjson::{self, PyValue};
+
+pub use sw_daemon::daemon_main::{run_with_hooks, DaemonHooks, TraceEvent};
+
+/// 以 `cargo test` 建置的 daemon 執行檔（`--features test-fakes` 下含測試專用 method）。
+pub const DAEMON_BIN: &str = env!("CARGO_BIN_EXE_serialwrapd");
+pub const PING: &str = r#"{"id":1,"method":"health.ping"}"#;
+pub const STOP: &str = r#"{"id":2,"method":"daemon.stop"}"#;
+pub const SHORT: Duration = Duration::from_secs(10);
+pub const LONG: Duration = Duration::from_secs(30);
+
+/// 目標 COM0 的 by-id 名稱（隔離 by-id 目錄內的 symlink，指向 PTY slave）。
+pub const TARGET_BY_ID: &str = "usb-serialwrap-test-COM0-if00";
+/// 假 DUT 的 prompt（與 `bb_faketarget.FakeTarget` 預設 prompt 一致，profile 的 prompt_regex 對應此值）。
+pub const TARGET_PROMPT: &str = "root@fake:~# ";
+
+/// 隔離環境要「pop」的高優先變數：以空字串覆寫（daemon 端 strip 後為空即視同未設）。
+/// 外層 shell 的同名變數因此無效（與 `tests/conftest.py` 的 pop 規則一致）。
+const POPPED_VARS: [&str; 5] = [
+    "SERIALWRAP_ENDPOINT",
+    "SERIALWRAP_PROFILE_DIR",
+    "SERIALWRAP_TTYMCU_PATH",
+    "SERIALWRAP_EVENTS_LOG_PATH",
+    "SERIALWRAP_DATA_DIR",
+];
+
+static SEQ: AtomicUsize = AtomicUsize::new(0);
+
+fn unique_root() -> PathBuf {
+    let n = SEQ.fetch_add(1, Ordering::SeqCst);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    // Unix socket 路徑上限約 108 bytes，根目錄刻意保持短。
+    let root = std::env::temp_dir().join(format!("sw21-{}-{}-{:x}", std::process::id(), n, nanos));
+    fs::create_dir_all(&root).expect("建立隔離根目錄");
+    root
+}
+
+/// 離開作用域時還原權限（唯讀目錄測試）並刪除整個隔離根目錄。
+struct RootGuard(PathBuf);
+
+impl Drop for RootGuard {
+    fn drop(&mut self) {
+        let _ = Command::new("chmod").arg("-R").arg("u+w").arg(&self.0).status();
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// 隔離實例（OD-11）：9 個目錄變數指向根目錄下的獨立路徑，5 個高優先變數 pop。
+///
+/// `vars` 為 `BTreeMap`，可直接 `Command::envs(&env.vars)`。欄位宣告順序即 Drop 順序：
+/// 先停 PTY 假 DUT，最後才刪根目錄。
+pub struct IsolatedEnv {
+    pub vars: BTreeMap<String, String>,
+    pub root: PathBuf,
+    /// `<run>/serialwrapd.sock`（預設 endpoint）。
+    pub socket: PathBuf,
+    /// `<run>/serialwrapd.lock`。
+    pub lock: PathBuf,
+    pub run_dir: PathBuf,
+    pub state_dir: PathBuf,
+    pub config_dir: PathBuf,
+    pub wal_dir: PathBuf,
+    pub by_id_dir: PathBuf,
+    pub by_path_dir: PathBuf,
+    pub log_dir: PathBuf,
+    pub events_dir: PathBuf,
+    pub events_rt_dir: PathBuf,
+    pub profile_dir: PathBuf,
+    /// 系統設定檔路徑（`SERIALWRAP_TEST_SYSTEM_CONFIG_PATH`；預設不建立）。
+    pub system_config: PathBuf,
+    /// 假 DUT 的 PTY slave 路徑（僅 `isolated_env_with_pty_target` 有值）。
+    pub pty_slave: PathBuf,
+    target: Option<FakeTargetProc>,
+    _root: RootGuard,
+}
+
+/// 建立隔離環境（尚未寫入任何 profile／config）。
+pub fn isolated_env() -> IsolatedEnv {
+    let root = unique_root();
+    let guard = RootGuard(root.clone());
+    let dir = |name: &str| -> PathBuf {
+        let p = root.join(name);
+        fs::create_dir_all(&p).expect("建立隔離目錄");
+        p
+    };
+    let run_dir = dir("run");
+    let state_dir = dir("state");
+    let config_dir = dir("config");
+    let wal_dir = dir("wal");
+    let by_id_dir = dir("by-id");
+    let by_path_dir = dir("by-path");
+    let log_dir = dir("blog");
+    let events_dir = dir("events.d");
+    let events_rt_dir = dir("events-rt");
+    let profile_dir = config_dir.join("profiles");
+    fs::create_dir_all(&profile_dir).expect("建立 profiles 目錄");
+    let home = dir("home");
+    let system_config = root.join("system-config").join("config.yaml");
+
+    let mut vars = BTreeMap::new();
+    let pairs: [(&str, PathBuf); 9] = [
+        ("SERIALWRAP_STATE_DIR", state_dir.clone()),
+        ("SERIALWRAP_RUN_DIR", run_dir.clone()),
+        ("SERIALWRAP_WAL_DIR", wal_dir.clone()),
+        ("SERIALWRAP_CONFIG_DIR", config_dir.clone()),
+        ("SERIALWRAP_LOG_DIR", log_dir.clone()),
+        ("SERIALWRAP_EVENTS_DIR", events_dir.clone()),
+        ("SERIALWRAP_EVENTS_RUNTIME_DIR", events_rt_dir.clone()),
+        ("SERIALWRAP_BY_ID_DIR", by_id_dir.clone()),
+        ("SERIALWRAP_BY_PATH_DIR", by_path_dir.clone()),
+    ];
+    for (key, value) in pairs {
+        vars.insert(key.to_string(), value.display().to_string());
+    }
+    vars.insert(
+        "SERIALWRAP_TEST_SYSTEM_CONFIG_PATH".to_string(),
+        system_config.display().to_string(),
+    );
+    vars.insert("HOME".to_string(), home.display().to_string());
+    vars.insert("XDG_CONFIG_HOME".to_string(), home.join(".config").display().to_string());
+    vars.insert("XDG_STATE_HOME".to_string(), home.join(".state").display().to_string());
+    vars.insert("XDG_DATA_HOME".to_string(), home.join(".data").display().to_string());
+    vars.insert("XDG_RUNTIME_DIR".to_string(), String::new());
+    vars.insert("SW_TEST_USER".to_string(), "root".to_string());
+    vars.insert("SW_TEST_PASS".to_string(), "pw".to_string());
+    for key in POPPED_VARS {
+        vars.insert(key.to_string(), String::new());
+    }
+    // 額外 pop：config 路徑與測試白名單只由個別案例顯式設定。
+    vars.insert("SERIALWRAP_CONFIG".to_string(), String::new());
+    vars.insert("SERIALWRAP_TEST_DEVICE_ALLOWLIST".to_string(), String::new());
+
+    IsolatedEnv {
+        vars,
+        root,
+        socket: run_dir.join("serialwrapd.sock"),
+        lock: run_dir.join("serialwrapd.lock"),
+        run_dir,
+        state_dir,
+        config_dir,
+        wal_dir,
+        by_id_dir,
+        by_path_dir,
+        log_dir,
+        events_dir,
+        events_rt_dir,
+        profile_dir,
+        system_config,
+        pty_slave: PathBuf::new(),
+        target: None,
+        _root: guard,
+    }
+}
+
+/// 隔離環境＋COM0 的 PTY 假 DUT（shell 平台 profile，`root`／`pw`，prompt `root@fake:~# `）。
+pub fn isolated_env_with_pty_target() -> IsolatedEnv {
+    let mut env = isolated_env();
+    write_target_config(&env.config_dir, &env.by_id_dir);
+    let (target, slave) = FakeTargetProc::start(&env.root, &env.by_id_dir, TARGET_BY_ID);
+    env.pty_slave = slave;
+    env.target = Some(target);
+    env
+}
+
+/// 寫入 `config.yaml`：一個 shell profile（`shell-test`）與 COM0 target（device_by_id 指向隔離 by-id 目錄）。
+pub fn write_target_config(config_dir: &Path, by_id_dir: &Path) {
+    let device = by_id_dir.join(TARGET_BY_ID);
+    let yaml = format!(
+        r#"profiles:
+  shell-test:
+    platform: shell
+    prompt_regex: "(?m)^root@fake:~# "
+    login_regex: "(?mi)login:\\s*$"
+    password_regex: "(?mi)password:\\s*$"
+    user_env: "SW_TEST_USER"
+    pass_env: "SW_TEST_PASS"
+    ready_probe: "echo __READY__${{nonce}}"
+    timeout_s: 15
+targets:
+  - com: COM0
+    profile: shell-test
+    device_by_id: "{}"
+"#,
+        device.display()
+    );
+    fs::write(config_dir.join("config.yaml"), yaml).expect("寫入 config.yaml");
+}
+
+impl IsolatedEnv {
+    /// 假 DUT 收到的全部位元組（自 PTY 假 DUT 啟動至今）。
+    pub fn target_rx(&mut self) -> Vec<u8> {
+        self.target
+            .as_mut()
+            .expect("無 PTY 假 DUT：請改用 isolated_env_with_pty_target()")
+            .rx_bytes()
+    }
+
+    /// 讓假 DUT 不再回 prompt（DUT 靜默）。
+    pub fn target_mute(&mut self) {
+        self.target
+            .as_mut()
+            .expect("無 PTY 假 DUT：請改用 isolated_env_with_pty_target()")
+            .mute();
+    }
+}
+
+/// PTY 假 DUT 子行程（以 `bb_faketarget.FakeTarget` 驅動；協定：stdin 一行一指令，stdout 一行一回應）。
+///
+/// 指令：`RX`（回 `RX <hex>`，假 DUT 收到的全部位元組）、`MUTE`（改 prompt 為不可匹配字串，回 `OK`）、`EXIT`。
+/// `MUTE` 為暫時手段：Task 15a 的 `FakeTarget.pause_responding` 落地後改用之。
+pub struct FakeTargetProc {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+const RUNNER_PY: &str = r#"
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from bb_faketarget import FakeTarget
+ft = FakeTarget(Path(sys.argv[2]))
+ft.start(Path(sys.argv[3]), sys.argv[4])
+print("READY " + ft.slave_path, flush=True)
+for raw in sys.stdin:
+    cmd = raw.strip()
+    if cmd == "RX":
+        print("RX " + ft.rx_log(timeout_s=0.5).hex(), flush=True)
+    elif cmd == "MUTE":
+        ft.prompt = "muted-dut> "
+        print("OK", flush=True)
+    elif cmd == "EXIT":
+        break
+ft.stop()
+"#;
+
+impl FakeTargetProc {
+    fn start(workdir: &Path, by_id_dir: &Path, name: &str) -> (FakeTargetProc, PathBuf) {
+        let lib = std::env::current_dir()
+            .expect("測試 cwd")
+            .join("../../tests/contract_blackbox");
+        let mut child = Command::new("python3")
+            .arg("-I")
+            .arg("-c")
+            .arg(RUNNER_PY)
+            .arg(&lib)
+            .arg(workdir)
+            .arg(by_id_dir)
+            .arg(name)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("啟動 PTY 假 DUT（python3）");
+        let stdin = child.stdin.take().expect("假 DUT stdin");
+        let mut stdout = BufReader::new(child.stdout.take().expect("假 DUT stdout"));
+        let mut line = String::new();
+        stdout.read_line(&mut line).expect("讀取假 DUT 就緒行");
+        let slave = line
+            .strip_prefix("READY ")
+            .unwrap_or_else(|| panic!("假 DUT 未就緒：{line:?}"))
+            .trim()
+            .to_string();
+        (FakeTargetProc { child, stdin, stdout }, PathBuf::from(slave))
+    }
+
+    fn send(&mut self, cmd: &str) -> String {
+        writeln!(self.stdin, "{cmd}").expect("送出假 DUT 指令");
+        self.stdin.flush().ok();
+        let mut line = String::new();
+        self.stdout.read_line(&mut line).expect("讀取假 DUT 回應");
+        line.trim_end().to_string()
+    }
+
+    fn rx_bytes(&mut self) -> Vec<u8> {
+        let reply = self.send("RX");
+        decode_hex(reply.strip_prefix("RX ").unwrap_or(""))
+    }
+
+    fn mute(&mut self) {
+        assert_eq!(self.send("MUTE"), "OK", "假 DUT MUTE 失敗");
+    }
+}
+
+impl Drop for FakeTargetProc {
+    fn drop(&mut self) {
+        let _ = writeln!(self.stdin, "EXIT");
+        let _ = self.stdin.flush();
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn decode_hex(s: &str) -> Vec<u8> {
+    s.as_bytes()
+        .chunks(2)
+        .filter(|c| c.len() == 2)
+        .map(|c| u8::from_str_radix(std::str::from_utf8(c).expect("hex 字元"), 16).expect("hex 位元組"))
+        .collect()
+}
+
+/// 由測試啟動的 daemon 行程；stdout 丟棄，stderr 寫入隔離根目錄檔案（可於執行中讀取）。
+pub struct DaemonProc {
+    child: Child,
+    stderr_path: PathBuf,
+}
+
+impl DaemonProc {
+    pub fn spawn(env: &IsolatedEnv, args: &[&str]) -> DaemonProc {
+        Self::spawn_with(env, &env.vars, args)
+    }
+
+    pub fn spawn_with(env: &IsolatedEnv, vars: &BTreeMap<String, String>, args: &[&str]) -> DaemonProc {
+        let n = SEQ.fetch_add(1, Ordering::SeqCst);
+        let stderr_path = env.root.join(format!("daemon-{n}.stderr"));
+        let file = File::create(&stderr_path).expect("建立 stderr 檔");
+        let child = Command::new(DAEMON_BIN)
+            .args(args)
+            .envs(vars)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(file))
+            .spawn()
+            .expect("啟動 serialwrapd");
+        DaemonProc { child, stderr_path }
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub fn stderr(&self) -> String {
+        fs::read_to_string(&self.stderr_path).unwrap_or_default()
+    }
+
+    /// 輪詢等待 stderr 出現指定片段（daemon 仍在執行時亦可用）。
+    pub fn wait_stderr_contains(&self, needle: &str, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let text = self.stderr();
+            if text.contains(needle) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!("stderr 在 {timeout:?} 內未出現 {needle:?}：{text:?}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// 等待行程結束；逾時 panic（不留下殘留行程：Drop 會 kill）。
+    pub fn wait(&mut self, timeout: Duration) -> ExitStatus {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait().expect("try_wait") {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                panic!("serialwrapd 未在 {timeout:?} 內結束");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+impl Drop for DaemonProc {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// 一次性執行結果（exit code 與完整 stderr）。
+pub struct Output {
+    pub code: Option<i32>,
+    pub stderr: String,
+}
+
+/// 以 `vars` 啟動 daemon（`args` 原樣）並等待其結束。
+pub fn run_to_exit(env: &IsolatedEnv, vars: &BTreeMap<String, String>, args: &[&str]) -> Output {
+    let mut d = DaemonProc::spawn_with(env, vars, args);
+    let status = d.wait(LONG);
+    Output {
+        code: status.code(),
+        stderr: d.stderr(),
+    }
+}
+
+/// 以測試執行檔自身重新啟動一個測試函式（子行程模式）。子行程以環境變數 `S21_CHILD=<mode>` 辨識，
+/// 並在測試函式內呼叫 in-process 的 `run_with_hooks` 後以其 exit code 結束。
+pub fn run_child_test(test_name: &str, mode: &str, env: &IsolatedEnv) -> Output {
+    let exe = std::env::current_exe().expect("測試執行檔路徑");
+    let out = Command::new(exe)
+        .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+        .envs(&env.vars)
+        .env("S21_CHILD", mode)
+        .stdin(Stdio::null())
+        .output()
+        .expect("啟動子行程測試");
+    Output {
+        code: out.status.code(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
+/// 送一行 NDJSON 請求並取回第一行回應；連線失敗、對端斷線或未收到回應時回傳空字串。
+pub fn rpc_once(socket: &Path, line: &str) -> String {
+    let platform = sw_pal::native();
+    let endpoint = EndpointSpec::Unix(socket.as_os_str().to_owned());
+    let mut stream = match platform
+        .rpc
+        .connect(&endpoint, SockTimeout::Blocking(Duration::from_secs(20)))
+    {
+        Ok(s) => s,
+        Err(_) => return String::new(),
+    };
+    let mut request = line.as_bytes().to_vec();
+    request.push(b'\n');
+    if stream.send_all(&request).is_err() {
+        return String::new();
+    }
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !out.contains(&b'\n') {
+        match stream.recv(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+        }
+    }
+    String::from_utf8_lossy(&out).lines().next().unwrap_or("").to_string()
+}
+
+/// `{"id":1,"method":…,"params":…}` 的便利包裝；回應解析為 `PyValue`（失敗時為 `Null`）。
+pub fn rpc_value(socket: &Path, method: &str, params: &str) -> PyValue {
+    let line = format!(r#"{{"id":1,"method":"{method}","params":{params}}}"#);
+    pyjson::loads(&rpc_once(socket, &line)).unwrap_or(PyValue::Null)
+}
+
+/// 輪詢直到 `health.ping` 回 `ok:true`；逾時 panic。
+pub fn wait_socket(socket: &Path, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if rpc_value(socket, "health.ping", "{}")["ok"] == true {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("daemon 未在 {timeout:?} 內就緒：{}", socket.display());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// `session.get_state` 的 `session` 物件（找不到時為 `Null`）。
+pub fn get_state(socket: &Path, com: &str) -> PyValue {
+    rpc_value(socket, "session.get_state", &format!(r#"{{"selector":"{com}"}}"#))["session"].clone()
+}
+
+/// 輪詢直到 COM 進入 READY；逾時 panic（需要 PTY 假 DUT 與 shell 登入）。
+pub fn wait_ready(env: &IsolatedEnv, com: &str) {
+    let deadline = Instant::now() + LONG;
+    loop {
+        let state = get_state(&env.socket, com);
+        if state["state"] == "READY" {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("{com} 未在 30 s 內進入 READY，最後狀態：{:?}", state["state"]);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// `health.status` 回應（`wal.healthy`、`test_device_allowlist` 等欄位）。
+pub fn health_status(socket: &Path) -> PyValue {
+    rpc_value(socket, "health.status", "{}")
+}
+
+/// `command.get` 的 `command` 物件（找不到時為 `Null`）。
+pub fn command_get(socket: &Path, cmd_id: &str) -> PyValue {
+    rpc_value(socket, "command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#))["command"].clone()
+}
+
+/// 以 `session.list` 取得全部 session（依 session_id 排序）。
+pub fn session_list(socket: &Path) -> PyValue {
+    rpc_value(socket, "session.list", "{}")["sessions"].clone()
+}
+
+/// 以 `command.submit` 送出命令（selector 為 COM；命令字串放在 `cmd`，對應 inventory §6.2 的參數鏈）。
+pub fn submit(socket: &Path, selector: &str, command: &str) -> PyValue {
+    rpc_value(
+        socket,
+        "command.submit",
+        &format!(r#"{{"selector":"{selector}","cmd":"{command}"}}"#),
+    )
+}
+
+/// 確認 PTY slave 可被獨占以外的方式（一般 `open(O_RDWR)`）開啟：TIOCEXCL 已解除時成功。
+pub fn pty_can_open_exclusively(path: &Path) -> bool {
+    fs::OpenOptions::new().read(true).write(true).open(path).is_ok()
+}
+
+/// 目前是否為 root（root 下 chmod 無效，唯讀類案例須 skip 並列為證據不足）。
+pub fn is_root() -> bool {
+    Command::new("id")
+        .arg("-u")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
+        .unwrap_or(false)
+}
+
+pub fn chmod(path: &Path, mode: &str) {
+    let status = Command::new("chmod")
+        .arg(mode)
+        .arg(path)
+        .status()
+        .expect("執行 chmod");
+    assert!(status.success(), "chmod {mode} {} 失敗", path.display());
+}
+
+/// in-process 測試用的平台夾具種類（僅列出尚未接線的需求，見 `in_process_platform`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fixture {
+    /// 無額外腳本（只需裝置掃描）。
+    None,
+    /// READY 的 shell 目標；前景命令 BlockUntilCancel，另有排隊命令。
+    ReadyShellBlockingWithQueue,
+    /// READY 的 shell 目標；session writer 以 BlockForever 卡住（drain 收斂不了）。
+    BlockForeverWriter,
+    /// WAL sync 每次失敗（FakeWalFs 故障注入）。
+    WalSyncFailure,
+}
+
+/// 建立 in-process 測試用的 `sw_pal::Platform`：環境變數取自 `vars`（不改動行程環境）、裝置來源為 `devices`、夾具為 `fixture`。
+///
+/// 紅燈狀態：`sw_pal::Platform` 尚無 DeviceSource 注入點（P5-T5 `devices` 工廠）與 FakeEnv 注入，
+/// 且 `FakeDeviceSource`（P5-T1）、READY shell 腳本、FakeWalFs 故障（P5-T7／T12）仍為 stub。
+/// 實作者於接線後以真實替身取代此 `unimplemented!`，並保持呼叫端簽章不變。
+pub fn in_process_platform(
+    vars: &BTreeMap<String, String>,
+    devices: Vec<(String, DeviceInfo)>,
+    fixture: Fixture,
+) -> sw_pal::Platform {
+    let _ = (vars, devices, fixture);
+    unimplemented!("slice21 T19 red: in-process 假平台（FakeDeviceSource 注入、FakeEnv、夾具）尚未接線")
+}
+
+/// 子行程模式：`restart_after_commit` 的 state.json 提交後中止（hook 於 `StateStore` commit 成功後觸發 abort）。
+pub fn child_daemon_abort_after_commit() {
+    let hooks = DaemonHooks {
+        before_state_commit: None,
+        after_state_commit: Some(Box::new(|| std::process::abort())),
+        trace: None,
+    };
+    let code = run_with_hooks(vec!["serialwrapd".to_string()], sw_pal::native(), hooks);
+    std::process::exit(code)
+}
+
+/// 子行程模式：`state.json` 提交前中止（hook 於 commit 前觸發 abort）。
+pub fn child_daemon_abort_before_commit() {
+    let hooks = DaemonHooks {
+        before_state_commit: Some(Box::new(|| std::process::abort())),
+        after_state_commit: None,
+        trace: None,
+    };
+    let code = run_with_hooks(vec!["serialwrapd".to_string()], sw_pal::native(), hooks);
+    std::process::exit(code)
+}
+
+/// 子行程模式取得目前行程的環境變數（即父行程以 `run_child_test` 注入的隔離 vars）。
+pub fn process_vars() -> BTreeMap<String, String> {
+    std::env::vars().collect()
+}

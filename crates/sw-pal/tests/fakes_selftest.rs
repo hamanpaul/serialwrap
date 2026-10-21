@@ -1,5 +1,20 @@
-//! sw-pal 記憶體替身自測（P4-T1）。
+//! sw-pal 記憶體替身自測（P4-T1）；Slice 2.1 Task 1 追加 FakeClock／FakeSerial／FakeWalFs／MemStream 自測。
+#![cfg(feature = "test-fakes")]
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 use sw_pal::fakes::*;
+use sw_pal::fakes::clock::FakeClock;
+use sw_pal::fakes::mem_stream::MemStream;
+use sw_pal::fakes::serial::{FakeSerialBackend, FakeWriteStep};
+use sw_pal::fakes::wal_fs::FakeWalFs;
+use sw_pal::{
+    CancelToken, Clock, DevicePath, HolderReport, HolderScanStatus, OpenError, PalError,
+    PalErrorKind, ReadOutcome, SerialBackend, SerialConfig, SubmitGate,
+    SubmitRevoked, SubmitStep, TxOutcome, WalFs,
+};
 use sw_pal::SysEnv;
 
 #[test]
@@ -38,4 +53,361 @@ fn fake_platform_unconfigured_component_panics_not_real_os() {
 #[test]
 fn p3_alias_still_compiles() {
     let _: fn() -> sw_pal::ClientPlatform = sw_pal::native_client;
+}
+
+// ---------------------------------------------------------------------------
+// Slice 2.1 Task 1：PAL test-fakes（FakeClock／FakeSerialBackend／FakeWalFs／MemStream）自測。
+// 紅燈階段：替身行為尚未實作，以下測試應於執行期因 `unimplemented!`（slice21 T1 ...）失敗。
+// ---------------------------------------------------------------------------
+
+const TTY: &str = "/dev/ttyFAKE0";
+const WAL: &str = "/wal/raw.wal.ndjson";
+const IO_ERR: &str = "[Errno 5] Input/output error";
+const NOSPC: &str = "[Errno 28] No space left on device";
+
+fn cfg() -> SerialConfig {
+    SerialConfig::from_uart_profile(115200, 8, "N", 1, "none", false)
+}
+
+fn dev_path() -> DevicePath {
+    DevicePath(TTY.into())
+}
+
+/// 永遠撤銷的 gate（R0-F1）：`os_submit` 不得被呼叫。
+struct RevokeAll;
+
+impl SubmitGate for RevokeAll {
+    fn submit(
+        &self,
+        _os_submit: &mut dyn FnMut() -> SubmitStep,
+    ) -> Result<SubmitStep, SubmitRevoked> {
+        Err(SubmitRevoked)
+    }
+}
+
+/// 第一次放行 `os_submit`，之後撤銷（R0-F1 尾段停止測試）。
+struct AcceptFirstThenRevoke(AtomicUsize);
+
+impl SubmitGate for AcceptFirstThenRevoke {
+    fn submit(
+        &self,
+        os_submit: &mut dyn FnMut() -> SubmitStep,
+    ) -> Result<SubmitStep, SubmitRevoked> {
+        if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+            Ok(os_submit())
+        } else {
+            Err(SubmitRevoked)
+        }
+    }
+}
+
+#[test]
+fn partial_write_then_error_reports_confirmed_bytes_only() {
+    let be = FakeSerialBackend::new();
+    let dev = be.add_device(TTY);
+    dev.script_write(vec![FakeWriteStep::AcceptThenError(
+        3,
+        PalError::io(5, IO_ERR),
+    )]);
+    let h = be.open_exclusive(&dev_path(), &cfg()).unwrap();
+    let (_r, mut w, waker, _close) = h.split();
+    let res = w.write(b"0123456789", &CancelToken::new(waker));
+    assert_eq!(res.outcome, TxOutcome::Completed(3));
+    assert!(res.error.is_some());
+    assert_eq!(dev.take_tx(), b"012");
+}
+
+#[test]
+fn block_until_cancel_returns_bytes_before_cancel() {
+    let be = FakeSerialBackend::new();
+    let dev = be.add_device(TTY);
+    dev.script_write(vec![FakeWriteStep::BlockUntilCancel {
+        accept_before_cancel: 4,
+    }]);
+    let h = be.open_exclusive(&dev_path(), &cfg()).unwrap();
+    let (_r, mut w, waker, _close) = h.split();
+    let tok = CancelToken::new(waker);
+    let t2 = tok.clone();
+    let j = thread::spawn(move || w.write(b"abcdefgh", &t2));
+    thread::sleep(Duration::from_millis(20));
+    tok.cancel();
+    let res = j.join().unwrap();
+    assert_eq!(res.outcome, TxOutcome::Completed(4));
+    assert_eq!(res.error.unwrap().kind, PalErrorKind::Cancelled);
+}
+
+#[test]
+fn second_open_while_held_is_held_with_unknown_holder() {
+    let be = FakeSerialBackend::new();
+    be.add_device(TTY);
+    let _h = be.open_exclusive(&dev_path(), &cfg()).unwrap();
+    match be.open_exclusive(&dev_path(), &cfg()) {
+        Err(OpenError::Held(rep)) => {
+            assert!(rep.pids.is_empty());
+            assert!(rep.holder_unknown);
+        }
+        Err(other) => panic!("expected Held, got {other:?}"),
+        Ok(_) => panic!("expected Held, got an open handle"),
+    }
+}
+
+#[test]
+fn close_requires_reader_and_writer_and_counts_once() {
+    let be = FakeSerialBackend::new();
+    let dev = be.add_device(TTY);
+    let h = be.open_exclusive(&dev_path(), &cfg()).unwrap();
+    let (r, w, _waker, close) = h.split();
+    let rc = close.close(r, w);
+    // fake 不模擬殘留獨占旗標；殘留情境由 Task 2 原生 PTY 測試驗證（R0-F3）。
+    assert!(rc.closed && rc.excl_cleared && rc.error.is_none());
+    assert_eq!(
+        (dev.open_count(), dev.close_count(), dev.is_open()),
+        (1, 1, false)
+    );
+}
+
+#[test]
+fn fake_clock_sleep_wakes_on_advance_and_wall_jump_keeps_mono() {
+    let c = FakeClock::at(1_000, 1_760_000_000_000_000);
+    let c2: Arc<dyn Clock> = c.clone();
+    let j = thread::spawn(move || {
+        c2.sleep(Duration::from_millis(500));
+        c2.mono_ns()
+    });
+    thread::sleep(Duration::from_millis(10));
+    c.set_wall_us(1_759_996_400_000_000);
+    c.advance(Duration::from_millis(500));
+    assert_eq!(j.join().unwrap(), 1_000 + 500_000_000);
+}
+
+#[test]
+fn unknown_step_reports_unknown() {
+    let be = FakeSerialBackend::new();
+    let dev = be.add_device(TTY);
+    dev.script_write(vec![FakeWriteStep::Unknown {
+        confirmed: 0,
+        error: PalError::io(5, IO_ERR),
+    }]);
+    let h = be.open_exclusive(&dev_path(), &cfg()).unwrap();
+    let (_r, mut w, waker, _close) = h.split();
+    let res = w.write(b"abc", &CancelToken::new(waker));
+    assert_eq!(res.outcome, TxOutcome::Unknown { confirmed: 0 });
+    assert!(dev.take_tx().is_empty());
+}
+
+#[test]
+fn deny_access_maps_to_access_denied() {
+    let be = FakeSerialBackend::new();
+    be.add_device(TTY);
+    be.deny_access(TTY);
+    match be.open_exclusive(&dev_path(), &cfg()) {
+        Err(OpenError::AccessDenied { holder, .. }) => assert_eq!(
+            holder,
+            HolderReport {
+                pids: vec![],
+                holder_unknown: true,
+                status: HolderScanStatus::Unsupported,
+            }
+        ),
+        Err(other) => panic!("expected AccessDenied, got {other:?}"),
+        Ok(_) => panic!("expected AccessDenied, got an open handle"),
+    }
+}
+
+#[test]
+fn removed_device_read_errors() {
+    let be = FakeSerialBackend::new();
+    be.add_device(TTY);
+    let h = be.open_exclusive(&dev_path(), &cfg()).unwrap();
+    let (mut r, _w, _waker, _close) = h.split();
+    be.remove_device(TTY);
+    let mut buf = [0u8; 16];
+    match r.read(&mut buf, Some(Duration::from_millis(200))) {
+        Err(e) => assert_eq!(e.py_message, IO_ERR),
+        Ok(out) => panic!("expected read error after remove_device, got {out:?}"),
+    }
+}
+
+#[test]
+fn reader_woken_by_waker() {
+    let be = FakeSerialBackend::new();
+    be.add_device(TTY);
+    let h = be.open_exclusive(&dev_path(), &cfg()).unwrap();
+    let (mut r, _w, waker, _close) = h.split();
+    let w2 = Arc::clone(&waker);
+    let j = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(20));
+        w2.wake();
+    });
+    let mut buf = [0u8; 8];
+    let out = r.read(&mut buf, Some(Duration::from_secs(1)));
+    j.join().unwrap();
+    assert_eq!(out.unwrap(), ReadOutcome::Woken);
+}
+
+#[test]
+fn fail_close_reports_error() {
+    let be = FakeSerialBackend::new();
+    let dev = be.add_device(TTY);
+    let h = be.open_exclusive(&dev_path(), &cfg()).unwrap();
+    let (r, w, _waker, close) = h.split();
+    dev.fail_close(PalError::io(5, IO_ERR));
+    let rc = close.close(r, w);
+    assert!(!rc.closed && !rc.excl_cleared && rc.error.is_some());
+}
+
+#[test]
+fn wal_fs_external_unlink_keeps_handle() {
+    let fs = FakeWalFs::new();
+    let p = Path::new(WAL);
+    let file = fs.open_append(p).unwrap();
+    fs.external_unlink(p);
+    assert_eq!(file.unlinked(), Ok(true));
+    assert_eq!(fs.path_identity(p), Ok(None));
+}
+
+#[test]
+fn wal_fs_pending_delete_with_external_reader() {
+    let fs = FakeWalFs::new();
+    let p = Path::new(WAL);
+    let file = fs.open_append(p).unwrap();
+    let old = file.identity().unwrap();
+    let ext = fs.hold_external_reader(p);
+    fs.external_unlink(p);
+    assert_eq!(fs.path_identity(p), Ok(Some(old)));
+    match fs.open_append(p) {
+        Err(e) => assert_eq!(e.kind, PalErrorKind::AccessDenied),
+        Ok(_) => panic!("open_append must be denied while pending-delete"),
+    }
+    drop(ext);
+    assert!(fs.open_append(p).is_ok());
+}
+
+#[test]
+fn wal_fs_partial_write_reports_sent_and_keeps_prefix() {
+    let fs = FakeWalFs::new();
+    let p = Path::new(WAL);
+    let mut file = fs.open_append(p).unwrap();
+    fs.fail_next_write_partial(p, 4, PalError::io(28, NOSPC));
+    let e = file.write_all_flush(b"abcdefgh\n").unwrap_err();
+    assert_eq!(e.sent, 4);
+    assert_eq!(e.error.py_message, NOSPC);
+    assert_eq!(fs.contents(p), Some(b"abcd".to_vec()));
+    file.write_all_flush(b"efgh\n").unwrap();
+    assert_eq!(fs.contents(p), Some(b"abcdefgh\n".to_vec()));
+    assert_eq!(
+        fs.write_calls(p),
+        vec![b"abcdefgh\n".to_vec(), b"efgh\n".to_vec()]
+    );
+    fs.fail_next_writes(p, 1, PalError::io(28, NOSPC));
+    let e2 = file.write_all_flush(b"ijkl\n").unwrap_err();
+    assert_eq!(e2.sent, 0);
+    assert_eq!(fs.contents(p), Some(b"abcdefgh\n".to_vec()));
+}
+
+#[test]
+fn mem_stream_roundtrip() {
+    use std::io::{Read, Write};
+    let (mut a, mut b) = MemStream::pair();
+    a.write_all(b"x\n").unwrap();
+    let mut buf = [0u8; 2];
+    b.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, b"x\n");
+    a.close_write();
+    let mut rest = [0u8; 8];
+    assert_eq!(b.read(&mut rest).unwrap(), 0);
+}
+
+#[test]
+fn on_tx_reply_pushes_rx_once() {
+    let be = FakeSerialBackend::new();
+    let dev = be.add_device(TTY);
+    dev.on_tx_reply(b"echo hi\n", b"hi\r\n# ");
+    let h = be.open_exclusive(&dev_path(), &cfg()).unwrap();
+    let (mut r, mut w, waker, _close) = h.split();
+    let tok = CancelToken::new(waker);
+    w.write(b"echo hi\n", &tok);
+    let mut buf = [0u8; 64];
+    match r.read(&mut buf, Some(Duration::from_secs(1))) {
+        Ok(ReadOutcome::Data(n)) => assert_eq!(&buf[..n], b"hi\r\n# "),
+        other => panic!("expected reply bytes, got {other:?}"),
+    }
+    w.write(b"echo hi\n", &tok);
+    assert_eq!(
+        r.read(&mut buf, Some(Duration::from_millis(100))),
+        Ok(ReadOutcome::TimedOut)
+    );
+}
+
+#[test]
+fn on_tx_match_echoes_nonce() {
+    let be = FakeSerialBackend::new();
+    let dev = be.add_device(TTY);
+    dev.on_tx_match(
+        r"^echo __READY__([0-9a-f]{8})$",
+        Box::new(|line: &[u8]| {
+            let text = String::from_utf8_lossy(line);
+            let nonce = text
+                .trim_end()
+                .trim_start_matches("echo __READY__")
+                .to_string();
+            format!("__READY__{nonce}\r\n# ").into_bytes()
+        }),
+    );
+    let h = be.open_exclusive(&dev_path(), &cfg()).unwrap();
+    let (mut r, mut w, waker, _close) = h.split();
+    let tok = CancelToken::new(waker);
+    w.write(b"echo __READY__ab12cd34\n", &tok);
+    let mut buf = [0u8; 128];
+    match r.read(&mut buf, Some(Duration::from_secs(1))) {
+        Ok(ReadOutcome::Data(n)) => {
+            let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+            assert!(text.contains("__READY__ab12cd34"), "reply was {text:?}");
+        }
+        other => panic!("expected reply, got {other:?}"),
+    }
+}
+
+#[test]
+fn fake_clock_subscribe_notified_on_advance() {
+    let c = FakeClock::new();
+    let rx = c.subscribe();
+    c.advance(Duration::from_millis(1));
+    assert!(rx.recv_timeout(Duration::from_millis(100)).is_ok());
+}
+
+#[test]
+fn fake_writer_revoking_gate_never_submits() {
+    let be = FakeSerialBackend::new();
+    let dev = be.add_device(TTY);
+    let h = be.open_exclusive(&dev_path(), &cfg()).unwrap();
+    let (_r, mut w, waker, _close) = h.split();
+    let tok = CancelToken::new(waker);
+    let res = w.write_gated(b"abc", &tok, &RevokeAll);
+    assert_eq!(res.outcome, TxOutcome::NotSubmitted);
+    assert!(res.error.is_none());
+    assert_eq!(dev.os_submits(), 0);
+    assert!(dev.take_tx().is_empty());
+    assert_eq!(dev.write_calls(), 1);
+}
+
+#[test]
+fn fake_revoke_after_partial_stops_tail() {
+    let be = FakeSerialBackend::new();
+    let dev = be.add_device(TTY);
+    dev.script_write(vec![FakeWriteStep::AcceptThenWouldBlock(2)]);
+    let h = be.open_exclusive(&dev_path(), &cfg()).unwrap();
+    let (_r, mut w, waker, _close) = h.split();
+    let tok = CancelToken::new(waker);
+    let j = thread::spawn(move || {
+        let gate = AcceptFirstThenRevoke(AtomicUsize::new(0));
+        w.write_gated(b"abcdef", &tok, &gate)
+    });
+    assert!(dev.wait_paused(Duration::from_secs(5)));
+    dev.release_pause();
+    let res = j.join().unwrap();
+    assert_eq!(res.outcome, TxOutcome::Completed(2));
+    assert_eq!(res.error.unwrap().kind, PalErrorKind::Cancelled);
+    assert_eq!(dev.take_tx(), b"ab");
+    assert_eq!(dev.os_submits(), 1);
 }

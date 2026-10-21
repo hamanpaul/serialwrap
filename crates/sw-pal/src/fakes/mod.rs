@@ -5,20 +5,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub mod clock;
+pub mod device;
 pub mod env;
 pub mod fs;
+pub mod mem_stream;
 pub mod platform;
 pub mod proc;
 pub mod process;
 pub mod realfs;
 pub mod registry;
 pub mod rpc;
+pub mod serial;
 pub mod service;
 pub mod sysenv;
 pub mod tunnel;
+pub mod wal_fs;
 
 // 測試以 `sw_pal::fakes::<Type>` 直接引用（計畫 Task 1／9／13 的 import 路徑）。
 pub use clock::FakeClock;
+pub use device::{FakeDeviceScript, FakeDeviceSource};
 pub use env::FakeEnv;
 pub use fs::{FaultFs, MemFs};
 pub use platform::{platform, posix_caps, windows_caps, FakePlatformBuilder};
@@ -62,6 +67,7 @@ pub fn fake_platform(
         tunnel: tunnel::FakeTunnel::new(false),
         service: service::FakeServiceCtl::new(Vec::new()),
         registry: registry::FakeRegistry::new(Vec::new(), &[]),
+        serial: serial::FakeSerialBackend::new(),
         caps: platform::posix_caps(),
     };
     (platform, connector, clock)

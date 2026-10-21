@@ -1,0 +1,352 @@
+"""Slice 2.1 出口 gate 判定器（scripts/rust/slice21_gate_judge.py）負向測試（P5-T22，紅燈）。
+
+對應計畫 Task 22 Step 1 的判定表。判定器為純函式，測試以記憶體內假報告驅動，
+L1 完整性判定重用 P2 唯一實作 `tests/acceptance/l1_judge.py`（不得另寫）。
+
+本檔約定的判定器介面（實作必須與之相容；計畫只給出 `judge(report, expect)` 名稱）：
+- `judge(report, expect) -> dict`，回傳含 `verdict`、`sections`（每列含 `name`、`status`、
+  `l1_verdict`）與 `case_uptake`（含 `valid_pass`、`denominator`、`rate`、`pass_case_ids`）。
+- `report`：schema 形狀，至少含 `identity`（必填欄位依 schema）與 `sections`；
+  section 的 `status`、`l1_verdict` 輸入值由判定器重新計算，不得沿用輸入。
+- `expect`：
+  - `lock`：`tests/acceptance/l1_required.lock.json` 形狀；必要集合以
+    `l1_judge.required_for(lock, required_set, platform)` 取得，缺集合 → EVIDENCE_MISSING。
+  - `base_dir`：`section.l1_results` 相對路徑的解析根；檔案缺失 → EVIDENCE_MISSING。
+  - `freeze`：Task 0b `tests/acceptance/breaker/slice_2.1.json` 形狀（`denominator`、`required_case_ids`）。
+  - `case_verdicts`：case_id → gate 判定（只有 `PASS` 計入 valid_pass）。
+  - `daemon_path`：可為 None；有值時與 `identity.daemon_sha256` 比對。
+
+紅燈原因：`scripts/rust/slice21_gate_judge.py` 尚不存在，載入即 FileNotFoundError。
+`test_case_uptake_from_valid_pass_only` 另依賴 Task 0b 產物 `slice_2.1.json`，缺檔時亦屬前置缺失。
+"""
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+import pathlib
+
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+# 測試區段（與 schema sections 列舉對齊）：名稱 → (平台, required_set)
+TEST_SECTIONS = {
+    "linux_l1": ("linux", "s21_core"),
+    "linux_cap_posix_pty": ("linux", "s21_gate:linux_cap_posix_pty"),
+    "windows_native_l1": ("windows", "s21_core"),
+    "windows_cap_windows_com": ("windows", "s21_gate:windows_cap_windows_com"),
+    "blackbox_python": ("linux", "s21_gate:blackbox_python"),
+    "blackbox_rust": ("linux", "s21_gate:blackbox_rust"),
+    "existing_suites_rust": ("linux", "s21_gate:existing_suites_rust"),
+    "pytest_full": ("linux", "s21_gate:pytest_full"),
+}
+NON_TEST_SECTIONS = ["l15_ab", "event_latency", "wal_s1w_perf", "cfg_boundary", "policy_check", "case_uptake"]
+CORE_NODEIDS = ["cargo:sw-core::wal::a", "cargo:sw-core::wal::b", "cargo:sw-core::wal::c"]
+GATE_NODEIDS = {  # 每個 gate 集合的凍結 nodeid（測試用，兩個一組）
+    name: [f"tests/test_{name}.py::test_{i}" for i in ("alpha", "beta")]
+    for name in ("linux_cap_posix_pty", "windows_cap_windows_com", "blackbox_python", "blackbox_rust",
+                 "existing_suites_rust", "pytest_full")
+}
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+IDENTITY = {
+    "cli_path": "/x/serialwrap",
+    "cli_sha256": _sha("cli"),
+    "daemon_implementation": "rust",
+    "daemon_version": "0.0.0-test",
+    "daemon_artifact_id": "artifact-test",
+    "daemon_sha256": _sha("daemon"),
+    "contracts_revision": "rev-test",
+    "cases_lock_sha256": _sha("cases-lock"),
+    "freeze_file_sha256": _sha("freeze"),
+    "tool_revision": {"uart_stdio_bridge_tree_sha256": _sha("bridge"), "runner_sha256": _sha("runner")},
+    "platform": {"os": "linux", "kernel": "6.6.87.2-microsoft-standard-WSL2", "arch": "x86_64"},
+    "device": None,
+}
+FREEZE_SYNTH = {"denominator": 3, "required_case_ids": ["c-1", "c-2", "c-3"]}
+
+
+def _judge_mod():
+    """載入判定器腳本（紅燈階段檔案不存在，於此拋 FileNotFoundError）。"""
+    spec = importlib.util.spec_from_file_location("slice21_gate_judge", ROOT / "scripts/rust/slice21_gate_judge.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _row(nodeid: str, outcome: str = "passed", skip_kind: str | None = None) -> dict:
+    if outcome == "passed":
+        phases = {"setup": "passed", "call": "passed", "teardown": "passed"}
+    elif outcome in ("failed", "error"):
+        phases = {"setup": "passed", "call": "failed", "teardown": None}
+    else:  # skipped／xfailed：整列在 setup 即跳過
+        phases = {"setup": "skipped", "call": None, "teardown": None}
+    return {"nodeid": nodeid, "outcome": outcome, "skip_kind": skip_kind, "phases": phases}
+
+
+def _l1(platform: str, runner: str, rows: list[dict], *, collected=None, deselected=(), exit_code=0, finished=True) -> dict:
+    """l1-results.v1 報告（與 tests/acceptance/l1_results.schema.json 同形）。"""
+    ids = [r["nodeid"] for r in rows]
+    return {
+        "schema_version": 2, "format": "l1-results.v1", "runner": runner, "platform": platform,
+        "argv": ["cargo", "test", "--workspace"] if runner == "cargo" else ["/x/pytest/__main__.py", "-q", "tests/"],
+        "markexpr": "", "counts": {}, "resources": {}, "uart_kind": "native",
+        "not_collected_platform": [], "core_portable_platform_skips": [],
+        "collected": list(collected) if collected is not None else ids + list(deselected),
+        "deselected": list(deselected), "results": rows,
+        "exit_code": exit_code, "finished": finished, "deployed_content": None,
+    }
+
+
+def _lock() -> dict:
+    sets = {"s21_core": {
+        "linux": {"nodeids": list(CORE_NODEIDS), "selector": {"argv": ["cargo", "test", "--workspace"]}},
+        "windows": {"nodeids": list(CORE_NODEIDS), "selector": {"argv": ["cargo", "test", "--workspace"]}},
+    }}
+    for name, ids in GATE_NODEIDS.items():
+        platform = "windows" if name.startswith("windows_") else "linux"
+        sets[f"s21_gate:{name}"] = {platform: {"nodeids": list(ids), "selector": {"argv": ["pytest", "-q"]}}}
+    return {"schema_version": 1, "sets": sets}
+
+
+def _section(name: str, *, exit_code: int = 0, l1_results: str | None = None, required_set: str | None = None,
+             allowed_missing_bo: str | None = None, counts: dict | None = None) -> dict:
+    """輸入區段：status／l1_verdict 由判定器重算，此處放置占位值。"""
+    c = counts or {}
+    return {
+        "name": name, "status": "PASS", "command": f"run {name}", "exit": exit_code,
+        "passed": c.get("passed", 0), "failed": c.get("failed", 0), "skipped": c.get("skipped", 0),
+        "deselected": c.get("deselected", 0), "ignored": c.get("ignored", 0),
+        "required_set": required_set, "l1_results": l1_results, "l1_verdict": {},
+        "allowed_missing_bo": allowed_missing_bo, "log": f"logs/{name}.log",
+    }
+
+
+def _counts(l1: dict) -> dict:
+    rows = l1["results"]
+    return {
+        "passed": sum(1 for r in rows if r["outcome"] == "passed"),
+        "failed": sum(1 for r in rows if r["outcome"] in ("failed", "error")),
+        "skipped": sum(1 for r in rows if r["outcome"] in ("skipped", "xfailed")),
+        "deselected": len(l1["deselected"]),
+        "ignored": sum(1 for r in rows if r["skip_kind"] == "capability"),
+    }
+
+
+class _Case:
+    """測試夾具：可覆寫各區段的 l1 報告，產生 (report, expect)。"""
+
+    def __init__(self, base_dir: pathlib.Path) -> None:
+        self.base = base_dir
+        self.l1: dict[str, dict | None] = {}
+        self.extra_sections: list[dict] = []
+        self.identity = json.loads(json.dumps(IDENTITY))
+        self.freeze = FREEZE_SYNTH
+        self.case_verdicts: dict[str, str] = {}
+        self.daemon_path: pathlib.Path | None = None
+        for name, (platform, _) in TEST_SECTIONS.items():
+            self.l1[name] = self._default_l1(name, platform)
+
+    def _default_l1(self, name: str, platform: str) -> dict | None:
+        if name == "windows_cap_windows_com":
+            return None                                   # 無 COM pair：證據缺失（BO-S21-01 豁免）
+        if name in ("linux_l1", "windows_native_l1"):
+            ids = CORE_NODEIDS
+            runner = "cargo"
+        else:
+            ids = GATE_NODEIDS[name]
+            runner = "pytest"
+        return _l1(platform, runner, [_row(i) for i in ids])
+
+    def write_l1(self, name: str, report: dict) -> str:
+        rel = f"l1/{name}.json"
+        path = self.base / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(report), encoding="utf-8")
+        return rel
+
+    def report(self) -> dict:
+        sections = []
+        for name, (platform, required_set) in TEST_SECTIONS.items():
+            l1 = self.l1.get(name)
+            rel = self.write_l1(name, l1) if l1 is not None else None
+            counts = _counts(l1) if l1 is not None else None
+            allowed = "BO-S21-01" if name == "windows_cap_windows_com" else None
+            sections.append(_section(name, l1_results=rel, required_set=required_set,
+                                     allowed_missing_bo=allowed, counts=counts))
+        for name in NON_TEST_SECTIONS:
+            sections.append(_section(name, exit_code=0))
+        sections.extend(self.extra_sections)
+        return {"schema_version": 1, "run_id": "t", "slice": "2.1", "identity": self.identity, "sections": sections}
+
+    def expect(self) -> dict:
+        return {"lock": _lock(), "base_dir": self.base, "freeze": self.freeze,
+                "case_verdicts": dict(self.case_verdicts), "daemon_path": self.daemon_path}
+
+
+def _sec(out: dict, name: str) -> dict:
+    return [s for s in out["sections"] if s["name"] == name][0]
+
+
+@pytest.fixture
+def case(tmp_path):
+    return _Case(tmp_path)
+
+
+def test_all_skipped_is_not_pass(case):
+    ids = [f"tests/test_x.py::test_{i:02d}" for i in range(36)]
+    case.l1["blackbox_python"] = _l1("linux", "pytest", [_row(i, "skipped", "capability") for i in ids])
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert _sec(out, "blackbox_python")["status"] == "EVIDENCE_MISSING"
+    assert out["verdict"] == "INCOMPLETE"
+
+
+def test_zero_tests_is_not_pass(case):
+    # `cargo test -- --ignored cap_posix_pty__` 輸出 0 tests、exit 0
+    case.l1["linux_cap_posix_pty"] = _l1("linux", "cargo", [], collected=[], exit_code=0)
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert _sec(out, "linux_cap_posix_pty")["status"] == "EVIDENCE_MISSING"
+    assert out["verdict"] == "INCOMPLETE"
+
+
+def test_count_threshold_cannot_substitute_required_nodeids(case):
+    # R5-F3：以其他 50 個測試湊數，必要 nodeid 皆未執行；舊的計數門檻會誤判 PASS
+    others = [f"cargo:sw-core::other::case_{i:02d}" for i in range(50)]
+    case.l1["linux_l1"] = _l1("linux", "cargo", [_row(i) for i in others], exit_code=0)
+    out = _judge_mod().judge(case.report(), case.expect())
+    sec = _sec(out, "linux_l1")
+    assert sec["status"] == "EVIDENCE_MISSING"
+    assert sorted(sec["l1_verdict"]["missing"]) == sorted(CORE_NODEIDS)
+    assert out["verdict"] == "INCOMPLETE"
+
+
+def test_required_nodeid_ignored_is_missing(case):
+    n1, n2 = GATE_NODEIDS["linux_cap_posix_pty"]
+    case.l1["linux_cap_posix_pty"] = _l1("linux", "pytest", [_row(n1), _row(n2, "skipped", "capability")])
+    out = _judge_mod().judge(case.report(), case.expect())
+    sec = _sec(out, "linux_cap_posix_pty")
+    assert sec["status"] == "EVIDENCE_MISSING"
+    assert sec["l1_verdict"]["skipped_required"][0]["nodeid"] == n2
+
+
+def test_duplicate_nodeid_is_missing(case):
+    n1, n2 = GATE_NODEIDS["linux_cap_posix_pty"]
+    # 同一必要 nodeid 兩列皆 passed（兩支 exe 重複執行）
+    case.l1["linux_cap_posix_pty"] = _l1("linux", "pytest", [_row(n1), _row(n1), _row(n2)])
+    out = _judge_mod().judge(case.report(), case.expect())
+    sec = _sec(out, "linux_cap_posix_pty")
+    assert sec["status"] == "EVIDENCE_MISSING"
+    assert n1 in sec["l1_verdict"]["duplicates"]
+    # 一列 failed 一列 passed → FAIL
+    case.l1["linux_cap_posix_pty"] = _l1("linux", "pytest", [_row(n1), _row(n1, "failed"), _row(n2)])
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert _sec(out, "linux_cap_posix_pty")["status"] == "FAIL"
+
+
+def test_runner_exit_or_unfinished_is_missing(case):
+    ids = GATE_NODEIDS["blackbox_python"]
+    # 全部必要 nodeid passed，但 runner 以 101 結束（報告 exit_code 與區段 exit 不一致）
+    case.l1["blackbox_python"] = _l1("linux", "pytest", [_row(i) for i in ids], exit_code=101)
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert _sec(out, "blackbox_python")["status"] == "EVIDENCE_MISSING"
+    # runner 未完成
+    case.l1["blackbox_python"] = _l1("linux", "pytest", [_row(i) for i in ids], finished=False)
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert _sec(out, "blackbox_python")["status"] == "EVIDENCE_MISSING"
+
+
+def test_missing_l1_results_is_missing(case):
+    # (a) 測試類區段 l1_results 為 null
+    case.l1["blackbox_python"] = None
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert _sec(out, "blackbox_python")["status"] == "EVIDENCE_MISSING"
+    # (b) 檔案不存在
+    rep = case.report()
+    [s for s in rep["sections"] if s["name"] == "blackbox_rust"][0]["l1_results"] = "l1/does-not-exist.json"
+    out = _judge_mod().judge(rep, case.expect())
+    assert _sec(out, "blackbox_rust")["status"] == "EVIDENCE_MISSING"
+    # (c) required_set 不在 lock
+    rep = case.report()
+    [s for s in rep["sections"] if s["name"] == "pytest_full"][0]["required_set"] = "s21_gate:not_in_lock"
+    out = _judge_mod().judge(rep, case.expect())
+    assert _sec(out, "pytest_full")["status"] == "EVIDENCE_MISSING"
+    # (d) 非測試類 policy_check required_set 為 null，不受影響
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert _sec(out, "policy_check")["status"] == "PASS"
+
+
+def test_full_required_set_pass(case):
+    out = _judge_mod().judge(case.report(), case.expect())
+    for name in TEST_SECTIONS:
+        expected = "EVIDENCE_MISSING" if name == "windows_cap_windows_com" else "PASS"
+        assert _sec(out, name)["status"] == expected, name
+    for name in NON_TEST_SECTIONS:
+        assert _sec(out, name)["status"] == "PASS", name
+    assert out["verdict"] == "READY_FOR_OWNER_EVIDENCE"
+
+
+def test_deselected_counts_as_missing(case):
+    n1, n2 = GATE_NODEIDS["blackbox_rust"]
+    case.l1["blackbox_rust"] = _l1("linux", "pytest", [_row(n1)], collected=[n1, n2], deselected=[n2])
+    out = _judge_mod().judge(case.report(), case.expect())
+    sec = _sec(out, "blackbox_rust")
+    assert sec["status"] == "EVIDENCE_MISSING"
+    assert sec["l1_verdict"]["deselected_required"]
+
+
+def test_only_allowed_bo_section_may_be_missing(case):
+    # 只有 windows_cap_windows_com（BO-S21-01 豁免）缺 → READY
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert out["verdict"] == "READY_FOR_OWNER_EVIDENCE"
+    # blackbox_rust 缺（非豁免）→ INCOMPLETE
+    case.l1["blackbox_rust"] = None
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert out["verdict"] == "INCOMPLETE"
+
+
+def test_failed_section_is_fail(case):
+    ids = GATE_NODEIDS["blackbox_python"]
+    case.l1["blackbox_python"] = _l1("linux", "pytest", [_row(ids[0], "failed"), _row(ids[1])], exit_code=1)
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert _sec(out, "blackbox_python")["status"] == "FAIL"
+    assert out["verdict"] == "FAIL"
+
+
+def test_identity_required(case):
+    for key in ("daemon_sha256", "cases_lock_sha256"):
+        case.identity.pop(key)
+        out = _judge_mod().judge(case.report(), case.expect())
+        assert out["verdict"] == "INCOMPLETE", key
+        case.identity = json.loads(json.dumps(IDENTITY))
+
+
+def test_identity_hash_matches_artifact(case):
+    artifact = case.base / "serialwrapd"
+    artifact.write_bytes(b"artifact-A")
+    case.daemon_path = artifact
+    case.identity["daemon_sha256"] = _sha("artifact-B")      # 不符
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert out["verdict"] == "FAIL"
+    case.identity["daemon_sha256"] = hashlib.sha256(b"artifact-A").hexdigest()   # 相符（正向對照）
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert out["verdict"] == "READY_FOR_OWNER_EVIDENCE"
+
+
+def test_case_uptake_from_valid_pass_only(case):
+    freeze = json.loads((ROOT / "tests/acceptance/breaker/slice_2.1.json").read_text(encoding="utf-8"))
+    ids = freeze["required_case_ids"]
+    case.freeze = freeze
+    case.case_verdicts = {ids[0]: "PASS", ids[1]: "PASS", ids[2]: "PASS", ids[3]: "SKIP", ids[4]: "EVIDENCE_MISSING"}
+    out = _judge_mod().judge(case.report(), case.expect())
+    cu = out["case_uptake"]
+    assert cu["valid_pass"] == 3
+    assert cu["rate"] == cu["valid_pass"] / freeze["denominator"]
+    assert cu["denominator"] == freeze["denominator"]
+    assert sorted(cu["pass_case_ids"]) == sorted(ids[:3])

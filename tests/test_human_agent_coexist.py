@@ -34,7 +34,7 @@ import pytest
 pytestmark = [pytest.mark.posix_only, pytest.mark.interactive_desktop, pytest.mark.posix_pty, pytest.mark.process_rpc]
 
 ROOT_DIR = pathlib.Path(__file__).resolve().parents[1]
-from ab_env import AB_ENV
+from ab_env import AB_ENV, assert_daemon_artifact
 SERIALWRAP = AB_ENV.get("SERIALWRAP_CLI_EXE") or str(ROOT_DIR / "serialwrap")
 SERIALWRAPD_ARGV = [AB_ENV["SERIALWRAP_DAEMON_EXE"]] if AB_ENV.get("SERIALWRAP_DAEMON_EXE") else [sys.executable, str(ROOT_DIR / "serialwrapd.py")]
 
@@ -206,6 +206,7 @@ targets:
             stderr=subprocess.DEVNULL,
         )
         self.addCleanup(self._stop_daemon)
+        assert_daemon_artifact(self._daemon.pid)  # P5-T20 Step 0：/proc/<pid>/exe 須等於所選 artifact
 
         # tmux session 名先定、清理先掛——_wait_ready 失敗時 unittest 跳過 tearDown，
         # addCleanup 仍會執行（#120：8 個殭屍 daemon 的成因就是舊 tearDown 被跳過）

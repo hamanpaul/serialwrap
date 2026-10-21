@@ -146,6 +146,7 @@ impl FakePlatformBuilder {
             registry: self
                 .registry
                 .unwrap_or_else(|| Arc::new(Unconfigured("registry"))),
+            serial: crate::fakes::serial::FakeSerialBackend::new(),
             caps: self.caps,
         }
     }

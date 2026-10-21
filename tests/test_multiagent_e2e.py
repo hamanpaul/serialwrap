@@ -24,7 +24,7 @@ import pytest
 pytestmark = [pytest.mark.posix_only, pytest.mark.posix_pty, pytest.mark.process_rpc]
 
 ROOT_DIR = pathlib.Path(__file__).resolve().parents[1]
-from ab_env import AB_ENV
+from ab_env import AB_ENV, assert_daemon_artifact
 SERIALWRAP = AB_ENV.get("SERIALWRAP_CLI_EXE") or str(ROOT_DIR / "serialwrap")
 SERIALWRAPD_ARGV = [AB_ENV["SERIALWRAP_DAEMON_EXE"]] if AB_ENV.get("SERIALWRAP_DAEMON_EXE") else [sys.executable, str(ROOT_DIR / "serialwrapd.py")]
 
@@ -237,6 +237,7 @@ targets:
                     daemon.kill()
 
         self.addCleanup(_cleanup_daemon)
+        assert_daemon_artifact(daemon.pid)  # P5-T20 Step 0：/proc/<pid>/exe 須等於所選 artifact
 
         ready = self._wait_ready(env, socket_path)
         self.assertTrue(ready["ok"], msg=f"session not ready: {ready['payload']}")

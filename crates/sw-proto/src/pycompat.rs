@@ -832,3 +832,24 @@ mod tests {
         assert_eq!(py_repr_str("é"), "'é'");
     }
 }
+
+/// Python 例外的 RPC 邊界表示（Slice 2.1 Task 0c；紅燈階段骨架）。
+///
+/// framing 轉 `EXCEPTION` 時 `message` 即 `str(exc)`；`Display` 輸出 `message`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PyErr {
+    pub message: String,
+}
+
+impl PyErr {
+    /// Python `ValueError(msg)`。
+    pub fn value_error(_msg: &str) -> PyErr {
+        unimplemented!("slice21 T0c PyErr::value_error")
+    }
+}
+
+impl std::fmt::Display for PyErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}

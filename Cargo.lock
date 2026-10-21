@@ -63,6 +63,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-channel"
+version = "0.5.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-utils"
+version = "0.8.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -269,6 +284,8 @@ dependencies = [
 name = "sw-core"
 version = "0.3.2"
 dependencies = [
+ "crossbeam-channel",
+ "indexmap",
  "sw-pal",
  "sw-proto",
 ]
@@ -286,6 +303,7 @@ dependencies = [
 name = "sw-pal"
 version = "0.3.2"
 dependencies = [
+ "crossbeam-channel",
  "libc",
  "tempfile",
  "windows-sys",

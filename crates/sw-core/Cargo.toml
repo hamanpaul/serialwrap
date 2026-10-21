@@ -9,3 +9,10 @@ publish.workspace = true
 [dependencies]
 sw-proto = { path = "../sw-proto" }
 sw-pal = { path = "../sw-pal" }
+# Slice 2.1（arch §5.4 TxWriter 通道與 §5.7 TX 帳本）。
+crossbeam-channel = { workspace = true }
+indexmap = { workspace = true }
+
+[features]
+# 記憶體替身（arch §4）；僅供測試，不得在產品路徑啟用。
+test-fakes = ["sw-pal/test-fakes"]

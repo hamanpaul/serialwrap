@@ -10,6 +10,10 @@ publish.workspace = true
 name = "serialwrapd"
 path = "src/main.rs"
 
+[features]
+# 測試替身與 in-process 測試掛鉤（P5-T19）：只供 `run_with_hooks`／`DaemonHooks`／`TraceEvent` 與測試使用，產品碼不讀任何測試 env。
+test-fakes = ["sw-pal/test-fakes"]
+
 [dependencies]
 sw-core = { path = "../sw-core" }
 sw-proto = { path = "../sw-proto" }

@@ -1,1 +1,31 @@
-//! Stage 2 承接；P3 為空殼。
+//! Stage 2 承接；Slice 2.1 逐 Task 建立中（各模組目前為紅燈階段骨架，函式本體為 `s21_todo!`，行為由各 Task 實作）。
+
+/// Slice 2.1 骨架未實作函式的統一 panic（紅燈測試的失敗訊息：`not implemented: slice21 <Task> <symbol>`）。
+#[macro_export]
+macro_rules! s21_todo {
+    ($t:literal, $sym:literal) => {
+        unimplemented!(concat!("slice21 ", $t, " ", $sym))
+    };
+}
+
+/// `Clock::mono_ns()` 的單位（納秒）。
+pub type Mono = u64;
+
+/// Slice 2.1 識別字串。
+pub const SLICE: &str = "2.1";
+
+pub mod actor;
+pub mod arbiter;
+pub mod drain;
+pub mod generations;
+pub mod login_fsm;
+pub mod mailbox;
+pub mod op_runner;
+pub mod quiet_gate;
+pub mod session_auth;
+pub mod session_core;
+pub mod session_manager;
+pub mod state_store;
+pub mod tx_writer;
+pub mod uart_bridge;
+pub mod wal;

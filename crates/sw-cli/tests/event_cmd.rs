@@ -98,6 +98,7 @@ fn event_params_and_dispatch_fail_until_implemented() {
         tunnel: sw_pal::fakes::FakeTunnel::new(false),
         service: sw_pal::fakes::FakeServiceCtl::new(Vec::new()),
         registry: sw_pal::fakes::FakeRegistry::new(Vec::new(), &[]),
+        serial: sw_pal::fakes::serial::FakeSerialBackend::new(),
         caps,
     };
     let env = sw_proto::runtime_paths::EnvSnapshot::from_pairs(std::iter::empty());
