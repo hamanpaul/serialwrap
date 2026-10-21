@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -57,6 +58,25 @@ def test_windows_pid_alive():
         child.kill()
         child.wait()
     assert probe.pid_alive(child.pid) is False
+
+
+def test_windows_pids_by_exe_finds_current_python():
+    probe = _rc().WindowsProbe()
+    assert os.getpid() in probe.pids_by_exe((sys.executable,))
+
+
+def test_windows_endpoint_reports_listener_and_closed_port():
+    probe = _rc().WindowsProbe()
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    endpoint = f"tcp://127.0.0.1:{port}"
+    try:
+        assert probe.endpoint_connectable(endpoint) is True
+    finally:
+        listener.close()
+    assert probe.endpoint_connectable(endpoint) is False
 
 
 def test_windows_com_exclusive(tmp_path: Path, request: pytest.FixtureRequest):

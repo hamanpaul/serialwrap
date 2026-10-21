@@ -10,6 +10,10 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import errno
+import socket
+import sys
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +72,50 @@ def _snap(pid: int | None = 4242, **kw: Any) -> Any:
 
 def _status(result: Any, name: str) -> list[str]:
     return [c.status for c in result.checks if c.name == name]
+
+
+class _BareProbe:
+    def __init__(self, **values: Any) -> None:
+        self.values = values
+
+    def pid_alive(self, pid: int) -> bool | None:
+        return self.values.get("pid_alive", {}).get(pid, False)
+
+    def descendants(self, pid: int) -> tuple[int, ...] | None:
+        return self.values.get("descendants", ())
+
+    def pids_by_exe(self, paths: Any) -> Any:
+        return self.values.get("by_exe", ())
+
+    def endpoint_connectable(self, endpoint: str) -> bool | None:
+        return self.values.get("endpoint", False)
+
+    def lock_acquirable(self, path: str) -> bool | None:
+        return True
+
+    def device_holders(self, path: str) -> Any:
+        return self.values.get("holders", ((), 0))
+
+    def device_exclusive_open(self, path: str) -> bool | None:
+        return True
+
+
+def _bare_spec(**overrides: Any) -> Any:
+    values = dict(
+        timeout_s=0.0,
+        poll_s=0.2,
+        endpoints=("tcp://127.0.0.1:48700",),
+        device_paths=(),
+        lock_paths=(),
+        device_open_probe=False,
+        accept_unreadable_holders=False,
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _cmd_result(rc: int, stdout: str = "", *, timed_out: bool = False) -> Any:
+    return SimpleNamespace(rc=rc, stdout=stdout, stderr="", timed_out=timed_out)
 
 
 def test_fake_probe_conforms_to_protocol():
@@ -229,3 +277,256 @@ def test_snapshot_from_endpoints_merges(tmp_path: Path):
     assert snap.device_paths == ("/dev/ttyX",)
     assert snap.lock_paths == ("/r/l.lock",)
     assert snap.daemon_pid is None
+
+
+def test_posix_cmdline_permission_error_is_unknown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    rc = _rc()
+    proc_root = tmp_path / "proc"
+    process = proc_root / "123"
+    process.mkdir(parents=True)
+    (process / "exe").symlink_to(sys.executable)
+    (process / "cmdline").write_bytes(b"python\0/tmp/serialwrapd.py\0")
+    probe = rc.PosixProbe()
+    probe._PROC_ROOT = str(proc_root)
+    original_read_bytes = Path.read_bytes
+
+    def denied_cmdline(path: Path) -> bytes:
+        if path == process / "cmdline":
+            raise PermissionError(errno.EACCES, "permission denied", str(path))
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", denied_cmdline)
+    assert probe.pids_by_exe(("/tmp/serialwrapd.py",)) is None
+
+
+def test_posix_pids_by_exe_resolves_relative_script_from_process_cwd(tmp_path: Path):
+    rc = _rc()
+    script = tmp_path / "serialwrapd.py"
+    script.write_text("pass\n", encoding="utf-8")
+    proc_root = tmp_path / "proc"
+    process = proc_root / "123"
+    process.mkdir(parents=True)
+    (process / "exe").symlink_to(sys.executable)
+    (process / "cwd").symlink_to(tmp_path, target_is_directory=True)
+    (process / "cmdline").write_bytes(f"{sys.executable}\0./serialwrapd.py\0".encode())
+    probe = rc.PosixProbe()
+    probe._PROC_ROOT = str(proc_root)
+    assert probe.pids_by_exe((str(script),)) == (123,)
+
+
+def test_windows_pids_by_exe_ignores_unrelated_unreadable_process():
+    rc = _rc()
+    probe = rc.WindowsProbe.__new__(rc.WindowsProbe)
+    probe._process_rows = lambda: [(4, 0, "System"), (55, 0, "serialwrapd.exe")]
+    probe._image_path = lambda pid: (None, None) if pid == 4 else (True, "/candidate/serialwrapd.exe")
+    assert probe.pids_by_exe(("/candidate/serialwrapd.exe",)) == (55,)
+
+
+def test_windows_invalid_pid_is_unknown():
+    rc = _rc()
+    probe = rc.WindowsProbe.__new__(rc.WindowsProbe)
+    assert probe.pid_alive(0) is None
+
+
+def test_posix_invalid_pid_is_unknown():
+    assert _rc().PosixProbe().pid_alive(0) is None
+
+
+def test_windows_closed_endpoint_probe_uses_refusal_timeout(monkeypatch: pytest.MonkeyPatch):
+    rc = _rc()
+    probe = rc.WindowsProbe.__new__(rc.WindowsProbe)
+    seen: list[float] = []
+
+    def refused(address: Any, *, timeout: float) -> Any:
+        seen.append(timeout)
+        raise ConnectionRefusedError(errno.ECONNREFUSED, "connection refused")
+
+    monkeypatch.setattr(socket, "create_connection", refused)
+    assert probe.endpoint_connectable("tcp://127.0.0.1:48700") is False
+    assert seen == [5.0]
+
+
+def test_capture_pre_stop_keeps_pid_when_running_is_false():
+    rc = _rc()
+    runner_calls: list[dict[str, Any]] = []
+
+    def runner(argv: Any, **kwargs: Any) -> Any:
+        runner_calls.append({"argv": list(argv), **kwargs})
+        return _cmd_result(0, '{"ok":true,"running":false,"pid":777}')
+
+    snap = rc.capture_pre_stop(
+        Path("/bundle/bin/serialwrap"),
+        {},
+        _bare_spec(),
+        daemon_exe=Path("/bundle/bin/serialwrapd"),
+        probe=_BareProbe(),
+        run=runner,
+    )
+    assert snap.daemon_pid == 777
+    assert snap.descendant_pids == ()
+
+
+def test_capture_pre_stop_rejects_live_daemon_error_response():
+    rc = _rc()
+
+    def runner(argv: Any, **kwargs: Any) -> Any:
+        return _cmd_result(2, '{"ok":false,"error_code":"TIMEOUT","daemon_reachable":true}')
+
+    with pytest.raises(rc.HarnessError, match="daemon status"):
+        rc.capture_pre_stop(
+            Path("/bundle/bin/serialwrap"), {}, _bare_spec(),
+            daemon_exe=Path("/bundle/bin/serialwrapd"), probe=_BareProbe(), run=runner,
+        )
+
+
+def test_capture_pre_stop_requires_all_endpoints_to_be_closed():
+    rc = _rc()
+
+    def runner(argv: Any, **kwargs: Any) -> Any:
+        return _cmd_result(2)
+
+    with pytest.raises(rc.HarnessError, match="端點"):
+        rc.capture_pre_stop(
+            Path("/bundle/bin/serialwrap"), {}, _bare_spec(),
+            daemon_exe=Path("/bundle/bin/serialwrapd"),
+            probe=_BareProbe(endpoint=True), run=runner,
+        )
+
+
+def test_capture_pre_stop_uses_explicit_endpoint_and_extended_timeout():
+    rc = _rc()
+    calls: list[dict[str, Any]] = []
+
+    def runner(argv: Any, **kwargs: Any) -> Any:
+        calls.append({"argv": list(argv), **kwargs})
+        return _cmd_result(0, '{"ok":true,"running":true,"pid":55}')
+
+    rc.capture_pre_stop(
+        Path("/bundle/bin/serialwrap"), {}, _bare_spec(),
+        daemon_exe=Path("/bundle/bin/serialwrapd"), endpoint="tcp://127.0.0.1:48700",
+        probe=_BareProbe(), run=runner,
+    )
+    assert calls[0]["argv"][:3] == ["/bundle/bin/serialwrap", "--endpoint", "tcp://127.0.0.1:48700"]
+    assert calls[0]["timeout"] == 15.0
+
+
+def test_capture_pre_stop_requires_evidence_for_daemon_down():
+    rc = _rc()
+
+    def runner(argv: Any, **kwargs: Any) -> Any:
+        return _cmd_result(2)
+
+    with pytest.raises(rc.HarnessError, match="端點"):
+        rc.capture_pre_stop(
+            Path("/bundle/bin/serialwrap"), {}, _bare_spec(endpoints=()),
+            daemon_exe=Path("/bundle/bin/serialwrapd"), probe=_BareProbe(), run=runner,
+        )
+
+
+def test_capture_pre_stop_accepts_socket_error_only_after_endpoint_closes():
+    rc = _rc()
+
+    def runner(argv: Any, **kwargs: Any) -> Any:
+        return _cmd_result(2, '{"ok":false,"error_code":"SOCKET_ERROR"}')
+
+    snap = rc.capture_pre_stop(
+        Path("/bundle/bin/serialwrap"), {}, _bare_spec(),
+        daemon_exe=Path("/bundle/bin/serialwrapd"), probe=_BareProbe(), run=runner,
+    )
+    assert snap.daemon_pid is None
+
+
+def test_safe_probe_exception_produces_unknown():
+    rc = _rc()
+    probe = _BareProbe()
+
+    def fail(endpoint: str) -> bool | None:
+        raise OSError("probe failed")
+
+    probe.endpoint_connectable = fail
+    result = rc.verify_released(
+        rc.PreStopSnapshot(None, (), ("/bundle/bin/serialwrapd",), ("broken",), (), (), 0.0),
+        _bare_spec(endpoints=()), probe=probe,
+    )
+    assert not result.released
+    assert _status(result, "endpoint") == ["unknown"]
+
+
+@pytest.mark.parametrize(
+    ("result", "stdout"),
+    [
+        (_cmd_result(-1, timed_out=True), ""),
+        (_cmd_result(1), ""),
+        (_cmd_result(0), '{"ok":true,"running":true}'),
+    ],
+)
+def test_capture_pre_stop_rejects_status_timeout_failure_or_missing_pid(result: Any, stdout: str):
+    rc = _rc()
+    if stdout:
+        result = _cmd_result(result.rc, stdout, timed_out=result.timed_out)
+
+    def runner(argv: Any, **kwargs: Any) -> Any:
+        return result
+
+    with pytest.raises(rc.HarnessError):
+        rc.capture_pre_stop(
+            Path("/bundle/bin/serialwrap"), {}, _bare_spec(),
+            daemon_exe=Path("/bundle/bin/serialwrapd"), probe=_BareProbe(), run=runner,
+        )
+
+
+def test_snapshot_from_missing_endpoints_uses_manifest_paths(tmp_path: Path):
+    rc = _rc()
+    snap = rc.snapshot_from_endpoints(
+        tmp_path / "missing-endpoints.json",
+        _bare_spec(endpoints=("tcp://127.0.0.1:4000",), device_paths=("device-a",), lock_paths=("lock-a",)),
+        match_paths=("/bundle/bin/serialwrapd",),
+    )
+    assert snap.endpoints == ("tcp://127.0.0.1:4000",)
+    assert snap.device_paths == ("device-a",)
+    assert snap.lock_paths == ("lock-a",)
+
+
+def test_snapshot_from_malformed_endpoints_is_unconfirmed(tmp_path: Path):
+    rc = _rc()
+    path = tmp_path / "endpoints.json"
+    path.write_text("{", encoding="utf-8")
+    with pytest.raises(rc.HarnessError, match="endpoints.json"):
+        rc.snapshot_from_endpoints(path, _bare_spec(), match_paths=("/bundle/bin/serialwrapd",))
+
+
+@pytest.mark.parametrize("pid", [0, -1])
+def test_invalid_snapshot_pid_is_unknown(pid: int):
+    rc = _rc()
+    result = rc.verify_released(
+        rc.PreStopSnapshot(pid, (), ("/bundle/bin/serialwrapd",), (), (), (), 0.0),
+        _bare_spec(endpoints=()), probe=_BareProbe(),
+    )
+    assert not result.released
+    assert _status(result, "daemon_pid") == ["unknown"]
+
+
+def test_invalid_descendant_pid_is_unknown():
+    rc = _rc()
+    result = rc.verify_released(
+        rc.PreStopSnapshot(None, (0,), ("/bundle/bin/serialwrapd",), (), (), (), 0.0),
+        _bare_spec(endpoints=()), probe=_BareProbe(),
+    )
+    assert not result.released
+    assert _status(result, "descendant") == ["unknown"]
+
+
+@pytest.mark.parametrize(
+    ("values", "name", "spec_overrides"),
+    [
+        ({"by_exe": ("bad-pid",)}, "leaked_daemon", {}),
+        ({"holders": (("bad-pid",), 0)}, "device_holders", {"device_paths": ("device-a",)}),
+    ],
+)
+def test_malformed_probe_pid_results_are_unknown(values: dict[str, Any], name: str, spec_overrides: dict[str, Any]):
+    rc = _rc()
+    spec = _bare_spec(**spec_overrides)
+    snap = rc.PreStopSnapshot(None, (), ("/bundle/bin/serialwrapd",), (), spec.device_paths, (), 0.0)
+    result = rc.verify_released(snap, spec, probe=_BareProbe(**values))
+    assert not result.released
+    assert _status(result, name) == ["unknown"]

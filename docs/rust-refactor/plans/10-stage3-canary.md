@@ -1062,11 +1062,12 @@ class PosixProbe: ...     # 實作 ReleaseProbe
 class WindowsProbe: ...   # 實作 ReleaseProbe（ctypes）
 def default_probe() -> ReleaseProbe        # os.name == "nt" → WindowsProbe()，否則 PosixProbe()
 def capture_pre_stop(cli_exe: Path, env: Mapping[str, str], spec: ReleaseSpec, *, daemon_exe: Path, entry_scripts: Sequence[str] = (),
-                     run: Runner = run_cmd, probe: ReleaseProbe | None = None, clock: Callable[[], float] = time.monotonic) -> PreStopSnapshot
-def snapshot_from_endpoints(endpoints_json: Path, spec: ReleaseSpec, *, match_paths: Sequence[str],
+                     endpoint: str | None = None, status_timeout_s: float = 15.0, run: Runner = run_cmd,
+                     probe: ReleaseProbe | None = None, clock: Callable[[], float] = time.monotonic) -> PreStopSnapshot
+def snapshot_from_endpoints(endpoints_json: Path | None, spec: ReleaseSpec, *, match_paths: Sequence[str],
                             clock: Callable[[], float] = time.monotonic) -> PreStopSnapshot
     # L1.5：func-test 自管 daemon，suite 結束時 daemon 已停；daemon_pid=None，endpoints／device_paths／lock_paths 取 spec 與
-    # suite adapter 寫的 endpoints.json（{"endpoints":[…],"device_paths":[…],"lock_paths":[…]}，Task 5B）之聯集（保序去重）
+    # suite adapter 寫的 endpoints.json（{"endpoints":[…],"device_paths":[…],"lock_paths":[…]}，Task 5B）之聯集（保序去重）；檔案缺少時只用 spec
 def verify_released(snap: PreStopSnapshot, spec: ReleaseSpec, *, probe: ReleaseProbe | None = None,
                     clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep) -> ReleaseResult
 ```
@@ -1456,7 +1457,7 @@ def run_ab(manifest_path: Path, *, out_dir: Path, repo_root: Path, run: Runner =
    3. `l2`／`l3`：`run(side.activate_argv, env=inst.env, timeout=600)`，rc≠0 → `abort_code = "HARNESS_SUITE_INFRA_ERROR"`。
    4. `clean = dut_state.verify_clean(...)`；非空 → `HARNESS_DUT_NOT_CLEAN`。
    5. 無 abort 時 `suite = suites.run_side(m, side, inst, ...)`（L3 的監管檢查在 adapter 內，失敗回 `HARNESS_FAILURE_RETENTION_UNVERIFIED`）；`identity_violations = suites.verify_run_identity(m, side, suite, expected_trees=trees[label])`，非空 → `abort_code = "HARNESS_ARTIFACT_MISMATCH"`（兩側都跑到預設 Python 基線屬此類；suite 實際執行的安裝含旁載檔而與第 2 步凍結 tree 不同亦屬此類，R5-F4）。
-   6. 不論前面成敗（`try/finally`）：`l1.5` → `pre = snapshot_from_endpoints(inst.report_dir/"endpoints.json", m.release, match_paths=…)`（檔案不存在時只用 spec，並在 notes 記 `"endpoints.json missing"`）；`l2`／`l3` → `pre = capture_pre_stop(...)` 後執行 `deactivate_argv`；`rel = verify_released(pre, m.release, ...)`；`cleanup = dut_state.cleanup_instance(inst)`。
+   6. 不論前面成敗（`try/finally`）：`l1.5` → `pre = snapshot_from_endpoints(inst.report_dir/"endpoints.json", m.release, match_paths=…)`（檔案不存在時只用 spec，並在 notes 記 `"endpoints.json missing"`）；`l2`／`l3` → `pre = capture_pre_stop(..., endpoint=m.endpoint)` 後執行 `deactivate_argv`；`rel = verify_released(pre, m.release, ...)`；`cleanup = dut_state.cleanup_instance(inst)`。
    7. `rel.released is False` 或 `cleanup` 非空 → `abort_code = "HARNESS_RELEASE_UNCONFIRMED"`（若已有 abort_code，保留原碼並在 notes 加 `"release unconfirmed"`）。
    8. 有 `abort_code` → **不啟動下一側**、不跑比較；但已取得的產品結果不得遺失：若本輪任一已完成側為 candidate 且 `suite.status == "FAIL"`，或該側自身證據已有安全違規（L1.5 任一 `comparison.json.invariants[*].result == "FAIL"`；L3 `release-gate.json` 的 safety check FAIL），最終 verdict 為 `FAIL`、`reason_code` 為該 abort 碼、notes 加 `"aborted after product failure"`；否則 verdict `INFRA_ERROR`。
    9. `KeyboardInterrupt`：仍完成第 6 步的停止與釋放驗證，verdict `ABORTED`、`HARNESS_ABORTED`（若已有第 8 步的產品 FAIL，verdict 仍為 `FAIL`），然後重新拋出。

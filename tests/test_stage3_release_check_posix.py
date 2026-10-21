@@ -60,28 +60,43 @@ def test_posix_unreadable_counted(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     probe = _rc().PosixProbe()
     dev = tmp_path / "fake-dev"
     dev.write_text("", encoding="utf-8")
-    # WSL 上系統程序（root）本身即不可讀，故以「注入前後的差量」判定本次注入的不可讀程序恰為 1。
-    before = probe.device_holders(str(dev))
-    assert before is not None
-    denied_fd_dir = f"/proc/{os.getpid()}/fd"
-    real_listdir = os.listdir
+    proc_root = tmp_path / "proc"
+    holder_fd_dir = proc_root / "100" / "fd"
+    denied_fd_dir = proc_root / "200" / "fd"
+    holder_fd_dir.mkdir(parents=True)
+    denied_fd_dir.mkdir(parents=True)
+    (holder_fd_dir / "7").symlink_to(dev)
+    probe._PROC_ROOT = str(proc_root)
     real_scandir = os.scandir
 
-    def _listdir(path: Any = ".", *args: Any, **kwargs: Any) -> Any:
-        if os.fspath(path) == denied_fd_dir:
-            raise PermissionError(13, "Permission denied", denied_fd_dir)
-        return real_listdir(path, *args, **kwargs)
-
     def _scandir(path: Any = ".", *args: Any, **kwargs: Any) -> Any:
-        if os.fspath(path) == denied_fd_dir:
-            raise PermissionError(13, "Permission denied", denied_fd_dir)
+        if os.fspath(path) == str(denied_fd_dir):
+            raise PermissionError(13, "Permission denied", str(denied_fd_dir))
         return real_scandir(path, *args, **kwargs)
 
-    monkeypatch.setattr(os, "listdir", _listdir)
     monkeypatch.setattr(os, "scandir", _scandir)
-    after = probe.device_holders(str(dev))
-    assert after is not None
-    assert after[1] - before[1] == 1
+    assert probe.device_holders(str(dev)) == ((100,), 1)
+
+
+def test_posix_descendants_skips_process_that_exits_during_scan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    probe = _rc().PosixProbe()
+    proc_root = tmp_path / "proc"
+    (proc_root / "100").mkdir(parents=True)
+    (proc_root / "101").mkdir()
+    (proc_root / "102").mkdir()
+    (proc_root / "100" / "stat").write_text("100 (daemon) S 1 0\n", encoding="utf-8")
+    (proc_root / "101" / "stat").write_text("101 (child) S 100 0\n", encoding="utf-8")
+    (proc_root / "102" / "stat").write_text("102 (vanishing) S 100 0\n", encoding="utf-8")
+    probe._PROC_ROOT = str(proc_root)
+    original_read_bytes = Path.read_bytes
+
+    def vanishing_stat(path: Path, *args: Any, **kwargs: Any) -> bytes:
+        if path == proc_root / "102" / "stat":
+            raise ProcessLookupError(3, "process disappeared", str(path))
+        return original_read_bytes(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_bytes", vanishing_stat)
+    assert probe.descendants(100) == (101,)
 
 
 def test_posix_lock_probe(tmp_path: Path):
