@@ -253,6 +253,38 @@ def test_help_lists_supported_options_without_building():
         assert option in result.stdout
 
 
+def test_mkbundle_respects_cargo_target_dir_override(tmp_path: Path) -> None:
+    _require_cargo()
+    result = subprocess.run(
+        [
+            "cargo",
+            "test",
+            "-p",
+            "sw-cli",
+            "--test",
+            "mgmt_layout",
+            "mkbundle_respects_cargo_target_dir_override",
+            "--",
+            "--ignored",
+            "--exact",
+        ],
+        cwd=REPO,
+        env=os.environ.copy(),
+        capture_output=True,
+        text=True,
+        timeout=900,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        "Rust mkbundle target-dir 回歸測試失敗："
+        f"stdout={result.stdout}\nstderr={result.stderr}"
+    )
+    assert "1 passed" in result.stdout, (
+        "pytest 必須確實執行 mkbundle_respects_cargo_target_dir_override："
+        f"stdout={result.stdout}\nstderr={result.stderr}"
+    )
+
+
 def _build_bundle(out: Path, version_override: str | None = None) -> Path:
     """以 `mkbundle.sh --dev` 建立指定目錄的新 bundle；失敗以 AssertionError 呈現（含 stderr）。"""
     _require_cargo()

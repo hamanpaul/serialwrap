@@ -12,11 +12,11 @@ tests/acceptance/l1_judge.py），複製閘門腳本到暫存樹後執行，不�
 - ab-report：ab_compare.py 的輸出（`result`、`cases[{id,class,…}]`）。
 - --l1-results <dir>：`<dir>/<platform>/<blackbox|cargo>/resource-report.json`（l1-results.v1）；
   blackbox 目錄另有同目錄 junit.xml。
+- --l15-report <path>|<platform>=<path>：可重複指定；未帶前綴時視為 linux。
+- --pytest-junit-report <path>：安全不變量引用的 test_rust_ pytest 節點必須在此 JUnit 中通過。
 - case id 慣例：`<檔名>::<函式名>`（與計畫各表一致）。
 
-紅燈：stage1a_gate.py 為 stub（exit 2、不產生報告），本檔測試以 strict xfail 標示。
-前置（P2 Task 13 `tests/acceptance/l1_judge.py`，唯一判定實作）：本 worktree 尚無此檔；
-閘門實作依計畫須載入它，未合併前 L1 相關判定無法通過，屬待補前置，不在本檔以斷言掩蓋。
+本檔直接執行 `stage1a_gate.py`，以暫存樹驗證 CLI 參數、證據判定與 fail-closed 行為；L1 集合由 P2 Task 13 的 `tests/acceptance/l1_judge.py` 判定。
 """
 from __future__ import annotations
 
@@ -169,7 +169,8 @@ class GateTree:
         self.win_report: dict[str, Any] | None = {"exe": "bin/serialwrap.exe", "passed": 3, "failed": 0,
                                                   "ignored": 0, "exit": 0}
         self.windows_com: str | None = None
-        self.l15_report: dict[str, Any] | None = None
+        self.l15_reports: list[tuple[str, dict[str, Any]]] = []
+        self.pytest_junit_xml: str | None = None
 
     def write(self) -> None:
         (self.root / "scripts" / "rust").mkdir(parents=True, exist_ok=True)
@@ -202,12 +203,14 @@ class GateTree:
             (out / "ab-report.json").write_text(json.dumps(self.ab_report, ensure_ascii=False), encoding="utf-8")
         if self.win_report is not None:
             (out / "win-report.json").write_text(json.dumps(self.win_report, ensure_ascii=False), encoding="utf-8")
-        if self.l15_report is not None:
-            (out / "l15-report.json").write_text(json.dumps(self.l15_report, ensure_ascii=False), encoding="utf-8")
+        for index, (_, report) in enumerate(self.l15_reports):
+            (out / f"l15-report-{index}.json").write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+        if self.pytest_junit_xml is not None:
+            (out / "pytest-junit.xml").write_text(self.pytest_junit_xml, encoding="utf-8")
         if self.windows_com is not None:
-            (out / "windows-com").mkdir(parents=True, exist_ok=True)
+            _write_windows_com_fixture(out, self.windows_com)
 
-    def run(self) -> tuple[int, dict[str, Any]]:
+    def run(self, *, legacy_l15_report: bool = False) -> tuple[int, dict[str, Any]]:
         self.write()
         out = self.root / "out"
         argv = [sys.executable, str(self.root / "scripts" / "rust" / "stage1a_gate.py"),
@@ -216,10 +219,13 @@ class GateTree:
             argv += ["--ab-report", str(out / "ab-report.json")]
         if self.win_report is not None:
             argv += ["--win-report", str(out / "win-report.json")]
-        if self.l15_report is not None:
-            argv += ["--l15-report", str(out / "l15-report.json")]
+        for index, (platform, _) in enumerate(self.l15_reports):
+            report_path = str(out / f"l15-report-{index}.json")
+            argv += ["--l15-report", report_path if legacy_l15_report else f"{platform}={report_path}"]
+        if self.pytest_junit_xml is not None:
+            argv += ["--pytest-junit-report", str(out / "pytest-junit.xml")]
         if self.windows_com is not None:
-            argv += ["--windows-com", str(out / "windows-com")]
+            argv += ["--windows-com", str(out)]
         r = subprocess.run(argv, capture_output=True, text=True, check=False)
         assert (out / "gate.json").exists(), f"閘門未產生報告（rc={r.returncode}，stderr={r.stderr.strip()!r}）"
         return r.returncode, json.loads((out / "gate.json").read_text(encoding="utf-8"))
@@ -228,6 +234,62 @@ class GateTree:
 @pytest.fixture
 def tree(tmp_path: Path) -> GateTree:
     return GateTree(tmp_path / "repo")
+
+
+_WIN_COM_P4 = "tests/contract_blackbox/test_cli_mgmt_daemon.py::test_autostart_l15_tx_once"
+_WIN_COM_SEQ = ["python-daemon-start", "session-list-ready", "cmd-submit", "cmd-status-poll",
+                "device-release", "session-list-released", "device-attach", "session-list-ready", "daemon-stop"]
+
+
+def _write_windows_com_fixture(out: Path, mode: str) -> None:
+    """依 win-blackbox.ps1 的 OutDir 佈局寫入 Windows COM 證據。
+
+    mode：valid（完整通過）、forged（僅有 verdict／windows_com 後門欄位）、
+    no-wire（缺 dut_stdin_write TX）、bad-order（序列步驟對調）。
+    """
+    if mode == "forged":
+        for name in ("windows-com.json", "report.json", "com-selftest.json"):
+            (out / name).write_text(json.dumps({"verdict": "PASS", "windows_com": "PASS"}), encoding="utf-8")
+        return
+    com = out / "windows-com"
+    (com / "bridge-selftest").mkdir(parents=True, exist_ok=True)
+    (com / "bridge").mkdir(parents=True, exist_ok=True)
+    (com / "bridge-selftest" / "selftest-report.json").write_text(json.dumps({"verdict": "PASS"}), encoding="utf-8")
+    names = list(_WIN_COM_SEQ)
+    if mode == "bad-order":
+        names[2], names[3] = names[3], names[2]
+    steps = [{"name": "python-daemon-start", "pid": 1}] + [
+        {"name": n, "returncode": 0} for n in names[1:]
+    ]
+    (com / "sequence-result.json").write_text(json.dumps({"result": "PASS", "steps": steps}), encoding="utf-8")
+    import base64
+    rows = [{"dir": "RX", "observation": "dut_stdout_read", "payload_b64": base64.b64encode(b"ok\n").decode()}]
+    if mode != "no-wire":
+        rows.append({"dir": "TX", "observation": "dut_stdin_write",
+                     "payload_b64": base64.b64encode(b"echo hi\n").decode()})
+    (com / "bridge" / "wire.ndjson").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    doc = {
+        "format": "windows-com-evidence.v1", "windows_com": "PASS", "com_pair": "COM20:COM21",
+        "selftest": {"status": "PASS"}, "sequence": {"status": "PASS"},
+        "bridge_stop": {"status": "PASS"},
+        "p4_case": {"nodeid": _WIN_COM_P4, "outcome": "passed"},
+    }
+    (out / "windows-com.json").write_text(json.dumps(doc), encoding="utf-8")
+
+
+def test_windows_com_valid_fixture_passes(tree):
+    tree.windows_com = "valid"
+    code, rep = tree.run()
+    assert rep["windows_com"] == "PASS", rep["windows_com_reasons"]
+
+
+@pytest.mark.parametrize("mode", ["forged", "no-wire", "bad-order"])
+def test_windows_com_invalid_evidence_is_not_pass(tree, mode):
+    tree.windows_com = mode
+    code, rep = tree.run()
+    assert rep["windows_com"] != "PASS"
+    assert rep["overall"] != "VERIFIED"
+    assert rep["windows_com_reasons"]
 
 
 def _l1_row(rep: dict[str, Any], set_id: str, platform: str) -> dict[str, Any]:
@@ -364,3 +426,208 @@ def test_l1_delegation_judged_from_blackbox_report(tree):
     assert _l1_row(rep, "s1a_cargo", "linux")["verdict"] == "evidence-insufficient"
     assert _l1_row(rep, "s1a_delegation", "linux")["verdict"] == "PASS"
     assert rep["overall"] == "FAIL"
+
+
+def test_slugged_contract_case_uses_source_ref(tree):
+    cid = "bb-session-reaches-ready"
+    source_ref = "tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_reaches_ready"
+    tree.cases.append({"case_id": cid, "layer": "L1", "cli_stage": "1A", "source_ref": source_ref})
+    tree.lock["sets"]["cli_1A"] = sorted([A1, cid, Z])
+    tree.ab_report["cases"].append({
+        "id": "test_bb_daemon_e2e.py::test_session_reaches_ready",
+        "case": "test_bb_daemon_e2e.py::test_session_reaches_ready",
+        "class": "ok",
+    })
+
+    _, rep = tree.run()
+
+    assert _case_row(rep, cid)["status"] == "ok"
+
+
+def test_slugged_contract_case_rejects_any_bad_source_ref_row(tree):
+    cid = "bb-session-reaches-ready"
+    source_ref = "tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_reaches_ready"
+    tree.cases.append({"case_id": cid, "layer": "L1", "cli_stage": "1A", "source_ref": source_ref})
+    tree.lock["sets"]["cli_1A"] = sorted([A1, cid, Z])
+    for class_name in ("ok", "regression"):
+        tree.ab_report["cases"].append({
+            "id": f"report-{class_name}",
+            "case": "test_bb_daemon_e2e.py::test_session_reaches_ready",
+            "class": class_name,
+        })
+
+    _, rep = tree.run()
+
+    assert _case_row(rep, cid)["status"] == "regression"
+
+
+def test_slugged_contract_case_does_not_fall_back_when_source_ref_is_absent(tree):
+    cid = "bb-session-reaches-ready"
+    tree.cases.append({
+        "case_id": cid,
+        "layer": "L1",
+        "cli_stage": "1A",
+        "source_ref": "tests/contract_blackbox/test_bb_daemon_e2e.py::test_missing_case",
+    })
+    tree.lock["sets"]["cli_1A"] = sorted([A1, cid, Z])
+    tree.ab_report["cases"].append({"id": cid, "class": "ok"})
+
+    _, rep = tree.run()
+
+    assert _case_row(rep, cid)["status"] == "evidence-insufficient"
+
+
+def test_l15_cases_are_found_across_repeated_reports(tree):
+    first = "l15-first-scenario"
+    second = "l15-second-scenario"
+    tree.cases.extend([
+        {"case_id": first, "layer": "L1.5", "platforms": ["linux", "windows"]},
+        {"case_id": second, "layer": "L1.5", "platforms": ["linux", "windows"]},
+    ])
+    tree.lock["sets"]["cli_1A"] = sorted([A1, first, second, Z])
+    tree.l15_reports = [
+        ("linux", {"results": [{"case_id": first, "verdict": "PASS", "gate_eligible": True}]}),
+        ("linux", {"results": [{"case_id": second, "verdict": "PASS", "gate_eligible": True}]}),
+    ]
+
+    _, rep = tree.run()
+
+    assert _case_row(rep, first)["status"] == "PASS"
+    assert _case_row(rep, second)["status"] == "PASS"
+
+
+def test_l15_case_requires_all_matching_rows_to_be_gate_eligible(tree):
+    cid = "l15-eligible-everywhere"
+    tree.cases.append({"case_id": cid, "layer": "L1.5", "platforms": ["linux", "windows"]})
+    tree.lock["sets"]["cli_1A"] = sorted([A1, cid, Z])
+    tree.l15_reports = [
+        ("linux", {"results": [{"case_id": cid, "verdict": "PASS", "gate_eligible": False}]}),
+        ("windows", {"results": [{"case_id": cid, "verdict": "PASS", "gate_eligible": True}]}),
+    ]
+
+    _, rep = tree.run()
+
+    assert _case_row(rep, cid)["status"] == "evidence-insufficient"
+
+
+def test_l15_case_fails_if_any_matching_row_fails(tree):
+    cid = "l15-fails-anywhere"
+    tree.cases.append({"case_id": cid, "layer": "L1.5", "platforms": ["linux", "windows"]})
+    tree.lock["sets"]["cli_1A"] = sorted([A1, cid, Z])
+    tree.l15_reports = [
+        ("linux", {"results": [{"case_id": cid, "verdict": "FAIL", "gate_eligible": True}]}),
+        ("windows", {"results": [{"case_id": cid, "verdict": "PASS", "gate_eligible": True}]}),
+    ]
+
+    _, rep = tree.run()
+
+    assert _case_row(rep, cid)["status"] == "FAIL"
+
+
+def test_windows_l15_case_cannot_use_linux_evidence(tree):
+    cid = "win-com-open-exclusive"
+    tree.cases.append({"case_id": cid, "layer": "L1.5", "platforms": ["windows"]})
+    tree.lock["sets"]["cli_1A"] = sorted([A1, cid, Z])
+    tree.l15_reports = [
+        ("linux", {"results": [{"case_id": cid, "verdict": "PASS", "gate_eligible": True}]}),
+    ]
+
+    _, rep = tree.run()
+
+    assert _case_row(rep, cid)["status"] == "evidence-insufficient"
+
+    tree.l15_reports.append(
+        ("windows", {"results": [{"case_id": cid, "verdict": "PASS", "gate_eligible": True}]})
+    )
+    _, rep = tree.run()
+
+    assert _case_row(rep, cid)["status"] == "PASS"
+
+
+def test_unprefixed_l15_report_path_is_linux_compatible(tree):
+    cid = "l15-legacy-linux-report"
+    tree.cases.append({"case_id": cid, "layer": "L1.5", "platforms": ["linux"]})
+    tree.lock["sets"]["cli_1A"] = sorted([A1, cid, Z])
+    tree.l15_reports = [
+        ("linux", {"results": [{"case_id": cid, "verdict": "PASS", "gate_eligible": True}]})
+    ]
+
+    _, rep = tree.run(legacy_l15_report=True)
+
+    assert _case_row(rep, cid)["status"] == "PASS"
+
+
+def _set_evidence_insufficient_invariant_cases(tree, cases: list[str]) -> None:
+    invariant = next(x for x in tree.coverage["invariants"] if x["id"] == "evidence-insufficient-never-pass")
+    invariant["cases"] = cases
+
+
+def test_evidence_insufficient_invariant_accepts_passing_pytest_junit(tree):
+    cases = [
+        "test_rust_ab_compare.py::test_classification",
+        "test_rust_stage1a_gate.py::test_l1_single_passing_case_is_insufficient",
+    ]
+    _set_evidence_insufficient_invariant_cases(tree, cases)
+    tree.pytest_junit_xml = (
+        '<testsuites tests="2" failures="0" errors="0" skipped="0">'
+        '<testsuite tests="2" failures="0" errors="0" skipped="0">'
+        '<testcase classname="tests.test_rust_ab_compare" name="test_classification" />'
+        '<testcase classname="tests.test_rust_stage1a_gate" '
+        'name="test_l1_single_passing_case_is_insufficient" />'
+        '</testsuite></testsuites>'
+    )
+
+    _, rep = tree.run()
+
+    invariant = next(x for x in rep["invariants"] if x["id"] == "evidence-insufficient-never-pass")
+    assert invariant["status"] == "PASS"
+    assert invariant["missing_or_failed"] == []
+
+
+def test_evidence_insufficient_invariant_fails_without_pytest_junit(tree):
+    cases = ["test_rust_ab_compare.py::test_classification"]
+    _set_evidence_insufficient_invariant_cases(tree, cases)
+
+    _, rep = tree.run()
+
+    invariant = next(x for x in rep["invariants"] if x["id"] == "evidence-insufficient-never-pass")
+    assert invariant["status"] == "FAIL"
+    assert invariant["missing_or_failed"] == cases
+    assert rep["overall"] == "FAIL"
+
+
+def test_evidence_insufficient_invariant_fails_on_pytest_junit_failure(tree):
+    case = "test_rust_ab_compare.py::test_classification"
+    _set_evidence_insufficient_invariant_cases(tree, [case])
+    tree.pytest_junit_xml = (
+        '<testsuites tests="1" failures="1" errors="0" skipped="0">'
+        '<testsuite tests="1" failures="1" errors="0" skipped="0">'
+        '<testcase classname="tests.test_rust_ab_compare" name="test_classification">'
+        '<failure message="assertion failed" />'
+        '</testcase></testsuite></testsuites>'
+    )
+
+    _, rep = tree.run()
+
+    invariant = next(x for x in rep["invariants"] if x["id"] == "evidence-insufficient-never-pass")
+    assert invariant["status"] == "FAIL"
+    assert invariant["missing_or_failed"] == [case]
+
+
+def test_evidence_insufficient_invariant_fails_when_junit_suite_has_other_error(tree):
+    case = "test_rust_ab_compare.py::test_classification"
+    _set_evidence_insufficient_invariant_cases(tree, [case])
+    tree.pytest_junit_xml = (
+        '<testsuites tests="2" failures="0" errors="1" skipped="0">'
+        '<testsuite tests="2" failures="0" errors="1" skipped="0">'
+        '<testcase classname="tests.test_rust_ab_compare" name="test_classification" />'
+        '<testcase classname="tests.test_unrelated" name="test_other_case">'
+        '<error message="fixture setup failed" />'
+        '</testcase></testsuite></testsuites>'
+    )
+
+    _, rep = tree.run()
+
+    invariant = next(x for x in rep["invariants"] if x["id"] == "evidence-insufficient-never-pass")
+    assert invariant["status"] == "FAIL"
+    assert invariant["missing_or_failed"] == [case]

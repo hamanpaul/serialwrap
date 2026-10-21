@@ -275,6 +275,11 @@ def test_duplicate_nodeid_preserved(tmp_path: Path) -> None:
 def test_list_only_feeds_regen_lock(tmp_path: Path) -> None:
     _assert_script()
     exe = _write_exe(tmp_path / "exe_a", TARGET, run_out="run_a_ok.txt")
+    ignored = exe.parent / "list_ignored.txt"
+    ignored.write_text(
+        ignored.read_text(encoding="utf-8") + "windows_switch_running_exe_rename: test\n",
+        encoding="utf-8",
+    )
     bin_dir = tmp_path / "bin"
     _write_cargo(bin_dir, [_artifact(exe, TARGET)])
     collect = tmp_path / "collect.json"
@@ -289,9 +294,10 @@ def test_list_only_feeds_regen_lock(tmp_path: Path) -> None:
     assert collect.is_file(), f"--list-only 未寫出輸出；stderr={r.stderr[-2000:]}"
     data = json.loads(collect.read_text(encoding="utf-8"))
     assert set(data) == {"collected"}                              # 只含 collected，不含執行結果
-    assert sorted(data["collected"]) == sorted([A, B, C])
+    assert sorted(data["collected"]) == sorted([A, B])             # 凍結分母只收可執行的非 cap_* 案例
+    assert all(not nodeid.rsplit("::", 1)[-1].startswith("cap_") for nodeid in data["collected"])
 
-    # 以 P2 Task 13 的 regen_lock.py 登記到暫存鎖檔（副本），必須成功登記三筆
+    # 以 P2 Task 13 的 regen_lock.py 登記到暫存鎖檔（副本），必須成功登記兩筆
     regen = ACCEPTANCE / "regen_lock.py"
     assert regen.is_file(), "tests/acceptance/regen_lock.py 不存在：P2 Task 13 尚未合併（前置缺口，見 plan §0.2）"
     acc = tmp_path / "tests" / "acceptance"
@@ -315,4 +321,4 @@ def test_list_only_feeds_regen_lock(tmp_path: Path) -> None:
     )
     assert rr.returncode == 0, rr.stderr[-2000:]
     got = json.loads(lock.read_text(encoding="utf-8"))["sets"]["t"]["linux"]["nodeids"]
-    assert got == sorted([A, B, C])
+    assert got == sorted([A, B])
