@@ -5,11 +5,8 @@
 `tools.stage3.canary_policy` 與 `stage3_fakes`，使 `python3 -m pytest -q --collect-only tests/` 在實作前後皆能完成收集。
 本檔不實作任何 production 程式；替身與政策模組（Task 1、Task 2）尚未存在時，紅燈原因即為模組不存在（ModuleNotFoundError）。
 
-計畫內部的不一致（已於對應測試以註解標示）：
-- Step 1 表格把「ended_steady=False 的 episode（序列末端、跨缺口、跨 daemon pid 變更）→ 無 cycle」寫為期望；
-  但 Interfaces 規則明定這類 episode 仍輸出 `result="ended_non_ready"` 的 cycle（只作紀錄、不計入配額），
-  且 `test_reconfirm_failed_is_not_steady` 亦要求此類 cycle 存在。因此上述三個測試改以
-  「不得出現 `recovered_ready` cycle（即不計入配額）」斷言，兩種實作皆相容。
+計畫曾把未完成 episode 寫成「無 cycle」，與 Interfaces 的 `ended_non_ready` 紀錄規則衝突；
+此處依 Interfaces 統一為保留一筆 `ended_non_ready` cycle，並明確驗證其不會計入配額。
 """
 
 from __future__ import annotations
@@ -81,7 +78,9 @@ def _nid() -> int:
     return next(_IDS)
 
 
-def _submit(n: int, wall_ts: str, *, com: str = COM, source: str = "agent:a", platform: str = "linux") -> dict:
+def _submit(
+    n: int, wall_ts: str, *, com: str | None = COM, source: str = "agent:a", platform: str = "linux"
+) -> dict:
     """帳本 submit 紀錄（欄位依 Task 1 帳本紀錄型別表）。cmd_id 為 arbiter 形式 32 hex。"""
     return {
         "type": "submit",
@@ -111,7 +110,14 @@ def _result(n: int, status: str, t_wall: str, *, error_code: str | None = None, 
     }
 
 
-def _signal(kind: str, wall_ts: str, *, com: str = COM, source: str = "system:recover", platform: str = "linux") -> dict:
+def _signal(
+    kind: str,
+    wall_ts: str,
+    *,
+    com: str | None = COM,
+    source: str = "system:recover",
+    platform: str = "linux",
+) -> dict:
     """帳本 wal_signal 紀錄（kind 為 Task 8 WalSignal.kind，例如 human_tx／recover_tx）。"""
     return {
         "type": "wal_signal",
@@ -194,15 +200,51 @@ def test_tree_change_between_snapshots_not_attributed():  # R4-F1，failing-firs
     assert cc.attribute_artifact(fakes.ts(3, 1, 1, 30), [a, b, c]) != cc.Attribution("art-1", fakes.BTREE, fakes.RTREE)
 
 
+def test_snapshot_lookups_scale_with_sorted_index(monkeypatch):
+    cc = _cc()
+    base = datetime(2026, 11, 3, tzinfo=timezone.utc)
+    rows = [
+        {
+            "t_wall": (base + timedelta(seconds=index * 30)).isoformat(),
+            "record_id": f"snapshot-{index:05d}",
+            "daemon_ok": True,
+            "daemon_pid": 100,
+            "artifact_check": "verified",
+            "artifact_id": "art-1",
+            "bundle_tree_sha256": "b" * 64,
+            "runtime_tree_sha256": "d" * 64,
+            "sessions": [{"com": COM}],
+        }
+        for index in range(10_000)
+    ]
+    actual_parse = cc.jsonio.parse_iso
+    parse_calls = 0
+
+    def counted_parse(value):
+        nonlocal parse_calls
+        parse_calls += 1
+        return actual_parse(value)
+
+    monkeypatch.setattr(cc.jsonio, "parse_iso", counted_parse)
+    target = rows[5_000]["t_wall"]
+    assert cc.attribute_artifact(target, rows) == cc.Attribution("art-1", "b" * 64, "d" * 64)
+    assert parse_calls < 100
+
+    parse_calls = 0
+    evidence = cc._snapshot_evidence("h1", COM, target, target, {"h1": rows}, 0)
+    assert evidence == ["snapshot:snapshot-05000"]
+    assert parse_calls < 100
+
+
 def test_episode_across_gap_not_counted(tmp_path):
     fakes = _fakes()
     cc = _cc()
     pol = _pol(tmp_path)
     # 第一段 READY→RELEASED 之後快照間隔 29.5 分鐘（> 30 s × 3），episode 被切斷。
-    # 計畫原文期望 classify == []；見檔頭說明，此處只斷言「不得計入配額」。
     snaps = _timeline(fakes, ["READY", "RELEASED"]) + _timeline(fakes, ["RELEASED", "READY"], start_s=1800)
-    counted = [c for c in cc.classify(snaps, [], [], [], pol, platform="linux") if c.result == "recovered_ready"]
-    assert counted == []
+    assert [(c.type, c.result) for c in cc.classify(snaps, [], [], [], pol, platform="linux")] == [
+        ("handoff_release_attach", "ended_non_ready")
+    ]
 
 
 def test_hotplug_requires_generation_bump(tmp_path):
@@ -289,8 +331,49 @@ def test_recovery_from_unsnapshotted_recover_tx(tmp_path):
     snaps = _timeline(fakes, ["READY"] * 5)  # 全程 READY，無 episode
     close = [_signal("recover_tx", _iso(10)), _signal("recover_tx", _iso(40))]  # 相隔 30 s
     far = [_signal("recover_tx", _iso(10)), _signal("recover_tx", _iso(310))]  # 相隔 300 s
-    assert [c.type for c in cc.classify(snaps, [], close, [], pol, platform="linux")] == ["recovery"]
-    assert [c.type for c in cc.classify(snaps, [], far, [], pol, platform="linux")] == ["recovery", "recovery"]
+    close_cycles = cc.classify(snaps, [], close, [], pol, platform="linux")
+    assert [(c.type, c.result) for c in close_cycles] == [("recovery", "recovered_ready")]
+    assert any(ref.startswith("snapshot:") for ref in close_cycles[0].evidence)
+    far_cycles = cc.classify(snaps, [], far, [], pol, platform="linux")
+    assert [(c.type, c.result) for c in far_cycles] == [
+        ("recovery", "recovered_ready"),
+        ("recovery", "ended_non_ready"),
+    ]
+
+
+def test_untracked_recovery_requires_steady_same_daemon_snapshot(tmp_path):
+    fakes = _fakes()
+    cc = _cc()
+    pol = _pol(tmp_path)
+    cases = [
+        (
+            [
+                fakes.snapshot(_iso(0), sessions=((COM, "ATTACHED", 1),)),
+                fakes.snapshot(_iso(30), sessions=((COM, "ATTACHED", 1),)),
+                fakes.snapshot(_iso(60), sessions=((COM, "ATTACHED", 1),)),
+            ],
+            _iso(10),
+        ),
+        (
+            [
+                fakes.snapshot(_iso(0), sessions=((COM, "RECOVERING", 1),)),
+                fakes.snapshot(_iso(600), sessions=((COM, "RECOVERING", 1),)),
+            ],
+            _iso(300),
+        ),
+        (
+            [
+                fakes.snapshot(_iso(0), pid=100),
+                fakes.snapshot(_iso(30), pid=101),
+            ],
+            _iso(10),
+        ),
+    ]
+    for snaps, signal_wall in cases:
+        cycles = cc.classify(
+            snaps, [], [_signal("recover_tx", signal_wall)], [], pol, platform="linux"
+        )
+        assert [(cycle.type, cycle.result) for cycle in cycles] == [("recovery", "ended_non_ready")]
 
 
 def test_recover_tx_inside_episode_not_double_counted(tmp_path):
@@ -299,7 +382,22 @@ def test_recover_tx_inside_episode_not_double_counted(tmp_path):
     pol = _pol(tmp_path)
     snaps = _timeline(fakes, ["READY", "ATTACHED", "READY"])
     signals = [_signal("recover_tx", _iso(30))]  # 落在 episode（ATTACHED 快照）期間
-    assert [c.type for c in cc.classify(snaps, [], signals, [], pol, platform="linux")] == ["recovery"]
+    cycles = cc.classify(snaps, [], signals, [], pol, platform="linux")
+    assert [(c.type, c.result) for c in cycles] == [("recovery", "recovered_ready")]
+
+
+def test_recover_tx_claimed_by_only_one_overlapping_episode(tmp_path):
+    fakes = _fakes()
+    cc = _cc()
+    pol = _pol(tmp_path)
+    snaps = [
+        fakes.snapshot(_iso(second), sessions=((COM, state, 1),))
+        for second, state in ((0, "READY"), (30, "ATTACHED"), (60, "READY"), (80, "ATTACHED"), (110, "READY"))
+    ]
+    signal = _signal("recover_tx", _iso(55))
+    cycles = cc.classify(snaps, [], [signal], [], pol, platform="linux")
+    assert [(cycle.type, cycle.result) for cycle in cycles] == [("recovery", "recovered_ready")]
+    assert cycles[0].evidence.count(f"wal:{signal['seq']}") == 1
 
 
 def test_unfinished_episode_dropped(tmp_path):
@@ -307,9 +405,9 @@ def test_unfinished_episode_dropped(tmp_path):
     cc = _cc()
     pol = _pol(tmp_path)
     snaps = _timeline(fakes, ["READY", "RELEASED"])  # 序列末端仍非穩態
-    # 計畫原文期望 無 cycle；見檔頭說明，此處只斷言「不得計入配額」。
-    counted = [c for c in cc.classify(snaps, [], [], [], pol, platform="linux") if c.result == "recovered_ready"]
-    assert counted == []
+    assert [(c.type, c.result) for c in cc.classify(snaps, [], [], [], pol, platform="linux")] == [
+        ("handoff_release_attach", "ended_non_ready")
+    ]
 
 
 def test_pid_change_splits_episode(tmp_path):
@@ -320,9 +418,10 @@ def test_pid_change_splits_episode(tmp_path):
         fakes,
         [_r("READY", pid=100), _r("RELEASED", pid=100), _r("ATTACHING", pid=101), _r("READY", pid=101)],
     )
-    # episode 中途 daemon pid 改變 → 切斷；計畫原文期望 無 cycle，見檔頭說明。
-    counted = [c for c in cc.classify(snaps, [], [], [], pol, platform="linux") if c.result == "recovered_ready"]
-    assert counted == []
+    # episode 中途 daemon pid 改變 → 保留切斷前的未完成紀錄，不得計入配額。
+    assert [(c.type, c.result) for c in cc.classify(snaps, [], [], [], pol, platform="linux")] == [
+        ("handoff_release_attach", "ended_non_ready")
+    ]
 
 
 def test_passthrough_attached_is_steady(tmp_path):
@@ -389,6 +488,14 @@ def test_coexist_bucket_and_cap(tmp_path):
     assert {c.type for c in cycles} == {"human_agent_coexist"}
 
 
+def test_null_com_does_not_pair_as_coexist(tmp_path):
+    cc = _cc()
+    pol = _pol(tmp_path)
+    submit = _submit(1, _iso(0), com=None)
+    signal = _signal("human_tx", _iso(0), com=None, source="human:alice")
+    assert cc.classify([], [submit], [signal], [], pol, platform="linux") == []
+
+
 def test_planned_restart_cycle(tmp_path):
     fakes = _fakes()
     cc = _cc()
@@ -397,7 +504,8 @@ def test_planned_restart_cycle(tmp_path):
 
     # (a) pid 100→101 且 note 覆蓋
     snaps = [fakes.snapshot(_iso(0, hour=10), pid=100), fakes.snapshot(_iso(120, hour=10), pid=101)]
-    assert [c.type for c in cc.classify(snaps, [], [], [note], pol, platform="linux")] == ["planned_restart"]
+    cycles = cc.classify(snaps, [], [], [note], pol, platform="linux")
+    assert [(c.type, c.result) for c in cycles] == [("planned_restart", "recovered_ready")]
 
     # (b) 中間夾一個 daemon_ok=False 的失聯快照，仍成立
     snaps_gap = [
@@ -405,10 +513,24 @@ def test_planned_restart_cycle(tmp_path):
         fakes.snapshot(_iso(60, hour=10), ok=False, pid=None),
         fakes.snapshot(_iso(120, hour=10), pid=101),
     ]
-    assert [c.type for c in cc.classify(snaps_gap, [], [], [note], pol, platform="linux")] == ["planned_restart"]
+    cycles_gap = cc.classify(snaps_gap, [], [], [note], pol, platform="linux")
+    assert [(c.type, c.result) for c in cycles_gap] == [("planned_restart", "recovered_ready")]
 
     # (c) 無 note → 無 cycle（由 Task 11 開事故）
     assert cc.classify(snaps, [], [], [], pol, platform="linux") == []
+
+
+def test_planned_restart_without_steady_session_is_not_counted(tmp_path):
+    fakes = _fakes()
+    cc = _cc()
+    pol = _pol(tmp_path)
+    note = _note("planned_restart", _iso(-120, hour=10), _iso(300, hour=10))
+    snaps = [
+        fakes.snapshot(_iso(0, hour=10), pid=100),
+        fakes.snapshot(_iso(120, hour=10), pid=101, sessions=((COM, "DETACHED", 2),)),
+    ]
+    cycles = cc.classify(snaps, [], [], [note], pol, platform="linux")
+    assert [(cycle.type, cycle.result) for cycle in cycles] == [("planned_restart", "ended_non_ready")]
 
 
 def test_unverified_artifact_not_attributed():
@@ -496,3 +618,16 @@ def test_coverage_ignores_gaps(tmp_path):
     assert cc.active_days(
         subs, snaps, pol, platform="linux", content=cc.Attribution("art-1", fakes.BTREE, fakes.RTREE), results=res
     ) == []
+
+
+def test_unverified_snapshots_do_not_add_active_day_coverage(tmp_path):
+    fakes = _fakes()
+    cc = _cc()
+    pol = _pol(tmp_path)
+    snaps = _content_snapshots(fakes)
+    for snapshot in snaps[1:]:
+        snapshot["artifact_check"] = "version_mismatch"
+    subs = [_submit(index + 1, _iso(0)) for index in range(20)]
+    results = [_result(index + 1, "done", _iso(0)) for index in range(20)]
+    content = cc.Attribution("art-1", fakes.BTREE, fakes.RTREE)
+    assert cc.active_days(subs, snaps, pol, platform="linux", content=content, results=results) == []

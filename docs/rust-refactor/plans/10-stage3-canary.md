@@ -2170,13 +2170,13 @@ def active_days(submits: Sequence[dict], snapshots: Sequence[dict], policy: Cana
 規則：
 - `episodes`：每 (host, com) 依 `t_wall` 排序；只取 `daemon_ok` 為 true 的快照；一個 episode＝前一個快照為穩態（`steady`）、之後連續 ≥1 個非穩態、再回到穩態（`ended_steady=True`）；相鄰快照間隔 > `collector_interval_s × episode_max_gap_factor` 時切斷、跨 daemon pid 變更時切斷、序列末端仍非穩態——這三種情形輸出 `ended_steady=False` 的 episode（只作紀錄）。`READY → READY(boot_quiet_remaining_s=12, ready_reconfirm_pending) → READY` 即形成一個 episode（非穩態不必改變 state）。
 - `classify_episode` 優先序：含 `RELEASED` → `handoff_release_attach`；含 `FLASHING` → linux 為 `flash`、windows 回 None；含 `DETACHED` 且 `after_generation > before_generation`（同一 daemon pid 內才比較）→ `hotplug_reattach`；`boot_signal` → `dut_reboot`；含 `RECOVERING` 或 `recover_tx_seen` → `recovery`；否則 None（不計）。`ended_steady=False` 時 cycle `result="ended_non_ready"`，否則 `"recovered_ready"`；只有 `recovered_ready` 計入配額。
-- `recover_tx_seen`：episode 期間（`start_wall - collector_interval_s` 至 `end_wall`）同 com 有 `recover_tx` 訊號。
-- 未被任何 episode 覆蓋的 `recover_tx` 訊號：同 com 以 `recover_cluster_s` 聚成一群，每群一個 `recovery` cycle（快速恢復未被快照捕捉）。
-- `human_agent_coexist`：同 com、同 `floor(epoch / coexist_bucket_s)` 桶內同時有 `human_tx` 訊號與該 com 的 submit → 一個 cycle；每 (host, com, 本地日期) 至多 `coexist_cap_per_day` 個。
-- `planned_restart`：同 host 的「前一個 `daemon_ok` 快照」與「本 `daemon_ok` 快照」（中間的失聯快照略過）daemon pid 不同、同 boot_id，且某筆 `note.kind == "planned_restart"` 的 `[from, to]` 覆蓋本快照時間 → 一個 cycle。
+- `recover_tx_seen`：episode 期間（`start_wall - collector_interval_s` 至 `end_wall`）同 com 有 `recover_tx` 訊號；一筆訊號至多歸屬一個 episode，若時間窗重疊，由時間最早的 episode 認領，避免重複計數。
+- 未被任何 episode 覆蓋的 `recover_tx` 訊號：同 com 以 `recover_cluster_s` 聚成一群，每群一個 `recovery` cycle（快速恢復未被快照捕捉）；只有在首筆訊號前 `collector_interval_s × episode_max_gap_factor` 內有同 host／COM／daemon pid 的 `daemon_ok` 快照，且群組結束後同一 daemon pid 持續可觀測、於同一間隔內出現該 COM 的穩態快照，結果才是 `recovered_ready` 並可計入配額；否則保留 `ended_non_ready` 紀錄，且不得計入配額。穩態證據快照須列入 `evidence`。
+- `human_agent_coexist`：同 com 為非空字串，且同 `floor(epoch / coexist_bucket_s)` 桶內同時有 `human_tx` 訊號與該 com 的 submit → 一個 cycle；null 或非字串 com 不得轉成字串配對；每 (host, com, 本地日期) 至多 `coexist_cap_per_day` 個。
+- `planned_restart`：同 host 的「前一個 `daemon_ok` 快照」與「本 `daemon_ok` 快照」（中間的失聯快照略過）daemon pid 不同、同 boot_id，且某筆 `note.kind == "planned_restart"` 的 `[from, to]` 覆蓋本快照時間 → 一個 cycle。只有同一新 daemon pid 在 `collector_interval_s × episode_max_gap_factor` 內持續可觀測，且本快照或後續快照至少有一個穩態 session，結果才是 `recovered_ready`；否則為 `ended_non_ready`。穩態證據快照須列入 `evidence`。
 - 每個 cycle 的 `artifact_id`／`bundle_tree_sha256`／`runtime_tree_sha256` 取自 `attribute_artifact(start_wall, …)`（None 時三者皆 None）。
 - `attribute_artifact`：找同 host 中 `t_wall <= ts` 的最後快照 p 與 `t_wall >= ts` 的第一個快照 n；兩者都存在、`daemon_ok`、`artifact_check == "verified"`、`artifact_id` 相同且非 None、`bundle_tree_sha256` 與 `runtime_tree_sha256` 分別相同且非 None、`daemon_pid` 相同 → `Attribution(artifact_id, bundle_tree_sha256, runtime_tree_sha256)`；否則 None（模糊不計；R4-F1：前後快照之間部署內容改變——例如旁載 `bin/version.dll`——即模糊）。
-- `active_days`：本地日期一律以 `canary_policy.local_date(quota, ts)`（含 `utc_offset_changes`）換算。某本地日期符合 (a) 該日歸屬 `content`（`attribute_artifact` 結果整組相等）的相異 submit 數 ≥ `active_day_min_distinct_submits`（`require_terminal_result` 時只計有終態 `submit_result` 者），且 (b) 該日快照覆蓋秒數 ≥ `active_day_min_snapshot_coverage_s`，覆蓋＝同日、兩端快照的 (`artifact_id`, `bundle_tree_sha256`, `runtime_tree_sha256`) 皆等於 `content`、`daemon_ok` 的相鄰快照對，間隔 ≤ `3 × collector_interval_s` 者的間隔總和。
+- `active_days`：本地日期一律以 `canary_policy.local_date(quota, ts)`（含 `utc_offset_changes`）換算。某本地日期符合 (a) 該日歸屬 `content`（`attribute_artifact` 結果整組相等）的相異 submit 數 ≥ `active_day_min_distinct_submits`（`require_terminal_result` 時只計有終態 `submit_result` 者），且 (b) 該日快照覆蓋秒數 ≥ `active_day_min_snapshot_coverage_s`，覆蓋＝同日、兩端快照的 (`artifact_id`, `bundle_tree_sha256`, `runtime_tree_sha256`) 皆等於 `content`、`artifact_check == "verified"`、`daemon_ok` 的相鄰快照對，間隔 ≤ `3 × collector_interval_s` 者的間隔總和。
 
 **Steps:**
 
@@ -2227,7 +2227,8 @@ def test_tree_change_between_snapshots_not_attributed():      # R4-F1，failing-
 
 def test_episode_across_gap_not_counted(pol):
     snaps = _snaps(["READY", "RELEASED"]) + _snaps(["RELEASED", "READY"], start_min=30)
-    assert cc.classify(snaps, [], [], [], pol, platform="linux") == []
+    cycles = cc.classify(snaps, [], [], [], pol, platform="linux")
+    assert [(c.type, c.result) for c in cycles] == [("handoff_release_attach", "ended_non_ready")]
 
 
 def test_hotplug_requires_generation_bump(pol):
@@ -2254,20 +2255,25 @@ def test_ambiguous_artifact_is_none():
 | `test_reconfirm_failed_is_not_steady` | `READY, READY(ready_reconfirm_failed=True)` 結尾 → 一個 `ended_non_ready` cycle，不計入配額 |
 | `test_boot_quiet_ready_forms_episode` | 全程 state 皆為 `READY`、僅中間一筆帶 `boot_quiet_remaining_s` → `episodes` 非空（守住上述產品事實：不得把 `READY＋boot quiet` 當穩態） |
 | `test_recovery_from_state` | `READY, RECOVERING, READY` → `["recovery"]` |
-| `test_recovery_from_unsnapshotted_recover_tx` | 全 READY 快照＋兩筆 `recover_tx` 相隔 30 s → 1 個 `recovery`；相隔 300 s → 2 個 |
+| `test_recovery_from_unsnapshotted_recover_tx` | 全 READY 快照＋兩筆 `recover_tx` 相隔 30 s → 1 個 `recovered_ready` recovery，並帶穩態快照證據；相隔 300 s → 兩群 recovery，只有有同 daemon 穩態快照證據者為 `recovered_ready` |
+| `test_untracked_recovery_requires_steady_same_daemon_snapshot` | 快照維持 ATTACHED／RECOVERING、觀測間隔超限或 daemon pid 改變時，未覆蓋的 `recover_tx` 只輸出 `ended_non_ready` |
+| `test_recover_tx_claimed_by_only_one_overlapping_episode` | 一筆 `recover_tx` 落入兩個 episode 的重疊窗口時，只由時間最早的 episode 認領並輸出一個 cycle |
 | `test_recover_tx_inside_episode_not_double_counted` | `READY, ATTACHED, READY` 期間有 `recover_tx` → 只 1 個 `recovery` |
-| `test_unfinished_episode_dropped` | 序列末端停在 `RELEASED` → 無 cycle |
-| `test_pid_change_splits_episode` | episode 中途 daemon pid 改變 → 無 cycle |
+| `test_unfinished_episode_dropped` | 序列末端停在 `RELEASED` → 一筆 `handoff_release_attach`、`ended_non_ready` 紀錄，不計入配額 |
+| `test_pid_change_splits_episode` | episode 中途 daemon pid 改變 → 保留切斷前一筆 `handoff_release_attach`、`ended_non_ready` 紀錄，不計入配額 |
 | `test_passthrough_attached_is_steady` | `command_capable=False` 的 COM 恆 ATTACHED → 無 episode；`platform="passthrough"` 同；使用者自訂名稱的 passthrough profile 亦同（不依 profile 名稱） |
 | `test_passthrough_ready_is_steady` | SC-35：`platform="passthrough"`（`command_capable=False` 與 `True` 各一）的 COM 序列 ATTACHED（持續 RX）→ READY（30 s 安靜後，`boot_quiet_remaining_s` 為 None、`ready_reconfirm_pending` 為 False）→ 無 episode、無 cycle，且不觸發 `stuck_attached` |
-| `test_coexist_bucket_and_cap` | 同 com 同日 7 個桶都有 human＋agent → 恰 5 個 `human_agent_coexist`（cap） |
-| `test_planned_restart_cycle` | pid 100→101 且 note 覆蓋 → `["planned_restart"]`；中間夾一個 `daemon_ok=False` 快照仍成立；無 note → 無 cycle（由 Task 11 開事故） |
+| `test_coexist_bucket_and_cap` | 同 com 同日 7 個桶都有 human＋agent → 恰 5 個 `human_agent_coexist`（cap）；null com 不得形成共存 cycle |
+| `test_planned_restart_cycle` | pid 100→101 且 note 覆蓋、重啟後有穩態 session → `["planned_restart"]` 且 `recovered_ready`；中間夾一個 `daemon_ok=False` 快照仍成立；無 note → 無 cycle（由 Task 11 開事故） |
+| `test_planned_restart_without_steady_session_is_not_counted` | planned restart 後同一 pid 的快照皆無穩態 session → 保留 `ended_non_ready`，不計入配額 |
 | `test_unverified_artifact_not_attributed` | 兩側快照 `artifact_check="version_mismatch"` → `attribute_artifact` 為 None；兩側 `artifact_check="verified"` 但 `bundle_tree=None` → 同為 None（R4-F1：無內容指紋不歸屬） |
 | `test_active_day_threshold` | 某日 19 個（皆有 `done` 結果）submit → 非活躍；20 個且覆蓋 3,600 s → 活躍；20 個但其中 1 個結果 `unknown` → 非活躍 |
 | `test_active_day_uses_utc_offset` | policy 覆寫 `platforms.linux.utc_offset_minutes=480`，submit 在 `2026-11-03T17:00:00+00:00` → 計入本地 `2026-11-04` |
 | `test_active_day_other_artifact_excluded` | 20 個 submit 歸屬 art-2，查 `content=Attribution("art-1", fakes.BTREE, fakes.RTREE)` → `[]` |
 | `test_active_day_other_tree_excluded`（R4-F1） | 20 個 submit 與覆蓋 3,600 s 的快照皆為 `artifact="art-1"` 但 `bundle_tree="e"*64, runtime_tree="f"*64`（同 manifest 的旁載安裝）→ 查 `Attribution("art-1", fakes.BTREE, fakes.RTREE)` 得 `[]`、查 `Attribution("art-1", "e"*64, "f"*64)` 得該日 |
 | `test_coverage_ignores_gaps` | 快照間隔 10 分鐘（> 3×30 s）→ 覆蓋為 0，非活躍 |
+| `test_unverified_snapshots_do_not_add_active_day_coverage` | 有相同 artifact/tree 欄位但 `artifact_check != "verified"` 的快照不得累計覆蓋秒數 |
+| `test_snapshot_lookups_scale_with_sorted_index` | 10,000 筆已排序快照的歸屬與證據查找只解析對數量級的時間鍵，避免每筆 submit／cycle 重掃全份快照 |
 
 - [ ] **Step 2：Run** `python3 -m pytest -q tests/test_stage3_canary_classify.py` → Expected: FAIL（`ImportError`）。
 - [ ] **Step 3：實作**（luna）依規則；所有時間比較以 `jsonio.parse_iso`；排序穩定（同時間以 `record_id` 次序）；依 P0 T14 在測試檔頭寫 `pytestmark`。
