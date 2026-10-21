@@ -8,6 +8,7 @@ COLLECTOR="$ROOT/scripts/rust/cargo_l1_results.py"
 CAPS=()
 PACKAGES=()
 CARGO_ARGS=()
+L1_SET="s1a_cargo"
 DRY_RUN=0
 
 while [[ $# -gt 0 ]]; do
@@ -21,6 +22,14 @@ while [[ $# -gt 0 ]]; do
     --package)
       [[ $# -ge 2 ]] || { echo "win-test.sh: --package 缺少值" >&2; exit 2; }
       PACKAGES+=(--package "$2")
+      shift 2
+      ;;
+    --l1-set)
+      [[ $# -ge 2 ]] || { echo "win-test.sh: --l1-set 缺少值" >&2; exit 2; }
+      case "$2" in
+        s1a_cargo|s1b_cargo) L1_SET="$2" ;;
+        *) echo "win-test.sh: 不支援的 L1 cargo 集合 $2" >&2; exit 2 ;;
+      esac
       shift 2
       ;;
     --dry-run) DRY_RUN=1; shift ;;
@@ -68,6 +77,7 @@ collector_args+=("${PACKAGES[@]}")
 collector_args+=("${CARGO_ARGS[@]}")
 
 if [[ "$DRY_RUN" == "1" ]]; then
+  printf 'L1 set: %s\n' "$L1_SET"
   if [[ "$is_wsl" == "1" ]]; then
     printf 'CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=%s\n' "$CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER"
     printf 'CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=%s\n' "$CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER"
@@ -101,7 +111,7 @@ python3 "$COLLECTOR" --out "$l1_path" --summary-out "$summary_path" "${collector
 collector_rc=$?
 set -e
 
-python3 - "$ROOT" "$l1_path" "$summary_path" "$report_path" "$run_id" "$collector_rc" "${CAPS[*]}" <<'PY'
+python3 - "$ROOT" "$l1_path" "$summary_path" "$report_path" "$run_id" "$collector_rc" "${CAPS[*]}" "$L1_SET" <<'PY'
 from __future__ import annotations
 
 import json
@@ -109,7 +119,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
-root, l1_path, summary_path, report_path, run_id, collector_rc, caps_raw = sys.argv[1:]
+root, l1_path, summary_path, report_path, run_id, collector_rc, caps_raw, l1_set = sys.argv[1:]
 l1 = json.loads(Path(l1_path).read_text(encoding="utf-8")) if Path(l1_path).exists() else {}
 summary = json.loads(Path(summary_path).read_text(encoding="utf-8")) if Path(summary_path).exists() else {}
 exes = summary.get("exes", [])
@@ -130,9 +140,9 @@ if not lock_path.is_file():
 if judge_path.is_file() and lock_path.is_file():
     try:
         lock = json.loads(lock_path.read_text(encoding="utf-8"))
-        required = lock.get("sets", {}).get("s1a_cargo", {}).get("windows")
+        required = lock.get("sets", {}).get(l1_set, {}).get("windows")
         if not isinstance(required, dict) or not isinstance(required.get("nodeids"), list):
-            l1_reasons.append("s1a_cargo_windows_lock_missing")
+            l1_reasons.append(f"{l1_set}_windows_lock_missing")
         elif required.get("selector", {}).get("argv") != l1.get("argv"):
             l1_reasons.append("s1a_cargo_windows_selector_mismatch")
         else:
@@ -149,7 +159,7 @@ if judge_path.is_file() and lock_path.is_file():
                     l1_reasons.append(f"l1_{l1_verdict.lower()}")
     except Exception as exc:
         l1_reasons.append(f"l1_judge_error:{type(exc).__name__}")
-# 本報告的 overall 僅表示要求的 Cargo 執行是否完整成功；Stage 1A 的凍結清單判定由 l1_verdict 單獨保留，出口 gate 必須同時檢查兩者。
+# 本報告的 overall 僅表示要求的 Cargo 執行是否完整成功；指定凍結清單判定由 l1_verdict 單獨保留，出口 gate 必須同時檢查兩者。
 run_ok = (collector_rc == "0" and bool(exes) and l1.get("finished") is True
           and l1.get("exit_code") == 0
           and all(item.get("failed") == 0 and item.get("exit") == 0 for item in exes))
@@ -160,6 +170,7 @@ report = {
     "overall": overall,
     "evidence_insufficient": sorted(evidence),
     "l1_results": Path(l1_path).name,
+    "l1_set": l1_set,
     "l1_verdict": l1_verdict,
     "l1_reasons": sorted(set(l1_reasons)),
 }

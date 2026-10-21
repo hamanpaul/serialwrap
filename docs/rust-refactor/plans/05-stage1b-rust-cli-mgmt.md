@@ -3544,7 +3544,7 @@ def test_p4_required_cases_have_passing_evidence():
 
 ```bash
 cargo test --workspace && cargo build --workspace --release
-scripts/rust/win-test.sh --package sw-pal --package sw-cli
+scripts/rust/win-test.sh --l1-set s1b_cargo --package sw-pal --package sw-cli
 SW_BUNDLE=$(scripts/rust/mkbundle.sh --dev --delegate-sentinel --print-dir)
 SERIALWRAP_CLI_EXE=$SW_BUNDLE/bin/serialwrap SERIALWRAP_AB_LABEL=rust-1b SW_RESOURCE_REPORT=target/p4-evidence/l1/linux/20groups/resource-report.json \
   python3 -m pytest -q tests/contract_blackbox -m "core_portable or posix_only" --junitxml=target/p4-evidence/l1/linux/20groups/junit.xml    # R5-F3：l1-results.v1 供 check_p4_cases --l1-results（argv＝s1b_20groups linux selector）
