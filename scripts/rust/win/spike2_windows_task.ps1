@@ -39,7 +39,7 @@ $isWhatIf = $WhatIfPreference -or ($PSBoundParameters.ContainsKey('WhatIf') -and
 function Invoke-Native([string]$Exe, [string[]]$NativeArgs) {
     $cmdDisplay = "$Exe " + ($NativeArgs -join ' ')
     if ($isWhatIf) {
-        Write-Host $cmdDisplay
+        [Console]::Out.WriteLine($cmdDisplay)
         return ""
     }
     $process = Start-Process -FilePath $Exe -ArgumentList $NativeArgs -NoNewWindow -PassThru -Wait
