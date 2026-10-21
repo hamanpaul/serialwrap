@@ -3,8 +3,8 @@
 
 - `--freeze`：凍結 `tests/acceptance/p4_case_map.yaml` 的必要案例集合，寫入 `tests/acceptance/p4_required.lock.json`。
   只允許在 lock 不存在時執行一次；既有 lock 一律拒絕覆寫。
-- `--freeze --add-only`：既有 lock 只能「追加」新的必要案例。既有案例若消失、降級為非必要、凍結欄位變動、
-  承接節點被移除或 `error_codes` 變動，一律 exit 1。占位節點（`sw-cli::p4_case_placeholders::`）不計入「承接節點被移除」。
+- `--freeze --add-only`：既有 lock 只能「追加」新的必要案例。既有案例若消失、降級為非必要、凍結欄位變動或承接節點被移除，一律 exit 1；
+  `error_codes` 新增只可用 `--allow-error-code-addition CODE` 逐碼核准，既有凍結碼不得移除。占位節點（`sw-cli::p4_case_placeholders::`）不計入「承接節點被移除」。
 - `--check`：對**目前 map 中所有必要案例**（不只 lock 內者）檢查：
   1. 凍結欄位（`FROZEN_FIELDS`）的 sha256 與 lock 相符；凍結時的承接節點集合（排除占位節點）⊆ 現在的節點集合；
   2. 只綁 `p4_case_placeholders` 占位節點的案例不得作為證據；
@@ -179,7 +179,7 @@ def _set_digest(entries: list[dict[str, Any]]) -> str:
     return _sha256_text(_canonical([[e["case_id"], e["sha256"]] for e in entries]))
 
 
-def freeze(add_only: bool) -> int:
+def freeze(add_only: bool, allowed_error_additions: list[str] | None = None) -> int:
     cases = load_cases()
     problems = validate_map(cases)
     if problems:
@@ -233,8 +233,20 @@ def freeze(add_only: bool) -> int:
         gone = _gone_nodes(entry, case)
         if gone:
             problems.append(f"{cid}: 凍結時的承接節點被移除：{gone}")
-    if sorted(codes) != sorted(lock.get("error_codes_at_freeze", [])):
-        problems.append("error_codes 與凍結時不同（本 Phase 不得新增錯誤碼）")
+    frozen_codes = set(lock.get("error_codes_at_freeze", []))
+    current_codes = set(codes)
+    allowed_codes = set(allowed_error_additions or [])
+    removed_codes = sorted(frozen_codes - current_codes)
+    added_codes = sorted(current_codes - frozen_codes)
+    unapproved_codes = sorted(set(added_codes) - allowed_codes)
+    unused_allowlist = sorted(allowed_codes - set(added_codes))
+    if removed_codes:
+        problems.append(f"error_codes 移除了凍結碼（不允許）：{removed_codes}")
+    if unapproved_codes or unused_allowlist:
+        problems.append(
+            "error_codes 凍結基線增補清單與差異不符："
+            f"未核准新增={unapproved_codes}、未使用核准={unused_allowlist}"
+        )
     if problems:
         print("\n".join(problems), file=sys.stderr)
         print("--add-only 拒絕：既有凍結內容不可被刪除或改寫", file=sys.stderr)
@@ -245,6 +257,7 @@ def freeze(add_only: bool) -> int:
     entries = sorted(lock.get("cases", []) + added, key=lambda e: e["case_id"])
     lock["cases"] = entries
     lock["case_set_sha256"] = _set_digest(entries)
+    lock["error_codes_at_freeze"] = sorted(current_codes)
     head = head_commit()
     if head not in lock.get("amended_commits", []):
         lock.setdefault("amended_commits", []).append(head)
@@ -578,6 +591,13 @@ def main() -> int:
     group.add_argument("--check", action="store_true", help="檢查必要案例的證據與碼集合")
     parser.add_argument("--add-only", action="store_true", help="與 --freeze 併用：只追加新的必要案例")
     parser.add_argument(
+        "--allow-error-code-addition",
+        action="append",
+        default=[],
+        metavar="CODE",
+        help="併入已核准的前序契約碼時逐碼列名；不得移除既有凍結碼",
+    )
+    parser.add_argument(
         "--evidence-dir",
         type=Path,
         default=EVIDENCE_DIR,
@@ -604,8 +624,10 @@ def main() -> int:
     args = parser.parse_args()
     if args.add_only and not args.freeze:
         parser.error("--add-only 只能與 --freeze 併用")
+    if args.allow_error_code_addition and not (args.freeze and args.add_only):
+        parser.error("--allow-error-code-addition 只能與 --freeze --add-only 併用")
     if args.freeze:
-        return freeze(add_only=args.add_only)
+        return freeze(add_only=args.add_only, allowed_error_additions=args.allow_error_code_addition)
     return check(
         evidence_dir=args.evidence_dir,
         l1_dir=args.l1_results,

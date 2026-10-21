@@ -152,3 +152,60 @@ def test_p4_case_map_tests_exist() -> None:
                 failures.append(f"{case_id}: 找不到 crates/{crate}/tests/{target}.rs 內的 #[test] fn {fn_name}")
 
     assert not failures, "承接測試節點不存在：\n" + "\n".join(failures)
+
+
+@pytest.mark.process_rpc
+def test_p4_freeze_add_only_requires_exact_error_code_allowlist(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """合併前已核准的碼只能逐名補入凍結基線，其他碼新增或刪除仍拒絕。"""
+    import importlib.util
+
+    script = REPO_ROOT / "scripts" / "rust" / "check_p4_cases.py"
+    spec = importlib.util.spec_from_file_location("check_p4_cases_freeze_fixture", script)
+    assert spec is not None and spec.loader is not None
+    checker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(checker)
+
+    case = {
+        "case_id": "fixture-case",
+        "necessity": "required",
+        "tests": ["sw-cli::target::test_case"],
+        "invariants": [],
+        "layer": "L1",
+        "platforms": ["linux"],
+        "capabilities": [],
+        "artifact": "rust-cli-bundle",
+        "evidence": "target/p4-evidence/fixture-case.json",
+    }
+    entry = checker._entry(case)
+    lock_path = tmp_path / "p4_required.lock.json"
+    lock_path.write_text(json.dumps({
+        "schema_version": 2,
+        "frozen_commit": "base",
+        "amended_commits": [],
+        "case_set_sha256": checker._set_digest([entry]),
+        "cases": [entry],
+        "error_codes_at_freeze": ["EXISTING_CODE"],
+    }), encoding="utf-8")
+    monkeypatch.setattr(checker, "LOCK", lock_path)
+    monkeypatch.setattr(checker, "load_cases", lambda: [case])
+    monkeypatch.setattr(checker, "validate_map", lambda _cases: [])
+    monkeypatch.setattr(checker, "error_codes", lambda: ["DRAIN_STALLED", "EXISTING_CODE"])
+    monkeypatch.setattr(checker, "head_commit", lambda: "merge-head")
+
+    before = lock_path.read_bytes()
+    assert checker.freeze(add_only=True) == 1
+    assert lock_path.read_bytes() == before
+
+    assert checker.freeze(add_only=True, allowed_error_additions=["DRAIN_STALLED"]) == 0
+    updated = json.loads(lock_path.read_text(encoding="utf-8"))
+    assert updated["error_codes_at_freeze"] == ["DRAIN_STALLED", "EXISTING_CODE"]
+    assert updated["amended_commits"] == ["merge-head"]
+
+    lock_after = lock_path.read_bytes()
+    monkeypatch.setattr(checker, "error_codes", lambda: ["DRAIN_STALLED", "EXISTING_CODE", "UNAPPROVED"])
+    assert checker.freeze(add_only=True, allowed_error_additions=["DRAIN_STALLED"]) == 1
+    assert lock_path.read_bytes() == lock_after
+
+    monkeypatch.setattr(checker, "error_codes", lambda: ["DRAIN_STALLED"])
+    assert checker.freeze(add_only=True, allowed_error_additions=["EXISTING_CODE"]) == 1
+    assert lock_path.read_bytes() == lock_after

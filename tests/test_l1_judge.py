@@ -919,3 +919,44 @@ def test_junit_counts_testcase_layer(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     assert checker._junit_counts(junit) == {"tests": 3, "failures": 2, "errors": 0, "skipped": 0}
+
+
+@pytest.mark.process_rpc
+def test_l1_add_only_removes_only_explicitly_approved_nodeids(tmp_path: Path) -> None:
+    """已替換的凍結占位節點須逐名核准移除，未列名或多列名都不得改鎖。"""
+    lock_path = tmp_path / "lock.json"
+    original = {
+        "schema_version": 1,
+        "sets": {
+            "s1b_cargo": {
+                "linux": {
+                    "selector": {"argv": ["--workspace"], "paths": [], "markexpr": ""},
+                    "nodeids": ["cargo:sw-cli::target::old_placeholder", "cargo:sw-cli::target::kept"],
+                }
+            }
+        },
+    }
+    lock_path.write_text(json.dumps(original), encoding="utf-8")
+    original_bytes = lock_path.read_bytes()
+    collect = tmp_path / "collect.json"
+    collect.write_text(json.dumps({"collected": ["cargo:sw-cli::target::kept", "cargo:sw-cli::target::replacement"]}), encoding="utf-8")
+    regen = [sys.executable, "tests/acceptance/regen_lock.py", "--lock-file", str(lock_path),
+             "--l1-add-only", "--set", "s1b_cargo", "--platform", "linux", "--collect", str(collect)]
+
+    refused = subprocess.run(regen, capture_output=True, text=True, cwd=REPO_ROOT)
+    assert refused.returncode == 1, refused.stdout + refused.stderr
+    assert lock_path.read_bytes() == original_bytes
+
+    allowed = subprocess.run([*regen, "--allow-removal", "cargo:sw-cli::target::old_placeholder"],
+                             capture_output=True, text=True, cwd=REPO_ROOT)
+    assert allowed.returncode == 0, allowed.stdout + allowed.stderr
+    revised = json.loads(lock_path.read_text(encoding="utf-8"))
+    assert revised["sets"]["s1b_cargo"]["linux"]["nodeids"] == [
+        "cargo:sw-cli::target::kept", "cargo:sw-cli::target::replacement"
+    ]
+
+    revised_bytes = lock_path.read_bytes()
+    overapproved = subprocess.run([*regen, "--allow-removal", "cargo:sw-cli::target::missing"],
+                                  capture_output=True, text=True, cwd=REPO_ROOT)
+    assert overapproved.returncode == 1, overapproved.stdout + overapproved.stderr
+    assert lock_path.read_bytes() == revised_bytes
