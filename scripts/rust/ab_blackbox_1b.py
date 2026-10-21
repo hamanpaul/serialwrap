@@ -17,6 +17,9 @@ from typing import Any
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
+# 以腳本模式執行時 sys.path[0] 為 scripts/rust，須補上 repo 根才能 import scripts.rust.* 與 sw_core（同 capture_cli_help.py 慣例）。
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 LOCK = ROOT / "tests/acceptance/p4_required.lock.json"
 CASE_MAP = ROOT / "tests/acceptance/p4_case_map.yaml"
 COMPARE = ROOT / "scripts/rust/ab_compare.py"
@@ -477,6 +480,42 @@ def _bundle_identity(cli: Path, platform: str, cases_sha: str, evidence: list[Pa
     }
 
 
+def _baseline_identity(cli: Path, platform: str, cases_sha: str, evidence: list[Path]) -> dict[str, Any]:
+    """A 輪（Python 基線）身分：基線不是 bundle，不要求 release-manifest；git_revision 取 HEAD。"""
+    from sw_core.release_manifest import package_tree_sha256
+
+    git_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    contract_revision = subprocess.check_output(
+        ["git", "rev-parse", "HEAD:contracts"], cwd=ROOT, text=True
+    ).strip()
+    return {
+        "cli_path": str(cli.resolve()),
+        "cli_sha256": _sha256_file(cli),
+        "cli_implementation": "python",
+        "daemon_version": (ROOT / "VERSION").read_text(encoding="utf-8").strip(),
+        "daemon_git_revision": git_head,
+        "daemon_tree_sha256": package_tree_sha256(),
+        "daemon_runtime_sha256": _sha256_file(Path(sys.executable).resolve()),
+        "contract_revision": contract_revision,
+        "case_list_sha256": cases_sha,
+        "tool_revision": f"{git_head}+{_tree_sha256(ROOT / 'tests/contract_blackbox')}",
+        "platform": platform,
+        "config_digest": hashlib.sha256((LOCK.read_bytes() + APPLICABILITY.read_bytes())).hexdigest(),
+        "dut_identity": "P2 黑箱測試目標",
+        "evidence_files": [
+            {"path": str(path.resolve()), "sha256": _sha256_file(path)}
+            for path in evidence if path.is_file()
+        ],
+    }
+
+
+def _required_line(node: str) -> str:
+    """required 清單須與 ab_compare 正規化形式相同（<檔名>.py::<函式>，去除類別與參數化後綴），否則比對會回報 required-missing。"""
+    path_text, *segments = node.split("::")
+    func = segments[-1].split("[", 1)[0] if segments else ""
+    return f"{Path(path_text).name}::{func}"
+
+
 def _write_identity(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 
@@ -543,7 +582,7 @@ def execute(*, cli: Path, out_dir: Path, platform: str, timeout: int) -> int:
     case_map = _frozen_case_map(lock_cases)
     selected_nodes = _applicable_nodes(frozen_nodes, platform)
     approved_a_skips = _approved_python_skips(lock_cases, case_map, platform, selected_nodes)
-    required_path.write_text("\n".join(selected_nodes) + "\n", encoding="utf-8")
+    required_path.write_text("\n".join(sorted({_required_line(node) for node in selected_nodes})) + "\n", encoding="utf-8")
     base_env = dict(os.environ)
     base_env["SERIALWRAP_DAEMON_EXE"] = str(PY_DAEMON)
 
@@ -615,10 +654,7 @@ def execute(*, cli: Path, out_dir: Path, platform: str, timeout: int) -> int:
     cases_sha_b = hashlib.sha256("\n".join(sorted(parsed_b)).encode("utf-8")).hexdigest()
     identity_evidence = [required_path, release_path, a_junit, b_junit, a_resource, b_resource]
     identity_a_cli = ROOT / ("serialwrap.py" if platform == "windows" else "serialwrap")
-    identity_a = _bundle_identity(identity_a_cli, platform, cases_sha_a, identity_evidence)
-    identity_a["cli_implementation"] = "python"
-    identity_a["daemon_tree_sha256"] = package_tree
-    identity_a["daemon_runtime_sha256"] = _sha256_file(Path(sys.executable).resolve())
+    identity_a = _baseline_identity(identity_a_cli, platform, cases_sha_a, identity_evidence)
     identity_b = _bundle_identity(cli, platform, cases_sha_b, identity_evidence)
     identity_b["cli_implementation"] = "rust"
     identity_b["daemon_tree_sha256"] = package_tree
