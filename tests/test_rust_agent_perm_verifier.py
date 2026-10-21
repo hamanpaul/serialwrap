@@ -242,13 +242,35 @@ def test_windows_owner_with_denied_write_is_not_blocked(tmp_path):
     # Windows 版 R4-F3 反例：本身分擁有的檔案即使 DACL deny (W,D)，擁有者仍隱含 WRITE_DAC，可自行改回
     f = tmp_path / "serialwrap.exe"
     f.write_bytes(b"x")
-    subprocess.run(["icacls", str(f), "/deny", f"{os.environ['USERNAME']}:(W,D)"], check=True, capture_output=True)
+    api = _load().WindowsNativeApi()
+    token_sid, _privileges, _admin = api.query_process_token()
+    assert token_sid is not None, "無法取得目前 TokenUser SID，不能建立 owner 測試夾具"
+    account = f"{os.environ['USERDOMAIN']}\\{os.environ['USERNAME']}"
     try:
+        owner_sid, _owner_rights, owner_query_ok = api.query_owner_and_dacl(str(f))
+        if owner_query_ok and owner_sid != token_sid:
+            # 提權 token 建檔時，Windows 預設 owner 可能是 Administrators 群組；明確改為 TokenUser。
+            subprocess.run(["icacls", str(f), "/setowner", account], check=True, capture_output=True)
+        # 隔離掉 tmp_path 繼承的 OWNER RIGHTS ACE，讓測試只驗證 TokenUser 的隱含 WRITE_DAC。
+        subprocess.run(["icacls", str(f), "/inheritance:r"], check=True, capture_output=True)
+        subprocess.run(["icacls", str(f), "/grant", f"{account}:(RX)"], check=True, capture_output=True)
+        subprocess.run(["icacls", str(f), "/deny", f"{account}:(W,D)"], check=True, capture_output=True)
         p, rep = _run(f)
         assert p.returncode == 3 and rep["verdict"] == "not_blocked" and rep["blocked"] is False
         assert [r["allowed"] for r in rep["results"] if r["target"] == str(f) and r["op"] == "write"] == [False]
-        assert any(c["path"] == str(f) and c["kind"] in ("owner", "dacl_write") and c["possible"] is True
-                   for c in rep["restore_checks"]), rep["restore_checks"]
+        target_checks = [c for c in rep["restore_checks"] if c["path"] == str(f)]
+        owner_sid, owner_rights_ace, owner_query_ok = api.query_owner_and_dacl(str(f))
+        assert owner_query_ok and owner_sid == token_sid and not owner_rights_ace
+        target_diagnostic = {
+            "owner_matches_token": token_sid is not None and owner_sid == token_sid,
+            "owner_rights_ace": owner_rights_ace,
+            "owner_query_ok": owner_query_ok,
+            "write_dac": api.test_open(str(f), 0x00040000),
+            "write_owner": api.test_open(str(f), 0x00080000),
+        }
+        assert any(c["kind"] in ("owner", "dacl_write") and c["possible"] is True
+                   for c in target_checks), {"target_checks": target_checks, "diagnostic": target_diagnostic}
+        subprocess.run(["icacls", str(f), "/reset"], check=True, capture_output=True)
         assert f.read_bytes() == b"x"
     finally:
         subprocess.run(["icacls", str(f), "/reset"], check=False, capture_output=True)
