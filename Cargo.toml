@@ -1,0 +1,4 @@
+# Rust workspace（P9-T16 紅燈階段：P3／P4 合入前的最小骨架，見各 crate 的替身註解）。
+[workspace]
+resolver = "2"
+members = ["crates/sw-proto", "crates/sw-cli", "crates/sw-daemon"]

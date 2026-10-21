@@ -1,0 +1,61 @@
+{
+  "bundle_version": "1.0.0",
+  "components": {
+    "assets": {
+      "profiles_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+      "skill_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "skill_windows_sha256": "4444444444444444444444444444444444444444444444444444444444444444"
+    },
+    "cli": {
+      "git_revision": "1111111111111111111111111111111111111111",
+      "implementation": "rust",
+      "path": "bin/serialwrap",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "version": "1.0.0"
+    },
+    "daemon": {
+      "entry": [
+        "py/python",
+        "-I",
+        "-B",
+        "py/serialwrapd.py"
+      ],
+      "git_revision": "1111111111111111111111111111111111111111",
+      "implementation": "python",
+      "launcher": {
+        "path": "bin/serialwrapd",
+        "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "package": {
+        "name": "serialwrap",
+        "tree_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "version": "1.0.0",
+        "wheel_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "runtime": {
+        "path": "py/python",
+        "python_version": "3.12.9",
+        "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "version": "1.0.0"
+    },
+    "supervisor": {
+      "default_mode": "systemd-user",
+      "definition_sha256": "6666666666666666666666666666666666666666666666666666666666666666"
+    }
+  },
+  "contract_revision": "2222222222222222222222222222222222222222",
+  "created_at": "2026-11-20T03:00:00+00:00",
+  "git_revision": "1111111111111111111111111111111111111111",
+  "pairing": {
+    "cli_version": "1.0.0",
+    "daemon_version": "1.0.0",
+    "rule": "exact"
+  },
+  "retirement": {
+    "python_daemon": "removed"
+  },
+  "schema_version": 1,
+  "stage": "3",
+  "target": "x86_64-unknown-linux-gnu"
+}

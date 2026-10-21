@@ -1,0 +1,11 @@
+[package]
+name = "sw-daemon"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+sw-proto = { path = "../sw-proto" }
+
+[dev-dependencies]
+serde_json = "=1.0.151"
