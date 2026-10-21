@@ -519,3 +519,20 @@ def test_tools_docker_reads_artifact_env(monkeypatch):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     assert mod._serialwrap_bin() == "/x/sw"
+
+
+@pytest.mark.memory_only
+def test_unresolved_template_fails_closed_with_variable_context():
+    """展開後仍殘留 {var.field} 樣板的 cli argv 必須 StepError，且附上對應變數的實際 CLI 回應（不得把字面樣板送進 CLI）。"""
+    import runner
+    from types import SimpleNamespace
+
+    fake_runner = SimpleNamespace(variables={"delay_cmd": {"ok": False, "error_code": "SESSION_NOT_READY"}})
+    with pytest.raises(runner.StepError, match="SESSION_NOT_READY"):
+        runner.TestRunner._require_resolved(
+            fake_runner, ["cmd", "status", "--cmd-id", "{delay_cmd.cmd_id}"], 7, "cli argv"
+        )
+    # 已完全解析者不得拋出例外
+    runner.TestRunner._require_resolved(
+        SimpleNamespace(variables={}), ["cmd", "status", "--cmd-id", "abc"], 7, "cli argv"
+    )

@@ -1112,6 +1112,33 @@ class TestRunner:
 
     # -- 變數展開 --
 
+    def _require_resolved(self, value: Any, idx: int, what: str) -> None:
+        """展開後仍殘留 {var.field} 樣板即 fail-closed。
+
+        原本未解析的樣板會被字面字串送進 CLI／wait，導致錯誤的 cmd_id 或 argv 被當成真實失敗，掩蓋變數未就緒的真因。
+        此處改為 StepError，並附上對應 save_as 變數的實際 CLI 回應，方便判讀。
+        """
+        leftovers: list[str] = []
+
+        def _scan(item: Any) -> None:
+            if isinstance(item, str):
+                leftovers.extend(m.group(0) for m in re.finditer(r"\{([a-zA-Z0-9_.]+)\}", item))
+            elif isinstance(item, list):
+                for entry in item:
+                    _scan(entry)
+            elif isinstance(item, dict):
+                for entry in item.values():
+                    _scan(entry)
+
+        _scan(value)
+        if not leftovers:
+            return
+        roots = sorted({token.strip("{}").split(".")[0] for token in leftovers})
+        context = {root: self.variables.get(root) for root in roots}
+        raise StepError(
+            f"步驟 {idx}: {what} 含未解析的樣板 {leftovers}；對應變數的實際 CLI 回應：{context}"
+        )
+
     def _expand(self, value: Any) -> Any:
         """展開 {var.field} 參照，支援 _plus_one_x 與 {N_x} 衍生變數。"""
         if isinstance(value, str):
@@ -1564,6 +1591,7 @@ class TestRunner:
     def _step_cli(self, step: dict[str, Any], idx: int) -> dict[str, Any]:
         assert self.harness is not None
         argv = self._expand(step.get("argv", []))
+        self._require_resolved(argv, idx, "cli argv")
         timeout = step.get("timeout", 10.0)
         resp = self._cli(argv, timeout=timeout)
         self._log(f"CLI 回應: ok={resp.get('ok')}")
@@ -1584,6 +1612,7 @@ class TestRunner:
     def _step_wait_command_done(self, step: dict[str, Any], idx: int) -> None:
         assert self.harness is not None
         cmd_id = self._expand(step.get("cmd_id", ""))
+        self._require_resolved(cmd_id, idx, "wait_command_done cmd_id")
         timeout_s = step.get("timeout_s", 10.0)
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
