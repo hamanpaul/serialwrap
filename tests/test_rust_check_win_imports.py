@@ -42,9 +42,18 @@ def _run(tmp_path: Path, dlls: str) -> subprocess.CompletedProcess[str]:
     _assert_script()
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
-    tool = bin_dir / "x86_64-w64-mingw32-objdump"
-    tool.write_text(FAKE_OBJDUMP, encoding="utf-8")
-    tool.chmod(0o755)
+    if os.name == "nt":
+        tool = bin_dir / "x86_64-w64-mingw32-objdump.cmd"
+        tool.write_text(
+            "@echo off\r\n"
+            "echo The Import Tables\r\n"
+            "for %%D in (%FAKE_DLLS%) do echo.    DLL Name: %%D\r\n",
+            encoding="utf-8",
+        )
+    else:
+        tool = bin_dir / "x86_64-w64-mingw32-objdump"
+        tool.write_text(FAKE_OBJDUMP, encoding="utf-8")
+        tool.chmod(0o755)
     env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}", "FAKE_DLLS": dlls}
     return subprocess.run(
         [sys.executable, str(SCRIPT), str(_exe(tmp_path))],

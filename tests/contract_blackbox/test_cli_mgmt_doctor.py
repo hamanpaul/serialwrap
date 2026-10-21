@@ -91,6 +91,7 @@ def _bundle_has_python_oracle(bundle_root: Path) -> bool:
     return res.returncode == 0
 
 
+@pytest.mark.case("sc25-release-manifest-version-pairing")
 def test_doctor_ab_shared_checks(tmp_path: Path) -> None:
     work_py = tmp_path / "py"
     work_cli = tmp_path / "cli"

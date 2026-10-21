@@ -156,6 +156,7 @@ def test_bundle_license_files_present(tmp_path: Path) -> None:
     assert "CyberCircuits" in str(provenance["authenticode_signer"])
 
 
+@pytest.mark.case("sc36-win-installer-com0com-optional")
 def test_installer_only_zip_extracts_complete_x64_payload(tmp_path: Path) -> None:
     result = _extract_fixture(tmp_path)
     assert result.returncode == 0, result.stderr
@@ -172,6 +173,7 @@ def test_installer_only_zip_extracts_complete_x64_payload(tmp_path: Path) -> Non
     assert not list(destination.glob(".com0com-extract-*")), "暫存安裝程式必須清除"
 
 
+@pytest.mark.case("sc36-win-installer-com0com-optional")
 def test_incomplete_installer_payload_fails_closed(tmp_path: Path) -> None:
     result = _extract_fixture(tmp_path, omit="com0com.cat")
     assert result.returncode != 0
@@ -180,6 +182,7 @@ def test_incomplete_installer_payload_fails_closed(tmp_path: Path) -> None:
     assert not list((tmp_path / "extracted").glob("*")), "不完整 payload 不得複製到目的目錄"
 
 
+@pytest.mark.case("sc36-win-installer-com0com-optional")
 def test_signed_zip_hash_mismatch_fails_before_extraction(tmp_path: Path) -> None:
     result = _extract_fixture(tmp_path, verify_source_hash=True)
     assert result.returncode != 0

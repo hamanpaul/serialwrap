@@ -58,7 +58,20 @@ def _install(src_name: str, dst: Path) -> Path:
 
 def _write_exe(exe_dir: Path, name: str, *, run_out: str, exit_code: int = 0) -> Path:
     exe_dir.mkdir(parents=True, exist_ok=True)
-    exe = _install("fake_libtest.sh", exe_dir / name)
+    if os.name == "nt":
+        exe = exe_dir / f"{name}.cmd"
+        exe.write_text(
+            "@echo off\r\n"
+            'set "base=%~dp0"\r\n'
+            'if /i "%~1"=="--ignored" (type "%base%list_ignored.txt" & exit /b 0)\r\n'
+            'if /i "%~1"=="--list" (type "%base%list_all.txt" & exit /b 0)\r\n'
+            'type "%base%run_out.txt"\r\n'
+            'for /f "usebackq delims=" %%I in ("%base%exit_code") do exit /b %%I\r\n'
+            "exit /b 0\r\n",
+            encoding="utf-8",
+        )
+    else:
+        exe = _install("fake_libtest.sh", exe_dir / name)
     shutil.copyfile(FIXTURE / "list_all.txt", exe_dir / "list_all.txt")
     shutil.copyfile(FIXTURE / "list_ignored.txt", exe_dir / "list_ignored.txt")
     shutil.copyfile(FIXTURE / run_out, exe_dir / "run_out.txt")
@@ -114,7 +127,16 @@ def _lib_artifact(package: str = CRATE) -> dict[str, Any]:
 
 def _write_cargo(bin_dir: Path, artifacts: list[dict[str, Any]], *, exit_code: int = 0) -> None:
     bin_dir.mkdir(parents=True, exist_ok=True)
-    _install("fake_cargo.sh", bin_dir / "cargo")
+    if os.name == "nt":
+        (bin_dir / "cargo.cmd").write_text(
+            "@echo off\r\n"
+            'type "%~dp0cargo_no_run.jsonl"\r\n'
+            'for /f "usebackq delims=" %%I in ("%~dp0cargo_exit") do exit /b %%I\r\n'
+            "exit /b 0\r\n",
+            encoding="utf-8",
+        )
+    else:
+        _install("fake_cargo.sh", bin_dir / "cargo")
     lines = [json.dumps(a) for a in artifacts]
     lines.append(json.dumps({"reason": "build-finished", "success": exit_code == 0}))
     (bin_dir / "cargo_no_run.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -212,7 +234,17 @@ def test_timeout_marks_unfinished(tmp_path: Path) -> None:
     exe_t = _write_exe(tmp_path / "exe_timeout", "pycompat_golden", run_out="run_a_ok.txt")
     bin_dir = tmp_path / "bin"
     _write_cargo(bin_dir, [_artifact(exe_a, TARGET), _artifact(exe_t, "pycompat_golden")])
-    runner = _install("fake_runner.sh", bin_dir / "fake_runner.sh")  # 第二支 exe 回 124
+    if os.name == "nt":
+        runner = bin_dir / "fake_runner.cmd"
+        runner.write_text(
+            "@echo off\r\n"
+            'if /i "%~nx1"=="exe_timeout.cmd" exit /b 124\r\n'
+            'call "%~1" %2 %3 %4 %5\r\n'
+            "exit /b %errorlevel%\r\n",
+            encoding="utf-8",
+        )
+    else:
+        runner = _install("fake_runner.sh", bin_dir / "fake_runner.sh")  # 第二支 exe 回 124
     out = tmp_path / "l1.json"
     r = _run(tmp_path, bin_dir, ["--platform", "windows", "--runner", str(runner), "--out", str(out)])
     rep = _report(out, r)

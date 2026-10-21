@@ -7,12 +7,13 @@
    屬於本計畫者全部出現在映射表
 4. 每筆承接節點真實存在，且**不執行 cargo**：
    - Rust 節點 `<crate>::<target>::<fn>` 對應 `crates/<crate>/tests/<target>.rs`，須有緊鄰（僅隔以屬性）的 `#[test]` 的 `fn <fn>(`；
-   - pytest 節點 `tests/...py::...` 以 `pytest --collect-only` 收集，且原始檔含 `@pytest.mark.case("<case_id>")`。
+   - pytest 節點 `tests/...py::...` 以 AST 精確確認節點與 `@pytest.mark.case("<case_id>")`；本機可執行平台另用 `pytest --collect-only` 收集。
 
 環境變數 `SW_REQUIRE_CASES_LOCK=1`：P2 的 lock／cases.yaml 缺席時改為失敗（預設 skip，因 P2-T10+ 未交付時仍可跑其餘檢查）。
 """
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -61,13 +62,70 @@ def _rust_node_present(crate: str, target: str, fn_name: str) -> bool:
 
 
 def _pytest_node_present(node: str, case_id: str) -> str | None:
-    """回傳 None 表示通過；否則回傳失敗原因。"""
-    file_part = node.split("::", 1)[0]
-    if not (REPO_ROOT / file_part).is_file():
+    """以 AST 驗證精確節點／case 綁定，再收集目前平台適用的 pytest node。"""
+    file_part, *segments = node.split("::")
+    path = REPO_ROOT / file_part
+    if not path.is_file():
         return f"檔案不存在：{file_part}"
-    source = (REPO_ROOT / file_part).read_text(encoding="utf-8")
-    if f'pytest.mark.case("{case_id}")' not in source:
+    try:
+        source = path.read_text(encoding="utf-8")
+        scope = ast.parse(source, filename=str(path)).body
+    except (OSError, SyntaxError, UnicodeError) as exc:
+        return f"Python 原始碼無法解析：{exc}"
+    if not segments:
+        return f"節點缺少函式／方法名稱：{node}"
+    owners: list[ast.AST] = [ast.Module(body=scope, type_ignores=[])]
+    for segment in segments:
+        name = segment.split("[", 1)[0]
+        found = next(
+            (
+                item
+                for item in scope
+                if isinstance(item, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+                and item.name == name
+            ),
+            None,
+        )
+        if found is None:
+            return f"找不到原始碼節點：{name}"
+        owners.append(found)
+        scope = getattr(found, "body", [])
+
+    def _has_marker(owner: ast.AST, marker: str, *, case_value: str | None = None) -> bool:
+        expressions: list[ast.AST] = list(getattr(owner, "decorator_list", []))
+        for statement in getattr(owner, "body", []):
+            if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+                if any(isinstance(target, ast.Name) and target.id == "pytestmark" for target in targets):
+                    expressions.append(statement.value)
+        for expression in expressions:
+            for item in ast.walk(expression):
+                if (
+                    case_value is None
+                    and isinstance(item, ast.Attribute)
+                    and item.attr == marker
+                    and isinstance(item.value, ast.Attribute)
+                    and item.value.attr == "mark"
+                ):
+                    return True
+                if not isinstance(item, ast.Call) or not isinstance(item.func, ast.Attribute):
+                    continue
+                if item.func.attr != marker:
+                    continue
+                if not isinstance(item.func.value, ast.Attribute) or item.func.value.attr != "mark":
+                    continue
+                if case_value is None or (
+                    item.args
+                    and isinstance(item.args[0], ast.Constant)
+                    and item.args[0].value == case_value
+                ):
+                    return True
+        return False
+
+    if not any(_has_marker(owner, "case", case_value=case_id) for owner in owners):
         return f"缺少 @pytest.mark.case(\"{case_id}\")"
+    if os.name == "nt" and any(_has_marker(owner, "posix_only") for owner in owners):
+        return None
     res = subprocess.run(
         [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider", node],
         cwd=str(REPO_ROOT),

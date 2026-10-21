@@ -16,6 +16,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -410,7 +411,10 @@ def _run_onefile(tmp_path: Path, cli_text: str, *, runs: int, private: bool) -> 
         sys_root = tmp_path / "sys"
         sys_root.mkdir(exist_ok=True)
         cmd += ["--system-tmp", str(sys_root)]
-        env["SYS_ROOT"] = str(sys_root)
+    else:
+        # 故意寫入 runner 未宣告獨占的共享系統暫存根，驗證事件只能判為證據不足。
+        sys_root = Path(tempfile.gettempdir())
+    env["SYS_ROOT"] = str(sys_root)
     res = subprocess.run(cmd, capture_output=True, text=True, env=env)
     assert res.returncode == 0, res.stdout + res.stderr
     return json.loads(res.stdout)
@@ -449,10 +453,11 @@ def test_no_onefile_shared_system_tmp_is_insufficient_not_pass(tmp_path: Path) -
         "open(p, 'w').write('x')\n"
         "os.remove(p)\n"
     )
+    sys_root = Path(tempfile.gettempdir())
     try:
         data = _run_onefile(tmp_path, cli_text, runs=1, private=False)
     finally:
-        for candidate in (Path("/tmp") / probe, Path(os.environ.get("TEMP", "")) / probe):
+        for candidate in (sys_root / probe, Path("/tmp") / probe, Path(os.environ.get("TEMP", "")) / probe):
             if candidate.name and candidate.exists():
                 candidate.unlink()
     assert data["verdict"] == "INSUFFICIENT", data

@@ -306,7 +306,11 @@ def test_whatif_schtasks_only_throwaway_task_name(tmp_path):
             [*cmd, "-Phase", phase, "-InstallRoot", str(tmp_path / "install"),
              "-OutDir", str(tmp_path / "out"), "-TaskName", THROWAWAY_TASK_R1, "-WhatIf"],
             capture_output=True, text=True, cwd=ROOT, timeout=120, check=False)
-        lines = [ln for ln in (proc.stdout + proc.stderr).splitlines() if re.search(r"schtasks", ln, re.I)]
+        lines = [
+            ln
+            for ln in ((proc.stdout or "") + (proc.stderr or "")).splitlines()
+            if re.search(r"schtasks", ln, re.I)
+        ]
         if phase in ("install", "single"):
             assert lines, f"{phase}：-WhatIf 未輸出任何 schtasks 命令"
         for ln in lines:
