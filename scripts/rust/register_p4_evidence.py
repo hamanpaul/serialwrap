@@ -60,6 +60,24 @@ def _head(repo_root: Path) -> str:
     return commit
 
 
+def _assert_clean_tree(repo_root: Path) -> None:
+    """證據必須對應乾淨的 HEAD：髒樹產生的證據會被 check_p4_cases 綁到 HEAD，造成誤導；故髒樹一律拒絕登記（不做任何寫入）。"""
+    result = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=normal", "--", ".", ":(exclude)target"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ValueError("無法檢查 git 工作樹狀態")
+    dirty = [line for line in result.stdout.splitlines() if line.strip()]
+    if dirty:
+        raise ValueError(
+            f"工作樹不乾淨（{len(dirty)} 項變更），拒絕登記 P4 證據；請先 commit 後於乾淨 HEAD 重建。前幾項：{dirty[:5]}"
+        )
+
+
 def _read_json(path: Path) -> dict[str, Any] | None:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -732,6 +750,7 @@ def _merge_records(path: Path, case_id: str, generated: list[dict[str, Any]]) ->
 
 
 def register(args: argparse.Namespace) -> dict[str, Any]:
+    _assert_clean_tree(args.repo_root)
     commit = _head(args.repo_root)
     cases = _load_case_map(args.case_map)
     generated_cases = 0

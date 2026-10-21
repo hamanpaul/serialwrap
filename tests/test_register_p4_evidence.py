@@ -170,12 +170,12 @@ def _write_l1_report(
     return junit_path
 
 
-def _run(tmp_path: Path, inputs: dict[str, Path], *, extra: list[str] | None = None) -> subprocess.CompletedProcess[str]:
+def _run(tmp_path: Path, inputs: dict[str, Path], *, extra: list[str] | None = None, repo_root: Path = ROOT) -> subprocess.CompletedProcess[str]:
     argv = [
         sys.executable,
         str(SCRIPT),
         "--repo-root",
-        str(ROOT),
+        str(repo_root),
         "--case-map",
         str(inputs["case_map"]),
         "--source-root",
@@ -539,3 +539,23 @@ def test_judge_spike2_and_owner_cases_are_not_rewritten(tmp_path: Path, case_id:
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert evidence_path.read_text(encoding="utf-8") == '{"owner":"keep"}\n'
+
+
+def test_dirty_worktree_is_refused_before_any_record(tmp_path: Path) -> None:
+    """髒樹證據會被綁到 HEAD；登記前即須拒絕（rc=2、stderr 說明原因、不寫任何證據）。"""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git_id = ["-c", "user.email=register-test@example.invalid", "-c", "user.name=register-test"]
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    (repo / "README.md").write_text("clean\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", *git_id, "commit", "-q", "-m", "init"], cwd=repo, check=True)
+    (repo / "README.md").write_text("dirty\n", encoding="utf-8")
+
+    inputs = _make_inputs(tmp_path)
+    result = _run(tmp_path, inputs, repo_root=repo)
+
+    assert result.returncode == 2, result.stderr
+    assert "工作樹不乾淨" in result.stderr
+    out_dir = inputs["out_dir"]
+    assert not out_dir.exists() or not any(out_dir.glob("*.json"))
