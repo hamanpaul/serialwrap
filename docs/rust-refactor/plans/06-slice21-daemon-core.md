@@ -4772,6 +4772,7 @@ git commit -m "chore(rust): Slice 2.1 出口 gate 腳本、報告 schema 與擁�
 - **合併阻擋（OD-08）**：本 PR 動到 PAL（serial、lock、device source、WalFs、RPC listener），依 OD-08「動到 PAL 的 PR 必須取得原生 Windows COM handle 證據；記憶體 fake 不得充數」，PR 保持 draft／不得合併，直到 BO-S21-01 證據回填並經審查，或擁有者在 PR 上留下明確書面豁免（比照 04 計畫 Task 9）。OD-15 起 BO-S21-01 可在擁有者 host（`COM20`／`COM21`）取得，預期以實跑證據解除阻擋，不以豁免代替。
 - 回歸 case 政策（#155）：本 Phase 非 bug 修復；實機案例由 BO-S21-07／08 以既有 TestPilot case 承接，PR 描述註明「未新增 regression case：F1／F2／F3／F4／F12 既有 18 個 case（17 個屬 `slice_2.1` 分母、`f4-interactive-line-cmd-defined` 為提前證據）由擁有者以 Rust daemon 執行」。
 - Slice 2.1 出口（§11.6）需同時具備：本環境 gate `READY_FOR_OWNER_EVIDENCE`（不得為 `INCOMPLETE`）＋BO-S21-01～16 證據回填並經審查＋`pending_decisions` 經擁有者裁決＋Task 23 校準報告。未回填前不得宣告 Slice 2.1 出口通過。
+- Slice 2.1 出口另需（OD-16 (4)，2026-10-22 自 Stage 1 移入；原 `run-l15.sh rust-1a`／`rust-1b` 項，見 plan 04 Task 19 Step 5 與 plan 05 Task 16 Step 4）：docker Rust-CLI L1.5——以本 Slice 的 Rust daemon bundle（`daemon.implementation=rust`，CLI 亦為 Rust）執行 `scripts/docker/run-l15.sh`（至少 `func-test-bridge` suite，`--bundle <bundle>`；兩容器拓樸、假 COM 為 socat PTY pair），產出 `evidence_layer: "L1.5-docker"` 報告且 PASS。本項為本環境可產出項（非 BLOCKED-OWNER），不計 L2／L3。移入理由：`run-l15.sh` 的 `--bundle` 需 CLI 與 daemon 皆 `implementation=rust`，Rust daemon 自本 Slice Task 19（`daemon_main`）起存在；Stage 1 bundle 的 daemon 為 Python，不列為 Stage 1 證據。
 
 ## BLOCKED-OWNER 總表
 

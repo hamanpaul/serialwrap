@@ -500,7 +500,7 @@ def test_l15_suite_runtime_import_and_cli_paths_match_serialwrap_image():
 def test_systemd_container_runners_resolve_imports_and_host_bind_paths():
     """回歸：systemd 容器內 runner 的 import、bridge 證據路徑與 runuser argv 必須能在真跑時成立。
 
-    systemd.Dockerfile 只在 /opt/serialwrap/.venv 安裝相依（系統 python3 無 PyYAML、無 scripts／tests 套件路徑），
+    systemd.Dockerfile 只在 /opt/serialwrap/.venv 安裝相依（系統 python3 無 scripts／tests 套件路徑；PyYAML 雖已由 python3-yaml 提供，runner 仍以 venv python 執行），
     故 runner 須以 venv python＋PYTHONPATH=/opt/serialwrap 執行；bridge 經 docker.sock 啟動 DUT 時 bind src 由
     host docker daemon 解析，證據根須為 host 同路徑掛載（SW_HOST_EVIDENCE_DIR）；runuser 不得把含
     SERIALWRAP_DAEMON_EXE=/…/serialwrapd 的環境展開成 argv，否則 #101 多開偵測把 runuser 父行程誤認為 daemon。
@@ -539,3 +539,47 @@ def test_systemd_container_runners_resolve_imports_and_host_bind_paths():
     finally:
         monkey.undo()
     assert captured and not any("serialwrapd" in arg for arg in captured[0]), captured
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_holder_scan_fail_closes_only_on_reachable_uids(monkeypatch):
+    """回歸（G-1）：其他 uid 行程（例如 messagebus）fd 表不可讀時不得誤報 fail-closed；
+    兩輪掃描權限所及 uid（root／swtest）的不可讀現存行程仍須 fail-closed。
+    """
+    sys.path.insert(0, str(REPO / "tools" / "uart_stdio_bridge" / "src"))
+    sys.path.insert(0, str(REPO))
+    try:
+        from scripts.docker import run_systemd_container as rsc  # noqa: PLC0415
+    finally:
+        sys.path.remove(str(REPO))
+        sys.path.remove(str(REPO / "tools" / "uart_stdio_bridge" / "src"))
+
+    def _scans(readable: list[int], pids: list[int], holders: list[int]):
+        def _fake_scan(target, *, as_user):
+            return {"pids": sorted(pids), "readable": sorted(readable), "holders": sorted(holders)}
+        return _fake_scan
+
+    dev = Path("/dev/null")
+
+    # 行程 200 為 messagebus（uid 999）：兩輪皆讀不到，但不在權限所及 uid 內，不得 fail-closed。
+    monkeypatch.setattr(rsc, "_scan_proc_fds", _scans(readable=[100], pids=[100, 200], holders=[100]))
+    monkeypatch.setattr(rsc, "_proc_uid", lambda pid: {100: 0, 200: 999}.get(pid))
+    assert rsc._holder_pids(dev) == [100]
+
+    # 行程 300 為 root（uid 0）且讀不到 fd 表：屬權限所及 uid，須 fail-closed。
+    monkeypatch.setattr(rsc, "_scan_proc_fds", _scans(readable=[100], pids=[100, 300], holders=[]))
+    monkeypatch.setattr(rsc, "_proc_uid", lambda pid: {100: 0, 300: 0}.get(pid))
+    with pytest.raises(RuntimeError, match="300"):
+        rsc._holder_pids(dev)
+
+    # 行程 400 為 swtest（uid 1000）且讀不到 fd 表：同樣須 fail-closed。
+    monkeypatch.setattr(rsc, "_scan_proc_fds", _scans(readable=[], pids=[400], holders=[]))
+    monkeypatch.setattr(rsc, "_proc_uid", lambda pid: {400: 1000}.get(pid))
+    with pytest.raises(RuntimeError, match="400"):
+        rsc._holder_pids(dev)
+
+    # 已結束的行程（uid 解析為 None）不計入 uncovered。
+    monkeypatch.setattr(rsc, "_scan_proc_fds", _scans(readable=[], pids=[500], holders=[]))
+    monkeypatch.setattr(rsc, "_proc_uid", lambda pid: None)
+    assert rsc._holder_pids(dev) == []

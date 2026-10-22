@@ -7,6 +7,7 @@ import os
 import pathlib
 import shlex
 import subprocess
+import sys
 import threading
 import time
 from typing import Any
@@ -92,19 +93,74 @@ def _main_pid(mode: str) -> int:
     return int(result.stdout.strip())
 
 
-def _holder_pids(device_path: pathlib.Path) -> list[int]:
-    target = os.path.realpath(device_path)
-    holders: list[int] = []
-    for process in pathlib.Path("/proc").iterdir():
-        if not process.name.isdigit():
-            continue
-        fd_dir = process / "fd"
+_PROC_FD_SCAN = r'''
+import json, os, pathlib, sys
+target = os.path.realpath(sys.argv[1])
+pids, readable, holders = [], [], []
+for proc in pathlib.Path("/proc").iterdir():
+    if not proc.name.isdigit():
+        continue
+    pid = int(proc.name)
+    pids.append(pid)
+    try:
+        fds = list((proc / "fd").iterdir())
+    except OSError:
+        continue
+    readable.append(pid)
+    for fd in fds:
         try:
-            if any(os.path.realpath(os.readlink(fd)) == target for fd in fd_dir.iterdir()):
-                holders.append(int(process.name))
+            if os.path.realpath(os.readlink(fd)) == target:
+                holders.append(pid)
+                break
         except OSError:
             continue
-    return sorted(holders)
+print(json.dumps({"pids": sorted(pids), "readable": sorted(readable), "holders": sorted(holders)}))
+'''
+
+
+def _scan_proc_fds(target: str, *, as_user: str | None) -> dict[str, list[int]]:
+    if as_user is None:
+        argv = [sys.executable, "-I", "-c", _PROC_FD_SCAN, target]
+    else:
+        argv = ["runuser", "-u", as_user, "--", "/usr/bin/python3", "-I", "-c", _PROC_FD_SCAN, target]
+    result = subprocess.run(argv, capture_output=True, text=True, check=False, timeout=30)
+    if result.returncode != 0:
+        raise RuntimeError(f"holder 掃描失敗（{as_user or 'root'}）：{result.stderr[-300:]}")
+    return json.loads(result.stdout)
+
+
+# 兩輪掃描的權限所及 uid：root（第一輪）與 swtest（第二輪，UID 1000，見 systemd.Dockerfile）。
+_HOLDER_SCAN_UIDS = frozenset({0, 1000})
+
+
+def _proc_uid(pid: int) -> int | None:
+    """回報行程擁有者 uid；行程已結束則為 None。"""
+    try:
+        return os.stat(f"/proc/{pid}").st_uid
+    except FileNotFoundError:
+        return None
+
+
+def _holder_pids(device_path: pathlib.Path) -> list[int]:
+    """回報持有裝置的行程 PID：root 與 daemon 使用者兩輪掃描取聯集。
+
+    容器內 root 不具 CAP_SYS_PTRACE，讀不到 swtest 行程的 fd 表，故另以 daemon 使用者掃描。
+    仍無法讀取 fd 表、且屬於兩輪掃描權限所及 uid（root／swtest）的現存行程會使判定失效（拋出 RuntimeError），
+    不得回傳「無持有者」（fail-closed）。其他 uid 的行程（例如 messagebus、systemd-timesync）不在兩輪權限內，
+    不計入 uncovered，以免容器內存在此類行程即誤報。殘留風險：其他 uid 行程若持有 usb-fake PTY 會被漏判；
+    本 harness 的 PTY 持有者僅為 serialwrapd 與 swtest 行程。
+    """
+    target = os.path.realpath(device_path)
+    root_scan = _scan_proc_fds(target, as_user=None)
+    user_scan = _scan_proc_fds(target, as_user=systemd_container.USER)
+    covered = set(root_scan["readable"]) | set(user_scan["readable"])
+    uncovered = sorted(
+        pid for pid in root_scan["pids"]
+        if pid not in covered and _proc_uid(pid) in _HOLDER_SCAN_UIDS
+    )
+    if uncovered:
+        raise RuntimeError(f"holder 掃描無法讀取現存行程 fd：{uncovered}")
+    return sorted(set(root_scan["holders"]) | set(user_scan["holders"]))
 
 
 def _bridge_mark(control: ControlClient, label: str, pid: int) -> None:
@@ -123,7 +179,7 @@ def _completed_marks(path: pathlib.Path) -> list[dict[str, Any]]:
 
 
 def _read_daemon_status(env: dict[str, str]) -> tuple[subprocess.CompletedProcess[str], dict[str, Any]]:
-    result = subprocess.run([env["SERIALWRAP_CLI_EXE"], "daemon", "status"], cwd=REPO,
+    result = subprocess.run([env["SERIALWRAP_CLI_EXE"], "daemon", "status"], cwd=systemd_container.REPO,
                             env=env, capture_output=True, text=True, check=False, timeout=20)
     try:
         payload = json.loads(result.stdout)
@@ -221,12 +277,20 @@ def _run_update_exit1(args: argparse.Namespace) -> int:
             env, dut_image=os.environ["SW_DUT_IMAGE"], run_id=run_id,
             evidence_root=evidence_root / "bridge",
         )
+        # 與 systemd_container.serve() 相同：bridge 建立的 PTY slave 交給 swtest 開啟（否則 daemon attach 得 PermissionError）。
+        for index in range(2):
+            link = pathlib.Path(env["SERIALWRAP_BY_ID_DIR"]) / f"usb-fake-{index}"
+            os.chown(link.resolve(), 1000, -1)
 
         initial = systemd_container._run_as_user(env, [str(old_cli), "setup", "--user"])
         evidence["initial_setup_exit"] = initial.returncode
         if initial.returncode != 0:
             failures.append(f"old bundle setup 失敗：{initial.stdout[-500:]} {initial.stderr[-500:]}")
         else:
+            # 與 initialize_supervised 相同：跨模式 setup 只完成 unit 安裝與註冊（hold），受監管 daemon 由 service restart 啟動。
+            initial_restart = systemd_container._service_action(mode, env, "restart")
+            if initial_restart.returncode != 0:
+                failures.append(f"初次 setup 後 service restart 失敗：{initial_restart.stderr[-500:]}")
             systemd_container._wait_daemon_ready(env, timeout_s=120)
             old_pid = systemd_container.daemon_pid(env)
             evidence["old_daemon_pid"] = old_pid
