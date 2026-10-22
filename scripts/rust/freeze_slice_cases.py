@@ -3,6 +3,7 @@
 
 讀取 P2 案例鎖 `tests/acceptance/cases.lock.json` 的 `sets["slice_<X>"]` 作為分母，寫出斷路器凍結檔
 `tests/acceptance/breaker/slice_<X>.json`（DISK_STABLE：排序鍵、緊湊分隔符）。
+分母先與 `cases.yaml` 以 P2 鎖檔工具 `regen_lock.compute_sets` 重算比對；鎖檔與 cases.yaml 不一致（鎖檔遭手改或過期）即拒絕。
 凍結檔一經寫出即不可覆寫（分母不得事後改）；已存在時以 exit 1 拒絕。
 寫入採「暫存檔 → os.link」發佈：目標已存在或寫入中途失敗時都不會留下半寫的凍結檔。
 
@@ -17,13 +18,16 @@ Stage 2 起算日（OD-02 的 24 週上限起點）全案只有一個：Slice 2.
   python3 scripts/rust/freeze_slice_cases.py --slice 2.1 --date YYYY-MM-DD [--out <路徑>]
   （`--frozen-at` 為 `--date` 的別名，供 09 計畫沿用。日期只接受 YYYY-MM-DD。）
 
-退出碼：0 寫入成功；1 凍結檔已存在（拒絕覆寫）；2 輸入錯誤（日期格式、版本不一致、起算日缺漏或衝突等）。
+退出碼：0 寫入成功；1 凍結檔已存在（拒絕覆寫）；2 輸入或寫入錯誤（日期格式、版本不一致、鎖檔與 cases.yaml 不一致、
+起算日缺漏或衝突、目錄不可寫、父路徑不是目錄等）。
+目錄不可寫等 OS 錯誤不得以 1 結束，否則與「已存在」無法區分。
 """
 from __future__ import annotations
 
 import argparse
 import datetime as dt
 import hashlib
+import importlib.util
 import json
 import os
 import pathlib
@@ -40,6 +44,27 @@ WINDOW_WEEKS = 3
 SLICES = ("2.1", "2.2", "2.3", "2.4")
 ORIGIN_SLICE = "2.1"
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+class AlreadyFrozen(Exception):
+    """凍結檔已存在（os.link 目標衝突）。與目錄不可寫等 OS 錯誤分開：前者退出碼 1，後者退出碼 2。"""
+
+
+def _force_utf8_stdio() -> None:
+    """固定 stdout／stderr 為 UTF-8、LF：Windows 預設 code page（如 cp1252）無法編碼繁中輸出時，
+    寫入後的成功訊息會以 exit 1 結束，與「已存在」混淆。僅於 __main__ 呼叫，避免改寫行程內（pytest）的串流。"""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", newline="\n")
+
+
+def _load_regen_lock():
+    """以檔案路徑載入 P2 鎖檔工具 regen_lock.py，重用其 compute_sets（集合定義單一來源，不複製規則）。"""
+    spec = importlib.util.spec_from_file_location("regen_lock", ACC / "regen_lock.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def _parse_date(value: str) -> str:
@@ -81,13 +106,20 @@ def resolve_stage2_started_at(slice_id: str, date: str, requested: str | None,
 
 def build_freeze(*, slice_id: str, date: str, stage2_started_at: str,
                  lock_path: pathlib.Path, yaml_path: pathlib.Path) -> dict:
-    """依鎖檔與 cases.yaml 組出凍結內容；鎖檔與 cases.yaml 版本不一致時拒絕（ValueError）。"""
+    """依鎖檔與 cases.yaml 組出凍結內容。
+
+    鎖檔與 cases.yaml 版本不一致、或鎖檔的集合與 cases.yaml 重算結果不一致時拒絕（ValueError）。
+    write-once 的凍結檔會永久固定分母，因此不能只比對版本字串，必須比對實際集合內容。
+    """
     lock = json.loads(lock_path.read_text(encoding="utf-8"))
     cases_doc = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
     revision = cases_doc["revision"]
     if lock["cases_revision"] != revision:
         raise ValueError(f"cases.lock.json（{lock['cases_revision']}）與 cases.yaml（{revision}）版本不一致")
     set_name = f"slice_{slice_id}"
+    recomputed = _load_regen_lock().compute_sets(cases_doc)[set_name]
+    if list(lock["sets"][set_name]) != recomputed:
+        raise ValueError(f"cases.lock.json 的 {set_name} 與 cases.yaml 重算結果不一致（鎖檔可能遭手改或過期）")
     required = list(lock["sets"][set_name])
     return {
         "schema_version": 1,
@@ -106,7 +138,8 @@ def build_freeze(*, slice_id: str, date: str, stage2_started_at: str,
 
 
 def write_once(path: pathlib.Path, doc: dict) -> None:
-    """以暫存檔寫入後用 os.link 發佈到 path：目標已存在即 FileExistsError（不覆寫）；
+    """以暫存檔寫入後用 os.link 發佈到 path：目標已存在即 AlreadyFrozen（不覆寫）；
+    父路徑不可用或不可寫等 OS 錯誤維持原例外（OSError），由呼叫端以退出碼 2 處理；
     寫入中途失敗時暫存檔會被移除，不會留下半寫的凍結檔。"""
     text = json.dumps(doc, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -118,7 +151,10 @@ def write_once(path: pathlib.Path, doc: dict) -> None:
             fh.flush()
             os.fsync(fh.fileno())
         os.chmod(tmp, 0o644)
-        os.link(tmp, path)
+        try:
+            os.link(tmp, path)
+        except FileExistsError as exc:
+            raise AlreadyFrozen(str(path)) from exc
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -151,12 +187,16 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         write_once(out, doc)
-    except FileExistsError:
+    except AlreadyFrozen:
         print(f"[freeze] 凍結檔已存在，拒絕覆寫（分母不得事後改）：{out}", file=sys.stderr)
         return 1
+    except OSError as exc:
+        print(f"[freeze] 寫入失敗（非覆寫衝突）：{out}：{exc}", file=sys.stderr)
+        return 2
     print(f"[freeze] 已寫入 {out}（denominator={doc['denominator']}）")
     return 0
 
 
 if __name__ == "__main__":
+    _force_utf8_stdio()
     sys.exit(main())

@@ -29,7 +29,7 @@
 - 長跑門檻唯一來源 `realhw/acceptance/longrun_acceptance.yaml`；OD-09 三項已凍結，其餘延後凍結（§14.2、§15.11.4）。
 - repo 政策：不得 commit 到 `main`；每個 code PR 附 `changelog.d/<issue>-<slug>.md`；commit 用 Conventional Commits 繁中 subject，含 `Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>` trailer；完成前跑 `python3 -m pytest -q tests/` 與 `python3 -m policy_check --repo .`。
 - 雙軌同步上限（§12.2「契約先行的雙軌開發」）：Stage 2 期間 Python／Rust 雙軌同步（含測試工具同步、實機重跑、缺陷處理）超過當雙週重構投入的 30% 時，暫停開立下一切片並重新排程；各切片校準報告（06 Task 23 起，07／08／09 出口報告沿用同格式）須列出當期雙軌投入比例。
-- 斷路器（§12.2、OD-02／OD-13）每個切片都適用：2.1～2.4 各自在切片開始時以 `scripts/rust/slice_breaker.py`（06 Task 0b 唯一建立者）凍結必要案例分母與觀測窗口（`tests/acceptance/breaker/slice_2.{1,2,3,4}.json`），出口 gate 判定；不得拆案例或改分母。
+- 斷路器（§12.2、OD-02／OD-13）每個切片都適用：2.1～2.4 各自在切片開始時以 `scripts/rust/freeze_slice_cases.py`（06 Task 0b 唯一建立者）凍結必要案例分母與觀測窗口，並以 `scripts/rust/slice_breaker.py` 判定（`tests/acceptance/breaker/slice_2.{1,2,3,4}.json`），出口 gate 判定；不得拆案例或改分母。
 - Spike 9（多使用者 IPC 信任邊界，§13）不在本計畫交付範圍：OD-12 限定單人工作站部署，多使用者部署（含 `windows-service` bench）前須另案交付 RPC token＋ACL 與 Spike 9 證據；P9 退役裁決不得宣稱多使用者隔離。
 
 ## Review Focus
@@ -369,7 +369,7 @@ OD-14（2026-10-16）裁決套用到 Python Stage 0 基線與 P0 契約。新 SC
 | `FsOps`（`mkdirs`、`remove_file -> PalResult<()>` 等） | P4-T1／T5 | P7-T6 只新增 `open_append`、`create_truncate`、`is_file`、`file_size`、`remove_file_if_exists` |
 | `resolve_config_path`（SC-09） | P3-T7 | P5-T19 委派（P3 沒有 `config_candidates`） |
 | `crates/sw-core/src/mcu_patterns.rs` | P5-T0（骨架） | P8-T2 Modify |
-| `scripts/rust/slice_breaker.py` | P5-T0b | P6-T0、P7-T0、P8-T1 只新增 `breaker/slice_2.x.json` |
+| `scripts/rust/freeze_slice_cases.py`、`scripts/rust/slice_breaker.py` | P5-T0b | P6-T0、P7-T0、P8-T1 只新增 `breaker/slice_2.x.json`（以 `freeze_slice_cases.py` 凍結） |
 | `contracts/ab_normalization.yaml` | P5-T20 | P9-T7B 只追加鍵 |
 | `longrun_acceptance.yaml` 三個 OD-09 延後項的寫入（`realhw/acceptance/od09_freeze.py`：`freeze`／`check_frozen_before`／`register_candidate_start`、`candidate_longrun_starts.ndjson`）、`docs/rust-refactor/owner-decisions-addenda.md`、`procedures/od09-deferred-freeze.md` | P2-T16（Stage 0；只依賴 P2-T12、P2-T15，R4-F2） | P4 Task 16（B-12）、P8 Task 15（第 8 項）長跑開跑前 `register-candidate`；P9-T6 L3 A/B 呼叫 `check_frozen_before`＋`register_candidate_start`；P9-T15／T14B 只消費 `freeze --out` 報告；P9-T1 不重建 addenda、P9-T17 不重建該程序檔；任何 Phase 不得另寫延後項或手改 acceptance |
 | `tests/acceptance/evidence_index.schema.json` | P2-T12 | P9-T1 另建 `stage3_evidence_index.schema.json` |

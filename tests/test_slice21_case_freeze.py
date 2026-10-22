@@ -7,10 +7,14 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import io
 import json
+import os
 import pathlib
+import sys
 
 import pytest
+import yaml
 
 pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
@@ -18,6 +22,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 ACC = ROOT / "tests" / "acceptance"
 FREEZE = ACC / "breaker" / "slice_2.1.json"
 LOCK = ACC / "cases.lock.json"
+CASES = ACC / "cases.yaml"
 
 
 def _load(name: str, rel: str):
@@ -36,16 +41,25 @@ def test_freeze_matches_lock():
     """分母以凍結時的 required_case_ids 為準，並與 lock["sets"]["slice_2.1"] 嚴格相等（lock 為 add-only，
     後續切片只新增 slice_2.1 以外的案例）。cases_lock_sha256 僅作 provenance：lock 每次 add-only 重算都會改位元組，
     只有 cases_revision 相同時才比對。分母指紋 denominator_sha256 以 lock 現行的 case_attrs 重算比對，
-    確認 required 案例的屬性未被改動。"""
+    確認 required 案例的屬性未被改動。另釘住凍結欄位（schema、slice、窗口、Stage 2 起算日）與 cases.yaml 重算的集合，
+    cases_yaml_sha256 同樣只在 cases_revision 相同時比對。"""
     fr = _freeze()
     lock = json.loads(LOCK.read_text(encoding="utf-8"))
+    cases_doc = yaml.safe_load(CASES.read_text(encoding="utf-8"))
     assert fr["required_case_ids"] == lock["sets"]["slice_2.1"]
     assert fr["denominator"] == len(lock["sets"]["slice_2.1"])
     canon = json.dumps([[cid, lock["case_attrs"][cid]] for cid in fr["required_case_ids"]],
                        ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     assert fr["denominator_sha256"] == hashlib.sha256(canon.encode("utf-8")).hexdigest()
+    assert fr["schema_version"] == 1 and fr["slice"] == "2.1" and fr["denominator_set"] == "slice_2.1"
+    assert fr["window"] == {"start": fr["frozen_at"], "weeks": 3}
+    assert fr["stage2_started_at"] == fr["frozen_at"]
+    assert fr["cases_revision"] == cases_doc["revision"]
+    recomputed = _load("regen_lock", "tests/acceptance/regen_lock.py").compute_sets(cases_doc)["slice_2.1"]
+    assert fr["required_case_ids"] == recomputed
     if fr["cases_revision"] == lock["cases_revision"]:
         assert fr["cases_lock_sha256"] == hashlib.sha256(LOCK.read_bytes()).hexdigest()
+        assert fr["cases_yaml_sha256"] == hashlib.sha256(CASES.read_bytes()).hexdigest()
 
 
 def test_freeze_precedes_any_gate_run():
@@ -200,3 +214,113 @@ def test_breaker_denominator_uses_frozen_ids_when_lock_grows():
     frozen = ids[:4]
     results = [{"case_id": ids[0], "verdict": "PASS"}]
     assert sb.acceptance_rate(lock, results, set_name="slice_2.1", required_case_ids=frozen) == 0.25
+
+
+def test_freeze_regular_file_parent_exits_2(tmp_path):
+    """父路徑是一般檔案屬寫入錯誤（exit 2），不得被誤判為「凍結檔已存在」（exit 1）。"""
+    freeze = _load("freeze_slice_cases", "scripts/rust/freeze_slice_cases.py")
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x", encoding="utf-8")
+    assert freeze.main(["--slice", "2.1", "--date", "2026-10-21", "--out", str(blocker / "slice_2.1.json")]) == 2
+
+
+def test_freeze_unwritable_directory_exits_2(tmp_path):
+    """目錄不可寫屬寫入錯誤（exit 2）。root 可寫入唯讀目錄、Windows 無 POSIX 權限位元，故略過。"""
+    if os.name == "nt" or os.geteuid() == 0:
+        pytest.skip("權限測試需非 root 的 POSIX 環境")
+    freeze = _load("freeze_slice_cases", "scripts/rust/freeze_slice_cases.py")
+    locked = tmp_path / "ro"
+    locked.mkdir()
+    locked.chmod(0o500)
+    try:
+        assert freeze.main(["--slice", "2.1", "--date", "2026-10-21", "--out", str(locked / "slice_2.1.json")]) == 2
+    finally:
+        locked.chmod(0o700)
+    assert list(locked.iterdir()) == []
+
+
+def test_build_freeze_rejects_lock_set_drift(tmp_path):
+    """鎖檔集合與 cases.yaml 重算結果不一致（手改或過期）時必須拒絕，不得寫入永久固定的分母。"""
+    freeze = _load("freeze_slice_cases", "scripts/rust/freeze_slice_cases.py")
+    lock = json.loads(LOCK.read_text(encoding="utf-8"))
+    lock["sets"]["slice_2.1"] = lock["sets"]["slice_2.1"][:-1]
+    drifted = tmp_path / "cases.lock.json"
+    drifted.write_text(json.dumps(lock), encoding="utf-8")
+    with pytest.raises(ValueError):
+        freeze.build_freeze(slice_id="2.1", date="2026-10-21", stage2_started_at="2026-10-21",
+                            lock_path=drifted, yaml_path=CASES)
+
+
+def test_freeze_stdio_is_utf8_under_cp1252(monkeypatch):
+    """cp1252 stdio 下輸出繁中訊息不得擲 UnicodeEncodeError（否則寫入成功後仍以 exit 1 結束）。"""
+    freeze = _load("freeze_slice_cases", "scripts/rust/freeze_slice_cases.py")
+    raw_out = io.BytesIO()
+    monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(raw_out, encoding="cp1252", write_through=True))
+    monkeypatch.setattr(sys, "stderr", io.TextIOWrapper(io.BytesIO(), encoding="cp1252", write_through=True))
+    freeze._force_utf8_stdio()
+    print("凍結檔已寫入")
+    assert "凍結檔已寫入".encode("utf-8") in raw_out.getvalue()
+
+
+def test_breaker_rejects_sparse_or_late_snapshots(tmp_path):
+    """窗口已結束時，快照只涵蓋窗口前段或只涵蓋後段都不是足夠證據，不得以 exit 0 放行。"""
+    sb = _load("slice_breaker", "scripts/rust/slice_breaker.py")
+    fr = {"window": {"start": "2026-11-02", "weeks": 3}, "stage2_started_at": "2026-10-21"}
+    early_only = [{"date": "2026-11-02", "rate": 0.0}, {"date": "2026-11-09", "rate": 0.10}]
+    out = sb.evaluate(fr, early_only, today="2026-12-31", stage2_estimate_weeks=0)
+    assert out["tripped"] is False and out["insufficient_evidence"] is True and "首尾" in out["reason"]
+    late_only = [{"date": "2026-11-16", "rate": 0.20}, {"date": "2026-11-23", "rate": 0.30}]
+    assert sb.evaluate(fr, late_only, today="2026-12-31", stage2_estimate_weeks=0)["insufficient_evidence"] is True
+    for rows in (early_only, late_only):
+        freeze_path, snap_path = _breaker_files(tmp_path, rows)
+        assert sb.main(["--freeze", str(freeze_path), "--snapshots", str(snap_path), "--today", "2026-12-31"]) == 3
+
+
+def test_breaker_od02_resubmit_boundary_and_exit_code(tmp_path):
+    """OD-02：2026-10-21 至 2027-04-07 恰為 24.0 週（不超過上限）；預估須為有限且非負的數值，否則拒絕。"""
+    sb = _load("slice_breaker", "scripts/rust/slice_breaker.py")
+    fr = {"window": {"start": "2026-11-02", "weeks": 3}, "stage2_started_at": "2026-10-21"}
+    flat_ok = [{"date": "2026-11-02", "rate": 0.40}, {"date": "2026-11-23", "rate": 0.60}]
+    assert sb.evaluate(fr, flat_ok, today="2027-04-07", stage2_estimate_weeks=0)["od02_resubmit"] is False
+    assert sb.evaluate(fr, flat_ok, today="2027-04-07", stage2_estimate_weeks=0.1)["od02_resubmit"] is True
+    assert sb.evaluate(fr, flat_ok, today="2027-04-08", stage2_estimate_weeks=0)["od02_resubmit"] is True
+    for bad in (float("nan"), float("inf"), -40.0, True):
+        with pytest.raises(ValueError):
+            sb.evaluate(fr, flat_ok, today="2027-04-07", stage2_estimate_weeks=bad)
+    freeze_path, snap_path = _breaker_files(tmp_path, flat_ok)
+    base = ["--freeze", str(freeze_path), "--snapshots", str(snap_path), "--today", "2027-01-27"]
+    assert sb.main(base + ["--stage2-estimate-weeks", "12"]) == 1
+    assert sb.main(base + ["--stage2-estimate-weeks", "nan"]) == 2
+    assert sb.main(base + ["--stage2-estimate-weeks", "-40"]) == 2
+
+
+def test_breaker_snapshot_denominator_cross_check(tmp_path):
+    """快照附上 passed／denominator 時須與凍結分母一致，且 rate 須等於 passed÷denominator。"""
+    sb = _load("slice_breaker", "scripts/rust/slice_breaker.py")
+    freeze_path = tmp_path / "freeze.json"
+    freeze_path.write_text(json.dumps({"window": {"start": "2026-11-02", "weeks": 3},
+                                       "stage2_started_at": "2026-10-21", "denominator": 49}), encoding="utf-8")
+    snap_path = tmp_path / "snap.ndjson"
+
+    def run(rows: list[dict]) -> int:
+        snap_path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        return sb.main(["--freeze", str(freeze_path), "--snapshots", str(snap_path), "--today", "2026-11-23"])
+
+    ok = [{"date": "2026-11-02", "rate": 20 / 49, "passed": 20, "denominator": 49},
+          {"date": "2026-11-23", "rate": 30 / 49, "passed": 30, "denominator": 49}]
+    assert run(ok) == 0
+    shrunk = [dict(ok[0]), {"date": "2026-11-23", "rate": 30 / 48, "passed": 30, "denominator": 48}]
+    assert run(shrunk) == 2
+    mismatch = [dict(ok[0]), {"date": "2026-11-23", "rate": 0.7, "passed": 30, "denominator": 49}]
+    assert run(mismatch) == 2
+
+
+def test_breaker_stdio_is_utf8_under_cp1252(monkeypatch):
+    """cp1252 stdio 下判定器輸出繁中原因時仍須以判定碼結束，不得因 UnicodeEncodeError 誤為 exit 1。"""
+    sb = _load("slice_breaker", "scripts/rust/slice_breaker.py")
+    raw_err = io.BytesIO()
+    monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(io.BytesIO(), encoding="cp1252", write_through=True))
+    monkeypatch.setattr(sys, "stderr", io.TextIOWrapper(raw_err, encoding="cp1252", write_through=True))
+    sb._force_utf8_stdio()
+    print("證據不足", file=sys.stderr)
+    assert "證據不足".encode("utf-8") in raw_err.getvalue()

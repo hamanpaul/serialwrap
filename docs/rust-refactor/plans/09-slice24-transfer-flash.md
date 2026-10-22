@@ -260,8 +260,8 @@ def throwaway_daemon(...) -> SwEnv            # fixture factory：獨立 RUN/STA
 def acceptance_rate(lock: dict, results: list[dict], *, set_name: str) -> float     # 取得有效 PASS 證據（Task 15 判定）的必要案例數 ÷ 凍結分母；SKIP／證據不足不計
 def evaluate(freeze: dict, snapshots: list[dict], *, today: str, stage2_estimate_weeks: float) -> dict
 #   snapshots：[{"date","rate","results_sha256"}]（每週一筆，check-in 至 tests/acceptance/breaker/slice_2.4.snapshots.ndjson）
-#   回 {"tripped": bool, "reason": str|None, "window_delta_pp": float, "od02_resubmit": bool}
-#   tripped：觀測窗口內任一連續三週 rate 累計增加 < 10 個百分點；od02_resubmit：stage2_started_at 至今已耗週數＋剩餘預估 > 24
+#   回 {"tripped": bool, "insufficient_evidence": bool, "reason": str|None, "window_delta_pp": float, "elapsed_weeks": float, "stage2_estimate_weeks": float, "od02_resubmit": bool}（沿用 06 Task 0b 實作）
+#   tripped：依 §12.2「觀測窗口起訖於切片開始時固定」，三週窗口內首尾快照 rate 累計增加 < 10 個百分點（單一固定窗口；「連續三週內」之滾動解讀見 NC-P5-02，待擁有者確認）；od02_resubmit：stage2_started_at 至今已耗週數＋剩餘預估 > 24（剩餘預估須為有限且 >= 0）
 def main(argv=None) -> int      # tripped 或 od02_resubmit → exit 1，stderr 指示「停止擴大部署、退守 Stage 1 artifact、提請擁有者審查／重提 OD-02」
 ```
 

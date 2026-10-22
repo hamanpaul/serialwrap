@@ -156,9 +156,19 @@ def test_scope_matches_cases_yaml():
     assert func_items == {cid for cid in later if cases[cid]["suite"] == "func-test"}
     assert reg_families == {cases[cid]["family"] for cid in later - early if cases[cid]["suite"] == "regression"}
     lock = json.loads(LOCK.read_text(encoding="utf-8"))
+    # 切片標籤必須與 cases.yaml 的 daemon_slice 一致（不只比對案例名稱）
+    for row in scope["cross_slice_cases"]:
+        if row["suite"] == "func-test":
+            for cid in row["items"]:
+                assert cases[cid]["daemon_slice"] == row["slice"], cid
+        elif row["suite"] == "regression":
+            for cid in later - early:
+                if cases[cid]["suite"] == "regression" and cases[cid]["family"] in row["items"]:
+                    assert cases[cid]["daemon_slice"] == row["slice"], cid
     for row in scope["early_evidence_cases"]:
         assert _after_21(lock["case_attrs"][row["case_id"]]["daemon_slice"]), row["case_id"]
         assert row["case_id"] not in lock["sets"]["slice_2.1"], row["case_id"]
+        assert row["lock_slice"] == lock["case_attrs"][row["case_id"]]["daemon_slice"], row["case_id"]
 
 
 def test_l15_and_windows_required_listed():

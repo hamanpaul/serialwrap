@@ -77,7 +77,7 @@
 | P0 | `contracts/error_codes.yaml`、`contracts/session_last_errors.yaml`、`contracts/behavior_changes.yaml`（含 SC-01～SC-19（SC-08 已依 OD-14 撤回、不在檔內）、SC-34、SC-35、DF-02～DF-17、BC-01～BC-04；`pending_owner_confirmations: []`）、`contracts/rpc_schema.json`、`contracts/wal_record.schema.json`、`contracts/state_file.schema.json` |
 | P1 | Python 基線已實作 BC-01～BC-04、SC-01～SC-07、SC-10、SC-11、SC-13、SC-19、DF-02～DF-04、DF-14、DF-15、DF-17；`contracts/golden/rpc/*.json`（Python 擷取的回應位元組） |
 | P1-OC | `02b-stage0-owner-confirmations.md`（OD-14）：Python A 側基線已實作 SC-34（attach／recover 回 `SESSION_NOT_READY`＋頂層 `last_error`／`last_error_detail`）、SC-35（passthrough 30 s 安靜轉 READY 與命令路徑、`PASSTHROUGH_READY_QUIET_S`）、SC-04 修訂（release drain 逾時 `DRAIN_STALLED`）、SC-08 撤回（socket 維持 `0o660` 基線）；OD-14 確認簿記（DF-02、SC-26、SC-27 `confirmed`、`pending_owner_confirmations: []`）；P1-OC 重新擷取的 `contracts/golden/rpc/*.json` 為本 Phase 比對基準 |
-| P2 | `tests/acceptance/{cases.yaml, cases.schema.json, cases.lock.json, regen_lock.py}`（P2 Task 12；欄位 `case_id`、`daemon_slice`、`necessity`、`prerequisites`、`invariants`、`behavior_changes`、`cross_slice_reason`；`lock["sets"]["slice_2.1"]`＝`necessity=="required"` 且 `daemon_slice ≤ 2.1`）；`func-test/runner.py`（`--mode pty|bridge|both`、`--dut-mode`、`--report-dir`、`--selftest-report`、`--scenarios`；`--case` 為**單值**，每次一個 case）與其 bridge／scenario 動作集合（`op_begin`／`op_end`、`bridge_control`（`pause_pump`／`resume_pump`／`transport_disconnect`／`transport_reconnect`）、`dut_control`（`emit`／`pause_responding`／`logical_reboot`）、`wait_wire_marker`、`assert_zero_tx`、`assert_wire_contiguous`、`assert_compare`、`wal_control`（`unlink_current`／`hold_reader`／`reset`）、`assert_wal_meta`、`assert_wal_marker`、`assert_command_resolved`，加上既有 `cli`／`wait_state`／`target_emit`）；DUT plan（`delay_reply`、`half_prompt`、`silent`、`stop_stdin`、`flood`）；`func-test/scenarios/l15-*.yaml`（§15.7.1 情境 11 筆，其中 `daemon_slice=2.1` 者 8 筆）；`func-test/lib/daemon_harness.py::{resolve_cli_exe, resolve_daemon_argv}`（只供 func-test）；bridge 資格報告 `selftest-report.json`（`uart-stdio-bridge selftest`） |
+| P2 | `tests/acceptance/{cases.yaml, cases.schema.json, cases.lock.json, regen_lock.py}`（P2 Task 12；欄位 `case_id`、`daemon_slice`、`necessity`、`prerequisites`、`invariants`、`behavior_changes`、`cross_slice_reason`；`lock["sets"]["slice_2.1"]`＝`necessity=="required"` 且 `daemon_slice ≤ 2.1`）；`func-test/runner.py`（`--mode pty|bridge|both`、`--dut-mode`、`--report-dir`、`--selftest-report`、`--scenarios`；`--case` 為**單值**，每次一個 case）與其 bridge／scenario 動作集合（`op_begin`／`op_end`、`bridge_control`（`pause_pump`／`resume_pump`／`transport_disconnect`／`transport_reconnect`）、`dut_control`（`emit`／`pause_responding`／`logical_reboot`）、`wait_wire_marker`、`assert_zero_tx`、`assert_wire_contiguous`、`assert_compare`、`wal_control`（`unlink_current`／`hold_reader`／`reset`）、`assert_wal_meta`、`assert_wal_marker`、`assert_command_resolved`，加上既有 `cli`／`wait_state`／`target_emit`）；DUT plan（`delay_reply`、`half_prompt`、`silent`、`stop_stdin`、`flood`）；`func-test/scenarios/l15-*.yaml`（共 15 筆，其中 `daemon_slice=2.1` 者 11 筆，與 `cases.yaml`／lock 一致）；`func-test/lib/daemon_harness.py::{resolve_cli_exe, resolve_daemon_argv}`（只供 func-test）；bridge 資格報告 `selftest-report.json`（`uart-stdio-bridge selftest`） |
 | P3 | `tests/ab_env.py::AB_ENV`（root conftest pop 之前擷取 `SERIALWRAP_CLI_EXE`／`SERIALWRAP_DAEMON_EXE`／`SERIALWRAP_AB_LABEL`）；`tests/contract_blackbox/bb_harness.py::{repo_root, ab_label, is_rust, cli_prefix, daemon_prefix, isolated_env(tmp, **overrides), run_cli, CliResult, NL}`、`bb_faketarget.FakeTarget(workdir, *, prompt, user, password)`（`.start(by_id_dir, name) -> Path`、`.rx_log() -> bytes`、`.stop()`；只模擬 `login:`／`Password:`／`echo X`／`^C`）、`bb_daemon.PyDaemon`、`bin/py-serialwrapd`；`sw_proto::{constants, error_codes::ErrorCode, session_last_errors::SessionLastError, pyjson::{PyValue, PyInt, PyDict, DumpOpts, Sep, loads, dumps, CLI_STDOUT, RPC_WIRE, RPC_EARLY, DISK_STABLE}, pydict!}`；`sw_proto::pycompat::{py_int_parse, py_float_parse, py_strip, py_bytes_strip, splitlines, universal_newlines, decode_utf8_replace, decode_utf8_strict, py_len_chars, py_truthy, PyOsError, sha256_hex}`、`sw_proto::pyfmt::{py_str, py_repr_str, py_repr_float}`；`sw_proto::pyre::{compile, PyFlags, PyRegex, valid_completion_regex}`；`sw_proto::config_types::{load_profiles(dir: &str, fs: &dyn ProfileFs), ProfileFs, LoadResult{profiles, templates, max_sessions}, ProfileTemplate, SessionProfile{com, act_no, alias, device_by_id, template}, UartProfile, RuntimeConfig{data}::{from_text, mode, socket_path}}`；`sw_proto::rpc_types::Method`；`sw_proto::runtime_paths::{RuntimePaths（String 欄位：config_dir, state_dir, run_dir, data_dir, lock_path, socket_path, default_tcp_port, default_endpoint, profile_dir, wal_dir, log_dir, config_yaml）::resolve, EnvSnapshot, NativeTraits, PathsError, resolve_config_path}`；`sw_proto::endpoint::{Endpoint{Unix(String), Tcp{host, port}}, parse_endpoint(&str) -> Result<Endpoint, EndpointError>, is_loopback_tcp}`；`sw_proto::version::{version, version_line}`；`sw_pal::traits::{PalError{kind, os_code, winerror, strerror, py_message}, PalErrorKind, SysEnv, Clock{mono_ns, sleep}, EndpointSpec{Unix(OsString), Tcp}, RpcConnector, RpcStream{send_all, recv}}`；`scripts/rust/check_cfg_boundary.py`、`scripts/rust/win-test.sh`、`scripts/rust/win-runner.sh`、`scripts/rust/win-blackbox.ps1`、`scripts/rust/mkbundle.sh` |
 | P4 | `sw_pal::FsOps: FsRead`（`atomic_write(p, data, mode: Option<u32>)`、`write_file`、`mkdirs`、`replace`、`remove_file`、`sync_dir`、`set_mode`、`file_lock_exclusive`）；`sw_pal::ProcScan::{serialwrapd_instances() -> Result<Vec<DaemonProc>, ScanFailure>（P4 實際簽章，P5 Task 0 雙審修正）, serialwrapd_tty_holders(&[PathBuf]) -> (Vec<u32>, HolderScanStatus), pid_alive}（`HolderScanStatus` 由 P4 05 Task 1 依 arch §4.2 定義，本 Phase 沿用）`；`ProcessCtl`；`sw_proto::config_types::RuntimeConfig::{set_mode, set_socket(&mut self, &str), to_yaml}`；`sw_pal::native() -> Platform`；`crates/sw-daemon/src/launcher.rs`（`components.daemon.implementation` 判斷） |
 | 本 Phase 補齊（Task 0c；上游未交付者） | `sw_proto::pycompat::{PyErr{message}::value_error, coerce_rpc_bool, py_round, iso_utc_now(us), strftime_utc(us, fmt), strftime_local(us, offset_s, fmt), uuid4_hex(rng), uuid4_dashed(rng), to_printable, clean_text, strip_ansi, a2b_base64_lenient, b2a_base64, shlex_quote, shlex_split(&str) -> Result<Vec<String>, ShlexError>}`（Python 產生 golden：`contracts/golden/pycompat_s21.tsv`；`contracts/golden/pycompat.tsv` 屬 P3 04 Task 4，不覆寫；`shlex_quote`／`b2a_base64` 供 P8 09 Task 3，`shlex_split` 供 P6 07 Task 3）；`sw_proto::rpc_types::Params<'a>::{str_or, int_or, float_or, truthy, raw, selector_chain}`；`sw_proto::config_types::RuntimeConfig::{windows_exclude_coms(&self) -> Vec<String>, windows_test_device_allowlist(&self) -> Result<Option<Vec<String>>, ()>}`；`sw_proto::runtime_paths::{DaemonDirs{by_id_dir, by_path_dir, events_dir, events_runtime_dir}, resolve_daemon_dirs(env: &EnvSnapshot) -> DaemonDirs}`；`sw_pal::traits::Clock` 擴充 `wall_unix_us(&self) -> i64`、`local_utc_offset_s(&self) -> i32`（native 與既有 fake 一併實作）；`sw_pal::traits::RpcServerStream: Read + Write + Send { shutdown_read, set_read_timeout }`（server 端；P3 `RpcStream{send_all, recv}` 維持 client 專用，arch §4.6 同步修訂）；`sw_proto::wal_types::crc32_hex(&[u8]) -> String`（`crc32fast` 只留在 sw-proto，arch §1.2） |
@@ -480,14 +480,14 @@ P5 Task 0 雙審修正（staging）：`crates` 僅限本 Task 0 骨架與修正�
 
 **Files:**
 - Create: `scripts/rust/freeze_slice_cases.py`、`scripts/rust/slice_breaker.py`、`tests/acceptance/breaker/slice_2.1.json`、`tests/acceptance/breaker/slice_2.1.snapshots.ndjson`（空檔）
-- Modify: `tests/test_slice21_scope.py`（加兩個測試）
+- Modify: `tests/test_slice21_scope.py`（加兩個測試；`test_scope_matches_cases_yaml` 加切片標籤比對）、`docs/rust-refactor/plans/09-slice24-transfer-flash.md`（斷路器段窗口語意與 OD-02 輸入驗證對齊）、`docs/rust-refactor/plans/spec-reconciliation.md`（§7 登記 NC-P5-02）
 - Test: `tests/test_slice21_case_freeze.py`
 
 **Interfaces:**
-- Consumes：P2 `tests/acceptance/cases.yaml`、`cases.lock.json`（欄位 `daemon_slice`、`necessity`）。
+- Consumes：P2 `tests/acceptance/cases.yaml`、`cases.lock.json`（欄位 `daemon_slice`、`necessity`）；`tests/acceptance/regen_lock.py` 的 `compute_sets`（凍結前以 cases.yaml 重算比對鎖檔集合）。
 - Produces：
-  - `scripts/rust/freeze_slice_cases.py --slice 2.1 --date YYYY-MM-DD`：寫 `tests/acceptance/breaker/slice_2.1.json`（`DISK_STABLE`）＝`{"schema_version":1,"slice":"2.1","frozen_at":<date>,"window":{"start":<date>,"weeks":3},"cases_revision":<cases.yaml revision>,"cases_lock_sha256":<cases.lock.json 位元組 sha256>,"cases_yaml_sha256":<cases.yaml 位元組 sha256>,"denominator_set":"slice_2.1","required_case_ids":<lock["sets"]["slice_2.1"] 原序>,"denominator":<len>,"stage2_started_at":<date>}`；已存在時拒絕覆寫（exit 1，分母不得事後改）。
-  - `scripts/rust/slice_breaker.py`：介面與 `09-slice24-transfer-flash.md` 斷路器段相同（`acceptance_rate(lock, results, *, set_name)`、`evaluate(freeze, snapshots, *, today, stage2_estimate_weeks)`、`main`）；本 Phase 為首個建立者，09 計畫改為沿用（下游對齊）。有效 PASS 只採 Task 22 gate 判定為 `PASS` 的案例證據；SKIP／INSUFFICIENT_EVIDENCE／EVIDENCE_MISSING 不計入分子。
+  - `scripts/rust/freeze_slice_cases.py --slice 2.1 --date YYYY-MM-DD`：寫 `tests/acceptance/breaker/slice_2.1.json`（`DISK_STABLE`）＝`{"schema_version":1,"slice":"2.1","frozen_at":<date>,"window":{"start":<date>,"weeks":3},"cases_revision":<cases.yaml revision>,"cases_lock_sha256":<cases.lock.json 位元組 sha256>,"cases_yaml_sha256":<cases.yaml 位元組 sha256>,"denominator_set":"slice_2.1","required_case_ids":<lock["sets"]["slice_2.1"] 原序>,"denominator":<len>,"denominator_sha256":<required 案例 case_attrs 的 canonical JSON sha256>,"stage2_started_at":<date>}`；已存在時拒絕覆寫（exit 1，分母不得事後改）。`--frozen-at` 為 `--date` 別名；日期只接受 YYYY-MM-DD；2.1 的 `stage2_started_at` 預設為開工日，2.2～2.4 必須沿用 `breaker/slice_2.1.json` 的值（缺檔、不一致或晚於開工日 → exit 2）；寫入以暫存檔＋`os.link` 發佈，不留半寫檔；分母先以 `regen_lock.compute_sets` 重算比對 cases.yaml（不一致 exit 2）；目標已存在 exit 1，父路徑為一般檔案或目錄不可寫等 OS 錯誤 exit 2。
+  - `scripts/rust/slice_breaker.py`：介面與 `09-slice24-transfer-flash.md` 斷路器段相同（`acceptance_rate(lock, results, *, set_name)`、`evaluate(freeze, snapshots, *, today, stage2_estimate_weeks)`、`main`）；本 Phase 為首個建立者，09 計畫改為沿用（下游對齊）。有效 PASS 只採 Task 22 gate 判定為 `PASS` 的案例證據；SKIP／INSUFFICIENT_EVIDENCE／EVIDENCE_MISSING 不計入分子，同一案例的全部 verdict 皆為 `PASS` 才計入。`acceptance_rate` 另接受 `required_case_ids`（呼叫端傳凍結檔分母，不隨 add-only 擴充的 lock 改變）；`evaluate` 另回 `insufficient_evidence`、`elapsed_weeks`、`stage2_estimate_weeks`（窗口已結束時，有效快照不足 2 筆，或快照未涵蓋窗口首尾（首筆晚於起點 7 日、或末筆早於終點 7 日）即 insufficient_evidence）；`stage2_estimate_weeks` 須為有限且 >= 0（NaN、負數、布林 → ValueError，`main` exit 2）；快照 rate 必須在 0～1；恰 +10 pp 不觸發（以 9 位小數捨入比較）；選填 `passed`／`denominator` 快照欄位須與凍結分母交叉檢查（`main` 不符即 exit 2）；`results_sha256` 目前不強制（既有快照格式不含此欄）；`main` 退出碼 0 未觸發、1 tripped 或 od02_resubmit、2 輸入錯誤、3 證據不足。窗口語意採單一固定窗口（起訖於切片開始時固定，§12.2）；「連續三週內」之滾動解讀登記為 NC-P5-02，待擁有者確認。
 
 - [ ] **Step 1：寫失敗測試**
 
@@ -495,18 +495,20 @@ P5 Task 0 雙審修正（staging）：`crates` 僅限本 Task 0 骨架與修正�
 
 | 測試名 | 精確斷言 |
 |---|---|
-| `test_freeze_matches_lock` | `slice_2.1.json.required_case_ids == lock["sets"]["slice_2.1"]`、`denominator == len(...)`、`cases_lock_sha256` 等於現行檔案 sha256 |
+| `test_freeze_matches_lock` | `slice_2.1.json.required_case_ids == lock["sets"]["slice_2.1"]`（嚴格相等）、`denominator == len(...)`、`denominator_sha256` 等於 required 案例 `case_attrs` 的 canonical JSON sha256（以 lock 現行值重算）；`cases_lock_sha256` 僅在 `cases_revision` 與 lock 相同時比對（lock 為 add-only，P6～P8 重算後位元組會變，分母屬性不變） |
 | `test_freeze_precedes_any_gate_run` | `frozen_at <= ` 任何 `target/slice21-gate/*/report.json` 的 `started_at` 日期（無報告時 PASS） |
 | `test_freeze_refuses_overwrite` | 以暫存目錄執行兩次 `freeze_slice_cases.py` → 第二次 exit 1、檔案不變 |
 | `test_breaker_trips_on_flat_rate` | 三週 snapshot rate `0.40, 0.44, 0.48`（累計 +8 pp）→ `tripped True` |
 | `test_breaker_counts_only_valid_pass` | results 含 `PASS`／`SKIP`／`EVIDENCE_MISSING` 各一 → `acceptance_rate == 1/denominator` |
+| 雙審補強（R-T0b-01～07，見 Produces） | `test_freeze_accepts_frozen_at_alias_and_rejects_non_iso_dates`（`--frozen-at` 別名；`20261021`、`2026-W43-3` → exit 2）、`test_freeze_later_slice_inherits_stage2_origin`（2.2 缺 2.1 凍結檔 → exit 2；沿用 2.1 起算日；不一致 → exit 2）、`test_freeze_rejects_stage2_later_than_date`、`test_breaker_exact_ten_pp_does_not_trip_and_9_99_trips`（恰 +10 pp 不觸發；+9.99 觸發）、`test_breaker_flags_insufficient_evidence_after_window`、`test_breaker_main_exit_codes`（0 正常／1 觸發／2 輸入錯誤／3 證據不足）、`test_breaker_rejects_percent_style_rate`（rate 10、10.5 → exit 2）、`test_breaker_requires_every_verdict_of_a_case_to_pass`、`test_breaker_denominator_uses_frozen_ids_when_lock_grows` |
+| 雙審補強第二輪 | `test_freeze_regular_file_parent_exits_2`、`test_freeze_unwritable_directory_exits_2`（非 root POSIX，否則 skip）、`test_build_freeze_rejects_lock_set_drift`、`test_freeze_stdio_is_utf8_under_cp1252`、`test_breaker_rejects_sparse_or_late_snapshots`（窗口前段／後段快照 → exit 3）、`test_breaker_od02_resubmit_boundary_and_exit_code`（24.0 週不觸發；NaN／負數／布林 → 拒絕）、`test_breaker_snapshot_denominator_cross_check`、`test_breaker_stdio_is_utf8_under_cp1252`；`test_freeze_matches_lock` 另釘 schema、slice、窗口、起算日與 cases.yaml 重算集合；`test_scope_matches_cases_yaml` 另比對切片標籤 |
 
 `tests/test_slice21_scope.py` 加：
 
 | 測試名 | 精確斷言 |
 |---|---|
 | `test_scope_matches_cases_yaml` | `slice21_scope.yaml.cross_slice_cases` 中 `func-test`／`regression` 的 items 集合 == `cases.yaml` 中同 suite、`daemon_slice > "2.1"` 的 case（regression 以 family 比對）；`early_evidence_cases` 每筆在 lock 屬 > 2.1 |
-| `test_l15_and_windows_required_listed` | lock `slice_2.1` 中 `suite ∈ {l15-scenario, windows-native}` 的 15 個 id（`l15-delayed-reply`、`l15-half-prompt`、`l15-slow-reader-backpressure`、`l15-transport-disconnect`、`l15-multi-source-contention-cli`、`l15-stale-event-delay`、`l15-wal-interference`、`l15-reject-zero-tx`、`win-com-open-exclusive`、`win-com-txrx-bridge`、`win-com-cancel-close`、`win-wal-av-rotate`、`win-wal-av-unlink`、`win-wal-av-reader-handle`、`win-wal-f12-progress`）全部出現在 Task 21 的執行清單或 BLOCKED-OWNER 總表的 `case_ids` 欄 |
+| `test_l15_and_windows_required_listed` | lock `slice_2.1` 中 `suite ∈ {l15-scenario, windows-native}` 的**全部** id（11 個 l15 ＋ 7 個 win，共 18 個；分母來源為 lock，文件化清單須與之相等）皆出現在 Task 21 的執行清單，或 BLOCKED-OWNER 總表的 `case_ids` 欄（第 3 欄）。l15：`l15-delayed-reply`、`l15-half-prompt`、`l15-slow-reader-backpressure`、`l15-transport-disconnect`、`l15-multi-source-contention-cli`、`l15-stale-event-delay`、`l15-wal-interference`、`l15-reject-zero-tx`、`l15-exclusive-open`、`l15-reboot-min-guard`、`l15-release-inflight`；win：`win-com-open-exclusive`、`win-com-txrx-bridge`、`win-com-cancel-close`、`win-wal-av-rotate`、`win-wal-av-unlink`、`win-wal-av-reader-handle`、`win-wal-f12-progress` |
 
 - [ ] **Step 2：執行並確認 FAIL**
 
@@ -515,17 +517,17 @@ Expected：FAIL，`FileNotFoundError: .../tests/acceptance/breaker/slice_2.1.jso
 
 - [ ] **Step 3：實作**
 
-依 Produces 寫兩支腳本（stdlib＋PyYAML）；以開工日執行 `python3 scripts/rust/freeze_slice_cases.py --slice 2.1 --date <開工日>` 產生凍結檔並 check-in。每週一以 Task 22 最近一次 gate 報告計算 rate，append 一行到 `slice_2.1.snapshots.ndjson`（`{"date","rate","results_sha256"}`）。
+依 Produces 寫兩支腳本（stdlib＋PyYAML）；以開工日執行 `python3 scripts/rust/freeze_slice_cases.py --slice 2.1 --date <開工日>` 產生凍結檔並 check-in。每週一以 Task 22 最近一次 gate 報告計算 rate，append 一行到 `slice_2.1.snapshots.ndjson`（`{"date","rate","results_sha256"}`）。rate 以 `acceptance_rate(lock, results, set_name="slice_2.1", required_case_ids=frozen["required_case_ids"])` 計算（不得手填分母），快照可附 `passed`、`denominator`。
 
 - [ ] **Step 4：執行並確認 PASS**
 
 Run：同 Step 2
-Expected：13 項 PASS（`test_slice21_case_freeze.py` 5、`test_slice21_scope.py` 8）。
+Expected：30 passed、1 skipped（`test_slice21_case_freeze.py` 22 項 PASS；`test_slice21_scope.py` 8 項 PASS；`test_event_latency_contract_frozen_before_slice_start` 1 項 skip 為 §5.3 INSUFFICIENT_EVIDENCE，sanctioned，不計為 PASS）。
 
 - [ ] **Step 5：Commit**
 
 ```bash
-git add scripts/rust/freeze_slice_cases.py scripts/rust/slice_breaker.py tests/acceptance/breaker tests/test_slice21_case_freeze.py tests/test_slice21_scope.py changelog.d/rust-s21-case-freeze.md
+git add scripts/rust/freeze_slice_cases.py scripts/rust/slice_breaker.py tests/acceptance/breaker tests/test_slice21_case_freeze.py tests/test_slice21_scope.py changelog.d/rust-s21-case-freeze.md docs/rust-refactor/plans/00-master-plan.md docs/rust-refactor/plans/06-slice21-daemon-core.md docs/rust-refactor/plans/07-slice22-console.md docs/rust-refactor/plans/08-slice23-login-events.md docs/rust-refactor/plans/09-slice24-transfer-flash.md docs/rust-refactor/plans/spec-reconciliation.md
 git commit -m "chore(tests): 凍結 Slice 2.1 必要案例分母與承接率斷路器" -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 ```
 
@@ -4502,7 +4504,7 @@ git commit -m "test(contract): Slice 2.1 黑箱案例並修正 Rust daemon 差�
 ## Task 21：L1.5 bridge 回歸（P2 凍結 2.1 情境＋s21 情境）與事件延遲量測
 
 **Test author model:** agy-gemini-3.8-flash-high　**Implementer model:** codex-gpt-6-luna-max
-**Changelog fragment:** `changelog.d/rust-s21-l15.md`（front matter `type: feat`、`scope: tests`；本文：「Slice 2.1 L1.5：以 Rust daemon 重跑 P2 凍結的 8 個 2.1 情境，新增 Quiet 零 TX、部分寫出中止不重送、release／attach 交接、外部占用、帳密未解析、WAL 外部刪除、reboot 最小防護與事件延遲情境。」）
+**Changelog fragment:** `changelog.d/rust-s21-l15.md`（front matter `type: feat`、`scope: tests`；本文：「Slice 2.1 L1.5：以 Rust daemon 重跑 P2 凍結的 11 個 2.1 情境，新增 Quiet 零 TX、部分寫出中止不重送、release／attach 交接、外部占用、帳密未解析、WAL 外部刪除、reboot 最小防護與事件延遲情境。」）
 **擁有者 host 可執行（OD-15）：** Windows L1.5：同一批情境在原生 Windows daemon（OD-11 隔離實例＋`SERIALWRAP_TEST_DEVICE_ALLOWLIST=COM20`）＋com0com DUT-side pair `COM20`／`COM21` 上的 A/B 證據（OD-08；含 `win-com-*` 三個凍結案例，BO-S21-13），orchestrator 經 WSL interop 代跑。
 
 **BLOCKED-OWNER：** 實機 A/B（§15.9.2）。
@@ -4519,7 +4521,7 @@ git commit -m "test(contract): Slice 2.1 黑箱案例並修正 Rust daemon 差�
 - Produces：`target/l15/slice21/<run_id>/{python,rust}/<case_id>/`（runner 產生的 `manifest.json`、`wire.ndjson`、`control.ndjson`、`correlation.ndjson`、`comparison.json`、`wal/`、`cli.ndjson`、`daemon.log`）；`contracts/resource_limits.yaml event_latency.measurement_runs`（三輪量測結果與 host load 紀錄）。
 
 **執行清單**（Python 基線先跑 A、確認 daemon 行程／PTY／lock 釋放後以新 DUT 實例跑 Rust B，§15.9.1）：
-- P2 凍結、`daemon_slice=2.1` 的 8 個：`l15-delayed-reply`、`l15-half-prompt`、`l15-slow-reader-backpressure`、`l15-transport-disconnect`、`l15-multi-source-contention-cli`、`l15-stale-event-delay`、`l15-wal-interference`、`l15-reject-zero-tx`（原檔不改；`l15-slow-reader-backpressure` 與 `l15-multi-source-contention-cli` 以 `assert_wire_contiguous` 驗證 §11.3 禁止交錯）。
+- P2 凍結、`daemon_slice=2.1` 的 11 個：`l15-delayed-reply`、`l15-half-prompt`、`l15-slow-reader-backpressure`、`l15-transport-disconnect`、`l15-multi-source-contention-cli`、`l15-stale-event-delay`、`l15-wal-interference`、`l15-reject-zero-tx`、`l15-exclusive-open`（flock／TIOCEXCL 獨占；Windows 由 `win-com-open-exclusive` 承接）、`l15-reboot-min-guard`（§11.6 reboot 最小防護）、`l15-release-inflight`（release 在途交接）（原檔不改；`l15-slow-reader-backpressure` 與 `l15-multi-source-contention-cli` 以 `assert_wire_contiguous` 驗證 §11.3 禁止交錯）。
 - 本 Task 新增的 10 個 `s21-*`（下表）。
 - Windows 凍結案例 `win-com-open-exclusive`、`win-com-txrx-bridge`、`win-com-cancel-close`（需 `windows_com`）列 BO-S21-13；`win-wal-av-*` 三個（需 `endpoint_av`）列 BO-S21-14；`win-wal-f12-progress`（L2 實體）列 BO-S21-16。
 
@@ -4533,7 +4535,8 @@ import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 P2_21 = ["l15-delayed-reply", "l15-half-prompt", "l15-slow-reader-backpressure", "l15-transport-disconnect",
-         "l15-multi-source-contention-cli", "l15-stale-event-delay", "l15-wal-interference", "l15-reject-zero-tx"]
+         "l15-multi-source-contention-cli", "l15-stale-event-delay", "l15-wal-interference", "l15-reject-zero-tx",
+         "l15-exclusive-open", "l15-reboot-min-guard", "l15-release-inflight"]
 S21 = sorted(p.stem for p in (ROOT / "func-test/scenarios").glob("s21-*.yaml"))
 GATE = os.environ.get("SERIALWRAP_GATE") == "1"
 RECORD_ONLY: set[str] = set()   # s21-exclusive-conflict-plain-open 已依規格 §6.2 定案為拒絕（§0.2），改為正式判定
@@ -4594,7 +4597,7 @@ Expected：`python` 參數全部 PASS（含 `s21-exclusive-conflict-plain-open`�
 - [ ] **Step 4：執行並確認 PASS**
 
 Run：Step 2 命令，另以 `SERIALWRAP_GATE=1` 再跑一次
-Expected：37 項全部 PASS（`test_case` 36 個參數組合＝(8＋10) 情境 × 2 label，加 `test_case_list_matches_freeze`），`s21-exclusive-conflict-plain-open` 兩個 label 皆 PASS；`SERIALWRAP_GATE=1` 下無 skip；`target/l15/slice21/<run_id>/` 兩輪證據齊全。
+Expected：43 項全部 PASS（`test_case` 42 個參數組合＝(11＋10) 情境 × 2 label，加 `test_case_list_matches_freeze`），`s21-exclusive-conflict-plain-open` 兩個 label 皆 PASS；`SERIALWRAP_GATE=1` 下無 skip；`target/l15/slice21/<run_id>/` 兩輪證據齊全。
 
 - [ ] **Step 5：Commit**
 
