@@ -40,7 +40,9 @@
       "properties": {
         "binary": {"type": "string"},
         "revision": {"type": "string"},
-        "tree_sha256": {"type": "string"}
+        "tree_sha256": {"type": "string"},
+        "git_head": {"type": "string"},
+        "git_clean": {"type": "boolean"}
       }
     },
     "steps": {

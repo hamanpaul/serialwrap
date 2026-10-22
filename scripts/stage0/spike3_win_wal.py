@@ -87,6 +87,19 @@ def _git_head() -> str:
     return out if cp.returncode == 0 and out else "unknown"
 
 
+def _git_clean() -> bool:
+    """工作樹（含未追蹤檔、排除 target/）乾淨才為 True；無法判定一律 False（gate fail-closed）。"""
+    try:
+        cp = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "status", "--porcelain", "--untracked-files=normal",
+             "--", ".", ":(exclude)target"],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return cp.returncode == 0 and cp.stdout.strip() == ""
+
+
 def _tree_sha256() -> str:
     """被測 sw_core 的部署樹 tree_sha256（規格 §9.5）；失敗寫 unknown。"""
     try:
@@ -450,6 +463,7 @@ def run_case(args: argparse.Namespace) -> int:
         "revision": _git_blob_sha1(Path(__file__).resolve()),
         "tree_sha256": _tree_sha256(),
         "git_head": _git_head(),
+        "git_clean": _git_clean(),
     }
     fallback = "none"
     if os.name != "nt":
