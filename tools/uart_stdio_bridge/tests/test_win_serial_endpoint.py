@@ -28,6 +28,8 @@ import pytest
 class FakeSerial:
     """最小 pySerial 替身：記錄 write、可注入回傳長度或例外。"""
 
+    dsr = False  # pySerial dsr 預設低電位；子類可覆寫為 property 以模擬 peer 開啟
+
     def __init__(self, **kwargs: Any) -> None:
         self.kwargs = dict(kwargs)
         self._timeout = kwargs.get("timeout")
@@ -495,6 +497,182 @@ def test_transport_mode_validated(fake_serial_module):
         WinSerialEndpoint("COMb", transport_mode="virtual_pty", serial_factory=RecordingFactory(FakeSerial()))
 
 
+# ---------------------------------------------------------------- peer gate（假 serial 純邏輯，Linux／hosted CI 皆跑）
+
+
+class PeerFakeSerial(FakeSerial):
+    """具 DSR 的替身：`dsr_on` 模擬對端 DTR 經 com0com 映射到本端 DSR（pySerial `dsr` 的 GetCommModemStatus 取值）。"""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.dsr_on = False
+
+    @property
+    def dsr(self) -> bool:
+        return self.dsr_on
+
+    def read(self, size: int = 1) -> bytes:
+        if not self.read_data:
+            # 對齊 pySerial 逾時等待語意：無資料時讓出時間片，避免讀取迴圈忙轉。
+            time.sleep(0.01)
+        return super().read(size)
+
+
+def _wait_until(predicate: Any, timeout_s: float) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return bool(predicate())
+
+
+def test_peer_gate_no_write_before_open(fake_serial_module):
+    """對應 POSIX `test_peer_gate_no_write_before_open`：peer 未開啟時寫入串流長度為 0；開啟後才寫入。"""
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    fake = PeerFakeSerial()
+    ep = WinSerialEndpoint("COMb", peer_gate=True, serial_factory=RecordingFactory(fake))
+    ep.open()
+    try:
+        assert ep.peer_open() is False
+        assert ep.write_some(b"BANNER\r\n", 0.2) == 0
+        assert fake.writes == []
+
+        fake.dsr_on = True
+        assert _wait_until(lambda: ep.peer_open() is True, 1.0)
+        assert ep.write_some(b"BANNER\r\n", 1.0) == len(b"BANNER\r\n")
+        assert fake.writes == [b"BANNER\r\n"]
+    finally:
+        ep.close()
+
+
+def test_peer_gate_settle_window_before_first_write(fake_serial_module):
+    """DSR 剛轉高時（pySerial open 的 PurgeComm 可能尚未執行）不立即寫入，須過 settle 窗口。"""
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    fake = PeerFakeSerial()
+    ep = WinSerialEndpoint("COMb", peer_gate=True, serial_factory=RecordingFactory(fake))
+    ep.open()
+    try:
+        fake.dsr_on = True
+        assert ep.write_some(b"x", 0.01) == 0
+        assert fake.writes == []
+        assert ep.write_some(b"x", 1.0) == 1
+        assert fake.writes == [b"x"]
+    finally:
+        ep.close()
+
+
+def test_peer_gate_disabled_writes_without_peer(fake_serial_module):
+    """peer_gate=False（selftest 既有規格）時不閘控寫入；peer_open 不取樣而回 None（與 HEAD 一致）。
+
+    回 False 會使 pumps 把寫入逾時縮為 50 ms，對端關閉時 fail-stop（HARNESS_WRITE_UNCERTAIN）。
+    """
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    fake = PeerFakeSerial()
+    ep = WinSerialEndpoint("COMb", peer_gate=False, serial_factory=RecordingFactory(fake))
+    ep.open()
+    try:
+        assert ep.peer_open() is None
+        assert ep.write_some(b"x", 0.2) == 1
+        assert fake.writes == [b"x"]
+    finally:
+        ep.close()
+
+
+def test_peer_gate_rejected_for_physical_usb_uart(fake_serial_module):
+    """DSR 映射僅於 com0com 實測；physical_usb_uart 啟用 peer gate 須拒絕，未啟用則 peer_open 為 None。"""
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    with pytest.raises(ValueError):
+        WinSerialEndpoint(
+            "COMb",
+            transport_mode="physical_usb_uart",
+            peer_gate=True,
+            serial_factory=RecordingFactory(PeerFakeSerial()),
+        )
+    ep = WinSerialEndpoint(
+        "COMb",
+        transport_mode="physical_usb_uart",
+        peer_gate=False,
+        serial_factory=RecordingFactory(PeerFakeSerial()),
+    )
+    ep.open()
+    try:
+        assert ep.peer_open() is None
+    finally:
+        ep.close()
+
+
+def test_peer_gate_rechecks_after_peer_close(fake_serial_module):
+    """peer 關閉（DSR 轉低）後寫入回 0 且不進入埠；再次開啟後恢復寫入。"""
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    fake = PeerFakeSerial()
+    ep = WinSerialEndpoint("COMb", peer_gate=True, serial_factory=RecordingFactory(fake))
+    ep.open()
+    try:
+        fake.dsr_on = True
+        assert _wait_until(lambda: ep.peer_open() is True, 1.0)
+        assert ep.write_some(b"A", 1.0) == 1
+
+        fake.dsr_on = False
+        assert ep.write_some(b"B", 0.1) == 0
+        assert ep.peer_open() is False
+        assert fake.writes == [b"A"]
+
+        fake.dsr_on = True
+        assert ep.write_some(b"C", 1.0) == 1
+        assert fake.writes == [b"A", b"C"]
+    finally:
+        ep.close()
+
+
+def test_peer_open_none_without_handle(fake_serial_module):
+    """無 handle（未開啟或已關閉）時 peer_open 回 None，不回 False 以免被誤判為對端已關閉。"""
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    ep = WinSerialEndpoint("COMb", peer_gate=True, serial_factory=RecordingFactory(PeerFakeSerial()))
+    assert ep.peer_open() is None
+    ep.open()
+    assert ep.peer_open() is False
+    ep.close()
+    assert ep.peer_open() is None
+
+
+def test_peer_gate_keeps_capabilities_undeclared(fake_serial_module):
+    """peer_gate 不得讓 capabilities 宣告 peer_state；該能力待 G4 peer-close 實測寫回後才可宣告。"""
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    ep = WinSerialEndpoint("COMb", peer_gate=True, serial_factory=RecordingFactory(PeerFakeSerial()))
+    ep.open()
+    try:
+        assert ep.capabilities() == {
+            "transport_disconnect": False,
+            "by_id_link": False,
+            "peer_state": False,
+        }
+        assert ep.describe()["peer_gate"] is True
+    finally:
+        ep.close()
+
+
+def test_open_endpoint_forwards_peer_gate(fake_serial_module):
+    from uart_stdio_bridge.endpoints import open_endpoint
+
+    fake_serial_module.Serial = RecordingFactory(PeerFakeSerial())
+    gated = open_endpoint({"kind": "win-serial", "com": "COMb", "peer_gate": True})
+    ungated = open_endpoint({"kind": "win-serial", "com": "COMb"})
+    try:
+        assert gated.peer_gate is True
+        assert ungated.peer_gate is False
+    finally:
+        gated.close()
+        ungated.close()
+
+
 # ---------------------------------------------------------------- 真實 COM pair 測試（擁有者 host，OD-15）
 
 
@@ -553,3 +731,113 @@ def test_cap_windows_com__exclusive_second_open_fails():
             serial.Serial(port=com_b, baudrate=115200, timeout=0.05)
     finally:
         ep.close()
+
+
+@pytest.mark.windows_native
+@pytest.mark.windows_com
+def test_cap_windows_com__peer_gate_no_write_before_peer_open():
+    """原生 pySerial：COM-A（serialwrap 端）未開啟時 peer_open 為 False 且寫入回 0；開啟後才寫入，且開啟前的 bytes 不出現。"""
+    import serial
+
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    com_a, com_b = _com_pair()
+    ep = WinSerialEndpoint(com_b, baud=115200, transport_mode="virtual_com0com", peer_gate=True)
+    ep.open()
+    peer = None
+    try:
+        assert ep.peer_open() is False
+        assert ep.write_some(b"BEFORE-PEER-OPEN\r\n", 0.3) == 0
+
+        peer = serial.Serial(port=com_a, baudrate=115200, bytesize=8, parity="N", stopbits=1, timeout=0.05)
+        assert _wait_until(lambda: ep.peer_open() is True, 5.0)
+
+        payload = b"AFTER-PEER-OPEN\r\n"
+        sent = 0
+        deadline = time.monotonic() + 5.0
+        while sent < len(payload) and time.monotonic() < deadline:
+            sent += ep.write_some(payload[sent:], 0.5)
+        assert sent == len(payload)
+        assert _read_serial_n(peer, len(payload), 5.0) == payload
+    finally:
+        ep.close()
+        if peer is not None:
+            peer.close()
+
+
+@pytest.mark.windows_native
+@pytest.mark.windows_com
+def test_cap_windows_com__peer_gate_rechecks_after_peer_close():
+    """原生 pySerial（G3 close 邊緣）：peer 關閉後 DSR 須於 1 s 內拉低（peer_open 為 False），寫入回 0 且不拋例外；
+    重新開啟後恢復寫入，且關閉期間寫入的 bytes 不得到達 peer。"""
+    import serial
+
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    com_a, com_b = _com_pair()
+    ep = WinSerialEndpoint(com_b, baud=115200, transport_mode="virtual_com0com", peer_gate=True)
+    ep.open()
+    peer = None
+    try:
+        peer = serial.Serial(port=com_a, baudrate=115200, bytesize=8, parity="N", stopbits=1, timeout=0.05)
+        assert _wait_until(lambda: ep.peer_open() is True, 5.0)
+        first = b"OPEN-1\r\n"
+        assert ep.write_some(first, 1.0) == len(first)
+        assert _read_serial_n(peer, len(first), 5.0) == first
+
+        peer.close()
+        peer = None
+        assert _wait_until(lambda: ep.peer_open() is False, 1.0), "peer 關閉後 DSR 未於 1 s 內拉低"
+        assert ep.write_some(b"CLOSED-GAP\r\n", 0.3) == 0
+
+        peer = serial.Serial(port=com_a, baudrate=115200, bytesize=8, parity="N", stopbits=1, timeout=0.05)
+        assert _wait_until(lambda: ep.peer_open() is True, 5.0)
+        second = b"OPEN-2\r\n"
+        sent = 0
+        deadline = time.monotonic() + 5.0
+        while sent < len(second) and time.monotonic() < deadline:
+            sent += ep.write_some(second[sent:], 0.5)
+        assert sent == len(second)
+        # 關閉期間寫入的 CLOSED-GAP 不得出現在重開後的讀取中
+        assert _read_serial_n(peer, len(second), 5.0) == second
+    finally:
+        ep.close()
+        if peer is not None:
+            peer.close()
+
+
+@pytest.mark.windows_native
+@pytest.mark.windows_com
+def test_cap_windows_com__bridge_banner_held_until_peer_open(tmp_path):
+    """重現 G3 的 PENDING-OD-S1X-WIN-BANNER：DUT 開機 banner 於 peer 開啟前產生，bridge 須握住直到 peer 開啟後才寫入。"""
+    import serial
+
+    from helpers import StubDutProcess
+
+    from uart_stdio_bridge.bridge.core import Bridge, BridgeConfig
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+    from uart_stdio_bridge.evidence.writer import EvidenceWriter
+
+    com_a, com_b = _com_pair()
+    banner = b"=== BOOT BANNER ===\r\n"
+    ep = WinSerialEndpoint(com_b, baud=115200, transport_mode="virtual_com0com", peer_gate=True)
+    dut = StubDutProcess()
+    dut.stdout_buf.extend(banner)
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    writer = EvidenceWriter(
+        evidence_dir / "wire.ndjson", run_id="native-banner", case_id="banner", clock_id="native"
+    )
+    cfg = BridgeConfig(run_id="native-banner", case_id="banner", port_id="COM0", evidence_dir=evidence_dir)
+    bridge = Bridge(cfg, ep, dut, writer, dut_control=None)
+    bridge.start()
+    peer = None
+    try:
+        time.sleep(0.5)
+        peer = serial.Serial(port=com_a, baudrate=115200, bytesize=8, parity="N", stopbits=1, timeout=0.05)
+        assert _read_serial_n(peer, len(banner), 10.0) == banner
+    finally:
+        bridge.handle_action("shutdown", {}, "act_shutdown")
+        bridge.wait()
+        if peer is not None:
+            peer.close()

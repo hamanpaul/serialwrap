@@ -106,6 +106,8 @@ def _run_command(argv: list[str]) -> int:
             "baud": args.baud,
             "transport_mode": transport_mode,
             "allow_peer_close": args.allow_peer_close,
+            # DSR 映射僅於 virtual_com0com 實測；physical_usb_uart 不啟用 peer gate（見 WinSerialEndpoint）。
+            "peer_gate": transport_mode == "virtual_com0com" and not args.no_peer_gate,
         }
 
     dut_control_dir = evidence_dir / "dut-control"

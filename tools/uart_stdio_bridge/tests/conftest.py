@@ -23,6 +23,7 @@ if str(SRC) not in sys.path:
 _TOOL_MARKERS = (
     "posix_pty: 需要 POSIX PTY（Linux）的測試；非 Linux 由測試檔以 cap:posix_pty 跳過",
     "windows_com: 需要真實 COM pair（環境變數 SW_TEST_COM_PAIR，擁有者 host）的測試",
+    "windows_native: 需以原生 Windows Python 執行的測試（與 windows_com 併用時為真實 COM 測試）",
     "physical_uart: 需要實體 UART 的測試",
     "docker: 需要 Docker 容器的測試",
 )

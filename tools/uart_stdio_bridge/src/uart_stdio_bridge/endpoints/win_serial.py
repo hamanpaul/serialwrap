@@ -11,9 +11,20 @@ from typing import Any, Callable
 
 from .base import EndpointError, EndpointWriteUncertain
 
+# pySerial 的 Windows `open()` 先以 SetCommState 拉起 DTR（對端即見 DSR），之後才以 PurgeComm 清空
+# 兩向緩衝；DSR 轉高到 PurgeComm 之間的極短窗口若寫入，bytes 會被清掉。peer 首次被觀測到開啟後，
+# 延後此時間才允許寫入，以跨過該窗口。0.2 s 為未經量測的選值，待 G3 原生實測（PENDING-OD-S1X-WIN-BANNER）校準。
+_PEER_OPEN_SETTLE_S = 0.2
+
 
 class WinSerialEndpoint:
-    """透過 pySerial 開啟 COM-B，不推測 Windows peer 狀態或斷線能力。"""
+    """透過 pySerial 開啟 COM-B（bridge 端）。
+
+    peer 開啟狀態以 COM-B 的 DSR 取樣：com0com 將對端（COM-A）開啟後拉起的 DTR 映射到本端 DSR。
+    `peer_gate=True` 時，peer 未開啟（或剛開啟、仍在 settle 窗口）不寫入，寫入串流長度為 0，
+    對應 POSIX PTY 的 peer gate。`capabilities()` 仍全為 False：`peer_state` 與 `transport_disconnect`
+    須待 peer-close 實測結果寫回後才得宣告，不得由本取樣推論。
+    """
 
     kind = "win-serial"
 
@@ -24,17 +35,25 @@ class WinSerialEndpoint:
         baud: int = 115200,
         transport_mode: str = "virtual_com0com",
         allow_peer_close: bool = False,
+        peer_gate: bool = False,
         serial_factory: Callable[..., Any] | None = None,
     ) -> None:
         if transport_mode not in ("virtual_com0com", "physical_usb_uart"):
             raise ValueError(f"不支援的 Windows transport_mode：{transport_mode}")
+        if bool(peer_gate) and transport_mode != "virtual_com0com":
+            # DSR 映射僅於 com0com（COM-A DTR → COM-B DSR）實測；3 線實體 adapter 的 DSR 可能未接，
+            # 啟用 gate 會使 DSR 恆低而永不寫入，故拒絕而非靜默失效。
+            raise ValueError("peer_gate 僅適用 transport_mode=virtual_com0com（DSR 映射僅於 com0com 實測）")
         self.com = com
         self.baud = baud
         self.transport_mode = transport_mode
         self.allow_peer_close = bool(allow_peer_close)
+        self.peer_gate = bool(peer_gate)
         self._serial_factory = serial_factory
         self._serial_obj: Any | None = None
         self._serial_timeout_exception: type[BaseException] | None = None
+        # DSR 首次被觀測為高的時間點（monotonic）；DSR 為低時清為 None。受 `_lock` 保護。
+        self._peer_on_since: float | None = None
         self.generation = 0
         self.last_fault: str | None = None
         # `_lock` 只保護狀態（handle、generation、closed 與 timeout 設定），絕不在阻塞 I/O 期間持有。
@@ -103,17 +122,21 @@ class WinSerialEndpoint:
         write_timeout = max(timeout, 0.001)
         deadline = time.monotonic() + timeout
         while True:
-            wait_without_handle = False
+            must_wait = False
             with self._lock:
                 self._ensure_io_allowed_locked()
                 if self.generation != start_generation:
                     return 0
                 serial_obj = self._serial_obj
                 if serial_obj is None:
-                    wait_without_handle = True
-                elif serial_obj.write_timeout != write_timeout:
-                    serial_obj.write_timeout = write_timeout
-            if not wait_without_handle:
+                    must_wait = True
+                else:
+                    if serial_obj.write_timeout != write_timeout:
+                        serial_obj.write_timeout = write_timeout
+                    # peer gate：peer 未開啟或仍在 settle 窗口時不寫入（不進入埠、不產生寫入紀錄），等至期限回 0。
+                    if not self._peer_writable_locked(serial_obj):
+                        must_wait = True
+            if not must_wait:
                 # 阻塞寫入不持有狀態鎖（僅持寫入串行鎖），讀取端不受阻塞。
                 with self._write_io_lock:
                     # 同讀取端：取得串行鎖前 handle 可能已被換掉，於串行鎖內重驗；未通過則不寫入（不產生不確定寫入）。
@@ -141,8 +164,19 @@ class WinSerialEndpoint:
                 return 0
             time.sleep(min(0.01, remaining))
 
-    def peer_open(self) -> None:
-        return None
+    def peer_open(self) -> bool | None:
+        """以 COM-B 的 DSR 取樣對端是否開啟；未啟用 peer gate、無 handle 或讀取失敗時回 None（不可得知）。
+
+        未啟用 peer gate 時不取樣，維持與既有行為一致：若回 False，pumps 會將寫入逾時縮為 50 ms，
+        導致對端關閉時寫入逾時並 fail-stop（HARNESS_WRITE_UNCERTAIN）。
+        """
+        if not self.peer_gate:
+            return None
+        with self._lock:
+            serial_obj = self._serial_obj
+            if serial_obj is None:
+                return None
+            return self._peer_dsr_locked(serial_obj)
 
     def capabilities(self) -> dict[str, bool]:
         return {"transport_disconnect": False, "by_id_link": False, "peer_state": False}
@@ -193,6 +227,8 @@ class WinSerialEndpoint:
                 "baud": self.baud,
                 "generation": self.generation,
                 "allow_peer_close": self.allow_peer_close,
+                "peer_gate": self.peer_gate,
+                "peer_open_settle_s": _PEER_OPEN_SETTLE_S,
             }
             if self.last_fault is not None:
                 description["last_fault"] = self.last_fault
@@ -231,10 +267,32 @@ class WinSerialEndpoint:
             raise EndpointError(f"HARNESS_ENDPOINT_OPEN_FAILED: 無法開啟 {self.com}：{exc}") from exc
 
         self._serial_obj = serial_obj
+        self._peer_on_since = None
         timeout_exception = getattr(module, "SerialTimeoutException", None)
         if isinstance(timeout_exception, type):
             self._serial_timeout_exception = timeout_exception
         self.generation += 1
+
+    def _peer_dsr_locked(self, serial_obj: Any) -> bool | None:
+        """讀取本端 DSR（pySerial 的 `dsr` 以 GetCommModemStatus 實作）並維護 settle 起點；讀不到回 None。"""
+        try:
+            dsr_on = bool(serial_obj.dsr)
+        except Exception:
+            return None
+        if not dsr_on:
+            self._peer_on_since = None
+        elif self._peer_on_since is None:
+            self._peer_on_since = time.monotonic()
+        return dsr_on
+
+    def _peer_writable_locked(self, serial_obj: Any) -> bool:
+        """peer gate 判定：關閉時恆允許；開啟時需 DSR 為高且已過 settle 窗口。"""
+        if not self.peer_gate:
+            return True
+        dsr_on = self._peer_dsr_locked(serial_obj)
+        if not dsr_on or self._peer_on_since is None:
+            return False
+        return time.monotonic() - self._peer_on_since >= _PEER_OPEN_SETTLE_S
 
     def _release_serial_locked(self) -> None:
         # 控制面（關閉、重開）必須等待進行中的讀取與寫入結束才換掉 handle：阻塞中的 I/O 不被半途關閉。
@@ -242,6 +300,7 @@ class WinSerialEndpoint:
         with self._read_io_lock, self._write_io_lock:
             serial_obj = self._serial_obj
             self._serial_obj = None
+            self._peer_on_since = None
             if serial_obj is not None:
                 try:
                     serial_obj.close()
