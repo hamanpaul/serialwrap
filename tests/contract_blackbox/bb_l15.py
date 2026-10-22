@@ -16,11 +16,12 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from bb_harness import repo_root
+from bb_harness import ab_env, repo_root
 
 ROOT = repo_root()
 BRIDGE_SRC = ROOT / "tools" / "uart_stdio_bridge" / "src"
@@ -159,6 +160,111 @@ def run_cli(
         timeout=timeout_s,
         check=False,
     )
+
+
+# ── PID namespace 隔離（pidns_rig）──────────────────────────────────────────
+# 宿主上的生產 serialwrapd（pipx／systemd）與容器內 daemon 會被 CLI 的 /proc 多開偵測
+# （matching_daemons，fail-closed）看見，使 rig 誤判 DEVICE_STILL_HELD／DAEMON_ALREADY_RUNNING_ELSEWHERE。
+# 因此凡「自啟 daemon 再呼叫 CLI daemon start／restart／update／supervision」的 Linux rig，整段
+# （bridge、daemon、CLI）於獨立 user+pid+mount namespace 內重跑；生產行程在 namespace 內不可見，
+# 偵測語意本身不改（仍 fail-closed）。
+PIDNS_OUTER_ENV = "SW_PIDNS_OUTER"
+PIDNS_CHILD_TIMEOUT_S = 1500.0
+_UNSHARE_PIDNS_ARGV = (
+    "unshare", "--user", "--map-current-user", "--pid", "--fork", "--mount", "--mount-proc",
+)
+
+
+def current_pidns_link() -> str | None:
+    """本行程所屬 pid namespace 的連結字串（`pid:[inode]`）；無法讀取回 None。"""
+    try:
+        return os.readlink("/proc/self/ns/pid")
+    except OSError:
+        return None
+
+
+def in_isolated_pidns() -> bool:
+    """行程是否位於外層 wrapper（`SW_PIDNS_OUTER` 記錄其 pid namespace）建立的不同 namespace 內。"""
+    outer = os.environ.get(PIDNS_OUTER_ENV)
+    current = current_pidns_link()
+    return bool(outer) and current is not None and current != outer
+
+
+def unshare_pidns_argv() -> list[str] | None:
+    """可用時回傳非特權 user+pid+mount namespace 的 argv 前綴；不可用回 None（呼叫端 skip）。"""
+    if shutil.which(_UNSHARE_PIDNS_ARGV[0]) is None:
+        return None
+    argv = list(_UNSHARE_PIDNS_ARGV)
+    try:
+        probe = subprocess.run(argv + ["true"], capture_output=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return argv if probe.returncode == 0 else None
+
+
+def run_nodeid_in_pidns(nodeid: str, rootpath: Path) -> tuple[str, str]:
+    """於新 pid namespace 內重跑單一 pytest nodeid；回傳 (outcome, message)。
+
+    outcome：``passed``／``skipped``／``failed``，或能力不足時 ``unavailable``（呼叫端 skip，絕不視為 PASS）。
+    子行程以 junit 回報結果，避免 skip 被誤判為通過；SW_RESOURCE_REPORT 不傳入子行程，不覆寫外層 L1 報告。
+    """
+    import xml.etree.ElementTree as ElementTree
+
+    prefix = unshare_pidns_argv()
+    if prefix is None:
+        return "unavailable", "此宿主無法以非特權 unshare 建立 user+pid+mount namespace（環境能力不足，非 PASS）"
+    outer = current_pidns_link()
+    if outer is None:
+        return "unavailable", "無法讀取 /proc/self/ns/pid（環境能力不足，非 PASS）"
+    env = dict(os.environ)
+    env.pop("SW_RESOURCE_REPORT", None)
+    # 根 conftest 於 import 時自 os.environ 移除 A/B 選擇器（已由 ab_env 模組擷取）；子行程須還原同一組選擇器，
+    # 否則 rust-only 案例會在子行程被誤判為 Python 基線而 skip。
+    env.update(ab_env())
+    env[PIDNS_OUTER_ENV] = outer
+    work = Path(tempfile.mkdtemp(prefix="sw-pidns-"))
+    try:
+        junit = work / "child.xml"
+        cmd = prefix + [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", f"--junitxml={junit}", nodeid]
+        # namespace 內的 init（即子 pytest）忽略未註冊的 SIGTERM，且 unshare 本身被殺時 init 會殘留；
+        # 故以獨立 session 啟動，逾時時對整個行程群組 SIGKILL，確保 namespace 內的 daemon／bridge 一併回收。
+        out_file = work / "child.out"
+        with out_file.open("wb") as out:
+            proc = subprocess.Popen(
+                cmd, cwd=str(rootpath), env=env, stdin=subprocess.DEVNULL,
+                stdout=out, stderr=subprocess.STDOUT, start_new_session=True,
+            )
+            try:
+                returncode = proc.wait(timeout=PIDNS_CHILD_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait(timeout=30)
+                return "failed", f"namespace 子行程逾時（{PIDNS_CHILD_TIMEOUT_S:.0f} s）：{nodeid}"
+        text = out_file.read_text(encoding="utf-8", errors="replace")
+        tail = text[-4000:]
+        del returncode
+        if not junit.is_file():
+            return "failed", f"namespace 子行程未產生 junit（rc={proc.returncode}）：\n{tail}"
+        root = ElementTree.parse(junit).getroot()
+        cases = list(root.iter("testcase"))
+        if len(cases) != 1:
+            return "failed", f"namespace 子行程應恰收集 1 個案例，實際 {len(cases)}：{nodeid}\n{tail}"
+        case = cases[0]
+        for kind in ("failure", "error"):
+            node = case.find(kind)
+            if node is not None:
+                return "failed", f"namespace 子行程失敗（{kind}）：\n{(node.get('message') or '')}\n{tail}"
+        skipped = case.find("skipped")
+        if skipped is not None:
+            return "skipped", f"namespace 子行程 skip：{skipped.get('message') or ''}"
+        return "passed", ""
+    except subprocess.TimeoutExpired:
+        return "failed", f"namespace 子行程逾時（{PIDNS_CHILD_TIMEOUT_S:.0f} s）：{nodeid}"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def _profile_yaml() -> str:
@@ -621,13 +727,49 @@ def control_marks(evidence_dir: Path) -> list[dict[str, Any]]:
     ]
 
 
-def start_file_push(cli: Path, env: dict[str, str], source: Path, remote: str) -> tuple[threading.Thread, list[subprocess.CompletedProcess[str]]]:
+class RaisingThread(threading.Thread):
+    """背景行程包裝：目標函式的例外不會被 threading 默默吞掉，於 `join()` 時原樣重新拋出。
+
+    若目標仍在執行中，`join(timeout)` 只回傳而不拋例外（呼叫端仍可用 `is_alive()` 判斷逾時）。
+    """
+
+    def __init__(self, target: Callable[[], None]) -> None:
+        super().__init__(daemon=True)
+        self._target_fn = target
+        self.error: BaseException | None = None
+
+    def run(self) -> None:
+        try:
+            self._target_fn()
+        except BaseException as exc:  # noqa: BLE001 - 於 join 端重新拋出
+            self.error = exc
+
+    def join(self, timeout: float | None = None) -> None:
+        super().join(timeout)
+        if not self.is_alive() and self.error is not None:
+            raise self.error
+
+
+def start_file_push(
+    cli: Path,
+    env: dict[str, str],
+    source: Path,
+    remote: str,
+    *,
+    ack_mode: str = "none",
+    chunk_timeout_s: float | None = None,
+) -> tuple[RaisingThread, list[subprocess.CompletedProcess[str]]]:
+    """背景啟動 file push；`ack_mode="none"` 為預設（吞吐優先，佔住傳輸中的 session），
+    需要「每個 chunk 等板端 ACK」（DUT 延遲 ACK 期間 TX 必須靜止）時傳 `ack_mode="auto"`。
+    `chunk_timeout_s` 非 None 時以 `--chunk-timeout` 覆寫單一 chunk 等待逾時；未指定則沿用 profile 推導值（下限 5 s）。"""
     result: list[subprocess.CompletedProcess[str]] = []
-    thread = threading.Thread(
-        # 橋接 DUT 上 echo ACK 約 1.6 KB/s，1 MiB 需約 640 s，超過 180 s 逾時；本 helper 只用來佔住傳輸中的 session，
-        # 故改 ack-mode none + chunk 4096（實測約 65 KB/s，約 16 s）。逾時與檔案大小不變，斷言由各測試自行判定。
-        target=lambda: result.append(run_cli(cli, ["--timeout", "180", "file", "push", "--selector", "COM0", "--local", str(source), "--remote", remote, "--ack-mode", "none", "--chunk-size", "4096"], env, timeout_s=180.0)),
-        daemon=True,
+    # 橋接 DUT 上 echo ACK 約 1.6 KB/s，1 MiB 需約 640 s，超過 180 s 逾時；本 helper 只用來佔住傳輸中的 session，
+    # 故預設改 ack-mode none + chunk 4096（實測約 65 KB/s，約 16 s）。逾時與檔案大小不變，斷言由各測試自行判定。
+    argv = ["--timeout", "180", "file", "push", "--selector", "COM0", "--local", str(source), "--remote", remote, "--ack-mode", ack_mode, "--chunk-size", "4096"]
+    if chunk_timeout_s is not None:
+        argv += ["--chunk-timeout", f"{chunk_timeout_s:g}"]
+    thread = RaisingThread(
+        lambda: result.append(run_cli(cli, argv, env, timeout_s=180.0)),
     )
     thread.start()
     return thread, result
@@ -767,7 +909,9 @@ def _dut_main(argv: list[str]) -> int:
             if hold:
                 holding = True
                 continue
-            if delay_ms and "SW_XFER_CHUNK_42" in command:
+            # 送出的 chunk 指令只含 sentinel 前綴 `SW_XFER_CHUNK_`（數值於 target 端 `$((6*7))` 展開），
+            # 不含 `SW_XFER_CHUNK_42` 全字；舊判斷永不成立，delay_ms 形同虛設。改為首個 chunk 延遲一次。
+            if delay_ms and "SW_XFER_CHUNK_" in command:
                 time.sleep(delay_ms / 1000)
                 delay_ms = 0
             if output:

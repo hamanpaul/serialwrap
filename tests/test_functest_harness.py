@@ -536,3 +536,142 @@ def test_unresolved_template_fails_closed_with_variable_context():
     runner.TestRunner._require_resolved(
         SimpleNamespace(variables={}), ["cmd", "status", "--cmd-id", "abc"], 7, "cli argv"
     )
+
+
+# ---------------------------------------------------------------------------
+# S1X-gate-accounting（計畫 03 §15.5／I10）：compare:none 的 gate_eligible 定義與 not_applicable 段。
+# ---------------------------------------------------------------------------
+
+def _eligibility(**overrides: Any) -> bool:
+    import runner
+
+    kwargs: dict[str, Any] = {
+        "mode": "bridge", "bridge_eligible": True, "cases_frozen": True, "settle_failure": None,
+        "shutdown_failure": None, "compare_mode": "none", "comparison_verdict": None,
+        "assert_steps_passed": 2, "not_applicable_steps": [], "ok": True,
+    }
+    kwargs.update(overrides)
+    return runner.compute_gate_eligible(**kwargs)
+
+
+@pytest.mark.memory_only
+def test_compare_none_eligible_only_when_all_asserts_pass_and_no_not_applicable():
+    assert _eligibility() is True
+    # 失敗的斷言（ok=False）不得成為資格
+    assert _eligibility(ok=False) is False
+    # 沒有任何斷言實際執行（無證據）不得成為資格
+    assert _eligibility(assert_steps_passed=0) is False
+    # not_applicable 段（POSIX 上的 segment (c)）永不計入資格
+    assert _eligibility(not_applicable_steps=[{"step": 8, "action": "cli"}]) is False
+    # 非 bridge、未自測、case 未凍結、settle／shutdown 失敗皆不得成為資格
+    assert _eligibility(mode="pty") is False
+    assert _eligibility(bridge_eligible=False) is False
+    assert _eligibility(cases_frozen=False) is False
+    assert _eligibility(settle_failure="x") is False
+    assert _eligibility(shutdown_failure="x") is False
+
+
+@pytest.mark.memory_only
+def test_compare_full_still_requires_comparator_pass():
+    assert _eligibility(compare_mode="full", comparison_verdict="PASS", assert_steps_passed=0) is True
+    assert _eligibility(compare_mode="full", comparison_verdict="FAIL") is False
+    assert _eligibility(compare_mode="full", comparison_verdict=None) is False
+    assert _eligibility(compare_mode="full", comparison_verdict="PASS", not_applicable_steps=[{"step": 1}]) is False
+
+
+def _run_bridge_case(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, steps: list[dict[str, Any]],
+                     *, host: str = "linux") -> dict[str, Any]:
+    """以假 harness 跑一個 bridge／compare:none 案例，回傳 runner.last_result（並附 run 的回傳值）。"""
+    import realhw.deployed_content
+    import runner
+    from lib import daemon_harness
+    from lib.yaml_loader import TestCase
+
+    monkeypatch.setattr(realhw.deployed_content, "measure", lambda *a, **k: {"bundle_tree_sha256": "a" * 64})
+    monkeypatch.setattr(realhw.deployed_content, "live_daemon", lambda pid, install: {"pid": pid})
+    monkeypatch.setattr(runner, "host_platform", lambda: host)
+    monkeypatch.setattr(runner.TestRunner, "_acceptance_cases_info", lambda self: ("d" * 64, True))
+    monkeypatch.setattr(runner.TestRunner, "_bridge_snapshot", lambda self, *, settle: {"settled": True})
+    monkeypatch.setattr(runner.TestRunner, "_capture_live_daemon", lambda self: None)
+    monkeypatch.setattr(runner.TestRunner, "_tool_identity", lambda self: {})
+    monkeypatch.setattr(runner.TestRunner, "_write_manifest", lambda self, *a, **k: None)
+    monkeypatch.setattr(runner.TestRunner, "_cli",
+                        lambda self, argv, timeout=10.0: {"sessions": [{"com": "COM0", "state": "DETACHED"}]})
+
+    def fake_start(self: Any) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory(prefix="sw-func-")
+        self._root = pathlib.Path(self._tmpdir.name)
+        (self._root / "run").mkdir(parents=True, exist_ok=True)
+        self._socket_path = str(self._root / "run" / "serialwrapd.sock")
+        pathlib.Path(self._socket_path).touch()
+
+    def fake_stop(self: Any) -> None:
+        if getattr(self, "_tmpdir", None) is not None:
+            self._tmpdir.cleanup()
+
+    monkeypatch.setattr(daemon_harness.DaemonHarness, "start", fake_start)
+    monkeypatch.setattr(daemon_harness.DaemonHarness, "stop", fake_stop)
+    monkeypatch.setattr(daemon_harness.DaemonHarness, "wait_endpoint", lambda self, timeout_s=5.0: None)
+
+    case = TestCase(
+        name="l15-probe",
+        category="l15-scenario",
+        severity="critical",
+        target={"platform": "shell"},
+        profile={},
+        env_files={},
+        steps=steps,
+        bridge={"applicable": True, "only": True, "compare": "none"},
+        scenario={"revision": "test"},
+    )
+    tr = runner.TestRunner(case, mode="bridge", report_dir=tmp_path / "reports")
+    returned_ok, message = tr.run()
+    return {**tr.last_result, "returned_ok": returned_ok, "message": message}
+
+
+@pytest.mark.memory_only
+def test_runner_compare_none_failed_assert_is_fail_and_not_eligible(tmp_path, monkeypatch):
+    res = _run_bridge_case(tmp_path, monkeypatch, [
+        {"action": "assert_state", "selector": "COM0", "expect": {"state": "READY"}},
+    ])
+    assert res["verdict"] == "FAIL", res
+    assert res["gate_eligible"] is False
+    assert res["returned_ok"] is False
+
+
+@pytest.mark.memory_only
+def test_runner_compare_none_passing_asserts_are_eligible(tmp_path, monkeypatch):
+    res = _run_bridge_case(tmp_path, monkeypatch, [
+        {"action": "assert_state", "selector": "COM0", "expect": {"state": "DETACHED"}},
+    ])
+    assert res["verdict"] == "PASS", res
+    assert res["gate_eligible"] is True
+    assert res["returned_ok"] is True
+
+
+@pytest.mark.memory_only
+def test_runner_posix_not_applicable_segment_is_not_pass(tmp_path, monkeypatch):
+    """POSIX 上 platforms:[windows] 的段記為 not_applicable：整體不得 PASS、不得 gate_eligible。"""
+    res = _run_bridge_case(tmp_path, monkeypatch, [
+        {"action": "assert_state", "selector": "COM0", "expect": {"state": "DETACHED"}},
+        {"action": "assert_state", "selector": "COM0", "expect": {"state": "READY"}, "platforms": ["windows"]},
+    ], host="linux")
+    assert res["verdict"] == "INSUFFICIENT_EVIDENCE", res
+    assert res["gate_eligible"] is False
+    assert res["returned_ok"] is False
+    assert "not_applicable" in res["message"]
+    # 結構化欄位：gate 依 not_applicable_steps 與 na_only_gap 判定缺口是否僅為平台不適用。
+    # step 為 0-based 步驟索引：第二個步驟（index 1）為 windows 專屬段。
+    assert [step["step"] for step in res["not_applicable_steps"]] == [1], res
+    assert res["na_only_gap"] is True, res
+
+
+@pytest.mark.memory_only
+def test_runner_windows_host_runs_segment_and_can_be_eligible(tmp_path, monkeypatch):
+    """同一段在 Windows 上實際執行（READY 不成立時 FAIL；成立時 PASS 且 eligible）。"""
+    res = _run_bridge_case(tmp_path, monkeypatch, [
+        {"action": "assert_state", "selector": "COM0", "expect": {"state": "DETACHED"}},
+        {"action": "assert_state", "selector": "COM0", "expect": {"state": "DETACHED"}, "platforms": ["windows"]},
+    ], host="windows")
+    assert res["verdict"] == "PASS", res
+    assert res["gate_eligible"] is True

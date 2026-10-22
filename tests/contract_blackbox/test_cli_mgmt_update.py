@@ -9,7 +9,6 @@ import os
 import shutil
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -18,6 +17,7 @@ import pytest
 from bb_harness import isolated_env, repo_root
 from bb_l15 import (
     BridgeTarget,
+    RaisingThread,
     current_release_path,
     daemon_pid,
     finish_test_rig,
@@ -44,6 +44,15 @@ from bb_l15 import (
 )
 
 pytestmark = [pytest.mark.posix_only]
+
+# busy 案例的 push 大小（依 ACK-gated 路徑實測吞吐決定，見該案例 docstring）。
+BUSY_PUSH_BYTES = 16 * 1024
+# 首個 chunk 的 ACK 延遲（毫秒）：須大於 setup 被拒所需時間。量測（WSL2 bridge）：in-flight push 期間
+# `setup --on-demand` 被拒約 7.2 s；取 20 s（餘裕約 13 s）。
+# 單一 chunk 等待逾時須大於此延遲，否則 CLI 在 ACK 到來前已逾時並送出清理指令（`SW_XFER_CLEANUP_`），
+# 該 TX 會落在拒絕視窗內、破壞零 TX 斷言；故另以 `chunk_timeout_s` 放寬（見 BUSY_CHUNK_TIMEOUT_S）。
+BUSY_FIRST_ACK_DELAY_MS = 20000
+BUSY_CHUNK_TIMEOUT_S = BUSY_FIRST_ACK_DELAY_MS / 1000 + 40
 
 
 def _install_old(tmp_path: Path, env: dict[str, str], bundle: Path) -> tuple[Path, Path]:
@@ -73,11 +82,14 @@ def _stop_rig(bridge: BridgeTarget, daemon, cli: Path, env: dict[str, str]) -> N
 @pytest.mark.rust_only
 @pytest.mark.case("sc23-setup-rollback")
 @pytest.mark.process_rpc
+@pytest.mark.pidns_rig
 def test_fresh_install_blackbox(tmp_path: Path) -> None:
     """隔離 HOME＋空 install root＋stub PATH：setup --on-demand → daemon start → session list；profiles／config 存在。"""
     env = isolated_env(tmp_path)
-    sw_bundle = os.environ.get("SW_BUNDLE", str(repo_root() / "target" / "mkbundle-dev"))
+    # 預設讀本測試專用的 mkbundle 產物 target/mkbundle-pytest（非共享的 target/mkbundle-dev，後者可能是舊版無標記目錄）。
+    sw_bundle = os.environ.get("SW_BUNDLE", str(repo_root() / "target" / "mkbundle-pytest"))
     cli_bin = Path(sw_bundle) / "bin" / "serialwrap"
+    assert cli_bin.is_file(), f"缺少 bundle CLI：{cli_bin}（請先 scripts/rust/mkbundle.sh --dev --out {sw_bundle}，或設 SW_BUNDLE）"
     daemon_started = False
     start_attempted = False
     try:
@@ -117,6 +129,7 @@ def test_fresh_install_blackbox(tmp_path: Path) -> None:
 
 @pytest.mark.rust_only
 @pytest.mark.posix_pty
+@pytest.mark.pidns_rig
 def test_update_rollback_ab_isolated(tmp_path: Path, env: dict[str, str]) -> None:
     """透過 bridge 以 0.4.0 安裝、更新至 0.4.1，再以真正 rollback 還原 0.4.0。"""
     old, new = update_bundles()
@@ -144,18 +157,29 @@ def test_update_rollback_ab_isolated(tmp_path: Path, env: dict[str, str]) -> Non
 
 @pytest.mark.rust_only
 @pytest.mark.posix_pty
+@pytest.mark.pidns_rig
 def test_update_busy_l15_zero_tx(tmp_path: Path, env: dict[str, str]) -> None:
-    """file push 正在 target 上處理 chunk 時更新回 SESSION_BUSY，更新期間 bridge DUT TX 無新增。"""
+    """file push 正在 target 上處理 chunk 時更新回 SESSION_BUSY，更新期間 bridge DUT TX 無新增。
+
+    時序設計（量測依據）：push 採 ACK-gated（`ack_mode=auto`，每個 chunk 等板端 `SW_XFER_CHUNK_42`），
+    DUT 於首個 chunk 延遲 `BUSY_FIRST_ACK_DELAY_MS` 才回 ACK。CLI 在 ACK 到來前不送下一個 chunk，故首個 chunk TX 之後、
+    ACK 之前的視窗內 TX 靜止；更新必須在該視窗內被拒，TX 差值為零。`wait_wire_contains` 對 TX 比對的是
+    chunk 指令文字（`SW_XFER_CHUNK_` 前綴，數值由目標端 `$((6*7))` 展開），而非 ACK 字串 `SW_XFER_CHUNK_42`。
+
+    檔案大小依量測：ACK-gated 路徑於 WSL2 bridge 實測約 2.2 KiB/s（64 KiB 約 30 s），因此本案例改用 16 KiB
+    （4 個 chunk，約 8 s 完成＋首個 ACK 延遲 `BUSY_FIRST_ACK_DELAY_MS`），仍為多 chunk 且 push 全程在 join 逾時內結束。
+    """
     old, new = update_bundles()
     old_cli, _root = _install_old(tmp_path, env, old)
-    bridge, daemon = _start_rig(tmp_path, env, delay_ms=3000)
+    bridge, daemon = _start_rig(tmp_path, env, delay_ms=BUSY_FIRST_ACK_DELAY_MS)
     new_cli = select_bundle(env, new)
     source = tmp_path / "busy-push.bin"
-    expected_md5, remote = make_push_file(source)
+    expected_md5, remote = make_push_file(source, size=BUSY_PUSH_BYTES)
     push_thread = None
     try:
-        push_thread, push_rows = start_file_push(new_cli, env, source, remote)
-        wait_wire_contains(bridge.evidence_dir, b"SW_XFER_CHUNK_42", timeout_s=30.0)
+        push_thread, push_rows = start_file_push(new_cli, env, source, remote, ack_mode="auto", chunk_timeout_s=BUSY_CHUNK_TIMEOUT_S)
+        # 等整行 chunk 指令（含行尾換行）都已寫入 TX，避免快照落在半行上；此後 CLI 等待首個 ACK，TX 靜止。
+        wait_wire_contains(bridge.evidence_dir, b"SW_XFER_CHUNK_'$((6*7))\n", timeout_s=30.0)
         tx_before = tx_bytes(bridge.evidence_dir)
         result = run_cli(new_cli, ["setup", "--on-demand"], env, timeout_s=30.0)
         data = json_stdout(result)
@@ -164,11 +188,11 @@ def test_update_busy_l15_zero_tx(tmp_path: Path, env: dict[str, str]) -> None:
         assert tx_bytes(bridge.evidence_dir) == tx_before
         assert daemon_pid(env) == daemon.proc.pid
         push_thread.join(180.0)
-        assert not push_thread.is_alive(), "1 MiB file push 未結束"
+        assert not push_thread.is_alive(), f"{BUSY_PUSH_BYTES} B file push 未結束"
         assert len(push_rows) == 1
         push = json_stdout(push_rows[0])
         assert push_rows[0].returncode == 0, push_rows[0].stdout + push_rows[0].stderr
-        assert push.get("bytes") == 1024 * 1024 and push.get("md5") == expected_md5
+        assert push.get("bytes") == BUSY_PUSH_BYTES and push.get("md5") == expected_md5
         assert (bridge.remote_root / Path(remote).name).read_bytes() == source.read_bytes()
     finally:
         if push_thread is not None and push_thread.is_alive():
@@ -178,6 +202,7 @@ def test_update_busy_l15_zero_tx(tmp_path: Path, env: dict[str, str]) -> None:
 
 @pytest.mark.rust_only
 @pytest.mark.posix_pty
+@pytest.mark.pidns_rig
 def test_update_file_push_after_last_probe_l15(tmp_path: Path, env: dict[str, str]) -> None:
     """最後預檢後再開始 1 MiB push，交接拒絕且 Current／PID 不變；push 完成並驗 MD5。"""
     old, new = update_bundles()
@@ -189,8 +214,8 @@ def test_update_file_push_after_last_probe_l15(tmp_path: Path, env: dict[str, st
     pause_dir = tmp_path / "pause-safety-check"
     env.update({"SW_TEST_UPDATE_PAUSE_AFTER": "safety_check", "SW_TEST_UPDATE_PAUSE_DIR": str(pause_dir)})
     update_rows = []
-    update_thread = threading.Thread(
-        target=lambda: update_rows.append(run_cli(new_cli, ["setup", "--on-demand"], env, timeout_s=240.0)), daemon=True
+    update_thread = RaisingThread(
+        lambda: update_rows.append(run_cli(new_cli, ["setup", "--on-demand"], env, timeout_s=240.0)),
     )
     push_thread = None
     old_pid = daemon_pid(env)
@@ -233,6 +258,7 @@ def test_update_file_push_after_last_probe_l15(tmp_path: Path, env: dict[str, st
 
 @pytest.mark.rust_only
 @pytest.mark.posix_pty
+@pytest.mark.pidns_rig
 def test_revert_new_daemon_push_not_aborted_l15(tmp_path: Path, env: dict[str, str]) -> None:
     """新版 daemon 已啟動後 push 持續阻止回滾 handoff；回滾待復原，push 完成後由舊 bundle 恢復。"""
     old, new = update_bundles()
@@ -246,8 +272,8 @@ def test_revert_new_daemon_push_not_aborted_l15(tmp_path: Path, env: dict[str, s
         "SW_TEST_UPDATE_FORCE_VERIFY_FAIL": "smoke_failed",
     })
     update_rows = []
-    update_thread = threading.Thread(
-        target=lambda: update_rows.append(run_cli(new_cli, ["setup", "--on-demand"], env, timeout_s=240.0)), daemon=True
+    update_thread = RaisingThread(
+        lambda: update_rows.append(run_cli(new_cli, ["setup", "--on-demand"], env, timeout_s=240.0)),
     )
     push_thread = None
     old_pid = daemon_pid(env)
@@ -304,6 +330,7 @@ def test_revert_new_daemon_push_not_aborted_l15(tmp_path: Path, env: dict[str, s
 
 @pytest.mark.rust_only
 @pytest.mark.posix_pty
+@pytest.mark.pidns_rig
 def test_update_push_after_freeze_zero_tx_l15(tmp_path: Path, env: dict[str, str]) -> None:
     """handoff_stop 回 ok 後 file.push 回 FLUSHED_BY_SHUTDOWN；凍結期間 DUT TX 為零且無部分檔案。"""
     old, new = update_bundles()
@@ -315,8 +342,8 @@ def test_update_push_after_freeze_zero_tx_l15(tmp_path: Path, env: dict[str, str
     pause_dir = tmp_path / "pause-handoff"
     env.update({"SW_TEST_UPDATE_PAUSE_AFTER": "handoff_stop:replied", "SW_TEST_UPDATE_PAUSE_DIR": str(pause_dir)})
     update_rows = []
-    update_thread = threading.Thread(
-        target=lambda: update_rows.append(run_cli(new_cli, ["setup", "--on-demand"], env, timeout_s=240.0)), daemon=True
+    update_thread = RaisingThread(
+        lambda: update_rows.append(run_cli(new_cli, ["setup", "--on-demand"], env, timeout_s=240.0)),
     )
     try:
         update_thread.start()

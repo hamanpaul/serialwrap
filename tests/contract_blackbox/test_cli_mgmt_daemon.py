@@ -167,6 +167,7 @@ def test_daemon_start_stop_ab_real_daemon(tmp_path: Path, env: dict[str, str], p
 
 
 @pytest.mark.case("sc20-daemon-restart")
+@pytest.mark.pidns_rig
 def test_daemon_restart_ab(tmp_path: Path, env: dict[str, str], no_delegation: Path) -> None:
     """SC-20：on-demand restart 後 pid 改變；兩實作輸出形狀 {ok,restarted,start,stopped} 正規化後相同。
 

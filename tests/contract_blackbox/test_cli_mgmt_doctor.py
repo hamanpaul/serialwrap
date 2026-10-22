@@ -22,8 +22,8 @@ if os.environ.get("SERIALWRAP_CLI_EXE") == "/bin/serialwrap":
     sw_bundle = os.environ.get("SW_BUNDLE")
     if sw_bundle and (Path(sw_bundle) / "bin" / "serialwrap").exists():
         os.environ["SERIALWRAP_CLI_EXE"] = str(Path(sw_bundle) / "bin" / "serialwrap")
-    elif (repo_root() / "target" / "mkbundle-dev" / "bin" / "serialwrap").exists():
-        os.environ["SERIALWRAP_CLI_EXE"] = str(repo_root() / "target" / "mkbundle-dev" / "bin" / "serialwrap")
+    elif (repo_root() / "target" / "mkbundle-pytest" / "bin" / "serialwrap").exists():
+        os.environ["SERIALWRAP_CLI_EXE"] = str(repo_root() / "target" / "mkbundle-pytest" / "bin" / "serialwrap")
 
 pytestmark = [pytest.mark.posix_only, pytest.mark.process_rpc]
 

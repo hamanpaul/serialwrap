@@ -79,6 +79,20 @@ def _stop_rig(bridge: BridgeTarget, daemon, cli: Path, env: dict[str, str]) -> N
     finish_test_rig(bridge, daemon, cli, env)
 
 
+def _wait_holder_named_serialwrapd(pid: int, endpoint: str, timeout_s: float = 10.0) -> None:
+    """等待 holder 行程的 argv0 變為 serialwrapd 且 cmdline 帶有本案例的 `--socket`（exec 完成）。"""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            parts = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        except OSError:
+            parts = []
+        if parts and os.path.basename(parts[0].decode("utf-8", errors="replace")) == "serialwrapd" and endpoint.encode() in parts:
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"holder pid={pid} 未在 {timeout_s:.0f} 秒內以 serialwrapd 身分出現於 /proc")
+
+
 def _prepare_flash_profile(env: dict[str, str]) -> Path:
     """以 passthrough 將 COM0 設為非 command-capable flash 候選。"""
     profile_dir = Path(env["SERIALWRAP_CONFIG_DIR"]) / "profiles"
@@ -104,6 +118,7 @@ def _prepare_flash_profile(env: dict[str, str]) -> Path:
 @pytest.mark.rust_only
 @pytest.mark.posix_pty
 @pytest.mark.process_rpc
+@pytest.mark.pidns_rig
 def test_supervision_set_force_push_continues_l15(tmp_path: Path, env: dict[str, str]) -> None:
     """1 MiB file push 進行時，force 切換必以 SESSION_BUSY 拒絕且不呼叫 systemctl。"""
     cli = _rust_cli()
@@ -209,6 +224,7 @@ def test_supervision_set_flashing_l15(tmp_path: Path, env: dict[str, str]) -> No
 @pytest.mark.case("sc22-supervision-mode-set")
 @pytest.mark.rust_only
 @pytest.mark.process_rpc
+@pytest.mark.pidns_rig
 def test_supervision_set_rust_only_switch(tmp_path: Path, env: dict[str, str]) -> None:
     """Stubd 交接成功走 systemd-user reconcile；METHOD_NOT_FOUND fail-closed 且不送 daemon.stop。"""
     cli = _rust_cli()
@@ -244,6 +260,9 @@ def test_supervision_set_rust_only_switch(tmp_path: Path, env: dict[str, str]) -
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
+        # 競態修正：bash 尚未 exec 成 `serialwrapd` 時，CLI 的安全檢查會把 holder 視為未知（DEVICE_STILL_HELD、
+        # holder_unknown），不送 daemon.handoff_stop。必須等 /proc 中的 argv0 確實為 serialwrapd 才繼續。
+        _wait_holder_named_serialwrapd(holder.pid, endpoint)
         handoff_reply = (
             {"ok": True, "stopping": True, "handoff_token": "a" * 32}
             if handoff_ok

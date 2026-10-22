@@ -194,6 +194,43 @@ def evaluate_bridge_eligibility(report_path: pathlib.Path | str | None) -> tuple
         return "INSUFFICIENT_EVIDENCE", False
 
 
+def host_platform() -> str:
+    """step 的 `platforms` 比對用本機平台（windows／linux）；與 DUT 平台（target.platform）無關。"""
+    return "windows" if os.name == "nt" else "linux"
+
+
+def compute_gate_eligible(
+    *,
+    mode: str,
+    bridge_eligible: bool,
+    cases_frozen: bool,
+    settle_failure: str | None,
+    shutdown_failure: str | None,
+    compare_mode: str,
+    comparison_verdict: str | None,
+    assert_steps_passed: int,
+    not_applicable_steps: list[dict[str, Any]],
+    ok: bool,
+) -> bool:
+    """bridge 結果的 gate_eligible（計畫 03 §15.5／I10）。
+
+    共同條件：bridge 模式、自測資格、case 已凍結、settle 與 bridge 關閉皆無失敗、
+    且沒有任何 not_applicable 段（不適用於本平台的段一律不計 PASS，也不得計入資格）。
+    - compare 非 none：比較器 verdict 必須為 PASS（既有規則）。
+    - compare none（l15-wal-interference）：沒有比較器證據；資格改以「所有斷言步驟 PASS」定義：
+      ok（無 StepError）、至少一個 assert_* 步驟實際執行並通過。
+    """
+    if mode != "bridge" or not bridge_eligible or not cases_frozen:
+        return False
+    if settle_failure is not None or shutdown_failure is not None:
+        return False
+    if not_applicable_steps:
+        return False
+    if compare_mode == "none":
+        return bool(ok) and assert_steps_passed >= 1
+    return comparison_verdict == "PASS"
+
+
 def _scrub_sensitive(value: Any, secrets: tuple[str, ...] = ()) -> Any:
     """遞迴移除原始 payload 欄位與遮罩報告內的機密字串。"""
     sensitive_names = {"payload_b64", "token", "secret", "password", "raw_payload"}
@@ -309,6 +346,9 @@ class TestRunner:
         self._bridge_shutdown_failure: str | None = None
         self._cases_yaml_digest: str | None = None
         self._cases_frozen = False
+        # S1X：step 的 `platforms` 不適用於本機時記為 not_applicable（不執行、不計 PASS、不計資格）。
+        self._not_applicable_steps: list[dict[str, Any]] = []
+        self._assert_steps_passed = 0
 
     def run(self) -> tuple[bool, str]:
         """執行測試，回傳 (通過, 訊息)。"""
@@ -439,16 +479,26 @@ class TestRunner:
         elif self._settle_failure:
             ok = False
             message = self._settle_failure
+        elif ok and self._not_applicable_steps:
+            message = f"not_applicable 段不計 PASS（不適用於 {host_platform()}）：{[s['step'] for s in self._not_applicable_steps]}"
         verdict = self._final_verdict(ok=ok, message=message)
-        gate_eligible = (
-            self.mode == "bridge"
-            and self._bridge_eligible
-            and self._cases_frozen
-            and self._settle_failure is None
-            and self._bridge_shutdown_failure is None
-            and (self.comparison or {}).get("verdict") == "PASS"
+        eligibility_kwargs = dict(
+            mode=self.mode,
+            bridge_eligible=self._bridge_eligible,
+            cases_frozen=self._cases_frozen,
+            settle_failure=self._settle_failure,
+            shutdown_failure=self._bridge_shutdown_failure,
+            compare_mode=str(self.tc.bridge.get("compare", "none")),
+            comparison_verdict=(self.comparison or {}).get("verdict"),
+            assert_steps_passed=self._assert_steps_passed,
+            ok=ok,
         )
-        self.last_result = self._result(verdict, message, gate_eligible=gate_eligible)
+        gate_eligible = compute_gate_eligible(not_applicable_steps=self._not_applicable_steps, **eligibility_kwargs)
+        # na_only_gap：其餘條件皆成立、唯一缺口是 not_applicable 段（gate 據此不把該列視為阻擋）。
+        na_only_gap = bool(self._not_applicable_steps) and compute_gate_eligible(
+            not_applicable_steps=[], **eligibility_kwargs
+        )
+        self.last_result = self._result(verdict, message, gate_eligible=gate_eligible, na_only_gap=na_only_gap)
         self._write_manifest(self._artifact_record(collect_artifacts(cli_argv, daemon_argv, ROOT_DIR)), self.comparison)
         return (verdict == "PASS" or verdict == "SKIP"), message
 
@@ -459,6 +509,9 @@ class TestRunner:
                 return "SKIP"
             if message.startswith("INSUFFICIENT_EVIDENCE:") or "INSUFFICIENT_EVIDENCE:" in message:
                 return "INSUFFICIENT_EVIDENCE"
+        if ok and self._not_applicable_steps:
+            # not_applicable 段（平台不適用）不得以 PASS 放行（plan 03 l15-wal-interference 段 (c)）。
+            return "INSUFFICIENT_EVIDENCE"
         if self.mode != "bridge":
             return "PASS" if ok else "FAIL"
         if not self._bridge_eligible or self._settle_failure or self._bridge_shutdown_failure:
@@ -528,7 +581,7 @@ class TestRunner:
                 return digest, False
         return digest, True
 
-    def _result(self, verdict: str, message: str, *, gate_eligible: bool = False) -> dict[str, Any]:
+    def _result(self, verdict: str, message: str, *, gate_eligible: bool = False, na_only_gap: bool = False) -> dict[str, Any]:
         comparison_verdict = self.comparison.get("verdict") if self.comparison else None
         return {
             "case_id": self.tc.name,
@@ -539,6 +592,9 @@ class TestRunner:
             "evidence_dir": str(self.run_dir),
             "comparison_verdict": comparison_verdict,
             "gate_eligible": gate_eligible,
+            # 結構化 not_applicable 段清單（平台不適用、未執行的段）；gate 以此判定缺口是否僅為平台不適用。
+            "not_applicable_steps": [dict(step) for step in self._not_applicable_steps],
+            "na_only_gap": bool(na_only_gap),
         }
 
     def _new_correlation(self) -> CorrelationLog:
@@ -1023,6 +1079,18 @@ class TestRunner:
         action = step.get("action", "")
         self._log(f"步驟 {step_idx}: {action}")
 
+        applicable = step.get("platforms")
+        if applicable is not None:
+            if not isinstance(applicable, list):
+                raise StepError(f"步驟 {step_idx}: platforms 必須為清單")
+            names = [str(x) for x in applicable]
+            if host_platform() not in names:
+                self._not_applicable_steps.append({
+                    "step": step_idx, "action": str(action), "platforms": names, "host": host_platform(),
+                })
+                self._log(f"步驟 {step_idx}: {action} 不適用於 {host_platform()}（not_applicable，不計 PASS）")
+                return
+
         if action in BRIDGE_ONLY_ACTIONS:
             is_bridge = (self.mode == "bridge") or (self.harness is not None and getattr(self.harness, "bridge", None) is not None)
             if not is_bridge:
@@ -1084,6 +1152,8 @@ class TestRunner:
             )
         try:
             response = handler(step, step_idx)
+            if str(action).startswith("assert_"):
+                self._assert_steps_passed += 1
         except Exception as exc:
             if self.correlation is not None and not is_op_boundary:
                 self.correlation.op_end(

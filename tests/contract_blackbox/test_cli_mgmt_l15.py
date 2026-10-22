@@ -9,7 +9,6 @@ import json
 import os
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -18,6 +17,7 @@ import pytest
 from bb_harness import cli_prefix
 from bb_l15 import (
     BridgeTarget,
+    RaisingThread,
     current_release_path,
     control_marks,
     daemon_pid,
@@ -140,6 +140,7 @@ def test_autostart_l15_tx_once(tmp_path: Path, env: dict[str, str]) -> None:
 
 @pytest.mark.case("sc23-setup-rollback")
 @pytest.mark.rust_only
+@pytest.mark.pidns_rig
 def test_update_busy_l15_zero_tx(tmp_path: Path, env: dict[str, str]) -> None:
     """背景 hold 命令期間更新回 SESSION_BUSY，拒絕前後 DUT TX delta 為零。"""
     old, new = update_bundles()
@@ -170,6 +171,7 @@ def test_update_busy_l15_zero_tx(tmp_path: Path, env: dict[str, str]) -> None:
 
 @pytest.mark.case("sc23-setup-rollback")
 @pytest.mark.rust_only
+@pytest.mark.pidns_rig
 def test_update_file_push_after_last_probe_l15(tmp_path: Path, env: dict[str, str]) -> None:
     """最後預檢後開始 1 MiB push，更新必拒絕交接且不切換；push 完成並驗 MD5。"""
     old, new = update_bundles()
@@ -182,9 +184,8 @@ def test_update_file_push_after_last_probe_l15(tmp_path: Path, env: dict[str, st
     env["SW_TEST_UPDATE_PAUSE_AFTER"] = "safety_check"
     env["SW_TEST_UPDATE_PAUSE_DIR"] = str(pause_dir)
     result_rows = []
-    update_thread = threading.Thread(
-        target=lambda: result_rows.append(run_cli(new_cli, ["setup", "--on-demand"], env, timeout_s=240.0)),
-        daemon=True,
+    update_thread = RaisingThread(
+        lambda: result_rows.append(run_cli(new_cli, ["setup", "--on-demand"], env, timeout_s=240.0)),
     )
     old_pid = daemon_pid(env)
     current_bytes = current_release_path(Path(env["SERIALWRAP_INSTALL_ROOT"])).read_bytes()
@@ -226,6 +227,7 @@ def test_update_file_push_after_last_probe_l15(tmp_path: Path, env: dict[str, st
 
 @pytest.mark.case("sc23-setup-rollback")
 @pytest.mark.rust_only
+@pytest.mark.pidns_rig
 def test_update_push_after_freeze_zero_tx_l15(tmp_path: Path, env: dict[str, str]) -> None:
     """handoff_stop 已成功後 file push 回 FLUSHED_BY_SHUTDOWN，凍結期間 DUT TX 為零且無部分檔。"""
     old, new = update_bundles()
@@ -238,9 +240,8 @@ def test_update_push_after_freeze_zero_tx_l15(tmp_path: Path, env: dict[str, str
     env["SW_TEST_UPDATE_PAUSE_AFTER"] = "handoff_stop:replied"
     env["SW_TEST_UPDATE_PAUSE_DIR"] = str(pause_dir)
     result_rows = []
-    update_thread = threading.Thread(
-        target=lambda: result_rows.append(run_cli(new_cli, ["setup", "--on-demand"], env, timeout_s=240.0)),
-        daemon=True,
+    update_thread = RaisingThread(
+        lambda: result_rows.append(run_cli(new_cli, ["setup", "--on-demand"], env, timeout_s=240.0)),
     )
     try:
         update_thread.start()
@@ -279,6 +280,7 @@ def test_update_push_after_freeze_zero_tx_l15(tmp_path: Path, env: dict[str, str
 
 
 @pytest.mark.case("bc05-process-lifecycle-stop-restart")
+@pytest.mark.pidns_rig
 def test_reject_conflict_l15_zero_tx(tmp_path: Path, env: dict[str, str]) -> None:
     """外部 serialwrapd holder 佔住 bridge tty 時，第二個 daemon start 被拒且 DUT TX 為零。"""
     prepare_profile(env)
@@ -319,6 +321,7 @@ def test_reject_conflict_l15_zero_tx(tmp_path: Path, env: dict[str, str]) -> Non
 
 
 @pytest.mark.case("sc20-daemon-restart")
+@pytest.mark.pidns_rig
 def test_restart_no_stale_console_replay(tmp_path: Path, env: dict[str, str]) -> None:
     """console 正向控制確實抵達 DUT；restart 後不得回放未送出的 partial line。"""
     prepare_profile(env)
@@ -385,6 +388,7 @@ def test_restart_no_stale_console_replay(tmp_path: Path, env: dict[str, str]) ->
 
 @pytest.mark.case("sc20-daemon-restart")
 @pytest.mark.rust_only
+@pytest.mark.pidns_rig
 def test_restart_no_reopen_before_handoff(tmp_path: Path, env: dict[str, str]) -> None:
     """P2 control marks 配對每個 daemon PID，並證明舊 tty 關閉後新 daemon 才開啟。"""
     prepare_profile(env)

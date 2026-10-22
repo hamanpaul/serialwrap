@@ -44,6 +44,7 @@ _BLACKBOX_MARKERS = {
     "needs_py_daemon": "需要 Python daemon 基線",
     "needs_delegation": "Rust 輪需要 Task 16 委派（Task 14 以 -m 'not needs_delegation' 排除）",
     "case": "P4 驗收案例綁定（對應 tests/acceptance/p4_case_map.yaml）",
+    "pidns_rig": "自啟 daemon 並呼叫 CLI daemon start／restart／update／supervision 的 Linux rig；整段於獨立 pid namespace 重跑",
 }
 
 
@@ -67,6 +68,27 @@ def pytest_configure(config: pytest.Config) -> None:
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
             config.pluginmanager.register(mod, "sw_resource_report")
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
+    """`pidns_rig` 案例於獨立 user+pid+mount namespace 內重跑整個 nodeid（bridge、daemon、CLI 同一 namespace）。
+
+    已位於隔離 namespace 時（ab_blackbox.sh 整段重入、或子行程）回 None 由原函式執行；
+    無法以非特權 unshare 建立 namespace 時 skip 並註明能力原因，絕不 PASS、不退回 --force-spawn。
+    """
+    if pyfuncitem.get_closest_marker("pidns_rig") is None or os.name != "posix":
+        return None
+    from bb_l15 import in_isolated_pidns, run_nodeid_in_pidns
+
+    if in_isolated_pidns():
+        return None
+    outcome, message = run_nodeid_in_pidns(pyfuncitem.nodeid, pyfuncitem.config.rootpath)
+    if outcome in ("unavailable", "skipped"):
+        pytest.skip(message)
+    if outcome == "failed":
+        pytest.fail(message, pytrace=False)
+    return True
 
 
 def pytest_runtest_setup(item: pytest.Item) -> None:
