@@ -312,6 +312,37 @@ def test_exec_replaces_process_and_sigterm_reaches_child(probe_bundle, env):
             p.wait()
 
 
+_WAIT_OBJECT_0 = 0x00000000
+_SYNCHRONIZE = 0x00100000
+_PROCESS_TERMINATE = 0x0001
+
+
+def _win_kernel32():
+    """僅 Windows 測試路徑使用：以行程 handle 追蹤委派子行程（不依賴 pywin32）。"""
+    import ctypes  # noqa: PLC0415
+    from ctypes import wintypes  # noqa: PLC0415
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.WaitForSingleObject.restype = wintypes.DWORD
+    k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    k32.TerminateProcess.restype = wintypes.BOOL
+    k32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    k32.CloseHandle.restype = wintypes.BOOL
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    return k32
+
+
+def _read_counter_pid(counter: Path) -> int | None:
+    """讀取委派子行程寫入 PROBE_COUNTER 的 pid；僅在整行寫完（以換行結尾）後回傳。"""
+    try:
+        text = counter.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return int(text.splitlines()[-1]) if text.endswith("\n") else None
+
+
 @pytest.mark.rust_only
 @pytest.mark.windows_native
 def test_windows_exec_or_wait_exit_code_and_terminate_propagation(probe_bundle, env, tmp_path):
@@ -333,17 +364,32 @@ def test_windows_exec_or_wait_exit_code_and_terminate_propagation(probe_bundle, 
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    k32 = _win_kernel32()
+    delegated = None
     try:
         deadline = time.monotonic() + 10
-        while not counter.is_file() and child.poll() is None and time.monotonic() < deadline:
+        while _read_counter_pid(counter) is None and child.poll() is None and time.monotonic() < deadline:
             time.sleep(0.05)
-        assert counter.is_file(), "委派子行程未啟動並進入 stdin 等待"
+        pid = _read_counter_pid(counter)
+        assert pid is not None, "委派子行程未啟動並進入 stdin 等待"
+        delegated = k32.OpenProcess(_SYNCHRONIZE | _PROCESS_TERMINATE, False, pid)
+        assert delegated, f"無法開啟委派子行程 pid={pid}"
         child.terminate()
+        # 委派子行程阻塞於 stdin 讀取，且 EOF 尚未送出；在確認其死亡前不得關閉 stdin。
+        # terminate 後立即 communicate 會先送 EOF，但 KILL_ON_JOB_CLOSE 須待父行程的 Job handle 隨行程收尾才生效（約數毫秒），
+        # 子行程可能先讀到 EOF 並輸出（競態）。與 sw-pal exec_or_wait_terminate_kills_default_grandchild 相同：以期限內輪詢死亡為準。
+        assert k32.WaitForSingleObject(delegated, 5000) == _WAIT_OBJECT_0, (
+            "委派父行程終止後 5 秒內委派子行程仍存活（未受 kill-on-close Job 約束）"
+        )
         stdout, stderr = child.communicate(input=b"", timeout=10)
         assert child.returncode == 1, f"Windows terminate exit code 不符：{child.returncode}"
         assert stdout == b"", f"委派子行程在父行程終止後仍存活並輸出：{stdout!r}"
         assert stderr == b"", f"terminate 傳遞期間出現 stderr：{stderr!r}"
     finally:
+        if delegated:
+            if k32.WaitForSingleObject(delegated, 0) != _WAIT_OBJECT_0:
+                k32.TerminateProcess(delegated, 1)  # 失敗路徑清理：不讓委派子行程殘留
+            k32.CloseHandle(delegated)
         if child.poll() is None:
             child.kill()
             child.communicate(timeout=5)
