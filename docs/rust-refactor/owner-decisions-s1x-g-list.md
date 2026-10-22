@@ -1,16 +1,16 @@
 # G 待擁有者裁決清單（S1X 組）
 
-由 `owner-decisions-addenda.md` 分出（該檔僅保留表格列，`od09_freeze._append_addenda` 於 EOF 追加）。以下皆為待裁決項目，未裁決前不得視為已核准。
+由 `owner-decisions-addenda.md` 分出（該檔僅保留表格列，`od09_freeze._append_addenda` 於 EOF 追加）。以下皆為待裁決項目，未裁決前不得視為已核准。（審查 L-5：下列標註「已由 OD-16 裁決」之項目已於 2026-10-22 裁決，本清單保留為歷史對照，現行狀態以 owner-decisions-addenda.md 為準。）
 
-- OD-S1X-01（Linux）：是否同意自 `s1a_cargo`／`s1b_cargo` 移除 ignored 案例（移除者須留在 BLOCKED-OWNER 總表）。逐名清單見下節「G1-l1-lock-vs-selector」之「OD-S1X-01（Linux）」。
-- OD-S1X-01（Windows）：Windows 集合的 add-only 登記須以真機收集輸出完成（WSL 無法產生）。另見下節「G1-l1-lock-vs-selector」之「OD-S1X-01（Windows）」（placeholder 12 筆、cfg 不可編譯 58 筆、posix_only 委派列、cap 列之移除裁決，以及 add-only 登記替換測試）。
-- OD-S1X-02：Windows golden 採 (i) 依 plan 04 Task 10 的 12 情境並縮減分母（實作目前擷取 14 情境，含 2 boundary），或 (ii) 改 plan 擷取鎖定的全部 test_bb_cli_help 節點（432 筆）。
-- OD-S1X-03：docker Rust-CLI L1.5 是否屬 Stage 1 範圍；目前一律 BLOCKED-PREREQ，非 PASS。
+- OD-S1X-01（Linux）（已由 OD-16 裁決，見 :210 起）：是否同意自 `s1a_cargo`／`s1b_cargo` 移除 ignored 案例（移除者須留在 BLOCKED-OWNER 總表）。逐名清單見下節「G1-l1-lock-vs-selector」之「OD-S1X-01（Linux）」。
+- OD-S1X-01（Windows）（已由 OD-16 裁決，見 :210 起）：Windows 集合的 add-only 登記須以真機收集輸出完成（WSL 無法產生）。另見下節「G1-l1-lock-vs-selector」之「OD-S1X-01（Windows）」（placeholder 12 筆、cfg 不可編譯 58 筆、posix_only 委派列、cap 列之移除裁決，以及 add-only 登記替換測試）。
+- OD-S1X-02（已由 OD-16 裁決，見 :210 起）：Windows golden 採 (i) 依 plan 04 Task 10 的 12 情境並縮減分母（實作目前擷取 14 情境，含 2 boundary），或 (ii) 改 plan 擷取鎖定的全部 test_bb_cli_help 節點（432 筆）。
+- OD-S1X-03（已由 OD-16 裁決，見 :210 起）：docker Rust-CLI L1.5 是否屬 Stage 1 範圍；目前一律 BLOCKED-PREREQ，非 PASS。
 - EDR 資料（spike3）：win-wal-av-* 與 win-wal-f12-progress 的 `--edr-product`／`--edr-status`，由擁有者 EDR 主控台查得；未知即 BLOCKED-OWNER，不得 PASS。
-- BLOCKED-PREREQ-S1X-04：systemd 實跑的基底 glibc（debian:12-slim／2.36 vs 二進位 GLIBC_2.39）；三個候選見 addenda 列，須擇一裁決後才能 pin 新映像。
+- BLOCKED-PREREQ-S1X-04（已由 OD-16 裁決，見 :210 起）：systemd 實跑的基底 glibc（debian:12-slim／2.36 vs 二進位 GLIBC_2.39）；三個候選見 addenda 列，須擇一裁決後才能 pin 新映像。
 - Windows cli_help oracle（`tests/contract_blackbox/test_bb_cli_help.py::test_platform_oracle_exists_and_boundary_values_are_native` 與 windows golden）：屬新 oracle，須非實作者單審通過後才可凍結。
 
-## G1-l1-lock-vs-selector（2026-10-22 補登；未裁決前不改鎖）
+## G1-l1-lock-vs-selector（2026-10-22 補登；OD-16 (1)(2) 已裁決並套用，見上列「OD-16 套用紀錄」）
 
 **本節性質**：逐名列出 `tests/acceptance/l1_required.lock.json` 中與所屬列 selector 不一致的 nodeid，供擁有者裁決。本輪只補登文件：未修改鎖檔、未移除任何節點、未取消任何 `#[ignore]`、未改 `l1_judge.py` 規則或 gate 會計。相關列維持 INSUFFICIENT／FAIL，並列入 PR。
 
@@ -206,3 +206,13 @@ cargo:sw-pal::sysenv_mgmt::which_uses_default_path_when_path_is_unset
 - **PENDING-OD-S1X-HANDOFF-WINDOW 關聯（候選，未驗證）**：`test_doctor_ab_shared_checks` 於 ab-suite 兩輪曾見 `single_daemon` 1 個與 0 個不一致；若成因為前序測試 `daemon restart` 後的舊 daemon 因 3 秒排空窗口延遲退出，則併入本列。修正輪已在隔離 pid namespace 內於比對前輪詢至無殘留 serialwrapd（`tests/contract_blackbox/test_cli_mgmt_doctor.py::_wait_no_serialwrapd`），根因未定。
 - **L1 報告 deployed_content**：已修正並登記 `CHG-S1X-DEPLOYED-01`（見 addenda）。
 - **G3 bridge revision**：已登記 `PENDING-OD-S1X-BRIDGE-REVISION`（BLOCKED-REVIEW）。本組不得自我核准。
+
+## OD-16 套用紀錄（2026-10-22）
+
+依 `owner-decisions-2026-10-15.md` OD-16 (1)(2) 套用於 `tests/acceptance/l1_required.lock.json`（未 commit）。逐名移除與 add-only 登記見 `owner-decisions-addenda.md` CHG-S1X-OD16-RM-01～06 與 CHG-S1X-OD16-ADD-01。
+
+- 已套用：Windows `s1a_cargo` placeholder 12＋cfg 不可編譯 58（共 70，自然缺席）；cap_* 與 `windows_switch_running_exe_rename` 於 Linux `s1a_cargo`／`s1b_cargo`、Windows `s1b_cargo` 移除（5＋5＋3，明示排除收集檔）並由 `scripts/rust/owner_gated.py` 列 BLOCKED-OWNER（不需改動該檔，既有登記已涵蓋）；posix_only 委派列 `s1a_blackbox.windows`、`s1a_delegation.windows` 各 1 筆；改名舊名兩筆（Linux `s1a_cargo`）；`s1a_blackbox.windows` test_help_usage_error_bytes 418 筆（431→14）。
+- 已 add-only 登記（Windows 原生收集）：`s1a_cargo.windows` +444、`s1b_cargo.windows` +3、`s1a_blackbox.windows` +15（含 `help_profile_test_col80`、替換測試）、`s1a_delegation.windows` +1（替換測試）。未登記 ignored／entry 項見 ADD-01。
+- 同步：`.github/workflows/tests.yml` `--allow-removal` 與 `tests/test_resource_report.py` pinned 清單各 507 筆。
+- 驗證：`regen_lock.py --check` rc=0；`--check --base HEAD --allow-removal <507 名>` rc=0（505 項集合層級移除，497 個唯一 nodeid）；`tests/test_l1_judge.py::test_l1_lock_frozen_set_excludes_capability_gated` 轉綠。
+- 殘留 OPEN（不得記為 PASS）：mkbundle ignored 三列（L-1、L-2、W-5）未移除，須先登記替換 pytest（G-list 步驟 2a）；W-3 替換測試原生 FAIL（PENDING-OD-S1X-WIN-DELEGATE-TERMINATE）；evidence 報告待新 Windows 原生 B 輪。詳見 CHG-S1X-OD16-OPEN-01。

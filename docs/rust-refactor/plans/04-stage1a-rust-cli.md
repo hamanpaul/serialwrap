@@ -3714,7 +3714,7 @@ PR 描述需列：§11.6 Stage 1A 列的每項證據與狀態（本環境 PASS�
 | B8 | Windows 上的 CPython 3.12.3 embeddable（argparse 方言基準，§0.7） | 10、16、17 | `win-python-3.12.3.sha256`、`win-blackbox.ps1 -Python3123` | 允許下載 python.org 3.12.3 embeddable 或手動放到 `%LOCALAPPDATA%\sw-rust-test\py-3.12.3\`；缺少時 Windows cli_help／委派 A/B 為「證據不足」 |
 | B9 | 跨 phase 待辦（本計畫不修改他 phase 檔案）：(a) P2 `test_cli_stage_rule` 是否把 console RPC 案例改列 `cli_stage:"1A"`；(b) P1 `resolve_config_path` 提供系統設定目錄的測試覆寫入口；(c) 盤點 10 G-08 的「rc=1」措辭更正為 1／120 兩種（Q-20）；(d) `05-stage1b` 的 changelog fragment `type: added` 不是合法 type | 0.3、2、11 | 本計畫已以 `p3_extra`、session fixture 防護、Q-20 實測值處理 | 由各 phase owner 排入 |
 | B10 | S1X：擁有者機台相依 cargo 列（`cap_*`、`windows_switch_running_exe_rename`）未執行 | 3、9、16、18 | `scripts/rust/owner_gated.py` 登記；gate 與 `check_p4_cases` 列為 BLOCKED-OWNER、不因不在鎖內而消失 | 擁有者 Windows／Linux 主機執行對應 `--ignored` 測試（B2、B3、05 B-02） |
-| B11 | S1X：Windows golden 範圍（本計畫 Task 10 文字為 12 情境；實作擷取 14 情境，含 2 boundary；`s1a_blackbox.windows` 鎖定 432 筆 test_bb_cli_help 節點）待 OD-S1X-02 裁決 | 10、16 | 本計畫不改鎖；裁決前 Windows golden 以實作的 14 情境為準（提議，待裁決；理由：boundary 案例為 oracle 測試與鎖定集合所需，文字未更新） | 擁有者裁決（見 owner-decisions-s1x-g-list.md） |
+| B11 | S1X：Windows golden 範圍（本計畫 Task 10 文字為 12 情境；實作擷取 14 情境，含 2 boundary）已由 OD-16 (2) 裁決（RESOLVED）：`s1a_blackbox.windows` 之 test_help_usage_error_bytes 分母 431→14，即 `contracts/cli_help/windows` 全部情境 | 10、16 | 鎖依 OD-16 (2) 以 `regen_lock --l1-add-only --allow-removal` 縮減（逐名見 owner-decisions-addenda.md CHG-S1X-OD16-RM-05）；boundary 案例為 oracle 測試與鎖定集合所需 | 已裁決（OD-16 (2)）；見 owner-decisions-s1x-g-list.md「OD-16 套用紀錄」 |
 
 本 phase 沒有 48 小時長跑或 >72 小時監管驗證需求（規格 §11.6：長跑屬 Stage 1B 出口）；CLI 效能指標（暖快取 p50 ≤2 ms／≤5 ms，以 `daemon status` 量測）因 1A 中 `daemon` 群組為委派，延至 P4 量測。
 
