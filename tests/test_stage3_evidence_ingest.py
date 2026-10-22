@@ -175,7 +175,8 @@ def _env_file(root: Path) -> Path:
 
 def _world(root: Path, *, stage: str = "3", platforms: tuple[str, ...] = ("linux", "windows")) -> SimpleNamespace:
     """建立證據索引與 (stage, platform) target；stage 3 的 target 另記受測 bundle 指紋。"""
-    idx = _fe().evidence_index(root, stage=stage, contract="c" * 40, platforms=platforms)
+    idx = _fe().evidence_index(root, stage=stage, contract="c" * 40,
+                               case_list=_sha(CASES_LOCK), platforms=platforms)
     return SimpleNamespace(
         root=root,
         idx=idx,
@@ -224,11 +225,11 @@ def _bundle(w, platform: str) -> Path:
 
 
 def _state(w) -> tuple[bytes, tuple[str, ...]]:
-    """index.json 位元組與 evidence_root 內檔案清單；拒收後必須完全不變。"""
-    files: tuple[str, ...] = ()
+    """index.json 位元組與 evidence_root 內檔案、目錄清單；拒收後必須完全不變。"""
+    paths: tuple[str, ...] = ()
     if w.evidence_root.exists():
-        files = tuple(sorted(str(p.relative_to(w.evidence_root)) for p in w.evidence_root.rglob("*") if p.is_file()))
-    return w.idx.read_bytes(), files
+        paths = tuple(sorted(str(p.relative_to(w.evidence_root)) for p in w.evidence_root.rglob("*")))
+    return w.idx.read_bytes(), paths
 
 
 def _ingest(w, *, kind: str, item_id: str, platform: str, report_path: Path, release_manifest: Path | None = None,
@@ -311,7 +312,8 @@ def _ab_report(w, *, platform: str = "linux", stage: str = "3", top: dict | None
         b["evidence_layer"] = evidence_layer
     b.update(b_side or {})
     doc = {"ab_manifest_sha256": "e" * 64, "run_id": "run-14b", "layer": "l3", "platform": platform,
-           "stage": stage, "contract_revision": t["contract_revision"], "case_list_sha256": t["case_list_sha256"],
+           "stage": stage, "contract_revision": t["contract_revision"], "case_list_sha256": _sha(CASES_YAML),
+           "case_lock_sha256": _sha(CASES_LOCK),
            "tool_revision": t["tool_revision"], "verdict": verdict, "reason_code": None,
            "sides": [a_side, b], "rounds": [], "started_at": "2026-11-02T09:00:00+00:00", "finished_at": NOW}
     doc.update(top or {})
@@ -356,37 +358,57 @@ def _drill_doc(w, platform: str, *, verdict: str = "PASS", bundle: str | None = 
 
 
 def _gate_doc(*, platform: str = "linux", mode: str = "candidate", release_gate_result: str = "PASS",
-              engine_verdict: str = "PASS", cli_sha: str, deployed: Any, top: dict | None = None) -> dict:
+              engine_verdict: str = "PASS", cli_sha: str, deployed: Any, contract_revision: str | None = "c" * 40,
+              top: dict | None = None) -> dict:
+    acceptance = yaml.safe_load(ACCEPTANCE_YAML.read_text(encoding="utf-8"))
+    engine_files = list(acceptance["workload"]["engine_files"])
+    engine_hashes = {path: (_sha(REPO_ROOT / path) if (REPO_ROOT / path).is_file() else None)
+                     for path in engine_files}
     doc = {"schema": "release-gate.v1", "platform": platform, "mode": mode,
            "release_gate_result": release_gate_result,
            "baseline_result": None if mode == "candidate" else "PASS",
            "engine_result": {"verdict": engine_verdict, "mode": "lr-mixed"},
-           "acceptance": {"revision": 2, "workload_contract_sha256": "w" * 64},
-           "run": {"cli_identity": {"sha256": cli_sha, "resolved": "/x/serialwrap", "pinned": True},
+           "acceptance": {"revision": 2, "workload_contract_sha256": "e" * 64,
+                          "effective_content": acceptance},
+           "run": {"started_at_utc": "2026-11-02T08:00:00+00:00",
+                   "engine_files_sha256": engine_hashes,
+                   "contract_revision": contract_revision,
+                   "cases_yaml_sha256": _sha(CASES_YAML),
+                   "cli_identity": {"sha256": cli_sha, "resolved": "/x/serialwrap", "pinned": True},
                    "deployed_content": deployed},
            "checks": []}
     doc.update(top or {})
     return doc
 
 
+def _gate_workload_sha(doc: dict) -> str:
+    workload = doc["acceptance"]["effective_content"]["workload"]
+    hashes = doc["run"]["engine_files_sha256"]
+    pairs = [[path, hashes[path]] for path in workload["engine_files"]]
+    return hashlib.sha256(json.dumps(pairs, separators=(",", ":"), sort_keys=True).encode("utf-8")).hexdigest()
+
+
 def _suite_doc(w, item, platform: str, *, cli_sha: str, deployed: Any, drop: tuple[str, ...] = (),
                top: dict | None = None) -> dict:
     """TestPilot／realhw `report.json`：`meta.cli_identity`、`meta.deployed_content`、`results[{id,verdict}]`。"""
+    tiers = "p0,p1,remote" if item.evidence_kind == "realhw-report" else None
+    required = _layer_ids(item, platform)
+    if tiers is not None:
+        selected_tiers = {value.strip().casefold() for value in tiers.split(",")}
+        required = [cid for cid in required if w.cases[cid]["family"].casefold() in selected_tiers]
     results = [{"id": cid, "verdict": "PASS", "reason": "", "category": "fake", "reason_code": None,
-                "duration_s": 1.0, "evidence": {}} for cid in _layer_ids(item, platform) if cid not in drop]
+                "duration_s": 1.0, "evidence": {}} for cid in required if cid not in drop]
     doc = {"meta": {"cli_identity": {"sha256": cli_sha, "resolved": "/x/serialwrap", "pinned": True},
                     "deployed_content": deployed, "started_at_utc": "2026-11-02T08:00:00+00:00",
-                    "platform": platform},
+                    "platform": platform, "contract_revision": "c" * 40,
+                    "cases_yaml_sha256": _sha(CASES_YAML), "tiers": tiers},
            "results": results}
     doc.update(top or {})
     return doc
 
 
 def _manual_doc(root: Path, *, procedure_sha: str | None = None, deployed: Any = None, top: dict | None = None) -> dict:
-    root.mkdir(parents=True, exist_ok=True)
-    proc = root / "procedure.md"
-    if not proc.exists():
-        proc.write_text("# 人工程序（測試用）\n", encoding="utf-8")
+    proc = REPO_ROOT / "docs" / "rust-refactor" / "procedures" / "stage3-runbook.md"
     doc = {"procedure_path": str(proc), "procedure_sha256": procedure_sha or _sha(proc), "result": "PASS",
            "executed_by": "owner", "executed_at": NOW, "artifacts": [], "deployed_content": deployed}
     doc.update(top or {})
@@ -399,6 +421,8 @@ def _functest_tree(w, item, platform: str, root_dir: Path, *, cli_sha: str, rel_
     for cid in _layer_ids(item, platform):
         run = root_dir / cid / "local-process" / "0"
         manifest = {"schema": "l15-manifest.v1", "case_id": cid,
+                    "created_at": "2026-11-02T08:00:00+00:00",
+                    "contract_revision": "c" * 40, "cases_yaml_sha256": _sha(CASES_YAML),
                     "artifacts": {"cli": {"sha256": cli_sha},
                                   "daemon": {"implementation": "rust", "sha256": "d" * 64, "tree_sha256": "d" * 64},
                                   "release_manifest_sha256": rel_sha, "deployed_content": deployed}}
@@ -408,6 +432,10 @@ def _functest_tree(w, item, platform: str, root_dir: Path, *, cli_sha: str, rel_
         _write_json(run / "comparison.json", {"schema": "comparison.v1", "verdict": "PASS", "streams": [],
                                               "invariants": []})
         _write_json(run / "bridge-manifest.json", {"closed_cleanly": True, "failure": None})
+    _write_json(root_dir / "func-test-report.json", {
+        "schema_version": "func-test-report.v1", "started_at": "2026-11-02T07:59:00+00:00",
+        "results": [],
+    })
     return root_dir
 
 
@@ -454,9 +482,9 @@ def _canary_scenario(root: Path):
     trees = _fe().target_trees(w.idx, "linux")
     g = _ccl().gate(recs, pol, platform="linux", artifact_id=t["artifact_id"], **trees)
     pid_change = [
-        _fk().snapshot("2026-11-16T06:00:00+00:00", pid=200, artifact=t["artifact_id"],
+        _fk().snapshot("2026-11-15T18:00:30+00:00", pid=200, artifact=t["artifact_id"],
                        bundle_tree=t["bundle_tree_sha256"], runtime_tree=t["runtime_tree_sha256"]),
-        _fk().snapshot("2026-11-16T06:00:30+00:00", pid=200, artifact=t["artifact_id"],
+        _fk().snapshot("2026-11-15T18:01:00+00:00", pid=200, artifact=t["artifact_id"],
                        bundle_tree=t["bundle_tree_sha256"], runtime_tree=t["runtime_tree_sha256"]),
     ]
     recs2 = recs + pid_change
@@ -529,7 +557,7 @@ def test_ab_report_bundle_tree_mismatch_rejected(tmp_path):
     assert _state(w) == before
 
 
-def test_ingest_entry_records_target_tree(tmp_path):
+def test_ingest_entry_records_target_tree(tmp_path, monkeypatch):
     """R3-F2／R4-F1：entry 的內容指紋取自產生端報告的量測值（恰等於 target），不由 target 回填。"""
     w = _world(tmp_path)
     t = _target(w, "linux")
@@ -554,7 +582,20 @@ def test_ingest_entry_records_target_tree(tmp_path):
     lock = fakes_l1.lock({L1_SET: {"linux": NODES}})
     rep = fakes_l1.full_pass(lock, L1_SET, "linux", deployed_content=_bracket(b / "bin" / "serialwrap"))
     jp = fakes_l1.write_report_dir(tmp_path / "junit-ok", rep)
-    e_junit = _ingest(w, kind="junit", item_id=LINUX_L1, platform="linux", report_path=jp, l1_lock=lock, now=NOW3)
+    ei = _ei()
+    validate_target = ei._validate_target
+
+    def mutate_target_after_validation(derived, *, kind, target, reuse_entry):
+        result = validate_target(derived, kind=kind, target=target, reuse_entry=reuse_entry)
+        if kind == "junit":
+            target["bundle_tree_sha256"] = "d" * 64
+            target["runtime_tree_sha256"] = "e" * 64
+        return result
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(ei, "_validate_target", mutate_target_after_validation)
+        e_junit = _ingest(w, kind="junit", item_id=LINUX_L1, platform="linux", report_path=jp,
+                          l1_lock=lock, now=NOW3)
     assert e_junit.bundle_tree_sha256 == t["bundle_tree_sha256"]
     assert e_junit.runtime_tree_sha256 == t["runtime_tree_sha256"]
 
@@ -773,7 +814,7 @@ def test_realhw_live_daemon_outside_install_rejected(tmp_path):
                "in_install": True, "error": None}]
     entry = _ingest(w, kind="realhw-report", item_id=item.item_id, platform="linux", report_path=_doc(inside),
                     release_manifest=rel, now=NOW2)
-    assert entry.result in ("PASS", "FAIL", "INSUFFICIENT")
+    assert entry.result == "PASS"
 
 
 def test_windows_stable_bin_sidecar_rejected(tmp_path):
@@ -875,6 +916,36 @@ def test_all_artifact_kinds_require_measured_tree(tmp_path):
     assert ei.TREE_REQUIRED_KINDS == frozenset(ei.KINDS) - {"od09-freeze", "bridge-selftest"}
     src = INGEST_SRC.read_text(encoding="utf-8")
     assert "report predates target bundle tree" not in src
+    tree = ast.parse(src)
+    ingest_def = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "ingest")
+    fields_value = next(
+        node.value for node in ast.walk(ingest_def)
+        if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "fields"
+                                                for target in node.targets)
+    )
+    tree_fields = {
+        key.value: value
+        for key, value in zip(fields_value.keys, fields_value.values)
+        if isinstance(key, ast.Constant) and key.value in {"bundle_tree_sha256", "runtime_tree_sha256"}
+    }
+    assert ast.unparse(tree_fields["bundle_tree_sha256"]) == "bundle_tree"
+    assert ast.unparse(tree_fields["runtime_tree_sha256"]) == "runtime_tree"
+    validate_def = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_validate_target")
+    exempt_branch = next(
+        node for node in ast.walk(validate_def)
+        if isinstance(node, ast.If) and "TREE_EXEMPT_KINDS" in ast.unparse(node.test)
+        and any(isinstance(child, ast.Return) and isinstance(child.value, ast.Tuple)
+                and any(isinstance(value, ast.Name) and value.id == "target" for value in ast.walk(child.value))
+                for child in ast.walk(node))
+    )
+    assert exempt_branch is not None
+    assert not any(
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name) and node.func.value.id == "target"
+        and any(isinstance(arg, ast.Constant) and arg.value in {"bundle_tree_sha256", "runtime_tree_sha256"}
+                for arg in node.args)
+        for node in ast.walk(ingest_def)
+    )
 
     params = [
         ("junit", LINUX_L1),
@@ -1003,7 +1074,8 @@ def test_gate_report_reuse_carries_measured_tree(tmp_path):
                      set_by="test", now=SET_AT, bundle_dir=b3)
     # 沿用條件要求 environment_id 等其餘欄位全同；替身 entry 預設用 fakes 的 ENV_DOC，改為與被引用 entry 相同
     reuse = _fe().entry(w.root, "S3-L3-AB-48H-LINUX", "PASS", platform="linux", n=7,
-                        reuse_of=gate_entry.entry_id, environment_id=gate_entry.environment_id)
+                        reuse_of=gate_entry.entry_id, environment_id=gate_entry.environment_id,
+                        workload_sha256=gate_entry.workload_sha256)
     _ix().add_entry(w.idx, reuse, catalog=w.cat)
     status, _ = _status(w, "S3-L3-AB-48H-LINUX")
     assert status == "SATISFIED"
@@ -1183,6 +1255,7 @@ def test_canary_new_incident_after_pass_blocks_stage3(tmp_path):
             over: dict[str, Any] = {}
             if item.evidence_kind == "junit":
                 over["l1_set_sha256"] = judge.set_sha256(l1["sets"][item.required_l1_set][platform]["nodeids"])
+                over["producer"] = "ingest:junit"
             _ix().add_entry(w.idx, fe.entry(w.root, item.item_id, "PASS", platform=platform, n=n, **over), catalog=w.cat)
 
     # (1) 報告 A：PASS
@@ -1214,7 +1287,9 @@ def test_canary_new_incident_after_pass_blocks_stage3(tmp_path):
     assert st["items"]["S3-CANARY-LINUX"]["satisfying_entries"] == []
 
     # (4) 以 environment 結案後重算 gate（PASS、帳本版本再增大）→ 報告 C 讓 stage 3 回到 PASS
-    known = _ci().current_incidents(sc.recs2, [])
+    snapshots = [record for record in sc.recs2 if record.get("type") == "snapshot"]
+    detected = _ci().detect(snapshots, [], [], sc.pol)
+    known = _ci().current_incidents(sc.recs2, detected)
     open_id = sorted(g2.tally.open_incidents)[0]
     closed_rec = _ci().close(sc.root / "ledger", open_id, resolution="environment", issue_ref=None,
                              note="計畫內維護重開機", closed_by="owner", now=LATER, known=known)
@@ -1312,7 +1387,7 @@ def test_junit_platform_skip_insufficient(tmp_path):
     lock = fakes_l1.lock({L1_SET: {"linux": NODES}})
     rows = [fakes_l1.row(n) for n in NODES]
     rep = fakes_l1.report(rows, platform="linux", core_portable_platform_skips=["tests/x.py::skip_me"],
-                          deployed_content=None)
+                          deployed_content=_l1_deployed(w))
     jp = fakes_l1.write_report_dir(tmp_path / "junit-cp-skip", rep)
     entry = _ingest(w, kind="junit", item_id=LINUX_L1, platform="linux", report_path=jp, l1_lock=lock)
     assert entry.result == "INSUFFICIENT"
@@ -1327,10 +1402,14 @@ def _l1_world(tmp_path: Path):
     return w, lock
 
 
+def _l1_deployed(w, platform: str = "linux"):
+    return _bracket(_bundle(w, platform) / "bin" / "serialwrap")
+
+
 def test_junit_single_pass_not_full_l1_exit(tmp_path):
     """R5-F3：只跑通一個案例（tests=1、無 failure）不得判 PASS；舊判準 tests>0 會給 PASS。"""
     w, lock = _l1_world(tmp_path)
-    rep = fakes_l1.report([fakes_l1.row(NODES[0])], platform="linux", deployed_content=None)
+    rep = fakes_l1.report([fakes_l1.row(NODES[0])], platform="linux", deployed_content=_l1_deployed(w))
     jp = fakes_l1.write_report_dir(tmp_path / "junit-single", rep)
     entry = _ingest(w, kind="junit", item_id=LINUX_L1, platform="linux", report_path=jp, l1_lock=lock)
     assert entry.result == "INSUFFICIENT"
@@ -1347,7 +1426,7 @@ def test_junit_required_skip_not_pass(tmp_path, outcome):
     w, lock = _l1_world(tmp_path)
     rows = [fakes_l1.row(NODES[0]), fakes_l1.row(NODES[1]),
             fakes_l1.row(NODES[2], outcome, skip_kind="other")]
-    rep = fakes_l1.report(rows, platform="linux", deployed_content=None)
+    rep = fakes_l1.report(rows, platform="linux", deployed_content=_l1_deployed(w))
     jp = fakes_l1.write_report_dir(tmp_path / f"junit-{outcome}", rep)
     entry = _ingest(w, kind="junit", item_id=LINUX_L1, platform="linux", report_path=jp, l1_lock=lock)
     assert entry.result == "INSUFFICIENT"
@@ -1362,20 +1441,23 @@ def test_junit_duplicate_and_incomplete_runs_not_pass(tmp_path, case):
     before = _state(w)
     if case == "duplicate":
         rows = [fakes_l1.row(NODES[0]), fakes_l1.row(NODES[1]), fakes_l1.row(NODES[1]), fakes_l1.row(NODES[2])]
-        rep = fakes_l1.report(rows, platform="linux", deployed_content=None)
+        rep = fakes_l1.report(rows, platform="linux", deployed_content=_l1_deployed(w))
         jp = fakes_l1.write_report_dir(tmp_path / case, rep)
     elif case == "exit-nonzero":
-        rep = fakes_l1.report([fakes_l1.row(n) for n in NODES], platform="linux", exit_code=2, deployed_content=None)
+        rep = fakes_l1.report([fakes_l1.row(n) for n in NODES], platform="linux", exit_code=2,
+                              deployed_content=_l1_deployed(w))
         jp = fakes_l1.write_report_dir(tmp_path / case, rep)
     elif case == "not-finished":
-        rep = fakes_l1.report([fakes_l1.row(n) for n in NODES], platform="linux", finished=False, deployed_content=None)
+        rep = fakes_l1.report([fakes_l1.row(n) for n in NODES], platform="linux", finished=False,
+                              deployed_content=_l1_deployed(w))
         jp = fakes_l1.write_report_dir(tmp_path / case, rep)
     elif case == "deselected":
         rep = fakes_l1.report([fakes_l1.row(NODES[0]), fakes_l1.row(NODES[1])], platform="linux",
-                              deselected=[NODES[2]], deployed_content=None)
+                              deselected=[NODES[2]], deployed_content=_l1_deployed(w))
         jp = fakes_l1.write_report_dir(tmp_path / case, rep)
     else:
-        rep = fakes_l1.report([fakes_l1.row(n) for n in NODES], platform="linux", deployed_content=None)
+        rep = fakes_l1.report([fakes_l1.row(n) for n in NODES], platform="linux",
+                              deployed_content=_l1_deployed(w))
         jp = fakes_l1.write_report_dir(tmp_path / case, rep, tests=4)
         with pytest.raises(_harness_error()) as exc:
             _ingest(w, kind="junit", item_id=LINUX_L1, platform="linux", report_path=jp, l1_lock=lock)
@@ -1403,7 +1485,7 @@ def test_junit_full_required_set_pass(tmp_path):
     w, lock = _l1_world(tmp_path)
     rows = [fakes_l1.row(NODES[0]), fakes_l1.row(NODES[1]), fakes_l1.row(NODES[2]),
             fakes_l1.row("tests/contract_blackbox/test_a.py::t9", "skipped", skip_kind="other")]
-    rep = fakes_l1.report(rows, platform="linux", deployed_content=None)
+    rep = fakes_l1.report(rows, platform="linux", deployed_content=_l1_deployed(w))
     jp = fakes_l1.write_report_dir(tmp_path / "junit-pass", rep)
     entry = _ingest(w, kind="junit", item_id=LINUX_L1, platform="linux", report_path=jp, l1_lock=lock)
     assert entry.result == "PASS"
@@ -1411,7 +1493,7 @@ def test_junit_full_required_set_pass(tmp_path):
     assert any(f.path.endswith("l1-verdict.json") for f in entry.files)
 
     rows_fail = [fakes_l1.row(NODES[0]), fakes_l1.row(NODES[1], "failed"), fakes_l1.row(NODES[2])]
-    rep_fail = fakes_l1.report(rows_fail, platform="linux", deployed_content=None)
+    rep_fail = fakes_l1.report(rows_fail, platform="linux", deployed_content=_l1_deployed(w))
     jp_fail = fakes_l1.write_report_dir(tmp_path / "junit-fail", rep_fail)
     entry_fail = _ingest(w, kind="junit", item_id=LINUX_L1, platform="linux", report_path=jp_fail, l1_lock=lock,
                          now=NOW2)
@@ -1421,7 +1503,7 @@ def test_junit_full_required_set_pass(tmp_path):
 def test_junit_l1_set_growth_makes_entry_stale(tmp_path):
     """R5-F3：必要集合 add-only 增加一筆後，舊 PASS 過期；集合不存在則 MISSING。"""
     w, lock = _l1_world(tmp_path)
-    rep = fakes_l1.full_pass(lock, L1_SET, "linux", deployed_content=None)
+    rep = fakes_l1.full_pass(lock, L1_SET, "linux", deployed_content=_l1_deployed(w))
     jp = fakes_l1.write_report_dir(tmp_path / "junit-growth", rep)
     entry = _ingest(w, kind="junit", item_id=LINUX_L1, platform="linux", report_path=jp, l1_lock=lock)
     assert entry.result == "PASS"
@@ -1440,15 +1522,15 @@ def test_junit_l1_set_growth_makes_entry_stale(tmp_path):
 def test_junit_item_without_l1_set_rejected(tmp_path):
     w, lock = _l1_world(tmp_path)
     item = w.cat[LINUX_L1]
-    rep = fakes_l1.full_pass(lock, L1_SET, "linux", deployed_content=None)
+    rep = fakes_l1.full_pass(lock, L1_SET, "linux", deployed_content=_l1_deployed(w))
     jp = fakes_l1.write_report_dir(tmp_path / "junit-no-set", rep)
     with pytest.raises(_harness_error()) as exc:
         _ei().derive("junit", jp, item=replace(item, required_l1_set=None), cases={}, lock={},
                      release_manifest=None, platform="linux", l1_lock=lock)
     _assert_ingest_invalid(exc)
 
-    before = _state(w)
     bad_entry = _fe().entry(w.root, "S3-ROLLBACK-LINUX", "PASS", platform="linux", n=9, l1_set_sha256="a" * 64)
+    before = _state(w)
     with pytest.raises(_harness_error()) as exc2:
         _ix().add_entry(w.idx, bad_entry, catalog=w.cat)
     _assert_ingest_invalid(exc2)
@@ -1462,7 +1544,9 @@ def test_junit_judge_matches_p2_vectors(tmp_path):
     w = _world(tmp_path)
     item = w.cat[LINUX_L1]
     for vec in vectors:
-        rep = vec["report"]
+        rep = copy.deepcopy(vec["report"])
+        if "deployed_content" in rep:  # 缺 deployed_content 的 INVALID 向量必須保持缺值
+            rep["deployed_content"] = _l1_deployed(w, vec["platform"])
         base = tmp_path / "vec" / vec["name"]
         junit = vec.get("junit")
         if junit is None:
@@ -1476,9 +1560,10 @@ def test_junit_judge_matches_p2_vectors(tmp_path):
         l1_lock = {"schema_version": 1,
                    "sets": {"vec": {vec["platform"]: {"selector": selector, "nodeids": list(vec["required"])}}}}
         if vec["verdict"] == "INVALID":
+            # INVALID 向量同樣以 "vec" 集合判定：集合缺失時 selector 無從比對（selector-mismatch 會被誤判為 INSUFFICIENT）
             with pytest.raises(_harness_error()) as exc:
-                _ei().derive("junit", jp, item=item, cases={}, lock={}, release_manifest=None,
-                             platform=vec["platform"], l1_lock=l1_lock)
+                _ei().derive("junit", jp, item=replace(item, required_l1_set="vec"), cases={}, lock={},
+                             release_manifest=None, platform=vec["platform"], l1_lock=l1_lock)
             assert exc.value.code == "HARNESS_EVIDENCE_INGEST_INVALID", vec["name"]
         else:
             derived = _ei().derive("junit", jp, item=replace(item, required_l1_set="vec"), cases={}, lock={},
@@ -1495,6 +1580,155 @@ def test_junit_judge_matches_p2_vectors(tmp_path):
             assert not ("tests" in strs and 0 in nums), ast.dump(node)
 
 
+def test_junit_uses_pytest_child_suite_timestamp(tmp_path):
+    ei = _ei()
+    item = _ix().load_exit_catalog()[LINUX_L1]
+    lock = fakes_l1.lock({L1_SET: {"linux": NODES}})
+    bundle = _fe().make_bundle(tmp_path / "bundle", stage="3")
+    deployed = _bracket(bundle / "bin" / "serialwrap")
+    for side in ("start", "end"):
+        deployed[side].pop("measured_at", None)
+    report = fakes_l1.full_pass(lock, L1_SET, "linux", deployed_content=deployed)
+    junit = fakes_l1.write_report_dir(tmp_path / "pytest-junit", report)
+    derived = ei.derive("junit", junit, item=item, cases={}, lock={}, release_manifest=None,
+                        platform="linux", l1_lock=lock)
+    assert derived.started_at == "2026-11-01T00:00:00+00:00"
+
+
+def test_pytest_resource_json_without_junit_is_rejected(tmp_path):
+    ei = _ei()
+    item = _ix().load_exit_catalog()[LINUX_L1]
+    lock = fakes_l1.lock({L1_SET: {"linux": NODES}})
+    bundle = _fe().make_bundle(tmp_path / "bundle", stage="3")
+    report = _write_json(
+        tmp_path / "resource-report.json",
+        fakes_l1.full_pass(lock, L1_SET, "linux", deployed_content=_bracket(bundle / "bin" / "serialwrap")),
+    )
+    with pytest.raises(_harness_error()) as exc:
+        ei.derive("junit", report, item=item, cases={}, lock={}, release_manifest=None,
+                  platform="linux", l1_lock=lock)
+    _assert_ingest_invalid(exc, "pytest junit XML is required")
+
+
+def test_frozen_case_pool_missing_definition_is_rejected():
+    ei = _ei()
+    item = SimpleNamespace(layer="L3", required_case_set="frozen")
+    with pytest.raises(_harness_error()) as exc:
+        ei._case_ids(
+            item,
+            cases={"known": {"layer": "L3", "platforms": ["linux"], "family": "P0"}},
+            lock={"sets": {"frozen": ["known", "missing"]}},
+            platform="linux",
+        )
+    _assert_ingest_invalid(exc, "frozen case missing has no definition")
+
+
+def test_realhw_required_cases_follow_report_tiers_and_keep_windows_gaps(tmp_path):
+    ei = _ei()
+    w = _world(tmp_path)
+    item = w.cat["S3-L3-P0P1-REMOTE-LINUX"]
+    bundle = _bundle(w, "linux")
+    report = _suite_doc(w, item, "linux", cli_sha=_sha(bundle / "bin" / "serialwrap"),
+                        deployed=_bracket(bundle / "bin" / "serialwrap"))
+    report_path = _write_json(tmp_path / "realhw-p0p1-remote.json", report)
+    derived = ei._derive_suite_report("realhw-report", report_path, item=item, cases=w.cases, lock=w.lock,
+                                      release_manifest=None, platform="linux", now=NOW)
+    assert derived.result == "PASS"
+    assert "lr-mixed" not in [row["id"] for row in report["results"]]
+
+    stale_cases = copy.deepcopy(report)
+    stale_cases["meta"]["cases_yaml_sha256"] = "0" * 64
+    stale_path = _write_json(tmp_path / "realhw-stale-cases.yaml-hash.json", stale_cases)
+    with pytest.raises(_harness_error()) as exc:
+        ei._derive_suite_report("realhw-report", stale_path, item=item, cases=w.cases, lock=w.lock,
+                                release_manifest=None, platform="linux", now=NOW)
+    _assert_ingest_invalid(exc, "cases_yaml_sha256")
+
+    failed_longrun = copy.deepcopy(report)
+    failed_longrun["results"].append({"id": "lr-mixed", "verdict": "FAIL"})
+    failed_path = _write_json(tmp_path / "realhw-extra-longrun-fail.json", failed_longrun)
+    failed = ei._derive_suite_report("realhw-report", failed_path, item=item, cases=w.cases, lock=w.lock,
+                                     release_manifest=None, platform="linux", now=NOW)
+    assert failed.result == "FAIL"
+
+    windows_item = w.cat["S3-L3-P0P1-REMOTE-WINDOWS"]
+    gap_cases = tuple(cid for cid in _layer_ids(windows_item, "windows")
+                      if w.cases[cid].get("windows_status") == "gap")
+    assert gap_cases
+    windows_bundle = _bundle(w, "windows")
+    windows_doc = _suite_doc(
+        w, windows_item, "windows", cli_sha=_sha(windows_bundle / "bin" / "serialwrap"),
+        deployed=_bracket(windows_bundle / "bin" / "serialwrap"), drop=gap_cases,
+    )
+    windows_path = _write_json(tmp_path / "realhw-windows-gap.json", windows_doc)
+    windows_result = ei._derive_suite_report("realhw-report", windows_path, item=windows_item, cases=w.cases,
+                                             lock=w.lock, release_manifest=None, platform="windows", now=NOW)
+    assert windows_result.result == "INSUFFICIENT"
+
+
+def test_ab_report_binds_case_lock_digest_not_case_yaml_digest(tmp_path):
+    ei = _ei()
+    w = _world(tmp_path)
+    item = w.cat["S3-L3-AB-48H-LINUX"]
+    target = _target(w, "linux")
+    doc = _ab_report(w)
+    report = _write_json(tmp_path / "ab-case-lock.json", doc)
+    derived = ei._derive_ab(report, item=item, platform="linux")
+    assert derived.case_list_sha256 == target["case_list_sha256"] == _sha(CASES_LOCK)
+    assert doc["case_list_sha256"] == _sha(CASES_YAML)
+    assert doc["case_list_sha256"] != doc["case_lock_sha256"]
+
+    doc["case_lock_sha256"] = "f" * 64
+    bad = _write_json(tmp_path / "ab-case-lock-mismatch.json", doc)
+    with pytest.raises(_harness_error()) as exc:
+        ei._validate_target(ei._derive_ab(bad, item=item, platform="linux"), kind="ab-report",
+                            target=target, reuse_entry=None)
+    _assert_ingest_invalid(exc, "case_list_sha256")
+
+
+def test_bridge_selftest_uses_native_qualification_contract(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "uart_stdio_bridge" / "src"))
+    from uart_stdio_bridge.identity import tool_tree_sha256
+    from uart_stdio_bridge.selftest import runner
+
+    ei = _ei()
+    tree_sha = tool_tree_sha256()
+    approved = runner.load_approved_revision()
+    report = {
+        "schema_version": "bridge-selftest.v1",
+        "created_at": "2026-11-02T08:00:00Z",
+        "complete": True,
+        "tool": {"tree_sha256": tree_sha},
+        "platform": {"os": "Linux"},
+        "endpoint": "posix-pty",
+        "capabilities": {"transport_disconnect": True},
+        "checks": [{"id": check_id, "verdict": "PASS"} for check_id in runner.CHECK_IDS],
+        "verdict": "PASS",
+        "test_overrides": {},
+    }
+    path = _write_json(tmp_path / "bridge-native.json", report)
+    item = SimpleNamespace(evidence_kind="bridge-selftest")
+    derived = ei.derive("bridge-selftest", path, item=item, cases={}, lock={}, release_manifest=None,
+                        platform="linux")
+    assert derived.result == "PASS"
+    assert derived.started_at == "2026-11-02T08:00:00+00:00"
+
+    mismatch = copy.deepcopy(report)
+    mismatch["tool"]["tree_sha256"] = "0" * 64
+    mismatch_path = _write_json(tmp_path / "bridge-tree-mismatch.json", mismatch)
+    failed = ei.derive("bridge-selftest", mismatch_path, item=item, cases={}, lock={}, release_manifest=None,
+                       platform="linux")
+    assert failed.result == "FAIL"
+
+    forged = copy.deepcopy(report)
+    forged["qualified"] = True
+    forged_path = _write_json(tmp_path / "bridge-forged.json", forged)
+    with pytest.raises(_harness_error()) as exc:
+        ei.derive("bridge-selftest", forged_path, item=item, cases={}, lock={}, release_manifest=None,
+                  platform="linux")
+    _assert_ingest_invalid(exc, "qualified")
+
+
 # ===========================================================================
 # manual／target
 # ===========================================================================
@@ -1509,6 +1743,21 @@ def test_manual_procedure_hash_checked(tmp_path):
     assert _state(w) == before
 
 
+def test_manual_procedure_cannot_self_authorize_external_copy(tmp_path):
+    ei = _ei()
+    w = _treed_world(tmp_path, "2.4")
+    copied = tmp_path / "procedure-copy.md"
+    copied.write_text("# 已被修改的程序\n", encoding="utf-8")
+    doc = _manual_doc(tmp_path / "manual", deployed=None)
+    doc["procedure_path"] = str(copied)
+    doc["procedure_sha256"] = _sha(copied)
+    report = _write_json(tmp_path / "manual-self-hashed-copy.json", doc)
+    with pytest.raises(_harness_error()) as exc:
+        ei.derive("manual-procedure", report, item=w.cat["S24-P2-1-MCU-FLASH"], cases=w.cases,
+                  lock=w.lock, release_manifest=None, platform="linux")
+    _assert_ingest_invalid(exc, "procedures 目錄外")
+
+
 def test_no_target_rejected(tmp_path):
     w = _world(tmp_path, stage="3", platforms=("linux",))
     before = _state(w)
@@ -1517,3 +1766,583 @@ def test_no_target_rejected(tmp_path):
         _ingest(w, kind="drill-report", item_id="S3-ROLLBACK-WINDOWS", platform="windows", report_path=rp)
     _assert_ingest_invalid(exc, "no target")
     assert _state(w) == before
+
+
+def test_add_entry_failure_removes_copied_evidence_and_directories(tmp_path, monkeypatch):
+    ei = _ei()
+    w = _world(tmp_path)
+    report = _write_json(tmp_path / "od09.json", _od09_doc())
+    before = _state(w)
+
+    def fail_add(*args, **kwargs):
+        raise ei._invalid("injected index write failure")
+
+    monkeypatch.setattr(_ix(), "add_entry", fail_add)
+    with pytest.raises(_harness_error()) as exc:
+        _ingest(w, kind="od09-freeze", item_id="S3-OD09-ALL-FROZEN", platform="linux", report_path=report)
+    _assert_ingest_invalid(exc, "injected index write failure")
+    assert _state(w) == before
+
+
+# ===========================================================================
+# 獨立推導器回歸：不依賴尚未交付的 evidence_index／canary_ledger
+# ===========================================================================
+def _unit_derived(**updates):
+    values = {
+        "result": "PASS",
+        "artifact_id": "a" * 64,
+        "contract_revision": "c" * 40,
+        "tool_revision": "t" * 40,
+        "case_list_sha256": "e" * 64,
+        "workload_sha256": None,
+        "bundle_tree_sha256": None,
+        "runtime_tree_sha256": None,
+        "xfail_cases": (),
+        "started_at": NOW,
+        "files": (),
+        "ledger_through": None,
+        "ledger_records": None,
+        "l1_set_sha256": None,
+        "l1_verdict": None,
+        "note": "測試",
+        "detail": (),
+    }
+    values.update(updates)
+    return _ei().Derived(**values)
+
+
+def _unit_regression_report(tmp_path: Path, rows: list[dict]) -> Path:
+    return _write_json(
+        tmp_path / "regression-report.json",
+        {
+            "meta": {
+                "started_at": "261102-100000",
+                "deployed_content_start": {"measured_at": NOW},
+                "cli_identity": {"sha256": "d" * 64},
+                "deployed_content": None,
+            },
+            "results": rows,
+        },
+    )
+
+
+def _unit_regression_derive(report: Path, *, cases: dict[str, dict]):
+    item = SimpleNamespace(layer="L2", required_case_set="frozen", candidate_longrun=False)
+    return _ei()._derive_suite_report(
+        "regression-report",
+        report,
+        item=item,
+        cases=cases,
+        lock={"sets": {"frozen": list(cases)}},
+        release_manifest=None,
+        platform="linux",
+        now=NOW,
+    )
+
+
+def test_regression_missing_required_case_is_insufficient(tmp_path):
+    cases = {"required": {"layer": "L2", "platforms": ["linux"]}}
+    report = _unit_regression_report(tmp_path, [])
+    derived = _unit_regression_derive(report, cases=cases)
+    assert derived.result == "INSUFFICIENT"
+    assert derived.started_at == NOW
+    assert any("missing cases" in detail for detail in derived.detail)
+
+
+def test_regression_extra_case_failure_still_fails(tmp_path):
+    cases = {
+        "required": {"layer": "L2", "platforms": ["linux"]},
+        "extra": {"layer": "L2", "platforms": ["linux"]},
+    }
+    report = _unit_regression_report(
+        tmp_path,
+        [{"id": "required", "verdict": "PASS"}, {"id": "extra", "verdict": "FAIL"}],
+    )
+    derived = _unit_regression_derive(report, cases=cases)
+    assert derived.result == "FAIL"
+
+
+def test_regression_failure_still_fails_with_frozen_required_case(tmp_path):
+    report = _unit_regression_report(
+        tmp_path,
+        [{"id": "uncatalogued", "verdict": "FAIL"}],
+    )
+    derived = _unit_regression_derive(
+        report, cases={"uncatalogued": {"layer": "L2", "platforms": ["linux"]}}
+    )
+    assert derived.result == "FAIL"
+
+
+def test_regression_uncatalogued_pass_does_not_change_required_result(tmp_path):
+    cases = {"required": {"layer": "L2", "platforms": ["linux"]}}
+    report = _unit_regression_report(
+        tmp_path,
+        [{"id": "required", "verdict": "PASS"}, {"id": "extra", "verdict": "PASS"}],
+    )
+    derived = _unit_regression_derive(report, cases=cases)
+    assert derived.result == "PASS"
+
+
+def test_xfail_without_expiry_is_a_failure_not_a_crash(tmp_path):
+    cases = {
+        "required": {
+            "layer": "L2",
+            "platforms": ["linux"],
+            "expected": "XFAIL",
+            "sentinel": {"signature": "known"},
+        }
+    }
+    report = _unit_regression_report(
+        tmp_path,
+        [{"id": "required", "verdict": "FAIL", "reason": "known"}],
+    )
+    derived = _unit_regression_derive(report, cases=cases)
+    assert derived.result == "FAIL"
+
+
+def test_gate_report_mode_platform_and_workload_identity(tmp_path):
+    ei = _ei()
+    bundle = _fe().make_bundle(tmp_path / "bundle", stage="2.4")
+    manifest_path = bundle / "release-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    cli_sha = manifest["components"]["cli"]["sha256"]
+    doc = _gate_doc(mode="baseline", cli_sha=cli_sha, deployed=None)
+    report = _write_json(tmp_path / "gate.json", doc)
+    candidate = SimpleNamespace(layer="L3", candidate_longrun=True)
+    with pytest.raises(_harness_error()) as exc:
+        ei._derive_suite_report(
+            "gate-report", report, item=candidate, cases={}, lock={}, release_manifest=manifest_path,
+            platform="linux", now=NOW,
+        )
+    _assert_ingest_invalid(exc, "mode")
+
+    baseline = SimpleNamespace(layer="L3", candidate_longrun=False)
+    derived = ei._derive_suite_report(
+        "gate-report", report, item=baseline, cases={}, lock={}, release_manifest=manifest_path,
+        platform="linux", now=NOW,
+    )
+    assert derived.workload_sha256 == _gate_workload_sha(doc)
+
+    doc["platform"] = "windows"
+    report = _write_json(tmp_path / "gate-wrong-platform.json", doc)
+    with pytest.raises(_harness_error()) as exc2:
+        ei._derive_suite_report(
+            "gate-report", report, item=baseline, cases={}, lock={}, release_manifest=manifest_path,
+            platform="linux", now=NOW,
+        )
+    _assert_ingest_invalid(exc2, "platform")
+
+
+def test_deployed_daemon_runtime_hash_accepts_windows_report_paths():
+    ei = _ei()
+    artifact = "c" * 64
+    cli_sha = "d" * 64
+    launcher_sha = "a" * 64
+    runtime_sha = "b" * 64
+    manifest = {
+        "components": {
+            "daemon": {
+                "launcher": {"sha256": launcher_sha},
+                "runtime": {"sha256": runtime_sha},
+            }
+        }
+    }
+    side = {
+        "schema_version": "deployed-content.v1",
+        "error": None,
+        "bundle_tree_sha256": "1" * 64,
+        "runtime_tree_sha256": "2" * 64,
+        "release_manifest_sha256": artifact,
+        "cli_sha256": cli_sha,
+        "install_dir": r"C:\serialwrap\release",
+        "daemon_resolved": r"C:\serialwrap\release\bin\serialwrapd",
+        "daemon_sha256": runtime_sha,
+    }
+    bracket = {
+        "start": dict(side),
+        "end": dict(side),
+        "daemon_live": [
+            {
+                "image_path": r"C:\serialwrap\release\runtime\python.exe",
+                "image_sha256": runtime_sha,
+                "in_install": True,
+                "error": None,
+            }
+        ],
+    }
+    measured = ei.deployed_tree(
+        [bracket], kind="realhw-report", artifact_id=artifact, cli_sha256=cli_sha, manifest_doc=manifest
+    )
+    assert measured.bundle_tree_sha256 == "1" * 64
+    assert measured.runtime_tree_sha256 == "2" * 64
+
+
+def test_deployed_daemon_without_manifest_is_unmeasured():
+    ei = _ei()
+    side = {
+        "schema_version": "deployed-content.v1",
+        "error": None,
+        "bundle_tree_sha256": "1" * 64,
+        "runtime_tree_sha256": "2" * 64,
+        "release_manifest_sha256": "c" * 64,
+        "cli_sha256": "d" * 64,
+        "install_dir": r"C:\serialwrap\release",
+        "daemon_resolved": r"C:\serialwrap\release\bin\serialwrapd",
+        "daemon_sha256": "b" * 64,
+    }
+    bracket = {
+        "start": dict(side),
+        "end": dict(side),
+        "daemon_live": [
+            {
+                "image_path": r"C:\serialwrap\release\bin\serialwrapd",
+                "image_sha256": "b" * 64,
+                "in_install": True,
+                "error": None,
+            }
+        ],
+    }
+    measured = ei.deployed_tree([bracket], kind="realhw-report", artifact_id=None, cli_sha256="d" * 64)
+    assert measured == ei.DeployedTree(None, None)
+
+
+def test_target_missing_tree_has_specific_rejection():
+    ei = _ei()
+    target = {"bundle_tree_sha256": "b" * 64, "runtime_tree_sha256": "c" * 64}
+    with pytest.raises(_harness_error()) as exc:
+        ei._validate_target(_unit_derived(bundle_tree_sha256=None, runtime_tree_sha256=None),
+                            kind="junit", target=target, reuse_entry=None)
+    _assert_ingest_invalid(exc, "report lacks deployed tree: junit")
+
+
+def test_reuse_compares_contract_identity_to_target_and_tree_to_source():
+    ei = _ei()
+    target = {
+        "artifact_id": "9" * 64,
+        "contract_revision": "c" * 40,
+        "tool_revision": "t" * 40,
+        "case_list_sha256": "e" * 64,
+        "bundle_tree_sha256": "7" * 64,
+        "runtime_tree_sha256": "8" * 64,
+    }
+    reused = {
+        "artifact_id": "a" * 64,
+        "contract_revision": "1" * 40,
+        "tool_revision": "2" * 40,
+        "case_list_sha256": "3" * 64,
+        "bundle_tree_sha256": "4" * 64,
+        "runtime_tree_sha256": "5" * 64,
+    }
+    derived = _unit_derived(
+        artifact_id=reused["artifact_id"],
+        contract_revision=target["contract_revision"],
+        tool_revision=target["tool_revision"],
+        case_list_sha256=target["case_list_sha256"],
+        bundle_tree_sha256=reused["bundle_tree_sha256"],
+        runtime_tree_sha256=reused["runtime_tree_sha256"],
+    )
+    assert ei._validate_target(derived, kind="gate-report", target=target, reuse_entry=reused) == (
+        target["bundle_tree_sha256"], target["runtime_tree_sha256"]
+    )
+
+
+def test_reuse_missing_deployed_tree_has_specific_rejection():
+    ei = _ei()
+    reused = {
+        "artifact_id": "a" * 64,
+        "runtime_tree_sha256": "5" * 64,
+        "bundle_tree_sha256": "4" * 64,
+    }
+    with pytest.raises(_harness_error()) as exc:
+        ei._validate_target(
+            _unit_derived(bundle_tree_sha256=None, runtime_tree_sha256=None),
+            kind="gate-report",
+            target={},
+            reuse_entry=reused,
+        )
+    _assert_ingest_invalid(exc, "report lacks deployed tree: gate-report")
+
+
+def test_gate_workload_sha_uses_engine_files_not_contract(tmp_path):
+    ei = _ei()
+    bundle = _fe().make_bundle(tmp_path / "bundle", stage="2.4")
+    manifest_path = bundle / "release-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    doc = _gate_doc(cli_sha=manifest["components"]["cli"]["sha256"], deployed=None)
+    report = _write_json(tmp_path / "gate.json", doc)
+    item = SimpleNamespace(layer="L3", candidate_longrun=True)
+    derived = ei._derive_suite_report(
+        "gate-report",
+        report,
+        item=item,
+        cases={},
+        lock={},
+        release_manifest=manifest_path,
+        platform="linux",
+        now=NOW,
+    )
+    assert derived.workload_sha256 == _gate_workload_sha(doc)
+
+
+def test_gate_report_rejects_incomplete_engine_hash_map(tmp_path):
+    ei = _ei()
+    bundle = _fe().make_bundle(tmp_path / "bundle", stage="2.4")
+    manifest_path = bundle / "release-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    doc = _gate_doc(cli_sha=manifest["components"]["cli"]["sha256"], deployed=None)
+    engine_file = doc["acceptance"]["effective_content"]["workload"]["engine_files"][0]
+    doc["run"]["engine_files_sha256"][engine_file] = None
+    report = _write_json(tmp_path / "gate-missing-engine-hash.json", doc)
+    with pytest.raises(_harness_error()) as exc:
+        ei._derive_suite_report(
+            "gate-report", report, item=SimpleNamespace(layer="L3", candidate_longrun=True),
+            cases={}, lock={}, release_manifest=manifest_path, platform="linux", now=NOW,
+        )
+    _assert_ingest_invalid(exc, "engine_files_sha256")
+
+
+def test_recorded_contract_revision_is_checked_against_target(tmp_path):
+    ei = _ei()
+    w = _treed_world(tmp_path, "2.4")
+    item = w.cat["S24-L3-LRMIXED-48H-LINUX"]
+    bundle = _bundle(w, "linux")
+    report_doc = _gate_doc(cli_sha=_sha(bundle / "bin" / "serialwrap"), deployed=_bracket(bundle / "bin" / "serialwrap"),
+                           contract_revision="1" * 40)
+    report = _write_json(tmp_path / "gate-old-contract.json", report_doc)
+    derived = ei._derive_suite_report("gate-report", report, item=item, cases=w.cases, lock=w.lock,
+                                      release_manifest=bundle / "release-manifest.json", platform="linux", now=NOW)
+    with pytest.raises(_harness_error()) as exc:
+        ei._validate_target(derived, kind="gate-report", target=_target(w, "linux", "2.4"), reuse_entry=None)
+    _assert_ingest_invalid(exc, "contract_revision")
+
+
+def test_functest_uses_native_created_at_and_rejects_disagreeing_contracts(tmp_path):
+    ei = _ei()
+    w = _treed_world(tmp_path, "2.4")
+    item = w.cat["S24-L15-ALL-CONTRACTS-LINUX"]
+    bundle = _bundle(w, "linux")
+    report_dir = _functest_tree(
+        w, item, "linux", tmp_path / "func", cli_sha=_sha(bundle / "bin" / "serialwrap"),
+        rel_sha=_sha(bundle / "release-manifest.json"), deployed=_bracket(bundle / "bin" / "serialwrap"),
+    )
+    derived = ei._derive_functest(report_dir, item=item, cases=w.cases, lock=w.lock, platform="linux",
+                                  release_manifest=None)
+    assert derived.started_at == "2026-11-02T07:59:00+00:00"
+    assert derived.contract_revision == "c" * 40
+
+    manifest_path = next(report_dir.rglob("manifest.json"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["contract_revision"] = "1" * 40
+    _write_json(manifest_path, manifest)
+    with pytest.raises(_harness_error()) as exc:
+        ei._derive_functest(report_dir, item=item, cases=w.cases, lock=w.lock, platform="linux",
+                            release_manifest=None)
+    _assert_ingest_invalid(exc, "contract identity changed")
+
+
+@pytest.mark.parametrize("bad_format,failed_row", [(True, False), (False, True)])
+def test_missing_l1_set_preserves_judge_severity(tmp_path, bad_format, failed_row):
+    ei = _ei()
+    bundle = _fe().make_bundle(tmp_path / "bundle", stage="3")
+    rows = [fakes_l1.row(NODES[0], "failed" if failed_row else "passed")]
+    report_doc = fakes_l1.report(
+        rows,
+        platform="linux",
+        deployed_content=_bracket(bundle / "bin" / "serialwrap"),
+    )
+    if bad_format:
+        report_doc["format"] = "not-l1-results"
+    report = fakes_l1.write_report_dir(tmp_path / "report", report_doc)
+    item = SimpleNamespace(required_l1_set=L1_SET)
+    if bad_format:
+        with pytest.raises(_harness_error()) as exc:
+            ei._derive_junit(
+                report,
+                item=item,
+                platform="linux",
+                l1_lock={},
+                release_manifest=None,
+            )
+        _assert_ingest_invalid(exc)
+    else:
+        derived = ei._derive_junit(
+            report,
+            item=item,
+            platform="linux",
+            l1_lock={},
+            release_manifest=None,
+        )
+        assert derived.result == "FAIL"
+        assert "no frozen l1 set" in derived.l1_verdict["reasons"]
+
+
+@pytest.mark.parametrize("direct_json", [True, False])
+def test_cargo_l1_report_without_junit_skips_xml_counts(tmp_path, monkeypatch, direct_json):
+    ei = _ei()
+    bundle = _fe().make_bundle(tmp_path / "bundle", stage="3")
+    lock = fakes_l1.lock({L1_SET: {"linux": NODES}}, argv=("cargo", "test"))
+    rep = fakes_l1.full_pass(
+        lock,
+        L1_SET,
+        "linux",
+        deployed_content=_bracket(bundle / "bin" / "serialwrap"),
+    )
+    rep["runner"] = "cargo"
+    rep["argv"] = ["cargo", "test"]
+    report_dir = tmp_path / "cargo-report"
+    resource_report = _write_json(report_dir / "resource-report.json", rep)
+    report = resource_report if direct_json else report_dir / "junit.xml"
+    monkeypatch.setattr(ei, "_junit_counts", lambda _: pytest.fail("cargo 報告不應解析 junit"))
+    derived = ei._derive_junit(
+        report,
+        item=SimpleNamespace(required_l1_set=L1_SET),
+        platform="linux",
+        l1_lock=lock,
+        release_manifest=None,
+    )
+    assert derived.result == "PASS"
+    assert derived.files == (resource_report,)
+
+
+def test_functest_null_manifest_and_cli_identity_are_unrecorded(tmp_path):
+    ei = _ei()
+    item = SimpleNamespace(layer="L1.5", required_case_set="frozen", candidate_longrun=False)
+    case = "l15-case"
+    root = tmp_path / "func"
+    run = root / case / "local-process" / "0"
+    _write_json(
+        run / "manifest.json",
+        {
+            "case_id": case,
+            "created_at": NOW,
+            "artifacts": {
+                "release_manifest_sha256": None,
+                "cli": {"sha256": None},
+                "deployed_content": None,
+            },
+        },
+    )
+    _write_json(run / "comparison.json", {"verdict": "PASS", "invariants": []})
+    _write_json(run / "bridge-manifest.json", {"closed_cleanly": True})
+    derived = ei._derive_functest(
+        root,
+        item=item,
+        cases={case: {"layer": "L1.5", "platforms": ["linux"]}},
+        lock={"sets": {"frozen": [case]}},
+        platform="linux",
+        release_manifest=None,
+    )
+    assert derived.result == "PASS"
+    assert derived.artifact_id is None
+    assert derived.bundle_tree_sha256 is None
+
+
+def test_copy_evidence_preserves_relative_paths_and_duplicate_basenames(tmp_path, monkeypatch):
+    ei = _ei()
+    monkeypatch.setattr(
+        _ix(),
+        "FrozenFile",
+        lambda *, path, sha256: SimpleNamespace(path=path, sha256=sha256),
+        raising=False,
+    )
+    report_root = tmp_path / "source-report"
+    (report_root / "start").mkdir(parents=True)
+    (report_root / "end").mkdir(parents=True)
+    report = _write_json(report_root / "report.json", {"ok": True})
+    start = report_root / "start" / "deployed.json"
+    end = report_root / "end" / "deployed.json"
+    start.write_text("start\n", encoding="utf-8")
+    end.write_text("end\n", encoding="utf-8")
+    files, destination, _ = ei._copy_evidence(
+        _unit_derived(files=(report, start, end)),
+        evidence_root=tmp_path / "evidence",
+        item_id="S3-ITEM",
+        platform="linux",
+        now=NOW,
+        report_root=report_root,
+    )
+    paths = [file.path for file in files]
+    assert any(path.endswith("/start/deployed.json") for path in paths)
+    assert any(path.endswith("/end/deployed.json") for path in paths)
+    assert (destination / "start" / "deployed.json").read_text(encoding="utf-8") == "start\n"
+    assert (destination / "end" / "deployed.json").read_text(encoding="utf-8") == "end\n"
+
+
+def test_copy_evidence_dot_directory_uses_resolved_name(tmp_path, monkeypatch):
+    ei = _ei()
+    monkeypatch.setattr(
+        _ix(),
+        "FrozenFile",
+        lambda *, path, sha256: SimpleNamespace(path=path, sha256=sha256),
+        raising=False,
+    )
+    source_dir = tmp_path / "dot-report"
+    source_dir.mkdir()
+    (source_dir / "report.json").write_text("{}\n", encoding="utf-8")
+    monkeypatch.chdir(source_dir)
+    _, destination, _ = ei._copy_evidence(
+        _unit_derived(files=(Path("."),)),
+        evidence_root=tmp_path / "evidence",
+        item_id="S3-ITEM",
+        platform="linux",
+        now=NOW,
+        report_root=Path("."),
+    )
+    assert (destination / "dot-report" / "report.json").read_text(encoding="utf-8") == "{}\n"
+
+
+def test_copy_evidence_wraps_oserror_and_removes_empty_item_dirs(tmp_path, monkeypatch):
+    ei = _ei()
+    monkeypatch.setattr(
+        _ix(),
+        "FrozenFile",
+        lambda *, path, sha256: SimpleNamespace(path=path, sha256=sha256),
+        raising=False,
+    )
+    source = _write_json(tmp_path / "report.json", {"ok": True})
+    evidence_root = tmp_path / "evidence"
+
+    def fail_copy(*args, **kwargs):
+        raise OSError("copy failed")
+
+    monkeypatch.setattr(ei.shutil, "copyfile", fail_copy)
+    with pytest.raises(_harness_error()) as exc:
+        ei._copy_evidence(
+            _unit_derived(files=(source,)),
+            evidence_root=evidence_root,
+            item_id="S3-ITEM",
+            platform="linux",
+            now=NOW,
+            report_root=tmp_path,
+        )
+    _assert_ingest_invalid(exc, "copy failed")
+    assert not evidence_root.exists()
+
+
+def test_manual_result_must_match_evidence_index_enum(tmp_path):
+    ei = _ei()
+    proc = REPO_ROOT / "docs" / "rust-refactor" / "procedures" / "stage3-runbook.md"
+    record = _write_json(
+        tmp_path / "manual.json",
+        {
+            "procedure_path": str(proc),
+            "procedure_sha256": _sha(proc),
+            "result": "UNRECOGNIZED",
+            "executed_by": "owner",
+            "executed_at": NOW,
+            "artifacts": [],
+            "deployed_content": None,
+        },
+    )
+    item = SimpleNamespace(evidence_kind="manual-procedure", layer="manual", candidate_longrun=False)
+    with pytest.raises(_harness_error()) as exc:
+        ei._derive_manual(record, item=item, platform="linux")
+    _assert_ingest_invalid(exc, "result")
+
+
+def test_report_timestamps_normalize_to_utc_and_replay_versions_compare_semantically():
+    ei = _ei()
+    old = ei._ledger_version({"ledger_through": "2026-11-16T20:00:00+08:00", "ledger_records": 10})
+    new = ei._ledger_version({"ledger_through": "2026-11-16T12:30:00+00:00", "ledger_records": 1})
+    assert ei._timestamp("2026-11-16T20:00:00+08:00", where="test") == "2026-11-16T12:00:00+00:00"
+    assert old[:2] < new[:2]

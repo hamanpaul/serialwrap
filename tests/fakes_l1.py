@@ -144,7 +144,10 @@ def junit_xml(
             counts[key] = value
     lines = [
         '<?xml version="1.0" encoding="utf-8"?>',
-        f'<testsuite name="pytest" tests="{counts["tests"]}" failures="{counts["failures"]}" '
+        f'<testsuites tests="{counts["tests"]}" failures="{counts["failures"]}" '
+        f'errors="{counts["errors"]}" skipped="{counts["skipped"]}">',
+        f'<testsuite name="pytest" timestamp="2026-11-01T00:00:00+00:00" '
+        f'tests="{counts["tests"]}" failures="{counts["failures"]}" '
         f'errors="{counts["errors"]}" skipped="{counts["skipped"]}">',
     ]
     for r in rows:
@@ -157,7 +160,7 @@ def junit_xml(
         elif r["outcome"] in ("skipped", "xfailed"):
             lines.append('<skipped message="fake skip"/>')
         lines.append("</testcase>")
-    lines.append("</testsuite>")
+    lines.extend(("</testsuite>", "</testsuites>"))
     return "\n".join(lines) + "\n"
 
 
