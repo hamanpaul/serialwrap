@@ -3089,7 +3089,12 @@ fn spawn_daemon(ctx: &mut CliCtx<'_>, root: &InstallRoot, endpoint: &str) -> Res
     let located = crate::commands::daemon_cmd::locate_daemon_argv(ctx).ok();
     let stable_name = if ctx.p.caps.path_flavor == sw_pal::PalPathFlavor::Windows { "serialwrapd.exe" } else { "serialwrapd" };
     let stable_daemon = root.bin.join(stable_name);
-    let mut argv = if ctx.p.fs.is_file(&stable_daemon) {
+    // POSIX 穩定入口是指向目標版本 `bin/serialwrapd` 的 symlink；PAL `is_file` 以 symlink_metadata 判定、
+    // 不跟隨連結，會改用 CLI 自身 bundle 的 launcher。回滾時 CLI 來自目前（新）版，因而啟動新版 daemon，
+    // start_and_verify 回報 pairing_mismatch。此處改以跟隨連結的 exists／!is_dir 判定入口存在，
+    // 確保切換後的穩定入口（即 handoff 目標版本）被啟動。
+    let stable_present = ctx.p.fs.exists(&stable_daemon) && !ctx.p.fs.is_dir(&stable_daemon);
+    let mut argv = if stable_present {
         vec![stable_daemon.to_string_lossy().into_owned()]
     } else {
         located.ok_or_else(|| "找不到可啟動的 serialwrapd".to_string())?

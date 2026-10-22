@@ -321,6 +321,8 @@ pub fn graceful_stop_with_existing_hold(
             }
         };
         crate::rollback::test_pause_after("handoff_stop:replied");
+        // 交接成功回覆後才記入 ran（與 Plain 的 `daemon stop` 記錄對稱），供 setup／supervision 回報與稽核。
+        ran.push(vec!["serialwrap".into(), "daemon".into(), "handoff_stop".into()]);
         chain.push(HandoffLink {
             token: token.clone(),
             pid: id.pid,
