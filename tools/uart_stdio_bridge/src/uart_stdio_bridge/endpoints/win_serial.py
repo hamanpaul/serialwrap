@@ -37,7 +37,12 @@ class WinSerialEndpoint:
         self._serial_timeout_exception: type[BaseException] | None = None
         self.generation = 0
         self.last_fault: str | None = None
+        # `_lock` 只保護狀態（handle、generation、closed 與 timeout 設定），絕不在阻塞 I/O 期間持有。
         self._lock = threading.RLock()
+        # 讀與寫各自串行化、彼此並行：寫入阻塞（對端不讀、緩衝區滿）時，讀取端仍須可前進，
+        # 否則 bridge 無法持續排空接收端，會形成 ST-03(a) 所描述的雙向死鎖。
+        self._read_io_lock = threading.Lock()
+        self._write_io_lock = threading.Lock()
         self._closed = False
 
     def open(self) -> None:
@@ -64,21 +69,25 @@ class WinSerialEndpoint:
                 serial_obj = self._serial_obj
                 if serial_obj is None:
                     wait_without_handle = True
-                else:
-                    try:
-                        if serial_obj.timeout != timeout:
-                            serial_obj.timeout = timeout
-                        return bytes(serial_obj.read(max_bytes))
-                    except Exception as exc:
-                        raise EndpointError(
-                            f"HARNESS_ENDPOINT_IO_ERROR: 讀取 {self.com} 失敗：{exc}"
-                        ) from exc
+                elif serial_obj.timeout != timeout:
+                    serial_obj.timeout = timeout
+            if not wait_without_handle:
+                # 阻塞讀取不持有狀態鎖（僅持讀取串行鎖），寫入端可同時前進。
+                with self._read_io_lock:
+                    # 取得串行鎖前 handle 可能已被控制面換掉（斷線或重開）：於串行鎖內重驗，不讀已關閉的 handle。
+                    # 未通過則落到下方等待，由迴圈頂端依最新狀態回空或等待（與無 handle 同語意）。
+                    if self._serial_obj is serial_obj and self.generation == start_generation:
+                        try:
+                            return bytes(serial_obj.read(max_bytes))
+                        except Exception as exc:
+                            raise EndpointError(
+                                f"HARNESS_ENDPOINT_IO_ERROR: 讀取 {self.com} 失敗：{exc}"
+                            ) from exc
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return b""
-            if wait_without_handle:
-                time.sleep(min(0.01, remaining))
+            time.sleep(min(0.01, remaining))
 
     def write_some(self, data: bytes, timeout_s: float) -> int:
         """寫入一段 bytes，回報 pySerial 實際回報的接受長度。"""
@@ -102,32 +111,35 @@ class WinSerialEndpoint:
                 serial_obj = self._serial_obj
                 if serial_obj is None:
                     wait_without_handle = True
-                else:
-                    try:
-                        if serial_obj.write_timeout != write_timeout:
-                            serial_obj.write_timeout = write_timeout
-                        count = int(serial_obj.write(data))
-                    except Exception as exc:
-                        is_timeout = self._serial_timeout_exception is not None and isinstance(
-                            exc, self._serial_timeout_exception
-                        )
-                        # 注入 factory 時也支援由替身提供的 pySerial 同名逾時例外。
-                        if is_timeout or exc.__class__.__name__ == "SerialTimeoutException":
-                            raise EndpointWriteUncertain(len(data), "write timeout") from exc
-                        raise EndpointError(
-                            f"HARNESS_ENDPOINT_IO_ERROR: 寫入 {self.com} 失敗：{exc}"
-                        ) from exc
-                    if not 0 <= count <= len(data):
-                        raise EndpointWriteUncertain(
-                            len(data), f"unexpected write count {count}"
-                        )
-                    return count
+                elif serial_obj.write_timeout != write_timeout:
+                    serial_obj.write_timeout = write_timeout
+            if not wait_without_handle:
+                # 阻塞寫入不持有狀態鎖（僅持寫入串行鎖），讀取端不受阻塞。
+                with self._write_io_lock:
+                    # 同讀取端：取得串行鎖前 handle 可能已被換掉，於串行鎖內重驗；未通過則不寫入（不產生不確定寫入）。
+                    if self._serial_obj is serial_obj and self.generation == start_generation:
+                        try:
+                            count = int(serial_obj.write(data))
+                        except Exception as exc:
+                            is_timeout = self._serial_timeout_exception is not None and isinstance(
+                                exc, self._serial_timeout_exception
+                            )
+                            # 注入 factory 時也支援由替身提供的 pySerial 同名逾時例外。
+                            if is_timeout or exc.__class__.__name__ == "SerialTimeoutException":
+                                raise EndpointWriteUncertain(len(data), "write timeout") from exc
+                            raise EndpointError(
+                                f"HARNESS_ENDPOINT_IO_ERROR: 寫入 {self.com} 失敗：{exc}"
+                            ) from exc
+                        if not 0 <= count <= len(data):
+                            raise EndpointWriteUncertain(
+                                len(data), f"unexpected write count {count}"
+                            )
+                        return count
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return 0
-            if wait_without_handle:
-                time.sleep(min(0.01, remaining))
+            time.sleep(min(0.01, remaining))
 
     def peer_open(self) -> None:
         return None
@@ -225,13 +237,16 @@ class WinSerialEndpoint:
         self.generation += 1
 
     def _release_serial_locked(self) -> None:
-        serial_obj = self._serial_obj
-        self._serial_obj = None
-        if serial_obj is not None:
-            try:
-                serial_obj.close()
-            except Exception as exc:
-                raise EndpointError(f"HARNESS_ENDPOINT_IO_ERROR: 關閉 {self.com} 失敗：{exc}") from exc
+        # 控制面（關閉、重開）必須等待進行中的讀取與寫入結束才換掉 handle：阻塞中的 I/O 不被半途關閉。
+        # 鎖序固定為 `_lock` → 讀取串行鎖 → 寫入串行鎖；I/O 路徑不在持有串行鎖時取得 `_lock`，故不會死鎖。
+        with self._read_io_lock, self._write_io_lock:
+            serial_obj = self._serial_obj
+            self._serial_obj = None
+            if serial_obj is not None:
+                try:
+                    serial_obj.close()
+                except Exception as exc:
+                    raise EndpointError(f"HARNESS_ENDPOINT_IO_ERROR: 關閉 {self.com} 失敗：{exc}") from exc
 
     def _ensure_not_closed_locked(self) -> None:
         if self._closed:

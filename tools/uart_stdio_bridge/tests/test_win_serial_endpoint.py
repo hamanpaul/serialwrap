@@ -364,6 +364,83 @@ def test_io_and_reconnect_are_serialized(fake_serial_module):
     assert second_handle_open
 
 
+class _ClosedAwareSerial(FakeSerial):
+    """關閉後讀寫即拋例外的替身（近似 pySerial 對已關閉埠的行為）。"""
+
+    def write(self, data: bytes) -> int:
+        if self.closed:
+            raise OSError("write on closed handle")
+        return super().write(data)
+
+    def read(self, size: int = 1) -> bytes:
+        if self.closed:
+            raise OSError("read on closed handle")
+        return b""
+
+
+class _HookedIoLock:
+    """包裝串行鎖：首次取得前先執行 hook（於同一執行緒斷線），用以確定性地重現「快照後、取鎖前」的交錯。"""
+
+    def __init__(self, inner: Any, hook: Any) -> None:
+        self._inner = inner
+        self._hook = hook
+        self._fired = False
+
+    def __enter__(self) -> _HookedIoLock:
+        if not self._fired:
+            self._fired = True
+            self._hook()
+        self._inner.acquire()
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        self._inner.release()
+        return False
+
+
+def test_read_does_not_touch_handle_closed_before_io_lock(fake_serial_module):
+    """取得 handle 快照後、取得讀取串行鎖前若已斷線：不得對已關閉的 handle 讀取（應如無 handle 般等待至期限回空）。"""
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    serials: list[_ClosedAwareSerial] = []
+
+    def factory(**kwargs: Any) -> _ClosedAwareSerial:
+        fake = _ClosedAwareSerial(**kwargs)
+        serials.append(fake)
+        return fake
+
+    ep = WinSerialEndpoint("COMb", allow_peer_close=True, serial_factory=factory)
+    ep.open()
+    try:
+        ep._read_io_lock = _HookedIoLock(ep._read_io_lock, lambda: ep.disconnect(remove_link=False))
+        assert ep.read(16, 0.05) == b""
+        assert serials[0].closed
+    finally:
+        ep.close()
+
+
+def test_write_does_not_touch_handle_closed_before_io_lock(fake_serial_module):
+    """取得 handle 快照後、取得寫入串行鎖前若已斷線：不得對已關閉的 handle 寫入（應回 0，不得拋例外）。"""
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    serials: list[_ClosedAwareSerial] = []
+
+    def factory(**kwargs: Any) -> _ClosedAwareSerial:
+        fake = _ClosedAwareSerial(**kwargs)
+        serials.append(fake)
+        return fake
+
+    ep = WinSerialEndpoint("COMb", allow_peer_close=True, serial_factory=factory)
+    ep.open()
+    try:
+        ep._write_io_lock = _HookedIoLock(ep._write_io_lock, lambda: ep.disconnect(remove_link=False))
+        assert ep.write_some(b"x", 0.05) == 0
+        assert serials[0].closed
+        assert serials[0].writes == []
+    finally:
+        ep.close()
+
+
 def test_open_endpoint_dispatches_and_opens_win_serial(fake_serial_module):
     from uart_stdio_bridge.endpoints import open_endpoint
 
