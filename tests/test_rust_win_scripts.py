@@ -256,3 +256,79 @@ def test_win_staging_covers_contract_blackbox_scripts_refs():
     assert refs, "預期 contract_blackbox 有 scripts/rust 引用（ab_blackbox_1b）"
     missing = sorted(ref for ref in refs if f"'{ref}'" not in ps1)
     assert not missing, f"win-blackbox.ps1 staging 清單未涵蓋：{missing}"
+
+
+def _ps_function(source: str, name: str) -> str:
+    """取出 win-blackbox.ps1 中指定 function 的本體（到下一個 function 或頂層 `$sourceRoot =` 為止）。"""
+    head = source.split(f"function {name}", 1)
+    assert len(head) == 2, f"win-blackbox.ps1 缺少 function {name}"
+    return head[1].split("\nfunction ", 1)[0].split("\n$sourceRoot =", 1)[0]
+
+
+def test_windows_process_handles_are_cached_after_start_process():
+    """每個 `$process = Start-Process ... -PassThru` 之後必須立即快取 `$process.Handle`。
+
+    Windows PowerShell 5.1 若未快取 Handle，行程結束後 ExitCode 會是 null（bridge_stop process_exit=null 的根因）。
+    """
+    ps1 = WIN_BLACKBOX_PS1.read_text(encoding="utf-8-sig")
+    starts = re.findall(r"\$process = Start-Process\b", ps1)
+    cached = re.findall(
+        r"\$process = Start-Process(?:[^\r\n]*`\r?\n)*[^\r\n]*\r?\n(?:\s*#[^\r\n]*\r?\n)*\s*\$null = \$process\.Handle\b",
+        ps1,
+    )
+    assert starts, "win-blackbox.ps1 應至少含一個 $process = Start-Process"
+    assert len(cached) == len(starts), f"Start-Process {len(starts)} 處，但僅 {len(cached)} 處緊接快取 Handle"
+
+
+def test_windows_exit_code_null_is_failure_not_zero():
+    """ExitCode 為 null 時必須判定為失敗，不得以 [int]$null（= 0）或 `ExitCode -eq 0` 放行。"""
+    ps1 = WIN_BLACKBOX_PS1.read_text(encoding="utf-8-sig")
+    # 舊的 null→0 放行形式不得再出現。
+    assert "[int]$process.ExitCode" not in ps1
+    assert "$Bridge.process.ExitCode -eq 0" not in ps1
+
+    selftest = _ps_function(ps1, "Invoke-BridgeSelftest")
+    assert "$null -eq $rawSelftestExit" in selftest
+    assert re.search(r"\$ok = \(\$exitStatusKnown -and\s", selftest), "selftest PASS 必須要求 ExitCode 已知"
+    assert "exit_status_known" in selftest
+
+    stop = _ps_function(ps1, "Stop-WindowsComBridge")
+    assert "$processExitKnown = ($null -ne $processExit)" in stop
+    assert re.search(r"status = if \(\$controlExit -eq 0 -and \$exited -and \$processExitKnown -and \$processExit -eq 0\)", stop)
+    assert "process_exit_known" in stop
+
+
+def test_windows_blackbox_l1_is_staged_then_copied_to_outdir():
+    """SW_RESOURCE_REPORT 與 B 輪 junit 必須指向 `<staging>\\l1\\windows\\blackbox\\`，之後複製到 OutDir。
+
+    test_cli_mgmt_ab_suite 要求 A/B 證據路徑位於本 worktree（staging），直接指向 \\\\wsl.localhost 會失敗。
+    """
+    ps1 = WIN_BLACKBOX_PS1.read_text(encoding="utf-8-sig")
+    assert "Join-Path $stagingRepo 'l1\\windows\\blackbox'" in ps1
+    assert "$stagingResourceReport = Join-Path $stagingL1Directory 'resource-report.json'" in ps1
+    assert "$bStagingJunit = Join-Path $stagingL1Directory 'junit.xml'" in ps1
+    # B 輪 Invoke-Blackbox 必須同時帶 staging 的 junit 與 resource report。
+    b_call = re.search(r"Invoke-Blackbox 'b-rust-win' \$bStagingJunit\b[\s\S]*?\$stagingResourceReport\b", ps1)
+    assert b_call, "B 輪必須以 staging junit 與 staging resource report 呼叫 Invoke-Blackbox"
+    assert "Invoke-Blackbox 'b-rust-win' $bJunit" not in ps1
+    assert "$resourceReport $bundleRoot" not in ps1
+    # 複製回 OutDir 的步驟必須存在，且目的地仍為 OutDir\l1\windows\blackbox。
+    assert "$l1Directory = Join-Path $outputRoot 'l1\\windows\\blackbox'" in ps1
+    assert "Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $l1Directory $_.Name) -Force" in ps1
+
+
+def test_windows_blackbox_ps1_parses_under_windows_powershell():
+    """以 Windows PowerShell 解析器語法檢查 win-blackbox.ps1（不執行）；無 powershell.exe 時 SKIP。"""
+    powershell = shutil.which("powershell.exe")
+    wslpath = shutil.which("wslpath")
+    if not powershell or not wslpath:
+        pytest.skip("需要 WSL interop（powershell.exe／wslpath）以解析 PowerShell 語法")
+    win_path = subprocess.run([wslpath, "-w", str(WIN_BLACKBOX_PS1)], capture_output=True, text=True, check=True).stdout.strip()
+    script = (
+        "$t=$null;$e=$null;"
+        f"[void][System.Management.Automation.Language.Parser]::ParseFile('{win_path}',[ref]$t,[ref]$e);"
+        "Write-Output ('parse_errors=' + $e.Count)"
+    )
+    out = subprocess.run([powershell, "-NoProfile", "-Command", script], capture_output=True, text=True,
+                         timeout=120, check=False).stdout
+    assert "parse_errors=0" in out, out

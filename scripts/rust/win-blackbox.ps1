@@ -327,12 +327,16 @@ raise SystemExit(0 if qualified else 1)
     $timeoutSeconds = $TimeoutSeconds
     $timedOut = $false
     $selftestProcessId = $null
+    # ExitCode 取不到（null）時必須判定為失敗；不得以 [int]$null（= 0）放行。
+    $exitStatusKnown = $true
     try {
         $pyCommand = Get-Command 'py.exe' -ErrorAction Stop
         $arguments = '-3.12 -m uart_stdio_bridge selftest --endpoint win-serial --com-pair {0} --transport-mode virtual_com0com --out "{1}"' -f $ComPair, $selftestRoot
         $process = Start-Process -FilePath $pyCommand.Source -ArgumentList $arguments `
             -WorkingDirectory $StagingRepo -PassThru -WindowStyle Hidden `
             -RedirectStandardOutput $selftestLog -RedirectStandardError $selftestError
+        # Windows PowerShell 5.1 必須在行程結束前快取 Handle，否則 ExitCode 會讀成 null。
+        $null = $process.Handle
         $selftestProcessId = [int]$process.Id
         if (-not $process.WaitForExit($timeoutSeconds * 1000)) {
             $timedOut = $true
@@ -340,7 +344,13 @@ raise SystemExit(0 if qualified else 1)
             $null = $process.WaitForExit(10000)
             $selftestExit = 124
         } else {
-            $selftestExit = [int]$process.ExitCode
+            $rawSelftestExit = $process.ExitCode
+            if ($null -eq $rawSelftestExit) {
+                $exitStatusKnown = $false
+                $selftestExit = 1
+            } else {
+                $selftestExit = [int]$rawSelftestExit
+            }
         }
         if (-not $timedOut -and (Test-Path -LiteralPath $reportPath -PathType Leaf)) {
             $qualificationOutput = & py -3.12 $verifyScript $reportPath 2>&1
@@ -356,15 +366,16 @@ raise SystemExit(0 if qualified else 1)
     if (-not $timedOut -and (Test-Path -LiteralPath $reportPath -PathType Leaf)) {
         $report = Get-Content -LiteralPath $reportPath -Raw -Encoding UTF8 | ConvertFrom-Json
     }
-    $ok = ($selftestExit -eq 0 -and $qualifiedExit -eq 0 -and $report -and $report.verdict -eq 'PASS')
+    $ok = ($exitStatusKnown -and $selftestExit -eq 0 -and $qualifiedExit -eq 0 -and $report -and $report.verdict -eq 'PASS')
     return [ordered]@{
         status = if ($ok) { 'PASS' } elseif ($report) { 'FAIL' } else { 'EVIDENCE-INSUFFICIENT' }
         exit = $selftestExit
+        exit_status_known = $exitStatusKnown
         qualification_exit = $qualifiedExit
         timeout_seconds = $timeoutSeconds
         timed_out = $timedOut
         process_id = $selftestProcessId
-        reason = if ($timedOut) { 'S0 selftest 逾時，沒有完成報告；保留部分工作證據並停止子行程樹' } elseif (-not $report) { 'S0 selftest 未產生完成報告' } else { $null }
+        reason = if ($timedOut) { 'S0 selftest 逾時，沒有完成報告；保留部分工作證據並停止子行程樹' } elseif (-not $exitStatusKnown) { 'S0 selftest 行程 ExitCode 不可得（null），視為失敗' } elseif (-not $report) { 'S0 selftest 未產生完成報告' } else { $null }
         qualification_output = @($qualificationOutput)
         report = $reportPath
         endpoint = 'win-serial'
@@ -463,6 +474,8 @@ raise SystemExit(main(arguments))
         $runnerArgs = '"{0}" "{1}"' -f $runScript, $specPath
         $process = Start-Process -FilePath $pythonExe -ArgumentList $runnerArgs -WorkingDirectory $StagingRepo `
             -PassThru -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+        # 快取 Handle 後 Stop 階段才讀得到 ExitCode（同 Invoke-BridgeSelftest）。
+        $null = $process.Handle
     } finally {
         if ($null -eq $oldPythonPath) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue }
         else { $env:PYTHONPATH = $oldPythonPath }
@@ -731,10 +744,14 @@ finally:
     if (Test-Path -LiteralPath $Bridge.control -PathType Leaf) {
         Remove-Item -LiteralPath $Bridge.control -Force
     }
+    # ExitCode 為 null 時必須判定為失敗（fail closed），不得與 0 比較後被當成通過。
+    $processExit = if ($exited) { $Bridge.process.ExitCode } else { $null }
+    $processExitKnown = ($null -ne $processExit)
     return [ordered]@{
-        status = if ($controlExit -eq 0 -and $exited -and $Bridge.process.ExitCode -eq 0) { 'PASS' } else { 'FAIL' }
+        status = if ($controlExit -eq 0 -and $exited -and $processExitKnown -and $processExit -eq 0) { 'PASS' } else { 'FAIL' }
         control_exit = $controlExit
-        process_exit = if ($exited) { $Bridge.process.ExitCode } else { $null }
+        process_exit = $processExit
+        process_exit_known = $processExitKnown
         output = @($controlOutput)
         stdout = $Bridge.stdout
         stderr = $Bridge.stderr
@@ -841,6 +858,12 @@ try {
     $aJunit = Join-Path $outputRoot 'a.xml'
     $l1Directory = Join-Path $outputRoot 'l1\windows\blackbox'
     $null = New-Item -ItemType Directory -Path $l1Directory -Force
+    # B 輪的 junit 與 SW_RESOURCE_REPORT 必須位於 staging（tests/contract_blackbox/test_cli_mgmt_ab_suite.py
+    # 要求 A/B 證據路徑位於本 worktree）；B 輪結束後再複製到 OutDir 的 l1\windows\blackbox\（plan 04 Task 17）。
+    $stagingL1Directory = Join-Path $stagingRepo 'l1\windows\blackbox'
+    $null = New-Item -ItemType Directory -Path $stagingL1Directory -Force
+    $bStagingJunit = Join-Path $stagingL1Directory 'junit.xml'
+    $stagingResourceReport = Join-Path $stagingL1Directory 'resource-report.json'
     $bJunit = Join-Path $l1Directory 'junit.xml'
     $bCompareJunit = Join-Path $outputRoot 'b.xml'
     $resourceReport = Join-Path $l1Directory 'resource-report.json'
@@ -893,9 +916,13 @@ try {
         } elseif ($ComPair) {
             $missing.Add('B 輪未帶 COM pair：selftest 實際失敗或 COM bridge 未啟動')
         }
-        $b = Invoke-Blackbox 'b-rust-win' $bJunit (Join-Path $bundleBin 'serialwrap.exe') `
-            $pythonDaemon $runtimeExe $Label $true $resourceReport $bundleRoot `
+        $b = Invoke-Blackbox 'b-rust-win' $bStagingJunit (Join-Path $bundleBin 'serialwrap.exe') `
+            $pythonDaemon $runtimeExe $Label $true $stagingResourceReport $bundleRoot `
             $activePair $activeWire $pidLog
+        # B 輪 L1 產物（junit 與 resource-report）自 staging 複製到 OutDir\l1\windows\blackbox\。
+        Get-ChildItem -LiteralPath $stagingL1Directory -File -ErrorAction SilentlyContinue | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $l1Directory $_.Name) -Force
+        }
         if (Test-Path -LiteralPath $bJunit -PathType Leaf) {
             Copy-Item -LiteralPath $bJunit -Destination $bCompareJunit -Force
         }
