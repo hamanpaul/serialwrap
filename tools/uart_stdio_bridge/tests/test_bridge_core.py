@@ -593,3 +593,136 @@ def test_barrier_unsettled_while_traffic(bridge_proc):
         os.close(fd)
     b.control.call("shutdown")
     assert b.wait(10) == 0
+
+
+class _WinPeerFakeSerial:
+    """win-serial 端點的 pySerial 替身：記錄 write；`dsr_on` 模擬對端開啟（DSR 轉高）。"""
+
+    def __init__(self, **kwargs: object) -> None:
+        self._timeout = kwargs.get("timeout")
+        self._write_timeout = kwargs.get("write_timeout")
+        self.dsr_on = False
+        self.writes: list[bytes] = []
+        self.closed = False
+
+    @property
+    def timeout(self) -> object:
+        return self._timeout
+
+    @timeout.setter
+    def timeout(self, value: object) -> None:
+        self._timeout = value
+
+    @property
+    def write_timeout(self) -> object:
+        return self._write_timeout
+
+    @write_timeout.setter
+    def write_timeout(self, value: object) -> None:
+        self._write_timeout = value
+
+    @property
+    def dsr(self) -> bool:
+        return self.dsr_on
+
+    def write(self, data: bytes) -> int:
+        self.writes.append(bytes(data))
+        return len(data)
+
+    def read(self, size: int = 1) -> bytes:
+        # 對齊 pySerial 逾時等待語意，避免讀取迴圈忙轉。
+        time.sleep(0.01)
+        return b""
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_win_serial_status_reports_peer_open_null(tmp_path: Path):
+    """Windows 端點不宣告 peer_state：對外 status 的 peer_open 必須為 None，即使 DSR 已為高。
+    內部 peer gate 仍照常取樣並於 DSR 高後寫出 banner。"""
+    from uart_stdio_bridge.bridge.core import Bridge, BridgeConfig
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+    from uart_stdio_bridge.evidence.writer import EvidenceWriter
+
+    banner = b"=== STATUS BANNER ===\r\n"
+    serials: list[_WinPeerFakeSerial] = []
+
+    def factory(**kwargs: object) -> _WinPeerFakeSerial:
+        fake = _WinPeerFakeSerial(**kwargs)
+        serials.append(fake)
+        return fake
+
+    endpoint = WinSerialEndpoint("COMb", peer_gate=True, serial_factory=factory)
+    dut = StubDutProcess()
+    dut.stdout_buf.extend(banner)
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    writer = EvidenceWriter(
+        evidence_dir / "wire.ndjson", run_id="r-status", case_id="c-status", clock_id="clk-status"
+    )
+    cfg = BridgeConfig(run_id="r-status", case_id="c-status", port_id="COM0", evidence_dir=evidence_dir)
+    bridge = Bridge(cfg, endpoint, dut, writer, dut_control=None)
+    bridge.start()
+    try:
+        time.sleep(0.3)
+        assert bridge.handle_action("status", {}, "act_status_closed")["peer_open"] is None
+
+        serials[0].dsr_on = True
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and b"".join(serials[0].writes) != banner:
+            time.sleep(0.01)
+        assert b"".join(serials[0].writes) == banner
+        assert bridge.handle_action("status", {}, "act_status_open")["peer_open"] is None
+    finally:
+        bridge.handle_action("shutdown", {}, "act_shutdown")
+        assert bridge.wait() == 0
+
+
+def test_win_serial_peer_gate_holds_banner_until_peer_open(tmp_path: Path):
+    """PENDING-OD-S1X-WIN-BANNER 的 bridge 層回歸：DUT 開機 banner 於 peer 開啟前產生，
+    peer 未開啟時 serial_write 串流長度為 0，peer 開啟後完整送出（對應 POSIX test_peer_gate_no_write_before_open）。"""
+    from uart_stdio_bridge.bridge.core import Bridge, BridgeConfig
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+    from uart_stdio_bridge.evidence.writer import EvidenceWriter
+
+    banner = b"=== BOOT BANNER ===\r\n"
+    serials: list[_WinPeerFakeSerial] = []
+
+    def factory(**kwargs: object) -> _WinPeerFakeSerial:
+        fake = _WinPeerFakeSerial(**kwargs)
+        serials.append(fake)
+        return fake
+
+    endpoint = WinSerialEndpoint("COMb", peer_gate=True, serial_factory=factory)
+    dut = StubDutProcess()
+    dut.stdout_buf.extend(banner)
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    writer = EvidenceWriter(
+        evidence_dir / "wire.ndjson", run_id="r-banner", case_id="c-banner", clock_id="clk-banner"
+    )
+    cfg = BridgeConfig(run_id="r-banner", case_id="c-banner", port_id="COM0", evidence_dir=evidence_dir)
+    bridge = Bridge(cfg, endpoint, dut, writer, dut_control=None)
+    bridge.start()
+    try:
+        time.sleep(0.3)
+        assert serials and serials[0].writes == []
+
+        serials[0].dsr_on = True
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and b"".join(serials[0].writes) != banner:
+            time.sleep(0.01)
+        assert b"".join(serials[0].writes) == banner
+    finally:
+        bridge.handle_action("shutdown", {}, "act_shutdown")
+        assert bridge.wait() == 0
+
+    lines = [
+        json.loads(line)
+        for line in (evidence_dir / "wire.ndjson").read_text(encoding="utf-8").splitlines()
+    ]
+    assert any(
+        r.get("meta", {}).get("event") == "peer_state" and r["meta"].get("open") is True
+        for r in lines
+    )
