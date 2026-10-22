@@ -951,6 +951,9 @@ class SerialwrapService:
                     })
                 error_code = "FLASHING_BUSY" if busy.get("flashing") else "SESSION_BUSY"
                 return {"ok": False, "error_code": error_code, "busy": rows}
+            # 回覆前先凍結背景引擎與 bridge TX（SC-11 排空窗口零 TX）：RPC admission 之外的
+            # 重探 tick、重 attach、login、console 行原本不經 admission。
+            self._sessions.freeze_for_handoff()
         return {"ok": True, "stopping": True, "handoff_token": token}
 
     def _dispatch(self, method: str, params: dict[str, Any]) -> dict[str, Any]:

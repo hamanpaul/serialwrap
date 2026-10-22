@@ -888,6 +888,9 @@ class SessionManager:
         self._draining_by_ids: dict[str, _DrainJob] = {}
         self._aborted_cmd_ids: set[str] = set()
         self._shutting_down = False
+        # 交接停止（SC-11 `daemon.handoff_stop`）freeze 成立後為 True：DeviceWatcher tick 不再排工、
+        # 在途 readiness probe 的結果不再改寫 session（見 freeze_for_handoff）。
+        self._handoff_frozen = False
         self._shutdown_deadline: float | None = None
         self._shutdown_workers: set[threading.Thread] = set()
         # flash 偵測 probe 進行中的 COM（#83 RACE-2 final）：probe 已開 bridge flash_mode gate 擋 console，
@@ -1015,6 +1018,38 @@ class SessionManager:
         """凍結 attach、hotplug 與後置重開入口。"""
         with self._lock:
             self._shutting_down = True
+
+    def freeze_for_handoff(self) -> None:
+        """交接停止成功後凍結背景引擎與既有 bridge 的 TX（SC-11 `daemon.handoff_stop`，R1-F1）。
+
+        RPC admission 只擋新進的 RPC；DeviceWatcher 重探 tick、重新 attach、login 與人工 console 行
+        等背景來源原本不經 admission，排空窗口內仍會 TX 或改寫 session。本方法於 freeze 成立時：
+
+        1. 進入 stopping gate（`begin_shutdown`）：attach、熱插不再開 UART、不建 worker；
+        2. 設 `_handoff_frozen`：`reconcile_readiness` 不再排重探／重 attach 與 lease tick，
+           在途 readiness probe 的結果不再改寫 session；
+        3. 對所有已掛載 bridge（session、attach、probe）呼叫 `freeze_tx()`：此後任何來源的 TX
+           都由 bridge 拒絕（零 TX）。
+
+        reader 與埠保持開啟；實際排空仍由 stop 的 `shutdown_drain()` 於窗口結束後完成。冪等。
+        """
+        with self._lock:
+            self._handoff_frozen = True
+            self._shutting_down = True
+            bridges: dict[int, UARTBridge] = {}
+            for session in self._sessions.values():
+                if session.bridge is not None:
+                    bridges[id(session.bridge)] = session.bridge
+            for bridge in self._attach_bridges.values():
+                bridges[id(bridge)] = bridge
+            for table in (self._attach_ops, self._preopened_ports, self._active_attach_ops):
+                for op in table.values():
+                    if op.probe_bridge is not None:
+                        bridges[id(op.probe_bridge)] = op.probe_bridge
+            for bridge in bridges.values():
+                freeze_tx = getattr(bridge, "freeze_tx", None)
+                if callable(freeze_tx):
+                    freeze_tx()
 
     def shutdown_drain(self, *, total_timeout_s: float = 5.0) -> dict[str, Any]:
         """以一個共用期限等待 attach 收尾並取得所有 bridge 關閉回條。"""
@@ -2094,6 +2129,9 @@ class SessionManager:
 
     def _finish_probe_reprobe(self, session_id: str, bridge: UARTBridge, result: dict[str, Any], now: float) -> None:
         with self._lock:
+            if self._handoff_frozen:
+                # 交接凍結後，在途 probe 的結果不得再把 session 推進到 READY（零狀態改寫）。
+                return
             current = self._sessions.get(session_id)
             if current is None or current.bridge is not bridge:
                 return
@@ -2207,6 +2245,7 @@ class SessionManager:
                             current is not None
                             and current.bridge is bridge
                             and current.state not in {"FLASHING", "RELEASED"}
+                            and not self._handoff_frozen
                         ):
                             current.state = "ATTACHED"
                             current.last_error = f"REPROBE_FAILED:{type(exc).__name__}"
@@ -2312,7 +2351,10 @@ class SessionManager:
 
         本方法由 DeviceWatcher tick 同步呼叫，因此只在 lock 內收集候選、不在此同步等待 probe；
         ATTACHED 的 readiness probe 改交背景 worker（Finding 3），DETACHED 走既有 threaded _spawn_attach。
+        交接凍結（freeze_for_handoff）後整個 tick 不再改動 session 或送出 TX（SC-11，零 TX）。
         """
+        if self._handoff_frozen:
+            return
         self._expire_interactive_leases_tick()
         now = time.monotonic()
         jobs: list[tuple[str, str, UARTBridge | None, str]] = []

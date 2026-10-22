@@ -923,6 +923,26 @@ class UARTBridge:
                     "UART pending write 取消失敗（com=%s）", self.com, exc_info=True
                 )
 
+    def freeze_tx(self) -> None:
+        """凍結此後所有來源的新 TX，但不啟動 drain（reader、埠與 console 保持開啟）。
+
+        交接停止（SC-11 `daemon.handoff_stop`）成功後由 SessionManager.freeze_for_handoff 呼叫：
+        與 `begin_drain` 共用 `_tx_frozen` 閘門，故 `_send_bytes_locked` 與 TX fence 內的提交檢查
+        都會拒絕之後的寫入（含背景 probe、login、human raw 與 console 行）。旗標在 state lock 下設定；
+        隨後以短期限等待 TX fence，使回覆前已授權的寫入段多半已結束。逾時不另記 log（見函式內註解）：
+        旗標已設定，之後新開始的寫入段仍一律拒絕，但已在進行中的段無法由此保證已完成。冪等。
+        """
+        with self._lifecycle_lock:
+            with self._state_lock:
+                self._tx_frozen = True
+        fence = getattr(self, "_tx_fence_lock", None)
+        if fence is None:
+            return
+        # 逾時不呼叫 logger：daemon logging 基線（contracts/daemon_logging.yaml）未列此訊息，新增 logger
+        # 呼叫需經契約變更與審查（已列為 reviewer 待辦）。逾時時已授權段可能仍在進行，但之後新開始的段一律拒絕。
+        if fence.acquire(timeout=_constants.DRAIN_FENCE_ACQUIRE_S):
+            fence.release()
+
     def _on_drain_invalidate(self) -> None:
         """Drain 開始時使所有已擷取的 deferred 輸入失效。"""
         self.invalidate_deferred("drain")

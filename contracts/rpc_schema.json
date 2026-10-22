@@ -1705,7 +1705,7 @@
       ],
       "side_effects": [
         {
-          "what": "在 AdmissionGate 原子判定閒置並凍結新操作；成功後回應寫出再進入 daemon.stop 停止序列",
+          "what": "在 AdmissionGate 原子判定閒置並凍結新操作；閒置時於回覆前另凍結背景來源（DeviceWatcher 重探與重 attach、login、console 行）並對既有 bridge 凍結新 TX（零 TX，未啟動 drain）；成功後回應寫出，RPC 監聽保留有界排空窗口（Python 基線 HANDOFF_DRAIN_GRACE_S=3 秒）：窗口內有副作用的請求回 FLUSHED_BY_SHUTDOWN＋reason handoff_frozen（零 TX、零狀態改寫），health.ping 仍可回應；窗口結束才關閉監聽並進入 daemon.stop 停止序列（Rust 細化須與此一致，見 SC-11 交接停止註記）",
           "when": "on_success",
           "idempotent": false
         }
