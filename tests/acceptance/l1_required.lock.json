@@ -6535,6 +6535,7 @@
           "tests/contract_blackbox/test_cli_mgmt_com0com.py::test_readme_com0com_both_languages",
           "tests/contract_blackbox/test_cli_mgmt_com0com.py::test_signed_zip_hash_mismatch_fails_before_extraction",
           "tests/contract_blackbox/test_cli_mgmt_connect.py::test_connect_benches_ab",
+          "tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_restart_ab",
           "tests/contract_blackbox/test_cli_mgmt_doctor.py::test_doctor_ab_shared_checks",
           "tests/contract_blackbox/test_cli_mgmt_doctor.py::test_doctor_ab_version_pairing_in_bundle",
           "tests/contract_blackbox/test_cli_mgmt_l15.py::test_autostart_l15_tx_once",

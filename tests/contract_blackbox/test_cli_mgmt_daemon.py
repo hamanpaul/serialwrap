@@ -168,6 +168,10 @@ def test_daemon_start_stop_ab_real_daemon(tmp_path: Path, env: dict[str, str], p
 
 @pytest.mark.case("sc20-daemon-restart")
 @pytest.mark.pidns_rig
+# P0 T14：補唯一平台 marker 與資源 marker。依賴 /proc 與 sh，故為 posix_only；Windows 由 cargo restart_* 承接 sc20，
+# 不在 s1b_20groups windows 收集範圍（-m "core_portable or windows_native"）。
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
 def test_daemon_restart_ab(tmp_path: Path, env: dict[str, str], no_delegation: Path) -> None:
     """SC-20：on-demand restart 後 pid 改變；兩實作輸出形狀 {ok,restarted,start,stopped} 正規化後相同。
 

@@ -186,7 +186,9 @@ def test_placeholder_only_case_is_not_evidence(gate) -> None:
 
 
 POSIX_NODE = "sw-pal::process_tunnel::posix_terminate_kills_whole_group_including_grandchild"
-PIDNS_NODE = "tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_restart_ab"
+# 兩個平台的凍結 selector 皆不收集的節點：無平台 marker 的 contract_blackbox 節點（test_daemon_start_ab_conflict）。
+# 原用 test_daemon_restart_ab，該節點補上 posix_only 後已被 Linux s1b_20groups 收集（S1X G5），故改用仍未收集者。
+UNSELECTED_NODE = "tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_start_ab_conflict"
 
 
 def test_pass_on_platform_outside_cargo_selector_does_not_count(gate) -> None:
@@ -208,10 +210,10 @@ def test_pass_on_applicable_platform_only_is_accepted(gate) -> None:
 
 
 def test_pass_for_node_outside_every_selector_is_rejected(gate) -> None:
-    """兩個平台的凍結 selector 都不收集的 contract_blackbox 節點（test_daemon_restart_ab 型態）即使有 PASS 亦 FAIL。"""
-    _write_map(gate, [_case("sc-a", platforms=["linux"], tests=[PIDNS_NODE])])
+    """兩個平台的凍結 selector 都不收集的 contract_blackbox 節點即使有 PASS 亦 FAIL。"""
+    _write_map(gate, [_case("sc-a", platforms=["linux"], tests=[UNSELECTED_NODE])])
     assert gate.freeze(add_only=False) == 0
-    _write_evidence(gate, "sc-a", [_pass_record(gate, "sc-a", platform="linux", test_id=PIDNS_NODE)])
+    _write_evidence(gate, "sc-a", [_pass_record(gate, "sc-a", platform="linux", test_id=UNSELECTED_NODE)])
     assert gate.check() == 1
 
 
